@@ -1,4 +1,4 @@
-# The Tachyon Programming Language — Complete Specification
+# The Tachyon Programming Language
 
 Target: x86-64 Linux, System V AMD64 ABI **only**
 
