@@ -1,16 +1,6 @@
 #!/bin/bash
 # tachyon.sh — compile a .tach file to an ELF binary
-#
-# Usage: ./tachyon.sh program.tach [-o output] [--keep] [--no-libc]
-#
-# Default (with libc):
-#   1. tachyon  program.tach → program.asm
-#   2. nasm     program.asm  → program.o
-#   3. gcc      program.o    → program       (links libc, crt provides _start)
-#
-# With --no-libc (freestanding):
-#   3. ld       program.o    → program       (our own _start, raw syscalls only)
-
+# Usage: ./tachyon.sh program.tach [-o output]
 
 cargo b -r
 
