@@ -429,14 +429,9 @@ impl<'a> Lowerer<'a> {
             }
             TypeKind::Array(e, n) => TypeInternal::Array(Box::new(self.resolve_ast_type(e)), *n),
             TypeKind::Pointer(i) => TypeInternal::Pointer(Box::new(self.resolve_ast_type(i))),
-            TypeKind::Fn {
-                params,
-                result,
-                is_variadic,
-            } => TypeInternal::Fn {
+            TypeKind::Fn { params, result } => TypeInternal::Fn {
                 params: params.iter().map(|x| self.resolve_ast_type(x)).collect(),
                 result: Box::new(self.resolve_ast_type(result)),
-                is_variadic: *is_variadic,
             },
         }
     }

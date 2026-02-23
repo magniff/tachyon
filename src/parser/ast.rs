@@ -88,7 +88,6 @@ pub enum TypeKind {
     Fn {
         params: Vec<Type>,
         result: Box<Type>,
-        is_variadic: bool,
     },
 }
 

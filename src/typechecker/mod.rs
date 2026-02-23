@@ -41,7 +41,6 @@ pub enum TypeInternal {
     Fn {
         params: Vec<TypeInternal>,
         result: Box<TypeInternal>,
-        is_variadic: bool,
     },
     Struct(String), // resolved by name
 }
@@ -435,11 +434,7 @@ impl Typechecker {
                 let inner_ty = self.resolve_type(inner)?;
                 Ok(TypeInternal::Pointer(Box::new(inner_ty)))
             }
-            TypeKind::Fn {
-                params,
-                result,
-                is_variadic,
-            } => {
+            TypeKind::Fn { params, result } => {
                 let mut p = Vec::new();
                 for t in params {
                     p.push(self.resolve_type(t)?);
@@ -447,7 +442,6 @@ impl Typechecker {
                 Ok(TypeInternal::Fn {
                     params: p,
                     result: Box::new(self.resolve_type(result)?),
-                    is_variadic: *is_variadic,
                 })
             }
         }
@@ -1305,11 +1299,7 @@ impl Typechecker {
         // Indirect call via fn pointer
         let callee_ty = self.synth_expr(callee)?;
         match &callee_ty {
-            TypeInternal::Fn {
-                params,
-                result,
-                is_variadic,
-            } => {
+            TypeInternal::Fn { params, result } => {
                 if args.len() != params.len() {
                     return Err(typechecker_error(
                         span,

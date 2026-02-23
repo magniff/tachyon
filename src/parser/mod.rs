@@ -1156,7 +1156,6 @@ impl Parser {
                     kind: TypeKind::Fn {
                         params: param_types,
                         result: ret,
-                        is_variadic,
                     },
                     span: start.merge(self.prev_span()),
                 })
