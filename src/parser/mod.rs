@@ -1123,11 +1123,9 @@ impl Parser {
                 self.advance();
                 self.expect(&TokenKind::LParen)?;
                 let mut param_types = Vec::new();
-                let mut is_variadic = false;
                 if !self.at(&TokenKind::RParen) {
                     loop {
                         if let Ok(_) = self.expect(&TokenKind::Ellipsis) {
-                            is_variadic = true;
                             break;
                         }
                         param_types.push(self.parse_type()?);
