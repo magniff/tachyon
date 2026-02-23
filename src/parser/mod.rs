@@ -39,23 +39,23 @@ impl Parser {
         }
     }
 
-    fn peek(&self) -> &TokenKind {
+    fn current_token(&self) -> &TokenKind {
         &self.tokens[self.pos].kind
     }
-    fn span(&self) -> Span {
+    fn current_token_span(&self) -> Span {
         self.tokens[self.pos].span
     }
-    fn at_eof(&self) -> bool {
-        matches!(self.peek(), TokenKind::EOF)
+    fn is_at_eof(&self) -> bool {
+        matches!(self.current_token(), TokenKind::EOF)
     }
 
     fn at(&self, kind: &TokenKind) -> bool {
-        std::mem::discriminant(self.peek()) == std::mem::discriminant(kind)
+        self.current_token() == kind
     }
 
     fn advance(&mut self) -> &Token {
         let tok = &self.tokens[self.pos];
-        if !self.at_eof() {
+        if !self.is_at_eof() {
             self.pos += 1;
         }
         tok
@@ -63,38 +63,45 @@ impl Parser {
 
     fn expect(&mut self, kind: &TokenKind) -> Result<Span, ParserError> {
         if self.at(kind) {
-            let s = self.span();
+            let s = self.current_token_span();
             self.advance();
             Ok(s)
         } else {
-            Err(self.error(format!("expected '{}', got '{}'", kind, self.peek())))
+            Err(self.error(format!(
+                "expected '{}', got '{}'",
+                kind,
+                self.current_token()
+            )))
         }
     }
 
     fn expect_ident(&mut self) -> Result<Spanned<String>, ParserError> {
-        if let TokenKind::Ident(name) = self.peek().clone() {
-            let span = self.span();
+        if let TokenKind::Ident(name) = self.current_token().clone() {
+            let span = self.current_token_span();
             self.advance();
             Ok((name, span))
         } else {
-            Err(self.error(format!("expected identifier, got '{}'", self.peek())))
+            Err(self.error(format!(
+                "expected identifier, got '{}'",
+                self.current_token()
+            )))
         }
     }
 
     fn expect_int(&mut self) -> Result<Spanned<u64>, ParserError> {
-        if let TokenKind::IntLiteral(v) = self.peek().clone() {
-            let span = self.span();
+        if let TokenKind::IntLiteral(v) = self.current_token().clone() {
+            let span = self.current_token_span();
             self.advance();
             Ok((v, span))
         } else {
-            Err(self.error(format!("expected integer, got '{}'", self.peek())))
+            Err(self.error(format!("expected integer, got '{}'", self.current_token())))
         }
     }
 
     fn error(&self, msg: impl Into<String>) -> ParserError {
         ParserError {
             message: msg.into(),
-            span: self.span(),
+            span: self.current_token_span(),
         }
     }
 
@@ -109,7 +116,7 @@ impl Parser {
     #[tracing::instrument(skip(self))]
     pub fn parse_program(&mut self) -> Result<Program, ParserError> {
         let mut items = Vec::new();
-        while !self.at_eof() {
+        while !self.is_at_eof() {
             items.push(self.parse_item()?);
         }
         Ok(Program { items })
@@ -117,26 +124,26 @@ impl Parser {
 
     #[tracing::instrument(skip(self))]
     fn parse_item(&mut self) -> Result<Item, ParserError> {
-        match self.peek() {
+        match self.current_token() {
             TokenKind::Fn => Ok(Item::Function(self.parse_function_decl()?)),
             TokenKind::Extern => Ok(Item::Extern(self.parse_extern_decl()?)),
             TokenKind::Struct => Ok(Item::Struct(self.parse_struct_decl()?)),
             _ => Err(self.error(format!(
                 "expected 'fn', 'extern', or 'struct', got '{}'",
-                self.peek()
+                self.current_token()
             ))),
         }
     }
 
     #[tracing::instrument(skip(self), level = "trace", ret)]
     fn parse_struct_decl(&mut self) -> Result<StructDecl, ParserError> {
-        let start = self.span();
+        let start = self.current_token_span();
         self.expect(&TokenKind::Struct)?;
         let name = self.expect_ident()?;
         self.expect(&TokenKind::LBrace)?;
         let mut fields = Vec::new();
-        while !self.at(&TokenKind::RBrace) && !self.at_eof() {
-            let fs = self.span();
+        while !self.at(&TokenKind::RBrace) && !self.is_at_eof() {
+            let fs = self.current_token_span();
             let fname = self.expect_ident()?;
             self.expect(&TokenKind::Colon)?;
             let ty = self.parse_type()?;
@@ -160,11 +167,11 @@ impl Parser {
 
     #[tracing::instrument(skip(self), level = "trace", ret)]
     fn parse_function_decl(&mut self) -> Result<FunctionDecl, ParserError> {
-        let start = self.span();
+        let start = self.current_token_span();
         self.expect(&TokenKind::Fn)?;
         let name = self.expect_ident()?;
         self.expect(&TokenKind::LParen)?;
-        let params = self.parse_params()?;
+        let (params, _) = self.parse_params(false)?;
         self.expect(&TokenKind::RParen)?;
         let return_type = if self.at(&TokenKind::Arrow) {
             self.advance();
@@ -184,12 +191,12 @@ impl Parser {
 
     #[tracing::instrument(skip(self), level = "trace", ret)]
     fn parse_extern_decl(&mut self) -> Result<ExternDecl, ParserError> {
-        let start = self.span();
+        let start = self.current_token_span();
         self.expect(&TokenKind::Extern)?;
         self.expect(&TokenKind::Fn)?;
         let name = self.expect_ident()?;
         self.expect(&TokenKind::LParen)?;
-        let params = self.parse_params()?;
+        let (params, is_variadic) = self.parse_params(true)?;
         self.expect(&TokenKind::RParen)?;
         let return_type = if self.at(&TokenKind::Arrow) {
             self.advance();
@@ -201,16 +208,27 @@ impl Parser {
         Ok(ExternDecl {
             name,
             params,
+            is_variadic,
             return_type,
             span: start.merge(self.prev_span()),
         })
     }
 
     #[tracing::instrument(skip(self), level = "trace")]
-    fn parse_params(&mut self) -> Result<Vec<Parameter>, ParserError> {
+    fn parse_params(&mut self, allow_elipsis: bool) -> Result<(Vec<Parameter>, bool), ParserError> {
         let mut params = Vec::new();
-        while !self.at(&TokenKind::RParen) && !self.at_eof() {
-            let ps = self.span();
+        let mut is_variadic = false;
+        while !self.at(&TokenKind::RParen) && !self.is_at_eof() {
+            let ps = self.current_token_span();
+            // parsing the vararg elipsis thing
+            // extern fn printf(format: *u8, ...);
+            if allow_elipsis {
+                if let Ok(_) = self.expect(&TokenKind::Ellipsis) {
+                    is_variadic = true;
+                    break;
+                }
+            }
+            // parsing a normal param_name: param_type pair
             let name = self.expect_ident()?;
             self.expect(&TokenKind::Colon)?;
             let ty = self.parse_type()?;
@@ -224,18 +242,18 @@ impl Parser {
             }
             self.advance();
         }
-        Ok(params)
+        Ok((params, is_variadic))
     }
 
     #[tracing::instrument(skip(self), level = "trace")]
     fn parse_block(&mut self) -> Result<Block, ParserError> {
-        let start = self.span();
+        let start = self.current_token_span();
         self.expect(&TokenKind::LBrace)?;
         let mut stmts = Vec::new();
         let mut tail_expr: Option<Box<Expr>> = None;
 
-        while !self.at(&TokenKind::RBrace) && !self.at_eof() {
-            match self.peek() {
+        while !self.at(&TokenKind::RBrace) && !self.is_at_eof() {
+            match self.current_token() {
                 TokenKind::Let => stmts.push(Stmt::Let(self.parse_let_stmt()?)),
                 TokenKind::Return => stmts.push(Stmt::Return(self.parse_return_stmt()?)),
                 TokenKind::Break => stmts.push(Stmt::Break(self.parse_break_stmt()?)),
@@ -243,13 +261,13 @@ impl Parser {
                 TokenKind::Loop => stmts.push(Stmt::Loop(self.parse_loop_stmt()?)),
                 _ => {
                     let expr = self.parse_expression()?;
-                    match self.peek() {
+                    match self.current_token() {
                         TokenKind::Eq
                         | TokenKind::PlusEq
                         | TokenKind::MinusEq
                         | TokenKind::ShlEq
                         | TokenKind::ShrEq => {
-                            let op = match self.peek() {
+                            let op = match self.current_token() {
                                 TokenKind::Eq => AssignOp::Assign,
                                 TokenKind::PlusEq => AssignOp::AddAssign,
                                 TokenKind::MinusEq => AssignOp::SubAssign,
@@ -269,7 +287,7 @@ impl Parser {
                             }));
                         }
                         TokenKind::Semi => {
-                            let span = expr.span.merge(self.span());
+                            let span = expr.span.merge(self.current_token_span());
                             self.advance();
                             stmts.push(Stmt::Expr(ExprStmt { expr, span }));
                         }
@@ -279,7 +297,7 @@ impl Parser {
                         _ => {
                             return Err(self.error(format!(
                                 "expected ';', '=', '+=', '-=', '<<=', '>>=', or '}}', got '{}'",
-                                self.peek()
+                                self.current_token()
                             )));
                         }
                     }
@@ -335,7 +353,7 @@ impl Parser {
 
     #[tracing::instrument(skip(self), level = "trace", ret)]
     fn parse_let_stmt(&mut self) -> Result<LetStmt, ParserError> {
-        let start = self.span();
+        let start = self.current_token_span();
         self.expect(&TokenKind::Let)?;
         let name = self.expect_ident()?;
         let ty = if self.at(&TokenKind::Colon) {
@@ -357,7 +375,7 @@ impl Parser {
 
     #[tracing::instrument(skip(self), level = "trace", ret)]
     fn parse_return_stmt(&mut self) -> Result<ReturnStmt, ParserError> {
-        let start = self.span();
+        let start = self.current_token_span();
         self.expect(&TokenKind::Return)?;
         let value = if !self.at(&TokenKind::Semi) {
             Some(self.parse_expression()?)
@@ -373,7 +391,7 @@ impl Parser {
 
     #[tracing::instrument(skip(self), level = "trace", ret)]
     fn parse_break_stmt(&mut self) -> Result<BreakStmt, ParserError> {
-        let start = self.span();
+        let start = self.current_token_span();
         self.expect(&TokenKind::Break)?;
         self.expect(&TokenKind::Semi)?;
         Ok(BreakStmt {
@@ -383,7 +401,7 @@ impl Parser {
 
     #[tracing::instrument(skip(self), level = "trace", ret)]
     fn parse_continue_stmt(&mut self) -> Result<ContinueStmt, ParserError> {
-        let start = self.span();
+        let start = self.current_token_span();
         self.expect(&TokenKind::Continue)?;
         self.expect(&TokenKind::Semi)?;
         Ok(ContinueStmt {
@@ -393,7 +411,7 @@ impl Parser {
 
     #[tracing::instrument(skip(self), level = "trace", ret)]
     fn parse_loop_stmt(&mut self) -> Result<LoopStmt, ParserError> {
-        let start = self.span();
+        let start = self.current_token_span();
         self.expect(&TokenKind::Loop)?;
         let body = self.parse_block()?;
         Ok(LoopStmt {
@@ -457,7 +475,7 @@ impl Parser {
     #[tracing::instrument(skip(self), level = "trace")]
     fn parse_equality(&mut self) -> Result<Expr, ParserError> {
         let lhs = self.parse_comparison()?;
-        let op = match self.peek() {
+        let op = match self.current_token() {
             TokenKind::EqEq => Some(BinOp::Eq),
             TokenKind::BangEq => Some(BinOp::Neq),
             _ => None,
@@ -482,7 +500,7 @@ impl Parser {
     #[tracing::instrument(skip(self), level = "trace")]
     fn parse_comparison(&mut self) -> Result<Expr, ParserError> {
         let lhs = self.parse_bitwise_or()?;
-        let op = match self.peek() {
+        let op = match self.current_token() {
             TokenKind::Lt => Some(BinOp::Lt),
             TokenKind::Gt => Some(BinOp::Gt),
             TokenKind::LtEq => Some(BinOp::LtEq),
@@ -567,7 +585,7 @@ impl Parser {
     fn parse_shift(&mut self) -> Result<Expr, ParserError> {
         let mut lhs = self.parse_additive()?;
         loop {
-            let op = match self.peek() {
+            let op = match self.current_token() {
                 TokenKind::Shl => BinOp::Shl,
                 TokenKind::Shr => BinOp::Shr,
                 _ => break,
@@ -591,7 +609,7 @@ impl Parser {
     fn parse_additive(&mut self) -> Result<Expr, ParserError> {
         let mut lhs = self.parse_multiplicative()?;
         loop {
-            let op = match self.peek() {
+            let op = match self.current_token() {
                 TokenKind::Plus => BinOp::Add,
                 TokenKind::Minus => BinOp::Sub,
                 _ => break,
@@ -615,7 +633,7 @@ impl Parser {
     fn parse_multiplicative(&mut self) -> Result<Expr, ParserError> {
         let mut lhs = self.parse_cast()?;
         loop {
-            let op = match self.peek() {
+            let op = match self.current_token() {
                 TokenKind::Star => BinOp::Mul,
                 TokenKind::Slash => BinOp::Div,
                 TokenKind::Percent => BinOp::Mod,
@@ -656,7 +674,7 @@ impl Parser {
 
     #[tracing::instrument(skip(self), level = "trace")]
     fn parse_unary(&mut self) -> Result<Expr, ParserError> {
-        let op = match self.peek() {
+        let op = match self.current_token() {
             TokenKind::Minus => Some(UnaryOp::Neg),
             TokenKind::Plus => Some(UnaryOp::Pos),
             TokenKind::Bang => Some(UnaryOp::Not),
@@ -666,7 +684,7 @@ impl Parser {
             _ => None,
         };
         if let Some(op) = op {
-            let start = self.span();
+            let start = self.current_token_span();
             self.advance();
             let expr = self.parse_unary()?;
             let span = start.merge(expr.span);
@@ -677,9 +695,9 @@ impl Parser {
                 },
                 span,
             })
-        } else if matches!(self.peek(), TokenKind::StarStar) {
+        } else if matches!(self.current_token(), TokenKind::StarStar) {
             // Lexer greedily matched ** — treat as two derefs: *(*expr)
-            let start = self.span();
+            let start = self.current_token_span();
             self.advance();
             let inner = self.parse_unary()?;
             let inner_span = start.merge(inner.span);
@@ -726,7 +744,7 @@ impl Parser {
     fn parse_postfix(&mut self) -> Result<Expr, ParserError> {
         let mut expr = self.parse_primary()?;
         loop {
-            match self.peek() {
+            match self.current_token() {
                 TokenKind::LParen => {
                     self.advance();
                     let args = self.parse_arg_list()?;
@@ -755,9 +773,9 @@ impl Parser {
                 }
                 TokenKind::Dot => {
                     self.advance();
-                    match self.peek().clone() {
+                    match self.current_token().clone() {
                         TokenKind::Ident(name) => {
-                            let fs = self.span();
+                            let fs = self.current_token_span();
                             self.advance();
                             let span = expr.span.merge(fs);
                             expr = Expr {
@@ -769,7 +787,7 @@ impl Parser {
                             };
                         }
                         TokenKind::IntLiteral(idx) => {
-                            let is = self.span();
+                            let is = self.current_token_span();
                             self.advance();
                             let span = expr.span.merge(is);
                             expr = Expr {
@@ -783,7 +801,7 @@ impl Parser {
                         _ => {
                             return Err(self.error(format!(
                                 "expected field name or index after '.', got '{}'",
-                                self.peek()
+                                self.current_token()
                             )));
                         }
                     }
@@ -815,9 +833,9 @@ impl Parser {
 
     #[tracing::instrument(skip(self), level = "trace")]
     fn parse_primary(&mut self) -> Result<Expr, ParserError> {
-        match self.peek().clone() {
+        match self.current_token().clone() {
             TokenKind::IntLiteral(v) => {
-                let span = self.span();
+                let span = self.current_token_span();
                 self.advance();
                 Ok(Expr {
                     kind: ExprKind::IntLiteral(v),
@@ -825,7 +843,7 @@ impl Parser {
                 })
             }
             TokenKind::FloatLiteral(v) => {
-                let span = self.span();
+                let span = self.current_token_span();
                 self.advance();
                 Ok(Expr {
                     kind: ExprKind::FloatLiteral(v),
@@ -833,7 +851,7 @@ impl Parser {
                 })
             }
             TokenKind::StringLiteral(s) => {
-                let span = self.span();
+                let span = self.current_token_span();
                 self.advance();
                 Ok(Expr {
                     kind: ExprKind::StringLiteral(s),
@@ -841,7 +859,7 @@ impl Parser {
                 })
             }
             TokenKind::True => {
-                let span = self.span();
+                let span = self.current_token_span();
                 self.advance();
                 Ok(Expr {
                     kind: ExprKind::BoolLiteral(true),
@@ -849,7 +867,7 @@ impl Parser {
                 })
             }
             TokenKind::False => {
-                let span = self.span();
+                let span = self.current_token_span();
                 self.advance();
                 Ok(Expr {
                     kind: ExprKind::BoolLiteral(false),
@@ -868,7 +886,7 @@ impl Parser {
             }
             TokenKind::If => self.parse_if_expression(),
             TokenKind::Ident(name) => {
-                let name_span = self.span();
+                let name_span = self.current_token_span();
                 self.advance();
                 if !self.no_struct && self.at(&TokenKind::LBrace) {
                     self.parse_struct_constructor_rest(name, name_span)
@@ -879,13 +897,16 @@ impl Parser {
                     })
                 }
             }
-            _ => Err(self.error(format!("expected expression, got '{}'", self.peek()))),
+            _ => Err(self.error(format!(
+                "expected expression, got '{}'",
+                self.current_token()
+            ))),
         }
     }
 
     #[tracing::instrument(skip(self), level = "trace")]
     fn parse_paren_expr(&mut self) -> Result<Expr, ParserError> {
-        let start = self.span();
+        let start = self.current_token_span();
         self.expect(&TokenKind::LParen)?;
 
         // Unit: ()
@@ -932,7 +953,7 @@ impl Parser {
 
     #[tracing::instrument(skip(self), level = "trace")]
     fn parse_array_literal(&mut self) -> Result<Expr, ParserError> {
-        let start = self.span();
+        let start = self.current_token_span();
         self.expect(&TokenKind::LBracket)?;
         let first = self.parse_expression()?;
 
@@ -971,8 +992,8 @@ impl Parser {
     ) -> Result<Expr, ParserError> {
         self.expect(&TokenKind::LBrace)?;
         let mut fields = Vec::new();
-        while !self.at(&TokenKind::RBrace) && !self.at_eof() {
-            let fs = self.span();
+        while !self.at(&TokenKind::RBrace) && !self.is_at_eof() {
+            let fs = self.current_token_span();
             let fname = self.expect_ident()?;
             self.expect(&TokenKind::Colon)?;
             let value = self.parse_expression()?;
@@ -998,7 +1019,7 @@ impl Parser {
 
     #[tracing::instrument(skip(self), level = "trace")]
     fn parse_if_expression(&mut self) -> Result<Expr, ParserError> {
-        let start = self.span();
+        let start = self.current_token_span();
         self.expect(&TokenKind::If)?;
         let cond = self.parse_expression_no_struct()?;
         let then_block = self.parse_block()?;
@@ -1021,8 +1042,8 @@ impl Parser {
     // ---- Types ----
     #[tracing::instrument(skip(self), level = "trace")]
     fn parse_type(&mut self) -> Result<Type, ParserError> {
-        let start = self.span();
-        match self.peek().clone() {
+        let start = self.current_token_span();
+        match self.current_token().clone() {
             TokenKind::Ident(name) => {
                 self.advance();
                 Ok(Type {
@@ -1104,7 +1125,11 @@ impl Parser {
                 let mut param_types = Vec::new();
                 if !self.at(&TokenKind::RParen) {
                     loop {
+                        if let Ok(_) = self.expect(&TokenKind::Ellipsis) {
+                            break;
+                        }
                         param_types.push(self.parse_type()?);
+
                         if !self.at(&TokenKind::Comma) {
                             break;
                         }
@@ -1117,16 +1142,23 @@ impl Parser {
                 self.expect(&TokenKind::RParen)?;
                 let ret = if self.at(&TokenKind::Arrow) {
                     self.advance();
-                    Some(Box::new(self.parse_type()?))
+                    Box::new(self.parse_type()?)
                 } else {
-                    None
+                    Box::new(Type {
+                        kind: TypeKind::Unit,
+                        span: self.current_token_span(),
+                    })
                 };
+
                 Ok(Type {
-                    kind: TypeKind::FnPtr(param_types, ret),
+                    kind: TypeKind::Fn {
+                        params: param_types,
+                        result: ret,
+                    },
                     span: start.merge(self.prev_span()),
                 })
             }
-            _ => Err(self.error(format!("expected type, got '{}'", self.peek()))),
+            _ => Err(self.error(format!("expected type, got '{}'", self.current_token()))),
         }
     }
 }
@@ -1138,6 +1170,8 @@ pub fn parse(tokens: &[crate::lexer::token::Token]) -> Result<Program, ParserErr
 
 #[cfg(test)]
 mod tests {
+    use crate::lexer::float::Float;
+
     use super::*;
 
     pub fn parse_source(src: &str) -> Result<Program, ParserError> {
@@ -1538,7 +1572,7 @@ mod tests {
     }
     fn float(v: f64) -> Expr {
         Expr {
-            kind: ExprKind::FloatLiteral(v),
+            kind: ExprKind::FloatLiteral(Float::from(v)),
             span: S,
         }
     }
@@ -1723,7 +1757,7 @@ mod tests {
             struct Vec2 { x: f64, y: f64 }
 
             extern fn sqrt(x: f64) -> f64;
-            extern fn printf(fmt: *u8) -> i32;
+            extern fn printf(fmt: *u8, ...) -> i32;
 
             fn length(v: Vec2) -> f64 {
                 let sq = v.x * v.x + v.y * v.y;
@@ -1789,6 +1823,7 @@ mod tests {
         let item_sqrt = Item::Extern(ExternDecl {
             name: sp("sqrt"),
             params: vec![param("x", named("f64"))],
+            is_variadic: false,
             return_type: Some(named("f64")),
             span: S,
         });
@@ -1796,6 +1831,7 @@ mod tests {
         let item_printf = Item::Extern(ExternDecl {
             name: sp("printf"),
             params: vec![param("fmt", ptr_ty(named("u8")))],
+            is_variadic: true,
             return_type: Some(named("i32")),
             span: S,
         });

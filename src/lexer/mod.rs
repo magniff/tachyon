@@ -3,6 +3,7 @@ use std::fmt;
 use span::Span;
 use token::{Token, TokenKind};
 
+pub mod float;
 pub mod span;
 pub mod token;
 
@@ -111,6 +112,7 @@ impl<'a> Lexer<'a> {
             let kind = match (b, c1, c2) {
                 (b'<', b'<', b'=') => Some(TokenKind::ShlEq),
                 (b'>', b'>', b'=') => Some(TokenKind::ShrEq),
+                (b'.', b'.', b'.') => Some(TokenKind::Ellipsis),
                 _ => None,
             };
             if let Some(kind) = kind {
@@ -384,7 +386,7 @@ impl<'a> Lexer<'a> {
             }
             let value: f64 = fs.parse().map_err(|_| self.err("invalid float"))?;
             return Ok(Token {
-                kind: TokenKind::FloatLiteral(value),
+                kind: TokenKind::FloatLiteral(value.into()),
                 span: Span::new(start, self.pos),
             });
         }
@@ -474,10 +476,10 @@ mod tests {
     fn test_lex_floats() {
         let mut l = Lexer::new("3.14 1.0 2.0e10 1.5e-3");
         let t = l.tokenize().unwrap();
-        assert!(matches!(t[0].kind, TokenKind::FloatLiteral(v) if (v - 3.14).abs() < 1e-10));
-        assert!(matches!(t[1].kind, TokenKind::FloatLiteral(v) if (v - 1.0).abs() < 1e-10));
-        assert!(matches!(t[2].kind, TokenKind::FloatLiteral(v) if (v - 2.0e10).abs() < 1.0));
-        assert!(matches!(t[3].kind, TokenKind::FloatLiteral(v) if (v - 1.5e-3).abs() < 1e-10));
+        assert!(matches!(t[0].kind, TokenKind::FloatLiteral(v) if (*v - 3.14).abs() < 1e-10));
+        assert!(matches!(t[1].kind, TokenKind::FloatLiteral(v) if (*v - 1.0).abs() < 1e-10));
+        assert!(matches!(t[2].kind, TokenKind::FloatLiteral(v) if (*v - 2.0e10).abs() < 1.0));
+        assert!(matches!(t[3].kind, TokenKind::FloatLiteral(v) if (*v - 1.5e-3).abs() < 1e-10));
     }
 
     #[test]
@@ -518,7 +520,7 @@ mod tests {
 
     #[test]
     fn test_lex_operators() {
-        let mut l = Lexer::new("+= -= != == >= <= && || ** -> << >> <<= >>=");
+        let mut l = Lexer::new("+= -= != == >= <= && || ** -> << >> <<= >>= ...");
         let t = l.tokenize().unwrap();
         assert!(matches!(t[0].kind, TokenKind::PlusEq));
         assert!(matches!(t[1].kind, TokenKind::MinusEq));
@@ -534,6 +536,7 @@ mod tests {
         assert!(matches!(t[11].kind, TokenKind::Shr));
         assert!(matches!(t[12].kind, TokenKind::ShlEq));
         assert!(matches!(t[13].kind, TokenKind::ShrEq));
+        assert!(matches!(t[14].kind, TokenKind::Ellipsis));
     }
 
     #[test]

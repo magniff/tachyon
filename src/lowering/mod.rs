@@ -225,7 +225,7 @@ pub fn layout_of(ty: &TypeInternal, structs: &HashMap<String, StructInfo>) -> La
         TypeInternal::I16 | TypeInternal::U16 => Layout { size: 2, align: 2 },
         TypeInternal::I32 | TypeInternal::U32 | TypeInternal::F32 => Layout { size: 4, align: 4 },
         TypeInternal::I64 | TypeInternal::U64 | TypeInternal::F64 => Layout { size: 8, align: 8 },
-        TypeInternal::Pointer(_) | TypeInternal::FnPtr(_, _) => Layout { size: 8, align: 8 },
+        TypeInternal::Pointer(_) | TypeInternal::Fn { .. } => Layout { size: 8, align: 8 },
         TypeInternal::Unit => Layout { size: 0, align: 1 },
         TypeInternal::Tuple(es) => compound_layout(es.iter(), structs),
         TypeInternal::Array(e, n) => {
@@ -282,7 +282,7 @@ pub fn type_internal_to_ir(ty: &TypeInternal) -> Option<IRType> {
         TypeInternal::I64 | TypeInternal::U64 => Some(IRType::I64),
         TypeInternal::F32 => Some(IRType::F32),
         TypeInternal::F64 => Some(IRType::F64),
-        TypeInternal::Pointer(_) | TypeInternal::FnPtr(_, _) => Some(IRType::Ptr),
+        TypeInternal::Pointer(_) | TypeInternal::Fn { .. } => Some(IRType::Ptr),
         _ => None,
     }
 }
@@ -429,14 +429,10 @@ impl<'a> Lowerer<'a> {
             }
             TypeKind::Array(e, n) => TypeInternal::Array(Box::new(self.resolve_ast_type(e)), *n),
             TypeKind::Pointer(i) => TypeInternal::Pointer(Box::new(self.resolve_ast_type(i))),
-            TypeKind::FnPtr(ps, r) => {
-                let pts: Vec<_> = ps.iter().map(|x| self.resolve_ast_type(x)).collect();
-                let rt = r
-                    .as_ref()
-                    .map(|x| self.resolve_ast_type(x))
-                    .unwrap_or(TypeInternal::Unit);
-                TypeInternal::FnPtr(pts, Box::new(rt))
-            }
+            TypeKind::Fn { params, result } => TypeInternal::Fn {
+                params: params.iter().map(|x| self.resolve_ast_type(x)).collect(),
+                result: Box::new(self.resolve_ast_type(result)),
+            },
         }
     }
 
@@ -484,8 +480,8 @@ impl<'a> Lowerer<'a> {
                         return sig.return_ty.clone();
                     }
                 }
-                if let TypeInternal::FnPtr(_, r) = self.expr_ty(callee) {
-                    *r
+                if let TypeInternal::Fn { result, .. } = self.expr_ty(callee) {
+                    *result
                 } else {
                     panic!("ICE")
                 }
@@ -586,8 +582,8 @@ impl<'a> Lowerer<'a> {
                 return sig.params.iter().map(|(_, t)| t.clone()).collect();
             }
         }
-        if let TypeInternal::FnPtr(ps, _) = self.expr_ty(callee) {
-            ps
+        if let TypeInternal::Fn { params, .. } = self.expr_ty(callee) {
+            params
         } else {
             panic!("ICE")
         }
@@ -926,7 +922,7 @@ impl<'a> Lowerer<'a> {
             ExprKind::FloatLiteral(val) => {
                 let ir = type_internal_to_ir(expected).unwrap_or(IRType::F64);
                 let v = self.fresh_vreg();
-                self.emit(Inst::ConstFloat(v, *val, ir));
+                self.emit(Inst::ConstFloat(v, **val, ir));
                 v
             }
             ExprKind::BoolLiteral(b) => {
@@ -1532,17 +1528,20 @@ impl<'a> Lowerer<'a> {
     }
 
     // Function call
-    fn lower_call(&mut self, callee: &Expr, args: &[Expr], expected: &TypeInternal) -> VReg {
+    fn lower_call(&mut self, callee: &Expr, arguments: &[Expr], expected: &TypeInternal) -> VReg {
         let ptys = self.call_param_tys(callee);
-        let mut ir_args = Vec::new();
-        for (i, arg) in args.iter().enumerate() {
-            let pty = &ptys[i];
+        let mut ir_arguments = Vec::new();
+        for (index, argument) in arguments.iter().enumerate() {
+            let pty = match ptys.get(index) {
+                Some(pty) => pty,
+                None => &self.expr_ty(argument),
+            };
             if is_scalar(pty) {
-                let v = self.lower_expr_to_operand(arg, pty);
-                ir_args.push((v, type_internal_to_ir(pty).unwrap()));
+                let v = self.lower_expr_to_operand(argument, pty);
+                ir_arguments.push((v, type_internal_to_ir(pty).unwrap()));
             } else {
-                let addr = self.expr_addr_of(arg, pty);
-                ir_args.push((addr, IRType::Ptr));
+                let addr = self.expr_addr_of(argument, pty);
+                ir_arguments.push((addr, IRType::Ptr));
             }
         }
 
@@ -1562,14 +1561,14 @@ impl<'a> Lowerer<'a> {
                 self.emit(Inst::Call {
                     dst: None,
                     func: n,
-                    args: ir_args,
+                    args: ir_arguments,
                 });
             } else {
                 let cv = self.lower_expr_to_operand(callee, &self.expr_ty(callee));
                 self.emit(Inst::CallIndirect {
                     dst: None,
                     callee: cv,
-                    args: ir_args,
+                    args: ir_arguments,
                 });
             }
             return self.const_zero();
@@ -1585,14 +1584,14 @@ impl<'a> Lowerer<'a> {
             self.emit(Inst::Call {
                 dst: Some((d, ri)),
                 func: n,
-                args: ir_args,
+                args: ir_arguments,
             });
         } else {
             let cv = self.lower_expr_to_operand(callee, &self.expr_ty(callee));
             self.emit(Inst::CallIndirect {
                 dst: Some((d, ri)),
                 callee: cv,
-                args: ir_args,
+                args: ir_arguments,
             });
         }
         d

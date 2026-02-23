@@ -2,10 +2,10 @@ use std::fmt;
 
 use crate::lexer;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenKind {
     IntLiteral(u64),
-    FloatLiteral(f64),
+    FloatLiteral(lexer::float::Float),
     StringLiteral(String),
     Ident(String),
     // Keywords
@@ -37,6 +37,7 @@ pub enum TokenKind {
     Shr,
     ShlEq,
     ShrEq,
+    Ellipsis,
     // Single-char
     Eq,
     Plus,
@@ -67,9 +68,9 @@ pub enum TokenKind {
 impl fmt::Display for TokenKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TokenKind::IntLiteral(v) => write!(f, "{}", v),
-            TokenKind::FloatLiteral(v) => write!(f, "{}", v),
-            TokenKind::StringLiteral(v) => write!(f, "{:?}", v),
+            TokenKind::IntLiteral(v) => write!(f, "{v}"),
+            TokenKind::FloatLiteral(v) => write!(f, "{v}"),
+            TokenKind::StringLiteral(v) => write!(f, "{v:?}"),
             TokenKind::Ident(v) => write!(f, "{}", v),
             TokenKind::Fn => write!(f, "fn"),
             TokenKind::Let => write!(f, "let"),
@@ -98,6 +99,7 @@ impl fmt::Display for TokenKind {
             TokenKind::Shr => write!(f, ">>"),
             TokenKind::ShlEq => write!(f, "<<="),
             TokenKind::ShrEq => write!(f, ">>="),
+            TokenKind::Ellipsis => write!(f, "..."),
             TokenKind::Eq => write!(f, "="),
             TokenKind::Plus => write!(f, "+"),
             TokenKind::Minus => write!(f, "-"),
