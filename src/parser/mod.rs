@@ -1123,9 +1123,15 @@ impl Parser {
                 self.advance();
                 self.expect(&TokenKind::LParen)?;
                 let mut param_types = Vec::new();
+                let mut is_variadic = false;
                 if !self.at(&TokenKind::RParen) {
                     loop {
+                        if let Ok(_) = self.expect(&TokenKind::Ellipsis) {
+                            is_variadic = true;
+                            break;
+                        }
                         param_types.push(self.parse_type()?);
+
                         if !self.at(&TokenKind::Comma) {
                             break;
                         }
@@ -1138,12 +1144,20 @@ impl Parser {
                 self.expect(&TokenKind::RParen)?;
                 let ret = if self.at(&TokenKind::Arrow) {
                     self.advance();
-                    Some(Box::new(self.parse_type()?))
+                    Box::new(self.parse_type()?)
                 } else {
-                    None
+                    Box::new(Type {
+                        kind: TypeKind::Unit,
+                        span: self.current_token_span(),
+                    })
                 };
+
                 Ok(Type {
-                    kind: TypeKind::FnPtr(param_types, ret),
+                    kind: TypeKind::Fn {
+                        params: param_types,
+                        result: ret,
+                        is_variadic,
+                    },
                     span: start.merge(self.prev_span()),
                 })
             }

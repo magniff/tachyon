@@ -85,7 +85,11 @@ pub enum TypeKind {
     Tuple(Vec<Type>),
     Array(Box<Type>, u64),
     Pointer(Box<Type>),
-    FnPtr(Vec<Type>, Option<Box<Type>>),
+    Fn {
+        params: Vec<Type>,
+        result: Box<Type>,
+        is_variadic: bool,
+    },
 }
 
 // --- Statements ---

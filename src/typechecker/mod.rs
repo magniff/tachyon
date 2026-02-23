@@ -38,8 +38,12 @@ pub enum TypeInternal {
     Tuple(Vec<TypeInternal>),
     Array(Box<TypeInternal>, u64),
     Pointer(Box<TypeInternal>),
-    FnPtr(Vec<TypeInternal>, Box<TypeInternal>), // params, return (Unit if none)
-    Struct(String),                              // resolved by name
+    Fn {
+        params: Vec<TypeInternal>,
+        result: Box<TypeInternal>,
+        is_variadic: bool,
+    },
+    Struct(String), // resolved by name
 }
 
 impl fmt::Display for TypeInternal {
@@ -72,7 +76,7 @@ impl fmt::Display for TypeInternal {
             }
             TypeInternal::Array(elem, n) => write!(f, "[{}; {}]", elem, n),
             TypeInternal::Pointer(inner) => write!(f, "*{}", inner),
-            TypeInternal::FnPtr(params, ret) => {
+            TypeInternal::Fn { params, result, .. } => {
                 write!(f, "fn(")?;
                 for (i, p) in params.iter().enumerate() {
                     if i > 0 {
@@ -81,8 +85,8 @@ impl fmt::Display for TypeInternal {
                     write!(f, "{}", p)?;
                 }
                 write!(f, ")")?;
-                if **ret != TypeInternal::Unit {
-                    write!(f, " -> {}", ret)?;
+                if **result != TypeInternal::Unit {
+                    write!(f, " -> {}", result)?;
                 }
                 Ok(())
             }
@@ -423,16 +427,20 @@ impl Typechecker {
                 let inner_ty = self.resolve_type(inner)?;
                 Ok(TypeInternal::Pointer(Box::new(inner_ty)))
             }
-            TypeKind::FnPtr(params, ret) => {
+            TypeKind::Fn {
+                params,
+                result,
+                is_variadic,
+            } => {
                 let mut p = Vec::new();
                 for t in params {
                     p.push(self.resolve_type(t)?);
                 }
-                let r = match ret {
-                    Some(t) => self.resolve_type(t)?,
-                    None => TypeInternal::Unit,
-                };
-                Ok(TypeInternal::FnPtr(p, Box::new(r)))
+                Ok(TypeInternal::Fn {
+                    params: p,
+                    result: Box::new(self.resolve_type(result)?),
+                    is_variadic: *is_variadic,
+                })
             }
         }
     }
@@ -1289,21 +1297,25 @@ impl Typechecker {
         // Indirect call via fn pointer
         let callee_ty = self.synth_expr(callee)?;
         match &callee_ty {
-            TypeInternal::FnPtr(param_tys, ret_ty) => {
-                if args.len() != param_tys.len() {
+            TypeInternal::Fn {
+                params,
+                result,
+                is_variadic,
+            } => {
+                if args.len() != params.len() {
                     return Err(typechecker_error(
                         span,
                         format!(
                             "function pointer expects {} arguments, got {}",
-                            param_tys.len(),
+                            params.len(),
                             args.len()
                         ),
                     ));
                 }
-                for (arg, pty) in args.iter().zip(param_tys.iter()) {
+                for (arg, pty) in args.iter().zip(params.iter()) {
                     self.check_expr(arg, pty)?;
                 }
-                Ok(*ret_ty.clone())
+                Ok(*result.clone())
             }
             _ => Err(typechecker_error(
                 callee.span,

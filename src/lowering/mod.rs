@@ -225,7 +225,7 @@ pub fn layout_of(ty: &TypeInternal, structs: &HashMap<String, StructInfo>) -> La
         TypeInternal::I16 | TypeInternal::U16 => Layout { size: 2, align: 2 },
         TypeInternal::I32 | TypeInternal::U32 | TypeInternal::F32 => Layout { size: 4, align: 4 },
         TypeInternal::I64 | TypeInternal::U64 | TypeInternal::F64 => Layout { size: 8, align: 8 },
-        TypeInternal::Pointer(_) | TypeInternal::FnPtr(_, _) => Layout { size: 8, align: 8 },
+        TypeInternal::Pointer(_) | TypeInternal::Fn { .. } => Layout { size: 8, align: 8 },
         TypeInternal::Unit => Layout { size: 0, align: 1 },
         TypeInternal::Tuple(es) => compound_layout(es.iter(), structs),
         TypeInternal::Array(e, n) => {
@@ -282,7 +282,7 @@ pub fn type_internal_to_ir(ty: &TypeInternal) -> Option<IRType> {
         TypeInternal::I64 | TypeInternal::U64 => Some(IRType::I64),
         TypeInternal::F32 => Some(IRType::F32),
         TypeInternal::F64 => Some(IRType::F64),
-        TypeInternal::Pointer(_) | TypeInternal::FnPtr(_, _) => Some(IRType::Ptr),
+        TypeInternal::Pointer(_) | TypeInternal::Fn { .. } => Some(IRType::Ptr),
         _ => None,
     }
 }
@@ -429,14 +429,15 @@ impl<'a> Lowerer<'a> {
             }
             TypeKind::Array(e, n) => TypeInternal::Array(Box::new(self.resolve_ast_type(e)), *n),
             TypeKind::Pointer(i) => TypeInternal::Pointer(Box::new(self.resolve_ast_type(i))),
-            TypeKind::FnPtr(ps, r) => {
-                let pts: Vec<_> = ps.iter().map(|x| self.resolve_ast_type(x)).collect();
-                let rt = r
-                    .as_ref()
-                    .map(|x| self.resolve_ast_type(x))
-                    .unwrap_or(TypeInternal::Unit);
-                TypeInternal::FnPtr(pts, Box::new(rt))
-            }
+            TypeKind::Fn {
+                params,
+                result,
+                is_variadic,
+            } => TypeInternal::Fn {
+                params: params.iter().map(|x| self.resolve_ast_type(x)).collect(),
+                result: Box::new(self.resolve_ast_type(result)),
+                is_variadic: *is_variadic,
+            },
         }
     }
 
@@ -484,8 +485,8 @@ impl<'a> Lowerer<'a> {
                         return sig.return_ty.clone();
                     }
                 }
-                if let TypeInternal::FnPtr(_, r) = self.expr_ty(callee) {
-                    *r
+                if let TypeInternal::Fn { result, .. } = self.expr_ty(callee) {
+                    *result
                 } else {
                     panic!("ICE")
                 }
@@ -586,8 +587,8 @@ impl<'a> Lowerer<'a> {
                 return sig.params.iter().map(|(_, t)| t.clone()).collect();
             }
         }
-        if let TypeInternal::FnPtr(ps, _) = self.expr_ty(callee) {
-            ps
+        if let TypeInternal::Fn { params, .. } = self.expr_ty(callee) {
+            params
         } else {
             panic!("ICE")
         }
