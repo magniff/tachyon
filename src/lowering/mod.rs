@@ -926,7 +926,7 @@ impl<'a> Lowerer<'a> {
             ExprKind::FloatLiteral(val) => {
                 let ir = type_internal_to_ir(expected).unwrap_or(IRType::F64);
                 let v = self.fresh_vreg();
-                self.emit(Inst::ConstFloat(v, *val, ir));
+                self.emit(Inst::ConstFloat(v, **val, ir));
                 v
             }
             ExprKind::BoolLiteral(b) => {

@@ -1,4 +1,4 @@
-use crate::lexer::span::Span;
+use crate::lexer::{span::Span, token::Float};
 
 pub type Spanned<T> = (T, Span);
 
@@ -50,6 +50,7 @@ impl std::fmt::Debug for FunctionDecl {
 pub struct ExternDecl {
     pub name: Spanned<String>,
     pub params: Vec<Parameter>,
+    pub is_variadic: bool,
     pub return_type: Option<Type>,
     pub span: Span,
 }
@@ -71,7 +72,6 @@ pub struct Parameter {
 }
 
 // --- Types ---
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct Type {
     pub kind: TypeKind,
@@ -233,7 +233,7 @@ pub struct FieldInit {
 #[derive(Debug, PartialEq)]
 pub enum ExprKind {
     IntLiteral(u64),
-    FloatLiteral(f64),
+    FloatLiteral(Float),
     StringLiteral(String),
     BoolLiteral(bool),
     UnitLiteral,

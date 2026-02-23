@@ -2,10 +2,38 @@ use std::fmt;
 
 use crate::lexer;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy)]
+pub struct Float(pub f64);
+
+impl std::fmt::Display for Float {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl PartialEq for Float {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_bits() == other.0.to_bits()
+    }
+}
+impl Eq for Float {}
+impl From<f64> for Float {
+    fn from(value: f64) -> Self {
+        Self(value)
+    }
+}
+
+impl std::ops::Deref for Float {
+    type Target = f64;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenKind {
     IntLiteral(u64),
-    FloatLiteral(f64),
+    FloatLiteral(Float),
     StringLiteral(String),
     Ident(String),
     // Keywords
@@ -37,6 +65,7 @@ pub enum TokenKind {
     Shr,
     ShlEq,
     ShrEq,
+    Ellipsis,
     // Single-char
     Eq,
     Plus,
@@ -67,9 +96,9 @@ pub enum TokenKind {
 impl fmt::Display for TokenKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TokenKind::IntLiteral(v) => write!(f, "{}", v),
-            TokenKind::FloatLiteral(v) => write!(f, "{}", v),
-            TokenKind::StringLiteral(v) => write!(f, "{:?}", v),
+            TokenKind::IntLiteral(v) => write!(f, "{v}"),
+            TokenKind::FloatLiteral(v) => write!(f, "{v}"),
+            TokenKind::StringLiteral(v) => write!(f, "{v:?}"),
             TokenKind::Ident(v) => write!(f, "{}", v),
             TokenKind::Fn => write!(f, "fn"),
             TokenKind::Let => write!(f, "let"),
@@ -98,6 +127,7 @@ impl fmt::Display for TokenKind {
             TokenKind::Shr => write!(f, ">>"),
             TokenKind::ShlEq => write!(f, "<<="),
             TokenKind::ShrEq => write!(f, ">>="),
+            TokenKind::Ellipsis => write!(f, "..."),
             TokenKind::Eq => write!(f, "="),
             TokenKind::Plus => write!(f, "+"),
             TokenKind::Minus => write!(f, "-"),
