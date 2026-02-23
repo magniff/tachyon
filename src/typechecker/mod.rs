@@ -171,6 +171,7 @@ pub struct FnSig {
     pub name: String,
     pub params: Vec<(String, TypeInternal)>,
     pub return_ty: TypeInternal,
+    pub is_variadic: bool,
 }
 
 // Scope / variable environment
@@ -219,7 +220,7 @@ impl TypingEnvironment {
 
 pub struct Typechecker {
     structs: HashMap<String, StructInfo>,
-    functions: HashMap<String, FnSig>,
+    signatures: HashMap<String, FnSig>,
     env: TypingEnvironment,
     return_ty: TypeInternal, // current function's return type
     loop_depth: u32,         // for break/continue validation
@@ -230,7 +231,7 @@ impl Typechecker {
     pub fn check_program(program: &Program) -> Result<CheckedProgram, Vec<TypecheckerError>> {
         let mut checker = Typechecker {
             structs: HashMap::new(),
-            functions: HashMap::new(),
+            signatures: HashMap::new(),
             env: TypingEnvironment::new(),
             return_ty: TypeInternal::Unit,
             loop_depth: 0,
@@ -258,7 +259,7 @@ impl Typechecker {
         if checker.errors.is_empty() {
             Ok(CheckedProgram {
                 structs: checker.structs,
-                functions: checker.functions,
+                functions: checker.signatures,
             })
         } else {
             Err(checker.errors)
@@ -367,12 +368,18 @@ impl Typechecker {
 
     fn collect_functions(&mut self, program: &Program) {
         for item in &program.items {
-            let (name, params_ast, ret_ast, span) = match item {
-                Item::Function(fd) => (&fd.name, &fd.params, &fd.return_type, fd.span),
-                Item::Extern(ed) => (&ed.name, &ed.params, &ed.return_type, ed.span),
+            let (name, params_ast, ret_ast, span, is_variadic) = match item {
+                Item::Function(fd) => (&fd.name, &fd.params, &fd.return_type, fd.span, false),
+                Item::Extern(ed) => (
+                    &ed.name,
+                    &ed.params,
+                    &ed.return_type,
+                    ed.span,
+                    ed.is_variadic,
+                ),
                 Item::Struct(_) => continue,
             };
-            if self.functions.contains_key(&name.0) {
+            if self.signatures.contains_key(&name.0) {
                 self.errors.push(typechecker_error(
                     span,
                     format!("duplicate function '{}'", name.0),
@@ -396,12 +403,13 @@ impl Typechecker {
                 },
                 None => TypeInternal::Unit,
             };
-            self.functions.insert(
+            self.signatures.insert(
                 name.0.clone(),
                 FnSig {
                     name: name.0.clone(),
                     params,
                     return_ty,
+                    is_variadic,
                 },
             );
         }
@@ -473,7 +481,7 @@ impl Typechecker {
     fn check_function_bodies(&mut self, program: &Program) {
         for item in &program.items {
             if let Item::Function(fd) = item {
-                let sig = self.functions.get(&fd.name.0).unwrap().clone();
+                let sig = self.signatures.get(&fd.name.0).unwrap().clone();
                 self.return_ty = sig.return_ty.clone();
                 self.loop_depth = 0;
                 self.env = TypingEnvironment::new();
@@ -1275,8 +1283,8 @@ impl Typechecker {
     ) -> TypecheckerResult<TypeInternal> {
         // Direct function call by name
         if let ExprKind::Ident(name) = &callee.kind {
-            if let Some(sig) = self.functions.get(name).cloned() {
-                if args.len() != sig.params.len() {
+            if let Some(sig) = self.signatures.get(name).cloned() {
+                if args.len() > sig.params.len() && !sig.is_variadic {
                     return Err(typechecker_error(
                         span,
                         format!(
