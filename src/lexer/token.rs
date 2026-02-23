@@ -2,38 +2,10 @@ use std::fmt;
 
 use crate::lexer;
 
-#[derive(Debug, Clone, Copy)]
-pub struct Float(pub f64);
-
-impl std::fmt::Display for Float {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl PartialEq for Float {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.to_bits() == other.0.to_bits()
-    }
-}
-impl Eq for Float {}
-impl From<f64> for Float {
-    fn from(value: f64) -> Self {
-        Self(value)
-    }
-}
-
-impl std::ops::Deref for Float {
-    type Target = f64;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenKind {
     IntLiteral(u64),
-    FloatLiteral(Float),
+    FloatLiteral(lexer::float::Float),
     StringLiteral(String),
     Ident(String),
     // Keywords

@@ -1159,7 +1159,7 @@ pub fn parse(tokens: &[crate::lexer::token::Token]) -> Result<Program, ParserErr
 
 #[cfg(test)]
 mod tests {
-    use crate::lexer::token::Float;
+    use crate::lexer::float::Float;
 
     use super::*;
 

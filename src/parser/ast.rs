@@ -1,4 +1,4 @@
-use crate::lexer::{span::Span, token::Float};
+use crate::lexer::{float::Float, span::Span};
 
 pub type Spanned<T> = (T, Span);
 

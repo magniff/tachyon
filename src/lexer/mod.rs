@@ -3,6 +3,7 @@ use std::fmt;
 use span::Span;
 use token::{Token, TokenKind};
 
+pub mod float;
 pub mod span;
 pub mod token;
 
