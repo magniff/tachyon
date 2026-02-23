@@ -1,0 +1,207 @@
+// ============================================================
+// Conway's Game of Life — Tachyon edition
+// ============================================================
+// Ported from C. Uses raw pointer arithmetic for the cell grid,
+// builds each frame in a heap buffer, single write() per frame.
+// ANSI 24-bit color: alive cells are white, dead cells fade
+// from blue to black based on how long they've been dead.
+
+extern fn write(fd: i32, buf: *u8, count: u64) -> i64;
+extern fn malloc(size: u64) -> *u8;
+extern fn rand() -> i32;
+extern fn srand(seed: i64);
+extern fn time(t: *u8) -> i64;
+extern fn ioctl(fd: i32, req: i64, arg: *u8) -> i32;
+extern fn exit(status: i32);
+
+// ---- output buffer helpers ----
+
+fn bput(b: *u8, p: i64, v: u8) -> i64 {
+    *((b as u64 + p as u64) as *u8) = v;
+    p + 1
+}
+
+fn bnum(b: *u8, p: i64, n: i64) -> i64 {
+    if n >= 100 {
+        let p1: i64 = bput(b, p,  (n / 100 % 10 + 48) as u8);
+        let p2: i64 = bput(b, p1, (n / 10 % 10 + 48) as u8);
+        bput(b, p2, (n % 10 + 48) as u8)
+    } else {
+        if n >= 10 {
+            let p1: i64 = bput(b, p, (n / 10 + 48) as u8);
+            bput(b, p1, (n % 10 + 48) as u8)
+        } else {
+            bput(b, p, (n + 48) as u8)
+        }
+    }
+}
+
+fn bstr(buf: *u8, pos: i64, s: (*u8, u64)) -> i64 {
+    let i: i64 = 0;
+    loop {
+        if i >= s.1 as i64 { break; };
+        *((buf as u64 + (pos + i) as u64) as *u8) =
+            *((s.0 as u64 + i as u64) as *u8);
+        i += 1;
+    }
+    pos + s.1 as i64
+}
+
+// Write: ESC[48;2;R;G;Bm<space>
+fn bcolor(buf: *u8, pos: i64, r: i64, g: i64, b: i64) -> i64 {
+    let p: i64 = bstr(buf, pos, "\x1B[48;2;");
+    let p: i64 = bnum(buf, p, r);
+    let p: i64 = bput(buf, p, 59);
+    let p: i64 = bnum(buf, p, g);
+    let p: i64 = bput(buf, p, 59);
+    let p: i64 = bnum(buf, p, b);
+    let p: i64 = bput(buf, p, 109);
+    bput(buf, p, 32)
+}
+
+fn print(s: (*u8, u64)) {
+    write(1, s.0, s.1);
+}
+
+// ---- cell grid ----
+// Layout per cell: 4 bytes [state0, age0, state1, age1]
+// state: 0=dead, 1=alive.  age: ticks since death (0-255).
+
+fn cell(cells: *u8, x: i64, y: i64, w: i64, h: i64) -> *u8 {
+    let nx: i64 = ((x % w) + w) % w;
+    let ny: i64 = ((y % h) + h) % h;
+    ((cells as u64) + ((ny * w + nx) * 4) as u64) as *u8
+}
+
+fn st(c: *u8, i: i64) -> i64  { (*((c as u64 + (i * 2) as u64) as *u8)) as i64 }
+fn ag(c: *u8, i: i64) -> i64  { (*((c as u64 + (i * 2 + 1) as u64) as *u8)) as i64 }
+
+fn set_st(c: *u8, i: i64, v: i64) { *((c as u64 + (i * 2) as u64) as *u8) = v as u8; }
+fn set_ag(c: *u8, i: i64, v: i64) { *((c as u64 + (i * 2 + 1) as u64) as *u8) = v as u8; }
+
+// ---- main ----
+
+fn main() -> i64 {
+    srand(time(0 as *u8));
+
+    // terminal size via ioctl(STDOUT, TIOCGWINSZ, &ws)
+    let ws: [u8; 8] = [0; 8];
+    let wsp: *u8 = &ws as *u8;
+    if ioctl(1, 21523, wsp) as i64 != 0 {
+        print("ioctl failed\n");
+        exit(1);
+    };
+
+    // winsize: [u16 rows, u16 cols, u16 xpix, u16 ypix] (little-endian)
+    let h: i64 = ((*wsp) as u64 +
+        (*((wsp as u64 + 1) as *u8)) as u64 * 256) as i64;
+    let w: i64 = ((*((wsp as u64 + 2) as *u8)) as u64 +
+        (*((wsp as u64 + 3) as *u8)) as u64 * 256) as i64;
+
+    // allocate cell grid
+    let cells: *u8 = malloc((w * h * 4) as u64);
+
+    // random init
+    let iy: i64 = 0;
+    loop {
+        if iy >= h { break; };
+        let ix: i64 = 0;
+        loop {
+            if ix >= w { break; };
+            let c: *u8 = cell(cells, ix, iy, w, h);
+            let alive: i64 = if (rand() as i64) % 2 == 0 { 1 } else { 0 };
+            set_st(c, 0, alive); set_ag(c, 0, 0);
+            set_st(c, 1, alive); set_ag(c, 1, 0);
+            ix += 1;
+        }
+        iy += 1;
+    }
+
+    // frame buffer: worst case ~22 bytes per cell + cursor reset
+    let fb: *u8 = malloc((w * h * 24 + 64) as u64);
+
+    // hide cursor
+    print("\x1B[?25l");
+
+    let gen: i64 = 0;
+    loop {
+        let cur: i64 = gen % 2;
+        let nxt: i64 = 1 - cur;
+
+        // ---- compute next generation ----
+        let cy: i64 = 0;
+        loop {
+            if cy >= h { break; };
+            let cx: i64 = 0;
+            loop {
+                if cx >= w { break; };
+                // count live neighbors
+                let nn: i64 = 0;
+                let dy: i64 = -1;
+                loop {
+                    if dy > 1 { break; };
+                    let dx: i64 = -1;
+                    loop {
+                        if dx > 1 { break; };
+                        if dx != 0 || dy != 0 {
+                            if st(cell(cells, cx + dx, cy + dy, w, h), cur) == 1 {
+                                nn += 1;
+                            };
+                        };
+                        dx += 1;
+                    }
+                    dy += 1;
+                }
+
+                let c: *u8 = cell(cells, cx, cy, w, h);
+                if st(c, cur) == 1 {
+                    if nn < 2 || nn > 3 {
+                        set_st(c, nxt, 0);
+                        set_ag(c, nxt, 1);
+                    } else {
+                        set_st(c, nxt, 1);
+                        set_ag(c, nxt, 0);
+                    };
+                } else {
+                    if nn == 3 {
+                        set_st(c, nxt, 1);
+                        set_ag(c, nxt, 0);
+                    } else {
+                        let a: i64 = ag(c, cur);
+                        set_st(c, nxt, 0);
+                        if a < 255 {
+                            set_ag(c, nxt, a + 1);
+                        } else {
+                            set_ag(c, nxt, 255);
+                        };
+                    };
+                };
+                cx += 1;
+            }
+            cy += 1;
+        }
+
+        // ---- render into frame buffer ----
+        let pos: i64 = 0;
+        let ci: i64 = 0;
+        loop {
+            if ci >= w * h { break; };
+            let c: *u8 = ((cells as u64) + (ci * 4) as u64) as *u8;
+            if st(c, cur) == 1 {
+                pos = bcolor(fb, pos, 255, 255, 255);
+            } else {
+                let color: i64 = 255 - ag(c, cur);
+                pos = bcolor(fb, pos, color / 2, color / 5, color);
+            };
+            ci += 1;
+        }
+
+        // cursor home
+        pos = bstr(fb, pos, "\x1B[1;1H");
+
+        // flush
+        write(1, fb, pos as u64);
+        gen += 1;
+    }
+    0
+}
