@@ -1533,17 +1533,20 @@ impl<'a> Lowerer<'a> {
     }
 
     // Function call
-    fn lower_call(&mut self, callee: &Expr, args: &[Expr], expected: &TypeInternal) -> VReg {
+    fn lower_call(&mut self, callee: &Expr, arguments: &[Expr], expected: &TypeInternal) -> VReg {
         let ptys = self.call_param_tys(callee);
-        let mut ir_args = Vec::new();
-        for (i, arg) in args.iter().enumerate() {
-            let pty = &ptys[i];
+        let mut ir_arguments = Vec::new();
+        for (index, argument) in arguments.iter().enumerate() {
+            let pty = match ptys.get(index) {
+                Some(pty) => pty,
+                None => &self.expr_ty(argument),
+            };
             if is_scalar(pty) {
-                let v = self.lower_expr_to_operand(arg, pty);
-                ir_args.push((v, type_internal_to_ir(pty).unwrap()));
+                let v = self.lower_expr_to_operand(argument, pty);
+                ir_arguments.push((v, type_internal_to_ir(pty).unwrap()));
             } else {
-                let addr = self.expr_addr_of(arg, pty);
-                ir_args.push((addr, IRType::Ptr));
+                let addr = self.expr_addr_of(argument, pty);
+                ir_arguments.push((addr, IRType::Ptr));
             }
         }
 
@@ -1563,14 +1566,14 @@ impl<'a> Lowerer<'a> {
                 self.emit(Inst::Call {
                     dst: None,
                     func: n,
-                    args: ir_args,
+                    args: ir_arguments,
                 });
             } else {
                 let cv = self.lower_expr_to_operand(callee, &self.expr_ty(callee));
                 self.emit(Inst::CallIndirect {
                     dst: None,
                     callee: cv,
-                    args: ir_args,
+                    args: ir_arguments,
                 });
             }
             return self.const_zero();
@@ -1586,14 +1589,14 @@ impl<'a> Lowerer<'a> {
             self.emit(Inst::Call {
                 dst: Some((d, ri)),
                 func: n,
-                args: ir_args,
+                args: ir_arguments,
             });
         } else {
             let cv = self.lower_expr_to_operand(callee, &self.expr_ty(callee));
             self.emit(Inst::CallIndirect {
                 dst: Some((d, ri)),
                 callee: cv,
-                args: ir_args,
+                args: ir_arguments,
             });
         }
         d
