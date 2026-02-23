@@ -6,62 +6,13 @@
 // ANSI 24-bit color: alive cells are white, dead cells fade
 // from blue to black based on how long they've been dead.
 
-extern fn write(fd: i32, buf: *u8, count: u64) -> i64;
+extern fn printf(fmt: *u8, ...) -> i32;
 extern fn malloc(size: u64) -> *u8;
 extern fn rand() -> i32;
 extern fn srand(seed: i64);
 extern fn time(t: *u8) -> i64;
 extern fn ioctl(fd: i32, req: i64, arg: *u8) -> i32;
 extern fn exit(status: i32);
-
-// ---- output buffer helpers ----
-
-fn bput(b: *u8, p: i64, v: u8) -> i64 {
-    *((b as u64 + p as u64) as *u8) = v;
-    p + 1
-}
-
-fn bnum(b: *u8, p: i64, n: i64) -> i64 {
-    if n >= 100 {
-        let p1: i64 = bput(b, p,  (n / 100 % 10 + 48) as u8);
-        let p2: i64 = bput(b, p1, (n / 10 % 10 + 48) as u8);
-        bput(b, p2, (n % 10 + 48) as u8)
-    } else {
-        if n >= 10 {
-            let p1: i64 = bput(b, p, (n / 10 + 48) as u8);
-            bput(b, p1, (n % 10 + 48) as u8)
-        } else {
-            bput(b, p, (n + 48) as u8)
-        }
-    }
-}
-
-fn bstr(buf: *u8, pos: i64, s: (*u8, u64)) -> i64 {
-    let i: i64 = 0;
-    loop {
-        if i >= s.1 as i64 { break; };
-        *((buf as u64 + (pos + i) as u64) as *u8) =
-            *((s.0 as u64 + i as u64) as *u8);
-        i += 1;
-    }
-    pos + s.1 as i64
-}
-
-// Write: ESC[48;2;R;G;Bm<space>
-fn bcolor(buf: *u8, pos: i64, r: i64, g: i64, b: i64) -> i64 {
-    let p: i64 = bstr(buf, pos, "\x1B[48;2;");
-    let p: i64 = bnum(buf, p, r);
-    let p: i64 = bput(buf, p, 59);
-    let p: i64 = bnum(buf, p, g);
-    let p: i64 = bput(buf, p, 59);
-    let p: i64 = bnum(buf, p, b);
-    let p: i64 = bput(buf, p, 109);
-    bput(buf, p, 32)
-}
-
-fn print(s: (*u8, u64)) {
-    write(1, s.0, s.1);
-}
 
 // ---- cell grid ----
 // Layout per cell: 4 bytes [state0, age0, state1, age1]
@@ -79,29 +30,23 @@ fn ag(c: *u8, i: i64) -> i64  { (*((c as u64 + (i * 2 + 1) as u64) as *u8)) as i
 fn set_st(c: *u8, i: i64, v: i64) { *((c as u64 + (i * 2) as u64) as *u8) = v as u8; }
 fn set_ag(c: *u8, i: i64, v: i64) { *((c as u64 + (i * 2 + 1) as u64) as *u8) = v as u8; }
 
-// ---- main ----
-
 fn main() -> i64 {
     srand(time(0 as *u8));
 
-    // terminal size via ioctl(STDOUT, TIOCGWINSZ, &ws)
     let ws: [u8; 8] = [0; 8];
     let wsp: *u8 = &ws as *u8;
     if ioctl(1, 21523, wsp) as i64 != 0 {
-        print("ioctl failed\n");
+        printf("ioctl failed\n".0);
         exit(1);
     };
 
-    // winsize: [u16 rows, u16 cols, u16 xpix, u16 ypix] (little-endian)
     let h: i64 = ((*wsp) as u64 +
         (*((wsp as u64 + 1) as *u8)) as u64 * 256) as i64;
     let w: i64 = ((*((wsp as u64 + 2) as *u8)) as u64 +
         (*((wsp as u64 + 3) as *u8)) as u64 * 256) as i64;
 
-    // allocate cell grid
     let cells: *u8 = malloc((w * h * 4) as u64);
 
-    // random init
     let iy: i64 = 0;
     loop {
         if iy >= h { break; };
@@ -117,11 +62,7 @@ fn main() -> i64 {
         iy += 1;
     }
 
-    // frame buffer: worst case ~22 bytes per cell + cursor reset
-    let fb: *u8 = malloc((w * h * 24 + 64) as u64);
-
-    // hide cursor
-    print("\x1B[?25l");
+    printf("\x1B[?25l".0);
 
     let gen: i64 = 0;
     loop {
@@ -135,7 +76,6 @@ fn main() -> i64 {
             let cx: i64 = 0;
             loop {
                 if cx >= w { break; };
-                // count live neighbors
                 let nn: i64 = 0;
                 let dy: i64 = -1;
                 loop {
@@ -181,26 +121,21 @@ fn main() -> i64 {
             cy += 1;
         }
 
-        // ---- render into frame buffer ----
-        let pos: i64 = 0;
+        // ---- render ----
         let ci: i64 = 0;
         loop {
             if ci >= w * h { break; };
             let c: *u8 = ((cells as u64) + (ci * 4) as u64) as *u8;
             if st(c, cur) == 1 {
-                pos = bcolor(fb, pos, 255, 255, 255);
+                printf("\x1B[48;2;255;255;255m ".0);
             } else {
                 let color: i64 = 255 - ag(c, cur);
-                pos = bcolor(fb, pos, color / 2, color / 5, color);
+                printf("\x1B[48;2;%d;%d;%dm ".0, color / 2, color / 5, color);
             };
             ci += 1;
         }
 
-        // cursor home
-        pos = bstr(fb, pos, "\x1B[1;1H");
-
-        // flush
-        write(1, fb, pos as u64);
+        printf("\x1B[1;1H".0);
         gen += 1;
     }
     0
