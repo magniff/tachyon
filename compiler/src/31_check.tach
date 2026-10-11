@@ -1,0 +1,1455 @@
+// Type checker: declarations, then every function body. Bidirectional,
+// like the reference checker (seed/src/typechecker): `check` pushes an expected
+// type into an expression (literals, aggregates, branches, arithmetic
+// operands take it), `synth` computes a type from the expression alone.
+// Every expression node gets its type in `ty`: the expected type in check
+// mode, the computed one in synth mode. The first error ends the
+// compilation.
+//
+// Resolutions recorded on nodes:
+//   E_IDENT  x = R_LOCAL / R_CONST / R_STATIC / R_FN, y = its index
+//   E_CALL   x = function + 1 for a direct call, 0 for a call through a value
+//   E_FIELD  x = field index
+//   E_BREAK, E_CONTINUE  x = the loop node
+//   E_LOOP   x = 1 if it has a break, y = the type of its break values
+//   P_BIND, PARAM  x = the local
+
+const R_LOCAL: i64 = 1;
+const R_CONST: i64 = 2;
+const R_STATIC: i64 = 3;
+const R_FN: i64 = 4;
+
+struct Local { name: i64, ty: i64, mutable: bool, is_param: bool, offset: i64 }
+
+static mut LOCALS: *Local = 0 as *Local;
+static mut LOCAL_COUNT: i64 = 0;
+static mut LOCAL_CAP: i64 = 0;
+// Locals in scope (innermost last), and where each scope starts in it.
+static mut ENV: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut SCOPES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut LOOP_STACK: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut RETURN_TYPE: i64 = 0;
+// In constant expressions no locals are visible.
+static mut CONST_CONTEXT: bool = false;
+static mut PROGRAM: i64 = 0;
+
+// ---- Errors ----
+
+fn type_error(n: i64, message: *u8) -> ! {
+    error_at(NODES[n].start, message)
+}
+
+fn mismatch_error(n: i64, expected: i64, actual: i64) -> ! {
+    err_begin(NODES[n].start);
+    err_str(c"expected '");
+    err_type(expected);
+    err_str(c"', got '");
+    err_type(actual);
+    err_str(c"'");
+    err_end()
+}
+
+// `message` followed by `, got '<type>'`.
+fn type_error_got(n: i64, message: *u8, t: i64) -> ! {
+    err_begin(NODES[n].start);
+    err_str(message);
+    err_str(c", got '");
+    err_type(t);
+    err_str(c"'");
+    err_end()
+}
+
+fn name_error(pos: i64, before: *u8, name: i64, after: *u8) -> ! {
+    err_begin(pos);
+    err_str(before);
+    err_sym(name);
+    err_str(after);
+    err_end()
+}
+
+// ---- Scopes ----
+
+fn push_scope() {
+    intvec_push(&SCOPES, ENV.count);
+}
+
+fn pop_scope() {
+    ENV.count = intvec_pop(&SCOPES);
+}
+
+fn define_local(name: i64, ty: i64, mutable: bool, is_param: bool) -> i64 {
+    LOCALS = grow(LOCALS as *u8, LOCAL_COUNT, &LOCAL_CAP, 40) as *Local;
+    let id = LOCAL_COUNT;
+    LOCALS[id] = Local { name: name, ty: ty, mutable: mutable, is_param: is_param, offset: 0 };
+    LOCAL_COUNT += 1;
+    intvec_push(&ENV, id);
+    id
+}
+
+// The innermost local named `name`, or -1.
+fn lookup_local(name: i64) -> i64 {
+    if CONST_CONTEXT {
+        return -1;
+    }
+    let mut i = ENV.count - 1;
+    while i >= 0 {
+        let id = ENV.data[i];
+        if LOCALS[id].name == name {
+            return id;
+        }
+        i -= 1;
+    }
+    -1
+}
+
+// ---- Declarations ----
+
+fn check_program(program: i64) {
+    PROGRAM = program;
+    collect_names();
+    collect_const_types();
+    collect_structs();
+    collect_aliases();
+    check_struct_cycles();
+    collect_functions();
+    collect_statics();
+    evaluate_consts();
+    for i in 0..NODES[program].count {
+        let item = child(program, i);
+        if NODES[item].kind == I_FN {
+            check_function(item);
+        }
+    }
+}
+
+fn duplicate_error(item: i64, kind: *u8) -> ! {
+    err_begin(NODES[item].start);
+    err_str(c"duplicate ");
+    err_str(kind);
+    err_str(c" '");
+    err_sym(NODES[item].a);
+    err_str(c"'");
+    err_end()
+}
+
+fn collect_names() {
+    for i in 0..NODES[PROGRAM].count {
+        let item = child(PROGRAM, i);
+        let kind = NODES[item].kind;
+        let name = NODES[item].a;
+        if kind == I_STRUCT || kind == I_TYPE {
+            if SYM_STRUCT[name] != 0 || SYM_ALIAS[name] != 0 || SYM_PRIMITIVE[name] != 0 {
+                duplicate_error(item, if kind == I_STRUCT { c"struct" } else { c"type" });
+            }
+            if kind == I_STRUCT {
+                add_struct(item);
+            } else {
+                SYM_ALIAS[name] = item;
+            }
+            continue;
+        }
+        if SYM_FN[name] != 0 || SYM_CONST[name] != 0 || SYM_STATIC[name] != 0 {
+            if kind == I_CONST {
+                duplicate_error(item, c"constant");
+            }
+            if kind == I_STATIC {
+                duplicate_error(item, c"static");
+            }
+            duplicate_error(item, c"function");
+        }
+        if kind == I_FN || kind == I_EXTERN {
+            FNS = grow(FNS as *u8, FN_COUNT, &FN_CAP, 56) as *FnInfo;
+            FNS[FN_COUNT] = FnInfo {
+                name: name, node: item, params: 0, param_count: 0, ret: TY_UNIT,
+                variadic: NODES[item].d != 0, is_extern: kind == I_EXTERN,
+            };
+            FN_COUNT += 1;
+            SYM_FN[name] = FN_COUNT;
+        } else if kind == I_CONST {
+            CONSTS = grow(CONSTS as *u8, CONST_COUNT, &CONST_CAP, 32) as *ConstInfo;
+            CONSTS[CONST_COUNT] = ConstInfo { node: item, ty: 0, value: 0, state: 0 };
+            CONST_COUNT += 1;
+            SYM_CONST[name] = CONST_COUNT;
+        } else if kind == I_STATIC {
+            STATICS = grow(STATICS as *u8, STATIC_COUNT, &STATIC_CAP, 24) as *StaticInfo;
+            STATICS[STATIC_COUNT] = StaticInfo { node: item, ty: 0, mutable: NODES[item].d != 0 };
+            STATIC_COUNT += 1;
+            SYM_STATIC[name] = STATIC_COUNT;
+        }
+    }
+}
+
+fn add_struct(item: i64) {
+    STRUCTS = grow(STRUCTS as *u8, STRUCT_COUNT, &STRUCT_CAP, 40) as *StructInfo;
+    STRUCTS[STRUCT_COUNT] = StructInfo {
+        name: NODES[item].a, node: item, fields: 0, field_count: 0, layout_state: 0,
+    };
+    STRUCT_COUNT += 1;
+    SYM_STRUCT[NODES[item].a] = STRUCT_COUNT;
+}
+
+fn collect_const_types() {
+    for c in 0..CONST_COUNT {
+        let item = CONSTS[c].node;
+        let ty = resolve_type(NODES[item].b);
+        if !(is_numeric(ty) || ty == TY_BOOL) {
+            err_begin(NODES[NODES[item].b].start);
+            err_str(c"constant '");
+            err_sym(NODES[item].a);
+            err_str(c"' has type '");
+            err_type(ty);
+            err_str(c"'; constants must be integers, floats or bool");
+            err_end();
+        }
+        CONSTS[c].ty = ty;
+    }
+}
+
+fn collect_structs() {
+    for s in 0..STRUCT_COUNT {
+        let item = STRUCTS[s].node;
+        STRUCTS[s].fields = FIELD_COUNT;
+        for i in 0..NODES[item].count {
+            let field = child(item, i);
+            for j in 0..i {
+                if NODES[child(item, j)].a == NODES[field].a {
+                    err_begin(NODES[field].start);
+                    err_str(c"duplicate field '");
+                    err_sym(NODES[field].a);
+                    err_str(c"' in struct '");
+                    err_sym(NODES[item].a);
+                    err_str(c"'");
+                    err_end();
+                }
+            }
+            let ty = resolve_type(NODES[field].b);
+            FIELDS = grow(FIELDS as *u8, FIELD_COUNT, &FIELD_CAP, 24) as *FieldInfo;
+            FIELDS[FIELD_COUNT] = FieldInfo { name: NODES[field].a, ty: ty, offset: 0 };
+            FIELD_COUNT += 1;
+        }
+        STRUCTS[s].field_count = NODES[item].count;
+    }
+}
+
+fn collect_aliases() {
+    for i in 0..NODES[PROGRAM].count {
+        let item = child(PROGRAM, i);
+        if NODES[item].kind == I_TYPE {
+            resolve_named(NODES[item].a, NODES[item].start);
+        }
+    }
+}
+
+fn check_struct_cycles() {
+    for s in 0..STRUCT_COUNT {
+        for t in 0..STRUCT_COUNT {
+            STRUCTS[t].layout_state = 0;
+        }
+        if struct_has_cycle(s) {
+            err_begin(NODES[STRUCTS[s].node].start);
+            err_str(c"struct '");
+            err_sym(STRUCTS[s].name);
+            err_str(c"' has infinite size due to recursive field (use a pointer to break the cycle)");
+            err_end();
+        }
+    }
+}
+
+// layout_state: 1 while visiting.
+fn struct_has_cycle(s: i64) -> bool {
+    if STRUCTS[s].layout_state == 1 {
+        return true;
+    }
+    STRUCTS[s].layout_state = 1;
+    for i in 0..STRUCTS[s].field_count {
+        if embeds_cycle((*struct_field(s, i)).ty) {
+            return true;
+        }
+    }
+    STRUCTS[s].layout_state = 0;
+    false
+}
+
+fn embeds_cycle(t: i64) -> bool {
+    let kind = TYPES[t].kind;
+    if kind == TY_STRUCT {
+        return struct_has_cycle(TYPES[t].a);
+    }
+    if kind == TY_ARRAY {
+        return embeds_cycle(TYPES[t].a);
+    }
+    if kind == TY_TUPLE {
+        for i in 0..TYPES[t].count {
+            if embeds_cycle(type_elem(t, i)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn collect_functions() {
+    for f in 0..FN_COUNT {
+        let item = FNS[f].node;
+        let mark = TSCRATCH.count;
+        for i in 0..NODES[item].count {
+            let param = child(item, i);
+            let name = NODES[param].a;
+            if name != UNDERSCORE {
+                for j in 0..i {
+                    if NODES[child(item, j)].a == name {
+                        name_error(NODES[param].start, c"duplicate parameter '", name, c"'");
+                    }
+                }
+            }
+            intvec_push(&TSCRATCH, resolve_type(NODES[param].b));
+        }
+        FNS[f].params = TLISTS.count;
+        FNS[f].param_count = TSCRATCH.count - mark;
+        for i in mark..TSCRATCH.count {
+            intvec_push(&TLISTS, TSCRATCH.data[i]);
+        }
+        TSCRATCH.count = mark;
+        FNS[f].ret = if NODES[item].b == 0 { TY_UNIT } else { resolve_type(NODES[item].b) };
+    }
+}
+
+fn collect_statics() {
+    for s in 0..STATIC_COUNT {
+        let item = STATICS[s].node;
+        let ty = resolve_type(NODES[item].b);
+        STATICS[s].ty = ty;
+        check_const_expr(NODES[item].c, ty);
+        // Evaluated now to report non-constant initializers; the code
+        // generator evaluates it again into the data section.
+        let scratch = buf_new();
+        const_emit(NODES[item].c, ty, scratch);
+    }
+}
+
+fn evaluate_consts() {
+    for c in 0..CONST_COUNT {
+        const_value(c);
+    }
+}
+
+// ---- Resolving types ----
+
+fn resolve_type(n: i64) -> i64 {
+    let kind = NODES[n].kind;
+    if kind == T_NAME {
+        return resolve_named(NODES[n].a, NODES[n].start);
+    }
+    if kind == T_UNIT { return TY_UNIT; }
+    if kind == T_NEVER { return TY_NEVER; }
+    if kind == T_PTR {
+        return ptr_to(resolve_type(NODES[n].a));
+    }
+    if kind == T_ARRAY {
+        let elem = resolve_type(NODES[n].a);
+        return array_of(elem, eval_array_len(NODES[n].b));
+    }
+    let mark = TSCRATCH.count;
+    for i in 0..NODES[n].count {
+        let elem = resolve_type(child(n, i));
+        intvec_push(&TSCRATCH, elem);
+    }
+    if kind == T_TUPLE {
+        return make_type(TY_TUPLE, 0, 0, mark);
+    }
+    let result = resolve_type(NODES[n].a);
+    make_type(TY_FN, result, 0, mark)
+}
+
+fn resolve_named(name: i64, pos: i64) -> i64 {
+    if SYM_PRIMITIVE[name] != 0 {
+        return SYM_PRIMITIVE[name];
+    }
+    if SYM_STRUCT[name] != 0 {
+        return struct_type(SYM_STRUCT[name] - 1);
+    }
+    if ALIAS_TYPE[name] != 0 {
+        return ALIAS_TYPE[name];
+    }
+    let alias = SYM_ALIAS[name];
+    if alias == 0 {
+        name_error(pos, c"unknown type '", name, c"'");
+    }
+    if ALIAS_BUSY[name] != 0 {
+        name_error(pos, c"type alias '", name, c"' is defined in terms of itself");
+    }
+    ALIAS_BUSY[name] = 1;
+    let resolved = resolve_type(NODES[alias].b);
+    ALIAS_BUSY[name] = 0;
+    ALIAS_TYPE[name] = resolved;
+    resolved
+}
+
+// ---- Functions ----
+
+fn check_function(item: i64) {
+    let f = SYM_FN[NODES[item].a] - 1;
+    RETURN_TYPE = FNS[f].ret;
+    LOOP_STACK.count = 0;
+    ENV.count = 0;
+    SCOPES.count = 0;
+    for i in 0..NODES[item].count {
+        let param = child(item, i);
+        if NODES[param].a != UNDERSCORE {
+            NODES[param].x = define_local(NODES[param].a, fn_param(f, i), NODES[param].c != 0, true);
+        } else {
+            NODES[param].x = -1;
+        }
+    }
+    let body = NODES[item].c;
+    let body_ty = check_block(body, RETURN_TYPE);
+    if body_ty != RETURN_TYPE && body_ty != TY_NEVER {
+        err_begin(NODES[body].start);
+        err_str(c"function '");
+        err_sym(NODES[item].a);
+        err_str(c"' body has type '");
+        err_type(body_ty);
+        err_str(c"', expected '");
+        err_type(RETURN_TYPE);
+        err_str(c"'");
+        err_end();
+    }
+}
+
+// The type of a block; `expected` (0 for none) goes to its tail.
+fn check_block(block: i64, expected: i64) -> i64 {
+    push_scope();
+    let mut diverges = false;
+    for i in 0..NODES[block].count {
+        if check_stmt(child(block, i)) {
+            diverges = true;
+        }
+    }
+    let tail = NODES[block].a;
+    let mut ty = TY_UNIT;
+    if tail != 0 {
+        ty = if expected != 0 { check_expr(tail, expected) } else { synth_expr(tail) };
+    }
+    pop_scope();
+    NODES[block].ty = if diverges { TY_NEVER } else { ty };
+    NODES[block].ty
+}
+
+fn check_branch(block: i64, expected: i64) -> i64 {
+    let ty = check_block(block, expected);
+    if ty != expected && ty != TY_NEVER {
+        mismatch_error(block, expected, ty);
+    }
+    ty
+}
+
+// Whether the statement diverges.
+fn check_stmt(stmt: i64) -> bool {
+    if NODES[stmt].kind == S_LET {
+        return check_let(stmt);
+    }
+    let expr = NODES[stmt].a;
+    let ty = if NODES[stmt].b != 0 { synth_expr(expr) } else { check_expr(expr, TY_UNIT) };
+    ty == TY_NEVER
+}
+
+fn check_let(stmt: i64) -> bool {
+    let init = NODES[stmt].c;
+    let mut binding_ty = 0;
+    let mut actual = 0;
+    if NODES[stmt].b != 0 {
+        binding_ty = resolve_type(NODES[stmt].b);
+        actual = check_expr(init, binding_ty);
+    } else {
+        binding_ty = synth_expr(init);
+        actual = binding_ty;
+    }
+    bind_pattern(NODES[stmt].a, binding_ty);
+    actual == TY_NEVER
+}
+
+fn bind_pattern(pattern: i64, ty: i64) {
+    let kind = NODES[pattern].kind;
+    NODES[pattern].ty = ty;
+    if kind == P_WILD {
+        return;
+    }
+    if kind == P_BIND {
+        NODES[pattern].x = define_local(NODES[pattern].a, ty, NODES[pattern].b != 0, false);
+        return;
+    }
+    let count = NODES[pattern].count;
+    if ty == TY_NEVER {
+        for i in 0..count {
+            bind_pattern(child(pattern, i), TY_NEVER);
+        }
+        return;
+    }
+    if TYPES[ty].kind != TY_TUPLE || TYPES[ty].count != count {
+        err_begin(NODES[pattern].start);
+        err_str(c"a tuple pattern with ");
+        err_int(count);
+        err_str(c" elements cannot bind a value of type '");
+        err_type(ty);
+        err_str(c"'");
+        err_end();
+    }
+    for i in 0..count {
+        bind_pattern(child(pattern, i), type_elem(ty, i));
+    }
+}
+
+// ---- Check mode ----
+
+fn passes_expected_to_operands(op: i64, expected: i64) -> bool {
+    if op == TK_PLUS || op == TK_MINUS || op == TK_STAR || op == TK_SLASH || op == TK_PERCENT {
+        return is_numeric(expected);
+    }
+    if op == TK_AMP || op == TK_PIPE || op == TK_CARET {
+        return is_integer(expected);
+    }
+    false
+}
+
+// Checks `n` against `expected`; returns `expected`, or `!` when the
+// expression diverges.
+fn check_expr(n: i64, expected: i64) -> i64 {
+    let actual = check_expr_inner(n, expected);
+    NODES[n].ty = expected;
+    actual
+}
+
+fn check_expr_inner(n: i64, expected: i64) -> i64 {
+    let kind = NODES[n].kind;
+    if kind == E_INT && NODES[n].b == SUF_NONE && is_integer(expected) {
+        check_int_fits(n, NODES[n].a as u64, expected);
+        return expected;
+    }
+    if kind == E_CHAR && is_integer(expected) {
+        check_int_fits(n, NODES[n].a as u64, expected);
+        return expected;
+    }
+    if kind == E_FLOAT && NODES[n].b == SUF_NONE && is_float(expected) {
+        return expected;
+    }
+    if kind == E_TUPLE && TYPES[expected].kind == TY_TUPLE {
+        check_tuple(n, expected);
+        return expected;
+    }
+    if kind == E_ARRAY && TYPES[expected].kind == TY_ARRAY {
+        check_array(n, expected);
+        return expected;
+    }
+    if kind == E_REPEAT && TYPES[expected].kind == TY_ARRAY {
+        check_expr(NODES[n].a, TYPES[expected].a);
+        let count = eval_array_len(NODES[n].b);
+        if count != TYPES[expected].b {
+            err_begin(NODES[NODES[n].b].start);
+            err_str(c"array repeat count is ");
+            err_int(count);
+            err_str(c", expected ");
+            err_int(TYPES[expected].b);
+            err_end();
+        }
+        return expected;
+    }
+    if kind == E_STRUCT {
+        check_struct_literal(n, expected);
+        return expected;
+    }
+    if kind == E_IF {
+        return check_if(n, expected);
+    }
+    if kind == E_BLOCK {
+        return check_branch(n, expected);
+    }
+    if kind == E_LOOP {
+        return check_loop(n, expected);
+    }
+    if kind == E_BINARY && passes_expected_to_operands(NODES[n].a, expected) {
+        check_expr(NODES[n].b, expected);
+        check_expr(NODES[n].c, expected);
+        return expected;
+    }
+    if kind == E_BINARY && (NODES[n].a == TK_SHL || NODES[n].a == TK_SHR) && is_integer(expected) {
+        check_expr(NODES[n].b, expected);
+        check_shift_amount(NODES[n].c);
+        return expected;
+    }
+    if kind == E_UNARY && NODES[n].a == TK_MINUS && is_numeric(expected) {
+        check_negation(n, expected);
+        return expected;
+    }
+    if kind == E_UNARY && NODES[n].a == TK_TILDE && is_integer(expected) {
+        check_expr(NODES[n].b, expected);
+        return expected;
+    }
+    let actual = synth_expr(n);
+    if actual == TY_NEVER {
+        return actual;
+    }
+    if actual != expected {
+        mismatch_error(n, expected, actual);
+    }
+    expected
+}
+
+fn check_int_fits(n: i64, value: u64, ty: i64) {
+    if value > int_max(ty) {
+        err_begin(NODES[n].start);
+        err_str(c"integer literal ");
+        buf_uint(ERR, value);
+        err_str(c" does not fit in type '");
+        err_type(ty);
+        err_str(c"'");
+        err_end();
+    }
+}
+
+fn check_tuple(n: i64, expected: i64) {
+    let count = NODES[n].count;
+    if count != TYPES[expected].count {
+        err_begin(NODES[n].start);
+        err_str(c"tuple has ");
+        err_int(count);
+        err_str(c" elements, expected ");
+        err_int(TYPES[expected].count);
+        err_end();
+    }
+    for i in 0..count {
+        check_expr(child(n, i), type_elem(expected, i));
+    }
+}
+
+fn check_array(n: i64, expected: i64) {
+    let count = NODES[n].count;
+    if count != TYPES[expected].b {
+        err_begin(NODES[n].start);
+        err_str(c"array has ");
+        err_int(count);
+        err_str(c" elements, expected ");
+        err_int(TYPES[expected].b);
+        err_end();
+    }
+    for i in 0..count {
+        check_expr(child(n, i), TYPES[expected].a);
+    }
+}
+
+fn check_struct_literal(n: i64, expected: i64) {
+    let name = NODES[n].a;
+    if TYPES[expected].kind == TY_STRUCT && STRUCTS[TYPES[expected].a].name != name {
+        err_begin(NODES[n].start);
+        err_str(c"expected struct '");
+        err_sym(STRUCTS[TYPES[expected].a].name);
+        err_str(c"', got constructor for '");
+        err_sym(name);
+        err_str(c"'");
+        err_end();
+    }
+    let actual = check_struct_fields(n);
+    if actual != expected {
+        mismatch_error(n, expected, actual);
+    }
+}
+
+// The fields of `Name { ... }`: each exactly once, with its declared type.
+fn check_struct_fields(n: i64) -> i64 {
+    let name = NODES[n].a;
+    if SYM_STRUCT[name] == 0 {
+        name_error(NODES[n].start, c"unknown struct '", name, c"'");
+    }
+    let s = SYM_STRUCT[name] - 1;
+    for i in 0..NODES[n].count {
+        let init = child(n, i);
+        for j in 0..i {
+            if NODES[child(n, j)].a == NODES[init].a {
+                name_error(NODES[init].start, c"duplicate field '", NODES[init].a, c"' in constructor");
+            }
+        }
+        let field = find_field(s, NODES[init].a);
+        if field < 0 {
+            err_begin(NODES[init].start);
+            err_str(c"unknown field '");
+            err_sym(NODES[init].a);
+            err_str(c"' in struct '");
+            err_sym(name);
+            err_str(c"'");
+            err_end();
+        }
+        NODES[init].x = field;
+        check_expr(NODES[init].b, (*struct_field(s, field)).ty);
+    }
+    for f in 0..STRUCTS[s].field_count {
+        let mut found = false;
+        for i in 0..NODES[n].count {
+            if NODES[child(n, i)].x == f {
+                found = true;
+            }
+        }
+        if !found {
+            err_begin(NODES[n].start);
+            err_str(c"missing field '");
+            err_sym((*struct_field(s, f)).name);
+            err_str(c"' in struct '");
+            err_sym(name);
+            err_str(c"' constructor");
+            err_end();
+        }
+    }
+    struct_type(s)
+}
+
+fn check_if(n: i64, expected: i64) -> i64 {
+    check_expr(NODES[n].a, TY_BOOL);
+    let else_block = NODES[n].c;
+    if else_block == 0 {
+        if expected != TY_UNIT {
+            err_begin(NODES[n].start);
+            err_str(c"if without else must have type '()', expected '");
+            err_type(expected);
+            err_str(c"'");
+            err_end();
+        }
+        check_branch(NODES[n].b, TY_UNIT);
+        return expected;
+    }
+    let then_ty = check_branch(NODES[n].b, expected);
+    let else_ty = check_branch(else_block, expected);
+    if then_ty == TY_NEVER && else_ty == TY_NEVER { TY_NEVER } else { expected }
+}
+
+fn check_negation(n: i64, expected: i64) {
+    let operand = NODES[n].b;
+    if NODES[operand].kind == E_INT && NODES[operand].b == SUF_NONE && is_signed(expected) {
+        let value = NODES[operand].a as u64;
+        let magnitude: u64 = if value == 0 { 0 } else { value - 1 };
+        if magnitude > int_max(expected) {
+            err_begin(NODES[n].start);
+            err_str(c"integer literal -");
+            buf_uint(ERR, value);
+            err_str(c" does not fit in type '");
+            err_type(expected);
+            err_str(c"'");
+            err_end();
+        }
+        NODES[operand].ty = expected;
+        return;
+    }
+    check_expr(operand, expected);
+}
+
+fn check_shift_amount(amount: i64) {
+    let ty = synth_expr(amount);
+    if !is_integer(ty) {
+        type_error_got(amount, c"shift amount must be integer", ty);
+    }
+}
+
+// ---- Synth mode ----
+
+fn synth_expr(n: i64) -> i64 {
+    let ty = synth_expr_inner(n);
+    NODES[n].ty = ty;
+    ty
+}
+
+fn synth_expr_inner(n: i64) -> i64 {
+    let kind = NODES[n].kind;
+    if kind == E_INT || kind == E_FLOAT {
+        if NODES[n].b != SUF_NONE {
+            return suffixed_literal(n, false);
+        }
+        return if kind == E_INT { TY_I64 } else { TY_F64 };
+    }
+    if kind == E_CHAR { return TY_U8; }
+    if kind == E_BOOL { return TY_BOOL; }
+    if kind == E_UNIT { return TY_UNIT; }
+    if kind == E_STR { return TY_STRING; }
+    if kind == E_CSTR { return TY_U8_PTR; }
+    if kind == E_IDENT { return synth_name(n); }
+    if kind == E_BINARY { return synth_binary(n); }
+    if kind == E_UNARY { return synth_unary(n); }
+    if kind == E_CAST { return synth_cast(n); }
+    if kind == E_CALL { return synth_call(n); }
+    if kind == E_INDEX { return synth_index(n); }
+    if kind == E_FIELD { return synth_field(n); }
+    if kind == E_TUPLE_FIELD { return synth_tuple_field(n); }
+    if kind == E_TUPLE {
+        let mark = TSCRATCH.count;
+        for i in 0..NODES[n].count {
+            let elem = synth_expr(child(n, i));
+            intvec_push(&TSCRATCH, elem);
+        }
+        return make_type(TY_TUPLE, 0, 0, mark);
+    }
+    if kind == E_ARRAY { return synth_array(n); }
+    if kind == E_REPEAT {
+        let elem = synth_expr(NODES[n].a);
+        return array_of(elem, eval_array_len(NODES[n].b));
+    }
+    if kind == E_STRUCT { return check_struct_fields(n); }
+    if kind == E_BLOCK { return check_block(n, 0); }
+    if kind == E_IF { return synth_if(n); }
+    if kind == E_LOOP { return check_loop(n, 0); }
+    if kind == E_WHILE { return check_while(n); }
+    if kind == E_FOR { return check_for(n); }
+    if kind == E_RANGE {
+        type_error(n, c"ranges can only be used as the bounds of a 'for' loop");
+    }
+    if kind == E_ASSIGN {
+        check_assign(n);
+        return TY_UNIT;
+    }
+    if kind == E_RETURN { return check_return(n); }
+    if kind == E_BREAK {
+        check_break(n);
+        return TY_NEVER;
+    }
+    // E_CONTINUE
+    NODES[n].x = find_loop(n, c"continue");
+    TY_NEVER
+}
+
+fn suffix_type(suffix: i64) -> i64 {
+    if suffix == SUF_I8 { return TY_I8; }
+    if suffix == SUF_I16 { return TY_I16; }
+    if suffix == SUF_I32 { return TY_I32; }
+    if suffix == SUF_I64 || suffix == SUF_ISIZE { return TY_I64; }
+    if suffix == SUF_U8 { return TY_U8; }
+    if suffix == SUF_U16 { return TY_U16; }
+    if suffix == SUF_U32 { return TY_U32; }
+    if suffix == SUF_U64 || suffix == SUF_USIZE { return TY_U64; }
+    if suffix == SUF_F32 { return TY_F32; }
+    TY_F64
+}
+
+// `1u8`, `2.5f32`; `negated` allows `-128i8`.
+fn suffixed_literal(n: i64, negated: bool) -> i64 {
+    let ty = suffix_type(NODES[n].b);
+    if NODES[n].kind == E_INT && is_integer(ty) {
+        let value = NODES[n].a as u64;
+        let mut limit = value;
+        if negated && is_signed(ty) && value > 0 {
+            limit = value - 1;
+        }
+        if limit > int_max(ty) {
+            err_begin(NODES[n].start);
+            err_str(c"integer literal ");
+            if negated {
+                err_str(c"-");
+            }
+            buf_uint(ERR, value);
+            err_str(c" does not fit in type '");
+            err_type(ty);
+            err_str(c"'");
+            err_end();
+        }
+    }
+    ty
+}
+
+fn synth_name(n: i64) -> i64 {
+    let name = NODES[n].a;
+    let local = lookup_local(name);
+    if local >= 0 {
+        NODES[n].x = R_LOCAL;
+        NODES[n].y = local;
+        return LOCALS[local].ty;
+    }
+    if SYM_CONST[name] != 0 {
+        NODES[n].x = R_CONST;
+        NODES[n].y = SYM_CONST[name] - 1;
+        return CONSTS[NODES[n].y].ty;
+    }
+    if SYM_STATIC[name] != 0 {
+        NODES[n].x = R_STATIC;
+        NODES[n].y = SYM_STATIC[name] - 1;
+        return STATICS[NODES[n].y].ty;
+    }
+    if SYM_FN[name] != 0 {
+        let f = SYM_FN[name] - 1;
+        if FNS[f].variadic {
+            name_error(NODES[n].start, c"variadic function '", name, c"' cannot be used as a value");
+        }
+        NODES[n].x = R_FN;
+        NODES[n].y = f;
+        return fn_value_type(f);
+    }
+    name_error(NODES[n].start, c"undefined variable '", name, c"'")
+}
+
+fn fn_value_type(f: i64) -> i64 {
+    let mark = TSCRATCH.count;
+    for i in 0..FNS[f].param_count {
+        intvec_push(&TSCRATCH, fn_param(f, i));
+    }
+    make_type(TY_FN, FNS[f].ret, 0, mark)
+}
+
+fn is_valid_cast(from: i64, to: i64) -> bool {
+    if is_numeric(from) && is_numeric(to) { return true; }
+    if is_pointer(from) && is_pointer(to) { return true; }
+    if is_integer(from) && is_pointer(to) { return true; }
+    if is_pointer(from) && is_integer(to) { return true; }
+    if from == TY_BOOL && is_integer(to) { return true; }
+    from == TY_NEVER
+}
+
+fn synth_cast(n: i64) -> i64 {
+    let operand = NODES[n].a;
+    let from = synth_expr(operand);
+    let to = resolve_type(NODES[n].b);
+    if !is_valid_cast(from, to) {
+        err_begin(NODES[operand].start);
+        err_str(c"cannot cast '");
+        err_type(from);
+        err_str(c"' to '");
+        err_type(to);
+        err_str(c"'");
+        err_end();
+    }
+    to
+}
+
+fn synth_index(n: i64) -> i64 {
+    let base = NODES[n].a;
+    let base_ty = synth_expr(base);
+    let base_kind = TYPES[base_ty].kind;
+    if base_kind != TY_ARRAY && base_kind != TY_PTR {
+        err_begin(NODES[base].start);
+        err_str(c"cannot index type '");
+        err_type(base_ty);
+        err_str(c"'");
+        err_end();
+    }
+    let index_ty = synth_expr(NODES[n].b);
+    if !is_integer(index_ty) {
+        err_begin(NODES[NODES[n].b].start);
+        err_str(c"index must be integer, got '");
+        err_type(index_ty);
+        err_str(c"'");
+        err_end();
+    }
+    TYPES[base_ty].a
+}
+
+fn synth_field(n: i64) -> i64 {
+    let base_ty = synth_expr(NODES[n].a);
+    let name = NODES[n].b;
+    if TYPES[base_ty].kind != TY_STRUCT {
+        err_begin(NODES[n].start);
+        err_str(c"cannot access field '");
+        err_sym(name);
+        err_str(c"' on type '");
+        err_type(base_ty);
+        err_str(c"'");
+        err_end();
+    }
+    let s = TYPES[base_ty].a;
+    let field = find_field(s, name);
+    if field < 0 {
+        err_begin(NODES[n].start);
+        err_str(c"struct '");
+        err_sym(STRUCTS[s].name);
+        err_str(c"' has no field '");
+        err_sym(name);
+        err_str(c"'");
+        err_end();
+    }
+    NODES[n].x = field;
+    (*struct_field(s, field)).ty
+}
+
+fn synth_tuple_field(n: i64) -> i64 {
+    let base_ty = synth_expr(NODES[n].a);
+    let index = NODES[n].b;
+    if TYPES[base_ty].kind != TY_TUPLE {
+        err_begin(NODES[n].start);
+        err_str(c"cannot use tuple index on type '");
+        err_type(base_ty);
+        err_str(c"'");
+        err_end();
+    }
+    if index >= TYPES[base_ty].count {
+        err_begin(NODES[n].start);
+        err_str(c"tuple index ");
+        err_int(index);
+        err_str(c" out of range for tuple with ");
+        err_int(TYPES[base_ty].count);
+        err_str(c" elements");
+        err_end();
+    }
+    type_elem(base_ty, index)
+}
+
+fn synth_array(n: i64) -> i64 {
+    let count = NODES[n].count;
+    if count == 0 {
+        type_error(n, c"cannot infer the type of an empty array; annotate it");
+    }
+    let elem = synth_expr(child(n, 0));
+    for i in 1..count {
+        check_expr(child(n, i), elem);
+    }
+    array_of(elem, count)
+}
+
+fn synth_if(n: i64) -> i64 {
+    check_expr(NODES[n].a, TY_BOOL);
+    let then_ty = check_block(NODES[n].b, 0);
+    let else_block = NODES[n].c;
+    if else_block == 0 {
+        if then_ty != TY_UNIT && then_ty != TY_NEVER {
+            type_error_got(n, c"if without else must have type '()'", then_ty);
+        }
+        return TY_UNIT;
+    }
+    let else_ty = check_block(else_block, 0);
+    if then_ty == TY_NEVER {
+        return else_ty;
+    }
+    if else_ty == TY_NEVER || then_ty == else_ty {
+        return then_ty;
+    }
+    err_begin(NODES[n].start);
+    err_str(c"if/else branches have different types: '");
+    err_type(then_ty);
+    err_str(c"' vs '");
+    err_type(else_ty);
+    err_str(c"'");
+    err_end()
+}
+
+// ---- Operators ----
+
+fn is_untyped_literal(n: i64) -> bool {
+    let kind = NODES[n].kind;
+    if (kind == E_INT || kind == E_FLOAT) && NODES[n].b == SUF_NONE {
+        return true;
+    }
+    if kind == E_CHAR {
+        return true;
+    }
+    if kind == E_UNARY && NODES[n].a == TK_MINUS {
+        return is_untyped_literal(NODES[n].b);
+    }
+    false
+}
+
+fn literal_takes_rhs_type(lhs: i64, rhs: i64) -> bool {
+    is_untyped_literal(lhs) && !is_untyped_literal(rhs)
+}
+
+// The common type of a non-shift operator's operands.
+fn synth_operands(lhs: i64, rhs: i64) -> i64 {
+    if literal_takes_rhs_type(lhs, rhs) {
+        let rhs_ty = synth_expr(rhs);
+        check_expr(lhs, rhs_ty);
+        return rhs_ty;
+    }
+    let lhs_ty = synth_expr(lhs);
+    check_expr(rhs, lhs_ty);
+    lhs_ty
+}
+
+fn synth_binary(n: i64) -> i64 {
+    let op = NODES[n].a;
+    let lhs = NODES[n].b;
+    let rhs = NODES[n].c;
+    if op == TK_SHL || op == TK_SHR {
+        let value_ty = synth_expr(lhs);
+        let amount_ty = synth_expr(rhs);
+        if !is_integer(value_ty) {
+            type_error_got(n, c"shift operator requires integer type", value_ty);
+        }
+        if !is_integer(amount_ty) {
+            type_error_got(n, c"shift amount must be integer", amount_ty);
+        }
+        return value_ty;
+    }
+    let ty = synth_operands(lhs, rhs);
+    if op == TK_PLUS || op == TK_MINUS || op == TK_STAR || op == TK_SLASH || op == TK_PERCENT {
+        if !is_numeric(ty) {
+            type_error_got(n, c"arithmetic operator requires numeric type", ty);
+        }
+        return ty;
+    }
+    if op == TK_LT || op == TK_GT || op == TK_LT_EQ || op == TK_GT_EQ {
+        if !(is_numeric(ty) || is_pointer(ty)) {
+            type_error_got(n, c"comparison requires numeric type", ty);
+        }
+        return TY_BOOL;
+    }
+    if op == TK_EQ_EQ || op == TK_BANG_EQ {
+        if !(is_numeric(ty) || ty == TY_BOOL || is_pointer(ty) || is_fn_type(ty)) {
+            type_error_got(n, c"equality requires numeric, bool, or pointer type", ty);
+        }
+        return TY_BOOL;
+    }
+    if op == TK_AMP_AMP || op == TK_PIPE_PIPE {
+        if ty != TY_BOOL {
+            type_error_got(n, c"logical operator requires bool", ty);
+        }
+        return TY_BOOL;
+    }
+    if !is_integer(ty) {
+        type_error_got(n, c"bitwise operator requires integer type", ty);
+    }
+    ty
+}
+
+fn synth_unary(n: i64) -> i64 {
+    let op = NODES[n].a;
+    let operand = NODES[n].b;
+    if op == TK_MINUS {
+        let mut ty = 0;
+        if NODES[operand].kind == E_INT && NODES[operand].b != SUF_NONE {
+            ty = suffixed_literal(operand, true);
+            NODES[operand].ty = ty;
+        } else {
+            ty = synth_expr(operand);
+        }
+        if !is_numeric(ty) {
+            type_error_got(n, c"unary '-' requires numeric type", ty);
+        }
+        return ty;
+    }
+    if op == TK_BANG {
+        check_expr(operand, TY_BOOL);
+        return TY_BOOL;
+    }
+    if op == TK_TILDE {
+        let ty = synth_expr(operand);
+        if !is_integer(ty) {
+            type_error_got(n, c"bitwise NOT requires integer type", ty);
+        }
+        return ty;
+    }
+    if op == TK_STAR {
+        let ty = synth_expr(operand);
+        if !is_pointer(ty) {
+            err_begin(NODES[n].start);
+            err_str(c"cannot deref non-pointer type '");
+            err_type(ty);
+            err_str(c"'");
+            err_end();
+        }
+        return TYPES[ty].a;
+    }
+    // TK_AMP
+    let ty = synth_expr(operand);
+    if !is_place(operand) {
+        type_error(n, c"cannot take address of non-lvalue expression");
+    }
+    ptr_to(ty)
+}
+
+// ---- Calls ----
+
+fn is_variadic_arg_type(t: i64) -> bool {
+    is_numeric(t) || t == TY_BOOL || is_pointer(t) || is_fn_type(t)
+}
+
+fn synth_call(n: i64) -> i64 {
+    let callee = NODES[n].a;
+    if NODES[callee].kind == E_IDENT && lookup_local(NODES[callee].a) < 0
+        && SYM_FN[NODES[callee].a] != 0 {
+        let f = SYM_FN[NODES[callee].a] - 1;
+        NODES[n].x = f + 1;
+        return check_direct_call(n, f);
+    }
+    let callee_ty = synth_expr(callee);
+    if !is_fn_type(callee_ty) {
+        err_begin(NODES[callee].start);
+        err_str(c"cannot call non-function type '");
+        err_type(callee_ty);
+        err_str(c"'");
+        err_end();
+    }
+    if NODES[n].count != TYPES[callee_ty].count {
+        err_begin(NODES[n].start);
+        err_str(c"function pointer expects ");
+        err_int(TYPES[callee_ty].count);
+        err_str(c" arguments, got ");
+        err_int(NODES[n].count);
+        err_end();
+    }
+    for i in 0..NODES[n].count {
+        check_expr(child(n, i), type_elem(callee_ty, i));
+    }
+    TYPES[callee_ty].a
+}
+
+fn check_direct_call(n: i64, f: i64) -> i64 {
+    let count = NODES[n].count;
+    let params = FNS[f].param_count;
+    let variadic = FNS[f].variadic;
+    let arity_ok = if variadic { count >= params } else { count == params };
+    if !arity_ok {
+        err_begin(NODES[n].start);
+        err_str(c"function '");
+        err_sym(FNS[f].name);
+        err_str(c"' expects ");
+        if variadic {
+            err_str(c"at least ");
+        }
+        err_int(params);
+        err_str(c" arguments, got ");
+        err_int(count);
+        err_end();
+    }
+    for i in 0..params {
+        check_expr(child(n, i), fn_param(f, i));
+    }
+    for i in params..count {
+        let arg = child(n, i);
+        let ty = synth_expr(arg);
+        if !is_variadic_arg_type(ty) {
+            err_begin(NODES[arg].start);
+            err_str(c"cannot pass value of type '");
+            err_type(ty);
+            err_str(c"' as a variadic argument");
+            err_end();
+        }
+    }
+    FNS[f].ret
+}
+
+// ---- Places and assignment ----
+
+fn is_place(n: i64) -> bool {
+    let kind = NODES[n].kind;
+    if kind == E_IDENT {
+        let name = NODES[n].a;
+        return lookup_local(name) >= 0 || SYM_STATIC[name] != 0;
+    }
+    if kind == E_UNARY {
+        return NODES[n].a == TK_STAR;
+    }
+    if kind == E_FIELD || kind == E_TUPLE_FIELD {
+        return is_place(NODES[n].a);
+    }
+    if kind == E_INDEX {
+        let base = NODES[n].a;
+        return is_pointer(NODES[base].ty) || is_place(base);
+    }
+    false
+}
+
+fn check_assign(n: i64) {
+    let op = NODES[n].a;
+    let target = NODES[n].b;
+    let value = NODES[n].c;
+    let target_ty = synth_expr(target);
+    if !is_place(target) {
+        let name = NODES[target].a;
+        if NODES[target].kind == E_IDENT && SYM_CONST[name] != 0 {
+            name_error(NODES[target].start, c"cannot assign to constant '", name, c"'");
+        }
+        if NODES[target].kind == E_IDENT && SYM_FN[name] != 0 {
+            name_error(NODES[target].start, c"cannot assign to function '", name, c"'");
+        }
+        type_error(target, c"invalid assignment target");
+    }
+    check_mutable_place(target);
+    if op == TK_EQ {
+        check_expr(value, target_ty);
+        return;
+    }
+    if op == TK_SHL_EQ || op == TK_SHR_EQ {
+        if !is_integer(target_ty) {
+            type_error_got(n, c"shift assignment requires integer type", target_ty);
+        }
+        check_shift_amount(value);
+        return;
+    }
+    if op == TK_AMP_EQ || op == TK_PIPE_EQ || op == TK_CARET_EQ {
+        if !is_integer(target_ty) {
+            type_error_got(n, c"bitwise assignment requires integer type", target_ty);
+        }
+    } else if !is_numeric(target_ty) {
+        type_error_got(n, c"compound assignment requires numeric type", target_ty);
+    }
+    check_expr(value, target_ty);
+}
+
+fn check_mutable_place(target: i64) {
+    let mut root = target;
+    loop {
+        let kind = NODES[root].kind;
+        if kind == E_FIELD || kind == E_TUPLE_FIELD {
+            root = NODES[root].a;
+        } else if kind == E_INDEX && !is_pointer(NODES[NODES[root].a].ty) {
+            root = NODES[root].a;
+        } else if kind == E_IDENT {
+            check_mutable_name(NODES[root].a, target);
+            return;
+        } else {
+            return;
+        }
+    }
+}
+
+fn check_mutable_name(name: i64, target: i64) {
+    let local = lookup_local(name);
+    if local >= 0 {
+        if LOCALS[local].mutable {
+            return;
+        }
+        err_begin(NODES[target].start);
+        err_str(c"cannot assign to immutable variable '");
+        err_sym(name);
+        err_str(c"'");
+        if LOCALS[local].is_param {
+            err_help(c"make the parameter mutable: `mut ");
+            err_help_sym(name);
+            err_help(c": ");
+            buf_type(ERR_HELP, LOCALS[local].ty);
+            err_help(c"`");
+        } else {
+            err_help(c"make it mutable: `let mut ");
+            err_help_sym(name);
+            err_help(c"`");
+        }
+        err_end();
+    }
+    if SYM_STATIC[name] != 0 && !STATICS[SYM_STATIC[name] - 1].mutable {
+        err_begin(NODES[target].start);
+        err_str(c"cannot assign to immutable static '");
+        err_sym(name);
+        err_str(c"'");
+        err_help(c"declare it `static mut ");
+        err_help_sym(name);
+        err_help(c"`");
+        err_end();
+    }
+}
+
+// ---- Loops and jumps ----
+
+// The loop a `break`/`continue` refers to.
+fn find_loop(n: i64, keyword: *u8) -> i64 {
+    let label = NODES[n].a;
+    if label == 0 {
+        if LOOP_STACK.count == 0 {
+            err_begin(NODES[n].start);
+            err_str(keyword);
+            err_str(c" outside of loop");
+            err_end();
+        }
+        return LOOP_STACK.data[LOOP_STACK.count - 1];
+    }
+    let mut i = LOOP_STACK.count - 1;
+    while i >= 0 {
+        let lp = LOOP_STACK.data[i];
+        if NODES[lp].a == label {
+            return lp;
+        }
+        i -= 1;
+    }
+    name_error(NODES[n].start, c"unknown loop label ':", label, c"'")
+}
+
+fn check_loop_body(lp: i64, body: i64) {
+    intvec_push(&LOOP_STACK, lp);
+    check_branch(body, TY_UNIT);
+    intvec_pop(&LOOP_STACK);
+}
+
+// `loop`; `expected` (0 for none) is the type of its break values.
+fn check_loop(n: i64, expected: i64) -> i64 {
+    NODES[n].x = 0;
+    NODES[n].y = expected;
+    check_loop_body(n, NODES[n].b);
+    if NODES[n].x == 0 {
+        return TY_NEVER;
+    }
+    if NODES[n].y == 0 { TY_UNIT } else { NODES[n].y }
+}
+
+fn check_while(n: i64) -> i64 {
+    check_expr(NODES[n].b, TY_BOOL);
+    check_loop_body(n, NODES[n].c);
+    TY_UNIT
+}
+
+fn check_for(n: i64) -> i64 {
+    let range = NODES[n].c;
+    if NODES[range].kind != E_RANGE {
+        type_error(range, c"'for' loops can only iterate over integer ranges ('a..b' or 'a..=b')");
+    }
+    let start = NODES[range].a;
+    let end = NODES[range].b;
+    let mut elem_ty = 0;
+    if literal_takes_rhs_type(start, end) {
+        elem_ty = synth_expr(end);
+        check_expr(start, elem_ty);
+    } else {
+        elem_ty = synth_expr(start);
+        check_expr(end, elem_ty);
+    }
+    if !is_integer(elem_ty) {
+        type_error_got(range, c"range bounds must be integers", elem_ty);
+    }
+    NODES[range].ty = elem_ty;
+    let pattern = NODES[n].b;
+    if NODES[pattern].kind == P_TUPLE {
+        type_error(pattern, c"a 'for' loop over a range binds one integer, not a tuple");
+    }
+    push_scope();
+    bind_pattern(pattern, elem_ty);
+    check_loop_body(n, NODES[n].d);
+    pop_scope();
+    TY_UNIT
+}
+
+fn check_break(n: i64) {
+    let lp = find_loop(n, c"break");
+    NODES[n].x = lp;
+    let value = NODES[n].b;
+    if value != 0 {
+        if NODES[lp].kind != E_LOOP {
+            err_begin(NODES[value].start);
+            err_str(c"'break' with a value is only allowed in 'loop', not in '");
+            err_str(if NODES[lp].kind == E_WHILE { c"while" } else { c"for" });
+            err_str(c"'");
+            err_end();
+        }
+        if NODES[lp].y != 0 {
+            check_expr(value, NODES[lp].y);
+        } else {
+            let ty = synth_expr(value);
+            if ty != TY_NEVER {
+                NODES[lp].y = ty;
+            }
+        }
+    } else if NODES[lp].kind == E_LOOP {
+        let ty = NODES[lp].y;
+        if ty != 0 && ty != TY_UNIT && ty != TY_NEVER {
+            err_begin(NODES[n].start);
+            err_str(c"expected '");
+            err_type(ty);
+            err_str(c"', got '()' (break without a value)");
+            err_end();
+        }
+        if ty == 0 {
+            NODES[lp].y = TY_UNIT;
+        }
+    }
+    NODES[lp].x = 1;
+}
+
+fn check_return(n: i64) -> i64 {
+    let value = NODES[n].a;
+    if value != 0 {
+        check_expr(value, RETURN_TYPE);
+    } else if RETURN_TYPE != TY_UNIT && RETURN_TYPE != TY_NEVER {
+        err_begin(NODES[n].start);
+        err_str(c"empty return in function returning '");
+        err_type(RETURN_TYPE);
+        err_str(c"'");
+        err_end();
+    }
+    TY_NEVER
+}

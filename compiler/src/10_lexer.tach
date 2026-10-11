@@ -1,0 +1,918 @@
+// Lexer: source text to tokens. Mirrors the reference lexer
+// (seed/src/lexer, the Rust compiler) token for token; `tachyonc --tokens`
+// prints the same dump as `tachyon tokens`.
+
+// ---- Token kinds ----
+
+const TK_EOF: i64 = 0;
+const TK_INT: i64 = 1;
+const TK_FLOAT: i64 = 2;
+const TK_CHAR: i64 = 3;
+const TK_STR: i64 = 4;
+const TK_CSTR: i64 = 5;
+const TK_IDENT: i64 = 6;
+const TK_RESERVED: i64 = 7;
+// Keywords
+const TK_FN: i64 = 10;
+const TK_LET: i64 = 11;
+const TK_MUT: i64 = 12;
+const TK_STRUCT: i64 = 13;
+const TK_IF: i64 = 14;
+const TK_ELSE: i64 = 15;
+const TK_LOOP: i64 = 16;
+const TK_WHILE: i64 = 17;
+const TK_FOR: i64 = 18;
+const TK_IN: i64 = 19;
+const TK_BREAK: i64 = 20;
+const TK_CONTINUE: i64 = 21;
+const TK_TRUE: i64 = 22;
+const TK_FALSE: i64 = 23;
+const TK_AS: i64 = 24;
+const TK_RETURN: i64 = 25;
+const TK_EXTERN: i64 = 26;
+const TK_CONST: i64 = 27;
+const TK_STATIC: i64 = 28;
+const TK_TYPE: i64 = 29;
+// Operators and punctuation
+const TK_PLUS_EQ: i64 = 40;
+const TK_MINUS_EQ: i64 = 41;
+const TK_STAR_EQ: i64 = 42;
+const TK_SLASH_EQ: i64 = 43;
+const TK_PERCENT_EQ: i64 = 44;
+const TK_AMP_EQ: i64 = 45;
+const TK_PIPE_EQ: i64 = 46;
+const TK_CARET_EQ: i64 = 47;
+const TK_BANG_EQ: i64 = 48;
+const TK_EQ_EQ: i64 = 49;
+const TK_GT_EQ: i64 = 50;
+const TK_LT_EQ: i64 = 51;
+const TK_AMP_AMP: i64 = 52;
+const TK_PIPE_PIPE: i64 = 53;
+const TK_ARROW: i64 = 54;
+const TK_FAT_ARROW: i64 = 55;
+const TK_SHL: i64 = 56;
+const TK_SHR: i64 = 57;
+const TK_SHL_EQ: i64 = 58;
+const TK_SHR_EQ: i64 = 59;
+const TK_DOT_DOT: i64 = 60;
+const TK_DOT_DOT_EQ: i64 = 61;
+const TK_ELLIPSIS: i64 = 62;
+const TK_COLON_COLON: i64 = 63;
+const TK_EQ: i64 = 64;
+const TK_PLUS: i64 = 65;
+const TK_MINUS: i64 = 66;
+const TK_STAR: i64 = 67;
+const TK_SLASH: i64 = 68;
+const TK_PERCENT: i64 = 69;
+const TK_CARET: i64 = 70;
+const TK_AMP: i64 = 71;
+const TK_PIPE: i64 = 72;
+const TK_TILDE: i64 = 73;
+const TK_BANG: i64 = 74;
+const TK_LT: i64 = 75;
+const TK_GT: i64 = 76;
+const TK_DOT: i64 = 77;
+const TK_COMMA: i64 = 78;
+const TK_SEMI: i64 = 79;
+const TK_COLON: i64 = 80;
+const TK_HASH: i64 = 81;
+const TK_QUESTION: i64 = 82;
+const TK_AT: i64 = 83;
+const TK_LPAREN: i64 = 84;
+const TK_RPAREN: i64 = 85;
+const TK_LBRACE: i64 = 86;
+const TK_RBRACE: i64 = 87;
+const TK_LBRACKET: i64 = 88;
+const TK_RBRACKET: i64 = 89;
+const TK_KIND_COUNT: i64 = 90;
+
+// Numeric literal suffixes (0: none).
+const SUF_NONE: i64 = 0;
+const SUF_I8: i64 = 1;
+const SUF_I16: i64 = 2;
+const SUF_I32: i64 = 3;
+const SUF_I64: i64 = 4;
+const SUF_ISIZE: i64 = 5;
+const SUF_U8: i64 = 6;
+const SUF_U16: i64 = 7;
+const SUF_U32: i64 = 8;
+const SUF_U64: i64 = 9;
+const SUF_USIZE: i64 = 10;
+const SUF_F32: i64 = 11;
+const SUF_F64: i64 = 12;
+
+// `value` is the integer value, the float's bits, the character, the
+// string id (TK_STR, TK_CSTR) or the symbol (TK_IDENT, TK_RESERVED).
+struct Token { kind: i64, start: i64, end: i64, value: u64, suffix: i64, joint: bool }
+
+static mut TOKS: *Token = 0 as *Token;
+static mut TOK_COUNT: i64 = 0;
+static mut TOK_CAP: i64 = 0;
+
+// The text of each keyword and punctuation kind, for messages.
+static mut TOKEN_TEXT: **u8 = 0 as **u8;
+// For each symbol: the keyword kind it spells, TK_RESERVED, or 0.
+static mut SYM_KEYWORD: *i64 = 0 as *i64;
+static mut SYM_KEYWORD_COUNT: i64 = 0;
+static mut SUFFIX_NAME: **u8 = 0 as **u8;
+// Symbol of the first suffix name; the suffixes are interned in order.
+static mut SUFFIX_SYM_BASE: i64 = 0;
+
+// String literals: their bytes, by id.
+struct Bytes { ptr: *u8, len: i64 }
+
+static mut STRS: *Bytes = 0 as *Bytes;
+static mut STR_COUNT: i64 = 0;
+static mut STR_CAP: i64 = 0;
+
+fn add_keyword(text: *u8, kind: i64) {
+    let sym = intern_c(text);
+    SYM_KEYWORD[sym] = kind;
+    TOKEN_TEXT[kind] = text;
+}
+
+fn add_reserved(text: *u8) {
+    let sym = intern_c(text);
+    SYM_KEYWORD[sym] = TK_RESERVED;
+}
+
+fn set_text(kind: i64, text: *u8) {
+    TOKEN_TEXT[kind] = text;
+}
+
+// Interns the keywords first, so their symbols are small numbers.
+fn init_lexer() {
+    TOKEN_TEXT = alloc_zeroed(TK_KIND_COUNT * 8) as **u8;
+    SYM_KEYWORD_COUNT = 64;
+    SYM_KEYWORD = alloc_zeroed(SYM_KEYWORD_COUNT * 8) as *i64;
+    add_keyword(c"fn", TK_FN);
+    add_keyword(c"let", TK_LET);
+    add_keyword(c"mut", TK_MUT);
+    add_keyword(c"struct", TK_STRUCT);
+    add_keyword(c"if", TK_IF);
+    add_keyword(c"else", TK_ELSE);
+    add_keyword(c"loop", TK_LOOP);
+    add_keyword(c"while", TK_WHILE);
+    add_keyword(c"for", TK_FOR);
+    add_keyword(c"in", TK_IN);
+    add_keyword(c"break", TK_BREAK);
+    add_keyword(c"continue", TK_CONTINUE);
+    add_keyword(c"true", TK_TRUE);
+    add_keyword(c"false", TK_FALSE);
+    add_keyword(c"as", TK_AS);
+    add_keyword(c"return", TK_RETURN);
+    add_keyword(c"extern", TK_EXTERN);
+    add_keyword(c"const", TK_CONST);
+    add_keyword(c"static", TK_STATIC);
+    add_keyword(c"type", TK_TYPE);
+    add_reserved(c"enum");
+    add_reserved(c"match");
+    add_reserved(c"impl");
+    add_reserved(c"trait");
+    add_reserved(c"pub");
+    add_reserved(c"mod");
+    add_reserved(c"use");
+    add_reserved(c"self");
+    add_reserved(c"Self");
+    add_reserved(c"super");
+    add_reserved(c"where");
+    add_reserved(c"unsafe");
+    add_reserved(c"defer");
+    add_reserved(c"union");
+    add_reserved(c"dyn");
+    add_reserved(c"move");
+    set_text(TK_EOF, c"EOF");
+    set_text(TK_PLUS_EQ, c"+=");
+    set_text(TK_MINUS_EQ, c"-=");
+    set_text(TK_STAR_EQ, c"*=");
+    set_text(TK_SLASH_EQ, c"/=");
+    set_text(TK_PERCENT_EQ, c"%=");
+    set_text(TK_AMP_EQ, c"&=");
+    set_text(TK_PIPE_EQ, c"|=");
+    set_text(TK_CARET_EQ, c"^=");
+    set_text(TK_BANG_EQ, c"!=");
+    set_text(TK_EQ_EQ, c"==");
+    set_text(TK_GT_EQ, c">=");
+    set_text(TK_LT_EQ, c"<=");
+    set_text(TK_AMP_AMP, c"&&");
+    set_text(TK_PIPE_PIPE, c"||");
+    set_text(TK_ARROW, c"->");
+    set_text(TK_FAT_ARROW, c"=>");
+    set_text(TK_SHL, c"<<");
+    set_text(TK_SHR, c">>");
+    set_text(TK_SHL_EQ, c"<<=");
+    set_text(TK_SHR_EQ, c">>=");
+    set_text(TK_DOT_DOT, c"..");
+    set_text(TK_DOT_DOT_EQ, c"..=");
+    set_text(TK_ELLIPSIS, c"...");
+    set_text(TK_COLON_COLON, c"::");
+    set_text(TK_EQ, c"=");
+    set_text(TK_PLUS, c"+");
+    set_text(TK_MINUS, c"-");
+    set_text(TK_STAR, c"*");
+    set_text(TK_SLASH, c"/");
+    set_text(TK_PERCENT, c"%");
+    set_text(TK_CARET, c"^");
+    set_text(TK_AMP, c"&");
+    set_text(TK_PIPE, c"|");
+    set_text(TK_TILDE, c"~");
+    set_text(TK_BANG, c"!");
+    set_text(TK_LT, c"<");
+    set_text(TK_GT, c">");
+    set_text(TK_DOT, c".");
+    set_text(TK_COMMA, c",");
+    set_text(TK_SEMI, c";");
+    set_text(TK_COLON, c":");
+    set_text(TK_HASH, c"#");
+    set_text(TK_QUESTION, c"?");
+    set_text(TK_AT, c"@");
+    set_text(TK_LPAREN, c"(");
+    set_text(TK_RPAREN, c")");
+    set_text(TK_LBRACE, c"{");
+    set_text(TK_RBRACE, c"}");
+    set_text(TK_LBRACKET, c"[");
+    set_text(TK_RBRACKET, c"]");
+    init_suffixes();
+}
+
+fn init_suffixes() {
+    SUFFIX_NAME = alloc_zeroed(13 * 8) as **u8;
+    SUFFIX_NAME[SUF_I8] = c"i8";
+    SUFFIX_NAME[SUF_I16] = c"i16";
+    SUFFIX_NAME[SUF_I32] = c"i32";
+    SUFFIX_NAME[SUF_I64] = c"i64";
+    SUFFIX_NAME[SUF_ISIZE] = c"isize";
+    SUFFIX_NAME[SUF_U8] = c"u8";
+    SUFFIX_NAME[SUF_U16] = c"u16";
+    SUFFIX_NAME[SUF_U32] = c"u32";
+    SUFFIX_NAME[SUF_U64] = c"u64";
+    SUFFIX_NAME[SUF_USIZE] = c"usize";
+    SUFFIX_NAME[SUF_F32] = c"f32";
+    SUFFIX_NAME[SUF_F64] = c"f64";
+    SUFFIX_SYM_BASE = SYM_COUNT;
+    for suffix in 1..13 {
+        intern_c(SUFFIX_NAME[suffix]);
+    }
+}
+
+// The suffix a symbol names, or SUF_NONE.
+fn suffix_of_sym(sym: i64) -> i64 {
+    if sym >= SUFFIX_SYM_BASE && sym < SUFFIX_SYM_BASE + 12 {
+        return sym - SUFFIX_SYM_BASE + 1;
+    }
+    SUF_NONE
+}
+
+fn is_float_suffix(suffix: i64) -> bool {
+    suffix == SUF_F32 || suffix == SUF_F64
+}
+
+fn keyword_of_sym(sym: i64) -> i64 {
+    if sym < SYM_KEYWORD_COUNT { SYM_KEYWORD[sym] } else { 0 }
+}
+
+// ---- The lexer ----
+
+static mut LEX_POS: i64 = 0;
+static mut LEX_END: i64 = 0;
+// The previous token was '.', so a number is a tuple index (`t.0.1`).
+static mut LEX_AFTER_DOT: bool = false;
+static mut LEX_SCRATCH: i64 = -1;
+
+fn is_digit(c: u8) -> bool {
+    c >= '0' && c <= '9'
+}
+
+fn is_alpha(c: u8) -> bool {
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+fn is_ident_byte(c: u8) -> bool {
+    c == '_' || is_alpha(c) || is_digit(c)
+}
+
+fn is_whitespace(c: u8) -> bool {
+    c == ' ' || c == '\t' || c == '\r' || c == '\n'
+}
+
+// The byte at `offset` from the lexer position, 0 past the end.
+fn peek_at(offset: i64) -> u8 {
+    if LEX_POS + offset < LEX_END { SRC[LEX_POS + offset] } else { 0 }
+}
+
+fn at_end() -> bool {
+    LEX_POS >= LEX_END
+}
+
+fn push_token(kind: i64, start: i64, value: u64, suffix: i64) {
+    TOKS = grow(TOKS as *u8, TOK_COUNT, &TOK_CAP, 48) as *Token;
+    TOKS[TOK_COUNT] = Token {
+        kind: kind, start: start, end: LEX_POS, value: value, suffix: suffix, joint: at_joint(),
+    };
+    TOK_COUNT += 1;
+    LEX_AFTER_DOT = kind == TK_DOT;
+}
+
+// Nothing separates the token just lexed from the next one.
+fn at_joint() -> bool {
+    if at_end() {
+        return false;
+    }
+    let c = peek_at(0);
+    if is_whitespace(c) {
+        return false;
+    }
+    if c == '/' {
+        let next = peek_at(1);
+        return !(next == '/' || next == '*');
+    }
+    true
+}
+
+fn skip_whitespace_and_comments() {
+    loop {
+        while !at_end() && is_whitespace(peek_at(0)) {
+            LEX_POS += 1;
+        }
+        if peek_at(0) == '/' && peek_at(1) == '/' {
+            while !at_end() && peek_at(0) != '\n' {
+                LEX_POS += 1;
+            }
+        } else if peek_at(0) == '/' && peek_at(1) == '*' {
+            skip_block_comment();
+        } else {
+            return;
+        }
+    }
+}
+
+// Block comments nest.
+fn skip_block_comment() {
+    let start = LEX_POS;
+    let mut depth = 0;
+    while !at_end() {
+        if peek_at(0) == '/' && peek_at(1) == '*' {
+            depth += 1;
+            LEX_POS += 2;
+        } else if peek_at(0) == '*' && peek_at(1) == '/' {
+            depth -= 1;
+            LEX_POS += 2;
+            if depth == 0 {
+                return;
+            }
+        } else {
+            LEX_POS += 1;
+        }
+    }
+    error_at(start, c"unterminated block comment");
+}
+
+// Lexes SRC[start..end) and appends its tokens; `last` adds the EOF token.
+fn lex_range(start: i64, end: i64, last: bool) {
+    if LEX_SCRATCH < 0 {
+        LEX_SCRATCH = buf_new();
+    }
+    LEX_POS = start;
+    LEX_END = end;
+    LEX_AFTER_DOT = false;
+    loop {
+        skip_whitespace_and_comments();
+        if at_end() {
+            break;
+        }
+        lex_token();
+    }
+    if last {
+        push_token(TK_EOF, LEX_POS, 0, 0);
+    }
+}
+
+fn lex_token() {
+    let c = peek_at(0);
+    if c == '"' {
+        lex_string(LEX_POS, false);
+    } else if c == 'c' && peek_at(1) == '"' {
+        lex_string(LEX_POS, true);
+    } else if c == '\'' {
+        lex_char();
+    } else if is_digit(c) {
+        lex_number();
+    } else if c == '_' || is_alpha(c) {
+        lex_ident();
+    } else {
+        lex_operator();
+    }
+}
+
+fn lex_ident() {
+    let start = LEX_POS;
+    while !at_end() && is_ident_byte(peek_at(0)) {
+        LEX_POS += 1;
+    }
+    let sym = intern(&SRC[start], LEX_POS - start);
+    let keyword = keyword_of_sym(sym);
+    if keyword == 0 {
+        push_token(TK_IDENT, start, sym as u64, 0);
+    } else {
+        push_token(keyword, start, sym as u64, 0);
+    }
+}
+
+fn three_char_operator(a: u8, b: u8, c: u8) -> i64 {
+    if a == '<' && b == '<' && c == '=' { return TK_SHL_EQ; }
+    if a == '>' && b == '>' && c == '=' { return TK_SHR_EQ; }
+    if a == '.' && b == '.' && c == '.' { return TK_ELLIPSIS; }
+    if a == '.' && b == '.' && c == '=' { return TK_DOT_DOT_EQ; }
+    0
+}
+
+fn two_char_operator(a: u8, b: u8) -> i64 {
+    if b == '=' {
+        if a == '+' { return TK_PLUS_EQ; }
+        if a == '-' { return TK_MINUS_EQ; }
+        if a == '*' { return TK_STAR_EQ; }
+        if a == '/' { return TK_SLASH_EQ; }
+        if a == '%' { return TK_PERCENT_EQ; }
+        if a == '&' { return TK_AMP_EQ; }
+        if a == '|' { return TK_PIPE_EQ; }
+        if a == '^' { return TK_CARET_EQ; }
+        if a == '!' { return TK_BANG_EQ; }
+        if a == '=' { return TK_EQ_EQ; }
+        if a == '>' { return TK_GT_EQ; }
+        if a == '<' { return TK_LT_EQ; }
+        return 0;
+    }
+    if a == '<' && b == '<' { return TK_SHL; }
+    if a == '>' && b == '>' { return TK_SHR; }
+    if a == '&' && b == '&' { return TK_AMP_AMP; }
+    if a == '|' && b == '|' { return TK_PIPE_PIPE; }
+    if a == '-' && b == '>' { return TK_ARROW; }
+    if a == '=' && b == '>' { return TK_FAT_ARROW; }
+    if a == '.' && b == '.' { return TK_DOT_DOT; }
+    if a == ':' && b == ':' { return TK_COLON_COLON; }
+    0
+}
+
+fn one_char_operator(c: u8) -> i64 {
+    if c == '=' { return TK_EQ; }
+    if c == '+' { return TK_PLUS; }
+    if c == '-' { return TK_MINUS; }
+    if c == '*' { return TK_STAR; }
+    if c == '/' { return TK_SLASH; }
+    if c == '%' { return TK_PERCENT; }
+    if c == '^' { return TK_CARET; }
+    if c == '&' { return TK_AMP; }
+    if c == '|' { return TK_PIPE; }
+    if c == '~' { return TK_TILDE; }
+    if c == '!' { return TK_BANG; }
+    if c == '<' { return TK_LT; }
+    if c == '>' { return TK_GT; }
+    if c == '.' { return TK_DOT; }
+    if c == ',' { return TK_COMMA; }
+    if c == ';' { return TK_SEMI; }
+    if c == ':' { return TK_COLON; }
+    if c == '#' { return TK_HASH; }
+    if c == '?' { return TK_QUESTION; }
+    if c == '@' { return TK_AT; }
+    if c == '(' { return TK_LPAREN; }
+    if c == ')' { return TK_RPAREN; }
+    if c == '{' { return TK_LBRACE; }
+    if c == '}' { return TK_RBRACE; }
+    if c == '[' { return TK_LBRACKET; }
+    if c == ']' { return TK_RBRACKET; }
+    0
+}
+
+fn lex_operator() {
+    let start = LEX_POS;
+    let a = peek_at(0);
+    if LEX_POS + 2 < LEX_END {
+        let kind = three_char_operator(a, peek_at(1), peek_at(2));
+        if kind != 0 {
+            LEX_POS += 3;
+            push_token(kind, start, 0, 0);
+            return;
+        }
+    }
+    if LEX_POS + 1 < LEX_END {
+        let kind = two_char_operator(a, peek_at(1));
+        if kind != 0 {
+            LEX_POS += 2;
+            push_token(kind, start, 0, 0);
+            return;
+        }
+    }
+    let kind = one_char_operator(a);
+    if kind == 0 {
+        error_at(start, c"unexpected character");
+    }
+    LEX_POS += 1;
+    push_token(kind, start, 0, 0);
+}
+
+// ---- Strings and characters ----
+
+fn add_string(p: *u8, n: i64) -> i64 {
+    STRS = grow(STRS as *u8, STR_COUNT, &STR_CAP, 16) as *Bytes;
+    let copy = alloc_zeroed(n + 1);
+    memcpy(copy, p, n as u64);
+    STRS[STR_COUNT] = Bytes { ptr: copy, len: n };
+    STR_COUNT += 1;
+    STR_COUNT - 1
+}
+
+// `"..."` or `c"..."` starting at `start`.
+fn lex_string(start: i64, is_c: bool) {
+    LEX_POS += if is_c { 2 } else { 1 };
+    buf_clear(LEX_SCRATCH);
+    loop {
+        if at_end() {
+            error_at(start, c"unterminated string literal");
+        }
+        let c = peek_at(0);
+        LEX_POS += 1;
+        if c == '"' {
+            break;
+        }
+        if c == '\n' {
+            error_at(LEX_POS - 1, c"newline in string literal");
+        }
+        if c == '\\' {
+            lex_escape(LEX_SCRATCH, false);
+        } else {
+            buf_byte(LEX_SCRATCH, c);
+        }
+    }
+    let bytes = BUFS[LEX_SCRATCH].data;
+    let n = BUFS[LEX_SCRATCH].len;
+    if is_c {
+        for i in 0..n {
+            if bytes[i] == 0 {
+                error_at(start, c"C string literal contains a NUL byte");
+            }
+        }
+    }
+    let id = add_string(bytes, n);
+    push_token(if is_c { TK_CSTR } else { TK_STR }, start, id as u64, 0);
+}
+
+fn hex_value(c: u8) -> i64 {
+    if c >= '0' && c <= '9' { return (c - '0') as i64; }
+    if c >= 'a' && c <= 'f' { return (c - 'a') as i64 + 10; }
+    if c >= 'A' && c <= 'F' { return (c - 'A') as i64 + 10; }
+    -1
+}
+
+fn lex_hex_digit() -> i64 {
+    if at_end() {
+        error_at(LEX_POS, c"expected hex digit");
+    }
+    let value = hex_value(peek_at(0));
+    if value < 0 {
+        error_at(LEX_POS, c"expected hex digit");
+    }
+    LEX_POS += 1;
+    value
+}
+
+// UTF-8 encoding of a code point.
+fn buf_utf8(out: i64, cp: i64) {
+    if cp < 0x80 {
+        buf_byte(out, cp as u8);
+    } else if cp < 0x800 {
+        buf_byte(out, (0xc0 | (cp >> 6)) as u8);
+        buf_byte(out, (0x80 | (cp & 0x3f)) as u8);
+    } else if cp < 0x10000 {
+        buf_byte(out, (0xe0 | (cp >> 12)) as u8);
+        buf_byte(out, (0x80 | ((cp >> 6) & 0x3f)) as u8);
+        buf_byte(out, (0x80 | (cp & 0x3f)) as u8);
+    } else {
+        buf_byte(out, (0xf0 | (cp >> 18)) as u8);
+        buf_byte(out, (0x80 | ((cp >> 12) & 0x3f)) as u8);
+        buf_byte(out, (0x80 | ((cp >> 6) & 0x3f)) as u8);
+        buf_byte(out, (0x80 | (cp & 0x3f)) as u8);
+    }
+}
+
+// An escape after '\'; appends its bytes to `out`.
+fn lex_escape(out: i64, in_char: bool) {
+    if at_end() {
+        error_at(LEX_POS, c"unterminated escape");
+    }
+    let escape_at = LEX_POS;
+    let c = peek_at(0);
+    LEX_POS += 1;
+    if c == 'n' { buf_byte(out, '\n'); return; }
+    if c == 't' { buf_byte(out, '\t'); return; }
+    if c == 'r' { buf_byte(out, '\r'); return; }
+    if c == '0' { buf_byte(out, 0); return; }
+    if c == '"' { buf_byte(out, '"'); return; }
+    if c == '\'' { buf_byte(out, '\''); return; }
+    if c == '\\' { buf_byte(out, '\\'); return; }
+    if c == 'x' {
+        let high = lex_hex_digit();
+        let low = lex_hex_digit();
+        buf_byte(out, ((high << 4) | low) as u8);
+        return;
+    }
+    if c == 'u' {
+        let cp = lex_unicode_escape(escape_at - 1, in_char);
+        buf_utf8(out, cp);
+        return;
+    }
+    error_at(escape_at, c"unknown escape");
+}
+
+fn lex_unicode_escape(backslash_at: i64, in_char: bool) -> i64 {
+    if peek_at(0) != '{' || at_end() {
+        error_at(LEX_POS, c"expected '{' after '\\u'");
+    }
+    LEX_POS += 1;
+    let mut value = 0;
+    let mut digits = 0;
+    while at_end() || peek_at(0) != '}' {
+        if digits == 6 {
+            error_at(LEX_POS, c"too many digits in '\\u{...}' escape");
+        }
+        value = value * 16 + lex_hex_digit();
+        digits += 1;
+    }
+    LEX_POS += 1;
+    if digits == 0 {
+        error_at(LEX_POS, c"empty '\\u{}' escape");
+    }
+    if value > 0x10ffff || (value >= 0xd800 && value <= 0xdfff) {
+        error_at(backslash_at, c"invalid unicode escape");
+    }
+    if in_char && value >= 0x80 {
+        error_at(backslash_at, c"character literal is not ASCII (a character is one byte, u8)");
+    }
+    value
+}
+
+fn lex_char() {
+    let start = LEX_POS;
+    LEX_POS += 1;
+    buf_clear(LEX_SCRATCH);
+    let c = peek_at(0);
+    if at_end() || c == '\n' {
+        error_at(start, c"unterminated character literal");
+    }
+    if c == '\'' {
+        error_at(start, c"empty character literal");
+    }
+    if c == '\\' {
+        LEX_POS += 1;
+        lex_escape(LEX_SCRATCH, true);
+    } else if c < 0x80 {
+        LEX_POS += 1;
+        buf_byte(LEX_SCRATCH, c);
+    } else {
+        // The character's UTF-8 bytes: the lead byte and its continuations.
+        let mut end = LEX_POS + 1;
+        while end < LEX_END && (SRC[end] & 0xc0) == 0x80 {
+            end += 1;
+        }
+        err_begin(start);
+        err_str(c"character literal '");
+        buf_bytes(ERR, &SRC[LEX_POS], end - LEX_POS);
+        err_str(c"' is not ASCII (a character is one byte, u8)");
+        err_end();
+    }
+    if at_end() || peek_at(0) != '\'' {
+        error_at(start, c"unterminated character literal (expected ')");
+    }
+    LEX_POS += 1;
+    push_token(TK_CHAR, start, BUFS[LEX_SCRATCH].data[0] as u64, 0);
+}
+
+// ---- Numbers ----
+
+// A '_' may end the digits only when a suffix follows (`1_u8`).
+fn check_trailing_underscore(last_underscore: bool) {
+    if last_underscore && !(!at_end() && is_alpha(peek_at(0))) {
+        error_at(LEX_POS - 1, c"trailing underscore in literal");
+    }
+}
+
+fn lex_number() {
+    let start = LEX_POS;
+    let second = peek_at(1);
+    if peek_at(0) == '0' && (second == 'x' || second == 'X' || second == 'b' || second == 'B') {
+        let radix: u64 = if second == 'x' || second == 'X' { 16 } else { 2 };
+        LEX_POS += 2;
+        let value = lex_radix_digits(radix);
+        lex_int_suffix(value, start, false);
+        return;
+    }
+    lex_decimal_or_float(start);
+}
+
+fn digit_value(c: u8, radix: u64) -> i64 {
+    let value = hex_value(c);
+    if value < 0 || value as u64 >= radix { -1 } else { value }
+}
+
+fn lex_radix_digits(radix: u64) -> u64 {
+    if at_end() || digit_value(peek_at(0), radix) < 0 {
+        error_at(LEX_POS, if radix == 16 { c"expected hex digit after '0x'" } else { c"expected binary digit after '0b'" });
+    }
+    let mut value: u64 = 0;
+    let mut last_underscore = false;
+    while !at_end() {
+        let c = peek_at(0);
+        if c == '_' {
+            last_underscore = true;
+            LEX_POS += 1;
+            continue;
+        }
+        let digit = digit_value(c, radix);
+        if digit < 0 {
+            break;
+        }
+        last_underscore = false;
+        if value > (0xffffffffffffffff - digit as u64) / radix {
+            error_at(LEX_POS, c"literal overflow");
+        }
+        value = value * radix + digit as u64;
+        LEX_POS += 1;
+    }
+    check_trailing_underscore(last_underscore);
+    value
+}
+
+// An identifier glued to a literal: its symbol, or -1.
+fn read_suffix() -> i64 {
+    if at_end() || !is_ident_byte(peek_at(0)) {
+        return -1;
+    }
+    let start = LEX_POS;
+    while !at_end() && is_ident_byte(peek_at(0)) {
+        LEX_POS += 1;
+    }
+    intern(&SRC[start], LEX_POS - start)
+}
+
+fn bits_of_f64(value: f64) -> u64 {
+    let copy = value;
+    *(&copy as *u64)
+}
+
+fn lex_int_suffix(value: u64, start: i64, decimal: bool) {
+    let suffix_at = LEX_POS;
+    let sym = read_suffix();
+    if sym < 0 {
+        push_token(TK_INT, start, value, 0);
+        return;
+    }
+    let suffix = suffix_of_sym(sym);
+    if suffix != SUF_NONE && is_float_suffix(suffix) && decimal {
+        push_token(TK_FLOAT, start, bits_of_f64(value as f64), suffix);
+        return;
+    }
+    if suffix != SUF_NONE && !is_float_suffix(suffix) {
+        push_token(TK_INT, start, value, suffix);
+        return;
+    }
+    error_at(suffix_at, c"invalid suffix on integer literal");
+}
+
+// Decimal digits (without '_') appended to `out`.
+fn read_decimal_digits(out: i64) {
+    if at_end() || !is_digit(peek_at(0)) {
+        error_at(LEX_POS, c"expected digit");
+    }
+    let mut last_underscore = false;
+    while !at_end() {
+        let c = peek_at(0);
+        if c == '_' {
+            last_underscore = true;
+            LEX_POS += 1;
+            continue;
+        }
+        if !is_digit(c) {
+            break;
+        }
+        last_underscore = false;
+        buf_byte(out, c);
+        LEX_POS += 1;
+    }
+    check_trailing_underscore(last_underscore);
+}
+
+// An exponent (`e5`, `E-3`) starts here.
+fn at_exponent() -> bool {
+    let e = peek_at(0);
+    if at_end() || !(e == 'e' || e == 'E') || LEX_POS + 1 >= LEX_END {
+        return false;
+    }
+    let sign = peek_at(1);
+    if sign == '+' || sign == '-' {
+        return LEX_POS + 2 < LEX_END && is_digit(peek_at(2));
+    }
+    is_digit(sign)
+}
+
+fn lex_decimal_or_float(start: i64) {
+    let text = LEX_SCRATCH;
+    buf_clear(text);
+    read_decimal_digits(text);
+    let has_fraction = peek_at(0) == '.' && LEX_POS + 1 < LEX_END && is_digit(peek_at(1));
+    let has_exponent = at_exponent();
+    if LEX_AFTER_DOT || !(has_fraction || has_exponent) {
+        let mut value: u64 = 0;
+        for i in 0..BUFS[text].len {
+            let digit = (BUFS[text].data[i] - '0') as u64;
+            if value > (0xffffffffffffffff - digit) / 10 {
+                error_at(LEX_POS, c"integer overflow");
+            }
+            value = value * 10 + digit;
+        }
+        lex_int_suffix(value, start, !LEX_AFTER_DOT);
+        return;
+    }
+    if has_fraction {
+        LEX_POS += 1;
+        buf_byte(text, '.');
+        read_decimal_digits(text);
+    }
+    if !at_end() && (peek_at(0) == 'e' || peek_at(0) == 'E') {
+        LEX_POS += 1;
+        buf_byte(text, 'e');
+        if !at_end() && (peek_at(0) == '+' || peek_at(0) == '-') {
+            buf_byte(text, peek_at(0));
+            LEX_POS += 1;
+        }
+        if at_end() || !is_digit(peek_at(0)) {
+            error_at(LEX_POS, c"expected digit in exponent");
+        }
+        read_decimal_digits(text);
+    }
+    buf_byte(text, 0);
+    let value = strtod(BUFS[text].data, 0 as **u8);
+    let suffix_at = LEX_POS;
+    let sym = read_suffix();
+    if sym < 0 {
+        push_token(TK_FLOAT, start, bits_of_f64(value), 0);
+        return;
+    }
+    let suffix = suffix_of_sym(sym);
+    if suffix == SUF_NONE || !is_float_suffix(suffix) {
+        error_at(suffix_at, c"invalid suffix on float literal");
+    }
+    push_token(TK_FLOAT, start, bits_of_f64(value), suffix);
+}
+
+// ---- The token dump (`--tokens`) ----
+
+fn dump_tokens(out: i64, base: i64) {
+    for i in 0..TOK_COUNT {
+        let tok = &TOKS[i];
+        buf_int(out, (*tok).start - base);
+        buf_byte(out, ' ');
+        buf_int(out, (*tok).end - base);
+        buf_byte(out, ' ');
+        buf_byte(out, if (*tok).joint { '1' } else { '0' });
+        buf_byte(out, ' ');
+        dump_token_text(out, tok);
+        buf_byte(out, '\n');
+    }
+}
+
+fn dump_hex_bytes(out: i64, id: i64) {
+    for i in 0..STRS[id].len {
+        buf_hex(out, STRS[id].ptr[i] as u64, 2);
+    }
+}
+
+fn dump_token_text(out: i64, tok: *Token) {
+    let kind = (*tok).kind;
+    let value = (*tok).value;
+    if kind == TK_INT {
+        buf_str(out, c"int ");
+        buf_uint(out, value);
+    } else if kind == TK_FLOAT {
+        buf_str(out, c"float ");
+        buf_hex(out, value, 16);
+    } else if kind == TK_CHAR {
+        buf_str(out, c"char ");
+        buf_uint(out, value);
+    } else if kind == TK_STR {
+        buf_str(out, c"str ");
+        dump_hex_bytes(out, value as i64);
+    } else if kind == TK_CSTR {
+        buf_str(out, c"cstr ");
+        dump_hex_bytes(out, value as i64);
+    } else if kind == TK_IDENT {
+        buf_str(out, c"ident ");
+        buf_str(out, sym_name(value as i64));
+    } else if kind == TK_RESERVED {
+        buf_str(out, sym_name(value as i64));
+    } else {
+        buf_str(out, TOKEN_TEXT[kind]);
+    }
+    if (*tok).suffix != SUF_NONE {
+        buf_byte(out, ' ');
+        buf_str(out, SUFFIX_NAME[(*tok).suffix]);
+    }
+}

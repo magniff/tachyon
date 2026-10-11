@@ -1,6 +1,8 @@
 # Tachyon grammar
 
-This is the grammar the compiler implements (`src/lexer`, `src/parser`).
+This is the grammar of tachyon 0.1, as the compiler implements it
+(`compiler/src/10_lexer.tach`, `compiler/src/21_parser.tach`; the seed
+implements the same language in `seed/src/lexer` and `seed/src/parser`).
 Items and statements are parsed by recursive descent, expressions by a Pratt
 (binding power) parser using the table below.
 
