@@ -1,16 +1,8 @@
 # The Tachyon Programming Language
 
-Targets: x86-64 Linux, x86-64 macOS and arm64 macOS (Apple Silicon).
-
-In addition to the Rust toolchain you need a C compiler (`cc`, or whatever
-`$CC` names) to link programs against libc.
-
-```
-$ cargo run -- run examples/helloworld.tach
-Hello from tachyon!
-```
-
-## A taste
+A small systems language: structs, raw pointers, fixed arrays, tuples,
+function pointers, C interop, and expression-oriented control flow. The
+compiler is written in tachyon itself.
 
 ```
 extern fn printf(format: *u8, ...) -> i32;
@@ -35,56 +27,50 @@ fn main() -> i64 {
 }
 ```
 
-Bindings are immutable unless declared `mut`. The full grammar, with the
-operator precedence table, is in [docs/grammar.md](docs/grammar.md).
+Bindings are immutable unless declared `mut`. The grammar, with the operator
+precedence table, is in [docs/grammar.md](docs/grammar.md).
 
-## The `tachyon` command
+## Getting a compiler
 
-```
-$ tachyon build examples/md5.tach -O              # an executable ./md5
-$ tachyon build examples/md5.tach -o md5 --emit obj   # an object file (or --emit clif)
-$ tachyon run -O examples/md5.tach < file         # build in a temp dir, run, forward the exit code
-$ tachyon run examples/args.tach -- one two       # arguments after `--` go to the program
-$ tachyon run --target macos-x86_64 examples/md5.tach   # x86-64 under Rosetta 2
-$ tachyon check examples/httpd.tach               # report errors without generating code
-$ tachyon clif -O examples/md5.tach               # Cranelift IR and machine code
-```
-
-From a checkout, use `cargo run --release -- <subcommand> ...`. The target
-defaults to the host. Diagnostics go to stderr (coloured on a terminal;
-`NO_COLOR` turns colour off). Exit codes: 1 for errors in the program or a
-failed link, 101 for an internal compiler error, and for `run` the program's
-own exit code.
-
-## Code generation
-
-The front end type checks a program and lowers it to tachyon's IR
-(`src/lowering`). The backend (`src/backend`) turns that IR into a native
-object file with [Cranelift](https://cranelift.dev), for `macos-aarch64`,
-`macos-x86_64` and `linux-x86_64`, and `src/driver.rs` links it with the
-system C compiler. Locals live in SSA values and registers. `-O` turns on
-Cranelift's optimizer (GVN, LICM, constant folding, strength reduction).
-
-## Testing
+The compiler (`compiler/`) is written in tachyon, so the first one comes from
+the release chain: the frozen Rust implementation (`stage0/`) builds release
+1.0.0, each release builds the next, and the last one builds HEAD. On macOS
+with Apple Silicon, with git, a Rust toolchain and clang:
 
 ```
-$ cargo test                                       # unit tests, CLI tests, CLIF snapshots, golden programs
-$ cargo test --test run -- --nocapture             # golden programs with a per-configuration summary
-$ TACHYON_RUN_FILTER=prog_ cargo test --test run   # only cases whose name contains "prog_"
-$ TACHYON_TARGET=macos-x86_64 TACHYON_OPT=1 cargo test --test run   # one target, -O only
-$ TACHYON_DOCKER=1 cargo test --test run           # run linux-x86_64 in a linux/amd64 container
-$ cargo insta review                               # accept intended changes to generated CLIF
+$ bootstrap/bootstrap.sh
+...
+compiler: target/tachyonc (tachyonc 1.0.0 (aarch64-apple-darwin))
 ```
 
-Golden programs live in `tests/run/*.tach` and state their expected output in
-comments (`// EXPECT:`, `// EXIT:`, `// ARGS:`, `// STDIN:`, `// ERROR:`,
-`// XFAIL:` for known bugs, `// XFAIL(macos-aarch64):` for one target;
-see `tests/run.rs`). Each program is compiled, linked (the same way as
-`tachyon build`) and run under every configuration: natively at `-O0` and
-`-O` and, on Apple Silicon, for x86-64 as well. Configurations that cannot
-run on the host are skipped (`TACHYON_REQUIRE_RUN=1` turns the skip into a
-failure). Programs marked `// SNAPSHOT` also have their CLIF snapshotted, and
-`tests/cranelift.rs` builds every program for every target on any host.
-`tests/cli.rs` exercises the `tachyon` command itself.
+Every step is checked: each compiler must compile itself to identical
+output (the fixpoint) and pass its release's test suite. See
+[docs/releases.md](docs/releases.md) for the versions, the release process
+and the rules.
 
-WIP, stay tuned
+## Using it
+
+```
+$ target/tachyonc examples/md5.tach -o md5.s && clang -arch arm64 -o md5 md5.s
+$ ./md5 < file
+```
+
+Several files form one program: `tachyonc a.tach b.tach -o out.s`.
+
+## Tests
+
+```
+$ tests/run.sh                       # the suite, with target/tachyonc
+$ tests/run.sh -c path/to/tachyonc prog_
+$ cd stage0 && cargo test            # stage0's own tests
+```
+
+## Layout
+
+| | |
+|---|---|
+| `compiler/` | the tachyon compiler, in tachyon ([compiler/README.md](compiler/README.md)) |
+| `examples/`, `tests/` | examples and the test suite of this release |
+| `docs/` | the grammar, and the release process |
+| `bootstrap/` | the release chain (`releases.toml`) and the script that replays it |
+| `stage0/` | the frozen Rust implementation, the root of the chain ([stage0/README.md](stage0/README.md)) |

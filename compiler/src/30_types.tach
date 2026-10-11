@@ -1,0 +1,387 @@
+// Types and declarations: the interned type table, layouts, and the tables
+// of structs, functions, constants, statics and aliases.
+//
+// A type is an index in TYPES. Types are interned, so two types are equal
+// exactly when their ids are. The primitive types have fixed ids.
+
+const TY_I8: i64 = 1;
+const TY_I16: i64 = 2;
+const TY_I32: i64 = 3;
+const TY_I64: i64 = 4;
+const TY_U8: i64 = 5;
+const TY_U16: i64 = 6;
+const TY_U32: i64 = 7;
+const TY_U64: i64 = 8;
+const TY_F32: i64 = 9;
+const TY_F64: i64 = 10;
+const TY_BOOL: i64 = 11;
+const TY_UNIT: i64 = 12;
+const TY_NEVER: i64 = 13;
+// Constructed kinds: TY_PTR a=pointee, TY_ARRAY a=elem b=length,
+// TY_TUPLE list=elements, TY_STRUCT a=struct, TY_FN list=params a=result.
+const TY_PTR: i64 = 14;
+const TY_ARRAY: i64 = 15;
+const TY_TUPLE: i64 = 16;
+const TY_STRUCT: i64 = 17;
+const TY_FN: i64 = 18;
+
+// `size` is -1 until computed.
+struct Type { kind: i64, a: i64, b: i64, list: i64, count: i64, size: i64, align: i64 }
+
+static mut TYPES: *Type = 0 as *Type;
+static mut TYPE_COUNT: i64 = 0;
+static mut TYPE_CAP: i64 = 0;
+// Element lists of tuple and function types.
+static mut TLISTS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// Elements of types being built; see make_type.
+static mut TSCRATCH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut TY_STRING: i64 = 0;
+static mut TY_U8_PTR: i64 = 0;
+
+fn add_type(kind: i64, a: i64, b: i64, list: i64, count: i64) -> i64 {
+    TYPES = grow(TYPES as *u8, TYPE_COUNT, &TYPE_CAP, 56) as *Type;
+    TYPES[TYPE_COUNT] = Type { kind: kind, a: a, b: b, list: list, count: count, size: -1, align: 1 };
+    TYPE_COUNT += 1;
+    TYPE_COUNT - 1
+}
+
+fn type_elem(t: i64, i: i64) -> i64 {
+    TLISTS.data[TYPES[t].list + i]
+}
+
+// The interned type with these fields and the elements TSCRATCH[mark..],
+// which are popped.
+fn make_type(kind: i64, a: i64, b: i64, mark: i64) -> i64 {
+    let count = TSCRATCH.count - mark;
+    for t in TY_PTR..TYPE_COUNT {
+        if TYPES[t].kind == kind && TYPES[t].a == a && TYPES[t].b == b && TYPES[t].count == count
+            && same_elems(t, mark) {
+            TSCRATCH.count = mark;
+            return t;
+        }
+    }
+    let list = TLISTS.count;
+    for i in mark..TSCRATCH.count {
+        intvec_push(&TLISTS, TSCRATCH.data[i]);
+    }
+    TSCRATCH.count = mark;
+    add_type(kind, a, b, list, count)
+}
+
+fn same_elems(t: i64, mark: i64) -> bool {
+    for i in 0..TYPES[t].count {
+        if type_elem(t, i) != TSCRATCH.data[mark + i] {
+            return false;
+        }
+    }
+    true
+}
+
+fn ptr_to(t: i64) -> i64 {
+    make_type(TY_PTR, t, 0, TSCRATCH.count)
+}
+
+fn array_of(elem: i64, len: i64) -> i64 {
+    make_type(TY_ARRAY, elem, len, TSCRATCH.count)
+}
+
+fn struct_type(s: i64) -> i64 {
+    make_type(TY_STRUCT, s, 0, TSCRATCH.count)
+}
+
+fn init_types() {
+    add_type(0, 0, 0, 0, 0);
+    for kind in TY_I8..TY_PTR {
+        add_type(kind, 0, 0, 0, 0);
+    }
+    TY_U8_PTR = ptr_to(TY_U8);
+    let mark = TSCRATCH.count;
+    intvec_push(&TSCRATCH, TY_U8_PTR);
+    intvec_push(&TSCRATCH, TY_U64);
+    TY_STRING = make_type(TY_TUPLE, 0, 0, mark);
+}
+
+fn is_integer(t: i64) -> bool {
+    t >= TY_I8 && t <= TY_U64
+}
+
+fn is_signed(t: i64) -> bool {
+    t >= TY_I8 && t <= TY_I64
+}
+
+fn is_float(t: i64) -> bool {
+    t == TY_F32 || t == TY_F64
+}
+
+fn is_numeric(t: i64) -> bool {
+    is_integer(t) || is_float(t)
+}
+
+fn is_pointer(t: i64) -> bool {
+    TYPES[t].kind == TY_PTR
+}
+
+fn is_fn_type(t: i64) -> bool {
+    TYPES[t].kind == TY_FN
+}
+
+// Held in memory; expressions of these types produce an address.
+fn is_compound(t: i64) -> bool {
+    let kind = TYPES[t].kind;
+    kind == TY_ARRAY || kind == TY_TUPLE || kind == TY_STRUCT
+}
+
+fn is_void(t: i64) -> bool {
+    t == TY_UNIT || t == TY_NEVER
+}
+
+// Bits of an integer type.
+fn int_bits(t: i64) -> i64 {
+    if t == TY_I8 || t == TY_U8 { return 8; }
+    if t == TY_I16 || t == TY_U16 { return 16; }
+    if t == TY_I32 || t == TY_U32 { return 32; }
+    64
+}
+
+// The largest value of an integer type, as u64.
+fn int_max(t: i64) -> u64 {
+    let bits = int_bits(t);
+    if bits == 64 {
+        return if is_signed(t) { 0x7fffffffffffffff } else { 0xffffffffffffffff };
+    }
+    let all: u64 = (1 << bits as u64) - 1;
+    if is_signed(t) { all >> 1 } else { all }
+}
+
+// ---- Type names, for messages ----
+
+fn buf_type(out: i64, t: i64) {
+    let kind = TYPES[t].kind;
+    if kind <= TY_NEVER {
+        buf_str(out, primitive_name(t));
+    } else if kind == TY_PTR {
+        buf_byte(out, '*');
+        buf_type(out, TYPES[t].a);
+    } else if kind == TY_ARRAY {
+        buf_byte(out, '[');
+        buf_type(out, TYPES[t].a);
+        buf_str(out, c"; ");
+        buf_int(out, TYPES[t].b);
+        buf_byte(out, ']');
+    } else if kind == TY_STRUCT {
+        buf_str(out, sym_name(STRUCTS[TYPES[t].a].name));
+    } else if kind == TY_TUPLE {
+        buf_byte(out, '(');
+        for i in 0..TYPES[t].count {
+            if i > 0 {
+                buf_str(out, c", ");
+            }
+            buf_type(out, type_elem(t, i));
+        }
+        buf_byte(out, ')');
+    } else {
+        buf_str(out, c"fn(");
+        for i in 0..TYPES[t].count {
+            if i > 0 {
+                buf_str(out, c", ");
+            }
+            buf_type(out, type_elem(t, i));
+        }
+        buf_str(out, c") -> ");
+        buf_type(out, TYPES[t].a);
+    }
+}
+
+fn primitive_name(t: i64) -> *u8 {
+    if t == TY_I8 { return c"i8"; }
+    if t == TY_I16 { return c"i16"; }
+    if t == TY_I32 { return c"i32"; }
+    if t == TY_I64 { return c"i64"; }
+    if t == TY_U8 { return c"u8"; }
+    if t == TY_U16 { return c"u16"; }
+    if t == TY_U32 { return c"u32"; }
+    if t == TY_U64 { return c"u64"; }
+    if t == TY_F32 { return c"f32"; }
+    if t == TY_F64 { return c"f64"; }
+    if t == TY_BOOL { return c"bool"; }
+    if t == TY_UNIT { return c"()"; }
+    c"!"
+}
+
+fn err_type(t: i64) {
+    buf_type(ERR, t);
+}
+
+// ---- Declarations ----
+
+struct StructInfo { name: i64, node: i64, fields: i64, field_count: i64, layout_state: i64 }
+struct FieldInfo { name: i64, ty: i64, offset: i64 }
+// Functions and externs. `params` indexes TLISTS.
+struct FnInfo {
+    name: i64, node: i64, params: i64, param_count: i64, ret: i64,
+    variadic: bool, is_extern: bool,
+}
+// state: 0 not evaluated, 1 being evaluated, 2 done.
+struct ConstInfo { node: i64, ty: i64, value: i64, state: i64 }
+struct StaticInfo { node: i64, ty: i64, mutable: bool }
+
+static mut STRUCTS: *StructInfo = 0 as *StructInfo;
+static mut STRUCT_COUNT: i64 = 0;
+static mut STRUCT_CAP: i64 = 0;
+static mut FIELDS: *FieldInfo = 0 as *FieldInfo;
+static mut FIELD_COUNT: i64 = 0;
+static mut FIELD_CAP: i64 = 0;
+static mut FNS: *FnInfo = 0 as *FnInfo;
+static mut FN_COUNT: i64 = 0;
+static mut FN_CAP: i64 = 0;
+static mut CONSTS: *ConstInfo = 0 as *ConstInfo;
+static mut CONST_COUNT: i64 = 0;
+static mut CONST_CAP: i64 = 0;
+static mut STATICS: *StaticInfo = 0 as *StaticInfo;
+static mut STATIC_COUNT: i64 = 0;
+static mut STATIC_CAP: i64 = 0;
+
+// Per symbol: index + 1 of what it names, 0 for nothing. Types and values
+// have separate namespaces.
+static mut SYM_STRUCT: *i64 = 0 as *i64;
+static mut SYM_ALIAS: *i64 = 0 as *i64;
+static mut SYM_FN: *i64 = 0 as *i64;
+static mut SYM_CONST: *i64 = 0 as *i64;
+static mut SYM_STATIC: *i64 = 0 as *i64;
+static mut SYM_PRIMITIVE: *i64 = 0 as *i64;
+// Aliases: the resolved type (0 until resolved), and whether being resolved.
+static mut ALIAS_TYPE: *i64 = 0 as *i64;
+static mut ALIAS_BUSY: *i64 = 0 as *i64;
+
+fn sym_table() -> *i64 {
+    alloc_zeroed(SYM_COUNT * 8) as *i64
+}
+
+fn init_declarations() {
+    let i8_sym = intern_c(c"i8");
+    let names: [*u8; 13] = [c"i8", c"i16", c"i32", c"i64", c"u8", c"u16", c"u32", c"u64",
+        c"f32", c"f64", c"bool", c"isize", c"usize"];
+    let types: [i64; 13] = [TY_I8, TY_I16, TY_I32, TY_I64, TY_U8, TY_U16, TY_U32, TY_U64,
+        TY_F32, TY_F64, TY_BOOL, TY_I64, TY_U64];
+    let mut syms: [i64; 13] = [0; 13];
+    for i in 0..13 {
+        syms[i] = intern_c(names[i]);
+    }
+    SYM_STRUCT = sym_table();
+    SYM_ALIAS = sym_table();
+    SYM_FN = sym_table();
+    SYM_CONST = sym_table();
+    SYM_STATIC = sym_table();
+    SYM_PRIMITIVE = sym_table();
+    ALIAS_TYPE = sym_table();
+    ALIAS_BUSY = sym_table();
+    for i in 0..13 {
+        SYM_PRIMITIVE[syms[i]] = types[i];
+    }
+    if i8_sym != syms[0] {
+        die(c"internal error: symbol table");
+    }
+}
+
+fn struct_field(s: i64, i: i64) -> *FieldInfo {
+    &FIELDS[STRUCTS[s].fields + i]
+}
+
+// The index of field `name` of struct `s`, or -1.
+fn find_field(s: i64, name: i64) -> i64 {
+    for i in 0..STRUCTS[s].field_count {
+        if (*struct_field(s, i)).name == name {
+            return i;
+        }
+    }
+    -1
+}
+
+fn fn_param(f: i64, i: i64) -> i64 {
+    TLISTS.data[FNS[f].params + i]
+}
+
+// ---- Layout ----
+
+fn align_to(offset: i64, align: i64) -> i64 {
+    (offset + align - 1) & ~(align - 1)
+}
+
+fn size_of(t: i64) -> i64 {
+    compute_layout(t);
+    TYPES[t].size
+}
+
+fn align_of(t: i64) -> i64 {
+    compute_layout(t);
+    TYPES[t].align
+}
+
+fn compute_layout(t: i64) {
+    if TYPES[t].size >= 0 {
+        return;
+    }
+    let kind = TYPES[t].kind;
+    let mut size = 0;
+    let mut align = 1;
+    if t == TY_I8 || t == TY_U8 || t == TY_BOOL {
+        size = 1;
+    } else if t == TY_I16 || t == TY_U16 {
+        size = 2;
+    } else if t == TY_I32 || t == TY_U32 || t == TY_F32 {
+        size = 4;
+    } else if t == TY_I64 || t == TY_U64 || t == TY_F64 || kind == TY_PTR || kind == TY_FN {
+        size = 8;
+    } else if kind == TY_ARRAY {
+        size = size_of(TYPES[t].a) * TYPES[t].b;
+        align = align_of(TYPES[t].a);
+    } else if kind == TY_TUPLE {
+        let mut offset = 0;
+        for i in 0..TYPES[t].count {
+            let elem = type_elem(t, i);
+            align = max_i64(align, align_of(elem));
+            offset = align_to(offset, align_of(elem)) + size_of(elem);
+        }
+        size = align_to(offset, align);
+    } else if kind == TY_STRUCT {
+        let s = TYPES[t].a;
+        let mut offset = 0;
+        for i in 0..STRUCTS[s].field_count {
+            let field = struct_field(s, i);
+            let field_ty = (*field).ty;
+            align = max_i64(align, align_of(field_ty));
+            offset = align_to(offset, align_of(field_ty));
+            (*field).offset = offset;
+            offset += size_of(field_ty);
+        }
+        size = align_to(offset, align);
+    }
+    if size > 0 && kind != TY_ARRAY && kind != TY_TUPLE && kind != TY_STRUCT {
+        align = size;
+    }
+    TYPES[t].size = size;
+    TYPES[t].align = align;
+}
+
+fn max_i64(a: i64, b: i64) -> i64 {
+    if a > b { a } else { b }
+}
+
+// The offset of element `i` of tuple type `t`.
+fn tuple_offset(t: i64, i: i64) -> i64 {
+    let mut offset = 0;
+    for j in 0..i + 1 {
+        let elem = type_elem(t, j);
+        offset = align_to(offset, align_of(elem));
+        if j < i {
+            offset += size_of(elem);
+        }
+    }
+    offset
+}
+
+// The offset of field `i` of struct `s`.
+fn field_offset(s: i64, i: i64) -> i64 {
+    compute_layout(struct_type(s));
+    (*struct_field(s, i)).offset
+}

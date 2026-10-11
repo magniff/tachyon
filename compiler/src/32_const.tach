@@ -1,0 +1,345 @@
+// Compile-time constants: `const` items, array lengths and the
+// initializers of statics. A scalar constant is held as 64 bits: integers
+// wrapped to their type (sign-extended when signed), floats as the bits of
+// an f64 (rounded to f32 first for f32), bools as 0 or 1.
+
+fn f64_of_bits(bits: i64) -> f64 {
+    let copy = bits;
+    *(&copy as *f64)
+}
+
+fn bits_of(value: f64) -> i64 {
+    let copy = value;
+    *(&copy as *i64)
+}
+
+fn f32_bits(value: f64) -> u32 {
+    let narrow = value as f32;
+    *(&narrow as *u32)
+}
+
+// `value` wrapped to the integer (or pointer) type `ty`.
+fn wrap_int(value: i64, ty: i64) -> i64 {
+    if !is_integer(ty) {
+        return value;
+    }
+    let bits = int_bits(ty);
+    if bits == 64 {
+        return value;
+    }
+    let mask: i64 = (1 << bits as u64) - 1;
+    let masked = value & mask;
+    if is_signed(ty) && (masked >> (bits - 1) as u64) == 1 {
+        return masked - (1 << bits as u64);
+    }
+    masked
+}
+
+fn float_const(value: f64, ty: i64) -> i64 {
+    if ty == TY_F32 {
+        return bits_of(value as f32 as f64);
+    }
+    bits_of(value)
+}
+
+fn not_constant(n: i64) -> ! {
+    type_error(n, c"expression is not a compile-time constant")
+}
+
+// Type checks `n` against `ty` with no locals in scope.
+fn check_const_expr(n: i64, ty: i64) {
+    let saved_context = CONST_CONTEXT;
+    let saved_return = RETURN_TYPE;
+    CONST_CONTEXT = true;
+    RETURN_TYPE = TY_UNIT;
+    check_expr(n, ty);
+    CONST_CONTEXT = saved_context;
+    RETURN_TYPE = saved_return;
+}
+
+fn const_value(c: i64) -> i64 {
+    if CONSTS[c].state == 2 {
+        return CONSTS[c].value;
+    }
+    let item = CONSTS[c].node;
+    if CONSTS[c].state == 1 {
+        name_error(NODES[item].start, c"constant '", NODES[item].a, c"' is defined in terms of itself");
+    }
+    CONSTS[c].state = 1;
+    check_const_expr(NODES[item].c, CONSTS[c].ty);
+    let value = const_eval(NODES[item].c);
+    CONSTS[c].value = value;
+    CONSTS[c].state = 2;
+    value
+}
+
+fn eval_array_len(n: i64) -> i64 {
+    let saved_context = CONST_CONTEXT;
+    CONST_CONTEXT = true;
+    let ty = synth_expr(n);
+    if !is_integer(ty) {
+        type_error_got(n, c"array length must be an integer", ty);
+    }
+    let value = const_eval(n);
+    CONST_CONTEXT = saved_context;
+    if is_signed(ty) && value < 0 {
+        type_error(n, c"array length must not be negative");
+    }
+    value
+}
+
+// The value of a scalar constant expression (already type checked).
+fn const_eval(n: i64) -> i64 {
+    let kind = NODES[n].kind;
+    let ty = NODES[n].ty;
+    if kind == E_INT || kind == E_CHAR {
+        return wrap_int(NODES[n].a, ty);
+    }
+    if kind == E_FLOAT {
+        return float_const(f64_of_bits(NODES[n].a), ty);
+    }
+    if kind == E_BOOL {
+        return NODES[n].a;
+    }
+    if kind == E_UNIT {
+        return 0;
+    }
+    if kind == E_IDENT {
+        if NODES[n].x != R_CONST {
+            name_error(NODES[n].start, c"'", NODES[n].a, c"' is not a constant");
+        }
+        return const_value(NODES[n].y);
+    }
+    if kind == E_UNARY {
+        return const_unary(n, ty);
+    }
+    if kind == E_BINARY {
+        return const_binary(n, ty);
+    }
+    if kind == E_CAST {
+        let operand = NODES[n].a;
+        let value = const_eval(operand);
+        return const_cast(n, value, NODES[operand].ty, ty);
+    }
+    not_constant(n)
+}
+
+fn const_unary(n: i64, ty: i64) -> i64 {
+    let op = NODES[n].a;
+    let operand = NODES[n].b;
+    let value = const_eval(operand);
+    if op == TK_MINUS {
+        if is_float(ty) {
+            return float_const(0.0 - f64_of_bits(value), ty);
+        }
+        return wrap_int(0 - value, ty);
+    }
+    if op == TK_BANG {
+        return 1 - value;
+    }
+    if op == TK_TILDE {
+        return wrap_int(~value, ty);
+    }
+    not_constant(n)
+}
+
+fn const_binary(n: i64, ty: i64) -> i64 {
+    let op = NODES[n].a;
+    let lhs = NODES[n].b;
+    let operand_ty = NODES[lhs].ty;
+    let a = const_eval(lhs);
+    if op == TK_AMP_AMP && a == 0 {
+        return 0;
+    }
+    if op == TK_PIPE_PIPE && a == 1 {
+        return 1;
+    }
+    let b = const_eval(NODES[n].c);
+    if operand_ty == TY_BOOL {
+        if op == TK_AMP_AMP || op == TK_PIPE_PIPE { return b; }
+        if op == TK_EQ_EQ { return (a == b) as i64; }
+        if op == TK_BANG_EQ { return (a != b) as i64; }
+        type_error(n, c"invalid operator on bools");
+    }
+    if is_float(operand_ty) {
+        return const_float_binary(n, op, f64_of_bits(a), f64_of_bits(b), ty);
+    }
+    const_int_binary(n, op, a, b, operand_ty, ty)
+}
+
+fn const_float_binary(n: i64, op: i64, a: f64, b: f64, ty: i64) -> i64 {
+    if op == TK_PLUS { return float_const(a + b, ty); }
+    if op == TK_MINUS { return float_const(a - b, ty); }
+    if op == TK_STAR { return float_const(a * b, ty); }
+    if op == TK_SLASH { return float_const(a / b, ty); }
+    if op == TK_PERCENT { return float_const(a % b, ty); }
+    if op == TK_EQ_EQ { return (a == b) as i64; }
+    if op == TK_BANG_EQ { return (a != b) as i64; }
+    if op == TK_LT { return (a < b) as i64; }
+    if op == TK_GT { return (a > b) as i64; }
+    if op == TK_LT_EQ { return (a <= b) as i64; }
+    if op == TK_GT_EQ { return (a >= b) as i64; }
+    type_error(n, c"invalid operator on floats")
+}
+
+// `a < b` for values of an integer type.
+fn const_less(a: i64, b: i64, ty: i64) -> bool {
+    if is_signed(ty) { a < b } else { (a as u64) < (b as u64) }
+}
+
+fn const_int_binary(n: i64, op: i64, a: i64, b: i64, operand_ty: i64, ty: i64) -> i64 {
+    if op == TK_PLUS { return wrap_int(a + b, ty); }
+    if op == TK_MINUS { return wrap_int(a - b, ty); }
+    if op == TK_STAR { return wrap_int(a * b, ty); }
+    if op == TK_SLASH || op == TK_PERCENT {
+        if b == 0 {
+            type_error(n, c"division by zero in constant expression");
+        }
+        if is_signed(operand_ty) {
+            // -MIN / -1 overflows; computed by negation, which wraps.
+            if b == -1 {
+                return if op == TK_SLASH { wrap_int(0 - a, ty) } else { 0 };
+            }
+            return wrap_int(if op == TK_SLASH { a / b } else { a % b }, ty);
+        }
+        let ua = a as u64;
+        let ub = b as u64;
+        return wrap_int((if op == TK_SLASH { ua / ub } else { ua % ub }) as i64, ty);
+    }
+    if op == TK_AMP { return wrap_int(a & b, ty); }
+    if op == TK_PIPE { return wrap_int(a | b, ty); }
+    if op == TK_CARET { return wrap_int(a ^ b, ty); }
+    if op == TK_SHL || op == TK_SHR {
+        let amount = (b as u64 & 0xffffffff) % int_bits(operand_ty) as u64;
+        if op == TK_SHL {
+            return wrap_int(a << amount, ty);
+        }
+        if is_signed(operand_ty) {
+            return wrap_int(a >> amount, ty);
+        }
+        return wrap_int(((a as u64) >> amount) as i64, ty);
+    }
+    if op == TK_EQ_EQ { return (a == b) as i64; }
+    if op == TK_BANG_EQ { return (a != b) as i64; }
+    if op == TK_LT { return const_less(a, b, operand_ty) as i64; }
+    if op == TK_GT { return const_less(b, a, operand_ty) as i64; }
+    if op == TK_LT_EQ { return !const_less(b, a, operand_ty) as i64; }
+    if op == TK_GT_EQ { return !const_less(a, b, operand_ty) as i64; }
+    not_constant(n)
+}
+
+fn int_to_f64(value: i64, from: i64) -> f64 {
+    if is_signed(from) { value as f64 } else { (value as u64) as f64 }
+}
+
+fn const_cast(n: i64, value: i64, from: i64, to: i64) -> i64 {
+    let from_float = is_float(from);
+    if (is_integer(to) || is_pointer(to)) && !from_float {
+        if from == TY_BOOL {
+            return value;
+        }
+        return wrap_int(value, to);
+    }
+    if is_float(to) && from_float {
+        return float_const(f64_of_bits(value), to);
+    }
+    if is_float(to) && (is_integer(from) || is_pointer(from)) {
+        return float_const(int_to_f64(value, from), to);
+    }
+    if is_integer(to) && from_float {
+        return float_to_int(f64_of_bits(value), to);
+    }
+    not_constant(n)
+}
+
+// A saturating float to integer conversion (NaN is 0), like Rust's `as`.
+fn float_to_int(value: f64, to: i64) -> i64 {
+    if value != value {
+        return 0;
+    }
+    let bits = int_bits(to);
+    if to == TY_U64 {
+        if value <= 0.0 {
+            return 0;
+        }
+        if value >= 18446744073709551616.0 {
+            return -1;
+        }
+        if value >= 9223372036854775808.0 {
+            return ((value - 9223372036854775808.0) as i64) ^ (1 << 63);
+        }
+        return value as i64;
+    }
+    let mut min = 0.0;
+    let mut max = 0.0;
+    if is_signed(to) {
+        min = 0.0 - int_to_f64(1 << (bits - 1) as u64, TY_I64);
+        max = int_to_f64(int_max(to) as i64, TY_I64);
+    } else {
+        max = int_to_f64(int_max(to) as i64, TY_I64);
+    }
+    if value <= min {
+        return wrap_int(min as i64, to);
+    }
+    if value >= max {
+        return int_max(to) as i64;
+    }
+    value as i64
+}
+
+// ---- Aggregate constants (the initializers of statics) ----
+
+// Appends the bytes of the constant `n` of type `ty` to buffer `out`.
+fn const_emit(n: i64, ty: i64, out: i64) {
+    let at = BUFS[out].len;
+    let size = size_of(ty);
+    buf_reserve(out, size);
+    memset(&BUFS[out].data[at], 0, size as u64);
+    BUFS[out].len += size;
+    const_write(n, ty, out, at);
+}
+
+fn const_write(n: i64, ty: i64, out: i64, at: i64) {
+    let kind = NODES[n].kind;
+    if kind == E_STRUCT {
+        let s = TYPES[ty].a;
+        for i in 0..NODES[n].count {
+            let init = child(n, i);
+            let field = NODES[init].x;
+            const_write(NODES[init].b, (*struct_field(s, field)).ty, out, at + field_offset(s, field));
+        }
+        return;
+    }
+    if kind == E_TUPLE {
+        for i in 0..NODES[n].count {
+            const_write(child(n, i), type_elem(ty, i), out, at + tuple_offset(ty, i));
+        }
+        return;
+    }
+    if kind == E_ARRAY || kind == E_REPEAT {
+        let elem = TYPES[ty].a;
+        let elem_size = size_of(elem);
+        for i in 0..TYPES[ty].b {
+            let value = if kind == E_ARRAY { child(n, i) } else { NODES[n].a };
+            const_write(value, elem, out, at + i * elem_size);
+        }
+        return;
+    }
+    if is_compound(ty) {
+        not_constant(n);
+    }
+    let value = const_eval(n);
+    write_scalar(out, at, value, ty);
+}
+
+// The bytes of a scalar constant, little-endian.
+fn write_scalar(out: i64, at: i64, value: i64, ty: i64) {
+    let size = size_of(ty);
+    let mut bits = value as u64;
+    if ty == TY_F32 {
+        bits = f32_bits(f64_of_bits(value)) as u64;
+    }
+    for i in 0..size {
+        BUFS[out].data[at + i] = (bits >> (i * 8) as u64) as u8;
+    }
+}
