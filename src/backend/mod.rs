@@ -82,16 +82,6 @@ impl Target {
     pub fn is_x86_64(self) -> bool {
         matches!(self, Target::LinuxX86_64 | Target::MacosX86_64)
     }
-
-    // Linker command (program and leading arguments) for an object file
-    // produced for this target.
-    pub fn linker(self) -> (&'static str, &'static [&'static str]) {
-        match self {
-            Target::LinuxX86_64 => ("cc", &[]),
-            Target::MacosX86_64 => ("clang", &["-arch", "x86_64", "-Wl,-w"]),
-            Target::MacosAarch64 => ("clang", &["-arch", "arm64"]),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

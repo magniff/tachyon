@@ -1,4 +1,5 @@
 pub mod backend;
+pub mod driver;
 pub mod lexer;
 pub mod lowering;
 pub mod parser;
@@ -18,6 +19,7 @@ pub struct CompilerError {
     message: String,
     span: (usize, Option<usize>),
     kind: ErrorKind,
+    help: Option<String>,
 }
 
 impl From<lexer::LexError> for CompilerError {
@@ -26,6 +28,7 @@ impl From<lexer::LexError> for CompilerError {
             message: error.message,
             span: (error.position, None),
             kind: ErrorKind::TokenizerError,
+            help: None,
         }
     }
 }
@@ -36,6 +39,7 @@ impl From<parser::ParserError> for CompilerError {
             message: error.message,
             span: (error.span.start, Some(error.span.end)),
             kind: ErrorKind::ParserError,
+            help: None,
         }
     }
 }
@@ -46,6 +50,7 @@ impl From<typechecker::TypecheckerError> for CompilerError {
             message: error.message,
             span: (error.span.start, Some(error.span.end)),
             kind: ErrorKind::TypecheckerError,
+            help: error.help,
         }
     }
 }
@@ -56,6 +61,7 @@ impl From<backend::GeneratorError> for CompilerError {
             message: error.message,
             span: (0, None),
             kind: ErrorKind::GeneratorError,
+            help: None,
         }
     }
 }
@@ -68,17 +74,31 @@ impl From<CompilerError> for Vec<CompilerError> {
 
 pub use backend::{Artifact, OptLevel, Options, Target};
 
-fn front_end(program_text: &str) -> Result<lowering::IrProgram, Vec<CompilerError>> {
-    let tokens = lexer::Lexer::new(&program_text)
+// Lexes, parses and type checks a program.
+fn analyze(
+    program_text: &str,
+) -> Result<(parser::Program, typechecker::CheckedProgram), Vec<CompilerError>> {
+    let tokens = lexer::Lexer::new(program_text)
         .tokenize()
         .map_err(|error| vec![error.into()])?;
-    let ast = parser::parse(&tokens).map_err(|error| vec![error.into()])?;
+    let ast = parser::parse(tokens)
+        .map_err(|errors| errors.into_iter().map(Into::into).collect::<Vec<_>>())?;
     let checked = typechecker::typecheck(&ast).map_err(|typechecker_errors| {
         typechecker_errors
             .into_iter()
             .map(|error| error.into())
             .collect::<Vec<_>>()
     })?;
+    Ok((ast, checked))
+}
+
+// Reports the program's errors without generating code.
+pub fn check(program_text: &str) -> Result<(), Vec<CompilerError>> {
+    analyze(program_text).map(|_| ())
+}
+
+fn front_end(program_text: &str) -> Result<lowering::IrProgram, Vec<CompilerError>> {
+    let (ast, checked) = analyze(program_text)?;
     Ok(lowering::lower(&ast, &checked))
 }
 
@@ -90,7 +110,10 @@ pub fn compile(program_text: &str, options: &Options) -> Result<Artifact, Vec<Co
 }
 
 // Cranelift IR and machine code of every function, for inspection.
-pub fn compile_to_clif(program_text: &str, options: &Options) -> Result<String, Vec<CompilerError>> {
+pub fn compile_to_clif(
+    program_text: &str,
+    options: &Options,
+) -> Result<String, Vec<CompilerError>> {
     let program = front_end(program_text)?;
     Ok(backend::cranelift::clif_text(&program, options).map_err(Into::<CompilerError>::into)?)
 }
@@ -176,6 +199,9 @@ pub fn format_errors(errors: &[CompilerError], program_text: &str) -> String {
                 }
             }
             out.push_str("  | ^--- spans multiple lines\n");
+        }
+        if let Some(help) = &error.help {
+            out.push_str(&format!("  = help: {}\n", help));
         }
         out.push('\n');
     }

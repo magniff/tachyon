@@ -119,12 +119,10 @@ struct Codegen {
     call_conv: CallConv,
     funcs: HashMap<String, FuncDecl>,
     strings: Vec<DataId>,
-    ipow: Option<FuncId>,
+    globals: Vec<DataId>,
     // x86-64 only: `mov al, 8; jmp f` thunks for variadic externs.
     va_thunks: HashMap<String, FuncId>,
 }
-
-const IPOW: &str = "__ipow";
 
 fn local_symbol(name: &str) -> String {
     if name == "main" {
@@ -160,7 +158,7 @@ impl Codegen {
             call_conv,
             funcs: HashMap::new(),
             strings: Vec::new(),
-            ipow: None,
+            globals: Vec::new(),
             va_thunks: HashMap::new(),
         };
         codegen.declare(program)?;
@@ -233,28 +231,15 @@ impl Codegen {
             );
         }
 
-        // Functions the lowering calls on its own (fmod, pow, __ipow) and
-        // thunks for variadic calls.
+        // Functions the lowering calls on its own (fmod, fmodf) and thunks
+        // for variadic calls.
         for function in &program.functions {
             for bb in &function.blocks {
                 for inst in &bb.instructions {
                     let Inst::Call { dst, func, args } = inst else {
                         continue;
                     };
-                    if func == IPOW {
-                        if self.ipow.is_none() {
-                            let sig = self.signature(
-                                &[IRType::I64, IRType::I64],
-                                Some(IRType::I64),
-                                false,
-                            );
-                            self.ipow = Some(
-                                self.module
-                                    .declare_function("tachyon.ipow", Linkage::Local, &sig)
-                                    .map_err(Self::module_error)?,
-                            );
-                        }
-                    } else if !self.funcs.contains_key(func) {
+                    if !self.funcs.contains_key(func) {
                         let params: Vec<IRType> = args.iter().map(|(_, ty)| *ty).collect();
                         let ret = dst.map(|(_, ty)| ty);
                         let sig = self.signature(&params, ret, true);
@@ -307,6 +292,29 @@ impl Codegen {
                 .map_err(Self::module_error)?;
             self.strings.push(id);
         }
+
+        for global in &program.globals {
+            let id = self
+                .module
+                .declare_data(
+                    &format!("tachyon.global.{}", global.name),
+                    Linkage::Local,
+                    global.mutable,
+                    false,
+                )
+                .map_err(Self::module_error)?;
+            let mut bytes = global.bytes.clone();
+            if bytes.is_empty() {
+                bytes.push(0);
+            }
+            let mut description = DataDescription::new();
+            description.define(bytes.into_boxed_slice());
+            description.set_align(global.align.max(1));
+            self.module
+                .define_data(id, &description)
+                .map_err(Self::module_error)?;
+            self.globals.push(id);
+        }
         Ok(())
     }
 
@@ -332,16 +340,6 @@ impl Codegen {
                 return Err(e);
             }
             self.compile(&function.name, decl.id, &mut ctx, &mut text)?;
-        }
-        if let Some(id) = self.ipow {
-            ctx.func.signature = self
-                .module
-                .declarations()
-                .get_function_decl(id)
-                .signature
-                .clone();
-            build_ipow(&mut ctx.func, &mut builder_ctx, self.module.target_config());
-            self.compile(IPOW, id, &mut ctx, &mut text)?;
         }
         let thunks: Vec<(String, FuncId)> = self
             .va_thunks
@@ -443,9 +441,11 @@ fn inst_def(inst: &Inst) -> Option<(VReg, Option<IRType>)> {
         INeg(d, _, t) | IBitNot(d, _, t) | FNeg(d, _, t) => (*d, Some(*t)),
         ICmp(d, ..) | FCmp(d, ..) | BoolNot(d, _) => (*d, Some(IRType::I8)),
         ConstInt(d, _, t) | ConstFloat(d, _, t) => (*d, Some(*t)),
-        ConstStringPtr(d, _) | SlotAddr(d, _) | MemberPtr(d, _, _) | IndexPtr(d, _, _, _) => {
-            (*d, Some(IRType::Ptr))
-        }
+        ConstStringPtr(d, _)
+        | GlobalAddr(d, _)
+        | SlotAddr(d, _)
+        | MemberPtr(d, _, _)
+        | IndexPtr(d, _, _, _) => (*d, Some(IRType::Ptr)),
         FuncAddr(d, _) => (*d, Some(IRType::Ptr)),
         IntToFloat(d, _, _, t, _)
         | FloatToInt(d, _, _, t, _)
@@ -504,9 +504,8 @@ fn inst_uses(inst: &Inst) -> Vec<VReg> {
             uses.extend(args.iter().map(|(v, _)| *v));
             uses
         }
-        ConstInt(..) | ConstFloat(..) | ConstStringPtr(..) | SlotAddr(..) | FuncAddr(..) => {
-            vec![]
-        }
+        ConstInt(..) | ConstFloat(..) | ConstStringPtr(..) | GlobalAddr(..) | SlotAddr(..)
+        | FuncAddr(..) => vec![],
     }
 }
 
@@ -1064,6 +1063,12 @@ impl<'a> Translator<'a> {
                 let r = self.b.ins().symbol_value(ptr, gv);
                 self.set(*d, r);
             }
+            GlobalAddr(d, index) => {
+                let gv = self.data_ref(self.cg.globals[*index]);
+                let ptr = self.cg.ptr;
+                let r = self.b.ins().symbol_value(ptr, gv);
+                self.set(*d, r);
+            }
             IntToFloat(d, s, from, to, signed) => {
                 let from_ty = self.ty(*from);
                 let to_ty = self.ty(*to);
@@ -1239,18 +1244,6 @@ impl<'a> Translator<'a> {
     }
 
     fn call(&mut self, dst: Option<(VReg, IRType)>, func: &str, args: &[(VReg, IRType)]) {
-        if func == IPOW {
-            let id = self.cg.ipow.expect("ipow declared");
-            let r = self.func_ref(id);
-            let x = self.get_as(args[0].0, types::I64);
-            let y = self.get_as(args[1].0, types::I64);
-            let call = self.b.ins().call(r, &[x, y]);
-            if let Some((d, _)) = dst {
-                let result = self.b.inst_results(call)[0];
-                self.set(d, result);
-            }
-            return;
-        }
         let decl = self.cg.funcs[func].clone();
         if decl.is_extern && !decl.is_variadic && args.len() != decl.params.len() {
             // The lowering passes compound results through a hidden pointer,
@@ -1364,56 +1357,6 @@ enum ShiftKind {
     Shl,
     Ushr,
     Sshr,
-}
-
-// __ipow(base, exp): exponentiation by squaring on 64-bit integers.
-fn build_ipow(
-    func: &mut ir::Function,
-    builder_ctx: &mut FunctionBuilderContext,
-    config: cranelift_codegen::isa::TargetFrontendConfig,
-) {
-    let mut b = FunctionBuilder::new(func, builder_ctx);
-    let entry = b.create_block();
-    let header = b.create_block();
-    let body = b.create_block();
-    let done = b.create_block();
-    b.append_block_params_for_function_params(entry);
-    let result = b.declare_var(types::I64);
-    let base = b.declare_var(types::I64);
-    let exp = b.declare_var(types::I64);
-
-    b.switch_to_block(entry);
-    let params = b.block_params(entry).to_vec();
-    let one = b.ins().iconst(types::I64, 1);
-    b.def_var(result, one);
-    b.def_var(base, params[0]);
-    b.def_var(exp, params[1]);
-    b.ins().jump(header, &[]);
-
-    b.switch_to_block(header);
-    let e = b.use_var(exp);
-    b.ins().brif(e, body, &[], done, &[]);
-
-    b.switch_to_block(body);
-    let e = b.use_var(exp);
-    let x = b.use_var(base);
-    let r = b.use_var(result);
-    let odd = b.ins().band_imm_u(e, 1);
-    let times = b.ins().imul(r, x);
-    let r = b.ins().select(odd, times, r);
-    b.def_var(result, r);
-    let x = b.ins().imul(x, x);
-    b.def_var(base, x);
-    let e = b.ins().ushr_imm_u(e, 1);
-    b.def_var(exp, e);
-    b.ins().jump(header, &[]);
-
-    b.switch_to_block(done);
-    let r = b.use_var(result);
-    b.ins().return_(&[r]);
-
-    b.seal_all_blocks();
-    b.finalize(config);
 }
 
 #[cfg(test)]
