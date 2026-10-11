@@ -17,8 +17,11 @@
 const LSR_MAX_POINTERS: i64 = 4;
 const UNSWITCH_MAX_SIZE: i64 = 48;
 
-// An affine form: AF[0] = k, AF[1] = s (the coefficient of the induction
-// variable), then the terms (b1, c1), (b2, c2) (b = 0: none).
+// An affine form: AF[0] = k, AF[1] = s, then the terms (b1, c1), (b2, c2)
+// (b = 0: none), then (v, m): the value is k + c1*b1 + c2*b2 + (s + m*v)*i
+// (v invariant: a stride known at run time only).
+const AF_SIZE: i64 = 8;
+
 fn af_set(af: *i64, k: i64, s: i64, b1: i64, c1: i64, b2: i64, c2: i64) {
     af[0] = k;
     af[1] = s;
@@ -26,6 +29,8 @@ fn af_set(af: *i64, k: i64, s: i64, b1: i64, c1: i64, b2: i64, c2: i64) {
     af[3] = c1;
     af[4] = b2;
     af[5] = c2;
+    af[6] = 0;
+    af[7] = 0;
 }
 
 // Adds term (b, c) to af; false when there is no room.
@@ -57,6 +62,11 @@ fn af_add_term(af: *i64, b: i64, c: i64) -> bool {
 // af = x + m * y.
 fn af_combine(af: *i64, x: *i64, y: *i64, m: i64) -> bool {
     af_set(af, x[0] + m * y[0], x[1] + m * y[1], x[2], x[3], x[4], x[5]);
+    if x[7] != 0 && y[7] != 0 && x[6] != y[6] {
+        return false;
+    }
+    af[6] = if x[7] != 0 { x[6] } else { y[6] };
+    af[7] = x[7] + m * y[7];
     af_add_term(af, y[2], m * y[3]) && af_add_term(af, y[4], m * y[5])
 }
 
@@ -65,6 +75,7 @@ fn af_scale(af: *i64, m: i64) {
     af[1] = af[1] * m;
     af[3] = af[3] * m;
     af[5] = af[5] * m;
+    af[7] = af[7] * m;
 }
 
 // The affine form of v in loop l over induction variable iv; *cost counts
@@ -88,8 +99,8 @@ fn affine_of(l: i64, iv: i64, v: i64, af: *i64, cost: *i64, depth: i64) -> bool 
         return true;
     }
     let op = INSTS[x].op;
-    let mut fa: [i64; 6] = [0; 6];
-    let mut fb: [i64; 6] = [0; 6];
+    let mut fa: [i64; 8] = [0; 8];
+    let mut fb: [i64; 8] = [0; 8];
     if op == Op::Add || op == Op::Sub {
         if !affine_of(l, iv, INSTS[x].a, &fa[0], cost, depth + 1)
             || !affine_of(l, iv, INSTS[x].b, &fb[0], cost, depth + 1) {
@@ -110,6 +121,20 @@ fn affine_of(l: i64, iv: i64, v: i64, af: *i64, cost: *i64, depth: i64) -> bool 
         } else if op == Op::Mul && is_const(a) {
             m = INSTS[a].imm;
             operand = b;
+        } else if op == Op::Mul && (invariant_in(l, b) || invariant_in(l, a)) {
+            // By a stride known at run time: the operand must be k + s*i.
+            let stride = if invariant_in(l, b) { b } else { a };
+            let other = if stride == b { a } else { b };
+            if !affine_of(l, iv, other, af, cost, depth + 1) || af[2] != 0 || af[4] != 0 || af[7] != 0 {
+                return false;
+            }
+            let k = af[0];
+            let sc = af[1];
+            af_set(af, 0, 0, stride, k, 0, 0);
+            af[6] = stride;
+            af[7] = sc;
+            *cost = *cost + 1;
+            return true;
         } else {
             return false;
         }
@@ -179,21 +204,25 @@ fn reduce_loop(fi: i64, l: i64) -> bool {
             let op = INSTS[v].op;
             if op == Op::Load || op == Op::Store {
                 let addr = ir_val(INSTS[v].a);
-                let mut af: [i64; 6] = [0; 6];
+                let mut af: [i64; 8] = [0; 8];
                 let mut cost = 0;
                 if !invariant_in(l, addr) && addr != iv
-                    && affine_of(l, iv, addr, &af[0], &cost, 0) && cost > 0 && af[1] != 0 {
+                    && affine_of(l, iv, addr, &af[0], &cost, 0) && cost > 0 && (af[1] != 0 || af[7] != 0) {
                     let mut g = -1;
-                    for k in 0..groups.count / 6 {
-                        if groups.data[6 * k + 1] == af[1] && groups.data[6 * k + 2] == af[2]
-                            && groups.data[6 * k + 3] == af[3] && groups.data[6 * k + 4] == af[4]
-                            && groups.data[6 * k + 5] == af[5] {
+                    for k in 0..groups.count / AF_SIZE {
+                        let mut same = true;
+                        for m in 1..AF_SIZE {
+                            if groups.data[AF_SIZE * k + m] != af[m] {
+                                same = false;
+                            }
+                        }
+                        if same {
                             g = k;
                         }
                     }
-                    if g < 0 && groups.count / 6 < LSR_MAX_POINTERS {
-                        g = groups.count / 6;
-                        for k in 0..6 {
+                    if g < 0 && groups.count / AF_SIZE < LSR_MAX_POINTERS {
+                        g = groups.count / AF_SIZE;
+                        for k in 0..AF_SIZE {
                             groups.push(af[k]);
                         }
                     }
@@ -207,12 +236,12 @@ fn reduce_loop(fi: i64, l: i64) -> bool {
             v = INSTS[v].next;
         }
     }
-    let ngroups = groups.count / 6;
+    let ngroups = groups.count / AF_SIZE;
     let pre_index = pred_index(h, pre);
     let latch_index = pred_index(h, latch);
     let start = iv_start(l, iv);
     for g in 0..ngroups {
-        let af = &groups.data[6 * g];
+        let af = &groups.data[AF_SIZE * g];
         let s = af[1];
         // The smallest k of the group is the pointer's.
         let mut k0 = 0;
@@ -225,8 +254,15 @@ fn reduce_loop(fi: i64, l: i64) -> bool {
         }
         // Start: the form at the induction variable's start.
         let base = materialize_affine(pre, af, k0);
-        let scaled = append_inst(pre, Op::Mul, TY_U64, start, append_const(pre, s, TY_U64));
+        // The coefficient of the induction variable, s + m*v.
+        let mut coef = append_const(pre, s, TY_U64);
+        if af[7] != 0 {
+            let sym = append_inst(pre, Op::Mul, TY_U64, af[6], append_const(pre, af[7], TY_U64));
+            coef = append_inst(pre, Op::Add, TY_U64, coef, sym);
+        }
+        let scaled = append_inst(pre, Op::Mul, TY_U64, start, coef);
         let init = append_inst(pre, Op::Add, TY_U64, base, scaled);
+        let stride = append_inst(pre, Op::Mul, TY_U64, coef, append_const(pre, step, TY_U64));
         let ptr = ir_make(Op::Phi, TY_U64, 0, 0, 0);
         INSTS[ptr].args = ARGS.count;
         INSTS[ptr].nargs = 2;
@@ -235,7 +271,7 @@ fn reduce_loop(fi: i64, l: i64) -> bool {
         ARGS.push(0);
         ARGTY.push(0);
         ir_prepend(h, ptr);
-        let next = append_inst(latch, Op::Add, TY_U64, ptr, append_const(latch, s * step, TY_U64));
+        let next = append_inst(latch, Op::Add, TY_U64, ptr, stride);
         ir_set_arg(ptr, pre_index, init);
         ir_set_arg(ptr, latch_index, next);
         for c in 0..cands.count / 3 {
