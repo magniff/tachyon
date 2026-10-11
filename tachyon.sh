@@ -70,8 +70,20 @@ fi
 
 [[ -x "$TACHYON" ]] || die "tachyon compiler not found"
 
+# Linux: ELF + gcc. macOS: Mach-O x86-64 + clang (Apple Silicon runs it
+# under Rosetta 2).
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    TARGET="macos-x86_64"
+    NASM_FORMAT="macho64"
+    LINK=(clang -arch x86_64 -Wl,-w)
+else
+    TARGET="linux-x86_64"
+    NASM_FORMAT="elf64"
+    LINK=(gcc -no-pie -lc)
+fi
+
 command -v nasm >/dev/null 2>&1 || die "nasm not found"
-command -v gcc  >/dev/null 2>&1 || die "gcc not found"
+command -v "${LINK[0]}" >/dev/null 2>&1 || die "${LINK[0]} not found"
 
 STEM="$(basename "${INPUT%.tach}")"
 
@@ -88,21 +100,22 @@ fi
 
 # --- Compile ---
 echo -e "${CYAN}[1/3]${NC} tachyon  ${INPUT} → ${ASM}" >&2
-"$TACHYON" --input "$INPUT" --output "$ASM" || die "compilation failed"
+"$TACHYON" --target "$TARGET" --input "$INPUT" --output "$ASM" || die "compilation failed"
 
 # --- Assemble ---
 echo -e "${CYAN}[2/3]${NC} nasm     ${ASM} → ${OBJ}" >&2
-nasm -f elf64 -o "$OBJ" "$ASM" || die "assembly failed"
+nasm -f "$NASM_FORMAT" -o "$OBJ" "$ASM" || die "assembly failed"
 
 # --- Link ---
-echo -e "${CYAN}[3/3]${NC} gcc      ${OBJ} → ${BIN}  (libc)" >&2
-gcc -o "$BIN" "$OBJ" -no-pie -lc -lm || die "linking failed"
+echo -e "${CYAN}[3/3]${NC} ${LINK[0]}  ${OBJ} → ${BIN}  (libc)" >&2
+"${LINK[@]}" -o "$BIN" "$OBJ" -lm || die "linking failed"
 
 # --- Run mode ---
 if [[ "$MODE" == "run" ]]; then
     echo -e "${GREEN}running:${NC} ${INPUT}" >&2
-    "$BIN" "${PROGRAM_ARGS[@]}"
-    STATUS=$?
+    # ${a[@]+...}: bash 3.2 (macOS) treats an empty array as unbound under -u.
+    STATUS=0
+    "$BIN" ${PROGRAM_ARGS[@]+"${PROGRAM_ARGS[@]}"} || STATUS=$?
     rm -rf "$TMPDIR"
     exit $STATUS
 fi

@@ -155,6 +155,7 @@ pub enum LValueKind {
     Ident(String),
     Deref(Box<Expr>),
     Field(Box<LValue>, Spanned<String>),
+    TupleField(Box<LValue>, Spanned<u64>),
     Index(Box<LValue>, Expr),
 }
 
@@ -237,7 +238,7 @@ pub struct FieldInit {
 pub enum ExprKind {
     IntLiteral(u64),
     FloatLiteral(Float),
-    StringLiteral(String),
+    StringLiteral(Vec<u8>),
     BoolLiteral(bool),
     UnitLiteral,
     Ident(String),

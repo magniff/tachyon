@@ -337,6 +337,13 @@ impl Parser {
                     span,
                 })
             }
+            ExprKind::TupleField { expr: inner, index } => {
+                let inner_lv = Self::expr_to_lvalue(*inner)?;
+                Ok(LValue {
+                    kind: LValueKind::TupleField(Box::new(inner_lv), index),
+                    span,
+                })
+            }
             ExprKind::Index { expr: inner, index } => {
                 let inner_lv = Self::expr_to_lvalue(*inner)?;
                 Ok(LValue {

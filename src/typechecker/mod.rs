@@ -488,15 +488,14 @@ impl Typechecker {
                 // Check body.
                 // If the body has a tail expression, check_block verifies it
                 // against the return type. If there's no tail, body type is ().
-                // We only flag a mismatch when there is no return statement,
-                // because `{ return X; }` has body type () but the return
-                // statement already checks X against the declared return type.
-                let has_return = Self::block_has_return(&fd.body);
+                // That is only fine when control never reaches the end of the
+                // body (every path returns), since `return X;` statements are
+                // checked against the declared return type on their own.
                 let body_ty = self.check_block(&fd.body, Some(&sig.return_ty));
 
                 match body_ty {
                     Ok(bt) => {
-                        if bt != sig.return_ty && !has_return {
+                        if bt != sig.return_ty && !block_diverges(&fd.body) {
                             self.errors.push(typechecker_error(
                                 fd.body.span,
                                 format!(
@@ -510,21 +509,6 @@ impl Typechecker {
                 }
             }
         }
-    }
-
-    fn block_has_return(block: &Block) -> bool {
-        for stmt in &block.stmts {
-            match stmt {
-                Stmt::Return(_) => return true,
-                Stmt::Loop(l) => {
-                    if Self::block_has_return(&l.body) {
-                        return true;
-                    }
-                }
-                _ => {}
-            }
-        }
-        false
     }
 
     fn check_block(
@@ -551,6 +535,20 @@ impl Typechecker {
 
         self.env.pop_scope();
         Ok(ty)
+    }
+
+    // A block in check mode (an if/else branch or a block expression): its
+    // tail must have the expected type, and a block without a tail has type
+    // () unless control never reaches its end.
+    fn check_branch(&mut self, block: &Block, expected: &TypeInternal) -> TypecheckerResult<()> {
+        let ty = self.check_block(block, Some(expected))?;
+        if ty != *expected && !block_diverges(block) {
+            return Err(typechecker_error(
+                block.span,
+                format!("expected '{}', got '{}'", expected, ty),
+            ));
+        }
+        Ok(())
     }
 
     fn check_stmt(&mut self, stmt: &Stmt) {
@@ -729,6 +727,24 @@ impl Typechecker {
                 let inner_ty = self.synth_lvalue(inner)?;
                 self.resolve_field_access(&inner_ty, &field_name.0, lv.span)
             }
+            LValueKind::TupleField(inner, index) => match self.synth_lvalue(inner)? {
+                TypeInternal::Tuple(elems) => {
+                    elems.get(index.0 as usize).cloned().ok_or_else(|| {
+                        typechecker_error(
+                            lv.span,
+                            format!(
+                                "tuple index {} out of range for tuple with {} elements",
+                                index.0,
+                                elems.len()
+                            ),
+                        )
+                    })
+                }
+                other => Err(typechecker_error(
+                    lv.span,
+                    format!("cannot use tuple index on type '{}'", other),
+                )),
+            },
             LValueKind::Index(inner, index_expr) => {
                 let inner_ty = self.synth_lvalue(inner)?;
                 match &inner_ty {
@@ -904,9 +920,8 @@ impl Typechecker {
                 self.check_expr(cond, &TypeInternal::Bool)?;
                 match else_block {
                     Some(eb) => {
-                        self.check_block(then_block, Some(expected))?;
-                        self.check_block(eb, Some(expected))?;
-                        Ok(())
+                        self.check_branch(then_block, expected)?;
+                        self.check_branch(eb, expected)
                     }
                     None => {
                         if *expected != TypeInternal::Unit {
@@ -925,10 +940,60 @@ impl Typechecker {
             }
 
             // Block: push expected into tail
-            ExprKind::Block(block) => {
-                self.check_block(block, Some(expected))?;
+            ExprKind::Block(block) => self.check_branch(block, expected),
+
+            // Arithmetic and bitwise operators: push a numeric expected type
+            // into both operands so literals take it (`let x: u8 = 1 + 2`).
+            ExprKind::BinOp { op, lhs, rhs }
+                if (matches!(
+                    op,
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Pow
+                ) && expected.is_numeric())
+                    || (matches!(op, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor)
+                        && expected.is_integer()) =>
+            {
+                self.check_expr(lhs, expected)?;
+                self.check_expr(rhs, expected)
+            }
+            ExprKind::BinOp {
+                op: BinOp::Shl | BinOp::Shr,
+                lhs,
+                rhs,
+            } if expected.is_integer() => {
+                self.check_expr(lhs, expected)?;
+                let rty = self.synth_expr(rhs)?;
+                if !rty.is_integer() {
+                    return Err(typechecker_error(
+                        rhs.span,
+                        format!("shift amount must be integer, got '{}'", rty),
+                    ));
+                }
                 Ok(())
             }
+            ExprKind::UnaryOp {
+                op: op @ (UnaryOp::Neg | UnaryOp::Pos),
+                expr: inner,
+            } if expected.is_numeric() => {
+                // `-128` fits i8 although `128` does not
+                if let (UnaryOp::Neg, ExprKind::IntLiteral(v)) = (op, &inner.kind)
+                    && expected.is_signed()
+                    && expected.is_integer()
+                {
+                    return self.check_int_fits(v.saturating_sub(1), expected, expr.span).map_err(
+                        |_| {
+                            typechecker_error(
+                                expr.span,
+                                format!("integer literal -{} does not fit in type '{}'", v, expected),
+                            )
+                        },
+                    );
+                }
+                self.check_expr(inner, expected)
+            }
+            ExprKind::UnaryOp {
+                op: UnaryOp::BitNot,
+                expr: inner,
+            } if expected.is_integer() => self.check_expr(inner, expected),
 
             // For everything else, fall back to synth + compare
             _ => {
@@ -960,9 +1025,26 @@ impl Typechecker {
                 ]))
             }
 
-            ExprKind::Ident(name) => self.env.lookup(name).cloned().ok_or_else(|| {
-                typechecker_error(expr.span, format!("undefined variable '{}'", name))
-            }),
+            ExprKind::Ident(name) => {
+                if let Some(ty) = self.env.lookup(name) {
+                    return Ok(ty.clone());
+                }
+                // A function used as a value has a function pointer type
+                match self.signatures.get(name) {
+                    Some(sig) if !sig.is_variadic => Ok(TypeInternal::Fn {
+                        params: sig.params.iter().map(|(_, t)| t.clone()).collect(),
+                        result: Box::new(sig.return_ty.clone()),
+                    }),
+                    Some(_) => Err(typechecker_error(
+                        expr.span,
+                        format!("variadic function '{}' cannot be used as a value", name),
+                    )),
+                    None => Err(typechecker_error(
+                        expr.span,
+                        format!("undefined variable '{}'", name),
+                    )),
+                }
+            }
 
             ExprKind::BinOp { op, lhs, rhs } => self.synth_binop(op, lhs, rhs, expr.span),
             ExprKind::UnaryOp { op, expr: inner } => self.synth_unaryop(op, inner, expr.span),
@@ -1132,9 +1214,17 @@ impl Typechecker {
             return Ok(lty);
         }
 
-        let lty = self.synth_expr(lhs)?;
-        // Check rhs against lhs type so literals pick up the right type
-        self.check_expr(rhs, &lty)?;
+        // Check one operand against the other's type so literals pick up the
+        // right type, whichever side they are on.
+        let lty = if literal_takes_rhs_type(lhs, rhs) {
+            let rty = self.synth_expr(rhs)?;
+            self.check_expr(lhs, &rty)?;
+            rty
+        } else {
+            let lty = self.synth_expr(lhs)?;
+            self.check_expr(rhs, &lty)?;
+            lty
+        };
 
         match op {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
@@ -1165,7 +1255,11 @@ impl Typechecker {
                 Ok(TypeInternal::Bool)
             }
             BinOp::Eq | BinOp::Neq => {
-                if !lty.is_numeric() && lty != TypeInternal::Bool && !lty.is_pointer() {
+                if !lty.is_numeric()
+                    && lty != TypeInternal::Bool
+                    && !lty.is_pointer()
+                    && !matches!(lty, TypeInternal::Fn { .. })
+                {
                     return Err(typechecker_error(
                         span,
                         format!(
@@ -1278,12 +1372,18 @@ impl Typechecker {
         // Direct function call by name
         if let ExprKind::Ident(name) = &callee.kind {
             if let Some(sig) = self.signatures.get(name).cloned() {
-                if args.len() > sig.params.len() && !sig.is_variadic {
+                let arity_ok = if sig.is_variadic {
+                    args.len() >= sig.params.len()
+                } else {
+                    args.len() == sig.params.len()
+                };
+                if !arity_ok {
                     return Err(typechecker_error(
                         span,
                         format!(
-                            "function '{}' expects {} arguments, got {}",
+                            "function '{}' expects {}{} arguments, got {}",
                             name,
+                            if sig.is_variadic { "at least " } else { "" },
                             sig.params.len(),
                             args.len()
                         ),
@@ -1291,6 +1391,31 @@ impl Typechecker {
                 }
                 for (arg, (_pname, pty)) in args.iter().zip(sig.params.iter()) {
                     self.check_expr(arg, pty)?;
+                }
+                // Variadic tail: C only receives scalars here
+                for arg in &args[sig.params.len()..] {
+                    let ty = self.synth_expr(arg)?;
+                    if !matches!(
+                        ty,
+                        TypeInternal::I8
+                            | TypeInternal::I16
+                            | TypeInternal::I32
+                            | TypeInternal::I64
+                            | TypeInternal::U8
+                            | TypeInternal::U16
+                            | TypeInternal::U32
+                            | TypeInternal::U64
+                            | TypeInternal::F32
+                            | TypeInternal::F64
+                            | TypeInternal::Bool
+                            | TypeInternal::Pointer(_)
+                            | TypeInternal::Fn { .. }
+                    ) {
+                        return Err(typechecker_error(
+                            arg.span,
+                            format!("cannot pass value of type '{}' as a variadic argument", ty),
+                        ));
+                    }
                 }
                 return Ok(sig.return_ty);
             }
@@ -1461,6 +1586,113 @@ impl Typechecker {
 pub struct CheckedProgram {
     pub structs: HashMap<String, StructInfo>,
     pub functions: HashMap<String, FnSig>,
+}
+
+// Control never reaches the end of the block: some statement returns,
+// breaks or continues, ends in an if/else whose branches all diverge, or is
+// a `loop` that contains no `break` of its own.
+pub fn block_diverges(block: &Block) -> bool {
+    block.stmts.iter().any(stmt_diverges) || block.expr.as_deref().is_some_and(expr_diverges)
+}
+
+fn stmt_diverges(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Return(_) | Stmt::Break(_) | Stmt::Continue(_) => true,
+        Stmt::Loop(l) => !block_breaks(&l.body),
+        Stmt::Let(l) => expr_diverges(&l.init),
+        Stmt::Assign(a) => expr_diverges(&a.value),
+        Stmt::Expr(e) => expr_diverges(&e.expr),
+    }
+}
+
+fn expr_diverges(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Block(b) => block_diverges(b),
+        ExprKind::If {
+            then_block,
+            else_block: Some(eb),
+            ..
+        } => block_diverges(then_block) && block_diverges(eb),
+        _ => false,
+    }
+}
+
+// Whether the block contains a `break` that exits the loop whose body it is
+// (breaks inside nested loops belong to those loops).
+fn block_breaks(block: &Block) -> bool {
+    block.stmts.iter().any(stmt_breaks) || block.expr.as_deref().is_some_and(expr_breaks)
+}
+
+fn stmt_breaks(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Break(_) => true,
+        Stmt::Return(r) => r.value.as_ref().is_some_and(expr_breaks),
+        Stmt::Continue(_) | Stmt::Loop(_) => false,
+        Stmt::Let(l) => expr_breaks(&l.init),
+        Stmt::Assign(a) => lvalue_breaks(&a.target) || expr_breaks(&a.value),
+        Stmt::Expr(e) => expr_breaks(&e.expr),
+    }
+}
+
+fn lvalue_breaks(lv: &LValue) -> bool {
+    match &lv.kind {
+        LValueKind::Ident(_) => false,
+        LValueKind::Deref(e) => expr_breaks(e),
+        LValueKind::Field(inner, _) | LValueKind::TupleField(inner, _) => lvalue_breaks(inner),
+        LValueKind::Index(inner, e) => lvalue_breaks(inner) || expr_breaks(e),
+    }
+}
+
+fn expr_breaks(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::IntLiteral(_)
+        | ExprKind::FloatLiteral(_)
+        | ExprKind::StringLiteral(_)
+        | ExprKind::BoolLiteral(_)
+        | ExprKind::UnitLiteral
+        | ExprKind::Ident(_) => false,
+        ExprKind::Tuple(es) | ExprKind::Array(es) => es.iter().any(expr_breaks),
+        ExprKind::ArrayRepeat(a, b) => expr_breaks(a) || expr_breaks(b),
+        ExprKind::StructConstructor { fields, .. } => fields.iter().any(|f| expr_breaks(&f.value)),
+        ExprKind::BinOp { lhs, rhs, .. } => expr_breaks(lhs) || expr_breaks(rhs),
+        ExprKind::UnaryOp { expr, .. }
+        | ExprKind::Cast { expr, .. }
+        | ExprKind::Field { expr, .. }
+        | ExprKind::TupleField { expr, .. } => expr_breaks(expr),
+        ExprKind::Call { callee, args } => expr_breaks(callee) || args.iter().any(expr_breaks),
+        ExprKind::Index { expr, index } => expr_breaks(expr) || expr_breaks(index),
+        ExprKind::Block(b) => block_breaks(b),
+        ExprKind::If {
+            cond,
+            then_block,
+            else_block,
+        } => {
+            expr_breaks(cond)
+                || block_breaks(then_block)
+                || else_block.as_ref().is_some_and(block_breaks)
+        }
+    }
+}
+
+// A numeric literal (optionally negated) whose type comes from context.
+// Lowering uses the same predicate to pick operand types, so the two stay
+// in agreement.
+pub fn is_untyped_literal(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::IntLiteral(_) | ExprKind::FloatLiteral(_) => true,
+        ExprKind::UnaryOp {
+            op: UnaryOp::Neg | UnaryOp::Pos,
+            expr: inner,
+        } => is_untyped_literal(inner),
+        _ => false,
+    }
+}
+
+// The operand type of a non-shift binary operator is the left operand's,
+// unless the left operand is a bare literal and the right one is not
+// (`1 + x`, `0 == n`): then the literal adopts the right operand's type.
+pub fn literal_takes_rhs_type(lhs: &Expr, rhs: &Expr) -> bool {
+    is_untyped_literal(lhs) && !is_untyped_literal(rhs)
 }
 
 pub fn typecheck(program: &Program) -> Result<CheckedProgram, Vec<TypecheckerError>> {
@@ -1782,6 +2014,46 @@ mod tests {
         check_err_contains(
             "fn foo(a: i32) {} fn main() { foo(1, 2); }",
             "expects 1 arguments, got 2",
+        );
+    }
+
+    #[test]
+    fn test_call_too_few_args() {
+        check_err_contains(
+            "fn foo(a: i32, b: i32) {} fn main() { foo(1); }",
+            "expects 2 arguments, got 1",
+        );
+    }
+
+    #[test]
+    fn test_call_variadic_too_few_args() {
+        check_err_contains(
+            "extern fn printf(f: *u8, ...) -> i32; fn main() { printf(); }",
+            "expects at least 1 arguments, got 0",
+        );
+    }
+
+    #[test]
+    fn test_call_variadic_extra_args_checked() {
+        check_err_contains(
+            r#"extern fn printf(f: *u8, ...) -> i32; fn main() { printf("%d".0, nope); }"#,
+            "undefined variable",
+        );
+    }
+
+    #[test]
+    fn test_call_variadic_rejects_compound() {
+        check_err_contains(
+            r#"extern fn printf(f: *u8, ...) -> i32; fn main() { printf("%s".0, "hi"); }"#,
+            "variadic argument",
+        );
+    }
+
+    #[test]
+    fn test_call_variadic_scalars_ok() {
+        check_ok(
+            r#"extern fn printf(f: *u8, ...) -> i32;
+            fn main() { let x: u8 = 1; let y: f32 = 2.0; printf("%d %f".0, x, y, &x); }"#,
         );
     }
 
@@ -2349,6 +2621,55 @@ mod tests {
                 x
             }
         "#,
+        );
+    }
+
+    #[test]
+    fn test_literal_takes_context_type() {
+        check_ok("fn main() { let x: u8 = 1 + 2; let y: i8 = -128; let z: i32 = 0 - 7; }");
+        check_ok("fn main() { let x: u8 = 3; let y = 1 + x; let b = 0 == x; let c: u8 = y; }");
+        check_ok("fn main() { let x: u32 = (1 << 31) | 5; let f: f32 = -1.5; }");
+        check_err_contains("fn main() { let x: i8 = -129; }", "-129 does not fit");
+        check_err_contains(
+            "fn main() { let a: u32 = 1; let x: u64 = a + 1; }",
+            "expected 'u64', got 'u32'",
+        );
+    }
+
+    #[test]
+    fn test_diverging_bodies() {
+        check_ok("fn f(c: bool) -> i64 { if c { return 1; } else { return 2; }; }");
+        check_ok("fn f() -> i64 { loop { return 1; } }");
+        check_ok("fn f(c: bool) -> i64 { let x: i64 = if c { return 0; } else { 5 }; x }");
+        check_err_contains(
+            "fn f(c: bool) -> i64 { loop { if c { break; }; return 1; } }",
+            "body has type '()'",
+        );
+        check_err_contains(
+            "fn f(c: bool) -> i64 { if c { return 1; }; }",
+            "body has type '()'",
+        );
+        // a break inside a nested loop does not leave the outer one
+        check_ok("fn f() -> i64 { loop { loop { break; } return 1; } }");
+    }
+
+    #[test]
+    fn test_block_without_tail_has_unit_type() {
+        check_err_contains("fn main() { let x: i64 = {}; }", "expected 'i64', got '()'");
+        check_err_contains(
+            "fn main() { let x: i64 = if true { 1 } else { }; }",
+            "expected 'i64', got '()'",
+        );
+    }
+
+    #[test]
+    fn test_function_as_value() {
+        check_ok(
+            "fn g(x: i64) -> i64 { x } fn main() { let f: fn(i64) -> i64 = g; let y = f(1); let e = f == g; }",
+        );
+        check_err_contains(
+            "extern fn printf(f: *u8, ...) -> i32; fn main() { let p = printf; }",
+            "variadic function 'printf' cannot be used as a value",
         );
     }
 }

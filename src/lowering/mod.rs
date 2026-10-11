@@ -163,6 +163,8 @@ pub enum Inst {
         args: Vec<(VReg, IRType)>,
     },
     Mov(VReg, VReg),
+    // Address of a function, for use as a function pointer
+    FuncAddr(VReg, String),
 }
 
 // Terminators
@@ -329,6 +331,8 @@ struct Lowerer<'a> {
     bb_n: u32,
     scopes: Vec<HashMap<String, Place>>,
     return_ty: TypeInternal,
+    // Hidden pointer to the caller's result slot for compound returns
+    sret: Option<VReg>,
     loop_stack: Vec<(BlockId, BlockId)>,
     strings: Vec<StringConstant>,
 }
@@ -345,6 +349,7 @@ impl<'a> Lowerer<'a> {
             bb_n: 0,
             scopes: vec![HashMap::new()],
             return_ty: TypeInternal::Unit,
+            sret: None,
             loop_stack: Vec::new(),
             strings: Vec::new(),
         }
@@ -393,12 +398,19 @@ impl<'a> Lowerer<'a> {
         self.scopes.last_mut().unwrap().insert(name, p);
     }
     fn lookup(&self, name: &str) -> &Place {
-        for s in self.scopes.iter().rev() {
-            if let Some(p) = s.get(name) {
-                return p;
-            }
+        self.lookup_local(name)
+            .unwrap_or_else(|| panic!("ICE: undefined '{}'", name))
+    }
+    fn lookup_local(&self, name: &str) -> Option<&Place> {
+        self.scopes.iter().rev().find_map(|s| s.get(name))
+    }
+    // Type of a function used as a value
+    fn fn_value_ty(&self, name: &str) -> TypeInternal {
+        let sig = &self.checked.functions[name];
+        TypeInternal::Fn {
+            params: sig.params.iter().map(|(_, t)| t.clone()).collect(),
+            result: Box::new(sig.return_ty.clone()),
         }
-        panic!("ICE: undefined '{}'", name);
     }
     fn const_zero(&mut self) -> VReg {
         let v = self.fresh_vreg();
@@ -446,11 +458,12 @@ impl<'a> Lowerer<'a> {
                 TypeInternal::Pointer(Box::new(TypeInternal::U8)),
                 TypeInternal::U64,
             ]),
-            ExprKind::Ident(name) => match self.lookup(name) {
-                Place::Register(_, ir) => ir_to_lang_ty(*ir),
-                Place::Address(_, ty) => ty.clone(),
+            ExprKind::Ident(name) => match self.lookup_local(name) {
+                Some(Place::Register(_, ir)) => ir_to_lang_ty(*ir),
+                Some(Place::Address(_, ty)) => ty.clone(),
+                None => self.fn_value_ty(name),
             },
-            ExprKind::BinOp { op, lhs, .. } => match op {
+            ExprKind::BinOp { op, lhs, rhs } => match op {
                 BinOp::Eq
                 | BinOp::Neq
                 | BinOp::Lt
@@ -459,7 +472,8 @@ impl<'a> Lowerer<'a> {
                 | BinOp::GtEq
                 | BinOp::And
                 | BinOp::Or => TypeInternal::Bool,
-                _ => self.expr_ty(lhs),
+                BinOp::Shl | BinOp::Shr => self.expr_ty(lhs),
+                _ => self.binop_operand_ty(lhs, rhs),
             },
             ExprKind::UnaryOp { op, expr: inner } => match op {
                 UnaryOp::Not => TypeInternal::Bool,
@@ -553,6 +567,16 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    // Operand type of a binary operator in synthesis mode; mirrors the
+    // typechecker's synth_binop.
+    fn binop_operand_ty(&self, lhs: &Expr, rhs: &Expr) -> TypeInternal {
+        if literal_takes_rhs_type(lhs, rhs) {
+            self.expr_ty(rhs)
+        } else {
+            self.expr_ty(lhs)
+        }
+    }
+
     fn struct_field_offset(&self, ty: &TypeInternal, field: &str) -> (u64, TypeInternal) {
         let s = if let TypeInternal::Struct(s) = ty {
             s
@@ -574,6 +598,30 @@ impl<'a> Lowerer<'a> {
         };
         let offs = field_offsets(es, &self.checked.structs);
         (offs[idx].0, es[idx].clone())
+    }
+
+    fn call_return_ty(&self, callee: &Expr) -> TypeInternal {
+        if let ExprKind::Ident(n) = &callee.kind
+            && let Some(sig) = self.checked.functions.get(n)
+        {
+            return sig.return_ty.clone();
+        }
+        if let TypeInternal::Fn { result, .. } = self.expr_ty(callee) {
+            *result
+        } else {
+            panic!("ICE")
+        }
+    }
+
+    fn is_variadic_call(&self, callee: &Expr) -> bool {
+        match &callee.kind {
+            ExprKind::Ident(n) => self
+                .checked
+                .functions
+                .get(n)
+                .is_some_and(|sig| sig.is_variadic),
+            _ => false,
+        }
     }
 
     fn call_param_tys(&self, callee: &Expr) -> Vec<TypeInternal> {
@@ -634,12 +682,20 @@ impl<'a> Lowerer<'a> {
         self.bb_n = 0;
         self.scopes = vec![HashMap::new()];
         self.return_ty = sig.return_ty.clone();
+        self.sret = None;
         self.loop_stack.clear();
 
         let entry = self.fresh_bb();
         self.start(entry);
 
         let mut ir_params = Vec::new();
+        // Compound results are written through a hidden first argument
+        // pointing at a slot in the caller's frame (SysV "sret").
+        if is_compound(&sig.return_ty) {
+            let v = self.fresh_vreg();
+            ir_params.push((v, IRType::Ptr));
+            self.sret = Some(v);
+        }
         for (pname, pty) in &sig.params {
             if is_scalar(pty) {
                 let ir = type_internal_to_ir(pty).unwrap();
@@ -679,9 +735,7 @@ impl<'a> Lowerer<'a> {
                 let ir = type_internal_to_ir(&ret).unwrap();
                 self.seal(Term::Ret(Some((v, ir))));
             } else {
-                let slot = self.alloc_slot_for(&ret);
-                let addr = self.fresh_vreg();
-                self.emit(Inst::SlotAddr(addr, slot));
+                let addr = self.sret.expect("ICE: compound return without sret");
                 self.lower_expr_to_addr(tail, addr, &ret);
                 self.seal(Term::Ret(Some((addr, IRType::Ptr))));
             }
@@ -756,8 +810,18 @@ impl<'a> Lowerer<'a> {
                 if is_scalar(&tgt_ty) {
                     let v = self.lower_expr_to_operand(&a.value, &tgt_ty);
                     self.emit(Inst::Store(addr, v, type_internal_to_ir(&tgt_ty).unwrap()));
-                } else {
+                } else if matches!(a.value.kind, ExprKind::Ident(_) | ExprKind::Call { .. }) {
                     self.lower_expr_to_addr(&a.value, addr, &tgt_ty);
+                } else {
+                    // The value may read the target (`p = P { x: p.y, y: p.x }`),
+                    // so build it aside and copy it over afterwards.
+                    let tmp = self.expr_addr_of(&a.value, &tgt_ty);
+                    let size = layout_of(&tgt_ty, &self.checked.structs).size;
+                    self.emit(Inst::MemCopy {
+                        dst: addr,
+                        src: tmp,
+                        size,
+                    });
                 }
             }
             AssignOp::AddAssign
@@ -811,9 +875,7 @@ impl<'a> Lowerer<'a> {
                 self.seal(Term::Ret(Some((v, type_internal_to_ir(&ret_ty).unwrap()))));
             }
             Some(e) => {
-                let slot = self.alloc_slot_for(&ret_ty);
-                let addr = self.fresh_vreg();
-                self.emit(Inst::SlotAddr(addr, slot));
+                let addr = self.sret.expect("ICE: compound return without sret");
                 self.lower_expr_to_addr(e, addr, &ret_ty);
                 self.seal(Term::Ret(Some((addr, IRType::Ptr))));
             }
@@ -888,6 +950,13 @@ impl<'a> Lowerer<'a> {
                 self.emit(Inst::MemberPtr(ptr, base, off));
                 (ptr, fty)
             }
+            LValueKind::TupleField(inner, index) => {
+                let (base, base_ty) = self.lower_lvalue_addr(inner);
+                let (off, ety) = self.tuple_field_offset(&base_ty, index.0 as usize);
+                let ptr = self.fresh_vreg();
+                self.emit(Inst::MemberPtr(ptr, base, off));
+                (ptr, ety)
+            }
             LValueKind::Index(inner, idx_expr) => {
                 let (base, base_ty) = self.lower_lvalue_addr(inner);
                 let elem_ty = if let TypeInternal::Array(e, _) = &base_ty {
@@ -895,8 +964,7 @@ impl<'a> Lowerer<'a> {
                 } else {
                     panic!("ICE")
                 };
-                let idx_ty = self.expr_ty(idx_expr);
-                let idx = self.lower_expr_to_operand(idx_expr, &idx_ty);
+                let idx = self.lower_index(idx_expr);
                 let esz = layout_of(&elem_ty, &self.checked.structs).size;
                 let ptr = self.fresh_vreg();
                 self.emit(Inst::IndexPtr(ptr, base, idx, esz));
@@ -940,6 +1008,11 @@ impl<'a> Lowerer<'a> {
                 addr
             }
 
+            ExprKind::Ident(name) if self.lookup_local(name).is_none() => {
+                let v = self.fresh_vreg();
+                self.emit(Inst::FuncAddr(v, name.clone()));
+                v
+            }
             ExprKind::Ident(name) => {
                 let place = self.lookup(name).clone();
                 match place {
@@ -964,19 +1037,14 @@ impl<'a> Lowerer<'a> {
             }
             ExprKind::Call { callee, args } => self.lower_call(callee, args, expected),
 
-            ExprKind::Index { expr: arr, index } => {
+            ExprKind::Index { expr: arr, .. } => {
                 let arr_ty = self.expr_ty(arr);
                 let elem_ty = if let TypeInternal::Array(e, _) = &arr_ty {
                     e.as_ref().clone()
                 } else {
                     panic!("ICE")
                 };
-                let base = self.expr_addr_of(arr, &arr_ty);
-                let idx_ty = self.expr_ty(index);
-                let idx = self.lower_expr_to_operand(index, &idx_ty);
-                let esz = layout_of(&elem_ty, &self.checked.structs).size;
-                let ptr = self.fresh_vreg();
-                self.emit(Inst::IndexPtr(ptr, base, idx, esz));
+                let ptr = self.expr_addr_of(expr, &elem_ty);
                 if is_scalar(&elem_ty) {
                     let v = self.fresh_vreg();
                     self.emit(Inst::Load(v, ptr, type_internal_to_ir(&elem_ty).unwrap()));
@@ -1090,12 +1158,63 @@ impl<'a> Lowerer<'a> {
                 } else {
                     panic!("ICE")
                 };
-                let esz = layout_of(&ety, &self.checked.structs).size;
-                for i in 0..n {
-                    let fp = self.fresh_vreg();
-                    self.emit(Inst::MemberPtr(fp, dst, i * esz));
-                    self.store_or_recurse(val, fp, &ety);
+                if n == 0 {
+                    return;
                 }
+                // Evaluate the element once into slot 0, then copy it into
+                // the others: unrolled for short arrays, as a loop otherwise.
+                let esz = layout_of(&ety, &self.checked.structs).size;
+                let first = self.fresh_vreg();
+                self.emit(Inst::MemberPtr(first, dst, 0));
+                self.store_or_recurse(val, first, &ety);
+                if n <= 8 {
+                    for i in 1..n {
+                        let fp = self.fresh_vreg();
+                        self.emit(Inst::MemberPtr(fp, dst, i * esz));
+                        self.copy_to_dst(fp, first, &ety);
+                    }
+                    return;
+                }
+                let counter = self.alloc_slot(8, 8);
+                let header = self.fresh_bb();
+                let body = self.fresh_bb();
+                let exit = self.fresh_bb();
+                let one = self.fresh_vreg();
+                self.emit(Inst::ConstInt(one, 1, IRType::I64));
+                let c0 = self.fresh_vreg();
+                self.emit(Inst::SlotAddr(c0, counter));
+                self.emit(Inst::Store(c0, one, IRType::I64));
+                self.seal(Term::Jump(header));
+
+                self.start(header);
+                let c1 = self.fresh_vreg();
+                self.emit(Inst::SlotAddr(c1, counter));
+                let i = self.fresh_vreg();
+                self.emit(Inst::Load(i, c1, IRType::I64));
+                let limit = self.fresh_vreg();
+                self.emit(Inst::ConstInt(limit, n as i64, IRType::I64));
+                let more = self.fresh_vreg();
+                self.emit(Inst::ICmp(more, CmpOp::Lt, i, limit, IRType::I64, false));
+                self.seal(Term::CondBr {
+                    cond: more,
+                    then_bb: body,
+                    else_bb: exit,
+                });
+
+                self.start(body);
+                let fp = self.fresh_vreg();
+                self.emit(Inst::IndexPtr(fp, dst, i, esz));
+                self.copy_to_dst(fp, first, &ety);
+                let step = self.fresh_vreg();
+                self.emit(Inst::ConstInt(step, 1, IRType::I64));
+                let next = self.fresh_vreg();
+                self.emit(Inst::IAdd(next, i, step, IRType::I64));
+                let c2 = self.fresh_vreg();
+                self.emit(Inst::SlotAddr(c2, counter));
+                self.emit(Inst::Store(c2, next, IRType::I64));
+                self.seal(Term::Jump(header));
+
+                self.start(exit);
             }
 
             ExprKind::StructConstructor { name, fields } => {
@@ -1173,9 +1292,31 @@ impl<'a> Lowerer<'a> {
             }
 
             _ => {
+                // Compound operands come back as the address of the value
+                // (an element, a `*p`, ...), which is copied into place.
                 let v = self.lower_expr_to_operand(expr, ty);
-                self.emit(Inst::Store(dst, v, type_internal_to_ir(ty).unwrap()));
+                if is_scalar(ty) {
+                    self.emit(Inst::Store(dst, v, type_internal_to_ir(ty).unwrap()));
+                } else {
+                    let size = layout_of(ty, &self.checked.structs).size;
+                    self.emit(Inst::MemCopy { dst, src: v, size });
+                }
             }
+        }
+    }
+
+    // Array index widened to 64 bits by its own signedness: IndexPtr adds the
+    // full register, and narrow values may carry garbage in the high bits.
+    fn lower_index(&mut self, index: &Expr) -> VReg {
+        let idx_ty = self.expr_ty(index);
+        let idx = self.lower_expr_to_operand(index, &idx_ty);
+        let ir = type_internal_to_ir(&idx_ty).unwrap();
+        if ir.size() < 8 {
+            let d = self.fresh_vreg();
+            self.emit(Inst::IntExt(d, idx, ir, IRType::I64, idx_ty.is_signed()));
+            d
+        } else {
+            idx
         }
     }
 
@@ -1200,19 +1341,62 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    // Address of `expr`. Places (variables, `*p`, fields and elements of
+    // places) yield their own address, so `&p.x` and `&a[i]` alias the
+    // original; any other expression is materialized in a fresh slot.
     fn expr_addr_of(&mut self, expr: &Expr, ty: &TypeInternal) -> VReg {
-        if let ExprKind::Ident(name) = &expr.kind {
-            let place = self.lookup(name).clone();
-            match place {
-                Place::Address(addr, _) => return addr,
-                Place::Register(v, ir) => {
-                    let slot = self.alloc_slot(ir.size(), ir.size());
-                    let addr = self.fresh_vreg();
-                    self.emit(Inst::SlotAddr(addr, slot));
-                    self.emit(Inst::Store(addr, v, ir));
-                    return addr;
+        match &expr.kind {
+            ExprKind::Ident(name) => {
+                let place = self.lookup(name).clone();
+                match place {
+                    Place::Address(addr, _) => return addr,
+                    Place::Register(v, ir) => {
+                        let slot = self.alloc_slot(ir.size(), ir.size());
+                        let addr = self.fresh_vreg();
+                        self.emit(Inst::SlotAddr(addr, slot));
+                        self.emit(Inst::Store(addr, v, ir));
+                        return addr;
+                    }
                 }
             }
+            ExprKind::UnaryOp {
+                op: UnaryOp::Deref,
+                expr: inner,
+            } => {
+                let it = self.expr_ty(inner);
+                return self.lower_expr_to_operand(inner, &it);
+            }
+            ExprKind::Field { expr: inner, name } => {
+                let it = self.expr_ty(inner);
+                let (off, _) = self.struct_field_offset(&it, &name.0);
+                let base = self.expr_addr_of(inner, &it);
+                let ptr = self.fresh_vreg();
+                self.emit(Inst::MemberPtr(ptr, base, off));
+                return ptr;
+            }
+            ExprKind::TupleField { expr: inner, index } => {
+                let it = self.expr_ty(inner);
+                let (off, _) = self.tuple_field_offset(&it, index.0 as usize);
+                let base = self.expr_addr_of(inner, &it);
+                let ptr = self.fresh_vreg();
+                self.emit(Inst::MemberPtr(ptr, base, off));
+                return ptr;
+            }
+            ExprKind::Index { expr: arr, index } => {
+                let arr_ty = self.expr_ty(arr);
+                let elem_ty = if let TypeInternal::Array(e, _) = &arr_ty {
+                    e.as_ref().clone()
+                } else {
+                    panic!("ICE")
+                };
+                let base = self.expr_addr_of(arr, &arr_ty);
+                let idx = self.lower_index(index);
+                let esz = layout_of(&elem_ty, &self.checked.structs).size;
+                let ptr = self.fresh_vreg();
+                self.emit(Inst::IndexPtr(ptr, base, idx, esz));
+                return ptr;
+            }
+            _ => {}
         }
         let slot = self.alloc_slot_for(ty);
         let addr = self.fresh_vreg();
@@ -1250,11 +1434,11 @@ impl<'a> Lowerer<'a> {
     }
 
     // String literal
-    fn lower_string_literal(&mut self, s: &str, dst: VReg) {
+    fn lower_string_literal(&mut self, s: &[u8], dst: VReg) {
         let idx = self.strings.len();
         self.strings.push(StringConstant {
             label: format!("__str{}", idx),
-            bytes: s.as_bytes().to_vec(),
+            bytes: s.to_vec(),
         });
         let ptr = self.fresh_vreg();
         self.emit(Inst::ConstStringPtr(ptr, idx));
@@ -1274,7 +1458,7 @@ impl<'a> Lowerer<'a> {
         op: &BinOp,
         lhs: &Expr,
         rhs: &Expr,
-        _expected: &TypeInternal,
+        expected: &TypeInternal,
     ) -> VReg {
         if matches!(op, BinOp::And) {
             return self.lower_sc_and(lhs, rhs);
@@ -1283,7 +1467,23 @@ impl<'a> Lowerer<'a> {
             return self.lower_sc_or(lhs, rhs);
         }
 
-        let lhs_ty = self.expr_ty(lhs);
+        // Mirrors the typechecker: a numeric expected type is pushed into
+        // arithmetic, bitwise and shift operands (check mode); otherwise the
+        // operand type is synthesized.
+        let lhs_ty = match op {
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Pow
+                if expected.is_numeric() =>
+            {
+                expected.clone()
+            }
+            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr
+                if expected.is_integer() =>
+            {
+                expected.clone()
+            }
+            BinOp::Shl | BinOp::Shr => self.expr_ty(lhs),
+            _ => self.binop_operand_ty(lhs, rhs),
+        };
         let a = self.lower_expr_to_operand(lhs, &lhs_ty);
         let rhs_ty = if matches!(op, BinOp::Shl | BinOp::Shr) {
             self.expr_ty(rhs)
@@ -1445,7 +1645,11 @@ impl<'a> Lowerer<'a> {
     fn lower_unaryop(&mut self, op: &UnaryOp, inner: &Expr, expected: &TypeInternal) -> VReg {
         match op {
             UnaryOp::Neg => {
-                let ty = self.expr_ty(inner);
+                let ty = if expected.is_numeric() {
+                    expected.clone()
+                } else {
+                    self.expr_ty(inner)
+                };
                 let ir = type_internal_to_ir(&ty).unwrap();
                 let v = self.lower_expr_to_operand(inner, &ty);
                 let d = self.fresh_vreg();
@@ -1457,7 +1661,11 @@ impl<'a> Lowerer<'a> {
                 d
             }
             UnaryOp::Pos => {
-                let ty = self.expr_ty(inner);
+                let ty = if expected.is_numeric() {
+                    expected.clone()
+                } else {
+                    self.expr_ty(inner)
+                };
                 self.lower_expr_to_operand(inner, &ty)
             }
             UnaryOp::Not => {
@@ -1467,7 +1675,11 @@ impl<'a> Lowerer<'a> {
                 d
             }
             UnaryOp::BitNot => {
-                let ty = self.expr_ty(inner);
+                let ty = if expected.is_integer() {
+                    expected.clone()
+                } else {
+                    self.expr_ty(inner)
+                };
                 let ir = type_internal_to_ir(&ty).unwrap();
                 let v = self.lower_expr_to_operand(inner, &ty);
                 let d = self.fresh_vreg();
@@ -1530,13 +1742,35 @@ impl<'a> Lowerer<'a> {
     // Function call
     fn lower_call(&mut self, callee: &Expr, arguments: &[Expr], expected: &TypeInternal) -> VReg {
         let ptys = self.call_param_tys(callee);
+        let ret_ty = self.call_return_ty(callee);
+        let variadic = self.is_variadic_call(callee);
         let mut ir_arguments = Vec::new();
+        let sret = if is_compound(&ret_ty) {
+            let slot = self.alloc_slot_for(&ret_ty);
+            let addr = self.fresh_vreg();
+            self.emit(Inst::SlotAddr(addr, slot));
+            ir_arguments.push((addr, IRType::Ptr));
+            Some(addr)
+        } else {
+            None
+        };
         for (index, argument) in arguments.iter().enumerate() {
             let pty = match ptys.get(index) {
                 Some(pty) => pty,
                 None => &self.expr_ty(argument),
             };
-            if is_scalar(pty) {
+            if variadic && index >= ptys.len() && is_scalar(pty) {
+                // C default argument promotions: f32 -> f64, small ints -> int
+                let v = self.lower_expr_to_operand(argument, pty);
+                let promoted = match pty {
+                    TypeInternal::F32 => TypeInternal::F64,
+                    TypeInternal::I8 | TypeInternal::I16 => TypeInternal::I32,
+                    TypeInternal::U8 | TypeInternal::U16 | TypeInternal::Bool => TypeInternal::U32,
+                    other => other.clone(),
+                };
+                let v = self.lower_cast(v, pty, &promoted);
+                ir_arguments.push((v, type_internal_to_ir(&promoted).unwrap()));
+            } else if is_scalar(pty) {
                 let v = self.lower_expr_to_operand(argument, pty);
                 ir_arguments.push((v, type_internal_to_ir(pty).unwrap()));
             } else {
@@ -1551,7 +1785,7 @@ impl<'a> Lowerer<'a> {
             false
         };
 
-        if *expected == TypeInternal::Unit {
+        if *expected == TypeInternal::Unit || sret.is_some() {
             if is_direct {
                 let n = if let ExprKind::Ident(n) = &callee.kind {
                     n.clone()
@@ -1571,7 +1805,10 @@ impl<'a> Lowerer<'a> {
                     args: ir_arguments,
                 });
             }
-            return self.const_zero();
+            return match sret {
+                Some(addr) if *expected != TypeInternal::Unit => addr,
+                _ => self.const_zero(),
+            };
         }
         let ri = type_internal_to_ir(expected).unwrap_or(IRType::Ptr);
         let d = self.fresh_vreg();
@@ -1895,6 +2132,7 @@ fn fmt_inst(i: &Inst) -> String {
             }
         }
         Inst::Mov(d, s) => format!("{} = mov {}", d, s),
+        Inst::FuncAddr(d, name) => format!("{} = funcaddr @{}", d, name),
     }
 }
 
@@ -1980,6 +2218,50 @@ mod tests {
         );
         assert!(s.contains("memberptr"));
         assert!(s.contains("iadd.i32"));
+    }
+    #[test]
+    fn test_struct_return_uses_sret() {
+        let prog = lower_ok(
+            "struct P { x: i64, y: i64 } fn mk(a: i64) -> P { P { x: a, y: a } } \
+             fn main() -> i64 { let p = mk(1); p.x }",
+        );
+        let mk = prog.functions.iter().find(|f| f.name == "mk").unwrap();
+        // Hidden result pointer comes first, then the declared parameter
+        assert_eq!(mk.params.len(), 2);
+        assert_eq!(mk.params[0].1, IRType::Ptr);
+        // The callee writes into the caller's slot instead of its own frame
+        assert!(mk.slots.iter().all(|s| s.size != 16));
+        let main = prog.functions.iter().find(|f| f.name == "main").unwrap();
+        let call = main
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .find_map(|i| match i {
+                Inst::Call { func, dst, args } if func == "mk" => Some((dst, args)),
+                _ => None,
+            })
+            .unwrap();
+        assert!(call.0.is_none());
+        assert_eq!(call.1.len(), 2);
+    }
+    #[test]
+    fn test_variadic_promotes_f32_and_small_ints() {
+        let prog = lower_ok(
+            "extern fn printf(f: *u8, ...) -> i32; \
+             fn main() { let x: f32 = 1.0; let y: u8 = 2; printf(\"\".0, x, y); }",
+        );
+        let main = prog.functions.iter().find(|f| f.name == "main").unwrap();
+        let args = main
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .find_map(|i| match i {
+                Inst::Call { func, args, .. } if func == "printf" => Some(args),
+                _ => None,
+            })
+            .unwrap();
+        let tys: Vec<IRType> = args.iter().map(|(_, t)| *t).collect();
+        assert_eq!(tys, vec![IRType::Ptr, IRType::F64, IRType::I32]);
     }
     #[test]
     fn test_array() {
