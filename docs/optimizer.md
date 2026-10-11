@@ -214,6 +214,64 @@ interop):
   different integer widths (an old one, exposed by SROA), and a nested
   `match` overwriting the switch state of the one it is in.
 
+## 0.4: loops (the plan)
+
+0.4 adds a loop optimizer to `-O2`, run per function after inlining and
+before LICM, then again after it. The passes, in pipeline order:
+
+1. **Loop analysis and canonical form** (`49_loop.tach`): the loop forest
+   (natural loops by header, nesting, depth); every loop gets a preheader
+   (one block entering the header, ending in a jump), a single latch (one
+   back edge) and dedicated exits (exit blocks entered only from inside the
+   loop). LCSSA: a value defined in a loop and used outside goes through a
+   phi in the exit block. Two utilities serve the transformations: an SSA
+   updater (the definitions of a value in several blocks; a use reads the
+   one that reaches it, with phis inserted where they meet: Braun et al.'s
+   construction over the finished CFG) and the cloning of a region of
+   blocks.
+2. **Loop rotation**: a `while` loop (exit test in the header) becomes a
+   guarded `do`-`while` (the test duplicated in the preheader, the exit
+   test at the latch): one branch per iteration instead of two, and the
+   body known to run at least once.
+3. **Induction variables and trip counts** (`49_scev.tach`): add
+   recurrences `{start, +, step}` of header phis; for a loop whose only
+   exit is at the latch, the trip count when it is a constant (by
+   evaluating the exit test with the folding rules, so wrapping is exactly
+   the machine's) and the exit values of induction variables for counted
+   loops `i < n` / `i != n` (an expression computed in the preheader); a
+   loop is finite when its exit test is such a counted test.
+4. **Dead loop deletion**: a finite loop without side effects whose results
+   are only its exit values is removed.
+5. **Unrolling**: full unrolling of loops with a small constant trip count;
+   partial unrolling (by 2 or 4) of loops with a constant trip count that
+   the factor divides, under a size budget.
+6. **Loop strength reduction**: an address `base + i * stride` (a shift or
+   a multiplication of an induction variable) inside a loop becomes a
+   pointer induction variable.
+7. **Unswitching**: a branch on a loop-invariant condition inside a small
+   loop: the loop is cloned, one copy per outcome, the test hoisted.
+8. **Value ranges and bounds checks** (`49_range.tach`): the range of an
+   integer value at a block, from its type, its operation (masks,
+   remainders, conversions), induction variables, and the branch conditions
+   that dominate the block; with it, bounds checks of slices whose index is
+   proven in range are removed (the check `i < len` is implied by a
+   dominating `i < n` with `n` the same length, and `i >= 0`), comparisons
+   decided by ranges are folded, and a branch whose outcome is implied by a
+   dominating condition on the edge into its block is threaded past.
+   Jump threading on implied conditions turns the arm-by-arm tests of a
+   `match` with guards into a decision tree.
+9. **Comparison chains**: `x == c1` / `x == c2` / ... tests of one value in
+   a chain of blocks become a `switch`.
+10. **Aggressive dead code elimination** (`46_adce.tach`): over control
+    dependence (post-dominators), branches that decide nothing live are
+    removed; branches of loops are kept (a loop may not terminate: only
+    the loop deletion above removes loops, when they are finite).
+
+Tested by IR `CHECK` tests per pass, the suite at every level, the fixpoint
+(the compiler itself is the largest loop test) and a loop mode of the random
+program generator (nested counted loops with varied bounds, steps,
+signedness and early exits, slices indexed in and out of bounds).
+
 ## Not yet
 
 Planned in [roadmap.md](roadmap.md): chains of comparisons of one value
