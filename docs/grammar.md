@@ -62,8 +62,8 @@ param        = [ "mut" ] ident ":" type ;              (* "_" ignores the argume
 
 extern_item  = "extern" '"C"' "{" { c_fn | c_static } "}"            (* (0.3) imports from C *)
              | "extern" '"C"' fn_decl                                 (* (0.3) C's convention, an unmangled symbol *)
-             | "extern" '"C"' "static" [ "mut" ] ident ":" type "=" expr ";"   (* (0.3) a static C can use *)
-             | "extern" [ '"C"' ] c_fn ;                              (* deprecated: the 0.2 form, meaning extern "C" *)
+             | "extern" '"C"' "static" [ "mut" ] ident ":" type "=" expr ";" ;  (* (0.3) a static C can use *)
+                                       (* 0.2's `extern fn f(...);` was removed in 0.4 *)
 c_fn         = "fn" ident "(" [ c_params ] ")" [ "->" type ] ";" ;
 c_params     = "..." | param { "," param } [ "," [ "..." ] ] ;
 c_static     = "static" [ "mut" ] ident ":" type ";" ;

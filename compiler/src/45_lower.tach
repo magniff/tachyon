@@ -17,63 +17,65 @@
 // An open-addressing hash map from i64 keys (never 0) to i64 values.
 struct HMap { keys: *i64, vals: *i64, size: i64, count: i64 }
 
-fn hmap_slot(m: *HMap, key: i64) -> i64 {
-    let mask = (*m).size - 1;
-    let mut slot = ((key as u64 * 11400714819323198485) >> 20) as i64 & mask;
-    while (*m).keys[slot] != 0 && (*m).keys[slot] != key {
-        slot = (slot + 1) & mask;
+impl HMap {
+    fn slot(self: *HMap, key: i64) -> i64 {
+        let mask = (*self).size - 1;
+        let mut slot = ((key as u64 * 11400714819323198485) >> 20) as i64 & mask;
+        while (*self).keys[slot] != 0 && (*self).keys[slot] != key {
+            slot = (slot + 1) & mask;
+        }
+        slot
     }
-    slot
-}
 
-fn hmap_get(m: *HMap, key: i64) -> i64 {
-    if (*m).size == 0 {
-        return 0;
+    fn get(self: *HMap, key: i64) -> i64 {
+        if (*self).size == 0 {
+            return 0;
+        }
+        let slot = self.slot(key);
+        if (*self).keys[slot] == key { (*self).vals[slot] } else { 0 }
     }
-    let slot = hmap_slot(m, key);
-    if (*m).keys[slot] == key { (*m).vals[slot] } else { 0 }
-}
 
-fn hmap_put(m: *HMap, key: i64, value: i64) {
-    if ((*m).count + 1) * 2 > (*m).size {
-        hmap_rehash(m);
+    fn put(self: *HMap, key: i64, value: i64) {
+        if ((*self).count + 1) * 2 > (*self).size {
+            self.rehash();
+        }
+        let slot = self.slot(key);
+        if (*self).keys[slot] == 0 {
+            (*self).count += 1;
+            (*self).keys[slot] = key;
+        }
+        (*self).vals[slot] = value;
     }
-    let slot = hmap_slot(m, key);
-    if (*m).keys[slot] == 0 {
-        (*m).count += 1;
-        (*m).keys[slot] = key;
-    }
-    (*m).vals[slot] = value;
-}
 
-fn hmap_rehash(m: *HMap) {
-    let old_keys = (*m).keys;
-    let old_vals = (*m).vals;
-    let old_size = (*m).size;
-    let mut size = old_size * 2;
-    if size < 256 {
-        size = 256;
-    }
-    (*m).keys = alloc_zeroed(size * 8) as *i64;
-    (*m).vals = alloc_zeroed(size * 8) as *i64;
-    (*m).size = size;
-    (*m).count = 0;
-    for i in 0..old_size {
-        if old_keys[i] != 0 {
-            hmap_put(m, old_keys[i], old_vals[i]);
+    fn rehash(self: *HMap) {
+        let old_keys = (*self).keys;
+        let old_vals = (*self).vals;
+        let old_size = (*self).size;
+        let mut size = old_size * 2;
+        if size < 256 {
+            size = 256;
+        }
+        (*self).keys = alloc_zeroed(size * 8) as *i64;
+        (*self).vals = alloc_zeroed(size * 8) as *i64;
+        (*self).size = size;
+        (*self).count = 0;
+        for i in 0..old_size {
+            if old_keys[i] != 0 {
+                self.put(old_keys[i], old_vals[i]);
+            }
+        }
+        if old_size > 0 {
+            free(old_keys as *u8);
+            free(old_vals as *u8);
         }
     }
-    if old_size > 0 {
-        free(old_keys as *u8);
-        free(old_vals as *u8);
-    }
-}
 
-fn hmap_clear(m: *HMap) {
-    if (*m).size > 0 {
-        memset((*m).keys as *u8, 0, ((*m).size * 8) as u64);
+    fn clear(self: *HMap) {
+        if (*self).size > 0 {
+            memset((*self).keys as *u8, 0, ((*self).size * 8) as u64);
+        }
+        (*self).count = 0;
     }
-    (*m).count = 0;
 }
 
 // ---- SSA construction ----
@@ -107,16 +109,16 @@ fn var_type(var: i64) -> i64 {
 }
 
 fn new_synth_var(ty: i64) -> i64 {
-    intvec_push(&SYNTH_TY, ty);
+    SYNTH_TY.push(ty);
     LOCAL_COUNT + SYNTH_TY.count - 1
 }
 
 fn ssa_write(var: i64, b: i64, value: i64) {
-    hmap_put(&DEFS, def_key(var, b), value);
+    DEFS.put(def_key(var, b), value);
 }
 
 fn ssa_read(var: i64, b: i64) -> i64 {
-    let v = hmap_get(&DEFS, def_key(var, b));
+    let v = DEFS.get(def_key(var, b));
     if v != 0 {
         return ir_val(v);
     }
@@ -125,13 +127,13 @@ fn ssa_read(var: i64, b: i64) -> i64 {
 
 // An undefined value of type `ty`: 0, placed in the entry block.
 fn ssa_undef(ty: i64) -> i64 {
-    let v = ir_make(OP_CONST, ty, 0, 0, 0);
+    let v = ir_make(Op::Const, ty, 0, 0, 0);
     ir_prepend(IRFUNCS[IRF].entry, v);
     v
 }
 
 fn new_phi(var: i64, b: i64) -> i64 {
-    let phi = ir_make(OP_PHI, var_type(var), 0, 0, 0);
+    let phi = ir_make(Op::Phi, var_type(var), 0, 0, 0);
     ir_prepend(b, phi);
     phi
 }
@@ -141,9 +143,9 @@ fn ssa_read_recursive(var: i64, b: i64) -> i64 {
     let preds = BLOCKS[b].preds.count;
     if BLOCKS[b].sealed == 0 {
         value = new_phi(var, b);
-        intvec_push(&INCOMPLETE, var);
-        intvec_push(&INCOMPLETE, value);
-        intvec_push(&INCOMPLETE, BLOCKS[b].incomplete);
+        INCOMPLETE.push(var);
+        INCOMPLETE.push(value);
+        INCOMPLETE.push(BLOCKS[b].incomplete);
         BLOCKS[b].incomplete = INCOMPLETE.count / 3;
     } else if preds == 1 {
         value = ssa_read(var, BLOCKS[b].preds.data[0]);
@@ -164,14 +166,14 @@ fn add_phi_operands(var: i64, phi: i64) -> i64 {
     for i in 0..BLOCKS[b].preds.count {
         let pred = BLOCKS[b].preds.data[i];
         let value = ssa_read(var, pred);
-        intvec_push(&SSA_STACK, value);
+        SSA_STACK.push(value);
     }
     let count = SSA_STACK.count - mark;
     INSTS[phi].args = ARGS.count;
     INSTS[phi].nargs = count;
     for i in 0..count {
-        intvec_push(&ARGS, SSA_STACK.data[mark + i]);
-        intvec_push(&ARGTY, 0);
+        ARGS.push(SSA_STACK.data[mark + i]);
+        ARGTY.push(0);
     }
     SSA_STACK.count = mark;
     try_remove_trivial_phi(phi)
@@ -226,17 +228,17 @@ fn start_dead_block() {
 // Ends the current block with a jump (no edge from a dead block).
 fn lower_jump(target: i64) {
     if is_dead_block(CUR) {
-        ir_terminate(CUR, TERM_UNREACH, 0, 0, 0);
+        ir_terminate(CUR, Term::Unreach, 0, 0, 0);
     } else {
-        ir_terminate(CUR, TERM_JUMP, 0, target, 0);
+        ir_terminate(CUR, Term::Jump, 0, target, 0);
     }
 }
 
 fn lower_branch(cond: i64, if_true: i64, if_false: i64) {
     if is_dead_block(CUR) {
-        ir_terminate(CUR, TERM_UNREACH, 0, 0, 0);
+        ir_terminate(CUR, Term::Unreach, 0, 0, 0);
     } else {
-        ir_terminate(CUR, TERM_BRANCH, cond, if_true, if_false);
+        ir_terminate(CUR, Term::Branch, cond, if_true, if_false);
     }
 }
 
@@ -253,16 +255,16 @@ fn lower_program(program: i64) {
     }
     // A local whose address is taken lives in memory.
     for n in 1..NODE_COUNT {
-        if NODES[n].kind == E_UNARY && NODES[n].a == TK_AMP {
+        if NODES[n].kind == NodeKind::Unary && NODES[n].op == Tok::Amp {
             let operand = NODES[n].b;
-            if NODES[operand].kind == E_IDENT && NODES[operand].x == R_LOCAL {
+            if NODES[operand].kind == NodeKind::Ident && NODES[operand].res == Res::Local {
                 PROMOTE[NODES[operand].y] = 0;
             }
         }
     }
     for i in 0..NODES[program].count {
         let item = child(program, i);
-        if NODES[item].kind == I_FN {
+        if NODES[item].kind == NodeKind::Fn {
             lower_function(item);
         }
     }
@@ -271,14 +273,14 @@ fn lower_program(program: i64) {
 fn lower_function(item: i64) {
     let f = NODES[item].x - 1;
     IRF = ir_new_func(f, item);
-    hmap_clear(&DEFS);
+    DEFS.clear();
     let entry = ir_new_block();
     IRFUNCS[IRF].entry = entry;
     BLOCKS[entry].sealed = 1;
     CUR = entry;
     let ret = FNS[f].ret;
     if returns_through_pointer(ret) {
-        IRFUNCS[IRF].result_ptr = emit_ir(OP_PARAM, TY_U64, 0, 0, -1);
+        IRFUNCS[IRF].result_ptr = emit_ir(Op::Param, TY_U64, 0, 0, -1);
     }
     for i in 0..FNS[f].param_count {
         let ty = fn_param(f, i);
@@ -287,20 +289,20 @@ fn lower_function(item: i64) {
             continue;
         }
         let kind = abi_classify(ty);
-        if kind == ABI_PIECES {
+        if kind == AbiClass::Pieces {
             // Stored from the registers (or stack slots) of its pieces:
-            // PARAM imm2 = the piece + 1.
+            // NodeKind::Param imm2 = the piece + 1.
             let slot = ir_slot_addr(new_slot_for(ty));
             for k in 0..ABI_PIECE_COUNT {
-                let piece = emit_ir(OP_PARAM, ABI_PIECE_TY[k], 0, 0, i);
+                let piece = emit_ir(Op::Param, ABI_PIECE_TY[k], 0, 0, i);
                 INSTS[piece].imm2 = k + 1;
                 ir_store(ABI_PIECE_TY[k], slot, piece, ABI_PIECE_OFFSET[k]);
             }
             bind_local(local, slot, ty, true);
             continue;
         }
-        let param = emit_ir(OP_PARAM, ir_type(ty), 0, 0, i);
-        if kind == ABI_STACK {
+        let param = emit_ir(Op::Param, ir_type(ty), 0, 0, i);
+        if kind == AbiClass::Stack {
             // The address of the caller's copy on the stack.
             INSTS[param].imm2 = -1;
         }
@@ -312,8 +314,8 @@ fn lower_function(item: i64) {
     if NODES[body].ty != TY_NEVER {
         lower_return(value);
     }
-    if BLOCKS[CUR].term == 0 {
-        ir_terminate(CUR, TERM_UNREACH, 0, 0, 0);
+    if BLOCKS[CUR].term == Term::None {
+        ir_terminate(CUR, Term::Unreach, 0, 0, 0);
     }
 }
 
@@ -330,7 +332,7 @@ fn lower_return(value: i64) {
     } else if is_compound(ret) {
         // Returned in registers, read in pieces from a multiple of 8 bytes.
         result = need_value(value, ret);
-        if size_of(ret) % 8 != 0 && INSTS[result].op != OP_SLOT {
+        if size_of(ret) % 8 != 0 && INSTS[result].op != Op::Slot {
             let copy = ir_slot_addr(new_slot_for(ret));
             lower_copy(copy, result, size_of(ret));
             result = copy;
@@ -344,9 +346,9 @@ fn lower_return(value: i64) {
         result = need_value(value, ret);
     }
     if !is_dead_block(CUR) {
-        ir_terminate(CUR, TERM_RET, result, 0, 0);
+        ir_terminate(CUR, Term::Ret, result, 0, 0);
     } else {
-        ir_terminate(CUR, TERM_UNREACH, 0, 0, 0);
+        ir_terminate(CUR, Term::Unreach, 0, 0, 0);
     }
     start_dead_block();
 }
@@ -356,7 +358,7 @@ fn lower_return(value: i64) {
 fn lower_block(block: i64) -> i64 {
     for i in 0..NODES[block].count {
         let stmt = child(block, i);
-        if NODES[stmt].kind == S_LET {
+        if NODES[stmt].kind == NodeKind::Let {
             lower_let(stmt);
         } else {
             lower_expr(NODES[stmt].a);
@@ -371,10 +373,12 @@ fn lower_block(block: i64) -> i64 {
 // Expressions whose compound value is a new temporary, which a binding or
 // an argument may take over without copying.
 fn is_fresh(n: i64) -> bool {
-    let kind = NODES[n].kind;
-    kind == E_STRUCT || kind == E_TUPLE || kind == E_ARRAY || kind == E_REPEAT
-        || kind == E_CALL || kind == E_STR || kind == E_VARIANT
-        || (kind == E_INDEX && NODES[NODES[n].b].kind == E_RANGE)
+    match NODES[n].kind {
+        NodeKind::StructLit | NodeKind::Tuple | NodeKind::Array | NodeKind::Repeat
+            | NodeKind::Call | NodeKind::Str | NodeKind::VariantLit => true,
+        NodeKind::Index => NODES[NODES[n].b].kind == NodeKind::Range,
+        _ => false,
+    }
 }
 
 fn lower_let(stmt: i64) {
@@ -389,17 +393,17 @@ fn lower_let(stmt: i64) {
 fn bind_pattern_ir(pattern: i64, value: i64, fresh: bool) {
     let kind = NODES[pattern].kind;
     let ty = NODES[pattern].ty;
-    if kind == P_WILD || ty == TY_NEVER {
+    if kind == NodeKind::PatWild || ty == TY_NEVER {
         return;
     }
-    if kind == P_BIND {
+    if kind == NodeKind::PatBind {
         bind_local(NODES[pattern].x, value, ty, fresh);
         return;
     }
     for i in 0..NODES[pattern].count {
         let mut elem_ty = 0;
         let mut offset = 0;
-        if kind == P_VARIANT {
+        if kind == NodeKind::PatVariant {
             elem_ty = variant_field(NODES[pattern].x, i);
             offset = variant_field_offset(NODES[pattern].x, i);
         } else {
@@ -454,7 +458,7 @@ fn lower_copy(dst: i64, src: i64, size: i64) {
         return;
     }
     if size <= INLINE_COPY_MAX {
-        let v = emit_ir(OP_COPY, 0, dst, src, size);
+        let v = emit_ir(Op::Copy, 0, dst, src, size);
         INSTS[v].imm2 = 0;
         return;
     }
@@ -462,7 +466,7 @@ fn lower_copy(dst: i64, src: i64, size: i64) {
     push_arg(dst, TY_U64);
     push_arg(src, TY_U64);
     push_arg(ir_const(size, TY_U64), TY_U64);
-    let call = emit_ir(OP_CALLC, 0, 0, 0, intern_c(c"memcpy"));
+    let call = emit_ir(Op::CallC, 0, 0, 0, intern_c(c"memcpy"));
     take_args(call, mark);
 }
 
@@ -495,7 +499,7 @@ fn lower_expr(n: i64) -> i64 {
     let value = lower_expr_inner(n);
     if NODES[n].ty == TY_NEVER {
         if !is_dead_block(CUR) {
-            ir_terminate(CUR, TERM_UNREACH, 0, 0, 0);
+            ir_terminate(CUR, Term::Unreach, 0, 0, 0);
             start_dead_block();
         }
         return 0;
@@ -504,111 +508,74 @@ fn lower_expr(n: i64) -> i64 {
 }
 
 fn lower_expr_inner(n: i64) -> i64 {
-    let kind = NODES[n].kind;
     let ty = NODES[n].ty;
-    if kind == E_INT || kind == E_CHAR {
-        return ir_const(wrap_int(NODES[n].a, ty), ir_type(ty));
-    }
-    if kind == E_FLOAT {
-        return ir_const(float_const(f64_of_bits(NODES[n].a), ty), ty);
-    }
-    if kind == E_BOOL {
-        return ir_const(NODES[n].a, TY_BOOL);
-    }
-    if kind == E_UNIT {
-        return 0;
-    }
-    if kind == E_STR {
-        return lower_string(n);
-    }
-    if kind == E_CSTR {
-        return emit_ir(OP_SADDR, TY_U64, 0, 0, NODES[n].a);
-    }
-    if kind == E_IDENT {
-        return lower_ident(n);
-    }
-    if kind == E_BINARY {
-        return lower_binary(n);
-    }
-    if kind == E_UNARY {
-        return lower_unary(n);
-    }
-    if kind == E_CAST {
-        let operand = NODES[n].a;
-        let value = lower_expr(operand);
-        return lower_cast(value, NODES[operand].ty, ty);
-    }
-    if kind == E_CALL {
-        return lower_call(n);
-    }
-    if kind == E_INDEX && NODES[NODES[n].b].kind == E_RANGE {
-        return lower_slicing(n);
-    }
-    if kind == E_INDEX || kind == E_FIELD || kind == E_TUPLE_FIELD {
-        return load_scalar(lower_addr(n), ty);
-    }
-    if kind == E_VARIANT {
-        return lower_variant(n);
-    }
-    if kind == E_MATCH {
-        return lower_match(n);
-    }
-    if kind == E_TUPLE || kind == E_ARRAY || kind == E_STRUCT {
-        return lower_aggregate(n);
-    }
-    if kind == E_REPEAT {
-        return lower_repeat(n);
-    }
-    if kind == E_BLOCK {
-        return lower_block(n);
-    }
-    if kind == E_IF {
-        return lower_if(n);
-    }
-    if kind == E_LOOP || kind == E_WHILE {
-        return lower_loop(n);
-    }
-    if kind == E_FOR {
-        lower_for(n);
-        return 0;
-    }
-    if kind == E_ASSIGN {
-        lower_assign(n);
-        return 0;
-    }
-    if kind == E_RETURN {
-        let mut value = 0;
-        if NODES[n].a != 0 {
-            value = lower_expr(NODES[n].a);
+    match NODES[n].kind {
+        NodeKind::Int | NodeKind::Char => ir_const(wrap_int(NODES[n].a, ty), ir_type(ty)),
+        NodeKind::Float => ir_const(float_const(f64_of_bits(NODES[n].a), ty), ty),
+        NodeKind::Bool => ir_const(NODES[n].a, TY_BOOL),
+        NodeKind::Unit => 0,
+        NodeKind::Str => lower_string(n),
+        NodeKind::CStr => emit_ir(Op::SAddr, TY_U64, 0, 0, NODES[n].a),
+        NodeKind::Ident => lower_ident(n),
+        NodeKind::Binary => lower_binary(n),
+        NodeKind::Unary => lower_unary(n),
+        NodeKind::Cast => {
+            let operand = NODES[n].a;
+            let value = lower_expr(operand);
+            lower_cast(value, NODES[operand].ty, ty)
         }
-        lower_return(value);
-        return 0;
+        NodeKind::Call => lower_call(n),
+        NodeKind::Index if NODES[NODES[n].b].kind == NodeKind::Range => lower_slicing(n),
+        NodeKind::Index | NodeKind::FieldAccess | NodeKind::TupleField => load_scalar(lower_addr(n), ty),
+        NodeKind::VariantLit => lower_variant(n),
+        NodeKind::Match => lower_match(n),
+        NodeKind::Tuple | NodeKind::Array | NodeKind::StructLit => lower_aggregate(n),
+        NodeKind::Repeat => lower_repeat(n),
+        NodeKind::Block => lower_block(n),
+        NodeKind::If => lower_if(n),
+        NodeKind::Loop | NodeKind::While => lower_loop(n),
+        NodeKind::For => {
+            lower_for(n);
+            0
+        }
+        NodeKind::Assign => {
+            lower_assign(n);
+            0
+        }
+        NodeKind::Return => {
+            let mut value = 0;
+            if NODES[n].a != 0 {
+                value = lower_expr(NODES[n].a);
+            }
+            lower_return(value);
+            0
+        }
+        NodeKind::Break => {
+            lower_break(n);
+            0
+        }
+        NodeKind::Continue => {
+            let info = NODES[NODES[n].x].z;
+            lower_jump(LOOP_INFO.data[info]);
+            start_dead_block();
+            0
+        }
+        _ => type_error(n, c"internal error: unexpected node in IR lowering"),
     }
-    if kind == E_BREAK {
-        lower_break(n);
-        return 0;
-    }
-    if kind == E_CONTINUE {
-        let info = NODES[NODES[n].x].z;
-        lower_jump(LOOP_INFO.data[info]);
-        start_dead_block();
-        return 0;
-    }
-    type_error(n, c"internal error: unexpected node in IR lowering")
 }
 
 fn lower_string(n: i64) -> i64 {
     let base = ir_slot_addr(new_slot_for(TY_STRING));
-    ir_store(TY_U64, base, emit_ir(OP_SADDR, TY_U64, 0, 0, NODES[n].a), 0);
-    ir_store(TY_U64, base, ir_const(STRS[NODES[n].a].len, TY_U64), 8);
+    ir_store(TY_U64, base, emit_ir(Op::SAddr, TY_U64, 0, 0, NODES[n].a), 0);
+    ir_store(TY_U64, base, ir_const(STRS[NODES[n].a].len as i64, TY_U64), 8);
     base
 }
 
 fn lower_ident(n: i64) -> i64 {
     let ty = NODES[n].ty;
-    let resolution = NODES[n].x;
+    let resolution = NODES[n].res;
     let index = NODES[n].y;
-    if resolution == R_LOCAL {
+    if resolution == Res::Local {
         if is_void(ty) {
             return 0;
         }
@@ -617,86 +584,85 @@ fn lower_ident(n: i64) -> i64 {
         }
         return load_scalar(LOCAL_ADDR[index], ty);
     }
-    if resolution == R_CONST {
+    if resolution == Res::Const {
         return ir_const(const_value(index), ir_type(ty));
     }
-    if resolution == R_STATIC {
-        return load_scalar(emit_ir(OP_GADDR, TY_U64, 0, 0, NODES[n].a), ty);
+    if resolution == Res::Static {
+        return load_scalar(emit_ir(Op::GAddr, TY_U64, 0, 0, NODES[n].a), ty);
     }
-    emit_ir(OP_FADDR, TY_U64, 0, 0, index)
+    emit_ir(Op::FAddr, TY_U64, 0, 0, index)
 }
 
 // The address of a place (or of a compound value).
 fn lower_addr(n: i64) -> i64 {
-    let kind = NODES[n].kind;
-    if kind == E_IDENT && NODES[n].x == R_LOCAL {
-        let local = NODES[n].y;
-        if PROMOTE[local] != 0 {
-            type_error(n, c"internal error: address of an SSA variable");
+    match NODES[n].kind {
+        NodeKind::Ident if NODES[n].res == Res::Local => {
+            let local = NODES[n].y;
+            if PROMOTE[local] != 0 {
+                type_error(n, c"internal error: address of an SSA variable");
+            }
+            LOCAL_ADDR[local]
         }
-        return LOCAL_ADDR[local];
-    }
-    if kind == E_IDENT && NODES[n].x == R_STATIC {
-        return emit_ir(OP_GADDR, TY_U64, 0, 0, NODES[n].a);
-    }
-    if kind == E_UNARY && NODES[n].a == TK_STAR {
-        return lower_operand(NODES[n].b);
-    }
-    if kind == E_FIELD {
-        let addr = lower_operand(NODES[n].a);
-        return ir_offset(addr, field_offset_of(n));
-    }
-    if kind == E_TUPLE_FIELD {
-        let base = NODES[n].a;
-        let addr = lower_operand(base);
-        return ir_offset(addr, tuple_offset(NODES[base].ty, NODES[n].b));
-    }
-    if kind == E_INDEX {
-        let base = NODES[n].a;
-        let base_ty = NODES[base].ty;
-        let elem_size = size_of(TYPES[base_ty].a);
-        let mut addr = lower_operand(base);
-        let index = lower_operand(NODES[n].b);
-        if is_slice(base_ty) {
-            let length = ir_load(TY_U64, addr, 8);
-            lower_check(ir_cmp(TK_LT, TY_U64, index, length),
-                        panic_kind(NODES[NODES[n].b].ty, false), index, length, 0);
-            addr = ir_load(TY_U64, addr, 0);
+        NodeKind::Ident if NODES[n].res == Res::Static => emit_ir(Op::GAddr, TY_U64, 0, 0, NODES[n].a),
+        NodeKind::Unary if NODES[n].op == Tok::Star => lower_operand(NODES[n].b),
+        NodeKind::FieldAccess => {
+            let addr = lower_operand(NODES[n].a);
+            ir_offset(addr, field_offset_of(n))
         }
-        let mut scaled = index;
-        if elem_size != 1 {
-            scaled = ir_binary(OP_MUL, TY_U64, index, ir_const(elem_size, TY_U64));
+        NodeKind::TupleField => {
+            let base = NODES[n].a;
+            let addr = lower_operand(base);
+            ir_offset(addr, tuple_offset(NODES[base].ty, NODES[n].b))
         }
-        return ir_binary(OP_ADD, TY_U64, addr, scaled);
+        NodeKind::Index => {
+            let base = NODES[n].a;
+            let base_ty = NODES[base].ty;
+            let elem_size = size_of(TYPES[base_ty].a);
+            let mut addr = lower_operand(base);
+            let index = lower_operand(NODES[n].b);
+            if is_slice(base_ty) {
+                let length = ir_load(TY_U64, addr, 8);
+                lower_check(ir_cmp(Cond::Lt, TY_U64, index, length),
+                            panic_kind(NODES[NODES[n].b].ty, false), index, length, 0);
+                addr = ir_load(TY_U64, addr, 0);
+            }
+            let mut scaled = index;
+            if elem_size != 1 {
+                scaled = ir_binary(Op::Mul, TY_U64, index, ir_const(elem_size, TY_U64));
+            }
+            ir_binary(Op::Add, TY_U64, addr, scaled)
+        }
+        _ => lower_operand(n),
     }
-    lower_operand(n)
 }
 
 // ---- Operators ----
 
-fn arith_op(token: i64) -> i64 {
-    if token == TK_PLUS { return OP_ADD; }
-    if token == TK_MINUS { return OP_SUB; }
-    if token == TK_STAR { return OP_MUL; }
-    if token == TK_SLASH { return OP_DIV; }
-    if token == TK_PERCENT { return OP_REM; }
-    if token == TK_AMP { return OP_AND; }
-    if token == TK_PIPE { return OP_OR; }
-    if token == TK_CARET { return OP_XOR; }
-    if token == TK_SHL { return OP_SHL; }
-    OP_SHR
+fn arith_op(token: Tok) -> Op {
+    match token {
+        Tok::Plus => Op::Add,
+        Tok::Minus => Op::Sub,
+        Tok::Star => Op::Mul,
+        Tok::Slash => Op::Div,
+        Tok::Percent => Op::Rem,
+        Tok::Amp => Op::And,
+        Tok::Pipe => Op::Or,
+        Tok::Caret => Op::Xor,
+        Tok::Shl => Op::Shl,
+        _ => Op::Shr,
+    }
 }
 
 // a <token> b, for operands of type `operand_ty` and a result of type `ty`.
-fn lower_operator(token: i64, operand_ty: i64, ty: i64, a: i64, b: i64) -> i64 {
+fn lower_operator(token: Tok, operand_ty: i64, ty: i64, a: i64, b: i64) -> i64 {
     if is_comparison(token) {
-        return ir_cmp(token, ir_type(operand_ty), a, b);
+        return ir_cmp(cond_of_token(token), ir_type(operand_ty), a, b);
     }
-    if is_float(ty) && token == TK_PERCENT {
+    if is_float(ty) && token == Tok::Percent {
         let mark = SSA_STACK.count;
         push_arg(a, ty);
         push_arg(b, ty);
-        let call = emit_ir(OP_CALLC, ty, 0, 0, intern_c(if ty == TY_F32 { c"fmodf" } else { c"fmod" }));
+        let call = emit_ir(Op::CallC, ty, 0, 0, intern_c(if ty == TY_F32 { c"fmodf" } else { c"fmod" }));
         take_args(call, mark);
         return call;
     }
@@ -704,10 +670,10 @@ fn lower_operator(token: i64, operand_ty: i64, ty: i64, a: i64, b: i64) -> i64 {
 }
 
 fn lower_binary(n: i64) -> i64 {
-    let op = NODES[n].a;
+    let op = NODES[n].op;
     let lhs = NODES[n].b;
     let rhs = NODES[n].c;
-    if op == TK_AMP_AMP || op == TK_PIPE_PIPE {
+    if op == Tok::AmpAmp || op == Tok::PipePipe {
         return lower_short_circuit(op, lhs, rhs);
     }
     let a = lower_operand(lhs);
@@ -715,13 +681,13 @@ fn lower_binary(n: i64) -> i64 {
     lower_operator(op, NODES[lhs].ty, NODES[n].ty, a, b)
 }
 
-fn lower_short_circuit(op: i64, lhs: i64, rhs: i64) -> i64 {
+fn lower_short_circuit(op: Tok, lhs: i64, rhs: i64) -> i64 {
     let result = new_synth_var(TY_BOOL);
     let a = lower_operand(lhs);
     ssa_write(result, CUR, a);
     let rhs_block = ir_new_block();
     let join = ir_new_block();
-    if op == TK_AMP_AMP {
+    if op == Tok::AmpAmp {
         lower_branch(a, rhs_block, join);
     } else {
         lower_branch(a, join, rhs_block);
@@ -737,27 +703,27 @@ fn lower_short_circuit(op: i64, lhs: i64, rhs: i64) -> i64 {
 }
 
 fn lower_unary(n: i64) -> i64 {
-    let op = NODES[n].a;
+    let op = NODES[n].op;
     let operand = NODES[n].b;
     let ty = NODES[n].ty;
-    if op == TK_AMP {
+    if op == Tok::Amp {
         return lower_addr(operand);
     }
     let value = lower_operand(operand);
-    if op == TK_MINUS {
-        return emit_ir(OP_NEG, ir_type(ty), value, 0, 0);
+    if op == Tok::Minus {
+        return emit_ir(Op::Neg, ir_type(ty), value, 0, 0);
     }
-    if op == TK_BANG {
-        return emit_ir(OP_NOT, TY_BOOL, value, 0, 0);
+    if op == Tok::Bang {
+        return emit_ir(Op::Not, TY_BOOL, value, 0, 0);
     }
-    if op == TK_TILDE {
-        return emit_ir(OP_BNOT, ir_type(ty), value, 0, 0);
+    if op == Tok::Tilde {
+        return emit_ir(Op::BNot, ir_type(ty), value, 0, 0);
     }
     load_scalar(value, ty)
 }
 
 fn ir_conv(value: i64, from: i64, to: i64) -> i64 {
-    let v = emit_ir(OP_CONV, to, value, 0, 0);
+    let v = emit_ir(Op::Conv, to, value, 0, 0);
     INSTS[v].imm2 = from;
     v
 }
@@ -781,8 +747,8 @@ fn lower_cast(value: i64, checker_from: i64, to: i64) -> i64 {
 // ---- Calls ----
 
 fn push_arg(value: i64, ty: i64) {
-    intvec_push(&SSA_STACK, value);
-    intvec_push(&SSA_STACK, ty);
+    SSA_STACK.push(value);
+    SSA_STACK.push(ty);
 }
 
 // Moves the arguments pushed since `mark` into call `call`.
@@ -791,8 +757,8 @@ fn take_args(call: i64, mark: i64) {
     INSTS[call].args = ARGS.count;
     INSTS[call].nargs = count;
     for i in 0..count {
-        intvec_push(&ARGS, SSA_STACK.data[mark + 2 * i]);
-        intvec_push(&ARGTY, SSA_STACK.data[mark + 2 * i + 1]);
+        ARGS.push(SSA_STACK.data[mark + 2 * i]);
+        ARGTY.push(SSA_STACK.data[mark + 2 * i + 1]);
     }
     SSA_STACK.count = mark;
 }
@@ -833,7 +799,7 @@ fn lower_call(n: i64) -> i64 {
                 value = copy;
             }
             let kind = if extra { variadic_kind(ty) } else { abi_classify(ty) };
-            if kind == ABI_PIECES {
+            if kind == AbiClass::Pieces {
                 // Its pieces, read from the (new) slot; a variadic one's
                 // first piece carries its type (see call_locations).
                 for k in 0..ABI_PIECE_COUNT {
@@ -868,9 +834,9 @@ fn lower_call(n: i64) -> i64 {
     let result_ty = if is_compound(ret) { 0 } else { ir_type(ret) };
     let mut call = 0;
     if direct >= 0 {
-        call = emit_ir(OP_CALL, result_ty, 0, 0, direct);
+        call = emit_ir(Op::Call, result_ty, 0, 0, direct);
     } else {
-        call = emit_ir(OP_CALLI, result_ty, callee_value, 0, callee_ty);
+        call = emit_ir(Op::CallI, result_ty, callee_value, 0, callee_ty);
     }
     INSTS[call].c = result_ptr;
     take_args(call, mark);
@@ -899,9 +865,9 @@ fn lower_check(ok: i64, kind: i64, a: i64, b: i64, c: i64) {
     push_arg(a, TY_U64);
     push_arg(b, TY_U64);
     push_arg(if c != 0 { c } else { ir_const(0, TY_U64) }, TY_U64);
-    let call = emit_ir(OP_CALLC, 0, 0, 0, rt_panic_sym());
+    let call = emit_ir(Op::CallC, 0, 0, 0, rt_panic_sym());
     take_args(call, mark);
-    ir_terminate(CUR, TERM_UNREACH, 0, 0, 0);
+    ir_terminate(CUR, Term::Unreach, 0, 0, 0);
     ir_seal(pass);
     CUR = pass;
 }
@@ -940,7 +906,7 @@ fn lower_slicing(n: i64) -> i64 {
     if is_slice(base_ty) {
         pointer = ir_load(TY_U64, value, 0);
         length = ir_load(TY_U64, value, 8);
-    } else if TYPES[base_ty].kind == TY_ARRAY {
+    } else if TYPES[base_ty].kind == TyKind::Array {
         length = ir_const(TYPES[base_ty].b, TY_U64);
     }
     let mut bound_ty = TY_U64;
@@ -960,20 +926,20 @@ fn lower_slicing(n: i64) -> i64 {
     }
     let mut end = hi;
     if inclusive {
-        end = ir_binary(OP_ADD, TY_U64, hi, ir_const(1, TY_U64));
+        end = ir_binary(Op::Add, TY_U64, hi, ir_const(1, TY_U64));
     }
-    if TYPES[base_ty].kind != TY_PTR {
+    if TYPES[base_ty].kind != TyKind::Ptr {
         let kind = panic_kind(bound_ty, true);
-        lower_check(ir_cmp(if inclusive { TK_LT } else { TK_LT_EQ }, TY_U64, hi, length), kind, lo, end, length);
-        lower_check(ir_cmp(TK_LT_EQ, TY_U64, lo, end), kind, lo, end, length);
+        lower_check(ir_cmp(if inclusive { Cond::Lt } else { Cond::Le }, TY_U64, hi, length), kind, lo, end, length);
+        lower_check(ir_cmp(Cond::Le, TY_U64, lo, end), kind, lo, end, length);
     }
     let mut scaled = lo;
     if elem_size != 1 {
-        scaled = ir_binary(OP_MUL, TY_U64, lo, ir_const(elem_size, TY_U64));
+        scaled = ir_binary(Op::Mul, TY_U64, lo, ir_const(elem_size, TY_U64));
     }
     let result = ir_slot_addr(new_slot_for(NODES[n].ty));
-    ir_store(TY_U64, result, ir_binary(OP_ADD, TY_U64, pointer, scaled), 0);
-    ir_store(TY_U64, result, ir_binary(OP_SUB, TY_U64, end, lo), 8);
+    ir_store(TY_U64, result, ir_binary(Op::Add, TY_U64, pointer, scaled), 0);
+    ir_store(TY_U64, result, ir_binary(Op::Sub, TY_U64, end, lo), 8);
     result
 }
 
@@ -1026,7 +992,7 @@ fn lower_match(n: i64) -> i64 {
         CUR = fail;
     }
     if !is_dead_block(CUR) {
-        ir_terminate(CUR, TERM_UNREACH, 0, 0, 0);
+        ir_terminate(CUR, Term::Unreach, 0, 0, 0);
     }
     ir_seal(join);
     CUR = join;
@@ -1040,7 +1006,7 @@ fn lower_match(n: i64) -> i64 {
 // alternatives of an or-pattern bind the same locals).
 fn alloc_pattern_locals(p: i64) {
     let kind = NODES[p].kind;
-    if kind == P_BIND {
+    if kind == NodeKind::PatBind {
         let local = NODES[p].x;
         let ty = LOCALS[local].ty;
         if PROMOTE[local] == 0 && !is_void(ty) {
@@ -1048,7 +1014,7 @@ fn alloc_pattern_locals(p: i64) {
         }
         return;
     }
-    if kind == P_TUPLE || kind == P_VARIANT || kind == P_OR {
+    if kind == NodeKind::PatTuple || kind == NodeKind::PatVariant || kind == NodeKind::PatOr {
         for i in 0..NODES[p].count {
             alloc_pattern_locals(child(p, i));
         }
@@ -1059,64 +1025,68 @@ fn alloc_pattern_locals(p: i64) {
 // compound value) matches pattern p; binds its variables.
 fn lower_pattern_test(p: i64, ty: i64, value: i64, fail: i64) {
     let kind = NODES[p].kind;
-    if kind == P_WILD || ty == TY_NEVER {
+    if ty == TY_NEVER {
         return;
     }
-    if kind == P_BIND {
-        let local = NODES[p].x;
-        if is_void(ty) {
+    match kind {
+        NodeKind::PatWild => return,
+        NodeKind::PatBind => {
+            let local = NODES[p].x;
+            if is_void(ty) {
+                return;
+            }
+            if PROMOTE[local] != 0 {
+                ssa_write(local, CUR, need_value(value, ty));
+            } else if is_compound(ty) {
+                lower_copy(LOCAL_ADDR[local], value, size_of(ty));
+            } else {
+                ir_store(ir_type(ty), LOCAL_ADDR[local], need_value(value, ty), 0);
+            }
             return;
         }
-        if PROMOTE[local] != 0 {
-            ssa_write(local, CUR, need_value(value, ty));
-        } else if is_compound(ty) {
-            lower_copy(LOCAL_ADDR[local], value, size_of(ty));
-        } else {
-            ir_store(ir_type(ty), LOCAL_ADDR[local], need_value(value, ty), 0);
+        NodeKind::PatLit => {
+            let t = ir_type(ty);
+            test_or_fail(ir_cmp(Cond::Eq, t, value, ir_const(NODES[p].x, t)), fail);
+            return;
         }
-        return;
-    }
-    if kind == P_LIT {
-        let t = ir_type(ty);
-        test_or_fail(ir_cmp(TK_EQ_EQ, t, value, ir_const(NODES[p].x, t)), fail);
-        return;
-    }
-    if kind == P_RANGE {
-        let t = ir_type(ty);
-        test_or_fail(ir_cmp(TK_GT_EQ, t, value, ir_const(NODES[p].x, t)), fail);
-        test_or_fail(ir_cmp(TK_LT_EQ, t, value, ir_const(NODES[p].y, t)), fail);
-        return;
-    }
-    if kind == P_OR {
-        let ok = ir_new_block();
-        let last = NODES[p].count - 1;
-        for i in 0..last {
-            let next = ir_new_block();
-            lower_pattern_test(child(p, i), ty, value, next);
+        NodeKind::PatRange => {
+            let t = ir_type(ty);
+            test_or_fail(ir_cmp(Cond::Ge, t, value, ir_const(NODES[p].x, t)), fail);
+            test_or_fail(ir_cmp(Cond::Le, t, value, ir_const(NODES[p].y, t)), fail);
+            return;
+        }
+        NodeKind::PatOr => {
+            let ok = ir_new_block();
+            let last = NODES[p].count - 1;
+            for i in 0..last {
+                let next = ir_new_block();
+                lower_pattern_test(child(p, i), ty, value, next);
+                lower_jump(ok);
+                ir_seal(next);
+                CUR = next;
+            }
+            lower_pattern_test(child(p, last), ty, value, fail);
             lower_jump(ok);
-            ir_seal(next);
-            CUR = next;
+            ir_seal(ok);
+            CUR = ok;
+            return;
         }
-        lower_pattern_test(child(p, last), ty, value, fail);
-        lower_jump(ok);
-        ir_seal(ok);
-        CUR = ok;
-        return;
-    }
-    if kind == P_VARIANT {
-        let v = NODES[p].x;
-        let tag = ENUMS[TYPES[ty].a].tag;
-        let tag_value = if is_compound(ty) { ir_load(tag, value, 0) } else { value };
-        test_or_fail(ir_cmp(TK_EQ_EQ, tag, tag_value, ir_const(wrap_int(VARIANTS[v].discr, tag), tag)), fail);
+        NodeKind::PatVariant => {
+            let v = NODES[p].x;
+            let tag = ENUMS[TYPES[ty].a].tag;
+            let tag_value = if is_compound(ty) { ir_load(tag, value, 0) } else { value };
+            test_or_fail(ir_cmp(Cond::Eq, tag, tag_value, ir_const(wrap_int(VARIANTS[v].discr, tag), tag)), fail);
+        }
+        _ => {}
     }
     for i in 0..NODES[p].count {
         let sub = child(p, i);
-        if NODES[sub].kind == P_WILD {
+        if NODES[sub].kind == NodeKind::PatWild {
             continue;
         }
         let mut elem_ty = 0;
         let mut offset = 0;
-        if kind == P_VARIANT {
+        if kind == NodeKind::PatVariant {
             elem_ty = variant_field(NODES[p].x, i);
             offset = variant_field_offset(NODES[p].x, i);
         } else {
@@ -1158,7 +1128,7 @@ fn switch_cases(n: i64, st: i64) -> bool {
             return false;
         }
         let kind = NODES[p].kind;
-        if kind == P_WILD || kind == P_BIND {
+        if kind == NodeKind::PatWild || kind == NodeKind::PatBind {
             SW_DEFAULT = i;
             break;
         }
@@ -1172,44 +1142,45 @@ fn switch_cases(n: i64, st: i64) -> bool {
 // Adds the values pattern p matches (for arm i, unless an earlier arm has
 // them); false when p is not a set of values.
 fn add_switch_values(p: i64, arm: i64) -> bool {
-    let kind = NODES[p].kind;
-    if kind == P_LIT {
-        add_switch_value(NODES[p].x, arm);
-        return true;
-    }
-    if kind == P_RANGE {
-        let ty = scalar_type(NODES[p].ty);
-        let count = int_key(NODES[p].y, ty) - int_key(NODES[p].x, ty) + 1;
-        if count < 1 || count > 256 || SW_CASES.count + 2 * count > 2048 {
-            return false;
+    match NODES[p].kind {
+        NodeKind::PatLit => {
+            add_switch_value(NODES[p].x, arm);
+            true
         }
-        for k in 0..count {
-            add_switch_value(wrap_int(NODES[p].x + k, ty), arm);
-        }
-        return true;
-    }
-    if kind == P_VARIANT {
-        for i in 0..NODES[p].count {
-            if !is_irrefutable(child(p, i)) {
+        NodeKind::PatRange => {
+            let ty = scalar_type(NODES[p].ty);
+            let count = int_key(NODES[p].y, ty) - int_key(NODES[p].x, ty) + 1;
+            if count < 1 || count > 256 || SW_CASES.count + 2 * count > 2048 {
                 return false;
             }
+            for k in 0..count {
+                add_switch_value(wrap_int(NODES[p].x + k, ty), arm);
+            }
+            true
         }
-        let v = NODES[p].x;
-        add_switch_value(wrap_int(VARIANTS[v].discr, ENUMS[VARIANTS[v].enum_id].tag), arm);
-        return true;
-    }
-    if kind == P_OR {
-        if binding_count(p) != 0 {
-            return false;
+        NodeKind::PatVariant => {
+            for i in 0..NODES[p].count {
+                if !is_irrefutable(child(p, i)) {
+                    return false;
+                }
+            }
+            let v = NODES[p].x;
+            add_switch_value(wrap_int(VARIANTS[v].discr, ENUMS[VARIANTS[v].enum_id].tag), arm);
+            true
         }
-        for i in 0..NODES[p].count {
-            if !add_switch_values(child(p, i), arm) {
+        NodeKind::PatOr => {
+            if binding_count(p) != 0 {
                 return false;
             }
+            for i in 0..NODES[p].count {
+                if !add_switch_values(child(p, i), arm) {
+                    return false;
+                }
+            }
+            true
         }
-        return true;
+        _ => false,
     }
-    false
 }
 
 fn add_switch_value(value: i64, arm: i64) {
@@ -1220,8 +1191,8 @@ fn add_switch_value(value: i64, arm: i64) {
         }
         i += 2;
     }
-    intvec_push(&SW_CASES, value);
-    intvec_push(&SW_CASES, arm);
+    SW_CASES.push(value);
+    SW_CASES.push(arm);
 }
 
 // Match n as a switch on the scrutinee (or its tag): every arm in a block
@@ -1246,13 +1217,13 @@ fn lower_match_switch(n: i64, st: i64, value: i64, result: i64, join: i64) {
     }
     let unreachable = default;
     if is_dead_block(CUR) {
-        ir_terminate(CUR, TERM_UNREACH, 0, 0, 0);
+        ir_terminate(CUR, Term::Unreach, 0, 0, 0);
     } else {
         let mark = SSA_STACK.count;
         let mut i = 0;
         while i < SW_CASES.count {
-            intvec_push(&SSA_STACK, SW_CASES.data[i]);
-            intvec_push(&SSA_STACK, first + SW_CASES.data[i + 1]);
+            SSA_STACK.push(SW_CASES.data[i]);
+            SSA_STACK.push(first + SW_CASES.data[i + 1]);
             i += 2;
         }
         ir_switch(CUR, key, default, mark);
@@ -1275,7 +1246,7 @@ fn lower_match_switch(n: i64, st: i64, value: i64, result: i64, join: i64) {
     if catch_all < 0 {
         CUR = unreachable;
         ir_seal(CUR);
-        ir_terminate(CUR, TERM_UNREACH, 0, 0, 0);
+        ir_terminate(CUR, Term::Unreach, 0, 0, 0);
     }
 }
 
@@ -1283,11 +1254,11 @@ fn lower_match_switch(n: i64, st: i64, value: i64, result: i64, join: i64) {
 // for a variant, the value for a binding.
 fn lower_pattern_binds(p: i64, ty: i64, value: i64) {
     let kind = NODES[p].kind;
-    if kind == P_BIND || kind == P_WILD {
+    if kind == NodeKind::PatBind || kind == NodeKind::PatWild {
         lower_pattern_test(p, ty, value, 0);
         return;
     }
-    if kind != P_VARIANT {
+    if kind != NodeKind::PatVariant {
         return;
     }
     let v = NODES[p].x;
@@ -1324,12 +1295,12 @@ fn lower_aggregate(n: i64) -> i64 {
         let mut value_node = elem;
         let mut offset = 0;
         let mut elem_ty = 0;
-        if kind == E_STRUCT {
+        if kind == NodeKind::StructLit {
             let s = TYPES[ty].a;
             value_node = NODES[elem].b;
             offset = field_offset(s, NODES[elem].x);
             elem_ty = (*struct_field(s, NODES[elem].x)).ty;
-        } else if kind == E_TUPLE {
+        } else if kind == NodeKind::Tuple {
             offset = tuple_offset(ty, i);
             elem_ty = type_elem(ty, i);
         } else {
@@ -1383,7 +1354,7 @@ fn lower_repeat(n: i64) -> i64 {
     store_value(at, 0, value, elem_ty);
     let next = ir_offset(at, elem_size);
     ssa_write(cursor, CUR, next);
-    lower_branch(ir_cmp(TK_BANG_EQ, TY_U64, next, end), body, exit);
+    lower_branch(ir_cmp(Cond::Ne, TY_U64, next, end), body, exit);
     ir_seal(body);
     ir_seal(exit);
     CUR = exit;
@@ -1458,9 +1429,9 @@ fn lower_branch_body(block: i64, result: i64, has_value: bool, join: i64) {
 
 fn new_loop_info(n: i64, continue_block: i64, exit: i64, break_var: i64) {
     NODES[n].z = LOOP_INFO.count;
-    intvec_push(&LOOP_INFO, continue_block);
-    intvec_push(&LOOP_INFO, exit);
-    intvec_push(&LOOP_INFO, break_var);
+    LOOP_INFO.push(continue_block);
+    LOOP_INFO.push(exit);
+    LOOP_INFO.push(break_var);
 }
 
 // `loop` and `while`.
@@ -1468,13 +1439,13 @@ fn lower_loop(n: i64) -> i64 {
     let header = ir_new_block();
     let exit = ir_new_block();
     let mut break_var = -1;
-    if NODES[n].kind == E_LOOP && NODES[n].x != 0 && !is_void(NODES[n].y) {
+    if NODES[n].kind == NodeKind::Loop && NODES[n].x != 0 && !is_void(NODES[n].y) {
         break_var = join_new(NODES[n].y);
     }
     new_loop_info(n, header, exit, break_var);
     lower_jump(header);
     CUR = header;
-    if NODES[n].kind == E_WHILE {
+    if NODES[n].kind == NodeKind::While {
         let cond = lower_operand(NODES[n].b);
         let body = ir_new_block();
         lower_branch(cond, body, exit);
@@ -1526,7 +1497,7 @@ fn lower_for(n: i64) {
     CUR = test;
     let value = ssa_read(counter, test);
     let body = ir_new_block();
-    lower_branch(ir_cmp(if inclusive { TK_GT } else { TK_GT_EQ }, ty, value, end), exit, body);
+    lower_branch(ir_cmp(if inclusive { Cond::Gt } else { Cond::Ge }, ty, value, end), exit, body);
     ir_seal(body);
     CUR = body;
     bind_pattern_ir(NODES[n].b, ssa_read(counter, body), false);
@@ -1537,11 +1508,11 @@ fn lower_for(n: i64) {
     let current = ssa_read(counter, next);
     if inclusive {
         let step = ir_new_block();
-        lower_branch(ir_cmp(TK_EQ_EQ, ty, current, end), exit, step);
+        lower_branch(ir_cmp(Cond::Eq, ty, current, end), exit, step);
         ir_seal(step);
         CUR = step;
     }
-    ssa_write(counter, CUR, ir_binary(OP_ADD, ty, current, ir_const(1, ty)));
+    ssa_write(counter, CUR, ir_binary(Op::Add, ty, current, ir_const(1, ty)));
     lower_jump(test);
     ir_seal(test);
     ir_seal(exit);
@@ -1553,11 +1524,11 @@ fn lower_for(n: i64) {
 // The right-hand side is evaluated first, then the target's address; a
 // compound assignment then reads the old value.
 fn lower_assign(n: i64) {
-    let op = NODES[n].a;
+    let op = NODES[n].op;
     let target = NODES[n].b;
     let value = NODES[n].c;
     let ty = NODES[target].ty;
-    if NODES[target].kind == E_IDENT && NODES[target].x == R_LOCAL
+    if NODES[target].kind == NodeKind::Ident && NODES[target].res == Res::Local
         && (PROMOTE[NODES[target].y] != 0 || is_void(ty)) {
         let local = NODES[target].y;
         if is_void(ty) {
@@ -1565,15 +1536,15 @@ fn lower_assign(n: i64) {
             return;
         }
         let v = lower_operand(value);
-        if op == TK_EQ {
+        if op == Tok::Eq {
             ssa_write(local, CUR, v);
             return;
         }
         let old = ssa_read(local, CUR);
-        ssa_write(local, CUR, lower_operator(arith_of_assign(op), ty, ty, old, v));
+        ssa_write(local, CUR, lower_operator(arith_op_of_assign(op), ty, ty, old, v));
         return;
     }
-    if op == TK_EQ {
+    if op == Tok::Eq {
         let v = lower_expr(value);
         let addr = lower_addr(target);
         store_value(addr, 0, v, ty);
@@ -1582,9 +1553,5 @@ fn lower_assign(n: i64) {
     let v = lower_operand(value);
     let addr = lower_addr(target);
     let old = ir_load(ir_type(ty), addr, 0);
-    ir_store(ir_type(ty), addr, lower_operator(arith_of_assign(op), ty, ty, old, v), 0);
-}
-
-fn arith_of_assign(op: i64) -> i64 {
-    arith_op_of_assign(op)
+    ir_store(ir_type(ty), addr, lower_operator(arith_op_of_assign(op), ty, ty, old, v), 0);
 }

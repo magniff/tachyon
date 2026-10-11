@@ -10,16 +10,16 @@ const AS_BP: i64 = 24;
 const PREFIX_BP: i64 = 25;
 const POSTFIX_BP: i64 = 27;
 
-fn tok_kind(offset: i64) -> i64 {
+fn tok_kind(offset: i64) -> Tok {
     let i = P + offset;
-    if i >= TOK_COUNT { TK_EOF } else { TOKS[i].kind }
+    if i >= TOK_COUNT { Tok::Eof } else { TOKS[i].kind }
 }
 
-fn cur() -> i64 {
+fn cur() -> Tok {
     TOKS[P].kind
 }
 
-fn at(kind: i64) -> bool {
+fn at(kind: Tok) -> bool {
     TOKS[P].kind == kind
 }
 
@@ -33,12 +33,12 @@ fn prev_end() -> i64 {
 }
 
 fn advance() {
-    if TOKS[P].kind != TK_EOF {
+    if TOKS[P].kind != Tok::Eof {
         P += 1;
     }
 }
 
-fn eat(kind: i64) -> bool {
+fn eat(kind: Tok) -> bool {
     if at(kind) {
         advance();
         return true;
@@ -48,14 +48,14 @@ fn eat(kind: i64) -> bool {
 
 fn err_token(i: i64) {
     let kind = TOKS[i].kind;
-    if kind == TK_IDENT || kind == TK_RESERVED || (kind >= TK_FN && kind <= TK_UNION) {
+    if kind == Tok::Ident || kind == Tok::Reserved || kind.is_keyword() {
         err_sym(TOKS[i].value as i64);
-    } else if kind == TK_INT || kind == TK_FLOAT || kind == TK_CHAR {
-        buf_bytes(ERR, &SRC[TOKS[i].start], TOKS[i].end - TOKS[i].start);
-    } else if kind == TK_STR || kind == TK_CSTR {
+    } else if kind == Tok::Int || kind == Tok::Float || kind == Tok::Char {
+        buf_bytes(ERR, SRC[TOKS[i].start..TOKS[i].end]);
+    } else if kind == Tok::Str || kind == Tok::CStr {
         err_str(c"string literal");
     } else {
-        err_str(TOKEN_TEXT[kind]);
+        err_str(kind.text());
     }
 }
 
@@ -68,11 +68,11 @@ fn syntax_error(message: *u8) -> ! {
     err_end()
 }
 
-fn expect(kind: i64) {
+fn expect(kind: Tok) {
     if !at(kind) {
         err_begin(cur_start());
         err_str(c"expected '");
-        err_str(TOKEN_TEXT[kind]);
+        err_str(kind.text());
         err_str(c"', got '");
         err_token(P);
         err_str(c"'");
@@ -85,7 +85,7 @@ fn reserved_error() -> ! {
     err_begin(cur_start());
     err_str(c"'");
     err_token(P);
-    if at(TK_RESERVED) {
+    if at(Tok::Reserved) {
         err_str(c"' is a reserved keyword (reserved for future use)");
     } else {
         err_str(c"' is reserved for future use");
@@ -96,10 +96,10 @@ fn reserved_error() -> ! {
 static mut UNDERSCORE: i64 = -1;
 
 fn expect_ident() -> i64 {
-    if at(TK_RESERVED) {
+    if at(Tok::Reserved) {
         reserved_error();
     }
-    if !at(TK_IDENT) {
+    if !at(Tok::Ident) {
         syntax_error(c"expected identifier");
     }
     let sym = TOKS[P].value as i64;
@@ -109,7 +109,7 @@ fn expect_ident() -> i64 {
 
 // A name being declared: an identifier other than `_`.
 fn expect_binding_name() -> i64 {
-    if at(TK_IDENT) && TOKS[P].value as i64 == UNDERSCORE {
+    if at(Tok::Ident) && TOKS[P].value as i64 == UNDERSCORE {
         error_at(cur_start(), c"'_' cannot be used as a name here");
     }
     expect_ident()
@@ -125,15 +125,15 @@ fn with_no_struct(value: bool) -> bool {
 
 fn parse_program() -> i64 {
     UNDERSCORE = intern_c(c"_");
-    let program = new_node(0, 0, 0);
+    let program = new_node(NodeKind::None, 0, 0);
     let mark = list_begin();
-    while !at(TK_EOF) {
-        if at(TK_IMPL) {
+    while !at(Tok::Eof) {
+        if at(Tok::Impl) {
             // The functions of an impl block are items of the program.
             parse_impl();
-        } else if at(TK_EXTERN) {
+        } else if at(Tok::Extern) {
             parse_extern();
-        } else if at(TK_HASH) {
+        } else if at(Tok::Hash) {
             list_push(parse_attributed_item());
         } else {
             list_push(parse_item());
@@ -144,154 +144,149 @@ fn parse_program() -> i64 {
 }
 
 fn parse_item() -> i64 {
-    let kind = cur();
-    if kind == TK_FN { return parse_function(); }
-    if kind == TK_STRUCT || kind == TK_UNION { return parse_struct(); }
-    if kind == TK_CONST { return parse_const_or_static(I_CONST); }
-    if kind == TK_STATIC { return parse_const_or_static(I_STATIC); }
-    if kind == TK_TYPE { return parse_type_alias(); }
-    if kind == TK_ENUM { return parse_enum(); }
-    if kind == TK_RESERVED {
-        reserved_error();
+    match cur() {
+        Tok::Fn => parse_function(),
+        Tok::Struct | Tok::Union => parse_struct(),
+        Tok::Const => parse_const_or_static(NodeKind::Const),
+        Tok::Static => parse_const_or_static(NodeKind::Static),
+        Tok::Type => parse_type_alias(),
+        Tok::Enum => parse_enum(),
+        Tok::Reserved => reserved_error(),
+        _ => syntax_error(c"expected an item ('fn', 'extern', 'struct', 'union', 'enum', 'impl', 'const', 'static' or 'type')"),
     }
-    syntax_error(c"expected an item ('fn', 'extern', 'struct', 'union', 'enum', 'impl', 'const', 'static' or 'type')")
 }
 
 // `impl T { fn ... }`: each function is pushed as an item, marked with T.
 fn parse_impl() {
-    expect(TK_IMPL);
+    expect(Tok::Impl);
     let type_name = expect_ident();
-    if at(TK_LT) {
+    if at(Tok::Lt) {
         error_at(cur_start(), c"generic impl blocks are not supported yet");
     }
-    expect(TK_LBRACE);
-    while !at(TK_RBRACE) && !at(TK_EOF) {
-        if !at(TK_FN) {
+    expect(Tok::LBrace);
+    while !at(Tok::RBrace) && !at(Tok::Eof) {
+        if !at(Tok::Fn) {
             syntax_error(c"expected 'fn' or '}' in an impl block");
         }
         let f = parse_function();
         NODES[f].d = type_name;
         list_push(f);
     }
-    expect(TK_RBRACE);
+    expect(Tok::RBrace);
 }
 
 // `enum E { A, B(T, ...), C = expr, ... }`
 fn parse_enum() -> i64 {
     let start = cur_start();
-    expect(TK_ENUM);
-    let n = new_node(I_ENUM, start, 0);
-    let new_a = expect_binding_name();
-    NODES[n].a = new_a;
-    if at(TK_LT) {
+    expect(Tok::Enum);
+    let n = new_node(NodeKind::Enum, start, 0);
+    NODES[n].a = expect_binding_name();
+    if at(Tok::Lt) {
         error_at(cur_start(), c"generic enums are not supported yet");
     }
-    expect(TK_LBRACE);
+    expect(Tok::LBrace);
     let mark = list_begin();
-    while !at(TK_RBRACE) && !at(TK_EOF) {
-        let variant = new_node(VARIANT, cur_start(), 0);
-        let new_va = expect_binding_name();
-        NODES[variant].a = new_va;
-        if at(TK_LBRACE) {
+    while !at(Tok::RBrace) && !at(Tok::Eof) {
+        let variant = new_node(NodeKind::Variant, cur_start(), 0);
+        NODES[variant].a = expect_binding_name();
+        if at(Tok::LBrace) {
             error_at(cur_start(), c"struct-like enum variants are not supported yet; use a tuple variant");
         }
-        if eat(TK_LPAREN) {
+        if eat(Tok::LParen) {
             NODES[variant].c = 1;
             let types = list_begin();
-            while !at(TK_RPAREN) && !at(TK_EOF) {
+            while !at(Tok::RParen) && !at(Tok::Eof) {
                 list_push(parse_type());
-                if !eat(TK_COMMA) {
+                if !eat(Tok::Comma) {
                     break;
                 }
             }
             list_end(variant, types);
-            expect(TK_RPAREN);
+            expect(Tok::RParen);
         }
-        if eat(TK_EQ) {
-            let new_vb = parse_expr();
-            NODES[variant].b = new_vb;
+        if eat(Tok::Eq) {
+            NODES[variant].b = parse_expr();
         }
-        let new_vend = prev_end();
-        NODES[variant].end = new_vend;
+        NODES[variant].end = prev_end();
         list_push(variant);
-        if !eat(TK_COMMA) {
+        if !eat(Tok::Comma) {
             break;
         }
     }
     list_end(n, mark);
-    expect(TK_RBRACE);
-    let new_end = prev_end();
-    NODES[n].end = new_end;
+    expect(Tok::RBrace);
+    NODES[n].end = prev_end();
     n
 }
 
 fn parse_function() -> i64 {
     let start = cur_start();
-    expect(TK_FN);
-    let n = new_node(I_FN, start, 0);
-    let new_a = expect_binding_name();
-    NODES[n].a = new_a;
-    expect(TK_LPAREN);
+    expect(Tok::Fn);
+    let n = new_node(NodeKind::Fn, start, 0);
+    NODES[n].a = expect_binding_name();
+    expect(Tok::LParen);
     parse_params(n, false);
-    expect(TK_RPAREN);
-    let new_b = parse_return_type();
-    NODES[n].b = new_b;
-    let new_c = parse_block();
-    NODES[n].c = new_c;
-    let new_end = prev_end();
-    NODES[n].end = new_end;
+    expect(Tok::RParen);
+    NODES[n].b = parse_return_type();
+    NODES[n].c = parse_block();
+    NODES[n].end = prev_end();
     n
 }
 
-// After `extern` (and `"C"`): a block of C declarations, `extern "C" { fn
-// f(...) -> T; static mut x: T; }`; a function with the C convention and
-// an unmangled symbol, `extern "C" fn f(...) -> T { ... }`; a static with
-// a C symbol, `extern "C" static mut x: T = v;`; or (deprecated) a single
-// declaration of a C function, `extern fn f(...) -> T;`. Items are pushed
-// to the program's list.
+// After `extern "C"`: a block of C declarations, `extern "C" { fn f(...)
+// -> T; static mut x: T; }`; a function with the C convention and an
+// unmangled symbol, `extern "C" fn f(...) -> T { ... }`; or a static with
+// a C symbol, `extern "C" static mut x: T = v;`. Items are pushed to the
+// program's list. (0.2's single declarations, `extern fn f(...) -> T;`,
+// were removed in 0.4.)
 fn parse_extern() {
     let start = cur_start();
-    expect(TK_EXTERN);
-    if at(TK_STR) {
-        let abi = TOKS[P].value as i64;
-        if !(STRS[abi].len == 1 && STRS[abi].ptr[0] == 'C') {
-            error_at(cur_start(), c"unsupported ABI; only \"C\" is supported");
-        }
-        advance();
+    expect(Tok::Extern);
+    if !at(Tok::Str) {
+        error_at(start, c_fn_outside_block());
     }
-    if eat(TK_LBRACE) {
-        while !at(TK_RBRACE) && !at(TK_EOF) {
-            if at(TK_FN) {
-                list_push(parse_c_function(cur_start()));
-            } else if at(TK_STATIC) {
+    let abi = TOKS[P].value as i64;
+    if !(STRS[abi].len == 1 && STRS[abi].ptr[0] == 'C') {
+        error_at(cur_start(), c"unsupported ABI; only \"C\" is supported");
+    }
+    advance();
+    if eat(Tok::LBrace) {
+        while !at(Tok::RBrace) && !at(Tok::Eof) {
+            if at(Tok::Fn) {
+                list_push(parse_c_function(cur_start(), true));
+            } else if at(Tok::Static) {
                 list_push(parse_c_static(cur_start(), false));
             } else {
                 syntax_error(c"expected 'fn', 'static' or '}' in an extern block");
             }
         }
-        expect(TK_RBRACE);
+        expect(Tok::RBrace);
         return;
     }
-    if at(TK_STATIC) {
+    if at(Tok::Static) {
         list_push(parse_c_static(start, true));
         return;
     }
-    list_push(parse_c_function(start));
+    list_push(parse_c_function(start, false));
 }
 
-// `fn f(...) -> T;` (a C function) or `fn f(...) -> T { ... }` (one with
-// the C convention, defined here).
-fn parse_c_function(start: i64) -> i64 {
-    if tok_kind(2) == TK_LPAREN {
+fn c_fn_outside_block() -> *u8 {
+    c"C functions are declared in an extern block: `extern \"C\" { fn f(...) -> T; }` (the 0.2 form `extern fn f(...) -> T;` was removed in 0.4)"
+}
+
+// `fn f(...) -> T;` (a C function, only in an extern block) or `fn
+// f(...) -> T { ... }` (one with the C convention, defined here).
+fn parse_c_function(start: i64, in_block: bool) -> i64 {
+    if tok_kind(2) == Tok::LParen {
         // Look past the parameters for the body.
         let saved = P;
         advance();
         advance();
         let mut depth = 0;
-        while !at(TK_EOF) {
-            if at(TK_LPAREN) {
+        while !at(Tok::Eof) {
+            if at(Tok::LParen) {
                 depth += 1;
-            } else if at(TK_RPAREN) {
+            } else if at(Tok::RParen) {
                 depth -= 1;
                 if depth == 0 {
                     break;
@@ -300,10 +295,10 @@ fn parse_c_function(start: i64) -> i64 {
             advance();
         }
         advance();
-        if eat(TK_ARROW) {
+        if eat(Tok::Arrow) {
             parse_type();
         }
-        let has_body = at(TK_LBRACE);
+        let has_body = at(Tok::LBrace);
         P = saved;
         if has_body {
             let f = parse_function();
@@ -312,43 +307,37 @@ fn parse_c_function(start: i64) -> i64 {
             return f;
         }
     }
-    expect(TK_FN);
-    let n = new_node(I_EXTERN, start, 0);
-    let new_a = expect_binding_name();
-    NODES[n].a = new_a;
-    expect(TK_LPAREN);
-    let new_d = parse_params(n, true) as i64;
-    NODES[n].d = new_d;
-    expect(TK_RPAREN);
-    let new_b = parse_return_type();
-    NODES[n].b = new_b;
-    expect(TK_SEMI);
-    let new_end = prev_end();
-    NODES[n].end = new_end;
+    if !in_block {
+        error_at(start, c_fn_outside_block());
+    }
+    expect(Tok::Fn);
+    let n = new_node(NodeKind::ExternFn, start, 0);
+    NODES[n].a = expect_binding_name();
+    expect(Tok::LParen);
+    NODES[n].d = parse_params(n, true) as i64;
+    expect(Tok::RParen);
+    NODES[n].b = parse_return_type();
+    expect(Tok::Semi);
+    NODES[n].end = prev_end();
     n
 }
 
 // `static [mut] x: T;` (defined in C) or, when `defines`, also `static
 // [mut] x: T = v;` (defined here, with a C symbol).
 fn parse_c_static(start: i64, defines: bool) -> i64 {
-    expect(TK_STATIC);
-    let n = new_node(I_STATIC, start, 0);
-    let new_d = eat(TK_MUT) as i64;
-    NODES[n].d = new_d;
-    let new_a = expect_binding_name();
-    NODES[n].a = new_a;
-    expect(TK_COLON);
-    let new_b = parse_type();
-    NODES[n].b = new_b;
+    expect(Tok::Static);
+    let n = new_node(NodeKind::Static, start, 0);
+    NODES[n].d = eat(Tok::Mut) as i64;
+    NODES[n].a = expect_binding_name();
+    expect(Tok::Colon);
+    NODES[n].b = parse_type();
     NODES[n].y = 1;
-    if defines && eat(TK_EQ) {
-        let new_c = parse_expr();
-        NODES[n].c = new_c;
+    if defines && eat(Tok::Eq) {
+        NODES[n].c = parse_expr();
         NODES[n].y = 2;
     }
-    expect(TK_SEMI);
-    let new_end = prev_end();
-    NODES[n].end = new_end;
+    expect(Tok::Semi);
+    NODES[n].end = prev_end();
     n
 }
 
@@ -358,15 +347,15 @@ fn parse_attributed_item() -> i64 {
     let mut align = 0;
     let mut int_type = 0;
     let at_start = cur_start();
-    while at(TK_HASH) {
+    while at(Tok::Hash) {
         advance();
-        expect(TK_LBRACKET);
+        expect(Tok::LBracket);
         let name = expect_ident();
         if name != intern_c(c"repr") {
             name_error(TOKS[P - 1].start, c"unknown attribute '", name, c"' (attributes in 0.3: repr)");
         }
-        expect(TK_LPAREN);
-        while !at(TK_RPAREN) && !at(TK_EOF) {
+        expect(Tok::LParen);
+        while !at(Tok::RParen) && !at(Tok::Eof) {
             let pos = cur_start();
             let arg = expect_ident();
             if arg == intern_c(c"C") {
@@ -374,13 +363,13 @@ fn parse_attributed_item() -> i64 {
             } else if arg == intern_c(c"packed") {
                 flags |= REPR_PACKED;
             } else if arg == intern_c(c"align") {
-                expect(TK_LPAREN);
-                if !at(TK_INT) {
+                expect(Tok::LParen);
+                if !at(Tok::Int) {
                     syntax_error(c"expected the alignment");
                 }
                 align = TOKS[P].value as i64;
                 advance();
-                expect(TK_RPAREN);
+                expect(Tok::RParen);
                 if align < 1 || align > 16 || (align & (align - 1)) != 0 {
                     error_at(pos, c"align(N) needs a power of two from 1 to 16");
                 }
@@ -390,14 +379,14 @@ fn parse_attributed_item() -> i64 {
             } else {
                 name_error(pos, c"unknown repr '", arg, c"' (expected C, packed, align(N) or an integer type)");
             }
-            if !eat(TK_COMMA) {
+            if !eat(Tok::Comma) {
                 break;
             }
         }
-        expect(TK_RPAREN);
-        expect(TK_RBRACKET);
+        expect(Tok::RParen);
+        expect(Tok::RBracket);
     }
-    if !at(TK_STRUCT) && !at(TK_UNION) && !at(TK_ENUM) {
+    if !at(Tok::Struct) && !at(Tok::Union) && !at(Tok::Enum) {
         error_at(at_start, c"#[repr(...)] goes before a struct, union or enum");
     }
     if ((flags & REPR_PACKED) != 0 || align != 0) && (flags & REPR_C) == 0 {
@@ -407,7 +396,7 @@ fn parse_attributed_item() -> i64 {
         error_at(at_start, c"a type cannot be both packed and aligned");
     }
     let item = parse_item();
-    if NODES[item].kind == I_ENUM {
+    if NODES[item].kind == NodeKind::Enum {
         if (flags & REPR_PACKED) != 0 || align != 0 {
             error_at(at_start, c"packed and align(N) are for structs and unions, not enums");
         }
@@ -437,18 +426,18 @@ fn is_int_type_name(name: i64) -> bool {
 fn parse_params(n: i64, allow_ellipsis: bool) -> bool {
     let mark = list_begin();
     let mut variadic = false;
-    while !at(TK_RPAREN) && !at(TK_EOF) {
-        if at(TK_ELLIPSIS) {
+    while !at(Tok::RParen) && !at(Tok::Eof) {
+        if at(Tok::Ellipsis) {
             if !allow_ellipsis {
                 error_at(cur_start(), c"only extern functions can be variadic");
             }
             advance();
             variadic = true;
-            eat(TK_COMMA);
+            eat(Tok::Comma);
             break;
         }
         list_push(parse_param());
-        if !eat(TK_COMMA) {
+        if !eat(Tok::Comma) {
             break;
         }
     }
@@ -458,94 +447,78 @@ fn parse_params(n: i64, allow_ellipsis: bool) -> bool {
 
 fn parse_param() -> i64 {
     let start = cur_start();
-    let mutable = eat(TK_MUT);
-    let n = new_node(PARAM, start, 0);
-    let new_a = if mutable { expect_binding_name() } else { expect_ident() };
-    NODES[n].a = new_a;
-    expect(TK_COLON);
-    let new_b = parse_type();
-    NODES[n].b = new_b;
+    let mutable = eat(Tok::Mut);
+    let n = new_node(NodeKind::Param, start, 0);
+    NODES[n].a = if mutable { expect_binding_name() } else { expect_ident() };
+    expect(Tok::Colon);
+    NODES[n].b = parse_type();
     NODES[n].c = mutable as i64;
-    let new_end = prev_end();
-    NODES[n].end = new_end;
+    NODES[n].end = prev_end();
     n
 }
 
 fn parse_return_type() -> i64 {
-    if eat(TK_ARROW) { parse_type() } else { 0 }
+    if eat(Tok::Arrow) { parse_type() } else { 0 }
 }
 
 fn parse_struct() -> i64 {
     let start = cur_start();
-    let is_union = at(TK_UNION);
+    let is_union = at(Tok::Union);
     advance();
-    let n = new_node(I_STRUCT, start, 0);
+    let n = new_node(NodeKind::Struct, start, 0);
     if is_union {
         NODES[n].c = REPR_UNION;
     }
-    let new_a = expect_binding_name();
-    NODES[n].a = new_a;
-    expect(TK_LBRACE);
+    NODES[n].a = expect_binding_name();
+    expect(Tok::LBrace);
     let mark = list_begin();
-    while !at(TK_RBRACE) && !at(TK_EOF) {
+    while !at(Tok::RBrace) && !at(Tok::Eof) {
         let field_start = cur_start();
-        let field = new_node(FIELD, field_start, 0);
-        let new_a = expect_binding_name();
-        NODES[field].a = new_a;
-        expect(TK_COLON);
-        let new_b = parse_type();
-        NODES[field].b = new_b;
-        let new_end = prev_end();
-        NODES[field].end = new_end;
+        let field = new_node(NodeKind::Field, field_start, 0);
+        NODES[field].a = expect_binding_name();
+        expect(Tok::Colon);
+        NODES[field].b = parse_type();
+        NODES[field].end = prev_end();
         list_push(field);
-        if !eat(TK_COMMA) {
+        if !eat(Tok::Comma) {
             break;
         }
     }
     list_end(n, mark);
-    expect(TK_RBRACE);
-    let new_end = prev_end();
-    NODES[n].end = new_end;
+    expect(Tok::RBrace);
+    NODES[n].end = prev_end();
     n
 }
 
-fn parse_const_or_static(kind: i64) -> i64 {
+fn parse_const_or_static(kind: NodeKind) -> i64 {
     let start = cur_start();
     advance();
     let n = new_node(kind, start, 0);
-    if kind == I_STATIC {
-        let new_d = eat(TK_MUT) as i64;
-        NODES[n].d = new_d;
+    if kind == NodeKind::Static {
+        NODES[n].d = eat(Tok::Mut) as i64;
     }
-    let new_a = expect_binding_name();
-    NODES[n].a = new_a;
-    expect(TK_COLON);
-    let new_b = parse_type();
-    NODES[n].b = new_b;
-    expect(TK_EQ);
-    let new_c = parse_expr();
-    NODES[n].c = new_c;
-    expect(TK_SEMI);
-    let new_end = prev_end();
-    NODES[n].end = new_end;
+    NODES[n].a = expect_binding_name();
+    expect(Tok::Colon);
+    NODES[n].b = parse_type();
+    expect(Tok::Eq);
+    NODES[n].c = parse_expr();
+    expect(Tok::Semi);
+    NODES[n].end = prev_end();
     n
 }
 
 fn parse_type_alias() -> i64 {
     let start = cur_start();
-    expect(TK_TYPE);
-    let n = new_node(I_TYPE, start, 0);
-    let new_a = expect_binding_name();
-    NODES[n].a = new_a;
-    if at(TK_LT) {
+    expect(Tok::Type);
+    let n = new_node(NodeKind::TypeAlias, start, 0);
+    NODES[n].a = expect_binding_name();
+    if at(Tok::Lt) {
         error_at(cur_start(), c"generic type aliases are not supported yet");
     }
-    expect(TK_EQ);
-    let new_b = parse_type();
-    NODES[n].b = new_b;
-    expect(TK_SEMI);
-    let new_end = prev_end();
-    NODES[n].end = new_end;
+    expect(Tok::Eq);
+    NODES[n].b = parse_type();
+    expect(Tok::Semi);
+    NODES[n].end = prev_end();
     n
 }
 
@@ -554,42 +527,38 @@ fn parse_type_alias() -> i64 {
 fn parse_type() -> i64 {
     let start = cur_start();
     let kind = cur();
-    if kind == TK_IDENT {
-        let n = new_node(T_NAME, start, 0);
-        let new_a = expect_ident();
-        NODES[n].a = new_a;
-        if at(TK_COLON_COLON) {
+    if kind == Tok::Ident {
+        let n = new_node(NodeKind::TyName, start, 0);
+        NODES[n].a = expect_ident();
+        if at(Tok::ColonColon) {
             error_at(cur_start(), c"paths are not supported yet");
         }
-        let new_end = prev_end();
-        NODES[n].end = new_end;
+        NODES[n].end = prev_end();
         return n;
     }
-    if kind == TK_STAR {
+    if kind == Tok::Star {
         advance();
-        let n = new_node(T_PTR, start, 0);
-        let new_a = parse_type();
-        NODES[n].a = new_a;
-        let new_end = prev_end();
-        NODES[n].end = new_end;
+        let n = new_node(NodeKind::TyPtr, start, 0);
+        NODES[n].a = parse_type();
+        NODES[n].end = prev_end();
         return n;
     }
-    if kind == TK_BANG {
+    if kind == Tok::Bang {
         advance();
-        return new_node(T_NEVER, start, prev_end());
+        return new_node(NodeKind::TyNever, start, prev_end());
     }
-    if kind == TK_LPAREN {
+    if kind == Tok::LParen {
         return parse_paren_type(start);
     }
-    if kind == TK_LBRACKET {
+    if kind == Tok::LBracket {
         return parse_array_type(start);
     }
-    if kind == TK_FN {
+    if kind == Tok::Fn {
         return parse_fn_type(start);
     }
-    if kind == TK_EXTERN {
+    if kind == Tok::Extern {
         advance();
-        if at(TK_STR) {
+        if at(Tok::Str) {
             let abi = TOKS[P].value as i64;
             if !(STRS[abi].len == 1 && STRS[abi].ptr[0] == 'C') {
                 error_at(cur_start(), c"unsupported ABI; only \"C\" is supported");
@@ -600,85 +569,77 @@ fn parse_type() -> i64 {
         NODES[n].d = 1;
         return n;
     }
-    if kind == TK_RESERVED {
+    if kind == Tok::Reserved {
         reserved_error();
     }
     syntax_error(c"expected type")
 }
 
 fn parse_paren_type(start: i64) -> i64 {
-    expect(TK_LPAREN);
-    if eat(TK_RPAREN) {
-        return new_node(T_UNIT, start, prev_end());
+    expect(Tok::LParen);
+    if eat(Tok::RParen) {
+        return new_node(NodeKind::TyUnit, start, prev_end());
     }
     let first = parse_type();
-    if !eat(TK_COMMA) {
-        expect(TK_RPAREN);
+    if !eat(Tok::Comma) {
+        expect(Tok::RParen);
         return first;
     }
-    let n = new_node(T_TUPLE, start, 0);
+    let n = new_node(NodeKind::TyTuple, start, 0);
     let mark = list_begin();
     list_push(first);
-    while !at(TK_RPAREN) && !at(TK_EOF) {
+    while !at(Tok::RParen) && !at(Tok::Eof) {
         list_push(parse_type());
-        if !eat(TK_COMMA) {
+        if !eat(Tok::Comma) {
             break;
         }
     }
     list_end(n, mark);
-    expect(TK_RPAREN);
-    let new_end = prev_end();
-    NODES[n].end = new_end;
+    expect(Tok::RParen);
+    NODES[n].end = prev_end();
     n
 }
 
 fn parse_array_type(start: i64) -> i64 {
-    expect(TK_LBRACKET);
-    let n = new_node(T_ARRAY, start, 0);
-    let new_a = parse_type();
-    NODES[n].a = new_a;
-    if eat(TK_RBRACKET) {
-        NODES[n].kind = T_SLICE;
-        let new_slice_end = prev_end();
-        NODES[n].end = new_slice_end;
+    expect(Tok::LBracket);
+    let n = new_node(NodeKind::TyArray, start, 0);
+    NODES[n].a = parse_type();
+    if eat(Tok::RBracket) {
+        NODES[n].kind = NodeKind::TySlice;
+        NODES[n].end = prev_end();
         return n;
     }
-    expect(TK_SEMI);
+    expect(Tok::Semi);
     let saved = with_no_struct(false);
-    let new_b = parse_expr();
-    NODES[n].b = new_b;
+    NODES[n].b = parse_expr();
     NO_STRUCT = saved;
-    expect(TK_RBRACKET);
-    let new_end = prev_end();
-    NODES[n].end = new_end;
+    expect(Tok::RBracket);
+    NODES[n].end = prev_end();
     n
 }
 
 fn parse_fn_type(start: i64) -> i64 {
-    expect(TK_FN);
-    expect(TK_LPAREN);
-    let n = new_node(T_FN, start, 0);
+    expect(Tok::Fn);
+    expect(Tok::LParen);
+    let n = new_node(NodeKind::TyFn, start, 0);
     let mark = list_begin();
-    while !at(TK_RPAREN) && !at(TK_EOF) {
-        if at(TK_ELLIPSIS) {
+    while !at(Tok::RParen) && !at(Tok::Eof) {
+        if at(Tok::Ellipsis) {
             error_at(cur_start(), c"function pointer types cannot be variadic; call variadic functions directly");
         }
         list_push(parse_type());
-        if !eat(TK_COMMA) {
+        if !eat(Tok::Comma) {
             break;
         }
     }
     list_end(n, mark);
-    expect(TK_RPAREN);
-    if eat(TK_ARROW) {
-        let new_a = parse_type();
-        NODES[n].a = new_a;
+    expect(Tok::RParen);
+    if eat(Tok::Arrow) {
+        NODES[n].a = parse_type();
     } else {
-        let new_a = new_node(T_UNIT, prev_end(), prev_end());
-        NODES[n].a = new_a;
+        NODES[n].a = new_node(NodeKind::TyUnit, prev_end(), prev_end());
     }
-    let new_end = prev_end();
-    NODES[n].end = new_end;
+    NODES[n].end = prev_end();
     n
 }
 
@@ -686,13 +647,13 @@ fn parse_fn_type(start: i64) -> i64 {
 
 fn parse_block() -> i64 {
     let start = cur_start();
-    expect(TK_LBRACE);
+    expect(Tok::LBrace);
     let saved = with_no_struct(false);
-    let block = new_node(E_BLOCK, start, 0);
+    let block = new_node(NodeKind::Block, start, 0);
     let mark = list_begin();
     let mut tail = 0;
-    while !at(TK_RBRACE) && !at(TK_EOF) {
-        if eat(TK_SEMI) {
+    while !at(Tok::RBrace) && !at(Tok::Eof) {
+        if eat(Tok::Semi) {
             continue;
         }
         if is_item_start(cur()) {
@@ -702,7 +663,7 @@ fn parse_block() -> i64 {
             syntax_error(c"expected ';' or '}' after expression");
         }
         let stmt = parse_stmt();
-        if NODES[stmt].kind == S_EXPR && NODES[stmt].b == 2 {
+        if NODES[stmt].kind == NodeKind::ExprStmt && NODES[stmt].b == 2 {
             // A tail expression.
             tail = NODES[stmt].a;
         } else {
@@ -711,60 +672,59 @@ fn parse_block() -> i64 {
     }
     list_end(block, mark);
     NODES[block].a = tail;
-    expect(TK_RBRACE);
+    expect(Tok::RBrace);
     NO_STRUCT = saved;
-    let new_end = prev_end();
-    NODES[block].end = new_end;
+    NODES[block].end = prev_end();
     block
 }
 
-fn is_item_start(kind: i64) -> bool {
-    kind == TK_FN || kind == TK_EXTERN || kind == TK_STRUCT || kind == TK_CONST
-        || kind == TK_STATIC || kind == TK_TYPE || kind == TK_ENUM || kind == TK_IMPL
-        || kind == TK_UNION
+fn is_item_start(kind: Tok) -> bool {
+    kind == Tok::Fn || kind == Tok::Extern || kind == Tok::Struct || kind == Tok::Const
+        || kind == Tok::Static || kind == Tok::Type || kind == Tok::Enum || kind == Tok::Impl
+        || kind == Tok::Union
 }
 
 // `name:` before `loop`, `while` or `for`.
 fn at_label() -> bool {
     let after = tok_kind(2);
-    at(TK_IDENT) && tok_kind(1) == TK_COLON
-        && (after == TK_LOOP || after == TK_WHILE || after == TK_FOR)
+    at(Tok::Ident) && tok_kind(1) == Tok::Colon
+        && (after == Tok::Loop || after == Tok::While || after == Tok::For)
 }
 
 fn at_block_like() -> bool {
     let kind = cur();
-    kind == TK_LBRACE || kind == TK_IF || kind == TK_LOOP || kind == TK_WHILE
-        || kind == TK_FOR || kind == TK_MATCH || at_label()
+    kind == Tok::LBrace || kind == Tok::If || kind == Tok::Loop || kind == Tok::While
+        || kind == Tok::For || kind == Tok::Match || at_label()
 }
 
 fn expr_stmt(expr: i64, has_semi: i64, start: i64) -> i64 {
-    let n = new_node(S_EXPR, start, prev_end());
+    let n = new_node(NodeKind::ExprStmt, start, prev_end());
     NODES[n].a = expr;
     NODES[n].b = has_semi;
     n
 }
 
-// A statement; an S_EXPR with b == 2 is the block's tail expression.
+// A statement; an NodeKind::ExprStmt with b == 2 is the block's tail expression.
 fn parse_stmt() -> i64 {
     let start = cur_start();
-    if at(TK_LET) {
+    if at(Tok::Let) {
         return parse_let();
     }
     if at_block_like() {
         // Ends at its closing brace; a `;` right after belongs to it.
         let expr = parse_primary();
-        if at(TK_RBRACE) {
+        if at(Tok::RBrace) {
             return expr_stmt(expr, 2, start);
         }
-        let has_semi = eat(TK_SEMI);
+        let has_semi = eat(Tok::Semi);
         return expr_stmt(expr, has_semi as i64, start);
     }
     let expr = parse_expr();
-    if at(TK_SEMI) {
+    if at(Tok::Semi) {
         advance();
         return expr_stmt(expr, 1, start);
     }
-    if at(TK_RBRACE) {
+    if at(Tok::RBrace) {
         return expr_stmt(expr, 2, start);
     }
     syntax_error(c"expected ';' or '}' after expression")
@@ -772,23 +732,19 @@ fn parse_stmt() -> i64 {
 
 fn parse_let() -> i64 {
     let start = cur_start();
-    expect(TK_LET);
-    let n = new_node(S_LET, start, 0);
-    let new_a = parse_pattern();
-    NODES[n].a = new_a;
-    if eat(TK_COLON) {
-        let new_b = parse_type();
-        NODES[n].b = new_b;
+    expect(Tok::Let);
+    let n = new_node(NodeKind::Let, start, 0);
+    NODES[n].a = parse_pattern();
+    if eat(Tok::Colon) {
+        NODES[n].b = parse_type();
     }
-    if at(TK_SEMI) {
+    if at(Tok::Semi) {
         error_at(cur_start(), c"'let' without an initializer is not supported; give the binding a value");
     }
-    expect(TK_EQ);
-    let new_c = parse_expr();
-    NODES[n].c = new_c;
-    expect(TK_SEMI);
-    let new_end = prev_end();
-    NODES[n].end = new_end;
+    expect(Tok::Eq);
+    NODES[n].c = parse_expr();
+    expect(Tok::Semi);
+    NODES[n].end = prev_end();
     n
 }
 
@@ -796,41 +752,38 @@ fn parse_let() -> i64 {
 fn parse_pattern() -> i64 {
     let start = cur_start();
     let first = parse_single_pattern();
-    if !at(TK_PIPE) {
+    if !at(Tok::Pipe) {
         return first;
     }
-    let n = new_node(P_OR, start, 0);
+    let n = new_node(NodeKind::PatOr, start, 0);
     let mark = list_begin();
     list_push(first);
-    while eat(TK_PIPE) {
+    while eat(Tok::Pipe) {
         list_push(parse_single_pattern());
     }
     list_end(n, mark);
-    let new_end = prev_end();
-    NODES[n].end = new_end;
+    NODES[n].end = prev_end();
     n
 }
 
 fn at_literal_pattern() -> bool {
     let kind = cur();
-    kind == TK_INT || kind == TK_CHAR || kind == TK_TRUE || kind == TK_FALSE
-        || (kind == TK_MINUS && (tok_kind(1) == TK_INT || tok_kind(1) == TK_FLOAT)) || kind == TK_FLOAT
+    kind == Tok::Int || kind == Tok::Char || kind == Tok::True || kind == Tok::False
+        || (kind == Tok::Minus && (tok_kind(1) == Tok::Int || tok_kind(1) == Tok::Float)) || kind == Tok::Float
 }
 
 // A literal (or a constant's name) in a pattern: an expression node.
 fn parse_pattern_literal() -> i64 {
     let start = cur_start();
-    if at(TK_MINUS) {
+    if at(Tok::Minus) {
         advance();
         let operand = parse_primary();
-        return make_unary(TK_MINUS, operand, start);
+        return make_unary(Tok::Minus, operand, start);
     }
-    if at(TK_IDENT) {
-        let n = new_node(E_IDENT, start, 0);
-        let new_a = expect_ident();
-        NODES[n].a = new_a;
-        let new_end = prev_end();
-        NODES[n].end = new_end;
+    if at(Tok::Ident) {
+        let n = new_node(NodeKind::Ident, start, 0);
+        NODES[n].a = expect_ident();
+        NODES[n].end = prev_end();
         return n;
     }
     parse_primary()
@@ -838,69 +791,63 @@ fn parse_pattern_literal() -> i64 {
 
 // `lo ..= hi` after the low end has been parsed.
 fn parse_range_pattern(start: i64, low: i64) -> i64 {
-    if at(TK_DOT_DOT) {
+    if at(Tok::DotDot) {
         error_at(cur_start(), c"exclusive range patterns are not supported; use 'a..=b'");
     }
-    expect(TK_DOT_DOT_EQ);
-    let n = new_node(P_RANGE, start, 0);
+    expect(Tok::DotDotEq);
+    let n = new_node(NodeKind::PatRange, start, 0);
     NODES[n].a = low;
-    if !(at_literal_pattern() || at(TK_IDENT)) {
+    if !(at_literal_pattern() || at(Tok::Ident)) {
         syntax_error(c"expected the end of the range pattern");
     }
-    let new_b = parse_pattern_literal();
-    NODES[n].b = new_b;
-    let new_end = prev_end();
-    NODES[n].end = new_end;
+    NODES[n].b = parse_pattern_literal();
+    NODES[n].end = prev_end();
     n
 }
 
 fn parse_single_pattern() -> i64 {
     let start = cur_start();
-    if at(TK_IDENT) && TOKS[P].value as i64 == UNDERSCORE {
+    if at(Tok::Ident) && TOKS[P].value as i64 == UNDERSCORE {
         advance();
-        return new_node(P_WILD, start, prev_end());
+        return new_node(NodeKind::PatWild, start, prev_end());
     }
-    if at(TK_MUT) {
+    if at(Tok::Mut) {
         advance();
-        let n = new_node(P_BIND, start, 0);
-        let new_a = expect_binding_name();
-        NODES[n].a = new_a;
+        let n = new_node(NodeKind::PatBind, start, 0);
+        NODES[n].a = expect_binding_name();
         NODES[n].b = 1;
-        let new_end = prev_end();
-        NODES[n].end = new_end;
+        NODES[n].end = prev_end();
         return n;
     }
     if at_literal_pattern() {
         let low = parse_pattern_literal();
-        if at(TK_DOT_DOT_EQ) || at(TK_DOT_DOT) {
+        if at(Tok::DotDotEq) || at(Tok::DotDot) {
             return parse_range_pattern(start, low);
         }
-        let n = new_node(P_LIT, start, prev_end());
+        let n = new_node(NodeKind::PatLit, start, prev_end());
         NODES[n].a = low;
         return n;
     }
-    if at(TK_IDENT) && tok_kind(1) == TK_COLON_COLON {
+    if at(Tok::Ident) && tok_kind(1) == Tok::ColonColon {
         return parse_variant_pattern(start);
     }
-    if at(TK_IDENT) && (tok_kind(1) == TK_DOT_DOT_EQ || tok_kind(1) == TK_DOT_DOT) {
+    if at(Tok::Ident) && (tok_kind(1) == Tok::DotDotEq || tok_kind(1) == Tok::DotDot) {
         let low = parse_pattern_literal();
         return parse_range_pattern(start, low);
     }
-    if at(TK_IDENT) {
-        let n = new_node(P_BIND, start, 0);
-        let new_a = expect_ident();
-        NODES[n].a = new_a;
-        let new_end = prev_end();
-        NODES[n].end = new_end;
-        if at(TK_LBRACE) || at(TK_LPAREN) {
+    if at(Tok::Ident) {
+        let n = new_node(NodeKind::PatBind, start, 0);
+        NODES[n].a = expect_ident();
+        NODES[n].end = prev_end();
+        if at(Tok::LBrace) || at(Tok::LParen) {
             error_at(cur_start(), c"struct and tuple-struct patterns are not supported; enum variants are written 'Enum::Variant(...)'");
         }
         return n;
     }
-    if at(TK_LPAREN) {
+    if at(Tok::LParen) {
         return parse_tuple_pattern(start);
     }
-    if at(TK_RESERVED) {
+    if at(Tok::Reserved) {
         reserved_error();
     }
     syntax_error(c"expected a pattern")
@@ -908,50 +855,46 @@ fn parse_single_pattern() -> i64 {
 
 // `E::V` or `E::V(p, ...)`
 fn parse_variant_pattern(start: i64) -> i64 {
-    let n = new_node(P_VARIANT, start, 0);
-    let new_a = expect_ident();
-    NODES[n].a = new_a;
-    expect(TK_COLON_COLON);
-    let new_b = expect_ident();
-    NODES[n].b = new_b;
-    if eat(TK_LPAREN) {
+    let n = new_node(NodeKind::PatVariant, start, 0);
+    NODES[n].a = expect_ident();
+    expect(Tok::ColonColon);
+    NODES[n].b = expect_ident();
+    if eat(Tok::LParen) {
         NODES[n].c = 1;
         let mark = list_begin();
-        while !at(TK_RPAREN) && !at(TK_EOF) {
+        while !at(Tok::RParen) && !at(Tok::Eof) {
             list_push(parse_pattern());
-            if !eat(TK_COMMA) {
+            if !eat(Tok::Comma) {
                 break;
             }
         }
         list_end(n, mark);
-        expect(TK_RPAREN);
+        expect(Tok::RParen);
     }
-    let new_end = prev_end();
-    NODES[n].end = new_end;
+    NODES[n].end = prev_end();
     n
 }
 
 fn parse_tuple_pattern(start: i64) -> i64 {
-    expect(TK_LPAREN);
-    let n = new_node(P_TUPLE, start, 0);
+    expect(Tok::LParen);
+    let n = new_node(NodeKind::PatTuple, start, 0);
     let mark = list_begin();
     let mut trailing_comma = false;
-    while !at(TK_RPAREN) && !at(TK_EOF) {
+    while !at(Tok::RParen) && !at(Tok::Eof) {
         list_push(parse_pattern());
-        trailing_comma = eat(TK_COMMA);
+        trailing_comma = eat(Tok::Comma);
         if !trailing_comma {
             break;
         }
     }
-    expect(TK_RPAREN);
+    expect(Tok::RParen);
     if SCRATCH.count - mark == 1 && !trailing_comma {
         let only = SCRATCH.data[mark];
         SCRATCH.count = mark;
         return only;
     }
     list_end(n, mark);
-    let new_end = prev_end();
-    NODES[n].end = new_end;
+    NODES[n].end = prev_end();
     n
 }
 
@@ -969,40 +912,40 @@ fn parse_expr_no_struct() -> i64 {
 }
 
 // Left and right binding powers of an infix operator token, 0 if none.
-fn infix_left_bp(kind: i64) -> i64 {
-    if kind == TK_EQ || (kind >= TK_PLUS_EQ && kind <= TK_CARET_EQ) || kind == TK_SHL_EQ || kind == TK_SHR_EQ {
-        return 2;
+fn infix_left_bp(kind: Tok) -> i64 {
+    match kind {
+        Tok::Eq | Tok::PlusEq | Tok::MinusEq | Tok::StarEq | Tok::SlashEq | Tok::PercentEq
+            | Tok::AmpEq | Tok::PipeEq | Tok::CaretEq | Tok::ShlEq | Tok::ShrEq => 2,
+        Tok::DotDot | Tok::DotDotEq => 4,
+        Tok::PipePipe => 6,
+        Tok::AmpAmp => 8,
+        Tok::EqEq | Tok::BangEq | Tok::Lt | Tok::Gt | Tok::LtEq | Tok::GtEq => 10,
+        Tok::Pipe => 12,
+        Tok::Caret => 14,
+        Tok::Amp => 16,
+        Tok::Shl | Tok::Shr => 18,
+        Tok::Plus | Tok::Minus => 20,
+        Tok::Star | Tok::Slash | Tok::Percent => 22,
+        _ => 0,
     }
-    if kind == TK_DOT_DOT || kind == TK_DOT_DOT_EQ { return 4; }
-    if kind == TK_PIPE_PIPE { return 6; }
-    if kind == TK_AMP_AMP { return 8; }
-    if is_comparison(kind) { return 10; }
-    if kind == TK_PIPE { return 12; }
-    if kind == TK_CARET { return 14; }
-    if kind == TK_AMP { return 16; }
-    if kind == TK_SHL || kind == TK_SHR { return 18; }
-    if kind == TK_PLUS || kind == TK_MINUS { return 20; }
-    if kind == TK_STAR || kind == TK_SLASH || kind == TK_PERCENT { return 22; }
-    0
 }
 
-fn is_comparison(kind: i64) -> bool {
-    kind == TK_EQ_EQ || kind == TK_BANG_EQ || kind == TK_LT || kind == TK_GT
-        || kind == TK_LT_EQ || kind == TK_GT_EQ
+fn is_comparison(kind: Tok) -> bool {
+    infix_left_bp(kind) == 10
 }
 
-fn is_assign_op(kind: i64) -> bool {
+fn is_assign_op(kind: Tok) -> bool {
     infix_left_bp(kind) == 2
 }
 
-fn is_reserved_punct(kind: i64) -> bool {
-    kind == TK_HASH || kind == TK_QUESTION || kind == TK_AT
+fn is_reserved_punct(kind: Tok) -> bool {
+    kind == Tok::Hash || kind == Tok::Question || kind == Tok::At
 }
 
 // Non-associative level of an operator: 1 comparison, 2 range, 0 none.
-fn non_assoc_level(kind: i64) -> i64 {
+fn non_assoc_level(kind: Tok) -> i64 {
     if is_comparison(kind) { return 1; }
-    if kind == TK_DOT_DOT || kind == TK_DOT_DOT_EQ { return 2; }
+    if kind == Tok::DotDot || kind == Tok::DotDotEq { return 2; }
     0
 }
 
@@ -1017,19 +960,17 @@ fn parse_infix(first: i64, min_bp: i64) -> i64 {
     let mut built_by = 0;
     loop {
         let kind = cur();
-        if (kind == TK_LPAREN || kind == TK_LBRACKET || kind == TK_DOT) && POSTFIX_BP >= min_bp {
+        if (kind == Tok::LParen || kind == Tok::LBracket || kind == Tok::Dot) && POSTFIX_BP >= min_bp {
             lhs = parse_postfix(lhs);
             built_by = 0;
             continue;
         }
-        if kind == TK_AS && AS_BP >= min_bp {
+        if kind == Tok::As && AS_BP >= min_bp {
             advance();
-            let n = new_node(E_CAST, NODES[lhs].start, 0);
+            let n = new_node(NodeKind::Cast, NODES[lhs].start, 0);
             NODES[n].a = lhs;
-            let new_b = parse_type();
-            NODES[n].b = new_b;
-            let new_end = prev_end();
-            NODES[n].end = new_end;
+            NODES[n].b = parse_type();
+            NODES[n].end = prev_end();
             lhs = n;
             built_by = 0;
             continue;
@@ -1058,42 +999,42 @@ fn parse_infix(first: i64, min_bp: i64) -> i64 {
     lhs
 }
 
-fn make_infix(kind: i64, lhs: i64, rhs: i64) -> i64 {
+fn make_infix(kind: Tok, lhs: i64, rhs: i64) -> i64 {
     let start = NODES[lhs].start;
     let end = NODES[rhs].end;
     if is_assign_op(kind) {
-        let n = new_node(E_ASSIGN, start, end);
-        NODES[n].a = kind;
+        let n = new_node(NodeKind::Assign, start, end);
+        NODES[n].op = kind;
         NODES[n].b = lhs;
         NODES[n].c = rhs;
         return n;
     }
-    if kind == TK_DOT_DOT || kind == TK_DOT_DOT_EQ {
-        let n = new_node(E_RANGE, start, end);
+    if kind == Tok::DotDot || kind == Tok::DotDotEq {
+        let n = new_node(NodeKind::Range, start, end);
         NODES[n].a = lhs;
         NODES[n].b = rhs;
-        NODES[n].c = (kind == TK_DOT_DOT_EQ) as i64;
+        NODES[n].c = (kind == Tok::DotDotEq) as i64;
         return n;
     }
-    let n = new_node(E_BINARY, start, end);
-    NODES[n].a = kind;
+    let n = new_node(NodeKind::Binary, start, end);
+    NODES[n].op = kind;
     NODES[n].b = lhs;
     NODES[n].c = rhs;
     n
 }
 
-fn starts_expr(kind: i64) -> bool {
-    kind == TK_INT || kind == TK_FLOAT || kind == TK_CHAR || kind == TK_STR || kind == TK_CSTR
-        || kind == TK_IDENT || kind == TK_TRUE || kind == TK_FALSE || kind == TK_LPAREN
-        || kind == TK_LBRACKET || kind == TK_LBRACE || kind == TK_MINUS || kind == TK_BANG
-        || kind == TK_TILDE || kind == TK_STAR || kind == TK_AMP || kind == TK_AMP_AMP
-        || kind == TK_IF || kind == TK_LOOP || kind == TK_WHILE || kind == TK_FOR
-        || kind == TK_RETURN || kind == TK_BREAK || kind == TK_CONTINUE || kind == TK_MATCH
+fn starts_expr(kind: Tok) -> bool {
+    kind == Tok::Int || kind == Tok::Float || kind == Tok::Char || kind == Tok::Str || kind == Tok::CStr
+        || kind == Tok::Ident || kind == Tok::True || kind == Tok::False || kind == Tok::LParen
+        || kind == Tok::LBracket || kind == Tok::LBrace || kind == Tok::Minus || kind == Tok::Bang
+        || kind == Tok::Tilde || kind == Tok::Star || kind == Tok::Amp || kind == Tok::AmpAmp
+        || kind == Tok::If || kind == Tok::Loop || kind == Tok::While || kind == Tok::For
+        || kind == Tok::Return || kind == Tok::Break || kind == Tok::Continue || kind == Tok::Match
 }
 
-fn make_unary(op: i64, operand: i64, start: i64) -> i64 {
-    let n = new_node(E_UNARY, start, NODES[operand].end);
-    NODES[n].a = op;
+fn make_unary(op: Tok, operand: i64, start: i64) -> i64 {
+    let n = new_node(NodeKind::Unary, start, NODES[operand].end);
+    NODES[n].op = op;
     NODES[n].b = operand;
     n
 }
@@ -1101,51 +1042,44 @@ fn make_unary(op: i64, operand: i64, start: i64) -> i64 {
 fn parse_prefix() -> i64 {
     let kind = cur();
     let start = cur_start();
-    if kind == TK_MINUS || kind == TK_BANG || kind == TK_TILDE || kind == TK_STAR || kind == TK_AMP {
+    if kind == Tok::Minus || kind == Tok::Bang || kind == Tok::Tilde || kind == Tok::Star || kind == Tok::Amp {
         advance();
         let operand = parse_expr_bp(PREFIX_BP);
         return make_unary(kind, operand, start);
     }
-    if kind == TK_AMP_AMP {
+    if kind == Tok::AmpAmp {
         // `&&x` is `& &x`.
         advance();
         let operand = parse_expr_bp(PREFIX_BP);
-        let inner = make_unary(TK_AMP, operand, start + 1);
-        return make_unary(TK_AMP, inner, start);
+        let inner = make_unary(Tok::Amp, operand, start + 1);
+        return make_unary(Tok::Amp, inner, start);
     }
-    if kind == TK_PLUS {
+    if kind == Tok::Plus {
         error_at(start, c"unary '+' is not supported");
     }
-    if kind == TK_RETURN {
+    if kind == Tok::Return {
         advance();
-        let n = new_node(E_RETURN, start, 0);
-        let new_a = parse_jump_value();
-        NODES[n].a = new_a;
-        let new_end = prev_end();
-        NODES[n].end = new_end;
+        let n = new_node(NodeKind::Return, start, 0);
+        NODES[n].a = parse_jump_value();
+        NODES[n].end = prev_end();
         return n;
     }
-    if kind == TK_BREAK {
+    if kind == Tok::Break {
         advance();
-        let n = new_node(E_BREAK, start, 0);
-        let new_a = parse_jump_label();
-        NODES[n].a = new_a;
-        let new_b = parse_jump_value();
-        NODES[n].b = new_b;
-        let new_end = prev_end();
-        NODES[n].end = new_end;
+        let n = new_node(NodeKind::Break, start, 0);
+        NODES[n].a = parse_jump_label();
+        NODES[n].b = parse_jump_value();
+        NODES[n].end = prev_end();
         return n;
     }
-    if kind == TK_CONTINUE {
+    if kind == Tok::Continue {
         advance();
-        let n = new_node(E_CONTINUE, start, 0);
-        let new_a = parse_jump_label();
-        NODES[n].a = new_a;
-        let new_end = prev_end();
-        NODES[n].end = new_end;
+        let n = new_node(NodeKind::Continue, start, 0);
+        NODES[n].a = parse_jump_label();
+        NODES[n].end = prev_end();
         return n;
     }
-    if kind == TK_DOT_DOT || kind == TK_DOT_DOT_EQ {
+    if kind == Tok::DotDot || kind == Tok::DotDotEq {
         error_at(start, c"a range needs a start: write 'a..b'");
     }
     parse_primary()
@@ -1156,7 +1090,7 @@ fn parse_jump_value() -> i64 {
 }
 
 fn parse_jump_label() -> i64 {
-    if at(TK_COLON) && tok_kind(1) == TK_IDENT {
+    if at(Tok::Colon) && tok_kind(1) == Tok::Ident {
         advance();
         return expect_ident();
     }
@@ -1165,55 +1099,48 @@ fn parse_jump_label() -> i64 {
 
 fn parse_postfix(lhs: i64) -> i64 {
     let start = NODES[lhs].start;
-    if eat(TK_LPAREN) {
-        let n = new_node(E_CALL, start, 0);
+    if eat(Tok::LParen) {
+        let n = new_node(NodeKind::Call, start, 0);
         NODES[n].a = lhs;
         let saved = with_no_struct(false);
-        parse_expr_list(n, TK_RPAREN);
+        parse_expr_list(n, Tok::RParen);
         NO_STRUCT = saved;
-        expect(TK_RPAREN);
-        let new_end = prev_end();
-        NODES[n].end = new_end;
+        expect(Tok::RParen);
+        NODES[n].end = prev_end();
         return n;
     }
-    if eat(TK_LBRACKET) {
-        let n = new_node(E_INDEX, start, 0);
+    if eat(Tok::LBracket) {
+        let n = new_node(NodeKind::Index, start, 0);
         NODES[n].a = lhs;
         let saved = with_no_struct(false);
-        let new_b = parse_index();
-        NODES[n].b = new_b;
+        NODES[n].b = parse_index();
         NO_STRUCT = saved;
-        expect(TK_RBRACKET);
-        let new_end = prev_end();
-        NODES[n].end = new_end;
+        expect(Tok::RBracket);
+        NODES[n].end = prev_end();
         return n;
     }
-    expect(TK_DOT);
-    if at(TK_IDENT) {
-        if tok_kind(1) == TK_LPAREN {
-            let n = new_node(E_METHOD, start, 0);
+    expect(Tok::Dot);
+    if at(Tok::Ident) {
+        if tok_kind(1) == Tok::LParen {
+            let n = new_node(NodeKind::MethodCall, start, 0);
             NODES[n].a = lhs;
-            let new_b = expect_ident();
-            NODES[n].b = new_b;
-            expect(TK_LPAREN);
+            NODES[n].b = expect_ident();
+            expect(Tok::LParen);
             let saved = with_no_struct(false);
-            parse_expr_list(n, TK_RPAREN);
+            parse_expr_list(n, Tok::RParen);
             NO_STRUCT = saved;
-            expect(TK_RPAREN);
-            let new_end = prev_end();
-            NODES[n].end = new_end;
+            expect(Tok::RParen);
+            NODES[n].end = prev_end();
             return n;
         }
-        let n = new_node(E_FIELD, start, 0);
+        let n = new_node(NodeKind::FieldAccess, start, 0);
         NODES[n].a = lhs;
-        let new_b = expect_ident();
-        NODES[n].b = new_b;
-        let new_end = prev_end();
-        NODES[n].end = new_end;
+        NODES[n].b = expect_ident();
+        NODES[n].end = prev_end();
         return n;
     }
-    if at(TK_INT) && TOKS[P].suffix == SUF_NONE {
-        let n = new_node(E_TUPLE_FIELD, start, TOKS[P].end);
+    if at(Tok::Int) && TOKS[P].suffix == SUF_NONE {
+        let n = new_node(NodeKind::TupleField, start, TOKS[P].end);
         NODES[n].a = lhs;
         NODES[n].b = TOKS[P].value as i64;
         advance();
@@ -1227,42 +1154,40 @@ fn parse_postfix(lhs: i64) -> i64 {
 fn parse_index() -> i64 {
     let start = cur_start();
     let mut low = 0;
-    if !at(TK_DOT_DOT) && !at(TK_DOT_DOT_EQ) {
+    if !at(Tok::DotDot) && !at(Tok::DotDotEq) {
         // Stops before a range operator.
         low = parse_expr_bp(5);
-        if !at(TK_DOT_DOT) && !at(TK_DOT_DOT_EQ) {
+        if !at(Tok::DotDot) && !at(Tok::DotDotEq) {
             return parse_infix(low, 0);
         }
     }
-    let inclusive = at(TK_DOT_DOT_EQ);
+    let inclusive = at(Tok::DotDotEq);
     advance();
-    let n = new_node(E_RANGE, start, 0);
+    let n = new_node(NodeKind::Range, start, 0);
     NODES[n].a = low;
     NODES[n].c = inclusive as i64;
-    if !at(TK_RBRACKET) {
-        let new_b = parse_expr_bp(5);
-        NODES[n].b = new_b;
+    if !at(Tok::RBracket) {
+        NODES[n].b = parse_expr_bp(5);
     } else if inclusive {
         syntax_error(c"an inclusive range needs an end");
     }
-    let new_end = prev_end();
-    NODES[n].end = new_end;
+    NODES[n].end = prev_end();
     n
 }
 
 // `e, e, ...` up to `close` (not consumed), as the list of `n`.
-fn parse_expr_list(n: i64, close: i64) {
+fn parse_expr_list(n: i64, close: Tok) {
     let mark = list_begin();
-    while !at(close) && !at(TK_EOF) {
+    while !at(close) && !at(Tok::Eof) {
         list_push(parse_expr());
-        if !eat(TK_COMMA) {
+        if !eat(Tok::Comma) {
             break;
         }
     }
     list_end(n, mark);
 }
 
-fn literal_node(kind: i64, start: i64, a: i64, b: i64) -> i64 {
+fn literal_node(kind: NodeKind, start: i64, a: i64, b: i64) -> i64 {
     advance();
     let n = new_node(kind, start, prev_end());
     NODES[n].a = a;
@@ -1275,43 +1200,43 @@ fn parse_primary() -> i64 {
     let start = cur_start();
     let value = TOKS[P].value as i64;
     let suffix = TOKS[P].suffix;
-    if kind == TK_INT { return literal_node(E_INT, start, value, suffix); }
-    if kind == TK_FLOAT { return literal_node(E_FLOAT, start, value, suffix); }
-    if kind == TK_CHAR { return literal_node(E_CHAR, start, value, 0); }
-    if kind == TK_STR { return literal_node(E_STR, start, value, 0); }
-    if kind == TK_CSTR { return literal_node(E_CSTR, start, value, 0); }
-    if kind == TK_TRUE { return literal_node(E_BOOL, start, 1, 0); }
-    if kind == TK_FALSE { return literal_node(E_BOOL, start, 0, 0); }
-    if kind == TK_LPAREN {
+    if kind == Tok::Int { return literal_node(NodeKind::Int, start, value, suffix); }
+    if kind == Tok::Float { return literal_node(NodeKind::Float, start, value, suffix); }
+    if kind == Tok::Char { return literal_node(NodeKind::Char, start, value, 0); }
+    if kind == Tok::Str { return literal_node(NodeKind::Str, start, value, 0); }
+    if kind == Tok::CStr { return literal_node(NodeKind::CStr, start, value, 0); }
+    if kind == Tok::True { return literal_node(NodeKind::Bool, start, 1, 0); }
+    if kind == Tok::False { return literal_node(NodeKind::Bool, start, 0, 0); }
+    if kind == Tok::LParen {
         let saved = with_no_struct(false);
         let e = parse_paren_expr();
         NO_STRUCT = saved;
         return e;
     }
-    if kind == TK_LBRACKET {
+    if kind == Tok::LBracket {
         let saved = with_no_struct(false);
         let e = parse_array_literal();
         NO_STRUCT = saved;
         return e;
     }
-    if kind == TK_LBRACE { return parse_block(); }
-    if kind == TK_IF { return parse_if(); }
-    if kind == TK_MATCH { return parse_match(); }
-    if kind == TK_LOOP || kind == TK_WHILE || kind == TK_FOR {
+    if kind == Tok::LBrace { return parse_block(); }
+    if kind == Tok::If { return parse_if(); }
+    if kind == Tok::Match { return parse_match(); }
+    if kind == Tok::Loop || kind == Tok::While || kind == Tok::For {
         return parse_loop(0, start);
     }
-    if kind == TK_IDENT && at_label() {
+    if kind == Tok::Ident && at_label() {
         let label = expect_ident();
-        expect(TK_COLON);
+        expect(Tok::Colon);
         return parse_loop(label, start);
     }
-    if kind == TK_IDENT && value == UNDERSCORE {
+    if kind == Tok::Ident && value == UNDERSCORE {
         error_at(start, c"'_' can only be used in patterns");
     }
-    if kind == TK_IDENT {
+    if kind == Tok::Ident {
         return parse_name_or_struct_literal();
     }
-    if is_reserved_punct(kind) || kind == TK_RESERVED {
+    if is_reserved_punct(kind) || kind == Tok::Reserved {
         reserved_error();
     }
     syntax_error(c"expected expression")
@@ -1320,47 +1245,41 @@ fn parse_primary() -> i64 {
 fn parse_name_or_struct_literal() -> i64 {
     let start = cur_start();
     let name = expect_ident();
-    if eat(TK_COLON_COLON) {
-        let n = new_node(E_PATH, start, 0);
+    if eat(Tok::ColonColon) {
+        let n = new_node(NodeKind::Path, start, 0);
         NODES[n].a = name;
-        let new_b = expect_ident();
-        NODES[n].b = new_b;
-        if at(TK_COLON_COLON) {
+        NODES[n].b = expect_ident();
+        if at(Tok::ColonColon) {
             error_at(cur_start(), c"paths have two parts: 'Type::member'");
         }
-        let new_end = prev_end();
-        NODES[n].end = new_end;
+        NODES[n].end = prev_end();
         return n;
     }
-    if !NO_STRUCT && at(TK_LBRACE) {
+    if !NO_STRUCT && at(Tok::LBrace) {
         advance();
-        let n = new_node(E_STRUCT, start, 0);
+        let n = new_node(NodeKind::StructLit, start, 0);
         NODES[n].a = name;
         let saved = with_no_struct(false);
         let mark = list_begin();
-        while !at(TK_RBRACE) && !at(TK_EOF) {
+        while !at(Tok::RBrace) && !at(Tok::Eof) {
             let init_start = cur_start();
-            let init = new_node(FIELD_INIT, init_start, 0);
-            let new_a = expect_binding_name();
-            NODES[init].a = new_a;
-            expect(TK_COLON);
-            let new_b = parse_expr();
-            NODES[init].b = new_b;
-            let new_end = prev_end();
-            NODES[init].end = new_end;
+            let init = new_node(NodeKind::FieldInit, init_start, 0);
+            NODES[init].a = expect_binding_name();
+            expect(Tok::Colon);
+            NODES[init].b = parse_expr();
+            NODES[init].end = prev_end();
             list_push(init);
-            if !eat(TK_COMMA) {
+            if !eat(Tok::Comma) {
                 break;
             }
         }
         list_end(n, mark);
         NO_STRUCT = saved;
-        expect(TK_RBRACE);
-        let new_end = prev_end();
-        NODES[n].end = new_end;
+        expect(Tok::RBrace);
+        NODES[n].end = prev_end();
         return n;
     }
-    let n = new_node(E_IDENT, start, prev_end());
+    let n = new_node(NodeKind::Ident, start, prev_end());
     NODES[n].a = name;
     n
 }
@@ -1368,173 +1287,148 @@ fn parse_name_or_struct_literal() -> i64 {
 // `()`, `(e)`, `(e,)` or `(e, e, ...)`
 fn parse_paren_expr() -> i64 {
     let start = cur_start();
-    expect(TK_LPAREN);
-    if eat(TK_RPAREN) {
-        return new_node(E_UNIT, start, prev_end());
+    expect(Tok::LParen);
+    if eat(Tok::RParen) {
+        return new_node(NodeKind::Unit, start, prev_end());
     }
     let first = parse_expr();
-    if eat(TK_COMMA) {
-        let n = new_node(E_TUPLE, start, 0);
+    if eat(Tok::Comma) {
+        let n = new_node(NodeKind::Tuple, start, 0);
         let mark = list_begin();
         list_push(first);
-        while !at(TK_RPAREN) && !at(TK_EOF) {
+        while !at(Tok::RParen) && !at(Tok::Eof) {
             list_push(parse_expr());
-            if !eat(TK_COMMA) {
+            if !eat(Tok::Comma) {
                 break;
             }
         }
         list_end(n, mark);
-        expect(TK_RPAREN);
-        let new_end = prev_end();
-        NODES[n].end = new_end;
+        expect(Tok::RParen);
+        NODES[n].end = prev_end();
         return n;
     }
-    expect(TK_RPAREN);
+    expect(Tok::RParen);
     NODES[first].start = start;
-    let new_end = prev_end();
-    NODES[first].end = new_end;
+    NODES[first].end = prev_end();
     first
 }
 
 // `[]`, `[e; n]` or `[e, e, ...]`
 fn parse_array_literal() -> i64 {
     let start = cur_start();
-    expect(TK_LBRACKET);
-    if eat(TK_RBRACKET) {
-        return new_node(E_ARRAY, start, prev_end());
+    expect(Tok::LBracket);
+    if eat(Tok::RBracket) {
+        return new_node(NodeKind::Array, start, prev_end());
     }
     let first = parse_expr();
-    if eat(TK_SEMI) {
-        let n = new_node(E_REPEAT, start, 0);
+    if eat(Tok::Semi) {
+        let n = new_node(NodeKind::Repeat, start, 0);
         NODES[n].a = first;
-        let new_b = parse_expr();
-        NODES[n].b = new_b;
-        expect(TK_RBRACKET);
-        let new_end = prev_end();
-        NODES[n].end = new_end;
+        NODES[n].b = parse_expr();
+        expect(Tok::RBracket);
+        NODES[n].end = prev_end();
         return n;
     }
-    let n = new_node(E_ARRAY, start, 0);
+    let n = new_node(NodeKind::Array, start, 0);
     let mark = list_begin();
     list_push(first);
-    if eat(TK_COMMA) {
-        while !at(TK_RBRACKET) && !at(TK_EOF) {
+    if eat(Tok::Comma) {
+        while !at(Tok::RBracket) && !at(Tok::Eof) {
             list_push(parse_expr());
-            if !eat(TK_COMMA) {
+            if !eat(Tok::Comma) {
                 break;
             }
         }
     }
     list_end(n, mark);
-    expect(TK_RBRACKET);
-    let new_end = prev_end();
-    NODES[n].end = new_end;
+    expect(Tok::RBracket);
+    NODES[n].end = prev_end();
     n
 }
 
 fn parse_if() -> i64 {
     let start = cur_start();
-    expect(TK_IF);
-    let n = new_node(E_IF, start, 0);
-    let new_a = parse_expr_no_struct();
-    NODES[n].a = new_a;
-    let new_b = parse_block();
-    NODES[n].b = new_b;
-    if eat(TK_ELSE) {
-        if at(TK_IF) {
+    expect(Tok::If);
+    let n = new_node(NodeKind::If, start, 0);
+    NODES[n].a = parse_expr_no_struct();
+    NODES[n].b = parse_block();
+    if eat(Tok::Else) {
+        if at(Tok::If) {
             // `else if`: an else block holding just the inner `if`.
             let inner = parse_if();
-            let block = new_node(E_BLOCK, NODES[inner].start, NODES[inner].end);
+            let block = new_node(NodeKind::Block, NODES[inner].start, NODES[inner].end);
             NODES[block].a = inner;
             NODES[n].c = block;
         } else {
-            let new_c = parse_block();
-            NODES[n].c = new_c;
+            NODES[n].c = parse_block();
         }
     }
-    let new_end = prev_end();
-    NODES[n].end = new_end;
+    NODES[n].end = prev_end();
     n
 }
 
 // `match e { pattern [if guard] => body, ... }`
 fn parse_match() -> i64 {
     let start = cur_start();
-    expect(TK_MATCH);
-    let n = new_node(E_MATCH, start, 0);
-    let new_a = parse_expr_no_struct();
-    NODES[n].a = new_a;
-    expect(TK_LBRACE);
+    expect(Tok::Match);
+    let n = new_node(NodeKind::Match, start, 0);
+    NODES[n].a = parse_expr_no_struct();
+    expect(Tok::LBrace);
     let saved = with_no_struct(false);
     let mark = list_begin();
-    while !at(TK_RBRACE) && !at(TK_EOF) {
-        let arm = new_node(ARM, cur_start(), 0);
-        let new_pattern = parse_pattern();
-        NODES[arm].a = new_pattern;
-        if eat(TK_IF) {
-            let new_guard = parse_expr();
-            NODES[arm].b = new_guard;
+    while !at(Tok::RBrace) && !at(Tok::Eof) {
+        let arm = new_node(NodeKind::Arm, cur_start(), 0);
+        NODES[arm].a = parse_pattern();
+        if eat(Tok::If) {
+            NODES[arm].b = parse_expr();
         }
-        expect(TK_FAT_ARROW);
+        expect(Tok::FatArrow);
         if at_block_like() {
             // Ends at its closing brace, like a statement.
-            let new_body = parse_primary();
-            NODES[arm].c = new_body;
-            eat(TK_COMMA);
+            NODES[arm].c = parse_primary();
+            eat(Tok::Comma);
         } else {
-            let new_body = parse_expr();
-            NODES[arm].c = new_body;
-            if !at(TK_RBRACE) {
-                if !at(TK_COMMA) {
+            NODES[arm].c = parse_expr();
+            if !at(Tok::RBrace) {
+                if !at(Tok::Comma) {
                     syntax_error(c"expected ',' or '}' after a match arm");
                 }
                 advance();
             }
         }
-        let new_end = prev_end();
-        NODES[arm].end = new_end;
+        NODES[arm].end = prev_end();
         list_push(arm);
     }
     list_end(n, mark);
     NO_STRUCT = saved;
-    expect(TK_RBRACE);
-    let new_end = prev_end();
-    NODES[n].end = new_end;
+    expect(Tok::RBrace);
+    NODES[n].end = prev_end();
     n
 }
 
 fn parse_loop(label: i64, start: i64) -> i64 {
-    if eat(TK_LOOP) {
-        let n = new_node(E_LOOP, start, 0);
+    if eat(Tok::Loop) {
+        let n = new_node(NodeKind::Loop, start, 0);
         NODES[n].a = label;
-        let new_b = parse_block();
-        NODES[n].b = new_b;
-        let new_end = prev_end();
-        NODES[n].end = new_end;
+        NODES[n].b = parse_block();
+        NODES[n].end = prev_end();
         return n;
     }
-    if eat(TK_WHILE) {
-        let n = new_node(E_WHILE, start, 0);
+    if eat(Tok::While) {
+        let n = new_node(NodeKind::While, start, 0);
         NODES[n].a = label;
-        let new_b = parse_expr_no_struct();
-        NODES[n].b = new_b;
-        let new_c = parse_block();
-        NODES[n].c = new_c;
-        let new_end = prev_end();
-        NODES[n].end = new_end;
+        NODES[n].b = parse_expr_no_struct();
+        NODES[n].c = parse_block();
+        NODES[n].end = prev_end();
         return n;
     }
-    expect(TK_FOR);
-    let n = new_node(E_FOR, start, 0);
+    expect(Tok::For);
+    let n = new_node(NodeKind::For, start, 0);
     NODES[n].a = label;
-    let new_b = parse_pattern();
-    NODES[n].b = new_b;
-    expect(TK_IN);
-    let new_c = parse_expr_no_struct();
-    NODES[n].c = new_c;
-    let new_d = parse_block();
-    NODES[n].d = new_d;
-    let new_end = prev_end();
-    NODES[n].end = new_end;
+    NODES[n].b = parse_pattern();
+    expect(Tok::In);
+    NODES[n].c = parse_expr_no_struct();
+    NODES[n].d = parse_block();
+    NODES[n].end = prev_end();
     n
 }

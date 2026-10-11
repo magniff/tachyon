@@ -61,7 +61,11 @@ build() {
     case "$2" in
         O0|O1|O2) "$COMPILER" --target "$TARGET" "-$2" "$1" -o "$3.s" ;;
         previous) "$PREVIOUS" --target "$TARGET" "$1" -o "$3.s" >/dev/null 2>&1 || return 1 ;;
-        seed) "$SEED" build -O --target "$SEED_TARGET" "$1" -o "$3" >/dev/null 2>&1; return ;;
+        seed)
+            # The seed knows only 0.2's declarations of C functions.
+            awk -f "$ROOT/tests/seed-compat.awk" "$1" >"$3.tach"
+            "$SEED" build -O --target "$SEED_TARGET" "$3.tach" -o "$3" >/dev/null 2>&1
+            return ;;
     esac
     # shellcheck disable=SC2086
     "$CC" $ARCH -o "$3" "$3.s" -lm

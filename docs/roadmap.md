@@ -174,6 +174,11 @@ The compiler's source starts using generics and modules.
 Runtimes per release are recorded here as each one ships. `bench/run.sh`
 prints the fastest of several runs, in milliseconds; "previous" is the
 previous release at its default level, "seed" the seed at `-O` (Cranelift).
+From 0.4 on the benchmarks declare their C functions in `extern "C"` blocks,
+which the seed does not know; `bench/run.sh` (and the fuzzer's seed mode)
+hand the seed a copy rewritten into 0.2's `extern fn` declarations by
+`tests/seed-compat.awk`, so the seed column stays for every program written
+in the seed's language.
 
 ### 0.2
 

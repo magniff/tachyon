@@ -76,7 +76,8 @@ test_seed() {
         exe="$WORK/p$seed.$level"
         if [ "$level" = seed ]; then
             [ -n "$SEED" ] || continue
-            "$SEED" build --target "$SEED_TARGET" "$program" -o "$exe" >"$exe.log" 2>&1 \
+            awk -f "$ROOT/tests/seed-compat.awk" "$program" >"$exe.tach"
+            "$SEED" build --target "$SEED_TARGET" "$exe.tach" -o "$exe" >"$exe.log" 2>&1 \
                 || { why="the seed failed to compile it"; break; }
         else
             "$COMPILER" --target "$TARGET" "-$level" --verify-ir "$program" -o "$exe.s" >"$exe.log" 2>&1 \

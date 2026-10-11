@@ -44,16 +44,16 @@ static mut GVN_COUNT: i64 = 0;
 // Slots filled, in order, to undo a scope.
 static mut GVN_LOG: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
-fn is_gvn_op(op: i64) -> bool {
-    is_remat_op(op) || (op >= OP_ADD && op <= OP_CONV)
+fn is_gvn_op(op: Op) -> bool {
+    op.is_remat() || op.is_pure()
 }
 
 fn is_commutative_op(v: i64) -> bool {
     let op = INSTS[v].op;
-    if op == OP_CMP {
-        return INSTS[v].imm == TK_EQ_EQ || INSTS[v].imm == TK_BANG_EQ;
+    if op == Op::Cmp {
+        return INSTS[v].cond == Cond::Eq || INSTS[v].cond == Cond::Ne;
     }
-    op == OP_ADD || op == OP_MUL || op == OP_AND || op == OP_OR || op == OP_XOR
+    op == Op::Add || op == Op::Mul || op == Op::And || op == Op::Or || op == Op::Xor
 }
 
 // The canonical order of commutative operands: constants on the right
@@ -70,6 +70,7 @@ fn operands_out_of_order(a: i64, b: i64) -> bool {
 fn gvn_hash(v: i64) -> u64 {
     let mut h: u64 = 1469598103934665603;
     h = (h ^ INSTS[v].op as u64) * 1099511628211;
+    h = (h ^ INSTS[v].cond as u64) * 1099511628211;
     h = (h ^ INSTS[v].ty as u64) * 1099511628211;
     h = (h ^ INSTS[v].a as u64) * 1099511628211;
     h = (h ^ INSTS[v].b as u64) * 1099511628211;
@@ -79,7 +80,7 @@ fn gvn_hash(v: i64) -> u64 {
 }
 
 fn gvn_equal(v: i64, w: i64) -> bool {
-    INSTS[v].op == INSTS[w].op && INSTS[v].ty == INSTS[w].ty && INSTS[v].a == INSTS[w].a
+    INSTS[v].op == INSTS[w].op && INSTS[v].cond == INSTS[w].cond && INSTS[v].ty == INSTS[w].ty && INSTS[v].a == INSTS[w].a
         && INSTS[v].b == INSTS[w].b && INSTS[v].imm == INSTS[w].imm
         && INSTS[v].imm2 == INSTS[w].imm2
 }
@@ -112,7 +113,7 @@ fn gvn_find_or_add(v: i64) -> i64 {
         slot = (slot + 1) & mask;
     }
     GVN_TABLE[slot] = v;
-    intvec_push(&GVN_LOG, slot as i64);
+    GVN_LOG.push(slot as i64);
     0
 }
 
@@ -120,7 +121,7 @@ fn gvn_find_or_add(v: i64) -> i64 {
 // the linear probing chains intact).
 fn gvn_undo(mark: i64) {
     while GVN_LOG.count > mark {
-        let slot = intvec_pop(&GVN_LOG);
+        let slot = GVN_LOG.pop();
         GVN_TABLE[slot] = 0;
     }
 }
@@ -141,7 +142,7 @@ fn gvn_undo(mark: i64) {
 // c1 + c2.
 fn address_base(v: i64, offset: *i64) -> i64 {
     let mut base = v;
-    while INSTS[base].op == OP_ADD && INSTS[base].ty == TY_U64 && is_const(INSTS[base].b) {
+    while INSTS[base].op == Op::Add && INSTS[base].ty == TY_U64 && is_const(INSTS[base].b) {
         *offset += INSTS[INSTS[base].b].imm;
         base = INSTS[base].a;
     }
@@ -156,29 +157,29 @@ fn is_memcpy(v: i64) -> bool {
     if MEMCPY_SYM == 0 {
         MEMCPY_SYM = intern_c(c"memcpy");
     }
-    INSTS[v].op == OP_CALLC && INSTS[v].imm == MEMCPY_SYM && INSTS[v].nargs == 3
+    INSTS[v].op == Op::CallC && INSTS[v].imm == MEMCPY_SYM && INSTS[v].nargs == 3
         && is_const(ir_val(ir_arg(v, 2)))
 }
 
-// The destination, source and size of copy v (OP_COPY or memcpy).
+// The destination, source and size of copy v (Op::Copy or memcpy).
 fn copy_dst(v: i64) -> i64 {
-    if INSTS[v].op == OP_COPY { INSTS[v].a } else { ir_val(ir_arg(v, 0)) }
+    if INSTS[v].op == Op::Copy { INSTS[v].a } else { ir_val(ir_arg(v, 0)) }
 }
 
 fn copy_src(v: i64) -> i64 {
-    if INSTS[v].op == OP_COPY { INSTS[v].b } else { ir_val(ir_arg(v, 1)) }
+    if INSTS[v].op == Op::Copy { INSTS[v].b } else { ir_val(ir_arg(v, 1)) }
 }
 
 fn copy_size(v: i64) -> i64 {
-    if INSTS[v].op == OP_COPY { INSTS[v].imm } else { INSTS[ir_val(ir_arg(v, 2))].imm }
+    if INSTS[v].op == Op::Copy { INSTS[v].imm } else { INSTS[ir_val(ir_arg(v, 2))].imm }
 }
 
 fn is_copy(v: i64) -> bool {
-    INSTS[v].op == OP_COPY || is_memcpy(v)
+    INSTS[v].op == Op::Copy || is_memcpy(v)
 }
 
-fn is_object_op(op: i64) -> bool {
-    op == OP_SLOT || op == OP_GADDR || op == OP_SADDR
+fn is_object_op(op: Op) -> bool {
+    op == Op::Slot || op == Op::GAddr || op == Op::SAddr
 }
 
 // The memory object address `v` points into (see above), or 0.
@@ -189,7 +190,7 @@ fn root_of(v: i64) -> i64 {
         if is_object_op(op) {
             return x;
         }
-        if op != OP_ADD || INSTS[x].ty != TY_U64 {
+        if op != Op::Add || INSTS[x].ty != TY_U64 {
             return 0;
         }
         if is_const(INSTS[x].b) {
@@ -228,9 +229,9 @@ fn find_escaping_slots(fi: i64) {
                 if operand == 0 {
                     continue;
                 }
-                let allowed = ((op == OP_LOAD || op == OP_STORE) && k == 0)
-                    || (op == OP_COPY && k <= 1)
-                    || (op == OP_ADD && k <= 1 && INSTS[v].ty == TY_U64)
+                let allowed = ((op == Op::Load || op == Op::Store) && k == 0)
+                    || (op == Op::Copy && k <= 1)
+                    || (op == Op::Add && k <= 1 && INSTS[v].ty == TY_U64)
                     || ((k == 3 || k == 4) && is_memcpy(v));
                 if !allowed {
                     mark_escape(operand);
@@ -246,7 +247,7 @@ fn find_escaping_slots(fi: i64) {
 
 fn mark_escape(operand: i64) {
     let root = root_of(operand);
-    if root != 0 && INSTS[root].op == OP_SLOT {
+    if root != 0 && INSTS[root].op == Op::Slot {
         SLOTS[INSTS[root].imm].escapes = 1;
     }
 }
@@ -258,10 +259,10 @@ fn object_of(root: i64) -> i64 {
         return 0;
     }
     let op = INSTS[root].op;
-    if op == OP_SLOT {
+    if op == Op::Slot {
         return INSTS[root].imm;
     }
-    if op == OP_GADDR {
+    if op == Op::GAddr {
         return -1 - INSTS[root].imm;
     }
     // Constant data, by string id.
@@ -269,11 +270,11 @@ fn object_of(root: i64) -> i64 {
 }
 
 fn is_constant_memory(root: i64) -> bool {
-    root != 0 && INSTS[root].op == OP_SADDR
+    root != 0 && INSTS[root].op == Op::SAddr
 }
 
 fn is_private_root(root: i64) -> bool {
-    root != 0 && INSTS[root].op == OP_SLOT && SLOTS[INSTS[root].imm].escapes == 0
+    root != 0 && INSTS[root].op == Op::Slot && SLOTS[INSTS[root].imm].escapes == 0
 }
 
 fn is_private_slot(base: i64) -> bool {
@@ -387,11 +388,11 @@ fn avail_add(base: i64, offset: i64, size: i64, ty: i64, value: i64) {
     if AVAIL.count >= AVAIL_MAX * 5 {
         list_remove(&AVAIL, 0, 5);
     }
-    intvec_push(&AVAIL, base);
-    intvec_push(&AVAIL, offset);
-    intvec_push(&AVAIL, size);
-    intvec_push(&AVAIL, ty);
-    intvec_push(&AVAIL, value);
+    AVAIL.push(base);
+    AVAIL.push(offset);
+    AVAIL.push(size);
+    AVAIL.push(ty);
+    AVAIL.push(value);
 }
 
 fn avail_find(base: i64, offset: i64, ty: i64) -> i64 {
@@ -441,7 +442,7 @@ fn pending_overwrite(base: i64, offset: i64, size: i64) -> bool {
 // Memory effects of instruction v; returns whether anything changed.
 fn memory_step(v: i64) -> bool {
     let op = INSTS[v].op;
-    if op == OP_LOAD {
+    if op == Op::Load {
         let ty = INSTS[v].ty;
         let size = size_of(ty);
         let mut offset = INSTS[v].imm;
@@ -467,11 +468,11 @@ fn memory_step(v: i64) -> bool {
             return true;
         }
         // From constant data at a known offset: a constant.
-        if INSTS[base].op == OP_SADDR {
+        if INSTS[base].op == Op::SAddr {
             let mut ok = false;
             let value = constant_load(INSTS[base].imm, offset, ty, &ok);
             if ok {
-                let c = ir_make(OP_CONST, ty, 0, 0, value);
+                let c = ir_make(Op::Const, ty, 0, 0, value);
                 ir_insert_before(v, c);
                 ir_replace(v, c);
                 return true;
@@ -481,7 +482,7 @@ fn memory_step(v: i64) -> bool {
         avail_add(base, offset, size, ty, v);
         return changed;
     }
-    if op == OP_STORE {
+    if op == Op::Store {
         let ty = INSTS[v].imm2;
         let size = size_of(ty);
         let mut offset = INSTS[v].imm;
@@ -494,10 +495,10 @@ fn memory_step(v: i64) -> bool {
         let changed = pending_overwrite(base, offset, size);
         avail_kill(base, offset, size);
         avail_add(base, offset, size, ty, INSTS[v].b);
-        intvec_push(&PENDING, base);
-        intvec_push(&PENDING, offset);
-        intvec_push(&PENDING, size);
-        intvec_push(&PENDING, v);
+        PENDING.push(base);
+        PENDING.push(offset);
+        PENDING.push(size);
+        PENDING.push(v);
         return changed;
     }
     if is_copy(v) {
@@ -510,15 +511,15 @@ fn memory_step(v: i64) -> bool {
         let changed = pending_overwrite(base, offset, size);
         avail_kill(base, offset, size);
         if !may_alias(base, offset, size, src, src_offset, size) {
-            intvec_push(&COPIES, base);
-            intvec_push(&COPIES, offset);
-            intvec_push(&COPIES, size);
-            intvec_push(&COPIES, copy_src(v));
-            intvec_push(&COPIES, v);
+            COPIES.push(base);
+            COPIES.push(offset);
+            COPIES.push(size);
+            COPIES.push(copy_src(v));
+            COPIES.push(v);
         }
         return changed;
     }
-    if is_call_op(op) {
+    if op.is_call() {
         // It may read anything but private slots.
         let mut i = 0;
         while i < PENDING.count {
@@ -539,7 +540,7 @@ fn apply_block_kills(b: i64) {
     let mut v = BLOCKS[b].first;
     while v != 0 {
         let op = INSTS[v].op;
-        if op == OP_STORE {
+        if op == Op::Store {
             let mut offset = INSTS[v].imm;
             let base = address_base(ir_val(INSTS[v].a), &offset);
             avail_kill(base, offset, size_of(INSTS[v].imm2));
@@ -547,7 +548,7 @@ fn apply_block_kills(b: i64) {
             let mut offset = 0;
             let base = address_base(ir_val(copy_dst(v)), &offset);
             avail_kill(base, offset, copy_size(v));
-        } else if is_call_op(op) {
+        } else if op.is_call() {
             avail_kill_call();
         }
         v = INSTS[v].next;
@@ -569,22 +570,22 @@ fn inherit_into(d: i64, c: i64) -> bool {
     REGION.count = 0;
     let mut work = IntVec { data: 0 as *i64, count: 0, cap: 0 };
     for i in 0..BLOCKS[c].preds.count {
-        intvec_push(&work, BLOCKS[c].preds.data[i]);
+        work.push(BLOCKS[c].preds.data[i]);
     }
     let mut ok = true;
     while work.count > 0 {
-        let b = intvec_pop(&work);
+        let b = work.pop();
         if b == d || BLOCKS[b].mark == stamp {
             continue;
         }
         BLOCKS[b].mark = stamp;
-        intvec_push(&REGION, b);
+        REGION.push(b);
         if REGION.count > 64 {
             ok = false;
             break;
         }
         for i in 0..BLOCKS[b].preds.count {
-            intvec_push(&work, BLOCKS[b].preds.data[i]);
+            work.push(BLOCKS[b].preds.data[i]);
         }
     }
     free(work.data as *u8);
@@ -612,12 +613,12 @@ fn remove_unread_slot_writes(fi: i64) -> bool {
         while v != 0 {
             let op = INSTS[v].op;
             let mut from = 0;
-            if op == OP_LOAD {
+            if op == Op::Load {
                 from = root_of(INSTS[v].a);
             } else if is_copy(v) {
                 from = root_of(copy_src(v));
             }
-            if from != 0 && INSTS[from].op == OP_SLOT {
+            if from != 0 && INSTS[from].op == Op::Slot {
                 read[INSTS[from].imm] = 1;
             }
             v = INSTS[v].next;
@@ -633,8 +634,8 @@ fn remove_unread_slot_writes(fi: i64) -> bool {
         while v != 0 {
             let next = INSTS[v].next;
             let op = INSTS[v].op;
-            if op == OP_STORE || is_copy(v) {
-                let to = root_of(if op == OP_STORE { INSTS[v].a } else { copy_dst(v) });
+            if op == Op::Store || is_copy(v) {
+                let to = root_of(if op == Op::Store { INSTS[v].a } else { copy_dst(v) });
                 if is_private_root(to) && read[INSTS[to].imm] == 0 {
                     ir_unlink(v);
                     changed = true;
@@ -672,14 +673,14 @@ fn gvn(fi: i64) -> bool {
     let mut stack = IntVec { data: 0 as *i64, count: 0, cap: 0 };
     AVAIL.count = 0;
     gvn_block(ORDER.data[0], &changed);
-    intvec_push(&stack, 0);
-    intvec_push(&stack, 0);
-    intvec_push(&stack, 0);
-    intvec_push(&stack, saved.count);
+    stack.push(0);
+    stack.push(0);
+    stack.push(0);
+    stack.push(saved.count);
     for i in 0..AVAIL.count {
-        intvec_push(&saved, AVAIL.data[i]);
+        saved.push(AVAIL.data[i]);
     }
-    intvec_push(&stack, AVAIL.count);
+    stack.push(AVAIL.count);
     while stack.count > 0 {
         let top = stack.count - 5;
         let k = stack.data[top];
@@ -692,20 +693,20 @@ fn gvn(fi: i64) -> bool {
             let start = stack.data[top + 3];
             let n = stack.data[top + 4];
             for i in 0..n {
-                intvec_push(&AVAIL, saved.data[start + i]);
+                AVAIL.push(saved.data[start + i]);
             }
             if !inherit_into(ORDER.data[k], child) {
                 AVAIL.count = 0;
             }
             gvn_block(child, &changed);
-            intvec_push(&stack, BLOCKS[child].order);
-            intvec_push(&stack, 0);
-            intvec_push(&stack, mark);
-            intvec_push(&stack, saved.count);
+            stack.push(BLOCKS[child].order);
+            stack.push(0);
+            stack.push(mark);
+            stack.push(saved.count);
             for i in 0..AVAIL.count {
-                intvec_push(&saved, AVAIL.data[i]);
+                saved.push(AVAIL.data[i]);
             }
-            intvec_push(&stack, AVAIL.count);
+            stack.push(AVAIL.count);
         } else {
             gvn_undo(stack.data[top + 2]);
             saved.count = stack.data[top + 3];
