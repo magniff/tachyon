@@ -54,12 +54,14 @@ trap 'rm -rf "$WORK"' EXIT INT TERM
 dd if=/dev/zero of="$WORK/md5.in" bs=1048576 count=8 2>/dev/null
 : >"$WORK/empty"
 
-# Builds variant $2 of program $1 (a .tach file) into $3.
+# Builds variant $2 of program $1 (a .tach file) into $3; fails when that
+# compiler does not know the program's language (the previous release and
+# the seed do not know what came after them).
 build() {
     case "$2" in
         O0|O1|O2) "$COMPILER" --target "$TARGET" "-$2" "$1" -o "$3.s" ;;
-        previous) "$PREVIOUS" --target "$TARGET" "$1" -o "$3.s" ;;
-        seed) "$SEED" build -O --target "$SEED_TARGET" "$1" -o "$3"; return ;;
+        previous) "$PREVIOUS" --target "$TARGET" "$1" -o "$3.s" >/dev/null 2>&1 || return 1 ;;
+        seed) "$SEED" build -O --target "$SEED_TARGET" "$1" -o "$3" >/dev/null 2>&1; return ;;
     esac
     # shellcheck disable=SC2086
     "$CC" $ARCH -o "$3" "$3.s" -lm
@@ -79,7 +81,10 @@ for source in "$ROOT"/bench/*.tach "$ROOT/examples/md5.tach"; do
     printf "%-10s" "$name"
     reference=""
     for v in $VARIANTS; do
-        build "$source" "$v" "$WORK/$name.$v"
+        if ! build "$source" "$v" "$WORK/$name.$v"; then
+            printf " %9s" "-"
+            continue
+        fi
         ms=$("$WORK/timer" "$RUNS" "$input" "$WORK/$name.$v.out" "$WORK/$name.$v")
         printf " %9s" "$ms"
         if [ -z "$reference" ]; then

@@ -4,7 +4,7 @@
 # compiled, assembled and linked with the C compiler, run, and checked.
 # POSIX sh and awk only, so it runs the same on macOS and Linux.
 #
-# usage: tests/run.sh [-c COMPILER] [-t TARGET] [-O LEVEL] [FILTER]
+# usage: tests/run.sh [-c COMPILER] [-t TARGET] [-O LEVEL] [-j JOBS] [FILTER]
 #
 #   -c COMPILER   the tachyonc binary to test (default: target/tachyonc,
 #                 as left by bootstrap/bootstrap.sh)
@@ -12,6 +12,8 @@
 #                 host; x86_64-macos runs under Rosetta on Apple silicon)
 #   -O LEVEL      the optimization level (0, 1 or 2; default: the
 #                 compiler's default)
+#   -j JOBS       cases run at once (default: the number of CPUs); the
+#                 report is the same for every JOBS
 #   FILTER        run only the cases whose name contains FILTER
 #
 # Environment: CC is the assembler/linker (default cc).
@@ -21,12 +23,15 @@
 #   // STDIN: text       stdin, one directive per line, joined with '\n'
 #   // EXPECT: text      expected stdout, one directive per line
 #   // EXIT: 3           expected exit code (default 0)
+#   // STDERR: text      stderr contains text, one directive per line
 #   // ERROR: text       compilation must fail (exit code 1) with an error
 #                        containing this text; one directive per message
 #   // XFAIL: reason     a known bug: the case is expected to fail, and
 #                        reported as a failure (XPASS) once it passes
 #   // XFAIL(T): reason  the same, only for target T
 #   // SOURCE: path      (.test files) the program, relative to the root
+#   // CSOURCE: path     a C file to compile and link with the program,
+#                        relative to the root (one directive per file)
 #   // BUILD: reason     (.test files) only compile and link it
 #   // CHECK: text       the optimized IR (--emit-ir) has a line containing
 #                        text, after the previous CHECK's line
@@ -46,9 +51,10 @@ CC=${CC:-cc}
 TARGET=""
 OPT=""
 TIMEOUT=20
+JOBS=""
 
 usage() {
-    sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' >&2
+    sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//' >&2
     exit 2
 }
 
@@ -57,6 +63,7 @@ while [ $# -gt 0 ]; do
         -c) [ $# -ge 2 ] || usage; COMPILER=$2; shift 2 ;;
         -t) [ $# -ge 2 ] || usage; TARGET=$2; shift 2 ;;
         -O) [ $# -ge 2 ] || usage; OPT="-O$2"; shift 2 ;;
+        -j) [ $# -ge 2 ] || usage; JOBS=$2; shift 2 ;;
         -h|--help) usage ;;
         -*) usage ;;
         *) break ;;
@@ -114,9 +121,11 @@ read_directives() {
             else if (key == "STDIN") stdin = stdin (nstdin++ ? "\n" : "") value
             else if (key == "EXPECT") expect = expect (nexpect++ ? "\n" : "") value
             else if (key == "EXIT") exitcode = value + 0
+            else if (key == "STDERR") stderrs = stderrs value "\n"
             else if (key == "ERROR") errors = errors value "\n"
             else if (key == "XFAIL" || key == "XFAIL(" target ")") xfail = value
             else if (key == "SOURCE") source = value
+            else if (key == "CSOURCE") csources = csources " " value
             else if (key == "BUILD") build = 1
             else if (key == "CHECK") checks = checks "+" value "\n"
             else if (key == "CHECK-NOT") checks = checks "-" value "\n"
@@ -127,9 +136,11 @@ read_directives() {
             printf "%s", stdin > (dir "/stdin")
             printf "%s", expect > (dir "/expect")
             printf "%d", exitcode > (dir "/exit")
+            printf "%s", stderrs > (dir "/stderrs")
             printf "%s", errors > (dir "/errors")
             printf "%s", xfail > (dir "/xfail")
             printf "%s", source > (dir "/source")
+            printf "%s", csources > (dir "/csources")
             printf "%d", build > (dir "/build")
             printf "%s", checks > (dir "/checks")
             printf "%s", (checkopt == "" ? "2" : checkopt) > (dir "/checkopt")
@@ -192,8 +203,12 @@ check_case() {
         { echo "compile failed:"; cat "$dir/compile.out"; } >"$dir/why"
         return 1
     fi
+    csources=""
+    for c in $(cat "$dir/csources"); do
+        csources="$csources $ROOT/$c"
+    done
     # shellcheck disable=SC2086
-    if ! "$CC" $LINK_FLAGS -o "$dir/prog" "$dir/prog.s" -lm >"$dir/link.out" 2>&1; then
+    if ! "$CC" $LINK_FLAGS -o "$dir/prog" "$dir/prog.s" $csources -lm >"$dir/link.out" 2>&1; then
         { echo "$CC failed:"; cat "$dir/link.out"; } >"$dir/why"
         return 1
     fi
@@ -214,6 +229,12 @@ check_case() {
         { echo "exit code: expected $expected_exit, got $RC"; cat "$dir/stderr"; } >"$dir/why"
         return 1
     fi
+    while IFS= read -r message; do
+        if ! grep -qF -- "$message" "$dir/stderr"; then
+            { echo "expected stderr containing '$message', got:"; cat "$dir/stderr"; } >"$dir/why"
+            return 1
+        fi
+    done <"$dir/stderrs"
     return 0
 }
 
@@ -250,7 +271,32 @@ check_ir() {
     return 1
 }
 
-count=0
+# The number of CPUs, for -j.
+cpu_count() {
+    n=$(sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 4)
+    case "$n" in
+        ''|*[!0-9]*) echo 4 ;;
+        *) echo "$n" ;;
+    esac
+}
+[ -n "$JOBS" ] || JOBS=$(cpu_count)
+
+# Runs case $1 in directory $2: its outcome in $2/status.
+run_case() {
+    file=$1
+    dir=$2
+    if check_case "$file" "$dir"; then
+        if [ -s "$dir/xfail" ]; then echo xpass; else echo pass; fi
+    elif [ -s "$dir/xfail" ]; then
+        echo xfail
+    else
+        echo fail
+    fi >"$dir/status"
+}
+
+# The cases, in order; up to JOBS at once (a FIFO holds the free slots).
+CASES="$WORK/cases"
+: >"$CASES"
 for file in "$ROOT"/tests/run/*.tach "$ROOT"/tests/examples/*.test; do
     [ -f "$file" ] || continue
     base=$(basename "$file")
@@ -262,26 +308,42 @@ for file in "$ROOT"/tests/run/*.tach "$ROOT"/tests/examples/*.test; do
         *"$FILTER"*) ;;
         *) continue ;;
     esac
+    echo "$name $file" >>"$CASES"
+done
+mkfifo "$WORK/slots"
+exec 3<>"$WORK/slots"
+i=0
+while [ "$i" -lt "$JOBS" ]; do
+    echo >&3
+    i=$((i + 1))
+done
+while read -r name file; do
     dir="$WORK/$name"
     mkdir -p "$dir"
     read_directives "$file" "$dir"
+    read -r _ <&3
+    ( run_case "$file" "$dir"; echo >&3 ) &
+done <"$CASES"
+wait
+exec 3>&-
+
+count=0
+while read -r name file; do
+    dir="$WORK/$name"
     category=${name%%_*}
     [ -s "$dir/errors" ] && category=error
-    if check_case "$file" "$dir"; then
-        if [ -s "$dir/xfail" ]; then
-            echo "$category fail" >>"$TALLY"
-            echo "XPASS $name: passes but is marked XFAIL ($(cat "$dir/xfail")); remove the directive" >>"$FAILURES"
-        else
-            echo "$category pass" >>"$TALLY"
-        fi
-    elif [ -s "$dir/xfail" ]; then
-        echo "$category xfail" >>"$TALLY"
-    else
+    status=$(cat "$dir/status" 2>/dev/null || echo fail)
+    if [ "$status" = xpass ]; then
+        echo "$category fail" >>"$TALLY"
+        echo "XPASS $name: passes but is marked XFAIL ($(cat "$dir/xfail")); remove the directive" >>"$FAILURES"
+    elif [ "$status" = fail ]; then
         echo "$category fail" >>"$TALLY"
         { echo "FAIL $name:"; sed 's/^/    /' "$dir/why"; echo; } >>"$FAILURES"
+    else
+        echo "$category $status" >>"$TALLY"
     fi
     count=$((count + 1))
-done
+done <"$CASES"
 
 [ $count -gt 0 ] || { echo "run.sh: no cases match '$FILTER'" >&2; exit 2; }
 cat "$FAILURES"

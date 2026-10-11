@@ -226,7 +226,24 @@ fn data_align(align: i64) {
     buf_byte(DATA, '\n');
 }
 
+// The alignment of each string literal or constant data (0: none).
+static mut STR_ALIGN: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// Read-only data made by the optimizer (as a string, so that it is
+// addressed like one): returns its id.
+fn add_const_data(p: *u8, n: i64, align: i64) -> i64 {
+    let id = add_string(p, n);
+    while STR_ALIGN.count <= id {
+        intvec_push(&STR_ALIGN, 0);
+    }
+    STR_ALIGN.data[id] = align;
+    id
+}
+
 fn data_string(id: i64) {
+    if id < STR_ALIGN.count && STR_ALIGN.data[id] > 1 {
+        data_align(STR_ALIGN.data[id]);
+    }
     buf_str(DATA, local_prefix());
     buf_str(DATA, c"str.");
     buf_int(DATA, id);
@@ -348,6 +365,12 @@ fn emit_peek(reg: i64) {
     if X86 { x64_peek(reg); } else { a64_peek(reg); }
 }
 
+// <reg> (an int register, or float register <reg> when `float`) = the
+// temporary `depth` below the top (0: the top), left in place.
+fn emit_peek_at(reg: i64, depth: i64, float: bool) {
+    if X86 { x64_peek_at(reg, depth, float); } else { a64_peek_at(reg, depth, float); }
+}
+
 // Drops `count` temporaries without changing DEPTH (for jumps out of the
 // current expression).
 fn emit_drop_temps(count: i64) {
@@ -360,7 +383,8 @@ fn emit_drop_temps(count: i64) {
 
 // Accumulator = the value of type `ty` at [<addr>].
 fn emit_load(ty: i64, addr: i64) {
-    if X86 { x64_load(ty, addr); } else { a64_load(ty, addr); }
+    let t = scalar_type(ty);
+    if X86 { x64_load(t, addr); } else { a64_load(t, addr); }
 }
 
 // <reg> = the 8 bytes at [<addr>].
@@ -371,7 +395,8 @@ fn emit_load_reg(reg: i64, addr: i64) {
 // [<addr>] = <reg>, a value of type `ty` (register <reg> of the float
 // accumulator's kind for floats).
 fn emit_store(ty: i64, reg: i64, addr: i64) {
-    if X86 { x64_store(ty, reg, addr); } else { a64_store(ty, reg, addr); }
+    let t = scalar_type(ty);
+    if X86 { x64_store(t, reg, addr); } else { a64_store(t, reg, addr); }
 }
 
 // [<addr> + offset] = the 8 bytes of <reg>.
@@ -394,7 +419,8 @@ fn emit_move_to_second(ty: i64) {
 
 // Brings R_ACC into the canonical form of `ty`.
 fn emit_normalize(ty: i64) {
-    if X86 { x64_normalize(ty); } else { a64_normalize(ty); }
+    let t = scalar_type(ty);
+    if X86 { x64_normalize(t); } else { a64_normalize(t); }
 }
 
 // R_ACC = R_ACC <op> R_SECOND for integers of type `ty`.
@@ -404,7 +430,8 @@ fn emit_int_binary(op: i64, ty: i64) {
 
 // R_ACC = (accumulator <op> second operand) as a bool; operands of `ty`.
 fn emit_compare(op: i64, ty: i64) {
-    if X86 { x64_compare(op, ty); } else { a64_compare(op, ty); }
+    let t = scalar_type(ty);
+    if X86 { x64_compare(op, t); } else { a64_compare(op, t); }
 }
 
 // Accumulator = -accumulator.
@@ -492,13 +519,14 @@ fn variadic_arg_location(ty: i64, state: *i64) -> i64 {
 // The first int argument register used by ordinary arguments of a function
 // returning `ret` (1 where the result pointer takes the first one).
 fn first_int_arg(ret: i64) -> i64 {
-    if X86 && is_compound(ret) { 1 } else { 0 }
+    if X86 && returns_through_pointer(ret) { 1 } else { 0 }
 }
 
 // Accumulator = the incoming parameter at `location`, of type `ty` (a
 // pointer for compound values).
 fn emit_load_param(location: i64, ty: i64) {
-    if X86 { x64_load_param(location, ty); } else { a64_load_param(location, ty); }
+    let t = scalar_type(ty);
+    if X86 { x64_load_param(location, t); } else { a64_load_param(location, t); }
 }
 
 // Moves the stack pointer down (reserve) or up (release) by `size` bytes.
@@ -513,13 +541,15 @@ fn emit_sp_add(size: i64) {
 // Loads argument register `location` from the temporary at sp + from;
 // `promote` widens an f32 to f64 (C's default promotion).
 fn emit_load_arg_reg(location: i64, ty: i64, from: i64, promote: bool) {
-    if X86 { x64_load_arg_reg(location, ty, from, promote); } else { a64_load_arg_reg(location, ty, from); }
+    let t = scalar_type(ty);
+    if X86 { x64_load_arg_reg(location, t, from, promote); } else { a64_load_arg_reg(location, t, from); }
 }
 
 // Copies the temporary at sp + from to the outgoing stack area at
 // sp + offset.
 fn emit_stack_arg(ty: i64, from: i64, offset: i64, promote: bool) {
-    if X86 { x64_stack_arg(ty, from, offset, promote); } else { a64_stack_arg(ty, from, offset, promote); }
+    let t = scalar_type(ty);
+    if X86 { x64_stack_arg(t, from, offset, promote); } else { a64_stack_arg(t, from, offset, promote); }
 }
 
 // Loads the callee of an indirect call from the temporary at sp + from.
@@ -535,4 +565,66 @@ fn emit_call(prefix: *u8, name: i64, is_extern: bool, variadic: bool, vector_reg
 
 fn emit_call_indirect() {
     if X86 { x64_call_indirect(); } else { a64_call_indirect(); }
+}
+
+// ---- Run-time checks ----
+//
+// A failed check calls the run-time helper `rt.panic(kind, a, b, c)`,
+// emitted once per program (see emit_runtime), which writes a message to
+// stderr and exits with 101. Kinds: index out of bounds (a = the index, b
+// = the length), signed or unsigned index; slice range out of bounds (a..b,
+// c = the length), signed or unsigned bounds.
+
+const PANIC_INDEX_SIGNED: i64 = 0;
+const PANIC_INDEX_UNSIGNED: i64 = 1;
+const PANIC_RANGE_SIGNED: i64 = 2;
+const PANIC_RANGE_UNSIGNED: i64 = 3;
+
+// Whether a check was generated (the helper is then emitted), and its
+// symbol (after the prefix of tachyon functions).
+static mut PANIC_USED: bool = false;
+static mut RT_PANIC_SYM: i64 = 0;
+
+fn rt_panic_sym() -> i64 {
+    if RT_PANIC_SYM == 0 {
+        RT_PANIC_SYM = intern_c(c"rt.panic");
+    }
+    RT_PANIC_SYM
+}
+
+// Calls the helper with a = R_ACC, b = R_SECOND, c = R_ADDR.
+fn emit_panic(kind: i64) {
+    PANIC_USED = true;
+    if X86 { x64_panic(kind); } else { a64_panic(kind); }
+}
+
+// The helper and its messages, when a check was generated.
+fn emit_runtime() {
+    if !PANIC_USED {
+        return;
+    }
+    let out = CODE;
+    buf_clear(CODE);
+    if X86 { x64_runtime(); } else { a64_runtime(); }
+    buf_bytes(ASM, BUFS[CODE].data, BUFS[CODE].len);
+    CODE = out;
+    // The four messages, 64 bytes apart.
+    data_section(false);
+    buf_str(DATA, c".p2align 6\n");
+    buf_str(DATA, local_prefix());
+    buf_str(DATA, c"rt.messages:\n");
+    let messages: [*u8; 4] = [
+        c"index out of bounds: index %lld, length %llu\n",
+        c"index out of bounds: index %llu, length %llu\n",
+        c"slice range out of bounds: %lld..%lld, length %llu\n",
+        c"slice range out of bounds: %llu..%llu, length %llu\n",
+    ];
+    for i in 0..4 {
+        let text = messages[i];
+        let n = strlen(text) as i64;
+        data_bytes(text, n);
+        buf_str(DATA, c"    .space ");
+        buf_int(DATA, 64 - n);
+        buf_byte(DATA, '\n');
+    }
 }

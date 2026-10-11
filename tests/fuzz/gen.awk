@@ -1,6 +1,8 @@
 # Writes a random tachyon program: integer arithmetic of every width,
 # floats, shifts, comparisons, casts, branches, loops, arrays, pointers and
-# calls.
+# calls; and (unless nonzero=1) the language of 0.3: structs (passed by
+# value too), enums with and without fields, match on integers and enums
+# (literals, ranges, alternatives, bindings, guards), methods and slices.
 # Everything it does is defined in tachyon (wrapping arithmetic, division
 # by zero, shift amounts), loops are bounded and indices in range, so
 # every optimization level must print the same.
@@ -8,7 +10,8 @@
 # usage: awk -v seed=N [-v nonzero=1] -f gen.awk
 #
 # nonzero=1 makes every divisor positive and odd, for comparing with the
-# seed, whose division traps on 0 and on MIN / -1.
+# seed, whose division traps on 0 and on MIN / -1, and leaves out what the
+# seed does not have (the 0.3 language).
 
 function rnd(n) { return int(rand() * n) }
 
@@ -96,7 +99,7 @@ function expr(t, depth,    k, v, u, op, ops) {
         if (v != "" && rnd(3) > 0) return v
         return literal(t)
     }
-    k = rnd(12)
+    k = rnd(FEAT ? 14 : 12)
     if (k <= 3) {
         split("+ - * / % & | ^", ops, " ")
         op = ops[1 + rnd(8)]
@@ -138,9 +141,228 @@ function expr(t, depth,    k, v, u, op, ops) {
         v = rnd(NA)
         if (AT[v] == t) return "(*(&" AN[v] "[" rnd(AL[v]) "]))"
     }
+    if (k >= 11 && FEAT) {
+        v = feature_expr(t, depth)
+        if (v != "") return v
+    }
     v = var_of(t)
     if (v != "") return v
     return literal(t)
+}
+
+# ---- The 0.3 language ----
+
+# An integer expression of type t using structs, enums, match, methods or
+# slices, or "".
+function feature_expr(t, depth,    k, v, i, f, s, lo, hi, n, e, body, u) {
+    k = rnd(8)
+    if (k == 0 && NSV > 0) {
+        # A field.
+        v = rnd(NSV)
+        s = SVS[v]
+        f = rnd(SNF[s])
+        if (is_float(SFT[s, f])) return "((" SVN[v] ".f" f " * 8.0) as i64 as " t ")"
+        return "(" SVN[v] ".f" f " as " t ")"
+    }
+    if (k == 1 && NSV > 0) {
+        # A method.
+        v = rnd(NSV)
+        return "(" SVN[v] ".m1() as " t ")"
+    }
+    if (k == 2 && depth > 0) return int_match(t, depth)
+    if (k == 3 && NEV > 0 && depth > 0) return enum_match(t, depth)
+    if (k == 4 && NCV > 0) {
+        v = rnd(NCV)
+        if (rnd(2)) return "(" CVN[v] " as " t ")"
+        return "(match " CVN[v] " { C::A => " expr(t, depth - 1) ", C::B | C::C => " literal(t) ", C::D => " expr(t, depth - 1) " })"
+    }
+    if (k == 5 && NA > 0) {
+        # An element of a slice of an array.
+        v = rnd(NA)
+        if (AT[v] != t) return ""
+        lo = rnd(AL[v])
+        hi = lo + 1 + rnd(AL[v] - lo)
+        return "(" AN[v] "[" lo ".." hi "])[" rnd(hi - lo) "]"
+    }
+    if (k == 6 && NSV > 0 && depth > 0) {
+        # A struct by value through a function.
+        v = rnd(NSV)
+        s = SVS[v]
+        return "(S" s "::g(" SVN[v] ", " expr("i64", depth - 1) ").f0 as " t ")"
+    }
+    return ""
+}
+
+# A match on an integer: distinct literal arms, an alternative, a range
+# above them, a guard, and a wildcard.
+function int_match(t, depth,    u, n, i, s, used, x, lo) {
+    u = pick_int_type()
+    s = "(match " expr(u, depth - 1) " {"
+    n = 1 + rnd(4)
+    for (i = 0; i < n; i++) {
+        x = rnd(20)
+        if (x in used) continue
+        used[x] = 1
+        if (rnd(3) == 0 && !((x + 21) in used)) {
+            used[x + 21] = 1
+            s = s " " x " | " (x + 21) " => " expr(t, depth - 1) ","
+        } else {
+            s = s " " x " => " expr(t, depth - 1) ","
+        }
+    }
+    if (rnd(2)) {
+        lo = 45 + rnd(10)
+        s = s " " lo "..=" (lo + rnd(30)) " => " expr(t, depth - 1) ","
+    }
+    if (rnd(2)) s = s " w if w > 70 => " expr(t, depth - 1) ","
+    return s " _ => " expr(t, depth - 1) " })"
+}
+
+# A match on an enum with fields: every variant, one with a guard.
+function enum_match(t, depth,    v, s, saved) {
+    v = rnd(NEV)
+    saved = NV
+    s = "(match " EVN[v] " {"
+    VN[NV] = "x0"; VT[NV] = ET0; VM[NV] = 0; NV++
+    if (rnd(2)) s = s " E::V0(x0) if x0 > 5" ET0 " => " expr(t, depth - 1) ","
+    s = s " E::V0(x0) => " expr(t, depth - 1) ","
+    NV = saved
+    VN[NV] = "x1"; VT[NV] = ET1; VM[NV] = 0; NV++
+    VN[NV] = "x2"; VT[NV] = ET2; VM[NV] = 0; NV++
+    s = s " E::V1(x1, x2) => " expr(t, depth - 1) ","
+    NV = saved
+    return s " E::V2 => " literal(t) " })"
+}
+
+# A value of enum E.
+function enum_value(depth,    k) {
+    k = rnd(3)
+    if (k == 0) return "E::V0(" expr(ET0, depth) ")"
+    if (k == 1) return "E::V1(" expr(ET1, depth) ", " expr(ET2, depth) ")"
+    return "E::V2"
+}
+
+function c_value(    k) {
+    k = rnd(4)
+    return "C::" (k == 0 ? "A" : k == 1 ? "B" : k == 2 ? "C" : "D")
+}
+
+# A literal of struct s.
+function struct_value(s, depth,    i, line) {
+    line = "S" s " {"
+    for (i = 0; i < SNF[s]; i++) {
+        if (i > 0) line = line ","
+        line = line " f" i ": " expr(SFT[s, i], depth)
+    }
+    return line " }"
+}
+
+# The type definitions, with methods.
+function type_defs(    s, i, n) {
+    NS = 1 + rnd(2)
+    for (s = 0; s < NS; s++) {
+        SNF[s] = 1 + rnd(4)
+        line = "struct S" s " {"
+        for (i = 0; i < SNF[s]; i++) {
+            SFT[s, i] = pick_type()
+            if (i > 0) line = line ","
+            line = line " f" i ": " SFT[s, i]
+        }
+        # f0 is an integer (methods modify it).
+        SFT[s, 0] = pick_int_type()
+        sub(/f0: [a-z0-9]+/, "f0: " SFT[s, 0], line)
+        print line " }"
+        print ""
+        print "impl S" s " {"
+        print "    fn m0(self: *S" s ", x: " SFT[s, 0] ") {"
+        print "        self.f0 = self.f0 ^ x;"
+        print "    }"
+        print "    fn m1(self: S" s ") -> u64 {"
+        line = "        let mut h: u64 = 7;"
+        print line
+        for (i = 0; i < SNF[s]; i++) {
+            if (is_float(SFT[s, i])) print "        h = h * 31 + ((self.f" i " * 4.0) as i64 as u64);"
+            else print "        h = h * 31 + (self.f" i " as u64);"
+        }
+        print "        h"
+        print "    }"
+        print "    fn g(v: Self, k: i64) -> Self {"
+        print "        let mut w = v;"
+        print "        w.f0 = w.f0 ^ (k as " SFT[s, 0] ");"
+        print "        w"
+        print "    }"
+        print "}"
+        print ""
+    }
+    ET0 = pick_int_type(); ET1 = pick_int_type(); ET2 = pick_int_type()
+    print "enum E { V0(" ET0 "), V1(" ET1 ", " ET2 "), V2 }"
+    print ""
+    print "enum C { A, B, C, D }"
+    print ""
+}
+
+# Locals of the new types (declared after the arrays).
+function feature_locals(    i, s) {
+    NSV = 0; NEV = 0; NCV = 0
+    n = rnd(3)
+    for (i = 0; i < n; i++) {
+        s = rnd(NS)
+        SVN[NSV] = "s" i; SVS[NSV] = s
+        print "    let mut s" i ": S" s " = " struct_value(s, 1) ";"
+        NSV++
+    }
+    n = rnd(3)
+    for (i = 0; i < n; i++) {
+        EVN[NEV] = "e" i
+        print "    let mut e" i ": E = " enum_value(1) ";"
+        NEV++
+    }
+    n = rnd(2)
+    for (i = 0; i < n; i++) {
+        CVN[NCV] = "c" i
+        print "    let mut c" i ": C = " c_value() ";"
+        NCV++
+    }
+}
+
+# A statement on the new types, or nothing.
+function feature_statement(level,    k, v, w, s, f, op) {
+    k = rnd(6)
+    if (k == 0 && NSV > 0) {
+        v = rnd(NSV)
+        s = SVS[v]
+        f = rnd(SNF[s])
+        print indent(level) SVN[v] ".f" f " = " expr(SFT[s, f], 2) ";"
+        return
+    }
+    if (k == 1 && NSV > 0) {
+        v = rnd(NSV)
+        s = SVS[v]
+        print indent(level) SVN[v] ".m0(" expr(SFT[s, 0], 2) ");"
+        return
+    }
+    if (k == 2 && NSV > 1) {
+        v = rnd(NSV)
+        w = rnd(NSV)
+        if (SVS[v] == SVS[w]) print indent(level) SVN[v] " = " SVN[w] ";"
+        return
+    }
+    if (k == 3 && NEV > 0) {
+        print indent(level) EVN[rnd(NEV)] " = " enum_value(2) ";"
+        return
+    }
+    if (k == 4 && NCV > 0) {
+        print indent(level) CVN[rnd(NCV)] " = " c_value() ";"
+        return
+    }
+    if (k == 5 && NA > 0 && NSV > 0) {
+        # Writes through a slice.
+        v = rnd(NA)
+        print indent(level) "{"
+        print indent(level + 1) "let sl = " AN[v] "[1..];"
+        print indent(level + 1) "sl[" rnd(AL[v] - 1) "] = " expr(AT[v], 2) ";"
+        print indent(level) "}"
+    }
 }
 
 # A positive odd divisor (the seed traps on 0 and on MIN / -1).
@@ -182,7 +404,11 @@ function assignable(    i, n, cands) {
 }
 
 function statement(level, loops,    k, v, t, a, op, ops, n, lim, saved) {
-    k = rnd(10)
+    k = rnd(FEAT ? 12 : 10)
+    if (k >= 10) {
+        feature_statement(level)
+        return
+    }
     if (k <= 3) {
         v = assignable()
         if (v < 0) return
@@ -274,6 +500,7 @@ function function_def(f,    i, n, t, line) {
         print "    let mut a" i ": [" t "; " AL[NA] "] = [" literal(t) "; " AL[NA] "];"
         NA++
     }
+    if (FEAT) feature_locals()
     statements(1, 0, 4 + rnd(8))
     # The result mixes every variable and array element.
     print "    let mut h: u64 = 1469598103934665603;"
@@ -285,6 +512,12 @@ function function_def(f,    i, n, t, line) {
         if (is_float(AT[i])) print "    for k in 0.." AL[i] " { h = (h ^ ((" AN[i] "[k] * 1000.0) as i64 as u64)) * 1099511628211; }"
         else print "    for k in 0.." AL[i] " { h = (h ^ (" AN[i] "[k] as u64)) * 1099511628211; }"
     }
+    if (FEAT) {
+        for (i = 0; i < NSV; i++) print "    h = (h ^ " SVN[i] ".m1()) * 1099511628211;"
+        for (i = 0; i < NEV; i++) print "    h = (h ^ (match " EVN[i] " { E::V0(a) => a as u64, E::V1(a, b) => (a as u64) * 3 + b as u64, E::V2 => 77 })) * 1099511628211;"
+        for (i = 0; i < NCV; i++) print "    h = (h ^ (" CVN[i] " as u64)) * 1099511628211;"
+        NSV = 0; NEV = 0; NCV = 0
+    }
     print "    h"
     print "}"
     print ""
@@ -295,9 +528,13 @@ BEGIN {
     split("i8 i16 i32 i64 u8 u16 u32 u64 f64 f32", T, " ")
     NT = 10
     for (i = 0; i < NT; i++) TYPES[i] = T[i + 1]
+    FEAT = nonzero ? 0 : 1
     print "// Generated by tests/fuzz/gen.awk, seed " seed "."
-    print "extern fn printf(format: *u8, ...) -> i32;"
+    # (The seed knows only the extern declarations of 0.2.)
+    if (FEAT) print "extern \"C\" { fn printf(format: *u8, ...) -> i32; }"
+    else print "extern fn printf(format: *u8, ...) -> i32;"
     print ""
+    if (FEAT) type_defs()
     NF = 0
     count = 3 + rnd(4)
     for (f = 0; f < count; f++) {

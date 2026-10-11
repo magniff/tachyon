@@ -33,8 +33,56 @@ binary is invoked, where its test runner is and which hosts it supports.
 | seed | `seed` | Rust 1.98.0 | aarch64-macos, x86_64-macos, x86_64-linux | the language, and its Rust implementation with a Cranelift backend |
 | 0.1.0 | `v0.1.0` | seed | aarch64-macos, x86_64-linux, x86_64-macos | the compiler in tachyon: the seed's whole language, compiled to AArch64 (Apple's arm64 ABI) and x86-64 (System V, ELF and Mach-O) assembly; a test suite run without cargo |
 | 0.2.0 | `v0.2.0` | 0.1.0 | aarch64-macos, x86_64-linux, x86_64-macos | the optimizer: SSA IR, SCCP, instruction combining, GVN, LICM, inlining, linear-scan register allocation; `-O0`/`-O1`/`-O2` (default `-O2`); random differential testing; `bench/` |
+| 0.3.0 | `v0.3.0` | 0.2.0 | aarch64-macos, x86_64-linux, x86_64-macos | aggregates and memory: enums with fields and `match`, methods, slices, C interop (`extern "C"`, `#[repr(C)]`, unions, C's convention for aggregates); SROA, memory forwarding across blocks, dead stores, switches and jump tables; ABI conformance fuzzing |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.3
+
+The language grew (see [grammar.md](grammar.md)); one change is breaking:
+
+- **Assignment evaluates its right-hand side first**, then the place (a
+  compound assignment then reads the old value), as Rust does; before, the
+  place's address came first. `a[i].x = f()` is now safe when `f` moves
+  `a`.
+- **Enums**, fieldless (with discriminants, castable to integers, compared
+  with `==`) or with tuple variants; **`match`** with literal, range,
+  constant, binding, wildcard, tuple, variant and or-patterns and guards,
+  checked for exhaustiveness (a missing case is named) and unreachable
+  arms; `let` and `for` patterns must be irrefutable.
+- **Methods** in `impl` blocks (`self: T` or `self: *T`, with `&` and `*`
+  added at the call), associated functions (`T::f()`), `Self`; a field
+  through a pointer to a struct (`p.f`).
+- **Slices** `[T]`: `a[lo..hi]` (and `..`, `lo..`, `..hi`, `..=`) of arrays
+  and slices, checked, and of raw pointers, unchecked; `s.len`, `s.ptr`;
+  checked indexing. A failed check prints `index out of bounds: index I,
+  length N` (or the range) on stderr and exits with 101.
+- **C interop** is explicit, as in Rust: `extern "C" { fn ...; static ...; }`
+  imports, `extern "C" fn` definitions (unmangled, callable from C) and
+  pointer types, `extern "C" static` exports, `#[repr(C)]` structs, enums
+  (an `int` tag, then a union of structs) and unions, `#[repr(C, packed)]`,
+  `#[repr(C, align(N))]`, `#[repr(u8)]` and friends for enum tags.
+  Everything in an `extern "C"` signature must be FFI-safe, which the
+  compiler checks. Aggregates follow C's calling convention exactly
+  (AArch64 HFAs and x-register pairs, System V eightbytes, MEMORY,
+  packed and aligned types, variadic calls). The 0.2 form `extern fn f();`
+  is still accepted (deprecated, meaning `extern "C"`); the compiler's own
+  source uses it until 0.4.
+- **Default layouts and conventions are unspecified**: a plain struct's
+  fields are now ordered to save padding; only `#[repr(C)]` types have C's
+  layout.
+- Reserved words `enum`, `match`, `impl`, `union` are keywords; `self` and
+  `Self` are no longer reserved.
+
+The optimizer (see [optimizer.md](optimizer.md)): scalar replacement of
+aggregates, an alias analysis that follows addresses to their objects
+through variable offsets, load and store forwarding along the dominator
+tree, copies read through and removed, dead store elimination, constant
+local tables moved to read-only data, a `switch` terminator with jump
+tables and binary searches. Tests: `tests/run.sh` and the fuzzers run in
+parallel (`-j`); `// STDERR:` and `// CSOURCE:` directives; the random
+program generator covers the new language; `tests/abi/run.sh` checks C
+interop with random signatures in both directions.
 
 ### What's new in 0.2
 
@@ -192,6 +240,7 @@ $ tests/run.sh -c ./tachyonc prog_                      # only cases named *prog
 $ tests/run.sh -c ./tachyonc -t x86_64-macos            # x86-64, under Rosetta
 $ tests/run.sh -c ./tachyonc -O 0                       # at another optimization level
 $ tests/fuzz/run.sh -c ./tachyonc -n 500                # random programs, -O0 vs -O1 vs -O2
+$ tests/abi/run.sh -c ./tachyonc -n 150                 # C interop: random signatures, both ways
 $ bench/run.sh -c ./tachyonc                            # benchmarks
 ```
 
@@ -210,8 +259,10 @@ same on every host, so a compiler can cross-compile itself.
 `tests/run.sh` is a POSIX shell script: it needs the compiler and `cc`, not
 cargo. Its directives (`// EXPECT:`, `// EXIT:`, `// ARGS:`, `// STDIN:`,
 `// ERROR:`, `// XFAIL:`, `// XFAIL(<target>):`, `// CHECK:`,
-`// CHECK-NOT:`, `// CHECK-OPT:`) are described at its top. A release's
-suite must pass at every optimization level.
+`// CHECK-NOT:`, `// CHECK-OPT:`, `// STDERR:`, `// CSOURCE:`) are described
+at its top. A release's suite must pass at every optimization level. The
+runners take `-j N` (default: the number of CPUs); their reports do not
+depend on it.
 
 The seed keeps its own tests, run with cargo:
 
@@ -251,6 +302,7 @@ To check the Linux chain from any machine with docker:
 $ bootstrap/linux-check.sh                   # HEAD and the tags, from a fresh clone
 $ bootstrap/linux-check.sh --seed-tests      # also the seed's cargo tests on Linux
 $ bootstrap/linux-check.sh --all-levels --fuzz=200   # also -O0/-O1/-O2 and random programs
+$ bootstrap/linux-check.sh --abi=150 --bench          # also C interop fuzzing and the benchmarks
 ```
 
 It builds a minimal Debian image (`bootstrap/ci/linux-x86_64.Dockerfile`:

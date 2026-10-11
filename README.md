@@ -1,34 +1,42 @@
 # The Tachyon Programming Language
 
-A small systems language: structs, raw pointers, fixed arrays, tuples,
-function pointers, C interop, and expression-oriented control flow. The
+A small systems language: structs, enums with `match`, methods, slices,
+raw pointers, fixed arrays, tuples, function pointers, C interop
+(`extern "C"`, `#[repr(C)]`), and expression-oriented control flow. The
 compiler is written in tachyon itself.
 
 ```
-extern fn printf(format: *u8, ...) -> i32;
+extern "C" {
+    fn printf(format: *u8, ...) -> i32;
+}
 
-struct Point { x: i64, y: i64 }
+enum Shape { Circle(f64), Rect(f64, f64), Empty }
 
-const N: i64 = 10;
-
-fn main() -> i64 {
-    let mut sum = 0;
-    for i in 0..N {
-        if i % 3 == 0 { continue; }
-        sum += i;
+impl Shape {
+    fn area(self: Shape) -> f64 {
+        match self {
+            Shape::Circle(r) => 3.14159 * r * r,
+            Shape::Rect(w, h) => w * h,
+            Shape::Empty => 0.0,
+        }
     }
-    let p = Point { x: sum, y: -1 };
-    let found = loop {
-        if p.x > 20 { break 'y'; }
-        break 'n';
-    };
-    printf(c"%ld %c\n", p.x, found as i32);
+}
+
+fn main() -> i32 {
+    let shapes: [Shape; 3] = [Shape::Circle(1.0), Shape::Rect(2.0, 3.5), Shape::Empty];
+    let mut total = 0.0;
+    for i in 0..3 {
+        total += shapes[i].area();
+    }
+    let middle = shapes[1..];
+    printf(c"%.2f %lu\n", total, middle.len);
     0
 }
 ```
 
 Bindings are immutable unless declared `mut`. The grammar, with the operator
-precedence table, is in [docs/grammar.md](docs/grammar.md).
+precedence table and what is (and is not) guaranteed about layout and
+calling conventions, is in [docs/grammar.md](docs/grammar.md).
 
 ## Getting a compiler
 
@@ -42,7 +50,7 @@ On macOS, with the Xcode command line tools and Rust (rustup):
 ```
 $ bootstrap/bootstrap.sh
 ...
-compiler: target/tachyonc (tachyonc 0.2.0 (host: aarch64-macos))
+compiler: target/tachyonc (tachyonc 0.3.0 (host: aarch64-macos))
 ```
 
 On x86-64 Linux, with git, gcc (or clang) and the libc headers, and Rust
@@ -51,7 +59,7 @@ On x86-64 Linux, with git, gcc (or clang) and the libc headers, and Rust
 ```
 $ bootstrap/bootstrap.sh
 ...
-compiler: target/tachyonc (tachyonc 0.2.0 (host: x86_64-linux))
+compiler: target/tachyonc (tachyonc 0.3.0 (host: x86_64-linux))
 ```
 
 Every step is checked: each compiler must compile itself to identical
@@ -72,7 +80,9 @@ links; on macOS, give `cc` the matching `-arch arm64` or `-arch x86_64`
 when it is not the host's. Several files form one program:
 `tachyonc a.tach b.tach -o out.s`.
 
-The compiler optimizes: `-O2` (the default) inlines, moves invariant code
+The compiler optimizes: `-O2` (the default) replaces aggregates by scalars,
+forwards memory across blocks, removes dead stores, turns `match` into jump
+tables, inlines, moves invariant code
 out of loops, propagates constants, numbers values and allocates
 registers; `-O1` does the same without inlining and loop motion; `-O0` is
 plain stack-machine code. `--emit-ir` shows the optimized IR. See
@@ -85,6 +95,7 @@ $ tests/run.sh                       # the suite, with target/tachyonc, for the 
 $ tests/run.sh -c path/to/tachyonc prog_
 $ tests/run.sh -t x86_64-macos       # x86-64 on Apple silicon, under Rosetta
 $ tests/run.sh -O 0                  # at another optimization level (0, 1, 2)
+$ tests/abi/run.sh -n 150            # random C signatures, called both ways
 $ tests/fuzz/run.sh -n 500           # random programs: -O0, -O1 and -O2 must agree
 $ bench/run.sh                       # benchmarks against cc -O2
 $ bootstrap/linux-check.sh           # the whole chain on x86-64 Linux, in docker

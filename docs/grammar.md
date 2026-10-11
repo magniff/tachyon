@@ -1,8 +1,9 @@
 # Tachyon grammar
 
-This is the grammar of tachyon 0.1, as the compiler implements it
+This is the grammar of tachyon 0.3, as the compiler implements it
 (`compiler/src/10_lexer.tach`, `compiler/src/21_parser.tach`; the seed
-implements the same language in `seed/src/lexer` and `seed/src/parser`).
+implements the language of 0.1 in `seed/src/lexer` and `seed/src/parser`).
+What 0.3 added is marked *(0.3)*.
 Items and statements are parsed by recursive descent, expressions by a Pratt
 (binding power) parser using the table below.
 
@@ -36,14 +37,15 @@ escape       = "\n" | "\t" | "\r" | "\0" | "\\" | '\"' | "\'"
 tuple index, so `t.0.1` is `(t.0).1`. A literal must not be followed
 directly by other letters (`3e` and `1foo` are errors).
 
-**Keywords:** `as break const continue else extern false fn for if in let
-loop mut return static struct true type while`.
+**Keywords:** `as break const continue else enum extern false fn for if impl
+in let loop match mut return static struct true type union while`.
 
-**Reserved** (an error if used): the keywords `enum match impl trait pub mod
-use self Self super where unsafe defer union dyn move`, and the tokens `::`
-`=>` `#` `?` `@`.
+**Reserved** (an error if used): the keywords `trait pub mod use super where
+unsafe defer dyn move`, and the tokens `?` `@`. `self` and `Self` are
+ordinary names, with a meaning in methods (see Items).
 
-A token is *joint* when no whitespace follows it. The parser splits a joint
+A token is *joint* when no whitespace follows it.
+`#` starts an attribute *(0.3)*. The parser splits a joint
 `&&` in prefix position into `& &`; `**` is not a token, so `**p` and `**T`
 are two `*`.
 
@@ -51,17 +53,30 @@ are two `*`.
 
 ```ebnf
 program      = { item } EOF ;
-item         = fn_decl | extern_decl | struct_decl | const_decl | static_decl | type_alias ;
+item         = fn_decl | extern_item | [ attributes ] ( struct_decl | union_decl | enum_decl )
+             | impl_block | const_decl | static_decl | type_alias ;
 
 fn_decl      = "fn" ident "(" [ params ] ")" [ "->" type ] block ;
 params       = param { "," param } [ "," ] ;
 param        = [ "mut" ] ident ":" type ;              (* "_" ignores the argument *)
 
-extern_decl  = "extern" [ '"C"' ] "fn" ident "(" [ ext_params ] ")" [ "->" type ] ";" ;
-ext_params   = "..." | param { "," param } [ "," [ "..." ] ] ;
+extern_item  = "extern" '"C"' "{" { c_fn | c_static } "}"            (* (0.3) imports from C *)
+             | "extern" '"C"' fn_decl                                 (* (0.3) C's convention, an unmangled symbol *)
+             | "extern" '"C"' "static" [ "mut" ] ident ":" type "=" expr ";"   (* (0.3) a static C can use *)
+             | "extern" [ '"C"' ] c_fn ;                              (* deprecated: the 0.2 form, meaning extern "C" *)
+c_fn         = "fn" ident "(" [ c_params ] ")" [ "->" type ] ";" ;
+c_params     = "..." | param { "," param } [ "," [ "..." ] ] ;
+c_static     = "static" [ "mut" ] ident ":" type ";" ;
+
+attributes   = { "#" "[" "repr" "(" repr { "," repr } ")" "]" } ;    (* (0.3) *)
+repr         = "C" | "packed" | "align" "(" int_lit ")" | int_type ;
 
 struct_decl  = "struct" ident "{" [ field { "," field } [ "," ] ] "}" ;
+union_decl   = "union" ident "{" [ field { "," field } [ "," ] ] "}" ;   (* (0.3) #[repr(C)] only *)
 field        = ident ":" type ;
+enum_decl    = "enum" ident "{" [ variant { "," variant } [ "," ] ] "}" ;   (* (0.3) *)
+variant      = ident [ "(" type { "," type } [ "," ] ")" ] [ "=" expr ] ;  (* "=": fieldless enums only *)
+impl_block   = "impl" ident "{" { fn_decl } "}" ;                    (* (0.3) *)
 
 const_decl   = "const" ident ":" type "=" expr ";" ;   (* integer, float or bool; evaluated at compile time *)
 static_decl  = "static" [ "mut" ] ident ":" type "=" expr ";" ;   (* constant initializer *)
@@ -70,27 +85,56 @@ type_alias   = "type" ident "=" type ";" ;
 
 Items may refer to each other in any order. Constants and statics are
 initialized by constant expressions: literals, other constants, unary and
-binary operators, casts, and array/tuple/struct literals of those. Constant
-arithmetic wraps like run-time arithmetic.
+binary operators, casts, enum variants, and array/tuple/struct literals of
+those. Constant arithmetic wraps like run-time arithmetic.
+
+**Enums** *(0.3)*. A fieldless enum's variants have discriminants (0, 1, ...
+unless given with `= expr`); such an enum is a scalar, compared with `==`
+and `!=` and cast to an integer with `as`. Variants with fields are tuple
+variants. Values are written `E::V` and `E::V(a, b)`.
+
+**Impl blocks** *(0.3)* hold the methods and associated functions of a
+struct or enum. A function whose first parameter is named `self`, of type
+`T` or `*T`, is a method, called as `x.m(args)`: the compiler passes `&x`
+or `*x` as the method needs (a temporary of a compound type may be passed by
+address too). Others are called as `T::f(args)` (methods too, with the
+receiver first). Inside an impl block, `Self` names the type.
+
+**Attributes** *(0.3)*: `#[repr(C)]` gives a struct, union or enum C's
+layout; `#[repr(C, packed)]` packs a struct (or union) without padding,
+`#[repr(C, align(N))]` raises its alignment to N (a power of two up to 16);
+`#[repr(u8)]` (any integer type) sets the tag type of an enum. Any other
+attribute is an error.
 
 ## Types
 
 ```ebnf
-type = ident                                          (* i8 ... u64, isize, usize, f32, f64, bool, a struct or an alias *)
+type = ident                                          (* i8 ... u64, isize, usize, f32, f64, bool, a struct, union, enum or alias, Self *)
      | "*" type                                       (* raw pointer *)
      | "(" ")" | "(" type ")" | "(" type "," [ type { "," type } [ "," ] ] ")"
      | "[" type ";" expr "]"                          (* the length is a constant expression *)
-     | "fn" "(" [ type { "," type } [ "," ] ] ")" [ "->" type ]   (* not variadic *)
-     | "!" ;                                          (* never: e.g. `extern fn exit(c: i32) -> !` *)
+     | "[" type "]"                                   (* (0.3) a slice: a pointer and a length *)
+     | [ "extern" '"C"' ] "fn" "(" [ type { "," type } [ "," ] ] ")" [ "->" type ]
+                                                      (* not variadic; extern "C" fn (0.3) is another type *)
+     | "!" ;                                          (* never: e.g. `fn exit(c: i32) -> !` *)
 ```
 
 ## Patterns
 
 ```ebnf
-pattern = "_" | [ "mut" ] ident | "(" [ pattern { "," pattern } [ "," ] ] ")" ;
+pattern  = single { "|" single } ;                     (* (0.3) alternatives *)
+single   = "_" | [ "mut" ] ident                      (* a binding, or a constant's name *)
+         | literal [ "..=" literal ]                  (* (0.3) integers, chars and bools; inclusive ranges *)
+         | ident "::" ident [ "(" [ pattern { "," pattern } [ "," ] ] ")" ]   (* (0.3) a variant *)
+         | "(" [ pattern { "," pattern } [ "," ] ] ")" ;
+literal  = [ "-" ] int_lit | char_lit | "true" | "false" | ident ;   (* ident: a constant *)
 ```
 
-`(p)` is `p`; `(p,)` is a one-element tuple pattern.
+`(p)` is `p`; `(p,)` is a one-element tuple pattern. An identifier that
+names a constant (and no local) is that constant's value; any other is a
+binding. Every alternative of an or-pattern binds the same variables, with
+the same types. The patterns of `let` and `for` must match every value
+(no literals, ranges, alternatives, or variants of enums with several).
 
 ## Statements and blocks
 
@@ -100,7 +144,7 @@ stmt        = ";"                                      (* empty statement *)
             | "let" pattern [ ":" type ] "=" expr ";"
             | block_like [ ";" ]
             | expr ";" ;
-block_like  = block | if_expr | loop_expr | while_expr | for_expr ;
+block_like  = block | if_expr | match_expr | loop_expr | while_expr | for_expr ;
 ```
 
 **Statement rule.** A statement that *starts* with a block-like expression
@@ -125,13 +169,16 @@ prefix      = ( "-" | "!" | "~" | "*" | "&" ) pratt(25)
             | "continue" [ ":" ident ]
             | primary ;
 postfix     = "(" [ expr { "," expr } [ "," ] ] ")"     (* call *)
-            | "[" expr "]"                            (* index: arrays and pointers *)
+            | "[" expr "]"                            (* index: arrays, slices and pointers *)
+            | "[" [ expr ] ( ".." | "..=" ) [ expr ] "]"   (* (0.3) slicing *)
+            | "." ident "(" [ expr { "," expr } [ "," ] ] ")"   (* (0.3) method call *)
             | "." ident                               (* field *)
             | "." int_lit                             (* tuple field *)
             | "as" type ;                             (* cast *)
 primary     = int_lit | float_lit | char_lit | string_lit | cstring_lit | "true" | "false"
             | ident
-            | ident "{" [ field_init { "," field_init } [ "," ] ] "}"   (* struct literal *)
+            | ident "::" ident                        (* (0.3) a variant or an associated function *)
+            | ident "{" [ field_init { "," field_init } [ "," ] ] "}"   (* struct (or union: one field) literal *)
             | "(" ")" | "(" expr ")" | "(" expr "," [ expr { "," expr } [ "," ] ] ")"
             | "[" "]" | "[" expr ";" expr "]" | "[" expr { "," expr } [ "," ] "]"
             | [ label ] block_like ;
@@ -139,6 +186,8 @@ field_init  = ident ":" expr ;
 label       = ident ":" ;                             (* only before loop, while, for *)
 
 if_expr     = "if" cond block [ "else" ( block | if_expr ) ] ;
+match_expr  = "match" cond "{" { arm } "}" ;          (* (0.3) *)
+arm         = pattern [ "if" expr ] "=>" ( block_like [ "," ] | expr ( "," | before "}" ) ) ;
 loop_expr   = "loop" block ;                          (* its value comes from `break value` *)
 while_expr  = "while" cond block ;
 for_expr    = "for" pattern "in" range block ;        (* range: a..b or a..=b, integers *)
@@ -156,8 +205,62 @@ type of its `break` values, `()` for a plain `break`, and `!` without any
 are only allowed as `for` bounds; the bounds are evaluated once, and the
 loop variable is a fresh copy in every iteration.
 
-A function stored in a field is called as `(s.f)(x)`; `s.f(x)` is reserved
-for methods.
+A function stored in a field is called as `(s.f)(x)`; `s.f(x)` calls a
+method. A field of a struct can be reached through a pointer to it: `p.f`
+is `(*p).f` *(0.3)*.
+
+**Assignment** evaluates its right-hand side first, then the place; a
+compound assignment then reads the place's old value *(0.3; before, the
+place came first)*.
+
+**match** *(0.3)* evaluates the scrutinee once, then tries the arms in
+order: an arm is taken when its pattern matches and its guard (if any) is
+true; its bindings are copies, made before the guard. The arms (without
+guards) must cover every value, and every arm must be reachable; a missing
+value is named in the error (`non-exhaustive match: 'Shape::Empty' is not
+covered`). A match is an expression, typed like `if`.
+
+**Slices** *(0.3)* `[T]` are a pointer and a length (`s.ptr`, `s.len`), made
+by slicing an array or a slice (checked: `lo <= hi <= len`), or a raw
+pointer (`p[lo..hi]`, unchecked). Indexing a slice is checked. Like
+pointers, slices are views: writing through one needs no `mut`. A failed
+check writes `index out of bounds: index I, length N` (or `slice range out
+of bounds: ...`) to stderr and exits with code 101.
+
+## Layout, conventions and C
+
+Tachyon guarantees **nothing** about the layout of its own types (the order
+and offsets of a struct's fields, the layout of tuples, enums and slices)
+or about the calling convention of its own functions: the compiler is free
+to choose them (0.3 orders a struct's fields to save padding), and
+optimizations may rely on that freedom. C compatibility is asked for
+explicitly, and then it is exact:
+
+- `#[repr(C)]` types have C's layout: fields in order, each at its C
+  offset; unions overlap their fields; `packed` and `align(N)` as with
+  GCC's attributes. A fieldless `#[repr(C)]` enum is a C `int`; one with
+  fields is a C struct: an `int` tag, then a union of one struct per
+  variant (RFC 2195's layout). `#[repr(u8)]` (any integer type) sets an
+  enum's tag type; with fields, each variant is then laid out as a struct
+  starting with the tag.
+- `extern "C"` functions (imported in an `extern "C" { ... }` block, or
+  defined with `extern "C" fn`) and `extern "C" fn` pointers follow the C
+  calling convention of the target: AAPCS64 as on macOS, or System V
+  x86-64, for every argument and result (aggregates in registers or on the
+  stack, homogeneous float aggregates, MEMORY class, variadic calls).
+  Defined ones have an unmangled global symbol; imported statics are
+  reached through the GOT; `extern "C" static` defines one C can use.
+- Every type in an `extern "C"` signature, function pointer type or static
+  must be **FFI-safe**: an integer or float, bool, a raw pointer (to
+  anything: a pointer to a non-C type is an opaque handle), an
+  `extern "C" fn` pointer, or a `#[repr(C)]` (or integer-repr enum) type
+  whose fields are FFI-safe (arrays of them inside structs too). Slices,
+  tuples, default-layout structs and enums, and plain `fn` pointers are
+  rejected, with a hint. Variadic arguments may be any FFI-safe type
+  (`f32` is passed as a double).
+- A plain `fn` and an `extern "C" fn` are different types: a tachyon
+  function cannot be handed to C as a callback; define the callback with
+  `extern "C" fn`.
 
 ### Binding powers
 

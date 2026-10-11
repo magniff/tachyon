@@ -253,6 +253,13 @@ fn simplify_cfg(fi: i64) -> bool {
             BLOCKS[b].s1 = 0;
             changed = true;
         }
+        // So is a switch on a constant, or with one successor.
+        if BLOCKS[b].term == TERM_SWITCH
+            && (INSTS[BLOCKS[b].cond].op == OP_CONST || BLOCKS[b].nsucc == 1) {
+            let taken = if BLOCKS[b].nsucc == 1 { BLOCKS[b].s0 } else { switch_target(b, INSTS[BLOCKS[b].cond].imm) };
+            switch_to_jump(b, taken);
+            changed = true;
+        }
     }
     if changed {
         remove_unreachable(fi);
@@ -271,6 +278,20 @@ fn simplify_cfg(fi: i64) -> bool {
         remove_trivial_phis(fi);
     }
     changed
+}
+
+// Turns switch b into a jump to `taken` (one of its successors).
+fn switch_to_jump(b: i64, taken: i64) {
+    for i in 0..BLOCKS[b].nsucc {
+        let s = succ(b, i);
+        if s != taken {
+            remove_pred(s, b);
+        }
+    }
+    BLOCKS[b].term = TERM_JUMP;
+    BLOCKS[b].cond = 0;
+    BLOCKS[b].s0 = taken;
+    BLOCKS[b].s1 = 0;
 }
 
 // Block b has one predecessor p, which jumps to it: move b's instructions
@@ -297,10 +318,7 @@ fn merge_into_pred(fi: i64, b: i64) -> bool {
         ir_append(p, v);
         v = next;
     }
-    BLOCKS[p].term = BLOCKS[b].term;
-    BLOCKS[p].cond = BLOCKS[b].cond;
-    BLOCKS[p].s0 = BLOCKS[b].s0;
-    BLOCKS[p].s1 = BLOCKS[b].s1;
+    copy_terminator(p, b);
     for i in 0..succ_count(b) {
         let s = succ(b, i);
         let index = pred_index(s, b);
@@ -331,12 +349,13 @@ fn thread_jump(fi: i64, b: i64) -> bool {
     }
     for i in 0..BLOCKS[b].preds.count {
         let p = BLOCKS[b].preds.data[i];
-        if BLOCKS[p].s0 == b {
-            BLOCKS[p].s0 = s;
+        if BLOCKS[p].term == TERM_SWITCH && is_succ(p, s) {
+            return false;
         }
-        if BLOCKS[p].term == TERM_BRANCH && BLOCKS[p].s1 == b {
-            BLOCKS[p].s1 = s;
-        }
+    }
+    for i in 0..BLOCKS[b].preds.count {
+        let p = BLOCKS[b].preds.data[i];
+        redirect_succ(p, b, s);
         intvec_push(&BLOCKS[s].preds, p);
     }
     remove_pred(s, b);
@@ -429,11 +448,17 @@ fn cleanup_function(fi: i64) {
 // The scalar pipeline (-O1), twice: constants, peepholes, control flow,
 // value numbering, dead code.
 fn simplify_function(fi: i64) {
-    for _ in 0..2 {
+    for round in 0..2 {
         sccp(fi);
         verify_func(fi, c"sccp");
         instcombine(fi);
         verify_func(fi, c"instcombine");
+        if round == 0 && sroa(fi) {
+            verify_func(fi, c"sroa");
+        }
+        if round == 0 && promote_constant_slots(fi) {
+            verify_func(fi, c"constant slots");
+        }
         simplify_cfg(fi);
         verify_func(fi, c"simplify_cfg");
         gvn(fi);
@@ -498,7 +523,7 @@ fn remove_dead_functions() {
         count_call_sites();
         for fi in 0..IRFUNC_COUNT {
             if FN_LIVE[fi] != 0 && FN_CALLS[fi] == 0 && FN_ADDRESS[fi] == 0
-                && FNS[IRFUNCS[fi].f].name != MAIN_SYM {
+                && !fn_is_global(IRFUNCS[fi].f) {
                 FN_LIVE[fi] = 0;
                 changed = true;
             }

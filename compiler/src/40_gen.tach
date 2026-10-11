@@ -34,12 +34,36 @@ fn alloc_slot(size: i64, align: i64) -> i64 {
     FRAME_SIZE
 }
 
+// A frame slot for a value of type `ty`; compound values get a multiple
+// of 8 bytes, so that they can be read and written in 8-byte pieces.
 fn alloc_slot_for(ty: i64) -> i64 {
-    alloc_slot(size_of(ty), align_of(ty))
+    let size = if is_compound(ty) { align_to(size_of(ty), 8) } else { size_of(ty) };
+    alloc_slot(size, align_of(ty))
 }
 
 fn fn_symbol_prefix(f: i64) -> *u8 {
-    if FNS[f].is_extern || FNS[f].name == MAIN_SYM { global_prefix() } else { function_prefix() }
+    if FNS[f].is_extern || FNS[f].export || FNS[f].name == MAIN_SYM { global_prefix() } else { function_prefix() }
+}
+
+// Whether function f has a global (C-visible) symbol.
+fn fn_is_global(f: i64) -> bool {
+    FNS[f].name == MAIN_SYM || FNS[f].export
+}
+
+// R_ACC (or `reg` with the machine layer) = the address of static `name`:
+// through the GOT when C defines it.
+fn emit_static_addr(name: i64) {
+    let s = SYM_STATIC[name] - 1;
+    let linkage = STATICS[s].linkage;
+    if linkage == 1 {
+        emit_extern_symbol_addr(name);
+    } else {
+        emit_local_symbol_addr(static_symbol_prefix(s), name);
+    }
+}
+
+fn static_symbol_prefix(s: i64) -> *u8 {
+    if STATICS[s].linkage != 0 { global_prefix() } else { static_prefix() }
 }
 
 // ---- The program ----
@@ -85,6 +109,7 @@ fn compile_program(output: *u8) {
             }
         }
     }
+    emit_runtime();
     gen_data();
     buf_bytes(ASM, BUFS[DATA].data, BUFS[DATA].len);
     emit_file_trailer();
@@ -100,11 +125,21 @@ fn gen_data() {
     for s in 0..STATIC_COUNT {
         let item = STATICS[s].node;
         let ty = STATICS[s].ty;
+        if STATICS[s].linkage == 1 {
+            // Defined in C.
+            continue;
+        }
         buf_clear(scratch);
         const_emit(NODES[item].c, ty, scratch);
         data_section(STATICS[s].mutable);
         data_align(align_of(ty));
-        data_label(static_prefix(), NODES[item].a);
+        if STATICS[s].linkage == 2 {
+            buf_str(DATA, c".globl ");
+            buf_str(DATA, global_prefix());
+            buf_bytes(DATA, SYMS[NODES[item].a].ptr, SYMS[NODES[item].a].len);
+            buf_byte(DATA, '\n');
+        }
+        data_label(static_symbol_prefix(s), NODES[item].a);
         data_bytes(BUFS[scratch].data, BUFS[scratch].len);
         if BUFS[scratch].len == 0 {
             buf_str(DATA, c"    .space 1\n");
@@ -115,16 +150,16 @@ fn gen_data() {
 // ---- Functions ----
 
 fn gen_function(item: i64) {
-    let f = SYM_FN[NODES[item].a] - 1;
+    let f = NODES[item].x - 1;
     CUR_FN = f;
     buf_clear(CODE);
     DEPTH = 0;
     FRAME_SIZE = 0;
     RETURN_LABEL = new_label();
-    emit_function_start(fn_symbol_prefix(f), FNS[f].name, FNS[f].name == MAIN_SYM);
+    emit_function_start(fn_symbol_prefix(f), FNS[f].name, fn_is_global(f));
     let ret = FNS[f].ret;
     RESULT_SLOT = 0;
-    if is_compound(ret) {
+    if returns_through_pointer(ret) {
         RESULT_SLOT = alloc_slot(8, 8);
         emit_frame_addr(R_ADDR, RESULT_SLOT);
         emit_store(TY_U64, R_RESULT, R_ADDR);
@@ -145,39 +180,64 @@ fn gen_function(item: i64) {
     buf_bytes(ASM, BUFS[CODE].data, BUFS[CODE].len);
 }
 
-// Stores the incoming parameters in their frame slots. Compound parameters
-// arrive as pointers and are copied once every register is saved.
+// Stores the incoming parameters in their frame slots, in order (so a
+// register is saved before another parameter's move can reuse it).
+// Aggregates in registers are stored piece by piece; those passed by
+// reference or on the stack are copied once every register is saved.
 fn gen_params(item: i64, f: i64) {
     let mut state: [i64; 3] = [first_int_arg(FNS[f].ret), 0, 0];
     let mut pending: [i64; 64] = [0; 64];
     let mut pending_count = 0;
+    let mut pieces: [i64; 4] = [0; 4];
     for i in 0..FNS[f].param_count {
         let ty = fn_param(f, i);
         if is_void(ty) {
             continue;
         }
-        let location = arg_location(ty, &state as *i64);
+        let kind = abi_classify(ty);
         let local = NODES[child(item, i)].x;
+        if kind == ABI_PIECES {
+            abi_piece_locations(ty, &state as *i64, &pieces as *i64);
+            if local < 0 {
+                continue;
+            }
+            let slot = alloc_slot_for(ty);
+            LOCALS[local].offset = slot;
+            for k in 0..ABI_PIECE_COUNT {
+                emit_load_param(pieces[k], ABI_PIECE_TY[k]);
+                store_to_frame(ABI_PIECE_TY[k], slot - ABI_PIECE_OFFSET[k]);
+            }
+            continue;
+        }
+        let mut location = 0;
+        if kind == ABI_STACK {
+            location = abi_stack_location(ty, &state as *i64);
+        } else {
+            location = arg_location(if kind == ABI_REF { TY_U64 } else { ty }, &state as *i64);
+        }
         if local < 0 {
             continue;
         }
         let slot = alloc_slot_for(ty);
         LOCALS[local].offset = slot;
-        // The accumulator = the incoming value (the pointer for compound
-        // values).
-        let value_ty = if is_compound(ty) { TY_U64 } else { ty };
-        emit_load_param(location, value_ty);
-        if is_compound(ty) {
-            let pointer_slot = alloc_slot(8, 8);
-            emit_frame_addr(R_ADDR, pointer_slot);
-            emit_store(TY_U64, R_ACC, R_ADDR);
-            pending[pending_count] = local;
-            pending[pending_count + 1] = pointer_slot;
-            pending_count += 2;
-        } else {
+        if kind == ABI_SCALAR {
+            emit_load_param(location, ty);
             emit_frame_addr(R_ADDR, slot);
             emit_store(ty, R_ACC, R_ADDR);
+            continue;
         }
+        // The accumulator = the address of the caller's copy.
+        if kind == ABI_STACK {
+            m_lea(0, reg_fp(), location);
+        } else {
+            emit_load_param(location, TY_U64);
+        }
+        let pointer_slot = alloc_slot(8, 8);
+        emit_frame_addr(R_ADDR, pointer_slot);
+        emit_store(TY_U64, R_ACC, R_ADDR);
+        pending[pending_count] = local;
+        pending[pending_count + 1] = pointer_slot;
+        pending_count += 2;
     }
     let mut i = 0;
     while i < pending_count {
@@ -190,12 +250,36 @@ fn gen_params(item: i64, f: i64) {
     }
 }
 
-// The accumulator holds the function's result: hand it to the caller.
+// The accumulator holds the function's result: hand it to the caller (in
+// registers, or copied through the result pointer, which x86-64 also
+// returns in rax).
 fn gen_return_value(ret: i64) {
-    if is_compound(ret) {
+    if !is_compound(ret) {
+        return;
+    }
+    if returns_through_pointer(ret) {
         emit_frame_addr(R_ADDR, RESULT_SLOT);
         emit_load_reg(R_SECOND, R_ADDR);
         emit_copy(size_of(ret));
+        if X86 {
+            load_reg_from_frame(R_ACC, RESULT_SLOT);
+        }
+        return;
+    }
+    let size = size_of(ret);
+    if size % 8 != 0 {
+        // Read in whole pieces from a copy of a multiple of 8 bytes.
+        let copy = alloc_slot_for(ret);
+        emit_frame_addr(R_SECOND, copy);
+        emit_copy(size);
+        emit_frame_addr(R_ACC, copy);
+    }
+    abi_classify(ret);
+    // The address moves out of the accumulator (a result register).
+    let base = if X86 { 11 } else { 16 };
+    m_mov(base, 0, TY_U64);
+    for k in 0..ABI_PIECE_COUNT {
+        m_load(ABI_PIECE_TY[k], return_piece_reg(k), base, ABI_PIECE_OFFSET[k]);
     }
 }
 
@@ -244,12 +328,24 @@ fn bind(pattern: i64) {
         store_to_frame(ty, slot);
         return;
     }
-    // A tuple: the accumulator is its address.
+    if NODES[pattern].count == 0 {
+        return;
+    }
+    // A tuple, or the only variant of an enum: the accumulator is its
+    // address.
     push_x0();
     for i in 0..NODES[pattern].count {
-        let elem_ty = type_elem(ty, i);
+        let mut elem_ty = 0;
+        let mut offset = 0;
+        if kind == P_VARIANT {
+            elem_ty = variant_field(NODES[pattern].x, i);
+            offset = variant_field_offset(NODES[pattern].x, i);
+        } else {
+            elem_ty = type_elem(ty, i);
+            offset = tuple_offset(ty, i);
+        }
         emit_peek(R_ACC);
-        emit_add_imm(R_ACC, tuple_offset(ty, i));
+        emit_add_imm(R_ACC, offset);
         if !is_compound(elem_ty) && !is_void(elem_ty) {
             emit_load(elem_ty, R_ACC);
         }
@@ -285,6 +381,8 @@ fn gen_expr(n: i64) {
         gen_cast(NODES[NODES[n].a].ty, ty);
     } else if kind == E_CALL {
         gen_call(n);
+    } else if kind == E_INDEX && NODES[NODES[n].b].kind == E_RANGE {
+        gen_slicing(n);
     } else if kind == E_INDEX || kind == E_FIELD || kind == E_TUPLE_FIELD {
         gen_addr(n);
         load_from_x0(ty);
@@ -296,6 +394,10 @@ fn gen_expr(n: i64) {
         gen_block(n);
     } else if kind == E_IF {
         gen_if(n);
+    } else if kind == E_MATCH {
+        gen_match(n);
+    } else if kind == E_VARIANT {
+        gen_variant(n);
     } else if kind == E_LOOP || kind == E_WHILE {
         gen_loop(n);
     } else if kind == E_FOR {
@@ -354,7 +456,7 @@ fn gen_ident(n: i64) {
             emit_load_imm(R_ACC, value as u64);
         }
     } else if resolution == R_STATIC {
-        emit_local_symbol_addr(static_prefix(), NODES[n].a);
+        emit_static_addr(NODES[n].a);
         load_from_x0(ty);
     } else {
         gen_fn_address(index);
@@ -375,13 +477,14 @@ fn gen_addr(n: i64) {
     if kind == E_IDENT && NODES[n].x == R_LOCAL {
         emit_frame_addr(R_ACC, LOCALS[NODES[n].y].offset);
     } else if kind == E_IDENT && NODES[n].x == R_STATIC {
-        emit_local_symbol_addr(static_prefix(), NODES[n].a);
+        emit_static_addr(NODES[n].a);
     } else if kind == E_UNARY && NODES[n].a == TK_STAR {
         gen_expr(NODES[n].b);
     } else if kind == E_FIELD {
         let base = NODES[n].a;
+        // The struct's (or slice's) address, or the pointer to the struct.
         gen_expr(base);
-        emit_add_imm(R_ACC, field_offset(TYPES[NODES[base].ty].a, NODES[n].x));
+        emit_add_imm(R_ACC, field_offset_of(n));
     } else if kind == E_TUPLE_FIELD {
         let base = NODES[n].a;
         gen_expr(base);
@@ -393,12 +496,48 @@ fn gen_addr(n: i64) {
     }
 }
 
+// The offset of the field of E_FIELD n in its base: a struct (also through
+// a pointer), or a slice.
+fn field_offset_of(n: i64) -> i64 {
+    let base_ty = NODES[NODES[n].a].ty;
+    if NODES[n].y == 2 {
+        return NODES[n].x * 8;
+    }
+    if NODES[n].y == 1 {
+        return field_offset(TYPES[TYPES[base_ty].a].a, NODES[n].x);
+    }
+    field_offset(TYPES[base_ty].a, NODES[n].x)
+}
+
+fn panic_kind(index_ty: i64, range: bool) -> i64 {
+    let signed = is_signed(index_ty);
+    if range {
+        return if signed { PANIC_RANGE_SIGNED } else { PANIC_RANGE_UNSIGNED };
+    }
+    if signed { PANIC_INDEX_SIGNED } else { PANIC_INDEX_UNSIGNED }
+}
+
 fn gen_index_addr(n: i64) {
     let base = NODES[n].a;
-    let elem_size = size_of(TYPES[NODES[base].ty].a);
+    let base_ty = NODES[base].ty;
+    let elem_size = size_of(TYPES[base_ty].a);
     gen_expr(base);
     push_x0();
     gen_expr(NODES[n].b);
+    if is_slice(base_ty) {
+        // Checked: the index against the slice's length.
+        emit_peek(R_SECOND);
+        emit_add_imm(R_SECOND, 8);
+        emit_load_reg(R_SECOND, R_SECOND);
+        let ok = new_label();
+        emit_compare_jump(TK_LT, false, ok);
+        emit_panic(panic_kind(NODES[NODES[n].b].ty, false));
+        emit_label(ok);
+        pop_x(R_SECOND);
+        emit_load_reg(R_SECOND, R_SECOND);
+        emit_index_addr(elem_size);
+        return;
+    }
     pop_x(R_SECOND);
     emit_index_addr(elem_size);
 }
@@ -576,6 +715,259 @@ fn load_reg_from_frame(reg: i64, offset: i64) {
     emit_load_reg(reg, R_ADDR);
 }
 
+// ---- Enums and slices ----
+
+// `E::V(...)`: a fieldless enum's tag, or a new value in a frame slot.
+fn gen_variant(n: i64) {
+    let ty = NODES[n].ty;
+    let v = NODES[n].a;
+    let tag = ENUMS[TYPES[ty].a].tag;
+    if !is_compound(ty) {
+        emit_load_imm(R_ACC, wrap_int(VARIANTS[v].discr, tag) as u64);
+        return;
+    }
+    let slot = alloc_slot_for(ty);
+    for i in 0..NODES[n].count {
+        gen_expr(child(n, i));
+        store_to_frame(variant_field(v, i), slot - variant_field_offset(v, i));
+    }
+    emit_load_imm(R_ACC, wrap_int(VARIANTS[v].discr, tag) as u64);
+    store_to_frame(tag, slot);
+    emit_frame_addr(R_ACC, slot);
+}
+
+// `a[lo..hi]` (and the other ranges) of an array, a slice or a pointer: a
+// new slice in a frame slot. Arrays and slices are checked: lo <= hi <=
+// the length (lo <= hi + 1 and hi < the length for `..=`).
+fn gen_slicing(n: i64) {
+    let base = NODES[n].a;
+    let base_ty = NODES[base].ty;
+    let range = NODES[n].b;
+    let low = NODES[range].a;
+    let high = NODES[range].b;
+    let inclusive = NODES[range].c != 0;
+    let elem_size = size_of(TYPES[base_ty].a);
+    // The result: the pointer at `slot`, the length at `slot - 8`.
+    let slot = alloc_slot(16, 8);
+    let length = alloc_slot(8, 8);
+    let low_slot = alloc_slot(8, 8);
+    let high_slot = alloc_slot(8, 8);
+    gen_expr(base);
+    if is_slice(base_ty) {
+        emit_move_to_second(TY_U64);
+        emit_load_reg(R_ACC, R_SECOND);
+        store_reg_to_frame(R_ACC, slot);
+        emit_add_imm(R_SECOND, 8);
+        emit_load_reg(R_ACC, R_SECOND);
+        store_reg_to_frame(R_ACC, length);
+    } else {
+        store_reg_to_frame(R_ACC, slot);
+        if TYPES[base_ty].kind == TY_ARRAY {
+            emit_load_imm(R_ACC, TYPES[base_ty].b as u64);
+            store_reg_to_frame(R_ACC, length);
+        }
+    }
+    let mut bound_ty = TY_U64;
+    if low != 0 {
+        gen_expr(low);
+        bound_ty = NODES[low].ty;
+    } else {
+        emit_load_imm(R_ACC, 0);
+    }
+    store_reg_to_frame(R_ACC, low_slot);
+    if high != 0 {
+        gen_expr(high);
+        bound_ty = NODES[high].ty;
+    } else {
+        load_reg_from_frame(R_ACC, length);
+    }
+    store_reg_to_frame(R_ACC, high_slot);
+    if TYPES[base_ty].kind != TY_PTR {
+        let ok = new_label();
+        let fail = new_label();
+        // hi <= length (hi < length for `..=`), then lo <= hi (+ 1).
+        load_reg_from_frame(R_SECOND, length);
+        load_reg_from_frame(R_ACC, high_slot);
+        emit_compare_jump(if inclusive { TK_GT_EQ } else { TK_GT }, false, fail);
+        if inclusive {
+            emit_add_imm(R_ACC, 1);
+        }
+        emit_move_to_second(TY_U64);
+        load_reg_from_frame(R_ACC, low_slot);
+        emit_compare_jump(TK_LT_EQ, false, ok);
+        emit_label(fail);
+        load_reg_from_frame(R_ACC, length);
+        push_x0();
+        load_reg_from_frame(R_SECOND, high_slot);
+        if inclusive {
+            emit_add_imm(R_SECOND, 1);
+        }
+        load_reg_from_frame(R_ACC, low_slot);
+        pop_x(R_ADDR);
+        emit_panic(panic_kind(bound_ty, true));
+        emit_label(ok);
+    }
+    // ptr += lo * size; len = hi (+ 1) - lo.
+    load_reg_from_frame(R_ACC, low_slot);
+    load_reg_from_frame(R_SECOND, slot);
+    emit_index_addr(elem_size);
+    store_reg_to_frame(R_ACC, slot);
+    load_reg_from_frame(R_ACC, low_slot);
+    emit_move_to_second(TY_U64);
+    load_reg_from_frame(R_ACC, high_slot);
+    if inclusive {
+        emit_add_imm(R_ACC, 1);
+    }
+    emit_int_binary(TK_MINUS, TY_U64);
+    store_reg_to_frame(R_ACC, slot - 8);
+    emit_frame_addr(R_ACC, slot);
+}
+
+// ---- match ----
+
+// Sequential tests in arm order: the scrutinee is evaluated once (a
+// compound one stays where it is: its address is kept), every arm's
+// pattern is tested in order, its bindings copied, its guard evaluated.
+fn gen_match(n: i64) {
+    let scrutinee = NODES[n].a;
+    let st = NODES[scrutinee].ty;
+    gen_expr(scrutinee);
+    if st == TY_NEVER {
+        return;
+    }
+    let held = alloc_slot(8, 8);
+    if is_compound(st) {
+        store_reg_to_frame(R_ACC, held);
+    } else {
+        store_to_frame(st, held);
+    }
+    let end = new_label();
+    for i in 0..NODES[n].count {
+        let arm = child(n, i);
+        let next = new_label();
+        alloc_pattern_slots(NODES[arm].a);
+        gen_pattern_test(NODES[arm].a, st, held, next);
+        if NODES[arm].b != 0 {
+            gen_expr(NODES[arm].b);
+            emit_jump_if_zero(next);
+        }
+        gen_expr(NODES[arm].c);
+        emit_jump(end);
+        emit_label(next);
+    }
+    emit_label(end);
+}
+
+// Frame slots for the locals a pattern binds (once: the alternatives of an
+// or-pattern bind the same locals).
+fn alloc_pattern_slots(p: i64) {
+    let kind = NODES[p].kind;
+    if kind == P_BIND {
+        let local = NODES[p].x;
+        if LOCALS[local].offset == 0 {
+            LOCALS[local].offset = alloc_slot_for(LOCALS[local].ty);
+        }
+        return;
+    }
+    if kind == P_TUPLE || kind == P_VARIANT || kind == P_OR {
+        for i in 0..NODES[p].count {
+            alloc_pattern_slots(child(p, i));
+        }
+    }
+}
+
+// Jumps to `fail` unless the value of type `ty` in frame slot `held` (the
+// address of a compound value) matches pattern p; binds its variables.
+fn gen_pattern_test(p: i64, ty: i64, held: i64, fail: i64) {
+    let kind = NODES[p].kind;
+    if kind == P_WILD || ty == TY_NEVER {
+        return;
+    }
+    if kind == P_BIND {
+        if is_void(ty) {
+            return;
+        }
+        load_held(ty, held);
+        store_to_frame(ty, LOCALS[NODES[p].x].offset);
+        return;
+    }
+    if kind == P_LIT || kind == P_RANGE {
+        let signed = is_signed(scalar_type(ty));
+        load_held(ty, held);
+        emit_load_imm(R_SECOND, NODES[p].x as u64);
+        if kind == P_LIT {
+            emit_compare_jump(TK_BANG_EQ, signed, fail);
+            return;
+        }
+        emit_compare_jump(TK_LT, signed, fail);
+        emit_load_imm(R_SECOND, NODES[p].y as u64);
+        emit_compare_jump(TK_GT, signed, fail);
+        return;
+    }
+    if kind == P_OR {
+        let ok = new_label();
+        let last = NODES[p].count - 1;
+        for i in 0..last {
+            let next = new_label();
+            gen_pattern_test(child(p, i), ty, held, next);
+            emit_jump(ok);
+            emit_label(next);
+        }
+        gen_pattern_test(child(p, last), ty, held, fail);
+        emit_label(ok);
+        return;
+    }
+    if kind == P_VARIANT {
+        let v = NODES[p].x;
+        let tag = ENUMS[TYPES[ty].a].tag;
+        if is_compound(ty) {
+            load_reg_from_frame(R_ACC, held);
+            emit_load(tag, R_ACC);
+        } else {
+            load_held(ty, held);
+        }
+        emit_load_imm(R_SECOND, wrap_int(VARIANTS[v].discr, tag) as u64);
+        emit_compare_jump(TK_BANG_EQ, is_signed(tag), fail);
+    }
+    // The elements of a tuple, the fields of a variant.
+    for i in 0..NODES[p].count {
+        let sub = child(p, i);
+        if NODES[sub].kind == P_WILD {
+            continue;
+        }
+        let mut elem_ty = 0;
+        let mut offset = 0;
+        if kind == P_VARIANT {
+            elem_ty = variant_field(NODES[p].x, i);
+            offset = variant_field_offset(NODES[p].x, i);
+        } else {
+            elem_ty = type_elem(ty, i);
+            offset = tuple_offset(ty, i);
+        }
+        let elem_held = alloc_slot(8, 8);
+        load_reg_from_frame(R_ACC, held);
+        emit_add_imm(R_ACC, offset);
+        if is_compound(elem_ty) {
+            store_reg_to_frame(R_ACC, elem_held);
+        } else if !is_void(elem_ty) {
+            emit_load(elem_ty, R_ACC);
+            store_to_frame(elem_ty, elem_held);
+        }
+        gen_pattern_test(sub, elem_ty, elem_held, fail);
+    }
+}
+
+// The accumulator = the value held in frame slot `held` (the address of a
+// compound value).
+fn load_held(ty: i64, held: i64) {
+    if is_compound(ty) {
+        load_reg_from_frame(R_ACC, held);
+    } else {
+        emit_frame_addr(R_ACC, held);
+        load_from_x0(ty);
+    }
+}
+
 // ---- Control flow ----
 
 fn gen_if(n: i64) {
@@ -682,36 +1074,48 @@ fn arith_op_of_assign(op: i64) -> i64 {
     TK_SHR
 }
 
-// The target's address is computed first; a compound assignment reads the
-// old value before evaluating the right-hand side.
+// The right-hand side is evaluated first, then the target's address; a
+// compound assignment then reads the old value.
 fn gen_assign(n: i64) {
     let op = NODES[n].a;
     let target = NODES[n].b;
     let value = NODES[n].c;
     let ty = NODES[target].ty;
-    gen_addr(target);
-    push_x0();
+    gen_expr(value);
     if op == TK_EQ {
-        gen_expr(value);
-        if is_compound(ty) {
-            pop_x(R_SECOND);
-            emit_copy(size_of(ty));
-        } else if is_void(ty) {
-            pop_x(R_SECOND);
+        if is_void(ty) {
+            gen_addr(target);
+            return;
+        }
+        // The value (the source's address for compound values) waits on the
+        // stack while the target's address is computed.
+        push_value(ty);
+        gen_addr(target);
+        emit_move_to_second(TY_U64);
+        if is_float(ty) {
+            pop_d(0);
         } else {
-            pop_x(R_ADDR);
-            emit_store(ty, R_ACC, R_ADDR);
+            pop_x(R_ACC);
+        }
+        if is_compound(ty) {
+            emit_copy(size_of(ty));
+        } else {
+            emit_store(ty, R_ACC, R_SECOND);
         }
         return;
     }
+    let value_ty = NODES[value].ty;
+    push_value(value_ty);
+    gen_addr(target);
+    push_x0();
     emit_peek(R_ADDR);
     emit_load(ty, R_ADDR);
-    push_value(ty);
-    gen_expr(value);
-    pop_second_operand(ty);
+    emit_peek_at(R_SECOND, 1, is_float(value_ty));
     gen_operator(arith_op_of_assign(op), ty, ty);
     pop_x(R_ADDR);
     emit_store(ty, R_ACC, R_ADDR);
+    emit_drop_temps(1);
+    DEPTH -= 1;
 }
 
 // ---- Calls ----
@@ -757,7 +1161,9 @@ fn gen_call(n: i64) {
         if is_void(ty) {
             continue;
         }
-        if is_compound(ty) && is_place_kind(arg) {
+        // A private copy, of a multiple of 8 bytes (read in pieces), unless
+        // the value is a new temporary.
+        if is_compound(ty) && !is_fresh(arg) {
             let copy = alloc_slot_for(ty);
             emit_frame_addr(R_SECOND, copy);
             emit_copy(size_of(ty));
@@ -775,21 +1181,33 @@ fn gen_call(n: i64) {
     gen_call_sequence(n, direct, &arg_types as *i64, count, param_count, variadic, pushed, ret);
 }
 
-// Where each argument goes (see arg_location); returns the size of the
-// outgoing stack area, and the number of float registers used in
-// `float_regs`.
+// Where each argument goes (see arg_location): `locations[i]` for scalars,
+// pointers to copies (ABI_REF) and copies on the stack (ABI_STACK), the
+// pieces' locations at `pieces[4 * i + k]` for aggregates in pieces;
+// `kinds[i]` is the ABI kind. Returns the size of the outgoing stack area,
+// and the number of float registers used in `float_regs`.
 fn assign_arg_locations(arg_types: *i64, count: i64, param_count: i64, variadic: bool,
-                        ret: i64, locations: *i64, float_regs: *i64) -> i64 {
+                        ret: i64, locations: *i64, pieces: *i64, kinds: *i64,
+                        float_regs: *i64) -> i64 {
     let mut state: [i64; 3] = [first_int_arg(ret), 0, 0];
     for i in 0..count {
         let ty = arg_types[i];
         if ty == 0 {
             continue;
         }
-        if variadic && i >= param_count {
-            locations[i] = variadic_arg_location(ty, &state as *i64);
+        let extra = variadic && i >= param_count;
+        let kind = if extra { variadic_kind(ty) } else { abi_classify(ty) };
+        kinds[i] = kind;
+        if extra && kind == ABI_PIECES {
+            abi_variadic_piece_locations(ty, &state as *i64, &pieces[4 * i]);
+        } else if extra && kind != ABI_STACK {
+            locations[i] = variadic_arg_location(if kind == ABI_REF { TY_U64 } else { ty }, &state as *i64);
+        } else if kind == ABI_PIECES {
+            abi_piece_locations(ty, &state as *i64, &pieces[4 * i]);
+        } else if kind == ABI_STACK {
+            locations[i] = abi_stack_location(ty, &state as *i64);
         } else {
-            locations[i] = arg_location(ty, &state as *i64);
+            locations[i] = arg_location(if kind == ABI_REF { TY_U64 } else { ty }, &state as *i64);
         }
     }
     *float_regs = state[1];
@@ -797,9 +1215,13 @@ fn assign_arg_locations(arg_types: *i64, count: i64, param_count: i64, variadic:
 }
 
 // Moves the pushed arguments into their registers and stack slots. The
-// k-th pushed temporary is at sp + stack_size + 16 * (pushed - 1 - k).
+// k-th pushed temporary is at sp + stack_size + 16 * (pushed - 1 - k); an
+// aggregate's temporary holds its address (of a private copy).
 fn place_args(arg_types: *i64, count: i64, param_count: i64, variadic: bool,
-              locations: *i64, stack_size: i64, pushed: i64) {
+              locations: *i64, pieces: *i64, kinds: *i64, stack_size: i64, pushed: i64) {
+    let scratch = if X86 { 10 } else { 16 };
+    let temp_int = if X86 { 11 } else { 17 };
+    let temp_float = if X86 { 40 } else { 48 };
     let mut k = 0;
     for i in 0..count {
         let ty = arg_types[i];
@@ -808,45 +1230,93 @@ fn place_args(arg_types: *i64, count: i64, param_count: i64, variadic: bool,
         }
         let from = stack_size + 16 * (pushed - 1 - k);
         k += 1;
+        let kind = kinds[i];
+        if kind == ABI_PIECES {
+            abi_classify(ty);
+            m_load(TY_U64, scratch, reg_sp(), from);
+            for p in 0..ABI_PIECE_COUNT {
+                let location = pieces[4 * i + p];
+                let piece_ty = ABI_PIECE_TY[p];
+                let offset = ABI_PIECE_OFFSET[p];
+                if location < 16 {
+                    m_load(piece_ty, arg_reg(location), scratch, offset);
+                } else {
+                    let temp = if is_float(piece_ty) { temp_float } else { temp_int };
+                    m_load(piece_ty, temp, scratch, offset);
+                    m_store(piece_ty, temp, reg_sp(), location - 16);
+                }
+            }
+            continue;
+        }
         let location = locations[i];
+        if kind == ABI_STACK {
+            // The aggregate's bytes, in 8-byte pieces (its copy is a
+            // multiple of 8 bytes).
+            m_load(TY_U64, scratch, reg_sp(), from);
+            let mut offset = 0;
+            while offset < size_of(ty) {
+                m_load(TY_U64, temp_int, scratch, offset);
+                m_store(TY_U64, temp_int, reg_sp(), location - 16 + offset);
+                offset += 8;
+            }
+            continue;
+        }
+        let value_ty = if kind == ABI_REF { TY_U64 } else { ty };
         let promote = variadic && i >= param_count;
         if location >= 16 {
-            emit_stack_arg(ty, from, location - 16, promote);
+            emit_stack_arg(value_ty, from, location - 16, promote);
         } else {
-            emit_load_arg_reg(location, ty, from, promote);
+            emit_load_arg_reg(location, value_ty, from, promote);
         }
     }
 }
 
-// Moves the pushed arguments into place, calls, and pops them.
+// Moves the pushed arguments into place, calls, and pops them. A compound
+// result is in a new frame slot (through the result pointer, or stored
+// from the result registers).
 fn gen_call_sequence(n: i64, direct: i64, arg_types: *i64, count: i64, param_count: i64,
                      variadic: bool, pushed: i64, ret: i64) {
     let mut locations: [i64; 64] = [0; 64];
+    let mut pieces: [i64; 256] = [0; 256];
+    let mut kinds: [i64; 64] = [0; 64];
     let mut float_regs = 0;
     let stack_size = assign_arg_locations(arg_types, count, param_count, variadic, ret,
-                                          &locations as *i64, &float_regs);
+                                          &locations as *i64, &pieces as *i64,
+                                          &kinds as *i64, &float_regs);
     if stack_size > 0 {
         emit_sp_sub(stack_size);
     }
-    place_args(arg_types, count, param_count, variadic, &locations as *i64, stack_size, pushed);
+    place_args(arg_types, count, param_count, variadic, &locations as *i64, &pieces as *i64,
+               &kinds as *i64, stack_size, pushed);
     if direct < 0 {
         emit_load_callee(stack_size);
     }
     let mut result_slot = 0;
+    let through_pointer = returns_through_pointer(ret);
     if is_compound(ret) {
         result_slot = alloc_slot_for(ret);
+    }
+    if through_pointer {
         emit_frame_addr(R_RESULT, result_slot);
     }
     if direct >= 0 {
-        emit_call(fn_symbol_prefix(direct), FNS[direct].name, FNS[direct].is_extern, variadic,
-                  float_regs);
+        emit_call(fn_symbol_prefix(direct), FNS[direct].name,
+                  FNS[direct].is_extern || FNS[direct].export, variadic, float_regs);
     } else {
         emit_call_indirect();
     }
     emit_drop_temps_now(stack_size, pushed);
     if is_compound(ret) {
+        if !through_pointer {
+            abi_classify(ret);
+            emit_frame_addr(R_ADDR, result_slot);
+            let base = if X86 { 11 } else { 9 };
+            for k in 0..ABI_PIECE_COUNT {
+                m_store(ABI_PIECE_TY[k], return_piece_reg(k), base, ABI_PIECE_OFFSET[k]);
+            }
+        }
         emit_frame_addr(R_ACC, result_slot);
-    } else if is_integer(ret) || ret == TY_BOOL {
+    } else if is_integer(scalar_type(ret)) || ret == TY_BOOL {
         emit_normalize(if ret == TY_BOOL { TY_U8 } else { ret });
     }
 }
