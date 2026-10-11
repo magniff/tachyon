@@ -1,4 +1,4 @@
-pub mod codegen;
+pub mod backend;
 pub mod lexer;
 pub mod lowering;
 pub mod parser;
@@ -50,8 +50,8 @@ impl From<typechecker::TypecheckerError> for CompilerError {
     }
 }
 
-impl From<codegen::GeneratorError> for CompilerError {
-    fn from(error: codegen::GeneratorError) -> Self {
+impl From<backend::GeneratorError> for CompilerError {
+    fn from(error: backend::GeneratorError) -> Self {
         Self {
             message: error.message,
             span: (0, None),
@@ -66,16 +66,9 @@ impl From<CompilerError> for Vec<CompilerError> {
     }
 }
 
-pub use codegen::Target;
+pub use backend::{Artifact, OptLevel, Options, Target};
 
-pub fn compile_program(program_text: &str) -> Result<String, Vec<CompilerError>> {
-    compile_program_for(program_text, Target::LinuxX86_64)
-}
-
-pub fn compile_program_for(
-    program_text: &str,
-    target: Target,
-) -> Result<String, Vec<CompilerError>> {
+fn front_end(program_text: &str) -> Result<lowering::IrProgram, Vec<CompilerError>> {
     let tokens = lexer::Lexer::new(&program_text)
         .tokenize()
         .map_err(|error| vec![error.into()])?;
@@ -86,8 +79,20 @@ pub fn compile_program_for(
             .map(|error| error.into())
             .collect::<Vec<_>>()
     })?;
-    Ok(codegen::generate_for(&lowering::lower(&ast, &checked), target)
+    Ok(lowering::lower(&ast, &checked))
+}
+
+pub fn compile(program_text: &str, options: &Options) -> Result<Artifact, Vec<CompilerError>> {
+    let program = front_end(program_text)?;
+    Ok(backend::backend()
+        .compile(&program, options)
         .map_err(Into::<CompilerError>::into)?)
+}
+
+// Cranelift IR and machine code of every function, for inspection.
+pub fn compile_to_clif(program_text: &str, options: &Options) -> Result<String, Vec<CompilerError>> {
+    let program = front_end(program_text)?;
+    Ok(backend::cranelift::clif_text(&program, options).map_err(Into::<CompilerError>::into)?)
 }
 
 pub fn format_errors(errors: &[CompilerError], program_text: &str) -> String {

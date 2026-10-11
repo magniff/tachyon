@@ -7,6 +7,8 @@ enum TargetArg {
     LinuxX86_64,
     #[value(name = "macos-x86_64")]
     MacosX86_64,
+    #[value(name = "macos-aarch64")]
+    MacosAarch64,
 }
 
 impl From<TargetArg> for tachyon::Target {
@@ -14,8 +16,17 @@ impl From<TargetArg> for tachyon::Target {
         match value {
             TargetArg::LinuxX86_64 => tachyon::Target::LinuxX86_64,
             TargetArg::MacosX86_64 => tachyon::Target::MacosX86_64,
+            TargetArg::MacosAarch64 => tachyon::Target::MacosAarch64,
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, clap::ValueEnum)]
+enum EmitArg {
+    /// An object file.
+    Default,
+    /// Cranelift IR and machine code, as text.
+    Clif,
 }
 
 #[derive(clap::Parser)]
@@ -26,9 +37,16 @@ struct Arguments {
     #[arg(long, short)]
     output: std::path::PathBuf,
 
-    /// Defaults to the host OS (always x86-64; Apple Silicon runs it under Rosetta).
+    /// Defaults to the host.
     #[arg(long, value_enum)]
     target: Option<TargetArg>,
+
+    /// Optimize.
+    #[arg(short = 'O')]
+    optimize: bool,
+
+    #[arg(long, value_enum, default_value = "default")]
+    emit: EmitArg,
 }
 
 fn main() {
@@ -41,12 +59,24 @@ fn main() {
 
     let arguments = Arguments::parse();
     let program_text = std::fs::read_to_string(&arguments.input).expect("read input");
-    let target = arguments
-        .target
-        .map(Into::into)
-        .unwrap_or_else(tachyon::Target::host);
+    let options = tachyon::Options {
+        target: arguments
+            .target
+            .map(Into::into)
+            .unwrap_or_else(tachyon::Target::host),
+        opt_level: if arguments.optimize {
+            tachyon::OptLevel::Speed
+        } else {
+            tachyon::OptLevel::None
+        },
+    };
 
-    match tachyon::compile_program_for(&program_text, target) {
+    let result = if arguments.emit == EmitArg::Clif {
+        tachyon::compile_to_clif(&program_text, &options).map(String::into_bytes)
+    } else {
+        tachyon::compile(&program_text, &options).map(|tachyon::Artifact(bytes)| bytes)
+    };
+    match result {
         Err(errors) => {
             tracing::error!(
                 "{errors}",
@@ -54,8 +84,8 @@ fn main() {
             );
             std::process::exit(1);
         }
-        Ok(assembly) => {
-            std::fs::write(&arguments.output, assembly).expect("write output");
+        Ok(bytes) => {
+            std::fs::write(&arguments.output, bytes).expect("write output");
         }
     }
 }

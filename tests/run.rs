@@ -1,5 +1,5 @@
-// Golden execution tests: compile each program, assemble and link it with
-// nasm + gcc, run it, and compare stdout and the exit code.
+// Golden execution tests: compile each program for every configured
+// target, link it, run it, and compare stdout and the exit code.
 //
 // Programs live in tests/run/*.tach and describe their expectations in
 // comments:
@@ -11,20 +11,34 @@
 //   // ERROR: substring    compilation must fail with this message
 //   // XFAIL: reason       known bug: the case is expected to fail; it is
 //                          reported as XPASS (a failure) once it passes
+//   // XFAIL(x): reason    the same, only for configurations whose name
+//                          contains x (a target or the opt level, e.g.
+//                          `XFAIL(macos-aarch64)` or `XFAIL(/O)`)
 //
 // Stdout is compared after trimming trailing whitespace.
 //
-// The generated code is x86-64. On x86-64 Linux (nasm + gcc) and on macOS
-// (nasm + clang -arch x86_64, run under Rosetta 2 on Apple Silicon) the tests
-// run natively. Elsewhere set TACHYON_DOCKER=1 to run them in a linux/amd64
-// container (built from tests/docker/Dockerfile). Without any of these, only
-// the ERROR cases run and the rest are skipped; set TACHYON_REQUIRE_RUN=1 to
-// turn the skip into a failure.
+// Configurations (target[/O]):
+//   <native target>         object file + cc, at -O0 and -O
+//   <x86-64 host target>    at -O0, when the native target is not x86-64
+//                           (Rosetta 2 on Apple Silicon)
+//
+// Environment:
+//   TACHYON_TARGET=<target>              run only this target
+//   TACHYON_OPT=0|1|all                  optimization levels
+//   TACHYON_DOCKER=1                     run linux-x86_64 in a container
+//                                        built from tests/docker/Dockerfile
+//   TACHYON_RUN_FILTER=substring         only cases whose name matches
+//   TACHYON_REQUIRE_RUN=1                fail instead of skipping when a
+//                                        configuration cannot run here
+//
+// ERROR cases exercise the front end only and run once.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+
+use tachyon::{Artifact, OptLevel, Options, Target};
 
 const DOCKER_IMAGE: &str = "tachyon-run-tests";
 const RUN_TIMEOUT: Duration = Duration::from_secs(20);
@@ -38,8 +52,9 @@ struct Case {
     expect: Vec<String>,
     exit: i32,
     error: Option<String>,
-    xfail: Option<String>,
-    // Only compile, assemble and link (programs that serve or animate).
+    // (scope, reason); a scope of None applies to every configuration.
+    xfail: Vec<(Option<String>, String)>,
+    // Only compile and link (programs that serve or animate).
     build_only: bool,
 }
 
@@ -67,14 +82,28 @@ impl Case {
                 "EXPECT" => case.expect.push(value),
                 "EXIT" => case.exit = value.trim().parse().expect("EXIT must be an integer"),
                 "ERROR" => case.error = Some(value),
-                "XFAIL" => case.xfail = Some(value),
-                _ => {}
+                "XFAIL" => case.xfail.push((None, value)),
+                _ => {
+                    if let Some(scope) =
+                        key.strip_prefix("XFAIL(").and_then(|k| k.strip_suffix(')'))
+                    {
+                        case.xfail.push((Some(scope.to_string()), value));
+                    }
+                }
             }
         }
         if !stdin.is_empty() {
             case.stdin = Some(stdin.join("\n"));
         }
         case
+    }
+
+    fn xfail_for(&self, config: &Config) -> Option<&str> {
+        let name = config.name();
+        self.xfail
+            .iter()
+            .find(|(scope, _)| scope.as_ref().is_none_or(|s| name.contains(s.as_str())))
+            .map(|(_, reason)| reason.as_str())
     }
 }
 
@@ -150,106 +179,169 @@ fn example_cases(root: &Path) -> Vec<Case> {
     ]
 }
 
-enum Toolchain {
-    Native(tachyon::Target),
+#[derive(Debug, Clone, Copy)]
+struct Config {
+    target: Target,
+    opt: OptLevel,
+}
+
+impl Config {
+    fn name(&self) -> String {
+        let opt = match self.opt {
+            OptLevel::None => "",
+            OptLevel::Speed => "/O",
+        };
+        format!("{}{}", self.target.name(), opt)
+    }
+
+    fn options(&self) -> Options {
+        Options {
+            target: self.target,
+            opt_level: self.opt,
+        }
+    }
+
+    // The link command, run in the case directory: produces ./prog from
+    // prog.o.
+    fn link_command(&self) -> (String, Vec<String>) {
+        let (linker, flags) = self.target.linker();
+        let mut args: Vec<String> = flags.iter().map(|s| s.to_string()).collect();
+        args.extend(["-o", "prog", "prog.o", "-lm"].map(String::from));
+        (linker.to_string(), args)
+    }
+}
+
+fn env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+fn parse_target(name: &str) -> Target {
+    [
+        Target::LinuxX86_64,
+        Target::MacosX86_64,
+        Target::MacosAarch64,
+    ]
+    .into_iter()
+    .find(|t| t.name() == name)
+    .unwrap_or_else(|| panic!("unknown TACHYON_TARGET '{}'", name))
+}
+
+fn configs() -> Vec<Config> {
+    let opt = env("TACHYON_OPT").unwrap_or_else(|| "all".into());
+    let target_override = if env("TACHYON_DOCKER").as_deref() == Some("1") {
+        Some(Target::LinuxX86_64)
+    } else {
+        env("TACHYON_TARGET").map(|t| parse_target(&t))
+    };
+    let opts: Vec<OptLevel> = match opt.as_str() {
+        "0" => vec![OptLevel::None],
+        "1" => vec![OptLevel::Speed],
+        "all" => vec![OptLevel::None, OptLevel::Speed],
+        other => panic!("TACHYON_OPT must be 0, 1 or all, not '{}'", other),
+    };
+
+    let targets = match target_override {
+        Some(target) => vec![target],
+        None => {
+            // Apple Silicon also runs x86-64 binaries, under Rosetta 2.
+            let native = Target::host();
+            if cfg!(target_os = "macos") && !native.is_x86_64() {
+                vec![native, Target::MacosX86_64]
+            } else {
+                vec![native]
+            }
+        }
+    };
+    let mut configs = Vec::new();
+    for (index, target) in targets.into_iter().enumerate() {
+        // -O on the first (native) target only, to keep the suite fast.
+        for opt in &opts {
+            if index > 0 && *opt == OptLevel::Speed && opts.len() > 1 {
+                continue;
+            }
+            configs.push(Config { target, opt: *opt });
+        }
+    }
+    configs
+}
+
+// Where a configuration's programs run.
+#[derive(Clone, Copy)]
+enum Runner {
+    Native,
     Docker,
 }
 
-impl Toolchain {
-    fn detect() -> Result<Toolchain, String> {
-        if std::env::var("TACHYON_DOCKER").is_ok_and(|v| v == "1") {
-            let status = Command::new("docker")
-                .args([
-                    "build",
-                    "-q",
-                    "--platform",
-                    "linux/amd64",
-                    "-t",
-                    DOCKER_IMAGE,
-                ])
-                .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/docker"))
-                .stdout(Stdio::null())
-                .status()
-                .map_err(|e| format!("cannot run docker: {}", e))?;
-            if !status.success() {
-                return Err("docker build of tests/docker failed".into());
-            }
-            return Ok(Toolchain::Docker);
-        }
-        let (target, linker) = if cfg!(target_os = "macos") {
-            (tachyon::Target::MacosX86_64, "clang")
-        } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-            (tachyon::Target::LinuxX86_64, "gcc")
-        } else {
-            return Err(
-                "host is neither x86-64 Linux nor macOS (set TACHYON_DOCKER=1 to use docker)"
-                    .into(),
-            );
-        };
-        for tool in ["nasm", linker] {
-            let found = Command::new(tool)
-                .arg("--version")
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|s| s.success());
-            if !found {
-                return Err(format!("'{}' not found", tool));
-            }
-        }
-        Ok(Toolchain::Native(target))
-    }
+fn tool_exists(tool: &str) -> bool {
+    Command::new(tool)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
 
-    fn target(&self) -> tachyon::Target {
-        match self {
-            Toolchain::Native(target) => *target,
-            Toolchain::Docker => tachyon::Target::LinuxX86_64,
+fn runner_for(config: &Config) -> Result<Runner, String> {
+    if config.target == Target::LinuxX86_64 && env("TACHYON_DOCKER").as_deref() == Some("1") {
+        let status = Command::new("docker")
+            .args([
+                "build",
+                "-q",
+                "--platform",
+                "linux/amd64",
+                "-t",
+                DOCKER_IMAGE,
+            ])
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/docker"))
+            .stdout(Stdio::null())
+            .status()
+            .map_err(|e| format!("cannot run docker: {}", e))?;
+        if !status.success() {
+            return Err("docker build of tests/docker failed".into());
         }
+        return Ok(Runner::Docker);
     }
+    // macOS runs x86-64 binaries on Apple Silicon through Rosetta 2.
+    let runs_here = Target::native() == Some(config.target)
+        || (cfg!(target_os = "macos") && config.target.is_macos());
+    if !runs_here {
+        return Err(format!(
+            "{} binaries do not run on this host (set TACHYON_DOCKER=1 for linux-x86_64)",
+            config.target.name()
+        ));
+    }
+    let (linker, _) = config.link_command();
+    if !tool_exists(&linker) {
+        return Err(format!("'{}' not found", linker));
+    }
+    Ok(Runner::Native)
+}
 
-    // Assemble prog.asm and link it into ./prog.
-    fn build_steps(&self) -> [(&'static str, &'static [&'static str]); 2] {
-        match self.target() {
-            tachyon::Target::LinuxX86_64 => [
-                ("nasm", &["-f", "elf64", "-o", "prog.o", "prog.asm"]),
-                ("gcc", &["-no-pie", "-o", "prog", "prog.o", "-lc", "-lm"]),
-            ],
-            tachyon::Target::MacosX86_64 => [
-                ("nasm", &["-f", "macho64", "-o", "prog.o", "prog.asm"]),
-                (
-                    "clang",
-                    &["-arch", "x86_64", "-Wl,-w", "-o", "prog", "prog.o", "-lm"],
-                ),
-            ],
+// A command running `program` inside `dir`, either directly or in the
+// container with `dir` mounted as the working directory.
+fn command(runner: Runner, dir: &Path, program: &str, args: &[String]) -> Command {
+    match runner {
+        Runner::Native => {
+            // Resolve ./prog against `dir` ourselves (relative paths with
+            // current_dir are platform-specific) but keep argv[0] as given.
+            let mut c = match program.strip_prefix("./") {
+                Some(local) => {
+                    let mut c = Command::new(dir.join(local));
+                    std::os::unix::process::CommandExt::arg0(&mut c, program);
+                    c
+                }
+                None => Command::new(program),
+            };
+            c.args(args).current_dir(dir);
+            c
         }
-    }
-
-    // A command running `program` inside `dir`, either directly or in the
-    // container with `dir` mounted as the working directory.
-    fn command(&self, dir: &Path, program: &str, args: &[&str]) -> Command {
-        match self {
-            Toolchain::Native(_) => {
-                // Resolve ./prog against `dir` ourselves (relative paths with
-                // current_dir are platform-specific) but keep argv[0] as given.
-                let mut c = match program.strip_prefix("./") {
-                    Some(local) => {
-                        let mut c = Command::new(dir.join(local));
-                        std::os::unix::process::CommandExt::arg0(&mut c, program);
-                        c
-                    }
-                    None => Command::new(program),
-                };
-                c.args(args).current_dir(dir);
-                c
-            }
-            Toolchain::Docker => {
-                let mut c = Command::new("docker");
-                c.args(["run", "--rm", "-i", "--platform", "linux/amd64", "-v"])
-                    .arg(format!("{}:/work", dir.display()))
-                    .args(["-w", "/work", DOCKER_IMAGE, "timeout", "20", program])
-                    .args(args);
-                c
-            }
+        Runner::Docker => {
+            let mut c = Command::new("docker");
+            c.args(["run", "--rm", "-i", "--platform", "linux/amd64", "-v"])
+                .arg(format!("{}:/work", dir.display()))
+                .args(["-w", "/work", DOCKER_IMAGE, "timeout", "20", program])
+                .args(args);
+            c
         }
     }
 }
@@ -304,29 +396,29 @@ fn run_with_timeout(mut command: Command, stdin: Option<&str>) -> Result<Output,
     })
 }
 
+fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
+    panic
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_default()
+}
+
 // Compile, turning a compiler panic (an internal compiler error) into an
 // error report so one crashing case does not take down the whole suite.
-fn compile(source: &str, target: tachyon::Target) -> Result<String, String> {
+fn compile(source: &str, options: Options) -> Result<Artifact, String> {
     let source_owned = source.to_string();
-    let result =
-        std::panic::catch_unwind(move || tachyon::compile_program_for(&source_owned, target));
+    let result = std::panic::catch_unwind(move || tachyon::compile(&source_owned, &options));
     match result {
-        Ok(Ok(assembly)) => Ok(assembly),
+        Ok(Ok(artifact)) => Ok(artifact),
         Ok(Err(errors)) => Err(tachyon::format_errors(&errors, source)),
-        Err(panic) => {
-            let message = panic
-                .downcast_ref::<String>()
-                .cloned()
-                .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
-                .unwrap_or_default();
-            Err(format!("compiler panicked: {}", message))
-        }
+        Err(panic) => Err(format!("compiler panicked: {}", panic_message(panic))),
     }
 }
 
 fn check_compile_error(case: &Case, expected: &str) -> Result<(), String> {
     let source = std::fs::read_to_string(&case.source).unwrap();
-    match compile(&source, tachyon::Target::LinuxX86_64) {
+    match compile(&source, Options::default()) {
         Ok(_) => Err(format!("expected compile error containing '{}'", expected)),
         Err(report) => {
             if report.contains(expected) {
@@ -341,33 +433,32 @@ fn check_compile_error(case: &Case, expected: &str) -> Result<(), String> {
     }
 }
 
-fn run_case(case: &Case, toolchain: &Toolchain, work: &Path) -> Result<(), String> {
+fn run_case(case: &Case, config: &Config, runner: Runner, work: &Path) -> Result<(), String> {
     let source = std::fs::read_to_string(&case.source).unwrap();
-    let assembly = compile(&source, toolchain.target())
+    let artifact = compile(&source, config.options())
         .map_err(|report| format!("compile failed:\n{}", report))?;
 
-    let dir = work.join(&case.name);
+    let dir = work.join(config.name().replace('/', "-")).join(&case.name);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("prog.asm"), assembly).unwrap();
+    let Artifact(bytes) = artifact;
+    std::fs::write(dir.join("prog.o"), bytes).unwrap();
 
-    for (tool, args) in toolchain.build_steps() {
-        let output = run_with_timeout(toolchain.command(&dir, tool, args), None)?;
-        if output.code != Some(0) {
-            return Err(format!(
-                "{} failed:\n{}{}",
-                tool, output.stdout, output.stderr
-            ));
-        }
+    let (linker, args) = config.link_command();
+    let output = run_with_timeout(command(runner, &dir, &linker, &args), None)?;
+    if output.code != Some(0) {
+        return Err(format!(
+            "{} failed:\n{}{}",
+            linker, output.stdout, output.stderr
+        ));
     }
 
     if case.build_only {
         return Ok(());
     }
 
-    let args: Vec<&str> = case.args.iter().map(String::as_str).collect();
     let output = run_with_timeout(
-        toolchain.command(&dir, "./prog", &args),
+        command(runner, &dir, "./prog", &case.args),
         case.stdin.as_deref(),
     )?;
     let expected = case.expect.join("\n");
@@ -398,6 +489,94 @@ fn run_case(case: &Case, toolchain: &Toolchain, work: &Path) -> Result<(), Strin
     }
 }
 
+// Per-category (file-name prefix) counts: pass, xfail, fail.
+type Tally = std::collections::BTreeMap<String, [usize; 3]>;
+
+struct Report {
+    name: String,
+    tally: Tally,
+    failures: Vec<String>,
+    skipped: Option<String>,
+}
+
+fn record(
+    tally: &mut Tally,
+    failures: &mut Vec<String>,
+    label: &str,
+    case: &Case,
+    xfail: Option<&str>,
+    result: Result<(), String>,
+) {
+    let category = case.name.split('_').next().unwrap_or("").to_string();
+    let counts = tally.entry(category).or_default();
+    match (result, xfail) {
+        (Ok(()), None) => counts[0] += 1,
+        (Err(_), Some(_)) => counts[1] += 1,
+        (Ok(()), Some(reason)) => {
+            counts[2] += 1;
+            failures.push(format!(
+                "[{}] {}: passes but is marked XFAIL ({}); remove the directive",
+                label, case.name, reason
+            ));
+        }
+        (Err(message), None) => {
+            counts[2] += 1;
+            failures.push(format!("[{}] {}: {}", label, case.name, message));
+        }
+    }
+}
+
+fn run_config(config: Config, cases: &[Case], work: &Path) -> Report {
+    let name = config.name();
+    let mut report = Report {
+        name: name.clone(),
+        tally: Tally::new(),
+        failures: Vec::new(),
+        skipped: None,
+    };
+    let runner = match runner_for(&config) {
+        Ok(runner) => runner,
+        Err(reason) => {
+            report.skipped = Some(reason);
+            return report;
+        }
+    };
+    for case in cases.iter().filter(|c| c.error.is_none()) {
+        let result = run_case(case, &config, runner, work);
+        record(
+            &mut report.tally,
+            &mut report.failures,
+            &name,
+            case,
+            case.xfail_for(&config),
+            result,
+        );
+    }
+    report
+}
+
+fn print_table(title: &str, tally: &Tally) {
+    eprintln!("\n  {}", title);
+    eprintln!(
+        "  {:<10} {:>5} {:>6} {:>5}",
+        "category", "pass", "xfail", "fail"
+    );
+    let mut total = [0usize; 3];
+    for (category, counts) in tally {
+        eprintln!(
+            "  {:<10} {:>5} {:>6} {:>5}",
+            category, counts[0], counts[1], counts[2]
+        );
+        for i in 0..3 {
+            total[i] += counts[i];
+        }
+    }
+    eprintln!(
+        "  {:<10} {:>5} {:>6} {:>5}",
+        "total", total[0], total[1], total[2]
+    );
+}
+
 #[test]
 fn golden_programs() {
     // Compiler panics are reported per case; keep the default hook from
@@ -413,89 +592,76 @@ fn golden_programs() {
     let mut cases: Vec<Case> = files.iter().map(|p| Case::from_file(p)).collect();
     cases.extend(example_cases(&root));
 
-    if let Ok(filter) = std::env::var("TACHYON_RUN_FILTER") {
+    if let Some(filter) = env("TACHYON_RUN_FILTER") {
         cases.retain(|c| c.name.contains(&filter));
     }
 
-    let toolchain = Toolchain::detect();
-    if let Err(reason) = &toolchain {
-        if std::env::var("TACHYON_REQUIRE_RUN").is_ok_and(|v| v == "1") {
-            panic!("cannot run golden programs: {}", reason);
+    let work = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("run");
+
+    // Front-end error cases, once.
+    let mut errors_tally = Tally::new();
+    let mut failures = Vec::new();
+    for case in cases.iter() {
+        if let Some(expected) = &case.error {
+            let xfail = case
+                .xfail
+                .iter()
+                .find(|(scope, _)| scope.is_none())
+                .map(|(_, r)| r.as_str());
+            let result = check_compile_error(case, expected);
+            record(
+                &mut errors_tally,
+                &mut failures,
+                "front end",
+                case,
+                xfail,
+                result,
+            );
         }
-        eprintln!(
-            "golden_programs: skipping execution ({}); only compile-error cases run",
-            reason
-        );
     }
 
-    let work = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("run");
-    let mut failures = Vec::new();
-    let mut skipped = 0;
-    // Per-category (file-name prefix) counts: pass, xfail, fail.
-    let mut tally: std::collections::BTreeMap<String, [usize; 3]> = Default::default();
-    for case in &cases {
-        let category = case.name.split('_').next().unwrap_or("").to_string();
-        let counts = tally.entry(category).or_default();
-        let result = match (&case.error, &toolchain) {
-            (Some(expected), _) => check_compile_error(case, expected),
-            (None, Ok(toolchain)) => run_case(case, toolchain, &work),
-            (None, Err(_)) => {
-                skipped += 1;
-                continue;
+    // Every configuration in parallel; each runs its cases in order.
+    let configs = configs();
+    let reports: Vec<Report> = std::thread::scope(|scope| {
+        let handles: Vec<_> = configs
+            .iter()
+            .map(|config| {
+                let cases = &cases;
+                let work = &work;
+                scope.spawn(move || run_config(*config, cases, work))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|p| panic!("{}", panic_message(p))))
+            .collect()
+    });
+
+    if !errors_tally.is_empty() {
+        print_table("front end (ERROR cases)", &errors_tally);
+    }
+    let mut skipped = Vec::new();
+    for report in reports {
+        match &report.skipped {
+            Some(reason) => {
+                eprintln!("\n  {}: skipped ({})", report.name, reason);
+                skipped.push(format!("{}: {}", report.name, reason));
             }
-        };
-        match (result, &case.xfail) {
-            (Ok(()), None) => {
-                counts[0] += 1;
-                eprintln!("  ok    {}", case.name);
-            }
-            (Err(_), Some(reason)) => {
-                counts[1] += 1;
-                eprintln!("  xfail {} ({})", case.name, reason);
-            }
-            (Ok(()), Some(reason)) => {
-                counts[2] += 1;
-                eprintln!("  XPASS {}", case.name);
-                failures.push(format!(
-                    "[{}] passes but is marked XFAIL ({}); remove the directive",
-                    case.name, reason
-                ));
-            }
-            (Err(message), None) => {
-                counts[2] += 1;
-                eprintln!("  FAIL  {}", case.name);
-                failures.push(format!("[{}] {}", case.name, message));
-            }
+            None => print_table(&report.name, &report.tally),
         }
+        failures.extend(report.failures);
     }
-    eprintln!(
-        "\n  {:<10} {:>5} {:>6} {:>5}",
-        "category", "pass", "xfail", "fail"
-    );
-    let mut total = [0usize; 3];
-    for (category, counts) in &tally {
-        eprintln!(
-            "  {:<10} {:>5} {:>6} {:>5}",
-            category, counts[0], counts[1], counts[2]
-        );
-        for i in 0..3 {
-            total[i] += counts[i];
-        }
-    }
-    eprintln!(
-        "  {:<10} {:>5} {:>6} {:>5}\n",
-        "total", total[0], total[1], total[2]
-    );
-    if skipped > 0 {
-        eprintln!("golden_programs: {} case(s) skipped", skipped);
-    }
+    eprintln!();
+
     // Restore the default hook so the summary below is printed.
     let _ = std::panic::take_hook();
+    if !skipped.is_empty() && env("TACHYON_REQUIRE_RUN").as_deref() == Some("1") {
+        panic!("cannot run golden programs:\n{}", skipped.join("\n"));
+    }
     assert!(
         failures.is_empty(),
-        "{} of {} golden program(s) failed:\n\n{}",
+        "{} golden program run(s) failed:\n\n{}",
         failures.len(),
-        cases.len(),
         failures.join("\n\n")
     );
 }
