@@ -32,8 +32,28 @@ binary is invoked, where its test runner is and which hosts it supports.
 |---|---|---|---|---|
 | seed | `seed` | Rust 1.98.0 | aarch64-macos, x86_64-macos, x86_64-linux | the language, and its Rust implementation with a Cranelift backend |
 | 0.1.0 | `v0.1.0` | seed | aarch64-macos, x86_64-linux, x86_64-macos | the compiler in tachyon: the seed's whole language, compiled to AArch64 (Apple's arm64 ABI) and x86-64 (System V, ELF and Mach-O) assembly; a test suite run without cargo |
+| 0.2.0 | `v0.2.0` | 0.1.0 | aarch64-macos, x86_64-linux, x86_64-macos | the optimizer: SSA IR, SCCP, instruction combining, GVN, LICM, inlining, linear-scan register allocation; `-O0`/`-O1`/`-O2` (default `-O2`); random differential testing; `bench/` |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.2
+
+The language is unchanged (every 0.1 program compiles and means the same).
+The compiler gained a middle end and a register-allocating back end,
+described in [optimizer.md](optimizer.md):
+
+- `-O0` is the 0.1 code generator; `-O1` lowers to an SSA IR and runs SCCP,
+  instruction combining, CFG simplification, GVN with load and store
+  forwarding, and dead code elimination, then allocates registers by linear
+  scan; `-O2`, the default, adds inlining and loop-invariant code motion.
+- `--emit-ir`, `--verify-ir` and `--print-after-all` show and check the IR.
+- One fix that is visible: `main` without a result type now exits with 0
+  (it exited with whatever was left in the result register).
+- Tests: `tests/run.sh -O LEVEL`, IR checks (`// CHECK:`, `// CHECK-NOT:`,
+  `// CHECK-OPT:`), random differential testing (`tests/fuzz/run.sh`).
+- `bench/run.sh` times programs at every level against the previous
+  release, the seed and C (`cc -O2`); results are in
+  [roadmap.md](roadmap.md#benchmarks).
 
 ## Hosts
 
@@ -97,12 +117,12 @@ A new feature is therefore adopted in two releases:
 
 ## Cutting a release
 
-Say the last release is 0.1.0 and you have implemented a feature on main.
+Say the last release is 0.2.0 and you have implemented a feature on main.
 
 1. Check the source rule: the compiler in `compiler/src` must still build
    with the previous release:
    ```
-   $ bootstrap/bootstrap.sh            # builds the seed and 0.1.0, then HEAD with it
+   $ bootstrap/bootstrap.sh            # builds the seed, 0.1.0 and 0.2.0, then HEAD with 0.2.0
    ```
 2. Add the tests for the new behaviour to `tests/` (`tests/run/*.tach` with
    `// EXPECT:` ... directives; see `tests/run.sh`), and examples if useful.
@@ -111,14 +131,14 @@ Say the last release is 0.1.0 and you have implemented a feature on main.
 4. Add the release to `bootstrap/releases.toml`:
    ```toml
    [[release]]
-   version = "0.2.0"
-   tag = "v0.2.0"
+   version = "0.3.0"
+   tag = "v0.3.0"
    compiler = "compiler/src"
-   built_by = "0.1.0"
+   built_by = "0.2.0"
    cli = "tachyonc-0.1"
    tests = "tests/run.sh"
    hosts = ["aarch64-macos", "x86_64-linux", "x86_64-macos"]
-   summary = "What 0.2.0 introduced."
+   summary = "What 0.3.0 introduced."
    ```
    and a row to the table above.
 5. Run the whole chain with the new entry, in working-tree mode (the tag
@@ -128,9 +148,9 @@ Say the last release is 0.1.0 and you have implemented a feature on main.
    $ bootstrap/bootstrap.sh --worktree --dev
    $ bootstrap/linux-check.sh --worktree --dev       # x86_64-linux, in a container
    ```
-   Then commit, and tag the commit: `git tag v0.2.0`. From now on,
-   `bootstrap/bootstrap.sh` builds the seed, 0.1.0, then 0.2.0 from its
-   tag, then HEAD.
+   Then commit, and tag the commit: `git tag v0.3.0`. From now on,
+   `bootstrap/bootstrap.sh` builds the seed, 0.1.0, 0.2.0, then 0.3.0 from
+   its tag, then HEAD.
 6. Now (and not before) the compiler's source may use the new feature.
 
 If a release changes how its binary is invoked or what it emits (another
@@ -170,6 +190,9 @@ $ cc -arch arm64 -o tachyonc tachyonc.s -lm
 $ tests/run.sh -c ./tachyonc                            # the test suite, for the host
 $ tests/run.sh -c ./tachyonc prog_                      # only cases named *prog_*
 $ tests/run.sh -c ./tachyonc -t x86_64-macos            # x86-64, under Rosetta
+$ tests/run.sh -c ./tachyonc -O 0                       # at another optimization level
+$ tests/fuzz/run.sh -c ./tachyonc -n 500                # random programs, -O0 vs -O1 vs -O2
+$ bench/run.sh -c ./tachyonc                            # benchmarks
 ```
 
 and on x86_64-linux:
@@ -186,7 +209,9 @@ same on every host, so a compiler can cross-compile itself.
 
 `tests/run.sh` is a POSIX shell script: it needs the compiler and `cc`, not
 cargo. Its directives (`// EXPECT:`, `// EXIT:`, `// ARGS:`, `// STDIN:`,
-`// ERROR:`, `// XFAIL:`, `// XFAIL(<target>):`) are described at its top.
+`// ERROR:`, `// XFAIL:`, `// XFAIL(<target>):`, `// CHECK:`,
+`// CHECK-NOT:`, `// CHECK-OPT:`) are described at its top. A release's
+suite must pass at every optimization level.
 
 The seed keeps its own tests, run with cargo:
 
@@ -216,7 +241,8 @@ $ bootstrap/bootstrap.sh
 
 This builds the seed from the `seed` tag with cargo, builds 0.1.0 (from
 `v0.1.0`) with the seed, checks 0.1.0's fixpoint, runs 0.1.0's test suite,
-does the same for every later release, and finally for HEAD. It prints a
+does the same for every later release (0.2.0 is built by 0.1.0), and
+finally for HEAD. It prints a
 summary and leaves the HEAD compiler in `target/tachyonc`.
 
 To check the Linux chain from any machine with docker:
@@ -224,6 +250,7 @@ To check the Linux chain from any machine with docker:
 ```
 $ bootstrap/linux-check.sh                   # HEAD and the tags, from a fresh clone
 $ bootstrap/linux-check.sh --seed-tests      # also the seed's cargo tests on Linux
+$ bootstrap/linux-check.sh --all-levels --fuzz=200   # also -O0/-O1/-O2 and random programs
 ```
 
 It builds a minimal Debian image (`bootstrap/ci/linux-x86_64.Dockerfile`:

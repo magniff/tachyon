@@ -4,12 +4,14 @@
 # compiled, assembled and linked with the C compiler, run, and checked.
 # POSIX sh and awk only, so it runs the same on macOS and Linux.
 #
-# usage: tests/run.sh [-c COMPILER] [-t TARGET] [FILTER]
+# usage: tests/run.sh [-c COMPILER] [-t TARGET] [-O LEVEL] [FILTER]
 #
 #   -c COMPILER   the tachyonc binary to test (default: target/tachyonc,
 #                 as left by bootstrap/bootstrap.sh)
 #   -t TARGET     aarch64-macos, x86_64-linux or x86_64-macos (default: the
 #                 host; x86_64-macos runs under Rosetta on Apple silicon)
+#   -O LEVEL      the optimization level (0, 1 or 2; default: the
+#                 compiler's default)
 #   FILTER        run only the cases whose name contains FILTER
 #
 # Environment: CC is the assembler/linker (default cc).
@@ -26,6 +28,11 @@
 #   // XFAIL(T): reason  the same, only for target T
 #   // SOURCE: path      (.test files) the program, relative to the root
 #   // BUILD: reason     (.test files) only compile and link it
+#   // CHECK: text       the optimized IR (--emit-ir) has a line containing
+#                        text, after the previous CHECK's line
+#   // CHECK-NOT: text   no line containing text between the neighbouring
+#                        CHECKs' lines (or the start and end)
+#   // CHECK-OPT: n      the level for the CHECKs (default 2)
 # Stdout is compared after removing trailing whitespace. Each program may
 # run for 20 seconds.
 
@@ -37,10 +44,11 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 COMPILER="$ROOT/target/tachyonc"
 CC=${CC:-cc}
 TARGET=""
+OPT=""
 TIMEOUT=20
 
 usage() {
-    sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' >&2
+    sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' >&2
     exit 2
 }
 
@@ -48,6 +56,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         -c) [ $# -ge 2 ] || usage; COMPILER=$2; shift 2 ;;
         -t) [ $# -ge 2 ] || usage; TARGET=$2; shift 2 ;;
+        -O) [ $# -ge 2 ] || usage; OPT="-O$2"; shift 2 ;;
         -h|--help) usage ;;
         -*) usage ;;
         *) break ;;
@@ -109,6 +118,9 @@ read_directives() {
             else if (key == "XFAIL" || key == "XFAIL(" target ")") xfail = value
             else if (key == "SOURCE") source = value
             else if (key == "BUILD") build = 1
+            else if (key == "CHECK") checks = checks "+" value "\n"
+            else if (key == "CHECK-NOT") checks = checks "-" value "\n"
+            else if (key == "CHECK-OPT") checkopt = value
         }
         END {
             printf "%s", args > (dir "/args")
@@ -119,6 +131,8 @@ read_directives() {
             printf "%s", xfail > (dir "/xfail")
             printf "%s", source > (dir "/source")
             printf "%d", build > (dir "/build")
+            printf "%s", checks > (dir "/checks")
+            printf "%s", (checkopt == "" ? "2" : checkopt) > (dir "/checkopt")
         }
     ' "$1"
 }
@@ -157,7 +171,7 @@ check_case() {
         source=$file
     fi
     if [ -s "$dir/errors" ]; then
-        "$COMPILER" --target "$TARGET" "$source" -o "$dir/prog.s" >"$dir/compile.out" 2>&1
+        "$COMPILER" --target "$TARGET" $OPT "$source" -o "$dir/prog.s" >"$dir/compile.out" 2>&1
         rc=$?
         if [ $rc -ne 1 ]; then
             { echo "expected a compile error (exit code 1), got exit code $rc:"; cat "$dir/compile.out"; } >"$dir/why"
@@ -171,7 +185,10 @@ check_case() {
         done <"$dir/errors"
         return 0
     fi
-    if ! "$COMPILER" --target "$TARGET" "$source" -o "$dir/prog.s" >"$dir/compile.out" 2>&1; then
+    if [ -s "$dir/checks" ] && ! check_ir "$source" "$dir"; then
+        return 1
+    fi
+    if ! "$COMPILER" --target "$TARGET" $OPT "$source" -o "$dir/prog.s" >"$dir/compile.out" 2>&1; then
         { echo "compile failed:"; cat "$dir/compile.out"; } >"$dir/why"
         return 1
     fi
@@ -198,6 +215,39 @@ check_case() {
         return 1
     fi
     return 0
+}
+
+# Matches the CHECK directives against the optimized IR of $1.
+check_ir() {
+    if ! "$COMPILER" --target "$TARGET" "-O$(cat "$2/checkopt")" --verify-ir --emit-ir "$1" -o "$2/ir.txt" >"$2/compile.out" 2>&1; then
+        { echo "--emit-ir failed:"; cat "$2/compile.out"; } >"$2/why"
+        return 1
+    fi
+    awk -v checks="$2/checks" '
+        { line[NR] = $0 }
+        END {
+            n = 0
+            while ((getline c < checks) > 0) { kind[n] = substr(c, 1, 1); text[n] = substr(c, 2); n++ }
+            pos = 0
+            nots = 0
+            for (i = 0; i < n; i++) {
+                if (kind[i] == "-") { pending[nots++] = text[i]; continue }
+                found = 0
+                for (j = pos + 1; j <= NR; j++) if (index(line[j], text[i])) { found = j; break }
+                if (!found) { print "CHECK not found after line " pos ": " text[i]; exit 1 }
+                for (k = 0; k < nots; k++)
+                    for (j = pos + 1; j < found; j++)
+                        if (index(line[j], pending[k])) { print "CHECK-NOT found at line " j ": " pending[k]; exit 1 }
+                nots = 0
+                pos = found
+            }
+            for (k = 0; k < nots; k++)
+                for (j = pos + 1; j <= NR; j++)
+                    if (index(line[j], pending[k])) { print "CHECK-NOT found at line " j ": " pending[k]; exit 1 }
+        }
+    ' "$2/ir.txt" >"$2/check.out" 2>&1 && return 0
+    { cat "$2/check.out"; echo "--- IR:"; cat "$2/ir.txt"; } >"$2/why"
+    return 1
 }
 
 count=0

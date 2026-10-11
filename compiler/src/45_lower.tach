@@ -1,0 +1,1054 @@
+// Lowering: the checked AST to the IR of 44_ir.tach, building SSA form on
+// the fly (Braun, Buchwald, Hack, Leißa, Mallon, Zwinkau: "Simple and
+// Efficient Construction of Static Single Assignment Form", CC 2013).
+//
+// SSA variables are the scalar locals whose address is never taken (the
+// others live in frame slots), and synthetic variables for the values of
+// `if`, `&&`/`||`, `loop` with `break` values and loop counters. A block
+// is sealed once all its predecessors are known; reading a variable in an
+// unsealed block makes an incomplete phi, completed when the block is
+// sealed. Structured control flow makes the sealing points obvious.
+//
+// Semantics are those of the 0.1 code generator (40_gen.tach): the same
+// evaluation order, the same calling convention (compound arguments are
+// passed as a pointer to a private copy, compound results through a
+// result pointer), and the same arithmetic.
+
+// An open-addressing hash map from i64 keys (never 0) to i64 values.
+struct HMap { keys: *i64, vals: *i64, size: i64, count: i64 }
+
+fn hmap_slot(m: *HMap, key: i64) -> i64 {
+    let mask = (*m).size - 1;
+    let mut slot = ((key as u64 * 11400714819323198485) >> 20) as i64 & mask;
+    while (*m).keys[slot] != 0 && (*m).keys[slot] != key {
+        slot = (slot + 1) & mask;
+    }
+    slot
+}
+
+fn hmap_get(m: *HMap, key: i64) -> i64 {
+    if (*m).size == 0 {
+        return 0;
+    }
+    let slot = hmap_slot(m, key);
+    if (*m).keys[slot] == key { (*m).vals[slot] } else { 0 }
+}
+
+fn hmap_put(m: *HMap, key: i64, value: i64) {
+    if ((*m).count + 1) * 2 > (*m).size {
+        hmap_rehash(m);
+    }
+    let slot = hmap_slot(m, key);
+    if (*m).keys[slot] == 0 {
+        (*m).count += 1;
+        (*m).keys[slot] = key;
+    }
+    (*m).vals[slot] = value;
+}
+
+fn hmap_rehash(m: *HMap) {
+    let old_keys = (*m).keys;
+    let old_vals = (*m).vals;
+    let old_size = (*m).size;
+    let mut size = old_size * 2;
+    if size < 256 {
+        size = 256;
+    }
+    (*m).keys = alloc_zeroed(size * 8) as *i64;
+    (*m).vals = alloc_zeroed(size * 8) as *i64;
+    (*m).size = size;
+    (*m).count = 0;
+    for i in 0..old_size {
+        if old_keys[i] != 0 {
+            hmap_put(m, old_keys[i], old_vals[i]);
+        }
+    }
+    if old_size > 0 {
+        free(old_keys as *u8);
+        free(old_vals as *u8);
+    }
+}
+
+fn hmap_clear(m: *HMap) {
+    if (*m).size > 0 {
+        memset((*m).keys as *u8, 0, ((*m).size * 8) as u64);
+    }
+    (*m).count = 0;
+}
+
+// ---- SSA construction ----
+
+// The current definition of each variable in each block: key
+// (var + 1) << 32 | block.
+static mut DEFS: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+// Incomplete phis: triples (var, phi, next) linked from Block.incomplete
+// (index + 1).
+static mut INCOMPLETE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// Scratch stack for phi operands and call arguments.
+static mut SSA_STACK: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// Types of the synthetic variables (variable LOCAL_COUNT + i).
+static mut SYNTH_TY: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// Per local: whether it is an SSA variable, and the address of its
+// storage otherwise.
+static mut PROMOTE: *i64 = 0 as *i64;
+static mut LOCAL_ADDR: *i64 = 0 as *i64;
+// Per loop (NODES[loop].z): continue block, exit block, break variable.
+static mut LOOP_INFO: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+fn def_key(var: i64, b: i64) -> i64 {
+    ((var + 1) << 32) | b
+}
+
+fn var_type(var: i64) -> i64 {
+    if var < LOCAL_COUNT {
+        return ir_type(LOCALS[var].ty);
+    }
+    SYNTH_TY.data[var - LOCAL_COUNT]
+}
+
+fn new_synth_var(ty: i64) -> i64 {
+    intvec_push(&SYNTH_TY, ty);
+    LOCAL_COUNT + SYNTH_TY.count - 1
+}
+
+fn ssa_write(var: i64, b: i64, value: i64) {
+    hmap_put(&DEFS, def_key(var, b), value);
+}
+
+fn ssa_read(var: i64, b: i64) -> i64 {
+    let v = hmap_get(&DEFS, def_key(var, b));
+    if v != 0 {
+        return ir_val(v);
+    }
+    ssa_read_recursive(var, b)
+}
+
+// An undefined value of type `ty`: 0, placed in the entry block.
+fn ssa_undef(ty: i64) -> i64 {
+    let v = ir_make(OP_CONST, ty, 0, 0, 0);
+    ir_prepend(IRFUNCS[IRF].entry, v);
+    v
+}
+
+fn new_phi(var: i64, b: i64) -> i64 {
+    let phi = ir_make(OP_PHI, var_type(var), 0, 0, 0);
+    ir_prepend(b, phi);
+    phi
+}
+
+fn ssa_read_recursive(var: i64, b: i64) -> i64 {
+    let mut value = 0;
+    let preds = BLOCKS[b].preds.count;
+    if BLOCKS[b].sealed == 0 {
+        value = new_phi(var, b);
+        intvec_push(&INCOMPLETE, var);
+        intvec_push(&INCOMPLETE, value);
+        intvec_push(&INCOMPLETE, BLOCKS[b].incomplete);
+        BLOCKS[b].incomplete = INCOMPLETE.count / 3;
+    } else if preds == 1 {
+        value = ssa_read(var, BLOCKS[b].preds.data[0]);
+    } else if preds == 0 {
+        value = ssa_undef(var_type(var));
+    } else {
+        let phi = new_phi(var, b);
+        ssa_write(var, b, phi);
+        value = add_phi_operands(var, phi);
+    }
+    ssa_write(var, b, value);
+    value
+}
+
+fn add_phi_operands(var: i64, phi: i64) -> i64 {
+    let b = INSTS[phi].block;
+    let mark = SSA_STACK.count;
+    for i in 0..BLOCKS[b].preds.count {
+        let pred = BLOCKS[b].preds.data[i];
+        let value = ssa_read(var, pred);
+        intvec_push(&SSA_STACK, value);
+    }
+    let count = SSA_STACK.count - mark;
+    INSTS[phi].args = ARGS.count;
+    INSTS[phi].nargs = count;
+    for i in 0..count {
+        intvec_push(&ARGS, SSA_STACK.data[mark + i]);
+        intvec_push(&ARGTY, 0);
+    }
+    SSA_STACK.count = mark;
+    try_remove_trivial_phi(phi)
+}
+
+// A phi whose operands are all the same value (or itself) is that value.
+fn try_remove_trivial_phi(phi: i64) -> i64 {
+    let mut same = 0;
+    for i in 0..INSTS[phi].nargs {
+        let operand = ir_val(ir_arg(phi, i));
+        if operand == same || operand == phi {
+            continue;
+        }
+        if same != 0 {
+            return phi;
+        }
+        same = operand;
+    }
+    if same == 0 {
+        same = ssa_undef(INSTS[phi].ty);
+    }
+    ir_replace(phi, same);
+    same
+}
+
+fn ir_seal(b: i64) {
+    let mut entry = BLOCKS[b].incomplete;
+    while entry != 0 {
+        let at = (entry - 1) * 3;
+        let var = INCOMPLETE.data[at];
+        let phi = INCOMPLETE.data[at + 1];
+        add_phi_operands(var, phi);
+        entry = INCOMPLETE.data[at + 2];
+    }
+    BLOCKS[b].incomplete = 0;
+    BLOCKS[b].sealed = 1;
+}
+
+// ---- Blocks during lowering ----
+
+// A block that no edge reaches (code after `return`, `break`, ...).
+fn is_dead_block(b: i64) -> bool {
+    BLOCKS[b].sealed != 0 && BLOCKS[b].preds.count == 0 && b != IRFUNCS[IRF].entry
+}
+
+fn start_dead_block() {
+    let b = ir_new_block();
+    BLOCKS[b].sealed = 1;
+    CUR = b;
+}
+
+// Ends the current block with a jump (no edge from a dead block).
+fn lower_jump(target: i64) {
+    if is_dead_block(CUR) {
+        ir_terminate(CUR, TERM_UNREACH, 0, 0, 0);
+    } else {
+        ir_terminate(CUR, TERM_JUMP, 0, target, 0);
+    }
+}
+
+fn lower_branch(cond: i64, if_true: i64, if_false: i64) {
+    if is_dead_block(CUR) {
+        ir_terminate(CUR, TERM_UNREACH, 0, 0, 0);
+    } else {
+        ir_terminate(CUR, TERM_BRANCH, cond, if_true, if_false);
+    }
+}
+
+// ---- The program ----
+
+// Lowers every function to IR.
+fn lower_program(program: i64) {
+    init_ir();
+    PROMOTE = alloc_zeroed((LOCAL_COUNT + 1) * 8) as *i64;
+    LOCAL_ADDR = alloc_zeroed((LOCAL_COUNT + 1) * 8) as *i64;
+    for local in 0..LOCAL_COUNT {
+        let ty = LOCALS[local].ty;
+        PROMOTE[local] = if is_void(ty) || is_compound(ty) { 0 } else { 1 };
+    }
+    // A local whose address is taken lives in memory.
+    for n in 1..NODE_COUNT {
+        if NODES[n].kind == E_UNARY && NODES[n].a == TK_AMP {
+            let operand = NODES[n].b;
+            if NODES[operand].kind == E_IDENT && NODES[operand].x == R_LOCAL {
+                PROMOTE[NODES[operand].y] = 0;
+            }
+        }
+    }
+    for i in 0..NODES[program].count {
+        let item = child(program, i);
+        if NODES[item].kind == I_FN {
+            lower_function(item);
+        }
+    }
+}
+
+fn lower_function(item: i64) {
+    let f = SYM_FN[NODES[item].a] - 1;
+    IRF = ir_new_func(f, item);
+    hmap_clear(&DEFS);
+    let entry = ir_new_block();
+    IRFUNCS[IRF].entry = entry;
+    BLOCKS[entry].sealed = 1;
+    CUR = entry;
+    let ret = FNS[f].ret;
+    if is_compound(ret) {
+        IRFUNCS[IRF].result_ptr = emit_ir(OP_PARAM, TY_U64, 0, 0, -1);
+    }
+    for i in 0..FNS[f].param_count {
+        let ty = fn_param(f, i);
+        let local = NODES[child(item, i)].x;
+        if is_void(ty) || local < 0 {
+            continue;
+        }
+        let param = emit_ir(OP_PARAM, ir_type(ty), 0, 0, i);
+        // A compound parameter points to the caller's private copy.
+        bind_local(local, param, ty, true);
+    }
+    let body = NODES[item].c;
+    let value = lower_block(body);
+    if NODES[body].ty != TY_NEVER {
+        lower_return(value);
+    }
+    if BLOCKS[CUR].term == 0 {
+        ir_terminate(CUR, TERM_UNREACH, 0, 0, 0);
+    }
+}
+
+fn lower_return(value: i64) {
+    let f = IRFUNCS[IRF].f;
+    let ret = FNS[f].ret;
+    let mut result = 0;
+    if is_compound(ret) {
+        lower_copy(IRFUNCS[IRF].result_ptr, value, size_of(ret));
+    } else if is_void(ret) {
+        // `main` without a result exits with 0.
+        if FNS[f].name == MAIN_SYM {
+            result = ir_const(0, TY_I64);
+        }
+    } else {
+        result = need_value(value, ret);
+    }
+    if !is_dead_block(CUR) {
+        ir_terminate(CUR, TERM_RET, result, 0, 0);
+    } else {
+        ir_terminate(CUR, TERM_UNREACH, 0, 0, 0);
+    }
+    start_dead_block();
+}
+
+// ---- Statements and bindings ----
+
+fn lower_block(block: i64) -> i64 {
+    for i in 0..NODES[block].count {
+        let stmt = child(block, i);
+        if NODES[stmt].kind == S_LET {
+            lower_let(stmt);
+        } else {
+            lower_expr(NODES[stmt].a);
+        }
+    }
+    if NODES[block].a != 0 {
+        return lower_expr(NODES[block].a);
+    }
+    0
+}
+
+// Expressions whose compound value is a new temporary, which a binding or
+// an argument may take over without copying.
+fn is_fresh(n: i64) -> bool {
+    let kind = NODES[n].kind;
+    kind == E_STRUCT || kind == E_TUPLE || kind == E_ARRAY || kind == E_REPEAT
+        || kind == E_CALL || kind == E_STR
+}
+
+fn lower_let(stmt: i64) {
+    let init = NODES[stmt].c;
+    let value = lower_expr(init);
+    if NODES[init].ty == TY_NEVER {
+        return;
+    }
+    bind_pattern_ir(NODES[stmt].a, value, is_fresh(init));
+}
+
+fn bind_pattern_ir(pattern: i64, value: i64, fresh: bool) {
+    let kind = NODES[pattern].kind;
+    let ty = NODES[pattern].ty;
+    if kind == P_WILD || ty == TY_NEVER {
+        return;
+    }
+    if kind == P_BIND {
+        bind_local(NODES[pattern].x, value, ty, fresh);
+        return;
+    }
+    for i in 0..NODES[pattern].count {
+        let elem_ty = type_elem(ty, i);
+        let offset = tuple_offset(ty, i);
+        let mut elem = 0;
+        if is_compound(elem_ty) {
+            elem = ir_offset(value, offset);
+        } else if !is_void(elem_ty) {
+            elem = ir_load(ir_type(elem_ty), value, offset);
+        }
+        bind_pattern_ir(child(pattern, i), elem, false);
+    }
+}
+
+// Binds local `local` (of type `ty`) to `value` (the address of a compound
+// value, taken over when `fresh`).
+fn bind_local(local: i64, value: i64, ty: i64, fresh: bool) {
+    if is_void(ty) {
+        return;
+    }
+    if PROMOTE[local] != 0 {
+        ssa_write(local, CUR, need_value(value, ty));
+        return;
+    }
+    if is_compound(ty) && fresh {
+        LOCAL_ADDR[local] = value;
+        return;
+    }
+    let addr = ir_slot_addr(ir_new_slot(size_of(ty), align_of(ty)));
+    if is_compound(ty) {
+        lower_copy(addr, value, size_of(ty));
+    } else {
+        ir_store(ir_type(ty), addr, need_value(value, ty), 0);
+    }
+    LOCAL_ADDR[local] = addr;
+}
+
+// Copies `size` bytes from `src` to `dst`.
+fn lower_copy(dst: i64, src: i64, size: i64) {
+    if size == 0 {
+        return;
+    }
+    if size <= INLINE_COPY_MAX {
+        let v = emit_ir(OP_COPY, 0, dst, src, size);
+        INSTS[v].imm2 = 0;
+        return;
+    }
+    let mark = SSA_STACK.count;
+    push_arg(dst, TY_U64);
+    push_arg(src, TY_U64);
+    push_arg(ir_const(size, TY_U64), TY_U64);
+    let call = emit_ir(OP_CALLC, 0, 0, 0, intern_c(c"memcpy"));
+    take_args(call, mark);
+}
+
+// ---- Expressions ----
+
+// `value`, or an undefined value of type `ty` when there is none (in code
+// after a diverging expression).
+fn need_value(value: i64, ty: i64) -> i64 {
+    if value != 0 || is_void(ty) {
+        return value;
+    }
+    ssa_undef(ir_type(ty))
+}
+
+fn lower_operand(n: i64) -> i64 {
+    need_value(lower_expr(n), NODES[n].ty)
+}
+
+fn load_scalar(addr: i64, ty: i64) -> i64 {
+    if is_compound(ty) {
+        return addr;
+    }
+    if is_void(ty) {
+        return 0;
+    }
+    ir_load(ir_type(ty), addr, 0)
+}
+
+fn lower_expr(n: i64) -> i64 {
+    let value = lower_expr_inner(n);
+    if NODES[n].ty == TY_NEVER {
+        if !is_dead_block(CUR) {
+            ir_terminate(CUR, TERM_UNREACH, 0, 0, 0);
+            start_dead_block();
+        }
+        return 0;
+    }
+    value
+}
+
+fn lower_expr_inner(n: i64) -> i64 {
+    let kind = NODES[n].kind;
+    let ty = NODES[n].ty;
+    if kind == E_INT || kind == E_CHAR {
+        return ir_const(wrap_int(NODES[n].a, ty), ir_type(ty));
+    }
+    if kind == E_FLOAT {
+        return ir_const(float_const(f64_of_bits(NODES[n].a), ty), ty);
+    }
+    if kind == E_BOOL {
+        return ir_const(NODES[n].a, TY_BOOL);
+    }
+    if kind == E_UNIT {
+        return 0;
+    }
+    if kind == E_STR {
+        return lower_string(n);
+    }
+    if kind == E_CSTR {
+        return emit_ir(OP_SADDR, TY_U64, 0, 0, NODES[n].a);
+    }
+    if kind == E_IDENT {
+        return lower_ident(n);
+    }
+    if kind == E_BINARY {
+        return lower_binary(n);
+    }
+    if kind == E_UNARY {
+        return lower_unary(n);
+    }
+    if kind == E_CAST {
+        let operand = NODES[n].a;
+        let value = lower_expr(operand);
+        return lower_cast(value, NODES[operand].ty, ty);
+    }
+    if kind == E_CALL {
+        return lower_call(n);
+    }
+    if kind == E_INDEX || kind == E_FIELD || kind == E_TUPLE_FIELD {
+        return load_scalar(lower_addr(n), ty);
+    }
+    if kind == E_TUPLE || kind == E_ARRAY || kind == E_STRUCT {
+        return lower_aggregate(n);
+    }
+    if kind == E_REPEAT {
+        return lower_repeat(n);
+    }
+    if kind == E_BLOCK {
+        return lower_block(n);
+    }
+    if kind == E_IF {
+        return lower_if(n);
+    }
+    if kind == E_LOOP || kind == E_WHILE {
+        return lower_loop(n);
+    }
+    if kind == E_FOR {
+        lower_for(n);
+        return 0;
+    }
+    if kind == E_ASSIGN {
+        lower_assign(n);
+        return 0;
+    }
+    if kind == E_RETURN {
+        let mut value = 0;
+        if NODES[n].a != 0 {
+            value = lower_expr(NODES[n].a);
+        }
+        lower_return(value);
+        return 0;
+    }
+    if kind == E_BREAK {
+        lower_break(n);
+        return 0;
+    }
+    if kind == E_CONTINUE {
+        let info = NODES[NODES[n].x].z;
+        lower_jump(LOOP_INFO.data[info]);
+        start_dead_block();
+        return 0;
+    }
+    type_error(n, c"internal error: unexpected node in IR lowering")
+}
+
+fn lower_string(n: i64) -> i64 {
+    let base = ir_slot_addr(ir_new_slot(16, 8));
+    ir_store(TY_U64, base, emit_ir(OP_SADDR, TY_U64, 0, 0, NODES[n].a), 0);
+    ir_store(TY_U64, base, ir_const(STRS[NODES[n].a].len, TY_U64), 8);
+    base
+}
+
+fn lower_ident(n: i64) -> i64 {
+    let ty = NODES[n].ty;
+    let resolution = NODES[n].x;
+    let index = NODES[n].y;
+    if resolution == R_LOCAL {
+        if is_void(ty) {
+            return 0;
+        }
+        if PROMOTE[index] != 0 {
+            return ssa_read(index, CUR);
+        }
+        return load_scalar(LOCAL_ADDR[index], ty);
+    }
+    if resolution == R_CONST {
+        return ir_const(const_value(index), ir_type(ty));
+    }
+    if resolution == R_STATIC {
+        return load_scalar(emit_ir(OP_GADDR, TY_U64, 0, 0, NODES[n].a), ty);
+    }
+    emit_ir(OP_FADDR, TY_U64, 0, 0, index)
+}
+
+// The address of a place (or of a compound value).
+fn lower_addr(n: i64) -> i64 {
+    let kind = NODES[n].kind;
+    if kind == E_IDENT && NODES[n].x == R_LOCAL {
+        let local = NODES[n].y;
+        if PROMOTE[local] != 0 {
+            type_error(n, c"internal error: address of an SSA variable");
+        }
+        return LOCAL_ADDR[local];
+    }
+    if kind == E_IDENT && NODES[n].x == R_STATIC {
+        return emit_ir(OP_GADDR, TY_U64, 0, 0, NODES[n].a);
+    }
+    if kind == E_UNARY && NODES[n].a == TK_STAR {
+        return lower_operand(NODES[n].b);
+    }
+    if kind == E_FIELD {
+        let base = NODES[n].a;
+        let addr = lower_operand(base);
+        return ir_offset(addr, field_offset(TYPES[NODES[base].ty].a, NODES[n].x));
+    }
+    if kind == E_TUPLE_FIELD {
+        let base = NODES[n].a;
+        let addr = lower_operand(base);
+        return ir_offset(addr, tuple_offset(NODES[base].ty, NODES[n].b));
+    }
+    if kind == E_INDEX {
+        let base = NODES[n].a;
+        let elem_size = size_of(TYPES[NODES[base].ty].a);
+        let addr = lower_operand(base);
+        let index = lower_operand(NODES[n].b);
+        let mut scaled = index;
+        if elem_size != 1 {
+            scaled = ir_binary(OP_MUL, TY_U64, index, ir_const(elem_size, TY_U64));
+        }
+        return ir_binary(OP_ADD, TY_U64, addr, scaled);
+    }
+    lower_operand(n)
+}
+
+// ---- Operators ----
+
+fn arith_op(token: i64) -> i64 {
+    if token == TK_PLUS { return OP_ADD; }
+    if token == TK_MINUS { return OP_SUB; }
+    if token == TK_STAR { return OP_MUL; }
+    if token == TK_SLASH { return OP_DIV; }
+    if token == TK_PERCENT { return OP_REM; }
+    if token == TK_AMP { return OP_AND; }
+    if token == TK_PIPE { return OP_OR; }
+    if token == TK_CARET { return OP_XOR; }
+    if token == TK_SHL { return OP_SHL; }
+    OP_SHR
+}
+
+// a <token> b, for operands of type `operand_ty` and a result of type `ty`.
+fn lower_operator(token: i64, operand_ty: i64, ty: i64, a: i64, b: i64) -> i64 {
+    if is_comparison(token) {
+        return ir_cmp(token, ir_type(operand_ty), a, b);
+    }
+    if is_float(ty) && token == TK_PERCENT {
+        let mark = SSA_STACK.count;
+        push_arg(a, ty);
+        push_arg(b, ty);
+        let call = emit_ir(OP_CALLC, ty, 0, 0, intern_c(if ty == TY_F32 { c"fmodf" } else { c"fmod" }));
+        take_args(call, mark);
+        return call;
+    }
+    ir_binary(arith_op(token), ir_type(ty), a, b)
+}
+
+fn lower_binary(n: i64) -> i64 {
+    let op = NODES[n].a;
+    let lhs = NODES[n].b;
+    let rhs = NODES[n].c;
+    if op == TK_AMP_AMP || op == TK_PIPE_PIPE {
+        return lower_short_circuit(op, lhs, rhs);
+    }
+    let a = lower_operand(lhs);
+    let b = lower_operand(rhs);
+    lower_operator(op, NODES[lhs].ty, NODES[n].ty, a, b)
+}
+
+fn lower_short_circuit(op: i64, lhs: i64, rhs: i64) -> i64 {
+    let result = new_synth_var(TY_BOOL);
+    let a = lower_operand(lhs);
+    ssa_write(result, CUR, a);
+    let rhs_block = ir_new_block();
+    let join = ir_new_block();
+    if op == TK_AMP_AMP {
+        lower_branch(a, rhs_block, join);
+    } else {
+        lower_branch(a, join, rhs_block);
+    }
+    ir_seal(rhs_block);
+    CUR = rhs_block;
+    let b = lower_operand(rhs);
+    ssa_write(result, CUR, b);
+    lower_jump(join);
+    ir_seal(join);
+    CUR = join;
+    ssa_read(result, join)
+}
+
+fn lower_unary(n: i64) -> i64 {
+    let op = NODES[n].a;
+    let operand = NODES[n].b;
+    let ty = NODES[n].ty;
+    if op == TK_AMP {
+        return lower_addr(operand);
+    }
+    let value = lower_operand(operand);
+    if op == TK_MINUS {
+        return emit_ir(OP_NEG, ir_type(ty), value, 0, 0);
+    }
+    if op == TK_BANG {
+        return emit_ir(OP_NOT, TY_BOOL, value, 0, 0);
+    }
+    if op == TK_TILDE {
+        return emit_ir(OP_BNOT, ir_type(ty), value, 0, 0);
+    }
+    load_scalar(value, ty)
+}
+
+fn ir_conv(value: i64, from: i64, to: i64) -> i64 {
+    let v = emit_ir(OP_CONV, to, value, 0, 0);
+    INSTS[v].imm2 = from;
+    v
+}
+
+fn lower_cast(value: i64, from: i64, to: i64) -> i64 {
+    if from == TY_NEVER || from == to || from == TY_BOOL {
+        return value;
+    }
+    let operand = need_value(value, from);
+    if is_float(from) || is_float(to) {
+        return ir_conv(operand, ir_type(from), ir_type(to));
+    }
+    // Integers and pointers: truncate or extend to `to`.
+    if !is_integer(to) || int_bits(to) == 64 {
+        return operand;
+    }
+    ir_conv(operand, ir_type(from), to)
+}
+
+// ---- Calls ----
+
+fn push_arg(value: i64, ty: i64) {
+    intvec_push(&SSA_STACK, value);
+    intvec_push(&SSA_STACK, ty);
+}
+
+// Moves the arguments pushed since `mark` into call `call`.
+fn take_args(call: i64, mark: i64) {
+    let count = (SSA_STACK.count - mark) / 2;
+    INSTS[call].args = ARGS.count;
+    INSTS[call].nargs = count;
+    for i in 0..count {
+        intvec_push(&ARGS, SSA_STACK.data[mark + 2 * i]);
+        intvec_push(&ARGTY, SSA_STACK.data[mark + 2 * i + 1]);
+    }
+    SSA_STACK.count = mark;
+}
+
+fn lower_call(n: i64) -> i64 {
+    let callee = NODES[n].a;
+    let direct = NODES[n].x - 1;
+    let mut param_count = 0;
+    let mut ret = 0;
+    let mut variadic = false;
+    let mut callee_ty = 0;
+    if direct >= 0 {
+        param_count = FNS[direct].param_count;
+        ret = FNS[direct].ret;
+        variadic = FNS[direct].variadic;
+    } else {
+        callee_ty = NODES[callee].ty;
+        param_count = TYPES[callee_ty].count;
+        ret = TYPES[callee_ty].a;
+    }
+    let mark = SSA_STACK.count;
+    for i in 0..NODES[n].count {
+        let arg = child(n, i);
+        let mut ty = NODES[arg].ty;
+        if i < param_count {
+            ty = if direct >= 0 { fn_param(direct, i) } else { type_elem(callee_ty, i) };
+        }
+        let mut value = lower_expr(arg);
+        if is_void(ty) {
+            continue;
+        }
+        value = need_value(value, ty);
+        if is_compound(ty) && !is_fresh(arg) {
+            let copy = ir_slot_addr(ir_new_slot(size_of(ty), align_of(ty)));
+            lower_copy(copy, value, size_of(ty));
+            value = copy;
+        }
+        let extra = variadic && i >= param_count;
+        if extra && ty == TY_F32 {
+            // C's default promotion.
+            value = ir_conv(value, TY_F32, TY_F64);
+            ty = TY_F64;
+        }
+        push_arg(value, if extra { 0 - ty } else { ty });
+    }
+    let mut callee_value = 0;
+    if direct < 0 {
+        callee_value = lower_operand(callee);
+    }
+    let mut result_ptr = 0;
+    if is_compound(ret) {
+        result_ptr = ir_slot_addr(ir_new_slot(size_of(ret), align_of(ret)));
+    }
+    let result_ty = if is_compound(ret) { 0 } else { ir_type(ret) };
+    let mut call = 0;
+    if direct >= 0 {
+        call = emit_ir(OP_CALL, result_ty, 0, 0, direct);
+    } else {
+        call = emit_ir(OP_CALLI, result_ty, callee_value, 0, callee_ty);
+    }
+    INSTS[call].c = result_ptr;
+    take_args(call, mark);
+    if is_compound(ret) {
+        return result_ptr;
+    }
+    if result_ty == 0 {
+        return 0;
+    }
+    call
+}
+
+// ---- Aggregates ----
+
+fn lower_aggregate(n: i64) -> i64 {
+    let ty = NODES[n].ty;
+    let kind = NODES[n].kind;
+    let base = ir_slot_addr(ir_new_slot(size_of(ty), align_of(ty)));
+    for i in 0..NODES[n].count {
+        let elem = child(n, i);
+        let mut value_node = elem;
+        let mut offset = 0;
+        let mut elem_ty = 0;
+        if kind == E_STRUCT {
+            let s = TYPES[ty].a;
+            value_node = NODES[elem].b;
+            offset = field_offset(s, NODES[elem].x);
+            elem_ty = (*struct_field(s, NODES[elem].x)).ty;
+        } else if kind == E_TUPLE {
+            offset = tuple_offset(ty, i);
+            elem_ty = type_elem(ty, i);
+        } else {
+            elem_ty = TYPES[ty].a;
+            offset = i * size_of(elem_ty);
+        }
+        let value = lower_expr(value_node);
+        store_value(base, offset, value, elem_ty);
+    }
+    base
+}
+
+// Stores `value` (of checker type `ty`) at addr + offset.
+fn store_value(addr: i64, offset: i64, value: i64, ty: i64) {
+    if is_void(ty) {
+        return;
+    }
+    let v = need_value(value, ty);
+    if is_compound(ty) {
+        lower_copy(ir_offset(addr, offset), v, size_of(ty));
+    } else {
+        ir_store(ir_type(ty), addr, v, offset);
+    }
+}
+
+// `[value; count]`: the value is evaluated once.
+fn lower_repeat(n: i64) -> i64 {
+    let ty = NODES[n].ty;
+    let elem_ty = TYPES[ty].a;
+    let count = TYPES[ty].b;
+    let elem_size = size_of(elem_ty);
+    let base = ir_slot_addr(ir_new_slot(size_of(ty), align_of(ty)));
+    let value = lower_expr(NODES[n].a);
+    if count == 0 || is_void(elem_ty) || elem_size == 0 {
+        return base;
+    }
+    if count <= 4 {
+        for i in 0..count {
+            store_value(base, i * elem_size, value, elem_ty);
+        }
+        return base;
+    }
+    let cursor = new_synth_var(TY_U64);
+    ssa_write(cursor, CUR, base);
+    let end = ir_offset(base, count * elem_size);
+    let body = ir_new_block();
+    let exit = ir_new_block();
+    lower_jump(body);
+    CUR = body;
+    let at = ssa_read(cursor, body);
+    store_value(at, 0, value, elem_ty);
+    let next = ir_offset(at, elem_size);
+    ssa_write(cursor, CUR, next);
+    lower_branch(ir_cmp(TK_BANG_EQ, TY_U64, next, end), body, exit);
+    ir_seal(body);
+    ir_seal(exit);
+    CUR = exit;
+    base
+}
+
+// ---- Control flow ----
+
+fn lower_if(n: i64) -> i64 {
+    let ty = NODES[n].ty;
+    let has_value = !is_void(ty);
+    let mut result = 0;
+    if has_value {
+        result = new_synth_var(ir_type(ty));
+    }
+    let cond = lower_operand(NODES[n].a);
+    let then_block = ir_new_block();
+    let mut else_block = 0;
+    if NODES[n].c != 0 {
+        else_block = ir_new_block();
+    }
+    let join = ir_new_block();
+    lower_branch(cond, then_block, if else_block != 0 { else_block } else { join });
+    ir_seal(then_block);
+    CUR = then_block;
+    lower_branch_body(NODES[n].b, result, has_value, join);
+    if else_block != 0 {
+        ir_seal(else_block);
+        CUR = else_block;
+        lower_branch_body(NODES[n].c, result, has_value, join);
+    }
+    ir_seal(join);
+    CUR = join;
+    if has_value {
+        return ssa_read(result, join);
+    }
+    0
+}
+
+fn lower_branch_body(block: i64, result: i64, has_value: bool, join: i64) {
+    let value = lower_block(block);
+    if has_value && NODES[block].ty != TY_NEVER {
+        ssa_write(result, CUR, need_value(value, NODES[block].ty));
+    }
+    lower_jump(join);
+}
+
+fn new_loop_info(n: i64, continue_block: i64, exit: i64, break_var: i64) {
+    NODES[n].z = LOOP_INFO.count;
+    intvec_push(&LOOP_INFO, continue_block);
+    intvec_push(&LOOP_INFO, exit);
+    intvec_push(&LOOP_INFO, break_var);
+}
+
+// `loop` and `while`.
+fn lower_loop(n: i64) -> i64 {
+    let header = ir_new_block();
+    let exit = ir_new_block();
+    let mut break_var = -1;
+    if NODES[n].kind == E_LOOP && NODES[n].x != 0 && !is_void(NODES[n].y) {
+        break_var = new_synth_var(ir_type(NODES[n].y));
+    }
+    new_loop_info(n, header, exit, break_var);
+    lower_jump(header);
+    CUR = header;
+    if NODES[n].kind == E_WHILE {
+        let cond = lower_operand(NODES[n].b);
+        let body = ir_new_block();
+        lower_branch(cond, body, exit);
+        ir_seal(body);
+        CUR = body;
+        lower_block(NODES[n].c);
+    } else {
+        lower_block(NODES[n].b);
+    }
+    lower_jump(header);
+    ir_seal(header);
+    ir_seal(exit);
+    CUR = exit;
+    if break_var >= 0 {
+        return ssa_read(break_var, exit);
+    }
+    0
+}
+
+fn lower_break(n: i64) {
+    let info = NODES[NODES[n].x].z;
+    let value = NODES[n].b;
+    let break_var = LOOP_INFO.data[info + 2];
+    if value != 0 {
+        let v = lower_expr(value);
+        if break_var >= 0 && NODES[value].ty != TY_NEVER {
+            ssa_write(break_var, CUR, need_value(v, NODES[value].ty));
+        }
+    }
+    lower_jump(LOOP_INFO.data[info + 1]);
+    start_dead_block();
+}
+
+// `for i in a..b`: the bounds are evaluated once; the loop variable is a
+// copy of the counter.
+fn lower_for(n: i64) {
+    let range = NODES[n].c;
+    let ty = NODES[range].ty;
+    let inclusive = NODES[range].c != 0;
+    let counter = new_synth_var(ty);
+    let start = lower_operand(NODES[range].a);
+    let end = lower_operand(NODES[range].b);
+    ssa_write(counter, CUR, start);
+    let test = ir_new_block();
+    let next = ir_new_block();
+    let exit = ir_new_block();
+    new_loop_info(n, next, exit, -1);
+    lower_jump(test);
+    CUR = test;
+    let value = ssa_read(counter, test);
+    let body = ir_new_block();
+    lower_branch(ir_cmp(if inclusive { TK_GT } else { TK_GT_EQ }, ty, value, end), exit, body);
+    ir_seal(body);
+    CUR = body;
+    bind_pattern_ir(NODES[n].b, ssa_read(counter, body), false);
+    lower_block(NODES[n].d);
+    lower_jump(next);
+    ir_seal(next);
+    CUR = next;
+    let current = ssa_read(counter, next);
+    if inclusive {
+        let step = ir_new_block();
+        lower_branch(ir_cmp(TK_EQ_EQ, ty, current, end), exit, step);
+        ir_seal(step);
+        CUR = step;
+    }
+    ssa_write(counter, CUR, ir_binary(OP_ADD, ty, current, ir_const(1, ty)));
+    lower_jump(test);
+    ir_seal(test);
+    ir_seal(exit);
+    CUR = exit;
+}
+
+// ---- Assignment ----
+
+// The target's address is computed first; a compound assignment reads the
+// old value before evaluating the right-hand side.
+fn lower_assign(n: i64) {
+    let op = NODES[n].a;
+    let target = NODES[n].b;
+    let value = NODES[n].c;
+    let ty = NODES[target].ty;
+    if NODES[target].kind == E_IDENT && NODES[target].x == R_LOCAL
+        && (PROMOTE[NODES[target].y] != 0 || is_void(ty)) {
+        let local = NODES[target].y;
+        if is_void(ty) {
+            lower_expr(value);
+            return;
+        }
+        if op == TK_EQ {
+            let v = lower_operand(value);
+            ssa_write(local, CUR, v);
+            return;
+        }
+        let old = ssa_read(local, CUR);
+        let v = lower_operand(value);
+        ssa_write(local, CUR, lower_operator(arith_of_assign(op), ty, ty, old, v));
+        return;
+    }
+    let addr = lower_addr(target);
+    if op == TK_EQ {
+        let v = lower_expr(value);
+        store_value(addr, 0, v, ty);
+        return;
+    }
+    let old = ir_load(ir_type(ty), addr, 0);
+    let v = lower_operand(value);
+    ir_store(ir_type(ty), addr, lower_operator(arith_of_assign(op), ty, ty, old, v), 0);
+}
+
+fn arith_of_assign(op: i64) -> i64 {
+    arith_op_of_assign(op)
+}
