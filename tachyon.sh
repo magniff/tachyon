@@ -2,8 +2,15 @@
 # tachyon.sh — build or run a .tach program
 #
 # Usage:
-#   ./tachyon.sh build program.tach [-o output] [--keep]
-#   ./tachyon.sh run   program.tach [program args...]
+#   ./tachyon.sh build [options] program.tach [-o output] [--keep]
+#   ./tachyon.sh run   [options] program.tach [program args...]
+#
+# Options (before the program):
+#   --target <target>   linux-x86_64, macos-x86_64 or macos-aarch64
+#                       (default: the host)
+#   -O                  optimize
+#
+# --keep keeps the intermediate object file.
 
 set -euo pipefail
 
@@ -14,21 +21,40 @@ NC='\033[0m'
 
 die() { echo -e "${RED}error:${NC} $*" >&2; exit 1; }
 
-[[ $# -lt 2 ]] && die "usage: tachyon.sh <build|run> <input.tach> [options]"
+[[ $# -lt 2 ]] && die "usage: tachyon.sh <build|run> [options] <input.tach> [args]"
 
 MODE="$1"
-shift
-
-INPUT="$1"
 shift
 
 [[ "$MODE" != "build" && "$MODE" != "run" ]] && \
     die "unknown mode '$MODE' (expected build or run)"
 
+TARGET=""
+OPT=()
+while [[ $# -gt 0 && "$1" == -* ]]; do
+    case "$1" in
+        --target)
+            shift
+            TARGET="${1:-}"
+            ;;
+        -O)
+            OPT=(-O)
+            ;;
+        *)
+            die "unknown option '$1'"
+            ;;
+    esac
+    shift
+done
+
+[[ $# -ge 1 ]] || die "missing input file"
+INPUT="$1"
+shift
+
 [[ -f "$INPUT" ]] || die "file not found: $INPUT"
 
 OUTPUT=""
-KEEP_ASM=0
+KEEP=0
 PROGRAM_ARGS=()
 
 # -------------------------------------------------
@@ -43,7 +69,7 @@ if [[ "$MODE" == "build" ]]; then
                 OUTPUT="$1"
                 ;;
             --keep)
-                KEEP_ASM=1
+                KEEP=1
                 ;;
             -*)
                 die "unknown option '$1'"
@@ -70,44 +96,45 @@ fi
 
 [[ -x "$TACHYON" ]] || die "tachyon compiler not found"
 
-# Linux: ELF + gcc. macOS: Mach-O x86-64 + clang (Apple Silicon runs it
-# under Rosetta 2).
-if [[ "$(uname -s)" == "Darwin" ]]; then
-    TARGET="macos-x86_64"
-    NASM_FORMAT="macho64"
-    LINK=(clang -arch x86_64 -Wl,-w)
-else
-    TARGET="linux-x86_64"
-    NASM_FORMAT="elf64"
-    LINK=(gcc -no-pie -lc)
+# Default target: the host. Apple Silicon also runs macos-x86_64 binaries
+# under Rosetta 2.
+if [[ -z "$TARGET" ]]; then
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        if [[ "$(uname -m)" == "arm64" ]]; then
+            TARGET="macos-aarch64"
+        else
+            TARGET="macos-x86_64"
+        fi
+    else
+        TARGET="linux-x86_64"
+    fi
 fi
 
-command -v nasm >/dev/null 2>&1 || die "nasm not found"
+case "$TARGET" in
+    macos-aarch64) LINK=(clang -arch arm64) ;;
+    macos-x86_64) LINK=(clang -arch x86_64 -Wl,-w) ;;
+    linux-x86_64) LINK=(cc) ;;
+    *) die "unknown target '$TARGET'" ;;
+esac
+
 command -v "${LINK[0]}" >/dev/null 2>&1 || die "${LINK[0]} not found"
 
 STEM="$(basename "${INPUT%.tach}")"
 
 if [[ "$MODE" == "build" ]]; then
-    ASM="${STEM}.asm"
-    OBJ="${STEM}.o"
+    WORK="."
     BIN="${OUTPUT:-$STEM}"
 else
-    TMPDIR="$(mktemp -d)"
-    ASM="${TMPDIR}/${STEM}.asm"
-    OBJ="${TMPDIR}/${STEM}.o"
-    BIN="${TMPDIR}/${STEM}.bin"
+    WORK="$(mktemp -d)"
+    BIN="${WORK}/${STEM}.bin"
 fi
+OBJ="${WORK}/${STEM}.o"
 
-# --- Compile ---
-echo -e "${CYAN}[1/3]${NC} tachyon  ${INPUT} → ${ASM}" >&2
-"$TACHYON" --target "$TARGET" --input "$INPUT" --output "$ASM" || die "compilation failed"
+echo -e "${CYAN}[1/2]${NC} tachyon  ${INPUT} → ${OBJ}  (${TARGET})" >&2
+"$TACHYON" --target "$TARGET" ${OPT[@]+"${OPT[@]}"} \
+    --input "$INPUT" --output "$OBJ" || die "compilation failed"
 
-# --- Assemble ---
-echo -e "${CYAN}[2/3]${NC} nasm     ${ASM} → ${OBJ}" >&2
-nasm -f "$NASM_FORMAT" -o "$OBJ" "$ASM" || die "assembly failed"
-
-# --- Link ---
-echo -e "${CYAN}[3/3]${NC} ${LINK[0]}  ${OBJ} → ${BIN}  (libc)" >&2
+echo -e "${CYAN}[2/2]${NC} ${LINK[0]}  ${OBJ} → ${BIN}  (libc)" >&2
 "${LINK[@]}" -o "$BIN" "$OBJ" -lm || die "linking failed"
 
 # --- Run mode ---
@@ -116,14 +143,13 @@ if [[ "$MODE" == "run" ]]; then
     # ${a[@]+...}: bash 3.2 (macOS) treats an empty array as unbound under -u.
     STATUS=0
     "$BIN" ${PROGRAM_ARGS[@]+"${PROGRAM_ARGS[@]}"} || STATUS=$?
-    rm -rf "$TMPDIR"
+    rm -rf "$WORK"
     exit $STATUS
 fi
 
 # --- Cleanup (build mode only) ---
-rm -f "$OBJ"
-if [[ $KEEP_ASM -eq 0 ]]; then
-    rm -f "$ASM"
+if [[ $KEEP -eq 0 ]]; then
+    rm -f "$OBJ"
 fi
 
 echo -e "${GREEN}done:${NC} ${BIN}" >&2

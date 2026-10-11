@@ -196,6 +196,9 @@ pub struct IRFunction {
     pub blocks: Vec<BasicBlock>,
     pub vreg_counter: u32,
     pub is_extern: bool,
+    // C variadic (`...`) extern: arguments past `params` follow the
+    // platform's variadic calling convention.
+    pub is_variadic: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -662,6 +665,7 @@ impl<'a> Lowerer<'a> {
                         blocks: vec![],
                         vreg_counter: 0,
                         is_extern: true,
+                        is_variadic: signature.is_variadic,
                     });
                 }
                 Item::Struct(_) => {}
@@ -752,6 +756,7 @@ impl<'a> Lowerer<'a> {
             blocks: std::mem::take(&mut self.blocks),
             vreg_counter: self.vreg_n,
             is_extern: false,
+            is_variadic: false,
         }
     }
 

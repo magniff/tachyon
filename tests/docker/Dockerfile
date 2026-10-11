@@ -2,5 +2,5 @@
 #   TACHYON_DOCKER=1 cargo test --test run
 FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends nasm gcc libc6-dev coreutils \
+    && apt-get install -y --no-install-recommends gcc libc6-dev coreutils \
     && rm -rf /var/lib/apt/lists/*
