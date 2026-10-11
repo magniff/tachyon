@@ -838,6 +838,7 @@ fn passes_expected_to_operands(op: Tok, expected: i64) -> bool {
 // Checks `n` against `expected`; returns `expected`, or `!` when the
 // expression diverges.
 fn check_expr(n: i64, expected: i64) -> i64 {
+    fold_layout_query(n);
     let actual = check_expr_inner(n, expected);
     NODES[n].ty = expected;
     actual
@@ -1089,6 +1090,7 @@ fn check_shift_amount(amount: i64) {
 // ---- Synth mode ----
 
 fn synth_expr(n: i64) -> i64 {
+    fold_layout_query(n);
     let ty = synth_expr_inner(n);
     NODES[n].ty = ty;
     ty
@@ -1555,6 +1557,62 @@ fn synth_unary(n: i64) -> i64 {
 
 fn is_variadic_arg_type(t: i64) -> bool {
     is_ffi_safe(t)
+}
+
+// `size_of(T)` and `align_of(T)` (0.4), unless the program has functions
+// of those names: integer constants, typed like an integer literal. The
+// argument, parsed as an expression, is read as a type (`*T`, `[T; n]`,
+// `[T]`, `(A, B)` and names are also expressions); the call becomes the
+// literal.
+fn fold_layout_query(n: i64) {
+    if NODES[n].kind != NodeKind::Call || NODES[n].count != 1 {
+        return;
+    }
+    let callee = NODES[n].a;
+    if NODES[callee].kind != NodeKind::Ident {
+        return;
+    }
+    let name = NODES[callee].a;
+    let is_size = name == intern_c(c"size_of");
+    if !is_size && name != intern_c(c"align_of") {
+        return;
+    }
+    if lookup_local(name) >= 0 || SYM_FN[name] != 0 || SYM_CONST[name] != 0 || SYM_STATIC[name] != 0 {
+        return;
+    }
+    let t = resolve_type(expr_as_type(child(n, 0)));
+    let value = if is_size { size_of(t) } else { align_of(t) };
+    NODES[n].kind = NodeKind::Int;
+    NODES[n].a = value;
+    NODES[n].b = SUF_NONE;
+    NODES[n].count = 0;
+}
+
+// The expression `e` turned into the type node it spells.
+fn expr_as_type(e: i64) -> i64 {
+    let kind = NODES[e].kind;
+    if kind == NodeKind::Ident {
+        NODES[e].kind = NodeKind::TyName;
+    } else if kind == NodeKind::Unary && NODES[e].op == Tok::Star {
+        NODES[e].kind = NodeKind::TyPtr;
+        NODES[e].a = expr_as_type(NODES[e].b);
+    } else if kind == NodeKind::Repeat {
+        NODES[e].kind = NodeKind::TyArray;
+        NODES[e].a = expr_as_type(NODES[e].a);
+    } else if kind == NodeKind::Array && NODES[e].count == 1 {
+        NODES[e].kind = NodeKind::TySlice;
+        NODES[e].a = expr_as_type(child(e, 0));
+    } else if kind == NodeKind::Tuple {
+        NODES[e].kind = NodeKind::TyTuple;
+        for i in 0..NODES[e].count {
+            expr_as_type(child(e, i));
+        }
+    } else if kind == NodeKind::Unit {
+        NODES[e].kind = NodeKind::TyUnit;
+    } else {
+        type_error(e, c"size_of and align_of take a type");
+    }
+    e
 }
 
 fn synth_call(n: i64) -> i64 {
