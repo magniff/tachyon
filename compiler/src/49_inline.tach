@@ -1,0 +1,376 @@
+// Inlining, bottom-up over the call graph: functions are processed by
+// strongly connected components (Tarjan's algorithm yields them callees
+// first), so a callee is already optimized when it is inlined, and calls
+// within a component (recursion) are never inlined. A callee is inlined
+// when it is small, or when this is its only call site (it is then not
+// emitted at all); the caller's size is bounded.
+
+const INLINE_SMALL: i64 = 30;
+const INLINE_ONCE: i64 = 400;
+const INLINE_BUDGET: i64 = 3000;
+
+// Per IR function: its component, size, number of direct call sites and
+// whether its address is taken (FADDR).
+static mut FN_SCC: *i64 = 0 as *i64;
+static mut FN_SIZE: *i64 = 0 as *i64;
+static mut FN_CALLS: *i64 = 0 as *i64;
+static mut FN_ADDRESS: *i64 = 0 as *i64;
+// Whether the function is emitted.
+static mut FN_LIVE: *i64 = 0 as *i64;
+
+// The number of instructions that turn into code.
+fn func_size(fi: i64) -> i64 {
+    let mut size = 0;
+    for i in 0..IRFUNCS[fi].blocks.count {
+        let b = IRFUNCS[fi].blocks.data[i];
+        if BLOCKS[b].removed != 0 {
+            continue;
+        }
+        let mut v = BLOCKS[b].first;
+        while v != 0 {
+            if !is_remat_op(INSTS[v].op) && INSTS[v].op != OP_PARAM {
+                size += 1;
+            }
+            v = INSTS[v].next;
+        }
+        size += 1;
+    }
+    size
+}
+
+// The IR function called by direct call v, or -1.
+fn ir_callee(v: i64) -> i64 {
+    if INSTS[v].op != OP_CALL {
+        return -1;
+    }
+    FN_IR[INSTS[v].imm] - 1
+}
+
+// Counts the call sites and address uses of every function.
+fn count_call_sites() {
+    for fi in 0..IRFUNC_COUNT {
+        FN_CALLS[fi] = 0;
+        FN_ADDRESS[fi] = 0;
+    }
+    for fi in 0..IRFUNC_COUNT {
+        if FN_LIVE[fi] == 0 {
+            continue;
+        }
+        for i in 0..IRFUNCS[fi].blocks.count {
+            let b = IRFUNCS[fi].blocks.data[i];
+            if BLOCKS[b].removed != 0 {
+                continue;
+            }
+            let mut v = BLOCKS[b].first;
+            while v != 0 {
+                let g = ir_callee(v);
+                if g >= 0 {
+                    FN_CALLS[g] += 1;
+                }
+                if INSTS[v].op == OP_FADDR && FN_IR[INSTS[v].imm] != 0 {
+                    FN_ADDRESS[FN_IR[INSTS[v].imm] - 1] = 1;
+                }
+                v = INSTS[v].next;
+            }
+        }
+    }
+}
+
+// ---- Strongly connected components (Tarjan) ----
+
+// The functions in the order to process them: components callees first.
+static mut SCC_ORDER: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The direct callees of fi (with repeats), in `out`.
+fn callees(fi: i64, out: *IntVec) {
+    (*out).count = 0;
+    for i in 0..IRFUNCS[fi].blocks.count {
+        let b = IRFUNCS[fi].blocks.data[i];
+        if BLOCKS[b].removed != 0 {
+            continue;
+        }
+        let mut v = BLOCKS[b].first;
+        while v != 0 {
+            let g = ir_callee(v);
+            if g >= 0 {
+                intvec_push(out, g);
+            }
+            v = INSTS[v].next;
+        }
+    }
+}
+
+fn compute_sccs() {
+    let n = IRFUNC_COUNT;
+    let index = alloc_zeroed((n + 1) * 8) as *i64;
+    let low = alloc_zeroed((n + 1) * 8) as *i64;
+    let on_stack = alloc_zeroed((n + 1) * 8) as *i64;
+    // Adjacency, computed once (CSR).
+    let adj_start = alloc_zeroed((n + 2) * 8) as *i64;
+    let mut adj = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    let mut scratch = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for fi in 0..n {
+        adj_start[fi] = adj.count;
+        callees(fi, &scratch);
+        for i in 0..scratch.count {
+            intvec_push(&adj, scratch.data[i]);
+        }
+    }
+    adj_start[n] = adj.count;
+    let mut stack = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    let mut calls = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    let mut next_index = 1;
+    let mut scc_id = 0;
+    SCC_ORDER.count = 0;
+    for root in 0..n {
+        if index[root] != 0 {
+            continue;
+        }
+        // (node, next edge) frames.
+        intvec_push(&calls, root);
+        intvec_push(&calls, adj_start[root]);
+        index[root] = next_index;
+        low[root] = next_index;
+        next_index += 1;
+        intvec_push(&stack, root);
+        on_stack[root] = 1;
+        while calls.count > 0 {
+            let top = calls.count - 2;
+            let v = calls.data[top];
+            let e = calls.data[top + 1];
+            if e < adj_start[v + 1] {
+                calls.data[top + 1] = e + 1;
+                let w = adj.data[e];
+                if index[w] == 0 {
+                    index[w] = next_index;
+                    low[w] = next_index;
+                    next_index += 1;
+                    intvec_push(&stack, w);
+                    on_stack[w] = 1;
+                    intvec_push(&calls, w);
+                    intvec_push(&calls, adj_start[w]);
+                } else if on_stack[w] != 0 && index[w] < low[v] {
+                    low[v] = index[w];
+                }
+                continue;
+            }
+            calls.count -= 2;
+            if calls.count > 0 {
+                let parent = calls.data[calls.count - 2];
+                if low[v] < low[parent] {
+                    low[parent] = low[v];
+                }
+            }
+            if low[v] == index[v] {
+                loop {
+                    let w = intvec_pop(&stack);
+                    on_stack[w] = 0;
+                    FN_SCC[w] = scc_id;
+                    intvec_push(&SCC_ORDER, w);
+                    if w == v {
+                        break;
+                    }
+                }
+                scc_id += 1;
+            }
+        }
+    }
+    free(index as *u8);
+    free(low as *u8);
+    free(on_stack as *u8);
+    free(adj_start as *u8);
+    free(adj.data as *u8);
+    free(scratch.data as *u8);
+    free(stack.data as *u8);
+    free(calls.data as *u8);
+}
+
+// ---- Inlining one call ----
+
+fn should_inline(fi: i64, g: i64) -> bool {
+    if g == fi || FN_SCC[g] == FN_SCC[fi] || FN_LIVE[g] == 0 {
+        return false;
+    }
+    if FN_SIZE[fi] + FN_SIZE[g] > INLINE_BUDGET {
+        return false;
+    }
+    if FN_SIZE[g] <= INLINE_SMALL {
+        return true;
+    }
+    FN_CALLS[g] == 1 && FN_ADDRESS[g] == 0 && FNS[IRFUNCS[g].f].name != MAIN_SYM
+        && FN_SIZE[g] <= INLINE_ONCE
+}
+
+fn inline_calls(fi: i64) -> bool {
+    let mut changed = false;
+    let mut i = 0;
+    // Blocks appended by inlining are visited too, except the callees'
+    // copies (BLOCKS[b].loop_depth == 1).
+    while i < IRFUNCS[fi].blocks.count {
+        let b = IRFUNCS[fi].blocks.data[i];
+        i += 1;
+        if BLOCKS[b].removed != 0 || BLOCKS[b].loop_depth == 1 {
+            continue;
+        }
+        let mut v = BLOCKS[b].first;
+        while v != 0 {
+            let next = INSTS[v].next;
+            let g = ir_callee(v);
+            if g >= 0 && should_inline(fi, g) {
+                FN_SIZE[fi] += FN_SIZE[g];
+                FN_CALLS[g] -= 1;
+                inline_call(fi, v, g);
+                changed = true;
+                // The rest of this block moved to the continuation block,
+                // visited later.
+                break;
+            }
+            v = next;
+        }
+    }
+    for k in 0..IRFUNCS[fi].blocks.count {
+        BLOCKS[IRFUNCS[fi].blocks.data[k]].loop_depth = 0;
+    }
+    changed
+}
+
+// The copy of value `v` of the callee (INSTS[v].aux).
+fn mapped(v: i64) -> i64 {
+    if v == 0 { 0 } else { INSTS[v].aux }
+}
+
+fn inline_call(fi: i64, call: i64, g: i64) {
+    resolve_all(g);
+    IRF = fi;
+    let b = INSTS[call].block;
+    // The continuation: the instructions after the call, and b's end.
+    let cont = ir_new_block();
+    BLOCKS[cont].sealed = 1;
+    let mut v = INSTS[call].next;
+    while v != 0 {
+        let next = INSTS[v].next;
+        ir_unlink(v);
+        ir_append(cont, v);
+        v = next;
+    }
+    BLOCKS[cont].term = BLOCKS[b].term;
+    BLOCKS[cont].cond = BLOCKS[b].cond;
+    BLOCKS[cont].s0 = BLOCKS[b].s0;
+    BLOCKS[cont].s1 = BLOCKS[b].s1;
+    for k in 0..succ_count(cont) {
+        let s = succ(cont, k);
+        let index = pred_index(s, b);
+        BLOCKS[s].preds.data[index] = cont;
+    }
+    // The values of the callee's parameters.
+    let callee_f = IRFUNCS[g].f;
+    let mut param_values: [i64; 64] = [0; 64];
+    let mut k = 0;
+    for p in 0..FNS[callee_f].param_count {
+        if !is_void(fn_param(callee_f, p)) {
+            param_values[p] = ir_arg(call, k);
+            k += 1;
+        }
+    }
+    // Copy the blocks and instructions.
+    for i in 0..IRFUNCS[g].blocks.count {
+        let gb = IRFUNCS[g].blocks.data[i];
+        if BLOCKS[gb].removed != 0 {
+            continue;
+        }
+        let nb = ir_new_block();
+        BLOCKS[nb].sealed = 1;
+        BLOCKS[nb].loop_depth = 1;
+        BLOCKS[gb].aux = nb;
+        let mut gv = BLOCKS[gb].first;
+        while gv != 0 {
+            let op = INSTS[gv].op;
+            if op == OP_PARAM {
+                INSTS[gv].aux = if INSTS[gv].imm < 0 { INSTS[call].c } else { param_values[INSTS[gv].imm] };
+            } else {
+                let nv = ir_make(op, INSTS[gv].ty, INSTS[gv].a, INSTS[gv].b, INSTS[gv].imm);
+                INSTS[nv].c = INSTS[gv].c;
+                INSTS[nv].imm2 = INSTS[gv].imm2;
+                if op == OP_SLOT {
+                    let s = INSTS[gv].imm;
+                    INSTS[nv].imm = ir_new_slot(SLOTS[s].size, SLOTS[s].align);
+                }
+                if INSTS[gv].nargs > 0 || op == OP_PHI || is_call_op(op) {
+                    INSTS[nv].args = ARGS.count;
+                    INSTS[nv].nargs = INSTS[gv].nargs;
+                    for a in 0..INSTS[gv].nargs {
+                        intvec_push(&ARGS, ir_arg(gv, a));
+                        intvec_push(&ARGTY, ARGTY.data[INSTS[gv].args + a]);
+                    }
+                }
+                ir_append(nb, nv);
+                INSTS[gv].aux = nv;
+            }
+            gv = INSTS[gv].next;
+        }
+    }
+    // Map the operands, the terminators and the predecessors.
+    let mut returns = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for i in 0..IRFUNCS[g].blocks.count {
+        let gb = IRFUNCS[g].blocks.data[i];
+        if BLOCKS[gb].removed != 0 {
+            continue;
+        }
+        let nb = BLOCKS[gb].aux;
+        let mut nv = BLOCKS[nb].first;
+        while nv != 0 {
+            INSTS[nv].a = mapped(INSTS[nv].a);
+            INSTS[nv].b = mapped(INSTS[nv].b);
+            INSTS[nv].c = mapped(INSTS[nv].c);
+            for a in 0..INSTS[nv].nargs {
+                ir_set_arg(nv, a, mapped(ir_arg(nv, a)));
+            }
+            nv = INSTS[nv].next;
+        }
+        for p in 0..BLOCKS[gb].preds.count {
+            intvec_push(&BLOCKS[nb].preds, BLOCKS[BLOCKS[gb].preds.data[p]].aux);
+        }
+        let term = BLOCKS[gb].term;
+        if term == TERM_RET {
+            BLOCKS[nb].term = TERM_JUMP;
+            BLOCKS[nb].s0 = cont;
+            intvec_push(&BLOCKS[cont].preds, nb);
+            intvec_push(&returns, mapped(BLOCKS[gb].cond));
+        } else {
+            BLOCKS[nb].term = term;
+            BLOCKS[nb].cond = mapped(BLOCKS[gb].cond);
+            BLOCKS[nb].s0 = if BLOCKS[gb].s0 != 0 { BLOCKS[BLOCKS[gb].s0].aux } else { 0 };
+            BLOCKS[nb].s1 = if BLOCKS[gb].s1 != 0 { BLOCKS[BLOCKS[gb].s1].aux } else { 0 };
+        }
+    }
+    // Enter the copy.
+    let entry = BLOCKS[IRFUNCS[g].entry].aux;
+    BLOCKS[b].term = TERM_JUMP;
+    BLOCKS[b].cond = 0;
+    BLOCKS[b].s0 = entry;
+    BLOCKS[b].s1 = 0;
+    intvec_push(&BLOCKS[entry].preds, b);
+    // The result.
+    let ty = INSTS[call].ty;
+    if ty != 0 {
+        let mut result = 0;
+        if returns.count == 0 {
+            result = ssa_undef(ty);
+        } else if returns.count == 1 {
+            result = returns.data[0];
+        } else {
+            result = ir_make(OP_PHI, ty, 0, 0, 0);
+            INSTS[result].args = ARGS.count;
+            INSTS[result].nargs = returns.count;
+            for r in 0..returns.count {
+                intvec_push(&ARGS, returns.data[r]);
+                intvec_push(&ARGTY, 0);
+            }
+            ir_prepend(cont, result);
+        }
+        ir_replace(call, result);
+    } else {
+        ir_unlink(call);
+    }
+    free(returns.data as *u8);
+}

@@ -11,6 +11,9 @@
 #                  ignored ones) instead of HEAD; combine with --dev before
 #                  the release tags exist
 #   --seed-tests   also run the seed's own test suite (cargo test)
+#   --all-levels   also run the final compiler's test suite at -O0, -O1, -O2
+#   --fuzz=N       also run N random programs (tests/fuzz/run.sh)
+#   --bench        also run the benchmarks (bench/run.sh)
 #
 # Other options go to bootstrap.sh, e.g. --dev. After the chain, the md5
 # example is checked against md5sum.
@@ -24,6 +27,9 @@ IMAGE=tachyon-bootstrap:linux-x86_64
 PLATFORM=linux/amd64
 WORKTREE=0
 SEED_TESTS=0
+ALL_LEVELS=0
+FUZZ=0
+BENCH=0
 
 die() {
     echo "linux-check: error: $*" >&2
@@ -39,7 +45,10 @@ for arg in "$@"; do
     case "$arg" in
         --worktree) WORKTREE=1 ;;
         --seed-tests) SEED_TESTS=1 ;;
-        -h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --all-levels) ALL_LEVELS=1 ;;
+        --fuzz=*) FUZZ=${arg#--fuzz=} ;;
+        --bench) BENCH=1 ;;
+        -h|--help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) rest="$rest $(quote "$arg")" ;;
     esac
 done
@@ -70,7 +79,8 @@ if [ $WORKTREE -eq 1 ]; then
 fi
 
 echo "==> running the chain in the container" >&2
-tar -C "$SNAP" -c -f - src | docker run --rm -i --platform "$PLATFORM" -e SEED_TESTS="$SEED_TESTS" "$IMAGE" sh -c '
+tar -C "$SNAP" -c -f - src | docker run --rm -i --platform "$PLATFORM" -e SEED_TESTS="$SEED_TESTS" \
+    -e ALL_LEVELS="$ALL_LEVELS" -e FUZZ="$FUZZ" -e BENCH="$BENCH" "$IMAGE" sh -c '
     set -eu
     mkdir /work
     tar -x --no-same-owner -f - -C /work
@@ -87,6 +97,22 @@ tar -C "$SNAP" -c -f - src | docker run --rm -i --platform "$PLATFORM" -e SEED_T
     want=$(md5sum </tmp/random | cut -d" " -f1)
     [ "$got" = "$want" ] || { echo "md5: tachyon $got, md5sum $want" >&2; exit 1; }
     echo "md5 example: $got, same as md5sum"
+    if [ "$ALL_LEVELS" = 1 ]; then
+        for level in 0 1 2; do
+            echo "==> the test suite at -O$level" >&2
+            tests/run.sh -O $level | tail -1
+        done
+    fi
+    if [ "$FUZZ" != 0 ]; then
+        echo "==> $FUZZ random programs" >&2
+        tests/fuzz/run.sh -n "$FUZZ" -k /tmp/fuzz-failures | tail -5
+    fi
+    if [ "$BENCH" = 1 ]; then
+        echo "==> benchmarks" >&2
+        previous=$(ls -d target/bootstrap/x86_64-linux/v*/tachyonc 2>/dev/null | head -1)
+        seed=$(ls -d target/bootstrap/x86_64-linux/seed-*/target/release/tachyon 2>/dev/null | head -1)
+        bench/run.sh ${previous:+-p "$previous"} ${seed:+-s "$seed"} -r 3
+    fi
     if [ "$SEED_TESTS" = 1 ]; then
         echo "==> the seed'"'"'s own tests (cargo test)" >&2
         start=$(date +%s)

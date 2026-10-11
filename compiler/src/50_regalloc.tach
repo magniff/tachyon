@@ -1,0 +1,689 @@
+// Register allocation for the IR back end: linear scan (Poletto & Sarkar,
+// "Linear Scan Register Allocation", TOPLAS 1999).
+//
+// Blocks are laid out in reverse post-order and every instruction gets a
+// position. Liveness is computed per block by the usual backward data
+// flow; a value's live interval is the hull of every position where it is
+// live (one range, holes ignored). Intervals are allocated in order of
+// their start: a value live across a call gets a callee-saved register,
+// other values prefer the caller-saved ones; when none is free, the
+// interval that ends last is spilled to a frame slot. Constants and
+// addresses (is_remat_op) are never allocated: the emitter rematerializes
+// them at each use. A compare used only by the branch right after it is
+// fused into that branch and needs no register either.
+//
+// Locations: 0-31 are the integer registers (hardware numbers), 32-63 the
+// float registers (32 + n), and -(1 + i) is spill slot i.
+
+const LOC_NONE: i64 = 1000000;
+
+// The function being allocated: its blocks in layout order.
+static mut ORDER: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// Per layout index: the start and end positions of the block.
+static mut BSTART: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut BEND: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// Allocated values: value ids by dense index (INSTS[v].aux = index + 1).
+static mut RA_VALS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut RA_START: *i64 = 0 as *i64;
+static mut RA_END: *i64 = 0 as *i64;
+static mut RA_LOC: *i64 = 0 as *i64;
+// Per dense index: a phi that has this value as an operand (its dense
+// index), or -1; allocation tries to give both the same register, which
+// removes the move between them.
+static mut RA_HINT: *i64 = 0 as *i64;
+static mut RA_CAP: i64 = 0;
+// Positions of the calls, in order.
+static mut CALL_POS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut SPILL_COUNT: i64 = 0;
+// Per register: whether a callee-saved register is used.
+static mut CALLEE_USED: [i64; 64] = [0; 64];
+// Uses of each instruction (indexed by value id), for the whole program.
+static mut USES: *i64 = 0 as *i64;
+// Liveness: bit sets of dense value indices, per layout index.
+static mut LIVE_IN: *u64 = 0 as *u64;
+static mut LIVE_OUT: *u64 = 0 as *u64;
+static mut LIVE_WORDS: i64 = 0;
+
+// ---- Preparation ----
+
+// Counts the uses of every value of every function.
+fn count_uses() {
+    USES = alloc_zeroed((INST_COUNT + 1) * 8) as *i64;
+    for fi in 0..IRFUNC_COUNT {
+        for i in 0..IRFUNCS[fi].blocks.count {
+            let b = IRFUNCS[fi].blocks.data[i];
+            if BLOCKS[b].removed != 0 {
+                continue;
+            }
+            let mut v = BLOCKS[b].first;
+            while v != 0 {
+                for k in 0..ir_operand_count(v) {
+                    let operand = ir_operand(v, k);
+                    if operand != 0 {
+                        USES[operand] += 1;
+                    }
+                }
+                v = INSTS[v].next;
+            }
+            let cond = BLOCKS[b].cond;
+            if cond != 0 {
+                USES[cond] += 1;
+            }
+        }
+    }
+}
+
+// Splits every edge from a block with two successors into a block with
+// phis, so that phi moves have a block of their own.
+fn split_critical_edges(fi: i64) {
+    IRF = fi;
+    let count = IRFUNCS[fi].blocks.count;
+    for i in 0..count {
+        let b = IRFUNCS[fi].blocks.data[i];
+        if BLOCKS[b].removed != 0 || BLOCKS[b].term != TERM_BRANCH {
+            continue;
+        }
+        for k in 0..2 {
+            let s = succ(b, k);
+            let first = BLOCKS[s].first;
+            if first == 0 || INSTS[first].op != OP_PHI {
+                continue;
+            }
+            let e = ir_new_block();
+            BLOCKS[e].sealed = 1;
+            BLOCKS[e].term = TERM_JUMP;
+            BLOCKS[e].s0 = s;
+            intvec_push(&BLOCKS[e].preds, b);
+            if k == 0 {
+                BLOCKS[b].s0 = e;
+            } else {
+                BLOCKS[b].s1 = e;
+            }
+            // Same index in the predecessor list, so the phis still match.
+            let index = pred_index(s, b);
+            BLOCKS[s].preds.data[index] = e;
+        }
+    }
+}
+
+// Lays out the reachable blocks in reverse post-order (BLOCKS[b].order is
+// the layout index, -1 for unreachable blocks).
+fn layout_blocks(fi: i64) {
+    for i in 0..IRFUNCS[fi].blocks.count {
+        let b = IRFUNCS[fi].blocks.data[i];
+        BLOCKS[b].order = -1;
+        BLOCKS[b].mark = 0;
+    }
+    ORDER.count = 0;
+    // Iterative depth-first search; post-order into ORDER, reversed below.
+    let mut stack = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    let entry = IRFUNCS[fi].entry;
+    intvec_push(&stack, entry);
+    intvec_push(&stack, 0);
+    BLOCKS[entry].mark = 1;
+    while stack.count > 0 {
+        let b = stack.data[stack.count - 2];
+        let next = stack.data[stack.count - 1];
+        if next < succ_count(b) {
+            stack.data[stack.count - 1] = next + 1;
+            // The second successor first, so that the first one comes
+            // right after the block when it can.
+            let s = succ(b, succ_count(b) - 1 - next);
+            if BLOCKS[s].mark == 0 {
+                BLOCKS[s].mark = 1;
+                intvec_push(&stack, s);
+                intvec_push(&stack, 0);
+            }
+        } else {
+            stack.count -= 2;
+            intvec_push(&ORDER, b);
+        }
+    }
+    free(stack.data as *u8);
+    let n = ORDER.count;
+    for i in 0..n / 2 {
+        let t = ORDER.data[i];
+        ORDER.data[i] = ORDER.data[n - 1 - i];
+        ORDER.data[n - 1 - i] = t;
+    }
+    for i in 0..n {
+        BLOCKS[ORDER.data[i]].order = i;
+    }
+}
+
+// Whether compare `v` is fused into the branch that ends its block.
+fn is_fused_compare(v: i64) -> bool {
+    let b = INSTS[v].block;
+    INSTS[v].op == OP_CMP && USES[v] == 1 && BLOCKS[b].term == TERM_BRANCH
+        && BLOCKS[b].cond == v && INSTS[v].next == 0 && !is_float(INSTS[v].imm2)
+}
+
+// Whether `v` is emitted at all, and whether it needs a location.
+fn is_emitted(v: i64) -> bool {
+    let op = INSTS[v].op;
+    if is_remat_op(op) || op == OP_PHI || op == OP_PARAM {
+        return false;
+    }
+    has_side_effect(op) || USES[v] > 0
+}
+
+fn needs_location(v: i64) -> bool {
+    let op = INSTS[v].op;
+    INSTS[v].ty != 0 && !is_remat_op(op) && USES[v] > 0 && !is_fused_compare(v)
+}
+
+// ---- Positions and liveness ----
+
+fn ra_value_index(v: i64) -> i64 {
+    INSTS[v].aux - 1
+}
+
+fn ra_reserve(n: i64) {
+    if n <= RA_CAP {
+        return;
+    }
+    let mut cap = RA_CAP * 2;
+    if cap < n {
+        cap = n;
+    }
+    if cap < 1024 {
+        cap = 1024;
+    }
+    free(RA_START as *u8);
+    free(RA_END as *u8);
+    free(RA_LOC as *u8);
+    free(RA_HINT as *u8);
+    RA_START = alloc_zeroed(cap * 8) as *i64;
+    RA_END = alloc_zeroed(cap * 8) as *i64;
+    RA_LOC = alloc_zeroed(cap * 8) as *i64;
+    RA_HINT = alloc_zeroed(cap * 8) as *i64;
+    RA_CAP = cap;
+}
+
+// Numbers the instructions and the allocated values.
+fn number_positions() {
+    BSTART.count = 0;
+    BEND.count = 0;
+    RA_VALS.count = 0;
+    CALL_POS.count = 0;
+    let mut pos = 0;
+    for k in 0..ORDER.count {
+        let b = ORDER.data[k];
+        intvec_push(&BSTART, pos);
+        pos += 2;
+        let mut v = BLOCKS[b].first;
+        while v != 0 {
+            let op = INSTS[v].op;
+            if op == OP_PHI || op == OP_PARAM {
+                INSTS[v].mark = BSTART.data[k];
+            } else {
+                INSTS[v].mark = pos;
+                pos += 2;
+            }
+            if is_call_op(op) {
+                intvec_push(&CALL_POS, INSTS[v].mark);
+            }
+            INSTS[v].aux = 0;
+            if needs_location(v) {
+                intvec_push(&RA_VALS, v);
+                INSTS[v].aux = RA_VALS.count;
+            }
+            v = INSTS[v].next;
+        }
+        intvec_push(&BEND, pos);
+        pos += 2;
+    }
+    // Parameters are defined when the function starts.
+    let entry = IRFUNCS[IRF].entry;
+    let mut v = BLOCKS[entry].first;
+    while v != 0 {
+        if INSTS[v].op == OP_PARAM {
+            INSTS[v].mark = 0;
+        }
+        v = INSTS[v].next;
+    }
+    ra_reserve(RA_VALS.count);
+}
+
+fn bit_set(set: *u64, i: i64) {
+    set[i >> 6] |= (1 as u64) << (i & 63) as u64;
+}
+
+fn bit_get(set: *u64, i: i64) -> bool {
+    (set[i >> 6] >> (i & 63) as u64) & 1 != 0
+}
+
+fn live_set(sets: *u64, k: i64) -> *u64 {
+    &sets[k * LIVE_WORDS]
+}
+
+// The dense index of operand `v` if it is allocated, else -1.
+fn tracked(v: i64) -> i64 {
+    if v == 0 {
+        return -1;
+    }
+    INSTS[v].aux - 1
+}
+
+fn compute_liveness() {
+    let n = ORDER.count;
+    LIVE_WORDS = (RA_VALS.count + 63) / 64 + 1;
+    free(LIVE_IN as *u8);
+    free(LIVE_OUT as *u8);
+    LIVE_IN = alloc_zeroed(n * LIVE_WORDS * 8 + 8) as *u64;
+    LIVE_OUT = alloc_zeroed(n * LIVE_WORDS * 8 + 8) as *u64;
+    let gen = alloc_zeroed(n * LIVE_WORDS * 8 + 8) as *u64;
+    let kill = alloc_zeroed(n * LIVE_WORDS * 8 + 8) as *u64;
+    for k in 0..n {
+        let b = ORDER.data[k];
+        let g = live_set(gen, k);
+        let d = live_set(kill, k);
+        let mut v = BLOCKS[b].first;
+        while v != 0 {
+            if INSTS[v].op != OP_PHI {
+                for i in 0..ir_operand_count(v) {
+                    let t = tracked(ir_operand(v, i));
+                    if t >= 0 && !bit_get(d, t) {
+                        bit_set(g, t);
+                    }
+                }
+            }
+            let t = tracked(v);
+            if t >= 0 {
+                bit_set(d, t);
+            }
+            v = INSTS[v].next;
+        }
+        let t = tracked(BLOCKS[b].cond);
+        if t >= 0 && !bit_get(d, t) {
+            bit_set(g, t);
+        }
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut k = n - 1;
+        while k >= 0 {
+            let b = ORDER.data[k];
+            let out = live_set(LIVE_OUT, k);
+            for i in 0..succ_count(b) {
+                let s = succ(b, i);
+                let sk = BLOCKS[s].order;
+                let sin = live_set(LIVE_IN, sk);
+                for w in 0..LIVE_WORDS {
+                    out[w] |= sin[w];
+                }
+                // Phi operands flowing from b.
+                let index = pred_index(s, b);
+                let mut phi = BLOCKS[s].first;
+                while phi != 0 && INSTS[phi].op == OP_PHI {
+                    let t = tracked(ir_arg(phi, index));
+                    if t >= 0 {
+                        bit_set(out, t);
+                    }
+                    phi = INSTS[phi].next;
+                }
+            }
+            let live_in = live_set(LIVE_IN, k);
+            let g = live_set(gen, k);
+            let d = live_set(kill, k);
+            for w in 0..LIVE_WORDS {
+                let value = g[w] | (out[w] & ~d[w]);
+                if value != live_in[w] {
+                    live_in[w] = value;
+                    changed = true;
+                }
+            }
+            k -= 1;
+        }
+    }
+    free(gen as *u8);
+    free(kill as *u8);
+}
+
+fn extend(t: i64, pos: i64) {
+    if t < 0 {
+        return;
+    }
+    if pos < RA_START[t] {
+        RA_START[t] = pos;
+    }
+    if pos > RA_END[t] {
+        RA_END[t] = pos;
+    }
+}
+
+fn build_intervals() {
+    for t in 0..RA_VALS.count {
+        RA_START[t] = 0x7fffffffffffffff;
+        RA_END[t] = -1;
+        RA_LOC[t] = LOC_NONE;
+        RA_HINT[t] = -1;
+    }
+    for k in 0..ORDER.count {
+        let b = ORDER.data[k];
+        let start = BSTART.data[k];
+        let end = BEND.data[k];
+        let live_in = live_set(LIVE_IN, k);
+        let out = live_set(LIVE_OUT, k);
+        for t in 0..RA_VALS.count {
+            if bit_get(live_in, t) {
+                extend(t, start);
+            }
+            if bit_get(out, t) {
+                extend(t, end);
+            }
+        }
+        let mut v = BLOCKS[b].first;
+        while v != 0 {
+            extend(tracked(v), INSTS[v].mark);
+            if INSTS[v].op == OP_PHI {
+                for i in 0..INSTS[v].nargs {
+                    let pred = BLOCKS[b].preds.data[i];
+                    let t = tracked(ir_arg(v, i));
+                    extend(t, BEND.data[BLOCKS[pred].order]);
+                    if t >= 0 && RA_HINT[t] < 0 {
+                        RA_HINT[t] = tracked(v);
+                    }
+                }
+            } else {
+                for i in 0..ir_operand_count(v) {
+                    extend(tracked(ir_operand(v, i)), INSTS[v].mark);
+                }
+                if is_fused_compare(v) {
+                    // Its operands are read again by the branch.
+                    extend(tracked(INSTS[v].a), end);
+                    extend(tracked(INSTS[v].b), end);
+                }
+            }
+            v = INSTS[v].next;
+        }
+        extend(tracked(BLOCKS[b].cond), end);
+    }
+}
+
+// ---- Linear scan ----
+
+// Whether the interval of dense index t contains a call strictly inside.
+fn crosses_call(t: i64) -> bool {
+    let start = RA_START[t];
+    let end = RA_END[t];
+    // Binary search for the first call after start.
+    let mut lo = 0;
+    let mut hi = CALL_POS.count;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if CALL_POS.data[mid] <= start {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo < CALL_POS.count && CALL_POS.data[lo] < end
+}
+
+// Sorts the dense indices by interval start (merge sort, stable).
+fn sorted_by_start() -> *i64 {
+    let n = RA_VALS.count;
+    let items = alloc_zeroed(n * 8 + 8) as *i64;
+    let tmp = alloc_zeroed(n * 8 + 8) as *i64;
+    for i in 0..n {
+        items[i] = i;
+    }
+    let mut width = 1;
+    while width < n {
+        let mut lo = 0;
+        while lo < n {
+            let mid = min_i64(lo + width, n);
+            let hi = min_i64(lo + 2 * width, n);
+            let mut i = lo;
+            let mut j = mid;
+            let mut k = lo;
+            while k < hi {
+                if i < mid && (j >= hi || RA_START[items[i]] <= RA_START[items[j]]) {
+                    tmp[k] = items[i];
+                    i += 1;
+                } else {
+                    tmp[k] = items[j];
+                    j += 1;
+                }
+                k += 1;
+            }
+            lo += 2 * width;
+        }
+        for i in 0..n {
+            items[i] = tmp[i];
+        }
+        width *= 2;
+    }
+    free(tmp as *u8);
+    items
+}
+
+fn min_i64(a: i64, b: i64) -> i64 {
+    if a < b { a } else { b }
+}
+
+// The registers available for allocation, by bank and by kind: fills
+// `regs` and returns the count.
+fn alloc_regs(float: bool, callee_saved: bool, regs: *i64) -> i64 {
+    let mut n = 0;
+    if X86 {
+        if float {
+            if !callee_saved {
+                // xmm14 and xmm15 are the parallel-move temporaries.
+                for r in 2..14 {
+                    regs[n] = 32 + r;
+                    n += 1;
+                }
+            }
+        } else if callee_saved {
+            let list: [i64; 5] = [3, 12, 13, 14, 15];
+            for i in 0..5 {
+                regs[n] = list[i];
+                n += 1;
+            }
+        } else {
+            let list: [i64; 4] = [6, 7, 8, 9];
+            for i in 0..4 {
+                regs[n] = list[i];
+                n += 1;
+            }
+        }
+        return n;
+    }
+    if float {
+        if callee_saved {
+            for r in 8..16 {
+                regs[n] = 32 + r;
+                n += 1;
+            }
+        } else {
+            // d30 and d31 are the parallel-move temporaries.
+            for r in 16..30 {
+                regs[n] = 32 + r;
+                n += 1;
+            }
+        }
+    } else if callee_saved {
+        for r in 19..29 {
+            regs[n] = r;
+            n += 1;
+        }
+    } else {
+        for r in 9..16 {
+            regs[n] = r;
+            n += 1;
+        }
+    }
+    n
+}
+
+fn is_callee_saved_reg(r: i64) -> bool {
+    if X86 {
+        return r == 3 || (r >= 12 && r <= 15);
+    }
+    (r >= 19 && r <= 28) || (r >= 40 && r <= 47)
+}
+
+static mut REG_OWNER: [i64; 64] = [0; 64];
+static mut ACTIVE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+fn spill(t: i64) {
+    RA_LOC[t] = 0 - (1 + SPILL_COUNT);
+    SPILL_COUNT += 1;
+}
+
+// A free register for dense index t from `regs`, or -1.
+fn free_reg(regs: *i64, count: i64) -> i64 {
+    for i in 0..count {
+        if REG_OWNER[regs[i]] < 0 {
+            return regs[i];
+        }
+    }
+    -1
+}
+
+// The register of a phi partner of t (a phi it feeds, or for a phi one
+// of its operands) when that register is free and suits t, or -1.
+fn hinted_reg(t: i64, float: bool, crossing: bool) -> i64 {
+    let v = RA_VALS.data[t];
+    if INSTS[v].op == OP_PHI {
+        // The phi it feeds first, then its operands.
+        let r = suitable_hint(RA_HINT[t], float, crossing);
+        if r >= 0 {
+            return r;
+        }
+        for i in 0..INSTS[v].nargs {
+            let r = suitable_hint(tracked(ir_arg(v, i)), float, crossing);
+            if r >= 0 {
+                return r;
+            }
+        }
+        return -1;
+    }
+    suitable_hint(RA_HINT[t], float, crossing)
+}
+
+fn suitable_hint(partner: i64, float: bool, crossing: bool) -> i64 {
+    if partner < 0 {
+        return -1;
+    }
+    let mut r = RA_LOC[partner];
+    if r == LOC_NONE && RA_HINT[partner] >= 0 {
+        // Not allocated yet: the register of the phi it feeds in turn.
+        r = RA_LOC[RA_HINT[partner]];
+    }
+    if r < 0 || r >= 64 || REG_OWNER[r] >= 0 || (r >= 32) != float {
+        return -1;
+    }
+    if crossing && !is_callee_saved_reg(r) {
+        return -1;
+    }
+    r
+}
+
+fn assign_reg(t: i64, r: i64) {
+    RA_LOC[t] = r;
+    REG_OWNER[r] = t;
+    intvec_push(&ACTIVE, t);
+    if is_callee_saved_reg(r) {
+        CALLEE_USED[r] = 1;
+    }
+}
+
+fn linear_scan() {
+    SPILL_COUNT = 0;
+    for r in 0..64 {
+        REG_OWNER[r] = -1;
+        CALLEE_USED[r] = 0;
+    }
+    ACTIVE.count = 0;
+    let items = sorted_by_start();
+    let mut caller: [i64; 32] = [0; 32];
+    let mut callee: [i64; 32] = [0; 32];
+    for i in 0..RA_VALS.count {
+        let t = items[i];
+        let start = RA_START[t];
+        // Expire the intervals that end before this one starts.
+        let mut k = 0;
+        while k < ACTIVE.count {
+            let a = ACTIVE.data[k];
+            if RA_END[a] <= start {
+                REG_OWNER[RA_LOC[a]] = -1;
+                ACTIVE.data[k] = ACTIVE.data[ACTIVE.count - 1];
+                ACTIVE.count -= 1;
+            } else {
+                k += 1;
+            }
+        }
+        let float = is_float(INSTS[RA_VALS.data[t]].ty);
+        let crossing = crosses_call(t);
+        let caller_count = alloc_regs(float, false, &caller as *i64);
+        let callee_count = alloc_regs(float, true, &callee as *i64);
+        let mut r = hinted_reg(t, float, crossing);
+        if r < 0 && !crossing {
+            r = free_reg(&caller as *i64, caller_count);
+        }
+        if r < 0 {
+            r = free_reg(&callee as *i64, callee_count);
+        }
+        if r >= 0 {
+            assign_reg(t, r);
+            continue;
+        }
+        // No register: spill the interval that ends last (among those
+        // whose register this one could use).
+        let mut victim = -1;
+        for k2 in 0..ACTIVE.count {
+            let a = ACTIVE.data[k2];
+            let reg = RA_LOC[a];
+            if (reg >= 32) != float {
+                continue;
+            }
+            if crossing && !is_callee_saved_reg(reg) {
+                continue;
+            }
+            if victim < 0 || RA_END[a] > RA_END[victim] {
+                victim = a;
+            }
+        }
+        if victim >= 0 && RA_END[victim] > RA_END[t] {
+            let reg = RA_LOC[victim];
+            spill(victim);
+            for k3 in 0..ACTIVE.count {
+                if ACTIVE.data[k3] == victim {
+                    ACTIVE.data[k3] = ACTIVE.data[ACTIVE.count - 1];
+                    ACTIVE.count -= 1;
+                    break;
+                }
+            }
+            REG_OWNER[reg] = -1;
+            assign_reg(t, reg);
+        } else {
+            spill(t);
+        }
+    }
+    free(items as *u8);
+}
+
+// The location of value v (LOC_NONE when it has none).
+fn loc_of(v: i64) -> i64 {
+    let t = INSTS[v].aux - 1;
+    if t < 0 {
+        return LOC_NONE;
+    }
+    RA_LOC[t]
+}
+
+// Allocates function `fi`: layout, positions, liveness, intervals and
+// locations.
+fn allocate_registers(fi: i64) {
+    IRF = fi;
+    split_critical_edges(fi);
+    layout_blocks(fi);
+    number_positions();
+    compute_liveness();
+    build_intervals();
+    linear_scan();
+}

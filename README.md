@@ -42,7 +42,7 @@ On macOS, with the Xcode command line tools and Rust (rustup):
 ```
 $ bootstrap/bootstrap.sh
 ...
-compiler: target/tachyonc (tachyonc 0.1.0 (host: aarch64-macos))
+compiler: target/tachyonc (tachyonc 0.2.0 (host: aarch64-macos))
 ```
 
 On x86-64 Linux, with git, gcc (or clang) and the libc headers, and Rust
@@ -51,7 +51,7 @@ On x86-64 Linux, with git, gcc (or clang) and the libc headers, and Rust
 ```
 $ bootstrap/bootstrap.sh
 ...
-compiler: target/tachyonc (tachyonc 0.1.0 (host: x86_64-linux))
+compiler: target/tachyonc (tachyonc 0.2.0 (host: x86_64-linux))
 ```
 
 Every step is checked: each compiler must compile itself to identical
@@ -72,12 +72,21 @@ links; on macOS, give `cc` the matching `-arch arm64` or `-arch x86_64`
 when it is not the host's. Several files form one program:
 `tachyonc a.tach b.tach -o out.s`.
 
+The compiler optimizes: `-O2` (the default) inlines, moves invariant code
+out of loops, propagates constants, numbers values and allocates
+registers; `-O1` does the same without inlining and loop motion; `-O0` is
+plain stack-machine code. `--emit-ir` shows the optimized IR. See
+[docs/optimizer.md](docs/optimizer.md).
+
 ## Tests
 
 ```
 $ tests/run.sh                       # the suite, with target/tachyonc, for the host
 $ tests/run.sh -c path/to/tachyonc prog_
 $ tests/run.sh -t x86_64-macos       # x86-64 on Apple silicon, under Rosetta
+$ tests/run.sh -O 0                  # at another optimization level (0, 1, 2)
+$ tests/fuzz/run.sh -n 500           # random programs: -O0, -O1 and -O2 must agree
+$ bench/run.sh                       # benchmarks against cc -O2
 $ bootstrap/linux-check.sh           # the whole chain on x86-64 Linux, in docker
 $ cd seed && cargo test              # the seed's own tests
 ```
@@ -88,6 +97,7 @@ $ cd seed && cargo test              # the seed's own tests
 |---|---|
 | `compiler/` | the tachyon compiler, in tachyon ([compiler/README.md](compiler/README.md)) |
 | `examples/`, `tests/` | examples and the test suite of this release |
-| `docs/` | the grammar, and the release process |
+| `docs/` | the grammar, the optimizer, the release process and the roadmap |
+| `bench/` | benchmarks (with C equivalents) and their runner |
 | `bootstrap/` | the release chain (`releases.toml`), the script that replays it, and the Linux container check |
 | `seed/` | the seed: the frozen Rust implementation, the root of the chain ([seed/README.md](seed/README.md)) |
