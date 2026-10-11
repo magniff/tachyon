@@ -8,6 +8,8 @@ $ tachyonc examples/md5.tach -o md5.s && cc -o md5 md5.s -lm
 $ tachyonc --target x86_64-linux compiler/src/*.tach -o linux.s   # cross-compile
 $ tachyonc -O0 examples/md5.tach -o md5.s     # -O0, -O1 or -O2 (the default)
 $ tachyonc --emit-ir examples/md5.tach -o md5.ir    # the optimized IR
+$ tachyonc --emit-imports prog.tach -o decls.tach   # what `import "x.h";` declares
+$ tachyonc --emit-header prog.tach -o prog.h        # the program's C header
 $ tachyonc --tokens file.tach        # the token dump (same format as the seed's `tachyon tokens`)
 $ tachyonc --version                 # the release and the host
 ```
@@ -32,6 +34,9 @@ format (`error[type error]: ...` / ` --> file: line L, column C` /
 |---|---|
 | `00_base.tach` | C library declarations, growable arrays, byte buffers, the symbol interner, source files, error reporting |
 | `10_lexer.tach` | source text to tokens; token for token the same as the seed's lexer |
+| `15_cpp.tach` | `import` (1/2): the C preprocessor, with the target C compiler's macros and include path |
+| `16_cimport.tach` | `import` (2/2): C declarations and layouts, written out as tachyon source |
+| `17_cheader.tach` | `--emit-header`: the C header of a program |
 | `20_ast.tach` | the AST: an arena of uniform nodes (`NODES`), child lists in `LISTS` |
 | `21_parser.tach` | recursive descent for items and statements, a Pratt parser for expressions |
 | `30_types.tach` | interned types, layouts, the tables of structs, functions, constants and statics |
@@ -131,7 +136,8 @@ language was checked with it: identical output for all 7,500 compilations
 ## Known limits
 
 - One error per compilation (the seed recovers and reports all of them).
-- `#[repr(C, align(N))]` takes N up to 16 (frames are not realigned).
+- `#[repr(C, align(N))]` takes N up to 16 (frames are not realigned); C
+  records aligned above 16 are imported opaque.
 - Targets: AArch64 macOS, x86-64 Linux and macOS. No AArch64 Linux yet.
 - The optimizer's limits are listed at the end of
   [docs/optimizer.md](../docs/optimizer.md).

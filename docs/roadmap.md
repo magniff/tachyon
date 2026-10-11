@@ -97,16 +97,53 @@ for, it is exact.
   calls; the 0.2 `extern fn` form accepted, deprecated. Gate: the ABI
   conformance fuzzer (`tests/abi/run.sh`), at least 1000 signatures clean
   per target.
-- **0.4**: `import "stdio.h"`: a C preprocessor and a declaration parser in
-  tachyon, mapping C types to tachyon and producing `extern "C"`
-  declarations and `#[repr(C)]` types; `--emit-header` for `extern "C"`
-  items and `#[repr(C)]` types; the compiler's own source moves to
-  `extern "C"` blocks and the deprecated form goes away;
-  `#[repr(C, align(N))]` above 16 (realigned frames).
+- [x] **0.4**: `import "stdio.h";` reads C headers as the target's C
+  compiler does (its predefined macros and include path come from
+  `cc -dM -E -v`): a C preprocessor (`#include_next`, `#pragma once`,
+  `#pragma pack`, GNU variadic macros, `__has_include`) and a declaration
+  reader in tachyon, written out as tachyon source (`--emit-imports`
+  shows it): `#[repr(C)]` records with C's layout (bit-fields, `packed`,
+  `aligned` and `#pragma pack` as explicit padding or `packed(N)`),
+  typedefs and enums as aliases, enumerators and constant macros as
+  constants, macro aliases of variables and functions, an `extern "C"`
+  block with `#[link_name]` for asm-label renames; what tachyon cannot
+  express (long double on x86-64, `_Complex`, `__int128`, vectors,
+  thread-local variables, static and inline functions) is left out and
+  named, with the reason, when used. `--emit-header` writes the C header
+  of a program (`extern "C"` functions and statics, `#[repr(C)]` and
+  integer-repr types, with `_Static_assert`s of every layout). The
+  compiler's own source moved to `extern "C"` blocks; the deprecated
+  form is gone. Gates: `tests/cimport/layout.sh` (sizes, alignments
+  and offsets of every record of 55 to 65 system headers agree with C),
+  `tests/abi/run.sh -i` (signatures through `import`) and `-H` (C
+  through the emitted header), 1000 signatures per target each.
+- 0.5: `#[repr(C, align(N))]` above 16 (needs realigned stack frames);
+  `import` into a module's namespace; function-like macros that are
+  expressions (as inline functions); `errno` (a macro around a function
+  call: use `*__error()` on macOS, `*__errno_location()` with glibc).
 
 ## 0.4: loops
 
 The compiler's own source starts using enums, `match`, methods and slices.
+
+Language (front end):
+
+- [x] `import "header.h";` and `--emit-header` (see the C interop track)
+- [x] `use E::*;` and `use E::{A, B};`: an enum's variants by their own
+  names, in expressions, calls and patterns
+- [x] `const` of fieldless enum types; C strings (`c"..."`) as `const`
+  and `static` initializers
+- [x] `n as E` for fieldless enums, checked (an invalid value exits with
+  101: "invalid value V for enum E"); `<`, `<=`, `>`, `>=` on fieldless
+  enums (declaration order); variant ranges `E::A..=E::C` in patterns
+- [x] `size_of(T)` and `align_of(T)`, integer constants
+- [x] `for x in s` over slices and arrays
+- [x] a slice's `len` is `i64` (was `u64`)
+- [x] raw identifiers (`r#type`), `#[link_name = "..."]` in extern
+  blocks, `#[repr(C, packed(N))]`, statics shared with C may be arrays
+
+Optimizations:
+
 
 - loop canonicalization: preheaders, single latch, dedicated exits, LCSSA
 - scalar evolution (add recurrences) and induction variable simplification

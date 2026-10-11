@@ -1,9 +1,9 @@
 # Tachyon grammar
 
-This is the grammar of tachyon 0.3, as the compiler implements it
+This is the grammar of tachyon 0.4, as the compiler implements it
 (`compiler/src/10_lexer.tach`, `compiler/src/21_parser.tach`; the seed
 implements the language of 0.1 in `seed/src/lexer` and `seed/src/parser`).
-What 0.3 added is marked *(0.3)*.
+What 0.3 added is marked *(0.3)*, what 0.4 added *(0.4)*.
 Items and statements are parsed by recursive descent, expressions by a Pratt
 (binding power) parser using the table below.
 
@@ -18,6 +18,7 @@ comment      = "//" { any - "\n" }
              | "/*" { any | comment } "*/" ;          (* block comments nest *)
 ident        = ( "_" | ascii_letter ) { "_" | ascii_letter | digit } ;
                                                        (* "_" alone is the wildcard pattern *)
+raw_ident    = "r#" ident ;                            (* (0.4) an identifier even if a keyword: r#type *)
 int_lit      = ( dec_digits | "0x" hex_digits | "0b" bin_digits ) [ int_suffix ] ;
 float_lit    = dec_digits "." dec_digits [ exponent ] [ float_suffix ]
              | dec_digits exponent [ float_suffix ]
@@ -38,9 +39,10 @@ tuple index, so `t.0.1` is `(t.0).1`. A literal must not be followed
 directly by other letters (`3e` and `1foo` are errors).
 
 **Keywords:** `as break const continue else enum extern false fn for if impl
-in let loop match mut return static struct true type union while`.
+import in let loop match mut return static struct true type union use while`
+(`import` and `use` since 0.4).
 
-**Reserved** (an error if used): the keywords `trait pub mod use super where
+**Reserved** (an error if used): the keywords `trait pub mod super where
 unsafe defer dyn move`, and the tokens `?` `@`. `self` and `Self` are
 ordinary names, with a meaning in methods (see Items).
 
@@ -54,22 +56,27 @@ are two `*`.
 ```ebnf
 program      = { item } EOF ;
 item         = fn_decl | extern_item | [ attributes ] ( struct_decl | union_decl | enum_decl )
-             | impl_block | const_decl | static_decl | type_alias ;
+             | impl_block | const_decl | static_decl | type_alias
+             | import_item | use_item ;                 (* (0.4) *)
+import_item  = "import" string_lit ";" ;              (* (0.4) a C header, see "Importing C headers" *)
+use_item     = "use" ident "::" ( "*" | ident | "{" ident { "," ident } [ "," ] "}" ) ";" ;
+                                                       (* (0.4) variants of an enum by their names *)
 
 fn_decl      = "fn" ident "(" [ params ] ")" [ "->" type ] block ;
 params       = param { "," param } [ "," ] ;
 param        = [ "mut" ] ident ":" type ;              (* "_" ignores the argument *)
 
-extern_item  = "extern" '"C"' "{" { c_fn | c_static } "}"            (* (0.3) imports from C *)
+extern_item  = "extern" '"C"' "{" { [ link_name ] ( c_fn | c_static ) } "}"   (* (0.3) imports from C *)
              | "extern" '"C"' fn_decl                                 (* (0.3) C's convention, an unmangled symbol *)
              | "extern" '"C"' "static" [ "mut" ] ident ":" type "=" expr ";" ;  (* (0.3) a static C can use *)
                                        (* 0.2's `extern fn f(...);` was removed in 0.4 *)
 c_fn         = "fn" ident "(" [ c_params ] ")" [ "->" type ] ";" ;
 c_params     = "..." | param { "," param } [ "," [ "..." ] ] ;
 c_static     = "static" [ "mut" ] ident ":" type ";" ;
+link_name    = "#" "[" "link_name" "=" string_lit "]" ;   (* (0.4) the C symbol, when not the name *)
 
 attributes   = { "#" "[" "repr" "(" repr { "," repr } ")" "]" } ;    (* (0.3) *)
-repr         = "C" | "packed" | "align" "(" int_lit ")" | int_type ;
+repr         = "C" | "packed" [ "(" int_lit ")" ] | "align" "(" int_lit ")" | int_type ;   (* packed(N): (0.4) *)
 
 struct_decl  = "struct" ident "{" [ field { "," field } [ "," ] ] "}" ;
 union_decl   = "union" ident "{" [ field { "," field } [ "," ] ] "}" ;   (* (0.3) #[repr(C)] only *)
@@ -78,7 +85,7 @@ enum_decl    = "enum" ident "{" [ variant { "," variant } [ "," ] ] "}" ;   (* (
 variant      = ident [ "(" type { "," type } [ "," ] ")" ] [ "=" expr ] ;  (* "=": fieldless enums only *)
 impl_block   = "impl" ident "{" { fn_decl } "}" ;                    (* (0.3) *)
 
-const_decl   = "const" ident ":" type "=" expr ";" ;   (* integer, float or bool; evaluated at compile time *)
+const_decl   = "const" ident ":" type "=" expr ";" ;   (* integer, float, bool, fieldless enum (0.4) or C string (0.4) *)
 static_decl  = "static" [ "mut" ] ident ":" type "=" expr ";" ;   (* constant initializer *)
 type_alias   = "type" ident "=" type ";" ;
 ```
@@ -126,6 +133,8 @@ pattern  = single { "|" single } ;                     (* (0.3) alternatives *)
 single   = "_" | [ "mut" ] ident                      (* a binding, or a constant's name *)
          | literal [ "..=" literal ]                  (* (0.3) integers, chars and bools; inclusive ranges *)
          | ident "::" ident [ "(" [ pattern { "," pattern } [ "," ] ] ")" ]   (* (0.3) a variant *)
+         | ident "::" ident "..=" ident "::" ident    (* (0.4) variants in declaration order *)
+         | ident "(" [ pattern { "," pattern } [ "," ] ] ")"   (* (0.4) a variant brought in by `use` *)
          | "(" [ pattern { "," pattern } [ "," ] ] ")" ;
 literal  = [ "-" ] int_lit | char_lit | "true" | "false" | ident ;   (* ident: a constant *)
 ```
@@ -190,7 +199,7 @@ match_expr  = "match" cond "{" { arm } "}" ;          (* (0.3) *)
 arm         = pattern [ "if" expr ] "=>" ( block_like [ "," ] | expr ( "," | before "}" ) ) ;
 loop_expr   = "loop" block ;                          (* its value comes from `break value` *)
 while_expr  = "while" cond block ;
-for_expr    = "for" pattern "in" range block ;        (* range: a..b or a..=b, integers *)
+for_expr    = "for" pattern "in" ( range | expr ) block ;   (* a..b, a..=b; slices and arrays (0.4) *)
 cond        = expr ;                                  (* without struct literals at the top level *)
 ```
 
@@ -306,3 +315,94 @@ The parser reports every independent syntax error. After an error it skips
 to the end of the statement (`;`), the end of the block (`}`), or the next
 `let` or item keyword, replaces the broken statement by an error node, and
 continues. An item keyword inside a block ends the block (a missing `}`).
+
+## Additions of 0.4
+
+**Enums.** A `const` may have a fieldless enum type (`const F: Color =
+Color::Green;`); in a pattern its name matches its variant. `n as E`
+converts an integer to a fieldless enum, checked: a value that is no
+variant's discriminant writes `invalid value V for enum E` to stderr and
+exits with code 101, at every optimization level. Fieldless enums compare
+with `<`, `<=`, `>` and `>=` in declaration order, which must be the order
+of their discriminants (an error otherwise). `E::A..=E::C` matches the
+variants from `A` to `C` in declaration order (variants without fields).
+`use E::*;` and `use E::{A, B};` bring variants into scope by their own
+names: as values (`A`), calls (`B(1, 2)`) and patterns (`A`, `B(x, _)`).
+A local, constant, static or function of the same name wins. `use` is the
+keyword modules will extend (0.5): `use path::{...};`.
+
+**Layout queries.** `size_of(T)` and `align_of(T)` are integer constants
+typed like an integer literal (`[u8; size_of(Header)]`). For a tachyon
+type they are fixed per compiler, not by the language. (A program's own
+functions named `size_of` or `align_of` win.)
+
+**Strings.** `c"..."` initializes a `const` or a `static` of type `*u8`:
+the address of the bytes (`const PROMPT: *u8 = c"> ";`).
+
+**Slices.** `s.len` is `i64` (it was `u64`): lengths and indices mix
+without casts. Indexing takes any integer type. `for x in s` iterates a
+slice or an array by value (the sequence is evaluated once; `break`,
+`continue` and labels work as in other loops).
+
+**Raw identifiers.** `r#name` is an identifier even when `name` is a
+keyword (`s.r#type`); C names that are tachyon keywords are imported so.
+
+**C.** `#[repr(C, packed(N))]` aligns fields to at most N (GCC's
+`#pragma pack(N)`); `#[link_name = "sym"]` in an extern block names the C
+symbol of a declaration; a static shared with C may be an array.
+
+## Importing C headers
+
+`import "stdio.h";` *(0.4)* reads a C header and adds its declarations to
+the program; `import "./mylib.h";` (a path starting with `./` or `../`)
+is relative to the importing file; `-I DIR` adds include directories. All
+imports of a program are read as one translation unit, as the target's C
+compiler reads them: its predefined macros and its include path come
+from `cc -dM -E -v` (`$TACHYON_CC` instead of `cc`), so headers need the
+target's C compiler on the host (a macOS host for both macOS targets, an
+x86-64 Linux host for `x86_64-linux`).
+
+What a header declares becomes tachyon declarations
+(`tachyonc --emit-imports file.tach -o decls.tach` shows them):
+
+| C | tachyon |
+|---|---|
+| `char` (plain), `signed char`, `unsigned char` | `u8`, `i8`, `u8` (`c"..."` strings are `*u8`) |
+| `short`, `int`, `long`, `long long`, and the unsigned ones | `i16`, `i32`, `i64`, `i64`, and `u16` ... `u64` |
+| `_Bool`, `float`, `double` | `bool`, `f32`, `f64` |
+| `long double` | `f64` on aarch64-macos; not imported on x86-64 |
+| `void *`, `T *` | `*u8`, `*T` |
+| function pointers | `extern "C" fn(...) -> R` (variadic ones: `*u8`) |
+| `struct`, `union` | `#[repr(C)]` types with C's exact layout: bit-fields become byte arrays (`_bitfield0`); `aligned`, `packed` and `#pragma pack` become `align(N)`, `packed(N)` or padding fields (`_pad0`); anonymous members are fields `_anon0` of types `<Struct>_anon0` |
+| `typedef` | a `type` alias; a typedef of an anonymous struct names it |
+| `enum` | `type E = u32;` (`i32` with negative values, the smallest with `packed`) and a `const` of type `E` per enumerator (`i32` for anonymous enums) |
+| object-like macros of integer or float constants | a `const` of their C type (`#define SIZE ((size_t)-1)` is `const SIZE: size_t`) |
+| macros naming a variable or a function (`#define stdin __stdinp`) | the same symbol under the macro's name |
+| functions, `extern` variables | an `extern "C"` block; asm labels (`realpath` as `_realpath$DARWIN_EXTSN`) become `#[link_name]` |
+
+Tags and ordinary names share tachyon's type namespace: a tag whose name
+a different typedef takes is renamed `struct_<tag>`. A record whose C
+layout tachyon cannot express (alignment above 16; packed and aligned at
+once), or that holds such a record or a type left out, is imported as an
+opaque struct, usable through pointers. Left out, and named with the
+reason when a program uses them: `long double` (x86-64), `_Complex`,
+`__int128`, vector types, thread-local variables, `static` and `inline`
+functions, variables defined in the header, function-like macros, string
+macros, `errno` (a macro around a call: `*__error()` on macOS,
+`*__errno_location()` with glibc). The program's own declarations win
+over imported ones of the same name (a program may declare
+`extern "C" { fn printf(...) -> i32; }` and import `stdio.h`). Imported
+names are global; 0.5's modules will give them a namespace.
+
+## C headers of a program
+
+`tachyonc --emit-header prog.tach -o prog.h` *(0.4)* writes the C view of
+a program: its `extern "C" fn` definitions and `extern "C"` statics, and
+the `#[repr(C)]` and integer-repr types they need, in dependency order,
+with an include guard, `extern "C"` for C++, and a `_Static_assert` of
+each type's layout. A fieldless enum is its integer type with constants
+`E_V`; an enum with fields is RFC 2195's struct (`tag`, then a union `u`
+of `struct { _0; _1; } V`), an integer-repr one a union of structs that
+start with the tag; `packed(N)` is `#pragma pack(N)`. Types of default
+layout appear only behind pointers, as incomplete structs. A name that is
+a C keyword is an error.
