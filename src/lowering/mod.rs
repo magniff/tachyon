@@ -149,6 +149,8 @@ pub enum Inst {
     },
 
     SlotAddr(VReg, Slot),
+    // Address of IrProgram::globals[index]
+    GlobalAddr(VReg, usize),
     MemberPtr(VReg, VReg, u64),
     IndexPtr(VReg, VReg, VReg, u64),
 
@@ -207,10 +209,20 @@ pub struct StringConstant {
     pub bytes: Vec<u8>,
 }
 
+// A `static`: its initial bytes, laid out for the target.
+#[derive(Debug, Clone)]
+pub struct GlobalData {
+    pub name: String,
+    pub bytes: Vec<u8>,
+    pub align: u64,
+    pub mutable: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct IrProgram {
     pub functions: Vec<IRFunction>,
     pub strings: Vec<StringConstant>,
+    pub globals: Vec<GlobalData>,
 }
 
 // Layout
@@ -231,7 +243,7 @@ pub fn layout_of(ty: &TypeInternal, structs: &HashMap<String, StructInfo>) -> La
         TypeInternal::I32 | TypeInternal::U32 | TypeInternal::F32 => Layout { size: 4, align: 4 },
         TypeInternal::I64 | TypeInternal::U64 | TypeInternal::F64 => Layout { size: 8, align: 8 },
         TypeInternal::Pointer(_) | TypeInternal::Fn { .. } => Layout { size: 8, align: 8 },
-        TypeInternal::Unit => Layout { size: 0, align: 1 },
+        TypeInternal::Unit | TypeInternal::Never => Layout { size: 0, align: 1 },
         TypeInternal::Tuple(es) => compound_layout(es.iter(), structs),
         TypeInternal::Array(e, n) => {
             let el = layout_of(e, structs);
@@ -301,26 +313,18 @@ fn is_compound(ty: &TypeInternal) -> bool {
         TypeInternal::Struct(_) | TypeInternal::Tuple(_) | TypeInternal::Array(_, _)
     )
 }
-
-fn ir_to_lang_ty(ir: IRType) -> TypeInternal {
-    match ir {
-        IRType::I8 => TypeInternal::I8,
-        IRType::I16 => TypeInternal::I16,
-        IRType::I32 => TypeInternal::I32,
-        IRType::I64 => TypeInternal::I64,
-        IRType::F32 => TypeInternal::F32,
-        IRType::F64 => TypeInternal::F64,
-        IRType::Ptr => TypeInternal::Pointer(Box::new(TypeInternal::U8)),
-    }
+// Types without a runtime value.
+fn is_void(ty: &TypeInternal) -> bool {
+    matches!(ty, TypeInternal::Unit | TypeInternal::Never)
 }
 
-// Where a local lives
-#[derive(Debug, Clone)]
-enum Place {
-    // We'll place everything into Addresses for now
-    Address(VReg, TypeInternal),
-    #[allow(dead_code)]
-    Register(VReg, IRType),
+// A loop that `break`/`continue` can target.
+struct LoopTarget {
+    label: Option<String>,
+    continue_bb: BlockId,
+    break_bb: BlockId,
+    // Where `break value` stores the loop's value.
+    result: Option<(VReg, TypeInternal)>,
 }
 
 // Lowering context
@@ -332,12 +336,15 @@ struct Lowerer<'a> {
     slots: Vec<SlotInfo>,
     vreg_n: u32,
     bb_n: u32,
-    scopes: Vec<HashMap<String, Place>>,
+    // Every local lives in memory: its address and type.
+    scopes: Vec<HashMap<String, (VReg, TypeInternal)>>,
     return_ty: TypeInternal,
     // Hidden pointer to the caller's result slot for compound returns
     sret: Option<VReg>,
-    loop_stack: Vec<(BlockId, BlockId)>,
+    loop_stack: Vec<LoopTarget>,
     strings: Vec<StringConstant>,
+    globals: Vec<GlobalData>,
+    global_index: HashMap<String, usize>,
 }
 
 impl<'a> Lowerer<'a> {
@@ -355,6 +362,8 @@ impl<'a> Lowerer<'a> {
             sret: None,
             loop_stack: Vec::new(),
             strings: Vec::new(),
+            globals: Vec::new(),
+            global_index: HashMap::new(),
         }
     }
 
@@ -377,6 +386,13 @@ impl<'a> Lowerer<'a> {
         let l = layout_of(ty, &self.checked.structs);
         self.alloc_slot(l.size, l.align)
     }
+    // A fresh stack slot for a value of `ty`, and its address.
+    fn temp_for(&mut self, ty: &TypeInternal) -> VReg {
+        let slot = self.alloc_slot_for(ty);
+        let addr = self.fresh_vreg();
+        self.emit(Inst::SlotAddr(addr, slot));
+        addr
+    }
     fn emit(&mut self, i: Inst) {
         self.cur_insts.push(i);
     }
@@ -391,193 +407,66 @@ impl<'a> Lowerer<'a> {
         self.cur_bb = id;
         self.cur_insts = Vec::new();
     }
+    // Ends the current block with `t` and continues in a fresh block that
+    // nothing jumps to (code after `return`, `break`, ...).
+    fn seal_and_start_dead(&mut self, t: Term) {
+        self.seal(t);
+        let dead = self.fresh_bb();
+        self.start(dead);
+    }
     fn push_scope(&mut self) {
         self.scopes.push(HashMap::new());
     }
     fn pop_scope(&mut self) {
         self.scopes.pop();
     }
-    fn define(&mut self, name: String, p: Place) {
-        self.scopes.last_mut().unwrap().insert(name, p);
+    fn define(&mut self, name: String, addr: VReg, ty: TypeInternal) {
+        self.scopes.last_mut().unwrap().insert(name, (addr, ty));
     }
-    fn lookup(&self, name: &str) -> &Place {
-        self.lookup_local(name)
-            .unwrap_or_else(|| panic!("ICE: undefined '{}'", name))
-    }
-    fn lookup_local(&self, name: &str) -> Option<&Place> {
+    fn lookup_local(&self, name: &str) -> Option<&(VReg, TypeInternal)> {
         self.scopes.iter().rev().find_map(|s| s.get(name))
     }
-    // Type of a function used as a value
-    fn fn_value_ty(&self, name: &str) -> TypeInternal {
-        let sig = &self.checked.functions[name];
-        TypeInternal::Fn {
-            params: sig.params.iter().map(|(_, t)| t.clone()).collect(),
-            result: Box::new(sig.return_ty.clone()),
+    // The storage of a variable or static: its address and type. Constants
+    // and functions have none.
+    fn ident_place(&mut self, name: &str) -> Option<(VReg, TypeInternal)> {
+        if let Some(place) = self.lookup_local(name) {
+            return Some(place.clone());
         }
+        let index = *self.global_index.get(name)?;
+        let addr = self.fresh_vreg();
+        self.emit(Inst::GlobalAddr(addr, index));
+        Some((addr, self.checked.statics[name].ty.clone()))
     }
     fn const_zero(&mut self) -> VReg {
         let v = self.fresh_vreg();
         self.emit(Inst::ConstInt(v, 0, IRType::I8));
         v
     }
-
-    fn resolve_ast_type(&self, t: &Type) -> TypeInternal {
-        match &t.kind {
-            TypeKind::Named(n) => match n.as_str() {
-                "i8" => TypeInternal::I8,
-                "i16" => TypeInternal::I16,
-                "i32" => TypeInternal::I32,
-                "i64" => TypeInternal::I64,
-                "u8" => TypeInternal::U8,
-                "u16" => TypeInternal::U16,
-                "u32" => TypeInternal::U32,
-                "u64" => TypeInternal::U64,
-                "f32" => TypeInternal::F32,
-                "f64" => TypeInternal::F64,
-                "bool" => TypeInternal::Bool,
-                "usize" => TypeInternal::U64,
-                _ => TypeInternal::Struct(n.clone()),
-            },
-            TypeKind::Unit => TypeInternal::Unit,
-            TypeKind::Tuple(ts) => {
-                TypeInternal::Tuple(ts.iter().map(|x| self.resolve_ast_type(x)).collect())
+    // A placeholder value of type `ty` for code that is never reached.
+    fn dummy(&mut self, ty: &TypeInternal) -> VReg {
+        match type_internal_to_ir(ty) {
+            Some(ir) if ir.is_float() => {
+                let v = self.fresh_vreg();
+                self.emit(Inst::ConstFloat(v, 0.0, ir));
+                v
             }
-            TypeKind::Array(e, n) => TypeInternal::Array(Box::new(self.resolve_ast_type(e)), *n),
-            TypeKind::Pointer(i) => TypeInternal::Pointer(Box::new(self.resolve_ast_type(i))),
-            TypeKind::Fn { params, result } => TypeInternal::Fn {
-                params: params.iter().map(|x| self.resolve_ast_type(x)).collect(),
-                result: Box::new(self.resolve_ast_type(result)),
-            },
+            Some(ir) => {
+                let v = self.fresh_vreg();
+                self.emit(Inst::ConstInt(v, 0, ir));
+                v
+            }
+            None if is_compound(ty) => self.temp_for(ty),
+            None => self.const_zero(),
         }
     }
 
+    // The type the checker gave the expression in its context.
     fn expr_ty(&self, expr: &Expr) -> TypeInternal {
-        match &expr.kind {
-            ExprKind::IntLiteral(_) => TypeInternal::I64,
-            ExprKind::FloatLiteral(_) => TypeInternal::F64,
-            ExprKind::BoolLiteral(_) => TypeInternal::Bool,
-            ExprKind::UnitLiteral => TypeInternal::Unit,
-            ExprKind::StringLiteral(_) => TypeInternal::Tuple(vec![
-                TypeInternal::Pointer(Box::new(TypeInternal::U8)),
-                TypeInternal::U64,
-            ]),
-            ExprKind::Ident(name) => match self.lookup_local(name) {
-                Some(Place::Register(_, ir)) => ir_to_lang_ty(*ir),
-                Some(Place::Address(_, ty)) => ty.clone(),
-                None => self.fn_value_ty(name),
-            },
-            ExprKind::BinOp { op, lhs, rhs } => match op {
-                BinOp::Eq
-                | BinOp::Neq
-                | BinOp::Lt
-                | BinOp::Gt
-                | BinOp::LtEq
-                | BinOp::GtEq
-                | BinOp::And
-                | BinOp::Or => TypeInternal::Bool,
-                BinOp::Shl | BinOp::Shr => self.expr_ty(lhs),
-                _ => self.binop_operand_ty(lhs, rhs),
-            },
-            ExprKind::UnaryOp { op, expr: inner } => match op {
-                UnaryOp::Not => TypeInternal::Bool,
-                UnaryOp::Deref => {
-                    if let TypeInternal::Pointer(p) = self.expr_ty(inner) {
-                        *p
-                    } else {
-                        panic!("ICE")
-                    }
-                }
-                UnaryOp::AddrOf => TypeInternal::Pointer(Box::new(self.expr_ty(inner))),
-                _ => self.expr_ty(inner),
-            },
-            ExprKind::Cast { ty, .. } => self.resolve_ast_type(ty),
-            ExprKind::Call { callee, .. } => {
-                if let ExprKind::Ident(n) = &callee.kind {
-                    if let Some(sig) = self.checked.functions.get(n) {
-                        return sig.return_ty.clone();
-                    }
-                }
-                if let TypeInternal::Fn { result, .. } = self.expr_ty(callee) {
-                    *result
-                } else {
-                    panic!("ICE")
-                }
-            }
-            ExprKind::Index { expr: a, .. } => {
-                if let TypeInternal::Array(e, _) = self.expr_ty(a) {
-                    *e
-                } else {
-                    panic!("ICE")
-                }
-            }
-            ExprKind::Field { expr: inner, name } => {
-                if let TypeInternal::Struct(s) = self.expr_ty(inner) {
-                    self.checked.structs[&s]
-                        .fields
-                        .iter()
-                        .find(|(n, _)| n == &name.0)
-                        .unwrap()
-                        .1
-                        .clone()
-                } else {
-                    panic!("ICE")
-                }
-            }
-            ExprKind::TupleField { expr: inner, index } => {
-                if let TypeInternal::Tuple(es) = self.expr_ty(inner) {
-                    es[index.0 as usize].clone()
-                } else {
-                    panic!("ICE")
-                }
-            }
-            ExprKind::Tuple(es) => {
-                TypeInternal::Tuple(es.iter().map(|e| self.expr_ty(e)).collect())
-            }
-            ExprKind::Array(es) => {
-                TypeInternal::Array(Box::new(self.expr_ty(&es[0])), es.len() as u64)
-            }
-            ExprKind::ArrayRepeat(v, c) => {
-                let n = if let ExprKind::IntLiteral(n) = c.kind {
-                    n
-                } else {
-                    panic!("ICE")
-                };
-                TypeInternal::Array(Box::new(self.expr_ty(v)), n)
-            }
-            ExprKind::StructConstructor { name, .. } => TypeInternal::Struct(name.0.clone()),
-            ExprKind::Block(b) => {
-                if let Some(t) = &b.expr {
-                    self.expr_ty(t)
-                } else {
-                    TypeInternal::Unit
-                }
-            }
-            ExprKind::If {
-                then_block,
-                else_block,
-                ..
-            } => {
-                if else_block.is_some() {
-                    if let Some(t) = &then_block.expr {
-                        self.expr_ty(t)
-                    } else {
-                        TypeInternal::Unit
-                    }
-                } else {
-                    TypeInternal::Unit
-                }
-            }
-        }
+        self.checked.type_of(expr).clone()
     }
 
-    // Operand type of a binary operator in synthesis mode; mirrors the
-    // typechecker's synth_binop.
-    fn binop_operand_ty(&self, lhs: &Expr, rhs: &Expr) -> TypeInternal {
-        if literal_takes_rhs_type(lhs, rhs) {
-            self.expr_ty(rhs)
-        } else {
-            self.expr_ty(lhs)
-        }
+    fn diverges(&self, expr: &Expr) -> bool {
+        self.checked.diverges(expr)
     }
 
     fn struct_field_offset(&self, ty: &TypeInternal, field: &str) -> (u64, TypeInternal) {
@@ -603,10 +492,17 @@ impl<'a> Lowerer<'a> {
         (offs[idx].0, es[idx].clone())
     }
 
+    // The function a call names directly; a local of the same name shadows
+    // the function and makes the call indirect.
+    fn direct_callee(&self, callee: &Expr) -> Option<&'a FnSig> {
+        match &callee.kind {
+            ExprKind::Ident(n) if self.lookup_local(n).is_none() => self.checked.functions.get(n),
+            _ => None,
+        }
+    }
+
     fn call_return_ty(&self, callee: &Expr) -> TypeInternal {
-        if let ExprKind::Ident(n) = &callee.kind
-            && let Some(sig) = self.checked.functions.get(n)
-        {
+        if let Some(sig) = self.direct_callee(callee) {
             return sig.return_ty.clone();
         }
         if let TypeInternal::Fn { result, .. } = self.expr_ty(callee) {
@@ -617,21 +513,13 @@ impl<'a> Lowerer<'a> {
     }
 
     fn is_variadic_call(&self, callee: &Expr) -> bool {
-        match &callee.kind {
-            ExprKind::Ident(n) => self
-                .checked
-                .functions
-                .get(n)
-                .is_some_and(|sig| sig.is_variadic),
-            _ => false,
-        }
+        self.direct_callee(callee)
+            .is_some_and(|sig| sig.is_variadic)
     }
 
     fn call_param_tys(&self, callee: &Expr) -> Vec<TypeInternal> {
-        if let ExprKind::Ident(n) = &callee.kind {
-            if let Some(sig) = self.checked.functions.get(n) {
-                return sig.params.iter().map(|(_, t)| t.clone()).collect();
-            }
+        if let Some(sig) = self.direct_callee(callee) {
+            return sig.params.iter().map(|(_, t)| t.clone()).collect();
         }
         if let TypeInternal::Fn { params, .. } = self.expr_ty(callee) {
             params
@@ -642,6 +530,23 @@ impl<'a> Lowerer<'a> {
 
     // Top-level
     fn lower_program(&mut self, program: &Program) -> IrProgram {
+        // Statics first, so functions can refer to them.
+        for item in &program.items {
+            if let Item::Static(sd) = item {
+                let info = &self.checked.statics[&sd.name.0];
+                let layout = layout_of(&info.ty, &self.checked.structs);
+                let mut bytes = vec![0u8; layout.size as usize];
+                self.write_const(&info.value, &info.ty, &mut bytes, 0);
+                self.global_index
+                    .insert(sd.name.0.clone(), self.globals.len());
+                self.globals.push(GlobalData {
+                    name: sd.name.0.clone(),
+                    bytes,
+                    align: layout.align,
+                    mutable: info.mutable,
+                });
+            }
+        }
         let mut functions = Vec::new();
         for item in &program.items {
             match item {
@@ -656,11 +561,7 @@ impl<'a> Lowerer<'a> {
                     functions.push(IRFunction {
                         name: ed.name.0.clone(),
                         params,
-                        return_ir: if signature.return_ty == TypeInternal::Unit {
-                            None
-                        } else {
-                            type_internal_to_ir(&signature.return_ty)
-                        },
+                        return_ir: type_internal_to_ir(&signature.return_ty),
                         slots: vec![],
                         blocks: vec![],
                         vreg_counter: 0,
@@ -668,12 +569,47 @@ impl<'a> Lowerer<'a> {
                         is_variadic: signature.is_variadic,
                     });
                 }
-                Item::Struct(_) => {}
+                _ => {}
             }
         }
         IrProgram {
             functions,
             strings: std::mem::take(&mut self.strings),
+            globals: std::mem::take(&mut self.globals),
+        }
+    }
+
+    // Stores a constant's bytes (little-endian) at `offset` of `out`.
+    fn write_const(&self, value: &ConstValue, ty: &TypeInternal, out: &mut [u8], offset: usize) {
+        let size = layout_of(ty, &self.checked.structs).size as usize;
+        match value {
+            ConstValue::Int(v) => {
+                out[offset..offset + size].copy_from_slice(&(*v as u128).to_le_bytes()[..size]);
+            }
+            ConstValue::Float(f) => {
+                if *ty == TypeInternal::F32 {
+                    out[offset..offset + 4].copy_from_slice(&(*f as f32).to_le_bytes());
+                } else {
+                    out[offset..offset + 8].copy_from_slice(&f.to_le_bytes());
+                }
+            }
+            ConstValue::Bool(b) => out[offset] = *b as u8,
+            ConstValue::Aggregate(values) => {
+                let elem_tys: Vec<TypeInternal> = match ty {
+                    TypeInternal::Array(elem, n) => vec![(**elem).clone(); *n as usize],
+                    TypeInternal::Tuple(elems) => elems.clone(),
+                    TypeInternal::Struct(name) => self.checked.structs[name]
+                        .fields
+                        .iter()
+                        .map(|(_, t)| t.clone())
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                let offsets = field_offsets(&elem_tys, &self.checked.structs);
+                for ((v, t), (off, _)) in values.iter().zip(&elem_tys).zip(&offsets) {
+                    self.write_const(v, t, out, offset + *off as usize);
+                }
+            }
         }
     }
 
@@ -701,50 +637,46 @@ impl<'a> Lowerer<'a> {
             self.sret = Some(v);
         }
         for (pname, pty) in &sig.params {
+            // Parameters live in slots, like every local.
+            let addr = self.temp_for(pty);
+            let v = self.fresh_vreg();
             if is_scalar(pty) {
                 let ir = type_internal_to_ir(pty).unwrap();
-                let v = self.fresh_vreg();
                 ir_params.push((v, ir));
-                // Store into slot so param can be reassigned
-                let slot = self.alloc_slot(ir.size(), ir.size());
-                let addr = self.fresh_vreg();
-                self.emit(Inst::SlotAddr(addr, slot));
                 self.emit(Inst::Store(addr, v, ir));
-                self.define(pname.clone(), Place::Address(addr, pty.clone()));
             } else {
-                let slot = self.alloc_slot_for(pty);
-                let addr = self.fresh_vreg();
-                self.emit(Inst::SlotAddr(addr, slot));
-                let src = self.fresh_vreg();
-                ir_params.push((src, IRType::Ptr));
-                let sz = layout_of(pty, &self.checked.structs).size;
+                ir_params.push((v, IRType::Ptr));
+                let size = layout_of(pty, &self.checked.structs).size;
                 self.emit(Inst::MemCopy {
                     dst: addr,
-                    src,
-                    size: sz,
+                    src: v,
+                    size,
                 });
-                self.define(pname.clone(), Place::Address(addr, pty.clone()));
+            }
+            if pname != "_" {
+                self.define(pname.clone(), addr, pty.clone());
             }
         }
 
         let ret = sig.return_ty.clone();
-        self.lower_block_stmts(&fd.body);
-
-        if let Some(tail) = &fd.body.expr {
-            if ret == TypeInternal::Unit {
-                self.lower_expr_discard(tail);
-                self.seal(Term::Ret(None));
-            } else if is_scalar(&ret) {
-                let v = self.lower_expr_to_operand(tail, &ret);
-                let ir = type_internal_to_ir(&ret).unwrap();
-                self.seal(Term::Ret(Some((v, ir))));
-            } else {
-                let addr = self.sret.expect("ICE: compound return without sret");
-                self.lower_expr_to_addr(tail, addr, &ret);
-                self.seal(Term::Ret(Some((addr, IRType::Ptr))));
+        self.push_scope();
+        let diverged = self.lower_stmts(&fd.body);
+        match &fd.body.expr {
+            Some(tail) if !diverged => {
+                if is_void(&ret) {
+                    self.lower_expr_discard(tail);
+                    self.seal(Term::Ret(None));
+                } else if is_scalar(&ret) {
+                    let v = self.lower_expr_to_operand(tail, &ret);
+                    let ir = type_internal_to_ir(&ret).unwrap();
+                    self.seal(Term::Ret(Some((v, ir))));
+                } else {
+                    let addr = self.sret.expect("ICE: compound return without sret");
+                    self.lower_expr_to_addr(tail, addr, &ret);
+                    self.seal(Term::Ret(Some((addr, IRType::Ptr))));
+                }
             }
-        } else {
-            self.seal(Term::Ret(None));
+            _ => self.seal(Term::Ret(None)),
         }
         self.pop_scope();
 
@@ -760,242 +692,379 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    // Block stmts (opens scope, caller pops)
-    fn lower_block_stmts(&mut self, block: &Block) {
-        self.push_scope();
+    // ---- Blocks and statements ----
+
+    // Lowers the block's statements in the current scope; stops after one
+    // that diverges (the rest is unreachable) and returns whether it did.
+    fn lower_stmts(&mut self, block: &Block) -> bool {
         for stmt in &block.stmts {
             self.lower_stmt(stmt);
+            let diverges = match stmt {
+                Stmt::Let(ls) => self.diverges(&ls.init),
+                Stmt::Expr(es) => self.diverges(&es.expr),
+            };
+            if diverges {
+                return true;
+            }
         }
+        false
     }
 
-    // Statements
+    fn lower_block_value(&mut self, block: &Block, expected: &TypeInternal) -> VReg {
+        self.push_scope();
+        let diverged = self.lower_stmts(block);
+        let v = match &block.expr {
+            Some(tail) if !diverged => self.lower_expr_to_operand(tail, expected),
+            _ => self.dummy(expected),
+        };
+        self.pop_scope();
+        v
+    }
+
+    fn lower_block_to_addr(&mut self, block: &Block, dst: VReg, ty: &TypeInternal) {
+        self.push_scope();
+        if !self.lower_stmts(block)
+            && let Some(tail) = &block.expr
+        {
+            self.lower_expr_to_addr(tail, dst, ty);
+        }
+        self.pop_scope();
+    }
+
+    fn lower_block_discard(&mut self, block: &Block) {
+        self.push_scope();
+        if !self.lower_stmts(block)
+            && let Some(tail) = &block.expr
+        {
+            self.lower_expr_discard(tail);
+        }
+        self.pop_scope();
+    }
+
     fn lower_stmt(&mut self, stmt: &Stmt) {
         match stmt {
             Stmt::Let(ls) => self.lower_let(ls),
-            Stmt::Assign(a) => self.lower_assign(a),
-            Stmt::Return(r) => self.lower_return(r),
-            Stmt::Break(_) => self.lower_break(),
-            Stmt::Continue(_) => self.lower_continue(),
-            Stmt::Loop(l) => self.lower_loop(l),
-            Stmt::Expr(es) => {
-                self.lower_expr_discard(&es.expr);
-            }
+            Stmt::Expr(es) => self.lower_expr_discard(&es.expr),
         }
     }
 
+    // Every binding gets its own stack slot, even scalars: assignments in
+    // loops and branches then update the canonical location, and reads in
+    // other blocks see the latest value.
     fn lower_let(&mut self, ls: &LetStmt) {
-        let ty = if let Some(ann) = &ls.ty {
-            self.resolve_ast_type(ann)
-        } else {
-            self.expr_ty(&ls.init)
-        };
-        if ty == TypeInternal::Unit {
-            self.lower_expr_discard(&ls.init);
-            return;
+        let ty = self.expr_ty(&ls.init);
+        match &ls.pattern.kind {
+            PatternKind::Wildcard => self.lower_expr_discard(&ls.init),
+            PatternKind::Binding { name, .. } => {
+                let addr = self.temp_for(&ty);
+                self.store_or_recurse(&ls.init, addr, &ty);
+                self.define(name.clone(), addr, ty);
+            }
+            PatternKind::Tuple(_) => {
+                // Destructure a private copy of the value.
+                let addr = self.temp_for(&ty);
+                self.lower_expr_to_addr(&ls.init, addr, &ty);
+                self.bind_pattern_at(&ls.pattern, addr, &ty);
+            }
         }
-        // Always use a stack slot, even for scalars. This ensures that
-        // assignments in loops/branches update the canonical location and
-        // reads in other basic blocks see the latest value.
-        let slot = self.alloc_slot_for(&ty);
-        let addr = self.fresh_vreg();
-        self.emit(Inst::SlotAddr(addr, slot));
-        if is_scalar(&ty) {
-            let v = self.lower_expr_to_operand(&ls.init, &ty);
-            self.emit(Inst::Store(addr, v, type_internal_to_ir(&ty).unwrap()));
-        } else {
-            self.lower_expr_to_addr(&ls.init, addr, &ty);
-        }
-        self.define(ls.name.0.clone(), Place::Address(addr, ty));
     }
 
-    fn lower_assign(&mut self, a: &AssignStmt) {
-        let (addr, tgt_ty) = self.lower_lvalue_addr(&a.target);
-        match a.op {
-            AssignOp::Assign => {
-                if is_scalar(&tgt_ty) {
-                    let v = self.lower_expr_to_operand(&a.value, &tgt_ty);
-                    self.emit(Inst::Store(addr, v, type_internal_to_ir(&tgt_ty).unwrap()));
-                } else if matches!(a.value.kind, ExprKind::Ident(_) | ExprKind::Call { .. }) {
-                    self.lower_expr_to_addr(&a.value, addr, &tgt_ty);
-                } else {
-                    // The value may read the target (`p = P { x: p.y, y: p.x }`),
-                    // so build it aside and copy it over afterwards.
-                    let tmp = self.expr_addr_of(&a.value, &tgt_ty);
-                    let size = layout_of(&tgt_ty, &self.checked.structs).size;
-                    self.emit(Inst::MemCopy {
-                        dst: addr,
-                        src: tmp,
-                        size,
-                    });
-                }
-            }
-            AssignOp::AddAssign
-            | AssignOp::SubAssign
-            | AssignOp::ShlAssign
-            | AssignOp::ShrAssign => {
-                let ir = type_internal_to_ir(&tgt_ty).unwrap();
-                let old = self.fresh_vreg();
-                self.emit(Inst::Load(old, addr, ir));
-                let rhs_ty = if matches!(a.op, AssignOp::ShlAssign | AssignOp::ShrAssign) {
-                    self.expr_ty(&a.value)
-                } else {
-                    tgt_ty.clone()
+    // Binds the names in `pattern` to the parts of the value at `addr`.
+    fn bind_pattern_at(&mut self, pattern: &Pattern, addr: VReg, ty: &TypeInternal) {
+        match &pattern.kind {
+            PatternKind::Wildcard => {}
+            PatternKind::Binding { name, .. } => self.define(name.clone(), addr, ty.clone()),
+            PatternKind::Tuple(pats) => {
+                let TypeInternal::Tuple(elems) = ty else {
+                    return;
                 };
-                let rhs = self.lower_expr_to_operand(&a.value, &rhs_ty);
-                let res = self.fresh_vreg();
-                let signed = tgt_ty.is_signed();
-                match a.op {
-                    AssignOp::AddAssign => {
-                        if ir.is_float() {
-                            self.emit(Inst::FAdd(res, old, rhs, ir));
-                        } else {
-                            self.emit(Inst::IAdd(res, old, rhs, ir));
-                        }
-                    }
-                    AssignOp::SubAssign => {
-                        if ir.is_float() {
-                            self.emit(Inst::FSub(res, old, rhs, ir));
-                        } else {
-                            self.emit(Inst::ISub(res, old, rhs, ir));
-                        }
-                    }
-                    AssignOp::ShlAssign => self.emit(Inst::IShl(res, old, rhs, ir)),
-                    AssignOp::ShrAssign => self.emit(Inst::IShr(res, old, rhs, ir, signed)),
-                    _ => unreachable!(),
+                let offsets = field_offsets(elems, &self.checked.structs);
+                for ((p, t), (off, _)) in pats.iter().zip(elems).zip(&offsets) {
+                    let ptr = self.fresh_vreg();
+                    self.emit(Inst::MemberPtr(ptr, addr, *off));
+                    self.bind_pattern_at(p, ptr, t);
                 }
-                self.emit(Inst::Store(addr, res, ir));
             }
         }
     }
 
-    fn lower_return(&mut self, r: &ReturnStmt) {
+    fn lower_assign(&mut self, op: AssignOp, target: &Expr, value: &Expr) {
+        let tgt_ty = self.expr_ty(target);
+        let addr = self.expr_addr_of(target, &tgt_ty);
+        let Some(bop) = op.binop() else {
+            if is_scalar(&tgt_ty) {
+                let v = self.lower_expr_to_operand(value, &tgt_ty);
+                self.emit(Inst::Store(addr, v, type_internal_to_ir(&tgt_ty).unwrap()));
+            } else if matches!(value.kind, ExprKind::Ident(_) | ExprKind::Call { .. }) {
+                self.lower_expr_to_addr(value, addr, &tgt_ty);
+            } else {
+                // The value may read the target (`p = P { x: p.y, y: p.x }`),
+                // so build it aside and copy it over afterwards.
+                let tmp = self.expr_addr_of(value, &tgt_ty);
+                let size = layout_of(&tgt_ty, &self.checked.structs).size;
+                self.emit(Inst::MemCopy {
+                    dst: addr,
+                    src: tmp,
+                    size,
+                });
+            }
+            return;
+        };
+        let ir = type_internal_to_ir(&tgt_ty).unwrap();
+        let old = self.fresh_vreg();
+        self.emit(Inst::Load(old, addr, ir));
+        let rhs_ty = if matches!(bop, BinOp::Shl | BinOp::Shr) {
+            self.expr_ty(value)
+        } else {
+            tgt_ty.clone()
+        };
+        let rhs = self.lower_expr_to_operand(value, &rhs_ty);
+        let res = self.emit_arith(bop, old, rhs, &tgt_ty);
+        self.emit(Inst::Store(addr, res, ir));
+    }
+
+    fn lower_return(&mut self, value: Option<&Expr>) {
         let ret_ty = self.return_ty.clone();
-        match &r.value {
-            Some(e) if ret_ty == TypeInternal::Unit => {
+        match value {
+            Some(e) if is_void(&ret_ty) => {
                 self.lower_expr_discard(e);
-                self.seal(Term::Ret(None));
+                self.seal_and_start_dead(Term::Ret(None));
             }
             Some(e) if is_scalar(&ret_ty) => {
                 let v = self.lower_expr_to_operand(e, &ret_ty);
-                self.seal(Term::Ret(Some((v, type_internal_to_ir(&ret_ty).unwrap()))));
+                let ir = type_internal_to_ir(&ret_ty).unwrap();
+                self.seal_and_start_dead(Term::Ret(Some((v, ir))));
             }
             Some(e) => {
                 let addr = self.sret.expect("ICE: compound return without sret");
                 self.lower_expr_to_addr(e, addr, &ret_ty);
-                self.seal(Term::Ret(Some((addr, IRType::Ptr))));
+                self.seal_and_start_dead(Term::Ret(Some((addr, IRType::Ptr))));
             }
-            None => self.seal(Term::Ret(None)),
+            None => self.seal_and_start_dead(Term::Ret(None)),
         }
-        let dead = self.fresh_bb();
-        self.start(dead);
     }
 
-    fn lower_break(&mut self) {
-        let (_, brk) = *self.loop_stack.last().unwrap();
-        self.seal(Term::Jump(brk));
-        let dead = self.fresh_bb();
-        self.start(dead);
+    fn loop_target(&self, label: &Option<Spanned<String>>) -> usize {
+        match label {
+            None => self.loop_stack.len() - 1,
+            Some((name, _)) => self
+                .loop_stack
+                .iter()
+                .rposition(|l| l.label.as_deref() == Some(name.as_str()))
+                .expect("ICE: unknown label"),
+        }
     }
 
-    fn lower_continue(&mut self) {
-        let (cont, _) = *self.loop_stack.last().unwrap();
-        self.seal(Term::Jump(cont));
-        let dead = self.fresh_bb();
-        self.start(dead);
+    fn lower_break(&mut self, label: &Option<Spanned<String>>, value: Option<&Expr>) {
+        let target = self.loop_target(label);
+        let result = self.loop_stack[target].result.clone();
+        if let Some(v) = value {
+            match result {
+                Some((addr, ty)) => self.store_or_recurse(v, addr, &ty),
+                None => self.lower_expr_discard(v),
+            }
+        }
+        let bb = self.loop_stack[target].break_bb;
+        self.seal_and_start_dead(Term::Jump(bb));
     }
 
-    fn lower_loop(&mut self, l: &LoopStmt) {
+    fn lower_continue(&mut self, label: &Option<Spanned<String>>) {
+        let target = self.loop_target(label);
+        let bb = self.loop_stack[target].continue_bb;
+        self.seal_and_start_dead(Term::Jump(bb));
+    }
+
+    // `loop { body }`; its value (of type `ty`) comes from `break value`.
+    fn lower_loop(
+        &mut self,
+        label: &Option<Spanned<String>>,
+        body: &Block,
+        ty: &TypeInternal,
+    ) -> VReg {
+        let result = if is_void(ty) {
+            None
+        } else {
+            Some((self.temp_for(ty), ty.clone()))
+        };
         let header = self.fresh_bb();
         let exit = self.fresh_bb();
         self.seal(Term::Jump(header));
         self.start(header);
-        self.loop_stack.push((header, exit));
-        self.lower_block_stmts(&l.body);
-        if let Some(tail) = &l.body.expr {
-            self.lower_expr_discard(tail);
+        self.loop_stack.push(LoopTarget {
+            label: label.as_ref().map(|l| l.0.clone()),
+            continue_bb: header,
+            break_bb: exit,
+            result: result.clone(),
+        });
+        self.lower_block_discard(body);
+        self.loop_stack.pop();
+        self.seal(Term::Jump(header));
+        self.start(exit);
+        match result {
+            Some((addr, ty)) if is_scalar(&ty) => {
+                let v = self.fresh_vreg();
+                self.emit(Inst::Load(v, addr, type_internal_to_ir(&ty).unwrap()));
+                v
+            }
+            Some((addr, _)) => addr,
+            None => self.const_zero(),
         }
-        self.pop_scope();
+    }
+
+    fn lower_while(&mut self, label: &Option<Spanned<String>>, cond: &Expr, body: &Block) {
+        let header = self.fresh_bb();
+        let body_bb = self.fresh_bb();
+        let exit = self.fresh_bb();
+        self.seal(Term::Jump(header));
+        self.start(header);
+        let c = self.lower_expr_to_operand(cond, &TypeInternal::Bool);
+        self.seal(Term::CondBr {
+            cond: c,
+            then_bb: body_bb,
+            else_bb: exit,
+        });
+        self.start(body_bb);
+        self.loop_stack.push(LoopTarget {
+            label: label.as_ref().map(|l| l.0.clone()),
+            continue_bb: header,
+            break_bb: exit,
+            result: None,
+        });
+        self.lower_block_discard(body);
         self.loop_stack.pop();
         self.seal(Term::Jump(header));
         self.start(exit);
     }
 
-    // LValue → address + type
-    fn lower_lvalue_addr(&mut self, lv: &LValue) -> (VReg, TypeInternal) {
-        match &lv.kind {
-            LValueKind::Ident(name) => {
-                let place = self.lookup(name).clone();
-                match place {
-                    Place::Register(v, ir) => {
-                        // Promote scalar to slot for assignment
-                        let slot = self.alloc_slot(ir.size(), ir.size());
-                        let addr = self.fresh_vreg();
-                        self.emit(Inst::SlotAddr(addr, slot));
-                        self.emit(Inst::Store(addr, v, ir));
-                        let ty = ir_to_lang_ty(ir);
-                        self.define(name.clone(), Place::Address(addr, ty.clone()));
-                        (addr, ty)
-                    }
-                    Place::Address(addr, ty) => (addr, ty),
-                }
-            }
-            LValueKind::Deref(inner) => {
-                let inner_ty = self.expr_ty(inner);
-                if let TypeInternal::Pointer(pointee) = &inner_ty {
-                    let ptr = self.lower_expr_to_operand(inner, &inner_ty);
-                    (ptr, *pointee.clone())
-                } else {
-                    panic!("ICE: deref non-ptr lvalue")
-                }
-            }
-            LValueKind::Field(inner, fname) => {
-                let (base, base_ty) = self.lower_lvalue_addr(inner);
-                let (off, fty) = self.struct_field_offset(&base_ty, &fname.0);
-                let ptr = self.fresh_vreg();
-                self.emit(Inst::MemberPtr(ptr, base, off));
-                (ptr, fty)
-            }
-            LValueKind::TupleField(inner, index) => {
-                let (base, base_ty) = self.lower_lvalue_addr(inner);
-                let (off, ety) = self.tuple_field_offset(&base_ty, index.0 as usize);
-                let ptr = self.fresh_vreg();
-                self.emit(Inst::MemberPtr(ptr, base, off));
-                (ptr, ety)
-            }
-            LValueKind::Index(inner, idx_expr) => {
-                let (base, base_ty) = self.lower_lvalue_addr(inner);
-                let elem_ty = if let TypeInternal::Array(e, _) = &base_ty {
-                    e.as_ref().clone()
-                } else {
-                    panic!("ICE")
-                };
-                let idx = self.lower_index(idx_expr);
-                let esz = layout_of(&elem_ty, &self.checked.structs).size;
-                let ptr = self.fresh_vreg();
-                self.emit(Inst::IndexPtr(ptr, base, idx, esz));
-                (ptr, elem_ty)
-            }
+    // `for i in a..b { body }` (or `a..=b`): the bounds are evaluated once;
+    // the counter never steps past the end, so `0..=255u8` terminates.
+    fn lower_for(
+        &mut self,
+        label: &Option<Spanned<String>>,
+        pattern: &Pattern,
+        iter: &Expr,
+        body: &Block,
+    ) {
+        let ExprKind::Range {
+            start,
+            end,
+            inclusive,
+        } = &iter.kind
+        else {
+            panic!("ICE: for over a non-range")
+        };
+        let elem = self.expr_ty(iter);
+        let ir = type_internal_to_ir(&elem).unwrap();
+        let signed = elem.is_signed();
+        let counter = self.temp_for(&elem);
+        let limit = self.temp_for(&elem);
+        let s = self.lower_expr_to_operand(start, &elem);
+        self.emit(Inst::Store(counter, s, ir));
+        let e = self.lower_expr_to_operand(end, &elem);
+        self.emit(Inst::Store(limit, e, ir));
+
+        let header = self.fresh_bb();
+        let body_bb = self.fresh_bb();
+        let latch = self.fresh_bb();
+        let exit = self.fresh_bb();
+        self.seal(Term::Jump(header));
+
+        self.start(header);
+        let i = self.fresh_vreg();
+        self.emit(Inst::Load(i, counter, ir));
+        let n = self.fresh_vreg();
+        self.emit(Inst::Load(n, limit, ir));
+        let more = self.fresh_vreg();
+        let cmp = if *inclusive { CmpOp::LtEq } else { CmpOp::Lt };
+        self.emit(Inst::ICmp(more, cmp, i, n, ir, signed));
+        self.seal(Term::CondBr {
+            cond: more,
+            then_bb: body_bb,
+            else_bb: exit,
+        });
+
+        self.start(body_bb);
+        self.push_scope();
+        if let PatternKind::Binding { name, .. } = &pattern.kind {
+            // Each iteration binds a copy: changing it does not affect the
+            // counter.
+            let var = self.temp_for(&elem);
+            self.emit(Inst::Store(var, i, ir));
+            self.define(name.clone(), var, elem.clone());
         }
+        self.loop_stack.push(LoopTarget {
+            label: label.as_ref().map(|l| l.0.clone()),
+            continue_bb: latch,
+            break_bb: exit,
+            result: None,
+        });
+        self.lower_block_discard(body);
+        self.loop_stack.pop();
+        self.pop_scope();
+        self.seal(Term::Jump(latch));
+
+        self.start(latch);
+        let cur = self.fresh_vreg();
+        self.emit(Inst::Load(cur, counter, ir));
+        if *inclusive {
+            // Stop at the end instead of stepping past it (it may be the
+            // type's maximum).
+            let last = self.fresh_vreg();
+            self.emit(Inst::Load(last, limit, ir));
+            let done = self.fresh_vreg();
+            self.emit(Inst::ICmp(done, CmpOp::Eq, cur, last, ir, signed));
+            let step_bb = self.fresh_bb();
+            self.seal(Term::CondBr {
+                cond: done,
+                then_bb: exit,
+                else_bb: step_bb,
+            });
+            self.start(step_bb);
+        }
+        let one = self.fresh_vreg();
+        self.emit(Inst::ConstInt(one, 1, ir));
+        let next = self.fresh_vreg();
+        self.emit(Inst::IAdd(next, cur, one, ir));
+        self.emit(Inst::Store(counter, next, ir));
+        self.seal(Term::Jump(header));
+
+        self.start(exit);
     }
+
+    // ---- Expressions ----
 
     // Expr → VReg (scalar or address-of-compound)
     fn lower_expr_to_operand(&mut self, expr: &Expr, expected: &TypeInternal) -> VReg {
-        if *expected == TypeInternal::Unit {
+        if self.diverges(expr) {
+            self.lower_expr_discard(expr);
+            return self.dummy(expected);
+        }
+        if is_void(expected) {
             self.lower_expr_discard(expr);
             return self.const_zero();
         }
 
         match &expr.kind {
-            ExprKind::IntLiteral(val) => {
+            ExprKind::IntLiteral(_)
+            | ExprKind::CharLiteral(_)
+            | ExprKind::FloatLiteral(_)
+            | ExprKind::SuffixedLiteral(..) => {
+                let (int, float) = match expr.kind {
+                    ExprKind::IntLiteral(v) | ExprKind::SuffixedLiteral(LitValue::Int(v), _) => {
+                        (v as i64, v as f64)
+                    }
+                    ExprKind::CharLiteral(c) => (c as i64, c as f64),
+                    ExprKind::FloatLiteral(f)
+                    | ExprKind::SuffixedLiteral(LitValue::Float(f), _) => (*f as i64, *f),
+                    _ => unreachable!(),
+                };
                 let ir = type_internal_to_ir(expected).unwrap_or(IRType::I64);
                 let v = self.fresh_vreg();
-                self.emit(Inst::ConstInt(v, *val as i64, ir));
-                v
-            }
-            ExprKind::FloatLiteral(val) => {
-                let ir = type_internal_to_ir(expected).unwrap_or(IRType::F64);
-                let v = self.fresh_vreg();
-                self.emit(Inst::ConstFloat(v, **val, ir));
+                if ir.is_float() {
+                    self.emit(Inst::ConstFloat(v, float, ir));
+                } else {
+                    self.emit(Inst::ConstInt(v, int, ir));
+                }
                 v
             }
             ExprKind::BoolLiteral(b) => {
@@ -1006,83 +1075,60 @@ impl<'a> Lowerer<'a> {
             ExprKind::UnitLiteral => self.const_zero(),
 
             ExprKind::StringLiteral(s) => {
-                let slot = self.alloc_slot(16, 8);
-                let addr = self.fresh_vreg();
-                self.emit(Inst::SlotAddr(addr, slot));
+                let addr = self.temp_for(expected);
                 self.lower_string_literal(s, addr);
                 addr
             }
+            ExprKind::CStringLiteral(s) => {
+                let index = self.string_constant(s);
+                let v = self.fresh_vreg();
+                self.emit(Inst::ConstStringPtr(v, index));
+                v
+            }
 
-            ExprKind::Ident(name) if self.lookup_local(name).is_none() => {
+            ExprKind::Ident(name) => {
+                if let Some((addr, ty)) = self.ident_place(name) {
+                    return if is_scalar(&ty) {
+                        let ir = type_internal_to_ir(&ty).unwrap();
+                        let v = self.fresh_vreg();
+                        self.emit(Inst::Load(v, addr, ir));
+                        v
+                    } else {
+                        addr
+                    };
+                }
+                if let Some(info) = self.checked.consts.get(name) {
+                    let ir = type_internal_to_ir(&info.ty).unwrap();
+                    let v = self.fresh_vreg();
+                    match info.value {
+                        ConstValue::Int(i) => self.emit(Inst::ConstInt(v, i as i64, ir)),
+                        ConstValue::Float(f) => self.emit(Inst::ConstFloat(v, f, ir)),
+                        ConstValue::Bool(b) => self.emit(Inst::ConstInt(v, b as i64, ir)),
+                        ConstValue::Aggregate(_) => panic!("ICE: aggregate constant"),
+                    }
+                    return v;
+                }
                 let v = self.fresh_vreg();
                 self.emit(Inst::FuncAddr(v, name.clone()));
                 v
             }
-            ExprKind::Ident(name) => {
-                let place = self.lookup(name).clone();
-                match place {
-                    Place::Register(v, _) => v,
-                    Place::Address(addr, ref ty) if is_scalar(ty) => {
-                        let ir = type_internal_to_ir(ty).unwrap();
-                        let v = self.fresh_vreg();
-                        self.emit(Inst::Load(v, addr, ir));
-                        v
-                    }
-                    Place::Address(addr, _) => addr,
-                }
-            }
 
-            ExprKind::BinOp { op, lhs, rhs } => self.lower_binop(op, lhs, rhs, expected),
+            ExprKind::BinOp { op, lhs, rhs } => self.lower_binop(op, lhs, rhs),
             ExprKind::UnaryOp { op, expr: inner } => self.lower_unaryop(op, inner, expected),
-            ExprKind::Cast { expr: inner, ty } => {
+            ExprKind::Cast { expr: inner, .. } => {
                 let from = self.expr_ty(inner);
-                let to = self.resolve_ast_type(ty);
+                let to = self.expr_ty(expr);
                 let src = self.lower_expr_to_operand(inner, &from);
                 self.lower_cast(src, &from, &to)
             }
-            ExprKind::Call { callee, args } => self.lower_call(callee, args, expected),
+            ExprKind::Call { callee, args } => self.lower_call(callee, args),
 
-            ExprKind::Index { expr: arr, .. } => {
-                let arr_ty = self.expr_ty(arr);
-                let elem_ty = if let TypeInternal::Array(e, _) = &arr_ty {
-                    e.as_ref().clone()
-                } else {
-                    panic!("ICE")
-                };
-                let ptr = self.expr_addr_of(expr, &elem_ty);
-                if is_scalar(&elem_ty) {
+            ExprKind::Index { .. } | ExprKind::Field { .. } | ExprKind::TupleField { .. } => {
+                let ty = self.expr_ty(expr);
+                let ptr = self.expr_addr_of(expr, &ty);
+                if is_scalar(&ty) {
                     let v = self.fresh_vreg();
-                    self.emit(Inst::Load(v, ptr, type_internal_to_ir(&elem_ty).unwrap()));
-                    v
-                } else {
-                    ptr
-                }
-            }
-
-            ExprKind::Field { expr: inner, name } => {
-                let inner_ty = self.expr_ty(inner);
-                let (off, fty) = self.struct_field_offset(&inner_ty, &name.0);
-                let base = self.expr_addr_of(inner, &inner_ty);
-                let ptr = self.fresh_vreg();
-                self.emit(Inst::MemberPtr(ptr, base, off));
-                if is_scalar(&fty) {
-                    let v = self.fresh_vreg();
-                    self.emit(Inst::Load(v, ptr, type_internal_to_ir(&fty).unwrap()));
-                    v
-                } else {
-                    ptr
-                }
-            }
-
-            ExprKind::TupleField { expr: inner, index } => {
-                let inner_ty = self.expr_ty(inner);
-                let (off, ety) = self.tuple_field_offset(&inner_ty, index.0 as usize);
-                let base = self.expr_addr_of(inner, &inner_ty);
-                let ptr = self.fresh_vreg();
-                self.emit(Inst::MemberPtr(ptr, base, off));
-                if is_scalar(&ety) {
-                    let v = self.fresh_vreg();
-                    self.emit(Inst::Load(v, ptr, type_internal_to_ir(&ety).unwrap()));
+                    self.emit(Inst::Load(v, ptr, type_internal_to_ir(&ty).unwrap()));
                     v
                 } else {
                     ptr
@@ -1095,32 +1141,37 @@ impl<'a> Lowerer<'a> {
                 else_block,
             } => self.lower_if_expr(cond, then_block, else_block.as_ref(), expected),
 
-            ExprKind::Block(block) => {
-                self.lower_block_stmts(block);
-                let r = if let Some(tail) = &block.expr {
-                    self.lower_expr_to_operand(tail, expected)
-                } else {
-                    self.const_zero()
-                };
-                self.pop_scope();
-                r
-            }
+            ExprKind::Block(block) => self.lower_block_value(block, expected),
+
+            ExprKind::Loop { label, body } => self.lower_loop(label, body, expected),
 
             ExprKind::Tuple(_)
             | ExprKind::Array(_)
             | ExprKind::ArrayRepeat(_, _)
             | ExprKind::StructConstructor { .. } => {
-                let slot = self.alloc_slot_for(expected);
-                let addr = self.fresh_vreg();
-                self.emit(Inst::SlotAddr(addr, slot));
+                let addr = self.temp_for(expected);
                 self.lower_expr_to_addr(expr, addr, expected);
                 addr
             }
+
+            // Unit-typed or diverging: handled above.
+            ExprKind::While { .. }
+            | ExprKind::For { .. }
+            | ExprKind::Assign { .. }
+            | ExprKind::Return(_)
+            | ExprKind::Break { .. }
+            | ExprKind::Continue { .. }
+            | ExprKind::Range { .. }
+            | ExprKind::Error => panic!("ICE: unexpected value expression {:?}", expr.span),
         }
     }
 
     // Expr → write result to memory at dst
     fn lower_expr_to_addr(&mut self, expr: &Expr, dst: VReg, ty: &TypeInternal) {
+        if self.diverges(expr) {
+            self.lower_expr_discard(expr);
+            return;
+        }
         match &expr.kind {
             ExprKind::StringLiteral(s) => self.lower_string_literal(s, dst),
 
@@ -1139,30 +1190,22 @@ impl<'a> Lowerer<'a> {
             }
 
             ExprKind::Array(elems) => {
-                let ety = if let TypeInternal::Array(e, _) = ty {
-                    e.as_ref().clone()
-                } else {
-                    self.expr_ty(&elems[0])
+                let TypeInternal::Array(ety, _) = ty else {
+                    panic!("ICE: array literal of type {}", ty)
                 };
-                let esz = layout_of(&ety, &self.checked.structs).size;
+                let esz = layout_of(ety, &self.checked.structs).size;
                 for (i, elem) in elems.iter().enumerate() {
                     let fp = self.fresh_vreg();
                     self.emit(Inst::MemberPtr(fp, dst, i as u64 * esz));
-                    self.store_or_recurse(elem, fp, &ety);
+                    self.store_or_recurse(elem, fp, ety);
                 }
             }
 
-            ExprKind::ArrayRepeat(val, count) => {
-                let ety = if let TypeInternal::Array(e, _) = ty {
-                    e.as_ref().clone()
-                } else {
-                    self.expr_ty(val)
+            ExprKind::ArrayRepeat(val, _) => {
+                let TypeInternal::Array(ety, n) = ty else {
+                    panic!("ICE: array literal of type {}", ty)
                 };
-                let n = if let ExprKind::IntLiteral(c) = count.kind {
-                    c
-                } else {
-                    panic!("ICE")
-                };
+                let (ety, n) = ((**ety).clone(), *n);
                 if n == 0 {
                     return;
                 }
@@ -1238,24 +1281,14 @@ impl<'a> Lowerer<'a> {
                 }
             }
 
-            ExprKind::Ident(name) => {
-                let place = self.lookup(name).clone();
-                match place {
-                    Place::Address(src, _) => {
-                        let sz = layout_of(ty, &self.checked.structs).size;
-                        self.emit(Inst::MemCopy { dst, src, size: sz });
-                    }
-                    Place::Register(v, ir) => self.emit(Inst::Store(dst, v, ir)),
-                }
+            ExprKind::Ident(name)
+                if self.lookup_local(name).is_some() || self.global_index.contains_key(name) =>
+            {
+                let (src, _) = self.ident_place(name).unwrap();
+                self.copy_to_dst(dst, src, ty);
             }
 
-            ExprKind::Block(block) => {
-                self.lower_block_stmts(block);
-                if let Some(tail) = &block.expr {
-                    self.lower_expr_to_addr(tail, dst, ty);
-                }
-                self.pop_scope();
-            }
+            ExprKind::Block(block) => self.lower_block_to_addr(block, dst, ty),
 
             ExprKind::If {
                 cond,
@@ -1263,46 +1296,18 @@ impl<'a> Lowerer<'a> {
                 else_block,
             } => self.lower_if_to_addr(cond, then_block, else_block.as_ref(), dst, ty),
 
-            ExprKind::Call { callee, args } => {
-                let v = self.lower_call(callee, args, ty);
-                if is_compound(ty) {
-                    let sz = layout_of(ty, &self.checked.structs).size;
-                    self.emit(Inst::MemCopy {
-                        dst,
-                        src: v,
-                        size: sz,
-                    });
-                }
-            }
-
-            ExprKind::Field {
-                expr: inner,
-                name: fname,
-            } => {
-                let it = self.expr_ty(inner);
-                let (off, fty) = self.struct_field_offset(&it, &fname.0);
-                let base = self.expr_addr_of(inner, &it);
-                let ptr = self.fresh_vreg();
-                self.emit(Inst::MemberPtr(ptr, base, off));
-                self.copy_to_dst(dst, ptr, &fty);
-            }
-
-            ExprKind::TupleField { expr: inner, index } => {
-                let it = self.expr_ty(inner);
-                let (off, ety) = self.tuple_field_offset(&it, index.0 as usize);
-                let base = self.expr_addr_of(inner, &it);
-                let ptr = self.fresh_vreg();
-                self.emit(Inst::MemberPtr(ptr, base, off));
-                self.copy_to_dst(dst, ptr, &ety);
+            ExprKind::Field { .. } | ExprKind::TupleField { .. } | ExprKind::Index { .. } => {
+                let ptr = self.expr_addr_of(expr, ty);
+                self.copy_to_dst(dst, ptr, ty);
             }
 
             _ => {
-                // Compound operands come back as the address of the value
-                // (an element, a `*p`, ...), which is copied into place.
+                // Calls return the sret slot and other compound operands the
+                // address of the value, which is copied into place.
                 let v = self.lower_expr_to_operand(expr, ty);
                 if is_scalar(ty) {
                     self.emit(Inst::Store(dst, v, type_internal_to_ir(ty).unwrap()));
-                } else {
+                } else if !is_void(ty) {
                     let size = layout_of(ty, &self.checked.structs).size;
                     self.emit(Inst::MemCopy { dst, src: v, size });
                 }
@@ -1340,28 +1345,21 @@ impl<'a> Lowerer<'a> {
             let v = self.fresh_vreg();
             self.emit(Inst::Load(v, src, ir));
             self.emit(Inst::Store(dst, v, ir));
-        } else {
+        } else if !is_void(ty) {
             let sz = layout_of(ty, &self.checked.structs).size;
             self.emit(Inst::MemCopy { dst, src, size: sz });
         }
     }
 
-    // Address of `expr`. Places (variables, `*p`, fields and elements of
-    // places) yield their own address, so `&p.x` and `&a[i]` alias the
-    // original; any other expression is materialized in a fresh slot.
+    // Address of `expr`. Places (variables, statics, `*p`, `p[i]`, fields
+    // and elements of places) yield their own address, so `&p.x` and `&a[i]`
+    // alias the original; any other expression is materialized in a fresh
+    // slot.
     fn expr_addr_of(&mut self, expr: &Expr, ty: &TypeInternal) -> VReg {
         match &expr.kind {
             ExprKind::Ident(name) => {
-                let place = self.lookup(name).clone();
-                match place {
-                    Place::Address(addr, _) => return addr,
-                    Place::Register(v, ir) => {
-                        let slot = self.alloc_slot(ir.size(), ir.size());
-                        let addr = self.fresh_vreg();
-                        self.emit(Inst::SlotAddr(addr, slot));
-                        self.emit(Inst::Store(addr, v, ir));
-                        return addr;
-                    }
+                if let Some((addr, _)) = self.ident_place(name) {
+                    return addr;
                 }
             }
             ExprKind::UnaryOp {
@@ -1387,41 +1385,34 @@ impl<'a> Lowerer<'a> {
                 self.emit(Inst::MemberPtr(ptr, base, off));
                 return ptr;
             }
-            ExprKind::Index { expr: arr, index } => {
-                let arr_ty = self.expr_ty(arr);
-                let elem_ty = if let TypeInternal::Array(e, _) = &arr_ty {
-                    e.as_ref().clone()
-                } else {
-                    panic!("ICE")
+            ExprKind::Index { expr: base, index } => {
+                let base_ty = self.expr_ty(base);
+                let base_addr = match &base_ty {
+                    // `p[i]` indexes from the pointer's value
+                    TypeInternal::Pointer(_) => self.lower_expr_to_operand(base, &base_ty),
+                    _ => self.expr_addr_of(base, &base_ty),
                 };
-                let base = self.expr_addr_of(arr, &arr_ty);
+                let elem_ty = self.expr_ty(expr);
                 let idx = self.lower_index(index);
                 let esz = layout_of(&elem_ty, &self.checked.structs).size;
                 let ptr = self.fresh_vreg();
-                self.emit(Inst::IndexPtr(ptr, base, idx, esz));
+                self.emit(Inst::IndexPtr(ptr, base_addr, idx, esz));
                 return ptr;
             }
             _ => {}
         }
-        let slot = self.alloc_slot_for(ty);
-        let addr = self.fresh_vreg();
-        self.emit(Inst::SlotAddr(addr, slot));
+        let addr = self.temp_for(ty);
         self.lower_expr_to_addr(expr, addr, ty);
         addr
     }
 
+    // Lowers an expression for its effects only.
     fn lower_expr_discard(&mut self, expr: &Expr) {
         match &expr.kind {
             ExprKind::Call { callee, args } => {
-                self.lower_call(callee, args, &TypeInternal::Unit);
+                self.lower_call(callee, args);
             }
-            ExprKind::Block(b) => {
-                self.lower_block_stmts(b);
-                if let Some(tail) = &b.expr {
-                    self.lower_expr_discard(tail);
-                }
-                self.pop_scope();
-            }
+            ExprKind::Block(b) => self.lower_block_discard(b),
             ExprKind::If {
                 cond,
                 then_block,
@@ -1429,22 +1420,52 @@ impl<'a> Lowerer<'a> {
             } => {
                 self.lower_if_expr(cond, then_block, else_block.as_ref(), &TypeInternal::Unit);
             }
+            ExprKind::Loop { label, body } => {
+                let ty = self.expr_ty(expr);
+                self.lower_loop(label, body, &ty);
+            }
+            ExprKind::While { label, cond, body } => self.lower_while(label, cond, body),
+            ExprKind::For {
+                label,
+                pattern,
+                iter,
+                body,
+            } => self.lower_for(label, pattern, iter, body),
+            ExprKind::Assign { op, target, value } => self.lower_assign(*op, target, value),
+            ExprKind::Return(value) => self.lower_return(value.as_deref()),
+            ExprKind::Break { label, value } => self.lower_break(label, value.as_deref()),
+            ExprKind::Continue { label } => self.lower_continue(label),
+            ExprKind::Range { .. } | ExprKind::Error => {
+                panic!("ICE: unexpected expression {:?}", expr.span)
+            }
             _ => {
                 let ty = self.expr_ty(expr);
-                if ty != TypeInternal::Unit {
+                if !is_void(&ty) {
                     let _ = self.lower_expr_to_operand(expr, &ty);
+                } else if self.diverges(expr) {
+                    // e.g. a cast of `return`: lower the operand for effect
+                    match &expr.kind {
+                        ExprKind::Cast { expr: inner, .. }
+                        | ExprKind::UnaryOp { expr: inner, .. } => self.lower_expr_discard(inner),
+                        _ => {}
+                    }
                 }
             }
         }
     }
 
-    // String literal
-    fn lower_string_literal(&mut self, s: &[u8], dst: VReg) {
+    fn string_constant(&mut self, s: &[u8]) -> usize {
         let idx = self.strings.len();
         self.strings.push(StringConstant {
             label: format!("__str{}", idx),
             bytes: s.to_vec(),
         });
+        idx
+    }
+
+    // String literal: a (*u8, u64) pair
+    fn lower_string_literal(&mut self, s: &[u8], dst: VReg) {
+        let idx = self.string_constant(s);
         let ptr = self.fresh_vreg();
         self.emit(Inst::ConstStringPtr(ptr, idx));
         let p0 = self.fresh_vreg();
@@ -1458,127 +1479,69 @@ impl<'a> Lowerer<'a> {
     }
 
     // Binary operators
-    fn lower_binop(
-        &mut self,
-        op: &BinOp,
-        lhs: &Expr,
-        rhs: &Expr,
-        expected: &TypeInternal,
-    ) -> VReg {
+    fn lower_binop(&mut self, op: &BinOp, lhs: &Expr, rhs: &Expr) -> VReg {
         if matches!(op, BinOp::And) {
             return self.lower_sc_and(lhs, rhs);
         }
         if matches!(op, BinOp::Or) {
             return self.lower_sc_or(lhs, rhs);
         }
-
-        // Mirrors the typechecker: a numeric expected type is pushed into
-        // arithmetic, bitwise and shift operands (check mode); otherwise the
-        // operand type is synthesized.
-        let lhs_ty = match op {
-            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Pow
-                if expected.is_numeric() =>
-            {
-                expected.clone()
-            }
-            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr
-                if expected.is_integer() =>
-            {
-                expected.clone()
-            }
-            BinOp::Shl | BinOp::Shr => self.expr_ty(lhs),
-            _ => self.binop_operand_ty(lhs, rhs),
-        };
+        let lhs_ty = self.expr_ty(lhs);
         let a = self.lower_expr_to_operand(lhs, &lhs_ty);
-        let rhs_ty = if matches!(op, BinOp::Shl | BinOp::Shr) {
-            self.expr_ty(rhs)
-        } else {
-            lhs_ty.clone()
-        };
+        let rhs_ty = self.expr_ty(rhs);
         let b = self.lower_expr_to_operand(rhs, &rhs_ty);
-        let ir = type_internal_to_ir(&lhs_ty).unwrap_or(IRType::I64);
-        let signed = lhs_ty.is_signed();
-        let d = self.fresh_vreg();
-
-        match op {
-            BinOp::Add => {
-                if ir.is_float() {
-                    self.emit(Inst::FAdd(d, a, b, ir))
-                } else {
-                    self.emit(Inst::IAdd(d, a, b, ir))
-                }
-            }
-            BinOp::Sub => {
-                if ir.is_float() {
-                    self.emit(Inst::FSub(d, a, b, ir))
-                } else {
-                    self.emit(Inst::ISub(d, a, b, ir))
-                }
-            }
-            BinOp::Mul => {
-                if ir.is_float() {
-                    self.emit(Inst::FMul(d, a, b, ir))
-                } else {
-                    self.emit(Inst::IMul(d, a, b, ir))
-                }
-            }
-            BinOp::Div => {
-                if ir.is_float() {
-                    self.emit(Inst::FDiv(d, a, b, ir))
-                } else {
-                    self.emit(Inst::IDiv(d, a, b, ir, signed))
-                }
-            }
-            BinOp::Mod => {
-                if ir.is_float() {
-                    let f = if ir == IRType::F64 { "fmod" } else { "fmodf" };
-                    self.emit(Inst::Call {
-                        dst: Some((d, ir)),
-                        func: f.into(),
-                        args: vec![(a, ir), (b, ir)],
-                    });
-                } else {
-                    self.emit(Inst::IMod(d, a, b, ir, signed))
-                }
-            }
-            BinOp::Pow => {
-                if ir.is_float() {
-                    let f = if ir == IRType::F64 { "pow" } else { "powf" };
-                    self.emit(Inst::Call {
-                        dst: Some((d, ir)),
-                        func: f.into(),
-                        args: vec![(a, ir), (b, ir)],
-                    });
-                } else {
-                    self.emit(Inst::Call {
-                        dst: Some((d, ir)),
-                        func: "__ipow".into(),
-                        args: vec![(a, ir), (b, ir)],
-                    });
-                }
-            }
-            BinOp::Shl => self.emit(Inst::IShl(d, a, b, ir)),
-            BinOp::Shr => self.emit(Inst::IShr(d, a, b, ir, signed)),
-            BinOp::BitAnd => self.emit(Inst::IBitAnd(d, a, b, ir)),
-            BinOp::BitOr => self.emit(Inst::IBitOr(d, a, b, ir)),
-            BinOp::BitXor => self.emit(Inst::IBitXor(d, a, b, ir)),
-            BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq => {
-                let c = match op {
-                    BinOp::Eq => CmpOp::Eq,
-                    BinOp::Neq => CmpOp::Neq,
-                    BinOp::Lt => CmpOp::Lt,
-                    BinOp::Gt => CmpOp::Gt,
-                    BinOp::LtEq => CmpOp::LtEq,
-                    _ => CmpOp::GtEq,
-                };
-                if ir.is_float() {
-                    self.emit(Inst::FCmp(d, c, a, b, ir))
-                } else {
-                    self.emit(Inst::ICmp(d, c, a, b, ir, signed))
-                }
-            }
-            BinOp::And | BinOp::Or => unreachable!(),
+        if !op.is_comparison() {
+            return self.emit_arith(*op, a, b, &lhs_ty);
         }
+        let ir = type_internal_to_ir(&lhs_ty).unwrap_or(IRType::I64);
+        let c = match op {
+            BinOp::Eq => CmpOp::Eq,
+            BinOp::Neq => CmpOp::Neq,
+            BinOp::Lt => CmpOp::Lt,
+            BinOp::Gt => CmpOp::Gt,
+            BinOp::LtEq => CmpOp::LtEq,
+            _ => CmpOp::GtEq,
+        };
+        let d = self.fresh_vreg();
+        if ir.is_float() {
+            self.emit(Inst::FCmp(d, c, a, b, ir))
+        } else {
+            self.emit(Inst::ICmp(d, c, a, b, ir, lhs_ty.is_signed()))
+        }
+        d
+    }
+
+    // An arithmetic, bitwise or shift operator on operands of type `ty`.
+    fn emit_arith(&mut self, op: BinOp, a: VReg, b: VReg, ty: &TypeInternal) -> VReg {
+        let ir = type_internal_to_ir(ty).unwrap_or(IRType::I64);
+        let signed = ty.is_signed();
+        let d = self.fresh_vreg();
+        let inst = match op {
+            BinOp::Add if ir.is_float() => Inst::FAdd(d, a, b, ir),
+            BinOp::Add => Inst::IAdd(d, a, b, ir),
+            BinOp::Sub if ir.is_float() => Inst::FSub(d, a, b, ir),
+            BinOp::Sub => Inst::ISub(d, a, b, ir),
+            BinOp::Mul if ir.is_float() => Inst::FMul(d, a, b, ir),
+            BinOp::Mul => Inst::IMul(d, a, b, ir),
+            BinOp::Div if ir.is_float() => Inst::FDiv(d, a, b, ir),
+            BinOp::Div => Inst::IDiv(d, a, b, ir, signed),
+            BinOp::Mod if ir.is_float() => {
+                let f = if ir == IRType::F64 { "fmod" } else { "fmodf" };
+                Inst::Call {
+                    dst: Some((d, ir)),
+                    func: f.into(),
+                    args: vec![(a, ir), (b, ir)],
+                }
+            }
+            BinOp::Mod => Inst::IMod(d, a, b, ir, signed),
+            BinOp::Shl => Inst::IShl(d, a, b, ir),
+            BinOp::Shr => Inst::IShr(d, a, b, ir, signed),
+            BinOp::BitAnd => Inst::IBitAnd(d, a, b, ir),
+            BinOp::BitOr => Inst::IBitOr(d, a, b, ir),
+            BinOp::BitXor => Inst::IBitXor(d, a, b, ir),
+            _ => panic!("ICE: not an arithmetic operator"),
+        };
+        self.emit(inst);
         d
     }
 
@@ -1650,11 +1613,7 @@ impl<'a> Lowerer<'a> {
     fn lower_unaryop(&mut self, op: &UnaryOp, inner: &Expr, expected: &TypeInternal) -> VReg {
         match op {
             UnaryOp::Neg => {
-                let ty = if expected.is_numeric() {
-                    expected.clone()
-                } else {
-                    self.expr_ty(inner)
-                };
+                let ty = self.expr_ty(inner);
                 let ir = type_internal_to_ir(&ty).unwrap();
                 let v = self.lower_expr_to_operand(inner, &ty);
                 let d = self.fresh_vreg();
@@ -1665,14 +1624,6 @@ impl<'a> Lowerer<'a> {
                 }
                 d
             }
-            UnaryOp::Pos => {
-                let ty = if expected.is_numeric() {
-                    expected.clone()
-                } else {
-                    self.expr_ty(inner)
-                };
-                self.lower_expr_to_operand(inner, &ty)
-            }
             UnaryOp::Not => {
                 let v = self.lower_expr_to_operand(inner, &TypeInternal::Bool);
                 let d = self.fresh_vreg();
@@ -1680,11 +1631,7 @@ impl<'a> Lowerer<'a> {
                 d
             }
             UnaryOp::BitNot => {
-                let ty = if expected.is_integer() {
-                    expected.clone()
-                } else {
-                    self.expr_ty(inner)
-                };
+                let ty = self.expr_ty(inner);
                 let ir = type_internal_to_ir(&ty).unwrap();
                 let v = self.lower_expr_to_operand(inner, &ty);
                 let d = self.fresh_vreg();
@@ -1711,6 +1658,9 @@ impl<'a> Lowerer<'a> {
 
     // Cast
     fn lower_cast(&mut self, src: VReg, from: &TypeInternal, to: &TypeInternal) -> VReg {
+        if *from == TypeInternal::Never {
+            return self.dummy(to);
+        }
         let fi = type_internal_to_ir(from).unwrap();
         let ti = type_internal_to_ir(to).unwrap();
         if fi == ti {
@@ -1744,16 +1694,15 @@ impl<'a> Lowerer<'a> {
         d
     }
 
-    // Function call
-    fn lower_call(&mut self, callee: &Expr, arguments: &[Expr], expected: &TypeInternal) -> VReg {
+    // Function call; returns the scalar result, the address of a compound
+    // result, or a placeholder for () and `!`.
+    fn lower_call(&mut self, callee: &Expr, arguments: &[Expr]) -> VReg {
         let ptys = self.call_param_tys(callee);
         let ret_ty = self.call_return_ty(callee);
         let variadic = self.is_variadic_call(callee);
         let mut ir_arguments = Vec::new();
         let sret = if is_compound(&ret_ty) {
-            let slot = self.alloc_slot_for(&ret_ty);
-            let addr = self.fresh_vreg();
-            self.emit(Inst::SlotAddr(addr, slot));
+            let addr = self.temp_for(&ret_ty);
             ir_arguments.push((addr, IRType::Ptr));
             Some(addr)
         } else {
@@ -1761,82 +1710,51 @@ impl<'a> Lowerer<'a> {
         };
         for (index, argument) in arguments.iter().enumerate() {
             let pty = match ptys.get(index) {
-                Some(pty) => pty,
-                None => &self.expr_ty(argument),
+                Some(pty) => pty.clone(),
+                None => self.expr_ty(argument),
             };
-            if variadic && index >= ptys.len() && is_scalar(pty) {
+            if variadic && index >= ptys.len() && is_scalar(&pty) {
                 // C default argument promotions: f32 -> f64, small ints -> int
-                let v = self.lower_expr_to_operand(argument, pty);
+                let v = self.lower_expr_to_operand(argument, &pty);
                 let promoted = match pty {
                     TypeInternal::F32 => TypeInternal::F64,
                     TypeInternal::I8 | TypeInternal::I16 => TypeInternal::I32,
                     TypeInternal::U8 | TypeInternal::U16 | TypeInternal::Bool => TypeInternal::U32,
-                    other => other.clone(),
+                    ref other => other.clone(),
                 };
-                let v = self.lower_cast(v, pty, &promoted);
+                let v = self.lower_cast(v, &pty, &promoted);
                 ir_arguments.push((v, type_internal_to_ir(&promoted).unwrap()));
-            } else if is_scalar(pty) {
-                let v = self.lower_expr_to_operand(argument, pty);
-                ir_arguments.push((v, type_internal_to_ir(pty).unwrap()));
+            } else if is_scalar(&pty) {
+                let v = self.lower_expr_to_operand(argument, &pty);
+                ir_arguments.push((v, type_internal_to_ir(&pty).unwrap()));
             } else {
-                let addr = self.expr_addr_of(argument, pty);
+                let addr = self.expr_addr_of(argument, &pty);
                 ir_arguments.push((addr, IRType::Ptr));
             }
         }
 
-        let is_direct = if let ExprKind::Ident(n) = &callee.kind {
-            self.checked.functions.contains_key(n)
-        } else {
-            false
-        };
-
-        if *expected == TypeInternal::Unit || sret.is_some() {
-            if is_direct {
-                let n = if let ExprKind::Ident(n) = &callee.kind {
-                    n.clone()
-                } else {
-                    unreachable!()
-                };
-                self.emit(Inst::Call {
-                    dst: None,
-                    func: n,
-                    args: ir_arguments,
-                });
-            } else {
-                let cv = self.lower_expr_to_operand(callee, &self.expr_ty(callee));
+        let dst = type_internal_to_ir(&ret_ty).map(|ir| (self.fresh_vreg(), ir));
+        match self.direct_callee(callee) {
+            Some(sig) => self.emit(Inst::Call {
+                dst,
+                func: sig.name.clone(),
+                args: ir_arguments,
+            }),
+            None => {
+                let callee_ty = self.expr_ty(callee);
+                let cv = self.lower_expr_to_operand(callee, &callee_ty);
                 self.emit(Inst::CallIndirect {
-                    dst: None,
+                    dst,
                     callee: cv,
                     args: ir_arguments,
                 });
             }
-            return match sret {
-                Some(addr) if *expected != TypeInternal::Unit => addr,
-                _ => self.const_zero(),
-            };
         }
-        let ri = type_internal_to_ir(expected).unwrap_or(IRType::Ptr);
-        let d = self.fresh_vreg();
-        if is_direct {
-            let n = if let ExprKind::Ident(n) = &callee.kind {
-                n.clone()
-            } else {
-                unreachable!()
-            };
-            self.emit(Inst::Call {
-                dst: Some((d, ri)),
-                func: n,
-                args: ir_arguments,
-            });
-        } else {
-            let cv = self.lower_expr_to_operand(callee, &self.expr_ty(callee));
-            self.emit(Inst::CallIndirect {
-                dst: Some((d, ri)),
-                callee: cv,
-                args: ir_arguments,
-            });
+        match (sret, dst) {
+            (Some(addr), _) => addr,
+            (None, Some((d, _))) => d,
+            (None, None) => self.const_zero(),
         }
-        d
     }
 
     // If expressions
@@ -1847,93 +1765,61 @@ impl<'a> Lowerer<'a> {
         else_b: Option<&Block>,
         expected: &TypeInternal,
     ) -> VReg {
+        if is_compound(expected) {
+            let addr = self.temp_for(expected);
+            self.lower_if_to_addr(cond, then_b, else_b, addr, expected);
+            return addr;
+        }
         let cv = self.lower_expr_to_operand(cond, &TypeInternal::Bool);
+        let tbb = self.fresh_bb();
+        let merge = self.fresh_bb();
+        let ebb = if else_b.is_some() {
+            self.fresh_bb()
+        } else {
+            merge
+        };
+        self.seal(Term::CondBr {
+            cond: cv,
+            then_bb: tbb,
+            else_bb: ebb,
+        });
 
-        if *expected == TypeInternal::Unit || else_b.is_none() {
-            let tbb = self.fresh_bb();
-            let merge = self.fresh_bb();
-            let ebb = if else_b.is_some() {
-                self.fresh_bb()
-            } else {
-                merge
-            };
-            self.seal(Term::CondBr {
-                cond: cv,
-                then_bb: tbb,
-                else_bb: ebb,
-            });
+        let Some(eb) = else_b.filter(|_| is_scalar(expected)) else {
+            // No value: () (or `!`).
             self.start(tbb);
-            self.lower_block_stmts(then_b);
-            if let Some(t) = &then_b.expr {
-                self.lower_expr_discard(t);
-            }
-            self.pop_scope();
+            self.lower_block_discard(then_b);
             self.seal(Term::Jump(merge));
             if let Some(eb) = else_b {
                 self.start(ebb);
-                self.lower_block_stmts(eb);
-                if let Some(t) = &eb.expr {
-                    self.lower_expr_discard(t);
-                }
-                self.pop_scope();
+                self.lower_block_discard(eb);
                 self.seal(Term::Jump(merge));
             }
             self.start(merge);
             return self.const_zero();
-        }
+        };
 
-        let eb = else_b.unwrap();
-        if is_scalar(expected) {
-            let tbb = self.fresh_bb();
-            let ebb = self.fresh_bb();
-            let merge = self.fresh_bb();
-            let ir = type_internal_to_ir(expected).unwrap();
-            let slot = self.alloc_slot(ir.size(), ir.size());
-            self.seal(Term::CondBr {
-                cond: cv,
-                then_bb: tbb,
-                else_bb: ebb,
-            });
+        let ir = type_internal_to_ir(expected).unwrap();
+        let slot = self.alloc_slot(ir.size(), ir.size());
+        self.start(tbb);
+        let tv = self.lower_block_value(then_b, expected);
+        let s1 = self.fresh_vreg();
+        self.emit(Inst::SlotAddr(s1, slot));
+        self.emit(Inst::Store(s1, tv, ir));
+        self.seal(Term::Jump(merge));
 
-            self.start(tbb);
-            self.lower_block_stmts(then_b);
-            let tv = if let Some(t) = &then_b.expr {
-                self.lower_expr_to_operand(t, expected)
-            } else {
-                self.const_zero()
-            };
-            let s1 = self.fresh_vreg();
-            self.emit(Inst::SlotAddr(s1, slot));
-            self.emit(Inst::Store(s1, tv, ir));
-            self.pop_scope();
-            self.seal(Term::Jump(merge));
+        self.start(ebb);
+        let ev = self.lower_block_value(eb, expected);
+        let s2 = self.fresh_vreg();
+        self.emit(Inst::SlotAddr(s2, slot));
+        self.emit(Inst::Store(s2, ev, ir));
+        self.seal(Term::Jump(merge));
 
-            self.start(ebb);
-            self.lower_block_stmts(eb);
-            let ev = if let Some(t) = &eb.expr {
-                self.lower_expr_to_operand(t, expected)
-            } else {
-                self.const_zero()
-            };
-            let s2 = self.fresh_vreg();
-            self.emit(Inst::SlotAddr(s2, slot));
-            self.emit(Inst::Store(s2, ev, ir));
-            self.pop_scope();
-            self.seal(Term::Jump(merge));
-
-            self.start(merge);
-            let r = self.fresh_vreg();
-            let s3 = self.fresh_vreg();
-            self.emit(Inst::SlotAddr(s3, slot));
-            self.emit(Inst::Load(r, s3, ir));
-            r
-        } else {
-            let slot = self.alloc_slot_for(expected);
-            let addr = self.fresh_vreg();
-            self.emit(Inst::SlotAddr(addr, slot));
-            self.lower_if_to_addr(cond, then_b, else_b, addr, expected);
-            addr
-        }
+        self.start(merge);
+        let r = self.fresh_vreg();
+        let s3 = self.fresh_vreg();
+        self.emit(Inst::SlotAddr(s3, slot));
+        self.emit(Inst::Load(r, s3, ir));
+        r
     }
 
     fn lower_if_to_addr(
@@ -1958,19 +1844,11 @@ impl<'a> Lowerer<'a> {
             else_bb: ebb,
         });
         self.start(tbb);
-        self.lower_block_stmts(then_b);
-        if let Some(t) = &then_b.expr {
-            self.lower_expr_to_addr(t, dst, ty);
-        }
-        self.pop_scope();
+        self.lower_block_to_addr(then_b, dst, ty);
         self.seal(Term::Jump(merge));
         if let Some(eb) = else_b {
             self.start(ebb);
-            self.lower_block_stmts(eb);
-            if let Some(t) = &eb.expr {
-                self.lower_expr_to_addr(t, dst, ty);
-            }
-            self.pop_scope();
+            self.lower_block_to_addr(eb, dst, ty);
             self.seal(Term::Jump(merge));
         }
         self.start(merge);
@@ -1986,6 +1864,15 @@ pub fn lower(program: &Program, checked: &CheckedProgram) -> IrProgram {
 // IR pretty-printer
 pub fn print_ir(prog: &IrProgram) -> String {
     let mut out = String::new();
+    for (i, g) in prog.globals.iter().enumerate() {
+        out += &format!(
+            "global{} {}{}: {:?}\n",
+            i,
+            if g.mutable { "mut " } else { "" },
+            g.name,
+            g.bytes
+        );
+    }
     for sc in &prog.strings {
         out += &format!(
             "{}: {:?}\n",
@@ -2120,6 +2007,7 @@ fn fmt_inst(i: &Inst) -> String {
         Inst::Store(a, v, t) => format!("store.{} [{}], {}", t, a, v),
         Inst::MemCopy { dst, src, size } => format!("memcpy [{}], [{}], {}", dst, src, size),
         Inst::SlotAddr(d, s) => format!("{} = slotaddr {}", d, s),
+        Inst::GlobalAddr(d, index) => format!("{} = globaladdr @global{}", d, index),
         Inst::MemberPtr(d, b, off) => format!("{} = memberptr {}, +{}", d, b, off),
         Inst::IndexPtr(d, b, idx, sz) => format!("{} = indexptr {}, {}, elem={}", d, b, idx, sz),
         Inst::Call { dst, func, args } => {
@@ -2159,7 +2047,8 @@ mod tests {
     use super::*;
 
     pub fn parse_source(src: &str) -> Result<Program, ParserError> {
-        parse(&crate::lexer::Lexer::new(src).tokenize().unwrap())
+        crate::parser::parse(crate::lexer::Lexer::new(src).tokenize().unwrap())
+            .map_err(|mut errors| errors.remove(0))
     }
 
     fn lower_ok(src: &str) -> IrProgram {
@@ -2212,7 +2101,7 @@ mod tests {
     }
     #[test]
     fn test_loop_break() {
-        let s = ir_str("fn f() { let i: i32 = 0; loop { if i == 10 { break; }; i += 1; } }");
+        let s = ir_str("fn f() { let mut i: i32 = 0; loop { if i == 10 { break; }; i += 1; } }");
         assert!(s.contains("jmp bb"));
         assert!(s.contains("icmp"));
     }
@@ -2333,7 +2222,7 @@ mod tests {
     }
     #[test]
     fn test_compound_assign() {
-        let s = ir_str("fn f() { let x: i32 = 1; x += 10; }");
+        let s = ir_str("fn f() { let mut x: i32 = 1; x += 10; }");
         assert!(s.contains("iadd.i32"));
         assert!(s.contains("store.i32"));
     }
@@ -2349,19 +2238,14 @@ mod tests {
         assert!(s.contains("iadd.i32"));
     }
     #[test]
-    fn test_power_int() {
-        let s = ir_str("fn f() -> i64 { 2 ** 10 }");
-        assert!(s.contains("call") && s.contains("__ipow"));
-    }
-    #[test]
-    fn test_power_float() {
-        let s = ir_str("fn f() -> f64 { let x: f64 = 2.0; x ** 3.0 }");
-        assert!(s.contains("call") && s.contains("pow"));
+    fn test_float_mod_calls_fmod() {
+        let s = ir_str("fn f() -> f64 { let x: f64 = 7.0; x % 3.0 }");
+        assert!(s.contains("call") && s.contains("fmod"));
     }
     #[test]
     fn test_continue() {
         let s = ir_str(
-            "fn f() { let i: i32 = 0; loop { i += 1; if i == 5 { continue; }; if i == 10 { break; }; } }",
+            "fn f() { let mut i: i32 = 0; loop { i += 1; if i == 5 { continue; }; if i == 10 { break; }; } }",
         );
         assert!(s.contains("jmp bb"));
     }

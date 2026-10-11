@@ -8,7 +8,8 @@
 //   // STDIN: text         stdin, one directive per line, joined with '\n'
 //   // EXPECT: text        expected stdout, one directive per line
 //   // EXIT: 3             expected exit code (default 0)
-//   // ERROR: substring    compilation must fail with this message
+//   // ERROR: substring    compilation must fail with this message (one
+//                          directive per expected message)
 //   // XFAIL: reason       known bug: the case is expected to fail; it is
 //                          reported as XPASS (a failure) once it passes
 //   // XFAIL(x): reason    the same, only for configurations whose name
@@ -51,7 +52,7 @@ struct Case {
     stdin: Option<String>,
     expect: Vec<String>,
     exit: i32,
-    error: Option<String>,
+    error: Vec<String>,
     // (scope, reason); a scope of None applies to every configuration.
     xfail: Vec<(Option<String>, String)>,
     // Only compile and link (programs that serve or animate).
@@ -81,7 +82,7 @@ impl Case {
                 "STDIN" => stdin.push(value),
                 "EXPECT" => case.expect.push(value),
                 "EXIT" => case.exit = value.trim().parse().expect("EXIT must be an integer"),
-                "ERROR" => case.error = Some(value),
+                "ERROR" => case.error.push(value),
                 "XFAIL" => case.xfail.push((None, value)),
                 _ => {
                     if let Some(scope) =
@@ -202,12 +203,9 @@ impl Config {
     }
 
     // The link command, run in the case directory: produces ./prog from
-    // prog.o.
+    // prog.o. The same invocation the `tachyon` command uses.
     fn link_command(&self) -> (String, Vec<String>) {
-        let (linker, flags) = self.target.linker();
-        let mut args: Vec<String> = flags.iter().map(|s| s.to_string()).collect();
-        args.extend(["-o", "prog", "prog.o", "-lm"].map(String::from));
-        (linker.to_string(), args)
+        tachyon::driver::link_args(self.target, "prog.o", "prog")
     }
 }
 
@@ -416,20 +414,17 @@ fn compile(source: &str, options: Options) -> Result<Artifact, String> {
     }
 }
 
-fn check_compile_error(case: &Case, expected: &str) -> Result<(), String> {
+fn check_compile_error(case: &Case, expected: &[String]) -> Result<(), String> {
     let source = std::fs::read_to_string(&case.source).unwrap();
     match compile(&source, Options::default()) {
-        Ok(_) => Err(format!("expected compile error containing '{}'", expected)),
-        Err(report) => {
-            if report.contains(expected) {
-                Ok(())
-            } else {
-                Err(format!(
-                    "expected compile error containing '{}', got:\n{}",
-                    expected, report
-                ))
-            }
-        }
+        Ok(_) => Err(format!("expected compile error containing {:?}", expected)),
+        Err(report) => match expected.iter().find(|e| !report.contains(e.as_str())) {
+            None => Ok(()),
+            Some(missing) => Err(format!(
+                "expected compile error containing '{}', got:\n{}",
+                missing, report
+            )),
+        },
     }
 }
 
@@ -541,7 +536,7 @@ fn run_config(config: Config, cases: &[Case], work: &Path) -> Report {
             return report;
         }
     };
-    for case in cases.iter().filter(|c| c.error.is_none()) {
+    for case in cases.iter().filter(|c| c.error.is_empty()) {
         let result = run_case(case, &config, runner, work);
         record(
             &mut report.tally,
@@ -602,7 +597,8 @@ fn golden_programs() {
     let mut errors_tally = Tally::new();
     let mut failures = Vec::new();
     for case in cases.iter() {
-        if let Some(expected) = &case.error {
+        if !case.error.is_empty() {
+            let expected = &case.error;
             let xfail = case
                 .xfail
                 .iter()
