@@ -171,7 +171,12 @@ fn materialize(v: i64, r: i64) {
     } else if op == OP_SLOT {
         m_lea(r, reg_sp(), SLOTS[imm].offset);
     } else if op == OP_GADDR {
-        m_symbol_addr(r, static_prefix(), imm);
+        let st = SYM_STATIC[imm] - 1;
+        if STATICS[st].linkage == 1 {
+            m_extern_addr(r, imm);
+        } else {
+            m_symbol_addr(r, static_symbol_prefix(st), imm);
+        }
     } else if op == OP_SADDR {
         m_string_addr(r, imm);
     } else if FNS[imm].is_extern {
@@ -251,6 +256,9 @@ fn const_of(v: i64, value: *i64) -> bool {
 const PM_LOC: i64 = 0;
 const PM_REMAT: i64 = 1;
 const PM_STACK: i64 = 2;
+// The address of a stack argument of the caller (an offset from the frame
+// pointer).
+const PM_ADDR: i64 = 3;
 static mut PM: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
 fn pm_add(dst: i64, kind: i64, src: i64, ty: i64) {
@@ -352,6 +360,8 @@ fn pm_resolve() {
         let r = if dst >= 0 { dst } else { reg_move_temp(is_float(ty)) };
         if pm_kind(i) == PM_REMAT {
             materialize(pm_src(i), r);
+        } else if pm_kind(i) == PM_ADDR {
+            m_lea(r, reg_fp(), pm_src(i));
         } else {
             m_load(ty, r, reg_fp(), pm_src(i));
         }
@@ -426,16 +436,24 @@ fn save_callee_saved(restore: bool) {
     }
 }
 
-// The C convention's location of each parameter of function `f`, by
-// parameter index (in `locations`).
-fn param_locations(f: i64, locations: *i64) {
+// The C convention's location of each parameter of function `f`: of
+// parameter i at locations[i], or of its pieces at pieces[4 * i + k] (see
+// 41_abi.tach).
+fn param_locations(f: i64, locations: *i64, pieces: *i64) {
     let mut state: [i64; 3] = [first_int_arg(FNS[f].ret), 0, 0];
     for i in 0..FNS[f].param_count {
         let ty = fn_param(f, i);
         if is_void(ty) {
             continue;
         }
-        locations[i] = arg_location(ty, &state as *i64);
+        let kind = abi_classify(ty);
+        if kind == ABI_PIECES {
+            abi_piece_locations(ty, &state as *i64, &pieces[4 * i]);
+        } else if kind == ABI_STACK {
+            locations[i] = abi_stack_location(ty, &state as *i64);
+        } else {
+            locations[i] = arg_location(if kind == ABI_REF { TY_U64 } else { scalar_type(ty) }, &state as *i64);
+        }
     }
 }
 
@@ -443,24 +461,28 @@ fn param_locations(f: i64, locations: *i64) {
 fn emit_entry_moves(fi: i64) {
     let f = IRFUNCS[fi].f;
     let mut locations: [i64; 64] = [0; 64];
+    let mut pieces: [i64; 256] = [0; 256];
     if FNS[f].param_count > 64 {
         die(c"too many parameters (at most 64 are supported)");
     }
-    param_locations(f, &locations as *i64);
+    param_locations(f, &locations as *i64, &pieces as *i64);
     let entry = IRFUNCS[fi].entry;
     let mut v = BLOCKS[entry].first;
     while v != 0 {
         if INSTS[v].op == OP_PARAM && loc_of(v) != LOC_NONE {
             let ty = INSTS[v].ty;
             let index = INSTS[v].imm;
+            let piece = INSTS[v].imm2;
             if index < 0 {
                 pm_add(loc_of(v), PM_LOC, reg_result_ptr(), TY_U64);
             } else {
-                let location = locations[index];
-                if location >= 16 {
+                let location = if piece > 0 { pieces[4 * index + piece - 1] } else { locations[index] };
+                if piece < 0 {
+                    pm_add(loc_of(v), PM_ADDR, location, TY_U64);
+                } else if location >= 16 {
                     let param_ty = fn_param(f, index);
-                    let load_ty = if is_compound(param_ty) { TY_U64 } else { ty };
-                    pm_add(loc_of(v), PM_STACK, 16 + location - 16, load_ty);
+                    let load_ty = if is_compound(param_ty) && piece == 0 { TY_U64 } else { ty };
+                    pm_add(loc_of(v), PM_STACK, location, load_ty);
                 } else {
                     pm_add(loc_of(v), PM_LOC, arg_reg(location), ty);
                 }
@@ -492,7 +514,7 @@ fn gen_ir_function(fi: i64) {
     LABEL_BASE = LABEL_COUNT + 1;
     LABEL_COUNT += ORDER.count;
     EPILOGUE_LABEL = new_label();
-    emit_function_start(fn_symbol_prefix(f), FNS[f].name, FNS[f].name == MAIN_SYM);
+    emit_function_start(fn_symbol_prefix(f), FNS[f].name, fn_is_global(f));
     if FRAME_TOTAL > 0 {
         if X86 { x64_frame_reserve(FRAME_TOTAL); } else { a64_frame_reserve(FRAME_TOTAL); }
     }
@@ -585,9 +607,21 @@ fn emit_ir_block(b: i64, k: i64) {
         }
     } else if term == TERM_BRANCH {
         emit_branch(b, next);
+    } else if term == TERM_SWITCH {
+        emit_switch(b);
     } else if term == TERM_RET {
         let value = BLOCKS[b].cond;
-        if value != 0 {
+        let ret = FNS[IRFUNCS[IRF].f].ret;
+        if value != 0 && is_compound(ret) && !returns_through_pointer(ret) {
+            // An aggregate returned in registers: its pieces, from its
+            // address.
+            abi_classify(ret);
+            let mut offset = 0;
+            let base = mem_base(value, 0, -1, &offset);
+            for k in 0..ABI_PIECE_COUNT {
+                m_load(ABI_PIECE_TY[k], return_piece_reg(k), base, offset + ABI_PIECE_OFFSET[k]);
+            }
+        } else if value != 0 {
             use_into(value, reg_ret(is_float(INSTS[value].ty)));
         }
         if next != 0 {
@@ -658,6 +692,93 @@ fn emit_branch(b: i64, next: i64) {
     }
     if other != next {
         m_jump(block_label(other));
+    }
+}
+
+// ---- Switches ----
+
+// The cases of the switch being emitted, sorted by value (in the order of
+// the switch's type): value and label.
+static mut SW_VALUES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut SW_LABELS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// A switch: a jump table when its cases are dense (at least 4, filling at
+// least a third of their range), else a binary search. Like branches,
+// switches have no phi moves (edges into phis are split).
+fn emit_switch(b: i64) {
+    let cond = BLOCKS[b].cond;
+    let ty = INSTS[cond].ty;
+    let n = BLOCKS[b].ncases;
+    SW_VALUES.count = 0;
+    SW_LABELS.count = 0;
+    for i in 0..n {
+        // Insertion in order of the keys (see int_key).
+        let key = int_key(case_value(b, i), ty);
+        let mut at = SW_VALUES.count;
+        intvec_push(&SW_VALUES, 0);
+        intvec_push(&SW_LABELS, 0);
+        while at > 0 && int_key(SW_VALUES.data[at - 1], ty) > key {
+            SW_VALUES.data[at] = SW_VALUES.data[at - 1];
+            SW_LABELS.data[at] = SW_LABELS.data[at - 1];
+            at -= 1;
+        }
+        SW_VALUES.data[at] = case_value(b, i);
+        SW_LABELS.data[at] = block_label(jump_target(case_target(b, i)));
+    }
+    let default = block_label(jump_target(BLOCKS[b].s0));
+    let r = int_operand(cond, 0);
+    if n == 0 {
+        m_jump(default);
+        return;
+    }
+    let low = SW_VALUES.data[0];
+    let range = int_key(SW_VALUES.data[n - 1], ty) - int_key(low, ty) + 1;
+    if n >= 4 && range > 0 && range <= 3 * n && range <= 4096 {
+        // One entry per value of the range: the case's label or the default.
+        let table = alloc_zeroed(range * 8) as *i64;
+        for i in 0..range {
+            table[i] = default;
+        }
+        for i in 0..n {
+            table[SW_VALUES.data[i] - low] = SW_LABELS.data[i];
+        }
+        if X86 {
+            mx_jump_table(r, low, range, default, table);
+        } else {
+            ma_jump_table(r, low, range, default, table);
+        }
+        free(table as *u8);
+        return;
+    }
+    emit_switch_search(r, ty, 0, n, default);
+}
+
+// Compares and branches for the cases lo..hi (sorted), by halves.
+fn emit_switch_search(r: i64, ty: i64, lo: i64, hi: i64, default: i64) {
+    if hi - lo <= 3 {
+        for i in lo..hi {
+            switch_compare(TK_EQ_EQ, ty, r, SW_VALUES.data[i], SW_LABELS.data[i]);
+        }
+        m_jump(default);
+        return;
+    }
+    let mid = (lo + hi) / 2;
+    switch_compare(TK_EQ_EQ, ty, r, SW_VALUES.data[mid], SW_LABELS.data[mid]);
+    let right = new_label();
+    switch_compare(TK_GT, ty, r, SW_VALUES.data[mid], right);
+    emit_switch_search(r, ty, lo, mid, default);
+    emit_label(right);
+    emit_switch_search(r, ty, mid + 1, hi, default);
+}
+
+// Jumps to `label` when register r <op> value.
+fn switch_compare(op: i64, ty: i64, r: i64, value: i64, label: i64) {
+    if fits_cmp_imm(value) {
+        m_cmp_branch(op, ty, r, 0, true, value, label);
+    } else {
+        let scratch = reg_scratch(1);
+        m_load_imm(scratch, value as u64);
+        m_cmp_branch(op, ty, r, scratch, false, 0, label);
     }
 }
 
@@ -735,12 +856,17 @@ fn emit_binary(v: i64) {
 
 // The base register and offset of a memory access to `addr` + `offset`:
 // frame slots are addressed from sp directly.
+// (`scratch` -1: the parallel moves' temporary, outside the argument and
+// result registers.)
 fn mem_base(addr: i64, offset: i64, scratch: i64, out_offset: *i64) -> i64 {
     if INSTS[addr].op == OP_SLOT {
         *out_offset = SLOTS[INSTS[addr].imm].offset + offset;
         return reg_sp();
     }
     *out_offset = offset;
+    if scratch < 0 {
+        return use_reg(addr, reg_move_temp(false));
+    }
     int_operand(addr, scratch)
 }
 
@@ -762,18 +888,84 @@ fn emit_store_inst(v: i64) {
 
 // ---- Calls ----
 
-// The argument locations of call `v` (in `locations`); returns the size of
-// its stack area, and the float registers used in `float_regs`.
-fn call_locations(v: i64, locations: *i64, float_regs: *i64) -> i64 {
-    let has_result_ptr = INSTS[v].c != 0;
-    let mut state: [i64; 3] = [if X86 && has_result_ptr { 1 } else { 0 }, 0, 0];
-    for i in 0..INSTS[v].nargs {
-        let ty = ARGTY.data[INSTS[v].args + i];
-        if ty < 0 {
-            locations[i] = variadic_arg_location(0 - ty, &state as *i64);
-        } else {
-            locations[i] = arg_location(ty, &state as *i64);
+// The function type called by call v: its parameters and result (0 for
+// the C library functions of OP_CALLC, whose arguments are scalars).
+fn callee_param_count(v: i64) -> i64 {
+    let op = INSTS[v].op;
+    if op == OP_CALL { return FNS[INSTS[v].imm].param_count; }
+    if op == OP_CALLI { return TYPES[INSTS[v].imm].count; }
+    0
+}
+
+fn callee_param(v: i64, i: i64) -> i64 {
+    if INSTS[v].op == OP_CALL { fn_param(INSTS[v].imm, i) } else { type_elem(INSTS[v].imm, i) }
+}
+
+fn callee_result(v: i64) -> i64 {
+    let op = INSTS[v].op;
+    if op == OP_CALL { return FNS[INSTS[v].imm].ret; }
+    if op == OP_CALLI { return TYPES[INSTS[v].imm].a; }
+    0
+}
+
+// The location of each argument (IR operand) of call `v` (in
+// `locations`), and for aggregates copied onto the stack their size (in
+// `copies`, 0 otherwise); returns the size of its stack area, and the
+// float registers used in `float_regs`.
+fn call_locations(v: i64, locations: *i64, copies: *i64, float_regs: *i64) -> i64 {
+    let mut state: [i64; 3] = [first_int_arg(callee_result(v)), 0, 0];
+    let mut j = 0;
+    for i in 0..callee_param_count(v) {
+        let ty = callee_param(v, i);
+        if is_void(ty) {
+            continue;
         }
+        let kind = abi_classify(ty);
+        if kind == ABI_PIECES {
+            abi_piece_locations(ty, &state as *i64, &locations[j]);
+            for k in 0..ABI_PIECE_COUNT {
+                copies[j + k] = 0;
+            }
+            j += ABI_PIECE_COUNT;
+        } else if kind == ABI_STACK {
+            locations[j] = abi_stack_location(ty, &state as *i64);
+            copies[j] = size_of(ty);
+            j += 1;
+        } else {
+            locations[j] = arg_location(if kind == ABI_REF { TY_U64 } else { scalar_type(ty) }, &state as *i64);
+            copies[j] = 0;
+            j += 1;
+        }
+    }
+    // The `...` arguments, and the arguments of C library functions.
+    while j < INSTS[v].nargs {
+        let ty = ARGTY.data[INSTS[v].args + j];
+        copies[j] = 0;
+        if ty < 0 && is_compound(0 - ty) {
+            let t = 0 - ty;
+            let kind = variadic_kind(t);
+            if kind == ABI_PIECES {
+                abi_variadic_piece_locations(t, &state as *i64, &locations[j]);
+                for k in 0..ABI_PIECE_COUNT {
+                    copies[j + k] = 0;
+                }
+                j += ABI_PIECE_COUNT;
+            } else if kind == ABI_STACK {
+                locations[j] = abi_stack_location(t, &state as *i64);
+                copies[j] = size_of(t);
+                j += 1;
+            } else {
+                locations[j] = variadic_arg_location(TY_U64, &state as *i64);
+                j += 1;
+            }
+            continue;
+        }
+        if ty < 0 {
+            locations[j] = variadic_arg_location(0 - ty, &state as *i64);
+        } else {
+            locations[j] = arg_location(ty, &state as *i64);
+        }
+        j += 1;
     }
     *float_regs = state[1];
     align_to(state[2], 16)
@@ -784,15 +976,17 @@ fn call_stack_size(v: i64) -> i64 {
         die(c"too many arguments (at most 64 are supported)");
     }
     let mut locations: [i64; 64] = [0; 64];
+    let mut copies: [i64; 64] = [0; 64];
     let mut float_regs = 0;
-    call_locations(v, &locations as *i64, &float_regs)
+    call_locations(v, &locations as *i64, &copies as *i64, &float_regs)
 }
 
 fn emit_call_inst(v: i64) {
     let op = INSTS[v].op;
     let mut locations: [i64; 64] = [0; 64];
+    let mut copies: [i64; 64] = [0; 64];
     let mut float_regs = 0;
-    call_locations(v, &locations as *i64, &float_regs);
+    call_locations(v, &locations as *i64, &copies as *i64, &float_regs);
     // Stack arguments first: their sources are still intact.
     for i in 0..INSTS[v].nargs {
         let location = locations[i];
@@ -800,6 +994,21 @@ fn emit_call_inst(v: i64) {
             continue;
         }
         let arg = ir_arg(v, i);
+        if copies[i] > 0 {
+            // An aggregate copied onto the stack, in 8-byte pieces (its
+            // private copy is a multiple of 8 bytes), through registers no
+            // value is allocated to.
+            let mut offset = 0;
+            let src = mem_base(arg, 0, -1, &offset);
+            let temp = reg_cycle(false);
+            let mut k = 0;
+            while k < copies[i] {
+                m_load(TY_U64, temp, src, offset + k);
+                m_store(TY_U64, temp, reg_sp(), location - 16 + k);
+                k += 8;
+            }
+            continue;
+        }
         let declared = ARGTY.data[INSTS[v].args + i];
         let variadic = declared < 0;
         let ty = if variadic { 0 - declared } else { declared };
@@ -822,7 +1031,9 @@ fn emit_call_inst(v: i64) {
             pm_add_value(arg_reg(location), ir_arg(v, i));
         }
     }
-    if INSTS[v].c != 0 {
+    let ret = callee_result(v);
+    let through_pointer = INSTS[v].c != 0 && returns_through_pointer(ret);
+    if through_pointer {
         pm_add_value(reg_result_ptr(), INSTS[v].c);
     }
     if op == OP_CALLI {
@@ -831,7 +1042,9 @@ fn emit_call_inst(v: i64) {
     pm_resolve();
     if op == OP_CALL {
         let f = INSTS[v].imm;
-        emit_call(fn_symbol_prefix(f), FNS[f].name, FNS[f].is_extern, FNS[f].variadic, float_regs);
+        emit_call(fn_symbol_prefix(f), FNS[f].name, FNS[f].is_extern || FNS[f].export, FNS[f].variadic, float_regs);
+    } else if op == OP_CALLC && INSTS[v].imm == rt_panic_sym() {
+        emit_call(function_prefix(), INSTS[v].imm, false, false, 0);
     } else if op == OP_CALLC {
         emit_call(global_prefix(), INSTS[v].imm, true, false, 0);
     } else if X86 {
@@ -839,18 +1052,28 @@ fn emit_call_inst(v: i64) {
     } else {
         a64_call_indirect();
     }
+    if INSTS[v].c != 0 && !through_pointer {
+        // An aggregate result in registers: stored in pieces into its slot.
+        abi_classify(ret);
+        let mut offset = 0;
+        let base = mem_base(INSTS[v].c, 0, -1, &offset);
+        for k in 0..ABI_PIECE_COUNT {
+            m_store(ABI_PIECE_TY[k], return_piece_reg(k), base, offset + ABI_PIECE_OFFSET[k]);
+        }
+        return;
+    }
     let ty = INSTS[v].ty;
     let loc = loc_of(v);
     if ty == 0 || loc == LOC_NONE {
         return;
     }
-    let ret = reg_ret(is_float(ty));
+    let ret_reg = reg_ret(is_float(ty));
     if ty == TY_BOOL || (is_integer(ty) && int_bits(ty) < 64) {
-        m_normalize(ret, if ty == TY_BOOL { TY_U8 } else { ty });
+        m_normalize(ret_reg, if ty == TY_BOOL { TY_U8 } else { ty });
     }
     if loc >= 0 {
-        m_mov(loc, ret, ty);
+        m_mov(loc, ret_reg, ty);
     } else {
-        m_store(spill_type(ty), ret, reg_sp(), spill_offset(loc));
+        m_store(spill_type(ty), ret_reg, reg_sp(), spill_offset(loc));
     }
 }

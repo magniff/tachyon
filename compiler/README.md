@@ -37,7 +37,9 @@ format (`error[type error]: ...` / ` --> file: line L, column C` /
 | `30_types.tach` | interned types, layouts, the tables of structs, functions, constants and statics |
 | `31_check.tach` | the bidirectional type checker; records a type on every expression node |
 | `32_const.tach` | compile-time evaluation: constants, array lengths, static initializers |
+| `33_match.tach` | patterns: their checking, refutability, `match`, and exhaustiveness and reachability by usefulness |
 | `40_gen.tach` | the driver of code generation, and the `-O0` code generator: walks the checked AST, in terms of the target interface |
+| `41_abi.tach` | C's calling convention for aggregates (AArch64 and System V): classification into pieces, locations |
 | `41_target.tach` | the target interface: targets, the machine model's virtual registers, object-format details (symbols, sections, labels), and dispatch to the instruction set |
 | `42_arm64.tach` | AArch64 for `-O0`: instructions and Apple's arm64 calling convention |
 | `43_x86_64.tach` | x86-64 for `-O0`: AT&T-syntax instructions and the System V calling convention |
@@ -45,7 +47,8 @@ format (`error[type error]: ...` / ` --> file: line L, column C` /
 | `45_lower.tach` | the checked AST to IR, building SSA form (Braun et al.) |
 | `46_opt.tach` | CFG cleanups, dominators, dead code elimination, and the pass pipeline |
 | `47_fold.tach` | constant folding, SCCP, instruction combining |
-| `48_gvn.tach` | global value numbering, load and store forwarding, alias analysis |
+| `48_gvn.tach` | global value numbering, alias analysis, load and store forwarding, dead stores |
+| `48_sroa.tach` | scalar replacement of aggregates; constant local tables to read-only data |
 | `49_inline.tach` | inlining over the call graph's components |
 | `49_licm.tach` | natural loops and loop-invariant code motion |
 | `50_regalloc.tach` | block layout, liveness, linear-scan register allocation |
@@ -72,10 +75,10 @@ instruction text is in `42_arm64.tach` and `43_x86_64.tach`; a new
 instruction set is a new file implementing the same interface (see "Adding
 a host" in [docs/releases.md](../docs/releases.md)).
 
-Semantics follow the seed exactly where programs can observe them, on every
-target: evaluation order (an assignment computes its target's address
-before the value; a compound assignment reads the old value before
-evaluating the right-hand side), wrapping arithmetic, shift amounts taken
+Semantics follow the seed where programs can observe them (except where
+0.3 changed the language: an assignment evaluates its right-hand side
+before its target's address, then a compound assignment reads the old
+value), on every target: wrapping arithmetic, shift amounts taken
 modulo 32 for types up to 32 bits and modulo 64 for 64-bit ones, saturating
 float-to-integer casts, and NaN-aware comparisons. One difference: integer
 division by zero is not trapped (`x / 0` is 0 and `x % 0` is `x`, the
@@ -85,7 +88,10 @@ the seed traps.
 ## The language subset of its own source
 
 A release's compiler source may only use what the previous release's binary
-supports (see [docs/releases.md](../docs/releases.md)). The 0.1 source,
+supports (see [docs/releases.md](../docs/releases.md)). The 0.3 source is
+built by 0.2.0 and uses the same subset as 0.2 (no enums, `match`, methods,
+slices or `extern "C"` blocks: those come in 0.4; its C declarations are
+the deprecated `extern fn` form). The 0.1 source,
 built by the seed, uses the constructs below; the 0.2 source, built by
 0.1.0, uses them too, and in addition struct fields of struct type,
 functions returning a struct, and statics of array type (all supported by
@@ -109,17 +115,16 @@ It does not use tuples, function pointer types, type aliases, loop labels,
 `break` with a value, `..=`, `"..."` strings or block comments; all of these
 are supported by the compiler itself and covered by the test suite.
 
-One rule its source follows that is easy to miss: since an assignment
-computes the target's address first, `NODES[n].a = parse_expr()` would write
-into the old array if `parse_expr` grows (reallocates) `NODES`. Such calls
-are made into a local first.
+One rule its source follows that is easy to miss: built by 0.2.0, whose
+assignments compute the target's address first, `NODES[n].a = parse_expr()`
+would write into the old array if `parse_expr` grows (reallocates)
+`NODES`. Such calls are made into a local first (0.3 evaluates the right
+side first, so from 0.4 on the rule goes away).
 
 ## Known limits
 
 - One error per compilation (the seed recovers and reports all of them).
-- Structs passed to or returned from C functions by value use tachyon's
-  convention, not C's (`div` returning `div_t` is wrong): the same limit as
-  the seed (`tests/run/abi_extern_small_struct.tach` is an XFAIL).
+- `#[repr(C, align(N))]` takes N up to 16 (frames are not realigned).
 - Targets: AArch64 macOS, x86-64 Linux and macOS. No AArch64 Linux yet.
 - The optimizer's limits are listed at the end of
   [docs/optimizer.md](../docs/optimizer.md).

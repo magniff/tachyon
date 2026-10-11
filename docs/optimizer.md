@@ -8,7 +8,8 @@ and back end; later releases extend it (see [roadmap.md](roadmap.md)).
 The code: `compiler/src/44_ir.tach` (IR), `45_lower.tach` (AST to SSA),
 `46_opt.tach` (CFG cleanups, dominators, dead code, the pipeline),
 `47_fold.tach` (folding, SCCP, instruction combining), `48_gvn.tach`
-(value numbering, memory forwarding, alias analysis), `49_licm.tach`,
+(value numbering, alias analysis, memory forwarding, dead stores),
+`48_sroa.tach` (scalar replacement, constant tables), `49_licm.tach`,
 `49_inline.tach`, `50_regalloc.tach` (linear scan), `51_emit.tach`
 (emission), `52_mc_arm64.tach` and `53_mc_x86_64.tach` (instructions).
 
@@ -17,7 +18,7 @@ The code: `compiler/src/44_ir.tach` (IR), `45_lower.tach` (AST to SSA),
 | flag | pipeline |
 |---|---|
 | `-O0` | the 0.1 code generator (`40_gen.tach`), unchanged: stack-machine code straight from the AST |
-| `-O1` | lowering to SSA; per function, twice: SCCP, instruction combining, CFG simplification, GVN, dead code elimination, CFG simplification; linear-scan register allocation |
+| `-O1` | lowering to SSA; per function, twice: SCCP, instruction combining, (the first time) scalar replacement of aggregates and constant tables, CFG simplification, GVN with memory forwarding and dead stores, dead code elimination, CFG simplification; linear-scan register allocation |
 | `-O2` (default) | `-O1`, then inlining bottom-up over the call graph and loop-invariant code motion, each followed by the `-O1` pipeline again; functions left without callers are not emitted |
 
 `-O0` stays as an independent oracle: it shares only the front end with
@@ -54,8 +55,17 @@ typed scalar values in SSA form; memory is explicit.
   `calli` (through a value) and `callc` (a C library function: `fmod`,
   `memcpy`). Calls keep the type of each argument as the callee sees it,
   for the C calling convention.
-- **Terminators**: `jump`, `branch` on a bool, `ret` with an optional value,
-  `unreachable`.
+- **Terminators**: `jump`, `branch` on a bool, `ret` with an optional value
+  (for an aggregate returned in registers, its address), `unreachable`, and
+  `switch` on an integer: case values with their blocks and a default;
+  its distinct successors are listed once, and each has the switch block
+  once among its predecessors.
+- **Calls follow C's convention** for every function: an aggregate
+  argument passed in registers is split by the lowering into its scalar
+  pieces (one `load` each, so the optimizer sees through the round trip),
+  and a parameter's pieces are separate `param`s (`imm2` = piece + 1)
+  stored into a slot; larger aggregates go by reference or as a copy on
+  the stack (`41_abi.tach`).
 - **Replacement** is lazy: `ir_replace(v, w)` records that `v` now stands
   for `w` (and unlinks `v`); `ir_val` follows such records, and passes
   resolve operands before they look at them.
@@ -92,10 +102,14 @@ pointer) and every arithmetic rule.
 | CFG simplification | branches on constants and branches with one target become jumps; a block merges into its only predecessor when that predecessor jumps to it; jumps through empty blocks are threaded (when the target has no phis) | `46_opt` |
 | dominators | Cooper, Harvey & Kennedy, *A Simple, Fast Dominance Algorithm*, over a reverse post-order | `46_opt` |
 | GVN | a walk of the dominator tree with a scoped hash table (undo log, so scopes are popped in constant time per entry) over the pure instructions; commutative operands in a canonical order | `48_gvn` |
-| memory forwarding | within a block: a load of a location known from an earlier load or store (same base, offset and type) is that value; stores, copies and calls invalidate what they may write | `48_gvn` |
-| alias analysis | addresses decompose into a base and a constant offset; distinct frame slots and statics never alias; a frame slot whose address never escapes (it is only used as the address of loads, stores and copies) is not written through pointers or by calls; otherwise ranges are compared when the bases agree | `48_gvn` |
+| alias analysis | an address is a base plus a constant offset; it points into a memory object (a frame slot, a static, constant data) through additions of constant or variable offsets, or into unknown memory; distinct objects never overlap; constant data is never written; a slot whose address only serves loads, stores, copies (memcpy calls included) and address arithmetic is private: no pointer from elsewhere and no call reaches it; within one object, byte ranges are compared when both offsets are known. No type-based rule: tachyon allows casts between any pointers | `48_gvn` |
 | dead code elimination | mark from instructions with side effects and the terminators, sweep the rest | `46_opt` |
 | LICM | natural loops from back edges (`h` dominates `t`); a preheader for each loop (the entering edge is split when needed); pure instructions whose operands are defined outside the loop move to the preheader, innermost loops first, and so do loads from frame slots and statics that nothing in the loop may write. Nothing moved can trap (division never traps in tachyon) | `49_licm` |
+| SROA | a frame slot of a struct, tuple, enum, slice, small array or scalar whose address serves only loads, stores and copies at constant offsets becomes one SSA variable per scalar leaf of its type, by Braun et al.'s construction over the existing CFG (blocks in reverse post-order, sealed once their predecessors are filled); copies move leaf by leaf, to or from memory when the other side stays there. The values of `if`, `match` and `loop` of up to 128 bytes are built in one slot each exit copies into, so they are replaced too | `48_sroa` |
+| constant tables | a private slot written only by stores of constants at known offsets, in one block that comes before every read, becomes read-only data; loads from read-only data (and string literals) at known offsets become constants | `48_sroa`, `48_gvn` |
+| memory forwarding | along the dominator tree: what a block knows about memory (location to value) goes to a block it dominates when that one's only predecessor is it, or after the writes of every block on the paths between them are applied; loads of known locations are their values; storing what a location holds is dropped; a load from the destination of a copy that still holds reads its source (and the copy may then die) | `48_gvn` |
+| dead stores | within a block, a store (or a copy) overwritten before anything may read it; a store or copy into a private slot that nothing reads | `48_gvn` |
+| switches | a `match` on an integer, a fieldless enum or an enum's tag whose arms are literals, ranges, alternatives of them, or variants whose fields only bind (and no guards), is a `switch`; SCCP decides switches on constants and prunes them to their reachable successor | `45_lower`, `47_fold`, `46_opt` |
 | inlining | strongly connected components of the call graph (Tarjan), callees first, so a callee is already optimized and recursion is never inlined; a callee is inlined when it has at most 30 instructions, or when this is its only call site and it has at most 400 (and is neither `main` nor address-taken); callers grow to at most 3,000 instructions. The callee's blocks are copied, parameters become the arguments, frame slots are copied, returns jump to a continuation block with a phi for the result | `49_inline` |
 
 The pipeline (`optimize_program` in `46_opt.tach`) runs the cleanup on
@@ -132,6 +146,11 @@ compare used only by the branch right after it is fused into that branch.
 | temporaries inside an instruction | x4-x7, x16, x17, d3-d7 | rax, rcx, rdx, xmm14, xmm15 |
 | parallel moves | x16 (temporary), x17 (cycles), d30, d31 | r11 (temporary), r10 (cycles), xmm14, xmm15 |
 
+**Switches** become a jump table when they have at least 4 cases filling at
+least a third of their range (up to 4096 entries): 32-bit offsets from the
+table, so the code is position independent on ELF too; otherwise a binary
+search of compares and branches.
+
 **Emission** (`51_emit.tach`). The frame is addressed from sp, which does
 not move in the body: outgoing stack arguments, spill slots, saved
 callee-saved registers, then the frame slots. Phis become parallel moves at
@@ -153,10 +172,18 @@ x86-64.
   --all-levels`).
 - **Random programs.** `tests/fuzz/gen.awk` writes random programs over
   every integer width with arithmetic, shifts, comparisons, casts, branches,
-  bounded loops, arrays, pointers and calls; `tests/fuzz/run.sh` compiles
+  bounded loops, arrays, pointers and calls, and (since 0.3, off in seed
+  mode) structs passed by value, enums, `match` on integers and enums with
+  ranges, alternatives and guards, methods and slices; `tests/fuzz/run.sh` compiles
   each at every level (with `--verify-ir`) and compares the output. With
   `-s SEED` the seed is a third oracle (divisors are then made non-zero,
   since the seed traps on division by zero).
+- **C interoperability.** `tests/abi/gen.awk` writes a C file and a
+  tachyon file that call each other with random signatures (scalars of
+  every width, `#[repr(C)]` structs, unions and enums, packed and aligned
+  ones, more arguments than registers, every kind of result, variadic
+  calls); every value is checked on the other side. `tests/abi/run.sh` runs
+  them at every level.
 - **IR tests.** Test cases with `// CHECK: text` and `// CHECK-NOT: text`
   are matched against `--emit-ir` (FileCheck's rules: CHECKs in order,
   CHECK-NOTs between them; `// CHECK-OPT: n` picks the level). The
@@ -167,12 +194,33 @@ x86-64.
   byte-identical assembly, on every host, and the assembly for a target
   does not depend on the host.
 
+## What 0.3 did
+
+0.3 (aggregates and memory) added, besides the language of
+[grammar.md](grammar.md) (enums and `match`, methods, slices, C
+interop):
+
+- the C calling convention for aggregates on both targets (and in the
+  `-O0` generator), checked against C by `tests/abi/run.sh`: random
+  signatures of scalars, `#[repr(C)]` structs (nested, with arrays, packed,
+  aligned), unions and enums, called from tachyon to C and from C to
+  tachyon (by name and through pointers), with results of every kind and
+  variadic calls;
+- SROA, constant tables, the alias analysis above, memory forwarding along
+  the dominator tree, copies read through, dead store elimination;
+- the `switch` terminator, `match` lowered to it, jump tables and binary
+  searches;
+- bugs found on the way: a reassociation of `(x + c1) + c2` across
+  different integer widths (an old one, exposed by SROA), and a nested
+  `match` overwriting the switch state of the one it is in.
+
 ## Not yet
 
-Planned in [roadmap.md](roadmap.md): scalar replacement of aggregates,
-dead store elimination, global (cross-block) load elimination and a real
-alias analysis for pointers (0.3); loop canonicalization, induction
-variables, unrolling and range analysis (0.4); live-range splitting and
-coalescing in the register allocator, rule-based instruction selection and
-scheduling (0.5); interprocedural analyses and a cost-model-driven inliner
-(0.6); an e-graph-based rewriter (0.7); vectorization (0.8).
+Planned in [roadmap.md](roadmap.md): chains of comparisons of one value
+turned into switches, aggressive dead code elimination, loop
+canonicalization, induction variables, unrolling, range analysis and
+bounds-check elimination (0.4); live-range splitting and coalescing in the
+register allocator, rule-based instruction selection, scheduling, a
+tachyon calling convention of its own (0.5); interprocedural analyses and a
+cost-model-driven inliner (0.6); an e-graph-based rewriter (0.7);
+vectorization (0.8).

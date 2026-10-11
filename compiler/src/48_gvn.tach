@@ -126,6 +126,16 @@ fn gvn_undo(mark: i64) {
 }
 
 // ---- Alias analysis ----
+//
+// An address is a base plus a constant offset (address_base); the base
+// points into a memory object, its root (root_of): a frame slot, a static,
+// or constant data (string literals and promoted constant arrays, never
+// written), through additions of constant or variable offsets; or into
+// unknown memory (root 0). Distinct objects never overlap; within one
+// object, byte ranges are compared when both offsets are known. A slot
+// whose address only serves loads, stores, copies and address arithmetic
+// is private: no pointer from elsewhere, and no call, reaches it. Tachyon
+// has no type-based aliasing rule: raw pointers may be cast freely.
 
 // The base of address `v` and its constant offset: (x + c1) + c2 is x at
 // c1 + c2.
@@ -138,8 +148,69 @@ fn address_base(v: i64, offset: *i64) -> i64 {
     base
 }
 
+static mut MEMCPY_SYM: i64 = 0;
+
+// Whether v is a copy too: a call of memcpy of a constant size (the
+// lowering of copies over INLINE_COPY_MAX bytes).
+fn is_memcpy(v: i64) -> bool {
+    if MEMCPY_SYM == 0 {
+        MEMCPY_SYM = intern_c(c"memcpy");
+    }
+    INSTS[v].op == OP_CALLC && INSTS[v].imm == MEMCPY_SYM && INSTS[v].nargs == 3
+        && is_const(ir_val(ir_arg(v, 2)))
+}
+
+// The destination, source and size of copy v (OP_COPY or memcpy).
+fn copy_dst(v: i64) -> i64 {
+    if INSTS[v].op == OP_COPY { INSTS[v].a } else { ir_val(ir_arg(v, 0)) }
+}
+
+fn copy_src(v: i64) -> i64 {
+    if INSTS[v].op == OP_COPY { INSTS[v].b } else { ir_val(ir_arg(v, 1)) }
+}
+
+fn copy_size(v: i64) -> i64 {
+    if INSTS[v].op == OP_COPY { INSTS[v].imm } else { INSTS[ir_val(ir_arg(v, 2))].imm }
+}
+
+fn is_copy(v: i64) -> bool {
+    INSTS[v].op == OP_COPY || is_memcpy(v)
+}
+
+fn is_object_op(op: i64) -> bool {
+    op == OP_SLOT || op == OP_GADDR || op == OP_SADDR
+}
+
+// The memory object address `v` points into (see above), or 0.
+fn root_of(v: i64) -> i64 {
+    let mut x = v;
+    for _ in 0..64 {
+        let op = INSTS[x].op;
+        if is_object_op(op) {
+            return x;
+        }
+        if op != OP_ADD || INSTS[x].ty != TY_U64 {
+            return 0;
+        }
+        if is_const(INSTS[x].b) {
+            x = INSTS[x].a;
+            continue;
+        }
+        let ra = root_of(INSTS[x].a);
+        let rb = root_of(INSTS[x].b);
+        if ra != 0 && rb == 0 {
+            return ra;
+        }
+        if rb != 0 && ra == 0 {
+            return rb;
+        }
+        return 0;
+    }
+    0
+}
+
 // Marks the frame slots of function `fi` whose address escapes: used other
-// than as the address of a load, store or copy (or plus a constant).
+// than by loads, stores, copies and address arithmetic.
 fn find_escaping_slots(fi: i64) {
     for i in 0..IRFUNCS[fi].slots.count {
         SLOTS[IRFUNCS[fi].slots.data[i]].escapes = 0;
@@ -159,7 +230,8 @@ fn find_escaping_slots(fi: i64) {
                 }
                 let allowed = ((op == OP_LOAD || op == OP_STORE) && k == 0)
                     || (op == OP_COPY && k <= 1)
-                    || (op == OP_ADD && k == 0 && is_const(INSTS[v].b) && INSTS[v].ty == TY_U64);
+                    || (op == OP_ADD && k <= 1 && INSTS[v].ty == TY_U64)
+                    || ((k == 3 || k == 4) && is_memcpy(v));
                 if !allowed {
                     mark_escape(operand);
                 }
@@ -173,73 +245,138 @@ fn find_escaping_slots(fi: i64) {
 }
 
 fn mark_escape(operand: i64) {
-    let mut offset = 0;
-    let base = address_base(operand, &offset);
-    if INSTS[base].op == OP_SLOT {
-        SLOTS[INSTS[base].imm].escapes = 1;
+    let root = root_of(operand);
+    if root != 0 && INSTS[root].op == OP_SLOT {
+        SLOTS[INSTS[root].imm].escapes = 1;
     }
 }
 
-// The memory object of a base address: a frame slot or a static, else 0.
-fn object_of(base: i64) -> i64 {
-    let op = INSTS[base].op;
+// The memory object of a root: a frame slot, a static, constant data
+// (negative, apart), or 0.
+fn object_of(root: i64) -> i64 {
+    if root == 0 {
+        return 0;
+    }
+    let op = INSTS[root].op;
     if op == OP_SLOT {
-        return INSTS[base].imm;
+        return INSTS[root].imm;
     }
     if op == OP_GADDR {
-        // Statics: negative symbols, apart from the slots.
-        return -1 - INSTS[base].imm;
+        return -1 - INSTS[root].imm;
     }
-    0
+    // Constant data, by string id.
+    -(1 << 40) - INSTS[root].imm
+}
+
+fn is_constant_memory(root: i64) -> bool {
+    root != 0 && INSTS[root].op == OP_SADDR
+}
+
+fn is_private_root(root: i64) -> bool {
+    root != 0 && INSTS[root].op == OP_SLOT && SLOTS[INSTS[root].imm].escapes == 0
 }
 
 fn is_private_slot(base: i64) -> bool {
-    INSTS[base].op == OP_SLOT && SLOTS[INSTS[base].imm].escapes == 0
+    is_private_root(root_of(base))
 }
 
-// Whether [base1 + off1, + size1) and [base2 + off2, + size2) may overlap.
+// Whether a call may write the memory at base: not when it is private or
+// constant.
+fn call_may_write(base: i64) -> bool {
+    let root = root_of(base);
+    !is_private_root(root) && !is_constant_memory(root)
+}
+
+// Whether [base1 + off1, + size1) and [base2 + off2, + size2) may overlap,
+// for an access that writes one of them (constant memory is never
+// written).
 fn may_alias(base1: i64, off1: i64, size1: i64, base2: i64, off2: i64, size2: i64) -> bool {
-    let o1 = object_of(base1);
-    let o2 = object_of(base2);
-    if base1 == base2 || (o1 != 0 && o1 == o2) {
+    if base1 == base2 {
         return off1 < off2 + size2 && off2 < off1 + size1;
     }
-    if o1 != 0 && o2 != 0 {
+    let r1 = root_of(base1);
+    let r2 = root_of(base2);
+    if is_constant_memory(r1) || is_constant_memory(r2) {
         return false;
     }
-    // A slot whose address never escapes is only reached through itself.
-    !is_private_slot(base1) && !is_private_slot(base2)
+    if r1 != 0 && r2 != 0 {
+        if object_of(r1) != object_of(r2) {
+            return false;
+        }
+        if base1 == r1 && base2 == r2 {
+            return off1 < off2 + size2 && off2 < off1 + size1;
+        }
+        return true;
+    }
+    // A private slot is only reached through itself.
+    !is_private_root(r1) && !is_private_root(r2)
 }
 
-// ---- Memory values within a block ----
+// ---- Memory values ----
+//
+// Known memory contents (AVAIL): (base, offset, size, type, value), 5 per
+// entry; a load of a known location is its value. Copies whose
+// destination still holds their source (COPIES): (destination base,
+// offset, size, source address, copy), 5 per entry; a load from such a
+// destination reads the source instead. Stores not yet read in this block
+// (PENDING): (base, offset, size, store), 4 per entry; a store overwritten
+// before it is read is dead. Writes kill what they may overlap; calls kill
+// what is neither private nor constant.
 
-// Known memory contents: (base, offset, size, type, value), 5 per entry.
 static mut AVAIL: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut COPIES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut PENDING: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+const AVAIL_MAX: i64 = 256;
 
+// Removes entry i (of `width` values) from list l.
+fn list_remove(l: *IntVec, i: i64, width: i64) {
+    for k in 0..width {
+        (*l).data[i + k] = (*l).data[(*l).count - width + k];
+    }
+    (*l).count -= width;
+}
+
+// A write of [base + offset, + size).
 fn avail_kill(base: i64, offset: i64, size: i64) {
     let mut i = 0;
     while i < AVAIL.count {
         let d = AVAIL.data;
         if may_alias(base, offset, size, d[i], d[i + 1], d[i + 2]) {
-            for k in 0..5 {
-                AVAIL.data[i + k] = AVAIL.data[AVAIL.count - 5 + k];
-            }
-            AVAIL.count -= 5;
+            list_remove(&AVAIL, i, 5);
+        } else {
+            i += 5;
+        }
+    }
+    i = 0;
+    while i < COPIES.count {
+        let d = COPIES.data;
+        let mut src_offset = 0;
+        let src = address_base(d[i + 3], &src_offset);
+        if may_alias(base, offset, size, d[i], d[i + 1], d[i + 2])
+            || may_alias(base, offset, size, src, src_offset, d[i + 2]) {
+            list_remove(&COPIES, i, 5);
         } else {
             i += 5;
         }
     }
 }
 
-// A call may write any memory but the private slots.
+// A call may write any memory but private slots and constants.
 fn avail_kill_call() {
     let mut i = 0;
     while i < AVAIL.count {
-        if !is_private_slot(AVAIL.data[i]) {
-            for k in 0..5 {
-                AVAIL.data[i + k] = AVAIL.data[AVAIL.count - 5 + k];
-            }
-            AVAIL.count -= 5;
+        if call_may_write(AVAIL.data[i]) {
+            list_remove(&AVAIL, i, 5);
+        } else {
+            i += 5;
+        }
+    }
+    i = 0;
+    while i < COPIES.count {
+        let mut src_offset = 0;
+        let src = address_base(COPIES.data[i + 3], &src_offset);
+        if call_may_write(COPIES.data[i]) || call_may_write(src) {
+            list_remove(&COPIES, i, 5);
         } else {
             i += 5;
         }
@@ -247,6 +384,9 @@ fn avail_kill_call() {
 }
 
 fn avail_add(base: i64, offset: i64, size: i64, ty: i64, value: i64) {
+    if AVAIL.count >= AVAIL_MAX * 5 {
+        list_remove(&AVAIL, 0, 5);
+    }
     intvec_push(&AVAIL, base);
     intvec_push(&AVAIL, offset);
     intvec_push(&AVAIL, size);
@@ -266,42 +406,256 @@ fn avail_find(base: i64, offset: i64, ty: i64) -> i64 {
     0
 }
 
-// Memory effects of instruction v; returns whether v was replaced.
+// A read of [base + offset, + size): the stores it may read are no longer
+// dead when overwritten.
+fn pending_read(base: i64, offset: i64, size: i64) {
+    let mut i = 0;
+    while i < PENDING.count {
+        let d = PENDING.data;
+        if may_alias(base, offset, size, d[i], d[i + 1], d[i + 2]) {
+            list_remove(&PENDING, i, 4);
+        } else {
+            i += 4;
+        }
+    }
+}
+
+// A write of [base + offset, + size): the pending stores it covers are
+// dead.
+fn pending_overwrite(base: i64, offset: i64, size: i64) -> bool {
+    let mut changed = false;
+    let mut i = 0;
+    while i < PENDING.count {
+        let d = PENDING.data;
+        if d[i] == base && d[i + 1] >= offset && d[i + 1] + d[i + 2] <= offset + size {
+            ir_unlink(d[i + 3]);
+            list_remove(&PENDING, i, 4);
+            changed = true;
+        } else {
+            i += 4;
+        }
+    }
+    changed
+}
+
+// Memory effects of instruction v; returns whether anything changed.
 fn memory_step(v: i64) -> bool {
     let op = INSTS[v].op;
     if op == OP_LOAD {
-        let mut offset = INSTS[v].imm;
-        let base = address_base(INSTS[v].a, &offset);
         let ty = INSTS[v].ty;
+        let size = size_of(ty);
+        let mut offset = INSTS[v].imm;
+        let mut base = address_base(INSTS[v].a, &offset);
+        let mut changed = false;
+        // From the source of a copy that still holds.
+        let mut i = 0;
+        while i < COPIES.count {
+            let d = COPIES.data;
+            if d[i] == base && offset >= d[i + 1] && offset + size <= d[i + 1] + d[i + 2] {
+                INSTS[v].a = d[i + 3];
+                INSTS[v].imm = offset - d[i + 1];
+                offset = INSTS[v].imm;
+                base = address_base(INSTS[v].a, &offset);
+                changed = true;
+                break;
+            }
+            i += 5;
+        }
         let known = avail_find(base, offset, ty);
         if known != 0 {
             ir_replace(v, known);
             return true;
         }
-        avail_add(base, offset, size_of(ty), ty, v);
-    } else if op == OP_STORE {
+        // From constant data at a known offset: a constant.
+        if INSTS[base].op == OP_SADDR {
+            let mut ok = false;
+            let value = constant_load(INSTS[base].imm, offset, ty, &ok);
+            if ok {
+                let c = ir_make(OP_CONST, ty, 0, 0, value);
+                ir_insert_before(v, c);
+                ir_replace(v, c);
+                return true;
+            }
+        }
+        pending_read(base, offset, size);
+        avail_add(base, offset, size, ty, v);
+        return changed;
+    }
+    if op == OP_STORE {
+        let ty = INSTS[v].imm2;
+        let size = size_of(ty);
         let mut offset = INSTS[v].imm;
         let base = address_base(INSTS[v].a, &offset);
-        let ty = INSTS[v].imm2;
-        avail_kill(base, offset, size_of(ty));
-        avail_add(base, offset, size_of(ty), ty, INSTS[v].b);
-    } else if op == OP_COPY {
+        // Storing what the location holds already: nothing to do.
+        if avail_find(base, offset, ty) == INSTS[v].b && INSTS[v].b != 0 {
+            ir_unlink(v);
+            return true;
+        }
+        let changed = pending_overwrite(base, offset, size);
+        avail_kill(base, offset, size);
+        avail_add(base, offset, size, ty, INSTS[v].b);
+        intvec_push(&PENDING, base);
+        intvec_push(&PENDING, offset);
+        intvec_push(&PENDING, size);
+        intvec_push(&PENDING, v);
+        return changed;
+    }
+    if is_copy(v) {
+        let size = copy_size(v);
+        let mut src_offset = 0;
+        let src = address_base(copy_src(v), &src_offset);
         let mut offset = 0;
-        let base = address_base(INSTS[v].a, &offset);
-        avail_kill(base, offset, INSTS[v].imm);
-    } else if is_call_op(op) {
+        let base = address_base(copy_dst(v), &offset);
+        pending_read(src, src_offset, size);
+        let changed = pending_overwrite(base, offset, size);
+        avail_kill(base, offset, size);
+        if !may_alias(base, offset, size, src, src_offset, size) {
+            intvec_push(&COPIES, base);
+            intvec_push(&COPIES, offset);
+            intvec_push(&COPIES, size);
+            intvec_push(&COPIES, copy_src(v));
+            intvec_push(&COPIES, v);
+        }
+        return changed;
+    }
+    if is_call_op(op) {
+        // It may read anything but private slots.
+        let mut i = 0;
+        while i < PENDING.count {
+            if !is_private_slot(PENDING.data[i]) {
+                list_remove(&PENDING, i, 4);
+            } else {
+                i += 4;
+            }
+        }
         avail_kill_call();
     }
     false
 }
 
+// The writes of block b, applied to AVAIL (for a block between a block and
+// one it dominates).
+fn apply_block_kills(b: i64) {
+    let mut v = BLOCKS[b].first;
+    while v != 0 {
+        let op = INSTS[v].op;
+        if op == OP_STORE {
+            let mut offset = INSTS[v].imm;
+            let base = address_base(ir_val(INSTS[v].a), &offset);
+            avail_kill(base, offset, size_of(INSTS[v].imm2));
+        } else if is_copy(v) {
+            let mut offset = 0;
+            let base = address_base(ir_val(copy_dst(v)), &offset);
+            avail_kill(base, offset, copy_size(v));
+        } else if is_call_op(op) {
+            avail_kill_call();
+        }
+        v = INSTS[v].next;
+    }
+}
+
+// Whether what is known at the end of d (in AVAIL) holds at the start of
+// c, which d dominates, once the writes of the blocks on the paths from d
+// to c are applied; false when those are too many to look at.
+static mut REGION_STAMP: i64 = 1;
+static mut REGION: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+fn inherit_into(d: i64, c: i64) -> bool {
+    if BLOCKS[c].preds.count == 1 && BLOCKS[c].preds.data[0] == d {
+        return true;
+    }
+    REGION_STAMP += 1;
+    let stamp = REGION_STAMP;
+    REGION.count = 0;
+    let mut work = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for i in 0..BLOCKS[c].preds.count {
+        intvec_push(&work, BLOCKS[c].preds.data[i]);
+    }
+    let mut ok = true;
+    while work.count > 0 {
+        let b = intvec_pop(&work);
+        if b == d || BLOCKS[b].mark == stamp {
+            continue;
+        }
+        BLOCKS[b].mark = stamp;
+        intvec_push(&REGION, b);
+        if REGION.count > 64 {
+            ok = false;
+            break;
+        }
+        for i in 0..BLOCKS[b].preds.count {
+            intvec_push(&work, BLOCKS[b].preds.data[i]);
+        }
+    }
+    free(work.data as *u8);
+    if !ok {
+        return false;
+    }
+    for i in 0..REGION.count {
+        apply_block_kills(REGION.data[i]);
+    }
+    true
+}
+
+// ---- Dead stores to private slots ----
+
+// Removes the stores and copies into private slots that nothing reads.
+fn remove_unread_slot_writes(fi: i64) -> bool {
+    let n = SLOT_COUNT + 1;
+    let read = alloc_zeroed(n * 8) as *i64;
+    for i in 0..IRFUNCS[fi].blocks.count {
+        let b = IRFUNCS[fi].blocks.data[i];
+        if BLOCKS[b].removed != 0 {
+            continue;
+        }
+        let mut v = BLOCKS[b].first;
+        while v != 0 {
+            let op = INSTS[v].op;
+            let mut from = 0;
+            if op == OP_LOAD {
+                from = root_of(INSTS[v].a);
+            } else if is_copy(v) {
+                from = root_of(copy_src(v));
+            }
+            if from != 0 && INSTS[from].op == OP_SLOT {
+                read[INSTS[from].imm] = 1;
+            }
+            v = INSTS[v].next;
+        }
+    }
+    let mut changed = false;
+    for i in 0..IRFUNCS[fi].blocks.count {
+        let b = IRFUNCS[fi].blocks.data[i];
+        if BLOCKS[b].removed != 0 {
+            continue;
+        }
+        let mut v = BLOCKS[b].first;
+        while v != 0 {
+            let next = INSTS[v].next;
+            let op = INSTS[v].op;
+            if op == OP_STORE || is_copy(v) {
+                let to = root_of(if op == OP_STORE { INSTS[v].a } else { copy_dst(v) });
+                if is_private_root(to) && read[INSTS[to].imm] == 0 {
+                    ir_unlink(v);
+                    changed = true;
+                }
+            }
+            v = next;
+        }
+    }
+    free(read as *u8);
+    changed
+}
+
 // ---- The walk ----
 
 fn gvn(fi: i64) -> bool {
+    resolve_all(fi);
     build_dom_tree(fi);
     find_escaping_slots(fi);
     let mut count = 0;
     for i in 0..ORDER.count {
+        BLOCKS[ORDER.data[i]].mark = 0;
         let mut v = BLOCKS[ORDER.data[i]].first;
         while v != 0 {
             count += 1;
@@ -310,30 +664,59 @@ fn gvn(fi: i64) -> bool {
     }
     gvn_reset(count);
     let mut changed = false;
-    // Explicit stack of (layout index, child position, log mark).
+    // What each block on the stack knows at its end: (start, count) in
+    // `saved`.
+    let mut saved = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    // Explicit stack of (layout index, child position, log mark, saved
+    // start, saved count).
     let mut stack = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    AVAIL.count = 0;
     gvn_block(ORDER.data[0], &changed);
     intvec_push(&stack, 0);
     intvec_push(&stack, 0);
     intvec_push(&stack, 0);
+    intvec_push(&stack, saved.count);
+    for i in 0..AVAIL.count {
+        intvec_push(&saved, AVAIL.data[i]);
+    }
+    intvec_push(&stack, AVAIL.count);
     while stack.count > 0 {
-        let top = stack.count - 3;
+        let top = stack.count - 5;
         let k = stack.data[top];
         let next = stack.data[top + 1];
         if DOM_START[k] + next < DOM_START[k + 1] {
             stack.data[top + 1] = next + 1;
             let child = DOM_CHILD[DOM_START[k] + next];
             let mark = GVN_LOG.count;
+            AVAIL.count = 0;
+            let start = stack.data[top + 3];
+            let n = stack.data[top + 4];
+            for i in 0..n {
+                intvec_push(&AVAIL, saved.data[start + i]);
+            }
+            if !inherit_into(ORDER.data[k], child) {
+                AVAIL.count = 0;
+            }
             gvn_block(child, &changed);
             intvec_push(&stack, BLOCKS[child].order);
             intvec_push(&stack, 0);
             intvec_push(&stack, mark);
+            intvec_push(&stack, saved.count);
+            for i in 0..AVAIL.count {
+                intvec_push(&saved, AVAIL.data[i]);
+            }
+            intvec_push(&stack, AVAIL.count);
         } else {
             gvn_undo(stack.data[top + 2]);
-            stack.count -= 3;
+            saved.count = stack.data[top + 3];
+            stack.count -= 5;
         }
     }
     free(stack.data as *u8);
+    free(saved.data as *u8);
+    if remove_unread_slot_writes(fi) {
+        changed = true;
+    }
     if changed {
         resolve_all(fi);
     }
@@ -341,7 +724,8 @@ fn gvn(fi: i64) -> bool {
 }
 
 fn gvn_block(b: i64, changed: *bool) {
-    AVAIL.count = 0;
+    COPIES.count = 0;
+    PENDING.count = 0;
     let mut v = BLOCKS[b].first;
     while v != 0 {
         let next = INSTS[v].next;

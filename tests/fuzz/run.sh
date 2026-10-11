@@ -4,7 +4,7 @@
 # must print the same. Mismatching programs are kept.
 #
 # usage: tests/fuzz/run.sh [-c COMPILER] [-s SEED] [-t TARGET] [-n COUNT]
-#                          [-f FIRST] [-k DIR]
+#                          [-f FIRST] [-k DIR] [-j JOBS]
 #
 #   -c COMPILER   the tachyonc to test (default: target/tachyonc)
 #   -s SEED       also compare with the seed binary (divisors are then
@@ -14,6 +14,7 @@
 #   -n COUNT      number of programs (default 200)
 #   -f FIRST      the first random seed (default 1)
 #   -k DIR        where to keep failing programs (default: tests/fuzz/failures)
+#   -j JOBS       programs tested at once (default: the number of CPUs)
 
 set -u
 LC_ALL=C
@@ -25,6 +26,7 @@ TARGET=""
 COUNT=200
 FIRST=1
 KEEP="$ROOT/tests/fuzz/failures"
+JOBS=""
 CC=${CC:-cc}
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -34,7 +36,8 @@ while [ $# -gt 0 ]; do
         -n) COUNT=$2; shift 2 ;;
         -f) FIRST=$2; shift 2 ;;
         -k) KEEP=$2; shift 2 ;;
-        *) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+        -j) JOBS=$2; shift 2 ;;
+        *) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
     esac
 done
 if [ -z "$TARGET" ]; then
@@ -53,12 +56,18 @@ esac
 NONZERO=0
 [ -n "$SEED" ] && NONZERO=1
 
+if [ -z "$JOBS" ]; then
+    JOBS=$(sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 4)
+    case "$JOBS" in ''|*[!0-9]*) JOBS=4 ;; esac
+fi
+
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-fuzz.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT INT TERM
-failures=0
-seed=$FIRST
-last=$((FIRST + COUNT))
-while [ "$seed" -lt "$last" ]; do
+
+# Tests program $1 (a random seed); why it fails, if it does, in
+# $WORK/p$1.why.
+test_seed() {
+    seed=$1
     program="$WORK/p$seed.tach"
     awk -v seed="$seed" -v nonzero="$NONZERO" -f "$ROOT/tests/fuzz/gen.awk" >"$program"
     reference=""
@@ -83,11 +92,35 @@ while [ "$seed" -lt "$last" ]; do
             break
         fi
     done
-    if [ -n "$why" ]; then
+    [ -n "$why" ] && echo "$why" >"$WORK/p$seed.why"
+    rm -f "$WORK/p$seed".O* "$WORK/p$seed".seed*
+}
+
+mkfifo "$WORK/slots"
+exec 3<>"$WORK/slots"
+i=0
+while [ "$i" -lt "$JOBS" ]; do
+    echo >&3
+    i=$((i + 1))
+done
+last=$((FIRST + COUNT))
+seed=$FIRST
+while [ "$seed" -lt "$last" ]; do
+    read -r _ <&3
+    ( test_seed "$seed"; echo >&3 ) &
+    seed=$((seed + 1))
+done
+wait
+exec 3>&-
+
+failures=0
+seed=$FIRST
+while [ "$seed" -lt "$last" ]; do
+    if [ -f "$WORK/p$seed.why" ]; then
         failures=$((failures + 1))
         mkdir -p "$KEEP"
-        cp "$program" "$KEEP/"
-        echo "FAIL seed $seed: $why (kept as $KEEP/p$seed.tach)"
+        cp "$WORK/p$seed.tach" "$KEEP/"
+        echo "FAIL seed $seed: $(cat "$WORK/p$seed.why") (kept as $KEEP/p$seed.tach)"
     fi
     seed=$((seed + 1))
 done

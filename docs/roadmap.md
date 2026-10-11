@@ -58,18 +58,51 @@ The foundation every later release builds on. Design and status in
 ## 0.3: aggregates and memory
 
 Language:
-- `enum` with payloads and exhaustive `match`
-- methods (`impl` blocks, static dispatch, `x.f()` sugar for `f(x)`)
-- slices `[T]` (pointer plus length) with bounds checks
+- [x] `enum` with payloads and exhaustive `match` (literal, range, constant,
+  binding, tuple, variant and or-patterns, guards; usefulness-based
+  exhaustiveness and reachability with witnesses)
+- [x] methods (`impl` blocks, static dispatch, `x.m()` with automatic `&`
+  and `*`, `T::f()`, `Self`), fields through pointers
+- [x] slices `[T]` (pointer plus length) with bounds checks
+- [x] assignment evaluates its right-hand side first
+- [x] C interop, Rust's model (see the track below)
 
 Optimizations:
-- SROA: tuples, structs and small arrays split into scalars
-- basic alias analysis: distinct stack slots and globals, field and
-  constant-offset disambiguation, escape-free locals
-- store-to-load forwarding, dead store elimination, memcpy elimination
-- `match` lowering: jump tables, binary decision trees
-- C ABI aggregate classification on both targets (small structs in
-  registers; fixes the `div_t` xfail)
+- [x] SROA: structs, tuples, enums, slices and small arrays split into
+  scalars (also the values of `if`/`match`/`loop`)
+- [x] alias analysis: objects reached through constant and variable
+  offsets, distinct objects, private slots, constant data; no type-based
+  rule (documented)
+- [x] store-to-load forwarding along the dominator tree, dead store
+  elimination, copies read through and removed (memcpy too), constant local
+  tables as read-only data
+- [x] `match` lowering: switches, jump tables, binary searches
+- [x] C ABI aggregate classification on both targets (fixes `div_t`)
+- moved to 0.4: comparison chains to switches; decision trees for matches
+  with guards or refutable nested patterns (they test arms in order)
+
+## C interop track
+
+C compatibility is opt-in, as in Rust: the layout of tachyon's own types
+and the convention of its own functions are unspecified; where C is asked
+for, it is exact.
+
+- **0.3**: `extern "C" { fn ...; static ...; }` imports, `extern "C" fn`
+  definitions with unmangled symbols, `extern "C" fn` pointer types
+  (distinct from `fn`), `extern "C" static` exports, varargs only in
+  imports; `#[repr(C)]` structs, unions and enums (RFC 2195's layout for
+  enums with fields), `#[repr(u8)]` and other integer tags,
+  `#[repr(C, packed)]`, `#[repr(C, align(N))]` (N up to 16); the FFI-safety
+  check; C's convention for every aggregate, every integer width, variadic
+  calls; the 0.2 `extern fn` form accepted, deprecated. Gate: the ABI
+  conformance fuzzer (`tests/abi/run.sh`), at least 1000 signatures clean
+  per target.
+- **0.4**: `import "stdio.h"`: a C preprocessor and a declaration parser in
+  tachyon, mapping C types to tachyon and producing `extern "C"`
+  declarations and `#[repr(C)]` types; `--emit-header` for `extern "C"`
+  items and `#[repr(C)]` types; the compiler's own source moves to
+  `extern "C"` blocks and the deprecated form goes away;
+  `#[repr(C, align(N))]` above 16 (realigned frames).
 
 ## 0.4: loops
 
@@ -171,3 +204,39 @@ seed's Cranelift output on four of five programs (md5 is 9% behind: its
 the stores), and within 10% of clang on matmul and sieve. Compile time of
 the compiler itself (14,000 lines) on the same machine: 0.1.0 32 ms, 0.2 at
 `-O0` 13 ms, at `-O1` 35 ms, at `-O2` 90 ms.
+
+### 0.3
+
+aarch64-macos (Apple silicon, native, on an otherwise idle machine;
+`bench/run.sh -r 7`; "0.2.0" is the
+previous release, which cannot build the programs written in the 0.3
+language, nor md5, whose example now uses `extern "C"`: its 0.2.0 time
+is from the 0.2 table):
+
+| program | 0.2.0 | 0.3 -O0 | 0.3 -O1 | 0.3 -O2 | seed -O | cc -O2 |
+|---|---|---|---|---|---|---|
+| collatz | 451 | 2549 | 423 | 420 | 479 | 297 |
+| fib | 29 | 56 | 29 | 29 | 30 | 15 |
+| interp (new: enums, `match`, methods, slices) | - | 444 | 95 | 54 | - | 41 |
+| matmul | 46 | 507 | 106 | 46 | 94 | 44 |
+| nbody (new: structs of floats) | - | 302 | 36 | 36 | - | 28 |
+| sieve | 69 | 270 | 67 | 69 | 70 | 72 |
+| md5 | (145) | 384 | 168 | 121 | - | - |
+
+x86_64-linux (the minimal Debian container under Rosetta; `-r 3`):
+
+| program | 0.2.0 | 0.3 -O0 | 0.3 -O1 | 0.3 -O2 | seed -O | cc -O2 |
+|---|---|---|---|---|---|---|
+| collatz | 465 | 2653 | 497 | 460 | 505 | 376 |
+| fib | 52 | 91 | 52 | 51 | 51 | 17 |
+| interp | - | 545 | 207 | 148 | - | 109 |
+| matmul | 55 | 617 | 254 | 54 | 191 | 28 |
+| nbody | - | 309 | 92 | 84 | - | 40 |
+| sieve | 165 | 334 | 181 | 160 | 152 | 150 |
+| md5 | (147) | 465 | 190 | 124 | - | - |
+
+md5 is 17% faster than 0.2 (its shift table is read-only data now, its
+loads folded); interp, a `match`-dispatched bytecode VM over a slice, is
+within 35% of C, and nbody within 30%, with every struct and enum value in
+registers. (sieve compiles to byte-identical code with 0.2.0 and 0.3; an
+earlier measurement showing it 18% slower was taken on a busy machine.)

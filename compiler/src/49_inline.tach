@@ -197,7 +197,7 @@ fn should_inline(fi: i64, g: i64) -> bool {
     if FN_SIZE[g] <= INLINE_SMALL {
         return true;
     }
-    FN_CALLS[g] == 1 && FN_ADDRESS[g] == 0 && FNS[IRFUNCS[g].f].name != MAIN_SYM
+    FN_CALLS[g] == 1 && FN_ADDRESS[g] == 0 && !fn_is_global(IRFUNCS[g].f)
         && FN_SIZE[g] <= INLINE_ONCE
 }
 
@@ -253,23 +253,22 @@ fn inline_call(fi: i64, call: i64, g: i64) {
         ir_append(cont, v);
         v = next;
     }
-    BLOCKS[cont].term = BLOCKS[b].term;
-    BLOCKS[cont].cond = BLOCKS[b].cond;
-    BLOCKS[cont].s0 = BLOCKS[b].s0;
-    BLOCKS[cont].s1 = BLOCKS[b].s1;
+    copy_terminator(cont, b);
     for k in 0..succ_count(cont) {
         let s = succ(cont, k);
         let index = pred_index(s, b);
         BLOCKS[s].preds.data[index] = cont;
     }
-    // The values of the callee's parameters.
+    // The operand of the call holding each parameter (its first piece,
+    // for an aggregate passed in pieces).
     let callee_f = IRFUNCS[g].f;
-    let mut param_values: [i64; 64] = [0; 64];
+    let mut param_first: [i64; 64] = [0; 64];
     let mut k = 0;
     for p in 0..FNS[callee_f].param_count {
-        if !is_void(fn_param(callee_f, p)) {
-            param_values[p] = ir_arg(call, k);
-            k += 1;
+        let ty = fn_param(callee_f, p);
+        if !is_void(ty) {
+            param_first[p] = k;
+            k += if abi_classify(ty) == ABI_PIECES { ABI_PIECE_COUNT } else { 1 };
         }
     }
     // Copy the blocks and instructions.
@@ -286,7 +285,13 @@ fn inline_call(fi: i64, call: i64, g: i64) {
         while gv != 0 {
             let op = INSTS[gv].op;
             if op == OP_PARAM {
-                INSTS[gv].aux = if INSTS[gv].imm < 0 { INSTS[call].c } else { param_values[INSTS[gv].imm] };
+                let index = INSTS[gv].imm;
+                let piece = INSTS[gv].imm2;
+                if index < 0 {
+                    INSTS[gv].aux = INSTS[call].c;
+                } else {
+                    INSTS[gv].aux = ir_arg(call, param_first[index] + if piece > 0 { piece - 1 } else { 0 });
+                }
             } else {
                 let nv = ir_make(op, INSTS[gv].ty, INSTS[gv].a, INSTS[gv].b, INSTS[gv].imm);
                 INSTS[nv].c = INSTS[gv].c;
@@ -294,6 +299,7 @@ fn inline_call(fi: i64, call: i64, g: i64) {
                 if op == OP_SLOT {
                     let s = INSTS[gv].imm;
                     INSTS[nv].imm = ir_new_slot(SLOTS[s].size, SLOTS[s].align);
+                    SLOTS[INSTS[nv].imm].ty = SLOTS[s].ty;
                 }
                 if INSTS[gv].nargs > 0 || op == OP_PHI || is_call_op(op) {
                     INSTS[nv].args = ARGS.count;
@@ -309,7 +315,11 @@ fn inline_call(fi: i64, call: i64, g: i64) {
             gv = INSTS[gv].next;
         }
     }
-    // Map the operands, the terminators and the predecessors.
+    // Map the operands, the terminators and the predecessors. An aggregate
+    // returned in registers is copied from its address to the call's
+    // result slot.
+    let ret = FNS[callee_f].ret;
+    let copy_result = INSTS[call].c != 0 && !returns_through_pointer(ret);
     let mut returns = IntVec { data: 0 as *i64, count: 0, cap: 0 };
     for i in 0..IRFUNCS[g].blocks.count {
         let gb = IRFUNCS[g].blocks.data[i];
@@ -332,10 +342,21 @@ fn inline_call(fi: i64, call: i64, g: i64) {
         }
         let term = BLOCKS[gb].term;
         if term == TERM_RET {
+            if copy_result {
+                let copy = ir_make(OP_COPY, 0, INSTS[call].c, mapped(BLOCKS[gb].cond), size_of(ret));
+                ir_append(nb, copy);
+            }
             BLOCKS[nb].term = TERM_JUMP;
             BLOCKS[nb].s0 = cont;
             intvec_push(&BLOCKS[cont].preds, nb);
             intvec_push(&returns, mapped(BLOCKS[gb].cond));
+        } else if term == TERM_SWITCH {
+            let mark = SSA_STACK.count;
+            for c in 0..BLOCKS[gb].ncases {
+                intvec_push(&SSA_STACK, case_value(gb, c));
+                intvec_push(&SSA_STACK, BLOCKS[case_target(gb, c)].aux);
+            }
+            ir_switch_no_preds(nb, mapped(BLOCKS[gb].cond), BLOCKS[BLOCKS[gb].s0].aux, mark);
         } else {
             BLOCKS[nb].term = term;
             BLOCKS[nb].cond = mapped(BLOCKS[gb].cond);

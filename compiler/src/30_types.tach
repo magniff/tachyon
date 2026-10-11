@@ -18,12 +18,16 @@ const TY_BOOL: i64 = 11;
 const TY_UNIT: i64 = 12;
 const TY_NEVER: i64 = 13;
 // Constructed kinds: TY_PTR a=pointee, TY_ARRAY a=elem b=length,
-// TY_TUPLE list=elements, TY_STRUCT a=struct, TY_FN list=params a=result.
+// TY_TUPLE list=elements, TY_STRUCT a=struct, TY_FN list=params a=result
+// b=1 for `extern "C" fn` (C's convention),
+// TY_ENUM a=enum, TY_SLICE a=elem.
 const TY_PTR: i64 = 14;
 const TY_ARRAY: i64 = 15;
 const TY_TUPLE: i64 = 16;
 const TY_STRUCT: i64 = 17;
 const TY_FN: i64 = 18;
+const TY_ENUM: i64 = 19;
+const TY_SLICE: i64 = 20;
 
 // `size` is -1 until computed.
 struct Type { kind: i64, a: i64, b: i64, list: i64, count: i64, size: i64, align: i64 }
@@ -89,6 +93,14 @@ fn struct_type(s: i64) -> i64 {
     make_type(TY_STRUCT, s, 0, TSCRATCH.count)
 }
 
+fn enum_type(e: i64) -> i64 {
+    make_type(TY_ENUM, e, 0, TSCRATCH.count)
+}
+
+fn slice_of(elem: i64) -> i64 {
+    make_type(TY_SLICE, elem, 0, TSCRATCH.count)
+}
+
 fn init_types() {
     add_type(0, 0, 0, 0, 0);
     for kind in TY_I8..TY_PTR {
@@ -125,10 +137,33 @@ fn is_fn_type(t: i64) -> bool {
     TYPES[t].kind == TY_FN
 }
 
-// Held in memory; expressions of these types produce an address.
+// Held in memory; expressions of these types produce an address. An enum
+// with fields lives in memory; a fieldless one is its tag, a scalar.
 fn is_compound(t: i64) -> bool {
     let kind = TYPES[t].kind;
-    kind == TY_ARRAY || kind == TY_TUPLE || kind == TY_STRUCT
+    kind == TY_ARRAY || kind == TY_TUPLE || kind == TY_STRUCT || kind == TY_SLICE
+        || (kind == TY_ENUM && ENUMS[TYPES[t].a].has_fields)
+}
+
+fn is_enum(t: i64) -> bool {
+    TYPES[t].kind == TY_ENUM
+}
+
+fn is_fieldless_enum(t: i64) -> bool {
+    TYPES[t].kind == TY_ENUM && !ENUMS[TYPES[t].a].has_fields
+}
+
+fn is_slice(t: i64) -> bool {
+    TYPES[t].kind == TY_SLICE
+}
+
+// The machine type of a scalar: the tag type for a fieldless enum, else
+// the type itself.
+fn scalar_type(t: i64) -> i64 {
+    if TYPES[t].kind == TY_ENUM && !ENUMS[TYPES[t].a].has_fields {
+        return ENUMS[TYPES[t].a].tag;
+    }
+    t
 }
 
 fn is_void(t: i64) -> bool {
@@ -170,6 +205,12 @@ fn buf_type(out: i64, t: i64) {
         buf_byte(out, ']');
     } else if kind == TY_STRUCT {
         buf_str(out, sym_name(STRUCTS[TYPES[t].a].name));
+    } else if kind == TY_ENUM {
+        buf_str(out, sym_name(ENUMS[TYPES[t].a].name));
+    } else if kind == TY_SLICE {
+        buf_byte(out, '[');
+        buf_type(out, TYPES[t].a);
+        buf_byte(out, ']');
     } else if kind == TY_TUPLE {
         buf_byte(out, '(');
         for i in 0..TYPES[t].count {
@@ -180,6 +221,9 @@ fn buf_type(out: i64, t: i64) {
         }
         buf_byte(out, ')');
     } else {
+        if TYPES[t].b != 0 {
+            buf_str(out, c"extern \"C\" ");
+        }
         buf_str(out, c"fn(");
         for i in 0..TYPES[t].count {
             if i > 0 {
@@ -214,16 +258,27 @@ fn err_type(t: i64) {
 
 // ---- Declarations ----
 
-struct StructInfo { name: i64, node: i64, fields: i64, field_count: i64, layout_state: i64 }
+// `repr` holds REPR_* flags (20_ast.tach), `align` an alignment from
+// #[repr(C, align(N))] (0: none).
+struct StructInfo {
+    name: i64, node: i64, fields: i64, field_count: i64, layout_state: i64, repr: i64,
+    align: i64,
+}
 struct FieldInfo { name: i64, ty: i64, offset: i64 }
 // Functions and externs. `params` indexes TLISTS.
+// `self_ty` is the type of the impl block of a method or associated
+// function (0 for free functions).
+// `is_extern`: a C function declared here; `export`: an `extern "C" fn`
+// defined here (an unmangled, global symbol).
 struct FnInfo {
     name: i64, node: i64, params: i64, param_count: i64, ret: i64,
-    variadic: bool, is_extern: bool,
+    variadic: bool, is_extern: bool, self_ty: i64, export: bool,
 }
 // state: 0 not evaluated, 1 being evaluated, 2 done.
 struct ConstInfo { node: i64, ty: i64, value: i64, state: i64 }
-struct StaticInfo { node: i64, ty: i64, mutable: bool }
+// `linkage`: 0 a tachyon static, 1 defined in C, 2 defined here with a C
+// symbol (see I_STATIC).
+struct StaticInfo { node: i64, ty: i64, mutable: bool, linkage: i64 }
 
 static mut STRUCTS: *StructInfo = 0 as *StructInfo;
 static mut STRUCT_COUNT: i64 = 0;
@@ -241,9 +296,34 @@ static mut STATICS: *StaticInfo = 0 as *StaticInfo;
 static mut STATIC_COUNT: i64 = 0;
 static mut STATIC_CAP: i64 = 0;
 
+// Enums: `tag` is the type of the discriminant; with `has_fields`, the
+// enum lives in memory, each variant laid out as its `shape`, the tuple
+// (tag, fields...).
+// `payload` is the offset of the fields of a #[repr(C)] enum with
+// fields (after its C int tag), set with its layout.
+struct EnumInfo {
+    name: i64, node: i64, variants: i64, variant_count: i64, tag: i64,
+    has_fields: bool, layout_state: i64, repr: i64, payload: i64,
+}
+// `fields` indexes TLISTS; `shape` is 0 for an enum without fields.
+struct VariantInfo { name: i64, node: i64, enum_id: i64, discr: i64, fields: i64, field_count: i64, shape: i64 }
+// Methods and associated functions: (type, name, function), from impls.
+struct MethodInfo { ty: i64, name: i64, f: i64 }
+
+static mut ENUMS: *EnumInfo = 0 as *EnumInfo;
+static mut ENUM_COUNT: i64 = 0;
+static mut ENUM_CAP: i64 = 0;
+static mut VARIANTS: *VariantInfo = 0 as *VariantInfo;
+static mut VARIANT_COUNT: i64 = 0;
+static mut VARIANT_CAP: i64 = 0;
+static mut METHODS: *MethodInfo = 0 as *MethodInfo;
+static mut METHOD_COUNT: i64 = 0;
+static mut METHOD_CAP: i64 = 0;
+
 // Per symbol: index + 1 of what it names, 0 for nothing. Types and values
 // have separate namespaces.
 static mut SYM_STRUCT: *i64 = 0 as *i64;
+static mut SYM_ENUM: *i64 = 0 as *i64;
 static mut SYM_ALIAS: *i64 = 0 as *i64;
 static mut SYM_FN: *i64 = 0 as *i64;
 static mut SYM_CONST: *i64 = 0 as *i64;
@@ -268,6 +348,7 @@ fn init_declarations() {
         syms[i] = intern_c(names[i]);
     }
     SYM_STRUCT = sym_table();
+    SYM_ENUM = sym_table();
     SYM_ALIAS = sym_table();
     SYM_FN = sym_table();
     SYM_CONST = sym_table();
@@ -301,6 +382,46 @@ fn fn_param(f: i64, i: i64) -> i64 {
     TLISTS.data[FNS[f].params + i]
 }
 
+fn enum_variant(e: i64, i: i64) -> i64 {
+    ENUMS[e].variants + i
+}
+
+// The variant of enum `e` named `name`, or -1.
+fn find_variant(e: i64, name: i64) -> i64 {
+    for i in 0..ENUMS[e].variant_count {
+        if VARIANTS[enum_variant(e, i)].name == name {
+            return enum_variant(e, i);
+        }
+    }
+    -1
+}
+
+fn variant_field(v: i64, i: i64) -> i64 {
+    TLISTS.data[VARIANTS[v].fields + i]
+}
+
+// The offset of field `i` of variant `v` (of an enum with fields): in the
+// tuple (tag, fields...), or for #[repr(C)] in the struct of its fields
+// after the tag (RFC 2195's layout: a C int, then a union of structs).
+fn variant_field_offset(v: i64, i: i64) -> i64 {
+    let e = VARIANTS[v].enum_id;
+    if (ENUMS[e].repr & REPR_C) != 0 {
+        compute_layout(enum_type(e));
+        return ENUMS[e].payload + tuple_offset(VARIANTS[v].shape, i);
+    }
+    tuple_offset(VARIANTS[v].shape, i + 1)
+}
+
+// The method or associated function `name` of type `t`, or -1.
+fn find_method(t: i64, name: i64) -> i64 {
+    for i in 0..METHOD_COUNT {
+        if METHODS[i].ty == t && METHODS[i].name == name {
+            return METHODS[i].f;
+        }
+    }
+    -1
+}
+
 // ---- Layout ----
 
 fn align_to(offset: i64, align: i64) -> i64 {
@@ -332,6 +453,30 @@ fn compute_layout(t: i64) {
         size = 4;
     } else if t == TY_I64 || t == TY_U64 || t == TY_F64 || kind == TY_PTR || kind == TY_FN {
         size = 8;
+    } else if kind == TY_SLICE {
+        size = 16;
+        align = 8;
+    } else if kind == TY_ENUM {
+        let e = TYPES[t].a;
+        size = size_of(ENUMS[e].tag);
+        align = size;
+        let mut largest = 0;
+        let mut widest = 1;
+        for i in 0..ENUMS[e].variant_count {
+            let shape = VARIANTS[enum_variant(e, i)].shape;
+            if shape != 0 {
+                largest = max_i64(largest, size_of(shape));
+                widest = max_i64(widest, align_of(shape));
+            }
+        }
+        if (ENUMS[e].repr & REPR_C) != 0 && ENUMS[e].has_fields {
+            ENUMS[e].payload = align_to(size, widest);
+            size = ENUMS[e].payload + largest;
+        } else {
+            size = max_i64(size, largest);
+        }
+        align = max_i64(align, widest);
+        size = align_to(size, align);
     } else if kind == TY_ARRAY {
         size = size_of(TYPES[t].a) * TYPES[t].b;
         align = align_of(TYPES[t].a);
@@ -345,18 +490,47 @@ fn compute_layout(t: i64) {
         size = align_to(offset, align);
     } else if kind == TY_STRUCT {
         let s = TYPES[t].a;
-        let mut offset = 0;
-        for i in 0..STRUCTS[s].field_count {
-            let field = struct_field(s, i);
-            let field_ty = (*field).ty;
-            align = max_i64(align, align_of(field_ty));
-            offset = align_to(offset, align_of(field_ty));
-            (*field).offset = offset;
-            offset += size_of(field_ty);
+        let repr = STRUCTS[s].repr;
+        let n = STRUCTS[s].field_count;
+        // The order of the fields in memory: as declared for C, by
+        // alignment (largest first, which leaves the least padding)
+        // otherwise.
+        let order = alloc_zeroed(n * 8 + 8) as *i64;
+        for i in 0..n {
+            order[i] = i;
         }
+        if (repr & REPR_C) == 0 {
+            for i in 1..n {
+                let mut j = i;
+                while j > 0 && align_of((*struct_field(s, order[j - 1])).ty) < align_of((*struct_field(s, order[j])).ty) {
+                    let swap = order[j];
+                    order[j] = order[j - 1];
+                    order[j - 1] = swap;
+                    j -= 1;
+                }
+            }
+        }
+        let mut offset = 0;
+        for k in 0..n {
+            let field = struct_field(s, order[k]);
+            let field_ty = (*field).ty;
+            let field_align = if (repr & REPR_PACKED) != 0 { 1 } else { align_of(field_ty) };
+            align = max_i64(align, field_align);
+            if (repr & REPR_UNION) != 0 {
+                (*field).offset = 0;
+                offset = max_i64(offset, size_of(field_ty));
+            } else {
+                offset = align_to(offset, field_align);
+                (*field).offset = offset;
+                offset += size_of(field_ty);
+            }
+        }
+        free(order as *u8);
+        align = max_i64(align, STRUCTS[s].align);
         size = align_to(offset, align);
     }
-    if size > 0 && kind != TY_ARRAY && kind != TY_TUPLE && kind != TY_STRUCT {
+    if size > 0 && kind != TY_ARRAY && kind != TY_TUPLE && kind != TY_STRUCT && kind != TY_ENUM
+        && kind != TY_SLICE {
         align = size;
     }
     TYPES[t].size = size;
@@ -384,4 +558,56 @@ fn tuple_offset(t: i64, i: i64) -> i64 {
 fn field_offset(s: i64, i: i64) -> i64 {
     compute_layout(struct_type(s));
     (*struct_field(s, i)).offset
+}
+
+// ---- C interoperability ----
+
+// Whether values of type t may cross to C (in an `extern "C"` signature
+// or static): scalars, bool, raw pointers (to anything: an opaque handle
+// is fine), `extern "C" fn` pointers, and #[repr(C)] (or, for enums,
+// #[repr(int)]) types made of those; `()` and `!` as results.
+fn is_ffi_safe(t: i64) -> bool {
+    let kind = TYPES[t].kind;
+    if is_numeric(t) || t == TY_BOOL || kind == TY_PTR {
+        return true;
+    }
+    if kind == TY_FN {
+        return TYPES[t].b != 0;
+    }
+    if kind == TY_STRUCT {
+        let s = TYPES[t].a;
+        if (STRUCTS[s].repr & REPR_C) == 0 {
+            return false;
+        }
+        for i in 0..STRUCTS[s].field_count {
+            if !is_ffi_field(( *struct_field(s, i)).ty) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if kind == TY_ENUM {
+        let e = TYPES[t].a;
+        if (ENUMS[e].repr & (REPR_C | REPR_INT)) == 0 {
+            return false;
+        }
+        for i in 0..ENUMS[e].variant_count {
+            let v = enum_variant(e, i);
+            for k in 0..VARIANTS[v].field_count {
+                if !is_ffi_field(variant_field(v, k)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+    false
+}
+
+// The same for a field of a C type: arrays of such types too.
+fn is_ffi_field(t: i64) -> bool {
+    if TYPES[t].kind == TY_ARRAY {
+        return is_ffi_field(TYPES[t].a);
+    }
+    is_ffi_safe(t)
 }

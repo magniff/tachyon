@@ -13,6 +13,7 @@
 #   --seed-tests   also run the seed's own test suite (cargo test)
 #   --all-levels   also run the final compiler's test suite at -O0, -O1, -O2
 #   --fuzz=N       also run N random programs (tests/fuzz/run.sh)
+#   --abi=N        also run N C interoperability programs (tests/abi/run.sh)
 #   --bench        also run the benchmarks (bench/run.sh)
 #
 # Other options go to bootstrap.sh, e.g. --dev. After the chain, the md5
@@ -29,6 +30,7 @@ WORKTREE=0
 SEED_TESTS=0
 ALL_LEVELS=0
 FUZZ=0
+ABI=0
 BENCH=0
 
 die() {
@@ -47,8 +49,9 @@ for arg in "$@"; do
         --seed-tests) SEED_TESTS=1 ;;
         --all-levels) ALL_LEVELS=1 ;;
         --fuzz=*) FUZZ=${arg#--fuzz=} ;;
+        --abi=*) ABI=${arg#--abi=} ;;
         --bench) BENCH=1 ;;
-        -h|--help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) rest="$rest $(quote "$arg")" ;;
     esac
 done
@@ -79,8 +82,8 @@ if [ $WORKTREE -eq 1 ]; then
 fi
 
 echo "==> running the chain in the container" >&2
-tar -C "$SNAP" -c -f - src | docker run --rm -i --platform "$PLATFORM" -e SEED_TESTS="$SEED_TESTS" \
-    -e ALL_LEVELS="$ALL_LEVELS" -e FUZZ="$FUZZ" -e BENCH="$BENCH" "$IMAGE" sh -c '
+tar -C "$SNAP" -c -f - src | docker run --rm -i --cpus 4 --platform "$PLATFORM" -e SEED_TESTS="$SEED_TESTS" \
+    -e ALL_LEVELS="$ALL_LEVELS" -e FUZZ="$FUZZ" -e ABI="$ABI" -e BENCH="$BENCH" "$IMAGE" sh -c '
     set -eu
     mkdir /work
     tar -x --no-same-owner -f - -C /work
@@ -107,9 +110,13 @@ tar -C "$SNAP" -c -f - src | docker run --rm -i --platform "$PLATFORM" -e SEED_T
         echo "==> $FUZZ random programs" >&2
         tests/fuzz/run.sh -n "$FUZZ" -k /tmp/fuzz-failures | tail -5
     fi
+    if [ "$ABI" -gt 0 ]; then
+        echo "==> $ABI C interoperability programs" >&2
+        tests/abi/run.sh -n "$ABI" -k /tmp/abi-failures | tail -5
+    fi
     if [ "$BENCH" = 1 ]; then
         echo "==> benchmarks" >&2
-        previous=$(ls -d target/bootstrap/x86_64-linux/v*/tachyonc 2>/dev/null | head -1)
+        previous=$(ls -d target/bootstrap/x86_64-linux/v*/tachyonc 2>/dev/null | tail -1)
         seed=$(ls -d target/bootstrap/x86_64-linux/seed-*/target/release/tachyon 2>/dev/null | head -1)
         bench/run.sh ${previous:+-p "$previous"} ${seed:+-s "$seed"} -r 3
     fi

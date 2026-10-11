@@ -271,9 +271,14 @@ fn lat_set(v: i64, state: i64, value: i64) {
 
 // Whether the edge from `p` to `b` is executable (BLOCKS[p].aux bit k for
 // successor k).
+// (Edges past the 62nd successor of a switch share bit 62.)
+fn edge_bit(k: i64) -> u64 {
+    (if k < 62 { k } else { 62 }) as u64
+}
+
 fn edge_executable(p: i64, b: i64) -> bool {
     for k in 0..succ_count(p) {
-        if succ(p, k) == b && (BLOCKS[p].aux >> k as u64) & 1 != 0 {
+        if succ(p, k) == b && (BLOCKS[p].aux >> edge_bit(k)) & 1 != 0 {
             return true;
         }
     }
@@ -281,10 +286,10 @@ fn edge_executable(p: i64, b: i64) -> bool {
 }
 
 fn mark_edge(p: i64, k: i64) {
-    if (BLOCKS[p].aux >> k as u64) & 1 != 0 {
+    if k < 62 && (BLOCKS[p].aux >> edge_bit(k)) & 1 != 0 {
         return;
     }
-    BLOCKS[p].aux |= 1 << k as u64;
+    BLOCKS[p].aux |= 1 << edge_bit(k);
     intvec_push(&CFG_WORK, succ(p, k));
 }
 
@@ -343,6 +348,21 @@ fn sccp_terminator(b: i64) {
     let term = BLOCKS[b].term;
     if term == TERM_JUMP {
         mark_edge(b, 0);
+    } else if term == TERM_SWITCH {
+        let cond = BLOCKS[b].cond;
+        let s = lat_of(cond);
+        if s == LAT_BOTTOM {
+            for k in 0..BLOCKS[b].nsucc {
+                mark_edge(b, k);
+            }
+        } else if s == LAT_CONST {
+            let target = switch_target(b, lat_value(cond));
+            for k in 0..BLOCKS[b].nsucc {
+                if succ(b, k) == target {
+                    mark_edge(b, k);
+                }
+            }
+        }
     } else if term == TERM_BRANCH {
         let cond = BLOCKS[b].cond;
         let s = lat_of(cond);
@@ -436,7 +456,26 @@ fn sccp_rewrite(fi: i64) -> bool {
     }
     for i in 0..IRFUNCS[fi].blocks.count {
         let b = IRFUNCS[fi].blocks.data[i];
-        if BLOCKS[b].removed != 0 || BLOCKS[b].mark == 0 || BLOCKS[b].term != TERM_BRANCH {
+        if BLOCKS[b].removed != 0 || BLOCKS[b].mark == 0 {
+            continue;
+        }
+        if BLOCKS[b].term == TERM_SWITCH && BLOCKS[b].nsucc < 62 {
+            // One successor reached only: a jump.
+            let mut taken = 0;
+            let mut reached = 0;
+            for k in 0..BLOCKS[b].nsucc {
+                if (BLOCKS[b].aux >> k as u64) & 1 != 0 {
+                    taken = succ(b, k);
+                    reached += 1;
+                }
+            }
+            if reached == 1 {
+                switch_to_jump(b, taken);
+                changed = true;
+            }
+            continue;
+        }
+        if BLOCKS[b].term != TERM_BRANCH {
             continue;
         }
         let bits = BLOCKS[b].aux;
@@ -571,8 +610,9 @@ fn combine(v: i64) -> bool {
     if op == OP_AND && c == all_ones(ty) {
         return replace_same_type(v, a);
     }
-    if op == OP_ADD && INSTS[a].op == OP_ADD && is_const(INSTS[a].b) && ty == TY_U64 {
-        // (x + c1) + c2
+    if op == OP_ADD && INSTS[a].op == OP_ADD && is_const(INSTS[a].b) && ty == TY_U64
+        && INSTS[a].ty == TY_U64 {
+        // (x + c1) + c2 (a narrower inner sum wraps first)
         INSTS[v].a = INSTS[a].a;
         let operand = const_before(v, INSTS[INSTS[a].b].imm + c, ty);
         INSTS[v].b = operand;
