@@ -48,6 +48,20 @@ pub fn link_args(target: Target, object: &str, output: &str) -> (String, Vec<Str
     (linker_program(), args)
 }
 
+// Whether `program` can be run: a path to a file, or a name found in a
+// directory of PATH. Checked before spawning, because a missing program is
+// not always reported as such by the spawn: under x86-64 emulation on
+// Linux (e.g. Rosetta in a container), posix_spawnp "succeeds" and the
+// child exits with status 127.
+fn program_exists(program: &str) -> bool {
+    if program.contains('/') {
+        return Path::new(program).is_file();
+    }
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
+        .unwrap_or(false)
+}
+
 // Links `object` into the executable `output`.
 pub fn link(target: Target, object: &Path, output: &Path) -> Result<(), BuildError> {
     let (program, args) = link_args(
@@ -55,6 +69,12 @@ pub fn link(target: Target, object: &Path, output: &Path) -> Result<(), BuildErr
         &object.display().to_string(),
         &output.display().to_string(),
     );
+    if !program_exists(&program) {
+        return Err(BuildError::Link(format!(
+            "linker '{}' not found; install a C compiler or set CC",
+            program
+        )));
+    }
     let result = Command::new(&program).args(&args).output();
     let out = match result {
         Ok(out) => out,

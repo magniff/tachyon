@@ -320,17 +320,14 @@ fn runner_for(config: &Config) -> Result<Runner, String> {
 fn command(runner: Runner, dir: &Path, program: &str, args: &[String]) -> Command {
     match runner {
         Runner::Native => {
-            // Resolve ./prog against `dir` ourselves (relative paths with
-            // current_dir are platform-specific) but keep argv[0] as given.
-            let mut c = match program.strip_prefix("./") {
-                Some(local) => {
-                    let mut c = Command::new(dir.join(local));
-                    std::os::unix::process::CommandExt::arg0(&mut c, program);
-                    c
-                }
-                None => Command::new(program),
-            };
-            c.args(args).current_dir(dir);
+            // Through the shell's exec, so ./prog is found in `dir` and
+            // argv[0] is "./prog" everywhere: setting argv[0] apart from the
+            // path is not kept by x86-64 emulators on Linux (binfmt, e.g.
+            // Rosetta in a container), which pass the path instead.
+            let mut c = Command::new("/bin/sh");
+            c.args(["-c", "exec \"$0\" \"$@\"", program])
+                .args(args)
+                .current_dir(dir);
             c
         }
         Runner::Docker => {

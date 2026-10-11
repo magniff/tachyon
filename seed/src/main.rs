@@ -17,7 +17,11 @@ use tachyon::driver::{self, BuildError};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "tachyon", version, about = "The tachyon compiler")]
+#[command(
+    name = "tachyon",
+    version = "seed",
+    about = "The tachyon compiler (the seed: the Rust implementation)"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,

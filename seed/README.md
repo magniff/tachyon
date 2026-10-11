@@ -1,13 +1,13 @@
-# stage0: the Rust implementation of tachyon
+# The seed: the Rust implementation of tachyon
 
 This is the original tachyon compiler, written in Rust with a Cranelift
-backend. It is **frozen**: it is the root of the release chain and only has
-to build tachyon 1.0.0, whose compiler is written in tachyon (`../compiler`).
-Fixes here are fine; new language features go into the tachyon compiler.
-See [../docs/releases.md](../docs/releases.md).
+backend. It is the **seed** of the release chain and it is **frozen**: its
+only job is to build tachyon 0.1.0, whose compiler is written in tachyon
+(`../compiler`). New language features go into the tachyon compiler, never
+here. See [../docs/releases.md](../docs/releases.md).
 
-Everything below runs inside this directory (`cd stage0`). The examples and
-golden programs here are a frozen copy for stage0's own tests.
+Everything below runs inside this directory (`cd seed`). The examples and
+golden programs here are a frozen copy for the seed's own tests.
 
 Targets: x86-64 Linux, x86-64 macOS and arm64 macOS (Apple Silicon).
 
