@@ -66,7 +66,16 @@ impl From<CompilerError> for Vec<CompilerError> {
     }
 }
 
+pub use codegen::Target;
+
 pub fn compile_program(program_text: &str) -> Result<String, Vec<CompilerError>> {
+    compile_program_for(program_text, Target::LinuxX86_64)
+}
+
+pub fn compile_program_for(
+    program_text: &str,
+    target: Target,
+) -> Result<String, Vec<CompilerError>> {
     let tokens = lexer::Lexer::new(&program_text)
         .tokenize()
         .map_err(|error| vec![error.into()])?;
@@ -77,7 +86,8 @@ pub fn compile_program(program_text: &str) -> Result<String, Vec<CompilerError>>
             .map(|error| error.into())
             .collect::<Vec<_>>()
     })?;
-    Ok(codegen::generate(&lowering::lower(&ast, &checked)).map_err(Into::<CompilerError>::into)?)
+    Ok(codegen::generate_for(&lowering::lower(&ast, &checked), target)
+        .map_err(Into::<CompilerError>::into)?)
 }
 
 pub fn format_errors(errors: &[CompilerError], program_text: &str) -> String {

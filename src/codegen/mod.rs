@@ -1,6 +1,8 @@
 // x86-64 NASM Code Generator
 // "Spill everything" allocator: every vreg lives at [rbp-N].
 // System V AMD64 ABI.
+// Function symbols are written as `$name` so that names which are NASM
+// keywords or register names (abs, byte, rax, ...) still assemble.
 
 use crate::lowering::*;
 use std::collections::HashMap;
@@ -99,16 +101,16 @@ fn store_float(o: &mut String, xmm: &str, v: u32, ty: IRType, f: &Frame) {
     writeln!(o, "  {} [rbp{:+}], {}", m, f.voff[&v], xmm).unwrap();
 }
 
+// Quotient ends up in rax, remainder in rdx. 8- and 16-bit operands are
+// widened to 32 bits: `div r8` leaves the remainder in ah, not dl.
 fn idiv(o: &mut String, sz: u64, signed: bool) {
     if signed {
         match sz {
-            1 => {
-                writeln!(o, "  cbw").unwrap();
-                writeln!(o, "  idiv cl").unwrap();
-            }
-            2 => {
-                writeln!(o, "  cwd").unwrap();
-                writeln!(o, "  idiv cx").unwrap();
+            1 | 2 => {
+                writeln!(o, "  movsx eax, {}", rax(sz)).unwrap();
+                writeln!(o, "  movsx ecx, {}", rcx(sz)).unwrap();
+                writeln!(o, "  cdq").unwrap();
+                writeln!(o, "  idiv ecx").unwrap();
             }
             4 => {
                 writeln!(o, "  cdq").unwrap();
@@ -121,11 +123,13 @@ fn idiv(o: &mut String, sz: u64, signed: bool) {
             _ => panic!(),
         }
     } else {
+        if sz < 4 {
+            writeln!(o, "  movzx eax, {}", rax(sz)).unwrap();
+            writeln!(o, "  movzx ecx, {}", rcx(sz)).unwrap();
+        }
         writeln!(o, "  xor edx, edx").unwrap();
         match sz {
-            1 => writeln!(o, "  div cl").unwrap(),
-            2 => writeln!(o, "  div cx").unwrap(),
-            4 => writeln!(o, "  div ecx").unwrap(),
+            1 | 2 | 4 => writeln!(o, "  div ecx").unwrap(),
             8 => writeln!(o, "  div rcx").unwrap(),
             _ => panic!(),
         }
@@ -161,7 +165,11 @@ fn fbin(
     store_float(o, "xmm0", d.0, ty, f);
 }
 
-fn call_args(o: &mut String, args: &[(VReg, IRType)], f: &Frame) {
+// Sets up arguments for a call and returns how many bytes of stack
+// arguments (including alignment padding) the caller must pop afterwards.
+// rsp is 16-byte aligned on entry (the frame size is a multiple of 16), so
+// an odd number of stack arguments needs 8 bytes of padding.
+fn call_args(o: &mut String, args: &[(VReg, IRType)], f: &Frame) -> u64 {
     let mut ii = 0usize;
     let mut fi = 0usize;
     let mut stk = Vec::new();
@@ -182,6 +190,10 @@ fn call_args(o: &mut String, args: &[(VReg, IRType)], f: &Frame) {
             }
         }
     }
+    let pad = if stk.len() % 2 == 1 { 8 } else { 0 };
+    if pad > 0 {
+        writeln!(o, "  sub rsp, {}", pad).unwrap();
+    }
     for (v, ty) in stk.iter().rev() {
         if ty.is_float() {
             load_float(o, "xmm15", v.0, *ty, f);
@@ -197,20 +209,83 @@ fn call_args(o: &mut String, args: &[(VReg, IRType)], f: &Frame) {
     } else {
         writeln!(o, "  xor eax, eax").unwrap();
     }
+    stk.len() as u64 * 8 + pad
+}
+
+fn pop_call_args(o: &mut String, bytes: u64) {
+    if bytes > 0 {
+        writeln!(o, "  add rsp, {}", bytes).unwrap();
+    }
+}
+
+// Object format and platform the assembly is written for. Both are x86-64
+// System V; they differ only in the object-file header and symbol naming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    // nasm -f elf64, linked with `gcc -no-pie`.
+    LinuxX86_64,
+    // nasm -f macho64, linked with `clang -arch x86_64`. C symbols carry a
+    // leading underscore, which nasm adds to every global and extern.
+    MacosX86_64,
+}
+
+impl Target {
+    pub fn host() -> Target {
+        if cfg!(target_os = "macos") {
+            Target::MacosX86_64
+        } else {
+            Target::LinuxX86_64
+        }
+    }
+
+    pub fn nasm_format(self) -> &'static str {
+        match self {
+            Target::LinuxX86_64 => "elf64",
+            Target::MacosX86_64 => "macho64",
+        }
+    }
 }
 
 // Public entry
 pub fn generate(prog: &IrProgram) -> Result<String, GeneratorError> {
+    generate_for(prog, Target::LinuxX86_64)
+}
+
+pub fn generate_for(prog: &IrProgram, target: Target) -> Result<String, GeneratorError> {
     let mut o = String::new();
+    if target == Target::MacosX86_64 {
+        writeln!(o, "%pragma macho gprefix _")?;
+    }
     writeln!(o, "bits 64")?;
     writeln!(o, "default rel")?;
-    writeln!(o, "section .note.GNU-stack noalloc noexec nowrite progbits")?;
+    if target == Target::LinuxX86_64 {
+        writeln!(o, "section .note.GNU-stack noalloc noexec nowrite progbits")?;
+    }
     writeln!(o)?;
 
     for func in &prog.functions {
         if func.is_extern {
-            writeln!(o, "extern {}", func.name)?;
+            writeln!(o, "extern ${}", func.name)?;
         }
+    }
+    // Calls the lowering introduces on its own (fmod, pow, ...) need an
+    // extern declaration even when the program never declared them.
+    let mut implicit_externs: Vec<&str> = Vec::new();
+    for func in &prog.functions {
+        for bb in &func.blocks {
+            for inst in &bb.instructions {
+                if let Inst::Call { func: callee, .. } = inst {
+                    let known =
+                        callee == "__ipow" || prog.functions.iter().any(|f| &f.name == callee);
+                    if !known && !implicit_externs.contains(&callee.as_str()) {
+                        implicit_externs.push(callee);
+                    }
+                }
+            }
+        }
+    }
+    for name in implicit_externs {
+        writeln!(o, "extern ${}", name)?;
     }
     writeln!(o)?;
 
@@ -248,9 +323,10 @@ pub fn generate(prog: &IrProgram) -> Result<String, GeneratorError> {
     writeln!(o, "section .rodata")?;
     for (label, val, ty) in &fcs {
         if *ty == IRType::F64 {
-            writeln!(o, "  {}: dq {:.20e}", label, val)?;
+            writeln!(o, "  {}: dq 0x{:016x} ; {:?}", label, val.to_bits(), val)?;
         } else {
-            writeln!(o, "  {}: dd {:e}", label, *val as f32)?;
+            let val = *val as f32;
+            writeln!(o, "  {}: dd 0x{:08x} ; {:?}", label, val.to_bits(), val)?;
         }
     }
     writeln!(o)?;
@@ -259,12 +335,13 @@ pub fn generate(prog: &IrProgram) -> Result<String, GeneratorError> {
     writeln!(o, "section .text")?;
     for func in &prog.functions {
         if !func.is_extern {
-            writeln!(o, "global {}", func.name)?;
+            writeln!(o, "global ${}", func.name)?;
         }
     }
     writeln!(o)?;
 
     let mut fi_global = 0usize;
+    let mut label_counter = 0usize;
 
     for func in &prog.functions {
         if func.is_extern {
@@ -272,23 +349,36 @@ pub fn generate(prog: &IrProgram) -> Result<String, GeneratorError> {
         }
         let f = frame(func);
 
-        writeln!(o, "{}:", func.name)?;
+        writeln!(o, "${}:", func.name)?;
         writeln!(o, "  push rbp")?;
         writeln!(o, "  mov rbp, rsp")?;
         if f.size > 0 {
             writeln!(o, "  sub rsp, {}", f.size)?;
         }
 
-        // Store incoming params
+        // Store incoming params. Past the 6 integer / 8 float registers,
+        // arguments live in the caller's frame starting at [rbp+16].
         let mut ii = 0usize;
         let mut ffi = 0usize;
+        let mut stack_off = 16i64;
         for (v, ty) in &func.params {
             if ty.is_float() {
-                store_float(&mut o, &format!("xmm{}", ffi), v.0, *ty, &f);
-                ffi += 1;
-            } else {
+                if ffi < 8 {
+                    store_float(&mut o, &format!("xmm{}", ffi), v.0, *ty, &f);
+                    ffi += 1;
+                } else {
+                    let m = if *ty == IRType::F64 { "movsd" } else { "movss" };
+                    writeln!(o, "  {} xmm15, [rbp{:+}]", m, stack_off)?;
+                    store_float(&mut o, "xmm15", v.0, *ty, &f);
+                    stack_off += 8;
+                }
+            } else if ii < INT_ARGS.len() {
                 writeln!(o, "  mov [rbp{:+}], {}", f.voff[&v.0], INT_ARGS[ii])?;
                 ii += 1;
+            } else {
+                writeln!(o, "  mov rax, [rbp{:+}]", stack_off)?;
+                store(&mut o, "rax", v.0, &f);
+                stack_off += 8;
             }
         }
 
@@ -296,7 +386,15 @@ pub fn generate(prog: &IrProgram) -> Result<String, GeneratorError> {
         for bb in &func.blocks {
             writeln!(o, ".L{}_bb{}:", func.name, bb.id.0)?;
             for inst in &bb.instructions {
-                emit_inst(&mut o, inst, &f, &fcs, &mut fi_global, &prog.strings);
+                emit_inst(
+                    &mut o,
+                    inst,
+                    prog,
+                    &f,
+                    &fcs,
+                    &mut fi_global,
+                    &mut label_counter,
+                );
             }
             emit_term(&mut o, &bb.teminator, &f, &func.name);
         }
@@ -311,10 +409,11 @@ pub fn generate(prog: &IrProgram) -> Result<String, GeneratorError> {
 fn emit_inst(
     o: &mut String,
     inst: &Inst,
+    prog: &IrProgram,
     f: &Frame,
     fcs: &[(String, f64, IRType)],
     fi: &mut usize,
-    strs: &[StringConstant],
+    labels: &mut usize,
 ) {
     match inst {
         Inst::IAdd(d, a, b, t) => ibin(o, "add", d, a, b, *t, f),
@@ -326,7 +425,11 @@ fn emit_inst(
             let s = t.size();
             load(o, "rax", a.0, f);
             load(o, "rcx", b.0, f);
-            writeln!(o, "  imul {}, {}", rax(s), rcx(s)).unwrap();
+            if s == 8 {
+                writeln!(o, "  imul rax, rcx").unwrap();
+            } else {
+                writeln!(o, "  imul eax, ecx").unwrap();
+            }
             store(o, "rax", d.0, f);
         }
         Inst::IDiv(d, a, b, t, sg) => {
@@ -410,25 +513,44 @@ fn emit_inst(
         Inst::FCmp(d, op, a, b, t) => {
             load_float(o, "xmm0", a.0, *t, f);
             load_float(o, "xmm1", b.0, *t, f);
-            writeln!(
-                o,
-                "  {} xmm0, xmm1",
-                if *t == IRType::F64 {
-                    "comisd"
-                } else {
-                    "comiss"
-                }
-            )
-            .unwrap();
-            let cc = match op {
-                CmpOp::Eq => "sete",
-                CmpOp::Neq => "setne",
-                CmpOp::Lt => "setb",
-                CmpOp::Gt => "seta",
-                CmpOp::LtEq => "setbe",
-                CmpOp::GtEq => "setae",
+            let cmp = if *t == IRType::F64 {
+                "comisd"
+            } else {
+                "comiss"
             };
-            writeln!(o, "  {} al", cc).unwrap();
+            // An unordered compare (either side NaN) sets ZF, PF and CF.
+            // `<` and `<=` swap operands so they test CF=0, which is false
+            // for NaN; `==` and `!=` consult PF explicitly.
+            match op {
+                CmpOp::Eq => {
+                    writeln!(o, "  {} xmm0, xmm1", cmp).unwrap();
+                    writeln!(o, "  sete al").unwrap();
+                    writeln!(o, "  setnp cl").unwrap();
+                    writeln!(o, "  and al, cl").unwrap();
+                }
+                CmpOp::Neq => {
+                    writeln!(o, "  {} xmm0, xmm1", cmp).unwrap();
+                    writeln!(o, "  setne al").unwrap();
+                    writeln!(o, "  setp cl").unwrap();
+                    writeln!(o, "  or al, cl").unwrap();
+                }
+                CmpOp::Gt => {
+                    writeln!(o, "  {} xmm0, xmm1", cmp).unwrap();
+                    writeln!(o, "  seta al").unwrap();
+                }
+                CmpOp::GtEq => {
+                    writeln!(o, "  {} xmm0, xmm1", cmp).unwrap();
+                    writeln!(o, "  setae al").unwrap();
+                }
+                CmpOp::Lt => {
+                    writeln!(o, "  {} xmm1, xmm0", cmp).unwrap();
+                    writeln!(o, "  seta al").unwrap();
+                }
+                CmpOp::LtEq => {
+                    writeln!(o, "  {} xmm1, xmm0", cmp).unwrap();
+                    writeln!(o, "  setae al").unwrap();
+                }
+            }
             writeln!(o, "  movzx eax, al").unwrap();
             store(o, "rax", d.0, f);
         }
@@ -462,40 +584,85 @@ fn emit_inst(
             *fi += 1;
         }
         Inst::ConstStringPtr(d, idx) => {
-            writeln!(o, "  lea rax, [{}]", strs[*idx].label).unwrap();
+            writeln!(o, "  lea rax, [{}]", prog.strings[*idx].label).unwrap();
             store(o, "rax", d.0, f);
         }
         Inst::IntToFloat(d, s, from, to, signed) => {
             let fs = from.size();
-            load(o, "rax", s.0, f);
-            if *signed && fs < 4 {
-                writeln!(o, "  movsx eax, {}", rax(fs)).unwrap();
-            } else if !signed && fs < 8 && fs > 1 {
-                writeln!(o, "  movzx eax, {}", rax(fs)).unwrap();
-            }
-            let cvt = if *to == IRType::F64 {
-                "cvtsi2sd"
+            let (cvt, add) = if *to == IRType::F64 {
+                ("cvtsi2sd", "addsd")
             } else {
-                "cvtsi2ss"
+                ("cvtsi2ss", "addss")
             };
-            if fs <= 4 {
-                writeln!(o, "  {} xmm0, eax", cvt).unwrap();
-            } else {
+            load(o, "rax", s.0, f);
+            if *signed {
+                if fs < 4 {
+                    writeln!(o, "  movsx eax, {}", rax(fs)).unwrap();
+                }
+                if fs <= 4 {
+                    writeln!(o, "  {} xmm0, eax", cvt).unwrap();
+                } else {
+                    writeln!(o, "  {} xmm0, rax", cvt).unwrap();
+                }
+            } else if fs < 8 {
+                // Zero-extend into rax; a signed 64-bit convert is then exact.
+                match fs {
+                    1 | 2 => writeln!(o, "  movzx eax, {}", rax(fs)).unwrap(),
+                    _ => writeln!(o, "  mov eax, eax").unwrap(),
+                }
                 writeln!(o, "  {} xmm0, rax", cvt).unwrap();
+            } else {
+                // u64 with the top bit set: halve (keeping the low bit for
+                // correct rounding), convert, then double.
+                let n = *labels;
+                *labels += 1;
+                writeln!(o, "  test rax, rax").unwrap();
+                writeln!(o, "  js .Lu2f_big{}", n).unwrap();
+                writeln!(o, "  {} xmm0, rax", cvt).unwrap();
+                writeln!(o, "  jmp .Lu2f_done{}", n).unwrap();
+                writeln!(o, ".Lu2f_big{}:", n).unwrap();
+                writeln!(o, "  mov rcx, rax").unwrap();
+                writeln!(o, "  shr rcx, 1").unwrap();
+                writeln!(o, "  and eax, 1").unwrap();
+                writeln!(o, "  or rcx, rax").unwrap();
+                writeln!(o, "  {} xmm0, rcx", cvt).unwrap();
+                writeln!(o, "  {} xmm0, xmm0", add).unwrap();
+                writeln!(o, ".Lu2f_done{}:", n).unwrap();
             }
             store_float(o, "xmm0", d.0, *to, f);
         }
-        Inst::FloatToInt(d, s, from, to, _) => {
+        Inst::FloatToInt(d, s, from, to, signed) => {
             load_float(o, "xmm0", s.0, *from, f);
-            let cvt = if *from == IRType::F64 {
-                "cvttsd2si"
+            let (cvt, cmp, sub) = if *from == IRType::F64 {
+                ("cvttsd2si", "comisd", "subsd")
             } else {
-                "cvttss2si"
+                ("cvttss2si", "comiss", "subss")
             };
-            if to.size() <= 4 {
+            if *signed && to.size() <= 4 {
                 writeln!(o, "  {} eax, xmm0", cvt).unwrap();
-            } else {
+            } else if *signed || to.size() <= 4 {
+                // Unsigned targets up to 32 bits fit a signed 64-bit convert.
                 writeln!(o, "  {} rax, xmm0", cvt).unwrap();
+            } else {
+                // u64: values >= 2^63 are converted after subtracting 2^63.
+                let n = *labels;
+                *labels += 1;
+                if *from == IRType::F64 {
+                    writeln!(o, "  mov rax, 0x43e0000000000000").unwrap();
+                    writeln!(o, "  movq xmm1, rax").unwrap();
+                } else {
+                    writeln!(o, "  mov eax, 0x5f000000").unwrap();
+                    writeln!(o, "  movd xmm1, eax").unwrap();
+                }
+                writeln!(o, "  {} xmm0, xmm1", cmp).unwrap();
+                writeln!(o, "  jae .Lf2u_big{}", n).unwrap();
+                writeln!(o, "  {} rax, xmm0", cvt).unwrap();
+                writeln!(o, "  jmp .Lf2u_done{}", n).unwrap();
+                writeln!(o, ".Lf2u_big{}:", n).unwrap();
+                writeln!(o, "  {} xmm0, xmm1", sub).unwrap();
+                writeln!(o, "  {} rax, xmm0", cvt).unwrap();
+                writeln!(o, "  btc rax, 63").unwrap();
+                writeln!(o, ".Lf2u_done{}:", n).unwrap();
             }
             store(o, "rax", d.0, f);
         }
@@ -517,11 +684,19 @@ fn emit_inst(
                     (1, 2) => {
                         writeln!(o, "  movsx ax, al").unwrap();
                     }
-                    (1, 4) | (1, 8) => {
+                    // Writing a 32-bit register zeroes bits 32..63, so a
+                    // 64-bit target needs the 64-bit form of movsx.
+                    (1, 4) => {
                         writeln!(o, "  movsx eax, al").unwrap();
                     }
-                    (2, 4) | (2, 8) => {
+                    (1, 8) => {
+                        writeln!(o, "  movsx rax, al").unwrap();
+                    }
+                    (2, 4) => {
                         writeln!(o, "  movsx eax, ax").unwrap();
+                    }
+                    (2, 8) => {
+                        writeln!(o, "  movsx rax, ax").unwrap();
                     }
                     (4, 8) => {
                         writeln!(o, "  movsxd rax, eax").unwrap();
@@ -617,8 +792,9 @@ fn emit_inst(
         }
 
         Inst::Call { dst, func, args } => {
-            call_args(o, args, f);
-            writeln!(o, "  call {}", func).unwrap();
+            let pushed = call_args(o, args, f);
+            writeln!(o, "  call ${}", func).unwrap();
+            pop_call_args(o, pushed);
             if let Some((d, t)) = dst {
                 if t.is_float() {
                     store_float(o, "xmm0", d.0, *t, f);
@@ -628,9 +804,10 @@ fn emit_inst(
             }
         }
         Inst::CallIndirect { dst, callee, args } => {
-            call_args(o, args, f);
+            let pushed = call_args(o, args, f);
             load(o, "r10", callee.0, f);
             writeln!(o, "  call r10").unwrap();
+            pop_call_args(o, pushed);
             if let Some((d, t)) = dst {
                 if t.is_float() {
                     store_float(o, "xmm0", d.0, *t, f);
@@ -641,6 +818,17 @@ fn emit_inst(
         }
         Inst::Mov(d, s) => {
             load(o, "rax", s.0, f);
+            store(o, "rax", d.0, f);
+        }
+        Inst::FuncAddr(d, name) => {
+            // Functions from shared libraries are addressed through the GOT
+            // (required for Mach-O, and valid for ELF).
+            let is_extern = prog.functions.iter().any(|g| &g.name == name && g.is_extern);
+            if is_extern {
+                writeln!(o, "  mov rax, [rel ${} wrt ..gotpcrel]", name).unwrap();
+            } else {
+                writeln!(o, "  lea rax, [rel ${}]", name).unwrap();
+            }
             store(o, "rax", d.0, f);
         }
     }

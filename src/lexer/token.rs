@@ -6,7 +6,8 @@ use crate::lexer;
 pub enum TokenKind {
     IntLiteral(u64),
     FloatLiteral(lexer::float::Float),
-    StringLiteral(String),
+    // Raw bytes: `\xNN` escapes may produce bytes that are not valid UTF-8.
+    StringLiteral(Vec<u8>),
     Ident(String),
     // Keywords
     Fn,
@@ -70,7 +71,7 @@ impl fmt::Display for TokenKind {
         match self {
             TokenKind::IntLiteral(v) => write!(f, "{v}"),
             TokenKind::FloatLiteral(v) => write!(f, "{v}"),
-            TokenKind::StringLiteral(v) => write!(f, "{v:?}"),
+            TokenKind::StringLiteral(v) => write!(f, "{:?}", String::from_utf8_lossy(v)),
             TokenKind::Ident(v) => write!(f, "{}", v),
             TokenKind::Fn => write!(f, "fn"),
             TokenKind::Let => write!(f, "let"),

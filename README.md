@@ -18,4 +18,26 @@ running: examples/helloworld.tach
 Hello from tachyon!
 ```
 
+## Testing
+
+```
+$ cargo test                                       # unit tests, asm snapshots, golden programs
+$ cargo test --test run -- --nocapture             # golden programs with a per-category summary
+$ TACHYON_RUN_FILTER=prog_ cargo test --test run   # only cases whose name contains "prog_"
+$ TACHYON_DOCKER=1 cargo test --test run           # run golden programs in a linux/amd64 container
+$ cargo insta review                               # accept intended changes to generated assembly
+```
+
+Golden programs live in `tests/run/*.tach` and state their expected output in
+comments (`// EXPECT:`, `// EXIT:`, `// ARGS:`, `// STDIN:`, `// ERROR:`,
+`// XFAIL:` for known bugs; see `tests/run.rs`). They are compiled, assembled,
+linked and executed natively on x86-64 Linux (nasm + gcc) and on macOS
+(nasm + `clang -arch x86_64`; Apple Silicon runs the binaries under Rosetta 2),
+through docker when `TACHYON_DOCKER=1` is set, and skipped otherwise
+(`TACHYON_REQUIRE_RUN=1` turns the skip into a failure). Programs marked
+`// SNAPSHOT` also have their assembly snapshotted.
+
+The compiler targets x86-64 Linux by default when run on Linux and x86-64
+macOS when run on macOS; pass `--target linux-x86_64|macos-x86_64` to choose.
+
 WIP, stay tunned

@@ -22,6 +22,9 @@ impl fmt::Display for LexError {
 pub struct Lexer<'a> {
     src: &'a [u8],
     pos: usize,
+    // The previous token was '.', so a number is a tuple index: `t.0.1` is
+    // `t . 0 . 1`, not `t . 0.1`.
+    after_dot: bool,
 }
 
 impl<'a> Lexer<'a> {
@@ -29,6 +32,7 @@ impl<'a> Lexer<'a> {
         Self {
             src: src.as_bytes(),
             pos: 0,
+            after_dot: false,
         }
     }
 
@@ -44,7 +48,9 @@ impl<'a> Lexer<'a> {
                 });
                 break;
             }
-            tokens.push(self.next_token()?);
+            let token = self.next_token()?;
+            self.after_dot = token.kind == TokenKind::Dot;
+            tokens.push(token);
         }
         Ok(tokens)
     }
@@ -192,7 +198,7 @@ impl<'a> Lexer<'a> {
     fn lex_string(&mut self) -> Result<Token, LexError> {
         let start = self.pos;
         self.advance(); // skip "
-        let mut val = String::new();
+        let mut val: Vec<u8> = Vec::new();
         loop {
             if self.pos >= self.src.len() {
                 return Err(self.err("unterminated string literal"));
@@ -217,16 +223,16 @@ impl<'a> Lexer<'a> {
                     }
                     let esc = self.advance();
                     match esc {
-                        b'n' => val.push('\n'),
-                        b't' => val.push('\t'),
-                        b'r' => val.push('\r'),
-                        b'0' => val.push('\0'),
-                        b'"' => val.push('"'),
-                        b'\\' => val.push('\\'),
+                        b'n' => val.push(b'\n'),
+                        b't' => val.push(b'\t'),
+                        b'r' => val.push(b'\r'),
+                        b'0' => val.push(0),
+                        b'"' => val.push(b'"'),
+                        b'\\' => val.push(b'\\'),
                         b'x' => {
                             let hi = self.hex_digit()?;
                             let lo = self.hex_digit()?;
-                            val.push(((hi << 4) | lo) as char);
+                            val.push((hi << 4) | lo);
                         }
                         _ => {
                             return Err(LexError {
@@ -237,16 +243,9 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 _ => {
-                    if b < 0x80 {
-                        val.push(b as char);
-                    } else {
-                        self.pos -= 1;
-                        let s = std::str::from_utf8(&self.src[self.pos..])
-                            .map_err(|_| self.err("invalid UTF-8"))?;
-                        let ch = s.chars().next().unwrap();
-                        self.pos += ch.len_utf8();
-                        val.push(ch);
-                    }
+                    // The source is a &str, so non-ASCII bytes are already
+                    // valid UTF-8 and are copied through unchanged.
+                    val.push(b);
                 }
             }
         }
@@ -365,15 +364,24 @@ impl<'a> Lexer<'a> {
 
     fn lex_decimal_or_float(&mut self, start: usize) -> Result<Token, LexError> {
         let int_str = self.read_dec_digits()?;
-        // Check for '.' followed by digit => float
-        if self.pos < self.src.len()
+        // '.' followed by a digit, or an exponent, makes a float
+        let has_fraction = self.pos < self.src.len()
             && self.src[self.pos] == b'.'
-            && self.peek_at(1).map_or(false, |b| b.is_ascii_digit())
-        {
-            self.pos += 1; // skip '.'
-            let frac_str = self.read_dec_digits()?;
-            let mut fs = format!("{}.{}", int_str, frac_str);
-            if self.pos < self.src.len() && self.src[self.pos] == b'e' {
+            && self.peek_at(1).map_or(false, |b| b.is_ascii_digit());
+        let has_exponent = matches!(self.peek(), Some(b'e' | b'E'))
+            && match self.peek_at(1) {
+                Some(b'+' | b'-') => self.peek_at(2).is_some_and(|b| b.is_ascii_digit()),
+                Some(b) => b.is_ascii_digit(),
+                None => false,
+            };
+        if !self.after_dot && (has_fraction || has_exponent) {
+            let mut fs = int_str.clone();
+            if has_fraction {
+                self.pos += 1; // skip '.'
+                fs.push('.');
+                fs.push_str(&self.read_dec_digits()?);
+            }
+            if self.pos < self.src.len() && matches!(self.src[self.pos], b'e' | b'E') {
                 self.pos += 1;
                 fs.push('e');
                 if self.pos < self.src.len() && matches!(self.src[self.pos], b'+' | b'-') {
@@ -474,9 +482,9 @@ mod tests {
 
     #[test]
     fn test_lex_floats() {
-        let mut l = Lexer::new("3.14 1.0 2.0e10 1.5e-3");
+        let mut l = Lexer::new("3.25 1.0 2.0e10 1.5e-3");
         let t = l.tokenize().unwrap();
-        assert!(matches!(t[0].kind, TokenKind::FloatLiteral(v) if (*v - 3.14).abs() < 1e-10));
+        assert!(matches!(t[0].kind, TokenKind::FloatLiteral(v) if (*v - 3.25).abs() < 1e-10));
         assert!(matches!(t[1].kind, TokenKind::FloatLiteral(v) if (*v - 1.0).abs() < 1e-10));
         assert!(matches!(t[2].kind, TokenKind::FloatLiteral(v) if (*v - 2.0e10).abs() < 1.0));
         assert!(matches!(t[3].kind, TokenKind::FloatLiteral(v) if (*v - 1.5e-3).abs() < 1e-10));
@@ -486,9 +494,9 @@ mod tests {
     fn test_lex_strings() {
         let mut l = Lexer::new(r#""hello" "world\n" "\x41""#);
         let t = l.tokenize().unwrap();
-        assert!(matches!(&t[0].kind, TokenKind::StringLiteral(s) if s == "hello"));
-        assert!(matches!(&t[1].kind, TokenKind::StringLiteral(s) if s == "world\n"));
-        assert!(matches!(&t[2].kind, TokenKind::StringLiteral(s) if s == "A"));
+        assert!(matches!(&t[0].kind, TokenKind::StringLiteral(s) if s == b"hello"));
+        assert!(matches!(&t[1].kind, TokenKind::StringLiteral(s) if s == b"world\n"));
+        assert!(matches!(&t[2].kind, TokenKind::StringLiteral(s) if s == b"A"));
     }
 
     #[test]
@@ -545,5 +553,34 @@ mod tests {
         let t = l.tokenize().unwrap();
         assert!(matches!(t[0].kind, TokenKind::IntLiteral(42)));
         assert!(matches!(t[1].kind, TokenKind::IntLiteral(43)));
+    }
+
+    #[test]
+    fn test_lex_exponent_without_fraction() {
+        let mut l = Lexer::new("1e3 2E-2 7e+1 3e");
+        let t = l.tokenize().unwrap();
+        assert!(matches!(&t[0].kind, TokenKind::FloatLiteral(f) if **f == 1e3));
+        assert!(matches!(&t[1].kind, TokenKind::FloatLiteral(f) if **f == 2e-2));
+        assert!(matches!(&t[2].kind, TokenKind::FloatLiteral(f) if **f == 7e1));
+        // `3e` is the integer 3 followed by the identifier `e`
+        assert!(matches!(t[3].kind, TokenKind::IntLiteral(3)));
+        assert!(matches!(&t[4].kind, TokenKind::Ident(s) if s == "e"));
+    }
+
+    #[test]
+    fn test_lex_nested_tuple_index() {
+        let mut l = Lexer::new("t.0.1 x = 0.1");
+        let t = l.tokenize().unwrap();
+        assert!(matches!(t[2].kind, TokenKind::IntLiteral(0)));
+        assert!(matches!(t[3].kind, TokenKind::Dot));
+        assert!(matches!(t[4].kind, TokenKind::IntLiteral(1)));
+        assert!(matches!(&t[7].kind, TokenKind::FloatLiteral(f) if **f == 0.1));
+    }
+
+    #[test]
+    fn test_lex_hex_escape_is_one_byte() {
+        let mut l = Lexer::new(r#""\xff\x00é""#);
+        let t = l.tokenize().unwrap();
+        assert!(matches!(&t[0].kind, TokenKind::StringLiteral(s) if s == &[0xff, 0x00, 0xc3, 0xa9]));
     }
 }
