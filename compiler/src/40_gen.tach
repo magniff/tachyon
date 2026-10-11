@@ -1,19 +1,20 @@
 // Code generator: walks the checked AST and emits assembly through the
-// target layer (41_arm64.tach). Every expression leaves its value in the
-// accumulator; operands wait on the stack of temporaries; locals live in
-// frame slots.
+// target interface (41_target.tach), in terms of its virtual registers.
+// Every expression leaves its value in the accumulator; operands wait on
+// the stack of temporaries; locals live in frame slots.
 //
 // Calling convention: the platform's C convention for scalars (so
 // functions can be passed to C, e.g. as qsort callbacks). Structs, tuples
 // and arrays are passed as a pointer to a copy made by the caller, and
-// returned through a result pointer in x8.
+// returned through a result pointer (R_RESULT: x8 on AArch64, the hidden
+// first argument rdi on x86-64).
 //
 // Labels: a loop node's `z` is its continue label; z + 1 is its break
 // label (z + 2 the condition of a `for`).
 
 static mut FRAME_SIZE: i64 = 0;
 static mut RETURN_LABEL: i64 = 0;
-// Frame slot holding the result pointer (x8) of a function returning a
+// Frame slot holding the result pointer of a function returning a
 // compound value.
 static mut RESULT_SLOT: i64 = 0;
 static mut CUR_FN: i64 = 0;
@@ -21,7 +22,7 @@ static mut CUR_FN: i64 = 0;
 static mut LABEL_DEPTH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 static mut MAIN_SYM: i64 = 0;
 
-// A new frame slot; returns its offset below x29.
+// A new frame slot; returns its offset below the frame pointer.
 fn alloc_slot(size: i64, align: i64) -> i64 {
     let mut a = align;
     if a < 1 {
@@ -36,7 +37,7 @@ fn alloc_slot_for(ty: i64) -> i64 {
 }
 
 fn fn_symbol_prefix(f: i64) -> *u8 {
-    if FNS[f].is_extern || FNS[f].name == MAIN_SYM { c"_" } else { c"_tachyon." }
+    if FNS[f].is_extern || FNS[f].name == MAIN_SYM { global_prefix() } else { function_prefix() }
 }
 
 // ---- The program ----
@@ -53,7 +54,7 @@ fn compile_program(output: *u8) {
     ASM = buf_new();
     DATA = buf_new();
     CODE = buf_new();
-    buf_str(ASM, c".section __TEXT,__text\n");
+    emit_file_header();
     for i in 0..NODES[program].count {
         let item = child(program, i);
         if NODES[item].kind == I_FN {
@@ -62,6 +63,7 @@ fn compile_program(output: *u8) {
     }
     gen_data();
     buf_bytes(ASM, BUFS[DATA].data, BUFS[DATA].len);
+    emit_file_trailer();
     buf_write_file(ASM, output);
 }
 
@@ -78,7 +80,7 @@ fn gen_data() {
         const_emit(NODES[item].c, ty, scratch);
         data_section(STATICS[s].mutable);
         data_align(align_of(ty));
-        data_label(c"_tachyon.static.", NODES[item].a);
+        data_label(static_prefix(), NODES[item].a);
         data_bytes(BUFS[scratch].data, BUFS[scratch].len);
         if BUFS[scratch].len == 0 {
             buf_str(DATA, c"    .space 1\n");
@@ -87,27 +89,6 @@ fn gen_data() {
 }
 
 // ---- Functions ----
-
-// Where an argument goes: 0-7 x registers, 8-15 d registers, 16 + offset
-// for the stack. `state` holds the next x register, the next d register
-// and the stack offset.
-fn arg_location(ty: i64, state: *i64) -> i64 {
-    if is_float(ty) {
-        if state[1] < 8 {
-            state[1] += 1;
-            return 8 + state[1] - 1;
-        }
-    } else if state[0] < 8 {
-        state[0] += 1;
-        return state[0] - 1;
-    }
-    // Apple's arm64 ABI packs stack arguments at their natural alignment.
-    let size = if is_compound(ty) { 8 } else { size_of(ty) };
-    state[2] = align_to(state[2], size);
-    let offset = state[2];
-    state[2] += size;
-    16 + offset
-}
 
 fn gen_function(item: i64) {
     let f = SYM_FN[NODES[item].a] - 1;
@@ -121,8 +102,8 @@ fn gen_function(item: i64) {
     RESULT_SLOT = 0;
     if is_compound(ret) {
         RESULT_SLOT = alloc_slot(8, 8);
-        emit_frame_addr(9, RESULT_SLOT);
-        ins(c"str x8, [x9]");
+        emit_frame_addr(R_ADDR, RESULT_SLOT);
+        emit_store(TY_U64, R_RESULT, R_ADDR);
     }
     gen_params(item, f);
     let body = NODES[item].c;
@@ -139,7 +120,7 @@ fn gen_function(item: i64) {
 // Stores the incoming parameters in their frame slots. Compound parameters
 // arrive as pointers and are copied once every register is saved.
 fn gen_params(item: i64, f: i64) {
-    let mut state: [i64; 3] = [0, 0, 0];
+    let mut state: [i64; 3] = [first_int_arg(FNS[f].ret), 0, 0];
     let mut pending: [i64; 64] = [0; 64];
     let mut pending_count = 0;
     for i in 0..FNS[f].param_count {
@@ -154,34 +135,28 @@ fn gen_params(item: i64, f: i64) {
         }
         let slot = alloc_slot_for(ty);
         LOCALS[local].offset = slot;
-        // x0/d0 = the incoming value (the pointer for compound values).
+        // The accumulator = the incoming value (the pointer for compound
+        // values).
         let value_ty = if is_compound(ty) { TY_U64 } else { ty };
-        if location < 8 {
-            ins_i(c"mov x0, x", location, c"");
-        } else if location < 16 {
-            ins_i(c"fmov d0, d", location - 8, c"");
-        } else {
-            ins_i(c"add x9, x29, #", 16 + location - 16, c"");
-            emit_load(value_ty, 9);
-        }
+        emit_load_param(location, value_ty);
         if is_compound(ty) {
             let pointer_slot = alloc_slot(8, 8);
-            emit_frame_addr(9, pointer_slot);
-            ins(c"str x0, [x9]");
+            emit_frame_addr(R_ADDR, pointer_slot);
+            emit_store(TY_U64, R_ACC, R_ADDR);
             pending[pending_count] = local;
             pending[pending_count + 1] = pointer_slot;
             pending_count += 2;
         } else {
-            emit_frame_addr(9, slot);
-            emit_store(ty, 0, 9);
+            emit_frame_addr(R_ADDR, slot);
+            emit_store(ty, R_ACC, R_ADDR);
         }
     }
     let mut i = 0;
     while i < pending_count {
         let local = pending[i];
-        emit_frame_addr(9, pending[i + 1]);
-        ins(c"ldr x0, [x9]");
-        emit_frame_addr(1, LOCALS[local].offset);
+        emit_frame_addr(R_ADDR, pending[i + 1]);
+        emit_load_reg(R_ACC, R_ADDR);
+        emit_frame_addr(R_SECOND, LOCALS[local].offset);
         emit_copy(size_of(LOCALS[local].ty));
         i += 2;
     }
@@ -190,8 +165,8 @@ fn gen_params(item: i64, f: i64) {
 // The accumulator holds the function's result: hand it to the caller.
 fn gen_return_value(ret: i64) {
     if is_compound(ret) {
-        emit_frame_addr(9, RESULT_SLOT);
-        ins(c"ldr x1, [x9]");
+        emit_frame_addr(R_ADDR, RESULT_SLOT);
+        emit_load_reg(R_SECOND, R_ADDR);
         emit_copy(size_of(ret));
     }
 }
@@ -213,18 +188,18 @@ fn gen_block(block: i64) {
     }
 }
 
-// Stores the accumulator (of type `ty`) at x29 - offset.
+// Stores the accumulator (of type `ty`) in the frame slot at `offset`.
 fn store_to_frame(ty: i64, offset: i64) {
     if is_void(ty) {
         return;
     }
     if is_compound(ty) {
-        emit_frame_addr(1, offset);
+        emit_frame_addr(R_SECOND, offset);
         emit_copy(size_of(ty));
         return;
     }
-    emit_frame_addr(9, offset);
-    emit_store(ty, 0, 9);
+    emit_frame_addr(R_ADDR, offset);
+    emit_store(ty, R_ACC, R_ADDR);
 }
 
 // Binds a pattern to the value in the accumulator (of the pattern's type).
@@ -241,18 +216,18 @@ fn bind(pattern: i64) {
         store_to_frame(ty, slot);
         return;
     }
-    // A tuple: x0 is its address.
+    // A tuple: the accumulator is its address.
     push_x0();
     for i in 0..NODES[pattern].count {
         let elem_ty = type_elem(ty, i);
-        ins(c"ldr x0, [sp]");
-        emit_add_imm(0, tuple_offset(ty, i));
+        emit_peek(R_ACC);
+        emit_add_imm(R_ACC, tuple_offset(ty, i));
         if !is_compound(elem_ty) && !is_void(elem_ty) {
-            emit_load(elem_ty, 0);
+            emit_load(elem_ty, R_ACC);
         }
         bind(child(pattern, i));
     }
-    pop_x(0);
+    pop_x(R_ACC);
 }
 
 // ---- Expressions ----
@@ -261,11 +236,11 @@ fn gen_expr(n: i64) {
     let kind = NODES[n].kind;
     let ty = NODES[n].ty;
     if kind == E_INT || kind == E_CHAR {
-        emit_load_imm(0, wrap_int(NODES[n].a, ty) as u64);
+        emit_load_imm(R_ACC, wrap_int(NODES[n].a, ty) as u64);
     } else if kind == E_FLOAT {
         emit_load_float(float_const(f64_of_bits(NODES[n].a), ty), ty);
     } else if kind == E_BOOL {
-        emit_load_imm(0, NODES[n].a as u64);
+        emit_load_imm(R_ACC, NODES[n].a as u64);
     } else if kind == E_UNIT {
     } else if kind == E_STR {
         gen_string(n);
@@ -317,21 +292,23 @@ fn gen_expr(n: i64) {
     }
 }
 
-// x0 holds the address of a value of type `ty`: load it if it is a scalar.
+// The accumulator holds the address of a value of type `ty`: load it if it
+// is a scalar.
 fn load_from_x0(ty: i64) {
     if !is_compound(ty) && !is_void(ty) {
-        emit_load(ty, 0);
+        emit_load(ty, R_ACC);
     }
 }
 
+// A string literal is a (pointer, length) tuple.
 fn gen_string(n: i64) {
     let slot = alloc_slot(16, 8);
     emit_string_addr(NODES[n].a);
-    emit_frame_addr(9, slot);
-    ins(c"str x0, [x9]");
-    emit_load_imm(0, STRS[NODES[n].a].len as u64);
-    ins(c"str x0, [x9, #8]");
-    emit_frame_addr(0, slot);
+    emit_frame_addr(R_ADDR, slot);
+    emit_store(TY_U64, R_ACC, R_ADDR);
+    emit_load_imm(R_ACC, STRS[NODES[n].a].len as u64);
+    emit_store_offset(R_ACC, R_ADDR, 8);
+    emit_frame_addr(R_ACC, slot);
 }
 
 fn gen_ident(n: i64) {
@@ -339,17 +316,17 @@ fn gen_ident(n: i64) {
     let resolution = NODES[n].x;
     let index = NODES[n].y;
     if resolution == R_LOCAL {
-        emit_frame_addr(0, LOCALS[index].offset);
+        emit_frame_addr(R_ACC, LOCALS[index].offset);
         load_from_x0(ty);
     } else if resolution == R_CONST {
         let value = const_value(index);
         if is_float(ty) {
             emit_load_float(value, ty);
         } else {
-            emit_load_imm(0, value as u64);
+            emit_load_imm(R_ACC, value as u64);
         }
     } else if resolution == R_STATIC {
-        emit_local_symbol_addr(c"_tachyon.static.", NODES[n].a);
+        emit_local_symbol_addr(static_prefix(), NODES[n].a);
         load_from_x0(ty);
     } else {
         gen_fn_address(index);
@@ -364,23 +341,23 @@ fn gen_fn_address(f: i64) {
     }
 }
 
-// x0 = the address of a place (or of a compound value).
+// The accumulator = the address of a place (or of a compound value).
 fn gen_addr(n: i64) {
     let kind = NODES[n].kind;
     if kind == E_IDENT && NODES[n].x == R_LOCAL {
-        emit_frame_addr(0, LOCALS[NODES[n].y].offset);
+        emit_frame_addr(R_ACC, LOCALS[NODES[n].y].offset);
     } else if kind == E_IDENT && NODES[n].x == R_STATIC {
-        emit_local_symbol_addr(c"_tachyon.static.", NODES[n].a);
+        emit_local_symbol_addr(static_prefix(), NODES[n].a);
     } else if kind == E_UNARY && NODES[n].a == TK_STAR {
         gen_expr(NODES[n].b);
     } else if kind == E_FIELD {
         let base = NODES[n].a;
         gen_expr(base);
-        emit_add_imm(0, field_offset(TYPES[NODES[base].ty].a, NODES[n].x));
+        emit_add_imm(R_ACC, field_offset(TYPES[NODES[base].ty].a, NODES[n].x));
     } else if kind == E_TUPLE_FIELD {
         let base = NODES[n].a;
         gen_expr(base);
-        emit_add_imm(0, tuple_offset(NODES[base].ty, NODES[n].b));
+        emit_add_imm(R_ACC, tuple_offset(NODES[base].ty, NODES[n].b));
     } else if kind == E_INDEX {
         gen_index_addr(n);
     } else {
@@ -394,15 +371,8 @@ fn gen_index_addr(n: i64) {
     gen_expr(base);
     push_x0();
     gen_expr(NODES[n].b);
-    pop_x(1);
-    if elem_size == 1 {
-        ins(c"add x0, x1, x0");
-    } else if elem_size > 0 && (elem_size & (elem_size - 1)) == 0 {
-        ins_i(c"add x0, x1, x0, lsl #", log2(elem_size), c"");
-    } else {
-        emit_load_imm(16, elem_size as u64);
-        ins(c"madd x0, x0, x16, x1");
-    }
+    pop_x(R_SECOND);
+    emit_index_addr(elem_size);
 }
 
 // ---- Operators ----
@@ -427,17 +397,22 @@ fn gen_binary(n: i64) {
     gen_expr(lhs);
     push_value(operand_ty);
     gen_expr(rhs);
-    if is_float(operand_ty) {
-        ins(c"fmov d1, d0");
-        pop_d(0);
-    } else {
-        ins(c"mov x1, x0");
-        pop_x(0);
-    }
+    pop_second_operand(operand_ty);
     gen_operator(op, operand_ty, NODES[n].ty);
 }
 
-// Accumulator = accumulator <op> second operand (x1/d1).
+// Moves the accumulator to the second operand and pops the first one into
+// the accumulator.
+fn pop_second_operand(ty: i64) {
+    emit_move_to_second(ty);
+    if is_float(ty) {
+        pop_d(0);
+    } else {
+        pop_x(R_ACC);
+    }
+}
+
+// Accumulator = accumulator <op> second operand.
 fn gen_operator(op: i64, operand_ty: i64, result_ty: i64) {
     if is_comparison(op) {
         emit_compare(op, operand_ty);
@@ -458,21 +433,13 @@ fn gen_unary(n: i64) {
     }
     gen_expr(operand);
     if op == TK_MINUS {
-        if ty == TY_F32 {
-            ins(c"fneg s0, s0");
-        } else if ty == TY_F64 {
-            ins(c"fneg d0, d0");
-        } else {
-            ins(c"neg x0, x0");
-            emit_normalize(ty);
-        }
+        emit_negate(ty);
     } else if op == TK_BANG {
-        ins(c"eor x0, x0, #1");
+        emit_not_bool();
     } else if op == TK_TILDE {
-        ins(c"mvn x0, x0");
-        emit_normalize(ty);
+        emit_bitnot(ty);
     } else {
-        // Deref: x0 is the pointer.
+        // Deref: the accumulator is the pointer.
         load_from_x0(ty);
     }
 }
@@ -488,8 +455,8 @@ fn gen_cast(from: i64, to: i64) {
     } else if is_float(from) {
         emit_float_to_int(from, to);
     } else if from != TY_BOOL {
-        // Integers and pointers: x0 is canonical for `from`, so this
-        // truncates or extends.
+        // Integers and pointers: the accumulator is canonical for `from`,
+        // so this truncates or extends.
         emit_normalize(to);
     }
 }
@@ -521,7 +488,7 @@ fn gen_aggregate(n: i64) {
         gen_expr(value);
         store_to_frame(elem_ty, slot - offset);
     }
-    emit_frame_addr(0, slot);
+    emit_frame_addr(R_ACC, slot);
 }
 
 // `[value; count]`: the value is evaluated once.
@@ -540,40 +507,45 @@ fn gen_repeat(n: i64) {
             let source = alloc_slot(8, 8);
             let cursor = alloc_slot(8, 8);
             let remaining = alloc_slot(8, 8);
-            emit_frame_addr(9, source);
-            ins(c"str x0, [x9]");
-            emit_frame_addr(0, slot);
-            emit_frame_addr(9, cursor);
-            ins(c"str x0, [x9]");
-            emit_load_imm(0, count as u64);
-            emit_frame_addr(9, remaining);
-            ins(c"str x0, [x9]");
+            store_reg_to_frame(R_ACC, source);
+            emit_frame_addr(R_ACC, slot);
+            store_reg_to_frame(R_ACC, cursor);
+            emit_load_imm(R_ACC, count as u64);
+            store_reg_to_frame(R_ACC, remaining);
             emit_label(top);
-            emit_frame_addr(9, cursor);
-            ins(c"ldr x1, [x9]");
-            emit_frame_addr(9, source);
-            ins(c"ldr x0, [x9]");
+            load_reg_from_frame(R_SECOND, cursor);
+            load_reg_from_frame(R_ACC, source);
             emit_copy(elem_size);
-            emit_frame_addr(9, cursor);
-            ins(c"ldr x0, [x9]");
-            emit_add_imm(0, elem_size);
-            ins(c"str x0, [x9]");
-            emit_frame_addr(9, remaining);
-            ins(c"ldr x0, [x9]");
-            ins(c"subs x0, x0, #1");
-            ins(c"str x0, [x9]");
-            ins_i(c"b.ne L", top, c"");
+            load_reg_from_frame(R_ACC, cursor);
+            emit_add_imm(R_ACC, elem_size);
+            emit_store(TY_U64, R_ACC, R_ADDR);
+            load_reg_from_frame(R_ACC, remaining);
+            emit_decrement(R_ACC);
+            emit_store(TY_U64, R_ACC, R_ADDR);
+            emit_jump_unless_zero_result(top);
         } else {
-            emit_frame_addr(10, slot);
-            emit_load_imm(11, count as u64);
+            emit_frame_addr(R_LOOP_PTR, slot);
+            emit_load_imm(R_LOOP_COUNT, count as u64);
             emit_label(top);
-            emit_store(elem_ty, 0, 10);
-            emit_add_imm(10, elem_size);
-            ins(c"subs x11, x11, #1");
-            ins_i(c"b.ne L", top, c"");
+            emit_store(elem_ty, R_ACC, R_LOOP_PTR);
+            emit_add_imm(R_LOOP_PTR, elem_size);
+            emit_decrement(R_LOOP_COUNT);
+            emit_jump_unless_zero_result(top);
         }
     }
-    emit_frame_addr(0, slot);
+    emit_frame_addr(R_ACC, slot);
+}
+
+// The 8 bytes of frame slot `offset` = <reg> (R_ADDR keeps the address).
+fn store_reg_to_frame(reg: i64, offset: i64) {
+    emit_frame_addr(R_ADDR, offset);
+    emit_store(TY_U64, reg, R_ADDR);
+}
+
+// <reg> = the 8 bytes of frame slot `offset` (R_ADDR keeps the address).
+fn load_reg_from_frame(reg: i64, offset: i64) {
+    emit_frame_addr(R_ADDR, offset);
+    emit_load_reg(reg, R_ADDR);
 }
 
 // ---- Control flow ----
@@ -631,44 +603,33 @@ fn gen_for(n: i64) {
     let counter = alloc_slot(8, 8);
     let end = alloc_slot(8, 8);
     gen_expr(NODES[range].a);
-    emit_frame_addr(9, counter);
-    ins(c"str x0, [x9]");
+    store_reg_to_frame(R_ACC, counter);
     gen_expr(NODES[range].b);
-    emit_frame_addr(9, end);
-    ins(c"str x0, [x9]");
+    store_reg_to_frame(R_ACC, end);
     let labels = new_loop_labels(n, 3);
     let next = labels;
     let exit = labels + 1;
     let test = labels + 2;
     emit_label(test);
     load_counter_and_end(counter, end);
-    ins(c"cmp x0, x1");
-    o(c"    b.");
-    o(condition(if inclusive { TK_GT } else { TK_GT_EQ }, is_signed(ty), false));
-    o(c" L");
-    oi(exit);
-    on();
+    emit_compare_jump(if inclusive { TK_GT } else { TK_GT_EQ }, is_signed(ty), exit);
     bind(NODES[n].b);
     gen_block(NODES[n].d);
     emit_label(next);
     load_counter_and_end(counter, end);
     if inclusive {
-        ins(c"cmp x0, x1");
-        ins_i(c"b.eq L", exit, c"");
+        emit_compare_jump(TK_EQ_EQ, is_signed(ty), exit);
     }
-    ins(c"add x0, x0, #1");
-    emit_frame_addr(9, counter);
-    ins(c"str x0, [x9]");
+    emit_add_imm(R_ACC, 1);
+    store_reg_to_frame(R_ACC, counter);
     emit_jump(test);
     emit_label(exit);
 }
 
-// x0 = the counter, x1 = the end.
+// The accumulator = the counter, the second operand = the end.
 fn load_counter_and_end(counter: i64, end: i64) {
-    emit_frame_addr(9, end);
-    ins(c"ldr x1, [x9]");
-    emit_frame_addr(9, counter);
-    ins(c"ldr x0, [x9]");
+    load_reg_from_frame(R_SECOND, end);
+    load_reg_from_frame(R_ACC, counter);
 }
 
 // `break` (to_end 1) or `continue` (to_end 0) out of loop `lp`.
@@ -705,30 +666,24 @@ fn gen_assign(n: i64) {
     if op == TK_EQ {
         gen_expr(value);
         if is_compound(ty) {
-            pop_x(1);
+            pop_x(R_SECOND);
             emit_copy(size_of(ty));
         } else if is_void(ty) {
-            pop_x(1);
+            pop_x(R_SECOND);
         } else {
-            pop_x(9);
-            emit_store(ty, 0, 9);
+            pop_x(R_ADDR);
+            emit_store(ty, R_ACC, R_ADDR);
         }
         return;
     }
-    ins(c"ldr x9, [sp]");
-    emit_load(ty, 9);
+    emit_peek(R_ADDR);
+    emit_load(ty, R_ADDR);
     push_value(ty);
     gen_expr(value);
-    if is_float(ty) {
-        ins(c"fmov d1, d0");
-        pop_d(0);
-    } else {
-        ins(c"mov x1, x0");
-        pop_x(0);
-    }
+    pop_second_operand(ty);
     gen_operator(arith_op_of_assign(op), ty, ty);
-    pop_x(9);
-    emit_store(ty, 0, 9);
+    pop_x(R_ADDR);
+    emit_store(ty, R_ACC, R_ADDR);
 }
 
 // ---- Calls ----
@@ -776,9 +731,9 @@ fn gen_call(n: i64) {
         }
         if is_compound(ty) && is_place_kind(arg) {
             let copy = alloc_slot_for(ty);
-            emit_frame_addr(1, copy);
+            emit_frame_addr(R_SECOND, copy);
             emit_copy(size_of(ty));
-            emit_frame_addr(0, copy);
+            emit_frame_addr(R_ACC, copy);
         }
         push_value(ty);
         arg_types[i] = ty;
@@ -793,25 +748,23 @@ fn gen_call(n: i64) {
 }
 
 // Where each argument goes (see arg_location); returns the size of the
-// outgoing stack area.
+// outgoing stack area, and the number of float registers used in
+// `float_regs`.
 fn assign_arg_locations(arg_types: *i64, count: i64, param_count: i64, variadic: bool,
-                        locations: *i64) -> i64 {
-    let mut state: [i64; 3] = [0, 0, 0];
+                        ret: i64, locations: *i64, float_regs: *i64) -> i64 {
+    let mut state: [i64; 3] = [first_int_arg(ret), 0, 0];
     for i in 0..count {
         let ty = arg_types[i];
         if ty == 0 {
             continue;
         }
         if variadic && i >= param_count {
-            // Apple's arm64 ABI: variadic arguments go on the stack, each
-            // in an 8-byte slot.
-            state[2] = align_to(state[2], 8);
-            locations[i] = 16 + state[2];
-            state[2] += 8;
+            locations[i] = variadic_arg_location(ty, &state as *i64);
         } else {
             locations[i] = arg_location(ty, &state as *i64);
         }
     }
+    *float_regs = state[1];
     align_to(state[2], 16)
 }
 
@@ -828,17 +781,11 @@ fn place_args(arg_types: *i64, count: i64, param_count: i64, variadic: bool,
         let from = stack_size + 16 * (pushed - 1 - k);
         k += 1;
         let location = locations[i];
+        let promote = variadic && i >= param_count;
         if location >= 16 {
-            let promote = variadic && i >= param_count;
-            move_stack_arg(ty, from, location - 16, promote);
-        } else if location >= 8 {
-            o(if ty == TY_F32 { c"    ldr s" } else { c"    ldr d" });
-            oi(location - 8);
-            ins_i(c", [sp, #", from, c"]");
+            emit_stack_arg(ty, from, location - 16, promote);
         } else {
-            o(c"    ldr x");
-            oi(location);
-            ins_i(c", [sp, #", from, c"]");
+            emit_load_arg_reg(location, ty, from, promote);
         }
     }
 }
@@ -847,30 +794,30 @@ fn place_args(arg_types: *i64, count: i64, param_count: i64, variadic: bool,
 fn gen_call_sequence(n: i64, direct: i64, arg_types: *i64, count: i64, param_count: i64,
                      variadic: bool, pushed: i64, ret: i64) {
     let mut locations: [i64; 64] = [0; 64];
-    let stack_size = assign_arg_locations(arg_types, count, param_count, variadic,
-                                          &locations as *i64);
+    let mut float_regs = 0;
+    let stack_size = assign_arg_locations(arg_types, count, param_count, variadic, ret,
+                                          &locations as *i64, &float_regs);
     if stack_size > 0 {
-        ins_i(c"sub sp, sp, #", stack_size, c"");
+        emit_sp_sub(stack_size);
     }
     place_args(arg_types, count, param_count, variadic, &locations as *i64, stack_size, pushed);
     if direct < 0 {
-        ins_i(c"ldr x16, [sp, #", stack_size, c"]");
+        emit_load_callee(stack_size);
     }
     let mut result_slot = 0;
     if is_compound(ret) {
         result_slot = alloc_slot_for(ret);
-        emit_frame_addr(8, result_slot);
+        emit_frame_addr(R_RESULT, result_slot);
     }
     if direct >= 0 {
-        o(c"    bl ");
-        emit_symbol_ref(fn_symbol_prefix(direct), FNS[direct].name);
-        on();
+        emit_call(fn_symbol_prefix(direct), FNS[direct].name, FNS[direct].is_extern, variadic,
+                  float_regs);
     } else {
-        ins(c"blr x16");
+        emit_call_indirect();
     }
     emit_drop_temps_now(stack_size, pushed);
     if is_compound(ret) {
-        emit_frame_addr(0, result_slot);
+        emit_frame_addr(R_ACC, result_slot);
     } else if is_integer(ret) || ret == TY_BOOL {
         emit_normalize(if ret == TY_BOOL { TY_U8 } else { ret });
     }
@@ -879,38 +826,7 @@ fn gen_call_sequence(n: i64, direct: i64, arg_types: *i64, count: i64, param_cou
 fn emit_drop_temps_now(stack_size: i64, pushed: i64) {
     let total = stack_size + 16 * pushed;
     if total > 0 {
-        emit_load_imm(16, total as u64);
-        ins(c"add sp, sp, x16");
+        emit_sp_add(total);
     }
     DEPTH -= pushed;
-}
-
-// Copies a pushed argument (at sp + from) to the outgoing stack area.
-fn move_stack_arg(ty: i64, from: i64, offset: i64, promote: bool) {
-    if is_float(ty) {
-        if ty == TY_F32 {
-            ins_i(c"ldr s16, [sp, #", from, c"]");
-            if promote {
-                ins(c"fcvt d16, s16");
-                ins_i(c"str d16, [sp, #", offset, c"]");
-            } else {
-                ins_i(c"str s16, [sp, #", offset, c"]");
-            }
-        } else {
-            ins_i(c"ldr d16, [sp, #", from, c"]");
-            ins_i(c"str d16, [sp, #", offset, c"]");
-        }
-        return;
-    }
-    ins_i(c"ldr x16, [sp, #", from, c"]");
-    let size = if is_compound(ty) || promote { 8 } else { size_of(ty) };
-    if size == 1 {
-        ins_i(c"strb w16, [sp, #", offset, c"]");
-    } else if size == 2 {
-        ins_i(c"strh w16, [sp, #", offset, c"]");
-    } else if size == 4 {
-        ins_i(c"str w16, [sp, #", offset, c"]");
-    } else {
-        ins_i(c"str x16, [sp, #", offset, c"]");
-    }
 }

@@ -1,16 +1,65 @@
 // The command line:
 //
-//   tachyonc <file.tach>... [-o out.s]   compile the files (one program)
-//   tachyonc --tokens <file.tach>        print the tokens of one file
-//   tachyonc --version                   print the release
+//   tachyonc [--target T] <file.tach>... [-o out.s]
+//                                   compile the files (one program) to
+//                                   assembly for target T (default: the
+//                                   host): aarch64-macos, x86_64-linux or
+//                                   x86_64-macos
+//   tachyonc --tokens <file.tach>   print the tokens of one file
+//   tachyonc --version              print the release and the host target
+
+extern fn uname(info: *u8) -> i32;
 
 fn usage() -> ! {
-    die(c"usage: tachyonc <file.tach>... [-o out.s] | tachyonc --tokens <file.tach> | tachyonc --version")
+    die(c"usage: tachyonc [--target aarch64-macos|x86_64-linux|x86_64-macos] <file.tach>... [-o out.s] | tachyonc --tokens <file.tach> | tachyonc --version")
 }
 
 // The release this source is; see docs/releases.md.
 fn version() -> *u8 {
-    c"tachyonc 1.0.0 (aarch64-apple-darwin)"
+    c"0.1.0"
+}
+
+// struct utsname: sysname is the first field on every system; machine is
+// the fifth, and the fields are 256 bytes long on macOS, 65 on Linux.
+const UTSNAME_SIZE: i64 = 2048;
+const MACOS_UTS_FIELD: i64 = 256;
+const LINUX_UTS_FIELD: i64 = 65;
+
+// The target of the machine this compiler runs on, or 0 when it has no
+// backend for it.
+fn host_target() -> i64 {
+    let info = alloc_zeroed(UTSNAME_SIZE);
+    if uname(info) != 0 {
+        return 0;
+    }
+    let mut field = 0;
+    if streq(info, c"Darwin") {
+        field = MACOS_UTS_FIELD;
+    } else if streq(info, c"Linux") {
+        field = LINUX_UTS_FIELD;
+    } else {
+        return 0;
+    }
+    let machine = &info[4 * field];
+    let x86 = streq(machine, c"x86_64");
+    if field == MACOS_UTS_FIELD {
+        if streq(machine, c"arm64") {
+            return T_AARCH64_MACOS;
+        }
+        return if x86 { T_X86_64_MACOS } else { 0 };
+    }
+    if x86 { T_X86_64_LINUX } else { 0 }
+}
+
+fn print_version() {
+    let out = buf_new();
+    buf_str(out, c"tachyonc ");
+    buf_str(out, version());
+    let host = host_target();
+    buf_str(out, c" (host: ");
+    buf_str(out, if host == 0 { c"unsupported" } else { target_name(host) });
+    buf_str(out, c")\n");
+    buf_write_fd(out, STDOUT);
 }
 
 fn streq(a: *u8, b: *u8) -> bool {
@@ -22,6 +71,7 @@ fn main(argc: i32, argv: **u8) -> i32 {
     let mut inputs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
     let mut output = c"a.s";
     let mut tokens_only = false;
+    let mut target = 0;
     let mut i = 1;
     while i < argc as i64 {
         let arg = argv[i];
@@ -33,9 +83,19 @@ fn main(argc: i32, argv: **u8) -> i32 {
             i += 2;
             continue;
         }
+        if streq(arg, c"--target") {
+            if i + 1 >= argc as i64 {
+                usage();
+            }
+            target = target_of_name(argv[i + 1]);
+            if target == 0 {
+                die2(c"unknown target (expected aarch64-macos, x86_64-linux or x86_64-macos): ", argv[i + 1]);
+            }
+            i += 2;
+            continue;
+        }
         if streq(arg, c"--version") {
-            write(STDOUT, version(), strlen(version()));
-            write(STDOUT, c"\n", 1);
+            print_version();
             return 0;
         }
         if streq(arg, c"--tokens") {
@@ -61,6 +121,13 @@ fn main(argc: i32, argv: **u8) -> i32 {
         buf_write_fd(out, STDOUT);
         return 0;
     }
+    if target == 0 {
+        target = host_target();
+        if target == 0 {
+            die(c"no backend for this host; pass --target aarch64-macos, x86_64-linux or x86_64-macos");
+        }
+    }
+    set_target(target);
     compile_program(output);
     0
 }

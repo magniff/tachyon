@@ -1,80 +1,47 @@
-// The target layer: AArch64 assembly for macOS (Apple's arm64 ABI), as
-// text for clang's assembler. The code generator (40_gen.tach) walks the
-// AST and calls these functions; another target replaces this file.
+// AArch64 for macOS (Apple's arm64 ABI), as text for clang's assembler:
+// the a64_* half of the target interface in 41_target.tach.
 //
-// Machine model used by the code generator:
-//   - the accumulator: x0 for integers, bools and pointers, d0 (s0 for f32)
-//     for floats, x0 holding the address for values kept in memory
-//     (structs, tuples, arrays);
-//   - a stack of temporaries (16 bytes each) on the machine stack;
-//   - every local lives in a frame slot at x29 - offset;
-//   - x1/d1 hold the second operand; x9-x17 are scratch.
+// Registers: the virtual registers are x<n> with the same number (R_ACC is
+// x0, R_RESULT x8, the ABI's indirect result register); the float
+// accumulator is d0 (s0 for f32), the second float operand d1. x16 and x17
+// are scratch; x29 is the frame pointer.
 
-// The assembly being generated for the current function, and for the
-// whole file.
-static mut CODE: i64 = -1;
-static mut ASM: i64 = -1;
-static mut DATA: i64 = -1;
-// Temporaries currently pushed (16 bytes each).
-static mut DEPTH: i64 = 0;
-static mut LABEL_COUNT: i64 = 0;
-
-fn o(s: *u8) {
-    buf_str(CODE, s);
-}
-
-fn oi(value: i64) {
-    buf_int(CODE, value);
-}
-
-fn on() {
-    buf_byte(CODE, '\n');
-}
-
-// "    <s>\n"
-fn ins(s: *u8) {
-    buf_str(CODE, c"    ");
-    buf_str(CODE, s);
-    buf_byte(CODE, '\n');
-}
-
-// "    <a><value><b>\n"
-fn ins_i(a: *u8, value: i64, b: *u8) {
-    buf_str(CODE, c"    ");
-    buf_str(CODE, a);
-    buf_int(CODE, value);
-    buf_str(CODE, b);
-    buf_byte(CODE, '\n');
-}
-
-fn new_label() -> i64 {
-    LABEL_COUNT += 1;
-    LABEL_COUNT
-}
-
-fn emit_label(label: i64) {
-    o(c"L");
-    oi(label);
-    o(c":\n");
-}
-
-fn emit_jump(label: i64) {
+fn a64_jump(label: i64) {
     ins_i(c"b L", label, c"");
 }
 
-// Jumps to `label` when x0 is zero (false).
-fn emit_jump_if_zero(label: i64) {
+fn a64_jump_if_zero(label: i64) {
     ins_i(c"cbz x0, L", label, c"");
 }
 
-fn emit_jump_if_nonzero(label: i64) {
+fn a64_jump_if_nonzero(label: i64) {
     ins_i(c"cbnz x0, L", label, c"");
+}
+
+fn a64_decrement(reg: i64) {
+    o(c"    subs x");
+    oi(reg);
+    o(c", x");
+    oi(reg);
+    o(c", #1\n");
+}
+
+fn a64_jump_unless_zero_result(label: i64) {
+    ins_i(c"b.ne L", label, c"");
+}
+
+fn a64_compare_jump(op: i64, signed: bool, label: i64) {
+    ins(c"cmp x0, x1");
+    o(c"    b.");
+    o(a64_condition(op, signed, false));
+    o(c" L");
+    oi(label);
+    on();
 }
 
 // ---- Constants and addresses ----
 
-// x<reg> = value
-fn emit_load_imm(reg: i64, value: u64) {
+fn a64_load_imm(reg: i64, value: u64) {
     let mut first = true;
     for chunk in 0..4 {
         let part = (value >> (chunk * 16) as u64) & 0xffff;
@@ -97,22 +64,20 @@ fn emit_load_imm(reg: i64, value: u64) {
     }
 }
 
-// x<reg> = x29 - offset
-fn emit_frame_addr(reg: i64, offset: i64) {
+fn a64_frame_addr(reg: i64, offset: i64) {
     if offset < 4096 {
         o(c"    sub x");
         oi(reg);
-        ins_i(c", x29, #", offset, c"");
+        end_i(c", x29, #", offset, c"");
         return;
     }
-    emit_load_imm(17, offset as u64);
+    a64_load_imm(17, offset as u64);
     o(c"    sub x");
     oi(reg);
-    ins(c", x29, x17");
+    end(c", x29, x17");
 }
 
-// x<reg> += value
-fn emit_add_imm(reg: i64, value: i64) {
+fn a64_add_imm(reg: i64, value: i64) {
     if value == 0 {
         return;
     }
@@ -121,24 +86,18 @@ fn emit_add_imm(reg: i64, value: i64) {
         oi(reg);
         o(c", x");
         oi(reg);
-        ins_i(c", #", value, c"");
+        end_i(c", #", value, c"");
         return;
     }
-    emit_load_imm(17, value as u64);
+    a64_load_imm(17, value as u64);
     o(c"    add x");
     oi(reg);
     o(c", x");
     oi(reg);
-    ins(c", x17");
+    end(c", x17");
 }
 
-fn emit_symbol_ref(sym_prefix: *u8, name: i64) {
-    o(sym_prefix);
-    buf_bytes(CODE, SYMS[name].ptr, SYMS[name].len);
-}
-
-// x0 = address of a symbol defined in this file.
-fn emit_local_symbol_addr(prefix: *u8, name: i64) {
+fn a64_local_symbol_addr(prefix: *u8, name: i64) {
     o(c"    adrp x0, ");
     emit_symbol_ref(prefix, name);
     o(c"@PAGE\n    add x0, x0, ");
@@ -146,8 +105,8 @@ fn emit_local_symbol_addr(prefix: *u8, name: i64) {
     o(c"@PAGEOFF\n");
 }
 
-// x0 = address of an external symbol, through the GOT.
-fn emit_extern_symbol_addr(name: i64) {
+// Through the GOT.
+fn a64_extern_symbol_addr(name: i64) {
     o(c"    adrp x0, ");
     emit_symbol_ref(c"_", name);
     o(c"@GOTPAGE\n    ldr x0, [x0, ");
@@ -155,65 +114,50 @@ fn emit_extern_symbol_addr(name: i64) {
     o(c"@GOTPAGEOFF]\n");
 }
 
-fn emit_string_addr(id: i64) {
+fn a64_string_addr(id: i64) {
     ins_i(c"adrp x0, Lstr.", id, c"@PAGE");
     ins_i(c"add x0, x0, Lstr.", id, c"@PAGEOFF");
 }
 
-// d0 (s0 for f32) = the float whose f64 bits are `bits`.
-fn emit_load_float(bits: i64, ty: i64) {
+fn a64_load_float(bits: i64, ty: i64) {
     if ty == TY_F32 {
-        emit_load_imm(16, f32_bits(f64_of_bits(bits)) as u64);
+        a64_load_imm(16, f32_bits(f64_of_bits(bits)) as u64);
         ins(c"fmov s0, w16");
     } else {
-        emit_load_imm(16, bits as u64);
+        a64_load_imm(16, bits as u64);
         ins(c"fmov d0, x16");
     }
 }
 
 // ---- Temporaries ----
 
-fn push_x0() {
+fn a64_push_int() {
     ins(c"str x0, [sp, #-16]!");
-    DEPTH += 1;
 }
 
-fn push_d0() {
+fn a64_push_float() {
     ins(c"str d0, [sp, #-16]!");
-    DEPTH += 1;
 }
 
-fn pop_x(reg: i64) {
+fn a64_pop_int(reg: i64) {
     ins_i(c"ldr x", reg, c", [sp], #16");
-    DEPTH -= 1;
 }
 
-fn pop_d(reg: i64) {
+fn a64_pop_float(reg: i64) {
     ins_i(c"ldr d", reg, c", [sp], #16");
-    DEPTH -= 1;
 }
 
-// Pushes the accumulator for a value of type `ty`.
-fn push_value(ty: i64) {
-    if is_float(ty) {
-        push_d0();
-    } else {
-        push_x0();
-    }
+fn a64_peek(reg: i64) {
+    ins_i(c"ldr x", reg, c", [sp]");
 }
 
-// Drops `count` temporaries without changing DEPTH (for jumps out of the
-// current expression).
-fn emit_drop_temps(count: i64) {
-    if count > 0 {
-        ins_i(c"add sp, sp, #", count * 16, c"");
-    }
+fn a64_drop_temps(count: i64) {
+    ins_i(c"add sp, sp, #", count * 16, c"");
 }
 
 // ---- Loads and stores ----
 
-// Accumulator = the value of type `ty` at [x<addr>].
-fn emit_load(ty: i64, addr: i64) {
+fn a64_load(ty: i64, addr: i64) {
     let size = size_of(ty);
     if ty == TY_F32 {
         ins_i(c"ldr s0, [x", addr, c"]");
@@ -236,8 +180,13 @@ fn emit_load(ty: i64, addr: i64) {
     }
 }
 
-// [x<addr>] = x<reg> (or d<reg>/s<reg> for floats), a value of type `ty`.
-fn emit_store(ty: i64, reg: i64, addr: i64) {
+fn a64_load_reg(reg: i64, addr: i64) {
+    o(c"    ldr x");
+    oi(reg);
+    end_i(c", [x", addr, c"]");
+}
+
+fn a64_store(ty: i64, reg: i64, addr: i64) {
     let size = size_of(ty);
     if ty == TY_F32 {
         o(c"    str s");
@@ -253,17 +202,23 @@ fn emit_store(ty: i64, reg: i64, addr: i64) {
         o(c"    str x");
     }
     oi(reg);
-    ins_i(c", [x", addr, c"]");
+    end_i(c", [x", addr, c"]");
 }
 
-// Copies `size` bytes from [x0] to [x1]; clobbers the scratch registers
-// (and every caller-saved register for large copies).
-fn emit_copy(size: i64) {
+fn a64_store_offset(reg: i64, addr: i64, offset: i64) {
+    o(c"    str x");
+    oi(reg);
+    o(c", [x");
+    oi(addr);
+    end_i(c", #", offset, c"]");
+}
+
+fn a64_copy(size: i64) {
     if size > 128 {
         ins(c"mov x16, x0");
         ins(c"mov x0, x1");
         ins(c"mov x1, x16");
-        emit_load_imm(2, size as u64);
+        a64_load_imm(2, size as u64);
         ins(c"bl _memcpy");
         return;
     }
@@ -289,11 +244,17 @@ fn emit_copy(size: i64) {
     }
 }
 
+fn a64_move_to_second(ty: i64) {
+    if is_float(ty) {
+        ins(c"fmov d1, d0");
+    } else {
+        ins(c"mov x1, x0");
+    }
+}
+
 // ---- Integer operations ----
 
-// Brings x0 into the canonical form of `ty`: sign- or zero-extended from
-// its width to 64 bits.
-fn emit_normalize(ty: i64) {
+fn a64_normalize(ty: i64) {
     if ty == TY_I8 { ins(c"sxtb x0, w0"); }
     else if ty == TY_U8 { ins(c"and x0, x0, #0xff"); }
     else if ty == TY_I16 { ins(c"sxth x0, w0"); }
@@ -302,8 +263,9 @@ fn emit_normalize(ty: i64) {
     else if ty == TY_U32 { ins(c"mov w0, w0"); }
 }
 
-// x0 = x0 <op> x1 for integers of type `ty`.
-fn emit_int_binary(op: i64, ty: i64) {
+// Division by zero gives 0 (and the remainder the dividend), as sdiv and
+// udiv do; the x86-64 target matches this.
+fn a64_int_binary(op: i64, ty: i64) {
     let signed = is_signed(ty);
     if op == TK_PLUS { ins(c"add x0, x0, x1"); }
     else if op == TK_MINUS { ins(c"sub x0, x0, x1"); }
@@ -328,11 +290,11 @@ fn emit_int_binary(op: i64, ty: i64) {
             ins(c"lsr x0, x0, x1");
         }
     }
-    emit_normalize(ty);
+    a64_normalize(ty);
 }
 
 // The condition code of a comparison.
-fn condition(op: i64, signed: bool, float: bool) -> *u8 {
+fn a64_condition(op: i64, signed: bool, float: bool) -> *u8 {
     if op == TK_EQ_EQ { return c"eq"; }
     if op == TK_BANG_EQ { return c"ne"; }
     if float {
@@ -348,8 +310,7 @@ fn condition(op: i64, signed: bool, float: bool) -> *u8 {
     if signed { c"ge" } else { c"hs" }
 }
 
-// x0 = (x0 <op> x1), or of d0/d1 for floats; operands of type `ty`.
-fn emit_compare(op: i64, ty: i64) {
+fn a64_compare(op: i64, ty: i64) {
     let float = is_float(ty);
     if ty == TY_F32 {
         ins(c"fcmp s0, s1");
@@ -359,12 +320,44 @@ fn emit_compare(op: i64, ty: i64) {
         ins(c"cmp x0, x1");
     }
     o(c"    cset x0, ");
-    o(condition(op, is_signed(ty), float));
+    o(a64_condition(op, is_signed(ty), float));
     on();
 }
 
-// d0 = d0 <op> d1 (s registers for f32).
-fn emit_float_binary(op: i64, ty: i64) {
+fn a64_negate(ty: i64) {
+    if ty == TY_F32 {
+        ins(c"fneg s0, s0");
+    } else if ty == TY_F64 {
+        ins(c"fneg d0, d0");
+    } else {
+        ins(c"neg x0, x0");
+        a64_normalize(ty);
+    }
+}
+
+fn a64_not_bool() {
+    ins(c"eor x0, x0, #1");
+}
+
+fn a64_bitnot(ty: i64) {
+    ins(c"mvn x0, x0");
+    a64_normalize(ty);
+}
+
+fn a64_index_addr(elem_size: i64) {
+    if elem_size == 1 {
+        ins(c"add x0, x1, x0");
+    } else if elem_size > 0 && (elem_size & (elem_size - 1)) == 0 {
+        ins_i(c"add x0, x1, x0, lsl #", log2(elem_size), c"");
+    } else {
+        a64_load_imm(16, elem_size as u64);
+        ins(c"madd x0, x0, x16, x1");
+    }
+}
+
+// ---- Floats ----
+
+fn a64_float_binary(op: i64, ty: i64) {
     let r = if ty == TY_F32 { c"s" } else { c"d" };
     if op == TK_PERCENT {
         ins(if ty == TY_F32 { c"bl _fmodf" } else { c"bl _fmod" });
@@ -382,27 +375,18 @@ fn emit_float_binary(op: i64, ty: i64) {
     o(c"1\n");
 }
 
-// ---- Conversions ----
-
-fn emit_int_to_float(from: i64, to: i64) {
+fn a64_int_to_float(from: i64, to: i64) {
     let reg = if to == TY_F32 { c"s0" } else { c"d0" };
     o(if is_signed(from) { c"    scvtf " } else { c"    ucvtf " });
     o(reg);
     o(c", x0\n");
 }
 
-fn emit_float_to_float(from: i64, to: i64) {
-    if from == to {
-        return;
-    }
+fn a64_float_to_float(to: i64) {
     ins(if to == TY_F64 { c"fcvt d0, s0" } else { c"fcvt s0, d0" });
 }
 
-// Saturating conversions (NaN is 0), like the reference backend: signed
-// results up to 32 bits convert at 32 bits and wrap, unsigned ones up to
-// 32 bits convert signed at 64 bits and wrap; u64 converts unsigned at
-// 2^63 and above.
-fn emit_float_to_int(from: i64, to: i64) {
+fn a64_float_to_int(from: i64, to: i64) {
     let src = if from == TY_F32 { c"s0" } else { c"d0" };
     if is_signed(to) && int_bits(to) <= 32 {
         o(c"    fcvtzs w0, ");
@@ -422,22 +406,22 @@ fn emit_float_to_int(from: i64, to: i64) {
         o(src);
         on();
         if from == TY_F32 {
-            emit_load_imm(9, 0x5f000000);
+            a64_load_imm(9, 0x5f000000);
             ins(c"fmov s1, w9");
             ins(c"fcmp s0, s1");
         } else {
-            emit_load_imm(9, 0x43e0000000000000);
+            a64_load_imm(9, 0x43e0000000000000);
             ins(c"fmov d1, x9");
             ins(c"fcmp d0, d1");
         }
         ins(c"csel x0, x17, x16, ge");
     }
-    emit_normalize(to);
+    a64_normalize(to);
 }
 
 // ---- Functions ----
 
-fn emit_function_start(symbol_prefix: *u8, name: i64, global: bool) {
+fn a64_function_start(symbol_prefix: *u8, name: i64, global: bool) {
     let out = ASM;
     buf_str(out, c"\n.p2align 2\n");
     if global {
@@ -452,92 +436,120 @@ fn emit_function_start(symbol_prefix: *u8, name: i64, global: bool) {
     buf_str(out, c"    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n");
 }
 
-// Reserves the frame once its size is known.
-fn emit_frame_reserve(frame_size: i64) {
-    let size = align_to(frame_size, 16);
-    if size == 0 {
-        return;
-    }
-    let out = CODE;
-    CODE = ASM;
+fn a64_frame_reserve(size: i64) {
     if size < 4096 {
         ins_i(c"sub sp, sp, #", size, c"");
     } else {
-        emit_load_imm(16, size as u64);
+        a64_load_imm(16, size as u64);
         ins(c"sub sp, sp, x16");
     }
-    CODE = out;
 }
 
-fn emit_epilogue() {
+fn a64_epilogue() {
     ins(c"mov sp, x29");
     ins(c"ldp x29, x30, [sp], #16");
     ins(c"ret");
 }
 
-// ---- Data ----
+// ---- Calls ----
 
-fn data_label(prefix: *u8, name: i64) {
-    buf_str(DATA, prefix);
-    buf_bytes(DATA, SYMS[name].ptr, SYMS[name].len);
-    buf_str(DATA, c":\n");
+fn a64_arg_location(ty: i64, state: *i64) -> i64 {
+    if is_float(ty) {
+        if state[1] < 8 {
+            state[1] += 1;
+            return 8 + state[1] - 1;
+        }
+    } else if state[0] < 8 {
+        state[0] += 1;
+        return state[0] - 1;
+    }
+    // Apple's arm64 ABI packs stack arguments at their natural alignment.
+    let size = if is_compound(ty) { 8 } else { size_of(ty) };
+    state[2] = align_to(state[2], size);
+    let offset = state[2];
+    state[2] += size;
+    16 + offset
 }
 
-// `.byte` lines for `n` bytes at `p`.
-fn data_bytes(p: *u8, n: i64) {
-    let mut all_zero = true;
-    for i in 0..n {
-        if p[i] != 0 {
-            all_zero = false;
-        }
+// Apple's arm64 ABI: variadic arguments go on the stack, each in an 8-byte
+// slot.
+fn a64_variadic_arg_location(state: *i64) -> i64 {
+    state[2] = align_to(state[2], 8);
+    let location = 16 + state[2];
+    state[2] += 8;
+    location
+}
+
+fn a64_load_param(location: i64, ty: i64) {
+    if location < 8 {
+        ins_i(c"mov x0, x", location, c"");
+    } else if location < 16 {
+        ins_i(c"fmov d0, d", location - 8, c"");
+    } else {
+        ins_i(c"add x9, x29, #", location, c"");
+        a64_load(ty, 9);
     }
-    if all_zero {
-        if n > 0 {
-            buf_str(DATA, c"    .space ");
-            buf_int(DATA, n);
-            buf_byte(DATA, '\n');
+}
+
+fn a64_sp_sub(size: i64) {
+    ins_i(c"sub sp, sp, #", size, c"");
+}
+
+fn a64_sp_add(size: i64) {
+    a64_load_imm(16, size as u64);
+    ins(c"add sp, sp, x16");
+}
+
+fn a64_load_arg_reg(location: i64, ty: i64, from: i64) {
+    if location >= 8 {
+        o(if ty == TY_F32 { c"    ldr s" } else { c"    ldr d" });
+        oi(location - 8);
+    } else {
+        o(c"    ldr x");
+        oi(location);
+    }
+    end_i(c", [sp, #", from, c"]");
+}
+
+fn a64_stack_arg(ty: i64, from: i64, offset: i64, promote: bool) {
+    if is_float(ty) {
+        if ty == TY_F32 {
+            ins_i(c"ldr s16, [sp, #", from, c"]");
+            if promote {
+                ins(c"fcvt d16, s16");
+                ins_i(c"str d16, [sp, #", offset, c"]");
+            } else {
+                ins_i(c"str s16, [sp, #", offset, c"]");
+            }
+        } else {
+            ins_i(c"ldr d16, [sp, #", from, c"]");
+            ins_i(c"str d16, [sp, #", offset, c"]");
         }
         return;
     }
-    let mut i = 0;
-    while i < n {
-        buf_str(DATA, c"    .byte ");
-        let mut j = 0;
-        while j < 16 && i < n {
-            if j > 0 {
-                buf_byte(DATA, ',');
-            }
-            buf_uint(DATA, p[i] as u64);
-            i += 1;
-            j += 1;
-        }
-        buf_byte(DATA, '\n');
+    ins_i(c"ldr x16, [sp, #", from, c"]");
+    let size = if is_compound(ty) || promote { 8 } else { size_of(ty) };
+    if size == 1 {
+        ins_i(c"strb w16, [sp, #", offset, c"]");
+    } else if size == 2 {
+        ins_i(c"strh w16, [sp, #", offset, c"]");
+    } else if size == 4 {
+        ins_i(c"str w16, [sp, #", offset, c"]");
+    } else {
+        ins_i(c"str x16, [sp, #", offset, c"]");
     }
 }
 
-fn data_section(writable: bool) {
-    buf_str(DATA, if writable { c"\n.section __DATA,__data\n" } else { c"\n.section __TEXT,__const\n" });
+fn a64_load_callee(from: i64) {
+    ins_i(c"ldr x16, [sp, #", from, c"]");
 }
 
-// log2 of a power of two up to 16.
-fn log2(value: i64) -> i64 {
-    let mut result = 0;
-    while (1 << result as u64) < value {
-        result += 1;
-    }
-    result
+fn a64_call(prefix: *u8, name: i64) {
+    o(c"    bl ");
+    emit_symbol_ref(prefix, name);
+    on();
 }
 
-fn data_align(align: i64) {
-    buf_str(DATA, c".p2align ");
-    buf_int(DATA, log2(align));
-    buf_byte(DATA, '\n');
-}
-
-fn data_string(id: i64) {
-    buf_str(DATA, c"Lstr.");
-    buf_int(DATA, id);
-    buf_str(DATA, c":\n");
-    data_bytes(STRS[id].ptr, STRS[id].len);
-    buf_str(DATA, c"    .byte 0\n");
+fn a64_call_indirect() {
+    ins(c"blr x16");
 }
