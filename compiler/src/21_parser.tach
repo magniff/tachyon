@@ -133,6 +133,10 @@ fn parse_program() -> i64 {
             parse_impl();
         } else if at(Tok::Extern) {
             parse_extern();
+        } else if at(Tok::Import) {
+            parse_import();
+        } else if at(Tok::Use) {
+            parse_use();
         } else if at(Tok::Hash) {
             list_push(parse_attributed_item());
         } else {
@@ -252,13 +256,21 @@ fn parse_extern() {
     advance();
     if eat(Tok::LBrace) {
         while !at(Tok::RBrace) && !at(Tok::Eof) {
-            if at(Tok::Fn) {
-                list_push(parse_c_function(cur_start(), true));
+            let link = parse_link_name();
+            let item = if at(Tok::Fn) {
+                parse_c_function(cur_start(), true)
             } else if at(Tok::Static) {
-                list_push(parse_c_static(cur_start(), false));
+                parse_c_static(cur_start(), false)
             } else {
-                syntax_error(c"expected 'fn', 'static' or '}' in an extern block");
+                syntax_error(c"expected 'fn', 'static' or '}' in an extern block")
+            };
+            if link >= 0 {
+                if NODES[item].kind != NodeKind::ExternFn && !(NODES[item].kind == NodeKind::Static && NODES[item].y == 1) {
+                    error_at(NODES[item].start, c"#[link_name] is for the functions and statics of an extern block");
+                }
+                LINK_NAMES.put(NODES[item].a + 1, link + 1);
             }
+            list_push(item);
         }
         expect(Tok::RBrace);
         return;
@@ -272,6 +284,73 @@ fn parse_extern() {
 
 fn c_fn_outside_block() -> *u8 {
     c"C functions are declared in an extern block: `extern \"C\" { fn f(...) -> T; }` (the 0.2 form `extern fn f(...) -> T;` was removed in 0.4)"
+}
+
+// `#[link_name = "symbol"]` before a declaration in an extern block: the
+// C symbol it stands for, when that is not its name. -1: none.
+fn parse_link_name() -> i64 {
+    if !at(Tok::Hash) {
+        return -1;
+    }
+    advance();
+    expect(Tok::LBracket);
+    let pos = cur_start();
+    let name = expect_ident();
+    if name != intern_c(c"link_name") {
+        name_error(pos, c"unknown attribute '", name, c"' in an extern block (expected link_name)");
+    }
+    expect(Tok::Eq);
+    if !at(Tok::Str) {
+        syntax_error(c"expected the symbol's name as a string");
+    }
+    let sym = intern(STRS[TOKS[P].value as i64]);
+    advance();
+    expect(Tok::RBracket);
+    sym
+}
+
+// `use E::*;` or `use E::{A, B};`: variants of enum E by their own names.
+fn parse_use() {
+    let start = cur_start();
+    expect(Tok::Use);
+    let n = new_node(NodeKind::Use, start, 0);
+    NODES[n].a = expect_ident();
+    expect(Tok::ColonColon);
+    let mark = list_begin();
+    if eat(Tok::Star) {
+        NODES[n].b = 1;
+    } else if eat(Tok::LBrace) {
+        while !at(Tok::RBrace) && !at(Tok::Eof) {
+            let item = new_node(NodeKind::Ident, cur_start(), 0);
+            NODES[item].a = expect_ident();
+            NODES[item].end = prev_end();
+            list_push(item);
+            if !eat(Tok::Comma) {
+                break;
+            }
+        }
+        expect(Tok::RBrace);
+    } else {
+        let item = new_node(NodeKind::Ident, cur_start(), 0);
+        NODES[item].a = expect_ident();
+        NODES[item].end = prev_end();
+        list_push(item);
+    }
+    list_end(n, mark);
+    expect(Tok::Semi);
+    NODES[n].end = prev_end();
+    list_push(n);
+}
+
+// `import "header.h";`: the declarations of a C header become part of the
+// program (16_cimport.tach; the driver reads the imports before parsing).
+fn parse_import() {
+    expect(Tok::Import);
+    if !at(Tok::Str) {
+        syntax_error(c"expected the name of a C header as a string");
+    }
+    advance();
+    expect(Tok::Semi);
 }
 
 // `fn f(...) -> T;` (a C function, only in an extern block) or `fn
@@ -681,7 +760,7 @@ fn parse_block() -> i64 {
 fn is_item_start(kind: Tok) -> bool {
     kind == Tok::Fn || kind == Tok::Extern || kind == Tok::Struct || kind == Tok::Const
         || kind == Tok::Static || kind == Tok::Type || kind == Tok::Enum || kind == Tok::Impl
-        || kind == Tok::Union
+        || kind == Tok::Union || kind == Tok::Import || kind == Tok::Use
 }
 
 // `name:` before `loop`, `while` or `for`.
