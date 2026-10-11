@@ -1121,6 +1121,9 @@ fn synth_expr_inner(n: i64) -> i64 {
             synth_expr(NODES[n].a);
             TY_NEVER
         }
+        // Already checked (a path made a variant), when a rewrite checks
+        // an expression again.
+        NodeKind::VariantLit => NODES[n].ty,
         NodeKind::Binary => synth_binary(n),
         NodeKind::Unary => synth_unary(n),
         NodeKind::Cast => synth_cast(n),
@@ -1254,13 +1257,15 @@ fn synth_name(n: i64) -> i64 {
 
 // `use E::*;` and `use E::{A, B};` (0.4): symbol -> variant + 1.
 static mut USE_VARIANT: *i64 = 0 as *i64;
+static mut USE_VARIANT_SIZE: i64 = 0;
 
 fn used_variant(name: i64) -> i64 {
-    if USE_VARIANT == 0 as *i64 || name >= SYM_COUNT { -1 } else { USE_VARIANT[name] - 1 }
+    if USE_VARIANT == 0 as *i64 || name >= USE_VARIANT_SIZE { -1 } else { USE_VARIANT[name] - 1 }
 }
 
 fn collect_uses() {
     USE_VARIANT = sym_table();
+    USE_VARIANT_SIZE = SYM_COUNT;
     for i in 0..NODES[PROGRAM].count {
         let item = child(PROGRAM, i);
         if NODES[item].kind != NodeKind::Use {
@@ -1659,7 +1664,9 @@ fn synth_binary(n: i64) -> i64 {
         }
         NODES[n].b = cast_node(lhs, ENUMS[e].tag);
         NODES[n].c = cast_node(rhs, ENUMS[e].tag);
-        return synth_binary(n);
+        synth_expr(NODES[n].b);
+        synth_expr(NODES[n].c);
+        return TY_BOOL;
     }
     if op == Tok::Lt || op == Tok::Gt || op == Tok::LtEq || op == Tok::GtEq {
         if !(is_numeric(ty) || is_pointer(ty)) {
@@ -2286,8 +2293,6 @@ fn check_for(n: i64) -> i64 {
 // `for p in s` over a slice or an array (0.4), by value:
 //   { let s' = s; for i' in 0..len { let p = s'[i']; body } }
 // The sequence is evaluated once; the loop keeps its label.
-static mut FOR_EACH_COUNT: i64 = 0;
-
 fn check_for_each(n: i64) -> i64 {
     let seq = NODES[n].c;
     let seq_ty = synth_expr(seq);
@@ -2297,15 +2302,10 @@ fn check_for_each(n: i64) -> i64 {
     }
     let start = NODES[n].start;
     let end = NODES[n].end;
-    FOR_EACH_COUNT += 1;
-    let b = buf_new();
-    buf_str(b, c"__for_seq");
-    buf_int(b, FOR_EACH_COUNT);
-    let seq_sym = intern(buf_slice(b));
-    buf_clear(b);
-    buf_str(b, c"__for_index");
-    buf_int(b, FOR_EACH_COUNT);
-    let index_sym = intern(buf_slice(b));
+    // (Fixed names: an inner loop's shadow the outer's, which are read
+    // before it. Interned before the symbol tables, see init_declarations.)
+    let seq_sym = intern_c(c"__for_seq");
+    let index_sym = intern_c(c"__for_index");
     // let s' = s;
     let seq_bind = new_node(NodeKind::PatBind, start, end);
     NODES[seq_bind].a = seq_sym;
