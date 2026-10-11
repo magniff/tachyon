@@ -15,14 +15,6 @@ pub struct GeneratorError {
     pub message: String,
 }
 
-impl From<std::fmt::Error> for GeneratorError {
-    fn from(value: std::fmt::Error) -> Self {
-        Self {
-            message: value.to_string(),
-        }
-    }
-}
-
 // The platform code is generated for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target {
