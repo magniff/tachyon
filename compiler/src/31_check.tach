@@ -115,6 +115,7 @@ fn check_program(program: i64) {
     collect_const_types();
     collect_structs();
     collect_enums();
+    collect_uses();
     collect_aliases();
     check_struct_cycles();
     collect_methods();
@@ -246,7 +247,9 @@ fn collect_const_types() {
     for c in 0..CONST_COUNT {
         let item = CONSTS[c].node;
         let ty = resolve_type(NODES[item].b);
-        if !(is_numeric(ty) || ty == TY_BOOL) {
+        // 0.4: fieldless enums, and C strings (`const S: *u8 = c"...";`).
+        let string = is_pointer(ty) && NODES[NODES[item].c].kind == NodeKind::CStr;
+        if !(is_numeric(ty) || ty == TY_BOOL || is_fieldless_enum(ty) || string) {
             err_begin(NODES[NODES[item].b].start);
             err_str(c"constant '");
             err_sym(NODES[item].a);
@@ -661,6 +664,10 @@ fn collect_statics() {
             continue;
         }
         check_const_expr(NODES[item].c, ty);
+        if NODES[NODES[item].c].kind == NodeKind::CStr {
+            // A C string (0.4): the address of the literal.
+            continue;
+        }
         // Evaluated now to report non-constant initializers; the code
         // generator evaluates it again into the data section.
         let scratch = buf_new();
@@ -1110,6 +1117,10 @@ fn synth_expr_inner(n: i64) -> i64 {
         NodeKind::Str => TY_STRING,
         NodeKind::CStr => TY_U8_PTR,
         NodeKind::Ident => synth_name(n),
+        NodeKind::EnumPanic => {
+            synth_expr(NODES[n].a);
+            TY_NEVER
+        }
         NodeKind::Binary => synth_binary(n),
         NodeKind::Unary => synth_unary(n),
         NodeKind::Cast => synth_cast(n),
@@ -1204,8 +1215,16 @@ fn synth_name(n: i64) -> i64 {
         return LOCALS[local].ty;
     }
     if SYM_CONST[name] != 0 {
+        let c = SYM_CONST[name] - 1;
+        let init = NODES[CONSTS[c].node].c;
+        if NODES[init].kind == NodeKind::CStr && is_pointer(CONSTS[c].ty) {
+            // A C string constant: the literal itself.
+            NODES[n].kind = NodeKind::CStr;
+            NODES[n].a = NODES[init].a;
+            return CONSTS[c].ty;
+        }
         NODES[n].res = Res::Const;
-        NODES[n].y = SYM_CONST[name] - 1;
+        NODES[n].y = c;
         return CONSTS[NODES[n].y].ty;
     }
     if SYM_STATIC[name] != 0 {
@@ -1222,7 +1241,74 @@ fn synth_name(n: i64) -> i64 {
         NODES[n].y = f;
         return fn_value_type(f);
     }
+    let v = used_variant(name);
+    if v >= 0 {
+        // A variant brought into scope by `use E::...;`: `E::V`.
+        NODES[n].kind = NodeKind::Path;
+        NODES[n].a = ENUMS[VARIANTS[v].enum_id].name;
+        NODES[n].b = name;
+        return synth_expr(n);
+    }
     unknown_name_error(NODES[n].start, c"undefined variable '", name)
+}
+
+// `use E::*;` and `use E::{A, B};` (0.4): symbol -> variant + 1.
+static mut USE_VARIANT: *i64 = 0 as *i64;
+
+fn used_variant(name: i64) -> i64 {
+    if USE_VARIANT == 0 as *i64 || name >= SYM_COUNT { -1 } else { USE_VARIANT[name] - 1 }
+}
+
+fn collect_uses() {
+    USE_VARIANT = sym_table();
+    for i in 0..NODES[PROGRAM].count {
+        let item = child(PROGRAM, i);
+        if NODES[item].kind != NodeKind::Use {
+            continue;
+        }
+        let name = NODES[item].a;
+        if SYM_ENUM[name] == 0 {
+            name_error(NODES[item].start, c"'", name, c"' is not an enum (use brings the variants of an enum into scope)");
+        }
+        let e = SYM_ENUM[name] - 1;
+        if NODES[item].b == 1 {
+            for k in 0..ENUMS[e].variant_count {
+                add_use(enum_variant(e, k), item);
+            }
+            continue;
+        }
+        for k in 0..NODES[item].count {
+            let id = child(item, k);
+            let v = find_variant(e, NODES[id].a);
+            if v < 0 {
+                err_begin(NODES[id].start);
+                err_str(c"enum '");
+                err_sym(name);
+                err_str(c"' has no variant '");
+                err_sym(NODES[id].a);
+                err_str(c"'");
+                err_end();
+            }
+            add_use(v, id);
+        }
+    }
+}
+
+fn add_use(v: i64, at: i64) {
+    let name = VARIANTS[v].name;
+    let old = USE_VARIANT[name] - 1;
+    if old >= 0 && old != v {
+        err_begin(NODES[at].start);
+        err_str(c"'");
+        err_sym(name);
+        err_str(c"' is brought into scope from both '");
+        err_sym(ENUMS[VARIANTS[old].enum_id].name);
+        err_str(c"' and '");
+        err_sym(ENUMS[VARIANTS[v].enum_id].name);
+        err_str(c"'");
+        err_end();
+    }
+    USE_VARIANT[name] = v + 1;
 }
 
 // An unknown name; when a C header left it out, why.
@@ -1254,6 +1340,7 @@ fn fn_value_type(f: i64) -> i64 {
 
 fn is_valid_cast(from: i64, to: i64) -> bool {
     if is_fieldless_enum(from) && is_integer(to) { return true; }
+    if is_integer(from) && is_fieldless_enum(to) { return true; }
     if is_numeric(from) && is_numeric(to) { return true; }
     if is_pointer(from) && is_pointer(to) { return true; }
     if is_integer(from) && is_pointer(to) { return true; }
@@ -1275,7 +1362,81 @@ fn synth_cast(n: i64) -> i64 {
         err_str(c"'");
         err_end();
     }
+    if is_integer(from) && is_fieldless_enum(to) {
+        return enum_cast(n, operand, from, to);
+    }
     to
+}
+
+// `n as E` for a fieldless enum E (0.4), checked: it becomes
+//   match n { d0 => E::V0, d1 => E::V1, ..., v => <panic: invalid value> }
+// (the discriminants the operand's type can hold).
+fn enum_cast(n: i64, operand: i64, from: i64, to: i64) -> i64 {
+    let e = TYPES[to].a;
+    let start = NODES[n].start;
+    let end = NODES[n].end;
+    let m = new_node(NodeKind::Match, start, end);
+    NODES[m].a = operand;
+    let mark = list_begin();
+    for i in 0..ENUMS[e].variant_count {
+        let v = enum_variant(e, i);
+        let d = VARIANTS[v].discr;
+        let fits = if is_signed(from) {
+            let half = 1 << (int_bits(from) - 1) as u64;
+            int_bits(from) == 64 || (d >= 0 - half && d < half)
+        } else {
+            d >= 0 && (int_bits(from) == 64 || d as u64 <= int_max(from))
+        };
+        if !fits {
+            continue;
+        }
+        let lit = new_node(NodeKind::Int, start, end);
+        NODES[lit].a = if d < 0 { 0 - d } else { d };
+        let mut value = lit;
+        if d < 0 {
+            value = new_node(NodeKind::Unary, start, end);
+            NODES[value].op = Tok::Minus;
+            NODES[value].b = lit;
+        }
+        let pat = new_node(NodeKind::PatLit, start, end);
+        NODES[pat].a = value;
+        let body = new_node(NodeKind::Path, start, end);
+        NODES[body].a = ENUMS[e].name;
+        NODES[body].b = VARIANTS[v].name;
+        let arm = new_node(NodeKind::Arm, start, end);
+        NODES[arm].a = pat;
+        NODES[arm].c = body;
+        list_push(arm);
+    }
+    let name = intern_c(c"__invalid_value");
+    let bind = new_node(NodeKind::PatBind, start, end);
+    NODES[bind].a = name;
+    let value = new_node(NodeKind::Ident, start, end);
+    NODES[value].a = name;
+    let panic = new_node(NodeKind::EnumPanic, start, end);
+    NODES[panic].a = value;
+    NODES[panic].x = enum_panic_kind(e);
+    let arm = new_node(NodeKind::Arm, start, end);
+    NODES[arm].a = bind;
+    NODES[arm].c = panic;
+    list_push(arm);
+    list_end(m, mark);
+    NODES[n] = NODES[m];
+    synth_expr(n)
+}
+
+// `T` as a type node: for casts the checker adds.
+fn type_name_node(t: i64, at: i64) -> i64 {
+    let node = new_node(NodeKind::TyName, NODES[at].start, NODES[at].end);
+    NODES[node].a = intern_c(primitive_name(t));
+    node
+}
+
+fn cast_node(e: i64, t: i64) -> i64 {
+    let c = new_node(NodeKind::Cast, NODES[e].start, NODES[e].end);
+    NODES[c].a = e;
+    NODES[c].b = type_name_node(t, e);
+    c
 }
 
 fn synth_index(n: i64) -> i64 {
@@ -1327,8 +1488,9 @@ fn synth_field(n: i64) -> i64 {
     if TYPES[base_ty].kind == TyKind::Slice {
         NODES[n].y = 2;
         if name == intern_c(c"len") {
+            // i64 (0.4; u64 before): lengths and indices mix without casts.
             NODES[n].x = 1;
-            return TY_U64;
+            return TY_I64;
         }
         if name == intern_c(c"ptr") {
             NODES[n].x = 0;
@@ -1482,6 +1644,23 @@ fn synth_binary(n: i64) -> i64 {
         }
         return ty;
     }
+    if (op == Tok::Lt || op == Tok::Gt || op == Tok::LtEq || op == Tok::GtEq) && is_fieldless_enum(ty) {
+        // 0.4: fieldless enums are ordered by declaration, which must be
+        // the order of their discriminants; compared as their tags.
+        let e = TYPES[ty].a;
+        for i in 1..ENUMS[e].variant_count {
+            if VARIANTS[enum_variant(e, i)].discr <= VARIANTS[enum_variant(e, i - 1)].discr {
+                err_begin(NODES[n].start);
+                err_str(c"'");
+                err_sym(ENUMS[e].name);
+                err_str(c"' cannot be ordered: its discriminants do not increase in declaration order");
+                err_end();
+            }
+        }
+        NODES[n].b = cast_node(lhs, ENUMS[e].tag);
+        NODES[n].c = cast_node(rhs, ENUMS[e].tag);
+        return synth_binary(n);
+    }
     if op == Tok::Lt || op == Tok::Gt || op == Tok::LtEq || op == Tok::GtEq {
         if !(is_numeric(ty) || is_pointer(ty)) {
             type_error_got(n, c"comparison requires numeric type", ty);
@@ -1618,6 +1797,16 @@ fn expr_as_type(e: i64) -> i64 {
 fn synth_call(n: i64) -> i64 {
     let callee = NODES[n].a;
     if NODES[callee].kind == NodeKind::Path {
+        return synth_path_call(n, callee);
+    }
+    if NODES[callee].kind == NodeKind::Ident && lookup_local(NODES[callee].a) < 0
+        && SYM_FN[NODES[callee].a] == 0 && SYM_CONST[NODES[callee].a] == 0
+        && SYM_STATIC[NODES[callee].a] == 0 && used_variant(NODES[callee].a) >= 0 {
+        // `V(a, b)` for a variant brought into scope by `use`.
+        let v = used_variant(NODES[callee].a);
+        NODES[callee].kind = NodeKind::Path;
+        NODES[callee].b = NODES[callee].a;
+        NODES[callee].a = ENUMS[VARIANTS[v].enum_id].name;
         return synth_path_call(n, callee);
     }
     if NODES[callee].kind == NodeKind::Ident && lookup_local(NODES[callee].a) < 0
@@ -2066,7 +2255,7 @@ fn check_while(n: i64) -> i64 {
 fn check_for(n: i64) -> i64 {
     let range = NODES[n].c;
     if NODES[range].kind != NodeKind::Range {
-        type_error(range, c"'for' loops can only iterate over integer ranges ('a..b' or 'a..=b')");
+        return check_for_each(n);
     }
     let start = NODES[range].a;
     let end = NODES[range].b;
@@ -2092,6 +2281,92 @@ fn check_for(n: i64) -> i64 {
     check_loop_body(n, NODES[n].d);
     pop_scope();
     TY_UNIT
+}
+
+// `for p in s` over a slice or an array (0.4), by value:
+//   { let s' = s; for i' in 0..len { let p = s'[i']; body } }
+// The sequence is evaluated once; the loop keeps its label.
+static mut FOR_EACH_COUNT: i64 = 0;
+
+fn check_for_each(n: i64) -> i64 {
+    let seq = NODES[n].c;
+    let seq_ty = synth_expr(seq);
+    let kind = TYPES[seq_ty].kind;
+    if kind != TyKind::Slice && kind != TyKind::Array {
+        type_error_got(seq, c"'for' loops iterate over integer ranges ('a..b'), slices and arrays", seq_ty);
+    }
+    let start = NODES[n].start;
+    let end = NODES[n].end;
+    FOR_EACH_COUNT += 1;
+    let b = buf_new();
+    buf_str(b, c"__for_seq");
+    buf_int(b, FOR_EACH_COUNT);
+    let seq_sym = intern(buf_slice(b));
+    buf_clear(b);
+    buf_str(b, c"__for_index");
+    buf_int(b, FOR_EACH_COUNT);
+    let index_sym = intern(buf_slice(b));
+    // let s' = s;
+    let seq_bind = new_node(NodeKind::PatBind, start, end);
+    NODES[seq_bind].a = seq_sym;
+    let seq_let = new_node(NodeKind::Let, start, end);
+    NODES[seq_let].a = seq_bind;
+    NODES[seq_let].c = seq;
+    // 0..len
+    let zero = new_node(NodeKind::Int, start, end);
+    let len = if kind == TyKind::Slice {
+        let s_ref = new_node(NodeKind::Ident, start, end);
+        NODES[s_ref].a = seq_sym;
+        let field = new_node(NodeKind::FieldAccess, start, end);
+        NODES[field].a = s_ref;
+        NODES[field].b = intern_c(c"len");
+        field
+    } else {
+        let count = new_node(NodeKind::Int, start, end);
+        NODES[count].a = TYPES[seq_ty].b;
+        NODES[count].b = SUF_I64;
+        count
+    };
+    NODES[zero].b = SUF_I64;
+    let range = new_node(NodeKind::Range, start, end);
+    NODES[range].a = zero;
+    NODES[range].b = len;
+    // let p = s'[i'];
+    let s_ref = new_node(NodeKind::Ident, start, end);
+    NODES[s_ref].a = seq_sym;
+    let i_ref = new_node(NodeKind::Ident, start, end);
+    NODES[i_ref].a = index_sym;
+    let elem = new_node(NodeKind::Index, start, end);
+    NODES[elem].a = s_ref;
+    NODES[elem].b = i_ref;
+    let elem_let = new_node(NodeKind::Let, start, end);
+    NODES[elem_let].a = NODES[n].b;
+    NODES[elem_let].c = elem;
+    // The body, after it.
+    let body = new_node(NodeKind::Block, start, end);
+    let mark = list_begin();
+    list_push(elem_let);
+    let old_body = new_node(NodeKind::ExprStmt, start, end);
+    NODES[old_body].a = NODES[n].d;
+    list_push(old_body);
+    list_end(body, mark);
+    // The loop, then the block around it, which takes the loop's place.
+    let index_bind = new_node(NodeKind::PatBind, start, end);
+    NODES[index_bind].a = index_sym;
+    let lp = new_node(NodeKind::For, start, end);
+    NODES[lp] = NODES[n];
+    NODES[lp].b = index_bind;
+    NODES[lp].c = range;
+    NODES[lp].d = body;
+    let outer = new_node(NodeKind::Block, start, end);
+    let mark2 = list_begin();
+    list_push(seq_let);
+    let loop_stmt = new_node(NodeKind::ExprStmt, start, end);
+    NODES[loop_stmt].a = lp;
+    list_push(loop_stmt);
+    list_end(outer, mark2);
+    NODES[n] = NODES[outer];
+    synth_expr(n)
 }
 
 fn check_break(n: i64) {
