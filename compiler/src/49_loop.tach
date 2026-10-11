@@ -22,9 +22,11 @@ static mut LP_COUNT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 static mut LP_BLOCKS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 // Per block id (below LP_NBLOCKS): the innermost loop containing it, + 1.
 static mut LP_OF: *i64 = 0 as *i64;
+static mut LP_OF_CAP: i64 = 0;
 static mut LP_NBLOCKS: i64 = 0;
 // A visit stamp per block id, for walks over the CFG.
 static mut LP_SEEN: *i64 = 0 as *i64;
+static mut LP_SEEN_CAP: i64 = 0;
 static mut LP_STAMP: i64 = 0;
 // Scratch lists.
 static mut LP_LIST: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -77,6 +79,23 @@ fn is_innermost(l: i64) -> bool {
     true
 }
 
+// A per-block array (indexed by block id) kept from call to call: grown
+// to cover every block (the contents are not kept then), with the entries
+// of function fi's blocks set to 0. (Allocating one per call would cost
+// the size of the whole program each time.)
+fn block_array(arr: *i64, cap: *i64, fi: i64) -> *i64 {
+    let mut a = arr;
+    if *cap < BLOCK_COUNT + 1 {
+        free(a as *u8);
+        *cap = (BLOCK_COUNT + 1) * 2;
+        a = alloc_zeroed(*cap * 8) as *i64;
+    }
+    for i in 0..IRFUNCS[fi].blocks.count {
+        a[IRFUNCS[fi].blocks.data[i]] = 0;
+    }
+    a
+}
+
 fn new_stamp() -> i64 {
     LP_STAMP += 1;
     LP_STAMP
@@ -91,12 +110,10 @@ fn analyze_loops(fi: i64) {
     LP_START.count = 0;
     LP_COUNT.count = 0;
     LP_BLOCKS.count = 0;
-    free(LP_OF as *u8);
-    free(LP_SEEN as *u8);
     LP_NBLOCKS = BLOCK_COUNT;
-    LP_OF = alloc_zeroed((BLOCK_COUNT + 1) * 8) as *i64;
-    LP_SEEN = alloc_zeroed((BLOCK_COUNT + 1) * 8) as *i64;
-    LP_STAMP = 0;
+    LP_OF = block_array(LP_OF, &LP_OF_CAP, fi);
+    // (Stamps only grow, so LP_SEEN needs no clearing.)
+    LP_SEEN = block_array(LP_SEEN, &LP_SEEN_CAP, fi);
     let mut work = IntVec { data: 0 as *i64, count: 0, cap: 0 };
     for i in 0..ORDER.count {
         let h = ORDER.data[i];
@@ -787,26 +804,37 @@ fn rotate_var(w: i64, h: i64, pre: i64) -> i64 {
     INSTS[w].mark - 1
 }
 
-// Rotates every loop of fi that can be; returns whether any was.
+// Rotates every loop of fi that can be; returns whether any was. One
+// analysis serves them all: rotation makes no blocks and moves none
+// between loops (a rotated loop's preheader now branches, which no other
+// loop's rotation depends on).
 fn rotate_loops(fi: i64) -> bool {
     ROTATED.count = 0;
+    canonicalize_loops(fi);
     let mut changed = false;
-    for _ in 0..1000 {
-        canonicalize_loops(fi);
-        let mut did = false;
+    // Innermost loops first: an outer loop's rotation then only adds phis
+    // to inner loops already rotated. The phis an updater leaves trivial
+    // go before the next rotation reads its header's phis.
+    let mut depth = 0;
+    for l in 0..loop_count() {
+        if LP_DEPTH.data[l] > depth {
+            depth = LP_DEPTH.data[l];
+        }
+    }
+    while depth >= 1 {
         for l in 0..loop_count() {
-            if loop_header(l) != IRFUNCS[fi].entry && rotate_loop(fi, l) {
-                did = true;
-                break;
+            if LP_DEPTH.data[l] == depth && loop_header(l) != IRFUNCS[fi].entry && rotate_loop(fi, l) {
+                changed = true;
+                resolve_all(fi);
+                remove_trivial_phis(fi);
             }
         }
-        if !did {
-            break;
-        }
-        changed = true;
+        depth -= 1;
+    }
+    if changed {
         resolve_all(fi);
         verify_func(fi, c"loop rotation");
-        // The old header now has the latch as its only predecessor.
+        // The old headers now have their latch as only predecessor.
         simplify_cfg(fi);
     }
     changed
