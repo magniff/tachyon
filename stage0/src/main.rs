@@ -58,6 +58,12 @@ enum Command {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+    /// Print the tokens of a file, one per line (for testing other lexers).
+    #[command(hide = true)]
+    Tokens {
+        /// The source file.
+        file: PathBuf,
+    },
 }
 
 #[derive(Args)]
@@ -300,6 +306,9 @@ fn main() -> ExitCode {
         Command::Run { compile, args } => run(compile, args),
         Command::Check { file } => check(file),
         Command::Clif { compile, output } => clif(compile, output.as_deref()),
+        Command::Tokens { file } => read_source(file).map(|source| {
+            print!("{}", tachyon::dump_tokens(&source));
+        }),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

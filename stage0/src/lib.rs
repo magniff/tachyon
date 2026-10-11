@@ -58,3 +58,48 @@ pub fn compile_to_clif(source: &str, options: &Options) -> Result<String, Vec<Co
     let program = front_end(source)?;
     Ok(backend::cranelift::clif_text(&program, options).map_err(CompilerError::from)?)
 }
+
+// One line per token in a stable format, for comparing the lexer with other
+// implementations (`tachyon tokens`): `<start> <end> <joint> <token>`, where
+// literals print as `int <value> [suffix]`, `float <bits> [suffix]`,
+// `char <value>`, `str <hex bytes>`, `cstr <hex bytes>`, identifiers as
+// `ident <name>`, and keywords and punctuation as their text. A lex error
+// ends the dump with `error <position>`.
+pub fn dump_tokens(source: &str) -> String {
+    use lexer::token::TokenKind;
+    use std::fmt::Write;
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{:02x}", byte)).collect()
+    }
+
+    let mut out = String::new();
+    let tokens = match lexer::Lexer::new(source).tokenize() {
+        Ok(tokens) => tokens,
+        Err(error) => {
+            let _ = writeln!(out, "error {}", error.position);
+            return out;
+        }
+    };
+    for token in tokens {
+        let text = match &token.kind {
+            TokenKind::IntLiteral(value) => format!("int {}", value),
+            TokenKind::SuffixedInt(value, suffix) => format!("int {} {}", value, suffix.name()),
+            TokenKind::FloatLiteral(value) => format!("float {:016x}", value.to_bits()),
+            TokenKind::SuffixedFloat(value, suffix) => {
+                format!("float {:016x} {}", value.to_bits(), suffix.name())
+            }
+            TokenKind::CharLiteral(value) => format!("char {}", value),
+            TokenKind::StringLiteral(bytes) => format!("str {}", hex(bytes)),
+            TokenKind::CStringLiteral(bytes) => format!("cstr {}", hex(bytes)),
+            TokenKind::Ident(name) => format!("ident {}", name),
+            other => other.to_string(),
+        };
+        let _ = writeln!(
+            out,
+            "{} {} {} {}",
+            token.span.start, token.span.end, token.joint as u8, text
+        );
+    }
+    out
+}
