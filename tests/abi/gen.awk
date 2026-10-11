@@ -158,7 +158,7 @@ function c_value(t,    s, i, k, m, n) {
         n = PNF[k, m]
         s = "{ .tag = " m
         if (n > 0) {
-            s = s ", .u = { .v" m " = {"
+            s = s ", .u = { ." PV m " = {"
             for (i = 0; i < n; i++) s = s (i ? ", " : " ") c_leaf(PFT[k, m, i], leaf(PFT[k, m, i]))
             s = s " } }"
         }
@@ -250,7 +250,7 @@ function c_checks(t, e, fk, arg, ind,    i, k, m, n, v) {
         print ind "if (" e ".tag != " m ") fail(" fk ", " arg ");" > CF
         for (i = 0; i < n; i++) {
             v = leaf(PFT[k, m, i])
-            print ind "if (" e ".u.v" m ".f" i " != " c_leaf(PFT[k, m, i], v) ") fail(" fk ", " arg ");" > CF
+            print ind "if (" e ".u." PV m PF i " != " c_leaf(PFT[k, m, i], v) ") fail(" fk ", " arg ");" > CF
         }
         return
     }
@@ -273,7 +273,8 @@ function define_types(    k, i, n, attr, line, m, kind) {
         PNV[k] = 2 + rnd(3)
         line = "enum P" k " {"
         for (m = 0; m < PNV[k]; m++) {
-            PNF[k, m] = rnd(4)
+            # (The first has fields: an enum with fields, a struct in C.)
+            PNF[k, m] = m == 0 ? 1 + rnd(3) : rnd(4)
             line = line (m ? "," : "") " V" m
             if (PNF[k, m] > 0) {
                 line = line "("
@@ -481,8 +482,19 @@ BEGIN {
     # C file includes and the tachyon file imports.
     IMPORT = (import == 1)
     HF = IMPORT ? hfile : CF
+    # Header mode: C uses the header tachyonc --emit-header writes for the
+    # tachyon half (hfile), not declarations of its own.
+    HEADER = (header == 1)
+    if (HEADER) HF = "/dev/null"
+    PV = HEADER ? "V" : "v"
+    PF = HEADER ? "._" : ".f"
     print "#include <stdarg.h>\n#include <stdbool.h>\n#include <stdint.h>\n#include <stdio.h>\n#include <stdlib.h>" > HF
     print "void fail(int f, int a);" > HF
+    if (HEADER) {
+        print "#include <stdarg.h>\n#include <stdbool.h>\n#include <stdint.h>\n#include <stdio.h>\n#include <stdlib.h>" > CF
+        n = split(hfile, parts, "/")
+        print "#include \"" parts[n] "\"" > CF
+    }
     if (IMPORT) {
         n = split(hfile, parts, "/")
         print "#include \"" parts[n] "\"" > CF
