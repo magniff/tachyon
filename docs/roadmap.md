@@ -511,3 +511,44 @@ by 0.5, compiling its own source. All builds print identical output.
 0.5 -O2 code runs about 1.4× faster than the seed's here. The compilers
 themselves are about as fast; the end-to-end build is slower because
 tachyon emits textual assembly (about 1 MB here) that `cc` assembles.
+
+### 0.6
+
+aarch64-macos (Apple silicon, native, idle machine; `bench/run.sh -r 7`;
+"0.5.0" is the previous release at its default level):
+
+| program | 0.5.0 | 0.6 -O0 | 0.6 -O1 | 0.6 -O2 | seed -O | cc -O2 |
+|---|---|---|---|---|---|---|
+| collatz | 292 | 2516 | 293 | 292 | 478 | 293 |
+| fib | 18 | 55 | 21 | 14 | 30 | 14 |
+| interp | 42 | 443 | 79 | 44 | - | 40 |
+| matmul | 28 | 503 | 76 | 27 | 93 | 43 |
+| nbody | 33 | 301 | 33 | 33 | - | 28 |
+| sieve | 61 | 266 | 64 | 64 | 69 | 72 |
+| stencil | 22 | 243 | 22 | 13 | - | 9 |
+| md5 | 73 | 383 | 151 | 74 | 134 | - |
+
+Geometric means: the seed's Cranelift code is 1.88× slower than 0.6 -O2;
+0.6 -O2 is level with clang -O2 over the seven programs with a C version
+(1.006×; stencil, which clang vectorizes, is 1.44×), and 5% faster than
+clang without stencil. fib now matches clang (shrink-wrapping: its base case touches no
+stack); stencil's bounds checks are all proven away (constants from its
+caller, ranges of sums and products). interp is 2% slower than with 0.5.0
+(43 against 44 ms, repeatably): to look at in 0.7. sieve's 61 against 64
+is within the run-to-run noise of this machine for that program.
+
+Compile time (new in the gate from 0.6). The same input for both
+compilers, the 0.6 phase-1 source of the compiler (35,800 lines), to
+assembly, best of 11:
+
+| | -O0 | -O2 |
+|---|---|---|
+| 0.5.0 | 63 ms | 583 ms |
+| 0.6.0 | 38 ms | 466 ms |
+
+The 0.6 compiler building itself (39,200 lines): 42 ms at -O0 and 510 ms
+at -O2 to assembly; 2.6 s to an executable at -O2, of which the system
+assembler takes about 2 s (0.7 writes object files itself). Per phase at
+-O2 (`--time-passes`): the loop passes 27%, register allocation and
+emission 22%, inlining and the simplification after it 16%, the scalar
+pipeline 11%, the interprocedural layer 4.5%, the front end 8%.
