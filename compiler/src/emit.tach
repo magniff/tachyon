@@ -845,6 +845,7 @@ pub fn gen_ir_function(fi: i64) {
         check_allocation(fi);
     }
     layout_frame(fi);
+    shrink_wrap(fi);
     SHORT_BRANCHES = function_size(fi) <= 800;
     find_trivial_jumps();
     layout_emission();
@@ -859,29 +860,21 @@ pub fn gen_ir_function(fi: i64) {
     LABEL_COUNT += ORDER.count;
     EPILOGUE_LABEL = new_label();
     EPILOGUE_USED = false;
-    HAS_FRAME = needs_frame(fi);
-    ir_function_start(fn_symbol_prefix(f), FNS[f].name, fn_is_global(f), HAS_FRAME);
-    if FRAME_TOTAL > 0 {
-        if X86 { x64_frame_reserve(FRAME_TOTAL); } else { a64_frame_reserve(FRAME_TOTAL); }
-        if FRAME_ALIGN > 16 {
-            // The frame is addressed from sp: aligned, its slots are (the
-            // epilogue restores sp from the frame pointer).
-            if X86 {
-                x64_imm(c"andq", 0 - FRAME_ALIGN, c"%rsp");
-            } else {
-                ins(c"mov x16, sp");
-                a64_align_down(16, FRAME_ALIGN);
-                ins(c"mov sp, x16");
-            }
-        }
+    FELL_INTO_EPILOGUE = false;
+    HAS_FRAME = SAVE >= 0;
+    ir_function_start(fn_symbol_prefix(f), FNS[f].name, fn_is_global(f), SAVE == 0);
+    CUR_IN_FRAME = SAVE == 0;
+    if SAVE == 0 {
+        emit_frame_setup();
     }
-    save_callee_saved(false);
     emit_entry_moves(fi);
     for j in 0..EMIT.count {
         emit_ir_block(EMIT.data[j], j);
     }
-    // The epilogue, when a block jumps to it or the last one falls into it.
-    if EPILOGUE_USED || falls_into_epilogue() {
+    // The epilogue, when a block jumps to it or the last one falls into it
+    // (blocks in the frame's region only).
+    if EPILOGUE_USED || FELL_INTO_EPILOGUE {
+        CUR_IN_FRAME = true;
         emit_label(EPILOGUE_LABEL);
         emit_ir_epilogue();
     }
@@ -903,20 +896,18 @@ pub fn gen_ir_function(fi: i64) {
 // Whether a jump to the epilogue was emitted.
 static mut EPILOGUE_USED: bool = false;
 
-// Whether the last block emitted returns by falling into the epilogue.
-fn falls_into_epilogue() -> bool {
-    if EMIT.count == 0 {
-        return false;
-    }
-    let b = EMIT.data[EMIT.count - 1];
-    BLOCKS[b].term == Term::Ret || BLOCKS[b].term == Term::Jump && jump_target(BLOCKS[b].s0) != b
-        && is_duplicable(jump_target(BLOCKS[b].s0))
-}
+// Whether the code emitted last returns, in the frame's region, by
+// falling into the epilogue.
+static mut FELL_INTO_EPILOGUE: bool = false;
 
 // Whether the function being emitted has a frame.
 static mut HAS_FRAME: bool = false;
 
 fn emit_ir_epilogue() {
+    if !CUR_IN_FRAME {
+        ins(c"ret");
+        return;
+    }
     save_callee_saved(true);
     if !HAS_FRAME {
         ins(c"ret");
@@ -930,6 +921,10 @@ fn emit_ir_epilogue() {
 // A return from a block that is not the last: the epilogue itself when it
 // is short (at most 4 registers to restore), else a jump to it.
 fn emit_return() {
+    if !CUR_IN_FRAME {
+        ins(c"ret");
+        return;
+    }
     let mut saved = 0;
     for r in 0..64 {
         if CALLEE_USED[r] != 0 {
@@ -957,18 +952,9 @@ fn function_size(fi: i64) -> i64 {
     n
 }
 
-// Whether function fi needs a frame: it calls, uses the stack (spills,
-// slots, saved registers) or has parameters on the stack. A leaf without
-// any of these leaves sp, the frame pointer and the return address alone.
-fn needs_frame(fi: i64) -> bool {
-    if FRAME_TOTAL > 0 || HAS_CALLS {
-        return true;
-    }
-    for r in 0..64 {
-        if CALLEE_USED[r] != 0 {
-            return true;
-        }
-    }
+// Whether function fi has parameters on the stack (read from the frame
+// pointer: the frame is then set up at its entry).
+fn has_stack_params(fi: i64) -> bool {
     let f = IRFUNCS[fi].f;
     let mut locations: [i64; 64] = [0; 64];
     let mut pieces: [i64; 256] = [0; 256];
@@ -989,6 +975,234 @@ fn needs_frame(fi: i64) -> bool {
         v = INSTS[v].next;
     }
     false
+}
+
+// ---- Shrink-wrapping ----
+//
+// The frame (the saved frame pointer and return address, the reserved
+// area, the saved callee-saved registers) is set up at the start of block
+// SAVE (a layout index): the nearest common dominator of the blocks that
+// need it (a call, a frame slot, a value in a callee-saved register or on
+// the stack, see mark_frame_blocks), moved up the dominator tree out of
+// loops. Its region is the blocks it dominates; a jump out of the region
+// (with critical edges split, only a block ending in a jump leaves it)
+// tears the frame down after the edge's moves, and the blocks outside run
+// without a frame: no path re-enters the region but through SAVE, and
+// SAVE is in no loop, so the frame is set up and torn down at most once.
+// Blocks outside return with a bare `ret`; a block outside that ends in a
+// call that does not return (a panic) links a frame of its own first
+// (x86-64 calls need an aligned stack). SAVE is 0 (the entry) when the frame is set up with the
+// function, -1 when it has none. Functions calling setjmp and the like,
+// realigning their frame or taking parameters on the stack keep theirs
+// at the entry.
+static mut SAVE: i64 = -1;
+// Per layout index: whether the block runs with the frame set up, and its
+// immediate dominator.
+static mut IN_FRAME: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut SW_IDOM: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// Whether the block being emitted runs with the frame set up.
+static mut CUR_IN_FRAME: bool = true;
+
+// Whether block b ends in a call that does not return, passing nothing
+// on the stack (its frame can be its own).
+fn is_noreturn_call_block(b: i64) -> bool {
+    let v = BLOCKS[b].last;
+    BLOCKS[b].term == Term::Unreach && v != 0 && INSTS[v].op.is_call() && call_stack_size(v) == 0
+}
+
+fn sw_intersect(a: i64, b: i64) -> i64 {
+    let mut x = a;
+    let mut y = b;
+    while x != y {
+        while x > y {
+            x = SW_IDOM.data[x];
+        }
+        while y > x {
+            y = SW_IDOM.data[y];
+        }
+    }
+    x
+}
+
+// Whether layout index a dominates layout index x.
+fn sw_dominates(a: i64, x: i64) -> bool {
+    let mut y = x;
+    while y > a {
+        y = SW_IDOM.data[y];
+    }
+    y == a
+}
+
+// Dominators over the layout (a reverse post-order): Cooper, Harvey and
+// Kennedy's iteration.
+fn sw_dominators() {
+    let n = ORDER.count;
+    SW_IDOM.count = 0;
+    for k in 0..n {
+        SW_IDOM.push(if k == 0 { 0 } else { -1 });
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for k in 1..n {
+            let b = ORDER.data[k];
+            let mut idom = -1;
+            for i in 0..BLOCKS[b].preds.count {
+                let pk = BLOCKS[BLOCKS[b].preds.data[i]].order;
+                if pk < 0 || SW_IDOM.data[pk] < 0 {
+                    continue;
+                }
+                idom = if idom < 0 { pk } else { sw_intersect(pk, idom) };
+            }
+            if idom != SW_IDOM.data[k] {
+                SW_IDOM.data[k] = idom;
+                changed = true;
+            }
+        }
+    }
+}
+
+// Whether the frame can be set up at layout index s: s is in no loop, no
+// block of its region leads back to it, and only jumps leave the region.
+fn sw_valid(s: i64) -> bool {
+    if s == 0 {
+        return true;
+    }
+    if LDEPTH.data[s] != 0 {
+        return false;
+    }
+    for k in s..ORDER.count {
+        if !sw_dominates(s, k) {
+            continue;
+        }
+        let b = ORDER.data[k];
+        for i in 0..succ_count(b) {
+            let sk = BLOCKS[succ(b, i)].order;
+            if sk == s || sk < 0 || (!sw_dominates(s, sk) && BLOCKS[b].term != Term::Jump) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+// Tears the frame down (on a jump out of its region): restores the
+// callee-saved registers, sp, the frame pointer and the return address.
+fn emit_frame_teardown() {
+    save_callee_saved(true);
+    if X86 {
+        ins(c"movq %rbp, %rsp");
+        ins(c"popq %rbp");
+    } else {
+        ins(c"mov sp, x29");
+        ins(c"ldp x29, x30, [sp], #16");
+    }
+}
+
+fn shrink_wrap(fi: i64) {
+    let n = ORDER.count;
+    let mut need = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for _ in 0..n {
+        need.push(0);
+    }
+    for k in 0..n {
+        let b = ORDER.data[k];
+        let mut v = BLOCKS[b].first;
+        while v != 0 {
+            let op = INSTS[v].op;
+            if op.is_call() && is_emitted(v) && !(v == BLOCKS[b].last && is_noreturn_call_block(b)) {
+                need.data[k] = 1;
+            }
+            if op == Slot && is_emitted(v) {
+                need.data[k] = 1;
+            }
+            for i in 0..ir_operand_count(v) {
+                let u = ir_operand(v, i);
+                if u != 0 && INSTS[u].op == Slot {
+                    need.data[k] = 1;
+                    if op == Phi {
+                        for j in 0..BLOCKS[b].preds.count {
+                            let pk = BLOCKS[BLOCKS[b].preds.data[j]].order;
+                            if pk >= 0 {
+                                need.data[pk] = 1;
+                            }
+                        }
+                    }
+                }
+            }
+            v = INSTS[v].next;
+        }
+        let cond = BLOCKS[b].cond;
+        if cond != 0 && INSTS[cond].op == Slot {
+            need.data[k] = 1;
+        }
+    }
+    mark_frame_blocks(need.data);
+    let mut any = false;
+    for k in 0..n {
+        if need.data[k] != 0 {
+            any = true;
+        }
+    }
+    if RETURNS_TWICE || FRAME_ALIGN > 16 || has_stack_params(fi) || (FRAME_TOTAL > 0 && !any) {
+        need.data[0] = 1;
+        any = true;
+    }
+    IN_FRAME.count = 0;
+    for _ in 0..n {
+        IN_FRAME.push(0);
+    }
+    SAVE = -1;
+    if any {
+        sw_dominators();
+        let mut s = -1;
+        for k in 0..n {
+            if need.data[k] != 0 {
+                s = if s < 0 { k } else { sw_intersect(s, k) };
+            }
+        }
+        while !sw_valid(s) {
+            s = SW_IDOM.data[s];
+        }
+        SAVE = s;
+        for k in 0..n {
+            if sw_dominates(s, k) {
+                IN_FRAME.data[k] = 1;
+            }
+        }
+    }
+    free(need.data as *u8);
+}
+
+// Links a frame: saves the frame pointer and the return address.
+fn emit_frame_link() {
+    if X86 {
+        ins(c"pushq %rbp");
+        ins(c"movq %rsp, %rbp");
+    } else {
+        ins(c"stp x29, x30, [sp, #-16]!");
+        ins(c"mov x29, sp");
+    }
+}
+
+// Reserves the frame's area, realigns it, saves the callee-saved
+// registers.
+fn emit_frame_setup() {
+    if FRAME_TOTAL > 0 {
+        if X86 { x64_frame_reserve(FRAME_TOTAL); } else { a64_frame_reserve(FRAME_TOTAL); }
+        if FRAME_ALIGN > 16 {
+            // The frame is addressed from sp: aligned, its slots are (the
+            // epilogue restores sp from the frame pointer).
+            if X86 {
+                x64_imm(c"andq", 0 - FRAME_ALIGN, c"%rsp");
+            } else {
+                ins(c"mov x16, sp");
+                a64_align_down(16, FRAME_ALIGN);
+                ins(c"mov sp, x16");
+            }
+        }
+    }
+    save_callee_saved(false);
 }
 
 // The function's label (as the shared emit_function_start writes it), and
@@ -1019,7 +1233,12 @@ fn find_trivial_jumps() {
 
 // Whether block b emits nothing but a jump: no instruction, no move.
 fn is_trivial_jump_now(b: i64) -> bool {
-    if BLOCKS[b].term != Term::Jump || b == IRFUNCS[IRF].entry {
+    if BLOCKS[b].term != Term::Jump || b == IRFUNCS[IRF].entry || BLOCKS[b].order == SAVE {
+        return false;
+    }
+    // A jump out of the frame's region tears the frame down.
+    let sk = BLOCKS[BLOCKS[b].s0].order;
+    if IN_FRAME.data[BLOCKS[b].order] != 0 && (sk < 0 || IN_FRAME.data[sk] == 0) {
         return false;
     }
     let mut v = BLOCKS[b].first;
@@ -1088,7 +1307,7 @@ static mut DUP_DEPTH: i64 = 0;
 
 fn is_duplicable(b: i64) -> bool {
     let term = BLOCKS[b].term;
-    if b == IRFUNCS[IRF].entry || (term != Term::Jump && term != Term::Branch && term != Term::Ret) {
+    if b == IRFUNCS[IRF].entry || BLOCKS[b].order == SAVE || (term != Term::Jump && term != Term::Branch && term != Term::Ret) {
         return false;
     }
     let mut n = 0;
@@ -1108,6 +1327,20 @@ fn is_duplicable(b: i64) -> bool {
 // The code of block b (without its label); `next` is the block emitted
 // after it (0: none, -1: a copy, which nothing follows).
 fn emit_block_code(b: i64, next: i64) {
+    let k = BLOCKS[b].order;
+    let outer = CUR_IN_FRAME;
+    CUR_IN_FRAME = IN_FRAME.data[k] != 0;
+    if SAVE > 0 && k == SAVE {
+        emit_frame_link();
+        emit_frame_setup();
+    } else if !CUR_IN_FRAME && is_noreturn_call_block(b) {
+        emit_frame_link();
+    }
+    emit_block_body(b, next);
+    CUR_IN_FRAME = outer;
+}
+
+fn emit_block_body(b: i64, next: i64) {
     let k = BLOCKS[b].order;
     let start = BSTART.data[k];
     plan_start_moves(b);
@@ -1156,6 +1389,9 @@ fn emit_block_code(b: i64, next: i64) {
             ST_FN[ST_BACK] += ST_FN[ST_MOVES] + ST_FN[ST_SPILLS] + ST_FN[ST_RELOADS] - before;
         }
         let target = jump_target(s);
+        if CUR_IN_FRAME && IN_FRAME.data[BLOCKS[target].order] == 0 {
+            emit_frame_teardown();
+        }
         if target != next {
             if DUP_DEPTH < 2 && is_duplicable(target) {
                 DUP_DEPTH += 1;
@@ -1199,8 +1435,10 @@ fn emit_block_code(b: i64, next: i64) {
         } else if value != 0 {
             use_into(value, end, reg_ret(is_float(INSTS[value].ty)));
         }
-        if next != 0 {
+        if next != 0 || !CUR_IN_FRAME {
             emit_return();
+        } else {
+            FELL_INTO_EPILOGUE = true;
         }
     } else {
         m_trap();
@@ -1347,7 +1585,15 @@ fn switch_compare(op: Cond, ty: i64, r: i64, value: i64, label: i64) {
 }
 
 pub fn fits_cmp_imm(imm: i64) -> bool {
-    if X86 { fits_i32(imm) } else { imm >= 0 && imm < 4096 }
+    // AArch64: cmp #imm, or cmn #-imm for a negative one.
+    if X86 { fits_i32(imm) } else { imm > -4096 && imm < 4096 }
+}
+
+// Whether comparison v (CMP) compares integers with a constant that fits
+// an immediate.
+pub fn is_cmp_imm_operand(v: i64) -> bool {
+    let b = INSTS[v].b;
+    !is_float(INSTS[v].imm2) && b != 0 && INSTS[b].op == Const && fits_cmp_imm(INSTS[b].imm)
 }
 
 // ---- Instructions ----
@@ -1362,6 +1608,16 @@ fn emit_inst(v: i64) {
         let a = operand_reg(INSTS[v].a);
         let r = result_reg(v);
         m_unary(op, INSTS[v].ty, r, a);
+        result_done(v, r);
+    } else if op == Cmp && is_cmp_imm_operand(v) {
+        let ty = INSTS[v].imm2;
+        let a = operand_reg(INSTS[v].a);
+        let r = result_reg(v);
+        if X86 {
+            mx_cmp_imm(INSTS[v].cond, ty, r, a, INSTS[INSTS[v].b].imm);
+        } else {
+            ma_cmp_imm(INSTS[v].cond, ty, r, a, INSTS[INSTS[v].b].imm);
+        }
         result_done(v, r);
     } else if op == Cmp {
         let ty = INSTS[v].imm2;
