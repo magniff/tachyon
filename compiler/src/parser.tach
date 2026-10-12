@@ -229,6 +229,10 @@ fn parse_top_item() {
     if at(Impl) {
         // The functions of an impl block are items of the program.
         parse_impl(false);
+    } else if at(Trait) {
+        let item = parse_trait();
+        mark_public(item, public);
+        list_push(item);
     } else if at(Extern) {
         let mark = SCRATCH.count;
         parse_extern();
@@ -295,12 +299,22 @@ fn parse_item() -> i64 {
 // each function is pushed as an item, marked with the type's name (d) and
 // the type (h); the impl's type parameters come first in its own (g).
 fn parse_impl(public: bool) {
+    let impl_start = cur_start();
     expect(Impl);
     let params = parse_generic_params();
-    let self_type = parse_type();
-    if NODES[self_type].kind != NodeKind::TyName {
+    let mut self_type = parse_type();
+    // `impl Trait for Type` (0.9): any type.
+    let mut trait_name = 0;
+    if eat(For) {
+        trait_name = self_type;
+        if NODES[trait_name].kind != NodeKind::TyName {
+            error_at(NODES[trait_name].start, c"expected a trait's name before 'for'");
+        }
+        self_type = parse_type();
+    } else if NODES[self_type].kind != NodeKind::TyName {
         error_at(NODES[self_type].start, c"impl blocks are for named types (structs and enums)");
     }
+    let fns = SCRATCH.count;
     expect(LBrace);
     while !at(RBrace) && !at(Eof) {
         let attrs_start = cur_start();
@@ -314,15 +328,78 @@ fn parse_impl(public: bool) {
         }
         let f = parse_function();
         NODES[f].p |= flags;
-        NODES[f].d = NODES[self_type].a;
+        NODES[f].d = if NODES[self_type].kind == NodeKind::TyName { NODES[self_type].a } else { UNDERSCORE };
         NODES[f].h = self_type;
         if params != 0 {
             NODES[f].g = merge_generics(params, NODES[f].g);
         }
-        mark_public(f, item_public);
+        // (a trait's methods are as visible as the trait)
+        mark_public(f, item_public || trait_name != 0);
         list_push(f);
     }
     expect(RBrace);
+    if trait_name != 0 {
+        let n = new_node(NodeKind::Impl, impl_start, prev_end());
+        NODES[n].a = trait_name;
+        NODES[n].b = self_type;
+        NODES[n].g = params;
+        let end = SCRATCH.count;
+        let mark = list_begin();
+        for i in fns..end {
+            list_push(SCRATCH.data[i]);
+        }
+        list_end(n, mark);
+        list_push(n);
+    }
+}
+
+// `trait Name { fn m(self: *Self) -> T; fn d(self: *Self) { ... } }` (0.9).
+fn parse_trait() -> i64 {
+    let start = cur_start();
+    expect(Trait);
+    let n = new_node(NodeKind::Trait, start, 0);
+    NODES[n].a = expect_binding_name();
+    if at(Lt) {
+        error_at(cur_start(), c"traits cannot have type parameters (yet)");
+    }
+    expect(LBrace);
+    let mark = list_begin();
+    while !at(RBrace) && !at(Eof) {
+        let attrs_start = cur_start();
+        let flags = parse_fn_attributes();
+        if at(Pub) {
+            error_at(cur_start(), c"the functions of a trait are as visible as the trait: no 'pub'");
+        }
+        if !at(Fn) && !(at(Unsafe) && tok_kind(1) == Fn) {
+            if flags != 0 {
+                error_at(attrs_start, c"#[inline] and #[cold] go before a function");
+            }
+            syntax_error(c"expected 'fn' or '}' in a trait");
+        }
+        let fstart = cur_start();
+        let is_unsafe = eat(Unsafe);
+        expect(Fn);
+        let f = new_node(NodeKind::Fn, fstart, 0);
+        NODES[f].p |= flags;
+        if is_unsafe {
+            NODES[f].p |= FN_UNSAFE;
+        }
+        NODES[f].a = expect_binding_name();
+        NODES[f].g = parse_generic_params();
+        expect(LParen);
+        parse_params(f, false);
+        expect(RParen);
+        NODES[f].b = parse_return_type();
+        if !eat(Semi) {
+            NODES[f].c = parse_block();
+        }
+        NODES[f].end = prev_end();
+        list_push(f);
+    }
+    list_end(n, mark);
+    expect(RBrace);
+    NODES[n].end = prev_end();
+    n
 }
 
 // The parameters of an impl block followed by those of one of its
@@ -355,6 +432,20 @@ fn parse_generic_params() -> i64 {
         let param = new_node(NodeKind::TyName, cur_start(), 0);
         NODES[param].a = expect_binding_name();
         NODES[param].end = prev_end();
+        if eat(Colon) {
+            // Bounds (0.9): `T: Hash + Eq`, a Generics node of trait names.
+            let bounds = new_node(NodeKind::Generics, cur_start(), 0);
+            let bmark = list_begin();
+            loop {
+                list_push(parse_type());
+                if !eat(Plus) {
+                    break;
+                }
+            }
+            list_end(bounds, bmark);
+            NODES[bounds].end = prev_end();
+            NODES[param].h = bounds;
+        }
         for i in mark..SCRATCH.count {
             if NODES[SCRATCH.data[i]].a == NODES[param].a {
                 name_error(NODES[param].start, c"duplicate type parameter '", NODES[param].a, c"'");

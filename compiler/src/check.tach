@@ -23,6 +23,11 @@ use crate::base::{
     recover_leave, report_warning,
 };
 use crate::fixunsafe::{FIX_UNSAFE, note_unsafe_site};
+use crate::traits::{
+    SYM_TRAIT, add_trait, binary_op_trait, bounded_param, bounded_param_of_type,
+    builtin_type_symbol, check_impl_signatures, collect_impls, impl_of_fn, init_traits,
+    negation_call, operator_call, require_in_bounds, std_trait, has_impl,
+};
 use crate::fiximports::report_legacy_imports;
 use crate::lexer::{
     SUF_F32, SUF_I16, SUF_I32, SUF_I64, SUF_I8, SUF_ISIZE, SUF_NONE, SUF_U16, SUF_U32, SUF_U64,
@@ -73,6 +78,7 @@ use crate::ast::NodeKind::{
     Loop, Match, MethodCall, Mod, PatBind, PatLit, PatTuple, PatVariant, PatWild, Path, Range,
     Repeat, Return, Static, Str, Struct, StructLit, Tuple, TupleField, TyArray, TyFn, TyName,
     TyNever, TyPtr, TySlice, TyTuple, TyUnit, TypeAlias, Unary, Unit, Use, VariantLit, While,
+    Impl, Trait,
 };
 
 pub enum Res { None, Local, Const, Static, Fn }
@@ -80,7 +86,11 @@ pub enum Res { None, Local, Const, Static, Fn }
 // `borrow` (0.9): a parameter declared with a pointer type, not `mut`: a
 // borrow of what the caller passed, dereferenced in safe code (see
 // "Unsafe code" below).
-struct Local { name: i64, ty: i64, mutable: bool, is_param: bool, offset: i64, borrow: bool }
+// `tparam` (0.9): the bounded type parameter its declared type names (a
+// parameter `x: T` or `x: *T`), whose bounds its methods come from; 0.
+struct Local {
+    name: i64, ty: i64, mutable: bool, is_param: bool, offset: i64, borrow: bool, tparam: i64,
+}
 
 pub static mut LOCALS: *Local = 0 as *Local;
 pub static mut LOCAL_COUNT: i64 = 0;
@@ -151,6 +161,7 @@ pub fn define_local(name: i64, ty: i64, mutable: bool, is_param: bool) -> i64 {
     let id = LOCAL_COUNT;
     LOCALS[id] = Local {
         name: name, ty: ty, mutable: mutable, is_param: is_param, offset: 0, borrow: false,
+        tparam: 0,
     };
     LOCAL_COUNT += 1;
     ENV.push(id);
@@ -314,6 +325,7 @@ pub fn check_program(program: i64) {
     SELF_TYPE_SYM = intern_c(c"Self");
     SELF_SYM = intern_c(c"self");
     init_modules();
+    init_traits();
     // The declarations, one phase after the other (see collect_phase).
     for phase in 0..PHASE_COUNT {
         collect_phase(phase);
@@ -341,7 +353,7 @@ pub fn check_program(program: i64) {
     finish_program(program);
 }
 
-const PHASE_COUNT: i64 = 12;
+const PHASE_COUNT: i64 = 14;
 
 // One phase of the declarations; its first error ends the checking (the
 // errors of function bodies, checked after, are reported together).
@@ -358,9 +370,11 @@ fn collect_phase(phase: i64) {
             5 => resolve_all_uses(),
             6 => collect_aliases(),
             7 => check_struct_cycles(),
-            8 => collect_methods(),
-            9 => collect_functions(),
-            10 => collect_statics(),
+            8 => collect_impls(),
+            9 => collect_methods(),
+            10 => collect_functions(),
+            11 => check_impl_signatures(),
+            12 => collect_statics(),
             _ => evaluate_consts(),
         }
     } else {
@@ -475,6 +489,9 @@ fn collect_names() {
     for i in 0..NODES[PROGRAM].count {
         let item = child(PROGRAM, i);
         let kind = NODES[item].kind;
+        if kind == Impl {
+            continue;
+        }
         let name = NODES[item].a;
         let m = module_of(item);
         if MODULES[m].is_c {
@@ -500,6 +517,14 @@ fn collect_names() {
                 continue;
             }
             Use => continue,
+            Trait => {
+                if item_node_of(key) != 0 || SYM_PRIMITIVE[name] != 0 {
+                    duplicate_error(item, c"name");
+                }
+                SYM_ITEM[key] = item;
+                add_trait(item, key, m);
+                continue;
+            }
             Mod => {
                 if item_node_of(key) != 0 {
                     duplicate_error(item, c"name");
@@ -592,7 +617,10 @@ fn method_symbol(type_sym: i64, name: i64) -> i64 {
 
 // The symbol of a type with methods.
 fn type_symbol(t: i64) -> i64 {
-    if TYPES[t].kind == TyKind::Struct { STRUCTS[TYPES[t].a].sym } else { ENUMS[TYPES[t].a].sym }
+    if TYPES[t].kind == TyKind::Struct { return STRUCTS[TYPES[t].a].sym; }
+    if TYPES[t].kind == TyKind::Enum { return ENUMS[TYPES[t].a].sym; }
+    // (0.9: a trait's impl for a builtin type)
+    builtin_type_symbol(t)
 }
 
 pub fn new_enum(item: i64, name: i64, sym: i64, module: i64) -> i64 {
@@ -892,13 +920,14 @@ fn collect_methods() {
             FNS[f].display = join_sym(template_name(tpl), c"::", name);
             continue;
         }
-        if NODES[self_node].count == 0 && NODES[self_node].g == 0 && type_name_key(self_node) < 0
+        if NODES[self_node].kind == TyName && NODES[self_node].count == 0 && NODES[self_node].g == 0
+            && type_name_key(self_node) < 0
             && SYM_PRIMITIVE[NODES[self_node].a] == 0 && env_lookup(NODES[self_node].a) == 0 {
             name_error(NODES[item].start, c"impl for unknown type '", NODES[self_node].a, c"'");
         }
         let t = resolve_type(self_node);
         let kind = TYPES[t].kind;
-        if kind != TyKind::Struct && kind != TyKind::Enum {
+        if kind != TyKind::Struct && kind != TyKind::Enum && impl_of_fn(f) < 0 {
             err_begin(NODES[item].start);
             err_str(c"impl blocks are only allowed for structs and enums, not '");
             err_type(t);
@@ -1412,6 +1441,9 @@ pub fn resolve_key(key: i64, name: i64, pos: i64) -> i64 {
         return enum_type(SYM_ENUM[key] - 1);
     }
     if SYM_ALIAS[key] == 0 {
+        if SYM_TRAIT[key] != 0 {
+            name_error(pos, c"'", name, c"' is a trait, not a type (no trait objects: use a type parameter bounded by it, 'T: Trait')");
+        }
         unknown_name_error(pos, c"unknown type '", name);
     }
     resolve_alias(key, pos)
@@ -1466,6 +1498,7 @@ fn check_function(item: i64) {
         if NODES[param].a != UNDERSCORE {
             NODES[param].x = define_local(NODES[param].a, fn_param(f, i), NODES[param].c != 0, true);
             LOCALS[NODES[param].x].borrow = is_borrow_param(param);
+            LOCALS[NODES[param].x].tparam = bounded_param_of_type(NODES[param].b);
         } else {
             NODES[param].x = -1;
         }
@@ -2483,6 +2516,10 @@ fn synth_binary(n: i64) -> i64 {
         return value_ty;
     }
     let ty = synth_operands(lhs, rhs);
+    // (0.9: an operator trait's impl for the type)
+    if binary_op_trait(op, ty) >= 0 {
+        return operator_call(n, ty);
+    }
     if op == Tok::Plus || op == Tok::Minus || op == Tok::Star || op == Tok::Slash || op == Tok::Percent {
         if !is_numeric(ty) {
             type_error_got(n, c"arithmetic operator requires numeric type", ty);
@@ -2564,7 +2601,7 @@ fn synth_binary(n: i64) -> i64 {
 
 // 0 when values of type `ty` can be compared with ==, else a type in it
 // that cannot.
-fn eq_unsupported(ty: i64) -> i64 {
+pub fn eq_unsupported(ty: i64) -> i64 {
     if is_numeric(ty) || ty == TY_BOOL || is_pointer(ty) || is_fn_type(ty) || is_fieldless_enum(ty) {
         return 0;
     }
@@ -2832,6 +2869,10 @@ fn synth_unary(n: i64) -> i64 {
             ty = synth_expr(operand);
         }
         if !is_numeric(ty) {
+            let neg = std_trait(c"Neg");
+            if neg >= 0 && has_impl(neg, ty) {
+                return negation_call(n, ty);
+            }
             type_error_got(n, c"unary '-' requires numeric type", ty);
         }
         return ty;
@@ -3312,6 +3353,12 @@ fn synth_path_call(n: i64, callee: i64) -> i64 {
         return synth_call(n);
     }
     let member = NODES[callee].b;
+    if NODES[callee].count == 0 && t >= 0 {
+        let bp = bounded_param(NODES[callee].a);
+        if bp != 0 {
+            require_in_bounds(bp, member, NODES[callee].start);
+        }
+    }
     if t == -1 {
         let tpl = PATH_TPL;
         if tpl < 0 && template_variant_named(-tpl - 1, member) {
@@ -3402,13 +3449,20 @@ fn synth_method(n: i64) -> i64 {
     let receiver_ty = synth_expr(receiver);
     let mut t = receiver_ty;
     let mut through_pointer = false;
-    if is_pointer(t) && (TYPES[TYPES[t].a].kind == TyKind::Struct || TYPES[TYPES[t].a].kind == TyKind::Enum) {
+    if is_pointer(t) && (TYPES[TYPES[t].a].kind == TyKind::Struct || TYPES[TYPES[t].a].kind == TyKind::Enum
+        || (method_of(t, name) < 0 && method_of(TYPES[t].a, name) >= 0)) {
         t = TYPES[t].a;
         through_pointer = true;
     }
+    // (0.9: a value of a bounded parameter's type has its bounds' methods)
+    if NODES[receiver].kind == Ident && NODES[receiver].res == Res::Local && NODES[receiver].y >= 0
+        && LOCALS[NODES[receiver].y].tparam != 0 {
+        require_in_bounds(LOCALS[NODES[receiver].y].tparam, name, NODES[n].start);
+    }
+    let f0 = method_of(t, name);
     let mut f = -1;
-    if TYPES[t].kind == TyKind::Struct || TYPES[t].kind == TyKind::Enum {
-        f = method_of(t, name);
+    if TYPES[t].kind == TyKind::Struct || TYPES[t].kind == TyKind::Enum || f0 >= 0 {
+        f = f0;
     }
     if f < 0 {
         err_begin(NODES[n].start);

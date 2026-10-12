@@ -356,10 +356,13 @@ matters to agents above all.
 
 - done: `unsafe` blocks and `unsafe fn`, borrows, `warning[unsafe]`,
   `--deny-warnings`, `--allow-unsafe` (bootstrap interface `tachyonc-0.9`),
-  `--fix-unsafe`; std, tests, examples, bench and fuzzers migrated
+  `--fix-unsafe`; std, tests, examples, bench and fuzzers migrated.
+  Traits: declarations with defaults, impls for any type, generic impls
+  with bounds, bounds on functions, structs and enums, coherence,
+  operator traits (Add, Sub, Mul, Div, Neg, Eq, Ord), std's Hash, impls
+  for the primitives and `[u8]`, `HashMap`, `sort`
 - in progress: -
-- remaining: traits (bounds, impls, operator traits, std HashMap and
-  sort); small fixes (const arrays, statics of structs with strings,
+- remaining: small fixes (const arrays, statics of structs with strings,
   line continuations, `Some`/`None` branch inference, cross-compiled C
   imports); e-graph rewriting (only if time allows)
 

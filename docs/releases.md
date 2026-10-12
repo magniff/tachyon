@@ -57,6 +57,14 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   `Buf::push_cstr` are `unsafe fn` (breaking). The tests, examples,
   benchmarks and fuzzers are unsafe-clean, and the test suite compiles
   every case with `--deny-warnings`.
+- **Traits.** `trait` declarations (with default functions), `impl Trait
+  for Type` for any type, generic impls with bounds, bounds `T: Hash +
+  Eq` on functions, structs and enums, checked at instantiation, one impl
+  per trait and type. Static dispatch only (no `dyn`). Operators on user
+  types through std's `Add`, `Sub`, `Mul`, `Div`, `Neg`, `Eq` (before the
+  structural `==`) and `Ord`. std gains `Hash`, impls for the primitives
+  and byte strings, `HashMap<K: Hash + Eq, V>` and `sort`. Unbounded
+  generics are unchanged.
 
 ### What's new in 0.8
 

@@ -60,7 +60,7 @@ item         = [ "pub" ] [ attributes ] [ "pub" ]       (* (0.6) attributes may 
                ( fn_decl | extern_item | struct_decl | union_decl | enum_decl
              | const_decl | static_decl | type_alias
              | import_item | use_item | mod_item )      (* pub, mod: (0.5); import, use: (0.4) *)
-             | impl_block ;
+             | impl_block | trait_decl ;             (* trait, impl Trait for: (0.9) *)
 import_item  = "import" string_lit "as" ident ";" ;     (* (0.4) a C header, see "Importing C headers"; as: (0.5), required (0.8) *)
 use_item     = "use" path "::" "{" use_name { "," use_name } [ "," ] "}" ";"
              | "use" path "::" use_name ";" ;          (* (0.4) variants of an enum; (0.5) paths, as; no "*" (0.8) *)
@@ -71,7 +71,8 @@ path         = ident { "::" ident } ;                  (* crate, self, super, st
 
 fn_decl      = [ "unsafe" ] "fn" ident [ generics ] "(" [ params ] ")" [ "->" type ] block ;
                                                        (* unsafe: (0.9), see "Unsafe code" *)
-generics     = "<" ident { "," ident } [ "," ] ">" ;  (* (0.5) type parameters, see "Generics" *)
+generics     = "<" tparam { "," tparam } [ "," ] ">" ;  (* (0.5) type parameters, see "Generics" *)
+tparam       = ident [ ":" path { "+" path } ] ;       (* bounds: (0.9), see "Traits" *)
 params       = param { "," param } [ "," ] ;
 param        = [ "mut" ] ident ":" type ;              (* "_" ignores the argument *)
 
@@ -94,7 +95,9 @@ union_decl   = "union" ident "{" [ field { "," field } [ "," ] ] "}" ;   (* (0.3
 field        = [ "pub" ] ident ":" type ;              (* pub (0.5): fields are as visible as their struct *)
 enum_decl    = "enum" ident [ generics ] "{" [ variant { "," variant } [ "," ] ] "}" ;   (* (0.3) *)
 variant      = ident [ "(" type { "," type } [ "," ] ")" ] [ "=" expr ] ;  (* "=": fieldless enums only *)
-impl_block   = "impl" [ generics ] type "{" { [ attributes ] [ "pub" ] fn_decl } "}" ;   (* (0.3); generics, a type with arguments: (0.5) *)
+impl_block   = "impl" [ generics ] [ path "for" ] type "{" { [ attributes ] [ "pub" ] fn_decl } "}" ;
+                                                       (* (0.3); generics, a type with arguments: (0.5); a trait's: (0.9) *)
+trait_decl   = "trait" ident "{" { [ attributes ] [ "unsafe" ] "fn" ident [ generics ] "(" [ params ] ")" [ "->" type ] ( ";" | block ) } "}" ;
 
 const_decl   = "const" ident ":" type "=" expr ";" ;   (* integer, float, bool, fieldless enum (0.4) or C string (0.4) *)
 static_decl  = "static" [ "mut" ] ident ":" type "=" expr ";" ;   (* constant initializer *)
@@ -510,8 +513,8 @@ it is written (as in C++ and Zig: there are no bounds; `a > b` is checked
 for each `T` it is used with). Each instantiation with new type arguments
 makes a separate function, struct or enum (*monomorphization*): no boxing,
 no dynamic dispatch, and every optimization applies to the instance.
-Bounded generics (traits) may come later, as a refinement: a program that
-compiles today will keep its meaning.
+Bounded generics (traits) came in 0.9 as a refinement (see "Traits"): a
+program that compiled before keeps its meaning.
 
 Type arguments are written after a type's name (`Vec<i64>`, `Option<*u8>`)
 and, in expressions, after `::` (the "turbofish"): `max::<u8>(a, b)`,
@@ -701,7 +704,8 @@ later). Gone:
   a path names a variant, import the constant by name: `use c::EOF;`.
 
 The prelude stays: a fixed, documented list of names (`Option`, `Some`,
-`None`, `Result`, `Ok`, `Err`, `Vec`, `print`, `println`), not a wildcard.
+`None`, `Result`, `Ok`, `Err`, `Vec`, `print`, `println`), not a wildcard. (0.9 adds
+the traits `Add`, `Sub`, `Mul`, `Div`, `Neg`, `Eq`, `Ord` and `Hash`.)
 
 The errors for the removed forms name their replacement, from what the
 program uses through them: `wildcard imports are not allowed: write 'use
@@ -801,6 +805,81 @@ migrated with `--fix-unsafe`).
 **std.** `panic`, `Buf::push_cstr` and `print_cstr` take C strings, which
 must end with a NUL: they are `unsafe fn` now (breaking). Everything else
 in std is safe and uses unsafe blocks inside.
+
+### Traits
+
+```
+trait Shape {
+    fn area(self: *Self) -> i64;
+    fn describe(self: *Self) {            // a default
+        print("area ");
+        std::print_int(self.area());
+    }
+}
+
+struct Square { side: i64 }
+
+impl Shape for Square {
+    fn area(self: *Square) -> i64 { self.side * self.side }
+}
+
+fn total<T: Shape>(items: [T]) -> i64 { ... }   // bounds
+struct Map<K: Hash + Eq, V> { ... }              // on structs and enums too
+impl<T: Hash> Hash for Pair<T> { ... }           // a generic impl, with bounds
+```
+
+A **trait** declares functions, with `Self` standing for the implementing
+type; a function may have a default body. An **impl** `impl Trait for
+Type { ... }` defines them for a type, any type (`impl Hash for i64`,
+`impl Eq for [u8]`): its functions become the type's methods and
+associated functions, in one namespace with the type's own (a name may
+not be defined twice), and visible wherever the trait is. A function the
+impl leaves out is the trait's default, copied into the impl and checked
+there (in the impl's module, with `Self` the impl's type); one without a
+default must be written. Each function of an impl must be one of the
+trait's, with the trait's signature (`Self` replaced by the type). A
+generic impl, `impl<T: Hash> Hash for Pair<T>`, is for a generic struct or
+enum with the impl's parameters as its arguments, and covers each
+instance whose arguments satisfy its bounds.
+
+**Coherence.** There is at most one impl per trait and type (a generic
+impl counts for all its instances); a second one is an error.
+
+**Bounds.** A type parameter may be bounded, `T: Hash + Eq`, on functions,
+impl blocks, structs and enums. Each instance's type arguments must
+implement the bounds (`the trait 'Hash' is not implemented for 'Thing'`,
+naming the bound). Generic code is still checked per instance (as in
+0.5), and a parameter's bounds also limit it: a function called on a
+value declared with a bounded parameter's type (`x: T`, `p: *T`) or as
+`T::f(...)` must be one of the bounds' (`no function 'hash' in the bounds
+of 'T'`). Unbounded parameters keep 0.5's meaning, so no program written
+for 0.5 to 0.8 changes. Dispatch is static (monomorphization); there are
+no trait objects: a trait is not a type (`dyn` stays reserved), nor are
+there supertraits, associated types or generic traits yet.
+
+**Operators** go through std's traits, in the prelude: `a + b`, `a - b`,
+`a * b`, `a / b` call `add`, `sub`, `mul`, `div` (`Add`, `Sub`, `Mul`,
+`Div`: `fn add(self: Self, other: Self) -> Self`), `-a` calls `neg`
+(`Neg`), `a == b` and `a != b` call `eq(&a, &b)` (`Eq`: `fn eq(self:
+*Self, other: *Self) -> bool`), and `<`, `<=`, `>`, `>=` compare `cmp`'s
+result with 0 (`Ord`: `fn cmp(self: *Self, other: *Self) -> i64`,
+negative, zero or positive). Each operand is evaluated once, left to
+right. A type's own impl takes precedence over 0.6's structural `==`
+(for structs, enums, tuples, arrays and slices); the builtin scalars
+(numbers, `bool`, pointers, functions) always keep their own operators.
+Builtin types implement the operator traits intrinsically, for bounds:
+numbers all of them, every type with `==` `Eq`, numbers, pointers and
+fieldless enums `Ord`. Compound assignment (`+=`) stays numeric.
+
+**std** (0.9): the traits `Add`, `Sub`, `Mul`, `Div`, `Neg`, `Eq`, `Ord`,
+`Hash` (`fn hash(self: *Self) -> u64`), in the prelude; impls of `Eq`,
+`Ord` and `Hash` for the integer types, `bool` and `[u8]` (byte strings:
+by bytes, lexicographically, FNV-1a); `sort<T: Ord>(s: [T])` (in place,
+a heapsort, not stable); and `HashMap<K: Hash + Eq, V>` (open addressing
+with linear probing): `new`, `insert` (returns the old value),
+`get`, `contains`, `remove`, `len`, `is_empty`, `free`, and iteration by
+slot: `slots()`, `key_at(i)` and `value_at(i)` (`None` for an empty
+slot).
 
 ## Importing C headers
 
