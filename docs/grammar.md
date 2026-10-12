@@ -27,7 +27,7 @@ exponent     = ( "e" | "E" ) [ "+" | "-" ] dec_digits ;
 int_suffix   = "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize" ;
 float_suffix = "f32" | "f64" ;
 char_lit     = "'" ( ascii_char | escape ) "'" ;       (* one byte, ASCII only *)
-string_lit   = '"' { char | escape } '"' ;             (* a a [u8] slice (0.6) *)
+string_lit   = '"' { char | escape } '"' ;             (* a [u8] slice (0.6; before, a (*u8, u64) pair) *)
 cstring_lit  = 'c"' { char | escape } '"' ;            (* a NUL-terminated *u8; no NUL inside *)
 escape       = "\n" | "\t" | "\r" | "\0" | "\\" | '\"' | "\'"
              | "\x" hex hex                            (* one byte *)
@@ -38,12 +38,13 @@ escape       = "\n" | "\t" | "\r" | "\0" | "\\" | '\"' | "\'"
 tuple index, so `t.0.1` is `(t.0).1`. A literal must not be followed
 directly by other letters (`3e` and `1foo` are errors).
 
-**Keywords:** `as break const continue else enum extern false fn for if impl
-import in let loop match mut return static struct true type union use while`
-(`import` and `use` since 0.4).
+**Keywords:** `as break const continue defer else enum extern false fn for
+if impl import in let loop match mod mut pub return static struct true type
+union use while` (`import` and `use` since 0.4, `pub` and `mod` since 0.5,
+`defer` since 0.6).
 
-**Reserved** (an error if used): the keywords `trait pub mod super where
-unsafe defer dyn move`, and the tokens `?` `@`. `self` and `Self` are
+**Reserved** (an error if used): the keywords `trait where unsafe dyn
+move`, and the tokens `?` `@`. `self` and `Self` are
 ordinary names, with a meaning in methods (see Items).
 
 A token is *joint* when no whitespace follows it.
@@ -55,7 +56,8 @@ are two `*`.
 
 ```ebnf
 program      = { item } EOF ;
-item         = [ "pub" ] ( fn_decl | extern_item | [ attributes ] ( struct_decl | union_decl | enum_decl )
+item         = [ "pub" ] [ attributes ] [ "pub" ]       (* (0.6) attributes may come before pub *)
+               ( fn_decl | extern_item | struct_decl | union_decl | enum_decl
              | const_decl | static_decl | type_alias
              | import_item | use_item | mod_item )      (* pub, mod: (0.5); import, use: (0.4) *)
              | impl_block ;
@@ -63,7 +65,8 @@ import_item  = "import" string_lit [ "as" ident ] ";" ;   (* (0.4) a C header, s
 use_item     = "use" path "::" ( "*" | "{" use_name { "," use_name } [ "," ] "}" ) ";"
              | "use" path "::" use_name ";" ;          (* (0.4) variants of an enum; (0.5) paths, as *)
 use_name     = ident [ "as" ident ] ;
-mod_item     = "mod" ident ";" ;                       (* (0.5) the module in ident.tach, see "Modules" *)
+mod_item     = "mod" ident ";"                         (* (0.5) the module in ident.tach, see "Modules" *)
+             | "mod" ident "{" { item } "}" ;          (* (0.6) an inline module *)
 path         = ident { "::" ident } ;                  (* crate, self, super, std, modules, an enum *)
 
 fn_decl      = "fn" ident [ generics ] "(" [ params ] ")" [ "->" type ] block ;
@@ -80,7 +83,9 @@ c_params     = "..." | param { "," param } [ "," [ "..." ] ] ;
 c_static     = "static" [ "mut" ] ident ":" type ";" ;
 link_name    = "#" "[" "link_name" "=" string_lit "]" ;   (* (0.4) the C symbol, when not the name *)
 
-attributes   = { "#" "[" "repr" "(" repr { "," repr } ")" "]" } ;    (* (0.3) *)
+attributes   = { "#" "[" attribute "]" } ;
+attribute    = "repr" "(" repr { "," repr } ")"        (* (0.3) structs, unions, enums *)
+             | "inline" [ "(" "never" ")" ] | "cold" ;  (* (0.6) functions *)
 repr         = "C" | "packed" [ "(" int_lit ")" ] | "align" "(" int_lit ")" | int_type ;   (* packed(N): (0.4) *)
 
 struct_decl  = "struct" ident [ generics ] "{" [ field { "," field } [ "," ] ] "}" ;
@@ -88,11 +93,11 @@ union_decl   = "union" ident "{" [ field { "," field } [ "," ] ] "}" ;   (* (0.3
 field        = [ "pub" ] ident ":" type ;              (* pub (0.5): fields are as visible as their struct *)
 enum_decl    = "enum" ident [ generics ] "{" [ variant { "," variant } [ "," ] ] "}" ;   (* (0.3) *)
 variant      = ident [ "(" type { "," type } [ "," ] ")" ] [ "=" expr ] ;  (* "=": fieldless enums only *)
-impl_block   = "impl" [ generics ] type "{" { [ "pub" ] fn_decl } "}" ;   (* (0.3); generics, a type with arguments: (0.5) *)
+impl_block   = "impl" [ generics ] type "{" { [ attributes ] [ "pub" ] fn_decl } "}" ;   (* (0.3); generics, a type with arguments: (0.5) *)
 
 const_decl   = "const" ident ":" type "=" expr ";" ;   (* integer, float, bool, fieldless enum (0.4) or C string (0.4) *)
 static_decl  = "static" [ "mut" ] ident ":" type "=" expr ";" ;   (* constant initializer *)
-type_alias   = "type" ident "=" type ";" ;
+type_alias   = "type" ident [ generics ] "=" type ";" ;   (* generics: (0.6) *)
 ```
 
 Items may refer to each other in any order. Constants and statics are
@@ -116,7 +121,8 @@ receiver first). Inside an impl block, `Self` names the type.
 layout; `#[repr(C, packed)]` packs a struct (or union) without padding,
 `#[repr(C, align(N))]` raises its alignment to N (a power of two up to
 4096; above 16 since 0.5, with stack frames realigned where needed);
-`#[repr(u8)]` (any integer type) sets the tag type of an enum. Any other
+`#[repr(u8)]` (any integer type) sets the tag type of an enum. Functions
+take `#[inline]`, `#[inline(never)]` and `#[cold]` (0.6). Any other
 attribute is an error.
 
 ## Types
@@ -159,6 +165,7 @@ the same types. The patterns of `let` and `for` must match every value
 block       = "{" { stmt } [ expr ] "}" ;
 stmt        = ";"                                      (* empty statement *)
             | "let" pattern [ ":" type ] "=" expr ";"
+            | "defer" ( block [ ";" ] | expr ";" )    (* (0.6) *)
             | block_like [ ";" ]
             | expr ";" ;
 block_like  = block | if_expr | match_expr | loop_expr | while_expr | for_expr ;
@@ -203,11 +210,11 @@ segment     = ident [ "::" type_args ] ;               (* (0.5) the turbofish: m
 field_init  = ident ":" expr ;
 label       = ident ":" ;                             (* only before loop, while, for *)
 
-if_expr     = "if" cond block [ "else" ( block | if_expr ) ] ;
+if_expr     = "if" [ "let" pattern "=" ] cond block [ "else" ( block | if_expr ) ] ;   (* if let: (0.6) *)
 match_expr  = "match" cond "{" { arm } "}" ;          (* (0.3) *)
 arm         = pattern [ "if" expr ] "=>" ( block_like [ "," ] | expr ( "," | before "}" ) ) ;
 loop_expr   = "loop" block ;                          (* its value comes from `break value` *)
-while_expr  = "while" cond block ;
+while_expr  = "while" [ "let" pattern "=" ] cond block ;   (* while let: (0.6) *)
 for_expr    = "for" pattern "in" ( range | expr ) block ;   (* a..b, a..=b; slices and arrays (0.4) *)
 cond        = expr ;                                  (* without struct literals at the top level *)
 ```
@@ -497,7 +504,78 @@ stderr and exit with 101. Its source is `compiler/std/std.tach`.
 
 ### Keywords
 
-`pub` and `mod` are keywords; `super` is no longer reserved.
+`pub` and `mod` are keywords; `super` is no longer reserved. (0.6: `defer`
+too.)
+
+## Additions of 0.6
+
+**String literals** are `[u8]` slices of their bytes, without a
+terminator (they were `(*u8, u64)` tuples, with the same layout: `.0` and
+`.1` become `.ptr` and `.len`). The standard library's `[u8]` functions
+take them directly: `println("hello")`. `c"..."` is still a `*u8` to a
+NUL-terminated copy, for C.
+
+**`if let` and `while let`.** `if let P = e { A } else { B }` is
+`match e { P => { A }, _ => { B } }`: P may be refutable, its bindings are
+in scope in A only; `else if` and `else if let` chain. Without `else` it
+has type `()`, like `if`. `while let P = e { body }` is
+`loop { match e { P => { body }, _ => break } }`, labels, `break` and
+`continue` included.
+
+**`defer`.** `defer expr;` or `defer { ... }` in a block runs the deferred
+statement when control leaves the block: at its end, or by `return`,
+`break` or `continue` (labelled ones too, running the deferred statements
+of every block left). Deferred statements run last first. A value that
+leaves the block (its tail, a returned value, a `break` value) is computed
+before they run, so a deferred statement assigning a variable does not
+change the value already taken from it. A deferred statement sees the
+bindings made before it; it may not `return`, nor `break`/`continue` out
+of itself (loops inside it are fine). Deferred statements do not run when
+the program ends by a failed check (exit 101), `exit`, or a `longjmp` past
+them.
+
+**Function attributes.** `#[inline]`, `#[inline(never)]` and `#[cold]`
+(rarely called) before a function, also in impl blocks: hints for the
+optimizer, which never change what a program does. `#[inline]` and
+`#[inline(never)]` together are an error. Attributes may now come before
+`pub` (`#[repr(C)] pub struct`) as well as after it.
+
+**Structural equality.** `==` and `!=` work on structs, tuples, arrays and
+enums with fields whose parts all have `==`: they compare field by field
+(for enums, the variant, then its fields), floats as floats (so a value
+holding a NaN is not equal to itself). Each operand is evaluated once.
+Unions and slices have no `==`; comparing a type that holds one is an error
+naming it.
+
+**The prelude.** Every module sees `Option`, `Some`, `None`, `Result`,
+`Ok`, `Err`, `Vec`, `print` and `println` (from `std`) without `use`. The
+prelude comes last: the module's own items, its imports, its `*` imports
+and local bindings all shadow it, so programs defining these names keep
+their meaning. The standard library is loaded when a program names one of
+them (or `std`).
+
+**Variants of generic enums by name.** `use Opt::*;` (and the prelude's
+`Some`, `None`, `Ok`, `Err`) brings the variants of a generic enum into
+scope, in expressions, calls and patterns; their type arguments are
+inferred as for `Opt::Som(x)`.
+
+**Name resolution.** A name in a module is, in order: a local binding, the
+module's own item, a name imported by name (`use a::b;`), a name brought
+by a `*` import, the prelude. Two `*` imports may bring different things
+under one name; using that name is then an error (import it by name, or
+write its path), where 0.5 silently took the first.
+
+**Inline modules.** `mod name { items }` declares a child module in place,
+with the same rules as a module in its own file (privacy, `use`, `super`).
+`mod name;` cannot appear inside an inline module.
+
+**Generic type aliases.** `type Pair<T> = (T, T);` takes type arguments
+where it is used (`Pair<i64>`), and generic functions infer theirs through
+it (`fn swap<T>(p: Pair<T>) -> Pair<T>`).
+
+Not in 0.6 (moved to 0.7): const generic lengths (`[T; N]` with `N` a
+parameter); `errno` and other macros that expand to expressions in C
+headers.
 
 ## Importing C headers
 
