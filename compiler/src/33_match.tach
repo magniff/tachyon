@@ -28,13 +28,13 @@ fn check_pat(p: i64, ty: i64) {
     if kind == NodeKind::PatWild {
         return;
     }
-    if kind == NodeKind::PatBind && NODES[p].b == 0 && SYM_CONST[NODES[p].a] == 0
+    if kind == NodeKind::PatBind && NODES[p].b == 0 && scope_const(NODES[p].a) == 0
         && lookup_local(NODES[p].a) < 0 && used_variant(NODES[p].a) >= 0 {
         // A variant brought into scope by `use` (0.4).
         let v = used_variant(NODES[p].a);
         NODES[p].kind = NodeKind::PatVariant;
         NODES[p].b = NODES[p].a;
-        NODES[p].a = ENUMS[VARIANTS[v].enum_id].name;
+        NODES[p].y = enum_type(VARIANTS[v].enum_id);
         NODES[p].c = 0;
         check_pat(p, ty);
         return;
@@ -45,7 +45,7 @@ fn check_pat(p: i64, ty: i64) {
         if v < 0 {
             name_error(NODES[p].start, c"unknown variant '", NODES[p].b, c"' (write 'Enum::Variant', or bring it into scope with 'use Enum::*;')");
         }
-        NODES[p].a = ENUMS[VARIANTS[v].enum_id].name;
+        NODES[p].y = enum_type(VARIANTS[v].enum_id);
         NODES[p].d = 0;
         check_pat(p, ty);
         return;
@@ -54,17 +54,17 @@ fn check_pat(p: i64, ty: i64) {
         variant_range(p, ty);
         return;
     }
-    if kind == NodeKind::PatBind && NODES[p].b == 0 && SYM_CONST[NODES[p].a] != 0
-        && lookup_local(NODES[p].a) < 0 && is_fieldless_enum(CONSTS[SYM_CONST[NODES[p].a] - 1].ty) {
+    if kind == NodeKind::PatBind && NODES[p].b == 0 && scope_const(NODES[p].a) != 0
+        && lookup_local(NODES[p].a) < 0 && is_fieldless_enum(CONSTS[scope_const(NODES[p].a) - 1].ty) {
         // A constant of a fieldless enum: its variant's pattern.
-        let c = SYM_CONST[NODES[p].a] - 1;
+        let c = scope_const(NODES[p].a) - 1;
         let e = TYPES[CONSTS[c].ty].a;
         let value = const_value(c);
         for i in 0..ENUMS[e].variant_count {
             let v = enum_variant(e, i);
             if wrap_int(VARIANTS[v].discr, ENUMS[e].tag) == value {
                 NODES[p].kind = NodeKind::PatVariant;
-                NODES[p].a = ENUMS[e].name;
+                NODES[p].y = enum_type(e);
                 NODES[p].b = VARIANTS[v].name;
                 NODES[p].c = 0;
             }
@@ -74,7 +74,7 @@ fn check_pat(p: i64, ty: i64) {
     }
     if kind == NodeKind::PatBind {
         let name = NODES[p].a;
-        if SYM_CONST[name] != 0 && NODES[p].b == 0 && lookup_local(name) < 0 {
+        if scope_const(name) != 0 && NODES[p].b == 0 && lookup_local(name) < 0 {
             // A constant's name: a literal pattern.
             let e = new_node(NodeKind::Ident, NODES[p].start, NODES[p].end);
             NODES[e].a = name;
@@ -152,8 +152,8 @@ fn check_pat(p: i64, ty: i64) {
 fn variant_range(p: i64, ty: i64) {
     let lo = NODES[p].a;
     let hi = NODES[p].b;
-    let t = resolve_named(NODES[lo].a, NODES[lo].start);
-    if TYPES[t].kind != TyKind::Enum || resolve_named(NODES[hi].a, NODES[hi].start) != t {
+    let t = pattern_enum_type(lo, ty);
+    if TYPES[t].kind != TyKind::Enum || pattern_enum_type(hi, ty) != t {
         type_error(p, c"a variant range needs two variants of the same enum");
     }
     let e = TYPES[t].a;
@@ -171,7 +171,7 @@ fn variant_range(p: i64, ty: i64) {
             name_error(NODES[p].start, c"variant ranges are for variants without fields; '", VARIANTS[v].name, c"' has fields");
         }
         let alt = new_node(NodeKind::PatVariant, NODES[p].start, NODES[p].end);
-        NODES[alt].a = ENUMS[e].name;
+        NODES[alt].y = t;
         NODES[alt].b = VARIANTS[v].name;
         list_push(alt);
     }
@@ -198,8 +198,44 @@ fn check_literal_type(p: i64, ty: i64, what: *u8) {
     }
 }
 
+// The type a variant pattern's enum name stands for: through its module
+// path (h); a generic enum written without arguments stands for the
+// instance being matched.
+fn pattern_enum_type(p: i64, ty: i64) -> i64 {
+    if NODES[p].y != 0 {
+        return NODES[p].y;
+    }
+    let name = NODES[p].a;
+    if NODES[p].h == 0 && (env_lookup(name) != 0 || SYM_PRIMITIVE[name] != 0 || (name == SELF_TYPE_SYM && SELF_TYPE != 0)) {
+        return resolve_named(name, NODES[p].start);
+    }
+    let m = if NODES[p].h != 0 { path_module(NODES[p].h, NODES[NODES[p].h].count) } else { CUR_MOD };
+    let b = lookup_name(m, name, CUR_MOD);
+    if binding_kind(b) == B_PRIVATE {
+        private_error(NODES[p].start, name);
+    }
+    if binding_kind(b) != B_ITEM {
+        unknown_name_error(NODES[p].start, c"unknown type '", name);
+    }
+    let key = binding_value(b);
+    let tpl = template_of_key(key);
+    if tpl != TPL_NONE {
+        if instance_of(ty, tpl) {
+            return ty;
+        }
+        err_begin(NODES[p].start);
+        err_str(c"expected '");
+        err_type(ty);
+        err_str(c"', got a pattern of '");
+        err_sym(name);
+        err_str(c"'");
+        err_end();
+    }
+    resolve_key(key, name, NODES[p].start)
+}
+
 fn check_variant_pattern(p: i64, ty: i64) {
-    let t = resolve_named(NODES[p].a, NODES[p].start);
+    let t = pattern_enum_type(p, ty);
     if TYPES[t].kind != TyKind::Enum {
         err_begin(NODES[p].start);
         err_str(c"'");

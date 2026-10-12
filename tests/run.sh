@@ -1,6 +1,7 @@
 #!/bin/sh
 # The test suite of this release, run with a tachyon compiler (no cargo
-# needed): every tests/run/*.tach and tests/examples/*.test case is
+# needed): every tests/run/*.tach, tests/run/*/main.tach (a program of
+# several modules, 0.5) and tests/examples/*.test case is
 # compiled, assembled and linked with the C compiler, run, and checked.
 # POSIX sh and awk only, so it runs the same on macOS and Linux.
 #
@@ -25,7 +26,9 @@
 #   // EXIT: 3           expected exit code (default 0)
 #   // STDERR: text      stderr contains text, one directive per line
 #   // ERROR: text       compilation must fail (exit code 1) with an error
-#                        containing this text; one directive per message
+#                        containing this text; one directive per message,
+#                        in the order they are reported
+#   // ERROR-COUNT: n    exactly n errors are reported
 #   // XFAIL: reason     a known bug: the case is expected to fail, and
 #                        reported as a failure (XPASS) once it passes
 #   // XFAIL(T): reason  the same, only for target T
@@ -40,6 +43,11 @@
 #   // CHECK-NOT: text   no line containing text between the neighbouring
 #                        CHECKs' lines (or the start and end)
 #   // CHECK-OPT: n      the level for the CHECKs (default 2)
+#   // ASM(T): text      the assembly for target T (at the CHECK-OPT level)
+#                        has a line containing text, after the previous
+#                        ASM(T)'s line; checked only when testing T
+#   // ASM-NOT(T): text  no line containing text between the neighbouring
+#                        ASM(T)s' lines
 # Stdout is compared after removing trailing whitespace. Each program may
 # run for 20 seconds.
 
@@ -125,6 +133,7 @@ read_directives() {
             else if (key == "EXIT") exitcode = value + 0
             else if (key == "STDERR") stderrs = stderrs value "\n"
             else if (key == "ERROR") errors = errors value "\n"
+            else if (key == "ERROR-COUNT") errcount = value
             else if (key == "XFAIL" || key == "XFAIL(" target ")") xfail = value
             else if (key == "SOURCE") source = value
             else if (key == "CSOURCE") csources = csources " " value
@@ -133,6 +142,8 @@ read_directives() {
             else if (key == "CHECK") checks = checks "+" value "\n"
             else if (key == "CHECK-NOT") checks = checks "-" value "\n"
             else if (key == "CHECK-OPT") checkopt = value
+            else if (key == "ASM(" target ")") asms = asms "+" value "\n"
+            else if (key == "ASM-NOT(" target ")") asms = asms "-" value "\n"
         }
         END {
             printf "%s", args > (dir "/args")
@@ -141,12 +152,14 @@ read_directives() {
             printf "%d", exitcode > (dir "/exit")
             printf "%s", stderrs > (dir "/stderrs")
             printf "%s", errors > (dir "/errors")
+            printf "%s", errcount > (dir "/errcount")
             printf "%s", xfail > (dir "/xfail")
             printf "%s", source > (dir "/source")
             printf "%s", csources > (dir "/csources")
             printf "%s", cheader > (dir "/cheader")
             printf "%d", build > (dir "/build")
             printf "%s", checks > (dir "/checks")
+            printf "%s", asms > (dir "/asms")
             printf "%s", (checkopt == "" ? "2" : checkopt) > (dir "/checkopt")
         }
     ' "$1"
@@ -192,13 +205,29 @@ check_case() {
             { echo "expected a compile error (exit code 1), got exit code $rc:"; cat "$dir/compile.out"; } >"$dir/why"
             return 1
         fi
-        while IFS= read -r message; do
-            if ! grep -qF -- "$message" "$dir/compile.out"; then
-                { echo "expected an error containing '$message', got:"; cat "$dir/compile.out"; } >"$dir/why"
+        # Each message, in order (several errors are reported at once).
+        missing=$(awk -v out="$dir/compile.out" '
+            BEGIN { while ((getline line < out) > 0) text[++n] = line }
+            {
+                while (at < n && index(text[at + 1], $0) == 0) at++
+                if (at >= n) { print $0; exit }
+                at++
+            }' "$dir/errors")
+        if [ -n "$missing" ]; then
+            { echo "expected an error containing '$missing' (after the ones before it), got:"; cat "$dir/compile.out"; } >"$dir/why"
+            return 1
+        fi
+        if [ -s "$dir/errcount" ]; then
+            got=$(grep -c '^error\[' "$dir/compile.out")
+            if [ "$got" -ne "$(cat "$dir/errcount")" ]; then
+                { echo "expected $(cat "$dir/errcount") errors, got $got:"; cat "$dir/compile.out"; } >"$dir/why"
                 return 1
             fi
-        done <"$dir/errors"
+        fi
         return 0
+    fi
+    if [ -s "$dir/asms" ] && ! check_asm "$source" "$dir"; then
+        return 1
     fi
     if [ -s "$dir/checks" ] && ! check_ir "$source" "$dir"; then
         return 1
@@ -256,7 +285,27 @@ check_ir() {
         { echo "--emit-ir failed:"; cat "$2/compile.out"; } >"$2/why"
         return 1
     fi
-    awk -v checks="$2/checks" '
+    match_checks "$2/ir.txt" "$2/checks" "$2/check.out" && return 0
+    { cat "$2/check.out"; echo "--- IR:"; cat "$2/ir.txt"; } >"$2/why"
+    return 1
+}
+
+# Matches the ASM directives against the assembly of $1 for the target.
+check_asm() {
+    if ! "$COMPILER" --target "$TARGET" "-O$(cat "$2/checkopt")" "$1" -o "$2/check.s" >"$2/compile.out" 2>&1; then
+        { echo "compile failed:"; cat "$2/compile.out"; } >"$2/why"
+        return 1
+    fi
+    match_checks "$2/check.s" "$2/asms" "$2/check.out" && return 0
+    { cat "$2/check.out"; echo "--- assembly:"; cat "$2/check.s"; } >"$2/why"
+    return 1
+}
+
+# Matches the checks in file $2 (+text: a line containing text, after the
+# previous one; -text: none until the next) against the lines of $1;
+# writes what failed to $3.
+match_checks() {
+    awk -v checks="$2" '
         { line[NR] = $0 }
         END {
             n = 0
@@ -278,9 +327,7 @@ check_ir() {
                 for (j = pos + 1; j <= NR; j++)
                     if (index(line[j], pending[k])) { print "CHECK-NOT found at line " j ": " pending[k]; exit 1 }
         }
-    ' "$2/ir.txt" >"$2/check.out" 2>&1 && return 0
-    { cat "$2/check.out"; echo "--- IR:"; cat "$2/ir.txt"; } >"$2/why"
-    return 1
+    ' "$1" >"$3" 2>&1
 }
 
 # The number of CPUs, for -j.
@@ -306,15 +353,22 @@ run_case() {
     fi >"$dir/status"
 }
 
+# The standard library built into the compiler must be its source's (0.5).
+if [ -x "$ROOT/compiler/std/embed.sh" ] && ! "$ROOT/compiler/std/embed.sh" -c; then
+    exit 1
+fi
+
 # The cases, in order; up to JOBS at once (a FIFO holds the free slots).
 CASES="$WORK/cases"
 : >"$CASES"
-for file in "$ROOT"/tests/run/*.tach "$ROOT"/tests/examples/*.test; do
+for file in "$ROOT"/tests/run/*.tach "$ROOT"/tests/run/*/main.tach "$ROOT"/tests/examples/*.test; do
     [ -f "$file" ] || continue
     base=$(basename "$file")
     name=${base%.*}
     case "$file" in
         *.test) name="example_$name" ;;
+        # A program of several modules: a directory with main.tach (0.5).
+        */main.tach) name=$(basename "$(dirname "$file")") ;;
     esac
     case "$name" in
         *"$FILTER"*) ;;

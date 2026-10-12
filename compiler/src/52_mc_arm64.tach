@@ -2,14 +2,12 @@
 // registers: 0-30 are x0-x30, 31 is sp (as a base or an addition source),
 // 32 + n is d<n> (s<n> for f32).
 //
-// Use of the registers: x0-x7 carry arguments and serve as operand
-// scratch registers (x0-x2) and the result scratch register (x3) between
-// calls; x8 is the result pointer; x9-x15 (caller-saved) and x19-x28
-// (callee-saved) are allocated; x16 holds the callee of indirect calls and
-// is the parallel moves' temporary; x17 breaks parallel move cycles and is
-// the temporary for addresses and constants here; x18 is reserved by the
-// platform. d0-d7 carry arguments and serve as scratch; d8-d15 and
-// d16-d29 are allocated; d30 and d31 are the parallel moves' registers.
+// Use of the registers: x0-x15 (caller-saved; x0-x7 also carry arguments,
+// x8 the result pointer) and x19-x28 (callee-saved) are allocated; x16
+// holds the callee of indirect calls and is the parallel moves' temporary;
+// x17 breaks parallel move cycles and is the temporary for addresses and
+// constants here; x18 is reserved by the platform. d0-d29 are allocated
+// (d8-d15 callee-saved); d30 and d31 are the parallel moves' registers.
 
 fn ma_r(r: i64) {
     if r == 31 {
@@ -143,6 +141,18 @@ fn ma_address(base: i64, offset: i64, size: i64) -> i64 {
 
 fn ma_mem_operand(base: i64, offset: i64) {
     o(c"[");
+    if MEM_INDEX >= 0 {
+        // [base, index, lsl #s] (no offset: see 50_isel.tach).
+        ma_r(base);
+        o(c", ");
+        ma_r(MEM_INDEX);
+        if MEM_SCALE != 0 {
+            o(c", lsl #");
+            oi(MEM_SCALE);
+        }
+        o(c"]");
+        return;
+    }
     if offset < 0 {
         o(c"x17]");
         return;
@@ -156,8 +166,8 @@ fn ma_mem_operand(base: i64, offset: i64) {
 }
 
 fn ma_load(ty: i64, dst: i64, base: i64, offset: i64) {
-    let size = size_of(ty);
-    let at = ma_address(base, offset, size);
+    let size = type_size(ty);
+    let at = if MEM_INDEX >= 0 { 0 } else { ma_address(base, offset, size) };
     o(c"    ");
     if is_float(ty) {
         o(c"ldr ");
@@ -190,8 +200,8 @@ fn ma_load(ty: i64, dst: i64, base: i64, offset: i64) {
 }
 
 fn ma_store(ty: i64, src: i64, base: i64, offset: i64) {
-    let size = size_of(ty);
-    let at = ma_address(base, offset, size);
+    let size = type_size(ty);
+    let at = if MEM_INDEX >= 0 { 0 } else { ma_address(base, offset, size) };
     o(c"    ");
     if is_float(ty) {
         o(c"str ");
@@ -319,6 +329,20 @@ fn ma_int_op(op: Op, ty: i64, d: i64, a: i64, b: i64) {
         }
     }
     ma_normalize(d, ty);
+}
+
+// Whether ma_int_op_imm emits `a <op> imm` (one instruction).
+fn ma_int_imm_ok(op: Op, imm: i64) -> bool {
+    if op == Op::Add || op == Op::Sub {
+        return imm > -4096 && imm < 4096;
+    }
+    if op == Op::Mul {
+        return imm == 3 || imm == 5 || imm == 9;
+    }
+    if op == Op::And || op == Op::Or || op == Op::Xor {
+        return is_logical_imm(imm as u64);
+    }
+    op == Op::Shl || op == Op::Shr
 }
 
 fn ma_int_op_imm(op: Op, ty: i64, d: i64, a: i64, imm: i64) -> bool {
@@ -527,26 +551,19 @@ fn ma_conv(from: i64, to: i64, d: i64, src: i64) {
         ma_f(src, from);
         on();
     } else {
-        // d = value >= 2^63 ? fcvtzu(value) : fcvtzs(value)
+        // d = value >= 2^63 ? fcvtzu(value) : fcvtzs(value); fcvtzs gives
+        // INT64_MAX exactly for those values (no smaller float rounds to
+        // it), the one value whose increment overflows.
         o(c"    fcvtzs x16, ");
         ma_f(src, from);
         on();
         o(c"    fcvtzu x17, ");
         ma_f(src, from);
         on();
-        if from == TY_F32 {
-            a64_load_imm(5, 0x5f000000);
-            ins(c"fmov s7, w5");
-        } else {
-            a64_load_imm(5, 0x43e0000000000000);
-            ins(c"fmov d7, x5");
-        }
-        o(c"    fcmp ");
-        ma_f(src, from);
-        o(if from == TY_F32 { c", s7\n" } else { c", d7\n" });
+        ins(c"cmn x16, #1");
         o(c"    csel ");
         ma_r(d);
-        o(c", x17, x16, ge\n");
+        o(c", x17, x16, vs\n");
     }
     ma_normalize(d, to);
 }
@@ -612,4 +629,155 @@ fn ma_jump_table(r: i64, low: i64, range: i64, default: i64, table: *i64) {
         oi(at);
         on();
     }
+}
+
+// ---- Machine operations of instruction selection (50_isel.tach) ----
+
+// d = c + a * b, or c - a * b.
+fn ma_madd(sub: bool, ty: i64, d: i64, a: i64, b: i64, c: i64) {
+    o(if sub { c"    msub " } else { c"    madd " });
+    ma_r(d);
+    o(c", ");
+    ma_r(a);
+    o(c", ");
+    ma_r(b);
+    o(c", ");
+    ma_r(c);
+    on();
+    ma_normalize(d, ty);
+}
+
+// d = a op (b sh k); `code` is 4 * op + sh (0 lsl, 1 lsr, 2 asr).
+fn ma_shop(code: i64, ty: i64, d: i64, a: i64, b: i64, k: i64) {
+    let op = code / 4;
+    let kind = code % 4;
+    let mnemonic = if op == Op::Add as i64 { c"add" } else if op == Op::Sub as i64 { c"sub" }
+        else if op == Op::And as i64 { c"and" } else if op == Op::Or as i64 { c"orr" } else { c"eor" };
+    ma_rrr(mnemonic, d, a, b);
+    BUFS[CODE].len -= 1;
+    o(if kind == 0 { c", lsl #" } else if kind == 1 { c", lsr #" } else { c", asr #" });
+    oi(k);
+    on();
+    ma_normalize(d, ty);
+}
+
+// d = (a >> k) & (2^n - 1).
+fn ma_ubfx(d: i64, a: i64, k: i64, n: i64) {
+    ma_rr(c"ubfx", d, a);
+    BUFS[CODE].len -= 1;
+    o(c", #");
+    oi(k);
+    o(c", #");
+    oi(n);
+    on();
+}
+
+// Sets the flags from a & b (b < 0: a & mask).
+fn ma_tst(a: i64, b: i64, mask: i64) {
+    if b >= 0 {
+        ma_rr(c"tst", a, b);
+    } else {
+        o(c"    tst ");
+        ma_r(a);
+        o(c", #");
+        oi(mask);
+        on();
+    }
+}
+
+// Jumps to `label` when a & b (b < 0: a & mask) is nonzero, or zero.
+fn ma_test_branch(a: i64, b: i64, mask: i64, if_nonzero: bool, label: i64) {
+    if b < 0 && mask > 0 && (mask & (mask - 1)) == 0 && SHORT_BRANCHES {
+        o(if if_nonzero { c"    tbnz " } else { c"    tbz " });
+        ma_r(a);
+        o(c", #");
+        oi(log2(mask));
+        end_i(c", L", label, c"");
+        return;
+    }
+    ma_tst(a, b, mask);
+    o(if if_nonzero { c"    b.ne L" } else { c"    b.eq L" });
+    oi(label);
+    on();
+}
+
+// d = (lhs op rhs) ? then : other (other + 1 when `increment`), or
+// (lhs & rhs) op 0 when `test` (rhs < 0: the immediate imm); cmp_ty is the
+// type compared, ty the selected; the flags are already set unless
+// `compare`.
+fn ma_select(op: Cond, test: bool, compare: bool, cmp_ty: i64, lhs: i64, rhs: i64, imm: i64, ty: i64, d: i64, then: i64,
+             other: i64, increment: bool) {
+    if !compare {
+    } else if test {
+        ma_tst(lhs, rhs, imm);
+    } else if is_float(cmp_ty) {
+        ma_compare(cmp_ty, lhs, rhs);
+    } else if rhs < 0 {
+        o(c"    cmp ");
+        ma_r(lhs);
+        o(c", #");
+        oi(imm);
+        on();
+    } else {
+        ma_rr(c"cmp", lhs, rhs);
+    }
+    let condition = a64_condition(op, is_signed(cmp_ty), is_float(cmp_ty) && !test);
+    if is_float(ty) {
+        o(c"    fcsel ");
+        ma_f(d, ty);
+        o(c", ");
+        ma_f(then, ty);
+        o(c", ");
+        ma_f(other, ty);
+    } else {
+        o(if increment { c"    csinc " } else { c"    csel " });
+        ma_r(d);
+        o(c", ");
+        ma_r_or_zero(then);
+        o(c", ");
+        ma_r_or_zero(other);
+    }
+    o(c", ");
+    o(condition);
+    on();
+}
+
+// x<r>, or xzr for -1.
+fn ma_r_or_zero(r: i64) {
+    if r < 0 {
+        o(c"xzr");
+    } else {
+        ma_r(r);
+    }
+}
+
+// Stores (or loads) registers r and s at [sp, #offset] and [sp, #offset +
+// 8]: x or d registers alike.
+fn ma_pair(load: bool, r: i64, s: i64, offset: i64) {
+    o(if load { c"    ldp " } else { c"    stp " });
+    if r >= 32 {
+        ma_f(r, TY_F64);
+        o(c", ");
+        ma_f(s, TY_F64);
+    } else {
+        ma_r(r);
+        o(c", ");
+        ma_r(s);
+    }
+    o(c", [sp");
+    if offset != 0 {
+        o(c", #");
+        oi(offset);
+    }
+    o(c"]\n");
+}
+
+// d = sqrt, fabs, floor, ceil, trunc or round (kind 0 to 5) of a.
+fn ma_fmath(kind: i64, ty: i64, d: i64, a: i64) {
+    o(if kind == 0 { c"    fsqrt " } else if kind == 1 { c"    fabs " } else if kind == 2 { c"    frintm " }
+        else if kind == 3 { c"    frintp " } else if kind == 4 { c"    frintz " } else { c"    frinta " });
+    ma_f(d, ty);
+    o(c", ");
+    ma_f(a, ty);
+    on();
 }

@@ -117,10 +117,11 @@ for, it is exact.
   and offsets of every record of 55 to 65 system headers agree with C),
   `tests/abi/run.sh -i` (signatures through `import`) and `-H` (C
   through the emitted header), 1000 signatures per target each.
-- 0.5: `#[repr(C, align(N))]` above 16 (needs realigned stack frames);
-  `import` into a module's namespace; function-like macros that are
-  expressions (as inline functions); `errno` (a macro around a function
-  call: use `*__error()` on macOS, `*__errno_location()` with glibc).
+- 0.5: [x] `#[repr(C, align(N))]` above 16, up to 4096 (realigned stack
+  frames); [x] `import` into a module's namespace (`import "h.h" as c;`, and an
+  `import` in any module); function-like macros that are expressions (as
+  inline functions) and `errno` (a macro around a function call: use
+  `*__error()` on macOS, `*__errno_location()` with glibc) move to 0.6.
 
 ## 0.4: loops
 
@@ -171,20 +172,84 @@ Optimizations, the loop optimizer (design and status in
 
 ## 0.5: backend quality (passing Cranelift)
 
-Language: generics by monomorphization (`fn f<T>`, `struct Vec<T>`),
-modules and imports.
+Language (front end; see grammar.md, "Additions of 0.5"):
 
-- register allocation with live-range splitting and coalescing (SSA-based
-  linear scan with interval splitting, or iterated register coalescing);
-  rematerialization of constants
-- instruction selection by tree-pattern rules (a rule table per target)
-- list scheduling, post-RA peepholes
-- tail calls, frame elision for leaf functions, shrink-wrapping
-- block layout by fall-through and loop structure
+- [x] generics by monomorphization, checked at instantiation:
+  `fn f<T>`, `struct Vec<T>`, `enum Option<T>`, `impl<T> Vec<T>` and
+  methods with type parameters of their own; type arguments written
+  (`Vec<i64>`, `max::<i64>`, `Vec::<u8>::new()`) or inferred from the
+  arguments and the expected type; deterministic instance symbols;
+  errors name the instantiation chain; a depth limit for instantiations
+  that grow forever. Bounded generics (traits) are left for later.
+- [x] modules: a file is a module (`mod m;`), `pub`, paths with `crate`,
+  `self` and `super`, `use a::b::{c, d as e}`, `use a::b::*`, `pub use`;
+  `import "h.h" as c;` names the C declarations' module
+- [x] several errors per compilation (pulled forward from 1.0): the parser
+  and the checker recover at statements, items and functions; errors that
+  follow from an earlier one are not reported
+- [x] a small standard library built into the compiler (`std::Option`,
+  `Result`, `Vec`, `Buf`, printing); a generic hash map waits for traits
+- [x] `size_of` and `align_of` are always the builtins (the compiler's own
+  functions were renamed)
+- not done: const generic array lengths (`[T; N]` with `N` a parameter),
+  generic type aliases, inline modules, `errno` (a macro around a call)
+
+Back end:
+
+The back end, in two stages (design and status in
+[optimizer.md](optimizer.md)). Stage A:
+
+- [x] register allocation by linear scan on SSA form with lifetime holes
+  and interval splitting (Wimmer & Mössenböck 2005, Wimmer & Franz 2010):
+  splits at block boundaries out of loops, eviction by next use weighted
+  by loop depth, phi and argument hints (coalescing), constants and
+  addresses kept in registers and rematerialized instead of spilled, one
+  store per spilled value, shared spill slots; every register but the
+  parallel moves' temporaries allocated (AArch64 x0-x15, x19-x28, d0-d29;
+  x86-64 rax-r9, rbx, r12-r15, xmm0-xmm13); `--verify-regalloc`, a checker
+  simulating the allocation, and `--print-regalloc`
+- [x] frame elision for leaf functions; sibling calls (tail calls to
+  callees taking no stack arguments, at -O2)
+- [x] (stage B1) a tachyon calling convention of its own for plain
+  functions at -O1/-O2: 16 integer and 16 float argument registers on
+  AArch64 (7 and 14 on x86-64), aggregates of up to four pieces passed and
+  returned in registers by their leaves (or 8-byte chunks), results as IR
+  values (`piece`, `pack`) that scalar replacement takes apart; C's
+  convention kept by everything C reaches
+- [x] (stage B1) realigned frames for `#[repr(C, align(N))]` above 16, up
+  to 4096, at every level; C records aligned above 16 import as ordinary
+  types; aggregates copied onto the stack aligned as clang and GCC do
+
+Stage B:
+
+- [x] instruction selection by rules (`50_isel.tach`): a per-target rule
+  table tiling each block's SSA DAG by maximal munch into machine
+  operations the allocator sees like any instruction: scaled-index
+  addressing (AArch64 `[x, x, lsl #s]`, x86-64 `d(b, i, s)`, frame slots
+  from `%rsp`), x86-64's three-operand `lea`, AArch64's `madd`/`msub`,
+  shifted operands, `ubfx`, `tst`/`tbz`/`tbnz`; selects from small
+  diamonds and triangles (`csel`, `csinc`, `fcsel`, `cmov`; one
+  comparison shared by neighbouring selects); the C library's `sqrt` on
+  macOS and `fabs`/`floor`/`ceil`/`trunc`/`round` on AArch64 as
+  instructions; branches on phis threaded into their predecessors, a
+  branch on its predecessor's condition decided
+- [x] block layout (`51_layout.tach`): chains by fall-through from static
+  edge weights (loop depth, back edges, cold panic paths last), and tail
+  duplication of small blocks at emission (threaded dispatch in
+  interpreters, loop rotation by layout), small epilogues inlined
+- [x] post-allocation peepholes: `stp`/`ldp` for callee-saved registers,
+  a move straight back dropped, a reload of what was just stored a move,
+  the argument or result register tried when a hint's register is taken
+- [x] scheduling, two rules before allocation: a branch's comparison
+  last in its block (fused), constants out of loops (made once)
+- moved: unrolling with run-time trip counts to 0.8 (the remainder loop
+  is the loop vectorizer's too), a general list scheduler to 0.9 (with
+  profiles), shrink-wrapping to 0.6
 
 ## 0.6: interprocedural
 
-The compiler's source starts using generics and modules.
+The compiler's source starts using generics, modules and the standard
+library (and reports several errors at once while it is written).
 
 - call graph, bottom-up SCC-ordered inlining with a cost model and an
   inline → simplify iteration
@@ -192,6 +257,8 @@ The compiler's source starts using generics and modules.
   noreturn), dead argument elimination, global DCE
 - function specialization on constant arguments
 - escape analysis: heap-to-stack for non-escaping `malloc`
+- shrink-wrapping (from 0.5): callee-saved registers and the frame only
+  on the paths that need them
 - language: `defer`, `#[inline]` / `#[cold]` attributes
 
 ## 0.7: equality saturation
@@ -206,6 +273,8 @@ The compiler's source starts using generics and modules.
 
 - SLP vectorizer
 - loop vectorizer for counted loops with simple dependences
+- unrolling with run-time trip counts (from 0.5), sharing the vectorizer's
+  remainder loop
 - NEON and SSE2/AVX2 lowering; language-level vector types (`v4f32`, ...)
 
 ## 0.9: profile-guided
@@ -213,6 +282,7 @@ The compiler's source starts using generics and modules.
 - instrumentation profiles (`--profile-generate` / `--profile-use`)
 - branch weights driving inlining, block layout and hot/cold splitting
 - PGO-aware register allocation and unrolling
+- list scheduling (from 0.5) where profiles say a block is hot
 
 ## 1.0: stable
 
@@ -321,3 +391,40 @@ linear-scan allocator cannot keep in one register, which costs a move and a
 jump on one path; that is 0.5's register allocator. stencil is 3× behind
 clang, which vectorizes it (0.8), and keeps bounds checks whose proof needs
 the caller's lengths (0.6).
+### 0.5
+
+aarch64-macos (Apple silicon, native, idle machine; `bench/run.sh -r 7`;
+"0.4.0" is the previous release at its default level):
+
+| program | 0.4.0 | 0.5 -O0 | 0.5 -O1 | 0.5 -O2 | seed -O | cc -O2 |
+|---|---|---|---|---|---|---|
+| collatz | 432 | 2437 | 293 | 292 | 475 | 292 |
+| fib | 18 | 55 | 31 | 17 | 29 | 14 |
+| interp | 56 | 440 | 79 | 44 | - | 40 |
+| matmul | 34 | 495 | 87 | 27 | 94 | 43 |
+| nbody | 35 | 299 | 33 | 32 | - | 28 |
+| sieve | 70 | 263 | 66 | 63 | 69 | 71 |
+| stencil | 26 | 242 | 22 | 22 | - | 9 |
+| md5 | 73 | 381 | 149 | 72 | 132 | - |
+
+Geometric means: the seed's Cranelift code is 1.81× slower than 0.5 -O2
+on the five programs it can build; 0.5 -O2 is 1.11× slower than clang -O2
+on the seven with a C version, and 3% faster without stencil (which clang
+vectorizes: 0.8). collatz now matches clang (a branch-free `tst`/`csinc`
+loop), interp is within 10% (threaded dispatch by tail duplication).
+
+A larger program: release 0.1.0's compiler (7,562 lines, branchy, many
+small functions; its source made acceptable to 0.5 by turning `extern fn`
+into blocks and renaming its `size_of`/`align_of`), built by the seed and
+by 0.5, compiling its own source. All builds print identical output.
+
+| | seed -O | 0.5 -O2 | 0.5 -O0 |
+|---|---|---|---|
+| 30 runs (best of 5, ms; ~38 ms of it is process start) | 230 | 175 | 461 |
+| executable size (bytes) | 207,496 | 243,208 | 306,088 |
+| build time, to an executable (ms) | 71 | 509 | 305 |
+| of which the compiler itself (to `.s`, ms) | - | 83 | - |
+
+0.5 -O2 code runs about 1.4× faster than the seed's here. The compilers
+themselves are about as fast; the end-to-end build is slower because
+tachyon emits textual assembly (about 1 MB here) that `cc` assembles.

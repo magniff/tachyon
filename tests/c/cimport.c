@@ -78,3 +78,15 @@ struct ci_flags ci_flags_make(int count, uint16_t id, float weight) {
 int ci_flags_check(struct ci_flags f, int count, uint16_t id) {
     return f.ready == 1 && f.count == (unsigned)count && f.id == id && f.weight > 0.0f;
 }
+
+struct ci_aligned32 ci_aligned32_make(int32_t v) {
+    struct ci_aligned32 a = { v };
+    return a;
+}
+
+int32_t ci_aligned32_sum(struct ci_aligned32 a, const struct ci_aligned32 *b) {
+    if (((unsigned long)b & 31) != 0) {
+        return -1;
+    }
+    return a.v + 10 * b->v;
+}

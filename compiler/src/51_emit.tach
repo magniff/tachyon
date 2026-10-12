@@ -2,13 +2,15 @@
 // and emits each instruction through the machine layer (m_* below, which
 // dispatches to 52_mc_arm64.tach or 53_mc_x86_64.tach).
 //
-// Operands are fetched into their register; a spilled value is loaded into
-// a scratch register first, a rematerialized one (constants, addresses)
-// computed there. A result goes straight to its register, or through a
-// scratch register into its spill slot. Phis become parallel moves at the
-// end of each predecessor (edges are split, so a predecessor of a block
-// with phis has a single successor); calls move their arguments into
-// place with the same parallel-move resolver.
+// Locations depend on the position (see 50_regalloc.tach): an
+// instruction's operands are where the allocation puts them at its
+// position, its result where it puts it two later. Every operand used in a
+// register is in one; operands that may be anywhere (call arguments, phi
+// operands, returned values) are moved into place by a parallel move, which
+// also emits the allocation's own moves: in the gap before an instruction,
+// and across each edge (at the end of a block with a single successor, or
+// at the start of a block with a single predecessor). A value that goes to
+// the stack is stored once, after its definition.
 //
 // The frame (offsets from sp, which does not move in the body):
 //   [0, out)                 outgoing stack arguments
@@ -25,21 +27,21 @@ static mut SAVE_BASE: i64 = 0;
 static mut FRAME_TOTAL: i64 = 0;
 static mut LABEL_BASE: i64 = 0;
 static mut EPILOGUE_LABEL: i64 = 0;
+// The index register of the next memory operand (-1: none) and its shift
+// (LOADX, STOREX, LEA).
+static mut MEM_INDEX: i64 = -1;
+static mut MEM_SCALE: i64 = 0;
+// Whether the function's branches all reach (AArch64's tbz and tbnz reach
+// 32 KB).
+static mut SHORT_BRANCHES: bool = false;
 
 // ---- Registers of the machine layer ----
 
 fn reg_sp() -> i64 { if X86 { 4 } else { 31 } }
 fn reg_fp() -> i64 { if X86 { 5 } else { 29 } }
-// Scratch registers for operands (never allocated).
-fn reg_scratch(i: i64) -> i64 {
-    if X86 { if i == 0 { 10 } else { 11 } } else { i }
-}
-fn freg_scratch(i: i64) -> i64 { 32 + i }
-// Where a result is computed when its value is spilled.
-fn reg_dst_scratch() -> i64 { if X86 { 0 } else { 3 } }
-fn freg_dst_scratch() -> i64 { if X86 { 32 } else { 34 } }
-// Parallel moves: the register that breaks cycles, and the temporary for
-// memory-to-memory moves.
+// Never allocated: the register that breaks cycles of parallel moves, and
+// the temporary for memory-to-memory moves (and for operands loaded or
+// rematerialized where they are needed).
 fn reg_cycle(float: bool) -> i64 {
     if float { if X86 { 47 } else { 63 } } else if X86 { 10 } else { 17 }
 }
@@ -50,10 +52,42 @@ fn reg_ret(float: bool) -> i64 { if float { 32 } else { 0 } }
 fn reg_result_ptr() -> i64 { if X86 { 7 } else { 8 } }
 fn reg_callee() -> i64 { if X86 { 11 } else { 16 } }
 
-// The register of argument location `location` (see arg_location).
+// Argument locations in the back end, for both conventions (see
+// 41_abi.tach): 0-31 the index of an int argument register, 32-63 of a
+// float one, XL_STACK + offset a slot of the stack argument area (outgoing:
+// from sp; incoming: from the frame pointer, 16 bytes up).
+const XL_FLOAT: i64 = 32;
+const XL_STACK: i64 = 64;
+
+fn xl_is_stack(location: i64) -> bool {
+    location >= XL_STACK
+}
+
+fn xl_offset(location: i64) -> i64 {
+    location - XL_STACK
+}
+
+// A location of the C convention (see arg_location) as a back-end one.
+fn xl_from_c(location: i64) -> i64 {
+    if location < 8 {
+        return location;
+    }
+    if location < 16 {
+        return XL_FLOAT + location - 8;
+    }
+    XL_STACK + location - 16
+}
+
+// The register of argument location `location`: C's argument registers
+// first, then the tachyon convention's further ones.
 fn arg_reg(location: i64) -> i64 {
-    if location >= 8 {
-        return 32 + location - 8;
+    if location >= XL_FLOAT {
+        let index = location - XL_FLOAT;
+        if X86 || index < 8 {
+            return 32 + index;
+        }
+        // d16-d23.
+        return 32 + 8 + index;
     }
     if !X86 {
         return location;
@@ -63,7 +97,48 @@ fn arg_reg(location: i64) -> i64 {
     if location == 2 { return 2; }
     if location == 3 { return 1; }
     if location == 4 { return 8; }
-    9
+    if location == 5 { return 9; }
+    0
+}
+
+// The tachyon convention's argument registers.
+fn t_int_args() -> i64 { if X86 { 7 } else { 16 } }
+fn t_float_args() -> i64 { if X86 { 14 } else { 16 } }
+
+// The location of the next scalar argument of type ty under the tachyon
+// convention: the next register of its class, else the next 8-byte stack
+// slot. `state` as for arg_location.
+fn t_arg_location(ty: i64, state: *i64) -> i64 {
+    if is_float(ty) {
+        if state[1] < t_float_args() {
+            state[1] += 1;
+            return XL_FLOAT + state[1] - 1;
+        }
+    } else if state[0] < t_int_args() {
+        state[0] += 1;
+        return state[0] - 1;
+    }
+    let offset = state[2];
+    state[2] += 8;
+    XL_STACK + offset
+}
+
+// Whether call v follows C's convention.
+fn call_uses_c(v: i64) -> bool {
+    let op = INSTS[v].op;
+    if op == Op::Call { return fn_uses_c(INSTS[v].imm); }
+    if op == Op::CallI { return fn_type_uses_c(INSTS[v].imm); }
+    true
+}
+
+fn call_returns_through_pointer(v: i64) -> bool {
+    conv_returns_through_pointer(call_uses_c(v), callee_result(v))
+}
+
+// The register of the result pointer: x8 / rdi in C's convention, the first
+// argument register in tachyon's.
+fn conv_result_ptr_reg(c: bool) -> i64 {
+    if c { reg_result_ptr() } else { arg_reg(0) }
 }
 
 fn is_float_reg(r: i64) -> bool {
@@ -85,9 +160,27 @@ fn block_label(b: i64) -> i64 {
 
 // ---- Dispatch to the machine layer ----
 
+// Post-allocation peepholes on what was just emitted (nothing else, not
+// even a label, since): a move back to where a value just came from is
+// none, and a load of the spill slot (or stack slot) just stored to is a
+// move from the register stored.
+static mut LAST_MOV_DST: i64 = -1;
+static mut LAST_MOV_SRC: i64 = -1;
+static mut LAST_MOV_END: i64 = -1;
+static mut LAST_STORE_REG: i64 = -1;
+static mut LAST_STORE_OFFSET: i64 = 0;
+static mut LAST_STORE_TYPE: i64 = 0;
+static mut LAST_STORE_END: i64 = -1;
+
 fn m_mov(dst: i64, src: i64, ty: i64) {
     if dst == src { return; }
+    if BUFS[CODE].len == LAST_MOV_END && dst == LAST_MOV_SRC && src == LAST_MOV_DST {
+        return;
+    }
     if X86 { mx_mov(dst, src, ty); } else { ma_mov(dst, src, ty); }
+    LAST_MOV_DST = dst;
+    LAST_MOV_SRC = src;
+    LAST_MOV_END = BUFS[CODE].len;
 }
 fn m_load_imm(dst: i64, value: u64) {
     if X86 { mx_load_imm(dst, value); } else { ma_load_imm(dst, value); }
@@ -96,10 +189,21 @@ fn m_load_fimm(dst: i64, bits: i64, ty: i64) {
     if X86 { mx_load_fimm(dst, bits, ty); } else { ma_load_fimm(dst, bits, ty); }
 }
 fn m_load(ty: i64, dst: i64, base: i64, offset: i64) {
+    if MEM_INDEX < 0 && base == reg_sp() && BUFS[CODE].len == LAST_STORE_END && offset == LAST_STORE_OFFSET
+        && ty == LAST_STORE_TYPE && type_size(ty) == 8 && (dst >= 32) == (LAST_STORE_REG >= 32) {
+        m_mov(dst, LAST_STORE_REG, ty);
+        return;
+    }
     if X86 { mx_load(ty, dst, base, offset); } else { ma_load(ty, dst, base, offset); }
 }
 fn m_store(ty: i64, src: i64, base: i64, offset: i64) {
     if X86 { mx_store(ty, src, base, offset); } else { ma_store(ty, src, base, offset); }
+    if MEM_INDEX < 0 && base == reg_sp() {
+        LAST_STORE_REG = src;
+        LAST_STORE_OFFSET = offset;
+        LAST_STORE_TYPE = ty;
+        LAST_STORE_END = BUFS[CODE].len;
+    }
 }
 fn m_lea(dst: i64, base: i64, offset: i64) {
     if X86 { mx_lea(dst, base, offset); } else { ma_lea(dst, base, offset); }
@@ -152,11 +256,18 @@ fn m_copy(dst: i64, src: i64, size: i64) {
 fn m_div(op: Op, ty: i64, dst: i64, a: i64, b: i64, b_const: i64, b_is_const: bool) {
     if X86 { mx_div(op, ty, dst, a, b, b_const, b_is_const); } else { ma_int_op(op, ty, dst, a, b); }
 }
+// Whether `dst = a <op> imm` is one instruction (m_int_op_imm emits it).
+fn m_int_imm_ok(op: Op, ty: i64, imm: i64) -> bool {
+    if X86 { mx_int_imm_ok(op, imm) } else { ma_int_imm_ok(op, imm) }
+}
 fn m_trap() {
     if X86 { ins(c"ud2"); } else { ins(c"brk #1"); }
 }
 
 // ---- Operands and results ----
+
+// The position of the instruction being emitted.
+static mut CUR_POS: i64 = 0;
 
 // Rematerializes value `v` (is_remat_op) into register `r`.
 fn materialize(v: i64, r: i64) {
@@ -186,15 +297,25 @@ fn materialize(v: i64, r: i64) {
     }
 }
 
-// The register holding value `v`: its own, or `scratch` after loading or
-// rematerializing it there.
-fn use_reg(v: i64, scratch: i64) -> i64 {
+// The register holding value `v`, an operand of the instruction being
+// emitted that needs one.
+fn use_reg(v: i64) -> i64 {
+    let loc = vloc(v, CUR_POS);
+    if loc < 0 || loc >= 64 {
+        die(c"internal error: an operand not in a register");
+    }
+    loc
+}
+
+// Value `v`, used at `pos` where it may be anywhere, in a register: its
+// own, or `scratch` after loading or rematerializing it there.
+fn use_any(v: i64, pos: i64, scratch: i64) -> i64 {
     if INSTS[v].op.is_remat() {
         materialize(v, scratch);
         return scratch;
     }
-    let loc = loc_of(v);
-    if loc == LOC_NONE {
+    let loc = vloc(v, pos);
+    if loc == LOC_NONE || loc == LOC_REMAT {
         die(c"internal error: operand without a location");
     }
     if loc >= 0 {
@@ -204,38 +325,38 @@ fn use_reg(v: i64, scratch: i64) -> i64 {
     scratch
 }
 
-// Value `v` in register `r` exactly.
-fn use_into(v: i64, r: i64) {
-    let got = use_reg(v, r);
+// Value `v` (used at `pos`) in register `r` exactly.
+fn use_into(v: i64, pos: i64, r: i64) {
+    let got = use_any(v, pos, r);
     m_mov(r, got, INSTS[v].ty);
 }
 
-fn int_operand(v: i64, i: i64) -> i64 {
-    use_reg(v, reg_scratch(i))
+fn int_operand(v: i64) -> i64 {
+    use_reg(v)
 }
 
-fn float_operand(v: i64, i: i64) -> i64 {
-    use_reg(v, freg_scratch(i))
+fn float_operand(v: i64) -> i64 {
+    use_reg(v)
 }
 
-fn operand_reg(v: i64, i: i64) -> i64 {
-    if is_float(INSTS[v].ty) { float_operand(v, i) } else { int_operand(v, i) }
+fn operand_reg(v: i64) -> i64 {
+    use_reg(v)
 }
 
 // Where the result of `v` is computed.
 fn result_reg(v: i64) -> i64 {
-    let loc = loc_of(v);
-    if loc >= 0 && loc != LOC_NONE {
-        return loc;
+    let loc = vloc(v, CUR_POS + 2);
+    if loc < 0 || loc >= 64 {
+        die(c"internal error: a result not in a register");
     }
-    if is_float(INSTS[v].ty) { freg_dst_scratch() } else { reg_dst_scratch() }
+    loc
 }
 
-// Stores the result into its spill slot when it has one.
+// Stores the result into its spill slot when it goes to the stack.
 fn result_done(v: i64, r: i64) {
-    let loc = loc_of(v);
-    if loc < 0 {
-        m_store(spill_type(INSTS[v].ty), r, reg_sp(), spill_offset(loc));
+    let t = tracked(v);
+    if t >= 0 && stored_at_def(t) {
+        m_store(spill_type(INSTS[v].ty), r, reg_sp(), spill_offset(0 - (1 + RV_SLOT[t])));
     }
 }
 
@@ -250,34 +371,37 @@ fn const_of(v: i64, value: *i64) -> bool {
 
 // ---- Parallel moves ----
 
-// Pending moves: destination location, source, kind, type. Kinds: a
-// location, a rematerialized value, a stack argument of the caller (the
-// source is an offset from the frame pointer).
+// Pending moves: destination location, kind, source, type, done, the value
+// read and the value written (for the checker). Kinds: a location, a
+// rematerialized value, a stack argument of the caller (the source is an
+// offset from the frame pointer), the address of one.
 const PM_LOC: i64 = 0;
 const PM_REMAT: i64 = 1;
 const PM_STACK: i64 = 2;
-// The address of a stack argument of the caller (an offset from the frame
-// pointer).
 const PM_ADDR: i64 = 3;
+const PM_FIELDS: i64 = 7;
 static mut PM: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
-fn pm_add(dst: i64, kind: i64, src: i64, ty: i64) {
-    if kind == PM_LOC && dst == src {
-        return;
-    }
+// (A move to its own location is kept: for the checker, the location then
+// holds the value written, as a phi takes its operand's register.)
+fn pm_add(dst: i64, kind: i64, src: i64, ty: i64, value: i64, result: i64) {
     PM.push(dst);
     PM.push(kind);
     PM.push(src);
     PM.push(ty);
     // Not done.
     PM.push(0);
+    PM.push(value);
+    PM.push(result);
 }
 
-fn pm_dst(i: i64) -> i64 { PM.data[i * 5] }
-fn pm_kind(i: i64) -> i64 { PM.data[i * 5 + 1] }
-fn pm_src(i: i64) -> i64 { PM.data[i * 5 + 2] }
-fn pm_ty(i: i64) -> i64 { PM.data[i * 5 + 3] }
-fn pm_done(i: i64) -> bool { PM.data[i * 5 + 4] != 0 }
+fn pm_dst(i: i64) -> i64 { PM.data[i * PM_FIELDS] }
+fn pm_kind(i: i64) -> i64 { PM.data[i * PM_FIELDS + 1] }
+fn pm_src(i: i64) -> i64 { PM.data[i * PM_FIELDS + 2] }
+fn pm_ty(i: i64) -> i64 { PM.data[i * PM_FIELDS + 3] }
+fn pm_done(i: i64) -> bool { PM.data[i * PM_FIELDS + 4] != 0 }
+fn pm_value(i: i64) -> i64 { PM.data[i * PM_FIELDS + 5] }
+fn pm_result(i: i64) -> i64 { PM.data[i * PM_FIELDS + 6] }
 
 // Moves location `src` to location `dst` (a value of type `ty`).
 fn move_loc(dst: i64, src: i64, ty: i64) {
@@ -301,7 +425,7 @@ fn move_loc(dst: i64, src: i64, ty: i64) {
 // Whether location `loc` is the source of a pending location move other
 // than move `except`.
 fn pm_is_source(loc: i64, except: i64) -> bool {
-    let n = PM.count / 5;
+    let n = PM.count / PM_FIELDS;
     for j in 0..n {
         if j != except && !pm_done(j) && pm_kind(j) == PM_LOC && pm_src(j) == loc {
             return true;
@@ -312,7 +436,12 @@ fn pm_is_source(loc: i64, except: i64) -> bool {
 
 // Emits every pending move, then clears them.
 fn pm_resolve() {
-    let n = PM.count / 5;
+    let n = PM.count / PM_FIELDS;
+    for i in 0..n {
+        if pm_kind(i) == PM_LOC && pm_dst(i) == pm_src(i) {
+            PM.data[i * PM_FIELDS + 4] = 1;
+        }
+    }
     loop {
         let mut pending = false;
         let mut progress = false;
@@ -323,7 +452,7 @@ fn pm_resolve() {
             pending = true;
             if !pm_is_source(pm_dst(i), i) {
                 move_loc(pm_dst(i), pm_src(i), pm_ty(i));
-                PM.data[i * 5 + 4] = 1;
+                PM.data[i * PM_FIELDS + 4] = 1;
                 progress = true;
             }
         }
@@ -347,7 +476,7 @@ fn pm_resolve() {
         move_loc(temp, d, pm_ty(i));
         for j in 0..n {
             if !pm_done(j) && pm_kind(j) == PM_LOC && pm_src(j) == d {
-                PM.data[j * 5 + 2] = temp;
+                PM.data[j * PM_FIELDS + 2] = temp;
             }
         }
     }
@@ -372,27 +501,62 @@ fn pm_resolve() {
     PM.count = 0;
 }
 
-// Adds the move of value `v` into location `dst`.
-fn pm_add_value(dst: i64, v: i64) {
+// Adds the move of value `v` (where it is at `pos`) into location `dst`.
+fn pm_add_value(dst: i64, v: i64, pos: i64) {
     if INSTS[v].op.is_remat() {
-        pm_add(dst, PM_REMAT, v, INSTS[v].ty);
+        pm_add(dst, PM_REMAT, v, INSTS[v].ty, v, v);
     } else {
-        pm_add(dst, PM_LOC, loc_of(v), INSTS[v].ty);
+        pm_add(dst, PM_LOC, vloc(v, pos), INSTS[v].ty, v, v);
     }
 }
 
 // ---- Functions ----
 
 // Assigns the frame offsets (after register allocation).
+// Whether the function being emitted calls anything.
+static mut HAS_CALLS: bool = false;
+
+// The alignment of the frame (above 16: sp is realigned in the prologue,
+// for slots, and stack arguments, aligned above 16).
+static mut FRAME_ALIGN: i64 = 16;
+
 fn layout_frame(fi: i64) {
     FRAME_OUT = 0;
+    FRAME_ALIGN = 16;
+    HAS_CALLS = false;
+    USES_SLOTS = false;
+    // Slots no instruction refers to any more (scalar replacement took
+    // them apart) get no room: offset -1.
+    for i in 0..IRFUNCS[fi].slots.count {
+        SLOTS[IRFUNCS[fi].slots.data[i]].offset = -1;
+    }
     for i in 0..ORDER.count {
         let mut v = BLOCKS[ORDER.data[i]].first;
         while v != 0 {
+            if INSTS[v].op.is_call() && is_emitted(v) {
+                HAS_CALLS = true;
+            }
+            if INSTS[v].op == Op::Slot && USES[v] > 0 {
+                SLOTS[INSTS[v].imm].offset = 0;
+                USES_SLOTS = true;
+            }
             if INSTS[v].op.is_call() {
                 let size = call_stack_size(v);
                 if size > FRAME_OUT {
                     FRAME_OUT = size;
+                }
+                if INSTS[v].op != Op::CallC {
+                    for k in 0..callee_param_count(v) {
+                        FRAME_ALIGN = max_i64(FRAME_ALIGN, type_align(callee_param(v, k)));
+                    }
+                }
+                // Aggregates passed to `...` (their first piece carries the
+                // type, negated).
+                for k in 0..INSTS[v].nargs {
+                    let declared = ARGTY.data[INSTS[v].args + k];
+                    if declared < 0 && declared != VARIADIC_PIECE {
+                        FRAME_ALIGN = max_i64(FRAME_ALIGN, type_align(0 - declared));
+                    }
                 }
             }
             v = INSTS[v].next;
@@ -412,47 +576,84 @@ fn layout_frame(fi: i64) {
     }
     for i in 0..IRFUNCS[fi].slots.count {
         let s = IRFUNCS[fi].slots.data[i];
+        if SLOTS[s].offset < 0 {
+            continue;
+        }
         offset = align_to(offset, SLOTS[s].align);
         SLOTS[s].offset = offset;
         offset += SLOTS[s].size;
+        FRAME_ALIGN = max_i64(FRAME_ALIGN, SLOTS[s].align);
     }
     FRAME_TOTAL = align_to(offset, 16);
 }
 
-// Saves (or restores) the callee-saved registers used.
+// Saves (or restores) the callee-saved registers used: on AArch64 two at
+// a time (stp, ldp) when they are of one kind.
 fn save_callee_saved(restore: bool) {
     let mut offset = SAVE_BASE;
+    let mut pending = -1;
     for r in 0..64 {
         if CALLEE_USED[r] == 0 {
             continue;
         }
-        let ty = if r >= 32 { TY_F64 } else { TY_U64 };
-        if restore {
-            m_load(ty, r, reg_sp(), offset);
+        if !X86 && pending >= 0 && (pending >= 32) == (r >= 32) && offset - 8 <= 504 {
+            ma_pair(restore, pending, r, offset - 8);
+            pending = -1;
         } else {
-            m_store(ty, r, reg_sp(), offset);
+            if pending >= 0 {
+                save_one(restore, pending, offset - 8);
+            }
+            pending = r;
         }
         offset += 8;
     }
+    if pending >= 0 {
+        save_one(restore, pending, offset - 8);
+    }
 }
 
-// The C convention's location of each parameter of function `f`: of
+fn save_one(restore: bool, r: i64, offset: i64) {
+    let ty = if r >= 32 { TY_F64 } else { TY_U64 };
+    if restore {
+        m_load(ty, r, reg_sp(), offset);
+    } else {
+        m_store(ty, r, reg_sp(), offset);
+    }
+}
+
+// The location of each parameter of function `f` (by its convention): of
 // parameter i at locations[i], or of its pieces at pieces[4 * i + k] (see
 // 41_abi.tach).
 fn param_locations(f: i64, locations: *i64, pieces: *i64) {
-    let mut state: [i64; 3] = [first_int_arg(FNS[f].ret), 0, 0];
+    let c = fn_uses_c(f);
+    let ret = FNS[f].ret;
+    let first = if c { first_int_arg(ret) } else if conv_returns_through_pointer(false, ret) { 1 } else { 0 };
+    let mut state: [i64; 3] = [first, 0, 0];
     for i in 0..FNS[f].param_count {
         let ty = fn_param(f, i);
         if is_void(ty) {
             continue;
         }
-        let kind = abi_classify(ty);
+        let kind = conv_classify(c, ty);
+        if !c {
+            if kind == AbiClass::Pieces {
+                for k in 0..ABI_PIECE_COUNT {
+                    pieces[4 * i + k] = t_arg_location(ABI_PIECE_TY[k], &state as *i64);
+                }
+            } else {
+                locations[i] = t_arg_location(if kind == AbiClass::Ref { TY_U64 } else { scalar_type(ty) }, &state as *i64);
+            }
+            continue;
+        }
         if kind == AbiClass::Pieces {
             abi_piece_locations(ty, &state as *i64, &pieces[4 * i]);
+            for k in 0..ABI_PIECE_COUNT {
+                pieces[4 * i + k] = xl_from_c(pieces[4 * i + k]);
+            }
         } else if kind == AbiClass::Stack {
-            locations[i] = abi_stack_location(ty, &state as *i64);
+            locations[i] = xl_from_c(abi_stack_location(ty, &state as *i64));
         } else {
-            locations[i] = arg_location(if kind == AbiClass::Ref { TY_U64 } else { scalar_type(ty) }, &state as *i64);
+            locations[i] = xl_from_c(arg_location(if kind == AbiClass::Ref { TY_U64 } else { scalar_type(ty) }, &state as *i64));
         }
     }
 }
@@ -469,37 +670,50 @@ fn emit_entry_moves(fi: i64) {
     let entry = IRFUNCS[fi].entry;
     let mut v = BLOCKS[entry].first;
     while v != 0 {
-        if INSTS[v].op == Op::Param && loc_of(v) != LOC_NONE {
+        let loc = vloc(v, 0);
+        if INSTS[v].op == Op::Param && loc != LOC_NONE {
             let ty = INSTS[v].ty;
             let index = INSTS[v].imm;
             let piece = INSTS[v].imm2;
             if index < 0 {
-                pm_add(loc_of(v), PM_LOC, reg_result_ptr(), TY_U64);
+                pm_add(loc, PM_LOC, conv_result_ptr_reg(fn_uses_c(f)), TY_U64, 0, v);
             } else {
                 let location = if piece > 0 { pieces[4 * index + piece - 1] } else { locations[index] };
+                // Stack arguments are 16 bytes above the frame pointer.
                 if piece < 0 {
-                    pm_add(loc_of(v), PM_ADDR, location, TY_U64);
-                } else if location >= 16 {
+                    pm_add(loc, PM_ADDR, 16 + xl_offset(location), TY_U64, 0, v);
+                } else if xl_is_stack(location) {
                     let param_ty = fn_param(f, index);
                     let load_ty = if is_compound(param_ty) && piece == 0 { TY_U64 } else { ty };
-                    pm_add(loc_of(v), PM_STACK, location, load_ty);
+                    pm_add(loc, PM_STACK, 16 + xl_offset(location), load_ty, 0, v);
                 } else {
-                    pm_add(loc_of(v), PM_LOC, arg_reg(location), ty);
+                    pm_add(loc, PM_LOC, arg_reg(location), ty, 0, v);
                 }
             }
         }
         v = INSTS[v].next;
     }
     pm_resolve();
-    // Narrow integers from C callers may carry garbage above their width.
+    // Narrow integers from C callers may carry garbage above their width;
+    // parameters that go to the stack are stored there.
     v = BLOCKS[entry].first;
     while v != 0 {
         let ty = INSTS[v].ty;
-        if INSTS[v].op == Op::Param && loc_of(v) != LOC_NONE && INSTS[v].imm >= 0
-            && (ty == TY_BOOL || (is_integer(ty) && int_bits(ty) < 64)) {
-            let r = use_reg(v, reg_scratch(0));
-            m_normalize(r, if ty == TY_BOOL { TY_U8 } else { ty });
-            result_done(v, r);
+        let t = tracked(v);
+        if INSTS[v].op == Op::Param && t >= 0 {
+            let narrow = INSTS[v].imm >= 0 && (ty == TY_BOOL || (is_integer(ty) && int_bits(ty) < 64));
+            let loc = tloc(t, 0);
+            if loc >= 0 {
+                if narrow {
+                    m_normalize(loc, if ty == TY_BOOL { TY_U8 } else { ty });
+                }
+                result_done(v, loc);
+            } else if narrow {
+                let r = reg_move_temp(false);
+                m_load(TY_U64, r, reg_sp(), spill_offset(loc));
+                m_normalize(r, if ty == TY_BOOL { TY_U8 } else { ty });
+                m_store(TY_U64, r, reg_sp(), spill_offset(loc));
+            }
         }
         v = INSTS[v].next;
     }
@@ -509,55 +723,202 @@ fn gen_ir_function(fi: i64) {
     IRF = fi;
     let f = IRFUNCS[fi].f;
     allocate_registers(fi);
+    if VERIFY_REGALLOC {
+        check_allocation(fi);
+    }
     layout_frame(fi);
+    SHORT_BRANCHES = function_size(fi) <= 800;
+    find_trivial_jumps();
+    layout_emission();
     buf_clear(CODE);
+    // The peepholes' memory of what was just emitted belongs to the code of
+    // the function before (whose length the new one's may match).
+    LAST_MOV_END = -1;
+    LAST_STORE_END = -1;
+    LAST_SELECT = 0;
+    LAST_SELECT_END = -1;
     LABEL_BASE = LABEL_COUNT + 1;
     LABEL_COUNT += ORDER.count;
     EPILOGUE_LABEL = new_label();
-    emit_function_start(fn_symbol_prefix(f), FNS[f].name, fn_is_global(f));
+    EPILOGUE_USED = false;
+    HAS_FRAME = needs_frame(fi);
+    ir_function_start(fn_symbol_prefix(f), FNS[f].name, fn_is_global(f), HAS_FRAME);
     if FRAME_TOTAL > 0 {
         if X86 { x64_frame_reserve(FRAME_TOTAL); } else { a64_frame_reserve(FRAME_TOTAL); }
+        if FRAME_ALIGN > 16 {
+            // The frame is addressed from sp: aligned, its slots are (the
+            // epilogue restores sp from the frame pointer).
+            if X86 {
+                x64_imm(c"andq", 0 - FRAME_ALIGN, c"%rsp");
+            } else {
+                ins(c"mov x16, sp");
+                a64_align_down(16, FRAME_ALIGN);
+                ins(c"mov sp, x16");
+            }
+        }
     }
     save_callee_saved(false);
     emit_entry_moves(fi);
-    for k in 0..ORDER.count {
-        if !is_skipped(ORDER.data[k]) {
-            emit_ir_block(ORDER.data[k], k);
-        }
+    for j in 0..EMIT.count {
+        emit_ir_block(EMIT.data[j], j);
     }
-    emit_label(EPILOGUE_LABEL);
-    save_callee_saved(true);
-    if X86 { x64_epilogue(); } else { a64_epilogue(); }
+    // The epilogue, when a block jumps to it or the last one falls into it.
+    if EPILOGUE_USED || falls_into_epilogue() {
+        emit_label(EPILOGUE_LABEL);
+        emit_ir_epilogue();
+    }
     buf_bytes(ASM, buf_slice(CODE));
 }
 
-// Whether block b emits nothing but a jump: no instruction, and the moves
-// into its successor's phis are all no-ops.
-fn is_trivial_jump(b: i64) -> bool {
-    if BLOCKS[b].term != Term::Jump {
+// Whether a jump to the epilogue was emitted.
+static mut EPILOGUE_USED: bool = false;
+
+// Whether the last block emitted returns by falling into the epilogue.
+fn falls_into_epilogue() -> bool {
+    if EMIT.count == 0 {
+        return false;
+    }
+    let b = EMIT.data[EMIT.count - 1];
+    BLOCKS[b].term == Term::Ret || BLOCKS[b].term == Term::Jump && jump_target(BLOCKS[b].s0) != b
+        && is_duplicable(jump_target(BLOCKS[b].s0))
+}
+
+// Whether the function being emitted has a frame.
+static mut HAS_FRAME: bool = false;
+
+fn emit_ir_epilogue() {
+    save_callee_saved(true);
+    if !HAS_FRAME {
+        ins(c"ret");
+    } else if X86 {
+        x64_epilogue();
+    } else {
+        a64_epilogue();
+    }
+}
+
+// A return from a block that is not the last: the epilogue itself when it
+// is short (at most 4 registers to restore), else a jump to it.
+fn emit_return() {
+    let mut saved = 0;
+    for r in 0..64 {
+        if CALLEE_USED[r] != 0 {
+            saved += 1;
+        }
+    }
+    if saved <= 4 {
+        emit_ir_epilogue();
+    } else {
+        EPILOGUE_USED = true;
+        m_jump(EPILOGUE_LABEL);
+    }
+}
+
+// The number of instructions of function fi.
+fn function_size(fi: i64) -> i64 {
+    let mut n = 0;
+    for i in 0..ORDER.count {
+        let mut v = BLOCKS[ORDER.data[i]].first;
+        while v != 0 {
+            n += 1;
+            v = INSTS[v].next;
+        }
+    }
+    n
+}
+
+// Whether function fi needs a frame: it calls, uses the stack (spills,
+// slots, saved registers) or has parameters on the stack. A leaf without
+// any of these leaves sp, the frame pointer and the return address alone.
+fn needs_frame(fi: i64) -> bool {
+    if FRAME_TOTAL > 0 || HAS_CALLS {
+        return true;
+    }
+    for r in 0..64 {
+        if CALLEE_USED[r] != 0 {
+            return true;
+        }
+    }
+    let f = IRFUNCS[fi].f;
+    let mut locations: [i64; 64] = [0; 64];
+    let mut pieces: [i64; 256] = [0; 256];
+    if FNS[f].param_count > 64 {
+        return true;
+    }
+    param_locations(f, &locations as *i64, &pieces as *i64);
+    let mut v = BLOCKS[IRFUNCS[fi].entry].first;
+    while v != 0 {
+        if INSTS[v].op == Op::Param && INSTS[v].imm >= 0 {
+            let index = INSTS[v].imm;
+            let piece = INSTS[v].imm2;
+            let location = if piece > 0 { pieces[4 * index + piece - 1] } else { locations[index] };
+            if piece < 0 || xl_is_stack(location) {
+                return true;
+            }
+        }
+        v = INSTS[v].next;
+    }
+    false
+}
+
+// The function's label (as the shared emit_function_start writes it), and
+// the saving of the frame pointer and return address when it has a frame.
+fn ir_function_start(prefix: *u8, name: i64, global: bool, frame: bool) {
+    emit_function_start(prefix, name, global);
+    if frame {
+        return;
+    }
+    let prologue = if X86 { c"    pushq %rbp\n    movq %rsp, %rbp\n" } else { c"    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n" };
+    let n = strlen(prologue) as i64;
+    let len = BUFS[ASM].len;
+    if len < n || memcmp(&BUFS[ASM].data[len - n], prologue, n as u64) != 0 {
+        die(c"internal error: unexpected function prologue");
+    }
+    BUFS[ASM].len = len - n;
+}
+
+// Per layout index: whether the block emits nothing but a jump.
+static mut TRIVIAL: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+fn find_trivial_jumps() {
+    TRIVIAL.count = 0;
+    for k in 0..ORDER.count {
+        TRIVIAL.push(if is_trivial_jump_now(ORDER.data[k]) { 1 } else { 0 });
+    }
+}
+
+// Whether block b emits nothing but a jump: no instruction, no move.
+fn is_trivial_jump_now(b: i64) -> bool {
+    if BLOCKS[b].term != Term::Jump || b == IRFUNCS[IRF].entry {
         return false;
     }
     let mut v = BLOCKS[b].first;
     while v != 0 {
-        if is_emitted(v) || INSTS[v].op == Op::Param {
+        let t = tracked(v);
+        if is_emitted(v) || INSTS[v].op == Op::Param || (INSTS[v].op == Op::Phi && t >= 0 && stored_at_def(t)) {
             return false;
         }
         v = INSTS[v].next;
     }
-    let s = BLOCKS[b].s0;
-    let index = pred_index(s, b);
-    let mut phi = BLOCKS[s].first;
-    while phi != 0 && INSTS[phi].op == Op::Phi {
-        let dst = loc_of(phi);
-        if dst != LOC_NONE {
-            let arg = ir_arg(phi, index);
-            if INSTS[arg].op.is_remat() || loc_of(arg) != dst {
-                return false;
-            }
-        }
-        phi = INSTS[phi].next;
+    let k = BLOCKS[b].order;
+    let i = gap_index(BSTART.data[k]);
+    if i < SPLIT_MOVES.count / 2 && SPLIT_MOVES.data[2 * i] <= BEND.data[k] {
+        return false;
     }
-    true
+    plan_start_moves(b);
+    plan_end_moves(b);
+    let mut empty = true;
+    for j in 0..PM.count / PM_FIELDS {
+        if pm_kind(j) != PM_LOC || pm_dst(j) != pm_src(j) {
+            empty = false;
+        }
+    }
+    PM.count = 0;
+    empty
+}
+
+fn is_trivial_jump(b: i64) -> bool {
+    BLOCKS[b].order >= 0 && TRIVIAL.data[BLOCKS[b].order] != 0
 }
 
 // Where a jump to b really goes: past blocks that only jump on (b itself
@@ -578,32 +939,98 @@ fn is_skipped(b: i64) -> bool {
     b != IRFUNCS[IRF].entry && is_trivial_jump(b) && jump_target(b) != b
 }
 
-// The block emitted after the one at layout index k, or 0.
-fn next_block(k: i64) -> i64 {
-    let mut i = k + 1;
-    while i < ORDER.count && is_skipped(ORDER.data[i]) {
-        i += 1;
-    }
-    if i < ORDER.count { ORDER.data[i] } else { 0 }
+// The block emitted after the one at index j of the emission order, or 0.
+fn next_block(j: i64) -> i64 {
+    if j + 1 < EMIT.count { EMIT.data[j + 1] } else { 0 }
 }
 
-fn emit_ir_block(b: i64, k: i64) {
+fn emit_ir_block(b: i64, j: i64) {
     emit_label(block_label(b));
+    emit_block_code(b, next_block(j));
+}
+
+// Tail duplication: a jump to a small block (at most 3 instructions, no
+// call, ending in a jump, a branch or a return) emits a copy of the block
+// instead, up to 2 deep. The copy is exact: a block's code depends on its
+// allocation (its positions) only, and the moves of the edge into it are
+// already done.
+static mut DUP_DEPTH: i64 = 0;
+
+fn is_duplicable(b: i64) -> bool {
+    let term = BLOCKS[b].term;
+    if b == IRFUNCS[IRF].entry || (term != Term::Jump && term != Term::Branch && term != Term::Ret) {
+        return false;
+    }
+    let mut n = 0;
     let mut v = BLOCKS[b].first;
     while v != 0 {
+        if INSTS[v].op.is_call() || INSTS[v].op == Op::Piece || INSTS[v].op == Op::Select && X86 {
+            return false;
+        }
         if is_emitted(v) && !is_fused_compare(v) {
-            emit_inst(v);
+            n += 1;
         }
         v = INSTS[v].next;
     }
+    n <= 3
+}
+
+// The code of block b (without its label); `next` is the block emitted
+// after it (0: none, -1: a copy, which nothing follows).
+fn emit_block_code(b: i64, next: i64) {
+    let k = BLOCKS[b].order;
+    let start = BSTART.data[k];
+    plan_start_moves(b);
+    pm_resolve();
+    // Phis that go to the stack are stored there.
+    let mut v = BLOCKS[b].first;
+    while v != 0 {
+        let t = tracked(v);
+        if INSTS[v].op == Op::Phi && t >= 0 && stored_at_def(t) {
+            let loc = tloc(t, start);
+            if loc >= 0 {
+                result_done(v, loc);
+            }
+        }
+        v = INSTS[v].next;
+    }
+    v = BLOCKS[b].first;
+    while v != 0 {
+        let op = INSTS[v].op;
+        if op != Op::Phi && op != Op::Param {
+            CUR_POS = INSTS[v].mark;
+            plan_gap_moves(CUR_POS - 1);
+            pm_resolve();
+            if is_emitted(v) && !is_fused_compare(v) {
+                emit_inst(v);
+            }
+        }
+        v = INSTS[v].next;
+    }
+    if TAIL_CALLED {
+        // The callee returns for this block.
+        TAIL_CALLED = false;
+        return;
+    }
+    let end = BEND.data[k];
+    CUR_POS = end;
+    plan_gap_moves(end - 1);
+    pm_resolve();
     let term = BLOCKS[b].term;
-    let next = next_block(k);
     if term == Term::Jump {
         let s = BLOCKS[b].s0;
-        phi_moves(b, s);
+        plan_end_moves(b);
+        pm_resolve();
         let target = jump_target(s);
         if target != next {
-            m_jump(block_label(target));
+            if DUP_DEPTH < 2 && is_duplicable(target) {
+                DUP_DEPTH += 1;
+                // The copy ends where this block does: its next block follows.
+                emit_block_code(target, next);
+                DUP_DEPTH -= 1;
+            } else {
+                m_jump(block_label(target));
+            }
         }
     } else if term == Term::Branch {
         emit_branch(b, next);
@@ -612,38 +1039,38 @@ fn emit_ir_block(b: i64, k: i64) {
     } else if term == Term::Ret {
         let value = BLOCKS[b].cond;
         let ret = FNS[IRFUNCS[IRF].f].ret;
-        if value != 0 && is_compound(ret) && !returns_through_pointer(ret) {
+        let c = fn_uses_c(IRFUNCS[IRF].f);
+        if value != 0 && INSTS[value].op == Op::Pack {
+            // The pieces of an aggregate result, into the result registers.
+            conv_classify(c, ret);
+            for i in 0..INSTS[value].nargs {
+                pm_add_value(conv_return_piece_reg(c, i), ir_arg(value, i), end);
+            }
+            pm_resolve();
+        } else if value != 0 && is_compound(ret) && !conv_returns_through_pointer(c, ret) {
             // An aggregate returned in registers: its pieces, from its
-            // address.
-            abi_classify(ret);
+            // address (out of the way of the result registers).
+            conv_classify(c, ret);
             let mut offset = 0;
-            let base = mem_base(value, 0, -1, &offset);
-            for k in 0..ABI_PIECE_COUNT {
-                m_load(ABI_PIECE_TY[k], return_piece_reg(k), base, offset + ABI_PIECE_OFFSET[k]);
+            let mut base = mem_base_any(value, 0, end, &offset);
+            for i in 0..ABI_PIECE_COUNT {
+                if base == conv_return_piece_reg(c, i) {
+                    m_mov(reg_move_temp(false), base, TY_U64);
+                    base = reg_move_temp(false);
+                }
+            }
+            for i in 0..ABI_PIECE_COUNT {
+                m_load(ABI_PIECE_TY[i], conv_return_piece_reg(c, i), base, offset + ABI_PIECE_OFFSET[i]);
             }
         } else if value != 0 {
-            use_into(value, reg_ret(is_float(INSTS[value].ty)));
+            use_into(value, end, reg_ret(is_float(INSTS[value].ty)));
         }
         if next != 0 {
-            m_jump(EPILOGUE_LABEL);
+            emit_return();
         }
     } else {
         m_trap();
     }
-}
-
-// The moves into the phis of `s`, at the end of its predecessor `b`.
-fn phi_moves(b: i64, s: i64) {
-    let index = pred_index(s, b);
-    let mut phi = BLOCKS[s].first;
-    while phi != 0 && INSTS[phi].op == Op::Phi {
-        let dst = loc_of(phi);
-        if dst != LOC_NONE {
-            pm_add_value(dst, ir_arg(phi, index));
-        }
-        phi = INSTS[phi].next;
-    }
-    pm_resolve();
 }
 
 fn emit_branch(b: i64, next: i64) {
@@ -662,23 +1089,35 @@ fn emit_branch(b: i64, next: i64) {
         other = s0;
         sense = false;
     }
-    if is_fused_compare(cond) {
+    if is_fused_compare(cond) && INSTS[cond].op == Op::Test {
+        let mut op = INSTS[cond].cond;
+        if !sense {
+            op = op.negate();
+        }
+        let a = int_operand(INSTS[cond].a);
+        let b = if INSTS[cond].b != 0 { int_operand(INSTS[cond].b) } else { -1 };
+        if X86 {
+            mx_test_branch(a, b, INSTS[cond].imm, op == Cond::Ne, block_label(target));
+        } else {
+            ma_test_branch(a, b, INSTS[cond].imm, op == Cond::Ne, block_label(target));
+        }
+    } else if is_fused_compare(cond) {
         let mut op = INSTS[cond].cond;
         if !sense {
             op = op.negate();
         }
         let ty = INSTS[cond].imm2;
-        let a = int_operand(INSTS[cond].a, 0);
+        let a = int_operand(INSTS[cond].a);
         let mut imm = 0;
         let rhs = INSTS[cond].b;
         if const_of(rhs, &imm) && fits_cmp_imm(imm) {
             m_cmp_branch(op, ty, a, 0, true, imm, block_label(target));
         } else {
-            let r = int_operand(rhs, 1);
+            let r = int_operand(rhs);
             m_cmp_branch(op, ty, a, r, false, 0, block_label(target));
         }
     } else {
-        let r = int_operand(cond, 0);
+        let r = int_operand(cond);
         m_branch_bool(r, sense, block_label(target));
     }
     if other != next {
@@ -717,7 +1156,7 @@ fn emit_switch(b: i64) {
         SW_LABELS.data[at] = block_label(jump_target(case_target(b, i)));
     }
     let default = block_label(jump_target(BLOCKS[b].s0));
-    let r = int_operand(cond, 0);
+    let r = int_operand(cond);
     if n == 0 {
         m_jump(default);
         return;
@@ -767,7 +1206,7 @@ fn switch_compare(op: Cond, ty: i64, r: i64, value: i64, label: i64) {
     if fits_cmp_imm(value) {
         m_cmp_branch(op, ty, r, 0, true, value, label);
     } else {
-        let scratch = reg_scratch(1);
+        let scratch = reg_move_temp(false);
         m_load_imm(scratch, value as u64);
         m_cmp_branch(op, ty, r, scratch, false, 0, label);
     }
@@ -781,22 +1220,24 @@ fn fits_cmp_imm(imm: i64) -> bool {
 
 fn emit_inst(v: i64) {
     let op = INSTS[v].op;
-    if op.is_binary() {
+    if op.is_remat() {
+        materialize(v, result_reg(v));
+    } else if op.is_binary() {
         emit_binary(v);
     } else if op == Op::Neg || op == Op::Not || op == Op::BNot {
-        let a = operand_reg(INSTS[v].a, 0);
+        let a = operand_reg(INSTS[v].a);
         let r = result_reg(v);
         m_unary(op, INSTS[v].ty, r, a);
         result_done(v, r);
     } else if op == Op::Cmp {
         let ty = INSTS[v].imm2;
-        let a = operand_reg(INSTS[v].a, 0);
-        let b = operand_reg(INSTS[v].b, 1);
+        let a = operand_reg(INSTS[v].a);
+        let b = operand_reg(INSTS[v].b);
         let r = result_reg(v);
         m_cmp(INSTS[v].cond, ty, r, a, b);
         result_done(v, r);
     } else if op == Op::Conv {
-        let a = operand_reg(INSTS[v].a, 0);
+        let a = operand_reg(INSTS[v].a);
         let r = result_reg(v);
         m_conv(INSTS[v].imm2, INSTS[v].ty, r, a);
         result_done(v, r);
@@ -805,37 +1246,133 @@ fn emit_inst(v: i64) {
     } else if op == Op::Store {
         emit_store_inst(v);
     } else if op == Op::Copy {
-        let dst = int_operand(INSTS[v].a, 0);
-        let src = int_operand(INSTS[v].b, 1);
+        let dst = int_operand(INSTS[v].a);
+        let src = int_operand(INSTS[v].b);
         m_copy(dst, src, INSTS[v].imm);
     } else if op.is_call() {
         emit_call_inst(v);
+    } else if op == Op::LoadX || op == Op::StoreX || op == Op::Lea {
+        emit_indexed(v);
+    } else if op == Op::Select {
+        emit_select(v);
+    } else if op == Op::FMath {
+        let a = operand_reg(INSTS[v].a);
+        let r = result_reg(v);
+        if X86 {
+            mx_sqrt(INSTS[v].ty, r, a);
+        } else {
+            ma_fmath(INSTS[v].imm, INSTS[v].ty, r, a);
+        }
+        result_done(v, r);
+    } else if op == Op::MAdd || op == Op::MSub || op == Op::ShOp || op == Op::Ubfx {
+        // AArch64 only (see 50_isel.tach).
+        let a = operand_reg(INSTS[v].a);
+        let b = if INSTS[v].b != 0 { operand_reg(INSTS[v].b) } else { -1 };
+        let r = result_reg(v);
+        if op == Op::Ubfx {
+            ma_ubfx(r, a, INSTS[v].imm, INSTS[v].imm2);
+        } else if op == Op::ShOp {
+            ma_shop(INSTS[v].imm2, INSTS[v].ty, r, a, b, INSTS[v].imm);
+        } else {
+            ma_madd(op == Op::MSub, INSTS[v].ty, r, a, b, operand_reg(INSTS[v].c));
+        }
+        result_done(v, r);
     } else {
         die(c"internal error: unexpected instruction in emission");
     }
+}
+
+// LOADX, STOREX and LEA: base + (index << scale) + offset (the base a frame
+// slot from sp on x86-64).
+fn emit_indexed(v: i64) {
+    let op = INSTS[v].op;
+    let mut offset = INSTS[v].imm;
+    let base_value = INSTS[v].a;
+    let mut base = 0;
+    if INSTS[base_value].op == Op::Slot {
+        offset += SLOTS[INSTS[base_value].imm].offset;
+        base = reg_sp();
+    } else {
+        base = int_operand(base_value);
+    }
+    MEM_INDEX = if INSTS[v].b != 0 { int_operand(INSTS[v].b) } else { -1 };
+    MEM_SCALE = INSTS[v].scale;
+    if op == Op::StoreX {
+        let r = operand_reg(INSTS[v].c);
+        m_store(INSTS[v].imm2, r, base, offset);
+        MEM_INDEX = -1;
+        return;
+    }
+    let r = result_reg(v);
+    if op == Op::LoadX {
+        m_load(INSTS[v].ty, r, base, offset);
+    } else {
+        m_lea(r, base, offset);
+    }
+    MEM_INDEX = -1;
+    result_done(v, r);
+}
+
+// The last select emitted, and the length of the code after it.
+static mut LAST_SELECT: i64 = 0;
+static mut LAST_SELECT_END: i64 = 0;
+
+// SELECT: the comparison (or test) of its last operands, then a conditional
+// select of its first two.
+fn emit_select(v: i64) {
+    let lhs = operand_reg(ir_arg(v, 0));
+    let rhs = if ir_arg(v, 1) != 0 { operand_reg(ir_arg(v, 1)) } else { -1 };
+    // (-1: xzr, see use_kind.)
+    let then = if !X86 && is_zero_operand(INSTS[v].a) { -1 } else { operand_reg(INSTS[v].a) };
+    let other = if !X86 && is_zero_operand(INSTS[v].b) { -1 } else { operand_reg(INSTS[v].b) };
+    let r = result_reg(v);
+    let test = (INSTS[v].scale & 1) == 1;
+    if X86 {
+        // The flags of the select just before, when it compared the same and
+        // nothing was emitted since (a rematerialized 0 is an xorl).
+        let p = INSTS[v].prev;
+        let same = p != 0 && p == LAST_SELECT && BUFS[CODE].len == LAST_SELECT_END && ir_arg(p, 0) == ir_arg(v, 0)
+            && ir_arg(p, 1) == ir_arg(v, 1) && INSTS[p].imm == INSTS[v].imm && INSTS[p].imm2 == INSTS[v].imm2
+            && INSTS[p].scale == INSTS[v].scale;
+        mx_select(INSTS[v].cond, test, !same, INSTS[v].imm2, lhs, rhs, INSTS[v].imm, r, then, other);
+        LAST_SELECT = v;
+        LAST_SELECT_END = BUFS[CODE].len;
+    } else {
+        // The flags of the select just before, when it compared the same
+        // (nothing between them on AArch64 touches the flags: moves,
+        // loads, stores and rematerializations do not).
+        let p = INSTS[v].prev;
+        let same = p != 0 && INSTS[p].op == Op::Select && ir_arg(p, 0) == ir_arg(v, 0) && ir_arg(p, 1) == ir_arg(v, 1)
+            && INSTS[p].imm == INSTS[v].imm && INSTS[p].imm2 == INSTS[v].imm2
+            && (INSTS[p].scale & 1) == (INSTS[v].scale & 1);
+        ma_select(INSTS[v].cond, test, !same, INSTS[v].imm2, lhs, rhs, INSTS[v].imm, INSTS[v].ty, r, then, other,
+            (INSTS[v].scale & 2) != 0);
+    }
+    result_done(v, r);
 }
 
 fn emit_binary(v: i64) {
     let op = INSTS[v].op;
     let ty = INSTS[v].ty;
     if is_float(ty) {
-        let a = float_operand(INSTS[v].a, 0);
-        let b = float_operand(INSTS[v].b, 1);
+        let a = float_operand(INSTS[v].a);
+        let b = float_operand(INSTS[v].b);
         let r = result_reg(v);
         m_float_op(op, ty, r, a, b);
         result_done(v, r);
         return;
     }
-    let a = int_operand(INSTS[v].a, 0);
+    let a = int_operand(INSTS[v].a);
     let r = result_reg(v);
     let mut imm = 0;
-    if const_of(INSTS[v].b, &imm) && op != Op::Div && op != Op::Rem {
-        if m_int_op_imm(op, ty, r, a, imm) {
-            result_done(v, r);
-            return;
+    if use_kind(v, 1) == USE_NONE && const_of(INSTS[v].b, &imm) {
+        if !m_int_op_imm(op, ty, r, a, imm) {
+            die(c"internal error: an immediate operand that does not fit");
         }
+        result_done(v, r);
+        return;
     }
-    let b = int_operand(INSTS[v].b, 1);
+    let b = int_operand(INSTS[v].b);
     if op == Op::Div || op == Op::Rem {
         let is_const = const_of(INSTS[v].b, &imm);
         m_div(op, ty, r, a, b, imm, is_const);
@@ -845,25 +1382,32 @@ fn emit_binary(v: i64) {
     result_done(v, r);
 }
 
-// The base register and offset of a memory access to `addr` + `offset`:
-// frame slots are addressed from sp directly.
-// (`scratch` -1: the parallel moves' temporary, outside the argument and
-// result registers.)
-fn mem_base(addr: i64, offset: i64, scratch: i64, out_offset: *i64) -> i64 {
+// The base register and offset of a memory access to `addr` + `offset`
+// (an operand needed in a register): frame slots are addressed from sp
+// directly.
+fn mem_base(addr: i64, offset: i64, out_offset: *i64) -> i64 {
     if INSTS[addr].op == Op::Slot {
         *out_offset = SLOTS[INSTS[addr].imm].offset + offset;
         return reg_sp();
     }
     *out_offset = offset;
-    if scratch < 0 {
-        return use_reg(addr, reg_move_temp(false));
+    int_operand(addr)
+}
+
+// The same for an address used at `pos` where it may be anywhere (loaded
+// into the parallel moves' temporary then).
+fn mem_base_any(addr: i64, offset: i64, pos: i64, out_offset: *i64) -> i64 {
+    if INSTS[addr].op == Op::Slot {
+        *out_offset = SLOTS[INSTS[addr].imm].offset + offset;
+        return reg_sp();
     }
-    int_operand(addr, scratch)
+    *out_offset = offset;
+    use_any(addr, pos, reg_move_temp(false))
 }
 
 fn emit_load_inst(v: i64) {
     let mut offset = 0;
-    let base = mem_base(INSTS[v].a, INSTS[v].imm, 0, &offset);
+    let base = mem_base(INSTS[v].a, INSTS[v].imm, &offset);
     let r = result_reg(v);
     m_load(INSTS[v].ty, r, base, offset);
     result_done(v, r);
@@ -871,9 +1415,9 @@ fn emit_load_inst(v: i64) {
 
 fn emit_store_inst(v: i64) {
     let mut offset = 0;
-    let base = mem_base(INSTS[v].a, INSTS[v].imm, 0, &offset);
+    let base = mem_base(INSTS[v].a, INSTS[v].imm, &offset);
     let value = INSTS[v].b;
-    let r = operand_reg(value, 1);
+    let r = operand_reg(value);
     m_store(INSTS[v].imm2, r, base, offset);
 }
 
@@ -904,6 +1448,9 @@ fn callee_result(v: i64) -> i64 {
 // `copies`, 0 otherwise); returns the size of its stack area, and the
 // float registers used in `float_regs`.
 fn call_locations(v: i64, locations: *i64, copies: *i64, float_regs: *i64) -> i64 {
+    if !call_uses_c(v) {
+        return t_call_locations(v, locations, copies, float_regs);
+    }
     let mut state: [i64; 3] = [first_int_arg(callee_result(v)), 0, 0];
     let mut j = 0;
     for i in 0..callee_param_count(v) {
@@ -920,7 +1467,7 @@ fn call_locations(v: i64, locations: *i64, copies: *i64, float_regs: *i64) -> i6
             j += ABI_PIECE_COUNT;
         } else if kind == AbiClass::Stack {
             locations[j] = abi_stack_location(ty, &state as *i64);
-            copies[j] = size_of(ty);
+            copies[j] = type_size(ty);
             j += 1;
         } else {
             locations[j] = arg_location(if kind == AbiClass::Ref { TY_U64 } else { scalar_type(ty) }, &state as *i64);
@@ -943,7 +1490,7 @@ fn call_locations(v: i64, locations: *i64, copies: *i64, float_regs: *i64) -> i6
                 j += ABI_PIECE_COUNT;
             } else if kind == AbiClass::Stack {
                 locations[j] = abi_stack_location(t, &state as *i64);
-                copies[j] = size_of(t);
+                copies[j] = type_size(t);
                 j += 1;
             } else {
                 locations[j] = variadic_arg_location(TY_U64, &state as *i64);
@@ -957,6 +1504,39 @@ fn call_locations(v: i64, locations: *i64, copies: *i64, float_regs: *i64) -> i6
             locations[j] = arg_location(ty, &state as *i64);
         }
         j += 1;
+    }
+    for i in 0..j {
+        locations[i] = xl_from_c(locations[i]);
+    }
+    *float_regs = state[1];
+    align_to(state[2], 16)
+}
+
+// call_locations for a call under the tachyon convention.
+fn t_call_locations(v: i64, locations: *i64, copies: *i64, float_regs: *i64) -> i64 {
+    let first = if conv_returns_through_pointer(false, callee_result(v)) { 1 } else { 0 };
+    let mut state: [i64; 3] = [first, 0, 0];
+    let mut j = 0;
+    for i in 0..callee_param_count(v) {
+        let ty = callee_param(v, i);
+        if is_void(ty) {
+            continue;
+        }
+        let kind = tabi_classify(ty);
+        if kind == AbiClass::Pieces {
+            for k in 0..ABI_PIECE_COUNT {
+                locations[j] = t_arg_location(ABI_PIECE_TY[k], &state as *i64);
+                copies[j] = 0;
+                j += 1;
+            }
+        } else {
+            locations[j] = t_arg_location(if kind == AbiClass::Ref { TY_U64 } else { scalar_type(ty) }, &state as *i64);
+            copies[j] = 0;
+            j += 1;
+        }
+    }
+    if j != INSTS[v].nargs {
+        die(c"internal error: arguments of a tachyon call");
     }
     *float_regs = state[1];
     align_to(state[2], 16)
@@ -972,6 +1552,102 @@ fn call_stack_size(v: i64) -> i64 {
     call_locations(v, &locations as *i64, &copies as *i64, &float_regs)
 }
 
+// Whether the block being emitted ended in a tail call (its return is then
+// the callee's).
+static mut TAIL_CALLED: bool = false;
+// Whether the function being emitted uses frame slots (whose addresses a
+// callee could hold: no tail calls then).
+static mut USES_SLOTS: bool = false;
+
+// Whether call v is a sibling call (at -O2): the last instruction of a
+// block returning its result (or nothing), from a tachyon function, to a
+// non-variadic callee taking no argument on the stack and returning no
+// aggregate, with the same result type, in a function whose frame no
+// callee can see.
+fn is_tail_call(v: i64) -> bool {
+    let op = INSTS[v].op;
+    let b = INSTS[v].block;
+    if OPT_LEVEL < 2 || USES_SLOTS || RETURNS_TWICE || (op != Op::Call && op != Op::CallI) || INSTS[v].next != 0
+        || INSTS[v].c != 0 {
+        return false;
+    }
+    let f = IRFUNCS[IRF].f;
+    let ret = FNS[f].ret;
+    if FNS[f].is_extern || FNS[f].export || fn_is_global(f) || is_compound(ret) || returns_through_pointer(ret) {
+        return false;
+    }
+    // The returning block: b, or the block b jumps to when it does
+    // nothing but return (a phi of the result).
+    let mut returning = b;
+    let mut result = v;
+    if BLOCKS[b].term == Term::Jump {
+        returning = BLOCKS[b].s0;
+        let mut w = BLOCKS[returning].first;
+        while w != 0 {
+            if INSTS[w].op != Op::Phi && is_emitted(w) {
+                return false;
+            }
+            if w == BLOCKS[returning].cond {
+                if INSTS[w].op != Op::Phi {
+                    return false;
+                }
+                result = w;
+                if ir_arg(w, pred_index(returning, b)) != v {
+                    return false;
+                }
+            }
+            w = INSTS[w].next;
+        }
+    }
+    if BLOCKS[returning].term != Term::Ret {
+        return false;
+    }
+    let value = BLOCKS[returning].cond;
+    if value != 0 && (value != result || INSTS[v].ty != ir_type(ret)) {
+        return false;
+    }
+    if value == 0 && !is_void(ret) {
+        return false;
+    }
+    if op == Op::Call && FNS[INSTS[v].imm].variadic {
+        return false;
+    }
+    call_stack_size(v) == 0
+}
+
+// The pieces of call v's aggregate result (see add_piece_defs): from the
+// result registers to their locations (narrow integers normalized).
+fn emit_call_pieces(v: i64, c: bool, ret: i64) {
+    let mut w = INSTS[v].next;
+    let mut any = false;
+    while w != 0 {
+        if INSTS[w].op == Op::Piece && INSTS[w].a == v && tracked(w) >= 0 {
+            if !any {
+                conv_classify(c, ret);
+                any = true;
+            }
+            let ty = INSTS[w].ty;
+            let reg = conv_return_piece_reg(c, INSTS[w].imm);
+            if ty == TY_BOOL || (is_integer(ty) && int_bits(ty) < 64) {
+                m_normalize(reg, if ty == TY_BOOL { TY_U8 } else { ty });
+            }
+            pm_add(vloc(w, CUR_POS + 2), PM_LOC, reg, ty, 0, w);
+        }
+        w = INSTS[w].next;
+    }
+    if !any {
+        return;
+    }
+    pm_resolve();
+    w = INSTS[v].next;
+    while w != 0 {
+        if INSTS[w].op == Op::Piece && INSTS[w].a == v && tracked(w) >= 0 {
+            result_done(w, vloc(w, CUR_POS + 2));
+        }
+        w = INSTS[w].next;
+    }
+}
+
 fn emit_call_inst(v: i64) {
     let op = INSTS[v].op;
     let mut locations: [i64; 64] = [0; 64];
@@ -979,9 +1655,10 @@ fn emit_call_inst(v: i64) {
     let mut float_regs = 0;
     call_locations(v, &locations as *i64, &copies as *i64, &float_regs);
     // Stack arguments first: their sources are still intact.
+    let c = call_uses_c(v);
     for i in 0..INSTS[v].nargs {
         let location = locations[i];
-        if location < 16 {
+        if !xl_is_stack(location) {
             continue;
         }
         let arg = ir_arg(v, i);
@@ -990,12 +1667,12 @@ fn emit_call_inst(v: i64) {
             // private copy is a multiple of 8 bytes), through registers no
             // value is allocated to.
             let mut offset = 0;
-            let src = mem_base(arg, 0, -1, &offset);
+            let src = mem_base_any(arg, 0, CUR_POS, &offset);
             let temp = reg_cycle(false);
             let mut k = 0;
             while k < copies[i] {
                 m_load(TY_U64, temp, src, offset + k);
-                m_store(TY_U64, temp, reg_sp(), location - 16 + k);
+                m_store(TY_U64, temp, reg_sp(), xl_offset(location) + k);
                 k += 8;
             }
             continue;
@@ -1004,33 +1681,57 @@ fn emit_call_inst(v: i64) {
         let variadic = declared < 0;
         let ty = if variadic { 0 - declared } else { declared };
         let value_ty = INSTS[arg].ty;
-        let r = use_reg(arg, reg_move_temp(is_float(value_ty)));
+        let r = use_any(arg, CUR_POS, reg_move_temp(is_float(value_ty)));
         let mut store_ty = value_ty;
         if !is_float(value_ty) {
             // Apple's arm64 ABI packs fixed stack arguments at their size;
             // everything else takes 8 bytes.
             store_ty = TY_U64;
-            if !X86 && !variadic && !is_compound(ty) && size_of(ty) < 8 {
+            if c && !X86 && !variadic && !is_compound(ty) && type_size(ty) < 8 {
                 store_ty = ty;
             }
         }
-        m_store(store_ty, r, reg_sp(), location - 16);
+        m_store(store_ty, r, reg_sp(), xl_offset(location));
     }
     for i in 0..INSTS[v].nargs {
         let location = locations[i];
-        if location < 16 {
-            pm_add_value(arg_reg(location), ir_arg(v, i));
+        if !xl_is_stack(location) {
+            pm_add_value(arg_reg(location), ir_arg(v, i), CUR_POS);
         }
     }
     let ret = callee_result(v);
-    let through_pointer = INSTS[v].c != 0 && returns_through_pointer(ret);
+    let through_pointer = INSTS[v].c != 0 && conv_returns_through_pointer(c, ret);
     if through_pointer {
-        pm_add_value(reg_result_ptr(), INSTS[v].c);
+        pm_add_value(conv_result_ptr_reg(c), INSTS[v].c, CUR_POS);
     }
     if op == Op::CallI {
-        pm_add_value(reg_callee(), INSTS[v].a);
+        pm_add_value(reg_callee(), INSTS[v].a, CUR_POS);
     }
     pm_resolve();
+    if is_tail_call(v) {
+        // The frame goes, then a jump: the callee returns to our caller.
+        save_callee_saved(true);
+        if X86 {
+            ins(c"movq %rbp, %rsp");
+            ins(c"popq %rbp");
+        } else {
+            ins(c"mov sp, x29");
+            ins(c"ldp x29, x30, [sp], #16");
+        }
+        if op == Op::Call {
+            let f = INSTS[v].imm;
+            o(if X86 { c"    jmp " } else { c"    b " });
+            emit_symbol_ref(fn_symbol_prefix(f), FNS[f].name);
+            if X86 && ELF && (FNS[f].is_extern || FNS[f].export) {
+                o(c"@PLT");
+            }
+            on();
+        } else {
+            ins(if X86 { c"jmp *%r11" } else { c"br x16" });
+        }
+        TAIL_CALLED = true;
+        return;
+    }
     if op == Op::Call {
         let f = INSTS[v].imm;
         emit_call(fn_symbol_prefix(f), FNS[f].name, FNS[f].is_extern || FNS[f].export, FNS[f].variadic, float_regs);
@@ -1043,28 +1744,26 @@ fn emit_call_inst(v: i64) {
     } else {
         a64_call_indirect();
     }
+    emit_call_pieces(v, c, ret);
     if INSTS[v].c != 0 && !through_pointer {
         // An aggregate result in registers: stored in pieces into its slot.
-        abi_classify(ret);
+        conv_classify(c, ret);
         let mut offset = 0;
-        let base = mem_base(INSTS[v].c, 0, -1, &offset);
+        let base = mem_base_any(INSTS[v].c, 0, CUR_POS + 2, &offset);
         for k in 0..ABI_PIECE_COUNT {
-            m_store(ABI_PIECE_TY[k], return_piece_reg(k), base, offset + ABI_PIECE_OFFSET[k]);
+            m_store(ABI_PIECE_TY[k], conv_return_piece_reg(c, k), base, offset + ABI_PIECE_OFFSET[k]);
         }
         return;
     }
     let ty = INSTS[v].ty;
-    let loc = loc_of(v);
-    if ty == 0 || loc == LOC_NONE {
+    if ty == 0 || tracked(v) < 0 {
         return;
     }
     let ret_reg = reg_ret(is_float(ty));
     if ty == TY_BOOL || (is_integer(ty) && int_bits(ty) < 64) {
         m_normalize(ret_reg, if ty == TY_BOOL { TY_U8 } else { ty });
     }
-    if loc >= 0 {
-        m_mov(loc, ret_reg, ty);
-    } else {
-        m_store(spill_type(ty), ret_reg, reg_sp(), spill_offset(loc));
-    }
+    let r = result_reg(v);
+    m_mov(r, ret_reg, ty);
+    result_done(v, r);
 }

@@ -32,17 +32,20 @@ format (`error[type error]: ...` / ` --> file: line L, column C` /
 
 | file | |
 |---|---|
-| `00_base.tach` | C library declarations, growable arrays, byte buffers, the symbol interner, source files, error reporting |
+| `00_base.tach` | C library declarations, growable arrays, byte buffers, the symbol interner and its growing tables, source files, error reporting and recovery (several errors at once) |
 | `10_lexer.tach` | source text to tokens; token for token the same as the seed's lexer |
 | `15_cpp.tach` | `import` (1/2): the C preprocessor, with the target C compiler's macros and include path |
 | `16_cimport.tach` | `import` (2/2): C declarations and layouts, written out as tachyon source |
 | `17_cheader.tach` | `--emit-header`: the C header of a program |
+| `18_std.tach` | the standard library's source, built in (generated from `compiler/std/std.tach` by `compiler/std/embed.sh`) |
 | `20_ast.tach` | the AST: an arena of uniform nodes (`NODES`), child lists in `LISTS` |
-| `21_parser.tach` | recursive descent for items and statements, a Pratt parser for expressions |
+| `21_parser.tach` | recursive descent for items and statements, a Pratt parser for expressions; recovery at statements and items |
+| `29_module.tach` | modules: loading `mod` files, the module tree, item keys, scopes (`use`, `pub`, paths) |
 | `30_types.tach` | interned types, layouts, the tables of structs, functions, constants and statics |
 | `31_check.tach` | the bidirectional type checker; records a type on every expression node |
 | `32_const.tach` | compile-time evaluation: constants, array lengths, static initializers |
 | `33_match.tach` | patterns: their checking, refutability, `match`, and exhaustiveness and reachability by usefulness |
+| `34_generic.tach` | generics: instances of structs, enums and functions (copies of their templates), inference of type arguments, symbols |
 | `40_gen.tach` | the driver of code generation, and the `-O0` code generator: walks the checked AST, in terms of the target interface |
 | `41_abi.tach` | C's calling convention for aggregates (AArch64 and System V): classification into pieces, locations |
 | `41_target.tach` | the target interface: targets, the machine model's virtual registers, object-format details (symbols, sections, labels), and dispatch to the instruction set |
@@ -128,7 +131,15 @@ id (`NODES[n]`, `INSTS[v]`, `TYPES[t]`), and the element sizes passed to
 `grow` are written out (`grow(..., 104)`: there is no `size_of`); a struct
 whose fields change must have its size updated (`init_ir` checks the IR's).
 
-Features new in 0.4 enter this source in 0.5.
+Features new in 0.4 enter this source in 0.5; the 0.5 source uses one so
+far: `size_of` and `align_of` are free for that (the layout functions are
+`type_size` and `type_align`). Features new in 0.5 (generics, modules, the
+standard library) enter this source in 0.6.
+
+Error recovery uses `_setjmp`/`_longjmp` (see `err_end` in
+`00_base.tach`): a function that sets a recovery point calls the work and
+then more code, never the work as a tail call, so its frame is alive when
+the jump comes back.
 
 To show that a change to the compiler's source changes nothing it emits,
 `tests/compare.sh OLD NEW` compiles a corpus (the test programs, the

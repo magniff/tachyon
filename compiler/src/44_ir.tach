@@ -55,6 +55,14 @@ enum Op {
     Shl = 18, Shr = 19,
     Neg = 20, Not = 21, BNot = 22, Cmp = 23, Conv = 24,
     Load = 25, Store = 26, Copy = 27, Call = 28, CallI = 29, CallC = 30,
+    // An aggregate result in registers (0.5): PIECE k of call `a` (defined
+    // by the call, in the block after it); PACK, the operand of a RET, the
+    // pieces returned (its operands).
+    Piece = 31, Pack = 32,
+    // Machine operations, made by instruction selection (50_isel.tach)
+    // just before register allocation; nothing else sees them.
+    LoadX = 33, StoreX = 34, Lea = 35, MAdd = 36, MSub = 37, ShOp = 38, Ubfx = 39,
+    Test = 40, Select = 41, FMath = 42,
 }
 
 // The comparison of a CMP instruction (and of the -O0 code generator's
@@ -80,8 +88,11 @@ struct Inst {
     repl: i64,
     // Scratch fields for the passes.
     mark: i64, aux: i64,
+    // Machine operations: the shift of an index (LOADX, STOREX, LEA), the
+    // kind of comparison (SELECT: 0 compare, 1 test).
+    scale: i64,
 }
-const INST_SIZE: i64 = 120;
+const INST_SIZE: i64 = 128;
 
 struct Block {
     first: i64, last: i64,
@@ -150,7 +161,7 @@ fn init_ir() {
     // Instruction 0 and block 0 stand for "none".
     INSTS = grow(INSTS as *u8, INST_COUNT, &INST_CAP, INST_SIZE) as *Inst;
     INSTS[0] = Inst { op: Op::None, cond: Cond::Eq, ty: 0, a: 0, b: 0, c: 0, imm: 0, imm2: 0, args: 0, nargs: 0,
-                      block: 0, prev: 0, next: 0, repl: 0, mark: 0, aux: 0 };
+                      block: 0, prev: 0, next: 0, repl: 0, mark: 0, aux: 0, scale: 0 };
     INST_COUNT = 1;
     BLOCKS = grow(BLOCKS as *u8, BLOCK_COUNT, &BLOCK_CAP, BLOCK_SIZE) as *Block;
     BLOCKS[0] = empty_block(0);
@@ -231,7 +242,7 @@ fn ir_make(op: Op, ty: i64, a: i64, b: i64, imm: i64) -> i64 {
     INSTS = grow(INSTS as *u8, INST_COUNT, &INST_CAP, INST_SIZE) as *Inst;
     let v = INST_COUNT;
     INSTS[v] = Inst { op: op, cond: Cond::Eq, ty: ty, a: a, b: b, c: 0, imm: imm, imm2: 0, args: 0, nargs: 0,
-                      block: 0, prev: 0, next: 0, repl: 0, mark: 0, aux: 0 };
+                      block: 0, prev: 0, next: 0, repl: 0, mark: 0, aux: 0, scale: 0 };
     INST_COUNT += 1;
     v
 }
@@ -377,7 +388,8 @@ impl Op {
     // Whether an instruction may be removed when its value is unused (and
     // moved or merged with an equal one, for those that read no memory).
     fn has_side_effect(self: Op) -> bool {
-        self == Op::Store || self == Op::Copy || self.is_call() || self == Op::Param
+        self == Op::Store || self == Op::StoreX || self == Op::Copy || self.is_call() || self == Op::Param
+            || self == Op::Piece || self == Op::Pack
     }
 
     // Instructions whose value is recomputed at each use by the back end
@@ -394,6 +406,11 @@ impl Op {
                 | Op::Shl | Op::Shr | Op::Neg | Op::Not | Op::BNot | Op::Cmp | Op::Conv => true,
             _ => false,
         }
+    }
+
+    // The machine operations of instruction selection.
+    fn is_machine(self: Op) -> bool {
+        self as i64 >= Op::LoadX as i64
     }
 
     // The binary arithmetic and bitwise operations.
@@ -419,7 +436,7 @@ fn ir_set_arg(v: i64, i: i64, value: i64) {
 // (some may be 0): a, b, c, then the ARGS of phis and calls.
 fn ir_operand_count(v: i64) -> i64 {
     let op = INSTS[v].op;
-    if op == Op::Phi || op.is_call() {
+    if op == Op::Phi || op.is_call() || op == Op::Pack || op == Op::Select {
         return INSTS[v].nargs + 3;
     }
     3
@@ -647,6 +664,18 @@ impl Op {
             Op::Call => c"call",
             Op::CallI => c"calli",
             Op::CallC => c"callc",
+            Op::Piece => c"piece",
+            Op::Pack => c"pack",
+            Op::LoadX => c"loadx",
+            Op::StoreX => c"storex",
+            Op::Lea => c"lea",
+            Op::MAdd => c"madd",
+            Op::MSub => c"msub",
+            Op::ShOp => c"shop",
+            Op::Ubfx => c"ubfx",
+            Op::Test => c"test",
+            Op::Select => c"select",
+            Op::FMath => c"fmath",
         }
     }
 }
@@ -726,7 +755,7 @@ fn print_inst(out: i64, v: i64) {
         buf_str(out, c" = ");
     }
     buf_str(out, op.name());
-    if op == Op::Cmp {
+    if op == Op::Cmp || op == Op::Test || op == Op::Select {
         buf_byte(out, '.');
         buf_str(out, INSTS[v].cond.name());
     }
@@ -744,7 +773,7 @@ fn print_inst(out: i64, v: i64) {
     } else if op == Op::Call || op == Op::FAddr {
         buf_byte(out, ' ');
         buf_str(out, sym_name(FNS[INSTS[v].imm].name));
-    } else if op == Op::Param || op == Op::Slot || op == Op::SAddr {
+    } else if op == Op::Param || op == Op::Slot || op == Op::SAddr || op == Op::Piece {
         buf_byte(out, ' ');
         buf_int(out, INSTS[v].imm);
     }
@@ -773,6 +802,15 @@ fn print_inst(out: i64, v: i64) {
     } else if op == Op::Conv || op == Op::Cmp {
         buf_str(out, c" from ");
         buf_ir_type(out, INSTS[v].imm2);
+    } else if op.is_machine() {
+        // imm, imm2 and scale as they are (see 50_isel.tach).
+        buf_str(out, c" [");
+        buf_int(out, INSTS[v].imm);
+        buf_str(out, c", ");
+        buf_int(out, INSTS[v].imm2);
+        buf_str(out, c", ");
+        buf_int(out, INSTS[v].scale);
+        buf_byte(out, ']');
     }
     buf_byte(out, '\n');
 }

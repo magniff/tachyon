@@ -23,6 +23,13 @@ static mut LABEL_DEPTH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 static mut MAIN_SYM: i64 = 0;
 // --emit-ir: print the optimized IR instead of assembly.
 static mut EMIT_IR: bool = false;
+// --emit-mir: the IR after instruction selection (50_isel.tach).
+static mut EMIT_MIR: bool = false;
+
+// Slots aligned above 16 (offset, alignment, size triples): the frame
+// pointer is only 16-aligned, so their address is rounded up at run time,
+// inside room left for it (see emit_frame_addr).
+static mut OVERALIGNED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
 // A new frame slot; returns its offset below the frame pointer.
 fn alloc_slot(size: i64, align: i64) -> i64 {
@@ -30,15 +37,37 @@ fn alloc_slot(size: i64, align: i64) -> i64 {
     if a < 1 {
         a = 1;
     }
+    if a > 16 {
+        FRAME_SIZE = align_to(FRAME_SIZE + size + a - 16, 16);
+        OVERALIGNED.push(FRAME_SIZE);
+        OVERALIGNED.push(a);
+        OVERALIGNED.push(size);
+        return FRAME_SIZE;
+    }
     FRAME_SIZE = align_to(FRAME_SIZE + size, a);
     FRAME_SIZE
+}
+
+// The slot aligned above 16 holding frame offset `offset` (the offset of
+// a slot, or of a field inside one: `slot - field`), as its index in
+// OVERALIGNED, or -1.
+fn overaligned_slot(offset: i64) -> i64 {
+    let mut i = 0;
+    while i < OVERALIGNED.count {
+        let slot = OVERALIGNED.data[i];
+        if offset <= slot && offset > slot - OVERALIGNED.data[i + 2] {
+            return i;
+        }
+        i += 3;
+    }
+    -1
 }
 
 // A frame slot for a value of type `ty`; compound values get a multiple
 // of 8 bytes, so that they can be read and written in 8-byte pieces.
 fn alloc_slot_for(ty: i64) -> i64 {
-    let size = if is_compound(ty) { align_to(size_of(ty), 8) } else { size_of(ty) };
-    alloc_slot(size, align_of(ty))
+    let size = if is_compound(ty) { align_to(type_size(ty), 8) } else { type_size(ty) };
+    alloc_slot(size, type_align(ty))
 }
 
 fn fn_symbol_prefix(f: i64) -> *u8 {
@@ -91,6 +120,16 @@ fn compile_program(output: *u8) {
         lower_program(program);
         optimize_program();
         if EMIT_IR {
+            for fi in 0..IRFUNC_COUNT {
+                if FN_LIVE[fi] != 0 {
+                    print_ir_func(ASM, fi);
+                }
+            }
+            buf_write_file(ASM, output);
+            return;
+        }
+        select_instructions();
+        if EMIT_MIR {
             for fi in 0..IRFUNC_COUNT {
                 if FN_LIVE[fi] != 0 {
                     print_ir_func(ASM, fi);
@@ -159,7 +198,7 @@ fn gen_data() {
         }
         const_emit(init, ty, scratch);
         data_section(STATICS[s].mutable);
-        data_align(align_of(ty));
+        data_align(type_align(ty));
         if STATICS[s].linkage == 2 {
             buf_str(DATA, c".globl ");
             buf_str(DATA, global_prefix());
@@ -182,6 +221,7 @@ fn gen_function(item: i64) {
     buf_clear(CODE);
     DEPTH = 0;
     FRAME_SIZE = 0;
+    OVERALIGNED.count = 0;
     RETURN_LABEL = new_label();
     emit_function_start(fn_symbol_prefix(f), FNS[f].name, fn_is_global(f));
     let ret = FNS[f].ret;
@@ -231,12 +271,17 @@ fn gen_params(item: i64, f: i64) {
             let slot = alloc_slot_for(ty);
             LOCALS[local].offset = slot;
             for k in 0..ABI_PIECE_COUNT {
-                // A piece on the stack is copied as an integer of its size:
-                // through the float accumulator it would overwrite the
-                // first float argument register (x86-64's xmm0), which a
-                // later parameter may still be in.
+                // On x86-64 a piece on the stack is copied as an integer of
+                // its size: through the float accumulator it would
+                // overwrite the first float argument register (xmm0),
+                // which a later parameter may still be in. Not on AArch64,
+                // whose int accumulator is x0, the first int argument
+                // register (an HFA on the stack, after the float registers
+                // ran out, may come before int parameters still in
+                // registers); its float registers are all taken by earlier
+                // parameters then.
                 let mut piece_ty = ABI_PIECE_TY[k];
-                if pieces[k] >= 16 && is_float(piece_ty) {
+                if X86 && pieces[k] >= 16 && is_float(piece_ty) {
                     piece_ty = if piece_ty == TY_F32 { TY_U32 } else { TY_U64 };
                 }
                 emit_load_param(pieces[k], piece_ty);
@@ -280,7 +325,7 @@ fn gen_params(item: i64, f: i64) {
         emit_frame_addr(R_ADDR, pending[i + 1]);
         emit_load_reg(R_ACC, R_ADDR);
         emit_frame_addr(R_SECOND, LOCALS[local].offset);
-        emit_copy(size_of(LOCALS[local].ty));
+        emit_copy(type_size(LOCALS[local].ty));
         i += 2;
     }
 }
@@ -295,13 +340,13 @@ fn gen_return_value(ret: i64) {
     if returns_through_pointer(ret) {
         emit_frame_addr(R_ADDR, RESULT_SLOT);
         emit_load_reg(R_SECOND, R_ADDR);
-        emit_copy(size_of(ret));
+        emit_copy(type_size(ret));
         if X86 {
             load_reg_from_frame(R_ACC, RESULT_SLOT);
         }
         return;
     }
-    let size = size_of(ret);
+    let size = type_size(ret);
     if size % 8 != 0 {
         // Read in whole pieces from a copy of a multiple of 8 bytes.
         let copy = alloc_slot_for(ret);
@@ -342,7 +387,7 @@ fn store_to_frame(ty: i64, offset: i64) {
     }
     if is_compound(ty) {
         emit_frame_addr(R_SECOND, offset);
-        emit_copy(size_of(ty));
+        emit_copy(type_size(ty));
         return;
     }
     emit_frame_addr(R_ADDR, offset);
@@ -538,7 +583,7 @@ fn panic_kind(index_ty: i64, range: bool) -> i64 {
 fn gen_index_addr(n: i64) {
     let base = NODES[n].a;
     let base_ty = NODES[base].ty;
-    let elem_size = size_of(TYPES[base_ty].a);
+    let elem_size = type_size(TYPES[base_ty].a);
     gen_expr(base);
     push_x0();
     gen_expr(NODES[n].b);
@@ -668,7 +713,7 @@ fn gen_aggregate(n: i64) {
             elem_ty = type_elem(ty, i);
         } else {
             elem_ty = TYPES[ty].a;
-            offset = i * size_of(elem_ty);
+            offset = i * type_size(elem_ty);
         }
         gen_expr(value);
         store_to_frame(elem_ty, slot - offset);
@@ -681,7 +726,7 @@ fn gen_repeat(n: i64) {
     let ty = NODES[n].ty;
     let elem_ty = TYPES[ty].a;
     let count = TYPES[ty].b;
-    let elem_size = size_of(elem_ty);
+    let elem_size = type_size(elem_ty);
     let slot = alloc_slot_for(ty);
     gen_expr(NODES[n].a);
     if count > 0 && !is_void(elem_ty) && elem_size > 0 {
@@ -764,7 +809,7 @@ fn gen_slicing(n: i64) {
     let low = NODES[range].a;
     let high = NODES[range].b;
     let inclusive = NODES[range].c != 0;
-    let elem_size = size_of(TYPES[base_ty].a);
+    let elem_size = type_size(TYPES[base_ty].a);
     // The result: the pointer at `slot`, the length at `slot - 8`.
     let slot = alloc_slot(16, 8);
     let length = alloc_slot(8, 8);
@@ -1123,7 +1168,7 @@ fn gen_assign(n: i64) {
             pop_x(R_ACC);
         }
         if is_compound(ty) {
-            emit_copy(size_of(ty));
+            emit_copy(type_size(ty));
         } else {
             emit_store(ty, R_ACC, R_SECOND);
         }
@@ -1191,7 +1236,7 @@ fn gen_call(n: i64) {
         if is_compound(ty) && !is_fresh(arg) {
             let copy = alloc_slot_for(ty);
             emit_frame_addr(R_SECOND, copy);
-            emit_copy(size_of(ty));
+            emit_copy(type_size(ty));
             emit_frame_addr(R_ACC, copy);
         }
         push_value(ty);
@@ -1264,7 +1309,7 @@ fn place_args(arg_types: *i64, count: i64, param_count: i64, variadic: bool,
                 let piece_ty = ABI_PIECE_TY[p];
                 let offset = ABI_PIECE_OFFSET[p];
                 if location < 16 {
-                    m_load(piece_ty, arg_reg(location), scratch, offset);
+                    m_load(piece_ty, arg_reg(xl_from_c(location)), scratch, offset);
                 } else {
                     let temp = if is_float(piece_ty) { temp_float } else { temp_int };
                     m_load(piece_ty, temp, scratch, offset);
@@ -1279,7 +1324,7 @@ fn place_args(arg_types: *i64, count: i64, param_count: i64, variadic: bool,
             // multiple of 8 bytes).
             m_load(TY_U64, scratch, reg_sp(), from);
             let mut offset = 0;
-            while offset < size_of(ty) {
+            while offset < type_size(ty) {
                 m_load(TY_U64, temp_int, scratch, offset);
                 m_store(TY_U64, temp_int, reg_sp(), location - 16 + offset);
                 offset += 8;
@@ -1308,6 +1353,21 @@ fn gen_call_sequence(n: i64, direct: i64, arg_types: *i64, count: i64, param_cou
     let stack_size = assign_arg_locations(arg_types, count, param_count, variadic, ret,
                                           &locations as *i64, &pieces as *i64,
                                           &kinds as *AbiClass, &float_regs);
+    // An aggregate aligned above 16 copied onto the stack (x86-64) must be
+    // aligned there: the pushed arguments move down so that the stack area
+    // is, and sp is restored from a frame slot after the call.
+    let mut over = 0;
+    for i in 0..count {
+        if kinds[i] == AbiClass::Stack {
+            let t = if arg_types[i] < 0 { 0 - arg_types[i] } else { arg_types[i] };
+            over = max_i64(over, type_align(t));
+        }
+    }
+    let mut saved_sp = 0;
+    if over > 16 && X86 {
+        saved_sp = alloc_slot(8, 8);
+        x64_realign_pushed(pushed, stack_size, over, saved_sp);
+    }
     if stack_size > 0 {
         emit_sp_sub(stack_size);
     }
@@ -1330,7 +1390,12 @@ fn gen_call_sequence(n: i64, direct: i64, arg_types: *i64, count: i64, param_cou
     } else {
         emit_call_indirect();
     }
-    emit_drop_temps_now(stack_size, pushed);
+    if saved_sp != 0 {
+        x64_restore_sp(saved_sp);
+        DEPTH -= pushed;
+    } else {
+        emit_drop_temps_now(stack_size, pushed);
+    }
     if is_compound(ret) {
         if !through_pointer {
             abi_classify(ret);

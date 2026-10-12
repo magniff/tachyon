@@ -38,6 +38,9 @@ static mut TLISTS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 static mut TSCRATCH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 static mut TY_STRING: i64 = 0;
 static mut TY_U8_PTR: i64 = 0;
+// The type of what failed to check (0.5): errors that name it follow from
+// an earlier error and are not reported (see err_end).
+static mut TY_ERROR: i64 = 0;
 
 fn add_type(kind: TyKind, a: i64, b: i64, list: i64, count: i64) -> i64 {
     TYPES = grow(TYPES as *u8, TYPE_COUNT, &TYPE_CAP, 56) as *Type;
@@ -108,6 +111,7 @@ fn init_types() {
     TSCRATCH.push(TY_U8_PTR);
     TSCRATCH.push(TY_U64);
     TY_STRING = make_type(TyKind::Tuple, 0, 0, mark);
+    TY_ERROR = add_type(TyKind::None, 1, 0, 0, 0);
 }
 
 fn is_integer(t: i64) -> bool {
@@ -188,6 +192,11 @@ fn int_max(t: i64) -> u64 {
 // ---- Type names, for messages ----
 
 fn buf_type(out: i64, t: i64) {
+    if t == TY_ERROR && t != 0 {
+        ERR_POISONED = true;
+        buf_str(out, c"{error}");
+        return;
+    }
     let kind = TYPES[t].kind;
     if kind == TyKind::None || kind == TyKind::Prim {
         buf_str(out, primitive_name(t));
@@ -257,9 +266,16 @@ fn err_type(t: i64) {
 
 // `repr` holds REPR_* flags (20_ast.tach), `align` an alignment from
 // #[repr(C, align(N))] (0: none).
+//
+// Generics (0.5, 34_generic.tach): a generic struct is a template
+// (`generic`: its number of type parameters), never used as a type
+// itself; each instance (`Pair<i64>`) is a struct of its own, with
+// `tmpl` = the template + 1 and its type arguments (`targs` indexes
+// TLISTS). `name` is for messages (`Pair<i64>`), `sym` the prefix of
+// its methods' symbols; `module` is where it was declared.
 struct StructInfo {
     name: i64, node: i64, fields: i64, field_count: i64, layout_state: i64, repr: i64,
-    align: i64,
+    align: i64, generic: i64, tmpl: i64, targs: i64, targ_count: i64, sym: i64, module: i64,
 }
 struct FieldInfo { name: i64, ty: i64, offset: i64 }
 // Functions and externs. `params` indexes TLISTS.
@@ -267,9 +283,16 @@ struct FieldInfo { name: i64, ty: i64, offset: i64 }
 // function (0 for free functions).
 // `is_extern`: a C function declared here; `export`: an `extern "C" fn`
 // defined here (an unmangled, global symbol).
+// `name` is the function's symbol, `display` its name in messages.
+// Generics (0.5): a template has `generic` type parameters; an instance
+// has `tmpl` = template + 1, its type arguments, the call that made it
+// (`origin`), the instance being checked then (`parent`, + 1) and the
+// depth of that chain.
 struct FnInfo {
     name: i64, node: i64, params: i64, param_count: i64, ret: i64,
     variadic: bool, is_extern: bool, self_ty: i64, export: bool,
+    display: i64, generic: i64, tmpl: i64, targs: i64, targ_count: i64,
+    origin: i64, parent: i64, depth: i64, module: i64,
 }
 // state: 0 not evaluated, 1 being evaluated, 2 done.
 struct ConstInfo { node: i64, ty: i64, value: i64, state: i64 }
@@ -301,6 +324,7 @@ static mut STATIC_CAP: i64 = 0;
 struct EnumInfo {
     name: i64, node: i64, variants: i64, variant_count: i64, tag: i64,
     has_fields: bool, layout_state: i64, repr: i64, payload: i64,
+    generic: i64, tmpl: i64, targs: i64, targ_count: i64, sym: i64, module: i64,
 }
 // `fields` indexes TLISTS; `shape` is 0 for an enum without fields.
 struct VariantInfo { name: i64, node: i64, enum_id: i64, discr: i64, fields: i64, field_count: i64, shape: i64 }
@@ -329,10 +353,13 @@ static mut SYM_PRIMITIVE: *i64 = 0 as *i64;
 // Aliases: the resolved type (0 until resolved), and whether being resolved.
 static mut ALIAS_TYPE: *i64 = 0 as *i64;
 static mut ALIAS_BUSY: *i64 = 0 as *i64;
+// Per key (29_module.tach): the item's node (0: no item).
+static mut SYM_ITEM: *i64 = 0 as *i64;
 
-fn sym_table() -> *i64 {
-    alloc_zeroed(SYM_COUNT * 8) as *i64
+fn item_node_of(key: i64) -> i64 {
+    SYM_ITEM[key]
 }
+
 
 fn init_declarations() {
     // Names the checker makes (0.4): interned before the tables indexed
@@ -350,15 +377,16 @@ fn init_declarations() {
     for i in 0..13 {
         syms[i] = intern_c(names[i]);
     }
-    SYM_STRUCT = sym_table();
-    SYM_ENUM = sym_table();
-    SYM_ALIAS = sym_table();
-    SYM_FN = sym_table();
-    SYM_CONST = sym_table();
-    SYM_STATIC = sym_table();
-    SYM_PRIMITIVE = sym_table();
-    ALIAS_TYPE = sym_table();
-    ALIAS_BUSY = sym_table();
+    sym_table(&SYM_STRUCT);
+    sym_table(&SYM_ENUM);
+    sym_table(&SYM_ALIAS);
+    sym_table(&SYM_FN);
+    sym_table(&SYM_CONST);
+    sym_table(&SYM_STATIC);
+    sym_table(&SYM_PRIMITIVE);
+    sym_table(&ALIAS_TYPE);
+    sym_table(&ALIAS_BUSY);
+    sym_table(&SYM_ITEM);
     for i in 0..13 {
         SYM_PRIMITIVE[syms[i]] = types[i];
     }
@@ -431,12 +459,12 @@ fn align_to(offset: i64, align: i64) -> i64 {
     (offset + align - 1) & ~(align - 1)
 }
 
-fn size_of(t: i64) -> i64 {
+fn type_size(t: i64) -> i64 {
     compute_layout(t);
     TYPES[t].size
 }
 
-fn align_of(t: i64) -> i64 {
+fn type_align(t: i64) -> i64 {
     compute_layout(t);
     TYPES[t].align
 }
@@ -461,15 +489,15 @@ fn compute_layout(t: i64) {
         align = 8;
     } else if kind == TyKind::Enum {
         let e = TYPES[t].a;
-        size = size_of(ENUMS[e].tag);
+        size = type_size(ENUMS[e].tag);
         align = size;
         let mut largest = 0;
         let mut widest = 1;
         for i in 0..ENUMS[e].variant_count {
             let shape = VARIANTS[enum_variant(e, i)].shape;
             if shape != 0 {
-                largest = max_i64(largest, size_of(shape));
-                widest = max_i64(widest, align_of(shape));
+                largest = max_i64(largest, type_size(shape));
+                widest = max_i64(widest, type_align(shape));
             }
         }
         if (ENUMS[e].repr & REPR_C) != 0 && ENUMS[e].has_fields {
@@ -481,14 +509,14 @@ fn compute_layout(t: i64) {
         align = max_i64(align, widest);
         size = align_to(size, align);
     } else if kind == TyKind::Array {
-        size = size_of(TYPES[t].a) * TYPES[t].b;
-        align = align_of(TYPES[t].a);
+        size = type_size(TYPES[t].a) * TYPES[t].b;
+        align = type_align(TYPES[t].a);
     } else if kind == TyKind::Tuple {
         let mut offset = 0;
         for i in 0..TYPES[t].count {
             let elem = type_elem(t, i);
-            align = max_i64(align, align_of(elem));
-            offset = align_to(offset, align_of(elem)) + size_of(elem);
+            align = max_i64(align, type_align(elem));
+            offset = align_to(offset, type_align(elem)) + type_size(elem);
         }
         size = align_to(offset, align);
     } else if kind == TyKind::Struct {
@@ -505,7 +533,7 @@ fn compute_layout(t: i64) {
         if (repr & REPR_C) == 0 {
             for i in 1..n {
                 let mut j = i;
-                while j > 0 && align_of((*struct_field(s, order[j - 1])).ty) < align_of((*struct_field(s, order[j])).ty) {
+                while j > 0 && type_align((*struct_field(s, order[j - 1])).ty) < type_align((*struct_field(s, order[j])).ty) {
                     let swap = order[j];
                     order[j] = order[j - 1];
                     order[j - 1] = swap;
@@ -518,16 +546,16 @@ fn compute_layout(t: i64) {
             let field = struct_field(s, order[k]);
             let field_ty = (*field).ty;
             // Packed: aligned to at most the packing (`align` holds it).
-            let natural = align_of(field_ty);
+            let natural = type_align(field_ty);
             let field_align = if (repr & REPR_PACKED) != 0 && natural > STRUCTS[s].align { STRUCTS[s].align } else { natural };
             align = max_i64(align, field_align);
             if (repr & REPR_UNION) != 0 {
                 (*field).offset = 0;
-                offset = max_i64(offset, size_of(field_ty));
+                offset = max_i64(offset, type_size(field_ty));
             } else {
                 offset = align_to(offset, field_align);
                 (*field).offset = offset;
-                offset += size_of(field_ty);
+                offset += type_size(field_ty);
             }
         }
         free(order as *u8);
@@ -553,9 +581,9 @@ fn tuple_offset(t: i64, i: i64) -> i64 {
     let mut offset = 0;
     for j in 0..i + 1 {
         let elem = type_elem(t, j);
-        offset = align_to(offset, align_of(elem));
+        offset = align_to(offset, type_align(elem));
         if j < i {
-            offset += size_of(elem);
+            offset += type_size(elem);
         }
     }
     offset

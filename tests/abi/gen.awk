@@ -1,6 +1,7 @@
 # Writes a random C interoperability test: a C file (cfile) and a tachyon
 # file (tfile) that call each other with random signatures: scalars of
-# every width, #[repr(C)] structs (nested, with arrays, packed or aligned),
+# every width, #[repr(C)] structs (nested, with arrays, packed or aligned to
+# 16, 32 or 64),
 # unions and enums (fieldless and with fields), more arguments than the
 # registers hold, results of every kind, variadic calls.
 #
@@ -310,20 +311,25 @@ function define_types(    k, i, n, attr, line, m, kind) {
         attr = ""
         m = rnd(8)
         if (m == 0 && TK[k] == "struct") attr = "packed"
-        if (m == 1) attr = "align"
+        if (m == 1) {
+            # Aligned to 16, 32 or 64 (above 16: realigned frames, 0.5).
+            attr = "align"
+            n = rnd(3)
+            AL[k] = n == 0 ? 16 : n == 1 ? 32 : 64
+        }
         for (i = 0; i < NF_[k]; i++) {
             if (rnd(5) == 0) FT[k, i] = "A" (1 + rnd(4)) ":" pick_scalar()
             else if (rnd(3) == 0 && k > 0 && attr != "packed") FT[k, i] = "S" rnd(k)
             else FT[k, i] = pick_scalar()
         }
-        if (!IMPORT) print (attr == "packed" ? "#[repr(C, packed)]" : attr == "align" ? "#[repr(C, align(16))]" : "#[repr(C)]") > TF
+        if (!IMPORT) print (attr == "packed" ? "#[repr(C, packed)]" : attr == "align" ? "#[repr(C, align(" AL[k] "))]" : "#[repr(C)]") > TF
         line = TK[k] " S" k " {"
         for (i = 0; i < NF_[k]; i++) {
             if (FT[k, i] ~ /^A/) line = line (i ? "," : "") " f" i ": [" t_scalar(array_elem(FT[k, i])) "; " array_len(FT[k, i]) "]"
             else line = line (i ? "," : "") " f" i ": " t_type(FT[k, i])
         }
         if (!IMPORT) print line " }" > TF
-        line = "typedef " TK[k] (attr == "packed" ? " __attribute__((packed))" : attr == "align" ? " __attribute__((aligned(16)))" : "") " {"
+        line = "typedef " TK[k] (attr == "packed" ? " __attribute__((packed))" : attr == "align" ? " __attribute__((aligned(" AL[k] ")))" : "") " {"
         for (i = 0; i < NF_[k]; i++) {
             if (FT[k, i] ~ /^A/) line = line " " c_scalar(array_elem(FT[k, i])) " f" i "[" array_len(FT[k, i]) "];"
             else line = line " " c_type(FT[k, i]) " f" i ";"
