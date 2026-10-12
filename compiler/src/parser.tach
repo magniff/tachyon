@@ -238,8 +238,7 @@ fn parse_top_item() {
         mark_public(n, public);
         list_push(n);
     } else if at(Hash) {
-        let item = parse_attributed_item();
-        mark_public(item, public);
+        let item = parse_attributed_item(public);
         list_push(item);
     } else {
         let item = parse_item();
@@ -281,11 +280,17 @@ fn parse_impl(public: bool) {
     }
     expect(LBrace);
     while !at(RBrace) && !at(Eof) {
+        let attrs_start = cur_start();
+        let flags = parse_fn_attributes();
         let item_public = eat(Pub) || public;
         if !at(Fn) {
+            if flags != 0 {
+                error_at(attrs_start, c"#[inline] and #[cold] go before a function");
+            }
             syntax_error(c"expected 'fn' or '}' in an impl block");
         }
         let f = parse_function();
+        NODES[f].p |= flags;
         NODES[f].d = NODES[self_type].a;
         NODES[f].h = self_type;
         if params != 0 {
@@ -666,20 +671,78 @@ fn parse_c_static(start: i64, defines: bool) -> i64 {
     n
 }
 
-// `#[repr(...)]` before a struct, union or enum.
-fn parse_attributed_item() -> i64 {
+// `#[inline]`, `#[inline(never)]` or `#[cold]` (0.6) after `#[` and the
+// name: its FN_ flag, or 0 when `name` is another attribute.
+fn parse_fn_attribute(name: i64, pos: i64) -> i64 {
+    if name == intern_c(c"cold") {
+        return FN_COLD;
+    }
+    if name != intern_c(c"inline") {
+        return 0;
+    }
+    if eat(LParen) {
+        let arg = expect_ident();
+        if arg != intern_c(c"never") {
+            name_error(pos, c"unknown inline option '", arg, c"' (expected #[inline] or #[inline(never)])");
+        }
+        expect(RParen);
+        return FN_NO_INLINE;
+    }
+    FN_INLINE
+}
+
+// The function attributes before a function in an impl block (0.6).
+fn parse_fn_attributes() -> i64 {
     let mut flags = 0;
+    let start = cur_start();
+    while at(Hash) {
+        let pos = cur_start();
+        advance();
+        expect(LBracket);
+        let name = expect_ident();
+        let flag = parse_fn_attribute(name, pos);
+        if flag == 0 {
+            name_error(pos, c"unknown attribute '", name, c"' before a function (expected inline, inline(never) or cold)");
+        }
+        flags |= flag;
+        expect(RBracket);
+    }
+    check_fn_attributes(flags, start);
+    flags
+}
+
+fn check_fn_attributes(flags: i64, pos: i64) {
+    if (flags & FN_INLINE) != 0 && (flags & FN_NO_INLINE) != 0 {
+        error_at(pos, c"a function cannot be both #[inline] and #[inline(never)]");
+    }
+}
+
+// Attributes, then the item: `#[repr(...)]` before a struct, union or
+// enum; `#[inline]`, `#[inline(never)]`, `#[cold]` (0.6) before a function.
+// `pub` may come before the attributes or (0.6) after them.
+fn parse_attributed_item(public: bool) -> i64 {
+    let mut flags = 0;
+    let mut fn_flags = 0;
+    let mut repr = false;
     let mut align = 0;
     let mut pack = 0;
     let mut int_type = 0;
     let at_start = cur_start();
     while at(Hash) {
+        let attr_pos = cur_start();
         advance();
         expect(LBracket);
         let name = expect_ident();
-        if name != intern_c(c"repr") {
-            name_error(TOKS[P - 1].start, c"unknown attribute '", name, c"' (attributes in 0.3: repr)");
+        let fn_flag = parse_fn_attribute(name, attr_pos);
+        if fn_flag != 0 {
+            fn_flags |= fn_flag;
+            expect(RBracket);
+            continue;
         }
+        if name != intern_c(c"repr") {
+            name_error(TOKS[P - 1].start, c"unknown attribute '", name, c"' (expected repr, inline, inline(never) or cold)");
+        }
+        repr = true;
         expect(LParen);
         while !at(RParen) && !at(Eof) {
             let pos = cur_start();
@@ -726,6 +789,20 @@ fn parse_attributed_item() -> i64 {
         expect(RParen);
         expect(RBracket);
     }
+    let item_public = eat(Pub) || public;
+    if fn_flags != 0 {
+        if repr {
+            error_at(at_start, c"#[repr(...)] and function attributes cannot be combined");
+        }
+        if !at(Fn) {
+            error_at(at_start, c"#[inline] and #[cold] go before a function");
+        }
+        check_fn_attributes(fn_flags, at_start);
+        let f = parse_function();
+        NODES[f].p |= fn_flags;
+        mark_public(f, item_public);
+        return f;
+    }
     if !at(Struct) && !at(Union) && !at(Enum) {
         error_at(at_start, c"#[repr(...)] goes before a struct, union or enum");
     }
@@ -749,6 +826,7 @@ fn parse_attributed_item() -> i64 {
         NODES[item].d = if pack != 0 { pack } else { align };
     }
     NODES[item].c = NODES[item].c | flags;
+    mark_public(item, item_public);
     item
 }
 
