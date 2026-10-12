@@ -44,7 +44,9 @@ function c_type(t) {
     return is_scalar(t) ? c_scalar(t) : t
 }
 
-function t_type(t) { return t == "E" ? "En" : is_scalar(t) ? t_scalar(t) : t }
+# (CQ: "c::" in import mode, where the header's declarations are named
+# through the import, `import "h.h" as c;`)
+function t_type(t) { return t == "E" ? CQ "En" : is_scalar(t) ? t_scalar(t) : t ~ /^S/ ? CQ t : t }
 
 function pick_scalar(    k) {
     split("i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 bool ptr f64 i32 u8", SC, " ")
@@ -118,7 +120,7 @@ function t_value(t,    s, i, k, m, n) {
     }
     if (t == "E") {
         k = h(LEAF++) % 3
-        return (IMPORT ? "En_" : "En::") (k == 0 ? "A" : k == 1 ? "B" : "C")
+        return (IMPORT ? CQ "En_" : "En::") (k == 0 ? "A" : k == 1 ? "B" : "C")
     }
     if (t ~ /^P/) {
         k = substr(t, 2) + 0
@@ -131,7 +133,7 @@ function t_value(t,    s, i, k, m, n) {
         return s ")"
     }
     k = substr(t, 2) + 0
-    s = t " {"
+    s = CQ t " {"
     if (TK[k] == "union") {
         m = h(LEAF++) % NF_[k]
         return s " f" m ": " t_value(FT[k, m]) " }"
@@ -180,20 +182,20 @@ function c_value(t,    s, i, k, m, n) {
 function t_checks(t, e, fk, arg, ind,    i, k, m, n, v, b) {
     if (is_scalar(t) && t !~ /^A/) {
         v = leaf(t)
-        print ind "if " e " != " t_leaf(t, v) " { fail(" fk ", " arg "); }" > TF
+        print ind "if " e " != " t_leaf(t, v) " { " CQ "fail(" fk ", " arg "); }" > TF
         return
     }
     if (t ~ /^A/) {
         n = array_len(t)
         for (i = 0; i < n; i++) {
             v = leaf(array_elem(t))
-            print ind "if " e "[" i "] != " t_leaf(array_elem(t), v) " { fail(" fk ", " arg "); }" > TF
+            print ind "if " e "[" i "] != " t_leaf(array_elem(t), v) " { " CQ "fail(" fk ", " arg "); }" > TF
         }
         return
     }
     if (t == "E") {
         k = h(LEAF++) % 3
-        print ind "if " e " != " (IMPORT ? "En_" : "En::") (k == 0 ? "A" : k == 1 ? "B" : "C") " { fail(" fk ", " arg "); }" > TF
+        print ind "if " e " != " (IMPORT ? CQ "En_" : "En::") (k == 0 ? "A" : k == 1 ? "B" : "C") " { " CQ "fail(" fk ", " arg "); }" > TF
         return
     }
     if (t ~ /^P/) {
@@ -209,9 +211,9 @@ function t_checks(t, e, fk, arg, ind,    i, k, m, n, v, b) {
         print ind b " => {" > TF
         for (i = 0; i < n; i++) {
             v = leaf(PFT[k, m, i])
-            print ind "    if x" DEPTHN "_" i " != " t_leaf(PFT[k, m, i], v) " { fail(" fk ", " arg "); }" > TF
+            print ind "    if x" DEPTHN "_" i " != " t_leaf(PFT[k, m, i], v) " { " CQ "fail(" fk ", " arg "); }" > TF
         }
-        print ind "} _ => fail(" fk ", " arg "), }" > TF
+        print ind "} _ => " CQ "fail(" fk ", " arg "), }" > TF
         DEPTHN++
         return
     }
@@ -420,7 +422,7 @@ function emit_function(k,    i, line) {
 # The tachyon calls of main for function K.
 function emit_calls(k,    i, line) {
     LEAF = args_base(k)
-    line = "c_f" k "("
+    line = CQ "c_f" k "("
     for (i = 0; i < NPAR[k]; i++) line = line (i ? ", " : "") t_value(PT[k, i])
     line = line ")"
     if (RT[k] == "void") {
@@ -430,7 +432,7 @@ function emit_calls(k,    i, line) {
         LEAF = result_base(k)
         t_checks(RT[k], "r" k, k, 300, "    ")
     }
-    print "    d_f" k "(t_f" k ");" > TF
+    print "    " CQ "d_f" k "(t_f" k ");" > TF
 }
 
 # A variadic call: v_fK(n, ...) with arguments of the promoted kinds.
@@ -458,7 +460,7 @@ function emit_variadic(k,    i, n, t, line) {
     print "    va_end(ap);" > CF
     print "}" > CF
     LEAF = 50000 + 1000 * k
-    line = "    v_f" k "(" n
+    line = "    " CQ "v_f" k "(" n
     for (i = 0; i < n; i++) {
         t = VT[i]
         if (is_scalar(t)) line = line ", " t_variadic_leaf(t, leaf(t))
@@ -487,6 +489,7 @@ BEGIN {
     # Import mode: the C declarations are in a header (hfile), which the
     # C file includes and the tachyon file imports.
     IMPORT = (import == 1)
+    CQ = IMPORT ? "c::" : ""
     HF = IMPORT ? hfile : CF
     # Header mode: C uses the header tachyonc --emit-header writes for the
     # tachyon half (hfile), not declarations of its own.
@@ -504,7 +507,7 @@ BEGIN {
     if (IMPORT) {
         n = split(hfile, parts, "/")
         print "#include \"" parts[n] "\"" > CF
-        print "import \"./" parts[n] "\";" > TF
+        print "import \"./" parts[n] "\" as c;" > TF
     }
     print "void fail(int f, int a) { printf(\"FAIL function %d argument %d\\n\", f, a); fflush(stdout); exit(1); }" > CF
     if (!IMPORT) print "#[repr(C)]" > TF
@@ -531,7 +534,7 @@ BEGIN {
     for (k = 0; k < NFN; k++) emit_calls(k)
     NV = 1 + rnd(3)
     for (k = 0; k < NV; k++) emit_variadic(k)
-    print "    printf(c\"ok\\n\");" > TF
+    print "    " CQ "printf(c\"ok\\n\");" > TF
     print "    0" > TF
     print "}" > TF
     close(DECLS)

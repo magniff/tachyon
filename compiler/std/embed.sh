@@ -14,7 +14,7 @@ tmp=$(mktemp)
     echo "// edit): the standard library's source (0.5), read when a program names"
     echo "// \`std\` (modules.tach)."
     echo ""
-    echo "use crate::base::*;"
+    echo "use crate::base::buf_str;"
     echo ""
     echo "pub fn std_source(out: i64) {"
     # (sed, not awk: awks differ on backslashes in replacements.)
