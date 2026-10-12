@@ -288,6 +288,8 @@ fn lower_function(item: i64) {
     let f = NODES[item].x - 1;
     IRF = ir_new_func(f, item);
     DEFS.clear();
+    DEFERS.count = 0;
+    DEFER_LOOPS.count = 0;
     let entry = ir_new_block();
     IRFUNCS[IRF].entry = entry;
     BLOCKS[entry].sealed = 1;
@@ -387,18 +389,51 @@ fn lower_return(value: i64) {
 // ---- Statements and bindings ----
 
 fn lower_block(block: i64) -> i64 {
+    let mark = DEFERS.count;
     for i in 0..NODES[block].count {
         let stmt = child(block, i);
         if NODES[stmt].kind == Let {
             lower_let(stmt);
+        } else if NODES[stmt].kind == Defer {
+            DEFERS.push(stmt);
         } else {
             lower_expr(NODES[stmt].a);
         }
     }
-    if NODES[block].a != 0 {
-        return lower_expr(NODES[block].a);
+    let tail = NODES[block].a;
+    let mut value = 0;
+    if tail != 0 {
+        value = lower_expr(tail);
     }
-    0
+    if DEFERS.count > mark {
+        if tail != 0 {
+            value = keep_value(value, NODES[tail].ty, mark);
+        }
+        lower_defers(mark);
+        DEFERS.count = mark;
+    }
+    value
+}
+
+// The deferred statements registered above DEFERS depth `depth`, last
+// first (0.6): at the end of their block, or at a jump out of it.
+fn lower_defers(depth: i64) {
+    let mut i = DEFERS.count - 1;
+    while i >= depth && !is_dead_block(CUR) {
+        lower_expr(NODES[DEFERS.data[i]].a);
+        i -= 1;
+    }
+}
+
+// A value computed before deferred statements run: a compound value is
+// copied, so a deferred statement changing its source does not change it.
+fn keep_value(value: i64, ty: i64, depth: i64) -> i64 {
+    if DEFERS.count > depth && value != 0 && is_compound(ty) && !is_dead_block(CUR) {
+        let copy = ir_slot_addr(new_slot_for(ty));
+        lower_copy(copy, value, type_size(ty));
+        return copy;
+    }
+    value
 }
 
 // Expressions whose compound value is a new temporary, which a binding or
@@ -582,8 +617,9 @@ fn lower_expr_inner(n: i64) -> i64 {
         Return => {
             let mut value = 0;
             if NODES[n].a != 0 {
-                value = lower_expr(NODES[n].a);
+                value = keep_value(lower_expr(NODES[n].a), NODES[NODES[n].a].ty, 0);
             }
+            lower_defers(0);
             lower_return(value);
             0
         }
@@ -593,6 +629,7 @@ fn lower_expr_inner(n: i64) -> i64 {
         }
         Continue => {
             let info = NODES[NODES[n].x].z;
+            lower_defers(defer_loop_depth(NODES[n].x));
             lower_jump(LOOP_INFO.data[info]);
             start_dead_block();
             0
@@ -1519,10 +1556,13 @@ fn lower_loop(n: i64) -> i64 {
         lower_branch(cond, body, exit);
         ir_seal(body);
         CUR = body;
+        defer_loop_enter(n);
         lower_block(NODES[n].c);
     } else {
+        defer_loop_enter(n);
         lower_block(NODES[n].b);
     }
+    defer_loop_leave();
     lower_jump(header);
     ir_seal(header);
     ir_seal(exit);
@@ -1537,12 +1577,14 @@ fn lower_break(n: i64) {
     let info = NODES[NODES[n].x].z;
     let value = NODES[n].b;
     let break_var = LOOP_INFO.data[info + 2];
+    let depth = defer_loop_depth(NODES[n].x);
     if value != 0 {
-        let v = lower_expr(value);
+        let v = keep_value(lower_expr(value), NODES[value].ty, depth);
         if break_var >= 0 && NODES[value].ty != TY_NEVER {
             join_write(break_var, v, NODES[value].ty);
         }
     }
+    lower_defers(depth);
     lower_jump(LOOP_INFO.data[info + 1]);
     start_dead_block();
 }
@@ -1569,7 +1611,9 @@ fn lower_for(n: i64) {
     ir_seal(body);
     CUR = body;
     bind_pattern_ir(NODES[n].b, ssa_read(counter, body), false);
+    defer_loop_enter(n);
     lower_block(NODES[n].d);
+    defer_loop_leave();
     lower_jump(next);
     ir_seal(next);
     CUR = next;

@@ -265,7 +265,20 @@ library (and reports several errors at once while it is written).
 - [x] back end: phi and loop-phi coalescing hints, x86-64 cmov operand
   hints, comparisons with immediates (cmn on AArch64), jump tables
   indexed by the value; `--stats` to measure the machine code
-- language: `defer`, `#[inline]` / `#[cold]` attributes
+- language (front end; see grammar.md, "Additions of 0.6"):
+  - [x] `defer`, on every way out of a block
+  - [x] `#[inline]`, `#[inline(never)]`, `#[cold]` (read by the optimizer
+    through `fn_attr_inline`/`fn_attr_cold`); attributes before `pub`
+  - [x] `if let`, `while let`
+  - [x] string literals are `[u8]` (breaking)
+  - [x] structural `==`/`!=` on structs, tuples, arrays, enums with fields
+  - [x] a prelude (Option, Some, None, Result, Ok, Err, Vec, print,
+    println); variants of generic enums by their own names
+  - [x] ambiguous `*` imports are an error where used (breaking: 0.5 took
+    the first)
+  - [x] inline modules, generic type aliases
+  - moved to 0.7: const generic lengths; `errno` (C macros that expand to
+    expressions)
 
 ## 0.7: equality saturation
 
@@ -315,6 +328,8 @@ through and stable, after as many 0.10.x / 0.11+ iterations as that takes:
   package workflow, documentation generation
 - stability: long-running fuzzing, real programs in tachyon beyond the
   compiler, no known miscompiles
+- making the language and its tools work for agents as well as people:
+  ideas collected in [agents.md](agents.md)
 - 1.0 freezes compatibility, not features: from 1.0 on, additions are minor
   releases and breaking changes wait for 2.0
 

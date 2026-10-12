@@ -241,6 +241,8 @@ fn gen_data() {
 fn gen_function(item: i64) {
     let f = NODES[item].x - 1;
     CUR_FN = f;
+    DEFERS.count = 0;
+    DEFER_LOOPS.count = 0;
     buf_clear(CODE);
     DEPTH = 0;
     FRAME_SIZE = 0;
@@ -389,17 +391,49 @@ fn gen_return_value(ret: i64) {
 // ---- Statements ----
 
 fn gen_block(block: i64) {
+    let mark = DEFERS.count;
     for i in 0..NODES[block].count {
         let stmt = child(block, i);
         if NODES[stmt].kind == Let {
             gen_expr(NODES[stmt].c);
             bind(NODES[stmt].a);
+        } else if NODES[stmt].kind == Defer {
+            DEFERS.push(stmt);
         } else {
             gen_expr(NODES[stmt].a);
         }
     }
-    if NODES[block].a != 0 {
-        gen_expr(NODES[block].a);
+    let tail = NODES[block].a;
+    if tail != 0 {
+        gen_expr(tail);
+    }
+    if DEFERS.count > mark {
+        gen_defers(mark, if tail != 0 { NODES[tail].ty } else { TY_UNIT });
+        DEFERS.count = mark;
+    }
+}
+
+// Runs the deferred statements registered above DEFERS depth `depth`, last
+// first (0.6), keeping the accumulator's value of type `ty` (a compound
+// one is copied first, so a deferred statement cannot change it).
+fn gen_defers(depth: i64, ty: i64) {
+    if DEFERS.count <= depth {
+        return;
+    }
+    let keep = !is_void(ty) && ty != TY_NEVER;
+    let mut slot = 0;
+    if keep {
+        slot = alloc_slot_for(ty);
+        store_to_frame(ty, slot);
+    }
+    let mut i = DEFERS.count - 1;
+    while i >= depth {
+        gen_expr(NODES[DEFERS.data[i]].a);
+        i -= 1;
+    }
+    if keep {
+        emit_frame_addr(R_ACC, slot);
+        load_from_x0(ty);
     }
 }
 
@@ -497,17 +531,26 @@ fn gen_expr(n: i64) {
         Return => {
             if NODES[n].a != 0 {
                 gen_expr(NODES[n].a);
+                gen_defers(0, NODES[NODES[n].a].ty);
                 gen_return_value(FNS[CUR_FN].ret);
+            } else {
+                gen_defers(0, TY_UNIT);
             }
             emit_jump(RETURN_LABEL);
         }
         Break => {
+            let mut ty = TY_UNIT;
             if NODES[n].b != 0 {
                 gen_expr(NODES[n].b);
+                ty = NODES[NODES[n].b].ty;
             }
+            gen_defers(defer_loop_depth(NODES[n].x), ty);
             jump_out_to_loop(NODES[n].x, 1);
         }
-        Continue => jump_out_to_loop(NODES[n].x, 0),
+        Continue => {
+            gen_defers(defer_loop_depth(NODES[n].x), TY_UNIT);
+            jump_out_to_loop(NODES[n].x, 0);
+        }
         _ => type_error(n, c"internal error: unexpected node in code generation"),
     }
 }
@@ -1097,10 +1140,13 @@ fn gen_loop(n: i64) {
     if NODES[n].kind == While {
         gen_expr(NODES[n].b);
         emit_jump_if_zero(top + 1);
+        defer_loop_enter(n);
         gen_block(NODES[n].c);
     } else {
+        defer_loop_enter(n);
         gen_block(NODES[n].b);
     }
+    defer_loop_leave();
     emit_jump(top);
     emit_label(top + 1);
 }
@@ -1125,7 +1171,9 @@ fn gen_for(n: i64) {
     load_counter_and_end(counter, end);
     emit_compare_jump(if inclusive { Cond::Gt } else { Cond::Ge }, is_signed(ty), exit);
     bind(NODES[n].b);
+    defer_loop_enter(n);
     gen_block(NODES[n].d);
+    defer_loop_leave();
     emit_label(next);
     load_counter_and_end(counter, end);
     if inclusive {
