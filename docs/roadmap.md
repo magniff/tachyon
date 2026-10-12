@@ -196,13 +196,33 @@ Language (front end; see grammar.md, "Additions of 0.5"):
 
 Back end:
 
-- register allocation with live-range splitting and coalescing (SSA-based
-  linear scan with interval splitting, or iterated register coalescing);
-  rematerialization of constants
-- instruction selection by tree-pattern rules (a rule table per target)
+The back end, in two stages (design and status in
+[optimizer.md](optimizer.md)). Stage A:
+
+- [x] register allocation by linear scan on SSA form with lifetime holes
+  and interval splitting (Wimmer & Mössenböck 2005, Wimmer & Franz 2010):
+  splits at block boundaries out of loops, eviction by next use weighted
+  by loop depth, phi and argument hints (coalescing), constants and
+  addresses kept in registers and rematerialized instead of spilled, one
+  store per spilled value, shared spill slots; every register but the
+  parallel moves' temporaries allocated (AArch64 x0-x15, x19-x28, d0-d29;
+  x86-64 rax-r9, rbx, r12-r15, xmm0-xmm13); `--verify-regalloc`, a checker
+  simulating the allocation, and `--print-regalloc`
+- [x] frame elision for leaf functions; sibling calls (tail calls to
+  callees taking no stack arguments, at -O2)
+- moved to stage B: realigned frames for `#[repr(C, align(N))]` above 16;
+  a tachyon calling convention of its own (more argument registers,
+  aggregates up to four registers passed and returned in registers: it
+  needs the lowering of calls to classify aggregates by convention)
+
+Stage B:
+
+- instruction selection by tree-pattern rules (a rule table per target),
+  scaled-index addressing
 - list scheduling, post-RA peepholes
-- tail calls, frame elision for leaf functions, shrink-wrapping
+- shrink-wrapping
 - block layout by fall-through and loop structure
+- unrolling with run-time trip counts
 
 ## 0.6: interprocedural
 

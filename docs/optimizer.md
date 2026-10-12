@@ -120,31 +120,74 @@ those whose address is taken).
 
 ## The back end
 
-**Layout and liveness** (`50_regalloc.tach`). Edges from a block with two
-successors into a block with phis are split. Blocks are laid out in reverse
-post-order; every instruction gets a position. Liveness is the usual
-backward data flow on bit sets; a value's live interval is the hull of
-every position where it is live (one range per value; holes are ignored).
+**Layout and liveness** (`50_regalloc.tach`). Critical edges (from a block
+with several successors to one with several predecessors) are split, so
+that every edge has a place for its moves. Blocks are laid out in reverse
+post-order; back edges (to a block not later in the order: the graph is
+reducible) give each block its loop depth. Positions go 4 apart: block k
+starts at BSTART[k], where its phis and parameters are defined; the
+instruction at p reads its operands at p, clobbers registers at p + 1 and
+writes its result at p + 2; p - 1 is the gap before it, where moves go;
+the terminator reads at BEND[k]. Liveness is the usual backward data flow
+on bit sets.
 
-**Linear scan** (Poletto & Sarkar, *Linear Scan Register Allocation*,
-TOPLAS 1999). Intervals are allocated in order of their start. A value live
-across a call gets a callee-saved register; others prefer caller-saved
-ones. When no register is free, the interval that ends last is spilled
-(the current one, or an active one whose register it then takes). A value
-that feeds a phi (and a phi itself) first tries the register of its phi
-partner, transitively through chains of phis, which removes most phi
-moves. Constants and addresses (`const`, `slot`, `gaddr`, `saddr`,
-`faddr`) are never allocated: they are rematerialized at each use. A
-compare used only by the branch right after it is fused into that branch.
+**Intervals.** A value's lifetime is a list of ranges with holes, and its
+uses with what each needs: a register (operands of most instructions), or
+anywhere (call arguments, phi operands, returned values: the emitter moves
+them into place). Operands taken as immediates and frame addresses used by
+loads and stores are not uses. Constants and addresses (`const`, `slot`,
+`gaddr`, `saddr`, `faddr`) get an interval only when some use needs them
+in a register; on the stack they are rematerialized, so they cost no
+store and no slot. Registers clobbered by calls (all caller-saved ones),
+and on x86-64 rax and rdx around a division and rcx around a shift by a
+register, are fixed intervals.
+
+**Linear scan with interval splitting** (C. Wimmer and H. Mössenböck,
+*Optimized Interval Splitting in a Linear Scan Register Allocator*, VEE
+2005; C. Wimmer and M. Franz, *Linear Scan Register Allocation on SSA
+Form*, CGO 2010). Intervals are taken by start; the active and inactive
+(in a hole) ones hold registers. An interval gets a register free for its
+whole lifetime when there is one, its hint first: the register of the
+phi it flows into (or for a phi, of the phi it flows into, else of an
+operand), following a partner not yet allocated to its own partner; else
+the argument or result register it goes to. Else the register free
+longest, for a first part, and the rest is split off. When none is free,
+the register whose holders' next use is farthest is taken from them (they
+go to the stack until just before that use), unless the interval's own
+first use is farther still: then it goes to the stack until then.
+Distances count uses in loops as nearer (by 4 per level of depth) and
+constants as cheap to bring back. Splits that bring a value back into a
+register move to the start of the outermost block between the last and
+the next use when it is less deep in loops, so reloads leave loops.
+
+**Spilling.** A value that goes to the stack anywhere is stored once,
+right after its definition (the phi moves write a phi there directly when
+it starts on the stack), so a split to the stack costs nothing and one
+back costs a load. Spill slots are shared by values whose lifetimes, from
+definition to last use, do not overlap.
+
+**Resolution.** A split inside a block where the value lives on is a move
+in the gap at the split. On each edge, the values live into the successor
+and its phis go from where they are at the end of the predecessor to where
+they are at the start of the successor: one parallel move, at the end of
+the predecessor when it has one successor, else at the start of the
+successor (which then has one predecessor). Moves to the stack are no
+moves (the value is there since its definition).
+
+**Checking** (`--verify-regalloc`). The checker simulates the allocation
+over the control flow graph: the contents of every register and spill
+slot, through the moves (planned by the same functions the emitter uses),
+definitions, stores and clobbers, meeting at joins (a location whose
+predecessors disagree holds nothing), until nothing changes; every use
+must find its value where the allocation says it is. `--print-regalloc`
+shows the blocks' positions and every value's intervals and locations.
 
 | | AArch64 | x86-64 |
 |---|---|---|
-| allocated, caller-saved | x9-x15, d16-d29 | rsi, rdi, r8, r9, xmm2-xmm13 |
+| allocated, caller-saved | x0-x15, d0-d7, d16-d29 | rax, rcx, rdx, rsi, rdi, r8, r9, xmm0-xmm13 |
 | allocated, callee-saved | x19-x28, d8-d15 | rbx, r12-r15 |
-| operand scratch | x0-x2, d0-d1 | r10, r11, xmm0-xmm1 |
-| result scratch | x3, d2 | rax, xmm0 |
-| temporaries inside an instruction | x4-x7, x16, x17, d3-d7 | rax, rcx, rdx, xmm14, xmm15 |
-| parallel moves | x16 (temporary), x17 (cycles), d30, d31 | r11 (temporary), r10 (cycles), xmm14, xmm15 |
+| temporaries inside an instruction | x16, x17, d30, d31 | r10, r11, xmm14, xmm15 |
+| parallel moves | x16 (temporary, indirect callee), x17 (cycles), d30, d31 | r11 (temporary, indirect callee), r10 (cycles), xmm14, xmm15 |
 
 **Switches** become a jump table when they have at least 4 cases filling at
 least a third of their range (up to 4096 entries): 32-bit offsets from the
@@ -153,16 +196,23 @@ search of compares and branches.
 
 **Emission** (`51_emit.tach`). The frame is addressed from sp, which does
 not move in the body: outgoing stack arguments, spill slots, saved
-callee-saved registers, then the frame slots. Phis become parallel moves at
-the end of each predecessor; calls put their arguments in place with the
-same resolver (stack arguments first, then registers, cycles broken through
-a scratch register). The function's entry moves the parameters from where
-the caller put them; narrow integers from C callers are normalized. Frame
-slots are addressed from sp directly by loads and stores. Immediate forms
-are used where the target has them (add/sub, shifts, logical immediates on
-AArch64, 32-bit immediates on x86-64, compare with an immediate, `cbz` and
-`cbnz`); division by a constant other than 0 and -1 skips the checks on
-x86-64.
+callee-saved registers, then the frame slots. Locations depend on the
+position: an instruction reads its operands where the allocation has them
+at its position and writes its result where it has it two later. Before
+each instruction come the moves of its gap; at the start and end of each
+block, those of its edges (phi moves among them); calls put their
+arguments in place with the same parallel-move resolver (stack arguments
+first, then registers, cycles broken through a temporary). The function's
+entry moves the parameters from where the caller put them; narrow
+integers from C callers are normalized. A leaf function (no call, nothing
+on the stack, no parameter on the stack) has no frame at all. At -O2, a
+call whose result is returned at once, to a callee taking no stack
+argument, is a sibling call: the frame goes, then a jump (not in
+functions using frame slots, whose addresses the callee could hold).
+Immediate forms are used where the target has them (add/sub, shifts,
+logical immediates on AArch64, 32-bit immediates on x86-64, compare with
+an immediate, `cbz` and `cbnz`); division by a constant other than 0 and
+-1 skips the checks on x86-64.
 
 ## Testing
 
@@ -308,12 +358,53 @@ down and to an exact end, `break` and `continue`, slices indexed one past
 the end now and then, chains of equality tests; the exit status is
 compared too).
 
+## 0.5: the back end, stage A
+
+The plan, in order of priority:
+
+1. A register allocator with live-range splitting and coalescing, in place
+   of 0.2's single-hull linear scan: linear scan on SSA form with lifetime
+   holes and interval splitting (above). The alternative, a backtracking
+   allocator over live-range bundles as in regalloc2, finds better
+   assignments under pressure, but linear scan with splitting gets most of
+   it for a fraction of the code and compile time, and keeps allocation
+   one pass. Acceptance: collatz's loop-carried value in one register (no
+   move in its loop), sieve's bound kept in a register instead of
+   rebuilt every iteration.
+2. A tachyon calling convention for plain `fn`s (more argument registers,
+   aggregates of up to four registers passed and returned in registers),
+   `extern "C"` staying exactly C. Safe per optimization level: a program
+   is compiled at one level, -O0 (the oracle) keeps C's convention, and
+   plain `fn` pointers only ever reach plain functions of the same
+   program.
+3. Frames: leaf functions without a frame; realigned frames for
+   `#[repr(C, align(N))]` above 16 at every level; sibling calls.
+
+Done: 1, and from 3 leaf frames and sibling calls. Stage A frees every
+register the old emitter kept as operand and result scratch (operands
+needing a register always get one), which gives AArch64 9 more integer
+and 8 more float registers and x86-64 3 more integer and 2 more float
+ones; the machine layer of x86-64 now uses only r10 and r11 inside
+instructions (rax and rdx stay fixed for division, rcx for shifts).
+
+Moved to stage B: the calling convention (2), which needs the lowering of
+calls and parameters to classify aggregates by convention (classification
+lives in `45_lower.tach` and `41_abi.tach`, shared with C's), and the
+realigned frames (from 3), which touch the -O0 generator too.
+
+Testing: `--verify-regalloc` over the suite, the fuzzers and the compiler
+itself in every gate run; `tests/run.sh` checks `// ASM(T):` and
+`// ASM-NOT(T):` directives against the assembly for target T
+(`opt_regalloc_coalesce`, `opt_leaf_frame`, `opt_tail_call`);
+`opt_regalloc_pressure` keeps more values live than there are registers;
+the random program generator has a pressure mode (`tests/fuzz/run.sh -p`:
+up to 10 parameters, 12 to 25 locals all live to the end).
+
 ## Not yet
 
 Planned in [roadmap.md](roadmap.md): unrolling with run-time trip counts
-(a remainder loop), induction variable narrowing (0.5, with instruction
-selection); live-range splitting and coalescing in the
-register allocator, rule-based instruction selection, scheduling, a
-tachyon calling convention of its own (0.5); interprocedural analyses and a
-cost-model-driven inliner (0.6); an e-graph-based rewriter (0.7);
-vectorization (0.8).
+(a remainder loop), induction variable narrowing, rule-based instruction
+selection with scaled-index addressing, scheduling, block layout,
+shrink-wrapping, a tachyon calling convention of its own, realigned frames
+(0.5, stage B); interprocedural analyses and a cost-model-driven inliner
+(0.6); an e-graph-based rewriter (0.7); vectorization (0.8).

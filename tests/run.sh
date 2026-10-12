@@ -43,6 +43,11 @@
 #   // CHECK-NOT: text   no line containing text between the neighbouring
 #                        CHECKs' lines (or the start and end)
 #   // CHECK-OPT: n      the level for the CHECKs (default 2)
+#   // ASM(T): text      the assembly for target T (at the CHECK-OPT level)
+#                        has a line containing text, after the previous
+#                        ASM(T)'s line; checked only when testing T
+#   // ASM-NOT(T): text  no line containing text between the neighbouring
+#                        ASM(T)s' lines
 # Stdout is compared after removing trailing whitespace. Each program may
 # run for 20 seconds.
 
@@ -137,6 +142,8 @@ read_directives() {
             else if (key == "CHECK") checks = checks "+" value "\n"
             else if (key == "CHECK-NOT") checks = checks "-" value "\n"
             else if (key == "CHECK-OPT") checkopt = value
+            else if (key == "ASM(" target ")") asms = asms "+" value "\n"
+            else if (key == "ASM-NOT(" target ")") asms = asms "-" value "\n"
         }
         END {
             printf "%s", args > (dir "/args")
@@ -152,6 +159,7 @@ read_directives() {
             printf "%s", cheader > (dir "/cheader")
             printf "%d", build > (dir "/build")
             printf "%s", checks > (dir "/checks")
+            printf "%s", asms > (dir "/asms")
             printf "%s", (checkopt == "" ? "2" : checkopt) > (dir "/checkopt")
         }
     ' "$1"
@@ -218,6 +226,9 @@ check_case() {
         fi
         return 0
     fi
+    if [ -s "$dir/asms" ] && ! check_asm "$source" "$dir"; then
+        return 1
+    fi
     if [ -s "$dir/checks" ] && ! check_ir "$source" "$dir"; then
         return 1
     fi
@@ -274,7 +285,27 @@ check_ir() {
         { echo "--emit-ir failed:"; cat "$2/compile.out"; } >"$2/why"
         return 1
     fi
-    awk -v checks="$2/checks" '
+    match_checks "$2/ir.txt" "$2/checks" "$2/check.out" && return 0
+    { cat "$2/check.out"; echo "--- IR:"; cat "$2/ir.txt"; } >"$2/why"
+    return 1
+}
+
+# Matches the ASM directives against the assembly of $1 for the target.
+check_asm() {
+    if ! "$COMPILER" --target "$TARGET" "-O$(cat "$2/checkopt")" "$1" -o "$2/check.s" >"$2/compile.out" 2>&1; then
+        { echo "compile failed:"; cat "$2/compile.out"; } >"$2/why"
+        return 1
+    fi
+    match_checks "$2/check.s" "$2/asms" "$2/check.out" && return 0
+    { cat "$2/check.out"; echo "--- assembly:"; cat "$2/check.s"; } >"$2/why"
+    return 1
+}
+
+# Matches the checks in file $2 (+text: a line containing text, after the
+# previous one; -text: none until the next) against the lines of $1;
+# writes what failed to $3.
+match_checks() {
+    awk -v checks="$2" '
         { line[NR] = $0 }
         END {
             n = 0
@@ -296,9 +327,7 @@ check_ir() {
                 for (j = pos + 1; j <= NR; j++)
                     if (index(line[j], pending[k])) { print "CHECK-NOT found at line " j ": " pending[k]; exit 1 }
         }
-    ' "$2/ir.txt" >"$2/check.out" 2>&1 && return 0
-    { cat "$2/check.out"; echo "--- IR:"; cat "$2/ir.txt"; } >"$2/why"
-    return 1
+    ' "$1" >"$3" 2>&1
 }
 
 # The number of CPUs, for -j.

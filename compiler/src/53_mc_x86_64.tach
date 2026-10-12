@@ -2,15 +2,13 @@
 // physical registers: 0-15 are the integer registers by hardware number
 // (rax rcx rdx rbx rsp rbp rsi rdi r8-r15), 32 + n is xmm<n>.
 //
-// Use of the registers: rax, rcx and rdx are temporaries inside one
-// instruction (division, shifts, conversions) and rax the result scratch
-// register; r10 and r11 are the operand scratch registers (r10 also
-// breaks parallel move cycles, r11 is the parallel moves' temporary and
-// holds the callee of indirect calls); rsi, rdi, r8 and r9 (caller-saved)
-// and rbx, r12-r15 (callee-saved) are allocated. xmm0 and xmm1 are
-// operand scratch registers, xmm2-xmm13 are allocated, xmm14 and xmm15
-// are the parallel moves' registers and temporaries inside one
-// instruction.
+// Use of the registers: rax, rcx, rdx, rsi, rdi, r8 and r9 (caller-saved)
+// and rbx, r12-r15 (callee-saved) are allocated (division takes rax and
+// rdx, a shift by a register cl: the allocator keeps them free there);
+// r10 and r11 are the temporaries inside one instruction, and of the
+// parallel moves (r10 breaks cycles, r11 is the temporary and holds the
+// callee of indirect calls). xmm0-xmm13 are allocated, xmm14 and xmm15 are
+// the parallel moves' registers and temporaries inside one instruction.
 
 fn mx_name(r: i64, size: i64) -> *u8 {
     if r >= 32 {
@@ -111,8 +109,8 @@ fn mx_load_imm(dst: i64, value: u64) {
     }
 }
 
-// Through rax (never an argument register, so this is safe in the middle
-// of a call's moves).
+// Through r10 (free after the cycles of a parallel move, where constants
+// are rematerialized, and inside instructions).
 fn mx_load_fimm(dst: i64, bits: i64, ty: i64) {
     if bits == 0 {
         mx_rr(if ty == TY_F32 { c"xorps" } else { c"xorpd" }, dst, dst);
@@ -121,12 +119,12 @@ fn mx_load_fimm(dst: i64, bits: i64, ty: i64) {
     if ty == TY_F32 {
         o(c"    movl $");
         buf_uint(CODE, f32_bits(f64_of_bits(bits)) as u64);
-        o(c", %eax\n    movd %eax, ");
+        o(c", %r10d\n    movd %r10d, ");
         mx_r(dst);
         on();
     } else {
-        mx_ir(c"movabsq", bits, 0);
-        o(c"    movq %rax, ");
+        mx_ir(c"movabsq", bits, 10);
+        o(c"    movq %r10, ");
         mx_r(dst);
         on();
     }
@@ -279,7 +277,7 @@ fn is_commutative(op: Op) -> bool {
     op == Op::Add || op == Op::Mul || op == Op::And || op == Op::Or || op == Op::Xor
 }
 
-// d = a <op> b. a and b are never rax, rcx or rdx.
+// d = a <op> b (for shifts, none of them is rcx).
 fn mx_int_op(op: Op, ty: i64, d: i64, a: i64, b: i64) {
     if op == Op::Shl || op == Op::Shr {
         // The amount is taken modulo 32 for types up to 32 bits, modulo 64
@@ -302,15 +300,23 @@ fn mx_int_op(op: Op, ty: i64, d: i64, a: i64, b: i64) {
         if is_commutative(op) {
             mx_rr(mx_op_mnemonic(op), a, d);
         } else {
-            mx_rr(c"movq", a, 0);
-            mx_rr(mx_op_mnemonic(op), b, 0);
-            mx_rr(c"movq", 0, d);
+            mx_rr(c"movq", a, 11);
+            mx_rr(mx_op_mnemonic(op), b, 11);
+            mx_rr(c"movq", 11, d);
         }
     } else {
         m_mov(d, a, TY_U64);
         mx_rr(mx_op_mnemonic(op), b, d);
     }
     mx_normalize(d, ty);
+}
+
+// Whether mx_int_op_imm emits `a <op> imm`.
+fn mx_int_imm_ok(op: Op, imm: i64) -> bool {
+    if op == Op::Shl || op == Op::Shr {
+        return true;
+    }
+    op != Op::Div && op != Op::Rem && fits_i32(imm)
 }
 
 fn mx_int_op_imm(op: Op, ty: i64, d: i64, a: i64, imm: i64) -> bool {
@@ -359,26 +365,27 @@ fn mx_int_op_imm(op: Op, ty: i64, d: i64, a: i64, imm: i64) -> bool {
 // d = a / b (or a % b). Division by zero gives 0 and the remainder the
 // dividend, and the signed MIN / -1 wraps, as on AArch64 (where idiv would
 // trap); the checks are left out for a constant divisor that needs none.
+// Neither a nor b is rax or rdx (nor is d).
 fn mx_div(op: Op, ty: i64, d: i64, a: i64, b: i64, b_const: i64, b_is_const: bool) {
     let remainder = op == Op::Rem;
     let signed = is_signed(ty);
     mx_rr(c"movq", a, 0);
-    mx_rr(c"movq", b, 1);
+    mx_rr(c"movq", b, 11);
     let checked = !(b_is_const && b_const != 0 && !(signed && b_const == -1));
     let by_zero = new_label();
     let done = new_label();
     if checked {
-        ins(c"testq %rcx, %rcx");
+        ins(c"testq %r11, %r11");
         x64_jcc(c"e", by_zero);
     }
     if signed {
         let by_minus_one = new_label();
         if checked {
-            ins(c"cmpq $-1, %rcx");
+            ins(c"cmpq $-1, %r11");
             x64_jcc(c"e", by_minus_one);
         }
         ins(c"cqto");
-        ins(c"idivq %rcx");
+        ins(c"idivq %r11");
         if remainder {
             ins(c"movq %rdx, %rax");
         }
@@ -389,7 +396,7 @@ fn mx_div(op: Op, ty: i64, d: i64, a: i64, b: i64, b_const: i64, b_is_const: boo
         }
     } else {
         ins(c"xorl %edx, %edx");
-        ins(c"divq %rcx");
+        ins(c"divq %r11");
         if remainder {
             ins(c"movq %rdx, %rax");
         }
@@ -439,15 +446,15 @@ fn mx_float_rr(name: *u8, f32: bool, a: i64, b: i64) {
 
 fn mx_unary(op: Op, ty: i64, d: i64, a: i64) {
     if op == Op::Neg && ty == TY_F32 {
-        mx_rr(c"movd", a, 0);
-        ins(c"xorl $0x80000000, %eax");
-        mx_rr(c"movd", 0, d);
+        mx_rr(c"movd", a, 11);
+        ins(c"xorl $0x80000000, %r11d");
+        mx_rr(c"movd", 11, d);
         return;
     }
     if op == Op::Neg && ty == TY_F64 {
-        mx_rr(c"movq", a, 0);
-        ins(c"btcq $63, %rax");
-        mx_rr(c"movq", 0, d);
+        mx_rr(c"movq", a, 11);
+        ins(c"btcq $63, %r11");
+        mx_rr(c"movq", 11, d);
         return;
     }
     m_mov(d, a, TY_U64);
@@ -469,7 +476,7 @@ fn mx_cmp(op: Cond, ty: i64, d: i64, a: i64, b: i64) {
         mx_rr(c"cmpq", b, a);
         o(c"    set");
         o(x64_int_cc(op, is_signed(ty)));
-        o(c" %al\n");
+        o(c" %r11b\n");
     } else {
         let compare = if ty == TY_F32 { c"ucomiss" } else { c"ucomisd" };
         // Unordered (NaN) sets ZF, PF and CF: == and != check PF; < and <=
@@ -480,20 +487,20 @@ fn mx_cmp(op: Cond, ty: i64, d: i64, a: i64, b: i64) {
             mx_rr(compare, b, a);
         }
         if op == Cond::Eq {
-            ins(c"sete %al");
-            ins(c"setnp %cl");
-            ins(c"andb %cl, %al");
+            ins(c"sete %r11b");
+            ins(c"setnp %r10b");
+            ins(c"andb %r10b, %r11b");
         } else if op == Cond::Ne {
-            ins(c"setne %al");
-            ins(c"setp %cl");
-            ins(c"orb %cl, %al");
+            ins(c"setne %r11b");
+            ins(c"setp %r10b");
+            ins(c"orb %r10b, %r11b");
         } else if op == Cond::Lt || op == Cond::Gt {
-            ins(c"seta %al");
+            ins(c"seta %r11b");
         } else {
-            ins(c"setae %al");
+            ins(c"setae %r11b");
         }
     }
-    o(c"    movzbl %al, ");
+    o(c"    movzbl %r11b, ");
     mx_rs(d, 4);
     on();
 }
@@ -527,10 +534,10 @@ fn mx_conv(from: i64, to: i64, d: i64, src: i64) {
         mx_normalize(d, to);
         return;
     }
-    // Saturating float to integer (see x64_float_to_int).
+    // Saturating float to integer (see x64_float_to_int), in r11.
     if is_signed(to) && int_bits(to) <= 32 {
         mx_truncate(from_f32, 32, src);
-        ins(c"movslq %eax, %rax");
+        ins(c"movslq %r11d, %r11");
     } else if to != TY_U64 {
         mx_truncate(from_f32, 64, src);
     } else {
@@ -538,12 +545,12 @@ fn mx_conv(from: i64, to: i64, d: i64, src: i64) {
         let big = new_label();
         let done = new_label();
         if from_f32 {
-            ins(c"movl $0x5f000000, %eax");
-            ins(c"movd %eax, %xmm15");
+            ins(c"movl $0x5f000000, %r11d");
+            ins(c"movd %r11d, %xmm15");
             mx_rr(c"ucomiss", 47, src);
         } else {
-            ins(c"movabsq $0x43e0000000000000, %rax");
-            ins(c"movq %rax, %xmm15");
+            ins(c"movabsq $0x43e0000000000000, %r11");
+            ins(c"movq %r11, %xmm15");
             mx_rr(c"ucomisd", 47, src);
         }
         x64_jcc(c"ae", big);
@@ -554,54 +561,54 @@ fn mx_conv(from: i64, to: i64, d: i64, src: i64) {
         // result means "saturate to the maximum".
         mx_rr(c"movapd", src, 46);
         ins(if from_f32 { c"subss %xmm15, %xmm14" } else { c"subsd %xmm15, %xmm14" });
-        ins(if from_f32 { c"cvttss2si %xmm14, %rax" } else { c"cvttsd2si %xmm14, %rax" });
+        ins(if from_f32 { c"cvttss2si %xmm14, %r11" } else { c"cvttsd2si %xmm14, %r11" });
         let saturate = new_label();
-        ins(c"testq %rax, %rax");
+        ins(c"testq %r11, %r11");
         x64_jcc(c"s", saturate);
-        ins(c"btsq $63, %rax");
+        ins(c"btsq $63, %r11");
         x64_jump(done);
         emit_label(saturate);
-        ins(c"movq $-1, %rax");
+        ins(c"movq $-1, %r11");
         emit_label(done);
     }
-    m_mov(d, 0, TY_U64);
+    m_mov(d, 11, TY_U64);
     mx_normalize(d, to);
 }
 
-// rax (eax at 32 bits) = the saturating signed conversion of float
-// register src (see x64_truncate).
+// r11 (r11d at 32 bits) = the saturating signed conversion of float
+// register src (see x64_truncate); r10 is a temporary.
 fn mx_truncate(f32: bool, bits: i64, src: i64) {
     let done = new_label();
     let nan = new_label();
     o(if f32 { c"    cvttss2si " } else { c"    cvttsd2si " });
     mx_r(src);
-    o(if bits == 32 { c", %eax\n" } else { c", %rax\n" });
+    o(if bits == 32 { c", %r11d\n" } else { c", %r11\n" });
     if bits == 32 {
-        ins(c"cmpl $-2147483648, %eax");
+        ins(c"cmpl $-2147483648, %r11d");
     } else {
-        ins(c"movabsq $-9223372036854775808, %rcx");
-        ins(c"cmpq %rcx, %rax");
+        ins(c"movabsq $-9223372036854775808, %r10");
+        ins(c"cmpq %r10, %r11");
     }
     x64_jcc(c"ne", done);
     mx_rr(if f32 { c"ucomiss" } else { c"ucomisd" }, src, src);
     x64_jcc(c"p", nan);
     // The minimum is right for negative overflow (and the minimum itself).
     if f32 {
-        mx_rr(c"movd", src, 1);
-        ins(c"testl %ecx, %ecx");
+        mx_rr(c"movd", src, 10);
+        ins(c"testl %r10d, %r10d");
     } else {
-        mx_rr(c"movq", src, 1);
-        ins(c"testq %rcx, %rcx");
+        mx_rr(c"movq", src, 10);
+        ins(c"testq %r10, %r10");
     }
     x64_jcc(c"s", done);
     if bits == 32 {
-        ins(c"movl $2147483647, %eax");
+        ins(c"movl $2147483647, %r11d");
     } else {
-        ins(c"movabsq $9223372036854775807, %rax");
+        ins(c"movabsq $9223372036854775807, %r11");
     }
     x64_jump(done);
     emit_label(nan);
-    ins(c"xorl %eax, %eax");
+    ins(c"xorl %r11d, %r11d");
     emit_label(done);
 }
 
@@ -621,12 +628,12 @@ fn mx_int_to_float(from: i64, to: i64, d: i64, src: i64) {
     mx_rr(convert, src, d);
     x64_jump(done);
     emit_label(big);
-    mx_rr(c"movq", src, 0);
-    ins(c"movq %rax, %rcx");
-    ins(c"shrq $1, %rax");
-    ins(c"andl $1, %ecx");
-    ins(c"orq %rcx, %rax");
-    mx_rr(convert, 0, d);
+    mx_rr(c"movq", src, 11);
+    ins(c"movq %r11, %r10");
+    ins(c"shrq $1, %r11");
+    ins(c"andl $1, %r10d");
+    ins(c"orq %r10, %r11");
+    mx_rr(convert, 11, d);
     mx_rr(if to == TY_F32 { c"addss" } else { c"addsd" }, d, d);
     emit_label(done);
 }
@@ -656,12 +663,12 @@ fn mx_copy_chunk(mnemonic: *u8, size: i64, dst: i64, src: i64, offset: i64) {
     o(c" ");
     mx_mem(src, offset);
     o(c", ");
-    mx_rs(0, size);
+    mx_rs(11, size);
     on();
     o(c"    ");
     o(mnemonic);
     o(c" ");
-    mx_rs(0, size);
+    mx_rs(11, size);
     o(c", ");
     mx_mem(dst, offset);
     on();
@@ -671,25 +678,25 @@ fn mx_copy_chunk(mnemonic: *u8, size: i64, dst: i64, src: i64, offset: i64) {
 // entry `value - low` for register r, the default above the range
 // (position independent).
 fn mx_jump_table(r: i64, low: i64, range: i64, default: i64, table: *i64) {
-    mx_mov(0, r, TY_U64);
+    mx_mov(11, r, TY_U64);
     if low != 0 {
         if fits_i32(low) {
-            mx_ir(c"subq", low, 0);
+            mx_ir(c"subq", low, 11);
         } else {
-            mx_load_imm(1, low as u64);
-            mx_rr(c"subq", 1, 0);
+            mx_load_imm(10, low as u64);
+            mx_rr(c"subq", 10, 11);
         }
     }
-    mx_ir(c"cmpq", range - 1, 0);
+    mx_ir(c"cmpq", range - 1, 11);
     x64_jcc(c"a", default);
     let at = new_label();
     o(c"    leaq ");
     o(local_prefix());
     oi(at);
-    o(c"(%rip), %rcx\n");
-    ins(c"movslq (%rcx,%rax,4), %rax");
-    ins(c"addq %rcx, %rax");
-    ins(c"jmp *%rax");
+    o(c"(%rip), %r10\n");
+    ins(c"movslq (%r10,%r11,4), %r11");
+    ins(c"addq %r10, %r11");
+    ins(c"jmp *%r11");
     ins(c".p2align 2");
     emit_label(at);
     for i in 0..range {
