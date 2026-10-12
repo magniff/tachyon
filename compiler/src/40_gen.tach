@@ -26,14 +26,41 @@ static mut EMIT_IR: bool = false;
 // --emit-mir: the IR after instruction selection (50_isel.tach).
 static mut EMIT_MIR: bool = false;
 
+// Slots aligned above 16 (offset, alignment, size triples): the frame
+// pointer is only 16-aligned, so their address is rounded up at run time,
+// inside room left for it (see emit_frame_addr).
+static mut OVERALIGNED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
 // A new frame slot; returns its offset below the frame pointer.
 fn alloc_slot(size: i64, align: i64) -> i64 {
     let mut a = align;
     if a < 1 {
         a = 1;
     }
+    if a > 16 {
+        FRAME_SIZE = align_to(FRAME_SIZE + size + a - 16, 16);
+        OVERALIGNED.push(FRAME_SIZE);
+        OVERALIGNED.push(a);
+        OVERALIGNED.push(size);
+        return FRAME_SIZE;
+    }
     FRAME_SIZE = align_to(FRAME_SIZE + size, a);
     FRAME_SIZE
+}
+
+// The slot aligned above 16 holding frame offset `offset` (the offset of
+// a slot, or of a field inside one: `slot - field`), as its index in
+// OVERALIGNED, or -1.
+fn overaligned_slot(offset: i64) -> i64 {
+    let mut i = 0;
+    while i < OVERALIGNED.count {
+        let slot = OVERALIGNED.data[i];
+        if offset <= slot && offset > slot - OVERALIGNED.data[i + 2] {
+            return i;
+        }
+        i += 3;
+    }
+    -1
 }
 
 // A frame slot for a value of type `ty`; compound values get a multiple
@@ -194,6 +221,7 @@ fn gen_function(item: i64) {
     buf_clear(CODE);
     DEPTH = 0;
     FRAME_SIZE = 0;
+    OVERALIGNED.count = 0;
     RETURN_LABEL = new_label();
     emit_function_start(fn_symbol_prefix(f), FNS[f].name, fn_is_global(f));
     let ret = FNS[f].ret;
@@ -243,12 +271,17 @@ fn gen_params(item: i64, f: i64) {
             let slot = alloc_slot_for(ty);
             LOCALS[local].offset = slot;
             for k in 0..ABI_PIECE_COUNT {
-                // A piece on the stack is copied as an integer of its size:
-                // through the float accumulator it would overwrite the
-                // first float argument register (x86-64's xmm0), which a
-                // later parameter may still be in.
+                // On x86-64 a piece on the stack is copied as an integer of
+                // its size: through the float accumulator it would
+                // overwrite the first float argument register (xmm0),
+                // which a later parameter may still be in. Not on AArch64,
+                // whose int accumulator is x0, the first int argument
+                // register (an HFA on the stack, after the float registers
+                // ran out, may come before int parameters still in
+                // registers); its float registers are all taken by earlier
+                // parameters then.
                 let mut piece_ty = ABI_PIECE_TY[k];
-                if pieces[k] >= 16 && is_float(piece_ty) {
+                if X86 && pieces[k] >= 16 && is_float(piece_ty) {
                     piece_ty = if piece_ty == TY_F32 { TY_U32 } else { TY_U64 };
                 }
                 emit_load_param(pieces[k], piece_ty);
@@ -1276,7 +1309,7 @@ fn place_args(arg_types: *i64, count: i64, param_count: i64, variadic: bool,
                 let piece_ty = ABI_PIECE_TY[p];
                 let offset = ABI_PIECE_OFFSET[p];
                 if location < 16 {
-                    m_load(piece_ty, arg_reg(location), scratch, offset);
+                    m_load(piece_ty, arg_reg(xl_from_c(location)), scratch, offset);
                 } else {
                     let temp = if is_float(piece_ty) { temp_float } else { temp_int };
                     m_load(piece_ty, temp, scratch, offset);
@@ -1320,6 +1353,21 @@ fn gen_call_sequence(n: i64, direct: i64, arg_types: *i64, count: i64, param_cou
     let stack_size = assign_arg_locations(arg_types, count, param_count, variadic, ret,
                                           &locations as *i64, &pieces as *i64,
                                           &kinds as *AbiClass, &float_regs);
+    // An aggregate aligned above 16 copied onto the stack (x86-64) must be
+    // aligned there: the pushed arguments move down so that the stack area
+    // is, and sp is restored from a frame slot after the call.
+    let mut over = 0;
+    for i in 0..count {
+        if kinds[i] == AbiClass::Stack {
+            let t = if arg_types[i] < 0 { 0 - arg_types[i] } else { arg_types[i] };
+            over = max_i64(over, type_align(t));
+        }
+    }
+    let mut saved_sp = 0;
+    if over > 16 && X86 {
+        saved_sp = alloc_slot(8, 8);
+        x64_realign_pushed(pushed, stack_size, over, saved_sp);
+    }
     if stack_size > 0 {
         emit_sp_sub(stack_size);
     }
@@ -1342,7 +1390,12 @@ fn gen_call_sequence(n: i64, direct: i64, arg_types: *i64, count: i64, param_cou
     } else {
         emit_call_indirect();
     }
-    emit_drop_temps_now(stack_size, pushed);
+    if saved_sp != 0 {
+        x64_restore_sp(saved_sp);
+        DEPTH -= pushed;
+    } else {
+        emit_drop_temps_now(stack_size, pushed);
+    }
     if is_compound(ret) {
         if !through_pointer {
             abi_classify(ret);

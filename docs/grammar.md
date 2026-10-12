@@ -114,7 +114,8 @@ receiver first). Inside an impl block, `Self` names the type.
 
 **Attributes** *(0.3)*: `#[repr(C)]` gives a struct, union or enum C's
 layout; `#[repr(C, packed)]` packs a struct (or union) without padding,
-`#[repr(C, align(N))]` raises its alignment to N (a power of two up to 16);
+`#[repr(C, align(N))]` raises its alignment to N (a power of two up to
+4096; above 16 since 0.5, with stack frames realigned where needed);
 `#[repr(u8)]` (any integer type) sets the tag type of an enum. Any other
 attribute is an error.
 
@@ -249,13 +250,20 @@ of bounds: ...`) to stderr and exits with code 101.
 Tachyon guarantees **nothing** about the layout of its own types (the order
 and offsets of a struct's fields, the layout of tuples, enums and slices)
 or about the calling convention of its own functions: the compiler is free
-to choose them (0.3 orders a struct's fields to save padding), and
-optimizations may rely on that freedom. C compatibility is asked for
-explicitly, and then it is exact:
+to choose them (0.3 orders a struct's fields to save padding; 0.5 has a
+convention of its own for plain functions at -O1 and -O2, with more
+argument registers and aggregates of up to four pieces passed and returned
+in registers), and optimizations may rely on that freedom. A plain `fn`
+value only ever holds a plain function, and `fn` and `extern "C" fn` do not
+convert into each other (casting one to the other through a raw pointer
+calls with the wrong convention). C compatibility is asked for explicitly,
+and then it is exact:
 
 - `#[repr(C)]` types have C's layout: fields in order, each at its C
   offset; unions overlap their fields; `packed` and `align(N)` as with
-  GCC's attributes. A fieldless `#[repr(C)]` enum is a C `int`; one with
+  GCC's attributes. Values aligned above 16 are aligned wherever tachyon
+  places them (frames, statics, arguments it copies onto the stack); the
+  heap is the allocator's business (`malloc` aligns to 16). A fieldless `#[repr(C)]` enum is a C `int`; one with
   fields is a C struct: an `int` tag, then a union of one struct per
   variant (RFC 2195's layout). `#[repr(u8)]` (any integer type) sets an
   enum's tag type; with fields, each variant is then laid out as a struct

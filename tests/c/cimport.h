@@ -130,6 +130,8 @@ struct ci_flags ci_flags_make(int count, uint16_t id, float weight);
 int ci_flags_check(struct ci_flags f, int count, uint16_t id);
 int64_t ci_packed_sum(struct ci_packed p);
 int64_t ci_pack2_sum(struct ci_pack2 p);
+struct ci_aligned32 ci_aligned32_make(int32_t v);
+int32_t ci_aligned32_sum(struct ci_aligned32 a, const struct ci_aligned32 *b);
 int ci_apply(ci_binop op, int a, int b);
 struct ci_ops ci_get_ops(void);
 int ci_sum_ints(int n, ...);

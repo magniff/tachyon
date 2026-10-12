@@ -117,8 +117,8 @@ for, it is exact.
   and offsets of every record of 55 to 65 system headers agree with C),
   `tests/abi/run.sh -i` (signatures through `import`) and `-H` (C
   through the emitted header), 1000 signatures per target each.
-- 0.5: `#[repr(C, align(N))]` above 16 (needs realigned stack frames);
-  [x] `import` into a module's namespace (`import "h.h" as c;`, and an
+- 0.5: [x] `#[repr(C, align(N))]` above 16, up to 4096 (realigned stack
+  frames); [x] `import` into a module's namespace (`import "h.h" as c;`, and an
   `import` in any module); function-like macros that are expressions (as
   inline functions) and `errno` (a macro around a function call: use
   `*__error()` on macOS, `*__errno_location()` with glibc) move to 0.6.
@@ -210,10 +210,15 @@ The back end, in two stages (design and status in
   simulating the allocation, and `--print-regalloc`
 - [x] frame elision for leaf functions; sibling calls (tail calls to
   callees taking no stack arguments, at -O2)
-- moved to stage B: realigned frames for `#[repr(C, align(N))]` above 16;
-  a tachyon calling convention of its own (more argument registers,
-  aggregates up to four registers passed and returned in registers: it
-  needs the lowering of calls to classify aggregates by convention)
+- [x] (stage B1) a tachyon calling convention of its own for plain
+  functions at -O1/-O2: 16 integer and 16 float argument registers on
+  AArch64 (7 and 14 on x86-64), aggregates of up to four pieces passed and
+  returned in registers by their leaves (or 8-byte chunks), results as IR
+  values (`piece`, `pack`) that scalar replacement takes apart; C's
+  convention kept by everything C reaches
+- [x] (stage B1) realigned frames for `#[repr(C, align(N))]` above 16, up
+  to 4096, at every level; C records aligned above 16 import as ordinary
+  types; aggregates copied onto the stack aligned as clang and GCC do
 
 Stage B:
 

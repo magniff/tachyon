@@ -279,7 +279,8 @@ fn lower_function(item: i64) {
     BLOCKS[entry].sealed = 1;
     CUR = entry;
     let ret = FNS[f].ret;
-    if returns_through_pointer(ret) {
+    let c = fn_uses_c(f);
+    if conv_returns_through_pointer(c, ret) {
         IRFUNCS[IRF].result_ptr = emit_ir(Op::Param, TY_U64, 0, 0, -1);
     }
     for i in 0..FNS[f].param_count {
@@ -288,7 +289,7 @@ fn lower_function(item: i64) {
         if is_void(ty) || local < 0 {
             continue;
         }
-        let kind = abi_classify(ty);
+        let kind = conv_classify(c, ty);
         if kind == AbiClass::Pieces {
             // Stored from the registers (or stack slots) of its pieces:
             // NodeKind::Param imm2 = the piece + 1.
@@ -323,20 +324,36 @@ fn lower_return(value: i64) {
     let f = IRFUNCS[IRF].f;
     let ret = FNS[f].ret;
     let mut result = 0;
-    if returns_through_pointer(ret) {
+    let c = fn_uses_c(f);
+    if conv_returns_through_pointer(c, ret) {
         lower_copy(IRFUNCS[IRF].result_ptr, value, type_size(ret));
-        if X86 {
+        if X86 && c {
             // Returned in rax, as C does.
             result = IRFUNCS[IRF].result_ptr;
         }
     } else if is_compound(ret) {
-        // Returned in registers, read in pieces from a multiple of 8 bytes.
-        result = need_value(value, ret);
-        if type_size(ret) % 8 != 0 && INSTS[result].op != Op::Slot {
+        // Returned in registers: its pieces, read from a multiple of 8
+        // bytes, packed for the RET.
+        let mut addr = need_value(value, ret);
+        if type_size(ret) % 8 != 0 && INSTS[addr].op != Op::Slot {
             let copy = ir_slot_addr(new_slot_for(ret));
-            lower_copy(copy, result, type_size(ret));
-            result = copy;
+            lower_copy(copy, addr, type_size(ret));
+            addr = copy;
         }
+        conv_classify(c, ret);
+        let count = ABI_PIECE_COUNT;
+        let mut tys: [i64; 4] = [0; 4];
+        let mut offsets: [i64; 4] = [0; 4];
+        for k in 0..count {
+            tys[k] = ABI_PIECE_TY[k];
+            offsets[k] = ABI_PIECE_OFFSET[k];
+        }
+        let mark = SSA_STACK.count;
+        for k in 0..count {
+            push_arg(ir_load(tys[k], addr, offsets[k]), tys[k]);
+        }
+        result = emit_ir(Op::Pack, 0, 0, 0, 0);
+        take_args(result, mark);
     } else if is_void(ret) {
         // `main` without a result exits with 0.
         if FNS[f].name == MAIN_SYM {
@@ -776,14 +793,17 @@ fn lower_call(n: i64) -> i64 {
     let mut ret = 0;
     let mut variadic = false;
     let mut callee_ty = 0;
+    let mut c = true;
     if direct >= 0 {
         param_count = FNS[direct].param_count;
         ret = FNS[direct].ret;
         variadic = FNS[direct].variadic;
+        c = fn_uses_c(direct);
     } else {
         callee_ty = NODES[callee].ty;
         param_count = TYPES[callee_ty].count;
         ret = TYPES[callee_ty].a;
+        c = fn_type_uses_c(callee_ty);
     }
     let mark = SSA_STACK.count;
     for i in 0..NODES[n].count {
@@ -804,7 +824,7 @@ fn lower_call(n: i64) -> i64 {
                 lower_copy(copy, value, type_size(ty));
                 value = copy;
             }
-            let kind = if extra { variadic_kind(ty) } else { abi_classify(ty) };
+            let kind = if extra { variadic_kind(ty) } else { conv_classify(c, ty) };
             if kind == AbiClass::Pieces {
                 // Its pieces, read from the (new) slot; a variadic one's
                 // first piece carries its type (see call_locations).
@@ -844,8 +864,22 @@ fn lower_call(n: i64) -> i64 {
     } else {
         call = emit_ir(Op::CallI, result_ty, callee_value, 0, callee_ty);
     }
-    INSTS[call].c = result_ptr;
+    let in_registers = is_compound(ret) && !conv_returns_through_pointer(c, ret);
+    INSTS[call].c = if in_registers { 0 } else { result_ptr };
     take_args(call, mark);
+    if in_registers {
+        // Its pieces, from the result registers (PIECE instructions right
+        // after the call), stored into the result's slot.
+        conv_classify(c, ret);
+        let count = ABI_PIECE_COUNT;
+        let mut pieces: [i64; 4] = [0; 4];
+        for k in 0..count {
+            pieces[k] = emit_ir(Op::Piece, ABI_PIECE_TY[k], call, 0, k);
+        }
+        for k in 0..count {
+            ir_store(ABI_PIECE_TY[k], result_ptr, pieces[k], ABI_PIECE_OFFSET[k]);
+        }
+    }
     if is_compound(ret) {
         return result_ptr;
     }

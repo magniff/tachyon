@@ -54,18 +54,21 @@ typed scalar values in SSA form; memory is explicit.
   (address plus constant offset), `copy`, and the calls `call` (direct),
   `calli` (through a value) and `callc` (a C library function: `fmod`,
   `memcpy`). Calls keep the type of each argument as the callee sees it,
-  for the C calling convention.
+  for the calling convention. An aggregate result in registers (0.5) is
+  `piece k` instructions after its call (defined by the call, in the
+  result registers), stored into the result's slot.
 - **Terminators**: `jump`, `branch` on a bool, `ret` with an optional value
-  (for an aggregate returned in registers, its address), `unreachable`, and
+  (for an aggregate returned in registers, a `pack` of its pieces, loaded
+  from the value), `unreachable`, and
   `switch` on an integer: case values with their blocks and a default;
   its distinct successors are listed once, and each has the switch block
   once among its predecessors.
-- **Calls follow C's convention** for every function: an aggregate
-  argument passed in registers is split by the lowering into its scalar
-  pieces (one `load` each, so the optimizer sees through the round trip),
-  and a parameter's pieces are separate `param`s (`imm2` = piece + 1)
-  stored into a slot; larger aggregates go by reference or as a copy on
-  the stack (`41_abi.tach`).
+- **Calls follow the callee's convention** (C's, or tachyon's: see
+  "Calling conventions"): an aggregate argument passed in registers is
+  split by the lowering into its scalar pieces (one `load` each, so the
+  optimizer sees through the round trip), and a parameter's pieces are
+  separate `param`s (`imm2` = piece + 1) stored into a slot; larger
+  aggregates go by reference or as a copy on the stack (`41_abi.tach`).
 - **Replacement** is lazy: `ir_replace(v, w)` records that `v` now stands
   for `w` (and unlinks `v`); `ir_val` follows such records, and passes
   resolve operands before they look at them.
@@ -390,7 +393,76 @@ instructions (rax and rdx stay fixed for division, rcx for shifts).
 Moved to stage B: the calling convention (2), which needs the lowering of
 calls and parameters to classify aggregates by convention (classification
 lives in `45_lower.tach` and `41_abi.tach`, shared with C's), and the
-realigned frames (from 3), which touch the -O0 generator too.
+realigned frames (from 3), which touch the -O0 generator too. Both are done
+(stage B1, below).
+
+## Calling conventions
+
+Plain `fn`s compiled at -O1 and -O2 call each other with tachyon's own
+convention; C's is kept by everything C can reach or call: functions
+imported from C or defined `extern "C"`, `main` (called by C), variadic
+functions, calls through `extern "C" fn` pointers, the run-time helpers,
+and every function at -O0, the oracle (`fn_uses_c`, `fn_type_uses_c` in
+`41_abi.tach`).
+
+The two never meet. A program is compiled at one level, and a plain `fn`
+value only ever holds a plain function of the same program: `fn` and
+`extern "C" fn` do not convert into each other, also not through statics or
+generic instances (they are type-checked the same way). `main` is the one
+plain function following C's convention whose value can be taken; for a
+`main` taking scalars that fit in C's argument registers and returning a
+scalar, as C's `main` does, the two conventions agree, because tachyon's
+puts the first scalars where C's does.
+
+**Arguments.** Every argument is a list of scalars, assigned one by one to
+the next free register of its class, else to the next 8-byte slot of the
+stack area:
+
+| | AArch64 | x86-64 |
+|---|---|---|
+| int registers | x0-x15 | rdi, rsi, rdx, rcx, r8, r9, rax |
+| float registers | d0-d7, d16-d23 | xmm0-xmm13 |
+| result registers | x0-x3, d0-d3 | rax, rdx, rcx, rsi, xmm0-xmm3 |
+| result pointer | first int argument | first int argument |
+
+(The temporaries the parallel moves and indirect calls use, x16/x17 and
+r10/r11, are never arguments.) An aggregate of at most four scalar leaves
+that do not overlap is its leaves (a struct of three `f64` is three float
+registers, `{u8, i64, f32, bool}` four registers of their own types); one
+with overlapping leaves (an enum with fields, a union) or more leaves, of
+at most 32 bytes, is its 8-byte chunks, read as integers; a larger one is
+a pointer to the caller's private copy. Since leaves are passed with their
+own types, scalar replacement takes an aggregate parameter or argument
+apart completely.
+
+**Results.** An aggregate of up to four pieces comes back in the result
+registers: as IR, the callee's `ret` takes a `pack` of the pieces, and the
+caller gets `piece` instructions defined by the call; scalar replacement
+then removes the slot on both sides. A larger one goes through a result
+pointer, passed as the first argument (and, unlike C on x86-64, not
+returned).
+
+**Frames aligned above 16.** Types may be aligned up to 4096
+(`#[repr(C, align(N))]`). At -O1/-O2 the frame is addressed from sp, so the
+prologue rounds sp down to the largest alignment a slot or a stack argument
+needs (the epilogue restores sp from the frame pointer; incoming stack
+arguments are reached from the frame pointer). At -O0, whose slots are
+reached from the frame pointer, such a slot gets room to be rounded up in
+and its address is rounded at run time (also for the address of a field of
+it: `slot - field`); a call copying such an aggregate onto the stack (x86-64)
+first moves the pushed arguments down so that the stack area is aligned,
+and sp comes back from a frame slot after the call. On x86-64 an aggregate
+copied onto the stack starts at a multiple of its alignment, as clang and
+GCC place it; on AArch64 an aggregate aligned above 16 is larger than 16
+bytes and goes by reference anyway.
+
+Testing: `tests/run/conv_tachyon.tach` (20 integer and 20 float arguments,
+aggregates of every shape in both directions, fn pointers, recursion,
+generic instances, registers running out), `align_over16` (locals, arrays,
+nested and 4096-aligned values, statics, parameters and results, C by value
+and by pointer in both directions), the random program generator's calls
+mode (`tests/fuzz/run.sh -C`), and the ABI fuzzer's structs aligned to 16,
+32 or 64 in all three modes.
 
 Testing: `--verify-regalloc` over the suite, the fuzzers and the compiler
 itself in every gate run; `tests/run.sh` checks `// ASM(T):` and
