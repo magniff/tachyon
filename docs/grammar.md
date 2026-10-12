@@ -247,7 +247,8 @@ covered`). A match is an expression, typed like `if`.
 
 **Slices** *(0.3)* `[T]` are a pointer and a length (`s.ptr`, `s.len`), made
 by slicing an array or a slice (checked: `lo <= hi <= len`), or a raw
-pointer (`p[lo..hi]`, unchecked). Indexing a slice is checked. Like
+pointer (`p[lo..hi]`, unchecked). Indexing a slice is checked, and so is
+indexing a fixed array *(0.7)*. Like
 pointers, slices are views: writing through one needs no `mut`. A failed
 check writes `index out of bounds: index I, length N` (or `slice range out
 of bounds: ...`) to stderr and exits with code 101.

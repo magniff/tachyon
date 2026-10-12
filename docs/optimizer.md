@@ -813,9 +813,15 @@ profile-guided scheduling (0.9).
   targets and in the Linux container, the fixpoint, objcheck 374/374 on
   all three targets, the fuzzer in every mode (about 1,300 programs on
   macOS), the ABI fuzzer in all three modes, host independence
-- after the object writer (scope added by the user: no undefined
-  behaviour): bounds-checked fixed-array indexing; an "Undefined
-  behaviour" section in grammar.md
+- done (scope added by the user: no undefined behaviour): fixed-array
+  indexing `a[i]` is checked like slice indexing, at every level (gen.tach
+  for -O0, lowering for -O1/-O2); SCCP and the value ranges remove what
+  they prove: matmul, nbody, stencil, sieve keep none, md5 keeps 2 (speed
+  unchanged), interp keeps 15 (46 -> 49 ms). With the checks scalar
+  promotion can keep a stack machine's `sp` in a register (shown on small
+  programs), but not yet in bench/interp: its `match`-dispatched loop is
+  not promoted (to look at in 0.8)
+- remaining: the "Undefined behaviour" section in grammar.md
 
 The compiler writes object files itself. The assembly text it has always
 written stays the single source: `objfile.tach` assembles exactly that
