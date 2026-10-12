@@ -24,14 +24,41 @@ static mut MAIN_SYM: i64 = 0;
 // --emit-ir: print the optimized IR instead of assembly.
 static mut EMIT_IR: bool = false;
 
+// Slots aligned above 16 (offset, alignment, size triples): the frame
+// pointer is only 16-aligned, so their address is rounded up at run time,
+// inside room left for it (see emit_frame_addr).
+static mut OVERALIGNED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
 // A new frame slot; returns its offset below the frame pointer.
 fn alloc_slot(size: i64, align: i64) -> i64 {
     let mut a = align;
     if a < 1 {
         a = 1;
     }
+    if a > 16 {
+        FRAME_SIZE = align_to(FRAME_SIZE + size + a - 16, 16);
+        OVERALIGNED.push(FRAME_SIZE);
+        OVERALIGNED.push(a);
+        OVERALIGNED.push(size);
+        return FRAME_SIZE;
+    }
     FRAME_SIZE = align_to(FRAME_SIZE + size, a);
     FRAME_SIZE
+}
+
+// The slot aligned above 16 holding frame offset `offset` (the offset of
+// a slot, or of a field inside one: `slot - field`), as its index in
+// OVERALIGNED, or -1.
+fn overaligned_slot(offset: i64) -> i64 {
+    let mut i = 0;
+    while i < OVERALIGNED.count {
+        let slot = OVERALIGNED.data[i];
+        if offset <= slot && offset > slot - OVERALIGNED.data[i + 2] {
+            return i;
+        }
+        i += 3;
+    }
+    -1
 }
 
 // A frame slot for a value of type `ty`; compound values get a multiple
@@ -182,6 +209,7 @@ fn gen_function(item: i64) {
     buf_clear(CODE);
     DEPTH = 0;
     FRAME_SIZE = 0;
+    OVERALIGNED.count = 0;
     RETURN_LABEL = new_label();
     emit_function_start(fn_symbol_prefix(f), FNS[f].name, fn_is_global(f));
     let ret = FNS[f].ret;
@@ -1308,6 +1336,21 @@ fn gen_call_sequence(n: i64, direct: i64, arg_types: *i64, count: i64, param_cou
     let stack_size = assign_arg_locations(arg_types, count, param_count, variadic, ret,
                                           &locations as *i64, &pieces as *i64,
                                           &kinds as *AbiClass, &float_regs);
+    // An aggregate aligned above 16 copied onto the stack (x86-64) must be
+    // aligned there: the pushed arguments move down so that the stack area
+    // is, and sp is restored from a frame slot after the call.
+    let mut over = 0;
+    for i in 0..count {
+        if kinds[i] == AbiClass::Stack {
+            let t = if arg_types[i] < 0 { 0 - arg_types[i] } else { arg_types[i] };
+            over = max_i64(over, type_align(t));
+        }
+    }
+    let mut saved_sp = 0;
+    if over > 16 && X86 {
+        saved_sp = alloc_slot(8, 8);
+        x64_realign_pushed(pushed, stack_size, over, saved_sp);
+    }
     if stack_size > 0 {
         emit_sp_sub(stack_size);
     }
@@ -1330,7 +1373,12 @@ fn gen_call_sequence(n: i64, direct: i64, arg_types: *i64, count: i64, param_cou
     } else {
         emit_call_indirect();
     }
-    emit_drop_temps_now(stack_size, pushed);
+    if saved_sp != 0 {
+        x64_restore_sp(saved_sp);
+        DEPTH -= pushed;
+    } else {
+        emit_drop_temps_now(stack_size, pushed);
+    }
     if is_compound(ret) {
         if !through_pointer {
             abi_classify(ret);

@@ -480,8 +480,13 @@ fn pm_add_value(dst: i64, v: i64, pos: i64) {
 // Whether the function being emitted calls anything.
 static mut HAS_CALLS: bool = false;
 
+// The alignment of the frame (above 16: sp is realigned in the prologue,
+// for slots, and stack arguments, aligned above 16).
+static mut FRAME_ALIGN: i64 = 16;
+
 fn layout_frame(fi: i64) {
     FRAME_OUT = 0;
+    FRAME_ALIGN = 16;
     HAS_CALLS = false;
     USES_SLOTS = false;
     for i in 0..ORDER.count {
@@ -497,6 +502,19 @@ fn layout_frame(fi: i64) {
                 let size = call_stack_size(v);
                 if size > FRAME_OUT {
                     FRAME_OUT = size;
+                }
+                if INSTS[v].op != Op::CallC {
+                    for k in 0..callee_param_count(v) {
+                        FRAME_ALIGN = max_i64(FRAME_ALIGN, type_align(callee_param(v, k)));
+                    }
+                }
+                // Aggregates passed to `...` (their first piece carries the
+                // type, negated).
+                for k in 0..INSTS[v].nargs {
+                    let declared = ARGTY.data[INSTS[v].args + k];
+                    if declared < 0 && declared != VARIADIC_PIECE {
+                        FRAME_ALIGN = max_i64(FRAME_ALIGN, type_align(0 - declared));
+                    }
                 }
             }
             v = INSTS[v].next;
@@ -519,6 +537,7 @@ fn layout_frame(fi: i64) {
         offset = align_to(offset, SLOTS[s].align);
         SLOTS[s].offset = offset;
         offset += SLOTS[s].size;
+        FRAME_ALIGN = max_i64(FRAME_ALIGN, SLOTS[s].align);
     }
     FRAME_TOTAL = align_to(offset, 16);
 }
@@ -655,6 +674,17 @@ fn gen_ir_function(fi: i64) {
     ir_function_start(fn_symbol_prefix(f), FNS[f].name, fn_is_global(f), frame);
     if FRAME_TOTAL > 0 {
         if X86 { x64_frame_reserve(FRAME_TOTAL); } else { a64_frame_reserve(FRAME_TOTAL); }
+        if FRAME_ALIGN > 16 {
+            // The frame is addressed from sp: aligned, its slots are (the
+            // epilogue restores sp from the frame pointer).
+            if X86 {
+                x64_imm(c"andq", 0 - FRAME_ALIGN, c"%rsp");
+            } else {
+                ins(c"mov x16, sp");
+                a64_align_down(16, FRAME_ALIGN);
+                ins(c"mov sp, x16");
+            }
+        }
     }
     save_callee_saved(false);
     emit_entry_moves(fi);
