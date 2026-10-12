@@ -106,8 +106,9 @@ list="$WORK/list"
 for f in tests/run/*.tach tests/run/*/main.tach examples/*.tach bench/*.tach compiler/src/main.tach; do
     [ -f "$f" ] || continue
     case "$f" in *"$FILTER"*) ;; *) continue ;; esac
-    # Programs that fail to compile, or need C sources or a header.
-    grep -q '// ERROR\|// CSOURCE\|// CHEADER' "$f" && continue
+    # Programs that fail to compile (or compile once --fix-imports has
+    # rewritten them, 0.8), or need C sources or a header.
+    grep -q '// ERROR\|// CSOURCE\|// CHEADER\|// FIXIMPORTS' "$f" && continue
     echo "$f" >>"$list"
 done
 n=0
