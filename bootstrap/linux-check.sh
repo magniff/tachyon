@@ -17,6 +17,8 @@
 #                  plain, through import and through --emit-header, and
 #                  check the layout of imported system headers
 #   --bench        also run the benchmarks (bench/run.sh)
+#   --objcheck     also check the compiler's objects against cc -c
+#                  (tests/objcheck.sh)
 #
 # Other options go to bootstrap.sh, e.g. --dev. After the chain, the md5
 # example is checked against md5sum.
@@ -34,6 +36,7 @@ ALL_LEVELS=0
 FUZZ=0
 ABI=0
 BENCH=0
+OBJCHECK=0
 
 die() {
     echo "linux-check: error: $*" >&2
@@ -53,7 +56,8 @@ for arg in "$@"; do
         --fuzz=*) FUZZ=${arg#--fuzz=} ;;
         --abi=*) ABI=${arg#--abi=} ;;
         --bench) BENCH=1 ;;
-        -h|--help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --objcheck) OBJCHECK=1 ;;
+        -h|--help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) rest="$rest $(quote "$arg")" ;;
     esac
 done
@@ -85,7 +89,7 @@ fi
 
 echo "==> running the chain in the container" >&2
 tar -C "$SNAP" -c -f - src | docker run --rm -i --cpus 4 --platform "$PLATFORM" -e SEED_TESTS="$SEED_TESTS" \
-    -e ALL_LEVELS="$ALL_LEVELS" -e FUZZ="$FUZZ" -e ABI="$ABI" -e BENCH="$BENCH" "$IMAGE" sh -c '
+    -e ALL_LEVELS="$ALL_LEVELS" -e FUZZ="$FUZZ" -e ABI="$ABI" -e BENCH="$BENCH" -e OBJCHECK="$OBJCHECK" "$IMAGE" sh -c '
     set -eu
     mkdir /work
     tar -x --no-same-owner -f - -C /work
@@ -111,6 +115,10 @@ tar -C "$SNAP" -c -f - src | docker run --rm -i --cpus 4 --platform "$PLATFORM" 
     if [ "$FUZZ" != 0 ]; then
         echo "==> $FUZZ random programs" >&2
         tests/fuzz/run.sh -n "$FUZZ" -k /tmp/fuzz-failures | tail -5
+    fi
+    if [ "$OBJCHECK" = 1 ]; then
+        echo "==> objects against cc -c" >&2
+        tests/objcheck.sh | tail -5
     fi
     if [ "$ABI" -gt 0 ]; then
         echo "==> $ABI C interoperability programs" >&2

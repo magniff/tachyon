@@ -91,9 +91,9 @@ END {
 # shellcheck disable=SC2086
 cc $arch $incs -o "$dir/c" "$dir/check.c"
 # shellcheck disable=SC2086
-"$compiler" $tflag $incs "$dir/check.tach" -o "$dir/t.s"
+"$compiler" $tflag $incs "$dir/check.tach" -o "$dir/t.o"
 # shellcheck disable=SC2086
-cc $arch -o "$dir/t" "$dir/t.s" -lm
+cc $arch -o "$dir/t" "$dir/t.o" -lm
 "$dir/c" > "$dir/c.out"
 "$dir/t" > "$dir/t.out"
 read -r records fields < "$dir/counts"
