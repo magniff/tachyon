@@ -15,11 +15,8 @@ tmp=$(mktemp)
     echo "// \`std\` (29_module.tach)."
     echo ""
     echo "fn std_source(out: i64) {"
-    awk '{
-        gsub(/\\/, "\\\\")
-        gsub(/"/, "\\\"")
-        printf "    buf_str(out, c\"%s\\n\");\n", $0
-    }' compiler/std/std.tach
+    # (sed, not awk: awks differ on backslashes in replacements.)
+    sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/^/    buf_str(out, c"/' -e 's/$/\\n");/' compiler/std/std.tach
     echo "}"
 } >"$tmp"
 if [ "${1:-}" = "-c" ]; then
