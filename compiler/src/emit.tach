@@ -51,6 +51,105 @@ pub static mut MEM_SCALE: i64 = 0;
 // 32 KB).
 pub static mut SHORT_BRANCHES: bool = false;
 
+// ---- Statistics (--stats) ----
+
+// --stats: 1 prints totals of the machine code emitted (at -O1 and -O2)
+// on stderr, 2 also a line per function.
+pub static mut STATS: i64 = 0;
+// The counters, of the function being emitted (ST_FN) and in total
+// (ST_ALL): instructions, register moves, stores to spill slots, loads
+// from them, moves and spill traffic on loop back edges, frame bytes
+// (with the saved frame pointer and return address), functions with a
+// frame, saved callee-saved registers, functions.
+const ST_INSTS: i64 = 0;
+const ST_MOVES: i64 = 1;
+const ST_SPILLS: i64 = 2;
+const ST_RELOADS: i64 = 3;
+const ST_BACK: i64 = 4;
+const ST_FRAME: i64 = 5;
+const ST_FRAMES: i64 = 6;
+const ST_SAVES: i64 = 7;
+const ST_FUNCS: i64 = 8;
+const ST_COUNT: i64 = 9;
+static mut ST_FN: [i64; 9] = [0; 9];
+static mut ST_ALL: [i64; 9] = [0; 9];
+
+fn st_names(k: i64) -> *u8 {
+    if k == ST_INSTS { c"instructions" }
+    else if k == ST_MOVES { c"moves" }
+    else if k == ST_SPILLS { c"spill stores" }
+    else if k == ST_RELOADS { c"reloads" }
+    else if k == ST_BACK { c"back-edge moves" }
+    else if k == ST_FRAME { c"frame bytes" }
+    else if k == ST_FRAMES { c"frames" }
+    else if k == ST_SAVES { c"saved registers" }
+    else { c"functions" }
+}
+
+// The spill traffic of the move to or from [sp + offset].
+fn st_spill(load: bool, base: i64, offset: i64) {
+    if MEM_INDEX < 0 && base == reg_sp() && offset >= SPILL_BASE && offset < SAVE_BASE {
+        ST_FN[if load { ST_RELOADS } else { ST_SPILLS }] += 1;
+    }
+}
+
+// The instructions of the function just emitted: lines of CODE indented
+// by four spaces that are not directives.
+fn st_count_instructions() -> i64 {
+    let data = BUFS[CODE].data;
+    let len = BUFS[CODE].len;
+    let mut n = 0;
+    let mut i = 0;
+    while i < len {
+        if i + 4 < len && data[i] == ' ' && data[i + 4] != '.' && data[i + 4] != ' ' {
+            n += 1;
+        }
+        while i < len && data[i] != '\n' {
+            i += 1;
+        }
+        i += 1;
+    }
+    n
+}
+
+fn st_function_done(fi: i64) {
+    ST_FN[ST_INSTS] = st_count_instructions();
+    ST_FN[ST_FUNCS] = 1;
+    if STATS > 1 {
+        let out = buf_new();
+        buf_str(out, c"stats ");
+        let name = FNS[IRFUNCS[fi].f].name;
+        buf_bytes(out, SYMS[name].text);
+        for k in 0..ST_COUNT - 1 {
+            buf_byte(out, ' ');
+            buf_int(out, ST_FN[k]);
+        }
+        buf_byte(out, '\n');
+        buf_write_fd(out, STDERR);
+    }
+    for k in 0..ST_COUNT {
+        ST_ALL[k] += ST_FN[k];
+        ST_FN[k] = 0;
+    }
+}
+
+// Prints the totals (after the last function).
+pub fn print_stats() {
+    if STATS == 0 {
+        return;
+    }
+    let out = buf_new();
+    buf_str(out, c"stats:");
+    for k in 0..ST_COUNT {
+        buf_str(out, if k == 0 { c" " } else { c", " });
+        buf_int(out, ST_ALL[k]);
+        buf_byte(out, ' ');
+        buf_str(out, st_names(k));
+    }
+    buf_byte(out, '\n');
+    buf_write_fd(out, STDERR);
+}
+
 // ---- Registers of the machine layer ----
 
 pub fn reg_sp() -> i64 { if X86 { 4 } else { 31 } }
@@ -194,6 +293,7 @@ pub fn m_mov(dst: i64, src: i64, ty: i64) {
         return;
     }
     if X86 { mx_mov(dst, src, ty); } else { ma_mov(dst, src, ty); }
+    ST_FN[ST_MOVES] += 1;
     LAST_MOV_DST = dst;
     LAST_MOV_SRC = src;
     LAST_MOV_END = BUFS[CODE].len;
@@ -210,9 +310,11 @@ pub fn m_load(ty: i64, dst: i64, base: i64, offset: i64) {
         m_mov(dst, LAST_STORE_REG, ty);
         return;
     }
+    st_spill(true, base, offset);
     if X86 { mx_load(ty, dst, base, offset); } else { ma_load(ty, dst, base, offset); }
 }
 pub fn m_store(ty: i64, src: i64, base: i64, offset: i64) {
+    st_spill(false, base, offset);
     if X86 { mx_store(ty, src, base, offset); } else { ma_store(ty, src, base, offset); }
     if MEM_INDEX < 0 && base == reg_sp() {
         LAST_STORE_REG = src;
@@ -783,6 +885,18 @@ pub fn gen_ir_function(fi: i64) {
         emit_label(EPILOGUE_LABEL);
         emit_ir_epilogue();
     }
+    if STATS > 0 {
+        if HAS_FRAME {
+            ST_FN[ST_FRAMES] = 1;
+            ST_FN[ST_FRAME] = FRAME_TOTAL + 16;
+        }
+        for r in 0..64 {
+            if CALLEE_USED[r] != 0 {
+                ST_FN[ST_SAVES] += 1;
+            }
+        }
+        st_function_done(fi);
+    }
     buf_bytes(ASM, buf_slice(CODE));
 }
 
@@ -1035,8 +1149,12 @@ fn emit_block_code(b: i64, next: i64) {
     let term = BLOCKS[b].term;
     if term == Term::Jump {
         let s = BLOCKS[b].s0;
+        let before = ST_FN[ST_MOVES] + ST_FN[ST_SPILLS] + ST_FN[ST_RELOADS];
         plan_end_moves(b);
         pm_resolve();
+        if BLOCKS[s].order <= k {
+            ST_FN[ST_BACK] += ST_FN[ST_MOVES] + ST_FN[ST_SPILLS] + ST_FN[ST_RELOADS] - before;
+        }
         let target = jump_target(s);
         if target != next {
             if DUP_DEPTH < 2 && is_duplicable(target) {
