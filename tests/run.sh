@@ -50,6 +50,12 @@
 #                        ASM(T)'s line; checked only when testing T
 #   // ASM-NOT(T): text  no line containing text between the neighbouring
 #                        ASM(T)s' lines
+#   // FIXIMPORTS: why   (0.8) a copy of the case (its directory, for a
+#                        main.tach) is rewritten by tachyonc --fix-imports,
+#                        which must then find nothing more to do; the copy
+#                        is what the other directives check
+#   // FIXED: text       the rewritten copy has a line (not a comment)
+#                        containing text, one directive per line
 # Stdout is compared after removing trailing whitespace. Each program may
 # run for 20 seconds.
 
@@ -148,6 +154,8 @@ read_directives() {
             else if (key == "CHECK-OPT") checkopt = value
             else if (key == "ASM(" target ")") asms = asms "+" value "\n"
             else if (key == "ASM-NOT(" target ")") asms = asms "-" value "\n"
+            else if (key == "FIXIMPORTS") fiximports = 1
+            else if (key == "FIXED") fixed = fixed value "\n"
         }
         END {
             printf "%s", args > (dir "/args")
@@ -165,6 +173,8 @@ read_directives() {
             printf "%s", checks > (dir "/checks")
             printf "%s", asms > (dir "/asms")
             printf "%s", (checkopt == "" ? "2" : checkopt) > (dir "/checkopt")
+            printf "%d", fiximports > (dir "/fiximports")
+            printf "%s", fixed > (dir "/fixed")
         }
     ' "$1"
 }
@@ -201,6 +211,9 @@ check_case() {
         source="$ROOT/$source"
     else
         source=$file
+    fi
+    if [ "$(cat "$dir/fiximports")" = 1 ] && ! fix_case "$source" "$dir"; then
+        return 1
     fi
     if [ -s "$dir/errors" ]; then
         "$COMPILER" --target "$TARGET" $OPT "$source" -o "$dir/prog.s" >"$dir/compile.out" 2>&1
@@ -280,6 +293,39 @@ check_case() {
             return 1
         fi
     done <"$dir/stderrs"
+    return 0
+}
+
+# FIXIMPORTS: a copy of case $1 (in $2/fix/run, next to a link to
+# tests/c, which cases include from) is rewritten by --fix-imports;
+# `source` becomes the copy.
+fix_case() {
+    fixdir="$2/fix"
+    mkdir -p "$fixdir/run"
+    ln -s "$ROOT/tests/c" "$fixdir/c"
+    case "$1" in
+        */main.tach)
+            cp -R "$(dirname "$1")" "$fixdir/run/"
+            source="$fixdir/run/$(basename "$(dirname "$1")")/main.tach" ;;
+        *)
+            cp "$1" "$fixdir/run/"
+            source="$fixdir/run/$(basename "$1")" ;;
+    esac
+    if ! "$COMPILER" --target "$TARGET" --fix-imports "$source" >"$2/fix.out" 2>&1; then
+        { echo "--fix-imports failed:"; cat "$2/fix.out"; } >"$2/why"
+        return 1
+    fi
+    if ! "$COMPILER" --target "$TARGET" --fix-imports "$source" >"$2/fix2.out" 2>&1 || [ -s "$2/fix2.out" ]; then
+        { echo "a second --fix-imports did not leave the program as it was:"; cat "$2/fix2.out"; } >"$2/why"
+        return 1
+    fi
+    find "$fixdir/run" -name '*.tach' -exec cat {} + | grep -v '^[[:space:]]*//' >"$2/fixed.txt"
+    while IFS= read -r text; do
+        if ! grep -qF -- "$text" "$2/fixed.txt"; then
+            { echo "the rewritten program has no line containing '$text':"; cat "$2/fixed.txt"; } >"$2/why"
+            return 1
+        fi
+    done <"$2/fixed"
     return 0
 }
 

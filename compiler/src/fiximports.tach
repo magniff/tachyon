@@ -1,0 +1,335 @@
+// `tachyonc --fix-imports FILE...` (0.8): rewrites a program written for
+// 0.7 or earlier, in place, into the imports 0.8 allows.
+//
+//   - `use a::b::*;` and `use E::*;` become `use a::b::{x, y};` (or `use
+//     a::b::x;`), listing the names the program finds through that `*`
+//     (sorted); a `*` nothing is found through is removed.
+//   - `import "h.h";` becomes `import "h.h" as c;` (every header's
+//     declarations are in one C module, so one name serves them all), and
+//     each use of a declaration found through it is written `c::name`.
+//
+// The program is checked as for compiling it; the module resolution
+// records what each `*` brought (modules.tach, LEGACY_IMPORTS). Every
+// file of the program (its modules' files too) is rewritten; the rest of
+// the text is left as it is.
+
+use crate::base::{FILES, FILE_COUNT, IntVec, SRC, STDOUT, SYMS, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, buf_write_fd, buf_write_file, intern_c};
+use crate::ast::NODES;
+use crate::modules::{B_MODULE, B_NONE, C_BY_NAME, C_MODULE, C_QUALS, GLOB_USES, STD_MODULE, binding, file_of_pos, glob_name_qualified, lookup_quiet, use_entry_count, use_entry_glob, use_entry_module, use_entry_node};
+
+pub static mut FIX_IMPORTS: bool = false;
+
+// The longest line a rewritten `use` keeps on one line.
+const LINE_WIDTH: i64 = 100;
+
+fn sym_less(a: i64, b: i64) -> bool {
+    let x = SYMS[a].text;
+    let y = SYMS[b].text;
+    let n = if x.len < y.len { x.len as i64 } else { y.len as i64 };
+    for i in 0..n {
+        if x[i] != y[i] {
+            return x[i] < y[i];
+        }
+    }
+    x.len < y.len
+}
+
+// Whether entry u is a plain `import "h.h";`.
+pub fn is_plain_import(u: i64) -> bool {
+    use_entry_glob(u) && NODES[use_entry_node(u)].d == 2
+}
+
+// The names the program finds through `*` entry u, sorted, into `out`;
+// the C declarations written with their path are left out, and `alias`
+// (the C module's name) takes their place.
+pub fn glob_names(u: i64, alias: i64, out: *IntVec) {
+    let mut qualified = false;
+    let mut i = 0;
+    while i < GLOB_USES.count {
+        if GLOB_USES.data[i] == u {
+            let name = GLOB_USES.data[i + 1];
+            if glob_name_qualified(u, name) {
+                qualified = true;
+            } else {
+                out.push(name);
+            }
+        }
+        i += 2;
+    }
+    if qualified {
+        let mut known = false;
+        for k in 0..(*out).count {
+            if (*out).data[k] == alias {
+                known = true;
+            }
+        }
+        if !known {
+            out.push(alias);
+        }
+    }
+    sort_syms(out);
+}
+
+fn sort_syms(v: *IntVec) {
+    for k in 1..(*v).count {
+        let mut j = k;
+        while j > 0 && sym_less((*v).data[j], (*v).data[j - 1]) {
+            let t = (*v).data[j];
+            (*v).data[j] = (*v).data[j - 1];
+            (*v).data[j - 1] = t;
+            j -= 1;
+        }
+    }
+}
+
+// The name for the C module: `c`, unless a module that needs it already
+// has another `c` in scope.
+pub fn c_alias() -> i64 {
+    let candidates: [*u8; 3] = [c"c", c"c_", c"cdecl"];
+    for k in 0..3 {
+        let name = intern_c(candidates[k]);
+        let mut free = true;
+        for u in 0..use_entry_count() {
+            if !use_entry_glob(u) {
+                continue;
+            }
+            let m = use_entry_module(u);
+            let b = lookup_quiet(m, name, m);
+            if b != B_NONE && (C_MODULE < 0 || b != binding(B_MODULE, C_MODULE)) {
+                free = false;
+            }
+        }
+        if free {
+            return name;
+        }
+    }
+    intern_c(c"cdecl")
+}
+
+fn line_start(pos: i64) -> i64 {
+    let f = file_of_pos(pos);
+    let mut i = pos;
+    while i > FILES[f].start && SRC[i - 1] != '\n' {
+        i -= 1;
+    }
+    i
+}
+
+fn line_end(pos: i64) -> i64 {
+    let f = file_of_pos(pos);
+    let mut i = pos;
+    while i < FILES[f].end && SRC[i] != '\n' {
+        i += 1;
+    }
+    i
+}
+
+fn blank(from: i64, to: i64) -> bool {
+    for i in from..to {
+        if SRC[i] != ' ' && SRC[i] != '\t' && SRC[i] != '\r' {
+            return false;
+        }
+    }
+    true
+}
+
+fn add_edit(edits: *IntVec, pos: i64, del: i64, text: i64) {
+    edits.push(pos);
+    edits.push(del);
+    edits.push(text);
+}
+
+// The edit for `*` entry u: its list of names, or its removal.
+fn glob_edit(u: i64, alias: i64, edits: *IntVec) {
+    let n = use_entry_node(u);
+    let path = NODES[n].c;
+    let mut star = NODES[path].end;
+    while SRC[star] != '*' {
+        star += 1;
+    }
+    let mut names = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    glob_names(u, alias, &names);
+    let start = line_start(n_start(n));
+    if names.count == 0 {
+        let first = n_start(n);
+        let end = line_end(NODES[n].end);
+        if blank(start, first) && blank(NODES[n].end, end) {
+            let f = file_of_pos(start);
+            add_edit(edits, start, if end < FILES[f].end { end + 1 - start } else { end - start }, buf_new());
+        } else {
+            add_edit(edits, first, NODES[n].end - first, buf_new());
+        }
+        return;
+    }
+    let text = buf_new();
+    if names.count == 1 {
+        // (one name: `use a::b::x;`)
+        buf_bytes(text, SYMS[names.data[0]].text);
+        add_edit(edits, star, 1, text);
+        return;
+    }
+    buf_byte(text, '{');
+    let mut width = 1;
+    for k in 0..names.count {
+        if k > 0 {
+            buf_str(text, c", ");
+        }
+        buf_bytes(text, SYMS[names.data[k]].text);
+        width += SYMS[names.data[k]].text.len as i64 + 2;
+    }
+    buf_byte(text, '}');
+    if (star - start) + width + (line_end(star) - star - 1) <= LINE_WIDTH {
+        add_edit(edits, star, 1, text);
+        return;
+    }
+    // One name after the other, on the lines between the braces.
+    let mut indent = start;
+    while SRC[indent] == ' ' || SRC[indent] == '\t' {
+        indent += 1;
+    }
+    let long = buf_new();
+    buf_byte(long, '{');
+    let mut col = LINE_WIDTH;
+    for k in 0..names.count {
+        let len = SYMS[names.data[k]].text.len as i64;
+        if col + 1 + len + 1 > LINE_WIDTH {
+            buf_byte(long, '\n');
+            buf_bytes(long, SRC[start..indent]);
+            buf_str(long, c"    ");
+            col = indent - start + 4;
+        } else {
+            buf_byte(long, ' ');
+            col += 1;
+        }
+        buf_bytes(long, SYMS[names.data[k]].text);
+        buf_byte(long, ',');
+        col += len + 1;
+    }
+    buf_byte(long, '\n');
+    buf_bytes(long, SRC[start..indent]);
+    buf_byte(long, '}');
+    add_edit(edits, star, 1, long);
+}
+
+// Where the item of Use node n starts (its `pub`, if any).
+fn n_start(n: i64) -> i64 {
+    let first = NODES[n].start;
+    let mut i = first;
+    while i > 0 && (SRC[i - 1] == ' ' || SRC[i - 1] == '\t') {
+        i -= 1;
+    }
+    if i >= 3 && SRC[i - 3] == 'p' && SRC[i - 2] == 'u' && SRC[i - 1] == 'b'
+        && (i == 3 || SRC[i - 4] == ' ' || SRC[i - 4] == '\t' || SRC[i - 4] == '\n') {
+        return i - 3;
+    }
+    first
+}
+
+fn alias_text(alias: i64, before: *u8, after: *u8) -> i64 {
+    let text = buf_new();
+    buf_str(text, before);
+    buf_bytes(text, SYMS[alias].text);
+    buf_str(text, after);
+    text
+}
+
+// Rewrites the program's files; returns the number of files changed.
+pub fn fix_imports() -> i64 {
+    let alias = c_alias();
+    let mut edits = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for u in 0..use_entry_count() {
+        if !use_entry_glob(u) {
+            continue;
+        }
+        if is_plain_import(u) {
+            let n = use_entry_node(u);
+            add_edit(&edits, NODES[n].end - 1, 0, alias_text(alias, c" as ", c""));
+        } else {
+            glob_edit(u, alias, &edits);
+        }
+    }
+    // The C declarations used in patterns, imported by name after the
+    // import (or the `*`) that brought them.
+    for u in 0..use_entry_count() {
+        let mut names = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut k = 0;
+        while k < C_BY_NAME.count {
+            if C_BY_NAME.data[k] == u {
+                names.push(C_BY_NAME.data[k + 1]);
+            }
+            k += 2;
+        }
+        if names.count == 0 {
+            continue;
+        }
+        sort_syms(&names);
+        let n = use_entry_node(u);
+        let start = line_start(n_start(n));
+        let mut indent = start;
+        while SRC[indent] == ' ' || SRC[indent] == '\t' {
+            indent += 1;
+        }
+        let text = buf_new();
+        buf_byte(text, '\n');
+        buf_bytes(text, SRC[start..indent]);
+        buf_str(text, c"use ");
+        buf_bytes(text, SYMS[alias].text);
+        buf_str(text, if names.count > 1 { c"::{" } else { c"::" });
+        for j in 0..names.count {
+            if j > 0 {
+                buf_str(text, c", ");
+            }
+            buf_bytes(text, SYMS[names.data[j]].text);
+        }
+        buf_str(text, if names.count > 1 { c"};" } else { c";" });
+        add_edit(&edits, NODES[n].end, 0, text);
+    }
+    let mut i = 0;
+    while i < C_QUALS.count {
+        add_edit(&edits, C_QUALS.data[i], 0, alias_text(alias, c"", c"::"));
+        i += 3;
+    }
+    // (in order of position: an insertion sort of the triples)
+    let n = edits.count / 3;
+    for k in 1..n {
+        let mut j = k;
+        while j > 0 && edits.data[3 * j] < edits.data[3 * (j - 1)] {
+            for x in 0..3 {
+                let t = edits.data[3 * j + x];
+                edits.data[3 * j + x] = edits.data[3 * (j - 1) + x];
+                edits.data[3 * (j - 1) + x] = t;
+            }
+            j -= 1;
+        }
+    }
+    let mut changed = 0;
+    let mut e = 0;
+    for f in 0..FILE_COUNT {
+        if FILES[f].module == STD_MODULE || FILES[f].module == C_MODULE {
+            continue;
+        }
+        if e >= n || edits.data[3 * e] >= FILES[f].end {
+            continue;
+        }
+        let out = buf_new();
+        let mut cur = FILES[f].start;
+        while e < n && edits.data[3 * e] < FILES[f].end + 1 {
+            let pos = edits.data[3 * e];
+            if pos >= cur {
+                buf_bytes(out, SRC[cur..pos]);
+                buf_bytes(out, buf_slice(edits.data[3 * e + 2]));
+                cur = pos + edits.data[3 * e + 1];
+            }
+            e += 1;
+        }
+        buf_bytes(out, SRC[cur..FILES[f].end]);
+        buf_write_file(out, FILES[f].path);
+        let note = buf_new();
+        buf_str(note, c"fixed ");
+        buf_str(note, FILES[f].path);
+        buf_byte(note, '\n');
+        buf_write_fd(note, STDOUT);
+        changed += 1;
+    }
+    changed
+}

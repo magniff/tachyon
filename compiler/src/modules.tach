@@ -404,6 +404,9 @@ pub fn collect_uses() {
                 continue;
             }
             let entry = USE_ENTRY_COUNT;
+            if NODES[item].a == 0 {
+                LEGACY_IMPORTS = true;
+            }
             add_use_entry(m, NODES[item].a, 0, 0, NODES[item].a == 0, public, item);
             USE_ENTRIES[entry].state = 2;
             USE_ENTRIES[entry].result = binding(B_MODULE, C_MODULE);
@@ -411,6 +414,7 @@ pub fn collect_uses() {
         }
         let path = NODES[item].c;
         if NODES[item].b == 1 {
+            LEGACY_IMPORTS = true;
             add_use_entry(m, -1, 0, path, true, public, item);
             continue;
         }
@@ -528,7 +532,8 @@ pub fn access_error(b: i64, pos: i64, name: i64) -> ! {
 
 // What `name` stands for in module m, seen from code in module `from`.
 pub fn lookup_name(m: i64, name: i64, from: i64) -> i64 {
-    let cacheable = SCOPES_READY && m == from;
+    // (not while the imports are recorded: see LEGACY_IMPORTS)
+    let cacheable = SCOPES_READY && m == from && !LEGACY_IMPORTS;
     let k = (name + 1) * 65536 + m;
     if cacheable {
         let known = SCOPE_CACHE.get(k);
@@ -575,6 +580,7 @@ fn lookup_uncached(m: i64, name: i64, from: i64, depth: i64) -> i64 {
     // `*` imports: two that bring different things make the name
     // ambiguous (an error where it is used; 0.6, before the first won).
     let mut globbed = B_NONE;
+    let mut via = -1;
     for k in 0..count {
         let u = MODULE_USES[m].data[k];
         if !USE_ENTRIES[u].glob || !(inside || USE_ENTRIES[u].public) {
@@ -594,12 +600,16 @@ fn lookup_uncached(m: i64, name: i64, from: i64, depth: i64) -> i64 {
         if found != B_NONE {
             if globbed == B_NONE {
                 globbed = found;
+                via = u;
             } else if globbed != found {
                 return B_AMBIGUOUS;
             }
         }
     }
     if globbed != B_NONE {
+        if LOOKUP_QUIET == 0 {
+            note_glob_use(via, name, m == from && depth == 0);
+        }
         return globbed;
     }
     if MODULES[m].is_c {
@@ -613,6 +623,131 @@ fn lookup_uncached(m: i64, name: i64, from: i64, depth: i64) -> i64 {
         return prelude_lookup(name, m, depth);
     }
     B_NONE
+}
+
+// ---- What the `*` imports and the plain header imports bring (0.8) ----
+//
+// 0.8 removed `use a::b::*;`, `use E::*;` and `import "h.h";` (without
+// `as`). They are still parsed and resolved, so that `tachyonc
+// --fix-imports` can turn code written for 0.7 into explicit imports, and
+// the errors for them can name what replaces them. While a program has
+// one (LEGACY_IMPORTS), every name a lookup finds through a `*` is
+// recorded with the entry that brought it, and the scope cache is off
+// (a lookup that only asks, LOOKUP_QUIET, records nothing; its caller
+// repeats it with lookup_commit once the answer is used).
+
+pub static mut LEGACY_IMPORTS: bool = false;
+pub static mut LOOKUP_QUIET: i64 = 0;
+// (entry, name) pairs, in the order found; GLOB_SEEN: the same, as keys.
+pub static mut GLOB_USES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut GLOB_SEEN: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+// The `*` entry (+ 1) a bare name of a module came through, by (module,
+// name).
+static mut GLOB_VIA: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+// The uses of C declarations through a plain `import "h.h";`: (position,
+// entry, name) triples, to be written `c::name`; QUAL_SEEN: by position,
+// and by (entry, name) for the names no longer imported by name.
+pub static mut C_QUALS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut QUAL_SEEN: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+static mut QUAL_NAMES: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+// The positions of patterns (a constant cannot be written with its path
+// there), and the C declarations used in them: (entry, name) pairs, to be
+// imported by name (`use c::EOF;`).
+static mut PATTERN_POS: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+pub static mut C_BY_NAME: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut BY_NAME_SEEN: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+// The name at `pos` is a pattern's.
+pub fn note_pattern_pos(pos: i64) {
+    if LEGACY_IMPORTS {
+        PATTERN_POS.put(pos + 1, 1);
+    }
+}
+
+fn glob_key(u: i64, name: i64) -> i64 {
+    (u + 1) * 16777216 + name + 1
+}
+
+fn note_glob_use(u: i64, name: i64, bare: bool) {
+    if bare {
+        GLOB_VIA.put((name + 1) * 65536 + USE_ENTRIES[u].module, u + 1);
+    }
+    let k = glob_key(u, name);
+    if GLOB_SEEN.get(k) == 0 {
+        GLOB_SEEN.put(k, 1);
+        GLOB_USES.push(u);
+        GLOB_USES.push(name);
+    }
+}
+
+// A lookup whose answer may go unused (records nothing).
+pub fn lookup_quiet(m: i64, name: i64, from: i64) -> i64 {
+    LOOKUP_QUIET += 1;
+    let b = lookup_name(m, name, from);
+    LOOKUP_QUIET -= 1;
+    b
+}
+
+// Bare name `name` at `pos`, looked up quietly in the current module, is
+// used.
+pub fn lookup_commit(name: i64, pos: i64) {
+    if LEGACY_IMPORTS {
+        note_c_use(pos, name, lookup_name(CUR_MOD, name, CUR_MOD));
+    }
+}
+
+// Bare name `name` at `pos` in the current module stands for b: when b is
+// a C declaration found through a `*` entry (a plain import, or a `*`
+// that leads to one), the use is recorded for --fix-imports.
+pub fn note_c_use(pos: i64, name: i64, b: i64) {
+    if !LEGACY_IMPORTS || LOOKUP_QUIET > 0 || C_MODULE < 0 || binding_kind(b) != B_ITEM {
+        return;
+    }
+    let via = GLOB_VIA.get((name + 1) * 65536 + CUR_MOD) - 1;
+    if via < 0 || qualified_if_known(C_MODULE, name) != binding_value(b) || QUAL_SEEN.get(pos + 1) != 0 {
+        return;
+    }
+    QUAL_SEEN.put(pos + 1, 1);
+    QUAL_NAMES.put(glob_key(via, name), 1);
+    if PATTERN_POS.get(pos + 1) != 0 {
+        if BY_NAME_SEEN.get(glob_key(via, name)) == 0 {
+            BY_NAME_SEEN.put(glob_key(via, name), 1);
+            C_BY_NAME.push(via);
+            C_BY_NAME.push(name);
+        }
+        return;
+    }
+    C_QUALS.push(pos);
+    C_QUALS.push(via);
+    C_QUALS.push(name);
+}
+
+// Whether the C declaration `name`, found through entry u, is written
+// with its path instead (so it is not imported by name).
+pub fn glob_name_qualified(u: i64, name: i64) -> bool {
+    QUAL_NAMES.get(glob_key(u, name)) != 0
+}
+
+pub fn use_entry_count() -> i64 {
+    USE_ENTRY_COUNT
+}
+
+// Entry u: its `use`/`import` node, module, and whether it is a `*` (or a
+// plain import, d = 2).
+pub fn use_entry_node(u: i64) -> i64 {
+    USE_ENTRIES[u].node
+}
+
+pub fn use_entry_module(u: i64) -> i64 {
+    USE_ENTRIES[u].module
+}
+
+pub fn use_entry_glob(u: i64) -> bool {
+    USE_ENTRIES[u].glob
+}
+
+pub fn file_of_pos(pos: i64) -> i64 {
+    file_of(pos)
 }
 
 // Variant `name` of enum e: B_VARIANT, or B_TVARIANT for a generic enum,
