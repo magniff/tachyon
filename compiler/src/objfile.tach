@@ -52,7 +52,7 @@ pub const TAIL_JCC: i64 = 3;
 // Bytes [start, start + len) of OBJ_BYTES, then the tail: an alignment to
 // 2^arg bytes, or a branch (arg: the condition) to symbol `sym`, short or
 // long. `addr`: the fragment's offset in its section.
-struct Frag { sec: i64, start: i64, len: i64, tail: i64, arg: i64, sym: i64, long: bool, addr: i64 }
+struct Frag { sec: i64, start: i64, len: i64, tail: i64, arg: i64, sym: i64, long: bool, addr: i64, atom: i64 }
 
 static mut FRAGS: *Frag = 0 as *Frag;
 static mut FRAG_COUNT: i64 = 0;
@@ -66,7 +66,7 @@ fn new_frag(sec: i64) {
         FRAGS[OPEN].len = BUFS[OBJ_BYTES].len - FRAGS[OPEN].start;
     }
     FRAGS = grow(FRAGS, FRAG_COUNT, &FRAG_CAP);
-    FRAGS[FRAG_COUNT] = Frag { sec: sec, start: BUFS[OBJ_BYTES].len, len: 0, tail: TAIL_NONE, arg: 0, sym: -1, long: false, addr: 0 };
+    FRAGS[FRAG_COUNT] = Frag { sec: sec, start: BUFS[OBJ_BYTES].len, len: 0, tail: TAIL_NONE, arg: 0, sym: -1, long: false, addr: 0, atom: -1 };
     OPEN = FRAG_COUNT;
     FRAG_COUNT += 1;
 }
@@ -76,6 +76,7 @@ fn end_frag(tail: i64, arg: i64, sym: i64) {
     FRAGS[OPEN].tail = tail;
     FRAGS[OPEN].arg = arg;
     FRAGS[OPEN].sym = sym;
+    FRAGS[OPEN].atom = CUR_ATOM[CUR_SEC];
     new_frag(CUR_SEC);
 }
 
@@ -133,7 +134,12 @@ fn put32(pos: i64, v: i64) {
 // start of fragment `frag`), or a name only referred to. `in_table`: the
 // symbol table needs it (relocations refer to it); `index`: its index
 // there.
-struct ASym { name: i64, defined: bool, global: bool, frag: i64, off: i64, sec: i64, in_table: bool, index: i64 }
+struct ASym { name: i64, defined: bool, global: bool, frag: i64, off: i64, sec: i64, in_table: bool, index: i64, atom: i64 }
+
+// Mach-O's atoms: a label that is not temporary starts one, which runs to
+// the next. LLVM resolves a pc-relative reference only within one atom
+// (else the linker could move them apart): the current atom per section.
+static mut CUR_ATOM: [i64; 4] = [-1, -1, -1, -1];
 
 static mut ASYMS: *ASym = 0 as *ASym;
 static mut ASYM_COUNT: i64 = 0;
@@ -149,7 +155,7 @@ pub fn asym(name: [u8]) -> i64 {
     }
     ASYMS = grow(ASYMS, ASYM_COUNT, &ASYM_CAP);
     let s = ASYM_COUNT;
-    ASYMS[s] = ASym { name: id, defined: false, global: false, frag: -1, off: 0, sec: -1, in_table: false, index: -1 };
+    ASYMS[s] = ASym { name: id, defined: false, global: false, frag: -1, off: 0, sec: -1, in_table: false, index: -1, atom: -1 };
     ASYM_COUNT += 1;
     ASYM_MAP.put(id + 1, s + 1);
     s
@@ -186,7 +192,7 @@ pub const FX_ABS64: i64 = 13;
 // x86-64 or data field); `frag`: its fragment; `end`: for x86-64, the
 // position where the instruction ends (pc); `sym2`: the subtracted label
 // of FX_DIFF32. `rex`: an x86-64 GOT load with a REX prefix.
-struct Fixup { kind: i64, frag: i64, pos: i64, sym: i64, sym2: i64, addend: i64, end: i64, rex: bool }
+struct Fixup { kind: i64, frag: i64, pos: i64, sym: i64, sym2: i64, addend: i64, end: i64, rex: bool, atom: i64 }
 
 static mut FIXUPS: *Fixup = 0 as *Fixup;
 static mut FIXUP_COUNT: i64 = 0;
@@ -194,7 +200,7 @@ static mut FIXUP_CAP: i64 = 0;
 
 pub fn fixup(kind: i64, pos: i64, sym: i64, addend: i64, end: i64, rex: bool) {
     FIXUPS = grow(FIXUPS, FIXUP_COUNT, &FIXUP_CAP);
-    FIXUPS[FIXUP_COUNT] = Fixup { kind: kind, frag: OPEN, pos: pos, sym: sym, sym2: -1, addend: addend, end: end, rex: rex };
+    FIXUPS[FIXUP_COUNT] = Fixup { kind: kind, frag: OPEN, pos: pos, sym: sym, sym2: -1, addend: addend, end: end, rex: rex, atom: CUR_ATOM[CUR_SEC] };
     FIXUP_COUNT += 1;
 }
 
@@ -457,6 +463,10 @@ fn label(a: i64, b: i64) {
     ASYMS[s].frag = OPEN;
     ASYMS[s].off = here() - FRAGS[OPEN].start;
     ASYMS[s].sec = CUR_SEC;
+    if !is_temp(s) {
+        CUR_ATOM[CUR_SEC] = s;
+    }
+    ASYMS[s].atom = CUR_ATOM[CUR_SEC];
 }
 
 fn assemble_line(a: i64, b: i64) {
@@ -500,15 +510,17 @@ fn assemble_line(a: i64, b: i64) {
 
 // ---- Layout ----
 
-// Mach-O: a branch to a temporary label of the same section may be
-// short; anything else is a relocation (LLVM's rule). ELF: a branch to a
-// non-global label of the same section may be short (GNU as's rule).
+// A branch the assembler resolves may be short: to a non-global label of
+// the same section (GNU as), and of the same atom (LLVM, Mach-O);
+// anything else is long, with a relocation.
 fn relaxable(f: i64) -> bool {
-    let s = FRAGS[f].sym;
-    if !ASYMS[s].defined || ASYMS[s].sec != FRAGS[f].sec {
-        return false;
-    }
-    if ELF { !ASYMS[s].global } else { is_temp(s) }
+    resolvable(FRAGS[f].sym, FRAGS[f].sec, FRAGS[f].atom)
+}
+
+// Whether a pc-relative reference to s from section sec, atom `atom`, is
+// resolved by the assembler.
+fn resolvable(s: i64, sec: i64, atom: i64) -> bool {
+    ASYMS[s].defined && ASYMS[s].sec == sec && !ASYMS[s].global && (ELF || ASYMS[s].atom == atom)
 }
 
 fn tail_size(f: i64, addr: i64) -> i64 {
@@ -629,7 +641,7 @@ fn resolve_fixups() {
             reloc_to(sec, p, MACHO_A64_GOT_PAGEOFF12, s, 0, false, 2);
         } else if kind == FX_X86_BRANCH || kind == FX_X86_RIP || kind == FX_X86_GOT {
             let end = FRAGS[f].addr + (fx.end - FRAGS[f].start);
-            if kind != FX_X86_GOT && same_section(s, sec) && !ASYMS[s].global {
+            if kind != FX_X86_GOT && resolvable(s, sec, fx.atom) {
                 put32(fx.pos, sym_addr(s) + fx.addend - end);
             } else if ELF {
                 let rtype = if kind == FX_X86_BRANCH { ELF_X64_PLT32 } else if kind == FX_X86_RIP { ELF_X64_PC32 } else if fx.rex { ELF_X64_REX_GOTPCRELX } else { ELF_X64_GOTPCRELX };
