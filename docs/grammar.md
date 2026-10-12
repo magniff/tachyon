@@ -253,6 +253,87 @@ pointers, slices are views: writing through one needs no `mut`. A failed
 check writes `index out of bounds: index I, length N` (or `slice range out
 of bounds: ...`) to stderr and exits with code 101.
 
+## Undefined behaviour
+
+The principle: a tachyon program means one thing, the same at every
+optimization level and on every target, so that it can be reasoned about
+(by people and by agents) from what it says. Where C leaves behaviour
+undefined, tachyon defines it, or checks it and stops with a message.
+The aim is no undefined behaviour at all in code that does not opt out of
+the checks; the operations below that are still undefined all involve raw
+pointers or C, and move behind an `unsafe` boundary in 0.8.
+
+**Defined** (each case checked at -O0 and -O2, on AArch64 and x86-64, at
+run time and in constant folding, which agree):
+
+- Integer overflow of `+`, `-`, `*` and unary `-` wraps at the type's
+  width (two's complement): `i32::MAX + 1 == i32::MIN`,
+  `-i64::MIN == i64::MIN`.
+- Division and remainder by zero: `x / 0 == 0`, `x % 0 == x`.
+  `MIN / -1 == MIN` and `MIN % -1 == 0`.
+- Shifts: the amount is taken modulo 64 for 64-bit operands, and modulo
+  32 for narrower ones, which are shifted as 32-bit values and then
+  truncated (`1u8 << 9 == 0`, `1u8 << 33 == 2`); a negative amount is a
+  large one (`1 << -1 == 1 << 63`). `>>` is arithmetic on signed types,
+  logical on unsigned ones.
+- Float to integer conversion (`as`): NaN becomes 0; a signed target
+  saturates at its own bounds (`1e30 as i64 == i64::MAX`,
+  `3e9 as i32 == i32::MAX`); `u64` saturates at its maximum above it and
+  wraps below zero (`-5.0 as u64 == 2^64 - 5`, as through `i64`);
+  narrower unsigned targets take the low bits of the `i64` conversion
+  (`300.0 as u8 == 44`).
+- Floating point is IEEE 754 double and single precision, without
+  reassociation or contraction (no fast-math); comparisons with NaN are
+  false, except `!=`, which is true.
+- Evaluation order: operands left to right, the right-hand side of an
+  assignment before its place, each operand of `==` on aggregates once.
+- Indexing a slice or a fixed array, and slicing an array or a slice, is
+  checked: a failure writes `index out of bounds: index I, length N` (or
+  `slice range out of bounds: ...`) to stderr and exits with 101 (arrays
+  since 0.7). A cast of an integer to an enum is checked (0.4), as are
+  std's `unwrap`s.
+- There is no uninitialized variable: `let` and `static` require an
+  initializer; aggregates are written in full by their literals.
+- There is no type-based aliasing rule: memory read through a pointer of
+  another type is that memory's bytes, reinterpreted (when the pointer is
+  valid; see below). `#[repr(C)]` unions read their bytes the same way.
+- Runaway recursion exhausts the stack and the operating system stops
+  the program (a guard page); it never corrupts memory. It is not yet a
+  panic with a message.
+
+**Still undefined** (all of it through raw pointers or C):
+
+- Dereferencing a raw pointer (`*p`, `p[i]`, `p.f` through a pointer)
+  that does not point to live memory of its type and alignment: null,
+  dangling (freed, or a returned local's address), out of bounds or
+  misaligned. Raw-pointer indexing `p[i]` is unchecked by design: a
+  pointer has no length.
+- Slicing a raw pointer (`p[lo..hi]`): the slice is only as valid as the
+  memory behind it.
+- Pointer arithmetic and casts: an integer cast to a pointer, a pointer
+  to one type used as another beyond the memory it points to.
+- Using an array or slice whose storage was moved or freed during the
+  expression that uses it: `a[f()]` reads the raw pointer `a` before
+  calling `f`; if `f` reallocates it, the access is through a dangling
+  pointer.
+- Reading memory nobody wrote (from `malloc`, or the padding of a struct
+  read as bytes): the value is unspecified, and the optimizer may assume
+  any value for it.
+- Calling C: everything C leaves undefined stays so (including a
+  declaration in an `extern "C"` block that does not match the C
+  definition, and `longjmp` past frames that need cleanup).
+- Calling a function pointer made from an integer or from a pointer of
+  another type.
+
+**The plan.** 0.8 introduces `unsafe` blocks and `unsafe fn`: every
+operation in the second list (raw-pointer dereference, indexing,
+slicing, arithmetic and casts, calls to `extern "C"` functions and
+through pointers made from integers) is allowed only inside them, and
+safe code (the rest of the language, std's safe API) has no undefined
+behaviour. Reading uninitialized heap memory goes away with a std
+allocator that zeroes (or a `freeze`), and stack exhaustion becomes a
+panic with a message.
+
 ## Layout, conventions and C
 
 Tachyon guarantees **nothing** about the layout of its own types (the order

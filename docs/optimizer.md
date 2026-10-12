@@ -821,7 +821,10 @@ profile-guided scheduling (0.9).
   promotion can keep a stack machine's `sp` in a register (shown on small
   programs), but not yet in bench/interp: its `match`-dispatched loop is
   not promoted (to look at in 0.8)
-- remaining: the "Undefined behaviour" section in grammar.md
+- done: an "Undefined behaviour" section in grammar.md: what is defined
+  (each case checked at -O0 and -O2 on both instruction sets, at run time
+  and folded), what is still undefined (raw pointers and C), and the plan
+  (`unsafe` in 0.8)
 
 The compiler writes object files itself. The assembly text it has always
 written stays the single source: `objfile.tach` assembles exactly that
