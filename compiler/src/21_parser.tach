@@ -128,10 +128,77 @@ fn parse_program() -> i64 {
     let program = new_node(NodeKind::None, 0, 0);
     let mark = list_begin();
     while !at(Tok::Eof) {
-        parse_top_item();
+        // A recovery point (see err_end): after an error, the parser goes
+        // on at the next item.
+        let depth = RECOVER_DEPTH;
+        let items = SCRATCH.count;
+        let start = P;
+        if _setjmp(recover_enter()) == 0 {
+            parse_top_item();
+        } else {
+            SCRATCH.count = items;
+            NO_STRUCT = false;
+            skip_to_item(start);
+        }
+        recover_leave(depth);
     }
     list_end(program, mark);
+    exit_if_errors();
     program
+}
+
+// After an error in the item starting at token `start`: on to the next
+// token after it that starts an item at the beginning of a line.
+fn skip_to_item(start: i64) {
+    P = start + 1;
+    while !at(Tok::Eof) {
+        let pos = TOKS[P].start;
+        let line_start = pos == 0 || SRC[pos - 1] == '\n';
+        if line_start && (is_item_start(cur()) || at(Tok::Pub) || at(Tok::Use) || at(Tok::Mod)
+            || at(Tok::Import) || at(Tok::Hash) || at(Tok::Impl)) {
+            return;
+        }
+        advance();
+    }
+}
+
+// After an error in the statement starting at token `start`: past its `;`,
+// or up to the `}` closing its block.
+fn skip_statement(start: i64) {
+    P = start;
+    // The brackets open in the statement (a `}` also closes the `(` and
+    // `[` left open inside its `{`).
+    let mut open = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    while !at(Tok::Eof) {
+        let kind = cur();
+        if kind == Tok::LBrace || kind == Tok::LParen || kind == Tok::LBracket {
+            open.push(kind as i64);
+        } else if kind == Tok::RBrace || kind == Tok::RParen || kind == Tok::RBracket {
+            if kind == Tok::RBrace {
+                while open.count > 0 && open.data[open.count - 1] != Tok::LBrace as i64 {
+                    open.count -= 1;
+                }
+            }
+            if open.count == 0 {
+                return;
+            }
+            open.count -= 1;
+            let depth = open.count;
+            if depth == 0 && kind == Tok::RBrace && P > start {
+                // A statement ending with a block (`if`, `while`, ...),
+                // unless an `else` follows.
+                advance();
+                if !at(Tok::Else) {
+                    return;
+                }
+                continue;
+            }
+        } else if kind == Tok::Semi && open.count == 0 {
+            advance();
+            return;
+        }
+        advance();
+    }
 }
 
 // One item (or the several items of an impl or extern block), pushed to
@@ -941,10 +1008,25 @@ fn parse_block() -> i64 {
         if is_item_start(cur()) {
             syntax_error(c"expected '}' (items cannot be nested in blocks)");
         }
-        if tail != 0 {
-            syntax_error(c"expected ';' or '}' after expression");
+        // A recovery point: after an error, on at the next statement.
+        let depth = RECOVER_DEPTH;
+        let stmts = SCRATCH.count;
+        let start = P;
+        let mut stmt = 0;
+        if _setjmp(recover_enter()) == 0 {
+            if tail != 0 {
+                syntax_error(c"expected ';' or '}' after expression");
+            }
+            stmt = parse_stmt();
+        } else {
+            SCRATCH.count = stmts;
+            NO_STRUCT = false;
+            skip_statement(start);
         }
-        let stmt = parse_stmt();
+        recover_leave(depth);
+        if stmt == 0 {
+            continue;
+        }
         if NODES[stmt].kind == NodeKind::ExprStmt && NODES[stmt].b == 2 {
             // A tail expression.
             tail = NODES[stmt].a;

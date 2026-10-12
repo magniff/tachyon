@@ -12,6 +12,9 @@
 // ---- C library ----
 
 extern "C" {
+    // Error recovery (see err_end): the jumps back to a recovery point.
+    fn _setjmp(env: *u8) -> i32;
+    fn _longjmp(env: *u8, value: i32) -> !;
     fn malloc(size: u64) -> *u8;
     fn realloc(ptr: *u8, size: u64) -> *u8;
     fn free(ptr: *u8);
@@ -415,6 +418,84 @@ fn err_begin(pos: i64) {
     buf_clear(ERR);
     buf_clear(ERR_HELP);
     ERR_POS = pos;
+    ERR_POISONED = false;
+}
+
+// ---- Several errors (0.5) ----
+//
+// The parser and the checker set recovery points (around an item, a
+// statement, a function's body): an error is recorded, and the work goes
+// on after the innermost recovery point, which skips what failed. At the
+// end of a phase that had errors, they are all printed, sorted by
+// position, and the compiler exits with 1. An error whose message names
+// the error type (the type given to what failed, see TY_ERROR) follows
+// from an earlier one and is not reported.
+//
+// A recovery point:
+//     let depth = RECOVER_DEPTH;
+//     if _setjmp(recover_enter()) == 0 {
+//         ... work that may fail ...
+//     } else {
+//         ... clean up after a failure ...
+//     }
+//     recover_leave(depth);
+// (_setjmp must be called by the function that goes on after the jump,
+// and that function must not return in between: the work is a call
+// followed by more code, never a tail call.)
+
+const MAX_ERRORS: i64 = 50;
+
+static mut RECOVER_BUFS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut RECOVER_DEPTH: i64 = 0;
+// The recorded errors: position and message (a buffer), in pairs.
+static mut ERRORS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut ERROR_COUNT: i64 = 0;
+// Whether the message being made names the error type.
+static mut ERR_POISONED: bool = false;
+
+fn recover_enter() -> *u8 {
+    if RECOVER_BUFS.count <= RECOVER_DEPTH {
+        RECOVER_BUFS.push(alloc_zeroed(512) as i64);
+    }
+    let jb = RECOVER_BUFS.data[RECOVER_DEPTH] as *u8;
+    RECOVER_DEPTH += 1;
+    jb
+}
+
+fn recover_leave(depth: i64) {
+    RECOVER_DEPTH = depth;
+}
+
+// Prints the recorded errors and exits with 1, if there are any.
+fn exit_if_errors() {
+    if ERROR_COUNT == 0 {
+        return;
+    }
+    // Sorted by position (stable: an insertion sort of the pairs).
+    let n = ERRORS.count / 2;
+    for i in 1..n {
+        let mut j = i;
+        while j > 0 && ERRORS.data[2 * (j - 1)] > ERRORS.data[2 * j] {
+            let pos = ERRORS.data[2 * j];
+            let text = ERRORS.data[2 * j + 1];
+            ERRORS.data[2 * j] = ERRORS.data[2 * (j - 1)];
+            ERRORS.data[2 * j + 1] = ERRORS.data[2 * (j - 1) + 1];
+            ERRORS.data[2 * (j - 1)] = pos;
+            ERRORS.data[2 * (j - 1) + 1] = text;
+            j -= 1;
+        }
+    }
+    let out = buf_new();
+    for i in 0..n {
+        buf_bytes(out, buf_slice(ERRORS.data[2 * i + 1]));
+    }
+    if ERROR_COUNT >= MAX_ERRORS {
+        buf_str(out, c"error: too many errors; stopping after ");
+        buf_int(out, MAX_ERRORS);
+        buf_byte(out, '\n');
+    }
+    buf_write_fd(out, STDERR);
+    exit(1);
 }
 
 // Text for the error's help line.
@@ -468,7 +549,15 @@ fn err_end() -> ! {
         buf_byte(out, '\n');
     }
     instantiation_notes(out);
-    buf_write_fd(out, STDERR);
+    if !ERR_POISONED {
+        ERRORS.push(ERR_POS);
+        ERRORS.push(out);
+        ERROR_COUNT += 1;
+    }
+    if RECOVER_DEPTH > 0 && ERROR_COUNT < MAX_ERRORS {
+        _longjmp(RECOVER_BUFS.data[RECOVER_DEPTH - 1] as *u8, 1);
+    }
+    exit_if_errors();
     exit(1)
 }
 

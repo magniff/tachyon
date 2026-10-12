@@ -26,7 +26,9 @@
 #   // EXIT: 3           expected exit code (default 0)
 #   // STDERR: text      stderr contains text, one directive per line
 #   // ERROR: text       compilation must fail (exit code 1) with an error
-#                        containing this text; one directive per message
+#                        containing this text; one directive per message,
+#                        in the order they are reported
+#   // ERROR-COUNT: n    exactly n errors are reported
 #   // XFAIL: reason     a known bug: the case is expected to fail, and
 #                        reported as a failure (XPASS) once it passes
 #   // XFAIL(T): reason  the same, only for target T
@@ -126,6 +128,7 @@ read_directives() {
             else if (key == "EXIT") exitcode = value + 0
             else if (key == "STDERR") stderrs = stderrs value "\n"
             else if (key == "ERROR") errors = errors value "\n"
+            else if (key == "ERROR-COUNT") errcount = value
             else if (key == "XFAIL" || key == "XFAIL(" target ")") xfail = value
             else if (key == "SOURCE") source = value
             else if (key == "CSOURCE") csources = csources " " value
@@ -142,6 +145,7 @@ read_directives() {
             printf "%d", exitcode > (dir "/exit")
             printf "%s", stderrs > (dir "/stderrs")
             printf "%s", errors > (dir "/errors")
+            printf "%s", errcount > (dir "/errcount")
             printf "%s", xfail > (dir "/xfail")
             printf "%s", source > (dir "/source")
             printf "%s", csources > (dir "/csources")
@@ -193,12 +197,25 @@ check_case() {
             { echo "expected a compile error (exit code 1), got exit code $rc:"; cat "$dir/compile.out"; } >"$dir/why"
             return 1
         fi
-        while IFS= read -r message; do
-            if ! grep -qF -- "$message" "$dir/compile.out"; then
-                { echo "expected an error containing '$message', got:"; cat "$dir/compile.out"; } >"$dir/why"
+        # Each message, in order (several errors are reported at once).
+        missing=$(awk -v out="$dir/compile.out" '
+            BEGIN { while ((getline line < out) > 0) text[++n] = line }
+            {
+                while (at < n && index(text[at + 1], $0) == 0) at++
+                if (at >= n) { print $0; exit }
+                at++
+            }' "$dir/errors")
+        if [ -n "$missing" ]; then
+            { echo "expected an error containing '$missing' (after the ones before it), got:"; cat "$dir/compile.out"; } >"$dir/why"
+            return 1
+        fi
+        if [ -s "$dir/errcount" ]; then
+            got=$(grep -c '^error\[' "$dir/compile.out")
+            if [ "$got" -ne "$(cat "$dir/errcount")" ]; then
+                { echo "expected $(cat "$dir/errcount") errors, got $got:"; cat "$dir/compile.out"; } >"$dir/why"
                 return 1
             fi
-        done <"$dir/errors"
+        fi
         return 0
     fi
     if [ -s "$dir/checks" ] && ! check_ir "$source" "$dir"; then

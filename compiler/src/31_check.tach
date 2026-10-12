@@ -112,31 +112,120 @@ fn check_program(program: i64) {
     SELF_TYPE_SYM = intern_c(c"Self");
     SELF_SYM = intern_c(c"self");
     init_modules();
-    collect_names();
-    collect_uses();
-    collect_const_types();
-    collect_structs();
-    collect_enums();
-    resolve_all_uses();
-    collect_aliases();
-    check_struct_cycles();
-    collect_methods();
-    collect_functions();
-    collect_statics();
-    evaluate_consts();
+    // The declarations, one phase after the other (see collect_phase).
+    for phase in 0..PHASE_COUNT {
+        collect_phase(phase);
+    }
+    exit_if_errors();
     for i in 0..NODES[program].count {
         let item = child(program, i);
         if NODES[item].kind == NodeKind::Fn && FNS[NODES[item].x - 1].generic == 0 {
-            check_function(item);
+            check_function_recovering(item);
         }
     }
     // The instances, as they are made: an instance may make more.
     let mut q = 0;
     while q < INST_QUEUE.count {
-        check_function(FNS[INST_QUEUE.data[q]].node);
+        check_function_recovering(FNS[INST_QUEUE.data[q]].node);
         q += 1;
     }
+    exit_if_errors();
     finish_program(program);
+}
+
+const PHASE_COUNT: i64 = 12;
+
+// One phase of the declarations; its first error ends the checking (the
+// errors of function bodies, checked after, are reported together).
+fn collect_phase(phase: i64) {
+    let depth = RECOVER_DEPTH;
+    let state = save_check_state();
+    if _setjmp(recover_enter()) == 0 {
+        match phase {
+            0 => collect_names(),
+            1 => collect_uses(),
+            2 => collect_const_types(),
+            3 => collect_structs(),
+            4 => collect_enums(),
+            5 => resolve_all_uses(),
+            6 => collect_aliases(),
+            7 => check_struct_cycles(),
+            8 => collect_methods(),
+            9 => collect_functions(),
+            10 => collect_statics(),
+            _ => evaluate_consts(),
+        }
+    } else {
+        // Later phases would only report what follows from this error.
+        restore_check_state(state);
+        exit_if_errors();
+    }
+    recover_leave(depth);
+}
+
+fn check_function_recovering(item: i64) {
+    let depth = RECOVER_DEPTH;
+    let state = save_check_state();
+    if _setjmp(recover_enter()) == 0 {
+        check_function(item);
+    } else {
+        restore_check_state(state);
+    }
+    recover_leave(depth);
+}
+
+// What the checker must put back after an error (see err_end): its
+// scopes, stacks and context.
+struct CheckState {
+    env: i64, scopes: i64, loops: i64, module: i64, self_ty: i64, tp_base: i64, tp_count: i64,
+    inst: i64, ret: i64, tscratch: i64, scratch: i64, const_context: bool,
+}
+
+fn save_check_state() -> CheckState {
+    CheckState {
+        env: ENV.count, scopes: SCOPES.count, loops: LOOP_STACK.count, module: CUR_MOD,
+        self_ty: SELF_TYPE, tp_base: TP_BASE, tp_count: TP_NAMES.count, inst: CUR_INST,
+        ret: RETURN_TYPE, tscratch: TSCRATCH.count, scratch: SCRATCH.count,
+        const_context: CONST_CONTEXT,
+    }
+}
+
+fn restore_check_state(s: CheckState) {
+    ENV.count = s.env;
+    SCOPES.count = s.scopes;
+    LOOP_STACK.count = s.loops;
+    CUR_MOD = s.module;
+    SELF_TYPE = s.self_ty;
+    TP_BASE = s.tp_base;
+    TP_NAMES.count = s.tp_count;
+    TP_TYPES.count = s.tp_count;
+    CUR_INST = s.inst;
+    RETURN_TYPE = s.ret;
+    TSCRATCH.count = s.tscratch;
+    SCRATCH.count = s.scratch;
+    CONST_CONTEXT = s.const_context;
+    OR_MODE = false;
+}
+
+// After an error in statement `stmt`: the names its `let` binds stand for
+// values of the error type, so that their uses report nothing more.
+fn poison_statement(stmt: i64) {
+    if NODES[stmt].kind == NodeKind::Let {
+        poison_pattern(NODES[stmt].a);
+    }
+}
+
+fn poison_pattern(p: i64) {
+    if p == 0 {
+        return;
+    }
+    if NODES[p].kind == NodeKind::PatBind {
+        NODES[p].x = define_local(NODES[p].a, TY_ERROR, true, false);
+        return;
+    }
+    for i in 0..NODES[p].count {
+        poison_pattern(child(p, i));
+    }
 }
 
 // The program's list, for the code generators: its items without the
@@ -1132,7 +1221,22 @@ fn check_block(block: i64, expected: i64) -> i64 {
     push_scope();
     let mut diverges = false;
     for i in 0..NODES[block].count {
-        if check_stmt(child(block, i)) {
+        // A recovery point: after an error, on at the next statement. A
+        // block with a statement that failed counts as diverging, which
+        // reports nothing more about its type.
+        let stmt = child(block, i);
+        let depth = RECOVER_DEPTH;
+        let state = save_check_state();
+        let mut result = false;
+        if _setjmp(recover_enter()) == 0 {
+            result = check_stmt(stmt);
+        } else {
+            restore_check_state(state);
+            poison_statement(stmt);
+            result = true;
+        }
+        recover_leave(depth);
+        if result {
             diverges = true;
         }
     }
