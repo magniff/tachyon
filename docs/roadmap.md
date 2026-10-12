@@ -18,6 +18,13 @@ x86_64-linux:
   at `-O0` and `-O2`, and end to end to an executable), and any regression
   against the previous release is explained or fixed.
 
+Principle: **no undefined behaviour.** Every operation safe code can
+write has defined behaviour (integer overflow wraps, division by zero,
+shifts and conversions are defined, indexing is checked); what cannot be
+checked (raw pointers, freeing memory, calls into C) is to be confined to
+`unsafe` blocks (0.8). For agents above all, a program that compiles
+should not be able to fail in ways no one can see in its text.
+
 Priorities, in order: correctness (the gate above); exact C interop where
 it is asked for; **compilation speed**, as fast as possible at every
 level, measured every release; then the speed of the generated code.
@@ -314,16 +321,26 @@ Back end:
   - moved to 0.7: const generic lengths; `errno` (C macros that expand to
     expressions)
 
-## 0.7: equality saturation
+## 0.7: object files
 
-Compilation speed: object files written directly (Mach-O for macOS, ELF
+Object files written directly (Mach-O for macOS, ELF
 for Linux, both targets): an instruction encoder and the relocations, symbol
 tables and sections each format needs, so `cc` only links. `--emit-asm`
 stays, and the object files are checked against `cc`'s assembly of the
 same text, section by section. The system assembler took 2.4 s of the
 compiler's 3 s self-build in 0.6.
 
-Language: traits (bounded generics), which a generic hash map and
+Also: fixed-array indexing bounds-checked like slices (no undefined
+behaviour; breaking), and an audit of the undefined behaviour left (in
+grammar.md); interp's 2% slowdown from 0.6.
+
+## 0.8: traits and equality saturation
+
+Language: `unsafe` blocks and functions: raw-pointer dereference,
+indexing and arithmetic, freeing memory and calls into C only inside them,
+so that safe code has no undefined behaviour at all; a checking mode for
+`unsafe` code (pointers carrying bounds, freed memory detected). Traits
+(bounded generics), which a generic hash map and
 operator overloading need; adding bounds does not change what programs
 written against 0.5's unbounded generics mean.
 
@@ -333,16 +350,16 @@ written against 0.5's unbounded generics mean.
   are accepted
 - partial redundancy elimination (GVN-PRE)
 
-## 0.8: vectorization
+## 0.9: vectorization and profiles
 
+Vectorization:
 - SLP vectorizer
 - loop vectorizer for counted loops with simple dependences
 - unrolling with run-time trip counts (from 0.5), sharing the vectorizer's
   remainder loop
 - NEON and SSE2/AVX2 lowering; language-level vector types (`v4f32`, ...)
 
-## 0.9: profile-guided
-
+Profile-guided:
 - instrumentation profiles (`--profile-generate` / `--profile-use`)
 - branch weights driving inlining, block layout and hot/cold splitting
 - PGO-aware register allocation and unrolling
@@ -552,3 +569,20 @@ assembler takes about 2 s (0.7 writes object files itself). Per phase at
 -O2 (`--time-passes`): the loop passes 27%, register allocation and
 emission 22%, inlining and the simplification after it 16%, the scalar
 pipeline 11%, the interprocedural layer 4.5%, the front end 8%.
+
+### 0.7
+
+Compile time, the compiler building itself (the 0.7 source, about 40,000
+lines; aarch64-macos, idle machine, best of 7), to an executable:
+
+| | -O0 | -O2 |
+|---|---|---|
+| 0.6.0: assembly, then `cc` assembles and links | 1867 ms | 2734 ms |
+| 0.7: the object written by the compiler, `cc` links | 119 ms | 616 ms |
+| of which the compiler (to the object) | 94 ms | 594 ms |
+
+15.7× and 4.4× faster end to end: the system assembler took about 1.8
+s to assemble the 5 MB of text; the compiler's own assembler, reading the
+same text, about 45 ms. The test suite's wall time is unchanged (17.4 s,
+mostly starting and linking 315 programs). Run time: the code is the same
+as with 0.6 (the objects hold exactly the assembly 0.6 would write).

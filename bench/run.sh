@@ -59,7 +59,12 @@ dd if=/dev/zero of="$WORK/md5.in" bs=1048576 count=8 2>/dev/null
 # the seed do not know what came after them).
 build() {
     case "$2" in
-        O0|O1|O2) "$COMPILER" --target "$TARGET" "-$2" "$1" -o "$3.s" ;;
+        # (from 0.7 the compiler writes objects; the previous release may
+        # only write assembly)
+        O0|O1|O2) "$COMPILER" --target "$TARGET" "-$2" "$1" -o "$3.o"
+            # shellcheck disable=SC2086
+            "$CC" $ARCH -o "$3" "$3.o" -lm
+            return ;;
         previous) "$PREVIOUS" --target "$TARGET" "$1" -o "$3.s" >/dev/null 2>&1 || return 1 ;;
         seed)
             # The seed knows only 0.2's declarations of C functions.

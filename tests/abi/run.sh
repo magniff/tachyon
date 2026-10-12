@@ -89,10 +89,10 @@ test_seed() {
     "$CC" $ARCH -c -w -o "$c.o" "$c" >"$c.log" 2>&1 || { echo "cc failed on the C half: $(head -3 "$c.log")" >"$WORK/p$seed.why"; return; }
     for level in O0 O1 O2; do
         exe="$WORK/p$seed.$level"
-        "$COMPILER" --target "$TARGET" "-$level" --verify-ir "$t" -o "$exe.s" >"$exe.log" 2>&1 \
+        "$COMPILER" --target "$TARGET" "-$level" --verify-ir "$t" -o "$exe.o" >"$exe.log" 2>&1 \
             || { echo "-$level failed to compile it: $(head -3 "$exe.log")" >"$WORK/p$seed.why"; return; }
         # shellcheck disable=SC2086
-        "$CC" $ARCH -o "$exe" "$exe.s" "$c.o" >>"$exe.log" 2>&1 \
+        "$CC" $ARCH -o "$exe" "$exe.o" "$c.o" >>"$exe.log" 2>&1 \
             || { echo "-$level: cc failed: $(head -3 "$exe.log")" >"$WORK/p$seed.why"; return; }
         out=$("$exe" 2>&1)
         if [ "$out" != ok ]; then

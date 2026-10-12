@@ -797,3 +797,71 @@ narrowing (from 0.5); interprocedural analyses and a
 cost-model-driven inliner (0.6); an e-graph-based rewriter (0.7);
 vectorization and unrolling with run-time trip counts (0.8);
 profile-guided scheduling (0.9).
+
+## 0.7: object files
+
+**0.7 status**
+- done: the assembler (`objfile.tach`, `enc_arm64.tach`, `enc_x86.tach`),
+  Mach-O and ELF writers; `-c` (or `-o x.o`) writes an object, `-S`,
+  `--emit-asm` (or `-o x.s`) assembly, any other output an executable
+  (cc links); tests/run.sh, the fuzzers, the benchmarks and the bootstrap
+  (interface `tachyonc-0.7`: its fixpoint compares objects) use objects;
+  tests/objcheck.sh: on all three targets every compilation of the corpus
+  (374) links to the same program as `cc -c` of its assembly; objects are
+  identical whatever the host; compile times in roadmap.md
+- gate passed (on objects): the suite at every level on both macOS
+  targets and in the Linux container, the fixpoint, objcheck 374/374 on
+  all three targets, the fuzzer in every mode (about 1,300 programs on
+  macOS), the ABI fuzzer in all three modes, host independence
+- done (scope added by the user: no undefined behaviour): fixed-array
+  indexing `a[i]` is checked like slice indexing, at every level (gen.tach
+  for -O0, lowering for -O1/-O2); SCCP and the value ranges remove what
+  they prove: matmul, nbody, stencil, sieve keep none, md5 keeps 2 (speed
+  unchanged), interp keeps 15 (46 -> 49 ms). With the checks scalar
+  promotion can keep a stack machine's `sp` in a register (shown on small
+  programs), but not yet in bench/interp: its `match`-dispatched loop is
+  not promoted (to look at in 0.8)
+- done: an "Undefined behaviour" section in grammar.md: what is defined
+  (each case checked at -O0 and -O2 on both instruction sets, at run time
+  and folded), what is still undefined (raw pointers and C), and the plan
+  (`unsafe` in 0.8)
+
+The compiler writes object files itself. The assembly text it has always
+written stays the single source: `objfile.tach` assembles exactly that
+text (one statement per line, the subset of the syntax the code
+generator uses), so `--emit-asm` and the object cannot disagree, and
+`cc -c` of the same text is an oracle for every object.
+
+**How it works.** `objfile.tach` reads the text line by line into
+fragments: runs of bytes, each with an optional tail whose size depends
+on where it lands: an alignment (zeros in data, NOPs in code, LLVM's
+NOPs on x86-64), or an x86-64 jump to a label, short or long. Labels
+remember their fragment and offset; references become fixups. Layout
+places the fragments section by section and relaxes the jumps as both
+system assemblers do: every jump short first, a short one that does not
+reach becomes long, until none changes. A jump may be short only when the
+assembler resolves it: a label of the same section that is not global
+(GNU as), and on Mach-O of the same atom as the jump (LLVM: an atom runs
+from one non-temporary symbol to the next, so the linker may move atoms
+apart). Fixups then become values, or relocations: AArch64 BRANCH26,
+PAGE21/PAGEOFF12, GOT_LOAD_PAGE21/PAGEOFF12, UNSIGNED; x86-64 Mach-O
+BRANCH, SIGNED, GOT_LOAD, UNSIGNED; ELF PLT32, PC32,
+(REX_)GOTPCRELX, 64 (a temporary label on ELF is its section's symbol
+plus an addend). The Mach-O writer adds, on AArch64, LLVM's section-start
+symbols (`ltmp0`...): the linker keeps a section, even an empty one, by
+its symbols.
+
+The encoders take the instruction forms the code generator writes and
+choose where the syntax leaves a choice as the system assemblers do:
+`ldr` with a negative or unaligned offset is `ldur`; `mov` of an
+immediate is `movz`, `movn` or `orr` with a bitmask; `add`/`sub` with sp
+take the extended-register form; x86-64 picks the shortest immediate, the
+accumulator forms of `op $imm32, %rax`, the MR form for register moves,
+`D1` for shifts by one.
+
+**Checked** by tests/objcheck.sh on every target: each program of the
+corpus at -O0 and -O2 is compiled to an object and to assembly, `cc -c`
+assembles the assembly, both are linked, and the two executables must
+have the same disassembly (padding NOPs aside) and the same data. The
+fixpoint compares the compiler's own objects; the objects of the x86-64
+build of the compiler (under Rosetta) are identical to the arm64 one's.

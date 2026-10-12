@@ -37,8 +37,27 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.4.0 | `v0.4.0` | 0.3.0 | aarch64-macos, x86_64-linux, x86_64-macos | loops and C headers: the compiler written in the 0.3 language; `import "x.h"` (a C preprocessor and declaration reader) and `--emit-header`; `use`, checked `as` to enums, enum ordering, `size_of`/`align_of`, `for x in s`; loop canonicalization, induction variables, rotation, unrolling, unswitching, strength reduction, value ranges and bounds-check elimination, aggressive DCE, tail recursion elimination |
 | 0.5.0 | `v0.5.0` | 0.4.0 | aarch64-macos, x86_64-linux, x86_64-macos | generics, modules and the back end: generics by monomorphization, modules (`mod`, `pub`, `use`), several errors per compilation, a small `std`; register allocation by linear scan with interval splitting, a calling convention of tachyon's own, frames aligned above 16, instruction selection by rules, block layout, selects, leaf frames, sibling calls |
 | 0.6.0 | `v0.6.0` | 0.5.0 | aarch64-macos, x86_64-linux, x86_64-macos | interprocedural: the compiler written as a module tree; string literals as slices, `if let`, `defer`, structural `==`, a prelude, inline modules, generic type aliases; a cost-model inliner, attribute inference, interprocedural constants, devirtualization, scalar promotion, heap to stack, global DCE; shrink-wrapping; `--time-passes`, `--stats` |
+| 0.7.0 | `v0.7.0` | 0.6.0 | aarch64-macos, x86_64-linux, x86_64-macos | object files: an assembler in the compiler writes Mach-O and ELF objects, `cc` only links (the compiler builds itself 4.4× faster at `-O2`, 15.7× at `-O0`); fixed-array indexing is checked; the undefined behaviour left is documented |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.7
+
+- **Object files.** The compiler assembles its own output: Mach-O for
+  macOS (arm64, x86-64) and ELF for Linux; `cc` only links. `-c` writes an
+  object, `-S` (or `--emit-asm`) assembly, any other output an executable.
+  The objects are checked against `cc -c` of the same assembly over the
+  whole corpus (`tests/objcheck.sh`), and are identical whatever the host.
+  The compiler builds itself to an executable in 0.6 s at `-O2` (2.7 s
+  with 0.6.0) and 0.12 s at `-O0` (1.9 s).
+- **Indexing a fixed array is checked** (breaking): `a[i]` on `[T; N]`
+  panics like slice indexing (exit 101) when out of bounds; the optimizer
+  removes the checks it proves unneeded.
+- **No undefined behaviour** is now a principle of the language;
+  [grammar.md](grammar.md) lists what is defined and the little that is
+  not yet (raw pointers, C calls), which 0.8 puts behind `unsafe`.
+- The bootstrap uses objects from 0.7 on (interface `tachyonc-0.7`; the
+  fixpoint compares objects).
 
 ### What's new in 0.6
 

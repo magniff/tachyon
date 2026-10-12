@@ -1,0 +1,1293 @@
+// Object files (0.7): the assembly the code generator wrote (ASM) is
+// assembled here, by the compiler itself, into a Mach-O object (macOS,
+// both instruction sets) or an ELF one (Linux), so that `cc` only links.
+// The text is the single source: `--emit-asm` writes it as it is, and the
+// object holds exactly what it says. tests/objcheck.sh links both this
+// object and `cc -c` of the same text and compares the results.
+//
+// The text is the compiler's own, in a small regular subset of the
+// assembler syntax (one statement per line; labels `name:`; the
+// directives .text, .data, .section, .globl, .p2align, .byte, .long,
+// .quad, .space). Lines are assembled in one pass into fragments: runs of
+// bytes, each followed by an optional tail whose size depends on where it
+// lands (an alignment, or an x86-64 branch that may be short or long).
+// Layout places the fragments, relaxing branches as GNU as and LLVM do
+// (all short first; one that does not reach grows, until nothing does);
+// then fixups are resolved or become relocations, and the object is
+// written (macho_write, elf_write).
+//
+// Instructions are encoded by enc_arm64.tach (AArch64) and enc_x86.tach
+// (x86-64).
+
+use crate::base::*;
+use crate::target::*;
+use crate::lower::*;
+use crate::enc_arm64::*;
+use crate::enc_x86::*;
+use crate::*;
+
+// ---- Sections ----
+
+pub const SEC_TEXT: i64 = 0;
+pub const SEC_CONST: i64 = 1;
+pub const SEC_DATA: i64 = 2;
+pub const SEC_NOTE: i64 = 3;
+const SEC_COUNT: i64 = 4;
+
+pub static mut CUR_SEC: i64 = 0;
+static mut SEC_ALIGN: [i64; 4] = [0, 0, 0, 0];
+static mut SEC_USED: [bool; 4] = [false, false, false, false];
+// Section contents after layout, and their sizes and addresses in the
+// object (Mach-O lays sections out one after the other).
+static mut SEC_BUF: [i64; 4] = [-1, -1, -1, -1];
+static mut SEC_ADDR: [i64; 4] = [0, 0, 0, 0];
+
+// ---- Fragments ----
+
+const TAIL_NONE: i64 = 0;
+const TAIL_ALIGN: i64 = 1;
+pub const TAIL_JMP: i64 = 2;
+pub const TAIL_JCC: i64 = 3;
+
+// Bytes [start, start + len) of OBJ_BYTES, then the tail: an alignment to
+// 2^arg bytes, or a branch (arg: the condition) to symbol `sym`, short or
+// long. `addr`: the fragment's offset in its section.
+struct Frag { sec: i64, start: i64, len: i64, tail: i64, arg: i64, sym: i64, long: bool, addr: i64, atom: i64 }
+
+static mut FRAGS: *Frag = 0 as *Frag;
+static mut FRAG_COUNT: i64 = 0;
+static mut FRAG_CAP: i64 = 0;
+// The fragment being filled (always the last one).
+static mut OPEN: i64 = -1;
+pub static mut OBJ_BYTES: i64 = -1;
+
+fn new_frag(sec: i64) {
+    if OPEN >= 0 {
+        FRAGS[OPEN].len = BUFS[OBJ_BYTES].len - FRAGS[OPEN].start;
+    }
+    FRAGS = grow(FRAGS, FRAG_COUNT, &FRAG_CAP);
+    FRAGS[FRAG_COUNT] = Frag { sec: sec, start: BUFS[OBJ_BYTES].len, len: 0, tail: TAIL_NONE, arg: 0, sym: -1, long: false, addr: 0, atom: -1 };
+    OPEN = FRAG_COUNT;
+    FRAG_COUNT += 1;
+}
+
+// Ends the open fragment with a tail, and opens the next.
+fn end_frag(tail: i64, arg: i64, sym: i64) {
+    FRAGS[OPEN].tail = tail;
+    FRAGS[OPEN].arg = arg;
+    FRAGS[OPEN].sym = sym;
+    FRAGS[OPEN].atom = CUR_ATOM[CUR_SEC];
+    new_frag(CUR_SEC);
+}
+
+fn switch_section(sec: i64) {
+    SEC_USED[sec] = true;
+    if sec != CUR_SEC {
+        CUR_SEC = sec;
+        new_frag(sec);
+    }
+}
+
+// The position (in OBJ_BYTES) of the next byte.
+pub fn here() -> i64 {
+    BUFS[OBJ_BYTES].len
+}
+
+pub fn out8(b: i64) {
+    buf_byte(OBJ_BYTES, (b & 255) as u8);
+}
+
+pub fn out16(v: i64) {
+    out8(v);
+    out8(v >> 8);
+}
+
+pub fn out32(v: i64) {
+    out8(v);
+    out8(v >> 8);
+    out8(v >> 16);
+    out8(v >> 24);
+}
+
+pub fn out64(v: i64) {
+    out32(v);
+    out32(v >> 32);
+}
+
+// Reads and writes a little-endian 32-bit word of OBJ_BYTES.
+fn get32(pos: i64) -> i64 {
+    let d = BUFS[OBJ_BYTES].data;
+    (d[pos] as i64) | (d[pos + 1] as i64) << 8 | (d[pos + 2] as i64) << 16 | (d[pos + 3] as i64) << 24
+}
+
+fn put32(pos: i64, v: i64) {
+    let d = BUFS[OBJ_BYTES].data;
+    d[pos] = (v & 255) as u8;
+    d[pos + 1] = ((v >> 8) & 255) as u8;
+    d[pos + 2] = ((v >> 16) & 255) as u8;
+    d[pos + 3] = ((v >> 24) & 255) as u8;
+}
+
+// ---- Symbols ----
+
+// A name of the assembly: a label (defined in `sec` at `off` from the
+// start of fragment `frag`), or a name only referred to. `in_table`: the
+// symbol table needs it (relocations refer to it); `index`: its index
+// there.
+struct ASym { name: i64, defined: bool, global: bool, frag: i64, off: i64, sec: i64, in_table: bool, index: i64, atom: i64 }
+
+// Mach-O's atoms: a label that is not temporary starts one, which runs to
+// the next. LLVM resolves a pc-relative reference only within one atom
+// (else the linker could move them apart): the current atom per section.
+static mut CUR_ATOM: [i64; 4] = [-1, -1, -1, -1];
+
+static mut ASYMS: *ASym = 0 as *ASym;
+static mut ASYM_COUNT: i64 = 0;
+static mut ASYM_CAP: i64 = 0;
+// Interned name + 1 -> symbol + 1.
+static mut ASYM_MAP: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+pub fn asym(name: [u8]) -> i64 {
+    let id = intern(name);
+    let known = ASYM_MAP.get(id + 1);
+    if known != 0 {
+        return known - 1;
+    }
+    ASYMS = grow(ASYMS, ASYM_COUNT, &ASYM_CAP);
+    let s = ASYM_COUNT;
+    ASYMS[s] = ASym { name: id, defined: false, global: false, frag: -1, off: 0, sec: -1, in_table: false, index: -1, atom: -1 };
+    ASYM_COUNT += 1;
+    ASYM_MAP.put(id + 1, s + 1);
+    s
+}
+
+// A temporary label (L... on Mach-O, .L... on ELF): never in the symbol
+// table unless a relocation needs it (Mach-O only; ELF uses the section).
+fn is_temp(s: i64) -> bool {
+    let t = SYMS[ASYMS[s].name].text;
+    if ELF { t.len >= 2 && t[0] == '.' && t[1] == 'L' } else { t.len >= 1 && t[0] == 'L' }
+}
+
+fn sym_addr(s: i64) -> i64 {
+    FRAGS[ASYMS[s].frag].addr + ASYMS[s].off
+}
+
+// ---- Fixups ----
+
+pub const FX_A64_B26: i64 = 1;
+pub const FX_A64_B19: i64 = 2;
+pub const FX_A64_B14: i64 = 3;
+pub const FX_A64_ADR: i64 = 4;
+pub const FX_A64_PAGE: i64 = 5;
+pub const FX_A64_PAGEOFF: i64 = 6;
+pub const FX_A64_GOTPAGE: i64 = 7;
+pub const FX_A64_GOTPAGEOFF: i64 = 8;
+pub const FX_X86_BRANCH: i64 = 9;
+pub const FX_X86_RIP: i64 = 10;
+pub const FX_X86_GOT: i64 = 11;
+pub const FX_DIFF32: i64 = 12;
+pub const FX_ABS64: i64 = 13;
+
+// `pos`: the field's position in OBJ_BYTES (an AArch64 instruction, or an
+// x86-64 or data field); `frag`: its fragment; `end`: for x86-64, the
+// position where the instruction ends (pc); `sym2`: the subtracted label
+// of FX_DIFF32. `rex`: an x86-64 GOT load with a REX prefix.
+struct Fixup { kind: i64, frag: i64, pos: i64, sym: i64, sym2: i64, addend: i64, end: i64, rex: bool, atom: i64 }
+
+static mut FIXUPS: *Fixup = 0 as *Fixup;
+static mut FIXUP_COUNT: i64 = 0;
+static mut FIXUP_CAP: i64 = 0;
+
+pub fn fixup(kind: i64, pos: i64, sym: i64, addend: i64, end: i64, rex: bool) {
+    FIXUPS = grow(FIXUPS, FIXUP_COUNT, &FIXUP_CAP);
+    FIXUPS[FIXUP_COUNT] = Fixup { kind: kind, frag: OPEN, pos: pos, sym: sym, sym2: -1, addend: addend, end: end, rex: rex, atom: CUR_ATOM[CUR_SEC] };
+    FIXUP_COUNT += 1;
+}
+
+// x86-64 branches whose size layout decides (jmp, jcc to a label).
+pub fn emit_relaxable(tail: i64, cond: i64, sym: i64) {
+    end_frag(tail, cond, sym);
+}
+
+// ---- Relocations ----
+
+// In section `sec` at `offset`: the object format's relocation type
+// `rtype`, against symbol `sym` (an ASYMS index, or -1 - section for a
+// section of ELF), with `addend` (ELF) and, for Mach-O, pc-relativity and
+// the field's length (log2 bytes).
+struct Reloc { sec: i64, offset: i64, rtype: i64, sym: i64, addend: i64, pcrel: bool, length: i64 }
+
+static mut RELOCS: *Reloc = 0 as *Reloc;
+static mut RELOC_COUNT: i64 = 0;
+static mut RELOC_CAP: i64 = 0;
+
+fn reloc(sec: i64, offset: i64, rtype: i64, sym: i64, addend: i64, pcrel: bool, length: i64) {
+    RELOCS = grow(RELOCS, RELOC_COUNT, &RELOC_CAP);
+    RELOCS[RELOC_COUNT] = Reloc { sec: sec, offset: offset, rtype: rtype, sym: sym, addend: addend, pcrel: pcrel, length: length };
+    RELOC_COUNT += 1;
+}
+
+// A relocation against symbol s plus `extra`: on ELF a temporary label
+// becomes its section's symbol plus the label's offset.
+fn reloc_to(sec: i64, offset: i64, rtype: i64, s: i64, extra: i64, pcrel: bool, length: i64) {
+    if ELF && ASYMS[s].defined && is_temp(s) {
+        reloc(sec, offset, rtype, -1 - ASYMS[s].sec, extra + sym_addr(s), pcrel, length);
+        return;
+    }
+    ASYMS[s].in_table = true;
+    reloc(sec, offset, rtype, s, extra, pcrel, length);
+}
+
+// ---- Errors ----
+
+static mut LINE_START: i64 = 0;
+static mut LINE_END: i64 = 0;
+
+pub fn asm_error(message: *u8) -> ! {
+    let line = BUFS[ASM].data[LINE_START..LINE_END];
+    let out = buf_new();
+    buf_str(out, c"internal error: cannot assemble: ");
+    buf_str(out, message);
+    buf_str(out, c": ");
+    buf_bytes(out, line);
+    buf_byte(out, '\n');
+    buf_write_fd(out, STDERR);
+    exit(1)
+}
+
+// ---- Lines ----
+
+fn is_space(c: u8) -> bool {
+    c == ' ' || c == '\t'
+}
+
+// Whether bytes [a, b) of the text spell `word`.
+pub fn text_is(a: i64, b: i64, word: *u8) -> bool {
+    let n = strlen(word) as i64;
+    n == b - a && memcmp(&BUFS[ASM].data[a], word, n as u64) == 0
+}
+
+// The operands of the statement being assembled: [OP_START[i], OP_END[i])
+// of the text, split at commas outside brackets and parentheses.
+pub static mut OP_START: [i64; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
+pub static mut OP_END: [i64; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
+pub static mut OP_COUNT: i64 = 0;
+
+fn split_operands(a: i64, b: i64) {
+    let t = BUFS[ASM].data;
+    OP_COUNT = 0;
+    let mut i = a;
+    while i < b {
+        while i < b && is_space(t[i]) {
+            i += 1;
+        }
+        if i >= b {
+            break;
+        }
+        let start = i;
+        let mut depth = 0;
+        while i < b && !(t[i] == ',' && depth == 0) {
+            if t[i] == '[' || t[i] == '(' {
+                depth += 1;
+            } else if t[i] == ']' || t[i] == ')' {
+                depth -= 1;
+            }
+            i += 1;
+        }
+        let mut end = i;
+        while end > start && is_space(t[end - 1]) {
+            end -= 1;
+        }
+        if OP_COUNT == 8 {
+            asm_error(c"too many operands");
+        }
+        OP_START[OP_COUNT] = start;
+        OP_END[OP_COUNT] = end;
+        OP_COUNT += 1;
+        i += 1;
+    }
+}
+
+// A number at [a, b): decimal or 0x hex, maybe negative.
+pub fn parse_number(a: i64, b: i64) -> i64 {
+    let t = BUFS[ASM].data;
+    let mut i = a;
+    let mut neg = false;
+    if i < b && t[i] == '-' {
+        neg = true;
+        i += 1;
+    }
+    let mut v: u64 = 0;
+    if i + 1 < b && t[i] == '0' && (t[i + 1] == 'x' || t[i + 1] == 'X') {
+        i += 2;
+        while i < b {
+            let c = t[i];
+            let d = if c >= '0' && c <= '9' { (c - '0') as u64 } else if c >= 'a' && c <= 'f' { (c - 'a') as u64 + 10 } else if c >= 'A' && c <= 'F' { (c - 'A') as u64 + 10 } else { asm_error(c"bad number") };
+            v = v * 16 + d;
+            i += 1;
+        }
+    } else {
+        if i >= b {
+            asm_error(c"bad number");
+        }
+        while i < b {
+            let c = t[i];
+            if c < '0' || c > '9' {
+                asm_error(c"bad number");
+            }
+            v = v * 10 + (c - '0') as u64;
+            i += 1;
+        }
+    }
+    if neg { 0 - v as i64 } else { v as i64 }
+}
+
+pub fn is_digit_start(c: u8) -> bool {
+    (c >= '0' && c <= '9') || c == '-'
+}
+
+// A data value: a number, a symbol, or `A - B` (two labels).
+fn data_value(a: i64, b: i64, size: i64) {
+    let t = BUFS[ASM].data;
+    if is_digit_start(t[a]) {
+        if size == 4 { out32(parse_number(a, b)); } else { out64(parse_number(a, b)); }
+        return;
+    }
+    let mut minus = a;
+    while minus < b && t[minus] != '-' {
+        minus += 1;
+    }
+    if minus < b {
+        let mut e1 = minus;
+        while e1 > a && is_space(t[e1 - 1]) {
+            e1 -= 1;
+        }
+        let mut s2 = minus + 1;
+        while s2 < b && is_space(t[s2]) {
+            s2 += 1;
+        }
+        if size != 4 {
+            asm_error(c"a difference of labels must be a .long");
+        }
+        let s1 = asym(t[a..e1]);
+        let s2sym = asym(t[s2..b]);
+        fixup(FX_DIFF32, here(), s1, 0, 0, false);
+        FIXUPS[FIXUP_COUNT - 1].sym2 = s2sym;
+        out32(0);
+        return;
+    }
+    if size != 8 {
+        asm_error(c"an address must be a .quad");
+    }
+    fixup(FX_ABS64, here(), asym(t[a..b]), 0, 0, false);
+    out64(0);
+}
+
+fn directive(a: i64, b: i64, rest: i64, end: i64) {
+    let t = BUFS[ASM].data;
+    if text_is(a, b, c".byte") {
+        let mut i = rest;
+        while i < end {
+            let mut v = 0;
+            while i < end && t[i] >= '0' && t[i] <= '9' {
+                v = v * 10 + (t[i] - '0') as i64;
+                i += 1;
+            }
+            out8(v);
+            while i < end && (t[i] == ',' || is_space(t[i])) {
+                i += 1;
+            }
+        }
+        return;
+    }
+    if text_is(a, b, c".long") || text_is(a, b, c".quad") {
+        split_operands(rest, end);
+        for k in 0..OP_COUNT {
+            data_value(OP_START[k], OP_END[k], if t[b - 1] == 'g' { 4 } else { 8 });
+        }
+        return;
+    }
+    if text_is(a, b, c".p2align") {
+        let n = parse_number(rest, end);
+        if n > SEC_ALIGN[CUR_SEC] {
+            SEC_ALIGN[CUR_SEC] = n;
+        }
+        if n > 0 {
+            end_frag(TAIL_ALIGN, n, -1);
+        }
+        return;
+    }
+    if text_is(a, b, c".space") {
+        let n = parse_number(rest, end);
+        buf_reserve(OBJ_BYTES, n);
+        memset(&BUFS[OBJ_BYTES].data[BUFS[OBJ_BYTES].len], 0, n as u64);
+        BUFS[OBJ_BYTES].len += n;
+        return;
+    }
+    if text_is(a, b, c".globl") {
+        let s = asym(t[rest..end]);
+        ASYMS[s].global = true;
+        return;
+    }
+    if text_is(a, b, c".text") {
+        switch_section(SEC_TEXT);
+        return;
+    }
+    if text_is(a, b, c".data") {
+        switch_section(SEC_DATA);
+        return;
+    }
+    if text_is(a, b, c".section") {
+        if text_is(rest, end, c"__TEXT,__text") {
+            switch_section(SEC_TEXT);
+        } else if text_is(rest, end, c"__TEXT,__const") || text_is(rest, end, c".rodata") {
+            switch_section(SEC_CONST);
+        } else if text_is(rest, end, c"__DATA,__data") {
+            switch_section(SEC_DATA);
+        } else if end - rest > 15 && text_is(rest, rest + 15, c".note.GNU-stack") {
+            switch_section(SEC_NOTE);
+        } else {
+            asm_error(c"unknown section");
+        }
+        return;
+    }
+    asm_error(c"unknown directive");
+}
+
+fn label(a: i64, b: i64) {
+    let s = asym(BUFS[ASM].data[a..b]);
+    if ASYMS[s].defined {
+        asm_error(c"label defined twice");
+    }
+    ASYMS[s].defined = true;
+    ASYMS[s].frag = OPEN;
+    ASYMS[s].off = here() - FRAGS[OPEN].start;
+    ASYMS[s].sec = CUR_SEC;
+    if !is_temp(s) {
+        CUR_ATOM[CUR_SEC] = s;
+    }
+    ASYMS[s].atom = CUR_ATOM[CUR_SEC];
+}
+
+fn assemble_line(a: i64, b: i64) {
+    let t = BUFS[ASM].data;
+    let mut i = a;
+    while i < b && is_space(t[i]) {
+        i += 1;
+    }
+    let mut e = b;
+    while e > i && is_space(t[e - 1]) {
+        e -= 1;
+    }
+    if i >= e {
+        return;
+    }
+    LINE_START = i;
+    LINE_END = e;
+    let mut w = i;
+    while w < e && !is_space(t[w]) {
+        w += 1;
+    }
+    if w == e && t[e - 1] == ':' {
+        label(i, e - 1);
+        return;
+    }
+    let mut r = w;
+    while r < e && is_space(t[r]) {
+        r += 1;
+    }
+    if t[i] == '.' {
+        directive(i, w, r, e);
+        return;
+    }
+    split_operands(r, e);
+    if X86 {
+        x86_instruction(i, w);
+    } else {
+        a64_instruction(i, w);
+    }
+}
+
+// ---- Layout ----
+
+// A branch the assembler resolves may be short: to a non-global label of
+// the same section (GNU as), and of the same atom (LLVM, Mach-O);
+// anything else is long, with a relocation.
+fn relaxable(f: i64) -> bool {
+    resolvable(FRAGS[f].sym, FRAGS[f].sec, FRAGS[f].atom)
+}
+
+// Whether a pc-relative reference to s from section sec, atom `atom`, is
+// resolved by the assembler.
+fn resolvable(s: i64, sec: i64, atom: i64) -> bool {
+    ASYMS[s].defined && ASYMS[s].sec == sec && !ASYMS[s].global && (ELF || ASYMS[s].atom == atom)
+}
+
+fn tail_size(f: i64, addr: i64) -> i64 {
+    let tail = FRAGS[f].tail;
+    if tail == TAIL_ALIGN {
+        let size = 1 << FRAGS[f].arg;
+        return (size - (addr & (size - 1))) & (size - 1);
+    }
+    if tail == TAIL_JMP {
+        return if FRAGS[f].long { 5 } else { 2 };
+    }
+    if tail == TAIL_JCC {
+        return if FRAGS[f].long { 6 } else { 2 };
+    }
+    0
+}
+
+fn layout_pass() {
+    let mut addr: [i64; 4] = [0, 0, 0, 0];
+    for f in 0..FRAG_COUNT {
+        let sec = FRAGS[f].sec;
+        FRAGS[f].addr = addr[sec];
+        addr[sec] += FRAGS[f].len;
+        addr[sec] += tail_size(f, addr[sec]);
+    }
+}
+
+fn layout() {
+    for f in 0..FRAG_COUNT {
+        if (FRAGS[f].tail == TAIL_JMP || FRAGS[f].tail == TAIL_JCC) && !relaxable(f) {
+            FRAGS[f].long = true;
+        }
+    }
+    loop {
+        layout_pass();
+        let mut changed = false;
+        for f in 0..FRAG_COUNT {
+            if (FRAGS[f].tail == TAIL_JMP || FRAGS[f].tail == TAIL_JCC) && !FRAGS[f].long {
+                let end = FRAGS[f].addr + FRAGS[f].len + 2;
+                let d = sym_addr(FRAGS[f].sym) - end;
+                if d < -128 || d > 127 {
+                    FRAGS[f].long = true;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+// ---- Fixups resolved, or relocations ----
+
+const MACHO_A64_UNSIGNED: i64 = 0;
+const MACHO_A64_BRANCH26: i64 = 2;
+const MACHO_A64_PAGE21: i64 = 3;
+const MACHO_A64_PAGEOFF12: i64 = 4;
+const MACHO_A64_GOT_PAGE21: i64 = 5;
+const MACHO_A64_GOT_PAGEOFF12: i64 = 6;
+const MACHO_X64_UNSIGNED: i64 = 0;
+const MACHO_X64_SIGNED: i64 = 1;
+const MACHO_X64_BRANCH: i64 = 2;
+const MACHO_X64_GOT_LOAD: i64 = 3;
+const ELF_X64_64: i64 = 1;
+const ELF_X64_PC32: i64 = 2;
+const ELF_X64_PLT32: i64 = 4;
+const ELF_X64_GOTPCRELX: i64 = 41;
+const ELF_X64_REX_GOTPCRELX: i64 = 42;
+
+fn same_section(s: i64, sec: i64) -> bool {
+    ASYMS[s].defined && ASYMS[s].sec == sec
+}
+
+fn patch_bits(pos: i64, value: i64, shift: i64, bits: i64, what: *u8) {
+    let limit = 1 << (bits - 1);
+    if value < 0 - limit || value >= limit {
+        asm_error(what);
+    }
+    let mask = (1 << bits) - 1;
+    put32(pos, get32(pos) | ((value & mask) << shift));
+}
+
+fn resolve_fixups() {
+    for k in 0..FIXUP_COUNT {
+        let fx = FIXUPS[k];
+        let f = fx.frag;
+        let sec = FRAGS[f].sec;
+        let p = FRAGS[f].addr + (fx.pos - FRAGS[f].start);
+        let s = fx.sym;
+        let kind = fx.kind;
+        if kind == FX_A64_B26 {
+            if same_section(s, sec) {
+                patch_bits(fx.pos, (sym_addr(s) - p) >> 2, 0, 26, c"branch out of range");
+            } else {
+                reloc_to(sec, p, MACHO_A64_BRANCH26, s, 0, true, 2);
+            }
+        } else if kind == FX_A64_B19 || kind == FX_A64_B14 || kind == FX_A64_ADR {
+            if !same_section(s, sec) {
+                asm_error(c"branch to another section");
+            }
+            let d = sym_addr(s) - p;
+            if kind == FX_A64_B19 {
+                patch_bits(fx.pos, d >> 2, 5, 19, c"conditional branch out of range");
+            } else if kind == FX_A64_B14 {
+                patch_bits(fx.pos, d >> 2, 5, 14, c"test branch out of range");
+            } else {
+                patch_bits(fx.pos, d & 3, 29, 2, c"adr");
+                patch_bits(fx.pos, d >> 2, 5, 19, c"adr out of range");
+            }
+        } else if kind == FX_A64_PAGE {
+            reloc_to(sec, p, MACHO_A64_PAGE21, s, 0, true, 2);
+        } else if kind == FX_A64_PAGEOFF {
+            reloc_to(sec, p, MACHO_A64_PAGEOFF12, s, 0, false, 2);
+        } else if kind == FX_A64_GOTPAGE {
+            reloc_to(sec, p, MACHO_A64_GOT_PAGE21, s, 0, true, 2);
+        } else if kind == FX_A64_GOTPAGEOFF {
+            reloc_to(sec, p, MACHO_A64_GOT_PAGEOFF12, s, 0, false, 2);
+        } else if kind == FX_X86_BRANCH || kind == FX_X86_RIP || kind == FX_X86_GOT {
+            let end = FRAGS[f].addr + (fx.end - FRAGS[f].start);
+            if kind != FX_X86_GOT && resolvable(s, sec, fx.atom) {
+                put32(fx.pos, sym_addr(s) + fx.addend - end);
+            } else if ELF {
+                let rtype = if kind == FX_X86_BRANCH { ELF_X64_PLT32 } else if kind == FX_X86_RIP { ELF_X64_PC32 } else if fx.rex { ELF_X64_REX_GOTPCRELX } else { ELF_X64_GOTPCRELX };
+                reloc_to(sec, p, rtype, s, fx.addend + p - end, true, 2);
+            } else {
+                if end != p + 4 {
+                    asm_error(c"a relocated field must end the instruction");
+                }
+                let rtype = if kind == FX_X86_BRANCH { MACHO_X64_BRANCH } else if kind == FX_X86_RIP { MACHO_X64_SIGNED } else { MACHO_X64_GOT_LOAD };
+                put32(fx.pos, fx.addend);
+                reloc_to(sec, p, rtype, s, 0, true, 2);
+            }
+        } else if kind == FX_DIFF32 {
+            if !same_section(s, sec) || !same_section(fx.sym2, sec) {
+                asm_error(c"a difference of labels in another section");
+            }
+            put32(fx.pos, sym_addr(s) - sym_addr(fx.sym2));
+        } else if kind == FX_ABS64 {
+            reloc_to(sec, p, if ELF { ELF_X64_64 } else if X86 { MACHO_X64_UNSIGNED } else { MACHO_A64_UNSIGNED }, s, 0, false, 3);
+        }
+    }
+}
+
+// x86-64 NOPs for alignment in code, as LLVM writes them (at most 10
+// bytes each).
+fn nops(out: i64, n: i64) {
+    // The NOPs of 1 to 10 bytes, one after the other (the k-byte one starts
+    // at k * (k - 1) / 2).
+    let table: [i64; 55] = [0x90, 0x66, 0x90, 0x0f, 0x1f, 0x00, 0x0f, 0x1f, 0x40, 0x00, 0x0f, 0x1f, 0x44, 0x00, 0x00, 0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00, 0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00, 0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00, 0x66, 0x2e, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00];
+    let mut left = n;
+    while left > 0 {
+        let k = if left > 10 { 10 } else { left };
+        let start = k * (k - 1) / 2;
+        for i in 0..k {
+            buf_byte(out, table[start + i] as u8);
+        }
+        left -= k;
+    }
+}
+
+// Section contents: fragments and their tails.
+fn build_sections() {
+    for sec in 0..SEC_COUNT {
+        SEC_BUF[sec] = buf_new();
+    }
+    for f in 0..FRAG_COUNT {
+        let sec = FRAGS[f].sec;
+        let out = SEC_BUF[sec];
+        buf_bytes(out, BUFS[OBJ_BYTES].data[FRAGS[f].start..FRAGS[f].start + FRAGS[f].len]);
+        let addr = FRAGS[f].addr + FRAGS[f].len;
+        let tail = FRAGS[f].tail;
+        if tail == TAIL_ALIGN {
+            let n = tail_size(f, addr);
+            if sec == SEC_TEXT && X86 {
+                nops(out, n);
+            } else if sec == SEC_TEXT && n % 4 == 0 {
+                for i in 0..n / 4 {
+                    buf_byte(out, 0x1f);
+                    buf_byte(out, 0x20);
+                    buf_byte(out, 0x03);
+                    buf_byte(out, 0xd5);
+                }
+            } else {
+                for i in 0..n {
+                    buf_byte(out, 0);
+                }
+            }
+        } else if tail == TAIL_JMP || tail == TAIL_JCC {
+            let s = FRAGS[f].sym;
+            let cc = FRAGS[f].arg;
+            if !FRAGS[f].long {
+                buf_byte(out, if tail == TAIL_JMP { 0xeb } else { (0x70 + cc) as u8 });
+                buf_byte(out, ((sym_addr(s) - (addr + 2)) & 255) as u8);
+            } else {
+                if tail == TAIL_JMP {
+                    buf_byte(out, 0xe9);
+                } else {
+                    buf_byte(out, 0x0f);
+                    buf_byte(out, (0x80 + cc) as u8);
+                }
+                let end = addr + tail_size(f, addr);
+                let p = end - 4;
+                let mut v = 0;
+                if relaxable(f) {
+                    v = sym_addr(s) - end;
+                } else if ELF {
+                    reloc_to(sec, p, ELF_X64_PLT32, s, -4, true, 2);
+                } else {
+                    reloc_to(sec, p, MACHO_X64_BRANCH, s, 0, true, 2);
+                }
+                buf_byte(out, (v & 255) as u8);
+                buf_byte(out, ((v >> 8) & 255) as u8);
+                buf_byte(out, ((v >> 16) & 255) as u8);
+                buf_byte(out, ((v >> 24) & 255) as u8);
+            }
+        }
+    }
+}
+
+// ---- Output helpers ----
+
+fn w8(out: i64, v: i64) {
+    buf_byte(out, (v & 255) as u8);
+}
+
+fn w16(out: i64, v: i64) {
+    w8(out, v);
+    w8(out, v >> 8);
+}
+
+fn w32(out: i64, v: i64) {
+    w16(out, v);
+    w16(out, v >> 16);
+}
+
+fn w64(out: i64, v: i64) {
+    w32(out, v);
+    w32(out, v >> 32);
+}
+
+// A name in a fixed 16-byte field.
+fn wname16(out: i64, name: *u8) {
+    let n = strlen(name) as i64;
+    for i in 0..16 {
+        w8(out, if i < n { name[i] as i64 } else { 0 });
+    }
+}
+
+fn pad_to(out: i64, size: i64) {
+    while BUFS[out].len < size {
+        buf_byte(out, 0);
+    }
+}
+
+fn align_up(v: i64, a: i64) -> i64 {
+    (v + a - 1) & (0 - a)
+}
+
+// ---- Mach-O ----
+
+fn macho_write(path: *u8) {
+    // Sections present: text always, the others when used.
+    let mut ord: [i64; 4] = [0, 0, 0, 0];
+    let mut secs: [i64; 3] = [0, 0, 0];
+    let mut nsect = 0;
+    for sec in 0..3 {
+        if sec == SEC_TEXT || BUFS[SEC_BUF[sec]].len > 0 || SEC_USED[sec] {
+            secs[nsect] = sec;
+            nsect += 1;
+            ord[sec] = nsect;
+        }
+    }
+    let mut vm = 0;
+    for k in 0..nsect {
+        let sec = secs[k];
+        vm = align_up(vm, 1 << SEC_ALIGN[sec]);
+        SEC_ADDR[sec] = vm;
+        vm += BUFS[SEC_BUF[sec]].len;
+    }
+    // On AArch64 LLVM marks the start of every section with a local
+    // symbol (ltmp0, ltmp1, ...): the linker keeps a section, even an
+    // empty one, by its symbols. The same here.
+    if !X86 {
+        for k in 0..nsect {
+            let sec = secs[k];
+            let name = buf_new();
+            buf_str(name, c"ltmp");
+            buf_int(name, k);
+            let s = asym(buf_slice(name));
+            let mut first = 0;
+            while FRAGS[first].sec != sec {
+                first += 1;
+            }
+            ASYMS[s].defined = true;
+            ASYMS[s].sec = sec;
+            ASYMS[s].frag = first;
+            ASYMS[s].off = 0;
+        }
+    }
+    // Symbols: locals (labels that are not temporary, and temporaries a
+    // relocation needs), then defined globals, then undefined ones.
+    let mut order = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for pass in 0..3 {
+        for s in 0..ASYM_COUNT {
+            let def = ASYMS[s].defined;
+            let local = def && !ASYMS[s].global && (!is_temp(s) || ASYMS[s].in_table);
+            let ext = def && ASYMS[s].global;
+            let undef = !def && (ASYMS[s].in_table || ASYMS[s].global);
+            if (pass == 0 && local) || (pass == 1 && ext) || (pass == 2 && undef) {
+                ASYMS[s].index = order.count;
+                order.push(s);
+            }
+        }
+    }
+    let mut nlocal = 0;
+    let mut next = 0;
+    for i in 0..order.count {
+        let s = order.data[i];
+        if ASYMS[s].defined && !ASYMS[s].global {
+            nlocal += 1;
+        } else if ASYMS[s].defined {
+            next += 1;
+        }
+    }
+    let nundef = order.count - nlocal - next;
+    // Relocations per section.
+    let ncmds = 4;
+    let seg_size = 72 + 80 * nsect;
+    let cmds_size = seg_size + 24 + 24 + 80;
+    let mut off = 32 + cmds_size;
+    let mut sec_off: [i64; 4] = [0, 0, 0, 0];
+    for k in 0..nsect {
+        let sec = secs[k];
+        off = align_up(off, 1 << SEC_ALIGN[sec]);
+        sec_off[sec] = off;
+        off += BUFS[SEC_BUF[sec]].len;
+    }
+    let content_end = off;
+    off = align_up(off, 8);
+    let mut rel_off: [i64; 4] = [0, 0, 0, 0];
+    let mut rel_n: [i64; 4] = [0, 0, 0, 0];
+    for k in 0..nsect {
+        let sec = secs[k];
+        rel_off[sec] = off;
+        for r in 0..RELOC_COUNT {
+            if RELOCS[r].sec == sec {
+                rel_n[sec] += 1;
+            }
+        }
+        off += 8 * rel_n[sec];
+    }
+    let sym_off = off;
+    off += 16 * order.count;
+    let str_off = off;
+    let strs = buf_new();
+    w8(strs, 0);
+    let mut strx = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for i in 0..order.count {
+        strx.push(BUFS[strs].len);
+        buf_bytes(strs, SYMS[ASYMS[order.data[i]].name].text);
+        w8(strs, 0);
+    }
+    pad_to(strs, align_up(BUFS[strs].len, 8));
+    let out = buf_new();
+    // Header.
+    w32(out, 0xfeedfacf);
+    w32(out, if X86 { 0x01000007 } else { 0x0100000c });
+    w32(out, if X86 { 3 } else { 0 });
+    w32(out, 1);
+    w32(out, ncmds);
+    w32(out, cmds_size);
+    w32(out, 0);
+    w32(out, 0);
+    // The segment and its sections.
+    w32(out, 0x19);
+    w32(out, seg_size);
+    wname16(out, c"");
+    w64(out, 0);
+    w64(out, vm);
+    w64(out, 32 + cmds_size);
+    w64(out, content_end - (32 + cmds_size));
+    w32(out, 7);
+    w32(out, 7);
+    w32(out, nsect);
+    w32(out, 0);
+    for k in 0..nsect {
+        let sec = secs[k];
+        wname16(out, if sec == SEC_TEXT { c"__text" } else if sec == SEC_CONST { c"__const" } else { c"__data" });
+        wname16(out, if sec == SEC_DATA { c"__DATA" } else { c"__TEXT" });
+        w64(out, SEC_ADDR[sec]);
+        w64(out, BUFS[SEC_BUF[sec]].len);
+        w32(out, sec_off[sec]);
+        w32(out, SEC_ALIGN[sec]);
+        w32(out, if rel_n[sec] > 0 { rel_off[sec] } else { 0 });
+        w32(out, rel_n[sec]);
+        w32(out, if sec == SEC_TEXT { 0x80000400 } else { 0 });
+        w32(out, 0);
+        w32(out, 0);
+        w32(out, 0);
+    }
+    // LC_BUILD_VERSION: macOS 11.0 (arm64) or 10.13 (x86-64).
+    w32(out, 0x32);
+    w32(out, 24);
+    w32(out, 1);
+    w32(out, if X86 { 0x000a0d00 } else { 0x000b0000 });
+    w32(out, 0);
+    w32(out, 0);
+    // LC_SYMTAB.
+    w32(out, 2);
+    w32(out, 24);
+    w32(out, sym_off);
+    w32(out, order.count);
+    w32(out, str_off);
+    w32(out, BUFS[strs].len);
+    // LC_DYSYMTAB.
+    w32(out, 0xb);
+    w32(out, 80);
+    w32(out, 0);
+    w32(out, nlocal);
+    w32(out, nlocal);
+    w32(out, next);
+    w32(out, nlocal + next);
+    w32(out, nundef);
+    for i in 0..12 {
+        w32(out, 0);
+    }
+    // Contents.
+    for k in 0..nsect {
+        let sec = secs[k];
+        pad_to(out, sec_off[sec]);
+        buf_bytes(out, buf_slice(SEC_BUF[sec]));
+    }
+    pad_to(out, align_up(BUFS[out].len, 8));
+    for k in 0..nsect {
+        let sec = secs[k];
+        pad_to(out, rel_off[sec]);
+        for r in 0..RELOC_COUNT {
+            if RELOCS[r].sec == sec {
+                let rl = RELOCS[r];
+                w32(out, rl.offset);
+                let pcrel = if rl.pcrel { 1 } else { 0 };
+                w32(out, ASYMS[rl.sym].index | pcrel << 24 | rl.length << 25 | 1 << 27 | rl.rtype << 28);
+            }
+        }
+    }
+    pad_to(out, sym_off);
+    for i in 0..order.count {
+        let s = order.data[i];
+        w32(out, strx.data[i]);
+        if ASYMS[s].defined {
+            w8(out, if ASYMS[s].global { 0x0f } else { 0x0e });
+            w8(out, ord[ASYMS[s].sec]);
+            w16(out, 0);
+            w64(out, SEC_ADDR[ASYMS[s].sec] + sym_addr(s));
+        } else {
+            w8(out, 0x01);
+            w8(out, 0);
+            w16(out, 0);
+            w64(out, 0);
+        }
+    }
+    buf_bytes(out, buf_slice(strs));
+    buf_write_file(out, path);
+}
+
+// ---- ELF ----
+
+fn elf_write(path: *u8) {
+    // Sections: 0 null, 1 .text, 2 .rodata, 3 .data, 4 .note.GNU-stack,
+    // then .rela.text, .rela.rodata, .rela.data (those with relocations),
+    // .symtab, .strtab, .shstrtab.
+    let mut shndx: [i64; 4] = [1, 2, 3, 4];
+    let names: [*u8; 4] = [c".text", c".rodata", c".data", c".note.GNU-stack"];
+    let mut rel_n: [i64; 4] = [0, 0, 0, 0];
+    for r in 0..RELOC_COUNT {
+        rel_n[RELOCS[r].sec] += 1;
+    }
+    let mut rela_index: [i64; 4] = [0, 0, 0, 0];
+    let mut nsh = 5;
+    for sec in 0..3 {
+        if rel_n[sec] > 0 {
+            rela_index[sec] = nsh;
+            nsh += 1;
+        }
+    }
+    let symtab_index = nsh;
+    let strtab_index = nsh + 1;
+    let shstrtab_index = nsh + 2;
+    nsh += 3;
+    // Symbols: null, the four sections, local labels, then globals.
+    let strs = buf_new();
+    w8(strs, 0);
+    let syms = buf_new();
+    for i in 0..24 {
+        w8(syms, 0);
+    }
+    for sec in 0..4 {
+        w32(syms, 0);
+        w8(syms, 3);
+        w8(syms, 0);
+        w16(syms, shndx[sec]);
+        w64(syms, 0);
+        w64(syms, 0);
+    }
+    let mut count = 5;
+    let mut first_global = 5;
+    for pass in 0..2 {
+        if pass == 1 {
+            first_global = count;
+        }
+        for s in 0..ASYM_COUNT {
+            let def = ASYMS[s].defined;
+            let local = def && !ASYMS[s].global && !is_temp(s);
+            let global = ASYMS[s].global || (!def && ASYMS[s].in_table);
+            if (pass == 0 && local) || (pass == 1 && global) {
+                ASYMS[s].index = count;
+                count += 1;
+                w32(syms, BUFS[strs].len);
+                buf_bytes(strs, SYMS[ASYMS[s].name].text);
+                w8(strs, 0);
+                w8(syms, if pass == 0 { 0 } else { 0x10 });
+                w8(syms, 0);
+                w16(syms, if def { shndx[ASYMS[s].sec] } else { 0 });
+                w64(syms, if def { sym_addr(s) } else { 0 });
+                w64(syms, 0);
+            }
+        }
+    }
+    let shstr = buf_new();
+    w8(shstr, 0);
+    let mut name_off: [i64; 12] = [0; 12];
+    for sec in 0..4 {
+        name_off[1 + sec] = BUFS[shstr].len;
+        buf_str(shstr, names[sec]);
+        w8(shstr, 0);
+    }
+    for sec in 0..3 {
+        if rel_n[sec] > 0 {
+            name_off[rela_index[sec]] = BUFS[shstr].len;
+            buf_str(shstr, c".rela");
+            buf_str(shstr, names[sec]);
+            w8(shstr, 0);
+        }
+    }
+    name_off[symtab_index] = BUFS[shstr].len;
+    buf_str(shstr, c".symtab");
+    w8(shstr, 0);
+    name_off[strtab_index] = BUFS[shstr].len;
+    buf_str(shstr, c".strtab");
+    w8(shstr, 0);
+    name_off[shstrtab_index] = BUFS[shstr].len;
+    buf_str(shstr, c".shstrtab");
+    w8(shstr, 0);
+    // File: header, contents, relocations, tables, section headers.
+    let out = buf_new();
+    for i in 0..64 {
+        w8(out, 0);
+    }
+    let mut sec_off: [i64; 12] = [0; 12];
+    let mut sec_size: [i64; 12] = [0; 12];
+    let elf_sec: [i64; 4] = [SEC_TEXT, SEC_CONST, SEC_DATA, SEC_NOTE];
+    for k in 0..4 {
+        let sec = elf_sec[k];
+        pad_to(out, align_up(BUFS[out].len, 1 << SEC_ALIGN[sec]));
+        sec_off[shndx[sec]] = BUFS[out].len;
+        sec_size[shndx[sec]] = BUFS[SEC_BUF[sec]].len;
+        buf_bytes(out, buf_slice(SEC_BUF[sec]));
+    }
+    for sec in 0..3 {
+        if rel_n[sec] > 0 {
+            pad_to(out, align_up(BUFS[out].len, 8));
+            sec_off[rela_index[sec]] = BUFS[out].len;
+            sec_size[rela_index[sec]] = 24 * rel_n[sec];
+            for r in 0..RELOC_COUNT {
+                if RELOCS[r].sec == sec {
+                    let rl = RELOCS[r];
+                    let sym = if rl.sym < 0 { 1 + elf_sec_index(-1 - rl.sym) } else { ASYMS[rl.sym].index };
+                    w64(out, rl.offset);
+                    w64(out, sym << 32 | rl.rtype);
+                    w64(out, rl.addend);
+                }
+            }
+        }
+    }
+    pad_to(out, align_up(BUFS[out].len, 8));
+    sec_off[symtab_index] = BUFS[out].len;
+    sec_size[symtab_index] = BUFS[syms].len;
+    buf_bytes(out, buf_slice(syms));
+    sec_off[strtab_index] = BUFS[out].len;
+    sec_size[strtab_index] = BUFS[strs].len;
+    buf_bytes(out, buf_slice(strs));
+    sec_off[shstrtab_index] = BUFS[out].len;
+    sec_size[shstrtab_index] = BUFS[shstr].len;
+    buf_bytes(out, buf_slice(shstr));
+    pad_to(out, align_up(BUFS[out].len, 8));
+    let sh_off = BUFS[out].len;
+    for i in 0..64 {
+        w8(out, 0);
+    }
+    for k in 0..4 {
+        let sec = elf_sec[k];
+        let i = shndx[sec];
+        w32(out, name_off[i]);
+        w32(out, 1);
+        w64(out, if sec == SEC_TEXT { 6 } else if sec == SEC_DATA { 3 } else if sec == SEC_CONST { 2 } else { 0 });
+        w64(out, 0);
+        w64(out, sec_off[i]);
+        w64(out, sec_size[i]);
+        w32(out, 0);
+        w32(out, 0);
+        w64(out, 1 << SEC_ALIGN[sec]);
+        w64(out, 0);
+    }
+    for sec in 0..3 {
+        if rel_n[sec] > 0 {
+            let i = rela_index[sec];
+            w32(out, name_off[i]);
+            w32(out, 4);
+            w64(out, 0x40);
+            w64(out, 0);
+            w64(out, sec_off[i]);
+            w64(out, sec_size[i]);
+            w32(out, symtab_index);
+            w32(out, shndx[sec]);
+            w64(out, 8);
+            w64(out, 24);
+        }
+    }
+    let tables: [i64; 3] = [symtab_index, strtab_index, shstrtab_index];
+    for k in 0..3 {
+        let i = tables[k];
+        w32(out, name_off[i]);
+        w32(out, if k == 0 { 2 } else { 3 });
+        w64(out, 0);
+        w64(out, 0);
+        w64(out, sec_off[i]);
+        w64(out, sec_size[i]);
+        w32(out, if k == 0 { strtab_index } else { 0 });
+        w32(out, if k == 0 { first_global } else { 0 });
+        w64(out, if k == 0 { 8 } else { 1 });
+        w64(out, if k == 0 { 24 } else { 0 });
+    }
+    // The header.
+    let h = BUFS[out].data;
+    let ident: [i64; 8] = [0x7f, 'E' as i64, 'L' as i64, 'F' as i64, 2, 1, 1, 0];
+    for i in 0..8 {
+        h[i] = ident[i] as u8;
+    }
+    let hdr = buf_new();
+    w16(hdr, 1);
+    w16(hdr, 62);
+    w32(hdr, 1);
+    w64(hdr, 0);
+    w64(hdr, 0);
+    w64(hdr, sh_off);
+    w32(hdr, 0);
+    w16(hdr, 64);
+    w16(hdr, 0);
+    w16(hdr, 0);
+    w16(hdr, 64);
+    w16(hdr, nsh);
+    w16(hdr, shstrtab_index);
+    memcpy(&h[16], BUFS[hdr].data, 48);
+    buf_write_file(out, path);
+}
+
+// The ELF section symbol's index (after the null symbol) of section sec.
+fn elf_sec_index(sec: i64) -> i64 {
+    if sec == SEC_TEXT { 0 } else if sec == SEC_CONST { 1 } else if sec == SEC_DATA { 2 } else { 3 }
+}
+
+// ---- The driver ----
+
+// Assembles ASM into an object file at `path`.
+pub fn write_object(path: *u8) {
+    OBJ_BYTES = buf_new();
+    CUR_SEC = SEC_TEXT;
+    SEC_USED[SEC_TEXT] = true;
+    new_frag(SEC_TEXT);
+    if X86 {
+        init_x86();
+    } else {
+        init_a64();
+    }
+    let t = BUFS[ASM].data;
+    let n = BUFS[ASM].len;
+    let mut i = 0;
+    while i < n {
+        let mut e = i;
+        while e < n && t[e] != '\n' {
+            e += 1;
+        }
+        assemble_line(i, e);
+        i = e + 1;
+    }
+    new_frag(CUR_SEC);
+    layout();
+    resolve_fixups();
+    build_sections();
+    if ELF {
+        SEC_ALIGN[SEC_NOTE] = 0;
+        elf_write(path);
+    } else {
+        macho_write(path);
+    }
+}
+
+// ---- Output ----
+
+extern "C" {
+    fn system(command: *u8) -> i32;
+    fn unlink(path: *u8) -> i32;
+    fn getenv(name: *u8) -> *u8;
+}
+
+// What the compiler writes: assembly (`-S`, `--emit-asm`, or an output
+// named *.s), an object (`-c`, or *.o), or an executable linked by `cc`
+// (any other output name).
+pub const OUT_ASM: i64 = 0;
+pub const OUT_OBJECT: i64 = 1;
+pub const OUT_EXECUTABLE: i64 = 2;
+pub static mut OUTPUT_MODE: i64 = -1;
+
+// The output mode for `path` when no option chose one.
+pub fn output_mode_of(path: *u8) -> i64 {
+    let n = strlen(path) as i64;
+    if n >= 2 && path[n - 2] == '.' && path[n - 1] == 's' {
+        return OUT_ASM;
+    }
+    if n >= 2 && path[n - 2] == '.' && path[n - 1] == 'o' {
+        return OUT_OBJECT;
+    }
+    OUT_EXECUTABLE
+}
+
+// Writes the program (ASM) to `path` as the output mode says.
+pub fn write_output(path: *u8) {
+    if OUTPUT_MODE == OUT_ASM {
+        buf_write_file(ASM, path);
+        return;
+    }
+    if OUTPUT_MODE == OUT_OBJECT {
+        write_object(path);
+        return;
+    }
+    let obj = buf_new();
+    buf_str(obj, path);
+    buf_str(obj, c".tachyon.o");
+    buf_byte(obj, 0);
+    let obj_path = BUFS[obj].data;
+    write_object(obj_path);
+    let cmd = buf_new();
+    let cc = getenv(c"TACHYON_CC");
+    buf_str(cmd, if cc != 0 as *u8 && cc[0] != 0 { cc } else { c"cc" });
+    if !ELF {
+        buf_str(cmd, if X86 { c" -arch x86_64" } else { c" -arch arm64" });
+    }
+    buf_str(cmd, c" -o '");
+    buf_str(cmd, path);
+    buf_str(cmd, c"' '");
+    buf_str(cmd, obj_path);
+    buf_str(cmd, c"'");
+    buf_byte(cmd, 0);
+    let status = system(BUFS[cmd].data);
+    unlink(obj_path);
+    if status != 0 {
+        die(c"linking failed");
+    }
+}
