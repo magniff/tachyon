@@ -12,29 +12,70 @@
 // Labels: a loop node's `z` is its continue label; z + 1 is its break
 // label (z + 2 the condition of a `for`).
 
-use crate::base::*;
-use crate::objfile::*;
-use crate::lexer::*;
-use crate::cimport::*;
-use crate::cheader::*;
-use crate::ast::*;
-use crate::parser::*;
-use crate::types::*;
-use crate::check::*;
-use crate::consteval::*;
-use crate::abi::*;
-use crate::target::*;
-use crate::x86_64::*;
-use crate::ir::*;
-use crate::lower::*;
-use crate::opt::*;
-use crate::inline::*;
-use crate::isel::*;
-use crate::regalloc::*;
-use crate::emit::*;
-use crate::*;
-use crate::timer::*;
-use crate::ast::NodeKind::*;
+use crate::base::{
+    BUFS, ERR_KIND, IntVec, SYMS, buf_byte, buf_bytes, buf_clear, buf_int, buf_new, buf_slice,
+    buf_str, buf_write_file, exit, intern_c,
+};
+use crate::objfile::write_output;
+use crate::lexer::{STRS, STR_COUNT, Tok};
+use crate::cimport::drop_shadowed_imports;
+use crate::cheader::emit_c_header;
+use crate::ast::{
+    DEFERS, DEFER_LOOPS, NODES, NodeKind, child, defer_loop_depth, defer_loop_enter,
+    defer_loop_leave, init_ast,
+};
+use crate::parser::{is_comparison, parse_program};
+use crate::types::{
+    ENUMS, FNS, STATICS, STATIC_COUNT, SYM_STATIC, TYPES, TY_BOOL, TY_F32, TY_NEVER, TY_U32, TY_U64,
+    TY_U8, TY_UNIT, TyKind, VARIANTS, align_to, field_offset, fn_param, init_declarations,
+    init_types, is_compound, is_float, is_integer, is_signed, is_slice, is_void, max_i64,
+    scalar_type, struct_field, tuple_offset, type_align, type_elem, type_size, variant_field,
+    variant_field_offset,
+};
+use crate::check::{LOCALS, Res, check_program, type_error};
+use crate::consteval::{const_emit, const_value, f64_of_bits, float_const, wrap_int};
+use crate::abi::{
+    ABI_PIECE_COUNT, ABI_PIECE_OFFSET, ABI_PIECE_TY, AbiClass, abi_classify, abi_piece_locations,
+    abi_stack_location, abi_variadic_piece_locations, return_piece_reg, returns_through_pointer,
+    variadic_kind,
+};
+use crate::target::{
+    ASM, CODE, DATA, DEPTH, PANIC_INDEX_SIGNED, PANIC_INDEX_UNSIGNED, PANIC_RANGE_SIGNED,
+    PANIC_RANGE_UNSIGNED, R_ACC, R_ADDR, R_LOOP_COUNT, R_LOOP_PTR, R_RESULT, R_SECOND, X86,
+    arg_location, data_align, data_bytes, data_label, data_section, data_string, emit_add_imm,
+    emit_bitnot, emit_call, emit_call_indirect, emit_compare, emit_compare_jump, emit_copy,
+    emit_decrement, emit_drop_temps, emit_epilogue, emit_extern_symbol_addr, emit_file_header,
+    emit_file_trailer, emit_float_binary, emit_float_to_float, emit_float_to_int, emit_frame_addr,
+    emit_frame_reserve, emit_function_start, emit_index_addr, emit_int_binary, emit_int_to_float,
+    emit_jump, emit_jump_if_nonzero, emit_jump_if_zero, emit_jump_unless_zero_result, emit_label,
+    emit_load, emit_load_arg_reg, emit_load_callee, emit_load_float, emit_load_imm, emit_load_param,
+    emit_load_reg, emit_local_symbol_addr, emit_move_to_second, emit_negate, emit_normalize,
+    emit_not_bool, emit_panic, emit_peek, emit_peek_at, emit_runtime, emit_sp_add, emit_sp_sub,
+    emit_stack_arg, emit_store, emit_store_offset, emit_string_addr, first_int_arg, function_prefix,
+    global_prefix, local_prefix, new_label, pop_d, pop_x, push_value, push_x0, static_prefix,
+    variadic_arg_location,
+};
+use crate::x86_64::{x64_realign_pushed, x64_restore_sp};
+use crate::ir::{Cond, IRFUNC_COUNT, cond_of_token, print_ir_func};
+use crate::lower::{is_fresh, lower_program};
+use crate::opt::{OPT_LEVEL, optimize_program};
+use crate::inline::FN_LIVE;
+use crate::isel::select_instructions;
+use crate::regalloc::count_uses;
+use crate::emit::{
+    arg_reg, gen_ir_function, m_lea, m_load, m_mov, m_store, print_stats, reg_fp, reg_sp, xl_from_c,
+};
+use crate::{
+    EMIT_HEADER, IMPORTED_START, T_CHECK, T_CODEGEN, T_ISEL, T_LOWER, T_OUTPUT, T_PARSE, timer_add,
+    timer_now, timer_report,
+};
+use crate::ast::NodeKind::{
+    Array, Assign, Binary, Bool, Break, CStr, Call, Cast, Char, Continue, Defer, EnumPanic,
+    FieldAccess, Float, Fn, For, Ident, If, Index, Int, Let, Loop, Match, PatBind, PatLit, PatOr,
+    PatRange, PatTuple, PatVariant, PatWild, Range, Repeat, Return, Str, StructLit, Tuple,
+    TupleField, Unary, Unit, VariantLit, While,
+};
+use crate::fiximports::{FIX_IMPORTS, fix_imports};
 
 static mut FRAME_SIZE: i64 = 0;
 static mut RETURN_LABEL: i64 = 0;
@@ -137,6 +178,10 @@ pub fn compile_program(output: *u8) {
     ERR_KIND = c"type error";
     check_program(program);
     timer_add(T_CHECK, t);
+    if FIX_IMPORTS {
+        fix_imports();
+        exit(0);
+    }
     if EMIT_HEADER {
         emit_c_header(program, output);
         return;

@@ -12,14 +12,30 @@
 // Or-patterns: the alternatives after the first bind the locals of the
 // first (OR_FIRST..OR_END in ENV) instead of new ones.
 use std::Option;
-use crate::base::*;
-use crate::ast::*;
-use crate::modules::*;
-use crate::types::*;
-use crate::check::*;
-use crate::consteval::*;
-use crate::generics::*;
-use crate::ast::NodeKind::*;
+use crate::base::{
+    ERR, ERR_HELP, IntVec, buf_byte, buf_int, buf_str, buf_uint, err_begin, err_end, err_help,
+    err_help_sym, err_int, err_str, err_sym, free, sym_name,
+};
+use crate::ast::{
+    ARM_NO_ELSE, ARM_SYNTHETIC, NODES, child, list_begin, list_end, list_push, new_node,
+};
+use crate::modules::{
+    B_ITEM, B_PRIVATE, CUR_MOD, access_error, binding_kind, binding_value, lookup_commit,
+    lookup_name, note_c_use, note_pattern_pos, path_module,
+};
+use crate::types::{
+    CONSTS, ENUMS, SYM_PRIMITIVE, TYPES, TY_BOOL, TY_NEVER, TY_UNIT, TyKind, VARIANTS, buf_type,
+    enum_type, enum_variant, err_type, find_variant, int_max, is_fieldless_enum, is_float,
+    is_integer, is_signed, type_elem, variant_field,
+};
+use crate::check::{
+    ENV, LOCALS, SELF_TYPE, SELF_TYPE_SYM, check_expr, define_local, lookup_local, mismatch_error,
+    name_error, pop_scope, push_scope, resolve_key, resolve_named, scope_const, synth_expr,
+    type_error, type_error_got, unknown_name_error, used_variant_enum,
+};
+use crate::consteval::{check_const_expr, const_eval, const_less, const_value, wrap_int};
+use crate::generics::{TPL_NONE, env_lookup, instance_of, template_of_key};
+use crate::ast::NodeKind::{Ident, PatBind, PatLit, PatOr, PatRange, PatTuple, PatVariant, PatWild};
 
 pub static mut OR_MODE: bool = false;
 static mut OR_FIRST: i64 = 0;
@@ -41,6 +57,7 @@ fn check_pat(p: i64, ty: i64) {
     if kind == PatBind && NODES[p].b == 0 && scope_const(NODES[p].a) == 0
         && lookup_local(NODES[p].a).is_none() && used_variant_enum(NODES[p].a, ty, p) != 0 {
         // A variant brought into scope by `use` (0.4) or the prelude (0.6).
+        lookup_commit(NODES[p].a, NODES[p].start);
         NODES[p].y = used_variant_enum(NODES[p].a, ty, p);
         NODES[p].kind = PatVariant;
         NODES[p].b = NODES[p].a;
@@ -52,8 +69,9 @@ fn check_pat(p: i64, ty: i64) {
         // `V(p, ...)`: a variant by its own name, from `use`.
         let t = used_variant_enum(NODES[p].b, ty, p);
         if t == 0 {
-            name_error(NODES[p].start, c"unknown variant '", NODES[p].b, c"' (write 'Enum::Variant', or bring it into scope with 'use Enum::*;')");
+            name_error(NODES[p].start, c"unknown variant '", NODES[p].b, c"' (write 'Enum::Variant', or bring it into scope with 'use Enum::Variant;')");
         }
+        lookup_commit(NODES[p].b, NODES[p].start);
         NODES[p].y = t;
         NODES[p].d = 0;
         check_pat(p, ty);
@@ -66,6 +84,8 @@ fn check_pat(p: i64, ty: i64) {
     if kind == PatBind && NODES[p].b == 0 && scope_const(NODES[p].a) != 0
         && lookup_local(NODES[p].a).is_none() && is_fieldless_enum(CONSTS[scope_const(NODES[p].a) - 1].ty) {
         // A constant of a fieldless enum: its variant's pattern.
+        note_pattern_pos(NODES[p].start);
+        lookup_commit(NODES[p].a, NODES[p].start);
         let c = scope_const(NODES[p].a) - 1;
         let e = TYPES[CONSTS[c].ty].a;
         let value = const_value(c);
@@ -85,6 +105,7 @@ fn check_pat(p: i64, ty: i64) {
         let name = NODES[p].a;
         if scope_const(name) != 0 && NODES[p].b == 0 && lookup_local(name).is_none() {
             // A constant's name: a literal pattern.
+            note_pattern_pos(NODES[p].start);
             let e = new_node(Ident, NODES[p].start, NODES[p].end);
             NODES[e].a = name;
             NODES[p].kind = PatLit;
@@ -220,6 +241,9 @@ fn pattern_enum_type(p: i64, ty: i64) -> i64 {
     }
     let m = if NODES[p].h != 0 { path_module(NODES[p].h, NODES[NODES[p].h].count) } else { CUR_MOD };
     let b = lookup_name(m, name, CUR_MOD);
+    if NODES[p].h == 0 {
+        note_c_use(NODES[p].start, name, b);
+    }
     if binding_kind(b) == B_PRIVATE {
         access_error(b, NODES[p].start, name);
     }
