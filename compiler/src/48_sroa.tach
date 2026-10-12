@@ -97,6 +97,31 @@ fn find_leaf(s: i64, offset: i64, ty: i64) -> i64 {
     -1
 }
 
+// The same for a load or a store: a 64-bit integer leaf also takes the
+// other 64-bit integer type (i64 and u64 have the same canonical bits; a
+// slice's length is an i64 leaf that a parameter's piece fills as u64).
+fn find_access_leaf(s: i64, offset: i64, ty: i64) -> i64 {
+    for i in 0..SR_COUNT[s] {
+        let lt = leaf_type(s, i);
+        if leaf_offset(s, i) == offset
+            && (lt == ty || (is_integer(lt) && is_integer(ty) && int_bits(lt) == 64 && int_bits(ty) == 64)) {
+            return i;
+        }
+    }
+    -1
+}
+
+// v as type ty: v, or a conversion before instruction `at` between 64-bit
+// integer types (which changes no bits).
+fn as_leaf_type(v: i64, ty: i64, at: i64) -> i64 {
+    if INSTS[v].ty == ty {
+        return v;
+    }
+    let c = op_before(at, Op::Conv, ty, v, 0);
+    INSTS[c].imm2 = INSTS[v].ty;
+    c
+}
+
 // Whether [offset, + size) holds whole leaves of slot s only.
 fn whole_leaves(s: i64, offset: i64, size: i64) -> bool {
     for i in 0..SR_COUNT[s] {
@@ -163,9 +188,9 @@ fn sroa_scan(fi: i64) {
                 }
                 let mut ok = false;
                 if op == Op::Load && k == 0 {
-                    ok = find_leaf(s, offset + INSTS[v].imm, INSTS[v].ty) >= 0;
+                    ok = find_access_leaf(s, offset + INSTS[v].imm, INSTS[v].ty) >= 0;
                 } else if op == Op::Store && k == 0 {
-                    ok = find_leaf(s, offset + INSTS[v].imm, INSTS[v].imm2) >= 0;
+                    ok = find_access_leaf(s, offset + INSTS[v].imm, INSTS[v].imm2) >= 0;
                 } else if op == Op::Copy && k <= 1 {
                     ok = whole_leaves(s, offset, INSTS[v].imm);
                 } else if op == Op::Add && k == 0 && INSTS[v].ty == TY_U64 && is_const(INSTS[v].b) {
@@ -223,14 +248,15 @@ fn sroa_block(b: i64) {
         if op == Op::Load {
             let s = sroa_slot(INSTS[v].a, &offset);
             if s != 0 {
-                let leaf = find_leaf(s, offset + INSTS[v].imm, INSTS[v].ty);
-                ir_replace(v, ssa_read(SR_VAR[s] + leaf, b));
+                let leaf = find_access_leaf(s, offset + INSTS[v].imm, INSTS[v].ty);
+                let value = ssa_read(SR_VAR[s] + leaf, b);
+                ir_replace(v, as_leaf_type(value, INSTS[v].ty, v));
             }
         } else if op == Op::Store {
             let s = sroa_slot(INSTS[v].a, &offset);
             if s != 0 {
-                let leaf = find_leaf(s, offset + INSTS[v].imm, INSTS[v].imm2);
-                ssa_write(SR_VAR[s] + leaf, b, ir_val(INSTS[v].b));
+                let leaf = find_access_leaf(s, offset + INSTS[v].imm, INSTS[v].imm2);
+                ssa_write(SR_VAR[s] + leaf, b, as_leaf_type(ir_val(INSTS[v].b), leaf_type(s, leaf), v));
                 ir_unlink(v);
             }
         } else if op == Op::Copy {
