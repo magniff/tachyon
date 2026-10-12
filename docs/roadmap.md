@@ -13,7 +13,16 @@ x86_64-linux:
 - the random-program differential tester (`-O0` vs every level, the seed as
   a third oracle) finds no mismatch;
 - output is deterministic and host-independent;
-- `bench/` results are recorded in this file.
+- `bench/` results are recorded in this file;
+- compile times are recorded in this file (the compiler building itself
+  at `-O0` and `-O2`, and end to end to an executable), and any regression
+  against the previous release is explained or fixed.
+
+Priorities, in order: correctness (the gate above); exact C interop where
+it is asked for; **compilation speed**, as fast as possible at every
+level, measured every release; then the speed of the generated code.
+Compilation speed is weighed in every design: an optimization has to pay
+for its compile time.
 
 The reference points: **Cranelift** does SSA, e-graph-based rewriting
 (GVN, constant folding, algebraic simplification, LICM, redundant load
@@ -184,7 +193,7 @@ Language (front end; see grammar.md, "Additions of 0.5"):
 - [x] modules: a file is a module (`mod m;`), `pub`, paths with `crate`,
   `self` and `super`, `use a::b::{c, d as e}`, `use a::b::*`, `pub use`;
   `import "h.h" as c;` names the C declarations' module
-- [x] several errors per compilation (pulled forward from 1.0): the parser
+- [x] several errors per compilation (pulled forward from 0.10): the parser
   and the checker recover at statements, items and functions; errors that
   follow from an earlier one are not reported
 - [x] a small standard library built into the compiler (`std::Option`,
@@ -222,7 +231,7 @@ The back end, in two stages (design and status in
 
 Stage B:
 
-- [x] instruction selection by rules (`50_isel.tach`): a per-target rule
+- [x] instruction selection by rules (`isel.tach`): a per-target rule
   table tiling each block's SSA DAG by maximal munch into machine
   operations the allocator sees like any instruction: scaled-index
   addressing (AArch64 `[x, x, lsl #s]`, x86-64 `d(b, i, s)`, frame slots
@@ -233,7 +242,7 @@ Stage B:
   macOS and `fabs`/`floor`/`ceil`/`trunc`/`round` on AArch64 as
   instructions; branches on phis threaded into their predecessors, a
   branch on its predecessor's condition decided
-- [x] block layout (`51_layout.tach`): chains by fall-through from static
+- [x] block layout (`layout.tach`): chains by fall-through from static
   edge weights (loop depth, back edges, cold panic paths last), and tail
   duplication of small blocks at emission (threaded dispatch in
   interpreters, loop rotation by layout), small epilogues inlined
@@ -251,17 +260,72 @@ Stage B:
 The compiler's source starts using generics, modules and the standard
 library (and reports several errors at once while it is written).
 
-- call graph, bottom-up SCC-ordered inlining with a cost model and an
-  inline → simplify iteration
-- IPSCCP, function attribute inference (pure, readonly, nocapture,
-  noreturn), dead argument elimination, global DCE
-- function specialization on constant arguments
-- escape analysis: heap-to-stack for non-escaping `malloc`
-- shrink-wrapping (from 0.5): callee-saved registers and the frame only
-  on the paths that need them
-- language: `defer`, `#[inline]` / `#[cold]` attributes
+Optimizations, interprocedural (design and status in
+[optimizer.md](optimizer.md)):
+
+- [x] call graph, bottom-up SCC-ordered inlining with a cost model
+  (callee size, constant arguments that decide something, loop depth,
+  cold blocks, single call site, growth budgets, `#[inline]` /
+  `#[inline(never)]` / `#[cold]` hints) and an inline → simplify
+  iteration (three rounds)
+- [x] interprocedural constant propagation: constant arguments (also
+  function addresses) into internal functions, constant results out;
+  indirect calls of a constant address made direct (devirtualization).
+  Dead arguments are no longer computed but stay in the signature (no
+  per-function convention changes)
+- [x] function attribute inference over the call graph's components:
+  readnone, readonly, noreturn, willreturn, nopanic, nocapture
+  (`--print-attrs`); calls that write nothing are no barrier to load
+  forwarding and LICM, unused pure calls are removed
+- [x] global DCE (a function whose address is taken stays)
+- [x] escape analysis: small non-escaping `malloc` / `calloc` become
+  frame slots
+- [x] scalar promotion of memory in loops; value ranges of sums,
+  products and shifts of two ranged values (stencil's bounds checks go,
+  with the constant lengths from its caller)
+- not done: function specialization by cloning (a copy per distinct
+  constant argument; needs new functions in the front end's tables),
+  value numbering of pure calls (with the e-graph, 0.7), promoting
+  `vm.sp` in `bench/interp` (fixed arrays are not bounds-checked, so
+  nothing proves `vm.stack[vm.sp]` apart from it)
+
+Back end:
+
+- [x] shrink-wrapping (from 0.5): the frame and the callee-saved
+  registers only on the paths that need them; jumps out of the frame's
+  region tear it down; panics outside it link a frame of their own; the
+  allocator keeps entry values in caller-saved registers until the first
+  call where it can
+- [x] back end: phi and loop-phi coalescing hints, x86-64 cmov operand
+  hints, comparisons with immediates (cmn on AArch64), jump tables
+  indexed by the value; `--stats` to measure the machine code
+- language (front end; see grammar.md, "Additions of 0.6"):
+  - [x] `defer`, on every way out of a block
+  - [x] `#[inline]`, `#[inline(never)]`, `#[cold]` (read by the optimizer
+    through `fn_attr_inline`/`fn_attr_cold`); attributes before `pub`
+  - [x] `if let`, `while let`
+  - [x] string literals are `[u8]` (breaking)
+  - [x] structural `==`/`!=` on structs, tuples, arrays, enums with fields
+  - [x] a prelude (Option, Some, None, Result, Ok, Err, Vec, print,
+    println); variants of generic enums by their own names
+  - [x] ambiguous `*` imports are an error where used (breaking: 0.5 took
+    the first)
+  - [x] inline modules, generic type aliases
+  - moved to 0.7: const generic lengths; `errno` (C macros that expand to
+    expressions)
 
 ## 0.7: equality saturation
+
+Compilation speed: object files written directly (Mach-O for macOS, ELF
+for Linux, both targets): an instruction encoder and the relocations, symbol
+tables and sections each format needs, so `cc` only links. `--emit-asm`
+stays, and the object files are checked against `cc`'s assembly of the
+same text, section by section. The system assembler took 2.4 s of the
+compiler's 3 s self-build in 0.6.
+
+Language: traits (bounded generics), which a generic hash map and
+operator overloading need; adding bounds does not change what programs
+written against 0.5's unbounded generics mean.
 
 - replace ad-hoc rewriting with an e-graph (acyclic, à la Cranelift's
   ægraph) and a rewrite-rule DSL compiled into matchers
@@ -284,12 +348,31 @@ library (and reports several errors at once while it is written).
 - PGO-aware register allocation and unrolling
 - list scheduling (from 0.5) where profiles say a block is hot
 
-## 1.0: stable
+## 0.10: feature-complete
 
-- language specification frozen; multi-error diagnostics; DWARF line
-  tables
+The last release of the build-out: everything planned above, finished.
+
+- multi-error diagnostics (done in 0.5); DWARF line tables
 - aarch64-linux host
 - within 10% of clang -O2 on `bench/`
+- a written language specification describing 0.10 as it is
+
+## Toward 1.0
+
+1.0 is not a feature milestone: it ships when the language is thought
+through and stable, after as many 0.10.x / 0.11+ iterations as that takes:
+
+- the surface language reworked with experience of real programs:
+  strings, error handling, iteration, conversions, traits and their
+  ergonomics, naming; anything breaking settled before 1.0
+- tools: a language server (editor support), a formatter, build and
+  package workflow, documentation generation
+- stability: long-running fuzzing, real programs in tachyon beyond the
+  compiler, no known miscompiles
+- making the language and its tools work for agents as well as people:
+  ideas collected in [agents.md](agents.md)
+- 1.0 freezes compatibility, not features: from 1.0 on, additions are minor
+  releases and breaking changes wait for 2.0
 
 ## Benchmarks
 
@@ -428,3 +511,44 @@ by 0.5, compiling its own source. All builds print identical output.
 0.5 -O2 code runs about 1.4× faster than the seed's here. The compilers
 themselves are about as fast; the end-to-end build is slower because
 tachyon emits textual assembly (about 1 MB here) that `cc` assembles.
+
+### 0.6
+
+aarch64-macos (Apple silicon, native, idle machine; `bench/run.sh -r 7`;
+"0.5.0" is the previous release at its default level):
+
+| program | 0.5.0 | 0.6 -O0 | 0.6 -O1 | 0.6 -O2 | seed -O | cc -O2 |
+|---|---|---|---|---|---|---|
+| collatz | 292 | 2516 | 293 | 292 | 478 | 293 |
+| fib | 18 | 55 | 21 | 14 | 30 | 14 |
+| interp | 42 | 443 | 79 | 44 | - | 40 |
+| matmul | 28 | 503 | 76 | 27 | 93 | 43 |
+| nbody | 33 | 301 | 33 | 33 | - | 28 |
+| sieve | 61 | 266 | 64 | 64 | 69 | 72 |
+| stencil | 22 | 243 | 22 | 13 | - | 9 |
+| md5 | 73 | 383 | 151 | 74 | 134 | - |
+
+Geometric means: the seed's Cranelift code is 1.88× slower than 0.6 -O2;
+0.6 -O2 is level with clang -O2 over the seven programs with a C version
+(1.006×; stencil, which clang vectorizes, is 1.44×), and 5% faster than
+clang without stencil. fib now matches clang (shrink-wrapping: its base case touches no
+stack); stencil's bounds checks are all proven away (constants from its
+caller, ranges of sums and products). interp is 2% slower than with 0.5.0
+(43 against 44 ms, repeatably): to look at in 0.7. sieve's 61 against 64
+is within the run-to-run noise of this machine for that program.
+
+Compile time (new in the gate from 0.6). The same input for both
+compilers, the 0.6 phase-1 source of the compiler (35,800 lines), to
+assembly, best of 11:
+
+| | -O0 | -O2 |
+|---|---|---|
+| 0.5.0 | 63 ms | 583 ms |
+| 0.6.0 | 38 ms | 466 ms |
+
+The 0.6 compiler building itself (39,200 lines): 42 ms at -O0 and 510 ms
+at -O2 to assembly; 2.6 s to an executable at -O2, of which the system
+assembler takes about 2 s (0.7 writes object files itself). Per phase at
+-O2 (`--time-passes`): the loop passes 27%, register allocation and
+emission 22%, inlining and the simplification after it 16%, the scalar
+pipeline 11%, the interprocedural layer 4.5%, the front end 8%.

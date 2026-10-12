@@ -1,0 +1,479 @@
+// The C calling convention for aggregates (structs, tuples, arrays, enums
+// with fields and slices passed or returned by value), shared by the -O0
+// code generator and the IR back end, so that every function follows C's
+// convention and can be handed to C.
+//
+// AArch64 (AAPCS64, as on macOS): a homogeneous float aggregate (one to
+// four floats of one type) goes in consecutive v registers, or entirely on
+// the stack (and no further v register is used); another aggregate of up
+// to 16 bytes goes in one or two x registers, or entirely on the stack (and
+// no further x register is used); a larger one is copied by the caller and
+// passed by reference. Results: an HFA in v0-v3, up to 16 bytes in x0/x1,
+// larger ones through the pointer in x8.
+//
+// x86-64 (System V): an aggregate of up to 16 bytes is split into
+// eightbytes, each INTEGER (an rdi/rsi/... register) when it holds any
+// non-float, else SSE (an xmm register); it goes in registers only when
+// all of its eightbytes fit, else entirely on the stack (and the registers
+// stay available). A larger one (MEMORY) is copied onto the stack. Results:
+// INTEGER eightbytes in rax then rdx, SSE ones in xmm0 then xmm1; MEMORY
+// ones through a hidden pointer (the first argument), returned in rax.
+//
+// An aggregate passed in registers is a list of pieces: (scalar type,
+// offset). A piece is read and written whole, so the memory holding such an
+// aggregate is a multiple of 8 bytes (frame slots are; see new_slot_for).
+
+// How a value is passed.
+use crate::base::*;
+use crate::types::*;
+use crate::gen::*;
+use crate::target::*;
+use crate::ir::*;
+use crate::opt::*;
+use crate::regalloc::*;
+
+pub enum AbiClass {
+    // A scalar, in a register (or a stack slot).
+    Scalar,
+    // In registers (or on the stack, in the same layout), as pieces.
+    Pieces,
+    // By reference: a pointer to a copy (AArch64, over 16 bytes).
+    Ref,
+    // Copied onto the stack (x86-64 MEMORY, over 16 bytes); results of
+    // both kinds go through a result pointer.
+    Stack,
+}
+
+// The pieces of the last classified aggregate.
+pub static mut ABI_PIECE_TY: [i64; 4] = [0; 4];
+pub static mut ABI_PIECE_OFFSET: [i64; 4] = [0; 4];
+pub static mut ABI_PIECE_COUNT: i64 = 0;
+// Scalar leaves of an aggregate: (offset, type) pairs.
+pub static mut ABI_LEAVES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// How a value of type `ty` is passed; for AbiClass::Pieces, its pieces.
+pub fn abi_classify(ty: i64) -> AbiClass {
+    ABI_PIECE_COUNT = 0;
+    if !is_compound(ty) {
+        return AbiClass::Scalar;
+    }
+    let size = type_size(ty);
+    ABI_LEAVES.count = 0;
+    abi_leaves(ty, 0);
+    if !X86 {
+        let mut elem = 0;
+        let mut count = 0;
+        if is_hfa(size, &elem, &count) {
+            for i in 0..count {
+                abi_add_piece(elem, i * type_size(elem));
+            }
+            return AbiClass::Pieces;
+        }
+        if size > 16 {
+            return AbiClass::Ref;
+        }
+        let mut offset = 0;
+        while offset < size {
+            abi_add_piece(int_piece_type(size - offset), offset);
+            offset += 8;
+        }
+        return AbiClass::Pieces;
+    }
+    if size > 16 || has_unaligned_leaf() {
+        return AbiClass::Stack;
+    }
+    let mut offset = 0;
+    while offset < size {
+        let chunk = min_i64(8, size - offset);
+        let mut integer = false;
+        let mut f32_only = true;
+        let mut any = false;
+        let mut i = 0;
+        while i < ABI_LEAVES.count {
+            let at = ABI_LEAVES.data[i];
+            let leaf = ABI_LEAVES.data[i + 1];
+            if at < offset + 8 && at + type_size(leaf) > offset {
+                any = true;
+                if !is_float(leaf) {
+                    integer = true;
+                }
+                if leaf != TY_F32 {
+                    f32_only = false;
+                }
+            }
+            i += 2;
+        }
+        if !any {
+            // Padding only (NO_CLASS): no register.
+        } else if integer {
+            abi_add_piece(int_piece_type(chunk), offset);
+        } else if f32_only && chunk <= 4 {
+            abi_add_piece(TY_F32, offset);
+        } else {
+            abi_add_piece(TY_F64, offset);
+        }
+        offset += 8;
+    }
+    AbiClass::Pieces
+}
+
+// Whether a leaf sits at an offset that is not a multiple of its
+// alignment (in a packed struct): such aggregates are MEMORY on x86-64.
+fn has_unaligned_leaf() -> bool {
+    let mut i = 0;
+    while i < ABI_LEAVES.count {
+        if ABI_LEAVES.data[i] % type_align(ABI_LEAVES.data[i + 1]) != 0 {
+            return true;
+        }
+        i += 2;
+    }
+    false
+}
+
+fn abi_add_piece(ty: i64, offset: i64) {
+    ABI_PIECE_TY[ABI_PIECE_COUNT] = ty;
+    ABI_PIECE_OFFSET[ABI_PIECE_COUNT] = offset;
+    ABI_PIECE_COUNT += 1;
+}
+
+// The integer type of a piece of `left` bytes (read whole: 3 bytes are
+// read as 4, 5 to 8 as 8).
+fn int_piece_type(left: i64) -> i64 {
+    if left >= 5 { return TY_U64; }
+    if left >= 3 { return TY_U32; }
+    if left == 2 { return TY_U16; }
+    TY_U8
+}
+
+// Appends the scalar leaves of `ty` at `offset` to ABI_LEAVES; the fields
+// of every variant of an enum overlap (a union).
+pub fn abi_leaves(ty: i64, offset: i64) {
+    let kind = TYPES[ty].kind;
+    if kind == TyKind::Struct {
+        let s = TYPES[ty].a;
+        for i in 0..STRUCTS[s].field_count {
+            abi_leaves((*struct_field(s, i)).ty, offset + field_offset(s, i));
+        }
+    } else if kind == TyKind::Tuple {
+        for i in 0..TYPES[ty].count {
+            abi_leaves(type_elem(ty, i), offset + tuple_offset(ty, i));
+        }
+    } else if kind == TyKind::Array {
+        let elem = TYPES[ty].a;
+        for i in 0..TYPES[ty].b {
+            abi_leaves(elem, offset + i * type_size(elem));
+        }
+    } else if kind == TyKind::Slice {
+        ABI_LEAVES.push(offset);
+        ABI_LEAVES.push(TY_U64);
+        ABI_LEAVES.push(offset + 8);
+        ABI_LEAVES.push(TY_U64);
+    } else if kind == TyKind::Enum && is_compound(ty) {
+        let e = TYPES[ty].a;
+        ABI_LEAVES.push(offset);
+        ABI_LEAVES.push(ENUMS[e].tag);
+        for i in 0..ENUMS[e].variant_count {
+            let v = enum_variant(e, i);
+            for k in 0..VARIANTS[v].field_count {
+                abi_leaves(variant_field(v, k), offset + variant_field_offset(v, k));
+            }
+        }
+    } else if !is_void(ty) {
+        ABI_LEAVES.push(offset);
+        ABI_LEAVES.push(scalar_type(ty));
+    }
+}
+
+// Whether the leaves are one to four floats of one type, one after the
+// other, filling the aggregate's `total` bytes (an AArch64 homogeneous
+// float aggregate has no padding); leaves that coincide (the members of a
+// union) count once.
+fn is_hfa(total: i64, elem: *i64, count: *i64) -> bool {
+    let n = ABI_LEAVES.count / 2;
+    if n < 1 {
+        return false;
+    }
+    let first = ABI_LEAVES.data[1];
+    if !is_float(first) {
+        return false;
+    }
+    let size = type_size(first);
+    // Every leaf is a float of that type at a multiple of its size, and the
+    // offsets used are 0, size, 2 * size... without a gap.
+    let mut highest = -1;
+    for i in 0..n {
+        let offset = ABI_LEAVES.data[2 * i];
+        if ABI_LEAVES.data[2 * i + 1] != first || offset % size != 0 {
+            return false;
+        }
+        highest = max_i64(highest, offset / size);
+    }
+    if highest > 3 || (highest + 1) * size != total {
+        return false;
+    }
+    for k in 0..highest + 1 {
+        let mut seen = false;
+        for i in 0..n {
+            if ABI_LEAVES.data[2 * i] == k * size {
+                seen = true;
+            }
+        }
+        if !seen {
+            return false;
+        }
+    }
+    *elem = first;
+    *count = highest + 1;
+    true
+}
+
+// The locations of the pieces of the aggregate of type `ty` just
+// classified (see arg_location for locations and `state`), in
+// `locations`. An aggregate aligned to 16 starts at a multiple of 16 on
+// the stack (Apple's AArch64 convention does not round it to an even x
+// register, unlike AAPCS64's).
+pub fn abi_piece_locations(ty: i64, state: *i64, locations: *i64) {
+    let size = type_size(ty);
+    let wide = type_align(ty) >= 16;
+    let n = ABI_PIECE_COUNT;
+    let mut ints = 0;
+    let mut floats = 0;
+    for i in 0..n {
+        if is_float(ABI_PIECE_TY[i]) {
+            floats += 1;
+        } else {
+            ints += 1;
+        }
+    }
+    let int_limit = if X86 { 6 } else { 8 };
+    if state[0] + ints <= int_limit && state[1] + floats <= 8 {
+        for i in 0..n {
+            if is_float(ABI_PIECE_TY[i]) {
+                locations[i] = 8 + state[1];
+                state[1] += 1;
+            } else {
+                locations[i] = state[0];
+                state[0] += 1;
+            }
+        }
+        return;
+    }
+    // On the stack, laid out as in memory.
+    if !X86 {
+        if floats > 0 {
+            state[1] = 8;
+        } else {
+            state[0] = 8;
+        }
+    }
+    // Apple's AArch64 convention passes a homogeneous float aggregate on
+    // the stack as its elements: at the element's alignment, taking its
+    // exact size (a union of three f32 takes 12 bytes at a multiple of 4),
+    // where other aggregates take 8-byte slots.
+    let hfa = !X86 && ints == 0 && !wide;
+    let base = align_to(state[2], if wide { type_align(ty) } else if hfa { type_size(ABI_PIECE_TY[0]) } else { 8 });
+    for i in 0..n {
+        locations[i] = 16 + base + ABI_PIECE_OFFSET[i];
+    }
+    state[2] = base + if hfa { size } else { align_to(size, 8) };
+}
+
+// The stack offset (from the outgoing area) of an aggregate copied onto the
+// stack (AbiClass::Stack): at a multiple of its alignment when that is 16
+// or more (as clang and GCC place them).
+pub fn abi_stack_location(ty: i64, state: *i64) -> i64 {
+    let base = align_to(state[2], if type_align(ty) >= 16 { type_align(ty) } else { 8 });
+    state[2] = base + align_to(type_size(ty), 8);
+    16 + base
+}
+
+// The `...` arguments of a C function: aggregates are classified as named
+// ones; on x86-64 they also go where named ones would, on Apple's AArch64
+// every variadic argument goes on the stack (an aggregate in pieces as its
+// bytes, homogeneous float aggregates of any size included; a larger one
+// by reference, in an 8-byte slot). Classifies ty.
+pub fn variadic_kind(ty: i64) -> AbiClass {
+    abi_classify(ty)
+}
+
+// The locations of the pieces of a variadic aggregate passed by value (see
+// variadic_by_reference), classified just before.
+pub fn abi_variadic_piece_locations(ty: i64, state: *i64, locations: *i64) {
+    if X86 {
+        abi_piece_locations(ty, state, locations);
+        return;
+    }
+    let base = align_to(state[2], if type_align(ty) >= 16 { 16 } else { 8 });
+    for i in 0..ABI_PIECE_COUNT {
+        locations[i] = 16 + base + ABI_PIECE_OFFSET[i];
+    }
+    state[2] = base + align_to(type_size(ty), 8);
+}
+
+// Whether a function returning `ret` gets a result pointer (does not
+// change the pieces of the last classified aggregate).
+pub fn returns_through_pointer(ret: i64) -> bool {
+    if !is_compound(ret) {
+        return false;
+    }
+    ABI_LEAVES.count = 0;
+    abi_leaves(ret, 0);
+    if X86 {
+        return type_size(ret) > 16 || has_unaligned_leaf();
+    }
+    let mut elem = 0;
+    let mut count = 0;
+    type_size(ret) > 16 && !is_hfa(type_size(ret), &elem, &count)
+}
+
+// The machine register of return piece i (x0/x1 or rax/rdx, v0-v3 or
+// xmm0/xmm1).
+pub fn return_piece_reg(i: i64) -> i64 {
+    let mut float = false;
+    let index = return_piece_index(i, &float);
+    if float {
+        return 32 + index;
+    }
+    if X86 && index == 1 { 2 } else { index }
+}
+
+// The register returning piece i of an aggregate result: x0, x1 / rax, rdx
+// for integers (0, 1: the argument-register numbering of the machine
+// layer is not used here), v0-v3 / xmm0, xmm1 for floats; as (is_float,
+// index) in `float`.
+fn return_piece_index(i: i64, float: *bool) -> i64 {
+    let mut ints = 0;
+    let mut floats = 0;
+    for k in 0..i {
+        if is_float(ABI_PIECE_TY[k]) {
+            floats += 1;
+        } else {
+            ints += 1;
+        }
+    }
+    *float = is_float(ABI_PIECE_TY[i]);
+    if *float { floats } else { ints }
+}
+
+// ---- The tachyon convention (0.5) ----
+//
+// Plain `fn`s compiled at -O1 and -O2 call each other with a convention of
+// their own; C's is kept by everything C can reach or call: functions
+// imported from C or defined `extern "C"`, `main`, variadic functions,
+// calls through `extern "C" fn` pointers, the run-time helpers, and every
+// function at -O0 (the oracle). The two never meet: a plain `fn` value only
+// ever holds a plain function of the same program (the types `fn` and
+// `extern "C" fn` do not convert into each other), and a program is
+// compiled at one level. `main`, called by C, is the one plain function
+// whose value can be taken while it follows C's convention; for a `main`
+// taking only scalars (in registers) and returning a scalar, as C's `main`
+// does, the two conventions agree.
+//
+// The convention: every argument is a list of scalars, passed one by one,
+// each in the next free register of its class (AArch64: x0-x15 and d0-d7,
+// d16-d23; x86-64: rdi, rsi, rdx, rcx, r8, r9, rax and xmm0-xmm13), or else
+// in the next 8-byte slot of the stack area. An aggregate (struct, tuple,
+// array, enum with fields, slice) of at most four scalar leaves that do not
+// overlap is its leaves; another one of at most 32 bytes is its 8-byte
+// chunks (read as integers); a larger one is a pointer to the caller's
+// copy. Results: up to four pieces in x0-x3 / rax, rdx, rcx, rsi and d0-d3
+// / xmm0-xmm3; a larger aggregate through a result pointer passed as the
+// first argument (and not returned). The scalars of the first registers go
+// where C's convention puts them, so a function taking scalars that fit in
+// C's registers and returning a scalar follows both.
+
+// Whether function f follows C's convention.
+pub fn fn_uses_c(f: i64) -> bool {
+    OPT_LEVEL == 0 || FNS[f].is_extern || FNS[f].export || FNS[f].variadic || FNS[f].name == MAIN_SYM
+}
+
+// Whether calls through a pointer of fn type t follow C's convention.
+pub fn fn_type_uses_c(t: i64) -> bool {
+    OPT_LEVEL == 0 || TYPES[t].b != 0
+}
+
+// How a value of type `ty` is passed under C's convention (c) or
+// tachyon's; for AbiClass::Pieces, its pieces.
+pub fn conv_classify(c: bool, ty: i64) -> AbiClass {
+    if c { abi_classify(ty) } else { tabi_classify(ty) }
+}
+
+// Whether a function returning `ret` gets a result pointer (does not
+// change the pieces of the last classified aggregate).
+pub fn conv_returns_through_pointer(c: bool, ret: i64) -> bool {
+    if c {
+        return returns_through_pointer(ret);
+    }
+    if !is_compound(ret) {
+        return false;
+    }
+    ABI_LEAVES.count = 0;
+    abi_leaves(ret, 0);
+    !leaves_as_pieces() && type_size(ret) > 32
+}
+
+// The tachyon convention's classification (see above).
+pub fn tabi_classify(ty: i64) -> AbiClass {
+    ABI_PIECE_COUNT = 0;
+    if !is_compound(ty) {
+        return AbiClass::Scalar;
+    }
+    ABI_LEAVES.count = 0;
+    abi_leaves(ty, 0);
+    if leaves_as_pieces() {
+        let mut i = 0;
+        while i < ABI_LEAVES.count {
+            abi_add_piece(ir_type(ABI_LEAVES.data[i + 1]), ABI_LEAVES.data[i]);
+            i += 2;
+        }
+        return AbiClass::Pieces;
+    }
+    let size = type_size(ty);
+    if size > 32 {
+        return AbiClass::Ref;
+    }
+    let mut offset = 0;
+    while offset < size {
+        abi_add_piece(int_piece_type(size - offset), offset);
+        offset += 8;
+    }
+    AbiClass::Pieces
+}
+
+// Whether the leaves just collected are at most four that do not overlap.
+fn leaves_as_pieces() -> bool {
+    let n = ABI_LEAVES.count / 2;
+    if n > 4 {
+        return false;
+    }
+    for i in 0..n {
+        let a = ABI_LEAVES.data[2 * i];
+        let a_end = a + type_size(ABI_LEAVES.data[2 * i + 1]);
+        for j in i + 1..n {
+            let b = ABI_LEAVES.data[2 * j];
+            let b_end = b + type_size(ABI_LEAVES.data[2 * j + 1]);
+            if a < b_end && b < a_end {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+// The machine register of return piece i of the last classified aggregate
+// under either convention.
+pub fn conv_return_piece_reg(c: bool, i: i64) -> i64 {
+    if c {
+        return return_piece_reg(i);
+    }
+    let mut float = false;
+    let index = return_piece_index(i, &float);
+    if float {
+        return 32 + index;
+    }
+    if !X86 {
+        return index;
+    }
+    // rax, rdx, rcx, rsi.
+    if index == 0 { 0 } else if index == 1 { 2 } else if index == 2 { 1 } else { 6 }
+}

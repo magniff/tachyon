@@ -6,17 +6,21 @@
 # usage: tests/compare.sh [-j JOBS] [-n FUZZ] [-a ABI] [-x REGEX] [-q] OLD NEW
 #
 #   -j JOBS   comparisons run at once (default: the number of CPUs)
-#   -n FUZZ   random programs from tests/fuzz/gen.awk (default 200; half of
-#             them in the seed-compatible mode)
-#   -a ABI    random C interop programs from tests/abi/gen.awk (default 100)
+#   -n FUZZ   random programs from tests/fuzz/gen.awk (default 200; in
+#             turn in each of its modes)
+#   -a ABI    random C interop programs from tests/abi/gen.awk (default
+#             100; half of them through import)
 #   -x REGEX  expected differences: comparisons whose names match REGEX
 #             (grep -E) are reported apart and do not fail
 #   -q        print only the summary
 #
-# The corpus: tests/run/*.tach, examples/*.tach, bench/*.tach, the random
-# programs, and two multi-file programs: the compiler's source in this tree
-# and at the last release tag (its 0.2-style C declarations, `extern fn`,
-# turned into extern "C" blocks, which both compilers accept). Each is compiled for every target at -O0,
+# The corpus: tests/run/*.tach and the multi-module tests/run/*/main.tach,
+# examples/*.tach, bench/*.tach, the random programs (every mode of
+# tests/fuzz/gen.awk), the C interop programs (tests/abi/gen.awk; half of
+# them through import, the others also through --emit-header), and the
+# compiler's source in this tree and at the last release tag (its 0.2-style
+# C declarations, `extern fn`, turned into extern "C" blocks, which both
+# compilers accept). Each is compiled for every target at -O0,
 # -O1 and -O2 (the assembly, the diagnostics and the exit status are
 # compared), its IR is emitted at -O1 and -O2, and its tokens are dumped.
 # Differing outputs are kept in target/compare/diff.
@@ -38,14 +42,18 @@ if [ "${1:-}" = "--job" ]; then
         while [ $n -gt 0 ]; do
             arg=$1
             shift
-            [ "$arg" = @OUT ] && arg=$rout.s
+            # (both compilers write to out.s, in a directory of their own:
+            # --emit-header names its include guard after the file)
+            [ "$arg" = @OUT ] && arg=$rout.d/out.s
             set -- "$@" "$arg"
             n=$((n - 1))
         done
-        rm -f "$rout.s"
+        rm -rf "$rout.d"
+        mkdir -p "$rout.d"
         "$rc" "$@" >"$rout.stdout" 2>"$rout.stderr"
         echo "exit $?" >>"$rout.stdout"
-        [ -f "$rout.s" ] || : >"$rout.s"
+        if [ -f "$rout.d/out.s" ]; then mv "$rout.d/out.s" "$rout.s"; else : >"$rout.s"; fi
+        rm -rf "$rout.d"
     }
     a="$dir/w/$name"
     run "$old" "$a.old" "$@"
@@ -73,7 +81,7 @@ while [ $# -gt 0 ]; do
         -a) ABI=$2; shift 2 ;;
         -x) EXPECTED=$2; shift 2 ;;
         -q) QUIET=1; shift ;;
-        -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         -*) echo "compare.sh: unknown option $1" >&2; exit 2 ;;
         *) break ;;
     esac
@@ -93,21 +101,43 @@ mkdir -p "$DIR/w" "$DIR/corpus/fuzz" "$DIR/corpus/abi" "$DIR/corpus/src-head" "$
 : >"$DIR/diffs"
 
 # The corpus.
+# Random programs in every mode of the generator, in turn: plain, the
+# seed-compatible one (positive divisors), loops, generics, register
+# pressure, calls.
 i=1
 while [ $i -le "$FUZZ" ]; do
-    nz=$((i % 2))
-    awk -v seed="$i" -v nonzero="$nz" -f "$ROOT/tests/fuzz/gen.awk" >"$DIR/corpus/fuzz/f$i.tach"
+    set -- 0 0 0 0 0 0
+    case $((i % 6)) in
+        1) set -- 1 0 0 0 0 0 ;;
+        2) set -- 0 1 0 0 0 0 ;;
+        3) set -- 0 0 1 0 0 0 ;;
+        4) set -- 0 0 0 1 0 0 ;;
+        5) set -- 0 0 0 0 1 0 ;;
+    esac
+    awk -v seed="$i" -v nonzero="$1" -v loops="$2" -v generics="$3" -v pressure="$4" \
+        -v calls="$5" -f "$ROOT/tests/fuzz/gen.awk" >"$DIR/corpus/fuzz/f$i.tach"
     i=$((i + 1))
 done
+# C interop programs: every other one declares its C half through an
+# imported header (import mode); the others are also run through
+# --emit-header.
 i=1
 while [ $i -le "$ABI" ]; do
+    imp=$((i % 2))
     awk -v seed="$i" -v cfile="$DIR/corpus/abi/a$i.c" -v tfile="$DIR/corpus/abi/a$i.tach" \
-        -f "$ROOT/tests/abi/gen.awk"
+        -v import="$imp" -v hfile="$DIR/corpus/abi/a$i.h" -f "$ROOT/tests/abi/gen.awk"
     rm -f "$DIR/corpus/abi/a$i.c"
     i=$((i + 1))
 done
-cp "$ROOT"/compiler/src/*.tach "$DIR/corpus/src-head/"
-release=$(cd "$ROOT" && git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null)
+# The compiler's source: a module tree with a root file (0.6), or (before)
+# all the files of the directory.
+cp -R "$ROOT"/compiler/src/. "$DIR/corpus/src-head/"
+# The last release: the last tag of bootstrap/releases.toml that exists (in
+# its order: tags are never sorted as text, v0.10.0 comes after v0.9.0).
+release=""
+for tag in $(sh "$ROOT/bootstrap/release-tags.sh"); do
+    (cd "$ROOT" && git rev-parse -q --verify "refs/tags/$tag" >/dev/null) && release=$tag
+done
 if [ -n "$release" ]; then
     (cd "$ROOT" && git archive "$release" compiler/src) | tar -x -C "$DIR/corpus/src-release" --strip-components=2
     for f in "$DIR"/corpus/src-release/*.tach; do
@@ -145,9 +175,31 @@ for f in "$ROOT"/tests/run/*.tach "$ROOT"/examples/*.tach "$ROOT"/bench/*.tach \
     base=$(basename "$(dirname "$f")")-$(basename "$f" .tach)
     program "$base" "$f"
     add "$base.tokens" --tokens "$f"
+    case $f in
+        "$DIR"/corpus/abi/*)
+            grep -q '^import ' "$f" || for t in $TARGETS; do
+                add "$base.$t.header" --target $t --emit-header "$f" -o @OUT
+            done
+            ;;
+    esac
 done
-program src-head "$DIR"/corpus/src-head/*.tach
-[ -n "$release" ] && program "src-$release" "$DIR"/corpus/src-release/*.tach
+# Programs of several modules (a directory with main.tach).
+for f in "$ROOT"/tests/run/*/main.tach; do
+    [ -f "$f" ] || continue
+    program "run-$(basename "$(dirname "$f")")" "$f"
+done
+# A source tree: its root file when it has one, else all its files.
+tree() { # dir
+    if [ -f "$1/main.tach" ] && grep -q '^mod ' "$1/main.tach"; then
+        echo "$1/main.tach"
+    else
+        echo "$1"/*.tach
+    fi
+}
+# shellcheck disable=SC2046
+program src-head $(tree "$DIR/corpus/src-head")
+# shellcheck disable=SC2046
+[ -n "$release" ] && program "src-$release" $(tree "$DIR/corpus/src-release")
 
 total=$(wc -l <"$jobs" | tr -d ' ')
 [ $QUIET -eq 1 ] || echo "compare: $total compilations each, $JOBS at a time"

@@ -36,8 +36,45 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.3.0 | `v0.3.0` | 0.2.0 | aarch64-macos, x86_64-linux, x86_64-macos | aggregates and memory: enums with fields and `match`, methods, slices, C interop (`extern "C"`, `#[repr(C)]`, unions, C's convention for aggregates); SROA, memory forwarding across blocks, dead stores, switches and jump tables; ABI conformance fuzzing |
 | 0.4.0 | `v0.4.0` | 0.3.0 | aarch64-macos, x86_64-linux, x86_64-macos | loops and C headers: the compiler written in the 0.3 language; `import "x.h"` (a C preprocessor and declaration reader) and `--emit-header`; `use`, checked `as` to enums, enum ordering, `size_of`/`align_of`, `for x in s`; loop canonicalization, induction variables, rotation, unrolling, unswitching, strength reduction, value ranges and bounds-check elimination, aggressive DCE, tail recursion elimination |
 | 0.5.0 | `v0.5.0` | 0.4.0 | aarch64-macos, x86_64-linux, x86_64-macos | generics, modules and the back end: generics by monomorphization, modules (`mod`, `pub`, `use`), several errors per compilation, a small `std`; register allocation by linear scan with interval splitting, a calling convention of tachyon's own, frames aligned above 16, instruction selection by rules, block layout, selects, leaf frames, sibling calls |
+| 0.6.0 | `v0.6.0` | 0.5.0 | aarch64-macos, x86_64-linux, x86_64-macos | interprocedural: the compiler written as a module tree; string literals as slices, `if let`, `defer`, structural `==`, a prelude, inline modules, generic type aliases; a cost-model inliner, attribute inference, interprocedural constants, devirtualization, scalar promotion, heap to stack, global DCE; shrink-wrapping; `--time-passes`, `--stats` |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.6
+
+The compiler's own source is a module tree in the 0.5 language (generics
+for its arrays, `Option` for lookups, enum variants by name), checked to
+emit byte-identical output to 0.5.0. Releases from 0.6 on name their root
+file in `bootstrap/releases.toml`.
+
+The language (see [grammar.md](grammar.md), "Additions of 0.6"); two
+changes are breaking:
+
+- **String literals are `[u8]` slices** (they were `(*u8, u64)` tuples):
+  `.ptr` and `.len`, and `println("hello")` works. `c"..."` is still a
+  `*u8`.
+- **Two `*` imports bringing different things under one name** make it an
+  error where the name is used (0.5 took the first).
+- `if let` and `while let`; `defer` (run when the block is left, last
+  first, on every way out but a panic); `==` and `!=` on structs, tuples,
+  arrays and enums with fields, field by field; a prelude (`Option`,
+  `Some`, `None`, `Result`, `Ok`, `Err`, `Vec`, `print`, `println`
+  without `use`, shadowed by anything the program declares or imports);
+  `#[inline]`, `#[inline(never)]`, `#[cold]`; inline modules
+  `mod m { ... }`; generic type aliases; attributes before `pub`.
+
+The optimizer (see [optimizer.md](optimizer.md)): a whole-program layer
+at `-O2`: interprocedural constants (arguments into internal functions,
+results out) and devirtualization, inlining bottom-up over the call graph
+with a cost model and budgets, function attribute inference (readnone,
+readonly, noreturn, willreturn, nopanic, nocapture; `--print-attrs`) used
+by GVN, LICM and dead code elimination, scalar promotion of memory in
+loops, small non-escaping heap allocations moved to the stack, global
+dead code elimination, value ranges of sums and products. The back end:
+shrink-wrapping (the frame only on the paths that need it), coalescing
+hints for phis, comparisons with immediates. `--time-passes` and
+`--stats` measure the compiler and its output; compile times are part of
+every release from now on (see [roadmap.md](roadmap.md)).
 
 ### What's new in 0.5
 
@@ -261,13 +298,14 @@ Say the last release is 0.2.0 and you have implemented a feature on main.
 2. Add the tests for the new behaviour to `tests/` (`tests/run/*.tach` with
    `// EXPECT:` ... directives; see `tests/run.sh`), and examples if useful.
    Update `docs/grammar.md` for language changes.
-3. Bump the version string in `compiler/src/90_main.tach` (`version()`).
+3. Bump the version string in `compiler/src/main.tach` (`version()`).
 4. Add the release to `bootstrap/releases.toml`:
    ```toml
    [[release]]
    version = "0.3.0"
    tag = "v0.3.0"
    compiler = "compiler/src"
+   root = "main.tach"          # from 0.6: the root of the compiler's module tree
    built_by = "0.2.0"
    cli = "tachyonc-0.1"
    tests = "tests/run.sh"
@@ -290,17 +328,22 @@ Say the last release is 0.2.0 and you have implemented a feature on main.
 If a release changes how its binary is invoked or what it emits (another
 command line), give it a new `cli` value and teach `compile_with` in
 `bootstrap/bootstrap.sh` about it; the script keeps every interface that a
-release in the chain uses.
+release in the chain uses. How a release's *source* is laid out is the
+`root` key's business: from 0.6 the compiler is a module tree whose root
+file (`compiler/src/main.tach`) is the only file on the command line; a
+release without `root` (0.1.0 to 0.5.0) is compiled from all the `.tach`
+files of its `compiler` directory, as one module. The builder's `cli` says
+how to invoke the builder; the release's `root` says what to give it.
 
 ## Adding a host
 
 A new host (say `aarch64-linux`) needs:
 
 1. A backend for it in the compiler: an instruction set file next to
-   `compiler/src/42_arm64.tach` and `43_x86_64.tach` (or a new object
+   `compiler/src/arm64.tach` and `x86_64.tach` (or a new object
    format and ABI in an existing one), a target name in
-   `compiler/src/41_target.tach`, and its detection in `host_target()` in
-   `90_main.tach`. The release that adds it is built on an existing host,
+   `compiler/src/target.tach`, and its detection in `host_target()` in
+   `main.tach`. The release that adds it is built on an existing host,
    and is checked on the new one by cross-compiling: its assembly for the
    new target must be the same wherever it is produced, and the suite must
    pass there (`tests/run.sh -t <target>`).
@@ -319,7 +362,7 @@ With a compiler binary at hand (`target/tachyonc`, as `bootstrap.sh` leaves
 it), on aarch64-macos:
 
 ```
-$ target/tachyonc compiler/src/*.tach -o tachyonc.s     # the compiler, by itself
+$ target/tachyonc compiler/src/main.tach -o tachyonc.s   # the compiler (its root file), by itself
 $ cc -arch arm64 -o tachyonc tachyonc.s -lm
 $ tests/run.sh -c ./tachyonc                            # the test suite, for the host
 $ tests/run.sh -c ./tachyonc prog_                      # only cases named *prog_*
@@ -333,7 +376,7 @@ $ bench/run.sh -c ./tachyonc                            # benchmarks
 and on x86_64-linux:
 
 ```
-$ target/tachyonc compiler/src/*.tach -o tachyonc.s
+$ target/tachyonc compiler/src/main.tach -o tachyonc.s
 $ cc -o tachyonc tachyonc.s -lm
 $ tests/run.sh -c ./tachyonc
 ```

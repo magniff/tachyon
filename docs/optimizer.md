@@ -5,19 +5,19 @@ invariants, the passes and the pipeline at each level, the back end, and
 how all of it is tested. This is the living design document of the middle
 and back end; later releases extend it (see [roadmap.md](roadmap.md)).
 
-The code: `compiler/src/44_ir.tach` (IR), `45_lower.tach` (AST to SSA),
-`46_opt.tach` (CFG cleanups, dominators, dead code, the pipeline),
-`47_fold.tach` (folding, SCCP, instruction combining), `48_gvn.tach`
+The code: `compiler/src/ir.tach` (IR), `lower.tach` (AST to SSA),
+`opt.tach` (CFG cleanups, dominators, dead code, the pipeline),
+`fold.tach` (folding, SCCP, instruction combining), `gvn.tach`
 (value numbering, alias analysis, memory forwarding, dead stores),
-`48_sroa.tach` (scalar replacement, constant tables), `49_licm.tach`,
-`49_inline.tach`, `50_regalloc.tach` (linear scan), `51_emit.tach`
-(emission), `52_mc_arm64.tach` and `53_mc_x86_64.tach` (instructions).
+`sroa.tach` (scalar replacement, constant tables), `licm.tach`,
+`inline.tach`, `regalloc.tach` (linear scan), `emit.tach`
+(emission), `mc_arm64.tach` and `mc_x86_64.tach` (instructions).
 
 ## Optimization levels
 
 | flag | pipeline |
 |---|---|
-| `-O0` | the 0.1 code generator (`40_gen.tach`), unchanged: stack-machine code straight from the AST |
+| `-O0` | the 0.1 code generator (`gen.tach`), unchanged: stack-machine code straight from the AST |
 | `-O1` | lowering to SSA; per function, twice: SCCP, instruction combining, (the first time) scalar replacement of aggregates and constant tables, CFG simplification, GVN with memory forwarding and dead stores, dead code elimination, CFG simplification; linear-scan register allocation |
 | `-O2` (default) | `-O1`, then per function in call-graph order (callees first): tail recursion elimination, inlining, the loop optimizer (0.4: rotation, induction variables and unrolling, value ranges, strength reduction and unswitching, aggressive DCE) and loop-invariant code motion, each followed by the `-O1` pipeline again; functions left without callers are not emitted |
 
@@ -68,7 +68,7 @@ typed scalar values in SSA form; memory is explicit.
   split by the lowering into its scalar pieces (one `load` each, so the
   optimizer sees through the round trip), and a parameter's pieces are
   separate `param`s (`imm2` = piece + 1) stored into a slot; larger
-  aggregates go by reference or as a copy on the stack (`41_abi.tach`).
+  aggregates go by reference or as a copy on the stack (`abi.tach`).
 - **Replacement** is lazy: `ir_replace(v, w)` records that `v` now stands
   for `w` (and unlinks `v`); `ir_val` follows such records, and passes
   resolve operands before they look at them.
@@ -83,7 +83,7 @@ Invariants (checked by `--verify-ir` after every pass):
   phi operand: dominates the end of the corresponding predecessor);
 - operands are resolved (no replaced instruction is referenced).
 
-**Construction** (`45_lower.tach`) follows Braun et al., *Simple and
+**Construction** (`lower.tach`) follows Braun et al., *Simple and
 Efficient Construction of Static Single Assignment Form* (CC 2013),
 directly from the checked AST. Scalar locals whose address is never taken
 are SSA variables; the others get frame slots. The values of `if`, `&&`,
@@ -98,24 +98,24 @@ pointer) and every arithmetic rule.
 
 | pass | algorithm | file |
 |---|---|---|
-| cleanup | unreachable-block removal; trivial-phi removal (a phi whose operands are one value is that value), to a fixpoint | `46_opt` |
-| SCCP | Wegman & Zadeck, *Constant Propagation with Conditional Branches* (TOPLAS 1991): a lattice per value, executable edges, two work lists; constant values and decided branches are rewritten | `47_fold` |
-| folding | what the machine computes: wrapping arithmetic at every width, `x / 0 == 0`, `x % 0 == x`, `MIN / -1 == MIN`, shift amounts modulo 32 (types up to 32 bits) or 64, IEEE comparisons, the saturating float-to-integer conversions of `-O0` (including its quirks: up to 32-bit signed targets saturate at 32 bits and wrap) | `47_fold` |
-| instruction combining | constants on the right; identities (`x + 0`, `x * 1`, `x & 0`, `x - x`, `x ^ x`, `x & x`, double negation, `b != false`); `x * 2^k` to a shift; unsigned division and remainder by `2^k` to a shift and a mask; signed division by `2^k` with the rounding fix-up (`(x + ((x >> 63) >>> (64 - k))) >> k`) and remainder from it; reassociation of constant address offsets and their folding into loads and stores; comparisons with the constant on the left mirrored; a branch on `!x` swapped | `47_fold` |
-| CFG simplification | branches on constants and branches with one target become jumps; a block merges into its only predecessor when that predecessor jumps to it; jumps through empty blocks are threaded (when the target has no phis) | `46_opt` |
-| dominators | Cooper, Harvey & Kennedy, *A Simple, Fast Dominance Algorithm*, over a reverse post-order | `46_opt` |
-| GVN | a walk of the dominator tree with a scoped hash table (undo log, so scopes are popped in constant time per entry) over the pure instructions; commutative operands in a canonical order | `48_gvn` |
-| alias analysis | an address is a base plus a constant offset; it points into a memory object (a frame slot, a static, constant data) through additions of constant or variable offsets, or into unknown memory; distinct objects never overlap; constant data is never written; a slot whose address only serves loads, stores, copies (memcpy calls included) and address arithmetic is private: no pointer from elsewhere and no call reaches it; within one object, byte ranges are compared when both offsets are known. No type-based rule: tachyon allows casts between any pointers | `48_gvn` |
-| dead code elimination | mark from instructions with side effects and the terminators, sweep the rest | `46_opt` |
-| LICM | natural loops from back edges (`h` dominates `t`); a preheader for each loop (the entering edge is split when needed); pure instructions whose operands are defined outside the loop move to the preheader, innermost loops first, and so do loads from frame slots and statics that nothing in the loop may write. Nothing moved can trap (division never traps in tachyon) | `49_licm` |
-| SROA | a frame slot of a struct, tuple, enum, slice, small array or scalar whose address serves only loads, stores and copies at constant offsets becomes one SSA variable per scalar leaf of its type, by Braun et al.'s construction over the existing CFG (blocks in reverse post-order, sealed once their predecessors are filled); copies move leaf by leaf, to or from memory when the other side stays there. The values of `if`, `match` and `loop` of up to 128 bytes are built in one slot each exit copies into, so they are replaced too | `48_sroa` |
-| constant tables | a private slot written only by stores of constants at known offsets, in one block that comes before every read, becomes read-only data; loads from read-only data (and string literals) at known offsets become constants | `48_sroa`, `48_gvn` |
-| memory forwarding | along the dominator tree: what a block knows about memory (location to value) goes to a block it dominates when that one's only predecessor is it, or after the writes of every block on the paths between them are applied; loads of known locations are their values; storing what a location holds is dropped; a load from the destination of a copy that still holds reads its source (and the copy may then die) | `48_gvn` |
-| dead stores | within a block, a store (or a copy) overwritten before anything may read it; a store or copy into a private slot that nothing reads | `48_gvn` |
-| switches | a `match` on an integer, a fieldless enum or an enum's tag whose arms are literals, ranges, alternatives of them, or variants whose fields only bind (and no guards), is a `switch`; SCCP decides switches on constants and prunes them to their reachable successor | `45_lower`, `47_fold`, `46_opt` |
-| inlining | strongly connected components of the call graph (Tarjan), callees first, so a callee is already optimized and recursion is never inlined; a callee is inlined when it has at most 30 instructions, or when this is its only call site and it has at most 400 (and is neither `main` nor address-taken); callers grow to at most 3,000 instructions. The callee's blocks are copied, parameters become the arguments, frame slots are copied, returns jump to a continuation block with a phi for the result | `49_inline` |
+| cleanup | unreachable-block removal; trivial-phi removal (a phi whose operands are one value is that value), to a fixpoint | `opt.tach` |
+| SCCP | Wegman & Zadeck, *Constant Propagation with Conditional Branches* (TOPLAS 1991): a lattice per value, executable edges, two work lists; constant values and decided branches are rewritten | `fold.tach` |
+| folding | what the machine computes: wrapping arithmetic at every width, `x / 0 == 0`, `x % 0 == x`, `MIN / -1 == MIN`, shift amounts modulo 32 (types up to 32 bits) or 64, IEEE comparisons, the saturating float-to-integer conversions of `-O0` (including its quirks: up to 32-bit signed targets saturate at 32 bits and wrap) | `fold.tach` |
+| instruction combining | constants on the right; identities (`x + 0`, `x * 1`, `x & 0`, `x - x`, `x ^ x`, `x & x`, double negation, `b != false`); `x * 2^k` to a shift; unsigned division and remainder by `2^k` to a shift and a mask; signed division by `2^k` with the rounding fix-up (`(x + ((x >> 63) >>> (64 - k))) >> k`) and remainder from it; reassociation of constant address offsets and their folding into loads and stores; comparisons with the constant on the left mirrored; a branch on `!x` swapped | `fold.tach` |
+| CFG simplification | branches on constants and branches with one target become jumps; a block merges into its only predecessor when that predecessor jumps to it; jumps through empty blocks are threaded (when the target has no phis) | `opt.tach` |
+| dominators | Cooper, Harvey & Kennedy, *A Simple, Fast Dominance Algorithm*, over a reverse post-order | `opt.tach` |
+| GVN | a walk of the dominator tree with a scoped hash table (undo log, so scopes are popped in constant time per entry) over the pure instructions; commutative operands in a canonical order | `gvn.tach` |
+| alias analysis | an address is a base plus a constant offset; it points into a memory object (a frame slot, a static, constant data) through additions of constant or variable offsets, or into unknown memory; distinct objects never overlap; constant data is never written; a slot whose address only serves loads, stores, copies (memcpy calls included) and address arithmetic is private: no pointer from elsewhere and no call reaches it; within one object, byte ranges are compared when both offsets are known. No type-based rule: tachyon allows casts between any pointers | `gvn.tach` |
+| dead code elimination | mark from instructions with side effects and the terminators, sweep the rest | `opt.tach` |
+| LICM | natural loops from back edges (`h` dominates `t`); a preheader for each loop (the entering edge is split when needed); pure instructions whose operands are defined outside the loop move to the preheader, innermost loops first, and so do loads from frame slots and statics that nothing in the loop may write. Nothing moved can trap (division never traps in tachyon) | `licm.tach` |
+| SROA | a frame slot of a struct, tuple, enum, slice, small array or scalar whose address serves only loads, stores and copies at constant offsets becomes one SSA variable per scalar leaf of its type, by Braun et al.'s construction over the existing CFG (blocks in reverse post-order, sealed once their predecessors are filled); copies move leaf by leaf, to or from memory when the other side stays there. The values of `if`, `match` and `loop` of up to 128 bytes are built in one slot each exit copies into, so they are replaced too | `sroa.tach` |
+| constant tables | a private slot written only by stores of constants at known offsets, in one block that comes before every read, becomes read-only data; loads from read-only data (and string literals) at known offsets become constants | `sroa.tach`, `gvn.tach` |
+| memory forwarding | along the dominator tree: what a block knows about memory (location to value) goes to a block it dominates when that one's only predecessor is it, or after the writes of every block on the paths between them are applied; loads of known locations are their values; storing what a location holds is dropped; a load from the destination of a copy that still holds reads its source (and the copy may then die) | `gvn.tach` |
+| dead stores | within a block, a store (or a copy) overwritten before anything may read it; a store or copy into a private slot that nothing reads | `gvn.tach` |
+| switches | a `match` on an integer, a fieldless enum or an enum's tag whose arms are literals, ranges, alternatives of them, or variants whose fields only bind (and no guards), is a `switch`; SCCP decides switches on constants and prunes them to their reachable successor | `lower.tach`, `fold.tach`, `opt.tach` |
+| inlining | strongly connected components of the call graph (Tarjan), callees first, so a callee is already optimized and recursion is never inlined; a callee is inlined when it has at most 30 instructions, or when this is its only call site and it has at most 400 (and is neither `main` nor address-taken); callers grow to at most 3,000 instructions. The callee's blocks are copied, parameters become the arguments, frame slots are copied, returns jump to a continuation block with a phi for the result | `inline.tach` |
 
-The pipeline (`optimize_program` in `46_opt.tach`) runs the cleanup on
+The pipeline (`optimize_program` in `opt.tach`) runs the cleanup on
 every function, then the `-O1` pipeline twice per function, then at `-O2`
 inlining and LICM in call-graph order, each followed by the `-O1`
 pipeline, and finally drops functions nobody calls (other than `main` and
@@ -123,7 +123,7 @@ those whose address is taken).
 
 ## The back end
 
-**Layout and liveness** (`50_regalloc.tach`). Critical edges (from a block
+**Layout and liveness** (`regalloc.tach`). Critical edges (from a block
 with several successors to one with several predecessors) are split, so
 that every edge has a place for its moves. Blocks are laid out in reverse
 post-order; back edges (to a block not later in the order: the graph is
@@ -197,7 +197,7 @@ least a third of their range (up to 4096 entries): 32-bit offsets from the
 table, so the code is position independent on ELF too; otherwise a binary
 search of compares and branches.
 
-**Emission** (`51_emit.tach`). The frame is addressed from sp, which does
+**Emission** (`emit.tach`). The frame is addressed from sp, which does
 not move in the body: outgoing stack arguments, spill slots, saved
 callee-saved registers, then the frame slots. Locations depend on the
 position: an instruction reads its operands where the allocation has them
@@ -270,12 +270,12 @@ interop):
 ## 0.4: the loop optimizer
 
 0.4 adds a loop optimizer to `-O2`, run per function after inlining and
-before LICM (`optimize_loops` in `46_opt.tach`; light cleanups between
+before LICM (`optimize_loops` in `opt.tach`; light cleanups between
 its passes, the `-O1` pipeline once after them). Tail recursion
-elimination runs before inlining (`49_tre.tach`). The passes, in
+elimination runs before inlining (`tre.tach`). The passes, in
 pipeline order:
 
-1. **Loop analysis and canonical form** (`49_loop.tach`): the loop forest
+1. **Loop analysis and canonical form** (`loops.tach`): the loop forest
    (natural loops by header, nesting, depth); every loop gets a preheader
    (one block entering the header, ending in a jump), a single latch (one
    back edge) and dedicated exits (exit blocks entered only from inside the
@@ -289,7 +289,7 @@ pipeline order:
    guarded `do`-`while` (the test duplicated in the preheader, the exit
    test at the latch): one branch per iteration instead of two, and the
    body known to run at least once.
-3. **Induction variables and trip counts** (`49_scev.tach`): add
+3. **Induction variables and trip counts** (`scev.tach`): add
    recurrences `{start, +, step}` of header phis; for a loop whose only
    exit is at the latch, the trip count when it is a constant (by
    evaluating the exit test with the folding rules, so wrapping is exactly
@@ -303,7 +303,7 @@ pipeline order:
    innermost loops with a constant trip count (found up to 4096) that the
    factor divides, up to 96 instructions. All copies are made from the
    untouched loop, then chained.
-6. **Loop strength reduction** (`49_lsr.tach`): an address affine in an
+6. **Loop strength reduction** (`lsr.tach`): an address affine in an
    induction variable (`k + c1*b1 + c2*b2 + (s + m*v)*i`, all 64-bit,
    `b1`, `b2`, `v` invariant) that costs a multiplication or a shift
    becomes a pointer induction variable; addresses a constant apart share
@@ -312,7 +312,7 @@ pipeline order:
    add per element.
 7. **Unswitching**: a branch on a loop-invariant condition inside a small
    loop: the loop is cloned, one copy per outcome, the test hoisted.
-8. **Value ranges and bounds checks** (`49_range.tach`): the range of an
+8. **Value ranges and bounds checks** (`range.tach`): the range of an
    integer value at a block, from its type, its operation (masks,
    remainders, conversions), induction variables, and the branch conditions
    that dominate the block; with it, bounds checks of slices whose index is
@@ -324,11 +324,11 @@ pipeline order:
    `match` with guards into a decision tree.
 9. **Comparison chains**: `x == c1` / `x == c2` / ... tests of one value in
    a chain of blocks become a `switch`.
-10. **Aggressive dead code elimination** (`46_adce.tach`): over control
+10. **Aggressive dead code elimination** (`adce.tach`): over control
     dependence (post-dominators), branches that decide nothing live are
     removed; branches of loops are kept (a loop may not terminate: only
     the loop deletion above removes loops, when they are finite).
-11. **Tail recursion elimination** (`49_tre.tach`): `return f(args)`,
+11. **Tail recursion elimination** (`tre.tach`): `return f(args)`,
     `return f(args) op y` and `return y op f(args)` (op one of `+ * & | ^`
     on integers, nothing with an effect after the call) become a loop with
     a phi per parameter and one for the accumulator; returns through a phi
@@ -392,7 +392,7 @@ instructions (rax and rdx stay fixed for division, rcx for shifts).
 
 Moved to stage B: the calling convention (2), which needs the lowering of
 calls and parameters to classify aggregates by convention (classification
-lives in `45_lower.tach` and `41_abi.tach`, shared with C's), and the
+lives in `lower.tach` and `abi.tach`, shared with C's), and the
 realigned frames (from 3), which touch the -O0 generator too. Both are done
 (stage B1, below).
 
@@ -403,7 +403,7 @@ convention; C's is kept by everything C can reach or call: functions
 imported from C or defined `extern "C"`, `main` (called by C), variadic
 functions, calls through `extern "C" fn` pointers, the run-time helpers,
 and every function at -O0, the oracle (`fn_uses_c`, `fn_type_uses_c` in
-`41_abi.tach`).
+`abi.tach`).
 
 The two never meet. A program is compiled at one level, and a plain `fn`
 value only ever holds a plain function of the same program: `fn` and
@@ -479,7 +479,7 @@ layout, post-allocation peepholes, unrolling with run-time trip counts,
 scheduling, shrink-wrapping. Done: the first three, and of scheduling the
 two rules that paid off; the rest is below.
 
-**Instruction selection** (`50_isel.tach`) runs between the optimizer and
+**Instruction selection** (`isel.tach`) runs between the optimizer and
 register allocation, after `--emit-ir` (so the optimizer's IR checks are
 unaffected; `--emit-mir` shows the IR after it). Per function:
 
@@ -534,7 +534,7 @@ unaffected; `--emit-mir` shows the IR after it). Per function:
    needed in a register (a store's value, a float) is made once; the
    allocator rematerializes it, before the loop, when it runs short.
 
-**Block layout** (`51_layout.tach`). The emission order is apart from the
+**Block layout** (`layout.tach`). The emission order is apart from the
 allocation order (any order is correct: every move belongs to a block or
 an edge, and a block's code depends on its positions only). Chains by
 fall-through (Pettis and Hansen, PLDI 1990, with static estimates): a
@@ -573,10 +573,227 @@ worth it), shrink-wrapping (moved to 0.6, with interprocedural attribute
 inference: its gain is in small functions with early returns that are
 not inlined).
 
+## 0.6: the back end, polished
+
+**Shrink-wrapping** (`emit.tach`). The frame (the saved frame pointer
+and return address, the reserved area, the saved callee-saved registers)
+is set up at the start of one block, SAVE: the nearest common dominator
+of the blocks that need it, moved up the dominator tree out of loops. A
+block needs the frame when it calls (other than a call ending a block
+that does not return), refers to a frame slot, or has a value in a
+callee-saved register or on the stack (`mark_frame_blocks` reads the
+allocation's intervals; the predecessors of a block that starts with
+such a value need it too, their edge moves write it). The blocks SAVE
+dominates run with the frame; a jump out of them tears it down after the
+edge's moves (with critical edges split only a block ending in a jump
+leaves the region, and it is never skipped as a trivial jump); the
+blocks outside run without one and return with a bare `ret`. No path
+re-enters the region but through SAVE, which is in no loop: the frame is
+set up and torn down at most once per call. A block outside that ends in
+a call that does not return (a panic) links a frame of its own first
+(x86-64 needs the stack aligned at a call). Functions calling setjmp and
+the like, realigning their frame, or taking parameters on the stack keep
+the frame at their entry.
+
+The allocator makes room for it. A value of the entry block (a
+parameter, mostly) that would take a callee-saved register for its whole
+lifetime keeps a caller-saved one, its hint first, until just before
+that register is needed elsewhere (a call, usually): at a block that is
+in no loop and dominates the rest of the value's blocks (layout order is
+not execution order: a loop run before the split point may be laid out
+after it), and no block where the value lives before it can be reached
+from it. The move into the callee-saved register costs what the entry
+move did, on the paths that need the frame only. And out of loops, a
+value that lives across no call does not follow its hint into a
+callee-saved register (the move the hint saves runs once, the frame it
+may force on a fast path every time).
+
+**Coalescing hints.** A value flowing into a phi takes the phi's
+register as its hint over the operand it is computed from: the phi's
+saves a move on the edge (a loop's back edge, often), the operand's
+nothing on AArch64 (three-operand instructions), and nothing on x86-64
+either when the operation commutes or has one operand. A loop header's
+phi takes its own hint from its back-edge value, not its initial one;
+and when that value is not allocated yet and lives across a call, the
+phi takes a callee-saved register, which the value can then share (the
+phi itself may live across no call: a caller-saved register would cost a
+move on every iteration). On x86-64 a select takes the register of an
+operand used only by it, so the cmov needs no movq first.
+
+**Instruction selection.** A comparison whose result is a value (not
+fused into a branch) compares with an immediate when the constant fits,
+on AArch64 with `cmn` for a small negative one, instead of holding the
+constant in a register (often a callee-saved one, across a loop with
+calls). A jump table over cases that start at 0 is indexed by the value
+itself.
+
+**`--stats`** prints totals of the machine code emitted on stderr
+(`--stats=functions` also a line per function): instructions, register
+moves, spill stores and reloads, moves on loop back edges, frame bytes,
+functions with a frame, saved callee-saved registers. The compiler's own
+source at the start of the work (0.6 phase 1), compiled by the compiler
+before and after:
+
+| | AArch64 before | after | x86-64 before | after |
+|---|---|---|---|---|
+| instructions | 203,020 | 197,385 (-2.8%) | 214,367 | 207,901 (-3.0%) |
+| register moves | 25,845 | 25,270 (-2.2%) | 27,393 | 27,446 (+0.2%) |
+| spill stores | 1,538 | 1,367 (-11%) | 4,205 | 3,952 (-6.0%) |
+| reloads | 4,607 | 4,159 (-9.7%) | 10,708 | 10,145 (-5.3%) |
+| moves on back edges | 2,984 | 2,653 (-11%) | 3,604 | 3,515 (-2.5%) |
+| functions setting up a frame later than their entry | 0 | 81 of 655 | | |
+
+(x86-64 counts the movq before a cmov as an instruction, not a register
+move.) At run time: fib, whose base case no longer touches the stack, is
+21% faster; the other benchmarks and the compiler itself are within
+noise. Compile time: the compiler compiling the same source at -O2 is
+within noise of before (+0.5%, best of 31 runs interleaved); -O0 does
+not run any of it. The entry split checks only dominance (a block in no
+loop reaches only later blocks of the layout), without searching the
+graph, which cost 2.6%.
+
+Found while reading the hot loops of `bench/`: interp's dispatch copied
+its opcode before indexing its jump table (fixed above); interp keeps its
+VM stack pointer in memory across iterations (scalar promotion: the
+middle end); stencil keeps bounds checks whose proof needs the caller's
+slice lengths (interprocedural, 0.6 2a); fib-like loops rotating two
+values (`a, b = b, a + b`) need a three-move cycle on the back edge
+(unrolling by two would rename them: 0.8 with run-time unrolling).
+
+## 0.6: interprocedural optimization
+
+The -O2 pipeline gains a whole-program layer (`ipo.tach`, `inline.tach`)
+around the per-function passes. In order:
+
+1. **Per function, -O1 pipeline** (as before): every function simplified
+   on its own.
+2. **Interprocedural constant propagation** (IPCP), over the call graph:
+   a parameter (or one piece of an aggregate passed in pieces) that every
+   direct call site passes the same constant is that constant in the
+   callee; a function whose every `ret` returns the same constant has its
+   call results replaced by it (the call stays, for its effects, until
+   attributes show it has none). Only internal functions: not `main`,
+   not `extern "C"` definitions, not address-taken (a function pointer
+   may reach them from anywhere). Signatures do not change (dead argument
+   *removal* would change the tachyon convention's register assignment
+   per function; the arguments are simply no longer read, and the
+   caller's computation of them dies when nothing else uses it).
+3. **Bottom-up over the call graph's strongly connected components**
+   (Tarjan; callees first), per function: tail recursion elimination,
+   **inlining**, the loop passes, LICM and **scalar promotion**, each
+   followed by the scalar pipeline; then the function's **attributes** are
+   inferred (callees are done, so their attributes are known; a component
+   of several functions is iterated optimistically to a fixed point).
+4. **Global dead code elimination**: functions and generic instances no
+   one reaches from `main`, the `extern "C"` definitions and the
+   address-taken functions are not emitted. A function whose address the
+   program takes stays, even when every call through the address was
+   made direct and inlined (a function used as a value is part of what
+   the program is; the IR and assembly tests rely on it).
+
+**The inliner's cost model.** The cost of inlining callee g at a call
+site is g's size (instructions that become code, after g was itself
+optimized: bottom-up order), minus a bonus for each constant argument
+whose parameter decides a branch, switch or division in g (10 each: the
+copy will fold), minus the call's own cost (the argument moves, the
+call, the result). The threshold is 30, doubled inside a loop and again
+in a loop nest, 0 in a cold block (one that leads only to a panic or a
+call of a `#[cold]` function). A function with a single call site that
+is not address-taken or global is inlined up to 400 (it is then not
+emitted). Never inlined: calls within one component (recursion), a
+function that calls `setjmp` or the like (or into one), and calls past
+the caller's size budget (3000) or the program's growth budget (the sum
+of all sizes may grow by half, plus 2000). `#[inline]` inlines whenever
+possible (no budget), `#[inline(never)]` never, `#[cold]` never and makes
+its call sites cold (the inliner reads them through the front end's
+`fn_attr_inline` and `fn_attr_cold`). Inlining iterates: after the inlined copies are
+simplified (constants propagated into them), their own calls are
+considered again, up to three rounds. Before each round, indirect calls
+of a constant function address become direct calls (devirtualization),
+so they can be inlined too.
+
+**Function attributes** (`--print-attrs` prints them), inferred per
+function from its instructions and its callees' attributes:
+
+| attribute | meaning |
+|---|---|
+| `readnone` | reads and writes no memory but its own private frame slots |
+| `readonly` | writes no memory but its private slots |
+| `noreturn` | never returns (every path ends in a panic or a noreturn call) |
+| `willreturn` | always returns: no loop, no recursion, only willreturn callees |
+| `nopanic` | cannot panic or exit: no bounds check, no `as E` check, only nopanic callees |
+| `nocapture(i)` | pointer parameter i is only dereferenced, compared or passed to nocapture parameters: it is not stored, returned or converted |
+
+A C function (`extern "C"` import), an indirect call and a function that
+calls one are unknown: none of these. The run-time panic is noreturn and
+writes nothing a later instruction could see. Uses: a call of a
+`readonly` function is not a memory barrier for load forwarding and
+LICM (it writes nothing), and a `readnone` one does not end the dead
+stores' search either (it reads nothing); a call of a `readnone`,
+`willreturn`, `nopanic` function whose result is unused is removed (dead
+code elimination, aggressive dead code elimination, dead loop deletion).
+Value numbering of such calls (two with equal arguments are one) is left
+for the e-graph of 0.7. In the compiler itself, of 1574 functions, 96 are
+inferred readnone, 233 more readonly, 293 willreturn, and 111 have
+nocapture parameters.
+
+**Scalar promotion** (LLVM's "promote memory to register" in LICM): a
+memory location accessed in a loop only by loads and stores of one type
+at one loop-invariant address, in a frame slot or a static, where no
+other access in the loop may overlap it, lives in a register for the
+loop: it is loaded in the preheader, its loads and stores become SSA
+values (the SSA updater places the phis), and when the loop stores to it,
+it is stored back in each exit. Accesses to the same object at variable
+offsets are disjoint when the value ranges at their blocks (bounds
+checks, loop counters, masks) keep them apart. Calls in the loop must
+not reach the location (a private slot, or a readnone callee). The pass
+runs after LICM, and an address constant (a slot's or a static's
+address) defined in the loop is made again outside it. Not promoted:
+`bench/interp`'s `vm.sp`. Indexing a fixed array is not checked in
+tachyon, so nothing bounds `vm.stack[vm.sp]` away from `vm.sp`; with
+checked array indexing (or out-of-bounds array indexing declared
+undefined) the ranges would.
+
+**Value ranges, extended:** the range of a sum, difference, product or
+left shift of two ranged values (interval arithmetic, given up on
+overflow), with the facts of the block applied to every operand, not
+only to the value compared. With IPCP this removes the bounds checks of a
+function whose slice lengths come from its callers as constants
+(`stencil`'s `sweep`).
+
+**Escape analysis (heap to stack):** a `malloc` (up to 1024 bytes) or
+`calloc` (up to 256) of a constant size whose result is only
+dereferenced, compared, copied to or from, and passed itself to `free`
+becomes a frame slot (zeroed for `calloc`), and the `free`s go; SROA can
+then take it apart. A pointer that is stored, returned, merged by a phi
+or passed to any other call keeps its allocation on the heap. One slot
+serves an allocation in a loop: the pointer of one iteration cannot reach
+the next (it would need a phi).
+
+**Compile time.** `--time-passes` prints the CPU time of each phase.
+Compiling the compiler itself to assembly at -O2 (Apple M-series, best
+of 7, user + system): 0.5.0 takes 0.63 s, 0.6 (built by itself) 0.50 s;
+at -O0, 0.06 s and 0.03 s. Of 0.6's -O2 time, the interprocedural layer
+is about 22 ms (constants 5, heap to stack 3, promotion 7, attributes
+7): promotion first checks cheaply for a loop that stores to a slot or a
+static (most functions have none), the capture analysis marks derived
+addresses in place of rescanning per address, and a component whose
+functions do not call each other is inferred in one round. The largest
+phases are the loop passes (about 130 ms), register allocation with
+emission (about 110 ms) and inlining with the simplification after it
+(about 80 ms).
+
+**Function pointers as constants:** interprocedural constant propagation
+carries function addresses too: a function pointer parameter every
+caller passes the same function becomes that function's address, and its
+indirect calls become direct (and inlinable). Specialization proper, a
+copy of the callee per distinct function pointer argument, needs a new
+function in the front end's tables per copy and is left for later.
+
 ## Not yet
 
-Planned in [roadmap.md](roadmap.md): induction variable narrowing, a
-tachyon calling convention of its own, realigned frames (0.5, stage B);
-interprocedural analyses, a cost-model-driven inliner and shrink-wrapping
-(0.6); an e-graph-based rewriter (0.7); vectorization and unrolling with
-run-time trip counts (0.8); profile-guided scheduling (0.9).
+Planned in [roadmap.md](roadmap.md), or left over: induction variable
+narrowing (from 0.5); interprocedural analyses and a
+cost-model-driven inliner (0.6); an e-graph-based rewriter (0.7);
+vectorization and unrolling with run-time trip counts (0.8);
+profile-guided scheduling (0.9).

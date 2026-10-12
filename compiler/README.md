@@ -1,11 +1,12 @@
 # tachyonc: the tachyon compiler, in tachyon
 
-`compiler/src/*.tach` is one program, compiled together:
+`compiler/src` is one program, a module tree whose root is
+`compiler/src/main.tach` (from 0.6; one module per file):
 
 ```
-$ tachyonc compiler/src/*.tach -o tachyonc.s && cc -o tachyonc tachyonc.s -lm
+$ tachyonc compiler/src/main.tach -o tachyonc.s && cc -o tachyonc tachyonc.s -lm
 $ tachyonc examples/md5.tach -o md5.s && cc -o md5 md5.s -lm
-$ tachyonc --target x86_64-linux compiler/src/*.tach -o linux.s   # cross-compile
+$ tachyonc --target x86_64-linux compiler/src/main.tach -o linux.s   # cross-compile
 $ tachyonc -O0 examples/md5.tach -o md5.s     # -O0, -O1 or -O2 (the default)
 $ tachyonc --emit-ir examples/md5.tach -o md5.ir    # the optimized IR
 $ tachyonc --emit-imports prog.tach -o decls.tach   # what `import "x.h";` declares
@@ -26,50 +27,58 @@ emits assembly that `cc` assembles and links against libc, for one of:
 The default target is the host, found with `uname`; the assembly for a
 target does not depend on the host. Errors are reported in the seed's
 format (`error[type error]: ...` / ` --> file: line L, column C` /
-`  = help: ...`); compilation stops at the first error.
+`  = help: ...`); the parser and the checker recover, so one compilation
+reports up to 50 errors.
 
 ## Structure
 
+Each file is a module of the root, `main.tach`, which declares them all
+(`mod lexer;` ...) in the order of the pipeline. Items are private unless
+another module uses them, and then `pub`; a module brings in the modules it
+uses with `use crate::m::*;` (and its main enum's variants, e.g. `use
+crate::ir::Op::*;`). The modules mirror the numbered files of 0.1 to 0.5
+(`00_base.tach` is `base.tach`, `46_opt.tach` is `opt.tach`, and so on).
+
 | file | |
 |---|---|
-| `00_base.tach` | C library declarations, growable arrays, byte buffers, the symbol interner and its growing tables, source files, error reporting and recovery (several errors at once) |
-| `10_lexer.tach` | source text to tokens; token for token the same as the seed's lexer |
-| `15_cpp.tach` | `import` (1/2): the C preprocessor, with the target C compiler's macros and include path |
-| `16_cimport.tach` | `import` (2/2): C declarations and layouts, written out as tachyon source |
-| `17_cheader.tach` | `--emit-header`: the C header of a program |
-| `18_std.tach` | the standard library's source, built in (generated from `compiler/std/std.tach` by `compiler/std/embed.sh`) |
-| `20_ast.tach` | the AST: an arena of uniform nodes (`NODES`), child lists in `LISTS` |
-| `21_parser.tach` | recursive descent for items and statements, a Pratt parser for expressions; recovery at statements and items |
-| `29_module.tach` | modules: loading `mod` files, the module tree, item keys, scopes (`use`, `pub`, paths) |
-| `30_types.tach` | interned types, layouts, the tables of structs, functions, constants and statics |
-| `31_check.tach` | the bidirectional type checker; records a type on every expression node |
-| `32_const.tach` | compile-time evaluation: constants, array lengths, static initializers |
-| `33_match.tach` | patterns: their checking, refutability, `match`, and exhaustiveness and reachability by usefulness |
-| `34_generic.tach` | generics: instances of structs, enums and functions (copies of their templates), inference of type arguments, symbols |
-| `40_gen.tach` | the driver of code generation, and the `-O0` code generator: walks the checked AST, in terms of the target interface |
-| `41_abi.tach` | C's calling convention for aggregates (AArch64 and System V): classification into pieces, locations |
-| `41_target.tach` | the target interface: targets, the machine model's virtual registers, object-format details (symbols, sections, labels), and dispatch to the instruction set |
-| `42_arm64.tach` | AArch64 for `-O0`: instructions and Apple's arm64 calling convention |
-| `43_x86_64.tach` | x86-64 for `-O0`: AT&T-syntax instructions and the System V calling convention |
-| `44_ir.tach` | the IR (`-O1` and up): instructions, blocks, functions, printing, verification |
-| `45_lower.tach` | the checked AST to IR, building SSA form (Braun et al.) |
-| `46_opt.tach` | CFG cleanups, dominators, dead code elimination, and the pass pipeline |
-| `47_fold.tach` | constant folding, SCCP, instruction combining |
-| `48_gvn.tach` | global value numbering, alias analysis, load and store forwarding, dead stores |
-| `48_sroa.tach` | scalar replacement of aggregates; constant local tables to read-only data |
-| `49_inline.tach` | inlining over the call graph's components |
-| `46_adce.tach` | aggressive dead code elimination over control dependence (post-dominators) |
-| `49_licm.tach` | natural loops and loop-invariant code motion |
-| `49_loop.tach` | the loop forest, canonical loops, LCSSA, the SSA updater, cloning, loop rotation |
-| `49_lsr.tach` | loop strength reduction (pointer induction variables), loop unswitching |
-| `49_range.tach` | value ranges and facts: bounds-check elimination, comparison folding, jump threading, comparison chains to switches |
-| `49_scev.tach` | induction variables, trip counts, exit values, dead loop deletion, unrolling |
-| `49_tre.tach` | tail recursion elimination with accumulators |
-| `50_regalloc.tach` | block layout, liveness, linear-scan register allocation |
-| `51_emit.tach` | emission of the allocated IR: operands, parallel moves, calls, frames |
-| `52_mc_arm64.tach` | AArch64 instructions on physical registers |
-| `53_mc_x86_64.tach` | x86-64 instructions on physical registers |
-| `90_main.tach` | the command line, and host detection |
+| `main.tach` | the root: the `mod` items of the others, the command line, and host detection |
+| `base.tach` | C library declarations, growable arrays, byte buffers, the symbol interner and its growing tables, source files, error reporting and recovery (several errors at once) |
+| `lexer.tach` | source text to tokens; token for token the same as the seed's lexer |
+| `cpp.tach` | `import` (1/2): the C preprocessor, with the target C compiler's macros and include path |
+| `cimport.tach` | `import` (2/2): C declarations and layouts, written out as tachyon source |
+| `cheader.tach` | `--emit-header`: the C header of a program |
+| `stdsrc.tach` | the standard library's source, built in (generated from `compiler/std/std.tach` by `compiler/std/embed.sh`) |
+| `ast.tach` | the AST: an arena of uniform nodes (`NODES`), child lists in `LISTS` |
+| `parser.tach` | recursive descent for items and statements, a Pratt parser for expressions; recovery at statements and items |
+| `modules.tach` | modules: loading `mod` files, the module tree, item keys, scopes (`use`, `pub`, paths) |
+| `types.tach` | interned types, layouts, the tables of structs, functions, constants and statics |
+| `check.tach` | the bidirectional type checker; records a type on every expression node |
+| `consteval.tach` | compile-time evaluation: constants, array lengths, static initializers |
+| `patterns.tach` | patterns: their checking, refutability, `match`, and exhaustiveness and reachability by usefulness |
+| `generics.tach` | generics: instances of structs, enums and functions (copies of their templates), inference of type arguments, symbols |
+| `gen.tach` | the driver of code generation, and the `-O0` code generator: walks the checked AST, in terms of the target interface |
+| `abi.tach` | C's calling convention for aggregates (AArch64 and System V): classification into pieces, locations |
+| `target.tach` | the target interface: targets, the machine model's virtual registers, object-format details (symbols, sections, labels), and dispatch to the instruction set |
+| `arm64.tach` | AArch64 for `-O0`: instructions and Apple's arm64 calling convention |
+| `x86_64.tach` | x86-64 for `-O0`: AT&T-syntax instructions and the System V calling convention |
+| `ir.tach` | the IR (`-O1` and up): instructions, blocks, functions, printing, verification |
+| `lower.tach` | the checked AST to IR, building SSA form (Braun et al.) |
+| `adce.tach` | aggressive dead code elimination over control dependence (post-dominators) |
+| `opt.tach` | CFG cleanups, dominators, dead code elimination, and the pass pipeline |
+| `fold.tach` | constant folding, SCCP, instruction combining |
+| `gvn.tach` | global value numbering, alias analysis, load and store forwarding, dead stores |
+| `sroa.tach` | scalar replacement of aggregates; constant local tables to read-only data |
+| `inline.tach` | inlining over the call graph's components |
+| `licm.tach` | natural loops and loop-invariant code motion |
+| `loops.tach` | the loop forest, canonical loops, LCSSA, the SSA updater, cloning, loop rotation |
+| `lsr.tach` | loop strength reduction (pointer induction variables), loop unswitching |
+| `range.tach` | value ranges and facts: bounds-check elimination, comparison folding, jump threading, comparison chains to switches |
+| `scev.tach` | induction variables, trip counts, exit values, dead loop deletion, unrolling |
+| `tre.tach` | tail recursion elimination with accumulators |
+| `regalloc.tach` | block layout, liveness, linear-scan register allocation |
+| `emit.tach` | emission of the allocated IR: operands, parallel moves, calls, frames |
+| `mc_arm64.tach` | AArch64 instructions on physical registers |
+| `mc_x86_64.tach` | x86-64 instructions on physical registers |
 
 Two back ends share the front end. At `-O1` and `-O2` (the default) the
 checked AST is lowered to an SSA IR, optimized, register-allocated and
@@ -85,7 +94,7 @@ convention for scalars, so tachyon functions can be handed to C (e.g. as
 returned through a result pointer (`x8` on AArch64; on x86-64 the hidden
 first argument `rdi`, as C does). Integers are kept sign- or zero-extended
 to 64 bits, so narrow arithmetic only needs a final extension. All
-instruction text is in `42_arm64.tach` and `43_x86_64.tach`; a new
+instruction text is in `arm64.tach` and `x86_64.tach`; a new
 instruction set is a new file implementing the same interface (see "Adding
 a host" in [docs/releases.md](../docs/releases.md)).
 
@@ -105,56 +114,56 @@ A release's compiler source may only use what the previous release's binary
 supports (see [docs/releases.md](../docs/releases.md)), so a feature that
 appears in release N enters the compiler's own source in N+1.
 
-The 0.4 source is built by 0.3.0 and uses the 0.3 language:
+The 0.6 source is built by 0.5.0 and uses the 0.5 language:
 
-- **C declarations** in an `extern "C" { ... }` block (`00_base.tach`,
-  `90_main.tach`); 0.2's single `extern fn f(...);` declarations were
-  removed from the language in 0.4;
-- **fieldless enums** for every kind of thing that used to be an integer
-  constant: `NodeKind` (AST nodes), `Tok` (tokens), `TyKind` (types), `Op`,
-  `Cond` and `Term` (the IR), `Res` (what an identifier names), `AbiClass`,
-  `Lattice` (SCCP). `Tok` and `Op` keep their 0.3 numbering
-  (`Tok::Plus as i64` is 65): the IR's value numbering hashes opcodes;
-- **match** for the dispatch over them (with guards and `|` alternatives);
-- **methods**: `IntVec` (`v.push(x)`, `v.pop()`), `HMap` (`m.get(k)`,
-  `m.put(k, v)`), and on the enums (`op.name()`, `op.is_pure()`,
-  `cond.negate()`, `cond.mirror()`, `kind.text()`);
-- **slices** where bytes were passed as a pointer and a length (`intern`,
-  `buf_bytes`, `add_string`, `data_bytes`, the symbol table's `text`, the
-  string literals `STRS`);
-- assignments that evaluate their right side first, so `NODES[n].a =
-  parse_expr()` is safe even when `parse_expr` reallocates `NODES`.
+- **modules**: one per file under the root `main.tach`, `pub` on what other
+  modules use, `use crate::m::*;` and `use crate::m::Enum::*;` (from 0.4's
+  `use E::*`: `Fn`, `Struct`, ... in the parser instead of `Tok::Fn`;
+  variants whose names clash with an item in scope, and those named
+  `None`, stay qualified);
+- **generics**: the growable arrays are `grow<T>(data, count, &cap)` and
+  `alloc_array::<T>(n)`, sized by `size_of(T)` (0.4): no element size is
+  written out any more, and the IR's and the allocator's struct-size checks
+  are gone with them;
+- **the standard library**: `Option<T>` for lookups that may find nothing
+  (`lookup_local`, `tparam_index`, `power_of_two`). `IntVec` stays (std's
+  `Vec<T>` checks every index, and the compiler indexes its arrays
+  directly in its hot loops);
+- from 0.3 and 0.4: `extern "C"` blocks, fieldless enums (`NodeKind`,
+  `Tok`, `TyKind`, `Op`, `Cond`, `Term`, `Res`, `AbiClass`, `Lattice`, `CT`,
+  `CK`) with `match`, methods (`IntVec`, `HMap`, the enums), slices for
+  byte strings, assignments that evaluate their right side first.
 
-Not used yet: enums with fields, tuples, function pointer types, `#[repr]`
-types, slicing of arrays. Most data still lives in global arrays indexed by
-id (`NODES[n]`, `INSTS[v]`, `TYPES[t]`), and the element sizes passed to
-`grow` are written out (`grow(..., 104)`: there is no `size_of`); a struct
-whose fields change must have its size updated (`init_ir` checks the IR's).
+Not used yet: enums with fields, function pointer types, `#[repr]` types,
+std's `Vec`. Most data lives in global arrays indexed by id (`NODES[n]`,
+`INSTS[v]`, `TYPES[t]`), `pub static mut` in the module that owns them.
 
-Features new in 0.4 enter this source in 0.5; the 0.5 source uses one so
-far: `size_of` and `align_of` are free for that (the layout functions are
-`type_size` and `type_align`). Features new in 0.5 (generics, modules, the
-standard library) enter this source in 0.6.
+0.5.0 reads `std` only when the files of the command line name it (fixed
+in 0.6), so `main.tach` names it (`use std::Option;`).
 
-Error recovery uses `_setjmp`/`_longjmp` (see `err_end` in
-`00_base.tach`): a function that sets a recovery point calls the work and
-then more code, never the work as a tail call, so its frame is alive when
-the jump comes back.
+Features new in 0.6 enter this source in 0.7.
+
+Error recovery uses `_setjmp`/`_longjmp` (see `err_end` in `base.tach`): a
+function that sets a recovery point calls the work and then more code,
+never the work as a tail call, so its frame is alive when the jump comes
+back.
 
 To show that a change to the compiler's source changes nothing it emits,
 `tests/compare.sh OLD NEW` compiles a corpus (the test programs, the
 examples, the benchmarks, random programs, the compiler's own source at
 HEAD and at the last release) with both compilers, at every level for
-every target, and compares the assembly, the IR, the token dumps and the
-diagnostics byte for byte. The 0.4 migration of this source to the 0.3
-language was checked with it: identical output for all 7,500 compilations
-(apart from the two programs testing the removed `extern fn`).
+every target, and compares the assembly, the IR, the token dumps, the C
+headers and the diagnostics byte for byte. The corpus: the test programs
+(also those of several modules), the examples, the benchmarks, random
+programs in every mode of the generator, C interop programs (half of them
+through `import`, the others also through `--emit-header`), and the
+compiler's own source at HEAD and at the last release. The 0.4 migration of
+this source to the 0.3 language and the 0.6 one to the 0.5 language were
+checked with it: identical output for every compilation (apart from the
+tests of what they changed on purpose).
 
 ## Known limits
 
-- One error per compilation (the seed recovers and reports all of them).
-- `#[repr(C, align(N))]` takes N up to 16 (frames are not realigned); C
-  records aligned above 16 are imported opaque.
 - Targets: AArch64 macOS, x86-64 Linux and macOS. No AArch64 Linux yet.
 - The optimizer's limits are listed at the end of
   [docs/optimizer.md](../docs/optimizer.md).
