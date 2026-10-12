@@ -410,11 +410,15 @@ static mut HAS_CALLS: bool = false;
 fn layout_frame(fi: i64) {
     FRAME_OUT = 0;
     HAS_CALLS = false;
+    USES_SLOTS = false;
     for i in 0..ORDER.count {
         let mut v = BLOCKS[ORDER.data[i]].first;
         while v != 0 {
             if INSTS[v].op.is_call() && is_emitted(v) {
                 HAS_CALLS = true;
+            }
+            if INSTS[v].op == Op::Slot && USES[v] > 0 {
+                USES_SLOTS = true;
             }
             if INSTS[v].op.is_call() {
                 let size = call_stack_size(v);
@@ -734,6 +738,11 @@ fn emit_ir_block(b: i64, k: i64) {
             }
         }
         v = INSTS[v].next;
+    }
+    if TAIL_CALLED {
+        // The callee returns for this block.
+        TAIL_CALLED = false;
+        return;
     }
     let end = BEND.data[k];
     CUR_POS = end;
@@ -1118,6 +1127,69 @@ fn call_stack_size(v: i64) -> i64 {
     call_locations(v, &locations as *i64, &copies as *i64, &float_regs)
 }
 
+// Whether the block being emitted ended in a tail call (its return is then
+// the callee's).
+static mut TAIL_CALLED: bool = false;
+// Whether the function being emitted uses frame slots (whose addresses a
+// callee could hold: no tail calls then).
+static mut USES_SLOTS: bool = false;
+
+// Whether call v is a sibling call (at -O2): the last instruction of a
+// block returning its result (or nothing), from a tachyon function, to a
+// non-variadic callee taking no argument on the stack and returning no
+// aggregate, with the same result type, in a function whose frame no
+// callee can see.
+fn is_tail_call(v: i64) -> bool {
+    let op = INSTS[v].op;
+    let b = INSTS[v].block;
+    if OPT_LEVEL < 2 || USES_SLOTS || (op != Op::Call && op != Op::CallI) || INSTS[v].next != 0
+        || INSTS[v].c != 0 {
+        return false;
+    }
+    let f = IRFUNCS[IRF].f;
+    let ret = FNS[f].ret;
+    if FNS[f].is_extern || FNS[f].export || fn_is_global(f) || is_compound(ret) || returns_through_pointer(ret) {
+        return false;
+    }
+    // The returning block: b, or the block b jumps to when it does
+    // nothing but return (a phi of the result).
+    let mut returning = b;
+    let mut result = v;
+    if BLOCKS[b].term == Term::Jump {
+        returning = BLOCKS[b].s0;
+        let mut w = BLOCKS[returning].first;
+        while w != 0 {
+            if INSTS[w].op != Op::Phi && is_emitted(w) {
+                return false;
+            }
+            if w == BLOCKS[returning].cond {
+                if INSTS[w].op != Op::Phi {
+                    return false;
+                }
+                result = w;
+                if ir_arg(w, pred_index(returning, b)) != v {
+                    return false;
+                }
+            }
+            w = INSTS[w].next;
+        }
+    }
+    if BLOCKS[returning].term != Term::Ret {
+        return false;
+    }
+    let value = BLOCKS[returning].cond;
+    if value != 0 && (value != result || INSTS[v].ty != ir_type(ret)) {
+        return false;
+    }
+    if value == 0 && !is_void(ret) {
+        return false;
+    }
+    if op == Op::Call && FNS[INSTS[v].imm].variadic {
+        return false;
+    }
+    call_stack_size(v) == 0
+}
+
 fn emit_call_inst(v: i64) {
     let op = INSTS[v].op;
     let mut locations: [i64; 64] = [0; 64];
@@ -1177,6 +1249,30 @@ fn emit_call_inst(v: i64) {
         pm_add_value(reg_callee(), INSTS[v].a, CUR_POS);
     }
     pm_resolve();
+    if is_tail_call(v) {
+        // The frame goes, then a jump: the callee returns to our caller.
+        save_callee_saved(true);
+        if X86 {
+            ins(c"movq %rbp, %rsp");
+            ins(c"popq %rbp");
+        } else {
+            ins(c"mov sp, x29");
+            ins(c"ldp x29, x30, [sp], #16");
+        }
+        if op == Op::Call {
+            let f = INSTS[v].imm;
+            o(if X86 { c"    jmp " } else { c"    b " });
+            emit_symbol_ref(fn_symbol_prefix(f), FNS[f].name);
+            if X86 && ELF && (FNS[f].is_extern || FNS[f].export) {
+                o(c"@PLT");
+            }
+            on();
+        } else {
+            ins(if X86 { c"jmp *%r11" } else { c"br x16" });
+        }
+        TAIL_CALLED = true;
+        return;
+    }
     if op == Op::Call {
         let f = INSTS[v].imm;
         emit_call(fn_symbol_prefix(f), FNS[f].name, FNS[f].is_extern || FNS[f].export, FNS[f].variadic, float_regs);
