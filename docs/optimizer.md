@@ -618,9 +618,8 @@ function that calls `setjmp` or the like (or into one), and calls past
 the caller's size budget (3000) or the program's growth budget (the sum
 of all sizes may grow by half, plus 2000). `#[inline]` inlines whenever
 possible (no budget), `#[inline(never)]` never, `#[cold]` never and makes
-its call sites cold (the inliner reads them through `fn_attr_inline` and
-`fn_attr_cold`; the front end records them with `set_fn_inline_hint` and
-`set_fn_cold`). Inlining iterates: after the inlined copies are
+its call sites cold (the inliner reads them through the front end's
+`fn_attr_inline` and `fn_attr_cold`). Inlining iterates: after the inlined copies are
 simplified (constants propagated into them), their own calls are
 considered again, up to three rounds. Before each round, indirect calls
 of a constant function address become direct calls (devirtualization),
