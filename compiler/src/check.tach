@@ -817,7 +817,8 @@ fn find_generic_method(tpl: i64, name: i64) -> i64 {
 fn collect_aliases() {
     for i in 0..NODES[PROGRAM].count {
         let item = child(PROGRAM, i);
-        if NODES[item].kind == TypeAlias {
+        // (generic aliases (0.6) are resolved where they are used)
+        if NODES[item].kind == TypeAlias && NODES[item].g == 0 {
             CUR_MOD = module_of(item);
             resolve_alias(qualify(CUR_MOD, NODES[item].a), NODES[item].start);
         }
@@ -1103,14 +1104,56 @@ fn resolve_type_name(n: i64) -> i64 {
         push_written_targs(g);
         return template_instance(tpl, mark, NODES[n].start);
     }
+    if g != 0 && SYM_ALIAS[key] != 0 && NODES[SYM_ALIAS[key]].g != 0 {
+        return generic_alias(key, g, NODES[n].start);
+    }
     if g != 0 {
         name_error(NODES[n].start, c"'", name, c"' is not generic");
     }
     resolve_key(key, name, NODES[n].start)
 }
 
+// `Pair<i64>` of a generic alias (0.6): its type with its parameters bound
+// to the arguments written in `g` (resolved here), in its own module.
+fn generic_alias(key: i64, g: i64, pos: i64) -> i64 {
+    let alias = SYM_ALIAS[key];
+    let params = NODES[alias].g;
+    if NODES[g].count != NODES[params].count {
+        err_begin(pos);
+        err_str(c"type alias '");
+        err_sym(NODES[alias].a);
+        err_str(c"' takes ");
+        err_int(NODES[params].count);
+        err_str(if NODES[params].count == 1 { c" type argument, got " } else { c" type arguments, got " });
+        err_int(NODES[g].count);
+        err_end();
+    }
+    if ALIAS_BUSY[key] != 0 {
+        name_error(pos, c"type alias '", NODES[alias].a, c"' is defined in terms of itself");
+    }
+    let mark = TSCRATCH.count;
+    push_written_targs(g);
+    let saved = TP_BASE;
+    let saved_mod = CUR_MOD;
+    TP_BASE = TP_NAMES.count;
+    for i in 0..NODES[params].count {
+        TP_NAMES.push(NODES[child(params, i)].a);
+        TP_TYPES.push(TSCRATCH.data[mark + i]);
+    }
+    TSCRATCH.count = mark;
+    CUR_MOD = module_of(alias);
+    ALIAS_BUSY[key] = 1;
+    let t = resolve_type(NODES[alias].b);
+    ALIAS_BUSY[key] = 0;
+    CUR_MOD = saved_mod;
+    TP_NAMES.count = TP_BASE;
+    TP_TYPES.count = TP_BASE;
+    TP_BASE = saved;
+    t
+}
+
 // The key a TyName names (through its module path), or -1.
-fn type_name_key(n: i64) -> i64 {
+pub fn type_name_key(n: i64) -> i64 {
     let name = NODES[n].a;
     let mut m = CUR_MOD;
     let mut b = 0;
@@ -1182,6 +1225,15 @@ fn resolve_alias(key: i64, pos: i64) -> i64 {
         return ALIAS_TYPE[key];
     }
     let alias = SYM_ALIAS[key];
+    if NODES[alias].g != 0 {
+        err_begin(pos);
+        err_str(c"type alias '");
+        err_sym(NODES[alias].a);
+        err_str(c"' is generic: write its type arguments ('");
+        err_sym(NODES[alias].a);
+        err_str(c"<...>')");
+        err_end();
+    }
     if ALIAS_BUSY[key] != 0 {
         name_error(pos, c"type alias '", NODES[alias].a, c"' is defined in terms of itself");
     }

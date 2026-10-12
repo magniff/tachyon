@@ -444,6 +444,40 @@ fn mentions_unbound(params: i64, bound: *i64, p: i64) -> bool {
 // Matches type node p (of a template declared in module `tmod`) against
 // type t, binding parameters; false when a parameter is already bound to
 // another type.
+// Generic aliases met while unifying (0.6): (name, argument node, its
+// module, the frame it is in: lo, hi) for each parameter of the aliases
+// being looked through; ALIAS_LO..ALIAS_HI are the entries in scope.
+static mut ALIAS_SUBST: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut ALIAS_LO: i64 = 0;
+static mut ALIAS_HI: i64 = 0;
+
+// Unifies the body of the generic alias named by p (`Pair<T>`, its
+// arguments in p's `g`) with t, its parameters standing for those
+// arguments.
+fn unify_alias(params: i64, bound: *i64, tmod: i64, p: i64, alias: i64, t: i64) -> bool {
+    let g = NODES[p].g;
+    let aparams = NODES[alias].g;
+    if NODES[g].count != NODES[aparams].count {
+        return true;
+    }
+    let mark = ALIAS_SUBST.count;
+    for i in 0..NODES[g].count {
+        ALIAS_SUBST.push(NODES[child(aparams, i)].a);
+        ALIAS_SUBST.push(child(g, i));
+        ALIAS_SUBST.push(tmod);
+        ALIAS_SUBST.push(ALIAS_LO);
+        ALIAS_SUBST.push(ALIAS_HI);
+    }
+    let (lo, hi) = (ALIAS_LO, ALIAS_HI);
+    ALIAS_LO = mark;
+    ALIAS_HI = ALIAS_SUBST.count;
+    let ok = unify(params, bound, module_of(alias), NODES[alias].b, t);
+    ALIAS_LO = lo;
+    ALIAS_HI = hi;
+    ALIAS_SUBST.count = mark;
+    ok
+}
+
 fn unify(params: i64, bound: *i64, tmod: i64, p: i64, t: i64) -> bool {
     if p == 0 || t == 0 {
         return true;
@@ -455,6 +489,20 @@ fn unify(params: i64, bound: *i64, tmod: i64, p: i64, t: i64) -> bool {
             return unify(params, bound, tmod, UNIFY_SELF, t);
         }
         if NODES[p].count == 0 && NODES[p].g == 0 {
+            // A parameter of an alias being looked through: its argument.
+            let mut i = ALIAS_LO;
+            while i < ALIAS_HI {
+                if ALIAS_SUBST.data[i] == NODES[p].a {
+                    let (lo, hi) = (ALIAS_LO, ALIAS_HI);
+                    ALIAS_LO = ALIAS_SUBST.data[i + 3];
+                    ALIAS_HI = ALIAS_SUBST.data[i + 4];
+                    let ok = unify(params, bound, ALIAS_SUBST.data[i + 2], ALIAS_SUBST.data[i + 1], t);
+                    ALIAS_LO = lo;
+                    ALIAS_HI = hi;
+                    return ok;
+                }
+                i += 5;
+            }
             match tparam_index(params, NODES[p].a) {
                 Option::Some(k) => {
                     if bound[k] == 0 {
@@ -472,8 +520,12 @@ fn unify(params: i64, bound: *i64, tmod: i64, p: i64, t: i64) -> bool {
         }
         let saved = CUR_MOD;
         CUR_MOD = tmod;
+        let key = if NODES[p].count == 0 && env_lookup(NODES[p].a) != 0 { -1 } else { type_name_key(p) };
         let tpl = template_of_type_node(p);
         CUR_MOD = saved;
+        if key >= 0 && SYM_ALIAS[key] != 0 && NODES[SYM_ALIAS[key]].g != 0 {
+            return unify_alias(params, bound, tmod, p, SYM_ALIAS[key], t);
+        }
         if tpl == TPL_NONE || !instance_of(t, tpl) {
             return true;
         }
