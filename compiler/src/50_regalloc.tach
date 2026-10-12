@@ -692,12 +692,64 @@ fn add_fixed(r: i64, from: i64, to: i64) {
     rev_add_range(&FIXED[r], from, to);
 }
 
+// ---- Calls that return twice ----
+//
+// setjmp and the like return again when something longjmps to them: then
+// the code after them runs again with the registers as the longjmp left
+// them (callee-saved ones as they were at the setjmp) and the frame as it
+// is now. So no register keeps a value across such a call (it clobbers
+// every register: what lives across is on the stack, stored before),
+// spill slots are not shared in its function (a slot reused after the
+// call would be wrong after the second return), and the function is never
+// a sibling caller, nor inlined, nor inlined into.
+
+fn sym_is(name: i64, s: *u8) -> bool {
+    let text = SYMS[name].text;
+    let n = strlen(s) as i64;
+    text.len == n && memcmp(text.ptr, s, n as u64) == 0
+}
+
+fn is_returns_twice_call(v: i64) -> bool {
+    let op = INSTS[v].op;
+    let mut name = 0;
+    if op == Op::Call {
+        name = FNS[INSTS[v].imm].name;
+    } else if op == Op::CallC {
+        name = INSTS[v].imm;
+    } else {
+        return false;
+    }
+    sym_is(name, c"setjmp") || sym_is(name, c"_setjmp") || sym_is(name, c"sigsetjmp")
+        || sym_is(name, c"__sigsetjmp") || sym_is(name, c"savectx") || sym_is(name, c"vfork")
+        || sym_is(name, c"getcontext")
+}
+
+fn calls_returns_twice(fi: i64) -> bool {
+    for i in 0..IRFUNCS[fi].blocks.count {
+        let b = IRFUNCS[fi].blocks.data[i];
+        if BLOCKS[b].removed == 0 {
+            let mut v = BLOCKS[b].first;
+            while v != 0 {
+                if is_returns_twice_call(v) {
+                    return true;
+                }
+                v = INSTS[v].next;
+            }
+        }
+    }
+    false
+}
+
+// Whether the function being allocated calls one.
+static mut RETURNS_TWICE: bool = false;
+
 // Registers clobbered by the instruction at p (besides its result).
 fn add_clobbers(v: i64, p: i64) {
     let op = INSTS[v].op;
     if op.is_call() {
+        let all = is_returns_twice_call(v);
         for r in 0..64 {
-            if is_allocatable(r) && !is_callee_saved_reg(r) {
+            if is_allocatable(r) && (all || !is_callee_saved_reg(r)) {
                 add_fixed(r, p + 1, p + 2);
             }
         }
@@ -1565,7 +1617,7 @@ fn assign_spill_slots() {
         let s = value_start(t);
         let mut slot = -1;
         for k in 0..slot_end.count {
-            if slot_end.data[k] <= s {
+            if slot_end.data[k] <= s && !RETURNS_TWICE {
                 slot = k;
                 break;
             }
@@ -1639,6 +1691,7 @@ fn stored_at_def(t: i64) -> bool {
 // locations.
 fn allocate_registers(fi: i64) {
     IRF = fi;
+    RETURNS_TWICE = calls_returns_twice(fi);
     split_critical_edges(fi);
     layout_blocks(fi);
     mark_reg_uses();
@@ -1891,8 +1944,9 @@ fn check_moves(state: *i64) {
 fn check_clobber(state: *i64, v: i64) {
     let op = INSTS[v].op;
     if op.is_call() {
+        let all = is_returns_twice_call(v);
         for r in 0..64 {
-            if !is_callee_saved_reg(r) {
+            if all || !is_callee_saved_reg(r) {
                 state[r] = -1;
             }
         }
