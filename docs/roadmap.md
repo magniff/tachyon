@@ -118,9 +118,10 @@ for, it is exact.
   `tests/abi/run.sh -i` (signatures through `import`) and `-H` (C
   through the emitted header), 1000 signatures per target each.
 - 0.5: `#[repr(C, align(N))]` above 16 (needs realigned stack frames);
-  `import` into a module's namespace; function-like macros that are
-  expressions (as inline functions); `errno` (a macro around a function
-  call: use `*__error()` on macOS, `*__errno_location()` with glibc).
+  [x] `import` into a module's namespace (`import "h.h" as c;`, and an
+  `import` in any module); function-like macros that are expressions (as
+  inline functions) and `errno` (a macro around a function call: use
+  `*__error()` on macOS, `*__errno_location()` with glibc) move to 0.6.
 
 ## 0.4: loops
 
@@ -171,8 +172,29 @@ Optimizations, the loop optimizer (design and status in
 
 ## 0.5: backend quality (passing Cranelift)
 
-Language: generics by monomorphization (`fn f<T>`, `struct Vec<T>`),
-modules and imports.
+Language (front end; see grammar.md, "Additions of 0.5"):
+
+- [x] generics by monomorphization, checked at instantiation:
+  `fn f<T>`, `struct Vec<T>`, `enum Option<T>`, `impl<T> Vec<T>` and
+  methods with type parameters of their own; type arguments written
+  (`Vec<i64>`, `max::<i64>`, `Vec::<u8>::new()`) or inferred from the
+  arguments and the expected type; deterministic instance symbols;
+  errors name the instantiation chain; a depth limit for instantiations
+  that grow forever. Bounded generics (traits) are left for later.
+- [x] modules: a file is a module (`mod m;`), `pub`, paths with `crate`,
+  `self` and `super`, `use a::b::{c, d as e}`, `use a::b::*`, `pub use`;
+  `import "h.h" as c;` names the C declarations' module
+- [x] several errors per compilation (pulled forward from 1.0): the parser
+  and the checker recover at statements, items and functions; errors that
+  follow from an earlier one are not reported
+- [x] a small standard library built into the compiler (`std::Option`,
+  `Result`, `Vec`, `Buf`, printing); a generic hash map waits for traits
+- [x] `size_of` and `align_of` are always the builtins (the compiler's own
+  functions were renamed)
+- not done: const generic array lengths (`[T; N]` with `N` a parameter),
+  generic type aliases, inline modules, `errno` (a macro around a call)
+
+Back end:
 
 - register allocation with live-range splitting and coalescing (SSA-based
   linear scan with interval splitting, or iterated register coalescing);
@@ -184,7 +206,8 @@ modules and imports.
 
 ## 0.6: interprocedural
 
-The compiler's source starts using generics and modules.
+The compiler's source starts using generics, modules and the standard
+library (and reports several errors at once while it is written).
 
 - call graph, bottom-up SCC-ordered inlining with a cost model and an
   inline → simplify iteration
