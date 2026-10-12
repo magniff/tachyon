@@ -1,133 +1,152 @@
-// ============================================================
-// Conway's Game of Life — Tachyon edition
-// ============================================================
-// Ported from C. Uses raw pointer arithmetic for the cell grid,
-// builds each frame in a heap buffer, single write() per frame.
-// ANSI 24-bit color: alive cells are white, dead cells fade
-// from blue to black based on how long they've been dead.
-
+// Conway's Game of Life in the terminal: a torus the size of the window,
+// random at first. Each frame is built in a std Buf and written at once.
+// ANSI 24-bit color: live cells are white, dead ones fade from blue to
+// black with the time since they died.
+//
+// It runs on Linux and macOS, built for either from either: the one
+// difference it meets, the number of the ioctl that asks for the window
+// size, is chosen at run time by uname().
 extern "C" {
-    fn printf(fmt: *u8, ...) -> i32;
-    fn malloc(size: u64) -> *u8;
+    fn write(fd: i32, buf: *u8, count: u64) -> i64;
     fn rand() -> i32;
-    fn srand(seed: i64);
-    fn time(t: *u8) -> i64;
-    fn ioctl(fd: i32, req: i64, arg: *u8) -> i32;
-    fn exit(status: i32);
+    fn srand(seed: u32);
+    fn time(t: *i64) -> i64;
+    fn ioctl(fd: i32, request: u64, ...) -> i32;
+    fn uname(name: *u8) -> i32;
 }
 
-// ---- cell grid ----
-// Layout per cell: 4 bytes [state0, age0, state1, age1]
-// state: 0=dead, 1=alive.  age: ticks since death (0-255).
+use std::Buf;
 
-fn cell(cells: *u8, x: i64, y: i64, w: i64, h: i64) -> *u8 {
-    let nx: i64 = ((x % w) + w) % w;
-    let ny: i64 = ((y % h) + h) % h;
-    ((cells as u64) + ((ny * w + nx) * 4) as u64) as *u8
-}
+// struct winsize, the same on both systems.
+#[repr(C)]
+struct Winsize { rows: u16, cols: u16, xpixel: u16, ypixel: u16 }
 
-fn st(c: *u8, i: i64) -> i64  { c[i * 2] as i64 }
-fn ag(c: *u8, i: i64) -> i64  { c[i * 2 + 1] as i64 }
+const TIOCGWINSZ_LINUX: u64 = 0x5413;
+const TIOCGWINSZ_MACOS: u64 = 0x40087468;    // _IOR('t', 104, struct winsize)
 
-fn set_st(c: *u8, i: i64, v: i64) { c[i * 2] = v as u8; }
-fn set_ag(c: *u8, i: i64, v: i64) { c[i * 2 + 1] = v as u8; }
-
-fn main() -> i64 {
-    srand(time(0 as *u8));
-
-    let ws: [u8; 8] = [0; 8];
-    let wsp: *u8 = &ws as *u8;
-    if ioctl(1, 21523, wsp) as i64 != 0 {
-        printf(c"ioctl failed\n");
-        exit(1);
+fn on_macos() -> bool {
+    // struct utsname starts with the system's name on both systems (its
+    // fields are 65 bytes long on Linux, 256 on macOS)
+    let mut names: [u8; 1280] = [0; 1280];
+    if uname(&names as *u8) != 0 {
+        return false;
     }
-
-    let h: i64 = wsp[0] as i64 + wsp[1] as i64 * 256;
-    let w: i64 = wsp[2] as i64 + wsp[3] as i64 * 256;
-
-    let cells: *u8 = malloc((w * h * 4) as u64);
-
-    let mut iy: i64 = 0;
-    while iy < h {
-        let mut ix: i64 = 0;
-        while ix < w {
-            let c: *u8 = cell(cells, ix, iy, w, h);
-            let alive: i64 = if (rand() as i64) % 2 == 0 { 1 } else { 0 };
-            set_st(c, 0, alive); set_ag(c, 0, 0);
-            set_st(c, 1, alive); set_ag(c, 1, 0);
-            ix += 1;
+    let darwin = "Darwin";
+    for i in 0..darwin.len {
+        if names[i] != darwin[i] {
+            return false;
         }
-        iy += 1;
+    }
+    true
+}
+
+// `age`: the generations since the cell died, up to 255.
+struct Cell { alive: bool, age: u8 }
+
+struct World { width: i64, height: i64, cells: Vec<Cell>, next: Vec<Cell> }
+
+impl World {
+    fn random(width: i64, height: i64) -> World {
+        let mut world = World { width: width, height: height, cells: Vec::new(), next: Vec::new() };
+        for _ in 0..width * height {
+            let cell = Cell { alive: rand() % 2 == 0, age: 0 };
+            world.cells.push(cell);
+            world.next.push(cell);
+        }
+        world
     }
 
-    printf(c"\x1B[?25l");
+    // The cell at (x, y), the edges wrapping around.
+    fn alive(self: *World, x: i64, y: i64) -> bool {
+        let wx = (x + self.width) % self.width;
+        let wy = (y + self.height) % self.height;
+        self.cells.get(wy * self.width + wx).alive
+    }
 
-    let mut gen: i64 = 0;
-    loop {
-        let cur: i64 = gen % 2;
-        let nxt: i64 = 1 - cur;
-
-        // ---- compute next generation ----
-        let mut cy: i64 = 0;
-        while cy < h {
-            let mut cx: i64 = 0;
-            while cx < w {
-                let mut nn: i64 = 0;
-                let mut dy: i64 = -1;
-                while dy <= 1 {
-                    let mut dx: i64 = -1;
-                    while dx <= 1 {
-                        if dx != 0 || dy != 0 {
-                            if st(cell(cells, cx + dx, cy + dy, w, h), cur) == 1 {
-                                nn += 1;
-                            }
-                        }
-                        dx += 1;
-                    }
-                    dy += 1;
+    fn neighbours(self: *World, x: i64, y: i64) -> i64 {
+        let mut n = 0;
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                if (dx != 0 || dy != 0) && self.alive(x + dx, y + dy) {
+                    n += 1;
                 }
+            }
+        }
+        n
+    }
 
-                let c: *u8 = cell(cells, cx, cy, w, h);
-                if st(c, cur) == 1 {
-                    if nn < 2 || nn > 3 {
-                        set_st(c, nxt, 0);
-                        set_ag(c, nxt, 1);
-                    } else {
-                        set_st(c, nxt, 1);
-                        set_ag(c, nxt, 0);
-                    }
-                } else if nn == 3 {
-                    set_st(c, nxt, 1);
-                    set_ag(c, nxt, 0);
+    fn step(self: *World) {
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let i = y * self.width + x;
+                let cell = self.cells.get(i);
+                let n = self.neighbours(x, y);
+                let next = if cell.alive {
+                    if n == 2 || n == 3 { cell } else { Cell { alive: false, age: 1 } }
+                } else if n == 3 {
+                    Cell { alive: true, age: 0 }
+                } else if cell.age < 255 {
+                    Cell { alive: false, age: cell.age + 1 }
                 } else {
-                    let a: i64 = ag(c, cur);
-                    set_st(c, nxt, 0);
-                    if a < 255 {
-                        set_ag(c, nxt, a + 1);
-                    } else {
-                        set_ag(c, nxt, 255);
-                    }
-                }
-                cx += 1;
+                    cell
+                };
+                self.next.set(i, next);
             }
-            cy += 1;
         }
-
-        // ---- render ----
-        let mut ci: i64 = 0;
-        while ci < w * h {
-            let c: *u8 = ((cells as u64) + (ci * 4) as u64) as *u8;
-            if st(c, cur) == 1 {
-                printf(c"\x1B[48;2;255;255;255m ");
-            } else {
-                let color: i64 = 255 - ag(c, cur);
-                printf(c"\x1B[48;2;%d;%d;%dm ", color / 2, color / 5, color);
-            }
-            ci += 1;
-        }
-
-        printf(c"\x1B[1;1H");
-        gen += 1;
+        let old = self.cells;
+        self.cells = self.next;
+        self.next = old;
     }
-    0
+
+    // One character cell per cell, row after row, the terminal wrapping
+    // the lines; then the cursor back home.
+    fn render(self: *World, out: *Buf) {
+        out.clear();
+        for cell in self.cells.as_slice() {
+            if cell.alive {
+                out.push_str("\x1B[48;2;255;255;255m ");
+            } else {
+                let color = 255 - cell.age as i64;
+                out.push_str("\x1B[48;2;");
+                out.push_int(color / 2);
+                out.push(';');
+                out.push_int(color / 5);
+                out.push(';');
+                out.push_int(color);
+                out.push_str("m ");
+            }
+        }
+        out.push_str("\x1B[1;1H");
+    }
+}
+
+fn write_all(bytes: [u8]) {
+    let mut at = 0;
+    while at < bytes.len {
+        let n = write(1, &bytes[at], (bytes.len - at) as u64);
+        if n <= 0 {
+            return;
+        }
+        at += n;
+    }
+}
+
+fn main() -> i32 {
+    srand(time(0 as *i64) as u32);
+
+    let mut size = Winsize { rows: 0, cols: 0, xpixel: 0, ypixel: 0 };
+    let request = if on_macos() { TIOCGWINSZ_MACOS } else { TIOCGWINSZ_LINUX };
+    if ioctl(1, request, &size) != 0 {
+        println("ioctl failed");
+        return 1;
+    }
+
+    let mut world = World::random(size.cols as i64, size.rows as i64);
+    let mut frame = Buf::new();
+    print("\x1B[?25l");
+    loop {
+        world.render(&frame);
+        write_all(frame.as_slice());
+        world.step();
+    }
 }
