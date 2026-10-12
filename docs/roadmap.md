@@ -314,14 +314,18 @@ Back end:
   - moved to 0.7: const generic lengths; `errno` (C macros that expand to
     expressions)
 
-## 0.7: equality saturation
+## 0.7: object files
 
-Compilation speed: object files written directly (Mach-O for macOS, ELF
+Object files written directly (Mach-O for macOS, ELF
 for Linux, both targets): an instruction encoder and the relocations, symbol
 tables and sections each format needs, so `cc` only links. `--emit-asm`
 stays, and the object files are checked against `cc`'s assembly of the
 same text, section by section. The system assembler took 2.4 s of the
 compiler's 3 s self-build in 0.6.
+
+Also: interp's 2% slowdown from 0.6.
+
+## 0.8: traits and equality saturation
 
 Language: traits (bounded generics), which a generic hash map and
 operator overloading need; adding bounds does not change what programs
@@ -333,16 +337,16 @@ written against 0.5's unbounded generics mean.
   are accepted
 - partial redundancy elimination (GVN-PRE)
 
-## 0.8: vectorization
+## 0.9: vectorization and profiles
 
+Vectorization:
 - SLP vectorizer
 - loop vectorizer for counted loops with simple dependences
 - unrolling with run-time trip counts (from 0.5), sharing the vectorizer's
   remainder loop
 - NEON and SSE2/AVX2 lowering; language-level vector types (`v4f32`, ...)
 
-## 0.9: profile-guided
-
+Profile-guided:
 - instrumentation profiles (`--profile-generate` / `--profile-use`)
 - branch weights driving inlining, block layout and hot/cold splitting
 - PGO-aware register allocation and unrolling
