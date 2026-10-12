@@ -324,6 +324,11 @@ run_case() {
     fi >"$dir/status"
 }
 
+# The standard library built into the compiler must be its source's (0.5).
+if [ -x "$ROOT/compiler/std/embed.sh" ] && ! "$ROOT/compiler/std/embed.sh" -c; then
+    exit 1
+fi
+
 # The cases, in order; up to JOBS at once (a FIFO holds the free slots).
 CASES="$WORK/cases"
 : >"$CASES"

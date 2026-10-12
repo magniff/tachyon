@@ -1,0 +1,260 @@
+// The standard library (0.5): the module `std`, built into the compiler
+// (compiler/std/embed.sh makes compiler/src/18_std.tach from this file).
+// A program that names `std` gets it: `std::Vec<i64>`, `use std::*;`.
+//
+// Option and Result, a growable vector, a byte buffer and printing.
+// Failures (unwrapping None, an index out of bounds) print a message on
+// stderr and exit with 101, like the language's own checks.
+
+extern "C" {
+    fn malloc(size: u64) -> *u8;
+    fn realloc(p: *u8, size: u64) -> *u8;
+    fn free(p: *u8);
+    fn write(fd: i32, data: *u8, count: u64) -> i64;
+    fn exit(code: i32) -> !;
+}
+
+// Prints `message` (a C string) on stderr and exits with 101.
+pub fn panic(message: *u8) -> ! {
+    let mut n = 0;
+    while message[n] != 0 {
+        n += 1;
+    }
+    write(2, message, n as u64);
+    write(2, c"\n", 1);
+    exit(101)
+}
+
+// ---- Option and Result ----
+
+pub enum Option<T> { None, Some(T) }
+
+impl<T> Option<T> {
+    pub fn is_some(self: *Option<T>) -> bool {
+        match *self {
+            Option::Some(_) => true,
+            Option::None => false,
+        }
+    }
+
+    pub fn is_none(self: *Option<T>) -> bool {
+        !self.is_some()
+    }
+
+    pub fn unwrap(self: Option<T>) -> T {
+        match self {
+            Option::Some(x) => x,
+            Option::None => panic(c"called unwrap on None"),
+        }
+    }
+
+    pub fn unwrap_or(self: Option<T>, other: T) -> T {
+        match self {
+            Option::Some(x) => x,
+            Option::None => other,
+        }
+    }
+}
+
+pub enum Result<T, E> { Ok(T), Err(E) }
+
+impl<T, E> Result<T, E> {
+    pub fn is_ok(self: *Result<T, E>) -> bool {
+        match *self {
+            Result::Ok(_) => true,
+            Result::Err(_) => false,
+        }
+    }
+
+    pub fn is_err(self: *Result<T, E>) -> bool {
+        !self.is_ok()
+    }
+
+    pub fn unwrap(self: Result<T, E>) -> T {
+        match self {
+            Result::Ok(x) => x,
+            Result::Err(_) => panic(c"called unwrap on Err"),
+        }
+    }
+
+    pub fn unwrap_or(self: Result<T, E>, other: T) -> T {
+        match self {
+            Result::Ok(x) => x,
+            Result::Err(_) => other,
+        }
+    }
+
+    pub fn ok(self: Result<T, E>) -> Option<T> {
+        match self {
+            Result::Ok(x) => Option::Some(x),
+            Result::Err(_) => Option::None,
+        }
+    }
+}
+
+// ---- Vec ----
+
+// A growable vector of T on the heap; `free` gives its memory back.
+pub struct Vec<T> { ptr: *T, len: i64, cap: i64 }
+
+impl<T> Vec<T> {
+    pub fn new() -> Vec<T> {
+        Vec { ptr: 0 as *T, len: 0, cap: 0 }
+    }
+
+    pub fn with_capacity(cap: i64) -> Vec<T> {
+        let mut v: Vec<T> = Vec::new();
+        v.reserve(cap);
+        v
+    }
+
+    pub fn len(self: *Vec<T>) -> i64 {
+        self.len
+    }
+
+    pub fn is_empty(self: *Vec<T>) -> bool {
+        self.len == 0
+    }
+
+    // Room for `extra` more elements.
+    pub fn reserve(self: *Vec<T>, extra: i64) {
+        if self.len + extra <= self.cap {
+            return;
+        }
+        let mut cap = if self.cap == 0 { 4 } else { self.cap * 2 };
+        while cap < self.len + extra {
+            cap *= 2;
+        }
+        self.ptr = realloc(self.ptr as *u8, (cap * size_of(T)) as u64) as *T;
+        self.cap = cap;
+    }
+
+    pub fn push(self: *Vec<T>, x: T) {
+        if self.len == self.cap {
+            self.reserve(1);
+        }
+        self.ptr[self.len] = x;
+        self.len += 1;
+    }
+
+    pub fn pop(self: *Vec<T>) -> Option<T> {
+        if self.len == 0 {
+            return Option::None;
+        }
+        self.len -= 1;
+        Option::Some(self.ptr[self.len])
+    }
+
+    // Element i (checked: out of bounds exits with 101).
+    pub fn get(self: *Vec<T>, i: i64) -> T {
+        self.as_slice()[i]
+    }
+
+    pub fn set(self: *Vec<T>, i: i64, x: T) {
+        self.as_slice()[i] = x;
+    }
+
+    pub fn as_slice(self: *Vec<T>) -> [T] {
+        self.ptr[0..self.len]
+    }
+
+    pub fn clear(self: *Vec<T>) {
+        self.len = 0;
+    }
+
+    pub fn free(self: *Vec<T>) {
+        free(self.ptr as *u8);
+        self.ptr = 0 as *T;
+        self.len = 0;
+        self.cap = 0;
+    }
+}
+
+// ---- Buf ----
+
+// A growable buffer of bytes, for building text.
+pub struct Buf { bytes: Vec<u8> }
+
+impl Buf {
+    pub fn new() -> Buf {
+        Buf { bytes: Vec::new() }
+    }
+
+    pub fn len(self: *Buf) -> i64 {
+        self.bytes.len
+    }
+
+    pub fn push(self: *Buf, b: u8) {
+        self.bytes.push(b);
+    }
+
+    pub fn push_str(self: *Buf, s: [u8]) {
+        self.bytes.reserve(s.len);
+        for b in s {
+            self.bytes.push(b);
+        }
+    }
+
+    // A C string (up to its NUL).
+    pub fn push_cstr(self: *Buf, s: *u8) {
+        let mut i = 0;
+        while s[i] != 0 {
+            self.bytes.push(s[i]);
+            i += 1;
+        }
+    }
+
+    // The decimal digits of v.
+    pub fn push_int(self: *Buf, v: i64) {
+        if v < 0 {
+            self.push('-');
+            if v == -9223372036854775807 - 1 {
+                self.push_cstr(c"9223372036854775808");
+                return;
+            }
+            self.push_int(-v);
+            return;
+        }
+        if v >= 10 {
+            self.push_int(v / 10);
+        }
+        self.push('0' + (v % 10) as u8);
+    }
+
+    pub fn as_slice(self: *Buf) -> [u8] {
+        self.bytes.as_slice()
+    }
+
+    pub fn clear(self: *Buf) {
+        self.bytes.clear();
+    }
+
+    pub fn free(self: *Buf) {
+        self.bytes.free();
+    }
+}
+
+// ---- Printing ----
+
+pub fn print(s: [u8]) {
+    write(1, s.ptr, s.len as u64);
+}
+
+pub fn println(s: [u8]) {
+    print(s);
+    write(1, c"\n", 1);
+}
+
+pub fn print_int(v: i64) {
+    let mut b = Buf::new();
+    b.push_int(v);
+    print(b.as_slice());
+    b.free();
+}
+
+pub fn print_cstr(s: *u8) {
+    let mut b = Buf::new();
+    b.push_cstr(s);
+    print(b.as_slice());
+    b.free();
+}
