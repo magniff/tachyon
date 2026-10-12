@@ -2,14 +2,12 @@
 // registers: 0-30 are x0-x30, 31 is sp (as a base or an addition source),
 // 32 + n is d<n> (s<n> for f32).
 //
-// Use of the registers: x0-x7 carry arguments and serve as operand
-// scratch registers (x0-x2) and the result scratch register (x3) between
-// calls; x8 is the result pointer; x9-x15 (caller-saved) and x19-x28
-// (callee-saved) are allocated; x16 holds the callee of indirect calls and
-// is the parallel moves' temporary; x17 breaks parallel move cycles and is
-// the temporary for addresses and constants here; x18 is reserved by the
-// platform. d0-d7 carry arguments and serve as scratch; d8-d15 and
-// d16-d29 are allocated; d30 and d31 are the parallel moves' registers.
+// Use of the registers: x0-x15 (caller-saved; x0-x7 also carry arguments,
+// x8 the result pointer) and x19-x28 (callee-saved) are allocated; x16
+// holds the callee of indirect calls and is the parallel moves' temporary;
+// x17 breaks parallel move cycles and is the temporary for addresses and
+// constants here; x18 is reserved by the platform. d0-d29 are allocated
+// (d8-d15 callee-saved); d30 and d31 are the parallel moves' registers.
 
 fn ma_r(r: i64) {
     if r == 31 {
@@ -321,6 +319,20 @@ fn ma_int_op(op: Op, ty: i64, d: i64, a: i64, b: i64) {
     ma_normalize(d, ty);
 }
 
+// Whether ma_int_op_imm emits `a <op> imm` (one instruction).
+fn ma_int_imm_ok(op: Op, imm: i64) -> bool {
+    if op == Op::Add || op == Op::Sub {
+        return imm > -4096 && imm < 4096;
+    }
+    if op == Op::Mul {
+        return imm == 3 || imm == 5 || imm == 9;
+    }
+    if op == Op::And || op == Op::Or || op == Op::Xor {
+        return is_logical_imm(imm as u64);
+    }
+    op == Op::Shl || op == Op::Shr
+}
+
 fn ma_int_op_imm(op: Op, ty: i64, d: i64, a: i64, imm: i64) -> bool {
     if op == Op::Add || op == Op::Sub {
         let mut value = imm;
@@ -527,26 +539,19 @@ fn ma_conv(from: i64, to: i64, d: i64, src: i64) {
         ma_f(src, from);
         on();
     } else {
-        // d = value >= 2^63 ? fcvtzu(value) : fcvtzs(value)
+        // d = value >= 2^63 ? fcvtzu(value) : fcvtzs(value); fcvtzs gives
+        // INT64_MAX exactly for those values (no smaller float rounds to
+        // it), the one value whose increment overflows.
         o(c"    fcvtzs x16, ");
         ma_f(src, from);
         on();
         o(c"    fcvtzu x17, ");
         ma_f(src, from);
         on();
-        if from == TY_F32 {
-            a64_load_imm(5, 0x5f000000);
-            ins(c"fmov s7, w5");
-        } else {
-            a64_load_imm(5, 0x43e0000000000000);
-            ins(c"fmov d7, x5");
-        }
-        o(c"    fcmp ");
-        ma_f(src, from);
-        o(if from == TY_F32 { c", s7\n" } else { c", d7\n" });
+        ins(c"cmn x16, #1");
         o(c"    csel ");
         ma_r(d);
-        o(c", x17, x16, ge\n");
+        o(c", x17, x16, vs\n");
     }
     ma_normalize(d, to);
 }
