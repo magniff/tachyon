@@ -802,11 +802,14 @@ profile-guided scheduling (0.9).
 
 **0.7 status**
 - done: the assembler (`objfile.tach`, `enc_arm64.tach`, `enc_x86.tach`),
-  Mach-O and ELF writers, `-c` / `-S` / executables; AArch64 objects
-  identical to `cc -c`'s over the corpus (382 compilations)
-- remaining: x86-64 (macOS, Linux) checked over the corpus;
-  tests/objcheck.sh; the bootstrap and the test runner on objects;
-  compile-time numbers; the gate
+  Mach-O and ELF writers; `-c` (or `-o x.o`) writes an object, `-S`,
+  `--emit-asm` (or `-o x.s`) assembly, any other output an executable
+  (cc links); tests/run.sh, the fuzzers, the benchmarks and the bootstrap
+  (interface `tachyonc-0.7`: its fixpoint compares objects) use objects;
+  tests/objcheck.sh: on all three targets every compilation of the corpus
+  (374) links to the same program as `cc -c` of its assembly; objects are
+  identical whatever the host; compile times in roadmap.md
+- remaining for the release: the gate's fuzz and ABI rounds on objects
 - after the object writer (scope added by the user: no undefined
   behaviour): bounds-checked fixed-array indexing; an "Undefined
   behaviour" section in grammar.md
@@ -816,3 +819,37 @@ written stays the single source: `objfile.tach` assembles exactly that
 text (one statement per line, the subset of the syntax the code
 generator uses), so `--emit-asm` and the object cannot disagree, and
 `cc -c` of the same text is an oracle for every object.
+
+**How it works.** `objfile.tach` reads the text line by line into
+fragments: runs of bytes, each with an optional tail whose size depends
+on where it lands: an alignment (zeros in data, NOPs in code, LLVM's
+NOPs on x86-64), or an x86-64 jump to a label, short or long. Labels
+remember their fragment and offset; references become fixups. Layout
+places the fragments section by section and relaxes the jumps as both
+system assemblers do: every jump short first, a short one that does not
+reach becomes long, until none changes. A jump may be short only when the
+assembler resolves it: a label of the same section that is not global
+(GNU as), and on Mach-O of the same atom as the jump (LLVM: an atom runs
+from one non-temporary symbol to the next, so the linker may move atoms
+apart). Fixups then become values, or relocations: AArch64 BRANCH26,
+PAGE21/PAGEOFF12, GOT_LOAD_PAGE21/PAGEOFF12, UNSIGNED; x86-64 Mach-O
+BRANCH, SIGNED, GOT_LOAD, UNSIGNED; ELF PLT32, PC32,
+(REX_)GOTPCRELX, 64 (a temporary label on ELF is its section's symbol
+plus an addend). The Mach-O writer adds, on AArch64, LLVM's section-start
+symbols (`ltmp0`...): the linker keeps a section, even an empty one, by
+its symbols.
+
+The encoders take the instruction forms the code generator writes and
+choose where the syntax leaves a choice as the system assemblers do:
+`ldr` with a negative or unaligned offset is `ldur`; `mov` of an
+immediate is `movz`, `movn` or `orr` with a bitmask; `add`/`sub` with sp
+take the extended-register form; x86-64 picks the shortest immediate, the
+accumulator forms of `op $imm32, %rax`, the MR form for register moves,
+`D1` for shifts by one.
+
+**Checked** by tests/objcheck.sh on every target: each program of the
+corpus at -O0 and -O2 is compiled to an object and to assembly, `cc -c`
+assembles the assembly, both are linked, and the two executables must
+have the same disassembly (padding NOPs aside) and the same data. The
+fixpoint compares the compiler's own objects; the objects of the x86-64
+build of the compiler (under Rosetta) are identical to the arm64 one's.

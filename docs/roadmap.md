@@ -569,3 +569,20 @@ assembler takes about 2 s (0.7 writes object files itself). Per phase at
 -O2 (`--time-passes`): the loop passes 27%, register allocation and
 emission 22%, inlining and the simplification after it 16%, the scalar
 pipeline 11%, the interprocedural layer 4.5%, the front end 8%.
+
+### 0.7
+
+Compile time, the compiler building itself (the 0.7 source, about 40,000
+lines; aarch64-macos, idle machine, best of 7), to an executable:
+
+| | -O0 | -O2 |
+|---|---|---|
+| 0.6.0: assembly, then `cc` assembles and links | 1867 ms | 2734 ms |
+| 0.7: the object written by the compiler, `cc` links | 119 ms | 616 ms |
+| of which the compiler (to the object) | 94 ms | 594 ms |
+
+15.7× and 4.4× faster end to end: the system assembler took about 1.8
+s to assemble the 5 MB of text; the compiler's own assembler, reading the
+same text, about 45 ms. The test suite's wall time is unchanged (17.4 s,
+mostly starting and linking 315 programs). Run time: the code is the same
+as with 0.6 (the objects hold exactly the assembly 0.6 would write).
