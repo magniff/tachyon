@@ -56,6 +56,12 @@
 #                        is what the other directives check
 #   // FIXED: text       the rewritten copy has a line (not a comment)
 #                        containing text, one directive per line
+#   // FIXUNSAFE: why    (0.9) the same with tachyonc --fix-unsafe
+#   // FLAGS: flags      (0.9) more compiler options for the case
+#   // WARNING: text     (0.9) the case compiles with a warning containing
+#                        this text, one directive per message, in order
+# Every case is compiled with --deny-warnings (0.9: no unsafe operation
+# outside unsafe code), except the ones with WARNING directives.
 # Stdout is compared after removing trailing whitespace. Each program may
 # run for 20 seconds.
 
@@ -155,7 +161,10 @@ read_directives() {
             else if (key == "ASM(" target ")") asms = asms "+" value "\n"
             else if (key == "ASM-NOT(" target ")") asms = asms "-" value "\n"
             else if (key == "FIXIMPORTS") fiximports = 1
+            else if (key == "FIXUNSAFE") fiximports = 2
             else if (key == "FIXED") fixed = fixed value "\n"
+            else if (key == "FLAGS") flags = flags " " value
+            else if (key == "WARNING") warnings = warnings value "\n"
         }
         END {
             printf "%s", args > (dir "/args")
@@ -175,6 +184,8 @@ read_directives() {
             printf "%s", (checkopt == "" ? "2" : checkopt) > (dir "/checkopt")
             printf "%d", fiximports > (dir "/fiximports")
             printf "%s", fixed > (dir "/fixed")
+            printf "%s", flags > (dir "/flags")
+            printf "%s", warnings > (dir "/warnings")
         }
     ' "$1"
 }
@@ -212,11 +223,16 @@ check_case() {
     else
         source=$file
     fi
-    if [ "$(cat "$dir/fiximports")" = 1 ] && ! fix_case "$source" "$dir"; then
-        return 1
-    fi
+    case "$(cat "$dir/fiximports")" in
+        1) fix_case "$source" "$dir" --fix-imports || return 1 ;;
+        2) fix_case "$source" "$dir" --fix-unsafe || return 1 ;;
+    esac
+    # The compiler's options for the case (0.9).
+    FLAGS="--deny-warnings $(cat "$dir/flags")"
+    [ -s "$dir/warnings" ] && FLAGS=$(cat "$dir/flags")
     if [ -s "$dir/errors" ]; then
-        "$COMPILER" --target "$TARGET" $OPT "$source" -o "$dir/prog.s" >"$dir/compile.out" 2>&1
+        # shellcheck disable=SC2086
+        "$COMPILER" --target "$TARGET" $OPT $FLAGS "$source" -o "$dir/prog.s" >"$dir/compile.out" 2>&1
         rc=$?
         if [ $rc -ne 1 ]; then
             { echo "expected a compile error (exit code 1), got exit code $rc:"; cat "$dir/compile.out"; } >"$dir/why"
@@ -249,9 +265,23 @@ check_case() {
     if [ -s "$dir/checks" ] && ! check_ir "$source" "$dir"; then
         return 1
     fi
-    if ! "$COMPILER" --target "$TARGET" $OPT "$source" -o "$dir/$OUT" >"$dir/compile.out" 2>&1; then
+    # shellcheck disable=SC2086
+    if ! "$COMPILER" --target "$TARGET" $OPT $FLAGS "$source" -o "$dir/$OUT" >"$dir/compile.out" 2>&1; then
         { echo "compile failed:"; cat "$dir/compile.out"; } >"$dir/why"
         return 1
+    fi
+    if [ -s "$dir/warnings" ]; then
+        missing=$(awk -v out="$dir/compile.out" '
+            BEGIN { while ((getline line < out) > 0) text[++n] = line }
+            {
+                while (at < n && index(text[at + 1], $0) == 0) at++
+                if (at >= n) { print $0; exit }
+                at++
+            }' "$dir/warnings")
+        if [ -n "$missing" ]; then
+            { echo "expected a warning containing '$missing' (after the ones before it), got:"; cat "$dir/compile.out"; } >"$dir/why"
+            return 1
+        fi
     fi
     csources=""
     for c in $(cat "$dir/csources"); do
@@ -259,7 +289,8 @@ check_case() {
     done
     # The program's C header, for its C sources.
     if [ -s "$dir/cheader" ]; then
-        if ! "$COMPILER" --target "$TARGET" --emit-header "$source" -o "$dir/$(cat "$dir/cheader")" >"$dir/header.out" 2>&1; then
+        # shellcheck disable=SC2086
+        if ! "$COMPILER" --target "$TARGET" $FLAGS --emit-header "$source" -o "$dir/$(cat "$dir/cheader")" >"$dir/header.out" 2>&1; then
             { echo "--emit-header failed:"; cat "$dir/header.out"; } >"$dir/why"
             return 1
         fi
@@ -296,9 +327,9 @@ check_case() {
     return 0
 }
 
-# FIXIMPORTS: a copy of case $1 (in $2/fix/run, next to a link to
-# tests/c, which cases include from) is rewritten by --fix-imports;
-# `source` becomes the copy.
+# FIXIMPORTS, FIXUNSAFE: a copy of case $1 (in $2/fix/run, next to a link
+# to tests/c, which cases include from) is rewritten by option $3
+# (--fix-imports or --fix-unsafe); `source` becomes the copy.
 fix_case() {
     fixdir="$2/fix"
     mkdir -p "$fixdir/run"
@@ -311,12 +342,12 @@ fix_case() {
             cp "$1" "$fixdir/run/"
             source="$fixdir/run/$(basename "$1")" ;;
     esac
-    if ! "$COMPILER" --target "$TARGET" --fix-imports "$source" >"$2/fix.out" 2>&1; then
-        { echo "--fix-imports failed:"; cat "$2/fix.out"; } >"$2/why"
+    if ! "$COMPILER" --target "$TARGET" "$3" "$source" >"$2/fix.out" 2>&1; then
+        { echo "$3 failed:"; cat "$2/fix.out"; } >"$2/why"
         return 1
     fi
-    if ! "$COMPILER" --target "$TARGET" --fix-imports "$source" >"$2/fix2.out" 2>&1 || [ -s "$2/fix2.out" ]; then
-        { echo "a second --fix-imports did not leave the program as it was:"; cat "$2/fix2.out"; } >"$2/why"
+    if ! "$COMPILER" --target "$TARGET" "$3" "$source" >"$2/fix2.out" 2>&1 || [ -s "$2/fix2.out" ]; then
+        { echo "a second $3 did not leave the program as it was:"; cat "$2/fix2.out"; } >"$2/why"
         return 1
     fi
     find "$fixdir/run" -name '*.tach' -exec cat {} + | grep -v '^[[:space:]]*//' >"$2/fixed.txt"
@@ -331,7 +362,8 @@ fix_case() {
 
 # Matches the CHECK directives against the optimized IR of $1.
 check_ir() {
-    if ! "$COMPILER" --target "$TARGET" "-O$(cat "$2/checkopt")" --verify-ir --emit-ir "$1" -o "$2/ir.txt" >"$2/compile.out" 2>&1; then
+    # shellcheck disable=SC2086
+    if ! "$COMPILER" --target "$TARGET" "-O$(cat "$2/checkopt")" $FLAGS --verify-ir --emit-ir "$1" -o "$2/ir.txt" >"$2/compile.out" 2>&1; then
         { echo "--emit-ir failed:"; cat "$2/compile.out"; } >"$2/why"
         return 1
     fi
@@ -342,7 +374,8 @@ check_ir() {
 
 # Matches the ASM directives against the assembly of $1 for the target.
 check_asm() {
-    if ! "$COMPILER" --target "$TARGET" "-O$(cat "$2/checkopt")" "$1" -o "$2/check.s" >"$2/compile.out" 2>&1; then
+    # shellcheck disable=SC2086
+    if ! "$COMPILER" --target "$TARGET" "-O$(cat "$2/checkopt")" $FLAGS "$1" -o "$2/check.s" >"$2/compile.out" 2>&1; then
         { echo "compile failed:"; cat "$2/compile.out"; } >"$2/why"
         return 1
     fi
@@ -406,6 +439,11 @@ run_case() {
 # The standard library built into the compiler must be its source's (0.5).
 if [ -x "$ROOT/compiler/std/embed.sh" ] && ! "$ROOT/compiler/std/embed.sh" -c; then
     exit 1
+fi
+
+# The optimizer's rewrite rules, on random values (0.9).
+if "$COMPILER" --check-rules >"$WORK/rules.out" 2>&1; then :; else
+    grep -q 'rewrite rules' "$WORK/rules.out" && { cat "$WORK/rules.out"; exit 1; }
 fi
 
 # The cases, in order; up to JOBS at once (a FIFO holds the free slots).

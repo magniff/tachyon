@@ -66,7 +66,7 @@ mod sys {
         // struct utsname: five fields of 256 bytes on macOS (the machine
         // last), six of 65 on Linux; the system's name comes first.
         let mut names: [u8; 1280] = [0; 1280];
-        if uname(&names as *u8) != 0 || !starts_with(names[..], "Darwin") {
+        if unsafe { uname(&names as *u8) != 0 || !starts_with(names[..], "Darwin") } {
             return System::Linux;
         }
         if starts_with(names[1024..], "arm64") { System::MacArm } else { System::MacIntel }
@@ -93,7 +93,7 @@ mod sys {
     // A TCP socket listening on addr:port (in host order), with
     // SO_REUSEADDR; or the message of what failed.
     pub fn listen_tcp(system: System, addr: u32, port: u16) -> Result<i32, [u8]> {
-        let fd = socket(AF_INET, SOCK_STREAM, 0);
+        let fd = unsafe { socket(AF_INET, SOCK_STREAM, 0) };
         if fd < 0 {
             return Err("error: socket() failed\n");
         }
@@ -102,11 +102,11 @@ mod sys {
         let level: i32 = if linux { 1 } else { 0xffff };
         let name: i32 = if linux { 2 } else { 4 };
         let one: i32 = 1;
-        setsockopt(fd, level, name, &one as *u8, size_of(i32) as u32);
+        unsafe { setsockopt(fd, level, name, &one as *u8, size_of(i32) as u32); }
 
         let bound = if linux {
             let sa = SockaddrIn { family: AF_INET as u16, port: swap16(port), addr: swap32(addr), zero: [0; 8] };
-            bind(fd, &sa as *u8, size_of(SockaddrIn) as u32)
+            unsafe { bind(fd, &sa as *u8, size_of(SockaddrIn) as u32) }
         } else {
             let sa = SockaddrInBsd {
                 len: size_of(SockaddrInBsd) as u8,
@@ -115,14 +115,14 @@ mod sys {
                 addr: swap32(addr),
                 zero: [0; 8],
             };
-            bind(fd, &sa as *u8, size_of(SockaddrInBsd) as u32)
+            unsafe { bind(fd, &sa as *u8, size_of(SockaddrInBsd) as u32) }
         };
         if bound < 0 {
-            close(fd);
+            unsafe { close(fd); }
             return Err("error: bind() failed (port 8000 in use?)\n");
         }
-        if listen(fd, 128) < 0 {
-            close(fd);
+        if unsafe { listen(fd, 128) < 0 } {
+            unsafe { close(fd); }
             return Err("error: listen() failed\n");
         }
         Ok(fd)
@@ -152,22 +152,22 @@ mod sys {
         match system {
             System::Linux => {
                 let d = entry as *DirentLinux;
-                (&d.name as *u8, d.r#type)
+                unsafe { (&d.name as *u8, d.r#type) }
             }
             System::MacArm => {
                 let d = entry as *DirentMac;
-                (&d.name as *u8, d.r#type)
+                unsafe { (&d.name as *u8, d.r#type) }
             }
             System::MacIntel => {
                 let d = entry as *DirentMacOld;
-                (&d.name as *u8, d.r#type)
+                unsafe { (&d.name as *u8, d.r#type) }
             }
         }
     }
 
     // The bytes of a C string.
     pub fn cstr(s: *u8) -> [u8] {
-        s[0..strlen(s) as i64]
+        unsafe { s[0..strlen(s) as i64] }
     }
 }
 
@@ -230,17 +230,17 @@ impl Path {
 enum Kind { Missing, Dir, File(i64) }
 
 fn probe(system: System, path: *u8) -> Kind {
-    let dir = opendir(path);
+    let dir = unsafe { opendir(path) };
     if dir as u64 != 0 {
-        closedir(dir);
+        unsafe { closedir(dir); }
         return Kind::Dir;
     }
-    let fd = open(path, O_RDONLY | sys::o_nonblock(system));
+    let fd = unsafe { open(path, O_RDONLY | sys::o_nonblock(system)) };
     if fd < 0 {
         return Kind::Missing;
     }
-    defer close(fd);
-    Kind::File(lseek(fd, 0, SEEK_END))
+    defer unsafe { close(fd) };
+    unsafe { Kind::File(lseek(fd, 0, SEEK_END)) }
 }
 
 // ============================================================================
@@ -336,13 +336,13 @@ fn push_escaped(out: *Buf, s: [u8]) {
 // ============================================================================
 
 fn eprint(s: [u8]) {
-    write(2, s.ptr, s.len as u64);
+    unsafe { write(2, s.ptr, s.len as u64); }
 }
 
 fn send_all(fd: i32, s: [u8]) {
     let mut sent = 0;
     while sent < s.len {
-        let n = write(fd, &s[sent], (s.len - sent) as u64);
+        let n = unsafe { write(fd, &s[sent], (s.len - sent) as u64) };
         if n <= 0 {
             break;
         }
@@ -415,12 +415,12 @@ fn push_style(out: *Buf) {
 }
 
 fn serve_directory(fd: i32, system: System, dir_path: *Path, url: [u8]) {
-    let dir = opendir(dir_path.c());
+    let dir = unsafe { opendir(dir_path.c()) };
     if dir as u64 == 0 {
         send_404(fd, url);
         return;
     }
-    defer closedir(dir);
+    defer unsafe { closedir(dir) };
 
     let mut body = Buf::new();
     defer body.free();
@@ -440,19 +440,19 @@ fn serve_directory(fd: i32, system: System, dir_path: *Path, url: [u8]) {
     body.push_str("<table>\n<tr><th class=\"icon\"></th><th>Name</th><th>Size</th></tr>\n");
 
     loop {
-        let entry = readdir(dir);
+        let entry = unsafe { readdir(dir) };
         if entry as u64 == 0 {
             break;
         }
-        let (cname, dtype) = sys::dirent(system, entry);
-        let name = sys::cstr(cname);
+        let (cname, dtype) = unsafe { sys::dirent(system, entry) };
+        let name = unsafe { sys::cstr(cname) };
         if ends_with(name, ".") && (name.len == 1 || name.len == 2 && name[0] == '.') {
             continue;
         }
 
         let mut path = Path::join(dir_path.bytes(), name);
         defer path.free();
-        let kind = probe(system, path.c());
+        let kind = unsafe { probe(system, path.c()) };
         // d_type is DT_UNKNOWN on file systems that do not keep it
         let is_dir = if dtype == sys::DT_UNKNOWN { kind == Kind::Dir } else { dtype == sys::DT_DIR };
 
@@ -493,19 +493,19 @@ fn serve_directory(fd: i32, system: System, dir_path: *Path, url: [u8]) {
 
 fn serve_file(fd: i32, system: System, path: *Path, size: i64) {
     // (not to wait for a writer if it is a FIFO)
-    let file = open(path.c(), O_RDONLY | sys::o_nonblock(system));
+    let file = unsafe { open(path.c(), O_RDONLY | sys::o_nonblock(system)) };
     if file < 0 {
         send_404(fd, path.bytes());
         return;
     }
-    defer close(file);
+    defer unsafe { close(file) };
 
     // (a FIFO or a device has no size)
     let length: Option<i64> = if size >= 0 { Some(size) } else { None };
     send_headers(fd, "200 OK", guess_mime(path.bytes()), length);
     let mut chunk: [u8; 8192] = [0; 8192];
     loop {
-        let n = read(file, &chunk as *u8, 8192);
+        let n = unsafe { read(file, &chunk as *u8, 8192) };
         if n <= 0 {
             break;
         }
@@ -539,9 +539,9 @@ fn parse_request(req: [u8]) -> Option<([u8], [u8])> {
 }
 
 fn handle_request(fd: i32, system: System, root: [u8]) {
-    defer close(fd);
+    defer unsafe { close(fd) };
     let mut request: [u8; 8192] = [0; 8192];
-    let n = read(fd, &request as *u8, 8191);
+    let n = unsafe { read(fd, &request as *u8, 8191) };
     if n <= 0 {
         return;
     }
@@ -563,7 +563,7 @@ fn handle_request(fd: i32, system: System, root: [u8]) {
 
     let mut path = Path::join(root, url);
     defer path.free();
-    match probe(system, path.c()) {
+    match unsafe { probe(system, path.c()) } {
         Kind::Missing => {
             eprint(" 404\n");
             send_404(fd, url);
@@ -586,7 +586,7 @@ fn handle_request(fd: i32, system: System, root: [u8]) {
             }
             let mut index = Path::join(path.bytes(), "index.html");
             defer index.free();
-            if let Kind::File(size) = probe(system, index.c()) {
+            if let Kind::File(size) = unsafe { probe(system, index.c()) } {
                 eprint(" 200 (index.html)\n");
                 serve_file(fd, system, &index, size);
                 return;
@@ -607,13 +607,13 @@ fn main(argc: i64, argv: **u8) -> i32 {
     // argv[1] made absolute, else the current directory
     let mut root_buf: [u8; 4096] = [0; 4096];
     let root_c = &root_buf as *u8;
-    if argc < 2 || realpath(argv[1], root_c) as u64 == 0 {
-        if getcwd(root_c, PATH_MAX as u64) as u64 == 0 {
+    if unsafe { argc < 2 || realpath(argv[1], root_c) as u64 == 0 } {
+        if unsafe { getcwd(root_c, PATH_MAX as u64) as u64 == 0 } {
             eprint("error: cannot get cwd\n");
             return 1;
         }
     }
-    let root = sys::cstr(root_c);
+    let root = unsafe { sys::cstr(root_c) };
 
     eprint("Serving ");
     eprint(root);
@@ -627,7 +627,7 @@ fn main(argc: i64, argv: **u8) -> i32 {
         Ok(server) => {
             eprint("Serving HTTP on http://127.0.0.1:8000/ ...\n");
             loop {
-                let fd = accept(server, 0 as *u8, 0 as *u32);
+                let fd = unsafe { accept(server, 0 as *u8, 0 as *u32) };
                 if fd >= 0 {
                     handle_request(fd, system, root);
                 }

@@ -20,7 +20,13 @@ use crate::base::{
     ERR, ERR_HELP, IntVec, RECOVER_DEPTH, SYMS, _setjmp, buf_byte, buf_bytes, buf_int, buf_new,
     buf_slice, buf_str, buf_uint, err_begin, err_end, err_help, err_help_sym, err_int, err_str,
     err_sym, error_at, exit_if_errors, grow, has_errors, intern, intern_c, recover_enter,
-    recover_leave,
+    recover_leave, report_warning,
+};
+use crate::fixunsafe::{FIX_UNSAFE, note_unsafe_site};
+use crate::traits::{
+    SYM_TRAIT, add_trait, binary_op_trait, bounded_param, bounded_param_of_type,
+    builtin_type_symbol, check_impl_signatures, collect_impls, impl_of_fn, init_traits,
+    negation_call, operator_call, require_in_bounds, std_trait, has_impl,
 };
 use crate::fiximports::report_legacy_imports;
 use crate::lexer::{
@@ -29,7 +35,8 @@ use crate::lexer::{
 };
 use crate::cimport::c_import_skip_reason;
 use crate::ast::{
-    ARM_SYNTHETIC, FN_COLD, FN_INLINE, FN_NO_INLINE, NODES, REPR_C, REPR_INT, REPR_UNION, SCRATCH,
+    ARM_SYNTHETIC, BLOCK_UNSAFE, FN_COLD, FN_INLINE, FN_NO_INLINE, FN_UNSAFE, NODES, REPR_C, REPR_INT,
+    REPR_UNION, SCRATCH,
     child, list_begin, list_end, list_push, new_node,
 };
 use crate::parser::{ITEM_PUBLIC, UNDERSCORE};
@@ -71,11 +78,19 @@ use crate::ast::NodeKind::{
     Loop, Match, MethodCall, Mod, PatBind, PatLit, PatTuple, PatVariant, PatWild, Path, Range,
     Repeat, Return, Static, Str, Struct, StructLit, Tuple, TupleField, TyArray, TyFn, TyName,
     TyNever, TyPtr, TySlice, TyTuple, TyUnit, TypeAlias, Unary, Unit, Use, VariantLit, While,
+    Impl, Trait,
 };
 
 pub enum Res { None, Local, Const, Static, Fn }
 
-struct Local { name: i64, ty: i64, mutable: bool, is_param: bool, offset: i64 }
+// `borrow` (0.9): a parameter declared with a pointer type, not `mut`: a
+// borrow of what the caller passed, dereferenced in safe code (see
+// "Unsafe code" below).
+// `tparam` (0.9): the bounded type parameter its declared type names (a
+// parameter `x: T` or `x: *T`), whose bounds its methods come from; 0.
+struct Local {
+    name: i64, ty: i64, mutable: bool, is_param: bool, offset: i64, borrow: bool, tparam: i64,
+}
 
 pub static mut LOCALS: *Local = 0 as *Local;
 pub static mut LOCAL_COUNT: i64 = 0;
@@ -144,7 +159,10 @@ pub fn pop_scope() {
 pub fn define_local(name: i64, ty: i64, mutable: bool, is_param: bool) -> i64 {
     LOCALS = grow(LOCALS, LOCAL_COUNT, &LOCAL_CAP);
     let id = LOCAL_COUNT;
-    LOCALS[id] = Local { name: name, ty: ty, mutable: mutable, is_param: is_param, offset: 0 };
+    LOCALS[id] = Local {
+        name: name, ty: ty, mutable: mutable, is_param: is_param, offset: 0, borrow: false,
+        tparam: 0,
+    };
     LOCAL_COUNT += 1;
     ENV.push(id);
     id
@@ -166,6 +184,140 @@ pub fn lookup_local(name: i64) -> Option<i64> {
     Option::None
 }
 
+// ---- Unsafe code (0.9) ----
+//
+// Safe code has no undefined behaviour; the operations that can have it
+// are allowed in unsafe code only: inside `unsafe { ... }` and in the body
+// of an `unsafe fn` (UNSAFE_DEPTH > 0). They are dereferencing, indexing
+// and slicing a raw pointer, casting an integer (other than the literal 0)
+// to a pointer, calling C (an `extern "C"` declaration or function
+// pointer), calling an `unsafe fn`, and reading a union's field.
+//
+// A *borrow* is a pointer known to point to live memory of its type: `&p`
+// for a place p, or a parameter declared with a pointer type (and not
+// `mut`), `self: *T` included. Dereferencing a borrow (`*b`, `b.f`, a
+// method through it) is safe; any other pointer is raw. So that borrowed
+// parameters can be trusted, passing a raw pointer where a function takes
+// a pointer parameter is unsafe (and so is calling through a function
+// pointer with one, or using such a function as a value).
+//
+// 0.9 reports an unsafe operation outside unsafe code as a warning
+// (`--deny-warnings`: an error; `--allow-unsafe`: nothing, for the
+// compiler's own source); 0.10 makes it an error. `--fix-unsafe` wraps
+// them in unsafe blocks (fixunsafe.tach).
+
+pub static mut ALLOW_UNSAFE: bool = false;
+pub static mut UNSAFE_DEPTH: i64 = 0;
+// The innermost statement, block tail or condition being checked: what
+// --fix-unsafe wraps (0: none).
+pub static mut WRAP_NODE: i64 = 0;
+
+// Flag of an expression whose value is not read (a place written, or
+// whose address is taken): a union's field may be written so.
+const NODE_NO_READ: i64 = 256;
+
+// The kinds of unsafe operations (a warning is reported once per position
+// and kind).
+const U_DEREF: i64 = 1;
+const U_FIELD: i64 = 2;
+const U_METHOD: i64 = 3;
+const U_INDEX: i64 = 4;
+const U_SLICE: i64 = 5;
+const U_INT_PTR: i64 = 6;
+const U_C_CALL: i64 = 7;
+const U_UNSAFE_CALL: i64 = 8;
+const U_UNION: i64 = 9;
+const U_PTR_ARG: i64 = 10;
+const U_FN_VALUE: i64 = 11;
+
+// Operation n, of kind `key`, needs unsafe code.
+fn unsafe_op(n: i64, key: i64, message: *u8) {
+    if UNSAFE_DEPTH > 0 || CONST_CONTEXT {
+        return;
+    }
+    if FIX_UNSAFE {
+        note_unsafe_site(WRAP_NODE);
+        return;
+    }
+    if ALLOW_UNSAFE {
+        return;
+    }
+    report_warning(NODES[n].start, key, c"unsafe", message,
+        c"put it in an `unsafe { ... }` block, or the function's body in an `unsafe fn` (`tachyonc --fix-unsafe` does the former; an error from 0.10)");
+}
+
+// Checks expression e (synthesized when `expected` is 0) as a unit
+// --fix-unsafe may wrap: a condition, a sequence, an arm's body.
+pub fn check_wrapped(e: i64, expected: i64) -> i64 {
+    let saved = WRAP_NODE;
+    WRAP_NODE = e;
+    let ty = if expected != 0 { check_expr(e, expected) } else { synth_expr(e) };
+    WRAP_NODE = saved;
+    ty
+}
+
+// Whether parameter node `param` is a borrow: a pointer type as written,
+// not `mut`.
+fn is_borrow_param(param: i64) -> bool {
+    NODES[param].c == 0 && NODES[param].b != 0 && NODES[NODES[param].b].kind == TyPtr
+}
+
+fn has_borrow_param(f: i64) -> bool {
+    if FNS[f].is_extern {
+        return false;
+    }
+    let item = FNS[f].node;
+    for i in 0..NODES[item].count {
+        if is_borrow_param(child(item, i)) {
+            return true;
+        }
+    }
+    false
+}
+
+// Whether expression e (checked) is a borrow.
+fn is_borrow(e: i64) -> bool {
+    let kind = NODES[e].kind;
+    if kind == Unary && NODES[e].op == Tok::Amp {
+        return true;
+    }
+    if kind == Ident && NODES[e].res == Res::Local && NODES[e].y >= 0 {
+        return LOCALS[NODES[e].y].borrow;
+    }
+    false
+}
+
+// Marks the place `target` (a chain of fields) as not read.
+fn mark_no_read(target: i64) {
+    let mut e = target;
+    while NODES[e].kind == FieldAccess || NODES[e].kind == TupleField {
+        NODES[e].p |= NODE_NO_READ;
+        e = NODES[e].a;
+    }
+}
+
+// A direct call n of function f (its arguments in n's list, from `first`
+// on for the ones written after a method's receiver): calling C or an
+// `unsafe fn`, and passing a raw pointer to a borrowed parameter, are
+// unsafe.
+fn check_call_safety(n: i64, f: i64, first: i64) {
+    if FNS[f].is_extern {
+        unsafe_op(n, U_C_CALL, c"calling a C function is unsafe");
+        return;
+    }
+    if (FNS[f].attrs & FN_UNSAFE) != 0 {
+        unsafe_op(n, U_UNSAFE_CALL, c"calling an `unsafe fn` is unsafe");
+    }
+    let item = FNS[f].node;
+    let count = if NODES[n].count < NODES[item].count { NODES[n].count } else { NODES[item].count };
+    for i in first..count {
+        let arg = child(n, i);
+        if is_borrow_param(child(item, i)) && !is_borrow(arg) {
+            unsafe_op(arg, U_PTR_ARG, c"passing a raw pointer to a pointer parameter is unsafe (the function dereferences it as a borrow): pass `&place` or a pointer parameter");
+        }
+    }
+}
+
 // ---- Declarations ----
 
 pub fn check_program(program: i64) {
@@ -173,6 +325,7 @@ pub fn check_program(program: i64) {
     SELF_TYPE_SYM = intern_c(c"Self");
     SELF_SYM = intern_c(c"self");
     init_modules();
+    init_traits();
     // The declarations, one phase after the other (see collect_phase).
     for phase in 0..PHASE_COUNT {
         collect_phase(phase);
@@ -200,7 +353,7 @@ pub fn check_program(program: i64) {
     finish_program(program);
 }
 
-const PHASE_COUNT: i64 = 12;
+const PHASE_COUNT: i64 = 14;
 
 // One phase of the declarations; its first error ends the checking (the
 // errors of function bodies, checked after, are reported together).
@@ -217,9 +370,11 @@ fn collect_phase(phase: i64) {
             5 => resolve_all_uses(),
             6 => collect_aliases(),
             7 => check_struct_cycles(),
-            8 => collect_methods(),
-            9 => collect_functions(),
-            10 => collect_statics(),
+            8 => collect_impls(),
+            9 => collect_methods(),
+            10 => collect_functions(),
+            11 => check_impl_signatures(),
+            12 => collect_statics(),
             _ => evaluate_consts(),
         }
     } else {
@@ -247,7 +402,7 @@ fn check_function_recovering(item: i64) {
 struct CheckState {
     env: i64, scopes: i64, loops: i64, module: i64, self_ty: i64, tp_base: i64, tp_count: i64,
     inst: i64, ret: i64, tscratch: i64, scratch: i64, const_context: bool,
-    defer_base: i64,
+    defer_base: i64, unsafe_depth: i64, wrap: i64,
 }
 
 fn save_check_state() -> CheckState {
@@ -255,7 +410,8 @@ fn save_check_state() -> CheckState {
         env: ENV.count, scopes: SCOPES.count, loops: LOOP_STACK.count, module: CUR_MOD,
         self_ty: SELF_TYPE, tp_base: TP_BASE, tp_count: TP_NAMES.count, inst: CUR_INST,
         ret: RETURN_TYPE, tscratch: TSCRATCH.count, scratch: SCRATCH.count,
-        const_context: CONST_CONTEXT, defer_base: DEFER_LOOP_BASE,
+        const_context: CONST_CONTEXT, defer_base: DEFER_LOOP_BASE, unsafe_depth: UNSAFE_DEPTH,
+        wrap: WRAP_NODE,
     }
 }
 
@@ -274,6 +430,8 @@ fn restore_check_state(s: CheckState) {
     TSCRATCH.count = s.tscratch;
     SCRATCH.count = s.scratch;
     CONST_CONTEXT = s.const_context;
+    UNSAFE_DEPTH = s.unsafe_depth;
+    WRAP_NODE = s.wrap;
     OR_MODE = false;
     UNIFY_SELF = 0;
 }
@@ -330,7 +488,18 @@ fn duplicate_error(item: i64, kind: *u8) -> ! {
 fn collect_names() {
     for i in 0..NODES[PROGRAM].count {
         let item = child(PROGRAM, i);
-        let kind = NODES[item].kind;
+        let mut kind = NODES[item].kind;
+        if kind == Impl {
+            continue;
+        }
+        if kind == Const && NODES[item].b != 0 && NODES[NODES[item].b].kind == TyArray {
+            // An array constant (0.9) is an immutable static: memory
+            // holding its elements.
+            NODES[item].kind = Static;
+            NODES[item].d = 0;
+            NODES[item].y = 0;
+            kind = Static;
+        }
         let name = NODES[item].a;
         let m = module_of(item);
         if MODULES[m].is_c {
@@ -356,6 +525,14 @@ fn collect_names() {
                 continue;
             }
             Use => continue,
+            Trait => {
+                if item_node_of(key) != 0 || SYM_PRIMITIVE[name] != 0 {
+                    duplicate_error(item, c"name");
+                }
+                SYM_ITEM[key] = item;
+                add_trait(item, key, m);
+                continue;
+            }
             Mod => {
                 if item_node_of(key) != 0 {
                     duplicate_error(item, c"name");
@@ -427,7 +604,7 @@ pub fn add_fn(item: i64, name: i64, display: i64) {
         self_ty: 0, export: kind == Fn && NODES[item].y != 0,
         display: display, generic: generic_count(NODES[item].g), tmpl: 0, targs: 0, targ_count: 0,
         origin: 0, parent: 0, depth: 0, module: module_of(item),
-        attrs: NODES[item].p & (FN_INLINE | FN_NO_INLINE | FN_COLD),
+        attrs: NODES[item].p & (FN_INLINE | FN_NO_INLINE | FN_COLD | FN_UNSAFE),
     };
     FN_COUNT += 1;
     NODES[item].x = FN_COUNT;
@@ -448,7 +625,10 @@ fn method_symbol(type_sym: i64, name: i64) -> i64 {
 
 // The symbol of a type with methods.
 fn type_symbol(t: i64) -> i64 {
-    if TYPES[t].kind == TyKind::Struct { STRUCTS[TYPES[t].a].sym } else { ENUMS[TYPES[t].a].sym }
+    if TYPES[t].kind == TyKind::Struct { return STRUCTS[TYPES[t].a].sym; }
+    if TYPES[t].kind == TyKind::Enum { return ENUMS[TYPES[t].a].sym; }
+    // (0.9: a trait's impl for a builtin type)
+    builtin_type_symbol(t)
 }
 
 pub fn new_enum(item: i64, name: i64, sym: i64, module: i64) -> i64 {
@@ -748,13 +928,14 @@ fn collect_methods() {
             FNS[f].display = join_sym(template_name(tpl), c"::", name);
             continue;
         }
-        if NODES[self_node].count == 0 && NODES[self_node].g == 0 && type_name_key(self_node) < 0
+        if NODES[self_node].kind == TyName && NODES[self_node].count == 0 && NODES[self_node].g == 0
+            && type_name_key(self_node) < 0
             && SYM_PRIMITIVE[NODES[self_node].a] == 0 && env_lookup(NODES[self_node].a) == 0 {
             name_error(NODES[item].start, c"impl for unknown type '", NODES[self_node].a, c"'");
         }
         let t = resolve_type(self_node);
         let kind = TYPES[t].kind;
-        if kind != TyKind::Struct && kind != TyKind::Enum {
+        if kind != TyKind::Struct && kind != TyKind::Enum && impl_of_fn(f) < 0 {
             err_begin(NODES[item].start);
             err_str(c"impl blocks are only allowed for structs and enums, not '");
             err_type(t);
@@ -1268,6 +1449,9 @@ pub fn resolve_key(key: i64, name: i64, pos: i64) -> i64 {
         return enum_type(SYM_ENUM[key] - 1);
     }
     if SYM_ALIAS[key] == 0 {
+        if SYM_TRAIT[key] != 0 {
+            name_error(pos, c"'", name, c"' is a trait, not a type (no trait objects: use a type parameter bounded by it, 'T: Trait')");
+        }
         unknown_name_error(pos, c"unknown type '", name);
     }
     resolve_alias(key, pos)
@@ -1321,10 +1505,14 @@ fn check_function(item: i64) {
         let param = child(item, i);
         if NODES[param].a != UNDERSCORE {
             NODES[param].x = define_local(NODES[param].a, fn_param(f, i), NODES[param].c != 0, true);
+            LOCALS[NODES[param].x].borrow = is_borrow_param(param);
+            LOCALS[NODES[param].x].tparam = bounded_param_of_type(NODES[param].b);
         } else {
             NODES[param].x = -1;
         }
     }
+    UNSAFE_DEPTH = if (FNS[f].attrs & FN_UNSAFE) != 0 { 1 } else { 0 };
+    WRAP_NODE = 0;
     let body = NODES[item].c;
     let body_ty = check_block(body, RETURN_TYPE);
     if body_ty != RETURN_TYPE && body_ty != TY_NEVER {
@@ -1349,6 +1537,11 @@ fn check_function(item: i64) {
 // The type of a block; `expected` (0 for none) goes to its tail.
 fn check_block(block: i64, expected: i64) -> i64 {
     push_scope();
+    let is_unsafe = (NODES[block].p & BLOCK_UNSAFE) != 0;
+    if is_unsafe {
+        UNSAFE_DEPTH += 1;
+    }
+    let saved_wrap = WRAP_NODE;
     let mut diverges = false;
     for i in 0..NODES[block].count {
         // A recovery point: after an error, on at the next statement. A
@@ -1358,6 +1551,7 @@ fn check_block(block: i64, expected: i64) -> i64 {
         let depth = RECOVER_DEPTH;
         let state = save_check_state();
         let mut result = false;
+        WRAP_NODE = stmt;
         if _setjmp(recover_enter()) == 0 {
             result = check_stmt(stmt);
         } else {
@@ -1373,7 +1567,12 @@ fn check_block(block: i64, expected: i64) -> i64 {
     let tail = NODES[block].a;
     let mut ty = TY_UNIT;
     if tail != 0 {
+        WRAP_NODE = tail;
         ty = if expected != 0 { check_expr(tail, expected) } else { synth_expr(tail) };
+    }
+    WRAP_NODE = saved_wrap;
+    if is_unsafe {
+        UNSAFE_DEPTH -= 1;
     }
     pop_scope();
     NODES[block].ty = if diverges { TY_NEVER } else { ty };
@@ -1683,7 +1882,7 @@ fn check_struct_fields(n: i64, expected: i64) -> i64 {
 }
 
 fn check_if(n: i64, expected: i64) -> i64 {
-    check_expr(NODES[n].a, TY_BOOL);
+    check_wrapped(NODES[n].a, TY_BOOL);
     let else_block = NODES[n].c;
     if else_block == 0 {
         if expected != TY_UNIT {
@@ -1932,6 +2131,9 @@ fn synth_name(n: i64) -> i64 {
         }
         NODES[n].res = Res::Fn;
         NODES[n].y = f;
+        if (FNS[f].attrs & FN_UNSAFE) != 0 || has_borrow_param(f) {
+            unsafe_op(n, U_FN_VALUE, c"using an `unsafe fn`, or a function with pointer parameters, as a value is unsafe (its callers are not checked)");
+        }
         return fn_value_type(f);
     }
     if SYM_STRUCT[key] != 0 || SYM_ENUM[key] != 0 || SYM_ALIAS[key] != 0 {
@@ -2033,6 +2235,9 @@ fn synth_cast(n: i64) -> i64 {
     if is_integer(from) && is_fieldless_enum(to) {
         return enum_cast(n, operand, from, to);
     }
+    if is_integer(from) && is_pointer(to) && !(NODES[operand].kind == Int && NODES[operand].a == 0) {
+        unsafe_op(n, U_INT_PTR, c"casting an integer to a pointer is unsafe");
+    }
     to
 }
 
@@ -2119,6 +2324,13 @@ fn synth_index(n: i64) -> i64 {
         err_end();
     }
     let index = NODES[n].b;
+    if base_kind == TyKind::Ptr {
+        if NODES[index].kind == Range {
+            unsafe_op(n, U_SLICE, c"slicing a raw pointer is unsafe");
+        } else {
+            unsafe_op(n, U_INDEX, c"indexing a raw pointer is unsafe");
+        }
+    }
     if NODES[index].kind == Range {
         // Slicing.
         if NODES[index].a != 0 {
@@ -2173,6 +2385,9 @@ fn synth_field(n: i64) -> i64 {
     if TYPES[base_ty].kind == TyKind::Ptr && TYPES[TYPES[base_ty].a].kind == TyKind::Struct {
         NODES[n].y = 1;
         base_ty = TYPES[base_ty].a;
+        if !is_borrow(NODES[n].a) {
+            unsafe_op(n, U_FIELD, c"access to a field through a raw pointer is unsafe");
+        }
     }
     if TYPES[base_ty].kind != TyKind::Struct {
         err_begin(NODES[n].start);
@@ -2200,6 +2415,9 @@ fn synth_field(n: i64) -> i64 {
         err_end();
     }
     NODES[n].x = field;
+    if (STRUCTS[s].repr & REPR_UNION) != 0 && (NODES[n].p & NODE_NO_READ) == 0 {
+        unsafe_op(n, U_UNION, c"reading a field of a union is unsafe");
+    }
     (*struct_field(s, field)).ty
 }
 
@@ -2237,10 +2455,48 @@ fn synth_array(n: i64) -> i64 {
     array_of(elem, count)
 }
 
+// Whether block b ends in a variant of a generic enum named without its
+// type arguments (`None`, `Option::None`): its type comes from context.
+fn tail_needs_context(b: i64) -> bool {
+    if NODES[b].kind != Block {
+        return false;
+    }
+    let tail = NODES[b].a;
+    if tail == 0 || NODES[tail].g != 0 {
+        return false;
+    }
+    if NODES[tail].kind == Ident {
+        if lookup_local(NODES[tail].a).is_some() {
+            return false;
+        }
+        return binding_kind(lookup_quiet(CUR_MOD, NODES[tail].a, CUR_MOD)) == B_TVARIANT;
+    }
+    if NODES[tail].kind == Path && NODES[tail].count == 0 && NODES[tail].y == 0 {
+        let b2 = lookup_quiet(CUR_MOD, NODES[tail].a, CUR_MOD);
+        return binding_kind(b2) == B_ITEM && template_of_key(binding_value(b2)) < 0;
+    }
+    false
+}
+
 fn synth_if(n: i64) -> i64 {
-    check_expr(NODES[n].a, TY_BOOL);
-    let then_ty = check_block(NODES[n].b, 0);
+    check_wrapped(NODES[n].a, TY_BOOL);
     let else_block = NODES[n].c;
+    // (0.9) `if c { None } else { Some(x) }`: the type from the other
+    // branch.
+    if else_block != 0 && NODES[else_block].kind == Block && tail_needs_context(NODES[n].b)
+        && !tail_needs_context(else_block) {
+        let else_ty = check_block(else_block, 0);
+        if else_ty != TY_NEVER {
+            check_branch(NODES[n].b, else_ty);
+            return else_ty;
+        }
+        return check_block(NODES[n].b, 0);
+    }
+    let then_ty = check_block(NODES[n].b, 0);
+    if else_block != 0 && then_ty != TY_NEVER && tail_needs_context(else_block) {
+        check_branch(else_block, then_ty);
+        return then_ty;
+    }
     if else_block == 0 {
         if then_ty != TY_UNIT && then_ty != TY_NEVER {
             type_error_got(n, c"if without else must have type '()'", then_ty);
@@ -2306,6 +2562,10 @@ fn synth_binary(n: i64) -> i64 {
         return value_ty;
     }
     let ty = synth_operands(lhs, rhs);
+    // (0.9: an operator trait's impl for the type)
+    if binary_op_trait(op, ty) >= 0 {
+        return operator_call(n, ty);
+    }
     if op == Tok::Plus || op == Tok::Minus || op == Tok::Star || op == Tok::Slash || op == Tok::Percent {
         if !is_numeric(ty) {
             type_error_got(n, c"arithmetic operator requires numeric type", ty);
@@ -2387,7 +2647,7 @@ fn synth_binary(n: i64) -> i64 {
 
 // 0 when values of type `ty` can be compared with ==, else a type in it
 // that cannot.
-fn eq_unsupported(ty: i64) -> i64 {
+pub fn eq_unsupported(ty: i64) -> i64 {
     if is_numeric(ty) || ty == TY_BOOL || is_pointer(ty) || is_fn_type(ty) || is_fieldless_enum(ty) {
         return 0;
     }
@@ -2655,6 +2915,10 @@ fn synth_unary(n: i64) -> i64 {
             ty = synth_expr(operand);
         }
         if !is_numeric(ty) {
+            let neg = std_trait(c"Neg");
+            if neg >= 0 && has_impl(neg, ty) {
+                return negation_call(n, ty);
+            }
             type_error_got(n, c"unary '-' requires numeric type", ty);
         }
         return ty;
@@ -2679,9 +2943,13 @@ fn synth_unary(n: i64) -> i64 {
             err_str(c"'");
             err_end();
         }
+        if !is_borrow(operand) {
+            unsafe_op(n, U_DEREF, c"dereference of a raw pointer is unsafe");
+        }
         return TYPES[ty].a;
     }
-    // Tok::Amp
+    // Tok::Amp: taking an address reads nothing (a union's field too).
+    mark_no_read(operand);
     let ty = synth_expr(operand);
     if !is_place(operand) {
         type_error(n, c"cannot take address of non-lvalue expression");
@@ -2815,8 +3083,15 @@ fn synth_call(n: i64) -> i64 {
         err_int(NODES[n].count);
         err_end();
     }
+    if TYPES[callee_ty].b != 0 {
+        unsafe_op(n, U_C_CALL, c"calling an extern \"C\" function pointer is unsafe");
+    }
     for i in 0..NODES[n].count {
-        check_expr(child(n, i), type_elem(callee_ty, i));
+        let arg = child(n, i);
+        check_expr(arg, type_elem(callee_ty, i));
+        if TYPES[callee_ty].b == 0 && is_pointer(type_elem(callee_ty, i)) && !is_borrow(arg) {
+            unsafe_op(arg, U_PTR_ARG, c"passing a raw pointer through a function pointer is unsafe (the function may dereference it)");
+        }
     }
     TYPES[callee_ty].a
 }
@@ -2859,6 +3134,7 @@ fn check_direct_call(n: i64, f: i64) -> i64 {
     for i in 0..params {
         check_arg(child(n, i), fn_param(f, i));
     }
+    check_call_safety(n, f, 0);
     for i in params..count {
         let arg = child(n, i);
         let ty = synth_expr(arg);
@@ -3123,6 +3399,12 @@ fn synth_path_call(n: i64, callee: i64) -> i64 {
         return synth_call(n);
     }
     let member = NODES[callee].b;
+    if NODES[callee].count == 0 && t >= 0 {
+        let bp = bounded_param(NODES[callee].a);
+        if bp != 0 {
+            require_in_bounds(bp, member, NODES[callee].start);
+        }
+    }
     if t == -1 {
         let tpl = PATH_TPL;
         if tpl < 0 && template_variant_named(-tpl - 1, member) {
@@ -3213,13 +3495,20 @@ fn synth_method(n: i64) -> i64 {
     let receiver_ty = synth_expr(receiver);
     let mut t = receiver_ty;
     let mut through_pointer = false;
-    if is_pointer(t) && (TYPES[TYPES[t].a].kind == TyKind::Struct || TYPES[TYPES[t].a].kind == TyKind::Enum) {
+    if is_pointer(t) && (TYPES[TYPES[t].a].kind == TyKind::Struct || TYPES[TYPES[t].a].kind == TyKind::Enum
+        || (method_of(t, name) < 0 && method_of(TYPES[t].a, name) >= 0)) {
         t = TYPES[t].a;
         through_pointer = true;
     }
+    // (0.9: a value of a bounded parameter's type has its bounds' methods)
+    if NODES[receiver].kind == Ident && NODES[receiver].res == Res::Local && NODES[receiver].y >= 0
+        && LOCALS[NODES[receiver].y].tparam != 0 {
+        require_in_bounds(LOCALS[NODES[receiver].y].tparam, name, NODES[n].start);
+    }
+    let f0 = method_of(t, name);
     let mut f = -1;
-    if TYPES[t].kind == TyKind::Struct || TYPES[t].kind == TyKind::Enum {
-        f = method_of(t, name);
+    if TYPES[t].kind == TyKind::Struct || TYPES[t].kind == TyKind::Enum || f0 >= 0 {
+        f = f0;
     }
     if f < 0 {
         err_begin(NODES[n].start);
@@ -3256,6 +3545,9 @@ fn synth_method(n: i64) -> i64 {
     }
     let self_ty = fn_param(f, 0);
     let mut arg = receiver;
+    if through_pointer && !is_borrow(receiver) {
+        unsafe_op(n, U_METHOD, c"calling a method through a raw pointer is unsafe");
+    }
     if self_ty == t {
         if through_pointer {
             arg = synthetic_unary(Tok::Star, receiver, t);
@@ -3309,6 +3601,7 @@ fn synth_method(n: i64) -> i64 {
     NODES[n].kind = Call;
     NODES[n].a = 0;
     NODES[n].x = f + 1;
+    check_call_safety(n, f, 1);
     FNS[f].ret
 }
 
@@ -3339,6 +3632,10 @@ fn check_assign(n: i64) {
     let op = NODES[n].op;
     let target = NODES[n].b;
     let value = NODES[n].c;
+    if op == Tok::Eq {
+        // Writing a union's field reads nothing.
+        mark_no_read(target);
+    }
     let target_ty = synth_expr(target);
     if !is_place(target) {
         let name = NODES[target].a;
@@ -3483,7 +3780,7 @@ fn check_loop(n: i64, expected: i64) -> i64 {
 }
 
 fn check_while(n: i64) -> i64 {
-    check_expr(NODES[n].b, TY_BOOL);
+    check_wrapped(NODES[n].b, TY_BOOL);
     check_loop_body(n, NODES[n].c);
     TY_UNIT
 }
@@ -3524,7 +3821,7 @@ fn check_for(n: i64) -> i64 {
 // The sequence is evaluated once; the loop keeps its label.
 fn check_for_each(n: i64) -> i64 {
     let seq = NODES[n].c;
-    let seq_ty = synth_expr(seq);
+    let seq_ty = check_wrapped(seq, 0);
     let kind = TYPES[seq_ty].kind;
     if kind != TyKind::Slice && kind != TyKind::Array {
         type_error_got(seq, c"'for' loops iterate over integer ranges ('a..b'), slices and arrays", seq_ty);

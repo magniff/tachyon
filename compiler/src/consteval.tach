@@ -3,7 +3,7 @@
 // wrapped to their type (sign-extended when signed), floats as the bits of
 // an f64 (rounded to f32 first for f32), bools as 0 or 1.
 
-use crate::base::{BUFS, buf_reserve, memset};
+use crate::base::{BUFS, IntVec, buf_reserve, memset};
 use crate::lexer::Tok;
 use crate::ast::{NODES, NodeKind, child};
 use crate::modules::{CUR_MOD, module_of};
@@ -304,13 +304,32 @@ fn float_to_int(value: f64, to: i64) -> i64 {
 // ---- Aggregate constants (the initializers of statics) ----
 
 // Appends the bytes of the constant `n` of type `ty` to buffer `out`.
+// The addresses in the last const_emit's bytes (0.9): (offset, string
+// id) pairs, each 8 bytes holding the address of a string literal's
+// bytes (a `[u8]` literal's pointer, or a `c"..."`).
+pub static mut CONST_RELOCS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
 pub fn const_emit(n: i64, ty: i64, out: i64) {
+    CONST_RELOCS.count = 0;
     let at = BUFS[out].len;
     let size = type_size(ty);
     buf_reserve(out, size);
     memset(&BUFS[out].data[at], 0, size as u64);
     BUFS[out].len += size;
     const_write(n, ty, out, at);
+    // (by offset: a struct's fields are not in their order)
+    let count = CONST_RELOCS.count / 2;
+    for i in 1..count {
+        let mut j = i;
+        while j > 0 && CONST_RELOCS.data[2 * j] < CONST_RELOCS.data[2 * (j - 1)] {
+            for k in 0..2 {
+                let t = CONST_RELOCS.data[2 * j + k];
+                CONST_RELOCS.data[2 * j + k] = CONST_RELOCS.data[2 * (j - 1) + k];
+                CONST_RELOCS.data[2 * (j - 1) + k] = t;
+            }
+            j -= 1;
+        }
+    }
 }
 
 fn const_write(n: i64, ty: i64, out: i64, at: i64) {
@@ -335,6 +354,17 @@ fn const_write(n: i64, ty: i64, out: i64, at: i64) {
                 let value = if NODES[n].kind == NodeKind::Array { child(n, i) } else { NODES[n].a };
                 const_write(value, elem, out, at + i * elem_size);
             }
+        }
+        NodeKind::Str => {
+            // A string literal in an aggregate (0.9): its address, then
+            // its length.
+            CONST_RELOCS.push(at);
+            CONST_RELOCS.push(NODES[n].a);
+            write_scalar(out, at + 8, crate::lexer::STRS[NODES[n].a].len as i64, TY_I64);
+        }
+        NodeKind::CStr if is_pointer(ty) => {
+            CONST_RELOCS.push(at);
+            CONST_RELOCS.push(NODES[n].a);
         }
         NodeKind::VariantLit if is_compound(ty) => {
             let v = NODES[n].a;

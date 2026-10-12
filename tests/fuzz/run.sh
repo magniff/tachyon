@@ -90,7 +90,7 @@ test_seed() {
             "$SEED" build --target "$SEED_TARGET" "$exe.tach" -o "$exe" >"$exe.log" 2>&1 \
                 || { why="the seed failed to compile it"; break; }
         else
-            "$COMPILER" --target "$TARGET" "-$level" --verify-ir "$program" -o "$exe.o" >"$exe.log" 2>&1 \
+            "$COMPILER" --target "$TARGET" "-$level" --deny-warnings --verify-ir "$program" -o "$exe.o" >"$exe.log" 2>&1 \
                 || { why="-$level failed to compile it: $(head -3 "$exe.log")"; break; }
             # shellcheck disable=SC2086
             "$CC" $ARCH -o "$exe" "$exe.o" >>"$exe.log" 2>&1 || { why="-$level: cc failed"; break; }

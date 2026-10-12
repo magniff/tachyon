@@ -39,12 +39,12 @@ tuple index, so `t.0.1` is `(t.0).1`. A literal must not be followed
 directly by other letters (`3e` and `1foo` are errors).
 
 **Keywords:** `as break const continue defer else enum extern false fn for
-if impl import in let loop match mod mut pub return static struct true type
-union use while` (`import` and `use` since 0.4, `pub` and `mod` since 0.5,
-`defer` since 0.6).
+if impl import in let loop match mod mut pub return static struct trait true
+type union unsafe use while` (`import` and `use` since 0.4, `pub` and `mod`
+since 0.5, `defer` since 0.6, `unsafe` and `trait` since 0.9).
 
-**Reserved** (an error if used): the keywords `trait where unsafe dyn
-move`, and the tokens `?` `@`. `self` and `Self` are
+**Reserved** (an error if used): the keywords `where dyn move`, and the
+tokens `?` `@`. `self` and `Self` are
 ordinary names, with a meaning in methods (see Items).
 
 A token is *joint* when no whitespace follows it.
@@ -60,7 +60,7 @@ item         = [ "pub" ] [ attributes ] [ "pub" ]       (* (0.6) attributes may 
                ( fn_decl | extern_item | struct_decl | union_decl | enum_decl
              | const_decl | static_decl | type_alias
              | import_item | use_item | mod_item )      (* pub, mod: (0.5); import, use: (0.4) *)
-             | impl_block ;
+             | impl_block | trait_decl ;             (* trait, impl Trait for: (0.9) *)
 import_item  = "import" string_lit "as" ident ";" ;     (* (0.4) a C header, see "Importing C headers"; as: (0.5), required (0.8) *)
 use_item     = "use" path "::" "{" use_name { "," use_name } [ "," ] "}" ";"
              | "use" path "::" use_name ";" ;          (* (0.4) variants of an enum; (0.5) paths, as; no "*" (0.8) *)
@@ -69,8 +69,10 @@ mod_item     = "mod" ident ";"                         (* (0.5) the module in id
              | "mod" ident "{" { item } "}" ;          (* (0.6) an inline module *)
 path         = ident { "::" ident } ;                  (* crate, self, super, std, modules, an enum *)
 
-fn_decl      = "fn" ident [ generics ] "(" [ params ] ")" [ "->" type ] block ;
-generics     = "<" ident { "," ident } [ "," ] ">" ;  (* (0.5) type parameters, see "Generics" *)
+fn_decl      = [ "unsafe" ] "fn" ident [ generics ] "(" [ params ] ")" [ "->" type ] block ;
+                                                       (* unsafe: (0.9), see "Unsafe code" *)
+generics     = "<" tparam { "," tparam } [ "," ] ">" ;  (* (0.5) type parameters, see "Generics" *)
+tparam       = ident [ ":" path { "+" path } ] ;       (* bounds: (0.9), see "Traits" *)
 params       = param { "," param } [ "," ] ;
 param        = [ "mut" ] ident ":" type ;              (* "_" ignores the argument *)
 
@@ -93,7 +95,9 @@ union_decl   = "union" ident "{" [ field { "," field } [ "," ] ] "}" ;   (* (0.3
 field        = [ "pub" ] ident ":" type ;              (* pub (0.5): fields are as visible as their struct *)
 enum_decl    = "enum" ident [ generics ] "{" [ variant { "," variant } [ "," ] ] "}" ;   (* (0.3) *)
 variant      = ident [ "(" type { "," type } [ "," ] ")" ] [ "=" expr ] ;  (* "=": fieldless enums only *)
-impl_block   = "impl" [ generics ] type "{" { [ attributes ] [ "pub" ] fn_decl } "}" ;   (* (0.3); generics, a type with arguments: (0.5) *)
+impl_block   = "impl" [ generics ] [ path "for" ] type "{" { [ attributes ] [ "pub" ] fn_decl } "}" ;
+                                                       (* (0.3); generics, a type with arguments: (0.5); a trait's: (0.9) *)
+trait_decl   = "trait" ident "{" { [ attributes ] [ "unsafe" ] "fn" ident [ generics ] "(" [ params ] ")" [ "->" type ] ( ";" | block ) } "}" ;
 
 const_decl   = "const" ident ":" type "=" expr ";" ;   (* integer, float, bool, fieldless enum (0.4) or C string (0.4) *)
 static_decl  = "static" [ "mut" ] ident ":" type "=" expr ";" ;   (* constant initializer *)
@@ -168,7 +172,8 @@ stmt        = ";"                                      (* empty statement *)
             | "defer" ( block [ ";" ] | expr ";" )    (* (0.6) *)
             | block_like [ ";" ]
             | expr ";" ;
-block_like  = block | if_expr | match_expr | loop_expr | while_expr | for_expr ;
+block_like  = block | "unsafe" block | if_expr | match_expr | loop_expr | while_expr | for_expr ;
+                                                       (* unsafe block: (0.9) *)
 ```
 
 **Statement rule.** A statement that *starts* with a block-like expression
@@ -181,7 +186,7 @@ block's value.
 Bindings are immutable unless declared `mut`; this covers assignment to the
 variable and to its fields and elements. Raw pointers are unchecked, as in
 C: `*p = v` and `p[i] = v` need no `mut`, and `&x` may be taken of an
-immutable `x`.
+immutable `x`; using a raw pointer is unsafe code (0.9, see "Unsafe code").
 
 ## Expressions
 
@@ -259,9 +264,9 @@ The principle: a tachyon program means one thing, the same at every
 optimization level and on every target, so that it can be reasoned about
 (by people and by agents) from what it says. Where C leaves behaviour
 undefined, tachyon defines it, or checks it and stops with a message.
-The aim is no undefined behaviour at all in code that does not opt out of
-the checks; the operations below that are still undefined all involve raw
-pointers or C, and move behind an `unsafe` boundary in 0.9.
+Since 0.9 there is none at all in safe code: the operations that can
+have it (all of them through raw pointers, unions or C) are allowed only
+in unsafe code, `unsafe { ... }` and `unsafe fn`.
 
 **Defined** (each case checked at -O0 and -O2, on AArch64 and x86-64, at
 run time and in constant folding, which agree):
@@ -301,38 +306,59 @@ run time and in constant folding, which agree):
   the program (a guard page); it never corrupts memory. It is not yet a
   panic with a message.
 
-**Still undefined** (all of it through raw pointers or C):
+**Safe code has no undefined behaviour** *(0.9)*. Everything that can
+have undefined behaviour is an *unsafe operation*, allowed only in unsafe
+code: inside an `unsafe { ... }` block or the body of an `unsafe fn` (see
+"Unsafe code" below for the rules, including borrowed pointer
+parameters). The unsafe operations, and what they promise:
 
-- Dereferencing a raw pointer (`*p`, `p[i]`, `p.f` through a pointer)
+- Dereferencing a raw pointer (`*p`, `p.f`, a method called through `p`)
   that does not point to live memory of its type and alignment: null,
   dangling (freed, or a returned local's address), out of bounds or
-  misaligned. Raw-pointer indexing `p[i]` is unchecked by design: a
-  pointer has no length.
-- Slicing a raw pointer (`p[lo..hi]`): the slice is only as valid as the
-  memory behind it.
-- Pointer arithmetic and casts: an integer cast to a pointer, a pointer
-  to one type used as another beyond the memory it points to.
-- Using an array or slice whose storage was moved or freed during the
-  expression that uses it: `a[f()]` reads the raw pointer `a` before
-  calling `f`; if `f` reallocates it, the access is through a dangling
-  pointer.
-- Reading memory nobody wrote (from `malloc`, or the padding of a struct
-  read as bytes): the value is unspecified, and the optimizer may assume
-  any value for it.
-- Calling C: everything C leaves undefined stays so (including a
-  declaration in an `extern "C"` block that does not match the C
-  definition, and `longjmp` past frames that need cleanup).
-- Calling a function pointer made from an integer or from a pointer of
-  another type.
+  misaligned. A *borrow* (`&place`, or a pointer parameter) is not a raw
+  pointer: dereferencing it is safe.
+- Indexing a raw pointer, `p[i]` (unchecked by design: a pointer has no
+  length), and slicing one, `p[lo..hi]` (the slice is only as valid as
+  the memory behind it).
+- Casting an integer to a pointer (other than the literal `0`, a null
+  pointer, which safe code cannot dereference). Pointer-to-pointer and
+  pointer-to-integer casts are safe; tachyon has no pointer arithmetic
+  (cast to an integer and back, in unsafe code).
+- Calling C: an `extern "C"` declaration (also the ones `import` makes)
+  or an `extern "C" fn` pointer. Everything C leaves undefined stays so
+  (including a declaration that does not match the C definition, and
+  `longjmp` past frames that need cleanup).
+- Calling an `unsafe fn`, whose contract the caller keeps.
+- Reading a field of a union (its bytes, reinterpreted). Writing one, and
+  taking its address, are safe.
+- Passing a pointer that is not a borrow to a function's pointer
+  parameter (which the function dereferences as a borrow), calling a
+  plain function pointer with one, and using an `unsafe fn` or a function
+  with pointer parameters as a value.
 
-**The plan.** 0.9 introduces `unsafe` blocks and `unsafe fn`: every
-operation in the second list (raw-pointer dereference, indexing,
-slicing, arithmetic and casts, calls to `extern "C"` functions and
-through pointers made from integers) is allowed only inside them, and
-safe code (the rest of the language, std's safe API) has no undefined
-behaviour. Reading uninitialized heap memory goes away with a std
-allocator that zeroes (or a `freeze`), and stack exhaustion becomes a
-panic with a message.
+What unsafe code must keep, so that the safe code around it stays
+defined, is the same list: every pointer it hands to safe code as a
+borrow points to live memory of its type, and every slice it makes is
+valid for its length while it is used. The same holds for memory a
+slice views: a slice of an array is valid while the array lives, and one
+from `Vec::as_slice` until the vector grows or is freed (tachyon has no
+lifetimes; using a view after its storage is gone is the one way safe
+code can still reach undefined behaviour, and std's types assume their
+fields are changed by their methods only, as tachyon has no private
+fields yet).
+
+Reading memory nobody wrote (from `malloc`, or a struct's padding read as
+bytes, both through raw pointers) gives an unspecified value, which the
+optimizer may take to be any value. Statics, `static mut` included, are
+safe to use: tachyon has no threads of its own (threads started through
+C are C's business). Runaway recursion still exhausts the stack, which
+the operating system stops (a guard page) without corrupting memory.
+
+**Transition.** In 0.9 an unsafe operation outside unsafe code is a
+*warning* (`warning[unsafe]`; `--deny-warnings` makes it an error); in
+0.10 it is an error. `tachyonc --fix-unsafe` wraps the operations in
+unsafe blocks. The compiler's own source, built by 0.8.0, migrates in
+0.10; until then the bootstrap builds it with `--allow-unsafe`.
 
 ## Layout, conventions and C
 
@@ -487,8 +513,8 @@ it is written (as in C++ and Zig: there are no bounds; `a > b` is checked
 for each `T` it is used with). Each instantiation with new type arguments
 makes a separate function, struct or enum (*monomorphization*): no boxing,
 no dynamic dispatch, and every optimization applies to the instance.
-Bounded generics (traits) may come later, as a refinement: a program that
-compiles today will keep its meaning.
+Bounded generics (traits) came in 0.9 as a refinement (see "Traits"): a
+program that compiled before keeps its meaning.
 
 Type arguments are written after a type's name (`Vec<i64>`, `Option<*u8>`)
 and, in expressions, after `::` (the "turbofish"): `max::<u8>(a, b)`,
@@ -678,7 +704,8 @@ later). Gone:
   a path names a variant, import the constant by name: `use c::EOF;`.
 
 The prelude stays: a fixed, documented list of names (`Option`, `Some`,
-`None`, `Result`, `Ok`, `Err`, `Vec`, `print`, `println`), not a wildcard.
+`None`, `Result`, `Ok`, `Err`, `Vec`, `print`, `println`), not a wildcard. (0.9 adds
+the traits `Add`, `Sub`, `Mul`, `Div`, `Neg`, `Eq`, `Ord` and `Hash`.)
 
 The errors for the removed forms name their replacement, from what the
 program uses through them: `wildcard imports are not allowed: write 'use
@@ -705,6 +732,178 @@ A program the tool cannot rewrite is one 0.7 rejects as well (a name two
 `*` imports bring, for instance); then it reports the errors and changes
 nothing. A second run finds nothing to do.
 
+## Additions of 0.9
+
+### Unsafe code
+
+```ebnf
+fn_decl      = [ "unsafe" ] "fn" ident ... ;          (* also in impl blocks, after pub and attributes *)
+unsafe_block = "unsafe" block ;                        (* an expression, block-like *)
+```
+
+An `unsafe { ... }` block is a block whose statements are *unsafe code*:
+the operations listed in "Undefined behaviour" (dereferencing, indexing
+and slicing raw pointers, integer-to-pointer casts, calling C or an
+`unsafe fn`, reading a union's field, passing raw pointers where
+borrows are expected) are allowed in it. Like any block, it is an
+expression (`let x = unsafe { *p };`) and a block-like statement. The
+body of an `unsafe fn` is unsafe code; calling one is an unsafe
+operation, so its callers take on its contract (document it next to the
+function). Nesting changes nothing: unsafe code inside unsafe code.
+
+```
+extern "C" { fn strlen(s: *u8) -> u64; }
+
+// The caller promises a NUL-terminated string.
+unsafe fn length(s: *u8) -> i64 { strlen(s) as i64 }
+
+fn main() -> i32 {
+    let n = unsafe { length(c"four") };
+    n as i32
+}
+```
+
+**Borrows.** Tachyon has raw pointers only, and methods take
+`self: *T`; to keep ordinary code safe, a pointer known to be valid is a
+*borrow*:
+
+- `&place` (the address of a local, a static, a field or a checked
+  element), and the receiver a method call takes that way (`v.push(1)`);
+- a parameter declared with a pointer type and not `mut`, `self: *T`
+  included.
+
+Dereferencing a borrow (`*p`, `p.f`, `p.m()`) is safe; indexing it
+(`p[i]`) is not (a borrow is one value, not an array). In exchange, a
+call passing something other than a borrow to a pointer parameter (a
+pointer field, a local holding a pointer, `malloc`'s result, `c"..."`,
+which is read-only memory) is unsafe: the caller vouches for it. A
+parameter of a generic type (`x: T`) is not a borrow, even when `T` is a
+pointer, so `Vec<*u8>::push(c"text")` is safe. A plain function pointer
+does not say whether its function borrows: calling one with a pointer
+argument that is not a borrow is unsafe, and so is making a function
+with pointer parameters into a value (`let f = add_one;`).
+
+**Diagnostics.** An unsafe operation outside unsafe code is reported as
+`warning[unsafe]` (each place once, at most 50, in source order); the
+program still compiles. Options:
+
+- `--deny-warnings`: warnings are errors (`error[unsafe]`); the test suite
+  compiles every case so.
+- `--allow-unsafe`: no unsafe warnings at all. The bootstrap passes it
+  (interface `tachyonc-0.9` in `bootstrap/releases.toml`) when it builds
+  the compiler's own source, which 0.8.0 compiles and which uses raw
+  pointers everywhere; releases before 0.9 are built as before.
+- `tachyonc --fix-unsafe FILE...`: rewrites the program in place, putting
+  each unsafe operation outside unsafe code in an unsafe block: the
+  statement around it (consecutive statements share one block), a
+  `let`'s value, a condition, a match arm or a block's tail. Nothing else
+  changes; a second run finds nothing to do.
+
+In 0.10 the warning becomes an error (and the compiler's source is
+migrated with `--fix-unsafe`).
+
+**std.** `panic`, `Buf::push_cstr` and `print_cstr` take C strings, which
+must end with a NUL: they are `unsafe fn` now (breaking). Everything else
+in std is safe and uses unsafe blocks inside.
+
+### Traits
+
+```
+trait Shape {
+    fn area(self: *Self) -> i64;
+    fn describe(self: *Self) {            // a default
+        print("area ");
+        std::print_int(self.area());
+    }
+}
+
+struct Square { side: i64 }
+
+impl Shape for Square {
+    fn area(self: *Square) -> i64 { self.side * self.side }
+}
+
+fn total<T: Shape>(items: [T]) -> i64 { ... }   // bounds
+struct Map<K: Hash + Eq, V> { ... }              // on structs and enums too
+impl<T: Hash> Hash for Pair<T> { ... }           // a generic impl, with bounds
+```
+
+A **trait** declares functions, with `Self` standing for the implementing
+type; a function may have a default body. An **impl** `impl Trait for
+Type { ... }` defines them for a type, any type (`impl Hash for i64`,
+`impl Eq for [u8]`): its functions become the type's methods and
+associated functions, in one namespace with the type's own (a name may
+not be defined twice), and visible wherever the trait is. A function the
+impl leaves out is the trait's default, copied into the impl and checked
+there (in the impl's module, with `Self` the impl's type); one without a
+default must be written. Each function of an impl must be one of the
+trait's, with the trait's signature (`Self` replaced by the type). A
+generic impl, `impl<T: Hash> Hash for Pair<T>`, is for a generic struct or
+enum with the impl's parameters as its arguments, and covers each
+instance whose arguments satisfy its bounds.
+
+**Coherence.** There is at most one impl per trait and type (a generic
+impl counts for all its instances); a second one is an error.
+
+**Bounds.** A type parameter may be bounded, `T: Hash + Eq`, on functions,
+impl blocks, structs and enums. Each instance's type arguments must
+implement the bounds (`the trait 'Hash' is not implemented for 'Thing'`,
+naming the bound). Generic code is still checked per instance (as in
+0.5), and a parameter's bounds also limit it: a function called on a
+value declared with a bounded parameter's type (`x: T`, `p: *T`) or as
+`T::f(...)` must be one of the bounds' (`no function 'hash' in the bounds
+of 'T'`). Unbounded parameters keep 0.5's meaning, so no program written
+for 0.5 to 0.8 changes. Dispatch is static (monomorphization); there are
+no trait objects: a trait is not a type (`dyn` stays reserved), nor are
+there supertraits, associated types or generic traits yet.
+
+**Operators** go through std's traits, in the prelude: `a + b`, `a - b`,
+`a * b`, `a / b` call `add`, `sub`, `mul`, `div` (`Add`, `Sub`, `Mul`,
+`Div`: `fn add(self: Self, other: Self) -> Self`), `-a` calls `neg`
+(`Neg`), `a == b` and `a != b` call `eq(&a, &b)` (`Eq`: `fn eq(self:
+*Self, other: *Self) -> bool`), and `<`, `<=`, `>`, `>=` compare `cmp`'s
+result with 0 (`Ord`: `fn cmp(self: *Self, other: *Self) -> i64`,
+negative, zero or positive). Each operand is evaluated once, left to
+right. A type's own impl takes precedence over 0.6's structural `==`
+(for structs, enums, tuples, arrays and slices); the builtin scalars
+(numbers, `bool`, pointers, functions) always keep their own operators.
+Builtin types implement the operator traits intrinsically, for bounds:
+numbers all of them, every type with `==` `Eq`, numbers, pointers and
+fieldless enums `Ord`. Compound assignment (`+=`) stays numeric.
+
+**std** (0.9): the traits `Add`, `Sub`, `Mul`, `Div`, `Neg`, `Eq`, `Ord`,
+`Hash` (`fn hash(self: *Self) -> u64`), in the prelude; impls of `Eq`,
+`Ord` and `Hash` for the integer types, `bool` and `[u8]` (byte strings:
+by bytes, lexicographically, FNV-1a); `sort<T: Ord>(s: [T])` (in place,
+a heapsort, not stable); and `HashMap<K: Hash + Eq, V>` (open addressing
+with linear probing): `new`, `insert` (returns the old value),
+`get`, `contains`, `remove`, `len`, `is_empty`, `free`, and iteration by
+slot: `slots()`, `key_at(i)` and `value_at(i)` (`None` for an empty
+slot).
+
+### Smaller changes
+
+- **Array constants**: `const PRIMES: [i64; 4] = [2, 3, 5, 7];` (elements
+  are constant expressions, other constants included). An array constant
+  is an immutable static: memory holding its elements, indexed like any
+  array (it is not usable where an integer constant is needed, nor in a
+  pattern).
+- **Strings in constant aggregates**: a static's initializer may hold
+  string literals (`[u8]`) and C strings inside structs, tuples and
+  arrays (`static OPS: [Op; 2] = [Op { name: "add", ... }, ...];`); their
+  addresses are relocated when the program loads.
+- **Line continuation**: in a string literal (`"..."` or `c"..."`), a
+  backslash at the end of a line leaves out the line break and the next
+  line's leading whitespace (spaces, tabs and further line breaks), as in
+  Rust.
+- **`if` and generic variants**: `if c { Some(x) } else { None }` (either
+  way round, and for any generic enum's variant named without type
+  arguments) takes its type from the other branch.
+- **Importing C headers when cross-compiling** (see below): `$TACHYON_CC`
+  may name a C compiler for another system, e.g. `TACHYON_CC="clang
+  --target=x86_64-linux-gnu --sysroot=DIR"` on macOS for `--target
+  x86_64-linux`; without it, the error says so.
+
 ## Importing C headers
 
 `import "stdio.h" as c;` *(0.4; `as`: 0.5, required since 0.8)* reads a C
@@ -715,7 +914,12 @@ imports of a program are read as one translation unit, as the target's C
 compiler reads them: its predefined macros and its include path come
 from `cc -dM -E -v` (`$TACHYON_CC` instead of `cc`), so headers need the
 target's C compiler on the host (a macOS host for both macOS targets, an
-x86-64 Linux host for `x86_64-linux`).
+x86-64 Linux host for `x86_64-linux`), unless `$TACHYON_CC` names a C
+compiler for the target (0.9: `clang --target=x86_64-linux-gnu
+--sysroot=DIR` with a Linux system's headers in DIR, or a cross gcc),
+which is then trusted for its headers and predefined macros. Another
+way: `tachyonc --emit-imports` on a host of the target's system writes
+the declarations as tachyon source, to use in place of the `import`.
 
 What a header declares becomes tachyon declarations
 (`tachyonc --emit-imports file.tach -o decls.tach` shows them):

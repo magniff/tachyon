@@ -8,7 +8,9 @@
 #   }
 #   extern "C" { fn exit(c: i32) -> !; }    extern fn exit(c: i32) -> !;
 #
-# Used to give the seed the benchmarks and the random programs.
+# Used to give the seed the benchmarks and the random programs. Unsafe
+# blocks (0.9) become plain blocks, `unsafe fn` plain functions.
+{ gsub(/unsafe \{/, "{"); gsub(/unsafe fn /, "fn ") }
 /^extern "C" \{ *fn .*; *\}$/ {
     sub(/^extern "C" \{ */, "extern ")
     sub(/ *\}$/, "")

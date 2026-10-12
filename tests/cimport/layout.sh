@@ -50,7 +50,8 @@ BEGIN {
     for (i = 1; i <= n; i++) print "#include <" hs[i] ">" > cfile
     print "#include <stdio.h>\n#include <stddef.h>\nint main(void) {" > cfile
     for (i = 1; i <= n; i++) print "import \"" hs[i] "\" as c;" > tfile
-    print "import \"stdio.h\" as c;\nfn main() -> i32 {" > tfile
+    # (0.9: raw pointers and C calls: unsafe code)
+    print "import \"stdio.h\" as c;\nfn main() -> i32 {\nunsafe {" > tfile
 }
 /^\/\/ C: / { pending = substr($0, 7); next }
 /^#\[repr/ { next }
@@ -83,7 +84,7 @@ active && /^\}$/ {
 { if (!active) pending = "" }
 END {
     print "    return 0;\n}" > cfile
-    print "    0\n}" > tfile
+    print "    0\n}\n}" > tfile
     print records + 0, nfields + 0 > "/dev/stderr"
 }
 ' "$dir/imp.out" 2> "$dir/counts"
@@ -91,7 +92,7 @@ END {
 # shellcheck disable=SC2086
 cc $arch $incs -o "$dir/c" "$dir/check.c"
 # shellcheck disable=SC2086
-"$compiler" $tflag $incs "$dir/check.tach" -o "$dir/t.o"
+"$compiler" $tflag $incs --deny-warnings "$dir/check.tach" -o "$dir/t.o"
 # shellcheck disable=SC2086
 cc $arch -o "$dir/t" "$dir/t.o" -lm
 "$dir/c" > "$dir/c.out"
