@@ -13,7 +13,16 @@ x86_64-linux:
 - the random-program differential tester (`-O0` vs every level, the seed as
   a third oracle) finds no mismatch;
 - output is deterministic and host-independent;
-- `bench/` results are recorded in this file.
+- `bench/` results are recorded in this file;
+- compile times are recorded in this file (the compiler building itself
+  at `-O0` and `-O2`, and end to end to an executable), and any regression
+  against the previous release is explained or fixed.
+
+Priorities, in order: correctness (the gate above); exact C interop where
+it is asked for; **compilation speed**, as fast as possible at every
+level, measured every release; then the speed of the generated code.
+Compilation speed is weighed in every design: an optimization has to pay
+for its compile time.
 
 The reference points: **Cranelift** does SSA, e-graph-based rewriting
 (GVN, constant folding, algebraic simplification, LICM, redundant load
@@ -275,6 +284,13 @@ library (and reports several errors at once while it is written).
     expressions)
 
 ## 0.7: equality saturation
+
+Compilation speed: object files written directly (Mach-O for macOS, ELF
+for Linux, both targets): an instruction encoder and the relocations, symbol
+tables and sections each format needs, so `cc` only links. `--emit-asm`
+stays, and the object files are checked against `cc`'s assembly of the
+same text, section by section. The system assembler took 2.4 s of the
+compiler's 3 s self-build in 0.6.
 
 Language: traits (bounded generics), which a generic hash map and
 operator overloading need; adding bounds does not change what programs
