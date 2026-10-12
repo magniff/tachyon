@@ -1,5 +1,6 @@
 // `tachyonc --fix-imports FILE...` (0.8): rewrites a program written for
-// 0.7 or earlier, in place, into the imports 0.8 allows.
+// 0.7 or earlier, in place, into the imports 0.8 allows; and the errors
+// for the forms 0.8 removed, which name what replaces them.
 //
 //   - `use a::b::*;` and `use E::*;` become `use a::b::{x, y};` (or `use
 //     a::b::x;`), listing the names the program finds through that `*`
@@ -13,9 +14,17 @@
 // file of the program (its modules' files too) is rewritten; the rest of
 // the text is left as it is.
 
-use crate::base::{FILES, FILE_COUNT, IntVec, SRC, STDOUT, SYMS, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, buf_write_fd, buf_write_file, intern_c};
+use crate::base::{
+    ERR, ERR_KIND, FILES, FILE_COUNT, IntVec, RECOVER_DEPTH, SRC, STDOUT, SYMS, _setjmp, buf_byte, buf_bytes,
+    buf_new, buf_slice, buf_str, buf_write_fd, buf_write_file, err_begin, err_end, err_help,
+    err_str, err_sym, intern_c, recover_enter, recover_leave,
+};
 use crate::ast::NODES;
-use crate::modules::{B_MODULE, B_NONE, C_BY_NAME, C_MODULE, C_QUALS, GLOB_USES, STD_MODULE, binding, file_of_pos, glob_name_qualified, lookup_quiet, use_entry_count, use_entry_glob, use_entry_module, use_entry_node};
+use crate::modules::{
+    B_MODULE, B_NONE, C_BY_NAME, C_MODULE, C_QUALS, GLOB_USES, LEGACY_IMPORTS, STD_MODULE, binding,
+    file_of_pos, glob_name_qualified, lookup_quiet, use_entry_count, use_entry_glob,
+    use_entry_module, use_entry_node,
+};
 
 pub static mut FIX_IMPORTS: bool = false;
 
@@ -142,11 +151,7 @@ fn add_edit(edits: *IntVec, pos: i64, del: i64, text: i64) {
 // The edit for `*` entry u: its list of names, or its removal.
 fn glob_edit(u: i64, alias: i64, edits: *IntVec) {
     let n = use_entry_node(u);
-    let path = NODES[n].c;
-    let mut star = NODES[path].end;
-    while SRC[star] != '*' {
-        star += 1;
-    }
+    let star = star_of(n);
     let mut names = IntVec { data: 0 as *i64, count: 0, cap: 0 };
     glob_names(u, alias, &names);
     let start = line_start(n_start(n));
@@ -209,6 +214,15 @@ fn glob_edit(u: i64, alias: i64, edits: *IntVec) {
     buf_bytes(long, SRC[start..indent]);
     buf_byte(long, '}');
     add_edit(edits, star, 1, long);
+}
+
+// The position of the `*` of Use node n.
+fn star_of(n: i64) -> i64 {
+    let mut star = NODES[NODES[n].c].end;
+    while SRC[star] != '*' {
+        star += 1;
+    }
+    star
 }
 
 // Where the item of Use node n starts (its `pub`, if any).
@@ -332,4 +346,93 @@ pub fn fix_imports() -> i64 {
         changed += 1;
     }
     changed
+}
+
+// ---- The errors for the removed forms (0.8) ----
+
+static mut LEGACY_REPORTED: bool = false;
+
+// One error for each `*` import and plain header import of the program
+// (not under --fix-imports), once. When the function bodies were checked
+// (`complete`), the error names what the program uses through it.
+pub fn report_legacy_imports(complete: bool) {
+    if !LEGACY_IMPORTS || FIX_IMPORTS || LEGACY_REPORTED {
+        return;
+    }
+    LEGACY_REPORTED = true;
+    let kind = ERR_KIND;
+    ERR_KIND = c"module error";
+    for u in 0..use_entry_count() {
+        if use_entry_glob(u) {
+            report_recovering(u, complete);
+        }
+    }
+    ERR_KIND = kind;
+}
+
+fn report_recovering(u: i64, complete: bool) {
+    let depth = RECOVER_DEPTH;
+    if _setjmp(recover_enter()) == 0 {
+        legacy_error(u, complete);
+    }
+    recover_leave(depth);
+}
+
+// The most names an error lists.
+const LISTED_NAMES: i64 = 8;
+
+fn legacy_error(u: i64, complete: bool) {
+    let alias = intern_c(c"c");
+    let n = use_entry_node(u);
+    err_begin(NODES[n].start);
+    if is_plain_import(u) {
+        err_str(c"importing every declaration of a header is not allowed: write '");
+        buf_bytes(ERR, SRC[NODES[n].start..NODES[n].end - 1]);
+        err_str(c" as c;' and 'c::");
+        let mut example = -1;
+        let mut i = 0;
+        while i < C_QUALS.count && example < 0 {
+            if C_QUALS.data[i + 1] == u {
+                example = C_QUALS.data[i + 2];
+            }
+            i += 3;
+        }
+        if example >= 0 {
+            err_sym(example);
+        } else {
+            err_str(c"name");
+        }
+        err_str(c"'");
+    } else {
+        let mut names = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        glob_names(u, alias, &names);
+        if complete && names.count == 0 {
+            err_str(c"wildcard imports are not allowed, and nothing is used through this one: remove it");
+        } else {
+            err_str(c"wildcard imports are not allowed: write '");
+            buf_bytes(ERR, SRC[NODES[n].start..star_of(n)]);
+            if !complete {
+                err_str(c"{...}");
+            } else if names.count == 1 {
+                err_sym(names.data[0]);
+            } else {
+                err_str(c"{");
+                for k in 0..names.count {
+                    if k == LISTED_NAMES {
+                        err_str(c", ...");
+                        break;
+                    }
+                    if k > 0 {
+                        err_str(c", ");
+                    }
+                    err_sym(names.data[k]);
+                }
+                err_str(c"}");
+            }
+            err_str(c";'");
+        }
+    }
+    err_str(c" (tachyonc --fix-imports rewrites a program this way)");
+    err_help(c"every name a file uses is declared in it, imported by name, or written with its path (0.8)");
+    err_end();
 }
