@@ -646,7 +646,11 @@ before and after:
 (x86-64 counts the movq before a cmov as an instruction, not a register
 move.) At run time: fib, whose base case no longer touches the stack, is
 21% faster; the other benchmarks and the compiler itself are within
-noise.
+noise. Compile time: the compiler compiling the same source at -O2 is
+within noise of before (+0.5%, best of 31 runs interleaved); -O0 does
+not run any of it. The entry split checks only dominance (a block in no
+loop reaches only later blocks of the layout), without searching the
+graph, which cost 2.6%.
 
 Found while reading the hot loops of `bench/`: interp's dispatch copied
 its opcode before indexing its jump table (fixed above); interp keeps its
