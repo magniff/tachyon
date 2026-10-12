@@ -881,6 +881,29 @@ with linear probing): `new`, `insert` (returns the old value),
 slot: `slots()`, `key_at(i)` and `value_at(i)` (`None` for an empty
 slot).
 
+### Smaller changes
+
+- **Array constants**: `const PRIMES: [i64; 4] = [2, 3, 5, 7];` (elements
+  are constant expressions, other constants included). An array constant
+  is an immutable static: memory holding its elements, indexed like any
+  array (it is not usable where an integer constant is needed, nor in a
+  pattern).
+- **Strings in constant aggregates**: a static's initializer may hold
+  string literals (`[u8]`) and C strings inside structs, tuples and
+  arrays (`static OPS: [Op; 2] = [Op { name: "add", ... }, ...];`); their
+  addresses are relocated when the program loads.
+- **Line continuation**: in a string literal (`"..."` or `c"..."`), a
+  backslash at the end of a line leaves out the line break and the next
+  line's leading whitespace (spaces, tabs and further line breaks), as in
+  Rust.
+- **`if` and generic variants**: `if c { Some(x) } else { None }` (either
+  way round, and for any generic enum's variant named without type
+  arguments) takes its type from the other branch.
+- **Importing C headers when cross-compiling** (see below): `$TACHYON_CC`
+  may name a C compiler for another system, e.g. `TACHYON_CC="clang
+  --target=x86_64-linux-gnu --sysroot=DIR"` on macOS for `--target
+  x86_64-linux`; without it, the error says so.
+
 ## Importing C headers
 
 `import "stdio.h" as c;` *(0.4; `as`: 0.5, required since 0.8)* reads a C
@@ -891,7 +914,12 @@ imports of a program are read as one translation unit, as the target's C
 compiler reads them: its predefined macros and its include path come
 from `cc -dM -E -v` (`$TACHYON_CC` instead of `cc`), so headers need the
 target's C compiler on the host (a macOS host for both macOS targets, an
-x86-64 Linux host for `x86_64-linux`).
+x86-64 Linux host for `x86_64-linux`), unless `$TACHYON_CC` names a C
+compiler for the target (0.9: `clang --target=x86_64-linux-gnu
+--sysroot=DIR` with a Linux system's headers in DIR, or a cross gcc),
+which is then trusted for its headers and predefined macros. Another
+way: `tachyonc --emit-imports` on a host of the target's system writes
+the declarations as tachyon source, to use in place of the `import`.
 
 What a header declares becomes tachyon declarations
 (`tachyonc --emit-imports file.tach -o decls.tach` shows them):

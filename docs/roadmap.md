@@ -361,10 +361,11 @@ matters to agents above all.
   with bounds, bounds on functions, structs and enums, coherence,
   operator traits (Add, Sub, Mul, Div, Neg, Eq, Ord), std's Hash, impls
   for the primitives and `[u8]`, `HashMap`, `sort`
+  Small fixes: array constants, strings in static aggregates, line
+  continuations in strings, `if c { Some(x) } else { None }` inference,
+  `$TACHYON_CC` for importing C headers when cross-compiling
 - in progress: -
-- remaining: small fixes (const arrays, statics of structs with strings,
-  line continuations, `Some`/`None` branch inference, cross-compiled C
-  imports); e-graph rewriting (only if time allows)
+- remaining: e-graph rewriting (only if time allows)
 
 Language: `unsafe` blocks and functions: raw-pointer dereference,
 indexing and arithmetic, freeing memory and calls into C only inside them,

@@ -65,6 +65,9 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   structural `==`) and `Ord`. std gains `Hash`, impls for the primitives
   and byte strings, `HashMap<K: Hash + Eq, V>` and `sort`. Unbounded
   generics are unchanged.
+- Smaller: array constants, string literals in static aggregates, line
+  continuations in string literals, `if`/`else` inference of `Some`/
+  `None`, and `$TACHYON_CC` naming a cross C compiler for `import`.
 
 ### What's new in 0.8
 

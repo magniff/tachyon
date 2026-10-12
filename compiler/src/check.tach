@@ -488,9 +488,17 @@ fn duplicate_error(item: i64, kind: *u8) -> ! {
 fn collect_names() {
     for i in 0..NODES[PROGRAM].count {
         let item = child(PROGRAM, i);
-        let kind = NODES[item].kind;
+        let mut kind = NODES[item].kind;
         if kind == Impl {
             continue;
+        }
+        if kind == Const && NODES[item].b != 0 && NODES[NODES[item].b].kind == TyArray {
+            // An array constant (0.9) is an immutable static: memory
+            // holding its elements.
+            NODES[item].kind = Static;
+            NODES[item].d = 0;
+            NODES[item].y = 0;
+            kind = Static;
         }
         let name = NODES[item].a;
         let m = module_of(item);
@@ -2447,10 +2455,48 @@ fn synth_array(n: i64) -> i64 {
     array_of(elem, count)
 }
 
+// Whether block b ends in a variant of a generic enum named without its
+// type arguments (`None`, `Option::None`): its type comes from context.
+fn tail_needs_context(b: i64) -> bool {
+    if NODES[b].kind != Block {
+        return false;
+    }
+    let tail = NODES[b].a;
+    if tail == 0 || NODES[tail].g != 0 {
+        return false;
+    }
+    if NODES[tail].kind == Ident {
+        if lookup_local(NODES[tail].a).is_some() {
+            return false;
+        }
+        return binding_kind(lookup_quiet(CUR_MOD, NODES[tail].a, CUR_MOD)) == B_TVARIANT;
+    }
+    if NODES[tail].kind == Path && NODES[tail].count == 0 && NODES[tail].y == 0 {
+        let b2 = lookup_quiet(CUR_MOD, NODES[tail].a, CUR_MOD);
+        return binding_kind(b2) == B_ITEM && template_of_key(binding_value(b2)) < 0;
+    }
+    false
+}
+
 fn synth_if(n: i64) -> i64 {
     check_wrapped(NODES[n].a, TY_BOOL);
-    let then_ty = check_block(NODES[n].b, 0);
     let else_block = NODES[n].c;
+    // (0.9) `if c { None } else { Some(x) }`: the type from the other
+    // branch.
+    if else_block != 0 && NODES[else_block].kind == Block && tail_needs_context(NODES[n].b)
+        && !tail_needs_context(else_block) {
+        let else_ty = check_block(else_block, 0);
+        if else_ty != TY_NEVER {
+            check_branch(NODES[n].b, else_ty);
+            return else_ty;
+        }
+        return check_block(NODES[n].b, 0);
+    }
+    let then_ty = check_block(NODES[n].b, 0);
+    if else_block != 0 && then_ty != TY_NEVER && tail_needs_context(else_block) {
+        check_branch(else_block, then_ty);
+        return then_ty;
+    }
     if else_block == 0 {
         if then_ty != TY_UNIT && then_ty != TY_NEVER {
             type_error_got(n, c"if without else must have type '()'", then_ty);
