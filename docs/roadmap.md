@@ -309,6 +309,8 @@ through and stable, after as many 0.10.x / 0.11+ iterations as that takes:
   package workflow, documentation generation
 - stability: long-running fuzzing, real programs in tachyon beyond the
   compiler, no known miscompiles
+- making the language and its tools work for agents as well as people:
+  ideas collected in [agents.md](agents.md)
 - 1.0 freezes compatibility, not features: from 1.0 on, additions are minor
   releases and breaking changes wait for 2.0
 
