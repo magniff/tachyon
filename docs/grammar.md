@@ -261,7 +261,7 @@ optimization level and on every target, so that it can be reasoned about
 undefined, tachyon defines it, or checks it and stops with a message.
 The aim is no undefined behaviour at all in code that does not opt out of
 the checks; the operations below that are still undefined all involve raw
-pointers or C, and move behind an `unsafe` boundary in 0.8.
+pointers or C, and move behind an `unsafe` boundary in 0.9.
 
 **Defined** (each case checked at -O0 and -O2, on AArch64 and x86-64, at
 run time and in constant folding, which agree):
@@ -325,7 +325,7 @@ run time and in constant folding, which agree):
 - Calling a function pointer made from an integer or from a pointer of
   another type.
 
-**The plan.** 0.8 introduces `unsafe` blocks and `unsafe fn`: every
+**The plan.** 0.9 introduces `unsafe` blocks and `unsafe fn`: every
 operation in the second list (raw-pointer dereference, indexing,
 slicing, arithmetic and casts, calls to `extern "C"` functions and
 through pointers made from integers) is allowed only inside them, and

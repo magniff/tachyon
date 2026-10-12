@@ -22,7 +22,7 @@ Principle: **no undefined behaviour.** Every operation safe code can
 write has defined behaviour (integer overflow wraps, division by zero,
 shifts and conversions are defined, indexing is checked); what cannot be
 checked (raw pointers, freeing memory, calls into C) is to be confined to
-`unsafe` blocks (0.8). For agents above all, a program that compiles
+`unsafe` blocks (0.9). For agents above all, a program that compiles
 should not be able to fail in ways no one can see in its text.
 
 Priorities, in order: correctness (the gate above); exact C interop where
@@ -334,7 +334,23 @@ Also: fixed-array indexing bounds-checked like slices (no undefined
 behaviour; breaking), and an audit of the undefined behaviour left (in
 grammar.md); interp's 2% slowdown from 0.6.
 
-## 0.8: traits and equality saturation
+## 0.8: no wildcard imports
+
+Every name a file uses is declared in it, imported by name, or written
+with its path: what a name means is visible where it is used, which
+matters to agents above all.
+
+- `use a::b::*` and `use E::*` are removed; `use a::b::{c, d}` and paths
+  stay. The prelude (a fixed, documented list) is not a wildcard.
+- `import "h.h";` (every declaration of a header in scope) is removed;
+  `import "h.h" as c;` and `c::printf(...)` stay.
+- `tachyonc --fix-imports FILE...` rewrites both forms into what replaces
+  them, listing the names the code actually uses; the errors for the
+  removed forms suggest the same.
+- the compiler's own source moves to explicit imports first (while 0.7.0
+  builds it).
+
+## 0.9: unsafe, traits and equality saturation
 
 Language: `unsafe` blocks and functions: raw-pointer dereference,
 indexing and arithmetic, freeing memory and calls into C only inside them,
@@ -350,7 +366,7 @@ written against 0.5's unbounded generics mean.
   are accepted
 - partial redundancy elimination (GVN-PRE)
 
-## 0.9: vectorization and profiles
+## 0.10: vectorization and profiles
 
 Vectorization:
 - SLP vectorizer
@@ -365,7 +381,7 @@ Profile-guided:
 - PGO-aware register allocation and unrolling
 - list scheduling (from 0.5) where profiles say a block is hot
 
-## 0.10: feature-complete
+## 0.11: feature-complete
 
 The last release of the build-out: everything planned above, finished.
 
@@ -377,7 +393,7 @@ The last release of the build-out: everything planned above, finished.
 ## Toward 1.0
 
 1.0 is not a feature milestone: it ships when the language is thought
-through and stable, after as many 0.10.x / 0.11+ iterations as that takes:
+through and stable, after as many 0.11.x / 0.12+ iterations as that takes:
 
 - the surface language reworked with experience of real programs:
   strings, error handling, iteration, conversions, traits and their
