@@ -18,6 +18,13 @@ x86_64-linux:
   at `-O0` and `-O2`, and end to end to an executable), and any regression
   against the previous release is explained or fixed.
 
+Principle: **no undefined behaviour.** Every operation safe code can
+write has defined behaviour (integer overflow wraps, division by zero,
+shifts and conversions are defined, indexing is checked); what cannot be
+checked (raw pointers, freeing memory, calls into C) is to be confined to
+`unsafe` blocks (0.8). For agents above all, a program that compiles
+should not be able to fail in ways no one can see in its text.
+
 Priorities, in order: correctness (the gate above); exact C interop where
 it is asked for; **compilation speed**, as fast as possible at every
 level, measured every release; then the speed of the generated code.
@@ -323,11 +330,17 @@ stays, and the object files are checked against `cc`'s assembly of the
 same text, section by section. The system assembler took 2.4 s of the
 compiler's 3 s self-build in 0.6.
 
-Also: interp's 2% slowdown from 0.6.
+Also: fixed-array indexing bounds-checked like slices (no undefined
+behaviour; breaking), and an audit of the undefined behaviour left (in
+grammar.md); interp's 2% slowdown from 0.6.
 
 ## 0.8: traits and equality saturation
 
-Language: traits (bounded generics), which a generic hash map and
+Language: `unsafe` blocks and functions: raw-pointer dereference,
+indexing and arithmetic, freeing memory and calls into C only inside them,
+so that safe code has no undefined behaviour at all; a checking mode for
+`unsafe` code (pointers carrying bounds, freed memory detected). Traits
+(bounded generics), which a generic hash map and
 operator overloading need; adding bounds does not change what programs
 written against 0.5's unbounded generics mean.
 
