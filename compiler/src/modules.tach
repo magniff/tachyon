@@ -176,11 +176,13 @@ pub fn load_modules() {
     load_std_if_named();
 }
 
-// The standard library, when the program names it (`std::...`), once.
+// The standard library, when the program names it (`std::...`) or (0.6) a
+// name of the prelude, once.
 fn load_std_if_named() {
     for i in 0..TOK_COUNT - 1 {
-        if TOKS[i].kind == Tok::Ident && TOKS[i + 1].kind == Tok::ColonColon
-            && TOKS[i].value as i64 == intern_c(c"std") && STD_MODULE < 0 {
+        if TOKS[i].kind == Tok::Ident && STD_MODULE < 0
+            && ((TOKS[i + 1].kind == Tok::ColonColon && TOKS[i].value as i64 == intern_c(c"std"))
+                || is_prelude_name(TOKS[i].value as i64)) {
             let text = buf_new();
             std_source(text);
             let start = add_source(c"<std>", text);
@@ -273,6 +275,11 @@ pub const B_ITEM: i64 = 1;
 pub const B_MODULE: i64 = 2;
 pub const B_VARIANT: i64 = 3;
 pub const B_PRIVATE: i64 = 4;
+// A variant of a generic enum (0.6), by the enum's template (its ENUMS
+// index): its type arguments are inferred where it is used.
+pub const B_TVARIANT: i64 = 5;
+// An ambiguous name (0.6): two `*` imports bring different things.
+pub const B_AMBIGUOUS: i64 = -4;
 
 pub fn binding(kind: i64, value: i64) -> i64 {
     kind + value * 8
@@ -390,15 +397,15 @@ fn resolve_use(u: i64) -> i64 {
         if binding_kind(prefix) == B_MODULE {
             result = lookup_name(binding_value(prefix), name, m);
             if binding_kind(result) == B_PRIVATE {
-                private_error(NODES[id].start, name);
+                access_error(result, NODES[id].start, name);
             }
             if result == B_NONE {
                 unresolved_import(id, path);
             }
         } else if binding_kind(prefix) == B_ITEM && SYM_ENUM[binding_value(prefix)] != 0 {
             let e = SYM_ENUM[binding_value(prefix)] - 1;
-            let v = find_variant(e, name);
-            if v < 0 {
+            let v = enum_variant_binding(e, name);
+            if v == B_NONE {
                 err_begin(NODES[id].start);
                 err_str(c"enum '");
                 err_sym(ENUMS[e].name);
@@ -407,7 +414,7 @@ fn resolve_use(u: i64) -> i64 {
                 err_str(c"'");
                 err_end();
             }
-            result = binding(B_VARIANT, v);
+            result = v;
         } else {
             not_enum_or_module(path);
         }
@@ -444,6 +451,15 @@ fn unresolved_import(id: i64, path: i64) -> ! {
 
 pub fn private_error(pos: i64, name: i64) -> ! {
     name_error(pos, c"'", name, c"' is private")
+}
+
+// The error for a binding that cannot be used: private, or (0.6) brought
+// by two `*` imports.
+pub fn access_error(b: i64, pos: i64, name: i64) -> ! {
+    if b == B_AMBIGUOUS {
+        name_error(pos, c"'", name, c"' is ambiguous: more than one '*' import brings it (import it by name, or write its path)");
+    }
+    private_error(pos, name)
 }
 
 // What `name` stands for in module m, seen from code in module `from`.
@@ -492,31 +508,91 @@ fn lookup_uncached(m: i64, name: i64, from: i64, depth: i64) -> i64 {
             return resolve_use(u);
         }
     }
+    // `*` imports: two that bring different things make the name
+    // ambiguous (an error where it is used; 0.6, before the first won).
+    let mut globbed = B_NONE;
     for k in 0..count {
         let u = MODULE_USES[m].data[k];
         if !USE_ENTRIES[u].glob || !(inside || USE_ENTRIES[u].public) {
             continue;
         }
         let what = resolve_use(u);
+        let mut found = B_NONE;
         if binding_kind(what) == B_MODULE {
-            let found = lookup_uncached(binding_value(what), name, m, depth + 1);
-            if binding_kind(found) == B_ITEM || binding_kind(found) == B_MODULE || binding_kind(found) == B_VARIANT {
-                return found;
+            let item = lookup_uncached(binding_value(what), name, m, depth + 1);
+            let kind = binding_kind(item);
+            if kind == B_ITEM || kind == B_MODULE || kind == B_VARIANT || kind == B_TVARIANT {
+                found = item;
             }
         } else {
-            let e = SYM_ENUM[binding_value(what)] - 1;
-            let v = find_variant(e, name);
-            if v >= 0 {
-                return binding(B_VARIANT, v);
+            found = enum_variant_binding(SYM_ENUM[binding_value(what)] - 1, name);
+        }
+        if found != B_NONE {
+            if globbed == B_NONE {
+                globbed = found;
+            } else if globbed != found {
+                return B_AMBIGUOUS;
             }
         }
+    }
+    if globbed != B_NONE {
+        return globbed;
     }
     if MODULES[m].is_c {
         // The imported declarations see the root's names (its types
         // replace the headers' of the same names).
         return lookup_uncached(0, name, 0, depth + 1);
     }
+    if STD_MODULE >= 0 && m != STD_MODULE {
+        return prelude_lookup(name, m, depth);
+    }
     B_NONE
+}
+
+// Variant `name` of enum e: B_VARIANT, or B_TVARIANT for a generic enum,
+// or B_NONE.
+pub fn enum_variant_binding(e: i64, name: i64) -> i64 {
+    if ENUMS[e].generic > 0 {
+        if template_variant_named(e, name) {
+            return binding(B_TVARIANT, e);
+        }
+        return B_NONE;
+    }
+    let v = find_variant(e, name);
+    if v >= 0 { binding(B_VARIANT, v) } else { B_NONE }
+}
+
+// ---- The prelude (0.6) ----
+//
+// Names every module sees without `use`, after everything else (its own
+// items, its imports, its `*` imports): std's Option, Some, None, Result,
+// Ok, Err, Vec, print and println. The standard library is loaded when a
+// program names one of them (or `std`).
+
+pub fn is_prelude_name(name: i64) -> bool {
+    let names: [*u8; 9] = [c"Option", c"Some", c"None", c"Result", c"Ok", c"Err", c"Vec", c"print", c"println"];
+    for i in 0..9 {
+        if name == intern_c(names[i]) {
+            return true;
+        }
+    }
+    false
+}
+
+fn prelude_lookup(name: i64, m: i64, depth: i64) -> i64 {
+    if !is_prelude_name(name) {
+        return B_NONE;
+    }
+    let some = name == intern_c(c"Some") || name == intern_c(c"None");
+    let ok = name == intern_c(c"Ok") || name == intern_c(c"Err");
+    if some || ok {
+        let e = lookup_uncached(STD_MODULE, intern_c(if some { c"Option" } else { c"Result" }), m, depth + 1);
+        if binding_kind(e) != B_ITEM || SYM_ENUM[binding_value(e)] == 0 {
+            return B_NONE;
+        }
+        return enum_variant_binding(SYM_ENUM[binding_value(e)] - 1, name);
+    }
+    lookup_uncached(STD_MODULE, name, m, depth + 1)
 }
 
 // The module (or the item, for the last segment) named by the first
@@ -547,7 +623,7 @@ fn resolve_path(m: i64, path: i64, count: i64, pos: i64) -> i64 {
         }
         let found = lookup_name(here, name, m);
         if binding_kind(found) == B_PRIVATE {
-            private_error(NODES[seg].start, name);
+            access_error(found, NODES[seg].start, name);
         }
         if found == B_NONE {
             if i == 0 && name == SYM_STD && STD_MODULE >= 0 {

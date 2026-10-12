@@ -750,7 +750,7 @@ fn variant_and_method_error(item: i64, type_name: i64) -> ! {
     err_end()
 }
 
-fn template_variant_named(e: i64, name: i64) -> bool {
+pub fn template_variant_named(e: i64, name: i64) -> bool {
     let item = ENUMS[e].node;
     for i in 0..NODES[item].count {
         if NODES[child(item, i)].a == name {
@@ -1124,7 +1124,7 @@ fn type_name_key(n: i64) -> i64 {
         b = lookup_name(m, name, CUR_MOD);
     }
     if binding_kind(b) == B_PRIVATE {
-        private_error(NODES[n].start, name);
+        access_error(b, NODES[n].start, name);
     }
     if binding_kind(b) != B_ITEM {
         return -1;
@@ -1145,7 +1145,7 @@ pub fn resolve_named(name: i64, pos: i64) -> i64 {
     }
     let b = lookup_name(CUR_MOD, name, CUR_MOD);
     if binding_kind(b) == B_PRIVATE {
-        private_error(pos, name);
+        access_error(b, pos, name);
     }
     if binding_kind(b) != B_ITEM {
         unknown_name_error(pos, c"unknown type '", name);
@@ -1477,7 +1477,7 @@ fn struct_of_literal(n: i64) -> i64 {
     let m = if NODES[n].h != 0 { path_module(NODES[n].h, NODES[NODES[n].h].count) } else { CUR_MOD };
     let b = lookup_name(m, name, CUR_MOD);
     if binding_kind(b) == B_PRIVATE {
-        private_error(NODES[n].start, name);
+        access_error(b, NODES[n].start, name);
     }
     if binding_kind(b) != B_ITEM {
         return -1;
@@ -1754,7 +1754,7 @@ fn synth_name(n: i64) -> i64 {
     let b = if resolved { binding(B_ITEM, name) } else { lookup_name(CUR_MOD, name, CUR_MOD) };
     let kind = binding_kind(b);
     if kind == B_PRIVATE {
-        private_error(NODES[n].start, name);
+        access_error(b, NODES[n].start, name);
     }
     if kind == B_VARIANT {
         // A variant brought into scope by `use E::...;`: `E::V`.
@@ -1763,6 +1763,14 @@ fn synth_name(n: i64) -> i64 {
         NODES[n].a = VARIANTS[v].name;
         NODES[n].b = VARIANTS[v].name;
         NODES[n].y = enum_type(VARIANTS[v].enum_id);
+        return synth_expr(n);
+    }
+    if kind == B_TVARIANT {
+        // A variant of a generic enum (0.6): its type arguments inferred
+        // (`y` < 0: the template; see path_target).
+        NODES[n].kind = Path;
+        NODES[n].b = name;
+        NODES[n].y = -binding_value(b) - 1;
         return synth_expr(n);
     }
     if kind == B_MODULE {
@@ -1828,6 +1836,30 @@ const NODE_RESOLVED: i64 = 2;
 pub fn used_variant(name: i64) -> i64 {
     let b = lookup_name(CUR_MOD, name, CUR_MOD);
     if binding_kind(b) == B_VARIANT { binding_value(b) } else { -1 }
+}
+
+// The enum type of the variant `name` in scope, in a pattern (p) against
+// a value of type `ty`, or 0 when `name` is no variant: a generic enum's
+// variant (0.6) takes the instance `ty`.
+pub fn used_variant_enum(name: i64, ty: i64, p: i64) -> i64 {
+    let b = lookup_name(CUR_MOD, name, CUR_MOD);
+    if binding_kind(b) == B_VARIANT {
+        return enum_type(VARIANTS[binding_value(b)].enum_id);
+    }
+    if binding_kind(b) != B_TVARIANT {
+        return 0;
+    }
+    let e = binding_value(b);
+    if !instance_of(ty, -e - 1) {
+        err_begin(NODES[p].start);
+        err_str(c"expected '");
+        err_type(ty);
+        err_str(c"', got a pattern of '");
+        err_sym(ENUMS[e].name);
+        err_str(c"'");
+        err_end();
+    }
+    ty
 }
 
 // Whether `name` is a constant in the current scope (its index + 1, or 0).
@@ -2643,6 +2675,16 @@ fn synth_call(n: i64) -> i64 {
             NODES[callee].y = enum_type(VARIANTS[v].enum_id);
             return synth_path_call(n, callee);
         }
+        if binding_kind(b) == B_TVARIANT {
+            // ... of a generic enum (0.6), its type arguments inferred.
+            NODES[callee].kind = Path;
+            NODES[callee].b = name;
+            NODES[callee].y = -binding_value(b) - 1;
+            return synth_path_call(n, callee);
+        }
+        if binding_kind(b) == B_PRIVATE {
+            access_error(b, NODES[callee].start, name);
+        }
         if binding_kind(b) == B_ITEM && SYM_FN[binding_value(b)] != 0 {
             return call_function(n, SYM_FN[binding_value(b)] - 1, NODES[callee].g);
         }
@@ -2734,9 +2776,14 @@ fn check_direct_call(n: i64, f: i64) -> i64 {
 static mut PATH_TPL: i64 = 0;
 
 fn path_target(n: i64) -> i64 {
-    if NODES[n].y != 0 {
+    if NODES[n].y > 0 {
         // Made by the checker from a variant in scope.
         return NODES[n].y;
+    }
+    if NODES[n].y < 0 {
+        // ... of a generic enum (0.6): its template.
+        PATH_TPL = NODES[n].y;
+        return -1;
     }
     let name = NODES[n].a;
     let member = NODES[n].b;
@@ -2768,14 +2815,14 @@ fn path_target(n: i64) -> i64 {
         }
     }
     if binding_kind(b) == B_PRIVATE {
-        private_error(NODES[n].start, name);
+        access_error(b, NODES[n].start, name);
     }
     if binding_kind(b) == B_MODULE {
         // `m::item`: the item, by key.
         let target = binding_value(b);
         let item = lookup_name(target, member, CUR_MOD);
         if binding_kind(item) == B_PRIVATE {
-            private_error(NODES[n].start, member);
+            access_error(item, NODES[n].start, member);
         }
         if binding_kind(item) == B_MODULE {
             name_error(NODES[n].start, c"'", member, c"' is a module, not a value");
