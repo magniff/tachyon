@@ -797,3 +797,22 @@ narrowing (from 0.5); interprocedural analyses and a
 cost-model-driven inliner (0.6); an e-graph-based rewriter (0.7);
 vectorization and unrolling with run-time trip counts (0.8);
 profile-guided scheduling (0.9).
+
+## 0.7: object files
+
+**0.7 status**
+- done: the assembler (`objfile.tach`, `enc_arm64.tach`, `enc_x86.tach`),
+  Mach-O and ELF writers, `-c` / `-S` / executables; AArch64 objects
+  identical to `cc -c`'s over the corpus (382 compilations)
+- remaining: x86-64 (macOS, Linux) checked over the corpus;
+  tests/objcheck.sh; the bootstrap and the test runner on objects;
+  compile-time numbers; the gate
+- after the object writer (scope added by the user: no undefined
+  behaviour): bounds-checked fixed-array indexing; an "Undefined
+  behaviour" section in grammar.md
+
+The compiler writes object files itself. The assembly text it has always
+written stays the single source: `objfile.tach` assembles exactly that
+text (one statement per line, the subset of the syntax the code
+generator uses), so `--emit-asm` and the object cannot disagree, and
+`cc -c` of the same text is an oracle for every object.
