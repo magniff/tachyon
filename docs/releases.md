@@ -68,6 +68,10 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 - Smaller: array constants, string literals in static aggregates, line
   continuations in string literals, `if`/`else` inference of `Some`/
   `None`, and `$TACHYON_CC` naming a cross C compiler for `import`.
+- **E-graph.** GVN's table is an acyclic e-graph with a table of rewrite
+  rules (a small pattern language) and cost-based extraction;
+  `tachyonc --check-rules` checks every rule on random values at every
+  integer width (tests/run.sh runs it).
 
 ### What's new in 0.8
 

@@ -865,3 +865,48 @@ assembles the assembly, both are linked, and the two executables must
 have the same disassembly (padding NOPs aside) and the same data. The
 fixpoint compares the compiler's own objects; the objects of the x86-64
 build of the compiler (under Rosetta) are identical to the arm64 one's.
+
+## 0.9: the e-graph
+
+GVN (`gvn.tach`) hash-conses the pure instructions along the dominator
+tree; 0.9 makes its table an acyclic e-graph, in the manner of
+Cranelift's aegraph (`egraph.tach`). Every value has an e-class (the
+values known equal to it: union-find, with a circular member list). An
+instruction new to the table is matched against the rewrite rules, each
+pattern's operands against every member of the operands' classes (so a
+rewrite made earlier, `x - 3` also being `x + -3`, enables later ones);
+a match builds its right-hand side from existing classes, through the
+table (equal nodes are shared; new ones go just before the instruction,
+so they dominate its uses), and joins it to the instruction's class.
+Nothing refers to a node made later, so the graph is acyclic and is never
+rebuilt or saturated to a fixpoint. Extraction then picks the class's
+cheapest member (constants 0, multiplication 3, division 20, the rest 1,
+plus the operands' best costs; the instruction itself on a tie) to stand
+for the instruction; members not picked are dead code for the DCE that
+follows.
+
+The rules are a table of patterns in a small language, parsed once into
+matchers:
+
+```
+(add (add x c1) c2) => (add x (+ c1 c2))
+(sub x c1) => (add x (negc c1))
+(sub (add x y) y) => x
+(mul x c1) if (pow2 c1) => (shl x (log2 c1))
+(eq (xor x c1) c2) => (eq x (^ c1 c2))
+(add (bnot x) 1) => (neg x)
+...
+```
+
+31 rules: reassociation of constants (add, mul, and, or, xor),
+cancellation (`(x + y) - y`, `x - (x - y)`, `(x ^ y) ^ y`), absorption,
+`x * c + x`, comparisons with constants through additions and xors,
+`x - y == 0`, negations and complements. Commutative operations match
+either way round. **Checked**: `tachyonc --check-rules` (run by
+tests/run.sh) evaluates both sides of every rule on random values (edge
+values included: 0, -1, 1, powers of two and their neighbours) at every
+integer width, with the optimizer's folding (which is the language's
+arithmetic: wrapping, shifts modulo the width), 2,000 times per rule and
+type; a rule that differs once fails. `--no-egraph` turns the rules off,
+to compare. The e-graph costs about 3% of the compiler's self-compile at
+`-O2`.

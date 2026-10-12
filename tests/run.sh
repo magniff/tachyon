@@ -441,6 +441,11 @@ if [ -x "$ROOT/compiler/std/embed.sh" ] && ! "$ROOT/compiler/std/embed.sh" -c; t
     exit 1
 fi
 
+# The optimizer's rewrite rules, on random values (0.9).
+if "$COMPILER" --check-rules >"$WORK/rules.out" 2>&1; then :; else
+    grep -q 'rewrite rules' "$WORK/rules.out" && { cat "$WORK/rules.out"; exit 1; }
+fi
+
 # The cases, in order; up to JOBS at once (a FIFO holds the free slots).
 CASES="$WORK/cases"
 : >"$CASES"

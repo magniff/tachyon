@@ -364,8 +364,14 @@ matters to agents above all.
   Small fixes: array constants, strings in static aggregates, line
   continuations in strings, `if c { Some(x) } else { None }` inference,
   `$TACHYON_CC` for importing C headers when cross-compiling
+  E-graph: GVN's table is an acyclic e-graph (Cranelift's aegraph) with
+  31 rewrite rules in a small pattern language, cost-based extraction,
+  and `tachyonc --check-rules` (randomized differential checking of
+  every rule at every integer width); `--no-egraph` to compare
 - in progress: -
-- remaining: e-graph rewriting (only if time allows)
+- remaining (moved to 0.10): GVN-PRE; a checking mode for unsafe code
+  (pointers carrying bounds); migrating the compiler's own source to
+  unsafe blocks (then unsafe operations outside unsafe code are errors)
 
 Language: `unsafe` blocks and functions: raw-pointer dereference,
 indexing and arithmetic, freeing memory and calls into C only inside them,
