@@ -558,7 +558,7 @@ function loop_statement(level, loops,    k, n, t, lo, hi, step, start, bound, a,
             else print indent(level + 2) VN[v] " ^= sl" saved "[j] as " VT[v] ";"
         } else {
             print indent(level + 1) "let mut j: u64 = 0;"
-            print indent(level + 1) "while j < sl" saved ".len" x " {"
+            print indent(level + 1) "while j < (sl" saved ".len" x ") as u64 {"
             print indent(level + 2) "sl" saved "[j] = " expr(AT[a], 1) ";"
             print indent(level + 2) "j += 1;"
         }
