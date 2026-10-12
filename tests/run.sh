@@ -1,6 +1,7 @@
 #!/bin/sh
 # The test suite of this release, run with a tachyon compiler (no cargo
-# needed): every tests/run/*.tach and tests/examples/*.test case is
+# needed): every tests/run/*.tach, tests/run/*/main.tach (a program of
+# several modules, 0.5) and tests/examples/*.test case is
 # compiled, assembled and linked with the C compiler, run, and checked.
 # POSIX sh and awk only, so it runs the same on macOS and Linux.
 #
@@ -309,12 +310,14 @@ run_case() {
 # The cases, in order; up to JOBS at once (a FIFO holds the free slots).
 CASES="$WORK/cases"
 : >"$CASES"
-for file in "$ROOT"/tests/run/*.tach "$ROOT"/tests/examples/*.test; do
+for file in "$ROOT"/tests/run/*.tach "$ROOT"/tests/run/*/main.tach "$ROOT"/tests/examples/*.test; do
     [ -f "$file" ] || continue
     base=$(basename "$file")
     name=${base%.*}
     case "$file" in
         *.test) name="example_$name" ;;
+        # A program of several modules: a directory with main.tach (0.5).
+        */main.tach) name=$(basename "$(dirname "$file")") ;;
     esac
     case "$name" in
         *"$FILTER"*) ;;
