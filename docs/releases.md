@@ -34,8 +34,53 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.1.0 | `v0.1.0` | seed | aarch64-macos, x86_64-linux, x86_64-macos | the compiler in tachyon: the seed's whole language, compiled to AArch64 (Apple's arm64 ABI) and x86-64 (System V, ELF and Mach-O) assembly; a test suite run without cargo |
 | 0.2.0 | `v0.2.0` | 0.1.0 | aarch64-macos, x86_64-linux, x86_64-macos | the optimizer: SSA IR, SCCP, instruction combining, GVN, LICM, inlining, linear-scan register allocation; `-O0`/`-O1`/`-O2` (default `-O2`); random differential testing; `bench/` |
 | 0.3.0 | `v0.3.0` | 0.2.0 | aarch64-macos, x86_64-linux, x86_64-macos | aggregates and memory: enums with fields and `match`, methods, slices, C interop (`extern "C"`, `#[repr(C)]`, unions, C's convention for aggregates); SROA, memory forwarding across blocks, dead stores, switches and jump tables; ABI conformance fuzzing |
+| 0.4.0 | `v0.4.0` | 0.3.0 | aarch64-macos, x86_64-linux, x86_64-macos | loops and C headers: the compiler written in the 0.3 language; `import "x.h"` (a C preprocessor and declaration reader) and `--emit-header`; `use`, checked `as` to enums, enum ordering, `size_of`/`align_of`, `for x in s`; loop canonicalization, induction variables, rotation, unrolling, unswitching, strength reduction, value ranges and bounds-check elimination, aggressive DCE, tail recursion elimination |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.4
+
+The compiler's own source is written in the 0.3 language (enums and
+`match` for every kind of node, token, type and instruction; methods;
+slices; `extern "C"` blocks), checked to emit byte-identical output to
+0.3.0 by `tests/compare.sh`, which compares two compilers over the suite,
+examples, benchmarks, random programs and the compiler itself.
+
+The language (see [grammar.md](grammar.md)); two changes are breaking:
+
+- **A slice's `len` is `i64`** (it was `u64`); indexing accepts any
+  integer type.
+- **The 0.2 form `extern fn f();` is removed**; use `extern "C" { ... }`.
+- **`import "stdio.h";`** reads C headers: a C preprocessor and a C
+  declaration reader, with the target's own predefined macros and include
+  path (from `cc`, or `$TACHYON_CC`), so a header means what it means to
+  C. Structs and unions (bit-fields, `packed`, `aligned`, `#pragma pack`)
+  become `#[repr(C)]` types, typedefs and enums aliases, enumerators and
+  constant macros typed constants, asm-label renames `#[link_name]`;
+  what tachyon cannot express (`long double` on x86-64, `_Complex`,
+  `__int128`, inline functions...) is left out, with an error naming the
+  reason when it is used. `-I` adds directories; `--emit-imports` shows
+  the result.
+- **`--emit-header`** writes a C header for a program's `extern "C"`
+  functions and statics and the types they need, each checked with a
+  `_Static_assert` of its size and alignment.
+- `use E::*;` and `use E::{A, B};`; `const` of enum types and of `c"..."`;
+  `n as E`, checked (an invalid value exits with 101); `<`, `<=`, `>`,
+  `>=` on fieldless enums and variant ranges in patterns; `size_of(T)` and
+  `align_of(T)`; `for x in s` over slices and arrays; raw identifiers
+  (`r#type`); `#[link_name]`; `#[repr(C, packed(N))]`. `import` and `use`
+  are keywords.
+
+The loop optimizer (see [optimizer.md](optimizer.md)): loop canonical form
+and LCSSA, rotation, induction variables and exact trip counts, full and
+partial unrolling, unswitching, strength reduction of addresses, value
+ranges (bounds checks they prove are removed, guarded `match` arms become
+decision trees, chains of tests become switches), dead loop deletion,
+aggressive dead code elimination, tail recursion elimination with
+accumulators. Tests: a loop mode for the random program generator
+(`tests/fuzz/run.sh -l`), the ABI fuzzer through `import` (`-i`) and
+through `--emit-header` (`-H`), a layout check of imported C records
+against `cc` (`tests/cimport/layout.sh`), a stencil benchmark.
 
 ### What's new in 0.3
 

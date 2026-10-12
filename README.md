@@ -50,7 +50,7 @@ On macOS, with the Xcode command line tools and Rust (rustup):
 ```
 $ bootstrap/bootstrap.sh
 ...
-compiler: target/tachyonc (tachyonc 0.3.0 (host: aarch64-macos))
+compiler: target/tachyonc (tachyonc 0.4.0 (host: aarch64-macos))
 ```
 
 On x86-64 Linux, with git, gcc (or clang) and the libc headers, and Rust
@@ -59,7 +59,7 @@ On x86-64 Linux, with git, gcc (or clang) and the libc headers, and Rust
 ```
 $ bootstrap/bootstrap.sh
 ...
-compiler: target/tachyonc (tachyonc 0.3.0 (host: x86_64-linux))
+compiler: target/tachyonc (tachyonc 0.4.0 (host: x86_64-linux))
 ```
 
 Every step is checked: each compiler must compile itself to identical

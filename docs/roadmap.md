@@ -297,3 +297,27 @@ loads folded); interp, a `match`-dispatched bytecode VM over a slice, is
 within 35% of C, and nbody within 30%, with every struct and enum value in
 registers. (sieve compiles to byte-identical code with 0.2.0 and 0.3; an
 earlier measurement showing it 18% slower was taken on a busy machine.)
+
+### 0.4
+
+aarch64-macos (Apple silicon, native, idle machine; `bench/run.sh -r 7`;
+"0.3.0" is the previous release at its default level):
+
+| program | 0.3.0 | 0.4 -O0 | 0.4 -O1 | 0.4 -O2 | seed -O | cc -O2 |
+|---|---|---|---|---|---|---|
+| collatz | 420 | 2440 | 423 | 431 | 478 | 293 |
+| fib | 28 | 55 | 28 | 18 | 29 | 14 |
+| interp | 54 | 440 | 94 | 55 | - | 41 |
+| matmul | 45 | 496 | 104 | 35 | 94 | 43 |
+| nbody | 36 | 299 | 35 | 34 | - | 28 |
+| sieve | 67 | 265 | 66 | 64 | 67 | 71 |
+| stencil (new: 2D five-point, f64) | 31 | 241 | 32 | 26 | - | 8 |
+| md5 | 119 | 381 | 164 | 73 | 132 | - |
+
+md5 is 39% faster than 0.3, fib 36% (tail recursion elimination halves the
+calls), matmul 22% (strength reduction of its addresses; it now beats
+clang). collatz is 3% slower: rotation leaves a loop-carried value that the
+linear-scan allocator cannot keep in one register, which costs a move and a
+jump on one path; that is 0.5's register allocator. stencil is 3× behind
+clang, which vectorizes it (0.8), and keeps bounds checks whose proof needs
+the caller's lengths (0.6).

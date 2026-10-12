@@ -13,7 +13,9 @@
 #   --seed-tests   also run the seed's own test suite (cargo test)
 #   --all-levels   also run the final compiler's test suite at -O0, -O1, -O2
 #   --fuzz=N       also run N random programs (tests/fuzz/run.sh)
-#   --abi=N        also run N C interoperability programs (tests/abi/run.sh)
+#   --abi=N        also run N C interoperability programs (tests/abi/run.sh),
+#                  plain, through import and through --emit-header, and
+#                  check the layout of imported system headers
 #   --bench        also run the benchmarks (bench/run.sh)
 #
 # Other options go to bootstrap.sh, e.g. --dev. After the chain, the md5
@@ -113,6 +115,14 @@ tar -C "$SNAP" -c -f - src | docker run --rm -i --cpus 4 --platform "$PLATFORM" 
     if [ "$ABI" -gt 0 ]; then
         echo "==> $ABI C interoperability programs" >&2
         tests/abi/run.sh -n "$ABI" -k /tmp/abi-failures | tail -5
+        echo "==> $ABI C interoperability programs, through import" >&2
+        tests/abi/run.sh -i -n "$ABI" -k /tmp/abi-failures | tail -5
+        echo "==> $ABI C interoperability programs, through --emit-header" >&2
+        tests/abi/run.sh -H -n "$ABI" -k /tmp/abi-failures | tail -5
+        echo "==> the layout of imported system headers" >&2
+        tests/cimport/layout.sh stdio.h stdlib.h string.h math.h time.h \
+            fcntl.h unistd.h signal.h sys/stat.h sys/time.h sys/socket.h \
+            netinet/in.h dirent.h pthread.h | tail -5
     fi
     if [ "$BENCH" = 1 ]; then
         echo "==> benchmarks" >&2
