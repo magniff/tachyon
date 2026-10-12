@@ -5,7 +5,7 @@
 # compiled, assembled and linked with the C compiler, run, and checked.
 # POSIX sh and awk only, so it runs the same on macOS and Linux.
 #
-# usage: tests/run.sh [-c COMPILER] [-t TARGET] [-O LEVEL] [-j JOBS] [FILTER]
+# usage: tests/run.sh [-c COMPILER] [-t TARGET] [-O LEVEL] [-j JOBS] [-a] [FILTER]
 #
 #   -c COMPILER   the tachyonc binary to test (default: target/tachyonc,
 #                 as left by bootstrap/bootstrap.sh)
@@ -15,9 +15,11 @@
 #                 compiler's default)
 #   -j JOBS       cases run at once (default: the number of CPUs); the
 #                 report is the same for every JOBS
+#   -a            programs go through assembly (tachyonc -S, then cc), as
+#                 before 0.7, instead of the compiler's own objects
 #   FILTER        run only the cases whose name contains FILTER
 #
-# Environment: CC is the assembler/linker (default cc).
+# Environment: CC is the linker (and the assembler with -a; default cc).
 #
 # Directives, in `//` comments of the case file:
 #   // ARGS: a b c       command-line arguments (whitespace separated)
@@ -62,9 +64,10 @@ TARGET=""
 OPT=""
 TIMEOUT=20
 JOBS=""
+OUT=prog.o
 
 usage() {
-    sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//' >&2
+    sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//' >&2
     exit 2
 }
 
@@ -74,6 +77,7 @@ while [ $# -gt 0 ]; do
         -t) [ $# -ge 2 ] || usage; TARGET=$2; shift 2 ;;
         -O) [ $# -ge 2 ] || usage; OPT="-O$2"; shift 2 ;;
         -j) [ $# -ge 2 ] || usage; JOBS=$2; shift 2 ;;
+        -a) OUT=prog.s; shift ;;
         -h|--help) usage ;;
         -*) usage ;;
         *) break ;;
@@ -232,7 +236,7 @@ check_case() {
     if [ -s "$dir/checks" ] && ! check_ir "$source" "$dir"; then
         return 1
     fi
-    if ! "$COMPILER" --target "$TARGET" $OPT "$source" -o "$dir/prog.s" >"$dir/compile.out" 2>&1; then
+    if ! "$COMPILER" --target "$TARGET" $OPT "$source" -o "$dir/$OUT" >"$dir/compile.out" 2>&1; then
         { echo "compile failed:"; cat "$dir/compile.out"; } >"$dir/why"
         return 1
     fi
@@ -249,7 +253,7 @@ check_case() {
         csources="-I $dir $csources"
     fi
     # shellcheck disable=SC2086
-    if ! "$CC" $LINK_FLAGS -o "$dir/prog" "$dir/prog.s" $csources -lm >"$dir/link.out" 2>&1; then
+    if ! "$CC" $LINK_FLAGS -o "$dir/prog" "$dir/$OUT" $csources -lm >"$dir/link.out" 2>&1; then
         { echo "$CC failed:"; cat "$dir/link.out"; } >"$dir/why"
         return 1
     fi

@@ -124,7 +124,7 @@ need() { # <tool> <why>
 need git "releases are read from git tags"
 need tar "release trees are extracted with git archive | tar"
 need awk "the manifest is read with awk"
-need cmp "the fixpoint compares the emitted assembly"
+need cmp "the fixpoint compares the emitted assembly or objects"
 need "$CC" "the C compiler assembles and links tachyon's output (set CC to use another)"
 if [ -z "$SEED_BIN" ]; then
     need cargo "the seed is the Rust compiler; install Rust with rustup (https://rustup.rs)"
@@ -248,6 +248,14 @@ compile_with() { # <cli> <bin> <src> <root> <out>
             "$cw_bin" --target "$HOST" "$@" -o "$cw_out.s" || die "$cw_bin failed to compile $cw_src"
             # shellcheck disable=SC2086
             "$CC" $LINK_FLAGS -o "$cw_out" "$cw_out.s" -lm || die "$CC failed to link $cw_out.s"
+            CW_EMITTED=s
+            ;;
+        tachyonc-0.7)
+            # From 0.7 the compiler writes the object itself; cc links.
+            "$cw_bin" --target "$HOST" "$@" -o "$cw_out.o" || die "$cw_bin failed to compile $cw_src"
+            # shellcheck disable=SC2086
+            "$CC" $LINK_FLAGS -o "$cw_out" "$cw_out.o" -lm || die "$CC failed to link $cw_out.o"
+            CW_EMITTED=o
             ;;
         *)
             die "unknown compiler interface '$cw_cli' (bootstrap.sh needs to learn it)"
@@ -267,8 +275,8 @@ build_and_check() { # <name> <tree> <compiler> <root> <cli> <tests> <builder_cli
     step "$bc_name: building with itself, twice"
     compile_with "$bc_cli" "$bc_dir/build1" "$bc_src" "$bc_root" "$bc_dir/build2"
     compile_with "$bc_cli" "$bc_dir/build2" "$bc_src" "$bc_root" "$bc_dir/build3"
-    cmp -s "$bc_dir/build2.s" "$bc_dir/build3.s" \
-        || die "$bc_name: no fixpoint: $bc_dir/build2.s and build3.s differ (its output depends on how it was built)"
+    cmp -s "$bc_dir/build2.$CW_EMITTED" "$bc_dir/build3.$CW_EMITTED" \
+        || die "$bc_name: no fixpoint: $bc_dir/build2.$CW_EMITTED and build3.$CW_EMITTED differ (its output depends on how it was built)"
     cp "$bc_dir/build2" "$bc_dir/tachyonc"
     step "$bc_name: running its test suite ($bc_tests)"
     if ! (cd "$bc_tree" && "./$bc_tests" -c "$bc_dir/tachyonc" -t "$HOST") >"$bc_dir/tests.log" 2>&1; then
