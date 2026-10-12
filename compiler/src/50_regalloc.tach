@@ -730,7 +730,7 @@ fn add_hints(v: i64) {
         call_locations(v, &locations as *i64, &copies as *i64, &float_regs);
         for i in 0..INSTS[v].nargs {
             let a = tracked(ir_arg(v, i));
-            if a >= 0 && locations[i] < 16 && RV_HREG[a] < 0 {
+            if a >= 0 && locations[i] < 16 && RV_HREG[a] < 0 && USES[ir_arg(v, i)] == 1 {
                 RV_HREG[a] = arg_reg(locations[i]);
             }
         }
@@ -820,19 +820,6 @@ fn build_intervals() {
             let op = INSTS[v].op;
             if t >= 0 && (op == Op::Phi || op == Op::Param) {
                 add_def(t, start, start, USE_NONE, live);
-                if op == Op::Phi {
-                    for i in 0..INSTS[v].nargs {
-                        let a = tracked(ir_arg(v, i));
-                        if a >= 0 {
-                            if RV_HINT[a] < 0 {
-                                RV_HINT[a] = t;
-                            }
-                            if RV_HINT[t] < 0 {
-                                RV_HINT[t] = a;
-                            }
-                        }
-                    }
-                }
             }
             v = INSTS[v].next;
         }
@@ -847,7 +834,43 @@ fn build_intervals() {
     for r in 0..64 {
         reverse_pairs(&FIXED[r]);
     }
+    phi_hints();
     param_hints();
+}
+
+// A phi operand would like its phi's register; a phi, the register of the
+// phi it flows into, else of an operand (coalescing them removes moves).
+fn phi_hints() {
+    for k in 0..ORDER.count {
+        let mut v = BLOCKS[ORDER.data[k]].first;
+        while v != 0 && INSTS[v].op == Op::Phi {
+            let t = tracked(v);
+            if t >= 0 {
+                for i in 0..INSTS[v].nargs {
+                    let a = tracked(ir_arg(v, i));
+                    if a >= 0 && RV_HINT[a] < 0 {
+                        RV_HINT[a] = t;
+                    }
+                }
+            }
+            v = INSTS[v].next;
+        }
+    }
+    for k in 0..ORDER.count {
+        let mut v = BLOCKS[ORDER.data[k]].first;
+        while v != 0 && INSTS[v].op == Op::Phi {
+            let t = tracked(v);
+            if t >= 0 && RV_HINT[t] < 0 {
+                for i in 0..INSTS[v].nargs {
+                    let a = tracked(ir_arg(v, i));
+                    if a >= 0 && RV_HINT[t] < 0 {
+                        RV_HINT[t] = a;
+                    }
+                }
+            }
+            v = INSTS[v].next;
+        }
+    }
 }
 
 // Parameters would like the register they arrive in.
@@ -1226,24 +1249,26 @@ fn use_distance(i: i64, pos: i64, from: i64) -> i64 {
     (d << 20) | min_i64(raw, 0xfffff)
 }
 
-// The register the value of interval i would like, or -1.
+// The register the value of interval i would like, or -1: its partner's
+// (a phi and its operands), else the register it arrives in or goes to.
 fn hint_reg(i: i64) -> i64 {
     let t = IVS[i].value;
-    if RV_HREG[t] >= 0 {
-        return RV_HREG[t];
-    }
-    let other = RV_HINT[t];
-    if other < 0 {
-        return -1;
-    }
-    let mut j = RV_FIRST[other];
-    while j >= 0 {
-        if IVS[j].reg >= 0 {
-            return IVS[j].reg;
+    let mut other = RV_HINT[t];
+    // The partner's register, or (not allocated yet) its own partner's.
+    for _ in 0..2 {
+        if other < 0 || other == t {
+            break;
         }
-        j = IVS[j].next;
+        let mut j = RV_FIRST[other];
+        while j >= 0 {
+            if IVS[j].reg >= 0 {
+                return IVS[j].reg;
+            }
+            j = IVS[j].next;
+        }
+        other = RV_HINT[other];
     }
-    -1
+    RV_HREG[t]
 }
 
 fn assign(i: i64, r: i64) {
@@ -1621,6 +1646,63 @@ fn allocate_registers(fi: i64) {
     compute_liveness();
     build_intervals();
     linear_scan();
+    if PRINT_REGALLOC {
+        print_allocation();
+    }
+}
+
+// --print-regalloc: the blocks' positions and every value's intervals,
+// on stderr.
+static mut PRINT_REGALLOC: bool = false;
+
+fn print_allocation() {
+    let out = buf_new();
+    buf_str(out, c"regalloc ");
+    buf_bytes(out, SYMS[FNS[IRFUNCS[IRF].f].name].text);
+    buf_str(out, c":\n");
+    for k in 0..ORDER.count {
+        buf_str(out, c"  b");
+        buf_int(out, ORDER.data[k]);
+        buf_str(out, c" [");
+        buf_int(out, BSTART.data[k]);
+        buf_str(out, c", ");
+        buf_int(out, BEND.data[k]);
+        buf_str(out, c"] depth ");
+        buf_int(out, LDEPTH.data[k]);
+        buf_str(out, c"\n");
+    }
+    for t in 0..RA_VALS.count {
+        buf_str(out, c"  v");
+        buf_int(out, RA_VALS.data[t]);
+        if RV_HINT[t] >= 0 {
+            buf_str(out, c" hint v");
+            buf_int(out, RA_VALS.data[RV_HINT[t]]);
+        }
+        if RV_HREG[t] >= 0 {
+            buf_str(out, c" hint r");
+            buf_int(out, RV_HREG[t]);
+        }
+        let mut i = RV_FIRST[t];
+        while i >= 0 {
+            buf_str(out, c" |");
+            if IVS[i].reg >= 0 {
+                buf_str(out, c" r");
+                buf_int(out, IVS[i].reg);
+            } else {
+                buf_str(out, c" stack");
+            }
+            for r in 0..IVS[i].ranges.count / 2 {
+                buf_str(out, c" [");
+                buf_int(out, IVS[i].ranges.data[2 * r]);
+                buf_str(out, c",");
+                buf_int(out, IVS[i].ranges.data[2 * r + 1]);
+                buf_str(out, c")");
+            }
+            i = IVS[i].next;
+        }
+        buf_str(out, c"\n");
+    }
+    buf_write_fd(out, 2);
 }
 
 // ---- Moves ----
