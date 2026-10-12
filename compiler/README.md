@@ -8,6 +8,8 @@ $ tachyonc examples/md5.tach -o md5.s && cc -o md5 md5.s -lm
 $ tachyonc --target x86_64-linux compiler/src/*.tach -o linux.s   # cross-compile
 $ tachyonc -O0 examples/md5.tach -o md5.s     # -O0, -O1 or -O2 (the default)
 $ tachyonc --emit-ir examples/md5.tach -o md5.ir    # the optimized IR
+$ tachyonc --emit-imports prog.tach -o decls.tach   # what `import "x.h";` declares
+$ tachyonc --emit-header prog.tach -o prog.h        # the program's C header
 $ tachyonc --tokens file.tach        # the token dump (same format as the seed's `tachyon tokens`)
 $ tachyonc --version                 # the release and the host
 ```
@@ -32,6 +34,9 @@ format (`error[type error]: ...` / ` --> file: line L, column C` /
 |---|---|
 | `00_base.tach` | C library declarations, growable arrays, byte buffers, the symbol interner, source files, error reporting |
 | `10_lexer.tach` | source text to tokens; token for token the same as the seed's lexer |
+| `15_cpp.tach` | `import` (1/2): the C preprocessor, with the target C compiler's macros and include path |
+| `16_cimport.tach` | `import` (2/2): C declarations and layouts, written out as tachyon source |
+| `17_cheader.tach` | `--emit-header`: the C header of a program |
 | `20_ast.tach` | the AST: an arena of uniform nodes (`NODES`), child lists in `LISTS` |
 | `21_parser.tach` | recursive descent for items and statements, a Pratt parser for expressions |
 | `30_types.tach` | interned types, layouts, the tables of structs, functions, constants and statics |
@@ -50,7 +55,13 @@ format (`error[type error]: ...` / ` --> file: line L, column C` /
 | `48_gvn.tach` | global value numbering, alias analysis, load and store forwarding, dead stores |
 | `48_sroa.tach` | scalar replacement of aggregates; constant local tables to read-only data |
 | `49_inline.tach` | inlining over the call graph's components |
+| `46_adce.tach` | aggressive dead code elimination over control dependence (post-dominators) |
 | `49_licm.tach` | natural loops and loop-invariant code motion |
+| `49_loop.tach` | the loop forest, canonical loops, LCSSA, the SSA updater, cloning, loop rotation |
+| `49_lsr.tach` | loop strength reduction (pointer induction variables), loop unswitching |
+| `49_range.tach` | value ranges and facts: bounds-check elimination, comparison folding, jump threading, comparison chains to switches |
+| `49_scev.tach` | induction variables, trip counts, exit values, dead loop deletion, unrolling |
+| `49_tre.tach` | tail recursion elimination with accumulators |
 | `50_regalloc.tach` | block layout, liveness, linear-scan register allocation |
 | `51_emit.tach` | emission of the allocated IR: operands, parallel moves, calls, frames |
 | `52_mc_arm64.tach` | AArch64 instructions on physical registers |
@@ -88,43 +99,51 @@ the seed traps.
 ## The language subset of its own source
 
 A release's compiler source may only use what the previous release's binary
-supports (see [docs/releases.md](../docs/releases.md)). The 0.3 source is
-built by 0.2.0 and uses the same subset as 0.2 (no enums, `match`, methods,
-slices or `extern "C"` blocks: those come in 0.4; its C declarations are
-the deprecated `extern fn` form). The 0.1 source,
-built by the seed, uses the constructs below; the 0.2 source, built by
-0.1.0, uses them too, and in addition struct fields of struct type,
-functions returning a struct, and statics of array type (all supported by
-0.1.0):
+supports (see [docs/releases.md](../docs/releases.md)), so a feature that
+appears in release N enters the compiler's own source in N+1.
 
-- items: `fn`, `extern fn` (including `-> !`), `struct`, `const`, `static`
-  and `static mut` (with struct literals and casts as initializers);
-- types: `i64`, `i32`, `u64`, `u32`, `u8`, `bool`, `f64`, `f32`, pointers
-  (`*T`, `**T`) and fixed arrays (`[T; N]`);
-- statements: `let`, `let mut`;
-- expressions: arithmetic, bitwise, shift, comparison and logical operators,
-  compound assignment, `as` casts, `&` and `*`, indexing of arrays and
-  pointers, field access, struct literals, array literals and `[v; n]`,
-  calls;
-- control flow: `if`/`else if`/`else` (also as values), `while`, `for` over
-  `a..b`, `loop`, `break`, `continue`, `return`;
-- literals: integers (decimal and hex), characters, floats, `c"..."`,
-  `true`/`false`.
+The 0.4 source is built by 0.3.0 and uses the 0.3 language:
 
-It does not use tuples, function pointer types, type aliases, loop labels,
-`break` with a value, `..=`, `"..."` strings or block comments; all of these
-are supported by the compiler itself and covered by the test suite.
+- **C declarations** in an `extern "C" { ... }` block (`00_base.tach`,
+  `90_main.tach`); 0.2's single `extern fn f(...);` declarations were
+  removed from the language in 0.4;
+- **fieldless enums** for every kind of thing that used to be an integer
+  constant: `NodeKind` (AST nodes), `Tok` (tokens), `TyKind` (types), `Op`,
+  `Cond` and `Term` (the IR), `Res` (what an identifier names), `AbiClass`,
+  `Lattice` (SCCP). `Tok` and `Op` keep their 0.3 numbering
+  (`Tok::Plus as i64` is 65): the IR's value numbering hashes opcodes;
+- **match** for the dispatch over them (with guards and `|` alternatives);
+- **methods**: `IntVec` (`v.push(x)`, `v.pop()`), `HMap` (`m.get(k)`,
+  `m.put(k, v)`), and on the enums (`op.name()`, `op.is_pure()`,
+  `cond.negate()`, `cond.mirror()`, `kind.text()`);
+- **slices** where bytes were passed as a pointer and a length (`intern`,
+  `buf_bytes`, `add_string`, `data_bytes`, the symbol table's `text`, the
+  string literals `STRS`);
+- assignments that evaluate their right side first, so `NODES[n].a =
+  parse_expr()` is safe even when `parse_expr` reallocates `NODES`.
 
-One rule its source follows that is easy to miss: built by 0.2.0, whose
-assignments compute the target's address first, `NODES[n].a = parse_expr()`
-would write into the old array if `parse_expr` grows (reallocates)
-`NODES`. Such calls are made into a local first (0.3 evaluates the right
-side first, so from 0.4 on the rule goes away).
+Not used yet: enums with fields, tuples, function pointer types, `#[repr]`
+types, slicing of arrays. Most data still lives in global arrays indexed by
+id (`NODES[n]`, `INSTS[v]`, `TYPES[t]`), and the element sizes passed to
+`grow` are written out (`grow(..., 104)`: there is no `size_of`); a struct
+whose fields change must have its size updated (`init_ir` checks the IR's).
+
+Features new in 0.4 enter this source in 0.5.
+
+To show that a change to the compiler's source changes nothing it emits,
+`tests/compare.sh OLD NEW` compiles a corpus (the test programs, the
+examples, the benchmarks, random programs, the compiler's own source at
+HEAD and at the last release) with both compilers, at every level for
+every target, and compares the assembly, the IR, the token dumps and the
+diagnostics byte for byte. The 0.4 migration of this source to the 0.3
+language was checked with it: identical output for all 7,500 compilations
+(apart from the two programs testing the removed `extern fn`).
 
 ## Known limits
 
 - One error per compilation (the seed recovers and reports all of them).
-- `#[repr(C, align(N))]` takes N up to 16 (frames are not realigned).
+- `#[repr(C, align(N))]` takes N up to 16 (frames are not realigned); C
+  records aligned above 16 are imported opaque.
 - Targets: AArch64 macOS, x86-64 Linux and macOS. No AArch64 Linux yet.
 - The optimizer's limits are listed at the end of
   [docs/optimizer.md](../docs/optimizer.md).

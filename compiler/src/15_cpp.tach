@@ -1,0 +1,1744 @@
+// C import (1/2): the C preprocessor, for `import "header.h";`.
+//
+// Headers are read as the target's C compiler reads them: its predefined
+// macros and its include search path are asked from the compiler itself
+// (`cc -dM -E -v`, see cpp_query_compiler), so a header means to tachyon
+// what it means to C on this machine. The preprocessor follows C11 6.10
+// with the GNU extensions system headers rely on: `#include_next`,
+// `, ## __VA_ARGS__`, `__has_include`, `#pragma once`. Macro expansion
+// uses hide sets (Prosser's algorithm): every token carries the set of
+// macros whose expansion produced it, and a macro is not expanded again
+// inside its own expansion.
+//
+// The output is one stream of tokens for the declarations of all the
+// imported headers, read by 16_cimport.tach.
+
+extern "C" {
+    fn popen(command: *u8, mode: *u8) -> *u8;
+    fn pclose(stream: *u8) -> i32;
+    fn fgets(buf: *u8, size: i32, stream: *u8) -> *u8;
+    fn getenv(name: *u8) -> *u8;
+    fn access(path: *u8, mode: i32) -> i32;
+    fn snprintf(buf: *u8, size: u64, format: *u8, ...) -> i32;
+    fn strtoull(s: *u8, end: **u8, base: i32) -> u64;
+    fn strtof(s: *u8, end: **u8) -> f32;
+}
+
+// ---- Tokens ----
+
+enum CK { Eof, Ident, Num, Char, Str, Punct }
+
+// `text` is the token's spelling, interned; `space`: whitespace before it;
+// `bol`: first on its line; `hide`: its hide set (HS).
+struct CTok { kind: CK, space: bool, bol: bool, text: i64, file: i64, line: i64, hide: i64 }
+
+static mut CTOKS: *CTok = 0 as *CTok;
+static mut CTOK_COUNT: i64 = 0;
+static mut CTOK_CAP: i64 = 0;
+// Token lists (macro bodies, parameters) live here.
+static mut CINTS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// The end of the stream.
+static mut C_EOF: i64 = 0;
+
+fn ctok_new(kind: CK, text: i64, file: i64, line: i64, space: bool, bol: bool) -> i64 {
+    CTOKS = grow(CTOKS as *u8, CTOK_COUNT, &CTOK_CAP, 40) as *CTok;
+    let t = CTOK_COUNT;
+    CTOKS[t] = CTok { kind: kind, space: space, bol: bol, text: text, file: file, line: line, hide: 0 };
+    CTOK_COUNT += 1;
+    t
+}
+
+fn ctok_copy(t: i64) -> i64 {
+    let n = ctok_new(CTOKS[t].kind, CTOKS[t].text, CTOKS[t].file, CTOKS[t].line, CTOKS[t].space, false);
+    CTOKS[n].hide = CTOKS[t].hide;
+    n
+}
+
+fn ctok_is(t: i64, sym: i64) -> bool {
+    CTOKS[t].text == sym && CTOKS[t].kind != CK::Str && CTOKS[t].kind != CK::Char
+}
+
+fn ctok_text(t: i64) -> *u8 {
+    sym_name(CTOKS[t].text)
+}
+
+// ---- Hide sets: linked lists of macro names, 0 the empty set ----
+
+struct HsNode { sym: i64, next: i64 }
+
+static mut HS: *HsNode = 0 as *HsNode;
+static mut HS_COUNT: i64 = 0;
+static mut HS_CAP: i64 = 0;
+
+fn hs_cons(sym: i64, next: i64) -> i64 {
+    HS = grow(HS as *u8, HS_COUNT, &HS_CAP, 16) as *HsNode;
+    HS[HS_COUNT] = HsNode { sym: sym, next: next };
+    HS_COUNT += 1;
+    HS_COUNT - 1
+}
+
+fn hs_has(h: i64, sym: i64) -> bool {
+    let mut p = h;
+    while p != 0 {
+        if HS[p].sym == sym {
+            return true;
+        }
+        p = HS[p].next;
+    }
+    false
+}
+
+fn hs_add(h: i64, sym: i64) -> i64 {
+    if hs_has(h, sym) { h } else { hs_cons(sym, h) }
+}
+
+fn hs_union(a: i64, b: i64) -> i64 {
+    let mut r = b;
+    let mut p = a;
+    while p != 0 {
+        r = hs_add(r, HS[p].sym);
+        p = HS[p].next;
+    }
+    r
+}
+
+fn hs_inter(a: i64, b: i64) -> i64 {
+    let mut r = 0;
+    let mut p = a;
+    while p != 0 {
+        if hs_has(b, HS[p].sym) {
+            r = hs_cons(HS[p].sym, r);
+        }
+        p = HS[p].next;
+    }
+    r
+}
+
+// ---- Errors in C code ----
+
+fn c_error(t: i64, message: *u8) -> ! {
+    // An error in the list of imports: at the `import` item.
+    if t > 0 && CTOKS[t].file == C_IMPORT_FILE && CTOKS[t].line - 1 < C_IMPORT_POS.count {
+        ERR_KIND = c"C import";
+        error_at(C_IMPORT_POS.data[CTOKS[t].line - 1], message);
+    }
+    let out = buf_new();
+    buf_str(out, c"error[C import]: ");
+    buf_str(out, message);
+    if t > 0 && CTOKS[t].file >= 0 {
+        buf_str(out, c"\n --> ");
+        buf_str(out, CFILES[CTOKS[t].file].path);
+        buf_str(out, c": line ");
+        buf_int(out, CTOKS[t].line);
+    }
+    buf_byte(out, '\n');
+    buf_write_fd(out, STDERR);
+    exit(1)
+}
+
+fn c_error2(t: i64, message: *u8, detail: *u8) -> ! {
+    let b = buf_new();
+    buf_str(b, message);
+    buf_str(b, detail);
+    buf_byte(b, 0);
+    c_error(t, BUFS[b].data)
+}
+
+// Where the `import` items are in SRC, in order (the lines of `<import>`).
+static mut C_IMPORT_POS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut C_IMPORT_FILE: i64 = -1;
+
+// ---- The lexer ----
+
+// `dir`: the index in CDIRS of the directory the file was found in (-1:
+// found otherwise), for #include_next.
+struct CFile { path: *u8, dir: i64, first: i64, end: i64 }
+
+static mut CFILES: *CFile = 0 as *CFile;
+static mut CFILE_COUNT: i64 = 0;
+static mut CFILE_CAP: i64 = 0;
+
+fn c_ident_byte(c: u8) -> bool {
+    is_ident_byte(c) || c == '$'
+}
+
+fn c_punct_len(p: *u8, n: i64) -> i64 {
+    let a = p[0];
+    let b = if n > 1 { p[1] } else { 0 as u8 };
+    let c = if n > 2 { p[2] } else { 0 as u8 };
+    if (a == '.' && b == '.' && c == '.') || (a == '<' && b == '<' && c == '=') || (a == '>' && b == '>' && c == '=') {
+        return 3;
+    }
+    if (a == '-' && (b == '>' || b == '-' || b == '=')) || (a == '+' && (b == '+' || b == '='))
+        || (a == '<' && (b == '<' || b == '=')) || (a == '>' && (b == '>' || b == '='))
+        || (a == '=' && b == '=') || (a == '!' && b == '=') || (a == '&' && (b == '&' || b == '='))
+        || (a == '|' && (b == '|' || b == '=')) || ((a == '*' || a == '/' || a == '%' || a == '^') && b == '=')
+        || (a == '#' && b == '#') {
+        return 2;
+    }
+    1
+}
+
+// Lexes `n` bytes at `p` (lines already spliced) into tokens of file `f`;
+// returns the first token's index (the tokens end at CTOK_COUNT).
+fn c_lex(p: *u8, n: i64, f: i64, first_line: i64) -> i64 {
+    let first = CTOK_COUNT;
+    let mut i = 0;
+    let mut line = first_line;
+    let mut bol = true;
+    let mut space = false;
+    while i < n {
+        let c = p[i];
+        if c == '\n' {
+            line += 1;
+            bol = true;
+            space = false;
+            i += 1;
+            continue;
+        }
+        if c == ' ' || c == '\t' || c == '\r' || c == 12 || c == 11 {
+            space = true;
+            i += 1;
+            continue;
+        }
+        if c == '/' && i + 1 < n && p[i + 1] == '/' {
+            while i < n && p[i] != '\n' {
+                i += 1;
+            }
+            space = true;
+            continue;
+        }
+        if c == '/' && i + 1 < n && p[i + 1] == '*' {
+            i += 2;
+            while i < n && !(p[i] == '*' && i + 1 < n && p[i + 1] == '/') {
+                if p[i] == '\n' {
+                    line += 1;
+                }
+                i += 1;
+            }
+            i += 2;
+            space = true;
+            continue;
+        }
+        let start = i;
+        let mut kind = CK::Punct;
+        // Prefixed literals: L"", u8"", u"", U"".
+        let mut prefix = 0;
+        if (c == 'L' || c == 'U' || c == 'u') && i + 1 < n && (p[i + 1] == '"' || p[i + 1] == '\'') {
+            prefix = 1;
+        } else if c == 'u' && i + 2 < n && p[i + 1] == '8' && (p[i + 2] == '"' || p[i + 2] == '\'') {
+            prefix = 2;
+        }
+        let q = p[i + prefix];
+        if (prefix > 0 || c == '"' || c == '\'') && (q == '"' || q == '\'') {
+            kind = if q == '"' { CK::Str } else { CK::Char };
+            i += prefix + 1;
+            while i < n && p[i] != q && p[i] != '\n' {
+                if p[i] == '\\' && i + 1 < n {
+                    i += 1;
+                }
+                i += 1;
+            }
+            if i < n && p[i] == q {
+                i += 1;
+            }
+        } else if is_digit(c) || (c == '.' && i + 1 < n && is_digit(p[i + 1])) {
+            kind = CK::Num;
+            i += 1;
+            while i < n {
+                let d = p[i];
+                if (d == '+' || d == '-') && (p[i - 1] == 'e' || p[i - 1] == 'E' || p[i - 1] == 'p' || p[i - 1] == 'P') {
+                    i += 1;
+                } else if c_ident_byte(d) || d == '.' {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+        } else if c == '_' || is_alpha(c) || c == '$' {
+            kind = CK::Ident;
+            while i < n && c_ident_byte(p[i]) {
+                i += 1;
+            }
+        } else {
+            i += c_punct_len(&p[i], n - i);
+        }
+        ctok_new(kind, intern(p[start..i]), f, line, space, bol);
+        bol = false;
+        space = false;
+    }
+    first
+}
+
+// Reads a file and lexes it; returns its CFILES index.
+fn c_load_file(path: *u8, dir: i64) -> i64 {
+    let raw = buf_new();
+    read_file(path, raw);
+    // Splice lines (a backslash before a newline); a spliced line's
+    // newline is kept, after the logical line, so lines keep their numbers.
+    let text = buf_new();
+    let data = BUFS[raw].data;
+    let n = BUFS[raw].len;
+    let mut pending = 0;
+    let mut i = 0;
+    while i < n {
+        if data[i] == '\\' && i + 1 < n && data[i + 1] == '\n' {
+            pending += 1;
+            i += 2;
+            continue;
+        }
+        if data[i] == '\\' && i + 2 < n && data[i + 1] == '\r' && data[i + 2] == '\n' {
+            pending += 1;
+            i += 3;
+            continue;
+        }
+        buf_byte(text, data[i]);
+        if data[i] == '\n' {
+            while pending > 0 {
+                buf_byte(text, '\n');
+                pending -= 1;
+            }
+        }
+        i += 1;
+    }
+    buf_byte(text, '\n');
+    CFILES = grow(CFILES as *u8, CFILE_COUNT, &CFILE_CAP, 32) as *CFile;
+    let f = CFILE_COUNT;
+    CFILE_COUNT += 1;
+    let first = c_lex(BUFS[text].data, BUFS[text].len, f, 1);
+    CFILES[f] = CFile { path: path, dir: dir, first: first, end: CTOK_COUNT };
+    f
+}
+
+// ---- Macros ----
+
+// `params`, `body`: lists in CINTS (parameter symbols; token indices).
+// `builtin`: predefined by the compiler (not imported as constants).
+struct Macro {
+    name: i64, func: bool, variadic: bool, builtin: bool,
+    params: i64, param_count: i64, body: i64, body_count: i64,
+}
+
+static mut MACROS: *Macro = 0 as *Macro;
+static mut MACRO_COUNT: i64 = 0;
+static mut MACRO_CAP: i64 = 0;
+// Symbol + 1 -> macro + 1 (0: not defined).
+static mut MACRO_OF: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+static mut DEFINING_BUILTINS: bool = false;
+
+fn macro_of(sym: i64) -> i64 {
+    MACRO_OF.get(sym + 1) - 1
+}
+
+fn macro_param(m: i64, i: i64) -> i64 {
+    CINTS.data[MACROS[m].params + i]
+}
+
+fn macro_tok(m: i64, i: i64) -> i64 {
+    CINTS.data[MACROS[m].body + i]
+}
+
+// The index of `sym` among the parameters of macro m, or -1.
+fn macro_param_index(m: i64, sym: i64) -> i64 {
+    if !MACROS[m].func {
+        return -1;
+    }
+    for i in 0..MACROS[m].param_count {
+        if macro_param(m, i) == sym {
+            return i;
+        }
+    }
+    -1
+}
+
+// ---- Well-known symbols ----
+
+static mut S_HASH: i64 = 0;
+static mut S_HASHHASH: i64 = 0;
+static mut S_LPAREN: i64 = 0;
+static mut S_RPAREN: i64 = 0;
+static mut S_COMMA: i64 = 0;
+static mut S_ELLIPSIS: i64 = 0;
+static mut S_VA_ARGS: i64 = 0;
+static mut S_DEFINED: i64 = 0;
+static mut S_LT: i64 = 0;
+static mut S_GT: i64 = 0;
+static mut S_PRAGMA_OP: i64 = 0;
+static mut S_HAS_INCLUDE: i64 = 0;
+static mut S_HAS_INCLUDE_NEXT: i64 = 0;
+static mut S_LINE: i64 = 0;
+static mut S_FILE: i64 = 0;
+static mut S_COUNTER: i64 = 0;
+static mut S_ONE: i64 = 0;
+static mut S_ZERO: i64 = 0;
+
+fn init_cpp_syms() {
+    S_HASH = intern_c(c"#");
+    S_HASHHASH = intern_c(c"##");
+    S_LPAREN = intern_c(c"(");
+    S_RPAREN = intern_c(c")");
+    S_COMMA = intern_c(c",");
+    S_ELLIPSIS = intern_c(c"...");
+    S_VA_ARGS = intern_c(c"__VA_ARGS__");
+    S_DEFINED = intern_c(c"defined");
+    S_LT = intern_c(c"<");
+    S_GT = intern_c(c">");
+    S_PRAGMA_OP = intern_c(c"_Pragma");
+    S_HAS_INCLUDE = intern_c(c"__has_include");
+    S_HAS_INCLUDE_NEXT = intern_c(c"__has_include_next");
+    S_LINE = intern_c(c"__LINE__");
+    S_FILE = intern_c(c"__FILE__");
+    S_COUNTER = intern_c(c"__COUNTER__");
+    S_ONE = intern_c(c"1");
+    S_ZERO = intern_c(c"0");
+}
+
+// Builtins that `#if` answers (and `defined` says are defined): every
+// feature query is answered "no", so headers take their plainest path.
+fn is_query_builtin(sym: i64) -> bool {
+    let names: [*u8; 14] = [c"__has_attribute", c"__has_cpp_attribute", c"__has_c_attribute",
+        c"__has_builtin", c"__has_feature", c"__has_extension", c"__has_warning",
+        c"__has_declspec_attribute", c"__building_module", c"__is_target_arch",
+        c"__is_target_vendor", c"__is_target_os", c"__is_target_environment", c"__has_embed"];
+    for i in 0..14 {
+        if sym == intern_c(names[i]) {
+            return true;
+        }
+    }
+    false
+}
+
+// ---- The input: include frames, and tokens pushed back ----
+
+static mut FRAME_FILE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut FRAME_POS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut FRAME_COND: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// Tokens to read before the file's: the next one last.
+static mut CPP_PENDING: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// Expanding a list on its own (macro arguments, #if lines): the end of
+// CPP_PENDING is the end of the input.
+static mut CPP_LIST_MODE: bool = false;
+// Conditional inclusion: per open #if, COND_TAKEN (in the branch being
+// read), COND_SEARCH (no branch taken yet), COND_DONE (a branch was taken).
+static mut CPP_CONDS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+const COND_TAKEN: i64 = 0;
+const COND_SEARCH: i64 = 1;
+const COND_DONE: i64 = 2;
+static mut CPP_COUNTER: i64 = 0;
+static mut CPP_ONCE: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+// Include search: CDIRS holds directory paths (C strings); the first
+// CDIR_USER are from -I.
+static mut CDIRS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+fn cur_frame() -> i64 {
+    FRAME_FILE.count - 1
+}
+
+fn push_frame(f: i64) {
+    if FRAME_FILE.count > 200 {
+        c_error2(0, c"#include nested too deeply: ", CFILES[f].path);
+    }
+    FRAME_FILE.push(f);
+    FRAME_POS.push(CFILES[f].first);
+    FRAME_COND.push(CPP_CONDS.count);
+}
+
+// The next token of the current file, or -1 at its end (no frames: EOF).
+fn file_tok() -> i64 {
+    let fr = cur_frame();
+    let pos = FRAME_POS.data[fr];
+    if pos >= CFILES[FRAME_FILE.data[fr]].end {
+        return -1;
+    }
+    FRAME_POS.data[fr] = pos + 1;
+    pos
+}
+
+fn file_peek() -> i64 {
+    let fr = cur_frame();
+    let pos = FRAME_POS.data[fr];
+    if pos >= CFILES[FRAME_FILE.data[fr]].end { -1 } else { pos }
+}
+
+// The rest of the directive's line, as a list in CINTS (start, count).
+fn line_tokens() -> (i64, i64) {
+    let start = CINTS.count;
+    loop {
+        let t = file_peek();
+        if t < 0 || CTOKS[t].bol {
+            break;
+        }
+        file_tok();
+        CINTS.push(t);
+    }
+    (start, CINTS.count - start)
+}
+
+fn skip_line() {
+    loop {
+        let t = file_peek();
+        if t < 0 || CTOKS[t].bol {
+            return;
+        }
+        file_tok();
+    }
+}
+
+// The next token before macro expansion; directives are carried out.
+fn raw_next() -> i64 {
+    loop {
+        if CPP_PENDING.count > 0 {
+            return CPP_PENDING.pop();
+        }
+        if CPP_LIST_MODE || FRAME_FILE.count == 0 {
+            return C_EOF;
+        }
+        let t = file_tok();
+        if t < 0 {
+            if CPP_CONDS.count != FRAME_COND.data[cur_frame()] {
+                c_error2(0, c"unterminated #if in ", CFILES[FRAME_FILE.data[cur_frame()]].path);
+            }
+            FRAME_FILE.pop();
+            FRAME_POS.pop();
+            FRAME_COND.pop();
+            continue;
+        }
+        if CTOKS[t].bol && ctok_is(t, S_HASH) && CTOKS[t].kind == CK::Punct {
+            directive(t);
+            continue;
+        }
+        return t;
+    }
+}
+
+fn push_back(t: i64) {
+    CPP_PENDING.push(t);
+}
+
+// Pushes the tokens of a list (in CINTS or scratch) to be read next.
+fn push_list(v: *IntVec) {
+    let mut i = (*v).count - 1;
+    while i >= 0 {
+        CPP_PENDING.push((*v).data[i]);
+        i -= 1;
+    }
+}
+
+// ---- Expansion ----
+
+// The next macro-expanded token.
+fn cpp_next() -> i64 {
+    loop {
+        let t = raw_next();
+        if CTOKS[t].kind != CK::Ident {
+            return t;
+        }
+        let sym = CTOKS[t].text;
+        if hs_has(CTOKS[t].hide, sym) {
+            return t;
+        }
+        if sym == S_PRAGMA_OP {
+            // _Pragma("...") is dropped.
+            let open = raw_next();
+            if !ctok_is(open, S_LPAREN) {
+                push_back(open);
+                return t;
+            }
+            let mut depth = 1;
+            while depth > 0 {
+                let x = raw_next();
+                if x == C_EOF {
+                    break;
+                }
+                if ctok_is(x, S_LPAREN) {
+                    depth += 1;
+                } else if ctok_is(x, S_RPAREN) {
+                    depth -= 1;
+                }
+            }
+            continue;
+        }
+        if sym == S_LINE || sym == S_COUNTER || sym == S_FILE {
+            let n = ctok_copy(t);
+            if sym == S_FILE {
+                CTOKS[n].kind = CK::Str;
+                let b = buf_new();
+                buf_byte(b, '"');
+                if CTOKS[t].file >= 0 {
+                    buf_str(b, CFILES[CTOKS[t].file].path);
+                }
+                buf_byte(b, '"');
+                CTOKS[n].text = intern(buf_slice(b));
+            } else {
+                CTOKS[n].kind = CK::Num;
+                let b = buf_new();
+                if sym == S_LINE {
+                    buf_int(b, CTOKS[t].line);
+                } else {
+                    buf_int(b, CPP_COUNTER);
+                    CPP_COUNTER += 1;
+                }
+                CTOKS[n].text = intern(buf_slice(b));
+            }
+            return n;
+        }
+        let m = macro_of(sym);
+        if m < 0 {
+            return t;
+        }
+        if !MACROS[m].func {
+            let out = subst(m, 0 as *i64, 0);
+            finish_expansion(&out, t, hs_add(CTOKS[t].hide, sym));
+            continue;
+        }
+        let next = raw_next();
+        if !ctok_is(next, S_LPAREN) {
+            push_back(next);
+            return t;
+        }
+        let args = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let rparen = collect_args(m, t, &args);
+        let out = subst(m, args.data, args.count);
+        finish_expansion(&out, t, hs_add(hs_inter(CTOKS[t].hide, CTOKS[rparen].hide), sym));
+    }
+}
+
+// Gives the expansion of the macro named by `t` its hide set and t's
+// leading space, and makes it the next input.
+fn finish_expansion(out: *IntVec, t: i64, hide: i64) {
+    for i in 0..(*out).count {
+        let n = ctok_copy((*out).data[i]);
+        CTOKS[n].hide = hs_union(CTOKS[n].hide, hide);
+        if i == 0 {
+            CTOKS[n].space = CTOKS[t].space;
+        }
+        (*out).data[i] = n;
+    }
+    push_list(out);
+}
+
+// The arguments of a call of function-like macro m (after its `(`):
+// `args` gets, per argument, the start of its tokens in CINTS and their
+// count. Returns the closing parenthesis.
+fn collect_args(m: i64, name: i64, args: *IntVec) -> i64 {
+    let mut depth = 0;
+    let pieces = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    let mut toks = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    let mut arg_start = 0;
+    let mut rparen = 0;
+    loop {
+        let t = raw_next();
+        if t == C_EOF {
+            c_error2(name, c"unterminated call of macro ", ctok_text(name));
+        }
+        if ctok_is(t, S_LPAREN) {
+            depth += 1;
+        } else if ctok_is(t, S_RPAREN) {
+            if depth == 0 {
+                rparen = t;
+                break;
+            }
+            depth -= 1;
+        } else if depth == 0 && ctok_is(t, S_COMMA) && CTOKS[t].kind == CK::Punct {
+            let in_va = MACROS[m].variadic && pieces.count / 2 == MACROS[m].param_count - 1;
+            if !in_va {
+                pieces.push(arg_start);
+                pieces.push(toks.count - arg_start);
+                arg_start = toks.count;
+                continue;
+            }
+        }
+        toks.push(t);
+    }
+    pieces.push(arg_start);
+    pieces.push(toks.count - arg_start);
+    let mut given = pieces.count / 2;
+    // `f()` passes one empty argument; it is no argument for a macro
+    // without parameters.
+    if given == 1 && MACROS[m].param_count == 0 && toks.count == 0 {
+        given = 0;
+    }
+    if given < MACROS[m].param_count && MACROS[m].variadic && given == MACROS[m].param_count - 1 {
+        pieces.push(toks.count);
+        pieces.push(0);
+        given += 1;
+    }
+    if given != MACROS[m].param_count {
+        c_error2(name, c"wrong number of arguments in call of macro ", ctok_text(name));
+    }
+    for i in 0..given {
+        let start = CINTS.count;
+        for k in 0..pieces.data[2 * i + 1] {
+            CINTS.push(toks.data[pieces.data[2 * i] + k]);
+        }
+        (*args).push(start);
+        (*args).push(pieces.data[2 * i + 1]);
+    }
+    rparen
+}
+
+// The tokens of list (start, count) in CINTS, macro-expanded on their own.
+fn expand_list(start: i64, count: i64) -> IntVec {
+    let saved_pending = CPP_PENDING;
+    let saved_mode = CPP_LIST_MODE;
+    CPP_PENDING = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    CPP_LIST_MODE = true;
+    let mut i = count - 1;
+    while i >= 0 {
+        CPP_PENDING.push(CINTS.data[start + i]);
+        i -= 1;
+    }
+    let mut out = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    loop {
+        let t = cpp_next();
+        if t == C_EOF {
+            break;
+        }
+        out.push(t);
+    }
+    CPP_PENDING = saved_pending;
+    CPP_LIST_MODE = saved_mode;
+    out
+}
+
+// The replacement of macro m, its parameters replaced by the arguments
+// (`args`: start and count of each in CINTS), with # and ## applied.
+fn subst(m: i64, args: *i64, nargs: i64) -> IntVec {
+    let mut out = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    let n = MACROS[m].body_count;
+    let mut i = 0;
+    while i < n {
+        let t = macro_tok(m, i);
+        let next = if i + 1 < n { macro_tok(m, i + 1) } else { -1 };
+        // # param: the argument as a string.
+        if MACROS[m].func && ctok_is(t, S_HASH) && next >= 0 {
+            let p = macro_param_index(m, CTOKS[next].text);
+            if p >= 0 {
+                out.push(stringize(args[2 * p], args[2 * p + 1], t));
+                i += 2;
+                continue;
+            }
+        }
+        // x ## y
+        if ctok_is(t, S_HASHHASH) && next >= 0 {
+            let p = macro_param_index(m, CTOKS[next].text);
+            if p >= 0 {
+                let start = args[2 * p];
+                let count = args[2 * p + 1];
+                // GNU: `, ## __VA_ARGS__` drops the comma when there are
+                // no variable arguments, and pastes nothing otherwise.
+                if out.count > 0 && ctok_is(out.data[out.count - 1], S_COMMA)
+                    && CTOKS[next].text == S_VA_ARGS {
+                    if count == 0 {
+                        out.pop();
+                    } else {
+                        for k in 0..count {
+                            out.push(CINTS.data[start + k]);
+                        }
+                    }
+                    i += 2;
+                    continue;
+                }
+                if count > 0 {
+                    if out.count > 0 {
+                        out.data[out.count - 1] = paste(out.data[out.count - 1], CINTS.data[start]);
+                    } else {
+                        out.push(CINTS.data[start]);
+                    }
+                    for k in 1..count {
+                        out.push(CINTS.data[start + k]);
+                    }
+                }
+                i += 2;
+                continue;
+            }
+            if out.count > 0 {
+                out.data[out.count - 1] = paste(out.data[out.count - 1], next);
+            } else {
+                out.push(next);
+            }
+            i += 2;
+            continue;
+        }
+        let p = if CTOKS[t].kind == CK::Ident { macro_param_index(m, CTOKS[t].text) } else { -1 };
+        if p >= 0 {
+            let start = args[2 * p];
+            let count = args[2 * p + 1];
+            if next >= 0 && ctok_is(next, S_HASHHASH) {
+                // The operand of ## is not expanded; an empty one leaves
+                // the other operand.
+                if count == 0 {
+                    let after = if i + 2 < n { macro_tok(m, i + 2) } else { -1 };
+                    let q = if after >= 0 && CTOKS[after].kind == CK::Ident { macro_param_index(m, CTOKS[after].text) } else { -1 };
+                    if q >= 0 {
+                        for k in 0..args[2 * q + 1] {
+                            out.push(CINTS.data[args[2 * q] + k]);
+                        }
+                        i += 3;
+                    } else {
+                        i += 2;
+                    }
+                    continue;
+                }
+                for k in 0..count {
+                    out.push(CINTS.data[start + k]);
+                }
+                i += 1;
+                continue;
+            }
+            let expanded = expand_list(start, count);
+            for k in 0..expanded.count {
+                let x = ctok_copy(expanded.data[k]);
+                if k == 0 {
+                    CTOKS[x].space = CTOKS[t].space;
+                }
+                out.push(x);
+            }
+            i += 1;
+            continue;
+        }
+        out.push(t);
+        i += 1;
+    }
+    out
+}
+
+fn stringize(start: i64, count: i64, at: i64) -> i64 {
+    let b = buf_new();
+    buf_byte(b, '"');
+    for k in 0..count {
+        let t = CINTS.data[start + k];
+        if k > 0 && CTOKS[t].space {
+            buf_byte(b, ' ');
+        }
+        let text = SYMS[CTOKS[t].text].text;
+        let quoted = CTOKS[t].kind == CK::Str || CTOKS[t].kind == CK::Char;
+        for j in 0..text.len as i64 {
+            let c = text[j];
+            if quoted && (c == '"' || c == '\\') {
+                buf_byte(b, '\\');
+            }
+            buf_byte(b, c);
+        }
+    }
+    buf_byte(b, '"');
+    let n = ctok_copy(at);
+    CTOKS[n].kind = CK::Str;
+    CTOKS[n].text = intern(buf_slice(b));
+    n
+}
+
+// The token spelled by a's text followed by b's (a's position).
+fn paste(a: i64, b: i64) -> i64 {
+    let buf = buf_new();
+    buf_bytes(buf, SYMS[CTOKS[a].text].text);
+    buf_bytes(buf, SYMS[CTOKS[b].text].text);
+    let first = c_lex(BUFS[buf].data, BUFS[buf].len, CTOKS[a].file, CTOKS[a].line);
+    if CTOK_COUNT - first != 1 {
+        c_error2(a, c"pasting does not give one token: ", sym_name(intern(buf_slice(buf))));
+    }
+    CTOKS[first].space = CTOKS[a].space;
+    CTOKS[first].bol = false;
+    CTOKS[first].hide = CTOKS[a].hide;
+    first
+}
+
+// ---- Directives ----
+
+fn directive(hash: i64) {
+    let t = file_peek();
+    if t < 0 || CTOKS[t].bol {
+        return;
+    }
+    file_tok();
+    let name = ctok_text(t);
+    if streq(name, c"define") {
+        define_macro();
+    } else if streq(name, c"undef") {
+        let (start, count) = line_tokens();
+        if count > 0 {
+            MACRO_OF.put(CTOKS[CINTS.data[start]].text + 1, 0);
+        }
+    } else if streq(name, c"include") || streq(name, c"include_next") || streq(name, c"import") {
+        include(t, streq(name, c"include_next"));
+    } else if streq(name, c"if") {
+        let (start, count) = line_tokens();
+        begin_cond(eval_if(t, start, count));
+    } else if streq(name, c"ifdef") || streq(name, c"ifndef") {
+        let (start, count) = line_tokens();
+        if count == 0 {
+            c_error(t, c"#ifdef without a name");
+        }
+        let defined = is_defined(CTOKS[CINTS.data[start]].text);
+        begin_cond(defined == streq(name, c"ifdef"));
+    } else if streq(name, c"elif") || streq(name, c"elifdef") || streq(name, c"elifndef") || streq(name, c"else") {
+        // Reached in a taken branch: the rest of the #if is skipped.
+        if CPP_CONDS.count == FRAME_COND.data[cur_frame()] {
+            c_error(t, c"#else or #elif without #if");
+        }
+        skip_line();
+        CPP_CONDS.data[CPP_CONDS.count - 1] = COND_DONE;
+        skip_branches();
+    } else if streq(name, c"endif") {
+        if CPP_CONDS.count == FRAME_COND.data[cur_frame()] {
+            c_error(t, c"#endif without #if");
+        }
+        CPP_CONDS.pop();
+        skip_line();
+    } else if streq(name, c"error") {
+        let b = buf_new();
+        let (start, count) = line_tokens();
+        for k in 0..count {
+            if k > 0 {
+                buf_byte(b, ' ');
+            }
+            buf_bytes(b, SYMS[CTOKS[CINTS.data[start + k]].text].text);
+        }
+        buf_byte(b, 0);
+        c_error2(hash, c"#error ", BUFS[b].data);
+    } else if streq(name, c"pragma") {
+        let (start, count) = line_tokens();
+        if count > 0 && streq(ctok_text(CINTS.data[start]), c"once") {
+            CPP_ONCE.put(intern_c(CFILES[CTOKS[hash].file].path) + 1, 1);
+        }
+        if count > 0 && streq(ctok_text(CINTS.data[start]), c"pack") {
+            pragma_pack(hash, start + 1, count - 1);
+        }
+    } else {
+        // #line, #ident, #warning, #sccs, #assert, ...: ignored.
+        skip_line();
+    }
+}
+
+// #pragma pack: (n), (), (push), (push, n), (pop), (push, name, n). The
+// packing in force is passed to the declarations as the tokens
+// `__tachyon_pack <n>` (0: none).
+static mut PACK_STACK: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut PACK_NOW: i64 = 0;
+
+fn pragma_pack(at: i64, start: i64, count: i64) {
+    let mut values = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    let mut push = false;
+    let mut pop = false;
+    for k in 0..count {
+        let t = CINTS.data[start + k];
+        if CTOKS[t].kind == CK::Num {
+            let mut end = 0 as *u8;
+            values.push(strtoull(ctok_text(t), &end, 10) as i64);
+        } else if CTOKS[t].kind == CK::Ident && streq(ctok_text(t), c"push") {
+            push = true;
+        } else if CTOKS[t].kind == CK::Ident && streq(ctok_text(t), c"pop") {
+            pop = true;
+        }
+    }
+    if push {
+        PACK_STACK.push(PACK_NOW);
+    }
+    if pop {
+        PACK_NOW = if PACK_STACK.count > 0 { PACK_STACK.pop() } else { 0 };
+    }
+    if values.count > 0 {
+        PACK_NOW = values.data[values.count - 1];
+    } else if !push && !pop {
+        PACK_NOW = 0;
+    }
+    let marker = ctok_copy(at);
+    CTOKS[marker].kind = CK::Ident;
+    CTOKS[marker].text = intern_c(c"__tachyon_pack");
+    let value = ctok_copy(at);
+    CTOKS[value].kind = CK::Num;
+    let b = buf_new();
+    buf_int(b, PACK_NOW);
+    CTOKS[value].text = intern(buf_slice(b));
+    push_back(value);
+    push_back(marker);
+}
+
+fn is_defined(sym: i64) -> bool {
+    macro_of(sym) >= 0 || sym == S_LINE || sym == S_FILE || sym == S_COUNTER
+        || sym == S_HAS_INCLUDE || sym == S_HAS_INCLUDE_NEXT || is_query_builtin(sym)
+}
+
+fn define_macro() {
+    let name_tok = file_tok();
+    if name_tok < 0 || CTOKS[name_tok].bol || CTOKS[name_tok].kind != CK::Ident {
+        c_error(name_tok, c"#define needs a macro name");
+    }
+    MACROS = grow(MACROS as *u8, MACRO_COUNT, &MACRO_CAP, 64) as *Macro;
+    let m = MACRO_COUNT;
+    MACROS[m] = Macro {
+        name: CTOKS[name_tok].text, func: false, variadic: false, builtin: DEFINING_BUILTINS,
+        params: 0, param_count: 0, body: 0, body_count: 0,
+    };
+    let open = file_peek();
+    if open >= 0 && !CTOKS[open].bol && !CTOKS[open].space && ctok_is(open, S_LPAREN) {
+        file_tok();
+        MACROS[m].func = true;
+        let params = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        loop {
+            let p = file_tok();
+            if p < 0 || CTOKS[p].bol {
+                c_error(name_tok, c"unterminated macro parameter list");
+            }
+            if ctok_is(p, S_RPAREN) {
+                break;
+            }
+            if ctok_is(p, S_COMMA) {
+                continue;
+            }
+            if ctok_is(p, S_ELLIPSIS) {
+                MACROS[m].variadic = true;
+                params.push(S_VA_ARGS);
+                continue;
+            }
+            // GNU named variadic parameter: `args...`.
+            let after = file_peek();
+            if after >= 0 && ctok_is(after, S_ELLIPSIS) {
+                file_tok();
+                MACROS[m].variadic = true;
+            }
+            params.push(CTOKS[p].text);
+        }
+        MACROS[m].params = CINTS.count;
+        for i in 0..params.count {
+            CINTS.push(params.data[i]);
+        }
+        MACROS[m].param_count = params.count;
+    }
+    let (start, count) = line_tokens();
+    MACROS[m].body = start;
+    MACROS[m].body_count = count;
+    MACRO_COUNT += 1;
+    MACRO_OF.put(MACROS[m].name + 1, m + 1);
+}
+
+fn begin_cond(taken: bool) {
+    if taken {
+        CPP_CONDS.push(COND_TAKEN);
+    } else {
+        CPP_CONDS.push(COND_SEARCH);
+        skip_branches();
+    }
+}
+
+// Skips the tokens of branches not taken, up to the branch to read (an
+// #elif that holds or an #else, in state COND_SEARCH) or the #endif.
+fn skip_branches() {
+    let mut depth = 0;
+    loop {
+        let t = file_tok();
+        if t < 0 {
+            c_error2(0, c"unterminated #if in ", CFILES[FRAME_FILE.data[cur_frame()]].path);
+        }
+        if !(CTOKS[t].bol && ctok_is(t, S_HASH)) {
+            continue;
+        }
+        let d = file_peek();
+        if d < 0 || CTOKS[d].bol {
+            continue;
+        }
+        let name = ctok_text(d);
+        if streq(name, c"if") || streq(name, c"ifdef") || streq(name, c"ifndef") {
+            depth += 1;
+            continue;
+        }
+        if streq(name, c"endif") {
+            if depth > 0 {
+                depth -= 1;
+                continue;
+            }
+            file_tok();
+            skip_line();
+            CPP_CONDS.pop();
+            return;
+        }
+        if depth > 0 || CPP_CONDS.data[CPP_CONDS.count - 1] != COND_SEARCH {
+            continue;
+        }
+        if streq(name, c"else") {
+            file_tok();
+            skip_line();
+            CPP_CONDS.data[CPP_CONDS.count - 1] = COND_TAKEN;
+            return;
+        }
+        if streq(name, c"elif") {
+            file_tok();
+            let (start, count) = line_tokens();
+            if eval_if(d, start, count) {
+                CPP_CONDS.data[CPP_CONDS.count - 1] = COND_TAKEN;
+                return;
+            }
+        } else if streq(name, c"elifdef") || streq(name, c"elifndef") {
+            file_tok();
+            let (start, count) = line_tokens();
+            if count > 0 && is_defined(CTOKS[CINTS.data[start]].text) == streq(name, c"elifdef") {
+                CPP_CONDS.data[CPP_CONDS.count - 1] = COND_TAKEN;
+                return;
+            }
+        }
+    }
+}
+
+// ---- #include ----
+
+fn path_join(dir: *u8, name: *u8) -> *u8 {
+    let b = buf_new();
+    buf_str(b, dir);
+    buf_byte(b, '/');
+    buf_str(b, name);
+    buf_byte(b, 0);
+    BUFS[b].data
+}
+
+// The directory part of a path ("." when it has none).
+fn path_dir(path: *u8) -> *u8 {
+    let n = strlen(path) as i64;
+    let mut i = n - 1;
+    while i >= 0 && path[i] != '/' {
+        i -= 1;
+    }
+    if i < 0 {
+        return c".";
+    }
+    if i == 0 {
+        return c"/";
+    }
+    let b = buf_new();
+    buf_bytes(b, path[0..i]);
+    buf_byte(b, 0);
+    BUFS[b].data
+}
+
+fn file_exists(path: *u8) -> bool {
+    access(path, 0) == 0
+}
+
+// Where `#include` finds `name`: the path and its directory index
+// (-1: not from the search path); path 0 when not found.
+fn find_include(name: *u8, quoted: bool, next: bool, from_file: i64) -> (*u8, i64) {
+    if name[0] == '/' {
+        return (if file_exists(name) { name } else { 0 as *u8 }, -1);
+    }
+    let mut first = 0;
+    if next && from_file >= 0 && CFILES[from_file].dir >= 0 {
+        first = CFILES[from_file].dir + 1;
+    } else if quoted && from_file >= 0 {
+        let p = path_join(path_dir(CFILES[from_file].path), name);
+        if file_exists(p) {
+            return (p, -1);
+        }
+    }
+    for i in first..CDIRS.count {
+        let p = path_join(CDIRS.data[i] as *u8, name);
+        if file_exists(p) {
+            return (p, i);
+        }
+    }
+    (0 as *u8, -1)
+}
+
+// The header named by tokens (start, count): `"name"` or `<name>`; also
+// whether it was quoted. 0 when the tokens name none.
+fn header_name(start: i64, count: i64) -> (*u8, bool) {
+    if count == 0 {
+        return (0 as *u8, false);
+    }
+    let first = CINTS.data[start];
+    let b = buf_new();
+    if CTOKS[first].kind == CK::Str {
+        let text = SYMS[CTOKS[first].text].text;
+        buf_bytes(b, text[1..text.len as i64 - 1]);
+        buf_byte(b, 0);
+        return (BUFS[b].data, true);
+    }
+    if !ctok_is(first, S_LT) {
+        return (0 as *u8, false);
+    }
+    for k in 1..count {
+        let t = CINTS.data[start + k];
+        if ctok_is(t, S_GT) {
+            buf_byte(b, 0);
+            return (BUFS[b].data, false);
+        }
+        if CTOKS[t].space && k > 1 {
+            buf_byte(b, ' ');
+        }
+        buf_bytes(b, SYMS[CTOKS[t].text].text);
+    }
+    (0 as *u8, false)
+}
+
+fn include(at: i64, next: bool) {
+    let (start, count) = line_tokens();
+    let (mut name, mut quoted) = header_name(start, count);
+    if name == 0 as *u8 {
+        let expanded = expand_list(start, count);
+        let s = CINTS.count;
+        for k in 0..expanded.count {
+            CINTS.push(expanded.data[k]);
+        }
+        let (n2, q2) = header_name(s, expanded.count);
+        name = n2;
+        quoted = q2;
+    }
+    if name == 0 as *u8 {
+        c_error(at, c"#include expects \"file\" or <file>");
+    }
+    let (path, dir) = find_include(name, quoted, next, CTOKS[at].file);
+    if path == 0 as *u8 {
+        c_error2(at, c"header not found: ", name);
+    }
+    open_header(path, dir);
+}
+
+fn open_header(path: *u8, dir: i64) {
+    if CPP_ONCE.get(intern_c(path) + 1) != 0 {
+        return;
+    }
+    let f = c_load_file(path, dir);
+    push_frame(f);
+}
+
+// ---- #if ----
+
+fn eval_if(at: i64, start: i64, count: i64) -> bool {
+    // `defined X` and __has_include(...) are answered before expansion.
+    let line = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    let mut k = 0;
+    while k < count {
+        let t = CINTS.data[start + k];
+        let sym = CTOKS[t].text;
+        if CTOKS[t].kind == CK::Ident && sym == S_DEFINED {
+            let mut j = k + 1;
+            let paren = j < count && ctok_is(CINTS.data[start + j], S_LPAREN);
+            if paren {
+                j += 1;
+            }
+            if j >= count {
+                c_error(t, c"'defined' without a name");
+            }
+            let value = is_defined(CTOKS[CINTS.data[start + j]].text);
+            j += 1;
+            if paren {
+                j += 1;
+            }
+            line.push(number_tok(t, value));
+            k = j;
+            continue;
+        }
+        if CTOKS[t].kind == CK::Ident && (sym == S_HAS_INCLUDE || sym == S_HAS_INCLUDE_NEXT) {
+            let mut j = k + 2;
+            let name_start = start + j;
+            while j < count && !ctok_is(CINTS.data[start + j], S_RPAREN) {
+                j += 1;
+            }
+            // `<a/b.h>` and `"a.h"` are not macro-expanded here.
+            let (name, quoted) = header_name(name_start, start + j - name_start);
+            let mut found = false;
+            if name != 0 as *u8 {
+                let (path, _) = find_include(name, quoted, sym == S_HAS_INCLUDE_NEXT, CTOKS[t].file);
+                found = path != 0 as *u8;
+            }
+            line.push(number_tok(t, found));
+            k = j + 1;
+            continue;
+        }
+        line.push(t);
+        k += 1;
+    }
+    let s = CINTS.count;
+    for i in 0..line.count {
+        CINTS.push(line.data[i]);
+    }
+    let expanded = expand_list(s, line.count);
+    let (value, _) = eval_tokens(&expanded, at, false);
+    value != 0
+}
+
+fn number_tok(at: i64, value: bool) -> i64 {
+    let n = ctok_copy(at);
+    CTOKS[n].kind = CK::Num;
+    CTOKS[n].text = if value { S_ONE } else { S_ZERO };
+    n
+}
+
+// ---- Constant expressions ----
+//
+// Shared by `#if` (mode false: identifiers are 0, arithmetic is in
+// intmax_t/uintmax_t) and the declarations (mode true: enumerators,
+// casts, sizeof, C's integer types). A value is (bits, C type); EV_FAIL
+// is set when the expression is not an integer constant.
+
+static mut EV_TOKS: *i64 = 0 as *i64;
+static mut EV_N: i64 = 0;
+static mut EV_POS: i64 = 0;
+static mut EV_AT: i64 = 0;
+static mut EV_DECL: bool = false;
+static mut EV_FAIL: bool = false;
+
+fn eval_tokens(list: *IntVec, at: i64, decl: bool) -> (u64, i64) {
+    let saved = (EV_TOKS, EV_N, EV_POS, EV_AT, EV_DECL);
+    EV_TOKS = (*list).data;
+    EV_N = (*list).count;
+    EV_POS = 0;
+    EV_AT = at;
+    EV_DECL = decl;
+    EV_FAIL = false;
+    let result = ev_cond();
+    if EV_POS < EV_N {
+        ev_fail();
+    }
+    let (toks, n, pos, at0, decl0) = saved;
+    EV_TOKS = toks;
+    EV_N = n;
+    EV_POS = pos;
+    EV_AT = at0;
+    EV_DECL = decl0;
+    if EV_FAIL && !decl {
+        c_error(at, c"invalid #if expression");
+    }
+    result
+}
+
+fn ev_fail() {
+    EV_FAIL = true;
+    EV_POS = EV_N;
+}
+
+fn ev_peek() -> i64 {
+    if EV_POS < EV_N { EV_TOKS[EV_POS] } else { C_EOF }
+}
+
+fn ev_at(text: *u8) -> bool {
+    let t = ev_peek();
+    t != C_EOF && CTOKS[t].kind == CK::Punct && streq(ctok_text(t), text)
+}
+
+fn ev_eat(text: *u8) -> bool {
+    if ev_at(text) {
+        EV_POS += 1;
+        return true;
+    }
+    false
+}
+
+// The type arithmetic on a and b is done in (C's usual conversions; in
+// #if, intmax_t and uintmax_t).
+fn ev_common(a: i64, b: i64) -> i64 {
+    let ta = ev_promote(a);
+    let tb = ev_promote(b);
+    let wa = cty_bits(ta);
+    let wb = cty_bits(tb);
+    let wide = if wa > wb { wa } else { wb };
+    let unsigned = (cty_bits(ta) == wide && !cty_signed(ta)) || (cty_bits(tb) == wide && !cty_signed(tb));
+    cty_int(wide, !unsigned)
+}
+
+fn ev_promote(t: i64) -> i64 {
+    if !EV_DECL {
+        return cty_int(64, cty_signed(t));
+    }
+    let bits = cty_bits(t);
+    if bits < 32 {
+        return cty_int(32, true);
+    }
+    cty_int(bits, cty_signed(t))
+}
+
+// `value` converted to integer type t.
+fn ev_convert(value: u64, t: i64) -> u64 {
+    let bits = cty_bits(t);
+    if bits >= 64 {
+        return value;
+    }
+    let mask = ((1 as u64) << bits as u64) - 1;
+    let v = value & mask;
+    if cty_signed(t) && (v >> (bits - 1) as u64) != 0 {
+        return v | ~mask;
+    }
+    v
+}
+
+fn ev_cond() -> (u64, i64) {
+    let (c, ct) = ev_binary(0);
+    if !ev_eat(c"?") {
+        return (c, ct);
+    }
+    let (a, at) = ev_cond();
+    if !ev_eat(c":") {
+        ev_fail();
+        return (0, ct);
+    }
+    let (b, bt) = ev_cond();
+    let t = ev_common(at, bt);
+    if c != 0 { (ev_convert(a, t), t) } else { (ev_convert(b, t), t) }
+}
+
+// Binding powers of the binary operators (0: not one).
+fn ev_prec(t: i64) -> i64 {
+    if t == C_EOF || CTOKS[t].kind != CK::Punct {
+        return 0;
+    }
+    let s = ctok_text(t);
+    if streq(s, c"||") { return 1; }
+    if streq(s, c"&&") { return 2; }
+    if streq(s, c"|") { return 3; }
+    if streq(s, c"^") { return 4; }
+    if streq(s, c"&") { return 5; }
+    if streq(s, c"==") || streq(s, c"!=") { return 6; }
+    if streq(s, c"<") || streq(s, c">") || streq(s, c"<=") || streq(s, c">=") { return 7; }
+    if streq(s, c"<<") || streq(s, c">>") { return 8; }
+    if streq(s, c"+") || streq(s, c"-") { return 9; }
+    if streq(s, c"*") || streq(s, c"/") || streq(s, c"%") { return 10; }
+    0
+}
+
+fn ev_binary(min: i64) -> (u64, i64) {
+    let (mut a, mut at) = ev_unary();
+    loop {
+        let op = ev_peek();
+        let prec = ev_prec(op);
+        if prec == 0 || prec <= min {
+            return (a, at);
+        }
+        EV_POS += 1;
+        let (b, bt) = ev_binary(prec);
+        let s = ctok_text(op);
+        let int_t = cty_int(if EV_DECL { 32 } else { 64 }, true);
+        if prec == 1 || prec == 2 {
+            let r = if prec == 1 { a != 0 || b != 0 } else { a != 0 && b != 0 };
+            a = r as u64;
+            at = int_t;
+            continue;
+        }
+        if prec == 8 {
+            let t = ev_promote(at);
+            let x = ev_convert(a, t);
+            let n = b & 63;
+            a = if streq(s, c"<<") {
+                ev_convert(x << n, t)
+            } else if cty_signed(t) {
+                ev_convert(((x as i64) >> n) as u64, t)
+            } else {
+                x >> n
+            };
+            at = t;
+            continue;
+        }
+        let t = ev_common(at, bt);
+        let x = ev_convert(a, t);
+        let y = ev_convert(b, t);
+        let signed = cty_signed(t);
+        if prec == 6 || prec == 7 {
+            let r = if streq(s, c"==") { x == y } else if streq(s, c"!=") { x != y }
+                else if signed {
+                    if streq(s, c"<") { (x as i64) < (y as i64) } else if streq(s, c">") { (x as i64) > (y as i64) }
+                    else if streq(s, c"<=") { (x as i64) <= (y as i64) } else { (x as i64) >= (y as i64) }
+                } else {
+                    if streq(s, c"<") { x < y } else if streq(s, c">") { x > y }
+                    else if streq(s, c"<=") { x <= y } else { x >= y }
+                };
+            a = r as u64;
+            at = int_t;
+            continue;
+        }
+        let r = if streq(s, c"|") { x | y } else if streq(s, c"^") { x ^ y } else if streq(s, c"&") { x & y }
+            else if streq(s, c"+") { x + y } else if streq(s, c"-") { x - y } else if streq(s, c"*") { x * y }
+            else {
+                if y == 0 {
+                    ev_fail();
+                    return (0, t);
+                }
+                if streq(s, c"/") {
+                    if signed { ((x as i64) / (y as i64)) as u64 } else { x / y }
+                } else {
+                    if signed { ((x as i64) % (y as i64)) as u64 } else { x % y }
+                }
+            };
+        a = ev_convert(r, t);
+        at = t;
+    }
+}
+
+fn ev_unary() -> (u64, i64) {
+    if ev_eat(c"-") {
+        let (v, t) = ev_unary();
+        let p = ev_promote(t);
+        return (ev_convert(0 - v, p), p);
+    }
+    if ev_eat(c"+") {
+        let (v, t) = ev_unary();
+        return (v, ev_promote(t));
+    }
+    if ev_eat(c"~") {
+        let (v, t) = ev_unary();
+        let p = ev_promote(t);
+        return (ev_convert(~v, p), p);
+    }
+    if ev_eat(c"!") {
+        let (v, _) = ev_unary();
+        return ((v == 0) as u64, cty_int(if EV_DECL { 32 } else { 64 }, true));
+    }
+    if EV_DECL {
+        let (handled, v, t) = cdecl_eval_special();
+        if handled {
+            return (v, t);
+        }
+    }
+    ev_primary()
+}
+
+fn ev_primary() -> (u64, i64) {
+    let t = ev_peek();
+    if t == C_EOF {
+        ev_fail();
+        return (0, cty_int(32, true));
+    }
+    if ev_eat(c"(") {
+        let r = ev_cond();
+        if !ev_eat(c")") {
+            ev_fail();
+        }
+        return r;
+    }
+    EV_POS += 1;
+    let kind = CTOKS[t].kind;
+    if kind == CK::Num {
+        return ev_number(t);
+    }
+    if kind == CK::Char {
+        return (char_value(t), cty_int(32, true));
+    }
+    if kind == CK::Ident {
+        let sym = CTOKS[t].text;
+        if is_query_builtin(sym) || sym == S_HAS_INCLUDE || sym == S_HAS_INCLUDE_NEXT {
+            // Feature queries reached through macros: "no".
+            if ev_eat(c"(") {
+                let mut depth = 1;
+                while depth > 0 && EV_POS < EV_N {
+                    if ev_at(c"(") {
+                        depth += 1;
+                    } else if ev_at(c")") {
+                        depth -= 1;
+                    }
+                    EV_POS += 1;
+                }
+            }
+            return (0, cty_int(64, true));
+        }
+        if !EV_DECL && sym == S_DEFINED {
+            // `defined` made by a macro's expansion (GCC accepts it).
+            let paren = ev_eat(c"(");
+            let name = ev_peek();
+            EV_POS += 1;
+            if paren {
+                ev_eat(c")");
+            }
+            return (is_defined(CTOKS[name].text) as u64, cty_int(64, true));
+        }
+        if !EV_DECL {
+            if streq(ctok_text(t), c"true") {
+                return (1, cty_int(64, true));
+            }
+            return (0, cty_int(64, true));
+        }
+        let (found, v, vt) = cdecl_ident_value(sym);
+        if found {
+            return (v, vt);
+        }
+    }
+    ev_fail();
+    (0, cty_int(32, true))
+}
+
+// The value and type of an integer literal (C11 6.4.4.1). 0 type: not one.
+fn ev_number(t: i64) -> (u64, i64) {
+    let text = sym_name(CTOKS[t].text);
+    let n = strlen(text) as i64;
+    let mut end = 0 as *u8;
+    let mut base = 10;
+    let mut digits = text;
+    if n > 1 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X') {
+        base = 16;
+    } else if n > 1 && text[0] == '0' && (text[1] == 'b' || text[1] == 'B') {
+        base = 2;
+        digits = &text[2];
+    } else if text[0] == '0' {
+        base = 8;
+    }
+    let value = strtoull(digits, &end, base as i32);
+    // The suffix: u, l, ll in any case and order.
+    let mut unsigned = false;
+    let mut longs = 0;
+    let mut p = end;
+    while p[0] != 0 {
+        let c = p[0];
+        if c == 'u' || c == 'U' {
+            unsigned = true;
+        } else if c == 'l' || c == 'L' {
+            longs += 1;
+        } else {
+            // A float, or an unknown suffix.
+            ev_fail();
+            return (0, 0);
+        }
+        p = &p[1];
+    }
+    if !EV_DECL {
+        return (value, cty_int(64, !(unsigned || value > 9223372036854775807)));
+    }
+    let fits_int = value <= 2147483647;
+    let fits_uint = value <= 4294967295;
+    let fits_long = value <= 9223372036854775807;
+    let ty = if longs == 0 && !unsigned && fits_int { cty_int(32, true) }
+        else if longs == 0 && fits_uint && (unsigned || base != 10) { cty_int(32, false) }
+        else if !unsigned && fits_long { cty_int(64, true) }
+        else { cty_int(64, false) };
+    (value, ty)
+}
+
+fn char_value(t: i64) -> u64 {
+    let text = sym_name(CTOKS[t].text);
+    let mut i = 0;
+    while text[i] != '\'' {
+        i += 1;
+    }
+    i += 1;
+    let c = text[i];
+    if c != '\\' {
+        return (c as i8) as i64 as u64;
+    }
+    let e = text[i + 1];
+    let v = if e == 'n' { 10 } else if e == 't' { 9 } else if e == 'r' { 13 } else if e == '0' && !is_digit(text[i + 2]) { 0 }
+        else if e == 'a' { 7 } else if e == 'b' { 8 } else if e == 'f' { 12 } else if e == 'v' { 11 }
+        else if e == 'x' {
+            let mut end = 0 as *u8;
+            strtoull(&text[i + 2], &end, 16) as i64
+        } else if is_digit(e) {
+            let mut end = 0 as *u8;
+            strtoull(&text[i + 1], &end, 8) as i64
+        } else { e as i64 };
+    ((v as u64 as u8) as i8) as i64 as u64
+}
+
+// ---- The C compiler's settings ----
+
+// Runs `command` and returns its output (stdout and stderr).
+fn run_command(command: *u8) -> i64 {
+    let out = buf_new();
+    let pipe = popen(command, c"r");
+    if pipe == 0 as *u8 {
+        die2(c"cannot run ", command);
+    }
+    let line = alloc_zeroed(4096);
+    while fgets(line, 4096, pipe) != 0 as *u8 {
+        buf_str(out, line);
+    }
+    pclose(pipe);
+    out
+}
+
+// The C compiler for headers: $TACHYON_CC, or cc.
+fn c_compiler() -> *u8 {
+    let env = getenv(c"TACHYON_CC");
+    if env != 0 as *u8 && env[0] != 0 { env } else { c"cc" }
+}
+
+// Asks the target's C compiler for its predefined macros (-dM) and its
+// include search path (-v), and defines and records them.
+fn cpp_query_compiler(target_flags: *u8) {
+    let b = buf_new();
+    buf_str(b, c_compiler());
+    buf_str(b, target_flags);
+    buf_str(b, c" -dM -E -v -x c /dev/null 2>&1");
+    buf_byte(b, 0);
+    let out = run_command(BUFS[b].data);
+    buf_byte(out, 0);
+    let text = BUFS[out].data;
+    let n = BUFS[out].len - 1;
+    // Lines: "#define ..." are macros; between "#include <...> search
+    // starts here:" and "End of search list." are directories.
+    let defines = buf_new();
+    let mut in_dirs = false;
+    let mut i = 0;
+    let mut found_dirs = false;
+    while i < n {
+        let mut j = i;
+        while j < n && text[j] != '\n' {
+            j += 1;
+        }
+        let line = text[i..j];
+        if starts_with(line, c"#define ") {
+            buf_bytes(defines, line);
+            buf_byte(defines, '\n');
+        } else if starts_with(line, c"#include <...> search starts here:") {
+            in_dirs = true;
+            found_dirs = true;
+        } else if starts_with(line, c"End of search list.") {
+            in_dirs = false;
+        } else if in_dirs && line.len > 1 && line[0] == ' ' {
+            // " /path" or " /path (framework directory)".
+            let mut e = line.len as i64;
+            if ends_with(line, c" (framework directory)") {
+                e = 0;
+            }
+            if e > 0 {
+                let d = buf_new();
+                buf_bytes(d, line[1..e]);
+                buf_byte(d, 0);
+                CDIRS.push(BUFS[d].data as i64);
+            }
+        }
+        i = j + 1;
+    }
+    if !found_dirs {
+        let msg = buf_new();
+        buf_str(msg, c"the C compiler gave no include search path for the target (");
+        buf_bytes(msg, buf_slice(b)[0..BUFS[b].len - 1]);
+        buf_str(msg, c"); its output was:\n");
+        buf_bytes(msg, text[0..n]);
+        buf_byte(msg, 0);
+        die(BUFS[msg].data);
+    }
+    // The predefined macros, as a file of #defines.
+    DEFINING_BUILTINS = true;
+    let f = c_load_text(c"<built-in>", defines);
+    push_frame(f);
+    loop {
+        let t = raw_next();
+        if t == C_EOF {
+            break;
+        }
+    }
+    DEFINING_BUILTINS = false;
+    // Not C syntax tachyon reads: blocks (`^`).
+    MACRO_OF.put(intern_c(c"__BLOCKS__") + 1, 0);
+}
+
+fn c_load_text(path: *u8, text: i64) -> i64 {
+    CFILES = grow(CFILES as *u8, CFILE_COUNT, &CFILE_CAP, 32) as *CFile;
+    let f = CFILE_COUNT;
+    CFILE_COUNT += 1;
+    let first = c_lex(BUFS[text].data, BUFS[text].len, f, 1);
+    CFILES[f] = CFile { path: path, dir: -1, first: first, end: CTOK_COUNT };
+    f
+}
+
+fn starts_with(s: [u8], prefix: *u8) -> bool {
+    let n = strlen(prefix);
+    s.len as u64 >= n && memcmp(s.ptr, prefix, n) == 0
+}
+
+fn ends_with(s: [u8], suffix: *u8) -> bool {
+    let n = strlen(suffix);
+    s.len as u64 >= n && memcmp(&s.ptr[s.len as i64 - n as i64], suffix, n) == 0
+}
+
+fn init_cpp() {
+    init_cpp_syms();
+    // Token 0: "no token"; C_EOF: the end of the input.
+    ctok_new(CK::Eof, intern_c(c""), -1, 0, false, false);
+    C_EOF = ctok_new(CK::Eof, intern_c(c""), -1, 0, false, true);
+    // Hide set 0 is the empty set.
+    hs_cons(-1, 0);
+}

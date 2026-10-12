@@ -28,7 +28,7 @@ fn func_size(fi: i64) -> i64 {
         }
         let mut v = BLOCKS[b].first;
         while v != 0 {
-            if !is_remat_op(INSTS[v].op) && INSTS[v].op != OP_PARAM {
+            if !INSTS[v].op.is_remat() && INSTS[v].op != Op::Param {
                 size += 1;
             }
             v = INSTS[v].next;
@@ -40,7 +40,7 @@ fn func_size(fi: i64) -> i64 {
 
 // The IR function called by direct call v, or -1.
 fn ir_callee(v: i64) -> i64 {
-    if INSTS[v].op != OP_CALL {
+    if INSTS[v].op != Op::Call {
         return -1;
     }
     FN_IR[INSTS[v].imm] - 1
@@ -67,7 +67,7 @@ fn count_call_sites() {
                 if g >= 0 {
                     FN_CALLS[g] += 1;
                 }
-                if INSTS[v].op == OP_FADDR && FN_IR[INSTS[v].imm] != 0 {
+                if INSTS[v].op == Op::FAddr && FN_IR[INSTS[v].imm] != 0 {
                     FN_ADDRESS[FN_IR[INSTS[v].imm] - 1] = 1;
                 }
                 v = INSTS[v].next;
@@ -93,7 +93,7 @@ fn callees(fi: i64, out: *IntVec) {
         while v != 0 {
             let g = ir_callee(v);
             if g >= 0 {
-                intvec_push(out, g);
+                out.push(g);
             }
             v = INSTS[v].next;
         }
@@ -113,7 +113,7 @@ fn compute_sccs() {
         adj_start[fi] = adj.count;
         callees(fi, &scratch);
         for i in 0..scratch.count {
-            intvec_push(&adj, scratch.data[i]);
+            adj.push(scratch.data[i]);
         }
     }
     adj_start[n] = adj.count;
@@ -127,12 +127,12 @@ fn compute_sccs() {
             continue;
         }
         // (node, next edge) frames.
-        intvec_push(&calls, root);
-        intvec_push(&calls, adj_start[root]);
+        calls.push(root);
+        calls.push(adj_start[root]);
         index[root] = next_index;
         low[root] = next_index;
         next_index += 1;
-        intvec_push(&stack, root);
+        stack.push(root);
         on_stack[root] = 1;
         while calls.count > 0 {
             let top = calls.count - 2;
@@ -145,10 +145,10 @@ fn compute_sccs() {
                     index[w] = next_index;
                     low[w] = next_index;
                     next_index += 1;
-                    intvec_push(&stack, w);
+                    stack.push(w);
                     on_stack[w] = 1;
-                    intvec_push(&calls, w);
-                    intvec_push(&calls, adj_start[w]);
+                    calls.push(w);
+                    calls.push(adj_start[w]);
                 } else if on_stack[w] != 0 && index[w] < low[v] {
                     low[v] = index[w];
                 }
@@ -163,10 +163,10 @@ fn compute_sccs() {
             }
             if low[v] == index[v] {
                 loop {
-                    let w = intvec_pop(&stack);
+                    let w = stack.pop();
                     on_stack[w] = 0;
                     FN_SCC[w] = scc_id;
-                    intvec_push(&SCC_ORDER, w);
+                    SCC_ORDER.push(w);
                     if w == v {
                         break;
                     }
@@ -268,7 +268,7 @@ fn inline_call(fi: i64, call: i64, g: i64) {
         let ty = fn_param(callee_f, p);
         if !is_void(ty) {
             param_first[p] = k;
-            k += if abi_classify(ty) == ABI_PIECES { ABI_PIECE_COUNT } else { 1 };
+            k += if abi_classify(ty) == AbiClass::Pieces { ABI_PIECE_COUNT } else { 1 };
         }
     }
     // Copy the blocks and instructions.
@@ -284,7 +284,7 @@ fn inline_call(fi: i64, call: i64, g: i64) {
         let mut gv = BLOCKS[gb].first;
         while gv != 0 {
             let op = INSTS[gv].op;
-            if op == OP_PARAM {
+            if op == Op::Param {
                 let index = INSTS[gv].imm;
                 let piece = INSTS[gv].imm2;
                 if index < 0 {
@@ -295,18 +295,19 @@ fn inline_call(fi: i64, call: i64, g: i64) {
             } else {
                 let nv = ir_make(op, INSTS[gv].ty, INSTS[gv].a, INSTS[gv].b, INSTS[gv].imm);
                 INSTS[nv].c = INSTS[gv].c;
+                INSTS[nv].cond = INSTS[gv].cond;
                 INSTS[nv].imm2 = INSTS[gv].imm2;
-                if op == OP_SLOT {
+                if op == Op::Slot {
                     let s = INSTS[gv].imm;
                     INSTS[nv].imm = ir_new_slot(SLOTS[s].size, SLOTS[s].align);
                     SLOTS[INSTS[nv].imm].ty = SLOTS[s].ty;
                 }
-                if INSTS[gv].nargs > 0 || op == OP_PHI || is_call_op(op) {
+                if INSTS[gv].nargs > 0 || op == Op::Phi || op.is_call() {
                     INSTS[nv].args = ARGS.count;
                     INSTS[nv].nargs = INSTS[gv].nargs;
                     for a in 0..INSTS[gv].nargs {
-                        intvec_push(&ARGS, ir_arg(gv, a));
-                        intvec_push(&ARGTY, ARGTY.data[INSTS[gv].args + a]);
+                        ARGS.push(ir_arg(gv, a));
+                        ARGTY.push(ARGTY.data[INSTS[gv].args + a]);
                     }
                 }
                 ir_append(nb, nv);
@@ -338,23 +339,23 @@ fn inline_call(fi: i64, call: i64, g: i64) {
             nv = INSTS[nv].next;
         }
         for p in 0..BLOCKS[gb].preds.count {
-            intvec_push(&BLOCKS[nb].preds, BLOCKS[BLOCKS[gb].preds.data[p]].aux);
+            BLOCKS[nb].preds.push(BLOCKS[BLOCKS[gb].preds.data[p]].aux);
         }
         let term = BLOCKS[gb].term;
-        if term == TERM_RET {
+        if term == Term::Ret {
             if copy_result {
-                let copy = ir_make(OP_COPY, 0, INSTS[call].c, mapped(BLOCKS[gb].cond), size_of(ret));
+                let copy = ir_make(Op::Copy, 0, INSTS[call].c, mapped(BLOCKS[gb].cond), size_of(ret));
                 ir_append(nb, copy);
             }
-            BLOCKS[nb].term = TERM_JUMP;
+            BLOCKS[nb].term = Term::Jump;
             BLOCKS[nb].s0 = cont;
-            intvec_push(&BLOCKS[cont].preds, nb);
-            intvec_push(&returns, mapped(BLOCKS[gb].cond));
-        } else if term == TERM_SWITCH {
+            BLOCKS[cont].preds.push(nb);
+            returns.push(mapped(BLOCKS[gb].cond));
+        } else if term == Term::Switch {
             let mark = SSA_STACK.count;
             for c in 0..BLOCKS[gb].ncases {
-                intvec_push(&SSA_STACK, case_value(gb, c));
-                intvec_push(&SSA_STACK, BLOCKS[case_target(gb, c)].aux);
+                SSA_STACK.push(case_value(gb, c));
+                SSA_STACK.push(BLOCKS[case_target(gb, c)].aux);
             }
             ir_switch_no_preds(nb, mapped(BLOCKS[gb].cond), BLOCKS[BLOCKS[gb].s0].aux, mark);
         } else {
@@ -366,11 +367,11 @@ fn inline_call(fi: i64, call: i64, g: i64) {
     }
     // Enter the copy.
     let entry = BLOCKS[IRFUNCS[g].entry].aux;
-    BLOCKS[b].term = TERM_JUMP;
+    BLOCKS[b].term = Term::Jump;
     BLOCKS[b].cond = 0;
     BLOCKS[b].s0 = entry;
     BLOCKS[b].s1 = 0;
-    intvec_push(&BLOCKS[entry].preds, b);
+    BLOCKS[entry].preds.push(b);
     // The result.
     let ty = INSTS[call].ty;
     if ty != 0 {
@@ -380,12 +381,12 @@ fn inline_call(fi: i64, call: i64, g: i64) {
         } else if returns.count == 1 {
             result = returns.data[0];
         } else {
-            result = ir_make(OP_PHI, ty, 0, 0, 0);
+            result = ir_make(Op::Phi, ty, 0, 0, 0);
             INSTS[result].args = ARGS.count;
             INSTS[result].nargs = returns.count;
             for r in 0..returns.count {
-                intvec_push(&ARGS, returns.data[r]);
-                intvec_push(&ARGTY, 0);
+                ARGS.push(returns.data[r]);
+                ARGTY.push(0);
             }
             ir_prepend(cont, result);
         }

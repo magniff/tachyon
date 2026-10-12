@@ -72,11 +72,18 @@ fn compile_program(output: *u8) {
     init_ast();
     ERR_KIND = c"parser error";
     let program = parse_program();
+    if IMPORTED_START >= 0 {
+        drop_shadowed_imports(program);
+    }
     MAIN_SYM = intern_c(c"main");
     init_types();
     init_declarations();
     ERR_KIND = c"type error";
     check_program(program);
+    if EMIT_HEADER {
+        emit_c_header(program, output);
+        return;
+    }
     ASM = buf_new();
     DATA = buf_new();
     CODE = buf_new();
@@ -104,14 +111,14 @@ fn compile_program(output: *u8) {
     } else {
         for i in 0..NODES[program].count {
             let item = child(program, i);
-            if NODES[item].kind == I_FN {
+            if NODES[item].kind == NodeKind::Fn {
                 gen_function(item);
             }
         }
     }
     emit_runtime();
     gen_data();
-    buf_bytes(ASM, BUFS[DATA].data, BUFS[DATA].len);
+    buf_bytes(ASM, buf_slice(DATA));
     emit_file_trailer();
     buf_write_file(ASM, output);
 }
@@ -130,17 +137,37 @@ fn gen_data() {
             continue;
         }
         buf_clear(scratch);
-        const_emit(NODES[item].c, ty, scratch);
+        let init = NODES[item].c;
+        if NODES[init].kind == NodeKind::CStr {
+            // A C string (0.4): the address of its bytes. (In the
+            // writable section: the address is relocated at load time.)
+            data_section(true);
+            data_align(8);
+            if STATICS[s].linkage == 2 {
+                buf_str(DATA, c".globl ");
+                buf_str(DATA, global_prefix());
+                buf_bytes(DATA, SYMS[NODES[item].a].text);
+                buf_byte(DATA, '\n');
+            }
+            data_label(static_symbol_prefix(s), NODES[item].a);
+            buf_str(DATA, c"    .quad ");
+            buf_str(DATA, local_prefix());
+            buf_str(DATA, c"str.");
+            buf_int(DATA, NODES[init].a);
+            buf_byte(DATA, '\n');
+            continue;
+        }
+        const_emit(init, ty, scratch);
         data_section(STATICS[s].mutable);
         data_align(align_of(ty));
         if STATICS[s].linkage == 2 {
             buf_str(DATA, c".globl ");
             buf_str(DATA, global_prefix());
-            buf_bytes(DATA, SYMS[NODES[item].a].ptr, SYMS[NODES[item].a].len);
+            buf_bytes(DATA, SYMS[NODES[item].a].text);
             buf_byte(DATA, '\n');
         }
         data_label(static_symbol_prefix(s), NODES[item].a);
-        data_bytes(BUFS[scratch].data, BUFS[scratch].len);
+        data_bytes(buf_slice(scratch));
         if BUFS[scratch].len == 0 {
             buf_str(DATA, c"    .space 1\n");
         }
@@ -177,7 +204,7 @@ fn gen_function(item: i64) {
     }
     emit_epilogue();
     emit_frame_reserve(FRAME_SIZE);
-    buf_bytes(ASM, BUFS[CODE].data, BUFS[CODE].len);
+    buf_bytes(ASM, buf_slice(CODE));
 }
 
 // Stores the incoming parameters in their frame slots, in order (so a
@@ -196,7 +223,7 @@ fn gen_params(item: i64, f: i64) {
         }
         let kind = abi_classify(ty);
         let local = NODES[child(item, i)].x;
-        if kind == ABI_PIECES {
+        if kind == AbiClass::Pieces {
             abi_piece_locations(ty, &state as *i64, &pieces as *i64);
             if local < 0 {
                 continue;
@@ -204,30 +231,38 @@ fn gen_params(item: i64, f: i64) {
             let slot = alloc_slot_for(ty);
             LOCALS[local].offset = slot;
             for k in 0..ABI_PIECE_COUNT {
-                emit_load_param(pieces[k], ABI_PIECE_TY[k]);
-                store_to_frame(ABI_PIECE_TY[k], slot - ABI_PIECE_OFFSET[k]);
+                // A piece on the stack is copied as an integer of its size:
+                // through the float accumulator it would overwrite the
+                // first float argument register (x86-64's xmm0), which a
+                // later parameter may still be in.
+                let mut piece_ty = ABI_PIECE_TY[k];
+                if pieces[k] >= 16 && is_float(piece_ty) {
+                    piece_ty = if piece_ty == TY_F32 { TY_U32 } else { TY_U64 };
+                }
+                emit_load_param(pieces[k], piece_ty);
+                store_to_frame(piece_ty, slot - ABI_PIECE_OFFSET[k]);
             }
             continue;
         }
         let mut location = 0;
-        if kind == ABI_STACK {
+        if kind == AbiClass::Stack {
             location = abi_stack_location(ty, &state as *i64);
         } else {
-            location = arg_location(if kind == ABI_REF { TY_U64 } else { ty }, &state as *i64);
+            location = arg_location(if kind == AbiClass::Ref { TY_U64 } else { ty }, &state as *i64);
         }
         if local < 0 {
             continue;
         }
         let slot = alloc_slot_for(ty);
         LOCALS[local].offset = slot;
-        if kind == ABI_SCALAR {
+        if kind == AbiClass::Scalar {
             emit_load_param(location, ty);
             emit_frame_addr(R_ADDR, slot);
             emit_store(ty, R_ACC, R_ADDR);
             continue;
         }
         // The accumulator = the address of the caller's copy.
-        if kind == ABI_STACK {
+        if kind == AbiClass::Stack {
             m_lea(0, reg_fp(), location);
         } else {
             emit_load_param(location, TY_U64);
@@ -288,7 +323,7 @@ fn gen_return_value(ret: i64) {
 fn gen_block(block: i64) {
     for i in 0..NODES[block].count {
         let stmt = child(block, i);
-        if NODES[stmt].kind == S_LET {
+        if NODES[stmt].kind == NodeKind::Let {
             gen_expr(NODES[stmt].c);
             bind(NODES[stmt].a);
         } else {
@@ -318,10 +353,10 @@ fn store_to_frame(ty: i64, offset: i64) {
 fn bind(pattern: i64) {
     let kind = NODES[pattern].kind;
     let ty = NODES[pattern].ty;
-    if kind == P_WILD || ty == TY_NEVER {
+    if kind == NodeKind::PatWild || ty == TY_NEVER {
         return;
     }
-    if kind == P_BIND {
+    if kind == NodeKind::PatBind {
         let local = NODES[pattern].x;
         let slot = alloc_slot_for(ty);
         LOCALS[local].offset = slot;
@@ -337,7 +372,7 @@ fn bind(pattern: i64) {
     for i in 0..NODES[pattern].count {
         let mut elem_ty = 0;
         let mut offset = 0;
-        if kind == P_VARIANT {
+        if kind == NodeKind::PatVariant {
             elem_ty = variant_field(NODES[pattern].x, i);
             offset = variant_field_offset(NODES[pattern].x, i);
         } else {
@@ -357,68 +392,55 @@ fn bind(pattern: i64) {
 // ---- Expressions ----
 
 fn gen_expr(n: i64) {
-    let kind = NODES[n].kind;
     let ty = NODES[n].ty;
-    if kind == E_INT || kind == E_CHAR {
-        emit_load_imm(R_ACC, wrap_int(NODES[n].a, ty) as u64);
-    } else if kind == E_FLOAT {
-        emit_load_float(float_const(f64_of_bits(NODES[n].a), ty), ty);
-    } else if kind == E_BOOL {
-        emit_load_imm(R_ACC, NODES[n].a as u64);
-    } else if kind == E_UNIT {
-    } else if kind == E_STR {
-        gen_string(n);
-    } else if kind == E_CSTR {
-        emit_string_addr(NODES[n].a);
-    } else if kind == E_IDENT {
-        gen_ident(n);
-    } else if kind == E_BINARY {
-        gen_binary(n);
-    } else if kind == E_UNARY {
-        gen_unary(n);
-    } else if kind == E_CAST {
-        gen_expr(NODES[n].a);
-        gen_cast(NODES[NODES[n].a].ty, ty);
-    } else if kind == E_CALL {
-        gen_call(n);
-    } else if kind == E_INDEX && NODES[NODES[n].b].kind == E_RANGE {
-        gen_slicing(n);
-    } else if kind == E_INDEX || kind == E_FIELD || kind == E_TUPLE_FIELD {
-        gen_addr(n);
-        load_from_x0(ty);
-    } else if kind == E_TUPLE || kind == E_ARRAY || kind == E_STRUCT {
-        gen_aggregate(n);
-    } else if kind == E_REPEAT {
-        gen_repeat(n);
-    } else if kind == E_BLOCK {
-        gen_block(n);
-    } else if kind == E_IF {
-        gen_if(n);
-    } else if kind == E_MATCH {
-        gen_match(n);
-    } else if kind == E_VARIANT {
-        gen_variant(n);
-    } else if kind == E_LOOP || kind == E_WHILE {
-        gen_loop(n);
-    } else if kind == E_FOR {
-        gen_for(n);
-    } else if kind == E_ASSIGN {
-        gen_assign(n);
-    } else if kind == E_RETURN {
-        if NODES[n].a != 0 {
+    match NODES[n].kind {
+        NodeKind::Int | NodeKind::Char => emit_load_imm(R_ACC, wrap_int(NODES[n].a, ty) as u64),
+        NodeKind::Float => emit_load_float(float_const(f64_of_bits(NODES[n].a), ty), ty),
+        NodeKind::Bool => emit_load_imm(R_ACC, NODES[n].a as u64),
+        NodeKind::Unit => {}
+        NodeKind::Str => gen_string(n),
+        NodeKind::CStr => emit_string_addr(NODES[n].a),
+        NodeKind::Ident => gen_ident(n),
+        NodeKind::Binary => gen_binary(n),
+        NodeKind::Unary => gen_unary(n),
+        NodeKind::Cast => {
             gen_expr(NODES[n].a);
-            gen_return_value(FNS[CUR_FN].ret);
+            gen_cast(NODES[NODES[n].a].ty, ty);
         }
-        emit_jump(RETURN_LABEL);
-    } else if kind == E_BREAK {
-        if NODES[n].b != 0 {
-            gen_expr(NODES[n].b);
+        NodeKind::Call => gen_call(n),
+        NodeKind::Index if NODES[NODES[n].b].kind == NodeKind::Range => gen_slicing(n),
+        NodeKind::Index | NodeKind::FieldAccess | NodeKind::TupleField => {
+            gen_addr(n);
+            load_from_x0(ty);
         }
-        jump_out_to_loop(NODES[n].x, 1);
-    } else if kind == E_CONTINUE {
-        jump_out_to_loop(NODES[n].x, 0);
-    } else {
-        type_error(n, c"internal error: unexpected node in code generation");
+        NodeKind::Tuple | NodeKind::Array | NodeKind::StructLit => gen_aggregate(n),
+        NodeKind::Repeat => gen_repeat(n),
+        NodeKind::Block => gen_block(n),
+        NodeKind::If => gen_if(n),
+        NodeKind::Match => gen_match(n),
+        NodeKind::VariantLit => gen_variant(n),
+        NodeKind::Loop | NodeKind::While => gen_loop(n),
+        NodeKind::For => gen_for(n),
+        NodeKind::Assign => gen_assign(n),
+        NodeKind::EnumPanic => {
+            gen_expr(NODES[n].a);
+            emit_panic(NODES[n].x);
+        }
+        NodeKind::Return => {
+            if NODES[n].a != 0 {
+                gen_expr(NODES[n].a);
+                gen_return_value(FNS[CUR_FN].ret);
+            }
+            emit_jump(RETURN_LABEL);
+        }
+        NodeKind::Break => {
+            if NODES[n].b != 0 {
+                gen_expr(NODES[n].b);
+            }
+            jump_out_to_loop(NODES[n].x, 1);
+        }
+        NodeKind::Continue => jump_out_to_loop(NODES[n].x, 0),
+        _ => type_error(n, c"internal error: unexpected node in code generation"),
     }
 }
 
@@ -443,19 +465,19 @@ fn gen_string(n: i64) {
 
 fn gen_ident(n: i64) {
     let ty = NODES[n].ty;
-    let resolution = NODES[n].x;
+    let resolution = NODES[n].res;
     let index = NODES[n].y;
-    if resolution == R_LOCAL {
+    if resolution == Res::Local {
         emit_frame_addr(R_ACC, LOCALS[index].offset);
         load_from_x0(ty);
-    } else if resolution == R_CONST {
+    } else if resolution == Res::Const {
         let value = const_value(index);
         if is_float(ty) {
             emit_load_float(value, ty);
         } else {
             emit_load_imm(R_ACC, value as u64);
         }
-    } else if resolution == R_STATIC {
+    } else if resolution == Res::Static {
         emit_static_addr(NODES[n].a);
         load_from_x0(ty);
     } else {
@@ -473,30 +495,26 @@ fn gen_fn_address(f: i64) {
 
 // The accumulator = the address of a place (or of a compound value).
 fn gen_addr(n: i64) {
-    let kind = NODES[n].kind;
-    if kind == E_IDENT && NODES[n].x == R_LOCAL {
-        emit_frame_addr(R_ACC, LOCALS[NODES[n].y].offset);
-    } else if kind == E_IDENT && NODES[n].x == R_STATIC {
-        emit_static_addr(NODES[n].a);
-    } else if kind == E_UNARY && NODES[n].a == TK_STAR {
-        gen_expr(NODES[n].b);
-    } else if kind == E_FIELD {
-        let base = NODES[n].a;
-        // The struct's (or slice's) address, or the pointer to the struct.
-        gen_expr(base);
-        emit_add_imm(R_ACC, field_offset_of(n));
-    } else if kind == E_TUPLE_FIELD {
-        let base = NODES[n].a;
-        gen_expr(base);
-        emit_add_imm(R_ACC, tuple_offset(NODES[base].ty, NODES[n].b));
-    } else if kind == E_INDEX {
-        gen_index_addr(n);
-    } else {
-        gen_expr(n);
+    match NODES[n].kind {
+        NodeKind::Ident if NODES[n].res == Res::Local => emit_frame_addr(R_ACC, LOCALS[NODES[n].y].offset),
+        NodeKind::Ident if NODES[n].res == Res::Static => emit_static_addr(NODES[n].a),
+        NodeKind::Unary if NODES[n].op == Tok::Star => gen_expr(NODES[n].b),
+        NodeKind::FieldAccess => {
+            // The struct's (or slice's) address, or the pointer to the struct.
+            gen_expr(NODES[n].a);
+            emit_add_imm(R_ACC, field_offset_of(n));
+        }
+        NodeKind::TupleField => {
+            let base = NODES[n].a;
+            gen_expr(base);
+            emit_add_imm(R_ACC, tuple_offset(NODES[base].ty, NODES[n].b));
+        }
+        NodeKind::Index => gen_index_addr(n),
+        _ => gen_expr(n),
     }
 }
 
-// The offset of the field of E_FIELD n in its base: a struct (also through
+// The offset of the field of NodeKind::FieldAccess n in its base: a struct (also through
 // a pointer), or a slice.
 fn field_offset_of(n: i64) -> i64 {
     let base_ty = NODES[NODES[n].a].ty;
@@ -530,7 +548,7 @@ fn gen_index_addr(n: i64) {
         emit_add_imm(R_SECOND, 8);
         emit_load_reg(R_SECOND, R_SECOND);
         let ok = new_label();
-        emit_compare_jump(TK_LT, false, ok);
+        emit_compare_jump(Cond::Lt, false, ok);
         emit_panic(panic_kind(NODES[NODES[n].b].ty, false));
         emit_label(ok);
         pop_x(R_SECOND);
@@ -545,13 +563,13 @@ fn gen_index_addr(n: i64) {
 // ---- Operators ----
 
 fn gen_binary(n: i64) {
-    let op = NODES[n].a;
+    let op = NODES[n].op;
     let lhs = NODES[n].b;
     let rhs = NODES[n].c;
-    if op == TK_AMP_AMP || op == TK_PIPE_PIPE {
+    if op == Tok::AmpAmp || op == Tok::PipePipe {
         let end = new_label();
         gen_expr(lhs);
-        if op == TK_AMP_AMP {
+        if op == Tok::AmpAmp {
             emit_jump_if_zero(end);
         } else {
             emit_jump_if_nonzero(end);
@@ -580,9 +598,9 @@ fn pop_second_operand(ty: i64) {
 }
 
 // Accumulator = accumulator <op> second operand.
-fn gen_operator(op: i64, operand_ty: i64, result_ty: i64) {
+fn gen_operator(op: Tok, operand_ty: i64, result_ty: i64) {
     if is_comparison(op) {
-        emit_compare(op, operand_ty);
+        emit_compare(cond_of_token(op), operand_ty);
     } else if is_float(operand_ty) {
         emit_float_binary(op, result_ty);
     } else {
@@ -591,19 +609,19 @@ fn gen_operator(op: i64, operand_ty: i64, result_ty: i64) {
 }
 
 fn gen_unary(n: i64) {
-    let op = NODES[n].a;
+    let op = NODES[n].op;
     let operand = NODES[n].b;
     let ty = NODES[n].ty;
-    if op == TK_AMP {
+    if op == Tok::Amp {
         gen_addr(operand);
         return;
     }
     gen_expr(operand);
-    if op == TK_MINUS {
+    if op == Tok::Minus {
         emit_negate(ty);
-    } else if op == TK_BANG {
+    } else if op == Tok::Bang {
         emit_not_bool();
-    } else if op == TK_TILDE {
+    } else if op == Tok::Tilde {
         emit_bitnot(ty);
     } else {
         // Deref: the accumulator is the pointer.
@@ -640,12 +658,12 @@ fn gen_aggregate(n: i64) {
         let mut value = elem;
         let mut offset = 0;
         let mut elem_ty = 0;
-        if kind == E_STRUCT {
+        if kind == NodeKind::StructLit {
             let s = TYPES[ty].a;
             value = NODES[elem].b;
             offset = field_offset(s, NODES[elem].x);
             elem_ty = (*struct_field(s, NODES[elem].x)).ty;
-        } else if kind == E_TUPLE {
+        } else if kind == NodeKind::Tuple {
             offset = tuple_offset(ty, i);
             elem_ty = type_elem(ty, i);
         } else {
@@ -762,7 +780,7 @@ fn gen_slicing(n: i64) {
         store_reg_to_frame(R_ACC, length);
     } else {
         store_reg_to_frame(R_ACC, slot);
-        if TYPES[base_ty].kind == TY_ARRAY {
+        if TYPES[base_ty].kind == TyKind::Array {
             emit_load_imm(R_ACC, TYPES[base_ty].b as u64);
             store_reg_to_frame(R_ACC, length);
         }
@@ -782,19 +800,19 @@ fn gen_slicing(n: i64) {
         load_reg_from_frame(R_ACC, length);
     }
     store_reg_to_frame(R_ACC, high_slot);
-    if TYPES[base_ty].kind != TY_PTR {
+    if TYPES[base_ty].kind != TyKind::Ptr {
         let ok = new_label();
         let fail = new_label();
         // hi <= length (hi < length for `..=`), then lo <= hi (+ 1).
         load_reg_from_frame(R_SECOND, length);
         load_reg_from_frame(R_ACC, high_slot);
-        emit_compare_jump(if inclusive { TK_GT_EQ } else { TK_GT }, false, fail);
+        emit_compare_jump(if inclusive { Cond::Ge } else { Cond::Gt }, false, fail);
         if inclusive {
             emit_add_imm(R_ACC, 1);
         }
         emit_move_to_second(TY_U64);
         load_reg_from_frame(R_ACC, low_slot);
-        emit_compare_jump(TK_LT_EQ, false, ok);
+        emit_compare_jump(Cond::Le, false, ok);
         emit_label(fail);
         load_reg_from_frame(R_ACC, length);
         push_x0();
@@ -818,7 +836,7 @@ fn gen_slicing(n: i64) {
     if inclusive {
         emit_add_imm(R_ACC, 1);
     }
-    emit_int_binary(TK_MINUS, TY_U64);
+    emit_int_binary(Tok::Minus, TY_U64);
     store_reg_to_frame(R_ACC, slot - 8);
     emit_frame_addr(R_ACC, slot);
 }
@@ -862,14 +880,14 @@ fn gen_match(n: i64) {
 // or-pattern bind the same locals).
 fn alloc_pattern_slots(p: i64) {
     let kind = NODES[p].kind;
-    if kind == P_BIND {
+    if kind == NodeKind::PatBind {
         let local = NODES[p].x;
         if LOCALS[local].offset == 0 {
             LOCALS[local].offset = alloc_slot_for(LOCALS[local].ty);
         }
         return;
     }
-    if kind == P_TUPLE || kind == P_VARIANT || kind == P_OR {
+    if kind == NodeKind::PatTuple || kind == NodeKind::PatVariant || kind == NodeKind::PatOr {
         for i in 0..NODES[p].count {
             alloc_pattern_slots(child(p, i));
         }
@@ -880,64 +898,69 @@ fn alloc_pattern_slots(p: i64) {
 // address of a compound value) matches pattern p; binds its variables.
 fn gen_pattern_test(p: i64, ty: i64, held: i64, fail: i64) {
     let kind = NODES[p].kind;
-    if kind == P_WILD || ty == TY_NEVER {
+    if ty == TY_NEVER {
         return;
     }
-    if kind == P_BIND {
-        if is_void(ty) {
+    match kind {
+        NodeKind::PatWild => return,
+        NodeKind::PatBind => {
+            if !is_void(ty) {
+                load_held(ty, held);
+                store_to_frame(ty, LOCALS[NODES[p].x].offset);
+            }
             return;
         }
-        load_held(ty, held);
-        store_to_frame(ty, LOCALS[NODES[p].x].offset);
-        return;
-    }
-    if kind == P_LIT || kind == P_RANGE {
-        let signed = is_signed(scalar_type(ty));
-        load_held(ty, held);
-        emit_load_imm(R_SECOND, NODES[p].x as u64);
-        if kind == P_LIT {
-            emit_compare_jump(TK_BANG_EQ, signed, fail);
-            return;
-        }
-        emit_compare_jump(TK_LT, signed, fail);
-        emit_load_imm(R_SECOND, NODES[p].y as u64);
-        emit_compare_jump(TK_GT, signed, fail);
-        return;
-    }
-    if kind == P_OR {
-        let ok = new_label();
-        let last = NODES[p].count - 1;
-        for i in 0..last {
-            let next = new_label();
-            gen_pattern_test(child(p, i), ty, held, next);
-            emit_jump(ok);
-            emit_label(next);
-        }
-        gen_pattern_test(child(p, last), ty, held, fail);
-        emit_label(ok);
-        return;
-    }
-    if kind == P_VARIANT {
-        let v = NODES[p].x;
-        let tag = ENUMS[TYPES[ty].a].tag;
-        if is_compound(ty) {
-            load_reg_from_frame(R_ACC, held);
-            emit_load(tag, R_ACC);
-        } else {
+        NodeKind::PatLit => {
             load_held(ty, held);
+            emit_load_imm(R_SECOND, NODES[p].x as u64);
+            emit_compare_jump(Cond::Ne, is_signed(scalar_type(ty)), fail);
+            return;
         }
-        emit_load_imm(R_SECOND, wrap_int(VARIANTS[v].discr, tag) as u64);
-        emit_compare_jump(TK_BANG_EQ, is_signed(tag), fail);
+        NodeKind::PatRange => {
+            let signed = is_signed(scalar_type(ty));
+            load_held(ty, held);
+            emit_load_imm(R_SECOND, NODES[p].x as u64);
+            emit_compare_jump(Cond::Lt, signed, fail);
+            emit_load_imm(R_SECOND, NODES[p].y as u64);
+            emit_compare_jump(Cond::Gt, signed, fail);
+            return;
+        }
+        NodeKind::PatOr => {
+            let ok = new_label();
+            let last = NODES[p].count - 1;
+            for i in 0..last {
+                let next = new_label();
+                gen_pattern_test(child(p, i), ty, held, next);
+                emit_jump(ok);
+                emit_label(next);
+            }
+            gen_pattern_test(child(p, last), ty, held, fail);
+            emit_label(ok);
+            return;
+        }
+        NodeKind::PatVariant => {
+            let v = NODES[p].x;
+            let tag = ENUMS[TYPES[ty].a].tag;
+            if is_compound(ty) {
+                load_reg_from_frame(R_ACC, held);
+                emit_load(tag, R_ACC);
+            } else {
+                load_held(ty, held);
+            }
+            emit_load_imm(R_SECOND, wrap_int(VARIANTS[v].discr, tag) as u64);
+            emit_compare_jump(Cond::Ne, is_signed(tag), fail);
+        }
+        _ => {}
     }
     // The elements of a tuple, the fields of a variant.
     for i in 0..NODES[p].count {
         let sub = child(p, i);
-        if NODES[sub].kind == P_WILD {
+        if NODES[sub].kind == NodeKind::PatWild {
             continue;
         }
         let mut elem_ty = 0;
         let mut offset = 0;
-        if kind == P_VARIANT {
+        if kind == NodeKind::PatVariant {
             elem_ty = variant_field(NODES[p].x, i);
             offset = variant_field_offset(NODES[p].x, i);
         } else {
@@ -993,7 +1016,7 @@ fn new_loop_labels(n: i64, count: i64) -> i64 {
     }
     NODES[n].z = first;
     while LABEL_DEPTH.count <= first {
-        intvec_push(&LABEL_DEPTH, 0);
+        LABEL_DEPTH.push(0);
     }
     LABEL_DEPTH.data[first] = DEPTH;
     first
@@ -1003,7 +1026,7 @@ fn new_loop_labels(n: i64, count: i64) -> i64 {
 fn gen_loop(n: i64) {
     let top = new_loop_labels(n, 2);
     emit_label(top);
-    if NODES[n].kind == E_WHILE {
+    if NODES[n].kind == NodeKind::While {
         gen_expr(NODES[n].b);
         emit_jump_if_zero(top + 1);
         gen_block(NODES[n].c);
@@ -1032,13 +1055,13 @@ fn gen_for(n: i64) {
     let test = labels + 2;
     emit_label(test);
     load_counter_and_end(counter, end);
-    emit_compare_jump(if inclusive { TK_GT } else { TK_GT_EQ }, is_signed(ty), exit);
+    emit_compare_jump(if inclusive { Cond::Gt } else { Cond::Ge }, is_signed(ty), exit);
     bind(NODES[n].b);
     gen_block(NODES[n].d);
     emit_label(next);
     load_counter_and_end(counter, end);
     if inclusive {
-        emit_compare_jump(TK_EQ_EQ, is_signed(ty), exit);
+        emit_compare_jump(Cond::Eq, is_signed(ty), exit);
     }
     emit_add_imm(R_ACC, 1);
     store_reg_to_frame(R_ACC, counter);
@@ -1061,28 +1084,30 @@ fn jump_out_to_loop(lp: i64, to_end: i64) {
 
 // ---- Assignment ----
 
-fn arith_op_of_assign(op: i64) -> i64 {
-    if op == TK_PLUS_EQ { return TK_PLUS; }
-    if op == TK_MINUS_EQ { return TK_MINUS; }
-    if op == TK_STAR_EQ { return TK_STAR; }
-    if op == TK_SLASH_EQ { return TK_SLASH; }
-    if op == TK_PERCENT_EQ { return TK_PERCENT; }
-    if op == TK_AMP_EQ { return TK_AMP; }
-    if op == TK_PIPE_EQ { return TK_PIPE; }
-    if op == TK_CARET_EQ { return TK_CARET; }
-    if op == TK_SHL_EQ { return TK_SHL; }
-    TK_SHR
+fn arith_op_of_assign(op: Tok) -> Tok {
+    match op {
+        Tok::PlusEq => Tok::Plus,
+        Tok::MinusEq => Tok::Minus,
+        Tok::StarEq => Tok::Star,
+        Tok::SlashEq => Tok::Slash,
+        Tok::PercentEq => Tok::Percent,
+        Tok::AmpEq => Tok::Amp,
+        Tok::PipeEq => Tok::Pipe,
+        Tok::CaretEq => Tok::Caret,
+        Tok::ShlEq => Tok::Shl,
+        _ => Tok::Shr,
+    }
 }
 
 // The right-hand side is evaluated first, then the target's address; a
 // compound assignment then reads the old value.
 fn gen_assign(n: i64) {
-    let op = NODES[n].a;
+    let op = NODES[n].op;
     let target = NODES[n].b;
     let value = NODES[n].c;
     let ty = NODES[target].ty;
     gen_expr(value);
-    if op == TK_EQ {
+    if op == Tok::Eq {
         if is_void(ty) {
             gen_addr(target);
             return;
@@ -1124,8 +1149,8 @@ fn gen_assign(n: i64) {
 // change: passed by value, they are copied first.
 fn is_place_kind(n: i64) -> bool {
     let kind = NODES[n].kind;
-    kind == E_IDENT || kind == E_FIELD || kind == E_TUPLE_FIELD || kind == E_INDEX
-        || (kind == E_UNARY && NODES[n].a == TK_STAR)
+    kind == NodeKind::Ident || kind == NodeKind::FieldAccess || kind == NodeKind::TupleField || kind == NodeKind::Index
+        || (kind == NodeKind::Unary && NODES[n].op == Tok::Star)
 }
 
 fn gen_call(n: i64) {
@@ -1182,12 +1207,12 @@ fn gen_call(n: i64) {
 }
 
 // Where each argument goes (see arg_location): `locations[i]` for scalars,
-// pointers to copies (ABI_REF) and copies on the stack (ABI_STACK), the
+// pointers to copies (AbiClass::Ref) and copies on the stack (AbiClass::Stack), the
 // pieces' locations at `pieces[4 * i + k]` for aggregates in pieces;
 // `kinds[i]` is the ABI kind. Returns the size of the outgoing stack area,
 // and the number of float registers used in `float_regs`.
 fn assign_arg_locations(arg_types: *i64, count: i64, param_count: i64, variadic: bool,
-                        ret: i64, locations: *i64, pieces: *i64, kinds: *i64,
+                        ret: i64, locations: *i64, pieces: *i64, kinds: *AbiClass,
                         float_regs: *i64) -> i64 {
     let mut state: [i64; 3] = [first_int_arg(ret), 0, 0];
     for i in 0..count {
@@ -1198,16 +1223,16 @@ fn assign_arg_locations(arg_types: *i64, count: i64, param_count: i64, variadic:
         let extra = variadic && i >= param_count;
         let kind = if extra { variadic_kind(ty) } else { abi_classify(ty) };
         kinds[i] = kind;
-        if extra && kind == ABI_PIECES {
+        if extra && kind == AbiClass::Pieces {
             abi_variadic_piece_locations(ty, &state as *i64, &pieces[4 * i]);
-        } else if extra && kind != ABI_STACK {
-            locations[i] = variadic_arg_location(if kind == ABI_REF { TY_U64 } else { ty }, &state as *i64);
-        } else if kind == ABI_PIECES {
+        } else if extra && kind != AbiClass::Stack {
+            locations[i] = variadic_arg_location(if kind == AbiClass::Ref { TY_U64 } else { ty }, &state as *i64);
+        } else if kind == AbiClass::Pieces {
             abi_piece_locations(ty, &state as *i64, &pieces[4 * i]);
-        } else if kind == ABI_STACK {
+        } else if kind == AbiClass::Stack {
             locations[i] = abi_stack_location(ty, &state as *i64);
         } else {
-            locations[i] = arg_location(if kind == ABI_REF { TY_U64 } else { ty }, &state as *i64);
+            locations[i] = arg_location(if kind == AbiClass::Ref { TY_U64 } else { ty }, &state as *i64);
         }
     }
     *float_regs = state[1];
@@ -1218,7 +1243,7 @@ fn assign_arg_locations(arg_types: *i64, count: i64, param_count: i64, variadic:
 // k-th pushed temporary is at sp + stack_size + 16 * (pushed - 1 - k); an
 // aggregate's temporary holds its address (of a private copy).
 fn place_args(arg_types: *i64, count: i64, param_count: i64, variadic: bool,
-              locations: *i64, pieces: *i64, kinds: *i64, stack_size: i64, pushed: i64) {
+              locations: *i64, pieces: *i64, kinds: *AbiClass, stack_size: i64, pushed: i64) {
     let scratch = if X86 { 10 } else { 16 };
     let temp_int = if X86 { 11 } else { 17 };
     let temp_float = if X86 { 40 } else { 48 };
@@ -1231,7 +1256,7 @@ fn place_args(arg_types: *i64, count: i64, param_count: i64, variadic: bool,
         let from = stack_size + 16 * (pushed - 1 - k);
         k += 1;
         let kind = kinds[i];
-        if kind == ABI_PIECES {
+        if kind == AbiClass::Pieces {
             abi_classify(ty);
             m_load(TY_U64, scratch, reg_sp(), from);
             for p in 0..ABI_PIECE_COUNT {
@@ -1249,7 +1274,7 @@ fn place_args(arg_types: *i64, count: i64, param_count: i64, variadic: bool,
             continue;
         }
         let location = locations[i];
-        if kind == ABI_STACK {
+        if kind == AbiClass::Stack {
             // The aggregate's bytes, in 8-byte pieces (its copy is a
             // multiple of 8 bytes).
             m_load(TY_U64, scratch, reg_sp(), from);
@@ -1261,7 +1286,7 @@ fn place_args(arg_types: *i64, count: i64, param_count: i64, variadic: bool,
             }
             continue;
         }
-        let value_ty = if kind == ABI_REF { TY_U64 } else { ty };
+        let value_ty = if kind == AbiClass::Ref { TY_U64 } else { ty };
         let promote = variadic && i >= param_count;
         if location >= 16 {
             emit_stack_arg(value_ty, from, location - 16, promote);
@@ -1278,16 +1303,16 @@ fn gen_call_sequence(n: i64, direct: i64, arg_types: *i64, count: i64, param_cou
                      variadic: bool, pushed: i64, ret: i64) {
     let mut locations: [i64; 64] = [0; 64];
     let mut pieces: [i64; 256] = [0; 256];
-    let mut kinds: [i64; 64] = [0; 64];
+    let mut kinds: [AbiClass; 64] = [AbiClass::Scalar; 64];
     let mut float_regs = 0;
     let stack_size = assign_arg_locations(arg_types, count, param_count, variadic, ret,
                                           &locations as *i64, &pieces as *i64,
-                                          &kinds as *i64, &float_regs);
+                                          &kinds as *AbiClass, &float_regs);
     if stack_size > 0 {
         emit_sp_sub(stack_size);
     }
     place_args(arg_types, count, param_count, variadic, &locations as *i64, &pieces as *i64,
-               &kinds as *i64, stack_size, pushed);
+               &kinds as *AbiClass, stack_size, pushed);
     if direct < 0 {
         emit_load_callee(stack_size);
     }

@@ -7,7 +7,14 @@
 # by zero, shift amounts), loops are bounded and indices in range, so
 # every optimization level must print the same.
 #
-# usage: awk -v seed=N [-v nonzero=1] -f gen.awk
+# usage: awk -v seed=N [-v nonzero=1] [-v loops=1] -f gen.awk
+#
+# loops=1 (the loop mode, for the loop optimizer of 0.4) adds more loops:
+# counted loops with bounds from expressions, inclusive ranges, while loops
+# of every integer type stepping up or down by varied steps, `!=` tests,
+# early `break` and `continue`, loops over slices whose index may run one
+# past the end (the bounds check exits with 101, alike at every level),
+# and chains of equality tests on one value.
 #
 # nonzero=1 makes every divisor positive and odd, for comparing with the
 # seed, whose division traps on 0 and on MIN / -1, and leaves out what the
@@ -404,6 +411,10 @@ function assignable(    i, n, cands) {
 }
 
 function statement(level, loops,    k, v, t, a, op, ops, n, lim, saved) {
+    if (LOOPMODE && rnd(3) == 0) {
+        loop_statement(level, loops)
+        return
+    }
     k = rnd(FEAT ? 12 : 10)
     if (k >= 10) {
         feature_statement(level)
@@ -443,6 +454,7 @@ function statement(level, loops,    k, v, t, a, op, ops, n, lim, saved) {
         print indent(level) "for i" level " in 0.." lim " {"
         VN[NV] = "i" level; VT[NV] = "i64"; VM[NV] = 0; NV++
         LOOPS++
+        INFOR[LOOPS] = 1
         statements(level + 1, loops + 1, 1 + rnd(3))
         LOOPS--
         NV = n
@@ -456,6 +468,7 @@ function statement(level, loops,    k, v, t, a, op, ops, n, lim, saved) {
         print indent(level) "while w" COUNTER " < " (1 + rnd(6)) " {"
         saved = COUNTER
         LOOPS++
+        INFOR[LOOPS] = 0
         statements(level + 1, loops + 1, 1 + rnd(3))
         LOOPS--
         print indent(level + 1) "w" saved " += 1;"
@@ -468,6 +481,122 @@ function statement(level, loops,    k, v, t, a, op, ops, n, lim, saved) {
         print indent(level) VN[v] (is_float(VT[v]) ? " += " : " ^= ") call(2) " as " VT[v] ";"
         return
     }
+}
+
+# The loop mode's statements: more loops, exits, slices, test chains.
+function loop_statement(level, loops,    k, n, t, lo, hi, step, start, bound, a, x, i, m, v, saved) {
+    k = rnd(9)
+    if (level >= 4 || loops >= 3) k = 8
+    if (k == 0) {
+        # A counted loop with bounds from expressions.
+        n = NV
+        lo = "((" expr("i64", 1) ") % 5)"
+        hi = "((" expr("i64", 1) ") % 9 + " rnd(12) ")"
+        print indent(level) "for i" level " in " lo (rnd(3) == 0 ? "..=" : "..") hi " {"
+        VN[NV] = "i" level; VT[NV] = "i64"; VM[NV] = 0; NV++
+        LOOPS++
+        INFOR[LOOPS] = 1
+        statements(level + 1, loops + 1, 1 + rnd(3))
+        LOOPS--
+        NV = n
+        print indent(level) "}"
+        return
+    }
+    if (k <= 3) {
+        # A while loop on its own counter of any integer type: up, down, or
+        # up to an exact end with !=.
+        t = pick_int_type()
+        COUNTER++
+        saved = COUNTER
+        step = 1 + rnd(3)
+        start = signed(t) ? rnd(41) - 20 : rnd(21)
+        if (k == 1) {
+            bound = start - 3 + rnd(40)
+            if (!signed(t) && bound < 0) bound = 0
+            print indent(level) "let mut w" saved ": " t " = " start ";"
+            print indent(level) "while w" saved " < " bound " {"
+        } else if (k == 2) {
+            bound = signed(t) ? start - rnd(30) : step - 1 + rnd(5)
+            if (start < bound) start = bound + rnd(30)
+            print indent(level) "let mut w" saved ": " t " = " start ";"
+            print indent(level) "while w" saved " > " bound " {"
+        } else {
+            step = 1
+            bound = start + rnd(25)
+            print indent(level) "let mut w" saved ": " t " = " start ";"
+            print indent(level) "while w" saved " != " bound " {"
+        }
+        n = NV
+        VN[NV] = "w" saved; VT[NV] = t; VM[NV] = 0; NV++
+        LOOPS++
+        INFOR[LOOPS] = 0
+        statements(level + 1, loops + 1, 1 + rnd(3))
+        LOOPS--
+        NV = n
+        print indent(level + 1) "w" saved (k == 2 ? " -= " : " += ") step ";"
+        print indent(level) "}"
+        return
+    }
+    if (k == 4 && LOOPS > 0) {
+        print indent(level) "if " cond(1) " { " (INFOR[LOOPS] && rnd(2) ? "continue" : "break") "; }"
+        return
+    }
+    if (k == 5 && FEAT && NA > 0) {
+        # A loop over a slice; its index may run one past the end.
+        a = rnd(NA)
+        lo = rnd(AL[a])
+        hi = lo + rnd(AL[a] - lo + 1)
+        COUNTER++
+        saved = COUNTER
+        print indent(level) "{"
+        print indent(level + 1) "let sl" saved " = " AN[a] "[" lo ".." hi "];"
+        x = rnd(16) == 0 ? " + 1" : ""
+        if (rnd(2)) {
+            print indent(level + 1) "for j in 0..(sl" saved ".len as i64" x ") {"
+            v = assignable()
+            if (rnd(2) || v < 0 || is_float(VT[v]) || is_float(AT[a])) print indent(level + 2) "sl" saved "[j] = " expr(AT[a], 1) ";"
+            else print indent(level + 2) VN[v] " ^= sl" saved "[j] as " VT[v] ";"
+        } else {
+            print indent(level + 1) "let mut j: u64 = 0;"
+            print indent(level + 1) "while j < (sl" saved ".len" x ") as u64 {"
+            print indent(level + 2) "sl" saved "[j] = " expr(AT[a], 1) ";"
+            print indent(level + 2) "j += 1;"
+        }
+        print indent(level + 1) "}"
+        print indent(level) "}"
+        return
+    }
+    if (k == 6) {
+        # A chain of equality tests on one value.
+        v = assignable()
+        if (v < 0 || is_float(VT[v])) return
+        m = 3 + rnd(4)
+        x = "(" VN[v] " % 8)"
+        for (i = 0; i < m; i++) {
+            print indent(level) (i == 0 ? "if " : "} else if ") x " == " rnd(8) " {"
+            print indent(level + 1) VN[v] " += " (1 + rnd(9)) ";"
+        }
+        print indent(level) "} else {"
+        print indent(level + 1) VN[v] " ^= 3;"
+        print indent(level) "}"
+        return
+    }
+    if (k == 7) {
+        # A counted loop with a constant trip count (unrolled).
+        n = NV
+        print indent(level) "for i" level " in " rnd(3) ".." rnd(20) " {"
+        VN[NV] = "i" level; VT[NV] = "i64"; VM[NV] = 0; NV++
+        LOOPS++
+        INFOR[LOOPS] = 1
+        statements(level + 1, loops + 1, 1 + rnd(2))
+        LOOPS--
+        NV = n
+        print indent(level) "}"
+        return
+    }
+    v = assignable()
+    if (v < 0) return
+    print indent(level) VN[v] " " (is_float(VT[v]) ? "+=" : "^=") " " expr(VT[v], 2) ";"
 }
 
 function statements(level, loops, count,    i) {
@@ -529,10 +658,10 @@ BEGIN {
     NT = 10
     for (i = 0; i < NT; i++) TYPES[i] = T[i + 1]
     FEAT = nonzero ? 0 : 1
+    LOOPMODE = loops ? 1 : 0
     print "// Generated by tests/fuzz/gen.awk, seed " seed "."
-    # (The seed knows only the extern declarations of 0.2.)
-    if (FEAT) print "extern \"C\" { fn printf(format: *u8, ...) -> i32; }"
-    else print "extern fn printf(format: *u8, ...) -> i32;"
+    # (run.sh gives the seed the 0.2 form, with tests/seed-compat.awk.)
+    print "extern \"C\" { fn printf(format: *u8, ...) -> i32; }"
     print ""
     if (FEAT) type_defs()
     NF = 0

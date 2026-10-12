@@ -67,7 +67,8 @@ fn const_value(c: i64) -> i64 {
     }
     CONSTS[c].state = 1;
     check_const_expr(NODES[item].c, CONSTS[c].ty);
-    let value = const_eval(NODES[item].c);
+    // A C string constant (0.4) has no value: its uses are the literal.
+    let value = if NODES[NODES[item].c].kind == NodeKind::CStr { 0 } else { const_eval(NODES[item].c) };
     CONSTS[c].value = value;
     CONSTS[c].state = 2;
     value
@@ -90,78 +91,60 @@ fn eval_array_len(n: i64) -> i64 {
 
 // The value of a scalar constant expression (already type checked).
 fn const_eval(n: i64) -> i64 {
-    let kind = NODES[n].kind;
     let ty = NODES[n].ty;
-    if kind == E_INT || kind == E_CHAR {
-        return wrap_int(NODES[n].a, ty);
-    }
-    if kind == E_FLOAT {
-        return float_const(f64_of_bits(NODES[n].a), ty);
-    }
-    if kind == E_BOOL {
-        return NODES[n].a;
-    }
-    if kind == E_UNIT {
-        return 0;
-    }
-    if kind == E_IDENT {
-        if NODES[n].x != R_CONST {
-            name_error(NODES[n].start, c"'", NODES[n].a, c"' is not a constant");
+    match NODES[n].kind {
+        NodeKind::Int | NodeKind::Char => wrap_int(NODES[n].a, ty),
+        NodeKind::Float => float_const(f64_of_bits(NODES[n].a), ty),
+        NodeKind::Bool => NODES[n].a,
+        NodeKind::Unit => 0,
+        NodeKind::Ident => {
+            if NODES[n].res != Res::Const {
+                name_error(NODES[n].start, c"'", NODES[n].a, c"' is not a constant");
+            }
+            const_value(NODES[n].y)
         }
-        return const_value(NODES[n].y);
+        NodeKind::Unary => const_unary(n, ty),
+        NodeKind::Binary => const_binary(n, ty),
+        NodeKind::Cast => {
+            let operand = NODES[n].a;
+            let value = const_eval(operand);
+            const_cast(n, value, scalar_type(NODES[operand].ty), ty)
+        }
+        NodeKind::VariantLit if !is_compound(ty) => wrap_int(VARIANTS[NODES[n].a].discr, scalar_type(ty)),
+        _ => not_constant(n),
     }
-    if kind == E_UNARY {
-        return const_unary(n, ty);
-    }
-    if kind == E_BINARY {
-        return const_binary(n, ty);
-    }
-    if kind == E_CAST {
-        let operand = NODES[n].a;
-        let value = const_eval(operand);
-        return const_cast(n, value, scalar_type(NODES[operand].ty), ty);
-    }
-    if kind == E_VARIANT && !is_compound(ty) {
-        return wrap_int(VARIANTS[NODES[n].a].discr, scalar_type(ty));
-    }
-    not_constant(n)
 }
 
 fn const_unary(n: i64, ty: i64) -> i64 {
-    let op = NODES[n].a;
-    let operand = NODES[n].b;
-    let value = const_eval(operand);
-    if op == TK_MINUS {
-        if is_float(ty) {
-            return float_const(0.0 - f64_of_bits(value), ty);
-        }
-        return wrap_int(0 - value, ty);
+    let value = const_eval(NODES[n].b);
+    match NODES[n].op {
+        Tok::Minus => if is_float(ty) {
+            float_const(0.0 - f64_of_bits(value), ty)
+        } else {
+            wrap_int(0 - value, ty)
+        },
+        Tok::Bang => 1 - value,
+        Tok::Tilde => wrap_int(~value, ty),
+        _ => not_constant(n),
     }
-    if op == TK_BANG {
-        return 1 - value;
-    }
-    if op == TK_TILDE {
-        return wrap_int(~value, ty);
-    }
-    not_constant(n)
 }
 
 fn const_binary(n: i64, ty: i64) -> i64 {
-    let op = NODES[n].a;
+    let op = NODES[n].op;
     let lhs = NODES[n].b;
     let operand_ty = NODES[lhs].ty;
     let a = const_eval(lhs);
-    if op == TK_AMP_AMP && a == 0 {
+    if op == Tok::AmpAmp && a == 0 {
         return 0;
     }
-    if op == TK_PIPE_PIPE && a == 1 {
+    if op == Tok::PipePipe && a == 1 {
         return 1;
     }
     let b = const_eval(NODES[n].c);
     if operand_ty == TY_BOOL {
-        if op == TK_AMP_AMP || op == TK_PIPE_PIPE { return b; }
-        if op == TK_EQ_EQ { return (a == b) as i64; }
-        if op == TK_BANG_EQ { return (a != b) as i64; }
+        if op == Tok::AmpAmp || op == Tok::PipePipe { return b; }
+        if op == Tok::EqEq { return (a == b) as i64; }
+        if op == Tok::BangEq { return (a != b) as i64; }
         type_error(n, c"invalid operator on bools");
     }
     if is_float(operand_ty) {
@@ -170,19 +153,21 @@ fn const_binary(n: i64, ty: i64) -> i64 {
     const_int_binary(n, op, a, b, operand_ty, ty)
 }
 
-fn const_float_binary(n: i64, op: i64, a: f64, b: f64, ty: i64) -> i64 {
-    if op == TK_PLUS { return float_const(a + b, ty); }
-    if op == TK_MINUS { return float_const(a - b, ty); }
-    if op == TK_STAR { return float_const(a * b, ty); }
-    if op == TK_SLASH { return float_const(a / b, ty); }
-    if op == TK_PERCENT { return float_const(a % b, ty); }
-    if op == TK_EQ_EQ { return (a == b) as i64; }
-    if op == TK_BANG_EQ { return (a != b) as i64; }
-    if op == TK_LT { return (a < b) as i64; }
-    if op == TK_GT { return (a > b) as i64; }
-    if op == TK_LT_EQ { return (a <= b) as i64; }
-    if op == TK_GT_EQ { return (a >= b) as i64; }
-    type_error(n, c"invalid operator on floats")
+fn const_float_binary(n: i64, op: Tok, a: f64, b: f64, ty: i64) -> i64 {
+    match op {
+        Tok::Plus => float_const(a + b, ty),
+        Tok::Minus => float_const(a - b, ty),
+        Tok::Star => float_const(a * b, ty),
+        Tok::Slash => float_const(a / b, ty),
+        Tok::Percent => float_const(a % b, ty),
+        Tok::EqEq => (a == b) as i64,
+        Tok::BangEq => (a != b) as i64,
+        Tok::Lt => (a < b) as i64,
+        Tok::Gt => (a > b) as i64,
+        Tok::LtEq => (a <= b) as i64,
+        Tok::GtEq => (a >= b) as i64,
+        _ => type_error(n, c"invalid operator on floats"),
+    }
 }
 
 // `a < b` for values of an integer type.
@@ -190,45 +175,47 @@ fn const_less(a: i64, b: i64, ty: i64) -> bool {
     if is_signed(ty) { a < b } else { (a as u64) < (b as u64) }
 }
 
-fn const_int_binary(n: i64, op: i64, a: i64, b: i64, operand_ty: i64, ty: i64) -> i64 {
-    if op == TK_PLUS { return wrap_int(a + b, ty); }
-    if op == TK_MINUS { return wrap_int(a - b, ty); }
-    if op == TK_STAR { return wrap_int(a * b, ty); }
-    if op == TK_SLASH || op == TK_PERCENT {
-        if b == 0 {
-            type_error(n, c"division by zero in constant expression");
-        }
-        if is_signed(operand_ty) {
-            // -MIN / -1 overflows; computed by negation, which wraps.
-            if b == -1 {
-                return if op == TK_SLASH { wrap_int(0 - a, ty) } else { 0 };
+fn const_int_binary(n: i64, op: Tok, a: i64, b: i64, operand_ty: i64, ty: i64) -> i64 {
+    match op {
+        Tok::Plus => wrap_int(a + b, ty),
+        Tok::Minus => wrap_int(a - b, ty),
+        Tok::Star => wrap_int(a * b, ty),
+        Tok::Slash | Tok::Percent => {
+            if b == 0 {
+                type_error(n, c"division by zero in constant expression");
             }
-            return wrap_int(if op == TK_SLASH { a / b } else { a % b }, ty);
+            if is_signed(operand_ty) {
+                // -MIN / -1 overflows; computed by negation, which wraps.
+                if b == -1 {
+                    return if op == Tok::Slash { wrap_int(0 - a, ty) } else { 0 };
+                }
+                return wrap_int(if op == Tok::Slash { a / b } else { a % b }, ty);
+            }
+            let ua = a as u64;
+            let ub = b as u64;
+            wrap_int((if op == Tok::Slash { ua / ub } else { ua % ub }) as i64, ty)
         }
-        let ua = a as u64;
-        let ub = b as u64;
-        return wrap_int((if op == TK_SLASH { ua / ub } else { ua % ub }) as i64, ty);
+        Tok::Amp => wrap_int(a & b, ty),
+        Tok::Pipe => wrap_int(a | b, ty),
+        Tok::Caret => wrap_int(a ^ b, ty),
+        Tok::Shl | Tok::Shr => {
+            let amount = (b as u64 & 0xffffffff) % int_bits(operand_ty) as u64;
+            if op == Tok::Shl {
+                wrap_int(a << amount, ty)
+            } else if is_signed(operand_ty) {
+                wrap_int(a >> amount, ty)
+            } else {
+                wrap_int(((a as u64) >> amount) as i64, ty)
+            }
+        }
+        Tok::EqEq => (a == b) as i64,
+        Tok::BangEq => (a != b) as i64,
+        Tok::Lt => const_less(a, b, operand_ty) as i64,
+        Tok::Gt => const_less(b, a, operand_ty) as i64,
+        Tok::LtEq => !const_less(b, a, operand_ty) as i64,
+        Tok::GtEq => !const_less(a, b, operand_ty) as i64,
+        _ => not_constant(n),
     }
-    if op == TK_AMP { return wrap_int(a & b, ty); }
-    if op == TK_PIPE { return wrap_int(a | b, ty); }
-    if op == TK_CARET { return wrap_int(a ^ b, ty); }
-    if op == TK_SHL || op == TK_SHR {
-        let amount = (b as u64 & 0xffffffff) % int_bits(operand_ty) as u64;
-        if op == TK_SHL {
-            return wrap_int(a << amount, ty);
-        }
-        if is_signed(operand_ty) {
-            return wrap_int(a >> amount, ty);
-        }
-        return wrap_int(((a as u64) >> amount) as i64, ty);
-    }
-    if op == TK_EQ_EQ { return (a == b) as i64; }
-    if op == TK_BANG_EQ { return (a != b) as i64; }
-    if op == TK_LT { return const_less(a, b, operand_ty) as i64; }
-    if op == TK_GT { return const_less(b, a, operand_ty) as i64; }
-    if op == TK_LT_EQ { return !const_less(b, a, operand_ty) as i64; }
-    if op == TK_GT_EQ { return !const_less(a, b, operand_ty) as i64; }
-    not_constant(n)
 }
 
 fn int_to_f64(value: i64, from: i64) -> f64 {
@@ -303,45 +290,44 @@ fn const_emit(n: i64, ty: i64, out: i64) {
 }
 
 fn const_write(n: i64, ty: i64, out: i64, at: i64) {
-    let kind = NODES[n].kind;
-    if kind == E_STRUCT {
-        let s = TYPES[ty].a;
-        for i in 0..NODES[n].count {
-            let init = child(n, i);
-            let field = NODES[init].x;
-            const_write(NODES[init].b, (*struct_field(s, field)).ty, out, at + field_offset(s, field));
+    match NODES[n].kind {
+        NodeKind::StructLit => {
+            let s = TYPES[ty].a;
+            for i in 0..NODES[n].count {
+                let init = child(n, i);
+                let field = NODES[init].x;
+                const_write(NODES[init].b, (*struct_field(s, field)).ty, out, at + field_offset(s, field));
+            }
         }
-        return;
-    }
-    if kind == E_TUPLE {
-        for i in 0..NODES[n].count {
-            const_write(child(n, i), type_elem(ty, i), out, at + tuple_offset(ty, i));
+        NodeKind::Tuple => {
+            for i in 0..NODES[n].count {
+                const_write(child(n, i), type_elem(ty, i), out, at + tuple_offset(ty, i));
+            }
         }
-        return;
-    }
-    if kind == E_ARRAY || kind == E_REPEAT {
-        let elem = TYPES[ty].a;
-        let elem_size = size_of(elem);
-        for i in 0..TYPES[ty].b {
-            let value = if kind == E_ARRAY { child(n, i) } else { NODES[n].a };
-            const_write(value, elem, out, at + i * elem_size);
+        NodeKind::Array | NodeKind::Repeat => {
+            let elem = TYPES[ty].a;
+            let elem_size = size_of(elem);
+            for i in 0..TYPES[ty].b {
+                let value = if NODES[n].kind == NodeKind::Array { child(n, i) } else { NODES[n].a };
+                const_write(value, elem, out, at + i * elem_size);
+            }
         }
-        return;
-    }
-    if kind == E_VARIANT && is_compound(ty) {
-        let v = NODES[n].a;
-        let tag = ENUMS[TYPES[ty].a].tag;
-        write_scalar(out, at, wrap_int(VARIANTS[v].discr, tag), tag);
-        for i in 0..NODES[n].count {
-            const_write(child(n, i), variant_field(v, i), out, at + variant_field_offset(v, i));
+        NodeKind::VariantLit if is_compound(ty) => {
+            let v = NODES[n].a;
+            let tag = ENUMS[TYPES[ty].a].tag;
+            write_scalar(out, at, wrap_int(VARIANTS[v].discr, tag), tag);
+            for i in 0..NODES[n].count {
+                const_write(child(n, i), variant_field(v, i), out, at + variant_field_offset(v, i));
+            }
         }
-        return;
+        _ => {
+            if is_compound(ty) {
+                not_constant(n);
+            }
+            let value = const_eval(n);
+            write_scalar(out, at, value, scalar_type(ty));
+        }
     }
-    if is_compound(ty) {
-        not_constant(n);
-    }
-    let value = const_eval(n);
-    write_scalar(out, at, value, scalar_type(ty));
 }
 
 // The bytes of a scalar constant, little-endian.

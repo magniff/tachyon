@@ -4,10 +4,10 @@
 // "Warnings for pattern matching", JFP 2007).
 //
 // Resolutions recorded on pattern nodes:
-//   P_BIND     x = the local
-//   P_LIT      x = the value (canonical for the type; a bool is 0 or 1)
-//   P_RANGE    x = the low value, y = the high value
-//   P_VARIANT  x = the variant (VARIANTS)
+//   NodeKind::PatBind     x = the local
+//   NodeKind::PatLit      x = the value (canonical for the type; a bool is 0 or 1)
+//   NodeKind::PatRange    x = the low value, y = the high value
+//   NodeKind::PatVariant  x = the variant (VARIANTS)
 
 // Or-patterns: the alternatives after the first bind the locals of the
 // first (OR_FIRST..OR_END in ENV) instead of new ones.
@@ -25,16 +25,60 @@ fn check_pattern(p: i64, ty: i64) {
 fn check_pat(p: i64, ty: i64) {
     let kind = NODES[p].kind;
     NODES[p].ty = ty;
-    if kind == P_WILD {
+    if kind == NodeKind::PatWild {
         return;
     }
-    if kind == P_BIND {
+    if kind == NodeKind::PatBind && NODES[p].b == 0 && SYM_CONST[NODES[p].a] == 0
+        && lookup_local(NODES[p].a) < 0 && used_variant(NODES[p].a) >= 0 {
+        // A variant brought into scope by `use` (0.4).
+        let v = used_variant(NODES[p].a);
+        NODES[p].kind = NodeKind::PatVariant;
+        NODES[p].b = NODES[p].a;
+        NODES[p].a = ENUMS[VARIANTS[v].enum_id].name;
+        NODES[p].c = 0;
+        check_pat(p, ty);
+        return;
+    }
+    if kind == NodeKind::PatVariant && NODES[p].d == 1 {
+        // `V(p, ...)`: a variant by its own name, from `use`.
+        let v = used_variant(NODES[p].b);
+        if v < 0 {
+            name_error(NODES[p].start, c"unknown variant '", NODES[p].b, c"' (write 'Enum::Variant', or bring it into scope with 'use Enum::*;')");
+        }
+        NODES[p].a = ENUMS[VARIANTS[v].enum_id].name;
+        NODES[p].d = 0;
+        check_pat(p, ty);
+        return;
+    }
+    if kind == NodeKind::PatRange && NODES[NODES[p].a].kind == NodeKind::PatVariant {
+        variant_range(p, ty);
+        return;
+    }
+    if kind == NodeKind::PatBind && NODES[p].b == 0 && SYM_CONST[NODES[p].a] != 0
+        && lookup_local(NODES[p].a) < 0 && is_fieldless_enum(CONSTS[SYM_CONST[NODES[p].a] - 1].ty) {
+        // A constant of a fieldless enum: its variant's pattern.
+        let c = SYM_CONST[NODES[p].a] - 1;
+        let e = TYPES[CONSTS[c].ty].a;
+        let value = const_value(c);
+        for i in 0..ENUMS[e].variant_count {
+            let v = enum_variant(e, i);
+            if wrap_int(VARIANTS[v].discr, ENUMS[e].tag) == value {
+                NODES[p].kind = NodeKind::PatVariant;
+                NODES[p].a = ENUMS[e].name;
+                NODES[p].b = VARIANTS[v].name;
+                NODES[p].c = 0;
+            }
+        }
+        check_pat(p, ty);
+        return;
+    }
+    if kind == NodeKind::PatBind {
         let name = NODES[p].a;
         if SYM_CONST[name] != 0 && NODES[p].b == 0 && lookup_local(name) < 0 {
             // A constant's name: a literal pattern.
-            let e = new_node(E_IDENT, NODES[p].start, NODES[p].end);
+            let e = new_node(NodeKind::Ident, NODES[p].start, NODES[p].end);
             NODES[e].a = name;
-            NODES[p].kind = P_LIT;
+            NODES[p].kind = NodeKind::PatLit;
             NODES[p].a = e;
             check_pat(p, ty);
             return;
@@ -51,7 +95,7 @@ fn check_pat(p: i64, ty: i64) {
         NODES[p].x = define_local(name, ty, NODES[p].b != 0, false);
         return;
     }
-    if kind == P_OR {
+    if kind == NodeKind::PatOr {
         check_or_pattern(p, ty);
         return;
     }
@@ -61,47 +105,79 @@ fn check_pat(p: i64, ty: i64) {
         }
         return;
     }
-    if kind == P_TUPLE {
-        let count = NODES[p].count;
-        if ty == TY_UNIT && count == 0 {
-            return;
+    match kind {
+        NodeKind::PatTuple => {
+            let count = NODES[p].count;
+            if ty == TY_UNIT && count == 0 {
+                return;
+            }
+            if TYPES[ty].kind != TyKind::Tuple || TYPES[ty].count != count {
+                err_begin(NODES[p].start);
+                err_str(c"a tuple pattern with ");
+                err_int(count);
+                err_str(c" elements cannot bind a value of type '");
+                err_type(ty);
+                err_str(c"'");
+                err_end();
+            }
+            for i in 0..count {
+                check_pat(child(p, i), type_elem(ty, i));
+            }
         }
-        if TYPES[ty].kind != TY_TUPLE || TYPES[ty].count != count {
-            err_begin(NODES[p].start);
-            err_str(c"a tuple pattern with ");
-            err_int(count);
-            err_str(c" elements cannot bind a value of type '");
-            err_type(ty);
-            err_str(c"'");
-            err_end();
+        NodeKind::PatLit => {
+            check_literal_type(p, ty, c"a literal pattern");
+            let e = NODES[p].a;
+            check_const_expr(e, ty);
+            NODES[p].x = const_eval(e);
         }
-        for i in 0..count {
-            check_pat(child(p, i), type_elem(ty, i));
+        NodeKind::PatRange => {
+            check_literal_type(p, ty, c"a range pattern");
+            if ty == TY_BOOL {
+                type_error(p, c"range patterns need an integer type, not 'bool'");
+            }
+            check_const_expr(NODES[p].a, ty);
+            check_const_expr(NODES[p].b, ty);
+            NODES[p].x = const_eval(NODES[p].a);
+            NODES[p].y = const_eval(NODES[p].b);
+            if const_less(NODES[p].y, NODES[p].x, ty) {
+                type_error(p, c"the range pattern is empty (its start is above its end)");
+            }
         }
-        return;
+        _ => check_variant_pattern(p, ty),
     }
-    if kind == P_LIT {
-        check_literal_type(p, ty, c"a literal pattern");
-        let e = NODES[p].a;
-        check_const_expr(e, ty);
-        NODES[p].x = const_eval(e);
-        return;
+}
+
+// `E::A..=E::C` (0.4): the variants from A to C in declaration order, as
+// an or-pattern.
+fn variant_range(p: i64, ty: i64) {
+    let lo = NODES[p].a;
+    let hi = NODES[p].b;
+    let t = resolve_named(NODES[lo].a, NODES[lo].start);
+    if TYPES[t].kind != TyKind::Enum || resolve_named(NODES[hi].a, NODES[hi].start) != t {
+        type_error(p, c"a variant range needs two variants of the same enum");
     }
-    if kind == P_RANGE {
-        check_literal_type(p, ty, c"a range pattern");
-        if ty == TY_BOOL {
-            type_error(p, c"range patterns need an integer type, not 'bool'");
-        }
-        check_const_expr(NODES[p].a, ty);
-        check_const_expr(NODES[p].b, ty);
-        NODES[p].x = const_eval(NODES[p].a);
-        NODES[p].y = const_eval(NODES[p].b);
-        if const_less(NODES[p].y, NODES[p].x, ty) {
-            type_error(p, c"the range pattern is empty (its start is above its end)");
-        }
-        return;
+    let e = TYPES[t].a;
+    let first = find_variant(e, NODES[lo].b);
+    let last = find_variant(e, NODES[hi].b);
+    if first < 0 || last < 0 {
+        type_error(p, c"unknown variant in a variant range");
     }
-    check_variant_pattern(p, ty);
+    if last < first {
+        type_error(p, c"the variant range is empty (its first variant is declared after its last)");
+    }
+    let mark = list_begin();
+    for v in first..last + 1 {
+        if VARIANTS[v].field_count > 0 {
+            name_error(NODES[p].start, c"variant ranges are for variants without fields; '", VARIANTS[v].name, c"' has fields");
+        }
+        let alt = new_node(NodeKind::PatVariant, NODES[p].start, NODES[p].end);
+        NODES[alt].a = ENUMS[e].name;
+        NODES[alt].b = VARIANTS[v].name;
+        list_push(alt);
+    }
+    list_end(p, mark);
+    NODES[p].kind = NodeKind::PatOr;
+    check_pat(p, ty);
 }
 
 fn check_literal_type(p: i64, ty: i64, what: *u8) {
@@ -124,7 +200,7 @@ fn check_literal_type(p: i64, ty: i64, what: *u8) {
 
 fn check_variant_pattern(p: i64, ty: i64) {
     let t = resolve_named(NODES[p].a, NODES[p].start);
-    if TYPES[t].kind != TY_ENUM {
+    if TYPES[t].kind != TyKind::Enum {
         err_begin(NODES[p].start);
         err_str(c"'");
         err_type(t);
@@ -231,52 +307,44 @@ fn or_rebind(p: i64, name: i64, ty: i64) -> i64 {
 }
 
 fn binding_count(p: i64) -> i64 {
-    let kind = NODES[p].kind;
-    if kind == P_BIND {
-        return 1;
-    }
-    if kind == P_OR {
-        return binding_count(child(p, 0));
-    }
-    if kind == P_TUPLE || kind == P_VARIANT {
-        let mut total = 0;
-        for i in 0..NODES[p].count {
-            total += binding_count(child(p, i));
+    match NODES[p].kind {
+        NodeKind::PatBind => 1,
+        NodeKind::PatOr => binding_count(child(p, 0)),
+        NodeKind::PatTuple | NodeKind::PatVariant => {
+            let mut total = 0;
+            for i in 0..NODES[p].count {
+                total += binding_count(child(p, i));
+            }
+            total
         }
-        return total;
+        _ => 0,
     }
-    0
 }
 
 // ---- Refutability ----
 
 fn is_irrefutable(p: i64) -> bool {
-    let kind = NODES[p].kind;
-    if kind == P_WILD || kind == P_BIND {
-        return true;
-    }
-    if NODES[p].ty == TY_NEVER {
-        return true;
-    }
-    if kind == P_TUPLE || kind == P_VARIANT {
-        if kind == P_VARIANT && ENUMS[VARIANTS[NODES[p].x].enum_id].variant_count != 1 {
-            return false;
-        }
-        for i in 0..NODES[p].count {
-            if !is_irrefutable(child(p, i)) {
-                return false;
+    match NODES[p].kind {
+        NodeKind::PatWild | NodeKind::PatBind => true,
+        _ if NODES[p].ty == TY_NEVER => true,
+        NodeKind::PatVariant if ENUMS[VARIANTS[NODES[p].x].enum_id].variant_count != 1 => false,
+        NodeKind::PatTuple | NodeKind::PatVariant => {
+            for i in 0..NODES[p].count {
+                if !is_irrefutable(child(p, i)) {
+                    return false;
+                }
             }
+            true
         }
-        return true;
+        _ => false,
     }
-    false
 }
 
 fn has_or_pattern(p: i64) -> i64 {
-    if NODES[p].kind == P_OR {
+    if NODES[p].kind == NodeKind::PatOr {
         return p;
     }
-    if NODES[p].kind == P_TUPLE || NODES[p].kind == P_VARIANT {
+    if NODES[p].kind == NodeKind::PatTuple || NODES[p].kind == NodeKind::PatVariant {
         for i in 0..NODES[p].count {
             let found = has_or_pattern(child(p, i));
             if found != 0 {
@@ -371,7 +439,7 @@ const W_TUPLE: i64 = 3;
 const W_INT: i64 = 4;
 
 fn is_wild(p: i64) -> bool {
-    p == 0 || NODES[p].kind == P_WILD || NODES[p].kind == P_BIND
+    p == 0 || NODES[p].kind == NodeKind::PatWild || NODES[p].kind == NodeKind::PatBind
 }
 
 // Integers in an order-preserving signed form: unsigned values with the
@@ -401,7 +469,7 @@ fn head_low(p: i64, ty: i64) -> i64 {
 }
 
 fn head_high(p: i64, ty: i64) -> i64 {
-    if NODES[p].kind == P_RANGE {
+    if NODES[p].kind == NodeKind::PatRange {
         return int_key(NODES[p].y, ty);
     }
     int_key(NODES[p].x, ty)
@@ -411,9 +479,9 @@ fn head_high(p: i64, ty: i64) -> i64 {
 // integer, 0 none (only wildcards match it).
 fn ctor_kind(ty: i64) -> i64 {
     let kind = TYPES[ty].kind;
-    if kind == TY_ENUM { return 1; }
+    if kind == TyKind::Enum { return 1; }
     if ty == TY_BOOL { return 2; }
-    if kind == TY_TUPLE || ty == TY_UNIT { return 3; }
+    if kind == TyKind::Tuple || ty == TY_UNIT { return 3; }
     if is_integer(ty) { return 4; }
     0
 }
@@ -438,16 +506,16 @@ fn expand_rows(m: i64, rows: i64, cols: i64, out_rows: *i64) -> i64 {
 // Pushes the row at `row` with head `head` (expanding or-patterns); returns
 // the number of rows pushed.
 fn push_expanded(row: i64, cols: i64, head: i64) -> i64 {
-    if head != 0 && NODES[head].kind == P_OR {
+    if head != 0 && NODES[head].kind == NodeKind::PatOr {
         let mut count = 0;
         for i in 0..NODES[head].count {
             count += push_expanded(row, cols, child(head, i));
         }
         return count;
     }
-    intvec_push(&MAT, head);
+    MAT.push(head);
     for c in 1..cols {
-        intvec_push(&MAT, MAT.data[row + c]);
+        MAT.push(MAT.data[row + c]);
     }
     1
 }
@@ -459,13 +527,13 @@ fn push_ctor_types(ty: i64, c: i64) -> i64 {
     if kind == 1 {
         let v = enum_variant(TYPES[ty].a, c);
         for i in 0..VARIANTS[v].field_count {
-            intvec_push(&MTY, variant_field(v, i));
+            MTY.push(variant_field(v, i));
         }
         return VARIANTS[v].field_count;
     }
     if kind == 3 && ty != TY_UNIT {
         for i in 0..TYPES[ty].count {
-            intvec_push(&MTY, type_elem(ty, i));
+            MTY.push(type_elem(ty, i));
         }
         return TYPES[ty].count;
     }
@@ -494,17 +562,17 @@ fn push_specialized(row: i64, cols: i64, ty: i64, c: i64, c_end: i64, arity: i64
     let head = MAT.data[row];
     if is_wild(head) {
         for _ in 0..arity {
-            intvec_push(&MAT, 0);
+            MAT.push(0);
         }
     } else if head_is(head, ty, c, c_end) {
         for i in 0..arity {
-            intvec_push(&MAT, child(head, i));
+            MAT.push(child(head, i));
         }
     } else {
         return false;
     }
     for k in 1..cols {
-        intvec_push(&MAT, MAT.data[row + k]);
+        MAT.push(MAT.data[row + k]);
     }
     true
 }
@@ -514,17 +582,17 @@ fn push_specialized(row: i64, cols: i64, ty: i64, c: i64, c_end: i64, arity: i64
 // (sorted, unique); the last segment ends at the type's maximum.
 fn int_segments(m: i64, rows: i64, cols: i64, ty: i64, extra: i64) {
     CUTS.count = 0;
-    intvec_push(&CUTS, min_key(ty));
+    CUTS.push(min_key(ty));
     let top = max_key(ty);
     for r in 0..rows + 1 {
         let p = if r < rows { MAT.data[mat_row(m, cols, r)] } else { extra };
         if is_wild(p) {
             continue;
         }
-        intvec_push(&CUTS, head_low(p, ty));
+        CUTS.push(head_low(p, ty));
         let high = head_high(p, ty);
         if high < top {
-            intvec_push(&CUTS, high + 1);
+            CUTS.push(high + 1);
         }
     }
     // Insertion sort, then unique.
@@ -596,12 +664,12 @@ fn useful(m: i64, rows: i64, cols: i64, types: i64, q: i64) -> bool {
     let tmark = MTY.count;
     let head = MAT.data[q];
     let mut result = false;
-    if head != 0 && NODES[head].kind == P_OR {
+    if head != 0 && NODES[head].kind == NodeKind::PatOr {
         for i in 0..NODES[head].count {
             let q2 = MAT.count;
-            intvec_push(&MAT, child(head, i));
+            MAT.push(child(head, i));
             for k in 1..cols {
-                intvec_push(&MAT, MAT.data[q + k]);
+                MAT.push(MAT.data[q + k]);
             }
             if useful(m, rows, cols, types, q2) {
                 result = true;
@@ -626,7 +694,7 @@ fn useful(m: i64, rows: i64, cols: i64, types: i64, q: i64) -> bool {
             let cuts = MAT.count;
             if kind == 4 {
                 for i in 0..CUTS.count {
-                    intvec_push(&MAT, CUTS.data[i]);
+                    MAT.push(CUTS.data[i]);
                 }
             }
             for c in 0..total {
@@ -654,7 +722,7 @@ fn useful(m: i64, rows: i64, cols: i64, types: i64, q: i64) -> bool {
         let row = mat_row(em, cols, r);
         if is_wild(MAT.data[row]) {
             for k in 1..cols {
-                intvec_push(&MAT, MAT.data[row + k]);
+                MAT.push(MAT.data[row + k]);
             }
             drows += 1;
         }
@@ -671,7 +739,7 @@ fn specialized_useful(m: i64, rows: i64, cols: i64, types: i64, q: i64, ty: i64,
     let tmark = MTY.count;
     let arity = push_ctor_types(ty, c);
     for k in 1..cols {
-        intvec_push(&MTY, MTY.data[types + k]);
+        MTY.push(MTY.data[types + k]);
     }
     let new_cols = arity + cols - 1;
     let s = MAT.count;
@@ -709,7 +777,7 @@ fn find_missing(m: i64, rows: i64, cols: i64, types: i64) -> bool {
     let cuts = MAT.count;
     if kind == 4 {
         for i in 0..CUTS.count {
-            intvec_push(&MAT, CUTS.data[i]);
+            MAT.push(CUTS.data[i]);
         }
     }
     if complete {
@@ -721,7 +789,7 @@ fn find_missing(m: i64, rows: i64, cols: i64, types: i64) -> bool {
             let arity_mark = MTY.count;
             let arity = push_ctor_types(ty, start);
             for k in 1..cols {
-                intvec_push(&MTY, MTY.data[types + k]);
+                MTY.push(MTY.data[types + k]);
             }
             let s = MAT.count;
             let mut srows = 0;
@@ -739,7 +807,7 @@ fn find_missing(m: i64, rows: i64, cols: i64, types: i64) -> bool {
                                         if kind == 1 { enum_variant(TYPES[ty].a, start) } else if kind == 4 { key_value(start, ty) } else { start },
                                         ty, base, arity);
                 for k in 0..cols - 1 {
-                    intvec_push(&WSTACK, WSTACK.data[base + arity + k]);
+                    WSTACK.push(WSTACK.data[base + arity + k]);
                 }
                 WSTACK.data[base] = node;
                 for k in 0..cols - 1 {
@@ -763,7 +831,7 @@ fn find_missing(m: i64, rows: i64, cols: i64, types: i64) -> bool {
         let row = mat_row(em, cols, r);
         if is_wild(MAT.data[row]) {
             for k in 1..cols {
-                intvec_push(&MAT, MAT.data[row + k]);
+                MAT.push(MAT.data[row + k]);
             }
             drows += 1;
         }
@@ -789,7 +857,7 @@ fn find_missing(m: i64, rows: i64, cols: i64, types: i64) -> bool {
                     let v = enum_variant(TYPES[ty].a, c);
                     let kids = WKIDS.count;
                     for _ in 0..VARIANTS[v].field_count {
-                        intvec_push(&WKIDS, witness_node(W_ANY, 0, 0, 0, 0));
+                        WKIDS.push(witness_node(W_ANY, 0, 0, 0, 0));
                     }
                     node = witness_node(W_VARIANT, v, ty, 0, 0);
                     WIT.data[node + 3] = kids;
@@ -803,7 +871,7 @@ fn find_missing(m: i64, rows: i64, cols: i64, types: i64) -> bool {
             }
         }
         let base = WSTACK.count - (cols - 1);
-        intvec_push(&WSTACK, 0);
+        WSTACK.push(0);
         let mut k = WSTACK.count - 1;
         while k > base {
             WSTACK.data[k] = WSTACK.data[k - 1];
@@ -820,14 +888,14 @@ fn find_missing(m: i64, rows: i64, cols: i64, types: i64) -> bool {
 fn witness_node(kind: i64, value: i64, ty: i64, kids_at: i64, kids: i64) -> i64 {
     let first = WKIDS.count;
     for i in 0..kids {
-        intvec_push(&WKIDS, WSTACK.data[kids_at + i]);
+        WKIDS.push(WSTACK.data[kids_at + i]);
     }
     let node = WIT.count;
-    intvec_push(&WIT, kind);
-    intvec_push(&WIT, value);
-    intvec_push(&WIT, ty);
-    intvec_push(&WIT, first);
-    intvec_push(&WIT, kids);
+    WIT.push(kind);
+    WIT.push(value);
+    WIT.push(ty);
+    WIT.push(first);
+    WIT.push(kids);
     node
 }
 
@@ -871,7 +939,7 @@ fn buf_witness(out: i64, node: i64) {
 fn check_arms(n: i64, st: i64) {
     MAT.count = 0;
     MTY.count = 0;
-    intvec_push(&MTY, st);
+    MTY.push(st);
     // The patterns of the arms without guards so far: one-column rows.
     let rows_start = 0;
     let mut rows = 0;
@@ -882,21 +950,21 @@ fn check_arms(n: i64, st: i64) {
         // The matrix is rebuilt from `kept` for every arm.
         MAT.count = 0;
         for r in 0..kept.count {
-            intvec_push(&MAT, kept.data[r]);
+            MAT.push(kept.data[r]);
         }
         let q = MAT.count;
-        intvec_push(&MAT, p);
+        MAT.push(p);
         if !useful(rows_start, kept.count, 1, 0, q) {
             type_error(p, c"unreachable match arm: the arms above match every value it matches");
         }
         if NODES[arm].b == 0 {
-            intvec_push(&kept, p);
+            kept.push(p);
             rows += 1;
         }
     }
     MAT.count = 0;
     for r in 0..kept.count {
-        intvec_push(&MAT, kept.data[r]);
+        MAT.push(kept.data[r]);
     }
     WSTACK.count = 0;
     if find_missing(0, kept.count, 1, 0) {

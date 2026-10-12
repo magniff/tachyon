@@ -11,20 +11,22 @@
 
 // ---- C library ----
 
-extern fn malloc(size: u64) -> *u8;
-extern fn realloc(ptr: *u8, size: u64) -> *u8;
-extern fn free(ptr: *u8);
-extern fn memcpy(dst: *u8, src: *u8, n: u64) -> *u8;
-extern fn memset(dst: *u8, c: i32, n: u64) -> *u8;
-extern fn memcmp(a: *u8, b: *u8, n: u64) -> i32;
-extern fn strlen(s: *u8) -> u64;
-extern fn strtod(s: *u8, end: **u8) -> f64;
-extern fn fopen(path: *u8, mode: *u8) -> *u8;
-extern fn fread(buf: *u8, size: u64, count: u64, file: *u8) -> u64;
-extern fn fwrite(buf: *u8, size: u64, count: u64, file: *u8) -> u64;
-extern fn fclose(file: *u8) -> i32;
-extern fn write(fd: i32, buf: *u8, n: u64) -> i64;
-extern fn exit(code: i32) -> !;
+extern "C" {
+    fn malloc(size: u64) -> *u8;
+    fn realloc(ptr: *u8, size: u64) -> *u8;
+    fn free(ptr: *u8);
+    fn memcpy(dst: *u8, src: *u8, n: u64) -> *u8;
+    fn memset(dst: *u8, c: i32, n: u64) -> *u8;
+    fn memcmp(a: *u8, b: *u8, n: u64) -> i32;
+    fn strlen(s: *u8) -> u64;
+    fn strtod(s: *u8, end: **u8) -> f64;
+    fn fopen(path: *u8, mode: *u8) -> *u8;
+    fn fread(buf: *u8, size: u64, count: u64, file: *u8) -> u64;
+    fn fwrite(buf: *u8, size: u64, count: u64, file: *u8) -> u64;
+    fn fclose(file: *u8) -> i32;
+    fn write(fd: i32, buf: *u8, n: u64) -> i64;
+    fn exit(code: i32) -> !;
+}
 
 const STDOUT: i32 = 1;
 const STDERR: i32 = 2;
@@ -65,15 +67,17 @@ fn alloc_zeroed(size: i64) -> *u8 {
 // A growable array of i64, used for node lists and scratch stacks.
 struct IntVec { data: *i64, count: i64, cap: i64 }
 
-fn intvec_push(v: *IntVec, value: i64) {
-    (*v).data = grow((*v).data as *u8, (*v).count, &(*v).cap, 8) as *i64;
-    (*v).data[(*v).count] = value;
-    (*v).count += 1;
-}
+impl IntVec {
+    fn push(self: *IntVec, value: i64) {
+        (*self).data = grow((*self).data as *u8, (*self).count, &(*self).cap, 8) as *i64;
+        (*self).data[(*self).count] = value;
+        (*self).count += 1;
+    }
 
-fn intvec_pop(v: *IntVec) -> i64 {
-    (*v).count -= 1;
-    (*v).data[(*v).count]
+    fn pop(self: *IntVec) -> i64 {
+        (*self).count -= 1;
+        (*self).data[(*self).count]
+    }
 }
 
 // ---- Byte buffers ----
@@ -118,14 +122,20 @@ fn buf_byte(b: i64, c: u8) {
     BUFS[b].len += 1;
 }
 
-fn buf_bytes(b: i64, p: *u8, n: i64) {
+fn buf_bytes(b: i64, bytes: [u8]) {
+    let n = bytes.len as i64;
     buf_reserve(b, n);
-    memcpy(&BUFS[b].data[BUFS[b].len], p, n as u64);
+    memcpy(&BUFS[b].data[BUFS[b].len], bytes.ptr, bytes.len as u64);
     BUFS[b].len += n;
 }
 
+// The bytes of buffer b.
+fn buf_slice(b: i64) -> [u8] {
+    BUFS[b].data[0..BUFS[b].len]
+}
+
 fn buf_str(b: i64, s: *u8) {
-    buf_bytes(b, s, strlen(s) as i64);
+    buf_bytes(b, s[0..strlen(s) as i64]);
 }
 
 fn buf_uint(b: i64, value: u64) {
@@ -204,7 +214,8 @@ fn die2(message: *u8, detail: *u8) -> ! {
 // ---- Symbols ----
 
 // Every identifier is interned once; a symbol is its index in SYMS.
-struct Sym { ptr: *u8, len: i64, hash: u64 }
+// `text` is NUL-terminated (text.ptr is a C string).
+struct Sym { text: [u8], hash: u64 }
 
 static mut SYMS: *Sym = 0 as *Sym;
 static mut SYM_COUNT: i64 = 0;
@@ -213,10 +224,10 @@ static mut SYM_CAP: i64 = 0;
 static mut SYM_TABLE: *i64 = 0 as *i64;
 static mut SYM_TABLE_SIZE: i64 = 0;
 
-fn hash_bytes(p: *u8, n: i64) -> u64 {
+fn hash_bytes(bytes: [u8]) -> u64 {
     let mut h: u64 = 14695981039346656037;
-    for i in 0..n {
-        h ^= p[i] as u64;
+    for i in 0..bytes.len as i64 {
+        h ^= bytes[i] as u64;
         h *= 1099511628211;
     }
     h
@@ -244,17 +255,18 @@ fn sym_table_rehash() {
     }
 }
 
-fn intern(p: *u8, n: i64) -> i64 {
+fn intern(bytes: [u8]) -> i64 {
+    let n = bytes.len as i64;
     if (SYM_COUNT + 1) * 2 > SYM_TABLE_SIZE {
         sym_table_rehash();
     }
-    let hash = hash_bytes(p, n);
+    let hash = hash_bytes(bytes);
     let mask = (SYM_TABLE_SIZE - 1) as u64;
     let mut slot = hash & mask;
     while SYM_TABLE[slot] != 0 {
         let sym = SYM_TABLE[slot] - 1;
-        if SYMS[sym].hash == hash && SYMS[sym].len == n
-            && memcmp(SYMS[sym].ptr, p, n as u64) == 0 {
+        if SYMS[sym].hash == hash && SYMS[sym].text.len as i64 == n
+            && memcmp(SYMS[sym].text.ptr, bytes.ptr, n as u64) == 0 {
             return sym;
         }
         slot = (slot + 1) & mask;
@@ -263,20 +275,20 @@ fn intern(p: *u8, n: i64) -> i64 {
     let sym = SYM_COUNT;
     // Symbols keep their own NUL-terminated copy, usable as a C string.
     let copy = alloc_zeroed(n + 1);
-    memcpy(copy, p, n as u64);
-    SYMS[sym] = Sym { ptr: copy, len: n, hash: hash };
+    memcpy(copy, bytes.ptr, n as u64);
+    SYMS[sym] = Sym { text: copy[0..n], hash: hash };
     SYM_COUNT += 1;
     SYM_TABLE[slot] = sym + 1;
     sym
 }
 
 fn intern_c(s: *u8) -> i64 {
-    intern(s, strlen(s) as i64)
+    intern(s[0..strlen(s) as i64])
 }
 
 // The symbol's name as a C string.
 fn sym_name(sym: i64) -> *u8 {
-    SYMS[sym].ptr
+    SYMS[sym].text.ptr
 }
 
 // ---- Source files ----
@@ -321,6 +333,26 @@ fn load_sources(paths: **u8, count: i64) {
     buf_byte(all, 0);
     SRC = BUFS[all].data;
     SRC_LEN = BUFS[all].len - 1;
+    SRC_BUF = all;
+}
+
+static mut SRC_BUF: i64 = 0;
+
+// Adds a source file made by the compiler (the declarations of `import`ed
+// C headers) after the others; returns its start in SRC.
+fn add_source(path: *u8, text: i64) -> i64 {
+    let all = SRC_BUF;
+    BUFS[all].len -= 1;
+    let start = BUFS[all].len;
+    buf_bytes(all, buf_slice(text));
+    FILES = grow(FILES as *u8, FILE_COUNT, &FILE_CAP, 24) as *SourceFile;
+    FILES[FILE_COUNT] = SourceFile { path: path, start: start, end: BUFS[all].len };
+    FILE_COUNT += 1;
+    buf_byte(all, '\n');
+    buf_byte(all, 0);
+    SRC = BUFS[all].data;
+    SRC_LEN = BUFS[all].len - 1;
+    start
 }
 
 // ---- Errors at a source position ----
@@ -351,7 +383,7 @@ fn err_help(s: *u8) {
 }
 
 fn err_help_sym(sym: i64) {
-    buf_bytes(ERR_HELP, SYMS[sym].ptr, SYMS[sym].len);
+    buf_bytes(ERR_HELP, SYMS[sym].text);
 }
 
 fn err_str(s: *u8) {
@@ -359,7 +391,7 @@ fn err_str(s: *u8) {
 }
 
 fn err_sym(sym: i64) {
-    buf_bytes(ERR, SYMS[sym].ptr, SYMS[sym].len);
+    buf_bytes(ERR, SYMS[sym].text);
 }
 
 fn err_int(value: i64) {
@@ -398,7 +430,7 @@ fn err_end() -> ! {
     buf_str(out, c"error[");
     buf_str(out, ERR_KIND);
     buf_str(out, c"]: ");
-    buf_bytes(out, BUFS[ERR].data, BUFS[ERR].len);
+    buf_bytes(out, buf_slice(ERR));
     buf_str(out, c"\n --> ");
     buf_str(out, FILES[file].path);
     buf_str(out, c": line ");
@@ -408,7 +440,7 @@ fn err_end() -> ! {
     buf_byte(out, '\n');
     if BUFS[ERR_HELP].len > 0 {
         buf_str(out, c"  = help: ");
-        buf_bytes(out, BUFS[ERR_HELP].data, BUFS[ERR_HELP].len);
+        buf_bytes(out, buf_slice(ERR_HELP));
         buf_byte(out, '\n');
     }
     buf_write_fd(out, STDERR);

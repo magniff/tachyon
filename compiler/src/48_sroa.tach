@@ -62,8 +62,8 @@ fn slot_leaves(s: i64) -> bool {
         if repeat {
             continue;
         }
-        intvec_push(&SR_LEAVES, 0);
-        intvec_push(&SR_LEAVES, 0);
+        SR_LEAVES.push(0);
+        SR_LEAVES.push(0);
         let mut k = count;
         while k > at {
             SR_LEAVES.data[2 * (SR_FIRST[s] + k)] = SR_LEAVES.data[2 * (SR_FIRST[s] + k - 1)];
@@ -97,6 +97,31 @@ fn find_leaf(s: i64, offset: i64, ty: i64) -> i64 {
     -1
 }
 
+// The same for a load or a store: a 64-bit integer leaf also takes the
+// other 64-bit integer type (i64 and u64 have the same canonical bits; a
+// slice's length is an i64 leaf that a parameter's piece fills as u64).
+fn find_access_leaf(s: i64, offset: i64, ty: i64) -> i64 {
+    for i in 0..SR_COUNT[s] {
+        let lt = leaf_type(s, i);
+        if leaf_offset(s, i) == offset
+            && (lt == ty || (is_integer(lt) && is_integer(ty) && int_bits(lt) == 64 && int_bits(ty) == 64)) {
+            return i;
+        }
+    }
+    -1
+}
+
+// v as type ty: v, or a conversion before instruction `at` between 64-bit
+// integer types (which changes no bits).
+fn as_leaf_type(v: i64, ty: i64, at: i64) -> i64 {
+    if INSTS[v].ty == ty {
+        return v;
+    }
+    let c = op_before(at, Op::Conv, ty, v, 0);
+    INSTS[c].imm2 = INSTS[v].ty;
+    c
+}
+
 // Whether [offset, + size) holds whole leaves of slot s only.
 fn whole_leaves(s: i64, offset: i64, size: i64) -> bool {
     for i in 0..SR_COUNT[s] {
@@ -113,7 +138,7 @@ fn whole_leaves(s: i64, offset: i64, size: i64) -> bool {
 fn sroa_slot(v: i64, offset: *i64) -> i64 {
     *offset = 0;
     let base = address_base(v, offset);
-    if INSTS[base].op != OP_SLOT || SR_STATE[INSTS[base].imm] == 0 {
+    if INSTS[base].op != Op::Slot || SR_STATE[INSTS[base].imm] == 0 {
         return 0;
     }
     INSTS[base].imm
@@ -162,13 +187,13 @@ fn sroa_scan(fi: i64) {
                     continue;
                 }
                 let mut ok = false;
-                if op == OP_LOAD && k == 0 {
-                    ok = find_leaf(s, offset + INSTS[v].imm, INSTS[v].ty) >= 0;
-                } else if op == OP_STORE && k == 0 {
-                    ok = find_leaf(s, offset + INSTS[v].imm, INSTS[v].imm2) >= 0;
-                } else if op == OP_COPY && k <= 1 {
+                if op == Op::Load && k == 0 {
+                    ok = find_access_leaf(s, offset + INSTS[v].imm, INSTS[v].ty) >= 0;
+                } else if op == Op::Store && k == 0 {
+                    ok = find_access_leaf(s, offset + INSTS[v].imm, INSTS[v].imm2) >= 0;
+                } else if op == Op::Copy && k <= 1 {
                     ok = whole_leaves(s, offset, INSTS[v].imm);
-                } else if op == OP_ADD && k == 0 && INSTS[v].ty == TY_U64 && is_const(INSTS[v].b) {
+                } else if op == Op::Add && k == 0 && INSTS[v].ty == TY_U64 && is_const(INSTS[v].b) {
                     ok = true;
                 }
                 if !ok {
@@ -196,7 +221,7 @@ fn sroa_scan(fi: i64) {
             }
             let mut v = BLOCKS[b].first;
             while v != 0 {
-                if INSTS[v].op == OP_COPY {
+                if INSTS[v].op == Op::Copy {
                     let mut d_off = 0;
                     let mut s_off = 0;
                     let d = sroa_slot(INSTS[v].a, &d_off);
@@ -220,20 +245,21 @@ fn sroa_block(b: i64) {
         let next = INSTS[v].next;
         let op = INSTS[v].op;
         let mut offset = 0;
-        if op == OP_LOAD {
+        if op == Op::Load {
             let s = sroa_slot(INSTS[v].a, &offset);
             if s != 0 {
-                let leaf = find_leaf(s, offset + INSTS[v].imm, INSTS[v].ty);
-                ir_replace(v, ssa_read(SR_VAR[s] + leaf, b));
+                let leaf = find_access_leaf(s, offset + INSTS[v].imm, INSTS[v].ty);
+                let value = ssa_read(SR_VAR[s] + leaf, b);
+                ir_replace(v, as_leaf_type(value, INSTS[v].ty, v));
             }
-        } else if op == OP_STORE {
+        } else if op == Op::Store {
             let s = sroa_slot(INSTS[v].a, &offset);
             if s != 0 {
-                let leaf = find_leaf(s, offset + INSTS[v].imm, INSTS[v].imm2);
-                ssa_write(SR_VAR[s] + leaf, b, ir_val(INSTS[v].b));
+                let leaf = find_access_leaf(s, offset + INSTS[v].imm, INSTS[v].imm2);
+                ssa_write(SR_VAR[s] + leaf, b, as_leaf_type(ir_val(INSTS[v].b), leaf_type(s, leaf), v));
                 ir_unlink(v);
             }
-        } else if op == OP_COPY {
+        } else if op == Op::Copy {
             sroa_copy(b, v);
         }
         v = next;
@@ -255,20 +281,20 @@ fn sroa_copy(b: i64, v: i64) {
         for i in 0..SR_COUNT[s] {
             let o = leaf_offset(s, i);
             if o >= s_off && o < s_off + size {
-                intvec_push(&SR_VALUES, o - s_off);
-                intvec_push(&SR_VALUES, leaf_type(s, i));
-                intvec_push(&SR_VALUES, ssa_read(SR_VAR[s] + i, b));
+                SR_VALUES.push(o - s_off);
+                SR_VALUES.push(leaf_type(s, i));
+                SR_VALUES.push(ssa_read(SR_VAR[s] + i, b));
             }
         }
     } else {
         for i in 0..SR_COUNT[d] {
             let o = leaf_offset(d, i);
             if o >= d_off && o < d_off + size {
-                let load = ir_make(OP_LOAD, leaf_type(d, i), INSTS[v].b, 0, o - d_off);
+                let load = ir_make(Op::Load, leaf_type(d, i), INSTS[v].b, 0, o - d_off);
                 ir_insert_before(v, load);
-                intvec_push(&SR_VALUES, o - d_off);
-                intvec_push(&SR_VALUES, leaf_type(d, i));
-                intvec_push(&SR_VALUES, load);
+                SR_VALUES.push(o - d_off);
+                SR_VALUES.push(leaf_type(d, i));
+                SR_VALUES.push(load);
             }
         }
     }
@@ -280,7 +306,7 @@ fn sroa_copy(b: i64, v: i64) {
         if d != 0 {
             ssa_write(SR_VAR[d] + find_leaf(d, d_off + at, ty), b, value);
         } else {
-            let store = ir_make(OP_STORE, 0, INSTS[v].a, value, at);
+            let store = ir_make(Op::Store, 0, INSTS[v].a, value, at);
             INSTS[store].imm2 = ty;
             ir_insert_before(v, store);
         }
@@ -330,7 +356,7 @@ fn sroa(fi: i64) -> bool {
     }
     // SSA construction: blocks in reverse post-order; BLOCKS[b].mark counts
     // the filled predecessors.
-    hmap_clear(&DEFS);
+    DEFS.clear();
     layout_blocks(fi);
     for i in 0..IRFUNCS[fi].blocks.count {
         let b = IRFUNCS[fi].blocks.data[i];
@@ -340,7 +366,7 @@ fn sroa(fi: i64) -> bool {
     }
     let mut order = IntVec { data: 0 as *i64, count: 0, cap: 0 };
     for k in 0..ORDER.count {
-        intvec_push(&order, ORDER.data[k]);
+        order.push(ORDER.data[k]);
     }
     for k in 0..order.count {
         let b = order.data[k];
@@ -389,13 +415,13 @@ fn promote_constant_slots(fi: i64) -> bool {
         let mut v = BLOCKS[b].first;
         while v != 0 {
             let op = INSTS[v].op;
-            if op == OP_STORE || is_copy(v) {
-                let root = root_of(if op == OP_STORE { INSTS[v].a } else { copy_dst(v) });
+            if op == Op::Store || is_copy(v) {
+                let root = root_of(if op == Op::Store { INSTS[v].a } else { copy_dst(v) });
                 if is_private_root(root) {
                     let s = INSTS[root].imm;
                     let mut offset = 0;
                     let base = address_base(INSTS[v].a, &offset);
-                    if op != OP_STORE || base != root || INSTS[INSTS[v].b].op != OP_CONST {
+                    if op != Op::Store || base != root || INSTS[INSTS[v].b].op != Op::Const {
                         block_of[s] = -1;
                     } else if block_of[s] == 0 {
                         block_of[s] = b;
@@ -417,12 +443,12 @@ fn promote_constant_slots(fi: i64) -> bool {
         while v != 0 {
             let op = INSTS[v].op;
             let mut from = 0;
-            if op == OP_LOAD {
+            if op == Op::Load {
                 from = root_of(INSTS[v].a);
             } else if is_copy(v) {
                 from = root_of(copy_src(v));
             }
-            if from != 0 && INSTS[from].op == OP_SLOT {
+            if from != 0 && INSTS[from].op == Op::Slot {
                 let s = INSTS[from].imm;
                 reads[s] = 1;
                 if block_of[s] > 0 {
@@ -435,7 +461,7 @@ fn promote_constant_slots(fi: i64) -> bool {
                     }
                 }
             }
-            if op == OP_STORE {
+            if op == Op::Store {
                 let root = root_of(INSTS[v].a);
                 if is_private_root(root) && block_of[INSTS[root].imm] > 0 {
                     stores[INSTS[root].imm] -= 1;
@@ -461,9 +487,9 @@ fn promote_constant_slots(fi: i64) -> bool {
         let mut v = BLOCKS[b].first;
         while v != 0 {
             let next = INSTS[v].next;
-            if INSTS[v].op == OP_STORE {
+            if INSTS[v].op == Op::Store {
                 let root = root_of(INSTS[v].a);
-                if root != 0 && INSTS[root].op == OP_SLOT && INSTS[root].imm == s {
+                if root != 0 && INSTS[root].op == Op::Slot && INSTS[root].imm == s {
                     let mut offset = 0;
                     address_base(INSTS[v].a, &offset);
                     write_scalar(scratch, offset + INSTS[v].imm, INSTS[INSTS[v].b].imm, INSTS[v].imm2);
@@ -472,14 +498,14 @@ fn promote_constant_slots(fi: i64) -> bool {
             }
             v = next;
         }
-        let id = add_const_data(BUFS[scratch].data, size, SLOTS[s].align);
-        let data = ir_make(OP_SADDR, TY_U64, 0, 0, id);
+        let id = add_const_data(BUFS[scratch].data[0..size], SLOTS[s].align);
+        let data = ir_make(Op::SAddr, TY_U64, 0, 0, id);
         ir_prepend(IRFUNCS[fi].entry, data);
         for i in 0..ORDER.count {
             let mut w = BLOCKS[ORDER.data[i]].first;
             while w != 0 {
                 let next = INSTS[w].next;
-                if INSTS[w].op == OP_SLOT && INSTS[w].imm == s {
+                if INSTS[w].op == Op::Slot && INSTS[w].imm == s {
                     ir_replace(w, data);
                 }
                 w = next;
@@ -502,7 +528,7 @@ fn promote_constant_slots(fi: i64) -> bool {
 fn constant_load(id: i64, offset: i64, ty: i64, ok: *bool) -> i64 {
     let size = size_of(ty);
     *ok = false;
-    if offset < 0 || offset + size > STRS[id].len {
+    if offset < 0 || offset + size > STRS[id].len as i64 {
         return 0;
     }
     let mut bits: u64 = 0;

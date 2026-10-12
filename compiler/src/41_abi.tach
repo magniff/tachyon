@@ -23,14 +23,18 @@
 // offset). A piece is read and written whole, so the memory holding such an
 // aggregate is a multiple of 8 bytes (frame slots are; see new_slot_for).
 
-const ABI_SCALAR: i64 = 0;
-// In registers (or on the stack, in the same layout), as pieces.
-const ABI_PIECES: i64 = 1;
-// By reference: a pointer to a copy (AArch64, over 16 bytes).
-const ABI_REF: i64 = 2;
-// Copied onto the stack (x86-64 MEMORY, over 16 bytes); results of both
-// kinds go through a result pointer.
-const ABI_STACK: i64 = 3;
+// How a value is passed.
+enum AbiClass {
+    // A scalar, in a register (or a stack slot).
+    Scalar,
+    // In registers (or on the stack, in the same layout), as pieces.
+    Pieces,
+    // By reference: a pointer to a copy (AArch64, over 16 bytes).
+    Ref,
+    // Copied onto the stack (x86-64 MEMORY, over 16 bytes); results of
+    // both kinds go through a result pointer.
+    Stack,
+}
 
 // The pieces of the last classified aggregate.
 static mut ABI_PIECE_TY: [i64; 4] = [0; 4];
@@ -39,11 +43,11 @@ static mut ABI_PIECE_COUNT: i64 = 0;
 // Scalar leaves of an aggregate: (offset, type) pairs.
 static mut ABI_LEAVES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
-// How a value of type `ty` is passed; for ABI_PIECES, its pieces.
-fn abi_classify(ty: i64) -> i64 {
+// How a value of type `ty` is passed; for AbiClass::Pieces, its pieces.
+fn abi_classify(ty: i64) -> AbiClass {
     ABI_PIECE_COUNT = 0;
     if !is_compound(ty) {
-        return ABI_SCALAR;
+        return AbiClass::Scalar;
     }
     let size = size_of(ty);
     ABI_LEAVES.count = 0;
@@ -55,20 +59,20 @@ fn abi_classify(ty: i64) -> i64 {
             for i in 0..count {
                 abi_add_piece(elem, i * size_of(elem));
             }
-            return ABI_PIECES;
+            return AbiClass::Pieces;
         }
         if size > 16 {
-            return ABI_REF;
+            return AbiClass::Ref;
         }
         let mut offset = 0;
         while offset < size {
             abi_add_piece(int_piece_type(size - offset), offset);
             offset += 8;
         }
-        return ABI_PIECES;
+        return AbiClass::Pieces;
     }
     if size > 16 || has_unaligned_leaf() {
-        return ABI_STACK;
+        return AbiClass::Stack;
     }
     let mut offset = 0;
     while offset < size {
@@ -102,7 +106,7 @@ fn abi_classify(ty: i64) -> i64 {
         }
         offset += 8;
     }
-    ABI_PIECES
+    AbiClass::Pieces
 }
 
 // Whether a leaf sits at an offset that is not a multiple of its
@@ -137,29 +141,29 @@ fn int_piece_type(left: i64) -> i64 {
 // of every variant of an enum overlap (a union).
 fn abi_leaves(ty: i64, offset: i64) {
     let kind = TYPES[ty].kind;
-    if kind == TY_STRUCT {
+    if kind == TyKind::Struct {
         let s = TYPES[ty].a;
         for i in 0..STRUCTS[s].field_count {
             abi_leaves((*struct_field(s, i)).ty, offset + field_offset(s, i));
         }
-    } else if kind == TY_TUPLE {
+    } else if kind == TyKind::Tuple {
         for i in 0..TYPES[ty].count {
             abi_leaves(type_elem(ty, i), offset + tuple_offset(ty, i));
         }
-    } else if kind == TY_ARRAY {
+    } else if kind == TyKind::Array {
         let elem = TYPES[ty].a;
         for i in 0..TYPES[ty].b {
             abi_leaves(elem, offset + i * size_of(elem));
         }
-    } else if kind == TY_SLICE {
-        intvec_push(&ABI_LEAVES, offset);
-        intvec_push(&ABI_LEAVES, TY_U64);
-        intvec_push(&ABI_LEAVES, offset + 8);
-        intvec_push(&ABI_LEAVES, TY_U64);
-    } else if kind == TY_ENUM && is_compound(ty) {
+    } else if kind == TyKind::Slice {
+        ABI_LEAVES.push(offset);
+        ABI_LEAVES.push(TY_U64);
+        ABI_LEAVES.push(offset + 8);
+        ABI_LEAVES.push(TY_U64);
+    } else if kind == TyKind::Enum && is_compound(ty) {
         let e = TYPES[ty].a;
-        intvec_push(&ABI_LEAVES, offset);
-        intvec_push(&ABI_LEAVES, ENUMS[e].tag);
+        ABI_LEAVES.push(offset);
+        ABI_LEAVES.push(ENUMS[e].tag);
         for i in 0..ENUMS[e].variant_count {
             let v = enum_variant(e, i);
             for k in 0..VARIANTS[v].field_count {
@@ -167,8 +171,8 @@ fn abi_leaves(ty: i64, offset: i64) {
             }
         }
     } else if !is_void(ty) {
-        intvec_push(&ABI_LEAVES, offset);
-        intvec_push(&ABI_LEAVES, scalar_type(ty));
+        ABI_LEAVES.push(offset);
+        ABI_LEAVES.push(scalar_type(ty));
     }
 }
 
@@ -262,7 +266,7 @@ fn abi_piece_locations(ty: i64, state: *i64, locations: *i64) {
 }
 
 // The stack offset (from the outgoing area) of an aggregate copied onto the
-// stack (ABI_STACK).
+// stack (AbiClass::Stack).
 fn abi_stack_location(ty: i64, state: *i64) -> i64 {
     let base = align_to(state[2], if align_of(ty) >= 16 { 16 } else { 8 });
     state[2] = base + align_to(size_of(ty), 8);
@@ -274,7 +278,7 @@ fn abi_stack_location(ty: i64, state: *i64) -> i64 {
 // every variadic argument goes on the stack (an aggregate in pieces as its
 // bytes, homogeneous float aggregates of any size included; a larger one
 // by reference, in an 8-byte slot). Classifies ty.
-fn variadic_kind(ty: i64) -> i64 {
+fn variadic_kind(ty: i64) -> AbiClass {
     abi_classify(ty)
 }
 

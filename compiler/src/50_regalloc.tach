@@ -88,14 +88,14 @@ fn split_critical_edges(fi: i64) {
             let s = succ(b, k);
             k += 1;
             let first = BLOCKS[s].first;
-            if first == 0 || INSTS[first].op != OP_PHI {
+            if first == 0 || INSTS[first].op != Op::Phi {
                 continue;
             }
             let e = ir_new_block();
             BLOCKS[e].sealed = 1;
-            BLOCKS[e].term = TERM_JUMP;
+            BLOCKS[e].term = Term::Jump;
             BLOCKS[e].s0 = s;
-            intvec_push(&BLOCKS[e].preds, b);
+            BLOCKS[e].preds.push(b);
             redirect_succ(b, s, e);
             // Same index in the predecessor list, so the phis still match.
             let index = pred_index(s, b);
@@ -116,8 +116,8 @@ fn layout_blocks(fi: i64) {
     // Iterative depth-first search; post-order into ORDER, reversed below.
     let mut stack = IntVec { data: 0 as *i64, count: 0, cap: 0 };
     let entry = IRFUNCS[fi].entry;
-    intvec_push(&stack, entry);
-    intvec_push(&stack, 0);
+    stack.push(entry);
+    stack.push(0);
     BLOCKS[entry].mark = 1;
     while stack.count > 0 {
         let b = stack.data[stack.count - 2];
@@ -129,12 +129,12 @@ fn layout_blocks(fi: i64) {
             let s = succ(b, succ_count(b) - 1 - next);
             if BLOCKS[s].mark == 0 {
                 BLOCKS[s].mark = 1;
-                intvec_push(&stack, s);
-                intvec_push(&stack, 0);
+                stack.push(s);
+                stack.push(0);
             }
         } else {
             stack.count -= 2;
-            intvec_push(&ORDER, b);
+            ORDER.push(b);
         }
     }
     free(stack.data as *u8);
@@ -152,22 +152,22 @@ fn layout_blocks(fi: i64) {
 // Whether compare `v` is fused into the branch that ends its block.
 fn is_fused_compare(v: i64) -> bool {
     let b = INSTS[v].block;
-    INSTS[v].op == OP_CMP && USES[v] == 1 && BLOCKS[b].term == TERM_BRANCH
+    INSTS[v].op == Op::Cmp && USES[v] == 1 && BLOCKS[b].term == Term::Branch
         && BLOCKS[b].cond == v && INSTS[v].next == 0 && !is_float(INSTS[v].imm2)
 }
 
 // Whether `v` is emitted at all, and whether it needs a location.
 fn is_emitted(v: i64) -> bool {
     let op = INSTS[v].op;
-    if is_remat_op(op) || op == OP_PHI || op == OP_PARAM {
+    if op.is_remat() || op == Op::Phi || op == Op::Param {
         return false;
     }
-    has_side_effect(op) || USES[v] > 0
+    op.has_side_effect() || USES[v] > 0
 }
 
 fn needs_location(v: i64) -> bool {
     let op = INSTS[v].op;
-    INSTS[v].ty != 0 && !is_remat_op(op) && USES[v] > 0 && !is_fused_compare(v)
+    INSTS[v].ty != 0 && !op.is_remat() && USES[v] > 0 && !is_fused_compare(v)
 }
 
 // ---- Positions and liveness ----
@@ -207,35 +207,35 @@ fn number_positions() {
     let mut pos = 0;
     for k in 0..ORDER.count {
         let b = ORDER.data[k];
-        intvec_push(&BSTART, pos);
+        BSTART.push(pos);
         pos += 2;
         let mut v = BLOCKS[b].first;
         while v != 0 {
             let op = INSTS[v].op;
-            if op == OP_PHI || op == OP_PARAM {
+            if op == Op::Phi || op == Op::Param {
                 INSTS[v].mark = BSTART.data[k];
             } else {
                 INSTS[v].mark = pos;
                 pos += 2;
             }
-            if is_call_op(op) {
-                intvec_push(&CALL_POS, INSTS[v].mark);
+            if op.is_call() {
+                CALL_POS.push(INSTS[v].mark);
             }
             INSTS[v].aux = 0;
             if needs_location(v) {
-                intvec_push(&RA_VALS, v);
+                RA_VALS.push(v);
                 INSTS[v].aux = RA_VALS.count;
             }
             v = INSTS[v].next;
         }
-        intvec_push(&BEND, pos);
+        BEND.push(pos);
         pos += 2;
     }
     // Parameters are defined when the function starts.
     let entry = IRFUNCS[IRF].entry;
     let mut v = BLOCKS[entry].first;
     while v != 0 {
-        if INSTS[v].op == OP_PARAM {
+        if INSTS[v].op == Op::Param {
             INSTS[v].mark = 0;
         }
         v = INSTS[v].next;
@@ -278,7 +278,7 @@ fn compute_liveness() {
         let d = live_set(kill, k);
         let mut v = BLOCKS[b].first;
         while v != 0 {
-            if INSTS[v].op != OP_PHI {
+            if INSTS[v].op != Op::Phi {
                 for i in 0..ir_operand_count(v) {
                     let t = tracked(ir_operand(v, i));
                     if t >= 0 && !bit_get(d, t) {
@@ -314,7 +314,7 @@ fn compute_liveness() {
                 // Phi operands flowing from b.
                 let index = pred_index(s, b);
                 let mut phi = BLOCKS[s].first;
-                while phi != 0 && INSTS[phi].op == OP_PHI {
+                while phi != 0 && INSTS[phi].op == Op::Phi {
                     let t = tracked(ir_arg(phi, index));
                     if t >= 0 {
                         bit_set(out, t);
@@ -375,7 +375,7 @@ fn build_intervals() {
         let mut v = BLOCKS[b].first;
         while v != 0 {
             extend(tracked(v), INSTS[v].mark);
-            if INSTS[v].op == OP_PHI {
+            if INSTS[v].op == Op::Phi {
                 for i in 0..INSTS[v].nargs {
                     let pred = BLOCKS[b].preds.data[i];
                     let t = tracked(ir_arg(v, i));
@@ -546,7 +546,7 @@ fn free_reg(regs: *i64, count: i64) -> i64 {
 // of its operands) when that register is free and suits t, or -1.
 fn hinted_reg(t: i64, float: bool, crossing: bool) -> i64 {
     let v = RA_VALS.data[t];
-    if INSTS[v].op == OP_PHI {
+    if INSTS[v].op == Op::Phi {
         // The phi it feeds first, then its operands.
         let r = suitable_hint(RA_HINT[t], float, crossing);
         if r >= 0 {
@@ -584,7 +584,7 @@ fn suitable_hint(partner: i64, float: bool, crossing: bool) -> i64 {
 fn assign_reg(t: i64, r: i64) {
     RA_LOC[t] = r;
     REG_OWNER[r] = t;
-    intvec_push(&ACTIVE, t);
+    ACTIVE.push(t);
     if is_callee_saved_reg(r) {
         CALLEE_USED[r] = 1;
     }

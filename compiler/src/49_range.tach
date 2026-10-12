@@ -1,0 +1,776 @@
+// Value ranges and the comparisons they decide (0.4): bounds-check
+// elimination, comparison folding, jump threading on implied conditions,
+// and comparison chains turned into switches.
+//
+// A fact is a comparison (or a bool) known to hold, or not, at a block: the
+// condition of every branch on the way to it along the dominator tree (when
+// the edge into a block on that way is its only way in), the case of a
+// switch that leads there, and for the blocks of a counted loop
+// (49_scev.tach) `i < n` and `i >= start` for its induction variable. The
+// range of an integer value is an interval (in the signed 64-bit view of
+// its canonical value) from its type and its operation (masks, remainders,
+// conversions, constants), narrowed by the facts that compare it with a
+// constant. A comparison is decided when the facts about the same operands,
+// or the ranges, leave only outcomes that agree.
+
+// The facts at a block: pairs (comparison or bool value, holds).
+static mut FACTS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// Per loop: the comparisons its counted test implies (0: none), made for
+// the facts (not in any block).
+static mut LOOP_FACT_LT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut LOOP_FACT_GE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// Outcomes of a comparison as a set: 1 less, 2 equal, 4 greater.
+fn cond_set(c: Cond) -> i64 {
+    match c {
+        Cond::Lt => 1,
+        Cond::Le => 3,
+        Cond::Eq => 2,
+        Cond::Ne => 5,
+        Cond::Gt => 4,
+        Cond::Ge => 6,
+    }
+}
+
+// The set with less and greater swapped (the operands swapped).
+fn mirror_set(s: i64) -> i64 {
+    (s & 2) | ((s & 1) << 2) | ((s & 4) >> 2)
+}
+
+fn is_order(c: Cond) -> bool {
+    c != Cond::Eq && c != Cond::Ne
+}
+
+// A comparison instruction outside any block, for a fact.
+fn fact_cmp(cond: Cond, ty: i64, a: i64, b: i64) -> i64 {
+    let v = ir_make(Op::Cmp, TY_BOOL, a, b, 0);
+    INSTS[v].cond = cond;
+    INSTS[v].imm2 = ty;
+    v
+}
+
+fn fact_const(value: i64, ty: i64) -> i64 {
+    ir_make(Op::Const, ty, 0, 0, value)
+}
+
+// The facts of the counted loops of the function (after analyze_loops).
+fn make_loop_facts() {
+    LOOP_FACT_LT.count = 0;
+    LOOP_FACT_GE.count = 0;
+    for l in 0..loop_count() {
+        let mut lt = 0;
+        let mut ge = 0;
+        let mut iv = 0;
+        let mut step = 0;
+        let mut n = 0;
+        let mut ne = false;
+        if loop_preheader(l) != 0 && loop_latch(l) != 0
+            && counted_loop(l, &iv, &step, &n, &ne) && !ne {
+            let latch = loop_latch(l);
+            let ty = INSTS[BLOCKS[latch].cond].imm2;
+            let start = iv_start(l, iv);
+            if step == 1 {
+                lt = fact_cmp(Cond::Lt, ty, iv, n);
+                ge = fact_cmp(Cond::Ge, ty, iv, start);
+            } else {
+                lt = fact_cmp(Cond::Gt, ty, iv, n);
+                ge = fact_cmp(Cond::Le, ty, iv, start);
+            }
+        }
+        LOOP_FACT_LT.push(lt);
+        LOOP_FACT_GE.push(ge);
+    }
+}
+
+// The facts at the start of block b into FACTS.
+fn collect_facts(b: i64) {
+    FACTS.count = 0;
+    let mut x = b;
+    let mut steps = 0;
+    while steps < 64 {
+        steps += 1;
+        if BLOCKS[x].preds.count == 1 {
+            let p = BLOCKS[x].preds.data[0];
+            edge_fact(p, x);
+        }
+        let up = BLOCKS[x].idom;
+        if up == x || up == 0 {
+            break;
+        }
+        x = up;
+    }
+    let mut l = innermost_loop(b);
+    while l >= 0 {
+        if l < LOOP_FACT_LT.count && LOOP_FACT_LT.data[l] != 0 {
+            FACTS.push(LOOP_FACT_LT.data[l]);
+            FACTS.push(1);
+            FACTS.push(LOOP_FACT_GE.data[l]);
+            FACTS.push(1);
+        }
+        l = LP_PARENT.data[l];
+    }
+}
+
+// The fact the edge p -> x gives (x reached by it), if any.
+fn edge_fact(p: i64, x: i64) {
+    if BLOCKS[p].term == Term::Branch && BLOCKS[p].s0 != BLOCKS[p].s1 {
+        FACTS.push(ir_val(BLOCKS[p].cond));
+        FACTS.push(if BLOCKS[p].s0 == x { 1 } else { 0 });
+    } else if BLOCKS[p].term == Term::Switch && BLOCKS[p].s0 != x {
+        // x is the target of exactly one case: the value is that case's.
+        let mut found = -1;
+        let mut count = 0;
+        for i in 0..BLOCKS[p].ncases {
+            if case_target(p, i) == x {
+                found = i;
+                count += 1;
+            }
+        }
+        if count == 1 {
+            let v = ir_val(BLOCKS[p].cond);
+            let ty = INSTS[v].ty;
+            FACTS.push(fact_cmp(Cond::Eq, ty, v, fact_const(case_value(p, found), ty)));
+            FACTS.push(1);
+        }
+    }
+}
+
+// v with conversions between 64-bit integer types (which change no bits)
+// looked through: values equal as bits compare equal.
+fn bits_of_value(v: i64) -> i64 {
+    let mut x = ir_val(v);
+    while INSTS[x].op == Op::Conv && is_integer(INSTS[x].ty) && is_integer(INSTS[x].imm2)
+        && int_bits(INSTS[x].ty) == 64 && int_bits(INSTS[x].imm2) == 64 {
+        x = ir_val(INSTS[x].a);
+    }
+    x
+}
+
+// ---- Ranges ----
+
+fn type_min(ty: i64) -> i64 {
+    if ty == TY_BOOL {
+        return 0;
+    }
+    if !is_integer(ty) {
+        return 0 - 9223372036854775807 - 1;
+    }
+    let bits = int_bits(ty);
+    if is_signed(ty) {
+        if bits == 64 { 0 - 9223372036854775807 - 1 } else { 0 - (1 << (bits - 1) as u64) }
+    } else if bits == 64 {
+        0 - 9223372036854775807 - 1
+    } else {
+        0
+    }
+}
+
+fn type_max(ty: i64) -> i64 {
+    if ty == TY_BOOL {
+        return 1;
+    }
+    if !is_integer(ty) {
+        return 9223372036854775807;
+    }
+    let bits = int_bits(ty);
+    if bits == 64 {
+        return 9223372036854775807;
+    }
+    if is_signed(ty) { (1 << (bits - 1) as u64) - 1 } else { (1 << bits as u64) - 1 }
+}
+
+// The range of v (context-free): *lo and *hi.
+fn range_of(v: i64, lo: *i64, hi: *i64, depth: i64) {
+    let ty = INSTS[v].ty;
+    *lo = type_min(ty);
+    *hi = type_max(ty);
+    let op = INSTS[v].op;
+    if op == Op::Const {
+        *lo = INSTS[v].imm;
+        *hi = INSTS[v].imm;
+        return;
+    }
+    if depth > 6 || !is_integer(ty) {
+        return;
+    }
+    let a = INSTS[v].a;
+    let b = INSTS[v].b;
+    if op == Op::And {
+        let m = if is_const(b) { INSTS[b].imm } else if is_const(a) { INSTS[a].imm } else { -1 };
+        if m >= 0 {
+            *lo = 0;
+            if m < *hi {
+                *hi = m;
+            }
+        }
+    } else if op == Op::Rem && is_const(b) && INSTS[b].imm != 0 {
+        let c = INSTS[b].imm;
+        if !is_signed(ty) && c > 0 {
+            *lo = 0;
+            *hi = c - 1;
+        } else if is_signed(ty) && c > 0 - 9223372036854775807 {
+            let m = if c < 0 { 0 - c } else { c };
+            let mut alo = 0;
+            let mut ahi = 0;
+            range_of(a, &alo, &ahi, depth + 1);
+            *lo = if alo >= 0 { 0 } else { 1 - m };
+            *hi = if ahi <= 0 { 0 } else { m - 1 };
+        }
+    } else if op == Op::Shr && is_const(b) && !is_signed(ty) {
+        let k = shift_amount(INSTS[b].imm, ty);
+        if k > 0 {
+            *lo = 0;
+            let max = if int_bits(ty) == 64 { 0 - 1 } else { type_max(ty) };
+            *hi = ((max as u64) >> k) as i64;
+        }
+    } else if op == Op::Conv && is_integer(INSTS[v].imm2) {
+        let from = INSTS[v].imm2;
+        if int_bits(from) < int_bits(ty) || (int_bits(from) == int_bits(ty) && is_signed(from) == is_signed(ty)) {
+            let mut alo = 0;
+            let mut ahi = 0;
+            range_of(a, &alo, &ahi, depth + 1);
+            // Widening keeps the value when it fits the new type.
+            if alo >= type_min(ty) && ahi <= type_max(ty) && (is_signed(ty) || alo >= 0) {
+                *lo = alo;
+                *hi = ahi;
+            }
+        }
+    } else if op == Op::Add && is_const(b) {
+        let c = INSTS[b].imm;
+        let mut alo = 0;
+        let mut ahi = 0;
+        range_of(a, &alo, &ahi, depth + 1);
+        let big = 4611686018427387904;
+        if alo > 0 - big && ahi < big && c > 0 - big && c < big
+            && alo + c >= type_min(ty) && ahi + c <= type_max(ty)
+            && (is_signed(ty) || int_bits(ty) < 64 || alo + c >= 0) {
+            *lo = alo + c;
+            *hi = ahi + c;
+        }
+    }
+}
+
+// The range of v at a block whose facts are in FACTS.
+fn range_at(v: i64, lo: *i64, hi: *i64) {
+    range_of(v, lo, hi, 0);
+    let mut i = 0;
+    while i < FACTS.count {
+        let f = FACTS.data[i];
+        let holds = FACTS.data[i + 1] != 0;
+        i += 2;
+        if INSTS[f].op != Op::Cmp || !is_integer(INSTS[f].imm2) {
+            continue;
+        }
+        let mut cond = INSTS[f].cond;
+        if !holds {
+            cond = cond.negate();
+        }
+        let fa = bits_of_value(INSTS[f].a);
+        let fb = bits_of_value(INSTS[f].b);
+        let mut k = 0;
+        if fa == bits_of_value(v) && is_const(fb) {
+            k = INSTS[fb].imm;
+        } else if fb == bits_of_value(v) && is_const(fa) {
+            k = INSTS[fa].imm;
+            cond = cond.mirror();
+        } else {
+            continue;
+        }
+        let signed = is_signed(INSTS[f].imm2);
+        let min = 0 - 9223372036854775807 - 1;
+        let max = 9223372036854775807;
+        match cond {
+            Cond::Eq => {
+                *lo = k;
+                *hi = k;
+            }
+            Cond::Ne => {
+                if *lo == k && k != max {
+                    *lo = k + 1;
+                } else if *hi == k && k != min {
+                    *hi = k - 1;
+                }
+            }
+            Cond::Lt | Cond::Le => {
+                let bound = if cond == Cond::Lt { if k == min { min } else { k - 1 } } else { k };
+                if signed || (k >= 0 && *lo >= 0) {
+                    if bound < *hi {
+                        *hi = bound;
+                    }
+                } else if k >= 0 {
+                    // Unsigned: below a non-negative bound, so non-negative.
+                    if *lo < 0 {
+                        *lo = 0;
+                    }
+                    if bound < *hi {
+                        *hi = bound;
+                    }
+                }
+            }
+            _ => {
+                let bound = if cond == Cond::Gt { if k == max { max } else { k + 1 } } else { k };
+                if signed || (k >= 0 && *lo >= 0) {
+                    if bound > *lo {
+                        *lo = bound;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The outcomes possible for intervals a and b.
+fn interval_outcomes(alo: i64, ahi: i64, blo: i64, bhi: i64) -> i64 {
+    let mut s = 0;
+    if alo < bhi {
+        s |= 1;
+    }
+    if alo <= bhi && blo <= ahi {
+        s |= 2;
+    }
+    if ahi > blo {
+        s |= 4;
+    }
+    s
+}
+
+// Whether comparison or bool c holds at a block with facts FACTS: 1 true,
+// 0 false, -1 unknown.
+fn decide(c: i64) -> i64 {
+    let mut i = 0;
+    while i < FACTS.count {
+        if FACTS.data[i] == c {
+            return FACTS.data[i + 1];
+        }
+        i += 2;
+    }
+    if INSTS[c].op != Op::Cmp || !is_integer(INSTS[c].imm2) {
+        return -1;
+    }
+    let a = bits_of_value(INSTS[c].a);
+    let b = bits_of_value(INSTS[c].b);
+    let q = cond_set(INSTS[c].cond);
+    let signed = is_signed(INSTS[c].imm2);
+    let mut alo = 0;
+    let mut ahi = 0;
+    let mut blo = 0;
+    let mut bhi = 0;
+    range_at(a, &alo, &ahi);
+    range_at(b, &blo, &bhi);
+    let nonneg = alo >= 0 && blo >= 0;
+    let mut outcomes = 7;
+    if a == b {
+        outcomes = 2;
+    }
+    if signed || nonneg || !is_order(INSTS[c].cond) {
+        outcomes &= interval_outcomes(alo, ahi, blo, bhi);
+    }
+    i = 0;
+    while i < FACTS.count {
+        let f = FACTS.data[i];
+        let holds = FACTS.data[i + 1] != 0;
+        i += 2;
+        if INSTS[f].op != Op::Cmp || !is_integer(INSTS[f].imm2) {
+            continue;
+        }
+        let fa = bits_of_value(INSTS[f].a);
+        let fb = bits_of_value(INSTS[f].b);
+        let mut fs = cond_set(INSTS[f].cond);
+        if !holds {
+            fs = 7 & ~fs;
+        }
+        if fa == b && fb == a {
+            fs = mirror_set(fs);
+        } else if fa != a || fb != b {
+            continue;
+        }
+        let fsigned = is_signed(INSTS[f].imm2);
+        if fs == 2 || fs == 5 || fsigned == signed || nonneg {
+            outcomes &= fs;
+        } else if fsigned && !signed && alo >= 0 && (fs & 4) == 0 {
+            // a <s b (or <=) with a >= 0: both are non-negative, and the
+            // unsigned order is the same.
+            outcomes &= fs;
+        }
+    }
+    if outcomes == 0 {
+        return -1;
+    }
+    if (outcomes & ~q) == 0 {
+        return 1;
+    }
+    if (outcomes & q) == 0 {
+        return 0;
+    }
+    -1
+}
+
+// ---- The pass ----
+
+// Decides the branches of fi whose condition the facts and ranges decide,
+// threads edges past blocks whose test the edge decides, and turns chains
+// of equality tests into switches. Returns whether anything changed.
+fn fold_by_ranges(fi: i64) -> bool {
+    IRF = fi;
+    resolve_all(fi);
+    analyze_loops(fi);
+    make_loop_facts();
+    let mut changed = false;
+    for round in 0..3 {
+        if round > 0 {
+            resolve_all(fi);
+            analyze_loops(fi);
+        }
+        let mut folded = false;
+        for i in 0..IRFUNCS[fi].blocks.count {
+            let b = IRFUNCS[fi].blocks.data[i];
+            if BLOCKS[b].removed != 0 || BLOCKS[b].order < 0 || BLOCKS[b].term != Term::Branch {
+                continue;
+            }
+            let c = ir_val(BLOCKS[b].cond);
+            if is_const(c) {
+                continue;
+            }
+            let d = decide_branch(b, c);
+            if d >= 0 {
+                let k = ir_make(Op::Const, TY_BOOL, 0, 0, d);
+                ir_append(b, k);
+                BLOCKS[b].cond = k;
+                folded = true;
+            }
+        }
+        if folded {
+            simplify_cfg(fi);
+        }
+        let threaded = thread_implied(fi);
+        if !folded && !threaded {
+            break;
+        }
+        changed = true;
+    }
+    if chains_to_switches(fi) {
+        changed = true;
+    }
+    if changed {
+        resolve_all(fi);
+        remove_unreachable(fi);
+        remove_trivial_phis(fi);
+        verify_func(fi, c"value ranges");
+    }
+    changed
+}
+
+// Whether the condition c of block b's branch is decided: by the facts at
+// b, or, for a phi of b, by the facts on each incoming edge alike.
+fn decide_branch(b: i64, c: i64) -> i64 {
+    collect_facts(b);
+    let d = decide(c);
+    if d >= 0 || INSTS[c].op != Op::Phi || INSTS[c].block != b {
+        return d;
+    }
+    let mut all = -1;
+    for k in 0..INSTS[c].nargs {
+        let p = BLOCKS[b].preds.data[k];
+        if BLOCKS[p].term == Term::Switch
+            || (BLOCKS[p].term == Term::Branch && BLOCKS[p].s0 == BLOCKS[p].s1) {
+            return -1;
+        }
+        collect_facts(p);
+        edge_fact(p, b);
+        let dk = decide(ir_val(ir_arg(c, k)));
+        if dk < 0 || (all >= 0 && dk != all) {
+            return -1;
+        }
+        all = dk;
+    }
+    all
+}
+
+// A block that only tests: no phis, its instructions pure (or constants)
+// and used by its own branch alone.
+fn is_test_block(fi: i64, j: i64) -> bool {
+    if BLOCKS[j].term != Term::Branch || j == IRFUNCS[fi].entry || BLOCKS[j].s0 == BLOCKS[j].s1 {
+        return false;
+    }
+    let mut v = BLOCKS[j].first;
+    let mut n = 0;
+    while v != 0 {
+        let op = INSTS[v].op;
+        if op != Op::Const && !op.is_pure() {
+            return false;
+        }
+        n += 1;
+        v = INSTS[v].next;
+    }
+    n <= 4 && !used_outside_block(fi, j)
+}
+
+// Per block id: whether a value defined in it is used in another block
+// (compute_exports).
+static mut EXPORTS: *i64 = 0 as *i64;
+static mut EXPORTS_CAP: i64 = 0;
+
+fn compute_exports(fi: i64) {
+    EXPORTS = block_array(EXPORTS, &EXPORTS_CAP, fi);
+    for i in 0..IRFUNCS[fi].blocks.count {
+        let b = IRFUNCS[fi].blocks.data[i];
+        if BLOCKS[b].removed != 0 {
+            continue;
+        }
+        let mut v = BLOCKS[b].first;
+        while v != 0 {
+            for k in 0..ir_operand_count(v) {
+                let w = ir_operand(v, k);
+                if w != 0 && INSTS[w].block != 0 && INSTS[w].block != b {
+                    EXPORTS[INSTS[w].block] = 1;
+                }
+            }
+            v = INSTS[v].next;
+        }
+        let c = BLOCKS[b].cond;
+        if c != 0 && INSTS[c].block != 0 && INSTS[c].block != b {
+            EXPORTS[INSTS[c].block] = 1;
+        }
+    }
+}
+
+// Whether a value defined in block j is used in another block.
+fn used_outside_block(fi: i64, j: i64) -> bool {
+    let _ = fi;
+    j >= BLOCK_COUNT || EXPORTS[j] != 0
+}
+
+// Jump threading: a predecessor p of a test block j, where the test is
+// decided (by p's facts and the edge p -> j), goes to j's outcome directly.
+fn thread_implied(fi: i64) -> bool {
+    let mut changed = false;
+    compute_exports(fi);
+    // One edge at a time: the facts need the dominators of the current CFG.
+    for _ in 0..1000 {
+        let mut did = false;
+        compute_dominators(fi);
+        for i in 0..IRFUNCS[fi].blocks.count {
+            if did {
+                break;
+            }
+            let j = IRFUNCS[fi].blocks.data[i];
+            if BLOCKS[j].removed != 0 || BLOCKS[j].order < 0 || BLOCKS[j].preds.count < 2 {
+                continue;
+            }
+            if !is_test_block(fi, j) {
+                continue;
+            }
+            let c = ir_val(BLOCKS[j].cond);
+            let mut k = 0;
+            while k < BLOCKS[j].preds.count {
+                let p = BLOCKS[j].preds.data[k];
+                k += 1;
+                if BLOCKS[p].term == Term::Switch || BLOCKS[p].order < 0
+                    || (BLOCKS[p].term == Term::Branch && BLOCKS[p].s0 == BLOCKS[p].s1) {
+                    continue;
+                }
+                collect_facts(p);
+                edge_fact(p, j);
+                let d = decide(c);
+                if d < 0 {
+                    continue;
+                }
+                let t = if d == 1 { BLOCKS[j].s0 } else { BLOCKS[j].s1 };
+                if is_succ(p, t) || t == j {
+                    continue;
+                }
+                // p -> t: t's phis take their operand for j.
+                let index = pred_index(t, j);
+                let first = LP_VALUES.count;
+                let mut phi = BLOCKS[t].first;
+                while phi != 0 && INSTS[phi].op == Op::Phi {
+                    LP_VALUES.push(ir_arg(phi, index));
+                    phi = INSTS[phi].next;
+                }
+                redirect_succ(p, j, t);
+                add_pred_values(t, p, &LP_VALUES, first);
+                LP_VALUES.count = first;
+                remove_pred(j, p);
+                did = true;
+                break;
+            }
+        }
+        if !did {
+            break;
+        }
+        changed = true;
+        remove_unreachable(fi);
+    }
+    changed
+}
+
+// ---- Comparison chains ----
+
+const CHAIN_MIN_CASES: i64 = 4;
+
+// The value block b tests for equality with a constant (its branch's
+// condition `x == k` or `x != k`): x, with *k and *equal (the successor
+// taken when equal) and *other (taken otherwise); 0 when it is not such a
+// test.
+fn equality_test(b: i64, k: *i64, equal: *i64, other: *i64) -> i64 {
+    if BLOCKS[b].term != Term::Branch || BLOCKS[b].s0 == BLOCKS[b].s1 {
+        return 0;
+    }
+    let c = ir_val(BLOCKS[b].cond);
+    if INSTS[c].op != Op::Cmp || !is_integer(INSTS[c].imm2) {
+        return 0;
+    }
+    let cond = INSTS[c].cond;
+    if cond != Cond::Eq && cond != Cond::Ne {
+        return 0;
+    }
+    let mut x = ir_val(INSTS[c].a);
+    let mut kv = ir_val(INSTS[c].b);
+    if is_const(x) {
+        let t = x;
+        x = kv;
+        kv = t;
+    }
+    if !is_const(kv) || is_const(x) {
+        return 0;
+    }
+    *k = INSTS[kv].imm;
+    if cond == Cond::Eq {
+        *equal = BLOCKS[b].s0;
+        *other = BLOCKS[b].s1;
+    } else {
+        *equal = BLOCKS[b].s1;
+        *other = BLOCKS[b].s0;
+    }
+    x
+}
+
+// Whether block b holds only constants and the comparison of its branch,
+// none used elsewhere.
+fn only_test(fi: i64, b: i64) -> bool {
+    let c = ir_val(BLOCKS[b].cond);
+    let mut v = BLOCKS[b].first;
+    while v != 0 {
+        if v != c && INSTS[v].op != Op::Const {
+            return false;
+        }
+        v = INSTS[v].next;
+    }
+    !used_outside_block(fi, b)
+}
+
+fn chains_to_switches(fi: i64) -> bool {
+    let mut changed = false;
+    compute_dominators(fi);
+    compute_exports(fi);
+    for i in 0..IRFUNCS[fi].blocks.count {
+        let b = IRFUNCS[fi].blocks.data[i];
+        if BLOCKS[b].removed != 0 || BLOCKS[b].order < 0
+            || (BLOCKS[b].preds.count == 0 && b != IRFUNCS[fi].entry) {
+            continue;
+        }
+        let mut k = 0;
+        let mut eq = 0;
+        let mut ne = 0;
+        let x = equality_test(b, &k, &eq, &ne);
+        if x == 0 {
+            continue;
+        }
+        // The chain: b, then blocks reached when not equal, each with b's
+        // chain as its only predecessor, testing x against a constant.
+        let mut cases = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut chain = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        cases.push(k);
+        cases.push(eq);
+        chain.push(b);
+        let mut tail = ne;
+        loop {
+            let mut k2 = 0;
+            let mut eq2 = 0;
+            let mut ne2 = 0;
+            if BLOCKS[tail].preds.count != 1 || tail == b || equality_test(tail, &k2, &eq2, &ne2) != x
+                || !only_test(fi, tail) {
+                break;
+            }
+            let mut dup = false;
+            for m in 0..cases.count / 2 {
+                if cases.data[2 * m] == k2 {
+                    dup = true;
+                }
+            }
+            if dup {
+                break;
+            }
+            cases.push(k2);
+            cases.push(eq2);
+            chain.push(tail);
+            tail = ne2;
+        }
+        if cases.count / 2 >= CHAIN_MIN_CASES && chain_targets_ok(&cases, &chain, tail) {
+            make_chain_switch(b, x, &cases, &chain, tail);
+            changed = true;
+        }
+        free(cases.data as *u8);
+        free(chain.data as *u8);
+    }
+    if changed {
+        remove_unreachable(fi);
+    }
+    changed
+}
+
+// Whether the chain's targets can take the switch block as their
+// predecessor: a target reached by several edges of the chain must have no
+// phis; no target is a block of the chain.
+fn chain_targets_ok(cases: *IntVec, chain: *IntVec, default: i64) -> bool {
+    let n = (*cases).count / 2;
+    for i in 0..n + 1 {
+        let t = if i < n { (*cases).data[2 * i + 1] } else { default };
+        for m in 0..(*chain).count {
+            if (*chain).data[m] == t {
+                return false;
+            }
+        }
+        let mut edges = 0;
+        for m in 0..n + 1 {
+            let u = if m < n { (*cases).data[2 * m + 1] } else { default };
+            if u == t {
+                edges += 1;
+            }
+        }
+        let first = BLOCKS[t].first;
+        if edges > 1 && first != 0 && INSTS[first].op == Op::Phi {
+            return false;
+        }
+    }
+    true
+}
+
+fn make_chain_switch(b: i64, x: i64, cases: *IntVec, chain: *IntVec, default: i64) {
+    let n = (*cases).count / 2;
+    // The targets lose the chain blocks as predecessors and get b once.
+    for i in 0..n + 1 {
+        let t = if i < n { (*cases).data[2 * i + 1] } else { default };
+        let from = if i < n { (*chain).data[i] } else { (*chain).data[(*chain).count - 1] };
+        let index = pred_index(t, from);
+        if index < 0 {
+            continue;
+        }
+        if pred_index(t, b) >= 0 && b != from {
+            remove_pred_at(t, index);
+        } else {
+            BLOCKS[t].preds.data[index] = b;
+        }
+    }
+    // The other chain blocks lose their predecessor (they become
+    // unreachable).
+    for m in 1..(*chain).count {
+        BLOCKS[(*chain).data[m]].preds.count = 0;
+    }
+    let mark = SSA_STACK.count;
+    for i in 0..n {
+        SSA_STACK.push((*cases).data[2 * i]);
+        SSA_STACK.push((*cases).data[2 * i + 1]);
+    }
+    ir_switch_no_preds(b, x, default, mark);
+}

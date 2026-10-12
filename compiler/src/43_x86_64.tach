@@ -167,16 +167,18 @@ fn x64_jump_unless_zero_result(label: i64) {
 }
 
 // The condition code of an integer comparison.
-fn x64_int_cc(op: i64, signed: bool) -> *u8 {
-    if op == TK_EQ_EQ { return c"e"; }
-    if op == TK_BANG_EQ { return c"ne"; }
-    if op == TK_LT { return if signed { c"l" } else { c"b" }; }
-    if op == TK_LT_EQ { return if signed { c"le" } else { c"be" }; }
-    if op == TK_GT { return if signed { c"g" } else { c"a" }; }
-    if signed { c"ge" } else { c"ae" }
+fn x64_int_cc(op: Cond, signed: bool) -> *u8 {
+    match op {
+        Cond::Eq => c"e",
+        Cond::Ne => c"ne",
+        Cond::Lt => if signed { c"l" } else { c"b" },
+        Cond::Le => if signed { c"le" } else { c"be" },
+        Cond::Gt => if signed { c"g" } else { c"a" },
+        Cond::Ge => if signed { c"ge" } else { c"ae" },
+    }
 }
 
-fn x64_compare_jump(op: i64, signed: bool, label: i64) {
+fn x64_compare_jump(op: Cond, signed: bool, label: i64) {
     ins(c"cmpq %rcx, %rax");
     x64_jcc(x64_int_cc(op, signed), label);
 }
@@ -402,27 +404,29 @@ fn x64_normalize(ty: i64) {
     else if ty == TY_U32 { ins(c"movl %eax, %eax"); }
 }
 
-fn x64_int_binary(op: i64, ty: i64) {
+fn x64_int_binary(op: Tok, ty: i64) {
     let signed = is_signed(ty);
-    if op == TK_PLUS { ins(c"addq %rcx, %rax"); }
-    else if op == TK_MINUS { ins(c"subq %rcx, %rax"); }
-    else if op == TK_STAR { ins(c"imulq %rcx, %rax"); }
-    else if op == TK_SLASH || op == TK_PERCENT {
-        x64_divide(op == TK_PERCENT, signed);
-    } else if op == TK_AMP { ins(c"andq %rcx, %rax"); }
-    else if op == TK_PIPE { ins(c"orq %rcx, %rax"); }
-    else if op == TK_CARET { ins(c"xorq %rcx, %rax"); }
-    else if op == TK_SHL || op == TK_SHR {
-        // The amount is taken modulo 32 for types up to 32 bits (8- and
-        // 16-bit values are shifted at 32 bits), modulo 64 for 64-bit ones.
-        ins(if int_bits(ty) == 64 { c"andq $63, %rcx" } else { c"andq $31, %rcx" });
-        if op == TK_SHL {
-            ins(c"shlq %cl, %rax");
-        } else if signed {
-            ins(c"sarq %cl, %rax");
-        } else {
-            ins(c"shrq %cl, %rax");
+    match op {
+        Tok::Plus => ins(c"addq %rcx, %rax"),
+        Tok::Minus => ins(c"subq %rcx, %rax"),
+        Tok::Star => ins(c"imulq %rcx, %rax"),
+        Tok::Slash | Tok::Percent => x64_divide(op == Tok::Percent, signed),
+        Tok::Amp => ins(c"andq %rcx, %rax"),
+        Tok::Pipe => ins(c"orq %rcx, %rax"),
+        Tok::Caret => ins(c"xorq %rcx, %rax"),
+        Tok::Shl | Tok::Shr => {
+            // The amount is taken modulo 32 for types up to 32 bits (8- and
+            // 16-bit values are shifted at 32 bits), modulo 64 for 64-bit ones.
+            ins(if int_bits(ty) == 64 { c"andq $63, %rcx" } else { c"andq $31, %rcx" });
+            if op == Tok::Shl {
+                ins(c"shlq %cl, %rax");
+            } else if signed {
+                ins(c"sarq %cl, %rax");
+            } else {
+                ins(c"shrq %cl, %rax");
+            }
         }
+        _ => {}
     }
     x64_normalize(ty);
 }
@@ -463,7 +467,7 @@ fn x64_divide(remainder: bool, signed: bool) {
     emit_label(done);
 }
 
-fn x64_compare(op: i64, ty: i64) {
+fn x64_compare(op: Cond, ty: i64) {
     if !is_float(ty) {
         ins(c"cmpq %rcx, %rax");
         o(c"    set");
@@ -475,20 +479,20 @@ fn x64_compare(op: i64, ty: i64) {
     let compare = if ty == TY_F32 { c"ucomiss" } else { c"ucomisd" };
     // Unordered (NaN) sets ZF, PF and CF: == and != check PF; < and <= swap
     // the operands to use the ordered "above" conditions.
-    if op == TK_LT || op == TK_LT_EQ {
+    if op == Cond::Lt || op == Cond::Le {
         x64_ins2(compare, c"%xmm0", c"%xmm1");
     } else {
         x64_ins2(compare, c"%xmm1", c"%xmm0");
     }
-    if op == TK_EQ_EQ {
+    if op == Cond::Eq {
         ins(c"sete %al");
         ins(c"setnp %r10b");
         ins(c"andb %r10b, %al");
-    } else if op == TK_BANG_EQ {
+    } else if op == Cond::Ne {
         ins(c"setne %al");
         ins(c"setp %r10b");
         ins(c"orb %r10b, %al");
-    } else if op == TK_LT || op == TK_GT {
+    } else if op == Cond::Lt || op == Cond::Gt {
         ins(c"seta %al");
     } else {
         ins(c"setae %al");
@@ -538,16 +542,18 @@ fn x64_index_addr(elem_size: i64) {
 
 // ---- Floats ----
 
-fn x64_float_binary(op: i64, ty: i64) {
+fn x64_float_binary(op: Tok, ty: i64) {
     let f32 = ty == TY_F32;
-    if op == TK_PERCENT {
+    if op == Tok::Percent {
         x64_call_c(if f32 { c"fmodf" } else { c"fmod" });
         return;
     }
-    if op == TK_PLUS { o(c"    add"); }
-    else if op == TK_MINUS { o(c"    sub"); }
-    else if op == TK_STAR { o(c"    mul"); }
-    else { o(c"    div"); }
+    o(match op {
+        Tok::Plus => c"    add",
+        Tok::Minus => c"    sub",
+        Tok::Star => c"    mul",
+        _ => c"    div",
+    });
     o(if f32 { c"ss %xmm1, %xmm0\n" } else { c"sd %xmm1, %xmm0\n" });
 }
 
@@ -665,11 +671,11 @@ fn x64_function_start(symbol_prefix: *u8, name: i64, global: bool) {
     if global {
         buf_str(out, c".globl ");
         buf_str(out, symbol_prefix);
-        buf_bytes(out, SYMS[name].ptr, SYMS[name].len);
+        buf_bytes(out, SYMS[name].text);
         buf_byte(out, '\n');
     }
     buf_str(out, symbol_prefix);
-    buf_bytes(out, SYMS[name].ptr, SYMS[name].len);
+    buf_bytes(out, SYMS[name].text);
     buf_str(out, c":\n");
     buf_str(out, c"    pushq %rbp\n    movq %rsp, %rbp\n");
 }

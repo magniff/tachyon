@@ -1,0 +1,841 @@
+// Loop analysis and the canonical form of loops (0.4), with the utilities
+// the loop transformations share: an SSA updater and the cloning of a
+// region of blocks.
+//
+// The loop forest: a natural loop per header (every back edge t -> h, where
+// h dominates t, adds to h's loop the blocks that reach t without passing
+// h); loops with distinct headers are nested or disjoint. A loop in
+// canonical form has a preheader (its header's only predecessor outside
+// the loop, ending in a jump), a single latch (the header's only
+// predecessor inside the loop) and dedicated exits (every block outside
+// the loop that a loop block branches to has only predecessors inside the
+// loop). LCSSA: a value defined in a loop and used outside it is used
+// through a phi in an exit block.
+
+// Per loop: its header, parent loop (-1: outermost), depth (1: outermost)
+// and blocks: LP_BLOCKS[LP_START[l]..][..LP_COUNT[l]], the header first.
+static mut LP_HEADER: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut LP_PARENT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut LP_DEPTH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut LP_START: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut LP_COUNT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut LP_BLOCKS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// Per block id (below LP_NBLOCKS): the innermost loop containing it, + 1.
+static mut LP_OF: *i64 = 0 as *i64;
+static mut LP_OF_CAP: i64 = 0;
+static mut LP_NBLOCKS: i64 = 0;
+// A visit stamp per block id, for walks over the CFG.
+static mut LP_SEEN: *i64 = 0 as *i64;
+static mut LP_SEEN_CAP: i64 = 0;
+static mut LP_STAMP: i64 = 0;
+// Scratch lists.
+static mut LP_LIST: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut LP_LIST2: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut LP_VALUES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+fn loop_count() -> i64 {
+    LP_HEADER.count
+}
+
+fn loop_header(l: i64) -> i64 {
+    LP_HEADER.data[l]
+}
+
+fn loop_block(l: i64, i: i64) -> i64 {
+    LP_BLOCKS.data[LP_START.data[l] + i]
+}
+
+fn loop_size(l: i64) -> i64 {
+    LP_COUNT.data[l]
+}
+
+// Whether block b belongs to loop l (or to a loop nested in it).
+fn loop_contains(l: i64, b: i64) -> bool {
+    if b >= LP_NBLOCKS {
+        return false;
+    }
+    let mut x = LP_OF[b] - 1;
+    while x >= 0 {
+        if x == l {
+            return true;
+        }
+        x = LP_PARENT.data[x];
+    }
+    false
+}
+
+// The innermost loop containing block b, or -1.
+fn innermost_loop(b: i64) -> i64 {
+    if b >= LP_NBLOCKS { -1 } else { LP_OF[b] - 1 }
+}
+
+// Whether loop l contains no other loop.
+fn is_innermost(l: i64) -> bool {
+    for k in 0..loop_count() {
+        if LP_PARENT.data[k] == l {
+            return false;
+        }
+    }
+    true
+}
+
+// A per-block array (indexed by block id) kept from call to call: grown
+// to cover every block (the contents are not kept then), with the entries
+// of function fi's blocks set to 0. (Allocating one per call would cost
+// the size of the whole program each time.)
+fn block_array(arr: *i64, cap: *i64, fi: i64) -> *i64 {
+    let mut a = arr;
+    if *cap < BLOCK_COUNT + 1 {
+        free(a as *u8);
+        *cap = (BLOCK_COUNT + 1) * 2;
+        a = alloc_zeroed(*cap * 8) as *i64;
+    }
+    for i in 0..IRFUNCS[fi].blocks.count {
+        a[IRFUNCS[fi].blocks.data[i]] = 0;
+    }
+    a
+}
+
+fn new_stamp() -> i64 {
+    LP_STAMP += 1;
+    LP_STAMP
+}
+
+// Finds the loops of function fi (and its dominators and block layout).
+fn analyze_loops(fi: i64) {
+    compute_dominators(fi);
+    LP_HEADER.count = 0;
+    LP_PARENT.count = 0;
+    LP_DEPTH.count = 0;
+    LP_START.count = 0;
+    LP_COUNT.count = 0;
+    LP_BLOCKS.count = 0;
+    LP_NBLOCKS = BLOCK_COUNT;
+    LP_OF = block_array(LP_OF, &LP_OF_CAP, fi);
+    // (Stamps only grow, so LP_SEEN needs no clearing.)
+    LP_SEEN = block_array(LP_SEEN, &LP_SEEN_CAP, fi);
+    let mut work = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for i in 0..ORDER.count {
+        let h = ORDER.data[i];
+        let start = LP_BLOCKS.count;
+        let stamp = new_stamp();
+        for k in 0..BLOCKS[h].preds.count {
+            let t = BLOCKS[h].preds.data[k];
+            if BLOCKS[t].order < 0 || !dominates(h, t) {
+                continue;
+            }
+            if LP_BLOCKS.count == start {
+                LP_SEEN[h] = stamp;
+                LP_BLOCKS.push(h);
+            }
+            if LP_SEEN[t] != stamp {
+                LP_SEEN[t] = stamp;
+                LP_BLOCKS.push(t);
+                work.push(t);
+            }
+            while work.count > 0 {
+                let x = work.pop();
+                for m in 0..BLOCKS[x].preds.count {
+                    let p = BLOCKS[x].preds.data[m];
+                    if BLOCKS[p].order >= 0 && LP_SEEN[p] != stamp {
+                        LP_SEEN[p] = stamp;
+                        LP_BLOCKS.push(p);
+                        work.push(p);
+                    }
+                }
+            }
+        }
+        if LP_BLOCKS.count > start {
+            LP_HEADER.push(h);
+            LP_PARENT.push(-1);
+            LP_DEPTH.push(1);
+            LP_START.push(start);
+            LP_COUNT.push(LP_BLOCKS.count - start);
+        }
+    }
+    free(work.data as *u8);
+    // Nesting: the loops from the largest to the smallest; the innermost
+    // loop seen so far that contains a header is its parent.
+    let n = loop_count();
+    let by_size = alloc_zeroed((n + 1) * 8) as *i64;
+    for l in 0..n {
+        let mut k = l;
+        while k > 0 && LP_COUNT.data[by_size[k - 1]] < LP_COUNT.data[l] {
+            by_size[k] = by_size[k - 1];
+            k -= 1;
+        }
+        by_size[k] = l;
+    }
+    for i in 0..n {
+        let l = by_size[i];
+        let parent = LP_OF[loop_header(l)] - 1;
+        LP_PARENT.data[l] = parent;
+        LP_DEPTH.data[l] = if parent < 0 { 1 } else { LP_DEPTH.data[parent] + 1 };
+        for k in 0..loop_size(l) {
+            LP_OF[loop_block(l, k)] = l + 1;
+        }
+    }
+    free(by_size as *u8);
+}
+
+// ---- Canonical form ----
+
+// The preheader of loop l (its header's only outside predecessor, which
+// jumps to it), or 0.
+fn loop_preheader(l: i64) -> i64 {
+    let h = loop_header(l);
+    let mut found = 0;
+    for k in 0..BLOCKS[h].preds.count {
+        let p = BLOCKS[h].preds.data[k];
+        if !loop_contains(l, p) {
+            if found != 0 {
+                return 0;
+            }
+            found = p;
+        }
+    }
+    if found == 0 || BLOCKS[found].term != Term::Jump {
+        return 0;
+    }
+    found
+}
+
+// The single latch of loop l, or 0.
+fn loop_latch(l: i64) -> i64 {
+    let h = loop_header(l);
+    let mut found = 0;
+    for k in 0..BLOCKS[h].preds.count {
+        let p = BLOCKS[h].preds.data[k];
+        if loop_contains(l, p) {
+            if found != 0 {
+                return 0;
+            }
+            found = p;
+        }
+    }
+    found
+}
+
+// The exit blocks of loop l (outside it, entered from it) into LP_LIST.
+fn loop_exits(l: i64) {
+    LP_LIST.count = 0;
+    let stamp = new_stamp();
+    for i in 0..loop_size(l) {
+        let b = loop_block(l, i);
+        for k in 0..succ_count(b) {
+            let s = succ(b, k);
+            if !loop_contains(l, s) && LP_SEEN[s] != stamp {
+                LP_SEEN[s] = stamp;
+                LP_LIST.push(s);
+            }
+        }
+    }
+}
+
+// Appends predecessor `pred` to block b; its k-th phi gets values[first + k].
+fn add_pred_values(b: i64, pred: i64, values: *IntVec, first: i64) {
+    BLOCKS[b].preds.push(pred);
+    let mut k = 0;
+    let mut phi = BLOCKS[b].first;
+    while phi != 0 && INSTS[phi].op == Op::Phi {
+        let n = INSTS[phi].nargs;
+        let start = ARGS.count;
+        for i in 0..n {
+            ARGS.push(ARGS.data[INSTS[phi].args + i]);
+            ARGTY.push(0);
+        }
+        ARGS.push((*values).data[first + k]);
+        ARGTY.push(0);
+        INSTS[phi].args = start;
+        INSTS[phi].nargs = n + 1;
+        k += 1;
+        phi = INSTS[phi].next;
+    }
+}
+
+// A new phi of type ty in block b (after its other phis) over `count`
+// operands values[first..].
+fn new_phi_in(b: i64, ty: i64, values: *IntVec, first: i64, count: i64) -> i64 {
+    let phi = ir_make(Op::Phi, ty, 0, 0, 0);
+    INSTS[phi].args = ARGS.count;
+    INSTS[phi].nargs = count;
+    for i in 0..count {
+        ARGS.push((*values).data[first + i]);
+        ARGTY.push(0);
+    }
+    let mut last_phi = 0;
+    let mut v = BLOCKS[b].first;
+    while v != 0 && INSTS[v].op == Op::Phi {
+        last_phi = v;
+        v = INSTS[v].next;
+    }
+    if last_phi == 0 {
+        ir_prepend(b, phi);
+    } else if INSTS[last_phi].next == 0 {
+        ir_append(b, phi);
+    } else {
+        ir_insert_before(INSTS[last_phi].next, phi);
+    }
+    phi
+}
+
+// Moves the predecessors `list` of block b (each once among b's
+// predecessors) to a new block that jumps to b: their edges go to the new
+// block, and b's phis get, for it, the operand of the one predecessor or a
+// new phi in the new block over theirs. Returns the new block.
+fn split_preds(fi: i64, b: i64, list: *IntVec) -> i64 {
+    IRF = fi;
+    let nb = ir_new_block();
+    BLOCKS[nb].sealed = 1;
+    let n = (*list).count;
+    let mark = LP_VALUES.count;
+    let mut phi = BLOCKS[b].first;
+    while phi != 0 && INSTS[phi].op == Op::Phi {
+        if n == 1 {
+            LP_VALUES.push(ir_arg(phi, pred_index(b, (*list).data[0])));
+        } else {
+            let first = LP_VALUES.count;
+            for i in 0..n {
+                LP_VALUES.push(ir_arg(phi, pred_index(b, (*list).data[i])));
+            }
+            let np = new_phi_in(nb, INSTS[phi].ty, &LP_VALUES, first, n);
+            LP_VALUES.count = first;
+            LP_VALUES.push(np);
+        }
+        phi = INSTS[phi].next;
+    }
+    for i in 0..n {
+        let p = (*list).data[i];
+        remove_pred(b, p);
+        redirect_succ(p, b, nb);
+        BLOCKS[nb].preds.push(p);
+    }
+    add_pred_values(b, nb, &LP_VALUES, mark);
+    LP_VALUES.count = mark;
+    BLOCKS[nb].term = Term::Jump;
+    BLOCKS[nb].s0 = b;
+    nb
+}
+
+// Puts loop l in canonical form; returns whether anything changed (the
+// loop forest must then be found again).
+fn canonicalize_loop(fi: i64, l: i64) -> bool {
+    let h = loop_header(l);
+    let mut outside = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    let mut inside = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for k in 0..BLOCKS[h].preds.count {
+        let p = BLOCKS[h].preds.data[k];
+        if loop_contains(l, p) {
+            inside.push(p);
+        } else {
+            outside.push(p);
+        }
+    }
+    let mut changed = false;
+    if outside.count > 0 && (outside.count > 1 || BLOCKS[outside.data[0]].term != Term::Jump) {
+        split_preds(fi, h, &outside);
+        changed = true;
+    }
+    if inside.count > 1 {
+        split_preds(fi, h, &inside);
+        changed = true;
+    }
+    free(outside.data as *u8);
+    free(inside.data as *u8);
+    if changed {
+        return true;
+    }
+    // Dedicated exits.
+    loop_exits(l);
+    let mut exits = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for i in 0..LP_LIST.count {
+        exits.push(LP_LIST.data[i]);
+    }
+    let mut from = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for i in 0..exits.count {
+        let e = exits.data[i];
+        let mut shared = false;
+        from.count = 0;
+        for k in 0..BLOCKS[e].preds.count {
+            let p = BLOCKS[e].preds.data[k];
+            if loop_contains(l, p) {
+                from.push(p);
+            } else {
+                shared = true;
+            }
+        }
+        if shared {
+            split_preds(fi, e, &from);
+            changed = true;
+        }
+    }
+    free(exits.data as *u8);
+    free(from.data as *u8);
+    changed
+}
+
+// Whether every edge of function fi is a single edge (no branch with both
+// successors the same block, no block twice among another's
+// predecessors): the transformations below assume it.
+fn edges_are_simple(fi: i64) -> bool {
+    for i in 0..IRFUNCS[fi].blocks.count {
+        let b = IRFUNCS[fi].blocks.data[i];
+        if BLOCKS[b].removed != 0 {
+            continue;
+        }
+        if BLOCKS[b].term == Term::Branch && BLOCKS[b].s0 == BLOCKS[b].s1 {
+            return false;
+        }
+    }
+    true
+}
+
+// Puts every loop of fi in canonical form (finding the loops again after
+// each change). Loops whose header is the entry are left alone.
+fn canonicalize_loops(fi: i64) -> bool {
+    let mut changed = false;
+    for _ in 0..1000 {
+        analyze_loops(fi);
+        let mut did = false;
+        for l in 0..loop_count() {
+            if loop_header(l) != IRFUNCS[fi].entry && canonicalize_loop(fi, l) {
+                did = true;
+                break;
+            }
+        }
+        if !did {
+            break;
+        }
+        changed = true;
+    }
+    changed
+}
+
+// Whether loop l is in canonical form.
+fn is_canonical(l: i64) -> bool {
+    if loop_preheader(l) == 0 || loop_latch(l) == 0 {
+        return false;
+    }
+    loop_exits(l);
+    for i in 0..LP_LIST.count {
+        let e = LP_LIST.data[i];
+        for k in 0..BLOCKS[e].preds.count {
+            if !loop_contains(l, BLOCKS[e].preds.data[k]) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+// ---- The SSA updater ----
+
+// A value defined in several blocks: ssa_write(var, block, value) for each
+// definition, then ssa_read(var, block) gives the value reaching the end of
+// a block (phis are placed where definitions meet; 45_lower.tach). Every
+// block must be sealed.
+fn updater_var(ty: i64) -> i64 {
+    new_synth_var(ty)
+}
+
+fn seal_all(fi: i64) {
+    for i in 0..IRFUNCS[fi].blocks.count {
+        let b = IRFUNCS[fi].blocks.data[i];
+        BLOCKS[b].sealed = 1;
+        BLOCKS[b].incomplete = 0;
+    }
+}
+
+// The block where a use of an operand happens: the block of instruction u,
+// or for a phi's k-th operand, the k-th predecessor of the phi's block.
+fn use_block(u: i64, k: i64) -> i64 {
+    if INSTS[u].op == Op::Phi && k >= 3 {
+        return BLOCKS[INSTS[u].block].preds.data[k - 3];
+    }
+    INSTS[u].block
+}
+
+// ---- LCSSA ----
+
+// Makes every value defined in loop l and used outside it go through phis
+// in the exit blocks. Returns whether anything changed. The dominators
+// must be current.
+fn form_lcssa(fi: i64, l: i64) -> bool {
+    IRF = fi;
+    // Uses outside the loop of values defined inside: (user, operand index)
+    // pairs; a terminator's condition is user -block (index 0).
+    let mut uses = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for i in 0..IRFUNCS[fi].blocks.count {
+        let b = IRFUNCS[fi].blocks.data[i];
+        if BLOCKS[b].removed != 0 || BLOCKS[b].order < 0 {
+            continue;
+        }
+        let mut v = BLOCKS[b].first;
+        while v != 0 {
+            for k in 0..ir_operand_count(v) {
+                let w = ir_operand(v, k);
+                if w != 0 && INSTS[w].block != 0 && loop_contains(l, INSTS[w].block)
+                    && !loop_contains(l, use_block(v, k)) {
+                    uses.push(v);
+                    uses.push(k);
+                }
+            }
+            v = INSTS[v].next;
+        }
+        let c = BLOCKS[b].cond;
+        if c != 0 && INSTS[c].block != 0 && loop_contains(l, INSTS[c].block) && !loop_contains(l, b) {
+            uses.push(0 - b);
+            uses.push(0);
+        }
+    }
+    if uses.count == 0 {
+        free(uses.data as *u8);
+        return false;
+    }
+    loop_exits(l);
+    let mut exits = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for i in 0..LP_LIST.count {
+        exits.push(LP_LIST.data[i]);
+    }
+    // One updater variable per value (INSTS[w].mark = var + 1).
+    for i in 0..uses.count / 2 {
+        let w = lcssa_used(uses.data[2 * i], uses.data[2 * i + 1]);
+        INSTS[w].mark = 0;
+    }
+    for i in 0..uses.count / 2 {
+        let u = uses.data[2 * i];
+        let k = uses.data[2 * i + 1];
+        let w = lcssa_used(u, k);
+        if INSTS[w].mark == 0 {
+            let var = updater_var(INSTS[w].ty);
+            INSTS[w].mark = var + 1;
+            for j in 0..exits.count {
+                let e = exits.data[j];
+                if dominates(INSTS[w].block, e) {
+                    let first = LP_VALUES.count;
+                    for m in 0..BLOCKS[e].preds.count {
+                        LP_VALUES.push(w);
+                    }
+                    let phi = new_phi_in(e, INSTS[w].ty, &LP_VALUES, first, BLOCKS[e].preds.count);
+                    LP_VALUES.count = first;
+                    ssa_write(var, e, phi);
+                }
+            }
+        }
+        let var = INSTS[w].mark - 1;
+        if u < 0 {
+            BLOCKS[0 - u].cond = ssa_read(var, 0 - u);
+        } else {
+            ir_set_operand(u, k, ssa_read(var, use_block(u, k)));
+        }
+    }
+    free(exits.data as *u8);
+    free(uses.data as *u8);
+    true
+}
+
+fn lcssa_used(u: i64, k: i64) -> i64 {
+    if u < 0 { BLOCKS[0 - u].cond } else { ir_operand(u, k) }
+}
+
+// ---- Cloning ----
+
+// The copy of value v when v is defined in the region being cloned (blocks
+// marked `stamp` in LP_SEEN), else v.
+fn clone_map(v: i64, stamp: i64) -> i64 {
+    if v == 0 || INSTS[v].block == 0 {
+        return v;
+    }
+    let b = INSTS[v].block;
+    if b < LP_NBLOCKS && LP_SEEN[b] == stamp { INSTS[v].aux } else { v }
+}
+
+fn clone_block_map(b: i64, stamp: i64) -> i64 {
+    if b != 0 && b < LP_NBLOCKS && LP_SEEN[b] == stamp { BLOCKS[b].aux } else { b }
+}
+
+// A copy of instruction v (not in a block; operands as they are).
+fn clone_inst(v: i64) -> i64 {
+    let op = INSTS[v].op;
+    let nv = ir_make(op, INSTS[v].ty, INSTS[v].a, INSTS[v].b, INSTS[v].imm);
+    INSTS[nv].c = INSTS[v].c;
+    INSTS[nv].cond = INSTS[v].cond;
+    INSTS[nv].imm2 = INSTS[v].imm2;
+    if INSTS[v].nargs > 0 || op == Op::Phi || op.is_call() {
+        INSTS[nv].args = ARGS.count;
+        INSTS[nv].nargs = INSTS[v].nargs;
+        for a in 0..INSTS[v].nargs {
+            ARGS.push(ir_arg(v, a));
+            ARGTY.push(ARGTY.data[INSTS[v].args + a]);
+        }
+    }
+    nv
+}
+
+// Clones the blocks `list` (marked `stamp` in LP_SEEN; LP_NBLOCKS must
+// cover them): BLOCKS[b].aux is b's copy and INSTS[v].aux v's. Operands
+// and successors inside the region are mapped to their copies; a copy's
+// predecessors are its original's, mapped, in the same order (those from
+// outside the region kept: their terminators still go to the original).
+fn clone_region(fi: i64, list: *IntVec, stamp: i64) {
+    IRF = fi;
+    let n = (*list).count;
+    for i in 0..n {
+        let b = (*list).data[i];
+        let nb = ir_new_block();
+        BLOCKS[nb].sealed = 1;
+        BLOCKS[b].aux = nb;
+        let mut v = BLOCKS[b].first;
+        while v != 0 {
+            let nv = clone_inst(v);
+            ir_append(nb, nv);
+            INSTS[v].aux = nv;
+            v = INSTS[v].next;
+        }
+    }
+    for i in 0..n {
+        let b = (*list).data[i];
+        let nb = BLOCKS[b].aux;
+        let mut v = BLOCKS[nb].first;
+        while v != 0 {
+            for k in 0..ir_operand_count(v) {
+                let w = ir_operand(v, k);
+                if w != 0 {
+                    ir_set_operand(v, k, clone_map(w, stamp));
+                }
+            }
+            v = INSTS[v].next;
+        }
+        copy_terminator(nb, b);
+        BLOCKS[nb].cond = clone_map(BLOCKS[b].cond, stamp);
+        map_successors(nb, stamp);
+        for k in 0..BLOCKS[b].preds.count {
+            BLOCKS[nb].preds.push(clone_block_map(BLOCKS[b].preds.data[k], stamp));
+        }
+    }
+}
+
+// Maps the successors of block b (a copy) through clone_block_map.
+fn map_successors(b: i64, stamp: i64) {
+    if BLOCKS[b].term == Term::Switch {
+        let start = SWCASES.count;
+        for i in 0..BLOCKS[b].ncases {
+            SWCASES.push(case_value(b, i));
+            SWCASES.push(clone_block_map(case_target(b, i), stamp));
+        }
+        BLOCKS[b].cases = start;
+        BLOCKS[b].s0 = clone_block_map(BLOCKS[b].s0, stamp);
+        switch_rebuild_succs(b);
+        return;
+    }
+    BLOCKS[b].s0 = clone_block_map(BLOCKS[b].s0, stamp);
+    BLOCKS[b].s1 = clone_block_map(BLOCKS[b].s1, stamp);
+}
+
+// Marks the blocks of loop l with a fresh stamp in LP_SEEN and lists them
+// in LP_LIST2; returns the stamp.
+fn mark_loop_blocks(l: i64) -> i64 {
+    let stamp = new_stamp();
+    LP_LIST2.count = 0;
+    for i in 0..loop_size(l) {
+        let b = loop_block(l, i);
+        LP_SEEN[b] = stamp;
+        LP_LIST2.push(b);
+    }
+    stamp
+}
+
+// The number of instructions in loop l.
+fn loop_inst_count(l: i64) -> i64 {
+    let mut n = 0;
+    for i in 0..loop_size(l) {
+        let mut v = BLOCKS[loop_block(l, i)].first;
+        while v != 0 {
+            n += 1;
+            v = INSTS[v].next;
+        }
+    }
+    n
+}
+
+// Whether v is defined outside loop l (constants and the like included).
+fn invariant_in(l: i64, v: i64) -> bool {
+    v == 0 || INSTS[v].block == 0 || !loop_contains(l, INSTS[v].block)
+}
+
+// ---- Rotation ----
+
+// Instructions (other than phis) a header may have to be duplicated.
+const ROTATE_MAX: i64 = 16;
+
+// The headers of the loops rotated in the current function (each loop is
+// rotated once).
+static mut ROTATED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+fn was_rotated(h: i64) -> bool {
+    for i in 0..ROTATED.count {
+        if ROTATED.data[i] == h {
+            return true;
+        }
+    }
+    false
+}
+
+// Turns loop l, when its header tests the exit (a while loop), into a
+// guarded do-while: the header's instructions are copied into the
+// preheader, which branches to the body or the exit; the header, reached
+// from the latch only, becomes part of the latch. Returns whether it did.
+fn rotate_loop(fi: i64, l: i64) -> bool {
+    let h = loop_header(l);
+    let pre = loop_preheader(l);
+    let latch = loop_latch(l);
+    if pre == 0 || latch == 0 || latch == h || BLOCKS[h].term != Term::Branch {
+        return false;
+    }
+    let s0 = BLOCKS[h].s0;
+    let s1 = BLOCKS[h].s1;
+    let in0 = loop_contains(l, s0);
+    let in1 = loop_contains(l, s1);
+    if in0 == in1 || s0 == s1 {
+        return false;
+    }
+    let body = if in0 { s0 } else { s1 };
+    let exit = if in0 { s1 } else { s0 };
+    if body == h || was_rotated(h) {
+        return false;
+    }
+    let mut size = 0;
+    let mut v = BLOCKS[h].first;
+    while v != 0 {
+        if INSTS[v].op != Op::Phi {
+            size += 1;
+        }
+        v = INSTS[v].next;
+    }
+    if size > ROTATE_MAX {
+        return false;
+    }
+    IRF = fi;
+    ROTATED.push(body);
+    // The header's values as the preheader sees them: a phi's operand for
+    // the preheader, copies of the other instructions (INSTS[v].aux).
+    let pre_index = pred_index(h, pre);
+    v = BLOCKS[h].first;
+    while v != 0 {
+        if INSTS[v].op == Op::Phi {
+            INSTS[v].aux = ir_arg(v, pre_index);
+        } else {
+            let nv = clone_inst(v);
+            for k in 0..ir_operand_count(nv) {
+                let w = ir_operand(nv, k);
+                if w != 0 && INSTS[w].block == h {
+                    ir_set_operand(nv, k, INSTS[w].aux);
+                }
+            }
+            ir_append(pre, nv);
+            INSTS[v].aux = nv;
+        }
+        v = INSTS[v].next;
+    }
+    let cond = BLOCKS[h].cond;
+    let pre_cond = if INSTS[cond].block == h { INSTS[cond].aux } else { cond };
+    // The preheader branches like the header; the header loses it.
+    BLOCKS[pre].term = Term::Branch;
+    BLOCKS[pre].cond = pre_cond;
+    BLOCKS[pre].s0 = s0;
+    BLOCKS[pre].s1 = s1;
+    remove_pred(h, pre);
+    for t in 0..2 {
+        let s = if t == 0 { body } else { exit };
+        let index = pred_index(s, h);
+        let first = LP_VALUES.count;
+        let mut phi = BLOCKS[s].first;
+        while phi != 0 && INSTS[phi].op == Op::Phi {
+            let w = ir_arg(phi, index);
+            LP_VALUES.push(if w != 0 && INSTS[w].block == h { INSTS[w].aux } else { w });
+            phi = INSTS[phi].next;
+        }
+        add_pred_values(s, pre, &LP_VALUES, first);
+        LP_VALUES.count = first;
+    }
+    // Uses of the header's values elsewhere read whichever definition
+    // reaches them: the header's or the preheader's.
+    v = BLOCKS[h].first;
+    while v != 0 {
+        INSTS[v].mark = 0;
+        v = INSTS[v].next;
+    }
+    for i in 0..IRFUNCS[fi].blocks.count {
+        let b = IRFUNCS[fi].blocks.data[i];
+        // (The header's own phis use values at the latch.)
+        if BLOCKS[b].removed != 0 {
+            continue;
+        }
+        let mut u = BLOCKS[b].first;
+        while u != 0 {
+            for k in 0..ir_operand_count(u) {
+                let w = ir_operand(u, k);
+                if w != 0 && INSTS[w].block == h {
+                    let ub = use_block(u, k);
+                    if ub != h {
+                        ir_set_operand(u, k, ssa_read(rotate_var(w, h, pre), ub));
+                    }
+                }
+            }
+            u = INSTS[u].next;
+        }
+        let c = BLOCKS[b].cond;
+        if c != 0 && INSTS[c].block == h && b != pre && b != h {
+            BLOCKS[b].cond = ssa_read(rotate_var(c, h, pre), b);
+        }
+    }
+    true
+}
+
+// The updater variable of header value w (defined in h, and as
+// INSTS[w].aux in the preheader).
+fn rotate_var(w: i64, h: i64, pre: i64) -> i64 {
+    if INSTS[w].mark == 0 {
+        let var = updater_var(INSTS[w].ty);
+        INSTS[w].mark = var + 1;
+        ssa_write(var, h, w);
+        ssa_write(var, pre, INSTS[w].aux);
+    }
+    INSTS[w].mark - 1
+}
+
+// Rotates every loop of fi that can be; returns whether any was. One
+// analysis serves them all: rotation makes no blocks and moves none
+// between loops (a rotated loop's preheader now branches, which no other
+// loop's rotation depends on).
+fn rotate_loops(fi: i64) -> bool {
+    ROTATED.count = 0;
+    canonicalize_loops(fi);
+    let mut changed = false;
+    // Innermost loops first: an outer loop's rotation then only adds phis
+    // to inner loops already rotated. The phis an updater leaves trivial
+    // go before the next rotation reads its header's phis.
+    let mut depth = 0;
+    for l in 0..loop_count() {
+        if LP_DEPTH.data[l] > depth {
+            depth = LP_DEPTH.data[l];
+        }
+    }
+    while depth >= 1 {
+        for l in 0..loop_count() {
+            if LP_DEPTH.data[l] == depth && loop_header(l) != IRFUNCS[fi].entry && rotate_loop(fi, l) {
+                changed = true;
+                resolve_all(fi);
+                remove_trivial_phis(fi);
+            }
+        }
+        depth -= 1;
+    }
+    if changed {
+        resolve_all(fi);
+        verify_func(fi, c"loop rotation");
+        // The old headers now have their latch as only predecessor.
+        simplify_cfg(fi);
+    }
+    changed
+}

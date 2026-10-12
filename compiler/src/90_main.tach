@@ -9,18 +9,24 @@
 //   --emit-ir                       write the optimized IR instead
 //   --verify-ir                     check the IR after every pass
 //   --print-after-all               print the IR after every pass (stderr)
+//   --emit-imports                  write what `import`ed C headers declare
+//                                   (as tachyon source) instead
+//   --emit-header                   write the program's C header instead
+//   -I DIR                          a directory for `import`ed C headers
 //   tachyonc --tokens <file.tach>   print the tokens of one file
 //   tachyonc --version              print the release and the host target
 
-extern fn uname(info: *u8) -> i32;
+extern "C" {
+    fn uname(info: *u8) -> i32;
+}
 
 fn usage() -> ! {
-    die(c"usage: tachyonc [--target aarch64-macos|x86_64-linux|x86_64-macos] [-O0|-O1|-O2] [--emit-ir] [--verify-ir] <file.tach>... [-o out.s] | tachyonc --tokens <file.tach> | tachyonc --version")
+    die(c"usage: tachyonc [--target aarch64-macos|x86_64-linux|x86_64-macos] [-O0|-O1|-O2] [--emit-ir] [--verify-ir] [--emit-imports] [--emit-header] [-I dir] <file.tach>... [-o out.s] | tachyonc --tokens <file.tach> | tachyonc --version")
 }
 
 // The release this source is; see docs/releases.md.
 fn version() -> *u8 {
-    c"0.3.0"
+    c"0.4.0"
 }
 
 // struct utsname: sysname is the first field on every system; machine is
@@ -76,6 +82,8 @@ fn main(argc: i32, argv: **u8) -> i32 {
     let mut output = c"a.s";
     let mut tokens_only = false;
     let mut target = 0;
+    let mut include_dirs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    let mut emit_imports = false;
     let mut i = 1;
     while i < argc as i64 {
         let arg = argv[i];
@@ -118,6 +126,29 @@ fn main(argc: i32, argv: **u8) -> i32 {
             i += 1;
             continue;
         }
+        if streq(arg, c"-I") {
+            if i + 1 >= argc as i64 {
+                usage();
+            }
+            include_dirs.push(argv[i + 1] as i64);
+            i += 2;
+            continue;
+        }
+        if arg[0] == '-' && arg[1] == 'I' {
+            include_dirs.push(&arg[2] as i64);
+            i += 1;
+            continue;
+        }
+        if streq(arg, c"--emit-header") {
+            EMIT_HEADER = true;
+            i += 1;
+            continue;
+        }
+        if streq(arg, c"--emit-imports") {
+            emit_imports = true;
+            i += 1;
+            continue;
+        }
         if streq(arg, c"--version") {
             print_version();
             return 0;
@@ -125,7 +156,7 @@ fn main(argc: i32, argv: **u8) -> i32 {
         if streq(arg, c"--tokens") {
             tokens_only = true;
         } else {
-            intvec_push(&inputs, arg as i64);
+            inputs.push(arg as i64);
         }
         i += 1;
     }
@@ -136,8 +167,9 @@ fn main(argc: i32, argv: **u8) -> i32 {
     load_sources(inputs.data as **u8, inputs.count);
     ERRORS_AS_DUMP = tokens_only;
     init_lexer();
-    for f in 0..FILE_COUNT {
-        lex_range(FILES[f].start, FILES[f].end, f + 1 == FILE_COUNT);
+    let user_files = FILE_COUNT;
+    for f in 0..user_files {
+        lex_range(FILES[f].start, FILES[f].end, tokens_only && f + 1 == user_files);
     }
     if tokens_only {
         let out = buf_new();
@@ -152,6 +184,48 @@ fn main(argc: i32, argv: **u8) -> i32 {
         }
     }
     set_target(target);
+    import_c_headers(target, &include_dirs, emit_imports, output);
+    lex_range(FILES[FILE_COUNT - 1].end, FILES[FILE_COUNT - 1].end, true);
     compile_program(output);
     0
+}
+
+// --emit-header: write the program's C header (17_cheader.tach).
+static mut EMIT_HEADER: bool = false;
+
+// The start in SRC of the declarations imported from C headers (-1: no
+// `import`).
+static mut IMPORTED_START: i64 = -1;
+
+// `import "header.h";` items: the headers are read (16_cimport.tach) and
+// their declarations, as tachyon source, are added to the program.
+fn import_c_headers(target: i64, include_dirs: *IntVec, emit: bool, output: *u8) {
+    let mut names = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    let mut dirs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for i in 0..TOK_COUNT {
+        if TOKS[i].kind == Tok::Import && i + 1 < TOK_COUNT && TOKS[i + 1].kind == Tok::Str {
+            let name = STRS[TOKS[i + 1].value as i64].ptr;
+            let mut file = 0;
+            while file + 1 < FILE_COUNT && TOKS[i].start >= FILES[file + 1].start {
+                file += 1;
+            }
+            names.push(name as i64);
+            C_IMPORT_POS.push(TOKS[i + 1].start);
+            dirs.push(path_dir(FILES[file].path) as i64);
+        }
+    }
+    if names.count == 0 {
+        if emit {
+            buf_write_file(buf_new(), output);
+            exit(0);
+        }
+        return;
+    }
+    let text = c_import(&names, &dirs, include_dirs, target);
+    if emit {
+        buf_write_file(text, output);
+        exit(0);
+    }
+    IMPORTED_START = add_source(c"<C import>", text);
+    lex_range(IMPORTED_START, FILES[FILE_COUNT - 1].end, false);
 }

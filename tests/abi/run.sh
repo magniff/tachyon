@@ -5,7 +5,7 @@
 # its C half (compiled by cc) and run; it must print "ok".
 #
 # usage: tests/abi/run.sh [-c COMPILER] [-t TARGET] [-n COUNT] [-f FIRST]
-#                         [-k DIR] [-j JOBS]
+#                         [-k DIR] [-j JOBS] [-i | -H]
 #
 #   -c COMPILER   the tachyonc to test (default: target/tachyonc)
 #   -t TARGET     aarch64-macos, x86_64-linux or x86_64-macos (default:
@@ -15,6 +15,11 @@
 #   -f FIRST      the first random seed (default 1)
 #   -k DIR        where to keep failing programs (default: tests/abi/failures)
 #   -j JOBS       programs tested at once (default: the number of CPUs)
+#   -i            import mode: the C declarations are in a header, which the
+#                 C half includes and the tachyon half imports (`import`);
+#                 the tachyon half declares only its enums (which shadow C's)
+#   -H            header mode: the C half uses the header tachyonc --emit-header
+#                 writes for the tachyon half, not declarations of its own
 
 set -u
 LC_ALL=C
@@ -26,6 +31,8 @@ COUNT=150
 FIRST=1
 KEEP="$ROOT/tests/abi/failures"
 JOBS=""
+IMPORT=0
+HEADER=0
 CC=${CC:-cc}
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -35,7 +42,9 @@ while [ $# -gt 0 ]; do
         -f) FIRST=$2; shift 2 ;;
         -k) KEEP=$2; shift 2 ;;
         -j) JOBS=$2; shift 2 ;;
-        *) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+        -i) IMPORT=1; shift ;;
+        -H) HEADER=1; shift ;;
+        *) sed -n "2,23p" "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
     esac
 done
 case "$COMPILER" in
@@ -69,9 +78,13 @@ test_seed() {
     seed=$1
     t="$WORK/p$seed.tach"
     c="$WORK/p$seed.c"
-    awk -v seed="$seed" -v cfile="$c" -v tfile="$t" -f "$ROOT/tests/abi/gen.awk"
+    awk -v seed="$seed" -v cfile="$c" -v tfile="$t" -v import="$IMPORT" -v header="$HEADER" -v hfile="$WORK/p$seed.h" -f "$ROOT/tests/abi/gen.awk"
     rm -f "$t.decls"
     grep -c '^extern "C" fn t_f\|^void v_f' "$t" "$c" | awk -F: '{ n += $2 } END { print n }' >"$WORK/p$seed.count"
+    if [ "$HEADER" = 1 ]; then
+        "$COMPILER" --target "$TARGET" --emit-header "$t" -o "$WORK/p$seed.h" >"$c.log" 2>&1 \
+            || { echo "--emit-header failed: $(head -3 "$c.log")" >"$WORK/p$seed.why"; return; }
+    fi
     # shellcheck disable=SC2086
     "$CC" $ARCH -c -w -o "$c.o" "$c" >"$c.log" 2>&1 || { echo "cc failed on the C half: $(head -3 "$c.log")" >"$WORK/p$seed.why"; return; }
     for level in O0 O1 O2; do
@@ -116,9 +129,13 @@ while [ "$seed" -lt "$last" ]; do
         failures=$((failures + 1))
         mkdir -p "$KEEP"
         cp "$WORK/p$seed.tach" "$WORK/p$seed.c" "$KEEP/"
+        [ -f "$WORK/p$seed.h" ] && cp "$WORK/p$seed.h" "$KEEP/"
         echo "FAIL seed $seed: $(cat "$WORK/p$seed.why") (kept in $KEEP)"
     fi
     seed=$((seed + 1))
 done
-echo "abi: $COUNT programs ($signatures signatures) for $TARGET, $failures failing"
+mode=""
+[ "$IMPORT" = 1 ] && mode=" through import"
+[ "$HEADER" = 1 ] && mode=" through --emit-header"
+echo "abi: $COUNT programs ($signatures signatures) for $TARGET$mode, $failures failing"
 [ "$failures" -eq 0 ]

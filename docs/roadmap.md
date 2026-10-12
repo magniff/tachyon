@@ -97,25 +97,77 @@ for, it is exact.
   calls; the 0.2 `extern fn` form accepted, deprecated. Gate: the ABI
   conformance fuzzer (`tests/abi/run.sh`), at least 1000 signatures clean
   per target.
-- **0.4**: `import "stdio.h"`: a C preprocessor and a declaration parser in
-  tachyon, mapping C types to tachyon and producing `extern "C"`
-  declarations and `#[repr(C)]` types; `--emit-header` for `extern "C"`
-  items and `#[repr(C)]` types; the compiler's own source moves to
-  `extern "C"` blocks and the deprecated form goes away;
-  `#[repr(C, align(N))]` above 16 (realigned frames).
+- [x] **0.4**: `import "stdio.h";` reads C headers as the target's C
+  compiler does (its predefined macros and include path come from
+  `cc -dM -E -v`): a C preprocessor (`#include_next`, `#pragma once`,
+  `#pragma pack`, GNU variadic macros, `__has_include`) and a declaration
+  reader in tachyon, written out as tachyon source (`--emit-imports`
+  shows it): `#[repr(C)]` records with C's layout (bit-fields, `packed`,
+  `aligned` and `#pragma pack` as explicit padding or `packed(N)`),
+  typedefs and enums as aliases, enumerators and constant macros as
+  constants, macro aliases of variables and functions, an `extern "C"`
+  block with `#[link_name]` for asm-label renames; what tachyon cannot
+  express (long double on x86-64, `_Complex`, `__int128`, vectors,
+  thread-local variables, static and inline functions) is left out and
+  named, with the reason, when used. `--emit-header` writes the C header
+  of a program (`extern "C"` functions and statics, `#[repr(C)]` and
+  integer-repr types, with `_Static_assert`s of every layout). The
+  compiler's own source moved to `extern "C"` blocks; the deprecated
+  form is gone. Gates: `tests/cimport/layout.sh` (sizes, alignments
+  and offsets of every record of 55 to 65 system headers agree with C),
+  `tests/abi/run.sh -i` (signatures through `import`) and `-H` (C
+  through the emitted header), 1000 signatures per target each.
+- 0.5: `#[repr(C, align(N))]` above 16 (needs realigned stack frames);
+  `import` into a module's namespace; function-like macros that are
+  expressions (as inline functions); `errno` (a macro around a function
+  call: use `*__error()` on macOS, `*__errno_location()` with glibc).
 
 ## 0.4: loops
 
 The compiler's own source starts using enums, `match`, methods and slices.
 
-- loop canonicalization: preheaders, single latch, dedicated exits, LCSSA
-- scalar evolution (add recurrences) and induction variable simplification
-- loop strength reduction
-- loop rotation, full unrolling of small constant trip counts, partial
-  unrolling
-- loop unswitching
-- value range analysis; bounds-check elimination from induction ranges
-- trip-count-based dead loop deletion
+Language (front end):
+
+- [x] `import "header.h";` and `--emit-header` (see the C interop track)
+- [x] `use E::*;` and `use E::{A, B};`: an enum's variants by their own
+  names, in expressions, calls and patterns
+- [x] `const` of fieldless enum types; C strings (`c"..."`) as `const`
+  and `static` initializers
+- [x] `n as E` for fieldless enums, checked (an invalid value exits with
+  101: "invalid value V for enum E"); `<`, `<=`, `>`, `>=` on fieldless
+  enums (declaration order); variant ranges `E::A..=E::C` in patterns
+- [x] `size_of(T)` and `align_of(T)`, integer constants
+- [x] `for x in s` over slices and arrays
+- [x] a slice's `len` is `i64` (was `u64`)
+- [x] raw identifiers (`r#type`), `#[link_name = "..."]` in extern
+  blocks, `#[repr(C, packed(N))]`, statics shared with C may be arrays
+
+Optimizations, the loop optimizer (design and status in
+[optimizer.md](optimizer.md)):
+
+- [x] loop canonicalization: preheaders, single latch, dedicated exits,
+  LCSSA; an SSA updater and region cloning for the transformations
+- [x] induction variables (add recurrences, also through chains of
+  constant additions) and their exit values; constant trip counts by
+  evaluating the exit test with the folding rules (wrapping exact)
+- [x] loop strength reduction: addresses affine in an induction variable
+  (constant or run-time strides) become pointer induction variables
+- [x] loop rotation; full unrolling of small constant trip counts; partial
+  unrolling by 2 or 4 when the factor divides a constant trip count.
+  Unrolling with a run-time trip count (a remainder loop) moves to 0.5
+- [x] loop unswitching on invariant conditions
+- [x] value ranges from types, operations, dominating branch conditions,
+  switch cases and counted loops; bounds checks they prove are removed,
+  comparisons they decide are folded, edges whose test they decide are
+  threaded (a `match` with guards becomes a decision tree)
+- [x] trip-count-based dead loop deletion; aggressive dead code
+  elimination over control dependence
+- [x] deferred from 0.3: chains of equality tests become switches;
+  decision trees for matches with guards (by threading)
+- [x] tail recursion elimination with accumulators (`fib`: half the calls)
+- not done: narrowing of induction variables (moves to 0.5, with
+  instruction selection); bounds checks whose proof needs the slice's
+  length from the caller (0.6, interprocedural)
 
 ## 0.5: backend quality (passing Cranelift)
 
@@ -174,6 +226,11 @@ The compiler's source starts using generics and modules.
 Runtimes per release are recorded here as each one ships. `bench/run.sh`
 prints the fastest of several runs, in milliseconds; "previous" is the
 previous release at its default level, "seed" the seed at `-O` (Cranelift).
+From 0.4 on the benchmarks declare their C functions in `extern "C"` blocks,
+which the seed does not know; `bench/run.sh` (and the fuzzer's seed mode)
+hand the seed a copy rewritten into 0.2's `extern fn` declarations by
+`tests/seed-compat.awk`, so the seed column stays for every program written
+in the seed's language.
 
 ### 0.2
 
@@ -240,3 +297,27 @@ loads folded); interp, a `match`-dispatched bytecode VM over a slice, is
 within 35% of C, and nbody within 30%, with every struct and enum value in
 registers. (sieve compiles to byte-identical code with 0.2.0 and 0.3; an
 earlier measurement showing it 18% slower was taken on a busy machine.)
+
+### 0.4
+
+aarch64-macos (Apple silicon, native, idle machine; `bench/run.sh -r 7`;
+"0.3.0" is the previous release at its default level):
+
+| program | 0.3.0 | 0.4 -O0 | 0.4 -O1 | 0.4 -O2 | seed -O | cc -O2 |
+|---|---|---|---|---|---|---|
+| collatz | 420 | 2440 | 423 | 431 | 478 | 293 |
+| fib | 28 | 55 | 28 | 18 | 29 | 14 |
+| interp | 54 | 440 | 94 | 55 | - | 41 |
+| matmul | 45 | 496 | 104 | 35 | 94 | 43 |
+| nbody | 36 | 299 | 35 | 34 | - | 28 |
+| sieve | 67 | 265 | 66 | 64 | 67 | 71 |
+| stencil (new: 2D five-point, f64) | 31 | 241 | 32 | 26 | - | 8 |
+| md5 | 119 | 381 | 164 | 73 | 132 | - |
+
+md5 is 39% faster than 0.3, fib 36% (tail recursion elimination halves the
+calls), matmul 22% (strength reduction of its addresses; it now beats
+clang). collatz is 3% slower: rotation leaves a loop-carried value that the
+linear-scan allocator cannot keep in one register, which costs a move and a
+jump on one path; that is 0.5's register allocator. stencil is 3× behind
+clang, which vectorizes it (0.8), and keeps bounds checks whose proof needs
+the caller's lengths (0.6).

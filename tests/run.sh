@@ -30,6 +30,8 @@
 #                        reported as a failure (XPASS) once it passes
 #   // XFAIL(T): reason  the same, only for target T
 #   // SOURCE: path      (.test files) the program, relative to the root
+#   // CHEADER: name.h    the program's C header (--emit-header), made for
+#                        its C sources to include
 #   // CSOURCE: path     a C file to compile and link with the program,
 #                        relative to the root (one directive per file)
 #   // BUILD: reason     (.test files) only compile and link it
@@ -126,6 +128,7 @@ read_directives() {
             else if (key == "XFAIL" || key == "XFAIL(" target ")") xfail = value
             else if (key == "SOURCE") source = value
             else if (key == "CSOURCE") csources = csources " " value
+            else if (key == "CHEADER") cheader = value
             else if (key == "BUILD") build = 1
             else if (key == "CHECK") checks = checks "+" value "\n"
             else if (key == "CHECK-NOT") checks = checks "-" value "\n"
@@ -141,6 +144,7 @@ read_directives() {
             printf "%s", xfail > (dir "/xfail")
             printf "%s", source > (dir "/source")
             printf "%s", csources > (dir "/csources")
+            printf "%s", cheader > (dir "/cheader")
             printf "%d", build > (dir "/build")
             printf "%s", checks > (dir "/checks")
             printf "%s", (checkopt == "" ? "2" : checkopt) > (dir "/checkopt")
@@ -207,6 +211,14 @@ check_case() {
     for c in $(cat "$dir/csources"); do
         csources="$csources $ROOT/$c"
     done
+    # The program's C header, for its C sources.
+    if [ -s "$dir/cheader" ]; then
+        if ! "$COMPILER" --target "$TARGET" --emit-header "$source" -o "$dir/$(cat "$dir/cheader")" >"$dir/header.out" 2>&1; then
+            { echo "--emit-header failed:"; cat "$dir/header.out"; } >"$dir/why"
+            return 1
+        fi
+        csources="-I $dir $csources"
+    fi
     # shellcheck disable=SC2086
     if ! "$CC" $LINK_FLAGS -o "$dir/prog" "$dir/prog.s" $csources -lm >"$dir/link.out" 2>&1; then
         { echo "$CC failed:"; cat "$dir/link.out"; } >"$dir/why"

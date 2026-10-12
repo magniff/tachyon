@@ -117,7 +117,7 @@ function t_value(t,    s, i, k, m, n) {
     }
     if (t == "E") {
         k = h(LEAF++) % 3
-        return "En::" (k == 0 ? "A" : k == 1 ? "B" : "C")
+        return (IMPORT ? "En_" : "En::") (k == 0 ? "A" : k == 1 ? "B" : "C")
     }
     if (t ~ /^P/) {
         k = substr(t, 2) + 0
@@ -158,7 +158,7 @@ function c_value(t,    s, i, k, m, n) {
         n = PNF[k, m]
         s = "{ .tag = " m
         if (n > 0) {
-            s = s ", .u = { .v" m " = {"
+            s = s ", .u = { ." PV m " = {"
             for (i = 0; i < n; i++) s = s (i ? ", " : " ") c_leaf(PFT[k, m, i], leaf(PFT[k, m, i]))
             s = s " } }"
         }
@@ -192,7 +192,7 @@ function t_checks(t, e, fk, arg, ind,    i, k, m, n, v, b) {
     }
     if (t == "E") {
         k = h(LEAF++) % 3
-        print ind "if " e " != En::" (k == 0 ? "A" : k == 1 ? "B" : "C") " { fail(" fk ", " arg "); }" > TF
+        print ind "if " e " != " (IMPORT ? "En_" : "En::") (k == 0 ? "A" : k == 1 ? "B" : "C") " { fail(" fk ", " arg "); }" > TF
         return
     }
     if (t ~ /^P/) {
@@ -250,7 +250,7 @@ function c_checks(t, e, fk, arg, ind,    i, k, m, n, v) {
         print ind "if (" e ".tag != " m ") fail(" fk ", " arg ");" > CF
         for (i = 0; i < n; i++) {
             v = leaf(PFT[k, m, i])
-            print ind "if (" e ".u.v" m ".f" i " != " c_leaf(PFT[k, m, i], v) ") fail(" fk ", " arg ");" > CF
+            print ind "if (" e ".u." PV m PF i " != " c_leaf(PFT[k, m, i], v) ") fail(" fk ", " arg ");" > CF
         }
         return
     }
@@ -266,14 +266,15 @@ function c_checks(t, e, fk, arg, ind,    i, k, m, n, v) {
 # ---- Declarations ----
 
 function define_types(    k, i, n, attr, line, m, kind) {
-    print "enum En { A = 0, B = 5, C = -3 }" > TF
-    print "typedef enum { En_A = 0, En_B = 5, En_C = -3 } En;" > CF
+    if (!IMPORT) print "enum En { A = 0, B = 5, C = -3 }" > TF
+    print "typedef enum { En_A = 0, En_B = 5, En_C = -3 } En;" > HF
     NP = 1 + rnd(2)
     for (k = 0; k < NP; k++) {
         PNV[k] = 2 + rnd(3)
         line = "enum P" k " {"
         for (m = 0; m < PNV[k]; m++) {
-            PNF[k, m] = rnd(4)
+            # (The first has fields: an enum with fields, a struct in C.)
+            PNF[k, m] = m == 0 ? 1 + rnd(3) : rnd(4)
             line = line (m ? "," : "") " V" m
             if (PNF[k, m] > 0) {
                 line = line "("
@@ -286,21 +287,21 @@ function define_types(    k, i, n, attr, line, m, kind) {
         }
         print "#[repr(C)]" > TF
         print line " }" > TF
-        print "typedef struct {" > CF
-        print "    int32_t tag;" > CF
+        print "typedef struct {" > HF
+        print "    int32_t tag;" > HF
         n = 0
         for (m = 0; m < PNV[k]; m++) if (PNF[k, m] > 0) n++
         if (n > 0) {
-            print "    union {" > CF
+            print "    union {" > HF
             for (m = 0; m < PNV[k]; m++) {
                 if (PNF[k, m] == 0) continue
                 line = "        struct {"
                 for (i = 0; i < PNF[k, m]; i++) line = line " " c_scalar(PFT[k, m, i]) " f" i ";"
-                print line " } v" m ";" > CF
+                print line " } v" m ";" > HF
             }
-            print "    } u;" > CF
+            print "    } u;" > HF
         }
-        print "} P" k ";" > CF
+        print "} P" k ";" > HF
     }
     NS = 2 + rnd(5)
     for (k = 0; k < NS; k++) {
@@ -315,19 +316,19 @@ function define_types(    k, i, n, attr, line, m, kind) {
             else if (rnd(3) == 0 && k > 0 && attr != "packed") FT[k, i] = "S" rnd(k)
             else FT[k, i] = pick_scalar()
         }
-        print (attr == "packed" ? "#[repr(C, packed)]" : attr == "align" ? "#[repr(C, align(16))]" : "#[repr(C)]") > TF
+        if (!IMPORT) print (attr == "packed" ? "#[repr(C, packed)]" : attr == "align" ? "#[repr(C, align(16))]" : "#[repr(C)]") > TF
         line = TK[k] " S" k " {"
         for (i = 0; i < NF_[k]; i++) {
             if (FT[k, i] ~ /^A/) line = line (i ? "," : "") " f" i ": [" t_scalar(array_elem(FT[k, i])) "; " array_len(FT[k, i]) "]"
             else line = line (i ? "," : "") " f" i ": " t_type(FT[k, i])
         }
-        print line " }" > TF
+        if (!IMPORT) print line " }" > TF
         line = "typedef " TK[k] (attr == "packed" ? " __attribute__((packed))" : attr == "align" ? " __attribute__((aligned(16)))" : "") " {"
         for (i = 0; i < NF_[k]; i++) {
             if (FT[k, i] ~ /^A/) line = line " " c_scalar(array_elem(FT[k, i])) " f" i "[" array_len(FT[k, i]) "];"
             else line = line " " c_type(FT[k, i]) " f" i ";"
         }
-        print line " } S" k ";" > CF
+        print line " } S" k ";" > HF
     }
 }
 
@@ -365,6 +366,10 @@ function args_base(k) { return 1000 * (2 * k + 1) }
 function result_base(k) { return 1000 * (2 * k + 2) }
 
 function emit_function(k,    i, line) {
+    # The prototypes, for the header (in import mode).
+    print c_ret(k) " c_f" k "(" c_params(k) ");" > HF
+    print "void d_f" k "(" c_ret(k) " (*f)(" c_params(k) "));" > HF
+    print c_ret(k) " t_f" k "(" c_params(k) ");" > HF
     # C: c_fK checks its arguments and returns the result.
     print c_ret(k) " c_f" k "(" c_params(k) ") {" > CF
     LEAF = args_base(k)
@@ -430,6 +435,7 @@ function emit_variadic(k,    i, n, t, line) {
         if (t ~ /^S/ && TK[substr(t, 2) + 0] == "union") t = "f64"
         VT[i] = t
     }
+    print "void v_f" k "(int n, ...);" > HF
     print "void v_f" k "(int n, ...) {" > CF
     print "    va_list ap;" > CF
     print "    va_start(ap, n);" > CF
@@ -472,25 +478,48 @@ BEGIN {
     printf "" > DECLS
     print "// Generated by tests/abi/gen.awk, seed " seed "." > TF
     print "/* Generated by tests/abi/gen.awk, seed " seed ". */" > CF
-    print "#include <stdarg.h>\n#include <stdbool.h>\n#include <stdint.h>\n#include <stdio.h>\n#include <stdlib.h>" > CF
+    # Import mode: the C declarations are in a header (hfile), which the
+    # C file includes and the tachyon file imports.
+    IMPORT = (import == 1)
+    HF = IMPORT ? hfile : CF
+    # Header mode: C uses the header tachyonc --emit-header writes for the
+    # tachyon half (hfile), not declarations of its own.
+    HEADER = (header == 1)
+    if (HEADER) HF = "/dev/null"
+    PV = HEADER ? "V" : "v"
+    PF = HEADER ? "._" : ".f"
+    print "#include <stdarg.h>\n#include <stdbool.h>\n#include <stdint.h>\n#include <stdio.h>\n#include <stdlib.h>" > HF
+    print "void fail(int f, int a);" > HF
+    if (HEADER) {
+        print "#include <stdarg.h>\n#include <stdbool.h>\n#include <stdint.h>\n#include <stdio.h>\n#include <stdlib.h>" > CF
+        n = split(hfile, parts, "/")
+        print "#include \"" parts[n] "\"" > CF
+    }
+    if (IMPORT) {
+        n = split(hfile, parts, "/")
+        print "#include \"" parts[n] "\"" > CF
+        print "import \"./" parts[n] "\";" > TF
+    }
     print "void fail(int f, int a) { printf(\"FAIL function %d argument %d\\n\", f, a); fflush(stdout); exit(1); }" > CF
-    print "#[repr(C)]" > TF
+    if (!IMPORT) print "#[repr(C)]" > TF
     define_types()
     NFN = 4 + rnd(5)
     for (k = 0; k < NFN; k++) {
         define_signature(k)
         emit_function(k)
     }
-    print "extern \"C\" {" > TF
-    print "    fn printf(format: *u8, ...) -> i32;" > TF
-    print "    fn fail(f: i32, a: i32);" > TF
-    for (k = 0; k < NFN; k++) {
-        print "    fn c_f" k "(" t_params(k) ")" t_ret(k) ";" > TF
-        print "    fn d_f" k "(f: extern \"C\" fn(" t_param_types(k) ")" t_ret(k) ");" > TF
+    if (!IMPORT) {
+        print "extern \"C\" {" > TF
+        print "    fn printf(format: *u8, ...) -> i32;" > TF
+        print "    fn fail(f: i32, a: i32);" > TF
+        for (k = 0; k < NFN; k++) {
+            print "    fn c_f" k "(" t_params(k) ")" t_ret(k) ";" > TF
+            print "    fn d_f" k "(f: extern \"C\" fn(" t_param_types(k) ")" t_ret(k) ");" > TF
+        }
+        # The variadic functions are declared after main, which calls them.
+        print "}" > TF
     }
     close(DECLS)
-    # The variadic functions are declared after main, which calls them.
-    print "}" > TF
     print "fn main() -> i32 {" > TF
     DEPTHN = 0
     for (k = 0; k < NFN; k++) emit_calls(k)
@@ -500,7 +529,9 @@ BEGIN {
     print "    0" > TF
     print "}" > TF
     close(DECLS)
-    print "extern \"C\" {" > TF
-    while ((getline line < DECLS) > 0) print line > TF
-    print "}" > TF
+    if (!IMPORT) {
+        print "extern \"C\" {" > TF
+        while ((getline line < DECLS) > 0) print line > TF
+        print "}" > TF
+    }
 }
