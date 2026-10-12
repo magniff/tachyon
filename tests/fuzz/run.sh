@@ -14,6 +14,7 @@
 #   -n COUNT      number of programs (default 200)
 #   -f FIRST      the first random seed (default 1)
 #   -k DIR        where to keep failing programs (default: tests/fuzz/failures)
+#   -l            the loop mode of gen.awk (more loops, slices, test chains)
 #   -j JOBS       programs tested at once (default: the number of CPUs)
 
 set -u
@@ -36,8 +37,9 @@ while [ $# -gt 0 ]; do
         -n) COUNT=$2; shift 2 ;;
         -f) FIRST=$2; shift 2 ;;
         -k) KEEP=$2; shift 2 ;;
+        -l) LOOPS=1; shift ;;
         -j) JOBS=$2; shift 2 ;;
-        *) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+        *) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
     esac
 done
 if [ -z "$TARGET" ]; then
@@ -69,7 +71,7 @@ trap 'rm -rf "$WORK"' EXIT INT TERM
 test_seed() {
     seed=$1
     program="$WORK/p$seed.tach"
-    awk -v seed="$seed" -v nonzero="$NONZERO" -f "$ROOT/tests/fuzz/gen.awk" >"$program"
+    awk -v seed="$seed" -v nonzero="$NONZERO" -v loops="${LOOPS:-0}" -f "$ROOT/tests/fuzz/gen.awk" >"$program"
     reference=""
     why=""
     for level in O0 O1 O2 seed; do
@@ -85,7 +87,10 @@ test_seed() {
             # shellcheck disable=SC2086
             "$CC" $ARCH -o "$exe" "$exe.s" >>"$exe.log" 2>&1 || { why="-$level: cc failed"; break; }
         fi
-        "$exe" >"$exe.out" 2>&1 || { why="$level: exit code $?"; break; }
+        # The exit status is part of the output (a bounds check exits
+        # with 101, alike at every level).
+        "$exe" >"$exe.out" 2>&1
+        echo "exit $?" >>"$exe.out"
         if [ -z "$reference" ]; then
             reference="$exe.out"
         elif ! cmp -s "$reference" "$exe.out"; then

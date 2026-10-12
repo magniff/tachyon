@@ -55,7 +55,13 @@ format (`error[type error]: ...` / ` --> file: line L, column C` /
 | `48_gvn.tach` | global value numbering, alias analysis, load and store forwarding, dead stores |
 | `48_sroa.tach` | scalar replacement of aggregates; constant local tables to read-only data |
 | `49_inline.tach` | inlining over the call graph's components |
+| `46_adce.tach` | aggressive dead code elimination over control dependence (post-dominators) |
 | `49_licm.tach` | natural loops and loop-invariant code motion |
+| `49_loop.tach` | the loop forest, canonical loops, LCSSA, the SSA updater, cloning, loop rotation |
+| `49_lsr.tach` | loop strength reduction (pointer induction variables), loop unswitching |
+| `49_range.tach` | value ranges and facts: bounds-check elimination, comparison folding, jump threading, comparison chains to switches |
+| `49_scev.tach` | induction variables, trip counts, exit values, dead loop deletion, unrolling |
+| `49_tre.tach` | tail recursion elimination with accumulators |
 | `50_regalloc.tach` | block layout, liveness, linear-scan register allocation |
 | `51_emit.tach` | emission of the allocated IR: operands, parallel moves, calls, frames |
 | `52_mc_arm64.tach` | AArch64 instructions on physical registers |
