@@ -19,7 +19,7 @@ The code: `compiler/src/44_ir.tach` (IR), `45_lower.tach` (AST to SSA),
 |---|---|
 | `-O0` | the 0.1 code generator (`40_gen.tach`), unchanged: stack-machine code straight from the AST |
 | `-O1` | lowering to SSA; per function, twice: SCCP, instruction combining, (the first time) scalar replacement of aggregates and constant tables, CFG simplification, GVN with memory forwarding and dead stores, dead code elimination, CFG simplification; linear-scan register allocation |
-| `-O2` (default) | `-O1`, then inlining bottom-up over the call graph and loop-invariant code motion, each followed by the `-O1` pipeline again; functions left without callers are not emitted |
+| `-O2` (default) | `-O1`, then per function in call-graph order (callees first): tail recursion elimination, inlining, the loop optimizer (0.4: rotation, induction variables and unrolling, value ranges, strength reduction and unswitching, aggressive DCE) and loop-invariant code motion, each followed by the `-O1` pipeline again; functions left without callers are not emitted |
 
 `-O0` stays as an independent oracle: it shares only the front end with
 the other levels, so a miscompile in the middle or back end shows up as a
@@ -214,10 +214,13 @@ interop):
   different integer widths (an old one, exposed by SROA), and a nested
   `match` overwriting the switch state of the one it is in.
 
-## 0.4: loops (the plan)
+## 0.4: the loop optimizer
 
 0.4 adds a loop optimizer to `-O2`, run per function after inlining and
-before LICM, then again after it. The passes, in pipeline order:
+before LICM (`optimize_loops` in `46_opt.tach`; light cleanups between
+its passes, the `-O1` pipeline once after them). Tail recursion
+elimination runs before inlining (`49_tre.tach`). The passes, in
+pipeline order:
 
 1. **Loop analysis and canonical form** (`49_loop.tach`): the loop forest
    (natural loops by header, nesting, depth); every loop gets a preheader
@@ -242,12 +245,18 @@ before LICM, then again after it. The passes, in pipeline order:
    loop is finite when its exit test is such a counted test.
 4. **Dead loop deletion**: a finite loop without side effects whose results
    are only its exit values is removed.
-5. **Unrolling**: full unrolling of loops with a small constant trip count;
-   partial unrolling (by 2 or 4) of loops with a constant trip count that
-   the factor divides, under a size budget.
-6. **Loop strength reduction**: an address `base + i * stride` (a shift or
-   a multiplication of an induction variable) inside a loop becomes a
-   pointer induction variable.
+5. **Unrolling**: full unrolling of loops with a small constant trip count
+   (up to 16 trips and 160 instructions); partial unrolling (by 4 or 2) of
+   innermost loops with a constant trip count (found up to 4096) that the
+   factor divides, up to 96 instructions. All copies are made from the
+   untouched loop, then chained.
+6. **Loop strength reduction** (`49_lsr.tach`): an address affine in an
+   induction variable (`k + c1*b1 + c2*b2 + (s + m*v)*i`, all 64-bit,
+   `b1`, `b2`, `v` invariant) that costs a multiplication or a shift
+   becomes a pointer induction variable; addresses a constant apart share
+   one pointer, the difference folded into the access's offset. Up to 4
+   pointers per loop. matmul's inner loop is two loads, a multiply and an
+   add per element.
 7. **Unswitching**: a branch on a loop-invariant condition inside a small
    loop: the loop is cloned, one copy per outcome, the test hoisted.
 8. **Value ranges and bounds checks** (`49_range.tach`): the range of an
@@ -266,18 +275,44 @@ before LICM, then again after it. The passes, in pipeline order:
     dependence (post-dominators), branches that decide nothing live are
     removed; branches of loops are kept (a loop may not terminate: only
     the loop deletion above removes loops, when they are finite).
+11. **Tail recursion elimination** (`49_tre.tach`): `return f(args)`,
+    `return f(args) op y` and `return y op f(args)` (op one of `+ * & | ^`
+    on integers, nothing with an effect after the call) become a loop with
+    a phi per parameter and one for the accumulator; returns through a phi
+    block are first moved into its predecessors. Functions with frame
+    slots or aggregate parameters are left alone.
 
-Tested by IR `CHECK` tests per pass, the suite at every level, the fixpoint
-(the compiler itself is the largest loop test) and a loop mode of the random
-program generator (nested counted loops with varied bounds, steps,
-signedness and early exits, slices indexed in and out of bounds).
+Instruction combining now reassociates `(x + c1) + c2` at every integer
+type (both sums of one type wrap alike), which unrolled induction
+variables need.
+
+Costs: the compiler (22,800 lines) compiles itself at `-O2` in about 1.75
+times the CPU time of 0.3.0 (300 ms against 170 ms on Apple silicon);
+`-O1` is unchanged. Per-block arrays are kept from call to call (one per
+call would cost the whole program's size each time), and loops are
+rotated in one sweep, innermost first.
+
+Bugs found on the way (all by the checks below, before they shipped): an
+exit value taken from the wrong phi (the first match kept a stale flag),
+unrolled copies cloned from an already rewired loop, header phis of the
+inner loop rotated after the outer one's updater added to them, and the
+header phis' own operands skipped when rewriting a rotated header's
+uses.
+
+Tested by IR `CHECK` tests (`tests/run/opt_loops.tach`,
+`opt_ranges.tach`, `opt_loop_transforms.tach`), the suite at every level,
+the fixpoint (the compiler itself is the largest loop test) and the loop
+mode of the random program generator (`tests/fuzz/run.sh -l`: counted
+loops with bounds from expressions, while loops of every integer type up,
+down and to an exact end, `break` and `continue`, slices indexed one past
+the end now and then, chains of equality tests; the exit status is
+compared too).
 
 ## Not yet
 
-Planned in [roadmap.md](roadmap.md): chains of comparisons of one value
-turned into switches, aggressive dead code elimination, loop
-canonicalization, induction variables, unrolling, range analysis and
-bounds-check elimination (0.4); live-range splitting and coalescing in the
+Planned in [roadmap.md](roadmap.md): unrolling with run-time trip counts
+(a remainder loop), induction variable narrowing (0.5, with instruction
+selection); live-range splitting and coalescing in the
 register allocator, rule-based instruction selection, scheduling, a
 tachyon calling convention of its own (0.5); interprocedural analyses and a
 cost-model-driven inliner (0.6); an e-graph-based rewriter (0.7);

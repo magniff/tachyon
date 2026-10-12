@@ -108,14 +108,31 @@ for, it is exact.
 
 The compiler's own source starts using enums, `match`, methods and slices.
 
-- loop canonicalization: preheaders, single latch, dedicated exits, LCSSA
-- scalar evolution (add recurrences) and induction variable simplification
-- loop strength reduction
-- loop rotation, full unrolling of small constant trip counts, partial
-  unrolling
-- loop unswitching
-- value range analysis; bounds-check elimination from induction ranges
-- trip-count-based dead loop deletion
+The loop optimizer (design and status in [optimizer.md](optimizer.md)):
+
+- [x] loop canonicalization: preheaders, single latch, dedicated exits,
+  LCSSA; an SSA updater and region cloning for the transformations
+- [x] induction variables (add recurrences, also through chains of
+  constant additions) and their exit values; constant trip counts by
+  evaluating the exit test with the folding rules (wrapping exact)
+- [x] loop strength reduction: addresses affine in an induction variable
+  (constant or run-time strides) become pointer induction variables
+- [x] loop rotation; full unrolling of small constant trip counts; partial
+  unrolling by 2 or 4 when the factor divides a constant trip count.
+  Unrolling with a run-time trip count (a remainder loop) moves to 0.5
+- [x] loop unswitching on invariant conditions
+- [x] value ranges from types, operations, dominating branch conditions,
+  switch cases and counted loops; bounds checks they prove are removed,
+  comparisons they decide are folded, edges whose test they decide are
+  threaded (a `match` with guards becomes a decision tree)
+- [x] trip-count-based dead loop deletion; aggressive dead code
+  elimination over control dependence
+- [x] deferred from 0.3: chains of equality tests become switches;
+  decision trees for matches with guards (by threading)
+- [x] tail recursion elimination with accumulators (`fib`: half the calls)
+- not done: narrowing of induction variables (moves to 0.5, with
+  instruction selection); bounds checks whose proof needs the slice's
+  length from the caller (0.6, interprocedural)
 
 ## 0.5: backend quality (passing Cranelift)
 
