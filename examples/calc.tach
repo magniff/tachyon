@@ -1,53 +1,61 @@
 // A calculator: reads lines of arithmetic from stdin and prints their
 // values. A tokenizer and a recursive-descent parser over a slice of
-// tokens, with enums, match, methods and slices.
+// tokens, with enums, match, methods, slices and std's Vec and Buf.
 extern "C" {
-    fn printf(format: *u8, ...) -> i32;
     fn getchar() -> i32;
 }
 
+use std::Buf;
+
 enum Token { Num(i64), Plus, Minus, Star, Slash, Percent, Open, Close, End }
+use Token::{Num, Plus, Minus, Star, Slash, Percent, Open, Close, End};
 
-enum Error { None, BadChar(u8), Unexpected(Token), DivideByZero }
+enum Error { BadChar(u8), Unexpected(Token), DivideByZero }
+use Error::{BadChar, Unexpected, DivideByZero};
 
-// `bad`: a character that starts no token (0: none).
-struct Lexer { text: [u8], at: u64, bad: u8 }
+// `bad`: the character that stopped the tokenizer, if one did.
+struct Lexer { text: [u8], at: i64, bad: Option<u8> }
 
 impl Lexer {
     fn next(self: *Lexer) -> Token {
-        while self.at < self.text.len as u64 && self.text[self.at] == ' ' {
+        while self.at < self.text.len && self.text[self.at] == ' ' {
             self.at += 1;
         }
-        if self.at == self.text.len as u64 {
-            return Token::End;
+        if self.at == self.text.len {
+            return End;
         }
         let c = self.text[self.at];
         self.at += 1;
         match c {
             '0'..='9' => {
                 let mut value = (c - '0') as i64;
-                while self.at < self.text.len as u64 && self.text[self.at] >= '0' && self.text[self.at] <= '9' {
-                    value = value * 10 + (self.text[self.at] - '0') as i64;
+                while self.at < self.text.len {
+                    let d = self.text[self.at];
+                    if d < '0' || d > '9' {
+                        break;
+                    }
+                    value = value * 10 + (d - '0') as i64;
                     self.at += 1;
                 }
-                Token::Num(value)
+                Num(value)
             }
-            '+' => Token::Plus,
-            '-' => Token::Minus,
-            '*' => Token::Star,
-            '/' => Token::Slash,
-            '%' => Token::Percent,
-            '(' => Token::Open,
-            ')' => Token::Close,
+            '+' => Plus,
+            '-' => Minus,
+            '*' => Star,
+            '/' => Slash,
+            '%' => Percent,
+            '(' => Open,
+            ')' => Close,
             _ => {
-                self.bad = c;
-                Token::End
+                self.bad = Some(c);
+                End
             }
         }
     }
 }
 
-struct Parser { tokens: [Token], at: u64, error: Error }
+// `error`: the first error met; a failed expression's value is 0.
+struct Parser { tokens: [Token], at: i64, error: Option<Error> }
 
 impl Parser {
     fn peek(self: *Parser) -> Token {
@@ -55,9 +63,8 @@ impl Parser {
     }
 
     fn fail(self: *Parser, e: Error) -> i64 {
-        match self.error {
-            Error::None => self.error = e,
-            _ => {}
+        if self.error.is_none() {
+            self.error = Some(e);
         }
         0
     }
@@ -67,11 +74,11 @@ impl Parser {
         let mut value = self.term();
         loop {
             match self.peek() {
-                Token::Plus => {
+                Plus => {
                     self.at += 1;
                     value += self.term();
                 }
-                Token::Minus => {
+                Minus => {
                     self.at += 1;
                     value -= self.term();
                 }
@@ -86,13 +93,13 @@ impl Parser {
         loop {
             let op = self.peek();
             match op {
-                Token::Star | Token::Slash | Token::Percent => {
+                Star | Slash | Percent => {
                     self.at += 1;
                     let rhs = self.unary();
                     value = match op {
-                        Token::Star => value * rhs,
-                        _ if rhs == 0 => self.fail(Error::DivideByZero),
-                        Token::Slash => value / rhs,
+                        Star => value * rhs,
+                        _ if rhs == 0 => self.fail(DivideByZero),
+                        Slash => value / rhs,
                         _ => value % rhs,
                     };
                 }
@@ -106,88 +113,95 @@ impl Parser {
         let t = self.peek();
         self.at += 1;
         match t {
-            Token::Minus => 0 - self.unary(),
-            Token::Num(n) => n,
-            Token::Open => {
+            Minus => -self.unary(),
+            Num(n) => n,
+            Open => {
                 let value = self.sum();
                 match self.peek() {
-                    Token::Close => {
+                    Close => {
                         self.at += 1;
                         value
                     }
-                    other => self.fail(Error::Unexpected(other)),
+                    other => self.fail(Unexpected(other)),
                 }
             }
             other => {
                 self.at -= 1;
-                self.fail(Error::Unexpected(other))
+                self.fail(Unexpected(other))
             }
         }
     }
 }
 
-fn token_name(t: Token) -> *u8 {
+fn token_name(t: Token) -> [u8] {
     match t {
-        Token::Num(_) => c"a number",
-        Token::Plus => c"'+'",
-        Token::Minus => c"'-'",
-        Token::Star => c"'*'",
-        Token::Slash => c"'/'",
-        Token::Percent => c"'%'",
-        Token::Open => c"'('",
-        Token::Close => c"')'",
-        Token::End => c"the end",
+        Num(_) => "a number",
+        Plus => "'+'",
+        Minus => "'-'",
+        Star => "'*'",
+        Slash => "'/'",
+        Percent => "'%'",
+        Open => "'('",
+        Close => "')'",
+        End => "the end",
     }
 }
 
 fn evaluate(line: [u8]) {
-    let mut tokens: [Token; 256] = [Token::End; 256];
-    let mut lexer = Lexer { text: line, at: 0, bad: 0 };
-    let mut count: u64 = 0;
+    let mut tokens: Vec<Token> = Vec::new();
+    defer tokens.free();
+    let mut lexer = Lexer { text: line, at: 0, bad: None };
     loop {
         let t = lexer.next();
-        tokens[count] = t;
-        count += 1;
-        match t {
-            Token::End => break,
-            _ => if count == 255 { break; },
+        tokens.push(t);
+        if t == End {
+            break;
         }
     }
-    let mut parser = Parser { tokens: tokens[..count], at: 0, error: Error::None };
-    if lexer.bad != 0 {
-        parser.error = Error::BadChar(lexer.bad);
+
+    let mut parser = Parser { tokens: tokens.as_slice(), at: 0, error: None };
+    if let Some(c) = lexer.bad {
+        parser.error = Some(BadChar(c));
     }
     let value = parser.sum();
-    match parser.peek() {
-        Token::End => {}
-        other => {
-            parser.fail(Error::Unexpected(other));
+    let rest = parser.peek();
+    if rest != End {
+        parser.fail(Unexpected(rest));
+    }
+
+    let mut out = Buf::new();
+    defer out.free();
+    match parser.error {
+        None => out.push_int(value),
+        Some(DivideByZero) => out.push_str("error: division by zero"),
+        Some(Unexpected(t)) => {
+            out.push_str("error: unexpected ");
+            out.push_str(token_name(t));
+        }
+        Some(BadChar(c)) => {
+            out.push_str("error: unexpected character '");
+            out.push(c);
+            out.push('\'');
         }
     }
-    match parser.error {
-        Error::None => printf(c"%ld\n", value),
-        Error::DivideByZero => printf(c"error: division by zero\n"),
-        Error::Unexpected(t) => printf(c"error: unexpected %s\n", token_name(t)),
-        Error::BadChar(c) => printf(c"error: unexpected character '%c'\n", c as i32),
-    };
+    println(out.as_slice());
 }
 
 fn main() -> i32 {
-    let mut line: [u8; 1024] = [0; 1024];
-    let mut n: u64 = 0;
+    let mut line = Buf::new();
+    defer line.free();
     loop {
         let c = getchar();
         if c < 0 || c == '\n' as i32 {
-            if n > 0 {
-                evaluate(line[..n]);
+            if line.len() > 0 {
+                evaluate(line.as_slice());
             }
-            n = 0;
+            line.clear();
             if c < 0 {
                 return 0;
             }
-        } else if n < 1024 {
-            line[n] = c as u8;
-            n += 1;
+        } else {
+            line.push(c as u8);
         }
     }
 }
