@@ -294,10 +294,11 @@ fn layout_blocks(fi: i64) {
     free(stack.data as *u8);
 }
 
-// Whether compare `v` is fused into the branch that ends its block.
+// Whether compare (or test) `v` is fused into the branch that ends its
+// block.
 fn is_fused_compare(v: i64) -> bool {
     let b = INSTS[v].block;
-    INSTS[v].op == Op::Cmp && USES[v] == 1 && BLOCKS[b].term == Term::Branch
+    (INSTS[v].op == Op::Cmp || INSTS[v].op == Op::Test) && USES[v] == 1 && BLOCKS[b].term == Term::Branch
         && BLOCKS[b].cond == v && INSTS[v].next == 0 && !is_float(INSTS[v].imm2)
 }
 
@@ -318,6 +319,14 @@ fn use_kind(v: i64, i: i64) -> i64 {
         return USE_ANY;
     }
     if (op == Op::Load || op == Op::Store) && i == 0 && INSTS[operand].op == Op::Slot {
+        return USE_NONE;
+    }
+    // AArch64's csel and csinc read a 0 from xzr.
+    if op == Op::Select && i < 2 && !X86 && is_zero_operand(operand) {
+        return USE_NONE;
+    }
+    // x86-64's indexed forms address a frame slot from %rsp.
+    if (op == Op::LoadX || op == Op::StoreX || op == Op::Lea) && i == 0 && INSTS[operand].op == Op::Slot {
         return USE_NONE;
     }
     if op.is_binary() && i == 1 && !is_float(INSTS[v].ty) && op != Op::Div && op != Op::Rem
@@ -343,6 +352,16 @@ fn term_uses(b: i64, out: *i64) -> i64 {
         out[0] = cond;
         out[1] = USE_ANY;
         return 1;
+    }
+    if term == Term::Branch && is_fused_compare(cond) && INSTS[cond].op == Op::Test {
+        out[0] = INSTS[cond].a;
+        out[1] = USE_REG;
+        if INSTS[cond].b == 0 {
+            return 1;
+        }
+        out[2] = INSTS[cond].b;
+        out[3] = USE_REG;
+        return 2;
     }
     if term == Term::Branch && is_fused_compare(cond) {
         out[0] = INSTS[cond].a;
@@ -795,6 +814,14 @@ fn add_hints(v: i64) {
         let a = tracked(INSTS[v].a);
         if a >= 0 && RV_HINT[t] < 0 && is_float(INSTS[INSTS[v].a].ty) == is_float(INSTS[v].ty) {
             RV_HINT[t] = a;
+        }
+    }
+    if op == Op::Select && X86 {
+        // cmov into the register of the value it replaces: that value
+        // would like the select's register.
+        let b = tracked(INSTS[v].b);
+        if b >= 0 && RV_HINT[b] < 0 && USES[INSTS[v].b] == 1 {
+            RV_HINT[b] = t;
         }
     }
 }
@@ -1295,7 +1322,10 @@ fn use_distance(i: i64, pos: i64, from: i64) -> i64 {
     let depth = min_i64(LDEPTH.data[block_at(pos)], 6);
     let raw = pos - from;
     let mut d = raw >> (2 * depth) as u64;
-    if iv_remat(i) {
+    // A constant is cheap to bring back, unless it is needed by the very
+    // next instruction (two constants needed there would take each
+    // other's register forever).
+    if iv_remat(i) && raw > 4 {
         d = d * 4 + 3;
     }
     (d << 20) | min_i64(raw, 0xfffff)
@@ -1363,6 +1393,13 @@ fn try_allocate_free(cur: i64) -> bool {
     let hint = hint_reg(cur);
     if hint >= 0 && (hint >= 32) == iv_float(cur) && is_allocatable(hint) && FREE_UNTIL[hint] >= end {
         assign(cur, hint);
+        return true;
+    }
+    // Else the argument or result register the value goes to, when the
+    // partner's is taken.
+    let to = RV_HREG[IVS[cur].value];
+    if to >= 0 && to != hint && (to >= 32) == iv_float(cur) && is_allocatable(to) && FREE_UNTIL[to] >= end {
+        assign(cur, to);
         return true;
     }
     let mut best = regs[0];
@@ -2097,4 +2134,9 @@ fn check_allocation(fi: i64) {
     }
     free(exits as *u8);
     free(state as *u8);
+}
+
+// Whether `v` is the integer constant 0 (read from xzr on AArch64).
+fn is_zero_operand(v: i64) -> bool {
+    INSTS[v].op == Op::Const && INSTS[v].imm == 0 && !is_float(INSTS[v].ty)
 }

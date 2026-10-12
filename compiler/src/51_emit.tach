@@ -27,6 +27,13 @@ static mut SAVE_BASE: i64 = 0;
 static mut FRAME_TOTAL: i64 = 0;
 static mut LABEL_BASE: i64 = 0;
 static mut EPILOGUE_LABEL: i64 = 0;
+// The index register of the next memory operand (-1: none) and its shift
+// (LOADX, STOREX, LEA).
+static mut MEM_INDEX: i64 = -1;
+static mut MEM_SCALE: i64 = 0;
+// Whether the function's branches all reach (AArch64's tbz and tbnz reach
+// 32 KB).
+static mut SHORT_BRANCHES: bool = false;
 
 // ---- Registers of the machine layer ----
 
@@ -80,9 +87,27 @@ fn block_label(b: i64) -> i64 {
 
 // ---- Dispatch to the machine layer ----
 
+// Post-allocation peepholes on what was just emitted (nothing else, not
+// even a label, since): a move back to where a value just came from is
+// none, and a load of the spill slot (or stack slot) just stored to is a
+// move from the register stored.
+static mut LAST_MOV_DST: i64 = -1;
+static mut LAST_MOV_SRC: i64 = -1;
+static mut LAST_MOV_END: i64 = -1;
+static mut LAST_STORE_REG: i64 = -1;
+static mut LAST_STORE_OFFSET: i64 = 0;
+static mut LAST_STORE_TYPE: i64 = 0;
+static mut LAST_STORE_END: i64 = -1;
+
 fn m_mov(dst: i64, src: i64, ty: i64) {
     if dst == src { return; }
+    if BUFS[CODE].len == LAST_MOV_END && dst == LAST_MOV_SRC && src == LAST_MOV_DST {
+        return;
+    }
     if X86 { mx_mov(dst, src, ty); } else { ma_mov(dst, src, ty); }
+    LAST_MOV_DST = dst;
+    LAST_MOV_SRC = src;
+    LAST_MOV_END = BUFS[CODE].len;
 }
 fn m_load_imm(dst: i64, value: u64) {
     if X86 { mx_load_imm(dst, value); } else { ma_load_imm(dst, value); }
@@ -91,10 +116,21 @@ fn m_load_fimm(dst: i64, bits: i64, ty: i64) {
     if X86 { mx_load_fimm(dst, bits, ty); } else { ma_load_fimm(dst, bits, ty); }
 }
 fn m_load(ty: i64, dst: i64, base: i64, offset: i64) {
+    if MEM_INDEX < 0 && base == reg_sp() && BUFS[CODE].len == LAST_STORE_END && offset == LAST_STORE_OFFSET
+        && ty == LAST_STORE_TYPE && type_size(ty) == 8 && (dst >= 32) == (LAST_STORE_REG >= 32) {
+        m_mov(dst, LAST_STORE_REG, ty);
+        return;
+    }
     if X86 { mx_load(ty, dst, base, offset); } else { ma_load(ty, dst, base, offset); }
 }
 fn m_store(ty: i64, src: i64, base: i64, offset: i64) {
     if X86 { mx_store(ty, src, base, offset); } else { ma_store(ty, src, base, offset); }
+    if MEM_INDEX < 0 && base == reg_sp() {
+        LAST_STORE_REG = src;
+        LAST_STORE_OFFSET = offset;
+        LAST_STORE_TYPE = ty;
+        LAST_STORE_END = BUFS[CODE].len;
+    }
 }
 fn m_lea(dst: i64, base: i64, offset: i64) {
     if X86 { mx_lea(dst, base, offset); } else { ma_lea(dst, base, offset); }
@@ -450,20 +486,37 @@ fn layout_frame(fi: i64) {
     FRAME_TOTAL = align_to(offset, 16);
 }
 
-// Saves (or restores) the callee-saved registers used.
+// Saves (or restores) the callee-saved registers used: on AArch64 two at
+// a time (stp, ldp) when they are of one kind.
 fn save_callee_saved(restore: bool) {
     let mut offset = SAVE_BASE;
+    let mut pending = -1;
     for r in 0..64 {
         if CALLEE_USED[r] == 0 {
             continue;
         }
-        let ty = if r >= 32 { TY_F64 } else { TY_U64 };
-        if restore {
-            m_load(ty, r, reg_sp(), offset);
+        if !X86 && pending >= 0 && (pending >= 32) == (r >= 32) && offset - 8 <= 504 {
+            ma_pair(restore, pending, r, offset - 8);
+            pending = -1;
         } else {
-            m_store(ty, r, reg_sp(), offset);
+            if pending >= 0 {
+                save_one(restore, pending, offset - 8);
+            }
+            pending = r;
         }
         offset += 8;
+    }
+    if pending >= 0 {
+        save_one(restore, pending, offset - 8);
+    }
+}
+
+fn save_one(restore: bool, r: i64, offset: i64) {
+    let ty = if r >= 32 { TY_F64 } else { TY_U64 };
+    if restore {
+        m_load(ty, r, reg_sp(), offset);
+    } else {
+        m_store(ty, r, reg_sp(), offset);
     }
 }
 
@@ -556,33 +609,93 @@ fn gen_ir_function(fi: i64) {
         check_allocation(fi);
     }
     layout_frame(fi);
+    SHORT_BRANCHES = function_size(fi) <= 800;
     find_trivial_jumps();
+    layout_emission();
     buf_clear(CODE);
+    // The peepholes' memory of what was just emitted belongs to the code of
+    // the function before (whose length the new one's may match).
+    LAST_MOV_END = -1;
+    LAST_STORE_END = -1;
+    LAST_SELECT = 0;
+    LAST_SELECT_END = -1;
     LABEL_BASE = LABEL_COUNT + 1;
     LABEL_COUNT += ORDER.count;
     EPILOGUE_LABEL = new_label();
-    let frame = needs_frame(fi);
-    ir_function_start(fn_symbol_prefix(f), FNS[f].name, fn_is_global(f), frame);
+    EPILOGUE_USED = false;
+    HAS_FRAME = needs_frame(fi);
+    ir_function_start(fn_symbol_prefix(f), FNS[f].name, fn_is_global(f), HAS_FRAME);
     if FRAME_TOTAL > 0 {
         if X86 { x64_frame_reserve(FRAME_TOTAL); } else { a64_frame_reserve(FRAME_TOTAL); }
     }
     save_callee_saved(false);
     emit_entry_moves(fi);
-    for k in 0..ORDER.count {
-        if !is_skipped(ORDER.data[k]) {
-            emit_ir_block(ORDER.data[k], k);
-        }
+    for j in 0..EMIT.count {
+        emit_ir_block(EMIT.data[j], j);
     }
-    emit_label(EPILOGUE_LABEL);
+    // The epilogue, when a block jumps to it or the last one falls into it.
+    if EPILOGUE_USED || falls_into_epilogue() {
+        emit_label(EPILOGUE_LABEL);
+        emit_ir_epilogue();
+    }
+    buf_bytes(ASM, buf_slice(CODE));
+}
+
+// Whether a jump to the epilogue was emitted.
+static mut EPILOGUE_USED: bool = false;
+
+// Whether the last block emitted returns by falling into the epilogue.
+fn falls_into_epilogue() -> bool {
+    if EMIT.count == 0 {
+        return false;
+    }
+    let b = EMIT.data[EMIT.count - 1];
+    BLOCKS[b].term == Term::Ret || BLOCKS[b].term == Term::Jump && jump_target(BLOCKS[b].s0) != b
+        && is_duplicable(jump_target(BLOCKS[b].s0))
+}
+
+// Whether the function being emitted has a frame.
+static mut HAS_FRAME: bool = false;
+
+fn emit_ir_epilogue() {
     save_callee_saved(true);
-    if !frame {
+    if !HAS_FRAME {
         ins(c"ret");
     } else if X86 {
         x64_epilogue();
     } else {
         a64_epilogue();
     }
-    buf_bytes(ASM, buf_slice(CODE));
+}
+
+// A return from a block that is not the last: the epilogue itself when it
+// is short (at most 4 registers to restore), else a jump to it.
+fn emit_return() {
+    let mut saved = 0;
+    for r in 0..64 {
+        if CALLEE_USED[r] != 0 {
+            saved += 1;
+        }
+    }
+    if saved <= 4 {
+        emit_ir_epilogue();
+    } else {
+        EPILOGUE_USED = true;
+        m_jump(EPILOGUE_LABEL);
+    }
+}
+
+// The number of instructions of function fi.
+fn function_size(fi: i64) -> i64 {
+    let mut n = 0;
+    for i in 0..ORDER.count {
+        let mut v = BLOCKS[ORDER.data[i]].first;
+        while v != 0 {
+            n += 1;
+            v = INSTS[v].next;
+        }
+    }
+    n
 }
 
 // Whether function fi needs a frame: it calls, uses the stack (spills,
@@ -697,17 +810,46 @@ fn is_skipped(b: i64) -> bool {
     b != IRFUNCS[IRF].entry && is_trivial_jump(b) && jump_target(b) != b
 }
 
-// The block emitted after the one at layout index k, or 0.
-fn next_block(k: i64) -> i64 {
-    let mut i = k + 1;
-    while i < ORDER.count && is_skipped(ORDER.data[i]) {
-        i += 1;
-    }
-    if i < ORDER.count { ORDER.data[i] } else { 0 }
+// The block emitted after the one at index j of the emission order, or 0.
+fn next_block(j: i64) -> i64 {
+    if j + 1 < EMIT.count { EMIT.data[j + 1] } else { 0 }
 }
 
-fn emit_ir_block(b: i64, k: i64) {
+fn emit_ir_block(b: i64, j: i64) {
     emit_label(block_label(b));
+    emit_block_code(b, next_block(j));
+}
+
+// Tail duplication: a jump to a small block (at most 3 instructions, no
+// call, ending in a jump, a branch or a return) emits a copy of the block
+// instead, up to 2 deep. The copy is exact: a block's code depends on its
+// allocation (its positions) only, and the moves of the edge into it are
+// already done.
+static mut DUP_DEPTH: i64 = 0;
+
+fn is_duplicable(b: i64) -> bool {
+    let term = BLOCKS[b].term;
+    if b == IRFUNCS[IRF].entry || (term != Term::Jump && term != Term::Branch && term != Term::Ret) {
+        return false;
+    }
+    let mut n = 0;
+    let mut v = BLOCKS[b].first;
+    while v != 0 {
+        if INSTS[v].op.is_call() || INSTS[v].op == Op::Select && X86 {
+            return false;
+        }
+        if is_emitted(v) && !is_fused_compare(v) {
+            n += 1;
+        }
+        v = INSTS[v].next;
+    }
+    n <= 3
+}
+
+// The code of block b (without its label); `next` is the block emitted
+// after it (0: none, -1: a copy, which nothing follows).
+fn emit_block_code(b: i64, next: i64) {
+    let k = BLOCKS[b].order;
     let start = BSTART.data[k];
     plan_start_moves(b);
     pm_resolve();
@@ -746,14 +888,20 @@ fn emit_ir_block(b: i64, k: i64) {
     plan_gap_moves(end - 1);
     pm_resolve();
     let term = BLOCKS[b].term;
-    let next = next_block(k);
     if term == Term::Jump {
         let s = BLOCKS[b].s0;
         plan_end_moves(b);
         pm_resolve();
         let target = jump_target(s);
         if target != next {
-            m_jump(block_label(target));
+            if DUP_DEPTH < 2 && is_duplicable(target) {
+                DUP_DEPTH += 1;
+                // The copy ends where this block does: its next block follows.
+                emit_block_code(target, next);
+                DUP_DEPTH -= 1;
+            } else {
+                m_jump(block_label(target));
+            }
         }
     } else if term == Term::Branch {
         emit_branch(b, next);
@@ -781,7 +929,7 @@ fn emit_ir_block(b: i64, k: i64) {
             use_into(value, end, reg_ret(is_float(INSTS[value].ty)));
         }
         if next != 0 {
-            m_jump(EPILOGUE_LABEL);
+            emit_return();
         }
     } else {
         m_trap();
@@ -804,7 +952,19 @@ fn emit_branch(b: i64, next: i64) {
         other = s0;
         sense = false;
     }
-    if is_fused_compare(cond) {
+    if is_fused_compare(cond) && INSTS[cond].op == Op::Test {
+        let mut op = INSTS[cond].cond;
+        if !sense {
+            op = op.negate();
+        }
+        let a = int_operand(INSTS[cond].a);
+        let b = if INSTS[cond].b != 0 { int_operand(INSTS[cond].b) } else { -1 };
+        if X86 {
+            mx_test_branch(a, b, INSTS[cond].imm, op == Cond::Ne, block_label(target));
+        } else {
+            ma_test_branch(a, b, INSTS[cond].imm, op == Cond::Ne, block_label(target));
+        }
+    } else if is_fused_compare(cond) {
         let mut op = INSTS[cond].cond;
         if !sense {
             op = op.negate();
@@ -954,9 +1114,104 @@ fn emit_inst(v: i64) {
         m_copy(dst, src, INSTS[v].imm);
     } else if op.is_call() {
         emit_call_inst(v);
+    } else if op == Op::LoadX || op == Op::StoreX || op == Op::Lea {
+        emit_indexed(v);
+    } else if op == Op::Select {
+        emit_select(v);
+    } else if op == Op::FMath {
+        let a = operand_reg(INSTS[v].a);
+        let r = result_reg(v);
+        if X86 {
+            mx_sqrt(INSTS[v].ty, r, a);
+        } else {
+            ma_fmath(INSTS[v].imm, INSTS[v].ty, r, a);
+        }
+        result_done(v, r);
+    } else if op == Op::MAdd || op == Op::MSub || op == Op::ShOp || op == Op::Ubfx {
+        // AArch64 only (see 50_isel.tach).
+        let a = operand_reg(INSTS[v].a);
+        let b = if INSTS[v].b != 0 { operand_reg(INSTS[v].b) } else { -1 };
+        let r = result_reg(v);
+        if op == Op::Ubfx {
+            ma_ubfx(r, a, INSTS[v].imm, INSTS[v].imm2);
+        } else if op == Op::ShOp {
+            ma_shop(INSTS[v].imm2, INSTS[v].ty, r, a, b, INSTS[v].imm);
+        } else {
+            ma_madd(op == Op::MSub, INSTS[v].ty, r, a, b, operand_reg(INSTS[v].c));
+        }
+        result_done(v, r);
     } else {
         die(c"internal error: unexpected instruction in emission");
     }
+}
+
+// LOADX, STOREX and LEA: base + (index << scale) + offset (the base a frame
+// slot from sp on x86-64).
+fn emit_indexed(v: i64) {
+    let op = INSTS[v].op;
+    let mut offset = INSTS[v].imm;
+    let base_value = INSTS[v].a;
+    let mut base = 0;
+    if INSTS[base_value].op == Op::Slot {
+        offset += SLOTS[INSTS[base_value].imm].offset;
+        base = reg_sp();
+    } else {
+        base = int_operand(base_value);
+    }
+    MEM_INDEX = if INSTS[v].b != 0 { int_operand(INSTS[v].b) } else { -1 };
+    MEM_SCALE = INSTS[v].scale;
+    if op == Op::StoreX {
+        let r = operand_reg(INSTS[v].c);
+        m_store(INSTS[v].imm2, r, base, offset);
+        MEM_INDEX = -1;
+        return;
+    }
+    let r = result_reg(v);
+    if op == Op::LoadX {
+        m_load(INSTS[v].ty, r, base, offset);
+    } else {
+        m_lea(r, base, offset);
+    }
+    MEM_INDEX = -1;
+    result_done(v, r);
+}
+
+// The last select emitted, and the length of the code after it.
+static mut LAST_SELECT: i64 = 0;
+static mut LAST_SELECT_END: i64 = 0;
+
+// SELECT: the comparison (or test) of its last operands, then a conditional
+// select of its first two.
+fn emit_select(v: i64) {
+    let lhs = operand_reg(ir_arg(v, 0));
+    let rhs = if ir_arg(v, 1) != 0 { operand_reg(ir_arg(v, 1)) } else { -1 };
+    // (-1: xzr, see use_kind.)
+    let then = if !X86 && is_zero_operand(INSTS[v].a) { -1 } else { operand_reg(INSTS[v].a) };
+    let other = if !X86 && is_zero_operand(INSTS[v].b) { -1 } else { operand_reg(INSTS[v].b) };
+    let r = result_reg(v);
+    let test = (INSTS[v].scale & 1) == 1;
+    if X86 {
+        // The flags of the select just before, when it compared the same and
+        // nothing was emitted since (a rematerialized 0 is an xorl).
+        let p = INSTS[v].prev;
+        let same = p != 0 && p == LAST_SELECT && BUFS[CODE].len == LAST_SELECT_END && ir_arg(p, 0) == ir_arg(v, 0)
+            && ir_arg(p, 1) == ir_arg(v, 1) && INSTS[p].imm == INSTS[v].imm && INSTS[p].imm2 == INSTS[v].imm2
+            && INSTS[p].scale == INSTS[v].scale;
+        mx_select(INSTS[v].cond, test, !same, INSTS[v].imm2, lhs, rhs, INSTS[v].imm, r, then, other);
+        LAST_SELECT = v;
+        LAST_SELECT_END = BUFS[CODE].len;
+    } else {
+        // The flags of the select just before, when it compared the same
+        // (nothing between them on AArch64 touches the flags: moves,
+        // loads, stores and rematerializations do not).
+        let p = INSTS[v].prev;
+        let same = p != 0 && INSTS[p].op == Op::Select && ir_arg(p, 0) == ir_arg(v, 0) && ir_arg(p, 1) == ir_arg(v, 1)
+            && INSTS[p].imm == INSTS[v].imm && INSTS[p].imm2 == INSTS[v].imm2
+            && (INSTS[p].scale & 1) == (INSTS[v].scale & 1);
+        ma_select(INSTS[v].cond, test, !same, INSTS[v].imm2, lhs, rhs, INSTS[v].imm, INSTS[v].ty, r, then, other,
+            (INSTS[v].scale & 2) != 0);
+    }
+    result_done(v, r);
 }
 
 fn emit_binary(v: i64) {

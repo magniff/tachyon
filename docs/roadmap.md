@@ -217,12 +217,29 @@ The back end, in two stages (design and status in
 
 Stage B:
 
-- instruction selection by tree-pattern rules (a rule table per target),
-  scaled-index addressing
-- list scheduling, post-RA peepholes
-- shrink-wrapping
-- block layout by fall-through and loop structure
-- unrolling with run-time trip counts
+- [x] instruction selection by rules (`50_isel.tach`): a per-target rule
+  table tiling each block's SSA DAG by maximal munch into machine
+  operations the allocator sees like any instruction: scaled-index
+  addressing (AArch64 `[x, x, lsl #s]`, x86-64 `d(b, i, s)`, frame slots
+  from `%rsp`), x86-64's three-operand `lea`, AArch64's `madd`/`msub`,
+  shifted operands, `ubfx`, `tst`/`tbz`/`tbnz`; selects from small
+  diamonds and triangles (`csel`, `csinc`, `fcsel`, `cmov`; one
+  comparison shared by neighbouring selects); the C library's `sqrt` on
+  macOS and `fabs`/`floor`/`ceil`/`trunc`/`round` on AArch64 as
+  instructions; branches on phis threaded into their predecessors, a
+  branch on its predecessor's condition decided
+- [x] block layout (`51_layout.tach`): chains by fall-through from static
+  edge weights (loop depth, back edges, cold panic paths last), and tail
+  duplication of small blocks at emission (threaded dispatch in
+  interpreters, loop rotation by layout), small epilogues inlined
+- [x] post-allocation peepholes: `stp`/`ldp` for callee-saved registers,
+  a move straight back dropped, a reload of what was just stored a move,
+  the argument or result register tried when a hint's register is taken
+- [x] scheduling, two rules before allocation: a branch's comparison
+  last in its block (fused), constants out of loops (made once)
+- moved: unrolling with run-time trip counts to 0.8 (the remainder loop
+  is the loop vectorizer's too), a general list scheduler to 0.9 (with
+  profiles), shrink-wrapping to 0.6
 
 ## 0.6: interprocedural
 
@@ -235,6 +252,8 @@ library (and reports several errors at once while it is written).
   noreturn), dead argument elimination, global DCE
 - function specialization on constant arguments
 - escape analysis: heap-to-stack for non-escaping `malloc`
+- shrink-wrapping (from 0.5): callee-saved registers and the frame only
+  on the paths that need them
 - language: `defer`, `#[inline]` / `#[cold]` attributes
 
 ## 0.7: equality saturation
@@ -249,6 +268,8 @@ library (and reports several errors at once while it is written).
 
 - SLP vectorizer
 - loop vectorizer for counted loops with simple dependences
+- unrolling with run-time trip counts (from 0.5), sharing the vectorizer's
+  remainder loop
 - NEON and SSE2/AVX2 lowering; language-level vector types (`v4f32`, ...)
 
 ## 0.9: profile-guided
@@ -256,6 +277,7 @@ library (and reports several errors at once while it is written).
 - instrumentation profiles (`--profile-generate` / `--profile-use`)
 - branch weights driving inlining, block layout and hot/cold splitting
 - PGO-aware register allocation and unrolling
+- list scheduling (from 0.5) where profiles say a block is hot
 
 ## 1.0: stable
 

@@ -400,11 +400,111 @@ itself in every gate run; `tests/run.sh` checks `// ASM(T):` and
 the random program generator has a pressure mode (`tests/fuzz/run.sh -p`:
 up to 10 parameters, 12 to 25 locals all live to the end).
 
+## 0.5: the back end, stage B (instruction selection and layout)
+
+The plan was, in order of priority: instruction selection by rules, block
+layout, post-allocation peepholes, unrolling with run-time trip counts,
+scheduling, shrink-wrapping. Done: the first three, and of scheduling the
+two rules that paid off; the rest is below.
+
+**Instruction selection** (`50_isel.tach`) runs between the optimizer and
+register allocation, after `--emit-ir` (so the optimizer's IR checks are
+unaffected; `--emit-mir` shows the IR after it). Per function:
+
+1. *Branches on phis.* A block holding only a phi and a branch on it (what
+   `&&`, `||` and a `bool` from an `if` leave) is threaded: each
+   predecessor that jumps there branches itself on its own value for the
+   phi (a comparison it made, which then fuses with the branch), or jumps
+   where a constant leads. A branch on the condition its only
+   predecessor branched on is decided by the edge.
+2. *Selects.* A diamond or triangle whose arms hold at most two cheap pure
+   instructions each (no division, no float conversion), and four in all
+   with the selects, meeting in a block whose phis (at most two that
+   differ) pick between the arms' values, becomes the arms' instructions,
+   moved up (speculated: they cannot trap), and a `select` per phi. A
+   select owns its comparison (two extra operands, as a phi's or a call's;
+   the right one may be an immediate), so nothing can come between the
+   comparison and its use of the flags: on x86-64 a rematerialized 0 is
+   an `xorl`. AArch64: `csel`, `fcsel`, `csinc` for `c ? a : b + 1` (and
+   `c ? a + 1 : b`, with the condition inverted, for integer comparisons
+   and tests: the negation of a float comparison is not the opposite
+   comparison), `xzr` for a 0; x86-64: `cmov` (integers only; the value
+   replaced is hinted to the select's register). A select comparing what
+   the select before it compared reuses its flags (on x86-64 only when
+   nothing was emitted between them).
+3. *Tiling* by maximal munch, each block's instructions from the last to
+   the first so that a user is matched before what it uses. A rule
+   matches a root and the definitions of some of its operands, each in the
+   same block and used by the root alone, and rewrites the root in place
+   into a machine operation whose operands are the leaves; use counts are
+   kept as rules go, and what was covered dies (dead code elimination
+   after). The machine operations are IR instructions like the others, so
+   liveness, the allocator and its checker need no special case:
+
+   | operation | meaning | made from |
+   |---|---|---|
+   | `loadx`, `storex` | access at `a + (b << s) + off` | load/store of `a + (b << s)` or `a + b`; AArch64: `s` the access size or 0, no offset; x86-64: `s` up to 3, any offset, a frame slot as the base (from `%rsp`) |
+   | `lea` (x86-64) | `a + (b << s) + off`, 64-bit | `a + (b << s)`, `a + b`, `a ± k`, `x * {3,5,9} + k`, `(x + y) + k` |
+   | `madd`, `msub` (AArch64) | `c ± a * b` | `c + a * b`, `c - a * b` (not by 3, 5 or 9: those are one shifted add already) |
+   | `shop` (AArch64) | `a op (b sh k)`, op `+ - & \| ^`, sh `lsl lsr asr` | an operation and a shift by a constant |
+   | `ubfx` (AArch64) | `(a >> k) & (2^n - 1)` | the same, the field within the type |
+   | `test` | `(a & b) == 0` or `!= 0`, fused with a branch | a branch on `(x & m) == 0`; `tbz`/`tbnz` for one bit (in functions small enough for their 32 KB reach) |
+   | `select` | above | selects on `(x & m) ==/!= 0` test |
+   | `fmath` | `sqrt`, `fabs`, `floor`, `ceil`, `trunc`, `round` | calls of the C library's functions of those names and C signatures (and the `f32` ones): `sqrt` on macOS only (Darwin's libm never sets errno, glibc's does), the others on AArch64 (x86-64 has them from SSE4.1 only) |
+
+   Integer arithmetic wraps and every machine operation normalizes its
+   result to its type once, so fusing integer operations is exact; floats
+   are never fused (no `fmadd`: one rounding per operation).
+4. *Scheduling*, two rules: a branch's comparison (used by the branch
+   alone) moves to the end of its block, where it fuses with the branch
+   (loop strength reduction leaves increments after it); constants defined
+   in loops move to the entry block (at most 16 per function), so that one
+   needed in a register (a store's value, a float) is made once; the
+   allocator rematerializes it, before the loop, when it runs short.
+
+**Block layout** (`51_layout.tach`). The emission order is apart from the
+allocation order (any order is correct: every move belongs to a block or
+an edge, and a block's code depends on its positions only). Chains by
+fall-through (Pettis and Hansen, PLDI 1990, with static estimates): a
+block's frequency is 8^(loop depth); a branch sends 63/64 away from a cold
+successor (one that only leads to a panic or `unreachable`), 7/8 along a
+back edge or within its loop, else half each way; the heaviest edges join
+the chain ending at their source to the one starting at their target. The
+entry's chain first, then the others by allocation order, cold ones last.
+
+**Tail duplication** at emission: a jump to a block of at most three
+instructions without a call, ending in a jump, a branch or a return,
+emits a copy of the block instead, up to two deep (the copy falls through
+to what follows the block it ends). In an interpreter, each handler then
+ends in its own dispatch test (threaded dispatch); a loop entered by a
+jump to its test gets the test at its end (rotation by layout). A return
+from a block that is not the last emits the epilogue when it restores at
+most four registers, and the shared epilogue is emitted only when
+something jumps or falls to it.
+
+**Post-allocation peepholes**: `stp`/`ldp` save and restore callee-saved
+registers in pairs; a move back to where a value just came from is
+dropped; a load of the stack slot just stored to is a move from the
+register stored; an interval whose partner's register (its hint) is taken
+tries the argument or result register it goes to before any other.
+
+Also fixed on the way: two constants needed by one instruction (a
+select's arms) took each other's register forever, a constant counting as
+cheap to evict even when the very next instruction needs it; a constant
+needed there is now as near as any other value.
+
+Not done: unrolling with run-time trip counts (moved to 0.8, whose loop
+vectorizer needs the same remainder loop), a general list scheduler (on
+the out-of-order cores tachyon targets, the two rules above are what
+mattered in `bench/`; moved to 0.9, where profiles tell which blocks are
+worth it), shrink-wrapping (moved to 0.6, with interprocedural attribute
+inference: its gain is in small functions with early returns that are
+not inlined).
+
 ## Not yet
 
-Planned in [roadmap.md](roadmap.md): unrolling with run-time trip counts
-(a remainder loop), induction variable narrowing, rule-based instruction
-selection with scaled-index addressing, scheduling, block layout,
-shrink-wrapping, a tachyon calling convention of its own, realigned frames
-(0.5, stage B); interprocedural analyses and a cost-model-driven inliner
-(0.6); an e-graph-based rewriter (0.7); vectorization (0.8).
+Planned in [roadmap.md](roadmap.md): induction variable narrowing, a
+tachyon calling convention of its own, realigned frames (0.5, stage B);
+interprocedural analyses, a cost-model-driven inliner and shrink-wrapping
+(0.6); an e-graph-based rewriter (0.7); vectorization and unrolling with
+run-time trip counts (0.8); profile-guided scheduling (0.9).
