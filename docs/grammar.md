@@ -27,7 +27,7 @@ exponent     = ( "e" | "E" ) [ "+" | "-" ] dec_digits ;
 int_suffix   = "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize" ;
 float_suffix = "f32" | "f64" ;
 char_lit     = "'" ( ascii_char | escape ) "'" ;       (* one byte, ASCII only *)
-string_lit   = '"' { char | escape } '"' ;             (* a (*u8, u64) pair *)
+string_lit   = '"' { char | escape } '"' ;             (* a a [u8] slice (0.6) *)
 cstring_lit  = 'c"' { char | escape } '"' ;            (* a NUL-terminated *u8; no NUL inside *)
 escape       = "\n" | "\t" | "\r" | "\0" | "\\" | '\"' | "\'"
              | "\x" hex hex                            (* one byte *)

@@ -1081,6 +1081,9 @@ fn parse_stmt() -> i64 {
     if at(Let) {
         return parse_let();
     }
+    if at(Defer) {
+        return parse_defer();
+    }
     if at_block_like() {
         // Ends at its closing brace; a `;` right after belongs to it.
         let expr = parse_primary();
@@ -1099,6 +1102,22 @@ fn parse_stmt() -> i64 {
         return expr_stmt(expr, 2, start);
     }
     syntax_error(c"expected ';' or '}' after expression")
+}
+
+// `defer expr;` or `defer { ... }` (0.6).
+fn parse_defer() -> i64 {
+    let start = cur_start();
+    expect(Defer);
+    let n = new_node(NodeKind::Defer, start, 0);
+    if at(LBrace) {
+        NODES[n].a = parse_block();
+        eat(Semi);
+    } else {
+        NODES[n].a = parse_expr();
+        expect(Semi);
+    }
+    NODES[n].end = prev_end();
+    n
 }
 
 fn parse_let() -> i64 {
@@ -1834,20 +1853,62 @@ fn parse_array_literal() -> i64 {
 fn parse_if() -> i64 {
     let start = cur_start();
     expect(If);
+    if at(Let) {
+        return parse_if_let(start);
+    }
     let n = new_node(NodeKind::If, start, 0);
     NODES[n].a = parse_expr_no_struct();
     NODES[n].b = parse_block();
     if eat(Else) {
-        if at(If) {
-            // `else if`: an else block holding just the inner `if`.
-            let inner = parse_if();
-            let block = new_node(NodeKind::Block, NODES[inner].start, NODES[inner].end);
-            NODES[block].a = inner;
-            NODES[n].c = block;
-        } else {
-            NODES[n].c = parse_block();
-        }
+        NODES[n].c = parse_else_part();
     }
+    NODES[n].end = prev_end();
+    n
+}
+
+// The else part of an `if` (after `else`): a block, or a block holding
+// just the inner `if` of an `else if`.
+fn parse_else_part() -> i64 {
+    if at(If) {
+        let inner = parse_if();
+        let block = new_node(NodeKind::Block, NODES[inner].start, NODES[inner].end);
+        NODES[block].a = inner;
+        return block;
+    }
+    parse_block()
+}
+
+// A match arm made by the parser: `pattern => body`.
+fn synthetic_arm(pattern: i64, body: i64, flags: i64) -> i64 {
+    let arm = new_node(NodeKind::Arm, NODES[pattern].start, NODES[body].end);
+    NODES[arm].a = pattern;
+    NODES[arm].c = body;
+    NODES[arm].p = flags;
+    arm
+}
+
+// `if let P = e { A } else { B }` (0.6), after `if`: the match
+// `match e { P => { A }, _ => { B } }` (B: an empty block without `else`).
+// The bindings of P are in scope in A only; P may be refutable or not.
+fn parse_if_let(start: i64) -> i64 {
+    expect(Let);
+    let pattern = parse_pattern();
+    expect(Eq);
+    let n = new_node(NodeKind::Match, start, 0);
+    NODES[n].a = parse_expr_no_struct();
+    let then = parse_block();
+    let mut flags = ARM_SYNTHETIC;
+    let otherwise = if eat(Else) {
+        parse_else_part()
+    } else {
+        flags = ARM_SYNTHETIC | ARM_NO_ELSE;
+        new_node(NodeKind::Block, prev_end(), prev_end())
+    };
+    let wild = new_node(NodeKind::PatWild, NODES[otherwise].start, NODES[otherwise].start);
+    let mark = list_begin();
+    list_push(synthetic_arm(pattern, then, 0));
+    list_push(synthetic_arm(wild, otherwise, flags));
+    list_end(n, mark);
     NODES[n].end = prev_end();
     n
 }
@@ -1891,6 +1952,30 @@ fn parse_match() -> i64 {
     n
 }
 
+// `while let P = e { body }` (0.6), after `while`: the loop
+// `loop { match e { P => { body }, _ => break } }`, keeping the label.
+fn parse_while_let(label: i64, start: i64) -> i64 {
+    expect(Let);
+    let pattern = parse_pattern();
+    expect(Eq);
+    let m = new_node(NodeKind::Match, start, 0);
+    NODES[m].a = parse_expr_no_struct();
+    let body = parse_block();
+    let brk = new_node(NodeKind::Break, NODES[body].end, NODES[body].end);
+    let wild = new_node(NodeKind::PatWild, NODES[body].end, NODES[body].end);
+    let mark = list_begin();
+    list_push(synthetic_arm(pattern, body, 0));
+    list_push(synthetic_arm(wild, brk, ARM_SYNTHETIC));
+    list_end(m, mark);
+    NODES[m].end = prev_end();
+    let block = new_node(NodeKind::Block, start, prev_end());
+    NODES[block].a = m;
+    let n = new_node(NodeKind::Loop, start, prev_end());
+    NODES[n].a = label;
+    NODES[n].b = block;
+    n
+}
+
 fn parse_loop(label: i64, start: i64) -> i64 {
     if eat(Loop) {
         let n = new_node(NodeKind::Loop, start, 0);
@@ -1900,6 +1985,9 @@ fn parse_loop(label: i64, start: i64) -> i64 {
         return n;
     }
     if eat(While) {
+        if at(Let) {
+            return parse_while_let(label, start);
+        }
         let n = new_node(NodeKind::While, start, 0);
         NODES[n].a = label;
         NODES[n].b = parse_expr_no_struct();

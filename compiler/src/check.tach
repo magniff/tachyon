@@ -40,6 +40,9 @@ static mut LOCAL_CAP: i64 = 0;
 pub static mut ENV: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 static mut SCOPES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 static mut LOOP_STACK: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// While checking a deferred statement (0.6): the LOOP_STACK depth at it
+// (loops below it cannot be left from it); -1 elsewhere.
+static mut DEFER_LOOP_BASE: i64 = -1;
 pub static mut RETURN_TYPE: i64 = 0;
 // In constant expressions no locals are visible.
 pub static mut CONST_CONTEXT: bool = false;
@@ -193,6 +196,7 @@ fn check_function_recovering(item: i64) {
 struct CheckState {
     env: i64, scopes: i64, loops: i64, module: i64, self_ty: i64, tp_base: i64, tp_count: i64,
     inst: i64, ret: i64, tscratch: i64, scratch: i64, const_context: bool,
+    defer_base: i64,
 }
 
 fn save_check_state() -> CheckState {
@@ -200,7 +204,7 @@ fn save_check_state() -> CheckState {
         env: ENV.count, scopes: SCOPES.count, loops: LOOP_STACK.count, module: CUR_MOD,
         self_ty: SELF_TYPE, tp_base: TP_BASE, tp_count: TP_NAMES.count, inst: CUR_INST,
         ret: RETURN_TYPE, tscratch: TSCRATCH.count, scratch: SCRATCH.count,
-        const_context: CONST_CONTEXT,
+        const_context: CONST_CONTEXT, defer_base: DEFER_LOOP_BASE,
     }
 }
 
@@ -208,6 +212,7 @@ fn restore_check_state(s: CheckState) {
     ENV.count = s.env;
     SCOPES.count = s.scopes;
     LOOP_STACK.count = s.loops;
+    DEFER_LOOP_BASE = s.defer_base;
     CUR_MOD = s.module;
     SELF_TYPE = s.self_ty;
     TP_BASE = s.tp_base;
@@ -1203,6 +1208,7 @@ fn check_function(item: i64) {
     SELF_TYPE = FNS[f].self_ty;
     RETURN_TYPE = FNS[f].ret;
     LOOP_STACK.count = 0;
+    DEFER_LOOP_BASE = -1;
     ENV.count = 0;
     SCOPES.count = 0;
     for i in 0..NODES[item].count {
@@ -1281,9 +1287,24 @@ fn check_stmt(stmt: i64) -> bool {
     if NODES[stmt].kind == Let {
         return check_let(stmt);
     }
+    if NODES[stmt].kind == Defer {
+        return check_defer(stmt);
+    }
     let expr = NODES[stmt].a;
     let ty = if NODES[stmt].b != 0 { synth_expr(expr) } else { check_expr(expr, TY_UNIT) };
     ty == TY_NEVER
+}
+
+// `defer` (0.6): the deferred expression, of any type (its value is
+// dropped), may not leave it: no `return`, and `break`/`continue` only to
+// loops inside it. It is checked where it stands, so it sees the bindings
+// made before it.
+fn check_defer(stmt: i64) -> bool {
+    let saved = DEFER_LOOP_BASE;
+    DEFER_LOOP_BASE = LOOP_STACK.count;
+    synth_expr(NODES[stmt].a);
+    DEFER_LOOP_BASE = saved;
+    false
 }
 
 fn check_let(stmt: i64) -> bool {
@@ -2961,6 +2982,14 @@ fn check_mutable_name(ident: i64, target: i64) {
 
 // ---- Loops and jumps ----
 
+fn leave_defer_error(n: i64, keyword: *u8) {
+    err_begin(NODES[n].start);
+    err_str(c"'");
+    err_str(keyword);
+    err_str(c"' cannot leave a deferred statement");
+    err_end();
+}
+
 // The loop a `break`/`continue` refers to.
 fn find_loop(n: i64, keyword: *u8) -> i64 {
     let label = NODES[n].a;
@@ -2971,12 +3000,18 @@ fn find_loop(n: i64, keyword: *u8) -> i64 {
             err_str(c" outside of loop");
             err_end();
         }
+        if DEFER_LOOP_BASE >= LOOP_STACK.count {
+            leave_defer_error(n, keyword);
+        }
         return LOOP_STACK.data[LOOP_STACK.count - 1];
     }
     let mut i = LOOP_STACK.count - 1;
     while i >= 0 {
         let lp = LOOP_STACK.data[i];
         if NODES[lp].a == label {
+            if DEFER_LOOP_BASE > i {
+                leave_defer_error(n, keyword);
+            }
             return lp;
         }
         i -= 1;
@@ -3155,6 +3190,9 @@ fn check_break(n: i64) {
 
 fn check_return(n: i64) -> i64 {
     let value = NODES[n].a;
+    if DEFER_LOOP_BASE >= 0 {
+        type_error(n, c"'return' inside a deferred statement");
+    }
     if value != 0 {
         check_expr(value, RETURN_TYPE);
     } else if RETURN_TYPE != TY_UNIT && RETURN_TYPE != TY_NEVER {
