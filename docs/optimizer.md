@@ -573,6 +573,102 @@ worth it), shrink-wrapping (moved to 0.6, with interprocedural attribute
 inference: its gain is in small functions with early returns that are
 not inlined).
 
+## 0.6: interprocedural optimization
+
+The -O2 pipeline gains a whole-program layer (`ipo.tach`, `inline.tach`)
+around the per-function passes. In order:
+
+1. **Per function, -O1 pipeline** (as before): every function simplified
+   on its own.
+2. **Interprocedural constant propagation** (IPCP), over the call graph:
+   a parameter (or one piece of an aggregate passed in pieces) that every
+   direct call site passes the same constant is that constant in the
+   callee; a function whose every `ret` returns the same constant has its
+   call results replaced by it (the call stays, for its effects, until
+   attributes show it has none). Only internal functions: not `main`,
+   not `extern "C"` definitions, not address-taken (a function pointer
+   may reach them from anywhere). Signatures do not change (dead argument
+   *removal* would change the tachyon convention's register assignment
+   per function; the arguments are simply no longer read, and the
+   caller's computation of them dies when nothing else uses it).
+3. **Bottom-up over the call graph's strongly connected components**
+   (Tarjan; callees first), per function: tail recursion elimination,
+   **inlining**, the loop passes, LICM and **scalar promotion**, each
+   followed by the scalar pipeline; then the function's **attributes** are
+   inferred (callees are done, so their attributes are known; a component
+   of several functions is iterated optimistically to a fixed point).
+4. **Global dead code elimination**: functions and generic instances no
+   one reaches from `main`, the `extern "C"` definitions and the
+   address-taken functions are not emitted.
+
+**The inliner's cost model.** The cost of inlining callee g at a call
+site is g's size (instructions that become code, after g was itself
+optimized: bottom-up order), minus a bonus for each constant argument
+whose parameter decides a branch, switch or division in g (10 each: the
+copy will fold), minus the call's own cost (the argument moves, the
+call, the result). The threshold is 30, doubled inside a loop and again
+in a loop nest, 0 in a cold block (one that leads only to a panic or a
+call of a `#[cold]` function). A function with a single call site that
+is not address-taken or global is inlined up to 400 (it is then not
+emitted). Never inlined: calls within one component (recursion), a
+function that calls `setjmp` or the like (or into one), and calls past
+the caller's size budget (3000) or the program's growth budget (the sum
+of all sizes may grow by half, plus 2000). `#[inline]` inlines whenever
+possible (no budget), `#[inline(never)]` never, `#[cold]` never and makes
+its call sites cold. Inlining iterates: after the inlined copies are
+simplified (constants propagated into them), their own calls are
+considered again, up to three rounds.
+
+**Function attributes** (`--print-attrs` prints them), inferred per
+function from its instructions and its callees' attributes:
+
+| attribute | meaning |
+|---|---|
+| `readnone` | reads and writes no memory but its own private frame slots |
+| `readonly` | writes no memory but its private slots |
+| `noreturn` | never returns (every path ends in a panic or a noreturn call) |
+| `willreturn` | always returns: no loop, no recursion, only willreturn callees |
+| `nopanic` | cannot panic or exit: no bounds check, no `as E` check, only nopanic callees |
+| `nocapture(i)` | pointer parameter i is only dereferenced, compared or passed to nocapture parameters: it is not stored, returned or converted |
+
+A C function (`extern "C"` import), an indirect call and a function that
+calls one are unknown: none of these. The run-time panic is noreturn and
+writes nothing a later instruction could see. Uses: a call of a
+`readonly` function is not a memory barrier for load forwarding and
+LICM (it writes nothing); a call of a `readnone`, `willreturn`, `nopanic`
+function whose result is unused is removed, and two such calls with
+equal arguments are one (GVN).
+
+**Scalar promotion** (LLVM's "promote memory to register" in LICM): a
+memory location accessed in a loop only by loads and stores of one type
+at one loop-invariant address, in a frame slot or a static, where no
+other access in the loop may overlap it, lives in a register for the
+loop: it is loaded in the preheader, its loads and stores become SSA
+values (the SSA updater places the phis), and when the loop stores to it,
+it is stored back in each exit. Accesses to the same object at variable
+offsets are disjoint when the value ranges at their blocks (bounds
+checks, loop counters) keep them apart: `vm.stack[vm.sp]` does not
+overlap `vm.sp`. Calls in the loop must not reach the location (a
+private slot, or a readnone callee).
+
+**Value ranges, extended:** the range of a sum, difference, product or
+left shift of two ranged values (interval arithmetic, given up on
+overflow), with the facts of the block applied to every operand, not
+only to the value compared. With IPCP this removes the bounds checks of a
+function whose slice lengths come from its callers as constants
+(`stencil`'s `sweep`).
+
+**Escape analysis (heap to stack):** a `malloc` or `calloc` of a small
+constant size whose result is only dereferenced and finally passed to
+`free` (on every path) becomes a frame slot (zeroed for `calloc`), and
+the `free` goes; SROA can then take it apart.
+
+**Function specialization:** a call passing a function pointer constant
+(an `FADDR`) to an internal function whose body calls that parameter is
+redirected to a copy of the callee with the parameter replaced by the
+constant (so the indirect call becomes direct and can be inlined), under
+a budget of copies.
+
 ## Not yet
 
 Planned in [roadmap.md](roadmap.md): induction variable narrowing, a

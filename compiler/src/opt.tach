@@ -19,6 +19,8 @@ use crate::lsr::*;
 use crate::range::*;
 use crate::scev::*;
 use crate::tre::*;
+use crate::ipo::*;
+use crate::promote::*;
 use crate::regalloc::*;
 
 pub static mut OPT_LEVEL: i64 = 2;
@@ -406,7 +408,7 @@ pub fn eliminate_dead_code(fi: i64) -> bool {
         }
         let mut v = BLOCKS[b].first;
         while v != 0 {
-            if INSTS[v].op.has_side_effect() {
+            if has_effect(v) {
                 mark_live(v, &work);
             }
             v = INSTS[v].next;
@@ -462,9 +464,15 @@ fn cleanup_function(fi: i64) {
     verify_func(fi, c"lowering, inlining and cleanup");
 }
 
+// After inlining into fi: the cleanup and the scalar pipeline.
+pub fn optimize_after_inlining(fi: i64) {
+    cleanup_function(fi);
+    simplify_function(fi);
+}
+
 // The scalar pipeline (-O1), twice: constants, peepholes, control flow,
 // value numbering, dead code.
-fn simplify_function(fi: i64) {
+pub fn simplify_function(fi: i64) {
     for round in 0..2 {
         sccp(fi);
         verify_func(fi, c"sccp");
@@ -505,16 +513,23 @@ pub fn optimize_program() {
     if OPT_LEVEL < 2 {
         return;
     }
-    // -O2: inlining bottom-up, then loop-invariant code motion.
+    // -O2: interprocedural constants, then bottom-up over the call graph's
+    // components: tail recursion, inlining, the loop passes, scalar
+    // promotion and loop-invariant code motion, and each component's
+    // attributes (docs/optimizer.md, 0.6).
     FN_SCC = alloc_array::<i64>(IRFUNC_COUNT + 1);
     FN_SIZE = alloc_array::<i64>(IRFUNC_COUNT + 1);
     FN_CALLS = alloc_array::<i64>(IRFUNC_COUNT + 1);
     FN_ADDRESS = alloc_array::<i64>(IRFUNC_COUNT + 1);
+    init_attrs();
+    count_call_sites();
+    compute_sccs();
+    propagate_constants();
     for fi in 0..IRFUNC_COUNT {
         FN_SIZE[fi] = func_size(fi);
     }
-    count_call_sites();
-    compute_sccs();
+    start_inlining_budget();
+    let mut component_start = 0;
     for i in 0..SCC_ORDER.count {
         let fi = SCC_ORDER.data[i];
         IRF = fi;
@@ -522,10 +537,7 @@ pub fn optimize_program() {
             cleanup_function(fi);
             simplify_function(fi);
         }
-        if inline_calls(fi) {
-            cleanup_function(fi);
-            simplify_function(fi);
-        }
+        inline_rounds(fi);
         if optimize_loops(fi) {
             simplify_function(fi);
         }
@@ -534,9 +546,21 @@ pub fn optimize_program() {
             verify_func(fi, c"licm");
             simplify_function(fi);
         }
+        // After LICM: the addresses of slots and statics are out of the
+        // loops by then.
+        if promote_loop_memory(fi) {
+            simplify_function(fi);
+        }
         FN_SIZE[fi] = func_size(fi);
+        if i + 1 == SCC_ORDER.count || FN_SCC[SCC_ORDER.data[i + 1]] != FN_SCC[fi] {
+            infer_component_attrs(component_start, i + 1);
+            component_start = i + 1;
+        }
     }
     remove_dead_functions();
+    if PRINT_ATTRS {
+        print_attrs();
+    }
 }
 
 // -O2's loop passes (loops.tach and the files after it), before LICM.

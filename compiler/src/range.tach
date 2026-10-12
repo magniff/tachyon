@@ -222,7 +222,7 @@ fn range_of(v: i64, lo: *i64, hi: *i64, depth: i64) {
             let m = if c < 0 { 0 - c } else { c };
             let mut alo = 0;
             let mut ahi = 0;
-            range_of(a, &alo, &ahi, depth + 1);
+            range_with_facts(a, &alo, &ahi, depth + 1);
             *lo = if alo >= 0 { 0 } else { 1 - m };
             *hi = if ahi <= 0 { 0 } else { m - 1 };
         }
@@ -238,31 +238,99 @@ fn range_of(v: i64, lo: *i64, hi: *i64, depth: i64) {
         if int_bits(from) < int_bits(ty) || (int_bits(from) == int_bits(ty) && is_signed(from) == is_signed(ty)) {
             let mut alo = 0;
             let mut ahi = 0;
-            range_of(a, &alo, &ahi, depth + 1);
+            range_with_facts(a, &alo, &ahi, depth + 1);
             // Widening keeps the value when it fits the new type.
             if alo >= type_min(ty) && ahi <= type_max(ty) && (is_signed(ty) || alo >= 0) {
                 *lo = alo;
                 *hi = ahi;
             }
         }
-    } else if op == Op::Add && is_const(b) {
-        let c = INSTS[b].imm;
+    } else if op == Op::Add || op == Op::Sub || op == Op::Mul || op == Op::Shl {
+        // Interval arithmetic on the operands' ranges (with the facts of
+        // the block applied to them), given up when a bound could leave
+        // the type or overflow.
         let mut alo = 0;
         let mut ahi = 0;
-        range_of(a, &alo, &ahi, depth + 1);
+        let mut blo = 0;
+        let mut bhi = 0;
+        range_with_facts(a, &alo, &ahi, depth + 1);
+        range_with_facts(b, &blo, &bhi, depth + 1);
         let big = 4611686018427387904;
-        if alo > 0 - big && ahi < big && c > 0 - big && c < big
-            && alo + c >= type_min(ty) && ahi + c <= type_max(ty)
-            && (is_signed(ty) || int_bits(ty) < 64 || alo + c >= 0) {
-            *lo = alo + c;
-            *hi = ahi + c;
+        let small = 2147483648;
+        let mut rlo = 0;
+        let mut rhi = 0;
+        let mut ok = false;
+        if op == Op::Add || op == Op::Sub {
+            if alo > 0 - big && ahi < big && blo > 0 - big && bhi < big {
+                ok = true;
+                if op == Op::Add {
+                    rlo = alo + blo;
+                    rhi = ahi + bhi;
+                } else {
+                    rlo = alo - bhi;
+                    rhi = ahi - blo;
+                }
+            }
+        } else if op == Op::Mul {
+            if alo > 0 - small && ahi < small && blo > 0 - small && bhi < small {
+                ok = true;
+                let p1 = alo * blo;
+                let p2 = alo * bhi;
+                let p3 = ahi * blo;
+                let p4 = ahi * bhi;
+                rlo = lesser(lesser(p1, p2), lesser(p3, p4));
+                rhi = greater(greater(p1, p2), greater(p3, p4));
+            }
+        } else if blo == bhi && blo >= 0 && blo < 32 && alo >= 0 && ahi < small {
+            ok = true;
+            rlo = alo << blo as u64;
+            rhi = ahi << blo as u64;
+        }
+        if ok && rlo >= type_min(ty) && rhi <= type_max(ty)
+            && (is_signed(ty) || int_bits(ty) < 64 || rlo >= 0) {
+            *lo = rlo;
+            *hi = rhi;
         }
     }
 }
 
+fn lesser(a: i64, b: i64) -> i64 {
+    if a < b { a } else { b }
+}
+
+fn greater(a: i64, b: i64) -> i64 {
+    if a > b { a } else { b }
+}
+
+// The range of v, with the facts in FACTS that compare v itself with a
+// constant applied.
+fn range_with_facts(v: i64, lo: *i64, hi: *i64, depth: i64) {
+    range_of(v, lo, hi, depth);
+    narrow_by_facts(v, lo, hi);
+}
+
 // The range of v at a block whose facts are in FACTS.
 fn range_at(v: i64, lo: *i64, hi: *i64) {
-    range_of(v, lo, hi, 0);
+    range_with_facts(v, lo, hi, 0);
+}
+
+// Prepares the range queries of value_range_at for function fi: its
+// loops and their facts (again after its control flow changes).
+pub fn prepare_ranges(fi: i64) {
+    analyze_loops(fi);
+    make_loop_facts();
+}
+
+// The range of integer value v at block b (the signed 64-bit view of its
+// canonical value): from its operations and the facts that hold at b.
+pub fn value_range_at(v: i64, b: i64, lo: *i64, hi: *i64) {
+    collect_facts(b);
+    range_at(v, lo, hi);
+}
+
+// Narrows [*lo, *hi], the range of v, by the facts in FACTS comparing v
+// with a constant.
+fn narrow_by_facts(v: i64, lo: *i64, hi: *i64) {
     let mut i = 0;
     while i < FACTS.count {
         let f = FACTS.data[i];
