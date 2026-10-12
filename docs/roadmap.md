@@ -368,6 +368,11 @@ matters to agents above all.
   31 rewrite rules in a small pattern language, cost-based extraction,
   and `tachyonc --check-rules` (randomized differential checking of
   every rule at every integer width); `--no-egraph` to compare
+- gate (on 249e3d1): bootstrap --dev fixpoint ok, 346 tests at -O0/1/2
+  on aarch64-macos and x86_64-macos, fuzz 200 per mode, ABI 50 (plain,
+  import, header), objcheck 404/404; x86_64-linux in a container: chain,
+  tests at every level, fuzz 80, ABI 30 x3, objcheck, header layout;
+  self-compile -O2 670 -> 703 ms (see Benchmarks, 0.9)
 - in progress: -
 - remaining (moved to 0.10): GVN-PRE; a checking mode for unsafe code
   (pointers carrying bounds); migrating the compiler's own source to
@@ -623,3 +628,18 @@ s to assemble the 5 MB of text; the compiler's own assembler, reading the
 same text, about 45 ms. The test suite's wall time is unchanged (17.4 s,
 mostly starting and linking 315 programs). Run time: the code is the same
 as with 0.6 (the objects hold exactly the assembly 0.6 would write).
+
+### 0.9
+
+Compile time, the compiler building itself to an object (the 0.9 source,
+about 44,000 lines; aarch64-macos, `--time-passes` total, best of 5; 0.9
+with `--allow-unsafe`):
+
+| | -O0 | -O2 |
+|---|---|---|
+| 0.8.0 | 87 ms | 670 ms |
+| 0.9 | 86 ms | 703 ms |
+| 0.9, `--no-egraph` | | 671 ms |
+
+The unsafe checks and traits cost nothing measurable; the e-graph's
+rewrite rules cost 4.7% at -O2 (within the 10% allowed).
