@@ -40,6 +40,9 @@ static mut LOCAL_CAP: i64 = 0;
 pub static mut ENV: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 static mut SCOPES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 static mut LOOP_STACK: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// While checking a deferred statement (0.6): the LOOP_STACK depth at it
+// (loops below it cannot be left from it); -1 elsewhere.
+static mut DEFER_LOOP_BASE: i64 = -1;
 pub static mut RETURN_TYPE: i64 = 0;
 // In constant expressions no locals are visible.
 pub static mut CONST_CONTEXT: bool = false;
@@ -193,6 +196,7 @@ fn check_function_recovering(item: i64) {
 struct CheckState {
     env: i64, scopes: i64, loops: i64, module: i64, self_ty: i64, tp_base: i64, tp_count: i64,
     inst: i64, ret: i64, tscratch: i64, scratch: i64, const_context: bool,
+    defer_base: i64,
 }
 
 fn save_check_state() -> CheckState {
@@ -200,7 +204,7 @@ fn save_check_state() -> CheckState {
         env: ENV.count, scopes: SCOPES.count, loops: LOOP_STACK.count, module: CUR_MOD,
         self_ty: SELF_TYPE, tp_base: TP_BASE, tp_count: TP_NAMES.count, inst: CUR_INST,
         ret: RETURN_TYPE, tscratch: TSCRATCH.count, scratch: SCRATCH.count,
-        const_context: CONST_CONTEXT,
+        const_context: CONST_CONTEXT, defer_base: DEFER_LOOP_BASE,
     }
 }
 
@@ -208,6 +212,7 @@ fn restore_check_state(s: CheckState) {
     ENV.count = s.env;
     SCOPES.count = s.scopes;
     LOOP_STACK.count = s.loops;
+    DEFER_LOOP_BASE = s.defer_base;
     CUR_MOD = s.module;
     SELF_TYPE = s.self_ty;
     TP_BASE = s.tp_base;
@@ -371,6 +376,7 @@ pub fn add_fn(item: i64, name: i64, display: i64) {
         self_ty: 0, export: kind == Fn && NODES[item].y != 0,
         display: display, generic: generic_count(NODES[item].g), tmpl: 0, targs: 0, targ_count: 0,
         origin: 0, parent: 0, depth: 0, module: module_of(item),
+        attrs: NODES[item].p & (FN_INLINE | FN_NO_INLINE | FN_COLD),
     };
     FN_COUNT += 1;
     NODES[item].x = FN_COUNT;
@@ -744,7 +750,7 @@ fn variant_and_method_error(item: i64, type_name: i64) -> ! {
     err_end()
 }
 
-fn template_variant_named(e: i64, name: i64) -> bool {
+pub fn template_variant_named(e: i64, name: i64) -> bool {
     let item = ENUMS[e].node;
     for i in 0..NODES[item].count {
         if NODES[child(item, i)].a == name {
@@ -811,7 +817,8 @@ fn find_generic_method(tpl: i64, name: i64) -> i64 {
 fn collect_aliases() {
     for i in 0..NODES[PROGRAM].count {
         let item = child(PROGRAM, i);
-        if NODES[item].kind == TypeAlias {
+        // (generic aliases (0.6) are resolved where they are used)
+        if NODES[item].kind == TypeAlias && NODES[item].g == 0 {
             CUR_MOD = module_of(item);
             resolve_alias(qualify(CUR_MOD, NODES[item].a), NODES[item].start);
         }
@@ -1097,14 +1104,56 @@ fn resolve_type_name(n: i64) -> i64 {
         push_written_targs(g);
         return template_instance(tpl, mark, NODES[n].start);
     }
+    if g != 0 && SYM_ALIAS[key] != 0 && NODES[SYM_ALIAS[key]].g != 0 {
+        return generic_alias(key, g, NODES[n].start);
+    }
     if g != 0 {
         name_error(NODES[n].start, c"'", name, c"' is not generic");
     }
     resolve_key(key, name, NODES[n].start)
 }
 
+// `Pair<i64>` of a generic alias (0.6): its type with its parameters bound
+// to the arguments written in `g` (resolved here), in its own module.
+fn generic_alias(key: i64, g: i64, pos: i64) -> i64 {
+    let alias = SYM_ALIAS[key];
+    let params = NODES[alias].g;
+    if NODES[g].count != NODES[params].count {
+        err_begin(pos);
+        err_str(c"type alias '");
+        err_sym(NODES[alias].a);
+        err_str(c"' takes ");
+        err_int(NODES[params].count);
+        err_str(if NODES[params].count == 1 { c" type argument, got " } else { c" type arguments, got " });
+        err_int(NODES[g].count);
+        err_end();
+    }
+    if ALIAS_BUSY[key] != 0 {
+        name_error(pos, c"type alias '", NODES[alias].a, c"' is defined in terms of itself");
+    }
+    let mark = TSCRATCH.count;
+    push_written_targs(g);
+    let saved = TP_BASE;
+    let saved_mod = CUR_MOD;
+    TP_BASE = TP_NAMES.count;
+    for i in 0..NODES[params].count {
+        TP_NAMES.push(NODES[child(params, i)].a);
+        TP_TYPES.push(TSCRATCH.data[mark + i]);
+    }
+    TSCRATCH.count = mark;
+    CUR_MOD = module_of(alias);
+    ALIAS_BUSY[key] = 1;
+    let t = resolve_type(NODES[alias].b);
+    ALIAS_BUSY[key] = 0;
+    CUR_MOD = saved_mod;
+    TP_NAMES.count = TP_BASE;
+    TP_TYPES.count = TP_BASE;
+    TP_BASE = saved;
+    t
+}
+
 // The key a TyName names (through its module path), or -1.
-fn type_name_key(n: i64) -> i64 {
+pub fn type_name_key(n: i64) -> i64 {
     let name = NODES[n].a;
     let mut m = CUR_MOD;
     let mut b = 0;
@@ -1118,7 +1167,7 @@ fn type_name_key(n: i64) -> i64 {
         b = lookup_name(m, name, CUR_MOD);
     }
     if binding_kind(b) == B_PRIVATE {
-        private_error(NODES[n].start, name);
+        access_error(b, NODES[n].start, name);
     }
     if binding_kind(b) != B_ITEM {
         return -1;
@@ -1139,7 +1188,7 @@ pub fn resolve_named(name: i64, pos: i64) -> i64 {
     }
     let b = lookup_name(CUR_MOD, name, CUR_MOD);
     if binding_kind(b) == B_PRIVATE {
-        private_error(pos, name);
+        access_error(b, pos, name);
     }
     if binding_kind(b) != B_ITEM {
         unknown_name_error(pos, c"unknown type '", name);
@@ -1176,6 +1225,15 @@ fn resolve_alias(key: i64, pos: i64) -> i64 {
         return ALIAS_TYPE[key];
     }
     let alias = SYM_ALIAS[key];
+    if NODES[alias].g != 0 {
+        err_begin(pos);
+        err_str(c"type alias '");
+        err_sym(NODES[alias].a);
+        err_str(c"' is generic: write its type arguments ('");
+        err_sym(NODES[alias].a);
+        err_str(c"<...>')");
+        err_end();
+    }
     if ALIAS_BUSY[key] != 0 {
         name_error(pos, c"type alias '", NODES[alias].a, c"' is defined in terms of itself");
     }
@@ -1203,6 +1261,7 @@ fn check_function(item: i64) {
     SELF_TYPE = FNS[f].self_ty;
     RETURN_TYPE = FNS[f].ret;
     LOOP_STACK.count = 0;
+    DEFER_LOOP_BASE = -1;
     ENV.count = 0;
     SCOPES.count = 0;
     for i in 0..NODES[item].count {
@@ -1281,9 +1340,24 @@ fn check_stmt(stmt: i64) -> bool {
     if NODES[stmt].kind == Let {
         return check_let(stmt);
     }
+    if NODES[stmt].kind == Defer {
+        return check_defer(stmt);
+    }
     let expr = NODES[stmt].a;
     let ty = if NODES[stmt].b != 0 { synth_expr(expr) } else { check_expr(expr, TY_UNIT) };
     ty == TY_NEVER
+}
+
+// `defer` (0.6): the deferred expression, of any type (its value is
+// dropped), may not leave it: no `return`, and `break`/`continue` only to
+// loops inside it. It is checked where it stands, so it sees the bindings
+// made before it.
+fn check_defer(stmt: i64) -> bool {
+    let saved = DEFER_LOOP_BASE;
+    DEFER_LOOP_BASE = LOOP_STACK.count;
+    synth_expr(NODES[stmt].a);
+    DEFER_LOOP_BASE = saved;
+    false
 }
 
 fn check_let(stmt: i64) -> bool {
@@ -1455,7 +1529,7 @@ fn struct_of_literal(n: i64) -> i64 {
     let m = if NODES[n].h != 0 { path_module(NODES[n].h, NODES[NODES[n].h].count) } else { CUR_MOD };
     let b = lookup_name(m, name, CUR_MOD);
     if binding_kind(b) == B_PRIVATE {
-        private_error(NODES[n].start, name);
+        access_error(b, NODES[n].start, name);
     }
     if binding_kind(b) != B_ITEM {
         return -1;
@@ -1732,7 +1806,7 @@ fn synth_name(n: i64) -> i64 {
     let b = if resolved { binding(B_ITEM, name) } else { lookup_name(CUR_MOD, name, CUR_MOD) };
     let kind = binding_kind(b);
     if kind == B_PRIVATE {
-        private_error(NODES[n].start, name);
+        access_error(b, NODES[n].start, name);
     }
     if kind == B_VARIANT {
         // A variant brought into scope by `use E::...;`: `E::V`.
@@ -1741,6 +1815,14 @@ fn synth_name(n: i64) -> i64 {
         NODES[n].a = VARIANTS[v].name;
         NODES[n].b = VARIANTS[v].name;
         NODES[n].y = enum_type(VARIANTS[v].enum_id);
+        return synth_expr(n);
+    }
+    if kind == B_TVARIANT {
+        // A variant of a generic enum (0.6): its type arguments inferred
+        // (`y` < 0: the template; see path_target).
+        NODES[n].kind = Path;
+        NODES[n].b = name;
+        NODES[n].y = -binding_value(b) - 1;
         return synth_expr(n);
     }
     if kind == B_MODULE {
@@ -1806,6 +1888,30 @@ const NODE_RESOLVED: i64 = 2;
 pub fn used_variant(name: i64) -> i64 {
     let b = lookup_name(CUR_MOD, name, CUR_MOD);
     if binding_kind(b) == B_VARIANT { binding_value(b) } else { -1 }
+}
+
+// The enum type of the variant `name` in scope, in a pattern (p) against
+// a value of type `ty`, or 0 when `name` is no variant: a generic enum's
+// variant (0.6) takes the instance `ty`.
+pub fn used_variant_enum(name: i64, ty: i64, p: i64) -> i64 {
+    let b = lookup_name(CUR_MOD, name, CUR_MOD);
+    if binding_kind(b) == B_VARIANT {
+        return enum_type(VARIANTS[binding_value(b)].enum_id);
+    }
+    if binding_kind(b) != B_TVARIANT {
+        return 0;
+    }
+    let e = binding_value(b);
+    if !instance_of(ty, -e - 1) {
+        err_begin(NODES[p].start);
+        err_str(c"expected '");
+        err_type(ty);
+        err_str(c"', got a pattern of '");
+        err_sym(ENUMS[e].name);
+        err_str(c"'");
+        err_end();
+    }
+    ty
 }
 
 // Whether `name` is a constant in the current scope (its index + 1, or 0).
@@ -2179,9 +2285,24 @@ fn synth_binary(n: i64) -> i64 {
         return TY_BOOL;
     }
     if op == Tok::EqEq || op == Tok::BangEq {
-        if !(is_numeric(ty) || ty == TY_BOOL || is_pointer(ty) || is_fn_type(ty)
-            || is_fieldless_enum(ty)) {
-            type_error_got(n, c"equality requires numeric, bool, pointer or fieldless enum type", ty);
+        if ty == TY_NEVER || ty == TY_ERROR {
+            return TY_BOOL;
+        }
+        let bad = eq_unsupported(ty);
+        if bad != 0 {
+            if bad == ty {
+                type_error_got(n, c"equality requires numeric, bool, pointer or enum type, or a struct, tuple or array of them", ty);
+            }
+            err_begin(NODES[n].start);
+            err_str(c"cannot compare '");
+            err_type(ty);
+            err_str(c"' with ==: it holds a '");
+            err_type(bad);
+            err_str(c"', which has no ==");
+            err_end();
+        }
+        if is_compound(ty) {
+            structural_eq(n, ty);
         }
         return TY_BOOL;
     }
@@ -2195,6 +2316,278 @@ fn synth_binary(n: i64) -> i64 {
         type_error_got(n, c"bitwise operator requires integer type", ty);
     }
     ty
+}
+
+// ---- Structural equality (0.6) ----
+//
+// `a == b` on a struct, tuple, array or enum with fields compares field by
+// field (floats as floats: NaN differs from itself); `!=` is its negation.
+// The checker rewrites the comparison in place into a block it checks:
+//     { let l = a; let r = b; l.f == r.f && l.g == r.g }        (struct)
+//     { let l = a; let r = b; l.0 == r.0 && ... }               (tuple)
+//     { let l = a; let r = b; let mut i = 0; let mut e = true;
+//       while e && i < N { e = l[i] == r[i]; i += 1; } e }      (array)
+//     { let l = a; let r = b; match (l, r) {
+//         (E::V(x0, x1), E::V(y0, y1)) => x0 == y0 && x1 == y1,
+//         ..., _ => false } }                                   (enum)
+// whose inner comparisons are rewritten the same way when compound.
+
+// 0 when values of type `ty` can be compared with ==, else a type in it
+// that cannot.
+fn eq_unsupported(ty: i64) -> i64 {
+    if is_numeric(ty) || ty == TY_BOOL || is_pointer(ty) || is_fn_type(ty) || is_fieldless_enum(ty) {
+        return 0;
+    }
+    let kind = TYPES[ty].kind;
+    if kind == TyKind::Struct {
+        let s = TYPES[ty].a;
+        if (STRUCTS[s].repr & REPR_UNION) != 0 {
+            return ty;
+        }
+        for i in 0..STRUCTS[s].field_count {
+            let bad = eq_unsupported((*struct_field(s, i)).ty);
+            if bad != 0 { return bad; }
+        }
+        return 0;
+    }
+    if kind == TyKind::Tuple {
+        for i in 0..TYPES[ty].count {
+            let bad = eq_unsupported(type_elem(ty, i));
+            if bad != 0 { return bad; }
+        }
+        return 0;
+    }
+    if kind == TyKind::Array {
+        return eq_unsupported(TYPES[ty].a);
+    }
+    if kind == TyKind::Enum {
+        let e = TYPES[ty].a;
+        for i in 0..ENUMS[e].variant_count {
+            let v = enum_variant(e, i);
+            for k in 0..VARIANTS[v].field_count {
+                let bad = eq_unsupported(variant_field(v, k));
+                if bad != 0 { return bad; }
+            }
+        }
+        return 0;
+    }
+    ty
+}
+
+fn eq_ident(name: i64, pos: i64) -> i64 {
+    let n = new_node(Ident, pos, pos);
+    NODES[n].a = name;
+    n
+}
+
+fn eq_binary(op: Tok, lhs: i64, rhs: i64, pos: i64) -> i64 {
+    let n = new_node(Binary, pos, pos);
+    NODES[n].op = op;
+    NODES[n].b = lhs;
+    NODES[n].c = rhs;
+    n
+}
+
+fn eq_bool(value: bool, pos: i64) -> i64 {
+    let n = new_node(Bool, pos, pos);
+    NODES[n].a = value as i64;
+    n
+}
+
+fn eq_int(value: i64, pos: i64) -> i64 {
+    let n = new_node(Int, pos, pos);
+    NODES[n].a = value;
+    NODES[n].b = SUF_NONE;
+    n
+}
+
+fn eq_bind(name: i64, mutable: bool, pos: i64) -> i64 {
+    let p = new_node(PatBind, pos, pos);
+    NODES[p].a = name;
+    NODES[p].b = mutable as i64;
+    p
+}
+
+fn eq_let(pattern: i64, init: i64, pos: i64) -> i64 {
+    let n = new_node(Let, pos, pos);
+    NODES[n].a = pattern;
+    NODES[n].c = init;
+    n
+}
+
+fn eq_stmt(expr: i64, pos: i64) -> i64 {
+    let n = new_node(ExprStmt, pos, pos);
+    NODES[n].a = expr;
+    NODES[n].b = 1;
+    n
+}
+
+fn eq_assign(op: Tok, target: i64, value: i64, pos: i64) -> i64 {
+    let n = new_node(Assign, pos, pos);
+    NODES[n].op = op;
+    NODES[n].b = target;
+    NODES[n].c = value;
+    n
+}
+
+// `parts` conjoined with &&, `true` for none.
+fn eq_and(mark: i64, pos: i64) -> i64 {
+    let count = SCRATCH.count - mark;
+    if count == 0 {
+        return eq_bool(true, pos);
+    }
+    let mut e = SCRATCH.data[mark];
+    for i in 1..count {
+        e = eq_binary(Tok::AmpAmp, e, SCRATCH.data[mark + i], pos);
+    }
+    SCRATCH.count = mark;
+    e
+}
+
+// The comparison of the values named `l` and `r` (of type `ty`), as
+// unchecked nodes.
+fn eq_compare(ty: i64, l: i64, r: i64, pos: i64) -> i64 {
+    let kind = TYPES[ty].kind;
+    if kind == TyKind::Struct {
+        let s = TYPES[ty].a;
+        let mark = SCRATCH.count;
+        for i in 0..STRUCTS[s].field_count {
+            let name = (*struct_field(s, i)).name;
+            let a = new_node(FieldAccess, pos, pos);
+            NODES[a].a = eq_ident(l, pos);
+            NODES[a].b = name;
+            let b = new_node(FieldAccess, pos, pos);
+            NODES[b].a = eq_ident(r, pos);
+            NODES[b].b = name;
+            SCRATCH.push(eq_binary(Tok::EqEq, a, b, pos));
+        }
+        return eq_and(mark, pos);
+    }
+    if kind == TyKind::Tuple {
+        let mark = SCRATCH.count;
+        for i in 0..TYPES[ty].count {
+            let a = new_node(TupleField, pos, pos);
+            NODES[a].a = eq_ident(l, pos);
+            NODES[a].b = i;
+            let b = new_node(TupleField, pos, pos);
+            NODES[b].a = eq_ident(r, pos);
+            NODES[b].b = i;
+            SCRATCH.push(eq_binary(Tok::EqEq, a, b, pos));
+        }
+        return eq_and(mark, pos);
+    }
+    if kind == TyKind::Array {
+        let i_name = intern_c(c"==i");
+        let e_name = intern_c(c"==e");
+        let block = new_node(Block, pos, pos);
+        let li = new_node(Index, pos, pos);
+        NODES[li].a = eq_ident(l, pos);
+        NODES[li].b = eq_ident(i_name, pos);
+        let ri = new_node(Index, pos, pos);
+        NODES[ri].a = eq_ident(r, pos);
+        NODES[ri].b = eq_ident(i_name, pos);
+        let body = new_node(Block, pos, pos);
+        let body_mark = list_begin();
+        list_push(eq_stmt(eq_assign(Tok::Eq, eq_ident(e_name, pos), eq_binary(Tok::EqEq, li, ri, pos), pos), pos));
+        list_push(eq_stmt(eq_assign(Tok::PlusEq, eq_ident(i_name, pos), eq_int(1, pos), pos), pos));
+        list_end(body, body_mark);
+        let w = new_node(While, pos, pos);
+        NODES[w].b = eq_binary(Tok::AmpAmp, eq_ident(e_name, pos),
+            eq_binary(Tok::Lt, eq_ident(i_name, pos), eq_int(TYPES[ty].b, pos), pos), pos);
+        NODES[w].c = body;
+        let mark = list_begin();
+        list_push(eq_let(eq_bind(i_name, true, pos), eq_int(0, pos), pos));
+        list_push(eq_let(eq_bind(e_name, true, pos), eq_bool(true, pos), pos));
+        list_push(eq_stmt(w, pos));
+        list_end(block, mark);
+        NODES[block].a = eq_ident(e_name, pos);
+        return block;
+    }
+    // An enum with fields: a match on the pair.
+    let e = TYPES[ty].a;
+    let m = new_node(Match, pos, pos);
+    let pair = new_node(Tuple, pos, pos);
+    let pair_mark = list_begin();
+    list_push(eq_ident(l, pos));
+    list_push(eq_ident(r, pos));
+    list_end(pair, pair_mark);
+    NODES[m].a = pair;
+    let arms = list_begin();
+    for i in 0..ENUMS[e].variant_count {
+        let v = enum_variant(e, i);
+        let count = VARIANTS[v].field_count;
+        let pats = new_node(PatTuple, pos, pos);
+        let pats_mark = list_begin();
+        for side in 0..2 {
+            let pv = new_node(PatVariant, pos, pos);
+            NODES[pv].a = ENUMS[e].name;
+            NODES[pv].b = VARIANTS[v].name;
+            NODES[pv].c = (count > 0) as i64;
+            NODES[pv].y = ty;
+            let fields_mark = list_begin();
+            for k in 0..count {
+                list_push(eq_bind(eq_field_name(side, k), false, pos));
+            }
+            list_end(pv, fields_mark);
+            list_push(pv);
+        }
+        list_end(pats, pats_mark);
+        let mark = SCRATCH.count;
+        for k in 0..count {
+            SCRATCH.push(eq_binary(Tok::EqEq, eq_ident(eq_field_name(0, k), pos), eq_ident(eq_field_name(1, k), pos), pos));
+        }
+        let body = eq_and(mark, pos);
+        let arm = new_node(Arm, pos, pos);
+        NODES[arm].a = pats;
+        NODES[arm].c = body;
+        list_push(arm);
+    }
+    let arm = new_node(Arm, pos, pos);
+    NODES[arm].a = new_node(PatWild, pos, pos);
+    NODES[arm].c = eq_bool(false, pos);
+    NODES[arm].p = ARM_SYNTHETIC;
+    list_push(arm);
+    list_end(m, arms);
+    m
+}
+
+// The binding of field k of the left (side 0) or right value in an arm.
+fn eq_field_name(side: i64, k: i64) -> i64 {
+    let out = buf_new();
+    buf_str(out, if side == 0 { c"==x" } else { c"==y" });
+    buf_int(out, k);
+    intern(buf_slice(out))
+}
+
+// Rewrites the checked comparison `n` of two values of compound type `ty`
+// into the block above, checked.
+fn structural_eq(n: i64, ty: i64) {
+    let pos = NODES[n].start;
+    let l = intern_c(c"==l");
+    let r = intern_c(c"==r");
+    let pl = eq_bind(l, false, pos);
+    let pr = eq_bind(r, false, pos);
+    let block = new_node(Block, NODES[n].start, NODES[n].end);
+    let mark = list_begin();
+    list_push(eq_let(pl, NODES[n].b, pos));
+    list_push(eq_let(pr, NODES[n].c, pos));
+    list_end(block, mark);
+    let mut tail = eq_compare(ty, l, r, pos);
+    if NODES[n].op == Tok::BangEq {
+        let not = new_node(Unary, pos, pos);
+        NODES[not].op = Tok::Bang;
+        NODES[not].b = tail;
+        tail = not;
+    }
+    NODES[block].a = tail;
+    // The operands are checked already: only their bindings are made.
+    push_scope();
+    check_pattern(pl, ty);
+    check_pattern(pr, ty);
+    check_expr(tail, TY_BOOL);
+    pop_scope();
+    NODES[n] = NODES[block];
+    NODES[n].ty = TY_BOOL;
 }
 
 fn synth_unary(n: i64) -> i64 {
@@ -2334,6 +2727,16 @@ fn synth_call(n: i64) -> i64 {
             NODES[callee].y = enum_type(VARIANTS[v].enum_id);
             return synth_path_call(n, callee);
         }
+        if binding_kind(b) == B_TVARIANT {
+            // ... of a generic enum (0.6), its type arguments inferred.
+            NODES[callee].kind = Path;
+            NODES[callee].b = name;
+            NODES[callee].y = -binding_value(b) - 1;
+            return synth_path_call(n, callee);
+        }
+        if binding_kind(b) == B_PRIVATE {
+            access_error(b, NODES[callee].start, name);
+        }
         if binding_kind(b) == B_ITEM && SYM_FN[binding_value(b)] != 0 {
             return call_function(n, SYM_FN[binding_value(b)] - 1, NODES[callee].g);
         }
@@ -2425,9 +2828,14 @@ fn check_direct_call(n: i64, f: i64) -> i64 {
 static mut PATH_TPL: i64 = 0;
 
 fn path_target(n: i64) -> i64 {
-    if NODES[n].y != 0 {
+    if NODES[n].y > 0 {
         // Made by the checker from a variant in scope.
         return NODES[n].y;
+    }
+    if NODES[n].y < 0 {
+        // ... of a generic enum (0.6): its template.
+        PATH_TPL = NODES[n].y;
+        return -1;
     }
     let name = NODES[n].a;
     let member = NODES[n].b;
@@ -2459,14 +2867,14 @@ fn path_target(n: i64) -> i64 {
         }
     }
     if binding_kind(b) == B_PRIVATE {
-        private_error(NODES[n].start, name);
+        access_error(b, NODES[n].start, name);
     }
     if binding_kind(b) == B_MODULE {
         // `m::item`: the item, by key.
         let target = binding_value(b);
         let item = lookup_name(target, member, CUR_MOD);
         if binding_kind(item) == B_PRIVATE {
-            private_error(NODES[n].start, member);
+            access_error(item, NODES[n].start, member);
         }
         if binding_kind(item) == B_MODULE {
             name_error(NODES[n].start, c"'", member, c"' is a module, not a value");
@@ -2961,6 +3369,14 @@ fn check_mutable_name(ident: i64, target: i64) {
 
 // ---- Loops and jumps ----
 
+fn leave_defer_error(n: i64, keyword: *u8) {
+    err_begin(NODES[n].start);
+    err_str(c"'");
+    err_str(keyword);
+    err_str(c"' cannot leave a deferred statement");
+    err_end();
+}
+
 // The loop a `break`/`continue` refers to.
 fn find_loop(n: i64, keyword: *u8) -> i64 {
     let label = NODES[n].a;
@@ -2971,12 +3387,18 @@ fn find_loop(n: i64, keyword: *u8) -> i64 {
             err_str(c" outside of loop");
             err_end();
         }
+        if DEFER_LOOP_BASE >= LOOP_STACK.count {
+            leave_defer_error(n, keyword);
+        }
         return LOOP_STACK.data[LOOP_STACK.count - 1];
     }
     let mut i = LOOP_STACK.count - 1;
     while i >= 0 {
         let lp = LOOP_STACK.data[i];
         if NODES[lp].a == label {
+            if DEFER_LOOP_BASE > i {
+                leave_defer_error(n, keyword);
+            }
             return lp;
         }
         i -= 1;
@@ -3155,6 +3577,9 @@ fn check_break(n: i64) {
 
 fn check_return(n: i64) -> i64 {
     let value = NODES[n].a;
+    if DEFER_LOOP_BASE >= 0 {
+        type_error(n, c"'return' inside a deferred statement");
+    }
     if value != 0 {
         check_expr(value, RETURN_TYPE);
     } else if RETURN_TYPE != TY_UNIT && RETURN_TYPE != TY_NEVER {

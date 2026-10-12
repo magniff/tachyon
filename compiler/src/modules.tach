@@ -130,7 +130,31 @@ fn file_of(pos: i64) -> i64 {
 }
 
 pub fn module_of(n: i64) -> i64 {
-    FILES[file_of(NODES[n].start)].module
+    module_at(NODES[n].start)
+}
+
+// Inline modules (0.6): (start, end, module) for each `mod m { ... }`, the
+// positions of its braces.
+static mut INLINE_MODS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The module of the code at position `pos`: the innermost inline module
+// around it, else its file's.
+fn module_at(pos: i64) -> i64 {
+    let mut best = -1;
+    let mut best_start = -1;
+    let mut i = 0;
+    while i < INLINE_MODS.count {
+        let start = INLINE_MODS.data[i];
+        if start <= pos && pos < INLINE_MODS.data[i + 1] && start > best_start {
+            best = INLINE_MODS.data[i + 2];
+            best_start = start;
+        }
+        i += 3;
+    }
+    if best >= 0 {
+        return best;
+    }
+    FILES[file_of(pos)].module
 }
 
 pub fn child_module(m: i64, name: i64) -> i64 {
@@ -167,7 +191,14 @@ pub fn load_modules() {
     let mut i = 0;
     while i + 2 < TOK_COUNT {
         if TOKS[i].kind == Tok::Mod && TOKS[i + 1].kind == Tok::Ident && TOKS[i + 2].kind == Tok::Semi {
-            load_module(file_of(TOKS[i].start), i);
+            let f = file_of(TOKS[i].start);
+            if module_at(TOKS[i].start) != FILES[f].module {
+                error_at(TOKS[i].start, c"'mod name;' cannot be inside an inline module (a module's file is found from its file's module)");
+            }
+            load_module(f, i);
+        }
+        if TOKS[i].kind == Tok::Mod && TOKS[i + 1].kind == Tok::Ident && TOKS[i + 2].kind == Tok::LBrace {
+            add_inline_module(i);
         }
         i += 1;
     }
@@ -176,11 +207,13 @@ pub fn load_modules() {
     load_std_if_named();
 }
 
-// The standard library, when the program names it (`std::...`), once.
+// The standard library, when the program names it (`std::...`) or (0.6) a
+// name of the prelude, once.
 fn load_std_if_named() {
     for i in 0..TOK_COUNT - 1 {
-        if TOKS[i].kind == Tok::Ident && TOKS[i + 1].kind == Tok::ColonColon
-            && TOKS[i].value as i64 == intern_c(c"std") && STD_MODULE < 0 {
+        if TOKS[i].kind == Tok::Ident && STD_MODULE < 0
+            && ((TOKS[i + 1].kind == Tok::ColonColon && TOKS[i].value as i64 == intern_c(c"std"))
+                || is_prelude_name(TOKS[i].value as i64)) {
             let text = buf_new();
             std_source(text);
             let start = add_source(c"<std>", text);
@@ -189,6 +222,39 @@ fn load_std_if_named() {
             lex_range(start, FILES[FILE_COUNT - 1].end, false);
         }
     }
+}
+
+// `mod name { ... }` at token i (0.6): a child module of the module around
+// it, holding the code between the braces.
+fn add_inline_module(i: i64) {
+    let parent = module_at(TOKS[i].start);
+    let name = TOKS[i + 1].value as i64;
+    if child_module(parent, name) >= 0 {
+        err_begin(TOKS[i + 1].start);
+        err_str(c"module '");
+        err_sym(name);
+        err_str(c"' is declared twice");
+        err_end();
+    }
+    let public = i > 0 && TOKS[i - 1].kind == Tok::Pub;
+    // The matching closing brace.
+    let mut depth = 0;
+    let mut j = i + 2;
+    while j < TOK_COUNT {
+        if TOKS[j].kind == Tok::LBrace {
+            depth += 1;
+        } else if TOKS[j].kind == Tok::RBrace {
+            depth -= 1;
+            if depth == 0 {
+                break;
+            }
+        }
+        j += 1;
+    }
+    let m = add_module(name, parent, public);
+    INLINE_MODS.push(TOKS[i + 2].start);
+    INLINE_MODS.push(if j < TOK_COUNT { TOKS[j].start + 1 } else { TOKS[TOK_COUNT - 1].start + 1 });
+    INLINE_MODS.push(m);
 }
 
 fn load_module(f: i64, i: i64) {
@@ -273,6 +339,11 @@ pub const B_ITEM: i64 = 1;
 pub const B_MODULE: i64 = 2;
 pub const B_VARIANT: i64 = 3;
 pub const B_PRIVATE: i64 = 4;
+// A variant of a generic enum (0.6), by the enum's template (its ENUMS
+// index): its type arguments are inferred where it is used.
+pub const B_TVARIANT: i64 = 5;
+// An ambiguous name (0.6): two `*` imports bring different things.
+pub const B_AMBIGUOUS: i64 = -4;
 
 pub fn binding(kind: i64, value: i64) -> i64 {
     kind + value * 8
@@ -390,15 +461,15 @@ fn resolve_use(u: i64) -> i64 {
         if binding_kind(prefix) == B_MODULE {
             result = lookup_name(binding_value(prefix), name, m);
             if binding_kind(result) == B_PRIVATE {
-                private_error(NODES[id].start, name);
+                access_error(result, NODES[id].start, name);
             }
             if result == B_NONE {
                 unresolved_import(id, path);
             }
         } else if binding_kind(prefix) == B_ITEM && SYM_ENUM[binding_value(prefix)] != 0 {
             let e = SYM_ENUM[binding_value(prefix)] - 1;
-            let v = find_variant(e, name);
-            if v < 0 {
+            let v = enum_variant_binding(e, name);
+            if v == B_NONE {
                 err_begin(NODES[id].start);
                 err_str(c"enum '");
                 err_sym(ENUMS[e].name);
@@ -407,7 +478,7 @@ fn resolve_use(u: i64) -> i64 {
                 err_str(c"'");
                 err_end();
             }
-            result = binding(B_VARIANT, v);
+            result = v;
         } else {
             not_enum_or_module(path);
         }
@@ -444,6 +515,15 @@ fn unresolved_import(id: i64, path: i64) -> ! {
 
 pub fn private_error(pos: i64, name: i64) -> ! {
     name_error(pos, c"'", name, c"' is private")
+}
+
+// The error for a binding that cannot be used: private, or (0.6) brought
+// by two `*` imports.
+pub fn access_error(b: i64, pos: i64, name: i64) -> ! {
+    if b == B_AMBIGUOUS {
+        name_error(pos, c"'", name, c"' is ambiguous: more than one '*' import brings it (import it by name, or write its path)");
+    }
+    private_error(pos, name)
 }
 
 // What `name` stands for in module m, seen from code in module `from`.
@@ -492,31 +572,91 @@ fn lookup_uncached(m: i64, name: i64, from: i64, depth: i64) -> i64 {
             return resolve_use(u);
         }
     }
+    // `*` imports: two that bring different things make the name
+    // ambiguous (an error where it is used; 0.6, before the first won).
+    let mut globbed = B_NONE;
     for k in 0..count {
         let u = MODULE_USES[m].data[k];
         if !USE_ENTRIES[u].glob || !(inside || USE_ENTRIES[u].public) {
             continue;
         }
         let what = resolve_use(u);
+        let mut found = B_NONE;
         if binding_kind(what) == B_MODULE {
-            let found = lookup_uncached(binding_value(what), name, m, depth + 1);
-            if binding_kind(found) == B_ITEM || binding_kind(found) == B_MODULE || binding_kind(found) == B_VARIANT {
-                return found;
+            let item = lookup_uncached(binding_value(what), name, m, depth + 1);
+            let kind = binding_kind(item);
+            if kind == B_ITEM || kind == B_MODULE || kind == B_VARIANT || kind == B_TVARIANT {
+                found = item;
             }
         } else {
-            let e = SYM_ENUM[binding_value(what)] - 1;
-            let v = find_variant(e, name);
-            if v >= 0 {
-                return binding(B_VARIANT, v);
+            found = enum_variant_binding(SYM_ENUM[binding_value(what)] - 1, name);
+        }
+        if found != B_NONE {
+            if globbed == B_NONE {
+                globbed = found;
+            } else if globbed != found {
+                return B_AMBIGUOUS;
             }
         }
+    }
+    if globbed != B_NONE {
+        return globbed;
     }
     if MODULES[m].is_c {
         // The imported declarations see the root's names (its types
         // replace the headers' of the same names).
         return lookup_uncached(0, name, 0, depth + 1);
     }
+    if STD_MODULE >= 0 && m != STD_MODULE {
+        return prelude_lookup(name, m, depth);
+    }
     B_NONE
+}
+
+// Variant `name` of enum e: B_VARIANT, or B_TVARIANT for a generic enum,
+// or B_NONE.
+pub fn enum_variant_binding(e: i64, name: i64) -> i64 {
+    if ENUMS[e].generic > 0 {
+        if template_variant_named(e, name) {
+            return binding(B_TVARIANT, e);
+        }
+        return B_NONE;
+    }
+    let v = find_variant(e, name);
+    if v >= 0 { binding(B_VARIANT, v) } else { B_NONE }
+}
+
+// ---- The prelude (0.6) ----
+//
+// Names every module sees without `use`, after everything else (its own
+// items, its imports, its `*` imports): std's Option, Some, None, Result,
+// Ok, Err, Vec, print and println. The standard library is loaded when a
+// program names one of them (or `std`).
+
+pub fn is_prelude_name(name: i64) -> bool {
+    let names: [*u8; 9] = [c"Option", c"Some", c"None", c"Result", c"Ok", c"Err", c"Vec", c"print", c"println"];
+    for i in 0..9 {
+        if name == intern_c(names[i]) {
+            return true;
+        }
+    }
+    false
+}
+
+fn prelude_lookup(name: i64, m: i64, depth: i64) -> i64 {
+    if !is_prelude_name(name) {
+        return B_NONE;
+    }
+    let some = name == intern_c(c"Some") || name == intern_c(c"None");
+    let ok = name == intern_c(c"Ok") || name == intern_c(c"Err");
+    if some || ok {
+        let e = lookup_uncached(STD_MODULE, intern_c(if some { c"Option" } else { c"Result" }), m, depth + 1);
+        if binding_kind(e) != B_ITEM || SYM_ENUM[binding_value(e)] == 0 {
+            return B_NONE;
+        }
+        return enum_variant_binding(SYM_ENUM[binding_value(e)] - 1, name);
+    }
+    lookup_uncached(STD_MODULE, name, m, depth + 1)
 }
 
 // The module (or the item, for the last segment) named by the first
@@ -547,7 +687,7 @@ fn resolve_path(m: i64, path: i64, count: i64, pos: i64) -> i64 {
         }
         let found = lookup_name(here, name, m);
         if binding_kind(found) == B_PRIVATE {
-            private_error(NODES[seg].start, name);
+            access_error(found, NODES[seg].start, name);
         }
         if found == B_NONE {
             if i == 0 && name == SYM_STD && STD_MODULE >= 0 {

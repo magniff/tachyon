@@ -259,7 +259,20 @@ library (and reports several errors at once while it is written).
 - escape analysis: heap-to-stack for non-escaping `malloc`
 - shrink-wrapping (from 0.5): callee-saved registers and the frame only
   on the paths that need them
-- language: `defer`, `#[inline]` / `#[cold]` attributes
+- language (front end; see grammar.md, "Additions of 0.6"):
+  - [x] `defer`, on every way out of a block
+  - [x] `#[inline]`, `#[inline(never)]`, `#[cold]` (read by the optimizer
+    through `fn_attr_inline`/`fn_attr_cold`); attributes before `pub`
+  - [x] `if let`, `while let`
+  - [x] string literals are `[u8]` (breaking)
+  - [x] structural `==`/`!=` on structs, tuples, arrays, enums with fields
+  - [x] a prelude (Option, Some, None, Result, Ok, Err, Vec, print,
+    println); variants of generic enums by their own names
+  - [x] ambiguous `*` imports are an error where used (breaking: 0.5 took
+    the first)
+  - [x] inline modules, generic type aliases
+  - moved to 0.7: const generic lengths; `errno` (C macros that expand to
+    expressions)
 
 ## 0.7: equality saturation
 
