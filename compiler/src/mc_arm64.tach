@@ -490,17 +490,46 @@ pub fn ma_cmp(op: Cond, ty: i64, d: i64, a: i64, b: i64) {
     on();
 }
 
+// Sets the flags from a - imm, |imm| < 4096 (cmn for a negative one).
+fn ma_compare_imm(a: i64, imm: i64) {
+    o(if imm < 0 { c"    cmn " } else { c"    cmp " });
+    ma_r(a);
+    o(c", #");
+    oi(if imm < 0 { 0 - imm } else { imm });
+    on();
+}
+
+// Links a frame: saves the frame pointer and the return address, points
+// the frame pointer at them.
+pub fn ma_frame_link() {
+    ins(c"stp x29, x30, [sp, #-16]!");
+    ins(c"mov x29, sp");
+}
+
+// Unlinks it: sp from the frame pointer, which and the return address are
+// restored.
+pub fn ma_frame_unlink() {
+    ins(c"mov sp, x29");
+    ins(c"ldp x29, x30, [sp], #16");
+}
+
+// d = (a op imm), integers, |imm| < 4096.
+pub fn ma_cmp_imm(op: Cond, ty: i64, d: i64, a: i64, imm: i64) {
+    ma_compare_imm(a, imm);
+    o(c"    cset ");
+    ma_r(d);
+    o(c", ");
+    o(a64_condition(op, is_signed(ty), false));
+    on();
+}
+
 pub fn ma_cmp_branch(op: Cond, ty: i64, a: i64, b: i64, b_is_imm: bool, imm: i64, label: i64) {
     if b_is_imm && imm == 0 && (op == Cond::Eq || op == Cond::Ne) {
         ma_branch_bool(a, op == Cond::Ne, label);
         return;
     }
     if b_is_imm {
-        o(c"    cmp ");
-        ma_r(a);
-        o(c", #");
-        oi(imm);
-        on();
+        ma_compare_imm(a, imm);
     } else {
         ma_rr(c"cmp", a, b);
     }
@@ -612,12 +641,23 @@ fn ma_copy_chunk(load: *u8, store: *u8, dst: i64, src: i64, offset: i64) {
 // A jump through a table of 32-bit offsets (from the table) to labels:
 // entry `value - low` for register r, the default above the range.
 pub fn ma_jump_table(r: i64, low: i64, range: i64, default: i64, table: *i64) {
-    ma_lea(16, r, 0 - low);
+    // The index: the value itself when the cases start at 0.
+    let index = if low == 0 { r } else { 16 };
+    if low != 0 {
+        ma_lea(16, r, 0 - low);
+    }
     if range - 1 < 4096 {
-        ins_i(c"cmp x16, #", range - 1, c"");
+        o(c"    cmp ");
+        ma_r(index);
+        o(c", #");
+        oi(range - 1);
+        on();
     } else {
         a64_load_imm(17, (range - 1) as u64);
-        ins(c"cmp x16, x17");
+        o(c"    cmp ");
+        ma_r(index);
+        o(c", x17");
+        on();
     }
     o(c"    b.hi L");
     oi(default);
@@ -626,7 +666,10 @@ pub fn ma_jump_table(r: i64, low: i64, range: i64, default: i64, table: *i64) {
     o(c"    adr x17, L");
     oi(at);
     on();
-    ins(c"ldrsw x16, [x17, x16, lsl #2]");
+    o(c"    ldrsw x16, [x17, ");
+    ma_r(index);
+    o(c", lsl #2]");
+    on();
     ins(c"add x17, x17, x16");
     ins(c"br x17");
     ins(c".p2align 2");
@@ -722,11 +765,7 @@ pub fn ma_select(op: Cond, test: bool, compare: bool, cmp_ty: i64, lhs: i64, rhs
     } else if is_float(cmp_ty) {
         ma_compare(cmp_ty, lhs, rhs);
     } else if rhs < 0 {
-        o(c"    cmp ");
-        ma_r(lhs);
-        o(c", #");
-        oi(imm);
-        on();
+        ma_compare_imm(lhs, imm);
     } else {
         ma_rr(c"cmp", lhs, rhs);
     }

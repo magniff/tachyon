@@ -266,8 +266,14 @@ library (and reports several errors at once while it is written).
   noreturn), dead argument elimination, global DCE
 - function specialization on constant arguments
 - escape analysis: heap-to-stack for non-escaping `malloc`
-- shrink-wrapping (from 0.5): callee-saved registers and the frame only
-  on the paths that need them
+- [x] shrink-wrapping (from 0.5): the frame and the callee-saved
+  registers only on the paths that need them; jumps out of the frame's
+  region tear it down; panics outside it link a frame of their own; the
+  allocator keeps entry values in caller-saved registers until the first
+  call where it can
+- [x] back end: phi and loop-phi coalescing hints, x86-64 cmov operand
+  hints, comparisons with immediates (cmn on AArch64), jump tables
+  indexed by the value; `--stats` to measure the machine code
 - language (front end; see grammar.md, "Additions of 0.6"):
   - [x] `defer`, on every way out of a block
   - [x] `#[inline]`, `#[inline(never)]`, `#[cold]` (read by the optimizer

@@ -56,6 +56,7 @@ use crate::abi::*;
 use crate::target::*;
 use crate::ir::*;
 use crate::emit::*;
+use crate::mc_x86_64::is_commutative;
 use crate::ir::Op::*;
 
 pub const LOC_NONE: i64 = 1000000;
@@ -336,6 +337,11 @@ pub fn use_kind(v: i64, i: i64) -> i64 {
     }
     // x86-64's indexed forms address a frame slot from %rsp.
     if (op == LoadX || op == StoreX || op == Lea) && i == 0 && INSTS[operand].op == Slot {
+        return USE_NONE;
+    }
+    // An integer comparison with a constant that fits compares with an
+    // immediate.
+    if op == Cmp && i == 1 && is_cmp_imm_operand(v) {
         return USE_NONE;
     }
     if op.is_binary() && i == 1 && !is_float(INSTS[v].ty) && op != Div && op != Rem
@@ -858,10 +864,21 @@ fn add_hints(v: i64) {
     }
     if op == Select && X86 {
         // cmov into the register of the value it replaces: that value
-        // would like the select's register.
+        // would like the select's register. The select itself would like
+        // the register of an operand used only here (free once it is
+        // read): the one it replaces, else the other (an inverted cmov);
+        // either way no movq first.
         let b = tracked(INSTS[v].b);
         if b >= 0 && RV_HINT[b] < 0 && USES[INSTS[v].b] == 1 {
             RV_HINT[b] = t;
+        }
+        let a = tracked(INSTS[v].a);
+        if RV_HINT[t] < 0 {
+            if b >= 0 && USES[INSTS[v].b] == 1 {
+                RV_HINT[t] = b;
+            } else if a >= 0 && USES[INSTS[v].a] == 1 {
+                RV_HINT[t] = a;
+            }
         }
     }
 }
@@ -973,6 +990,23 @@ fn build_intervals() {
 
 // A phi operand would like its phi's register; a phi, the register of the
 // phi it flows into, else of an operand (coalescing them removes moves).
+// Whether value w's hint is only the operand it is computed from (see
+// add_hints), which a phi it flows into overrides: the phi's register
+// saves a move on the edge (a loop's back edge, often), the operand's
+// nothing on AArch64, and on x86-64 nothing either when the operation
+// commutes or has one operand (its result in the phi's register costs
+// the same move as in the operand's).
+fn operand_hint_only(w: i64, t: i64) -> bool {
+    let op = INSTS[w].op;
+    if op == Select && X86 && (RV_HINT[t] == tracked(INSTS[w].a) || RV_HINT[t] == tracked(INSTS[w].b)) {
+        return true;
+    }
+    if !(op.is_binary() || op == Neg || op == BNot || op == Conv) || RV_HINT[t] != tracked(INSTS[w].a) {
+        return false;
+    }
+    !X86 || !op.is_binary() || is_commutative(op)
+}
+
 fn phi_hints() {
     for k in 0..ORDER.count {
         let mut v = BLOCKS[ORDER.data[k]].first;
@@ -980,8 +1014,9 @@ fn phi_hints() {
             let t = tracked(v);
             if t >= 0 {
                 for i in 0..INSTS[v].nargs {
-                    let a = tracked(ir_arg(v, i));
-                    if a >= 0 && RV_HINT[a] < 0 {
+                    let w = ir_arg(v, i);
+                    let a = tracked(w);
+                    if a >= 0 && (RV_HINT[a] < 0 || operand_hint_only(w, a)) {
                         RV_HINT[a] = t;
                     }
                 }
@@ -989,11 +1024,21 @@ fn phi_hints() {
             v = INSTS[v].next;
         }
     }
+    // A phi's own hint: the value it gets on a back edge (the loop's
+    // value, moved on every iteration when they differ), else the first.
     for k in 0..ORDER.count {
-        let mut v = BLOCKS[ORDER.data[k]].first;
+        let b = ORDER.data[k];
+        let mut v = BLOCKS[b].first;
         while v != 0 && INSTS[v].op == Phi {
             let t = tracked(v);
             if t >= 0 && RV_HINT[t] < 0 {
+                for i in 0..INSTS[v].nargs {
+                    let a = tracked(ir_arg(v, i));
+                    let p = BLOCKS[b].preds.data[i];
+                    if a >= 0 && a != t && BLOCKS[p].order >= k {
+                        RV_HINT[t] = a;
+                    }
+                }
                 for i in 0..INSTS[v].nargs {
                     let a = tracked(ir_arg(v, i));
                     if a >= 0 && RV_HINT[t] < 0 {
@@ -1414,6 +1459,185 @@ fn assign(i: i64, r: i64) {
     }
 }
 
+// Dominators over the layout (a reverse post-order), computed once per
+// function when an entry split asks (Cooper, Harvey and Kennedy).
+static mut RA_IDOM: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut RA_IDOM_READY: bool = false;
+
+fn ra_dominators() {
+    if RA_IDOM_READY {
+        return;
+    }
+    RA_IDOM_READY = true;
+    let n = ORDER.count;
+    RA_IDOM.count = 0;
+    for k in 0..n {
+        RA_IDOM.push(if k == 0 { 0 } else { -1 });
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for k in 1..n {
+            let b = ORDER.data[k];
+            let mut idom = -1;
+            for i in 0..BLOCKS[b].preds.count {
+                let pk = BLOCKS[BLOCKS[b].preds.data[i]].order;
+                if pk < 0 || RA_IDOM.data[pk] < 0 {
+                    continue;
+                }
+                if idom < 0 {
+                    idom = pk;
+                } else {
+                    let mut x = pk;
+                    let mut y = idom;
+                    while x != y {
+                        while x > y {
+                            x = RA_IDOM.data[x];
+                        }
+                        while y > x {
+                            y = RA_IDOM.data[y];
+                        }
+                    }
+                    idom = x;
+                }
+            }
+            if idom != RA_IDOM.data[k] {
+                RA_IDOM.data[k] = idom;
+                changed = true;
+            }
+        }
+    }
+}
+
+fn ra_dominates(a: i64, x: i64) -> bool {
+    let mut y = x;
+    while y > a {
+        y = RA_IDOM.data[y];
+    }
+    y == a
+}
+
+// Whether interval i (a whole value) can move to its second location at
+// the start of block k (in no loop): k dominates every block at or after
+// it where the value lives. (A block in no loop reaches only blocks after
+// it in the layout, a reverse post-order: going back takes a back edge,
+// into a loop that would contain it. So no block before k where the value
+// lives can see the second location.)
+fn entry_split_ok(i: i64, k: i64) -> bool {
+    ra_dominators();
+    let n = ORDER.count;
+    for j in 0..IVS[i].ranges.count / 2 {
+        let from = IVS[i].ranges.data[2 * j];
+        let to = IVS[i].ranges.data[2 * j + 1];
+        let mut b = max_i64(block_at(from), k);
+        while b < n && BSTART.data[b] < to {
+            if !ra_dominates(k, b) {
+                return false;
+            }
+            b += 1;
+        }
+    }
+    true
+}
+
+// A value defined in the entry block (a parameter, mostly) that would take
+// a callee-saved register for its whole lifetime: it keeps a caller-saved
+// one (its hint first) until just before that one is needed elsewhere (a
+// call, usually), when that is past the entry block, and the rest goes on.
+// Moving it into the callee-saved register there rather than at the entry
+// costs the same move, and leaves the paths that return before any call
+// without a frame (shrink-wrapping, see emit.tach).
+fn try_entry_split(cur: i64, hint: i64, regs: *i64, n: i64) -> bool {
+    let start = ra_start(cur);
+    if block_at(start) != 0 || RV_FIRST[IVS[cur].value] != cur || RETURNS_TWICE {
+        return false;
+    }
+    let mut c = -1;
+    if hint >= 0 && (hint >= 32) == iv_float(cur) && is_allocatable(hint) && !is_callee_saved_reg(hint)
+        && FREE_UNTIL[hint] > BEND.data[0] {
+        c = hint;
+    } else {
+        for k in 0..n {
+            let r = regs[k];
+            if !is_callee_saved_reg(r) && (c < 0 || FREE_UNTIL[r] > FREE_UNTIL[c]) {
+                c = r;
+            }
+        }
+    }
+    if c < 0 || FREE_UNTIL[c] <= BEND.data[0] {
+        return false;
+    }
+    let end = ra_end(cur);
+    if FREE_UNTIL[c] >= end {
+        // Free all along: no callee-saved register is needed at all.
+        assign(cur, c);
+        return true;
+    }
+    // Out of loops, where every later use passes: in the block of the
+    // conflict, or at the start of the last block before it that is in no
+    // loop and dominates the rest of the value's blocks (in layout order,
+    // a loop run before it may come after it).
+    let limit = FREE_UNTIL[c];
+    let mut k = block_at(limit);
+    let mut split = -1;
+    if LDEPTH.data[k] == 0 && entry_split_ok(cur, k) {
+        split = move_point_before(limit, start + 1);
+    }
+    while split < 0 && k > 0 {
+        if LDEPTH.data[k] == 0 && BSTART.data[k] < limit && entry_split_ok(cur, k) {
+            split = BSTART.data[k];
+        }
+        k -= 1;
+    }
+    if split <= start || split >= end || block_at(split) == 0 {
+        return false;
+    }
+    assign(cur, c);
+    heap_push(split_at(cur, split));
+    true
+}
+
+// Whether v is a phi of a loop header (a block with a back edge into it).
+fn is_loop_phi(v: i64) -> bool {
+    if INSTS[v].op != Phi {
+        return false;
+    }
+    let b = INSTS[v].block;
+    let k = BLOCKS[b].order;
+    for i in 0..BLOCKS[b].preds.count {
+        if BLOCKS[BLOCKS[b].preds.data[i]].order >= k {
+            return true;
+        }
+    }
+    false
+}
+
+// Whether interval i lives across a call: every caller-saved register of
+// `regs` is clobbered somewhere in it.
+fn crosses_calls(i: i64, regs: *i64, n: i64) -> bool {
+    let mut any = false;
+    for k in 0..n {
+        let r = regs[k];
+        if is_callee_saved_reg(r) {
+            continue;
+        }
+        any = true;
+        if FIXED[r].count == 0 || next_intersection(&FIXED[r], &IVS[i].ranges, 0) == POS_MAX {
+            return false;
+        }
+    }
+    any
+}
+
+// Gives interval cur register r, free for its whole lifetime: unless r is
+// callee-saved and an entry split keeps it in a caller-saved one first.
+fn assign_whole(cur: i64, r: i64, hint: i64, regs: *i64, n: i64) {
+    if is_callee_saved_reg(r) && try_entry_split(cur, hint, regs, n) {
+        return;
+    }
+    assign(cur, r);
+}
+
 fn try_allocate_free(cur: i64) -> bool {
     let mut regs: [i64; 32] = [0; 32];
     let n = class_regs(iv_float(cur), &regs as *i64);
@@ -1445,22 +1669,42 @@ fn try_allocate_free(cur: i64) -> bool {
         }
     }
     let hint = hint_reg(cur);
-    if hint >= 0 && (hint >= 32) == iv_float(cur) && is_allocatable(hint) && FREE_UNTIL[hint] >= end {
-        assign(cur, hint);
+    // Out of loops, a value that lives across no call does not follow its
+    // hint into a callee-saved register: the move the hint saves runs
+    // once, the frame it may force on paths that need none (see
+    // shrink-wrapping in emit.tach) every time.
+    let cheap_hint = !is_callee_saved_reg(hint) || LDEPTH.data[block_at(start)] != 0
+        || crosses_calls(cur, &regs as *i64, n);
+    if hint >= 0 && (hint >= 32) == iv_float(cur) && is_allocatable(hint) && FREE_UNTIL[hint] >= end && cheap_hint {
+        assign_whole(cur, hint, hint, &regs as *i64, n);
         return true;
+    }
+    // The partner not allocated yet will need a callee-saved register (it
+    // lives across a call): one free now can be both's.
+    let partner = RV_HINT[IVS[cur].value];
+    if hint < 0 && partner >= 0 && partner != IVS[cur].value && RV_FIRST[partner] >= 0
+        && is_loop_phi(RA_VALS.data[IVS[cur].value])
+        && IVS[RV_FIRST[partner]].reg == UNASSIGNED && crosses_calls(RV_FIRST[partner], &regs as *i64, n) {
+        for k in 0..n {
+            let r = regs[k];
+            if is_callee_saved_reg(r) && FREE_UNTIL[r] >= end {
+                assign_whole(cur, r, hint, &regs as *i64, n);
+                return true;
+            }
+        }
     }
     // Else the argument or result register the value goes to, when the
     // partner's is taken.
     let to = RV_HREG[IVS[cur].value];
     if to >= 0 && to != hint && (to >= 32) == iv_float(cur) && is_allocatable(to) && FREE_UNTIL[to] >= end {
-        assign(cur, to);
+        assign_whole(cur, to, hint, &regs as *i64, n);
         return true;
     }
     let mut best = regs[0];
     for k in 0..n {
         let r = regs[k];
         if FREE_UNTIL[r] >= end {
-            assign(cur, r);
+            assign_whole(cur, r, hint, &regs as *i64, n);
             return true;
         }
         if FREE_UNTIL[r] > FREE_UNTIL[best] {
@@ -1778,10 +2022,54 @@ pub fn stored_at_def(t: i64) -> bool {
     RV_SLOT[t] >= 0
 }
 
+// Shrink-wrapping (see emit.tach): marks in `need` (per layout index)
+// the blocks where some value is in a callee-saved register or on the
+// stack, or is stored to its spill slot, and the predecessors of a block
+// that starts with one there (their edge moves may write it).
+pub fn mark_frame_blocks(need: *i64) {
+    for t in 0..RA_VALS.count {
+        let v = RA_VALS.data[t];
+        let mut i = RV_FIRST[t];
+        if i < 0 {
+            continue;
+        }
+        if RV_SLOT[t] >= 0 {
+            need[block_at(value_start(t))] = 1;
+        }
+        while i >= 0 {
+            let r = IVS[i].reg;
+            if (r >= 0 && is_callee_saved_reg(r)) || (r == ON_STACK && !INSTS[v].op.is_remat()) {
+                for j in 0..IVS[i].ranges.count / 2 {
+                    mark_frame_range(need, IVS[i].ranges.data[2 * j], IVS[i].ranges.data[2 * j + 1]);
+                }
+            }
+            i = IVS[i].next;
+        }
+    }
+}
+
+fn mark_frame_range(need: *i64, from: i64, to: i64) {
+    let mut k = max_i64(block_at(from), 0);
+    while k < ORDER.count && BSTART.data[k] < to {
+        need[k] = 1;
+        if from <= BSTART.data[k] {
+            let b = ORDER.data[k];
+            for i in 0..BLOCKS[b].preds.count {
+                let p = BLOCKS[b].preds.data[i];
+                if BLOCKS[p].order >= 0 {
+                    need[BLOCKS[p].order] = 1;
+                }
+            }
+        }
+        k += 1;
+    }
+}
+
 // Allocates function `fi`: layout, positions, liveness, intervals and
 // locations.
 pub fn allocate_registers(fi: i64) {
     IRF = fi;
+    RA_IDOM_READY = false;
     RETURNS_TWICE = calls_returns_twice(fi);
     split_critical_edges(fi);
     layout_blocks(fi);
