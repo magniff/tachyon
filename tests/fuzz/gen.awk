@@ -8,7 +8,7 @@
 # every optimization level must print the same.
 #
 # usage: awk -v seed=N [-v nonzero=1] [-v loops=1] [-v generics=1]
-#                        [-v pressure=1] [-v calls=1] -f gen.awk
+#                        [-v pressure=1] [-v calls=1] [-v lang06=1] -f gen.awk
 #
 # loops=1 (the loop mode, for the loop optimizer of 0.4) adds more loops:
 # counted loops with bounds from expressions, inclusive ranges, while loops
@@ -24,6 +24,10 @@
 # to 10 parameters (beyond the argument registers) and 12 to 25 locals,
 # every one of them live until the end, and more statements (so more
 # calls, inside loops too).
+# lang06=1 (the 0.6 language) adds functions using defer on every way out
+# of their blocks (a log of what ran is printed at the end), if let and
+# while let over the prelude's Option, string slices, and structural ==
+# on structs, tuples, arrays and enums with fields.
 # calls=1 (for the tachyon calling convention of 0.5) adds functions of 3
 # to 12 parameters of every shape (structs, enums, tuples, arrays,
 # scalars) returning aggregates, called directly and through fn pointers,
@@ -165,6 +169,10 @@ function expr(t, depth,    k, v, u, op, ops) {
         v = generic_expr(t, depth)
         if (v != "") return v
     }
+    if (k >= 11 && L06 && rnd(2)) {
+        v = lang06_expr(t, depth)
+        if (v != "") return v
+    }
     if (k >= 11 && FEAT) {
         v = feature_expr(t, depth)
         if (v != "") return v
@@ -172,6 +180,97 @@ function expr(t, depth,    k, v, u, op, ops) {
     v = var_of(t)
     if (v != "") return v
     return literal(t)
+}
+
+# ---- The 0.6 language ----
+
+function lang06_defs() {
+    print "static mut DLOG: u64 = 0;"
+    print ""
+    print "fn dnote(d: u64) { DLOG = DLOG * 31 + d; }"
+    print ""
+    print "fn dfn(x: i64, n: i64) -> i64 {"
+    print "    defer dnote(1);"
+    print "    let mut acc = x;"
+    print "    let mut i = 0;"
+    print "    outer: while i < n {"
+    print "        defer dnote(2);"
+    print "        i += 1;"
+    print "        if acc % 3 == 0 { acc += 1; continue; }"
+    print "        for j in 0..2 {"
+    print "            defer { dnote(4); }"
+    print "            if acc > 1000 { break :outer; }"
+    print "            if j == 1 && acc % 5 == 0 { continue :outer; }"
+    print "        }"
+    print "        defer { dnote(3); }"
+    print "        acc = acc * 2 + i;"
+    print "        if acc % 7 == 0 { return acc; }"
+    print "    }"
+    print "    acc"
+    print "}"
+    print ""
+    print "fn opt_of(x: i64) -> Option<i64> { if x % 2 == 0 { Some(x / 2) } else { None } }"
+    print ""
+    print "fn iflet(x: i64) -> i64 { if let Some(v) = opt_of(x) { v } else if let 5 = x { 50 } else { -x } }"
+    print ""
+    print "fn wlet(x: i64) -> i64 {"
+    print "    let mut v = x;"
+    print "    let mut n = 0;"
+    print "    while let Some(h) = opt_of(v) { v = h; n += 1; if n > 60 { break; } }"
+    print "    n * 100 + v"
+    print "}"
+    print ""
+    print "fn streq(a: [u8], b: [u8]) -> bool {"
+    print "    if a.len != b.len { return false; }"
+    print "    for i in 0..a.len { if a[i] != b[i] { return false; } }"
+    print "    true"
+    print "}"
+    print ""
+    print "struct Q { a: i64, b: u8, c: (i32, bool) }"
+    print ""
+    print "enum R { P(i64, u8), Z, T(Q) }"
+    print ""
+}
+
+# A small i64 expression (so that comparisons are sometimes equal).
+function small06(depth) {
+    if (depth <= 0 || rnd(2)) return rnd(3)
+    return "(" expr("i64", depth - 1) " % 3)"
+}
+
+function bool06() { return rnd(2) ? "true" : "false" }
+
+function q_value06(depth) {
+    return "Q { a: " small06(depth) ", b: " small06(depth) " as u8, c: (" small06(depth) " as i32, " bool06() ") }"
+}
+
+function r_value06(depth,    k) {
+    k = rnd(3)
+    if (k == 0) return "R::P(" small06(depth) ", " small06(depth) " as u8)"
+    if (k == 1) return "R::Z"
+    return "R::T(" q_value06(depth) ")"
+}
+
+# An integer expression of type t in the 0.6 language, or "".
+function lang06_expr(t, depth,    k, w, n, lo, hi, words) {
+    if (depth <= 0) return ""
+    k = rnd(9)
+    if (k == 0) return "(dfn(" expr("i64", depth - 1) ", " rnd(6) ") as " t ")"
+    if (k == 1) return "(iflet(" expr("i64", depth - 1) ") as " t ")"
+    if (k == 2) return "(wlet(" expr("i64", depth - 1) ") as " t ")"
+    if (k == 3) return "((" q_value06(depth) " == " q_value06(depth) ") as " t ")"
+    if (k == 4) return "((" r_value06(depth) " != " r_value06(depth) ") as " t ")"
+    if (k == 5) return "(([" small06(depth) ", " small06(depth) "] == [" small06(depth) ", " small06(depth) "]) as " t ")"
+    split("tachyon defer slice x ab", words, " ")
+    w = words[1 + rnd(5)]
+    n = length(w)
+    if (k == 6) {
+        lo = rnd(n + 1)
+        hi = lo + rnd(n - lo + 1)
+        return "(\"" w "\"[" lo ".." hi "].len as " t ")"
+    }
+    if (k == 7) return "(streq(\"" w "\", \"" words[1 + rnd(5)] "\") as " t ")"
+    return "(((" small06(depth) ", " bool06() ") != (" small06(depth) ", " bool06() ")) as " t ")"
 }
 
 # ---- Generics (0.5) ----
@@ -718,12 +817,14 @@ BEGIN {
     LOOPMODE = loops ? 1 : 0
     PRESSURE = pressure ? 1 : 0
     CALLS = (calls && !nonzero) ? 1 : 0
+    L06 = (lang06 && !nonzero) ? 1 : 0
     print "// Generated by tests/fuzz/gen.awk, seed " seed "."
     # (run.sh gives the seed the 0.2 form, with tests/seed-compat.awk.)
     print "extern \"C\" { fn printf(format: *u8, ...) -> i32; }"
     print ""
     if (FEAT) type_defs()
     if (GEN) generic_defs()
+    if (L06) lang06_defs()
     NF = 0
     count = 3 + rnd(4)
     for (f = 0; f < count; f++) {
@@ -745,6 +846,7 @@ BEGIN {
         }
     }
     if (CALLS) calls_main()
+    if (L06) print "    printf(c\"%lu\\n\", DLOG);"
     print "    0"
     print "}"
 }

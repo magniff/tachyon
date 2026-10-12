@@ -230,16 +230,24 @@ fn parse_top_item() {
         advance();
         let n = new_node(NodeKind::Mod, start, 0);
         NODES[n].a = expect_binding_name();
-        if at(LBrace) {
-            error_at(cur_start(), c"inline modules are not supported; a module is a file: write 'mod name;' and put it in name.tach");
+        if eat(LBrace) {
+            // `mod name { items }` (0.6): its items are the program's, in
+            // the module the loader made for the braces (modules.tach).
+            NODES[n].end = prev_end();
+            mark_public(n, public);
+            list_push(n);
+            while !at(RBrace) && !at(Eof) {
+                parse_top_item();
+            }
+            expect(RBrace);
+            return;
         }
         expect(Semi);
         NODES[n].end = prev_end();
         mark_public(n, public);
         list_push(n);
     } else if at(Hash) {
-        let item = parse_attributed_item();
-        mark_public(item, public);
+        let item = parse_attributed_item(public);
         list_push(item);
     } else {
         let item = parse_item();
@@ -281,11 +289,17 @@ fn parse_impl(public: bool) {
     }
     expect(LBrace);
     while !at(RBrace) && !at(Eof) {
+        let attrs_start = cur_start();
+        let flags = parse_fn_attributes();
         let item_public = eat(Pub) || public;
         if !at(Fn) {
+            if flags != 0 {
+                error_at(attrs_start, c"#[inline] and #[cold] go before a function");
+            }
             syntax_error(c"expected 'fn' or '}' in an impl block");
         }
         let f = parse_function();
+        NODES[f].p |= flags;
         NODES[f].d = NODES[self_type].a;
         NODES[f].h = self_type;
         if params != 0 {
@@ -666,20 +680,78 @@ fn parse_c_static(start: i64, defines: bool) -> i64 {
     n
 }
 
-// `#[repr(...)]` before a struct, union or enum.
-fn parse_attributed_item() -> i64 {
+// `#[inline]`, `#[inline(never)]` or `#[cold]` (0.6) after `#[` and the
+// name: its FN_ flag, or 0 when `name` is another attribute.
+fn parse_fn_attribute(name: i64, pos: i64) -> i64 {
+    if name == intern_c(c"cold") {
+        return FN_COLD;
+    }
+    if name != intern_c(c"inline") {
+        return 0;
+    }
+    if eat(LParen) {
+        let arg = expect_ident();
+        if arg != intern_c(c"never") {
+            name_error(pos, c"unknown inline option '", arg, c"' (expected #[inline] or #[inline(never)])");
+        }
+        expect(RParen);
+        return FN_NO_INLINE;
+    }
+    FN_INLINE
+}
+
+// The function attributes before a function in an impl block (0.6).
+fn parse_fn_attributes() -> i64 {
     let mut flags = 0;
+    let start = cur_start();
+    while at(Hash) {
+        let pos = cur_start();
+        advance();
+        expect(LBracket);
+        let name = expect_ident();
+        let flag = parse_fn_attribute(name, pos);
+        if flag == 0 {
+            name_error(pos, c"unknown attribute '", name, c"' before a function (expected inline, inline(never) or cold)");
+        }
+        flags |= flag;
+        expect(RBracket);
+    }
+    check_fn_attributes(flags, start);
+    flags
+}
+
+fn check_fn_attributes(flags: i64, pos: i64) {
+    if (flags & FN_INLINE) != 0 && (flags & FN_NO_INLINE) != 0 {
+        error_at(pos, c"a function cannot be both #[inline] and #[inline(never)]");
+    }
+}
+
+// Attributes, then the item: `#[repr(...)]` before a struct, union or
+// enum; `#[inline]`, `#[inline(never)]`, `#[cold]` (0.6) before a function.
+// `pub` may come before the attributes or (0.6) after them.
+fn parse_attributed_item(public: bool) -> i64 {
+    let mut flags = 0;
+    let mut fn_flags = 0;
+    let mut repr = false;
     let mut align = 0;
     let mut pack = 0;
     let mut int_type = 0;
     let at_start = cur_start();
     while at(Hash) {
+        let attr_pos = cur_start();
         advance();
         expect(LBracket);
         let name = expect_ident();
-        if name != intern_c(c"repr") {
-            name_error(TOKS[P - 1].start, c"unknown attribute '", name, c"' (attributes in 0.3: repr)");
+        let fn_flag = parse_fn_attribute(name, attr_pos);
+        if fn_flag != 0 {
+            fn_flags |= fn_flag;
+            expect(RBracket);
+            continue;
         }
+        if name != intern_c(c"repr") {
+            name_error(TOKS[P - 1].start, c"unknown attribute '", name, c"' (expected repr, inline, inline(never) or cold)");
+        }
+        repr = true;
         expect(LParen);
         while !at(RParen) && !at(Eof) {
             let pos = cur_start();
@@ -726,6 +798,20 @@ fn parse_attributed_item() -> i64 {
         expect(RParen);
         expect(RBracket);
     }
+    let item_public = eat(Pub) || public;
+    if fn_flags != 0 {
+        if repr {
+            error_at(at_start, c"#[repr(...)] and function attributes cannot be combined");
+        }
+        if !at(Fn) {
+            error_at(at_start, c"#[inline] and #[cold] go before a function");
+        }
+        check_fn_attributes(fn_flags, at_start);
+        let f = parse_function();
+        NODES[f].p |= fn_flags;
+        mark_public(f, item_public);
+        return f;
+    }
     if !at(Struct) && !at(Union) && !at(Enum) {
         error_at(at_start, c"#[repr(...)] goes before a struct, union or enum");
     }
@@ -749,6 +835,7 @@ fn parse_attributed_item() -> i64 {
         NODES[item].d = if pack != 0 { pack } else { align };
     }
     NODES[item].c = NODES[item].c | flags;
+    mark_public(item, item_public);
     item
 }
 
@@ -856,9 +943,8 @@ fn parse_type_alias() -> i64 {
     expect(Type);
     let n = new_node(NodeKind::TypeAlias, start, 0);
     NODES[n].a = expect_binding_name();
-    if at(Lt) {
-        error_at(cur_start(), c"generic type aliases are not supported yet");
-    }
+    // `type Pair<T> = (T, T);` (0.6): generic, its parameters in `g`.
+    NODES[n].g = parse_generic_params();
     expect(Eq);
     NODES[n].b = parse_type();
     expect(Semi);
@@ -1081,6 +1167,9 @@ fn parse_stmt() -> i64 {
     if at(Let) {
         return parse_let();
     }
+    if at(Defer) {
+        return parse_defer();
+    }
     if at_block_like() {
         // Ends at its closing brace; a `;` right after belongs to it.
         let expr = parse_primary();
@@ -1099,6 +1188,22 @@ fn parse_stmt() -> i64 {
         return expr_stmt(expr, 2, start);
     }
     syntax_error(c"expected ';' or '}' after expression")
+}
+
+// `defer expr;` or `defer { ... }` (0.6).
+fn parse_defer() -> i64 {
+    let start = cur_start();
+    expect(Defer);
+    let n = new_node(NodeKind::Defer, start, 0);
+    if at(LBrace) {
+        NODES[n].a = parse_block();
+        eat(Semi);
+    } else {
+        NODES[n].a = parse_expr();
+        expect(Semi);
+    }
+    NODES[n].end = prev_end();
+    n
 }
 
 fn parse_let() -> i64 {
@@ -1834,20 +1939,62 @@ fn parse_array_literal() -> i64 {
 fn parse_if() -> i64 {
     let start = cur_start();
     expect(If);
+    if at(Let) {
+        return parse_if_let(start);
+    }
     let n = new_node(NodeKind::If, start, 0);
     NODES[n].a = parse_expr_no_struct();
     NODES[n].b = parse_block();
     if eat(Else) {
-        if at(If) {
-            // `else if`: an else block holding just the inner `if`.
-            let inner = parse_if();
-            let block = new_node(NodeKind::Block, NODES[inner].start, NODES[inner].end);
-            NODES[block].a = inner;
-            NODES[n].c = block;
-        } else {
-            NODES[n].c = parse_block();
-        }
+        NODES[n].c = parse_else_part();
     }
+    NODES[n].end = prev_end();
+    n
+}
+
+// The else part of an `if` (after `else`): a block, or a block holding
+// just the inner `if` of an `else if`.
+fn parse_else_part() -> i64 {
+    if at(If) {
+        let inner = parse_if();
+        let block = new_node(NodeKind::Block, NODES[inner].start, NODES[inner].end);
+        NODES[block].a = inner;
+        return block;
+    }
+    parse_block()
+}
+
+// A match arm made by the parser: `pattern => body`.
+fn synthetic_arm(pattern: i64, body: i64, flags: i64) -> i64 {
+    let arm = new_node(NodeKind::Arm, NODES[pattern].start, NODES[body].end);
+    NODES[arm].a = pattern;
+    NODES[arm].c = body;
+    NODES[arm].p = flags;
+    arm
+}
+
+// `if let P = e { A } else { B }` (0.6), after `if`: the match
+// `match e { P => { A }, _ => { B } }` (B: an empty block without `else`).
+// The bindings of P are in scope in A only; P may be refutable or not.
+fn parse_if_let(start: i64) -> i64 {
+    expect(Let);
+    let pattern = parse_pattern();
+    expect(Eq);
+    let n = new_node(NodeKind::Match, start, 0);
+    NODES[n].a = parse_expr_no_struct();
+    let then = parse_block();
+    let mut flags = ARM_SYNTHETIC;
+    let otherwise = if eat(Else) {
+        parse_else_part()
+    } else {
+        flags = ARM_SYNTHETIC | ARM_NO_ELSE;
+        new_node(NodeKind::Block, prev_end(), prev_end())
+    };
+    let wild = new_node(NodeKind::PatWild, NODES[otherwise].start, NODES[otherwise].start);
+    let mark = list_begin();
+    list_push(synthetic_arm(pattern, then, 0));
+    list_push(synthetic_arm(wild, otherwise, flags));
+    list_end(n, mark);
     NODES[n].end = prev_end();
     n
 }
@@ -1891,6 +2038,30 @@ fn parse_match() -> i64 {
     n
 }
 
+// `while let P = e { body }` (0.6), after `while`: the loop
+// `loop { match e { P => { body }, _ => break } }`, keeping the label.
+fn parse_while_let(label: i64, start: i64) -> i64 {
+    expect(Let);
+    let pattern = parse_pattern();
+    expect(Eq);
+    let m = new_node(NodeKind::Match, start, 0);
+    NODES[m].a = parse_expr_no_struct();
+    let body = parse_block();
+    let brk = new_node(NodeKind::Break, NODES[body].end, NODES[body].end);
+    let wild = new_node(NodeKind::PatWild, NODES[body].end, NODES[body].end);
+    let mark = list_begin();
+    list_push(synthetic_arm(pattern, body, 0));
+    list_push(synthetic_arm(wild, brk, ARM_SYNTHETIC));
+    list_end(m, mark);
+    NODES[m].end = prev_end();
+    let block = new_node(NodeKind::Block, start, prev_end());
+    NODES[block].a = m;
+    let n = new_node(NodeKind::Loop, start, prev_end());
+    NODES[n].a = label;
+    NODES[n].b = block;
+    n
+}
+
 fn parse_loop(label: i64, start: i64) -> i64 {
     if eat(Loop) {
         let n = new_node(NodeKind::Loop, start, 0);
@@ -1900,6 +2071,9 @@ fn parse_loop(label: i64, start: i64) -> i64 {
         return n;
     }
     if eat(While) {
+        if at(Let) {
+            return parse_while_let(label, start);
+        }
         let n = new_node(NodeKind::While, start, 0);
         NODES[n].a = label;
         NODES[n].b = parse_expr_no_struct();
