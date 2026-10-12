@@ -809,7 +809,10 @@ profile-guided scheduling (0.9).
   tests/objcheck.sh: on all three targets every compilation of the corpus
   (374) links to the same program as `cc -c` of its assembly; objects are
   identical whatever the host; compile times in roadmap.md
-- remaining for the release: the gate's fuzz and ABI rounds on objects
+- gate passed (on objects): the suite at every level on both macOS
+  targets and in the Linux container, the fixpoint, objcheck 374/374 on
+  all three targets, the fuzzer in every mode (about 1,300 programs on
+  macOS), the ABI fuzzer in all three modes, host independence
 - after the object writer (scope added by the user: no undefined
   behaviour): bounds-checked fixed-array indexing; an "Undefined
   behaviour" section in grammar.md
