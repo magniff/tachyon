@@ -5,7 +5,8 @@
 # to assembly, which `cc -c` assembles; both objects are linked by cc into
 # executables, and the two executables must hold the same code and data:
 # their disassembly (alignment padding aside: the system assemblers pick
-# their own NOPs) and the contents of every other section. POSIX sh, cc
+# their own NOPs) and the contents of every other section (but GNU ld's
+# build id, a hash of the whole file, symbol tables included). POSIX sh, cc
 # and objdump only, so it runs the same on macOS and Linux.
 #
 # usage: tests/objcheck.sh [-c COMPILER] [-t TARGET] [-j JOBS] [FILTER]
@@ -68,7 +69,7 @@ code() {
 # The contents of every section but the code.
 data() {
     objdump -s "$1" | awk '
-        /^Contents of section/ { skip = ($0 ~ /text/); print; next }
+        /^Contents of section/ { skip = ($0 ~ /text|build-id/); print; next }
         /file format/ { next }
         !skip && /^ [0-9a-f]+ / { print }'
 }
