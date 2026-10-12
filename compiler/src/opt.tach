@@ -19,6 +19,9 @@ use crate::lsr::*;
 use crate::range::*;
 use crate::scev::*;
 use crate::tre::*;
+use crate::ipo::*;
+use crate::promote::*;
+use crate::timer::*;
 use crate::regalloc::*;
 
 pub static mut OPT_LEVEL: i64 = 2;
@@ -406,7 +409,7 @@ pub fn eliminate_dead_code(fi: i64) -> bool {
         }
         let mut v = BLOCKS[b].first;
         while v != 0 {
-            if INSTS[v].op.has_side_effect() {
+            if has_effect(v) {
                 mark_live(v, &work);
             }
             v = INSTS[v].next;
@@ -462,9 +465,15 @@ fn cleanup_function(fi: i64) {
     verify_func(fi, c"lowering, inlining and cleanup");
 }
 
+// After inlining into fi: the cleanup and the scalar pipeline.
+pub fn optimize_after_inlining(fi: i64) {
+    cleanup_function(fi);
+    simplify_function(fi);
+}
+
 // The scalar pipeline (-O1), twice: constants, peepholes, control flow,
 // value numbering, dead code.
-fn simplify_function(fi: i64) {
+pub fn simplify_function(fi: i64) {
     for round in 0..2 {
         sccp(fi);
         verify_func(fi, c"sccp");
@@ -498,45 +507,91 @@ pub fn optimize_program() {
     if OPT_LEVEL == 0 {
         return;
     }
+    let mut t = timer_now();
     for fi in 0..IRFUNC_COUNT {
         IRF = fi;
         simplify_function(fi);
     }
+    timer_add(T_SCALAR, t);
     if OPT_LEVEL < 2 {
         return;
     }
-    // -O2: inlining bottom-up, then loop-invariant code motion.
+    t = timer_now();
+    // -O2: interprocedural constants, then bottom-up over the call graph's
+    // components: tail recursion, inlining, the loop passes, scalar
+    // promotion and loop-invariant code motion, and each component's
+    // attributes (docs/optimizer.md, 0.6).
     FN_SCC = alloc_array::<i64>(IRFUNC_COUNT + 1);
     FN_SIZE = alloc_array::<i64>(IRFUNC_COUNT + 1);
     FN_CALLS = alloc_array::<i64>(IRFUNC_COUNT + 1);
     FN_ADDRESS = alloc_array::<i64>(IRFUNC_COUNT + 1);
+    init_attrs();
+    count_call_sites();
+    // The functions whose address the program takes stay in it, even when
+    // every call through the address is made direct (see
+    // remove_dead_functions).
+    FN_TAKEN = alloc_array::<i64>(IRFUNC_COUNT + 1);
+    for fi in 0..IRFUNC_COUNT {
+        FN_TAKEN[fi] = FN_ADDRESS[fi];
+    }
+    compute_sccs();
+    propagate_constants();
     for fi in 0..IRFUNC_COUNT {
         FN_SIZE[fi] = func_size(fi);
     }
-    count_call_sites();
-    compute_sccs();
+    start_inlining_budget();
+    timer_add(T_IPCP, t);
+    let mut component_start = 0;
     for i in 0..SCC_ORDER.count {
         let fi = SCC_ORDER.data[i];
         IRF = fi;
+        t = timer_now();
         if eliminate_tail_recursion(fi) {
             cleanup_function(fi);
             simplify_function(fi);
         }
-        if inline_calls(fi) {
-            cleanup_function(fi);
+        timer_add(T_TRE, t);
+        t = timer_now();
+        inline_rounds(fi);
+        timer_add(T_INLINE, t);
+        t = timer_now();
+        if heap_to_stack(fi) {
             simplify_function(fi);
         }
+        timer_add(T_HEAP, t);
+        t = timer_now();
         if optimize_loops(fi) {
             simplify_function(fi);
         }
+        timer_add(T_LOOPS, t);
+        t = timer_now();
         if run_licm(fi) {
             resolve_all(fi);
             verify_func(fi, c"licm");
             simplify_function(fi);
         }
+        timer_add(T_LICM, t);
+        // After LICM: the addresses of slots and statics are out of the
+        // loops by then.
+        t = timer_now();
+        if promote_loop_memory(fi) {
+            simplify_function(fi);
+        }
+        timer_add(T_PROMOTE, t);
+        t = timer_now();
         FN_SIZE[fi] = func_size(fi);
+        if i + 1 == SCC_ORDER.count || FN_SCC[SCC_ORDER.data[i + 1]] != FN_SCC[fi] {
+            infer_component_attrs(component_start, i + 1);
+            component_start = i + 1;
+        }
+        timer_add(T_ATTRS, t);
     }
+    t = timer_now();
     remove_dead_functions();
+    timer_add(T_GLOBAL_DCE, t);
+    if PRINT_ATTRS {
+        print_attrs();
+    }
 }
 
 // -O2's loop passes (loops.tach and the files after it), before LICM.
@@ -585,8 +640,16 @@ fn light_cleanup(fi: i64) {
     verify_func(fi, c"cleanup");
 }
 
-// Functions nobody calls or takes the address of (other than main) are
-// not emitted.
+// Per IR function: whether the program took its address (before
+// optimization).
+static mut FN_TAKEN: *i64 = 0 as *i64;
+
+// Global dead code elimination: functions nobody calls or takes the
+// address of (other than main and the extern "C" definitions) are not
+// emitted, transitively. A function whose address the program took is
+// kept even when every call through it was made direct and inlined: a
+// function used as a value is part of what the program is (and of what
+// the tests look at).
 fn remove_dead_functions() {
     let mut changed = true;
     while changed {
@@ -594,7 +657,7 @@ fn remove_dead_functions() {
         count_call_sites();
         for fi in 0..IRFUNC_COUNT {
             if FN_LIVE[fi] != 0 && FN_CALLS[fi] == 0 && FN_ADDRESS[fi] == 0
-                && !fn_is_global(IRFUNCS[fi].f) {
+                && FN_TAKEN[fi] == 0 && !fn_is_global(IRFUNCS[fi].f) {
                 FN_LIVE[fi] = 0;
                 changed = true;
             }
