@@ -314,6 +314,12 @@ fn use_kind(v: i64, i: i64) -> i64 {
         }
         return USE_ANY;
     }
+    if op == Op::Piece {
+        return USE_NONE;
+    }
+    if op == Op::Pack {
+        return USE_ANY;
+    }
     if op == Op::Phi {
         return USE_ANY;
     }
@@ -328,12 +334,20 @@ fn use_kind(v: i64, i: i64) -> i64 {
 }
 
 // The operands the terminator of block b reads (at BEND), with their
-// kinds: up to two (value, kind) pairs in out; returns the count.
+// kinds: up to four (value, kind) pairs in out; returns the count.
 fn term_uses(b: i64, out: *i64) -> i64 {
     let cond = BLOCKS[b].cond;
     let term = BLOCKS[b].term;
     if cond == 0 {
         return 0;
+    }
+    if term == Term::Ret && INSTS[cond].op == Op::Pack {
+        // The pieces of an aggregate result.
+        for i in 0..INSTS[cond].nargs {
+            out[2 * i] = ir_arg(cond, i);
+            out[2 * i + 1] = USE_ANY;
+        }
+        return INSTS[cond].nargs;
     }
     if term == Term::Ret {
         let ret = FNS[IRFUNCS[IRF].f].ret;
@@ -373,7 +387,7 @@ fn is_live_use(v: i64, kind: i64) -> bool {
 // Whether `v` is computed where it is defined.
 fn is_emitted(v: i64) -> bool {
     let op = INSTS[v].op;
-    if op == Op::Phi || op == Op::Param {
+    if op == Op::Phi || op == Op::Param || op == Op::Piece || op == Op::Pack {
         return false;
     }
     if op.is_remat() {
@@ -420,7 +434,7 @@ fn ra_reserve(n: i64) {
 
 // Marks the values some use needs in a register.
 fn mark_reg_uses() {
-    let mut out: [i64; 4] = [0; 4];
+    let mut out: [i64; 8] = [0; 8];
     for k in 0..ORDER.count {
         let b = ORDER.data[k];
         let mut v = BLOCKS[b].first;
@@ -509,7 +523,7 @@ fn compute_liveness() {
     LIVE_OUT = alloc_zeroed(n * LIVE_WORDS * 8 + 8) as *u64;
     let gen = alloc_zeroed(n * LIVE_WORDS * 8 + 8) as *u64;
     let kill = alloc_zeroed(n * LIVE_WORDS * 8 + 8) as *u64;
-    let mut out: [i64; 4] = [0; 4];
+    let mut out: [i64; 8] = [0; 8];
     for k in 0..n {
         let b = ORDER.data[k];
         let g = live_set(gen, k);
@@ -768,6 +782,29 @@ fn add_clobbers(v: i64, p: i64) {
     }
 }
 
+// The pieces of call v's aggregate result (PIECE instructions after it in
+// its block): defined by the call, in its result registers (as hints).
+fn add_piece_defs(v: i64, start: i64, p: i64, live: *u64) {
+    let mut w = INSTS[v].next;
+    let mut classified = false;
+    while w != 0 {
+        if INSTS[w].op == Op::Piece && INSTS[w].a == v {
+            if !classified {
+                conv_classify(call_uses_c(v), callee_result(v));
+                classified = true;
+            }
+            let t = tracked(w);
+            if t >= 0 {
+                add_def(t, start, p + 2, USE_REG, live);
+                if RV_HREG[t] < 0 {
+                    RV_HREG[t] = conv_return_piece_reg(call_uses_c(v), INSTS[w].imm);
+                }
+            }
+        }
+        w = INSTS[w].next;
+    }
+}
+
 // The hints of instruction v (at p): its result's register, its operands'.
 fn add_hints(v: i64) {
     let op = INSTS[v].op;
@@ -809,7 +846,7 @@ fn build_intervals() {
         RV_HREG[t] = -1;
     }
     let live = alloc_zeroed(LIVE_WORDS * 8 + 8) as *u64;
-    let mut out: [i64; 4] = [0; 4];
+    let mut out: [i64; 8] = [0; 8];
     let mut k = ORDER.count - 1;
     while k >= 0 {
         let b = ORDER.data[k];
@@ -838,15 +875,29 @@ fn build_intervals() {
             if t >= 0 && RV_HREG[t] < 0 && !is_compound(FNS[IRFUNCS[IRF].f].ret) {
                 RV_HREG[t] = reg_ret(is_float(INSTS[out[0]].ty));
             }
+            let pack = BLOCKS[b].cond;
+            if INSTS[pack].op == Op::Pack {
+                let f = IRFUNCS[IRF].f;
+                conv_classify(fn_uses_c(f), FNS[f].ret);
+                for i in 0..count {
+                    let a = tracked(out[2 * i]);
+                    if a >= 0 && RV_HREG[a] < 0 {
+                        RV_HREG[a] = conv_return_piece_reg(fn_uses_c(f), i);
+                    }
+                }
+            }
         }
         let mut v = BLOCKS[b].last;
         while v != 0 {
             let op = INSTS[v].op;
-            if op != Op::Phi && op != Op::Param && !is_fused_compare(v) {
+            if op != Op::Phi && op != Op::Param && op != Op::Piece && op != Op::Pack && !is_fused_compare(v) {
                 let p = INSTS[v].mark;
                 let t = tracked(v);
                 if t >= 0 {
                     add_def(t, start, p + 2, if op.is_remat() { USE_NONE } else { USE_REG }, live);
+                }
+                if op.is_call() {
+                    add_piece_defs(v, start, p, live);
                 }
                 add_clobbers(v, p);
                 add_hints(v);
@@ -2012,6 +2063,11 @@ fn ra_check_block(state: *i64, b: i64) {
         let p = INSTS[v].mark;
         plan_gap_moves(p - 1);
         check_moves(state);
+        if op == Op::Piece || op == Op::Pack {
+            // Defined by their call; read by the RET.
+            v = INSTS[v].next;
+            continue;
+        }
         for i in 0..ir_operand_count(v) {
             let operand = ir_operand(v, i);
             if operand != 0 && !(op.is_call() && i == 2 && !call_returns_through_pointer(v)) {
@@ -2025,12 +2081,21 @@ fn ra_check_block(state: *i64, b: i64) {
         if is_emitted(v) {
             check_def(state, v, p + 2);
         }
+        if op.is_call() {
+            let mut w = INSTS[v].next;
+            while w != 0 {
+                if INSTS[w].op == Op::Piece && INSTS[w].a == v && tracked(w) >= 0 {
+                    check_def(state, w, p + 2);
+                }
+                w = INSTS[w].next;
+            }
+        }
         v = INSTS[v].next;
     }
     let end = BEND.data[k];
     plan_gap_moves(end - 1);
     check_moves(state);
-    let mut out: [i64; 4] = [0; 4];
+    let mut out: [i64; 8] = [0; 8];
     let count = term_uses(b, &out as *i64);
     for i in 0..count {
         check_use(state, out[2 * i], end, out[2 * i + 1]);

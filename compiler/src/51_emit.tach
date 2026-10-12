@@ -489,6 +489,11 @@ fn layout_frame(fi: i64) {
     FRAME_ALIGN = 16;
     HAS_CALLS = false;
     USES_SLOTS = false;
+    // Slots no instruction refers to any more (scalar replacement took
+    // them apart) get no room: offset -1.
+    for i in 0..IRFUNCS[fi].slots.count {
+        SLOTS[IRFUNCS[fi].slots.data[i]].offset = -1;
+    }
     for i in 0..ORDER.count {
         let mut v = BLOCKS[ORDER.data[i]].first;
         while v != 0 {
@@ -496,6 +501,7 @@ fn layout_frame(fi: i64) {
                 HAS_CALLS = true;
             }
             if INSTS[v].op == Op::Slot && USES[v] > 0 {
+                SLOTS[INSTS[v].imm].offset = 0;
                 USES_SLOTS = true;
             }
             if INSTS[v].op.is_call() {
@@ -534,6 +540,9 @@ fn layout_frame(fi: i64) {
     }
     for i in 0..IRFUNCS[fi].slots.count {
         let s = IRFUNCS[fi].slots.data[i];
+        if SLOTS[s].offset < 0 {
+            continue;
+        }
         offset = align_to(offset, SLOTS[s].align);
         SLOTS[s].offset = offset;
         offset += SLOTS[s].size;
@@ -883,7 +892,14 @@ fn emit_ir_block(b: i64, k: i64) {
         let value = BLOCKS[b].cond;
         let ret = FNS[IRFUNCS[IRF].f].ret;
         let c = fn_uses_c(IRFUNCS[IRF].f);
-        if value != 0 && is_compound(ret) && !conv_returns_through_pointer(c, ret) {
+        if value != 0 && INSTS[value].op == Op::Pack {
+            // The pieces of an aggregate result, into the result registers.
+            conv_classify(c, ret);
+            for i in 0..INSTS[value].nargs {
+                pm_add_value(conv_return_piece_reg(c, i), ir_arg(value, i), end);
+            }
+            pm_resolve();
+        } else if value != 0 && is_compound(ret) && !conv_returns_through_pointer(c, ret) {
             // An aggregate returned in registers: its pieces, from its
             // address (out of the way of the result registers).
             conv_classify(c, ret);
@@ -1344,6 +1360,39 @@ fn is_tail_call(v: i64) -> bool {
     call_stack_size(v) == 0
 }
 
+// The pieces of call v's aggregate result (see add_piece_defs): from the
+// result registers to their locations (narrow integers normalized).
+fn emit_call_pieces(v: i64, c: bool, ret: i64) {
+    let mut w = INSTS[v].next;
+    let mut any = false;
+    while w != 0 {
+        if INSTS[w].op == Op::Piece && INSTS[w].a == v && tracked(w) >= 0 {
+            if !any {
+                conv_classify(c, ret);
+                any = true;
+            }
+            let ty = INSTS[w].ty;
+            let reg = conv_return_piece_reg(c, INSTS[w].imm);
+            if ty == TY_BOOL || (is_integer(ty) && int_bits(ty) < 64) {
+                m_normalize(reg, if ty == TY_BOOL { TY_U8 } else { ty });
+            }
+            pm_add(vloc(w, CUR_POS + 2), PM_LOC, reg, ty, 0, w);
+        }
+        w = INSTS[w].next;
+    }
+    if !any {
+        return;
+    }
+    pm_resolve();
+    w = INSTS[v].next;
+    while w != 0 {
+        if INSTS[w].op == Op::Piece && INSTS[w].a == v && tracked(w) >= 0 {
+            result_done(w, vloc(w, CUR_POS + 2));
+        }
+        w = INSTS[w].next;
+    }
+}
+
 fn emit_call_inst(v: i64) {
     let op = INSTS[v].op;
     let mut locations: [i64; 64] = [0; 64];
@@ -1440,6 +1489,7 @@ fn emit_call_inst(v: i64) {
     } else {
         a64_call_indirect();
     }
+    emit_call_pieces(v, c, ret);
     if INSTS[v].c != 0 && !through_pointer {
         // An aggregate result in registers: stored in pieces into its slot.
         conv_classify(c, ret);

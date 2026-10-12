@@ -4,7 +4,7 @@
 # must print the same. Mismatching programs are kept.
 #
 # usage: tests/fuzz/run.sh [-c COMPILER] [-s SEED] [-t TARGET] [-n COUNT]
-#                          [-f FIRST] [-k DIR] [-j JOBS] [-l] [-g] [-p]
+#                          [-f FIRST] [-k DIR] [-j JOBS] [-l] [-g] [-p] [-C]
 #
 #   -c COMPILER   the tachyonc to test (default: target/tachyonc)
 #   -s SEED       also compare with the seed binary (divisors are then
@@ -17,6 +17,7 @@
 #   -l            the loop mode of gen.awk (more loops, slices, test chains)
 #   -g            the generics mode of gen.awk (0.5)
 #   -p            the pressure mode of gen.awk (many parameters and locals)
+#   -C            the calls mode of gen.awk (aggregates passed and returned)
 #   -j JOBS       programs tested at once (default: the number of CPUs)
 
 set -u
@@ -42,8 +43,9 @@ while [ $# -gt 0 ]; do
         -l) LOOPS=1; shift ;;
         -g) GENERICS=1; shift ;;
         -p) PRESSURE=1; shift ;;
+        -C) CALLS=1; shift ;;
         -j) JOBS=$2; shift 2 ;;
-        *) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+        *) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
     esac
 done
 if [ -z "$TARGET" ]; then
@@ -75,7 +77,7 @@ trap 'rm -rf "$WORK"' EXIT INT TERM
 test_seed() {
     seed=$1
     program="$WORK/p$seed.tach"
-    awk -v seed="$seed" -v nonzero="$NONZERO" -v loops="${LOOPS:-0}" -v generics="${GENERICS:-0}" -v pressure="${PRESSURE:-0}" -f "$ROOT/tests/fuzz/gen.awk" >"$program"
+    awk -v seed="$seed" -v nonzero="$NONZERO" -v loops="${LOOPS:-0}" -v generics="${GENERICS:-0}" -v pressure="${PRESSURE:-0}" -v calls="${CALLS:-0}" -f "$ROOT/tests/fuzz/gen.awk" >"$program"
     reference=""
     why=""
     for level in O0 O1 O2 seed; do

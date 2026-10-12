@@ -332,13 +332,28 @@ fn lower_return(value: i64) {
             result = IRFUNCS[IRF].result_ptr;
         }
     } else if is_compound(ret) {
-        // Returned in registers, read in pieces from a multiple of 8 bytes.
-        result = need_value(value, ret);
-        if type_size(ret) % 8 != 0 && INSTS[result].op != Op::Slot {
+        // Returned in registers: its pieces, read from a multiple of 8
+        // bytes, packed for the RET.
+        let mut addr = need_value(value, ret);
+        if type_size(ret) % 8 != 0 && INSTS[addr].op != Op::Slot {
             let copy = ir_slot_addr(new_slot_for(ret));
-            lower_copy(copy, result, type_size(ret));
-            result = copy;
+            lower_copy(copy, addr, type_size(ret));
+            addr = copy;
         }
+        conv_classify(c, ret);
+        let count = ABI_PIECE_COUNT;
+        let mut tys: [i64; 4] = [0; 4];
+        let mut offsets: [i64; 4] = [0; 4];
+        for k in 0..count {
+            tys[k] = ABI_PIECE_TY[k];
+            offsets[k] = ABI_PIECE_OFFSET[k];
+        }
+        let mark = SSA_STACK.count;
+        for k in 0..count {
+            push_arg(ir_load(tys[k], addr, offsets[k]), tys[k]);
+        }
+        result = emit_ir(Op::Pack, 0, 0, 0, 0);
+        take_args(result, mark);
     } else if is_void(ret) {
         // `main` without a result exits with 0.
         if FNS[f].name == MAIN_SYM {
@@ -849,8 +864,22 @@ fn lower_call(n: i64) -> i64 {
     } else {
         call = emit_ir(Op::CallI, result_ty, callee_value, 0, callee_ty);
     }
-    INSTS[call].c = result_ptr;
+    let in_registers = is_compound(ret) && !conv_returns_through_pointer(c, ret);
+    INSTS[call].c = if in_registers { 0 } else { result_ptr };
     take_args(call, mark);
+    if in_registers {
+        // Its pieces, from the result registers (PIECE instructions right
+        // after the call), stored into the result's slot.
+        conv_classify(c, ret);
+        let count = ABI_PIECE_COUNT;
+        let mut pieces: [i64; 4] = [0; 4];
+        for k in 0..count {
+            pieces[k] = emit_ir(Op::Piece, ABI_PIECE_TY[k], call, 0, k);
+        }
+        for k in 0..count {
+            ir_store(ABI_PIECE_TY[k], result_ptr, pieces[k], ABI_PIECE_OFFSET[k]);
+        }
+    }
     if is_compound(ret) {
         return result_ptr;
     }
