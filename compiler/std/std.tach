@@ -5,6 +5,12 @@
 // Option and Result, a growable vector, a byte buffer and printing.
 // Failures (unwrapping None, an index out of bounds) print a message on
 // stderr and exit with 101, like the language's own checks.
+//
+// Unsafe code (0.9): the safe functions here have no undefined behaviour
+// as long as a Vec's and a Buf's fields are changed by their methods only
+// (tachyon has no private fields yet), and a slice from `as_slice` is not
+// used after the Vec grows or is freed. The functions taking C strings
+// are `unsafe fn`: the string must end with a NUL.
 
 extern "C" {
     fn malloc(size: u64) -> *u8;
@@ -15,7 +21,7 @@ extern "C" {
 }
 
 // Prints `message` (a C string) on stderr and exits with 101.
-pub fn panic(message: *u8) -> ! {
+pub unsafe fn panic(message: *u8) -> ! {
     let mut n = 0;
     while message[n] != 0 {
         n += 1;
@@ -44,7 +50,7 @@ impl<T> Option<T> {
     pub fn unwrap(self: Option<T>) -> T {
         match self {
             Option::Some(x) => x,
-            Option::None => panic(c"called unwrap on None"),
+            Option::None => unsafe { panic(c"called unwrap on None") },
         }
     }
 
@@ -73,7 +79,7 @@ impl<T, E> Result<T, E> {
     pub fn unwrap(self: Result<T, E>) -> T {
         match self {
             Result::Ok(x) => x,
-            Result::Err(_) => panic(c"called unwrap on Err"),
+            Result::Err(_) => unsafe { panic(c"called unwrap on Err") },
         }
     }
 
@@ -125,7 +131,7 @@ impl<T> Vec<T> {
         while cap < self.len + extra {
             cap *= 2;
         }
-        self.ptr = realloc(self.ptr as *u8, (cap * size_of(T)) as u64) as *T;
+        self.ptr = unsafe { realloc(self.ptr as *u8, (cap * size_of(T)) as u64) as *T };
         self.cap = cap;
     }
 
@@ -133,7 +139,9 @@ impl<T> Vec<T> {
         if self.len == self.cap {
             self.reserve(1);
         }
-        self.ptr[self.len] = x;
+        unsafe {
+            self.ptr[self.len] = x;
+        }
         self.len += 1;
     }
 
@@ -142,7 +150,7 @@ impl<T> Vec<T> {
             return Option::None;
         }
         self.len -= 1;
-        Option::Some(self.ptr[self.len])
+        Option::Some(unsafe { self.ptr[self.len] })
     }
 
     // Element i (checked: out of bounds exits with 101).
@@ -155,7 +163,7 @@ impl<T> Vec<T> {
     }
 
     pub fn as_slice(self: *Vec<T>) -> [T] {
-        self.ptr[0..self.len]
+        unsafe { self.ptr[0..self.len] }
     }
 
     pub fn clear(self: *Vec<T>) {
@@ -163,7 +171,9 @@ impl<T> Vec<T> {
     }
 
     pub fn free(self: *Vec<T>) {
-        free(self.ptr as *u8);
+        unsafe {
+            free(self.ptr as *u8);
+        }
         self.ptr = 0 as *T;
         self.len = 0;
         self.cap = 0;
@@ -196,7 +206,7 @@ impl Buf {
     }
 
     // A C string (up to its NUL).
-    pub fn push_cstr(self: *Buf, s: *u8) {
+    pub unsafe fn push_cstr(self: *Buf, s: *u8) {
         let mut i = 0;
         while s[i] != 0 {
             self.bytes.push(s[i]);
@@ -209,7 +219,7 @@ impl Buf {
         if v < 0 {
             self.push('-');
             if v == -9223372036854775807 - 1 {
-                self.push_cstr(c"9223372036854775808");
+                self.push_str("9223372036854775808");
                 return;
             }
             self.push_int(-v);
@@ -237,12 +247,14 @@ impl Buf {
 // ---- Printing ----
 
 pub fn print(s: [u8]) {
-    write(1, s.ptr, s.len as u64);
+    unsafe {
+        write(1, s.ptr, s.len as u64);
+    }
 }
 
 pub fn println(s: [u8]) {
     print(s);
-    write(1, c"\n", 1);
+    print("\n");
 }
 
 pub fn print_int(v: i64) {
@@ -252,7 +264,8 @@ pub fn print_int(v: i64) {
     b.free();
 }
 
-pub fn print_cstr(s: *u8) {
+// A C string (up to its NUL).
+pub unsafe fn print_cstr(s: *u8) {
     let mut b = Buf::new();
     b.push_cstr(s);
     print(b.as_slice());

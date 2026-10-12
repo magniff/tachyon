@@ -409,13 +409,16 @@ function emit_function(k,    i, line) {
     }
     print "}" > CF
     # Tachyon: t_fK, the extern "C" definition.
+    # (0.9: its body, of C calls, unions and casts, is unsafe code)
     print "extern \"C\" fn t_f" k "(" t_params(k) ")" t_ret(k) " {" > TF
+    print "    unsafe {" > TF
     LEAF = args_base(k)
     for (i = 0; i < NPAR[k]; i++) t_checks(PT[k, i], "a" i, k, 200 + i, "    ")
     if (RT[k] != "void") {
         LEAF = result_base(k)
         print "    " t_value(RT[k]) > TF
     }
+    print "    }" > TF
     print "}" > TF
 }
 
@@ -530,12 +533,14 @@ BEGIN {
     }
     close(DECLS)
     print "fn main() -> i32 {" > TF
+    print "    unsafe {" > TF
     DEPTHN = 0
     for (k = 0; k < NFN; k++) emit_calls(k)
     NV = 1 + rnd(3)
     for (k = 0; k < NV; k++) emit_variadic(k)
     print "    " CQ "printf(c\"ok\\n\");" > TF
     print "    0" > TF
+    print "    }" > TF
     print "}" > TF
     close(DECLS)
     if (!IMPORT) {

@@ -8,7 +8,7 @@ use crate::base::{
 };
 use crate::lexer::{STRS, SUF_NONE, TOKS, TOK_COUNT, Tok};
 use crate::ast::{
-    ARM_NO_ELSE, ARM_SYNTHETIC, FN_COLD, FN_INLINE, FN_NO_INLINE, NODES, NodeKind, REPR_C, REPR_INT,
+    ARM_NO_ELSE, ARM_SYNTHETIC, BLOCK_UNSAFE, FN_COLD, FN_INLINE, FN_NO_INLINE, FN_UNSAFE, NODES, NodeKind, REPR_C, REPR_INT,
     REPR_PACKED, REPR_UNION, SCRATCH, child, list_begin, list_end, list_push, new_node,
 };
 use crate::check::name_error;
@@ -20,7 +20,7 @@ use crate::lexer::Tok::{
     LBrace, LBracket, LParen, Let, Loop, Lt, LtEq, Match, Minus, MinusEq, Mod, Mut, Percent,
     PercentEq, Pipe, PipeEq, PipePipe, Plus, PlusEq, Pub, Question, RBrace, RBracket, RParen,
     Reserved, Return, Semi, Shl, ShlEq, Shr, ShrEq, Slash, SlashEq, Star, StarEq, Static, Str,
-    Struct, Tilde, True, Type, Union, Use, While,
+    Struct, Tilde, Trait, True, Type, Union, Unsafe, Use, While,
 };
 
 static mut P: i64 = 0;
@@ -176,7 +176,7 @@ fn skip_to_item(start: i64) {
         let pos = TOKS[P].start;
         let line_start = pos == 0 || SRC[pos - 1] == '\n';
         if line_start && (is_item_start(cur()) || at(Pub) || at(Use) || at(Mod)
-            || at(Import) || at(Hash) || at(Impl)) {
+            || at(Import) || at(Hash) || at(Impl) || at(Unsafe) || at(Trait)) {
             return;
         }
         advance();
@@ -280,7 +280,7 @@ fn mark_public(item: i64, public: bool) {
 
 fn parse_item() -> i64 {
     match cur() {
-        Fn => parse_function(),
+        Fn | Unsafe => parse_function(),
         Struct | Union => parse_struct(),
         Const => parse_const_or_static(NodeKind::Const),
         Static => parse_const_or_static(NodeKind::Static),
@@ -306,7 +306,7 @@ fn parse_impl(public: bool) {
         let attrs_start = cur_start();
         let flags = parse_fn_attributes();
         let item_public = eat(Pub) || public;
-        if !at(Fn) {
+        if !at(Fn) && !(at(Unsafe) && tok_kind(1) == Fn) {
             if flags != 0 {
                 error_at(attrs_start, c"#[inline] and #[cold] go before a function");
             }
@@ -454,8 +454,13 @@ fn parse_enum() -> i64 {
 
 fn parse_function() -> i64 {
     let start = cur_start();
+    // `unsafe fn` (0.9).
+    let is_unsafe = eat(Unsafe);
     expect(Fn);
     let n = new_node(NodeKind::Fn, start, 0);
+    if is_unsafe {
+        NODES[n].p |= FN_UNSAFE;
+    }
     NODES[n].a = expect_binding_name();
     NODES[n].g = parse_generic_params();
     expect(LParen);
@@ -818,7 +823,7 @@ fn parse_attributed_item(public: bool) -> i64 {
         if repr {
             error_at(at_start, c"#[repr(...)] and function attributes cannot be combined");
         }
-        if !at(Fn) {
+        if !at(Fn) && !(at(Unsafe) && tok_kind(1) == Fn) {
             error_at(at_start, c"#[inline] and #[cold] go before a function");
         }
         check_fn_attributes(fn_flags, at_start);
@@ -1166,7 +1171,7 @@ fn at_label() -> bool {
 fn at_block_like() -> bool {
     let kind = cur();
     kind == LBrace || kind == If || kind == Loop || kind == While
-        || kind == For || kind == Match || at_label()
+        || kind == For || kind == Match || at_label() || (kind == Unsafe && tok_kind(1) == LBrace)
 }
 
 fn expr_stmt(expr: i64, has_semi: i64, start: i64) -> i64 {
@@ -1573,6 +1578,7 @@ fn starts_expr(kind: Tok) -> bool {
         || kind == Tilde || kind == Star || kind == Amp || kind == AmpAmp
         || kind == If || kind == Loop || kind == While || kind == For
         || kind == Return || kind == Break || kind == Continue || kind == Match
+        || kind == Unsafe
 }
 
 fn make_unary(op: Tok, operand: i64, start: i64) -> i64 {
@@ -1780,6 +1786,17 @@ fn parse_primary() -> i64 {
         return e;
     }
     if kind == LBrace { return parse_block(); }
+    if kind == Unsafe {
+        // `unsafe { ... }` (0.9): a block of unsafe code.
+        advance();
+        if !at(LBrace) {
+            syntax_error(c"expected '{' after 'unsafe' (an unsafe block), or 'unsafe fn' as an item");
+        }
+        let block = parse_block();
+        NODES[block].start = start;
+        NODES[block].p |= BLOCK_UNSAFE;
+        return block;
+    }
     if kind == If { return parse_if(); }
     if kind == Match { return parse_match(); }
     if kind == Loop || kind == While || kind == For {

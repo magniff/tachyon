@@ -352,6 +352,17 @@ matters to agents above all.
 
 ## 0.9: unsafe, traits and equality saturation
 
+**0.9 status** (work in progress on branch `release-0.9`):
+
+- done: `unsafe` blocks and `unsafe fn`, borrows, `warning[unsafe]`,
+  `--deny-warnings`, `--allow-unsafe` (bootstrap interface `tachyonc-0.9`),
+  `--fix-unsafe`; std, tests, examples, bench and fuzzers migrated
+- in progress: -
+- remaining: traits (bounds, impls, operator traits, std HashMap and
+  sort); small fixes (const arrays, statics of structs with strings,
+  line continuations, `Some`/`None` branch inference, cross-compiled C
+  imports); e-graph rewriting (only if time allows)
+
 Language: `unsafe` blocks and functions: raw-pointer dereference,
 indexing and arithmetic, freeing memory and calls into C only inside them,
 so that safe code has no undefined behaviour at all; a checking mode for

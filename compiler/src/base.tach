@@ -491,11 +491,95 @@ pub fn has_errors() -> bool {
     ERROR_COUNT > 0
 }
 
+// ---- Warnings (0.9) ----
+//
+// A warning is printed like an error, `warning[<kind>]: ...`, and does not
+// fail the compilation; each (position, message) once, however often the
+// checker meets it (a generic function is checked per instance), in
+// position order, at most MAX_WARNINGS of them. `--deny-warnings` makes
+// every warning an error.
+
+pub static mut DENY_WARNINGS: bool = false;
+const MAX_WARNINGS: i64 = 50;
+// The recorded warnings: position, text (a buffer), key, in triples.
+static mut WARNINGS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// Records a warning (or, with --deny-warnings, an error) at `pos`; `key`
+// tells warnings at one position apart.
+pub fn report_warning(pos: i64, key: i64, kind: *u8, message: *u8, help: *u8) {
+    let mut i = 0;
+    while i < WARNINGS.count {
+        if WARNINGS.data[i] == pos && WARNINGS.data[i + 2] == key {
+            return;
+        }
+        i += 3;
+    }
+    let out = buf_new();
+    buf_str(out, if DENY_WARNINGS { c"error[" } else { c"warning[" });
+    buf_str(out, kind);
+    buf_str(out, c"]: ");
+    buf_str(out, message);
+    buf_str(out, c"\n --> ");
+    buf_position(out, pos);
+    buf_byte(out, '\n');
+    if help != 0 as *u8 {
+        buf_str(out, c"  = help: ");
+        buf_str(out, help);
+        buf_byte(out, '\n');
+    }
+    WARNINGS.push(pos);
+    WARNINGS.push(out);
+    WARNINGS.push(key);
+    if DENY_WARNINGS && ERROR_COUNT < MAX_ERRORS {
+        ERRORS.push(pos);
+        ERRORS.push(out);
+        ERROR_COUNT += 1;
+    }
+}
+
+// The number of warnings recorded.
+pub fn warning_count() -> i64 {
+    WARNINGS.count / 3
+}
+
+// Prints the recorded warnings (not with --deny-warnings: they are
+// errors), sorted by position, and forgets them.
+pub fn flush_warnings() {
+    let n = WARNINGS.count / 3;
+    if n == 0 || DENY_WARNINGS {
+        return;
+    }
+    for i in 1..n {
+        let mut j = i;
+        while j > 0 && WARNINGS.data[3 * (j - 1)] > WARNINGS.data[3 * j] {
+            for k in 0..3 {
+                let t = WARNINGS.data[3 * j + k];
+                WARNINGS.data[3 * j + k] = WARNINGS.data[3 * (j - 1) + k];
+                WARNINGS.data[3 * (j - 1) + k] = t;
+            }
+            j -= 1;
+        }
+    }
+    let out = buf_new();
+    let shown = if n < MAX_WARNINGS { n } else { MAX_WARNINGS };
+    for i in 0..shown {
+        buf_bytes(out, buf_slice(WARNINGS.data[3 * i + 1]));
+    }
+    if n > shown {
+        buf_str(out, c"warning: ");
+        buf_int(out, n - shown);
+        buf_str(out, c" more warnings not shown\n");
+    }
+    buf_write_fd(out, STDERR);
+    WARNINGS.count = 0;
+}
+
 // Prints the recorded errors and exits with 1, if there are any.
 pub fn exit_if_errors() {
     if ERROR_COUNT == 0 {
         return;
     }
+    flush_warnings();
     // Sorted by position (stable: an insertion sort of the pairs).
     let n = ERRORS.count / 2;
     for i in 1..n {

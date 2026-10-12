@@ -42,6 +42,22 @@ binary is invoked, where its test runner is and which hosts it supports.
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
+### What's new in 0.9 (in progress)
+
+- **Unsafe code.** `unsafe { ... }` blocks and `unsafe fn`: dereferencing,
+  indexing and slicing raw pointers, integer-to-pointer casts, calls into
+  C and to `unsafe fn`, and reading union fields are allowed only there,
+  so safe code has no undefined behaviour. Pointer parameters (and
+  `self: *T`) are *borrows*, dereferenced in safe code; passing a raw
+  pointer to one is unsafe. In 0.9 an unsafe operation outside unsafe
+  code is a warning (`warning[unsafe]`; `--deny-warnings` makes warnings
+  errors), an error from 0.10; `tachyonc --fix-unsafe` adds the blocks.
+  The compiler's own source is built with `--allow-unsafe` (interface
+  `tachyonc-0.9`) until 0.10 migrates it. std's `panic`, `print_cstr` and
+  `Buf::push_cstr` are `unsafe fn` (breaking). The tests, examples,
+  benchmarks and fuzzers are unsafe-clean, and the test suite compiles
+  every case with `--deny-warnings`.
+
 ### What's new in 0.8
 
 - **No wildcard imports** (breaking). `use a::b::*;`, `use E::*;` and

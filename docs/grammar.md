@@ -39,12 +39,12 @@ tuple index, so `t.0.1` is `(t.0).1`. A literal must not be followed
 directly by other letters (`3e` and `1foo` are errors).
 
 **Keywords:** `as break const continue defer else enum extern false fn for
-if impl import in let loop match mod mut pub return static struct true type
-union use while` (`import` and `use` since 0.4, `pub` and `mod` since 0.5,
-`defer` since 0.6).
+if impl import in let loop match mod mut pub return static struct trait true
+type union unsafe use while` (`import` and `use` since 0.4, `pub` and `mod`
+since 0.5, `defer` since 0.6, `unsafe` and `trait` since 0.9).
 
-**Reserved** (an error if used): the keywords `trait where unsafe dyn
-move`, and the tokens `?` `@`. `self` and `Self` are
+**Reserved** (an error if used): the keywords `where dyn move`, and the
+tokens `?` `@`. `self` and `Self` are
 ordinary names, with a meaning in methods (see Items).
 
 A token is *joint* when no whitespace follows it.
@@ -69,7 +69,8 @@ mod_item     = "mod" ident ";"                         (* (0.5) the module in id
              | "mod" ident "{" { item } "}" ;          (* (0.6) an inline module *)
 path         = ident { "::" ident } ;                  (* crate, self, super, std, modules, an enum *)
 
-fn_decl      = "fn" ident [ generics ] "(" [ params ] ")" [ "->" type ] block ;
+fn_decl      = [ "unsafe" ] "fn" ident [ generics ] "(" [ params ] ")" [ "->" type ] block ;
+                                                       (* unsafe: (0.9), see "Unsafe code" *)
 generics     = "<" ident { "," ident } [ "," ] ">" ;  (* (0.5) type parameters, see "Generics" *)
 params       = param { "," param } [ "," ] ;
 param        = [ "mut" ] ident ":" type ;              (* "_" ignores the argument *)
@@ -168,7 +169,8 @@ stmt        = ";"                                      (* empty statement *)
             | "defer" ( block [ ";" ] | expr ";" )    (* (0.6) *)
             | block_like [ ";" ]
             | expr ";" ;
-block_like  = block | if_expr | match_expr | loop_expr | while_expr | for_expr ;
+block_like  = block | "unsafe" block | if_expr | match_expr | loop_expr | while_expr | for_expr ;
+                                                       (* unsafe block: (0.9) *)
 ```
 
 **Statement rule.** A statement that *starts* with a block-like expression
@@ -181,7 +183,7 @@ block's value.
 Bindings are immutable unless declared `mut`; this covers assignment to the
 variable and to its fields and elements. Raw pointers are unchecked, as in
 C: `*p = v` and `p[i] = v` need no `mut`, and `&x` may be taken of an
-immutable `x`.
+immutable `x`; using a raw pointer is unsafe code (0.9, see "Unsafe code").
 
 ## Expressions
 
@@ -259,9 +261,9 @@ The principle: a tachyon program means one thing, the same at every
 optimization level and on every target, so that it can be reasoned about
 (by people and by agents) from what it says. Where C leaves behaviour
 undefined, tachyon defines it, or checks it and stops with a message.
-The aim is no undefined behaviour at all in code that does not opt out of
-the checks; the operations below that are still undefined all involve raw
-pointers or C, and move behind an `unsafe` boundary in 0.9.
+Since 0.9 there is none at all in safe code: the operations that can
+have it (all of them through raw pointers, unions or C) are allowed only
+in unsafe code, `unsafe { ... }` and `unsafe fn`.
 
 **Defined** (each case checked at -O0 and -O2, on AArch64 and x86-64, at
 run time and in constant folding, which agree):
@@ -301,38 +303,59 @@ run time and in constant folding, which agree):
   the program (a guard page); it never corrupts memory. It is not yet a
   panic with a message.
 
-**Still undefined** (all of it through raw pointers or C):
+**Safe code has no undefined behaviour** *(0.9)*. Everything that can
+have undefined behaviour is an *unsafe operation*, allowed only in unsafe
+code: inside an `unsafe { ... }` block or the body of an `unsafe fn` (see
+"Unsafe code" below for the rules, including borrowed pointer
+parameters). The unsafe operations, and what they promise:
 
-- Dereferencing a raw pointer (`*p`, `p[i]`, `p.f` through a pointer)
+- Dereferencing a raw pointer (`*p`, `p.f`, a method called through `p`)
   that does not point to live memory of its type and alignment: null,
   dangling (freed, or a returned local's address), out of bounds or
-  misaligned. Raw-pointer indexing `p[i]` is unchecked by design: a
-  pointer has no length.
-- Slicing a raw pointer (`p[lo..hi]`): the slice is only as valid as the
-  memory behind it.
-- Pointer arithmetic and casts: an integer cast to a pointer, a pointer
-  to one type used as another beyond the memory it points to.
-- Using an array or slice whose storage was moved or freed during the
-  expression that uses it: `a[f()]` reads the raw pointer `a` before
-  calling `f`; if `f` reallocates it, the access is through a dangling
-  pointer.
-- Reading memory nobody wrote (from `malloc`, or the padding of a struct
-  read as bytes): the value is unspecified, and the optimizer may assume
-  any value for it.
-- Calling C: everything C leaves undefined stays so (including a
-  declaration in an `extern "C"` block that does not match the C
-  definition, and `longjmp` past frames that need cleanup).
-- Calling a function pointer made from an integer or from a pointer of
-  another type.
+  misaligned. A *borrow* (`&place`, or a pointer parameter) is not a raw
+  pointer: dereferencing it is safe.
+- Indexing a raw pointer, `p[i]` (unchecked by design: a pointer has no
+  length), and slicing one, `p[lo..hi]` (the slice is only as valid as
+  the memory behind it).
+- Casting an integer to a pointer (other than the literal `0`, a null
+  pointer, which safe code cannot dereference). Pointer-to-pointer and
+  pointer-to-integer casts are safe; tachyon has no pointer arithmetic
+  (cast to an integer and back, in unsafe code).
+- Calling C: an `extern "C"` declaration (also the ones `import` makes)
+  or an `extern "C" fn` pointer. Everything C leaves undefined stays so
+  (including a declaration that does not match the C definition, and
+  `longjmp` past frames that need cleanup).
+- Calling an `unsafe fn`, whose contract the caller keeps.
+- Reading a field of a union (its bytes, reinterpreted). Writing one, and
+  taking its address, are safe.
+- Passing a pointer that is not a borrow to a function's pointer
+  parameter (which the function dereferences as a borrow), calling a
+  plain function pointer with one, and using an `unsafe fn` or a function
+  with pointer parameters as a value.
 
-**The plan.** 0.9 introduces `unsafe` blocks and `unsafe fn`: every
-operation in the second list (raw-pointer dereference, indexing,
-slicing, arithmetic and casts, calls to `extern "C"` functions and
-through pointers made from integers) is allowed only inside them, and
-safe code (the rest of the language, std's safe API) has no undefined
-behaviour. Reading uninitialized heap memory goes away with a std
-allocator that zeroes (or a `freeze`), and stack exhaustion becomes a
-panic with a message.
+What unsafe code must keep, so that the safe code around it stays
+defined, is the same list: every pointer it hands to safe code as a
+borrow points to live memory of its type, and every slice it makes is
+valid for its length while it is used. The same holds for memory a
+slice views: a slice of an array is valid while the array lives, and one
+from `Vec::as_slice` until the vector grows or is freed (tachyon has no
+lifetimes; using a view after its storage is gone is the one way safe
+code can still reach undefined behaviour, and std's types assume their
+fields are changed by their methods only, as tachyon has no private
+fields yet).
+
+Reading memory nobody wrote (from `malloc`, or a struct's padding read as
+bytes, both through raw pointers) gives an unspecified value, which the
+optimizer may take to be any value. Statics, `static mut` included, are
+safe to use: tachyon has no threads of its own (threads started through
+C are C's business). Runaway recursion still exhausts the stack, which
+the operating system stops (a guard page) without corrupting memory.
+
+**Transition.** In 0.9 an unsafe operation outside unsafe code is a
+*warning* (`warning[unsafe]`; `--deny-warnings` makes it an error); in
+0.10 it is an error. `tachyonc --fix-unsafe` wraps the operations in
+unsafe blocks. The compiler's own source, built by 0.8.0, migrates in
+0.10; until then the bootstrap builds it with `--allow-unsafe`.
 
 ## Layout, conventions and C
 
@@ -704,6 +727,80 @@ did, then:
 A program the tool cannot rewrite is one 0.7 rejects as well (a name two
 `*` imports bring, for instance); then it reports the errors and changes
 nothing. A second run finds nothing to do.
+
+## Additions of 0.9
+
+### Unsafe code
+
+```ebnf
+fn_decl      = [ "unsafe" ] "fn" ident ... ;          (* also in impl blocks, after pub and attributes *)
+unsafe_block = "unsafe" block ;                        (* an expression, block-like *)
+```
+
+An `unsafe { ... }` block is a block whose statements are *unsafe code*:
+the operations listed in "Undefined behaviour" (dereferencing, indexing
+and slicing raw pointers, integer-to-pointer casts, calling C or an
+`unsafe fn`, reading a union's field, passing raw pointers where
+borrows are expected) are allowed in it. Like any block, it is an
+expression (`let x = unsafe { *p };`) and a block-like statement. The
+body of an `unsafe fn` is unsafe code; calling one is an unsafe
+operation, so its callers take on its contract (document it next to the
+function). Nesting changes nothing: unsafe code inside unsafe code.
+
+```
+extern "C" { fn strlen(s: *u8) -> u64; }
+
+// The caller promises a NUL-terminated string.
+unsafe fn length(s: *u8) -> i64 { strlen(s) as i64 }
+
+fn main() -> i32 {
+    let n = unsafe { length(c"four") };
+    n as i32
+}
+```
+
+**Borrows.** Tachyon has raw pointers only, and methods take
+`self: *T`; to keep ordinary code safe, a pointer known to be valid is a
+*borrow*:
+
+- `&place` (the address of a local, a static, a field or a checked
+  element), and the receiver a method call takes that way (`v.push(1)`);
+- a parameter declared with a pointer type and not `mut`, `self: *T`
+  included.
+
+Dereferencing a borrow (`*p`, `p.f`, `p.m()`) is safe; indexing it
+(`p[i]`) is not (a borrow is one value, not an array). In exchange, a
+call passing something other than a borrow to a pointer parameter (a
+pointer field, a local holding a pointer, `malloc`'s result, `c"..."`,
+which is read-only memory) is unsafe: the caller vouches for it. A
+parameter of a generic type (`x: T`) is not a borrow, even when `T` is a
+pointer, so `Vec<*u8>::push(c"text")` is safe. A plain function pointer
+does not say whether its function borrows: calling one with a pointer
+argument that is not a borrow is unsafe, and so is making a function
+with pointer parameters into a value (`let f = add_one;`).
+
+**Diagnostics.** An unsafe operation outside unsafe code is reported as
+`warning[unsafe]` (each place once, at most 50, in source order); the
+program still compiles. Options:
+
+- `--deny-warnings`: warnings are errors (`error[unsafe]`); the test suite
+  compiles every case so.
+- `--allow-unsafe`: no unsafe warnings at all. The bootstrap passes it
+  (interface `tachyonc-0.9` in `bootstrap/releases.toml`) when it builds
+  the compiler's own source, which 0.8.0 compiles and which uses raw
+  pointers everywhere; releases before 0.9 are built as before.
+- `tachyonc --fix-unsafe FILE...`: rewrites the program in place, putting
+  each unsafe operation outside unsafe code in an unsafe block: the
+  statement around it (consecutive statements share one block), a
+  `let`'s value, a condition, a match arm or a block's tail. Nothing else
+  changes; a second run finds nothing to do.
+
+In 0.10 the warning becomes an error (and the compiler's source is
+migrated with `--fix-unsafe`).
+
+**std.** `panic`, `Buf::push_cstr` and `print_cstr` take C strings, which
+must end with a NUL: they are `unsafe fn` now (breaking). Everything else
+in std is safe and uses unsafe blocks inside.
 
 ## Importing C headers
 
