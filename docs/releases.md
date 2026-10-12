@@ -39,6 +39,7 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.6.0 | `v0.6.0` | 0.5.0 | aarch64-macos, x86_64-linux, x86_64-macos | interprocedural: the compiler written as a module tree; string literals as slices, `if let`, `defer`, structural `==`, a prelude, inline modules, generic type aliases; a cost-model inliner, attribute inference, interprocedural constants, devirtualization, scalar promotion, heap to stack, global DCE; shrink-wrapping; `--time-passes`, `--stats` |
 | 0.7.0 | `v0.7.0` | 0.6.0 | aarch64-macos, x86_64-linux, x86_64-macos | object files: an assembler in the compiler writes Mach-O and ELF objects, `cc` only links (the compiler builds itself 4.4× faster at `-O2`, 15.7× at `-O0`); fixed-array indexing is checked; the undefined behaviour left is documented |
 | 0.8.0 | `v0.8.0` | 0.7.0 | aarch64-macos, x86_64-linux, x86_64-macos | no wildcard imports: `use x::*` and `import "h.h";` without `as` are removed, every name a file uses is declared, imported by name or written with its path; `tachyonc --fix-imports` rewrites older code |
+| 0.9.0 | `v0.9.0` | 0.8.0 | aarch64-macos, x86_64-linux, x86_64-macos | `unsafe`, traits and an e-graph: `unsafe` blocks and functions (safe code has no undefined behaviour; a warning in 0.9, an error from 0.10), `--fix-unsafe`; traits, bounds, operator traits, std `HashMap` and `sort`; array constants, line continuations; GVN on an acyclic e-graph with rewrite rules checked by `--check-rules` |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
@@ -72,6 +73,33 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   rules (a small pattern language) and cost-based extraction;
   `tachyonc --check-rules` checks every rule on random values at every
   integer width (tests/run.sh runs it).
+
+### What's new in 0.9
+
+- **`unsafe`.** Raw-pointer dereference, indexing and slicing, integer to
+  pointer casts, calls to C functions and to `unsafe fn`, and reading a
+  union's field need an `unsafe { ... }` block or an `unsafe fn`: safe code
+  has no undefined behaviour (see [grammar.md](grammar.md), which also
+  states the gaps left: slices outliving their storage). A pointer
+  parameter that is not `mut` is a borrow, and dereferencing it is safe.
+  In 0.9 an unsafe operation outside `unsafe` is a warning
+  (`--deny-warnings` makes it an error, as every test does); from 0.10 it
+  is an error. `tachyonc --fix-unsafe` adds the blocks. Breaking: std's
+  `panic`, `print_cstr` and `Buf::push_cstr` are `unsafe fn`.
+- **Traits**: `trait`, default functions, `impl Trait for T`, generic
+  impls with bounds, bounds on functions and types (checked at
+  instantiation), one impl per trait and type; operator traits `Add`,
+  `Sub`, `Mul`, `Div`, `Neg`, `Eq`, `Ord`. std: `Hash`, `Eq`/`Ord`/`Hash`
+  for the integers, `bool` and `[u8]`, `std::HashMap`, `std::sort`. No
+  trait objects yet. Unbounded generics mean what they did.
+- Array constants, string literals in static aggregates, `\` line
+  continuations in strings, `Some`/`None` inferred across `if`/`else`;
+  `$TACHYON_CC` names a cross C compiler for `import`.
+- **An e-graph**: GVN works on an acyclic e-graph (as Cranelift's aegraph)
+  with 31 rewrite rules in a small pattern language, the cheapest member
+  of each class extracted; `tachyonc --check-rules` tests every rule on
+  random values at every integer width (run by the test suite). It costs
+  about 5% of `-O2` compile time.
 
 ### What's new in 0.8
 
