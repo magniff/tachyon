@@ -61,9 +61,9 @@ item         = [ "pub" ] [ attributes ] [ "pub" ]       (* (0.6) attributes may 
              | const_decl | static_decl | type_alias
              | import_item | use_item | mod_item )      (* pub, mod: (0.5); import, use: (0.4) *)
              | impl_block ;
-import_item  = "import" string_lit [ "as" ident ] ";" ;   (* (0.4) a C header, see "Importing C headers"; as: (0.5) *)
-use_item     = "use" path "::" ( "*" | "{" use_name { "," use_name } [ "," ] "}" ) ";"
-             | "use" path "::" use_name ";" ;          (* (0.4) variants of an enum; (0.5) paths, as *)
+import_item  = "import" string_lit "as" ident ";" ;     (* (0.4) a C header, see "Importing C headers"; as: (0.5), required (0.8) *)
+use_item     = "use" path "::" "{" use_name { "," use_name } [ "," ] "}" ";"
+             | "use" path "::" use_name ";" ;          (* (0.4) variants of an enum; (0.5) paths, as; no "*" (0.8) *)
 use_name     = ident [ "as" ident ] ;
 mod_item     = "mod" ident ";"                         (* (0.5) the module in ident.tach, see "Modules" *)
              | "mod" ident "{" { item } "}" ;          (* (0.6) an inline module *)
@@ -436,8 +436,9 @@ exits with code 101, at every optimization level. Fieldless enums compare
 with `<`, `<=`, `>` and `>=` in declaration order, which must be the order
 of their discriminants (an error otherwise). `E::A..=E::C` matches the
 variants from `A` to `C` in declaration order (variants without fields).
-`use E::*;` and `use E::{A, B};` bring variants into scope by their own
-names: as values (`A`), calls (`B(1, 2)`) and patterns (`A`, `B(x, _)`).
+`use E::{A, B};` (and, until 0.8, `use E::*;`) brings variants into scope
+by their own names: as values (`A`), calls (`B(1, 2)`) and patterns (`A`,
+`B(x, _)`).
 A local, constant, static or function of the same name wins. `use` is the
 keyword modules will extend (0.5): `use path::{...};`.
 
@@ -554,15 +555,15 @@ name in scope (an item, a child module, an import), `crate` (the root
 module), `self` (this module), `super` (the parent module) or `std`.
 
 `use` brings names into scope: `use a::b::c;`, `use a::b::c as d;`, `use
-a::b::{c, d as e};`, `use a::b::*;` (every public item of module `a::b`,
-or every variant of an enum). Names declared in a module win over those a
-`*` brings in. `pub use` re-exports: the module's users see the name as
-one of its items. Imports are resolved on demand, so their order does not
-matter; an import that depends on itself is an error.
+a::b::{c, d as e};` (until 0.8 also `use a::b::*;`, every public item of
+module `a::b`, or every variant of an enum). `pub use` re-exports: the
+module's users see the name as one of its items. Imports are resolved on
+demand, so their order does not matter; an import that depends on itself
+is an error.
 
-`import "stdio.h";` *(0.4)* makes the declarations of C headers visible in
-the importing module; `import "stdio.h" as c;` names them instead
-(`c::printf(...)`). All the imported headers of a program share one module
+`import "stdio.h" as c;` names the declarations of C headers in the
+importing module (`c::printf(...)`; until 0.8, `import "stdio.h";` made
+them visible by their own names). All the imported headers of a program share one module
 of C declarations. They see the root module's names: a type the program
 declares replaces the header's type of the same name (as in 0.4), while the
 program's functions and constants of the same names coexist with the
@@ -576,7 +577,7 @@ as one root module.
 ### The standard library
 
 The module `std` is built into the compiler, read when a program names it
-(`std::Vec<i64>`, `use std::*;`): `Option<T>` and `Result<T, E>` (`is_some`,
+(`std::Vec<i64>`, `use std::{Buf, Vec};`): `Option<T>` and `Result<T, E>` (`is_some`,
 `unwrap`, `unwrap_or`, `ok`...), `Vec<T>` (`new`, `with_capacity`, `push`,
 `pop`, `get` and `set` checked like a slice's index, `len`, `as_slice`,
 `clear`, `free`), `Buf` (a byte buffer: `push`, `push_str`, `push_cstr`,
@@ -631,13 +632,13 @@ naming it.
 
 **The prelude.** Every module sees `Option`, `Some`, `None`, `Result`,
 `Ok`, `Err`, `Vec`, `print` and `println` (from `std`) without `use`. The
-prelude comes last: the module's own items, its imports, its `*` imports
-and local bindings all shadow it, so programs defining these names keep
+prelude comes last: the module's own items, its imports (and, until 0.8,
+its `*` imports) and local bindings all shadow it, so programs defining these names keep
 their meaning. The standard library is loaded when a program names one of
 them (or `std`).
 
-**Variants of generic enums by name.** `use Opt::*;` (and the prelude's
-`Some`, `None`, `Ok`, `Err`) brings the variants of a generic enum into
+**Variants of generic enums by name.** `use Opt::{Som, Non};` (and the
+prelude's `Some`, `None`, `Ok`, `Err`) brings the variants of a generic enum into
 scope, in expressions, calls and patterns; their type arguments are
 inferred as for `Opt::Som(x)`.
 
@@ -645,7 +646,8 @@ inferred as for `Opt::Som(x)`.
 module's own item, a name imported by name (`use a::b;`), a name brought
 by a `*` import, the prelude. Two `*` imports may bring different things
 under one name; using that name is then an error (import it by name, or
-write its path), where 0.5 silently took the first.
+write its path), where 0.5 silently took the first. (0.8 removed `*`
+imports.)
 
 **Inline modules.** `mod name { items }` declares a child module in place,
 with the same rules as a module in its own file (privacy, `use`, `super`).
@@ -659,10 +661,55 @@ Not in 0.6 (moved to 0.7): const generic lengths (`[T; N]` with `N` a
 parameter); `errno` and other macros that expand to expressions in C
 headers.
 
+## Additions of 0.8
+
+**No wildcard imports.** Every name a file uses is declared in it,
+imported by name, or written with its path, so what a name means can be
+traced from where it is used to a declaration or an explicit import,
+without knowing what another module happens to contain (or will contain
+later). Gone:
+
+- `use a::b::*;` and `use E::*;`: write `use a::b::{c, d};` and `use
+  E::{A, B};`, or the paths (`a::b::c`, `E::A`);
+- `import "stdio.h";`, which brought every declaration of a header into
+  scope: write `import "stdio.h" as c;` and `c::printf(...)`. All headers
+  share one module of C declarations, so one name serves them all
+  (`import "stdio.h" as c; import "stdlib.h" as c;`). In a pattern, where
+  a path names a variant, import the constant by name: `use c::EOF;`.
+
+The prelude stays: a fixed, documented list of names (`Option`, `Some`,
+`None`, `Result`, `Ok`, `Err`, `Vec`, `print`, `println`), not a wildcard.
+
+The errors for the removed forms name their replacement, from what the
+program uses through them: `wildcard imports are not allowed: write 'use
+util::{double, half};'`.
+
+**`tachyonc --fix-imports FILE...`** rewrites a program written for 0.7 or
+earlier, in place: every file of it (the files of its modules too). It
+checks the program as for compiling it, resolving the old forms as 0.7
+did, then:
+
+- each `use X::*;` becomes `use X::{names};` (or `use X::name;`), listing,
+  sorted, the names the program finds through it (a name the module
+  declares itself, or imports by name, is not among them, as it was not
+  found through the `*`); a `*` nothing is found through is removed. Long
+  lists are wrapped, one line of names after the other;
+- each `import "h.h";` becomes `import "h.h" as c;` (`c` unless the module
+  has another `c`), and each use of a declaration found through it is
+  written `c::name` (a `*` that led to such a declaration, as `use
+  super::*;` from an inline module, imports `c` instead; an import by name
+  through another module, `use io::printf;`, is left for you to rewrite);
+- nothing else changes, byte for byte.
+
+A program the tool cannot rewrite is one 0.7 rejects as well (a name two
+`*` imports bring, for instance); then it reports the errors and changes
+nothing. A second run finds nothing to do.
+
 ## Importing C headers
 
-`import "stdio.h";` *(0.4)* reads a C header and adds its declarations to
-the program; `import "./mylib.h";` (a path starting with `./` or `../`)
+`import "stdio.h" as c;` *(0.4; `as`: 0.5, required since 0.8)* reads a C
+header and adds its declarations to the program, named through `c`
+(`c::printf`); `import "./mylib.h" as c;` (a path starting with `./` or `../`)
 is relative to the importing file; `-I DIR` adds include directories. All
 imports of a program are read as one translation unit, as the target's C
 compiler reads them: its predefined macros and its include path come
@@ -700,7 +747,7 @@ macros, `errno` (a macro around a call: `*__error()` on macOS,
 `*__errno_location()` with glibc). The program's own declarations win
 over imported ones of the same name (a program may declare
 `extern "C" { fn printf(...) -> i32; }` and import `stdio.h`). Imported
-names are global; 0.5's modules will give them a namespace.
+names live in the C module, named by `as`.
 
 ## C headers of a program
 

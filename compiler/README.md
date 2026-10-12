@@ -9,7 +9,8 @@ $ tachyonc examples/md5.tach -o md5.s && cc -o md5 md5.s -lm
 $ tachyonc --target x86_64-linux compiler/src/main.tach -o linux.s   # cross-compile
 $ tachyonc -O0 examples/md5.tach -o md5.s     # -O0, -O1 or -O2 (the default)
 $ tachyonc --emit-ir examples/md5.tach -o md5.ir    # the optimized IR
-$ tachyonc --emit-imports prog.tach -o decls.tach   # what `import "x.h";` declares
+$ tachyonc --emit-imports prog.tach -o decls.tach   # what `import "x.h" as c;` declares
+$ tachyonc --fix-imports prog.tach   # rewrite 0.7's `*` imports and plain header imports (0.8)
 $ tachyonc --emit-header prog.tach -o prog.h        # the program's C header
 $ tachyonc --tokens file.tach        # the token dump (same format as the seed's `tachyon tokens`)
 $ tachyonc --version                 # the release and the host
@@ -34,9 +35,10 @@ reports up to 50 errors.
 
 Each file is a module of the root, `main.tach`, which declares them all
 (`mod lexer;` ...) in the order of the pipeline. Items are private unless
-another module uses them, and then `pub`; a module brings in the modules it
-uses with `use crate::m::*;` (and its main enum's variants, e.g. `use
-crate::ir::Op::*;`). The modules mirror the numbered files of 0.1 to 0.5
+another module uses them, and then `pub`; a module imports by name what it
+uses from the others, `use crate::m::{a, b};` (and its main enum's variants,
+e.g. `use crate::ir::Op::{Add, Sub};`; 0.8 has no `*` imports, and
+`tachyonc --fix-imports` wrote these lists from the `*` imports before). The modules mirror the numbered files of 0.1 to 0.5
 (`00_base.tach` is `base.tach`, `46_opt.tach` is `opt.tach`, and so on).
 
 | file | |
@@ -133,6 +135,10 @@ The 0.6 source is built by 0.5.0 and uses the 0.5 language:
   `Tok`, `TyKind`, `Op`, `Cond`, `Term`, `Res`, `AbiClass`, `Lattice`, `CT`,
   `CK`) with `match`, methods (`IntVec`, `HMap`, the enums), slices for
   byte strings, assignments that evaluate their right side first.
+
+The 0.8 source, built by 0.7.0 and by itself, imports every name it uses
+by name: `tachyonc --fix-imports compiler/src/main.tach` replaced its 380
+`*` imports (the compilers built before and after are byte-identical).
 
 Not used yet: enums with fields, function pointer types, `#[repr]` types,
 std's `Vec`. Most data lives in global arrays indexed by id (`NODES[n]`,
