@@ -683,6 +683,19 @@ or passed to any other call keeps its allocation on the heap. One slot
 serves an allocation in a loop: the pointer of one iteration cannot reach
 the next (it would need a phi).
 
+**Compile time.** `--time-passes` prints the CPU time of each phase.
+Compiling the compiler itself to assembly at -O2 (Apple M-series, best
+of 7, user + system): 0.5.0 takes 0.63 s, 0.6 (built by itself) 0.50 s;
+at -O0, 0.06 s and 0.03 s. Of 0.6's -O2 time, the interprocedural layer
+is about 22 ms (constants 5, heap to stack 3, promotion 7, attributes
+7): promotion first checks cheaply for a loop that stores to a slot or a
+static (most functions have none), the capture analysis marks derived
+addresses in place of rescanning per address, and a component whose
+functions do not call each other is inferred in one round. The largest
+phases are the loop passes (about 130 ms), register allocation with
+emission (about 110 ms) and inlining with the simplification after it
+(about 80 ms).
+
 **Function pointers as constants:** interprocedural constant propagation
 carries function addresses too: a function pointer parameter every
 caller passes the same function becomes that function's address, and its

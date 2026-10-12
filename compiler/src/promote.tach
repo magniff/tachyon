@@ -18,6 +18,7 @@ use crate::gvn::*;
 use crate::loops::*;
 use crate::range::*;
 use crate::ipo::*;
+use crate::regalloc::*;
 use crate::ir::Op::*;
 
 // The memory accesses of the loop being looked at: per access, its
@@ -31,6 +32,11 @@ const MAX_ACCESSES: i64 = 2000;
 // Returns whether any was.
 pub fn promote_loop_memory(fi: i64) -> bool {
     IRF = fi;
+    // Most functions have no loop with memory in it: the loop analysis is
+    // not worth starting for them.
+    if !has_loop_with_memory(fi) {
+        return false;
+    }
     resolve_all(fi);
     seal_all(fi);
     canonicalize_loops(fi);
@@ -66,6 +72,38 @@ pub fn promote_loop_memory(fi: i64) -> bool {
         verify_func(fi, c"scalar promotion");
     }
     changed
+}
+
+// Whether function fi has a cycle (an edge to a block not later in
+// reverse post-order) with a store to a frame slot or a static in a block
+// on it: a quick filter (a location only loaded in a loop is LICM's).
+fn has_loop_with_memory(fi: i64) -> bool {
+    layout_blocks(fi);
+    for i in 0..ORDER.count {
+        let b = ORDER.data[i];
+        for k in 0..succ_count(b) {
+            let s = succ(b, k);
+            if BLOCKS[s].order >= 0 && BLOCKS[s].order <= BLOCKS[b].order {
+                // A back edge s <- b: the blocks from s to b in the order
+                // hold the loop (and maybe more).
+                for j in BLOCKS[s].order..BLOCKS[b].order + 1 {
+                    let mut v = BLOCKS[ORDER.data[j]].first;
+                    while v != 0 {
+                        if INSTS[v].op == Store {
+                            let mut offset = 0;
+                            let base = address_base(ir_val(INSTS[v].a), &offset);
+                            let op = INSTS[base].op;
+                            if op == Op::Slot || op == GAddr {
+                                return true;
+                            }
+                        }
+                        v = INSTS[v].next;
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 fn collect_accesses(l: i64) -> bool {

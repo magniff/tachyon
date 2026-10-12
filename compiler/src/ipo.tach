@@ -185,6 +185,7 @@ fn compute_attrs(fi: i64) -> i64 {
                         // Within the component: what is assumed so far;
                         // recursion may not return.
                         known = FN_ATTRS[g] & ~ATTR_WILLRETURN;
+                        USED_COMPONENT = true;
                     }
                 }
                 if known & ATTR_READNONE == 0 {
@@ -245,38 +246,38 @@ fn compute_nocapture(fi: i64) -> i64 {
 // Whether value p (an address) is captured in function fi: stored as a
 // value, returned, merged by a phi, converted, or passed where it may be
 // kept. Addresses computed from it (p + x) are followed.
+// The addresses derived from the parameter being looked at are marked
+// with a stamp (INSTS[v].mark); passes over the function repeat while new
+// ones are found (rarely more than two).
+static mut CAPTURE_STAMP: i64 = 1000000000;
+
 fn captured(fi: i64, p: i64) -> bool {
-    let mut derived = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-    derived.push(p);
+    CAPTURE_STAMP += 1;
+    let stamp = CAPTURE_STAMP;
+    INSTS[p].mark = stamp;
     let mut result = false;
-    let mut d = 0;
-    while d < derived.count && !result {
-        let x = derived.data[d];
-        d += 1;
+    let mut grew = true;
+    while grew && !result {
+        grew = false;
         for i in 0..IRFUNCS[fi].blocks.count {
             let b = IRFUNCS[fi].blocks.data[i];
             if BLOCKS[b].removed != 0 {
                 continue;
             }
-            if BLOCKS[b].term == Term::Ret && ir_val(BLOCKS[b].cond) == x {
+            if BLOCKS[b].term == Term::Ret && BLOCKS[b].cond != 0 && INSTS[ir_val(BLOCKS[b].cond)].mark == stamp {
                 result = true;
             }
             let mut v = BLOCKS[b].first;
             while v != 0 && !result {
                 for k in 0..ir_operand_count(v) {
-                    if ir_operand(v, k) == 0 || ir_val(ir_operand(v, k)) != x {
+                    if ir_operand(v, k) == 0 || INSTS[ir_val(ir_operand(v, k))].mark != stamp {
                         continue;
                     }
                     let op = INSTS[v].op;
                     if op == Add && INSTS[v].ty == TY_U64 && k <= 1 {
-                        let mut seen = false;
-                        for j in 0..derived.count {
-                            if derived.data[j] == v {
-                                seen = true;
-                            }
-                        }
-                        if !seen {
-                            derived.push(v);
+                        if INSTS[v].mark != stamp {
+                            INSTS[v].mark = stamp;
+                            grew = true;
                         }
                     } else if (op == Load || op == Store) && k == 0 {
                     } else if op == Copy && k <= 1 {
@@ -284,6 +285,9 @@ fn captured(fi: i64, p: i64) -> bool {
                     } else if op == Call && k >= 3 {
                         let g = FN_IR[INSTS[v].imm] - 1;
                         let bit = k - 3;
+                        if g >= 0 && g != fi && FN_SCC[g] == FN_SCC[fi] {
+                            USED_COMPONENT = true;
+                        }
                         if g < 0 || bit >= 63 || g == fi
                             || (FN_SCC[g] != FN_SCC[fi] && FN_ATTRS_DONE[g] == 0)
                             || FN_NOCAPTURE[g] & (1 << bit) == 0 {
@@ -298,13 +302,17 @@ fn captured(fi: i64, p: i64) -> bool {
             }
         }
     }
-    free(derived.data as *u8);
     result
 }
 
+// Whether the attributes just computed used the assumptions about the
+// component's own functions (a call within it).
+static mut USED_COMPONENT: bool = false;
+
 // Infers the attributes of the functions SCC_ORDER[start..end] (one
 // component), optimistically: everything is assumed, then taken away
-// until nothing changes.
+// until nothing changes. A component whose functions do not call each
+// other (a single function, not recursive) takes one round.
 pub fn infer_component_attrs(start: i64, end: i64) {
     for i in start..end {
         let fi = SCC_ORDER.data[i];
@@ -316,14 +324,19 @@ pub fn infer_component_attrs(start: i64, end: i64) {
     while changed && rounds < 16 {
         changed = false;
         rounds += 1;
+        USED_COMPONENT = false;
         for i in start..end {
             let fi = SCC_ORDER.data[i];
             IRF = fi;
+            let nocapture = FN_NOCAPTURE[fi];
             let attrs = compute_attrs(fi);
-            if attrs != FN_ATTRS[fi] {
+            if attrs != FN_ATTRS[fi] || FN_NOCAPTURE[fi] != nocapture {
                 FN_ATTRS[fi] = attrs;
                 changed = true;
             }
+        }
+        if !USED_COMPONENT {
+            changed = false;
         }
     }
     if changed {
