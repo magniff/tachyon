@@ -37,8 +37,8 @@ dir=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-layout.XXXXXX")
 trap 'rm -rf "$dir"' EXIT
 
 {
-    for h in "$@"; do echo "import \"$h\";"; done
-    echo 'import "stdio.h";'
+    for h in "$@"; do echo "import \"$h\" as c;"; done
+    echo 'import "stdio.h" as c;'
 } > "$dir/imp.tach"
 # shellcheck disable=SC2086
 "$compiler" $tflag $incs --emit-imports "$dir/imp.tach" -o "$dir/imp.out"
@@ -49,8 +49,8 @@ BEGIN {
     n = split(headers, hs, " ")
     for (i = 1; i <= n; i++) print "#include <" hs[i] ">" > cfile
     print "#include <stdio.h>\n#include <stddef.h>\nint main(void) {" > cfile
-    for (i = 1; i <= n; i++) print "import \"" hs[i] "\";" > tfile
-    print "import \"stdio.h\";\nfn main() -> i32 {" > tfile
+    for (i = 1; i <= n; i++) print "import \"" hs[i] "\" as c;" > tfile
+    print "import \"stdio.h\" as c;\nfn main() -> i32 {" > tfile
 }
 /^\/\/ C: / { pending = substr($0, 7); next }
 /^#\[repr/ { next }
@@ -67,16 +67,16 @@ active && /^    [^ ]+: / {
 }
 active && /^\}$/ {
     printf "    printf(\"%s %%zu %%zu\", sizeof(%s), _Alignof(%s));\n", tname, rec_c, rec_c > cfile
-    printf "    let p%d = 4096 as *%s;\n", ++k, tname > tfile
-    printf "    printf(c\"%s %%zu %%zu\", size_of(%s), align_of(%s));\n", tname, tname, tname > tfile
+    printf "    let p%d = 4096 as *c::%s;\n", ++k, tname > tfile
+    printf "    c::printf(c\"%s %%zu %%zu\", size_of(c::%s), align_of(c::%s));\n", tname, tname, tname > tfile
     for (i = 1; i <= nf; i++) {
         cf = fields[i]; sub(/^r#/, "", cf)
         printf "    printf(\" %%zu\", offsetof(%s, %s));\n", rec_c, cf > cfile
-        printf "    printf(c\" %%zu\", (&(*p%d).%s) as u64 - 4096);\n", k, fields[i] > tfile
+        printf "    c::printf(c\" %%zu\", (&(*p%d).%s) as u64 - 4096);\n", k, fields[i] > tfile
         nfields++
     }
     print "    printf(\"\\n\");" > cfile
-    print "    printf(c\"\\n\");" > tfile
+    print "    c::printf(c\"\\n\");" > tfile
     active = 0; records++
     next
 }
