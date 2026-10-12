@@ -301,14 +301,18 @@ fn init_rules() {
 
 // ---- E-classes ----
 //
-// Per value (by id, valid when its stamp is this run's): the class's
-// representative (union-find), the next member (a circular list), and the
+// The e-classes are directional, as in Cranelift: when a rule shows
+// instruction v equal to w (which dominates v), w and its own members
+// join v's class, but v does not join w's (w's other users may not be
+// dominated by v). Per value (by id, valid when its stamp is this run's):
+// its members (a run in ALTS; none recorded: the value alone) and the
 // best cost found for it.
 
 static mut EC_STAMP: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static mut EC_PARENT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static mut EC_NEXT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut EC_START: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut EC_LEN: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 static mut EC_COST: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut ALTS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 static mut RUN: i64 = 0;
 
 // Whether the e-graph runs (-O1 and up; `--no-egraph` turns it off, to
@@ -318,45 +322,46 @@ pub static mut EGRAPH: bool = true;
 pub fn egraph_start() {
     init_rules();
     RUN += 1;
+    ALTS.count = 0;
 }
 
 fn ec_touch(v: i64) {
     while EC_STAMP.count <= v {
         EC_STAMP.push(0);
-        EC_PARENT.push(0);
-        EC_NEXT.push(0);
+        EC_START.push(0);
+        EC_LEN.push(0);
         EC_COST.push(0);
     }
     if EC_STAMP.data[v] != RUN {
         EC_STAMP.data[v] = RUN;
-        EC_PARENT.data[v] = v;
-        EC_NEXT.data[v] = v;
+        EC_START.data[v] = 0;
+        EC_LEN.data[v] = 0;
         EC_COST.data[v] = 0;
     }
 }
 
-fn ec_find(v: i64) -> i64 {
+fn member_count(v: i64) -> i64 {
     ec_touch(v);
-    let mut r = v;
-    while EC_PARENT.data[r] != r {
-        r = EC_PARENT.data[r];
-        ec_touch(r);
-    }
-    EC_PARENT.data[v] = r;
-    r
+    if EC_LEN.data[v] == 0 { 1 } else { EC_LEN.data[v] }
 }
 
-fn ec_union(v: i64, w: i64) {
-    let a = ec_find(v);
-    let b = ec_find(w);
-    if a == b {
-        return;
+fn member(v: i64, i: i64) -> i64 {
+    if EC_LEN.data[v] == 0 { v } else { ALTS.data[EC_START.data[v] + i] }
+}
+
+fn is_member(v: i64, w: i64) -> bool {
+    let n = member_count(v);
+    for i in 0..n {
+        if member(v, i) == w {
+            return true;
+        }
     }
-    EC_PARENT.data[b] = a;
-    // Splice the circular member lists.
-    let na = EC_NEXT.data[a];
-    EC_NEXT.data[a] = EC_NEXT.data[b];
-    EC_NEXT.data[b] = na;
+    false
+}
+
+// Whether v and w are known equal.
+fn same_value(v: i64, w: i64) -> bool {
+    v == w || is_member(v, w) || is_member(w, v)
 }
 
 fn op_cost(op: Op) -> i64 {
@@ -403,7 +408,7 @@ fn bind(var: i64, v: i64) -> bool {
         TRAIL.push(var);
         return true;
     }
-    ec_find(BIND[var]) == ec_find(v)
+    same_value(BIND[var], v)
 }
 
 fn is_commutative_pattern(p: i64) -> bool {
@@ -431,9 +436,9 @@ fn pmatch(p: i64, v: i64, ty: i64) -> bool {
     }
     let op = P_OP.data[p];
     let is_cmp = op == Cmp as i64;
-    let start = ec_find(v);
-    let mut m = start;
-    loop {
+    let n = member_count(v);
+    for k in 0..n {
+        let m = member(v, k);
         let mop = INSTS[m].op;
         if mop as i64 == op && (if is_cmp {
             INSTS[m].cond as i64 == P_COND.data[p] && INSTS[m].ty == TY_BOOL
@@ -456,26 +461,20 @@ fn pmatch(p: i64, v: i64, ty: i64) -> bool {
                 }
             }
         }
-        m = EC_NEXT.data[m];
-        if m == start {
-            return false;
-        }
     }
+    false
 }
 
 // A constant member of v's class, or 0.
 fn const_member(v: i64) -> i64 {
-    let start = ec_find(v);
-    let mut m = start;
-    loop {
+    let n = member_count(v);
+    for k in 0..n {
+        let m = member(v, k);
         if INSTS[m].op == Const {
             return m;
         }
-        m = EC_NEXT.data[m];
-        if m == start {
-            return 0;
-        }
     }
+    0
 }
 
 // ---- Building right-hand sides ----
@@ -588,6 +587,8 @@ pub fn egraph_rewrite(v: i64) -> i64 {
     if !is_integer(operand_ty) || (is_cmp && INSTS[v].cond != Cond::Eq && INSTS[v].cond != Cond::Ne) {
         return v;
     }
+    FOUND.count = 0;
+    FOUND.push(v);
     for r in 0..RULE_COUNT {
         let lhs = R_LHS.data[r];
         if P_OP.data[lhs] != op as i64 {
@@ -613,30 +614,45 @@ pub fn egraph_rewrite(v: i64) -> i64 {
         if INSTS[w].ty != ty {
             continue;
         }
-        ec_union(v, w);
-    }
-    // Extraction: the cheapest member (v on a tie).
-    let start = ec_find(v);
-    let mut best = v;
-    let mut best_cost = node_cost(v);
-    let mut m = start;
-    loop {
-        if m != v && INSTS[m].op != Op::None {
-            let c = EC_COST.data[m];
-            if c < best_cost {
-                best = m;
-                best_cost = c;
+        // w and its members join v's class.
+        let n = member_count(w);
+        for k in 0..n {
+            let m = member(w, k);
+            let mut known = false;
+            for j in 0..FOUND.count {
+                if FOUND.data[j] == m {
+                    known = true;
+                }
+            }
+            if !known {
+                FOUND.push(m);
             }
         }
-        m = EC_NEXT.data[m];
-        if m == start {
-            break;
+    }
+    if FOUND.count == 1 {
+        return v;
+    }
+    EC_START.data[v] = ALTS.count;
+    EC_LEN.data[v] = FOUND.count;
+    for j in 0..FOUND.count {
+        ALTS.push(FOUND.data[j]);
+    }
+    // Extraction: the cheapest member (v on a tie).
+    let mut best = v;
+    let mut best_cost = EC_COST.data[v];
+    for j in 1..FOUND.count {
+        let m = FOUND.data[j];
+        ec_touch(m);
+        if EC_COST.data[m] < best_cost {
+            best = m;
+            best_cost = EC_COST.data[m];
         }
     }
     EC_COST.data[v] = best_cost;
-    EC_COST.data[best] = best_cost;
     best
 }
+
+static mut FOUND: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
 // ---- Checking the rules (tachyonc --check-rules) ----
 

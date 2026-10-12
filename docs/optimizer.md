@@ -871,7 +871,11 @@ build of the compiler (under Rosetta) are identical to the arm64 one's.
 GVN (`gvn.tach`) hash-conses the pure instructions along the dominator
 tree; 0.9 makes its table an acyclic e-graph, in the manner of
 Cranelift's aegraph (`egraph.tach`). Every value has an e-class (the
-values known equal to it: union-find, with a circular member list). An
+values known equal to it). Classes are directional, as in Cranelift: when
+a rule shows instruction v equal to w (which dominates it), w and its
+members join v's class but not the other way round, since w's other
+users need not be dominated by v (joining both ways, with union-find,
+was the first version's bug, found by the fuzzer). An
 instruction new to the table is matched against the rewrite rules, each
 pattern's operands against every member of the operands' classes (so a
 rewrite made earlier, `x - 3` also being `x + -3`, enables later ones);
