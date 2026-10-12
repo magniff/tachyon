@@ -1,9 +1,10 @@
 # The Tachyon Programming Language
 
 A small systems language: structs, enums with `match`, methods, slices,
-raw pointers, fixed arrays, tuples, function pointers, C interop
-(`extern "C"`, `#[repr(C)]`), and expression-oriented control flow. The
-compiler is written in tachyon itself.
+generics, modules, raw pointers, fixed arrays, tuples, function pointers,
+C interop (`extern "C"`, `#[repr(C)]`, `import "stdio.h"`,
+`--emit-header`), and expression-oriented control flow. The compiler is
+written in tachyon itself.
 
 ```
 extern "C" {
@@ -50,7 +51,7 @@ On macOS, with the Xcode command line tools and Rust (rustup):
 ```
 $ bootstrap/bootstrap.sh
 ...
-compiler: target/tachyonc (tachyonc 0.4.0 (host: aarch64-macos))
+compiler: target/tachyonc (tachyonc 0.5.0 (host: aarch64-macos))
 ```
 
 On x86-64 Linux, with git, gcc (or clang) and the libc headers, and Rust
@@ -59,7 +60,7 @@ On x86-64 Linux, with git, gcc (or clang) and the libc headers, and Rust
 ```
 $ bootstrap/bootstrap.sh
 ...
-compiler: target/tachyonc (tachyonc 0.4.0 (host: x86_64-linux))
+compiler: target/tachyonc (tachyonc 0.5.0 (host: x86_64-linux))
 ```
 
 Every step is checked: each compiler must compile itself to identical
@@ -77,15 +78,20 @@ $ ./md5 < file
 The compiler emits assembly for the host (`--target aarch64-macos`,
 `x86_64-linux` or `x86_64-macos` picks another), which `cc` assembles and
 links; on macOS, give `cc` the matching `-arch arm64` or `-arch x86_64`
-when it is not the host's. Several files form one program:
+when it is not the host's. A program's modules are found from its root
+file (`mod m;`); several files on the command line also form one program:
 `tachyonc a.tach b.tach -o out.s`.
 
-The compiler optimizes: `-O2` (the default) replaces aggregates by scalars,
-forwards memory across blocks, removes dead stores, turns `match` into jump
-tables, inlines, moves invariant code
-out of loops, propagates constants, numbers values and allocates
-registers; `-O1` does the same without inlining and loop motion; `-O0` is
-plain stack-machine code. `--emit-ir` shows the optimized IR. See
+The compiler optimizes: `-O2` (the default) inlines, optimizes loops
+(rotation, induction variables, unrolling, unswitching, strength
+reduction, bounds checks proven away), replaces aggregates by scalars,
+forwards memory and removes dead stores, propagates constants, numbers
+values, and turns `match` into jump tables; its back end allocates
+registers by linear scan with interval splitting, selects instructions by
+rules and lays out blocks by fall-through. `-O1` does the same without
+inlining and the loop optimizer; `-O0` is plain stack-machine code, kept
+as the reference the others are tested against. `--emit-ir` shows the
+optimized IR, `--emit-mir` the IR after instruction selection. See
 [docs/optimizer.md](docs/optimizer.md).
 
 ## Tests

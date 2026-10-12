@@ -391,3 +391,40 @@ linear-scan allocator cannot keep in one register, which costs a move and a
 jump on one path; that is 0.5's register allocator. stencil is 3× behind
 clang, which vectorizes it (0.8), and keeps bounds checks whose proof needs
 the caller's lengths (0.6).
+### 0.5
+
+aarch64-macos (Apple silicon, native, idle machine; `bench/run.sh -r 7`;
+"0.4.0" is the previous release at its default level):
+
+| program | 0.4.0 | 0.5 -O0 | 0.5 -O1 | 0.5 -O2 | seed -O | cc -O2 |
+|---|---|---|---|---|---|---|
+| collatz | 432 | 2437 | 293 | 292 | 475 | 292 |
+| fib | 18 | 55 | 31 | 17 | 29 | 14 |
+| interp | 56 | 440 | 79 | 44 | - | 40 |
+| matmul | 34 | 495 | 87 | 27 | 94 | 43 |
+| nbody | 35 | 299 | 33 | 32 | - | 28 |
+| sieve | 70 | 263 | 66 | 63 | 69 | 71 |
+| stencil | 26 | 242 | 22 | 22 | - | 9 |
+| md5 | 73 | 381 | 149 | 72 | 132 | - |
+
+Geometric means: the seed's Cranelift code is 1.81× slower than 0.5 -O2
+on the five programs it can build; 0.5 -O2 is 1.11× slower than clang -O2
+on the seven with a C version, and 3% faster without stencil (which clang
+vectorizes: 0.8). collatz now matches clang (a branch-free `tst`/`csinc`
+loop), interp is within 10% (threaded dispatch by tail duplication).
+
+A larger program: release 0.1.0's compiler (7,562 lines, branchy, many
+small functions; its source made acceptable to 0.5 by turning `extern fn`
+into blocks and renaming its `size_of`/`align_of`), built by the seed and
+by 0.5, compiling its own source. All builds print identical output.
+
+| | seed -O | 0.5 -O2 | 0.5 -O0 |
+|---|---|---|---|
+| 30 runs (best of 5, ms; ~38 ms of it is process start) | 230 | 175 | 461 |
+| executable size (bytes) | 207,496 | 243,208 | 306,088 |
+| build time, to an executable (ms) | 71 | 509 | 305 |
+| of which the compiler itself (to `.s`, ms) | - | 83 | - |
+
+0.5 -O2 code runs about 1.4× faster than the seed's here. The compilers
+themselves are about as fast; the end-to-end build is slower because
+tachyon emits textual assembly (about 1 MB here) that `cc` assembles.

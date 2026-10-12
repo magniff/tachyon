@@ -35,8 +35,49 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.2.0 | `v0.2.0` | 0.1.0 | aarch64-macos, x86_64-linux, x86_64-macos | the optimizer: SSA IR, SCCP, instruction combining, GVN, LICM, inlining, linear-scan register allocation; `-O0`/`-O1`/`-O2` (default `-O2`); random differential testing; `bench/` |
 | 0.3.0 | `v0.3.0` | 0.2.0 | aarch64-macos, x86_64-linux, x86_64-macos | aggregates and memory: enums with fields and `match`, methods, slices, C interop (`extern "C"`, `#[repr(C)]`, unions, C's convention for aggregates); SROA, memory forwarding across blocks, dead stores, switches and jump tables; ABI conformance fuzzing |
 | 0.4.0 | `v0.4.0` | 0.3.0 | aarch64-macos, x86_64-linux, x86_64-macos | loops and C headers: the compiler written in the 0.3 language; `import "x.h"` (a C preprocessor and declaration reader) and `--emit-header`; `use`, checked `as` to enums, enum ordering, `size_of`/`align_of`, `for x in s`; loop canonicalization, induction variables, rotation, unrolling, unswitching, strength reduction, value ranges and bounds-check elimination, aggressive DCE, tail recursion elimination |
+| 0.5.0 | `v0.5.0` | 0.4.0 | aarch64-macos, x86_64-linux, x86_64-macos | generics, modules and the back end: generics by monomorphization, modules (`mod`, `pub`, `use`), several errors per compilation, a small `std`; register allocation by linear scan with interval splitting, a calling convention of tachyon's own, frames aligned above 16, instruction selection by rules, block layout, selects, leaf frames, sibling calls |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.5
+
+The language (see [grammar.md](grammar.md), "Additions of 0.5"):
+
+- **Generics** by monomorphization, checked at instantiation: generic
+  functions, structs, enums and `impl` blocks, methods with type
+  parameters of their own; type arguments written (`Vec<i64>`,
+  `max::<i64>(..)`, `Vec::<u8>::new()`) or inferred from the arguments
+  and the expected type. An error inside an instance names the
+  instantiation chain. Bounds (traits) are left for later; adding them
+  will not change what today's programs mean.
+- **Modules**: a file is a module (`mod m;` loads `m.tach` or
+  `m/mod.tach`); items are private unless `pub`; paths with `crate`,
+  `self`, `super`; `use a::b::{c, d as e}`, `use a::b::*`, `pub use`;
+  `import "h.h" as c;` puts a header's declarations under `c::`. Several
+  files on the command line still make one root module.
+- **Several errors per compilation**: the parser and the checker recover,
+  and errors that follow from an earlier one are not reported.
+- **A small standard library**, built into the compiler: `std::Option`,
+  `Result`, `Vec`, `Buf`, printing.
+- `size_of` and `align_of` are always the builtins; `#[repr(C,
+  align(N))]` up to 4096, and C records aligned above 16 import normally.
+- The layout and calling convention of plain functions and default
+  types stay unspecified: at `-O1`/`-O2` plain functions now use a
+  convention of tachyon's own; everything C can reach keeps C's.
+
+The back end (see [optimizer.md](optimizer.md)): register allocation by
+linear scan on SSA with lifetime holes and interval splitting, coalescing
+hints and rematerialization, checked by `--verify-regalloc`; a calling
+convention of its own (16 integer and 16 float argument registers on
+AArch64, aggregates in registers); realigned frames; instruction selection
+by per-target rule tables (scaled-index addressing, `lea`, `madd`, shifted
+operands, `ubfx`, `tbz`, `csel`/`csinc`/`cmov` selects, libm calls as
+instructions where exact); block layout by fall-through with cold paths
+last and tail duplication; `stp`/`ldp` and other post-allocation
+peepholes; leaf functions without frames; sibling calls; `setjmp` and
+other calls that return twice handled soundly. Tests: `ASM(T):`
+directives, `ERROR-COUNT:`, several `ERROR:` lines; random programs in
+generics, register-pressure and calls modes; `--emit-mir`.
 
 ### What's new in 0.4
 
