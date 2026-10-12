@@ -573,10 +573,93 @@ worth it), shrink-wrapping (moved to 0.6, with interprocedural attribute
 inference: its gain is in small functions with early returns that are
 not inlined).
 
+## 0.6: the back end, polished
+
+**Shrink-wrapping** (`emit.tach`). The frame (the saved frame pointer
+and return address, the reserved area, the saved callee-saved registers)
+is set up at the start of one block, SAVE: the nearest common dominator
+of the blocks that need it, moved up the dominator tree out of loops. A
+block needs the frame when it calls (other than a call ending a block
+that does not return), refers to a frame slot, or has a value in a
+callee-saved register or on the stack (`mark_frame_blocks` reads the
+allocation's intervals; the predecessors of a block that starts with
+such a value need it too, their edge moves write it). The blocks SAVE
+dominates run with the frame; a jump out of them tears it down after the
+edge's moves (with critical edges split only a block ending in a jump
+leaves the region, and it is never skipped as a trivial jump); the
+blocks outside run without one and return with a bare `ret`. No path
+re-enters the region but through SAVE, which is in no loop: the frame is
+set up and torn down at most once per call. A block outside that ends in
+a call that does not return (a panic) links a frame of its own first
+(x86-64 needs the stack aligned at a call). Functions calling setjmp and
+the like, realigning their frame, or taking parameters on the stack keep
+the frame at their entry.
+
+The allocator makes room for it. A value of the entry block (a
+parameter, mostly) that would take a callee-saved register for its whole
+lifetime keeps a caller-saved one, its hint first, until just before
+that register is needed elsewhere (a call, usually): at a block that is
+in no loop and dominates the rest of the value's blocks (layout order is
+not execution order: a loop run before the split point may be laid out
+after it), and no block where the value lives before it can be reached
+from it. The move into the callee-saved register costs what the entry
+move did, on the paths that need the frame only. And out of loops, a
+value that lives across no call does not follow its hint into a
+callee-saved register (the move the hint saves runs once, the frame it
+may force on a fast path every time).
+
+**Coalescing hints.** A value flowing into a phi takes the phi's
+register as its hint over the operand it is computed from: the phi's
+saves a move on the edge (a loop's back edge, often), the operand's
+nothing on AArch64 (three-operand instructions), and nothing on x86-64
+either when the operation commutes or has one operand. A loop header's
+phi takes its own hint from its back-edge value, not its initial one;
+and when that value is not allocated yet and lives across a call, the
+phi takes a callee-saved register, which the value can then share (the
+phi itself may live across no call: a caller-saved register would cost a
+move on every iteration). On x86-64 a select takes the register of an
+operand used only by it, so the cmov needs no movq first.
+
+**Instruction selection.** A comparison whose result is a value (not
+fused into a branch) compares with an immediate when the constant fits,
+on AArch64 with `cmn` for a small negative one, instead of holding the
+constant in a register (often a callee-saved one, across a loop with
+calls). A jump table over cases that start at 0 is indexed by the value
+itself.
+
+**`--stats`** prints totals of the machine code emitted on stderr
+(`--stats=functions` also a line per function): instructions, register
+moves, spill stores and reloads, moves on loop back edges, frame bytes,
+functions with a frame, saved callee-saved registers. The compiler's own
+source at the start of the work (0.6 phase 1), compiled by the compiler
+before and after:
+
+| | AArch64 before | after | x86-64 before | after |
+|---|---|---|---|---|
+| instructions | 203,020 | 197,385 (-2.8%) | 214,367 | 207,901 (-3.0%) |
+| register moves | 25,845 | 25,270 (-2.2%) | 27,393 | 27,446 (+0.2%) |
+| spill stores | 1,538 | 1,367 (-11%) | 4,205 | 3,952 (-6.0%) |
+| reloads | 4,607 | 4,159 (-9.7%) | 10,708 | 10,145 (-5.3%) |
+| moves on back edges | 2,984 | 2,653 (-11%) | 3,604 | 3,515 (-2.5%) |
+| functions setting up a frame later than their entry | 0 | 81 of 655 | | |
+
+(x86-64 counts the movq before a cmov as an instruction, not a register
+move.) At run time: fib, whose base case no longer touches the stack, is
+21% faster; the other benchmarks and the compiler itself are within
+noise.
+
+Found while reading the hot loops of `bench/`: interp's dispatch copied
+its opcode before indexing its jump table (fixed above); interp keeps its
+VM stack pointer in memory across iterations (scalar promotion: the
+middle end); stencil keeps bounds checks whose proof needs the caller's
+slice lengths (interprocedural, 0.6 2a); fib-like loops rotating two
+values (`a, b = b, a + b`) need a three-move cycle on the back edge
+(unrolling by two would rename them: 0.8 with run-time unrolling).
+
 ## Not yet
 
-Planned in [roadmap.md](roadmap.md): induction variable narrowing, a
-tachyon calling convention of its own, realigned frames (0.5, stage B);
-interprocedural analyses, a cost-model-driven inliner and shrink-wrapping
-(0.6); an e-graph-based rewriter (0.7); vectorization and unrolling with
-run-time trip counts (0.8); profile-guided scheduling (0.9).
+Planned in [roadmap.md](roadmap.md), or left over: induction variable
+narrowing (from 0.5); interprocedural analyses and a
+cost-model-driven inliner (0.6); an e-graph-based rewriter (0.7);
+vectorization and unrolling with run-time trip counts (0.8);
+profile-guided scheduling (0.9).
