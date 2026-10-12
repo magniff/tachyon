@@ -126,7 +126,14 @@ tar -C "$SNAP" -c -f - src | docker run --rm -i --cpus 4 --platform "$PLATFORM" 
     fi
     if [ "$BENCH" = 1 ]; then
         echo "==> benchmarks" >&2
-        previous=$(ls -d target/bootstrap/x86_64-linux/v*/tachyonc 2>/dev/null | tail -1)
+        # The newest release built here, in the order of releases.toml (tags
+        # never sorted as text: v0.10.0 comes after v0.9.0).
+        previous=""
+        for tag in $(sh bootstrap/release-tags.sh); do
+            for p in target/bootstrap/x86_64-linux/"$tag"-*/tachyonc; do
+                [ -x "$p" ] && previous=$p
+            done
+        done
         seed=$(ls -d target/bootstrap/x86_64-linux/seed-*/target/release/tachyon 2>/dev/null | head -1)
         bench/run.sh ${previous:+-p "$previous"} ${seed:+-s "$seed"} -r 3
     fi

@@ -1,0 +1,794 @@
+// Constant folding, sparse conditional constant propagation (Wegman &
+// Zadeck, "Constant Propagation with Conditional Branches", TOPLAS 1991)
+// and instruction combining.
+//
+// Folding computes exactly what the code generator's instructions compute
+// at run time (not what consteval.tach computes for constant items, which
+// differs for out-of-range float-to-integer conversions): wrapping
+// arithmetic on canonical 64-bit values, `x / 0 == 0`, `x % 0 == x`,
+// `MIN / -1 == MIN`, shift amounts modulo 32 (types up to 32 bits) or 64,
+// IEEE comparisons, and the saturating float-to-integer conversions of
+// emit_float_to_int.
+
+use std::Option;
+use crate::base::*;
+use crate::types::*;
+use crate::consteval::*;
+use crate::target::*;
+use crate::ir::*;
+use crate::opt::*;
+use crate::ir::Op::*;
+
+// ---- Folding ----
+
+fn is_foldable_op(op: Op) -> bool {
+    op.is_pure() || op == Const
+}
+
+pub fn shift_amount(b: i64, ty: i64) -> u64 {
+    (b & (if int_bits(ty) == 64 { 63 } else { 31 })) as u64
+}
+
+// a <op> b (or <op> a) for constant operands, as the machine computes it.
+pub fn fold_value(v: i64, a: i64, b: i64) -> i64 {
+    let op = INSTS[v].op;
+    let ty = INSTS[v].ty;
+    match op {
+        Const => return INSTS[v].imm,
+        Cmp => return fold_compare(INSTS[v].cond, INSTS[v].imm2, a, b) as i64,
+        Conv => return fold_conversion(INSTS[v].imm2, ty, a),
+        _ => {}
+    }
+    if is_float(ty) {
+        let x = f64_of_bits(a);
+        let y = f64_of_bits(b);
+        return match op {
+            Add => float_const(x + y, ty),
+            Sub => float_const(x - y, ty),
+            Mul => float_const(x * y, ty),
+            Div => float_const(x / y, ty),
+            // Negation flips the sign bit (also of zero and NaN).
+            _ => a ^ (1 << 63),
+        };
+    }
+    match op {
+        Add => wrap_int(a + b, ty),
+        Sub => wrap_int(a - b, ty),
+        Mul => wrap_int(a * b, ty),
+        Div | Rem => fold_division(op == Rem, ty, a, b),
+        And => wrap_int(a & b, ty),
+        Or => wrap_int(a | b, ty),
+        Xor => wrap_int(a ^ b, ty),
+        Shl => wrap_int(a << shift_amount(b, ty), ty),
+        Shr => if is_signed(ty) {
+            wrap_int(a >> shift_amount(b, ty), ty)
+        } else {
+            wrap_int(((a as u64) >> shift_amount(b, ty)) as i64, ty)
+        },
+        Neg => wrap_int(0 - a, ty),
+        Not => 1 - a,
+        _ => wrap_int(~a, ty),
+    }
+}
+
+// Whether folding v gave a NaN made by float arithmetic: its bits are the
+// machine's (AArch64's default NaN is positive, x86-64's negative), so it
+// is not made a constant: the target computes it at run time (and the
+// compiler's output does not depend on its host). SCCP still folds what
+// depends on it alone (sccp_rewrite).
+pub fn fold_makes_nan(v: i64, result: i64) -> bool {
+    let op = INSTS[v].op;
+    is_float(INSTS[v].ty) && op != Neg && op != Const && f64_of_bits(result) != f64_of_bits(result)
+}
+
+fn fold_division(remainder: bool, ty: i64, a: i64, b: i64) -> i64 {
+    if b == 0 {
+        return if remainder { a } else { 0 };
+    }
+    if is_signed(ty) {
+        if b == -1 {
+            return if remainder { 0 } else { wrap_int(0 - a, ty) };
+        }
+        return wrap_int(if remainder { a % b } else { a / b }, ty);
+    }
+    let ua = a as u64;
+    let ub = b as u64;
+    wrap_int((if remainder { ua % ub } else { ua / ub }) as i64, ty)
+}
+
+pub fn fold_compare(op: Cond, ty: i64, a: i64, b: i64) -> bool {
+    if is_float(ty) {
+        let x = f64_of_bits(a);
+        let y = f64_of_bits(b);
+        return match op {
+            Cond::Eq => x == y,
+            Cond::Ne => x != y,
+            Cond::Lt => x < y,
+            Cond::Le => x <= y,
+            Cond::Gt => x > y,
+            Cond::Ge => x >= y,
+        };
+    }
+    let less = if is_signed(ty) { a < b } else { (a as u64) < (b as u64) };
+    let greater = if is_signed(ty) { a > b } else { (a as u64) > (b as u64) };
+    match op {
+        Cond::Eq => a == b,
+        Cond::Ne => a != b,
+        Cond::Lt => less,
+        Cond::Gt => greater,
+        Cond::Le => !greater,
+        Cond::Ge => !less,
+    }
+}
+
+fn fold_conversion(from: i64, to: i64, a: i64) -> i64 {
+    if is_float(from) && is_float(to) {
+        return float_const(f64_of_bits(a), to);
+    }
+    if is_float(to) {
+        // Converted directly (not through f64) to round once.
+        if to == TY_F32 {
+            let narrow = if is_signed(from) { a as f32 } else { (a as u64) as f32 };
+            return bits_of(narrow as f64);
+        }
+        return bits_of(if is_signed(from) { a as f64 } else { (a as u64) as f64 });
+    }
+    if is_float(from) {
+        return fold_float_to_int(f64_of_bits(a), to);
+    }
+    wrap_int(a, to)
+}
+
+// Saturating conversion to a signed integer of `bits` bits (NaN is 0).
+fn saturate_signed(x: f64, bits: i64) -> i64 {
+    if x != x {
+        return 0;
+    }
+    let limit = if bits == 64 { 9223372036854775808.0 } else { 2147483648.0 };
+    if x <= 0.0 - limit {
+        return if bits == 64 { -9223372036854775807 - 1 } else { -2147483648 };
+    }
+    if x >= limit {
+        return if bits == 64 { 9223372036854775807 } else { 2147483647 };
+    }
+    x as i64
+}
+
+// What emit_float_to_int computes: signed results up to 32 bits convert
+// at 32 bits and wrap, unsigned ones up to 32 bits convert signed at 64
+// bits and wrap; u64 converts unsigned (saturating) at 2^63 and above,
+// signed (saturating, so -5.0 is 2^64 - 5) below.
+fn fold_float_to_int(x: f64, to: i64) -> i64 {
+    if to == TY_U64 && x >= 9223372036854775808.0 {
+        if x >= 18446744073709551616.0 {
+            return -1;
+        }
+        return ((x - 9223372036854775808.0) as i64) ^ (1 << 63);
+    }
+    if is_signed(to) && int_bits(to) <= 32 {
+        return wrap_int(saturate_signed(x, 32), to);
+    }
+    wrap_int(saturate_signed(x, 64), to)
+}
+
+// ---- Users ----
+
+// The users of each value of a function (CSR): USER_START[i] ..
+// USER_START[i + 1] in USER_LIST, by dense index (INSTS[v].aux - 1);
+// users are instructions, or -(block) for a block's terminator.
+static mut FN_VALUES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut USER_START: *i64 = 0 as *i64;
+static mut USER_LIST: *i64 = 0 as *i64;
+
+// Numbers the instructions of function `fi` (INSTS[v].aux = index + 1).
+fn number_values(fi: i64) {
+    FN_VALUES.count = 0;
+    for i in 0..IRFUNCS[fi].blocks.count {
+        let b = IRFUNCS[fi].blocks.data[i];
+        if BLOCKS[b].removed != 0 {
+            continue;
+        }
+        let mut v = BLOCKS[b].first;
+        while v != 0 {
+            FN_VALUES.push(v);
+            INSTS[v].aux = FN_VALUES.count;
+            v = INSTS[v].next;
+        }
+    }
+}
+
+fn build_users(fi: i64) {
+    number_values(fi);
+    let n = FN_VALUES.count;
+    free(USER_START as *u8);
+    USER_START = alloc_array::<i64>(n + 2);
+    // Count, then fill.
+    for pass in 0..2 {
+        let mut fill: *i64 = 0 as *i64;
+        if pass == 1 {
+            let mut total = 0;
+            for i in 0..n + 1 {
+                let count = USER_START[i];
+                USER_START[i] = total;
+                total += count;
+            }
+            USER_START[n + 1] = total;
+            free(USER_LIST as *u8);
+            USER_LIST = alloc_array::<i64>(total + 1);
+            fill = alloc_array::<i64>(n + 1);
+        }
+        for i in 0..IRFUNCS[fi].blocks.count {
+            let b = IRFUNCS[fi].blocks.data[i];
+            if BLOCKS[b].removed != 0 {
+                continue;
+            }
+            let mut v = BLOCKS[b].first;
+            while v != 0 {
+                for k in 0..ir_operand_count(v) {
+                    add_user(ir_operand(v, k), v, pass, fill);
+                }
+                v = INSTS[v].next;
+            }
+            add_user(BLOCKS[b].cond, 0 - b, pass, fill);
+        }
+        if pass == 1 {
+            free(fill as *u8);
+        }
+    }
+}
+
+fn add_user(operand: i64, user: i64, pass: i64, fill: *i64) {
+    if operand == 0 || INSTS[operand].aux == 0 {
+        return;
+    }
+    let t = INSTS[operand].aux - 1;
+    if pass == 0 {
+        USER_START[t] += 1;
+    } else {
+        USER_LIST[USER_START[t] + fill[t]] = user;
+        fill[t] += 1;
+    }
+}
+
+// ---- SCCP ----
+
+// The lattice of a value: not known yet (Top), a constant, or not a
+// constant (Bottom).
+enum Lattice { Top, Const, Bottom }
+
+// Per dense index: lattice state and constant.
+static mut LAT: *Lattice = 0 as *Lattice;
+static mut LAT_VALUE: *i64 = 0 as *i64;
+static mut SSA_WORK: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut CFG_WORK: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+fn lat_of(v: i64) -> Lattice {
+    LAT[INSTS[v].aux - 1]
+}
+
+fn lat_value(v: i64) -> i64 {
+    LAT_VALUE[INSTS[v].aux - 1]
+}
+
+// Lowers the state of v; queues its users when it changed.
+fn lat_set(v: i64, state: Lattice, value: i64) {
+    let t = INSTS[v].aux - 1;
+    let old = LAT[t];
+    if old == Lattice::Bottom || state == Lattice::Top {
+        return;
+    }
+    if old == Lattice::Const {
+        if state == Lattice::Const && value == LAT_VALUE[t] {
+            return;
+        }
+        // Two different constants, or more than a constant.
+        LAT[t] = Lattice::Bottom;
+    } else {
+        LAT[t] = state;
+        LAT_VALUE[t] = value;
+    }
+    SSA_WORK.push(v);
+}
+
+// Whether the edge from `p` to `b` is executable (BLOCKS[p].aux bit k for
+// successor k).
+// (Edges past the 62nd successor of a switch share bit 62.)
+fn edge_bit(k: i64) -> u64 {
+    (if k < 62 { k } else { 62 }) as u64
+}
+
+fn edge_executable(p: i64, b: i64) -> bool {
+    for k in 0..succ_count(p) {
+        if succ(p, k) == b && (BLOCKS[p].aux >> edge_bit(k)) & 1 != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+fn mark_edge(p: i64, k: i64) {
+    if k < 62 && (BLOCKS[p].aux >> edge_bit(k)) & 1 != 0 {
+        return;
+    }
+    BLOCKS[p].aux |= 1 << edge_bit(k);
+    CFG_WORK.push(succ(p, k));
+}
+
+fn sccp_eval(v: i64) {
+    let op = INSTS[v].op;
+    if INSTS[v].ty == 0 {
+        return;
+    }
+    if op == Phi {
+        let b = INSTS[v].block;
+        let mut state = Lattice::Top;
+        let mut value = 0;
+        for i in 0..INSTS[v].nargs {
+            let p = BLOCKS[b].preds.data[i];
+            if !edge_executable(p, b) {
+                continue;
+            }
+            let operand = ir_arg(v, i);
+            let s = lat_of(operand);
+            if s == Lattice::Bottom {
+                state = Lattice::Bottom;
+                break;
+            }
+            if s == Lattice::Const {
+                if state == Lattice::Const && value != lat_value(operand) {
+                    state = Lattice::Bottom;
+                    break;
+                }
+                state = Lattice::Const;
+                value = lat_value(operand);
+            }
+        }
+        lat_set(v, state, value);
+        return;
+    }
+    if !is_foldable_op(op) {
+        lat_set(v, Lattice::Bottom, 0);
+        return;
+    }
+    if op == Const {
+        lat_set(v, Lattice::Const, INSTS[v].imm);
+        return;
+    }
+    let a = INSTS[v].a;
+    let b = INSTS[v].b;
+    let sa = lat_of(a);
+    let sb = if b != 0 { lat_of(b) } else { Lattice::Const };
+    if sa == Lattice::Bottom || sb == Lattice::Bottom {
+        lat_set(v, Lattice::Bottom, 0);
+    } else if sa == Lattice::Const && sb == Lattice::Const {
+        lat_set(v, Lattice::Const, fold_value(v, lat_value(a), if b != 0 { lat_value(b) } else { 0 }));
+    }
+}
+
+fn sccp_terminator(b: i64) {
+    let term = BLOCKS[b].term;
+    if term == Term::Jump {
+        mark_edge(b, 0);
+    } else if term == Term::Switch {
+        let cond = BLOCKS[b].cond;
+        let s = lat_of(cond);
+        if s == Lattice::Bottom {
+            for k in 0..BLOCKS[b].nsucc {
+                mark_edge(b, k);
+            }
+        } else if s == Lattice::Const {
+            let target = switch_target(b, lat_value(cond));
+            for k in 0..BLOCKS[b].nsucc {
+                if succ(b, k) == target {
+                    mark_edge(b, k);
+                }
+            }
+        }
+    } else if term == Term::Branch {
+        let cond = BLOCKS[b].cond;
+        let s = lat_of(cond);
+        if s == Lattice::Bottom {
+            mark_edge(b, 0);
+            mark_edge(b, 1);
+        } else if s == Lattice::Const {
+            mark_edge(b, if lat_value(cond) != 0 { 0 } else { 1 });
+        }
+    }
+}
+
+pub fn sccp(fi: i64) -> bool {
+    build_users(fi);
+    let n = FN_VALUES.count;
+    free(LAT as *u8);
+    free(LAT_VALUE as *u8);
+    LAT = alloc_array::<Lattice>(n + 1);
+    LAT_VALUE = alloc_array::<i64>(n + 1);
+    for i in 0..IRFUNCS[fi].blocks.count {
+        let b = IRFUNCS[fi].blocks.data[i];
+        BLOCKS[b].aux = 0;
+        BLOCKS[b].mark = 0;
+    }
+    SSA_WORK.count = 0;
+    CFG_WORK.count = 0;
+    CFG_WORK.push(IRFUNCS[fi].entry);
+    while CFG_WORK.count > 0 || SSA_WORK.count > 0 {
+        if CFG_WORK.count > 0 {
+            let b = CFG_WORK.pop();
+            if BLOCKS[b].mark == 0 {
+                BLOCKS[b].mark = 1;
+                let mut v = BLOCKS[b].first;
+                while v != 0 {
+                    sccp_eval(v);
+                    v = INSTS[v].next;
+                }
+                sccp_terminator(b);
+            } else {
+                // A new edge into a visited block: its phis may change.
+                let mut v = BLOCKS[b].first;
+                while v != 0 && INSTS[v].op == Phi {
+                    sccp_eval(v);
+                    v = INSTS[v].next;
+                }
+            }
+            continue;
+        }
+        let v = SSA_WORK.pop();
+        let t = INSTS[v].aux - 1;
+        for i in USER_START[t]..USER_START[t + 1] {
+            let user = USER_LIST[i];
+            if user < 0 {
+                if BLOCKS[0 - user].mark != 0 {
+                    sccp_terminator(0 - user);
+                }
+            } else if BLOCKS[INSTS[user].block].mark != 0 {
+                sccp_eval(user);
+            }
+        }
+    }
+    sccp_rewrite(fi)
+}
+
+// Replaces the values found constant, and the branches decided.
+fn sccp_rewrite(fi: i64) -> bool {
+    let mut changed = false;
+    IRF = fi;
+    for i in 0..FN_VALUES.count {
+        let v = FN_VALUES.data[i];
+        let op = INSTS[v].op;
+        if LAT[i] != Lattice::Const || op == Const || INSTS[v].block == 0 {
+            continue;
+        }
+        if BLOCKS[INSTS[v].block].mark == 0 {
+            continue;
+        }
+        let value = LAT_VALUE[i];
+        // A NaN made by float arithmetic stays computed at run time (see
+        // fold_makes_nan); what depends on it alone (its comparisons, its
+        // conversions to integers) is folded all the same.
+        if is_float(INSTS[v].ty) && f64_of_bits(value) != f64_of_bits(value) {
+            continue;
+        }
+        if op == Phi {
+            let c = ir_make(Const, INSTS[v].ty, 0, 0, value);
+            ir_prepend(IRFUNCS[fi].entry, c);
+            ir_replace(v, c);
+        } else {
+            INSTS[v].op = Const;
+            INSTS[v].cond = Cond::Eq;
+            INSTS[v].imm = value;
+            INSTS[v].a = 0;
+            INSTS[v].b = 0;
+            INSTS[v].imm2 = 0;
+        }
+        changed = true;
+    }
+    for i in 0..IRFUNCS[fi].blocks.count {
+        let b = IRFUNCS[fi].blocks.data[i];
+        if BLOCKS[b].removed != 0 || BLOCKS[b].mark == 0 {
+            continue;
+        }
+        if BLOCKS[b].term == Term::Switch && BLOCKS[b].nsucc < 62 {
+            // One successor reached only: a jump.
+            let mut taken = 0;
+            let mut reached = 0;
+            for k in 0..BLOCKS[b].nsucc {
+                if (BLOCKS[b].aux >> k as u64) & 1 != 0 {
+                    taken = succ(b, k);
+                    reached += 1;
+                }
+            }
+            if reached == 1 {
+                switch_to_jump(b, taken);
+                changed = true;
+            }
+            continue;
+        }
+        if BLOCKS[b].term != Term::Branch {
+            continue;
+        }
+        let bits = BLOCKS[b].aux;
+        if bits == 1 || bits == 2 {
+            // One edge is never taken.
+            let taken = if bits == 1 { BLOCKS[b].s0 } else { BLOCKS[b].s1 };
+            let dropped = if bits == 1 { BLOCKS[b].s1 } else { BLOCKS[b].s0 };
+            // One edge goes (even when both lead to the same block).
+            remove_pred(dropped, b);
+            BLOCKS[b].term = Term::Jump;
+            BLOCKS[b].cond = 0;
+            BLOCKS[b].s0 = taken;
+            BLOCKS[b].s1 = 0;
+            changed = true;
+        }
+    }
+    if changed {
+        resolve_all(fi);
+        remove_unreachable(fi);
+        remove_trivial_phis(fi);
+    }
+    changed
+}
+
+// ---- Instruction combining ----
+
+fn is_const_value(v: i64, value: i64) -> bool {
+    INSTS[v].op == Const && INSTS[v].imm == value
+}
+
+pub fn is_const(v: i64) -> bool {
+    INSTS[v].op == Const
+}
+
+// log2 of a power of two, or -1.
+fn power_of_two(value: i64) -> Option<i64> {
+    if value <= 0 || (value & (value - 1)) != 0 {
+        return Option::None;
+    }
+    Option::Some(log2(value))
+}
+
+// A new constant before instruction `at`.
+pub fn const_before(at: i64, value: i64, ty: i64) -> i64 {
+    let c = ir_make(Const, ty, 0, 0, value);
+    ir_insert_before(at, c);
+    c
+}
+
+pub fn op_before(at: i64, op: Op, ty: i64, a: i64, b: i64) -> i64 {
+    let v = ir_make(op, ty, a, b, 0);
+    ir_insert_before(at, v);
+    v
+}
+
+// Replaces v by `by` when they have the same type.
+fn replace_same_type(v: i64, by: i64) -> bool {
+    if INSTS[by].ty != INSTS[v].ty {
+        return false;
+    }
+    ir_replace(v, by);
+    true
+}
+
+fn make_const(v: i64, value: i64) -> bool {
+    INSTS[v].op = Const;
+    INSTS[v].cond = Cond::Eq;
+    INSTS[v].imm = wrap_int(value, INSTS[v].ty);
+    INSTS[v].a = 0;
+    INSTS[v].b = 0;
+    INSTS[v].imm2 = 0;
+    true
+}
+
+// The all-ones value of integer type ty (canonical).
+pub fn all_ones(ty: i64) -> i64 {
+    wrap_int(-1, ty)
+}
+
+// Rewrites instruction v into something cheaper; returns whether it
+// changed (v may have been replaced).
+fn combine(v: i64) -> bool {
+    let op = INSTS[v].op;
+    let ty = INSTS[v].ty;
+    if op == Load || op == Store {
+        return fold_address(v);
+    }
+    if op == Neg || op == Not || op == BNot {
+        let a = INSTS[v].a;
+        if INSTS[a].op == op && !(op == Neg && is_float(ty)) {
+            return replace_same_type(v, INSTS[a].a);
+        }
+        return false;
+    }
+    if op == Cmp {
+        return combine_compare(v);
+    }
+    if !op.is_binary() || is_float(ty) {
+        return false;
+    }
+    let mut a = INSTS[v].a;
+    let mut b = INSTS[v].b;
+    // Constants go right.
+    if is_const(a) && !is_const(b) && (op == Add || op == Mul || op == And
+        || op == Or || op == Xor) {
+        INSTS[v].a = b;
+        INSTS[v].b = a;
+        a = INSTS[v].a;
+        b = INSTS[v].b;
+    }
+    if !is_const(b) {
+        if a == b {
+            if op == Sub || op == Xor {
+                return make_const(v, 0);
+            }
+            if op == And || op == Or {
+                return replace_same_type(v, a);
+            }
+        }
+        return false;
+    }
+    let c = INSTS[b].imm;
+    if c == 0 && (op == Add || op == Sub || op == Or || op == Xor
+        || op == Shl || op == Shr) {
+        return replace_same_type(v, a);
+    }
+    if (op == Shl || op == Shr) && shift_amount(c, ty) == 0 {
+        return replace_same_type(v, a);
+    }
+    if c == 0 && (op == Mul || op == And) {
+        return make_const(v, 0);
+    }
+    if op == And && c == all_ones(ty) {
+        return replace_same_type(v, a);
+    }
+    if op == Add && INSTS[a].op == Add && is_const(INSTS[a].b) && is_integer(ty)
+        && INSTS[a].ty == ty {
+        // (x + c1) + c2, both of one type (a narrower inner sum would wrap
+        // first)
+        INSTS[v].a = INSTS[a].a;
+        let operand = const_before(v, wrap_int(INSTS[INSTS[a].b].imm + c, ty), ty);
+        INSTS[v].b = operand;
+        return true;
+    }
+    if op == Mul {
+        if c == 1 {
+            return replace_same_type(v, a);
+        }
+        match power_of_two(c) {
+            Option::Some(k) if k > 0 => {
+                INSTS[v].op = Shl;
+                let operand = const_before(v, k, ty);
+                INSTS[v].b = operand;
+                return true;
+            }
+            _ => return false,
+        }
+    }
+    if (op == Div || op == Rem) && c == 1 {
+        if op == Div {
+            return replace_same_type(v, a);
+        }
+        return make_const(v, 0);
+    }
+    if op == Div || op == Rem {
+        return combine_division(v, a, c);
+    }
+    false
+}
+
+// Division by a power of two: a shift (with a fix-up toward zero for signed
+// values), and the remainder a mask (or x - q * 2^k).
+fn combine_division(v: i64, a: i64, c: i64) -> bool {
+    let op = INSTS[v].op;
+    let ty = INSTS[v].ty;
+    let k = power_of_two(c).unwrap_or(0);
+    if k <= 0 || k > 62 {
+        return false;
+    }
+    if !is_signed(ty) {
+        if op == Div {
+            INSTS[v].op = Shr;
+            let operand = const_before(v, k, ty);
+            INSTS[v].b = operand;
+        } else {
+            INSTS[v].op = And;
+            let operand = const_before(v, c - 1, ty);
+            INSTS[v].b = operand;
+        }
+        return true;
+    }
+    // q = (x + ((x >> 63) >>> (64 - k))) >> k, on the canonical 64-bit value.
+    let sign = op_before(v, Shr, TY_I64, a, const_before(v, 63, TY_I64));
+    let bias = op_before(v, Shr, TY_U64, sign, const_before(v, 64 - k, TY_U64));
+    let biased = op_before(v, Add, TY_I64, a, bias);
+    if op == Div {
+        INSTS[v].op = Shr;
+        INSTS[v].a = biased;
+        let operand = const_before(v, k, ty);
+        INSTS[v].b = operand;
+        return true;
+    }
+    let q = op_before(v, Shr, TY_I64, biased, const_before(v, k, TY_I64));
+    let back = op_before(v, Shl, TY_I64, q, const_before(v, k, TY_I64));
+    INSTS[v].op = Sub;
+    INSTS[v].b = back;
+    true
+}
+
+fn combine_compare(v: i64) -> bool {
+    let mut a = INSTS[v].a;
+    let mut b = INSTS[v].b;
+    let mut cond = INSTS[v].cond;
+    let ty = INSTS[v].imm2;
+    if is_const(a) && !is_const(b) {
+        // Constants go right.
+        INSTS[v].a = b;
+        INSTS[v].b = a;
+        INSTS[v].cond = cond.mirror();
+        a = INSTS[v].a;
+        b = INSTS[v].b;
+        cond = INSTS[v].cond;
+    }
+    if a == b && !is_float(ty) {
+        return make_const(v, (cond == Cond::Eq || cond == Cond::Le || cond == Cond::Ge) as i64);
+    }
+    if ty == TY_BOOL && is_const(b) && !is_const(a) {
+        // b != false, b == true: b itself.
+        let c = INSTS[b].imm;
+        if (cond == Cond::Ne && c == 0) || (cond == Cond::Eq && c == 1) {
+            return replace_same_type(v, a);
+        }
+    }
+    false
+}
+
+// load/store at (x + c) + offset: at x + (offset + c).
+fn fold_address(v: i64) -> bool {
+    let addr = INSTS[v].a;
+    if INSTS[addr].op == Add && is_const(INSTS[addr].b) && INSTS[addr].ty == TY_U64 {
+        let c = INSTS[INSTS[addr].b].imm;
+        let offset = INSTS[v].imm + c;
+        if offset >= -1073741824 && offset <= 1073741824 {
+            INSTS[v].a = INSTS[addr].a;
+            INSTS[v].imm = offset;
+            return true;
+        }
+    }
+    false
+}
+
+pub fn instcombine(fi: i64) -> bool {
+    let mut changed = false;
+    for i in 0..IRFUNCS[fi].blocks.count {
+        let b = IRFUNCS[fi].blocks.data[i];
+        if BLOCKS[b].removed != 0 {
+            continue;
+        }
+        let mut v = BLOCKS[b].first;
+        while v != 0 {
+            let next = INSTS[v].next;
+            ir_resolve_operands(v);
+            // Up to a few rewrites of one instruction.
+            let mut rounds = 0;
+            while rounds < 4 && INSTS[v].block != 0 && combine(v) {
+                changed = true;
+                rounds += 1;
+                ir_resolve_operands(v);
+            }
+            v = next;
+        }
+        // A branch on !x branches on x the other way.
+        if BLOCKS[b].term == Term::Branch {
+            let cond = ir_val(BLOCKS[b].cond);
+            if INSTS[cond].op == Not {
+                BLOCKS[b].cond = INSTS[cond].a;
+                let s0 = BLOCKS[b].s0;
+                BLOCKS[b].s0 = BLOCKS[b].s1;
+                BLOCKS[b].s1 = s0;
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        resolve_all(fi);
+    }
+    changed
+}

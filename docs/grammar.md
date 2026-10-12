@@ -1,7 +1,7 @@
 # Tachyon grammar
 
 This is the grammar of tachyon 0.4, as the compiler implements it
-(`compiler/src/10_lexer.tach`, `compiler/src/21_parser.tach`; the seed
+(`compiler/src/lexer.tach`, `compiler/src/parser.tach`; the seed
 implements the language of 0.1 in `seed/src/lexer` and `seed/src/parser`).
 What 0.3 added is marked *(0.3)*, what 0.4 added *(0.4)*.
 Items and statements are parsed by recursive descent, expressions by a Pratt

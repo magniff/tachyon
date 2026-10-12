@@ -1,0 +1,613 @@
+// The module base: the C library, growable arrays, byte buffers, the
+// symbol interner, source files and error reporting (and recovery). The
+// compiler's root is main.tach.
+
+use crate::generics::*;
+
+// ---- C library ----
+
+pub extern "C" {
+    // Error recovery (see err_end): the jumps back to a recovery point.
+    fn _setjmp(env: *u8) -> i32;
+    fn _longjmp(env: *u8, value: i32) -> !;
+    fn malloc(size: u64) -> *u8;
+    fn realloc(ptr: *u8, size: u64) -> *u8;
+    fn free(ptr: *u8);
+    fn memcpy(dst: *u8, src: *u8, n: u64) -> *u8;
+    fn memset(dst: *u8, c: i32, n: u64) -> *u8;
+    fn memcmp(a: *u8, b: *u8, n: u64) -> i32;
+    fn strlen(s: *u8) -> u64;
+    fn strtod(s: *u8, end: **u8) -> f64;
+    fn fopen(path: *u8, mode: *u8) -> *u8;
+    fn fread(buf: *u8, size: u64, count: u64, file: *u8) -> u64;
+    fn fwrite(buf: *u8, size: u64, count: u64, file: *u8) -> u64;
+    fn fclose(file: *u8) -> i32;
+    fn write(fd: i32, buf: *u8, n: u64) -> i64;
+    fn exit(code: i32) -> !;
+}
+
+pub const STDOUT: i32 = 1;
+pub const STDERR: i32 = 2;
+
+// ---- Growable arrays ----
+
+// Makes room for one more element in an array of `count` elements of T
+// with capacity `*cap`; returns the (possibly moved) data.
+pub fn grow<T>(data: *T, count: i64, cap: *i64) -> *T {
+    if count < *cap {
+        return data;
+    }
+    let mut new_cap = *cap * 2;
+    if new_cap < 64 {
+        new_cap = 64;
+    }
+    *cap = new_cap;
+    let grown = realloc(data as *u8, (new_cap * size_of(T)) as u64);
+    if grown == 0 as *u8 {
+        die(c"out of memory");
+    }
+    grown as *T
+}
+
+// An array of `n` elements of T, zeroed.
+pub fn alloc_array<T>(n: i64) -> *T {
+    alloc_zeroed(n * size_of(T)) as *T
+}
+
+pub fn alloc_zeroed(size: i64) -> *u8 {
+    let mut bytes = size;
+    if bytes < 8 {
+        bytes = 8;
+    }
+    let data = malloc(bytes as u64);
+    if data == 0 as *u8 {
+        die(c"out of memory");
+    }
+    memset(data, 0, bytes as u64);
+    data
+}
+
+// A growable array of i64, used for node lists and scratch stacks.
+pub struct IntVec { data: *i64, count: i64, cap: i64 }
+
+impl IntVec {
+    fn push(self: *IntVec, value: i64) {
+        (*self).data = grow((*self).data, (*self).count, &(*self).cap);
+        (*self).data[(*self).count] = value;
+        (*self).count += 1;
+    }
+
+    fn pop(self: *IntVec) -> i64 {
+        (*self).count -= 1;
+        (*self).data[(*self).count]
+    }
+}
+
+// ---- Byte buffers ----
+
+// Buffers are referred to by id; `BUFS[id]` holds the bytes.
+struct Buf { data: *u8, len: i64, cap: i64 }
+
+pub static mut BUFS: *Buf = 0 as *Buf;
+static mut BUF_COUNT: i64 = 0;
+static mut BUF_CAP: i64 = 0;
+
+pub fn buf_new() -> i64 {
+    BUFS = grow(BUFS, BUF_COUNT, &BUF_CAP);
+    let id = BUF_COUNT;
+    BUFS[id] = Buf { data: alloc_zeroed(256), len: 0, cap: 256 };
+    BUF_COUNT += 1;
+    id
+}
+
+pub fn buf_reserve(b: i64, extra: i64) {
+    let needed = BUFS[b].len + extra;
+    if needed <= BUFS[b].cap {
+        return;
+    }
+    let mut new_cap = BUFS[b].cap * 2;
+    while new_cap < needed {
+        new_cap *= 2;
+    }
+    BUFS[b].data = realloc(BUFS[b].data, new_cap as u64);
+    BUFS[b].cap = new_cap;
+}
+
+pub fn buf_clear(b: i64) {
+    BUFS[b].len = 0;
+}
+
+pub fn buf_byte(b: i64, c: u8) {
+    if BUFS[b].len == BUFS[b].cap {
+        buf_reserve(b, 1);
+    }
+    BUFS[b].data[BUFS[b].len] = c;
+    BUFS[b].len += 1;
+}
+
+pub fn buf_bytes(b: i64, bytes: [u8]) {
+    let n = bytes.len as i64;
+    buf_reserve(b, n);
+    memcpy(&BUFS[b].data[BUFS[b].len], bytes.ptr, bytes.len as u64);
+    BUFS[b].len += n;
+}
+
+// The bytes of buffer b.
+pub fn buf_slice(b: i64) -> [u8] {
+    BUFS[b].data[0..BUFS[b].len]
+}
+
+pub fn buf_str(b: i64, s: *u8) {
+    buf_bytes(b, s[0..strlen(s) as i64]);
+}
+
+pub fn buf_uint(b: i64, value: u64) {
+    let mut digits: [u8; 24] = [0; 24];
+    let mut n = 0;
+    let mut v = value;
+    loop {
+        digits[n] = '0' + (v % 10) as u8;
+        n += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    while n > 0 {
+        n -= 1;
+        buf_byte(b, digits[n]);
+    }
+}
+
+pub fn buf_int(b: i64, value: i64) {
+    if value < 0 {
+        buf_byte(b, '-');
+        // Also right for the most negative value: its negation wraps to
+        // itself, which as u64 is the right magnitude.
+        buf_uint(b, (0 - value) as u64);
+    } else {
+        buf_uint(b, value as u64);
+    }
+}
+
+fn hex_digit_char(d: u64) -> u8 {
+    if d < 10 { '0' + d as u8 } else { 'a' + (d - 10) as u8 }
+}
+
+// `value` as exactly `digits` lowercase hex digits.
+pub fn buf_hex(b: i64, value: u64, digits: i64) {
+    let mut i = digits - 1;
+    while i >= 0 {
+        buf_byte(b, hex_digit_char((value >> (i * 4) as u64) & 15));
+        i -= 1;
+    }
+}
+
+// Writes the whole buffer to a file descriptor.
+pub fn buf_write_fd(b: i64, fd: i32) {
+    write(fd, BUFS[b].data, BUFS[b].len as u64);
+}
+
+pub fn buf_write_file(b: i64, path: *u8) {
+    let file = fopen(path, c"wb");
+    if file == 0 as *u8 {
+        die2(c"cannot write ", path);
+    }
+    fwrite(BUFS[b].data, 1, BUFS[b].len as u64, file);
+    fclose(file);
+}
+
+// ---- Fatal errors without a source position ----
+
+pub fn die(message: *u8) -> ! {
+    write(STDERR, c"error: ", 7);
+    write(STDERR, message, strlen(message));
+    write(STDERR, c"\n", 1);
+    exit(1)
+}
+
+pub fn die2(message: *u8, detail: *u8) -> ! {
+    write(STDERR, c"error: ", 7);
+    write(STDERR, message, strlen(message));
+    write(STDERR, detail, strlen(detail));
+    write(STDERR, c"\n", 1);
+    exit(1)
+}
+
+// ---- Symbols ----
+
+// Every identifier is interned once; a symbol is its index in SYMS.
+// `text` is NUL-terminated (text.ptr is a C string).
+struct Sym { text: [u8], hash: u64 }
+
+pub static mut SYMS: *Sym = 0 as *Sym;
+pub static mut SYM_COUNT: i64 = 0;
+static mut SYM_CAP: i64 = 0;
+// Open addressing: symbol + 1 per slot, 0 when empty.
+static mut SYM_TABLE: *i64 = 0 as *i64;
+static mut SYM_TABLE_SIZE: i64 = 0;
+
+fn hash_bytes(bytes: [u8]) -> u64 {
+    let mut h: u64 = 14695981039346656037;
+    for i in 0..bytes.len as i64 {
+        h ^= bytes[i] as u64;
+        h *= 1099511628211;
+    }
+    h
+}
+
+fn sym_table_insert(sym: i64) {
+    let mask = (SYM_TABLE_SIZE - 1) as u64;
+    let mut slot = SYMS[sym].hash & mask;
+    while SYM_TABLE[slot] != 0 {
+        slot = (slot + 1) & mask;
+    }
+    SYM_TABLE[slot] = sym + 1;
+}
+
+fn sym_table_rehash() {
+    let mut new_size = SYM_TABLE_SIZE * 2;
+    if new_size < 1024 {
+        new_size = 1024;
+    }
+    free(SYM_TABLE as *u8);
+    SYM_TABLE = alloc_array::<i64>(new_size);
+    SYM_TABLE_SIZE = new_size;
+    for sym in 0..SYM_COUNT {
+        sym_table_insert(sym);
+    }
+}
+
+// The symbol with these bytes, or -1 (none is made).
+pub fn find_sym(bytes: [u8]) -> i64 {
+    if SYM_TABLE_SIZE == 0 {
+        return -1;
+    }
+    let n = bytes.len as i64;
+    let hash = hash_bytes(bytes);
+    let mask = (SYM_TABLE_SIZE - 1) as u64;
+    let mut slot = hash & mask;
+    while SYM_TABLE[slot] != 0 {
+        let sym = SYM_TABLE[slot] - 1;
+        if SYMS[sym].hash == hash && SYMS[sym].text.len as i64 == n
+            && memcmp(SYMS[sym].text.ptr, bytes.ptr, n as u64) == 0 {
+            return sym;
+        }
+        slot = (slot + 1) & mask;
+    }
+    -1
+}
+
+pub fn intern(bytes: [u8]) -> i64 {
+    let n = bytes.len as i64;
+    if (SYM_COUNT + 1) * 2 > SYM_TABLE_SIZE {
+        sym_table_rehash();
+    }
+    let hash = hash_bytes(bytes);
+    let mask = (SYM_TABLE_SIZE - 1) as u64;
+    let mut slot = hash & mask;
+    while SYM_TABLE[slot] != 0 {
+        let sym = SYM_TABLE[slot] - 1;
+        if SYMS[sym].hash == hash && SYMS[sym].text.len as i64 == n
+            && memcmp(SYMS[sym].text.ptr, bytes.ptr, n as u64) == 0 {
+            return sym;
+        }
+        slot = (slot + 1) & mask;
+    }
+    SYMS = grow(SYMS, SYM_COUNT, &SYM_CAP);
+    let sym = SYM_COUNT;
+    // Symbols keep their own NUL-terminated copy, usable as a C string.
+    let copy = alloc_zeroed(n + 1);
+    memcpy(copy, bytes.ptr, n as u64);
+    SYMS[sym] = Sym { text: copy[0..n], hash: hash };
+    SYM_COUNT += 1;
+    SYM_TABLE[slot] = sym + 1;
+    if SYM_COUNT > SYM_TABLES_CAP && SYM_TABLES.count > 0 {
+        grow_sym_tables();
+    }
+    sym
+}
+
+// Tables indexed by symbol (see sym_table): their addresses, and their
+// capacity, which grows with the symbols (names made after the tables,
+// such as the keys of module items and the names of generic instances).
+static mut SYM_TABLES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut SYM_TABLES_CAP: i64 = 0;
+
+// A zeroed table indexed by symbol, stored in `*slot` and kept as large
+// as the symbol table.
+pub fn sym_table(slot: **i64) {
+    if SYM_TABLES_CAP < SYM_COUNT + 1 {
+        if SYM_TABLES.count > 0 {
+            grow_sym_tables();
+        } else {
+            SYM_TABLES_CAP = (SYM_COUNT + 1) * 2;
+        }
+    }
+    *slot = alloc_array::<i64>(SYM_TABLES_CAP);
+    SYM_TABLES.push(slot as i64);
+}
+
+fn grow_sym_tables() {
+    let old = SYM_TABLES_CAP;
+    let mut cap = old * 2;
+    while cap < SYM_COUNT + 1 {
+        cap *= 2;
+    }
+    for i in 0..SYM_TABLES.count {
+        let slot = SYM_TABLES.data[i] as **i64;
+        let table = alloc_array::<i64>(cap);
+        memcpy(table as *u8, *slot as *u8, (old * 8) as u64);
+        free(*slot as *u8);
+        *slot = table;
+    }
+    SYM_TABLES_CAP = cap;
+}
+
+pub fn intern_c(s: *u8) -> i64 {
+    intern(s[0..strlen(s) as i64])
+}
+
+// The symbol's name as a C string.
+pub fn sym_name(sym: i64) -> *u8 {
+    SYMS[sym].text.ptr
+}
+
+// ---- Source files ----
+
+// All files are read into one buffer, SRC; a position is an offset in it.
+// `module`: the module the file makes (modules.tach; 0 for the root).
+struct SourceFile { path: *u8, start: i64, end: i64, module: i64 }
+
+pub static mut SRC: *u8 = 0 as *u8;
+static mut SRC_LEN: i64 = 0;
+pub static mut FILES: *SourceFile = 0 as *SourceFile;
+pub static mut FILE_COUNT: i64 = 0;
+static mut FILE_CAP: i64 = 0;
+
+pub fn read_file(path: *u8, out: i64) {
+    let file = fopen(path, c"rb");
+    if file == 0 as *u8 {
+        die2(c"cannot read ", path);
+    }
+    loop {
+        buf_reserve(out, 65536);
+        let got = fread(&BUFS[out].data[BUFS[out].len], 1, 65536, file);
+        BUFS[out].len += got as i64;
+        if got == 0 {
+            break;
+        }
+    }
+    fclose(file);
+}
+
+// Reads all source files into SRC; each file is followed by a newline so
+// that tokens never span files.
+pub fn load_sources(paths: **u8, count: i64) {
+    let all = buf_new();
+    for i in 0..count {
+        let start = BUFS[all].len;
+        read_file(paths[i], all);
+        FILES = grow(FILES, FILE_COUNT, &FILE_CAP);
+        FILES[FILE_COUNT] = SourceFile { path: paths[i], start: start, end: BUFS[all].len, module: 0 };
+        FILE_COUNT += 1;
+        buf_byte(all, '\n');
+    }
+    buf_byte(all, 0);
+    SRC = BUFS[all].data;
+    SRC_LEN = BUFS[all].len - 1;
+    SRC_BUF = all;
+}
+
+static mut SRC_BUF: i64 = 0;
+
+// Adds a source file made by the compiler (the declarations of `import`ed
+// C headers) after the others; returns its start in SRC.
+pub fn add_source(path: *u8, text: i64) -> i64 {
+    let all = SRC_BUF;
+    BUFS[all].len -= 1;
+    let start = BUFS[all].len;
+    buf_bytes(all, buf_slice(text));
+    FILES = grow(FILES, FILE_COUNT, &FILE_CAP);
+    FILES[FILE_COUNT] = SourceFile { path: path, start: start, end: BUFS[all].len, module: 0 };
+    FILE_COUNT += 1;
+    buf_byte(all, '\n');
+    buf_byte(all, 0);
+    SRC = BUFS[all].data;
+    SRC_LEN = BUFS[all].len - 1;
+    start
+}
+
+// ---- Errors at a source position ----
+
+pub static mut ERR: i64 = -1;
+static mut ERR_POS: i64 = 0;
+// `--tokens`: errors print as `error <position in the file>` on stdout, the
+// format of the reference lexer's dump.
+pub static mut ERRORS_AS_DUMP: bool = false;
+// The phase reporting errors, as in the reference compiler's diagnostics.
+pub static mut ERR_KIND: *u8 = 0 as *u8;
+pub static mut ERR_HELP: i64 = -1;
+
+// Starts an error message at `pos`; finish it with err_* and err_end.
+pub fn err_begin(pos: i64) {
+    if ERR < 0 {
+        ERR = buf_new();
+        ERR_HELP = buf_new();
+    }
+    buf_clear(ERR);
+    buf_clear(ERR_HELP);
+    ERR_POS = pos;
+    ERR_POISONED = false;
+}
+
+// ---- Several errors (0.5) ----
+//
+// The parser and the checker set recovery points (around an item, a
+// statement, a function's body): an error is recorded, and the work goes
+// on after the innermost recovery point, which skips what failed. At the
+// end of a phase that had errors, they are all printed, sorted by
+// position, and the compiler exits with 1. An error whose message names
+// the error type (the type given to what failed, see TY_ERROR) follows
+// from an earlier one and is not reported.
+//
+// A recovery point:
+//     let depth = RECOVER_DEPTH;
+//     if _setjmp(recover_enter()) == 0 {
+//         ... work that may fail ...
+//     } else {
+//         ... clean up after a failure ...
+//     }
+//     recover_leave(depth);
+// (_setjmp must be called by the function that goes on after the jump,
+// and that function must not return in between: the work is a call
+// followed by more code, never a tail call.)
+
+const MAX_ERRORS: i64 = 50;
+
+static mut RECOVER_BUFS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut RECOVER_DEPTH: i64 = 0;
+// The recorded errors: position and message (a buffer), in pairs.
+static mut ERRORS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut ERROR_COUNT: i64 = 0;
+// Whether the message being made names the error type.
+pub static mut ERR_POISONED: bool = false;
+
+pub fn recover_enter() -> *u8 {
+    if RECOVER_BUFS.count <= RECOVER_DEPTH {
+        RECOVER_BUFS.push(alloc_zeroed(512) as i64);
+    }
+    let jb = RECOVER_BUFS.data[RECOVER_DEPTH] as *u8;
+    RECOVER_DEPTH += 1;
+    jb
+}
+
+pub fn recover_leave(depth: i64) {
+    RECOVER_DEPTH = depth;
+}
+
+// Prints the recorded errors and exits with 1, if there are any.
+pub fn exit_if_errors() {
+    if ERROR_COUNT == 0 {
+        return;
+    }
+    // Sorted by position (stable: an insertion sort of the pairs).
+    let n = ERRORS.count / 2;
+    for i in 1..n {
+        let mut j = i;
+        while j > 0 && ERRORS.data[2 * (j - 1)] > ERRORS.data[2 * j] {
+            let pos = ERRORS.data[2 * j];
+            let text = ERRORS.data[2 * j + 1];
+            ERRORS.data[2 * j] = ERRORS.data[2 * (j - 1)];
+            ERRORS.data[2 * j + 1] = ERRORS.data[2 * (j - 1) + 1];
+            ERRORS.data[2 * (j - 1)] = pos;
+            ERRORS.data[2 * (j - 1) + 1] = text;
+            j -= 1;
+        }
+    }
+    let out = buf_new();
+    for i in 0..n {
+        buf_bytes(out, buf_slice(ERRORS.data[2 * i + 1]));
+    }
+    if ERROR_COUNT >= MAX_ERRORS {
+        buf_str(out, c"error: too many errors; stopping after ");
+        buf_int(out, MAX_ERRORS);
+        buf_byte(out, '\n');
+    }
+    buf_write_fd(out, STDERR);
+    exit(1);
+}
+
+// Text for the error's help line.
+pub fn err_help(s: *u8) {
+    buf_str(ERR_HELP, s);
+}
+
+pub fn err_help_sym(sym: i64) {
+    buf_bytes(ERR_HELP, SYMS[sym].text);
+}
+
+pub fn err_str(s: *u8) {
+    buf_str(ERR, s);
+}
+
+pub fn err_sym(sym: i64) {
+    buf_bytes(ERR, SYMS[sym].text);
+}
+
+pub fn err_int(value: i64) {
+    buf_int(ERR, value);
+}
+
+// Prints the error and exits:
+//   error[<kind>]: <message>
+//    --> <file>: line <line>, column <column>
+//     = help: <help>
+pub fn err_end() -> ! {
+    let out = buf_new();
+    let mut file = 0;
+    while file + 1 < FILE_COUNT && ERR_POS >= FILES[file + 1].start {
+        file += 1;
+    }
+    if ERRORS_AS_DUMP {
+        buf_str(out, c"error ");
+        buf_int(out, ERR_POS - FILES[file].start);
+        buf_byte(out, '\n');
+        buf_write_fd(out, STDOUT);
+        exit(0);
+    }
+    buf_str(out, c"error[");
+    buf_str(out, ERR_KIND);
+    buf_str(out, c"]: ");
+    buf_bytes(out, buf_slice(ERR));
+    buf_str(out, c"\n --> ");
+    buf_position(out, ERR_POS);
+    buf_byte(out, '\n');
+    if BUFS[ERR_HELP].len > 0 {
+        buf_str(out, c"  = help: ");
+        buf_bytes(out, buf_slice(ERR_HELP));
+        buf_byte(out, '\n');
+    }
+    instantiation_notes(out);
+    if !ERR_POISONED {
+        ERRORS.push(ERR_POS);
+        ERRORS.push(out);
+        ERROR_COUNT += 1;
+    }
+    if RECOVER_DEPTH > 0 && ERROR_COUNT < MAX_ERRORS {
+        _longjmp(RECOVER_BUFS.data[RECOVER_DEPTH - 1] as *u8, 1);
+    }
+    exit_if_errors();
+    exit(1)
+}
+
+// `<file>: line <line>, column <column>` of position pos.
+pub fn buf_position(out: i64, pos: i64) {
+    let mut file = 0;
+    while file + 1 < FILE_COUNT && pos >= FILES[file + 1].start {
+        file += 1;
+    }
+    let mut line = 1;
+    let mut col = 1;
+    let mut i = FILES[file].start;
+    while i < pos && i < SRC_LEN {
+        if SRC[i] == '\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+        i += 1;
+    }
+    buf_str(out, FILES[file].path);
+    buf_str(out, c": line ");
+    buf_int(out, line);
+    buf_str(out, c", column ");
+    buf_int(out, col);
+}
+
+pub fn error_at(pos: i64, message: *u8) -> ! {
+    err_begin(pos);
+    err_str(message);
+    err_end()
+}

@@ -261,13 +261,14 @@ Say the last release is 0.2.0 and you have implemented a feature on main.
 2. Add the tests for the new behaviour to `tests/` (`tests/run/*.tach` with
    `// EXPECT:` ... directives; see `tests/run.sh`), and examples if useful.
    Update `docs/grammar.md` for language changes.
-3. Bump the version string in `compiler/src/90_main.tach` (`version()`).
+3. Bump the version string in `compiler/src/main.tach` (`version()`).
 4. Add the release to `bootstrap/releases.toml`:
    ```toml
    [[release]]
    version = "0.3.0"
    tag = "v0.3.0"
    compiler = "compiler/src"
+   root = "main.tach"          # from 0.6: the root of the compiler's module tree
    built_by = "0.2.0"
    cli = "tachyonc-0.1"
    tests = "tests/run.sh"
@@ -290,17 +291,22 @@ Say the last release is 0.2.0 and you have implemented a feature on main.
 If a release changes how its binary is invoked or what it emits (another
 command line), give it a new `cli` value and teach `compile_with` in
 `bootstrap/bootstrap.sh` about it; the script keeps every interface that a
-release in the chain uses.
+release in the chain uses. How a release's *source* is laid out is the
+`root` key's business: from 0.6 the compiler is a module tree whose root
+file (`compiler/src/main.tach`) is the only file on the command line; a
+release without `root` (0.1.0 to 0.5.0) is compiled from all the `.tach`
+files of its `compiler` directory, as one module. The builder's `cli` says
+how to invoke the builder; the release's `root` says what to give it.
 
 ## Adding a host
 
 A new host (say `aarch64-linux`) needs:
 
 1. A backend for it in the compiler: an instruction set file next to
-   `compiler/src/42_arm64.tach` and `43_x86_64.tach` (or a new object
+   `compiler/src/arm64.tach` and `x86_64.tach` (or a new object
    format and ABI in an existing one), a target name in
-   `compiler/src/41_target.tach`, and its detection in `host_target()` in
-   `90_main.tach`. The release that adds it is built on an existing host,
+   `compiler/src/target.tach`, and its detection in `host_target()` in
+   `main.tach`. The release that adds it is built on an existing host,
    and is checked on the new one by cross-compiling: its assembly for the
    new target must be the same wherever it is produced, and the suite must
    pass there (`tests/run.sh -t <target>`).
@@ -319,7 +325,7 @@ With a compiler binary at hand (`target/tachyonc`, as `bootstrap.sh` leaves
 it), on aarch64-macos:
 
 ```
-$ target/tachyonc compiler/src/*.tach -o tachyonc.s     # the compiler, by itself
+$ target/tachyonc compiler/src/main.tach -o tachyonc.s   # the compiler (its root file), by itself
 $ cc -arch arm64 -o tachyonc tachyonc.s -lm
 $ tests/run.sh -c ./tachyonc                            # the test suite, for the host
 $ tests/run.sh -c ./tachyonc prog_                      # only cases named *prog_*
@@ -333,7 +339,7 @@ $ bench/run.sh -c ./tachyonc                            # benchmarks
 and on x86_64-linux:
 
 ```
-$ target/tachyonc compiler/src/*.tach -o tachyonc.s
+$ target/tachyonc compiler/src/main.tach -o tachyonc.s
 $ cc -o tachyonc tachyonc.s -lm
 $ tests/run.sh -c ./tachyonc
 ```

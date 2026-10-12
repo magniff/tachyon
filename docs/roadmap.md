@@ -184,7 +184,7 @@ Language (front end; see grammar.md, "Additions of 0.5"):
 - [x] modules: a file is a module (`mod m;`), `pub`, paths with `crate`,
   `self` and `super`, `use a::b::{c, d as e}`, `use a::b::*`, `pub use`;
   `import "h.h" as c;` names the C declarations' module
-- [x] several errors per compilation (pulled forward from 1.0): the parser
+- [x] several errors per compilation (pulled forward from 0.10): the parser
   and the checker recover at statements, items and functions; errors that
   follow from an earlier one are not reported
 - [x] a small standard library built into the compiler (`std::Option`,
@@ -222,7 +222,7 @@ The back end, in two stages (design and status in
 
 Stage B:
 
-- [x] instruction selection by rules (`50_isel.tach`): a per-target rule
+- [x] instruction selection by rules (`isel.tach`): a per-target rule
   table tiling each block's SSA DAG by maximal munch into machine
   operations the allocator sees like any instruction: scaled-index
   addressing (AArch64 `[x, x, lsl #s]`, x86-64 `d(b, i, s)`, frame slots
@@ -233,7 +233,7 @@ Stage B:
   macOS and `fabs`/`floor`/`ceil`/`trunc`/`round` on AArch64 as
   instructions; branches on phis threaded into their predecessors, a
   branch on its predecessor's condition decided
-- [x] block layout (`51_layout.tach`): chains by fall-through from static
+- [x] block layout (`layout.tach`): chains by fall-through from static
   edge weights (loop depth, back edges, cold panic paths last), and tail
   duplication of small blocks at emission (threaded dispatch in
   interpreters, loop rotation by layout), small epilogues inlined
@@ -263,6 +263,10 @@ library (and reports several errors at once while it is written).
 
 ## 0.7: equality saturation
 
+Language: traits (bounded generics), which a generic hash map and
+operator overloading need; adding bounds does not change what programs
+written against 0.5's unbounded generics mean.
+
 - replace ad-hoc rewriting with an e-graph (acyclic, à la Cranelift's
   ægraph) and a rewrite-rule DSL compiled into matchers
 - rewrite rules checked by randomized differential testing before they
@@ -284,12 +288,29 @@ library (and reports several errors at once while it is written).
 - PGO-aware register allocation and unrolling
 - list scheduling (from 0.5) where profiles say a block is hot
 
-## 1.0: stable
+## 0.10: feature-complete
 
-- language specification frozen; multi-error diagnostics; DWARF line
-  tables
+The last release of the build-out: everything planned above, finished.
+
+- multi-error diagnostics (done in 0.5); DWARF line tables
 - aarch64-linux host
 - within 10% of clang -O2 on `bench/`
+- a written language specification describing 0.10 as it is
+
+## Toward 1.0
+
+1.0 is not a feature milestone: it ships when the language is thought
+through and stable, after as many 0.10.x / 0.11+ iterations as that takes:
+
+- the surface language reworked with experience of real programs:
+  strings, error handling, iteration, conversions, traits and their
+  ergonomics, naming; anything breaking settled before 1.0
+- tools: a language server (editor support), a formatter, build and
+  package workflow, documentation generation
+- stability: long-running fuzzing, real programs in tachyon beyond the
+  compiler, no known miscompiles
+- 1.0 freezes compatibility, not features: from 1.0 on, additions are minor
+  releases and breaking changes wait for 2.0
 
 ## Benchmarks
 

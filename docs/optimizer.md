@@ -5,19 +5,19 @@ invariants, the passes and the pipeline at each level, the back end, and
 how all of it is tested. This is the living design document of the middle
 and back end; later releases extend it (see [roadmap.md](roadmap.md)).
 
-The code: `compiler/src/44_ir.tach` (IR), `45_lower.tach` (AST to SSA),
-`46_opt.tach` (CFG cleanups, dominators, dead code, the pipeline),
-`47_fold.tach` (folding, SCCP, instruction combining), `48_gvn.tach`
+The code: `compiler/src/ir.tach` (IR), `lower.tach` (AST to SSA),
+`opt.tach` (CFG cleanups, dominators, dead code, the pipeline),
+`fold.tach` (folding, SCCP, instruction combining), `gvn.tach`
 (value numbering, alias analysis, memory forwarding, dead stores),
-`48_sroa.tach` (scalar replacement, constant tables), `49_licm.tach`,
-`49_inline.tach`, `50_regalloc.tach` (linear scan), `51_emit.tach`
-(emission), `52_mc_arm64.tach` and `53_mc_x86_64.tach` (instructions).
+`sroa.tach` (scalar replacement, constant tables), `licm.tach`,
+`inline.tach`, `regalloc.tach` (linear scan), `emit.tach`
+(emission), `mc_arm64.tach` and `mc_x86_64.tach` (instructions).
 
 ## Optimization levels
 
 | flag | pipeline |
 |---|---|
-| `-O0` | the 0.1 code generator (`40_gen.tach`), unchanged: stack-machine code straight from the AST |
+| `-O0` | the 0.1 code generator (`gen.tach`), unchanged: stack-machine code straight from the AST |
 | `-O1` | lowering to SSA; per function, twice: SCCP, instruction combining, (the first time) scalar replacement of aggregates and constant tables, CFG simplification, GVN with memory forwarding and dead stores, dead code elimination, CFG simplification; linear-scan register allocation |
 | `-O2` (default) | `-O1`, then per function in call-graph order (callees first): tail recursion elimination, inlining, the loop optimizer (0.4: rotation, induction variables and unrolling, value ranges, strength reduction and unswitching, aggressive DCE) and loop-invariant code motion, each followed by the `-O1` pipeline again; functions left without callers are not emitted |
 
@@ -68,7 +68,7 @@ typed scalar values in SSA form; memory is explicit.
   split by the lowering into its scalar pieces (one `load` each, so the
   optimizer sees through the round trip), and a parameter's pieces are
   separate `param`s (`imm2` = piece + 1) stored into a slot; larger
-  aggregates go by reference or as a copy on the stack (`41_abi.tach`).
+  aggregates go by reference or as a copy on the stack (`abi.tach`).
 - **Replacement** is lazy: `ir_replace(v, w)` records that `v` now stands
   for `w` (and unlinks `v`); `ir_val` follows such records, and passes
   resolve operands before they look at them.
@@ -83,7 +83,7 @@ Invariants (checked by `--verify-ir` after every pass):
   phi operand: dominates the end of the corresponding predecessor);
 - operands are resolved (no replaced instruction is referenced).
 
-**Construction** (`45_lower.tach`) follows Braun et al., *Simple and
+**Construction** (`lower.tach`) follows Braun et al., *Simple and
 Efficient Construction of Static Single Assignment Form* (CC 2013),
 directly from the checked AST. Scalar locals whose address is never taken
 are SSA variables; the others get frame slots. The values of `if`, `&&`,
@@ -98,24 +98,24 @@ pointer) and every arithmetic rule.
 
 | pass | algorithm | file |
 |---|---|---|
-| cleanup | unreachable-block removal; trivial-phi removal (a phi whose operands are one value is that value), to a fixpoint | `46_opt` |
-| SCCP | Wegman & Zadeck, *Constant Propagation with Conditional Branches* (TOPLAS 1991): a lattice per value, executable edges, two work lists; constant values and decided branches are rewritten | `47_fold` |
-| folding | what the machine computes: wrapping arithmetic at every width, `x / 0 == 0`, `x % 0 == x`, `MIN / -1 == MIN`, shift amounts modulo 32 (types up to 32 bits) or 64, IEEE comparisons, the saturating float-to-integer conversions of `-O0` (including its quirks: up to 32-bit signed targets saturate at 32 bits and wrap) | `47_fold` |
-| instruction combining | constants on the right; identities (`x + 0`, `x * 1`, `x & 0`, `x - x`, `x ^ x`, `x & x`, double negation, `b != false`); `x * 2^k` to a shift; unsigned division and remainder by `2^k` to a shift and a mask; signed division by `2^k` with the rounding fix-up (`(x + ((x >> 63) >>> (64 - k))) >> k`) and remainder from it; reassociation of constant address offsets and their folding into loads and stores; comparisons with the constant on the left mirrored; a branch on `!x` swapped | `47_fold` |
-| CFG simplification | branches on constants and branches with one target become jumps; a block merges into its only predecessor when that predecessor jumps to it; jumps through empty blocks are threaded (when the target has no phis) | `46_opt` |
-| dominators | Cooper, Harvey & Kennedy, *A Simple, Fast Dominance Algorithm*, over a reverse post-order | `46_opt` |
-| GVN | a walk of the dominator tree with a scoped hash table (undo log, so scopes are popped in constant time per entry) over the pure instructions; commutative operands in a canonical order | `48_gvn` |
-| alias analysis | an address is a base plus a constant offset; it points into a memory object (a frame slot, a static, constant data) through additions of constant or variable offsets, or into unknown memory; distinct objects never overlap; constant data is never written; a slot whose address only serves loads, stores, copies (memcpy calls included) and address arithmetic is private: no pointer from elsewhere and no call reaches it; within one object, byte ranges are compared when both offsets are known. No type-based rule: tachyon allows casts between any pointers | `48_gvn` |
-| dead code elimination | mark from instructions with side effects and the terminators, sweep the rest | `46_opt` |
-| LICM | natural loops from back edges (`h` dominates `t`); a preheader for each loop (the entering edge is split when needed); pure instructions whose operands are defined outside the loop move to the preheader, innermost loops first, and so do loads from frame slots and statics that nothing in the loop may write. Nothing moved can trap (division never traps in tachyon) | `49_licm` |
-| SROA | a frame slot of a struct, tuple, enum, slice, small array or scalar whose address serves only loads, stores and copies at constant offsets becomes one SSA variable per scalar leaf of its type, by Braun et al.'s construction over the existing CFG (blocks in reverse post-order, sealed once their predecessors are filled); copies move leaf by leaf, to or from memory when the other side stays there. The values of `if`, `match` and `loop` of up to 128 bytes are built in one slot each exit copies into, so they are replaced too | `48_sroa` |
-| constant tables | a private slot written only by stores of constants at known offsets, in one block that comes before every read, becomes read-only data; loads from read-only data (and string literals) at known offsets become constants | `48_sroa`, `48_gvn` |
-| memory forwarding | along the dominator tree: what a block knows about memory (location to value) goes to a block it dominates when that one's only predecessor is it, or after the writes of every block on the paths between them are applied; loads of known locations are their values; storing what a location holds is dropped; a load from the destination of a copy that still holds reads its source (and the copy may then die) | `48_gvn` |
-| dead stores | within a block, a store (or a copy) overwritten before anything may read it; a store or copy into a private slot that nothing reads | `48_gvn` |
-| switches | a `match` on an integer, a fieldless enum or an enum's tag whose arms are literals, ranges, alternatives of them, or variants whose fields only bind (and no guards), is a `switch`; SCCP decides switches on constants and prunes them to their reachable successor | `45_lower`, `47_fold`, `46_opt` |
-| inlining | strongly connected components of the call graph (Tarjan), callees first, so a callee is already optimized and recursion is never inlined; a callee is inlined when it has at most 30 instructions, or when this is its only call site and it has at most 400 (and is neither `main` nor address-taken); callers grow to at most 3,000 instructions. The callee's blocks are copied, parameters become the arguments, frame slots are copied, returns jump to a continuation block with a phi for the result | `49_inline` |
+| cleanup | unreachable-block removal; trivial-phi removal (a phi whose operands are one value is that value), to a fixpoint | `opt.tach` |
+| SCCP | Wegman & Zadeck, *Constant Propagation with Conditional Branches* (TOPLAS 1991): a lattice per value, executable edges, two work lists; constant values and decided branches are rewritten | `fold.tach` |
+| folding | what the machine computes: wrapping arithmetic at every width, `x / 0 == 0`, `x % 0 == x`, `MIN / -1 == MIN`, shift amounts modulo 32 (types up to 32 bits) or 64, IEEE comparisons, the saturating float-to-integer conversions of `-O0` (including its quirks: up to 32-bit signed targets saturate at 32 bits and wrap) | `fold.tach` |
+| instruction combining | constants on the right; identities (`x + 0`, `x * 1`, `x & 0`, `x - x`, `x ^ x`, `x & x`, double negation, `b != false`); `x * 2^k` to a shift; unsigned division and remainder by `2^k` to a shift and a mask; signed division by `2^k` with the rounding fix-up (`(x + ((x >> 63) >>> (64 - k))) >> k`) and remainder from it; reassociation of constant address offsets and their folding into loads and stores; comparisons with the constant on the left mirrored; a branch on `!x` swapped | `fold.tach` |
+| CFG simplification | branches on constants and branches with one target become jumps; a block merges into its only predecessor when that predecessor jumps to it; jumps through empty blocks are threaded (when the target has no phis) | `opt.tach` |
+| dominators | Cooper, Harvey & Kennedy, *A Simple, Fast Dominance Algorithm*, over a reverse post-order | `opt.tach` |
+| GVN | a walk of the dominator tree with a scoped hash table (undo log, so scopes are popped in constant time per entry) over the pure instructions; commutative operands in a canonical order | `gvn.tach` |
+| alias analysis | an address is a base plus a constant offset; it points into a memory object (a frame slot, a static, constant data) through additions of constant or variable offsets, or into unknown memory; distinct objects never overlap; constant data is never written; a slot whose address only serves loads, stores, copies (memcpy calls included) and address arithmetic is private: no pointer from elsewhere and no call reaches it; within one object, byte ranges are compared when both offsets are known. No type-based rule: tachyon allows casts between any pointers | `gvn.tach` |
+| dead code elimination | mark from instructions with side effects and the terminators, sweep the rest | `opt.tach` |
+| LICM | natural loops from back edges (`h` dominates `t`); a preheader for each loop (the entering edge is split when needed); pure instructions whose operands are defined outside the loop move to the preheader, innermost loops first, and so do loads from frame slots and statics that nothing in the loop may write. Nothing moved can trap (division never traps in tachyon) | `licm.tach` |
+| SROA | a frame slot of a struct, tuple, enum, slice, small array or scalar whose address serves only loads, stores and copies at constant offsets becomes one SSA variable per scalar leaf of its type, by Braun et al.'s construction over the existing CFG (blocks in reverse post-order, sealed once their predecessors are filled); copies move leaf by leaf, to or from memory when the other side stays there. The values of `if`, `match` and `loop` of up to 128 bytes are built in one slot each exit copies into, so they are replaced too | `sroa.tach` |
+| constant tables | a private slot written only by stores of constants at known offsets, in one block that comes before every read, becomes read-only data; loads from read-only data (and string literals) at known offsets become constants | `sroa.tach`, `gvn.tach` |
+| memory forwarding | along the dominator tree: what a block knows about memory (location to value) goes to a block it dominates when that one's only predecessor is it, or after the writes of every block on the paths between them are applied; loads of known locations are their values; storing what a location holds is dropped; a load from the destination of a copy that still holds reads its source (and the copy may then die) | `gvn.tach` |
+| dead stores | within a block, a store (or a copy) overwritten before anything may read it; a store or copy into a private slot that nothing reads | `gvn.tach` |
+| switches | a `match` on an integer, a fieldless enum or an enum's tag whose arms are literals, ranges, alternatives of them, or variants whose fields only bind (and no guards), is a `switch`; SCCP decides switches on constants and prunes them to their reachable successor | `lower.tach`, `fold.tach`, `opt.tach` |
+| inlining | strongly connected components of the call graph (Tarjan), callees first, so a callee is already optimized and recursion is never inlined; a callee is inlined when it has at most 30 instructions, or when this is its only call site and it has at most 400 (and is neither `main` nor address-taken); callers grow to at most 3,000 instructions. The callee's blocks are copied, parameters become the arguments, frame slots are copied, returns jump to a continuation block with a phi for the result | `inline.tach` |
 
-The pipeline (`optimize_program` in `46_opt.tach`) runs the cleanup on
+The pipeline (`optimize_program` in `opt.tach`) runs the cleanup on
 every function, then the `-O1` pipeline twice per function, then at `-O2`
 inlining and LICM in call-graph order, each followed by the `-O1`
 pipeline, and finally drops functions nobody calls (other than `main` and
@@ -123,7 +123,7 @@ those whose address is taken).
 
 ## The back end
 
-**Layout and liveness** (`50_regalloc.tach`). Critical edges (from a block
+**Layout and liveness** (`regalloc.tach`). Critical edges (from a block
 with several successors to one with several predecessors) are split, so
 that every edge has a place for its moves. Blocks are laid out in reverse
 post-order; back edges (to a block not later in the order: the graph is
@@ -197,7 +197,7 @@ least a third of their range (up to 4096 entries): 32-bit offsets from the
 table, so the code is position independent on ELF too; otherwise a binary
 search of compares and branches.
 
-**Emission** (`51_emit.tach`). The frame is addressed from sp, which does
+**Emission** (`emit.tach`). The frame is addressed from sp, which does
 not move in the body: outgoing stack arguments, spill slots, saved
 callee-saved registers, then the frame slots. Locations depend on the
 position: an instruction reads its operands where the allocation has them
@@ -270,12 +270,12 @@ interop):
 ## 0.4: the loop optimizer
 
 0.4 adds a loop optimizer to `-O2`, run per function after inlining and
-before LICM (`optimize_loops` in `46_opt.tach`; light cleanups between
+before LICM (`optimize_loops` in `opt.tach`; light cleanups between
 its passes, the `-O1` pipeline once after them). Tail recursion
-elimination runs before inlining (`49_tre.tach`). The passes, in
+elimination runs before inlining (`tre.tach`). The passes, in
 pipeline order:
 
-1. **Loop analysis and canonical form** (`49_loop.tach`): the loop forest
+1. **Loop analysis and canonical form** (`loops.tach`): the loop forest
    (natural loops by header, nesting, depth); every loop gets a preheader
    (one block entering the header, ending in a jump), a single latch (one
    back edge) and dedicated exits (exit blocks entered only from inside the
@@ -289,7 +289,7 @@ pipeline order:
    guarded `do`-`while` (the test duplicated in the preheader, the exit
    test at the latch): one branch per iteration instead of two, and the
    body known to run at least once.
-3. **Induction variables and trip counts** (`49_scev.tach`): add
+3. **Induction variables and trip counts** (`scev.tach`): add
    recurrences `{start, +, step}` of header phis; for a loop whose only
    exit is at the latch, the trip count when it is a constant (by
    evaluating the exit test with the folding rules, so wrapping is exactly
@@ -303,7 +303,7 @@ pipeline order:
    innermost loops with a constant trip count (found up to 4096) that the
    factor divides, up to 96 instructions. All copies are made from the
    untouched loop, then chained.
-6. **Loop strength reduction** (`49_lsr.tach`): an address affine in an
+6. **Loop strength reduction** (`lsr.tach`): an address affine in an
    induction variable (`k + c1*b1 + c2*b2 + (s + m*v)*i`, all 64-bit,
    `b1`, `b2`, `v` invariant) that costs a multiplication or a shift
    becomes a pointer induction variable; addresses a constant apart share
@@ -312,7 +312,7 @@ pipeline order:
    add per element.
 7. **Unswitching**: a branch on a loop-invariant condition inside a small
    loop: the loop is cloned, one copy per outcome, the test hoisted.
-8. **Value ranges and bounds checks** (`49_range.tach`): the range of an
+8. **Value ranges and bounds checks** (`range.tach`): the range of an
    integer value at a block, from its type, its operation (masks,
    remainders, conversions), induction variables, and the branch conditions
    that dominate the block; with it, bounds checks of slices whose index is
@@ -324,11 +324,11 @@ pipeline order:
    `match` with guards into a decision tree.
 9. **Comparison chains**: `x == c1` / `x == c2` / ... tests of one value in
    a chain of blocks become a `switch`.
-10. **Aggressive dead code elimination** (`46_adce.tach`): over control
+10. **Aggressive dead code elimination** (`adce.tach`): over control
     dependence (post-dominators), branches that decide nothing live are
     removed; branches of loops are kept (a loop may not terminate: only
     the loop deletion above removes loops, when they are finite).
-11. **Tail recursion elimination** (`49_tre.tach`): `return f(args)`,
+11. **Tail recursion elimination** (`tre.tach`): `return f(args)`,
     `return f(args) op y` and `return y op f(args)` (op one of `+ * & | ^`
     on integers, nothing with an effect after the call) become a loop with
     a phi per parameter and one for the accumulator; returns through a phi
@@ -392,7 +392,7 @@ instructions (rax and rdx stay fixed for division, rcx for shifts).
 
 Moved to stage B: the calling convention (2), which needs the lowering of
 calls and parameters to classify aggregates by convention (classification
-lives in `45_lower.tach` and `41_abi.tach`, shared with C's), and the
+lives in `lower.tach` and `abi.tach`, shared with C's), and the
 realigned frames (from 3), which touch the -O0 generator too. Both are done
 (stage B1, below).
 
@@ -403,7 +403,7 @@ convention; C's is kept by everything C can reach or call: functions
 imported from C or defined `extern "C"`, `main` (called by C), variadic
 functions, calls through `extern "C" fn` pointers, the run-time helpers,
 and every function at -O0, the oracle (`fn_uses_c`, `fn_type_uses_c` in
-`41_abi.tach`).
+`abi.tach`).
 
 The two never meet. A program is compiled at one level, and a plain `fn`
 value only ever holds a plain function of the same program: `fn` and
@@ -479,7 +479,7 @@ layout, post-allocation peepholes, unrolling with run-time trip counts,
 scheduling, shrink-wrapping. Done: the first three, and of scheduling the
 two rules that paid off; the rest is below.
 
-**Instruction selection** (`50_isel.tach`) runs between the optimizer and
+**Instruction selection** (`isel.tach`) runs between the optimizer and
 register allocation, after `--emit-ir` (so the optimizer's IR checks are
 unaffected; `--emit-mir` shows the IR after it). Per function:
 
@@ -534,7 +534,7 @@ unaffected; `--emit-mir` shows the IR after it). Per function:
    needed in a register (a store's value, a float) is made once; the
    allocator rematerializes it, before the loop, when it runs short.
 
-**Block layout** (`51_layout.tach`). The emission order is apart from the
+**Block layout** (`layout.tach`). The emission order is apart from the
 allocation order (any order is correct: every move belongs to a block or
 an edge, and a block's code depends on its positions only). Chains by
 fall-through (Pettis and Hansen, PLDI 1990, with static estimates): a

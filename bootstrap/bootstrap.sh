@@ -59,6 +59,25 @@ step() {
     echo "==> $*" >&2
 }
 
+# Whether version $1 is older than $2: their dot-separated numbers compared
+# as numbers, never as text (0.9.0 is older than 0.10.0). Releases are taken
+# in the order of releases.toml, which this checks; nothing here may sort
+# versions or tags as strings.
+version_lt() { # <a> <b>
+    awk -v a="$1" -v b="$2" 'BEGIN {
+        na = split(a, x, "."); nb = split(b, y, ".")
+        n = na > nb ? na : nb
+        for (i = 1; i <= n; i++) {
+            if (x[i] + 0 < y[i] + 0) exit 0
+            if (x[i] + 0 > y[i] + 0) exit 1
+        }
+        exit 1
+    }'
+}
+# (a self-check, cheap enough to run every time)
+{ version_lt 0.9.0 0.10.0 && ! version_lt 0.10.0 0.9.0 && version_lt 0.10.0 1.0.0 \
+    && ! version_lt 0.5.0 0.5.0; } || die "internal error: version_lt compares versions as text"
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --worktree) WORKTREE=1 ;;
@@ -119,17 +138,17 @@ trap 'rm -rf "$WORK"' EXIT INT TERM
 
 # One line per entry, fields separated by '|' (hosts comma-separated):
 #   seed|<tag>|<dir>
-#   release|<version>|<tag>|<compiler>|<built_by>|<cli>|<tests>|<hosts>
-#   head|<compiler>|<cli>|<tests>|<hosts>
+#   release|<version>|<tag>|<compiler>|<built_by>|<cli>|<tests>|<hosts>|<root>
+#   head|<compiler>|<cli>|<tests>|<hosts>|<root>
 [ -f "$MANIFEST" ] || die "missing $MANIFEST"
 awk '
     function flush() {
         if (section == "seed")
             print "seed|" v["tag"] "|" v["dir"]
         if (section == "release")
-            print "release|" v["version"] "|" v["tag"] "|" v["compiler"] "|" v["built_by"] "|" v["cli"] "|" v["tests"] "|" v["hosts"]
+            print "release|" v["version"] "|" v["tag"] "|" v["compiler"] "|" v["built_by"] "|" v["cli"] "|" v["tests"] "|" v["hosts"] "|" v["root"]
         if (section == "head")
-            print "head|" v["compiler"] "|" v["cli"] "|" v["tests"] "|" v["hosts"]
+            print "head|" v["compiler"] "|" v["cli"] "|" v["tests"] "|" v["hosts"] "|" v["root"]
         split("", v)
     }
     /^[ \t]*#/ || /^[ \t]*$/ { next }
@@ -155,7 +174,7 @@ grep -q '^head|' "$WORK/manifest" || die "$MANIFEST has no [head] section"
 IFS='|' read -r _ SEED_TAG SEED_DIR <<EOF
 $(grep '^seed|' "$WORK/manifest")
 EOF
-IFS='|' read -r _ HEAD_COMPILER HEAD_CLI HEAD_TESTS HEAD_HOSTS <<EOF
+IFS='|' read -r _ HEAD_COMPILER HEAD_CLI HEAD_TESTS HEAD_HOSTS HEAD_ROOT <<EOF
 $(grep '^head|' "$WORK/manifest")
 EOF
 if [ -n "$UNTIL" ] && ! grep -q "^release|$UNTIL|" "$WORK/releases"; then
@@ -169,7 +188,11 @@ check_host() { # <what> <comma-separated hosts>
     esac
 }
 
-while IFS='|' read -r _ version _ _ _ _ _ hosts; do
+prev_version=""
+while IFS='|' read -r _ version _ _ _ _ _ hosts _; do
+    [ -z "$prev_version" ] || version_lt "$prev_version" "$version" \
+        || die "$MANIFEST: release $version comes after $prev_version but is not newer (versions compare by number: 0.9.0 < 0.10.0)"
+    prev_version=$version
     check_host "release $version" "$hosts"
     [ "$version" = "$UNTIL" ] && break
 done <"$WORK/releases"
@@ -199,13 +222,21 @@ extract() { # <commit> <dir>
 
 # ---- Building and checking one compiler ----
 
-# Compiles the .tach files of <src> into the executable <out> with the
-# compiler <bin>, invoked through interface <cli>, for the host.
+# Compiles the compiler in <src> into the executable <out> with the
+# compiler <bin>, invoked through interface <cli>, for the host: its root
+# file <root> (a module tree, from 0.6), or else all the .tach files of
+# <src> (one module).
 # (POSIX sh has no local variables: each function uses its own prefix.)
-compile_with() { # <cli> <bin> <src> <out>
-    cw_cli=$1 cw_bin=$2 cw_src=$3 cw_out=$4
-    set -- "$cw_src"/*.tach
-    [ -e "$1" ] || die "no .tach files in $cw_src"
+compile_with() { # <cli> <bin> <src> <root> <out>
+    cw_cli=$1 cw_bin=$2 cw_src=$3 cw_root=$4 cw_out=$5
+    if [ -n "$cw_root" ]; then
+        set -- "$cw_src/$cw_root"
+        [ -f "$1" ] || die "no root file $cw_root in $cw_src"
+        [ "$cw_cli" != seed ] || die "the seed compiles one file: $cw_src is a module tree"
+    else
+        set -- "$cw_src"/*.tach
+        [ -e "$1" ] || die "no .tach files in $cw_src"
+    fi
     case "$cw_cli" in
         seed)
             # The seed compiles one file: the sources together.
@@ -227,15 +258,15 @@ compile_with() { # <cli> <bin> <src> <out>
 # Builds the compiler in <tree>/<compiler> with <builder>, checks the
 # fixpoint and runs the tree's test suite; leaves <dir>/tachyonc and sets
 # TEST_TOTAL.
-build_and_check() { # <name> <tree> <compiler> <cli> <tests> <builder_cli> <builder_bin> <builder_name> <dir>
-    bc_name=$1 bc_tree=$2 bc_src="$2/$3" bc_cli=$4 bc_tests=$5
-    bc_builder_cli=$6 bc_builder_bin=$7 bc_builder_name=$8 bc_dir=$9
+build_and_check() { # <name> <tree> <compiler> <root> <cli> <tests> <builder_cli> <builder_bin> <builder_name> <dir>
+    bc_name=$1 bc_tree=$2 bc_src="$2/$3" bc_root=$4 bc_cli=$5 bc_tests=$6
+    bc_builder_cli=$7 bc_builder_bin=$8 bc_builder_name=$9 bc_dir=${10}
     mkdir -p "$bc_dir"
     step "$bc_name: building with $bc_builder_name"
-    compile_with "$bc_builder_cli" "$bc_builder_bin" "$bc_src" "$bc_dir/build1"
+    compile_with "$bc_builder_cli" "$bc_builder_bin" "$bc_src" "$bc_root" "$bc_dir/build1"
     step "$bc_name: building with itself, twice"
-    compile_with "$bc_cli" "$bc_dir/build1" "$bc_src" "$bc_dir/build2"
-    compile_with "$bc_cli" "$bc_dir/build2" "$bc_src" "$bc_dir/build3"
+    compile_with "$bc_cli" "$bc_dir/build1" "$bc_src" "$bc_root" "$bc_dir/build2"
+    compile_with "$bc_cli" "$bc_dir/build2" "$bc_src" "$bc_root" "$bc_dir/build3"
     cmp -s "$bc_dir/build2.s" "$bc_dir/build3.s" \
         || die "$bc_name: no fixpoint: $bc_dir/build2.s and build3.s differ (its output depends on how it was built)"
     cp "$bc_dir/build2" "$bc_dir/tachyonc"
@@ -293,7 +324,7 @@ PREV_CLI=seed
 PREV_NAME=seed
 STOPPED=0
 
-while IFS='|' read -r _ version tag compiler built_by cli tests _; do
+while IFS='|' read -r _ version tag compiler built_by cli tests _ root; do
     [ "$built_by" = "$PREV_NAME" ] \
         || die "release $version is built by '$built_by', but the previous step is '$PREV_NAME'"
     commit=$(tag_commit "$tag")
@@ -310,7 +341,7 @@ while IFS='|' read -r _ version tag compiler built_by cli tests _; do
         TEST_TOTAL=$(cat "$dir/ok")
     else
         extract "$commit" "$dir/tree"
-        build_and_check "$version" "$dir/tree" "$compiler" "$cli" "$tests" \
+        build_and_check "$version" "$dir/tree" "$compiler" "$root" "$cli" "$tests" \
             "$PREV_CLI" "$PREV_BIN" "$PREV_NAME" "$dir" </dev/null
         echo "$TEST_TOTAL" >"$dir/ok"
     fi
@@ -341,7 +372,7 @@ if [ $STOPPED -eq 0 ]; then
         head_tree="$head_dir/tree"
         extract "$head_commit" "$head_tree"
     fi
-    build_and_check head "$head_tree" "$HEAD_COMPILER" "$HEAD_CLI" "$HEAD_TESTS" \
+    build_and_check head "$head_tree" "$HEAD_COMPILER" "$HEAD_ROOT" "$HEAD_CLI" "$HEAD_TESTS" \
         "$PREV_CLI" "$PREV_BIN" "$PREV_NAME" "$head_dir"
     note "head     $head_desc, built by $PREV_NAME, fixpoint ok, tests: $TEST_TOTAL"
     FINAL="$head_dir/tachyonc"
