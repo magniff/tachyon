@@ -599,7 +599,10 @@ around the per-function passes. In order:
    of several functions is iterated optimistically to a fixed point).
 4. **Global dead code elimination**: functions and generic instances no
    one reaches from `main`, the `extern "C"` definitions and the
-   address-taken functions are not emitted.
+   address-taken functions are not emitted. A function whose address the
+   program takes stays, even when every call through the address was
+   made direct and inlined (a function used as a value is part of what
+   the program is; the IR and assembly tests rely on it).
 
 **The inliner's cost model.** The cost of inlining callee g at a call
 site is g's size (instructions that become code, after g was itself
@@ -615,9 +618,13 @@ function that calls `setjmp` or the like (or into one), and calls past
 the caller's size budget (3000) or the program's growth budget (the sum
 of all sizes may grow by half, plus 2000). `#[inline]` inlines whenever
 possible (no budget), `#[inline(never)]` never, `#[cold]` never and makes
-its call sites cold. Inlining iterates: after the inlined copies are
+its call sites cold (the inliner reads them through `fn_attr_inline` and
+`fn_attr_cold`; the front end records them with `set_fn_inline_hint` and
+`set_fn_cold`). Inlining iterates: after the inlined copies are
 simplified (constants propagated into them), their own calls are
-considered again, up to three rounds.
+considered again, up to three rounds. Before each round, indirect calls
+of a constant function address become direct calls (devirtualization),
+so they can be inlined too.
 
 **Function attributes** (`--print-attrs` prints them), inferred per
 function from its instructions and its callees' attributes:
@@ -635,9 +642,14 @@ A C function (`extern "C"` import), an indirect call and a function that
 calls one are unknown: none of these. The run-time panic is noreturn and
 writes nothing a later instruction could see. Uses: a call of a
 `readonly` function is not a memory barrier for load forwarding and
-LICM (it writes nothing); a call of a `readnone`, `willreturn`, `nopanic`
-function whose result is unused is removed, and two such calls with
-equal arguments are one (GVN).
+LICM (it writes nothing), and a `readnone` one does not end the dead
+stores' search either (it reads nothing); a call of a `readnone`,
+`willreturn`, `nopanic` function whose result is unused is removed (dead
+code elimination, aggressive dead code elimination, dead loop deletion).
+Value numbering of such calls (two with equal arguments are one) is left
+for the e-graph of 0.7. In the compiler itself, of 1574 functions, 96 are
+inferred readnone, 233 more readonly, 293 willreturn, and 111 have
+nocapture parameters.
 
 **Scalar promotion** (LLVM's "promote memory to register" in LICM): a
 memory location accessed in a loop only by loads and stores of one type
@@ -647,9 +659,14 @@ loop: it is loaded in the preheader, its loads and stores become SSA
 values (the SSA updater places the phis), and when the loop stores to it,
 it is stored back in each exit. Accesses to the same object at variable
 offsets are disjoint when the value ranges at their blocks (bounds
-checks, loop counters) keep them apart: `vm.stack[vm.sp]` does not
-overlap `vm.sp`. Calls in the loop must not reach the location (a
-private slot, or a readnone callee).
+checks, loop counters, masks) keep them apart. Calls in the loop must
+not reach the location (a private slot, or a readnone callee). The pass
+runs after LICM, and an address constant (a slot's or a static's
+address) defined in the loop is made again outside it. Not promoted:
+`bench/interp`'s `vm.sp`. Indexing a fixed array is not checked in
+tachyon, so nothing bounds `vm.stack[vm.sp]` away from `vm.sp`; with
+checked array indexing (or out-of-bounds array indexing declared
+undefined) the ranges would.
 
 **Value ranges, extended:** the range of a sum, difference, product or
 left shift of two ranged values (interval arithmetic, given up on
@@ -658,16 +675,21 @@ only to the value compared. With IPCP this removes the bounds checks of a
 function whose slice lengths come from its callers as constants
 (`stencil`'s `sweep`).
 
-**Escape analysis (heap to stack):** a `malloc` or `calloc` of a small
-constant size whose result is only dereferenced and finally passed to
-`free` (on every path) becomes a frame slot (zeroed for `calloc`), and
-the `free` goes; SROA can then take it apart.
+**Escape analysis (heap to stack):** a `malloc` (up to 1024 bytes) or
+`calloc` (up to 256) of a constant size whose result is only
+dereferenced, compared, copied to or from, and passed itself to `free`
+becomes a frame slot (zeroed for `calloc`), and the `free`s go; SROA can
+then take it apart. A pointer that is stored, returned, merged by a phi
+or passed to any other call keeps its allocation on the heap. One slot
+serves an allocation in a loop: the pointer of one iteration cannot reach
+the next (it would need a phi).
 
-**Function specialization:** a call passing a function pointer constant
-(an `FADDR`) to an internal function whose body calls that parameter is
-redirected to a copy of the callee with the parameter replaced by the
-constant (so the indirect call becomes direct and can be inlined), under
-a budget of copies.
+**Function pointers as constants:** interprocedural constant propagation
+carries function addresses too: a function pointer parameter every
+caller passes the same function becomes that function's address, and its
+indirect calls become direct (and inlinable). Specialization proper, a
+copy of the callee per distinct function pointer argument, needs a new
+function in the front end's tables per copy and is left for later.
 
 ## Not yet
 

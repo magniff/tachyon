@@ -251,12 +251,34 @@ Stage B:
 The compiler's source starts using generics, modules and the standard
 library (and reports several errors at once while it is written).
 
-- call graph, bottom-up SCC-ordered inlining with a cost model and an
-  inline → simplify iteration
-- IPSCCP, function attribute inference (pure, readonly, nocapture,
-  noreturn), dead argument elimination, global DCE
-- function specialization on constant arguments
-- escape analysis: heap-to-stack for non-escaping `malloc`
+Optimizations, interprocedural (design and status in
+[optimizer.md](optimizer.md)):
+
+- [x] call graph, bottom-up SCC-ordered inlining with a cost model
+  (callee size, constant arguments that decide something, loop depth,
+  cold blocks, single call site, growth budgets, `#[inline]` /
+  `#[inline(never)]` / `#[cold]` hints) and an inline → simplify
+  iteration (three rounds)
+- [x] interprocedural constant propagation: constant arguments (also
+  function addresses) into internal functions, constant results out;
+  indirect calls of a constant address made direct (devirtualization).
+  Dead arguments are no longer computed but stay in the signature (no
+  per-function convention changes)
+- [x] function attribute inference over the call graph's components:
+  readnone, readonly, noreturn, willreturn, nopanic, nocapture
+  (`--print-attrs`); calls that write nothing are no barrier to load
+  forwarding and LICM, unused pure calls are removed
+- [x] global DCE (a function whose address is taken stays)
+- [x] escape analysis: small non-escaping `malloc` / `calloc` become
+  frame slots
+- [x] scalar promotion of memory in loops; value ranges of sums,
+  products and shifts of two ranged values (stencil's bounds checks go,
+  with the constant lengths from its caller)
+- not done: function specialization by cloning (a copy per distinct
+  constant argument; needs new functions in the front end's tables),
+  value numbering of pure calls (with the e-graph, 0.7), promoting
+  `vm.sp` in `bench/interp` (fixed arrays are not bounds-checked, so
+  nothing proves `vm.stack[vm.sp]` apart from it)
 - shrink-wrapping (from 0.5): callee-saved registers and the frame only
   on the paths that need them
 - language: `defer`, `#[inline]` / `#[cold]` attributes
