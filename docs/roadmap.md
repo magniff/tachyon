@@ -403,7 +403,15 @@ written against 0.5's unbounded generics mean.
   9281 of 9281 compilations identical); unsafe operations outside unsafe
   code are errors (`error[unsafe]`), `--allow-unsafe` is gone, and the
   bootstrap interface `tachyonc-0.10` builds HEAD
-- in progress: vector types
+- done: vector types (`v2f64` ... `v16i8`; grammar.md "Additions of
+  0.10"): lanewise operators, masks, select, lanes, sums, checked loads
+  and stores; -O0 lane by lane; IR vector instructions (vbin, vcmp,
+  vsplat, vext, vins, vsum, vneg, vsel), scalar replacement keeps vectors
+  whole; NEON and SSE2 (red zone for what SSE2 lacks) in both text
+  emitters and both encoders; vectors in the float registers (never
+  d8-d15, whose upper halves calls do not keep), 16-byte spill slots;
+  not FFI-safe
+- in progress: loop vectorizer
 - remaining: NEON/SSE2 lowering; loop vectorizer with
   run-time trip counts; profile-guided optimization; SLP; GVN-PRE
 

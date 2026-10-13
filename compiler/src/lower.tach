@@ -19,14 +19,14 @@ use crate::base::{IntVec, alloc_array, free, intern_c, memset};
 use crate::lexer::{STRS, Tok};
 use crate::ast::{
     DEFERS, DEFER_LOOPS, NODES, NODE_COUNT, NodeKind, child, defer_loop_depth, defer_loop_enter,
-    defer_loop_leave,
+    defer_loop_leave, VK_LANE, VK_LOAD, VK_NEW, VK_SELECT, VK_SPLAT, VK_STORE, VK_SUM, VK_WITH,
 };
 use crate::parser::is_comparison;
 use crate::types::{
     ENUMS, FNS, TYPES, TY_BOOL, TY_F32, TY_F64, TY_I64, TY_NEVER, TY_STRING, TY_U64, TyKind,
     VARIANTS, align_to, field_offset, fn_param, int_bits, is_compound, is_enum, is_float,
     is_integer, is_slice, is_void, scalar_type, struct_field, tuple_offset, type_align, type_elem,
-    type_size, variant_field, variant_field_offset,
+    type_size, variant_field, variant_field_offset, is_vector, vec_elem, vec_lanes,
 };
 use crate::check::{LOCALS, LOCAL_COUNT, Res, type_error};
 use crate::consteval::{const_value, f64_of_bits, float_const, wrap_int};
@@ -36,7 +36,7 @@ use crate::abi::{
     ABI_PIECE_COUNT, ABI_PIECE_OFFSET, ABI_PIECE_TY, AbiClass, conv_classify,
     conv_returns_through_pointer, fn_type_uses_c, fn_uses_c, variadic_kind,
 };
-use crate::target::{PANIC_USED, X86, rt_panic_sym};
+use crate::target::{PANIC_INDEX_SIGNED, PANIC_RANGE_SIGNED, PANIC_USED, X86, rt_panic_sym};
 use crate::ir::{
     ARGS, ARGTY, BLOCKS, BLOCK_COUNT, CUR, Cond, INLINE_COPY_MAX, INSTS, IRF, IRFUNCS, Op, SLOTS,
     Term, VARIADIC_PIECE, cond_of_token, emit_ir, init_ir, ir_arg, ir_binary, ir_cmp, ir_const,
@@ -650,6 +650,7 @@ fn lower_expr_inner(n: i64) -> i64 {
             Index if NODES[NODES[n].b].kind == Range => lower_slicing(n),
             Index | FieldAccess | TupleField => load_scalar(lower_addr(n), ty),
             VariantLit => lower_variant(n),
+            NodeKind::VecOp => lower_vecop(n),
             Match => lower_match(n),
             Tuple | Array | StructLit => lower_aggregate(n),
             Repeat => lower_repeat(n),
@@ -820,6 +821,11 @@ fn lower_binary(n: i64) -> i64 {
         if op == Tok::AmpAmp || op == Tok::PipePipe {
             return lower_short_circuit(op, lhs, rhs);
         }
+        if is_vector(NODES[lhs].ty) {
+            let a = vec_operand(lhs);
+            let b = vec_operand(rhs);
+            return vec_result(vector_operator(op, NODES[lhs].ty, NODES[n].ty, a, b), NODES[n].ty);
+        }
         let a = lower_operand(lhs);
         let b = lower_operand(rhs);
         lower_operator(op, NODES[lhs].ty, NODES[n].ty, a, b)
@@ -854,6 +860,10 @@ fn lower_unary(n: i64) -> i64 {
         let ty = NODES[n].ty;
         if op == Tok::Amp {
             return lower_addr(operand);
+        }
+        if op == Tok::Minus && is_vector(ty) {
+            let a = vec_operand(operand);
+            return vec_result(emit_ir(Op::VNeg, ty, a, 0, 0), ty);
         }
         let value = lower_operand(operand);
         if op == Tok::Minus {
@@ -1126,6 +1136,154 @@ fn lower_slicing(n: i64) -> i64 {
         ir_store(TY_U64, result, ir_binary(Op::Add, TY_U64, pointer, scaled), 0);
         ir_store(TY_U64, result, ir_binary(Op::Sub, TY_U64, end, lo), 8);
         result
+    }
+}
+
+// ---- Vectors (0.10) ----
+//
+// A vector expression's value is an address, as for other compound types;
+// its operations load their operands (once, in order: the value is taken
+// before the next operand is evaluated, as -O0 copies it), compute with
+// the vector instructions, and store the result into a new slot. Scalar
+// replacement turns those slots into values.
+
+fn arith_token_of(t: Tok) -> Tok {
+    t
+}
+
+// The value of vector expression e (of its vector type).
+fn vec_operand(e: i64) -> i64 {
+    unsafe {
+        let addr = lower_operand(e);
+        ir_load(NODES[e].ty, addr, 0)
+    }
+}
+
+// The address of a new slot holding vector `value`.
+fn vec_result(value: i64, vt: i64) -> i64 {
+    let base = ir_slot_addr(new_slot_for(vt));
+    ir_store(vt, base, value, 0);
+    base
+}
+
+// a <token> b on vectors of type vt; the result of type `result_ty`.
+fn vector_operator(token: Tok, vt: i64, result_ty: i64, a: i64, b: i64) -> i64 {
+    if is_comparison(token) {
+        let v = emit_ir(Op::VCmp, result_ty, a, b, 0);
+        unsafe {
+            INSTS[v].cond = cond_of_token(token);
+            INSTS[v].imm2 = vt;
+        }
+        return v;
+    }
+    emit_ir(Op::VBin, vt, a, b, arith_op(token) as i64)
+}
+
+// The first element's address and the length of the slice or array that
+// expression s is.
+fn lower_elements(s: i64, len: *i64) -> i64 {
+    unsafe {
+        let ty = NODES[s].ty;
+        let value = lower_operand(s);
+        if is_slice(ty) {
+            *len = ir_load(TY_U64, value, 8);
+            return ir_load(TY_U64, value, 0);
+        }
+        *len = ir_const(TYPES[ty].b, TY_U64);
+        value
+    }
+}
+
+// The address of lanes index..index + lanes of s (checked).
+fn lower_vector_address(s: i64, index: i64, vt: i64) -> i64 {
+    let mut len = 0;
+    let base = lower_elements(s, &len);
+    let idx = lower_operand(index);
+    let lanes = vec_lanes(vt);
+    let end = ir_binary(Op::Add, TY_I64, idx, ir_const(lanes, TY_I64));
+    let room = ir_binary(Op::Sub, TY_I64, len, ir_const(lanes, TY_I64));
+    lower_check(ir_cmp(Cond::Le, TY_I64, idx, room), PANIC_RANGE_SIGNED, idx, end, len);
+    lower_check(ir_cmp(Cond::Ge, TY_I64, idx, ir_const(0, TY_I64)), PANIC_RANGE_SIGNED, idx, end, len);
+    let size = type_size(vec_elem(vt));
+    ir_binary(Op::Add, TY_U64, base, ir_binary(Op::Mul, TY_U64, idx, ir_const(size, TY_U64)))
+}
+
+// The lane index `index` (an expression), checked against vt's lanes.
+fn lower_lane_index(index: i64, vt: i64) -> i64 {
+    let idx = lower_operand(index);
+    let lanes = ir_const(vec_lanes(vt), TY_U64);
+    lower_check(ir_cmp(Cond::Lt, TY_U64, idx, lanes), PANIC_INDEX_SIGNED, idx, lanes, 0);
+    idx
+}
+
+// The constant value of IR value v (-1 when not a constant).
+fn const_lane(v: i64) -> i64 {
+    unsafe {
+        if INSTS[v].op == Op::Const && INSTS[v].imm >= 0 && INSTS[v].imm < 16 {
+            return INSTS[v].imm;
+        }
+        -1
+    }
+}
+
+fn lower_vecop(n: i64) -> i64 {
+    unsafe {
+        let kind = NODES[n].x;
+        let vt = NODES[n].y;
+        let elem = vec_elem(vt);
+        let lanes = vec_lanes(vt);
+        let esize = type_size(elem);
+        if kind == VK_NEW || kind == VK_SPLAT {
+            let first = lower_operand(child(n, 0));
+            let mut v = emit_ir(Op::VSplat, vt, first, 0, 0);
+            if kind == VK_NEW {
+                for i in 1..lanes {
+                    let x = lower_operand(child(n, i));
+                    v = emit_ir(Op::VIns, vt, v, x, i);
+                }
+            }
+            return vec_result(v, vt);
+        }
+        if kind == VK_LOAD {
+            let addr = lower_vector_address(child(n, 0), child(n, 1), vt);
+            return vec_result(ir_load(vt, addr, 0), vt);
+        }
+        let a = vec_operand(NODES[n].a);
+        if kind == VK_STORE {
+            let addr = lower_vector_address(child(n, 0), child(n, 1), vt);
+            ir_store(vt, addr, a, 0);
+            return 0;
+        }
+        if kind == VK_SUM {
+            return emit_ir(Op::VSum, ir_type(elem), a, 0, 0);
+        }
+        if kind == VK_SELECT {
+            let x = vec_operand(child(n, 0));
+            let y = vec_operand(child(n, 1));
+            let ty = NODES[child(n, 0)].ty;
+            let v = emit_ir(Op::VSel, ty, a, x, 0);
+            INSTS[v].c = y;
+            return vec_result(v, ty);
+        }
+        let idx = lower_lane_index(child(n, 0), vt);
+        let lane = const_lane(idx);
+        if kind == VK_LANE {
+            if lane >= 0 {
+                return emit_ir(Op::VExt, ir_type(elem), a, 0, lane);
+            }
+            let base = vec_result(a, vt);
+            let at = ir_binary(Op::Add, TY_U64, base, ir_binary(Op::Mul, TY_U64, idx, ir_const(esize, TY_U64)));
+            return ir_load(ir_type(elem), at, 0);
+        }
+        // VK_WITH
+        let x = lower_operand(child(n, 1));
+        if lane >= 0 {
+            return vec_result(emit_ir(Op::VIns, vt, a, x, lane), vt);
+        }
+        let base = vec_result(a, vt);
+        let at = ir_binary(Op::Add, TY_U64, base, ir_binary(Op::Mul, TY_U64, idx, ir_const(esize, TY_U64)));
+        ir_store(ir_type(elem), at, x, 0);
+        base
     }
 }
 
@@ -1770,6 +1928,13 @@ fn lower_assign(n: i64) {
             let v = lower_expr(value);
             let addr = lower_addr(target);
             store_value(addr, 0, v, ty);
+            return;
+        }
+        if is_vector(ty) {
+            let v = vec_operand(value);
+            let addr = lower_addr(target);
+            let old = ir_load(ty, addr, 0);
+            ir_store(ty, addr, vector_operator(arith_token_of(arith_op_of_assign(op)), ty, ty, old, v), 0);
             return;
         }
         let v = lower_operand(value);

@@ -28,7 +28,7 @@ use crate::base::{
 use crate::types::{
     FNS, STATICS, SYM_STATIC, TYPES, TY_BOOL, TY_F64, TY_U64, TY_U8, align_to, fn_param, int_bits,
     is_compound, is_float, is_integer, is_void, max_i64, scalar_type, type_align, type_elem,
-    type_size,
+    type_size, in_fregs, is_vector,
 };
 use crate::patterns::int_key;
 use crate::gen::{fn_is_global, fn_symbol_prefix, static_symbol_prefix};
@@ -52,7 +52,7 @@ use crate::ir::{
 use crate::opt::OPT_LEVEL;
 use crate::regalloc::{
     BEND, BSTART, CALLEE_USED, LDEPTH, LOC_NONE, LOC_REMAT, ORDER, RETURNS_TWICE, RV_SLOT,
-    SPILL_COUNT, SPLIT_MOVES, USES, USE_NONE, VERIFY_REGALLOC, allocate_registers, check_allocation,
+    SPILL_COUNT, SPILL_VECTORS, SPLIT_MOVES, USES, USE_NONE, VERIFY_REGALLOC, allocate_registers, check_allocation,
     gap_index, is_emitted, is_fused_compare, is_zero_operand, mark_frame_blocks, plan_end_moves,
     plan_gap_moves, plan_start_moves, stored_at_def, tloc, tracked, use_kind, vloc,
 };
@@ -62,18 +62,19 @@ use crate::mc_arm64::{
     ma_float_op, ma_fmath, ma_frame_link, ma_frame_unlink, ma_int_imm_ok, ma_int_op, ma_int_op_imm,
     ma_jump_table, ma_lea, ma_load, ma_load_fimm, ma_load_imm, ma_madd, ma_mov, ma_normalize,
     ma_pair, ma_select, ma_shop, ma_store, ma_string_addr, ma_symbol_addr, ma_test_branch, ma_ubfx,
-    ma_unary,
+    ma_unary, ma_vbin, ma_vcmp, ma_vext, ma_vins, ma_vneg, ma_vsel, ma_vsplat, ma_vsum,
 };
 use crate::mc_x86_64::{
     mx_branch_bool, mx_cmp, mx_cmp_branch, mx_cmp_imm, mx_conv, mx_copy, mx_div, mx_extern_addr,
     mx_float_op, mx_frame_link, mx_frame_unlink, mx_int_imm_ok, mx_int_op, mx_int_op_imm,
     mx_jump_table, mx_lea, mx_load, mx_load_fimm, mx_load_imm, mx_mov, mx_normalize, mx_select,
-    mx_sqrt, mx_store, mx_string_addr, mx_symbol_addr, mx_test_branch, mx_unary,
+    mx_sqrt, mx_store, mx_string_addr, mx_symbol_addr, mx_test_branch, mx_unary, mx_vbin, mx_vcmp,
+    mx_vext, mx_vins, mx_vneg, mx_vsel, mx_vsplat, mx_vsum,
 };
 use crate::ir::Op::{
     BNot, Call, CallC, CallI, Cmp, Const, Conv, Copy, Div, FMath, GAddr, Lea, Load, LoadX, MAdd,
     MSub, Neg, Not, Pack, Param, Phi, Piece, Rem, SAddr, Select, ShOp, Slot, Store, StoreX, Test,
-    Ubfx,
+    Ubfx, VBin, VCmp, VExt, VIns, VNeg, VSel, VSplat, VSum,
 };
 
 static mut FRAME_OUT: i64 = 0;
@@ -311,7 +312,7 @@ fn is_float_reg(r: i64) -> bool {
 
 // The type a spill slot is accessed with.
 fn spill_type(ty: i64) -> i64 {
-    if is_float(ty) { ty } else { TY_U64 }
+    if in_fregs(ty) { ty } else { TY_U64 }
 }
 
 fn spill_offset(loc: i64) -> i64 {
@@ -595,7 +596,7 @@ fn move_loc(dst: i64, src: i64, ty: i64) {
     } else if src >= 0 {
         m_store(st, src, reg_sp(), spill_offset(dst));
     } else {
-        let temp = reg_move_temp(is_float(ty));
+        let temp = reg_move_temp(in_fregs(ty));
         m_load(st, temp, reg_sp(), spill_offset(src));
         m_store(st, temp, reg_sp(), spill_offset(dst));
     }
@@ -649,7 +650,7 @@ fn pm_resolve() {
                 i += 1;
             }
             let d = pm_dst(i);
-            let temp = reg_cycle(is_float(pm_ty(i)));
+            let temp = reg_cycle(in_fregs(pm_ty(i)));
             if pm_is_source(temp, -1) {
                 die(c"internal error: parallel move cycle register in use");
             }
@@ -666,7 +667,7 @@ fn pm_resolve() {
             }
             let dst = pm_dst(i);
             let ty = pm_ty(i);
-            let r = if dst >= 0 { dst } else { reg_move_temp(is_float(ty)) };
+            let r = if dst >= 0 { dst } else { reg_move_temp(in_fregs(ty)) };
             if pm_kind(i) == PM_REMAT {
                 materialize(pm_src(i), r);
             } else if pm_kind(i) == PM_ADDR {
@@ -746,7 +747,7 @@ fn layout_frame(fi: i64) {
                 v = INSTS[v].next;
             }
         }
-        let mut offset = align_to(FRAME_OUT, 8);
+        let mut offset = align_to(FRAME_OUT, if SPILL_VECTORS { 16 } else { 8 });
         SPILL_BASE = offset;
         offset += 8 * SPILL_COUNT;
         SAVE_BASE = offset;
@@ -1754,6 +1755,8 @@ fn emit_inst(v: i64) {
                 ma_fmath(INSTS[v].imm, INSTS[v].ty, r, a);
             }
             result_done(v, r);
+        } else if op.is_vector() {
+            emit_vector(v);
         } else if op == MAdd || op == MSub || op == ShOp || op == Ubfx {
             // AArch64 only (see isel.tach).
             let a = operand_reg(INSTS[v].a);
@@ -1802,6 +1805,39 @@ fn emit_indexed(v: i64) {
             m_lea(r, base, offset);
         }
         MEM_INDEX = -1;
+        result_done(v, r);
+    }
+}
+
+// A vector operation (0.10).
+fn emit_vector(v: i64) {
+    unsafe {
+        let op = INSTS[v].op;
+        let ty = INSTS[v].ty;
+        let a = operand_reg(INSTS[v].a);
+        let b = if INSTS[v].b != 0 { operand_reg(INSTS[v].b) } else { -1 };
+        let r = result_reg(v);
+        let vt = if op == VCmp { INSTS[v].imm2 } else if op == VExt || op == VSum { INSTS[INSTS[v].a].ty } else { ty };
+        if op == VBin {
+            let raw = INSTS[v].imm;
+            let bop = raw as Op;
+            if X86 { mx_vbin(bop, vt, r, a, b); } else { ma_vbin(bop, vt, r, a, b); }
+        } else if op == VCmp {
+            if X86 { mx_vcmp(INSTS[v].cond, vt, r, a, b); } else { ma_vcmp(INSTS[v].cond, vt, r, a, b); }
+        } else if op == VNeg {
+            if X86 { mx_vneg(vt, r, a); } else { ma_vneg(vt, r, a); }
+        } else if op == VSplat {
+            if X86 { mx_vsplat(vt, r, a); } else { ma_vsplat(vt, r, a); }
+        } else if op == VExt {
+            if X86 { mx_vext(vt, r, a, INSTS[v].imm); } else { ma_vext(vt, r, a, INSTS[v].imm); }
+        } else if op == VIns {
+            if X86 { mx_vins(vt, r, a, b, INSTS[v].imm); } else { ma_vins(vt, r, a, b, INSTS[v].imm); }
+        } else if op == VSum {
+            if X86 { mx_vsum(vt, r, a); } else { ma_vsum(vt, r, a); }
+        } else {
+            let c = operand_reg(INSTS[v].c);
+            if X86 { mx_vsel(r, a, b, c); } else { ma_vsel(r, a, b, c); }
+        }
         result_done(v, r);
     }
 }

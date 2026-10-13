@@ -26,6 +26,14 @@ const C_X: i64 = 1;
 const C_W: i64 = 2;
 const C_D: i64 = 3;
 const C_S: i64 = 4;
+// (0.10) q, h and b registers; v<n>.<arrangement> (imm: the element size,
+// 0 b to 3 d; shift: Q, 1 for 128 bits); v<n>.<e>[i] (imm: the element
+// size; amount: the index).
+const C_Q: i64 = 5;
+const C_H: i64 = 6;
+const C_B: i64 = 7;
+const C_V: i64 = 8;
+const C_VL: i64 = 9;
 
 // Symbol modifiers.
 const M_NONE: i64 = 0;
@@ -118,6 +126,20 @@ const A_SCVTF: i64 = 70;
 const A_UCVTF: i64 = 71;
 const A_FCVTZS: i64 = 72;
 const A_FCVTZU: i64 = 73;
+const A_DUP: i64 = 74;
+const A_SMOV: i64 = 75;
+const A_ADDV: i64 = 76;
+const A_ADDP: i64 = 77;
+const A_FADDP: i64 = 78;
+const A_CMEQ: i64 = 79;
+const A_CMGT: i64 = 80;
+const A_CMGE: i64 = 81;
+const A_FCMEQ: i64 = 82;
+const A_FCMGT: i64 = 83;
+const A_FCMGE: i64 = 84;
+const A_BSL: i64 = 85;
+const A_BIT: i64 = 86;
+const A_BIF: i64 = 87;
 
 fn def(name: *u8, code: i64) {
     let id = intern_c(name);
@@ -137,6 +159,10 @@ pub fn init_a64() {
         def(c"sxtb", A_SXTB); def(c"sxth", A_SXTH); def(c"sxtw", A_SXTW); def(c"ubfx", A_UBFX);
         def(c"cset", A_CSET); def(c"csel", A_CSEL); def(c"csinc", A_CSINC); def(c"fcsel", A_FCSEL);
         def(c"b", A_B); def(c"bl", A_BL); def(c"br", A_BR); def(c"blr", A_BLR); def(c"ret", A_RET);
+        def(c"dup", A_DUP); def(c"smov", A_SMOV); def(c"addv", A_ADDV); def(c"addp", A_ADDP);
+        def(c"faddp", A_FADDP); def(c"cmeq", A_CMEQ); def(c"cmgt", A_CMGT); def(c"cmge", A_CMGE);
+        def(c"fcmeq", A_FCMEQ); def(c"fcmgt", A_FCMGT); def(c"fcmge", A_FCMGE); def(c"bsl", A_BSL);
+        def(c"bit", A_BIT); def(c"bif", A_BIF);
         def(c"cbz", A_CBZ); def(c"cbnz", A_CBNZ); def(c"tbz", A_TBZ); def(c"tbnz", A_TBNZ);
         def(c"brk", A_BRK); def(c"adr", A_ADR); def(c"adrp", A_ADRP);
         def(c"ldr", A_LDR); def(c"str", A_STR); def(c"ldrb", A_LDRB); def(c"strb", A_STRB);
@@ -185,11 +211,15 @@ fn parse_reg(a: i64, b: i64, op: *AOp) -> bool {
             (*op).sp = false;
             return true;
         }
+        if tchar(a) == 'v' && parse_vreg(a, b, op) {
+            return true;
+        }
         if b - a < 2 || b - a > 3 {
             return false;
         }
         let c = tchar(a);
-        let cls = if c == 'x' { C_X } else if c == 'w' { C_W } else if c == 'd' { C_D } else if c == 's' { C_S } else { 0 };
+        let cls = if c == 'x' { C_X } else if c == 'w' { C_W } else if c == 'd' { C_D } else if c == 's' { C_S }
+            else if c == 'q' { C_Q } else if c == 'h' { C_H } else if c == 'b' { C_B } else { 0 };
         if cls == 0 {
             return false;
         }
@@ -204,6 +234,59 @@ fn parse_reg(a: i64, b: i64, op: *AOp) -> bool {
         (*op).reg = n;
         (*op).cls = cls;
         (*op).sp = false;
+        true
+    }
+}
+
+// The element size of letter c (b h s d: 0 to 3), or -1.
+fn elem_size_of(c: u8) -> i64 {
+    if c == 'b' { return 0; }
+    if c == 'h' { return 1; }
+    if c == 's' { return 2; }
+    if c == 'd' { return 3; }
+    -1
+}
+
+// v<n>.<arrangement> or v<n>.<e>[i] at [a, b) (0.10).
+fn parse_vreg(a: i64, b: i64, op: *AOp) -> bool {
+    unsafe {
+        let mut i = a + 1;
+        let mut n = 0;
+        while i < b && tchar(i) >= '0' && tchar(i) <= '9' {
+            n = n * 10 + (tchar(i) - '0') as i64;
+            i += 1;
+        }
+        if i == a + 1 || i >= b || tchar(i) != '.' {
+            return false;
+        }
+        i += 1;
+        (*op).reg = n;
+        (*op).sp = false;
+        if i + 1 < b && tchar(i + 1) == '[' {
+            let size = elem_size_of(tchar(i));
+            if size < 0 || tchar(b - 1) != ']' {
+                return false;
+            }
+            (*op).cls = C_VL;
+            (*op).imm = size;
+            (*op).amount = parse_number(i + 2, b - 1);
+            return true;
+        }
+        let mut lanes = 0;
+        while i < b && tchar(i) >= '0' && tchar(i) <= '9' {
+            lanes = lanes * 10 + (tchar(i) - '0') as i64;
+            i += 1;
+        }
+        if i + 1 != b {
+            return false;
+        }
+        let size = elem_size_of(tchar(i));
+        if size < 0 {
+            return false;
+        }
+        (*op).cls = C_V;
+        (*op).imm = size;
+        (*op).shift = if lanes << size as u64 == 16 { 1 } else { 0 };
         true
     }
 }
@@ -610,10 +693,99 @@ fn conv(base: i64, gp_k: i64, fp_k: i64) {
     word(base | sf(gp_k) | ftype(fp_k) | r(1) << 5 | r(0));
 }
 
+// imm5 of an element of size `size` (0 b to 3 d) at `index`.
+fn imm5(size: i64, index: i64) -> i64 {
+    (index << (size + 1) as u64) | (1 << size as u64)
+}
+
+fn is_simd(k: i64) -> bool {
+    unsafe {
+        let cls = OPS[k].cls;
+        OPS[k].kind == K_REG && (cls == C_V || cls == C_VL || cls == C_Q || cls == C_H || cls == C_B)
+    }
+}
+
+// Advanced SIMD (0.10): the forms vector code uses (mc_arm64.tach).
+fn a64_simd(code: i64) {
+    unsafe {
+        let o0 = OPS[0];
+        let o1 = OPS[1];
+        if code == A_LDR || code == A_STR {
+            load_store(if code == A_LDR { 0x3cc00000 } else { 0x3c800000 }, 4);
+            return;
+        }
+        let q = o0.shift << 30;
+        if OP_COUNT == 3 && o0.cls == C_V {
+            let rm = r(2) << 16 | r(1) << 5 | r(0);
+            let size = o0.imm << 22;
+            let sz = (if o0.imm == 3 { 1 } else { 0 }) << 22;
+            let w = if code == A_ADD { 0x0e208400 | size }
+                else if code == A_SUB { 0x2e208400 | size }
+                else if code == A_MUL { 0x0e209c00 | size }
+                else if code == A_CMEQ { 0x2e208c00 | size }
+                else if code == A_CMGT { 0x0e203400 | size }
+                else if code == A_CMGE { 0x0e203c00 | size }
+                else if code == A_AND { 0x0e201c00 }
+                else if code == A_ORR { 0x0ea01c00 }
+                else if code == A_EOR { 0x2e201c00 }
+                else if code == A_BSL { 0x2e601c00 }
+                else if code == A_BIT { 0x2ea01c00 }
+                else if code == A_BIF { 0x2ee01c00 }
+                else if code == A_FADD { 0x0e20d400 | sz }
+                else if code == A_FSUB { 0x0ea0d400 | sz }
+                else if code == A_FMUL { 0x2e20dc00 | sz }
+                else if code == A_FDIV { 0x2e20fc00 | sz }
+                else if code == A_FCMEQ { 0x0e20e400 | sz }
+                else if code == A_FCMGE { 0x2e20e400 | sz }
+                else if code == A_FCMGT { 0x2ea0e400 | sz }
+                else if code == A_FADDP { 0x2e20d400 | sz }
+                else { asm_error(c"unknown vector instruction") };
+            word(w | q | rm);
+            return;
+        }
+        need(2);
+        let rr = r(1) << 5 | r(0);
+        if code == A_MOV && o0.cls == C_V {
+            word(0x0ea01c00 | q | r(1) << 16 | rr);
+        } else if (code == A_NEG || code == A_FNEG || code == A_MVN) && o0.cls == C_V {
+            let sz = (if o0.imm == 3 { 1 } else { 0 }) << 22;
+            let w = if code == A_NEG { 0x2e20b800 | o0.imm << 22 } else if code == A_FNEG { 0x2ea0f800 | sz } else { 0x2e205800 };
+            word(w | q | rr);
+        } else if code == A_DUP && o1.cls == C_VL {
+            word(0x0e000400 | q | imm5(o1.imm, o1.amount) << 16 | rr);
+        } else if code == A_DUP {
+            word(0x0e000c00 | q | imm5(o0.imm, 0) << 16 | rr);
+        } else if code == A_MOV && o0.cls == C_VL && o1.cls == C_VL {
+            word(0x6e000400 | imm5(o0.imm, o0.amount) << 16 | (o1.amount << o1.imm as u64) << 11 | rr);
+        } else if code == A_MOV && o0.cls == C_VL {
+            word(0x4e001c00 | imm5(o0.imm, o0.amount) << 16 | rr);
+        } else if code == A_MOV && (o0.cls == C_X || o0.cls == C_W) {
+            word((if o0.cls == C_X { 0x4e003c00 } else { 0x0e003c00 }) | imm5(o1.imm, o1.amount) << 16 | rr);
+        } else if code == A_MOV {
+            word(0x5e000400 | imm5(o1.imm, o1.amount) << 16 | rr);
+        } else if code == A_SMOV {
+            word((if o0.cls == C_X { 0x4e002c00 } else { 0x0e002c00 }) | imm5(o1.imm, o1.amount) << 16 | rr);
+        } else if code == A_ADDV {
+            word(0x0e31b800 | o1.shift << 30 | o1.imm << 22 | rr);
+        } else if code == A_ADDP {
+            word(0x5ef1b800 | rr);
+        } else if code == A_FADDP {
+            word(0x7e30d800 | (if o1.imm == 3 { 1 << 22 } else { 0 }) | rr);
+        } else {
+            asm_error(c"unknown vector instruction");
+        }
+    }
+}
+
 pub fn a64_instruction(a: i64, b: i64) {
     unsafe {
         for k in 0..OP_COUNT {
             parse_operand(k);
+        }
+        if OP_COUNT > 0 && (is_simd(0) || (OP_COUNT > 1 && is_simd(1))) {
+            let id = intern(BUFS[ASM].data[a..b]);
+            a64_simd(MN[id]);
+            return;
         }
         let t = BUFS[ASM].data;
         if b - a > 2 && t[a] == 'b' && t[a + 1] == '.' {

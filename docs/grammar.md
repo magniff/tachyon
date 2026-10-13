@@ -899,6 +899,85 @@ slot).
   --target=x86_64-linux-gnu --sysroot=DIR"` on macOS for `--target
   x86_64-linux`; without it, the error says so.
 
+## Additions of 0.10
+
+### Vector types
+
+Six types of 16 bytes (aligned to 16) hold several values ("lanes") of
+one scalar type, computed together (SIMD: NEON on AArch64, SSE2 on
+x86-64):
+
+| type | lanes | | type | lanes |
+|---|---|---|---|---|
+| `v2f64` | 2 × `f64` | | `v4i32` | 4 × `i32` |
+| `v4f32` | 4 × `f32` | | `v8i16` | 8 × `i16` |
+| `v2i64` | 2 × `i64` | | `v16i8` | 16 × `i8` |
+
+Their names are reserved like the primitive types' (no item may take
+one; a local of that name shadows the constructor). A vector is a value:
+it is copied by `=`, passed and returned like a struct; lane `i` lives
+at byte `i × size_of(lane)` (`[T; N]`'s layout), and a vector in memory
+may be read lane by lane through a pointer. Integer lanes are signed;
+there are no unsigned vector types.
+
+**Making vectors.**
+
+- `v4f32(a, b, c, d)`: one argument per lane, of the lane type, in order
+  (the lane count must match);
+- `v4f32::splat(x)`: every lane `x`;
+- `v4f32::load(s, i)`: lanes `s[i]`, `s[i + 1]`, ... `s[i + N - 1]` of `s`,
+  a slice or an array of the lane type; `i` is an `i64`. Checked: unless
+  `0 <= i` and `i + N <= len(s)`, the program stops with `slice range out
+  of bounds: i..i+N, length len` (exit code 101), as a bad slicing does.
+
+**Operations** (lane by lane, `a` and `b` of one vector type):
+
+- `a + b`, `a - b`, `a * b`, `-a`: on every vector type. Integer lanes
+  wrap at their width (two's complement, as the scalar operators); float
+  lanes follow IEEE 754 (binary64 or binary32, round to nearest even, one
+  rounding per operation: no fused multiply-add), NaN propagating.
+  `-a` on floats flips the sign bit (`-0.0` from `0.0`).
+- `a / b`: float vectors only (IEEE). **Integer vectors have no
+  division** (none of the targets has an instruction for it; write the
+  loop over the lanes).
+- `a & b`, `a | b`, `a ^ b`: integer vectors only, on the bits.
+- `a == b`, `a != b`, `a < b`, `a <= b`, `a > b`, `a >= b`: a **mask**,
+  the integer vector of the lanes' width (`v2i64` for `v2f64`, `v4i32`
+  for `v4f32`, the type itself for the integer vectors), each lane `-1`
+  (all bits set) where the comparison holds and `0` where it does not.
+  Integer comparisons are signed. Float comparisons are IEEE: with a NaN
+  lane, `==`, `<`, `<=`, `>`, `>=` are false and `!=` is true. (So
+  `a == b` is not a `bool`: `if a == b` is a type error.)
+- `m.select(a, b)`, for a mask `m` (an integer vector) and vectors `a`,
+  `b` whose mask type is `m`'s: `(a & m) | (b & ~m)` on the bits, so a
+  lane of `a` where `m`'s is `-1` and of `b` where it is `0`.
+- `+=`, `-=`, `*=`, `/=`, `&=`, `|=`, `^=`: as the operators, on a
+  vector place.
+
+**Lanes.**
+
+- `v.lane(i)`: lane `i` (an `i64`), of the lane type. Checked: unless `0
+  <= i < N`, the program stops with `index out of bounds: index i, length
+  N`.
+- `v.with_lane(i, x)`: `v` with lane `i` replaced by `x` (checked the
+  same way, before `x` is evaluated).
+- `v.sum()`: the sum of the lanes, of the lane type. Integer sums wrap.
+  Float sums are pairwise, which fixes the rounding: `l0 + l1` for two
+  lanes, `(l0 + l1) + (l2 + l3)` for four.
+- `v.store(s, i)`: writes the lanes to `s[i]` ... `s[i + N - 1]`, of a
+  slice or an array place (assigned, so a mutable one) of the lane type;
+  checked as `load`.
+
+Operands are evaluated left to right, the receiver of a method first;
+each vector operand's value is taken when it is evaluated. Nothing about
+vectors is undefined behaviour.
+
+**C.** Vectors are not FFI-safe: an `extern "C"` signature, function
+pointer type or static cannot hold one (C's vector types and their
+conventions are not supported; pass a pointer to the lanes or an array).
+In tachyon's own convention a vector is passed like a struct of its
+lanes.
+
 ## Importing C headers
 
 `import "stdio.h" as c;` *(0.4; `as`: 0.5, required since 0.8)* reads a C

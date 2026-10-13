@@ -38,6 +38,16 @@
 //           argument as the callee sees it (negated for the `...` of a
 //           variadic function: an aggregate passed in pieces there has its
 //           negated type on the first, VARIADIC_PIECE on the others).
+//   Vectors (0.10; ty or imm2 a vector type, a value of 16 bytes in a
+//   float register; LOAD and STORE move them too):
+//   VBIN    a <imm> b lanewise, imm = ADD SUB MUL DIV (floats) AND OR XOR
+//   VCMP    a <cond> b lanewise, operands of vector type imm2; ty is the
+//           mask type (each lane -1 or 0)
+//   VSPLAT  every lane = a;  VNEG  -a lanewise
+//   VEXT    lane imm of a (ty: the lane type, canonical)
+//   VINS    a with lane imm = b
+//   VSUM    the sum of a's lanes (floats: pairwise)
+//   VSEL    (b & a) | (c & ~a) on the bits: a is a mask, b and c of type ty
 //
 // Block terminators: JUMP s0; BRANCH cond ? s0 : s1; RET cond (0: no
 // value; for an aggregate returned in registers, its address); UNREACH;
@@ -55,14 +65,14 @@ use crate::base::{
 use crate::lexer::Tok;
 use crate::types::{
     FNS, FN_COUNT, TY_BOOL, TY_U64, buf_type, is_fieldless_enum, is_float, is_integer, is_void,
-    scalar_type,
+    scalar_type, is_vector,
 };
 use crate::lower::SSA_STACK;
 use crate::opt::{compute_dominators, dominates};
 use Op::{
     Add, And, BNot, Call, CallC, CallI, Cmp, Const, Conv, Copy, Div, FAddr, FMath, GAddr, Lea, Load,
     LoadX, MAdd, MSub, Mul, Neg, Not, Or, Pack, Param, Phi, Piece, Rem, SAddr, Select, ShOp, Shl,
-    Shr, Store, StoreX, Sub, Test, Ubfx, Xor,
+    Shr, Store, StoreX, Sub, Test, Ubfx, Xor, VBin, VCmp, VSplat, VExt, VIns, VSum, VNeg, VSel,
 };
 
 pub enum Op {
@@ -80,6 +90,8 @@ pub enum Op {
     // just before register allocation; nothing else sees them.
     LoadX = 33, StoreX = 34, Lea = 35, MAdd = 36, MSub = 37, ShOp = 38, Ubfx = 39,
     Test = 40, Select = 41, FMath = 42,
+    // Vectors (0.10), not machine operations.
+    VBin = 43, VCmp = 44, VSplat = 45, VExt = 46, VIns = 47, VSum = 48, VNeg = 49, VSel = 50,
 }
 
 // The comparison of a CMP instruction (and of the -O0 code generator's
@@ -194,7 +206,7 @@ pub fn ir_type(t: i64) -> i64 {
     if is_void(t) {
         return 0;
     }
-    if is_integer(t) || is_float(t) || t == TY_BOOL {
+    if is_integer(t) || is_float(t) || t == TY_BOOL || is_vector(t) {
         return t;
     }
     if is_fieldless_enum(t) {
@@ -438,7 +450,13 @@ impl Op {
 
     // The machine operations of instruction selection.
     fn is_machine(self: Op) -> bool {
-        self as i64 >= LoadX as i64
+        self as i64 >= LoadX as i64 && self as i64 <= FMath as i64
+    }
+
+    // The vector operations (0.10): pure, computed from their operands
+    // alone, never trapping.
+    fn is_vector(self: Op) -> bool {
+        self as i64 >= VBin as i64 && self as i64 <= VSel as i64
     }
 
     // The binary arithmetic and bitwise operations.
@@ -730,6 +748,14 @@ impl Op {
             Test => c"test",
             Select => c"select",
             FMath => c"fmath",
+            VBin => c"vbin",
+            VCmp => c"vcmp",
+            VSplat => c"vsplat",
+            VExt => c"vext",
+            VIns => c"vins",
+            VSum => c"vsum",
+            VNeg => c"vneg",
+            VSel => c"vsel",
         }
     }
 }
@@ -810,9 +836,15 @@ fn print_inst(out: i64, v: i64) {
             buf_str(out, c" = ");
         }
         buf_str(out, op.name());
-        if op == Cmp || op == Test || op == Select {
+        if op == Cmp || op == Test || op == Select || op == VCmp {
             buf_byte(out, '.');
             buf_str(out, INSTS[v].cond.name());
+        }
+        if op == VBin {
+            buf_byte(out, '.');
+            let raw = INSTS[v].imm;
+            let bop = raw as Op;
+            buf_str(out, bop.name());
         }
         if op == Const {
             buf_byte(out, ' ');
@@ -854,9 +886,12 @@ fn print_inst(out: i64, v: i64) {
         } else if op == Copy {
             buf_str(out, c" size ");
             buf_int(out, INSTS[v].imm);
-        } else if op == Conv || op == Cmp {
+        } else if op == Conv || op == Cmp || op == VCmp {
             buf_str(out, c" from ");
             buf_ir_type(out, INSTS[v].imm2);
+        } else if op == VExt || op == VIns {
+            buf_str(out, c" lane ");
+            buf_int(out, INSTS[v].imm);
         } else if op.is_machine() {
             // imm, imm2 and scale as they are (see isel.tach).
             buf_str(out, c" [");

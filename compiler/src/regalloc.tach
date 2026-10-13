@@ -54,7 +54,7 @@ use crate::base::{
     IntVec, SYMS, alloc_array, buf_bytes, buf_int, buf_new, buf_str, buf_write_fd, die, exit, free,
     grow, memcmp, strlen,
 };
-use crate::types::{FNS, is_compound, is_float, max_i64};
+use crate::types::{FNS, in_fregs, is_compound, is_float, is_vector, max_i64};
 use crate::abi::{conv_classify, conv_return_piece_reg, conv_returns_through_pointer, fn_uses_c};
 use crate::target::X86;
 use crate::ir::{
@@ -120,6 +120,8 @@ static mut FIXED: *IntVec = 0 as *IntVec;
 // Moves inside blocks: (gap, dense index) pairs, sorted by gap.
 pub static mut SPLIT_MOVES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 pub static mut SPILL_COUNT: i64 = 0;
+// Whether a vector is spilled (the spill area is then 16-aligned).
+pub static mut SPILL_VECTORS: bool = false;
 // Per register: whether a callee-saved register is used.
 pub static mut CALLEE_USED: [i64; 64] = [0; 64];
 // Uses of each instruction (indexed by value id), for the whole program,
@@ -855,7 +857,7 @@ fn add_clobbers(v: i64, p: i64) {
             }
             return;
         }
-        if X86 && !is_float(INSTS[v].ty) {
+        if X86 && !in_fregs(INSTS[v].ty) {
             // Division uses rax and rdx, shifts by a register cl, from the
             // reading of the operands to the writing of the result.
             if (op == Div || op == Rem) && is_allocatable(0) {
@@ -901,7 +903,7 @@ fn add_hints(v: i64) {
         let t = tracked(v);
         if op.is_call() {
             if t >= 0 && RV_HREG[t] < 0 {
-                RV_HREG[t] = reg_ret(is_float(INSTS[v].ty));
+                RV_HREG[t] = reg_ret(in_fregs(INSTS[v].ty));
             }
             let mut locations: [i64; 64] = [0; 64];
             let mut copies: [i64; 64] = [0; 64];
@@ -920,7 +922,7 @@ fn add_hints(v: i64) {
         }
         if op.is_binary() || op == Neg || op == BNot || op == Conv {
             let a = tracked(INSTS[v].a);
-            if a >= 0 && RV_HINT[t] < 0 && is_float(INSTS[INSTS[v].a].ty) == is_float(INSTS[v].ty) {
+            if a >= 0 && RV_HINT[t] < 0 && in_fregs(INSTS[INSTS[v].a].ty) == in_fregs(INSTS[v].ty) {
                 RV_HINT[t] = a;
             }
         }
@@ -984,7 +986,7 @@ fn build_intervals() {
             if BLOCKS[b].term == Term::Ret && count > 0 {
                 let t = tracked(out[0]);
                 if t >= 0 && RV_HREG[t] < 0 && !is_compound(FNS[IRFUNCS[IRF].f].ret) {
-                    RV_HREG[t] = reg_ret(is_float(INSTS[out[0]].ty));
+                    RV_HREG[t] = reg_ret(in_fregs(INSTS[out[0]].ty));
                 }
                 let pack = BLOCKS[b].cond;
                 if INSTS[pack].op == Pack {
@@ -1369,7 +1371,7 @@ fn gap_before(use_pos: i64) -> i64 {
 // ---- Registers ----
 
 // The registers allocated, in order of preference: caller-saved first.
-fn class_regs(float: bool, regs: *i64) -> i64 {
+fn class_regs(float: bool, vector: bool, regs: *i64) -> i64 {
     unsafe {
         let mut n = 0;
         if X86 {
@@ -1391,7 +1393,9 @@ fn class_regs(float: bool, regs: *i64) -> i64 {
         if float {
             for r in 16..30 { regs[n] = 32 + r; n += 1; }
             for r in 0..8 { regs[n] = 32 + r; n += 1; }
-            for r in 8..16 { regs[n] = 32 + r; n += 1; }
+            if !vector {
+                for r in 8..16 { regs[n] = 32 + r; n += 1; }
+            }
             return n;
         }
         for r in 9..16 { regs[n] = r; n += 1; }
@@ -1493,7 +1497,18 @@ fn heap_pop() -> i64 {
 }
 
 fn iv_float(i: i64) -> bool {
-    unsafe { is_float(INSTS[RA_VALS.data[IVS[i].value]].ty) }
+    unsafe { in_fregs(INSTS[RA_VALS.data[IVS[i].value]].ty) }
+}
+
+// A vector (0.10): in a float register, but never in one whose upper half
+// a call may change (d8-d15 keep only their low 64 bits on AArch64).
+fn iv_vector(i: i64) -> bool {
+    unsafe { is_vector(INSTS[RA_VALS.data[IVS[i].value]].ty) }
+}
+
+// Whether register r may hold interval i.
+fn reg_fits(i: i64, r: i64) -> bool {
+    r >= 0 && (r >= 32) == iv_float(i) && is_allocatable(r) && !(iv_vector(i) && !X86 && r >= 40 && r < 48)
 }
 
 fn iv_remat(i: i64) -> bool {
@@ -1649,7 +1664,7 @@ fn try_entry_split(cur: i64, hint: i64, regs: *i64, n: i64) -> bool {
             return false;
         }
         let mut c = -1;
-        if hint >= 0 && (hint >= 32) == iv_float(cur) && is_allocatable(hint) && !is_callee_saved_reg(hint)
+        if reg_fits(cur, hint) && !is_callee_saved_reg(hint)
             && FREE_UNTIL[hint] > BEND.data[0] {
             c = hint;
         } else {
@@ -1742,7 +1757,7 @@ fn assign_whole(cur: i64, r: i64, hint: i64, regs: *i64, n: i64) {
 fn try_allocate_free(cur: i64) -> bool {
     unsafe {
         let mut regs: [i64; 32] = [0; 32];
-        let n = class_regs(iv_float(cur), &regs as *i64);
+        let n = class_regs(iv_float(cur), iv_vector(cur), &regs as *i64);
         let start = ra_start(cur);
         let end = ra_end(cur);
         for k in 0..n {
@@ -1777,7 +1792,7 @@ fn try_allocate_free(cur: i64) -> bool {
         // shrink-wrapping in emit.tach) every time.
         let cheap_hint = !is_callee_saved_reg(hint) || LDEPTH.data[block_at(start)] != 0
             || crosses_calls(cur, &regs as *i64, n);
-        if hint >= 0 && (hint >= 32) == iv_float(cur) && is_allocatable(hint) && FREE_UNTIL[hint] >= end && cheap_hint {
+        if reg_fits(cur, hint) && FREE_UNTIL[hint] >= end && cheap_hint {
             assign_whole(cur, hint, hint, &regs as *i64, n);
             return true;
         }
@@ -1798,7 +1813,7 @@ fn try_allocate_free(cur: i64) -> bool {
         // Else the argument or result register the value goes to, when the
         // partner's is taken.
         let to = RV_HREG[IVS[cur].value];
-        if to >= 0 && to != hint && (to >= 32) == iv_float(cur) && is_allocatable(to) && FREE_UNTIL[to] >= end {
+        if to != hint && reg_fits(cur, to) && FREE_UNTIL[to] >= end {
             assign_whole(cur, to, hint, &regs as *i64, n);
             return true;
         }
@@ -1860,7 +1875,7 @@ fn remove_at(list: *IntVec, k: i64) {
 fn allocate_blocked(cur: i64) {
     unsafe {
         let mut regs: [i64; 32] = [0; 32];
-        let n = class_regs(iv_float(cur), &regs as *i64);
+        let n = class_regs(iv_float(cur), iv_vector(cur), &regs as *i64);
         let start = ra_start(cur);
         for k in 0..n {
             USE_POS[regs[k]] = POS_MAX;
@@ -2057,23 +2072,39 @@ fn assign_spill_slots() {
             }
             spilled.data[j] = t;
         }
-        // slot_end[i]: where the lifetime of the value in slot i ends.
+        // slot_end[i]: where the lifetime of the value in slot i ends. A
+        // vector (0.10) takes two slots, the first of them even (the spill
+        // area is then 16-aligned).
         let mut slot_end = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        SPILL_VECTORS = false;
         for i in 0..n {
             let t = spilled.data[i];
             let s = value_start(t);
+            let wide = is_vector(INSTS[RA_VALS.data[t]].ty);
+            let step = if wide { 2 } else { 1 };
             let mut slot = -1;
-            for k in 0..slot_end.count {
-                if slot_end.data[k] <= s && !RETURNS_TWICE {
+            let mut k = 0;
+            while k + step <= slot_end.count {
+                if slot_end.data[k] <= s && (!wide || slot_end.data[k + 1] <= s) && !RETURNS_TWICE {
                     slot = k;
                     break;
                 }
+                k += step;
             }
             if slot < 0 {
+                if wide && slot_end.count % 2 == 1 {
+                    slot_end.push(0);
+                }
                 slot = slot_end.count;
-                slot_end.push(0);
+                for _ in 0..step {
+                    slot_end.push(0);
+                }
             }
             slot_end.data[slot] = value_end(t);
+            if wide {
+                slot_end.data[slot + 1] = value_end(t);
+                SPILL_VECTORS = true;
+            }
             RV_SLOT[t] = slot;
         }
         SPILL_COUNT = slot_end.count;
@@ -2471,7 +2502,7 @@ fn check_clobber(state: *i64, v: i64) {
             }
             return;
         }
-        if X86 && !is_float(INSTS[v].ty) && X86_ALLOC_ACD {
+        if X86 && !in_fregs(INSTS[v].ty) && X86_ALLOC_ACD {
             if op == Div || op == Rem {
                 state[0] = -1;
                 state[2] = -1;

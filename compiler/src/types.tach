@@ -9,7 +9,7 @@ use crate::base::{
     sym_name, sym_table,
 };
 use crate::ast::{FN_COLD, FN_INLINE, FN_NO_INLINE, REPR_C, REPR_INT, REPR_PACKED, REPR_UNION};
-use TyKind::{Array, Enum, Fn, Prim, Ptr, Slice, Struct, Tuple};
+use TyKind::{Array, Enum, Fn, Prim, Ptr, Slice, Struct, Tuple, Vector};
 
 pub const TY_I8: i64 = 1;
 pub const TY_I16: i64 = 2;
@@ -30,8 +30,9 @@ const FIRST_CONSTRUCTED: i64 = 14;
 // The kinds of types: the primitives (by id: TY_I8 ... TY_NEVER), and the
 // constructed ones: Ptr a=pointee, Array a=elem b=length, Tuple
 // list=elements, Struct a=struct, Fn list=params a=result b=1 for
-// `extern "C" fn` (C's convention), Enum a=enum, Slice a=elem.
-pub enum TyKind { None, Prim, Ptr, Array, Tuple, Struct, Fn, Enum, Slice }
+// `extern "C" fn` (C's convention), Enum a=enum, Slice a=elem, Vector
+// (0.10) a=lane type b=lanes.
+pub enum TyKind { None, Prim, Ptr, Array, Tuple, Struct, Fn, Enum, Slice, Vector }
 
 // `size` is -1 until computed.
 pub struct Type { kind: TyKind, a: i64, b: i64, list: i64, count: i64, size: i64, align: i64 }
@@ -48,6 +49,13 @@ pub static mut TY_U8_PTR: i64 = 0;
 // The type of what failed to check (0.5): errors that name it follow from
 // an earlier error and are not reported (see err_end).
 pub static mut TY_ERROR: i64 = 0;
+// The vector types (0.10): 16 bytes each.
+pub static mut TY_V2F64: i64 = 0;
+pub static mut TY_V4F32: i64 = 0;
+pub static mut TY_V2I64: i64 = 0;
+pub static mut TY_V4I32: i64 = 0;
+pub static mut TY_V8I16: i64 = 0;
+pub static mut TY_V16I8: i64 = 0;
 
 fn add_type(kind: TyKind, a: i64, b: i64, list: i64, count: i64) -> i64 {
     unsafe {
@@ -123,6 +131,59 @@ pub fn init_types() {
     // A string literal is a `[u8]` (0.6; a `(*u8, u64)` tuple before).
     TY_STRING = slice_of(TY_U8);
     TY_ERROR = add_type(TyKind::None, 1, 0, 0, 0);
+    TY_V2F64 = make_type(Vector, TY_F64, 2, TSCRATCH.count);
+    TY_V4F32 = make_type(Vector, TY_F32, 4, TSCRATCH.count);
+    TY_V2I64 = make_type(Vector, TY_I64, 2, TSCRATCH.count);
+    TY_V4I32 = make_type(Vector, TY_I32, 4, TSCRATCH.count);
+    TY_V8I16 = make_type(Vector, TY_I16, 8, TSCRATCH.count);
+    TY_V16I8 = make_type(Vector, TY_I8, 16, TSCRATCH.count);
+}
+
+// ---- Vector types (0.10) ----
+
+pub fn is_vector(t: i64) -> bool {
+    unsafe { TYPES[t].kind == Vector }
+}
+
+// The lane type and the number of lanes of vector type t.
+pub fn vec_elem(t: i64) -> i64 {
+    unsafe { TYPES[t].a }
+}
+
+pub fn vec_lanes(t: i64) -> i64 {
+    unsafe { TYPES[t].b }
+}
+
+// Whether values of type t live in the float registers: floats, and the
+// vectors (in their 128-bit form, v0-v31 / xmm0-xmm15).
+pub fn in_fregs(t: i64) -> bool {
+    is_float(t) || is_vector(t)
+}
+
+pub fn is_float_vector(t: i64) -> bool {
+    is_vector(t) && is_float(vec_elem(t))
+}
+
+// The vector type of `lanes` lanes of type `elem` (one of the six), or 0.
+pub fn vector_type(elem: i64, lanes: i64) -> i64 {
+    unsafe {
+        let all: [i64; 6] = [TY_V2F64, TY_V4F32, TY_V2I64, TY_V4I32, TY_V8I16, TY_V16I8];
+        for i in 0..6 {
+            if TYPES[all[i]].a == elem && TYPES[all[i]].b == lanes {
+                return all[i];
+            }
+        }
+        0
+    }
+}
+
+// The mask type of vector type t: the integer vector of its lane width.
+pub fn vec_mask_type(t: i64) -> i64 {
+    unsafe {
+        if t == TY_V2F64 { return TY_V2I64; }
+        if t == TY_V4F32 { return TY_V4I32; }
+        t
+    }
 }
 
 pub fn is_integer(t: i64) -> bool {
@@ -154,7 +215,7 @@ pub fn is_fn_type(t: i64) -> bool {
 pub fn is_compound(t: i64) -> bool {
     unsafe {
         let kind = TYPES[t].kind;
-        kind == Array || kind == Tuple || kind == Struct || kind == Slice
+        kind == Array || kind == Tuple || kind == Struct || kind == Slice || kind == Vector
             || (kind == Enum && ENUMS[TYPES[t].a].has_fields)
     }
 }
@@ -216,6 +277,10 @@ pub fn buf_type(out: i64, t: i64) {
         let kind = TYPES[t].kind;
         if kind == TyKind::None || kind == Prim {
             buf_str(out, primitive_name(t));
+        } else if kind == Vector {
+            buf_byte(out, 'v');
+            buf_int(out, TYPES[t].b);
+            buf_str(out, primitive_name(TYPES[t].a));
         } else if kind == Ptr {
             buf_byte(out, '*');
             buf_type(out, TYPES[t].a);
@@ -411,6 +476,12 @@ pub fn init_declarations() {
         for i in 0..13 {
             syms[i] = intern_c(names[i]);
         }
+        let vnames: [*u8; 6] = [c"v2f64", c"v4f32", c"v2i64", c"v4i32", c"v8i16", c"v16i8"];
+        let vtypes: [i64; 6] = [TY_V2F64, TY_V4F32, TY_V2I64, TY_V4I32, TY_V8I16, TY_V16I8];
+        let mut vsyms: [i64; 6] = [0; 6];
+        for i in 0..6 {
+            vsyms[i] = intern_c(vnames[i]);
+        }
         sym_table(&SYM_STRUCT);
         sym_table(&SYM_ENUM);
         sym_table(&SYM_ALIAS);
@@ -423,6 +494,10 @@ pub fn init_declarations() {
         sym_table(&SYM_ITEM);
         for i in 0..13 {
             SYM_PRIMITIVE[syms[i]] = types[i];
+        }
+        // The vector types (0.10).
+        for i in 0..6 {
+            SYM_PRIMITIVE[vsyms[i]] = vtypes[i];
         }
         if i8_sym != syms[0] {
             die(c"internal error: symbol table");
@@ -531,6 +606,9 @@ pub fn compute_layout(t: i64) {
         } else if kind == Slice {
             size = 16;
             align = 8;
+        } else if kind == Vector {
+            size = 16;
+            align = 16;
         } else if kind == Enum {
             let e = TYPES[t].a;
             size = type_size(ENUMS[e].tag);

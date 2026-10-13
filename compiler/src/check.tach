@@ -35,7 +35,8 @@ use crate::lexer::{
 };
 use crate::cimport::c_import_skip_reason;
 use crate::ast::{
-    ARM_SYNTHETIC, BLOCK_UNSAFE, FN_COLD, FN_INLINE, FN_NO_INLINE, FN_UNSAFE, NODES, REPR_C, REPR_INT,
+    ARM_SYNTHETIC, BLOCK_UNSAFE, VK_LANE, VK_LOAD, VK_NEW, VK_SELECT, VK_SPLAT, VK_STORE, VK_SUM,
+    VK_WITH, FN_COLD, FN_INLINE, FN_NO_INLINE, FN_UNSAFE, NODES, REPR_C, REPR_INT,
     REPR_UNION, SCRATCH,
     child, list_begin, list_end, list_push, new_node,
 };
@@ -59,7 +60,7 @@ use crate::types::{
     int_max, is_compound, is_ffi_field, is_ffi_safe, is_fieldless_enum, is_float, is_fn_type,
     is_integer, is_numeric, is_pointer, is_signed, is_slice, item_node_of, make_type,
     primitive_name, ptr_to, slice_of, struct_field, struct_type, type_align, type_elem, type_size,
-    variant_field,
+    variant_field, is_vector, is_float_vector, vec_elem, vec_lanes, vec_mask_type,
 };
 use crate::consteval::{
     check_const_expr, const_emit, const_eval, const_value, eval_array_len, wrap_int,
@@ -78,7 +79,7 @@ use crate::ast::NodeKind::{
     Loop, Match, MethodCall, Mod, PatBind, PatLit, PatTuple, PatVariant, PatWild, Path, Range,
     Repeat, Return, Static, Str, Struct, StructLit, Tuple, TupleField, TyArray, TyFn, TyName,
     TyNever, TyPtr, TySlice, TyTuple, TyUnit, TypeAlias, Unary, Unit, Use, VariantLit, While,
-    Impl, Trait,
+    Impl, Trait, VecOp,
 };
 
 pub enum Res { None, Local, Const, Static, Fn }
@@ -2085,6 +2086,7 @@ fn synth_expr_inner(n: i64) -> i64 {
             // Already checked (a path made a variant), when a rewrite checks
             // an expression again.
             VariantLit => NODES[n].ty,
+            VecOp => synth_vecop(n),
             Binary => synth_binary(n),
             Unary => synth_unary(n),
             Cast => synth_cast(n),
@@ -2726,6 +2728,9 @@ fn synth_binary(n: i64) -> i64 {
             return value_ty;
         }
         let ty = synth_operands(lhs, rhs);
+        if is_vector(ty) {
+            return vector_binary(n, op, ty);
+        }
         // (0.9: an operator trait's impl for the type)
         if binary_op_trait(op, ty) >= 0 {
             return operator_call(n, ty);
@@ -3100,7 +3105,7 @@ fn synth_unary(n: i64) -> i64 {
             } else {
                 ty = synth_expr(operand);
             }
-            if !is_numeric(ty) {
+            if !is_numeric(ty) && !is_vector(ty) {
                 let neg = std_trait(c"Neg");
                 if neg >= 0 && has_impl(neg, ty) {
                     return negation_call(n, ty);
@@ -3227,6 +3232,12 @@ fn synth_call(n: i64) -> i64 {
         }
         if NODES[callee].kind == Path {
             return synth_path_call(n, callee);
+        }
+        if NODES[callee].kind == Ident && (NODES[callee].p & NODE_RESOLVED) == 0
+            && lookup_local(NODES[callee].a).is_none() && env_lookup(NODES[callee].a) == 0
+            && is_vector(SYM_PRIMITIVE[NODES[callee].a]) {
+            // `v4f32(a, b, c, d)` (0.10).
+            return make_vecop(n, 0, VK_NEW, SYM_PRIMITIVE[NODES[callee].a]);
         }
         if NODES[callee].kind == Ident && (NODES[callee].p & NODE_RESOLVED) == 0
             && lookup_local(NODES[callee].a).is_none() {
@@ -3601,6 +3612,30 @@ fn path_member_error(n: i64, t: i64, member: i64) -> ! {
 // (or of a method, with the receiver passed explicitly).
 fn synth_path_call(n: i64, callee: i64) -> i64 {
     unsafe {
+        if NODES[callee].count == 0 && NODES[callee].y == 0 && env_lookup(NODES[callee].a) == 0
+            && is_vector(SYM_PRIMITIVE[NODES[callee].a]) {
+            // `v4f32::splat(x)`, `v4f32::load(s, i)` (0.10).
+            let vt = SYM_PRIMITIVE[NODES[callee].a];
+            let member = NODES[callee].b;
+            if NODES[callee].g != 0 {
+                name_error(NODES[callee].start, c"'", NODES[callee].a, c"' takes no type arguments");
+            }
+            if sym_is_c(member, c"splat") {
+                return make_vecop(n, 0, VK_SPLAT, vt);
+            }
+            if sym_is_c(member, c"load") {
+                return make_vecop(n, 0, VK_LOAD, vt);
+            }
+            err_begin(NODES[callee].start);
+            err_str(c"no associated function '");
+            err_sym(member);
+            err_str(c"' for vector type '");
+            err_type(vt);
+            err_str(c"'");
+            err_help(c"vector types have `splat(x)` and `load(slice, index)`");
+            err_end();
+            return vt;
+        }
         let mut t = path_target(callee);
         if t == -2 {
             // `m::f(args)`: a call of an item of a module.
@@ -3707,6 +3742,9 @@ fn synth_method(n: i64) -> i64 {
         let receiver = NODES[n].a;
         let name = NODES[n].b;
         let receiver_ty = synth_expr(receiver);
+        if is_vector(receiver_ty) {
+            return vector_method(n, name, receiver_ty);
+        }
         let mut t = receiver_ty;
         let mut through_pointer = false;
         if is_pointer(t) && (TYPES[TYPES[t].a].kind == TyKind::Struct || TYPES[TYPES[t].a].kind == TyKind::Enum
@@ -3820,6 +3858,225 @@ fn synth_method(n: i64) -> i64 {
     }
 }
 
+// ---- Vector operations (0.10) ----
+//
+// The vector types (`v2f64`, `v4f32`, `v2i64`, `v4i32`, `v8i16`, `v16i8`)
+// have lanewise operators (`+ - *` on all of them, `/` on the float ones,
+// `& | ^` on the integer ones, comparisons giving a mask: the integer
+// vector of the lane width, each lane -1 or 0) and these operations, which
+// become VecOp nodes: `vNtT(lanes...)`, `vNtT::splat(x)`,
+// `vNtT::load(s, i)`, `v.store(s, i)`, `v.lane(i)`, `v.with_lane(i, x)`,
+// `v.sum()`, `mask.select(a, b)`. Indices are i64.
+
+fn sym_is_c(sym: i64, s: *u8) -> bool {
+    unsafe { sym == intern_c(s) }
+}
+
+// Turns call (or method call) n into a VecOp of kind `kind` on vector type
+// `vt` (receiver: the method's receiver, or 0), and checks it.
+fn make_vecop(n: i64, receiver: i64, kind: i64, vt: i64) -> i64 {
+    unsafe {
+        NODES[n].kind = VecOp;
+        NODES[n].a = receiver;
+        NODES[n].b = 0;
+        NODES[n].x = kind;
+        NODES[n].y = vt;
+    }
+    synth_vecop(n)
+}
+
+fn vector_method(n: i64, name: i64, vt: i64) -> i64 {
+    unsafe {
+        let receiver = NODES[n].a;
+        if NODES[n].g != 0 {
+            name_error(NODES[n].start, c"method '", name, c"' is not generic");
+        }
+        if sym_is_c(name, c"lane") { return make_vecop(n, receiver, VK_LANE, vt); }
+        if sym_is_c(name, c"with_lane") { return make_vecop(n, receiver, VK_WITH, vt); }
+        if sym_is_c(name, c"sum") { return make_vecop(n, receiver, VK_SUM, vt); }
+        if sym_is_c(name, c"store") { return make_vecop(n, receiver, VK_STORE, vt); }
+        if sym_is_c(name, c"select") && !is_float_vector(vt) {
+            return make_vecop(n, receiver, VK_SELECT, vt);
+        }
+        err_begin(NODES[n].start);
+        err_str(c"no method '");
+        err_sym(name);
+        err_str(c"' on vector type '");
+        err_type(vt);
+        err_str(c"'");
+        err_help(c"vectors have `lane(i)`, `with_lane(i, x)`, `sum()`, `store(slice, i)`, and masks `select(a, b)`");
+        err_end();
+        vt
+    }
+}
+
+fn vecop_arity(n: i64, want: i64) -> bool {
+    unsafe {
+        if NODES[n].count == want {
+            return true;
+        }
+        err_begin(NODES[n].start);
+        err_str(c"this vector operation takes ");
+        err_int(want);
+        err_str(c" arguments, got ");
+        err_int(NODES[n].count);
+        err_end();
+        for i in 0..NODES[n].count {
+            synth_expr(child(n, i));
+        }
+        false
+    }
+}
+
+// The memory operand of a vector load or store: a slice or an array of
+// the lanes' type.
+fn check_vector_memory(n: i64, e: i64, elem: i64, store: bool) {
+    unsafe {
+        let ty = synth_expr(e);
+        let kind = TYPES[ty].kind;
+        if ty == TY_ERROR || ty == TY_NEVER {
+            return;
+        }
+        if (kind != TyKind::Slice && kind != TyKind::Array) || TYPES[ty].a != elem {
+            err_begin(NODES[e].start);
+            err_str(c"expected a slice or an array of '");
+            err_type(elem);
+            err_str(c"', got '");
+            err_type(ty);
+            err_str(c"'");
+            err_end();
+            return;
+        }
+        if store && kind == TyKind::Array {
+            if !is_place(e) {
+                type_error(e, c"a vector can only be stored into an array that is a place (a variable, field or element)");
+            }
+            check_mutable_place(e);
+        }
+    }
+}
+
+pub fn synth_vecop(n: i64) -> i64 {
+    unsafe {
+        let kind = NODES[n].x;
+        let vt = NODES[n].y;
+        let elem = vec_elem(vt);
+        let receiver = NODES[n].a;
+        if receiver != 0 {
+            synth_expr(receiver);
+        }
+        if kind == VK_NEW {
+            if vecop_arity(n, vec_lanes(vt)) {
+                for i in 0..NODES[n].count {
+                    check_expr(child(n, i), elem);
+                }
+            }
+            return vt;
+        }
+        if kind == VK_SPLAT {
+            if vecop_arity(n, 1) {
+                check_expr(child(n, 0), elem);
+            }
+            return vt;
+        }
+        if kind == VK_LOAD || kind == VK_STORE {
+            if vecop_arity(n, 2) {
+                check_vector_memory(n, child(n, 0), elem, kind == VK_STORE);
+                check_expr(child(n, 1), TY_I64);
+            }
+            return if kind == VK_LOAD { vt } else { TY_UNIT };
+        }
+        if kind == VK_LANE {
+            if vecop_arity(n, 1) {
+                check_expr(child(n, 0), TY_I64);
+            }
+            return elem;
+        }
+        if kind == VK_WITH {
+            if vecop_arity(n, 2) {
+                check_expr(child(n, 0), TY_I64);
+                check_expr(child(n, 1), elem);
+            }
+            return vt;
+        }
+        if kind == VK_SUM {
+            vecop_arity(n, 0);
+            return elem;
+        }
+        // VK_SELECT: the mask is the receiver.
+        if !vecop_arity(n, 2) {
+            return vt;
+        }
+        let a = child(n, 0);
+        let ty = synth_expr(a);
+        if !is_vector(ty) || vec_mask_type(ty) != vt {
+            if ty != TY_ERROR && ty != TY_NEVER {
+                err_begin(NODES[a].start);
+                err_str(c"a mask of type '");
+                err_type(vt);
+                err_str(c"' selects between vectors with lanes of its width, got '");
+                err_type(ty);
+                err_str(c"'");
+                err_end();
+            }
+            synth_expr(child(n, 1));
+            return vt;
+        }
+        check_expr(child(n, 1), ty);
+        ty
+    }
+}
+
+fn arith_token_of_assign(op: Tok) -> Tok {
+    if op == Tok::PlusEq { return Tok::Plus; }
+    if op == Tok::MinusEq { return Tok::Minus; }
+    if op == Tok::StarEq { return Tok::Star; }
+    if op == Tok::SlashEq { return Tok::Slash; }
+    if op == Tok::PercentEq { return Tok::Percent; }
+    if op == Tok::AmpEq { return Tok::Amp; }
+    if op == Tok::PipeEq { return Tok::Pipe; }
+    if op == Tok::CaretEq { return Tok::Caret; }
+    op
+}
+
+// Reports an error when operator `op` (arithmetic or bitwise) does not
+// apply to vector type `ty`.
+fn vector_operator_ok(n: i64, op: Tok, ty: i64) {
+    unsafe { vector_operator_check(n, op, ty); }
+}
+
+unsafe fn vector_operator_check(n: i64, op: Tok, ty: i64) {
+    if op == Tok::Plus || op == Tok::Minus || op == Tok::Star {
+        return;
+    }
+    if op == Tok::Slash {
+        if !is_float_vector(ty) {
+            type_error_got(n, c"integer vectors have no division", ty);
+        }
+        return;
+    }
+    if op == Tok::Amp || op == Tok::Pipe || op == Tok::Caret {
+        if is_float_vector(ty) {
+            type_error_got(n, c"bitwise operators on vectors require an integer vector", ty);
+        }
+        return;
+    }
+    type_error_got(n, c"this operator does not apply to vectors", ty);
+}
+
+fn vector_binary(n: i64, op: Tok, ty: i64) -> i64 {
+    if op == Tok::EqEq || op == Tok::BangEq || op == Tok::Lt || op == Tok::Gt || op == Tok::LtEq
+        || op == Tok::GtEq {
+        return vec_mask_type(ty);
+    }
+    if op == Tok::AmpAmp || op == Tok::PipePipe {
+        unsafe { type_error_got(n, c"logical operator requires bool", ty); }
+        return TY_BOOL;
+    }
+    vector_operator_ok(n, op, ty);
+    ty
+}
+
 // ---- Places and assignment ----
 
 fn is_place(n: i64) -> bool {
@@ -3875,6 +4132,12 @@ fn check_assign(n: i64) {
                 type_error_got(n, c"shift assignment requires integer type", target_ty);
             }
             check_shift_amount(value);
+            return;
+        }
+        if is_vector(target_ty) {
+            // (0.10: lanewise, as the operator)
+            vector_operator_ok(n, arith_token_of_assign(op), target_ty);
+            check_expr(value, target_ty);
             return;
         }
         if op == Tok::AmpEq || op == Tok::PipeEq || op == Tok::CaretEq {
