@@ -60,8 +60,9 @@
 #   // FLAGS: flags      (0.9) more compiler options for the case
 #   // WARNING: text     (0.9) the case compiles with a warning containing
 #                        this text, one directive per message, in order
-# Every case is compiled with --deny-warnings (0.9: no unsafe operation
-# outside unsafe code), except the ones with WARNING directives.
+# Every case is compiled with --deny-warnings, except the ones with WARNING
+# directives (0.9's unsafe warnings are errors from 0.10; there are no
+# warnings at the moment).
 # Stdout is compared after removing trailing whitespace. Each program may
 # run for 20 seconds.
 

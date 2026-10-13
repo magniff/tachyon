@@ -43,6 +43,16 @@ binary is invoked, where its test runner is and which hosts it supports.
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
+### What's new in 0.10 (in progress)
+
+- **Unsafe operations are errors.** An unsafe operation outside unsafe
+  code is `error[unsafe]` (a warning in 0.9); `tachyonc --fix-unsafe`
+  still adds the blocks. `--allow-unsafe` is gone (breaking): the
+  compiler's own source is in unsafe code (whole function bodies in one
+  block where a function has several unsafe operations), and the
+  bootstrap builds 0.10 through the interface `tachyonc-0.10`, which does
+  not pass it. Releases before 0.10 are built as before.
+
 ### What's new in 0.9 (in progress)
 
 - **Unsafe code.** `unsafe { ... }` blocks and `unsafe fn`: dereferencing,

@@ -354,11 +354,9 @@ safe to use: tachyon has no threads of its own (threads started through
 C are C's business). Runaway recursion still exhausts the stack, which
 the operating system stops (a guard page) without corrupting memory.
 
-**Transition.** In 0.9 an unsafe operation outside unsafe code is a
-*warning* (`warning[unsafe]`; `--deny-warnings` makes it an error); in
-0.10 it is an error. `tachyonc --fix-unsafe` wraps the operations in
-unsafe blocks. The compiler's own source, built by 0.8.0, migrates in
-0.10; until then the bootstrap builds it with `--allow-unsafe`.
+**Errors.** An unsafe operation outside unsafe code is an error
+(`error[unsafe]`, from 0.10; 0.9 reported it as a warning).
+`tachyonc --fix-unsafe` wraps such operations in unsafe blocks.
 
 ## Layout, conventions and C
 
@@ -783,24 +781,21 @@ does not say whether its function borrows: calling one with a pointer
 argument that is not a borrow is unsafe, and so is making a function
 with pointer parameters into a value (`let f = add_one;`).
 
-**Diagnostics.** An unsafe operation outside unsafe code is reported as
-`warning[unsafe]` (each place once, at most 50, in source order); the
-program still compiles. Options:
+**Diagnostics.** An unsafe operation outside unsafe code is an error,
+`error[unsafe]` (each place once, in source order, with the other
+errors; 0.9 reported it as a warning). Options:
 
-- `--deny-warnings`: warnings are errors (`error[unsafe]`); the test suite
-  compiles every case so.
-- `--allow-unsafe`: no unsafe warnings at all. The bootstrap passes it
-  (interface `tachyonc-0.9` in `bootstrap/releases.toml`) when it builds
-  the compiler's own source, which 0.8.0 compiles and which uses raw
-  pointers everywhere; releases before 0.9 are built as before.
+- `--deny-warnings`: warnings are errors. There are no warnings at the
+  moment (0.9's unsafe warnings are errors now); the option stays for
+  future ones, and the test suite compiles every case with it.
 - `tachyonc --fix-unsafe FILE...`: rewrites the program in place, putting
   each unsafe operation outside unsafe code in an unsafe block: the
   statement around it (consecutive statements share one block), a
   `let`'s value, a condition, a match arm or a block's tail. Nothing else
   changes; a second run finds nothing to do.
 
-In 0.10 the warning becomes an error (and the compiler's source is
-migrated with `--fix-unsafe`).
+0.9's `--allow-unsafe` (no unsafe warnings, for the compiler's own source,
+which 0.10 migrated) is gone: 0.10 rejects it.
 
 **std.** `panic`, `Buf::push_cstr` and `print_cstr` take C strings, which
 must end with a NUL: they are `unsafe fn` now (breaking). Everything else

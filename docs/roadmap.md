@@ -400,9 +400,11 @@ written against 0.5's unbounded generics mean.
   function bodies in `unsafe { ... }` where a function has several
   unsafe operations, `tachyonc --fix-unsafe` for the rest; the compilers
   built before and after are byte-identical, and tests/compare.sh finds
-  9281 of 9281 compilations identical)
-- in progress: unsafe operations outside unsafe code become errors
-- remaining: vector types; NEON/SSE2 lowering; loop vectorizer with
+  9281 of 9281 compilations identical); unsafe operations outside unsafe
+  code are errors (`error[unsafe]`), `--allow-unsafe` is gone, and the
+  bootstrap interface `tachyonc-0.10` builds HEAD
+- in progress: vector types
+- remaining: NEON/SSE2 lowering; loop vectorizer with
   run-time trip counts; profile-guided optimization; SLP; GVN-PRE
 
 Vectorization:
