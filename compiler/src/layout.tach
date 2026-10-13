@@ -46,55 +46,59 @@ fn int_vec_fill(vec: *IntVec, n: i64, value: i64) {
 // one, or calls the panic or a `#[cold]` function, or jumps to such a
 // block.
 fn ends_cold(b: i64) -> bool {
-    let mut x = b;
-    for _ in 0..8 {
-        if BLOCKS[x].term == Term::Unreach {
-            return true;
-        }
-        let mut v = BLOCKS[x].first;
-        while v != 0 {
-            if INSTS[v].op == Op::CallC && INSTS[v].imm == rt_panic_sym() {
+    unsafe {
+        let mut x = b;
+        for _ in 0..8 {
+            if BLOCKS[x].term == Term::Unreach {
                 return true;
             }
-            if INSTS[v].op == Op::Call && fn_attr_cold(INSTS[v].imm) {
-                return true;
+            let mut v = BLOCKS[x].first;
+            while v != 0 {
+                if INSTS[v].op == Op::CallC && INSTS[v].imm == rt_panic_sym() {
+                    return true;
+                }
+                if INSTS[v].op == Op::Call && fn_attr_cold(INSTS[v].imm) {
+                    return true;
+                }
+                v = INSTS[v].next;
             }
-            v = INSTS[v].next;
+            if BLOCKS[x].term != Term::Jump {
+                return false;
+            }
+            x = BLOCKS[x].s0;
         }
-        if BLOCKS[x].term != Term::Jump {
-            return false;
-        }
-        x = BLOCKS[x].s0;
+        false
     }
-    false
 }
 
 fn block_freq(k: i64) -> i64 {
-    1 << (3 * min_i64(LDEPTH.data[k], 6)) as u64
+    unsafe { 1 << (3 * min_i64(LDEPTH.data[k], 6)) as u64 }
 }
 
 // The share (of 64) of block k's frequency going to its successor s
 // (by index), on a branch to s and other.
 fn branch_share(k: i64, s: i64, other: i64) -> i64 {
-    let cold_s = COLD.data[s] != 0;
-    let cold_other = COLD.data[other] != 0;
-    if cold_s != cold_other {
-        return if cold_s { 1 } else { 63 };
+    unsafe {
+        let cold_s = COLD.data[s] != 0;
+        let cold_other = COLD.data[other] != 0;
+        if cold_s != cold_other {
+            return if cold_s { 1 } else { 63 };
+        }
+        // A back edge (to a block not later in the allocation order: a loop
+        // header) is likely; so is staying within the loop.
+        let back_s = s <= k;
+        let back_other = other <= k;
+        if back_s != back_other {
+            return if back_s { 56 } else { 8 };
+        }
+        let depth = LDEPTH.data[k];
+        let in_s = LDEPTH.data[s] >= depth;
+        let in_other = LDEPTH.data[other] >= depth;
+        if in_s != in_other {
+            return if in_s { 56 } else { 8 };
+        }
+        32
     }
-    // A back edge (to a block not later in the allocation order: a loop
-    // header) is likely; so is staying within the loop.
-    let back_s = s <= k;
-    let back_other = other <= k;
-    if back_s != back_other {
-        return if back_s { 56 } else { 8 };
-    }
-    let depth = LDEPTH.data[k];
-    let in_s = LDEPTH.data[s] >= depth;
-    let in_other = LDEPTH.data[other] >= depth;
-    if in_s != in_other {
-        return if in_s { 56 } else { 8 };
-    }
-    32
 }
 
 fn add_edge(weight: i64, from: i64, to: i64) {
@@ -108,43 +112,47 @@ fn add_edge(weight: i64, from: i64, to: i64) {
 
 // Whether edge i comes before edge j: heavier first, then in order.
 fn edge_before(i: i64, j: i64) -> bool {
-    let wi = EDGES.data[3 * i];
-    let wj = EDGES.data[3 * j];
-    if wi != wj {
-        return wi > wj;
+    unsafe {
+        let wi = EDGES.data[3 * i];
+        let wj = EDGES.data[3 * j];
+        if wi != wj {
+            return wi > wj;
+        }
+        i < j
     }
-    i < j
 }
 
 // Sorts EDGE_ORDER (indices of edges) by edge_before: bottom-up merge sort.
 fn sort_edges() {
-    let n = EDGE_ORDER.count;
-    int_vec_fill(&EDGE_TEMP, n, 0);
-    let mut width = 1;
-    while width < n {
-        let mut lo = 0;
-        while lo < n {
-            let mid = min_i64(lo + width, n);
-            let hi = min_i64(lo + 2 * width, n);
-            let mut i = lo;
-            let mut j = mid;
-            let mut k = lo;
-            while k < hi {
-                if i < mid && (j >= hi || !edge_before(EDGE_ORDER.data[j], EDGE_ORDER.data[i])) {
-                    EDGE_TEMP.data[k] = EDGE_ORDER.data[i];
-                    i += 1;
-                } else {
-                    EDGE_TEMP.data[k] = EDGE_ORDER.data[j];
-                    j += 1;
+    unsafe {
+        let n = EDGE_ORDER.count;
+        int_vec_fill(&EDGE_TEMP, n, 0);
+        let mut width = 1;
+        while width < n {
+            let mut lo = 0;
+            while lo < n {
+                let mid = min_i64(lo + width, n);
+                let hi = min_i64(lo + 2 * width, n);
+                let mut i = lo;
+                let mut j = mid;
+                let mut k = lo;
+                while k < hi {
+                    if i < mid && (j >= hi || !edge_before(EDGE_ORDER.data[j], EDGE_ORDER.data[i])) {
+                        EDGE_TEMP.data[k] = EDGE_ORDER.data[i];
+                        i += 1;
+                    } else {
+                        EDGE_TEMP.data[k] = EDGE_ORDER.data[j];
+                        j += 1;
+                    }
+                    k += 1;
                 }
-                k += 1;
+                lo = hi;
             }
-            lo = hi;
+            for k in 0..n {
+                EDGE_ORDER.data[k] = EDGE_TEMP.data[k];
+            }
+            width *= 2;
         }
-        for k in 0..n {
-            EDGE_ORDER.data[k] = EDGE_TEMP.data[k];
-        }
-        width *= 2;
     }
 }
 
@@ -154,82 +162,84 @@ fn edge_target(b: i64) -> i64 {
     if is_skipped(t) {
         return -1;
     }
-    BLOCKS[t].order
+    unsafe { BLOCKS[t].order }
 }
 
 pub fn layout_emission() {
-    let n = ORDER.count;
-    int_vec_fill(&CHAIN_NEXT, n, -1);
-    CHAIN_HEAD.count = 0;
-    CHAIN_TAIL.count = 0;
-    COLD.count = 0;
-    for k in 0..n {
-        CHAIN_HEAD.push(k);
-        CHAIN_TAIL.push(k);
-        COLD.push(if ends_cold(ORDER.data[k]) { 1 } else { 0 });
-    }
-    EDGES.count = 0;
-    for k in 0..n {
-        let b = ORDER.data[k];
-        if is_skipped(b) {
-            continue;
-        }
-        let freq = block_freq(k);
-        let term = BLOCKS[b].term;
-        if term == Term::Jump {
-            add_edge(64 * freq, k, edge_target(BLOCKS[b].s0));
-        } else if term == Term::Branch {
-            let s0 = edge_target(BLOCKS[b].s0);
-            let s1 = edge_target(BLOCKS[b].s1);
-            if s0 >= 0 && s1 >= 0 {
-                add_edge(branch_share(k, s0, s1) * freq, k, s0);
-                add_edge(branch_share(k, s1, s0) * freq, k, s1);
-            }
-        }
-    }
-    EDGE_ORDER.count = 0;
-    for i in 0..EDGES.count / 3 {
-        EDGE_ORDER.push(i);
-    }
-    sort_edges();
-    for i in 0..EDGE_ORDER.count {
-        let e = EDGE_ORDER.data[i];
-        let from = EDGES.data[3 * e + 1];
-        let to = EDGES.data[3 * e + 2];
-        let head_from = CHAIN_HEAD.data[from];
-        let head_to = CHAIN_HEAD.data[to];
-        // From the end of a chain to the start of another (never to the
-        // entry, which stays first).
-        if CHAIN_TAIL.data[head_from] != from || head_to != to || head_from == head_to || to == 0 {
-            continue;
-        }
-        CHAIN_NEXT.data[from] = to;
-        CHAIN_TAIL.data[head_from] = CHAIN_TAIL.data[to];
-        let mut x = to;
-        while x >= 0 {
-            CHAIN_HEAD.data[x] = head_from;
-            x = CHAIN_NEXT.data[x];
-        }
-    }
-    // The chains: the entry's, the hot ones, the cold ones (a chain is cold
-    // when its first block is).
-    EMIT.count = 0;
-    for pass in 0..2 {
+    unsafe {
+        let n = ORDER.count;
+        int_vec_fill(&CHAIN_NEXT, n, -1);
+        CHAIN_HEAD.count = 0;
+        CHAIN_TAIL.count = 0;
+        COLD.count = 0;
         for k in 0..n {
-            if CHAIN_HEAD.data[k] != k {
+            CHAIN_HEAD.push(k);
+            CHAIN_TAIL.push(k);
+            COLD.push(if ends_cold(ORDER.data[k]) { 1 } else { 0 });
+        }
+        EDGES.count = 0;
+        for k in 0..n {
+            let b = ORDER.data[k];
+            if is_skipped(b) {
                 continue;
             }
-            let cold = COLD.data[k] != 0 && k != 0;
-            if (pass == 0) == cold {
-                continue;
-            }
-            let mut x = k;
-            while x >= 0 {
-                let b = ORDER.data[x];
-                if !is_skipped(b) {
-                    EMIT.push(b);
+            let freq = block_freq(k);
+            let term = BLOCKS[b].term;
+            if term == Term::Jump {
+                add_edge(64 * freq, k, edge_target(BLOCKS[b].s0));
+            } else if term == Term::Branch {
+                let s0 = edge_target(BLOCKS[b].s0);
+                let s1 = edge_target(BLOCKS[b].s1);
+                if s0 >= 0 && s1 >= 0 {
+                    add_edge(branch_share(k, s0, s1) * freq, k, s0);
+                    add_edge(branch_share(k, s1, s0) * freq, k, s1);
                 }
+            }
+        }
+        EDGE_ORDER.count = 0;
+        for i in 0..EDGES.count / 3 {
+            EDGE_ORDER.push(i);
+        }
+        sort_edges();
+        for i in 0..EDGE_ORDER.count {
+            let e = EDGE_ORDER.data[i];
+            let from = EDGES.data[3 * e + 1];
+            let to = EDGES.data[3 * e + 2];
+            let head_from = CHAIN_HEAD.data[from];
+            let head_to = CHAIN_HEAD.data[to];
+            // From the end of a chain to the start of another (never to the
+            // entry, which stays first).
+            if CHAIN_TAIL.data[head_from] != from || head_to != to || head_from == head_to || to == 0 {
+                continue;
+            }
+            CHAIN_NEXT.data[from] = to;
+            CHAIN_TAIL.data[head_from] = CHAIN_TAIL.data[to];
+            let mut x = to;
+            while x >= 0 {
+                CHAIN_HEAD.data[x] = head_from;
                 x = CHAIN_NEXT.data[x];
+            }
+        }
+        // The chains: the entry's, the hot ones, the cold ones (a chain is cold
+        // when its first block is).
+        EMIT.count = 0;
+        for pass in 0..2 {
+            for k in 0..n {
+                if CHAIN_HEAD.data[k] != k {
+                    continue;
+                }
+                let cold = COLD.data[k] != 0 && k != 0;
+                if (pass == 0) == cold {
+                    continue;
+                }
+                let mut x = k;
+                while x >= 0 {
+                    let b = ORDER.data[x];
+                    if !is_skipped(b) {
+                        EMIT.push(b);
+                    }
+                    x = CHAIN_NEXT.data[x];
+                }
             }
         }
     }

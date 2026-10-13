@@ -23,17 +23,17 @@ use crate::lexer::Tok::{
 
 pub fn f64_of_bits(bits: i64) -> f64 {
     let copy = bits;
-    *(&copy as *f64)
+    unsafe { *(&copy as *f64) }
 }
 
 pub fn bits_of(value: f64) -> i64 {
     let copy = value;
-    *(&copy as *i64)
+    unsafe { *(&copy as *i64) }
 }
 
 pub fn f32_bits(value: f64) -> u32 {
     let narrow = value as f32;
-    *(&narrow as *u32)
+    unsafe { *(&narrow as *u32) }
 }
 
 // `value` wrapped to the integer (or pointer) type `ty`.
@@ -61,7 +61,7 @@ pub fn float_const(value: f64, ty: i64) -> i64 {
 }
 
 fn not_constant(n: i64) -> ! {
-    type_error(n, c"expression is not a compile-time constant")
+    unsafe { type_error(n, c"expression is not a compile-time constant") }
 }
 
 // Type checks `n` against `ty` with no locals in scope.
@@ -76,105 +76,115 @@ pub fn check_const_expr(n: i64, ty: i64) {
 }
 
 pub fn const_value(c: i64) -> i64 {
-    if CONSTS[c].state == 2 {
-        return CONSTS[c].value;
+    unsafe {
+        if CONSTS[c].state == 2 {
+            return CONSTS[c].value;
+        }
+        let item = CONSTS[c].node;
+        if CONSTS[c].state == 1 {
+            name_error(NODES[item].start, c"constant '", NODES[item].a, c"' is defined in terms of itself");
+        }
+        CONSTS[c].state = 1;
+        // In the constant's module, without type parameters in scope.
+        let saved_mod = CUR_MOD;
+        CUR_MOD = module_of(item);
+        let saved_env = env_enter(0, 0, 0);
+        check_const_expr(NODES[item].c, CONSTS[c].ty);
+        // A C string constant (0.4) has no value: its uses are the literal.
+        let value = if NODES[NODES[item].c].kind == NodeKind::CStr { 0 } else { const_eval(NODES[item].c) };
+        env_leave(saved_env);
+        CUR_MOD = saved_mod;
+        CONSTS[c].value = value;
+        CONSTS[c].state = 2;
+        value
     }
-    let item = CONSTS[c].node;
-    if CONSTS[c].state == 1 {
-        name_error(NODES[item].start, c"constant '", NODES[item].a, c"' is defined in terms of itself");
-    }
-    CONSTS[c].state = 1;
-    // In the constant's module, without type parameters in scope.
-    let saved_mod = CUR_MOD;
-    CUR_MOD = module_of(item);
-    let saved_env = env_enter(0, 0, 0);
-    check_const_expr(NODES[item].c, CONSTS[c].ty);
-    // A C string constant (0.4) has no value: its uses are the literal.
-    let value = if NODES[NODES[item].c].kind == NodeKind::CStr { 0 } else { const_eval(NODES[item].c) };
-    env_leave(saved_env);
-    CUR_MOD = saved_mod;
-    CONSTS[c].value = value;
-    CONSTS[c].state = 2;
-    value
 }
 
 pub fn eval_array_len(n: i64) -> i64 {
-    let saved_context = CONST_CONTEXT;
-    CONST_CONTEXT = true;
-    let ty = synth_expr(n);
-    if !is_integer(ty) {
-        type_error_got(n, c"array length must be an integer", ty);
+    unsafe {
+        let saved_context = CONST_CONTEXT;
+        CONST_CONTEXT = true;
+        let ty = synth_expr(n);
+        if !is_integer(ty) {
+            type_error_got(n, c"array length must be an integer", ty);
+        }
+        let value = const_eval(n);
+        CONST_CONTEXT = saved_context;
+        if is_signed(ty) && value < 0 {
+            type_error(n, c"array length must not be negative");
+        }
+        value
     }
-    let value = const_eval(n);
-    CONST_CONTEXT = saved_context;
-    if is_signed(ty) && value < 0 {
-        type_error(n, c"array length must not be negative");
-    }
-    value
 }
 
 // The value of a scalar constant expression (already type checked).
 pub fn const_eval(n: i64) -> i64 {
-    let ty = NODES[n].ty;
-    match NODES[n].kind {
-        NodeKind::Int | NodeKind::Char => wrap_int(NODES[n].a, ty),
-        NodeKind::Float => float_const(f64_of_bits(NODES[n].a), ty),
-        NodeKind::Bool => NODES[n].a,
-        NodeKind::Unit => 0,
-        NodeKind::Ident => {
-            if NODES[n].res != Res::Const {
-                name_error(NODES[n].start, c"'", NODES[n].a, c"' is not a constant");
+    unsafe {
+        let ty = NODES[n].ty;
+        match NODES[n].kind {
+            NodeKind::Int | NodeKind::Char => wrap_int(NODES[n].a, ty),
+            NodeKind::Float => float_const(f64_of_bits(NODES[n].a), ty),
+            NodeKind::Bool => NODES[n].a,
+            NodeKind::Unit => 0,
+            NodeKind::Ident => {
+                if NODES[n].res != Res::Const {
+                    name_error(NODES[n].start, c"'", NODES[n].a, c"' is not a constant");
+                }
+                const_value(NODES[n].y)
             }
-            const_value(NODES[n].y)
+            NodeKind::Unary => const_unary(n, ty),
+            NodeKind::Binary => const_binary(n, ty),
+            NodeKind::Cast => {
+                let operand = NODES[n].a;
+                let value = const_eval(operand);
+                const_cast(n, value, scalar_type(NODES[operand].ty), ty)
+            }
+            NodeKind::VariantLit if !is_compound(ty) => wrap_int(VARIANTS[NODES[n].a].discr, scalar_type(ty)),
+            _ => not_constant(n),
         }
-        NodeKind::Unary => const_unary(n, ty),
-        NodeKind::Binary => const_binary(n, ty),
-        NodeKind::Cast => {
-            let operand = NODES[n].a;
-            let value = const_eval(operand);
-            const_cast(n, value, scalar_type(NODES[operand].ty), ty)
-        }
-        NodeKind::VariantLit if !is_compound(ty) => wrap_int(VARIANTS[NODES[n].a].discr, scalar_type(ty)),
-        _ => not_constant(n),
     }
 }
 
 fn const_unary(n: i64, ty: i64) -> i64 {
-    let value = const_eval(NODES[n].b);
-    match NODES[n].op {
-        Minus => if is_float(ty) {
-            float_const(0.0 - f64_of_bits(value), ty)
-        } else {
-            wrap_int(0 - value, ty)
-        },
-        Bang => 1 - value,
-        Tilde => wrap_int(~value, ty),
-        _ => not_constant(n),
+    unsafe {
+        let value = const_eval(NODES[n].b);
+        match NODES[n].op {
+            Minus => if is_float(ty) {
+                float_const(0.0 - f64_of_bits(value), ty)
+            } else {
+                wrap_int(0 - value, ty)
+            },
+            Bang => 1 - value,
+            Tilde => wrap_int(~value, ty),
+            _ => not_constant(n),
+        }
     }
 }
 
 fn const_binary(n: i64, ty: i64) -> i64 {
-    let op = NODES[n].op;
-    let lhs = NODES[n].b;
-    let operand_ty = NODES[lhs].ty;
-    let a = const_eval(lhs);
-    if op == AmpAmp && a == 0 {
-        return 0;
+    unsafe {
+        let op = NODES[n].op;
+        let lhs = NODES[n].b;
+        let operand_ty = NODES[lhs].ty;
+        let a = const_eval(lhs);
+        if op == AmpAmp && a == 0 {
+            return 0;
+        }
+        if op == PipePipe && a == 1 {
+            return 1;
+        }
+        let b = const_eval(NODES[n].c);
+        if operand_ty == TY_BOOL {
+            if op == AmpAmp || op == PipePipe { return b; }
+            if op == EqEq { return (a == b) as i64; }
+            if op == BangEq { return (a != b) as i64; }
+            type_error(n, c"invalid operator on bools");
+        }
+        if is_float(operand_ty) {
+            return const_float_binary(n, op, f64_of_bits(a), f64_of_bits(b), ty);
+        }
+        const_int_binary(n, op, a, b, operand_ty, ty)
     }
-    if op == PipePipe && a == 1 {
-        return 1;
-    }
-    let b = const_eval(NODES[n].c);
-    if operand_ty == TY_BOOL {
-        if op == AmpAmp || op == PipePipe { return b; }
-        if op == EqEq { return (a == b) as i64; }
-        if op == BangEq { return (a != b) as i64; }
-        type_error(n, c"invalid operator on bools");
-    }
-    if is_float(operand_ty) {
-        return const_float_binary(n, op, f64_of_bits(a), f64_of_bits(b), ty);
-    }
-    const_int_binary(n, op, a, b, operand_ty, ty)
 }
 
 fn const_float_binary(n: i64, op: Tok, a: f64, b: f64, ty: i64) -> i64 {
@@ -190,7 +200,7 @@ fn const_float_binary(n: i64, op: Tok, a: f64, b: f64, ty: i64) -> i64 {
         Gt => (a > b) as i64,
         LtEq => (a <= b) as i64,
         GtEq => (a >= b) as i64,
-        _ => type_error(n, c"invalid operator on floats"),
+        _ => unsafe { type_error(n, c"invalid operator on floats") },
     }
 }
 
@@ -206,7 +216,7 @@ fn const_int_binary(n: i64, op: Tok, a: i64, b: i64, operand_ty: i64, ty: i64) -
         Star => wrap_int(a * b, ty),
         Slash | Percent => {
             if b == 0 {
-                type_error(n, c"division by zero in constant expression");
+                unsafe { type_error(n, c"division by zero in constant expression"); }
             }
             if is_signed(operand_ty) {
                 // -MIN / -1 overflows; computed by negation, which wraps.
@@ -310,76 +320,80 @@ fn float_to_int(value: f64, to: i64) -> i64 {
 pub static mut CONST_RELOCS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
 pub fn const_emit(n: i64, ty: i64, out: i64) {
-    CONST_RELOCS.count = 0;
-    let at = BUFS[out].len;
-    let size = type_size(ty);
-    buf_reserve(out, size);
-    memset(&BUFS[out].data[at], 0, size as u64);
-    BUFS[out].len += size;
-    const_write(n, ty, out, at);
-    // (by offset: a struct's fields are not in their order)
-    let count = CONST_RELOCS.count / 2;
-    for i in 1..count {
-        let mut j = i;
-        while j > 0 && CONST_RELOCS.data[2 * j] < CONST_RELOCS.data[2 * (j - 1)] {
-            for k in 0..2 {
-                let t = CONST_RELOCS.data[2 * j + k];
-                CONST_RELOCS.data[2 * j + k] = CONST_RELOCS.data[2 * (j - 1) + k];
-                CONST_RELOCS.data[2 * (j - 1) + k] = t;
+    unsafe {
+        CONST_RELOCS.count = 0;
+        let at = BUFS[out].len;
+        let size = type_size(ty);
+        buf_reserve(out, size);
+        memset(&BUFS[out].data[at], 0, size as u64);
+        BUFS[out].len += size;
+        const_write(n, ty, out, at);
+        // (by offset: a struct's fields are not in their order)
+        let count = CONST_RELOCS.count / 2;
+        for i in 1..count {
+            let mut j = i;
+            while j > 0 && CONST_RELOCS.data[2 * j] < CONST_RELOCS.data[2 * (j - 1)] {
+                for k in 0..2 {
+                    let t = CONST_RELOCS.data[2 * j + k];
+                    CONST_RELOCS.data[2 * j + k] = CONST_RELOCS.data[2 * (j - 1) + k];
+                    CONST_RELOCS.data[2 * (j - 1) + k] = t;
+                }
+                j -= 1;
             }
-            j -= 1;
         }
     }
 }
 
 fn const_write(n: i64, ty: i64, out: i64, at: i64) {
-    match NODES[n].kind {
-        NodeKind::StructLit => {
-            let s = TYPES[ty].a;
-            for i in 0..NODES[n].count {
-                let init = child(n, i);
-                let field = NODES[init].x;
-                const_write(NODES[init].b, (*struct_field(s, field)).ty, out, at + field_offset(s, field));
+    unsafe {
+        match NODES[n].kind {
+            NodeKind::StructLit => {
+                let s = TYPES[ty].a;
+                for i in 0..NODES[n].count {
+                    let init = child(n, i);
+                    let field = NODES[init].x;
+                    const_write(NODES[init].b, (*struct_field(s, field)).ty, out, at + field_offset(s, field));
+                }
             }
-        }
-        NodeKind::Tuple => {
-            for i in 0..NODES[n].count {
-                const_write(child(n, i), type_elem(ty, i), out, at + tuple_offset(ty, i));
+            NodeKind::Tuple => {
+                for i in 0..NODES[n].count {
+                    const_write(child(n, i), type_elem(ty, i), out, at + tuple_offset(ty, i));
+                }
             }
-        }
-        NodeKind::Array | NodeKind::Repeat => {
-            let elem = TYPES[ty].a;
-            let elem_size = type_size(elem);
-            for i in 0..TYPES[ty].b {
-                let value = if NODES[n].kind == NodeKind::Array { child(n, i) } else { NODES[n].a };
-                const_write(value, elem, out, at + i * elem_size);
+            NodeKind::Array | NodeKind::Repeat => {
+                let elem = TYPES[ty].a;
+                let elem_size = type_size(elem);
+                for i in 0..TYPES[ty].b {
+                    let value = if NODES[n].kind == NodeKind::Array { child(n, i) } else { NODES[n].a };
+                    const_write(value, elem, out, at + i * elem_size);
+                }
             }
-        }
-        NodeKind::Str => {
-            // A string literal in an aggregate (0.9): its address, then
-            // its length.
-            CONST_RELOCS.push(at);
-            CONST_RELOCS.push(NODES[n].a);
-            write_scalar(out, at + 8, crate::lexer::STRS[NODES[n].a].len as i64, TY_I64);
-        }
-        NodeKind::CStr if is_pointer(ty) => {
-            CONST_RELOCS.push(at);
-            CONST_RELOCS.push(NODES[n].a);
-        }
-        NodeKind::VariantLit if is_compound(ty) => {
-            let v = NODES[n].a;
-            let tag = ENUMS[TYPES[ty].a].tag;
-            write_scalar(out, at, wrap_int(VARIANTS[v].discr, tag), tag);
-            for i in 0..NODES[n].count {
-                const_write(child(n, i), variant_field(v, i), out, at + variant_field_offset(v, i));
+            NodeKind::Str => {
+                // A string literal in an aggregate (0.9): its address, then
+                // its length.
+                CONST_RELOCS.push(at);
+                CONST_RELOCS.push(NODES[n].a);
+                write_scalar(out, at + 8, crate::lexer::STRS[NODES[n].a].len as i64, TY_I64);
             }
-        }
-        _ => {
-            if is_compound(ty) {
-                not_constant(n);
+            NodeKind::CStr if is_pointer(ty) => {
+                CONST_RELOCS.push(at);
+                CONST_RELOCS.push(NODES[n].a);
             }
-            let value = const_eval(n);
-            write_scalar(out, at, value, scalar_type(ty));
+            NodeKind::VariantLit if is_compound(ty) => {
+                let v = NODES[n].a;
+                let tag = ENUMS[TYPES[ty].a].tag;
+                write_scalar(out, at, wrap_int(VARIANTS[v].discr, tag), tag);
+                for i in 0..NODES[n].count {
+                    const_write(child(n, i), variant_field(v, i), out, at + variant_field_offset(v, i));
+                }
+            }
+            _ => {
+                if is_compound(ty) {
+                    not_constant(n);
+                }
+                let value = const_eval(n);
+                write_scalar(out, at, value, scalar_type(ty));
+            }
         }
     }
 }
@@ -392,6 +406,6 @@ pub fn write_scalar(out: i64, at: i64, value: i64, ty: i64) {
         bits = f32_bits(f64_of_bits(value)) as u64;
     }
     for i in 0..size {
-        BUFS[out].data[at + i] = (bits >> (i * 8) as u64) as u8;
+        unsafe { BUFS[out].data[at + i] = (bits >> (i * 8) as u64) as u8; }
     }
 }

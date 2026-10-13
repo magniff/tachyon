@@ -394,6 +394,17 @@ written against 0.5's unbounded generics mean.
 
 ## 0.10: vectorization and profiles
 
+**0.10 status** (work in progress on branch `release-0.10`):
+
+- done: the compiler's own source migrated to unsafe code (whole
+  function bodies in `unsafe { ... }` where a function has several
+  unsafe operations, `tachyonc --fix-unsafe` for the rest; the compilers
+  built before and after are byte-identical, and tests/compare.sh finds
+  9281 of 9281 compilations identical)
+- in progress: unsafe operations outside unsafe code become errors
+- remaining: vector types; NEON/SSE2 lowering; loop vectorizer with
+  run-time trip counts; profile-guided optimization; SLP; GVN-PRE
+
 Vectorization:
 - SLP vectorizer
 - loop vectorizer for counted loops with simple dependences

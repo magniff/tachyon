@@ -58,68 +58,70 @@ pub static mut ABI_LEAVES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 }
 
 // How a value of type `ty` is passed; for AbiClass::Pieces, its pieces.
 pub fn abi_classify(ty: i64) -> AbiClass {
-    ABI_PIECE_COUNT = 0;
-    if !is_compound(ty) {
-        return AbiClass::Scalar;
-    }
-    let size = type_size(ty);
-    ABI_LEAVES.count = 0;
-    abi_leaves(ty, 0);
-    if !X86 {
-        let mut elem = 0;
-        let mut count = 0;
-        if is_hfa(size, &elem, &count) {
-            for i in 0..count {
-                abi_add_piece(elem, i * type_size(elem));
+    unsafe {
+        ABI_PIECE_COUNT = 0;
+        if !is_compound(ty) {
+            return AbiClass::Scalar;
+        }
+        let size = type_size(ty);
+        ABI_LEAVES.count = 0;
+        abi_leaves(ty, 0);
+        if !X86 {
+            let mut elem = 0;
+            let mut count = 0;
+            if is_hfa(size, &elem, &count) {
+                for i in 0..count {
+                    abi_add_piece(elem, i * type_size(elem));
+                }
+                return AbiClass::Pieces;
+            }
+            if size > 16 {
+                return AbiClass::Ref;
+            }
+            let mut offset = 0;
+            while offset < size {
+                abi_add_piece(int_piece_type(size - offset), offset);
+                offset += 8;
             }
             return AbiClass::Pieces;
         }
-        if size > 16 {
-            return AbiClass::Ref;
+        if size > 16 || has_unaligned_leaf() {
+            return AbiClass::Stack;
         }
         let mut offset = 0;
         while offset < size {
-            abi_add_piece(int_piece_type(size - offset), offset);
+            let chunk = min_i64(8, size - offset);
+            let mut integer = false;
+            let mut f32_only = true;
+            let mut any = false;
+            let mut i = 0;
+            while i < ABI_LEAVES.count {
+                let at = ABI_LEAVES.data[i];
+                let leaf = ABI_LEAVES.data[i + 1];
+                if at < offset + 8 && at + type_size(leaf) > offset {
+                    any = true;
+                    if !is_float(leaf) {
+                        integer = true;
+                    }
+                    if leaf != TY_F32 {
+                        f32_only = false;
+                    }
+                }
+                i += 2;
+            }
+            if !any {
+                // Padding only (NO_CLASS): no register.
+            } else if integer {
+                abi_add_piece(int_piece_type(chunk), offset);
+            } else if f32_only && chunk <= 4 {
+                abi_add_piece(TY_F32, offset);
+            } else {
+                abi_add_piece(TY_F64, offset);
+            }
             offset += 8;
         }
-        return AbiClass::Pieces;
+        AbiClass::Pieces
     }
-    if size > 16 || has_unaligned_leaf() {
-        return AbiClass::Stack;
-    }
-    let mut offset = 0;
-    while offset < size {
-        let chunk = min_i64(8, size - offset);
-        let mut integer = false;
-        let mut f32_only = true;
-        let mut any = false;
-        let mut i = 0;
-        while i < ABI_LEAVES.count {
-            let at = ABI_LEAVES.data[i];
-            let leaf = ABI_LEAVES.data[i + 1];
-            if at < offset + 8 && at + type_size(leaf) > offset {
-                any = true;
-                if !is_float(leaf) {
-                    integer = true;
-                }
-                if leaf != TY_F32 {
-                    f32_only = false;
-                }
-            }
-            i += 2;
-        }
-        if !any {
-            // Padding only (NO_CLASS): no register.
-        } else if integer {
-            abi_add_piece(int_piece_type(chunk), offset);
-        } else if f32_only && chunk <= 4 {
-            abi_add_piece(TY_F32, offset);
-        } else {
-            abi_add_piece(TY_F64, offset);
-        }
-        offset += 8;
-    }
-    AbiClass::Pieces
 }
 
 // Whether a leaf sits at an offset that is not a multiple of its
@@ -127,7 +129,7 @@ pub fn abi_classify(ty: i64) -> AbiClass {
 fn has_unaligned_leaf() -> bool {
     let mut i = 0;
     while i < ABI_LEAVES.count {
-        if ABI_LEAVES.data[i] % type_align(ABI_LEAVES.data[i + 1]) != 0 {
+        if unsafe { ABI_LEAVES.data[i] % type_align(ABI_LEAVES.data[i + 1]) != 0 } {
             return true;
         }
         i += 2;
@@ -153,39 +155,41 @@ fn int_piece_type(left: i64) -> i64 {
 // Appends the scalar leaves of `ty` at `offset` to ABI_LEAVES; the fields
 // of every variant of an enum overlap (a union).
 pub fn abi_leaves(ty: i64, offset: i64) {
-    let kind = TYPES[ty].kind;
-    if kind == TyKind::Struct {
-        let s = TYPES[ty].a;
-        for i in 0..STRUCTS[s].field_count {
-            abi_leaves((*struct_field(s, i)).ty, offset + field_offset(s, i));
-        }
-    } else if kind == TyKind::Tuple {
-        for i in 0..TYPES[ty].count {
-            abi_leaves(type_elem(ty, i), offset + tuple_offset(ty, i));
-        }
-    } else if kind == TyKind::Array {
-        let elem = TYPES[ty].a;
-        for i in 0..TYPES[ty].b {
-            abi_leaves(elem, offset + i * type_size(elem));
-        }
-    } else if kind == TyKind::Slice {
-        ABI_LEAVES.push(offset);
-        ABI_LEAVES.push(TY_U64);
-        ABI_LEAVES.push(offset + 8);
-        ABI_LEAVES.push(TY_U64);
-    } else if kind == TyKind::Enum && is_compound(ty) {
-        let e = TYPES[ty].a;
-        ABI_LEAVES.push(offset);
-        ABI_LEAVES.push(ENUMS[e].tag);
-        for i in 0..ENUMS[e].variant_count {
-            let v = enum_variant(e, i);
-            for k in 0..VARIANTS[v].field_count {
-                abi_leaves(variant_field(v, k), offset + variant_field_offset(v, k));
+    unsafe {
+        let kind = TYPES[ty].kind;
+        if kind == TyKind::Struct {
+            let s = TYPES[ty].a;
+            for i in 0..STRUCTS[s].field_count {
+                abi_leaves((*struct_field(s, i)).ty, offset + field_offset(s, i));
             }
+        } else if kind == TyKind::Tuple {
+            for i in 0..TYPES[ty].count {
+                abi_leaves(type_elem(ty, i), offset + tuple_offset(ty, i));
+            }
+        } else if kind == TyKind::Array {
+            let elem = TYPES[ty].a;
+            for i in 0..TYPES[ty].b {
+                abi_leaves(elem, offset + i * type_size(elem));
+            }
+        } else if kind == TyKind::Slice {
+            ABI_LEAVES.push(offset);
+            ABI_LEAVES.push(TY_U64);
+            ABI_LEAVES.push(offset + 8);
+            ABI_LEAVES.push(TY_U64);
+        } else if kind == TyKind::Enum && is_compound(ty) {
+            let e = TYPES[ty].a;
+            ABI_LEAVES.push(offset);
+            ABI_LEAVES.push(ENUMS[e].tag);
+            for i in 0..ENUMS[e].variant_count {
+                let v = enum_variant(e, i);
+                for k in 0..VARIANTS[v].field_count {
+                    abi_leaves(variant_field(v, k), offset + variant_field_offset(v, k));
+                }
+            }
+        } else if !is_void(ty) {
+            ABI_LEAVES.push(offset);
+            ABI_LEAVES.push(scalar_type(ty));
         }
-    } else if !is_void(ty) {
-        ABI_LEAVES.push(offset);
-        ABI_LEAVES.push(scalar_type(ty));
     }
 }
 
@@ -194,42 +198,44 @@ pub fn abi_leaves(ty: i64, offset: i64) {
 // float aggregate has no padding); leaves that coincide (the members of a
 // union) count once.
 fn is_hfa(total: i64, elem: *i64, count: *i64) -> bool {
-    let n = ABI_LEAVES.count / 2;
-    if n < 1 {
-        return false;
-    }
-    let first = ABI_LEAVES.data[1];
-    if !is_float(first) {
-        return false;
-    }
-    let size = type_size(first);
-    // Every leaf is a float of that type at a multiple of its size, and the
-    // offsets used are 0, size, 2 * size... without a gap.
-    let mut highest = -1;
-    for i in 0..n {
-        let offset = ABI_LEAVES.data[2 * i];
-        if ABI_LEAVES.data[2 * i + 1] != first || offset % size != 0 {
+    unsafe {
+        let n = ABI_LEAVES.count / 2;
+        if n < 1 {
             return false;
         }
-        highest = max_i64(highest, offset / size);
-    }
-    if highest > 3 || (highest + 1) * size != total {
-        return false;
-    }
-    for k in 0..highest + 1 {
-        let mut seen = false;
+        let first = ABI_LEAVES.data[1];
+        if !is_float(first) {
+            return false;
+        }
+        let size = type_size(first);
+        // Every leaf is a float of that type at a multiple of its size, and the
+        // offsets used are 0, size, 2 * size... without a gap.
+        let mut highest = -1;
         for i in 0..n {
-            if ABI_LEAVES.data[2 * i] == k * size {
-                seen = true;
+            let offset = ABI_LEAVES.data[2 * i];
+            if ABI_LEAVES.data[2 * i + 1] != first || offset % size != 0 {
+                return false;
+            }
+            highest = max_i64(highest, offset / size);
+        }
+        if highest > 3 || (highest + 1) * size != total {
+            return false;
+        }
+        for k in 0..highest + 1 {
+            let mut seen = false;
+            for i in 0..n {
+                if ABI_LEAVES.data[2 * i] == k * size {
+                    seen = true;
+                }
+            }
+            if !seen {
+                return false;
             }
         }
-        if !seen {
-            return false;
-        }
+        *elem = first;
+        *count = highest + 1;
+        true
     }
-    *elem = first;
-    *count = highest + 1;
-    true
 }
 
 // The locations of the pieces of the aggregate of type `ty` just
@@ -238,58 +244,62 @@ fn is_hfa(total: i64, elem: *i64, count: *i64) -> bool {
 // the stack (Apple's AArch64 convention does not round it to an even x
 // register, unlike AAPCS64's).
 pub fn abi_piece_locations(ty: i64, state: *i64, locations: *i64) {
-    let size = type_size(ty);
-    let wide = type_align(ty) >= 16;
-    let n = ABI_PIECE_COUNT;
-    let mut ints = 0;
-    let mut floats = 0;
-    for i in 0..n {
-        if is_float(ABI_PIECE_TY[i]) {
-            floats += 1;
-        } else {
-            ints += 1;
-        }
-    }
-    let int_limit = if X86 { 6 } else { 8 };
-    if state[0] + ints <= int_limit && state[1] + floats <= 8 {
+    unsafe {
+        let size = type_size(ty);
+        let wide = type_align(ty) >= 16;
+        let n = ABI_PIECE_COUNT;
+        let mut ints = 0;
+        let mut floats = 0;
         for i in 0..n {
             if is_float(ABI_PIECE_TY[i]) {
-                locations[i] = 8 + state[1];
-                state[1] += 1;
+                floats += 1;
             } else {
-                locations[i] = state[0];
-                state[0] += 1;
+                ints += 1;
             }
         }
-        return;
-    }
-    // On the stack, laid out as in memory.
-    if !X86 {
-        if floats > 0 {
-            state[1] = 8;
-        } else {
-            state[0] = 8;
+        let int_limit = if X86 { 6 } else { 8 };
+        if state[0] + ints <= int_limit && state[1] + floats <= 8 {
+            for i in 0..n {
+                if is_float(ABI_PIECE_TY[i]) {
+                    locations[i] = 8 + state[1];
+                    state[1] += 1;
+                } else {
+                    locations[i] = state[0];
+                    state[0] += 1;
+                }
+            }
+            return;
         }
+        // On the stack, laid out as in memory.
+        if !X86 {
+            if floats > 0 {
+                state[1] = 8;
+            } else {
+                state[0] = 8;
+            }
+        }
+        // Apple's AArch64 convention passes a homogeneous float aggregate on
+        // the stack as its elements: at the element's alignment, taking its
+        // exact size (a union of three f32 takes 12 bytes at a multiple of 4),
+        // where other aggregates take 8-byte slots.
+        let hfa = !X86 && ints == 0 && !wide;
+        let base = align_to(state[2], if wide { type_align(ty) } else if hfa { type_size(ABI_PIECE_TY[0]) } else { 8 });
+        for i in 0..n {
+            locations[i] = 16 + base + ABI_PIECE_OFFSET[i];
+        }
+        state[2] = base + if hfa { size } else { align_to(size, 8) };
     }
-    // Apple's AArch64 convention passes a homogeneous float aggregate on
-    // the stack as its elements: at the element's alignment, taking its
-    // exact size (a union of three f32 takes 12 bytes at a multiple of 4),
-    // where other aggregates take 8-byte slots.
-    let hfa = !X86 && ints == 0 && !wide;
-    let base = align_to(state[2], if wide { type_align(ty) } else if hfa { type_size(ABI_PIECE_TY[0]) } else { 8 });
-    for i in 0..n {
-        locations[i] = 16 + base + ABI_PIECE_OFFSET[i];
-    }
-    state[2] = base + if hfa { size } else { align_to(size, 8) };
 }
 
 // The stack offset (from the outgoing area) of an aggregate copied onto the
 // stack (AbiClass::Stack): at a multiple of its alignment when that is 16
 // or more (as clang and GCC place them).
 pub fn abi_stack_location(ty: i64, state: *i64) -> i64 {
-    let base = align_to(state[2], if type_align(ty) >= 16 { type_align(ty) } else { 8 });
-    state[2] = base + align_to(type_size(ty), 8);
-    16 + base
+    unsafe {
+        let base = align_to(state[2], if type_align(ty) >= 16 { type_align(ty) } else { 8 });
+        state[2] = base + align_to(type_size(ty), 8);
+        16 + base
+    }
 }
 
 // The `...` arguments of a C function: aggregates are classified as named
@@ -304,15 +314,17 @@ pub fn variadic_kind(ty: i64) -> AbiClass {
 // The locations of the pieces of a variadic aggregate passed by value (see
 // variadic_by_reference), classified just before.
 pub fn abi_variadic_piece_locations(ty: i64, state: *i64, locations: *i64) {
-    if X86 {
-        abi_piece_locations(ty, state, locations);
-        return;
+    unsafe {
+        if X86 {
+            abi_piece_locations(ty, state, locations);
+            return;
+        }
+        let base = align_to(state[2], if type_align(ty) >= 16 { 16 } else { 8 });
+        for i in 0..ABI_PIECE_COUNT {
+            locations[i] = 16 + base + ABI_PIECE_OFFSET[i];
+        }
+        state[2] = base + align_to(type_size(ty), 8);
     }
-    let base = align_to(state[2], if type_align(ty) >= 16 { 16 } else { 8 });
-    for i in 0..ABI_PIECE_COUNT {
-        locations[i] = 16 + base + ABI_PIECE_OFFSET[i];
-    }
-    state[2] = base + align_to(type_size(ty), 8);
 }
 
 // Whether a function returning `ret` gets a result pointer (does not
@@ -389,12 +401,12 @@ fn return_piece_index(i: i64, float: *bool) -> i64 {
 
 // Whether function f follows C's convention.
 pub fn fn_uses_c(f: i64) -> bool {
-    OPT_LEVEL == 0 || FNS[f].is_extern || FNS[f].export || FNS[f].variadic || FNS[f].name == MAIN_SYM
+    unsafe { OPT_LEVEL == 0 || FNS[f].is_extern || FNS[f].export || FNS[f].variadic || FNS[f].name == MAIN_SYM }
 }
 
 // Whether calls through a pointer of fn type t follow C's convention.
 pub fn fn_type_uses_c(t: i64) -> bool {
-    OPT_LEVEL == 0 || TYPES[t].b != 0
+    unsafe { OPT_LEVEL == 0 || TYPES[t].b != 0 }
 }
 
 // How a value of type `ty` is passed under C's convention (c) or
@@ -428,7 +440,7 @@ pub fn tabi_classify(ty: i64) -> AbiClass {
     if leaves_as_pieces() {
         let mut i = 0;
         while i < ABI_LEAVES.count {
-            abi_add_piece(ir_type(ABI_LEAVES.data[i + 1]), ABI_LEAVES.data[i]);
+            unsafe { abi_add_piece(ir_type(ABI_LEAVES.data[i + 1]), ABI_LEAVES.data[i]); }
             i += 2;
         }
         return AbiClass::Pieces;
@@ -447,22 +459,24 @@ pub fn tabi_classify(ty: i64) -> AbiClass {
 
 // Whether the leaves just collected are at most four that do not overlap.
 fn leaves_as_pieces() -> bool {
-    let n = ABI_LEAVES.count / 2;
-    if n > 4 {
-        return false;
-    }
-    for i in 0..n {
-        let a = ABI_LEAVES.data[2 * i];
-        let a_end = a + type_size(ABI_LEAVES.data[2 * i + 1]);
-        for j in i + 1..n {
-            let b = ABI_LEAVES.data[2 * j];
-            let b_end = b + type_size(ABI_LEAVES.data[2 * j + 1]);
-            if a < b_end && b < a_end {
-                return false;
+    unsafe {
+        let n = ABI_LEAVES.count / 2;
+        if n > 4 {
+            return false;
+        }
+        for i in 0..n {
+            let a = ABI_LEAVES.data[2 * i];
+            let a_end = a + type_size(ABI_LEAVES.data[2 * i + 1]);
+            for j in i + 1..n {
+                let b = ABI_LEAVES.data[2 * j];
+                let b_end = b + type_size(ABI_LEAVES.data[2 * j + 1]);
+                if a < b_end && b < a_end {
+                    return false;
+                }
             }
         }
+        true
     }
-    true
 }
 
 // The machine register of return piece i of the last classified aggregate
