@@ -968,6 +968,9 @@ there are no unsigned vector types.
   slice or an array place (assigned, so a mutable one) of the lane type;
   checked as `load`.
 
+A static (or a constant aggregate) may hold vectors made by `vNtT(...)`
+or `vNtT::splat(x)` of constant lanes.
+
 Operands are evaluated left to right, the receiver of a method first;
 each vector operand's value is taken when it is evaluated. Nothing about
 vectors is undefined behaviour.
