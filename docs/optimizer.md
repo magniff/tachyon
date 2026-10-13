@@ -1006,3 +1006,55 @@ level, overlapping slices, a check failing part way),
 reductions, maps, stencils and explicit vector code over slices of
 random lengths and starts, overlapping slices of one array, slices too
 short for the loop. `--no-vectorize` turns the vectorizer off.
+
+## 0.10: profiles
+
+`tachyonc --profile-generate FILE` (at `-O1` or `-O2`) instruments the
+program: after lowering, every IR block starts by incrementing its
+counter (a 64-bit load, add and store), and `main` starts with a call to
+the runtime (`profile.tach` holds its source, added to the program as the
+module `__profile`), which allocates the counters and registers, with
+`atexit`, the function writing them to FILE when the program exits (also
+through `exit`, a failed check included):
+
+```
+tachyon-profile 1
+fn <symbol> <checksum> <blocks>
+<count of block 0>
+...
+```
+
+Functions are in the compiler's order, so the file is deterministic for a
+deterministic program; a run overwrites it. `--profile-use FILE` reads it
+at the same point, where the IR of a function is exactly what its source
+gives (the same in both compilations): the counts go to the blocks
+(`BLOCKS[b].count`, -1 where unknown) of each function whose symbol and
+checksum (of its blocks' operations, terminators and successors, in
+order) match. A function changed since keeps no counts, with
+`warning[profile]: the profile of 'f' is stale ...`; a file that cannot
+be read is a warning too. `-O0` ignores `--profile-use`.
+
+The counts are hints. Passes that copy blocks keep them (inlining scales
+a callee's counts by the call site's over the callee's entry; loop
+cloning copies them); blocks made later are unknown. They decide:
+
+- **block layout** (`layout.tach`): the counts are the blocks'
+  frequencies (unknown ones estimated: an edge's block as the lesser of
+  its ends, others from their predecessors' shares), a branch's
+  successors share in proportion to their counts, and blocks that never
+  ran go last with the cold ones;
+- **inlining**: a call site that never ran is cold (inlined only if that
+  costs no size), a hot one (a 32nd of the profile's largest count, 64 at
+  least) takes callees up to 240 instructions (30, doubled per loop level,
+  otherwise);
+- **unrolling and vectorization**: a loop that never ran is neither
+  unrolled nor vectorized; a hot one may grow twice as much (192
+  instructions) when unrolled partially.
+
+Not done: hot/cold function splitting, profile-guided register
+allocation and scheduling. Tested by `tests/run/opt_profile.tach` (the
+test runner's `PROFILE` directive compiles a case with
+`--profile-generate`, runs it, then checks it compiled with the profile:
+the rare way of a branch out of the fall-through, a hot call inlined)
+and `opt_profile_stale.tach` (a checked-in profile, stale for one
+function).

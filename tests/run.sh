@@ -57,9 +57,14 @@
 #   // FIXED: text       the rewritten copy has a line (not a comment)
 #                        containing text, one directive per line
 #   // FIXUNSAFE: why    (0.9) the same with tachyonc --fix-unsafe
-#   // FLAGS: flags      (0.9) more compiler options for the case
+#   // FLAGS: flags      (0.9) more compiler options for the case (0.10:
+#                        @ROOT@ stands for the root of the tree)
 #   // WARNING: text     (0.9) the case compiles with a warning containing
 #                        this text, one directive per message, in order
+#   // PROFILE: why      (0.10) at -O1 and -O2, the case is first compiled
+#                        with --profile-generate, run and checked; the
+#                        other directives then check it compiled with
+#                        --profile-use of that profile
 # Every case is compiled with --deny-warnings, except the ones with WARNING
 # directives (0.9's unsafe warnings are errors from 0.10; there are no
 # warnings at the moment).
@@ -166,6 +171,7 @@ read_directives() {
             else if (key == "FIXED") fixed = fixed value "\n"
             else if (key == "FLAGS") flags = flags " " value
             else if (key == "WARNING") warnings = warnings value "\n"
+            else if (key == "PROFILE") profile = 1
         }
         END {
             printf "%s", args > (dir "/args")
@@ -187,6 +193,7 @@ read_directives() {
             printf "%s", fixed > (dir "/fixed")
             printf "%s", flags > (dir "/flags")
             printf "%s", warnings > (dir "/warnings")
+            printf "%d", profile > (dir "/profile")
         }
     ' "$1"
 }
@@ -229,8 +236,12 @@ check_case() {
         2) fix_case "$source" "$dir" --fix-unsafe || return 1 ;;
     esac
     # The compiler's options for the case (0.9).
-    FLAGS="--deny-warnings $(cat "$dir/flags")"
-    [ -s "$dir/warnings" ] && FLAGS=$(cat "$dir/flags")
+    FLAGS="--deny-warnings $(sed "s|@ROOT@|$ROOT|g" "$dir/flags")"
+    # (A profile's warnings come at -O1 and -O2 only: -O0 reads none.)
+    if [ "$OPT" = -O0 ] && grep -q -- --profile-use "$dir/flags"; then
+        : >"$dir/warnings"
+    fi
+    [ -s "$dir/warnings" ] && FLAGS=$(sed "s|@ROOT@|$ROOT|g" "$dir/flags")
     if [ -s "$dir/errors" ]; then
         # shellcheck disable=SC2086
         "$COMPILER" --target "$TARGET" $OPT $FLAGS "$source" -o "$dir/prog.s" >"$dir/compile.out" 2>&1
@@ -260,6 +271,10 @@ check_case() {
         fi
         return 0
     fi
+    PFLAGS=""
+    if [ "$(cat "$dir/profile")" = 1 ] && ! profile_case "$source" "$dir"; then
+        return 1
+    fi
     if [ -s "$dir/asms" ] && ! check_asm "$source" "$dir"; then
         return 1
     fi
@@ -267,7 +282,9 @@ check_case() {
         return 1
     fi
     # shellcheck disable=SC2086
-    if ! "$COMPILER" --target "$TARGET" $OPT $FLAGS "$source" -o "$dir/$OUT" >"$dir/compile.out" 2>&1; then
+    [ "$OPT" = -O0 ] && PFLAGS=""
+    # shellcheck disable=SC2086
+    if ! "$COMPILER" --target "$TARGET" $OPT $FLAGS $PFLAGS "$source" -o "$dir/$OUT" >"$dir/compile.out" 2>&1; then
         { echo "compile failed:"; cat "$dir/compile.out"; } >"$dir/why"
         return 1
     fi
@@ -361,10 +378,37 @@ fix_case() {
     return 0
 }
 
+# PROFILE: case $1 compiled with --profile-generate, run and checked; then
+# FLAGS use the profile it wrote.
+profile_case() {
+    # (At the CHECK level: -O0 takes no profile.)
+    # shellcheck disable=SC2086
+    if ! "$COMPILER" --target "$TARGET" "-O$(cat "$2/checkopt")" $FLAGS --profile-generate "$2/profile.data" "$1" -o "$2/$OUT" >"$2/compile.out" 2>&1; then
+        { echo "--profile-generate failed:"; cat "$2/compile.out"; } >"$2/why"
+        return 1
+    fi
+    # shellcheck disable=SC2086
+    if ! "$CC" $LINK_FLAGS -o "$2/prog" "$2/$OUT" -lm >"$2/link.out" 2>&1; then
+        { echo "link failed (instrumented):"; cat "$2/link.out"; } >"$2/why"
+        return 1
+    fi
+    run_program "$2"
+    if [ "$RC" -ne "$(cat "$2/exit")" ] || [ "$(trimmed "$2/stdout")" != "$(trimmed "$2/expect")" ]; then
+        { echo "the instrumented program (exit $RC) printed:"; cat "$2/stdout"; } >"$2/why"
+        return 1
+    fi
+    if [ ! -s "$2/profile.data" ]; then
+        echo "the instrumented program wrote no profile" >"$2/why"
+        return 1
+    fi
+    PFLAGS="--profile-use $2/profile.data"
+    return 0
+}
+
 # Matches the CHECK directives against the optimized IR of $1.
 check_ir() {
     # shellcheck disable=SC2086
-    if ! "$COMPILER" --target "$TARGET" "-O$(cat "$2/checkopt")" $FLAGS --verify-ir --emit-ir "$1" -o "$2/ir.txt" >"$2/compile.out" 2>&1; then
+    if ! "$COMPILER" --target "$TARGET" "-O$(cat "$2/checkopt")" $FLAGS $PFLAGS --verify-ir --emit-ir "$1" -o "$2/ir.txt" >"$2/compile.out" 2>&1; then
         { echo "--emit-ir failed:"; cat "$2/compile.out"; } >"$2/why"
         return 1
     fi
@@ -376,7 +420,7 @@ check_ir() {
 # Matches the ASM directives against the assembly of $1 for the target.
 check_asm() {
     # shellcheck disable=SC2086
-    if ! "$COMPILER" --target "$TARGET" "-O$(cat "$2/checkopt")" $FLAGS "$1" -o "$2/check.s" >"$2/compile.out" 2>&1; then
+    if ! "$COMPILER" --target "$TARGET" "-O$(cat "$2/checkopt")" $FLAGS $PFLAGS "$1" -o "$2/check.s" >"$2/compile.out" 2>&1; then
         { echo "compile failed:"; cat "$2/compile.out"; } >"$2/why"
         return 1
     fi

@@ -14,6 +14,8 @@ $ tachyonc --fix-imports prog.tach   # rewrite 0.7's `*` imports and plain heade
 $ tachyonc --emit-header prog.tach -o prog.h        # the program's C header
 $ tachyonc --tokens file.tach        # the token dump (same format as the seed's `tachyon tokens`)
 $ tachyonc --version                 # the release and the host
+$ tachyonc --profile-generate p.prof prog.tach -o prog.o   # instrument (0.10)
+$ tachyonc --profile-use p.prof prog.tach -o prog.o        # optimize with the counts
 ```
 
 It accepts the whole language of [docs/grammar.md](../docs/grammar.md) and

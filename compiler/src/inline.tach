@@ -27,12 +27,15 @@ use crate::opt::{optimize_after_inlining, resolve_all};
 use crate::loops::{LP_DEPTH, analyze_loops, block_array, innermost_loop};
 use crate::fold::is_const;
 use crate::ipo::devirtualize;
+use crate::profile::{is_cold_block, is_hot_count};
 use crate::regalloc::calls_returns_twice;
 
 const INLINE_SMALL: i64 = 30;
 const INLINE_ONCE: i64 = 400;
 const INLINE_BUDGET: i64 = 3000;
 const INLINE_ROUNDS: i64 = 3;
+// The size a hot call site's callee may have (0.10, profiles).
+const INLINE_HOT: i64 = 240;
 // The bonus per constant argument whose parameter decides a branch, a
 // switch or an arithmetic operation of the callee.
 const CONST_ARG_BONUS: i64 = 10;
@@ -385,11 +388,16 @@ fn should_inline(fi: i64, g: i64, call: i64) -> bool {
         }
         let b = INSTS[call].block;
         let once = FN_CALLS[g] == 1 && FN_ADDRESS[g] == 0 && !fn_is_global(gf);
-        if site_cold(b) {
+        // (0.10: with a profile, a call that never ran is cold, and a hot one
+        // takes a callee up to INLINE_HOT)
+        if site_cold(b) || is_cold_block(b) {
             // In a cold block, only when that makes the program no bigger.
             return once || inline_cost(g, call) <= 0;
         }
         if once && FN_SIZE[g] <= INLINE_ONCE {
+            return true;
+        }
+        if is_hot_count(BLOCKS[b].count) && inline_cost(g, call) <= INLINE_HOT {
             return true;
         }
         let depth = site_depth(b);
@@ -448,6 +456,17 @@ pub fn inline_calls(fi: i64) -> bool {
         }
         changed
     }
+}
+
+// The count of a block of a callee (that ran `count` times, its entry
+// `entry` times) inlined at a call site that ran `site` times (0.10), or
+// -1.
+fn scaled_count(count: i64, site: i64, entry: i64) -> i64 {
+    if count < 0 || site < 0 || entry <= 0 {
+        return -1;
+    }
+    let x = count as f64 * site as f64 / entry as f64;
+    if x > 1099511627776.0 { 1099511627776 } else { x as i64 }
 }
 
 // Records the loop depth and coldness of a block made after
@@ -520,6 +539,7 @@ fn inline_call(fi: i64, call: i64, g: i64) -> i64 {
         // The continuation: the instructions after the call, and b's end.
         let cont = ir_new_block();
         BLOCKS[cont].sealed = 1;
+        BLOCKS[cont].count = BLOCKS[b].count;
         let mut v = INSTS[call].next;
         while v != 0 {
             let next = INSTS[v].next;
@@ -555,6 +575,7 @@ fn inline_call(fi: i64, call: i64, g: i64) -> i64 {
             BLOCKS[nb].sealed = 1;
             BLOCKS[nb].loop_depth = 1;
             BLOCKS[nb].novec = BLOCKS[gb].novec;
+            BLOCKS[nb].count = scaled_count(BLOCKS[gb].count, BLOCKS[b].count, BLOCKS[IRFUNCS[g].entry].count);
             BLOCKS[gb].aux = nb;
             let mut gv = BLOCKS[gb].first;
             while gv != 0 {

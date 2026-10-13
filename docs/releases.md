@@ -52,6 +52,14 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   block where a function has several unsafe operations), and the
   bootstrap builds 0.10 through the interface `tachyonc-0.10`, which does
   not pass it. Releases before 0.10 are built as before.
+- **Vector types** `v2f64`, `v4f32`, `v2i64`, `v4i32`, `v8i16`, `v16i8`:
+  lanewise arithmetic, masks, select, lanes, sums, checked loads and
+  stores (grammar.md, "Additions of 0.10"); NEON and SSE2. Their names are
+  reserved (breaking, for programs naming an item so).
+- **Loop vectorizer** for counted loops over slices and arrays, guarded
+  at run time; `--no-vectorize`; `tests/fuzz/run.sh -V`.
+- **Profiles**: `--profile-generate FILE` and `--profile-use FILE` (block
+  layout, inlining, unrolling).
 
 ### What's new in 0.9 (in progress)
 

@@ -421,9 +421,17 @@ written against 0.5's unbounded generics mean.
   overlapping slices, checks failing part way
 - done: vector loops of small bodies run two vectors an iteration (own
   accumulators); invariant splats before the loop; optimizer.md "0.10"
-- in progress: profile-guided optimization
-- remaining: NEON/SSE2 lowering; loop vectorizer with
-  run-time trip counts; profile-guided optimization; SLP; GVN-PRE
+- done: profile-guided optimization (profile.tach): `--profile-generate
+  FILE` (block counters, written at exit by a small runtime added to the
+  program), `--profile-use FILE` (counts per function, checked by a
+  checksum of its IR: stale profiles ignored with a warning) for block
+  layout, inlining (hot call sites), unrolling and vectorization (cold
+  loops); the test runner's `PROFILE` directive
+- in progress: -
+- remaining: SLP vectorizer; outer-loop vectorization (matmul's inner
+  loop is a float sum, which may not be reassociated); scalar unrolling
+  with run-time trip counts; GVN-PRE; interp's slowdown; a checking mode
+  for unsafe code
 
 Vectorization:
 - SLP vectorizer
