@@ -411,7 +411,12 @@ written against 0.5's unbounded generics mean.
   emitters and both encoders; vectors in the float registers (never
   d8-d15, whose upper halves calls do not keep), 16-byte spill slots;
   not FFI-safe
-- in progress: loop vectorizer
+- done: loop vectorizer (vectorize.tach): innermost counted loops with
+  unit-stride loads and stores of one type and integer reductions, a
+  vector loop guarded at run time (bounds checks proven for the whole
+  loop, no overlap between stores and other accesses) and the original
+  loop as the remainder and the fallback; `--no-vectorize`
+- in progress: vectorizing fuzz mode, benchmarks
 - remaining: NEON/SSE2 lowering; loop vectorizer with
   run-time trip counts; profile-guided optimization; SLP; GVN-PRE
 
