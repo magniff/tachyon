@@ -79,6 +79,8 @@ e.g. `use crate::ir::Op::{Add, Sub};`; 0.8 has no `*` imports, and
 | `range.tach` | value ranges and facts: bounds-check elimination, comparison folding, jump threading, comparison chains to switches |
 | `scev.tach` | induction variables, trip counts, exit values, dead loop deletion, unrolling |
 | `tre.tach` | tail recursion elimination with accumulators |
+| `vectorize.tach` | the loop vectorizer (0.10): innermost and outer loops, run-time guards, remainders |
+| `profile.tach` | profiles (0.10): instrumentation, the runtime's source, reading a profile |
 | `regalloc.tach` | block layout, liveness, linear-scan register allocation |
 | `emit.tach` | emission of the allocated IR: operands, parallel moves, calls, frames |
 | `mc_arm64.tach` | AArch64 instructions on physical registers |
