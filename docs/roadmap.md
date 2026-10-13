@@ -419,7 +419,9 @@ written against 0.5's unbounded generics mean.
 - done: `tests/fuzz/run.sh -V` (genvec.awk): reductions, maps, stencils
   and explicit vector code over slices of random lengths and starts,
   overlapping slices, checks failing part way
-- in progress: benchmarks
+- done: vector loops of small bodies run two vectors an iteration (own
+  accumulators); invariant splats before the loop; optimizer.md "0.10"
+- in progress: profile-guided optimization
 - remaining: NEON/SSE2 lowering; loop vectorizer with
   run-time trip counts; profile-guided optimization; SLP; GVN-PRE
 

@@ -914,3 +914,95 @@ arithmetic: wrapping, shifts modulo the width), 2,000 times per rule and
 type; a rule that differs once fails. `--no-egraph` turns the rules off,
 to compare. The e-graph costs about 3% of the compiler's self-compile at
 `-O2`.
+
+## 0.10: vectors
+
+**Vector values.** The vector types of the language (`v2f64`, `v4f32`,
+`v2i64`, `v4i32`, `v8i16`, `v16i8`; grammar.md) are compound in the
+front end: an expression's value is the address of its 16 bytes, as for
+a struct. Lowering loads a vector operand once (when it is evaluated),
+computes with the vector instructions (`vbin.op`, `vcmp.cond`, `vsplat`,
+`vext`, `vins`, `vsum`, `vneg`, `vsel`) and stores the result into a new
+slot; scalar replacement keeps a vector slot's leaf whole, so the slots
+become SSA values. `-O0` computes lane by lane, through frame slots: it
+shares nothing with the vector instructions, and stays the oracle. Calls
+pass vectors as structs of their lanes (tachyon's convention); C's
+conventions for vectors are not supported (vectors are not FFI-safe).
+
+The vector instructions are pure, GVN numbers them and LICM moves them;
+nothing folds them, and the e-graph's rules (integer patterns) never
+match them. In the back end a vector lives in a float register as its
+128 bits: q/v registers on AArch64 (never d8-d15, whose upper halves a
+call does not keep: a vector interval's register class leaves them out),
+xmm on x86-64, both caller-saved; spills take two adjacent 8-byte slots,
+the spill area then 16-aligned. Each instruction is one NEON instruction
+on AArch64, except a 64-bit multiplication (lane by lane in x16 and
+x17). SSE2 has no 8-, 32- or 64-bit multiplication, no 64-bit
+comparison, and moves lanes to and from the integer registers poorly:
+those go lane by lane through the red zone below `%rsp` (System V
+leaves 128 bytes there for the function; nothing else in the generated
+code uses it). Both encoders (`enc_arm64.tach`, `enc_x86.tach`) learned
+the instructions; `tests/objcheck.sh` checks them against `cc -c`. AVX2
+is not used: Rosetta, where x86-64 is tested on Apple silicon, has none.
+
+**The loop vectorizer** (`vectorize.tach`, after the value ranges and
+before strength reduction). A candidate is an innermost counted loop
+(an induction variable `i` from `start`, step 1, to `n`, the latch's test
+`i + 1 < n` or `!=`) whose blocks form a chain from the header to the
+latch, each branching out only to checks that fail (blocks ending in
+`unreachable`). Every instruction is classified:
+
+- *uniform*: computed from `i` and loop invariants by pure operations
+  (addresses, indices), with its coefficient of `i` when it is affine
+  (`coef`); copied into the vector loop, where `i` is the first lane's;
+- *vector*: a load or store whose address has coefficient size(T)
+  (unit stride), arithmetic on such values (`+ - *`, `/` on floats,
+  `& | ^`, negation), and reductions: a header phi `r` whose next value is
+  `r op x` (op one of `+ - * & | ^`, integers only: a float sum would be
+  reassociated, which changes its rounding); the other operand of a
+  vector operation is a vector or the same in every iteration (a splat);
+- *skipped*: the latch's test and the checks (`idx <u len` with idx
+  uniform of coefficient 1, len invariant).
+
+All vector values have one element type T (an unsigned type uses the
+signed vector of its width; reductions convert back), so VF = 16 /
+size(T) lanes. Loops with calls, other phis, other control flow,
+non-unit or unknown strides, comparisons that are values, or a load from
+an invariant address in a loop that stores, are left alone.
+
+The transformation keeps the original loop as the remainder and the
+fallback, and puts before it:
+
+```
+C:  trips = n - start
+    ok = trips >= U*VF
+         && for each check: lo = idx(start) >= 0 && hi = idx(n-1) >= lo && hi < len
+         && for each store S and access A at another address:
+            [S(start), S(n-1)+size) and [A(start), A(n-1)+size) disjoint
+    branch ok, VP, SP
+VP: splats of invariants, the reductions' first vectors (the scalar start
+    in lane 0, the identity in the others; zeros for the further copies),
+    vend = start + (trips & -(U*VF))
+VH: U copies of the body (U = 2 for bodies of up to 40 instructions,
+    each copy with its own accumulators); i += U*VF; branch i != vend
+VX: accumulators combined, summed across lanes; branch vend == n, E, SP
+SP: i and the reductions from C or from VX; the scalar loop
+```
+
+`hi >= lo` catches an index that would wrap (the trip count is below
+2^63). So the vector loop runs exactly when the scalar loop would run
+every iteration without a failing check and without a store reaching
+memory another access (at a different address) reads or writes; else the
+scalar loop runs from where the vector loop stopped, or from the start,
+and stops where it would, at the same iteration. Exit values: the
+reductions' results, and uniform values at the last iteration (computed
+after the vector loop). The scalar loop's header is marked (`novec`,
+kept by inlining and cloning) so that it is not vectorized again;
+partial unrolling leaves the loops the vectorizer takes to it.
+
+Tested by `tests/run/opt_vectorize.tach` (IR and assembly checks, every
+level, overlapping slices, a check failing part way),
+`tests/run/vector_*.tach`, and `tests/fuzz/run.sh -V`: random
+reductions, maps, stencils and explicit vector code over slices of
+random lengths and starts, overlapping slices of one array, slices too
+short for the loop. `--no-vectorize` turns the vectorizer off.

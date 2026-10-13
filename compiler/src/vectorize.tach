@@ -58,6 +58,7 @@ pub static mut VECTORIZE: bool = true;
 const VEC_MAX_INSTS: i64 = 160;
 const VEC_MAX_CHECKS: i64 = 8;
 const VEC_MAX_OVERLAPS: i64 = 8;
+const VEC_UNROLL_SIZE: i64 = 40;
 
 // The classes of the loop's instructions (INSTS[v].aux, while INSTS[v].mark
 // is the analysis' stamp).
@@ -70,6 +71,9 @@ static mut VSTAMP: i64 = 4398046511104;
 // The loop being vectorized.
 static mut V_IV: i64 = 0;
 static mut V_N: i64 = 0;
+static mut V_START: i64 = 0;
+// The number of instructions of the loop.
+static mut V_SIZE: i64 = 0;
 static mut V_NE: bool = false;
 static mut V_ELEM: i64 = 0;
 static mut V_VT: i64 = 0;
@@ -344,6 +348,7 @@ fn analyze(l: i64, exit: *i64) -> bool {
                 v = INSTS[v].next;
             }
         }
+        V_SIZE = total;
         if V_ELEM == 0 || (V_HAS_ULOAD && V_HAS_STORE) {
             return false;
         }
@@ -659,14 +664,59 @@ fn vector_of(v: i64, vh: i64, vp: i64, l: i64) -> i64 {
             }
             k += 2;
         }
-        let s = ir_make(VSplat, V_VT, map_get(x), 0, 0);
-        if invariant_in(l, x) {
+        if invariant_in(l, x) || !loads_in(l, x) {
+            // The same in every iteration (coefficient 0, no load): computed
+            // once, before the loop.
+            let s = ir_make(VSplat, V_VT, eval_at(l, x, V_START, vp), 0, 0);
             ir_append(vp, s);
             map_put(key, s);
-        } else {
-            ir_append(vh, s);
+            return s;
         }
+        let s = ir_make(VSplat, V_VT, map_get(x), 0, 0);
+        ir_append(vh, s);
         s
+    }
+}
+
+// One copy of the loop's body in block vh (V_MAP maps the induction
+// variable and the reductions' phis).
+fn emit_body(l: i64, vh: i64, vp: i64) {
+    unsafe {
+        let vt = V_VT;
+        for k in 0..V_CHAIN.count {
+            let mut v = BLOCKS[V_CHAIN.data[k]].first;
+            while v != 0 {
+                let cls = class_of(v);
+                let op = INSTS[v].op;
+                if op == Phi || cls == VC_SKIP {
+                    v = INSTS[v].next;
+                    continue;
+                }
+                if cls == VC_UNIFORM {
+                    let nv = ir_make(op, INSTS[v].ty, map_get(INSTS[v].a), map_get(INSTS[v].b), INSTS[v].imm);
+                    INSTS[nv].imm2 = INSTS[v].imm2;
+                    INSTS[nv].cond = INSTS[v].cond;
+                    ir_append(vh, nv);
+                    map_put(v, nv);
+                } else if op == Load {
+                    let nv = append(vh, Load, vt, map_get(INSTS[v].a), 0, INSTS[v].imm);
+                    map_put(v, nv);
+                } else if op == Store {
+                    let value = vector_of(INSTS[v].b, vh, vp, l);
+                    let nv = append(vh, Store, 0, map_get(INSTS[v].a), value, INSTS[v].imm);
+                    INSTS[nv].imm2 = vt;
+                } else if op == Neg {
+                    let nv = append(vh, VNeg, vt, vector_of(INSTS[v].a, vh, vp, l), 0, 0);
+                    map_put(v, nv);
+                } else {
+                    let a = vector_of(INSTS[v].a, vh, vp, l);
+                    let b = vector_of(INSTS[v].b, vh, vp, l);
+                    let nv = append(vh, VBin, vt, a, b, op as i64);
+                    map_put(v, nv);
+                }
+                v = INSTS[v].next;
+            }
+        }
     }
 }
 
@@ -687,6 +737,7 @@ fn vectorize_loop(fi: i64, l: i64) -> bool {
         let h = loop_header(l);
         let p = loop_preheader(l);
         let start = ir_val(ir_arg(V_IV, pred_index(h, p)));
+        V_START = start;
         let vf = V_VF;
         let elem = V_ELEM;
         let vt = V_VT;
@@ -708,7 +759,9 @@ fn vectorize_loop(fi: i64, l: i64) -> bool {
         BLOCKS[c].preds.push(p);
         let n = V_N;
         let trips = append(c, Sub, TY_I64, n, start, 0);
-        let mut ok = cmp(c, Cond::Ge, TY_U64, trips, konst(c, vf, TY_I64));
+        // Small bodies run two vectors an iteration.
+        let unroll = if V_SIZE <= VEC_UNROLL_SIZE { 2 } else { 1 };
+        let mut ok = cmp(c, Cond::Ge, TY_U64, trips, konst(c, unroll * vf, TY_I64));
         let last = append(c, Sub, TY_I64, n, konst(c, 1, TY_I64), 0);
         for k in 0..V_CHECKS.count / 3 {
             let idx = V_CHECKS.data[3 * k + 1];
@@ -744,10 +797,11 @@ fn vectorize_loop(fi: i64, l: i64) -> bool {
         }
         ir_terminate(c, Term::Branch, ok, vp, sp);
         // VP: the vector preheader.
-        let mask = konst(vp, 0 - vf, TY_I64);
+        let mask = konst(vp, 0 - unroll * vf, TY_I64);
         let vtrips = append(vp, And, TY_I64, trips, mask, 0);
         let vend = append(vp, Add, TY_I64, start, vtrips, 0);
         let mut red_init = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut red_id = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for r in 0..V_REDS.count / 3 {
             let phi = V_REDS.data[3 * r];
             let raw = V_REDS.data[3 * r + 2];
@@ -756,9 +810,11 @@ fn vectorize_loop(fi: i64, l: i64) -> bool {
             let id = append(vp, VSplat, vt, konst(vp, identity(op), lt), 0, 0);
             let first = append(vp, VIns, vt, id, init, 0);
             red_init.push(first);
+            red_id.push(id);
         }
         ir_terminate(vp, Term::Jump, 0, vh, 0);
-        // VH: the vector loop.
+        // VH: the vector loop, `unroll` copies of the body (each with its
+        // own accumulators, combined after the loop).
         let viv = ir_make(Phi, INSTS[V_IV].ty, 0, 0, 0);
         INSTS[viv].args = ARGS.count;
         INSTS[viv].nargs = 2;
@@ -767,70 +823,68 @@ fn vectorize_loop(fi: i64, l: i64) -> bool {
         ARGS.push(0);
         ARGTY.push(0);
         ir_append(vh, viv);
-        map_put(V_IV, viv);
         let mut red_phis = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for r in 0..V_REDS.count / 3 {
-            let rp = ir_make(Phi, vt, 0, 0, 0);
-            INSTS[rp].args = ARGS.count;
-            INSTS[rp].nargs = 2;
-            ARGS.push(red_init.data[r]);
-            ARGTY.push(0);
-            ARGS.push(0);
-            ARGTY.push(0);
-            ir_append(vh, rp);
-            map_put(V_REDS.data[3 * r], rp);
-            red_phis.push(rp);
-        }
-        for k in 0..V_CHAIN.count {
-            let mut v = BLOCKS[V_CHAIN.data[k]].first;
-            while v != 0 {
-                let cls = class_of(v);
-                let op = INSTS[v].op;
-                if op == Phi || cls == VC_SKIP {
-                    v = INSTS[v].next;
-                    continue;
-                }
-                if cls == VC_UNIFORM {
-                    let nv = ir_make(op, INSTS[v].ty, map_get(INSTS[v].a), map_get(INSTS[v].b), INSTS[v].imm);
-                    INSTS[nv].imm2 = INSTS[v].imm2;
-                    INSTS[nv].cond = INSTS[v].cond;
-                    ir_append(vh, nv);
-                    map_put(v, nv);
-                } else if op == Load {
-                    let nv = append(vh, Load, vt, map_get(INSTS[v].a), 0, INSTS[v].imm);
-                    map_put(v, nv);
-                } else if op == Store {
-                    let value = vector_of(INSTS[v].b, vh, vp, l);
-                    let nv = append(vh, Store, 0, map_get(INSTS[v].a), value, INSTS[v].imm);
-                    INSTS[nv].imm2 = vt;
-                } else if op == Neg {
-                    let nv = append(vh, VNeg, vt, vector_of(INSTS[v].a, vh, vp, l), 0, 0);
-                    map_put(v, nv);
-                } else {
-                    let a = vector_of(INSTS[v].a, vh, vp, l);
-                    let b = vector_of(INSTS[v].b, vh, vp, l);
-                    let nv = append(vh, VBin, vt, a, b, op as i64);
-                    map_put(v, nv);
-                }
-                v = INSTS[v].next;
+        let mut red_nexts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for u in 0..unroll {
+            for r in 0..V_REDS.count / 3 {
+                let rp = ir_make(Phi, vt, 0, 0, 0);
+                INSTS[rp].args = ARGS.count;
+                INSTS[rp].nargs = 2;
+                ARGS.push(if u == 0 { red_init.data[r] } else { red_id.data[r] });
+                ARGTY.push(0);
+                ARGS.push(0);
+                ARGTY.push(0);
+                ir_append(vh, rp);
+                red_phis.push(rp);
             }
         }
-        let vnext = append(vh, Add, INSTS[V_IV].ty, viv, konst(vh, vf, INSTS[V_IV].ty), 0);
+        for u in 0..unroll {
+            // A fresh map per copy (the splats of invariants stay).
+            let mut k = 0;
+            let mut kept = 0;
+            while k < V_MAP.count {
+                if V_MAP.data[k] < 0 {
+                    V_MAP.data[kept] = V_MAP.data[k];
+                    V_MAP.data[kept + 1] = V_MAP.data[k + 1];
+                    kept += 2;
+                }
+                k += 2;
+            }
+            V_MAP.count = kept;
+            if u == 0 {
+                map_put(V_IV, viv);
+            } else {
+                map_put(V_IV, append(vh, Add, INSTS[V_IV].ty, viv, konst(vh, u * vf, INSTS[V_IV].ty), 0));
+            }
+            for r in 0..V_REDS.count / 3 {
+                map_put(V_REDS.data[3 * r], red_phis.data[u * (V_REDS.count / 3) + r]);
+            }
+            emit_body(l, vh, vp);
+            for r in 0..V_REDS.count / 3 {
+                red_nexts.push(map_get(V_REDS.data[3 * r + 1]));
+            }
+        }
+        let vnext = append(vh, Add, INSTS[V_IV].ty, viv, konst(vh, unroll * vf, INSTS[V_IV].ty), 0);
         ir_set_arg(viv, 1, vnext);
-        for r in 0..V_REDS.count / 3 {
-            ir_set_arg(red_phis.data[r], 1, map_get(V_REDS.data[3 * r + 1]));
+        for i in 0..red_phis.count {
+            ir_set_arg(red_phis.data[i], 1, red_nexts.data[i]);
         }
         let more = cmp(vh, Cond::Ne, TY_I64, vnext, vend);
         // (Its predecessors: vp, then vh, the phis' operand order.)
         ir_terminate(vh, Term::Branch, more, vh, vx);
         // VX: the reductions summed.
         let mut red_final = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for r in 0..V_REDS.count / 3 {
+        let nr = V_REDS.count / 3;
+        for r in 0..nr {
             let phi = V_REDS.data[3 * r];
             let raw = V_REDS.data[3 * r + 2];
             let op = raw as Op;
             let ty = INSTS[phi].ty;
-            let vec = map_get(V_REDS.data[3 * r + 1]);
+            let mut vec = red_nexts.data[r];
+            for u in 1..unroll {
+                let comb = if op == Sub { Add } else { op };
+                vec = append(vx, VBin, vt, vec, red_nexts.data[u * nr + r], comb as i64);
+            }
             let mut s = 0;
             if op == Add || op == Sub {
                 s = append(vx, VSum, lt, vec, 0, 0);
@@ -888,6 +942,8 @@ fn vectorize_loop(fi: i64, l: i64) -> bool {
         BLOCKS[h].novec = 1;
         free(vals.data as *u8);
         free(red_init.data as *u8);
+        free(red_id.data as *u8);
+        free(red_nexts.data as *u8);
         free(red_phis.data as *u8);
         free(red_final.data as *u8);
         true
