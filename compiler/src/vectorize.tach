@@ -951,6 +951,30 @@ fn vectorize_loop(fi: i64, l: i64) -> bool {
     }
 }
 
+// Whether loop l is no candidate at a glance: a call, a copy, no memory
+// access, or too big (before the costlier analysis).
+fn quick_reject(l: i64) -> bool {
+    unsafe {
+        let mut n = 0;
+        let mut memory = false;
+        for i in 0..loop_size(l) {
+            let mut v = BLOCKS[loop_block(l, i)].first;
+            while v != 0 {
+                let op = INSTS[v].op;
+                if op.is_call() || op == Op::Copy || op.is_vector() {
+                    return true;
+                }
+                if op == Load || op == Store {
+                    memory = true;
+                }
+                n += 1;
+                v = INSTS[v].next;
+            }
+        }
+        !memory || n > VEC_MAX_INSTS
+    }
+}
+
 // Vectorizes the innermost loops of fi that can be; returns whether any
 // was.
 pub fn vectorize_loops(fi: i64) -> bool {
@@ -961,21 +985,29 @@ pub fn vectorize_loops(fi: i64) -> bool {
         canonicalize_loops(fi);
         let mut headers = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for l in 0..loop_count() {
-            if is_innermost(l) && loop_header(l) != IRFUNCS[fi].entry && BLOCKS[loop_header(l)].novec == 0 {
+            if is_innermost(l) && loop_header(l) != IRFUNCS[fi].entry && BLOCKS[loop_header(l)].novec == 0
+                && !is_cold_block(loop_header(l)) && !quick_reject(l) {
                 headers.push(loop_header(l));
             }
         }
         let mut changed = false;
+        // (The loops are found again after a change only.)
+        let mut stale = false;
         for i in 0..headers.count {
-            canonicalize_loops(fi);
+            if stale {
+                canonicalize_loops(fi);
+                stale = false;
+            }
             let l = innermost_loop(headers.data[i]);
             if l < 0 || loop_header(l) != headers.data[i] || !is_canonical(l) {
                 continue;
             }
-            form_lcssa(fi, l);
-            resolve_all(fi);
+            if form_lcssa(fi, l) {
+                resolve_all(fi);
+            }
             if vectorize_loop(fi, l) {
                 changed = true;
+                stale = true;
                 resolve_all(fi);
                 verify_func(fi, c"vectorization");
             }
@@ -985,8 +1017,6 @@ pub fn vectorize_loops(fi: i64) -> bool {
     }
 }
 
-// Whether loop l would be vectorized (for unrolling, which leaves it to
-// the vectorizer then).
 // Returns the lanes (0: not vectorizable).
 pub fn vectorizable_lanes(l: i64) -> i64 {
     let mut e = 0;
