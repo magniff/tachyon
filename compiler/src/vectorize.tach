@@ -36,16 +36,17 @@ use crate::types::{
 };
 use crate::ir::{
     ARGS, ARGTY, BLOCKS, Cond, INSTS, IRF, IRFUNCS, Op, Term, ir_append, ir_arg, ir_make,
-    ir_new_block, ir_set_arg, ir_terminate, ir_val, pred_index, verify_func,
+    ir_new_block, ir_set_arg, ir_terminate, ir_val, pred_index, verify_func, ir_insert_before,
 };
 use crate::opt::resolve_all;
 use crate::fold::is_const;
 use crate::loops::{
     add_pred_values, canonicalize_loops, form_lcssa, innermost_loop, invariant_in, is_canonical,
     is_innermost, loop_block, loop_contains, loop_count, loop_header, loop_latch, loop_preheader,
-    loop_size, new_phi_in,
+    loop_size, new_phi_in, LP_PARENT, LP_LIST2, clone_region, mark_loop_blocks,
 };
-use crate::scev::counted_loop;
+use crate::scev::{counted_loop, iv_step};
+use crate::gvn::address_base;
 use crate::profile::is_cold_block;
 use crate::range::bits_of_value;
 use crate::ir::Op::{
@@ -58,7 +59,7 @@ pub static mut VECTORIZE: bool = true;
 
 const VEC_MAX_INSTS: i64 = 160;
 const VEC_MAX_CHECKS: i64 = 8;
-const VEC_MAX_OVERLAPS: i64 = 8;
+const VEC_MAX_OVERLAPS: i64 = 16;
 const VEC_UNROLL_SIZE: i64 = 40;
 
 // The classes of the loop's instructions (INSTS[v].aux, while INSTS[v].mark
@@ -73,6 +74,10 @@ static mut VSTAMP: i64 = 4398046511104;
 static mut V_IV: i64 = 0;
 static mut V_N: i64 = 0;
 static mut V_START: i64 = 0;
+// The inner loop's induction variable (outer loops, see below), or 0.
+static mut V_IV2: i64 = 0;
+// The inner loop's induction variable's last value (a constant).
+static mut V_LAST2: i64 = 0;
 // The number of instructions of the loop.
 static mut V_SIZE: i64 = 0;
 static mut V_NE: bool = false;
@@ -114,10 +119,19 @@ fn set_class(v: i64, c: i64) {
 const NONAFFINE: i64 = 9223372036854775807;
 
 fn coef(l: i64, v: i64) -> i64 {
+    coef_wrt(l, v, V_IV, V_IV2)
+}
+
+// The coefficient of induction variable `iv` in v, where `other` (another
+// induction variable, of an inner loop, or 0) counts as invariant.
+fn coef_wrt(l: i64, v: i64, iv: i64, other: i64) -> i64 {
     unsafe {
         let x = ir_val(v);
-        if x == V_IV {
+        if x == iv {
             return 1;
+        }
+        if x == other && other != 0 {
+            return 0;
         }
         if invariant_in(l, x) {
             return 0;
@@ -126,8 +140,8 @@ fn coef(l: i64, v: i64) -> i64 {
             return NONAFFINE;
         }
         let op = INSTS[x].op;
-        let a = if INSTS[x].a != 0 { coef(l, INSTS[x].a) } else { 0 };
-        let b = if INSTS[x].b != 0 { coef(l, INSTS[x].b) } else { 0 };
+        let a = if INSTS[x].a != 0 { coef_wrt(l, INSTS[x].a, iv, other) } else { 0 };
+        let b = if INSTS[x].b != 0 { coef_wrt(l, INSTS[x].b, iv, other) } else { 0 };
         if a == NONAFFINE || b == NONAFFINE {
             return NONAFFINE;
         }
@@ -217,6 +231,7 @@ fn analyze(l: i64, exit: *i64) -> bool {
         V_ELEM = 0;
         V_HAS_STORE = false;
         V_HAS_ULOAD = false;
+        V_IV2 = 0;
         V_CHAIN.count = 0;
         V_CHECKS.count = 0;
         V_ACCESS.count = 0;
@@ -350,7 +365,7 @@ fn analyze(l: i64, exit: *i64) -> bool {
             }
         }
         V_SIZE = total;
-        if V_ELEM == 0 || (V_HAS_ULOAD && V_HAS_STORE) {
+        if V_ELEM == 0 {
             return false;
         }
         V_VF = 16 / type_size(V_ELEM);
@@ -464,22 +479,61 @@ fn is_check(c: i64) -> bool {
     }
 }
 
-// The number of runtime overlap tests the accesses need.
+// The accesses grouped by the base of their address (the address less a
+// constant): (base, lowest offset, highest offset + size, whether one
+// stores) quadruples. An access's offset adds its constant to its
+// instruction's.
+static mut V_GROUPS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// Groups the accesses; false when a group stores and holds accesses at
+// different offsets (a dependence the overlap test would always find).
+fn build_groups() -> bool {
+    unsafe {
+        V_GROUPS.count = 0;
+        for i in 0..V_ACCESS.count / 3 {
+            let a = V_ACCESS.data[3 * i];
+            let mut off = INSTS[a].imm;
+            let base = ir_val(address_base(V_ACCESS.data[3 * i + 1], &off));
+            let end = off + V_ACCESS.data[3 * i + 2];
+            let store = INSTS[a].op == Store;
+            let mut g = 0;
+            while g < V_GROUPS.count && V_GROUPS.data[g] != base {
+                g += 4;
+            }
+            if g == V_GROUPS.count {
+                V_GROUPS.push(base);
+                V_GROUPS.push(off);
+                V_GROUPS.push(end);
+                V_GROUPS.push(if store { 1 } else { 0 });
+                continue;
+            }
+            let same = V_GROUPS.data[g + 1] == off && V_GROUPS.data[g + 2] == end;
+            if !same && (store || V_GROUPS.data[g + 3] != 0) {
+                return false;
+            }
+            if off < V_GROUPS.data[g + 1] { V_GROUPS.data[g + 1] = off; }
+            if end > V_GROUPS.data[g + 2] { V_GROUPS.data[g + 2] = end; }
+            if store { V_GROUPS.data[g + 3] = 1; }
+        }
+        true
+    }
+}
+
+// The number of runtime overlap tests the groups need (each storing group
+// against every other); a large number when they cannot be.
 fn overlap_pairs() -> i64 {
     unsafe {
-        let n = V_ACCESS.count / 3;
+        if !build_groups() {
+            return 1000000;
+        }
+        let n = V_GROUPS.count / 4;
         let mut count = 0;
         for i in 0..n {
-            let a = V_ACCESS.data[3 * i];
-            if INSTS[a].op != Store {
+            if V_GROUPS.data[4 * i + 3] == 0 {
                 continue;
             }
             for j in 0..n {
-                let b = V_ACCESS.data[3 * j];
-                if j == i || (INSTS[b].op == Store && j < i) {
-                    continue;
-                }
-                if !same_address(a, b) {
+                if j != i && (V_GROUPS.data[4 * j + 3] == 0 || j > i) {
                     count += 1;
                 }
             }
@@ -488,10 +542,76 @@ fn overlap_pairs() -> i64 {
     }
 }
 
-// Whether accesses a and b are at the same address in every iteration.
-fn same_address(a: i64, b: i64) -> bool {
+// Appends to block c the test that groups i and j do not overlap (over
+// all iterations: one wholly below the other) to *ok.
+fn group_test(l: i64, c: i64, i: i64, j: i64, ok: i64, start: i64, last: i64, start2: i64, last2: i64) -> i64 {
     unsafe {
-        ir_val(INSTS[a].a) == ir_val(INSTS[b].a) && INSTS[a].imm == INSTS[b].imm
+        let below = group_below(l, c, i, j, start, last, start2, last2);
+        let above = group_below(l, c, j, i, start, last, start2, last2);
+        and_into(c, ok, append(c, Or, TY_BOOL, below, above, 0))
+    }
+}
+
+// Whether group g's bytes all come before group h's: every highest
+// corner of g (its end) at most every lowest corner of h.
+fn group_below(l: i64, c: i64, g: i64, h: i64, start: i64, last: i64, start2: i64, last2: i64) -> i64 {
+    unsafe {
+        let mut his: [i64; 2] = [0; 2];
+        let mut los: [i64; 2] = [0; 2];
+        let nh = group_corners(l, c, g, true, start, last, start2, last2, &his as *i64);
+        let nl = group_corners(l, c, h, false, start, last, start2, last2, &los as *i64);
+        let mut ok = 0;
+        for a in 0..nh {
+            let end = append(c, Add, TY_U64, his[a], konst(c, V_GROUPS.data[4 * g + 2], TY_U64), 0);
+            for b in 0..nl {
+                let begin = append(c, Add, TY_U64, los[b], konst(c, V_GROUPS.data[4 * h + 1], TY_U64), 0);
+                ok = and_into(c, ok, cmp(c, Cond::Le, TY_U64, end, begin));
+            }
+        }
+        ok
+    }
+}
+
+// The base of group g at its highest (or lowest) iterations, into out:
+// one value, or two when its coefficient of k has an unknown sign (k's
+// first and last value; j's coefficient is a constant).
+fn group_corners(l: i64, c: i64, g: i64, high: bool, start: i64, last: i64, start2: i64, last2: i64, out: *i64) -> i64 {
+    unsafe {
+        let base = V_GROUPS.data[4 * g];
+        let cj = coef_wrt(l, base, V_IV, V_IV2);
+        let jv = if (cj >= 0) == high { last } else { start };
+        if V_IV2 == 0 {
+            out[0] = eval_at(l, base, jv, c);
+            return 1;
+        }
+        let ck = coef_wrt(l, base, V_IV2, V_IV);
+        if ck != NONAFFINE {
+            let kv = if (ck >= 0) == high { last2 } else { start2 };
+            out[0] = eval_at2(l, base, jv, kv, c);
+            return 1;
+        }
+        out[0] = eval_at2(l, base, jv, start2, c);
+        out[1] = eval_at2(l, base, jv, last2, c);
+        2
+    }
+}
+
+// The overlap tests of all the groups, and'ed into ok.
+fn overlap_tests(l: i64, c: i64, ok0: i64, start: i64, last: i64, start2: i64, last2: i64) -> i64 {
+    unsafe {
+        let mut ok = ok0;
+        let n = V_GROUPS.count / 4;
+        for i in 0..n {
+            if V_GROUPS.data[4 * i + 3] == 0 {
+                continue;
+            }
+            for j in 0..n {
+                if j != i && (V_GROUPS.data[4 * j + 3] == 0 || j > i) {
+                    ok = group_test(l, c, i, j, ok, start, last, start2, last2);
+                }
+            }
+        }
+        ok
     }
 }
 
@@ -509,10 +629,13 @@ fn classify(l: i64, v: i64, latch_cond: i64) -> bool {
             let ty = INSTS[v].ty;
             let addr = ir_val(INSTS[v].a);
             let c = coef(l, addr);
-            if c == 0 && !V_HAS_STORE && (class_of(addr) == VC_UNIFORM || invariant_in(l, addr)) {
-                // An invariant address (and no store in the loop: see analyze):
-                // the same value.
+            if c == 0 && (class_of(addr) == VC_UNIFORM || invariant_in(l, addr)) {
+                // An invariant address: the same value in every iteration (a
+                // store reaching it is ruled out by the overlap test).
                 V_HAS_ULOAD = true;
+                V_ACCESS.push(v);
+                V_ACCESS.push(addr);
+                V_ACCESS.push(type_size(ty));
                 set_class(v, VC_UNIFORM);
                 return true;
             }
@@ -773,29 +896,8 @@ fn vectorize_loop(fi: i64, l: i64) -> bool {
             ok = and_into(c, ok, cmp(c, Cond::Ge, TY_I64, hi, lo));
             ok = and_into(c, ok, cmp(c, Cond::Lt, TY_I64, hi, len));
         }
-        let na = V_ACCESS.count / 3;
-        for i in 0..na {
-            let a = V_ACCESS.data[3 * i];
-            if INSTS[a].op != Store {
-                continue;
-            }
-            for j in 0..na {
-                let b = V_ACCESS.data[3 * j];
-                if j == i || (INSTS[b].op == Store && j < i) || same_address(a, b) {
-                    continue;
-                }
-                // [lo, hi) of each, over all iterations: disjoint.
-                let alo = append(c, Add, TY_U64, eval_at(l, V_ACCESS.data[3 * i + 1], start, c), konst(c, INSTS[a].imm, TY_U64), 0);
-                let ahi = append(c, Add, TY_U64, eval_at(l, V_ACCESS.data[3 * i + 1], last, c),
-                    konst(c, INSTS[a].imm + V_ACCESS.data[3 * i + 2], TY_U64), 0);
-                let blo = append(c, Add, TY_U64, eval_at(l, V_ACCESS.data[3 * j + 1], start, c), konst(c, INSTS[b].imm, TY_U64), 0);
-                let bhi = append(c, Add, TY_U64, eval_at(l, V_ACCESS.data[3 * j + 1], last, c),
-                    konst(c, INSTS[b].imm + V_ACCESS.data[3 * j + 2], TY_U64), 0);
-                let below = cmp(c, Cond::Le, TY_U64, ahi, blo);
-                let above = cmp(c, Cond::Le, TY_U64, bhi, alo);
-                ok = and_into(c, ok, append(c, Or, TY_BOOL, below, above, 0));
-            }
-        }
+        build_groups();
+        ok = overlap_tests(l, c, ok, start, last, 0, 0);
         ir_terminate(c, Term::Branch, ok, vp, sp);
         // VP: the vector preheader.
         let mask = konst(vp, 0 - unroll * vf, TY_I64);
@@ -984,13 +1086,54 @@ pub fn vectorize_loops(fi: i64) -> bool {
         }
         canonicalize_loops(fi);
         let mut headers = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut outer = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for l in 0..loop_count() {
-            if is_innermost(l) && loop_header(l) != IRFUNCS[fi].entry && BLOCKS[loop_header(l)].novec == 0
-                && !is_cold_block(loop_header(l)) && !quick_reject(l) {
+            if loop_header(l) == IRFUNCS[fi].entry || BLOCKS[loop_header(l)].novec != 0
+                || is_cold_block(loop_header(l)) || quick_reject(l) {
+                continue;
+            }
+            if is_innermost(l) {
                 headers.push(loop_header(l));
+                continue;
+            }
+            // (A loop holding one innermost loop.)
+            let mut child = -1;
+            let mut children = 0;
+            for x in 0..loop_count() {
+                if LP_PARENT.data[x] == l {
+                    child = x;
+                    children += 1;
+                }
+            }
+            if children == 1 && is_innermost(child) {
+                outer.push(loop_header(l));
+                outer.push(loop_header(child));
             }
         }
         let mut changed = false;
+        let mut k = 0;
+        while k < outer.count {
+            canonicalize_loops(fi);
+            let l = innermost_loop(outer.data[k]);
+            let l2 = innermost_loop(outer.data[k + 1]);
+            k += 2;
+            if l < 0 || l2 < 0 || loop_header(l) != outer.data[k - 2] || loop_header(l2) != outer.data[k - 1]
+                || !is_canonical(l) || !is_canonical(l2) || LP_PARENT.data[l2] != l {
+                continue;
+            }
+            if form_lcssa(fi, l) {
+                resolve_all(fi);
+            }
+            if vectorize_outer(fi, l, l2) {
+                changed = true;
+                resolve_all(fi);
+                verify_func(fi, c"vectorization (outer loop)");
+            }
+        }
+        free(outer.data as *u8);
+        if changed {
+            canonicalize_loops(fi);
+        }
         // (The loops are found again after a change only.)
         let mut stale = false;
         for i in 0..headers.count {
@@ -1021,4 +1164,589 @@ pub fn vectorize_loops(fi: i64) -> bool {
 pub fn vectorizable_lanes(l: i64) -> i64 {
     let mut e = 0;
     if VECTORIZE && analyze(l, &e) { V_VF } else { 0 }
+}
+
+// ---- Outer loops (0.10) ----
+//
+// A loop L (induction variable j) whose body holds one inner loop L2
+// (induction variable k, its bounds invariant in L), and nothing else but
+// straight-line code before and after it, gets a vector version over j:
+// VF iterations of L at once, L2 run once for all of them with each lane's
+// values (its phis, accumulators over k, become vectors: each lane adds up
+// exactly what the scalar loop adds for its j, in the same order, so a
+// float sum vectorizes too). Values the same for all lanes (j's, k's, and
+// loads at addresses without j) stay scalar. matmul's `for j { sum = 0;
+// for k { sum += a[i][k] * b[k][j] } c[i][j] = sum }` is the case. As for
+// innermost loops, a run-time test before the loop requires enough
+// iterations and no store overlapping another access at another address
+// (ranges over all j and k); the original loop runs otherwise, and the
+// remainder.
+
+// Instructions' classes, saved (cloning uses INSTS[v].aux): (value,
+// class) pairs.
+static mut V_CLASS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// The blocks of L (and L2) in order: before L2, L2's, after it.
+static mut V_PRE: i64 = 0;
+
+fn saved_class(v: i64) -> i64 {
+    unsafe {
+        let x = ir_val(v);
+        let mut k = 0;
+        while k < V_CLASS.count {
+            if V_CLASS.data[k] == x {
+                return V_CLASS.data[k + 1];
+            }
+            k += 2;
+        }
+        0
+    }
+}
+
+// The chain of blocks from b to `to` (both in L, not in L2), each jumping
+// to the next, appended to V_CHAIN; false when there is another shape.
+fn chain_to(l: i64, l2: i64, from: i64, to: i64) -> bool {
+    unsafe {
+        let mut b = from;
+        for _ in 0..16 {
+            V_CHAIN.push(b);
+            if b == to {
+                return true;
+            }
+            let s = BLOCKS[b].s0;
+            if BLOCKS[b].term != Term::Jump || !loop_contains(l, s) || loop_contains(l2, s) || BLOCKS[s].preds.count != 1 {
+                return false;
+            }
+            b = s;
+        }
+        false
+    }
+}
+
+// The inner loop l2: a header phi (*iv) from a constant start, by a
+// constant step s > 0 (unrolling makes it more than 1), while its next
+// value is below a constant (or not equal to it, reached exactly); its
+// last value in *last.
+fn inner_counted(l2: i64, iv: *i64, last: *i64) -> bool {
+    unsafe {
+        let h = loop_header(l2);
+        let latch = loop_latch(l2);
+        let c = ir_val(BLOCKS[latch].cond);
+        if INSTS[c].op != Cmp || !is_integer(INSTS[c].imm2) || int_bits(INSTS[c].imm2) != 64 {
+            return false;
+        }
+        let mut cond = INSTS[c].cond;
+        let mut x = bits_of_value(INSTS[c].a);
+        let mut n = bits_of_value(INSTS[c].b);
+        if is_const(x) && !is_const(n) {
+            let t = x;
+            x = n;
+            n = t;
+            cond = cond.mirror();
+        }
+        if !is_const(n) || BLOCKS[latch].term != Term::Branch {
+            return false;
+        }
+        if BLOCKS[latch].s0 != h {
+            cond = cond.negate();
+        }
+        let mut phi = BLOCKS[h].first;
+        while phi != 0 && INSTS[phi].op == Phi {
+            let mut s = 0;
+            if ir_val(ir_arg(phi, pred_index(h, latch))) == x && iv_step(l2, phi, &s) && s > 0
+                && int_bits(INSTS[phi].ty) == 64 {
+                let k0v = ir_val(ir_arg(phi, pred_index(h, loop_preheader(l2))));
+                if !is_const(k0v) {
+                    return false;
+                }
+                let k0 = INSTS[k0v].imm;
+                let nn = INSTS[n].imm;
+                if k0 >= nn || nn - k0 > 1073741824 {
+                    return false;
+                }
+                if cond == Cond::Ne && (nn - k0) % s != 0 {
+                    return false;
+                }
+                if cond != Cond::Ne && cond != Cond::Lt {
+                    return false;
+                }
+                let trips = (nn - k0 + s - 1) / s;
+                *iv = phi;
+                *last = k0 + (trips - 1) * s;
+                return true;
+            }
+            phi = INSTS[phi].next;
+        }
+        false
+    }
+}
+
+fn analyze_outer(l: i64, l2: i64, exit: *i64) -> bool {
+    unsafe {
+        VSTAMP += 1;
+        V_ELEM = 0;
+        V_HAS_STORE = false;
+        V_HAS_ULOAD = false;
+        V_CHAIN.count = 0;
+        V_CHECKS.count = 0;
+        V_ACCESS.count = 0;
+        V_REDS.count = 0;
+        V_IV2 = 0;
+        let h = loop_header(l);
+        let latch = loop_latch(l);
+        let h2 = loop_header(l2);
+        let latch2 = loop_latch(l2);
+        let p2 = loop_preheader(l2);
+        if BLOCKS[h].novec != 0 || is_cold_block(h) || latch == 0 || loop_preheader(l) == 0 || latch2 == 0
+            || p2 == 0 || BLOCKS[latch].term != Term::Branch || BLOCKS[latch2].term != Term::Branch {
+            return false;
+        }
+        let mut iv = 0;
+        let mut step = 0;
+        let mut n = 0;
+        let mut ne = false;
+        if !counted_loop(l, &iv, &step, &n, &ne) || step != 1 || int_bits(INSTS[iv].ty) != 64 {
+            return false;
+        }
+        let mut iv2 = 0;
+        let mut last2 = 0;
+        if !inner_counted(l2, &iv2, &last2) {
+            return false;
+        }
+        V_IV = iv;
+        V_N = n;
+        V_NE = ne;
+        V_IV2 = iv2;
+        V_LAST2 = last2;
+        // L2's only exit is at its latch.
+        let s0 = BLOCKS[latch2].s0;
+        let s1 = BLOCKS[latch2].s1;
+        let e2 = if s0 == h2 { s1 } else { s0 };
+        if loop_contains(l2, e2) || !loop_contains(l, e2) || BLOCKS[e2].preds.count != 1 {
+            return false;
+        }
+        // The blocks: h ... p2, L2 (a chain of jumps), e2 ... latch.
+        if !chain_to(l, l2, h, p2) || BLOCKS[p2].s0 != h2 {
+            return false;
+        }
+        V_PRE = V_CHAIN.count;
+        let mut b = h2;
+        for _ in 0..16 {
+            V_CHAIN.push(b);
+            if b == latch2 {
+                break;
+            }
+            let s = BLOCKS[b].s0;
+            if BLOCKS[b].term != Term::Jump || !loop_contains(l2, s) || BLOCKS[s].preds.count != 1 {
+                return false;
+            }
+            b = s;
+        }
+        if V_CHAIN.data[V_CHAIN.count - 1] != latch2 || V_CHAIN.count - V_PRE != loop_size(l2) {
+            return false;
+        }
+        if !chain_to(l, l2, e2, latch) || V_CHAIN.count != loop_size(l) {
+            return false;
+        }
+        let ss0 = BLOCKS[latch].s0;
+        let e = if ss0 == h { BLOCKS[latch].s1 } else { ss0 };
+        if loop_contains(l, e) || BLOCKS[e].preds.count != 1 {
+            return false;
+        }
+        *exit = e;
+        // Phis: j alone in h; k and accumulators in h2; e2's (one operand)
+        // take their operand's class below.
+        let mut phi = BLOCKS[h].first;
+        while phi != 0 && INSTS[phi].op == Phi {
+            if phi != iv {
+                return false;
+            }
+            set_class(phi, VC_UNIFORM);
+            phi = INSTS[phi].next;
+        }
+        phi = BLOCKS[h2].first;
+        while phi != 0 && INSTS[phi].op == Phi {
+            if phi == iv2 {
+                set_class(phi, VC_UNIFORM);
+            } else {
+                if !use_elem(INSTS[phi].ty) {
+                    return false;
+                }
+                set_class(phi, VC_VECTOR);
+            }
+            phi = INSTS[phi].next;
+        }
+        let latch_cond = ir_val(BLOCKS[latch].cond);
+        let mut total = 0;
+        for k in 0..V_CHAIN.count {
+            let blk = V_CHAIN.data[k];
+            let mut v = BLOCKS[blk].first;
+            while v != 0 {
+                total += 1;
+                if total > VEC_MAX_INSTS {
+                    return false;
+                }
+                if INSTS[v].op == Phi {
+                    if blk == e2 {
+                        let w = ir_val(ir_arg(v, 0));
+                        let c = if class_of(w) != 0 { class_of(w) } else { VC_UNIFORM };
+                        if c == VC_SKIP {
+                            return false;
+                        }
+                        set_class(v, c);
+                    } else if class_of(v) == 0 {
+                        return false;
+                    }
+                } else if !classify_outer(l, v, latch_cond) {
+                    return false;
+                }
+                v = INSTS[v].next;
+            }
+        }
+        V_SIZE = total;
+        if V_ELEM == 0 {
+            return false;
+        }
+        V_VF = 16 / type_size(V_ELEM);
+        V_VT = vector_type(lane_type(V_ELEM), V_VF);
+        if V_VT == 0 {
+            return false;
+        }
+        // The accumulators' operands have values for every lane.
+        phi = BLOCKS[h2].first;
+        while phi != 0 && INSTS[phi].op == Phi {
+            if phi != iv2 {
+                for i in 0..INSTS[phi].nargs {
+                    if !vector_operand_ok(l, ir_arg(phi, i)) {
+                        return false;
+                    }
+                }
+            }
+            phi = INSTS[phi].next;
+        }
+        // What L leaves for after it: invariants only.
+        let mut x = BLOCKS[e].first;
+        while x != 0 && INSTS[x].op == Phi {
+            if !invariant_in(l, ir_val(ir_arg(x, 0))) {
+                return false;
+            }
+            x = INSTS[x].next;
+        }
+        // Addresses: affine in j and k, from no load.
+        for k in 0..V_ACCESS.count / 3 {
+            let a = V_ACCESS.data[3 * k + 1];
+            if !multi_affine(l, a) || loads_in(l, a) {
+                return false;
+            }
+        }
+        if overlap_pairs() > VEC_MAX_OVERLAPS {
+            return false;
+        }
+        true
+    }
+}
+
+fn classify_outer(l: i64, v: i64, latch_cond: i64) -> bool {
+    unsafe {
+        let op = INSTS[v].op;
+        if v == latch_cond {
+            set_class(v, VC_SKIP);
+            return true;
+        }
+        if op == Load || op == Store {
+            let ty = if op == Load { INSTS[v].ty } else { INSTS[v].imm2 };
+            let addr = ir_val(INSTS[v].a);
+            let c = coef(l, addr);
+            V_ACCESS.push(v);
+            V_ACCESS.push(addr);
+            V_ACCESS.push(type_size(ty));
+            if op == Load && c == 0 && (class_of(addr) == VC_UNIFORM || invariant_in(l, addr)) {
+                // The same for all lanes (stores are kept apart by the
+                // overlap test).
+                set_class(v, VC_UNIFORM);
+                return true;
+            }
+            if c != type_size(ty) || !use_elem(ty) {
+                return false;
+            }
+            if op == Store {
+                if !vector_operand_ok(l, INSTS[v].b) {
+                    return false;
+                }
+                V_HAS_STORE = true;
+            }
+            set_class(v, VC_VECTOR);
+            return true;
+        }
+        let a = if INSTS[v].a != 0 { class_of(ir_val(INSTS[v].a)) } else { 0 };
+        let b = if INSTS[v].b != 0 { class_of(ir_val(INSTS[v].b)) } else { 0 };
+        if a == VC_VECTOR || b == VC_VECTOR {
+            let ty = INSTS[v].ty;
+            let ok_op = op == Add || op == Sub || op == Mul || op == And || op == Or || op == Xor
+                || op == Neg || (op == Div && is_float(ty));
+            if !ok_op || (is_float(ty) && (op == And || op == Or || op == Xor)) || !use_elem(ty) {
+                return false;
+            }
+            if !vector_operand_ok(l, INSTS[v].a) || (INSTS[v].b != 0 && !vector_operand_ok(l, INSTS[v].b)) {
+                return false;
+            }
+            set_class(v, VC_VECTOR);
+            return true;
+        }
+        if a == VC_SKIP || b == VC_SKIP {
+            return false;
+        }
+        if op.is_pure() || op == Const {
+            // (A comparison: the inner loop's test; its operands are the same
+            // for all lanes.)
+            set_class(v, VC_UNIFORM);
+            return true;
+        }
+        false
+    }
+}
+
+// Whether v is affine in j and in k separately, with invariant (maybe
+// not constant) coefficients and no product of the two: its extremes over
+// the iterations are then at the corners.
+fn multi_affine(l: i64, v: i64) -> bool {
+    lin_mask(l, v) >= 0
+}
+
+// What v depends on: 1 for j, 2 for k (3 for both), -1 when not linear.
+fn lin_mask(l: i64, v: i64) -> i64 {
+    unsafe {
+        let x = ir_val(v);
+        if x == V_IV {
+            return 1;
+        }
+        if x == V_IV2 {
+            return 2;
+        }
+        if x == 0 || invariant_in(l, x) {
+            return 0;
+        }
+        if class_of(x) != VC_UNIFORM || INSTS[x].op == Load || INSTS[x].op == Phi {
+            return -1;
+        }
+        let op = INSTS[x].op;
+        let a = lin_mask(l, INSTS[x].a);
+        let b = lin_mask(l, INSTS[x].b);
+        if a < 0 || b < 0 {
+            return -1;
+        }
+        if a == 0 && b == 0 {
+            return 0;
+        }
+        if !is_integer(INSTS[x].ty) || int_bits(INSTS[x].ty) != 64 {
+            return -1;
+        }
+        if op == Add || op == Sub {
+            return a | b;
+        }
+        if op == Mul && (a == 0 || b == 0) {
+            return a | b;
+        }
+        if op == Shl && b == 0 && is_const(ir_val(INSTS[x].b)) {
+            return a;
+        }
+        if op == Conv && is_integer(INSTS[x].imm2) && int_bits(INSTS[x].imm2) == 64 {
+            return a;
+        }
+        -1
+    }
+}
+
+// The value of v (uniform, without loads) with j = `at` and k = `at2`, in
+// block b.
+fn eval_at2(l: i64, v: i64, at: i64, at2: i64, b: i64) -> i64 {
+    unsafe {
+        let x = ir_val(v);
+        if x == V_IV {
+            return at;
+        }
+        if x == V_IV2 {
+            return at2;
+        }
+        if invariant_in(l, x) {
+            return x;
+        }
+        let a = if INSTS[x].a != 0 { eval_at2(l, INSTS[x].a, at, at2, b) } else { 0 };
+        let y = if INSTS[x].b != 0 { eval_at2(l, INSTS[x].b, at, at2, b) } else { 0 };
+        let nv = ir_make(INSTS[x].op, INSTS[x].ty, a, y, INSTS[x].imm);
+        INSTS[nv].imm2 = INSTS[x].imm2;
+        INSTS[nv].cond = INSTS[x].cond;
+        ir_append(b, nv);
+        nv
+    }
+}
+
+// The vector value of operand w of copy nv (whose original's operand had
+// class `cls`): w itself, or a splat (in vp for invariants, else just
+// before nv).
+fn outer_vector(l: i64, w: i64, cls: i64, nv: i64, vp: i64) -> i64 {
+    unsafe {
+        if cls == VC_VECTOR {
+            return w;
+        }
+        let s = ir_make(VSplat, V_VT, w, 0, 0);
+        // (Copies are in no loop of the forest: in_clone tells them apart.)
+        if !in_clone(w) && invariant_in(l, w) {
+            ir_append(vp, s);
+        } else {
+            ir_insert_before(nv, s);
+        }
+        s
+    }
+}
+
+static mut V_CLONE_STAMP: i64 = 0;
+
+// Whether value w is in the copy of L.
+fn in_clone(w: i64) -> bool {
+    unsafe {
+        let b = INSTS[w].block;
+        b != 0 && BLOCKS[b].mark == V_CLONE_STAMP
+    }
+}
+
+fn vectorize_outer(fi: i64, l: i64, l2: i64) -> bool {
+    unsafe {
+        let mut e = 0;
+        if !analyze_outer(l, l2, &e) {
+            V_IV2 = 0;
+            return false;
+        }
+        IRF = fi;
+        let h = loop_header(l);
+        let p = loop_preheader(l);
+        let latch = loop_latch(l);
+        let h2 = loop_header(l2);
+        let p2 = loop_preheader(l2);
+        let start = ir_val(ir_arg(V_IV, pred_index(h, p)));
+        let start2 = ir_val(ir_arg(V_IV2, pred_index(h2, p2)));
+        let vf = V_VF;
+        let vt = V_VT;
+        let n = V_N;
+        // Classes, saved before cloning.
+        V_CLASS.count = 0;
+        for k in 0..V_CHAIN.count {
+            let mut v = BLOCKS[V_CHAIN.data[k]].first;
+            while v != 0 {
+                V_CLASS.push(v);
+                V_CLASS.push(class_of(v));
+                v = INSTS[v].next;
+            }
+        }
+        let c = ir_new_block();
+        let vp = ir_new_block();
+        let vx = ir_new_block();
+        let sp = ir_new_block();
+        BLOCKS[c].sealed = 1;
+        BLOCKS[vp].sealed = 1;
+        BLOCKS[vx].sealed = 1;
+        BLOCKS[sp].sealed = 1;
+        BLOCKS[p].s0 = c;
+        BLOCKS[c].preds.push(p);
+        let trips = append(c, Sub, TY_I64, n, start, 0);
+        let mut ok = cmp(c, Cond::Ge, TY_U64, trips, konst(c, vf, TY_I64));
+        let last = append(c, Sub, TY_I64, n, konst(c, 1, TY_I64), 0);
+        let last2 = konst(c, V_LAST2, TY_I64);
+        build_groups();
+        ok = overlap_tests(l, c, ok, start, last, start2, last2);
+        ir_terminate(c, Term::Branch, ok, vp, sp);
+        let vtrips = append(vp, And, TY_I64, trips, konst(vp, 0 - vf, TY_I64), 0);
+        let vend = append(vp, Add, TY_I64, start, vtrips, 0);
+        // The copy of L.
+        let stamp = mark_loop_blocks(l);
+        clone_region(fi, &LP_LIST2, stamp);
+        VSTAMP += 1;
+        V_CLONE_STAMP = VSTAMP;
+        for i in 0..LP_LIST2.count {
+            BLOCKS[BLOCKS[LP_LIST2.data[i]].aux].mark = V_CLONE_STAMP;
+        }
+        let h_c = BLOCKS[h].aux;
+        let latch_c = BLOCKS[latch].aux;
+        // Turn the copy's vector values into vectors.
+        for k in 0..V_CHAIN.count {
+            let mut v = BLOCKS[V_CHAIN.data[k]].first;
+            while v != 0 {
+                let nv = INSTS[v].aux;
+                let op = INSTS[v].op;
+                if saved_class(v) == VC_VECTOR {
+                    if op == Phi {
+                        INSTS[nv].ty = vt;
+                        let pb = INSTS[nv].block;
+                        for i in 0..INSTS[nv].nargs {
+                            let cls = saved_class(ir_arg(v, i));
+                            if cls != VC_VECTOR {
+                                // A splat at the end of the predecessor.
+                                let w = ir_arg(nv, i);
+                                let s = ir_make(VSplat, vt, w, 0, 0);
+                                ir_append(BLOCKS[pb].preds.data[i], s);
+                                ir_set_arg(nv, i, s);
+                            }
+                        }
+                    } else if op == Load {
+                        INSTS[nv].ty = vt;
+                    } else if op == Store {
+                        INSTS[nv].imm2 = vt;
+                        INSTS[nv].b = outer_vector(l, INSTS[nv].b, saved_class(INSTS[v].b), nv, vp);
+                    } else if op == Neg {
+                        INSTS[nv].op = VNeg;
+                        INSTS[nv].ty = vt;
+                        INSTS[nv].a = outer_vector(l, INSTS[nv].a, saved_class(INSTS[v].a), nv, vp);
+                    } else {
+                        INSTS[nv].imm = op as i64;
+                        INSTS[nv].op = VBin;
+                        INSTS[nv].ty = vt;
+                        INSTS[nv].a = outer_vector(l, INSTS[nv].a, saved_class(INSTS[v].a), nv, vp);
+                        INSTS[nv].b = outer_vector(l, INSTS[nv].b, saved_class(INSTS[v].b), nv, vp);
+                    }
+                }
+                v = INSTS[v].next;
+            }
+        }
+        // The copy's entry: from vp; its j steps by VF, to vend, out to vx.
+        let hp = pred_index(h_c, p);
+        BLOCKS[h_c].preds.data[hp] = vp;
+        BLOCKS[vp].term = Term::Jump;
+        BLOCKS[vp].s0 = h_c;
+        let jv = INSTS[V_IV].aux;
+        let jl = pred_index(h_c, latch_c);
+        let vnext = append(latch_c, Add, INSTS[V_IV].ty, jv, konst(latch_c, vf, INSTS[V_IV].ty), 0);
+        ir_set_arg(jv, jl, vnext);
+        let more = cmp(latch_c, Cond::Ne, TY_I64, vnext, vend);
+        BLOCKS[latch_c].term = Term::Branch;
+        BLOCKS[latch_c].cond = more;
+        BLOCKS[latch_c].s0 = h_c;
+        BLOCKS[latch_c].s1 = vx;
+        BLOCKS[vx].preds.push(latch_c);
+        let done = cmp(vx, Cond::Eq, TY_I64, vend, n);
+        ir_terminate(vx, Term::Branch, done, e, sp);
+        // SP: the scalar loop's preheader, from C or VX.
+        let mut vals = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        vals.push(start);
+        vals.push(vend);
+        let iv0 = new_phi_in(sp, INSTS[V_IV].ty, &vals, 0, 2);
+        let ohp = pred_index(h, p);
+        ir_set_arg(V_IV, ohp, iv0);
+        ir_terminate(sp, Term::Jump, 0, h, 0);
+        BLOCKS[h].preds.count -= 1;
+        BLOCKS[h].preds.data[ohp] = sp;
+        // E: from VX too (its phis' operands are invariants).
+        vals.count = 0;
+        let mut x = BLOCKS[e].first;
+        while x != 0 && INSTS[x].op == Phi {
+            vals.push(ir_val(ir_arg(x, 0)));
+            x = INSTS[x].next;
+        }
+        BLOCKS[e].preds.count -= 1;
+        add_pred_values(e, vx, &vals, 0);
+        BLOCKS[h].novec = 1;
+        BLOCKS[h2].novec = 1;
+        BLOCKS[BLOCKS[h2].aux].novec = 1;
+        free(vals.data as *u8);
+        V_IV2 = 0;
+        true
+    }
 }

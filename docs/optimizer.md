@@ -990,7 +990,11 @@ SP: i and the reductions from C or from VX; the scalar loop
 ```
 
 `hi >= lo` catches an index that would wrap (the trip count is below
-2^63). So the vector loop runs exactly when the scalar loop would run
+2^63). The overlap tests go by groups of accesses whose addresses differ
+by a constant (one range each; a storing group whose accesses are at
+different offsets is a dependence, and the loop is left alone), so
+`v[0] ... v[6]` cost one test. A load at an address the same in every
+iteration is a scalar, its range part of the tests. So the vector loop runs exactly when the scalar loop would run
 every iteration without a failing check and without a store reaching
 memory another access (at a different address) reads or writes; else the
 scalar loop runs from where the vector loop stopped, or from the start,
@@ -1000,12 +1004,32 @@ after the vector loop). The scalar loop's header is marked (`novec`,
 kept by inlining and cloning) so that it is not vectorized again;
 partial unrolling leaves the loops the vectorizer takes to it.
 
+**Outer loops.** A loop over j whose body is straight-line code around
+one inner loop over k (from a constant to a constant, by any step:
+unrolling may have made it 4) is vectorized over j: the copy of the
+whole nest (`clone_region`) runs VF values of j at once, the inner
+loop's phis that are not k become vectors (each lane accumulates exactly
+the scalar loop's sequence for its j: a float sum is fine here, nothing
+is reassociated), loads whose address has no j stay scalars (a splat
+where a vector needs them), and loads and stores at unit stride in j
+become vector accesses. The overlap test takes each group's range over
+both j and k: addresses affine in each (no j·k product), with the
+corners evaluated before the loop (both values of k when its coefficient
+is not a constant, `b[k * n + j]`). This is matmul's
+`for j { sum = 0.0; for k { sum += a[i][k] * b[k][j] } c[i][j] = sum }`.
+Scalar evolution's entry test (`entry_implies`) now also finds the guard
+in a block dominating the preheader (an inner loop's guard that the outer
+loop's made redundant was not found before).
+
 Tested by `tests/run/opt_vectorize.tach` (IR and assembly checks, every
 level, overlapping slices, a check failing part way),
+`opt_vectorize_outer.tach` (matrix-vector and matrix products, f64 and
+f32, an output overlapping the input),
 `tests/run/vector_*.tach`, and `tests/fuzz/run.sh -V`: random
 reductions, maps, stencils and explicit vector code over slices of
 random lengths and starts, overlapping slices of one array, slices too
-short for the loop. `--no-vectorize` turns the vectorizer off.
+short for the loop, nested loops over raw pointers (an output overlapping
+the input now and then). `--no-vectorize` turns the vectorizer off.
 
 ## 0.10: profiles
 

@@ -427,9 +427,12 @@ written against 0.5's unbounded generics mean.
   checksum of its IR: stale profiles ignored with a warning) for block
   layout, inlining (hot call sites), unrolling and vectorization (cold
   loops); the test runner's `PROFILE` directive
+- done: outer-loop vectorization (a loop around one inner loop, over the
+  outer index: matmul, whose inner loop is a float sum that may not be
+  reassociated); loads at invariant addresses kept scalar under the
+  overlap test; overlap tests by groups of accesses
 - in progress: -
-- remaining: SLP vectorizer; outer-loop vectorization (matmul's inner
-  loop is a float sum, which may not be reassociated); scalar unrolling
+- remaining: SLP vectorizer; scalar unrolling
   with run-time trip counts; GVN-PRE; interp's slowdown; a checking mode
   for unsafe code
 

@@ -132,6 +132,33 @@ function explicit_kernel(id, t,    vt, l, op, ops, n) {
     KIND[id] = "map"
 }
 
+# An outer loop over j around an inner loop over q (a constant count):
+# acc[j] built over q from a[q * W + j] and b[q] (raw pointers into
+# arrays sized for it), stored to out[j].
+function nested_kernel(id, t,    load, op, ops, n) {
+    if (is_float(t)) {
+        n = split("+ - *", ops, " ")
+    } else {
+        n = split("+ - * & | ^", ops, " ")
+    }
+    op = ops[1 + rnd(n)]
+    Q[id] = 2 + rnd(30)
+    W[id] = 8 + rnd(40)
+    load[1] = "a[q * " W[id] " + j]"
+    load[2] = "b[q]"
+    print "#[inline(never)]"
+    print "unsafe fn k" id "(a: *" t ", b: *" t ", out: *" t ", n: i64, k: " t ") {"
+    print "    for j in 0..n {"
+    print "        let mut acc: " t " = k;"
+    print "        for q in 0.." Q[id] " {"
+    print "            acc = acc " op " " elem_expr(t, 1 + rnd(2), 2, load) ";"
+    print "        }"
+    print "        out[j] = acc;"
+    print "    }"
+    print "}"
+    KIND[id] = "nested"
+}
+
 function fill(name, t, len,    s) {
     s = rnd(1000)
     print "    let mut " name ": [" t "; " len "] = [0 as " t "; " len "];"
@@ -172,7 +199,8 @@ BEGIN {
     for (id = 0; id < nk; id++) {
         T[id] = TYPES[1 + rnd(NT)]
         k = rnd(10)
-        if (k <= 2) reduction_kernel(id, T[id])
+        if (k <= 1) reduction_kernel(id, T[id])
+        else if (k == 2) nested_kernel(id, T[id])
         else if (k <= 5) map_kernel(id, T[id])
         else if (k <= 7) stencil_kernel(id, T[id])
         else {
@@ -187,6 +215,7 @@ BEGIN {
     for (id = 0; id < nk; id++) {
         t = T[id]
         len = 1 + rnd(70)
+        if (KIND[id] == "nested") len = Q[id] * W[id] + W[id]
         LEN[id] = len
         fill("a" id, t, len)
         fill("b" id, t, len)
@@ -203,7 +232,14 @@ BEGIN {
         if (lb > len) lb = len
         if (lc > len) lc = len
         minlen = len - max3(la, lb, lc)
-        if (KIND[id] == "reduce") {
+        if (KIND[id] == "nested") {
+            # out: c, or (now and then) a itself at an offset; n up to W.
+            n = rnd(W[id] + 1)
+            o = rnd(3) == 0 ? "&a" id "[" rnd(W[id]) "]" : "&c" id "[0]"
+            print "    unsafe { k" id "(&a" id "[0], &b" id "[0], " o ", Z + " n ", " kv "); }"
+            show("a" id, t, W[id])
+            show("c" id, t, W[id])
+        } else if (KIND[id] == "reduce") {
             hi = len - rnd(3)
             if (hi < la) hi = la
             print "    unsafe { printf(c\"k" id " %lld\\n\", k" id "(a" id "[Z + " la "..Z + " hi "], " kv ") as i64); }"
