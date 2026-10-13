@@ -19,6 +19,7 @@
 #   -p            the pressure mode of gen.awk (many parameters and locals)
 #   -C            the calls mode of gen.awk (aggregates passed and returned)
 #   -N            the 0.6 language mode of gen.awk (defer, if let, ==, strings)
+#   -V            vectorizable loops and vector code, from genvec.awk (0.10)
 #   -j JOBS       programs tested at once (default: the number of CPUs)
 
 set -u
@@ -46,8 +47,9 @@ while [ $# -gt 0 ]; do
         -p) PRESSURE=1; shift ;;
         -C) CALLS=1; shift ;;
         -N) LANG06=1; shift ;;
+        -V) VECTOR=1; shift ;;
         -j) JOBS=$2; shift 2 ;;
-        *) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+        *) sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
     esac
 done
 if [ -z "$TARGET" ]; then
@@ -79,7 +81,11 @@ trap 'rm -rf "$WORK"' EXIT INT TERM
 test_seed() {
     seed=$1
     program="$WORK/p$seed.tach"
-    awk -v seed="$seed" -v nonzero="$NONZERO" -v loops="${LOOPS:-0}" -v generics="${GENERICS:-0}" -v pressure="${PRESSURE:-0}" -v calls="${CALLS:-0}" -v lang06="${LANG06:-0}" -f "$ROOT/tests/fuzz/gen.awk" >"$program"
+    if [ "${VECTOR:-0}" = 1 ]; then
+        awk -v seed="$seed" -f "$ROOT/tests/fuzz/genvec.awk" >"$program"
+    else
+        awk -v seed="$seed" -v nonzero="$NONZERO" -v loops="${LOOPS:-0}" -v generics="${GENERICS:-0}" -v pressure="${PRESSURE:-0}" -v calls="${CALLS:-0}" -v lang06="${LANG06:-0}" -f "$ROOT/tests/fuzz/gen.awk" >"$program"
+    fi
     reference=""
     why=""
     for level in O0 O1 O2 seed; do

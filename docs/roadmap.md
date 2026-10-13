@@ -416,7 +416,10 @@ written against 0.5's unbounded generics mean.
   vector loop guarded at run time (bounds checks proven for the whole
   loop, no overlap between stores and other accesses) and the original
   loop as the remainder and the fallback; `--no-vectorize`
-- in progress: vectorizing fuzz mode, benchmarks
+- done: `tests/fuzz/run.sh -V` (genvec.awk): reductions, maps, stencils
+  and explicit vector code over slices of random lengths and starts,
+  overlapping slices, checks failing part way
+- in progress: benchmarks
 - remaining: NEON/SSE2 lowering; loop vectorizer with
   run-time trip counts; profile-guided optimization; SLP; GVN-PRE
 
