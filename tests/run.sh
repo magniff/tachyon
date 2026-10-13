@@ -237,6 +237,11 @@ check_case() {
     esac
     # The compiler's options for the case (0.9).
     FLAGS="--deny-warnings $(sed "s|@ROOT@|$ROOT|g" "$dir/flags")"
+    # (--check-unsafe needs the IR: such a case runs at -O1 when -O0 is
+    # asked for, 0.10.)
+    if [ "$OPT" = -O0 ] && grep -q -- --check-unsafe "$dir/flags"; then
+        OPT=-O1
+    fi
     # (A profile's warnings come at -O1 and -O2 only: -O0 reads none.)
     if [ "$OPT" = -O0 ] && grep -q -- --profile-use "$dir/flags"; then
         : >"$dir/warnings"

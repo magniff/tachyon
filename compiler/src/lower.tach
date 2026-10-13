@@ -19,14 +19,14 @@ use crate::base::{IntVec, alloc_array, free, intern_c, memset};
 use crate::lexer::{STRS, Tok};
 use crate::ast::{
     DEFERS, DEFER_LOOPS, NODES, NODE_COUNT, NodeKind, child, defer_loop_depth, defer_loop_enter,
-    defer_loop_leave, VK_LANE, VK_LOAD, VK_NEW, VK_SELECT, VK_SPLAT, VK_STORE, VK_SUM, VK_WITH,
+    defer_loop_leave, NODE_RAW, VK_LANE, VK_LOAD, VK_NEW, VK_SELECT, VK_SPLAT, VK_STORE, VK_SUM, VK_WITH,
 };
 use crate::parser::is_comparison;
 use crate::types::{
     ENUMS, FNS, TYPES, TY_BOOL, TY_F32, TY_F64, TY_I64, TY_NEVER, TY_STRING, TY_U64, TyKind,
     VARIANTS, align_to, field_offset, fn_param, int_bits, is_compound, is_enum, is_float,
     is_integer, is_slice, is_void, scalar_type, struct_field, tuple_offset, type_align, type_elem,
-    type_size, variant_field, variant_field_offset, is_vector, vec_elem, vec_lanes,
+    type_size, variant_field, variant_field_offset, is_vector, vec_elem, vec_lanes, TY_U8_PTR,
 };
 use crate::check::{LOCALS, LOCAL_COUNT, Res, type_error};
 use crate::consteval::{const_value, f64_of_bits, float_const, wrap_int};
@@ -37,6 +37,8 @@ use crate::abi::{
     conv_returns_through_pointer, fn_type_uses_c, fn_uses_c, variadic_kind,
 };
 use crate::target::{PANIC_INDEX_SIGNED, PANIC_RANGE_SIGNED, PANIC_USED, X86, rt_panic_sym};
+use crate::unsafecheck::{CHECK_MODULE, CHECK_UNSAFE, check_function, redirect_alloc, site_string};
+use crate::profile::PROFILE_MODULE;
 use crate::ir::{
     ARGS, ARGTY, BLOCKS, BLOCK_COUNT, CUR, Cond, INLINE_COPY_MAX, INSTS, IRF, IRFUNCS, Op, SLOTS,
     Term, VARIADIC_PIECE, cond_of_token, emit_ir, init_ir, ir_arg, ir_binary, ir_cmp, ir_const,
@@ -741,10 +743,16 @@ fn lower_addr(n: i64) -> i64 {
                 LOCAL_ADDR[local]
             }
             Ident if NODES[n].res == Res::Static => emit_ir(Op::GAddr, TY_U64, 0, 0, NODES[n].a),
-            Unary if NODES[n].op == Tok::Star => lower_operand(NODES[n].b),
+            Unary if NODES[n].op == Tok::Star => {
+                let addr = lower_operand(NODES[n].b);
+                raw_check(n, addr, ir_const(type_size(NODES[n].ty), TY_U64));
+                addr
+            }
             FieldAccess => {
                 let addr = lower_operand(NODES[n].a);
-                ir_offset(addr, field_offset_of(n))
+                let field = ir_offset(addr, field_offset_of(n));
+                raw_check(n, field, ir_const(type_size(NODES[n].ty), TY_U64));
+                field
             }
             TupleField => {
                 let base = NODES[n].a;
@@ -773,7 +781,9 @@ fn lower_addr(n: i64) -> i64 {
                 if elem_size != 1 {
                     scaled = ir_binary(Op::Mul, TY_U64, index, ir_const(elem_size, TY_U64));
                 }
-                ir_binary(Op::Add, TY_U64, addr, scaled)
+                let at = ir_binary(Op::Add, TY_U64, addr, scaled);
+                raw_check(n, at, ir_const(elem_size, TY_U64));
+                at
             }
             _ => lower_operand(n),
         }
@@ -875,6 +885,7 @@ fn lower_unary(n: i64) -> i64 {
         if op == Tok::Tilde {
             return emit_ir(Op::BNot, ir_type(ty), value, 0, 0);
         }
+        raw_check(n, value, ir_const(type_size(ty), TY_U64));
         load_scalar(value, ty)
     }
 }
@@ -925,7 +936,8 @@ fn take_args(call: i64, mark: i64) {
 fn lower_call(n: i64) -> i64 {
     unsafe {
         let callee = NODES[n].a;
-        let direct = NODES[n].x - 1;
+        // (--check-unsafe: malloc and the like go through the runtime)
+        let direct = redirect_alloc(NODES[n].x - 1, FNS[IRFUNCS[IRF].f].module);
         let mut param_count = 0;
         let mut ret = 0;
         let mut variadic = false;
@@ -1132,10 +1144,38 @@ fn lower_slicing(n: i64) -> i64 {
         if elem_size != 1 {
             scaled = ir_binary(Op::Mul, TY_U64, lo, ir_const(elem_size, TY_U64));
         }
+        let start = ir_binary(Op::Add, TY_U64, pointer, scaled);
+        if TYPES[base_ty].kind == TyKind::Ptr {
+            let count = ir_binary(Op::Sub, TY_U64, end, lo);
+            raw_check(n, start, ir_binary(Op::Mul, TY_U64, count, ir_const(elem_size, TY_U64)));
+        }
         let result = ir_slot_addr(new_slot_for(NODES[n].ty));
-        ir_store(TY_U64, result, ir_binary(Op::Add, TY_U64, pointer, scaled), 0);
+        ir_store(TY_U64, result, start, 0);
         ir_store(TY_U64, result, ir_binary(Op::Sub, TY_U64, end, lo), 8);
         result
+    }
+}
+
+// ---- The checking mode (0.10) ----
+
+// With --check-unsafe: the check of `size` bytes (an IR value) at addr,
+// for the raw-pointer access n.
+fn raw_check(n: i64, addr: i64, size: i64) {
+    unsafe {
+        let m = FNS[IRFUNCS[IRF].f].module;
+        if !CHECK_UNSAFE || (NODES[n].p & NODE_RAW) == 0 || m == CHECK_MODULE || m == PROFILE_MODULE {
+            return;
+        }
+        let f = check_function();
+        if f < 0 {
+            return;
+        }
+        let mark = SSA_STACK.count;
+        push_arg(addr, TY_U64);
+        push_arg(size, TY_U64);
+        push_arg(emit_ir(Op::SAddr, TY_U64, 0, 0, site_string(NODES[n].start)), TY_U8_PTR);
+        let call = emit_ir(Op::Call, 0, 0, 0, f);
+        take_args(call, mark);
     }
 }
 

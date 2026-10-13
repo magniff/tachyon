@@ -431,10 +431,15 @@ written against 0.5's unbounded generics mean.
   outer index: matmul, whose inner loop is a float sum that may not be
   reassociated); loads at invariant addresses kept scalar under the
   overlap test; overlap tests by groups of accesses
+- done: a checking mode for unsafe code (`--check-unsafe`,
+  unsafecheck.tach): raw-pointer accesses checked against the heap blocks
+  the program allocated (out of bounds, use after free, double free); the
+  compiler compiled with it compiles itself to the same output
+- done: interp: `vm.sp` is promoted (the 0.6 note): interp is level with
+  cc -O2 (40 against 39-40 ms)
 - in progress: -
-- remaining: SLP vectorizer; scalar unrolling
-  with run-time trip counts; GVN-PRE; interp's slowdown; a checking mode
-  for unsafe code
+- remaining: SLP vectorizer; scalar unrolling with run-time trip counts;
+  GVN-PRE
 
 Vectorization:
 - SLP vectorizer

@@ -358,6 +358,21 @@ the operating system stops (a guard page) without corrupting memory.
 (`error[unsafe]`, from 0.10; 0.9 reported it as a warning).
 `tachyonc --fix-unsafe` wraps such operations in unsafe blocks.
 
+**Checking unsafe code** (0.10). `tachyonc --check-unsafe` (at `-O1` or
+`-O2`) checks unsafe code's raw-pointer accesses at run time: every
+dereference of a raw pointer (`*p`, the whole pointee), index (`p[i]`,
+the element), field through one (`p.f`, the field) and slice made from
+one (`p[a..b]`, its bytes). The heap blocks the program allocates
+through C's `malloc`, `calloc`, `realloc` and `free` (std's included)
+are recorded; an access that starts in a live block and runs past its
+end, starts just past the end of one, runs into a block from below, or
+falls in one of the last 4096 blocks freed, stops the program with
+`unsafe access <what>: N bytes at offset K of a block of M bytes` and the
+access's place in the source (exit code 101), as do freeing a freed
+block. What it does not see is not checked: the stack and statics, memory
+C allocates, pointers C code dereferences, a function pointer to
+`malloc`. Programs run tens of times slower.
+
 ## Layout, conventions and C
 
 Tachyon guarantees **nothing** about the layout of its own types (the order
