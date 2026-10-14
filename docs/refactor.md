@@ -255,8 +255,9 @@ main.tach:13:25: error[type error] undefined variable 'twice' | help: add `use c
 
 Exit 0 without errors (and then nothing is printed but warnings), 1 with
 them; at most 50 errors, as in a compilation. `--diagnostics=human`
-prints the long form. About 30 ms on the compiler's source (55,000
-lines).
+prints the long form. About 60 ms on the compiler's source (77,000
+lines); 0.13: about 7 ms when the program has not changed since a
+command read it, from the tools' cache ([query.md](query.md#speed-the-cache-013)).
 
 ## tachyonc fix
 

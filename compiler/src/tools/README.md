@@ -9,7 +9,7 @@ the edited program checked before anything is written, a journal for
 
 | module | |
 |---|---|
-| `query/` | `tachyonc query`: definitions (`defs`), positions, references (`refs`), `def`/`show`/`items` (`show`), diagnostics and `try:` lines |
+| `query/` | `tachyonc query`: definitions (`defs`), positions, references (`refs`), `def`/`show`/`items` (`show`), diagnostics and `try:` lines; the tools' cache under target/ (`cache`, 0.13) |
 | `query_text.tach` | `query text`, `query show FILE`, a module's regions (`::use`, `::header`, `::extern`) |
 | `plan/` | the planning queries: `stats`, `deps` (with the clustering), `unused`, `impact`; `lint` |
 | `proc.tach` | processes and files: running a program, workers, renames |
