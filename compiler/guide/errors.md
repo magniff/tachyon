@@ -15,25 +15,24 @@ error (short form, without the position), and the fix.
 let s: String = String::new();
 ```
 ```err
-error[type error] unknown type 'String'
+error[type error] unknown type 'String' | help: text is `[u8]`, a slice of bytes (string literals are one); build it in a `std::Buf`
 ```
-Text is `[u8]`; build it with `std::Buf`. Also `char` (use `u8`), `Box`,
-`usize` indices (use `i64`).
+Also `str`, `char` (use `u8`), `Box`, `usize` indices (use `i64`).
 
 ```tach
 fn get(x: &i64) -> i64 { *x }
 ```
 ```err
-error[parser error] expected type, got '&'
+error[parser error] expected type, got '&' | help: write `*T`: one pointer type for `&T` and `&mut T`
 ```
-`*i64`: one pointer type for `&T` and `&mut T`.
+`*i64`; `&str` is `[u8]`. In an expression, `&mut x` is `&x`.
 
 ```tach
 struct P { x: i64 }
 impl P { fn get(&self) -> i64 { self.x } }
 ```
 ```err
-error[parser error] expected identifier, got '&'
+error[parser error] expected identifier, got '&' | help: write the type of self: `self: *T` (a pointer: `&self`, `&mut self`) or `self: T` (a copy)
 ```
 `fn get(self: *P) -> i64`; `fn get(self)` is an error too: write
 `self: P` for a copy.
@@ -50,7 +49,7 @@ No closures in 0.13: a named `fn`, passed as `fn(i64) -> i64`, or a loop.
 fn f(r: Result<i64, i64>) -> Result<i64, i64> { let x = r?; Ok(x) }
 ```
 ```err
-error[parser error] '?' is reserved for future use
+error[parser error] '?' is reserved for future use | help: `match r { Ok(v) => v, Err(e) => return Err(e) }` (the same for Option)
 ```
 `let x = match r { Ok(v) => v, Err(e) => return Err(e) };`
 
@@ -58,10 +57,9 @@ error[parser error] '?' is reserved for future use
 println!("{}", 1);
 ```
 ```err
-error[parser error] expected ';' or '}' after expression, got '!'
+error[parser error] 'println!' is a macro call: tachyon has no macros | help: `println(s)` and `print(s)` take a [u8]; numbers: `std::print_int(n)`; or build the text in a `std::Buf` (`push_str`, `push_int`) and print `b.as_slice()`
 ```
-No macros: `std::print_int(1); println("");`. Also `vec!`, `format!`,
-`assert!`.
+The help names what replaces `vec!`, `format!`, `assert!` and the others.
 
 ```tach
 'outer: for i in 0..3 { break 'outer; }
@@ -170,6 +168,18 @@ let b: u8 = 300;
 ```err
 error[type error] integer literal 300 does not fit in type 'u8'
 ```
+An unsuffixed literal takes the type the code around it gives: `if ok {
+line[i] } else { 0 }` is a `u8`, from the other branch; so are match arms
+and array elements beside a `u8`. Alone, a literal is `i64` (`f64`).
+
+```tach
+const ORIGIN: (i64, i64) = (0, 0);
+fn main() -> i32 { 0 }
+```
+```err
+error[type error] constant 'ORIGIN' has type '(i64, i64)'; constants must be integers, floats, bool or string literals | help: a `static` holds other values: `static ORIGIN: (i64, i64) = ...;`
+```
+`const GREETING: [u8] = "hello";` is a constant (0.14).
 
 ```tach
 let x = 1;
@@ -267,16 +277,15 @@ let mut v: Vec<i64> = Vec::new();
 for x in v.iter() { }
 ```
 ```err
-error[type error] no method 'iter' on type 'Vec<i64>'
+error[type error] no method 'iter' on type 'Vec<i64>' | help: no iterators: `for x in v.as_slice()`
 ```
-`for x in v.as_slice() { }`.
 
 ```tach
 let mut v: Vec<i64> = Vec::new();
 for x in v { }
 ```
 ```err
-error[type error] 'for' loops iterate over integer ranges ('a..b'), slices and arrays, got 'Vec<i64>'
+error[type error] 'for' loops iterate over integer ranges ('a..b'), slices and arrays, got 'Vec<i64>' | help: a Vec's elements are a slice: `for x in v.as_slice()`
 ```
 
 ```tach
@@ -284,9 +293,18 @@ let s = "abc";
 let n = s.len();
 ```
 ```err
-error[type error] no method 'len' on type '[u8]'
+error[type error] no method 'len' on type '[u8]' | help: `len` is a field of slices: `s.len`
 ```
-`s.len` is a field of slices (`Vec` has the method `len()`).
+(`Vec` has the method `len()`.) A misspelt method, field or item gets
+the nearest name of its kind:
+
+```tach
+use std::Buf;
+fn main() -> i32 { let mut b = Buf::new(); b.push_string("x"); 0 }
+```
+```err
+error[type error] no method 'push_string' on type 'Buf' | help: did you mean 'push_str'?
+```
 
 ```tach
 fn sum(s: [i64]) -> i64 { s[0] }
@@ -378,15 +396,19 @@ fn main() -> i32 { let total = 1; std::print_int(totl); 0 }
 ```err
 error[type error] undefined variable 'totl' | help: did you mean 'total'?
 ```
+A module and an item of the same name both work, as in Rust: after `mod
+eval; use eval::eval;`, `eval(x)` calls the function and `eval::NAME`
+goes through the module.
 
 ```tach
 mod m { fn hidden() -> i64 { 1 } }
 fn main() -> i32 { m::hidden() as i32 }
 ```
 ```err
-error[type error] 'hidden' is private
+error[type error] 'hidden' is private | help: make it public: `pub fn hidden` at
 ```
-`pub fn hidden`. Child modules see their parent's private items, not
+The help gives the declaration with `pub` and where it is (`tachyonc fix
+--only pub` writes them all). Child modules see their parent's private items, not
 the reverse.
 
 ## unsafe

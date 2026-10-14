@@ -1023,6 +1023,46 @@ conventions are not supported; pass a pointer to the lanes or an array).
 In tachyon's own convention a vector is passed like a struct of its
 lanes.
 
+## Additions of 0.14
+
+**The type of an unsuffixed literal from its neighbours.** An integer
+or float literal without a suffix (`0`, `-1`, `2.5`, a character) whose
+type no expected type gives takes the type of what stands beside it:
+
+- an `if`/`else` with one branch such a literal (or a block of only one,
+  or an `else if` chain of them) and the other of a numeric type: that
+  type (`if c { line[i] } else { 0 }` is a `u8`);
+- a `match` whose arm is such a literal: the type of the first other
+  arm (`match i { 0 => 0, _ => b[i] }`);
+- an array literal: the type of its first element that is not such a
+  literal (`[0, 1, b[2]]` is a `[u8; 3]`).
+
+Where nothing gives a type the rules are as before: `i64` (`f64`). The
+literal must fit (`if c { 300 } else { b[0] }` is an error). Binary
+operators, ranges, arguments and annotated `let`s already gave their
+type (0.4).
+
+**String constants.** `const S: [u8] = "text";`: a constant of type
+`[u8]` initialized by a string literal; each use is the literal. Other
+types still need a `static` (the error says so).
+
+**A module and an item of the same name.** Where a module has a child
+module `m` and imports an item named `m` (`mod eval; use eval::eval;`),
+the name is the item where a value or a type is wanted (`eval(x)`,
+`let t: token = token { .. }`) and the module where a path goes on
+(`eval::other`), as in Rust.
+
+**Errors.** After an error in an `if`'s or `while`'s condition, a
+`match`'s scrutinee or a `for` loop's sequence, the code that depends on
+it is checked too (its bindings of the error type), so its errors come in
+the same compilation. Unknown methods, fields, associated functions,
+variants and module items get `help: did you mean 'x'?` with the nearest
+name of that kind (the same but for case and underscores, else an edit
+distance up to a third of the length); a private item gets the help
+`make it public: `pub fn f` at FILE:LINE:COL`; Rust habits (`&self`,
+`&str`, `&mut x`, `println!` and the other macros, `?`, `String`,
+`s.len()`, `.iter()`) get a help naming what tachyon writes.
+
 ## Importing C headers
 
 `import "stdio.h" as c;` *(0.4; `as`: 0.5, required since 0.8)* reads a C

@@ -3,6 +3,7 @@
 // (`m::f`, `T::f`, `Enum::Variant`) and the calls through them, and
 // method calls (`x.m()`, with `&x` or `*x` as its `self` needs).
 
+use crate::base::SYMS;
 use crate::base::diag::{
     ERR_HELP, err_begin, err_end, err_failed_name, err_help, err_help_sym, err_int, err_str,
     err_sym, error_at,
@@ -39,7 +40,8 @@ use crate::front::lexer::Tok;
 use crate::front::modules::{CUR_MOD, C_MODULE, MODULES, STD_MODULE};
 use crate::front::modules::lookup::{
     B_ITEM, B_MODULE, B_NONE, B_PRIVATE, B_TVARIANT, B_VARIANT, SYM_CRATE, SYM_STD, SYM_SUPER,
-    access_error, binding, binding_kind, binding_value, lookup_name, note_c_use, path_module,
+    access_error, binding, binding_kind, binding_value, lookup_item, lookup_name, note_c_use,
+    path_module,
 };
 use crate::front::traits::{bounded_param, require_in_bounds};
 use crate::front::types::{
@@ -76,7 +78,7 @@ pub fn synth_call(n: i64) -> i64 {
         if NODES[callee].kind == Ident && (NODES[callee].p & NODE_RESOLVED) == 0
             && lookup_local(NODES[callee].a).is_none() {
             let name = NODES[callee].a;
-            let b = lookup_name(CUR_MOD, name, CUR_MOD);
+            let b = lookup_item(CUR_MOD, name, CUR_MOD);
             note_c_use(NODES[callee].start, name, b);
             if binding_kind(b) == B_VARIANT {
                 // `V(a, b)` for a variant brought into scope by `use`.
@@ -473,6 +475,41 @@ pub fn offer_template_methods(near: *Near, tpl: i64, methods_only: bool) {
     }
 }
 
+// The help of an unknown method a Rust programmer calls on a slice, an
+// array or a Vec (0.14): what tachyon writes instead.
+fn rust_method_help(t: i64, name: i64) {
+    unsafe {
+        let text = SYMS[name].text;
+        let kind = TYPES[t].kind;
+        let seq = kind == TyKind::Slice || kind == TyKind::Array;
+        let iter = text == "iter" || text == "into_iter" || text == "iter_mut" || text == "chars"
+            || text == "bytes";
+        if seq && text == "len" {
+            err_help(if kind == TyKind::Slice { c"`len` is a field of slices: `s.len`" }
+                else { c"an array's length is its slice's field: `a[..].len`" });
+        } else if seq && iter {
+            err_help(c"no iterators: `for x in s` goes over a slice's elements (a [u8]'s bytes)");
+        } else if seq && (text == "to_string" || text == "to_owned" || text == "to_vec"
+            || text == "clone" || text == "as_str" || text == "as_bytes") {
+            err_help(c"a string is a `[u8]` already; to copy it, push it into a `std::Buf` (`b.push_str(s)`)");
+        } else if iter && is_std_vec(t) {
+            err_help(c"no iterators: `for x in v.as_slice()`");
+        }
+    }
+}
+
+// Whether t is a `Vec<T>` (std's), or a pointer to one.
+pub fn is_std_vec(t: i64) -> bool {
+    unsafe {
+        let mut s = t;
+        if TYPES[s].kind == TyKind::Ptr {
+            s = TYPES[s].a;
+        }
+        TYPES[s].kind == TyKind::Struct && STRUCTS[TYPES[s].a].tmpl != 0
+            && SYMS[template_name(STRUCTS[TYPES[s].a].tmpl)].text == "Vec"
+    }
+}
+
 fn path_member_error(n: i64, t: i64, member: i64) -> ! {
     unsafe {
         err_begin(NODES[n].start);
@@ -672,6 +709,7 @@ pub fn synth_method(n: i64) -> i64 {
             if TYPES[t].kind == TyKind::Struct && find_field(TYPES[t].a, name) >= 0 {
                 err_help(c"to call a function stored in a field, write (s.f)(x)");
             }
+            rust_method_help(t, name);
             let mut near = near_to(name);
             offer_methods(&near, t, true);
             near.help();

@@ -9,7 +9,7 @@ use crate::base::diag::{
     err_sym,
 };
 use crate::front::ast::{FN_UNSAFE, NODES};
-use crate::front::ast::NodeKind::{CStr, Path};
+use crate::front::ast::NodeKind::{CStr, Path, Str};
 use crate::front::check::{CHECK_UNCHECKED, LOCALS, Res, lookup_local, name_error};
 use crate::front::check::synth_mode::synth_expr;
 use crate::front::check::unsafety::{U_FN_VALUE, has_borrow_param, unsafe_op};
@@ -21,13 +21,13 @@ use crate::front::modules::{
 };
 use crate::front::modules::lookup::{
     B_ITEM, B_MODULE, B_PRIVATE, B_TVARIANT, B_VARIANT, access_error, binding, binding_kind,
-    binding_value, lookup_name, lookup_quiet, note_c_use,
+    binding_value, lookup_item, lookup_quiet, note_c_use,
 };
 use crate::front::parser::items::ITEM_PUBLIC;
 use crate::front::types::{
     CONSTS, ENUMS, FNS, STATICS, SYM_ALIAS, SYM_CONST, SYM_ENUM, SYM_FN, SYM_PRIMITIVE, SYM_STATIC,
-    SYM_STRUCT, TSCRATCH, TY_ERROR, TyKind, VARIANTS, enum_type, err_type, fn_param, is_pointer,
-    item_node_of, make_type,
+    SYM_STRUCT, TSCRATCH, TY_ERROR, TY_STRING, TyKind, VARIANTS, enum_type, err_type, fn_param,
+    is_pointer, item_node_of, make_type,
 };
 use crate::tools::fix::note_missing_use;
 use std::Option;
@@ -50,7 +50,7 @@ pub fn synth_name(n: i64) -> i64 {
                 Option::None => {}
             }
         }
-        let b = if resolved { binding(B_ITEM, name) } else { lookup_name(CUR_MOD, name, CUR_MOD) };
+        let b = if resolved { binding(B_ITEM, name) } else { lookup_item(CUR_MOD, name, CUR_MOD) };
         if !resolved {
             note_c_use(NODES[n].start, name, b);
         }
@@ -94,6 +94,13 @@ pub fn synth_name(n: i64) -> i64 {
                 NODES[n].kind = CStr;
                 NODES[n].a = NODES[init].a;
                 return CONSTS[c].ty;
+            }
+            if NODES[init].kind == Str && CONSTS[c].ty == TY_STRING {
+                // A string constant (0.14): the literal itself.
+                NODES[n].kind = Str;
+                NODES[n].a = NODES[init].a;
+                NODES[n].b = NODES[init].b;
+                return TY_STRING;
             }
             NODES[n].res = Res::Const;
             NODES[n].y = c;
@@ -206,6 +213,9 @@ pub fn unknown_name_error(pos: i64, before: *u8, name: i64) -> ! {
 // in scope (`did you mean 'x'?`).
 fn suggest_name(name: i64, value: bool) {
     unsafe {
+        if !value && rust_type_help(name) {
+            return;
+        }
         let path = import_path_for(name, value);
         if path != 0 {
             note_missing_use(CUR_MOD, intern(buf_slice(path)), name);
@@ -222,6 +232,26 @@ fn suggest_name(name: i64, value: bool) {
             err_help_sym(near);
             err_help(c"'?");
         }
+    }
+}
+
+// The help of an unknown type a Rust programmer writes (0.14): what
+// tachyon has instead; whether there was one.
+fn rust_type_help(name: i64) -> bool {
+    unsafe {
+        let text = SYMS[name].text;
+        if text == "String" || text == "str" {
+            err_help(c"text is `[u8]`, a slice of bytes (string literals are one); build it in a `std::Buf`");
+        } else if text == "char" {
+            err_help(c"`u8`: text is bytes, and 'a' is a u8");
+        } else if text == "HashSet" || text == "BTreeSet" {
+            err_help(c"a `std::HashMap<K, bool>`");
+        } else if text == "Box" || text == "Rc" || text == "Arc" {
+            err_help(c"keep the value in a `Vec<T>` (one element), or point to it with a `*T`");
+        } else {
+            return false;
+        }
+        true
     }
 }
 
