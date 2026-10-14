@@ -19,8 +19,8 @@ use crate::front::ast::NodeKind::{
     Ident, PatBind, PatLit, PatOr, PatRange, PatTuple, PatVariant, PatWild,
 };
 use crate::front::check::{
-    ENV, LOCALS, SELF_TYPE, SELF_TYPE_SYM, define_local, lookup_local, mismatch_error, name_error,
-    pop_scope, push_scope, type_error, type_error_got,
+    ENV, LOCALS, SELF_TYPE, SELF_TYPE_SYM, check_recovering, define_local, lookup_local,
+    mismatch_error, name_error, poison_pattern, pop_scope, push_scope, type_error, type_error_got,
 };
 use crate::front::check::check_mode::check_expr;
 use crate::front::check::names::{scope_const, unknown_name_error, used_variant_enum};
@@ -35,9 +35,9 @@ use crate::front::modules::lookup::{
 };
 use crate::front::patterns::usefulness::check_arms;
 use crate::front::types::{
-    CONSTS, ENUMS, SYM_PRIMITIVE, TYPES, TY_BOOL, TY_NEVER, TY_UNIT, TyKind, VARIANTS, buf_type,
-    enum_type, enum_variant, err_type, find_variant, is_fieldless_enum, is_float, is_integer,
-    item_node_of, type_elem, variant_field,
+    CONSTS, ENUMS, SYM_PRIMITIVE, TYPES, TY_BOOL, TY_ERROR, TY_NEVER, TY_UNIT, TyKind, VARIANTS,
+    buf_type, enum_type, enum_variant, err_type, find_variant, is_fieldless_enum, is_float,
+    is_integer, item_node_of, type_elem, variant_field,
 };
 use crate::tools::query::qnote;
 
@@ -492,7 +492,7 @@ pub fn check_irrefutable(p: i64, what: *u8) {
 pub fn check_match(n: i64, expected: i64) -> i64 {
     unsafe {
         let scrutinee = NODES[n].a;
-        let st = check_wrapped(scrutinee, 0);
+        let st = check_recovering(scrutinee, 0);
         let mut result = expected;
         let mut all_never = true;
         // `if let` without `else` (0.6): of type `()`, like an `if`.
@@ -507,7 +507,12 @@ pub fn check_match(n: i64, expected: i64) -> i64 {
         for i in 0..NODES[n].count {
             let arm = child(n, i);
             push_scope();
-            check_pattern(NODES[arm].a, st);
+            if st == TY_ERROR {
+                // (after an error in the scrutinee: bindings of the error type)
+                poison_pattern(NODES[arm].a);
+            } else {
+                check_pattern(NODES[arm].a, st);
+            }
             if NODES[arm].b != 0 {
                 check_expr(NODES[arm].b, TY_BOOL);
             }
@@ -532,7 +537,7 @@ pub fn check_match(n: i64, expected: i64) -> i64 {
             }
             pop_scope();
         }
-        if st != TY_NEVER {
+        if st != TY_NEVER && st != TY_ERROR {
             check_arms(n, st);
         }
         if all_never || result == 0 {

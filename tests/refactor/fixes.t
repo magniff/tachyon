@@ -3,7 +3,7 @@
 $ check
 main.tach:15:25: error[type error] undefined variable 'twice' | help: add `use crate::util::twice;`
 main.tach:17:13: error[unsafe] calling a C function is unsafe | help: put it in an `unsafe { ... }` block, or the function's body in an `unsafe fn` (`tachyonc --fix-unsafe` does the former)
-main.tach:18:13: error[type error] 'hidden' is private
+main.tach:18:13: error[type error] 'hidden' is private | help: make it public: `pub fn hidden` at ./util.tach:19:1
 [exit 1]
 $ fix --dry-run
 --- a/main.tach

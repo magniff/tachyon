@@ -15,14 +15,14 @@ use crate::front::ast::NodeKind::{
     Range, While,
 };
 use crate::front::check::{
-    DEFER_LOOP_BASE, ENV, LOCALS, LOOP_STACK, RETURN_TYPE, SCOPES, SELF_TYPE, define_local,
-    lookup_local, mismatch_error, name_error, poison_statement, pop_scope, push_scope,
+    DEFER_LOOP_BASE, ENV, LOCALS, LOOP_STACK, RETURN_TYPE, SCOPES, SELF_TYPE, check_recovering,
+    define_local, lookup_local, mismatch_error, name_error, poison_statement, pop_scope, push_scope,
     restore_check_state, save_check_state, type_error, type_error_got,
 };
 use crate::front::check::check_mode::check_expr;
 use crate::front::check::resolve::resolve_type;
 use crate::front::check::synth_mode::{literal_takes_rhs_type, synth_expr};
-use crate::front::check::unsafety::{UNSAFE_DEPTH, WRAP_NODE, check_wrapped, is_borrow_param};
+use crate::front::check::unsafety::{UNSAFE_DEPTH, WRAP_NODE, is_borrow_param};
 use crate::front::generics::{CUR_INST, TP_BASE, env_enter, env_leave, template_of_key};
 use crate::front::lexer::SUF_I64;
 use crate::front::modules::CUR_MOD;
@@ -31,7 +31,7 @@ use crate::front::parser::UNDERSCORE;
 use crate::front::patterns::{check_irrefutable, check_pattern};
 use crate::front::traits::bounded_param_of_type;
 use crate::front::types::{
-    FNS, TYPES, TY_BOOL, TY_NEVER, TY_UNIT, TyKind, err_type, fn_param, is_integer,
+    FNS, TYPES, TY_BOOL, TY_ERROR, TY_NEVER, TY_UNIT, TyKind, err_type, fn_param, is_integer,
 };
 
 // ---- Functions ----
@@ -190,7 +190,7 @@ fn check_let(stmt: i64) -> bool {
 
 pub fn check_if(n: i64, expected: i64) -> i64 {
     unsafe {
-        check_wrapped(NODES[n].a, TY_BOOL);
+        check_recovering(NODES[n].a, TY_BOOL);
         let else_block = NODES[n].c;
         if else_block == 0 {
             if expected != TY_UNIT {
@@ -236,7 +236,7 @@ fn tail_needs_context(b: i64) -> bool {
 
 pub fn synth_if(n: i64) -> i64 {
     unsafe {
-        check_wrapped(NODES[n].a, TY_BOOL);
+        check_recovering(NODES[n].a, TY_BOOL);
         let else_block = NODES[n].c;
         // (0.9) `if c { None } else { Some(x) }`: the type from the other
         // branch.
@@ -341,7 +341,7 @@ pub fn check_loop(n: i64, expected: i64) -> i64 {
 
 pub fn check_while(n: i64) -> i64 {
     unsafe {
-        check_wrapped(NODES[n].b, TY_BOOL);
+        check_recovering(NODES[n].b, TY_BOOL);
         check_loop_body(n, NODES[n].c);
     }
     TY_UNIT
@@ -386,7 +386,15 @@ pub fn check_for(n: i64) -> i64 {
 fn check_for_each(n: i64) -> i64 {
     unsafe {
         let seq = NODES[n].c;
-        let seq_ty = check_wrapped(seq, 0);
+        let seq_ty = check_recovering(seq, 0);
+        if seq_ty == TY_ERROR {
+            // (after an error in the sequence, the body is checked too)
+            push_scope();
+            check_pattern(NODES[n].b, TY_ERROR);
+            check_loop_body(n, NODES[n].d);
+            pop_scope();
+            return TY_UNIT;
+        }
         let kind = TYPES[seq_ty].kind;
         if kind != TyKind::Slice && kind != TyKind::Array {
             type_error_got(seq,
