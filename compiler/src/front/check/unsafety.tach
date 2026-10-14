@@ -1,0 +1,160 @@
+// Unsafe code (0.9): the operations that need it, borrows, and the units
+// --fix-unsafe wraps.
+//
+// Safe code has no undefined behaviour; the operations that can have it
+// are allowed in unsafe code only: inside `unsafe { ... }` and in the body
+// of an `unsafe fn` (UNSAFE_DEPTH > 0). They are dereferencing, indexing
+// and slicing a raw pointer, casting an integer (other than the literal 0)
+// to a pointer, calling C (an `extern "C"` declaration or function
+// pointer), calling an `unsafe fn`, and reading a union's field.
+//
+// A *borrow* is a pointer known to point to live memory of its type: `&p`
+// for a place p, or a parameter declared with a pointer type (and not
+// `mut`), `self: *T` included. Dereferencing a borrow (`*b`, `b.f`, a
+// method through it) is safe; any other pointer is raw. So that borrowed
+// parameters can be trusted, passing a raw pointer where a function takes
+// a pointer parameter is unsafe (and so is calling through a function
+// pointer with one, or using such a function as a value).
+//
+// An unsafe operation outside unsafe code is an error (`error[unsafe]`;
+// a warning in 0.9). `--fix-unsafe` wraps them in unsafe blocks
+// (fixunsafe.tach).
+
+use crate::base::report_error_once;
+use crate::front::ast::{FN_UNSAFE, NODES, child};
+use crate::front::ast::NodeKind::{FieldAccess, Ident, TupleField, TyPtr, Unary};
+use crate::front::check::{CONST_CONTEXT, LOCALS, Res};
+use crate::front::lexer::Tok;
+use crate::front::types::FNS;
+use crate::tools::fixunsafe::{FIX_UNSAFE, note_unsafe_site};
+use crate::front::check::check_mode::check_expr;
+use crate::front::check::synth_mode::synth_expr;
+
+pub static mut UNSAFE_DEPTH: i64 = 0;
+
+// The innermost statement, block tail or condition being checked: what
+// --fix-unsafe wraps (0: none).
+pub static mut WRAP_NODE: i64 = 0;
+
+// Flag of an expression whose value is not read (a place written, or
+// whose address is taken): a union's field may be written so.
+pub const NODE_NO_READ: i64 = 256;
+
+// The kinds of unsafe operations (a warning is reported once per position
+// and kind).
+pub const U_DEREF: i64 = 1;
+
+pub const U_FIELD: i64 = 2;
+
+pub const U_METHOD: i64 = 3;
+
+pub const U_INDEX: i64 = 4;
+
+pub const U_SLICE: i64 = 5;
+
+pub const U_INT_PTR: i64 = 6;
+
+pub const U_C_CALL: i64 = 7;
+
+const U_UNSAFE_CALL: i64 = 8;
+
+pub const U_UNION: i64 = 9;
+
+pub const U_PTR_ARG: i64 = 10;
+
+pub const U_FN_VALUE: i64 = 11;
+
+// Operation n, of kind `key`, needs unsafe code.
+pub fn unsafe_op(n: i64, key: i64, message: *u8) {
+    if UNSAFE_DEPTH > 0 || CONST_CONTEXT {
+        return;
+    }
+    if FIX_UNSAFE && WRAP_NODE != 0 {
+        note_unsafe_site(WRAP_NODE);
+        return;
+    }
+    unsafe {
+        report_error_once(NODES[n].start, key, c"unsafe", message,
+            c"put it in an `unsafe { ... }` block, or the function's body in an `unsafe fn` (`tachyonc --fix-unsafe` does the former)");
+    }
+}
+
+// Checks expression e (synthesized when `expected` is 0) as a unit
+// --fix-unsafe may wrap: a condition, a sequence, an arm's body.
+pub fn check_wrapped(e: i64, expected: i64) -> i64 {
+    let saved = WRAP_NODE;
+    WRAP_NODE = e;
+    let ty = if expected != 0 { check_expr(e, expected) } else { synth_expr(e) };
+    WRAP_NODE = saved;
+    ty
+}
+
+// Whether parameter node `param` is a borrow: a pointer type as written,
+// not `mut`.
+pub fn is_borrow_param(param: i64) -> bool {
+    unsafe { NODES[param].c == 0 && NODES[param].b != 0 && NODES[NODES[param].b].kind == TyPtr }
+}
+
+pub fn has_borrow_param(f: i64) -> bool {
+    unsafe {
+        if FNS[f].is_extern {
+            return false;
+        }
+        let item = FNS[f].node;
+        for i in 0..NODES[item].count {
+            if is_borrow_param(child(item, i)) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// Whether expression e (checked) is a borrow.
+pub fn is_borrow(e: i64) -> bool {
+    unsafe {
+        let kind = NODES[e].kind;
+        if kind == Unary && NODES[e].op == Tok::Amp {
+            return true;
+        }
+        if kind == Ident && NODES[e].res == Res::Local && NODES[e].y >= 0 {
+            return LOCALS[NODES[e].y].borrow;
+        }
+        false
+    }
+}
+
+// Marks the place `target` (a chain of fields) as not read.
+pub fn mark_no_read(target: i64) {
+    unsafe {
+        let mut e = target;
+        while NODES[e].kind == FieldAccess || NODES[e].kind == TupleField {
+            NODES[e].p |= NODE_NO_READ;
+            e = NODES[e].a;
+        }
+    }
+}
+
+// A direct call n of function f (its arguments in n's list, from `first`
+// on for the ones written after a method's receiver): calling C or an
+// `unsafe fn`, and passing a raw pointer to a borrowed parameter, are
+// unsafe.
+pub fn check_call_safety(n: i64, f: i64, first: i64) {
+    unsafe {
+        if FNS[f].is_extern {
+            unsafe_op(n, U_C_CALL, c"calling a C function is unsafe");
+            return;
+        }
+        if (FNS[f].attrs & FN_UNSAFE) != 0 {
+            unsafe_op(n, U_UNSAFE_CALL, c"calling an `unsafe fn` is unsafe");
+        }
+        let item = FNS[f].node;
+        let count = if NODES[n].count < NODES[item].count { NODES[n].count } else { NODES[item].count };
+        for i in first..count {
+            let arg = child(n, i);
+            if is_borrow_param(child(item, i)) && !is_borrow(arg) {
+                unsafe_op(arg, U_PTR_ARG, c"passing a raw pointer to a pointer parameter is unsafe (the function dereferences it as a borrow): pass `&place` or a pointer parameter");
+            }
+        }
+    }
+}

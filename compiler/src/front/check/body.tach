@@ -1,0 +1,516 @@
+// Function bodies and control flow: a function's body checked against its
+// return type, blocks (their scopes, unsafe blocks, recovery at each
+// statement), statements (`let`, `defer`), `if` in both modes, loops and
+// the jumps out of them (`break`, `continue`, `return`).
+
+use crate::base::{
+    RECOVER_DEPTH, _setjmp, err_begin, err_end, err_str, err_sym, intern_c, recover_enter,
+    recover_leave,
+};
+use crate::front::ast::{
+    BLOCK_UNSAFE, FN_UNSAFE, NODES, child, list_begin, list_end, list_push, new_node,
+};
+use crate::front::ast::NodeKind::{
+    Block, Defer, ExprStmt, FieldAccess, For, Ident, Index, Int, Let, Loop, PatBind, PatTuple, Path,
+    Range, While,
+};
+use crate::front::check::{
+    DEFER_LOOP_BASE, ENV, LOCALS, LOOP_STACK, RETURN_TYPE, SCOPES, SELF_TYPE, define_local, lookup_local, mismatch_error, name_error,
+    poison_statement, pop_scope, push_scope, restore_check_state, save_check_state, type_error, type_error_got,
+};
+use crate::front::check::resolve::resolve_type;
+use crate::front::check::unsafety::{UNSAFE_DEPTH, WRAP_NODE, check_wrapped, is_borrow_param};
+use crate::front::generics::{CUR_INST, TP_BASE, env_enter, env_leave, template_of_key};
+use crate::front::lexer::SUF_I64;
+use crate::front::modules::CUR_MOD;
+use crate::front::modules::lookup::{B_ITEM, B_TVARIANT, binding_kind, binding_value, lookup_quiet};
+use crate::front::parser::UNDERSCORE;
+use crate::front::patterns::{check_irrefutable, check_pattern};
+use crate::front::traits::bounded_param_of_type;
+use crate::front::types::{
+    FNS, TYPES, TY_BOOL, TY_NEVER, TY_UNIT, TyKind, err_type, fn_param, is_integer,
+};
+use crate::front::check::check_mode::check_expr;
+use crate::front::check::synth_mode::{literal_takes_rhs_type, synth_expr};
+
+// ---- Functions ----
+
+pub fn check_function(item: i64) {
+    unsafe {
+        let f = NODES[item].x - 1;
+        CUR_MOD = FNS[f].module;
+        let mut saved_env = TP_BASE;
+        if FNS[f].tmpl != 0 {
+            // An instance: its template's parameters stand for its arguments.
+            saved_env = env_enter(NODES[FNS[FNS[f].tmpl - 1].node].g, FNS[f].targs, FNS[f].targ_count);
+            CUR_INST = f;
+        }
+        SELF_TYPE = FNS[f].self_ty;
+        RETURN_TYPE = FNS[f].ret;
+        LOOP_STACK.count = 0;
+        DEFER_LOOP_BASE = -1;
+        ENV.count = 0;
+        SCOPES.count = 0;
+        for i in 0..NODES[item].count {
+            let param = child(item, i);
+            if NODES[param].a != UNDERSCORE {
+                NODES[param].x = define_local(NODES[param].a, fn_param(f, i), NODES[param].c != 0, true);
+                LOCALS[NODES[param].x].borrow = is_borrow_param(param);
+                LOCALS[NODES[param].x].tparam = bounded_param_of_type(NODES[param].b);
+            } else {
+                NODES[param].x = -1;
+            }
+        }
+        UNSAFE_DEPTH = if (FNS[f].attrs & FN_UNSAFE) != 0 { 1 } else { 0 };
+        WRAP_NODE = 0;
+        let body = NODES[item].c;
+        let body_ty = check_block(body, RETURN_TYPE);
+        if body_ty != RETURN_TYPE && body_ty != TY_NEVER {
+            err_begin(NODES[body].start);
+            err_str(c"function '");
+            err_sym(NODES[item].a);
+            err_str(c"' body has type '");
+            err_type(body_ty);
+            err_str(c"', expected '");
+            err_type(RETURN_TYPE);
+            err_str(c"'");
+            err_end();
+        }
+        SELF_TYPE = 0;
+        if FNS[f].tmpl != 0 {
+            env_leave(saved_env);
+            CUR_INST = -1;
+        }
+        CUR_MOD = 0;
+    }
+}
+
+// The type of a block; `expected` (0 for none) goes to its tail.
+pub fn check_block(block: i64, expected: i64) -> i64 {
+    unsafe {
+        push_scope();
+        let is_unsafe = (NODES[block].p & BLOCK_UNSAFE) != 0;
+        if is_unsafe {
+            UNSAFE_DEPTH += 1;
+        }
+        let saved_wrap = WRAP_NODE;
+        let mut diverges = false;
+        for i in 0..NODES[block].count {
+            // A recovery point: after an error, on at the next statement. A
+            // block with a statement that failed counts as diverging, which
+            // reports nothing more about its type.
+            let stmt = child(block, i);
+            let depth = RECOVER_DEPTH;
+            let state = save_check_state();
+            let mut result = false;
+            WRAP_NODE = stmt;
+            if _setjmp(recover_enter()) == 0 {
+                result = check_stmt(stmt);
+            } else {
+                restore_check_state(state);
+                poison_statement(stmt);
+                result = true;
+            }
+            recover_leave(depth);
+            if result {
+                diverges = true;
+            }
+        }
+        let tail = NODES[block].a;
+        let mut ty = TY_UNIT;
+        if tail != 0 {
+            WRAP_NODE = tail;
+            ty = if expected != 0 { check_expr(tail, expected) } else { synth_expr(tail) };
+        }
+        WRAP_NODE = saved_wrap;
+        if is_unsafe {
+            UNSAFE_DEPTH -= 1;
+        }
+        pop_scope();
+        NODES[block].ty = if diverges { TY_NEVER } else { ty };
+        NODES[block].ty
+    }
+}
+
+pub fn check_branch(block: i64, expected: i64) -> i64 {
+    let ty = check_block(block, expected);
+    if ty != expected && ty != TY_NEVER {
+        mismatch_error(block, expected, ty);
+    }
+    ty
+}
+
+// Whether the statement diverges.
+fn check_stmt(stmt: i64) -> bool {
+    unsafe {
+        if NODES[stmt].kind == Let {
+            return check_let(stmt);
+        }
+        if NODES[stmt].kind == Defer {
+            return check_defer(stmt);
+        }
+        let expr = NODES[stmt].a;
+        let ty = if NODES[stmt].b != 0 { synth_expr(expr) } else { check_expr(expr, TY_UNIT) };
+        ty == TY_NEVER
+    }
+}
+
+// `defer` (0.6): the deferred expression, of any type (its value is
+// dropped), may not leave it: no `return`, and `break`/`continue` only to
+// loops inside it. It is checked where it stands, so it sees the bindings
+// made before it.
+fn check_defer(stmt: i64) -> bool {
+    let saved = DEFER_LOOP_BASE;
+    DEFER_LOOP_BASE = LOOP_STACK.count;
+    unsafe { synth_expr(NODES[stmt].a); }
+    DEFER_LOOP_BASE = saved;
+    false
+}
+
+fn check_let(stmt: i64) -> bool {
+    unsafe {
+        let init = NODES[stmt].c;
+        let mut binding_ty = 0;
+        let mut actual = 0;
+        if NODES[stmt].b != 0 {
+            binding_ty = resolve_type(NODES[stmt].b);
+            actual = check_expr(init, binding_ty);
+        } else {
+            binding_ty = synth_expr(init);
+            actual = binding_ty;
+        }
+        check_pattern(NODES[stmt].a, binding_ty);
+        check_irrefutable(NODES[stmt].a, c"let");
+        actual == TY_NEVER
+    }
+}
+
+pub fn check_if(n: i64, expected: i64) -> i64 {
+    unsafe {
+        check_wrapped(NODES[n].a, TY_BOOL);
+        let else_block = NODES[n].c;
+        if else_block == 0 {
+            if expected != TY_UNIT {
+                err_begin(NODES[n].start);
+                err_str(c"if without else must have type '()', expected '");
+                err_type(expected);
+                err_str(c"'");
+                err_end();
+            }
+            check_branch(NODES[n].b, TY_UNIT);
+            return expected;
+        }
+        let then_ty = check_branch(NODES[n].b, expected);
+        let else_ty = check_branch(else_block, expected);
+        if then_ty == TY_NEVER && else_ty == TY_NEVER { TY_NEVER } else { expected }
+    }
+}
+
+// Whether block b ends in a variant of a generic enum named without its
+// type arguments (`None`, `Option::None`): its type comes from context.
+fn tail_needs_context(b: i64) -> bool {
+    unsafe {
+        if NODES[b].kind != Block {
+            return false;
+        }
+        let tail = NODES[b].a;
+        if tail == 0 || NODES[tail].g != 0 {
+            return false;
+        }
+        if NODES[tail].kind == Ident {
+            if lookup_local(NODES[tail].a).is_some() {
+                return false;
+            }
+            return binding_kind(lookup_quiet(CUR_MOD, NODES[tail].a, CUR_MOD)) == B_TVARIANT;
+        }
+        if NODES[tail].kind == Path && NODES[tail].count == 0 && NODES[tail].y == 0 {
+            let b2 = lookup_quiet(CUR_MOD, NODES[tail].a, CUR_MOD);
+            return binding_kind(b2) == B_ITEM && template_of_key(binding_value(b2)) < 0;
+        }
+        false
+    }
+}
+
+pub fn synth_if(n: i64) -> i64 {
+    unsafe {
+        check_wrapped(NODES[n].a, TY_BOOL);
+        let else_block = NODES[n].c;
+        // (0.9) `if c { None } else { Some(x) }`: the type from the other
+        // branch.
+        if else_block != 0 && NODES[else_block].kind == Block && tail_needs_context(NODES[n].b)
+            && !tail_needs_context(else_block) {
+            let else_ty = check_block(else_block, 0);
+            if else_ty != TY_NEVER {
+                check_branch(NODES[n].b, else_ty);
+                return else_ty;
+            }
+            return check_block(NODES[n].b, 0);
+        }
+        let then_ty = check_block(NODES[n].b, 0);
+        if else_block != 0 && then_ty != TY_NEVER && tail_needs_context(else_block) {
+            check_branch(else_block, then_ty);
+            return then_ty;
+        }
+        if else_block == 0 {
+            if then_ty != TY_UNIT && then_ty != TY_NEVER {
+                type_error_got(n, c"if without else must have type '()'", then_ty);
+            }
+            return TY_UNIT;
+        }
+        let else_ty = check_block(else_block, 0);
+        if then_ty == TY_NEVER {
+            return else_ty;
+        }
+        if else_ty == TY_NEVER || then_ty == else_ty {
+            return then_ty;
+        }
+        err_begin(NODES[n].start);
+        err_str(c"if/else branches have different types: '");
+        err_type(then_ty);
+        err_str(c"' vs '");
+        err_type(else_ty);
+        err_str(c"'");
+        err_end()
+    }
+}
+
+// ---- Loops and jumps ----
+
+fn leave_defer_error(n: i64, keyword: *u8) {
+    unsafe {
+        err_begin(NODES[n].start);
+        err_str(c"'");
+        err_str(keyword);
+        err_str(c"' cannot leave a deferred statement");
+        err_end();
+    }
+}
+
+// The loop a `break`/`continue` refers to.
+pub fn find_loop(n: i64, keyword: *u8) -> i64 {
+    unsafe {
+        let label = NODES[n].a;
+        if label == 0 {
+            if LOOP_STACK.count == 0 {
+                err_begin(NODES[n].start);
+                err_str(keyword);
+                err_str(c" outside of loop");
+                err_end();
+            }
+            if DEFER_LOOP_BASE >= LOOP_STACK.count {
+                leave_defer_error(n, keyword);
+            }
+            return LOOP_STACK.data[LOOP_STACK.count - 1];
+        }
+        let mut i = LOOP_STACK.count - 1;
+        while i >= 0 {
+            let lp = LOOP_STACK.data[i];
+            if NODES[lp].a == label {
+                if DEFER_LOOP_BASE > i {
+                    leave_defer_error(n, keyword);
+                }
+                return lp;
+            }
+            i -= 1;
+        }
+        name_error(NODES[n].start, c"unknown loop label ':", label, c"'")
+    }
+}
+
+fn check_loop_body(lp: i64, body: i64) {
+    LOOP_STACK.push(lp);
+    check_branch(body, TY_UNIT);
+    LOOP_STACK.pop();
+}
+
+// `loop`; `expected` (0 for none) is the type of its break values.
+pub fn check_loop(n: i64, expected: i64) -> i64 {
+    unsafe {
+        NODES[n].x = 0;
+        NODES[n].y = expected;
+        check_loop_body(n, NODES[n].b);
+        if NODES[n].x == 0 {
+            return TY_NEVER;
+        }
+        if NODES[n].y == 0 { TY_UNIT } else { NODES[n].y }
+    }
+}
+
+pub fn check_while(n: i64) -> i64 {
+    unsafe {
+        check_wrapped(NODES[n].b, TY_BOOL);
+        check_loop_body(n, NODES[n].c);
+    }
+    TY_UNIT
+}
+
+pub fn check_for(n: i64) -> i64 {
+    unsafe {
+        let range = NODES[n].c;
+        if NODES[range].kind != Range {
+            return check_for_each(n);
+        }
+        let start = NODES[range].a;
+        let end = NODES[range].b;
+        let mut elem_ty = 0;
+        if literal_takes_rhs_type(start, end) {
+            elem_ty = synth_expr(end);
+            check_expr(start, elem_ty);
+        } else {
+            elem_ty = synth_expr(start);
+            check_expr(end, elem_ty);
+        }
+        if !is_integer(elem_ty) {
+            type_error_got(range, c"range bounds must be integers", elem_ty);
+        }
+        NODES[range].ty = elem_ty;
+        let pattern = NODES[n].b;
+        if NODES[pattern].kind == PatTuple {
+            type_error(pattern, c"a 'for' loop over a range binds one integer, not a tuple");
+        }
+        push_scope();
+        check_pattern(pattern, elem_ty);
+        check_irrefutable(pattern, c"for");
+        check_loop_body(n, NODES[n].d);
+        pop_scope();
+        TY_UNIT
+    }
+}
+
+// `for p in s` over a slice or an array (0.4), by value:
+//   { let s' = s; for i' in 0..len { let p = s'[i']; body } }
+// The sequence is evaluated once; the loop keeps its label.
+fn check_for_each(n: i64) -> i64 {
+    unsafe {
+        let seq = NODES[n].c;
+        let seq_ty = check_wrapped(seq, 0);
+        let kind = TYPES[seq_ty].kind;
+        if kind != TyKind::Slice && kind != TyKind::Array {
+            type_error_got(seq, c"'for' loops iterate over integer ranges ('a..b'), slices and arrays", seq_ty);
+        }
+        let start = NODES[n].start;
+        let end = NODES[n].end;
+        // (Fixed names: an inner loop's shadow the outer's, which are read
+        // before it. Interned before the symbol tables, see init_declarations.)
+        let seq_sym = intern_c(c"__for_seq");
+        let index_sym = intern_c(c"__for_index");
+        // let s' = s;
+        let seq_bind = new_node(PatBind, start, end);
+        NODES[seq_bind].a = seq_sym;
+        let seq_let = new_node(Let, start, end);
+        NODES[seq_let].a = seq_bind;
+        NODES[seq_let].c = seq;
+        // 0..len
+        let zero = new_node(Int, start, end);
+        let len = if kind == TyKind::Slice {
+            let s_ref = new_node(Ident, start, end);
+            NODES[s_ref].a = seq_sym;
+            let field = new_node(FieldAccess, start, end);
+            NODES[field].a = s_ref;
+            NODES[field].b = intern_c(c"len");
+            field
+        } else {
+            let count = new_node(Int, start, end);
+            NODES[count].a = TYPES[seq_ty].b;
+            NODES[count].b = SUF_I64;
+            count
+        };
+        NODES[zero].b = SUF_I64;
+        let range = new_node(Range, start, end);
+        NODES[range].a = zero;
+        NODES[range].b = len;
+        // let p = s'[i'];
+        let s_ref = new_node(Ident, start, end);
+        NODES[s_ref].a = seq_sym;
+        let i_ref = new_node(Ident, start, end);
+        NODES[i_ref].a = index_sym;
+        let elem = new_node(Index, start, end);
+        NODES[elem].a = s_ref;
+        NODES[elem].b = i_ref;
+        let elem_let = new_node(Let, start, end);
+        NODES[elem_let].a = NODES[n].b;
+        NODES[elem_let].c = elem;
+        // The body, after it.
+        let body = new_node(Block, start, end);
+        let mark = list_begin();
+        list_push(elem_let);
+        let old_body = new_node(ExprStmt, start, end);
+        NODES[old_body].a = NODES[n].d;
+        list_push(old_body);
+        list_end(body, mark);
+        // The loop, then the block around it, which takes the loop's place.
+        let index_bind = new_node(PatBind, start, end);
+        NODES[index_bind].a = index_sym;
+        let lp = new_node(For, start, end);
+        NODES[lp] = NODES[n];
+        NODES[lp].b = index_bind;
+        NODES[lp].c = range;
+        NODES[lp].d = body;
+        let outer = new_node(Block, start, end);
+        let mark2 = list_begin();
+        list_push(seq_let);
+        let loop_stmt = new_node(ExprStmt, start, end);
+        NODES[loop_stmt].a = lp;
+        list_push(loop_stmt);
+        list_end(outer, mark2);
+        NODES[n] = NODES[outer];
+        synth_expr(n)
+    }
+}
+
+pub fn check_break(n: i64) {
+    unsafe {
+        let lp = find_loop(n, c"break");
+        NODES[n].x = lp;
+        let value = NODES[n].b;
+        if value != 0 {
+            if NODES[lp].kind != Loop {
+                err_begin(NODES[value].start);
+                err_str(c"'break' with a value is only allowed in 'loop', not in '");
+                err_str(if NODES[lp].kind == While { c"while" } else { c"for" });
+                err_str(c"'");
+                err_end();
+            }
+            if NODES[lp].y != 0 {
+                check_expr(value, NODES[lp].y);
+            } else {
+                let ty = synth_expr(value);
+                if ty != TY_NEVER {
+                    NODES[lp].y = ty;
+                }
+            }
+        } else if NODES[lp].kind == Loop {
+            let ty = NODES[lp].y;
+            if ty != 0 && ty != TY_UNIT && ty != TY_NEVER {
+                err_begin(NODES[n].start);
+                err_str(c"expected '");
+                err_type(ty);
+                err_str(c"', got '()' (break without a value)");
+                err_end();
+            }
+            if ty == 0 {
+                NODES[lp].y = TY_UNIT;
+            }
+        }
+        NODES[lp].x = 1;
+    }
+}
+
+pub fn check_return(n: i64) -> i64 {
+    unsafe {
+        let value = NODES[n].a;
+        if DEFER_LOOP_BASE >= 0 {
+            type_error(n, c"'return' inside a deferred statement");
+        }
+        if value != 0 {
+            check_expr(value, RETURN_TYPE);
+        } else if RETURN_TYPE != TY_UNIT && RETURN_TYPE != TY_NEVER {
+            err_begin(NODES[n].start);
+            err_str(c"empty return in function returning '");
+            err_type(RETURN_TYPE);
+            err_str(c"'");
+            err_end();
+        }
+        TY_NEVER
+    }
+}

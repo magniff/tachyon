@@ -1,0 +1,575 @@
+// Types of the declarations (the later phases of collect_phase): structs
+// and enums that would contain themselves, function signatures (and the C
+// FFI rules for `extern "C"` ones), statics and constants; and resolving
+// a type as written (a name, a path, an alias, a generic instance) to a
+// type.
+
+use crate::base::{buf_new, err_begin, err_end, err_end_soft, err_help, err_int, err_str, err_sym};
+use crate::front::ast::{FN_SIG_FAILED, NODES, REPR_C, child};
+use crate::front::ast::NodeKind::{CStr, TyArray, TyName, TyNever, TyPtr, TySlice, TyTuple, TyUnit};
+use crate::front::check::{
+    SELF_TYPE, SELF_TYPE_SYM, Try, attempt, has_error_type, name_error, resolve_type_or_error,
+};
+use crate::front::consteval::{check_const_expr, const_emit, const_value, eval_array_len};
+use crate::front::generics::{
+    TPL_NONE, TP_BASE, TP_NAMES, TP_TYPES, env_lookup, template_instance, template_of_key,
+};
+use crate::front::generics::instantiate::push_written_targs;
+use crate::front::modules::{CUR_MOD, module_of};
+use crate::front::modules::lookup::{
+    B_ITEM, B_PRIVATE, access_error, binding_kind, binding_value, lookup_name, note_c_use,
+    path_module,
+};
+use crate::front::parser::UNDERSCORE;
+use crate::front::traits::SYM_TRAIT;
+use crate::front::types::{
+    ALIAS_BUSY, ALIAS_TYPE, CONST_COUNT, ENUMS, ENUM_COUNT, FNS, FN_COUNT, STATICS, STATIC_COUNT,
+    STRUCTS, STRUCT_COUNT, SYM_ALIAS, SYM_ENUM, SYM_PRIMITIVE, SYM_STRUCT, TLISTS, TSCRATCH, TYPES,
+    TY_ERROR, TY_NEVER, TY_UNIT, TyKind, VARIANTS, array_of, enum_type, enum_variant, err_type,
+    fn_param, is_ffi_field, is_ffi_safe, item_node_of, make_type, ptr_to, slice_of, struct_field,
+    struct_type, type_elem, variant_field,
+};
+use crate::tools::query::qnote;
+use crate::front::check::names::unknown_name_error;
+
+pub fn reset_layout_states() {
+    unsafe {
+        for t in 0..STRUCT_COUNT {
+            STRUCTS[t].layout_state = 0;
+        }
+        for t in 0..ENUM_COUNT {
+            ENUMS[t].layout_state = 0;
+        }
+    }
+}
+
+// Each struct or enum on a cycle of fields is reported, and the cycle is
+// broken: its fields that hold it have the error type.
+pub fn check_struct_cycles() {
+    unsafe {
+        for s in 0..STRUCT_COUNT {
+            if STRUCTS[s].generic == 0 {
+                struct_cycle_error(s, NODES[STRUCTS[s].node].start);
+            }
+        }
+        for e in 0..ENUM_COUNT {
+            if ENUMS[e].generic == 0 {
+                enum_cycle_error(e, NODES[ENUMS[e].node].start);
+            }
+        }
+    }
+}
+
+// Reports (at pos) that struct s holds itself through its fields, and
+// breaks the cycle; whether it does.
+pub fn struct_cycle_error(s: i64, pos: i64) -> bool {
+    unsafe {
+        let mut found = false;
+        for i in 0..STRUCTS[s].field_count {
+            let field = struct_field(s, i);
+            reset_layout_states();
+            if holds((*field).ty, s + 1) {
+                (*field).ty = TY_ERROR;
+                found = true;
+            }
+        }
+        reset_layout_states();
+        if found {
+            err_begin(pos);
+            err_str(c"struct '");
+            err_sym(STRUCTS[s].name);
+            err_str(c"' has infinite size due to recursive field (use a pointer to break the cycle)");
+            err_end_soft();
+        }
+        found
+    }
+}
+
+pub fn enum_cycle_error(e: i64, pos: i64) -> bool {
+    unsafe {
+        let mut found = false;
+        for i in 0..ENUMS[e].variant_count {
+            let v = enum_variant(e, i);
+            for k in 0..VARIANTS[v].field_count {
+                reset_layout_states();
+                if holds(variant_field(v, k), -(e + 1)) {
+                    TLISTS.data[VARIANTS[v].fields + k] = TY_ERROR;
+                    found = true;
+                }
+            }
+        }
+        reset_layout_states();
+        if !found {
+            return false;
+        }
+        // (the variants' shapes hold their field types)
+        if ENUMS[e].has_fields {
+            let repr_c = (ENUMS[e].repr & REPR_C) != 0;
+            for i in 0..ENUMS[e].variant_count {
+                let v = enum_variant(e, i);
+                let mark = TSCRATCH.count;
+                if !repr_c {
+                    TSCRATCH.push(ENUMS[e].tag);
+                }
+                for k in 0..VARIANTS[v].field_count {
+                    TSCRATCH.push(variant_field(v, k));
+                }
+                VARIANTS[v].shape = make_type(TyKind::Tuple, 0, 0, mark);
+            }
+        }
+        err_begin(pos);
+        err_str(c"enum '");
+        err_sym(ENUMS[e].name);
+        err_str(c"' has infinite size due to a recursive field (use a pointer to break the cycle)");
+        err_end_soft();
+        true
+    }
+}
+
+// Whether a value of type t holds the struct or enum `at` (struct s as
+// s + 1, enum e as -(e + 1)); layout_state 2 marks the ones seen.
+fn holds(t: i64, at: i64) -> bool {
+    unsafe {
+        let kind = TYPES[t].kind;
+        if kind == TyKind::Struct {
+            let s = TYPES[t].a;
+            if s + 1 == at {
+                return true;
+            }
+            if STRUCTS[s].layout_state != 0 {
+                return false;
+            }
+            STRUCTS[s].layout_state = 2;
+            for i in 0..STRUCTS[s].field_count {
+                if holds((*struct_field(s, i)).ty, at) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if kind == TyKind::Enum {
+            let e = TYPES[t].a;
+            if -(e + 1) == at {
+                return true;
+            }
+            if ENUMS[e].layout_state != 0 {
+                return false;
+            }
+            ENUMS[e].layout_state = 2;
+            for i in 0..ENUMS[e].variant_count {
+                let v = enum_variant(e, i);
+                for k in 0..VARIANTS[v].field_count {
+                    if holds(variant_field(v, k), at) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+        if kind == TyKind::Array {
+            return holds(TYPES[t].a, at);
+        }
+        if kind == TyKind::Tuple {
+            for i in 0..TYPES[t].count {
+                if holds(type_elem(t, i), at) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+pub fn collect_functions() {
+    unsafe {
+        for f in 0..FN_COUNT {
+            if FNS[f].generic == 0 && FNS[f].tmpl == 0 {
+                CUR_MOD = FNS[f].module;
+                SELF_TYPE = FNS[f].self_ty;
+                resolve_signature(f);
+            }
+        }
+        SELF_TYPE = 0;
+        CUR_MOD = 0;
+    }
+}
+
+// The parameter and result types of function f.
+// (A type that names nothing is the error type; 0.10. So are all of them
+// for a function whose declaration failed.)
+pub fn resolve_signature(f: i64) {
+    unsafe {
+        let item = FNS[f].node;
+        let failed = (NODES[item].p & FN_SIG_FAILED) != 0;
+        let mark = TSCRATCH.count;
+        for i in 0..NODES[item].count {
+            let param = child(item, i);
+            let name = NODES[param].a;
+            if name != UNDERSCORE && !failed {
+                for j in 0..i {
+                    if NODES[child(item, j)].a == name {
+                        err_begin(NODES[param].start);
+                        err_str(c"duplicate parameter '");
+                        err_sym(name);
+                        err_str(c"'");
+                        err_end_soft();
+                        break;
+                    }
+                }
+            }
+            let ty = if failed { TY_ERROR } else { resolve_type_or_error(NODES[param].b) };
+            TSCRATCH.push(ty);
+        }
+        FNS[f].params = TLISTS.count;
+        FNS[f].param_count = TSCRATCH.count - mark;
+        for i in mark..TSCRATCH.count {
+            TLISTS.push(TSCRATCH.data[i]);
+        }
+        TSCRATCH.count = mark;
+        FNS[f].ret = if failed {
+            TY_ERROR
+        } else if NODES[item].b == 0 {
+            TY_UNIT
+        } else {
+            resolve_type_or_error(NODES[item].b)
+        };
+        if (FNS[f].is_extern || FNS[f].export) && !failed {
+            check_c_function(f);
+        }
+    }
+}
+
+// The parameters and result of a function with C's convention must be
+// FFI-safe (see is_ffi_safe).
+fn check_c_function(f: i64) {
+    unsafe {
+        let item = FNS[f].node;
+        for i in 0..FNS[f].param_count {
+            let param = child(item, i);
+            check_ffi_type(fn_param(f, i), NODES[param].b, c"parameter");
+        }
+        let ret = FNS[f].ret;
+        if ret != TY_UNIT && ret != TY_NEVER {
+            check_ffi_type(ret, NODES[item].b, c"result");
+        }
+    }
+}
+
+fn check_c_signature(fn_ty: i64, n: i64, what: *u8) {
+    unsafe {
+        for i in 0..TYPES[fn_ty].count {
+            check_ffi_type(type_elem(fn_ty, i), child(n, i), c"parameter");
+        }
+        let ret = TYPES[fn_ty].a;
+        if ret != TY_UNIT && ret != TY_NEVER {
+            check_ffi_type(ret, NODES[n].a, c"result");
+        }
+    }
+}
+
+fn check_ffi_type(t: i64, n: i64, what: *u8) {
+    unsafe {
+        if is_ffi_safe(t) || has_error_type(t) {
+            return;
+        }
+        err_begin(NODES[n].start);
+        err_str(c"type '");
+        err_type(t);
+        err_str(c"' of this ");
+        err_str(what);
+        err_str(c" cannot cross to C");
+        let kind = TYPES[t].kind;
+        if kind == TyKind::Struct || kind == TyKind::Enum {
+            err_help(c"declare it #[repr(C)] (its layout is unspecified otherwise), with fields that can cross to C");
+        } else if kind == TyKind::Fn {
+            err_help(c"use an extern \"C\" fn type, and pass functions defined with extern \"C\" fn");
+        } else if kind == TyKind::Slice {
+            err_help(c"pass the pointer and the length (s.ptr, s.len)");
+        } else if kind == TyKind::Tuple {
+            err_help(c"use a #[repr(C)] struct");
+        } else if kind == TyKind::Array {
+            err_help(c"pass a pointer to its first element, or wrap it in a #[repr(C)] struct");
+        }
+        err_end_soft();
+    }
+}
+
+pub fn collect_statics() {
+    unsafe {
+        for s in 0..STATIC_COUNT {
+            let item = STATICS[s].node;
+            CUR_MOD = module_of(item);
+            let ty = resolve_type_or_error(NODES[item].b);
+            STATICS[s].ty = ty;
+            // A static shared with C is memory with C's layout: arrays of
+            // FFI-safe types too (0.4).
+            if STATICS[s].linkage != 0 && !is_ffi_field(ty) {
+                check_ffi_type(ty, NODES[item].b, c"static");
+            }
+            if STATICS[s].linkage == 1 || has_error_type(ty) {
+                continue;
+            }
+            attempt(Try::Static, s);
+        }
+        CUR_MOD = 0;
+    }
+}
+
+// The initializer of static s.
+pub fn check_static(s: i64) {
+    unsafe {
+        let item = STATICS[s].node;
+        let ty = STATICS[s].ty;
+        check_const_expr(NODES[item].c, ty);
+        if NODES[NODES[item].c].kind == CStr {
+            // A C string (0.4): the address of the literal.
+            return;
+        }
+        // Evaluated now to report non-constant initializers; the code
+        // generator evaluates it again into the data section.
+        let scratch = buf_new();
+        const_emit(NODES[item].c, ty, scratch);
+    }
+}
+
+pub fn evaluate_consts() {
+    CUR_MOD = 0;
+    for c in 0..CONST_COUNT {
+        const_value(c);
+    }
+}
+
+// ---- Resolving types ----
+
+pub fn resolve_type(n: i64) -> i64 {
+    unsafe {
+        let kind = NODES[n].kind;
+        match kind {
+            TyName => return resolve_type_name(n),
+            TyUnit => return TY_UNIT,
+            TyNever => return TY_NEVER,
+            TyPtr => return ptr_to(resolve_type(NODES[n].a)),
+            TySlice => return slice_of(resolve_type(NODES[n].a)),
+            TyArray => {
+                let elem = resolve_type(NODES[n].a);
+                return array_of(elem, eval_array_len(NODES[n].b));
+            }
+            _ => {}
+        }
+        // A tuple or a function type: the element types first.
+        let mark = TSCRATCH.count;
+        for i in 0..NODES[n].count {
+            let elem = resolve_type(child(n, i));
+            TSCRATCH.push(elem);
+        }
+        if kind == TyTuple {
+            return make_type(TyKind::Tuple, 0, 0, mark);
+        }
+        let result = resolve_type(NODES[n].a);
+        let fn_ty = make_type(TyKind::Fn, result, NODES[n].d, mark);
+        if NODES[n].d != 0 {
+            check_c_signature(fn_ty, n, c"an extern \"C\" fn type");
+        }
+        fn_ty
+    }
+}
+
+// A named type: a type parameter, a primitive, `Self`, or a struct, enum
+// or alias (through the module path in its list, if any; an instance of a
+// generic one with the arguments in its `g`).
+fn resolve_type_name(n: i64) -> i64 {
+    unsafe {
+        let name = NODES[n].a;
+        let g = NODES[n].g;
+        if NODES[n].count == 0 {
+            let param = env_lookup(name);
+            if param != 0 {
+                if g != 0 {
+                    name_error(NODES[n].start, c"type parameter '", name, c"' takes no type arguments");
+                }
+                return param;
+            }
+            if g == 0 {
+                return resolve_named(name, NODES[n].start);
+            }
+        }
+        let key = type_name_key(n);
+        if key < 0 {
+            unknown_name_error(NODES[n].start, c"unknown type '", name);
+        }
+        let tpl = template_of_key(key);
+        if tpl != TPL_NONE {
+            if g == 0 {
+                err_begin(NODES[n].start);
+                err_str(c"'");
+                err_sym(name);
+                err_str(c"' is generic: write its type arguments ('");
+                err_sym(name);
+                err_str(c"<...>')");
+                err_end();
+            }
+            let mark = TSCRATCH.count;
+            push_written_targs(g);
+            return template_instance(tpl, mark, NODES[n].start);
+        }
+        if g != 0 && SYM_ALIAS[key] != 0 && NODES[SYM_ALIAS[key]].g != 0 {
+            return generic_alias(key, g, NODES[n].start);
+        }
+        if g != 0 {
+            name_error(NODES[n].start, c"'", name, c"' is not generic");
+        }
+        resolve_key(key, name, NODES[n].start)
+    }
+}
+
+// `Pair<i64>` of a generic alias (0.6): its type with its parameters bound
+// to the arguments written in `g` (resolved here), in its own module.
+fn generic_alias(key: i64, g: i64, pos: i64) -> i64 {
+    unsafe {
+        let alias = SYM_ALIAS[key];
+        let params = NODES[alias].g;
+        if NODES[g].count != NODES[params].count {
+            err_begin(pos);
+            err_str(c"type alias '");
+            err_sym(NODES[alias].a);
+            err_str(c"' takes ");
+            err_int(NODES[params].count);
+            err_str(if NODES[params].count == 1 { c" type argument, got " } else { c" type arguments, got " });
+            err_int(NODES[g].count);
+            err_end();
+        }
+        if ALIAS_BUSY[key] != 0 {
+            name_error(pos, c"type alias '", NODES[alias].a, c"' is defined in terms of itself");
+        }
+        let mark = TSCRATCH.count;
+        push_written_targs(g);
+        let saved = TP_BASE;
+        let saved_mod = CUR_MOD;
+        TP_BASE = TP_NAMES.count;
+        for i in 0..NODES[params].count {
+            TP_NAMES.push(NODES[child(params, i)].a);
+            TP_TYPES.push(TSCRATCH.data[mark + i]);
+        }
+        TSCRATCH.count = mark;
+        CUR_MOD = module_of(alias);
+        ALIAS_BUSY[key] = 1;
+        let t = resolve_type_or_error(NODES[alias].b);
+        ALIAS_BUSY[key] = 0;
+        CUR_MOD = saved_mod;
+        TP_NAMES.count = TP_BASE;
+        TP_TYPES.count = TP_BASE;
+        TP_BASE = saved;
+        t
+    }
+}
+
+// The key a TyName names (through its module path), or -1.
+pub fn type_name_key(n: i64) -> i64 {
+    unsafe {
+        let name = NODES[n].a;
+        let mut m = CUR_MOD;
+        let mut b = 0;
+        if NODES[n].count > 0 {
+            m = path_module(n, NODES[n].count);
+            b = lookup_name(m, name, CUR_MOD);
+        } else {
+            if SYM_PRIMITIVE[name] != 0 || (name == SELF_TYPE_SYM && SELF_TYPE != 0) {
+                return -1;
+            }
+            b = lookup_name(m, name, CUR_MOD);
+            note_c_use(NODES[n].start, name, b);
+        }
+        if binding_kind(b) == B_PRIVATE {
+            access_error(b, NODES[n].start, name);
+        }
+        if binding_kind(b) != B_ITEM {
+            return -1;
+        }
+        let key = binding_value(b);
+        qnote(NODES[n].start, name, item_node_of(key), 0);
+        key
+    }
+}
+
+pub fn resolve_named(name: i64, pos: i64) -> i64 {
+    unsafe {
+        let param = env_lookup(name);
+        if param != 0 {
+            return param;
+        }
+        if SYM_PRIMITIVE[name] != 0 {
+            return SYM_PRIMITIVE[name];
+        }
+        if name == SELF_TYPE_SYM && SELF_TYPE != 0 {
+            return SELF_TYPE;
+        }
+        let b = lookup_name(CUR_MOD, name, CUR_MOD);
+        note_c_use(pos, name, b);
+        if binding_kind(b) == B_PRIVATE {
+            access_error(b, pos, name);
+        }
+        if binding_kind(b) != B_ITEM {
+            unknown_name_error(pos, c"unknown type '", name);
+        }
+        let key = binding_value(b);
+        qnote(pos, name, item_node_of(key), 0);
+        if template_of_key(key) != TPL_NONE {
+            err_begin(pos);
+            err_str(c"'");
+            err_sym(name);
+            err_str(c"' is generic: write its type arguments ('");
+            err_sym(name);
+            err_str(c"<...>')");
+            err_end();
+        }
+        resolve_key(key, name, pos)
+    }
+}
+
+// The struct, enum or alias with key `key`.
+pub fn resolve_key(key: i64, name: i64, pos: i64) -> i64 {
+    unsafe {
+        if SYM_STRUCT[key] != 0 {
+            return struct_type(SYM_STRUCT[key] - 1);
+        }
+        if SYM_ENUM[key] != 0 {
+            return enum_type(SYM_ENUM[key] - 1);
+        }
+        if SYM_ALIAS[key] == 0 {
+            if SYM_TRAIT[key] != 0 {
+                name_error(pos, c"'", name, c"' is a trait, not a type (no trait objects: use a type parameter bounded by it, 'T: Trait')");
+            }
+            unknown_name_error(pos, c"unknown type '", name);
+        }
+        resolve_alias(key, pos)
+    }
+}
+
+pub fn resolve_alias(key: i64, pos: i64) -> i64 {
+    unsafe {
+        if ALIAS_TYPE[key] != 0 {
+            return ALIAS_TYPE[key];
+        }
+        let alias = SYM_ALIAS[key];
+        if NODES[alias].g != 0 {
+            err_begin(pos);
+            err_str(c"type alias '");
+            err_sym(NODES[alias].a);
+            err_str(c"' is generic: write its type arguments ('");
+            err_sym(NODES[alias].a);
+            err_str(c"<...>')");
+            err_end();
+        }
+        if ALIAS_BUSY[key] != 0 {
+            name_error(pos, c"type alias '", NODES[alias].a, c"' is defined in terms of itself");
+        }
+        ALIAS_BUSY[key] = 1;
+        let saved = CUR_MOD;
+        CUR_MOD = module_of(alias);
+        let resolved = resolve_type_or_error(NODES[alias].b);
+        CUR_MOD = saved;
+        ALIAS_BUSY[key] = 0;
+        ALIAS_TYPE[key] = resolved;
+        resolved
+    }
+}

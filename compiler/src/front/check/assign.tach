@@ -1,0 +1,160 @@
+// Places and assignment: which expressions are places, `=` and the
+// compound assignments (`+=` and the others, on numbers and vectors), and
+// the mutability a write to a place needs.
+
+use crate::base::{ERR_HELP, err_begin, err_end, err_help, err_help_sym, err_str, err_sym};
+use crate::front::ast::NODES;
+use crate::front::ast::NodeKind::{FieldAccess, Ident, Index, Range, TupleField, Unary};
+use crate::front::check::{LOCALS, Res, lookup_local, name_error, type_error, type_error_got};
+use crate::front::check::check_mode::{check_expr, check_shift_amount};
+use crate::front::check::synth_mode::synth_expr;
+use crate::front::check::unsafety::mark_no_read;
+use crate::front::check::vectors::vector_operator_ok;
+use crate::front::lexer::Tok;
+use crate::front::types::{
+    CONSTS, STATICS, SYM_STATIC, buf_type, is_integer, is_numeric, is_pointer, is_slice, is_vector,
+};
+
+fn arith_token_of_assign(op: Tok) -> Tok {
+    if op == Tok::PlusEq { return Tok::Plus; }
+    if op == Tok::MinusEq { return Tok::Minus; }
+    if op == Tok::StarEq { return Tok::Star; }
+    if op == Tok::SlashEq { return Tok::Slash; }
+    if op == Tok::PercentEq { return Tok::Percent; }
+    if op == Tok::AmpEq { return Tok::Amp; }
+    if op == Tok::PipeEq { return Tok::Pipe; }
+    if op == Tok::CaretEq { return Tok::Caret; }
+    op
+}
+
+// ---- Places and assignment ----
+
+pub fn is_place(n: i64) -> bool {
+    unsafe {
+        match NODES[n].kind {
+            Ident => {
+                let name = NODES[n].a;
+                lookup_local(name).is_some() || SYM_STATIC[name] != 0
+            }
+            Unary => NODES[n].op == Tok::Star,
+            // Through a pointer.
+            FieldAccess if NODES[n].y == 1 => true,
+            FieldAccess | TupleField => is_place(NODES[n].a),
+            Index => {
+                let base = NODES[n].a;
+                if NODES[NODES[n].b].kind == Range {
+                    return false;
+                }
+                is_pointer(NODES[base].ty) || is_slice(NODES[base].ty) || is_place(base)
+            }
+            _ => false,
+        }
+    }
+}
+
+pub fn check_assign(n: i64) {
+    unsafe {
+        let op = NODES[n].op;
+        let target = NODES[n].b;
+        let value = NODES[n].c;
+        if op == Tok::Eq {
+            // Writing a union's field reads nothing.
+            mark_no_read(target);
+        }
+        let target_ty = synth_expr(target);
+        if !is_place(target) {
+            let name = NODES[target].a;
+            if NODES[target].kind == Ident && NODES[target].res == Res::Const {
+                name_error(NODES[target].start, c"cannot assign to constant '", NODES[CONSTS[NODES[target].y].node].a, c"'");
+            }
+            if NODES[target].kind == Ident && NODES[target].res == Res::Fn {
+                name_error(NODES[target].start, c"cannot assign to function '", name, c"'");
+            }
+            type_error(target, c"invalid assignment target");
+        }
+        check_mutable_place(target);
+        if op == Tok::Eq {
+            check_expr(value, target_ty);
+            return;
+        }
+        if op == Tok::ShlEq || op == Tok::ShrEq {
+            if !is_integer(target_ty) {
+                type_error_got(n, c"shift assignment requires integer type", target_ty);
+            }
+            check_shift_amount(value);
+            return;
+        }
+        if is_vector(target_ty) {
+            // (0.10: lanewise, as the operator)
+            vector_operator_ok(n, arith_token_of_assign(op), target_ty);
+            check_expr(value, target_ty);
+            return;
+        }
+        if op == Tok::AmpEq || op == Tok::PipeEq || op == Tok::CaretEq {
+            if !is_integer(target_ty) {
+                type_error_got(n, c"bitwise assignment requires integer type", target_ty);
+            }
+        } else if !is_numeric(target_ty) {
+            type_error_got(n, c"compound assignment requires numeric type", target_ty);
+        }
+        check_expr(value, target_ty);
+    }
+}
+
+pub fn check_mutable_place(target: i64) {
+    let mut root = target;
+    loop {
+        unsafe {
+            match NODES[root].kind {
+                // Through a pointer: no `mut` needed.
+                FieldAccess if NODES[root].y == 1 => return,
+                FieldAccess | TupleField => root = NODES[root].a,
+                Index if !is_pointer(NODES[NODES[root].a].ty)
+                    && !is_slice(NODES[NODES[root].a].ty) => root = NODES[root].a,
+                Ident => {
+                    check_mutable_name(root, target);
+                    return;
+                }
+                _ => return,
+            }
+        }
+    }
+}
+
+fn check_mutable_name(ident: i64, target: i64) {
+    unsafe {
+        let name = NODES[ident].a;
+        let local = if NODES[ident].res == Res::Local { NODES[ident].y } else { -1 };
+        if local >= 0 {
+            if LOCALS[local].mutable {
+                return;
+            }
+            err_begin(NODES[target].start);
+            err_str(c"cannot assign to immutable variable '");
+            err_sym(name);
+            err_str(c"'");
+            if LOCALS[local].is_param {
+                err_help(c"make the parameter mutable: `mut ");
+                err_help_sym(name);
+                err_help(c": ");
+                buf_type(ERR_HELP, LOCALS[local].ty);
+                err_help(c"`");
+            } else {
+                err_help(c"make it mutable: `let mut ");
+                err_help_sym(name);
+                err_help(c"`");
+            }
+            err_end();
+        }
+        if NODES[ident].res == Res::Static && !STATICS[NODES[ident].y].mutable {
+            err_begin(NODES[target].start);
+            err_str(c"cannot assign to immutable static '");
+            err_sym(name);
+            err_str(c"'");
+            err_help(c"declare it `static mut ");
+            err_help_sym(name);
+            err_help(c"`");
+            err_end();
+        }
+    }
+}
