@@ -701,8 +701,10 @@ optimizer, which never change what a program does. `#[inline]` and
 enums with fields whose parts all have `==`: they compare field by field
 (for enums, the variant, then its fields), floats as floats (so a value
 holding a NaN is not equal to itself). Each operand is evaluated once.
-Unions and slices have no `==`; comparing a type that holds one is an error
-naming it.
+A part whose type has an `impl Eq` is compared by it, as `==` on it alone
+is (0.14): a `[u8]` field or payload by bytes, through std's impl.
+Unions and the other slices have no `==`; comparing a type that holds one
+is an error naming it.
 
 **The prelude.** Every module sees `Option`, `Some`, `None`, `Result`,
 `Ok`, `Err`, `Vec`, `print` and `println` (from `std`) without `use`. The
