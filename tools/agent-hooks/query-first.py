@@ -162,6 +162,12 @@ def main():
                          % (prog, suggestion(prog, args)))
         return 2
 
+    if tool in ("Edit", "Write", "MultiEdit") and phase == "PreToolUse":
+        target = inp.get("file_path") or ""
+        if target.endswith(".tach"):
+            log(gd, {"kind": tool.lower(), "session": session, "agent": agent, "target": target[:200],
+                     "bytes": len(inp.get("new_string") or inp.get("content") or "")})
+        return 0
     if tool in ("Read", "Grep") and phase == "PreToolUse":
         target = inp.get("file_path") or inp.get("path") or ""
         pattern = inp.get("pattern", "")

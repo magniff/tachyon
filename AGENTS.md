@@ -33,6 +33,11 @@ The reason is recorded (`.git/agent-tools.jsonl`) and is how the tool
 gets better, so be specific: what you needed, and what query gave or
 lacked. Editing files (Edit, Write, `sed -i`) is not affected.
 
+When any tachyon tool (query, edit, refactor, check, fix, the hook)
+falls short, record it in one line:
+
+    tools/agent-feedback "query refs" "misses uses inside never-instantiated generic fns"
+
 ## Conventions
 
 - Commit as `git -c user.name=magniff -c user.email=tinysnippets@gmail.com

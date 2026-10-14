@@ -139,7 +139,7 @@ def hook_report(path):
     kinds = Counter(r.get("kind") for r in recs)
     print("## The query-first hook\n")
     print("| event | count |\n|---|---|")
-    for k in ("query", "query-result", "blocked", "escape", "read", "grep", "edit", "read-unenforced"):
+    for k in ("query", "query-result", "blocked", "escape", "feedback", "read", "grep", "edit", "write", "multiedit", "read-unenforced"):
         if kinds.get(k):
             print(f"| {k} | {kinds[k]} |")
     subs = Counter()
@@ -155,6 +155,11 @@ def hook_report(path):
         print(f"\nQueries that answered nothing or failed: {len(empty)}\n")
         for r in empty[:15]:
             print(f"- `{r.get('command','')[:100]}` {r.get('stderr','')[:100]}")
+    fb = [r for r in recs if r.get("kind") == "feedback"]
+    if fb:
+        print(f"\n## Feedback on the tools ({len(fb)})\n")
+        for r in fb:
+            print(f"- **{r.get('tool','')}**: {r.get('message','')}")
     esc = [r for r in recs if r.get("kind") == "escape"]
     if esc:
         print(f"\n## Where query was not enough ({len(esc)})\n")
