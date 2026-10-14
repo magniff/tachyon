@@ -75,7 +75,8 @@ their names, as do `extern "C"` items and `#[link_name]`s.
 ## Tools
 
 - `tachyonc fix --only imports` adds the `use` lines a program is
-  missing (and removes unused ones with `--only unused`).
+  missing for its own items (std's are imported by hand: `use std::Buf;`),
+  and `--only unused` removes unused ones.
 - `tachyonc query items` lists every module; `query items MODULE` its
   items with signatures.
 - `tachyonc refactor move a::f --to crate::b` moves items, fixing

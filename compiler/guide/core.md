@@ -480,7 +480,7 @@ tachyonc --diagnostics=short f.tach -o f # the same form when compiling
 tachyonc query show NAME                # an item's source: fn, Type::method, Enum::Variant, FILE:LINE
 tachyonc query def NAME                 # where it is defined, its signature
 tachyonc query refs NAME                # every resolved use (--count, --in FILE)
-tachyonc query items [MODULE]           # a module's items, like a header (std too)
+tachyonc query items [MODULE]           # a module's items with signatures, like a header
 tachyonc edit patch NAME --old 'a < b' --new 'a <= b'   # change text inside one item
 tachyonc edit replace NAME < new.tach   # replace an item; edit insert --after NAME; edit delete NAME
 tachyonc fix                            # missing imports, unused, pub, unsafe blocks

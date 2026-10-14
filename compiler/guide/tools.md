@@ -30,7 +30,7 @@ files are the modules it loads.
 | where it is defined, its signature | `tachyonc query def NAME` |
 | every use | `tachyonc query refs NAME` (`--count`, `--in FILE\|MODULE`) |
 | who calls a function | `tachyonc query callers NAME` |
-| a module's items (`std` too) | `tachyonc query items MODULE`; every module: `query items` |
+| a module's items, with signatures | `tachyonc query items MODULE`; every module: `query items` |
 | a module's `use` lines, header comment | `tachyonc query show MODULE::use` (`::header`) |
 | lines of any file | `tachyonc query text FILE:A-B` |
 | what nothing uses | `tachyonc query unused` |

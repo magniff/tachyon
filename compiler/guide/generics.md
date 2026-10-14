@@ -61,7 +61,7 @@ fn main() -> i32 {
 
 - Type arguments: after a type's name (`Vec<i64>`, `Option<*u8>`), and in
   expressions after `::` (`Vec::<u8>::new()`, `max::<i64>(a, b)`,
-  `Pair::<i64> { a: 1, b: 2 }`, `v.map::<f64>(f)`). They are inferred
+  `Pair::<i64> { a: 1, b: 2 }`, a method's own: `x.m::<u8>()`). They are inferred
   from arguments and from the expected type (`let v: Vec<i64> =
   Vec::new();`); unsuffixed literals are looked at last.
 - A generic function used as a value needs its arguments:
