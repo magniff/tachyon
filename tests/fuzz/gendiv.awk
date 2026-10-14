@@ -91,7 +91,10 @@ function divisor(t,    b, k, kind, neg, v, small, n) {
     return lit(t, "0x" hex_random(int(k / 4), signed(t) ? 8 : 16), neg)
 }
 
+# (Numbers are printed with %.0f: some awks print large ones in exponent
+# notation.)
 function lit(t, v, neg) {
+    if (substr(v "", 1, 2) != "0x") v = sprintf("%.0f", v)
     if (neg) return "(0" t " - " v t ")"
     return v t
 }
@@ -118,7 +121,7 @@ function curated_lit(t, v) {
 
 function min_lit(t) {
     if (t == "i64") return "(0i64 - 0x7fffffffffffffffi64 - 1i64)"
-    return "(0" t " - " (pow2(bits(t) - 1) - 1) t " - 1" t ")"
+    return "(0" t " - " sprintf("%.0f", pow2(bits(t) - 1) - 1) t " - 1" t ")"
 }
 
 BEGIN {
