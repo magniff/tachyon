@@ -1192,10 +1192,13 @@ counted loop, and all but the HashMap ones have an indexed `at`.
 b: *T) -> i64` (negative: `a` first; a heapsort). Every std iterator
 method is `#[inline]`, so that a chain becomes one loop.
 
-(Until closures are merged, `map` and `filter` take no closure, the
-consumers call `next`, and `fold` with a named function is refused by the
-not-yet-implemented `FnMut` bound; compiler/std/iter_t1t2.tach is std's
-iterators after the merge.)
+```
+let v: Vec<i64> = ...;
+let total = v.iter().filter(|x| x % 2 == 0).map(|x| x * x).sum();
+let mut w = v.iter().enumerate().map(|(i, x)| i * x).collect();   // a Vec: free it
+w.sort_by(|a, b| b.cmp(a));
+for (x, k) in v.iter().zip(0..10).take(3) { ... }
+```
 
 ## Importing C headers
 

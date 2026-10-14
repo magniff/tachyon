@@ -6,13 +6,9 @@
 // (docs/design/closures-iterators.md).
 //
 // Every method is #[inline], so that a chain becomes one loop: the
-// sources and adapters override `fold` with a counted loop (internal
-// iteration). `exact_len` and `at` let zip and enumerate index both
-// sides when they know their length.
-//
-// (Staged until closures land: the consumers below call `next`, and
-// sort_by's F has no bound; compiler/std/iter_t1t2.tach is this file with
-// the consumers on `fold` and `F: FnMut(*T, *T) -> i64`.)
+// consumers are written on `fold`, and the sources and adapters override
+// `fold` with a counted loop (internal iteration). `exact_len` and `at`
+// let zip and enumerate index both sides when they know their length.
 
 pub trait Iterator {
     type Item;
@@ -26,7 +22,8 @@ pub trait Iterator {
         -1
     }
 
-    // The k-th item left: only when exact_len() > k, with k increasing.
+    // The k-th item left: only when exact_len() > k, with k increasing
+    // (0, 1, 2, ...) and no other use of the iterator in between.
     #[inline]
     fn at(self: *Self, k: i64) -> Self::Item {
         self.next().unwrap()
@@ -60,6 +57,7 @@ pub trait Iterator {
         Take { it: self, n: n }
     }
 
+    // f(...f(f(init, x0), x1)..., xn): the loop every consumer is.
     #[inline]
     fn fold<B, F: FnMut(B, Self::Item) -> B>(self: Self, init: B, f: F) -> B {
         let mut it = self;
@@ -73,69 +71,49 @@ pub trait Iterator {
 
     #[inline]
     fn for_each<F: FnMut(Self::Item)>(self: Self, f: F) {
-        let mut it = self;
         let mut g = f;
-        while let Option::Some(x) = it.next() {
-            g(x);
-        }
+        self.fold((), | u: (), x | g(x));
     }
 
     #[inline]
     fn count(self: Self) -> i64 {
-        let mut it = self;
-        let mut n = 0;
-        while let Option::Some(_) = it.next() {
-            n += 1;
-        }
-        n
+        self.fold(0i64, | n, x | n + 1)
     }
 
     // The sum of the items, from `0 as Self::Item`.
     #[inline]
     fn sum(self: Self) -> Self::Item {
-        let mut it = self;
-        let mut s = 0 as Self::Item;
-        while let Option::Some(x) = it.next() {
-            s = s + x;
-        }
-        s
+        self.fold(0 as Self::Item, | s, x | s + x)
     }
 
     #[inline]
     fn min(self: Self) -> Option<Self::Item> {
         let mut it = self;
-        let mut best = it.next();
-        while let Option::Some(x) = it.next() {
-            if let Option::Some(m) = best {
-                if x < m {
-                    best = Option::Some(x);
-                }
-            }
+        match it.next() {
+            Option::Some(first) => Option::Some(it.fold(first, | m, x | if x < m { x } else { m })),
+            Option::None => Option::None,
         }
-        best
     }
 
     #[inline]
     fn max(self: Self) -> Option<Self::Item> {
         let mut it = self;
-        let mut best = it.next();
-        while let Option::Some(x) = it.next() {
-            if let Option::Some(m) = best {
-                if x > m {
-                    best = Option::Some(x);
-                }
-            }
+        match it.next() {
+            Option::Some(first) => Option::Some(it.fold(first, | m, x | if x > m { x } else { m })),
+            Option::None => Option::None,
         }
-        best
     }
 
+    // A new Vec of the items (the caller frees it).
     #[inline]
     fn collect(self: Self) -> Vec<Self::Item> {
         let mut it = self;
         let mut v: Vec<Self::Item> = Vec::new();
-        while let Option::Some(x) = it.next() {
-            v.push(x);
+        let n = it.exact_len();
+        if n > 0 {
+            v.reserve(n);
         }
+        it.for_each(| x | v.push(x));
         v
     }
 }
@@ -499,7 +477,7 @@ impl<T>[T] {
 
     // Sorts it in place by f (see sort_by).
     #[inline]
-    pub fn sort_by<F>(self: [T], f: F) {
+    pub fn sort_by<F: FnMut(*T, *T) -> i64>(self: [T], f: F) {
         sort_by(self, f);
     }
 }
@@ -514,7 +492,7 @@ impl<T> Vec<T> {
 
     // Sorts it in place by f (see sort_by).
     #[inline]
-    pub fn sort_by<F>(self: *Vec<T>, f: F) {
+    pub fn sort_by<F: FnMut(*T, *T) -> i64>(self: *Vec<T>, f: F) {
         sort_by(self.as_slice(), f);
     }
 }
@@ -629,7 +607,7 @@ impl<K: Hash + Eq, V> HashMap<K, V> {
 // Sorts s in place by f: f(a, b) is negative, zero or positive as *a goes
 // before, with or after *b (`|a, b| a.cmp(b)`: smallest first). A
 // heapsort: not stable.
-pub fn sort_by<T, F>(s: [T], f: F) {
+pub fn sort_by<T, F: FnMut(*T, *T) -> i64>(s: [T], f: F) {
     let mut g = f;
     let n = s.len;
     let mut start = n / 2;
