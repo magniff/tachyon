@@ -1,0 +1,308 @@
+// The spellings of a NAME, FILE or MODULE that the tools print, as the
+// lookups take them (0.15): what one command prints, another accepts.
+//
+// - `main.tach:12:5:` (a short diagnostic's position, its colon) and
+//   `main.tach:12-30` (a `show` header's lines) are `main.tach:12`;
+// - `./main.tach`, `/abs/path/main.tach`: matched to the program's file
+//   by whole components (path_matches);
+// - `Vec<i64>::push`, `Vec::<i64>::new`, `twice<V2>`: the generic
+//   arguments of an instance dropped;
+// - `main.0`, `main.0.1` (a closure's symbol: closure k of the function
+//   with symbol S is `S.k`): the function;
+// - `a::mod`, `crate::a::mod`: the module `a`; `f()`: `f`.
+
+use crate::base::{BUFS, FILES, IntVec, SRC, buf_byte, buf_bytes, buf_new, buf_slice, buf_str};
+use crate::tools::query::def_at_line;
+use crate::tools::query::defs::{DEFS, MOD_DEF};
+use crate::tools::query::diagnostics::diag;
+use crate::tools::query::positions::{LINES, line_end, line_index, line_of};
+use crate::tools::query::show::{find_modules, query_items};
+
+fn is_digit(c: u8) -> bool {
+    c >= '0' && c <= '9'
+}
+
+fn is_name_byte(c: u8) -> bool {
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || is_digit(c) || c == '_'
+}
+
+// NAME as the lookups take it (see the header); a FILE or a pattern is
+// left as it is but for its end.
+pub fn canonical_name(name0: [u8]) -> [u8] {
+    let mut name = name0;
+    // (blanks, and the `:` or `,` after a position or a name)
+    while name.len > 0 && (name[name.len - 1] == ':' || name[name.len - 1] == ','
+        || name[name.len - 1] == ' ' || name[name.len - 1] == '\t') {
+        name = name[0..name.len - 1];
+    }
+    while name.len > 0 && (name[0] == ' ' || name[0] == '\t') {
+        name = name[1..name.len];
+    }
+    while name.len > 2 && name[0] == '.' && name[1] == '/' {
+        name = name[2..name.len];
+    }
+    if name.len > 2 && name[name.len - 2] == '(' && name[name.len - 1] == ')' {
+        name = name[0..name.len - 2];
+    }
+    // A symbol of the generated code (`_tachyon.std.Buf.new`, an
+    // instance's `tachyon.apply.GN6main.0`): the path of its function.
+    let sym = symbol_path(name);
+    if sym.len > 0 {
+        return sym;
+    }
+    // FILE:A-B: FILE:A.
+    let i = digits_before(name, name.len);
+    if i < name.len && i >= 2 && name[i - 1] == '-' {
+        let j = digits_before(name, i - 1);
+        if j < i - 1 && j >= 2 && name[j - 1] == ':' && name[j - 2] != ':' {
+            name = name[0..i - 1];
+        }
+    }
+    // A closure's symbol (`main.0.1`): its function. (A file has `.tach`.)
+    loop {
+        let k = digits_before(name, name.len);
+        if k < name.len && k >= 2 && name[k - 1] == '.' && is_name_byte(name[k - 2]) {
+            name = name[0..k - 1];
+        } else {
+            break;
+        }
+    }
+    // `a::mod`: the module a.
+    if name.len > 5 && name[name.len - 5..name.len] == "::mod" {
+        name = name[0..name.len - 5];
+    }
+    // Generic arguments (not a leading `<Type as Trait>`).
+    let mut any = false;
+    for k in 1..name.len {
+        if name[k] == '<' && (is_name_byte(name[k - 1]) || name[k - 1] == ':') {
+            any = true;
+        }
+    }
+    if !any {
+        return name;
+    }
+    let out = buf_new();
+    let mut k = 0;
+    while k < name.len {
+        let c = name[k];
+        if k > 0 && c == '<' && (is_name_byte(name[k - 1]) || name[k - 1] == ':') {
+            let mut depth = 0;
+            let mut e = k;
+            while e < name.len {
+                if name[e] == '<' {
+                    depth += 1;
+                } else if name[e] == '>' {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                e += 1;
+            }
+            // (`Vec::<i64>::new`: the `::` before the arguments goes too)
+            let b = buf_slice(out);
+            if b.len >= 2 && b[b.len - 1] == ':' && b[b.len - 2] == ':' {
+                unsafe {
+                    BUFS[out].len -= 2;
+                }
+            }
+            k = e + 1;
+            continue;
+        }
+        buf_byte(out, c);
+        k += 1;
+    }
+    buf_slice(out)
+}
+
+// A symbol of the generated code as a path (gen0's function_prefix and
+// static_prefix, generic_symbol's `.G` and a closure's `.k` dropped, `.`
+// as `::`); empty when name is no such symbol.
+fn symbol_path(name: [u8]) -> [u8] {
+    let mut s = name;
+    if s.len > 1 && s[0] == '_' && s[1] == 't' {
+        s = s[1..s.len];
+    }
+    if s.len <= 8 || s[0..8] != "tachyon." {
+        return name[0..0];
+    }
+    s = s[8..s.len];
+    if s.len > 7 && s[0..7] == "static." {
+        s = s[7..s.len];
+    }
+    let out = buf_new();
+    let mut k = 0;
+    // (an impl's functions on a type that is no struct: `Tl.cmp` is
+    // `i64::cmp`, `TSh.eq` is `[u8]::eq`)
+    if s.len > 1 && s[0] == 'T' {
+        let mut at = 1;
+        if demangle_type(s, &at, out) && at < s.len && s[at] == '.' {
+            k = at;
+        } else {
+            unsafe {
+                BUFS[out].len = 0;
+            }
+        }
+    }
+    while k < s.len {
+        if s[k] == '.' {
+            // (an instance's arguments, a closure's number: the end)
+            if k + 1 < s.len && (s[k + 1] == 'G' || is_digit(s[k + 1])) {
+                break;
+            }
+            buf_byte(out, ':');
+            buf_byte(out, ':');
+        } else {
+            buf_byte(out, s[k]);
+        }
+        k += 1;
+    }
+    buf_slice(out)
+}
+
+// Whether name is a symbol of the generated code (symbol_path).
+pub fn is_symbol(name: [u8]) -> bool {
+    symbol_path(name).len > 0
+}
+
+// The type of mangle_type's code at s[*at..] (primitives, pointers,
+// slices, structs and enums), written to out; false for another code.
+fn demangle_type(s: [u8], at: *i64, out: i64) -> bool {
+    let k = *at;
+    if k >= s.len {
+        return false;
+    }
+    *at = k + 1;
+    let c = s[k];
+    if c == 'P' {
+        buf_byte(out, '*');
+        return demangle_type(s, at, out);
+    }
+    if c == 'S' {
+        buf_byte(out, '[');
+        let ok = demangle_type(s, at, out);
+        buf_byte(out, ']');
+        return ok;
+    }
+    if c == 'N' {
+        let mut n = 0;
+        let mut e = k + 1;
+        while e < s.len && is_digit(s[e]) {
+            n = n * 10 + (s[e] - '0') as i64;
+            e += 1;
+        }
+        if e == k + 1 || e + n > s.len {
+            return false;
+        }
+        buf_bytes(out, s[e..e + n]);
+        *at = e + n;
+        return true;
+    }
+    let codes = "asilhtjmfdb";
+    let types = ["i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32", "f64", "bool"];
+    for i in 0..codes.len {
+        if codes[i] == c {
+            buf_bytes(out, types[i]);
+            return true;
+        }
+    }
+    false
+}
+
+// The start of the run of digits that ends s[0..end] (end: none).
+fn digits_before(s: [u8], end: i64) -> i64 {
+    let mut i = end;
+    while i > 0 && is_digit(s[i - 1]) {
+        i -= 1;
+    }
+    i
+}
+
+// Whether the program's file p is the file x names: the same path, or one
+// ends with the other by whole components (`gvn.tach`, `./main.tach`,
+// `/home/me/prog/main.tach` for `main.tach`).
+pub fn path_matches(p: [u8], x0: [u8]) -> bool {
+    let mut x = x0;
+    while x.len > 2 && x[0] == '.' && x[1] == '/' {
+        x = x[2..x.len];
+    }
+    if x.len == 0 || p.len == 0 {
+        return false;
+    }
+    if p == x {
+        return true;
+    }
+    // (std's source, `<std>`: `std`, or its file in the compiler's tree)
+    if p == "<std>" && (x == "std" || x == "std.tach" || x == "compiler/std/std.tach") {
+        return true;
+    }
+    if p.len > x.len {
+        return p[p.len - x.len - 1] == '/' && p[p.len - x.len..p.len] == x;
+    }
+    x.len > p.len && p[0] != '<' && x[x.len - p.len - 1] == '/' && x[x.len - p.len..x.len] == p
+}
+
+pub fn is_name_char(c: u8) -> bool {
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+}
+
+// (0.15) The item that starts below line `line` of file f, when that line
+// is a comment or an attribute, and the ones down to the item are too or
+// blank (a `show` header's first line is its comment's); -1 otherwise.
+pub fn item_below(f: i64, line: i64) -> i64 {
+    unsafe {
+        let first = line_index(FILES[f].start);
+        let mut l = line;
+        while l >= 1 && first + l - 1 < LINES.count && LINES.data[first + l - 1] < FILES[f].end {
+            let mut p = LINES.data[first + l - 1];
+            let end = line_end(p);
+            while p < end && (SRC[p] == ' ' || SRC[p] == '\t') {
+                p += 1;
+            }
+            let blank = p >= end;
+            let comment = p + 1 < end && ((SRC[p] == '/' && SRC[p + 1] == '/')
+                || (SRC[p] == '#' && SRC[p + 1] == '['));
+            if blank && l == line {
+                return -1;
+            }
+            if !blank && !comment {
+                let d = def_at_line(f, l);
+                return if d >= 0 && line_of(DEFS[d].start) == l { d } else { -1 };
+            }
+            l += 1;
+        }
+        -1
+    }
+}
+
+// (0.15) NAME as a module (`crate`, `a::b`): the definitions of its `mod`
+// items, into out; for the root, which has none, a note and its items.
+pub fn module_def(name: [u8], out: *IntVec) -> bool {
+    unsafe {
+        let mut modules = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        find_modules(name, true, &modules);
+        if modules.count == 0 {
+            return false;
+        }
+        let mut root = false;
+        for i in 0..modules.count {
+            let m = modules.data[i];
+            if m < MOD_DEF.count && MOD_DEF.data[m] >= 0 {
+                out.push(MOD_DEF.data[m]);
+            } else {
+                root = true;
+            }
+        }
+        if (*out).count > 0 {
+            return true;
+        }
+        if root {
+            let d = diag(c"note", c"query.module");
+            buf_byte(d, '\'');
+            buf_bytes(d, name);
+            buf_str(d, c"' is a module without a `mod` item (the root, or std); its items:\n");
+            query_items(&modules);
+        }
+        root
+    }
+}

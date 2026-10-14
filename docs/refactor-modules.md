@@ -192,7 +192,9 @@ an inline module (`refactor.inline`), a module that does not exist
 
 ## new-module, move-module
 
-`refactor new-module crate::a::b`: makes `b`'s file, empty, and its
+`refactor new-module crate::a::b` (0.15: or `a::b`; the module paths
+of new-module, move-module and split may leave out `crate::`): makes
+`b`'s file, empty, and its
 `mod b;` line in `a` (after `a`'s last `mod` line, else before its first
 item). `--dir` makes it a dir module (`b/mod.tach`). The modules of the
 path that do not exist are made too, as dir modules. A file module that

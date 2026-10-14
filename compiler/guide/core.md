@@ -463,7 +463,9 @@ tachyonc f.tach -o f                    # the same lines when compiling, off a t
 tachyonc query show NAME                # an item's source: fn, Type::method, Enum::Variant, FILE:LINE
 tachyonc query def NAME                 # where it is defined, its signature
 tachyonc query refs NAME                # every resolved use (--count, --in FILE)
-tachyonc query items [MODULE]           # a module's items with signatures, like a header
+tachyonc query items [MODULE]           # a module's items with signatures (std: its API)
+tachyonc query context NAME             # source, what it calls, its types and callers, at once
+tachyonc try '7 / 2'                    # run a snippet with std: its output, TYPE = VALUE
 tachyonc edit patch NAME --old 'a < b' --new 'a <= b'   # change text inside one item
 tachyonc edit replace NAME < new.tach   # replace an item; edit insert --after NAME; edit delete NAME
 tachyonc fix                            # missing imports, unused, pub, unsafe blocks

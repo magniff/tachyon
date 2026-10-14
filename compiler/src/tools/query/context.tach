@@ -1,0 +1,552 @@
+// `query context NAME... [--budget N]` (0.15): what an agent fetches in
+// three to five queries about an item, in one answer sized to a budget
+// (CONTEXT_BUDGET tokens by default; 4 bytes a token): the item's source
+// with its comments and its section's title, the signatures of what it
+// calls and of the types it uses, and its callers with their lines. What
+// does not fit is counted in a last note, with the commands that print
+// it. For a module: its banners and items with their signatures, then
+// the bodies of the items the module uses most, as far as they fit.
+
+use crate::base::{
+    BUFS, FILES, IntVec, SRC, STDOUT, STDOUT_CAPTURE, SYMS, alloc_array, buf_byte, buf_bytes,
+    buf_int, buf_new, buf_slice, buf_str, buf_write_fd,
+};
+use crate::front::modules::{MODULES, file_of_pos, module_count};
+use crate::middle::lower::ssa::HMap;
+use crate::tools::query::{QF_DEF, QF_USE};
+use crate::tools::query::budget::{BYTES_PER_TOKEN, OPT_BUDGET};
+use crate::tools::query::defs::{
+    DEFS, DEF_COUNT, K_ALIAS, K_CONST, K_ENUM, K_FIELD, K_FN, K_IMPL_METHOD, K_METHOD, K_MOD,
+    K_STATIC, K_STRUCT, K_TRAIT, K_TRAIT_FN, K_VARIANT, MOD_DEF, find_defs, kind_name, mod_fqn,
+};
+use crate::tools::query::diagnostics::{diag, put_word, try_begin, try_end};
+use crate::tools::query::names::canonical_name;
+use crate::tools::query::positions::{
+    enclosing, line_end, line_of, line_start, put_loc, put_path, rank_of, sort_by_keys,
+};
+use crate::tools::query::refs::{
+    GROUP, R_DEF, R_FLAGS, R_GROUP, R_POS, TARGETS, collect_all_refs, put_line, put_short,
+};
+use crate::tools::query::sections::{
+    B_KIND, B_SECTION, B_START, OPT_BANNERS, banners_of_module, put_title,
+};
+use crate::tools::query::show::{find_modules, put_signature, query_items, query_show, text_start};
+use crate::tools::query::stdq::put_std_use;
+
+// The budget of an answer without --budget, in tokens.
+pub const CONTEXT_BUDGET: i64 = 2000;
+
+// The longest type shown whole (`struct T { a: i64, b: [u8] }`), in bytes.
+const TYPE_WHOLE: i64 = 160;
+
+// What was left out, for the last note.
+static mut CUT_LINES: i64 = 0;
+static mut CUT_CALLS: i64 = 0;
+static mut CUT_TYPES: i64 = 0;
+static mut CUT_CALLERS: i64 = 0;
+static mut CUT_ITEMS: i64 = 0;
+
+// The references of the program, (position, definition, flags) triples.
+static mut ALL: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+fn budget_bytes() -> i64 {
+    unsafe {
+        if OPT_BUDGET == 0 {
+            return 1 << 40;
+        }
+        (if OPT_BUDGET > 0 { OPT_BUDGET } else { CONTEXT_BUDGET }) * BYTES_PER_TOKEN
+    }
+}
+
+// Per definition: its references in the program.
+static mut REF_N: *i64 = 0 as *i64;
+
+// Every reference, once (collect_all_refs; what it leaves behind is
+// dropped, so refs can be collected again).
+fn load_refs() {
+    unsafe {
+        if ALL.count > 0 {
+            return;
+        }
+        collect_all_refs(&ALL);
+        REF_N = alloc_array::<i64>(DEF_COUNT + 1);
+        let mut i = 0;
+        while i < ALL.count {
+            REF_N[ALL.data[i + 1]] += 1;
+            i += 3;
+        }
+        TARGETS.count = 0;
+        R_POS.count = 0;
+        R_DEF.count = 0;
+        R_GROUP.count = 0;
+        R_FLAGS.count = 0;
+        GROUP = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+    }
+}
+
+// `query context` for the NAMEs of args: the exit status.
+pub fn query_context(text: [u8], matches: *IntVec) -> i64 {
+    unsafe {
+        if (*matches).count > 5 {
+            return query_show(matches, text);
+        }
+        load_refs();
+        let n = (*matches).count;
+        let per = budget_bytes() / (if n > 0 { n } else { 1 });
+        for i in 0..n {
+            let d = (*matches).data[i];
+            if DEFS[d].kind == K_MOD {
+                let m = module_of_def(d);
+                if m >= 0 {
+                    module_context(m, per);
+                    continue;
+                }
+            }
+            item_context(d, per);
+        }
+        put_cut_note(text);
+        0
+    }
+}
+
+// The module NAME names when it is a module and no other item (`query
+// context crate::tools::query`, `context query`), or -1.
+pub fn context_module(name0: [u8]) -> i64 {
+    unsafe {
+        let name = canonical_name(name0);
+        let mut mods = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        find_modules(name, false, &mods);
+        if mods.count != 1 {
+            return -1;
+        }
+        let mut defs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        find_defs(name, false, &defs);
+        for i in 0..defs.count {
+            if DEFS[defs.data[i]].kind != K_MOD {
+                return -1;
+            }
+        }
+        mods.data[0]
+    }
+}
+
+// `query context MODULE`: the exit status.
+pub fn query_context_module(m: i64, text: [u8]) -> i64 {
+    load_refs();
+    module_context(m, budget_bytes());
+    put_cut_note(text);
+    0
+}
+
+fn module_of_def(d: i64) -> i64 {
+    unsafe {
+        for m in 0..module_count() {
+            if m < MOD_DEF.count && MOD_DEF.data[m] == d {
+                return m;
+            }
+        }
+        -1
+    }
+}
+
+fn is_fn_kind(k: i64) -> bool {
+    k == K_FN || k == K_METHOD || k == K_IMPL_METHOD || k == K_TRAIT_FN
+}
+
+fn is_type_kind(k: i64) -> bool {
+    k == K_STRUCT || k == K_ENUM || k == K_TRAIT || k == K_ALIAS
+}
+
+// Whether definition e is inside definition d (a local item, d's fields).
+fn inside(e: i64, d: i64) -> bool {
+    unsafe {
+        e == d || DEFS[e].parent == d
+            || (DEFS[e].start >= DEFS[d].start && DEFS[e].start < DEFS[d].end)
+    }
+}
+
+// The section banner above position pos in module m, or -1.
+fn section_of(m: i64, pos: i64) -> i64 {
+    unsafe {
+        let mut banners = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        banners_of_module(m, &banners);
+        let mut best = -1;
+        for i in 0..banners.count {
+            let b = banners.data[i];
+            if B_KIND.data[b] == B_SECTION && B_START.data[b] < pos
+                && file_of_pos(B_START.data[b]) == file_of_pos(pos) {
+                best = b;
+            }
+        }
+        best
+    }
+}
+
+// `PATH<TAB>FILE:LINE:COL<TAB>KIND<TAB>SIGNATURE` of e (a short struct or
+// enum whole).
+fn put_def_line(out: i64, e: i64) {
+    unsafe {
+        buf_bytes(out, SYMS[DEFS[e].fqn].text);
+        buf_byte(out, '\t');
+        put_loc(out, DEFS[e].name_pos);
+        buf_byte(out, '\t');
+        buf_str(out, kind_name(DEFS[e].kind));
+        buf_byte(out, '\t');
+        let k = DEFS[e].kind;
+        if k == K_STRUCT || k == K_ENUM {
+            let whole = buf_new();
+            if DEFS[e].public {
+                buf_str(whole, c"pub ");
+            }
+            crate::tools::query::positions::collapse(whole, DEFS[e].start, DEFS[e].end);
+            if buf_slice(whole).len <= TYPE_WHOLE {
+                buf_bytes(out, buf_slice(whole));
+                buf_byte(out, '\n');
+                return;
+            }
+        }
+        put_signature(out, e);
+        buf_byte(out, '\n');
+    }
+}
+
+// Lines of `from` (a buffer) appended to out while they fit in *room
+// bytes; the number of lines left out.
+fn fit_lines(out: i64, from: i64, room: *i64) -> i64 {
+    unsafe {
+        let s = buf_slice(from);
+        let mut i = 0;
+        let mut cut = 0;
+        while i < s.len {
+            let mut e = i;
+            while e < s.len && s[e] != '\n' {
+                e += 1;
+            }
+            let n = e + 1 - i;
+            if cut == 0 && n <= *room {
+                buf_bytes(out, s[i..e + 1]);
+                *room = *room - n;
+            } else {
+                cut += 1;
+            }
+            i = e + 1;
+        }
+        cut
+    }
+}
+
+// The context of definition d, in about `budget` bytes.
+fn item_context(d: i64, budget: i64) {
+    unsafe {
+        let head = buf_new();
+        let first = text_start(d);
+        let last = line_end(if DEFS[d].end > DEFS[d].start { DEFS[d].end - 1 }
+            else { DEFS[d].start });
+        buf_str(head, c"// ");
+        buf_bytes(head, SYMS[DEFS[d].fqn].text);
+        buf_byte(head, '\t');
+        put_path(head, file_of_pos(first));
+        buf_byte(head, ':');
+        buf_int(head, line_of(first));
+        buf_byte(head, '-');
+        buf_int(head, line_of(last));
+        let sec = section_of(DEFS[d].module, first);
+        if sec >= 0 {
+            buf_str(head, c"\tsection: ");
+            put_title(head, sec);
+        }
+        buf_byte(head, '\n');
+        put_std_use(head, d);
+        let src = buf_new();
+        buf_bytes(src, SRC[first..last]);
+        buf_byte(src, '\n');
+        // What it uses, in order of first use; who uses it.
+        let mut used = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut seen = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        let mut callers = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut i = 0;
+        while i < ALL.count {
+            let pos = ALL.data[i];
+            let mut e = ALL.data[i + 1];
+            let fl = ALL.data[i + 2];
+            i += 3;
+            if (fl & QF_DEF) != 0 {
+                continue;
+            }
+            if pos >= DEFS[d].start && pos < DEFS[d].end {
+                if (DEFS[e].kind == K_FIELD || DEFS[e].kind == K_VARIANT) && DEFS[e].parent >= 0 {
+                    e = DEFS[e].parent;
+                }
+                if inside(e, d) || DEFS[e].kind == K_MOD || seen.get(e + 1) != 0 {
+                    continue;
+                }
+                seen.put(e + 1, 1);
+                used.push(e);
+            } else if e == d && (fl & QF_USE) == 0 {
+                callers.push(pos);
+            }
+        }
+        sort_positions(&used, true);
+        sort_positions(&callers, false);
+        let calls = buf_new();
+        let types = buf_new();
+        let others = buf_new();
+        let mut n_calls = 0;
+        let mut n_types = 0;
+        let mut n_others = 0;
+        for j in 0..used.count {
+            let e = used.data[j];
+            let k = DEFS[e].kind;
+            if is_fn_kind(k) {
+                put_def_line(calls, e);
+                n_calls += 1;
+            } else if is_type_kind(k) {
+                put_def_line(types, e);
+                n_types += 1;
+            } else {
+                put_def_line(others, e);
+                n_others += 1;
+            }
+        }
+        let who = buf_new();
+        for j in 0..callers.count {
+            let pos = callers.data[j];
+            let enc = enclosing(pos);
+            put_short(who, if enc >= 0 { DEFS[enc].fqn } else { mod_fqn(DEFS[d].module) });
+            buf_byte(who, '\t');
+            put_loc(who, pos);
+            buf_byte(who, '\t');
+            put_line(who, pos);
+            buf_byte(who, '\n');
+        }
+        // Fitting: the header always; the source up to what the lists
+        // leave (half the budget at least); then the lists in turn.
+        let out = buf_new();
+        buf_bytes(out, buf_slice(head));
+        let mut room = budget - buf_slice(head).len;
+        let lists = buf_slice(calls).len + buf_slice(types).len + buf_slice(others).len
+            + buf_slice(who).len + 64;
+        let keep = if lists < room / 2 { lists } else { room / 2 };
+        let mut src_room = room - keep;
+        let cut = fit_lines(out, src, &src_room);
+        if cut > 0 {
+            buf_str(out, c"// (");
+            buf_int(out, cut);
+            buf_str(out, c" more lines)\n");
+            CUT_LINES += cut;
+        }
+        room = keep + src_room;
+        put_list(out, c"calls", n_calls, calls, &room, 0);
+        put_list(out, c"types", n_types, types, &room, 1);
+        put_list(out, c"uses", n_others, others, &room, 1);
+        put_list(out, if is_fn_kind(DEFS[d].kind) { c"callers" } else { c"used by" }, callers.count,
+            who, &room, 2);
+        buf_write_fd(out, STDOUT);
+    }
+}
+
+// `// TITLE (N)` and the lines of list `from`, as far as they fit (the
+// title only with its first line); which counter the lines left out go
+// to (0 calls, 1 types, 2 callers).
+fn put_list(out: i64, title: *u8, n: i64, from: i64, room: *i64, which: i64) {
+    unsafe {
+        if n == 0 {
+            return;
+        }
+        let head = buf_new();
+        buf_str(head, c"// ");
+        buf_str(head, title);
+        buf_str(head, c" (");
+        buf_int(head, n);
+        buf_str(head, c")\n");
+        let s = buf_slice(from);
+        let mut first = 0;
+        while first < s.len && s[first] != '\n' {
+            first += 1;
+        }
+        let mut cut = n;
+        if buf_slice(head).len + first + 1 <= *room {
+            buf_bytes(out, buf_slice(head));
+            *room = *room - buf_slice(head).len;
+            cut = fit_lines(out, from, room);
+        }
+        if which == 0 {
+            CUT_CALLS += cut;
+        } else if which == 1 {
+            CUT_TYPES += cut;
+        } else {
+            CUT_CALLERS += cut;
+        }
+    }
+}
+
+// Sorts positions (or, `defs`, definitions by their positions).
+fn sort_positions(v: *IntVec, defs: bool) {
+    unsafe {
+        let n = (*v).count;
+        let k1 = alloc_array::<i64>(n + 1);
+        let k2 = alloc_array::<i64>(n + 1);
+        let mut idx = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..n {
+            idx.push(i);
+            let pos = if defs { DEFS[(*v).data[i]].name_pos } else { (*v).data[i] };
+            k1[i] = rank_of(pos);
+            k2[i] = pos;
+        }
+        if defs {
+            // (what it uses: the least used in the program first, the
+            // most specific; then in order of first use)
+            for a in 1..n {
+                let mut b = a;
+                while b > 0 && REF_N[(*v).data[b - 1]] > REF_N[(*v).data[b]] {
+                    let t = (*v).data[b];
+                    (*v).data[b] = (*v).data[b - 1];
+                    (*v).data[b - 1] = t;
+                    b -= 1;
+                }
+            }
+            return;
+        }
+        sort_by_keys(&idx, k1, k2);
+        let copy = alloc_array::<i64>(n + 1);
+        for i in 0..n {
+            copy[i] = (*v).data[idx.data[i]];
+        }
+        for i in 0..n {
+            (*v).data[i] = copy[i];
+        }
+    }
+}
+
+// The context of module m, in about `budget` bytes: `items --comments`,
+// then the bodies of its items that the module's own code uses most.
+fn module_context(m: i64, budget: i64) {
+    unsafe {
+        let saved = STDOUT_CAPTURE;
+        let items = buf_new();
+        STDOUT_CAPTURE = items;
+        let banners = OPT_BANNERS;
+        OPT_BANNERS = true;
+        let mut ms = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        ms.push(m);
+        query_items(&ms);
+        OPT_BANNERS = banners;
+        STDOUT_CAPTURE = saved;
+        let out = buf_new();
+        let mut room = budget;
+        CUT_ITEMS += fit_lines(out, items, &room);
+        // Uses of each item from inside the module.
+        let uses = alloc_array::<i64>(DEF_COUNT + 1);
+        let outside = alloc_array::<i64>(DEF_COUNT + 1);
+        let rank = alloc_array::<i64>(DEF_COUNT + 1);
+        let mut i = 0;
+        while i < ALL.count {
+            let pos = ALL.data[i];
+            let e = ALL.data[i + 1];
+            let fl = ALL.data[i + 2];
+            i += 3;
+            if (fl & QF_DEF) == 0 && DEFS[e].module == m && is_fn_kind(DEFS[e].kind) {
+                let enc = enclosing(pos);
+                if enc >= 0 && enc != e && DEFS[enc].module == m {
+                    uses[e] += 1;
+                } else if enc != e && (fl & QF_USE) == 0 {
+                    outside[e] += 1;
+                }
+            }
+        }
+        // (what the module uses most first, then what is used from
+        // outside it most)
+        let mut order = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for e in 0..DEF_COUNT {
+            if DEFS[e].module == m && is_fn_kind(DEFS[e].kind) && DEFS[e].kind != K_TRAIT_FN {
+                order.push(e);
+                rank[e] = uses[e] * 1000000 + outside[e];
+            }
+        }
+        // (most used first; insertion sort, few items)
+        for a in 1..order.count {
+            let mut b = a;
+            while b > 0 && rank[order.data[b - 1]] < rank[order.data[b]] {
+                let t = order.data[b];
+                order.data[b] = order.data[b - 1];
+                order.data[b - 1] = t;
+                b -= 1;
+            }
+        }
+        let mut shown = 0;
+        for j in 0..order.count {
+            let d = order.data[j];
+            let first = text_start(d);
+            let last = line_end(DEFS[d].end - 1);
+            let body = buf_new();
+            buf_str(body, c"// ");
+            buf_bytes(body, SYMS[DEFS[d].fqn].text);
+            buf_byte(body, '\t');
+            put_path(body, file_of_pos(first));
+            buf_byte(body, ':');
+            buf_int(body, line_of(first));
+            buf_byte(body, '-');
+            buf_int(body, line_of(last));
+            buf_str(body, c"\tused ");
+            buf_int(body, uses[d]);
+            buf_str(body, c" times in the module, ");
+            buf_int(body, outside[d]);
+            buf_str(body, c" outside\n");
+            buf_bytes(body, SRC[first..last]);
+            buf_byte(body, '\n');
+            if buf_slice(body).len <= room {
+                buf_bytes(out, buf_slice(body));
+                room -= buf_slice(body).len;
+                shown += 1;
+            }
+        }
+        CUT_LINES += order.count - shown;
+        buf_write_fd(out, STDOUT);
+    }
+}
+
+// The note saying what the budget left out, and the commands that print
+// it.
+fn put_cut_note(name: [u8]) {
+    unsafe {
+        if CUT_LINES + CUT_CALLS + CUT_TYPES + CUT_CALLERS + CUT_ITEMS == 0 {
+            return;
+        }
+        let d = diag(c"note", c"query.budget");
+        buf_str(d, c"over the budget of ");
+        buf_int(d, budget_bytes() / BYTES_PER_TOKEN);
+        buf_str(d, c" tokens, left out:");
+        put_count(d, CUT_LINES, c"source lines (or bodies)");
+        put_count(d, CUT_ITEMS, c"items");
+        put_count(d, CUT_CALLS, c"calls");
+        put_count(d, CUT_TYPES, c"types or uses");
+        put_count(d, CUT_CALLERS, c"callers");
+        buf_byte(d, '\n');
+        if CUT_LINES > 0 {
+            try_end(try_begin(c"show", name, true));
+        }
+        if CUT_CALLERS > 0 {
+            try_end(try_begin(c"callers", name, true));
+        }
+        let t = try_begin(c"context", name, true);
+        buf_str(t, c" --budget ");
+        buf_int(t, budget_bytes() / BYTES_PER_TOKEN * 3);
+        try_end(t);
+    }
+}
+
+fn put_count(d: i64, n: i64, what: *u8) {
+    unsafe {
+        if n == 0 {
+            return;
+        }
+        let s = crate::base::buf_slice(d);
+        if s[s.len - 1] != ':' {
+            buf_byte(d, ',');
+        }
+        buf_byte(d, ' ');
+        buf_str(d, what);
+        buf_byte(d, ' ');
+        buf_int(d, n);
+    }
+}

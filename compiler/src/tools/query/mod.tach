@@ -43,6 +43,10 @@ pub mod grep;
 pub mod sections;
 pub mod typeat;
 pub mod cache;
+pub mod names;
+mod stdq;
+mod budget;
+mod context;
 
 use crate::host_target;
 use crate::base::{
@@ -56,7 +60,7 @@ use crate::front::check::check_program;
 use crate::front::cimport::{IMPORTED_START, drop_shadowed_imports, import_c_headers};
 use crate::front::cpp::directives::file_exists;
 use crate::front::lexer::{init_lexer, lex_range};
-use crate::front::modules::{load_modules, module_at};
+use crate::front::modules::{STD_ALWAYS, STD_MODULE, load_modules, module_at};
 use crate::front::parser::parse_program;
 use crate::front::types::{ENUMS, STRUCTS, TYPES, TyKind, init_declarations, init_types};
 use crate::gen0::gen::MAIN_SYM;
@@ -75,20 +79,26 @@ use diagnostics::{
     program_errors, push_once, try_begin, try_end, try_query, write_diags,
 };
 use grep::{G_CODE, G_COMMENT, G_STRING, OPT_WHERE, OPT_WORD, query_grep};
-use positions::{LINES, init_containers, init_positions, line_index, line_start, sort_by_position};
+use positions::{
+    LINES, init_containers, init_positions, line_end, line_index, line_start, sort_by_position,
+};
 use refs::{
-    OPT_ALL, OPT_COUNT, OPT_IN, OPT_KIND, OPT_LIMIT, file_text, put_bad_in, query_refs, resolve_in,
-    try_refs,
+    OPT_ALL, OPT_COUNT, OPT_IN, OPT_KIND, OPT_LIMIT, def_used_at, file_text, put_bad_in, query_refs,
+    resolve_in, try_refs,
 };
 use sections::{OPT_BANNERS, show_section};
 use show::{find_modules, query_def, query_items, query_modules, query_show, text_start};
 use typeat::query_type;
 
+use budget::{OPT_BUDGET, begin_output, end_output};
+use cache::{cache_restore, cache_save};
+use context::{context_module, query_context, query_context_module};
 use crate::base::timer::{
     TIME_PASSES, T_ANSWER, T_CHECK, T_INDEX, T_LOAD, T_PARSE, timer_add, timer_now, timer_report,
 };
 use crate::tools::conflicts::run_conflicts;
-use crate::tools::query::cache::{cache_restore, cache_save};
+use names::{canonical_name, is_name_char, is_symbol, item_below, module_def, path_matches};
+use stdq::{all_std, ask_with_std, names_std, std_requested, std_root, wants_std};
 
 extern "C" {
     fn getenv(name: *u8) -> *u8;
@@ -301,6 +311,7 @@ fn put_usage(out: i64) {
         buf_str(out,
             c"usage: tachyonc query def|show NAME... [--root ROOT] [--exact] [--with-comments]\n");
         buf_str(out, c"       tachyonc query show FILE.tach | MODULE::use | MODULE::header | MODULE::extern\n");
+        buf_str(out, c"       tachyonc query context NAME...|MODULE [--budget TOKENS]   (source, calls, types, callers)\n");
         buf_str(out, c"       tachyonc query text FILE[:A[-B]]...\n");
         buf_str(out, c"       tachyonc query diff\n");
         buf_str(out, c"       tachyonc query refs|callers NAME... [--exact] [--count] [--in FILE|MODULE] [--limit N] [--all]\n");
@@ -313,7 +324,8 @@ fn put_usage(out: i64) {
         buf_str(out, c"       tachyonc query unused [MODULE] [--all]\n");
         buf_str(out, c"       tachyonc query impact NAME\n");
         buf_str(out, c"       tachyonc query conflicts [FILE|DIR|FILE:LINE...] [--show]\n");
-        buf_str(out, c"NAME: a path or its end (f, m::f, T::f, T.field), or FILE:LINE\n");
+        buf_str(out, c"NAME: a path or its end (f, m::f, T::f, T.field), or FILE:LINE; std's too (std::f, Vec::push)\n");
+        buf_str(out, c"--budget TOKENS: any answer cut to about TOKENS (default 8000; 0: no limit; context: 2000)\n");
         buf_str(out, c"ROOT: --root ROOT, a last argument ending in .tach, $TACHYON_ROOT, ./main.tach, ./compiler/src/main.tach\n");
         buf_str(out, c"see docs/query.md and docs/refactor.md\n");
     }
@@ -325,14 +337,14 @@ fn usage_error() -> i64 {
     unsafe { diag(c"error", c"query.usage") }
 }
 
-const N_COMMANDS: i64 = 14;
+const N_COMMANDS: i64 = 15;
 
 fn command_name(i: i64) -> *u8 {
     if i == 0 { c"def" } else if i == 1 { c"show" } else if i == 2 { c"refs" }
     else if i == 3 { c"callers" } else if i == 4 { c"items" } else if i == 5 { c"stats" }
     else if i == 6 { c"deps" } else if i == 7 { c"unused" } else if i == 8 { c"impact" }
     else if i == 9 { c"text" } else if i == 10 { c"diff" } else if i == 11 { c"grep" }
-    else if i == 12 { c"type" } else { c"conflicts" }
+    else if i == 12 { c"type" } else if i == 13 { c"context" } else { c"conflicts" }
 }
 
 // The command nearest to cmd (edit distance at most 2), or 0.
@@ -375,7 +387,10 @@ pub static mut OPT_OVER: i64 = 1000;
 pub static mut OPT_MAX_LINES: i64 = 1000;
 
 pub fn run_query(argc: i64, argv: **u8) -> i64 {
+    // (0.15: the answer within its budget, budget.tach)
+    begin_output();
     let status = run_query_inner(argc, argv);
+    end_output(argc, argv, argc >= 3 && unsafe { streq(argv[2], c"context") });
     write_diags();
     timer_report();
     status
@@ -410,7 +425,8 @@ fn run_query_inner(argc: i64, argv: **u8) -> i64 {
         while i < argc {
             let a = argv[i];
             let valued = streq(a, c"--in") || streq(a, c"--limit") || streq(a, c"--root")
-                || streq(a, c"--over") || streq(a, c"--max-lines") || streq(a, c"--kind");
+                || streq(a, c"--over") || streq(a, c"--max-lines") || streq(a, c"--kind")
+                || streq(a, c"--budget");
             if streq(a, c"--count") {
                 OPT_COUNT = true;
             } else if streq(a, c"--exact") {
@@ -452,6 +468,8 @@ fn run_query_inner(argc: i64, argv: **u8) -> i64 {
                         OPT_LIMIT = n;
                     } else if streq(a, c"--over") {
                         OPT_OVER = n;
+                    } else if streq(a, c"--budget") {
+                        OPT_BUDGET = n;
                     } else {
                         OPT_MAX_LINES = n;
                     }
@@ -554,6 +572,13 @@ fn run_query_inner(argc: i64, argv: **u8) -> i64 {
         if root == 0 as *u8 {
             root = infer_root(&args);
         }
+        // (0.15: std's names where there is no program: a program of
+        // nothing but std)
+        let mut std_only = false;
+        if find_root(root) == 0 as *u8 && !streq(cmd, c"grep") && all_std(&args) {
+            root = std_root();
+            std_only = root != 0 as *u8;
+        }
         root = root_or_diag(root, cmd, first, args.count > 0);
         if root == 0 as *u8 {
             return 2;
@@ -562,19 +587,36 @@ fn run_query_inner(argc: i64, argv: **u8) -> i64 {
         // when it holds for the program; else read in full, then cached.
         // grep and type need the tokens and nodes, which are not cached:
         // they read the program in full, and leave the cache as it is)
-        let cacheable = streq(cmd, c"def") || streq(cmd, c"show") || streq(cmd, c"refs")
-            || streq(cmd, c"callers") || items;
-        let cached = cacheable && cache_restore(root, 0, is_refs);
+        // (0.15: a question about std reads the program with std, and
+        // without the cache, which holds the program as it is)
+        let mut with_std = std_only || std_requested()
+            || (OPT_IN != 0 as *u8 && names_std(c_slice(OPT_IN)));
+        for k in 0..args.count {
+            if names_std(c_slice(args.data[k] as *u8)) {
+                with_std = true;
+            }
+        }
+        STD_ALWAYS = with_std;
+        let context = streq(cmd, c"context");
+        let cacheable = (streq(cmd, c"def") || streq(cmd, c"show") || streq(cmd, c"refs")
+            || streq(cmd, c"callers") || items || context) && !with_std;
+        let cached = cacheable && cache_restore(root, 0, is_refs || context);
         if !cached && !load_program(root, 0) {
             // (nothing to answer with: the errors say why)
             program_errors(c"error", root, true);
             return 1;
         }
+        if !with_std && STD_MODULE < 0 && !items && !streq(cmd, c"grep") && !streq(cmd, c"type")
+            && wants_std(&args) {
+            // (a NAME std defines and the program does not: asked again
+            // with std)
+            ask_with_std(argv);
+        }
         let t = timer_now();
         let status = answer(cmd, &args, items, is_refs);
         timer_add(T_ANSWER, t);
         program_errors(c"warning", root, status != 0);
-        write_diags();
+        // (the diagnostics after the answer: run_query)
         if cacheable {
             cache_save(root, 0);
         }
@@ -585,10 +627,15 @@ fn run_query_inner(argc: i64, argv: **u8) -> i64 {
 // The definitions answering to NAME, in order of position (none: after
 // the diagnostic saying so, for command cmd). NAME is a path, or its end
 // (see name_matches), or `FILE:LINE` (`FILE:LINE:COL`, as a compiler's
-// error has it): the innermost item whose text holds that line.
-pub fn resolve_name(cmd: *u8, name: [u8], out: *IntVec) -> bool {
+// error has it): the innermost item whose text holds that line (0.15: on
+// a comment or blank line, the item below it; outside every item, as on
+// a `use` line, what the name at COL, or the first on the line, names).
+// Every spelling the tools print is taken (canonical_name).
+pub fn resolve_name(cmd: *u8, name0: [u8], out: *IntVec) -> bool {
     unsafe {
+        let name = canonical_name(name0);
         let mut line = -1;
+        let mut col = -1;
         let mut file = name[0..0];
         let a = trailing_number(name);
         if a > 0 && name[a - 1] == ':' && (a < 2 || name[a - 2] != ':') {
@@ -597,6 +644,7 @@ pub fn resolve_name(cmd: *u8, name: [u8], out: *IntVec) -> bool {
             let b = trailing_number(file);
             if b > 0 && file[b - 1] == ':' && (b < 2 || file[b - 2] != ':') {
                 // (FILE:LINE:COL)
+                col = line;
                 line = parse_digits(file[b..file.len]);
                 file = file[0..b - 1];
             }
@@ -618,6 +666,14 @@ pub fn resolve_name(cmd: *u8, name: [u8], out: *IntVec) -> bool {
                     sort_by_position(out);
                 }
             }
+            if (*out).count == 0 && name.len != name0.len && is_symbol(name0) {
+                // (a symbol of a trait's default function: `T::f` is the
+                // trait's `f`)
+                find_defs(last_segment(name), OPT_EXACT, out);
+            }
+            if (*out).count == 0 && module_def(name, out) {
+                return true;
+            }
             if (*out).count == 0 {
                 no_match(cmd, name);
                 return false;
@@ -627,9 +683,7 @@ pub fn resolve_name(cmd: *u8, name: [u8], out: *IntVec) -> bool {
         let mut f = -1;
         for g in 0..FILE_COUNT {
             let p = file_text(g);
-            if bytes_eq(p, file)
-                || (p.len > file.len && bytes_eq(p[p.len - file.len..p.len], file)
-                    && p[p.len - file.len - 1] == '/') {
+            if path_matches(p, file) {
                 f = g;
                 break;
             }
@@ -642,7 +696,27 @@ pub fn resolve_name(cmd: *u8, name: [u8], out: *IntVec) -> bool {
             try_end(try_begin(c"items", name[0..0], false));
             return false;
         }
-        let d = def_at_line(f, line);
+        let mut d = def_at_line(f, line);
+        if d < 0 {
+            d = item_below(f, line);
+        }
+        if d < 0 && line >= 1 {
+            let idx = line_index(FILES[f].start) + line - 1;
+            if idx < LINES.count && LINES.data[idx] < FILES[f].end {
+                let start = LINES.data[idx];
+                let end = line_end(start);
+                if col >= 1 && start + col - 1 <= end {
+                    // (the name holding COL: it starts at or before it)
+                    let mut p = start + col - 1;
+                    while p > start && is_name_char(SRC[p - 1]) {
+                        p -= 1;
+                    }
+                    d = def_used_at(p, end);
+                } else {
+                    d = def_used_at(start, end);
+                }
+            }
+        }
         if d < 0 {
             let e = diag(c"error", c"query.no-match");
             buf_str(e, c"no item at ");
@@ -732,8 +806,7 @@ pub fn file_named(file: [u8]) -> i64 {
     unsafe {
         for g in 0..FILE_COUNT {
             let p = file_text(g);
-            if p.len > 0 && p[0] != '<' && (bytes_eq(p, file) || (p.len > file.len
-                && bytes_eq(p[p.len - file.len..p.len], file) && p[p.len - file.len - 1] == '/')) {
+            if p.len > 0 && p[0] != '<' && path_matches(p, file) {
                 return g;
             }
         }
@@ -784,6 +857,23 @@ fn answer(cmd: *u8, args: *IntVec, items: bool, is_refs: bool) -> i64 {
         }
         if streq(cmd, c"grep") {
             return query_grep(args);
+        }
+        if streq(cmd, c"context") {
+            // (0.15: context.tach)
+            let mut status = 0;
+            for i in 0..n {
+                let text = c_slice((*args).data[i] as *u8);
+                let m = context_module(text);
+                if m >= 0 {
+                    query_context_module(m, text);
+                    continue;
+                }
+                let mut matches = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+                if !resolve_name(cmd, text, &matches) || query_context(text, &matches) != 0 {
+                    status = 1;
+                }
+            }
+            return status;
         }
         let mut status = 0;
         let mut all = IntVec { data: 0 as *i64, count: 0, cap: 0 };
