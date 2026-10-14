@@ -27,7 +27,11 @@
 #                      uses the working tree
 #   --host HOST        build for HOST instead of the detected host (on
 #                      Apple silicon, --host x86_64-macos builds and tests
-#                      the chain for Intel Macs, run under Rosetta)
+#                      the chain for Intel Macs, run under Rosetta);
+#                      --host aarch64-linux (0.11) runs the chain here and
+#                      then cross-builds HEAD's compiler for aarch64-linux,
+#                      as an object to link there (see
+#                      bootstrap/aarch64-linux-check.sh)
 #   --seed-bin PATH    use this seed binary instead of building one
 #   --cache DIR        the cache directory (default: target/bootstrap)
 #   --clean            empty the cache first
@@ -88,7 +92,7 @@ while [ $# -gt 0 ]; do
         --cache) [ $# -ge 2 ] || die "--cache needs a directory"; CACHE=$2; shift ;;
         --clean) CLEAN=1 ;;
         --out) [ $# -ge 2 ] || die "--out needs a path"; OUT=$2; shift ;;
-        -h|--help) sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown option '$1' (see --help)" ;;
     esac
     shift
@@ -97,13 +101,34 @@ done
 # ---- The host ----
 
 # The host as a tachyon target name.
-if [ -z "$HOST" ]; then
+detect_host() {
     case "$(uname -s)-$(uname -m)" in
-        Darwin-arm64) HOST=aarch64-macos ;;
-        Darwin-x86_64) HOST=x86_64-macos ;;
-        Linux-x86_64) HOST=x86_64-linux ;;
-        *) die "unsupported host: $(uname -s) $(uname -m). tachyon builds on aarch64-macos (Apple silicon), x86_64-macos and x86_64-linux; another host needs a release with a backend for it (see docs/releases.md)." ;;
+        Darwin-arm64) echo aarch64-macos ;;
+        Darwin-x86_64) echo x86_64-macos ;;
+        Linux-x86_64) echo x86_64-linux ;;
+        Linux-aarch64) echo aarch64-linux ;;
+        *) echo unsupported ;;
     esac
+}
+CROSS=""
+if [ -z "$HOST" ]; then
+    HOST=$(detect_host)
+    [ "$HOST" != unsupported ] \
+        || die "unsupported host: $(uname -s) $(uname -m). tachyon builds on aarch64-macos (Apple silicon), x86_64-macos and x86_64-linux; another host needs a release with a backend for it (see docs/releases.md)."
+fi
+# aarch64-linux (0.11): no release before 0.11, nor the seed (Rust and
+# Cranelift, pinned), runs there, so the chain cannot start on it. It runs
+# on another host, and HEAD's compiler is then cross-compiled for
+# aarch64-linux; its output does not depend on the host it runs on.
+if [ "$HOST" = aarch64-linux ]; then
+    build_host=$(detect_host)
+    case "$build_host" in
+        aarch64-macos|x86_64-macos|x86_64-linux) ;;
+        *) die "the chain cannot run on aarch64-linux (the seed and the releases before 0.11 have no aarch64-linux backend). Run bootstrap/bootstrap.sh --host aarch64-linux on aarch64-macos, x86_64-macos or x86_64-linux, which cross-builds the compiler for aarch64-linux, then finish on aarch64-linux as bootstrap/aarch64-linux-check.sh does (see docs/releases.md)." ;;
+    esac
+    CROSS=aarch64-linux
+    HOST=$build_host
+    [ -z "$UNTIL" ] || die "--host aarch64-linux cross-builds HEAD: it does not combine with --until"
 fi
 # The seed's name for it, and how the C compiler links for it.
 case "$HOST" in
@@ -197,6 +222,12 @@ while IFS='|' read -r _ version _ _ _ _ _ hosts _; do
     [ "$version" = "$UNTIL" ] && break
 done <"$WORK/releases"
 [ -n "$UNTIL" ] || check_host "the compiler at HEAD" "$HEAD_HOSTS"
+if [ -n "$CROSS" ]; then
+    case ",$HEAD_HOSTS," in
+        *",$CROSS,"*) ;;
+        *) die "the compiler at HEAD supports $HEAD_HOSTS, not $CROSS" ;;
+    esac
+fi
 
 # ---- Git ----
 
@@ -406,12 +437,29 @@ if [ $STOPPED -eq 0 ]; then
     cp "$FINAL" "$ROOT/target/tachyonc"
 fi
 
+if [ -n "$CROSS" ]; then
+    # HEAD's compiler, built and tested here, compiles its own source for
+    # the other host: the object of the compiler that runs there, which `cc
+    # -lm` links there. Built there by itself, it must emit this object
+    # again (bootstrap/aarch64-linux-check.sh checks it).
+    step "head: cross-compiling itself for $CROSS"
+    cross_dir="$CACHE/head/$CROSS"
+    mkdir -p "$cross_dir" "$ROOT/target/$CROSS"
+    "$FINAL" --target "$CROSS" "$head_tree/$HEAD_COMPILER/$HEAD_ROOT" -o "$cross_dir/tachyonc.o" \
+        || die "the cross-compilation for $CROSS failed"
+    cp "$cross_dir/tachyonc.o" "$ROOT/target/$CROSS/tachyonc.o"
+    note "$CROSS    cross-compiled by head: $ROOT/target/$CROSS/tachyonc.o (link it there: cc -o tachyonc tachyonc.o -lm)"
+    FINAL="$cross_dir/tachyonc.o"
+fi
+
 [ -z "$OUT" ] || cp "$FINAL" "$OUT"
 
 echo
-echo "tachyon bootstrap on $HOST:"
+echo "tachyon bootstrap on $HOST${CROSS:+, for $CROSS}:"
 cat "$SUMMARY"
-if [ $STOPPED -eq 0 ]; then
+if [ -n "$CROSS" ]; then
+    echo "compiler for $CROSS: $ROOT/target/$CROSS/tachyonc.o${OUT:+, also $OUT}; for $HOST: $ROOT/target/tachyonc"
+elif [ $STOPPED -eq 0 ]; then
     echo "compiler: $ROOT/target/tachyonc ($("$FINAL" --version))${OUT:+, also $OUT}"
 else
     echo "compiler: $FINAL ($("$FINAL" --version))${OUT:+, also $OUT}"

@@ -12,8 +12,8 @@
 # usage: tests/objcheck.sh [-c COMPILER] [-t TARGET] [-j JOBS] [FILTER]
 #
 #   -c COMPILER   the tachyonc to check (default: target/tachyonc)
-#   -t TARGET     aarch64-macos, x86_64-linux or x86_64-macos (default:
-#                 the host)
+#   -t TARGET     aarch64-macos, aarch64-linux, x86_64-linux or
+#                 x86_64-macos (default: the host)
 #   -j JOBS       programs checked at once (default: the number of CPUs)
 #   FILTER        only the programs whose path contains FILTER
 

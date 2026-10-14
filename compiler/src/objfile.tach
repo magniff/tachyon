@@ -243,6 +243,12 @@ fn reloc(sec: i64, offset: i64, rtype: i64, sym: i64, addend: i64, pcrel: bool, 
     RELOC_COUNT += 1;
 }
 
+// A relocation against symbol s itself (a GOT entry's).
+fn reloc_to_symbol(sec: i64, offset: i64, rtype: i64, s: i64, pcrel: bool) {
+    unsafe { ASYMS[s].in_table = true; }
+    reloc(sec, offset, rtype, s, 0, pcrel, 2);
+}
+
 // A relocation against symbol s plus `extra`: on ELF a temporary label
 // becomes its section's symbol plus the label's offset.
 fn reloc_to(sec: i64, offset: i64, rtype: i64, s: i64, extra: i64, pcrel: bool, length: i64) {
@@ -411,9 +417,36 @@ fn data_value(a: i64, b: i64, size: i64) {
     }
 }
 
+// ---- AArch64 ELF mapping symbols ----
+//
+// The AArch64 ELF ABI marks where code ($x) and data ($d) start in a
+// section, as GNU as does (disassemblers show data in code, such as jump
+// tables, as data): (section, fragment, offset, kind) for each change.
+
+const MAP_CODE: i64 = 1;
+const MAP_DATA: i64 = 2;
+static mut MAP_STATE: [i64; 4] = [0, 0, 0, 0];
+static mut MAPS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+fn mapping(kind: i64) {
+    unsafe {
+        if !ELF || X86 || MAP_STATE[CUR_SEC] == kind {
+            return;
+        }
+        MAP_STATE[CUR_SEC] = kind;
+        MAPS.push(CUR_SEC);
+        MAPS.push(OPEN);
+        MAPS.push(here() - FRAGS[OPEN].start);
+        MAPS.push(kind);
+    }
+}
+
 fn directive(a: i64, b: i64, rest: i64, end: i64) {
     unsafe {
         let t = BUFS[ASM].data;
+        if text_is(a, b, c".byte") || text_is(a, b, c".long") || text_is(a, b, c".quad") || text_is(a, b, c".space") {
+            mapping(MAP_DATA);
+        }
         if text_is(a, b, c".byte") {
             let mut i = rest;
             while i < end {
@@ -537,6 +570,7 @@ fn assemble_line(a: i64, b: i64) {
         if X86 {
             x86_instruction(i, w);
         } else {
+            mapping(MAP_CODE);
             a64_instruction(i, w);
         }
     }
@@ -630,6 +664,34 @@ const ELF_X64_PC32: i64 = 2;
 const ELF_X64_PLT32: i64 = 4;
 const ELF_X64_GOTPCRELX: i64 = 41;
 const ELF_X64_REX_GOTPCRELX: i64 = 42;
+const ELF_A64_ABS64: i64 = 257;
+const ELF_A64_ADR_PREL_PG_HI21: i64 = 275;
+const ELF_A64_ADD_ABS_LO12_NC: i64 = 277;
+const ELF_A64_LDST8_ABS_LO12_NC: i64 = 278;
+const ELF_A64_JUMP26: i64 = 282;
+const ELF_A64_CALL26: i64 = 283;
+const ELF_A64_LDST16_ABS_LO12_NC: i64 = 284;
+const ELF_A64_LDST32_ABS_LO12_NC: i64 = 285;
+const ELF_A64_LDST64_ABS_LO12_NC: i64 = 286;
+const ELF_A64_LDST128_ABS_LO12_NC: i64 = 299;
+const ELF_A64_ADR_GOT_PAGE: i64 = 311;
+const ELF_A64_LD64_GOT_LO12_NC: i64 = 312;
+
+// The relocation of a page offset (:lo12:) in the instruction at `pos`:
+// an add, or a load or store of 1 to 16 bytes, whose size scales the
+// offset.
+fn elf_a64_lo12(pos: i64) -> i64 {
+    let w = get32(pos);
+    if (w & 0x1f000000) == 0x11000000 {
+        return ELF_A64_ADD_ABS_LO12_NC;
+    }
+    let size = (w >> 30) & 3;
+    let simd = (w >> 26) & 1;
+    if simd != 0 && size == 0 && ((w >> 23) & 1) != 0 {
+        return ELF_A64_LDST128_ABS_LO12_NC;
+    }
+    if size == 0 { ELF_A64_LDST8_ABS_LO12_NC } else if size == 1 { ELF_A64_LDST16_ABS_LO12_NC } else if size == 2 { ELF_A64_LDST32_ABS_LO12_NC } else { ELF_A64_LDST64_ABS_LO12_NC }
+}
 
 fn same_section(s: i64, sec: i64) -> bool {
     unsafe { ASYMS[s].defined && ASYMS[s].sec == sec }
@@ -656,6 +718,9 @@ fn resolve_fixups() {
             if kind == FX_A64_B26 {
                 if same_section(s, sec) {
                     patch_bits(fx.pos, (sym_addr(s) - p) >> 2, 0, 26, c"branch out of range");
+                } else if ELF {
+                    let call = (get32(fx.pos) & 0x80000000) != 0;
+                    reloc_to(sec, p, if call { ELF_A64_CALL26 } else { ELF_A64_JUMP26 }, s, 0, true, 2);
                 } else {
                     reloc_to(sec, p, MACHO_A64_BRANCH26, s, 0, true, 2);
                 }
@@ -673,13 +738,13 @@ fn resolve_fixups() {
                     patch_bits(fx.pos, d >> 2, 5, 19, c"adr out of range");
                 }
             } else if kind == FX_A64_PAGE {
-                reloc_to(sec, p, MACHO_A64_PAGE21, s, 0, true, 2);
+                reloc_to(sec, p, if ELF { ELF_A64_ADR_PREL_PG_HI21 } else { MACHO_A64_PAGE21 }, s, 0, true, 2);
             } else if kind == FX_A64_PAGEOFF {
-                reloc_to(sec, p, MACHO_A64_PAGEOFF12, s, 0, false, 2);
+                reloc_to(sec, p, if ELF { elf_a64_lo12(fx.pos) } else { MACHO_A64_PAGEOFF12 }, s, 0, false, 2);
             } else if kind == FX_A64_GOTPAGE {
-                reloc_to(sec, p, MACHO_A64_GOT_PAGE21, s, 0, true, 2);
+                reloc_to_symbol(sec, p, if ELF { ELF_A64_ADR_GOT_PAGE } else { MACHO_A64_GOT_PAGE21 }, s, true);
             } else if kind == FX_A64_GOTPAGEOFF {
-                reloc_to(sec, p, MACHO_A64_GOT_PAGEOFF12, s, 0, false, 2);
+                reloc_to_symbol(sec, p, if ELF { ELF_A64_LD64_GOT_LO12_NC } else { MACHO_A64_GOT_PAGEOFF12 }, s, false);
             } else if kind == FX_X86_BRANCH || kind == FX_X86_RIP || kind == FX_X86_GOT {
                 let end = FRAGS[f].addr + (fx.end - FRAGS[f].start);
                 if kind != FX_X86_GOT && resolvable(s, sec, fx.atom) {
@@ -701,7 +766,8 @@ fn resolve_fixups() {
                 }
                 put32(fx.pos, sym_addr(s) - sym_addr(fx.sym2));
             } else if kind == FX_ABS64 {
-                reloc_to(sec, p, if ELF { ELF_X64_64 } else if X86 { MACHO_X64_UNSIGNED } else { MACHO_A64_UNSIGNED }, s, 0, false, 3);
+                let rtype = if ELF && X86 { ELF_X64_64 } else if ELF { ELF_A64_ABS64 } else if X86 { MACHO_X64_UNSIGNED } else { MACHO_A64_UNSIGNED };
+                reloc_to(sec, p, rtype, s, 0, false, 3);
             }
         }
     }
@@ -1076,6 +1142,26 @@ fn elf_write(path: *u8) {
             w64(syms, 0);
         }
         let mut count = 5;
+        // Mapping symbols ($x, $d), local.
+        let mut map_name: [i64; 3] = [0, 0, 0];
+        let mut k = 0;
+        while k < MAPS.count {
+            let kind = MAPS.data[k + 3];
+            if map_name[kind] == 0 {
+                map_name[kind] = BUFS[strs].len;
+                buf_str(strs, if kind == MAP_CODE { c"$x" } else { c"$d" });
+                w8(strs, 0);
+            }
+            let f = MAPS.data[k + 1];
+            w32(syms, map_name[kind]);
+            w8(syms, 0);
+            w8(syms, 0);
+            w16(syms, shndx[MAPS.data[k]]);
+            w64(syms, FRAGS[f].addr + MAPS.data[k + 2]);
+            w64(syms, 0);
+            count += 1;
+            k += 4;
+        }
         let mut first_global = 5;
         for pass in 0..2 {
             if pass == 1 {
@@ -1221,7 +1307,7 @@ fn elf_write(path: *u8) {
         }
         let hdr = buf_new();
         w16(hdr, 1);
-        w16(hdr, 62);
+        w16(hdr, if X86 { 62 } else { 183 });
         w32(hdr, 1);
         w64(hdr, 0);
         w64(hdr, 0);

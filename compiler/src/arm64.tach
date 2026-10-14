@@ -1,5 +1,8 @@
-// AArch64 for macOS (Apple's arm64 ABI), as text for clang's assembler:
-// the a64_* half of the target interface in target.tach.
+// AArch64 for macOS (Apple's arm64 ABI, Mach-O) and Linux (the standard
+// AAPCS64, ELF; 0.11), as text for clang's assembler or GNU as: the a64_*
+// half of the target interface in target.tach. The two differ in symbol
+// syntax (`sym@PAGE` against `:lo12:sym`...) and in where stack and
+// variadic arguments go.
 //
 // Registers: the virtual registers are x<n> with the same number (R_ACC is
 // x0, R_RESULT x8, the ABI's indirect result register); the float
@@ -14,22 +17,86 @@ use crate::types::{
 };
 use crate::consteval::{f32_bits, f64_of_bits};
 use crate::target::{
-    ASM, emit_symbol_ref, end, end_i, function_prefix, ins, ins_i, local_prefix, log2, o, oi, on,
-    rt_panic_sym,
+    APPLE_A64, ASM, ELF, emit_symbol_ref, end, end_i, function_prefix, global_prefix, ins, ins_i,
+    local_prefix, log2, o, oi, on, rt_panic_sym,
 };
 use crate::ir::Cond;
 use crate::lexer::Tok::{Amp, Caret, Minus, Percent, Pipe, Plus, Shl, Shr, Slash, Star};
 
+// ---- Symbols and labels ----
+
+// A label as an operand: L<n> on Mach-O, .L<n> on ELF.
+pub fn a64_label(label: i64) {
+    unsafe { o(local_prefix()); }
+    oi(label);
+}
+
+// "    <s> <label>\n"
+fn a64_branch(s: *u8, label: i64) {
+    unsafe {
+        o(c"    ");
+        o(s);
+        o(c" ");
+    }
+    a64_label(label);
+    on();
+}
+
+// The symbol operands of AArch64 addressing: the 4 KB page of a symbol
+// (adrp), its offset in the page (add, ldr), and the same for its GOT
+// entry; `sym@PAGE`, `sym@PAGEOFF`, `sym@GOTPAGE`, `sym@GOTPAGEOFF` on
+// Mach-O, `sym`, `:lo12:sym`, `:got:sym`, `:got_lo12:sym` on ELF.
+pub const A64_PAGE: i64 = 0;
+pub const A64_PAGEOFF: i64 = 1;
+pub const A64_GOTPAGE: i64 = 2;
+pub const A64_GOTPAGEOFF: i64 = 3;
+
+fn a64_modifier_before(kind: i64) {
+    unsafe {
+        if ELF {
+            o(if kind == A64_PAGEOFF { c":lo12:" } else if kind == A64_GOTPAGE { c":got:" } else if kind == A64_GOTPAGEOFF { c":got_lo12:" } else { c"" });
+        }
+    }
+}
+
+fn a64_modifier_after(kind: i64) {
+    unsafe {
+        if !ELF {
+            o(if kind == A64_PAGE { c"@PAGE" } else if kind == A64_PAGEOFF { c"@PAGEOFF" } else if kind == A64_GOTPAGE { c"@GOTPAGE" } else { c"@GOTPAGEOFF" });
+        }
+    }
+}
+
+// <prefix><name> with modifier `kind`.
+pub fn a64_sym(prefix: *u8, name: i64, kind: i64) {
+    a64_modifier_before(kind);
+    emit_symbol_ref(prefix, name);
+    a64_modifier_after(kind);
+}
+
+// String literal `id` (a local label) with modifier `kind`.
+pub fn a64_str_sym(id: i64, kind: i64) {
+    a64_modifier_before(kind);
+    unsafe {
+        o(local_prefix());
+        o(c"str.");
+    }
+    oi(id);
+    a64_modifier_after(kind);
+}
+
+// ---- Control flow ----
+
 pub fn a64_jump(label: i64) {
-    unsafe { ins_i(c"b L", label, c""); }
+    unsafe { a64_branch(c"b", label); }
 }
 
 pub fn a64_jump_if_zero(label: i64) {
-    unsafe { ins_i(c"cbz x0, L", label, c""); }
+    unsafe { a64_branch(c"cbz x0,", label); }
 }
 
 pub fn a64_jump_if_nonzero(label: i64) {
-    unsafe { ins_i(c"cbnz x0, L", label, c""); }
+    unsafe { a64_branch(c"cbnz x0,", label); }
 }
 
 pub fn a64_decrement(reg: i64) {
@@ -43,7 +110,7 @@ pub fn a64_decrement(reg: i64) {
 }
 
 pub fn a64_jump_unless_zero_result(label: i64) {
-    unsafe { ins_i(c"b.ne L", label, c""); }
+    unsafe { a64_branch(c"b.ne", label); }
 }
 
 pub fn a64_compare_jump(op: Cond, signed: bool, label: i64) {
@@ -51,9 +118,9 @@ pub fn a64_compare_jump(op: Cond, signed: bool, label: i64) {
         ins(c"cmp x0, x1");
         o(c"    b.");
         o(a64_condition(op, signed, false));
-        o(c" L");
+        o(c" ");
     }
-    oi(label);
+    a64_label(label);
     on();
 }
 
@@ -135,10 +202,10 @@ pub fn a64_add_imm(reg: i64, value: i64) {
 pub fn a64_local_symbol_addr(prefix: *u8, name: i64) {
     unsafe {
         o(c"    adrp x0, ");
-        emit_symbol_ref(prefix, name);
-        o(c"@PAGE\n    add x0, x0, ");
-        emit_symbol_ref(prefix, name);
-        o(c"@PAGEOFF\n");
+        a64_sym(prefix, name, A64_PAGE);
+        o(c"\n    add x0, x0, ");
+        a64_sym(prefix, name, A64_PAGEOFF);
+        on();
     }
 }
 
@@ -146,17 +213,20 @@ pub fn a64_local_symbol_addr(prefix: *u8, name: i64) {
 pub fn a64_extern_symbol_addr(name: i64) {
     unsafe {
         o(c"    adrp x0, ");
-        emit_symbol_ref(c"_", name);
-        o(c"@GOTPAGE\n    ldr x0, [x0, ");
-        emit_symbol_ref(c"_", name);
-        o(c"@GOTPAGEOFF]\n");
+        a64_sym(global_prefix(), name, A64_GOTPAGE);
+        o(c"\n    ldr x0, [x0, ");
+        a64_sym(global_prefix(), name, A64_GOTPAGEOFF);
+        o(c"]\n");
     }
 }
 
 pub fn a64_string_addr(id: i64) {
     unsafe {
-        ins_i(c"adrp x0, Lstr.", id, c"@PAGE");
-        ins_i(c"add x0, x0, Lstr.", id, c"@PAGEOFF");
+        o(c"    adrp x0, ");
+        a64_str_sym(id, A64_PAGE);
+        o(c"\n    add x0, x0, ");
+        a64_str_sym(id, A64_PAGEOFF);
+        on();
     }
 }
 
@@ -279,7 +349,7 @@ pub fn a64_copy(size: i64) {
             ins(c"mov x0, x1");
             ins(c"mov x1, x16");
             a64_load_imm(2, size as u64);
-            ins(c"bl _memcpy");
+            a64_call_c(c"memcpy");
             return;
         }
         let mut offset = 0;
@@ -437,7 +507,7 @@ pub fn a64_float_binary(op: Tok, ty: i64) {
     unsafe {
         let r = if ty == TY_F32 { c"s" } else { c"d" };
         if op == Percent {
-            ins(if ty == TY_F32 { c"bl _fmodf" } else { c"bl _fmod" });
+            a64_call_c(if ty == TY_F32 { c"fmodf" } else { c"fmod" });
             return;
         }
         o(match op {
@@ -554,8 +624,9 @@ pub fn a64_arg_location(ty: i64, state: *i64) -> i64 {
             state[0] += 1;
             return state[0] - 1;
         }
-        // Apple's arm64 ABI packs stack arguments at their natural alignment.
-        let size = if is_compound(ty) { 8 } else { type_size(ty) };
+        // Apple's arm64 ABI packs stack arguments at their natural alignment;
+        // AAPCS64 gives each one an 8-byte slot.
+        let size = if is_compound(ty) || !APPLE_A64 { 8 } else { type_size(ty) };
         state[2] = align_to(state[2], size);
         let offset = state[2];
         state[2] += size;
@@ -596,11 +667,21 @@ pub fn a64_sp_add(size: i64) {
     unsafe { ins(c"add sp, sp, x16"); }
 }
 
-pub fn a64_load_arg_reg(location: i64, ty: i64, from: i64) {
+pub fn a64_load_arg_reg(location: i64, ty: i64, from: i64, promote: bool) {
     unsafe {
         if location >= 8 {
             o(if ty == TY_F32 { c"    ldr s" } else { c"    ldr d" });
             oi(location - 8);
+            if ty == TY_F32 && promote {
+                // A variadic f32 in a register (AAPCS64), as C's double.
+                end_i(c", [sp, #", from, c"]");
+                o(c"    fcvt d");
+                oi(location - 8);
+                o(c", s");
+                oi(location - 8);
+                on();
+                return;
+            }
         } else {
             o(c"    ldr x");
             oi(location);
@@ -627,7 +708,7 @@ pub fn a64_stack_arg(ty: i64, from: i64, offset: i64, promote: bool) {
             return;
         }
         ins_i(c"ldr x16, [sp, #", from, c"]");
-        let size = if is_compound(ty) || promote { 8 } else { type_size(ty) };
+        let size = if is_compound(ty) || promote || !APPLE_A64 { 8 } else { type_size(ty) };
         if size == 1 {
             ins_i(c"strb w16, [sp, #", offset, c"]");
         } else if size == 2 {
@@ -650,6 +731,16 @@ pub fn a64_call(prefix: *u8, name: i64) {
     on();
 }
 
+// Calls the C library's function `name`.
+pub fn a64_call_c(name: *u8) {
+    unsafe {
+        o(c"    bl ");
+        o(global_prefix());
+        o(name);
+    }
+    on();
+}
+
 pub fn a64_call_indirect() {
     unsafe { ins(c"blr x16"); }
 }
@@ -669,7 +760,8 @@ pub fn a64_panic(kind: i64) {
 }
 
 // rt.panic(kind, a, b, c): dprintf(2, message[kind], a, b, c); exit(101).
-// Apple's arm64 ABI passes the variadic arguments on the stack.
+// Apple's arm64 ABI passes the variadic arguments on the stack, AAPCS64 in
+// registers.
 pub fn a64_runtime() {
     unsafe {
         o(c"\n.p2align 2\n");
@@ -677,19 +769,30 @@ pub fn a64_runtime() {
         o(c":\n");
         ins(c"stp x29, x30, [sp, #-16]!");
         ins(c"mov x29, sp");
-        ins(c"sub sp, sp, #32");
-        ins(c"stp x1, x2, [sp]");
-        ins(c"str x3, [sp, #16]");
+        if APPLE_A64 {
+            ins(c"sub sp, sp, #32");
+            ins(c"stp x1, x2, [sp]");
+            ins(c"str x3, [sp, #16]");
+        } else {
+            ins(c"mov x4, x3");
+            ins(c"mov x3, x2");
+            ins(c"mov x2, x1");
+        }
         o(c"    adrp x8, ");
+        a64_modifier_before(A64_PAGE);
         o(local_prefix());
-        o(c"rt.messages@PAGE\n");
-        o(c"    add x8, x8, ");
+        o(c"rt.messages");
+        a64_modifier_after(A64_PAGE);
+        o(c"\n    add x8, x8, ");
+        a64_modifier_before(A64_PAGEOFF);
         o(local_prefix());
-        o(c"rt.messages@PAGEOFF\n");
+        o(c"rt.messages");
+        a64_modifier_after(A64_PAGEOFF);
+        on();
         ins(c"add x1, x8, x0, lsl #6");
         ins(c"mov w0, #2");
-        ins(c"bl _dprintf");
+        a64_call_c(c"dprintf");
         ins(c"mov w0, #101");
-        ins(c"bl _exit");
+        a64_call_c(c"exit");
     }
 }

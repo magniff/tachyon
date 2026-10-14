@@ -480,6 +480,16 @@ The last release of the build-out.
   cost model for the loop vectorizer (from 0.10)
 - multi-error diagnostics: done (0.5, completed in 0.10)
 
+0.11 A status (DWARF line tables, aarch64-linux):
+
+- aarch64-linux target: done (AAPCS64 in abi.tach and both back ends, ELF
+  objects with R_AARCH64_* relocations and mapping symbols, `import`);
+  tests, fuzz, ABI (three modes) and objcheck pass in a linux/arm64
+  container
+- aarch64-linux host: done (cross-built by `bootstrap.sh --host
+  aarch64-linux`, finished natively by `bootstrap/aarch64-linux-check.sh`)
+- DWARF line tables (`-g`): to do
+
 ## Toward 1.0
 
 1.0 is not a feature milestone: it ships when the language is thought

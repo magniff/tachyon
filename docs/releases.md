@@ -374,6 +374,7 @@ message, on a host that some release in the chain does not support.
 | `aarch64-macos` | Macs with Apple silicon | git, Rust (rustup), the Xcode command line tools (`cc` is clang) |
 | `x86_64-macos` | Intel Macs | the same |
 | `x86_64-linux` | x86-64 Linux with glibc | git, Rust (rustup), a C compiler with the libc headers (`gcc` and `libc6-dev` on Debian/Ubuntu, or clang) |
+| `aarch64-linux` (from 0.11) | AArch64 Linux with glibc | a C compiler with the libc headers; the chain itself runs on one of the hosts above (see below) |
 
 Every host also needs the POSIX utilities that any Unix has (`sh`, `awk`,
 `sed`, `tar`, `cmp`, `mktemp`); the scripts use nothing beyond POSIX, and
@@ -388,6 +389,41 @@ if your rustup does not install toolchains automatically, run
 
 On Apple silicon, `bootstrap.sh --host x86_64-macos` builds and checks the
 chain for Intel Macs, running the x86-64 binaries under Rosetta 2.
+
+### aarch64-linux: cross-built, then checked natively
+
+0.11 adds the target and host `aarch64-linux` (the standard AAPCS64, ELF,
+position independent). The chain cannot start there: the seed (Rust with
+Cranelift, pinned) has no aarch64-linux backend, and neither has any
+release before 0.11, so no step before HEAD runs on it. Rather than a new
+seed, the compiler for it is cross-built, which is sound because a
+compiler's output does not depend on the host it runs on (the fixpoint
+check proves it for every host it runs on):
+
+1. On a host where the chain runs (aarch64-macos, x86_64-macos or
+   x86_64-linux), `bootstrap.sh --host aarch64-linux` runs the chain as
+   usual (HEAD built by the last release, its fixpoint and its test suite
+   on that host), then has HEAD's compiler compile its own source for
+   aarch64-linux: `target/aarch64-linux/tachyonc.o`, the object of the
+   compiler that runs there (`cc -o tachyonc tachyonc.o -lm` links it
+   there). On aarch64-linux itself, `bootstrap.sh` stops with this advice.
+2. On aarch64-linux, the cross-built compiler builds itself. The object it
+   writes must be the cross-built one, byte for byte (the host made no
+   difference), and the compiler so built must write it again (the
+   fixpoint); then the test suite runs there, with the random programs,
+   the C interoperability checks and the object check.
+
+`bootstrap/aarch64-linux-check.sh` does both: step 1 where it runs, step 2
+in a linux/arm64 Debian container (`bootstrap/ci/linux-aarch64.Dockerfile`;
+native on Apple silicon, e.g. with colima):
+
+```
+$ bootstrap/aarch64-linux-check.sh --worktree --dev --all-levels --fuzz=100 --abi=40 --objcheck --debugger
+```
+
+In `releases.toml`, `aarch64-linux` is a host of HEAD (and so of 0.11 and
+every later release), and of no release before; the releases before 0.11
+and their checks are unchanged.
 
 ## Semantic versioning
 
@@ -518,7 +554,7 @@ $ cc -o tachyonc tachyonc.s -lm
 $ tests/run.sh -c ./tachyonc
 ```
 
-`tachyonc --target T` picks the target (`aarch64-macos`, `x86_64-linux`,
+`tachyonc --target T` picks the target (`aarch64-macos`, `aarch64-linux`, `x86_64-linux`,
 `x86_64-macos`); the default is the host. The assembly for a target is the
 same on every host, so a compiler can cross-compile itself.
 

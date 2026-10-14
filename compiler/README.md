@@ -26,6 +26,7 @@ emits assembly that `cc` assembles and links against libc, for one of:
 | `aarch64-macos` | AArch64, Apple's arm64 ABI, Mach-O | `cc -arch arm64` |
 | `x86_64-linux` | x86-64, System V ABI, ELF, position independent | `cc` (gcc or clang) |
 | `x86_64-macos` | x86-64, System V ABI, Mach-O | `cc -arch x86_64` |
+| `aarch64-linux` | AArch64, the standard AAPCS64, ELF, position independent (0.11) | `cc` (gcc or clang) |
 
 The default target is the host, found with `uname`; the assembly for a
 target does not depend on the host. Errors are reported in the seed's
@@ -63,7 +64,7 @@ e.g. `use crate::ir::Op::{Add, Sub};`; 0.8 has no `*` imports, and
 | `gen.tach` | the driver of code generation, and the `-O0` code generator: walks the checked AST, in terms of the target interface |
 | `abi.tach` | C's calling convention for aggregates (AArch64 and System V): classification into pieces, locations |
 | `target.tach` | the target interface: targets, the machine model's virtual registers, object-format details (symbols, sections, labels), and dispatch to the instruction set |
-| `arm64.tach` | AArch64 for `-O0`: instructions and Apple's arm64 calling convention |
+| `arm64.tach` | AArch64 for `-O0`: instructions, Apple's arm64 calling convention and AAPCS64's, Mach-O and ELF symbol syntax |
 | `x86_64.tach` | x86-64 for `-O0`: AT&T-syntax instructions and the System V calling convention |
 | `ir.tach` | the IR (`-O1` and up): instructions, blocks, functions, printing, verification |
 | `lower.tach` | the checked AST to IR, building SSA form (Braun et al.) |
@@ -174,6 +175,8 @@ tests of what they changed on purpose).
 
 ## Known limits
 
-- Targets: AArch64 macOS, x86-64 Linux and macOS. No AArch64 Linux yet.
+- Targets: AArch64 macOS and Linux, x86-64 Linux and macOS. On AArch64
+  Linux the bootstrap chain cannot run (see "aarch64-linux" in
+  [docs/releases.md](../docs/releases.md)): the compiler is cross-built.
 - The optimizer's limits are listed at the end of
   [docs/optimizer.md](../docs/optimizer.md).

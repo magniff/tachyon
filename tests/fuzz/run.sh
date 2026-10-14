@@ -9,8 +9,8 @@
 #   -c COMPILER   the tachyonc to test (default: target/tachyonc)
 #   -s SEED       also compare with the seed binary (divisors are then
 #                 positive: the seed traps on 0 and on MIN / -1)
-#   -t TARGET     aarch64-macos, x86_64-linux or x86_64-macos (default:
-#                 the host)
+#   -t TARGET     aarch64-macos, aarch64-linux, x86_64-linux or
+#                 x86_64-macos (default: the host)
 #   -n COUNT      number of programs (default 200)
 #   -f FIRST      the first random seed (default 1)
 #   -k DIR        where to keep failing programs (default: tests/fuzz/failures)
@@ -57,6 +57,7 @@ if [ -z "$TARGET" ]; then
         Darwin-arm64) TARGET=aarch64-macos ;;
         Darwin-x86_64) TARGET=x86_64-macos ;;
         Linux-x86_64) TARGET=x86_64-linux ;;
+        Linux-aarch64) TARGET=aarch64-linux ;;
         *) echo "fuzz: unknown host" >&2; exit 2 ;;
     esac
 fi
