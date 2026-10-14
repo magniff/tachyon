@@ -1,7 +1,10 @@
 # The shell
 
 Shell commands run without asking, inside a sandbox that allows writes
-only in the current directory. A command line that uses shell variables
-(`$x`, `for f in ...; do ... $f ...`) is refused by the harness: put such
-logic in a script file in the current directory and run it with
-`sh script.sh`.
+only in the current directory. The harness refuses some command lines
+because of their form, not their purpose: lines with shell variables
+(`$x`, `$?`), loops, heredocs, or several commands chained with `&&`,
+`;` or `cd`. When that happens, do not give up and do not stop: write
+files with the Write tool (a script, a test input), then run one simple
+command at a time, e.g. `tachyonc main.tach -o prog`, `sh check.sh`,
+`./prog < input.txt`.
