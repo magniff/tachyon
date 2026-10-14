@@ -20,7 +20,7 @@ use crate::base::{
     ERR, ERR_HELP, IntVec, RECOVER_DEPTH, SYMS, _setjmp, buf_byte, buf_bytes, buf_int, buf_new,
     buf_slice, buf_str, buf_uint, err_begin, err_end, err_end_soft, err_failed_name, err_help,
     err_help_sym, err_int, err_str, err_sym, error_at, error_at_soft, exit_if_errors, grow, intern,
-    intern_c, recover_enter, recover_leave, report_error_once,
+    intern_c, recover_enter, recover_leave, report_error_once, SYM_COUNT, edit_distance,
 };
 use crate::fixunsafe::{FIX_UNSAFE, note_unsafe_site};
 use crate::traits::{
@@ -47,7 +47,8 @@ use crate::modules::{
     STD_MODULE,
     SYM_CRATE, SYM_STD, SYM_SUPER, access_error, binding, binding_kind, binding_value, child_module,
     collect_uses, init_modules, item_symbol, join_sym, lookup_name, lookup_quiet, module_of,
-    note_c_use, path_module, qualify, resolve_all_uses, resolve_use_of,
+    note_c_use, path_module, qualify, resolve_all_uses, resolve_use_of, item_key_if_known,
+    module_count,
 };
 use crate::types::{
     ALIAS_BUSY, ALIAS_TYPE, CONSTS, CONST_CAP, CONST_COUNT, ConstInfo, ENUMS, ENUM_CAP, ENUM_COUNT,
@@ -2514,8 +2515,143 @@ pub fn unknown_name_error(pos: i64, before: *u8, name: i64) -> ! {
             err_help_sym(name);
             err_help(c"' was not imported from the C headers: ");
             err_help(reason);
+        } else if before[0] == 'u' && before[1] == 'n' && (before[2] == 'd' || before[2] == 'k') {
+            // (`undefined variable '`, `unknown type '`, `unknown struct '`)
+            suggest_name(name, before[2] == 'd');
         }
         err_end()
+    }
+}
+
+// ---- Suggestions for unknown names (0.11) ----
+
+// The help of an unknown name (a value, or a type): the item of that name
+// another module has (`add `use crate::m::name;``), else the nearest name
+// in scope (`did you mean 'x'?`).
+fn suggest_name(name: i64, value: bool) {
+    unsafe {
+        let path = import_path_for(name, value);
+        if path != 0 {
+            err_help(c"add `use ");
+            buf_bytes(ERR_HELP, buf_slice(path));
+            err_help(c"::");
+            err_help_sym(name);
+            err_help(c";`");
+            return;
+        }
+        let near = nearest_name(name, value);
+        if near >= 0 {
+            err_help(c"did you mean '");
+            err_help_sym(near);
+            err_help(c"'?");
+        }
+    }
+}
+
+// Whether key `key` (an item's) is a value (a function, constant or
+// static) or, for !value, a type.
+fn key_is(key: i64, value: bool) -> bool {
+    unsafe {
+        if value {
+            SYM_FN[key] != 0 || SYM_CONST[key] != 0 || SYM_STATIC[key] != 0
+        } else {
+            SYM_STRUCT[key] != 0 || SYM_ENUM[key] != 0 || SYM_ALIAS[key] != 0 || template_of_key(key) != TPL_NONE
+        }
+    }
+}
+
+// Whether `name` is a value (or a type) where the checker is.
+fn name_in_scope(name: i64, value: bool) -> bool {
+    unsafe {
+        if value {
+            match lookup_local(name) {
+                Option::Some(_) => { return true; }
+                Option::None => {}
+            }
+        } else if env_lookup(name) != 0 || SYM_PRIMITIVE[name] != 0 {
+            return true;
+        }
+        let b = lookup_quiet(CUR_MOD, name, CUR_MOD);
+        binding_kind(b) == B_ITEM && key_is(binding_value(b), value)
+    }
+}
+
+// The name in scope nearest to `name` (edit distance, at most a third of
+// its length), or -1.
+fn nearest_name(name: i64, value: bool) -> i64 {
+    unsafe {
+        let want = SYMS[name].text;
+        let mut limit = want.len / 3;
+        if limit < 1 {
+            limit = 1;
+        }
+        let mut best = -1;
+        let mut best_d = limit + 1;
+        for s in 0..SYM_COUNT {
+            let t = SYMS[s].text;
+            if s == name || t.len == 0 || t.len > want.len + limit || t.len + limit < want.len {
+                continue;
+            }
+            let c = t[0];
+            if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_') {
+                continue;
+            }
+            let mut ident = true;
+            for i in 0..t.len {
+                let x = t[i];
+                if !((x >= 'a' && x <= 'z') || (x >= 'A' && x <= 'Z') || (x >= '0' && x <= '9') || x == '_') {
+                    ident = false;
+                    break;
+                }
+            }
+            if !ident {
+                continue;
+            }
+            let d = edit_distance(want, t);
+            if d < best_d && name_in_scope(s, value) {
+                best = s;
+                best_d = d;
+            }
+        }
+        best
+    }
+}
+
+// The path of the module (`crate::a::b`, `std`) whose public item `name`
+// is a value (or a type) the current module could import: a buffer, or 0.
+fn import_path_for(name: i64, value: bool) -> i64 {
+    unsafe {
+        for m in 0..module_count() {
+            if m == CUR_MOD || m == C_MODULE {
+                continue;
+            }
+            let key = item_key_if_known(m, name);
+            if key < 0 {
+                continue;
+            }
+            let item = item_node_of(key);
+            if item == 0 || (NODES[item].p & ITEM_PUBLIC) == 0 || !key_is(key, value) {
+                continue;
+            }
+            let out = buf_new();
+            put_module_path(out, m);
+            return out;
+        }
+        0
+    }
+}
+
+fn put_module_path(out: i64, m: i64) {
+    unsafe {
+        if m == 0 {
+            buf_str(out, c"crate");
+        } else if m == STD_MODULE {
+            buf_str(out, c"std");
+        } else {
+            put_module_path(out, MODULES[m].parent);
+            buf_str(out, c"::");
+            buf_bytes(out, SYMS[MODULES[m].name].text);
+        }
     }
 }
 

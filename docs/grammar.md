@@ -824,6 +824,12 @@ errors; 0.9 reported it as a warning). Options:
 - `--deny-warnings`: warnings are errors. There are no warnings at the
   moment (0.9's unsafe warnings are errors now); the option stays for
   future ones, and the test suite compiles every case with it.
+- `--diagnostics=short` (0.11): every error and warning on one line,
+  `FILE:LINE:COL: error[KIND] MESSAGE | help: HELP | note: NOTE`, for
+  tools and agents (`--diagnostics=human`, the default, is the form
+  above). An unknown name's help is the `use` line that imports it from
+  another module (``add `use crate::m::name;` ``), else the nearest name in
+  scope (`did you mean 'total'?`).
 - `tachyonc --fix-unsafe FILE...`: rewrites the program in place, putting
   each unsafe operation outside unsafe code in an unsafe block: the
   statement around it (consecutive statements share one block), a
