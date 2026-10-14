@@ -4,7 +4,7 @@ Tachyon is a compiled systems language. Its syntax is close to Rust's,
 its model close to C's: structs, enums with exhaustive `match`, traits
 and generics (monomorphized), modules, checked slices, raw pointers,
 `unsafe`, exact C interop. There is no borrow checker, no lifetimes, no
-destructors, no macros, and (in 0.13) no closures or iterators. Safe
+destructors, no macros. Closures and iterators are new in 0.14. Safe
 code has no undefined behaviour. This text matches this compiler;
 `tachyonc guide TOPIC` gives the detail (topics at the end).
 
@@ -41,7 +41,7 @@ files on the command line make one program; `mod name;` loads
 | `use m::*;` | not allowed: `use m::{a, b};`, or the path `m::a` |
 | `println!("{}", x)`, `format!` | no macros: `print("x = "); std::print_int(x); println("");`; floats through C's `printf` |
 | `v[i]` on a `Vec` | `v.get(i)`, `v.set(i, x)`, `v.as_slice()[i]` |
-| closures, `.iter().map()` | none in 0.13 (coming in 0.14): `for i in 0..s.len { ... s[i] ... }`, `for x in slice` |
+| closures, `.iter().map()` | the same (0.14): `\|x\| x + k`, `v.iter().map(\|x\| x * 2).sum()`; `F: Fn(i64) -> i64` bounds; no `dyn Fn`, `FnOnce`, `iter_mut` (`guide closures`, `guide iterators`) |
 | `x?` | none yet (0.15): `match r { Ok(v) => v, Err(e) => return Err(e) }` |
 | `impl Trait for T`, `T: Trait` | the same; `type Item;` associated types (0.14); no `dyn`, `where`, supertraits, `#[derive]` |
 | `Drop`, RAII | none: call `free()`, usually `defer v.free();` |
@@ -445,7 +445,6 @@ the one hole in safe code (no lifetimes).
 | `expected ';', got '!'` | no macros: `println(...)`, `std::print_int(...)` |
 | `cannot assign to immutable variable 'x'` | `let mut x` |
 | `cannot index type 'Vec<i64>'` | `v.get(i)`, `v.as_slice()[i]` |
-| `'for' loops iterate over ... got 'Vec<i64>'` | `for x in v.as_slice()` |
 | `no method 'len' on type '[u8]'` | `s.len`, a field |
 | `expected '[i64]', got '[i64; 3]'` | pass `a[..]` |
 | `expected 'i64', got 'i32'` | `x as i64` |
@@ -473,6 +472,10 @@ tachyonc undo                           # take the last edit back
 tachyonc refactor rename main::x total  # a local (or FILE:LINE:COL), an item, a field, with every use
 ```
 
+They pay off on renames, moves, signature, field and variant changes,
+errors across files and large code; a small file is cheaper read whole
+(`query show FILE.tach`, `query text FILE:1-200`) than queried piece by
+piece.
 ROOT is `--root FILE`, a last argument ending in `.tach`, or
 `./main.tach`. Every edit is checked first: one that adds an error
 writes nothing. A problem is one line, `error CODE: message`, then

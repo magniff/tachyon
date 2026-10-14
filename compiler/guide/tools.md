@@ -5,6 +5,13 @@ reading files with grep or sed, and edit through it instead of
 rewriting files. Names are resolved by the compiler, so a query sees
 uses through imports and ignores comments and strings.
 
+When they pay off: renames, moves, signature, field and variant
+changes (every use, checked, in one command), errors across files, and
+code too large to read. A small program (a few hundred lines) is
+cheaper read whole, once (`tachyonc query show FILE.tach` up to 200
+lines, `query text FILE:A-B` 200 at a time), than explored with many
+small queries.
+
 ## The loop
 
 1. Write the program; `tachyonc check` (the front end only: fast, every

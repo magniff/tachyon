@@ -9,8 +9,8 @@ prelude names need no import: `Option`, `Some`, `None`, `Result`, `Ok`,
 
 What a Rust programmer will miss: there is no `String` (use `[u8]` and
 `Buf`), no formatting (`print` takes a `[u8]`; numbers through
-`print_int` or `Buf::push_int`; floats through C's `printf`), no
-iterators, no file reading (call C), no `HashSet` (a
+`print_int` or `Buf::push_int`; floats through C's `printf`), no file
+or stdin reading (call C; iterators: `tachyonc guide iterators`), no `HashSet` (a
 `HashMap<K, bool>`), no `Vec` indexing (`get`, `set`, `as_slice()[i]`),
 no `Option::map`. Nothing frees itself: call `free()`, usually right
 after creating the value with `defer x.free();`.

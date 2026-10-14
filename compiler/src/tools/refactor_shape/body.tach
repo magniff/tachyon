@@ -5,10 +5,12 @@
 // a text re-indented.
 
 use crate::base::{IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_new, buf_slice};
-use crate::front::ast::{BLOCK_UNSAFE, FN_UNSAFE, NODES, NODE_COUNT, NodeKind, child};
+use crate::front::ast::{
+    BLOCK_UNSAFE, CLOSURE_MOVE, FN_UNSAFE, NODES, NODE_CAPTURE, NODE_COUNT, NodeKind, child,
+};
 use crate::front::check::{LOCALS, Res};
 use crate::front::lexer::Tok;
-use crate::front::types::{TYPES, TyKind, buf_type, is_pointer};
+use crate::front::types::{ENUMS, STRUCTS, TLISTS, TYPES, TyKind, buf_type, is_pointer, type_elem};
 use crate::middle::lower::ssa::HMap;
 use crate::tools::edit::TARGET_NAME;
 use crate::tools::edit::apply::{copy_rewritten, overlay_args};
@@ -30,7 +32,8 @@ pub const USE_FIELD_WRITE: i64 = 4;
 pub const USE_FIELD_READ: i64 = 5;
 
 // The node children of checked node n (its expressions, statements,
-// patterns; not its types and names), into out.
+// patterns; not its types and names; 0.14: a closure's parameters and
+// body), into out.
 pub fn kids(n: i64, out: *IntVec) {
     unsafe {
         let k = NODES[n].kind;
@@ -38,6 +41,11 @@ pub fn kids(n: i64, out: *IntVec) {
         let b = NODES[n].b;
         let c = NODES[n].c;
         let d = NODES[n].d;
+        // (0.14: a captured use, rewritten to its closure's environment, is
+        // a leaf; local_of gives its local)
+        if (NODES[n].p & NODE_CAPTURE) != 0 {
+            return;
+        }
         if k == NodeKind::Binary || k == NodeKind::Assign {
             push2(out, b, c);
         } else if k == NodeKind::Unary {
@@ -68,6 +76,12 @@ pub fn kids(n: i64, out: *IntVec) {
             push2(out, c, 0);
         } else if k == NodeKind::PatTuple || k == NodeKind::PatVariant || k == NodeKind::PatOr {
             list(n, out);
+        } else if k == NodeKind::Closure {
+            // (0.14: its parameters, their patterns, its body)
+            list(n, out);
+            push2(out, a, 0);
+        } else if k == NodeKind::Param {
+            push2(out, d, 0);
         }
         else if k == NodeKind::Call || k == NodeKind::MethodCall || k == NodeKind::Match
             || k == NodeKind::VecOp {
@@ -119,7 +133,9 @@ pub fn load_body(f: i64) {
         }
         while todo.count > 0 {
             let n = todo.pop();
-            if NODES[n].kind == NodeKind::PatBind {
+            // (0.14: a closure's parameter with a plain name declares it)
+            if NODES[n].kind == NodeKind::PatBind
+                || (NODES[n].kind == NodeKind::Param && NODES[n].d == 0) {
                 DECL.put(NODES[n].x + 1, n + 1);
             }
             let mut ks = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -149,14 +165,85 @@ pub fn in_body(n: i64) -> bool {
     unsafe { PARENT.get(n + 1) != 0 }
 }
 
-// The local Ident node n names, or -1.
+// The local Ident node n names, or -1 (0.14: also a use of a local a
+// closure captured, rewritten to the closure's environment: its local).
 pub fn local_of(n: i64) -> i64 {
     unsafe {
+        if (NODES[n].p & NODE_CAPTURE) != 0 && NODES[n].d > 0 {
+            return NODES[n].d - 1;
+        }
         if NODES[n].kind == NodeKind::Ident && NODES[n].res == Res::Local && NODES[n].y >= 0 {
             NODES[n].y
         } else {
             -1
         }
+    }
+}
+
+// The innermost closure around node n of the body loaded (0.14), or -1.
+pub fn closure_around(n: i64) -> i64 {
+    unsafe {
+        let mut q = parent(n);
+        while q >= 0 {
+            if NODES[q].kind == NodeKind::Closure {
+                return q;
+            }
+            q = parent(q);
+        }
+        -1
+    }
+}
+
+// Whether node n is a use of a local captured by a `move` closure (0.14):
+// its closure's own copy, the local itself unchanged.
+pub fn captured_by_move(n: i64) -> bool {
+    unsafe {
+        if (NODES[n].p & NODE_CAPTURE) == 0 {
+            return false;
+        }
+        let c = closure_around(n);
+        c >= 0 && (NODES[c].c & CLOSURE_MOVE) != 0
+    }
+}
+
+// Whether type t holds a closure (0.14: `closure(i64) -> i64`, a
+// `Map<I, F>` of one, a pointer to one): it has no name to write it by.
+pub fn has_closure(t: i64, depth: i64) -> bool {
+    unsafe {
+        if t <= 0 || depth > 8 {
+            return false;
+        }
+        let kind = TYPES[t].kind;
+        if kind == TyKind::Ptr || kind == TyKind::Slice || kind == TyKind::Array {
+            return has_closure(TYPES[t].a, depth + 1);
+        }
+        if kind == TyKind::Tuple {
+            for i in 0..TYPES[t].count {
+                if has_closure(type_elem(t, i), depth + 1) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        let mut list = 0;
+        let mut count = 0;
+        if kind == TyKind::Struct {
+            let s = TYPES[t].a;
+            if STRUCTS[s].closure != 0 {
+                return true;
+            }
+            list = STRUCTS[s].targs;
+            count = STRUCTS[s].targ_count;
+        } else if kind == TyKind::Enum {
+            list = ENUMS[TYPES[t].a].targs;
+            count = ENUMS[TYPES[t].a].targ_count;
+        }
+        for i in 0..count {
+            if has_closure(TLISTS.data[list + i], depth + 1) {
+                return true;
+            }
+        }
+        false
     }
 }
 

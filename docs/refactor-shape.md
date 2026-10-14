@@ -166,6 +166,13 @@ double(n)` `3 * (n + n)`). `$x...` that matched nothing goes with a comma
 next to it. Sites inside a rewritten site are left for another run
 (`note rewrite.nested`).
 
+(0.14) A pattern matches inside closures' bodies too; a closure in the
+pattern matches one with the same parameters, result type and `move` as
+written, its body matched (`apply(|y| $b, $x)`); holes do not stand for
+a closure's parameters. A closure put where an operand or a callee is
+gets parentheses, since its body takes all that follows (`apply($f,
+$x)` to `$f($x)` makes `(|y| y + 1)(2)`).
+
 Nothing matches: `note rewrite.none`, exit 0; when sites matched but for
 --where, `note rewrite.types` gives the first one's type and place, and
 `try:` the command with that type; sites whose type the checker never
@@ -211,6 +218,15 @@ extracted lines 40-43 of crate::calc::mean_to into add_all(i, n, acc) -> i64→c
   results with the block's value (`refactor.results`); `self` in a trait
   impl's function (`refactor.self`); a generic FN (`refactor.generic`);
   NEW taken (`refactor.collision`).
+- Closures (0.14): the lines may hold closures, or be lines of a
+  closure's block body. A local a closure captures is the local itself
+  (a parameter of NEW when declared before the lines; a `move`
+  closure's assignments change its copy, not the local); a closure's
+  parameters and the locals of its body are its own; its `return` and
+  `defer` stay in it. A parameter or result whose type holds a closure
+  (a closure made before the lines and used in them, one used after
+  them, `Map<I, F>`) has no name to write: refused (`refactor.closure`,
+  `try:` the lines from the closure's `let`).
 
 ## refactor inline (0.13)
 
@@ -241,6 +257,9 @@ inlined crate::calc::quad at 1 call, deleted it→2 files→+10 -12 lines
   there are made `pub`, the imports of FN's module it needs are copied
   (`use crate::ir::Op::Const;`), then rounds of `fix --only imports,pub`
   and the imports tidied.
+- Calls inside closures are calls (0.14): inlined, renamed, given a new
+  argument by `refactor signature`, like any other; a `return` inside a
+  closure of the body is the closure's.
 - Refused: a body with a `return` (`refactor.escapes`), a call of FN in
   its body (`refactor.recursive`), a generic or bodiless FN
   (`refactor.generic`), an `extern "C"` one (`refactor.extern`), a name
@@ -346,6 +365,7 @@ as it changes the program through the edit engine (`edit_replace`,
 | `refactor.range` | error | 1 | extract-function: the lines cut a statement, or are not in FN's body | the whole statements' lines |
 | `refactor.escapes` | error | 1 | extract-function: a return, break, continue or defer leaves the lines; inline: FN returns early | the lines before it; `query show FILE:LINE` |
 | `refactor.results` | error | 1 | extract-function: results NEW cannot give back | `query show FILE:LINE` |
+| `refactor.closure` | error | 1 | extract-function (0.14): a parameter or result of NEW would be a closure, whose type has no name | the lines from the closure's `let`; `query show FILE:LINE` |
 | `refactor.self`, `refactor.receiver` | error | 1 | self in a trait impl's function; a borrowed receiver used as `self` | |
 | `refactor.generic`, `refactor.recursive` | error | 1 | a generic or bodiless function; inline: FN calls itself | |
 | `refactor.no-call`, `refactor.ambiguous` | error | 1 | inline: no call (on the line of `--at`), several there | `query refs` |

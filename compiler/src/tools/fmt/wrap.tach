@@ -7,8 +7,10 @@
 //   1. after a `,` or `;` (the others follow, one level deeper);
 //   2. before an `else`;
 //   3. before a binary operator, loosest first (op_rank);
-//   4. after the shallowest `(` or `[` holding the overflow;
-//   5. after the shallowest `{` (and before its `}`).
+//   4. before each `.` of a chain of method calls (0.14: `xs.iter()`,
+//      then `.map(|x| x * 2)` and `.sum()` on lines of their own);
+//   5. after the shallowest `(` or `[` holding the overflow;
+//   6. after the shallowest `{` (and before its `}`).
 //
 // In a `{ }` opened on the line, the contents go on lines of their own
 // instead (a `match`: an arm a line). Before a break, the lines after the
@@ -21,7 +23,7 @@
 use crate::base::IntVec;
 use crate::front::lexer::Tok;
 use crate::tools::fmt::layout::{
-    BRK, IND, LOPEN, RANGED, WIDTH, generic, is_unary, line_end_piece, space,
+    BRK, IND, LOPEN, RANGED, WIDTH, bar, generic, is_unary, line_end_piece, space,
 };
 use crate::tools::fmt::pieces::{
     LINE_COMMENT, MATCH, P_KIND, P_NL, is_close, is_comment, is_open, kind, piece,
@@ -36,9 +38,14 @@ static mut DEP: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 // The binding of binary operator piece i, loosest first (docs/grammar.md,
 // "Binding powers"): 0 `||`, 1 `&&`, 2 a comparison, 3 `|`, 4 `^`, 5
 // `&`, 6 a shift, 7 `+` `-`, 8 `*` `/` `%`; -1 for any other piece (a
-// prefix `-`, `*` or `&`, the `<` and `>` of type arguments).
+// prefix `-`, `*` or `&`, the `<` and `>` of type arguments, the bars of
+// a closure).
 fn op_rank(i: i64) -> i64 {
     let k = kind(i);
+    // (a closure's bars are no operators)
+    if bar(i) != 0 {
+        return -1;
+    }
     if k == Tok::PipePipe as i64 {
         return 0;
     }
@@ -69,6 +76,61 @@ fn op_rank(i: i64) -> i64 {
         return if is_unary(i) { -1 } else { 8 };
     }
     if k == Tok::Slash as i64 || k == Tok::Percent as i64 { 8 } else { -1 }
+}
+
+// The break class of a method chain (after the binary operators).
+const CHAIN: i64 = 11;
+
+// Whether piece k is the `.` of a method call (`.map(`, `.collect::<`).
+fn method_dot(k: i64) -> bool {
+    k + 2 < P_KIND.count && kind(k) == Tok::Dot as i64 && kind(k + 1) == Tok::Ident as i64
+        && (kind(k + 2) == Tok::LParen as i64 || kind(k + 2) == Tok::ColonColon as i64)
+}
+
+// Whether piece k can be part of a method chain outside its brackets: a
+// name, a path, a `.`, a `?`, a literal receiver, type arguments.
+fn in_chain(k: i64) -> bool {
+    let kk = kind(k);
+    kk == Tok::Ident as i64 || kk == Tok::Dot as i64 || kk == Tok::ColonColon as i64
+        || kk == Tok::Question as i64
+        || kk == Tok::Int as i64 || kk == Tok::Str as i64 || generic(k)
+}
+
+// The method `.`s of the chain holding method `.` k (0.14: `.iter().map(..)`),
+// pieces i..last of a line, into out; the call brackets are skipped.
+fn chain_dots(k: i64, i: i64, last: i64, out: *IntVec) {
+    unsafe {
+        let mut p = k - 1;
+        while p >= i {
+            let kp = kind(p);
+            if (kp == Tok::RParen as i64 || kp == Tok::RBracket as i64) && MATCH.data[p] >= i
+                && MATCH.data[p] < p {
+                p = MATCH.data[p] - 1;
+            } else if in_chain(p) {
+                if method_dot(p) {
+                    (*out).push(p);
+                }
+                p -= 1;
+            } else {
+                break;
+            }
+        }
+        p = k;
+        while p < last {
+            let kp = kind(p);
+            if (kp == Tok::LParen as i64 || kp == Tok::LBracket as i64) && MATCH.data[p] > p
+                && MATCH.data[p] < last {
+                p = MATCH.data[p] + 1;
+            } else if in_chain(p) {
+                if method_dot(p) {
+                    (*out).push(p);
+                }
+                p += 1;
+            } else {
+                break;
+            }
+        }
+    }
 }
 
 fn has_newline(s: [u8]) -> bool {
@@ -131,7 +193,7 @@ pub fn wrap_line(i: i64, e: i64) -> bool {
         // (any before the overflow leaves a first line that fits).
         let mut best = -1;
         let mut best_dep = 1000;
-        let mut best_class = 9;
+        let mut best_class = 99;
         let mut open_at = -1;
         let mut open_dep = 1000;
         let mut brace_at = -1;
@@ -153,18 +215,27 @@ pub fn wrap_line(i: i64, e: i64) -> bool {
             }
             let pk = kind(k - 1);
             let mut at = k;
-            let mut class = 9;
-            if pk == Tok::Comma as i64 || pk == Tok::Semi as i64 {
+            let mut class = 99;
+            // (not between a closure's bars)
+            if (pk == Tok::Comma as i64 && bar(k - 1) != 3) || pk == Tok::Semi as i64 {
                 at = k - 1;
                 class = 0;
             } else if kind(k) == Tok::Else as i64 {
                 class = 1;
             } else if op_rank(k) >= 0 {
                 class = 2 + op_rank(k);
+            } else if method_dot(k) {
+                // (a chain of two method calls or more)
+                let mut dots = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+                chain_dots(k, i, last, &dots);
+                if dots.count >= 2 {
+                    class = CHAIN;
+                }
             }
             let g = GRP.data[at - i];
             let d = DEP.data[at - i];
-            if class < 9 && (g < 0 || MATCH.data[g] >= o)
+            // (class 9 and 10, `+` and `*`, are not breaks: as in 0.13)
+            if (class < 9 || class == CHAIN) && (g < 0 || MATCH.data[g] >= o)
                 && (d < best_dep || (d == best_dep && class <= best_class)) {
                 best = k;
                 best_dep = d;
@@ -175,6 +246,19 @@ pub fn wrap_line(i: i64, e: i64) -> bool {
         // of their own first)
         if brace_at >= 0 && best >= 0 && brace_dep < best_dep {
             return expand(brace_at, last);
+        }
+        // (a chain: a line for each call, `.iter()` too)
+        if best >= 0 && best_class == CHAIN {
+            let mut dots = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            chain_dots(best, i, last, &dots);
+            let mut changed = false;
+            for j in 0..dots.count {
+                if dots.data[j] > i && BRK.data[dots.data[j]] == 0 {
+                    BRK.data[dots.data[j]] = 1;
+                    changed = true;
+                }
+            }
+            return changed;
         }
         if best >= 0 {
             let at = if best_class == 0 { best - 1 } else { best };

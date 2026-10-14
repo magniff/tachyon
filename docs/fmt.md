@@ -81,6 +81,10 @@ Within that:
   before a trailing comment. `<` and `>` are tight in type arguments
   (`Vec<i64>`, `max::<u8>(x)`: after a type's name, `::`, `impl`, or the
   name an item declares, and written tight) and spaced as comparisons.
+  (0.14) None inside a closure's bars: `|x, y| x + y`, `||`,
+  `move |x| -> i64 { x }`, `|(a, b): (i64, i64)|`; a bar opens a closure
+  where an operand starts (after `(`, `,`, `=`, `move`, `return`...), and
+  `a | b`, `a || b` after an operand stay operators, spaced.
 - **Blank lines**: at most one in a row; none at the start of the file,
   after an opening bracket or before a closing one; one between two items
   of a file, impl, trait, module or extern block when either is a
@@ -94,9 +98,13 @@ Within that:
 - **Wrapping at 100 columns**: a longer line is broken where it
   overflows, in the brackets around that point, at the first of: a `,` or
   `;` (filled: as many as fit on each line), an `else`, a binary operator,
-  loosest first (`||`, `&&`, comparisons, `|`, `^`, `&`, shifts, `+ -`,
-  `* / %`), shallowest bracket first; else after the `(` or `[` that holds
-  it. Within a `{ }` opened on the line its contents go on lines of their
+  loosest first (`||`, `&&`, comparisons, `|`, `^`, `&`, shifts; not
+  `+ -` and `* / %`, which 0.13 leaves as they are), (0.14) before each
+  `.` of a chain of two method calls or more (`xs`, then `.iter()`,
+  `.map(|x| x * 3)`, `.sum()` a line each, one level in), shallowest
+  bracket first; else after the `(` or `[` that holds it. A closure's bars
+  and the commas between them are no breaks: a long closure with a block
+  body has the block's contents on lines of their own. Within a `{ }` opened on the line its contents go on lines of their
   own (a `match`: an arm a line). The lines after it that continue it the
   same way (more arguments, more `&&`) are joined to it first and filled
   again. A line with a token too long for any line (a long string) is left

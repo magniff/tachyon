@@ -127,15 +127,15 @@ too big: 500
 
 | Rust | tachyon |
 |---|---|
-| `for x in v.iter()`, `for x in &v` | `for x in v.as_slice()` (a copy of each element) |
-| `for (i, x) in s.iter().enumerate()` | `for i in 0..s.len { let x = s[i]; ... }` |
+| `for x in v.iter()`, `for x in &v` | the same (0.14), and `for x in v`: a copy of each element |
+| `for (i, x) in s.iter().enumerate()` | the same (0.14) |
 | `for x in v.iter_mut() { *x += 1 }` | `for i in 0..s.len { s[i] += 1; }` |
-| `.map()`, `.filter()`, `.sum()`, `.collect()` | a loop that pushes to a `Vec` or adds to a `mut` |
-| `\|x\| x + 1` | none in 0.13 (0.14): a named `fn` |
-| a closure capturing state | a `fn` taking a pointer to a context struct |
+| `.map()`, `.filter()`, `.sum()`, `.collect()` | the same (0.14); `collect()` makes a `Vec` only (`guide iterators`) |
+| `\|x\| x + 1`, `move \|\|` | the same (0.14); a `let mut` is captured by reference, the rest by value (`guide closures`) |
+| `impl Fn(i64) -> i64`, `Box<dyn Fn>` | a generic parameter `F: Fn(i64) -> i64`; none as a result |
 | `(0..n).rev()` | `let mut i = n; while i > 0 { i -= 1; ... }` |
 | `.step_by(2)` | `while` with `i += 2` |
-| `sort()`, `sort_by_key` | `std::sort(s)` (`T: Ord`; not stable); implement `Ord` for another order |
+| `sort()`, `sort_by(\|a, b\| ...)` | `std::sort(s)` (`T: Ord`; not stable); `v.sort_by(\|a, b\| b.cmp(a))` (0.14; `a`, `b`: `*T`) |
 
 A function value is `fn(A) -> R`, a plain function, no environment.
 Using a function with pointer parameters as a value, and calling it

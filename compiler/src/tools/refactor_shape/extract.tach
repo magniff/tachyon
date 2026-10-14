@@ -23,6 +23,7 @@ use crate::base::{
     BUFS, FILES, IntVec, SRC, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, intern,
 };
 use crate::front::ast::{NODES, NODE_COUNT, NodeKind, child};
+use crate::front::check::LOCALS;
 use crate::front::modules::file_of_pos;
 use crate::front::types::{TY_NEVER, TY_UNIT, buf_type, is_pointer};
 use crate::tools::edit::edit_replace;
@@ -37,9 +38,9 @@ use crate::tools::query::positions::{LINES, line_index, line_of};
 use crate::tools::refactor_mod::cli::is_ident;
 use crate::tools::refactor_shape::{SUB, load_and_find, opt, sym_text, take_args, usage_error};
 use crate::tools::refactor_shape::body::{
-    USE_ADDR, USE_ASSIGN, USE_AUTOREF, USE_FIELD_READ, USE_FIELD_WRITE, USE_VALUE, decl_of, in_body,
-    in_unsafe, load_body, local_mut, local_name, local_of, parent, put_local_type, reindent,
-    text_with, use_kind,
+    USE_ADDR, USE_ASSIGN, USE_AUTOREF, USE_FIELD_READ, USE_FIELD_WRITE, USE_VALUE, captured_by_move,
+    closure_around, decl_of, has_closure, in_body, in_unsafe, load_body, local_mut, local_name,
+    local_of, parent, put_local_type, reindent, text_with, use_kind,
 };
 
 // How a local the lines use is passed (mode of each parameter).
@@ -203,6 +204,11 @@ fn extract_inner(argc: i64, argv: **u8) -> i64 {
                 continue;
             }
             let k = NODES[n].kind;
+            // (0.14: control flow inside a closure of the lines stays in it)
+            let c = closure_around(n);
+            if c >= 0 && NODES[c].start >= sa {
+                continue;
+            }
             let mut what = 0 as *u8;
             if k == NodeKind::Return {
                 what = c"returns from ";
@@ -269,6 +275,46 @@ fn extract_inner(argc: i64, argv: **u8) -> i64 {
         }
         // (in the order of first use: they were found in node order)
         sort_by_first_use(&params, &modes, sa, sb);
+        // (0.14: a closure's type has no name: NEW cannot take or give one)
+        for i in 0..params.count + results.count + 1 {
+            let mut l = -1;
+            let mut t = 0;
+            if i < params.count {
+                l = params.data[i];
+                t = LOCALS[l].ty;
+            } else if i < params.count + results.count {
+                l = results.data[i - params.count];
+                t = LOCALS[l].ty;
+            } else if tail >= 0 {
+                t = NODES[tail].ty;
+            }
+            if !has_closure(t, 0) {
+                continue;
+            }
+            let e = diag(c"error", c"refactor.closure");
+            buf_str(e, c"lines ");
+            put_range(e, la, lb);
+            if i < params.count {
+                buf_str(e, c" use '");
+                buf_bytes(e, local_name(l));
+                buf_str(e, c"', a closure made before them");
+            } else if l >= 0 {
+                buf_str(e, c" make '");
+                buf_bytes(e, local_name(l));
+                buf_str(e, c"', a closure used after them");
+            } else {
+                buf_str(e, c" end the block with a closure");
+            }
+            buf_str(e, c"; a closure's type has no name for NEW's signature\n");
+            let dn = if i < params.count { decl_of(l) } else { -1 };
+            // (made by a `let` of the same block: extract from there)
+            if dn >= 0 && parent(dn) >= 0 && parent(parent(dn)) == blk {
+                try_extract(name, new_name, line_of(NODES[dn].start), lb);
+            } else {
+                try_show_at(file, la);
+            }
+            return 1;
+        }
         let mut back = 0;
         for i in 0..params.count {
             if modes.data[i] == GIVEN_BACK {
@@ -498,7 +544,8 @@ fn mode_of(l: i64, sa: i64, sb: i64) -> i64 {
                 && !is_pointer(NODES[n].ty) {
                 indexed = true;
             }
-            let k = use_kind(n);
+            // (0.14: a `move` closure changes its own copy)
+            let k = if captured_by_move(n) { USE_VALUE } else { use_kind(n) };
             if k == USE_ASSIGN {
                 assign = true;
             } else if k == USE_ADDR || k == USE_AUTOREF || k == USE_FIELD_WRITE {
