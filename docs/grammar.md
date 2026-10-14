@@ -1070,7 +1070,9 @@ it is checked too (its bindings of the error type), so its errors come in
 the same compilation. Unknown methods, fields, associated functions,
 variants and module items get `help: did you mean 'x'?` with the nearest
 name of that kind (the same but for case and underscores, else an edit
-distance up to a third of the length); a private item gets the help
+distance up to a third of the length); an unknown name std has gets
+its `use std::...;` line, or the nearest std name, even when the program
+does not name std; a private item gets the help
 `make it public: `pub fn f` at FILE:LINE:COL`; Rust habits (`&self`,
 `&str`, `&mut x`, `println!` and the other macros, `?`, `String`,
 `s.len()`, `.iter()`) get a help naming what tachyon writes.

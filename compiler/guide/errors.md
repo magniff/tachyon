@@ -391,6 +391,16 @@ error[type error] undefined variable 'helper' | help: add `use crate::m::helper;
 Add the `use` line the help names, or run `tachyonc fix`.
 
 ```tach
+fn main() -> i32 { let text = read_to_string(); 0 }
+```
+```err
+error[type error] undefined variable 'read_to_string' | help: std reads stdin: `std::read_stdin()` (all of it, a Buf), `std::read_line(&buf)` (one line, false at the end), `std::Scanner` (tokens)
+```
+std's items get their `use` line (`add `use std::read_line;``) or the
+nearest std name; an unknown function with neither points to `tachyonc
+guide std`.
+
+```tach
 fn main() -> i32 { let total = 1; std::print_int(totl); 0 }
 ```
 ```err
