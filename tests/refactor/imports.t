@@ -44,7 +44,7 @@ $ fix --only reexports --in util.tach --dry-run
 ## All of them, tidied: area, perimeter and unused_one go, helper stays
 ## as a private import (shapes::local uses it), volume is the interface.
 $ fix --only reexports,tidy-imports
-fixed 6 imports through re-exports, 4 unused re-exports, 4 untidy use lines	4 files	+8 -11 lines
+fixed 6 imports through re-exports, 4 unused re-exports, 5 untidy use lines	4 files	+8 -11 lines
 % cat main.tach
 // A program for `fix --only tidy-imports` and `fix --only reexports`
 // (tests/refactor/imports.t): untidy use lines, imports through
@@ -52,8 +52,8 @@ fixed 6 imports through re-exports, 4 unused re-exports, 4 untidy use lines	4 fi
 mod shapes;
 mod util;
 
-use crate::shapes::calc::area;
 use shapes::volume;
+use shapes::calc::area;
 use util::{cube, square, third, twice};
 use util::half as halve;
 

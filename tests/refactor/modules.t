@@ -255,7 +255,7 @@ index bf000c1..872f916 100644
  pub fn area(p: Point) -> i64 {
      p.x * p.y
 diff --git a/main.tach b/main.tach
-index 620be80..9888618 100644
+index 620be80..2ddb6f5 100644
 --- a/main.tach
 +++ b/main.tach
 @@ -3,7 +3,8 @@ mod geom;
@@ -263,8 +263,8 @@ index 620be80..9888618 100644
  mod util;
  
 -use geom::{Point, area};
-+use crate::shapes::Point;
 +use geom::area;
++use shapes::Point;
  use util::twice;
  
  fn main() -> i32 {
@@ -323,10 +323,9 @@ $ refactor move util::COUNTER --to crate::geom --dry-run
 $ refactor move util::twice --to crate::shapes --dry-run
 --- a/main.tach
 +++ b/main.tach
-@@ -5,0 +6 @@
-+use crate::shapes::twice;
-@@ -7 +7,0 @@
+@@ -7 +7 @@
 -use util::twice;
++use shapes::twice;
 --- a/geom.tach
 +++ b/geom.tach
 @@ -3 +3 @@
