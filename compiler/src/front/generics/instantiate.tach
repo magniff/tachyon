@@ -18,21 +18,23 @@ use crate::front::ast::NodeKind::{
     Unary, While,
 };
 use crate::front::check::{Res, SELF_TYPE, SELF_TYPE_SYM};
+use crate::front::check::args::is_default_arg;
 use crate::front::check::collect::{add_fn, template_of_type_node};
 use crate::front::check::resolve::{resolve_signature, resolve_type, type_name_key};
 use crate::front::check::synth_mode::synth_expr;
-use crate::front::check::widen::join_int;
+use crate::front::check::widen::{join_int, takes_context};
 use crate::front::closures::fn_bounds::{infer_closure_arg, infer_from_fn_bound, is_deferred_arg};
 use crate::front::generics::{
-    CUR_INST, INST_QUEUE, MAX_INST_DEPTH, TPL_NONE, check_targ_depth, env_enter, env_leave,
-    env_lookup, generic_symbol, hint_for, instance_of, instance_targs, is_untyped_literal_expr,
-    mark_synthed, same_targs, take_targs, targ_count_error, template_instance,
+    CUR_INST, HINT_NODE, HINT_TY, INST_QUEUE, MAX_INST_DEPTH, SYNTHED, TPL_NONE, check_targ_depth,
+    env_enter, env_leave, env_lookup, generic_symbol, hint_for, instance_of, instance_targs,
+    is_untyped_literal_expr, mark_synthed, same_targs, take_targs, targ_count_error,
+    template_instance,
 };
 use crate::front::modules::{CUR_MOD, module_of};
 use crate::front::traits::check_bounds;
 use crate::front::types::{
     ENUMS, FNS, FN_COUNT, STRUCTS, SYM_ALIAS, TLISTS, TSCRATCH, TYPES, TY_NEVER, TyKind, buf_type,
-    err_type, type_elem,
+    err_type, is_integer, type_elem,
 };
 use std::Option;
 
@@ -189,16 +191,9 @@ pub fn unify(params: i64, bound: *i64, tmod: i64, p: i64, t: i64) -> bool {
                             bound[k] = t;
                             return true;
                         }
-                        if bound[k] == t {
-                            return true;
-                        }
-                        // (0.15: bound twice, to two integer types: the wider)
-                        let joined = join_int(bound[k], t);
-                        if joined != 0 {
-                            bound[k] = joined;
-                            return true;
-                        }
-                        return false;
+                        // (0.15: two arguments of two integer types join in
+                        // infer_from, where they are values)
+                        return bound[k] == t;
                     }
                     Option::None => return true,
                 }
@@ -257,16 +252,29 @@ pub fn unify(params: i64, bound: *i64, tmod: i64, p: i64, t: i64) -> bool {
 fn infer_from(params: i64, bound: *i64, tmod: i64, args: i64, first: i64, types: i64,
     first_type: i64, param_nodes: bool, result: i64, hint: i64) {
     unsafe {
+        // (0.15) Which parameters a value binds (the expected type, or an
+        // argument whose type is the parameter itself) are `loose`: two
+        // integer types of values join. One bound before (by the receiver,
+        // the turbofish) or inside another type (`Vec<T>`) is exact.
+        let count = NODES[params].count;
+        let loose = alloc_array::<i64>(count);
+        for i in 0..count {
+            loose[i] = if bound[i] == 0 { 2 } else { 0 };
+        }
         if hint != 0 && result != 0 {
-            let trial = alloc_array::<i64>(NODES[params].count);
-            for i in 0..NODES[params].count {
+            let trial = alloc_array::<i64>(count);
+            for i in 0..count {
                 trial[i] = bound[i];
             }
             if unify(params, trial, tmod, result, hint) {
-                for i in 0..NODES[params].count {
+                for i in 0..count {
                     bound[i] = trial[i];
                 }
             }
+            free(trial as *u8);
+        }
+        for i in 0..count {
+            loose[i] = if loose[i] == 2 && bound[i] != 0 { 1 } else { 0 };
         }
         // (0.14: pass 2, the closures, typed from their parameters' bounds;
         // then what the bounds' constraints bind)
@@ -277,10 +285,16 @@ fn infer_from(params: i64, bound: *i64, tmod: i64, args: i64, first: i64, types:
                     break;
                 }
                 let p = if param_nodes { NODES[child(types, k)].b } else { child(types, k) };
-                if !mentions_unbound(params, bound, p) {
+                let arg = child(args, i);
+                let joins = joins_later(params, bound, loose, p) && !takes_context(arg);
+                if !joins && !mentions_unbound(params, bound, p) {
                     continue;
                 }
-                let arg = child(args, i);
+                // (0.15: a parameter's default is checked against the
+                // instance's type, in the callee's module)
+                if is_default_arg(arg) {
+                    continue;
+                }
                 if is_deferred_arg(arg) {
                     if pass == 2 {
                         infer_closure_arg(params, bound, tmod, arg, p);
@@ -291,8 +305,19 @@ fn infer_from(params: i64, bound: *i64, tmod: i64, args: i64, first: i64, types:
                 if pass == 0 && is_untyped_literal_expr(arg) || pass == 2 {
                     continue;
                 }
-                let t = synth_expr(arg);
-                mark_synthed(arg);
+                let mut t = NODES[arg].ty;
+                if SYNTHED.get(arg + 1) == 0 {
+                    if joins {
+                        // (the hint check mode would give it)
+                        HINT_NODE = arg;
+                        HINT_TY = bound[bare_param(params, p)];
+                    }
+                    t = synth_expr(arg);
+                    mark_synthed(arg);
+                }
+                if t != TY_NEVER && join_arg(params, bound, loose, p, t) {
+                    continue;
+                }
                 if t != TY_NEVER && !unify(params, bound, tmod, p, t) {
                     err_begin(NODES[arg].start);
                     err_str(c"mismatched types: this is '");
@@ -302,10 +327,68 @@ fn infer_from(params: i64, bound: *i64, tmod: i64, args: i64, first: i64, types:
                 }
             }
         }
-        for k in 0..NODES[params].count {
+        free(loose as *u8);
+        for k in 0..count {
             infer_from_fn_bound(params, bound, tmod, k);
             infer_from_assoc(params, bound, tmod, k);
         }
+    }
+}
+
+// The parameter of `params` that type node p is itself (`T`, not `*T`),
+// or -1.
+fn bare_param(params: i64, p: i64) -> i64 {
+    unsafe {
+        if NODES[p].kind != TyName || NODES[p].count != 0 || NODES[p].g != 0
+            || is_projection_node(p) || is_self_name(p) || ALIAS_LO < ALIAS_HI {
+            return -1;
+        }
+        match tparam_index(params, NODES[p].a) {
+            Option::Some(k) => k,
+            Option::None => -1,
+        }
+    }
+}
+
+// (0.15) Whether an argument of type node p must be synthesized although
+// p's parameters are bound: p is a parameter a value bound (`loose`), so
+// that a wider integer argument joins with it.
+fn joins_later(params: i64, bound: *i64, loose: *i64, p: i64) -> bool {
+    let k = bare_param(params, p);
+    unsafe { k >= 0 && loose[k] != 0 && is_integer(bound[k]) }
+}
+
+// (0.15) An argument of type t whose parameter's type is p: when p is a
+// type parameter itself, it is bound to t, or joins with the integer type
+// it has: kept when t widens to it (the argument is widened when it is
+// checked), the wider t when it was bound by a value (`loose`). True when
+// done, false for unify to bind or report.
+fn join_arg(params: i64, bound: *i64, loose: *i64, p: i64, t: i64) -> bool {
+    let k = bare_param(params, p);
+    if k < 0 {
+        return false;
+    }
+    unsafe {
+        if bound[k] == 0 {
+            bound[k] = t;
+            loose[k] = 1;
+            return true;
+        }
+        if bound[k] == t {
+            return true;
+        }
+        let j = join_int(bound[k], t);
+        if j == 0 {
+            return false;
+        }
+        if j == bound[k] {
+            return true;
+        }
+        if loose[k] == 0 {
+            return false;
+        }
+        bound[k] = j;
+        true
     }
 }
 
@@ -651,7 +734,7 @@ pub fn clone_node(n: i64) -> i64 {
 }
 
 // Which of a, b, c are child nodes, by kind (see ast.tach).
-fn node_field_a(kind: NodeKind) -> bool {
+pub fn node_field_a(kind: NodeKind) -> bool {
     match kind {
         Let | Cast | Index | Repeat | If
             | Range | Return | Arm | ExprStmt
@@ -663,7 +746,7 @@ fn node_field_a(kind: NodeKind) -> bool {
     }
 }
 
-fn node_field_b(kind: NodeKind) -> bool {
+pub fn node_field_b(kind: NodeKind) -> bool {
     match kind {
         Param | Let | Cast | Index | Repeat
             | If | Loop | While | For | Range
@@ -674,7 +757,7 @@ fn node_field_b(kind: NodeKind) -> bool {
     }
 }
 
-fn node_field_c(kind: NodeKind) -> bool {
+pub fn node_field_c(kind: NodeKind) -> bool {
     match kind {
         Let | If | While | For | Assign
             | Arm | Binary => true,

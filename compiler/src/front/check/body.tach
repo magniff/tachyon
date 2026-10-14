@@ -5,7 +5,8 @@
 
 use crate::base::_setjmp;
 use crate::base::diag::{
-    RECOVER_DEPTH, err_begin, err_end, err_str, err_sym, recover_enter, recover_leave,
+    ERR_HELP, RECOVER_DEPTH, err_begin, err_end, err_help, err_str, err_sym, recover_enter,
+    recover_leave,
 };
 use crate::front::ast::{BLOCK_UNSAFE, FN_LAZY, FN_UNSAFE, NODES, child};
 use crate::front::ast::NodeKind::{Block, Defer, Ident, If, Let, Loop, PatTuple, Path, Range, While};
@@ -15,12 +16,13 @@ use crate::front::check::{
     poison_statement, pop_scope, push_scope, restore_check_state, save_check_state, type_error,
     type_error_got,
 };
+use crate::front::check::args::check_default_types;
 use crate::front::check::check_mode::check_expr;
 use crate::front::check::iterate::check_for_iter;
 use crate::front::check::resolve::resolve_type;
 use crate::front::check::synth_mode::{is_context_literal, literal_takes_rhs_type, synth_expr};
 use crate::front::check::unsafety::{UNSAFE_DEPTH, WRAP_NODE, is_borrow_param};
-use crate::front::check::widen::join_int;
+use crate::front::check::widen::{join_values, widens};
 use crate::front::closures::escape::check_scope_exit;
 use crate::front::generics::{CUR_INST, TP_BASE, env_enter, env_leave, template_of_key};
 use crate::front::modules::CUR_MOD;
@@ -29,7 +31,8 @@ use crate::front::parser::UNDERSCORE;
 use crate::front::patterns::{check_irrefutable, check_pattern};
 use crate::front::traits::bounded_param_of_type;
 use crate::front::types::{
-    FNS, TY_BOOL, TY_ERROR, TY_NEVER, TY_UNIT, err_type, fn_param, is_integer, is_numeric,
+    FNS, TY_BOOL, TY_ERROR, TY_I64, TY_NEVER, TY_UNIT, buf_type, err_type, fn_param, is_integer,
+    is_numeric,
 };
 
 // ---- Functions ----
@@ -61,6 +64,8 @@ pub fn check_function(item: i64) {
         DEFER_LOOP_BASE = -1;
         ENV.count = 0;
         SCOPES.count = 0;
+        // (0.15: the defaults' types, without the parameters)
+        check_default_types(item, f);
         for i in 0..NODES[item].count {
             let param = child(item, i);
             if NODES[param].a != UNDERSCORE {
@@ -229,17 +234,25 @@ fn tail_needs_context(b: i64) -> bool {
             return false;
         }
         let tail = NODES[b].a;
-        if tail == 0 || NODES[tail].g != 0 {
+        tail != 0 && names_context_variant(tail)
+    }
+}
+
+// Whether expression e is a variant of a generic enum named without its
+// type arguments (`None`, `Option::None`): its type comes from context.
+pub fn names_context_variant(e: i64) -> bool {
+    unsafe {
+        if NODES[e].g != 0 {
             return false;
         }
-        if NODES[tail].kind == Ident {
-            if lookup_local(NODES[tail].a).is_some() {
+        if NODES[e].kind == Ident {
+            if lookup_local(NODES[e].a).is_some() {
                 return false;
             }
-            return binding_kind(lookup_quiet(CUR_MOD, NODES[tail].a, CUR_MOD)) == B_TVARIANT;
+            return binding_kind(lookup_quiet(CUR_MOD, NODES[e].a, CUR_MOD)) == B_TVARIANT;
         }
-        if NODES[tail].kind == Path && NODES[tail].count == 0 && NODES[tail].y == 0 {
-            let b2 = lookup_quiet(CUR_MOD, NODES[tail].a, CUR_MOD);
+        if NODES[e].kind == Path && NODES[e].count == 0 && NODES[e].y == 0 {
+            let b2 = lookup_quiet(CUR_MOD, NODES[e].a, CUR_MOD);
             return binding_kind(b2) == B_ITEM && template_of_key(binding_value(b2)) < 0;
         }
         false
@@ -286,7 +299,7 @@ pub fn synth_if(n: i64) -> i64 {
                 return else_ty;
             }
             // (0.15: two integer types join to the wider one)
-            let joined = join_int(then_ty, else_ty);
+            let joined = join_values(then_block, then_ty, else_block, else_ty);
             if joined != 0 {
                 return joined;
             }
@@ -312,7 +325,7 @@ pub fn synth_if(n: i64) -> i64 {
             return then_ty;
         }
         // (0.15: two integer types join to the wider one)
-        let joined = join_int(then_ty, else_ty);
+        let joined = join_values(then_block, then_ty, else_block, else_ty);
         if joined != 0 {
             return joined;
         }
@@ -328,6 +341,15 @@ fn branch_types_error(n: i64, then_ty: i64, else_ty: i64) -> ! {
         err_str(c"' vs '");
         err_type(else_ty);
         err_str(c"'");
+        // (0.15: integers that do not widen one to the other)
+        if is_integer(then_ty) && is_integer(else_ty) {
+            err_help(c"convert a branch explicitly: '");
+            let wide = if widens(then_ty, TY_I64) && widens(else_ty, TY_I64) { TY_I64 }
+                else { then_ty };
+            err_help(c"as ");
+            buf_type(ERR_HELP, wide);
+            err_help(c"'");
+        }
         err_end()
     }
 }

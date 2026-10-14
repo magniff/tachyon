@@ -5,13 +5,32 @@
 // (`Param.h`) checked in the callee's module, per call. Defaults are on
 // trailing parameters of fn items and inherent methods only.
 //
-// Phase 0: stubs, which report the feature unimplemented when a call uses
-// it.
+// Also the shorthand of a struct literal's field (`P { x, y }`), whose
+// unknown name gets the long form as its help.
 
-use crate::base::diag::{err_begin, err_end_soft, err_str};
-use crate::front::ast::{CALL_ARGS_DONE, NODES, NodeKind, child};
-use crate::front::check::FNS;
-use crate::front::closures::unimplemented;
+use crate::base::{IntVec, SRC, buf_byte, buf_bytes, buf_new, buf_slice, free};
+use crate::base::diag::{
+    ERR_HELP, err_begin, err_end, err_end_soft, err_help, err_help_sym, err_int, err_str, err_sym,
+};
+use crate::front::ast::{
+    CALL_ARGS_DONE, FIELD_SHORTHAND, NODES, NodeKind, child, list_begin, list_end, list_push,
+};
+use crate::front::check::{ENV, FNS, SELF_TYPE, lookup_local};
+use crate::front::check::check_mode::check_expr;
+use crate::front::check::names::near_to;
+use crate::front::check::unsafety::UNSAFE_DEPTH;
+use crate::front::check::vectors::sym_is_c;
+use crate::front::generics::instantiate::{clone_node, node_field_a, node_field_b, node_field_c};
+use crate::front::modules::CUR_MOD;
+use crate::front::modules::lookup::{B_NONE, binding_kind, lookup_quiet};
+use crate::front::traits::impl_trait_node;
+use crate::front::types::{buf_type, fn_param, is_integer, is_signed};
+use crate::middle::lower::ssa::HMap;
+
+// The defaults put into calls (a clone's node + 1 to its function + 1),
+// checked in their function's module (check_default_arg).
+static mut DEFAULT_ARGS: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+static mut DEFAULTS_USED: bool = false;
 
 // The arguments of call n (a Call or MethodCall) of function f (a FNS
 // index, a template before it is instantiated), whose list holds the
@@ -19,44 +38,432 @@ use crate::front::closures::unimplemented;
 // the receiver is apart): put in parameter order, the defaults of the
 // parameters not given appended (clones of Param.h), and n flagged
 // CALL_ARGS_DONE. Nothing to do when n has no named argument and gives
-// every parameter.
+// every parameter (an arity error is check_direct_call's).
 pub fn normalize_args(n: i64, f: i64, first_param: i64) {
     unsafe {
         if f < 0 || (NODES[n].p & CALL_ARGS_DONE) != 0 {
             return;
         }
-        for i in 0..NODES[n].count {
+        let node = FNS[f].node;
+        let count = NODES[n].count;
+        let mut positional = 0;
+        while positional < count && NODES[child(n, positional)].kind != NodeKind::NamedArg {
+            positional += 1;
+        }
+        let is_fn = NODES[node].kind == NodeKind::Fn;
+        let params = if is_fn { NODES[node].count } else { FNS[f].param_count };
+        if positional == count {
+            // (a parameter left out: when one after it has a default, the
+            // missing one is named, else the arity error)
+            let given = first_param + count;
+            if !is_fn || given >= params || NODES[child(node, params - 1)].h == 0 {
+                return;
+            }
+        } else {
+            named_args_allowed(n, f, child(n, positional));
+        }
+        if first_param + positional > params {
+            arity_error(n, f, first_param, params);
+        }
+        // slots[k]: the argument of parameter k; text[k]: its node as
+        // written (the NamedArg of a named one), for the help
+        let slots = alloc_array_i64(params);
+        let text = alloc_array_i64(params);
+        for i in 0..positional {
+            slots[first_param + i] = child(n, i);
+            text[first_param + i] = child(n, i);
+        }
+        let mut last = -1;
+        for i in positional..count {
             let arg = child(n, i);
-            if NODES[arg].kind == NodeKind::NamedArg {
-                unimplemented(NODES[arg].start, c"named arguments");
+            let k = param_named(node, NODES[arg].a);
+            if k < 0 {
+                unknown_param_error(arg, f, node);
+            }
+            if k < first_param {
+                err_begin(NODES[arg].start);
+                err_str(c"'self' cannot be named: the receiver is the value before '.'");
+                err_end();
+            }
+            if slots[k] != 0 {
+                err_begin(NODES[arg].start);
+                err_str(c"parameter '");
+                err_sym(NODES[arg].a);
+                if k < first_param + positional {
+                    err_str(c"' is given by position already");
+                } else {
+                    err_str(c"' is given twice");
+                }
+                err_end();
+            }
+            slots[k] = NODES[arg].b;
+            text[k] = arg;
+            if k < last {
+                order_error(n, f, arg, text, first_param, params);
+            }
+            last = k;
+        }
+        for k in first_param..params {
+            if slots[k] == 0 {
+                let h = if is_fn { NODES[child(node, k)].h } else { 0 };
+                if h == 0 {
+                    missing_error(n, f, node, k, text, first_param, params);
+                }
+                let c = clone_node(h);
+                if !DEFAULTS_USED {
+                    DEFAULTS_USED = true;
+                }
+                DEFAULT_ARGS.put(c + 1, f + 1);
+                slots[k] = c;
             }
         }
-        let node = FNS[f].node;
-        let given = first_param + NODES[n].count;
-        if NODES[node].kind == NodeKind::Fn && given < NODES[node].count
-            && NODES[child(node, given)].h != 0 {
-            unimplemented(NODES[n].start, c"parameter defaults");
+        let mark = list_begin();
+        for k in first_param..params {
+            list_push(slots[k]);
         }
+        list_end(n, mark);
+        NODES[n].p |= CALL_ARGS_DONE;
+        free(slots as *u8);
+        free(text as *u8);
+    }
+}
+
+fn alloc_array_i64(n: i64) -> *i64 {
+    let a = crate::base::alloc_array::<i64>(if n > 0 { n } else { 1 });
+    unsafe {
+        for i in 0..n {
+            a[i] = 0;
+        }
+    }
+    a
+}
+
+// The index of function node `node`'s parameter named `name`, or -1.
+fn param_named(node: i64, name: i64) -> i64 {
+    unsafe {
+        if NODES[node].kind != NodeKind::Fn && NODES[node].kind != NodeKind::ExternFn {
+            return -1;
+        }
+        for k in 0..NODES[node].count {
+            if NODES[child(node, k)].a == name {
+                return k;
+            }
+        }
+        -1
+    }
+}
+
+// Whether call n of f may name its arguments (`arg` is the first named
+// one): not a trait's function (an impl may name its parameters
+// differently), not a variadic C function.
+fn named_args_allowed(n: i64, f: i64, arg: i64) {
+    unsafe {
+        let mut what = 0 as *u8;
+        if impl_trait_node(f) != 0 {
+            what = c"' is a trait's function: its arguments are positional";
+        } else if FNS[f].variadic {
+            what = c"' is variadic: its arguments are positional";
+        } else if NODES[FNS[f].node].kind != NodeKind::Fn
+            && NODES[FNS[f].node].kind != NodeKind::ExternFn {
+            what = c"' takes positional arguments only";
+        }
+        if what == 0 as *u8 {
+            return;
+        }
+        err_begin(NODES[arg].start);
+        err_str(c"'");
+        err_sym(FNS[f].display);
+        err_str(what);
+        err_help(c"write '");
+        buf_bytes(ERR_HELP, SRC[NODES[NODES[arg].b].start..NODES[NODES[arg].b].end]);
+        err_help(c"' without its name");
+        err_end();
+    }
+}
+
+fn arity_error(n: i64, f: i64, first_param: i64, params: i64) -> ! {
+    unsafe {
+        err_begin(NODES[n].start);
+        err_str(c"function '");
+        err_sym(FNS[f].display);
+        err_str(c"' expects ");
+        err_int(params - first_param);
+        err_str(c" arguments, got more");
+        err_end()
+    }
+}
+
+// A named argument whose name no parameter of f has.
+fn unknown_param_error(arg: i64, f: i64, node: i64) -> ! {
+    unsafe {
+        err_begin(NODES[arg].start);
+        err_str(c"function '");
+        err_sym(FNS[f].display);
+        err_str(c"' has no parameter '");
+        err_sym(NODES[arg].a);
+        err_str(c"'");
+        let mut near = near_to(NODES[arg].a);
+        if NODES[node].kind == NodeKind::Fn || NODES[node].kind == NodeKind::ExternFn {
+            for k in 0..NODES[node].count {
+                near.offer(NODES[child(node, k)].a);
+            }
+        }
+        near.help();
+        err_end()
+    }
+}
+
+// The call n as it would be written with its arguments in parameter
+// order (text[k]: parameter k's argument as written, 0: none), and
+// `name: VALUE` for parameter `missing` (-1: none), into the help.
+fn help_call(n: i64, node: i64, text: *i64, first_param: i64, params: i64, missing: i64) {
+    unsafe {
+        let first_arg = child(n, 0);
+        let open = if NODES[n].count > 0 { NODES[first_arg].start } else { NODES[n].end - 1 };
+        buf_bytes(ERR_HELP, SRC[NODES[n].start..open]);
+        let mut any = false;
+        for k in first_param..params {
+            if text[k] != 0 || k == missing {
+                if any {
+                    err_help(c", ");
+                }
+                any = true;
+                if k == missing {
+                    err_help_sym(NODES[child(node, k)].a);
+                    err_help(c": VALUE");
+                } else {
+                    buf_bytes(ERR_HELP, SRC[NODES[text[k]].start..NODES[text[k]].end]);
+                }
+            }
+        }
+        err_help(c")");
+    }
+}
+
+// Named argument `arg` comes after one of a later parameter.
+fn order_error(n: i64, f: i64, arg: i64, text: *i64, first_param: i64, params: i64) -> ! {
+    unsafe {
+        err_begin(NODES[arg].start);
+        err_str(c"named argument '");
+        err_sym(NODES[arg].a);
+        err_str(c"' is out of order: named arguments follow the parameters of '");
+        err_sym(FNS[f].display);
+        err_str(c"'");
+        err_help(c"write '");
+        help_call(n, FNS[f].node, text, first_param, params, -1);
+        err_help(c"'");
+        err_end()
+    }
+}
+
+// Parameter k of f is given no argument and has no default.
+fn missing_error(n: i64, f: i64, node: i64, k: i64, text: *i64, first_param: i64,
+    params: i64) -> ! {
+    unsafe {
+        err_begin(NODES[n].start);
+        err_str(c"missing argument '");
+        err_sym(NODES[child(node, k)].a);
+        err_str(c"' of '");
+        err_sym(FNS[f].display);
+        err_str(c"' (it has no default)");
+        err_help(c"give it: '");
+        help_call(n, node, text, first_param, params, k);
+        err_help(c"'");
+        err_end()
+    }
+}
+
+// Whether argument `arg` is a parameter's default put into its call.
+pub fn is_default_arg(arg: i64) -> bool {
+    unsafe { DEFAULTS_USED && DEFAULT_ARGS.get(arg + 1) != 0 }
+}
+
+// Default `arg` (is_default_arg) checked against its parameter's type ty
+// (of the instance called): in its function's module, with its `Self`,
+// without the caller's locals, outside `unsafe`.
+pub fn check_default_arg(arg: i64, ty: i64) {
+    unsafe {
+        let f = DEFAULT_ARGS.get(arg + 1) - 1;
+        let saved_mod = CUR_MOD;
+        let saved_self = SELF_TYPE;
+        let saved_unsafe = UNSAFE_DEPTH;
+        let saved_env = ENV;
+        ENV = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        CUR_MOD = FNS[f].module;
+        SELF_TYPE = FNS[f].self_ty;
+        UNSAFE_DEPTH = 0;
+        check_expr(arg, ty);
+        free(ENV.data as *u8);
+        ENV = saved_env;
+        UNSAFE_DEPTH = saved_unsafe;
+        SELF_TYPE = saved_self;
+        CUR_MOD = saved_mod;
     }
 }
 
 // The defaults of function f's parameters (a FNS index; called once its
-// signature is resolved): on trailing parameters only, of the parameter's
-// type, naming no parameter or local.
+// signature is resolved): on trailing parameters only, naming no
+// parameter. (Their types: check_default_types, with the body.)
 pub fn check_param_defaults(f: i64) {
     unsafe {
         let node = FNS[f].node;
         if NODES[node].kind != NodeKind::Fn {
             return;
         }
+        let mut with_default = -1;
         for i in 0..NODES[node].count {
             let p = child(node, i);
             if NODES[p].h != 0 {
-                err_begin(NODES[NODES[p].h].start);
-                err_str(c"parameter defaults are not implemented yet (check.unimplemented)");
+                with_default = i;
+                let used = param_use(NODES[p].h, node);
+                if used != 0 {
+                    err_begin(NODES[used].start);
+                    err_str(c"the default of '");
+                    err_sym(NODES[p].a);
+                    err_str(c"' uses parameter '");
+                    err_sym(NODES[used].a);
+                    err_str(c"': a default is computed without the arguments");
+                    err_help(
+                        c"compute it in the body from an Option parameter, or give it a constant");
+                    err_end_soft();
+                }
+            } else if with_default >= 0 {
+                err_begin(NODES[p].start);
+                err_str(c"parameter '");
+                err_sym(NODES[p].a);
+                err_str(c"' has no default, but '");
+                err_sym(NODES[child(node, with_default)].a);
+                err_str(c"' before it has one: defaults are on the last parameters");
+                err_help(c"give '");
+                err_help_sym(NODES[p].a);
+                err_help(c"' a default too, or move it before '");
+                err_help_sym(NODES[child(node, with_default)].a);
+                err_help(c"'");
                 err_end_soft();
                 return;
             }
         }
+    }
+}
+
+// An Ident in expression e that names a parameter of function node `node`
+// (0: none).
+fn param_use(e: i64, node: i64) -> i64 {
+    unsafe {
+        if e == 0 {
+            return 0;
+        }
+        let kind = NODES[e].kind;
+        if kind == NodeKind::Ident {
+            return if param_named(node, NODES[e].a) >= 0 { e } else { 0 };
+        }
+        if kind == NodeKind::Closure {
+            return 0;
+        }
+        let mut found = 0;
+        if node_field_a(kind) {
+            found = param_use(NODES[e].a, node);
+        }
+        if found == 0 && node_field_b(kind) {
+            found = param_use(NODES[e].b, node);
+        }
+        if found == 0 && node_field_c(kind) {
+            found = param_use(NODES[e].c, node);
+        }
+        let mut i = 0;
+        while found == 0 && i < NODES[e].count {
+            found = param_use(child(e, i), node);
+            i += 1;
+        }
+        found
+    }
+}
+
+// The types of function f's defaults (f an instance, or not generic),
+// checked when its body is (a copy of each, against the parameter's type,
+// as a call would check it): before its parameters are locals.
+pub fn check_default_types(item: i64, f: i64) {
+    unsafe {
+        if NODES[item].kind != NodeKind::Fn {
+            return;
+        }
+        for i in 0..NODES[item].count {
+            let h = NODES[child(item, i)].h;
+            if h != 0 && param_use(h, item) == 0 {
+                let saved_unsafe = UNSAFE_DEPTH;
+                UNSAFE_DEPTH = 0;
+                check_expr(clone_node(h), fn_param(f, i));
+                UNSAFE_DEPTH = saved_unsafe;
+            }
+        }
+    }
+}
+
+// A named argument outside the arguments of a function's call (of a
+// closure, a variant, a function value).
+pub fn misplaced_named_arg(n: i64) -> ! {
+    unsafe {
+        err_begin(NODES[n].start);
+        err_str(c"named argument '");
+        err_sym(NODES[n].a);
+        err_str(c"': only the calls of functions and methods name their arguments");
+        err_help(c"write '");
+        buf_bytes(ERR_HELP, SRC[NODES[NODES[n].b].start..NODES[NODES[n].b].end]);
+        err_help(c"' without its name");
+        err_end()
+    }
+}
+
+// The shorthand fields of struct literal n (`P { x, y }`): a name that is
+// neither a local nor an item gets the long form as its help.
+pub fn check_shorthands(n: i64) {
+    unsafe {
+        for i in 0..NODES[n].count {
+            let init = child(n, i);
+            if (NODES[init].p & FIELD_SHORTHAND) != 0 {
+                let name = NODES[init].a;
+                if lookup_local(name).is_none()
+                    && binding_kind(lookup_quiet(CUR_MOD, name, CUR_MOD)) == B_NONE {
+                    err_begin(NODES[init].start);
+                    err_str(c"undefined variable '");
+                    err_sym(name);
+                    err_str(c"' (the shorthand of '");
+                    err_sym(name);
+                    err_str(c": ");
+                    err_sym(name);
+                    err_str(c"')");
+                    err_help(c"write '");
+                    err_help_sym(name);
+                    err_help(c": VALUE'");
+                    err_end();
+                }
+            }
+        }
+    }
+}
+
+// (0.15) The help of `i64::MAX`, `u8::MIN`: integer types have no
+// associated constants; std has their limits (`std::I64_MAX`).
+pub fn int_limit_help(t: i64, member: i64) {
+    unsafe {
+        if !is_integer(t) || !sym_is_c(member, c"MAX") && !sym_is_c(member, c"MIN") {
+            return;
+        }
+        let mut name = buf_new();
+        buf_type(name, t);
+        err_help(c"std has the limits: '");
+        if is_signed(t) || sym_is_c(member, c"MAX") {
+            err_help(c"std::");
+            let text = buf_slice(name);
+            for i in 0..text.len {
+                let b = text[i];
+                buf_byte(ERR_HELP, if b >= 'a' && b <= 'z' { b - 32 } else { b });
+            }
+            err_help(c"_");
+            err_help_sym(member);
+        } else {
+            err_help(c"0");
+        }
+        err_help(c"'");
     }
 }

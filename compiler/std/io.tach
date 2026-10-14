@@ -3,6 +3,11 @@
 // compiler/std/embed.sh appends this file to std.tach (0.15: split from
 // it): the same module, `std`. Reading stdin by lines or whole, trimming,
 // splitting and parsing text, and a Scanner of tokens and numbers.
+//
+// (0.15) The convention: an Option means absence (the end of the input,
+// nothing found), a Result with an error enum a failure: `read_line` and
+// `read_stdin` fail with an IoError, `parse_int` with a ParseIntError,
+// `Scanner::next_int` with a ScanError.
 
 // ---- Reading stdin (0.14) ----
 
@@ -13,11 +18,11 @@ static mut STDIN_POS: i64 = 0;
 static mut STDIN_LEN: i64 = 0;
 const STDIN_BLOCK: i64 = 65536;
 
-// Bytes in STDIN_BUF[STDIN_POS..STDIN_LEN], read if there were none;
-// false at the end of input.
-fn stdin_fill() -> bool {
+// Bytes in STDIN_BUF[STDIN_POS..STDIN_LEN], read if there were none: 1;
+// 0 at the end of input, -1 when reading failed.
+fn stdin_fill() -> i64 {
     if STDIN_POS < STDIN_LEN {
-        return true;
+        return 1;
     }
     if STDIN_BUF == 0 as *u8 {
         STDIN_BUF = unsafe { malloc(STDIN_BLOCK as u64) };
@@ -25,33 +30,40 @@ fn stdin_fill() -> bool {
     let n = unsafe { read(0, STDIN_BUF, STDIN_BLOCK as u64) };
     STDIN_POS = 0;
     STDIN_LEN = if n > 0 { n } else { 0 };
-    n > 0
+    if n > 0 { 1 } else if n == 0 { 0 } else { -1 }
 }
 
 // The next line of stdin into `line` (emptied first), without its '\n';
-// false at the end of input (an empty line is true, an empty `line`).
-pub fn read_line(line: *Buf) -> bool {
+// Ok(false) at the end of input.
+pub fn read_line(line: *Buf) -> Result<bool, IoError> {
     line.clear();
     let mut any = false;
-    while stdin_fill() {
+    loop {
+        let filled = stdin_fill();
+        if filled < 0 {
+            return Result::Err(IoError::Read);
+        }
+        if filled == 0 {
+            break;
+        }
         any = true;
         let block = unsafe { STDIN_BUF[STDIN_POS..STDIN_LEN] };
         for i in 0..block.len {
             if block[i] == '\n' {
                 line.push_str(block[..i]);
                 STDIN_POS += i + 1;
-                return true;
+                return Result::Ok(true);
             }
         }
         line.push_str(block);
         STDIN_POS = STDIN_LEN;
     }
-    any
+    Result::Ok(any)
 }
 
 // All of stdin that is left, in a new Buf (the caller frees it). It
 // shares a buffer with read_line, not with C's getchar or scanf.
-pub fn read_stdin() -> Buf {
+pub fn read_stdin() -> Result<Buf, IoError> {
     let mut b = Buf::new();
     if STDIN_POS < STDIN_LEN {
         b.push_str(unsafe { STDIN_BUF[STDIN_POS..STDIN_LEN] });
@@ -61,8 +73,12 @@ pub fn read_stdin() -> Buf {
         b.bytes.reserve(STDIN_BLOCK);
         let room = b.bytes.cap - b.bytes.len;
         let n = unsafe { read(0, &b.bytes.ptr[b.bytes.len], room as u64) };
-        if n <= 0 {
-            return b;
+        if n == 0 {
+            return Result::Ok(b);
+        }
+        if n < 0 {
+            b.free();
+            return Result::Err(IoError::Read);
         }
         b.bytes.len += n;
     }
@@ -94,35 +110,42 @@ pub fn trim(s: [u8]) -> [u8] {
 }
 
 // s as an integer: an optional '-' or '+', then decimal digits, nothing
-// else (no spaces). None if s is not one or does not fit in an i64.
-pub fn parse_int(s: [u8]) -> Option<i64> {
+// else (no spaces); Err if s is not one or does not fit in an i64.
+pub fn parse_int(s: [u8]) -> Result<i64, ParseIntError> {
     let mut i = 0;
     if s.len > 0 && (s[0] == '-' || s[0] == '+') {
         i = 1;
     }
     if i == s.len {
-        return Option::None;
+        return Result::Err(ParseIntError::Empty);
     }
     // Summed as a negative number, which reaches the smallest i64.
     let min = -9223372036854775807 - 1;
     let mut n = 0;
     while i < s.len {
         if !is_digit(s[i]) {
-            return Option::None;
+            return Result::Err(ParseIntError::InvalidDigit(i));
         }
         let d = (s[i] - '0') as i64;
         if n < min / 10 || (n == min / 10 && d > -(min % 10)) {
-            return Option::None;
+            // (a later byte that is not a digit is still that error)
+            while i < s.len {
+                if !is_digit(s[i]) {
+                    return Result::Err(ParseIntError::InvalidDigit(i));
+                }
+                i += 1;
+            }
+            return Result::Err(ParseIntError::Overflow);
         }
         n = n * 10 - d;
         i += 1;
     }
     if s[0] == '-' {
-        Option::Some(n)
+        Result::Ok(n)
     } else if n == min {
-        Option::None
+        Result::Err(ParseIntError::Overflow)
     } else {
-        Option::Some(-n)
+        Result::Ok(-n)
     }
 }
 
@@ -179,12 +202,15 @@ impl Scanner {
         Option::Some(s[start..i])
     }
 
-    // The next token as an integer (`parse_int`); None at the end, or if
+    // The next token as an integer (`parse_int`); Err at the end, or if
     // it is not one (it is consumed all the same).
-    pub fn next_int(self: *Scanner) -> Option<i64> {
+    pub fn next_int(self: *Scanner) -> Result<i64, ScanError> {
         match self.next_token() {
-            Option::Some(t) => parse_int(t),
-            Option::None => Option::None,
+            Option::Some(t) => match parse_int(t) {
+                Result::Ok(n) => Result::Ok(n),
+                Result::Err(e) => Result::Err(ScanError::Parse(e)),
+            },
+            Option::None => Result::Err(ScanError::End),
         }
     }
 
@@ -219,3 +245,105 @@ impl Scanner {
         self.text[self.pos..]
     }
 }
+
+// ---- Errors of reading and parsing (0.15) ----
+
+// Reading stdin failed (read_line, read_stdin).
+pub enum IoError { Read, Write }
+
+// Why parse_int failed: no digits; the byte at this index is not a digit;
+// the number does not fit in an i64.
+pub enum ParseIntError { Empty, InvalidDigit(i64), Overflow }
+
+// Why Scanner::next_int failed: no token left; the token is not a number.
+pub enum ScanError { End, Parse(ParseIntError) }
+
+impl Display for IoError {
+    #[inline]
+    fn fmt(self: *IoError, f: *Fmt) {
+        match *self {
+            IoError::Read => f.str("cannot read the input"),
+            IoError::Write => f.str("cannot write the output"),
+        }
+    }
+}
+
+impl Debug for IoError {
+    #[inline]
+    fn fmt_debug(self: *IoError, f: *Fmt) {
+        match *self {
+            IoError::Read => f.str("Read"),
+            IoError::Write => f.str("Write"),
+        }
+    }
+}
+
+impl Display for ParseIntError {
+    #[inline]
+    fn fmt(self: *ParseIntError, f: *Fmt) {
+        match *self {
+            ParseIntError::Empty => f.str("cannot parse an integer from an empty text"),
+            ParseIntError::InvalidDigit(i) => {
+                f.str("invalid digit at byte ");
+                f.display(&i);
+            }
+            ParseIntError::Overflow => f.str("the number does not fit in an i64"),
+        }
+    }
+}
+
+impl Debug for ParseIntError {
+    #[inline]
+    fn fmt_debug(self: *ParseIntError, f: *Fmt) {
+        match *self {
+            ParseIntError::Empty => f.str("Empty"),
+            ParseIntError::InvalidDigit(i) => {
+                f.str("InvalidDigit(");
+                f.debug(&i);
+                f.str(")");
+            }
+            ParseIntError::Overflow => f.str("Overflow"),
+        }
+    }
+}
+
+impl Display for ScanError {
+    #[inline]
+    fn fmt(self: *ScanError, f: *Fmt) {
+        match *self {
+            ScanError::End => f.str("no number left: the end of the input"),
+            ScanError::Parse(e) => f.display(&e),
+        }
+    }
+}
+
+impl Debug for ScanError {
+    #[inline]
+    fn fmt_debug(self: *ScanError, f: *Fmt) {
+        match *self {
+            ScanError::End => f.str("End"),
+            ScanError::Parse(e) => {
+                f.str("Parse(");
+                f.debug(&e);
+                f.str(")");
+            }
+        }
+    }
+}
+
+// ---- Integer limits (0.15) ----
+
+// The smallest and largest values of the integer types (Rust's `i32::MAX`
+// is `std::I32_MAX`).
+pub const I8_MIN: i8 = -128;
+pub const I8_MAX: i8 = 127;
+pub const I16_MIN: i16 = -32768;
+pub const I16_MAX: i16 = 32767;
+pub const I32_MIN: i32 = -2147483648;
+pub const I32_MAX: i32 = 2147483647;
+pub const I64_MIN: i64 = -9223372036854775807 - 1;
+pub const I64_MAX: i64 = 9223372036854775807;
+pub const U8_MAX: u8 = 255;
+pub const U16_MAX: u16 = 65535;
+pub const U32_MAX: u32 = 4294967295;
+pub const U64_MAX: u64 = 18446744073709551615;
