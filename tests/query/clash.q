@@ -13,21 +13,21 @@ $ refs helper
 # clash/b.tach
 1:8	def	->b::helper	pub fn helper() -> i64 {
 # clash/main.tach
-15:8	crate	->a::helper	use a::helper as a_helper;
-32:13	main	->a::helper	let n = a_helper() + b::helper() + helper;
-32:29	main	->b::helper	let n = a_helper() + b::helper() + helper;
+15:8	use	crate	->a::helper	use a::helper as a_helper;
+32:13	call	main	->a::helper	let n = a_helper() + b::helper() + helper;
+32:29	call	main	->b::helper	let n = a_helper() + b::helper() + helper;
 $ refs a::helper
 # clash/a.tach
 2:8	def	pub fn helper() -> i64 {
 # clash/main.tach
-15:8	crate	use a::helper as a_helper;
-32:13	main	let n = a_helper() + b::helper() + helper;
+15:8	use	crate	use a::helper as a_helper;
+32:13	call	main	let n = a_helper() + b::helper() + helper;
 $ refs crate::b::helper --count
 2
 $ callers helper
 # clash/main.tach
-32:13	main	->a::helper	let n = a_helper() + b::helper() + helper;
-32:29	main	->b::helper	let n = a_helper() + b::helper() + helper;
+32:13	call	main	->a::helper	let n = a_helper() + b::helper() + helper;
+32:29	call	main	->b::helper	let n = a_helper() + b::helper() + helper;
 $ def --exact helper
 error query.no-match: no definition 'helper'
 try: tachyonc query def crate::a::helper
@@ -44,9 +44,9 @@ $ refs Point
 # clash/geom.tach
 4:8	def	->geom::Point	pub fn Point(x: i64) -> i64 {
 # clash/main.tach
-16:12	crate	->geom::Point	use geom::{Point, V2};
-33:16	main	->a::Point	let p = a::Point { x: Point(n) };
-33:27	main	->geom::Point	let p = a::Point { x: Point(n) };
+16:12	use	crate	->geom::Point	use geom::{Point, V2};
+33:16	init	main	->a::Point	let p = a::Point { x: Point(n) };
+33:27	call	main	->geom::Point	let p = a::Point { x: Point(n) };
 $ show a::Point
 // crate::a::Point	clash/a.tach:6-8
 pub struct Point {
@@ -62,10 +62,10 @@ $ refs V2::len
 # clash/geom.tach
 15:12	def	pub fn len(self: *V2) -> i64 {
 # clash/main.tach
-40:17	main	mine.push(v.len());
+40:17	call	main	mine.push(v.len());
 $ refs myvec::Vec::len
 # clash/main.tach
-47:76	main	let total = twice_generic(&sq) + twice_generic(&v) + sq.twice() + mine.len() + printf(r);
+47:76	call	main	let total = twice_generic(&sq) + twice_generic(&v) + sq.twice() + mine.len() + printf(r);
 # clash/myvec.tach
 11:12	def	pub fn len(self: *Vec) -> i64 {
 $ def V2::add
@@ -76,38 +76,38 @@ $ refs '<V2 as Add>::add'
 # clash/geom.tach
 21:8	def	fn add(self: V2, o: V2) -> V2 {
 # clash/main.tach
-35:13	main	let v = V2 { x: 1, y: 2 } + V2 { x: 3, y: 4 };
+35:13	call	main	let v = V2 { x: 1, y: 2 } + V2 { x: 3, y: 4 };
 $ refs '<crate::geom::V2 as Add>::add' --exact
 # clash/geom.tach
 21:8	def	fn add(self: V2, o: V2) -> V2 {
 # clash/main.tach
-35:13	main	let v = V2 { x: 1, y: 2 } + V2 { x: 3, y: 4 };
+35:13	call	main	let v = V2 { x: 1, y: 2 } + V2 { x: 3, y: 4 };
 $ refs V2::add
 # clash/geom.tach
 21:8	def	fn add(self: V2, o: V2) -> V2 {
 # clash/main.tach
-35:13	main	let v = V2 { x: 1, y: 2 } + V2 { x: 3, y: 4 };
+35:13	call	main	let v = V2 { x: 1, y: 2 } + V2 { x: 3, y: 4 };
 $ refs crate::myvec::Vec::add
 # clash/main.tach
-41:10	main	mine.add(1);
+41:10	call	main	mine.add(1);
 # clash/myvec.tach
 15:12	def	pub fn add(self: *Vec, k: i64) {
 $ refs Area::area
 # clash/geom.tach
 27:8	def	-><geom::V2 as Area>::area	fn area(self: *V2) -> i64 {
 # clash/main.tach
-27:7	twice_generic	-><geom::V2 as Area>::area	x.area() + x.area()
-27:7	twice_generic	-><shapes::Square as Area>::area	x.area() + x.area()
-27:18	twice_generic	-><geom::V2 as Area>::area	x.area() + x.area()
-27:18	twice_generic	-><shapes::Square as Area>::area	x.area() + x.area()
+27:7	call	twice_generic	-><geom::V2 as Area>::area	x.area() + x.area()
+27:7	call	twice_generic	-><shapes::Square as Area>::area	x.area() + x.area()
+27:18	call	twice_generic	-><geom::V2 as Area>::area	x.area() + x.area()
+27:18	call	twice_generic	-><shapes::Square as Area>::area	x.area() + x.area()
 # clash/shapes.tach
 2:8	def	->shapes::Area::area	fn area(self: *Self) -> i64;
-5:14	shapes::Area::twice	-><geom::V2 as Area>::area	self.area() * 2
-5:14	shapes::Area::twice	-><shapes::Square as Area>::area	self.area() * 2
+5:14	call	shapes::Area::twice	-><geom::V2 as Area>::area	self.area() * 2
+5:14	call	shapes::Area::twice	-><shapes::Square as Area>::area	self.area() * 2
 14:8	def	-><shapes::Square as Area>::area	fn area(self: *Square) -> i64 {
 $ refs Area::twice
 # clash/main.tach
-47:61	main	let total = twice_generic(&sq) + twice_generic(&v) + sq.twice() + mine.len() + printf(r);
+47:61	call	main	let total = twice_generic(&sq) + twice_generic(&v) + sq.twice() + mine.len() + printf(r);
 # clash/shapes.tach
 4:8	def	fn twice(self: *Self) -> i64 {
 $ show '<Square as Area>::area'
@@ -117,14 +117,14 @@ $ show '<Square as Area>::area'
     }
 $ refs crate::shapes::Area
 # clash/geom.tach
-1:20	geom	use crate::shapes::Area;
-26:6	geom	impl Area for V2 {
+1:20	use	geom	use crate::shapes::Area;
+26:6	type	geom	impl Area for V2 {
 # clash/main.tach
-17:14	crate	use shapes::{Area, Shape, Square};
-26:21	twice_generic	fn twice_generic<T: Area>(x: *T) -> i64 {
+17:14	use	crate	use shapes::{Area, Shape, Square};
+26:21	type	twice_generic	fn twice_generic<T: Area>(x: *T) -> i64 {
 # clash/shapes.tach
 1:11	def	pub trait Area {
-13:6	shapes	impl Area for Square {
+13:6	type	shapes	impl Area for Square {
 $ def push
 crate::myvec::Vec::push	clash/myvec.tach:7:12	method	pub fn push(self: *Vec, x: i64)
 std::Vec::push	<std>:138:12	method	pub fn push(self: *Vec<T>, x: T)
@@ -134,36 +134,43 @@ $ refs Vec::push --count
 5	std::Vec::push
 $ callers crate::myvec::Vec::push
 # clash/main.tach
-40:10	main	mine.push(v.len());
+40:10	call	main	mine.push(v.len());
 $ refs crate::myvec::Vec::push
 # clash/main.tach
-40:10	main	mine.push(v.len());
+40:10	call	main	mine.push(v.len());
 # clash/myvec.tach
 7:12	def	pub fn push(self: *Vec, x: i64) {
 $ refs geom::V2
 # clash/geom.tach
 8:12	def	pub struct V2 {
-13:6	geom	impl V2 {
-15:23	geom::V2::len	pub fn len(self: *V2) -> i64 {
-20:14	geom	impl Add for V2 {
-21:18	<geom::V2 as Add>::add	fn add(self: V2, o: V2) -> V2 {
-21:25	<geom::V2 as Add>::add	fn add(self: V2, o: V2) -> V2 {
-21:32	<geom::V2 as Add>::add	fn add(self: V2, o: V2) -> V2 {
-22:9	<geom::V2 as Add>::add	V2 { x: self.x + o.x, y: self.y + o.y }
-26:15	geom	impl Area for V2 {
-27:20	<geom::V2 as Area>::area	fn area(self: *V2) -> i64 {
+13:6	type	geom	impl V2 {
+15:23	type	geom::V2::len	pub fn len(self: *V2) -> i64 {
+20:14	type	geom	impl Add for V2 {
+21:18	type	<geom::V2 as Add>::add	fn add(self: V2, o: V2) -> V2 {
+21:25	type	<geom::V2 as Add>::add	fn add(self: V2, o: V2) -> V2 {
+21:32	type	<geom::V2 as Add>::add	fn add(self: V2, o: V2) -> V2 {
+22:9	init	<geom::V2 as Add>::add	V2 { x: self.x + o.x, y: self.y + o.y }
+26:15	type	geom	impl Area for V2 {
+27:20	type	<geom::V2 as Area>::area	fn area(self: *V2) -> i64 {
 # clash/main.tach
-16:19	crate	use geom::{Point, V2};
-35:13	main	let v = V2 { x: 1, y: 2 } + V2 { x: 3, y: 4 };
-35:33	main	let v = V2 { x: 1, y: 2 } + V2 { x: 3, y: 4 };
+16:19	use	crate	use geom::{Point, V2};
+35:13	init	main	let v = V2 { x: 1, y: 2 } + V2 { x: 3, y: 4 };
+35:33	init	main	let v = V2 { x: 1, y: 2 } + V2 { x: 3, y: 4 };
+# clash/shapes.tach
+2:20	type	shapes::Area::area	fn area(self: *Self) -> i64;
+4:21	type	shapes::Area::twice	fn twice(self: *Self) -> i64 {
+# <std>
+282:30	type	std::Add::add	pub trait Add { fn add(self: Self, other: Self) -> Self; }
+282:43	type	std::Add::add	pub trait Add { fn add(self: Self, other: Self) -> Self; }
+282:52	type	std::Add::add	pub trait Add { fn add(self: Self, other: Self) -> Self; }
 $ callers printf
 # clash/main.tach
-47:84	main	->printf	let total = twice_generic(&sq) + twice_generic(&v) + sq.twice() + mine.len() + printf(r);
-49:12	main	->c::printf	c::printf(c"%d\n", total as i32);
+47:84	call	main	->printf	let total = twice_generic(&sq) + twice_generic(&v) + sq.twice() + mine.len() + printf(r);
+49:12	call	main	->c::printf	c::printf(c"%d\n", total as i32);
 $ refs crate::printf
 # clash/main.tach
 21:4	def	fn printf(x: i64) -> i64 {
-47:84	main	let total = twice_generic(&sq) + twice_generic(&v) + sq.twice() + mine.len() + printf(r);
+47:84	call	main	let total = twice_generic(&sq) + twice_generic(&v) + sq.twice() + mine.len() + printf(r);
 $ show crate::printf
 // crate::printf	clash/main.tach:20-23
 /// The user's own printf (the C one is c::printf).
@@ -176,16 +183,16 @@ $ refs Point.x
 # clash/a.tach
 7:9	def	pub x: i64,
 # clash/main.tach
-33:24	main	let p = a::Point { x: Point(n) };
-34:39	main	let s = sys::SockaddrIn { port: p.x };
+33:24	init	main	let p = a::Point { x: Point(n) };
+34:39	read	main	let s = sys::SockaddrIn { port: p.x };
 $ refs .x --count
 3	crate::a::Point.x
 9	crate::geom::V2.x
 $ refs SockaddrIn.port
 # clash/main.tach
 10:33	def	pub struct SockaddrIn { pub port: i64 }
-34:31	main	let s = sys::SockaddrIn { port: p.x };
-38:20	main	std_vec.push(s.port);
+34:31	init	main	let s = sys::SockaddrIn { port: p.x };
+38:20	read	main	std_vec.push(s.port);
 $ show sys::SockaddrIn
 // crate::sys::SockaddrIn	clash/main.tach:10-10
     pub struct SockaddrIn { pub port: i64 }
@@ -193,34 +200,34 @@ $ def Shape::Circle
 crate::shapes::Shape::Circle	clash/shapes.tach:20:5	variant	Circle(i64)
 $ refs Shape::Circle
 # clash/main.tach
-42:24	main	let shape = Shape::Circle(2);
-44:16	main	Shape::Circle(k) => k,
+42:24	init	main	let shape = Shape::Circle(2);
+44:16	pat	main	Shape::Circle(k) => k,
 # clash/shapes.tach
 20:5	def	Circle(i64),
 $ refs Shape::Dot
 # clash/main.tach
-45:16	main	Shape::Dot => 0,
+45:16	pat	main	Shape::Dot => 0,
 # clash/shapes.tach
 21:5	def	Dot,
 $ refs crate::shapes::Shape
 # clash/main.tach
-17:20	crate	use shapes::{Area, Shape, Square};
-42:17	main	let shape = Shape::Circle(2);
-44:9	main	Shape::Circle(k) => k,
-45:9	main	Shape::Dot => 0,
+17:20	use	crate	use shapes::{Area, Shape, Square};
+42:17	type	main	let shape = Shape::Circle(2);
+44:9	type	main	Shape::Circle(k) => k,
+45:9	type	main	Shape::Dot => 0,
 # clash/shapes.tach
 19:10	def	pub enum Shape {
 $ refs a
 # clash/main.tach
 3:5	def	mod a;
-15:5	crate	use a::helper as a_helper;
-33:13	main	let p = a::Point { x: Point(n) };
+15:5	mod	crate	use a::helper as a_helper;
+33:13	mod	main	let p = a::Point { x: Point(n) };
 $ def twice_generic
 crate::twice_generic	clash/main.tach:26:4	fn	fn twice_generic<T: Area>(x: *T) -> i64
 $ callers twice_generic
 # clash/main.tach
-47:17	main	let total = twice_generic(&sq) + twice_generic(&v) + sq.twice() + mine.len() + printf(r);
-47:38	main	let total = twice_generic(&sq) + twice_generic(&v) + sq.twice() + mine.len() + printf(r);
+47:17	call	main	let total = twice_generic(&sq) + twice_generic(&v) + sq.twice() + mine.len() + printf(r);
+47:38	call	main	let total = twice_generic(&sq) + twice_generic(&v) + sq.twice() + mine.len() + printf(r);
 $ def UNIT
 crate::shapes::UNIT	clash/shapes.tach:24:11	const	pub const UNIT: i64 = 1
 $ def COUNT
@@ -259,14 +266,23 @@ try: tachyonc query def crate::a::helper
 try: tachyonc query def crate::b::helper
 [exit 1]
 $ refs MyVec
-error query.alias: 'MyVec' is an import alias in crate
-try: tachyonc query refs crate::myvec::Vec
-[exit 1]
+# clash/main.tach
+18:12	use	crate	use myvec::Vec as MyVec;
+39:20	init	main	let mut mine = MyVec { n: 0 };
+# clash/myvec.tach
+2:12	def	pub struct Vec {
+6:6	type	myvec	impl Vec {
+7:24	type	myvec::Vec::push	pub fn push(self: *Vec, x: i64) {
+11:23	type	myvec::Vec::len	pub fn len(self: *Vec) -> i64 {
+15:23	type	myvec::Vec::add	pub fn add(self: *Vec, k: i64) {
+note query.alias: 'MyVec' is an import alias in crate, for crate::myvec::Vec
 $ refs a_helper
-error query.alias: 'a_helper' is an import alias in crate
-try: tachyonc query refs crate::a::helper
-try: tachyonc query refs crate::b::helper
-[exit 1]
+# clash/a.tach
+2:8	def	pub fn helper() -> i64 {
+# clash/main.tach
+15:8	use	crate	use a::helper as a_helper;
+32:13	call	main	let n = a_helper() + b::helper() + helper;
+note query.alias: 'a_helper' is an import alias in crate, for crate::a::helper
 $ items nosuch
 error query.no-match: no module 'nosuch'
 try: tachyonc query items

@@ -8,14 +8,18 @@ use crate::base::{
     buf_new, buf_str, buf_write_fd, streq, strlen,
 };
 use crate::front::ast::{NODES, NODE_COUNT, NodeKind, child};
-use crate::front::check::Res;
+use crate::front::check::{Res, SELF_TYPE_SYM};
 use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
 use crate::front::modules::{MODULES, file_of_pos, module_at, module_count};
 use crate::front::types::{CONSTS, FNS, STATICS, STRUCTS, TYPES, TyKind, VARIANTS};
 use crate::middle::lower::ssa::HMap;
-use crate::tools::query::{NOTES, QF_CALL, QF_DEF, def_at_line, parse_digits, trailing_number};
+use crate::tools::query::{
+    NOTES, QF_CALL, QF_DEF, QF_INIT, QF_PAT, QF_USE, QF_WRITE, def_at_line, parse_digits,
+    trailing_number,
+};
 use crate::tools::query::defs::{
-    DEFS, DEF_COUNT, K_IMPL_METHOD, K_TRAIT_FN, bytes_eq, def_of_node, find_in, mod_fqn, trait_of,
+    DEFS, DEF_COUNT, K_ALIAS, K_ENUM, K_IMPL_METHOD, K_MOD, K_STRUCT, K_TRAIT, K_TRAIT_FN, bytes_eq,
+    def_of_node, find_in, is_alias_name, mod_fqn, trait_of,
 };
 use crate::tools::query::diagnostics::{diag, put_cword, put_word, try_begin, try_end};
 use crate::tools::query::positions::{
@@ -132,11 +136,102 @@ fn field_node(s: i64, i: i64, name: i64) -> i64 {
     }
 }
 
+// The places assignments write (0.13): each target, and the fields,
+// indexings and statics it is made of up to a dereference (`A.b[i].c =
+// x` writes A, b and c), as node + 1 in out.
+fn written_places(out: *HMap) {
+    unsafe {
+        for n in 1..NODE_COUNT {
+            if NODES[n].kind != NodeKind::Assign {
+                continue;
+            }
+            let mut t = NODES[n].b;
+            while t > 0 {
+                let k = NODES[t].kind;
+                out.put(t + 1, 1);
+                if k == NodeKind::FieldAccess || k == NodeKind::Index || k == NodeKind::TupleField {
+                    t = NODES[t].a;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+// The kind of reference r (0.13): def, use (an import), call, init (a
+// struct literal, a constructed variant), write (an assignment's target),
+// pat (a pattern), mod (a module path), type (a type, a trait), or read.
+pub fn ref_kind(r: i64) -> *u8 {
+    unsafe {
+        let fl = R_FLAGS.data[r];
+        if (fl & QF_DEF) != 0 {
+            return c"def";
+        }
+        if (fl & QF_USE) != 0 {
+            return c"use";
+        }
+        if (fl & QF_CALL) != 0 {
+            return c"call";
+        }
+        if (fl & QF_INIT) != 0 {
+            return c"init";
+        }
+        if (fl & QF_WRITE) != 0 {
+            return c"write";
+        }
+        if (fl & QF_PAT) != 0 {
+            return c"pat";
+        }
+        let k = DEFS[R_DEF.data[r]].kind;
+        if k == K_MOD {
+            return c"mod";
+        }
+        if k == K_STRUCT || k == K_ENUM || k == K_TRAIT || k == K_ALIAS {
+            return c"type";
+        }
+        c"read"
+    }
+}
+
+// --kind K[,K...] (0.13): refs keeps the references of those kinds.
+pub static mut OPT_KIND: *u8 = 0 as *u8;
+
+// Whether kind k is in the comma-separated list.
+fn kind_listed(k: *u8, list: *u8) -> bool {
+    unsafe {
+        let n = strlen(k) as i64;
+        let mut i = 0;
+        while list[i] != 0 {
+            let mut j = i;
+            while list[j] != 0 && list[j] != ',' {
+                j += 1;
+            }
+            if j - i == n {
+                let mut same = true;
+                for x in 0..n {
+                    if list[i + x] != k[x] {
+                        same = false;
+                    }
+                }
+                if same {
+                    return true;
+                }
+            }
+            i = if list[j] == ',' { j + 1 } else { j };
+        }
+        false
+    }
+}
+
 // The references the checked nodes record, and the ones the hooks noted.
 pub fn collect_refs() {
     unsafe {
+        let mut written = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        written_places(&written);
         for n in 1..NODE_COUNT {
             let kind = NODES[n].kind;
+            let w = if written.get(n + 1) != 0 { QF_WRITE } else { 0 };
             if kind == NodeKind::Ident {
                 let y = NODES[n].y;
                 let res = NODES[n].res;
@@ -145,7 +240,7 @@ pub fn collect_refs() {
                 } else if res == Res::Const {
                     add_name_ref(CONSTS[y].node, n, 0);
                 } else if res == Res::Static {
-                    add_name_ref(STATICS[y].node, n, 0);
+                    add_name_ref(STATICS[y].node, n, w);
                 }
             } else if kind == NodeKind::Call {
                 if NODES[n].x <= 0 {
@@ -169,30 +264,30 @@ pub fn collect_refs() {
                 let s = struct_node(NODES[NODES[n].a].ty);
                 let field = field_node(s, NODES[n].x, NODES[n].b);
                 if field != 0 {
-                    add_ref(field, NODES[NODES[n].a].end, NODES[n].end, NODES[n].b, false, NODES[n].start, 0);
+                    add_ref(field, NODES[NODES[n].a].end, NODES[n].end, NODES[n].b, false, NODES[n].start, w);
                 }
             } else if kind == NodeKind::StructLit {
                 let s = struct_node(NODES[n].ty);
                 if s == 0 {
                     continue;
                 }
-                if NODES[n].a == NODES[s].a {
-                    add_ref(s, NODES[n].start, NODES[n].end, NODES[n].a, false, NODES[n].start, 0);
+                if NODES[n].a == NODES[s].a || NODES[n].a == SELF_TYPE_SYM || is_alias_name(NODES[n].a) {
+                    add_ref(s, NODES[n].start, NODES[n].end, NODES[n].a, false, NODES[n].start, QF_INIT);
                 }
                 for i in 0..NODES[n].count {
                     let init = child(n, i);
                     let field = field_node(s, NODES[init].x, NODES[init].a);
                     if field != 0 {
-                        add_ref(field, NODES[init].start, -1, -1, false, NODES[init].start, 0);
+                        add_ref(field, NODES[init].start, -1, -1, false, NODES[init].start, QF_INIT);
                     }
                 }
             } else if kind == NodeKind::VariantLit {
                 let v = NODES[n].a;
-                add_ref(VARIANTS[v].node, NODES[n].start, NODES[n].end, VARIANTS[v].name, false, NODES[n].start, 0);
+                add_ref(VARIANTS[v].node, NODES[n].start, NODES[n].end, VARIANTS[v].name, false, NODES[n].start, QF_INIT);
             } else if kind == NodeKind::PatVariant {
                 let v = NODES[n].x;
                 if NODES[n].ty != 0 && v >= 0 && VARIANTS[v].name == NODES[n].b {
-                    add_ref(VARIANTS[v].node, NODES[n].start, NODES[n].end, NODES[n].b, false, NODES[n].start, 0);
+                    add_ref(VARIANTS[v].node, NODES[n].start, NODES[n].end, NODES[n].b, false, NODES[n].start, QF_PAT);
                 }
             }
         }
@@ -355,7 +450,8 @@ pub fn resolve_in(x: [u8]) -> bool {
         if is_file {
             for f in 0..FILE_COUNT {
                 let p = file_text(f);
-                if bytes_eq(p, x) || (p.len > x.len && bytes_eq(p[p.len - x.len..p.len], x) && p[p.len - x.len - 1] == '/') {
+                if bytes_eq(p, x) || (p.len > x.len && bytes_eq(p[p.len - x.len..p.len], x) && p[p.len - x.len - 1] == '/')
+                    || dir_holds(p, x) {
                     IN_FILE.data[f] = 1;
                     any = true;
                 }
@@ -370,6 +466,24 @@ pub fn resolve_in(x: [u8]) -> bool {
         }
         any
     }
+}
+
+// Whether directory x (whole components, a trailing `/` or not: `front`,
+// `compiler/src/front/`) holds file p (0.13).
+fn dir_holds(p: [u8], x0: [u8]) -> bool {
+    let mut x = x0;
+    while x.len > 0 && x[x.len - 1] == '/' {
+        x = x[0..x.len - 1];
+    }
+    if x.len == 0 || x.len + 1 >= p.len {
+        return false;
+    }
+    for i in 0..p.len - x.len {
+        if (i == 0 || p[i - 1] == '/') && p[i + x.len] == '/' && bytes_eq(p[i..i + x.len], x) {
+            return true;
+        }
+    }
+    false
 }
 
 // The message of a --in that resolve_in did not resolve (after `diag`):
@@ -441,6 +555,9 @@ pub fn query_refs(matches: *IntVec, cmd: *u8, name: [u8]) -> i64 {
         for i in 0..order.count {
             let r = order.data[i];
             if calls_only && (R_FLAGS.data[r] & QF_CALL) == 0 {
+                continue;
+            }
+            if OPT_KIND != 0 as *u8 && !kind_listed(ref_kind(r), OPT_KIND) {
                 continue;
             }
             if !ref_in(R_POS.data[r]) {
@@ -543,9 +660,9 @@ pub fn query_refs(matches: *IntVec, cmd: *u8, name: [u8]) -> i64 {
             buf_byte(out, ':');
             buf_int(out, pos - line_start(pos) + 1);
             buf_byte(out, '\t');
-            if (R_FLAGS.data[r] & QF_DEF) != 0 {
-                buf_str(out, c"def");
-            } else {
+            buf_str(out, ref_kind(r));
+            if (R_FLAGS.data[r] & QF_DEF) == 0 {
+                buf_byte(out, '\t');
                 let e = enclosing(pos);
                 put_short(out, if e >= 0 { DEFS[e].fqn } else { mod_fqn(module_at(pos)) });
             }

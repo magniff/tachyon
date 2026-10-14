@@ -63,9 +63,9 @@ $ refs a::helper b::helper --root clash/main.tach
 # clash/b.tach
 1:8	def	->b::helper	pub fn helper() -> i64 {
 # clash/main.tach
-15:8	crate	->a::helper	use a::helper as a_helper;
-32:13	main	->a::helper	let n = a_helper() + b::helper() + helper;
-32:29	main	->b::helper	let n = a_helper() + b::helper() + helper;
+15:8	use	crate	->a::helper	use a::helper as a_helper;
+32:13	call	main	->a::helper	let n = a_helper() + b::helper() + helper;
+32:29	call	main	->b::helper	let n = a_helper() + b::helper() + helper;
 $ def a::helper nothing_here b::helper --root clash/main.tach
 crate::a::helper	clash/a.tach:2:8	fn	pub fn helper() -> i64
 crate::b::helper	clash/b.tach:1:8	fn	pub fn helper() -> i64

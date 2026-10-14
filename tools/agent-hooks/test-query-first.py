@@ -69,6 +69,10 @@ st, err = blocked("head -n 30 compiler/src/gvn.tach")
 case("read head compiler", "MODULE::header" in err and "query text compiler/src/gvn.tach:1-30" in err, True)
 st, err = blocked("cat tests/refactor/patch/main.tach")
 case("read cat", "tachyonc query show tests/refactor/patch/main.tach" in err, True)
+case("grep of text suggests query grep",
+     "query grep 'no definition'" in blocked("grep -rn 'no definition' compiler/src")[1], True)
+case("grep of a name suggests refs and grep",
+     "query refs run_gvn | tachyonc query grep run_gvn" in blocked("grep -rn run_gvn compiler/src")[1], True)
 case("read docs",blocked("grep -n edit docs/refactor.md")[0], False)
 case("read escape", blocked("sed -n '1,9p' compiler/src/gvn.tach  # no-query: the use lines")[0], False)
 

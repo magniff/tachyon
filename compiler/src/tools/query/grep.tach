@@ -1,0 +1,259 @@
+// `query grep PATTERN...` (0.13; docs/query.md): a literal text search
+// over the program's files, for what is not a name (a message, a comment,
+// part of an identifier). Each hit is printed as a reference is, under
+// `# FILE`: `LINE:COL<TAB>code|comment|string<TAB>ENCLOSING<TAB>SOURCE`,
+// where ENCLOSING is the item holding it (else its module) and the second
+// field says whether the hit is in code, a comment or a string (or
+// character) literal, from the lexer's tokens. The files the compiler
+// makes (`<std>`, `<C import>`) are searched only when --in names them.
+//
+//   --code, --comments, --strings   only hits there (any of them)
+//   --word                          only hits that are whole identifiers
+//   --in FILE|MODULE|FILE:LINE, --count, --limit N, --all: as for refs
+
+use crate::base::{
+    FILES, FILE_COUNT, IntVec, SRC, STDOUT, alloc_array, buf_byte, buf_bytes, buf_int, buf_new,
+    buf_str, buf_write_fd, strlen,
+};
+use crate::front::lexer::{TOKS, TOK_COUNT, Tok, is_ident_byte};
+use crate::front::modules::{file_of_pos, module_at};
+use crate::tools::query::defs::{DEFS, mod_fqn};
+use crate::tools::query::diagnostics::{diag, put_cword, put_word, try_begin, try_end};
+use crate::tools::query::positions::{
+    enclosing, line_of, line_start, rank_of, sort_by_keys, token_at,
+};
+use crate::tools::query::refs::{
+    IN_FILE, OPT_ALL, OPT_COUNT, OPT_IN, OPT_LIMIT, REFS_BUDGET, file_text, put_line, put_short,
+    ref_in,
+};
+
+// The options of grep: which places (G_CODE | G_COMMENT | G_STRING; 0:
+// all), whole identifiers only.
+pub const G_CODE: i64 = 1;
+pub const G_COMMENT: i64 = 2;
+pub const G_STRING: i64 = 4;
+pub static mut OPT_WHERE: i64 = 0;
+pub static mut OPT_WORD: bool = false;
+
+// Where the byte at pos is: G_CODE, G_COMMENT or G_STRING (between the
+// tokens is a comment, or space).
+fn place_of(pos: i64) -> i64 {
+    unsafe {
+        let mut t = token_at(pos);
+        if t >= TOK_COUNT || TOKS[t].start != pos {
+            t -= 1;
+        }
+        if t < 0 || TOKS[t].kind == Tok::Eof || pos >= TOKS[t].end || file_of_pos(TOKS[t].start) != file_of_pos(pos) {
+            return G_COMMENT;
+        }
+        let k = TOKS[t].kind;
+        if k == Tok::Str || k == Tok::CStr || k == Tok::Char { G_STRING } else { G_CODE }
+    }
+}
+
+fn place_name(p: i64) -> *u8 {
+    if p == G_CODE { c"code" } else if p == G_COMMENT { c"comment" } else { c"string" }
+}
+
+// Whether pattern pat is at pos (and, --word, a whole identifier).
+fn hit_at(pos: i64, end: i64, pat: [u8], start: i64) -> bool {
+    unsafe {
+        if pos + pat.len > end {
+            return false;
+        }
+        for j in 0..pat.len {
+            if SRC[pos + j] != pat[j] {
+                return false;
+            }
+        }
+        if OPT_WORD {
+            if pos > start && is_ident_byte(SRC[pos - 1]) {
+                return false;
+            }
+            if pos + pat.len < end && is_ident_byte(SRC[pos + pat.len]) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// The hits of the patterns (C strings in pats), in order, each position
+// once, into out.
+fn find_hits(pats: *IntVec, out: *IntVec) {
+    unsafe {
+        let mut all = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for f in 0..FILE_COUNT {
+            let generated = FILES[f].path[0] == '<';
+            if generated && (OPT_IN == 0 as *u8 || IN_FILE.count <= f || IN_FILE.data[f] == 0) {
+                continue;
+            }
+            let start = FILES[f].start;
+            let end = FILES[f].end;
+            for k in 0..(*pats).count {
+                let p = (*pats).data[k] as *u8;
+                let pat = p[0..strlen(p) as i64];
+                if pat.len == 0 {
+                    continue;
+                }
+                let first = pat[0];
+                let mut pos = start;
+                while pos + pat.len <= end {
+                    if SRC[pos] == first && hit_at(pos, end, pat, start) && ref_in(pos)
+                        && (OPT_WHERE == 0 || (OPT_WHERE & place_of(pos)) != 0) {
+                        all.push(pos);
+                    }
+                    pos += 1;
+                }
+            }
+        }
+        let n = all.count;
+        let k1 = alloc_array::<i64>(n + 1);
+        let k2 = alloc_array::<i64>(n + 1);
+        let mut idx = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..n {
+            idx.push(i);
+            k1[i] = rank_of(all.data[i]);
+            k2[i] = all.data[i];
+        }
+        sort_by_keys(&idx, k1, k2);
+        for i in 0..n {
+            let pos = all.data[idx.data[i]];
+            if (*out).count == 0 || (*out).data[(*out).count - 1] != pos {
+                out.push(pos);
+            }
+        }
+    }
+}
+
+// A `try:` line: the same grep with one more option (and its value).
+fn try_grep(pats: *IntVec, option: *u8, value: [u8]) {
+    unsafe {
+        let out = try_begin(c"grep", value[0..0], false);
+        for k in 0..(*pats).count {
+            put_cword(out, (*pats).data[k] as *u8);
+        }
+        if OPT_IN != 0 as *u8 && !crate::base::streq(option, c"--in") {
+            buf_str(out, c" --in");
+            put_cword(out, OPT_IN);
+        }
+        if (OPT_WHERE & G_CODE) != 0 {
+            buf_str(out, c" --code");
+        }
+        if (OPT_WHERE & G_COMMENT) != 0 {
+            buf_str(out, c" --comments");
+        }
+        if (OPT_WHERE & G_STRING) != 0 {
+            buf_str(out, c" --strings");
+        }
+        if OPT_WORD {
+            buf_str(out, c" --word");
+        }
+        buf_byte(out, ' ');
+        buf_str(out, option);
+        if value.len > 0 {
+            put_word(out, value);
+        }
+        try_end(out);
+    }
+}
+
+// `query grep PATTERN...`: the exit status (0, also for no hit).
+pub fn query_grep(pats: *IntVec) -> i64 {
+    unsafe {
+        let mut hits = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        find_hits(pats, &hits);
+        let out = buf_new();
+        let total = hits.count;
+        if OPT_COUNT {
+            buf_int(out, total);
+            buf_byte(out, '\n');
+            buf_write_fd(out, STDOUT);
+            return 0;
+        }
+        if total == 0 {
+            let d = diag(c"note", c"query.empty");
+            buf_str(d, c"0 hits");
+            if OPT_IN != 0 as *u8 {
+                buf_str(d, c" in ");
+                buf_str(d, OPT_IN);
+            }
+            buf_byte(d, '\n');
+            return 0;
+        }
+        // Per file: the number of hits.
+        let mut files = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut per_file = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut biggest = -1;
+        let mut biggest_n = 0;
+        for i in 0..total {
+            let f = file_of_pos(hits.data[i]);
+            if files.count == 0 || files.data[files.count - 1] != f {
+                files.push(f);
+                per_file.push(0);
+            }
+            per_file.data[per_file.count - 1] += 1;
+            if per_file.data[per_file.count - 1] > biggest_n {
+                biggest_n = per_file.data[per_file.count - 1];
+                biggest = f;
+            }
+        }
+        if OPT_LIMIT < 0 && !OPT_ALL && total > REFS_BUDGET {
+            for i in 0..files.count {
+                buf_bytes(out, file_text(files.data[i]));
+                buf_byte(out, '\t');
+                buf_int(out, per_file.data[i]);
+                buf_byte(out, '\n');
+            }
+            buf_write_fd(out, STDOUT);
+            let d = diag(c"note", c"query.truncated");
+            buf_int(d, total);
+            buf_str(d, c" hits in ");
+            buf_int(d, files.count);
+            buf_str(d, if files.count == 1 { c" file\n" } else { c" files\n" });
+            if files.count > 1 {
+                try_grep(pats, c"--in", file_text(biggest));
+            }
+            try_grep(pats, c"--limit 60", file_text(biggest)[0..0]);
+            try_grep(pats, c"--all", file_text(biggest)[0..0]);
+            return 0;
+        }
+        let shown = if OPT_LIMIT >= 0 && OPT_LIMIT < total { OPT_LIMIT } else { total };
+        let mut cur = -1;
+        for i in 0..shown {
+            let pos = hits.data[i];
+            let f = file_of_pos(pos);
+            if f != cur {
+                buf_str(out, c"# ");
+                buf_bytes(out, file_text(f));
+                buf_byte(out, '\n');
+                cur = f;
+            }
+            buf_int(out, line_of(pos));
+            buf_byte(out, ':');
+            buf_int(out, pos - line_start(pos) + 1);
+            buf_byte(out, '\t');
+            buf_str(out, place_name(place_of(pos)));
+            buf_byte(out, '\t');
+            let e = enclosing(pos);
+            put_short(out, if e >= 0 { DEFS[e].fqn } else { mod_fqn(module_at(pos)) });
+            buf_byte(out, '\t');
+            put_line(out, pos);
+            buf_byte(out, '\n');
+        }
+        buf_write_fd(out, STDOUT);
+        if shown < total {
+            let d = diag(c"note", c"query.truncated");
+            buf_str(d, c"showing ");
+            buf_int(d, shown);
+            buf_str(d, c" of ");
+            buf_int(d, total);
+            buf_str(d, c" hits\n");
+            if files.count > 1 {
+                try_grep(pats, c"--in", file_text(biggest));
+            }
+            try_grep(pats, c"--all", file_text(biggest)[0..0]);
+        }
+        0
+    }
+}
