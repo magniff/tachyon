@@ -13,8 +13,8 @@ the edited program checked before anything is written, a journal for
 | `query_text.tach` | `query text`, `query show FILE`, a module's regions (`::use`, `::header`, `::extern`) |
 | `plan/` | the planning queries: `stats`, `deps` (with the clustering), `unused`, `impact`; `lint` |
 | `proc.tach` | processes and files: running a program, workers, renames |
-| `edit/` | the edit engine (`mod`, `apply`, `diff`, `undo`), items as text (`items`), `edit replace|insert|delete`, `check` (`cli`), `edit wrap` (`wrap`), `edit new-file` (`newfile`) |
-| `patch/` | `edit patch`, `edit insert --in`: edits inside an item by its text |
+| `edit/` | the edit engine (`mod`, `apply`, `diff`, `undo`), items as text (`items`), `edit replace|insert|delete`, `check` (`cli`), `edit wrap` (`wrap`), `edit new-file` (`newfile`); `edit apply` (`applyfile`, 0.15); what an edit that adds errors broke, and the refactoring that fits (`breaks`, 0.15) |
+| `patch/` | `edit patch`, `edit insert --in`: edits inside an item by its text (0.15: of several targets) |
 | `fix.tach` | `tachyonc fix`: every machine-applicable fix, in rounds, as one edit |
 | `fiximports.tach`, `fixunsafe.tach` | `fix --only imports` (0.8's wildcards), `fix --only unsafe` |
 | `tidyimports.tach` | `fix --only tidy-imports`, and the round move and split run |

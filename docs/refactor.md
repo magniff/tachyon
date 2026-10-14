@@ -11,6 +11,8 @@ one line `SEVERITY CODE: MESSAGE` followed by `try:` lines, as there.
 tachyonc edit patch TARGET --old TEXT --new TEXT [--old TEXT --new TEXT]... [--loose]
 tachyonc edit patch TARGET [--loose] < PAIRS   (0.12; see "Edits inside an item")
 tachyonc edit patch TARGET --pairs FILE [--loose]   (0.13)
+tachyonc edit patch [TARGET] --old A --new B --in NAME --old C --new D   (0.15: several targets)
+tachyonc edit apply [FILE]                     (0.15) several items' new text, one edit
 tachyonc edit insert --in TARGET --after|--before ANCHOR [--loose] < TEXT
 tachyonc edit wrap TARGET --in HEAD [--body | --lines A-B]   (0.13)
 tachyonc edit new-file PATH [--pub] < TEXT     (0.13) the file and its mod line
@@ -50,9 +52,11 @@ files, computed from the compiler's spans. It is applied atomically:
    and message (not by line: an edit moves lines). An error the edited
    program has and the program had not is a **new error**: the copies
    are removed, nothing is written, and the new errors are printed
-   (short form, positions in the edited text) with
-   `error edit.breaks: N new errors; nothing written` and `try:` the same
-   command with `--no-check`;
+   (short form, positions in the edited text), each tagged with the item
+   it is in (0.15), with `error edit.breaks: N new errors; nothing
+   written`, the refactoring that fits when one does, and `try:` the
+   same command with `--no-check` (see "When an edit breaks the
+   program");
 4. otherwise the copies are renamed onto the files (rename(2): each file
    is replaced whole, never half written), the edit is journaled, and
    one line says what changed:
@@ -212,6 +216,40 @@ matched as on the command line (0.13: its first and last lines may be
 parts of lines; before, they had to be whole). An empty NEW removes
 OLD's lines.
 
+### Several targets (0.15)
+
+The pairs of one call may change several items, in several files: on
+the command line `--in NAME` starts the pairs of another target (TARGET
+before the first `--in` is optional), and in a pairs file (stdin or
+`--pairs FILE`) a line `@@ NAME` does, for the blocks after it:
+
+```
+$ tachyonc edit patch area --old 'r.w * r.h' --new 'r.h * r.w' --in main --old '== 26' --new '== 27'
+patched crate::shapes::area, crate::main→2 files→+2 -2 lines
+```
+
+```
+@@ crate::shapes::area
+<<<<<<< OLD
+pub fn area(r: Rect) -> i64 {
+=======
+pub fn area(r: Rect) -> bool {
+>>>>>>> NEW
+@@ main
+<<<<<<< OLD
+    if area(r) + 1 == 7 {
+=======
+    if area(r) {
+>>>>>>> NEW
+```
+
+Each target is found as TARGET is, each OLD in its target's text as it
+was before the edit; all of it is one edit: checked once (so a signature
+and its callers change together, with no error between them), written
+all or not at all, one `undo`. A pair that does not match is reported
+with its target; the `try:` line is then a pairs file with every
+target's `@@` line. A pair before any target: `error edit.usage`.
+
 ### insert --in
 
 `edit insert --in TARGET --after ANCHOR < TEXT` inserts TEXT's lines
@@ -227,6 +265,78 @@ relative to them.
 $ tachyonc edit insert --in calc::sum_to --after 'while i <= n {' < stmt.tach
 inserted in crate::calc::sum_to→calc.tach→+3 -0 lines
 ```
+
+## edit apply (0.15)
+
+`edit apply [FILE]` (stdin without FILE) takes the new text of several
+items in one file, each block introduced by a header line, and makes
+them one edit: checked once, all or nothing, one `undo`, `--dry-run`,
+`--show`, `--no-check` as for every edit.
+
+| header | the block |
+|---|---|
+| `@@ NAME` | NAME's text becomes the block's (as `edit replace NAME`) |
+| `// PATH<TAB>FILE:A-B` (a header of `query show`) | the same, for PATH |
+| `@@ NAME` naming no definition, whose text defines its last segment | added at the end of its module (`@@ shapes::perimeter`) |
+| `@@ new after NAME`, `@@ new before NAME` | inserted next to NAME (as `edit insert`) |
+| `@@ new in MODULE` | added at the end of MODULE's file |
+| `@@ delete NAME` | NAME deleted (no text) |
+| `@@ MODULE::use`, `@@ MODULE::header` | the module's `use` lines or header comment |
+
+So the output of `query show A B` (or the items of `query context`),
+changed and given back, is a round trip: change the items in place, add
+blocks for new ones, apply. Each block is made as `edit replace`,
+`insert` and `delete` make theirs (Items as text, below; the indentation
+of a method's text is fitted); the `use` lines the new text needs are
+added (`note edit.imports`).
+
+```
+$ tachyonc query show area main > items.tach      # then change them, add blocks
+$ tachyonc edit apply items.tach --show
+applied 3 blocks: replaced crate::shapes::area; added crate::shapes::perimeter; replaced crate::main→2 files→+9 -2 lines
+```
+
+Errors: `error edit.format` (text before the first header, a header
+naming nothing, a block without text, a delete block with text; nothing
+is read of the program), `error edit.overlap` (two blocks change one
+item), `error edit.no-module` (a new item for a module with no file of
+its own: name an item to put it after), and NAME's errors as for `edit
+replace` (`query.no-match`, `query.ambiguous`).
+
+### When an edit breaks the program (0.15)
+
+An edit that adds errors prints them, each followed by the item it is
+in: `[edited: PATH]` for text the edit changed, `[in PATH]` for an item
+it does not change (errors outside items, in a `use` line, have no tag).
+`edit.breaks` counts both, and its notes say what to do instead of
+`--no-check`:
+
+```
+main.tach:15:5: error[type error] function 'shapes::scale' expects 3 arguments, got 2  [in crate::main]
+error edit.breaks: 1 new error (1 in crate::main, which the edit does not change); nothing written
+note edit.refactor: the uses of crate::shapes::scale no longer fit its new shape: a refactoring changes them with it (VALUE, EXPR: to fill in), then the rest of the edit
+try: tachyonc refactor signature crate::shapes::scale --add 'm: i64 = VALUE'
+note edit.together: change crate::main in the same edit: one `edit apply FILE` with a block per item, or `edit patch --pairs FILE` with `@@ NAME` blocks
+try: tachyonc query show crate::main
+try: tachyonc edit patch scale --old 'k: i64' --new 'k: i64, m: i64' --no-check
+```
+
+- **`note edit.refactor`**: an edited item's shape changed and its uses
+  broke. The edit's old and new text of the item are compared: a
+  function's name (`refactor rename PATH NEW`) and parameters
+  (`refactor signature`: `--add 'x: T = VALUE'` with `--at N` when not
+  last, `--remove x`, `--rename-param a b` when only names changed in
+  place, `--type x T --default '$x as T'` between number types or
+  `--default EXPR`, `--reorder`), a struct's fields (`refactor field
+  --add`, `--rename`, `--type`; a removed field: `query refs S.g`, its
+  uses), an enum's variants (`refactor variant --add 'X(T)' --arm
+  'EXPR'`, `--rename`, `--remove`). VALUE and EXPR are to be filled in.
+  With errors only in the edited text, a renamed parameter still used by
+  its old name gets `--rename-param` (it renames the uses too).
+- **`note edit.together`**: items the edit does not change have errors;
+  `try:` their `query show`, to change them in the same edit (`edit
+  apply`, `edit patch` with targets).
+- **`--no-check`** is the last `try:`, as before.
 
 ## edit wrap
 
@@ -535,6 +645,11 @@ edit engine lays out the lines every edit writes the same way, and
 |---|---|---|---|---|
 | `edit.breaks` | error | 1 | the edit adds errors (they are printed); nothing written | the command with `--no-check` |
 | `edit.breaks` | warning | 1, 0 | the same with `--dry-run`, or `--no-check` (written) | `tachyonc check` |
+| `edit.refactor` | note | | (0.15) with edit.breaks: an edited item's shape changed and its uses broke | the refactoring that changes them with it |
+| `edit.together` | note | | (0.15) with edit.breaks: items the edit does not change have errors | `query show` of them |
+| `edit.format` | error | 2 | (0.15) apply: the file is not blocks | |
+| `edit.overlap` | error | 1 | (0.15) apply: two blocks change one item | |
+| `edit.no-module` | error | 1 | (0.15) apply: a new item for a module with no file of its own | `query items MODULE` |
 | `edit.no-text` | error | 2 | replace or insert without TEXT on stdin; patch without pairs | the command `< new.tach`; with `--old OLD --new NEW` |
 | `patch.no-match` | error | 1 | an OLD or ANCHOR is not in TARGET (with the nearest line) | the command with that line's text, or with `--loose`, or `query show FILE:LINE` |
 | `patch.ambiguous` | error | 1 | an OLD or ANCHOR occurs several times (their lines) | the command with more context around each |

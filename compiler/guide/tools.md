@@ -60,6 +60,7 @@ an edit then `check`.
 | change text inside an item | `tachyonc edit patch NAME --old 'TEXT' --new 'TEXT'` (pairs repeat) |
 | replace, add, remove an item | `tachyonc edit replace NAME < new.tach`, `edit insert --after NAME < item.tach`, `edit delete NAME` |
 | add statements inside an item | `tachyonc edit insert --in NAME --after 'ANCHOR' < text` |
+| several items at once, one edit | `tachyonc edit apply items.tach`: `@@ NAME` then its new text, `@@ new after NAME`, `@@ delete NAME` (or `query show A B`'s output, edited) |
 | see the result | `--show` on any edit; `tachyonc query diff` |
 | undo the last edit | `tachyonc undo` (the journal: in `.git`, else in `.tachyonc/` next to main.tach) |
 | rename anything, with every use | `tachyonc refactor rename PATH NEW` |
@@ -72,8 +73,10 @@ an edit then `check`.
 | imports, unused, pub, unsafe | `tachyonc fix` (`--only imports,unused,pub,unsafe`, `--dry-run`) |
 
 Every edit is atomic: the edited program is checked first, and an edit
-that adds an error writes nothing and prints the errors. `--dry-run`
-prints the diff instead; `--no-check` writes anyway.
+that adds an error writes nothing and prints the errors, each tagged
+`[edited: PATH]` or `[in PATH]` (an item the edit did not change: change
+it in the same `edit apply`, or run the refactoring the `try:` line
+names). `--dry-run` prints the diff instead; `--no-check` writes anyway.
 
 ## Diagnostics
 
