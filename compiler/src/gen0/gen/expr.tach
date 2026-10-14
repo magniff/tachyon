@@ -217,11 +217,39 @@ pub fn panic_kind(index_ty: i64, range: bool) -> i64 {
     if signed { PANIC_INDEX_SIGNED } else { PANIC_INDEX_UNSIGNED }
 }
 
+// Whether the pointer `n`, the base of `p[i]` or `p[lo..hi]`, is a place:
+// evaluated to its location first and read only after the index or bounds
+// (as a slice's pointer and length are), so that an index that changes it,
+// a call that grows the table it points to, is seen (0.14).
+pub fn pointer_place(n: i64) -> bool {
+    unsafe {
+        match NODES[n].kind {
+            Ident => NODES[n].res == Res::Local || NODES[n].res == Res::Static,
+            Unary => NODES[n].op == Tok::Star,
+            FieldAccess | TupleField => true,
+            Index => NODES[NODES[n].b].kind != Range,
+            _ => false,
+        }
+    }
+}
+
 fn gen_index_addr(n: i64) {
     unsafe {
         let base = NODES[n].a;
         let base_ty = NODES[base].ty;
         let elem_size = type_size(TYPES[base_ty].a);
+        if TYPES[base_ty].kind == TyKind::Ptr && pointer_place(base) {
+            // The pointer's location, the index, then the pointer.
+            gen_addr(base);
+            push_x0();
+            gen_expr(NODES[n].b);
+            pop_x(R_SECOND);
+            emit_load_reg(R_SECOND, R_SECOND);
+            emit_index_addr(elem_size);
+            return;
+        }
+        // A slice's address (its pointer and length are read after the
+        // index), an array's, or a pointer value.
         gen_expr(base);
         push_x0();
         gen_expr(NODES[n].b);
@@ -458,21 +486,16 @@ fn gen_slicing(n: i64) {
         let length = alloc_slot(8, 8);
         let low_slot = alloc_slot(8, 8);
         let high_slot = alloc_slot(8, 8);
-        gen_expr(base);
-        if is_slice(base_ty) {
-            emit_move_to_second(TY_U64);
-            emit_load_reg(R_ACC, R_SECOND);
-            store_reg_to_frame(R_ACC, slot);
-            emit_add_imm(R_SECOND, 8);
-            emit_load_reg(R_ACC, R_SECOND);
-            store_reg_to_frame(R_ACC, length);
+        // The base first: a slice's address, a pointer's location (a
+        // place) or value, an array's address; then the bounds; then what
+        // the base holds, so that bounds that change it are seen.
+        let late_pointer = TYPES[base_ty].kind == TyKind::Ptr && pointer_place(base);
+        if late_pointer {
+            gen_addr(base);
         } else {
-            store_reg_to_frame(R_ACC, slot);
-            if TYPES[base_ty].kind == TyKind::Array {
-                emit_load_imm(R_ACC, TYPES[base_ty].b as u64);
-                store_reg_to_frame(R_ACC, length);
-            }
+            gen_expr(base);
         }
+        store_reg_to_frame(R_ACC, slot);
         let mut bound_ty = TY_U64;
         if low != 0 {
             gen_expr(low);
@@ -484,10 +507,27 @@ fn gen_slicing(n: i64) {
         if high != 0 {
             gen_expr(high);
             bound_ty = NODES[high].ty;
-        } else {
-            load_reg_from_frame(R_ACC, length);
+            store_reg_to_frame(R_ACC, high_slot);
         }
-        store_reg_to_frame(R_ACC, high_slot);
+        if is_slice(base_ty) {
+            load_reg_from_frame(R_SECOND, slot);
+            emit_load_reg(R_ACC, R_SECOND);
+            store_reg_to_frame(R_ACC, slot);
+            emit_add_imm(R_SECOND, 8);
+            emit_load_reg(R_ACC, R_SECOND);
+            store_reg_to_frame(R_ACC, length);
+        } else if late_pointer {
+            load_reg_from_frame(R_SECOND, slot);
+            emit_load_reg(R_ACC, R_SECOND);
+            store_reg_to_frame(R_ACC, slot);
+        } else if TYPES[base_ty].kind == TyKind::Array {
+            emit_load_imm(R_ACC, TYPES[base_ty].b as u64);
+            store_reg_to_frame(R_ACC, length);
+        }
+        if high == 0 {
+            load_reg_from_frame(R_ACC, length);
+            store_reg_to_frame(R_ACC, high_slot);
+        }
         if TYPES[base_ty].kind != TyKind::Ptr {
             let ok = new_label();
             let fail = new_label();

@@ -245,6 +245,21 @@ is `(*p).f` *(0.3)*.
 compound assignment then reads the place's old value *(0.3; before, the
 place came first)*.
 
+**Indexing** *(0.14)*: in `a[i]`, `a[lo..hi]` and a vector `load` or
+`store` of `a`, the base `a` is evaluated first, to its location when it
+is a place (a variable, a static, a field, an element, `*p`), without
+reading it; then the index or the bounds, left to right; and only then
+is what `a` holds read: a slice's pointer and length (for the check and
+the access), a pointer's value. An index whose evaluation changes `a`
+(a call that grows the table `a` views and stores the new view in `a`)
+is seen, and nothing reads the old storage; before 0.14, slicing and
+indexing a pointer read `a` before the bounds. With the assignment rule,
+`a[i] = e` and `a[i] += e` evaluate `e`, then `a`'s location, `i`, and
+then read `a`. A base that is not a place (`f()[i]`, `v.as_slice()[i]`)
+is a value, computed before the index; and in `a[i][j]` the location of
+`a[i]` is computed before `j`, and only the inner slice is read after
+it.
+
 **match** *(0.3)* evaluates the scrutinee once, then tries the arms in
 order: an arm is taken when its pattern matches and its guard (if any) is
 true; its bindings are copies, made before the guard. The arms (without
@@ -293,7 +308,9 @@ run time and in constant folding, which agree):
   reassociation or contraction (no fast-math); comparisons with NaN are
   false, except `!=`, which is true.
 - Evaluation order: operands left to right, the right-hand side of an
-  assignment before its place, each operand of `==` on aggregates once.
+  assignment before its place, the index of `a[i]` (the bounds of
+  `a[lo..hi]`) before what the place `a` holds is read (0.14), each
+  operand of `==` on aggregates once.
 - Indexing a slice or a fixed array, and slicing an array or a slice, is
   checked: a failure writes `index out of bounds: index I, length N` (or
   `slice range out of bounds: ...`) to stderr and exits with 101 (arrays
@@ -347,7 +364,15 @@ from `Vec::as_slice` until the vector grows or is freed (tachyon has no
 lifetimes; using a view after its storage is gone is the one way safe
 code can still reach undefined behaviour, and std's types assume their
 fields are changed by their methods only, as tachyon has no private
-fields yet).
+fields yet). A view need not have a name: a slice argument (or a
+receiver taken by value) is a copy made before the later arguments run
+(`take(v.as_slice(), grow(&v))`); the base of an index that is not a
+place, before its index (`v.as_slice()[grow(&v)]`); and `for x in v`,
+`v.iter()` and the iterators made from them view `v` for the whole loop,
+so growing `v` in it reads freed memory. A view stored in a place and
+taken again after each growth is read when it is used: `S[grow()]`, with
+`grow` pushing and then setting `S = V.as_slice()`, is defined (the
+indexing rule above).
 
 Reading memory nobody wrote (from `malloc`, or a struct's padding read as
 bytes, both through raw pointers) gives an unspecified value, which the

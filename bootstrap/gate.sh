@@ -37,6 +37,7 @@
 # fuzz-generics, fuzz-pressure, fuzz-calls, fuzz-lang06, fuzz-vector,
 # fuzz-div, fuzz-range, fuzz-seed (against the Rust seed); abi-plain,
 # abi-import, abi-header; objcheck; layout (tests/cimport/layout.sh); debug (tests/debug.sh);
+# stress-grow (the compiler with every table growth moving, 0.14);
 # linux-x86_64 (bootstrap/linux-check.sh); linux-aarch64
 # (bootstrap/aarch64-linux-check.sh); bench.
 #
@@ -95,7 +96,7 @@ while [ $# -gt 0 ]; do
         --seed) [ $# -ge 2 ] || die "--seed needs a binary"; SEED_BIN=$2; shift ;;
         --inside) INSIDE=1; LINUX=0 ;;
         --list) LIST=1 ;;
-        -h|--help) sed -n '2,49p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,50p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown option '$1' (see --help)" ;;
     esac
     shift
@@ -140,7 +141,7 @@ esac
 
 FUZZ_STEPS="fuzz-plain fuzz-loops fuzz-generics fuzz-pressure fuzz-calls fuzz-lang06 fuzz-vector fuzz-div fuzz-range fuzz-seed"
 ABI_STEPS="abi-plain abi-import abi-header"
-HOST_STEPS="suite-O0 suite-O1 suite-O2 $FUZZ_STEPS $ABI_STEPS objcheck layout debug"
+HOST_STEPS="suite-O0 suite-O1 suite-O2 $FUZZ_STEPS $ABI_STEPS objcheck layout debug stress-grow"
 LINUX_STEPS="linux-x86_64 linux-aarch64"
 case "$MODE" in
     quick) STEPS="suite-O2 $FUZZ_STEPS abi-plain" ;;
@@ -283,6 +284,22 @@ run_step() {
                 time.h fcntl.h unistd.h signal.h sys/stat.h sys/time.h sys/socket.h \
                 netinet/in.h dirent.h pthread.h) ;;
         debug) sh "$ROOT/tests/debug.sh" -c "$C" ;;
+        stress-grow)
+            # (0.14) The compiler with TACHYON_STRESS_GROW=1 (base::grow):
+            # every growth of its tables moves them and poisons the old
+            # block, so a read through a stale table pointer shows. Its
+            # self-compile gives the same object as without, and the suite
+            # passes at -O0 and -O2.
+            o="$RUN/stress-grow"
+            mkdir -p "$o"
+            "$C" "$ROOT/compiler/src/main.tach" -o "$o/plain.o" || return 1
+            TACHYON_STRESS_GROW=1 "$C" "$ROOT/compiler/src/main.tach" -o "$o/stress.o" || return 1
+            cmp -s "$o/plain.o" "$o/stress.o" \
+                || { echo "stress-grow: the self-compile differs: $o/plain.o $o/stress.o"; return 1; }
+            for level in 0 2; do
+                TACHYON_STRESS_GROW=1 sh "$ROOT/tests/run.sh" -c "$C" -O $level || return 1
+            done
+            echo "stress-grow: the self-compile is the same; the suite passes at -O0 and -O2" ;;
         linux-x86_64)
             command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 \
                 || { echo "docker is not running (start it, e.g. colima start; or --no-linux)"; return 1; }
@@ -435,7 +452,8 @@ note_of() {
     case "$1" in
         chain) awk '/^  head / { sub(/^  head +/, ""); print; exit }' "$l" ;;
         suite-*) awk '$1 == "total" { printf "%d passed, %d xfail, %d failed\n", $2, $3, $4 }' "$l" ;;
-        fuzz-*|abi-*|objcheck|layout|debug) grep -E '^(fuzz|abi|objcheck|layout|debug):' "$l" | tail -1 ;;
+        fuzz-*|abi-*|objcheck|layout|debug|stress-grow)
+            grep -E '^(fuzz|abi|objcheck|layout|debug|stress-grow):' "$l" | tail -1 ;;
         linux-*) grep '^gate-row' "$l" | awk -F'\t' '$3 != "pass" && $3 != "skip" { bad = bad " " $2 } END { n = NR; print n " steps in the container" (bad == "" ? "" : "; failed:" bad) }' ;;
         bench) grep '^geomean' "$l" | tail -1 ;;
     esac
