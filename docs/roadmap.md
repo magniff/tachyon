@@ -584,6 +584,33 @@ test suite from then on), done with 0.11's own refactoring commands and
 proven output-identical with `same-output`. Every place the tools fell
 short is recorded (tools/agent-feedback, the hook's log).
 
+Done (0.12.0). Phase 1 moved the modules into six folders by phase
+(`base`, `front`, `middle`, `back`, `gen0`, `tools`) in one `refactor
+--script`; phase 2, six agents in parallel worktrees, split the 25 files
+over 1,000 lines by concern (77 files before, 172 after; `lint
+--max-lines 1000` clean); the clean-up then added the tools the agents
+had asked for (`fix --only reexports` and `tidy-imports`, `split
+--reexport` and part headers, `MODULE::use` and `::header` as edit
+targets, the hook's fixes) and used them: every import names the module
+that defines what it imports (805 imports and paths rewritten, every
+re-export removed), the `use` lines tidied, 16 unused items deleted, a
+README per folder. `same-output` identical after every step, against
+the reorganization's base and against 0.11.0 (4,668 compilations); the
+fixpoint holds (built by 0.11.0, 418 tests). The tool use, phase by
+phase, is in agent-tool-usage.md, "0.12: the reorganization through the
+tools".
+
+0.12.0 release gate (2026-10-14): `bootstrap/gate.sh --release`, 11:54
+wall, every step passed: the chain (fixpoint, built by 0.11.0) and the
+suite at -O0/1/2 (418 tests) on aarch64-macos; fuzz 60 in each of the
+ten modes (the seed in one), ABI 100 in three modes, objcheck (904 of
+904), header layouts, the lldb check; x86_64-linux (its own chain, the
+suite at every level, fuzz 50 in ten modes, ABI 40 in three, objcheck,
+layouts); aarch64-linux (the cross-built fixpoint, the suite, fuzz 300
+in nine modes, ABI 150 in three, objcheck, layouts, gdb). Benchmarks and
+compile times in "Benchmarks", 0.12. Not run: the suite on x86_64-macos
+(Rosetta on the test machine).
+
 ## 0.13: the tools, improved from that record
 
 What 0.12's refactoring showed the tools lacked, fixed and measured
@@ -1003,3 +1030,58 @@ The 0.11 compiler, built by itself, compiles the same input at -O2 as
 fast as 0.10.0 (its new passes cost about what its better-optimized code
 saves) and 9% faster at -O0. `check` (the front end only) and a query
 answer in under 50 ms.
+
+### 0.12
+
+aarch64-macos (Apple silicon, native; `bench/run.sh -p <0.11.0> -r 9`,
+the fastest of 9 runs in ms, run after the gate on a machine with other
+work on it, load average about 5; "0.11.0" is the previous release at
+its default level; the last row is the geometric mean over cc -O2's,
+programs with a C version only):
+
+| program | 0.11.0 | 0.12 -O2 | cc -O2 |
+|---|---|---|---|
+| binarytrees | 174 | 179 | 172 |
+| collatz | 293 | 291 | 292 |
+| fannkuch | 116 | 116 | 139 |
+| fib | 14 | 14 | 14 |
+| interp | 42 | 44 | 40 |
+| json | 107 | 107 | 92 |
+| mandelbrot | 162 | 162 | 156 |
+| matmul | 18 | 18 | 43 |
+| nbody | 31 | 31 | 28 |
+| sieve | 62 | 63 | 71 |
+| sort | 63 | 63 | 58 |
+| stencil | 8 | 8 | 8 |
+| wordcount | 84 | 84 | 70 |
+| md5 | 35 | 36 | - |
+| geomean vs cc -O2 | 0.957 | 0.963 | 1 |
+
+(-O0 and -O1 in the same run: geomean 6.843 and 1.344.) The generated
+code is 0.11.0's byte for byte: `tachyonc same-output` against the
+0.11.0 compiler is identical over the whole corpus (4,668 compilations:
+tests/run, examples, bench and compiler/src, four targets, -O0 to -O2),
+so the differences above are this machine's spread (the gate's own
+`--only bench` run, with the containers just stopped, had binarytrees
+151 against 157 and mandelbrot 181 against 165, each way).
+
+Compile time (aarch64-macos, wall time, best of 7, the two compilers
+alternating on the same input: the 0.12 source, 77,400 lines in 172
+files):
+
+| | 0.11.0 | 0.12 |
+|---|---|---|
+| the compiler to an object, -O0 | 163 ms | 165 ms |
+| the compiler to an object, -O2 | 1316 ms | 1315 ms |
+| to an executable (`cc` links), -O0 | 194 ms | 195 ms |
+| to an executable (`cc` links), -O2 | 1347 ms | 1350 ms |
+| `tachyonc check compiler/src/main.tach` | 60 ms | 60 ms |
+| `tachyonc query refs run_gvn` | 65 ms | 66 ms |
+
+The same within noise, as expected of a reorganization that changes no
+output (the 0.11 numbers above were on the 0.11 source, 71,900 lines; the
+split into 172 files costs nothing measurable).
+
+The gate (`bootstrap/gate.sh --release`, every step at once on
+aarch64-macos and in the two Linux containers): 11:54 wall, every step
+passed.

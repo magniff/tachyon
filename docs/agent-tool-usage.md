@@ -324,3 +324,67 @@ tools is the headline number. New files, test fixtures, docs, scratch
 programs (target/, /tmp), dry runs and blocked rewrites are listed apart
 and not counted. Logs from before 0.12 have no tool runs and no
 existence for Write, so the number is meaningful from 0.12 on.
+
+## 0.12: the reorganization through the tools
+
+The 0.12 reorganization of `compiler/src` (2026-10-14, 15:37 to 17:00)
+was made with the tools, in three steps: phase 1, one agent moving the
+modules into six folders by phase; phase 2, six agents in parallel
+worktrees, each splitting one area's files over 1,000 lines; then the
+clean-up (the tools the agents asked for, then the source tidied with
+them). Sources: the agents' reports, and the hook's log for each window
+(`tools/agent-tool-usage.py --hook-log`, the log cut by time).
+
+**Edits to existing compiler source, through `tachyonc`:**
+
+| step | agent | tool share | how |
+|---|---|---|---|
+| phase 1 | the folders | 100% (11 edits) | one `refactor --script` of `move-module`s, then `edit` and `fix` |
+| phase 2 | front-syntax (parser, cpp, cimport) | 100% | `refactor split`, `edit patch` |
+| phase 2 | middle (ir, lower, range, vectorize) | ~100% | `refactor split`, `edit patch` |
+| phase 2 | objects, gen0, base | ~100% | `refactor split`, `edit patch` |
+| phase 2 | back-codegen (emit, isel, regalloc, mc_*) | 97% | `refactor split`, `edit patch`; the rest Edit |
+| phase 2 | tools (query, edit, patch, rewrite, plan, refactor_shape) | 94% | `refactor split`, `edit patch`; the rest Edit |
+| phase 2 | front-check (check, patterns, generics, modules) | 15% | its parts' header comments and moved banners, edited with the Edit tool: no tool reached a module's header or `use` lines |
+| clean-up | the tools, then the source | 96% (22 of 23) | `fix --only reexports` (805 imports and paths, 291 re-exports, one edit), `fix --only tidy-imports` (126 `use` items), `fix --only unused`, the unused items deleted in one script, comments with `edit patch FILE`; the one shell edit, a Python rewrite of a new file before its `mod` line existed |
+
+Over phase 2 the log has 103 tool edits and 34 Edit-tool edits (most of
+them front-check's), and 186 queries (`text` 84, `show` 38, `deps` 16,
+`items` 14, `refs` 10, `stats` 7). Its "shell rewrites" (3 in phase 1, 3
+in phase 2) were none of them compiler source: `sed -i` on
+`compiler/std/embed.sh`, test scripts and scratch files under target/ or
+/tmp, and a feedback message quoting `sed -i`; the hook of 0.12 no longer
+counts them. Its records then had one agent id for all six agents, so
+the per-agent shares are the agents' own counts.
+
+**The recurring shortfalls** (42 feedback entries in phases 1 and 2), and
+what 0.12 fixed:
+
+| shortfall | entries | 0.12 |
+|---|---|---|
+| `split` rewrote every importer outside the module (so parallel splits touched each other's files), and the hand-written `pub use` then clashed with the imports `split` had added | 8 | `split --reexport`; `fix --only reexports` removes such re-exports later |
+| a module's `use` lines and header comment out of the tools' reach: `edit patch MODULE::use`, `edit replace`, `FILE:LINE` on a `use` line, the root's `main::header`; a new part with no header | 13 | `MODULE::use`, `MODULE::header` (and `main::`) as targets of `edit patch`, `replace`, `insert`, `delete`; `split --header`, or the part's banner |
+| imports left untidy by `move`, `split` and `fix`: new lines not merged, names unsorted, lists not rewrapped, ragged lines | 6 | `fix --only tidy-imports`; `move` and `split` tidy what they edit |
+| the layout of moved code: adjacent constants and statics double-spaced, banners following the last items of their group or left over unrelated ones | 6 | adjacent items stay together; a banner goes where most of its group goes |
+| the hook and its report: writes judged by every path a command names (a doc, a scratch helper, a quoted `sed`), one agent id for all; `tools/agent-feedback` refused in worktrees (it ran git) | 6 | judged by the files written; agent id and worktree logged; no git run |
+| `edit patch` with multi-line OLD: its lines must be whole lines | 3 | (0.13) |
+| `fix --only unused` and `query unused` counted the root's imports that others import through as unused | 1 | fixed |
+| no query lists a module's banners; `mod` and `use` lines inserted between a comment and its item; an extern block's moved functions in a new block at the end | 3 | (0.13) |
+
+Found in the clean-up itself: `edit patch` removing whole lines between
+two blank lines left both (fixed: one goes with them); `fix --in MODULE`
+reaches the module's children for unused imports but not for missing
+ones (0.13).
+
+**The remaining gaps, for 0.13:**
+
+1. `edit patch` whole-line rules: a multi-line OLD whose last line is a
+   prefix, matched or said plainly; `FILE:LINE` on a line outside any
+   item (a `use`, a comment) taken as that file's region.
+2. Comments as first-class: section banners listed by `query` (`query
+   items --banners`), moved and edited by name; the comment above an item
+   kept with it when imports or `mod` lines are added.
+3. `--in` meaning the same subtree for every fix; `split --plan`'s part
+   names from the banners.
+4. Per-agent numbers from the log itself (0.12's hook logs the agent id
+   and worktree; the report prints a table per agent).

@@ -127,7 +127,8 @@ edited program, before the check.
 New `use` lines go after the module's last `use` (else before its first
 item), one per module path, its names sorted, wrapped at 100 columns.
 Nothing outside the edited ranges changes, byte for byte, but the `use`
-lines of the files edited, tidied (below).
+lines of the files edited, tidied (above). A `mod` line and imports added
+at one place: the `mod` line first (0.12).
 
 Refused, nothing written: a name the item would take that is taken
 there (`refactor.collision`), a method or a field (`refactor.not-movable`),

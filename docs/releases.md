@@ -42,8 +42,40 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.9.0 | `v0.9.0` | 0.8.0 | aarch64-macos, x86_64-linux, x86_64-macos | `unsafe`, traits and an e-graph: `unsafe` blocks and functions (safe code has no undefined behaviour; a warning in 0.9, an error from 0.10), `--fix-unsafe`; traits, bounds, operator traits, std `HashMap` and `sort`; array constants, line continuations; GVN on an acyclic e-graph with rewrite rules checked by `--check-rules` |
 | 0.10.0 | `v0.10.0` | 0.9.0 | aarch64-macos, x86_64-linux, x86_64-macos | vectors and profiles: an unsafe operation outside `unsafe` is an error; vector types (`v4f32`, `v2f64`, ...) on NEON and SSE2; a loop vectorizer; profile-guided optimization; `--check-unsafe`; every error of a compilation reported |
 | 0.11.0 | `v0.11.0` | 0.10.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | feature-complete, and tools for agents: DWARF line tables (`-g`); aarch64-linux as a target and a host; a broader `bench/`, a cost model for the loop vectorizer, unrolling with run-time trip counts, an SLP vectorizer, division by constants, value ranges through phis; `tachyonc query`, `check`, `fix`, `lint`, `same-output`, `edit` by name and semantic refactorings (`refactor rename`, `move`, `signature`, `field`, `variant`, `split`, `rewrite`, scripts, `undo`) |
+| 0.12.0 | `v0.12.0` | 0.11.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | the compiler's source reorganized through its own tools: folders by phase, no file over 1,000 lines, no re-exports, tidy imports, output identical to 0.11's; `edit patch`, `edit insert --in`, `query text`, a module's `use` lines and header as targets, `fix --only reexports` and `tidy-imports`, `split --reexport`; the release gate in one command (`bootstrap/gate.sh`) |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.12
+
+- **The compiler's source, reorganized** (compiler/README.md): six
+  folders by phase (`base`, `front`, `middle`, `back`, `gen0`, `tools`),
+  each with a README; the 25 files over 1,000 lines split by concern
+  into folders of their own (77 files before, 172 now, none over 1,000
+  lines: `tachyonc lint --max-lines 1000`); every import names the module that
+  defines what it imports (no re-exports), the `use` lines merged,
+  sorted and wrapped. Done with the compiler's own tools, almost every
+  edit through them (docs/agent-tool-usage.md, 0.12), and proven to
+  change nothing: `same-output` identical over 4,668 compilations, the
+  0.12.0 compiler emits what 0.11.0 does.
+- **Tools** (docs/refactor.md, docs/refactor-modules.md, docs/query.md):
+  `edit patch TARGET --old --new` and `edit insert --in` (edits inside an
+  item, by its text, checked and undoable), `--show`, `query diff`,
+  `query text FILE:A-B`, `query show FILE` and a module's regions;
+  `MODULE::use` and `MODULE::header` as targets of `edit patch`,
+  `replace`, `insert`, `delete`; `fix --only tidy-imports` and `fix
+  --only reexports` (`// api:` keeps a re-export); `refactor split
+  --reexport` and `--header`, parts headed by their banner, runs of items
+  kept together, banners moving with most of their group; `move` and
+  `split` leave tidy imports. The agent hook judges writes by the files
+  written, logs which agent made each record, and with
+  `tools/agent-feedback` finds the log without running git.
+- **The gate in one command**: `bootstrap/gate.sh --release` runs the
+  chain, the suite at every level, the fuzzers and the Linux containers
+  at once and prints one table; `bootstrap.sh --history fast` checks the
+  older releases' fixpoints without their suites;
+  `tests/fuzz/forever.sh` fuzzes between releases.
+- **Breaking**: nothing in the language or the command line.
 
 ### What's new in 0.11
 
