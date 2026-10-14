@@ -1,0 +1,257 @@
+// The ELF writer (Linux): the header, the present sections, a .rela
+// section per section with relocations, .symtab, .strtab and .shstrtab.
+
+use crate::back::objfile::{
+    ASYMS, ASYM_COUNT, FRAGS, RELOCS, RELOC_COUNT, SEC_ALIGN, SEC_BUF, SEC_CONST, SEC_DATA,
+    SEC_DEBUG_ABBREV, SEC_DEBUG_INFO, SEC_DEBUG_LINE, SEC_NOTE, SEC_TEXT, SEC_USED, align_up,
+    is_debug, is_temp, pad_to, sym_addr, w16, w32, w64, w8,
+};
+use crate::back::objfile::assemble::{MAPS, MAP_CODE};
+use crate::base::{BUFS, SYMS, buf_bytes, buf_new, buf_slice, buf_str, buf_write_file, memcpy};
+use crate::base::target::X86;
+
+// A section's ELF name.
+fn elf_name(sec: i64) -> *u8 {
+    if sec == SEC_TEXT { c".text" } else if sec == SEC_CONST { c".rodata" } else if sec == SEC_DATA { c".data" }
+    else if sec == SEC_NOTE { c".note.GNU-stack" } else if sec == SEC_DEBUG_ABBREV { c".debug_abbrev" }
+    else if sec == SEC_DEBUG_INFO { c".debug_info" } else { c".debug_line" }
+}
+
+pub fn elf_write(path: *u8) {
+    unsafe {
+        // Sections: 0 null, .text, .rodata, .data, .note.GNU-stack, the debug
+        // sections when used, then a .rela section per section with
+        // relocations, .symtab, .strtab, .shstrtab.
+        let mut shndx: [i64; 8] = [0; 8];
+        let mut present: [i64; 8] = [0; 8];
+        let mut npresent = 0;
+        let elf_order: [i64; 7] = [SEC_TEXT, SEC_CONST, SEC_DATA, SEC_NOTE, SEC_DEBUG_ABBREV, SEC_DEBUG_INFO, SEC_DEBUG_LINE];
+        for k in 0..7 {
+            let sec = elf_order[k];
+            if !is_debug(sec) || SEC_USED[sec] || BUFS[SEC_BUF[sec]].len > 0 {
+                present[npresent] = sec;
+                npresent += 1;
+                shndx[sec] = npresent;
+            }
+        }
+        let mut rel_n: [i64; 8] = [0; 8];
+        for r in 0..RELOC_COUNT {
+            rel_n[RELOCS[r].sec] += 1;
+        }
+        let mut rela_index: [i64; 8] = [0; 8];
+        let mut nsh = 1 + npresent;
+        for k in 0..npresent {
+            let sec = present[k];
+            if rel_n[sec] > 0 {
+                rela_index[sec] = nsh;
+                nsh += 1;
+            }
+        }
+        let symtab_index = nsh;
+        let strtab_index = nsh + 1;
+        let shstrtab_index = nsh + 2;
+        nsh += 3;
+        // Symbols: null, the sections, mapping symbols, local labels, then
+        // globals.
+        let strs = buf_new();
+        w8(strs, 0);
+        let syms = buf_new();
+        for i in 0..24 {
+            w8(syms, 0);
+        }
+        for k in 0..npresent {
+            w32(syms, 0);
+            w8(syms, 3);
+            w8(syms, 0);
+            w16(syms, shndx[present[k]]);
+            w64(syms, 0);
+            w64(syms, 0);
+            SECSYM[present[k]] = 1 + k;
+        }
+        let mut count = 1 + npresent;
+        // Mapping symbols ($x, $d), local.
+        let mut map_name: [i64; 3] = [0, 0, 0];
+        let mut m = 0;
+        while m < MAPS.count {
+            let kind = MAPS.data[m + 3];
+            if map_name[kind] == 0 {
+                map_name[kind] = BUFS[strs].len;
+                buf_str(strs, if kind == MAP_CODE { c"$x" } else { c"$d" });
+                w8(strs, 0);
+            }
+            let f = MAPS.data[m + 1];
+            w32(syms, map_name[kind]);
+            w8(syms, 0);
+            w8(syms, 0);
+            w16(syms, shndx[MAPS.data[m]]);
+            w64(syms, FRAGS[f].addr + MAPS.data[m + 2]);
+            w64(syms, 0);
+            count += 1;
+            m += 4;
+        }
+        let mut first_global = count;
+        for pass in 0..2 {
+            if pass == 1 {
+                first_global = count;
+            }
+            for s in 0..ASYM_COUNT {
+                let def = ASYMS[s].defined;
+                let local = def && !ASYMS[s].global && !is_temp(s);
+                let global = ASYMS[s].global || (!def && ASYMS[s].in_table);
+                if (pass == 0 && local) || (pass == 1 && global) {
+                    ASYMS[s].index = count;
+                    count += 1;
+                    w32(syms, BUFS[strs].len);
+                    buf_bytes(strs, SYMS[ASYMS[s].name].text);
+                    w8(strs, 0);
+                    w8(syms, if pass == 0 { 0 } else { 0x10 });
+                    w8(syms, 0);
+                    w16(syms, if def { shndx[ASYMS[s].sec] } else { 0 });
+                    w64(syms, if def { sym_addr(s) } else { 0 });
+                    w64(syms, 0);
+                }
+            }
+        }
+        let shstr = buf_new();
+        w8(shstr, 0);
+        let mut name_off: [i64; 20] = [0; 20];
+        for k in 0..npresent {
+            name_off[1 + k] = BUFS[shstr].len;
+            buf_str(shstr, elf_name(present[k]));
+            w8(shstr, 0);
+        }
+        for k in 0..npresent {
+            let sec = present[k];
+            if rel_n[sec] > 0 {
+                name_off[rela_index[sec]] = BUFS[shstr].len;
+                buf_str(shstr, c".rela");
+                buf_str(shstr, elf_name(sec));
+                w8(shstr, 0);
+            }
+        }
+        name_off[symtab_index] = BUFS[shstr].len;
+        buf_str(shstr, c".symtab");
+        w8(shstr, 0);
+        name_off[strtab_index] = BUFS[shstr].len;
+        buf_str(shstr, c".strtab");
+        w8(shstr, 0);
+        name_off[shstrtab_index] = BUFS[shstr].len;
+        buf_str(shstr, c".shstrtab");
+        w8(shstr, 0);
+        // File: header, contents, relocations, tables, section headers.
+        let out = buf_new();
+        for i in 0..64 {
+            w8(out, 0);
+        }
+        let mut sec_off: [i64; 20] = [0; 20];
+        let mut sec_size: [i64; 20] = [0; 20];
+        for k in 0..npresent {
+            let sec = present[k];
+            pad_to(out, align_up(BUFS[out].len, 1 << SEC_ALIGN[sec]));
+            sec_off[shndx[sec]] = BUFS[out].len;
+            sec_size[shndx[sec]] = BUFS[SEC_BUF[sec]].len;
+            buf_bytes(out, buf_slice(SEC_BUF[sec]));
+        }
+        for k in 0..npresent {
+            let sec = present[k];
+            if rel_n[sec] > 0 {
+                pad_to(out, align_up(BUFS[out].len, 8));
+                sec_off[rela_index[sec]] = BUFS[out].len;
+                sec_size[rela_index[sec]] = 24 * rel_n[sec];
+                for r in 0..RELOC_COUNT {
+                    if RELOCS[r].sec == sec {
+                        let rl = RELOCS[r];
+                        let sym = if rl.sym < 0 { SECSYM[-1 - rl.sym] } else { ASYMS[rl.sym].index };
+                        w64(out, rl.offset);
+                        w64(out, sym << 32 | rl.rtype);
+                        w64(out, rl.addend);
+                    }
+                }
+            }
+        }
+        pad_to(out, align_up(BUFS[out].len, 8));
+        sec_off[symtab_index] = BUFS[out].len;
+        sec_size[symtab_index] = BUFS[syms].len;
+        buf_bytes(out, buf_slice(syms));
+        sec_off[strtab_index] = BUFS[out].len;
+        sec_size[strtab_index] = BUFS[strs].len;
+        buf_bytes(out, buf_slice(strs));
+        sec_off[shstrtab_index] = BUFS[out].len;
+        sec_size[shstrtab_index] = BUFS[shstr].len;
+        buf_bytes(out, buf_slice(shstr));
+        pad_to(out, align_up(BUFS[out].len, 8));
+        let sh_off = BUFS[out].len;
+        for i in 0..64 {
+            w8(out, 0);
+        }
+        for k in 0..npresent {
+            let sec = present[k];
+            let i = shndx[sec];
+            w32(out, name_off[i]);
+            w32(out, 1);
+            w64(out, if sec == SEC_TEXT { 6 } else if sec == SEC_DATA { 3 } else if sec == SEC_CONST { 2 } else { 0 });
+            w64(out, 0);
+            w64(out, sec_off[i]);
+            w64(out, sec_size[i]);
+            w32(out, 0);
+            w32(out, 0);
+            w64(out, 1 << SEC_ALIGN[sec]);
+            w64(out, 0);
+        }
+        for k in 0..npresent {
+            let sec = present[k];
+            if rel_n[sec] > 0 {
+                let i = rela_index[sec];
+                w32(out, name_off[i]);
+                w32(out, 4);
+                w64(out, 0x40);
+                w64(out, 0);
+                w64(out, sec_off[i]);
+                w64(out, sec_size[i]);
+                w32(out, symtab_index);
+                w32(out, shndx[sec]);
+                w64(out, 8);
+                w64(out, 24);
+            }
+        }
+        let tables: [i64; 3] = [symtab_index, strtab_index, shstrtab_index];
+        for k in 0..3 {
+            let i = tables[k];
+            w32(out, name_off[i]);
+            w32(out, if k == 0 { 2 } else { 3 });
+            w64(out, 0);
+            w64(out, 0);
+            w64(out, sec_off[i]);
+            w64(out, sec_size[i]);
+            w32(out, if k == 0 { strtab_index } else { 0 });
+            w32(out, if k == 0 { first_global } else { 0 });
+            w64(out, if k == 0 { 8 } else { 1 });
+            w64(out, if k == 0 { 24 } else { 0 });
+        }
+        // The header.
+        let h = BUFS[out].data;
+        let ident: [i64; 8] = [0x7f, 'E' as i64, 'L' as i64, 'F' as i64, 2, 1, 1, 0];
+        for i in 0..8 {
+            h[i] = ident[i] as u8;
+        }
+        let hdr = buf_new();
+        w16(hdr, 1);
+        w16(hdr, if X86 { 62 } else { 183 });
+        w32(hdr, 1);
+        w64(hdr, 0);
+        w64(hdr, 0);
+        w64(hdr, sh_off);
+        w32(hdr, 0);
+        w16(hdr, 64);
+        w16(hdr, 0);
+        w16(hdr, 0);
+        w16(hdr, 64);
+        w16(hdr, nsh);
+        w16(hdr, shstrtab_index);
+        memcpy(&h[16], BUFS[hdr].data, 48);
+        buf_write_file(out, path);
+    }
+}
+
+// The ELF symbol index of each section's symbol.
+static mut SECSYM: [i64; 8] = [0; 8];
