@@ -1,0 +1,311 @@
+// The code inside a function's body, as checked, for the refactorings
+// that move it (0.13: extract-function, inline): the children and the
+// parent of each node, its locals and where they are declared, the
+// written type of a local, how a use of a local uses it, and the lines of
+// a text re-indented.
+
+use crate::base::{IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_new, buf_slice};
+use crate::front::ast::{BLOCK_UNSAFE, FN_UNSAFE, NODES, NODE_COUNT, NodeKind, child};
+use crate::front::check::{LOCALS, Res};
+use crate::front::lexer::Tok;
+use crate::front::types::{TYPES, TyKind, buf_type, is_pointer};
+use crate::middle::lower::ssa::HMap;
+
+// The parent of each node of the body being looked at (node + 1 ->
+// parent + 1), and the declaration of each local there (local + 1 ->
+// PatBind or Param node + 1).
+static mut PARENT: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+static mut DECL: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+// How a use of a local uses it (use_kind).
+pub const USE_VALUE: i64 = 0;
+pub const USE_ASSIGN: i64 = 1;
+pub const USE_ADDR: i64 = 2;
+pub const USE_AUTOREF: i64 = 3;
+pub const USE_FIELD_WRITE: i64 = 4;
+pub const USE_FIELD_READ: i64 = 5;
+
+// The node children of checked node n (its expressions, statements,
+// patterns; not its types and names), into out.
+pub fn kids(n: i64, out: *IntVec) {
+    unsafe {
+        let k = NODES[n].kind;
+        let a = NODES[n].a;
+        let b = NODES[n].b;
+        let c = NODES[n].c;
+        let d = NODES[n].d;
+        if k == NodeKind::Binary || k == NodeKind::Assign {
+            push2(out, b, c);
+        } else if k == NodeKind::Unary {
+            push2(out, b, 0);
+        } else if k == NodeKind::Cast || k == NodeKind::FieldAccess || k == NodeKind::TupleField || k == NodeKind::Return
+            || k == NodeKind::ExprStmt || k == NodeKind::Defer || k == NodeKind::EnumPanic {
+            push2(out, a, 0);
+        } else if k == NodeKind::Index || k == NodeKind::Repeat || k == NodeKind::Range || k == NodeKind::If {
+            push2(out, a, b);
+            if k == NodeKind::If {
+                push2(out, c, 0);
+            }
+        } else if k == NodeKind::Loop || k == NodeKind::Break || k == NodeKind::FieldInit {
+            push2(out, b, 0);
+        } else if k == NodeKind::While {
+            push2(out, b, c);
+        } else if k == NodeKind::For {
+            push2(out, b, c);
+            push2(out, d, 0);
+        } else if k == NodeKind::Let {
+            push2(out, a, c);
+        } else if k == NodeKind::Arm {
+            push2(out, a, b);
+            push2(out, c, 0);
+        } else if k == NodeKind::PatTuple || k == NodeKind::PatVariant || k == NodeKind::PatOr {
+            list(n, out);
+        } else if k == NodeKind::Call || k == NodeKind::MethodCall || k == NodeKind::Match || k == NodeKind::VecOp {
+            push2(out, a, 0);
+            list(n, out);
+        } else if k == NodeKind::Block {
+            list(n, out);
+            push2(out, a, 0);
+        } else if k == NodeKind::Tuple || k == NodeKind::Array || k == NodeKind::StructLit || k == NodeKind::VariantLit {
+            list(n, out);
+        }
+    }
+}
+
+fn push2(out: *IntVec, x: i64, y: i64) {
+    if x > 0 {
+        out.push(x);
+    }
+    if y > 0 {
+        out.push(y);
+    }
+}
+
+fn list(n: i64, out: *IntVec) {
+    unsafe {
+        for i in 0..NODES[n].count {
+            push2(out, child(n, i), 0);
+        }
+    }
+}
+
+// Walks the body of function node f: the parents of its nodes, the
+// declarations of its locals (its parameters' too).
+pub fn load_body(f: i64) {
+    unsafe {
+        PARENT = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        DECL = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        for i in 0..NODES[f].count {
+            let p = child(f, i);
+            if NODES[p].kind == NodeKind::Param {
+                DECL.put(NODES[p].x + 1, p + 1);
+            }
+        }
+        let mut todo = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        if NODES[f].c > 0 {
+            todo.push(NODES[f].c);
+        }
+        while todo.count > 0 {
+            let n = todo.pop();
+            if NODES[n].kind == NodeKind::PatBind {
+                DECL.put(NODES[n].x + 1, n + 1);
+            }
+            let mut ks = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            kids(n, &ks);
+            for i in 0..ks.count {
+                let c = ks.data[i];
+                if c > 0 && c < NODE_COUNT && PARENT.get(c + 1) == 0 {
+                    PARENT.put(c + 1, n + 1);
+                    todo.push(c);
+                }
+            }
+        }
+    }
+}
+
+pub fn parent(n: i64) -> i64 {
+    unsafe { PARENT.get(n + 1) - 1 }
+}
+
+// The PatBind or Param node declaring local l, -1.
+pub fn decl_of(l: i64) -> i64 {
+    unsafe { DECL.get(l + 1) - 1 }
+}
+
+// Whether node n is in the body loaded (or is it).
+pub fn in_body(n: i64) -> bool {
+    unsafe { PARENT.get(n + 1) != 0 }
+}
+
+// The local Ident node n names, or -1.
+pub fn local_of(n: i64) -> i64 {
+    unsafe {
+        if NODES[n].kind == NodeKind::Ident && NODES[n].res == Res::Local && NODES[n].y >= 0 {
+            NODES[n].y
+        } else {
+            -1
+        }
+    }
+}
+
+// How use n of a local (an Ident) uses it: assigned (`x = `, `x += `),
+// its address taken (`&x`; the receiver of a method taking `self: *T`),
+// a field or element of it written or its address taken (`x.f = `, `&x.f`,
+// `x.a[i] = `), read (`x.f`), or its value.
+pub fn use_kind(n: i64) -> i64 {
+    unsafe {
+        let p = parent(n);
+        if p < 0 {
+            return USE_VALUE;
+        }
+        let k = NODES[p].kind;
+        if k == NodeKind::Unary && NODES[p].op == Tok::Amp {
+            return if NODES[p].start < NODES[n].start { USE_ADDR } else { USE_AUTOREF };
+        }
+        if k == NodeKind::Assign && NODES[p].b == n {
+            return USE_ASSIGN;
+        }
+        if is_pointer(NODES[n].ty) {
+            return USE_VALUE;
+        }
+        let mut q = n;
+        let mut up = p;
+        while up >= 0 && (NODES[up].kind == NodeKind::FieldAccess || NODES[up].kind == NodeKind::TupleField
+            || NODES[up].kind == NodeKind::Index) && NODES[up].a == q {
+            // (through a pointer: written there, not here)
+            if is_pointer(NODES[q].ty) || (NODES[up].kind == NodeKind::Index && !is_array(NODES[q].ty)) {
+                return if q == n { USE_VALUE } else { USE_FIELD_READ };
+            }
+            q = up;
+            up = parent(up);
+        }
+        if q == n {
+            return USE_VALUE;
+        }
+        if up >= 0 && ((NODES[up].kind == NodeKind::Assign && NODES[up].b == q)
+            || (NODES[up].kind == NodeKind::Unary && NODES[up].op == Tok::Amp)) {
+            return USE_FIELD_WRITE;
+        }
+        USE_FIELD_READ
+    }
+}
+
+fn is_array(t: i64) -> bool {
+    unsafe { TYPES[t].kind == TyKind::Array }
+}
+
+// Whether node n is inside unsafe code of function f: an `unsafe { }`
+// block around it, or f an `unsafe fn`.
+pub fn in_unsafe(f: i64, n: i64) -> bool {
+    unsafe {
+        if (NODES[f].p & FN_UNSAFE) != 0 {
+            return true;
+        }
+        let mut q = parent(n);
+        while q >= 0 {
+            if NODES[q].kind == NodeKind::Block && (NODES[q].p & BLOCK_UNSAFE) != 0 {
+                return true;
+            }
+            q = parent(q);
+        }
+        false
+    }
+}
+
+// The type of local l as written where it is declared (a parameter's, a
+// `let x: T`), else as the checker has it; into out.
+pub fn put_local_type(out: i64, l: i64) {
+    unsafe {
+        let dn = decl_of(l);
+        if dn >= 0 {
+            let mut t = 0;
+            if NODES[dn].kind == NodeKind::Param {
+                t = NODES[dn].b;
+            } else {
+                let p = parent(dn);
+                if p >= 0 && NODES[p].kind == NodeKind::Let && NODES[p].a == dn {
+                    t = NODES[p].b;
+                }
+            }
+            if t > 0 && NODES[t].end > NODES[t].start {
+                buf_bytes(out, SRC[NODES[t].start..NODES[t].end]);
+                return;
+            }
+        }
+        buf_type(out, LOCALS[l].ty);
+    }
+}
+
+// Whether local l was declared `mut`.
+pub fn local_mut(l: i64) -> bool {
+    unsafe { LOCALS[l].mutable }
+}
+
+pub fn local_name(l: i64) -> [u8] {
+    unsafe { SYMS[LOCALS[l].name].text }
+}
+
+// The lines of text s, their least indentation (of the lines not blank)
+// replaced by `indent`; blank lines empty. Into out.
+pub fn reindent(out: i64, s: [u8], indent: [u8]) {
+    let mut least = -1;
+    let mut i = 0;
+    while i < s.len {
+        let mut e = i;
+        while e < s.len && s[e] != '\n' {
+            e += 1;
+        }
+        let mut a = i;
+        while a < e && (s[a] == ' ' || s[a] == '\t') {
+            a += 1;
+        }
+        if a < e && (least < 0 || a - i < least) {
+            least = a - i;
+        }
+        i = e + 1;
+    }
+    i = 0;
+    while i < s.len {
+        let mut e = i;
+        while e < s.len && s[e] != '\n' {
+            e += 1;
+        }
+        let mut a = i;
+        while a < e && (s[a] == ' ' || s[a] == '\t') {
+            a += 1;
+        }
+        if a < e {
+            buf_bytes(out, indent);
+            buf_bytes(out, s[i + least..e]);
+        }
+        buf_byte(out, '\n');
+        i = e + 1;
+    }
+}
+
+// The text of SRC[a..b) with the replacements (starts, ends, texts:
+// buffers) inside it, as a buffer.
+pub fn text_with(a: i64, b: i64, starts: *IntVec, ends: *IntVec, texts: *IntVec) -> i64 {
+    unsafe {
+        let out = buf_new();
+        let mut cur = a;
+        loop {
+            // (the next replacement from cur)
+            let mut next = -1;
+            for i in 0..(*starts).count {
+                let s = (*starts).data[i];
+                if s >= cur && s < b && (next < 0 || s < (*starts).data[next]) {
+                    next = i;
+                }
+            }
+            if next < 0 {
+                break;
+            }
+            buf_bytes(out, SRC[cur..(*starts).data[next]]);
+            buf_bytes(out, buf_slice((*texts).data[next]));
+            cur = (*ends).data[next];
+        }
+        buf_bytes(out, SRC[cur..b]);
+        out
+    }
+}
