@@ -12,7 +12,8 @@
 #                  the release tags exist
 #   --seed-tests   also run the seed's own test suite (cargo test)
 #   --all-levels   also run the final compiler's test suite at -O0, -O1, -O2
-#   --fuzz=N       also run N random programs (tests/fuzz/run.sh)
+#   --fuzz=N       also run N random programs (tests/fuzz/run.sh), and N
+#                  of divisions by constants (-D)
 #   --abi=N        also run N C interoperability programs (tests/abi/run.sh),
 #                  plain, through import and through --emit-header, and
 #                  check the layout of imported system headers
@@ -126,6 +127,8 @@ tar -C "$SNAP" -c -f - src | docker run --rm -i --cpus 4 --platform "$PLATFORM" 
     if [ "$FUZZ" != 0 ]; then
         echo "==> $FUZZ random programs" >&2
         tests/fuzz/run.sh -n "$FUZZ" -k /tmp/fuzz-failures | tail -5
+        echo "==> $FUZZ random programs of divisions by constants" >&2
+        tests/fuzz/run.sh -D -n "$FUZZ" -k /tmp/fuzz-failures | tail -5
     fi
     if [ "$OBJCHECK" = 1 ]; then
         echo "==> objects against cc -c" >&2

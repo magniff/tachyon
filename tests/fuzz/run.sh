@@ -5,6 +5,7 @@
 #
 # usage: tests/fuzz/run.sh [-c COMPILER] [-s SEED] [-t TARGET] [-n COUNT]
 #                          [-f FIRST] [-k DIR] [-j JOBS] [-l] [-g] [-p] [-C] [-N]
+#                          [-V] [-D] [-R]
 #
 #   -c COMPILER   the tachyonc to test (default: target/tachyonc)
 #   -s SEED       also compare with the seed binary (divisors are then
@@ -20,6 +21,12 @@
 #   -C            the calls mode of gen.awk (aggregates passed and returned)
 #   -N            the 0.6 language mode of gen.awk (defer, if let, ==, strings)
 #   -V            vectorizable loops and vector code, from genvec.awk (0.10)
+#   -D            divisions by constants of every type, from gendiv.awk
+#                 (0.11), each also checked against a division by an
+#                 unknown divisor (a FAIL line is a failure; not run by
+#                 the seed, which traps on 0)
+#   -R            loops indexing arrays of fixed sizes with steps of any
+#                 kind, from genrange.awk (0.11: ranges through phis)
 #   -j JOBS       programs tested at once (default: the number of CPUs)
 
 set -u
@@ -48,8 +55,10 @@ while [ $# -gt 0 ]; do
         -C) CALLS=1; shift ;;
         -N) LANG06=1; shift ;;
         -V) VECTOR=1; shift ;;
+        -D) DIVIDE=1; shift ;;
+        -R) RANGES=1; shift ;;
         -j) JOBS=$2; shift 2 ;;
-        *) sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+        *) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
     esac
 done
 if [ -z "$TARGET" ]; then
@@ -84,6 +93,10 @@ test_seed() {
     program="$WORK/p$seed.tach"
     if [ "${VECTOR:-0}" = 1 ]; then
         awk -v seed="$seed" -f "$ROOT/tests/fuzz/genvec.awk" >"$program"
+    elif [ "${RANGES:-0}" = 1 ]; then
+        awk -v seed="$seed" -f "$ROOT/tests/fuzz/genrange.awk" >"$program"
+    elif [ "${DIVIDE:-0}" = 1 ]; then
+        awk -v seed="$seed" -v iterations=500 -f "$ROOT/tests/fuzz/gendiv.awk" >"$program"
     else
         awk -v seed="$seed" -v nonzero="$NONZERO" -v loops="${LOOPS:-0}" -v generics="${GENERICS:-0}" -v pressure="${PRESSURE:-0}" -v calls="${CALLS:-0}" -v lang06="${LANG06:-0}" -f "$ROOT/tests/fuzz/gen.awk" >"$program"
     fi
@@ -92,7 +105,7 @@ test_seed() {
     for level in O0 O1 O2 seed; do
         exe="$WORK/p$seed.$level"
         if [ "$level" = seed ]; then
-            [ -n "$SEED" ] || continue
+            [ -n "$SEED" ] && [ "${DIVIDE:-0}" = 0 ] || continue
             awk -f "$ROOT/tests/seed-compat.awk" "$program" >"$exe.tach"
             "$SEED" build --target "$SEED_TARGET" "$exe.tach" -o "$exe" >"$exe.log" 2>&1 \
                 || { why="the seed failed to compile it"; break; }
@@ -106,6 +119,10 @@ test_seed() {
         # with 101, alike at every level).
         "$exe" >"$exe.out" 2>&1
         echo "exit $?" >>"$exe.out"
+        if grep -q '^FAIL' "$exe.out"; then
+            why="-$level: $(grep '^FAIL' "$exe.out" | head -1)"
+            break
+        fi
         if [ -z "$reference" ]; then
             reference="$exe.out"
         elif ! cmp -s "$reference" "$exe.out"; then
