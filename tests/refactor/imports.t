@@ -9,15 +9,15 @@ note fix.none: nothing to fix
 $ fix --only tidy-imports --dry-run
 --- a/main.tach
 +++ b/main.tach
-@@ -7,3 +7 @@
+@@ -7,3 +7,2 @@
 -use util::square;
 -use shapes::area;
 -use util::{twice, cube};
++use shapes::{area, volume};
 +use util::{cube, square, third, twice};
-@@ -11,2 +9 @@
+@@ -11,2 +9,0 @@
 -use util::third;
 -use shapes::volume;
-+use shapes::{area, volume};
 --- a/shapes/mod.tach
 +++ b/shapes/mod.tach
 @@ -5,2 +5 @@
@@ -44,7 +44,7 @@ $ fix --only reexports --in util.tach --dry-run
 ## All of them, tidied: area, perimeter and unused_one go, helper stays
 ## as a private import (shapes::local uses it), volume is the interface.
 $ fix --only reexports,tidy-imports
-fixed 6 imports through re-exports, 4 unused re-exports, 4 untidy use lines	4 files	+7 -10 lines
+fixed 6 imports through re-exports, 4 unused re-exports, 4 untidy use lines	4 files	+8 -11 lines
 % cat main.tach
 // A program for `fix --only tidy-imports` and `fix --only reexports`
 // (tests/refactor/imports.t): untidy use lines, imports through
@@ -52,10 +52,10 @@ fixed 6 imports through re-exports, 4 unused re-exports, 4 untidy use lines	4 fi
 mod shapes;
 mod util;
 
-use util::{cube, square, third, twice};
-use util::half as halve;
 use crate::shapes::calc::area;
 use shapes::volume;
+use util::{cube, square, third, twice};
+use util::half as halve;
 
 fn main() -> i32 {
     let a = square(3) + twice(2) + cube(1) + halve(4) + area(2) + volume(1);

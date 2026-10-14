@@ -238,7 +238,7 @@ try: tachyonc edit patch NAME --old OLD --new NEW
 ## 0.12: a module's use lines (MODULE::use) and header comment
 ## (MODULE::header) as TARGET: patch, replace, insert, delete.
 $ edit patch crate::use --old 'clamp, sum_to' --new 'sum_to, clamp'
-patched crate::use	main.tach	+1 -1 lines
+note edit.unchanged: nothing to change
 $ edit patch main::header --old 'to patch' --new 'to edit' --show
 patched main::header	main.tach	+1 -1 lines
 // main.tach:1
@@ -259,7 +259,7 @@ $ edit replace crate::use --dry-run < $T/inputs/use_alias.tach
 --- a/main.tach
 +++ b/main.tach
 @@ -4 +3,0 @@
--use calc::{sum_to, clamp};
+-use calc::{clamp, sum_to};
 main.tach:7:13: error[type error] undefined variable 'clamp' | help: add `use crate::calc::clamp;`
 main.tach:8:13: error[type error] undefined variable 'sum_to' | help: add `use crate::calc::sum_to;`
 warning edit.breaks: 2 new errors (dry run)
@@ -269,7 +269,7 @@ deleted crate::header	main.tach	+0 -1 lines
 % cat main.tach
 mod calc;
 
-use calc::{sum_to, clamp};
+use calc::{clamp, sum_to};
 use calc::clamp as clip;
 
 fn main() -> i32 {

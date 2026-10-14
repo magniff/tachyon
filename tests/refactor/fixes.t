@@ -8,9 +8,10 @@ main.tach:18:13: error[type error] 'hidden' is private
 $ fix --dry-run
 --- a/main.tach
 +++ b/main.tach
-@@ -7 +7 @@
+@@ -7 +6,0 @@
 -use util::{square, unused_one};
-+use util::{square, twice, cube};
+@@ -8,0 +8 @@
++use util::{cube, square, twice};
 @@ -17 +17 @@
 -    let b = abs(-1) as i64;
 +    let b = unsafe { abs(-1) as i64 };
@@ -21,20 +22,29 @@ $ fix --dry-run
 +pub fn hidden() -> i64 {
 --- a/shapes.tach
 +++ b/shapes.tach
-@@ -3,2 +2,0 @@
+@@ -1,5 +1 @@
+-use crate::util::{
+-    square,
 -    twice,
 -    cube,
+-};
++use crate::util::square;
 $ fix --only unused --dry-run
 --- a/main.tach
 +++ b/main.tach
-@@ -7 +7 @@
+@@ -7 +6,0 @@
 -use util::{square, unused_one};
+@@ -8,0 +8 @@
 +use util::square;
 --- a/shapes.tach
 +++ b/shapes.tach
-@@ -3,2 +2,0 @@
+@@ -1,5 +1 @@
+-use crate::util::{
+-    square,
 -    twice,
 -    cube,
+-};
++use crate::util::square;
 $ fix --only pub,unsafe --dry-run
 --- a/main.tach
 +++ b/main.tach
@@ -50,25 +60,29 @@ $ fix --only pub,unsafe --dry-run
 $ fix --only unused --in shapes.tach --dry-run
 --- a/shapes.tach
 +++ b/shapes.tach
-@@ -3,2 +2,0 @@
+@@ -1,5 +1 @@
+-use crate::util::{
+-    square,
 -    twice,
 -    cube,
+-};
++use crate::util::square;
 $ fix --in nowhere
 error fix.bad-in: no file or module 'nowhere' in the program
 [exit 1]
 $ fix
-fixed 2 missing imports, 3 unused imports, 1 pub, 1 unsafe block	3 files	+3 -5 lines
+fixed 2 missing imports, 3 unused imports, 1 pub, 1 unsafe block	3 files	+4 -8 lines
 $ check
 ## Nothing left to fix.
 $ fix
 note fix.none: nothing to fix
 % git diff --stat
  main.tach   | 4 ++--
- shapes.tach | 2 --
+ shapes.tach | 6 +-----
  util.tach   | 2 +-
- 3 files changed, 3 insertions(+), 5 deletions(-)
+ 3 files changed, 4 insertions(+), 8 deletions(-)
 $ undo
-undid fixed 2 missing imports, 3 unused imports, 1 pub, 1 unsafe block	3 files	+3 -5 lines
+undid fixed 2 missing imports, 3 unused imports, 1 pub, 1 unsafe block	3 files	+4 -8 lines
 % git status --short
 $ fix --only nonsense
 error fix.usage: --only takes imports, unused, pub, unsafe, tidy-imports or reexports, not 'nonsense'
