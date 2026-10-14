@@ -108,7 +108,10 @@ patched crate::middle::range::decide→compiler/src/middle/range.tach→+1 -1 li
 ```
 
 - **TARGET** is a NAME as `query` takes it, or `FILE:LINE` (the innermost
-  item holding that line: the position of a compiler error), or a module
+  item holding that line: the position of a compiler error; 0.14: on a
+  line no item holds, a banner, a comment between items, the header or
+  the `use` lines, the lines from the end of the item before to the
+  comments of the item after), or a module
   or a file of the program (all of its text: its `use` lines, its header
   comment), or (0.12) `MODULE::use` (its `use` lines: from the first to
   the last) or `MODULE::header` (the comment at the top of its file), as
@@ -173,6 +176,10 @@ try: tachyonc edit patch clamp --pairs .git/tachyon-edits/try-1.pairs
   have in the file).
 - `--dry-run` prints the diff (no context lines), `--no-check` writes an
   edit that adds errors, as for every edit.
+- **Imports (0.14)**: when the check finds new errors, a round of `fix
+  --only imports` on the edited file adds the `use` lines of the names
+  the new text takes from other modules (as `edit replace` and `insert`
+  do, below), and the edit is checked with them: `note edit.imports`.
 - Only the summary line is printed, never the file.
 
 ### Pairs on stdin, or in a file
@@ -286,6 +293,19 @@ TEXT is read from stdin: blank lines first and last, and trailing
 blanks, are dropped; when none of its lines is indented and the item is
 (a method), every line gets the item's indentation.
 
+**Imports (0.14).** TEXT may name items of other modules that its file
+does not import: when the check finds new errors, a round of `fix
+--only imports` on the edited file adds their `use` lines (merged into a
+`use` of that module, else a new line, as the file writes its paths),
+and the edit is checked again with them: `note edit.imports`, and the
+lines are in the diff (`--show`, `query diff`); not with `--no-check`,
+which asks for the errors. A name is imported from the module the
+error's help names (`add `use crate::m::name;``: the first module with a
+public item of that name), so a name several modules have is worth a
+look at the diff. So does `edit patch`; in a
+script, a step's round runs whether it has errors or not (a step is not
+checked).
+
 **A module's use lines and header (0.12).** `MODULE::use` and
 `MODULE::header` are NAMEs for `edit replace`, `insert` and `delete` too:
 `edit replace m::header < header.txt` replaces the comment at the top of
@@ -338,12 +358,12 @@ fixed 2 missing imports, 3 unused imports, 1 pub, 1 unsafe block→3 files→+3 
 
 | `--only` | what |
 |---|---|
-| `imports` | the `use` lines the errors for unknown names ask for (`help: add `use crate::m::name;``): merged into a `use` of that module when there is one (`use m::{a}` gains `, name`; `use m::a;` becomes `use m::{a, name};`), else a line after the module's last `use`; and 0.8's wildcard migration (`use a::*;` becomes the names it brings) |
+| `imports` | the `use` lines the errors for unknown names ask for (`help: add `use crate::m::name;``): merged into a `use` of that module when there is one, however its path is written (`use m::{a}` gains `, name`; `use m::a;` becomes `use m::{a, name};`), else a line after the module's last `use` (a child module's path relative when the module writes them so, 0.14); and 0.8's wildcard migration (`use a::*;` becomes the names it brings) |
 | `unused` | imports whose name is written nowhere else in their file, removed (the name of a list with its separator; the item when all go; `use p::{a}` left with one name becomes `use p::a`). `pub use` is kept |
 | `pub` | `pub` on the items other modules use while they are private (`error ... is private`) |
 | `unsafe` | the unsafe operations outside unsafe code, wrapped in unsafe blocks (the outermost unit around each: a statement, `let p = unsafe { e };`, an expression); a function with several of them gets its whole body in one block, one level deeper, when its braces have lines of their own (0.12, the codebase's style; `--fix-unsafe` keeps 0.9's units) |
 
-| `tidy-imports` | (0.12) the `use` lines in the codebase's style: the `use` items of a module with one path (and one `pub`) merged where the first is, their names sorted (byte order) and each once, `use p::a;` for one, `use p::{a, b};` when the line fits in 100 columns, else wrapped four spaces in, a line per name imported under another name (`use p::a as b;`); a `use` with a comment on its lines, or sharing a line, is left as it is, and one with a comment right above it is not merged into another |
+| `tidy-imports` | (0.12) the `use` lines in the codebase's style: the paths of a module's child modules written as most of its `use` lines that could be written either way write them (0.14: relative, `use a::x;`, or from `crate`, `use crate::m::a::x;`; a tie, as the first), the `use` items of a module with one path (and one `pub`) merged where the first is, their names sorted (byte order) and each once, `use p::a;` for one, `use p::{a, b};` when the line fits in 100 columns, else wrapped four spaces in, a line per name imported under another name (`use p::a as b;`); a `use` with a comment on its lines, or sharing a line, is left as it is, and one with a comment right above it is not merged into another |
 | `reexports` | (0.12) every import and path that reaches an item through a re-export (a `pub use` of another module, or an ancestor's import: `use crate::f` where the root imports f) is written from the module that defines the item (`mod` lines on the way made `pub` when needed); then the re-exports nothing goes through any more are removed, or made private imports when their file still names them |
 
 By default the first four (`imports`, `unused`, `pub`, `unsafe`),

@@ -15,7 +15,7 @@ anything query accepts.
 tachyonc refactor signature FN --add 'x: T = VALUE' [--at N] | --remove x
                                | --rename-param a b | --reorder b,a,c | --type x T [--default EXPR]
 tachyonc refactor field STRUCT --add 'g: T = VALUE' | --remove g | --rename g h | --type g T
-tachyonc refactor variant ENUM --add 'X(T, ...)' [--arm EXPR] | --remove V | --rename V W
+tachyonc refactor variant ENUM --add 'X(T, ...)' [--arm EXPR] [--arm-in SITE EXPR]... | --remove V | --rename V W
 tachyonc rewrite 'PATTERN' 'REPLACEMENT' [--where '$x: T']... [--in FILE|MODULE]
 tachyonc refactor extract-function FN --lines A-B --to NEW          (0.13)
 tachyonc refactor inline FN [--at FILE:LINE] [--keep]                 (0.13)
@@ -104,6 +104,28 @@ A `#[repr(C)]` struct's layout changes with --add, --remove and --type:
   write it; else by its full path); without, the command is refused and
   lists them, `FILE:LINE:COL→FUNCTION` on stdout, then
   `error refactor.non-exhaustive` and `try: query show FILE:LINE`.
+- `--arm-in SITE EXPR` (0.14, repeatable): the arm of the matches SITE
+  names, for matches of different result types: SITE is the function
+  (any item) the match is in, as `query` takes a NAME, or `FILE:LINE` of
+  a line of the match. The first `--arm-in` that names a match gives its
+  arm; `--arm`, the others'. The refusal's last `try:` line is the
+  command with an `--arm-in SITE 'EXPR'` for each match left (SITE the
+  function the listing names, `FILE:LINE` when it has two), to fill in:
+
+```
+$ tachyonc refactor variant Shape --add 'Ring(i64)'
+shapes.tach:9:5→shapes::area
+shapes.tach:16:5→shapes::round
+error refactor.non-exhaustive: 2 matches on crate::shapes::Shape would not cover Ring; nothing written
+try: tachyonc query show shapes.tach:9
+try: tachyonc query show shapes.tach:16
+try: tachyonc refactor variant crate::shapes::Shape --add 'Ring(i64)' --arm 'EXPR' --dry-run
+try: tachyonc refactor variant crate::shapes::Shape --add 'Ring(i64)' --arm-in shapes::area 'EXPR' --arm-in shapes::round 'EXPR' --dry-run
+$ tachyonc refactor variant Shape --add 'Ring(i64)' --arm-in area 0 --arm-in round false
+```
+
+  A SITE that names no match needing an arm: `error refactor.no-site`,
+  and the matches listed.
 - `--remove V`: refused while V is constructed (`refactor.constructed`),
   matched inside another pattern (`refactor.nested`) or by an `if let` /
   `while let` (`refactor.if-let`); else the arms matching V alone go, an
@@ -254,7 +276,9 @@ script steps.txt: 4 commands→2 files→+9 -9 lines
 
 A file of `refactor`, `rewrite`, `edit` and `fix` commands, one per line
 as typed after `tachyonc` (words as sh splits them: `'...'`, `"..."`;
-`#` starts a comment; `< PATH` gives the command its stdin), run in turn
+`#` starts a comment; `< PATH` gives the command its stdin, and 0.14,
+`<<WORD` the lines after it up to a line `WORD`, as sh's here-document:
+`<<'WORD'` and `<< WORD` too, the text taken as it is), run in turn
 in one invocation, each on the program the ones before left, and checked
 once, at the end: all or nothing. Each command runs in a copy of the
 process (fork) that reads the copies the commands before it wrote
@@ -266,6 +290,31 @@ one edit: checked, written, journaled (one `undo` takes the whole script
 back), or with --dry-run, the diff; then the total line. The script's
 options (--dry-run, --no-check, --root, --target) are the script's; a
 line may not give `--root` or `--target`.
+
+A command's stdin can be in the script (0.14), so that a script of
+patches of several lines, or of new items, is one file:
+
+```
+# pairs of several lines, as edit patch reads them from stdin
+edit patch area <<END
+<<<<<<< OLD
+    p.x * p.height
+=======
+    // (the rectangle's)
+    p.x * p.height
+>>>>>>> NEW
+END
+edit insert --after area <<'EOF'
+pub fn half_area(p: Point) -> i64 {
+    area(p) / 2
+}
+EOF
+```
+
+The text goes to a file next to the root (`ROOT.tachyon-stdin~`) while
+the command runs. A `<<WORD` without its line `WORD`: `error
+refactor.script: FILE:LINE: no line 'WORD' ends the text of <<WORD`.
+`--pairs FILE` works in a script as on the command line.
 
 The commands come from one table, `compiler/src/tools/commands.tach`:
 `run_tool` (the commands a script may run: `edit`, `fix`, `rewrite`,
@@ -287,7 +336,8 @@ as it changes the program through the edit engine (`edit_replace`,
 | `refactor.used` | error | 1 | a parameter or field to remove is used | `query show FILE:LINE`, `query refs` |
 | `refactor.fn-value` | error | 1 | the function is used as a value; its type would change | `query refs` |
 | `refactor.operator`, `refactor.extern`, `refactor.trait` | error | 1 | an operator calls it; C's; an impl's parameters differ | |
-| `refactor.non-exhaustive` | error | 1 | --add without --arm, and matches need an arm (listed) | `query show FILE:LINE` |
+| `refactor.non-exhaustive` | error | 1 | --add without --arm, and matches need an arm (listed) | `query show FILE:LINE`, the command with `--arm` or an `--arm-in` per match |
+| `refactor.no-site` | error | 1 | an `--arm-in` SITE holds no match that needs an arm (0.14; the matches listed) | |
 | `refactor.constructed`, `refactor.nested`, `refactor.if-let` | error | 1 | a variant to remove is constructed, matched inside a pattern, by an if let | `query refs`, `query show` |
 | `refactor.effects` | warning | 0 | an argument that calls a function is removed or moved | |
 | `refactor.layout` | warning | 0 | a `#[repr(C)]` struct's layout changes | |
@@ -319,5 +369,5 @@ as it changes the program through the edit engine (`edit_replace`,
   `if let`, is refused rather than rewritten.
 - A struct field added by `refactor field --add` is not `pub` unless the
   text says so.
-- `refactor variant --add --arm` binds no fields (`X(_, _)`); an arm
-  using them is written by hand (`edit`).
+- `refactor variant --add --arm` (and `--arm-in`) binds no fields (`X(_,
+  _)`); an arm using them is written by hand (`edit`).
