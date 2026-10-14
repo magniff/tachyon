@@ -480,10 +480,10 @@ pub fn area(p: Point) -> i64 {
     p.x * p.y
 }
 % cat geom/scaling.tach
+// Scaling
+
 use crate::geom::Point;
 use crate::util::twice;
-
-// ---- Scaling ----
 
 // p, k times larger.
 pub fn scale(p: Point, k: i64) -> Point {
@@ -528,7 +528,7 @@ tachyonc refactor split crate::geom --into crate::geom::part3 --items scale,doub
 note refactor.plan: the same in one edit: --auto
 try: tachyonc refactor split crate::geom --auto --max-lines 20
 $ refactor split crate::geom --auto --max-lines 20
-split crate::geom into 2 modules	5 files	+30 -22 lines
+split crate::geom into 2 modules	5 files	+32 -24 lines
 % find . -name '*.tach' | sort
 ./geom/mod.tach
 ./geom/part2.tach
@@ -540,7 +540,7 @@ $ main.tach -o prog
 % ./prog; echo "exit $?"
 exit 0
 $ undo
-undid split crate::geom into 2 modules	5 files	+30 -22 lines
+undid split crate::geom into 2 modules	5 files	+32 -24 lines
 % git status --short
 ?? prog
 $ refactor split crate::util --plan
@@ -589,10 +589,10 @@ split crate::geom: 3 items into crate::geom::scaling	3 files	+21 -18 lines
 --- a/geom/scaling.tach
 +++ b/geom/scaling.tach
 @@ -0,0 +1,18 @@
++// Scaling
++
 +use crate::geom::Point;
 +use crate::util::twice;
-+
-+// ---- Scaling ----
 +
 +// p, k times larger.
 +pub fn scale(p: Point, k: i64) -> Point {

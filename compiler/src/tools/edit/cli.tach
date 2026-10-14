@@ -21,12 +21,13 @@ use crate::tools::proc::read_stdin;
 use crate::tools::query::{
     c_slice, ends_with_c, front_end, load_program, resolve_name, root_or_diag,
 };
-use crate::tools::query::defs::{DEFS, K_FIELD, K_VARIANT};
+use crate::tools::query::defs::{DEFS, K_FIELD, K_VARIANT, mod_fqn};
 use crate::tools::query::diagnostics::{
     OPT_EXACT, PROG, ROOT_GIVEN, TOOL, diag, program_errors, try_begin, try_end, write_diags,
 };
 use crate::tools::query::positions::{line_end, line_start};
 use crate::tools::query::show::text_start;
+use crate::tools::query_text::region_target;
 
 // ---- The commands ----
 
@@ -164,6 +165,18 @@ fn run_edit_inner(argc: i64, argv: **u8) -> i64 {
             program_errors(c"error", root, true);
             return 1;
         }
+        // A module's use lines or header comment (0.12).
+        let mut rf = 0;
+        let mut rk = 0;
+        let mut spans = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let r = region_target(name, what, &rf, &rk, &spans);
+        if r == 1 {
+            return 1;
+        }
+        if r == 0 {
+            return edit_region(rf, rk, &spans, if replace { 'r' } else if insert { if after { 'a' } else { 'b' } } else { 'd' },
+                input, root);
+        }
         let mut matches = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         if !resolve_name(what, name, &matches) {
             return 1;
@@ -263,6 +276,89 @@ fn delete_item(d: i64, whole: bool, head: i64, tail: i64) {
             return;
         }
         delete_lines(line_start(text_start(d)), tail);
+    }
+}
+
+// An edit of a module's use lines or its header comment, file f's regions
+// of kind `kind` (1 use, 2 header; byte ranges in spans), `how`: 'r'
+// replace (the first region becomes TEXT, the others go; with none, TEXT
+// goes at the top of the file, after its header for use lines), 'a' or
+// 'b' insert (after the last use line, before the first), 'd' delete.
+fn edit_region(f: i64, kind: i64, spans: *IntVec, how: u8, input: i64, root: *u8) -> i64 {
+    unsafe {
+        let n = (*spans).count;
+        let summary = buf_new();
+        let text = if how == 'd' { buf_new() } else { item_text(buf_slice(input), SRC[0..0]) };
+        if (how == 'a' || how == 'b') && kind != 1 {
+            let e = diag(c"error", c"edit.layout");
+            buf_str(e, c"a header comment is replaced, not inserted next to\n");
+            let out = try_begin(c"replace", SYMS[mod_fqn(FILES[f].module)].text, true);
+            buf_str(out, c"::header < header.txt");
+            try_end(out);
+            return 1;
+        }
+        if how == 'd' && n == 0 {
+            let e = diag(c"note", c"edit.unchanged");
+            buf_str(e, c"nothing to delete\n");
+            return 0;
+        }
+        if how == 'd' {
+            let mut k = 0;
+            while k < n {
+                delete_lines((*spans).data[k], (*spans).data[k + 1]);
+                k += 2;
+            }
+            buf_str(summary, c"deleted ");
+        } else if n == 0 {
+            // (none yet: at the top, after the header for use lines)
+            let mut at = FILES[f].start;
+            if kind == 1 {
+                while at < FILES[f].end && (blank_line(at) || comment_at(at)) {
+                    at = after_line(at);
+                }
+            }
+            let out = buf_new();
+            buf_bytes(out, buf_slice(text));
+            buf_str(out, if at < FILES[f].end { c"\n\n" } else { c"\n" });
+            edit_replace(at, at, out);
+            buf_str(summary, if how == 'r' { c"replaced " } else { c"inserted " });
+        } else if how == 'r' {
+            edit_replace((*spans).data[0], line_end((*spans).data[1] - 1), text);
+            let mut k = 2;
+            while k < n {
+                delete_lines((*spans).data[k], (*spans).data[k + 1]);
+                k += 2;
+            }
+            buf_str(summary, c"replaced ");
+        } else {
+            let out = buf_new();
+            if how == 'a' {
+                let at = line_end((*spans).data[n - 1] - 1);
+                buf_byte(out, '\n');
+                buf_bytes(out, buf_slice(text));
+                edit_replace(at, at, out);
+                buf_str(summary, c"inserted after ");
+            } else {
+                buf_bytes(out, buf_slice(text));
+                buf_byte(out, '\n');
+                edit_replace((*spans).data[0], (*spans).data[0], out);
+                buf_str(summary, c"inserted before ");
+            }
+        }
+        buf_bytes(summary, SYMS[mod_fqn(FILES[f].module)].text);
+        buf_str(summary, if kind == 1 { c"::use" } else { c"::header" });
+        apply_edit(buf_slice(summary), root)
+    }
+}
+
+// Whether the line at pos is a comment (blanks before `//`).
+fn comment_at(pos: i64) -> bool {
+    unsafe {
+        let mut p = pos;
+        while SRC[p] == ' ' || SRC[p] == '\t' {
+            p += 1;
+        }
+        SRC[p] == '/' && SRC[p + 1] == '/'
     }
 }
 

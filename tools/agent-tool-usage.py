@@ -191,11 +191,32 @@ def edit_report(recs):
     """Edits to existing compiler source by the tools, against shell
     rewrites and the Edit and Write tools; the other edits apart."""
     counted = Counter()   # how -> edits of existing compiler source
+    per_agent = defaultdict(Counter)  # who -> how -> edits
     by_tool = Counter()
     other = Counter()     # what -> edits not counted
     reasons = []
     for r in recs:
         kind = r.get("kind")
+        before = Counter(counted)
+        tally_edit(r, kind, counted, by_tool, other, reasons)
+        for how, n in (counted - before).items():
+            per_agent[agent_key(r)][how] += n
+    print_edit_report(counted, by_tool, other, reasons, per_agent)
+
+
+def agent_key(r):
+    """Who made a record: the harness's agent id, else the checkout (a
+    parallel agent's worktree), else the session (0.11's records)."""
+    if r.get("agent_id"):
+        return r["agent_id"]
+    if r.get("worktree"):
+        return os.path.basename(r["worktree"].rstrip("/")) or r["worktree"]
+    return "session " + (r.get("session") or "?")
+
+
+def tally_edit(r, kind, counted, by_tool, other, reasons):
+    """Counts record r (of kind) in the edit report's tallies."""
+    if True:
         if kind == "tool-result":
             if not r.get("written"):
                 other["tool dry runs, plans and refusals (nothing written)"] += 1
@@ -232,6 +253,9 @@ def edit_report(recs):
                 other["new compiler files (Write)"] += 1
             else:
                 other[f"{kind.capitalize()} of {k}"] += 1
+
+
+def print_edit_report(counted, by_tool, other, reasons, per_agent):
     total = sum(counted.values())
     print("\n## Edits to existing compiler source\n")
     print("Compiler source is compiler/src and compiler/std; new files, test "
@@ -247,6 +271,13 @@ def edit_report(recs):
               "(the tools against shell rewrites and Edit/Write of existing compiler files).")
     else:
         print("\n**Tool edits: no edits of existing compiler source logged.**")
+    if len(per_agent) > 1:
+        print("\nPer agent (the harness's agent id, else its worktree, else its session):\n")
+        print("| agent | tools | shell | Edit | Write | tool share |\n|---|---|---|---|---|---|")
+        for who, c in sorted(per_agent.items(), key=lambda kv: -sum(kv[1].values())):
+            n = sum(c.values())
+            print(f"| {who} | {c['tools']} | {c['shell']} | {c['Edit']} | {c['Write']} | "
+                  f"{100 * c['tools'] / n:.0f}% |")
     if other:
         print("\nNot counted:\n\n| what | count |\n|---|---|")
         for k, v in other.most_common():

@@ -20,6 +20,7 @@ use crate::tools::refactor_mod::{
 };
 use crate::tools::refactor_move::{MV_DEF, MV_DEST, later_edit, region_at};
 use crate::tools::refactor_mod::cli::user_pos;
+use crate::tools::tidyimports::put_use_text;
 
 // ---- Imports ----
 
@@ -47,6 +48,75 @@ static mut MU_DEF: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 static mut MU_PATH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
 pub static mut REFUSED: bool = false;
+
+// split --reexport (0.12): the module split (-1: none), and the items it
+// re-exports.
+pub static mut SPLIT_FROM: i64 = -1;
+
+static mut REEX: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+fn reexport(d: i64) {
+    unsafe {
+        for i in 0..REEX.count {
+            if REEX.data[i] == d {
+                return;
+            }
+        }
+        REEX.push(d);
+    }
+}
+
+// The `pub use` lines of the module split with --reexport (a buffer, one
+// line per part, each ending with a newline): what code outside uses of
+// its parts, and what it imports of them itself (those imports are the
+// re-exports).
+pub fn reexport_lines() -> i64 {
+    unsafe {
+        let out = buf_new();
+        if SPLIT_FROM < 0 {
+            return out;
+        }
+        for i in 0..IM_REGION.count {
+            let d = IM_DEF.data[i];
+            if IM_REGION.data[i] == SPLIT_FROM && IM_NAME.data[i] == DEFS[d].name && home(d) != SPLIT_FROM {
+                reexport(d);
+                IM_REGION.data[i] = -1;
+            }
+        }
+        let mut parts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..REEX.count {
+            let h = home(REEX.data[i]);
+            let mut seen = false;
+            for j in 0..parts.count {
+                if parts.data[j] == h {
+                    seen = true;
+                }
+            }
+            if !seen {
+                parts.push(h);
+            }
+        }
+        for j in 0..parts.count {
+            let p = parts.data[j];
+            let mut names = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            let none = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            for i in 0..REEX.count {
+                if home(REEX.data[i]) == p {
+                    names.push(DEFS[REEX.data[i]].name);
+                }
+            }
+            let path = buf_new();
+            if crate::tools::refactor_mod::region_parent(p) == SPLIT_FROM {
+                buf_bytes(path, SYMS[crate::tools::refactor_mod::region_name(p)].text);
+            } else {
+                put_region_path(path, p);
+            }
+            put_use_text(out, SRC[0..0], true, buf_slice(path), &names, &none);
+            buf_byte(out, '\n');
+        }
+        out
+    }
+}
 
 // Name id of Use node u is removed.
 pub fn remove_use_names(u: i64, id: i64) {
@@ -288,6 +358,16 @@ pub fn analyze() -> bool {
             let moved_item = old_home != new_home;
             let moved_code = old_reg != new_reg;
             if !moved_item && !moved_code {
+                continue;
+            }
+            if SPLIT_FROM >= 0 && moved_item && !within(old_reg, SPLIT_FROM) {
+                // (split --reexport: code outside the module is left as it
+                // is, the module re-exports the item)
+                if user_pos(DEFS[it].start) && !DEFS[it].public && pubbed.get(it + 1) == 0 {
+                    pubbed.put(it + 1, 1);
+                    later_edit(DEFS[it].start, DEFS[it].start, text_of(c_slice(c"pub ")));
+                }
+                reexport(it);
                 continue;
             }
             let ti = token_at(p);

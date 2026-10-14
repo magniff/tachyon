@@ -38,15 +38,15 @@ use crate::tools::edit::delete_lines;
 use crate::tools::refactor_mod::{
     NM_BODY, NM_PATH, NM_USES, binding_of,
     collision, emit_regions, is_new, item_binding, load_refs,
-    own_file, put_edit, ref_named,
+    own_file, put_edit, ref_named, NM_HEAD,
 };
-use crate::tools::refactor_move::units::{UN_FIRST, import_anchor, make_blocks, split_plan, units_of};
+use crate::tools::refactor_move::units::{UN_FIRST, import_anchor, make_blocks, split_plan, units_of, banner_above};
 use crate::tools::refactor_move::imports::{
-    IM_REGION, REFUSED, analyze, emit_use_edits, region_uses, remove_use_names, rewrite_imports,
+    IM_REGION, REFUSED, analyze, emit_use_edits, region_uses, remove_use_names, rewrite_imports, SPLIT_FROM, reexport_lines,
 };
 use crate::tools::refactor_mod::cli::{
     OPT_AUTO, OPT_INTO, OPT_ITEMS, OPT_PLAN, finish, inline_module, make_path, module_named,
-    no_module, one_definition, path_segments,
+    no_module, one_definition, path_segments, OPT_HEADER, TIDY_AFTER, OPT_REEXPORT,
 };
 
 // ---- Blocks: the text that moves ----
@@ -57,6 +57,7 @@ static mut BL_START: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 static mut BL_END: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 static mut BL_DEST: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 static mut BL_WRAP: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut BL_BANNER: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
 // The moves asked for: items and their regions.
 pub static mut MV_DEF: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -82,7 +83,11 @@ fn region_at(pos: i64) -> i64 {
     }
 }
 
-fn add_block(start: i64, end: i64, dest: i64, wrap: i64) {
+// Block [start, end) of a moved text goes to region dest (wrap: the
+// unit of the extern block of a function moved alone; -2: a banner moved
+// alone, above the group's first unit going there); banner: the end of
+// the banner it starts with (its comment lines), -1 for none.
+fn add_block(start: i64, end: i64, dest: i64, wrap: i64, banner: i64) {
     unsafe {
         // (in order of position)
         let mut k = BL_START.count;
@@ -90,17 +95,20 @@ fn add_block(start: i64, end: i64, dest: i64, wrap: i64) {
         BL_END.push(0);
         BL_DEST.push(0);
         BL_WRAP.push(0);
+        BL_BANNER.push(0);
         while k > 0 && BL_START.data[k - 1] > start {
             BL_START.data[k] = BL_START.data[k - 1];
             BL_END.data[k] = BL_END.data[k - 1];
             BL_DEST.data[k] = BL_DEST.data[k - 1];
             BL_WRAP.data[k] = BL_WRAP.data[k - 1];
+            BL_BANNER.data[k] = BL_BANNER.data[k - 1];
             k -= 1;
         }
         BL_START.data[k] = start;
         BL_END.data[k] = end;
         BL_DEST.data[k] = dest;
         BL_WRAP.data[k] = wrap;
+        BL_BANNER.data[k] = banner;
     }
 }
 
@@ -361,14 +369,23 @@ pub fn move_edits() -> bool {
             }
         }
         emit_use_edits();
-        // The imports, where they go.
+        // The imports, where they go (and split --reexport's re-exports).
+        let reex = reexport_lines();
         let mut regions = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for i in 0..IM_REGION.count {
-            push_once(&regions, IM_REGION.data[i]);
+            if IM_REGION.data[i] >= 0 {
+                push_once(&regions, IM_REGION.data[i]);
+            }
+        }
+        if BUFS[reex].len > 0 {
+            push_once(&regions, SPLIT_FROM);
         }
         for i in 0..regions.count {
             let r = regions.data[i];
             let lines = region_uses(r);
+            if r == SPLIT_FROM {
+                buf_bytes(lines, buf_slice(reex));
+            }
             if is_new(r) {
                 buf_bytes(NM_USES.data[r - module_count()], buf_slice(lines));
                 continue;
@@ -397,20 +414,52 @@ pub fn move_edits() -> bool {
             let r = dests.data[i];
             let body = buf_new();
             let mut k = 0;
+            // (the block before, to keep adjacent ones together: a run of
+            // constants stays one, 0.12)
+            let mut prev = -1;
             while k < BL_START.count {
                 if BL_DEST.data[k] != r {
                     k += 1;
                     continue;
                 }
-                if BUFS[body].len > 0 {
+                let mut text = buf_slice(texts.data[k]);
+                if prev < 0 && is_new(r) && BUFS[NM_HEAD.data[r - module_count()]].len == 0 {
+                    // A part's header: --header, or the banner it starts
+                    // with (then not repeated), or the banner above its
+                    // first block where it was.
+                    let head = NM_HEAD.data[r - module_count()];
+                    if OPT_HEADER != 0 as *u8 {
+                        put_header(head, c_slice(OPT_HEADER));
+                    } else if BL_BANNER.data[k] >= 0 {
+                        put_header(head, SRC[BL_START.data[k]..BL_BANNER.data[k]]);
+                        text = after_blank_lines(text, BL_BANNER.data[k] - BL_START.data[k]);
+                    } else {
+                        let mut e = 0;
+                        let b = banner_above(BL_START.data[k], &e);
+                        if b >= 0 {
+                            put_header(head, SRC[b..e]);
+                        }
+                    }
+                }
+                if BL_WRAP.data[k] == -2 {
+                    // (a banner moved alone: one blank line after it)
+                    while text.len > 1 && text[text.len - 1] == '\n' && text[text.len - 2] == '\n' {
+                        text = text[0..text.len - 1];
+                    }
+                }
+                let adjacent = prev >= 0 && BL_END.data[prev] == BL_START.data[k] && BL_WRAP.data[k] < 0
+                    && BL_WRAP.data[prev] == -1;
+                if BUFS[body].len > 0 && !adjacent && text.len > 0 {
                     buf_byte(body, '\n');
                 }
                 let x = BL_WRAP.data[k];
                 if x < 0 {
-                    buf_bytes(body, buf_slice(texts.data[k]));
+                    buf_bytes(body, text);
+                    prev = k;
                     k += 1;
                     continue;
                 }
+                prev = k;
                 // Functions of an extern block: in one like it.
                 let t = UN_FIRST.data[x];
                 let mut lb = t;
@@ -466,11 +515,57 @@ fn only_blank(a: i64, b: i64) -> bool {
     }
 }
 
+// The header comment of a part made from text (a banner, or --header):
+// its lines as comments, without the rules of a banner (`// ---- Name
+// ----` is `// Name`), into buffer out.
+fn put_header(out: i64, text: [u8]) {
+    unsafe {
+        let mut i = 0;
+        while i < text.len {
+            let mut e = i;
+            while e < text.len && text[e] != '\n' {
+                e += 1;
+            }
+            let mut a = i;
+            while a < e && (text[a] == ' ' || text[a] == '\t') {
+                a += 1;
+            }
+            if a + 1 < e && text[a] == '/' && text[a + 1] == '/' {
+                a += 2;
+            }
+            while a < e && (text[a] == ' ' || text[a] == '-' || text[a] == '=' || text[a] == '*') {
+                a += 1;
+            }
+            let mut b = e;
+            while b > a && (text[b - 1] == ' ' || text[b - 1] == '-' || text[b - 1] == '=' || text[b - 1] == '*'
+                || text[b - 1] == '\r') {
+                b -= 1;
+            }
+            if b > a {
+                buf_str(out, c"// ");
+                buf_bytes(out, text[a..b]);
+                buf_byte(out, '\n');
+            }
+            i = e + 1;
+        }
+    }
+}
+
+// text after its first n bytes and the blank lines that follow them.
+fn after_blank_lines(text: [u8], n: i64) -> [u8] {
+    let mut p = n;
+    while p < text.len && text[p] == '\n' {
+        p += 1;
+    }
+    text[p..text.len]
+}
+
 // ---- move ----
 
 // `refactor move PATH... --to MODULE`.
 pub fn run_move(words: *IntVec, to: *u8, root: *u8) -> i64 {
     unsafe {
+        TIDY_AFTER = true;
         let t = module_named(c_slice(to));
         if t < 0 {
             return no_module(c_slice(to), c"new-module");
@@ -524,9 +619,13 @@ pub fn run_move(words: *IntVec, to: *u8, root: *u8) -> i64 {
 // edit.
 pub fn run_split(name: [u8], root: *u8) -> i64 {
     unsafe {
+        TIDY_AFTER = true;
         let m = module_named(name);
         if m < 0 {
             return no_module(name, 0 as *u8);
+        }
+        if OPT_REEXPORT {
+            SPLIT_FROM = m;
         }
         let f = own_file(m);
         if f < 0 {

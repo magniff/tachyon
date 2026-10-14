@@ -365,6 +365,9 @@ pub fn show_region(name: [u8]) -> i64 {
         let module = name[0..name.len - cut];
         let mut modules = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         find_modules(module, false, &modules);
+        if modules.count == 0 && root_stem(module) {
+            modules.push(0);
+        }
         // (the files of those modules)
         let mut files = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for i in 0..modules.count {
@@ -450,10 +453,30 @@ fn region_lines(out: i64, f: i64, kind: i64, label: [u8]) -> i64 {
         let text = SRC[FILES[f].start..FILES[f].end];
         let mut starts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         line_starts(text, &starts);
+        let mut spans = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        region_spans(f, kind, &spans);
+        let mut k = 0;
+        while k < spans.count {
+            put_region(out, f, label, text, &starts, spans.data[k], spans.data[k + 1]);
+            k += 2;
+        }
+        spans.count / 2
+    }
+}
+
+// The regions of kind `kind` (1 use lines, 2 the header comment, 3 extern
+// blocks) of file f: their first and last lines (0-based), in pairs, into
+// out. The header is the comment lines at the top (blank lines among
+// them), but for those right above the first item (its own comment, when
+// it is not a mod or use line);
+// consecutive use lines are one region.
+fn region_spans(f: i64, kind: i64, out: *IntVec) {
+    unsafe {
+        let text = SRC[FILES[f].start..FILES[f].end];
+        let mut starts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        line_starts(text, &starts);
         let n = starts.count;
-        let mut count = 0;
         if kind == 2 {
-            // The comment lines at the top (blank lines among them).
             let mut last = -1;
             let mut k = 0;
             while k < n {
@@ -465,11 +488,25 @@ fn region_lines(out: i64, f: i64, kind: i64, label: [u8]) -> i64 {
                 }
                 k += 1;
             }
-            if last >= 0 {
-                put_region(out, f, label, text, &starts, 0, last);
-                count = 1;
+            let first = if k < n { line_at(text, &starts, k) } else { text[0..0] };
+            let decl = starts_with(first, c"mod ") || starts_with(first, c"pub mod ") || starts_with(first, c"use ")
+                || starts_with(first, c"pub use ") || starts_with(first, c"import ");
+            if k < n && last == k - 1 && !decl {
+                // (the comment lines right above the first item are its
+                // own: the header ends at the blank line before them; not
+                // above a mod or use line)
+                while last >= 0 && is_comment_line(line_at(text, &starts, last)) {
+                    last -= 1;
+                }
+                while last >= 0 && is_blank_line(line_at(text, &starts, last)) {
+                    last -= 1;
+                }
             }
-            return count;
+            if last >= 0 {
+                out.push(0);
+                out.push(last);
+            }
+            return;
         }
         let mut k = 0;
         while k < n {
@@ -480,8 +517,7 @@ fn region_lines(out: i64, f: i64, kind: i64, label: [u8]) -> i64 {
                 k += 1;
                 continue;
             }
-            // To the `;` (use) or the matching `}` (extern); consecutive
-            // use lines are one region.
+            // To the `;` (use) or the matching `}` (extern).
             let first = k;
             let mut last = k;
             if kind == 1 {
@@ -518,11 +554,101 @@ fn region_lines(out: i64, f: i64, kind: i64, label: [u8]) -> i64 {
             if last >= n {
                 last = n - 1;
             }
-            put_region(out, f, label, text, &starts, first, last);
-            count += 1;
+            out.push(first);
+            out.push(last);
             k = last + 1;
         }
-        count
+    }
+}
+
+// `MODULE::use` or `MODULE::header` as the TARGET of an edit (0.12): -1
+// when name is not one (or names no module: then it is a NAME), 1 after a
+// diagnostic (several modules), else 0 with its file, its kind (1 use, 2
+// header) and the byte ranges of its regions in SRC (whole lines, in
+// pairs: start, end after the last line's newline) in spans.
+pub fn region_target(name: [u8], what: *u8, file: *i64, kind: *i64, spans: *IntVec) -> i64 {
+    unsafe {
+        let mut cut = 0;
+        if ends_with_bytes(name, c"::use") {
+            *kind = 1;
+            cut = 5;
+        } else if ends_with_bytes(name, c"::header") {
+            *kind = 2;
+            cut = 8;
+        }
+        if cut == 0 || name.len <= cut {
+            return -1;
+        }
+        let module = name[0..name.len - cut];
+        let mut modules = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        find_modules(module, false, &modules);
+        if modules.count == 0 && root_stem(module) {
+            modules.push(0);
+        }
+        let mut files = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..modules.count {
+            for f in 0..FILE_COUNT {
+                if FILES[f].module == modules.data[i] && FILES[f].path[0] != '<' {
+                    files.push(f);
+                }
+            }
+        }
+        if files.count == 0 {
+            return -1;
+        }
+        if files.count > 1 {
+            let d = diag(c"error", c"query.ambiguous");
+            buf_bytes(d, module);
+            buf_str(d, c" names ");
+            buf_int(d, files.count);
+            buf_str(d, c" modules; give more of its path\n");
+            for i in 0..files.count {
+                if i < 3 {
+                    let label = buf_new();
+                    buf_bytes(label, SYMS[mod_fqn(FILES[files.data[i]].module)].text);
+                    buf_bytes(label, name[name.len - cut..name.len]);
+                    try_end(try_begin(what, buf_slice(label), true));
+                }
+            }
+            return 1;
+        }
+        let f = files.data[0];
+        *file = f;
+        let mut lines = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        region_spans(f, *kind, &lines);
+        let text = SRC[FILES[f].start..FILES[f].end];
+        let mut starts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        line_starts(text, &starts);
+        let mut k = 0;
+        while k < lines.count {
+            let last = lines.data[k + 1];
+            spans.push(FILES[f].start + starts.data[lines.data[k]]);
+            spans.push(if last + 1 < starts.count { FILES[f].start + starts.data[last + 1] } else { FILES[f].end });
+            k += 2;
+        }
+        0
+    }
+}
+
+// Whether name is the root file's name without `.tach` (`main::header`
+// for `crate::header`).
+fn root_stem(name: [u8]) -> bool {
+    unsafe {
+        let mut root = -1;
+        for f in 0..FILE_COUNT {
+            if FILES[f].module == 0 && FILES[f].path[0] != '<' {
+                root = f;
+            }
+        }
+        if root < 0 {
+            return false;
+        }
+        let p = c_slice(FILES[root].path);
+        let mut s = p.len;
+        while s > 0 && p[s - 1] != '/' {
+            s -= 1;
+        }
+        p.len - s == name.len + 5 && crate::tools::proc::same_bytes(p[s..s + name.len], name)
     }
 }
 

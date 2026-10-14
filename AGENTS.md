@@ -19,6 +19,7 @@ sed, head, cat or awk ([docs/query.md](docs/query.md)):
 | what a module contains | `target/tachyonc query items MODULE` |
 | the item at a compiler error's position | `target/tachyonc query show FILE:LINE` (`--with-comments`: its section comment too) |
 | a module's `use` lines, header comment, extern blocks | `target/tachyonc query show MODULE::use` (`::header`, `::extern`) |
+| change a module's `use` lines or header comment | `target/tachyonc edit patch\|replace MODULE::use` (`MODULE::header`; `edit insert --after MODULE::use`, `edit delete`) |
 | lines of any file (a test, a fixture, conflict markers), a small file | `target/tachyonc query text FILE:A-B`, `query show FILE.tach` |
 | change a few lines inside an item (a condition, a statement) | `target/tachyonc edit patch NAME\|FILE:LINE --old 'TEXT' --new 'TEXT'` (pairs repeat; several lines: `< pairs`, blocks `<<<<<<< OLD` / `=======` / `>>>>>>> NEW`; `--loose` for other indentation) |
 | add statements inside an item | `target/tachyonc edit insert --in NAME --after\|--before 'ANCHOR' < text` |
@@ -32,10 +33,11 @@ sed, head, cat or awk ([docs/query.md](docs/query.md)):
 | rename anything (a module: its file too), with every reference | `target/tachyonc refactor rename PATH NEW` |
 | move items to another module, imports and `pub` fixed | `target/tachyonc refactor move PATH... --to MODULE` |
 | make a module; move one (file, folder, paths) | `target/tachyonc refactor new-module crate::a::b`, `refactor move-module crate::a crate::x::a` |
-| split a module into files | `target/tachyonc refactor split MODULE --plan` (then `--auto`, or `--into M --items a,b`) |
+| split a module into files | `target/tachyonc refactor split MODULE --plan` (then `--auto`, or `--into M --items a,b`; `--reexport` leaves code outside as it is; `--header TEXT`) |
 | several changes, checked once, all or nothing | `target/tachyonc refactor --script steps.txt` (one command per line) |
 | the errors, one per line (front end only) | `target/tachyonc check` |
 | missing/unused imports, `pub`, `unsafe` blocks | `target/tachyonc fix` (`--only imports,unused,pub,unsafe`, `--in FILE\|MODULE`, `--dry-run`) |
+| imports through re-exports, then the re-exports; merged, sorted, wrapped `use` lines | `target/tachyonc fix --only reexports,tidy-imports` (`// api:` above a `pub use` keeps it) |
 | prove a refactoring changed no output | `target/tachyonc same-output OLD_TACHYONC` |
 | file and item sizes | `target/tachyonc query stats [MODULE\|FILE]` |
 | how a module's items use each other, how to split it | `target/tachyonc query deps MODULE --max-lines 1000` |

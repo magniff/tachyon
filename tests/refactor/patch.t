@@ -228,3 +228,73 @@ $ edit patch --old 'v' --new 'w'
 error edit.usage: a TARGET is needed
 try: tachyonc edit patch NAME --old OLD --new NEW
 [exit 2]
+## 0.12: a module's use lines (MODULE::use) and header comment
+## (MODULE::header) as TARGET: patch, replace, insert, delete.
+$ edit patch crate::use --old 'clamp, sum_to' --new 'sum_to, clamp'
+patched crate::use	main.tach	+1 -1 lines
+$ edit patch main::header --old 'to patch' --new 'to edit' --show
+patched main::header	main.tach	+1 -1 lines
+// main.tach:1
+1	// A program to edit (tests/refactor/patch.t).
+$ edit patch calc::use --old a --new b
+error patch.no-region: no use lines in crate::calc; edit replace adds them
+try: tachyonc edit replace calc::use < uses.tach
+[exit 1]
+$ edit replace calc::header < $T/inputs/header.txt
+replaced crate::calc::header	calc.tach	+2 -1 lines
+$ edit insert --after crate::use < $T/inputs/use_alias.tach
+inserted after crate::use	main.tach	+1 -0 lines
+$ edit insert --before calc::header < $T/inputs/header.txt
+error edit.layout: a header comment is replaced, not inserted next to
+try: tachyonc edit replace crate::calc::header < header.txt
+[exit 1]
+$ edit replace crate::use --dry-run < $T/inputs/use_alias.tach
+--- a/main.tach
++++ b/main.tach
+@@ -4 +3,0 @@
+-use calc::{sum_to, clamp};
+main.tach:7:13: error[type error] undefined variable 'clamp' | help: add `use crate::calc::clamp;`
+main.tach:8:13: error[type error] undefined variable 'sum_to' | help: add `use crate::calc::sum_to;`
+warning edit.breaks: 2 new errors (dry run)
+[exit 1]
+$ edit delete crate::header
+deleted crate::header	main.tach	+0 -1 lines
+% cat main.tach
+mod calc;
+
+use calc::{sum_to, clamp};
+use calc::clamp as clip;
+
+fn main() -> i32 {
+    let a = clamp(15, 0, 10);
+    let b = sum_to(4);
+    if a + b == 20 { 0 } else { 1 }
+}
+% cat calc.tach
+// Arithmetic helpers: clamp and sum_to,
+// patched by tests/refactor/patch.t.
+
+// v, kept within [lo, hi].
+pub fn clamp(v: i64, lo: i64, hi: i64) -> i64 {
+    if v < lo {
+        return lo;
+    }
+    if v > hi {
+        return hi;
+    }
+    v
+}
+
+// 1 + 2 + ... + n.
+pub fn sum_to(n: i64) -> i64 {
+    let mut total = 0;
+    let mut i = 1;
+    if i == 3 {
+        total += 0;
+    }
+    while i <= n {
+        total += i;
+        i += 1;
+    }
+    total
+}

@@ -16,7 +16,7 @@ hook = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(hook)
 
 LOGGED = []
-hook.log = lambda gd, record: LOGGED.append(record)
+hook.log = lambda gd, record: LOGGED.append({**hook.IDENT, **record})
 hook.query_ready = lambda gd, cwd: True
 hook.git_dir = lambda cwd: "/nonexistent"
 
@@ -134,6 +134,60 @@ st, err, recs = bash("target/tachyonc refactor rename f g --root tests/refactor/
 case("tool on a test program", [(r["written"], r["compiler"]) for r in recs], [(True, False)])
 st, err, recs = bash("target/tachyonc undo", "PostToolUse", "undid patched crate::a\tcompiler/src/a.tach\t+1 -1 lines\n")
 case("tool undo", [(r["tool"], r["written"], r["compiler"]) for r in recs], [("undo", True, True)])
+
+# 0.12: writes are judged by the files written, not by every path named.
+case("python writes a doc naming source", blocked(
+    "python3 - <<'EOF'\nopen('compiler/README.md', 'w').write('see compiler/std/std.tach')\nEOF")[0], False)
+case("python writes a scratch helper", blocked(
+    "python3 - <<'EOF'\np = '/private/tmp/claude-1/scratchpad/h.py'\n"
+    "open(p, 'w').write(\"run('compiler/src/main.tach')\")\nEOF")[0], False)
+case("python writes source, variable", blocked(
+    "python3 - <<'EOF'\nsrc = 'compiler/src/a.tach'\nopen(src, 'w').write('x')\nEOF")[0], True)
+case("python write, file unknown", blocked(
+    "python3 -c \"import sys; open(sys.argv[1], 'w').write('x')\" compiler/src/a.tach")[0], True)
+st, err, recs = bash("sed -i '' 's/a/b/' target/patch.txt && target/tachyonc edit patch "
+                     "compiler/src/a.tach < target/patch.txt")
+case("sed -i scratch input, no edit logged", (st, [r["kind"] for r in recs]), (0, []))
+case("sed -i after cd into scratch", blocked("cd target/copy && sed -i 's/a/b/' compiler/src/x.tach")[0], False)
+case("sed -i docs quoting a read", blocked(
+    "sed -i '' \"s|grep x|sed -n '120,180p' compiler/src/gvn.tach; cat compiler/src/a.tach|\" docs/query.md")[0],
+     False)
+case("awk generating a program", blocked("awk -f tests/fuzz/gendiv.awk > target/fuzz/x.tach")[0], False)
+case("grep of a generated program", blocked("grep -c add target/fuzz/x.tach")[0], False)
+case("read with 2>&1", blocked("grep -n fn compiler/src/a.tach 2>&1")[0], True)
+
+# 0.12: the checkout and its shared git directory, without git; who logs.
+import tempfile
+with tempfile.TemporaryDirectory() as tmp:
+    tmp = os.path.realpath(tmp)
+    main = os.path.join(tmp, "main")
+    common = os.path.join(main, ".git")
+    wt_git = os.path.join(common, "worktrees", "a")
+    wt = os.path.join(tmp, "wt", "a")
+    os.makedirs(wt_git)
+    os.makedirs(os.path.join(wt, "compiler", "src"))
+    with open(os.path.join(wt, ".git"), "w") as fh:
+        fh.write("gitdir: " + wt_git + "\n")
+    with open(os.path.join(wt_git, "commondir"), "w") as fh:
+        fh.write("../..\n")
+    case("checkout of main", hook.checkout_of(main), (main, common))
+    case("checkout of a worktree", hook.checkout_of(os.path.join(wt, "compiler", "src")), (wt, common))
+    case("checkout of nothing", hook.checkout_of("/"), (None, None))
+    st, err, recs = run({"hook_event_name": "PreToolUse", "tool_name": "Bash", "cwd": wt,
+                         "session_id": "s123456789", "transcript_path": "/x/t.jsonl", "agent_id": "agent-7",
+                         "tool_input": {"command": "target/tachyonc query show f"}})
+    case("identity", [(r.get("session"), r.get("agent_id"), r.get("worktree")) for r in recs],
+         [("s1234567", "agent-7", wt)])
+    # tools/agent-feedback, from a worktree: into the shared log, no git run.
+    import subprocess
+    feedback = os.path.join(os.path.dirname(HERE), "agent-feedback")
+    env = dict(os.environ, PATH="/usr/bin:/bin:" + os.path.dirname(sys.executable))
+    out = subprocess.run([feedback, "query", "a note"], cwd=os.path.join(wt, "compiler"), env=env,
+                         capture_output=True, text=True)
+    with open(os.path.join(common, "agent-tools.jsonl")) as fh:
+        rec = json.loads(fh.readline())
+    case("agent-feedback in a worktree", (out.stdout.strip(), rec["tool"], rec["message"], rec["worktree"]),
+         ("recorded", "query", "a note", wt))
 
 print("total", "ok" if FAILED == 0 else f"{FAILED} failed")
 sys.exit(1 if FAILED else 0)

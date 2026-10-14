@@ -16,7 +16,7 @@ tachyonc edit insert --after|--before NAME [ROOT] < TEXT
 tachyonc edit delete NAME [ROOT]
 tachyonc undo [--force]                        the last edit, undone
 tachyonc check [ROOT]                          the front end's errors, one per line
-tachyonc fix [ROOT] [--only imports,unused,pub,unsafe] [--in FILE|MODULE]
+tachyonc fix [ROOT] [--only imports,unused,pub,unsafe,tidy-imports,reexports] [--in FILE|MODULE]
 tachyonc same-output OLD [--corpus DIR|FILE]... [-j N] [--work DIR]
 tachyonc lint --max-lines N [ROOT]
 tachyonc query stats [MODULE|FILE] [--over N] [--all]
@@ -107,7 +107,10 @@ patched crate::middle::range::decide→compiler/src/middle/range.tach→+1 -1 li
 - **TARGET** is a NAME as `query` takes it, or `FILE:LINE` (the innermost
   item holding that line: the position of a compiler error), or a module
   or a file of the program (all of its text: its `use` lines, its header
-  comment). An item's text is its lines with the comment and attribute
+  comment), or (0.12) `MODULE::use` (its `use` lines: from the first to
+  the last) or `MODULE::header` (the comment at the top of its file), as
+  `query show` prints them; the root module is `crate` or the root file's
+  name (`main::header`). An item's text is its lines with the comment and attribute
   lines above it, as `query show` prints them.
 - **Each OLD must occur exactly once** in TARGET's text, matched byte for
   byte. Every OLD is found in the text as it was before the edit, the
@@ -213,6 +216,18 @@ TEXT is read from stdin: blank lines first and last, and trailing
 blanks, are dropped; when none of its lines is indented and the item is
 (a method), every line gets the item's indentation.
 
+**A module's use lines and header (0.12).** `MODULE::use` and
+`MODULE::header` are NAMEs for `edit replace`, `insert` and `delete` too:
+`edit replace m::header < header.txt` replaces the comment at the top of
+m's file (or puts TEXT there, a blank line after it, when it has none);
+`edit replace m::use < uses.tach` replaces its first block of `use` lines
+with TEXT and removes the others (none: TEXT goes after the header);
+`edit insert --after|--before m::use` adds lines after the last `use`
+line or before the first; `edit delete` removes them. The header is the
+comment lines at the top of the file, except those right above the first
+item (its own comment; not above a `mod` or `use` line). A header is
+replaced, not inserted next to (`edit.layout`).
+
 An item that shares a line with other code (a field of
 `struct P { x: i64, y: i64 }`) is its exact bytes: replace replaces
 them, delete removes them with their `, `, insert is refused
@@ -257,8 +272,26 @@ fixed 2 missing imports, 3 unused imports, 1 pub, 1 unsafe block→3 files→+3 
 | `pub` | `pub` on the items other modules use while they are private (`error ... is private`) |
 | `unsafe` | the unsafe operations outside unsafe code, wrapped in unsafe blocks (the outermost unit around each: a statement, `let p = unsafe { e };`, an expression); a function with several of them gets its whole body in one block, one level deeper, when its braces have lines of their own (0.12, the codebase's style; `--fix-unsafe` keeps 0.9's units) |
 
-By default all four, everywhere; `--in FILE|MODULE` keeps the fixes of
-one file or module (matched like query's `--in`; none:
+| `tidy-imports` | (0.12) the `use` lines in the codebase's style: the `use` items of a module with one path (and one `pub`) merged where the first is, their names sorted (byte order) and each once, `use p::a;` for one, `use p::{a, b};` when the line fits in 100 columns, else wrapped four spaces in, a line per name imported under another name (`use p::a as b;`); a `use` with a comment on its lines, or sharing a line, is left as it is, and one with a comment right above it is not merged into another |
+| `reexports` | (0.12) every import and path that reaches an item through a re-export (a `pub use` of another module, or an ancestor's import: `use crate::f` where the root imports f) is written from the module that defines the item (`mod` lines on the way made `pub` when needed); then the re-exports nothing goes through any more are removed, or made private imports when their file still names them |
+
+By default the first four (`imports`, `unused`, `pub`, `unsafe`),
+everywhere; `tidy-imports` and `reexports` only when asked for (`--only
+reexports,tidy-imports` does both: the rounds tidy what the first
+rewrote).
+
+**Re-exports kept: the interface.** A `pub use` with a comment line
+starting `// api:` right above it (in its comment lines) is the module's
+interface: `reexports` keeps it and the imports and paths through it. A
+program's own modules need none (the compiler has none); a library's
+modules mark what they offer. With `--in`, only the imports and paths
+there are rewritten, and only the re-exports there removed.
+
+`unused` (0.12) keeps an import that another module imports or names
+through (`use crate::f` reaching the root's `use util::f`): it is used,
+although its file does not name it; `query unused` likewise.
+
+`--in FILE|MODULE` keeps the fixes of one file or module (matched like query's `--in`; none:
 `error fix.bad-in`). A fix can let the checker see more: the checker
 stops at the first unknown name of a statement, so its second appears
 only once the first is imported. So fix runs again on the edited program
@@ -413,6 +446,7 @@ Exit 1 when a file is over, 0 when none is.
 | `undo.empty` | error | 1 | no edit to undo | |
 | `undo.changed` | error | 1 | a file changed since the edit | `undo --force` |
 | `fix.none` | note | 0 | nothing to fix | |
+| `patch.no-region` | error | 1 | `MODULE::use` or `::header` to patch, and the module has none | `edit replace MODULE::use\|header`, which adds them |
 | `fix.bad-in` | error | 1 | `--in` names no file or module of the program | |
 | `lint.max-lines` | error | 1 | a file over N lines | `query deps MODULE --max-lines N` |
 | `same-output.differs` | error | 1 | compilations differ | the `diff`, the compilation |
