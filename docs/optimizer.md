@@ -1105,6 +1105,29 @@ iterations it replaces. Unrolling asks the same question
 (`vectorizable_lanes`), so a loop the vectorizer turns down is unrolled
 as before.
 
+*Against full unrolling.* A loop of a few constant trips is unrolled
+whole by `transform_loops` (scev.tach: at most 16 trips and 160
+instructions), and there the scalar alternative is not the loop: each
+copy keeps only its loads, stores and operations (the induction variable,
+the latch's test and the addresses affine in it become constants and
+offsets, what is invariant leaves, a check of a constant length on an
+index of the induction variable and constants is decided), and SLP may
+pack them. With `unrolled` = the trip count, `vector_unroll` weighs the
+vector loop against T times that. The unroller asks so before unrolling;
+and a loop whose checks kept the unroller from it (an exit other than the
+latch's) until the ranges removed them is left by the vectorizer when
+unrolling whole is cheaper (`full_unroll_trips`), with transform_loops run
+again after the vectorizer (only then). bench/fannkuch's copy of a
+10-element permutation had been a vector loop since the ranges through
+phis proved its checks: a run-time overlap test of the two arrays (both
+on the stack), five vector iterations, the scalar loop as fallback, the
+loop not unrolled; it is now ten loads and stores, which SLP makes five
+16-byte copies, as with `--no-vectorize`: about 5% faster, which takes
+back the 3% it had lost (it was not the forwarding of 8-byte stores to
+16-byte loads, as first thought: the unrolled copy has those too).
+`tests/run/opt_vectorize_unrolled.tach`. The compiler's own code is
+unchanged.
+
 In 0.10, `[0; 20]` became a loop of two 16-byte stores an iteration,
 which never ran (20 < 32); it is now one vector store and four scalar
 ones. A loop the profile shows running two iterations an entry over
@@ -1267,11 +1290,6 @@ What remains, measured:
   sift-down, `end <= s.len` (so the first `s[root]`, with root the
   caller's start, keeps its check). C has no checks; this is the safety
   tachyon keeps.
-- *fannkuch* is 3% slower than before the ranges through phis: with its
-  checks proven, the copy of a 10-element permutation is vectorized, and its
-  16-byte loads read what 8-byte stores have just written, which no store
-  forwards (the vectorizer's cost model does not see it; `--no-vectorize`
-  gives the old time back). It stays ahead of clang.
 - *FMA*: clang contracts `a * b + c` by default (nbody: 27 ms against 29
   with `-ffp-contract=off`); tachyon never does, as that changes results.
 - *Floats compared for a branch* are `fcmp`, `cset`, `cbnz` on AArch64

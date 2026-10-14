@@ -44,14 +44,16 @@ calling conventions, is in [docs/grammar.md](docs/grammar.md).
 The compiler (`compiler/`) is written in tachyon, so the first one comes from
 the release chain: the frozen Rust implementation, the seed (`seed/`),
 builds release 0.1.0, each release builds the next, and the last one builds
-HEAD. It runs on macOS (Apple silicon and Intel) and on x86-64 Linux.
+HEAD. It runs on macOS (Apple silicon and Intel) and on x86-64 Linux;
+from 0.11 also on AArch64 Linux, where the compiler is cross-built (see
+[docs/releases.md](docs/releases.md), "aarch64-linux").
 
 On macOS, with the Xcode command line tools and Rust (rustup):
 
 ```
 $ bootstrap/bootstrap.sh
 ...
-compiler: target/tachyonc (tachyonc 0.10.0 (host: aarch64-macos))
+compiler: target/tachyonc (tachyonc 0.11.0 (host: aarch64-macos))
 ```
 
 On x86-64 Linux, with git, gcc (or clang) and the libc headers, and Rust
@@ -60,7 +62,7 @@ On x86-64 Linux, with git, gcc (or clang) and the libc headers, and Rust
 ```
 $ bootstrap/bootstrap.sh
 ...
-compiler: target/tachyonc (tachyonc 0.10.0 (host: x86_64-linux))
+compiler: target/tachyonc (tachyonc 0.11.0 (host: x86_64-linux))
 ```
 
 Every step is checked: each compiler must compile itself to identical

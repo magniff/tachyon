@@ -41,8 +41,48 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.8.0 | `v0.8.0` | 0.7.0 | aarch64-macos, x86_64-linux, x86_64-macos | no wildcard imports: `use x::*` and `import "h.h";` without `as` are removed, every name a file uses is declared, imported by name or written with its path; `tachyonc --fix-imports` rewrites older code |
 | 0.9.0 | `v0.9.0` | 0.8.0 | aarch64-macos, x86_64-linux, x86_64-macos | `unsafe`, traits and an e-graph: `unsafe` blocks and functions (safe code has no undefined behaviour; a warning in 0.9, an error from 0.10), `--fix-unsafe`; traits, bounds, operator traits, std `HashMap` and `sort`; array constants, line continuations; GVN on an acyclic e-graph with rewrite rules checked by `--check-rules` |
 | 0.10.0 | `v0.10.0` | 0.9.0 | aarch64-macos, x86_64-linux, x86_64-macos | vectors and profiles: an unsafe operation outside `unsafe` is an error; vector types (`v4f32`, `v2f64`, ...) on NEON and SSE2; a loop vectorizer; profile-guided optimization; `--check-unsafe`; every error of a compilation reported |
+| 0.11.0 | `v0.11.0` | 0.10.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | feature-complete, and tools for agents: DWARF line tables (`-g`); aarch64-linux as a target and a host; a broader `bench/`, a cost model for the loop vectorizer, unrolling with run-time trip counts, an SLP vectorizer, division by constants, value ranges through phis; `tachyonc query`, `check`, `fix`, `lint`, `same-output`, `edit` by name and semantic refactorings (`refactor rename`, `move`, `signature`, `field`, `variant`, `split`, `rewrite`, scripts, `undo`) |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.11
+
+- **Debug information**: `-g` writes DWARF line tables (and the compile
+  unit's functions) in the assembly and in the objects the compiler
+  writes, Mach-O and ELF; on macOS `dsymutil` runs after linking. lldb
+  and gdb stop at source lines and show `file:line` in backtraces. The
+  output without `-g` is unchanged.
+- **aarch64-linux** as a target (`--target aarch64-linux`: AAPCS64, ELF,
+  `import` of its headers) and a host, whose compiler is cross-built on
+  another host and then rebuilds itself there to the same object (see
+  "aarch64-linux: cross-built, then checked natively" below).
+- **Faster code**: a cost model for the loop vectorizer (expected trips
+  from constant bounds or the profile, and against unrolling a short
+  loop whole), unrolling of loops with run-time trip counts, an SLP
+  vectorizer (stores to the lanes of a vector packed with their values),
+  division and remainder by constants as multiplications, value ranges
+  through phis (more bounds checks removed), branches on `&&` threaded,
+  equalities from branches. `bench/` has six more programs (binarytrees,
+  fannkuch, json, mandelbrot, sort, wordcount), each with its C version,
+  and a geometric mean against `cc -O2`: tachyon -O2 is at 0.95 of it
+  (docs/roadmap.md, "Benchmarks").
+- **Tools for agents** (docs/query.md, docs/refactor.md and the pages it
+  links): `tachyonc query` (`def`, `show`, `refs`, `callers`, `items`,
+  `stats`, `deps`, `unused`, `impact`), `tachyonc check` (the front end
+  only, one line per error), `fix` (missing and unused imports, `pub`,
+  `unsafe` blocks), `lint --max-lines N`, `same-output OLD_TACHYONC`;
+  `edit replace|insert|delete NAME` and `undo`; `refactor rename`, `move`,
+  `new-module`, `move-module`, `split`, `signature`, `field`, `variant`,
+  the typed `rewrite`, and `refactor --script`. Every edit is checked
+  before it is written (nothing is written when it adds an error).
+  `--diagnostics=short`: one line per error, with a stable code and a
+  suggested fix. AGENTS.md and a hook for agents working on the compiler
+  (`tools/agent-hooks/`).
+- **Fixed**: `x as i64 < n` compares (a primitive type takes no type
+  arguments); it failed with "expected '>'" when `n` was followed by `.`.
+- **Breaking**: nothing in the language. On the command line, a first
+  argument `query`, `edit`, `undo`, `check`, `fix`, `lint` or
+  `same-output` is a command, not a file to compile.
 
 ### What's new in 0.10 (in progress)
 
