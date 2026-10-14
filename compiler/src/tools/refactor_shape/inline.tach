@@ -29,10 +29,10 @@ use crate::front::types::FNS;
 use crate::tools::edit::edit_replace;
 use crate::tools::edit::apply::{finish_edit, prepare_edit, set_command};
 use crate::tools::edit::cli::delete_lines;
-use crate::tools::edit::items::{indent_of, item_tail, node_head, item_head};
+use crate::tools::edit::items::{indent_of, item_tail, node_head, item_head, after_line};
 use crate::tools::fix::remove_use_name;
 use crate::tools::query::{QF_DEF, QF_USE, c_slice, root_or_diag};
-use crate::tools::query::defs::{DEFS, K_FN, K_METHOD, def_of_node, DEF_COUNT, K_IMPL_METHOD, K_MOD};
+use crate::tools::query::defs::{DEFS, K_FN, K_METHOD, def_of_node, K_IMPL_METHOD, K_MOD};
 use crate::tools::query::diagnostics::{PROG, ROOT_GIVEN, TOOL, diag, diags, put_cword, put_root, put_word, try_end, write_diags};
 use crate::tools::query::positions::{enclosing, line_of, line_start, token_at};
 use crate::tools::query::refs::{R_FLAGS, R_POS, R_DEF};
@@ -45,6 +45,7 @@ use crate::tools::refactor_shape::body::{
 };
 use crate::tools::rewrite::parsed::{binding_level, expr_slots, pa, pchild, pcount, pend, pk, pstart};
 use crate::tools::tidyimports::tidy_round;
+use crate::tools::refactor_mod::{item_binding, load_refs, own_file, use_binding_id, use_node_of};
 
 // The parameters of FN: their locals, names, the uses of each in its body
 // (Ident nodes), whether the body changes them.
@@ -64,6 +65,8 @@ static mut BODY_FREE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 // The items the body names (load_free_defs), and the ones made pub.
 static mut FREE_DEF: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 static mut PUBBED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+static mut COPIED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
 pub fn run_inline(argc: i64, argv: **u8) -> i64 {
     let status = inline_inner(argc, argv);
@@ -286,23 +289,19 @@ fn load_callee(d: i64, f: i64, fqn: [u8]) -> bool {
     }
 }
 
-// The items FN's body (node body) names (FREE_DEF): found from every
-// reference the checker resolved.
+// The items FN's body (node body) names (FREE_DEF: functions, types,
+// constants, statics; not a variant, a field, a method): from every
+// reference the checker resolved (load_refs, which copy_imports needs too).
 fn load_free_defs(body: i64) {
     unsafe {
-        let mut all = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for x in 0..DEF_COUNT {
-            let k = DEFS[x].kind;
-            if DEFS[x].parent < 0 && k != K_METHOD && k != K_IMPL_METHOD && k != K_MOD {
-                all.push(x);
-            }
-        }
-        refs_of(&all);
+        load_refs();
         for r in 0..R_POS.count {
             let pos = R_POS.data[r];
+            let x = R_DEF.data[r];
+            let k = DEFS[x].kind;
             if (R_FLAGS.data[r] & QF_DEF) == 0 && pos >= NODES[body].start && pos < NODES[body].end
-                && !contains(&FREE_DEF, R_DEF.data[r]) {
-                FREE_DEF.push(R_DEF.data[r]);
+                && DEFS[x].parent < 0 && k != K_METHOD && k != K_IMPL_METHOD && k != K_MOD && !contains(&FREE_DEF, x) {
+                FREE_DEF.push(x);
             }
         }
     }
@@ -321,6 +320,70 @@ fn publish_free_defs(m: i64) {
             PUBBED.push(x);
             let at = item_head(x);
             edit_replace(at, at, text_of_c(c"pub "));
+        }
+    }
+}
+
+// The imports of FN's module (m) its body names that the caller's
+// module (cm) lacks, added there: `use PATH::NAME;` after its last `use`
+// (a variant, `use crate::ir::Op::Const`, which fix cannot find).
+fn copy_imports(m: i64, cm: i64, body: i64) {
+    unsafe {
+        if m == cm {
+            return;
+        }
+        let f = own_file(cm);
+        if f < 0 {
+            return;
+        }
+        let mut t = token_at(NODES[body].start);
+        while t < TOK_COUNT && TOKS[t].start < NODES[body].end {
+            let s = TOKS[t].value as i64;
+            let after_dot = t > 0 && (TOKS[t - 1].kind == Tok::Dot || TOKS[t - 1].kind == Tok::ColonColon);
+            if TOKS[t].kind != Tok::Ident || after_dot || contains(&BODY_LOCALS, s) || contains(&P_NAME, s)
+                || contains(&COPIED, cm * 1000003 + s) {
+                t += 1;
+                continue;
+            }
+            let id = use_binding_id(m, s);
+            if id == 0 || item_binding(cm, s) >= 0 || use_binding_id(cm, s) != 0 {
+                t += 1;
+                continue;
+            }
+            let u = use_node_of(id);
+            let mut path = SRC[NODES[NODES[u].c].start..NODES[NODES[u].c].end];
+            if path.len > 2 && path[path.len - 1] == ':' {
+                path = path[0..path.len - 2];
+            }
+            if !(path.len > 7 && bytes_is(path[0..7], c"crate::")) && !(path.len > 5 && bytes_is(path[0..5], c"std::")) {
+                t += 1;
+                continue;
+            }
+            COPIED.push(cm * 1000003 + s);
+            let line = buf_new();
+            buf_str(line, c"use ");
+            buf_bytes(line, path);
+            buf_str(line, c"::");
+            buf_bytes(line, SYMS[NODES[id].a].text);
+            if NODES[id].b != 0 {
+                buf_str(line, c" as ");
+                buf_bytes(line, SYMS[NODES[id].b].text);
+            }
+            buf_str(line, c";\n");
+            // (after the module's last `use`, else before its first line
+            // of code)
+            let mut at = -1;
+            for v in 1..NODE_COUNT {
+                if NODES[v].kind == NodeKind::Use && file_of_pos(NODES[v].start) == f && after_line(NODES[v].end - 1) > at {
+                    at = after_line(NODES[v].end - 1);
+                }
+            }
+            if at < 0 {
+                at = line_start(TOKS[token_at(FILES[f].start)].start);
+                buf_byte(line, '\n');
+            }
+            edit_replace(at, at, line);
+            t += 1;
         }
     }
 }
@@ -374,6 +437,7 @@ fn inline_call(d: i64, o: i64, n: i64, fqn: [u8]) -> bool {
             }
         }
         publish_free_defs(module_at(pstart(o)));
+        copy_imports(DEFS[d].module, module_at(pstart(o)), body);
         // Each parameter: the argument put in for it, or bound first.
         let single = NODES[body].count == 0 && NODES[body].a > 0;
         let mut complex = 0;
@@ -493,12 +557,18 @@ fn inline_call(d: i64, o: i64, n: i64, fqn: [u8]) -> bool {
     }
 }
 
-// The statement call o is the whole of (`f(x);`, as written), or -1.
+// The statement call o is the whole of (`f(x);`, as written; not a
+// block's value), or -1.
 fn statement_of(o: i64) -> i64 {
     unsafe {
         for p in 1..PROGRAM_END {
             if pk(p) == NodeKind::ExprStmt && pa(p) == o {
-                return p;
+                // (with its `;`)
+                let mut e = pend(o);
+                while SRC[e] == ' ' || SRC[e] == '\t' || SRC[e] == '\n' {
+                    e += 1;
+                }
+                return if SRC[e] == ';' { p } else { -1 };
             }
         }
         -1
