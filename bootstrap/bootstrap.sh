@@ -17,7 +17,10 @@
 # Built steps are cached under target/bootstrap/<host>/, by tag and
 # commit, so a rerun only redoes HEAD (and what --history full asks for
 # that the cache lacks). The final compiler is copied to target/tachyonc,
-# where tests/run.sh looks for it.
+# where tests/run.sh looks for it. (0.14) In a linked git worktree the
+# releases come from the main checkout's cache (or $TACHYON_BOOTSTRAP_CACHE),
+# so a fresh worktree builds only HEAD; HEAD itself is always built in the
+# worktree's own target/bootstrap.
 #
 # usage: bootstrap/bootstrap.sh [options]
 #
@@ -35,8 +38,11 @@
 #                      as an object to link there (see
 #                      bootstrap/aarch64-linux-check.sh)
 #   --seed-bin PATH    use this seed binary instead of building one
-#   --cache DIR        the cache directory (default: target/bootstrap)
-#   --clean            empty the cache first
+#   --cache DIR        the cache directory for the releases (default:
+#                      $TACHYON_BOOTSTRAP_CACHE, else the main checkout's
+#                      target/bootstrap in a linked worktree, else
+#                      target/bootstrap)
+#   --clean            empty the cache first (and use this checkout's own)
 #   --out PATH         also copy the final compiler here
 #   --history MODE     (0.11) what is checked of the releases before HEAD:
 #                      `fast` (the default) builds each and checks its
@@ -57,7 +63,8 @@ export LC_ALL
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 MANIFEST="$ROOT/bootstrap/releases.toml"
-CACHE="$ROOT/target/bootstrap"
+CACHE=
+LOCAL_CACHE="$ROOT/target/bootstrap"
 WORKTREE=0
 DEV=0
 UNTIL=""
@@ -109,11 +116,25 @@ while [ $# -gt 0 ]; do
         --history) [ $# -ge 2 ] || die "--history needs fast or full"; HISTORY=$2; shift ;;
         --history=*) HISTORY=${1#--history=} ;;
         --no-head-tests) RUN_HEAD_TESTS=0 ;;
-        -h|--help) sed -n '2,52p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,58p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown option '$1' (see --help)" ;;
     esac
     shift
 done
+if [ -z "$CACHE" ] && [ $CLEAN -eq 0 ]; then
+    if [ -n "${TACHYON_BOOTSTRAP_CACHE:-}" ]; then
+        CACHE=$TACHYON_BOOTSTRAP_CACHE
+    else
+        # A linked worktree shares the main checkout's releases (keyed by tag
+        # and commit, so sharing is safe); HEAD stays local, below.
+        common=$(cd "$ROOT" && git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+        main_root=$(dirname "$common")
+        if [ -n "$common" ] && [ "$main_root" != "$ROOT" ] && [ -d "$main_root/target/bootstrap" ]; then
+            CACHE="$main_root/target/bootstrap"
+        fi
+    fi
+fi
+[ -n "$CACHE" ] || CACHE=$LOCAL_CACHE
 case "$HISTORY" in
     fast|full) ;;
     *) die "--history is fast or full, not '$HISTORY'" ;;
@@ -256,6 +277,9 @@ fi
 cd "$ROOT"
 git rev-parse --git-dir >/dev/null 2>&1 || die "$ROOT is not a git repository"
 CACHE="$CACHE/$HOST"
+LOCAL_CACHE="$LOCAL_CACHE/$HOST"
+[ "$CACHE" = "$LOCAL_CACHE" ] || step "releases from the shared cache $CACHE"
+mkdir -p "$LOCAL_CACHE"
 if [ $CLEAN -eq 1 ]; then
     step "cleaning $CACHE"
     rm -rf "$CACHE"
@@ -398,7 +422,7 @@ if [ -n "$seed_commit" ]; then
     [ -d "$seed_cache/tree" ] || extract "$seed_commit" "$seed_cache/tree"
     build_seed "$seed_cache/tree" "$seed_cache" "tag '$SEED_TAG'"
 elif [ $DEV -eq 1 ]; then
-    build_seed "$ROOT" "$CACHE/seed-worktree" "the working tree (--dev)"
+    build_seed "$ROOT" "$LOCAL_CACHE/seed-worktree" "the working tree (--dev)"
 else
     die "tag '$SEED_TAG' not found; fetch the tags (git fetch --tags), or use --dev before it exists"
 fi
@@ -473,7 +497,7 @@ FINAL=$PREV_BIN
 # ---- HEAD ----
 
 if [ $STOPPED -eq 0 ]; then
-    head_dir="$CACHE/head"
+    head_dir="$LOCAL_CACHE/head"
     rm -rf "$head_dir"
     mkdir -p "$head_dir"
     if [ $WORKTREE -eq 1 ]; then
@@ -500,7 +524,7 @@ if [ -n "$CROSS" ]; then
     # -lm` links there. Built there by itself, it must emit this object
     # again (bootstrap/aarch64-linux-check.sh checks it).
     step "head: cross-compiling itself for $CROSS"
-    cross_dir="$CACHE/head/$CROSS"
+    cross_dir="$LOCAL_CACHE/head/$CROSS"
     mkdir -p "$cross_dir" "$ROOT/target/$CROSS"
     "$FINAL" --target "$CROSS" "$head_tree/$HEAD_COMPILER/$HEAD_ROOT" -o "$cross_dir/tachyonc.o" \
         || die "the cross-compilation for $CROSS failed"

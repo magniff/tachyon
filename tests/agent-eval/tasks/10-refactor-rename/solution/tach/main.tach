@@ -1,0 +1,338 @@
+// A library's front desk: books, members, loans and reports, driven by
+// commands on stdin, one per line. Everything printed goes through `out`.
+
+mod catalog;
+mod loans;
+mod members;
+mod report;
+mod text;
+
+import "stdio.h" as c;
+use catalog::{Book, Catalog};
+use loans::{LOAN_DAYS, Loans, days_late, late_fee};
+use members::Members;
+use report::{report_members, report_overdue, report_stock, report_summary};
+use std::Buf;
+use text::{parse_int, push_int, push_money, rest_after, words};
+
+// A member may hold this many books at once.
+const MAX_LOANS: i64 = 3;
+// A member who owes more than this, in cents, may not borrow.
+const MAX_OWED: i64 = 1000;
+
+pub struct Library {
+    pub catalog: Catalog,
+    pub members: Members,
+    pub loans: Loans,
+    // Fees paid, in cents.
+    pub collected: i64,
+}
+
+fn main() -> i32 {
+    let mut input = Buf::new();
+    loop {
+        let ch = unsafe { c::getchar() };
+        if ch < 0 {
+            break;
+        }
+        input.push(ch as u8);
+    }
+    let mut lib = Library {
+        catalog: Catalog::new(),
+        members: Members::new(),
+        loans: Loans::new(),
+        collected: 0,
+    };
+    let mut out = Buf::new();
+    let text = input.as_slice();
+    let mut start = 0;
+    for i in 0..text.len + 1 {
+        if i == text.len || text[i] == '\n' {
+            let mut line = text[start..i];
+            start = i + 1;
+            if line.len > 0 && line[line.len - 1] == '\r' {
+                line = line[..line.len - 1];
+            }
+            let mut w = words(line);
+            defer w.free();
+            if w.len() == 0 || w.get(0)[0] == '#' {
+                continue;
+            }
+            run_command(&lib, line, w.as_slice(), &out);
+        }
+    }
+    print(out.as_slice());
+    0
+}
+
+fn run_command(lib: *Library, line: [u8], w: [[u8]], out: *Buf) {
+    let cmd = w[0];
+    if cmd == "ADD" {
+        cmd_add(lib, line, w, out);
+    } else if cmd == "JOIN" {
+        cmd_join(lib, line, w, out);
+    } else if cmd == "LEND" {
+        cmd_lend(lib, w, out);
+    } else if cmd == "RETURN" {
+        cmd_return(lib, w, out);
+    } else if cmd == "PAY" {
+        cmd_pay(lib, w, out);
+    } else if cmd == "REPORT" {
+        cmd_report(lib, w, out);
+    } else {
+        out.push_str("error: unknown command ");
+        out.push_str(cmd);
+        out.push('\n');
+    }
+}
+
+// Writes the usage line of a command given too few words.
+fn usage(text: [u8], out: *Buf) {
+    out.push_str("error: usage: ");
+    out.push_str(text);
+    out.push('\n');
+}
+
+// The number in `word`, or None after writing an error.
+fn number(word: [u8], out: *Buf) -> Option<i64> {
+    let n = parse_int(word);
+    if n.is_none() {
+        out.push_str("error: bad number ");
+        out.push_str(word);
+        out.push('\n');
+    }
+    n
+}
+
+// ADD <id> <copies> <title>
+fn cmd_add(lib: *Library, line: [u8], w: [[u8]], out: *Buf) {
+    if w.len < 4 {
+        return usage("ADD <id> <copies> <title>", out);
+    }
+    let id = match number(w[1], out) {
+        Some(n) => n,
+        None => return,
+    };
+    let copies = match number(w[2], out) {
+        Some(n) => n,
+        None => return,
+    };
+    if copies == 0 {
+        out.push_str("error: no copies\n");
+        return;
+    }
+    let known = lib.catalog.find(id).is_some();
+    let now = lib.catalog.add(id, rest_after(line, 3), copies);
+    if known {
+        out.push_str("restocked ");
+        push_int(out, id);
+        out.push_str(": ");
+        push_int(out, now);
+        out.push_str(" copies\n");
+    } else {
+        out.push_str("added ");
+        push_int(out, id);
+        out.push_str(": ");
+        out.push_str(rest_after(line, 3));
+        out.push('\n');
+    }
+}
+
+// JOIN <id> <name>
+fn cmd_join(lib: *Library, line: [u8], w: [[u8]], out: *Buf) {
+    if w.len < 3 {
+        return usage("JOIN <id> <name>", out);
+    }
+    let id = match number(w[1], out) {
+        Some(n) => n,
+        None => return,
+    };
+    if lib.members.add(id, rest_after(line, 2)) {
+        out.push_str("joined ");
+    } else {
+        out.push_str("error: member exists ");
+    }
+    push_int(out, id);
+    out.push('\n');
+}
+
+// LEND <member> <book> <day>
+fn cmd_lend(lib: *Library, w: [[u8]], out: *Buf) {
+    if w.len < 4 {
+        return usage("LEND <member> <book> <day>", out);
+    }
+    let member = match number(w[1], out) {
+        Some(n) => n,
+        None => return,
+    };
+    let book = match number(w[2], out) {
+        Some(n) => n,
+        None => return,
+    };
+    let day = match number(w[3], out) {
+        Some(n) => n,
+        None => return,
+    };
+    let mi = match lib.members.find(member) {
+        Some(i) => i,
+        None => {
+            out.push_str("error: no member ");
+            push_int(out, member);
+            out.push('\n');
+            return;
+        }
+    };
+    let bi = match lib.catalog.find(book) {
+        Some(i) => i,
+        None => {
+            out.push_str("error: no book ");
+            push_int(out, book);
+            out.push('\n');
+            return;
+        }
+    };
+    let ms = lib.members.list.as_slice();
+    let items = lib.catalog.items.as_slice();
+    let it: Book = items[bi];
+    if ms[mi].on_loan >= MAX_LOANS {
+        out.push_str("error: member ");
+        push_int(out, member);
+        out.push_str(" holds ");
+        push_int(out, MAX_LOANS);
+        out.push_str(" books\n");
+        return;
+    }
+    if ms[mi].owes > MAX_OWED {
+        out.push_str("error: member ");
+        push_int(out, member);
+        out.push_str(" owes ");
+        push_money(out, ms[mi].owes);
+        out.push('\n');
+        return;
+    }
+    if it.available() == 0 {
+        out.push_str("error: book ");
+        push_int(out, book);
+        out.push_str(" is out\n");
+        return;
+    }
+    items[bi].lent += 1;
+    ms[mi].on_loan += 1;
+    lib.loans.lend(member, book, day);
+    out.push_str("lent ");
+    push_int(out, book);
+    out.push_str(" to ");
+    push_int(out, member);
+    out.push_str(", due day ");
+    push_int(out, day + LOAN_DAYS);
+    out.push('\n');
+}
+
+// RETURN <member> <book> <day>
+fn cmd_return(lib: *Library, w: [[u8]], out: *Buf) {
+    if w.len < 4 {
+        return usage("RETURN <member> <book> <day>", out);
+    }
+    let member = match number(w[1], out) {
+        Some(n) => n,
+        None => return,
+    };
+    let book = match number(w[2], out) {
+        Some(n) => n,
+        None => return,
+    };
+    let day = match number(w[3], out) {
+        Some(n) => n,
+        None => return,
+    };
+    let li = match lib.loans.find(member, book) {
+        Some(i) => i,
+        None => {
+            out.push_str("error: no loan of ");
+            push_int(out, book);
+            out.push_str(" to ");
+            push_int(out, member);
+            out.push('\n');
+            return;
+        }
+    };
+    let loan = lib.loans.remove(li);
+    let days = day - loan.day;
+    let fee = late_fee(days);
+    if let Some(mi) = lib.members.find(member) {
+        let ms = lib.members.list.as_slice();
+        ms[mi].on_loan -= 1;
+        ms[mi].owes += fee;
+    }
+    if let Some(bi) = lib.catalog.find(book) {
+        lib.catalog.items.as_slice()[bi].lent -= 1;
+    }
+    out.push_str("returned ");
+    push_int(out, book);
+    out.push_str(" by ");
+    push_int(out, member);
+    out.push_str(", ");
+    push_int(out, days_late(days));
+    out.push_str(" days late, fee ");
+    push_money(out, fee);
+    out.push('\n');
+}
+
+// PAY <member> <cents>
+fn cmd_pay(lib: *Library, w: [[u8]], out: *Buf) {
+    if w.len < 3 {
+        return usage("PAY <member> <cents>", out);
+    }
+    let member = match number(w[1], out) {
+        Some(n) => n,
+        None => return,
+    };
+    let cents = match number(w[2], out) {
+        Some(n) => n,
+        None => return,
+    };
+    let mi = match lib.members.find(member) {
+        Some(i) => i,
+        None => {
+            out.push_str("error: no member ");
+            push_int(out, member);
+            out.push('\n');
+            return;
+        }
+    };
+    let amount = lib.members.pay(mi, cents);
+    lib.collected += amount;
+    out.push_str("paid ");
+    push_money(out, amount);
+    out.push_str(", owes ");
+    push_money(out, lib.members.list.get(mi).owes);
+    out.push('\n');
+}
+
+// REPORT STOCK | MEMBERS | OVERDUE <day> | SUMMARY
+fn cmd_report(lib: *Library, w: [[u8]], out: *Buf) {
+    if w.len < 2 {
+        return usage("REPORT <kind>", out);
+    }
+    let kind = w[1];
+    if kind == "STOCK" {
+        report_stock(lib, out);
+    } else if kind == "MEMBERS" {
+        report_members(lib, out);
+    } else if kind == "OVERDUE" {
+        if w.len < 3 {
+            return usage("REPORT OVERDUE <day>", out);
+        }
+        let day = match number(w[2], out) {
+            Some(n) => n,
+            None => return,
+        };
+        report_overdue(lib, day, out);
+    } else if kind == "SUMMARY" {
+        report_summary(lib, out);
+    } else {
+        out.push_str("error: unknown report ");
+        out.push_str(kind);
+        out.push('\n');
+    }
+}
