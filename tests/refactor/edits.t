@@ -143,7 +143,7 @@ error edit.no-text: the new text is read from stdin; none was given
 try: tachyonc edit replace geom::area < new.tach
 [exit 2]
 $ edit move geom::area
-error edit.usage: unknown command 'move' (replace, insert, delete)
+error edit.usage: unknown command 'move' (patch, replace, insert, delete)
 [exit 2]
 ## Undo, edit by edit; a file changed since is not undone (--force does).
 $ undo

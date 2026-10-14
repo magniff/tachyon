@@ -3,6 +3,7 @@
 //   tachyonc edit replace NAME [ROOT] < TEXT   the item's text becomes TEXT
 //   tachyonc edit insert --after|--before NAME [ROOT] < TEXT
 //   tachyonc edit delete NAME [ROOT]
+//   tachyonc edit patch TARGET --old TEXT --new TEXT   (patch.tach)
 //   tachyonc undo                              the last edit, undone
 //   tachyonc check [ROOT]                      the front end's errors
 //
@@ -43,6 +44,7 @@ use crate::proc::{
 use crate::target::target_of_name;
 use crate::streq;
 use crate::cpp::file_exists;
+use crate::patch::run_patch;
 
 // ---- The edit engine ----
 
@@ -66,6 +68,8 @@ static mut DEL_TO: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 // The options every editing command takes.
 pub static mut DRY_RUN: bool = false;
 pub static mut NO_CHECK: bool = false;
+// --show: print the changed regions after the edit (0.12).
+pub static mut SHOW: bool = false;
 // --target T (0: the host), passed on to the check.
 pub static mut TARGET: i64 = 0;
 pub static mut TARGET_NAME: *u8 = 0 as *u8;
@@ -963,7 +967,89 @@ pub fn finish_edit(what: [u8], root: *u8) -> i64 {
         }
         buf_byte(summary, '\n');
         buf_write_fd(summary, STDOUT);
+        if SHOW {
+            show_changes(buf_slice(diff));
+        }
         if ok { 0 } else { 1 }
+    }
+}
+
+// --show (0.12): after an edit, the regions it changed, as their new lines
+// numbered (from the edit's diff): `// FILE:A-B` then `LINE<TAB>TEXT`;
+// lines only removed: `// FILE:A: N lines removed after line A`.
+fn show_changes(diff: [u8]) {
+    unsafe {
+        let out = buf_new();
+        let mut file = diff[0..0];
+        let mut line = 0;
+        let mut header = false;
+        let mut i = 0;
+        while i < diff.len {
+            let mut e = i;
+            while e < diff.len && diff[e] != '\n' {
+                e += 1;
+            }
+            let l = diff[i..e];
+            if header && l.len >= 6 && l[0] == '+' && l[1] == '+' && l[2] == '+' {
+                file = l[6..l.len];
+                header = false;
+            } else if l.len >= 6 && l[0] == '-' && l[1] == '-' && l[2] == '-' && l[3] == ' ' {
+                header = true;
+            } else if l.len > 2 && l[0] == '@' && l[1] == '@' {
+                // `@@ -A[,B] +C[,D] @@`
+                let mut p = 4;
+                let mut removed = 1;
+                while p < l.len && l[p] >= '0' && l[p] <= '9' {
+                    p += 1;
+                }
+                if p < l.len && l[p] == ',' {
+                    p += 1;
+                    removed = 0;
+                    while p < l.len && l[p] >= '0' && l[p] <= '9' {
+                        removed = removed * 10 + (l[p] - '0') as i64;
+                        p += 1;
+                    }
+                }
+                p += 2;
+                let mut c = 0;
+                while p < l.len && l[p] >= '0' && l[p] <= '9' {
+                    c = c * 10 + (l[p] - '0') as i64;
+                    p += 1;
+                }
+                let mut d = 1;
+                if p < l.len && l[p] == ',' {
+                    p += 1;
+                    d = 0;
+                    while p < l.len && l[p] >= '0' && l[p] <= '9' {
+                        d = d * 10 + (l[p] - '0') as i64;
+                        p += 1;
+                    }
+                }
+                line = c;
+                buf_str(out, c"// ");
+                buf_bytes(out, file);
+                buf_byte(out, ':');
+                buf_int(out, c);
+                if d == 0 {
+                    buf_str(out, c": ");
+                    buf_int(out, removed);
+                    buf_str(out, if removed == 1 { c" line removed after line " } else { c" lines removed after line " });
+                    buf_int(out, c);
+                } else if d > 1 {
+                    buf_byte(out, '-');
+                    buf_int(out, c + d - 1);
+                }
+                buf_byte(out, '\n');
+            } else if l.len > 0 && l[0] == '+' {
+                buf_int(out, line);
+                buf_byte(out, '\t');
+                buf_bytes(out, l[1..l.len]);
+                buf_byte(out, '\n');
+                line += 1;
+            }
+            i = e + 1;
+        }
+        buf_write_fd(out, STDOUT);
     }
 }
 
@@ -1348,6 +1434,60 @@ fn run_undo(force: bool, from: *u8) -> i64 {
     }
 }
 
+// `tachyonc query diff [ROOT]` (0.12): the last edit of the journal (what
+// `undo` would take back), its summary line, then its diff with no
+// context lines; nothing changes.
+pub fn run_query_diff(from: *u8) -> i64 {
+    unsafe {
+        let dir = journal_dir(if from != 0 as *u8 { from } else { c"." });
+        let n = if dir == 0 as *u8 { 0 } else { read_number(path_in(dir, c"head")) };
+        let files = buf_new();
+        if n <= 0 || !read_file_if(entry_path(dir, n, -1, c"files"), files) {
+            let d = diag(c"error", c"undo.empty");
+            buf_str(d, c"no edit in the journal\n");
+            return 1;
+        }
+        let out = buf_new();
+        let summary = buf_new();
+        read_file_if(entry_path(dir, n, -1, c"summary"), summary);
+        buf_str(out, c"# ");
+        buf_bytes(out, buf_slice(summary));
+        if BUFS[out].data[BUFS[out].len - 1] != '\n' {
+            buf_byte(out, '\n');
+        }
+        let t = buf_slice(files);
+        let mut i = 0;
+        let mut k = 0;
+        while i < t.len {
+            let mut tab = i;
+            while tab < t.len && t[tab] != '\t' {
+                tab += 1;
+            }
+            let p = buf_new();
+            buf_bytes(p, t[i..tab]);
+            let before = buf_new();
+            let after = buf_new();
+            read_file_if(entry_path(dir, n, k, c"before"), before);
+            read_file_if(entry_path(dir, n, k, c"after"), after);
+            // (relative to the current directory when under it)
+            let path = buf_slice(p);
+            let here = c_slice(absolute_path(c"."));
+            let mut shown = path;
+            if path.len > here.len + 1 && path[here.len] == '/' && same_bytes(path[0..here.len], here) {
+                shown = path[here.len + 1..path.len];
+            }
+            diff_texts(out, shown, buf_slice(before), buf_slice(after));
+            while i < t.len && t[i] != '\n' {
+                i += 1;
+            }
+            i += 1;
+            k += 1;
+        }
+        buf_write_fd(out, STDOUT);
+        0
+    }
+}
+
 // ---- Items as text ----
 //
 // An item's text (what replace, insert and delete work on) is whole lines
@@ -1403,7 +1543,7 @@ pub fn node_head(start: i64) -> i64 {
 
 // The end of the item of definition d: its node's end, and the `;` or (a
 // field, a variant) the `,` right after it.
-fn item_tail(d: i64) -> i64 {
+pub fn item_tail(d: i64) -> i64 {
     unsafe {
         let end = DEFS[d].end;
         let i = token_at(end);
@@ -1601,13 +1741,16 @@ fn usage(message: *u8) -> i64 {
     }
 }
 
-// The options the editing commands share: --dry-run, --no-check, --exact,
-// --root R, --target T. Whether a[i] is one (*i moves past its value).
+// The options the editing commands share: --dry-run, --no-check, --show,
+// --exact, --root R, --target T. Whether a[i] is one (*i moves past its
+// value).
 pub fn take_edit_option(argc: i64, argv: **u8, i: *i64, root: **u8) -> bool {
     unsafe {
         let a = argv[*i];
         if streq(a, c"--dry-run") {
             DRY_RUN = true;
+        } else if streq(a, c"--show") {
+            SHOW = true;
         } else if streq(a, c"--no-check") {
             NO_CHECK = true;
         } else if streq(a, c"--exact") {
@@ -1627,7 +1770,17 @@ pub fn take_edit_option(argc: i64, argv: **u8, i: *i64, root: **u8) -> bool {
     }
 }
 
-// `edit replace|insert|delete ...`.
+// Whether word is one of argv[3..].
+fn has_arg(argc: i64, argv: **u8, word: *u8) -> bool {
+    for i in 3..argc {
+        if unsafe { streq(argv[i], word) } {
+            return true;
+        }
+    }
+    false
+}
+
+// `edit replace|insert|delete ...` (`patch`, `insert --in`: patch.tach).
 fn run_edit_inner(argc: i64, argv: **u8) -> i64 {
     unsafe {
         PROG = argv[0];
@@ -1635,9 +1788,12 @@ fn run_edit_inner(argc: i64, argv: **u8) -> i64 {
         ARGC = argc;
         ARGV = argv;
         if argc < 3 {
-            return usage(c"no command (replace, insert, delete)");
+            return usage(c"no command (patch, replace, insert, delete)");
         }
         let cmd = argv[2];
+        if streq(cmd, c"patch") || (streq(cmd, c"insert") && has_arg(argc, argv, c"--in")) {
+            return run_patch(argc, argv);
+        }
         let replace = streq(cmd, c"replace");
         let insert = streq(cmd, c"insert");
         let delete = streq(cmd, c"delete");
@@ -1645,7 +1801,7 @@ fn run_edit_inner(argc: i64, argv: **u8) -> i64 {
             let d = diag(c"error", c"edit.usage");
             buf_str(d, c"unknown command '");
             buf_str(d, cmd);
-            buf_str(d, c"' (replace, insert, delete)\n");
+            buf_str(d, c"' (patch, replace, insert, delete)\n");
             return 2;
         }
         let mut after = false;

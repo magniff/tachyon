@@ -55,6 +55,8 @@ use crate::gen::MAIN_SYM;
 use crate::lower::HMap;
 use crate::{IMPORTED_START, host_target, import_c_headers, streq};
 use crate::plan::{query_deps, query_impact, query_stats, query_unused};
+use crate::query_text::{WITH_COMMENTS, all_files, infer_root, run_text, section_start, show_region, show_files};
+use crate::edit::run_query_diff;
 
 extern "C" {
     fn getenv(name: *u8) -> *u8;
@@ -1420,6 +1422,10 @@ pub static mut OPT_IN: *u8 = 0 as *u8;
 // --in: per file, per module, whether it is in.
 pub static mut IN_FILE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 pub static mut IN_MODULE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// --in FILE:LINE: the text of the item holding that line, [IN_START, IN_END).
+pub static mut IN_START: i64 = -1;
+pub static mut IN_END: i64 = -1;
+pub static mut IN_NO_ITEM: bool = false;
 
 // The path of file f as printed.
 pub fn file_text(f: i64) -> [u8] {
@@ -1434,7 +1440,9 @@ pub fn file_text(f: i64) -> [u8] {
 
 // Resolves --in X: a file (X has a `/`, ends in `.tach` or is `<std>`;
 // the path, or its end by whole components) or a module (matched like
-// NAME, with its inline modules). Whether anything matched.
+// NAME, with its inline modules), or FILE:LINE (the item holding that
+// line: ref_in; its file for the fixes by module). Whether anything
+// matched.
 pub fn resolve_in(x: [u8]) -> bool {
     unsafe {
         let mut any = false;
@@ -1443,6 +1451,28 @@ pub fn resolve_in(x: [u8]) -> bool {
         }
         for _ in 0..module_count() {
             IN_MODULE.push(0);
+        }
+        // (FILE:LINE: the item holding that line; its file for what works by
+        // file or module)
+        let a = trailing_number(x);
+        if a > 0 && x[a - 1] == ':' && (a < 2 || x[a - 2] != ':') {
+            let file = x[0..a - 1];
+            for f in 0..FILE_COUNT {
+                let p = file_text(f);
+                if bytes_eq(p, file) || (p.len > file.len && bytes_eq(p[p.len - file.len..p.len], file)
+                    && p[p.len - file.len - 1] == '/') {
+                    let d = def_at_line(f, parse_digits(x[a..x.len]));
+                    if d < 0 {
+                        IN_NO_ITEM = true;
+                        return false;
+                    }
+                    IN_START = text_start(d);
+                    IN_END = DEFS[d].end;
+                    IN_FILE.data[f] = 1;
+                    return true;
+                }
+            }
+            return false;
         }
         let is_file = x.len > 0 && (x[0] == '<' || find_in(x, c"/", 0) >= 0 || find_in(x, c".tach", 0) >= 0);
         if is_file {
@@ -1465,11 +1495,30 @@ pub fn resolve_in(x: [u8]) -> bool {
     }
 }
 
+// The message of a --in that resolve_in did not resolve (after `diag`):
+// no such file or module, or (FILE:LINE) no item at that line.
+pub fn put_bad_in(d: i64, x: *u8) {
+    unsafe {
+        if IN_NO_ITEM {
+            buf_str(d, c"no item at ");
+            buf_str(d, x);
+            buf_byte(d, '\n');
+            return;
+        }
+        buf_str(d, c"no file or module '");
+        buf_str(d, x);
+        buf_str(d, c"' in the program\n");
+    }
+}
+
 // Whether the reference at pos passes --in.
 pub fn ref_in(pos: i64) -> bool {
     unsafe {
         if OPT_IN == 0 as *u8 {
             return true;
+        }
+        if IN_START >= 0 {
+            return pos >= IN_START && pos < IN_END;
         }
         if IN_FILE.data[file_of_pos(pos)] != 0 {
             return true;
@@ -1772,7 +1821,7 @@ fn query_show(matches: *IntVec, name: [u8]) -> i64 {
         }
         for i in 0..n {
             let d = (*matches).data[i];
-            let first = text_start(d);
+            let first = section_start(text_start(d));
             let last = line_end(if DEFS[d].end > DEFS[d].start { DEFS[d].end - 1 } else { DEFS[d].start });
             buf_str(out, c"// ");
             buf_bytes(out, SYMS[DEFS[d].fqn].text);
@@ -2056,7 +2105,10 @@ pub fn load_program(root: *u8, target: i64) -> bool {
 // The commands, for `--help` and the nearest command to a misspelt one.
 fn put_usage(out: i64) {
     unsafe {
-        buf_str(out, c"usage: tachyonc query def|show NAME... [--root ROOT] [--exact]\n");
+        buf_str(out, c"usage: tachyonc query def|show NAME... [--root ROOT] [--exact] [--with-comments]\n");
+        buf_str(out, c"       tachyonc query show FILE.tach | MODULE::use | MODULE::header | MODULE::extern\n");
+        buf_str(out, c"       tachyonc query text FILE[:A[-B]]...\n");
+        buf_str(out, c"       tachyonc query diff\n");
         buf_str(out, c"       tachyonc query refs|callers NAME... [--exact] [--count] [--in FILE|MODULE] [--limit N] [--all]\n");
         buf_str(out, c"       tachyonc query items [MODULE...]\n");
         buf_str(out, c"       tachyonc query stats [MODULE|FILE] [--over N] [--all]\n");
@@ -2075,12 +2127,12 @@ fn usage_error() -> i64 {
     unsafe { diag(c"error", c"query.usage") }
 }
 
-const N_COMMANDS: i64 = 9;
+const N_COMMANDS: i64 = 11;
 
 fn command_name(i: i64) -> *u8 {
     if i == 0 { c"def" } else if i == 1 { c"show" } else if i == 2 { c"refs" } else if i == 3 { c"callers" }
     else if i == 4 { c"items" } else if i == 5 { c"stats" } else if i == 6 { c"deps" } else if i == 7 { c"unused" }
-    else { c"impact" }
+    else if i == 8 { c"impact" } else if i == 9 { c"text" } else { c"diff" }
 }
 
 // The command nearest to cmd (edit distance at most 2), or 0.
@@ -2160,6 +2212,8 @@ fn run_query_inner(argc: i64, argv: **u8) -> i64 {
                 OPT_EXACT = true;
             } else if streq(a, c"--all") {
                 OPT_ALL = true;
+            } else if streq(a, c"--with-comments") {
+                WITH_COMMENTS = true;
             } else if valued {
                 if i + 1 >= argc || argv[i + 1][0] == '-' {
                     bad = a;
@@ -2207,6 +2261,16 @@ fn run_query_inner(argc: i64, argv: **u8) -> i64 {
                 try_end(try_begin(c"items", c_slice(c""), false));
             }
             return 2;
+        }
+        // Text (0.12, query_text.tach): no program read.
+        if streq(cmd, c"text") {
+            return run_text(&args);
+        }
+        if streq(cmd, c"show") && root == 0 as *u8 && all_files(&args) {
+            return show_files(&args);
+        }
+        if streq(cmd, c"diff") {
+            return run_query_diff(root);
         }
         // ROOT: --root, else a last argument ending in .tach after the
         // NAMEs (or alone, for items: its MODULE is optional; for stats
@@ -2259,6 +2323,9 @@ fn run_query_inner(argc: i64, argv: **u8) -> i64 {
                 try_end(try_begin(cmd, first, args.count > 0));
             }
             return 2;
+        }
+        if root == 0 as *u8 {
+            root = infer_root(&args);
         }
         root = root_or_diag(root, cmd, first, args.count > 0);
         if root == 0 as *u8 {
@@ -2420,9 +2487,7 @@ fn answer(cmd: *u8, args: *IntVec, items: bool, is_refs: bool) -> i64 {
         if is_refs {
             if OPT_IN != 0 as *u8 && !resolve_in(c_slice(OPT_IN)) {
                 let out = diag(c"error", c"query.bad-in");
-                buf_str(out, c"no file or module '");
-                buf_str(out, OPT_IN);
-                buf_str(out, c"' in the program\n");
+                put_bad_in(out, OPT_IN);
                 try_end(try_begin(cmd, c_slice((*args).data[0] as *u8), true));
                 return 1;
             }
@@ -2431,6 +2496,16 @@ fn answer(cmd: *u8, args: *IntVec, items: bool, is_refs: bool) -> i64 {
         let mut all = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for i in 0..n {
             let text = c_slice((*args).data[i] as *u8);
+            if streq(cmd, c"show") {
+                // (MODULE::use, ::header, ::extern)
+                let r = show_region(text);
+                if r >= 0 {
+                    if r != 0 {
+                        status = 1;
+                    }
+                    continue;
+                }
+            }
             let mut matches = IntVec { data: 0 as *i64, count: 0, cap: 0 };
             if !resolve_name(cmd, text, &matches) {
                 status = 1;

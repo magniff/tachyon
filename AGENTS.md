@@ -17,8 +17,13 @@ sed, head, cat or awk ([docs/query.md](docs/query.md)):
 | where something is used | `target/tachyonc query refs NAME` (`--count`, `--in FILE\|MODULE`) |
 | where it is defined, its signature | `target/tachyonc query def NAME` |
 | what a module contains | `target/tachyonc query items MODULE` |
-| the item at a compiler error's position | `target/tachyonc query show FILE:LINE` |
+| the item at a compiler error's position | `target/tachyonc query show FILE:LINE` (`--with-comments`: its section comment too) |
+| a module's `use` lines, header comment, extern blocks | `target/tachyonc query show MODULE::use` (`::header`, `::extern`) |
+| lines of any file (a test, a fixture, conflict markers), a small file | `target/tachyonc query text FILE:A-B`, `query show FILE.tach` |
+| change a few lines inside an item (a condition, a statement) | `target/tachyonc edit patch NAME\|FILE:LINE --old 'TEXT' --new 'TEXT'` (pairs repeat; several lines: `< pairs`, blocks `<<<<<<< OLD` / `=======` / `>>>>>>> NEW`; `--loose` for other indentation) |
+| add statements inside an item | `target/tachyonc edit insert --in NAME --after\|--before 'ANCHOR' < text` |
 | replace, add or remove an item by name | `target/tachyonc edit replace NAME < new.tach`, `edit insert --after\|--before NAME`, `edit delete NAME` (`--dry-run` for the diff) |
+| see what an edit changed, without reading the file back | `--show` on any edit or refactoring; `target/tachyonc query diff` (the last one) |
 | take the last edit back | `target/tachyonc undo` |
 | add, remove, rename, reorder or retype a parameter, with every call | `target/tachyonc refactor signature FN --add 'x: i64 = 0'` (`--remove x`, `--rename-param a b`, `--reorder b,a`, `--type x T`) |
 | add, remove, rename or retype a field, with every literal and access | `target/tachyonc refactor field STRUCT --add 'g: i64 = 0'` (`--remove g`, `--rename g h`, `--type g T`) |
@@ -56,7 +61,14 @@ with a trailing comment saying why:
 
 The reason is recorded (`.git/agent-tools.jsonl`) and is how the tool
 gets better, so be specific: what you needed, and what query gave or
-lacked. Editing files (Edit, Write, `sed -i`) is not affected.
+lacked.
+
+Edits go through `tachyonc edit` too: the hook also blocks shell
+rewrites of compiler source (`sed -i`, `perl -pi`, Python writing a
+`.tach` file under compiler/src or compiler/std) and suggests the `edit
+patch` that does the same, checked and undoable. When the tools cannot
+make the edit, append `# no-tool: <what the tools could not do>`. The
+Edit and Write tools, test fixtures and docs are not affected.
 
 When any tachyon tool (query, edit, refactor, check, fix, the hook)
 falls short, record it in one line:

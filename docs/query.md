@@ -13,7 +13,10 @@ compiler's own `<std>` and `<C import>` last), then line, then column.
 
 ```
 tachyonc query def NAME... [--root ROOT] [--exact]
-tachyonc query show NAME... [--root ROOT] [--exact]
+tachyonc query show NAME... [--root ROOT] [--exact] [--with-comments]
+tachyonc query show FILE.tach... | MODULE::use | MODULE::header | MODULE::extern
+tachyonc query text FILE[:A[-B]]...                         (no program read)
+tachyonc query diff [ROOT]                                  the last journaled edit
 tachyonc query refs NAME... [--root ROOT] [--exact] [--count] [--in FILE|MODULE] [--limit N] [--all]
 tachyonc query callers NAME... [--root ROOT] [--exact] [--count] [--in FILE|MODULE] [--limit N] [--all]
 tachyonc query items [MODULE...] [--root ROOT]
@@ -149,6 +152,57 @@ A struct or enum shows its whole declaration (not its impl blocks);
 `show` prints only their paths, one per line, and fails (exit 1) with
 `error query.ambiguous` and a `try:` line showing the first.
 
+`--with-comments` (0.12) starts the text higher: with the comment block
+above the item's own comments, after blank lines (a section comment,
+`// ---- The edit engine ----`), when there is one.
+
+### Text that is not an item (0.12)
+
+Most reads that queries could not answer were plain text: a module's
+`use` lines, a file's header comment, a test fixture, a file with merge
+conflict markers. These are answered too:
+
+| NAME | what show prints |
+|---|---|
+| `MODULE::use` | the module's `use` lines (each run of consecutive ones, with their continuation lines) |
+| `MODULE::header` | the comment at the top of its file (to its first line that is neither a comment nor blank) |
+| `MODULE::extern` | its `extern "C" { ... }` blocks |
+| `FILE.tach` (every NAME a file) | the whole file, `// FILE:1-N` then its lines, when it has at most 200 lines; else `error query.too-long` with `try:` `query stats FILE` (compiler source) and `query text FILE:1-200` |
+
+Each region is printed as an item is (`// crate::gvn::use→compiler/src/gvn.tach:12-20`,
+then its lines); none: `note query.empty`. A module of an inline `mod m
+{ }` has no file of its own: its name is matched as a NAME.
+
+`query text FILE[:A[-B]]...` prints lines A to B of any file (`FILE:A`
+one line, `FILE:A-` to the end, `FILE` all), numbered, without reading
+the program (no root, no parse: a test fixture, a generated program, a
+file with conflict markers, a doc):
+
+```
+// text/main.tach:6-8
+6→mod util;
+7→
+8→use util::{
+```
+
+At most 200 lines: past them `note query.truncated` and `try:` the next
+range. Lines past the end: `error query.no-match` with the file's
+length and `try:` its last lines; a file that cannot be read: `error
+query.no-file`.
+
+`query diff [ROOT]`: the last edit of the journal (what `undo` would take
+back, [refactor.md](refactor.md)): `# SUMMARY`, then its diff with no
+context lines. Nothing changes.
+
+### A file outside the compiler's source (0.12)
+
+When the default root would be the compiler's (`./compiler/src/main.tach`,
+or none) and a NAME is a `FILE.tach` or `FILE:LINE` outside compiler/src
+and compiler/std, the root is that file's program: the `main.tach` of its
+directory or of one of the two above it, else the file itself. So `query
+show tests/run/loops.tach:12` answers from that test, not from the
+compiler.
+
 ## refs and callers
 
 Every resolved reference, one per line, under a header per file:
@@ -194,7 +248,9 @@ references.
 - `--in FILE|MODULE` keeps the references in a file (an argument with a
   `/`, ending in `.tach` or `<std>`: the path, or its end by whole
   components, `gvn.tach`) or a module (matched like NAME, its inline
-  modules included: `gvn`, `crate::ir`).
+  modules included: `gvn`, `crate::ir`), or the item holding a line,
+  `FILE:LINE` (0.12; `rewrite --in` too; `fix --in FILE:LINE` fixes that
+  line's module).
 - None left: `note query.empty: 0 refs` (exit 0).
 
 ### The budget
@@ -257,7 +313,12 @@ when it was given, names quoted for the shell when they need it).
 | `query.ambiguous` | error | 1 | `show` matches more than 5 definitions (their paths on stdout) | `show` of the first |
 | `query.truncated` | note | 0 | refs/callers past the budget, or cut by `--limit` | `--in` the file with the most, `--limit 60`, `--all` |
 | `query.empty` | note | 0 | refs/callers found nothing (after `--in`) | |
-| `query.bad-in` | error | 1 | `--in` names no file or module of the program | the command without `--in` |
+| `query.bad-in` | error | 1 | `--in` names no file or module of the program (`no item at FILE:LINE` for a line between items) | the command without `--in` |
+| `query.no-file` | error | 1 | `text` or `show FILE`: the file cannot be read | |
+| `query.too-long` | error | 1 | `show FILE` of more than 200 lines | `query stats FILE`, `query text FILE:1-200` |
+| `query.truncated` | note | 0 | `text` of more than 200 lines | the next range |
+| `query.empty` | note | 0 | `show MODULE::use` (`header`, `extern`): none | |
+| `undo.empty` | error | 1 | `diff`: no edit in the journal | |
 | `query.program-errors` | warning | (the answer's) | the program has errors: their number, and the first one when nothing answered | the compilation that lists them all, one per line |
 | `query.program-errors` | error | 1 | the program could not be parsed at all | the same |
 | `query.no-root` | error | 2 | no ROOT, no `$TACHYON_ROOT`, no `./main.tach` or `./compiler/src/main.tach` | the command with a root |

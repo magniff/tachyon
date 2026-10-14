@@ -307,3 +307,20 @@ So for 0.12: `tachyonc edit patch NAME|FILE:LINE --old TEXT --new TEXT`
 never read whole), `edit insert --in NAME --after ANCHOR`, the hook
 steering Python and `sed -i` rewrites of compiler source to them, and the
 metric counted on edits to existing compiler source only.
+
+## 0.12: edits inside an item, and the edit metric
+
+Gap 2 above is `tachyonc edit patch` and `edit insert --in`
+([refactor.md](refactor.md)); the hook now blocks shell rewrites of
+compiler source (`# no-tool:` to go around it) and logs every tool run
+with whether it wrote, and Edit/Write with whether the file existed.
+
+`tools/agent-tool-usage.py --hook-log` reports **edits to existing
+compiler source** (compiler/src, compiler/std) on their own: tool edits
+(`tachyonc edit`, `refactor`, `fix`, `rewrite`, `undo`, written, on the
+compiler's source) against shell rewrites that ran (`sed -i`, `perl -pi`,
+Python) plus Edit and Write of existing compiler files. The share of the
+tools is the headline number. New files, test fixtures, docs, scratch
+programs (target/, /tmp), dry runs and blocked rewrites are listed apart
+and not counted. Logs from before 0.12 have no tool runs and no
+existence for Write, so the number is meaningful from 0.12 on.
