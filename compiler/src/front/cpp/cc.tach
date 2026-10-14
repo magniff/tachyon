@@ -1,0 +1,139 @@
+// The C compiler's settings: its predefined macros and its include search
+// path, asked from the target's C compiler (`cc -dM -E -v`, or
+// $TACHYON_CC), so that headers mean what they mean to C on this machine.
+
+use crate::base::{
+    BUFS, alloc_zeroed, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, die, die2, intern_c,
+    memcmp, strlen,
+};
+use crate::front::cpp::{C_EOF, DEFINING_BUILTINS, MACRO_OF};
+use crate::front::cpp::directives::CDIRS;
+use crate::front::cpp::input::{c_load_text, push_frame, raw_next};
+
+// Runs `command` and returns its output (stdout and stderr).
+fn run_command(command: *u8) -> i64 {
+    unsafe {
+        let out = buf_new();
+        let pipe = popen(command, c"r");
+        if pipe == 0 as *u8 {
+            die2(c"cannot run ", command);
+        }
+        let line = alloc_zeroed(4096);
+        while fgets(line, 4096, pipe) != 0 as *u8 {
+            buf_str(out, line);
+        }
+        pclose(pipe);
+        out
+    }
+}
+
+// Whether $TACHYON_CC names the C compiler for headers (0.9: then it is
+// trusted to be one for the target, even when cross-compiling).
+pub fn c_compiler_given() -> bool {
+    unsafe {
+        let env = getenv(c"TACHYON_CC");
+        env != 0 as *u8 && env[0] != 0
+    }
+}
+
+// The C compiler for headers: $TACHYON_CC, or cc.
+fn c_compiler() -> *u8 {
+    unsafe {
+        let env = getenv(c"TACHYON_CC");
+        if env != 0 as *u8 && env[0] != 0 { env } else { c"cc" }
+    }
+}
+
+// Asks the target's C compiler for its predefined macros (-dM) and its
+// include search path (-v), and defines and records them.
+pub fn cpp_query_compiler(target_flags: *u8) {
+    unsafe {
+        let b = buf_new();
+        buf_str(b, c_compiler());
+        buf_str(b, target_flags);
+        buf_str(b, c" -dM -E -v -x c /dev/null 2>&1");
+        buf_byte(b, 0);
+        let out = run_command(BUFS[b].data);
+        buf_byte(out, 0);
+        let text = BUFS[out].data;
+        let n = BUFS[out].len - 1;
+        // Lines: "#define ..." are macros; between "#include <...> search
+        // starts here:" and "End of search list." are directories.
+        let defines = buf_new();
+        let mut in_dirs = false;
+        let mut i = 0;
+        let mut found_dirs = false;
+        while i < n {
+            let mut j = i;
+            while j < n && text[j] != '\n' {
+                j += 1;
+            }
+            let line = text[i..j];
+            if starts_with(line, c"#define ") {
+                buf_bytes(defines, line);
+                buf_byte(defines, '\n');
+            } else if starts_with(line, c"#include <...> search starts here:") {
+                in_dirs = true;
+                found_dirs = true;
+            } else if starts_with(line, c"End of search list.") {
+                in_dirs = false;
+            } else if in_dirs && line.len > 1 && line[0] == ' ' {
+                // " /path" or " /path (framework directory)".
+                let mut e = line.len as i64;
+                if ends_with(line, c" (framework directory)") {
+                    e = 0;
+                }
+                if e > 0 {
+                    let d = buf_new();
+                    buf_bytes(d, line[1..e]);
+                    buf_byte(d, 0);
+                    CDIRS.push(BUFS[d].data as i64);
+                }
+            }
+            i = j + 1;
+        }
+        if !found_dirs {
+            let msg = buf_new();
+            buf_str(msg, c"the C compiler gave no include search path for the target (");
+            buf_bytes(msg, buf_slice(b)[0..BUFS[b].len - 1]);
+            buf_str(msg, c"); its output was:\n");
+            buf_bytes(msg, text[0..n]);
+            buf_byte(msg, 0);
+            die(BUFS[msg].data);
+        }
+        // The predefined macros, as a file of #defines.
+        DEFINING_BUILTINS = true;
+        let f = c_load_text(c"<built-in>", defines);
+        push_frame(f);
+        loop {
+            let t = raw_next();
+            if t == C_EOF {
+                break;
+            }
+        }
+        DEFINING_BUILTINS = false;
+        // Not C syntax tachyon reads: blocks (`^`).
+        MACRO_OF.put(intern_c(c"__BLOCKS__") + 1, 0);
+    }
+}
+
+fn starts_with(s: [u8], prefix: *u8) -> bool {
+    unsafe {
+        let n = strlen(prefix);
+        s.len as u64 >= n && memcmp(s.ptr, prefix, n) == 0
+    }
+}
+
+fn ends_with(s: [u8], suffix: *u8) -> bool {
+    unsafe {
+        let n = strlen(suffix);
+        s.len as u64 >= n && memcmp(&s.ptr[s.len as i64 - n as i64], suffix, n) == 0
+    }
+}
+
+pub extern "C" {
+    fn popen(command: *u8, mode: *u8) -> *u8;
+    fn pclose(stream: *u8) -> i32;
+    fn fgets(buf: *u8, size: i32, stream: *u8) -> *u8;
+    fn getenv(name: *u8) -> *u8;
+}

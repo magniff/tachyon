@@ -1,0 +1,338 @@
+// Names in expressions: what an identifier names (a local, a constant, a
+// static, a function as a value, a variant), the scope lookups patterns
+// share, and the unknown-name error with its suggestions (a near name in
+// scope, or the `use` that would bring it).
+
+use crate::base::{SYMS, SYM_COUNT, buf_bytes, buf_new, buf_slice, buf_str, intern};
+use crate::base::diag::{
+    ERR_HELP, edit_distance, err_begin, err_end, err_failed_name, err_help, err_help_sym, err_str,
+    err_sym,
+};
+use crate::front::ast::{FN_UNSAFE, NODES};
+use crate::front::ast::NodeKind::{CStr, Path};
+use crate::front::check::{LOCALS, Res, lookup_local, name_error};
+use crate::front::check::synth_mode::synth_expr;
+use crate::front::check::unsafety::{U_FN_VALUE, has_borrow_param, unsafe_op};
+use crate::front::cimport::c_import_skip_reason;
+use crate::front::generics::{TPL_NONE, env_lookup, instance_of, targ_count_error, template_of_key};
+use crate::front::generics::instantiate::{fn_instance, push_written_targs};
+use crate::front::modules::{
+    CUR_MOD, C_MODULE, MODULES, STD_MODULE, item_key_if_known, module_count,
+};
+use crate::front::modules::lookup::{
+    B_ITEM, B_MODULE, B_PRIVATE, B_TVARIANT, B_VARIANT, access_error, binding, binding_kind,
+    binding_value, lookup_name, lookup_quiet, note_c_use,
+};
+use crate::front::parser::items::ITEM_PUBLIC;
+use crate::front::types::{
+    CONSTS, ENUMS, FNS, STATICS, SYM_ALIAS, SYM_CONST, SYM_ENUM, SYM_FN, SYM_PRIMITIVE, SYM_STATIC,
+    SYM_STRUCT, TSCRATCH, TyKind, VARIANTS, enum_type, err_type, fn_param, is_pointer, item_node_of,
+    make_type,
+};
+use crate::tools::fix::note_missing_use;
+use std::Option;
+
+pub fn synth_name(n: i64) -> i64 {
+    unsafe {
+        let name = NODES[n].a;
+        let resolved = (NODES[n].p & NODE_RESOLVED) != 0;
+        if !resolved {
+            match lookup_local(name) {
+                Option::Some(local) => {
+                    if NODES[n].g != 0 {
+                        name_error(NODES[n].start, c"'", name, c"' is a variable, not a generic function");
+                    }
+                    NODES[n].res = Res::Local;
+                    NODES[n].y = local;
+                    return LOCALS[local].ty;
+                }
+                Option::None => {}
+            }
+        }
+        let b = if resolved { binding(B_ITEM, name) } else { lookup_name(CUR_MOD, name, CUR_MOD) };
+        if !resolved {
+            note_c_use(NODES[n].start, name, b);
+        }
+        let kind = binding_kind(b);
+        if kind == B_PRIVATE {
+            access_error(b, NODES[n].start, name);
+        }
+        if kind == B_VARIANT {
+            // A variant brought into scope by `use E::...;`: `E::V`.
+            let v = binding_value(b);
+            NODES[n].kind = Path;
+            NODES[n].a = VARIANTS[v].name;
+            NODES[n].b = VARIANTS[v].name;
+            NODES[n].y = enum_type(VARIANTS[v].enum_id);
+            return synth_expr(n);
+        }
+        if kind == B_TVARIANT {
+            // A variant of a generic enum (0.6): its type arguments inferred
+            // (`y` < 0: the template; see path_target).
+            NODES[n].kind = Path;
+            NODES[n].b = name;
+            NODES[n].y = -binding_value(b) - 1;
+            return synth_expr(n);
+        }
+        if kind == B_MODULE {
+            name_error(NODES[n].start, c"'", name, c"' is a module, not a value");
+        }
+        if kind != B_ITEM {
+            unknown_name_error(NODES[n].start, c"undefined variable '", name);
+        }
+        let key = binding_value(b);
+        if SYM_CONST[key] != 0 {
+            let c = SYM_CONST[key] - 1;
+            let init = NODES[CONSTS[c].node].c;
+            if NODES[init].kind == CStr && is_pointer(CONSTS[c].ty) {
+                // A C string constant: the literal itself.
+                NODES[n].kind = CStr;
+                NODES[n].a = NODES[init].a;
+                return CONSTS[c].ty;
+            }
+            NODES[n].res = Res::Const;
+            NODES[n].y = c;
+            return CONSTS[NODES[n].y].ty;
+        }
+        if SYM_STATIC[key] != 0 {
+            NODES[n].res = Res::Static;
+            NODES[n].y = SYM_STATIC[key] - 1;
+            // The code generators find statics by their symbol.
+            NODES[n].a = NODES[STATICS[NODES[n].y].node].a;
+            return STATICS[NODES[n].y].ty;
+        }
+        if SYM_FN[key] != 0 {
+            let mut f = SYM_FN[key] - 1;
+            if FNS[f].variadic {
+                name_error(NODES[n].start, c"variadic function '", name, c"' cannot be used as a value");
+            }
+            if FNS[f].generic > 0 {
+                // `max::<i64>` as a value: the arguments must be written.
+                if NODES[n].g == 0 {
+                    name_error(NODES[n].start, c"generic function '", name, c"' needs its type arguments to be used as a value ('f::<T>')");
+                }
+                if NODES[NODES[n].g].count != FNS[f].generic {
+                    targ_count_error(NODES[n].start, c"function", FNS[f].display, FNS[f].generic, NODES[NODES[n].g].count);
+                }
+                let mark = TSCRATCH.count;
+                push_written_targs(NODES[n].g);
+                f = fn_instance(f, mark, n);
+            } else if NODES[n].g != 0 {
+                name_error(NODES[n].start, c"function '", name, c"' is not generic");
+            }
+            NODES[n].res = Res::Fn;
+            NODES[n].y = f;
+            if (FNS[f].attrs & FN_UNSAFE) != 0 || has_borrow_param(f) {
+                unsafe_op(n, U_FN_VALUE, c"using an `unsafe fn`, or a function with pointer parameters, as a value is unsafe (its callers are not checked)");
+            }
+            return fn_value_type(f);
+        }
+        if SYM_STRUCT[key] != 0 || SYM_ENUM[key] != 0 || SYM_ALIAS[key] != 0 {
+            name_error(NODES[n].start, c"'", name, c"' is a type, not a value");
+        }
+        unknown_name_error(NODES[n].start, c"undefined variable '", name)
+    }
+}
+
+// An Ident whose `a` is already a key (a path resolved to an item).
+pub const NODE_RESOLVED: i64 = 2;
+
+// The enum type of the variant `name` in scope, in a pattern (p) against
+// a value of type `ty`, or 0 when `name` is no variant: a generic enum's
+// variant (0.6) takes the instance `ty`.
+pub fn used_variant_enum(name: i64, ty: i64, p: i64) -> i64 {
+    unsafe {
+        let b = lookup_quiet(CUR_MOD, name, CUR_MOD);
+        if binding_kind(b) == B_VARIANT {
+            return enum_type(VARIANTS[binding_value(b)].enum_id);
+        }
+        if binding_kind(b) != B_TVARIANT {
+            return 0;
+        }
+        let e = binding_value(b);
+        if !instance_of(ty, -e - 1) {
+            err_begin(NODES[p].start);
+            err_str(c"expected '");
+            err_type(ty);
+            err_str(c"', got a pattern of '");
+            err_sym(ENUMS[e].name);
+            err_str(c"'");
+            err_end();
+        }
+        ty
+    }
+}
+
+// Whether `name` is a constant in the current scope (its index + 1, or 0).
+pub fn scope_const(name: i64) -> i64 {
+    let b = lookup_quiet(CUR_MOD, name, CUR_MOD);
+    if binding_kind(b) == B_ITEM { unsafe { SYM_CONST[binding_value(b)] } } else { 0 }
+}
+
+// An unknown name; when a C header left it out, why.
+pub fn unknown_name_error(pos: i64, before: *u8, name: i64) -> ! {
+    unsafe {
+        err_begin(pos);
+        err_str(before);
+        err_sym(name);
+        err_str(c"'");
+        err_failed_name(name);
+        let reason = c_import_skip_reason(name);
+        if reason != 0 as *u8 {
+            err_help(c"'");
+            err_help_sym(name);
+            err_help(c"' was not imported from the C headers: ");
+            err_help(reason);
+        } else if before[0] == 'u' && before[1] == 'n' && (before[2] == 'd' || before[2] == 'k') {
+            // (`undefined variable '`, `unknown type '`, `unknown struct '`)
+            suggest_name(name, before[2] == 'd');
+        }
+        err_end()
+    }
+}
+
+// ---- Suggestions for unknown names (0.11) ----
+
+// The help of an unknown name (a value, or a type): the item of that name
+// another module has (`add `use crate::m::name;``), else the nearest name
+// in scope (`did you mean 'x'?`).
+fn suggest_name(name: i64, value: bool) {
+    unsafe {
+        let path = import_path_for(name, value);
+        if path != 0 {
+            note_missing_use(CUR_MOD, intern(buf_slice(path)), name);
+            err_help(c"add `use ");
+            buf_bytes(ERR_HELP, buf_slice(path));
+            err_help(c"::");
+            err_help_sym(name);
+            err_help(c";`");
+            return;
+        }
+        let near = nearest_name(name, value);
+        if near >= 0 {
+            err_help(c"did you mean '");
+            err_help_sym(near);
+            err_help(c"'?");
+        }
+    }
+}
+
+// Whether key `key` (an item's) is a value (a function, constant or
+// static) or, for !value, a type.
+fn key_is(key: i64, value: bool) -> bool {
+    unsafe {
+        if value {
+            SYM_FN[key] != 0 || SYM_CONST[key] != 0 || SYM_STATIC[key] != 0
+        } else {
+            SYM_STRUCT[key] != 0 || SYM_ENUM[key] != 0 || SYM_ALIAS[key] != 0 || template_of_key(key) != TPL_NONE
+        }
+    }
+}
+
+// Whether `name` is a value (or a type) where the checker is.
+fn name_in_scope(name: i64, value: bool) -> bool {
+    unsafe {
+        if value {
+            match lookup_local(name) {
+                Option::Some(_) => { return true; }
+                Option::None => {}
+            }
+        } else if env_lookup(name) != 0 || SYM_PRIMITIVE[name] != 0 {
+            return true;
+        }
+        let b = lookup_quiet(CUR_MOD, name, CUR_MOD);
+        binding_kind(b) == B_ITEM && key_is(binding_value(b), value)
+    }
+}
+
+// The name in scope nearest to `name` (edit distance, at most a third of
+// its length), or -1.
+fn nearest_name(name: i64, value: bool) -> i64 {
+    unsafe {
+        let want = SYMS[name].text;
+        let mut limit = want.len / 3;
+        if limit < 1 {
+            limit = 1;
+        }
+        let mut best = -1;
+        let mut best_d = limit + 1;
+        for s in 0..SYM_COUNT {
+            let t = SYMS[s].text;
+            if s == name || t.len == 0 || t.len > want.len + limit || t.len + limit < want.len {
+                continue;
+            }
+            let c = t[0];
+            if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_') {
+                continue;
+            }
+            let mut ident = true;
+            for i in 0..t.len {
+                let x = t[i];
+                if !((x >= 'a' && x <= 'z') || (x >= 'A' && x <= 'Z') || (x >= '0' && x <= '9') || x == '_') {
+                    ident = false;
+                    break;
+                }
+            }
+            if !ident {
+                continue;
+            }
+            let d = edit_distance(want, t);
+            if d < best_d && name_in_scope(s, value) {
+                best = s;
+                best_d = d;
+            }
+        }
+        best
+    }
+}
+
+// The path of the module (`crate::a::b`, `std`) whose public item `name`
+// is a value (or a type) the current module could import: a buffer, or 0.
+fn import_path_for(name: i64, value: bool) -> i64 {
+    unsafe {
+        for m in 0..module_count() {
+            if m == CUR_MOD || m == C_MODULE {
+                continue;
+            }
+            let key = item_key_if_known(m, name);
+            if key < 0 {
+                continue;
+            }
+            let item = item_node_of(key);
+            if item == 0 || (NODES[item].p & ITEM_PUBLIC) == 0 || !key_is(key, value) {
+                continue;
+            }
+            let out = buf_new();
+            put_module_path(out, m);
+            return out;
+        }
+        0
+    }
+}
+
+fn put_module_path(out: i64, m: i64) {
+    unsafe {
+        if m == 0 {
+            buf_str(out, c"crate");
+        } else if m == STD_MODULE {
+            buf_str(out, c"std");
+        } else {
+            put_module_path(out, MODULES[m].parent);
+            buf_str(out, c"::");
+            buf_bytes(out, SYMS[MODULES[m].name].text);
+        }
+    }
+}
+
+pub fn fn_value_type(f: i64) -> i64 {
+    unsafe {
+        let mark = TSCRATCH.count;
+        for i in 0..FNS[f].param_count {
+            TSCRATCH.push(fn_param(f, i));
+        }
+        if FNS[f].is_extern || FNS[f].export {
+            return make_type(TyKind::Fn, FNS[f].ret, 1, mark);
+        }
+        make_type(TyKind::Fn, FNS[f].ret, 0, mark)
+    }
+}

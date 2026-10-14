@@ -1,0 +1,557 @@
+// What register allocation (regalloc/mod.tach) starts from: use counts,
+// critical edges split, the blocks in layout order, what each use of a
+// value needs, positions, and liveness.
+
+use crate::back::abi::{conv_returns_through_pointer, fn_uses_c};
+use crate::back::emit::blocks::{fits_cmp_imm, is_cmp_imm_operand};
+use crate::back::regalloc::{
+    BEND, BSTART, FIXED, LDEPTH, LIVE_IN, LIVE_OUT, LIVE_WORDS, ORDER, RA_VALS, REG_USED, RV_CAP,
+    RV_FIRST, RV_HINT, RV_HREG, RV_SLOT, USES, USE_ANY, USE_NONE, USE_REG,
+};
+use crate::base::{IntVec, alloc_array, free};
+use crate::front::types::{FNS, is_compound, is_float};
+use crate::base::target::X86;
+use crate::middle::ir::{
+    BLOCKS, INSTS, INST_COUNT, IRF, IRFUNCS, IRFUNC_COUNT, Term, ir_arg, ir_new_block, ir_operand,
+    ir_operand_count, ir_set_arg,
+};
+use crate::middle::ir::cfg::{pred_index, redirect_succ, succ, succ_count};
+use crate::middle::ir::Op::{
+    Cmp, Const, Div, Lea, Load, LoadX, Pack, Param, Phi, Piece, Rem, Select, Slot, Store, StoreX,
+    Test,
+};
+use crate::back::regalloc::locations::vloc;
+use crate::back::emit::machine::{call_returns_through_pointer, m_int_imm_ok};
+
+// ---- Preparation ----
+
+// Counts the uses of every value of every function.
+pub fn count_uses() {
+    USES = alloc_array::<i64>(INST_COUNT + 1);
+    REG_USED = alloc_array::<i64>(INST_COUNT + 1);
+    FIXED = alloc_array::<IntVec>(64);
+    for fi in 0..IRFUNC_COUNT {
+        unsafe {
+            for i in 0..IRFUNCS[fi].blocks.count {
+                let b = IRFUNCS[fi].blocks.data[i];
+                if BLOCKS[b].removed != 0 {
+                    continue;
+                }
+                let mut v = BLOCKS[b].first;
+                while v != 0 {
+                    for k in 0..ir_operand_count(v) {
+                        let operand = ir_operand(v, k);
+                        if operand != 0 {
+                            USES[operand] += 1;
+                        }
+                    }
+                    v = INSTS[v].next;
+                }
+                let cond = BLOCKS[b].cond;
+                if cond != 0 {
+                    USES[cond] += 1;
+                }
+            }
+        }
+    }
+}
+
+// Splits every critical edge (from a block with several successors to one
+// with several predecessors) with an empty block, so that the moves of
+// each edge have a place of their own.
+pub fn split_critical_edges(fi: i64) {
+    unsafe {
+        IRF = fi;
+        let count = IRFUNCS[fi].blocks.count;
+        for i in 0..count {
+            let b = IRFUNCS[fi].blocks.data[i];
+            if BLOCKS[b].removed != 0 || succ_count(b) < 2 {
+                continue;
+            }
+            if BLOCKS[b].term == Term::Branch && BLOCKS[b].s0 == BLOCKS[b].s1 {
+                // Both ways lead to the same block: a jump (one edge less).
+                let s = BLOCKS[b].s0;
+                let first = pred_index(s, b);
+                let mut second = -1;
+                for j in first + 1..BLOCKS[s].preds.count {
+                    if second < 0 && BLOCKS[s].preds.data[j] == b {
+                        second = j;
+                    }
+                }
+                if second >= 0 {
+                    for j in second..BLOCKS[s].preds.count - 1 {
+                        BLOCKS[s].preds.data[j] = BLOCKS[s].preds.data[j + 1];
+                    }
+                    BLOCKS[s].preds.count -= 1;
+                    let mut phi = BLOCKS[s].first;
+                    while phi != 0 && INSTS[phi].op == Phi {
+                        let gone = ir_arg(phi, second);
+                        if gone != 0 {
+                            USES[gone] -= 1;
+                        }
+                        for j in second..INSTS[phi].nargs - 1 {
+                            ir_set_arg(phi, j, ir_arg(phi, j + 1));
+                        }
+                        INSTS[phi].nargs -= 1;
+                        phi = INSTS[phi].next;
+                    }
+                }
+                USES[BLOCKS[b].cond] -= 1;
+                BLOCKS[b].cond = 0;
+                BLOCKS[b].term = Term::Jump;
+                BLOCKS[b].s1 = 0;
+                continue;
+            }
+            let mut k = 0;
+            while k < succ_count(b) {
+                let s = succ(b, k);
+                k += 1;
+                if BLOCKS[s].preds.count < 2 {
+                    continue;
+                }
+                let e = ir_new_block();
+                BLOCKS[e].sealed = 1;
+                BLOCKS[e].term = Term::Jump;
+                BLOCKS[e].s0 = s;
+                BLOCKS[e].preds.push(b);
+                redirect_succ(b, s, e);
+                // Same index in the predecessor list, so the phis still match.
+                let index = pred_index(s, b);
+                BLOCKS[s].preds.data[index] = e;
+            }
+        }
+    }
+}
+
+// Lays out the reachable blocks in reverse post-order (BLOCKS[b].order is
+// the layout index, -1 for unreachable blocks), and finds their loop
+// depths.
+pub fn layout_blocks(fi: i64) {
+    unsafe {
+        for i in 0..IRFUNCS[fi].blocks.count {
+            let b = IRFUNCS[fi].blocks.data[i];
+            BLOCKS[b].order = -1;
+            BLOCKS[b].mark = 0;
+        }
+        ORDER.count = 0;
+        // Iterative depth-first search; post-order into ORDER, reversed below.
+        let mut stack = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let entry = IRFUNCS[fi].entry;
+        stack.push(entry);
+        stack.push(0);
+        BLOCKS[entry].mark = 1;
+        while stack.count > 0 {
+            let b = stack.data[stack.count - 2];
+            let next = stack.data[stack.count - 1];
+            if next < succ_count(b) {
+                stack.data[stack.count - 1] = next + 1;
+                // The second successor first, so that the first one comes
+                // right after the block when it can.
+                let s = succ(b, succ_count(b) - 1 - next);
+                if BLOCKS[s].mark == 0 {
+                    BLOCKS[s].mark = 1;
+                    stack.push(s);
+                    stack.push(0);
+                }
+            } else {
+                stack.count -= 2;
+                ORDER.push(b);
+            }
+        }
+        let n = ORDER.count;
+        for i in 0..n / 2 {
+            let t = ORDER.data[i];
+            ORDER.data[i] = ORDER.data[n - 1 - i];
+            ORDER.data[n - 1 - i] = t;
+        }
+        for i in 0..n {
+            BLOCKS[ORDER.data[i]].order = i;
+        }
+        // Loops: an edge to a block not later in the order is a back edge
+        // (the graph is reducible); the loop of header h is h and the blocks
+        // reaching a latch without passing h.
+        LDEPTH.count = 0;
+        for _ in 0..n {
+            LDEPTH.push(0);
+        }
+        for h in 0..n {
+            let header = ORDER.data[h];
+            stack.count = 0;
+            for i in 0..BLOCKS[header].preds.count {
+                let p = BLOCKS[header].preds.data[i];
+                if BLOCKS[p].order >= h {
+                    stack.push(p);
+                }
+            }
+            if stack.count == 0 {
+                continue;
+            }
+            for k in 0..n {
+                BLOCKS[ORDER.data[k]].mark = 0;
+            }
+            BLOCKS[header].mark = 1;
+            LDEPTH.data[h] += 1;
+            while stack.count > 0 {
+                let b = stack.pop();
+                if BLOCKS[b].mark != 0 || BLOCKS[b].order < 0 {
+                    continue;
+                }
+                BLOCKS[b].mark = 1;
+                LDEPTH.data[BLOCKS[b].order] += 1;
+                for i in 0..BLOCKS[b].preds.count {
+                    stack.push(BLOCKS[b].preds.data[i]);
+                }
+            }
+        }
+        free(stack.data as *u8);
+    }
+}
+
+// Whether compare (or test) `v` is fused into the branch that ends its
+// block.
+pub fn is_fused_compare(v: i64) -> bool {
+    unsafe {
+        let b = INSTS[v].block;
+        (INSTS[v].op == Cmp || INSTS[v].op == Test) && USES[v] == 1 && BLOCKS[b].term == Term::Branch
+            && BLOCKS[b].cond == v && INSTS[v].next == 0 && !is_float(INSTS[v].imm2)
+    }
+}
+
+// How instruction v uses its operand i (see ir_operand).
+pub fn use_kind(v: i64, i: i64) -> i64 {
+    unsafe {
+        let operand = ir_operand(v, i);
+        if operand == 0 {
+            return USE_NONE;
+        }
+        let op = INSTS[v].op;
+        if op.is_call() {
+            if i == 2 && INSTS[operand].op == Slot && !call_returns_through_pointer(v) {
+                return USE_NONE;
+            }
+            return USE_ANY;
+        }
+        if op == Piece {
+            return USE_NONE;
+        }
+        if op == Pack {
+            return USE_ANY;
+        }
+        if op == Phi {
+            return USE_ANY;
+        }
+        if (op == Load || op == Store) && i == 0 && INSTS[operand].op == Slot {
+            return USE_NONE;
+        }
+        // AArch64's csel and csinc read a 0 from xzr.
+        if op == Select && i < 2 && !X86 && is_zero_operand(operand) {
+            return USE_NONE;
+        }
+        // x86-64's indexed forms address a frame slot from %rsp.
+        if (op == LoadX || op == StoreX || op == Lea) && i == 0 && INSTS[operand].op == Slot {
+            return USE_NONE;
+        }
+        // An integer comparison with a constant that fits compares with an
+        // immediate.
+        if op == Cmp && i == 1 && is_cmp_imm_operand(v) {
+            return USE_NONE;
+        }
+        if op.is_binary() && i == 1 && !is_float(INSTS[v].ty) && op != Div && op != Rem
+            && INSTS[operand].op == Const && m_int_imm_ok(op, INSTS[v].ty, INSTS[operand].imm) {
+            return USE_NONE;
+        }
+        USE_REG
+    }
+}
+
+// The operands the terminator of block b reads (at BEND), with their
+// kinds: up to four (value, kind) pairs in out; returns the count.
+pub fn term_uses(b: i64, out: *i64) -> i64 {
+    unsafe {
+        let cond = BLOCKS[b].cond;
+        let term = BLOCKS[b].term;
+        if cond == 0 {
+            return 0;
+        }
+        if term == Term::Ret && INSTS[cond].op == Pack {
+            // The pieces of an aggregate result.
+            for i in 0..INSTS[cond].nargs {
+                out[2 * i] = ir_arg(cond, i);
+                out[2 * i + 1] = USE_ANY;
+            }
+            return INSTS[cond].nargs;
+        }
+        if term == Term::Ret {
+            let ret = FNS[IRFUNCS[IRF].f].ret;
+            if is_compound(ret) && !conv_returns_through_pointer(fn_uses_c(IRFUNCS[IRF].f), ret) && INSTS[cond].op == Slot {
+                return 0;
+            }
+            out[0] = cond;
+            out[1] = USE_ANY;
+            return 1;
+        }
+        if term == Term::Branch && is_fused_compare(cond) && INSTS[cond].op == Test {
+            out[0] = INSTS[cond].a;
+            out[1] = USE_REG;
+            if INSTS[cond].b == 0 {
+                return 1;
+            }
+            out[2] = INSTS[cond].b;
+            out[3] = USE_REG;
+            return 2;
+        }
+        if term == Term::Branch && is_fused_compare(cond) {
+            out[0] = INSTS[cond].a;
+            out[1] = USE_REG;
+            let rhs = INSTS[cond].b;
+            if INSTS[rhs].op == Const && fits_cmp_imm(INSTS[rhs].imm) {
+                return 1;
+            }
+            out[2] = rhs;
+            out[3] = USE_REG;
+            return 2;
+        }
+        if term == Term::Branch || term == Term::Switch {
+            out[0] = cond;
+            out[1] = USE_REG;
+            return 1;
+        }
+        0
+    }
+}
+
+// Whether a use of kind `kind` of value `v` makes it live: remat values
+// only when they are needed in a register (else they are rematerialized
+// where they are needed).
+pub fn is_live_use(v: i64, kind: i64) -> bool {
+    unsafe { kind == USE_REG || (kind == USE_ANY && !INSTS[v].op.is_remat()) }
+}
+
+// Whether `v` is computed where it is defined.
+pub fn is_emitted(v: i64) -> bool {
+    unsafe {
+        let op = INSTS[v].op;
+        if op == Phi || op == Param || op == Piece || op == Pack {
+            return false;
+        }
+        if op.is_remat() {
+            if INSTS[v].aux == 0 {
+                return false;
+            }
+            let loc = vloc(v, INSTS[v].mark + 2);
+            return loc >= 0 && loc < 64;
+        }
+        op.has_side_effect() || USES[v] > 0
+    }
+}
+
+fn needs_location(v: i64) -> bool {
+    unsafe {
+        let op = INSTS[v].op;
+        if INSTS[v].ty == 0 || USES[v] == 0 || is_fused_compare(v) {
+            return false;
+        }
+        !op.is_remat() || REG_USED[v] != 0
+    }
+}
+
+// ---- Positions and liveness ----
+
+fn ra_reserve(n: i64) {
+    if n <= RV_CAP {
+        return;
+    }
+    let mut cap = RV_CAP * 2;
+    if cap < n {
+        cap = n;
+    }
+    if cap < 1024 {
+        cap = 1024;
+    }
+    unsafe {
+        free(RV_FIRST as *u8);
+        free(RV_SLOT as *u8);
+        free(RV_HINT as *u8);
+        free(RV_HREG as *u8);
+    }
+    RV_FIRST = alloc_array::<i64>(cap);
+    RV_SLOT = alloc_array::<i64>(cap);
+    RV_HINT = alloc_array::<i64>(cap);
+    RV_HREG = alloc_array::<i64>(cap);
+    RV_CAP = cap;
+}
+
+// Marks the values some use needs in a register.
+pub fn mark_reg_uses() {
+    unsafe {
+        let mut out: [i64; 8] = [0; 8];
+        for k in 0..ORDER.count {
+            let b = ORDER.data[k];
+            let mut v = BLOCKS[b].first;
+            while v != 0 {
+                if !is_fused_compare(v) {
+                    for i in 0..ir_operand_count(v) {
+                        if use_kind(v, i) == USE_REG {
+                            REG_USED[ir_operand(v, i)] = 1;
+                        }
+                    }
+                }
+                v = INSTS[v].next;
+            }
+            let n = term_uses(b, &out as *i64);
+            for i in 0..n {
+                if out[2 * i + 1] == USE_REG {
+                    REG_USED[out[2 * i]] = 1;
+                }
+            }
+        }
+    }
+}
+
+// Numbers the instructions and the allocated values.
+pub fn number_positions() {
+    unsafe {
+        BSTART.count = 0;
+        BEND.count = 0;
+        RA_VALS.count = 0;
+        let mut pos = 0;
+        for k in 0..ORDER.count {
+            let b = ORDER.data[k];
+            let start = pos;
+            BSTART.push(start);
+            let mut v = BLOCKS[b].first;
+            while v != 0 {
+                let op = INSTS[v].op;
+                if op == Phi || op == Param {
+                    INSTS[v].mark = start;
+                } else {
+                    pos += 4;
+                    INSTS[v].mark = pos;
+                }
+                INSTS[v].aux = 0;
+                if needs_location(v) {
+                    RA_VALS.push(v);
+                    INSTS[v].aux = RA_VALS.count;
+                }
+                v = INSTS[v].next;
+            }
+            pos += 4;
+            BEND.push(pos);
+            pos += 4;
+        }
+        ra_reserve(RA_VALS.count);
+    }
+}
+
+pub fn bit_set(set: *u64, i: i64) {
+    unsafe { set[i >> 6] |= (1 as u64) << (i & 63) as u64; }
+}
+
+pub fn bit_clear(set: *u64, i: i64) {
+    unsafe { set[i >> 6] &= ~((1 as u64) << (i & 63) as u64); }
+}
+
+fn bit_get(set: *u64, i: i64) -> bool {
+    unsafe { (set[i >> 6] >> (i & 63) as u64) & 1 != 0 }
+}
+
+pub fn live_set(sets: *u64, k: i64) -> *u64 {
+    unsafe { &sets[k * LIVE_WORDS] }
+}
+
+// The dense index of operand `v` if it is allocated, else -1.
+pub fn tracked(v: i64) -> i64 {
+    if v == 0 {
+        return -1;
+    }
+    unsafe { INSTS[v].aux - 1 }
+}
+
+pub fn compute_liveness() {
+    unsafe {
+        let n = ORDER.count;
+        LIVE_WORDS = (RA_VALS.count + 63) / 64 + 1;
+        free(LIVE_IN as *u8);
+        free(LIVE_OUT as *u8);
+        LIVE_IN = alloc_array::<u64>(n * LIVE_WORDS + 1);
+        LIVE_OUT = alloc_array::<u64>(n * LIVE_WORDS + 1);
+        let gen = alloc_array::<u64>(n * LIVE_WORDS + 1);
+        let kill = alloc_array::<u64>(n * LIVE_WORDS + 1);
+        let mut out: [i64; 8] = [0; 8];
+        for k in 0..n {
+            let b = ORDER.data[k];
+            let g = live_set(gen, k);
+            let d = live_set(kill, k);
+            let mut v = BLOCKS[b].first;
+            while v != 0 {
+                if INSTS[v].op != Phi && !is_fused_compare(v) {
+                    for i in 0..ir_operand_count(v) {
+                        let operand = ir_operand(v, i);
+                        let t = tracked(operand);
+                        if t >= 0 && is_live_use(operand, use_kind(v, i)) && !bit_get(d, t) {
+                            bit_set(g, t);
+                        }
+                    }
+                }
+                let t = tracked(v);
+                if t >= 0 {
+                    bit_set(d, t);
+                }
+                v = INSTS[v].next;
+            }
+            let count = term_uses(b, &out as *i64);
+            for i in 0..count {
+                let t = tracked(out[2 * i]);
+                if t >= 0 && is_live_use(out[2 * i], out[2 * i + 1]) && !bit_get(d, t) {
+                    bit_set(g, t);
+                }
+            }
+        }
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let mut k = n - 1;
+            while k >= 0 {
+                let b = ORDER.data[k];
+                let live_out = live_set(LIVE_OUT, k);
+                for i in 0..succ_count(b) {
+                    let s = succ(b, i);
+                    let sk = BLOCKS[s].order;
+                    let sin = live_set(LIVE_IN, sk);
+                    for w in 0..LIVE_WORDS {
+                        live_out[w] |= sin[w];
+                    }
+                    // Phi operands flowing from b.
+                    let index = pred_index(s, b);
+                    let mut phi = BLOCKS[s].first;
+                    while phi != 0 && INSTS[phi].op == Phi {
+                        let arg = ir_arg(phi, index);
+                        let t = tracked(arg);
+                        if t >= 0 && tracked(phi) >= 0 && is_live_use(arg, USE_ANY) {
+                            bit_set(live_out, t);
+                        }
+                        phi = INSTS[phi].next;
+                    }
+                }
+                let live_in = live_set(LIVE_IN, k);
+                let g = live_set(gen, k);
+                let d = live_set(kill, k);
+                for w in 0..LIVE_WORDS {
+                    let value = g[w] | (live_out[w] & ~d[w]);
+                    if value != live_in[w] {
+                        live_in[w] = value;
+                        changed = true;
+                    }
+                }
+                k -= 1;
+            }
+        }
+        free(gen as *u8);
+        free(kill as *u8);
+    }
+}
+
+// Whether `v` is the integer constant 0 (read from xzr on AArch64).
+pub fn is_zero_operand(v: i64) -> bool {
+    unsafe { INSTS[v].op == Const && INSTS[v].imm == 0 && !is_float(INSTS[v].ty) }
+}

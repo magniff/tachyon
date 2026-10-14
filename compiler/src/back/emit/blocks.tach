@@ -1,0 +1,438 @@
+// Blocks (emit/mod.tach): blocks that are only a jump skipped, the
+// blocks emitted in layout order with their bodies and branches, and
+// switches.
+
+use crate::back::abi::{
+    ABI_PIECE_COUNT, ABI_PIECE_OFFSET, ABI_PIECE_TY, conv_classify, conv_return_piece_reg,
+    conv_returns_through_pointer, fn_uses_c,
+};
+use crate::back::dwarf::DEBUG_INFO;
+use crate::back::emit::calls::TAIL_CALLED;
+use crate::back::emit::machine::{
+    block_label, m_branch_bool, m_cmp_branch, m_jump, m_load, m_load_imm, m_mov, m_trap,
+    reg_move_temp, reg_ret,
+};
+use crate::back::emit::operands::{
+    CUR_POS, PM, PM_FIELDS, PM_LOC, const_of, int_operand, pm_add_value, pm_dst, pm_kind,
+    pm_resolve, pm_src, result_done, use_into,
+};
+use crate::back::emit::stats::{ST_BACK, ST_FN, ST_MOVES, ST_RELOADS, ST_SPILLS};
+use crate::back::layout::EMIT;
+use crate::back::mc_arm64::ops::{ma_jump_table, ma_test_branch};
+use crate::back::mc_x86_64::ops::{mx_jump_table, mx_test_branch};
+use crate::back::regalloc::{BEND, BSTART, ORDER, SPLIT_MOVES};
+use crate::back::regalloc::locations::{
+    gap_index, plan_end_moves, plan_gap_moves, plan_start_moves, stored_at_def, tloc,
+};
+use crate::back::regalloc::prepare::{is_emitted, is_fused_compare, tracked};
+use crate::base::{IntVec, alloc_array, free};
+use crate::front::patterns::usefulness::int_key;
+use crate::front::types::{FNS, TY_U64, is_compound, is_float};
+use crate::gen0::target::{emit_label, new_label};
+use crate::base::target::X86;
+use crate::gen0::x86_64::fits_i32;
+use crate::middle::ir::{BLOCKS, Cond, INSTS, IRF, IRFUNCS, Term, ir_arg};
+use crate::middle::ir::cfg::{case_target, case_value};
+use crate::middle::ir::Op::{Const, Pack, Param, Phi, Piece, Select, Test};
+use crate::back::emit::function::{
+    CUR_IN_FRAME, FELL_INTO_EPILOGUE, IN_FRAME, SAVE, emit_frame_link, emit_frame_setup,
+    emit_frame_teardown, emit_loc, emit_return, is_noreturn_call_block,
+};
+use crate::back::emit::insts::{emit_inst, mem_base_any};
+
+// Per layout index: whether the block emits nothing but a jump.
+static mut TRIVIAL: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+pub fn find_trivial_jumps() {
+    TRIVIAL.count = 0;
+    for k in 0..ORDER.count {
+        TRIVIAL.push(if unsafe { is_trivial_jump_now(ORDER.data[k]) } { 1 } else { 0 });
+    }
+}
+
+// Whether block b emits nothing but a jump: no instruction, no move.
+fn is_trivial_jump_now(b: i64) -> bool {
+    unsafe {
+        if BLOCKS[b].term != Term::Jump || b == IRFUNCS[IRF].entry || BLOCKS[b].order == SAVE {
+            return false;
+        }
+        // A jump out of the frame's region tears the frame down.
+        let sk = BLOCKS[BLOCKS[b].s0].order;
+        if IN_FRAME.data[BLOCKS[b].order] != 0 && (sk < 0 || IN_FRAME.data[sk] == 0) {
+            return false;
+        }
+        let mut v = BLOCKS[b].first;
+        while v != 0 {
+            let t = tracked(v);
+            if is_emitted(v) || INSTS[v].op == Param || (INSTS[v].op == Phi && t >= 0 && stored_at_def(t)) {
+                return false;
+            }
+            v = INSTS[v].next;
+        }
+        let k = BLOCKS[b].order;
+        let i = gap_index(BSTART.data[k]);
+        if i < SPLIT_MOVES.count / 2 && SPLIT_MOVES.data[2 * i] <= BEND.data[k] {
+            return false;
+        }
+        plan_start_moves(b);
+        plan_end_moves(b);
+        let mut empty = true;
+        for j in 0..PM.count / PM_FIELDS {
+            if pm_kind(j) != PM_LOC || pm_dst(j) != pm_src(j) {
+                empty = false;
+            }
+        }
+        PM.count = 0;
+        empty
+    }
+}
+
+fn is_trivial_jump(b: i64) -> bool {
+    unsafe { BLOCKS[b].order >= 0 && TRIVIAL.data[BLOCKS[b].order] != 0 }
+}
+
+// Where a jump to b really goes: past blocks that only jump on (b itself
+// when the chain does not end, in an empty endless loop).
+pub fn jump_target(b: i64) -> i64 {
+    unsafe {
+        let mut target = b;
+        for _ in 0..16 {
+            if target == IRFUNCS[IRF].entry || !is_trivial_jump(target) {
+                return target;
+            }
+            target = BLOCKS[target].s0;
+        }
+        b
+    }
+}
+
+// Blocks every jump passes by are not emitted at all.
+pub fn is_skipped(b: i64) -> bool {
+    unsafe { b != IRFUNCS[IRF].entry && is_trivial_jump(b) && jump_target(b) != b }
+}
+
+// The block emitted after the one at index j of the emission order, or 0.
+fn next_block(j: i64) -> i64 {
+    if j + 1 < EMIT.count { unsafe { EMIT.data[j + 1] } } else { 0 }
+}
+
+pub fn emit_ir_block(b: i64, j: i64) {
+    emit_label(block_label(b));
+    emit_block_code(b, next_block(j));
+}
+
+// Tail duplication: a jump to a small block (at most 3 instructions, no
+// call, ending in a jump, a branch or a return) emits a copy of the block
+// instead, up to 2 deep. The copy is exact: a block's code depends on its
+// allocation (its positions) only, and the moves of the edge into it are
+// already done.
+static mut DUP_DEPTH: i64 = 0;
+
+fn is_duplicable(b: i64) -> bool {
+    unsafe {
+        let term = BLOCKS[b].term;
+        if b == IRFUNCS[IRF].entry || BLOCKS[b].order == SAVE || (term != Term::Jump && term != Term::Branch && term != Term::Ret) {
+            return false;
+        }
+        let mut n = 0;
+        let mut v = BLOCKS[b].first;
+        while v != 0 {
+            if INSTS[v].op.is_call() || INSTS[v].op == Piece || INSTS[v].op == Select && X86 {
+                return false;
+            }
+            if is_emitted(v) && !is_fused_compare(v) {
+                n += 1;
+            }
+            v = INSTS[v].next;
+        }
+        n <= 3
+    }
+}
+
+// The code of block b (without its label); `next` is the block emitted
+// after it (0: none, -1: a copy, which nothing follows).
+fn emit_block_code(b: i64, next: i64) {
+    unsafe {
+        let k = BLOCKS[b].order;
+        let outer = CUR_IN_FRAME;
+        CUR_IN_FRAME = IN_FRAME.data[k] != 0;
+        if SAVE > 0 && k == SAVE {
+            emit_frame_link();
+            emit_frame_setup();
+        } else if !CUR_IN_FRAME && is_noreturn_call_block(b) {
+            emit_frame_link();
+        }
+        emit_block_body(b, next);
+        CUR_IN_FRAME = outer;
+    }
+}
+
+fn emit_block_body(b: i64, next: i64) {
+    unsafe {
+        let k = BLOCKS[b].order;
+        let start = BSTART.data[k];
+        plan_start_moves(b);
+        pm_resolve();
+        // Phis that go to the stack are stored there.
+        let mut v = BLOCKS[b].first;
+        while v != 0 {
+            let t = tracked(v);
+            if INSTS[v].op == Phi && t >= 0 && stored_at_def(t) {
+                let loc = tloc(t, start);
+                if loc >= 0 {
+                    result_done(v, loc);
+                }
+            }
+            v = INSTS[v].next;
+        }
+        v = BLOCKS[b].first;
+        while v != 0 {
+            let op = INSTS[v].op;
+            if op != Phi && op != Param {
+                CUR_POS = INSTS[v].mark;
+                plan_gap_moves(CUR_POS - 1);
+                pm_resolve();
+                if is_emitted(v) && !is_fused_compare(v) {
+                    if DEBUG_INFO {
+                        emit_loc(v);
+                    }
+                    emit_inst(v);
+                }
+            }
+            v = INSTS[v].next;
+        }
+        if TAIL_CALLED {
+            // The callee returns for this block.
+            TAIL_CALLED = false;
+            return;
+        }
+        let end = BEND.data[k];
+        CUR_POS = end;
+        plan_gap_moves(end - 1);
+        pm_resolve();
+        let term = BLOCKS[b].term;
+        if term == Term::Jump {
+            let s = BLOCKS[b].s0;
+            let before = ST_FN[ST_MOVES] + ST_FN[ST_SPILLS] + ST_FN[ST_RELOADS];
+            plan_end_moves(b);
+            pm_resolve();
+            if BLOCKS[s].order <= k {
+                ST_FN[ST_BACK] += ST_FN[ST_MOVES] + ST_FN[ST_SPILLS] + ST_FN[ST_RELOADS] - before;
+            }
+            let target = jump_target(s);
+            if CUR_IN_FRAME && IN_FRAME.data[BLOCKS[target].order] == 0 {
+                emit_frame_teardown();
+            }
+            if target != next {
+                if DUP_DEPTH < 2 && is_duplicable(target) {
+                    DUP_DEPTH += 1;
+                    // The copy ends where this block does: its next block follows.
+                    emit_block_code(target, next);
+                    DUP_DEPTH -= 1;
+                } else {
+                    m_jump(block_label(target));
+                }
+            }
+        } else if term == Term::Branch {
+            emit_branch(b, next);
+        } else if term == Term::Switch {
+            emit_switch(b);
+        } else if term == Term::Ret {
+            let value = BLOCKS[b].cond;
+            let ret = FNS[IRFUNCS[IRF].f].ret;
+            let c = fn_uses_c(IRFUNCS[IRF].f);
+            if value != 0 && INSTS[value].op == Pack {
+                // The pieces of an aggregate result, into the result registers.
+                conv_classify(c, ret);
+                for i in 0..INSTS[value].nargs {
+                    pm_add_value(conv_return_piece_reg(c, i), ir_arg(value, i), end);
+                }
+                pm_resolve();
+            } else if value != 0 && is_compound(ret) && !conv_returns_through_pointer(c, ret) {
+                // An aggregate returned in registers: its pieces, from its
+                // address (out of the way of the result registers).
+                conv_classify(c, ret);
+                let mut offset = 0;
+                let mut base = mem_base_any(value, 0, end, &offset);
+                for i in 0..ABI_PIECE_COUNT {
+                    if base == conv_return_piece_reg(c, i) {
+                        m_mov(reg_move_temp(false), base, TY_U64);
+                        base = reg_move_temp(false);
+                    }
+                }
+                for i in 0..ABI_PIECE_COUNT {
+                    m_load(ABI_PIECE_TY[i], conv_return_piece_reg(c, i), base, offset + ABI_PIECE_OFFSET[i]);
+                }
+            } else if value != 0 {
+                use_into(value, end, reg_ret(is_float(INSTS[value].ty)));
+            }
+            if next != 0 || !CUR_IN_FRAME {
+                emit_return();
+            } else {
+                FELL_INTO_EPILOGUE = true;
+            }
+        } else {
+            m_trap();
+        }
+    }
+}
+
+fn emit_branch(b: i64, next: i64) {
+    unsafe {
+        let cond = BLOCKS[b].cond;
+        // Branches have no phi moves (edges into phis are split), so they can
+        // skip blocks that only jump on.
+        let s0 = jump_target(BLOCKS[b].s0);
+        let s1 = jump_target(BLOCKS[b].s1);
+        // Jump to `target` when the condition is `sense`, fall through or jump
+        // to `other` otherwise.
+        let mut target = s0;
+        let mut other = s1;
+        let mut sense = true;
+        if s0 == next {
+            target = s1;
+            other = s0;
+            sense = false;
+        }
+        if is_fused_compare(cond) && INSTS[cond].op == Test {
+            let mut op = INSTS[cond].cond;
+            if !sense {
+                op = op.negate();
+            }
+            let a = int_operand(INSTS[cond].a);
+            let b = if INSTS[cond].b != 0 { int_operand(INSTS[cond].b) } else { -1 };
+            if X86 {
+                mx_test_branch(a, b, INSTS[cond].imm, op == Cond::Ne, block_label(target));
+            } else {
+                ma_test_branch(a, b, INSTS[cond].imm, op == Cond::Ne, block_label(target));
+            }
+        } else if is_fused_compare(cond) {
+            let mut op = INSTS[cond].cond;
+            if !sense {
+                op = op.negate();
+            }
+            let ty = INSTS[cond].imm2;
+            let a = int_operand(INSTS[cond].a);
+            let mut imm = 0;
+            let rhs = INSTS[cond].b;
+            if const_of(rhs, &imm) && fits_cmp_imm(imm) {
+                m_cmp_branch(op, ty, a, 0, true, imm, block_label(target));
+            } else {
+                let r = int_operand(rhs);
+                m_cmp_branch(op, ty, a, r, false, 0, block_label(target));
+            }
+        } else {
+            let r = int_operand(cond);
+            m_branch_bool(r, sense, block_label(target));
+        }
+        if other != next {
+            m_jump(block_label(other));
+        }
+    }
+}
+
+// ---- Switches ----
+
+// The cases of the switch being emitted, sorted by value (in the order of
+// the switch's type): value and label.
+static mut SW_VALUES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+static mut SW_LABELS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// A switch: a jump table when its cases are dense (at least 4, filling at
+// least a third of their range), else a binary search. Like branches,
+// switches have no phi moves (edges into phis are split).
+fn emit_switch(b: i64) {
+    unsafe {
+        let cond = BLOCKS[b].cond;
+        let ty = INSTS[cond].ty;
+        let n = BLOCKS[b].ncases;
+        SW_VALUES.count = 0;
+        SW_LABELS.count = 0;
+        for i in 0..n {
+            // Insertion in order of the keys (see int_key).
+            let key = int_key(case_value(b, i), ty);
+            let mut at = SW_VALUES.count;
+            SW_VALUES.push(0);
+            SW_LABELS.push(0);
+            while at > 0 && int_key(SW_VALUES.data[at - 1], ty) > key {
+                SW_VALUES.data[at] = SW_VALUES.data[at - 1];
+                SW_LABELS.data[at] = SW_LABELS.data[at - 1];
+                at -= 1;
+            }
+            SW_VALUES.data[at] = case_value(b, i);
+            SW_LABELS.data[at] = block_label(jump_target(case_target(b, i)));
+        }
+        let default = block_label(jump_target(BLOCKS[b].s0));
+        let r = int_operand(cond);
+        if n == 0 {
+            m_jump(default);
+            return;
+        }
+        let low = SW_VALUES.data[0];
+        let range = int_key(SW_VALUES.data[n - 1], ty) - int_key(low, ty) + 1;
+        if n >= 4 && range > 0 && range <= 3 * n && range <= 4096 {
+            // One entry per value of the range: the case's label or the default.
+            let table = alloc_array::<i64>(range);
+            for i in 0..range {
+                table[i] = default;
+            }
+            for i in 0..n {
+                table[SW_VALUES.data[i] - low] = SW_LABELS.data[i];
+            }
+            if X86 {
+                mx_jump_table(r, low, range, default, table);
+            } else {
+                ma_jump_table(r, low, range, default, table);
+            }
+            free(table as *u8);
+            return;
+        }
+        emit_switch_search(r, ty, 0, n, default);
+    }
+}
+
+// Compares and branches for the cases lo..hi (sorted), by halves.
+fn emit_switch_search(r: i64, ty: i64, lo: i64, hi: i64, default: i64) {
+    unsafe {
+        if hi - lo <= 3 {
+            for i in lo..hi {
+                switch_compare(Cond::Eq, ty, r, SW_VALUES.data[i], SW_LABELS.data[i]);
+            }
+            m_jump(default);
+            return;
+        }
+        let mid = (lo + hi) / 2;
+        switch_compare(Cond::Eq, ty, r, SW_VALUES.data[mid], SW_LABELS.data[mid]);
+        let right = new_label();
+        switch_compare(Cond::Gt, ty, r, SW_VALUES.data[mid], right);
+        emit_switch_search(r, ty, lo, mid, default);
+        emit_label(right);
+        emit_switch_search(r, ty, mid + 1, hi, default);
+    }
+}
+
+// Jumps to `label` when register r <op> value.
+fn switch_compare(op: Cond, ty: i64, r: i64, value: i64, label: i64) {
+    if fits_cmp_imm(value) {
+        m_cmp_branch(op, ty, r, 0, true, value, label);
+    } else {
+        let scratch = reg_move_temp(false);
+        m_load_imm(scratch, value as u64);
+        m_cmp_branch(op, ty, r, scratch, false, 0, label);
+    }
+}
+
+pub fn fits_cmp_imm(imm: i64) -> bool {
+    // AArch64: cmp #imm, or cmn #-imm for a negative one.
+    if X86 { fits_i32(imm) } else { imm > -4096 && imm < 4096 }
+}
+
+// Whether comparison v (CMP) compares integers with a constant that fits
+// an immediate.
+pub fn is_cmp_imm_operand(v: i64) -> bool {
+    unsafe {
+        let b = INSTS[v].b;
+        !is_float(INSTS[v].imm2) && b != 0 && INSTS[b].op == Const && fits_cmp_imm(INSTS[b].imm)
+    }
+}

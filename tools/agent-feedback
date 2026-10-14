@@ -4,16 +4,50 @@
 #
 #   tools/agent-feedback TOOL "what you needed, what the tool did or lacked"
 #
-# Appends one JSON line to .git/agent-tools.jsonl (shared by all worktrees);
-# tools/agent-tool-usage.py --hook-log summarizes it.
+# Appends one JSON line to agent-tools.jsonl in the shared git directory
+# (.git of the main checkout, for every worktree); tools/agent-tool-usage.py
+# --hook-log summarizes it. Git is not run (0.12: a harness guard may refuse
+# it inside a worktree): the directory is found by walking up from the
+# current directory to a `.git`, and from a worktree's `.git` file to its
+# common directory.
 set -eu
 [ $# -ge 2 ] || { echo "usage: tools/agent-feedback TOOL MESSAGE" >&2; exit 2; }
-dir=$(git rev-parse --path-format=absolute --git-common-dir)
-python3 -I - "$dir/agent-tools.jsonl" "$1" "$2" <<'PY'
-import json, sys, time
-path, tool, msg = sys.argv[1:4]
-with open(path, "a") as fh:
-    fh.write(json.dumps({"kind": "feedback", "tool": tool, "message": msg[:600],
+exec python3 -I - "$PWD" "$1" "$2" <<'PY'
+import json, os, sys, time
+
+
+def checkout_of(cwd):
+    d = os.path.abspath(cwd)
+    while True:
+        g = os.path.join(d, ".git")
+        if os.path.isdir(g):
+            return d, g
+        if os.path.isfile(g):
+            with open(g) as fh:
+                text = fh.read().strip()
+            if not text.startswith("gitdir:"):
+                return d, None
+            gd = text[len("gitdir:"):].strip()
+            if not os.path.isabs(gd):
+                gd = os.path.normpath(os.path.join(d, gd))
+            try:
+                with open(os.path.join(gd, "commondir")) as fh:
+                    common = fh.read().strip()
+            except OSError:
+                return d, gd
+            return d, common if os.path.isabs(common) else os.path.normpath(os.path.join(gd, common))
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None, None
+        d = parent
+
+
+cwd, tool, msg = sys.argv[1:4]
+root, gd = checkout_of(cwd)
+if not gd:
+    sys.exit("agent-feedback: no git checkout above " + cwd)
+with open(os.path.join(gd, "agent-tools.jsonl"), "a") as fh:
+    fh.write(json.dumps({"kind": "feedback", "tool": tool, "message": msg[:600], "worktree": root[-120:],
                          "time": time.strftime("%Y-%m-%dT%H:%M:%S")}) + "\n")
+print("recorded")
 PY
-echo "recorded"

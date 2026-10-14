@@ -1,0 +1,303 @@
+// What -g adds to the object (0.11): the `.cfi_*` directives, made into
+// Mach-O's compact unwind section, and `.file` / `.loc`, made into the
+// DWARF line program of .debug_line once layout has fixed the addresses.
+
+use crate::back::objfile::{
+    CUR_SEC, FRAGS, FRAG_CAP, FRAG_COUNT, Frag, OPEN, SEC_ALIGN, SEC_BUF, SEC_DEBUG_LINE, SEC_TEXT,
+    SEC_UNWIND, SEC_USED, TAIL_NONE, here, reloc, w16, w32, w64, w8,
+};
+use crate::back::objfile::assemble::{asm_error, is_space, parse_number, text_is};
+use crate::base::{BUFS, IntVec, SYMS, buf_byte, buf_bytes, buf_new, grow, intern};
+use crate::gen0::target::ASM;
+use crate::back::objfile::resolve::{
+    ELF_A64_ABS64, ELF_X64_64, MACHO_A64_UNSIGNED, MACHO_X64_UNSIGNED,
+};
+use crate::base::target::{ELF, X86};
+
+// ---- Call frame information (0.11, -g, Mach-O) ----
+//
+// The `.cfi_*` directives describe the standard frame a function sets up
+// at its entry (the frame pointer and return address saved, the frame
+// pointer the CFA's base): what Mach-O's compact unwind encoding says in
+// one word per function, as LLVM writes it from them (debuggers unwind
+// with it, without having to understand the code).
+
+// Per function: its start and end (fragment, offset) each.
+pub static mut CFI_FNS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut CFI_OPS: i64 = 0;
+
+pub fn cfi_directive(a: i64, b: i64) {
+    unsafe {
+        if ELF {
+            asm_error(c"call frame information is written on Mach-O only");
+        }
+        if text_is(a, b, c".cfi_startproc") {
+            CFI_FNS.push(OPEN);
+            CFI_FNS.push(here() - FRAGS[OPEN].start);
+            CFI_OPS = 0;
+        } else if text_is(a, b, c".cfi_endproc") {
+            if CFI_OPS != 3 {
+                asm_error(c"call frame information other than the standard frame");
+            }
+            CFI_FNS.push(OPEN);
+            CFI_FNS.push(here() - FRAGS[OPEN].start);
+        } else if text_is(a, b, c".cfi_def_cfa") || text_is(a, b, c".cfi_offset") || text_is(a, b, c".cfi_def_cfa_offset")
+            || text_is(a, b, c".cfi_def_cfa_register") {
+            // (the standard frame's three, in the order the back ends write
+            // them)
+            CFI_OPS += 1;
+        } else {
+            asm_error(c"unknown CFI directive");
+        }
+    }
+}
+
+// The compact unwind entries: per function its address (relocated), size,
+// encoding (a frame: UNWIND_ARM64_MODE_FRAME, UNWIND_X86_64_MODE_RBP_FRAME),
+// and no personality or LSDA.
+pub fn compact_unwind() {
+    unsafe {
+        let out = SEC_BUF[SEC_UNWIND];
+        SEC_USED[SEC_UNWIND] = true;
+        SEC_ALIGN[SEC_UNWIND] = 3;
+        // An empty fragment, at the section's start, for its symbol.
+        FRAGS = grow(FRAGS, FRAG_COUNT, &FRAG_CAP);
+        FRAGS[FRAG_COUNT] = Frag { sec: SEC_UNWIND, start: 0, len: 0, tail: TAIL_NONE, arg: 0, sym: -1, long: false, addr: 0, atom: -1 };
+        FRAG_COUNT += 1;
+        let mut k = 0;
+        while k < CFI_FNS.count {
+            let start = FRAGS[CFI_FNS.data[k]].addr + CFI_FNS.data[k + 1];
+            let end = FRAGS[CFI_FNS.data[k + 2]].addr + CFI_FNS.data[k + 3];
+            reloc(SEC_UNWIND, BUFS[out].len, if X86 { MACHO_X64_UNSIGNED } else { MACHO_A64_UNSIGNED }, -1 - SEC_TEXT, start, false, 3);
+            w64(out, start);
+            w32(out, end - start);
+            w32(out, if X86 { 0x01000000 } else { 0x04000000 });
+            w64(out, 0);
+            w64(out, 0);
+            k += 4;
+        }
+    }
+}
+
+// ---- DWARF line tables (0.11, -g) ----
+//
+// `.file N "path"` names file N; `.loc N line column` gives the source
+// position of the next instruction: a row of the line table. The rows make
+// the line program of .debug_line (DWARF 4), written after layout, where
+// the addresses are known; its one sequence covers the text section.
+
+pub static mut LOC_PENDING: bool = false;
+pub static mut LOC_FILE: i64 = 0;
+pub static mut LOC_LINE: i64 = 0;
+pub static mut LOC_COL: i64 = 0;
+// Rows: (fragment, offset, file, line, column) each.
+pub static mut ROWS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// Per file number: its directory (an index in DIRS, 0 for none) and name
+// (interned), as the system assemblers split a path.
+static mut FILE_DIR: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut FILE_NAME: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut DIRS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+pub fn line_row() {
+    unsafe {
+        LOC_PENDING = false;
+        if CUR_SEC != SEC_TEXT {
+            return;
+        }
+        ROWS.push(OPEN);
+        ROWS.push(here() - FRAGS[OPEN].start);
+        ROWS.push(LOC_FILE);
+        ROWS.push(LOC_LINE);
+        ROWS.push(LOC_COL);
+    }
+}
+
+// .file N "path"
+pub fn dwarf_file(a: i64, b: i64) {
+    unsafe {
+        let t = BUFS[ASM].data;
+        let mut i = a;
+        let start = i;
+        while i < b && !is_space(t[i]) {
+            i += 1;
+        }
+        let n = parse_number(start, i);
+        while i < b && t[i] != '"' {
+            i += 1;
+        }
+        if i >= b {
+            asm_error(c"expected a file name");
+        }
+        i += 1;
+        let path = buf_new();
+        while i < b && t[i] != '"' {
+            if t[i] == '\\' && i + 1 < b {
+                i += 1;
+            }
+            buf_byte(path, t[i]);
+            i += 1;
+        }
+        let p = BUFS[path].data;
+        let len = BUFS[path].len;
+        let mut slash = len - 1;
+        while slash >= 0 && p[slash] != '/' {
+            slash -= 1;
+        }
+        while FILE_NAME.count <= n {
+            FILE_NAME.push(0);
+            FILE_DIR.push(0);
+        }
+        FILE_NAME.data[n] = intern(p[slash + 1..len]);
+        if slash > 0 {
+            let dir = intern(p[0..slash]);
+            let mut d = 0;
+            while d < DIRS.count && DIRS.data[d] != dir {
+                d += 1;
+            }
+            if d == DIRS.count {
+                DIRS.push(dir);
+            }
+            FILE_DIR.data[n] = d + 1;
+        }
+    }
+}
+
+fn uleb(out: i64, value: i64) {
+    let mut v = value;
+    loop {
+        let low = v & 127;
+        v = v >> 7;
+        if v == 0 {
+            w8(out, low);
+            return;
+        }
+        w8(out, low | 128);
+    }
+}
+
+fn sleb(out: i64, value: i64) {
+    let mut v = value;
+    loop {
+        let low = v & 127;
+        v = v >> 7;
+        if (v == 0 && (low & 64) == 0) || (v == -1 && (low & 64) != 0) {
+            w8(out, low);
+            return;
+        }
+        w8(out, low | 128);
+    }
+}
+
+const LINE_BASE: i64 = -5;
+const LINE_RANGE: i64 = 14;
+const OPCODE_BASE: i64 = 13;
+
+// The line program, after the contents of .debug_line (a label at most).
+pub fn line_program() {
+    unsafe {
+        let out = SEC_BUF[SEC_DEBUG_LINE];
+        SEC_USED[SEC_DEBUG_LINE] = true;
+        let start = BUFS[out].len;
+        w32(out, 0);
+        w16(out, 4);
+        w32(out, 0);
+        let header_start = BUFS[out].len;
+        w8(out, 1);
+        w8(out, 1);
+        w8(out, 1);
+        w8(out, LINE_BASE & 255);
+        w8(out, LINE_RANGE);
+        w8(out, OPCODE_BASE);
+        let lengths: [i64; 12] = [0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1];
+        for i in 0..12 {
+            w8(out, lengths[i]);
+        }
+        for d in 0..DIRS.count {
+            buf_bytes(out, SYMS[DIRS.data[d]].text);
+            w8(out, 0);
+        }
+        w8(out, 0);
+        for f in 1..FILE_NAME.count {
+            if FILE_NAME.data[f] == 0 {
+                // (a number not named: an empty name keeps the numbering)
+                w8(out, 0);
+                w8(out, 0);
+                w8(out, 0);
+                w8(out, 0);
+                continue;
+            }
+            buf_bytes(out, SYMS[FILE_NAME.data[f]].text);
+            w8(out, 0);
+            uleb(out, FILE_DIR.data[f]);
+            w8(out, 0);
+            w8(out, 0);
+        }
+        w8(out, 0);
+        let header_len = BUFS[out].len - header_start;
+        // The program: the sequence's address (relocated: the text section's
+        // start plus the first row's offset), then one row per entry.
+        let mut addr = FRAGS[ROWS.data[0]].addr + ROWS.data[1];
+        w8(out, 0);
+        uleb(out, 9);
+        w8(out, 2);
+        reloc(SEC_DEBUG_LINE, BUFS[out].len, if ELF && X86 { ELF_X64_64 } else if ELF { ELF_A64_ABS64 } else if X86 { MACHO_X64_UNSIGNED } else { MACHO_A64_UNSIGNED }, -1 - SEC_TEXT, addr, false, 3);
+        w64(out, if ELF { 0 } else { addr });
+        let mut file = 1;
+        let mut line = 1;
+        let mut col = 0;
+        let mut k = 0;
+        while k < ROWS.count {
+            let row_addr = FRAGS[ROWS.data[k]].addr + ROWS.data[k + 1];
+            let row_file = ROWS.data[k + 2];
+            let row_line = ROWS.data[k + 3];
+            let row_col = ROWS.data[k + 4];
+            if row_file != file {
+                w8(out, 4);
+                uleb(out, row_file);
+                file = row_file;
+            }
+            if row_col != col {
+                w8(out, 5);
+                uleb(out, row_col);
+                col = row_col;
+            }
+            let mut dl = row_line - line;
+            let da = row_addr - addr;
+            if dl < LINE_BASE || dl >= LINE_BASE + LINE_RANGE {
+                w8(out, 3);
+                sleb(out, dl);
+                dl = 0;
+            }
+            let special = (dl - LINE_BASE) + LINE_RANGE * da + OPCODE_BASE;
+            if special <= 255 {
+                w8(out, special);
+            } else {
+                w8(out, 2);
+                uleb(out, da);
+                if dl != 0 {
+                    w8(out, (dl - LINE_BASE) + OPCODE_BASE);
+                } else {
+                    w8(out, 1);
+                }
+            }
+            line = row_line;
+            addr = row_addr;
+            k += 5;
+        }
+        // The end of the sequence: the end of the text section.
+        let end = BUFS[SEC_BUF[SEC_TEXT]].len;
+        if end > addr {
+            w8(out, 2);
+            uleb(out, end - addr);
+        }
+        w8(out, 0);
+        uleb(out, 1);
+        w8(out, 1);
+        let total = BUFS[out].len - start - 4;
+        let d = BUFS[out].data;
+        for i in 0..4 {
+            d[start + i] = ((total >> (8 * i)) & 255) as u8;
+            d[start + 6 + i] = ((header_len >> (8 * i)) & 255) as u8;
+        }
+    }
+}

@@ -7,11 +7,11 @@ source into folders with no file over 1,000 lines.
 
 ```
 tachyonc refactor rename PATH NEW [ROOT]
-tachyonc refactor move PATH... --to MODULE [--keep-impls]     (or: move PATH MODULE)
+tachyonc refactor move PATH... --to MODULE [--keep-impls] [--no-tidy]     (or: move PATH MODULE)
 tachyonc refactor new-module crate::a::b [--file|--dir]
 tachyonc refactor move-module crate::a crate::x::b
-tachyonc refactor split MODULE --into NEWMOD --items a,b,c [--keep-impls]
-tachyonc refactor split MODULE --plan|--auto [--max-lines N]
+tachyonc refactor split MODULE --into NEWMOD --items a,b,c [--keep-impls] [--reexport] [--header TEXT]
+tachyonc refactor split MODULE --plan|--auto [--max-lines N] [--reexport]
 ```
 
 Every one is one edit of the edit engine ([refactor.md](refactor.md)):
@@ -71,9 +71,10 @@ exception:
 **Banners.** A banner is a block of comment lines with a blank line
 after it, after some code in the file (a comment at the top of a file
 is the file's, and never moves): `// ---- Scaling ----`. It heads the
-items after it, up to the next banner: its group. It moves (above the
-first of them, with the blank lines between) when every item of its
-group moves to the same module; otherwise it stays, over the items left.
+items after it, up to the next banner: its group. It goes (0.12) where
+most of its group's lines go: above the first item of the group that
+goes there, with one blank line after it; it stays when most of them
+stay.
 
 **Impl blocks.** A type's impl blocks in its module move with it: its
 inherent impls and its trait impls (`--keep-impls` leaves them). A
@@ -86,8 +87,23 @@ that stays, stays with the type. A method never moves alone
 an `extern "C" { }` block of its own in the new module; the whole block
 moves when all its functions do.
 
-**Where it goes.** At the end of the module's file, a blank line before
-each item; into a new module's file after its imports.
+**Where it goes.** At the end of the module's file; into a new module's
+file after its imports. Items that were next to each other (no blank
+line between: a run of constants) stay so (0.12); the others get a
+blank line before them.
+
+**A new file's header (0.12).** A module that `split` makes starts with
+a header comment: `--header TEXT` (with `--into`), else the banner its
+first item comes with (moved to the top, its rules dropped: `// ----
+Scaling ----` is `// Scaling`), else a copy of the banner above that
+item where it was. No banner, no header.
+
+**Tidy imports (0.12).** Then the files the move edited and made get
+their `use` lines tidied, as `fix --only tidy-imports` does
+([refactor.md](refactor.md)): a name added to a `use` of the same path
+is merged into it, the lists are sorted and wrapped at 100 columns
+(`--no-tidy`: as the move wrote them). This is a round of `fix` on the
+edited program, before the check.
 
 **References.** Every reference the checker resolved, in every module:
 
@@ -110,7 +126,9 @@ each item; into a new module's file after its imports.
 
 New `use` lines go after the module's last `use` (else before its first
 item), one per module path, its names sorted, wrapped at 100 columns.
-Nothing outside the edited ranges changes, byte for byte.
+Nothing outside the edited ranges changes, byte for byte, but the `use`
+lines of the files edited, tidied (above). A `mod` line and imports added
+at one place: the `mod` line first (0.12).
 
 Refused, nothing written: a name the item would take that is taken
 there (`refactor.collision`), a method or a field (`refactor.not-movable`),
@@ -144,6 +162,14 @@ written).
 (names in MODULE, or paths) to NEWMOD, made when it does not exist: a
 child (`crate::m::part`) makes MODULE a dir module (`m.tach` ->
 `m/mod.tach`, `m/part.tach`).
+
+`--reexport` (0.12) keeps MODULE's interface: code outside MODULE is
+left as it is, and MODULE re-exports its parts' items that code outside
+uses, with what it uses of them itself: `pub use part::{a, b};`, one
+line per part (an item made `pub` when it was not; the `mod part;` line
+stays private). For splits that must not touch other files (parallel
+agents each splitting one module); `fix --only reexports` removes such
+re-exports later.
 
 `--plan [--max-lines N]` (1000): the split of MODULE into parts of at
 most N lines, as the commands that make it, one per line, to run in
@@ -204,6 +230,7 @@ found no file over, the copy built with target/tachyonc, and
   it uses may leave an error the check then refuses.
 - Inline modules (`mod m { }`) are not moved into or out of.
 - A module moved back leaves the dir module made for it on the way.
-- Paths written from `crate` are long; the moved code's imports are
-  added, never merged into an existing `use` of the same module.
+- Paths written from `crate` are long (0.12: imports are tidied, merged
+  into a `use` of the same path, but `use crate::a::b::f` and `use
+  b::f` are two paths).
 - Names of `--plan`'s parts are guesses: rename them.

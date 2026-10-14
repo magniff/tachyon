@@ -1,0 +1,444 @@
+// Lowering: the checked AST to the IR of ir.tach, building SSA form on
+// the fly (Braun, Buchwald, Hack, Leißa, Mallon, Zwinkau: "Simple and
+// Efficient Construction of Static Single Assignment Form", CC 2013).
+//
+// SSA variables are the scalar locals whose address is never taken (the
+// others live in frame slots), and synthetic variables for the values of
+// `if`, `&&`/`||`, `loop` with `break` values and loop counters. A block
+// is sealed once all its predecessors are known; reading a variable in an
+// unsealed block makes an incomplete phi, completed when the block is
+// sealed. Structured control flow makes the sealing points obvious.
+//
+// Semantics are those of the 0.1 code generator (gen.tach): the same
+// evaluation order, the same calling convention (compound arguments are
+// passed as a pointer to a private copy, compound results through a
+// result pointer), and the same arithmetic.
+
+mod calls;
+mod control;
+mod expr;
+mod matching;
+pub mod ssa;
+mod vector;
+
+use ssa::{DEFS, SSA_STACK, ssa_read, ssa_write};
+
+use crate::base::{alloc_array, intern_c};
+use crate::front::lexer::Tok;
+use crate::front::ast::{DEFERS, DEFER_LOOPS, NODES, NODE_COUNT, NodeKind, child};
+use crate::front::types::{
+    FNS, TY_I64, TY_NEVER, TY_U64, align_to, fn_param, is_compound, is_vector, is_void,
+    tuple_offset, type_align, type_elem, type_size, variant_field, variant_field_offset,
+};
+use crate::front::check::{LOCALS, LOCAL_COUNT, Res};
+use crate::gen0::gen::MAIN_SYM;
+use crate::gen0::gen::expr::arith_op_of_assign;
+use crate::back::abi::{
+    ABI_PIECE_COUNT, ABI_PIECE_OFFSET, ABI_PIECE_TY, AbiClass, conv_classify,
+    conv_returns_through_pointer, fn_uses_c,
+};
+use crate::base::target::X86;
+use crate::back::dwarf::DEBUG_INFO;
+use crate::middle::ir::{
+    BLOCKS, CUR, INLINE_COPY_MAX, INSTS, IRF, IRFUNCS, IR_LOC, Op, SLOTS, Term, emit_ir, init_ir,
+    ir_const, ir_load, ir_new_block, ir_new_func, ir_new_slot, ir_offset, ir_slot_addr, ir_store,
+    ir_type,
+};
+use crate::middle::ir::cfg::ir_terminate;
+use crate::front::ast::NodeKind::{
+    Array, Call, Defer, Fn, Ident, Index, Let, PatBind, PatVariant, PatWild, Range, Repeat, Str,
+    StructLit, Tuple, Unary, VariantLit,
+};
+use crate::middle::lower::calls::{push_arg, take_args};
+use crate::middle::lower::expr::{
+    lower_addr, lower_expr, lower_operand, lower_operator, need_value, store_value,
+};
+use crate::middle::lower::ssa::{LOCAL_ADDR, PROMOTE};
+use crate::middle::lower::vector::{arith_token_of, vec_operand, vector_operator};
+
+// ---- Blocks during lowering ----
+
+// A block that no edge reaches (code after `return`, `break`, ...).
+fn is_dead_block(b: i64) -> bool {
+    unsafe { BLOCKS[b].sealed != 0 && BLOCKS[b].preds.count == 0 && b != IRFUNCS[IRF].entry }
+}
+
+fn start_dead_block() {
+    let b = ir_new_block();
+    unsafe { BLOCKS[b].sealed = 1; }
+    CUR = b;
+}
+
+// Ends the current block with a jump (no edge from a dead block).
+fn lower_jump(target: i64) {
+    if is_dead_block(CUR) {
+        ir_terminate(CUR, Term::Unreach, 0, 0, 0);
+    } else {
+        ir_terminate(CUR, Term::Jump, 0, target, 0);
+    }
+}
+
+fn lower_branch(cond: i64, if_true: i64, if_false: i64) {
+    if is_dead_block(CUR) {
+        ir_terminate(CUR, Term::Unreach, 0, 0, 0);
+    } else {
+        ir_terminate(CUR, Term::Branch, cond, if_true, if_false);
+    }
+}
+
+// ---- The program ----
+
+// Lowers every function to IR.
+pub fn lower_program(program: i64) {
+    unsafe {
+        init_ir();
+        PROMOTE = alloc_array::<i64>(LOCAL_COUNT + 1);
+        LOCAL_ADDR = alloc_array::<i64>(LOCAL_COUNT + 1);
+        for local in 0..LOCAL_COUNT {
+            let ty = LOCALS[local].ty;
+            PROMOTE[local] = if is_void(ty) || is_compound(ty) { 0 } else { 1 };
+        }
+        // A local whose address is taken lives in memory.
+        for n in 1..NODE_COUNT {
+            if NODES[n].kind == Unary && NODES[n].op == Tok::Amp {
+                let operand = NODES[n].b;
+                if NODES[operand].kind == Ident && NODES[operand].res == Res::Local {
+                    PROMOTE[NODES[operand].y] = 0;
+                }
+            }
+        }
+        for i in 0..NODES[program].count {
+            let item = child(program, i);
+            if NODES[item].kind == Fn {
+                lower_function(item);
+            }
+        }
+    }
+}
+
+fn lower_function(item: i64) {
+    unsafe {
+        let f = NODES[item].x - 1;
+        // (-g) The parameters and the frame come from the declaration.
+        IR_LOC = if DEBUG_INFO { NODES[item].start + 1 } else { 0 };
+        IRF = ir_new_func(f, item);
+        DEFS.clear();
+        DEFERS.count = 0;
+        DEFER_LOOPS.count = 0;
+        let entry = ir_new_block();
+        IRFUNCS[IRF].entry = entry;
+        BLOCKS[entry].sealed = 1;
+        CUR = entry;
+        let ret = FNS[f].ret;
+        let c = fn_uses_c(f);
+        if conv_returns_through_pointer(c, ret) {
+            IRFUNCS[IRF].result_ptr = emit_ir(Op::Param, TY_U64, 0, 0, -1);
+        }
+        for i in 0..FNS[f].param_count {
+            let ty = fn_param(f, i);
+            let local = NODES[child(item, i)].x;
+            if is_void(ty) || local < 0 {
+                continue;
+            }
+            let kind = conv_classify(c, ty);
+            if kind == AbiClass::Pieces {
+                // Stored from the registers (or stack slots) of its pieces:
+                // NodeKind::Param imm2 = the piece + 1.
+                let slot = ir_slot_addr(new_slot_for(ty));
+                for k in 0..ABI_PIECE_COUNT {
+                    let piece = emit_ir(Op::Param, ABI_PIECE_TY[k], 0, 0, i);
+                    INSTS[piece].imm2 = k + 1;
+                    ir_store(ABI_PIECE_TY[k], slot, piece, ABI_PIECE_OFFSET[k]);
+                }
+                bind_local(local, slot, ty, true);
+                continue;
+            }
+            let param = emit_ir(Op::Param, ir_type(ty), 0, 0, i);
+            if kind == AbiClass::Stack {
+                // The address of the caller's copy on the stack.
+                INSTS[param].imm2 = -1;
+            }
+            // A compound parameter points to the caller's private copy.
+            bind_local(local, param, ty, true);
+        }
+        let body = NODES[item].c;
+        let value = lower_block(body);
+        if NODES[body].ty != TY_NEVER {
+            lower_return(value);
+        }
+        if BLOCKS[CUR].term == Term::None {
+            ir_terminate(CUR, Term::Unreach, 0, 0, 0);
+        }
+        IR_LOC = 0;
+    }
+}
+
+fn lower_return(value: i64) {
+    unsafe {
+        let f = IRFUNCS[IRF].f;
+        let ret = FNS[f].ret;
+        let mut result = 0;
+        let c = fn_uses_c(f);
+        if conv_returns_through_pointer(c, ret) {
+            lower_copy(IRFUNCS[IRF].result_ptr, value, type_size(ret));
+            if X86 && c {
+                // Returned in rax, as C does.
+                result = IRFUNCS[IRF].result_ptr;
+            }
+        } else if is_compound(ret) {
+            // Returned in registers: its pieces, read from a multiple of 8
+            // bytes, packed for the RET.
+            let mut addr = need_value(value, ret);
+            if type_size(ret) % 8 != 0 && INSTS[addr].op != Op::Slot {
+                let copy = ir_slot_addr(new_slot_for(ret));
+                lower_copy(copy, addr, type_size(ret));
+                addr = copy;
+            }
+            conv_classify(c, ret);
+            let count = ABI_PIECE_COUNT;
+            let mut tys: [i64; 4] = [0; 4];
+            let mut offsets: [i64; 4] = [0; 4];
+            for k in 0..count {
+                tys[k] = ABI_PIECE_TY[k];
+                offsets[k] = ABI_PIECE_OFFSET[k];
+            }
+            let mark = SSA_STACK.count;
+            for k in 0..count {
+                push_arg(ir_load(tys[k], addr, offsets[k]), tys[k]);
+            }
+            result = emit_ir(Op::Pack, 0, 0, 0, 0);
+            take_args(result, mark);
+        } else if is_void(ret) {
+            // `main` without a result exits with 0.
+            if FNS[f].name == MAIN_SYM {
+                result = ir_const(0, TY_I64);
+            }
+        } else {
+            result = need_value(value, ret);
+        }
+        if !is_dead_block(CUR) {
+            ir_terminate(CUR, Term::Ret, result, 0, 0);
+        } else {
+            ir_terminate(CUR, Term::Unreach, 0, 0, 0);
+        }
+        start_dead_block();
+    }
+}
+
+// ---- Statements and bindings ----
+
+fn lower_block(block: i64) -> i64 {
+    unsafe {
+        let mark = DEFERS.count;
+        // (-g) Instructions come from the statement being lowered, and after
+        // the block from the statement holding it.
+        let outer = IR_LOC;
+        for i in 0..NODES[block].count {
+            let stmt = child(block, i);
+            if DEBUG_INFO {
+                IR_LOC = NODES[stmt].start + 1;
+            }
+            if NODES[stmt].kind == Let {
+                lower_let(stmt);
+            } else if NODES[stmt].kind == Defer {
+                DEFERS.push(stmt);
+            } else {
+                lower_expr(NODES[stmt].a);
+            }
+        }
+        let tail = NODES[block].a;
+        let mut value = 0;
+        if tail != 0 {
+            if DEBUG_INFO {
+                IR_LOC = NODES[tail].start + 1;
+            }
+            value = lower_expr(tail);
+        }
+        if DEFERS.count > mark {
+            if tail != 0 {
+                value = keep_value(value, NODES[tail].ty, mark);
+            }
+            lower_defers(mark);
+            DEFERS.count = mark;
+        }
+        IR_LOC = outer;
+        value
+    }
+}
+
+// The deferred statements registered above DEFERS depth `depth`, last
+// first (0.6): at the end of their block, or at a jump out of it.
+fn lower_defers(depth: i64) {
+    let mut i = DEFERS.count - 1;
+    while i >= depth && !is_dead_block(CUR) {
+        unsafe { lower_expr(NODES[DEFERS.data[i]].a); }
+        i -= 1;
+    }
+}
+
+// A value computed before deferred statements run: a compound value is
+// copied, so a deferred statement changing its source does not change it.
+fn keep_value(value: i64, ty: i64, depth: i64) -> i64 {
+    if DEFERS.count > depth && value != 0 && is_compound(ty) && !is_dead_block(CUR) {
+        let copy = ir_slot_addr(new_slot_for(ty));
+        lower_copy(copy, value, type_size(ty));
+        return copy;
+    }
+    value
+}
+
+// Expressions whose compound value is a new temporary, which a binding or
+// an argument may take over without copying.
+pub fn is_fresh(n: i64) -> bool {
+    unsafe {
+        match NODES[n].kind {
+            StructLit | Tuple | Array | Repeat
+                | Call | Str | VariantLit => true,
+            Index => NODES[NODES[n].b].kind == Range,
+            _ => false,
+        }
+    }
+}
+
+fn lower_let(stmt: i64) {
+    unsafe {
+        let init = NODES[stmt].c;
+        let value = lower_expr(init);
+        if NODES[init].ty == TY_NEVER {
+            return;
+        }
+        bind_pattern_ir(NODES[stmt].a, value, is_fresh(init));
+    }
+}
+
+fn bind_pattern_ir(pattern: i64, value: i64, fresh: bool) {
+    unsafe {
+        let kind = NODES[pattern].kind;
+        let ty = NODES[pattern].ty;
+        if kind == PatWild || ty == TY_NEVER {
+            return;
+        }
+        if kind == PatBind {
+            bind_local(NODES[pattern].x, value, ty, fresh);
+            return;
+        }
+        for i in 0..NODES[pattern].count {
+            let mut elem_ty = 0;
+            let mut offset = 0;
+            if kind == PatVariant {
+                elem_ty = variant_field(NODES[pattern].x, i);
+                offset = variant_field_offset(NODES[pattern].x, i);
+            } else {
+                elem_ty = type_elem(ty, i);
+                offset = tuple_offset(ty, i);
+            }
+            let mut elem = 0;
+            if is_compound(elem_ty) {
+                elem = ir_offset(value, offset);
+            } else if !is_void(elem_ty) {
+                elem = ir_load(ir_type(elem_ty), value, offset);
+            }
+            bind_pattern_ir(child(pattern, i), elem, false);
+        }
+    }
+}
+
+// Binds local `local` (of type `ty`) to `value` (the address of a compound
+// value, taken over when `fresh`).
+fn bind_local(local: i64, value: i64, ty: i64, fresh: bool) {
+    unsafe {
+        if is_void(ty) {
+            return;
+        }
+        if PROMOTE[local] != 0 {
+            ssa_write(local, CUR, need_value(value, ty));
+            return;
+        }
+        if is_compound(ty) && fresh {
+            LOCAL_ADDR[local] = value;
+            return;
+        }
+        let addr = ir_slot_addr(new_slot_for(ty));
+        if is_compound(ty) {
+            lower_copy(addr, value, type_size(ty));
+        } else {
+            ir_store(ir_type(ty), addr, need_value(value, ty), 0);
+        }
+        LOCAL_ADDR[local] = addr;
+    }
+}
+
+// A frame slot for a value of type `ty`; compound values get a multiple of
+// 8 bytes, so that they can be read and written in 8-byte pieces.
+fn new_slot_for(ty: i64) -> i64 {
+    let size = if is_compound(ty) { align_to(type_size(ty), 8) } else { type_size(ty) };
+    let slot = ir_new_slot(size, type_align(ty));
+    unsafe { SLOTS[slot].ty = ty; }
+    slot
+}
+
+// Copies `size` bytes from `src` to `dst`.
+fn lower_copy(dst: i64, src: i64, size: i64) {
+    unsafe {
+        if size == 0 {
+            return;
+        }
+        if size <= INLINE_COPY_MAX {
+            let v = emit_ir(Op::Copy, 0, dst, src, size);
+            INSTS[v].imm2 = 0;
+            return;
+        }
+        let mark = SSA_STACK.count;
+        push_arg(dst, TY_U64);
+        push_arg(src, TY_U64);
+        push_arg(ir_const(size, TY_U64), TY_U64);
+        let call = emit_ir(Op::CallC, 0, 0, 0, intern_c(c"memcpy"));
+        take_args(call, mark);
+    }
+}
+
+// ---- Assignment ----
+
+// The right-hand side is evaluated first, then the target's address; a
+// compound assignment then reads the old value.
+fn lower_assign(n: i64) {
+    unsafe {
+        let op = NODES[n].op;
+        let target = NODES[n].b;
+        let value = NODES[n].c;
+        let ty = NODES[target].ty;
+        if NODES[target].kind == Ident && NODES[target].res == Res::Local
+            && (PROMOTE[NODES[target].y] != 0 || is_void(ty)) {
+            let local = NODES[target].y;
+            if is_void(ty) {
+                lower_expr(value);
+                return;
+            }
+            let v = lower_operand(value);
+            if op == Tok::Eq {
+                ssa_write(local, CUR, v);
+                return;
+            }
+            let old = ssa_read(local, CUR);
+            ssa_write(local, CUR, lower_operator(arith_op_of_assign(op), ty, ty, old, v));
+            return;
+        }
+        if op == Tok::Eq {
+            let v = lower_expr(value);
+            let addr = lower_addr(target);
+            store_value(addr, 0, v, ty);
+            return;
+        }
+        if is_vector(ty) {
+            let v = vec_operand(value);
+            let addr = lower_addr(target);
+            let old = ir_load(ty, addr, 0);
+            ir_store(ty, addr, vector_operator(arith_token_of(arith_op_of_assign(op)), ty, ty, old, v), 0);
+            return;
+        }
+        let v = lower_operand(value);
+        let addr = lower_addr(target);
+        let old = ir_load(ir_type(ty), addr, 0);
+        ir_store(ir_type(ty), addr, lower_operator(arith_op_of_assign(op), ty, ty, old, v), 0);
+    }
+}

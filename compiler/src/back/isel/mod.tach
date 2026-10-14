@@ -1,0 +1,278 @@
+// Instruction selection: from the optimized IR to machine operations, just
+// before register allocation (after --emit-ir, so the optimizer's IR is what
+// that shows).
+//
+// Three steps per function:
+//
+// 0. Branches on phis. A block holding nothing but a phi and a branch on
+//    it (what `&&`, `||` and a `bool` result of `if` leave) is threaded:
+//    each predecessor that jumps there branches itself, on its own value
+//    for the phi (a comparison it made, fused with the branch then), or
+//    jumps where a constant goes.
+//
+// 1. Selects. A branch whose two ways (a diamond, or a triangle with one
+//    way empty) do at most a few pure, cheap instructions and meet again in
+//    a block whose phis pick between their values becomes those
+//    instructions, moved up, and a SELECT per phi (csel / fcsel on AArch64,
+//    cmov on x86-64, integers only there). A select owns its comparison: it
+//    compares its two extra operands itself (ARGS: the left side, and the
+//    right side or 0 for an immediate in imm), so nothing can come between
+//    the comparison and its use of the flags.
+//
+// 1b. Divisions by constants (0.11): x / d and x % d for a constant d are
+//    a multiplication by a magic number (divisions.tach), then tiled as the rest.
+//
+// 2. Tiling, by maximal munch: the instructions of each block from the last
+//    to the first, so that a user is matched before what it uses. A rule
+//    matches an instruction (the root) and the definitions of some of its
+//    operands, each in the same block and used by the root alone, and
+//    rewrites the root in place into a machine operation whose operands are
+//    the leaves; what the rule covered dies, and dead code elimination
+//    removes it. The machine operations (ir.tach):
+//
+//    loadx  ty a, b [off, -, s]      load ty from a + (b << s) + off
+//    storex a, b, c [off, ty, s]     store c (of type ty) there
+//    lea    a, b [off, -, s]         a + (b << s) + off (b may be 0), 64-bit
+//    madd   a, b, c                  c + a * b (AArch64)
+//    msub   a, b, c                  c - a * b (AArch64)
+//    shop   a, b [k, 4 * op + kind]  a op (b sh k); sh: 0 lsl, 1 lsr, 2 asr
+//                                    (AArch64)
+//    ubfx   a [k, n]                 (a >> k) & (2^n - 1), k + n within the
+//                                    type (AArch64)
+//    test.c a, b [m]                 (a & b) c 0, b 0 for the mask m: only
+//                                    as the condition of the branch ending
+//                                    its block
+//    fmath  a [kind]                 sqrt, fabs, floor, ceil, trunc, round
+//                                    (kind 0 to 5) of a float
+//    mulh   a, b [signed]            the high 64 bits of the 128-bit a * b
+//                                    (umulh, smulh; mulq, imulq: rdx)
+//    select.c a, b; lhs, rhs [imm, ty, kind]
+//                                    a if lhs c rhs (kind & 1 == 0) or if
+//                                    (lhs & rhs) c 0 (kind & 1 == 1), else
+//                                    b, or b + 1 when kind & 2 (csinc);
+//                                    rhs 0: the immediate imm; ty the
+//                                    comparison's operand type
+//
+// Then two scheduling rules (before register allocation): a branch's
+// comparison moves to the end of its block, where the branch fuses with
+// it; constants defined in loops move to the entry block (up to 16 per
+// function), so that a constant needed in a register is made once (the
+// allocator still brings it back by rematerialization, before the loop,
+// when it runs short of registers).
+//
+// The rules, per target:
+//
+//   both     load/store of (a + (b << s)), (a + b)  -> loadx/storex
+//            branch on (x & m) == 0, != 0           -> test
+//            selects (above); a select on (x & m) == 0 or != 0 tests
+//            the C library's sqrt (and sqrtf) on macOS, whose libm never
+//            sets errno                             -> fmath (fsqrt, sqrtsd)
+//   AArch64  s is the access size (or 0) and there is no offset;
+//            c + a * b, c - a * b                   -> madd, msub
+//            x op (y sh k), op in + - & | ^         -> shop
+//            (x >> k) & (2^n - 1)                   -> ubfx
+//            c ? a : b + 1, c ? a + 1 : b (integers) -> csinc
+//            fabs, floor, ceil, trunc, round (and their f32 forms: exact
+//            instructions, no errno)               -> fmath (fabs, frint*)
+//   x86-64   s up to 3, any offset, a frame slot as the base (from %rsp);
+//            a + (b << s), a + b, a + k, a - k (64-bit) -> lea
+//
+// Integer arithmetic wraps, and every machine operation normalizes its
+// result to its type once, so fusing integer operations is exact. Floats
+// are never fused (no fmadd): tachyon's float arithmetic is IEEE, one
+// rounding per operation.
+
+mod branches;
+mod divisions;
+mod tiling;
+
+use crate::base::{alloc_array, free};
+use crate::front::types::is_float;
+use crate::middle::ir::{
+    BLOCKS, INSTS, INST_COUNT, IRF, IRFUNCS, IRFUNC_COUNT, Op, Term, ir_append, ir_insert_before,
+    ir_operand, ir_operand_count, ir_unlink,
+};
+use crate::middle::ir::verify::verify_func;
+use crate::middle::opt::eliminate_dead_code;
+use crate::middle::inline::FN_LIVE;
+use crate::back::regalloc::LDEPTH;
+use crate::middle::ir::Op::{Cmp, Const, Param, Test};
+use crate::back::regalloc::prepare::layout_blocks;
+use crate::back::isel::branches::{form_selects, thread_phi_branches};
+use crate::back::isel::divisions::lower_divisions;
+use crate::back::isel::tiling::isel_function;
+
+// Uses of each instruction of the function being selected (by value id).
+static mut ISEL_USES: *i64 = 0 as *i64;
+static mut ISEL_CAP: i64 = 0;
+
+pub fn select_instructions() {
+    unsafe {
+        for fi in 0..IRFUNC_COUNT {
+            if FN_LIVE[fi] == 0 {
+                continue;
+            }
+            IRF = fi;
+            let threaded = thread_phi_branches(fi);
+            if form_selects(fi) || threaded {
+                eliminate_dead_code(fi);
+            }
+            lower_divisions(fi);
+            isel_function(fi);
+            eliminate_dead_code(fi);
+            schedule_function(fi);
+            verify_func(fi, c"instruction selection");
+        }
+    }
+}
+
+// ---- Use counts ----
+
+fn isel_count_uses(fi: i64) {
+    unsafe {
+        if ISEL_CAP < INST_COUNT + 1 {
+            free(ISEL_USES as *u8);
+            ISEL_CAP = 2 * INST_COUNT + 1024;
+            ISEL_USES = alloc_array::<i64>(ISEL_CAP);
+        }
+        for i in 0..IRFUNCS[fi].blocks.count {
+            let b = IRFUNCS[fi].blocks.data[i];
+            if BLOCKS[b].removed != 0 {
+                continue;
+            }
+            let mut v = BLOCKS[b].first;
+            while v != 0 {
+                ISEL_USES[v] = 0;
+                v = INSTS[v].next;
+            }
+        }
+        for i in 0..IRFUNCS[fi].blocks.count {
+            let b = IRFUNCS[fi].blocks.data[i];
+            if BLOCKS[b].removed != 0 {
+                continue;
+            }
+            let mut v = BLOCKS[b].first;
+            while v != 0 {
+                for k in 0..ir_operand_count(v) {
+                    let operand = ir_operand(v, k);
+                    if operand != 0 {
+                        ISEL_USES[operand] += 1;
+                    }
+                }
+                v = INSTS[v].next;
+            }
+            if BLOCKS[b].cond != 0 {
+                ISEL_USES[BLOCKS[b].cond] += 1;
+            }
+        }
+    }
+}
+
+// One use of `v` less; when it was the last, `v` is dead and so are its
+// own uses.
+fn isel_release(v: i64) {
+    unsafe {
+        if v == 0 {
+            return;
+        }
+        ISEL_USES[v] -= 1;
+        if ISEL_USES[v] == 0 && !INSTS[v].op.has_side_effect() {
+            for k in 0..ir_operand_count(v) {
+                isel_release(ir_operand(v, k));
+            }
+        }
+    }
+}
+
+fn isel_retain(v: i64) {
+    if v != 0 {
+        unsafe { ISEL_USES[v] += 1; }
+    }
+}
+
+// Whether `v` (an operand of `user`) can be covered by a rule rooted at
+// `user`: an integer instruction `op` of the same block used by `user`
+// alone.
+fn coverable(v: i64, op: Op, user: i64) -> bool {
+    unsafe {
+        v != 0 && INSTS[v].op == op && INSTS[v].block == INSTS[user].block && ISEL_USES[v] == 1
+            && !is_float(INSTS[v].ty)
+    }
+}
+
+fn isel_const(v: i64, out: *i64) -> bool {
+    unsafe {
+        if v != 0 && INSTS[v].op == Const && !is_float(INSTS[v].ty) {
+            *out = INSTS[v].imm;
+            return true;
+        }
+        false
+    }
+}
+
+// Rewrites root `v`'s operands to a, b, c (counting the new uses before
+// releasing the old ones, so that shared leaves stay alive).
+fn isel_set_operands(v: i64, a: i64, b: i64, c: i64) {
+    unsafe {
+        let old_a = INSTS[v].a;
+        let old_b = INSTS[v].b;
+        let old_c = INSTS[v].c;
+        INSTS[v].a = a;
+        INSTS[v].b = b;
+        INSTS[v].c = c;
+        isel_retain(a);
+        isel_retain(b);
+        isel_retain(c);
+        isel_release(old_a);
+        isel_release(old_b);
+        isel_release(old_c);
+    }
+}
+
+// ---- Scheduling ----
+
+fn schedule_function(fi: i64) {
+    unsafe {
+        isel_count_uses(fi);
+        let entry = IRFUNCS[fi].entry;
+        // Loop depths (by layout index), from the allocator's layout.
+        layout_blocks(fi);
+        // Constants go after the entry's parameters (and before its branch's
+        // comparison, which stays last).
+        let mut at = BLOCKS[entry].first;
+        while at != 0 && INSTS[at].op == Param {
+            at = INSTS[at].next;
+        }
+        let mut hoisted = 0;
+        for i in 0..IRFUNCS[fi].blocks.count {
+            let b = IRFUNCS[fi].blocks.data[i];
+            if BLOCKS[b].removed != 0 || BLOCKS[b].order < 0 {
+                continue;
+            }
+            // The branch's comparison (or test), used by it alone, last.
+            let c = BLOCKS[b].cond;
+            if BLOCKS[b].term == Term::Branch && c != 0 && INSTS[c].block == b && INSTS[c].next != 0
+                && (INSTS[c].op == Cmp || INSTS[c].op == Test) && ISEL_USES[c] == 1 {
+                ir_unlink(c);
+                ir_append(b, c);
+            }
+            if b == entry || LDEPTH.data[BLOCKS[b].order] == 0 {
+                continue;
+            }
+            let mut v = BLOCKS[b].first;
+            while v != 0 {
+                let next = INSTS[v].next;
+                if INSTS[v].op == Const && ISEL_USES[v] > 0 && hoisted < 16 {
+                    ir_unlink(v);
+                    if at == 0 {
+                        ir_append(entry, v);
+                    } else {
+                        ir_insert_before(at, v);
+                    }
+                    hoisted += 1;
+                }
+                v = next;
+            }
+        }
+    }
+}

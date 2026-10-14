@@ -1,0 +1,693 @@
+// Collecting the declarations (the first phases of collect_phase): every
+// item's name in its module, the constants' types, the structs' fields,
+// the enums' variants (their discriminants and tag types), the methods of
+// impl blocks (generic ones as templates) and the type aliases.
+
+use crate::base::{
+    IntVec, SYMS, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, grow, intern, intern_c,
+};
+use crate::base::diag::{
+    err_begin, err_end, err_end_soft, err_int, err_str, err_sym, error_at, error_at_soft,
+};
+use crate::front::ast::{
+    FN_COLD, FN_INLINE, FN_NO_INLINE, FN_SIG_FAILED, FN_UNSAFE, NODES, REPR_C, REPR_INT, child,
+};
+use crate::front::ast::NodeKind::{
+    CStr, Const, Enum, ExternFn, Fn, Impl, Mod, Static, Struct, Trait, TyArray, TyName, TypeAlias,
+    Use,
+};
+use crate::front::check::{
+    CONST_CONTEXT, PROGRAM, SELF_TYPE_SYM, TRY_RESULT, Try, attempt, name_error,
+    resolve_type_or_error, type_error, type_error_got,
+};
+use crate::front::consteval::{const_eval, wrap_int};
+use crate::front::generics::{TPL_NONE, env_lookup, template_name, template_of_key};
+use crate::front::modules::{
+    CUR_MOD, MODULES, child_module, item_symbol, join_sym, module_of, qualify,
+};
+use crate::front::parser::items::ITEM_PUBLIC;
+use crate::front::traits::{add_trait, builtin_type_symbol, impl_of_fn};
+use crate::front::types::{
+    CONSTS, CONST_CAP, CONST_COUNT, ConstInfo, ENUMS, ENUM_CAP, ENUM_COUNT, EnumInfo, FIELDS,
+    FIELD_CAP, FIELD_COUNT, FNS, FN_CAP, FN_COUNT, FieldInfo, FnInfo, METHODS, METHOD_CAP,
+    METHOD_COUNT, MethodInfo, STATICS, STATIC_CAP, STATIC_COUNT, STRUCTS, STRUCT_CAP, STRUCT_COUNT,
+    SYM_ALIAS, SYM_CONST, SYM_ENUM, SYM_FN, SYM_ITEM, SYM_PRIMITIVE, SYM_STATIC, SYM_STRUCT,
+    StaticInfo, StructInfo, TLISTS, TSCRATCH, TYPES, TY_BOOL, TY_ERROR, TY_I16, TY_I32, TY_I64,
+    TY_I8, TY_U16, TY_U32, TY_U64, TY_U8, TY_UNIT, TyKind, VARIANTS, VARIANT_CAP, VARIANT_COUNT,
+    VariantInfo, buf_type, enum_variant, err_type, find_method, find_variant, is_fieldless_enum,
+    is_integer, is_numeric, is_pointer, item_node_of, make_type, variant_field,
+};
+use crate::front::check::resolve::{resolve_alias, resolve_type, type_name_key};
+use crate::front::check::synth_mode::synth_expr;
+
+fn duplicate_error(item: i64, kind: *u8) -> ! {
+    unsafe {
+        err_begin(NODES[item].start);
+        err_str(c"duplicate ");
+        err_str(kind);
+        err_str(c" '");
+        err_sym(NODES[item].a);
+        err_str(c"'");
+        err_end()
+    }
+}
+
+pub fn collect_names() {
+    unsafe {
+        for i in 0..NODES[PROGRAM].count {
+            attempt(Try::Name, child(PROGRAM, i));
+        }
+    }
+}
+
+// The name item declares (a duplicate is left out: a function's x stays
+// 0).
+pub fn collect_name(item: i64) {
+    unsafe {
+        let mut kind = NODES[item].kind;
+        if kind == Impl {
+            return;
+        }
+        if kind == Const && NODES[item].b != 0 && NODES[NODES[item].b].kind == TyArray {
+            // An array constant (0.9) is an immutable static: memory
+            // holding its elements.
+            NODES[item].kind = Static;
+            NODES[item].d = 0;
+            NODES[item].y = 0;
+            kind = Static;
+        }
+        let name = NODES[item].a;
+        let m = module_of(item);
+        if MODULES[m].is_c {
+            NODES[item].p |= ITEM_PUBLIC;
+        }
+        let key = qualify(m, name);
+        match kind {
+            Struct | TypeAlias | Enum => {
+                if SYM_STRUCT[key] != 0 || SYM_ENUM[key] != 0 || SYM_ALIAS[key] != 0
+                    || SYM_PRIMITIVE[name] != 0 || name == SELF_TYPE_SYM {
+                    duplicate_error(item, match kind {
+                        Struct => c"struct",
+                        Enum => c"enum",
+                        _ => c"type",
+                    });
+                }
+                match kind {
+                    Struct => add_struct(item, key, m),
+                    Enum => add_enum(item, key, m),
+                    _ => SYM_ALIAS[key] = item,
+                }
+                SYM_ITEM[key] = item;
+                return;
+            }
+            Use => return,
+            Trait => {
+                if item_node_of(key) != 0 || SYM_PRIMITIVE[name] != 0 {
+                    duplicate_error(item, c"name");
+                }
+                SYM_ITEM[key] = item;
+                add_trait(item, key, m);
+                return;
+            }
+            Mod => {
+                if item_node_of(key) != 0 {
+                    duplicate_error(item, c"name");
+                }
+                return;
+            }
+            Fn if NODES[item].d != 0 => {
+                // A method or associated function: found through METHODS
+                // (see collect_methods), which also names it.
+                add_fn(item, name, name);
+                return;
+            }
+            _ => {}
+        }
+        if SYM_FN[key] != 0 || SYM_CONST[key] != 0 || SYM_STATIC[key] != 0 {
+            match kind {
+                Const => duplicate_error(item, c"constant"),
+                Static => duplicate_error(item, c"static"),
+                _ => duplicate_error(item, c"function"),
+            }
+        }
+        if child_module(m, name) >= 0 {
+            duplicate_error(item, c"name (a module has it)");
+        }
+        if name == intern_c(c"size_of") || name == intern_c(c"align_of") {
+            name_error(NODES[item].start, c"'", name, c"' is a builtin (size_of(T) and align_of(T)); choose another name");
+        }
+        SYM_ITEM[key] = item;
+        match kind {
+            Fn | ExternFn => {
+                // C functions and `extern "C" fn` definitions keep their
+                // names as symbols; others are prefixed by their module.
+                let c_name = kind == ExternFn || NODES[item].y != 0;
+                add_fn(item, if c_name { name } else { item_symbol(m, name) }, key);
+                SYM_FN[key] = FN_COUNT;
+            }
+            Const => {
+                CONSTS = grow(CONSTS, CONST_COUNT, &CONST_CAP);
+                CONSTS[CONST_COUNT] = ConstInfo { node: item, ty: 0, value: 0, state: 0 };
+                CONST_COUNT += 1;
+                SYM_CONST[key] = CONST_COUNT;
+            }
+            Static => {
+                STATICS = grow(STATICS, STATIC_COUNT, &STATIC_CAP);
+                STATICS[STATIC_COUNT] = StaticInfo {
+                    node: item, ty: 0, mutable: NODES[item].d != 0, linkage: NODES[item].y,
+                };
+                STATIC_COUNT += 1;
+                SYM_STATIC[key] = STATIC_COUNT;
+                // The static's symbol (its name for C, prefixed by its
+                // module otherwise) is its item's name from now on, and
+                // also finds it (the code generators look statics up by
+                // symbol).
+                let sym = if NODES[item].y != 0 { name } else { item_symbol(m, name) };
+                SYM_STATIC[sym] = STATIC_COUNT;
+                NODES[item].a = sym;
+            }
+            _ => {}
+        }
+    }
+}
+
+pub fn add_fn(item: i64, name: i64, display: i64) {
+    unsafe {
+        FNS = grow(FNS, FN_COUNT, &FN_CAP);
+        let kind = NODES[item].kind;
+        FNS[FN_COUNT] = FnInfo {
+            name: name, node: item, params: 0, param_count: 0, ret: TY_UNIT,
+            variadic: kind == ExternFn && NODES[item].d != 0, is_extern: kind == ExternFn,
+            self_ty: 0, export: kind == Fn && NODES[item].y != 0,
+            display: display, generic: generic_count(NODES[item].g), tmpl: 0, targs: 0, targ_count: 0,
+            origin: 0, parent: 0, depth: 0, module: module_of(item),
+            attrs: NODES[item].p & (FN_INLINE | FN_NO_INLINE | FN_COLD | FN_UNSAFE),
+        };
+        FN_COUNT += 1;
+        NODES[item].x = FN_COUNT;
+    }
+}
+
+fn generic_count(g: i64) -> i64 {
+    if g == 0 { 0 } else { unsafe { NODES[g].count } }
+}
+
+// The symbol `Type.name` of a method (from its type's symbol).
+fn method_symbol(type_sym: i64, name: i64) -> i64 {
+    unsafe {
+        let out = buf_new();
+        buf_bytes(out, SYMS[type_sym].text);
+        buf_byte(out, '.');
+        buf_bytes(out, SYMS[name].text);
+        intern(buf_slice(out))
+    }
+}
+
+// The symbol of a type with methods.
+fn type_symbol(t: i64) -> i64 {
+    unsafe {
+        if TYPES[t].kind == TyKind::Struct { return STRUCTS[TYPES[t].a].sym; }
+        if TYPES[t].kind == TyKind::Enum { return ENUMS[TYPES[t].a].sym; }
+        // (0.9: a trait's impl for a builtin type)
+        builtin_type_symbol(t)
+    }
+}
+
+pub fn new_enum(item: i64, name: i64, sym: i64, module: i64) -> i64 {
+    unsafe {
+        ENUMS = grow(ENUMS, ENUM_COUNT, &ENUM_CAP);
+        ENUMS[ENUM_COUNT] = EnumInfo {
+            name: name, node: item, variants: 0, variant_count: 0, tag: TY_U8,
+            has_fields: false, layout_state: 0, repr: NODES[item].c, payload: 0,
+            generic: 0, tmpl: 0, targs: 0, targ_count: 0, sym: sym, module: module,
+        };
+    }
+    ENUM_COUNT += 1;
+    ENUM_COUNT - 1
+}
+
+fn add_enum(item: i64, key: i64, module: i64) {
+    unsafe {
+        let e = new_enum(item, NODES[item].a, item_symbol(module, NODES[item].a), module);
+        ENUMS[e].generic = generic_count(NODES[item].g);
+        SYM_ENUM[key] = e + 1;
+    }
+}
+
+pub fn new_struct(item: i64, name: i64, sym: i64, module: i64) -> i64 {
+    unsafe {
+        STRUCTS = grow(STRUCTS, STRUCT_COUNT, &STRUCT_CAP);
+        STRUCTS[STRUCT_COUNT] = StructInfo {
+            name: name, node: item, fields: 0, field_count: 0, layout_state: 0,
+            repr: NODES[item].c, align: NODES[item].d,
+            generic: 0, tmpl: 0, targs: 0, targ_count: 0, sym: sym, module: module,
+        };
+    }
+    STRUCT_COUNT += 1;
+    STRUCT_COUNT - 1
+}
+
+fn add_struct(item: i64, key: i64, module: i64) {
+    unsafe {
+        let s = new_struct(item, NODES[item].a, item_symbol(module, NODES[item].a), module);
+        STRUCTS[s].generic = generic_count(NODES[item].g);
+        SYM_STRUCT[key] = s + 1;
+    }
+}
+
+pub fn collect_const_types() {
+    unsafe {
+        for c in 0..CONST_COUNT {
+            let item = CONSTS[c].node;
+            CUR_MOD = module_of(item);
+            let mut ty = resolve_type_or_error(NODES[item].b);
+            // 0.4: fieldless enums, and C strings (`const S: *u8 = c"...";`).
+            let string = is_pointer(ty) && NODES[NODES[item].c].kind == CStr;
+            if !(is_numeric(ty) || ty == TY_BOOL || is_fieldless_enum(ty) || string) {
+                err_begin(NODES[NODES[item].b].start);
+                err_str(c"constant '");
+                err_sym(NODES[item].a);
+                err_str(c"' has type '");
+                err_type(ty);
+                err_str(c"'; constants must be integers, floats or bool");
+                err_end_soft();
+                ty = TY_ERROR;
+            }
+            CONSTS[c].ty = ty;
+        }
+    }
+}
+
+pub fn collect_structs() {
+    unsafe {
+        for s in 0..STRUCT_COUNT {
+            if STRUCTS[s].generic == 0 && STRUCTS[s].tmpl == 0 {
+                CUR_MOD = STRUCTS[s].module;
+                collect_struct_fields(s);
+            }
+        }
+        CUR_MOD = 0;
+    }
+}
+
+// The fields of struct s (of a struct item, or of an instance of a
+// generic one, with its parameters in scope).
+pub fn collect_struct_fields(s: i64) {
+    unsafe {
+        let item = STRUCTS[s].node;
+        let mark = TSCRATCH.count;
+        for i in 0..NODES[item].count {
+            let field = child(item, i);
+            for j in 0..i {
+                if NODES[child(item, j)].a == NODES[field].a {
+                    err_begin(NODES[field].start);
+                    err_str(c"duplicate field '");
+                    err_sym(NODES[field].a);
+                    err_str(c"' in struct '");
+                    err_sym(NODES[item].a);
+                    err_str(c"'");
+                    err_end_soft();
+                    break;
+                }
+            }
+            let ty = resolve_type_or_error(NODES[field].b);
+            TSCRATCH.push(ty);
+        }
+        // Instances made while resolving the types added fields of their own:
+        // this struct's go after them.
+        STRUCTS[s].fields = FIELD_COUNT;
+        for i in 0..NODES[item].count {
+            FIELDS = grow(FIELDS, FIELD_COUNT, &FIELD_CAP);
+            FIELDS[FIELD_COUNT] = FieldInfo { name: NODES[child(item, i)].a, ty: TSCRATCH.data[mark + i], offset: 0 };
+            FIELD_COUNT += 1;
+        }
+        TSCRATCH.count = mark;
+        STRUCTS[s].field_count = NODES[item].count;
+    }
+}
+
+pub fn collect_enums() {
+    unsafe {
+        for e in 0..ENUM_COUNT {
+            if ENUMS[e].generic == 0 && ENUMS[e].tmpl == 0 {
+                CUR_MOD = ENUMS[e].module;
+                collect_enum_variants(e);
+            }
+        }
+        CUR_MOD = 0;
+    }
+}
+
+// The variants of enum e (of an enum item, or of an instance of a generic
+// one, with its parameters in scope).
+pub fn collect_enum_variants(e: i64) {
+    unsafe {
+        let item = ENUMS[e].node;
+        let mut has_fields = false;
+        for i in 0..NODES[item].count {
+            if NODES[child(item, i)].c != 0 {
+                has_fields = true;
+            }
+        }
+        ENUMS[e].has_fields = has_fields;
+        // The field types of every variant first (resolving them may make
+        // instances, with variants of their own), then the variants.
+        let types = TSCRATCH.count;
+        let discrs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut next = 0;
+        let mut low = 0;
+        let mut high = 0;
+        for i in 0..NODES[item].count {
+            let node = child(item, i);
+            for j in 0..i {
+                if NODES[child(item, j)].a == NODES[node].a {
+                    err_begin(NODES[node].start);
+                    err_str(c"duplicate variant '");
+                    err_sym(NODES[node].a);
+                    err_str(c"' in enum '");
+                    err_sym(NODES[item].a);
+                    err_str(c"'");
+                    err_end_soft();
+                    break;
+                }
+            }
+            if NODES[node].c != 0 && NODES[node].count == 0 {
+                error_at_soft(NODES[node].start, c"a tuple variant needs at least one field; write the variant without '()'");
+            }
+            for k in 0..NODES[node].count {
+                let ty = resolve_type_or_error(child(node, k));
+                TSCRATCH.push(ty);
+            }
+            let mut discr = next;
+            if NODES[node].b != 0 {
+                if has_fields {
+                    error_at_soft(NODES[NODES[node].b].start, c"explicit discriminants are only allowed in enums without fields");
+                } else if attempt(Try::Discr, NODES[node].b) {
+                    discr = TRY_RESULT;
+                }
+            }
+            for j in 0..i {
+                if discrs.data[j] == discr {
+                    err_begin(NODES[node].start);
+                    err_str(c"discriminant ");
+                    err_int(discr);
+                    err_str(c" of variant '");
+                    err_sym(NODES[node].a);
+                    err_str(c"' is already used by '");
+                    err_sym(NODES[child(item, j)].a);
+                    err_str(c"'");
+                    err_end_soft();
+                    break;
+                }
+            }
+            discrs.push(discr);
+            if i == 0 || discr < low {
+                low = discr;
+            }
+            if i == 0 || discr > high {
+                high = discr;
+            }
+            next = discr + 1;
+        }
+        ENUMS[e].variants = VARIANT_COUNT;
+        ENUMS[e].variant_count = NODES[item].count;
+        let mut at = types;
+        for i in 0..NODES[item].count {
+            let node = child(item, i);
+            let fields = TLISTS.count;
+            for k in 0..NODES[node].count {
+                TLISTS.push(TSCRATCH.data[at + k]);
+            }
+            at += NODES[node].count;
+            VARIANTS = grow(VARIANTS, VARIANT_COUNT, &VARIANT_CAP);
+            VARIANTS[VARIANT_COUNT] = VariantInfo {
+                name: NODES[node].a, node: node, enum_id: e, discr: discrs.data[i], fields: fields,
+                field_count: NODES[node].count, shape: 0,
+            };
+            VARIANT_COUNT += 1;
+        }
+        TSCRATCH.count = types;
+        ENUMS[e].tag = enum_tag_type(e, item, low, high);
+        let repr_c = (ENUMS[e].repr & REPR_C) != 0;
+        if has_fields {
+            for i in 0..ENUMS[e].variant_count {
+                let v = enum_variant(e, i);
+                let mark = TSCRATCH.count;
+                if !repr_c {
+                    TSCRATCH.push(ENUMS[e].tag);
+                }
+                for k in 0..VARIANTS[v].field_count {
+                    TSCRATCH.push(variant_field(v, k));
+                }
+                VARIANTS[v].shape = make_type(TyKind::Tuple, 0, 0, mark);
+            }
+        }
+    }
+}
+
+// The type of the tag of enum e: from #[repr(u8)] and the like, a C int
+// for #[repr(C)], else the smallest that holds every discriminant.
+fn enum_tag_type(e: i64, item: i64, low: i64, high: i64) -> i64 {
+    unsafe {
+        let mut tag = 0;
+        if (ENUMS[e].repr & REPR_INT) != 0 {
+            tag = SYM_PRIMITIVE[NODES[item].d];
+        } else if (ENUMS[e].repr & REPR_C) != 0 {
+            tag = TY_I32;
+        } else {
+            return tag_type_for(low, high);
+        }
+        if ENUMS[e].variant_count > 0 && (wrap_int(low, tag) != low || wrap_int(high, tag) != high) {
+            err_begin(NODES[item].start);
+            err_str(c"the discriminants of enum '");
+            err_sym(NODES[item].a);
+            err_str(c"' do not fit its tag type '");
+            err_type(tag);
+            err_str(c"'");
+            err_end_soft();
+        }
+        tag
+    }
+}
+
+// The smallest integer type holding every discriminant in low..=high.
+fn tag_type_for(low: i64, high: i64) -> i64 {
+    if low >= 0 {
+        if high <= 255 { return TY_U8; }
+        if high <= 65535 { return TY_U16; }
+        if high <= 4294967295 { return TY_U32; }
+        return TY_I64;
+    }
+    if low >= -128 && high <= 127 { return TY_I8; }
+    if low >= -32768 && high <= 32767 { return TY_I16; }
+    if low >= -2147483648 && high <= 2147483647 { return TY_I32; }
+    TY_I64
+}
+
+pub fn eval_discriminant(n: i64) -> i64 {
+    unsafe {
+        let saved_context = CONST_CONTEXT;
+        CONST_CONTEXT = true;
+        let ty = synth_expr(n);
+        if !is_integer(ty) {
+            type_error_got(n, c"an enum discriminant must be an integer", ty);
+        }
+        let value = const_eval(n);
+        CONST_CONTEXT = saved_context;
+        if ty == TY_U64 && value < 0 {
+            type_error(n, c"an enum discriminant must fit in i64");
+        }
+        value
+    }
+}
+
+// The methods and associated functions of impl blocks. Those of a
+// generic type (`impl<T> Vec<T>`) are templates, found through GMETHODS
+// by the type's template; the others are found through METHODS by type.
+pub fn collect_methods() {
+    unsafe {
+        for f in 0..FN_COUNT {
+            let item = FNS[f].node;
+            if FNS[f].is_extern || NODES[item].h == 0 || (NODES[item].p & FN_SIG_FAILED) != 0 {
+                continue;
+            }
+            if !attempt(Try::Method, f) {
+                // (its Self is unknown: neither its signature nor its body
+                // is checked)
+                NODES[item].p |= FN_SIG_FAILED;
+            }
+        }
+        CUR_MOD = 0;
+    }
+}
+
+pub fn collect_method(f: i64) {
+    unsafe {
+        let item = FNS[f].node;
+        let self_node = NODES[item].h;
+        CUR_MOD = FNS[f].module;
+        let name = NODES[item].a;
+        let tpl = impl_template(item);
+        if tpl != TPL_NONE {
+            for i in 0..GMETHOD_COUNT {
+                if GMETHODS[i].ty == tpl && GMETHODS[i].name == name {
+                    err_begin(NODES[item].start);
+                    err_str(c"duplicate method '");
+                    err_sym(name);
+                    err_str(c"' for type '");
+                    err_sym(template_name(tpl));
+                    err_str(c"'");
+                    err_end();
+                }
+            }
+            if tpl < 0 && template_variant_named(-tpl - 1, name) {
+                variant_and_method_error(item, template_name(tpl));
+            }
+            GMETHODS = grow(GMETHODS, GMETHOD_COUNT, &GMETHOD_CAP);
+            GMETHODS[GMETHOD_COUNT] = MethodInfo { ty: tpl, name: name, f: f };
+            GMETHOD_COUNT += 1;
+            let base = if tpl > 0 { STRUCTS[tpl - 1].sym } else { ENUMS[-tpl - 1].sym };
+            FNS[f].name = method_symbol(base, name);
+            FNS[f].display = join_sym(template_name(tpl), c"::", name);
+            return;
+        }
+        if NODES[self_node].kind == TyName && NODES[self_node].count == 0 && NODES[self_node].g == 0
+            && type_name_key(self_node) < 0
+            && SYM_PRIMITIVE[NODES[self_node].a] == 0 && env_lookup(NODES[self_node].a) == 0 {
+            name_error(NODES[item].start, c"impl for unknown type '", NODES[self_node].a, c"'");
+        }
+        let t = resolve_type(self_node);
+        let kind = TYPES[t].kind;
+        if kind != TyKind::Struct && kind != TyKind::Enum && impl_of_fn(f) < 0 {
+            err_begin(NODES[item].start);
+            err_str(c"impl blocks are only allowed for structs and enums, not '");
+            err_type(t);
+            err_str(c"'");
+            err_end();
+        }
+        if find_method(t, name) >= 0 {
+            err_begin(NODES[item].start);
+            err_str(c"duplicate method '");
+            err_sym(name);
+            err_str(c"' for type '");
+            err_type(t);
+            err_str(c"'");
+            err_end();
+        }
+        if kind == TyKind::Enum && find_variant(TYPES[t].a, name) >= 0 {
+            let out = buf_new();
+            buf_type(out, t);
+            variant_and_method_error(item, intern(buf_slice(out)));
+        }
+        if FNS[f].generic == 0 {
+            FNS[f].self_ty = t;
+        }
+        FNS[f].name = method_symbol(type_symbol(t), name);
+        let out = buf_new();
+        buf_type(out, t);
+        buf_str(out, c"::");
+        buf_bytes(out, SYMS[name].text);
+        FNS[f].display = intern(buf_slice(out));
+        METHODS = grow(METHODS, METHOD_COUNT, &METHOD_CAP);
+        METHODS[METHOD_COUNT] = MethodInfo { ty: t, name: name, f: f };
+        METHOD_COUNT += 1;
+    }
+}
+
+fn variant_and_method_error(item: i64, type_name: i64) -> ! {
+    unsafe {
+        err_begin(NODES[item].start);
+        err_str(c"'");
+        err_sym(NODES[item].a);
+        err_str(c"' is both a variant and an associated function of '");
+        err_sym(type_name);
+        err_str(c"'");
+        err_end()
+    }
+}
+
+pub fn template_variant_named(e: i64, name: i64) -> bool {
+    unsafe {
+        let item = ENUMS[e].node;
+        for i in 0..NODES[item].count {
+            if NODES[child(item, i)].a == name {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// The template an impl block is for, when it is generic (`impl<T>
+// Vec<T>`): its self type names a generic type with the impl's
+// parameters as arguments. TPL_NONE otherwise.
+fn impl_template(item: i64) -> i64 {
+    unsafe {
+        let self_node = NODES[item].h;
+        let tpl = template_of_type_node(self_node);
+        if tpl == TPL_NONE {
+            return TPL_NONE;
+        }
+        let params = NODES[item].g;
+        let impl_count = if params == 0 { 0 } else { NODES[params].a };
+        if impl_count == 0 {
+            // `impl Vec<i64>`: methods of one instance.
+            return TPL_NONE;
+        }
+        let g = NODES[self_node].g;
+        if g == 0 || NODES[g].count != impl_count {
+            error_at(NODES[self_node].start, c"a generic impl block is for its type with its parameters as arguments: 'impl<T> Vec<T>'");
+        }
+        for i in 0..impl_count {
+            let arg = child(g, i);
+            if NODES[arg].kind != TyName || NODES[arg].a != NODES[child(params, i)].a || NODES[arg].g != 0 {
+                error_at(NODES[arg].start, c"a generic impl block is for its type with its parameters as arguments, in order: 'impl<T> Vec<T>'");
+            }
+        }
+        tpl
+    }
+}
+
+// The template a TyName names (a generic struct or enum), or TPL_NONE.
+pub fn template_of_type_node(n: i64) -> i64 {
+    if unsafe { NODES[n].kind != TyName || env_lookup(NODES[n].a) != 0 } {
+        return TPL_NONE;
+    }
+    let key = type_name_key(n);
+    if key < 0 {
+        return TPL_NONE;
+    }
+    template_of_key(key)
+}
+
+pub static mut GMETHODS: *MethodInfo = 0 as *MethodInfo;
+
+pub static mut GMETHOD_COUNT: i64 = 0;
+
+static mut GMETHOD_CAP: i64 = 0;
+
+// The method template `name` of template tpl, or -1.
+pub fn find_generic_method(tpl: i64, name: i64) -> i64 {
+    unsafe {
+        for i in 0..GMETHOD_COUNT {
+            if GMETHODS[i].ty == tpl && GMETHODS[i].name == name {
+                return GMETHODS[i].f;
+            }
+        }
+        -1
+    }
+}
+
+pub fn collect_aliases() {
+    unsafe {
+        for i in 0..NODES[PROGRAM].count {
+            let item = child(PROGRAM, i);
+            // (generic aliases (0.6) are resolved where they are used)
+            if NODES[item].kind == TypeAlias && NODES[item].g == 0 {
+                CUR_MOD = module_of(item);
+                resolve_alias(qualify(CUR_MOD, NODES[item].a), NODES[item].start);
+            }
+        }
+    }
+    CUR_MOD = 0;
+}

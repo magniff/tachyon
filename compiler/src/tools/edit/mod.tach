@@ -1,0 +1,279 @@
+// Changing a program by name, atomically (0.11; docs/refactor.md):
+//
+//   tachyonc edit replace NAME [ROOT] < TEXT   the item's text becomes TEXT
+//   tachyonc edit insert --after|--before NAME [ROOT] < TEXT
+//   tachyonc edit delete NAME [ROOT]
+//   tachyonc edit patch TARGET --old TEXT --new TEXT   (patch.tach)
+//   tachyonc undo                              the last edit, undone
+//   tachyonc check [ROOT]                      the front end's errors
+//
+// Every change goes through the edit engine: a set of replacements of
+// byte ranges of the program's files, computed from the compiler's spans.
+// It is applied atomically:
+//   1. each changed file's new text is written to a copy next to it
+//      (`FILE.tachyon-edit~`);
+//   2. the front end runs again on the edited program (`tachyonc check`,
+//      reading the copies in place of the files: --overlay);
+//   3. an error the edited program has and the program had not is a new
+//      error: then the copies are removed, nothing is written, and the
+//      new errors are reported (short form, `try:` the same command with
+//      --no-check);
+//   4. otherwise the copies are renamed onto the files, the edit is
+//      journaled (.git/tachyon-edits, for `undo`), and one line says what
+//      changed: `replaced crate::gvn::run_gvn<TAB>compiler/src/gvn.tach<TAB>+3 -5 lines`.
+// `--dry-run` does all but write: it prints the edit as a unified diff
+// with no context lines (and says when the edit would add errors).
+// Nothing outside the replaced ranges changes, byte for byte.
+//
+// This file holds the engine's edits and the files they make, move and
+// remove; the diff is in diff, the check and the writing of an edit in
+// apply, the journal and `undo` in undo, an item's lines and text in
+// items, and the `edit` commands in cli.
+
+mod diff;
+pub mod apply;
+pub mod undo;
+pub mod items;
+pub mod cli;
+
+use crate::base::{BUFS, FILES, FILE_COUNT, IntVec, SRC, buf_bytes, buf_new, buf_slice, buf_str};
+use crate::tools::query::c_slice;
+use crate::tools::proc::{buf_cstr, remove_dir, same_bytes};
+
+// ---- The edit engine ----
+
+// The replacements: start and end (positions in SRC), text (a buffer), in
+// the order they were added.
+static mut E_START: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut E_END: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut E_TEXT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// Files the edit makes (for the refactorings that make modules): path (a C
+// string) and text (a buffer).
+static mut NEW_PATH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut NEW_TEXT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// Files the edit moves (the module refactorings, 0.11): the file's index
+// and its new path. A moved file is a new file (its edited text) and a
+// removed one (DEL_FILE; DEL_TO: the new file it became).
+static mut RN_FILE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut RN_PATH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut DEL_FILE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut DEL_TO: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The options every editing command takes.
+pub static mut DRY_RUN: bool = false;
+pub static mut NO_CHECK: bool = false;
+// --show: print the changed regions after the edit (0.12).
+pub static mut SHOW: bool = false;
+// --target T (0: the host), passed on to the check.
+pub static mut TARGET: i64 = 0;
+pub static mut TARGET_NAME: *u8 = 0 as *u8;
+// The command line, for the `try:` line of a refused edit.
+static mut ARGC: i64 = 0;
+static mut ARGV: **u8 = 0 as **u8;
+
+// Replaces SRC[start..end) by buffer text (an insertion when start ==
+// end). False, and nothing added, when the range overlaps one already
+// added (insertions at one position keep their order, before a
+// replacement starting there).
+pub fn edit_replace(start: i64, end: i64, text: i64) -> bool {
+    unsafe {
+        for i in 0..E_START.count {
+            let s = E_START.data[i];
+            let e = E_END.data[i];
+            if start < e && s < end {
+                return false;
+            }
+            // (an insertion strictly inside a replacement)
+            if start == end && s < start && start < e {
+                return false;
+            }
+            if s == e && start < s && s < end {
+                return false;
+            }
+        }
+        E_START.push(start);
+        E_END.push(end);
+        E_TEXT.push(text);
+        true
+    }
+}
+
+// Makes file `path` (new) with the text of buffer `text`.
+pub fn edit_new_file(path: *u8, text: i64) {
+    NEW_PATH.push(path as i64);
+    NEW_TEXT.push(text);
+}
+
+// Moves file f (an index into FILES) to `path` (new), with its edits.
+pub fn edit_move_file(f: i64, path: *u8) {
+    RN_FILE.push(f);
+    RN_PATH.push(path as i64);
+}
+
+pub fn edit_count() -> i64 {
+    E_START.count + NEW_PATH.count + RN_FILE.count
+}
+
+// The moved files, once their new texts are made: each is a new file and
+// a removed one.
+fn move_files() {
+    unsafe {
+        for i in 0..RN_FILE.count {
+            let f = RN_FILE.data[i];
+            let mut text = -1;
+            let mut k = 0;
+            while k < CH_FILE.count {
+                if CH_FILE.data[k] == f {
+                    text = CH_TEXT.data[k];
+                    CH_FILE.data[k] = CH_FILE.data[CH_FILE.count - 1];
+                    CH_TEXT.data[k] = CH_TEXT.data[CH_TEXT.count - 1];
+                    CH_FILE.count -= 1;
+                    CH_TEXT.count -= 1;
+                    break;
+                }
+                k += 1;
+            }
+            if text < 0 {
+                text = buf_new();
+                buf_bytes(text, SRC[FILES[f].start..FILES[f].end]);
+            }
+            NEW_PATH.push(RN_PATH.data[i]);
+            NEW_TEXT.push(text);
+            DEL_FILE.push(f);
+            DEL_TO.push(NEW_PATH.count - 1);
+        }
+    }
+}
+
+// The path a removed file is read from in the check: one that never
+// exists.
+pub fn gone_path(path: *u8) -> *u8 {
+    unsafe {
+        let b = buf_new();
+        buf_str(b, path);
+        buf_str(b, c".tachyon-gone~");
+        buf_cstr(b)
+    }
+}
+
+// Removes file `path` of the program (a script's step moved it): false
+// when it is none of the program's files.
+pub fn edit_remove_file(path: [u8]) -> bool {
+    unsafe {
+        for f in 0..FILE_COUNT {
+            if same_bytes(c_slice(FILES[f].path), path) {
+                DEL_FILE.push(f);
+                DEL_TO.push(-1);
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// Removes the directories of path that are left empty (up from its own).
+pub fn remove_empty_dirs(path: *u8) {
+    unsafe {
+        let b = buf_new();
+        buf_str(b, path);
+        loop {
+            while BUFS[b].len > 0 && BUFS[b].data[BUFS[b].len - 1] != '/' {
+                BUFS[b].len -= 1;
+            }
+            if BUFS[b].len <= 1 {
+                return;
+            }
+            BUFS[b].len -= 1;
+            if !remove_dir(buf_cstr(b)) {
+                return;
+            }
+        }
+    }
+}
+
+// The edits in order of position (a stable insertion sort; insertions
+// before the replacement that starts where they are).
+fn sorted_edits(out: *IntVec) {
+    unsafe {
+        for i in 0..E_START.count {
+            out.push(i);
+        }
+        let v = (*out).data;
+        for i in 1..(*out).count {
+            let mut j = i;
+            while j > 0 && edit_before(v[j], v[j - 1]) {
+                let t = v[j];
+                v[j] = v[j - 1];
+                v[j - 1] = t;
+                j -= 1;
+            }
+        }
+    }
+}
+
+fn edit_before(a: i64, b: i64) -> bool {
+    unsafe {
+        let sa = E_START.data[a];
+        let sb = E_START.data[b];
+        if sa != sb {
+            return sa < sb;
+        }
+        // (at one position: an insertion first; of two insertions, a `mod`
+        // line first: a split's `mod part;` above the imports it adds)
+        if E_END.data[a] == sa && E_END.data[b] == sb {
+            return mod_line(E_TEXT.data[a]) && !mod_line(E_TEXT.data[b]);
+        }
+        E_END.data[a] == sa && E_END.data[b] != sb
+    }
+}
+
+// Whether buffer t starts with a `mod` line.
+fn mod_line(t: i64) -> bool {
+    unsafe {
+        let s = buf_slice(t);
+        let mut i = 0;
+        if s.len > 4 && s[0] == 'p' && s[1] == 'u' && s[2] == 'b' && s[3] == ' ' {
+            i = 4;
+        }
+        i + 4 <= s.len && s[i] == 'm' && s[i + 1] == 'o' && s[i + 2] == 'd' && s[i + 3] == ' '
+    }
+}
+
+// The files the edit changes: per changed file, its index and its new
+// text; then the new files.
+static mut CH_FILE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut CH_TEXT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// Lines added and removed, in all.
+static mut ADDED: i64 = 0;
+static mut REMOVED: i64 = 0;
+
+// The new texts of the changed files, into CH_FILE / CH_TEXT.
+fn new_texts(order: *IntVec) {
+    unsafe {
+        let n = (*order).count;
+        let mut k = 0;
+        for f in 0..FILE_COUNT {
+            if k >= n {
+                break;
+            }
+            let first = (*order).data[k];
+            if E_START.data[first] > FILES[f].end {
+                continue;
+            }
+            let out = buf_new();
+            let mut cur = FILES[f].start;
+            while k < n && E_START.data[(*order).data[k]] <= FILES[f].end {
+                let e = (*order).data[k];
+                buf_bytes(out, SRC[cur..E_START.data[e]]);
+                buf_bytes(out, buf_slice(E_TEXT.data[e]));
+                cur = E_END.data[e];
+                k += 1;
+            }
+            buf_bytes(out, SRC[cur..FILES[f].end]);
+            if !same_bytes(buf_slice(out), SRC[FILES[f].start..FILES[f].end]) {
+                CH_FILE.push(f);
+                CH_TEXT.push(out);
+            }
+        }
+    }
+}

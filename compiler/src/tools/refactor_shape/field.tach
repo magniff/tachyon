@@ -1,0 +1,327 @@
+// `refactor field STRUCT`: a field added, removed, renamed or retyped, in
+// the struct, its literals and its field accesses; and the member lookups
+// and renames refactor variant shares.
+
+use crate::base::{IntVec, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, intern};
+use crate::front::ast::{NODES, NODE_COUNT, NodeKind, REPR_C};
+use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
+use crate::front::types::{STRUCTS, TYPES, TyKind};
+use crate::middle::lower::ssa::HMap;
+use crate::tools::edit::edit_replace;
+use crate::tools::edit::apply::{apply_edit, set_command};
+use crate::tools::query::{QF_DEF, c_slice, root_or_diag};
+use crate::tools::query::defs::{DEFS, DEF_COUNT, K_STRUCT};
+use crate::tools::query::diagnostics::{PROG, ROOT_GIVEN, TOOL, diag, write_diags};
+use crate::tools::query::positions::{put_loc, token_at};
+use crate::tools::query::refs::{R_FLAGS, R_POS};
+use crate::tools::refactor_shape::{
+    SUB, find_byte, leading_name, list_insert, list_of_node, list_remove, load_and_find, opt,
+    orig_of, put_count, refs_of, replace_name, split_default, sym_text, take_args, text_buf,
+    try_query_name, usage_error,
+};
+use crate::tools::rewrite::sort_by_start;
+use crate::tools::rewrite::parsed::{pa, pb, pc, pchild, pcount, pend, pstart};
+
+// ---- refactor field ----
+
+pub fn run_field(argc: i64, argv: **u8) -> i64 {
+    let status = field_inner(argc, argv);
+    write_diags();
+    status
+}
+
+// The struct item of checked type t (through a pointer), or 0.
+fn struct_node_of(t0: i64) -> i64 {
+    unsafe {
+        if t0 <= 0 {
+            return 0;
+        }
+        let t = if TYPES[t0].kind == TyKind::Ptr { TYPES[t0].a } else { t0 };
+        if t <= 0 || TYPES[t].kind != TyKind::Struct {
+            return 0;
+        }
+        STRUCTS[TYPES[t].a].node
+    }
+}
+
+// The literals of struct node s, as written, each once.
+fn literals_of(s: i64, out: *IntVec) {
+    unsafe {
+        let mut seen = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        for n in 1..NODE_COUNT {
+            if NODES[n].kind != NodeKind::StructLit || struct_node_of(NODES[n].ty) != s {
+                continue;
+            }
+            let o = orig_of(n, NodeKind::StructLit);
+            if o < 0 || seen.get(o + 1) != 0 {
+                continue;
+            }
+            seen.put(o + 1, 1);
+            out.push(o);
+        }
+        sort_by_start(out);
+    }
+}
+
+// The field of struct node s named `name`: its index, or -1.
+fn field_index(s: i64, name: i64) -> i64 {
+    for i in 0..pcount(s) {
+        if pa(pchild(s, i)) == name {
+            return i;
+        }
+    }
+    -1
+}
+
+fn put_fields(out: i64, s: i64) {
+    unsafe {
+        buf_byte(out, '{');
+        for i in 0..pcount(s) {
+            buf_str(out, if i > 0 { c", " } else { c" " });
+            buf_bytes(out, sym_text(pa(pchild(s, i))));
+        }
+        buf_str(out, c" }");
+    }
+}
+
+pub fn no_member(d: i64, s: i64, name: *u8, what: *u8) -> i64 {
+    unsafe {
+        let e = diag(c"error", c"refactor.no-member");
+        buf_bytes(e, sym_text(DEFS[d].fqn));
+        buf_str(e, c" has no ");
+        buf_str(e, what);
+        buf_str(e, c" '");
+        buf_str(e, name);
+        buf_str(e, c"': ");
+        put_fields(e, s);
+        buf_byte(e, '\n');
+        try_query_name(c"show", sym_text(DEFS[d].fqn));
+        1
+    }
+}
+
+// The definition of member `name` (a field, a variant) of d.
+pub fn member_def(d: i64, name: i64) -> i64 {
+    unsafe {
+        for x in 0..DEF_COUNT {
+            if DEFS[x].parent == d && DEFS[x].name == name {
+                return x;
+            }
+        }
+        -1
+    }
+}
+
+// Renames each reference (R_POS) to `old` as `new`.
+pub fn rename_refs(old: i64, new: i64) -> i64 {
+    unsafe {
+        let mut n = 0;
+        let mut seen = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        for r in 0..R_POS.count {
+            let pos = R_POS.data[r];
+            let t = token_at(pos);
+            if seen.get(pos + 1) != 0 || t >= TOK_COUNT || TOKS[t].start != pos || TOKS[t].kind != Tok::Ident
+                || TOKS[t].value as i64 != old {
+                continue;
+            }
+            seen.put(pos + 1, 1);
+            replace_name(pos, old, new);
+            n += 1;
+        }
+        n
+    }
+}
+
+fn field_inner(argc: i64, argv: **u8) -> i64 {
+    unsafe {
+        set_command(argc, argv);
+        PROG = argv[0];
+        TOOL = c"refactor";
+        SUB = c"field";
+        let mut root = 0 as *u8;
+        let mut words = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut opts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let example = c"STRUCT --add 'g: i64 = 0' --dry-run";
+        if !take_args(argc, argv, c"--add=1 --remove=1 --rename=2 --type=2", &root, &words, &opts) {
+            return 2;
+        }
+        if words.count != 1 {
+            return usage_error(if words.count == 0 { c"a STRUCT is needed" } else { c"one STRUCT at a time" }, example);
+        }
+        let add = opt(&opts, c"--add", false);
+        let remove = opt(&opts, c"--remove", false);
+        let rename = opt(&opts, c"--rename", false);
+        let retype = opt(&opts, c"--type", false);
+        let actions = (add != 0 as *u8) as i64 + (remove != 0 as *u8) as i64 + (rename != 0 as *u8) as i64
+            + (retype != 0 as *u8) as i64;
+        if actions != 1 {
+            return usage_error(c"one of --add, --remove, --rename, --type", example);
+        }
+        let name = c_slice(words.data[0] as *u8);
+        ROOT_GIVEN = root;
+        root = root_or_diag(root, SUB, name, true);
+        if root == 0 as *u8 {
+            return 2;
+        }
+        let mut status = 0;
+        let d = load_and_find(root, name, 1 << K_STRUCT, c"struct", &status);
+        if d < 0 {
+            return status;
+        }
+        let s = DEFS[d].node;
+        let fqn = sym_text(DEFS[d].fqn);
+        let mut lits = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        literals_of(s, &lits);
+        let what = buf_new();
+        let layout = (pc(s) & REPR_C) != 0 && rename == 0 as *u8;
+        if add != 0 as *u8 {
+            let text = c_slice(add);
+            let mut vstart = -1;
+            let dend = split_default(text, &vstart);
+            let decl = text[0..dend];
+            let fname = leading_name(decl);
+            if fname < 0 || find_byte(decl, ':') < 0 {
+                return usage_error(c"--add takes 'NAME: TYPE = VALUE' (VALUE: the literals' value)", example);
+            }
+            if field_index(s, fname) >= 0 {
+                let e = diag(c"error", c"refactor.clash");
+                buf_bytes(e, fqn);
+                buf_str(e, c" has a field '");
+                buf_bytes(e, sym_text(fname));
+                buf_str(e, c"' already\n");
+                return 1;
+            }
+            if vstart < 0 && lits.count > 0 {
+                let e = diag(c"error", c"refactor.no-default");
+                buf_str(e, c"the literals of ");
+                buf_bytes(e, fqn);
+                buf_str(e, c" need a value for ");
+                buf_bytes(e, sym_text(fname));
+                buf_str(e, c": --add 'NAME: TYPE = VALUE'\n");
+                return 2;
+            }
+            list_of_node(s);
+            list_insert(pcount(s), decl);
+            let init = buf_new();
+            buf_bytes(init, sym_text(fname));
+            buf_str(init, c": ");
+            if vstart >= 0 {
+                buf_bytes(init, text[vstart..text.len]);
+            }
+            for i in 0..lits.count {
+                list_of_node(lits.data[i]);
+                list_insert(pcount(lits.data[i]), buf_slice(init));
+            }
+            buf_str(what, c"added field ");
+            buf_bytes(what, decl);
+            buf_str(what, c" to ");
+            buf_bytes(what, fqn);
+            buf_str(what, c", ");
+            put_count(what, lits.count, c"literal", c"literals");
+        } else if remove != 0 as *u8 {
+            let fname = intern(c_slice(remove));
+            let k = field_index(s, fname);
+            if k < 0 {
+                return no_member(d, s, remove, c"field");
+            }
+            // Its uses: the references but its definition and the
+            // literals' fields.
+            let fd = member_def(d, fname);
+            let mut targets = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            targets.push(fd);
+            refs_of(&targets);
+            let mut inits = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+            for i in 0..lits.count {
+                for j in 0..pcount(lits.data[i]) {
+                    inits.put(pstart(pchild(lits.data[i], j)) + 1, 1);
+                }
+            }
+            let mut used = 0;
+            let mut first = -1;
+            for r in 0..R_POS.count {
+                if (R_FLAGS.data[r] & QF_DEF) != 0 || inits.get(R_POS.data[r] + 1) != 0 {
+                    continue;
+                }
+                if first < 0 {
+                    first = R_POS.data[r];
+                }
+                used += 1;
+            }
+            if used > 0 {
+                let e = diag(c"error", c"refactor.used");
+                buf_bytes(e, sym_text(DEFS[fd].fqn));
+                buf_str(e, c" is used: ");
+                put_count(e, used, c"reference", c"references");
+                buf_str(e, c" (first: ");
+                put_loc(e, first);
+                buf_str(e, c")\n");
+                try_query_name(c"refs", sym_text(DEFS[fd].fqn));
+                return 1;
+            }
+            list_of_node(s);
+            list_remove(k);
+            for i in 0..lits.count {
+                let l = lits.data[i];
+                list_of_node(l);
+                for j in 0..pcount(l) {
+                    if pa(pchild(l, j)) == fname {
+                        list_remove(j);
+                    }
+                }
+            }
+            buf_str(what, c"removed field ");
+            buf_bytes(what, sym_text(fname));
+            buf_str(what, c" of ");
+            buf_bytes(what, fqn);
+            buf_str(what, c", ");
+            put_count(what, lits.count, c"literal", c"literals");
+        } else if rename != 0 as *u8 {
+            let old = intern(c_slice(rename));
+            let new = intern(c_slice(opt(&opts, c"--rename", true)));
+            if field_index(s, old) < 0 {
+                return no_member(d, s, rename, c"field");
+            }
+            if field_index(s, new) >= 0 {
+                let e = diag(c"error", c"refactor.clash");
+                buf_bytes(e, fqn);
+                buf_str(e, c" has a field '");
+                buf_bytes(e, sym_text(new));
+                buf_str(e, c"' already\n");
+                return 1;
+            }
+            let mut targets = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            targets.push(member_def(d, old));
+            refs_of(&targets);
+            let n = rename_refs(old, new);
+            buf_str(what, c"renamed field ");
+            buf_bytes(what, sym_text(old));
+            buf_str(what, c" to ");
+            buf_bytes(what, sym_text(new));
+            buf_str(what, c" of ");
+            buf_bytes(what, fqn);
+            buf_str(what, c", ");
+            put_count(what, n - 1, c"use", c"uses");
+        } else {
+            let fname = intern(c_slice(retype));
+            let k = field_index(s, fname);
+            if k < 0 {
+                return no_member(d, s, retype, c"field");
+            }
+            let ty = c_slice(opt(&opts, c"--type", true));
+            let t = pb(pchild(s, k));
+            edit_replace(pstart(t), pend(t), text_buf(ty));
+            buf_str(what, c"changed field ");
+            buf_bytes(what, sym_text(fname));
+            buf_str(what, c" to ");
+            buf_bytes(what, ty);
+            buf_str(what, c" in ");
+            buf_bytes(what, fqn);
+        }
+        if layout {
+            let e = diag(c"warning", c"refactor.layout");
+            buf_bytes(e, fqn);
+            buf_str(e, c" is #[repr(C)]: its layout changes (C code sharing it must change too)\n");
+        }
+        apply_edit(buf_slice(what), root)
+    }
+}

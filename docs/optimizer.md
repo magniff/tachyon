@@ -5,13 +5,16 @@ invariants, the passes and the pipeline at each level, the back end, and
 how all of it is tested. This is the living design document of the middle
 and back end; later releases extend it (see [roadmap.md](roadmap.md)).
 
-The code: `compiler/src/ir.tach` (IR), `lower.tach` (AST to SSA),
+The code (0.12: in folders, see compiler/README.md): the middle end in
+`compiler/src/middle/`: `ir.tach` (IR), `lower.tach` (AST to SSA),
 `opt.tach` (CFG cleanups, dominators, dead code, the pipeline),
 `fold.tach` (folding, SCCP, instruction combining), `gvn.tach`
 (value numbering, alias analysis, memory forwarding, dead stores),
 `sroa.tach` (scalar replacement, constant tables), `licm.tach`,
-`inline.tach`, `regalloc.tach` (linear scan), `emit.tach`
-(emission), `mc_arm64.tach` and `mc_x86_64.tach` (instructions).
+`inline.tach` and the other passes; the back end in
+`compiler/src/back/`: `isel.tach`, `regalloc.tach` (linear scan),
+`emit.tach` (emission), `mc_arm64.tach` and `mc_x86_64.tach`
+(instructions); `-O0`'s generator in `compiler/src/gen0/`.
 
 ## Optimization levels
 

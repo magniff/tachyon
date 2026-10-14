@@ -1,0 +1,305 @@
+// After the text is assembled: layout places the fragments, relaxing
+// branches; each fixup is then resolved into its bytes or becomes a
+// relocation (the Mach-O and ELF relocation types are here); and
+// build_sections joins the fragments into each section's contents.
+
+use crate::back::objfile::{
+    ASYMS, FIXUPS, FIXUP_COUNT, FRAGS, FRAG_COUNT, FX_A64_ADR, FX_A64_B14, FX_A64_B19, FX_A64_B26,
+    FX_A64_GOTPAGE, FX_A64_GOTPAGEOFF, FX_A64_PAGE, FX_A64_PAGEOFF, FX_ABS32, FX_ABS64, FX_DIFF32,
+    FX_X86_BRANCH, FX_X86_GOT, FX_X86_RIP, OBJ_BYTES, SEC_BUF, SEC_COUNT, SEC_TEXT, TAIL_ALIGN,
+    TAIL_JCC, TAIL_JMP, get32, is_debug, put32, reloc, reloc_to, reloc_to_symbol, sym_addr,
+};
+use crate::back::objfile::assemble::asm_error;
+use crate::base::{BUFS, buf_byte, buf_bytes, buf_new};
+use crate::base::target::{ELF, X86};
+
+// ---- Layout ----
+
+// A branch the assembler resolves may be short: to a non-global label of
+// the same section (GNU as), and of the same atom (LLVM, Mach-O);
+// anything else is long, with a relocation.
+fn relaxable(f: i64) -> bool {
+    unsafe { resolvable(FRAGS[f].sym, FRAGS[f].sec, FRAGS[f].atom) }
+}
+
+// Whether a pc-relative reference to s from section sec, atom `atom`, is
+// resolved by the assembler.
+fn resolvable(s: i64, sec: i64, atom: i64) -> bool {
+    unsafe { ASYMS[s].defined && ASYMS[s].sec == sec && !ASYMS[s].global && (ELF || ASYMS[s].atom == atom) }
+}
+
+fn tail_size(f: i64, addr: i64) -> i64 {
+    unsafe {
+        let tail = FRAGS[f].tail;
+        if tail == TAIL_ALIGN {
+            let size = 1 << FRAGS[f].arg;
+            return (size - (addr & (size - 1))) & (size - 1);
+        }
+        if tail == TAIL_JMP {
+            return if FRAGS[f].long { 5 } else { 2 };
+        }
+        if tail == TAIL_JCC {
+            return if FRAGS[f].long { 6 } else { 2 };
+        }
+        0
+    }
+}
+
+fn layout_pass() {
+    unsafe {
+        let mut addr: [i64; 8] = [0; 8];
+        for f in 0..FRAG_COUNT {
+            let sec = FRAGS[f].sec;
+            FRAGS[f].addr = addr[sec];
+            addr[sec] += FRAGS[f].len;
+            addr[sec] += tail_size(f, addr[sec]);
+        }
+    }
+}
+
+pub fn layout() {
+    unsafe {
+        for f in 0..FRAG_COUNT {
+            if (FRAGS[f].tail == TAIL_JMP || FRAGS[f].tail == TAIL_JCC) && !relaxable(f) {
+                FRAGS[f].long = true;
+            }
+        }
+        loop {
+            layout_pass();
+            let mut changed = false;
+            for f in 0..FRAG_COUNT {
+                if (FRAGS[f].tail == TAIL_JMP || FRAGS[f].tail == TAIL_JCC) && !FRAGS[f].long {
+                    let end = FRAGS[f].addr + FRAGS[f].len + 2;
+                    let d = sym_addr(FRAGS[f].sym) - end;
+                    if d < -128 || d > 127 {
+                        FRAGS[f].long = true;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+}
+
+// ---- Fixups resolved, or relocations ----
+
+pub const MACHO_A64_UNSIGNED: i64 = 0;
+const MACHO_A64_BRANCH26: i64 = 2;
+const MACHO_A64_PAGE21: i64 = 3;
+const MACHO_A64_PAGEOFF12: i64 = 4;
+const MACHO_A64_GOT_PAGE21: i64 = 5;
+const MACHO_A64_GOT_PAGEOFF12: i64 = 6;
+pub const MACHO_X64_UNSIGNED: i64 = 0;
+const MACHO_X64_SIGNED: i64 = 1;
+const MACHO_X64_BRANCH: i64 = 2;
+const MACHO_X64_GOT_LOAD: i64 = 3;
+pub const ELF_X64_64: i64 = 1;
+const ELF_X64_PC32: i64 = 2;
+const ELF_X64_PLT32: i64 = 4;
+const ELF_X64_GOTPCRELX: i64 = 41;
+const ELF_X64_REX_GOTPCRELX: i64 = 42;
+pub const ELF_A64_ABS64: i64 = 257;
+const ELF_A64_ABS32: i64 = 258;
+const ELF_X64_32: i64 = 10;
+const ELF_A64_ADR_PREL_PG_HI21: i64 = 275;
+const ELF_A64_ADD_ABS_LO12_NC: i64 = 277;
+const ELF_A64_LDST8_ABS_LO12_NC: i64 = 278;
+const ELF_A64_JUMP26: i64 = 282;
+const ELF_A64_CALL26: i64 = 283;
+const ELF_A64_LDST16_ABS_LO12_NC: i64 = 284;
+const ELF_A64_LDST32_ABS_LO12_NC: i64 = 285;
+const ELF_A64_LDST64_ABS_LO12_NC: i64 = 286;
+const ELF_A64_LDST128_ABS_LO12_NC: i64 = 299;
+const ELF_A64_ADR_GOT_PAGE: i64 = 311;
+const ELF_A64_LD64_GOT_LO12_NC: i64 = 312;
+
+// The relocation of a page offset (:lo12:) in the instruction at `pos`:
+// an add, or a load or store of 1 to 16 bytes, whose size scales the
+// offset.
+fn elf_a64_lo12(pos: i64) -> i64 {
+    let w = get32(pos);
+    if (w & 0x1f000000) == 0x11000000 {
+        return ELF_A64_ADD_ABS_LO12_NC;
+    }
+    let size = (w >> 30) & 3;
+    let simd = (w >> 26) & 1;
+    if simd != 0 && size == 0 && ((w >> 23) & 1) != 0 {
+        return ELF_A64_LDST128_ABS_LO12_NC;
+    }
+    if size == 0 { ELF_A64_LDST8_ABS_LO12_NC } else if size == 1 { ELF_A64_LDST16_ABS_LO12_NC } else if size == 2 { ELF_A64_LDST32_ABS_LO12_NC } else { ELF_A64_LDST64_ABS_LO12_NC }
+}
+
+fn same_section(s: i64, sec: i64) -> bool {
+    unsafe { ASYMS[s].defined && ASYMS[s].sec == sec }
+}
+
+fn patch_bits(pos: i64, value: i64, shift: i64, bits: i64, what: *u8) {
+    let limit = 1 << (bits - 1);
+    if value < 0 - limit || value >= limit {
+        asm_error(what);
+    }
+    let mask = (1 << bits) - 1;
+    put32(pos, get32(pos) | ((value & mask) << shift));
+}
+
+pub fn resolve_fixups() {
+    unsafe {
+        for k in 0..FIXUP_COUNT {
+            let fx = FIXUPS[k];
+            let f = fx.frag;
+            let sec = FRAGS[f].sec;
+            let p = FRAGS[f].addr + (fx.pos - FRAGS[f].start);
+            let s = fx.sym;
+            let kind = fx.kind;
+            if kind == FX_A64_B26 {
+                if same_section(s, sec) {
+                    patch_bits(fx.pos, (sym_addr(s) - p) >> 2, 0, 26, c"branch out of range");
+                } else if ELF {
+                    let call = (get32(fx.pos) & 0x80000000) != 0;
+                    reloc_to(sec, p, if call { ELF_A64_CALL26 } else { ELF_A64_JUMP26 }, s, 0, true, 2);
+                } else {
+                    reloc_to(sec, p, MACHO_A64_BRANCH26, s, 0, true, 2);
+                }
+            } else if kind == FX_A64_B19 || kind == FX_A64_B14 || kind == FX_A64_ADR {
+                if !same_section(s, sec) {
+                    asm_error(c"branch to another section");
+                }
+                let d = sym_addr(s) - p;
+                if kind == FX_A64_B19 {
+                    patch_bits(fx.pos, d >> 2, 5, 19, c"conditional branch out of range");
+                } else if kind == FX_A64_B14 {
+                    patch_bits(fx.pos, d >> 2, 5, 14, c"test branch out of range");
+                } else {
+                    patch_bits(fx.pos, d & 3, 29, 2, c"adr");
+                    patch_bits(fx.pos, d >> 2, 5, 19, c"adr out of range");
+                }
+            } else if kind == FX_A64_PAGE {
+                reloc_to(sec, p, if ELF { ELF_A64_ADR_PREL_PG_HI21 } else { MACHO_A64_PAGE21 }, s, 0, true, 2);
+            } else if kind == FX_A64_PAGEOFF {
+                reloc_to(sec, p, if ELF { elf_a64_lo12(fx.pos) } else { MACHO_A64_PAGEOFF12 }, s, 0, false, 2);
+            } else if kind == FX_A64_GOTPAGE {
+                reloc_to_symbol(sec, p, if ELF { ELF_A64_ADR_GOT_PAGE } else { MACHO_A64_GOT_PAGE21 }, s, true);
+            } else if kind == FX_A64_GOTPAGEOFF {
+                reloc_to_symbol(sec, p, if ELF { ELF_A64_LD64_GOT_LO12_NC } else { MACHO_A64_GOT_PAGEOFF12 }, s, false);
+            } else if kind == FX_X86_BRANCH || kind == FX_X86_RIP || kind == FX_X86_GOT {
+                let end = FRAGS[f].addr + (fx.end - FRAGS[f].start);
+                if kind != FX_X86_GOT && resolvable(s, sec, fx.atom) {
+                    put32(fx.pos, sym_addr(s) + fx.addend - end);
+                } else if ELF {
+                    let rtype = if kind == FX_X86_BRANCH { ELF_X64_PLT32 } else if kind == FX_X86_RIP { ELF_X64_PC32 } else if fx.rex { ELF_X64_REX_GOTPCRELX } else { ELF_X64_GOTPCRELX };
+                    reloc_to(sec, p, rtype, s, fx.addend + p - end, true, 2);
+                } else {
+                    if end != p + 4 {
+                        asm_error(c"a relocated field must end the instruction");
+                    }
+                    let rtype = if kind == FX_X86_BRANCH { MACHO_X64_BRANCH } else if kind == FX_X86_RIP { MACHO_X64_SIGNED } else { MACHO_X64_GOT_LOAD };
+                    put32(fx.pos, fx.addend);
+                    reloc_to(sec, p, rtype, s, 0, true, 2);
+                }
+            } else if kind == FX_DIFF32 {
+                // Two labels of one section (0.11: not necessarily this one,
+                // e.g. a function's size in the debug information).
+                if !ASYMS[s].defined || !same_section(fx.sym2, ASYMS[s].sec) {
+                    asm_error(c"a difference of labels of different sections");
+                }
+                put32(fx.pos, sym_addr(s) - sym_addr(fx.sym2));
+            } else if kind == FX_ABS32 {
+                if !ELF {
+                    asm_error(c"a 32-bit address");
+                }
+                reloc_to(sec, p, if X86 { ELF_X64_32 } else { ELF_A64_ABS32 }, s, 0, false, 2);
+            } else if kind == FX_ABS64 {
+                let rtype = if ELF && X86 { ELF_X64_64 } else if ELF { ELF_A64_ABS64 } else if X86 { MACHO_X64_UNSIGNED } else { MACHO_A64_UNSIGNED };
+                if !ELF && is_debug(sec) && ASYMS[s].defined {
+                    // An address in the debug information of a Mach-O object:
+                    // relative to its section, as LLVM writes it (dsymutil
+                    // relocates those).
+                    reloc(sec, p, rtype, -1 - ASYMS[s].sec, sym_addr(s), false, 3);
+                } else {
+                    reloc_to(sec, p, rtype, s, 0, false, 3);
+                }
+            }
+        }
+    }
+}
+
+// x86-64 NOPs for alignment in code, as LLVM writes them (at most 10
+// bytes each).
+fn nops(out: i64, n: i64) {
+    // The NOPs of 1 to 10 bytes, one after the other (the k-byte one starts
+    // at k * (k - 1) / 2).
+    let table: [i64; 55] = [0x90, 0x66, 0x90, 0x0f, 0x1f, 0x00, 0x0f, 0x1f, 0x40, 0x00, 0x0f, 0x1f, 0x44, 0x00, 0x00, 0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00, 0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00, 0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00, 0x66, 0x2e, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00];
+    let mut left = n;
+    while left > 0 {
+        let k = if left > 10 { 10 } else { left };
+        let start = k * (k - 1) / 2;
+        for i in 0..k {
+            buf_byte(out, table[start + i] as u8);
+        }
+        left -= k;
+    }
+}
+
+// Section contents: fragments and their tails.
+pub fn build_sections() {
+    unsafe {
+        for sec in 0..SEC_COUNT {
+            SEC_BUF[sec] = buf_new();
+        }
+        for f in 0..FRAG_COUNT {
+            let sec = FRAGS[f].sec;
+            let out = SEC_BUF[sec];
+            buf_bytes(out, BUFS[OBJ_BYTES].data[FRAGS[f].start..FRAGS[f].start + FRAGS[f].len]);
+            let addr = FRAGS[f].addr + FRAGS[f].len;
+            let tail = FRAGS[f].tail;
+            if tail == TAIL_ALIGN {
+                let n = tail_size(f, addr);
+                if sec == SEC_TEXT && X86 {
+                    nops(out, n);
+                } else if sec == SEC_TEXT && n % 4 == 0 {
+                    for i in 0..n / 4 {
+                        buf_byte(out, 0x1f);
+                        buf_byte(out, 0x20);
+                        buf_byte(out, 0x03);
+                        buf_byte(out, 0xd5);
+                    }
+                } else {
+                    for i in 0..n {
+                        buf_byte(out, 0);
+                    }
+                }
+            } else if tail == TAIL_JMP || tail == TAIL_JCC {
+                let s = FRAGS[f].sym;
+                let cc = FRAGS[f].arg;
+                if !FRAGS[f].long {
+                    buf_byte(out, if tail == TAIL_JMP { 0xeb } else { (0x70 + cc) as u8 });
+                    buf_byte(out, ((sym_addr(s) - (addr + 2)) & 255) as u8);
+                } else {
+                    if tail == TAIL_JMP {
+                        buf_byte(out, 0xe9);
+                    } else {
+                        buf_byte(out, 0x0f);
+                        buf_byte(out, (0x80 + cc) as u8);
+                    }
+                    let end = addr + tail_size(f, addr);
+                    let p = end - 4;
+                    let mut v = 0;
+                    if relaxable(f) {
+                        v = sym_addr(s) - end;
+                    } else if ELF {
+                        reloc_to(sec, p, ELF_X64_PLT32, s, -4, true, 2);
+                    } else {
+                        reloc_to(sec, p, MACHO_X64_BRANCH, s, 0, true, 2);
+                    }
+                    buf_byte(out, (v & 255) as u8);
+                    buf_byte(out, ((v >> 8) & 255) as u8);
+                    buf_byte(out, ((v >> 16) & 255) as u8);
+                    buf_byte(out, ((v >> 24) & 255) as u8);
+                }
+            }
+        }
+    }
+}

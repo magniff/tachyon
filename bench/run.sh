@@ -50,7 +50,8 @@ case "$TARGET" in
 esac
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-bench.XXXXXX")
-trap 'rm -rf "$WORK"' EXIT INT TERM
+trap 'rm -rf "$WORK"' EXIT
+trap 'exit 130' INT TERM
 # shellcheck disable=SC2086
 "$CC" -O2 -o "$WORK/timer" "$ROOT/bench/timer.c"
 dd if=/dev/zero of="$WORK/md5.in" bs=1048576 count=8 2>/dev/null

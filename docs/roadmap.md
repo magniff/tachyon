@@ -28,6 +28,19 @@ x86_64-linux:
   `tachyonc` rather than the shell, and why the rest did not; the gaps
   feed the next release's tools.
 
+The gate is one command (from 0.11; [releases.md](releases.md), "The
+gate"): `bootstrap/gate.sh --release` builds the chain (every release's
+fixpoint, the last release's suite, the working tree), then runs at once
+the suite at every level, the random programs in every mode (the seed in
+one), the C interop fuzzer in its three modes, objcheck, the header
+layouts and the debugger check, next to the two Linux containers
+(x86_64-linux from its own chain, aarch64-linux cross-built), and prints
+one table. The benchmarks run alone afterwards, on an idle machine
+(`gate.sh --only bench`). Between releases `tests/fuzz/forever.sh`
+fuzzes every mode at low priority, so the gate's fuzz counts stay
+modest; `bootstrap.sh --history full` (every release's suite) is an
+occasional complete replay, not part of every gate.
+
 Principle: **no undefined behaviour.** Every operation safe code can
 write has defined behaviour (integer overflow wraps, division by zero,
 shifts and conversions are defined, indexing is checked); what cannot be
@@ -571,6 +584,33 @@ test suite from then on), done with 0.11's own refactoring commands and
 proven output-identical with `same-output`. Every place the tools fell
 short is recorded (tools/agent-feedback, the hook's log).
 
+Done (0.12.0). Phase 1 moved the modules into six folders by phase
+(`base`, `front`, `middle`, `back`, `gen0`, `tools`) in one `refactor
+--script`; phase 2, six agents in parallel worktrees, split the 25 files
+over 1,000 lines by concern (77 files before, 172 after; `lint
+--max-lines 1000` clean); the clean-up then added the tools the agents
+had asked for (`fix --only reexports` and `tidy-imports`, `split
+--reexport` and part headers, `MODULE::use` and `::header` as edit
+targets, the hook's fixes) and used them: every import names the module
+that defines what it imports (805 imports and paths rewritten, every
+re-export removed), the `use` lines tidied, 16 unused items deleted, a
+README per folder. `same-output` identical after every step, against
+the reorganization's base and against 0.11.0 (4,668 compilations); the
+fixpoint holds (built by 0.11.0, 418 tests). The tool use, phase by
+phase, is in agent-tool-usage.md, "0.12: the reorganization through the
+tools".
+
+0.12.0 release gate (2026-10-14): `bootstrap/gate.sh --release`, 11:54
+wall, every step passed: the chain (fixpoint, built by 0.11.0) and the
+suite at -O0/1/2 (418 tests) on aarch64-macos; fuzz 60 in each of the
+ten modes (the seed in one), ABI 100 in three modes, objcheck (904 of
+904), header layouts, the lldb check; x86_64-linux (its own chain, the
+suite at every level, fuzz 50 in ten modes, ABI 40 in three, objcheck,
+layouts); aarch64-linux (the cross-built fixpoint, the suite, fuzz 300
+in nine modes, ABI 150 in three, objcheck, layouts, gdb). Benchmarks and
+compile times in "Benchmarks", 0.12. Not run: the suite on x86_64-macos
+(Rosetta on the test machine).
+
 ## 0.13: the tools, improved from that record
 
 What 0.12's refactoring showed the tools lacked, fixed and measured
@@ -589,7 +629,13 @@ feature new in release N enters the compiler's own source in N+1
   given to a fresh agent with only `tachyonc guide` and the docs;
   measured: success rate, tokens, tool calls, compile-fix iterations.
   Baseline on 0.13; no release may regress it, and language changes must
-  improve it
+  improve it. Each task has a Rust twin (same specification, same hidden
+  tests) as the control: a language the models know against one they do
+  not; tachyon runs in four conditions (compiler only, with the guide,
+  with the tools and `try:` diagnostics, with both) to show what each
+  contributes; models of several sizes, hosted (small, mid, large) and
+  local (e.g. Qwen3-Coder through any OpenAI-compatible server, driven by a
+  minimal agent loop in the runner with the same tools)
 - closures (`|x| x * 2`): capture by value, or by borrow when they do not
   escape; `Fn`/`FnMut` traits, monomorphized; a non-capturing closure is a
   `fn` pointer
@@ -621,6 +667,14 @@ feature new in release N enters the compiler's own source in N+1
   `#[no_alloc]`, `#[no_io]`; effect bounds on trait methods; generics'
   effects inferred per instantiation
 - writing a `static mut` needs the `global` effect (denied in pure code)
+- allocation is explicit, as in Zig: an `Allocator` interface passed or
+  stored (std containers carry theirs), no allocator in scope means no
+  allocation; std provides a general-purpose allocator (with leak,
+  double-free and use-after-free detection in debug builds), an arena
+  (bump allocation, freed at once, a scoped form whose values cannot
+  escape) and a fixed-buffer allocator; `alloc` names which allocator a
+  function uses, so `#[no_alloc]` and "allocates only from its arena" are
+  checked and shown by `query effects`
 - the optimizer uses them: pure calls numbered, hoisted and memoized in
   the e-graph
 - the compiler's source moves to `?`, `derive`, interpolation and widening
@@ -637,6 +691,10 @@ feature new in release N enters the compiler's own source in N+1
   closes the dangling-borrow gap without lifetime annotations
 - raw pointers stay the escape hatch, in `unsafe`, checked by
   `--check-unsafe`
+- with the allocators of 0.16: an owned value carries its allocator,
+  moves and destructors free through it; values in an arena skip
+  per-value destruction, and second-class references keep arena data from
+  outliving its scope. One design covers ownership and allocation
 - `tachyonc fix --values` migrates the common patterns (manual `free` to
   destructors, stored slices to owned copies or indices) and gives exact
   diagnostics for the rest
@@ -654,7 +712,10 @@ feature new in release N enters the compiler's own source in N+1
   types; `#[fuzz]` entry points; snapshot tests; `tachyonc test` (with the
   `-O0` against `-O2` comparison built in) and `tachyonc reduce`
 - `type X = distinct T`; non-null pointer types
-- the compiler's source moves to mutable value semantics (0.17)
+- the compiler's source moves to mutable value semantics (0.17) and to
+  arenas: the syntax tree and types in one per compilation, the IR in one
+  per function, reset after it is emitted (compile time measured before
+  and after)
 - after 0.18 the type system has settled: the language specification is
   written (see "Toward 1.0")
 
@@ -969,3 +1030,58 @@ The 0.11 compiler, built by itself, compiles the same input at -O2 as
 fast as 0.10.0 (its new passes cost about what its better-optimized code
 saves) and 9% faster at -O0. `check` (the front end only) and a query
 answer in under 50 ms.
+
+### 0.12
+
+aarch64-macos (Apple silicon, native; `bench/run.sh -p <0.11.0> -r 9`,
+the fastest of 9 runs in ms, run after the gate on a machine with other
+work on it, load average about 5; "0.11.0" is the previous release at
+its default level; the last row is the geometric mean over cc -O2's,
+programs with a C version only):
+
+| program | 0.11.0 | 0.12 -O2 | cc -O2 |
+|---|---|---|---|
+| binarytrees | 174 | 179 | 172 |
+| collatz | 293 | 291 | 292 |
+| fannkuch | 116 | 116 | 139 |
+| fib | 14 | 14 | 14 |
+| interp | 42 | 44 | 40 |
+| json | 107 | 107 | 92 |
+| mandelbrot | 162 | 162 | 156 |
+| matmul | 18 | 18 | 43 |
+| nbody | 31 | 31 | 28 |
+| sieve | 62 | 63 | 71 |
+| sort | 63 | 63 | 58 |
+| stencil | 8 | 8 | 8 |
+| wordcount | 84 | 84 | 70 |
+| md5 | 35 | 36 | - |
+| geomean vs cc -O2 | 0.957 | 0.963 | 1 |
+
+(-O0 and -O1 in the same run: geomean 6.843 and 1.344.) The generated
+code is 0.11.0's byte for byte: `tachyonc same-output` against the
+0.11.0 compiler is identical over the whole corpus (4,668 compilations:
+tests/run, examples, bench and compiler/src, four targets, -O0 to -O2),
+so the differences above are this machine's spread (the gate's own
+`--only bench` run, with the containers just stopped, had binarytrees
+151 against 157 and mandelbrot 181 against 165, each way).
+
+Compile time (aarch64-macos, wall time, best of 7, the two compilers
+alternating on the same input: the 0.12 source, 77,400 lines in 172
+files):
+
+| | 0.11.0 | 0.12 |
+|---|---|---|
+| the compiler to an object, -O0 | 163 ms | 165 ms |
+| the compiler to an object, -O2 | 1316 ms | 1315 ms |
+| to an executable (`cc` links), -O0 | 194 ms | 195 ms |
+| to an executable (`cc` links), -O2 | 1347 ms | 1350 ms |
+| `tachyonc check compiler/src/main.tach` | 60 ms | 60 ms |
+| `tachyonc query refs run_gvn` | 65 ms | 66 ms |
+
+The same within noise, as expected of a reorganization that changes no
+output (the 0.11 numbers above were on the 0.11 source, 71,900 lines; the
+split into 172 files costs nothing measurable).
+
+The gate (`bootstrap/gate.sh --release`, every step at once on
+aarch64-macos and in the two Linux containers): 11:54 wall, every step
+passed.

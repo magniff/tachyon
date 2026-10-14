@@ -1,0 +1,283 @@
+// The AST: every node (item, type, pattern, statement, expression) is an
+// entry in NODES, referred to by index; 0 is "no node". Child lists live in
+// LISTS (`list` is the first index, `count` the length).
+//
+// Field use by kind (operators are their token kinds, labels are symbols
+// with 0 for "no label"):
+//
+//   items       NodeKind::Fn       a=name b=return type c=body d=type name of its
+//                          `impl` (0: a free function) list=params
+//                          y=1 for an `extern "C" fn` definition (x: the
+//                          function, FNS index + 1, set by the checker)
+//               NodeKind::ExternFn   a=name b=return type d=variadic list=params
+//                          (a C function: `extern "C" { fn ...; }`, or
+//                          the deprecated `extern fn ...;`)
+//               NodeKind::Struct   a=name c=repr flags d=align list=fields (also
+//                          unions: REPR_UNION)
+//               NodeKind::Const    a=name b=type c=value
+//               NodeKind::Static   a=name b=type c=value d=mutable y=C linkage
+//                          (1: defined in C, no value; 2: defined here
+//                          with a C symbol)
+//               NodeKind::TypeAlias     a=name b=type
+//               NodeKind::Enum     a=name c=repr flags d=tag type name (REPR_INT)
+//                          list=variants
+//               NodeKind::Variant    a=name b=discriminant expr (0: none) c=1 when
+//                          written with parentheses list=field types
+//               NodeKind::Param      a=name b=type c=mutable
+//               NodeKind::Field      a=name b=type
+//   types       NodeKind::TyName a=name, NodeKind::TyPtr a=pointee, NodeKind::TyUnit, NodeKind::TyNever,
+//               NodeKind::TyTuple list, NodeKind::TyArray a=elem b=length expr,
+//               NodeKind::TyFn list=params a=result d=1 for `extern "C" fn`,
+//               NodeKind::TySlice a=elem
+//   patterns    NodeKind::PatWild, NodeKind::PatBind a=name b=mutable, NodeKind::PatTuple list,
+//               NodeKind::PatLit a=literal expr (NodeKind::Int, NodeKind::Char, NodeKind::Bool, a negated
+//                 NodeKind::Int, or an NodeKind::Ident naming a constant),
+//               NodeKind::PatRange a=low b=high (literal exprs, inclusive),
+//               NodeKind::PatVariant a=enum name b=variant name c=1 when written
+//                 with parentheses list=field patterns,
+//               NodeKind::PatOr list=alternatives
+//   statements  NodeKind::Let a=pattern b=type c=init, NodeKind::ExprStmt a=expr b=has_semi
+//   expressions NodeKind::Int a=value b=suffix, NodeKind::Float a=bits b=suffix,
+//               NodeKind::Char a=value, NodeKind::Str/NodeKind::CStr a=string id, NodeKind::Bool a,
+//               NodeKind::Unit, NodeKind::Ident a=name,
+//               NodeKind::Binary op b=lhs c=rhs, NodeKind::Unary op b=operand,
+//               NodeKind::Cast a=expr b=type, NodeKind::Call a=callee list=args,
+//               NodeKind::Index a=base b=index, NodeKind::FieldAccess a=base b=name,
+//               NodeKind::TupleField a=base b=index, NodeKind::Tuple list, NodeKind::Array list,
+//               NodeKind::Repeat a=value b=count, NodeKind::StructLit a=name list=inits,
+//               NodeKind::FieldInit a=name b=value,
+//               NodeKind::Block list=stmts a=tail, NodeKind::If a=cond b=then c=else,
+//               NodeKind::Loop a=label b=body, NodeKind::While a=label b=cond c=body,
+//               NodeKind::For a=label b=pattern c=range d=body,
+//               NodeKind::Range a=start b=end c=inclusive,
+//               NodeKind::Assign op b=target c=value, NodeKind::Return a=value,
+//               NodeKind::Break a=label b=value, NodeKind::Continue a=label,
+//               NodeKind::Path a=type name b=member name (`T::m`),
+//               NodeKind::Match a=scrutinee list=arms,
+//               NodeKind::Arm a=pattern b=guard (0: none) c=body,
+//               NodeKind::MethodCall a=receiver b=method name list=args (the checker
+//                 turns it into an NodeKind::Call; g=type arguments),
+//               NodeKind::VariantLit a=variant (VARIANTS) list=fields (made by the
+//                 checker from an NodeKind::Path or an NodeKind::Call of one)
+//
+// Generics (0.5): `g` is a NodeKind::Generics node: the type parameters of
+// a generic Fn, Struct or Enum, or the type arguments of a TyName
+// (`Vec<T>`), an Ident or a Path's type (`max::<i64>`, `Vec::<u8>::new`)
+// or a StructLit (`Pair::<i64> { ... }`). `h` is the self type (a TyName)
+// of a function in an `impl` block.
+//
+// The checker fills `ty` (the node's type) and `x`, `y` (resolutions, see
+// check.tach); the code generator uses `z`.
+
+use crate::base::{IntVec, grow};
+use crate::front::lexer::Tok;
+use crate::front::check::Res;
+
+pub enum NodeKind {
+    // "No node" (node 0), and the program's list of items.
+    None,
+    // Items.
+    Fn, ExternFn, Struct, Const, Static, TypeAlias, Enum, Variant, Param, Field,
+    // Types.
+    TyName, TyPtr, TyUnit, TyNever, TyTuple, TyArray, TyFn, TySlice,
+    // Patterns.
+    PatWild, PatBind, PatTuple, PatLit, PatRange, PatVariant, PatOr,
+    // Statements.
+    Let, ExprStmt,
+    // Expressions.
+    Int, Float, Char, Str, CStr, Bool, Unit, Ident, Binary, Unary, Cast, Call,
+    Index, FieldAccess, TupleField, Tuple, Array, Repeat, StructLit, FieldInit,
+    Block, If, Loop, While, For, Range, Assign, Return, Break, Continue, Path,
+    Match, Arm, MethodCall, VariantLit,
+    // Items (0.4).
+    Use,
+    // A failed `n as E` (made by the checker): a=the value, x=the panic
+    // kind (0.4).
+    EnumPanic,
+    // Generic parameters or arguments (0.5), the `g` of another node:
+    // list=TyName nodes naming the parameters of a generic item (a=the
+    // number of them that come from its impl block), or the type nodes
+    // given as arguments (`Vec<T>`, `max::<i64>`).
+    Generics,
+    // `mod name;` (0.5): a=name.
+    Mod,
+    // `defer stmt;` / `defer { ... }` (0.6), a statement: a=the deferred
+    // expression (a Block for `defer { ... }`).
+    Defer,
+    // `trait Name { fn ...; }` (0.9), an item: a=name list=its functions
+    // (Fn nodes; c=0 for a function without a default body).
+    Trait,
+    // `impl Trait for Type { ... }` (0.9), an item: a=the trait (a TyName)
+    // b=the type g=the impl's type parameters list=its functions (which
+    // are items of the program too).
+    Impl,
+    // A vector operation (0.10), made by the checker from a call: x=the
+    // operation (VK_*), y=the vector type, a=the receiver of a method (0:
+    // none), list=the arguments.
+    VecOp,
+}
+
+// The vector operations (0.10): `vNtT(lanes...)`, `vNtT::splat(x)`,
+// `vNtT::load(s, i)`, `v.store(s, i)`, `v.lane(i)`, `v.with_lane(i, x)`,
+// `v.sum()`, `mask.select(a, b)`.
+pub const VK_NEW: i64 = 1;
+pub const VK_SPLAT: i64 = 2;
+pub const VK_LOAD: i64 = 3;
+pub const VK_STORE: i64 = 4;
+pub const VK_LANE: i64 = 5;
+pub const VK_WITH: i64 = 6;
+pub const VK_SUM: i64 = 7;
+pub const VK_SELECT: i64 = 8;
+
+// `#[repr(...)]` of structs, unions and enums.
+pub const REPR_C: i64 = 1;
+pub const REPR_PACKED: i64 = 2;
+pub const REPR_UNION: i64 = 4;
+pub const REPR_INT: i64 = 8;
+
+struct Node {
+    kind: NodeKind, start: i64, end: i64,
+    // The operator of Binary, Unary and Assign nodes.
+    op: Tok,
+    // What an Ident names (set by the checker).
+    res: Res,
+    a: i64, b: i64, c: i64, d: i64,
+    list: i64, count: i64,
+    ty: i64, x: i64, y: i64, z: i64,
+    g: i64, h: i64,
+    // Flags (0.5): ITEM_PUBLIC on items declared `pub`; ARM_SYNTHETIC (0.6)
+    // on the `_` arm an `if let` or `while let` is desugared with.
+    p: i64,
+}
+
+// Deferred statements (0.6) while lowering a function: the Defer nodes of
+// the enclosing blocks, in order; DEFER_LOOPS holds (loop node, DEFERS
+// depth at its body) pairs of the enclosing loops, so a `break` or
+// `continue` runs the defers registered inside the loop it leaves.
+pub static mut DEFERS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut DEFER_LOOPS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+pub fn defer_loop_enter(lp: i64) {
+    DEFER_LOOPS.push(lp);
+    DEFER_LOOPS.push(DEFERS.count);
+}
+
+pub fn defer_loop_leave() {
+    DEFER_LOOPS.count -= 2;
+}
+
+// The DEFERS depth at the body of loop `lp` (an enclosing loop).
+pub fn defer_loop_depth(lp: i64) -> i64 {
+    unsafe {
+        let mut i = DEFER_LOOPS.count - 2;
+        while i >= 0 {
+            if DEFER_LOOPS.data[i] == lp {
+                return DEFER_LOOPS.data[i + 1];
+            }
+            i -= 2;
+        }
+        0
+    }
+}
+
+// The last arm of the `match` an `if let` / `while let` becomes (0.6): never
+// reported unreachable.
+pub const ARM_SYNTHETIC: i64 = 2;
+// ... of an `if let` without `else`: the `if let` must have type `()`.
+pub const ARM_NO_ELSE: i64 = 4;
+// Function attributes (0.6), flags of Fn nodes: #[inline], #[inline(never)],
+// #[cold] (see fn_attr_inline, fn_attr_cold).
+pub const FN_INLINE: i64 = 8;
+pub const FN_NO_INLINE: i64 = 16;
+pub const FN_COLD: i64 = 32;
+// `unsafe fn` (0.9), a flag of Fn nodes: callable only from unsafe code,
+// and its body is unsafe code.
+pub const FN_UNSAFE: i64 = 64;
+// A raw-pointer access (0.10): a flag of the Unary `*`, Index and
+// FieldAccess nodes the checker finds dereference a raw pointer, which
+// --check-unsafe checks (unsafecheck.tach).
+pub const NODE_RAW: i64 = 65536;
+
+// `unsafe { ... }` (0.9), a flag of Block nodes.
+pub const BLOCK_UNSAFE: i64 = 128;
+// A function whose body had a syntax error (0.10), a flag of Fn nodes: its
+// signature is checked, not its body. Also (FN_SIG_FAILED) a function
+// whose declaration failed in the checker: neither is.
+pub const FN_BODY_FAILED: i64 = 16777216;
+pub const FN_SIG_FAILED: i64 = 33554432;
+
+pub static mut NODES: *Node = 0 as *Node;
+pub static mut NODE_COUNT: i64 = 0;
+static mut NODE_CAP: i64 = 0;
+static mut LISTS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// Children of lists being built; see list_begin/list_end.
+pub static mut SCRATCH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+pub fn new_node(kind: NodeKind, start: i64, end: i64) -> i64 {
+    unsafe {
+        NODES = grow(NODES, NODE_COUNT, &NODE_CAP);
+        let n = NODE_COUNT;
+        NODES[n] = Node {
+            kind: kind, start: start, end: end, op: Tok::Eof, res: Res::None, a: 0, b: 0, c: 0, d: 0,
+            list: 0, count: 0, ty: 0, x: 0, y: 0, z: 0, g: 0, h: 0, p: 0,
+        };
+        NODE_COUNT += 1;
+        n
+    }
+}
+
+pub fn init_ast() {
+    // Node 0 stands for "no node".
+    new_node(NodeKind::None, 0, 0);
+}
+
+// Lists are built on SCRATCH: remember `list_begin()`, push the children
+// with `list_push`, and move them to node `n` with `list_end(n, mark)`.
+pub fn list_begin() -> i64 {
+    SCRATCH.count
+}
+
+pub fn list_push(child: i64) {
+    SCRATCH.push(child);
+}
+
+pub fn list_end(n: i64, mark: i64) {
+    unsafe {
+        NODES[n].list = LISTS.count;
+        NODES[n].count = SCRATCH.count - mark;
+        for i in mark..SCRATCH.count {
+            LISTS.push(SCRATCH.data[i]);
+        }
+        SCRATCH.count = mark;
+    }
+}
+
+// Child `i` of node `n`'s list.
+pub fn child(n: i64, i: i64) -> i64 {
+    unsafe { LISTS.data[NODES[n].list + i] }
+}
+
+// The nodes as parsed (0.11), kept when KEEP_PARSED is set before the
+// front end runs: the checker changes nodes in place (a method call
+// becomes a Call, a path a VariantLit), and the refactorings and rewrite
+// match the program as written. keep_parsed() copies the nodes made since
+// its last call.
+pub static mut KEEP_PARSED: bool = false;
+pub static mut PARSED_NODES: *Node = 0 as *Node;
+pub static mut PARSED_COUNT: i64 = 0;
+static mut PARSED_CAP: i64 = 0;
+
+pub fn keep_parsed() {
+    unsafe {
+        while PARSED_COUNT < NODE_COUNT {
+            PARSED_NODES = grow(PARSED_NODES, PARSED_COUNT, &PARSED_CAP);
+            PARSED_NODES[PARSED_COUNT] = NODES[PARSED_COUNT];
+            PARSED_COUNT += 1;
+        }
+    }
+}
+
+// Child `i` of the list of node `n` as parsed.
+pub fn parsed_child(n: i64, i: i64) -> i64 {
+    unsafe { LISTS.data[PARSED_NODES[n].list + i] }
+}

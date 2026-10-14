@@ -1,0 +1,183 @@
+// Printing the IR as text (--print-ir, --print-after-all, the verifier's
+// failures): values, instructions, blocks and whole functions.
+
+use crate::base::{buf_byte, buf_hex, buf_int, buf_str, sym_name};
+use crate::front::types::{FNS, buf_type, is_float};
+use crate::middle::ir::{BLOCKS, INSTS, IRFUNCS, Op, Term, ir_operand, ir_operand_count, ir_val};
+use crate::middle::ir::Op::{
+    Call, CallC, Cmp, Const, Conv, Copy, FAddr, GAddr, Load, Param, Piece, SAddr, Select, Store,
+    Test, VBin, VCmp, VExt, VIns,
+};
+use crate::middle::ir::cfg::{case_target, case_value};
+
+pub fn buf_value(out: i64, v: i64) {
+    if v == 0 {
+        unsafe { buf_str(out, c"_"); }
+        return;
+    }
+    buf_byte(out, 'v');
+    buf_int(out, v);
+}
+
+fn buf_ir_type(out: i64, t: i64) {
+    if t == 0 {
+        unsafe { buf_str(out, c"void"); }
+    } else {
+        buf_type(out, t);
+    }
+}
+
+fn print_inst(out: i64, v: i64) {
+    unsafe {
+        let op = INSTS[v].op;
+        buf_str(out, c"    ");
+        if INSTS[v].ty != 0 {
+            buf_value(out, v);
+            buf_str(out, c": ");
+            buf_ir_type(out, INSTS[v].ty);
+            buf_str(out, c" = ");
+        }
+        buf_str(out, op.name());
+        if op == Cmp || op == Test || op == Select || op == VCmp {
+            buf_byte(out, '.');
+            buf_str(out, INSTS[v].cond.name());
+        }
+        if op == VBin {
+            buf_byte(out, '.');
+            let raw = INSTS[v].imm;
+            let bop = raw as Op;
+            buf_str(out, bop.name());
+        }
+        if op == Const {
+            buf_byte(out, ' ');
+            if is_float(INSTS[v].ty) {
+                buf_str(out, c"0x");
+                buf_hex(out, INSTS[v].imm as u64, 16);
+            } else {
+                buf_int(out, INSTS[v].imm);
+            }
+        } else if op == GAddr || op == CallC {
+            buf_byte(out, ' ');
+            buf_str(out, sym_name(INSTS[v].imm));
+        } else if op == Call || op == FAddr {
+            buf_byte(out, ' ');
+            buf_str(out, sym_name(FNS[INSTS[v].imm].name));
+        } else if op == Param || op == Op::Slot || op == SAddr || op == Piece {
+            buf_byte(out, ' ');
+            buf_int(out, INSTS[v].imm);
+        }
+        let mut first = true;
+        for i in 0..ir_operand_count(v) {
+            let operand = ir_operand(v, i);
+            if operand == 0 && i < 3 {
+                continue;
+            }
+            buf_str(out, if first { c" " } else { c", " });
+            first = false;
+            buf_value(out, ir_val(operand));
+        }
+        if op == Load || op == Store {
+            if INSTS[v].imm != 0 {
+                buf_str(out, c" +");
+                buf_int(out, INSTS[v].imm);
+            }
+            if op == Store {
+                buf_byte(out, ' ');
+                buf_ir_type(out, INSTS[v].imm2);
+            }
+        } else if op == Copy {
+            buf_str(out, c" size ");
+            buf_int(out, INSTS[v].imm);
+        } else if op == Conv || op == Cmp || op == VCmp {
+            buf_str(out, c" from ");
+            buf_ir_type(out, INSTS[v].imm2);
+        } else if op == VExt || op == VIns {
+            buf_str(out, c" lane ");
+            buf_int(out, INSTS[v].imm);
+        } else if op.is_machine() {
+            // imm, imm2 and scale as they are (see isel.tach).
+            buf_str(out, c" [");
+            buf_int(out, INSTS[v].imm);
+            buf_str(out, c", ");
+            buf_int(out, INSTS[v].imm2);
+            buf_str(out, c", ");
+            buf_int(out, INSTS[v].scale);
+            buf_byte(out, ']');
+        }
+        buf_byte(out, '\n');
+    }
+}
+
+pub fn buf_block(out: i64, b: i64) {
+    buf_byte(out, 'b');
+    buf_int(out, b);
+}
+
+fn print_block(out: i64, b: i64) {
+    unsafe {
+        buf_block(out, b);
+        if BLOCKS[b].preds.count > 0 {
+            buf_str(out, c" <-");
+            for i in 0..BLOCKS[b].preds.count {
+                buf_byte(out, ' ');
+                buf_block(out, BLOCKS[b].preds.data[i]);
+            }
+        }
+        buf_str(out, c":\n");
+        let mut v = BLOCKS[b].first;
+        while v != 0 {
+            print_inst(out, v);
+            v = INSTS[v].next;
+        }
+        let term = BLOCKS[b].term;
+        buf_str(out, c"    ");
+        if term == Term::Jump {
+            buf_str(out, c"jump ");
+            buf_block(out, BLOCKS[b].s0);
+        } else if term == Term::Branch {
+            buf_str(out, c"branch ");
+            buf_value(out, ir_val(BLOCKS[b].cond));
+            buf_str(out, c", ");
+            buf_block(out, BLOCKS[b].s0);
+            buf_str(out, c", ");
+            buf_block(out, BLOCKS[b].s1);
+        } else if term == Term::Ret {
+            buf_str(out, c"ret");
+            if BLOCKS[b].cond != 0 {
+                buf_byte(out, ' ');
+                buf_value(out, ir_val(BLOCKS[b].cond));
+            }
+        } else if term == Term::Unreach {
+            buf_str(out, c"unreachable");
+        } else if term == Term::Switch {
+            buf_str(out, c"switch ");
+            buf_value(out, ir_val(BLOCKS[b].cond));
+            buf_str(out, c", default ");
+            buf_block(out, BLOCKS[b].s0);
+            for i in 0..BLOCKS[b].ncases {
+                buf_str(out, c", ");
+                buf_int(out, case_value(b, i));
+                buf_str(out, c" -> ");
+                buf_block(out, case_target(b, i));
+            }
+        } else {
+            buf_str(out, c"(no terminator)");
+        }
+        buf_byte(out, '\n');
+    }
+}
+
+pub fn print_ir_func(out: i64, fi: i64) {
+    unsafe {
+        buf_str(out, c"fn ");
+        buf_str(out, sym_name(FNS[IRFUNCS[fi].f].name));
+        buf_str(out, c":\n");
+        for i in 0..IRFUNCS[fi].blocks.count {
+            let b = IRFUNCS[fi].blocks.data[i];
+            if BLOCKS[b].removed == 0 {
+                print_block(out, b);
+            }
+        }
+        buf_byte(out, '\n');
+    }
+}

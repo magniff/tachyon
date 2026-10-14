@@ -1,0 +1,422 @@
+// Type checker: declarations, then every function body. Bidirectional,
+// like the reference checker (seed/src/typechecker): `check` pushes an expected
+// type into an expression (literals, aggregates, branches, arithmetic
+// operands take it), `synth` computes a type from the expression alone.
+// Every expression node gets its type in `ty`: the expected type in check
+// mode, the computed one in synth mode. After an error the checking goes
+// on (see "Recovery" below).
+//
+// Resolutions recorded on nodes:
+//   NodeKind::Ident  res = what it names, y = its index
+//   NodeKind::Call   x = function + 1 for a direct call, 0 for a call through a value
+//   NodeKind::FieldAccess  x = field index
+//   NodeKind::Break, NodeKind::Continue  x = the loop node
+//   NodeKind::Loop   x = 1 if it has a break, y = the type of its break values
+//   NodeKind::PatBind, NodeKind::Param  x = the local
+//
+// Here: the checker's state, errors, scopes of locals, the phases of the
+// declarations and recovery. The parts: collect and resolve (the
+// declarations), body (function bodies, statements, control flow),
+// check_mode and synth_mode (expressions), names, calls, assign, equality,
+// vectors, and unsafety (what needs unsafe code).
+
+pub mod unsafety;
+pub mod collect;
+pub mod resolve;
+mod body;
+pub mod check_mode;
+pub mod synth_mode;
+pub mod names;
+pub mod equality;
+mod calls;
+mod vectors;
+mod assign;
+
+use std::Option;
+use crate::base::{IntVec, _setjmp, grow, intern_c};
+use crate::base::diag::{
+    RECOVER_DEPTH, err_begin, err_end, err_str, err_sym, error_at, exit_if_errors, recover_enter,
+    recover_leave,
+};
+use crate::front::traits::{
+    check_impl_signatures, collect_impl, collect_impls, init_traits, trait_named,
+};
+use crate::tools::fiximports::report_legacy_imports;
+use crate::front::ast::{
+    FN_BODY_FAILED, FN_SIG_FAILED, NODES, SCRATCH, child, list_begin, list_end, list_push,
+};
+use crate::front::modules::{CUR_MOD, init_modules};
+use crate::front::modules::lookup::{collect_uses, resolve_all_uses, resolve_use_of};
+use crate::front::types::{FNS, TSCRATCH, TYPES, TY_ERROR, TyKind, err_type, type_elem};
+use crate::front::consteval::const_value_of;
+use crate::front::patterns::OR_MODE;
+use crate::front::generics::{CUR_INST, INST_QUEUE, TP_BASE, TP_NAMES, TP_TYPES};
+use crate::front::generics::instantiate::UNIFY_SELF;
+use crate::front::ast::NodeKind::{
+    Array, Const, Enum, Fn, Impl, Let, PatBind, Static, Struct, Tuple, Use,
+};
+use crate::front::check::unsafety::{UNSAFE_DEPTH, WRAP_NODE};
+use crate::front::check::collect::{
+    collect_aliases, collect_const_types, collect_enums, collect_method, collect_methods,
+    collect_name, collect_names, collect_structs, eval_discriminant,
+};
+use crate::front::check::resolve::{
+    check_static, check_struct_cycles, collect_functions, collect_statics, evaluate_consts,
+};
+use crate::front::check::body::check_function;
+
+// What other modules use of the parts.
+use resolve::resolve_type;
+
+// What an identifier names.
+pub enum Res { None, Local, Const, Static, Fn }
+
+// `borrow` (0.9): a parameter declared with a pointer type, not `mut`: a
+// borrow of what the caller passed, dereferenced in safe code (see
+// unsafety.tach).
+// `tparam` (0.9): the bounded type parameter its declared type names (a
+// parameter `x: T` or `x: *T`), whose bounds its methods come from; 0.
+struct Local {
+    name: i64, ty: i64, mutable: bool, is_param: bool, offset: i64, borrow: bool, tparam: i64,
+}
+
+pub static mut LOCALS: *Local = 0 as *Local;
+pub static mut LOCAL_COUNT: i64 = 0;
+static mut LOCAL_CAP: i64 = 0;
+// Locals in scope (innermost last), and where each scope starts in it.
+pub static mut ENV: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut SCOPES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut LOOP_STACK: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// While checking a deferred statement (0.6): the LOOP_STACK depth at it
+// (loops below it cannot be left from it); -1 elsewhere.
+static mut DEFER_LOOP_BASE: i64 = -1;
+pub static mut RETURN_TYPE: i64 = 0;
+// In constant expressions no locals are visible.
+pub static mut CONST_CONTEXT: bool = false;
+pub static mut PROGRAM: i64 = 0;
+// The type `Self` names (in an impl block), or 0; the symbols `Self` and
+// `self`.
+pub static mut SELF_TYPE: i64 = 0;
+pub static mut SELF_TYPE_SYM: i64 = 0;
+pub static mut SELF_SYM: i64 = 0;
+
+// ---- Errors ----
+
+pub fn type_error(n: i64, message: *u8) -> ! {
+    unsafe { error_at(NODES[n].start, message) }
+}
+
+pub fn mismatch_error(n: i64, expected: i64, actual: i64) -> ! {
+    unsafe {
+        err_begin(NODES[n].start);
+        err_str(c"expected '");
+        err_type(expected);
+        err_str(c"', got '");
+        err_type(actual);
+        err_str(c"'");
+        err_end()
+    }
+}
+
+// `message` followed by `, got '<type>'`.
+pub fn type_error_got(n: i64, message: *u8, t: i64) -> ! {
+    unsafe {
+        err_begin(NODES[n].start);
+        err_str(message);
+        err_str(c", got '");
+        err_type(t);
+        err_str(c"'");
+        err_end()
+    }
+}
+
+pub fn name_error(pos: i64, before: *u8, name: i64, after: *u8) -> ! {
+    err_begin(pos);
+    err_str(before);
+    err_sym(name);
+    err_str(after);
+    err_end()
+}
+
+// ---- Scopes ----
+
+pub fn push_scope() {
+    SCOPES.push(ENV.count);
+}
+
+pub fn pop_scope() {
+    ENV.count = SCOPES.pop();
+}
+
+pub fn define_local(name: i64, ty: i64, mutable: bool, is_param: bool) -> i64 {
+    unsafe {
+        LOCALS = grow(LOCALS, LOCAL_COUNT, &LOCAL_CAP);
+        let id = LOCAL_COUNT;
+        LOCALS[id] = Local {
+            name: name, ty: ty, mutable: mutable, is_param: is_param, offset: 0, borrow: false,
+            tparam: 0,
+        };
+        LOCAL_COUNT += 1;
+        ENV.push(id);
+        id
+    }
+}
+
+// The innermost local named `name`, or -1.
+pub fn lookup_local(name: i64) -> Option<i64> {
+    unsafe {
+        if CONST_CONTEXT {
+            return Option::None;
+        }
+        let mut i = ENV.count - 1;
+        while i >= 0 {
+            let id = ENV.data[i];
+            if LOCALS[id].name == name {
+                return Option::Some(id);
+            }
+            i -= 1;
+        }
+        Option::None
+    }
+}
+
+// ---- Declarations ----
+
+pub fn check_program(program: i64) {
+    unsafe {
+        PROGRAM = program;
+        SELF_TYPE_SYM = intern_c(c"Self");
+        SELF_SYM = intern_c(c"self");
+        init_modules();
+        init_traits();
+        // The declarations, one phase after the other (see collect_phase),
+        // then every function body, whatever errors the declarations had
+        // (0.10: what failed in them is the error type, or left out).
+        for phase in 0..PHASE_COUNT {
+            collect_phase(phase);
+        }
+        for i in 0..NODES[program].count {
+            let item = child(program, i);
+            // (x is 0 for a function left out by its declaration's error)
+            if NODES[item].kind == Fn && NODES[item].x != 0 && FNS[NODES[item].x - 1].generic == 0 {
+                check_function_recovering(item);
+            }
+        }
+        // The instances, as they are made: an instance may make more.
+        let mut q = 0;
+        while q < INST_QUEUE.count {
+            check_function_recovering(FNS[INST_QUEUE.data[q]].node);
+            q += 1;
+        }
+        // (0.8: `*` imports and plain header imports, once the names used
+        // through them are known)
+        report_legacy_imports(true);
+        exit_if_errors();
+        finish_program(program);
+    }
+}
+
+const PHASE_COUNT: i64 = 14;
+
+// One phase of the declarations. Each item recovers from its errors on
+// its own (see attempt); an error none of them catches ends the checking.
+fn collect_phase(phase: i64) {
+    let depth = RECOVER_DEPTH;
+    let state = save_check_state();
+    if unsafe { _setjmp(recover_enter()) == 0 } {
+        match phase {
+            0 => collect_names(),
+            1 => collect_uses(),
+            2 => collect_const_types(),
+            3 => collect_structs(),
+            4 => collect_enums(),
+            5 => resolve_all_uses(),
+            6 => collect_aliases(),
+            7 => check_struct_cycles(),
+            8 => collect_impls(),
+            9 => collect_methods(),
+            10 => collect_functions(),
+            11 => check_impl_signatures(),
+            12 => collect_statics(),
+            _ => evaluate_consts(),
+        }
+    } else {
+        // Later phases would only report what follows from this error.
+        restore_check_state(state);
+        report_legacy_imports(false);
+        exit_if_errors();
+    }
+    recover_leave(depth);
+}
+
+fn check_function_recovering(item: i64) {
+    // (not a function whose body had a syntax error, or whose declaration
+    // failed)
+    if unsafe { (NODES[item].p & (FN_BODY_FAILED | FN_SIG_FAILED)) != 0 } {
+        return;
+    }
+    let depth = RECOVER_DEPTH;
+    let state = save_check_state();
+    if unsafe { _setjmp(recover_enter()) == 0 } {
+        check_function(item);
+    } else {
+        restore_check_state(state);
+    }
+    recover_leave(depth);
+}
+
+// What the checker must put back after an error (see err_end): its
+// scopes, stacks and context.
+struct CheckState {
+    env: i64, scopes: i64, loops: i64, module: i64, self_ty: i64, tp_base: i64, tp_count: i64,
+    inst: i64, ret: i64, tscratch: i64, scratch: i64, const_context: bool,
+    defer_base: i64, unsafe_depth: i64, wrap: i64,
+}
+
+fn save_check_state() -> CheckState {
+    CheckState {
+        env: ENV.count, scopes: SCOPES.count, loops: LOOP_STACK.count, module: CUR_MOD,
+        self_ty: SELF_TYPE, tp_base: TP_BASE, tp_count: TP_NAMES.count, inst: CUR_INST,
+        ret: RETURN_TYPE, tscratch: TSCRATCH.count, scratch: SCRATCH.count,
+        const_context: CONST_CONTEXT, defer_base: DEFER_LOOP_BASE, unsafe_depth: UNSAFE_DEPTH,
+        wrap: WRAP_NODE,
+    }
+}
+
+fn restore_check_state(s: CheckState) {
+    ENV.count = s.env;
+    SCOPES.count = s.scopes;
+    LOOP_STACK.count = s.loops;
+    DEFER_LOOP_BASE = s.defer_base;
+    CUR_MOD = s.module;
+    SELF_TYPE = s.self_ty;
+    TP_BASE = s.tp_base;
+    TP_NAMES.count = s.tp_count;
+    TP_TYPES.count = s.tp_count;
+    CUR_INST = s.inst;
+    RETURN_TYPE = s.ret;
+    TSCRATCH.count = s.tscratch;
+    SCRATCH.count = s.scratch;
+    CONST_CONTEXT = s.const_context;
+    UNSAFE_DEPTH = s.unsafe_depth;
+    WRAP_NODE = s.wrap;
+    OR_MODE = false;
+    UNIFY_SELF = 0;
+}
+
+// ---- Recovery (0.10) ----
+//
+// The declarations recover from errors item by item, and the parts of an
+// item one by one (a field's, a parameter's type...): what failed becomes
+// the error type (an unresolvable type) or is left out (a duplicate), and
+// the errors that would follow from it are not reported. The function
+// bodies recover statement by statement (see check_block); a function
+// whose body had a syntax error, or whose declaration failed, is not
+// checked.
+
+// What `attempt` does.
+pub enum Try { Name, Type, Method, Static, Const, Use, Impl, Bound, Discr }
+
+// The result of the attempt that went through.
+pub static mut TRY_RESULT: i64 = 0;
+
+// Does `what` for `arg` with a recovery point: whether it went through
+// (an error was recorded otherwise, and the checker's state is as it was).
+pub fn attempt(what: Try, arg: i64) -> bool {
+    let depth = RECOVER_DEPTH;
+    let state = save_check_state();
+    let mut ok = true;
+    if unsafe { _setjmp(recover_enter()) == 0 } {
+        match what {
+            Try::Name => collect_name(arg),
+            Try::Type => TRY_RESULT = resolve_type(arg),
+            Try::Method => collect_method(arg),
+            Try::Static => check_static(arg),
+            Try::Const => const_value_of(arg),
+            Try::Use => resolve_use_of(arg),
+            Try::Impl => collect_impl(arg),
+            Try::Bound => TRY_RESULT = trait_named(arg),
+            Try::Discr => TRY_RESULT = eval_discriminant(arg),
+        }
+    } else {
+        restore_check_state(state);
+        ok = false;
+    }
+    recover_leave(depth);
+    ok
+}
+
+// The type node n names; the error type (an error recorded) when it
+// names none.
+pub fn resolve_type_or_error(n: i64) -> i64 {
+    if attempt(Try::Type, n) { TRY_RESULT } else { TY_ERROR }
+}
+
+// Whether type t is or holds the error type (a type that failed).
+pub fn has_error_type(t: i64) -> bool {
+    unsafe {
+        if t == TY_ERROR {
+            return true;
+        }
+        let kind = TYPES[t].kind;
+        if kind == TyKind::Ptr || kind == TyKind::Slice || kind == TyKind::Array {
+            return has_error_type(TYPES[t].a);
+        }
+        if kind == TyKind::Fn && has_error_type(TYPES[t].a) {
+            return true;
+        }
+        if kind == TyKind::Tuple || kind == TyKind::Fn {
+            for i in 0..TYPES[t].count {
+                if has_error_type(type_elem(t, i)) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+// After an error in statement `stmt`: the names its `let` binds stand for
+// values of the error type, so that their uses report nothing more.
+fn poison_statement(stmt: i64) {
+    unsafe {
+        if NODES[stmt].kind == Let {
+            poison_pattern(NODES[stmt].a);
+        }
+    }
+}
+
+fn poison_pattern(p: i64) {
+    unsafe {
+        if p == 0 {
+            return;
+        }
+        if NODES[p].kind == PatBind {
+            NODES[p].x = define_local(NODES[p].a, TY_ERROR, true, false);
+            return;
+        }
+        for i in 0..NODES[p].count {
+            poison_pattern(child(p, i));
+        }
+    }
+}
+
+// The program's list, for the code generators: its items without the
+// generic templates, then the instances of generic functions.
+fn finish_program(program: i64) {
+    unsafe {
+        let mark = list_begin();
+        for i in 0..NODES[program].count {
+            let item = child(program, i);
+            let kind = NODES[item].kind;
+            if (kind == Fn || kind == Struct || kind == Enum) && NODES[item].g != 0 {
+                continue;
+            }
+            list_push(item);
+        }
+        for q in 0..INST_QUEUE.count {
+            list_push(FNS[INST_QUEUE.data[q]].node);
+        }
+        list_end(program, mark);
+    }
+}

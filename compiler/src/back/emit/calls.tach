@@ -1,0 +1,396 @@
+// Calls (emit/mod.tach): where a call's arguments and result go, tail
+// calls, and the call itself.
+
+use crate::back::abi::{
+    ABI_PIECE_COUNT, ABI_PIECE_OFFSET, ABI_PIECE_TY, AbiClass, abi_classify, abi_piece_locations,
+    abi_stack_location, abi_variadic_piece_locations, conv_classify, conv_return_piece_reg,
+    conv_returns_through_pointer, returns_through_pointer, tabi_classify, variadic_kind,
+};
+use crate::back::emit::function::emit_frame_teardown;
+use crate::back::emit::insts::mem_base_any;
+use crate::back::emit::machine::{
+    arg_reg, call_uses_c, conv_result_ptr_reg, m_load, m_mov, m_normalize, m_store, reg_callee,
+    reg_cycle, reg_move_temp, reg_ret, reg_sp, t_arg_location, xl_from_c, xl_is_stack, xl_offset,
+};
+use crate::back::emit::operands::{
+    CUR_POS, PM_LOC, pm_add, pm_add_value, pm_resolve, result_done, result_reg, use_any,
+};
+use crate::back::regalloc::intervals::RETURNS_TWICE;
+use crate::back::regalloc::locations::vloc;
+use crate::back::regalloc::prepare::{is_emitted, tracked};
+use crate::base::die;
+use crate::front::types::{
+    FNS, TYPES, TY_BOOL, TY_U64, TY_U8, align_to, fn_param, int_bits, is_compound, is_float,
+    is_integer, is_void, scalar_type, type_elem, type_size,
+};
+use crate::gen0::arm64::a64_call_indirect;
+use crate::gen0::gen::{fn_is_global, fn_symbol_prefix};
+use crate::gen0::target::{
+    arg_location, emit_call, emit_symbol_ref, first_int_arg, function_prefix, global_prefix, ins, o,
+    on, rt_panic_sym, variadic_arg_location,
+};
+use crate::base::target::{APPLE_A64, ELF, X86};
+use crate::gen0::x86_64::x64_call_indirect;
+use crate::middle::ir::{ARGTY, BLOCKS, INSTS, IRF, IRFUNCS, Term, ir_arg, ir_type};
+use crate::middle::ir::cfg::pred_index;
+use crate::middle::ir::Op::{Call, CallC, CallI, Phi, Piece};
+use crate::middle::opt::OPT_LEVEL;
+
+// ---- Calls ----
+
+// The function type called by call v: its parameters and result (0 for
+// the C library functions of Op::CallC, whose arguments are scalars).
+pub fn callee_param_count(v: i64) -> i64 {
+    unsafe {
+        let op = INSTS[v].op;
+        if op == Call { return FNS[INSTS[v].imm].param_count; }
+        if op == CallI { return TYPES[INSTS[v].imm].count; }
+        0
+    }
+}
+
+pub fn callee_param(v: i64, i: i64) -> i64 {
+    unsafe {
+        if INSTS[v].op == Call { fn_param(INSTS[v].imm, i) } else { type_elem(INSTS[v].imm, i) }
+    }
+}
+
+pub fn callee_result(v: i64) -> i64 {
+    unsafe {
+        let op = INSTS[v].op;
+        if op == Call { return FNS[INSTS[v].imm].ret; }
+        if op == CallI { return TYPES[INSTS[v].imm].a; }
+        0
+    }
+}
+
+// The location of each argument (IR operand) of call `v` (in
+// `locations`), and for aggregates copied onto the stack their size (in
+// `copies`, 0 otherwise); returns the size of its stack area, and the
+// float registers used in `float_regs`.
+pub fn call_locations(v: i64, locations: *i64, copies: *i64, float_regs: *i64) -> i64 {
+    unsafe {
+        if !call_uses_c(v) {
+            return t_call_locations(v, locations, copies, float_regs);
+        }
+        let mut state: [i64; 3] = [first_int_arg(callee_result(v)), 0, 0];
+        let mut j = 0;
+        for i in 0..callee_param_count(v) {
+            let ty = callee_param(v, i);
+            if is_void(ty) {
+                continue;
+            }
+            let kind = abi_classify(ty);
+            if kind == AbiClass::Pieces {
+                abi_piece_locations(ty, &state as *i64, &locations[j]);
+                for k in 0..ABI_PIECE_COUNT {
+                    copies[j + k] = 0;
+                }
+                j += ABI_PIECE_COUNT;
+            } else if kind == AbiClass::Stack {
+                locations[j] = abi_stack_location(ty, &state as *i64);
+                copies[j] = type_size(ty);
+                j += 1;
+            } else {
+                locations[j] = arg_location(if kind == AbiClass::Ref { TY_U64 } else { scalar_type(ty) }, &state as *i64);
+                copies[j] = 0;
+                j += 1;
+            }
+        }
+        // The `...` arguments, and the arguments of C library functions.
+        while j < INSTS[v].nargs {
+            let ty = ARGTY.data[INSTS[v].args + j];
+            copies[j] = 0;
+            if ty < 0 && is_compound(0 - ty) {
+                let t = 0 - ty;
+                let kind = variadic_kind(t);
+                if kind == AbiClass::Pieces {
+                    abi_variadic_piece_locations(t, &state as *i64, &locations[j]);
+                    for k in 0..ABI_PIECE_COUNT {
+                        copies[j + k] = 0;
+                    }
+                    j += ABI_PIECE_COUNT;
+                } else if kind == AbiClass::Stack {
+                    locations[j] = abi_stack_location(t, &state as *i64);
+                    copies[j] = type_size(t);
+                    j += 1;
+                } else {
+                    locations[j] = variadic_arg_location(TY_U64, &state as *i64);
+                    j += 1;
+                }
+                continue;
+            }
+            if ty < 0 {
+                locations[j] = variadic_arg_location(0 - ty, &state as *i64);
+            } else {
+                locations[j] = arg_location(ty, &state as *i64);
+            }
+            j += 1;
+        }
+        for i in 0..j {
+            locations[i] = xl_from_c(locations[i]);
+        }
+        *float_regs = state[1];
+        align_to(state[2], 16)
+    }
+}
+
+// call_locations for a call under the tachyon convention.
+fn t_call_locations(v: i64, locations: *i64, copies: *i64, float_regs: *i64) -> i64 {
+    unsafe {
+        let first = if conv_returns_through_pointer(false, callee_result(v)) { 1 } else { 0 };
+        let mut state: [i64; 3] = [first, 0, 0];
+        let mut j = 0;
+        for i in 0..callee_param_count(v) {
+            let ty = callee_param(v, i);
+            if is_void(ty) {
+                continue;
+            }
+            let kind = tabi_classify(ty);
+            if kind == AbiClass::Pieces {
+                for k in 0..ABI_PIECE_COUNT {
+                    locations[j] = t_arg_location(ABI_PIECE_TY[k], &state as *i64);
+                    copies[j] = 0;
+                    j += 1;
+                }
+            } else {
+                locations[j] = t_arg_location(if kind == AbiClass::Ref { TY_U64 } else { scalar_type(ty) }, &state as *i64);
+                copies[j] = 0;
+                j += 1;
+            }
+        }
+        if j != INSTS[v].nargs {
+            die(c"internal error: arguments of a tachyon call");
+        }
+        *float_regs = state[1];
+        align_to(state[2], 16)
+    }
+}
+
+pub fn call_stack_size(v: i64) -> i64 {
+    unsafe {
+        if INSTS[v].nargs > 64 {
+            die(c"too many arguments (at most 64 are supported)");
+        }
+        let mut locations: [i64; 64] = [0; 64];
+        let mut copies: [i64; 64] = [0; 64];
+        let mut float_regs = 0;
+        call_locations(v, &locations as *i64, &copies as *i64, &float_regs)
+    }
+}
+
+// Whether the block being emitted ended in a tail call (its return is then
+// the callee's).
+pub static mut TAIL_CALLED: bool = false;
+
+// Whether the function being emitted uses frame slots (whose addresses a
+// callee could hold: no tail calls then).
+pub static mut USES_SLOTS: bool = false;
+
+// Whether call v is a sibling call (at -O2): the last instruction of a
+// block returning its result (or nothing), from a tachyon function, to a
+// non-variadic callee taking no argument on the stack and returning no
+// aggregate, with the same result type, in a function whose frame no
+// callee can see.
+fn is_tail_call(v: i64) -> bool {
+    unsafe {
+        let op = INSTS[v].op;
+        let b = INSTS[v].block;
+        if OPT_LEVEL < 2 || USES_SLOTS || RETURNS_TWICE || (op != Call && op != CallI) || INSTS[v].next != 0
+            || INSTS[v].c != 0 {
+            return false;
+        }
+        let f = IRFUNCS[IRF].f;
+        let ret = FNS[f].ret;
+        if FNS[f].is_extern || FNS[f].export || fn_is_global(f) || is_compound(ret) || returns_through_pointer(ret) {
+            return false;
+        }
+        // The returning block: b, or the block b jumps to when it does
+        // nothing but return (a phi of the result).
+        let mut returning = b;
+        let mut result = v;
+        if BLOCKS[b].term == Term::Jump {
+            returning = BLOCKS[b].s0;
+            let mut w = BLOCKS[returning].first;
+            while w != 0 {
+                if INSTS[w].op != Phi && is_emitted(w) {
+                    return false;
+                }
+                if w == BLOCKS[returning].cond {
+                    if INSTS[w].op != Phi {
+                        return false;
+                    }
+                    result = w;
+                    if ir_arg(w, pred_index(returning, b)) != v {
+                        return false;
+                    }
+                }
+                w = INSTS[w].next;
+            }
+        }
+        if BLOCKS[returning].term != Term::Ret {
+            return false;
+        }
+        let value = BLOCKS[returning].cond;
+        if value != 0 && (value != result || INSTS[v].ty != ir_type(ret)) {
+            return false;
+        }
+        if value == 0 && !is_void(ret) {
+            return false;
+        }
+        if op == Call && FNS[INSTS[v].imm].variadic {
+            return false;
+        }
+        call_stack_size(v) == 0
+    }
+}
+
+// The pieces of call v's aggregate result (see add_piece_defs): from the
+// result registers to their locations (narrow integers normalized).
+fn emit_call_pieces(v: i64, c: bool, ret: i64) {
+    unsafe {
+        let mut w = INSTS[v].next;
+        let mut any = false;
+        while w != 0 {
+            if INSTS[w].op == Piece && INSTS[w].a == v && tracked(w) >= 0 {
+                if !any {
+                    conv_classify(c, ret);
+                    any = true;
+                }
+                let ty = INSTS[w].ty;
+                let reg = conv_return_piece_reg(c, INSTS[w].imm);
+                if ty == TY_BOOL || (is_integer(ty) && int_bits(ty) < 64) {
+                    m_normalize(reg, if ty == TY_BOOL { TY_U8 } else { ty });
+                }
+                pm_add(vloc(w, CUR_POS + 2), PM_LOC, reg, ty, 0, w);
+            }
+            w = INSTS[w].next;
+        }
+        if !any {
+            return;
+        }
+        pm_resolve();
+        w = INSTS[v].next;
+        while w != 0 {
+            if INSTS[w].op == Piece && INSTS[w].a == v && tracked(w) >= 0 {
+                result_done(w, vloc(w, CUR_POS + 2));
+            }
+            w = INSTS[w].next;
+        }
+    }
+}
+
+pub fn emit_call_inst(v: i64) {
+    unsafe {
+        let op = INSTS[v].op;
+        let mut locations: [i64; 64] = [0; 64];
+        let mut copies: [i64; 64] = [0; 64];
+        let mut float_regs = 0;
+        call_locations(v, &locations as *i64, &copies as *i64, &float_regs);
+        // Stack arguments first: their sources are still intact.
+        let c = call_uses_c(v);
+        for i in 0..INSTS[v].nargs {
+            let location = locations[i];
+            if !xl_is_stack(location) {
+                continue;
+            }
+            let arg = ir_arg(v, i);
+            if copies[i] > 0 {
+                // An aggregate copied onto the stack, in 8-byte pieces (its
+                // private copy is a multiple of 8 bytes), through registers no
+                // value is allocated to.
+                let mut offset = 0;
+                let src = mem_base_any(arg, 0, CUR_POS, &offset);
+                let temp = reg_cycle(false);
+                let mut k = 0;
+                while k < copies[i] {
+                    m_load(TY_U64, temp, src, offset + k);
+                    m_store(TY_U64, temp, reg_sp(), xl_offset(location) + k);
+                    k += 8;
+                }
+                continue;
+            }
+            let declared = ARGTY.data[INSTS[v].args + i];
+            let variadic = declared < 0;
+            let ty = if variadic { 0 - declared } else { declared };
+            let value_ty = INSTS[arg].ty;
+            let r = use_any(arg, CUR_POS, reg_move_temp(is_float(value_ty)));
+            let mut store_ty = value_ty;
+            if !is_float(value_ty) {
+                // Apple's arm64 ABI packs fixed stack arguments at their size;
+                // everything else takes 8 bytes.
+                store_ty = TY_U64;
+                if c && APPLE_A64 && !variadic && !is_compound(ty) && type_size(ty) < 8 {
+                    store_ty = ty;
+                }
+            }
+            m_store(store_ty, r, reg_sp(), xl_offset(location));
+        }
+        for i in 0..INSTS[v].nargs {
+            let location = locations[i];
+            if !xl_is_stack(location) {
+                pm_add_value(arg_reg(location), ir_arg(v, i), CUR_POS);
+            }
+        }
+        let ret = callee_result(v);
+        let through_pointer = INSTS[v].c != 0 && conv_returns_through_pointer(c, ret);
+        if through_pointer {
+            pm_add_value(conv_result_ptr_reg(c), INSTS[v].c, CUR_POS);
+        }
+        if op == CallI {
+            pm_add_value(reg_callee(), INSTS[v].a, CUR_POS);
+        }
+        pm_resolve();
+        if is_tail_call(v) {
+            // The frame goes, then a jump: the callee returns to our caller.
+            emit_frame_teardown();
+            if op == Call {
+                let f = INSTS[v].imm;
+                o(if X86 { c"    jmp " } else { c"    b " });
+                emit_symbol_ref(fn_symbol_prefix(f), FNS[f].name);
+                if X86 && ELF && (FNS[f].is_extern || FNS[f].export) {
+                    o(c"@PLT");
+                }
+                on();
+            } else {
+                ins(if X86 { c"jmp *%r11" } else { c"br x16" });
+            }
+            TAIL_CALLED = true;
+            return;
+        }
+        if op == Call {
+            let f = INSTS[v].imm;
+            emit_call(fn_symbol_prefix(f), FNS[f].name, FNS[f].is_extern || FNS[f].export, FNS[f].variadic, float_regs);
+        } else if op == CallC && INSTS[v].imm == rt_panic_sym() {
+            emit_call(function_prefix(), INSTS[v].imm, false, false, 0);
+        } else if op == CallC {
+            emit_call(global_prefix(), INSTS[v].imm, true, false, 0);
+        } else if X86 {
+            x64_call_indirect();
+        } else {
+            a64_call_indirect();
+        }
+        emit_call_pieces(v, c, ret);
+        if INSTS[v].c != 0 && !through_pointer {
+            // An aggregate result in registers: stored in pieces into its slot.
+            conv_classify(c, ret);
+            let mut offset = 0;
+            let base = mem_base_any(INSTS[v].c, 0, CUR_POS + 2, &offset);
+            for k in 0..ABI_PIECE_COUNT {
+                m_store(ABI_PIECE_TY[k], conv_return_piece_reg(c, k), base, offset + ABI_PIECE_OFFSET[k]);
+            }
+            return;
+        }
+        let ty = INSTS[v].ty;
+        if ty == 0 || tracked(v) < 0 {
+            return;
+        }
+        let ret_reg = reg_ret(is_float(ty));
+        if ty == TY_BOOL || (is_integer(ty) && int_bits(ty) < 64) {
+            m_normalize(ret_reg, if ty == TY_BOOL { TY_U8 } else { ty });
+        }
+        let r = result_reg(v);
+        m_mov(r, ret_reg, ty);
+        result_done(v, r);
+    }
+}

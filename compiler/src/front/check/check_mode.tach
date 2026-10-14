@@ -1,0 +1,327 @@
+// Check mode: an expression checked against the type its context expects
+// (check_expr). Integer literals take the expected type (and must fit it),
+// tuples, arrays and struct literals pass it to their parts, branches and
+// arithmetic operands are checked against it; everything else is
+// synthesized and compared with it.
+
+use crate::base::buf_uint;
+use crate::base::diag::{ERR, err_begin, err_end, err_int, err_str, err_sym};
+use crate::front::ast::{NODES, REPR_UNION, child};
+use crate::front::ast::NodeKind::{
+    Array, Binary, Block, Char, Float, If, Int, Loop, Match, Repeat, StructLit, Tuple, Unary,
+};
+use crate::front::check::{SELF_TYPE, SELF_TYPE_SYM, mismatch_error, name_error, type_error_got};
+use crate::front::check::body::{check_branch, check_if, check_loop};
+use crate::front::check::resolve::resolve_alias;
+use crate::front::consteval::eval_array_len;
+use crate::front::generics::{HINT_NODE, HINT_TY, check_arg, env_lookup};
+use crate::front::generics::instantiate::infer_struct_literal;
+use crate::front::lexer::{SUF_NONE, Tok};
+use crate::front::modules::CUR_MOD;
+use crate::front::modules::lookup::{
+    B_ITEM, B_PRIVATE, access_error, binding_kind, binding_value, lookup_name, note_c_use,
+    path_module,
+};
+use crate::front::patterns::check_match;
+use crate::front::types::{
+    STRUCTS, SYM_ALIAS, SYM_STRUCT, TYPES, TY_ERROR, TY_NEVER, TyKind, err_type, find_field,
+    int_max, is_float, is_integer, is_numeric, is_signed, struct_field, struct_type, type_elem,
+};
+use crate::front::check::synth_mode::{fold_layout_query, synth_expr};
+use crate::front::check::names::unknown_name_error;
+
+fn passes_expected_to_operands(op: Tok, expected: i64) -> bool {
+    if op == Tok::Plus || op == Tok::Minus || op == Tok::Star || op == Tok::Slash || op == Tok::Percent {
+        return is_numeric(expected);
+    }
+    if op == Tok::Amp || op == Tok::Pipe || op == Tok::Caret {
+        return is_integer(expected);
+    }
+    false
+}
+
+// Checks `n` against `expected`; returns `expected`, or `!` when the
+// expression diverges.
+pub fn check_expr(n: i64, expected: i64) -> i64 {
+    fold_layout_query(n);
+    HINT_NODE = n;
+    HINT_TY = expected;
+    let actual = check_expr_inner(n, expected);
+    unsafe { NODES[n].ty = expected; }
+    actual
+}
+
+fn check_expr_inner(n: i64, expected: i64) -> i64 {
+    unsafe {
+        match NODES[n].kind {
+            Int if NODES[n].b == SUF_NONE && is_integer(expected) => {
+                check_int_fits(n, NODES[n].a as u64, expected);
+                return expected;
+            }
+            Char if is_integer(expected) => {
+                check_int_fits(n, NODES[n].a as u64, expected);
+                return expected;
+            }
+            Float if NODES[n].b == SUF_NONE && is_float(expected) => {
+                return expected;
+            }
+            Tuple if TYPES[expected].kind == TyKind::Tuple => {
+                check_tuple(n, expected);
+                return expected;
+            }
+            Array if TYPES[expected].kind == TyKind::Array => {
+                check_array(n, expected);
+                return expected;
+            }
+            Repeat if TYPES[expected].kind == TyKind::Array => {
+                check_expr(NODES[n].a, TYPES[expected].a);
+                let count = eval_array_len(NODES[n].b);
+                if count != TYPES[expected].b {
+                    err_begin(NODES[NODES[n].b].start);
+                    err_str(c"array repeat count is ");
+                    err_int(count);
+                    err_str(c", expected ");
+                    err_int(TYPES[expected].b);
+                    err_end();
+                }
+                return expected;
+            }
+            StructLit => {
+                check_struct_literal(n, expected);
+                return expected;
+            }
+            If => return check_if(n, expected),
+            Match => return check_match(n, expected),
+            Block => return check_branch(n, expected),
+            Loop => return check_loop(n, expected),
+            Binary if passes_expected_to_operands(NODES[n].op, expected) => {
+                check_expr(NODES[n].b, expected);
+                check_expr(NODES[n].c, expected);
+                return expected;
+            }
+            Binary if (NODES[n].op == Tok::Shl || NODES[n].op == Tok::Shr) && is_integer(expected) => {
+                check_expr(NODES[n].b, expected);
+                check_shift_amount(NODES[n].c);
+                return expected;
+            }
+            Unary if NODES[n].op == Tok::Minus && is_numeric(expected) => {
+                check_negation(n, expected);
+                return expected;
+            }
+            Unary if NODES[n].op == Tok::Tilde && is_integer(expected) => {
+                check_expr(NODES[n].b, expected);
+                return expected;
+            }
+            _ => {}
+        }
+    }
+    let actual = synth_expr(n);
+    if actual == TY_NEVER {
+        return actual;
+    }
+    // (a value of the error type, or one where it is expected, follows
+    // from an earlier error: nothing to report)
+    if actual != expected && actual != TY_ERROR && expected != TY_ERROR {
+        mismatch_error(n, expected, actual);
+    }
+    expected
+}
+
+fn check_int_fits(n: i64, value: u64, ty: i64) {
+    unsafe {
+        if value > int_max(ty) {
+            err_begin(NODES[n].start);
+            err_str(c"integer literal ");
+            buf_uint(ERR, value);
+            err_str(c" does not fit in type '");
+            err_type(ty);
+            err_str(c"'");
+            err_end();
+        }
+    }
+}
+
+fn check_tuple(n: i64, expected: i64) {
+    unsafe {
+        let count = NODES[n].count;
+        if count != TYPES[expected].count {
+            err_begin(NODES[n].start);
+            err_str(c"tuple has ");
+            err_int(count);
+            err_str(c" elements, expected ");
+            err_int(TYPES[expected].count);
+            err_end();
+        }
+        for i in 0..count {
+            check_expr(child(n, i), type_elem(expected, i));
+        }
+    }
+}
+
+fn check_array(n: i64, expected: i64) {
+    unsafe {
+        let count = NODES[n].count;
+        if count != TYPES[expected].b {
+            err_begin(NODES[n].start);
+            err_str(c"array has ");
+            err_int(count);
+            err_str(c" elements, expected ");
+            err_int(TYPES[expected].b);
+            err_end();
+        }
+        for i in 0..count {
+            check_expr(child(n, i), TYPES[expected].a);
+        }
+    }
+}
+
+// The struct a struct literal names (`Self` included; through its module
+// path, h), or -1. A generic struct's template is returned as it is.
+fn struct_of_literal(n: i64) -> i64 {
+    unsafe {
+        let name = NODES[n].a;
+        if NODES[n].h == 0 {
+            if name == SELF_TYPE_SYM && SELF_TYPE != 0 && TYPES[SELF_TYPE].kind == TyKind::Struct {
+                return TYPES[SELF_TYPE].a;
+            }
+            let param = env_lookup(name);
+            if param != 0 && TYPES[param].kind == TyKind::Struct {
+                return TYPES[param].a;
+            }
+        }
+        let m = if NODES[n].h != 0 { path_module(NODES[n].h, NODES[NODES[n].h].count) } else { CUR_MOD };
+        let b = lookup_name(m, name, CUR_MOD);
+        if NODES[n].h == 0 {
+            note_c_use(NODES[n].start, name, b);
+        }
+        if binding_kind(b) == B_PRIVATE {
+            access_error(b, NODES[n].start, name);
+        }
+        if binding_kind(b) != B_ITEM {
+            return -1;
+        }
+        let key = binding_value(b);
+        if SYM_STRUCT[key] != 0 {
+            return SYM_STRUCT[key] - 1;
+        }
+        if SYM_ALIAS[key] != 0 {
+            let t = resolve_alias(key, NODES[n].start);
+            if TYPES[t].kind == TyKind::Struct {
+                return TYPES[t].a;
+            }
+        }
+        -1
+    }
+}
+
+fn check_struct_literal(n: i64, expected: i64) {
+    unsafe {
+        let actual = check_struct_fields(n, expected);
+        if actual != expected {
+            if TYPES[expected].kind == TyKind::Struct && TYPES[actual].kind == TyKind::Struct {
+                err_begin(NODES[n].start);
+                err_str(c"expected struct '");
+                err_sym(STRUCTS[TYPES[expected].a].name);
+                err_str(c"', got constructor for '");
+                err_sym(STRUCTS[TYPES[actual].a].name);
+                err_str(c"'");
+                err_end();
+            }
+            mismatch_error(n, expected, actual);
+        }
+    }
+}
+
+// The fields of `Name { ... }`: each exactly once, with its declared type.
+// `expected` (0: none) may give a generic struct's type arguments.
+pub fn check_struct_fields(n: i64, expected: i64) -> i64 {
+    unsafe {
+        let name = NODES[n].a;
+        let mut s = struct_of_literal(n);
+        if s < 0 {
+            unknown_name_error(NODES[n].start, c"unknown struct '", name);
+        }
+        if STRUCTS[s].generic > 0 {
+            s = infer_struct_literal(s, n, expected);
+        } else if NODES[n].g != 0 {
+            name_error(NODES[n].start, c"struct '", name, c"' is not generic");
+        }
+        for i in 0..NODES[n].count {
+            let init = child(n, i);
+            for j in 0..i {
+                if NODES[child(n, j)].a == NODES[init].a {
+                    name_error(NODES[init].start, c"duplicate field '", NODES[init].a, c"' in constructor");
+                }
+            }
+            let field = find_field(s, NODES[init].a);
+            if field < 0 {
+                err_begin(NODES[init].start);
+                err_str(c"unknown field '");
+                err_sym(NODES[init].a);
+                err_str(c"' in struct '");
+                err_sym(STRUCTS[s].name);
+                err_str(c"'");
+                err_end();
+            }
+            NODES[init].x = field;
+            check_arg(NODES[init].b, (*struct_field(s, field)).ty);
+        }
+        if (STRUCTS[s].repr & REPR_UNION) != 0 {
+            if NODES[n].count != 1 {
+                err_begin(NODES[n].start);
+                err_str(c"a literal of union '");
+                err_sym(STRUCTS[s].name);
+                err_str(c"' sets exactly one field");
+                err_end();
+            }
+            return struct_type(s);
+        }
+        for f in 0..STRUCTS[s].field_count {
+            let mut found = false;
+            for i in 0..NODES[n].count {
+                if NODES[child(n, i)].x == f {
+                    found = true;
+                }
+            }
+            if !found {
+                err_begin(NODES[n].start);
+                err_str(c"missing field '");
+                err_sym((*struct_field(s, f)).name);
+                err_str(c"' in struct '");
+                err_sym(STRUCTS[s].name);
+                err_str(c"' constructor");
+                err_end();
+            }
+        }
+        struct_type(s)
+    }
+}
+
+fn check_negation(n: i64, expected: i64) {
+    unsafe {
+        let operand = NODES[n].b;
+        if NODES[operand].kind == Int && NODES[operand].b == SUF_NONE && is_signed(expected) {
+            let value = NODES[operand].a as u64;
+            let magnitude: u64 = if value == 0 { 0 } else { value - 1 };
+            if magnitude > int_max(expected) {
+                err_begin(NODES[n].start);
+                err_str(c"integer literal -");
+                buf_uint(ERR, value);
+                err_str(c" does not fit in type '");
+                err_type(expected);
+                err_str(c"'");
+                err_end();
+            }
+            NODES[operand].ty = expected;
+            return;
+        }
+        check_expr(operand, expected);
+    }
+}
+
+pub fn check_shift_amount(amount: i64) {
+    let ty = synth_expr(amount);
+    if !is_integer(ty) {
+        unsafe { type_error_got(amount, c"shift amount must be integer", ty); }
+    }
+}

@@ -1,0 +1,404 @@
+// Modules (0.5): a file is a module. The files named on the command line
+// make the root module (the crate); `mod name;` in a module's file loads
+// name.tach (or name/mod.tach) as its child module `name`. The C headers
+// of `import` make a module of their own.
+//
+// Every item has a key: its name qualified by its module's path
+// (`util::Point`; an item of the root module is keyed by its bare name).
+// The tables of declarations (types.tach) are indexed by keys. Code
+// names an item through its module's scope: the module's own items, its
+// child modules, what its `use` items import, and the prelude. (0.8: no
+// `*` imports, which brought every item of a module, or every variant of
+// an enum; they are still resolved, for --fix-imports and for the errors
+// that replace them: see LEGACY_IMPORTS.)
+//
+// Items are private to their module (and its descendants) unless `pub`.
+//
+// Here: the table of modules, item keys, and loading the modules' files;
+// in lookup.tach: scopes, `use` items, lookups and paths.
+
+pub mod lookup;
+
+use crate::base::{
+    BUFS, FILES, FILE_COUNT, IntVec, SYMS, add_source, buf_byte, buf_bytes, buf_clear, buf_new,
+    buf_slice, buf_str, find_sym, grow, intern, intern_c, read_file, streq, strlen,
+};
+use crate::base::diag::{
+    err_begin, err_end_soft, err_help, err_str, err_sym, error_at_soft, fail_name,
+};
+use crate::front::lexer::{TOKS, TOK_COUNT, Tok, lex_range};
+use crate::front::cpp::directives::{file_exists, path_dir};
+use crate::front::stdsrc::std_source;
+use crate::middle::profile::{PROFILE_GENERATE, PROFILE_MODULE, profile_runtime_source};
+use crate::middle::unsafecheck::{CHECK_MODULE, CHECK_UNSAFE, check_runtime_source};
+use crate::front::ast::NODES;
+use crate::middle::lower::ssa::HMap;
+use crate::front::modules::lookup::is_prelude_name;
+
+// What other modules use of the parts.
+
+// `key`: the module's path (`a::b`), `sym`: the same with dots (`a.b`),
+// the prefix of its items' symbols in the assembly.
+struct Module {
+    name: i64, parent: i64, key: i64, sym: i64, public: bool, is_c: bool,
+}
+
+pub static mut MODULES: *Module = 0 as *Module;
+static mut MODULE_COUNT: i64 = 0;
+static mut MODULE_CAP: i64 = 0;
+// The module of the imported C declarations, and of the standard library
+// (-1: none).
+pub static mut C_MODULE: i64 = -1;
+pub static mut STD_MODULE: i64 = -1;
+// The module of the code being checked.
+pub static mut CUR_MOD: i64 = 0;
+
+pub fn add_module(name: i64, parent: i64, public: bool) -> i64 {
+    unsafe {
+        MODULES = grow(MODULES, MODULE_COUNT, &MODULE_CAP);
+        let m = MODULE_COUNT;
+        let mut key = name;
+        let mut sym = name;
+        if parent > 0 {
+            key = join_sym(MODULES[parent].key, c"::", name);
+            sym = join_sym(MODULES[parent].sym, c".", name);
+        }
+        MODULES[m] = Module { name: name, parent: parent, key: key, sym: sym, public: public, is_c: false };
+        MODULE_COUNT += 1;
+        m
+    }
+}
+
+pub fn init_modules() {
+    if MODULE_COUNT == 0 {
+        add_module(-1, -1, true);
+    }
+}
+
+pub fn join_sym(a: i64, sep: *u8, b: i64) -> i64 {
+    intern(joined(a, sep, b))
+}
+
+// The text of symbols a and b joined by sep, in a buffer reused by the
+// next call.
+static mut JOIN_BUF: i64 = -1;
+
+fn joined(a: i64, sep: *u8, b: i64) -> [u8] {
+    unsafe {
+        if JOIN_BUF < 0 {
+            JOIN_BUF = buf_new();
+        }
+        buf_clear(JOIN_BUF);
+        buf_bytes(JOIN_BUF, SYMS[a].text);
+        buf_str(JOIN_BUF, sep);
+        buf_bytes(JOIN_BUF, SYMS[b].text);
+        buf_slice(JOIN_BUF)
+    }
+}
+
+static mut QUALIFIED: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+// The key of item `name` of module m.
+pub fn qualify(m: i64, name: i64) -> i64 {
+    if m <= 0 {
+        return name;
+    }
+    let k = (name + 1) * 65536 + m;
+    let known = QUALIFIED.get(k);
+    if known != 0 {
+        return known - 1;
+    }
+    let key = unsafe { join_sym(MODULES[m].key, c"::", name) };
+    QUALIFIED.put(k, key + 1);
+    key
+}
+
+// The key of item `name` of module m if it has been made (an item of that
+// name exists there), else -1; makes no symbol.
+fn qualified_if_known(m: i64, name: i64) -> i64 {
+    if m <= 0 {
+        return name;
+    }
+    let known = QUALIFIED.get((name + 1) * 65536 + m);
+    if known != 0 {
+        return known - 1;
+    }
+    unsafe { find_sym(joined(MODULES[m].key, c"::", name)) }
+}
+
+// The key of item `name` of module m, if it has one, else -1 (0.11:
+// suggestions for unknown names).
+pub fn item_key_if_known(m: i64, name: i64) -> i64 {
+    qualified_if_known(m, name)
+}
+
+// The assembly symbol of item `name` of module m.
+pub fn item_symbol(m: i64, name: i64) -> i64 {
+    if m <= 0 { name } else { unsafe { join_sym(MODULES[m].sym, c".", name) } }
+}
+
+// The file holding position `pos`.
+fn file_of(pos: i64) -> i64 {
+    // (the files are in order of their start positions)
+    let mut lo = 0;
+    let mut hi = FILE_COUNT - 1;
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        if unsafe { pos >= FILES[mid].start } {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo
+}
+
+pub fn module_of(n: i64) -> i64 {
+    unsafe { module_at(NODES[n].start) }
+}
+
+// Inline modules (0.6): (start, end, module) for each `mod m { ... }`, the
+// positions of its braces.
+static mut INLINE_MODS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The module of the code at position `pos`: the innermost inline module
+// around it, else its file's.
+pub fn module_at(pos: i64) -> i64 {
+    unsafe {
+        let mut best = -1;
+        let mut best_start = -1;
+        let mut i = 0;
+        while i < INLINE_MODS.count {
+            let start = INLINE_MODS.data[i];
+            if start <= pos && pos < INLINE_MODS.data[i + 1] && start > best_start {
+                best = INLINE_MODS.data[i + 2];
+                best_start = start;
+            }
+            i += 3;
+        }
+        if best >= 0 {
+            return best;
+        }
+        FILES[file_of(pos)].module
+    }
+}
+
+pub fn module_count() -> i64 {
+    MODULE_COUNT
+}
+
+pub fn child_module(m: i64, name: i64) -> i64 {
+    for c in 1..MODULE_COUNT {
+        if unsafe { MODULES[c].parent == m && MODULES[c].name == name } {
+            return c;
+        }
+    }
+    -1
+}
+
+// Whether module `inner` is `outer` or one of its descendants.
+fn is_within(inner: i64, outer: i64) -> bool {
+    let mut m = inner;
+    while m >= 0 {
+        if m == outer {
+            return true;
+        }
+        unsafe { m = MODULES[m].parent; }
+    }
+    false
+}
+
+// ---- Loading ----
+
+// `mod name;` in the files read so far (and in the files they load): the
+// child modules' files are read, lexed and appended. Done before parsing.
+pub fn load_modules() {
+    unsafe {
+        init_modules();
+        load_std_if_named();
+        // One pass over the tokens, in the order of the files (a module's file
+        // and its tokens are appended when it is loaded, so its own `mod`
+        // items come later in the pass).
+        let mut i = 0;
+        while i + 2 < TOK_COUNT {
+            if TOKS[i].kind == Tok::Mod && TOKS[i + 1].kind == Tok::Ident && TOKS[i + 2].kind == Tok::Semi {
+                let f = file_of(TOKS[i].start);
+                // (after an error, on with the next one: 0.10)
+                if module_at(TOKS[i].start) != FILES[f].module {
+                    error_at_soft(TOKS[i].start, c"'mod name;' cannot be inside an inline module (a module's file is found from its file's module)");
+                    fail_name(TOKS[i + 1].value as i64);
+                } else {
+                    load_module(f, i);
+                }
+            }
+            if TOKS[i].kind == Tok::Mod && TOKS[i + 1].kind == Tok::Ident && TOKS[i + 2].kind == Tok::LBrace {
+                add_inline_module(i);
+            }
+            i += 1;
+        }
+        // Named only in a module's file (fixed in 0.6: 0.5 looked at the files
+        // of the command line alone).
+        load_std_if_named();
+        // (0.10: --check-unsafe's runtime)
+        if CHECK_UNSAFE && CHECK_MODULE < 0 {
+            let text = buf_new();
+            check_runtime_source(text);
+            let start = add_source(c"<check>", text);
+            CHECK_MODULE = add_module(intern_c(c"__check"), 0, false);
+            FILES[FILE_COUNT - 1].module = CHECK_MODULE;
+            lex_range(start, FILES[FILE_COUNT - 1].end, false);
+        }
+        // (0.10: --profile-generate's runtime)
+        if PROFILE_GENERATE != 0 as *u8 && PROFILE_MODULE < 0 {
+            let text = buf_new();
+            profile_runtime_source(text);
+            let start = add_source(c"<profile>", text);
+            PROFILE_MODULE = add_module(intern_c(c"__profile"), 0, false);
+            FILES[FILE_COUNT - 1].module = PROFILE_MODULE;
+            lex_range(start, FILES[FILE_COUNT - 1].end, false);
+        }
+    }
+}
+
+// The standard library, when the program names it (`std::...`) or (0.6) a
+// name of the prelude, once.
+fn load_std_if_named() {
+    unsafe {
+        for i in 0..TOK_COUNT - 1 {
+            if TOKS[i].kind == Tok::Ident && STD_MODULE < 0
+                && ((TOKS[i + 1].kind == Tok::ColonColon && TOKS[i].value as i64 == intern_c(c"std"))
+                    || is_prelude_name(TOKS[i].value as i64)) {
+                let text = buf_new();
+                std_source(text);
+                let start = add_source(c"<std>", text);
+                STD_MODULE = add_module(intern_c(c"std"), 0, true);
+                FILES[FILE_COUNT - 1].module = STD_MODULE;
+                lex_range(start, FILES[FILE_COUNT - 1].end, false);
+            }
+        }
+    }
+}
+
+// `mod name { ... }` at token i (0.6): a child module of the module around
+// it, holding the code between the braces.
+fn add_inline_module(i: i64) {
+    unsafe {
+        let parent = module_at(TOKS[i].start);
+        let name = TOKS[i + 1].value as i64;
+        if child_module(parent, name) >= 0 {
+            err_begin(TOKS[i + 1].start);
+            err_str(c"module '");
+            err_sym(name);
+            err_str(c"' is declared twice");
+            err_end_soft();
+        }
+        let public = i > 0 && TOKS[i - 1].kind == Tok::Pub;
+        // The matching closing brace.
+        let mut depth = 0;
+        let mut j = i + 2;
+        while j < TOK_COUNT {
+            if TOKS[j].kind == Tok::LBrace {
+                depth += 1;
+            } else if TOKS[j].kind == Tok::RBrace {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            j += 1;
+        }
+        let m = add_module(name, parent, public);
+        INLINE_MODS.push(TOKS[i + 2].start);
+        INLINE_MODS.push(if j < TOK_COUNT { TOKS[j].start + 1 } else { TOKS[TOK_COUNT - 1].start + 1 });
+        INLINE_MODS.push(m);
+    }
+}
+
+fn load_module(f: i64, i: i64) {
+    unsafe {
+        let parent = FILES[f].module;
+        let name = TOKS[i + 1].value as i64;
+        if child_module(parent, name) >= 0 {
+            err_begin(TOKS[i + 1].start);
+            err_str(c"module '");
+            err_sym(name);
+            err_str(c"' is declared twice");
+            err_end_soft();
+            return;
+        }
+        let public = i > 0 && TOKS[i - 1].kind == Tok::Pub;
+        let path = module_file(f, name);
+        if path == 0 as *u8 {
+            err_begin(TOKS[i + 1].start);
+            err_str(c"cannot find the file of module '");
+            err_sym(name);
+            err_str(c"'");
+            err_help(c"looked for ");
+            err_help(module_candidate(f, name, false));
+            err_help(c" and ");
+            err_help(module_candidate(f, name, true));
+            err_end_soft();
+            // (what it would have declared is unknown: no errors for it)
+            fail_name(name);
+            return;
+        }
+        let m = add_module(name, parent, public);
+        let text = buf_new();
+        read_file(path, text);
+        let start = add_source(path, text);
+        FILES[FILE_COUNT - 1].module = m;
+        lex_range(start, FILES[FILE_COUNT - 1].end, false);
+    }
+}
+
+// Where `mod name;` in file f looks: next to the file for a root file or a
+// `mod.tach`, else in the directory named after the file (`a.tach`: `a/`);
+// as `name.tach`, or `name/mod.tach` when `nested`.
+fn module_candidate(f: i64, name: i64, nested: bool) -> *u8 {
+    unsafe {
+        let path = FILES[f].path;
+        let out = buf_new();
+        buf_str(out, path_dir(path));
+        buf_byte(out, '/');
+        let base = path_base(path);
+        if FILES[f].module > 0 && !streq(base, c"mod.tach") {
+            let n = strlen(base) as i64;
+            let stem = if n > 5 && streq(&base[n - 5], c".tach") { n - 5 } else { n };
+            buf_bytes(out, base[0..stem]);
+            buf_byte(out, '/');
+        }
+        buf_bytes(out, SYMS[name].text);
+        buf_str(out, if nested { c"/mod.tach" } else { c".tach" });
+        buf_byte(out, 0);
+        BUFS[out].data
+    }
+}
+
+fn module_file(f: i64, name: i64) -> *u8 {
+    unsafe {
+        let flat = module_candidate(f, name, false);
+        if file_exists(flat) {
+            return flat;
+        }
+        let nested = module_candidate(f, name, true);
+        if file_exists(nested) {
+            return nested;
+        }
+        0 as *u8
+    }
+}
+
+fn path_base(path: *u8) -> *u8 {
+    unsafe {
+        let n = strlen(path) as i64;
+        let mut i = n - 1;
+        while i >= 0 && path[i] != '/' {
+            i -= 1;
+        }
+        &path[i + 1]
+    }
+}
+
+pub fn file_of_pos(pos: i64) -> i64 {
+    file_of(pos)
+}

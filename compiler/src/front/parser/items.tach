@@ -1,0 +1,728 @@
+// Items: functions, structs, enums, constants, statics, type aliases,
+// impl blocks and traits with their generic parameters, `use` and
+// `import` lines, and the attributes before an item (`#[repr]`,
+// `#[inline]`, `#[cold]`).
+
+use crate::base::intern_c;
+use crate::base::diag::error_at;
+use crate::front::ast::{
+    FN_BODY_FAILED, FN_COLD, FN_INLINE, FN_NO_INLINE, FN_UNSAFE, NODES, NodeKind, REPR_C, REPR_INT,
+    REPR_PACKED, REPR_UNION, SCRATCH, child, list_begin, list_end, list_push, new_node,
+};
+use crate::front::check::name_error;
+use crate::front::lexer::TOKS;
+use crate::front::lexer::Tok::{
+    Arrow, As, Colon, ColonColon, Comma, Const, Ellipsis, Enum, Eof, Eq, Extern, Fn, For, Gt, Hash,
+    Impl, Import, Int, LBrace, LBracket, LParen, Lt, Mod, Mut, Plus, Pub, RBrace, RBracket, RParen,
+    Reserved, Semi, Star, Static, Str, Struct, Trait, Type, Union, Unsafe, Use,
+};
+use crate::front::parser::{
+    BODY_FAILED, P, UNDERSCORE, advance, at, cur, cur_start, eat, expect, expect_binding_name,
+    expect_ident, prev_end, reserved_error, syntax_error, tok_kind,
+};
+use crate::front::parser::exprs::parse_expr;
+use crate::front::parser::foreign::parse_extern;
+use crate::front::parser::stmts::parse_block;
+use crate::front::parser::types::{is_int_type_name, parse_type};
+
+// One item (or the several items of an impl or extern block), pushed to
+// the program's list.
+pub fn parse_top_item() {
+    unsafe {
+        let public = eat(Pub);
+        if at(Impl) {
+            // The functions of an impl block are items of the program.
+            parse_impl(false);
+        } else if at(Trait) {
+            let item = parse_trait();
+            mark_public(item, public);
+            list_push(item);
+        } else if at(Extern) {
+            let mark = SCRATCH.count;
+            parse_extern();
+            for i in mark..SCRATCH.count {
+                mark_public(SCRATCH.data[i], public);
+            }
+        } else if at(Import) {
+            parse_import(public);
+        } else if at(Use) {
+            parse_use(public);
+        } else if at(Mod) {
+            let start = cur_start();
+            advance();
+            let n = new_node(NodeKind::Mod, start, 0);
+            NODES[n].a = expect_binding_name();
+            if eat(LBrace) {
+                // `mod name { items }` (0.6): its items are the program's, in
+                // the module the loader made for the braces (modules.tach).
+                NODES[n].end = prev_end();
+                mark_public(n, public);
+                list_push(n);
+                while !at(RBrace) && !at(Eof) {
+                    parse_top_item();
+                }
+                expect(RBrace);
+                return;
+            }
+            expect(Semi);
+            NODES[n].end = prev_end();
+            mark_public(n, public);
+            list_push(n);
+        } else if at(Hash) {
+            let item = parse_attributed_item(public);
+            list_push(item);
+        } else {
+            let item = parse_item();
+            mark_public(item, public);
+            list_push(item);
+        }
+    }
+}
+
+pub const ITEM_PUBLIC: i64 = 1;
+
+fn mark_public(item: i64, public: bool) {
+    if public {
+        unsafe { NODES[item].p |= ITEM_PUBLIC; }
+    }
+}
+
+fn parse_item() -> i64 {
+    match cur() {
+        Fn | Unsafe => parse_function(),
+        Struct | Union => parse_struct(),
+        Const => parse_const_or_static(NodeKind::Const),
+        Static => parse_const_or_static(NodeKind::Static),
+        Type => parse_type_alias(),
+        Enum => parse_enum(),
+        Reserved => reserved_error(),
+        _ => unsafe { syntax_error(c"expected an item ('fn', 'extern', 'struct', 'union', 'enum', 'impl', 'const', 'static' or 'type')") },
+    }
+}
+
+// `impl T { fn ... }`, `impl<T> Vec<T> { ... }` or `impl Vec<i64> { ... }`:
+// each function is pushed as an item, marked with the type's name (d) and
+// the type (h); the impl's type parameters come first in its own (g).
+fn parse_impl(public: bool) {
+    unsafe {
+        let impl_start = cur_start();
+        expect(Impl);
+        let params = parse_generic_params();
+        let mut self_type = parse_type();
+        // `impl Trait for Type` (0.9): any type.
+        let mut trait_name = 0;
+        if eat(For) {
+            trait_name = self_type;
+            if NODES[trait_name].kind != NodeKind::TyName {
+                error_at(NODES[trait_name].start, c"expected a trait's name before 'for'");
+            }
+            self_type = parse_type();
+        } else if NODES[self_type].kind != NodeKind::TyName {
+            error_at(NODES[self_type].start, c"impl blocks are for named types (structs and enums)");
+        }
+        let fns = SCRATCH.count;
+        expect(LBrace);
+        while !at(RBrace) && !at(Eof) {
+            let attrs_start = cur_start();
+            let flags = parse_fn_attributes();
+            let item_public = eat(Pub) || public;
+            if !at(Fn) && !(at(Unsafe) && tok_kind(1) == Fn) {
+                if flags != 0 {
+                    error_at(attrs_start, c"#[inline] and #[cold] go before a function");
+                }
+                syntax_error(c"expected 'fn' or '}' in an impl block");
+            }
+            let f = parse_function();
+            NODES[f].p |= flags;
+            NODES[f].d = if NODES[self_type].kind == NodeKind::TyName { NODES[self_type].a } else { UNDERSCORE };
+            NODES[f].h = self_type;
+            if params != 0 {
+                NODES[f].g = merge_generics(params, NODES[f].g);
+            }
+            // (a trait's methods are as visible as the trait)
+            mark_public(f, item_public || trait_name != 0);
+            list_push(f);
+        }
+        expect(RBrace);
+        if trait_name != 0 {
+            let n = new_node(NodeKind::Impl, impl_start, prev_end());
+            NODES[n].a = trait_name;
+            NODES[n].b = self_type;
+            NODES[n].g = params;
+            let end = SCRATCH.count;
+            let mark = list_begin();
+            for i in fns..end {
+                list_push(SCRATCH.data[i]);
+            }
+            list_end(n, mark);
+            list_push(n);
+        }
+    }
+}
+
+// `trait Name { fn m(self: *Self) -> T; fn d(self: *Self) { ... } }` (0.9).
+fn parse_trait() -> i64 {
+    unsafe {
+        let start = cur_start();
+        expect(Trait);
+        let n = new_node(NodeKind::Trait, start, 0);
+        NODES[n].a = expect_binding_name();
+        if at(Lt) {
+            error_at(cur_start(), c"traits cannot have type parameters (yet)");
+        }
+        expect(LBrace);
+        let mark = list_begin();
+        while !at(RBrace) && !at(Eof) {
+            let attrs_start = cur_start();
+            let flags = parse_fn_attributes();
+            if at(Pub) {
+                error_at(cur_start(), c"the functions of a trait are as visible as the trait: no 'pub'");
+            }
+            if !at(Fn) && !(at(Unsafe) && tok_kind(1) == Fn) {
+                if flags != 0 {
+                    error_at(attrs_start, c"#[inline] and #[cold] go before a function");
+                }
+                syntax_error(c"expected 'fn' or '}' in a trait");
+            }
+            let fstart = cur_start();
+            let is_unsafe = eat(Unsafe);
+            expect(Fn);
+            let f = new_node(NodeKind::Fn, fstart, 0);
+            NODES[f].p |= flags;
+            if is_unsafe {
+                NODES[f].p |= FN_UNSAFE;
+            }
+            NODES[f].a = expect_binding_name();
+            NODES[f].g = parse_generic_params();
+            expect(LParen);
+            parse_params(f, false);
+            expect(RParen);
+            NODES[f].b = parse_return_type();
+            if !eat(Semi) {
+                NODES[f].c = parse_fn_body(f);
+            }
+            NODES[f].end = prev_end();
+            list_push(f);
+        }
+        list_end(n, mark);
+        expect(RBrace);
+        NODES[n].end = prev_end();
+        n
+    }
+}
+
+// The parameters of an impl block followed by those of one of its
+// functions (`a` counts the impl's).
+fn merge_generics(outer: i64, own: i64) -> i64 {
+    unsafe {
+        let n = new_node(NodeKind::Generics, NODES[outer].start, NODES[outer].end);
+        let mark = list_begin();
+        for i in 0..NODES[outer].count {
+            list_push(child(outer, i));
+        }
+        if own != 0 {
+            for i in 0..NODES[own].count {
+                list_push(child(own, i));
+            }
+        }
+        list_end(n, mark);
+        NODES[n].a = NODES[outer].count;
+        n
+    }
+}
+
+// `<T, U>` after the name of a generic item (0.5); 0 when there is none.
+fn parse_generic_params() -> i64 {
+    unsafe {
+        if !at(Lt) {
+            return 0;
+        }
+        let n = new_node(NodeKind::Generics, cur_start(), 0);
+        advance();
+        let mark = list_begin();
+        while !at(Gt) && !at(Eof) {
+            let param = new_node(NodeKind::TyName, cur_start(), 0);
+            NODES[param].a = expect_binding_name();
+            NODES[param].end = prev_end();
+            if eat(Colon) {
+                // Bounds (0.9): `T: Hash + Eq`, a Generics node of trait names.
+                let bounds = new_node(NodeKind::Generics, cur_start(), 0);
+                let bmark = list_begin();
+                loop {
+                    list_push(parse_type());
+                    if !eat(Plus) {
+                        break;
+                    }
+                }
+                list_end(bounds, bmark);
+                NODES[bounds].end = prev_end();
+                NODES[param].h = bounds;
+            }
+            for i in mark..SCRATCH.count {
+                if NODES[SCRATCH.data[i]].a == NODES[param].a {
+                    name_error(NODES[param].start, c"duplicate type parameter '", NODES[param].a, c"'");
+                }
+            }
+            list_push(param);
+            if !eat(Comma) {
+                break;
+            }
+        }
+        list_end(n, mark);
+        if NODES[n].count == 0 {
+            error_at(NODES[n].start, c"expected a type parameter");
+        }
+        expect(Gt);
+        NODES[n].end = prev_end();
+        n
+    }
+}
+
+// `enum E { A, B(T, ...), C = expr, ... }`
+fn parse_enum() -> i64 {
+    unsafe {
+        let start = cur_start();
+        expect(Enum);
+        let n = new_node(NodeKind::Enum, start, 0);
+        NODES[n].a = expect_binding_name();
+        NODES[n].g = parse_generic_params();
+        expect(LBrace);
+        let mark = list_begin();
+        while !at(RBrace) && !at(Eof) {
+            let variant = new_node(NodeKind::Variant, cur_start(), 0);
+            NODES[variant].a = expect_binding_name();
+            if at(LBrace) {
+                error_at(cur_start(), c"struct-like enum variants are not supported yet; use a tuple variant");
+            }
+            if eat(LParen) {
+                NODES[variant].c = 1;
+                let types = list_begin();
+                while !at(RParen) && !at(Eof) {
+                    list_push(parse_type());
+                    if !eat(Comma) {
+                        break;
+                    }
+                }
+                list_end(variant, types);
+                expect(RParen);
+            }
+            if eat(Eq) {
+                NODES[variant].b = parse_expr();
+            }
+            NODES[variant].end = prev_end();
+            list_push(variant);
+            if !eat(Comma) {
+                break;
+            }
+        }
+        list_end(n, mark);
+        expect(RBrace);
+        NODES[n].end = prev_end();
+        n
+    }
+}
+
+pub fn parse_function() -> i64 {
+    unsafe {
+        let start = cur_start();
+        // `unsafe fn` (0.9).
+        let is_unsafe = eat(Unsafe);
+        expect(Fn);
+        let n = new_node(NodeKind::Fn, start, 0);
+        if is_unsafe {
+            NODES[n].p |= FN_UNSAFE;
+        }
+        NODES[n].a = expect_binding_name();
+        NODES[n].g = parse_generic_params();
+        expect(LParen);
+        parse_params(n, false);
+        expect(RParen);
+        NODES[n].b = parse_return_type();
+        NODES[n].c = parse_fn_body(n);
+        NODES[n].end = prev_end();
+        n
+    }
+}
+
+// The body of function n; one with a syntax error is marked so (the
+// checker leaves it out).
+fn parse_fn_body(n: i64) -> i64 {
+    unsafe {
+        let saved = BODY_FAILED;
+        BODY_FAILED = false;
+        let body = parse_block();
+        if BODY_FAILED {
+            NODES[n].p |= FN_BODY_FAILED;
+        }
+        BODY_FAILED = saved;
+        body
+    }
+}
+
+// `use a::b::c;`, `use a::b::{c, d as e};`, `use a::b as x;` (0.5; 0.4
+// had `use E::{A, B};` for the variants of an enum). `use a::b::*;` and
+// `use E::*;` are parsed for --fix-imports, and are an error otherwise
+// (0.8). c = a Path node whose list is the segments before the braces (or
+// the star), b = 1 for `*`, list = the imported names (Ident nodes: a =
+// the name, b = its new name, 0 for none).
+fn parse_use(public: bool) {
+    unsafe {
+        let start = cur_start();
+        expect(Use);
+        let n = new_node(NodeKind::Use, start, 0);
+        let path = new_node(NodeKind::Path, cur_start(), 0);
+        let segments = list_begin();
+        let mark = list_begin();
+        let mut last = 0;
+        loop {
+            let seg = new_node(NodeKind::Ident, cur_start(), 0);
+            NODES[seg].a = expect_ident();
+            NODES[seg].end = prev_end();
+            if !eat(ColonColon) {
+                last = seg;
+                break;
+            }
+            list_push(seg);
+            if at(Star) || at(LBrace) {
+                break;
+            }
+        }
+        list_end(path, segments);
+        NODES[path].end = prev_end();
+        NODES[n].c = path;
+        let items = list_begin();
+        if last != 0 {
+            if eat(As) {
+                NODES[last].b = expect_binding_name();
+            }
+            list_push(last);
+        } else if eat(Star) {
+            NODES[n].b = 1;
+        } else {
+            expect(LBrace);
+            while !at(RBrace) && !at(Eof) {
+                let item = new_node(NodeKind::Ident, cur_start(), 0);
+                NODES[item].a = expect_ident();
+                if eat(As) {
+                    NODES[item].b = expect_binding_name();
+                }
+                NODES[item].end = prev_end();
+                list_push(item);
+                if !eat(Comma) {
+                    break;
+                }
+            }
+            expect(RBrace);
+        }
+        list_end(n, items);
+        if NODES[path].count == 0 && NODES[n].b == 0 {
+            error_at(start, c"a use names an item through a path: 'use module::item;'");
+        }
+        expect(Semi);
+        NODES[n].end = prev_end();
+        mark_public(n, public);
+        let _ = mark;
+        list_push(n);
+    }
+}
+
+// `import "header.h" as c;`: the declarations of a C header become part
+// of the program (cimport.tach; the driver reads the imports before
+// parsing). They live in a module of their own, which the importing
+// module names `c`: `c::printf`. `import "header.h";`, which brought
+// them all into scope, is parsed for --fix-imports, and is an error
+// otherwise (0.8). A Use node with d = 2 and a = that name (0: none).
+fn parse_import(public: bool) {
+    unsafe {
+        let start = cur_start();
+        expect(Import);
+        if !at(Str) {
+            syntax_error(c"expected the name of a C header as a string");
+        }
+        advance();
+        let n = new_node(NodeKind::Use, start, 0);
+        NODES[n].d = 2;
+        if eat(As) {
+            NODES[n].a = expect_binding_name();
+        }
+        expect(Semi);
+        NODES[n].end = prev_end();
+        mark_public(n, public);
+        list_push(n);
+    }
+}
+
+// `#[inline]`, `#[inline(never)]` or `#[cold]` (0.6) after `#[` and the
+// name: its FN_ flag, or 0 when `name` is another attribute.
+fn parse_fn_attribute(name: i64, pos: i64) -> i64 {
+    unsafe {
+        if name == intern_c(c"cold") {
+            return FN_COLD;
+        }
+        if name != intern_c(c"inline") {
+            return 0;
+        }
+        if eat(LParen) {
+            let arg = expect_ident();
+            if arg != intern_c(c"never") {
+                name_error(pos, c"unknown inline option '", arg, c"' (expected #[inline] or #[inline(never)])");
+            }
+            expect(RParen);
+            return FN_NO_INLINE;
+        }
+        FN_INLINE
+    }
+}
+
+// The function attributes before a function in an impl block (0.6).
+fn parse_fn_attributes() -> i64 {
+    let mut flags = 0;
+    let start = cur_start();
+    while at(Hash) {
+        let pos = cur_start();
+        advance();
+        expect(LBracket);
+        let name = expect_ident();
+        let flag = parse_fn_attribute(name, pos);
+        if flag == 0 {
+            unsafe {
+                name_error(pos, c"unknown attribute '", name, c"' before a function (expected inline, inline(never) or cold)");
+            }
+        }
+        flags |= flag;
+        expect(RBracket);
+    }
+    check_fn_attributes(flags, start);
+    flags
+}
+
+fn check_fn_attributes(flags: i64, pos: i64) {
+    if (flags & FN_INLINE) != 0 && (flags & FN_NO_INLINE) != 0 {
+        unsafe { error_at(pos, c"a function cannot be both #[inline] and #[inline(never)]"); }
+    }
+}
+
+// Attributes, then the item: `#[repr(...)]` before a struct, union or
+// enum; `#[inline]`, `#[inline(never)]`, `#[cold]` (0.6) before a function.
+// `pub` may come before the attributes or (0.6) after them.
+fn parse_attributed_item(public: bool) -> i64 {
+    unsafe {
+        let mut flags = 0;
+        let mut fn_flags = 0;
+        let mut repr = false;
+        let mut align = 0;
+        let mut pack = 0;
+        let mut int_type = 0;
+        let at_start = cur_start();
+        while at(Hash) {
+            let attr_pos = cur_start();
+            advance();
+            expect(LBracket);
+            let name = expect_ident();
+            let fn_flag = parse_fn_attribute(name, attr_pos);
+            if fn_flag != 0 {
+                fn_flags |= fn_flag;
+                expect(RBracket);
+                continue;
+            }
+            if name != intern_c(c"repr") {
+                name_error(TOKS[P - 1].start, c"unknown attribute '", name, c"' (expected repr, inline, inline(never) or cold)");
+            }
+            repr = true;
+            expect(LParen);
+            while !at(RParen) && !at(Eof) {
+                let pos = cur_start();
+                let arg = expect_ident();
+                if arg == intern_c(c"C") {
+                    flags |= REPR_C;
+                } else if arg == intern_c(c"packed") {
+                    flags |= REPR_PACKED;
+                    pack = 1;
+                    if eat(LParen) {
+                        // packed(N): fields aligned to at most N (0.4; GCC's
+                        // #pragma pack(N)).
+                        if !at(Int) {
+                            syntax_error(c"expected the packing");
+                        }
+                        pack = TOKS[P].value as i64;
+                        advance();
+                        expect(RParen);
+                        if pack < 1 || pack > 16 || (pack & (pack - 1)) != 0 {
+                            error_at(pos, c"packed(N) needs a power of two from 1 to 16");
+                        }
+                    }
+                } else if arg == intern_c(c"align") {
+                    expect(LParen);
+                    if !at(Int) {
+                        syntax_error(c"expected the alignment");
+                    }
+                    align = TOKS[P].value as i64;
+                    advance();
+                    expect(RParen);
+                    if align < 1 || align > 4096 || (align & (align - 1)) != 0 {
+                        error_at(pos, c"align(N) needs a power of two from 1 to 4096");
+                    }
+                } else if is_int_type_name(arg) {
+                    flags |= REPR_INT;
+                    int_type = arg;
+                } else {
+                    name_error(pos, c"unknown repr '", arg, c"' (expected C, packed, align(N) or an integer type)");
+                }
+                if !eat(Comma) {
+                    break;
+                }
+            }
+            expect(RParen);
+            expect(RBracket);
+        }
+        let item_public = eat(Pub) || public;
+        if fn_flags != 0 {
+            if repr {
+                error_at(at_start, c"#[repr(...)] and function attributes cannot be combined");
+            }
+            if !at(Fn) && !(at(Unsafe) && tok_kind(1) == Fn) {
+                error_at(at_start, c"#[inline] and #[cold] go before a function");
+            }
+            check_fn_attributes(fn_flags, at_start);
+            let f = parse_function();
+            NODES[f].p |= fn_flags;
+            mark_public(f, item_public);
+            return f;
+        }
+        if !at(Struct) && !at(Union) && !at(Enum) {
+            error_at(at_start, c"#[repr(...)] goes before a struct, union or enum");
+        }
+        if ((flags & REPR_PACKED) != 0 || align != 0) && (flags & REPR_C) == 0 {
+            error_at(at_start, c"packed and align(N) are only for #[repr(C, ...)] types");
+        }
+        if (flags & REPR_PACKED) != 0 && align != 0 {
+            error_at(at_start, c"a type cannot be both packed and aligned");
+        }
+        let item = parse_item();
+        if NODES[item].kind == NodeKind::Enum {
+            if (flags & REPR_PACKED) != 0 || align != 0 {
+                error_at(at_start, c"packed and align(N) are for structs and unions, not enums");
+            }
+            NODES[item].d = int_type;
+        } else {
+            if (flags & REPR_INT) != 0 {
+                error_at(at_start, c"an integer repr is for enums only");
+            }
+            // For packed types, `d` is the packing (1 for plain packed).
+            NODES[item].d = if pack != 0 { pack } else { align };
+        }
+        NODES[item].c = NODES[item].c | flags;
+        mark_public(item, item_public);
+        item
+    }
+}
+
+// The parameters of `n` up to `)`; whether they end with `...`.
+pub fn parse_params(n: i64, allow_ellipsis: bool) -> bool {
+    let mark = list_begin();
+    let mut variadic = false;
+    while !at(RParen) && !at(Eof) {
+        if at(Ellipsis) {
+            if !allow_ellipsis {
+                unsafe { error_at(cur_start(), c"only extern functions can be variadic"); }
+            }
+            advance();
+            variadic = true;
+            eat(Comma);
+            break;
+        }
+        list_push(parse_param());
+        if !eat(Comma) {
+            break;
+        }
+    }
+    list_end(n, mark);
+    variadic
+}
+
+fn parse_param() -> i64 {
+    unsafe {
+        let start = cur_start();
+        let mutable = eat(Mut);
+        let n = new_node(NodeKind::Param, start, 0);
+        NODES[n].a = if mutable { expect_binding_name() } else { expect_ident() };
+        expect(Colon);
+        NODES[n].b = parse_type();
+        NODES[n].c = mutable as i64;
+        NODES[n].end = prev_end();
+        n
+    }
+}
+
+pub fn parse_return_type() -> i64 {
+    if eat(Arrow) { parse_type() } else { 0 }
+}
+
+fn parse_struct() -> i64 {
+    unsafe {
+        let start = cur_start();
+        let is_union = at(Union);
+        advance();
+        let n = new_node(NodeKind::Struct, start, 0);
+        if is_union {
+            NODES[n].c = REPR_UNION;
+        }
+        NODES[n].a = expect_binding_name();
+        NODES[n].g = parse_generic_params();
+        expect(LBrace);
+        let mark = list_begin();
+        while !at(RBrace) && !at(Eof) {
+            let field_start = cur_start();
+            // `pub` (0.5) is allowed: a field is visible wherever its struct is.
+            eat(Pub);
+            let field = new_node(NodeKind::Field, field_start, 0);
+            NODES[field].a = expect_binding_name();
+            expect(Colon);
+            NODES[field].b = parse_type();
+            NODES[field].end = prev_end();
+            list_push(field);
+            if !eat(Comma) {
+                break;
+            }
+        }
+        list_end(n, mark);
+        expect(RBrace);
+        NODES[n].end = prev_end();
+        n
+    }
+}
+
+fn parse_const_or_static(kind: NodeKind) -> i64 {
+    unsafe {
+        let start = cur_start();
+        advance();
+        let n = new_node(kind, start, 0);
+        if kind == NodeKind::Static {
+            NODES[n].d = eat(Mut) as i64;
+        }
+        NODES[n].a = expect_binding_name();
+        expect(Colon);
+        NODES[n].b = parse_type();
+        expect(Eq);
+        NODES[n].c = parse_expr();
+        expect(Semi);
+        NODES[n].end = prev_end();
+        n
+    }
+}
+
+fn parse_type_alias() -> i64 {
+    unsafe {
+        let start = cur_start();
+        expect(Type);
+        let n = new_node(NodeKind::TypeAlias, start, 0);
+        NODES[n].a = expect_binding_name();
+        // `type Pair<T> = (T, T);` (0.6): generic, its parameters in `g`.
+        NODES[n].g = parse_generic_params();
+        expect(Eq);
+        NODES[n].b = parse_type();
+        expect(Semi);
+        NODES[n].end = prev_end();
+        n
+    }
+}

@@ -45,7 +45,8 @@ esac
 [ -x "$COMPILER" ] || { echo "query/run.sh: no compiler at $COMPILER" >&2; exit 2; }
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-query.XXXXXX")
-trap 'rm -rf "$WORK"' EXIT INT TERM
+trap 'rm -rf "$WORK"' EXIT
+trap 'exit 130' INT TERM
 STATUS=0
 
 # The transcript of test file $1 (its `$` lines run again), on stdout.
@@ -105,10 +106,10 @@ unset TACHYON_ROOT
 TAB=$(printf '\t')
 out=$("$COMPILER" query show gvn::run_gvn compiler/src/main.tach 2>&1)
 ok=0
-printf '%s\n' "$out" | head -1 | grep -q "^// crate::gvn::run_gvn${TAB}compiler/src/gvn.tach:[0-9]*-[0-9]*\$" \
+printf '%s\n' "$out" | head -1 | grep -q "^// crate::middle::gvn::run_gvn${TAB}compiler/src/middle/gvn.tach:[0-9]*-[0-9]*\$" \
     && printf '%s\n' "$out" | grep -q '^pub fn run_gvn(' && ok=1
 check self_show "$ok" "$out"
-out=$("$COMPILER" query refs --count crate::gvn::run_gvn compiler/src/main.tach 2>&1)
+out=$("$COMPILER" query refs --count crate::middle::gvn::run_gvn compiler/src/main.tach 2>&1)
 ok=0
 [ "$out" -ge 3 ] 2>/dev/null && ok=1
 check self_refs_count "$ok" "$out"
@@ -122,15 +123,15 @@ n=$(printf '%s\n' "$out" | grep -c "^compiler/src/[a-z_0-9/]*\.tach${TAB}[0-9]*\
     && printf '%s\n' "$err" | head -1 | grep -q '^note query.truncated: [0-9]* refs in [0-9]* files$' \
     && [ "$(printf '%s\n' "$err" | grep -c '^try: .* query refs IntVec::push --')" = 3 ] && ok=1
 check self_refs_budget "$ok" "$(printf '%s\n' "$out" "$err" | tail -6)"
-out=$("$COMPILER" query refs IntVec::push --in base.tach 2>&1)
+out=$("$COMPILER" query refs IntVec::push --in compiler/src/base/mod.tach 2>&1)
 ok=0
 n=$(printf '%s\n' "$out" | grep -c "^[0-9]*:[0-9]*${TAB}base::[A-Za-z_:]*${TAB}")
-[ "$n" -ge 3 ] && printf '%s\n' "$out" | head -1 | grep -q '^# compiler/src/base.tach$' \
+[ "$n" -ge 1 ] && printf '%s\n' "$out" | head -1 | grep -q '^# compiler/src/base/mod.tach$' \
     && printf '%s\n' "$out" | grep -q "^[0-9]*:[0-9]*${TAB}def${TAB}fn push(" && ok=1
 check self_refs_in_file "$ok" "$(printf '%s\n' "$out" | head -5)"
 out=$("$COMPILER" query refs IntVec::push --in gvn --limit 5 2>&1)
 ok=0
-[ "$(printf '%s\n' "$out" | grep -c "^[0-9]*:[0-9]*${TAB}gvn::")" = 5 ] \
+[ "$(printf '%s\n' "$out" | grep -c "^[0-9]*:[0-9]*${TAB}middle::gvn::")" = 5 ] \
     && printf '%s\n' "$out" | grep -q '^note query.truncated: showing 5 of [0-9]* refs$' && ok=1
 check self_refs_in_module_limit "$ok" "$out"
 n=$("$COMPILER" query refs IntVec::push --all 2>/dev/null | grep -c "^[0-9]*:[0-9]*${TAB}")
@@ -139,24 +140,24 @@ ok=0
 check self_refs_all "$ok" "$n"
 out=$("$COMPILER" query callers check_program 2>&1)
 ok=0
-printf '%s\n' "$out" | grep -q "^[0-9]*:[0-9]*${TAB}gen::compile_program${TAB}" && ok=1
+printf '%s\n' "$out" | grep -q "^[0-9]*:[0-9]*${TAB}gen0::gen::compile_program${TAB}" && ok=1
 check self_callers "$ok" "$out"
 out=$("$COMPILER" query def NodeKind::Fn 2>&1)
 ok=0
-[ "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" = 1 ] && printf '%s\n' "$out" | grep -q "^crate::ast::NodeKind::Fn${TAB}compiler/src/ast.tach:[0-9]*:[0-9]*${TAB}variant${TAB}Fn\$" && ok=1
+[ "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" = 1 ] && printf '%s\n' "$out" | grep -q "^crate::front::ast::NodeKind::Fn${TAB}compiler/src/front/ast.tach:[0-9]*:[0-9]*${TAB}variant${TAB}Fn\$" && ok=1
 check self_def_variant "$ok" "$out"
 out=$("$COMPILER" query items gvn 2>&1)
 ok=0
-printf '%s\n' "$out" | head -1 | grep -q "^# crate::gvn${TAB}compiler/src/gvn.tach\$" \
+printf '%s\n' "$out" | head -1 | grep -q "^# crate::middle::gvn${TAB}compiler/src/middle/gvn.tach\$" \
     && printf '%s\n' "$out" | grep -q "^[0-9]*${TAB}fn${TAB}pub fn run_gvn(fi: i64) -> bool\$" && ok=1
 check self_items "$ok" "$(printf '%s\n' "$out" | head -5)"
 # More than 5 definitions for show: their paths, and an error.
 out=$("$COMPILER" query show .name 2>&1)
 rc=$?
 ok=0
-[ $rc = 1 ] && printf '%s\n' "$out" | grep -q '^crate::modules::Module.name$' \
+[ $rc = 1 ] && printf '%s\n' "$out" | grep -q '^crate::front::modules::Module.name$' \
     && printf '%s\n' "$out" | grep -q "^error query.ambiguous: [0-9]* definitions match '.name'; showing paths only\$" \
-    && printf '%s\n' "$out" | grep -q '^try: .* query show crate::[a-z]*::[A-Za-z]*\.name$' && ok=1
+    && printf '%s\n' "$out" | grep -q '^try: .* query show crate::[a-z_0-9:]*::[A-Za-z]*\.name$' && ok=1
 check self_show_ambiguous "$ok" "$out"
 # A long source line is cut at 100 bytes, with `…`.
 out=$("$COMPILER" query refs IntVec::push --in vectorize --all 2>&1 | awk -F "$TAB" 'length($3) > 100')

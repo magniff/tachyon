@@ -178,7 +178,7 @@ back), or with --dry-run, the diff; then the total line. The script's
 options (--dry-run, --no-check, --root, --target) are the script's; a
 line may not give `--root` or `--target`.
 
-The commands come from one table, `compiler/src/commands.tach`:
+The commands come from one table, `compiler/src/tools/commands.tach`:
 `run_tool` (the commands a script may run: `edit`, `fix`, `rewrite`,
 `refactor`) and `run_refactor` (a `refactor` subcommand, one row each). A
 command added there works from the command line and in scripts, as long

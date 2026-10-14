@@ -1,0 +1,791 @@
+// Writing the imported declarations as tachyon: names for C's types,
+// `#[repr(C)]` structs and unions with explicit padding, type aliases,
+// constants for enumerators and macros, and the `extern "C"` block of
+// functions and variables, with link names and aliases.
+
+use crate::base::{
+    IntVec, SYMS, alloc_zeroed, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, buf_uint,
+    intern, intern_c, streq, strlen, strtod,
+};
+use crate::front::cimport::{
+    CENUMERATORS, CENUMERATOR_COUNT, CENUMS, CENUM_COUNT, CFUNCS, CFUNC_COUNT, CRECS, CREC_COUNT,
+    CTYPEDEFS, CTYPEDEF_COUNT, CTYPES, CVARS, CVAR_COUNT, D_N, D_POS, D_TOKS, ENUMERATOR_OF,
+    FUNC_OF, VAR_OF, cfield, cty_integer, cty_resolve, cty_signed, skip_reason,
+};
+use crate::front::cimport::CT::{Array, Bad, Bool, Enum, Float, Func, Int, Named, Ptr, Record, Void};
+use crate::front::cpp::{
+    CINTS, CK, CTOKS, MACROS, MACRO_COUNT, S_LPAREN, S_RPAREN, ctok_copy, ctok_is, ctok_text,
+    macro_of, macro_tok, snprintf, strtof,
+};
+use crate::front::cpp::eval::{EV_FAIL, ev_convert, eval_tokens};
+use crate::front::cpp::expand::expand_list;
+use crate::front::lexer::{Tok, keyword_of_sym};
+use crate::front::types::align_to;
+use crate::middle::lower::ssa::HMap;
+use crate::front::cimport::layout::{c_align, c_size, c_value_problem, crec_layout};
+use crate::front::cimport::decls::enumerator_type;
+use crate::front::cimport::specifiers::{C_LONG_DOUBLE_64, typedef_of};
+
+// ---- Writing tachyon ----
+
+static mut OUTB: i64 = 0;
+// Tachyon names taken: types, values (symbol + 1 -> 1).
+static mut USED_TYPE: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+static mut USED_VALUE: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+fn out(s: *u8) {
+    buf_str(OUTB, s);
+}
+
+fn out_int(v: i64) {
+    buf_int(OUTB, v);
+}
+
+// A C identifier as a tachyon name: keywords as raw identifiers.
+fn out_name(sym: i64) {
+    unsafe {
+        let k = keyword_of_sym(sym);
+        if k != Tok::Eof || sym == intern_c(c"self") || sym == intern_c(c"Self") || sym == intern_c(c"_") {
+            out(c"r#");
+        }
+        buf_bytes(OUTB, SYMS[sym].text);
+    }
+}
+
+fn is_primitive_name(sym: i64) -> bool {
+    let names: [*u8; 14] = [c"i8", c"i16", c"i32", c"i64", c"u8", c"u16", c"u32", c"u64",
+        c"f32", c"f64", c"bool", c"isize", c"usize", c"Self"];
+    for i in 0..14 {
+        if unsafe { sym == intern_c(names[i]) } {
+            return true;
+        }
+    }
+    false
+}
+
+// Claims a type name; false when taken.
+fn claim_type(sym: i64) -> bool {
+    if USED_TYPE.get(sym + 1) != 0 || is_primitive_name(sym) {
+        return false;
+    }
+    USED_TYPE.put(sym + 1, 1);
+    true
+}
+
+fn prefixed(prefix: *u8, sym: i64) -> i64 {
+    let b = buf_new();
+    buf_str(b, prefix);
+    unsafe { buf_bytes(b, SYMS[sym].text); }
+    intern(buf_slice(b))
+}
+
+// The tachyon spelling of C type t (a value's type; void is not one).
+fn out_type(t: i64) {
+    unsafe {
+        let k = CTYPES[t].kind;
+        match k {
+            Int => {
+                out(if CTYPES[t].b != 0 { c"i" } else { c"u" });
+                out_int(CTYPES[t].a);
+            }
+            Bool => out(c"bool"),
+            Float => out(if CTYPES[t].a == 32 { c"f32" } else { c"f64" }),
+            Void => out(c"u8"),
+            Ptr => {
+                let p = cty_resolve(CTYPES[t].a);
+                let pk = CTYPES[p].kind;
+                if pk == Func {
+                    if CTYPES[p].d != 0 || c_fn_problem(p) >= 0 {
+                        out(c"*u8");
+                    } else {
+                        out_fn_type(p);
+                    }
+                } else if pk == Void || pk == Bad {
+                    out(c"*u8");
+                } else {
+                    out(c"*");
+                    out_type(CTYPES[t].a);
+                }
+            }
+            Array => {
+                out(c"[");
+                out_type(CTYPES[t].a);
+                out(c"; ");
+                out_int(if CTYPES[t].b < 0 { 0 } else { CTYPES[t].b });
+                out(c"]");
+            }
+            Record => out_name(CRECS[CTYPES[t].a].name),
+            Enum => {
+                let e = CTYPES[t].a;
+                if CENUMS[e].name >= 0 {
+                    out_name(CENUMS[e].name);
+                } else {
+                    out_type(CENUMS[e].underlying);
+                }
+            }
+            Named => {
+                let td = CTYPES[t].a;
+                if CTYPEDEFS[td].tname >= 0 {
+                    out_name(CTYPEDEFS[td].tname);
+                } else {
+                    out_type(CTYPEDEFS[td].ty);
+                }
+            }
+            Func => out_fn_type(t),
+            Bad => out(c"u8"),
+        }
+    }
+}
+
+fn out_fn_type(f: i64) {
+    unsafe {
+        out(c"extern \"C\" fn(");
+        for i in 0..CTYPES[f].c {
+            if i > 0 {
+                out(c", ");
+            }
+            out_type(CINTS.data[CTYPES[f].b + i]);
+        }
+        out(c")");
+        let ret = cty_resolve(CTYPES[f].a);
+        if CTYPES[ret].kind != Void {
+            out(c" -> ");
+            out_type(CTYPES[f].a);
+        }
+    }
+}
+
+// Why function type f cannot be imported, or -1.
+fn c_fn_problem(f: i64) -> i64 {
+    unsafe {
+        for i in 0..CTYPES[f].c {
+            let p = c_value_problem(CINTS.data[CTYPES[f].b + i]);
+            if p >= 0 {
+                return p;
+            }
+        }
+        let ret = cty_resolve(CTYPES[f].a);
+        if CTYPES[ret].kind == Void {
+            return -1;
+        }
+        if CTYPES[ret].kind == Array {
+            return intern_c(c"it returns an array");
+        }
+        c_value_problem(CTYPES[f].a)
+    }
+}
+
+// Names for the records, enums and typedefs (C's tag and ordinary
+// namespaces share tachyon's type namespace).
+fn assign_type_names() {
+    unsafe {
+        // Anonymous records and enums take the name of their first typedef.
+        for i in 0..CTYPEDEF_COUNT {
+            let t = CTYPEDEFS[i].ty;
+            if CTYPES[t].kind == Record {
+                let r = CTYPES[t].a;
+                // (Not a typedef that raises the alignment: GCC keeps the
+                // size, which no tachyon type can do.)
+                let raises = CTYPEDEFS[i].align_attr > 0 && CTYPEDEFS[i].align_attr > c_align(t);
+                if CRECS[r].tag < 0 && CRECS[r].name < 0 && CRECS[r].parent < 0 && !raises && claim_type(CTYPEDEFS[i].name) {
+                    CRECS[r].name = CTYPEDEFS[i].name;
+                    CTYPEDEFS[i].tname = -2;
+                }
+            } else if CTYPES[t].kind == Enum {
+                let e = CTYPES[t].a;
+                if CENUMS[e].tag < 0 && CENUMS[e].name < 0 && claim_type(CTYPEDEFS[i].name) {
+                    CENUMS[e].name = CTYPEDEFS[i].name;
+                    CTYPEDEFS[i].tname = -2;
+                }
+            }
+        }
+        // Typedefs other than `typedef struct x x;`.
+        for i in 0..CTYPEDEF_COUNT {
+            if CTYPEDEFS[i].tname == -2 {
+                continue;
+            }
+            let t = CTYPEDEFS[i].ty;
+            let name = CTYPEDEFS[i].name;
+            let r = cty_resolve(t);
+            if CTYPES[r].kind == Func || CTYPES[r].kind == Bad || CTYPES[r].kind == Void {
+                continue;
+            }
+            if CTYPES[t].kind == Record && CRECS[CTYPES[t].a].tag == name {
+                continue;
+            }
+            if CTYPES[t].kind == Enum && CENUMS[CTYPES[t].a].tag == name {
+                continue;
+            }
+            // A typedef that raises its type's alignment is another type,
+            // which a tachyon alias is not.
+            if CTYPEDEFS[i].align_attr > 0 && CTYPEDEFS[i].align_attr > c_align(t) {
+                skip_reason(name, intern_c(c"its typedef raises the alignment"));
+                continue;
+            }
+            if claim_type(name) {
+                CTYPEDEFS[i].tname = name;
+            }
+        }
+        for r in 0..CREC_COUNT {
+            if CRECS[r].name >= 0 {
+                continue;
+            }
+            if CRECS[r].tag >= 0 {
+                if claim_type(CRECS[r].tag) {
+                    CRECS[r].name = CRECS[r].tag;
+                } else {
+                    CRECS[r].name = prefixed(if CRECS[r].is_union != 0 { c"union_" } else { c"struct_" }, CRECS[r].tag);
+                    claim_type(CRECS[r].name);
+                }
+            }
+        }
+        // Anonymous records: after their parent, `<parent>_anon<k>`; others
+        // `anon_<k>`.
+        let mut k = 0;
+        for r in 0..CREC_COUNT {
+            if CRECS[r].name < 0 {
+                let b = buf_new();
+                if CRECS[r].parent >= 0 && CRECS[CRECS[r].parent].name >= 0 {
+                    buf_bytes(b, SYMS[CRECS[CRECS[r].parent].name].text);
+                    buf_str(b, c"_anon");
+                } else {
+                    buf_str(b, c"anon_");
+                }
+                buf_int(b, k);
+                k += 1;
+                CRECS[r].name = intern(buf_slice(b));
+                claim_type(CRECS[r].name);
+            }
+        }
+        for e in 0..CENUM_COUNT {
+            if CENUMS[e].name < 0 && CENUMS[e].tag >= 0 {
+                if claim_type(CENUMS[e].tag) {
+                    CENUMS[e].name = CENUMS[e].tag;
+                } else {
+                    CENUMS[e].name = prefixed(c"enum_", CENUMS[e].tag);
+                    claim_type(CENUMS[e].name);
+                }
+            }
+        }
+    }
+}
+
+// A member name not used by a field of r: `base<k>`.
+fn member_name(r: i64, base: *u8, k: i64) -> i64 {
+    let b = buf_new();
+    buf_str(b, base);
+    buf_int(b, k);
+    let mut sym = intern(buf_slice(b));
+    loop {
+        let mut clash = false;
+        unsafe {
+            for i in 0..CRECS[r].field_count {
+                if (*cfield(r, i)).name == sym {
+                    clash = true;
+                }
+            }
+        }
+        if !clash {
+            return sym;
+        }
+        buf_byte(b, '_');
+        sym = intern(buf_slice(b));
+    }
+}
+
+fn out_member(name: i64, size: i64) {
+    unsafe {
+        out(c"    ");
+        out_name(name);
+        out(c": [u8; ");
+        out_int(size);
+        out(c"],\n");
+    }
+}
+
+fn emit_record(r: i64) {
+    unsafe {
+        crec_layout(r);
+        // The C spelling, when there is one.
+        if CRECS[r].tag >= 0 && CRECS[r].tag != intern_c(c"__va_list_tag") && CRECS[r].tag != intern_c(c"__va_list") {
+            out(if CRECS[r].is_union != 0 { c"// C: union " } else { c"// C: struct " });
+            buf_bytes(OUTB, SYMS[CRECS[r].tag].text);
+            out(c"\n");
+        } else if CRECS[r].parent < 0 && CRECS[r].name >= 0 && typedef_of(CRECS[r].name) >= 0 {
+            out(c"// C: ");
+            buf_bytes(OUTB, SYMS[CRECS[r].name].text);
+            out(c"\n");
+        }
+        if CRECS[r].opaque >= 0 {
+            // Usable through pointers only.
+            out(c"// ");
+            buf_bytes(OUTB, SYMS[CRECS[r].name].text);
+            out(c": opaque, ");
+            buf_bytes(OUTB, SYMS[CRECS[r].opaque].text);
+            out(c"\nstruct ");
+            out_name(CRECS[r].name);
+            out(c" {}\n");
+            return;
+        }
+        out(c"#[repr(C");
+        if CRECS[r].emit_packed != 0 {
+            out(c", packed");
+            if CRECS[r].emit_packed > 1 {
+                out(c"(");
+                out_int(CRECS[r].emit_packed);
+                out(c")");
+            }
+        }
+        if CRECS[r].emit_align != 0 {
+            out(c", align(");
+            out_int(CRECS[r].emit_align);
+            out(c")");
+        }
+        out(c")]\n");
+        let is_union = CRECS[r].is_union != 0;
+        out(if is_union { c"union " } else { c"struct " });
+        out_name(CRECS[r].name);
+        out(c" {\n");
+        let mut at = 0;
+        let mut pads = 0;
+        let mut anons = 0;
+        let mut bitfields = 0;
+        let n = CRECS[r].field_count;
+        let mut i = 0;
+        while i < n {
+            let f = cfield(r, i);
+            if (*f).bits >= 0 {
+                if is_union {
+                    if (*f).bits > 0 {
+                        out_member(member_name(r, c"_bitfield", bitfields), ((*f).bits + 7) / 8);
+                        bitfields += 1;
+                    }
+                    i += 1;
+                    continue;
+                }
+                // A run of bit-fields: their bytes.
+                let first_bit = (*f).bit_offset;
+                let mut end_bit = first_bit;
+                while i < n && (*cfield(r, i)).bits >= 0 {
+                    let g = cfield(r, i);
+                    let e = (*g).bit_offset + (*g).bits;
+                    end_bit = if e > end_bit { e } else { end_bit };
+                    i += 1;
+                }
+                let lo = first_bit / 8;
+                let hi = (end_bit + 7) / 8;
+                if hi > lo {
+                    if lo > at {
+                        out_member(member_name(r, c"_pad", pads), lo - at);
+                        pads += 1;
+                    }
+                    let start = if lo > at { lo } else { at };
+                    out_member(member_name(r, c"_bitfield", bitfields), hi - start);
+                    bitfields += 1;
+                    at = hi;
+                }
+                continue;
+            }
+            // Padding only where tachyon's own placement would differ.
+            let mut ma = c_align((*f).ty);
+            if CRECS[r].emit_packed != 0 && ma > CRECS[r].emit_packed {
+                ma = CRECS[r].emit_packed;
+            }
+            if !is_union && (*f).offset > align_to(at, ma) {
+                out_member(member_name(r, c"_pad", pads), (*f).offset - at);
+                pads += 1;
+            }
+            out(c"    ");
+            if (*f).name >= 0 {
+                out_name((*f).name);
+            } else {
+                out_name(member_name(r, c"_anon", anons));
+                anons += 1;
+            }
+            out(c": ");
+            out_type((*f).ty);
+            out(c",\n");
+            if !is_union {
+                at = (*f).offset + c_size((*f).ty);
+            }
+            i += 1;
+        }
+        // Tail padding beyond what alignment gives.
+        let align = if CRECS[r].emit_packed != 0 { CRECS[r].emit_packed } else { CRECS[r].align };
+        if is_union {
+            let mut largest = 0;
+            for j in 0..n {
+                let f = cfield(r, j);
+                let s = if (*f).bits >= 0 { ((*f).bits + 7) / 8 } else { c_size((*f).ty) };
+                largest = if s > largest { s } else { largest };
+            }
+            if align_to(largest, align) < CRECS[r].size {
+                out_member(member_name(r, c"_pad", pads), CRECS[r].size);
+            }
+        } else if align_to(at, align) < CRECS[r].size {
+            out_member(member_name(r, c"_pad", pads), CRECS[r].size - at);
+        }
+        out(c"}\n");
+    }
+}
+
+// The tachyon type of an integer constant of C type t.
+fn out_const_type(t: i64) {
+    let r = cty_resolve(t);
+    if unsafe { CTYPES[t].kind == Named && CTYPEDEFS[CTYPES[t].a].tname >= 0 && CTYPES[r].kind == Int } {
+        out_type(t);
+        return;
+    }
+    out_type(cty_integer(t));
+}
+
+fn out_value(v: u64, t: i64) {
+    if cty_signed(t) {
+        out_int(v as i64);
+    } else {
+        buf_uint(OUTB, v);
+    }
+}
+
+fn claim_value(sym: i64) -> bool {
+    if USED_VALUE.get(sym + 1) != 0 {
+        return false;
+    }
+    USED_VALUE.put(sym + 1, 1);
+    true
+}
+
+// Writes the imported declarations as tachyon source to buffer `b`.
+pub fn cimport_emit(b: i64) {
+    unsafe {
+        OUTB = b;
+        assign_type_names();
+        for r in 0..CREC_COUNT {
+            emit_record(r);
+        }
+        for i in 0..CTYPEDEF_COUNT {
+            if CTYPEDEFS[i].tname >= 0 {
+                let problem = c_value_problem(CTYPEDEFS[i].ty);
+                let r = cty_resolve(CTYPEDEFS[i].ty);
+                if problem >= 0 && !(CTYPES[r].kind == Record) {
+                    skip_reason(CTYPEDEFS[i].name, problem);
+                    continue;
+                }
+                out(c"type ");
+                out_name(CTYPEDEFS[i].tname);
+                out(c" = ");
+                out_type(CTYPEDEFS[i].ty);
+                out(c";\n");
+            }
+        }
+        for e in 0..CENUM_COUNT {
+            if CENUMS[e].name >= 0 {
+                out(c"type ");
+                out_name(CENUMS[e].name);
+                out(c" = ");
+                out_type(CENUMS[e].underlying);
+                out(c";\n");
+            }
+        }
+        out(c"extern \"C\" {\n");
+        for i in 0..CFUNC_COUNT {
+            let f = cty_resolve(CFUNCS[i].ty);
+            let problem = c_fn_problem(f);
+            if problem >= 0 {
+                skip_reason(CFUNCS[i].name, problem);
+                continue;
+            }
+            if !claim_value(CFUNCS[i].name) {
+                continue;
+            }
+            EMITTED_VALUE.put(CFUNCS[i].name + 1, 1);
+            out_link_name(CFUNCS[i].link, CFUNCS[i].name);
+            out_function(i, CFUNCS[i].name);
+        }
+        for i in 0..CVAR_COUNT {
+            let problem = c_value_problem(CVARS[i].ty);
+            let r = cty_resolve(CVARS[i].ty);
+            if problem >= 0 || (CTYPES[r].kind == Array && CTYPES[r].b < 0) {
+                skip_reason(CVARS[i].name, if problem >= 0 { problem } else { intern_c(c"an array of unknown size") });
+                continue;
+            }
+            if !claim_value(CVARS[i].name) {
+                continue;
+            }
+            EMITTED_VALUE.put(CVARS[i].name + 1, 1);
+            out_link_name(CVARS[i].link, CVARS[i].name);
+            out(if CVARS[i].is_const != 0 { c"    static " } else { c"    static mut " });
+            out_name(CVARS[i].name);
+            out(c": ");
+            out_type(CVARS[i].ty);
+            out(c";\n");
+        }
+        out(c"}\n");
+        for i in 0..CENUMERATOR_COUNT {
+            let name = CENUMERATORS[i].name;
+            if ENUMERATOR_OF.get(name + 1) != i + 1 || !claim_value(name) {
+                continue;
+            }
+            let e = CENUMERATORS[i].ty;
+            out(c"const ");
+            out_name(name);
+            out(c": ");
+            let t = if CENUMS[e].name >= 0 { CENUMS[e].ty } else { enumerator_type(i) };
+            out_type(t);
+            out(c" = ");
+            out_value(CENUMERATORS[i].value as u64, t);
+            out(c";\n");
+        }
+        emit_macro_constants();
+        emit_aliases();
+    }
+}
+
+// The declaration of C function f under `name`.
+fn out_function(i: i64, name: i64) {
+    unsafe {
+        let f = cty_resolve(CFUNCS[i].ty);
+        out(c"    fn ");
+        out_name(name);
+        out(c"(");
+        for k in 0..CTYPES[f].c {
+            if k > 0 {
+                out(c", ");
+            }
+            out(c"p");
+            out_int(k);
+            out(c": ");
+            out_type(CINTS.data[CTYPES[f].b + k]);
+        }
+        if CTYPES[f].d != 0 {
+            out(if CTYPES[f].c > 0 { c", ..." } else { c"..." });
+        }
+        out(c")");
+        let ret = cty_resolve(CTYPES[f].a);
+        if CTYPES[ret].kind == Void {
+            if CFUNCS[i].noreturn != 0 {
+                out(c" -> !");
+            }
+        } else {
+            out(c" -> ");
+            out_type(CTYPES[f].a);
+        }
+        out(c";\n");
+    }
+}
+
+// `#[link_name]` when an asm label renames the symbol. Labels are
+// assembler names: on Mach-O, C's names have a leading underscore.
+fn out_link_name(link: i64, name: i64) {
+    unsafe {
+        if link < 0 {
+            return;
+        }
+        let text = SYMS[link].text;
+        let mut start = 0;
+        if !C_TARGET_ELF {
+            if text.len == 0 || text[0] != '_' {
+                return;
+            }
+            start = 1;
+        }
+        let sym = intern(text[start..text.len as i64]);
+        if sym == name {
+            return;
+        }
+        out(c"    #[link_name = \"");
+        buf_bytes(OUTB, SYMS[sym].text);
+        out(c"\"]\n");
+    }
+}
+
+pub static mut C_TARGET_ELF: bool = false;
+
+// Object-like macros that are integer or float constants, as constants.
+fn emit_macro_constants() {
+    unsafe {
+        for m in 0..MACRO_COUNT {
+            let name = MACROS[m].name;
+            if MACROS[m].builtin || MACROS[m].func || macro_of(name) != m || MACROS[m].body_count == 0 {
+                continue;
+            }
+            if USED_VALUE.get(name + 1) != 0 {
+                continue;
+            }
+            let at = macro_tok(m, 0);
+            let start = CINTS.count;
+            let tok = ctok_copy(at);
+            CTOKS[tok].kind = CK::Ident;
+            CTOKS[tok].text = name;
+            CINTS.push(tok);
+            let expanded = expand_list(start, 1);
+            if expanded.count == 0 {
+                continue;
+            }
+            if emit_float_constant(name, &expanded) {
+                continue;
+            }
+            if expanded.count == 1 && CTOKS[expanded.data[0]].kind == CK::Ident {
+                // `#define stdin __stdinp`: another name for a variable or a
+                // function, declared again under it.
+                ALIASES.push(name);
+                ALIASES.push(CTOKS[expanded.data[0]].text);
+                continue;
+            }
+            let saved = (D_TOKS, D_N, D_POS);
+            let (v, t) = eval_tokens(&expanded, at, true);
+            let (dt, dn, dp) = saved;
+            D_TOKS = dt;
+            D_N = dn;
+            D_POS = dp;
+            if EV_FAIL || cty_integer(t) == 0 {
+                continue;
+            }
+            claim_value(name);
+            out(c"const ");
+            out_name(name);
+            out(c": ");
+            out_const_type(t);
+            out(c" = ");
+            out_value(ev_convert(v, t), t);
+            out(c";\n");
+        }
+    }
+}
+
+// Macros naming a variable or a function: (macro, name) pairs.
+static mut ALIASES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The aliases as declarations of the same C symbols under the macros'
+// names (only of variables and functions that were imported).
+fn emit_aliases() {
+    unsafe {
+        out(c"extern \"C\" {\n");
+        let mut i = 0;
+        while i < ALIASES.count {
+            let name = ALIASES.data[i];
+            let target = ALIASES.data[i + 1];
+            i += 2;
+            if USED_VALUE.get(name + 1) != 0 {
+                continue;
+            }
+            let v = VAR_OF.get(target + 1) - 1;
+            let f = FUNC_OF.get(target + 1) - 1;
+            if v >= 0 && EMITTED_VALUE.get(target + 1) != 0 {
+                claim_value(name);
+                out_alias_link(CVARS[v].link, target);
+                out(if CVARS[v].is_const != 0 { c"    static " } else { c"    static mut " });
+                out_name(name);
+                out(c": ");
+                out_type(CVARS[v].ty);
+                out(c";\n");
+            } else if f >= 0 && EMITTED_VALUE.get(target + 1) != 0 {
+                claim_value(name);
+                out_alias_link(CFUNCS[f].link, target);
+                out_function(f, name);
+            }
+        }
+        out(c"}\n");
+    }
+}
+
+// The link name of an alias: the target's own, or its name.
+fn out_alias_link(link: i64, target: i64) {
+    if link >= 0 {
+        out_link_name(link, -1);
+        return;
+    }
+    unsafe {
+        out(c"    #[link_name = \"");
+        buf_bytes(OUTB, SYMS[target].text);
+        out(c"\"]\n");
+    }
+}
+
+// Values emitted as declarations (symbol + 1 -> 1).
+static mut EMITTED_VALUE: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+// `[(] [-] float-literal [)]`: a float constant.
+fn emit_float_constant(name: i64, toks: *IntVec) -> bool {
+    unsafe {
+        let mut lo = 0;
+        let mut hi = (*toks).count;
+        while hi - lo >= 2 && ctok_is((*toks).data[lo], S_LPAREN) && ctok_is((*toks).data[hi - 1], S_RPAREN) {
+            lo += 1;
+            hi -= 1;
+        }
+        let mut negative = false;
+        if hi - lo == 2 && CTOKS[(*toks).data[lo]].kind == CK::Punct && streq(ctok_text((*toks).data[lo]), c"-") {
+            negative = true;
+            lo += 1;
+        }
+        if hi - lo != 1 || CTOKS[(*toks).data[lo]].kind != CK::Num {
+            return false;
+        }
+        let text = ctok_text((*toks).data[lo]);
+        let n = strlen(text) as i64;
+        let hex = n > 1 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X');
+        let mut is_float = false;
+        for i in 0..n {
+            let c = text[i];
+            if c == '.' || (!hex && (c == 'e' || c == 'E')) || (hex && (c == 'p' || c == 'P')) {
+                is_float = true;
+            }
+        }
+        if !is_float {
+            return false;
+        }
+        let last = text[n - 1];
+        let mut end = 0 as *u8;
+        let mut is_f32 = false;
+        let mut value: f64 = 0.0;
+        if last == 'f' || last == 'F' {
+            is_f32 = true;
+            value = strtof(text, &end) as f64;
+        } else if last == 'l' || last == 'L' {
+            if !C_LONG_DOUBLE_64 {
+                return false;
+            }
+            value = strtod(text, &end);
+        } else {
+            value = strtod(text, &end);
+        }
+        if negative {
+            value = 0.0 - value;
+        }
+        if value != value || value - value != 0.0 {
+            return false;
+        }
+        if !claim_value(name) {
+            return true;
+        }
+        let digits = alloc_zeroed(64);
+        snprintf(digits, 64, c"%.17g", value);
+        let mut dot = false;
+        let mut exp = -1;
+        let dn = strlen(digits) as i64;
+        for i in 0..dn {
+            if digits[i] == '.' {
+                dot = true;
+            }
+            if digits[i] == 'e' {
+                exp = i;
+            }
+        }
+        out(c"const ");
+        out_name(name);
+        out(if is_f32 { c": f32 = " } else { c": f64 = " });
+        if dot {
+            out(digits);
+        } else if exp >= 0 {
+            buf_bytes(OUTB, digits[0..exp]);
+            out(c".0");
+            out(&digits[exp]);
+        } else {
+            out(digits);
+            out(c".0");
+        }
+        out(c";\n");
+        true
+    }
+}

@@ -1,0 +1,680 @@
+// `tachyonc query` (0.11): questions about a program, answered by the
+// front end (lexer, modules, parser, checker; no lowering, no code), for
+// agents that would otherwise read the source with grep and sed. See
+// docs/query.md for the commands and their output.
+//
+//   tachyonc query def NAME [ROOT] [--exact]       where NAME is defined
+//   tachyonc query show NAME [ROOT] [--exact]      its source text
+//   tachyonc query refs NAME [ROOT] [--count] [--exact] [--in FILE|MODULE]
+//                       [--limit N] [--all]        every resolved reference
+//   tachyonc query callers NAME [ROOT] [...]       the references that call it
+//   tachyonc query items [MODULE] [ROOT]           a module's items, or the
+//                                                  module tree
+//
+// Every definition has a fully qualified path (`crate::gvn::run_gvn`,
+// `std::Vec::push`, `crate::ir::Inst.op`, `<crate::geom::V2 as Add>::add`),
+// printed first and accepted back as NAME; a partial path matches every
+// path it ends (by whole segments).
+//
+// The definitions are taken from the parsed program before the checker
+// rewrites it; the references are what the checker resolved: recorded on
+// the nodes it checked (identifiers, calls, fields, literals, variants),
+// and, for what the nodes do not keep (types, imports, module paths), by
+// the hooks that call `qnote`. A generic function is checked per instance
+// (copies of its nodes, at the same positions): references are counted
+// once per position.
+//
+// The output is for agents: one fact per line, fields separated by a
+// TAB, refs grouped under `# FILE` and cut to a per-file summary past
+// REFS_BUDGET; problems on stderr as `<severity> <code>: <message>` with
+// `try: <command>` lines (see Diagnostics).
+//
+// This file holds the hooks the checker calls (`qnote`) and the command
+// line; the definitions are in defs, the problems and `try:` lines in
+// diagnostics, positions and lines in positions, `refs` in refs, `def`,
+// `show` and `items` in show.
+
+pub mod defs;
+pub mod diagnostics;
+pub mod positions;
+pub mod refs;
+pub mod show;
+
+use crate::base::{
+    FILES, FILE_COUNT, IntVec, SRC, STDOUT, SYMS, _setjmp, alloc_array, alloc_zeroed, buf_byte,
+    buf_bytes, buf_new, buf_str, buf_write_fd, intern_c, load_sources, streq, strlen,
+};
+use crate::base::diag::{ERR_BAIL, ERR_KIND, RECOVER_DEPTH, edit_distance};
+use crate::front::lexer::{init_lexer, lex_range};
+use crate::front::cpp::directives::file_exists;
+use crate::front::cimport::{IMPORTED_START, drop_shadowed_imports, import_c_headers};
+use crate::front::ast::{KEEP_PARSED, init_ast, keep_parsed};
+use crate::front::parser::parse_program;
+use crate::front::modules::load_modules;
+use crate::front::types::{init_declarations, init_types};
+use crate::front::check::check_program;
+use crate::base::target::{T_X86_64_LINUX, set_target};
+use crate::gen0::gen::MAIN_SYM;
+use crate::host_target;
+use crate::tools::plan::{query_impact, query_stats, query_unused};
+use crate::tools::plan::deps::query_deps;
+use crate::tools::query_text::{
+    WITH_COMMENTS, all_files, infer_root, run_text, show_files, show_region,
+};
+use crate::tools::edit::undo::run_query_diff;
+use defs::{collect_defs, find_defs, finish_defs};
+use diagnostics::{
+    CMD, OPT_EXACT, PROG, ROOT_GIVEN, diag, is_query_command, no_match, no_module, program_errors,
+    push_once, try_begin, try_end, try_query, write_diags,
+};
+use positions::{LINES, init_containers, init_positions, line_index, line_start, sort_by_position};
+use refs::{
+    OPT_ALL, OPT_COUNT, OPT_IN, OPT_LIMIT, file_text, put_bad_in, query_refs, resolve_in, try_refs,
+};
+use show::{find_modules, query_def, query_items, query_modules, query_show, text_start};
+
+use defs::{DEFS, DEF_COUNT, K_FIELD, K_VARIANT, MOD_DEF, bytes_eq, mod_fqn};
+
+extern "C" {
+    fn getenv(name: *u8) -> *u8;
+}
+
+// Set while a query runs: the hooks record what they resolve.
+pub static mut QUERY: bool = false;
+
+// Flags of a reference: a call, the definition itself, an import.
+pub const QF_CALL: i64 = 1;
+pub const QF_DEF: i64 = 2;
+pub const QF_USE: i64 = 4;
+
+// What the checker resolved that its nodes do not keep: (position the name
+// is looked for from, the name written there, the definition's node,
+// flags), in fours.
+static mut NOTES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The name `name` written at (or just after) `from` stands for the item
+// whose node is `def`.
+pub fn qnote(from: i64, name: i64, def: i64, flags: i64) {
+    if !QUERY || def <= 0 {
+        return;
+    }
+    NOTES.push(from);
+    NOTES.push(name);
+    NOTES.push(def);
+    NOTES.push(flags);
+}
+
+// ... for module m.
+pub fn qnote_module(from: i64, name: i64, m: i64, flags: i64) {
+    unsafe {
+        if !QUERY || m < 0 || m >= MOD_DEF.count || MOD_DEF.data[m] < 0 {
+            return;
+        }
+        qnote(from, name, DEFS[MOD_DEF.data[m]].node, flags);
+    }
+}
+
+// ---- The command line ----
+
+pub fn ends_with_c(s: *u8, suffix: *u8) -> bool {
+    unsafe {
+        let n = strlen(s) as i64;
+        let k = strlen(suffix) as i64;
+        n >= k && streq(&s[n - k], suffix)
+    }
+}
+
+// The program's root: ROOT, else $TACHYON_ROOT, ./main.tach or
+// ./compiler/src/main.tach; 0 when there is none.
+pub fn find_root(given: *u8) -> *u8 {
+    unsafe {
+        if given != 0 as *u8 {
+            return given;
+        }
+        let env = getenv(c"TACHYON_ROOT");
+        if env != 0 as *u8 && env[0] != 0 {
+            return env;
+        }
+        if file_exists(c"main.tach") {
+            return c"main.tach";
+        }
+        if file_exists(c"compiler/src/main.tach") {
+            return c"compiler/src/main.tach";
+        }
+        0 as *u8
+    }
+}
+
+// The root of a command's program (given, or found), or 0 after the
+// diagnostic saying why there is none (the command then exits with 2);
+// `cmd` and `name` make its `try:` line.
+pub fn root_or_diag(given: *u8, cmd: *u8, name: [u8], with_name: bool) -> *u8 {
+    unsafe {
+        let root = find_root(given);
+        if root == 0 as *u8 {
+            let out = diag(c"error", c"query.no-root");
+            buf_str(out, c"no root (TACHYON_ROOT, ./main.tach, ./compiler/src/main.tach)\n");
+            ROOT_GIVEN = c"path/to/main.tach";
+            try_end(try_begin(cmd, name, with_name));
+            return 0 as *u8;
+        }
+        if !file_exists(root) {
+            let out = diag(c"error", c"query.bad-root");
+            buf_str(out, c"cannot read '");
+            buf_str(out, root);
+            buf_str(out, c"'\n");
+            ROOT_GIVEN = 0 as *u8;
+            if find_root(0 as *u8) != 0 as *u8 {
+                try_end(try_begin(cmd, name, with_name));
+            }
+            return 0 as *u8;
+        }
+        root
+    }
+}
+
+// The front end, up to the checked program, for `target` (0: the host);
+// an error that would end the compilation jumps back to the caller's
+// ERR_BAIL.
+pub fn front_end(root: *u8, target0: i64) {
+    unsafe {
+        ERR_KIND = c"tokenizer error";
+        let paths = alloc_array::<*u8>(1);
+        paths[0] = root;
+        load_sources(paths, 1);
+        init_lexer();
+        lex_range(FILES[0].start, FILES[0].end, false);
+        ERR_KIND = c"module error";
+        load_modules();
+        ERR_KIND = c"tokenizer error";
+        let mut target = target0;
+        if target == 0 {
+            target = host_target();
+        }
+        if target == 0 {
+            target = T_X86_64_LINUX;
+        }
+        set_target(target);
+        let dirs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        import_c_headers(target, &dirs, false, c"");
+        lex_range(FILES[FILE_COUNT - 1].end, FILES[FILE_COUNT - 1].end, true);
+        init_ast();
+        ERR_KIND = c"parser error";
+        let program = parse_program();
+        if KEEP_PARSED {
+            keep_parsed();
+        }
+        if IMPORTED_START >= 0 {
+            drop_shadowed_imports(program);
+        }
+        collect_defs(program);
+        PARSED = true;
+        MAIN_SYM = intern_c(c"main");
+        init_types();
+        init_declarations();
+        ERR_KIND = c"type error";
+        check_program(program);
+    }
+}
+
+// Whether the program was parsed (the definitions are known).
+pub static mut PARSED: bool = false;
+
+// Reads the program of `root` for a question or a change (0.11): its front
+// end, as far as it gets (its errors are recorded, never printed), then
+// the paths and positions of its definitions; the hooks note what they
+// resolve (refs). Whether the program was parsed: when not, there is
+// nothing to answer with.
+pub fn load_program(root: *u8, target: i64) -> bool {
+    unsafe {
+        QUERY = true;
+        ERR_BAIL = alloc_zeroed(512);
+        if _setjmp(ERR_BAIL) == 0 {
+            front_end(root, target);
+        }
+        RECOVER_DEPTH = 0;
+        ERR_BAIL = 0 as *u8;
+        QUERY = false;
+        if !PARSED {
+            return false;
+        }
+        init_positions();
+        finish_defs();
+        init_containers();
+        true
+    }
+}
+
+// The commands, for `--help` and the nearest command to a misspelt one.
+fn put_usage(out: i64) {
+    unsafe {
+        buf_str(out, c"usage: tachyonc query def|show NAME... [--root ROOT] [--exact] [--with-comments]\n");
+        buf_str(out, c"       tachyonc query show FILE.tach | MODULE::use | MODULE::header | MODULE::extern\n");
+        buf_str(out, c"       tachyonc query text FILE[:A[-B]]...\n");
+        buf_str(out, c"       tachyonc query diff\n");
+        buf_str(out, c"       tachyonc query refs|callers NAME... [--exact] [--count] [--in FILE|MODULE] [--limit N] [--all]\n");
+        buf_str(out, c"       tachyonc query items [MODULE...]\n");
+        buf_str(out, c"       tachyonc query stats [MODULE|FILE] [--over N] [--all]\n");
+        buf_str(out, c"       tachyonc query deps MODULE [--max-lines N]\n");
+        buf_str(out, c"       tachyonc query unused [MODULE] [--all]\n");
+        buf_str(out, c"       tachyonc query impact NAME\n");
+        buf_str(out, c"NAME: a path or its end (f, m::f, T::f, T.field), or FILE:LINE\n");
+        buf_str(out, c"ROOT: --root ROOT, a last argument ending in .tach, $TACHYON_ROOT, ./main.tach, ./compiler/src/main.tach\n");
+        buf_str(out, c"see docs/query.md and docs/refactor.md\n");
+    }
+}
+
+// A usage error: `error query.usage: <message>`; the caller writes the
+// message, then its `try:` lines.
+fn usage_error() -> i64 {
+    unsafe { diag(c"error", c"query.usage") }
+}
+
+const N_COMMANDS: i64 = 11;
+
+fn command_name(i: i64) -> *u8 {
+    if i == 0 { c"def" } else if i == 1 { c"show" } else if i == 2 { c"refs" } else if i == 3 { c"callers" }
+    else if i == 4 { c"items" } else if i == 5 { c"stats" } else if i == 6 { c"deps" } else if i == 7 { c"unused" }
+    else if i == 8 { c"impact" } else if i == 9 { c"text" } else { c"diff" }
+}
+
+// The command nearest to cmd (edit distance at most 2), or 0.
+fn nearest_command(cmd: *u8) -> *u8 {
+    unsafe {
+        let want = cmd[0..strlen(cmd) as i64];
+        let mut best = 0 as *u8;
+        let mut best_d = 3;
+        for i in 0..N_COMMANDS {
+            let c = command_name(i);
+            let d = edit_distance(want, c[0..strlen(c) as i64]);
+            if d < best_d {
+                best = c;
+                best_d = d;
+            }
+        }
+        best
+    }
+}
+
+pub fn c_slice(s: *u8) -> [u8] {
+    unsafe { s[0..strlen(s) as i64] }
+}
+
+// A decimal number (all of s), or -1.
+pub fn parse_count(s: *u8) -> i64 {
+    unsafe {
+        let mut n = 0;
+        let mut j = 0;
+        while s[j] >= '0' && s[j] <= '9' {
+            n = n * 10 + (s[j] - '0') as i64;
+            j += 1;
+        }
+        if j == 0 || s[j] != 0 { -1 } else { n }
+    }
+}
+
+// The options of stats and deps (0.11).
+pub static mut OPT_OVER: i64 = 1000;
+pub static mut OPT_MAX_LINES: i64 = 1000;
+
+pub fn run_query(argc: i64, argv: **u8) -> i64 {
+    let status = run_query_inner(argc, argv);
+    write_diags();
+    status
+}
+
+fn run_query_inner(argc: i64, argv: **u8) -> i64 {
+    unsafe {
+        PROG = argv[0];
+        if argc < 3 {
+            let out = usage_error();
+            buf_str(out, c"no command\n");
+            try_end(try_begin(c"items", c_slice(c""), false));
+            return 2;
+        }
+        let cmd = argv[2];
+        CMD = cmd;
+        if streq(cmd, c"--help") || streq(cmd, c"-h") || streq(cmd, c"help") {
+            let out = buf_new();
+            put_usage(out);
+            buf_write_fd(out, STDOUT);
+            return 0;
+        }
+        let mut args = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut bad = 0 as *u8;
+        let mut bad_value = false;
+        let mut root = 0 as *u8;
+        let mut i = 3;
+        while i < argc {
+            let a = argv[i];
+            let valued = streq(a, c"--in") || streq(a, c"--limit") || streq(a, c"--root") || streq(a, c"--over")
+                || streq(a, c"--max-lines");
+            if streq(a, c"--count") {
+                OPT_COUNT = true;
+            } else if streq(a, c"--exact") {
+                OPT_EXACT = true;
+            } else if streq(a, c"--all") {
+                OPT_ALL = true;
+            } else if streq(a, c"--with-comments") {
+                WITH_COMMENTS = true;
+            } else if valued {
+                if i + 1 >= argc || argv[i + 1][0] == '-' {
+                    bad = a;
+                    bad_value = true;
+                } else if streq(a, c"--in") {
+                    OPT_IN = argv[i + 1];
+                    i += 1;
+                } else if streq(a, c"--root") {
+                    root = argv[i + 1];
+                    i += 1;
+                } else {
+                    let n = parse_count(argv[i + 1]);
+                    if n < 0 {
+                        bad = a;
+                        bad_value = true;
+                    } else if streq(a, c"--limit") {
+                        OPT_LIMIT = n;
+                    } else if streq(a, c"--over") {
+                        OPT_OVER = n;
+                    } else {
+                        OPT_MAX_LINES = n;
+                    }
+                    i += 1;
+                }
+            } else if a[0] == '-' && a[1] == '-' {
+                bad = a;
+            } else {
+                args.push(a as i64);
+            }
+            i += 1;
+        }
+        let items = streq(cmd, c"items");
+        let is_refs = streq(cmd, c"refs") || streq(cmd, c"callers");
+        if !is_query_command(cmd) {
+            let out = usage_error();
+            buf_str(out, c"unknown command '");
+            buf_str(out, cmd);
+            buf_str(out, c"'\n");
+            let near = nearest_command(cmd);
+            if near != 0 as *u8 && args.count >= 1 {
+                try_query(near, c_slice(args.data[0] as *u8));
+            } else if args.count >= 1 {
+                try_query(c"def", c_slice(args.data[0] as *u8));
+            } else {
+                try_end(try_begin(c"items", c_slice(c""), false));
+            }
+            return 2;
+        }
+        // Text (0.12, query_text.tach): no program read.
+        if streq(cmd, c"text") {
+            return run_text(&args);
+        }
+        if streq(cmd, c"show") && root == 0 as *u8 && all_files(&args) {
+            return show_files(&args);
+        }
+        if streq(cmd, c"diff") {
+            return run_query_diff(root);
+        }
+        // ROOT: --root, else a last argument ending in .tach after the
+        // NAMEs (or alone, for items: its MODULE is optional; for stats
+        // and unused a lone FILE.tach is a file of the program).
+        if root == 0 as *u8 && args.count >= 1 && ends_with_c(args.data[args.count - 1] as *u8, c".tach")
+            && (args.count >= 2 || items) {
+            args.count -= 1;
+            root = args.data[args.count] as *u8;
+        }
+        ROOT_GIVEN = root;
+        let needs_name = !items && !streq(cmd, c"unused") && !streq(cmd, c"stats");
+        let single = streq(cmd, c"deps") || streq(cmd, c"impact") || streq(cmd, c"stats") || streq(cmd, c"unused");
+        let first = if args.count == 0 { c_slice(c"") } else { c_slice(args.data[0] as *u8) };
+        if needs_name && args.count == 0 {
+            let out = usage_error();
+            buf_str(out, cmd);
+            if streq(cmd, c"deps") {
+                buf_str(out, c" needs a MODULE\n");
+            } else {
+                buf_str(out, c" needs a NAME (a path or its end: f, m::f, T::f, T.field; or FILE:LINE)\n");
+            }
+            try_end(try_begin(c"items", first, false));
+            return 2;
+        }
+        let mut extra = if single && args.count > 1 { args.data[1] as *u8 } else { 0 as *u8 };
+        // (`NAME ROOT EXTRA...`: the old form, with an argument too many)
+        for k in 0..args.count - 1 {
+            if root == 0 as *u8 && extra == 0 as *u8 && ends_with_c(args.data[k] as *u8, c".tach") {
+                ROOT_GIVEN = args.data[k] as *u8;
+                extra = args.data[k + 1] as *u8;
+            }
+        }
+        if bad != 0 as *u8 || extra != 0 as *u8 {
+            let out = usage_error();
+            if bad != 0 as *u8 && bad_value {
+                buf_str(out, bad);
+                buf_str(out, if streq(bad, c"--in") { c" needs a FILE or MODULE\n" } else if streq(bad, c"--root") { c" needs a root file\n" } else { c" needs a number\n" });
+            } else if bad != 0 as *u8 {
+                buf_str(out, c"unknown option '");
+                buf_str(out, bad);
+                buf_str(out, c"'\n");
+            } else {
+                buf_str(out, c"unexpected argument '");
+                buf_str(out, extra);
+                buf_str(out, c"'\n");
+            }
+            if bad != 0 as *u8 && bad_value && streq(bad, c"--limit") {
+                try_refs(cmd, first, c"--limit 60", c_slice(c""));
+            } else {
+                try_end(try_begin(cmd, first, args.count > 0));
+            }
+            return 2;
+        }
+        if root == 0 as *u8 {
+            root = infer_root(&args);
+        }
+        root = root_or_diag(root, cmd, first, args.count > 0);
+        if root == 0 as *u8 {
+            return 2;
+        }
+        if !load_program(root, 0) {
+            // (nothing to answer with: the errors say why)
+            program_errors(c"error", root, true);
+            return 1;
+        }
+        let status = answer(cmd, &args, items, is_refs);
+        program_errors(c"warning", root, status != 0);
+        status
+    }
+}
+
+// The definitions answering to NAME, in order of position (none: after
+// the diagnostic saying so, for command cmd). NAME is a path, or its end
+// (see name_matches), or `FILE:LINE` (`FILE:LINE:COL`, as a compiler's
+// error has it): the innermost item whose text holds that line.
+pub fn resolve_name(cmd: *u8, name: [u8], out: *IntVec) -> bool {
+    unsafe {
+        let mut line = -1;
+        let mut file = name[0..0];
+        let a = trailing_number(name);
+        if a > 0 && name[a - 1] == ':' && (a < 2 || name[a - 2] != ':') {
+            line = parse_digits(name[a..name.len]);
+            file = name[0..a - 1];
+            let b = trailing_number(file);
+            if b > 0 && file[b - 1] == ':' && (b < 2 || file[b - 2] != ':') {
+                // (FILE:LINE:COL)
+                line = parse_digits(file[b..file.len]);
+                file = file[0..b - 1];
+            }
+        }
+        if line < 0 {
+            find_defs(name, OPT_EXACT, out);
+            if (*out).count == 0 {
+                no_match(cmd, name);
+                return false;
+            }
+            return true;
+        }
+        let mut f = -1;
+        for g in 0..FILE_COUNT {
+            let p = file_text(g);
+            if bytes_eq(p, file) || (p.len > file.len && bytes_eq(p[p.len - file.len..p.len], file) && p[p.len - file.len - 1] == '/') {
+                f = g;
+                break;
+            }
+        }
+        if f < 0 {
+            let d = diag(c"error", c"query.no-match");
+            buf_str(d, c"no file '");
+            buf_bytes(d, file);
+            buf_str(d, c"' in the program\n");
+            try_end(try_begin(c"items", name[0..0], false));
+            return false;
+        }
+        let d = def_at_line(f, line);
+        if d < 0 {
+            let e = diag(c"error", c"query.no-match");
+            buf_str(e, c"no item at ");
+            buf_bytes(e, name);
+            buf_byte(e, '\n');
+            try_query(c"items", SYMS[mod_fqn(FILES[f].module)].text);
+            return false;
+        }
+        out.push(d);
+        true
+    }
+}
+
+// The start of the run of digits that ends s (s.len: none).
+fn trailing_number(s: [u8]) -> i64 {
+    let mut i = s.len;
+    while i > 0 && s[i - 1] >= '0' && s[i - 1] <= '9' {
+        i -= 1;
+    }
+    if i == s.len { -1 } else { i }
+}
+
+fn parse_digits(s: [u8]) -> i64 {
+    let mut n = 0;
+    for i in 0..s.len {
+        n = n * 10 + (s[i] - '0') as i64;
+    }
+    n
+}
+
+// The innermost definition (not a field or variant) of file f whose text
+// (its comments and attributes included) holds line `line`, or -1.
+pub fn def_at_line(f: i64, line: i64) -> i64 {
+    unsafe {
+        let idx = line_index(FILES[f].start) + line - 1;
+        if line < 1 || idx >= LINES.count || LINES.data[idx] >= FILES[f].end + 1 {
+            return -1;
+        }
+        let mut pos = LINES.data[idx];
+        while pos < FILES[f].end && (SRC[pos] == ' ' || SRC[pos] == '\t') {
+            pos += 1;
+        }
+        let mut best = -1;
+        let mut best_size = 0;
+        for d in 0..DEF_COUNT {
+            let k = DEFS[d].kind;
+            if k == K_FIELD || k == K_VARIANT || DEFS[d].start < FILES[f].start || DEFS[d].start >= FILES[f].end {
+                continue;
+            }
+            if pos >= DEFS[d].end || pos < line_start(DEFS[d].start) {
+                continue;
+            }
+            let from = text_start(d);
+            if pos < from {
+                continue;
+            }
+            if best < 0 || DEFS[d].end - from < best_size {
+                best = d;
+                best_size = DEFS[d].end - from;
+            }
+        }
+        best
+    }
+}
+
+// The answer to the command, once the program is known; the NAMEs (or
+// MODULEs) are `args`.
+fn answer(cmd: *u8, args: *IntVec, items: bool, is_refs: bool) -> i64 {
+    unsafe {
+        let n = (*args).count;
+        if items {
+            if n == 0 {
+                query_modules();
+                return 0;
+            }
+            let mut modules = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            let mut status = 0;
+            for i in 0..n {
+                let text = c_slice((*args).data[i] as *u8);
+                let before = modules.count;
+                find_modules(text, OPT_EXACT, &modules);
+                if modules.count == before {
+                    no_module(text);
+                    status = 1;
+                }
+            }
+            query_items(&modules);
+            return status;
+        }
+        if streq(cmd, c"stats") {
+            return query_stats(if n == 0 { 0 as *u8 } else { (*args).data[0] as *u8 });
+        }
+        if streq(cmd, c"deps") {
+            return query_deps(c_slice((*args).data[0] as *u8));
+        }
+        if streq(cmd, c"unused") {
+            return query_unused(if n == 0 { 0 as *u8 } else { (*args).data[0] as *u8 });
+        }
+        if is_refs {
+            if OPT_IN != 0 as *u8 && !resolve_in(c_slice(OPT_IN)) {
+                let out = diag(c"error", c"query.bad-in");
+                put_bad_in(out, OPT_IN);
+                try_end(try_begin(cmd, c_slice((*args).data[0] as *u8), true));
+                return 1;
+            }
+        }
+        let mut status = 0;
+        let mut all = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..n {
+            let text = c_slice((*args).data[i] as *u8);
+            if streq(cmd, c"show") {
+                // (MODULE::use, ::header, ::extern)
+                let r = show_region(text);
+                if r >= 0 {
+                    if r != 0 {
+                        status = 1;
+                    }
+                    continue;
+                }
+            }
+            let mut matches = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            if !resolve_name(cmd, text, &matches) {
+                status = 1;
+                continue;
+            }
+            if is_refs {
+                for j in 0..matches.count {
+                    push_once(&all, matches.data[j]);
+                }
+            } else if streq(cmd, c"impact") {
+                status = query_impact(&matches, text);
+            } else if streq(cmd, c"show") {
+                if query_show(&matches, text) != 0 {
+                    status = 1;
+                }
+            } else {
+                query_def(&matches);
+            }
+        }
+        if is_refs && all.count > 0 {
+            sort_by_position(&all);
+            let name = c_slice((*args).data[0] as *u8);
+            if query_refs(&all, cmd, name) != 0 {
+                status = 1;
+            }
+        }
+        status
+    }
+}

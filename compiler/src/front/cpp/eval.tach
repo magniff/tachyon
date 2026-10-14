@@ -1,0 +1,387 @@
+// The C preprocessor's constant expressions: the integer expressions of
+// `#if` and of the declarations cimport reads (enumerators, array
+// sizes), with C's usual arithmetic conversions.
+
+use crate::base::{IntVec, streq, strlen, sym_name};
+use crate::front::cimport::{cty_bits, cty_int, cty_signed};
+use crate::front::cimport::decls::{cdecl_eval_special, cdecl_ident_value};
+use crate::front::cpp::{
+    CTOKS, C_EOF, S_DEFINED, S_HAS_INCLUDE, S_HAS_INCLUDE_NEXT, c_error, ctok_text,
+    is_query_builtin, strtoull,
+};
+use crate::front::cpp::CK::{Char, Ident, Num, Punct};
+use crate::front::lexer::is_digit;
+use crate::front::cpp::directives::is_defined;
+
+// ---- Constant expressions ----
+//
+// Shared by `#if` (mode false: identifiers are 0, arithmetic is in
+// intmax_t/uintmax_t) and the declarations (mode true: enumerators,
+// casts, sizeof, C's integer types). A value is (bits, C type); EV_FAIL
+// is set when the expression is not an integer constant.
+
+pub static mut EV_TOKS: *i64 = 0 as *i64;
+pub static mut EV_N: i64 = 0;
+pub static mut EV_POS: i64 = 0;
+static mut EV_AT: i64 = 0;
+static mut EV_DECL: bool = false;
+pub static mut EV_FAIL: bool = false;
+
+pub fn eval_tokens(list: *IntVec, at: i64, decl: bool) -> (u64, i64) {
+    let saved = (EV_TOKS, EV_N, EV_POS, EV_AT, EV_DECL);
+    EV_TOKS = (*list).data;
+    EV_N = (*list).count;
+    EV_POS = 0;
+    EV_AT = at;
+    EV_DECL = decl;
+    EV_FAIL = false;
+    let result = ev_cond();
+    if EV_POS < EV_N {
+        ev_fail();
+    }
+    let (toks, n, pos, at0, decl0) = saved;
+    EV_TOKS = toks;
+    EV_N = n;
+    EV_POS = pos;
+    EV_AT = at0;
+    EV_DECL = decl0;
+    if EV_FAIL && !decl {
+        unsafe { c_error(at, c"invalid #if expression"); }
+    }
+    result
+}
+
+fn ev_fail() {
+    EV_FAIL = true;
+    EV_POS = EV_N;
+}
+
+pub fn ev_peek() -> i64 {
+    if EV_POS < EV_N { unsafe { EV_TOKS[EV_POS] } } else { C_EOF }
+}
+
+fn ev_at(text: *u8) -> bool {
+    let t = ev_peek();
+    unsafe { t != C_EOF && CTOKS[t].kind == Punct && streq(ctok_text(t), text) }
+}
+
+fn ev_eat(text: *u8) -> bool {
+    if ev_at(text) {
+        EV_POS += 1;
+        return true;
+    }
+    false
+}
+
+// The type arithmetic on a and b is done in (C's usual conversions; in
+// #if, intmax_t and uintmax_t).
+fn ev_common(a: i64, b: i64) -> i64 {
+    let ta = ev_promote(a);
+    let tb = ev_promote(b);
+    let wa = cty_bits(ta);
+    let wb = cty_bits(tb);
+    let wide = if wa > wb { wa } else { wb };
+    let unsigned = (cty_bits(ta) == wide && !cty_signed(ta)) || (cty_bits(tb) == wide && !cty_signed(tb));
+    cty_int(wide, !unsigned)
+}
+
+fn ev_promote(t: i64) -> i64 {
+    if !EV_DECL {
+        return cty_int(64, cty_signed(t));
+    }
+    let bits = cty_bits(t);
+    if bits < 32 {
+        return cty_int(32, true);
+    }
+    cty_int(bits, cty_signed(t))
+}
+
+// `value` converted to integer type t.
+pub fn ev_convert(value: u64, t: i64) -> u64 {
+    let bits = cty_bits(t);
+    if bits >= 64 {
+        return value;
+    }
+    let mask = ((1 as u64) << bits as u64) - 1;
+    let v = value & mask;
+    if cty_signed(t) && (v >> (bits - 1) as u64) != 0 {
+        return v | ~mask;
+    }
+    v
+}
+
+fn ev_cond() -> (u64, i64) {
+    unsafe {
+        let (c, ct) = ev_binary(0);
+        if !ev_eat(c"?") {
+            return (c, ct);
+        }
+        let (a, at) = ev_cond();
+        if !ev_eat(c":") {
+            ev_fail();
+            return (0, ct);
+        }
+        let (b, bt) = ev_cond();
+        let t = ev_common(at, bt);
+        if c != 0 { (ev_convert(a, t), t) } else { (ev_convert(b, t), t) }
+    }
+}
+
+// Binding powers of the binary operators (0: not one).
+fn ev_prec(t: i64) -> i64 {
+    unsafe {
+        if t == C_EOF || CTOKS[t].kind != Punct {
+            return 0;
+        }
+        let s = ctok_text(t);
+        if streq(s, c"||") { return 1; }
+        if streq(s, c"&&") { return 2; }
+        if streq(s, c"|") { return 3; }
+        if streq(s, c"^") { return 4; }
+        if streq(s, c"&") { return 5; }
+        if streq(s, c"==") || streq(s, c"!=") { return 6; }
+        if streq(s, c"<") || streq(s, c">") || streq(s, c"<=") || streq(s, c">=") { return 7; }
+        if streq(s, c"<<") || streq(s, c">>") { return 8; }
+        if streq(s, c"+") || streq(s, c"-") { return 9; }
+        if streq(s, c"*") || streq(s, c"/") || streq(s, c"%") { return 10; }
+        0
+    }
+}
+
+fn ev_binary(min: i64) -> (u64, i64) {
+    unsafe {
+        let (mut a, mut at) = ev_unary();
+        loop {
+            let op = ev_peek();
+            let prec = ev_prec(op);
+            if prec == 0 || prec <= min {
+                return (a, at);
+            }
+            EV_POS += 1;
+            let (b, bt) = ev_binary(prec);
+            let s = ctok_text(op);
+            let int_t = cty_int(if EV_DECL { 32 } else { 64 }, true);
+            if prec == 1 || prec == 2 {
+                let r = if prec == 1 { a != 0 || b != 0 } else { a != 0 && b != 0 };
+                a = r as u64;
+                at = int_t;
+                continue;
+            }
+            if prec == 8 {
+                let t = ev_promote(at);
+                let x = ev_convert(a, t);
+                let n = b & 63;
+                a = if streq(s, c"<<") {
+                    ev_convert(x << n, t)
+                } else if cty_signed(t) {
+                    ev_convert(((x as i64) >> n) as u64, t)
+                } else {
+                    x >> n
+                };
+                at = t;
+                continue;
+            }
+            let t = ev_common(at, bt);
+            let x = ev_convert(a, t);
+            let y = ev_convert(b, t);
+            let signed = cty_signed(t);
+            if prec == 6 || prec == 7 {
+                let r = if streq(s, c"==") { x == y } else if streq(s, c"!=") { x != y }
+                    else if signed {
+                        if streq(s, c"<") { (x as i64) < (y as i64) } else if streq(s, c">") { (x as i64) > (y as i64) }
+                        else if streq(s, c"<=") { (x as i64) <= (y as i64) } else { (x as i64) >= (y as i64) }
+                    } else {
+                        if streq(s, c"<") { x < y } else if streq(s, c">") { x > y }
+                        else if streq(s, c"<=") { x <= y } else { x >= y }
+                    };
+                a = r as u64;
+                at = int_t;
+                continue;
+            }
+            let r = if streq(s, c"|") { x | y } else if streq(s, c"^") { x ^ y } else if streq(s, c"&") { x & y }
+                else if streq(s, c"+") { x + y } else if streq(s, c"-") { x - y } else if streq(s, c"*") { x * y }
+                else {
+                    if y == 0 {
+                        ev_fail();
+                        return (0, t);
+                    }
+                    if streq(s, c"/") {
+                        if signed { ((x as i64) / (y as i64)) as u64 } else { x / y }
+                    } else {
+                        if signed { ((x as i64) % (y as i64)) as u64 } else { x % y }
+                    }
+                };
+            a = ev_convert(r, t);
+            at = t;
+        }
+    }
+}
+
+pub fn ev_unary() -> (u64, i64) {
+    unsafe {
+        if ev_eat(c"-") {
+            let (v, t) = ev_unary();
+            let p = ev_promote(t);
+            return (ev_convert(0 - v, p), p);
+        }
+        if ev_eat(c"+") {
+            let (v, t) = ev_unary();
+            return (v, ev_promote(t));
+        }
+        if ev_eat(c"~") {
+            let (v, t) = ev_unary();
+            let p = ev_promote(t);
+            return (ev_convert(~v, p), p);
+        }
+        if ev_eat(c"!") {
+            let (v, _) = ev_unary();
+            return ((v == 0) as u64, cty_int(if EV_DECL { 32 } else { 64 }, true));
+        }
+        if EV_DECL {
+            let (handled, v, t) = cdecl_eval_special();
+            if handled {
+                return (v, t);
+            }
+        }
+        ev_primary()
+    }
+}
+
+fn ev_primary() -> (u64, i64) {
+    unsafe {
+        let t = ev_peek();
+        if t == C_EOF {
+            ev_fail();
+            return (0, cty_int(32, true));
+        }
+        if ev_eat(c"(") {
+            let r = ev_cond();
+            if !ev_eat(c")") {
+                ev_fail();
+            }
+            return r;
+        }
+        EV_POS += 1;
+        let kind = CTOKS[t].kind;
+        if kind == Num {
+            return ev_number(t);
+        }
+        if kind == Char {
+            return (char_value(t), cty_int(32, true));
+        }
+        if kind == Ident {
+            let sym = CTOKS[t].text;
+            if is_query_builtin(sym) || sym == S_HAS_INCLUDE || sym == S_HAS_INCLUDE_NEXT {
+                // Feature queries reached through macros: "no".
+                if ev_eat(c"(") {
+                    let mut depth = 1;
+                    while depth > 0 && EV_POS < EV_N {
+                        if ev_at(c"(") {
+                            depth += 1;
+                        } else if ev_at(c")") {
+                            depth -= 1;
+                        }
+                        EV_POS += 1;
+                    }
+                }
+                return (0, cty_int(64, true));
+            }
+            if !EV_DECL && sym == S_DEFINED {
+                // `defined` made by a macro's expansion (GCC accepts it).
+                let paren = ev_eat(c"(");
+                let name = ev_peek();
+                EV_POS += 1;
+                if paren {
+                    ev_eat(c")");
+                }
+                return (is_defined(CTOKS[name].text) as u64, cty_int(64, true));
+            }
+            if !EV_DECL {
+                if streq(ctok_text(t), c"true") {
+                    return (1, cty_int(64, true));
+                }
+                return (0, cty_int(64, true));
+            }
+            let (found, v, vt) = cdecl_ident_value(sym);
+            if found {
+                return (v, vt);
+            }
+        }
+        ev_fail();
+        (0, cty_int(32, true))
+    }
+}
+
+// The value and type of an integer literal (C11 6.4.4.1). 0 type: not one.
+fn ev_number(t: i64) -> (u64, i64) {
+    unsafe {
+        let text = sym_name(CTOKS[t].text);
+        let n = strlen(text) as i64;
+        let mut end = 0 as *u8;
+        let mut base = 10;
+        let mut digits = text;
+        if n > 1 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X') {
+            base = 16;
+        } else if n > 1 && text[0] == '0' && (text[1] == 'b' || text[1] == 'B') {
+            base = 2;
+            digits = &text[2];
+        } else if text[0] == '0' {
+            base = 8;
+        }
+        let value = strtoull(digits, &end, base as i32);
+        // The suffix: u, l, ll in any case and order.
+        let mut unsigned = false;
+        let mut longs = 0;
+        let mut p = end;
+        while p[0] != 0 {
+            let c = p[0];
+            if c == 'u' || c == 'U' {
+                unsigned = true;
+            } else if c == 'l' || c == 'L' {
+                longs += 1;
+            } else {
+                // A float, or an unknown suffix.
+                ev_fail();
+                return (0, 0);
+            }
+            p = &p[1];
+        }
+        if !EV_DECL {
+            return (value, cty_int(64, !(unsigned || value > 9223372036854775807)));
+        }
+        let fits_int = value <= 2147483647;
+        let fits_uint = value <= 4294967295;
+        let fits_long = value <= 9223372036854775807;
+        let ty = if longs == 0 && !unsigned && fits_int { cty_int(32, true) }
+            else if longs == 0 && fits_uint && (unsigned || base != 10) { cty_int(32, false) }
+            else if !unsigned && fits_long { cty_int(64, true) }
+            else { cty_int(64, false) };
+        (value, ty)
+    }
+}
+
+fn char_value(t: i64) -> u64 {
+    unsafe {
+        let text = sym_name(CTOKS[t].text);
+        let mut i = 0;
+        while text[i] != '\'' {
+            i += 1;
+        }
+        i += 1;
+        let c = text[i];
+        if c != '\\' {
+            return (c as i8) as i64 as u64;
+        }
+        let e = text[i + 1];
+        let v = if e == 'n' { 10 } else if e == 't' { 9 } else if e == 'r' { 13 } else if e == '0' && !is_digit(text[i + 2]) { 0 }
+            else if e == 'a' { 7 } else if e == 'b' { 8 } else if e == 'f' { 12 } else if e == 'v' { 11 }
+            else if e == 'x' {
+                let mut end = 0 as *u8;
+                strtoull(&text[i + 2], &end, 16) as i64
+            } else if is_digit(e) {
+                let mut end = 0 as *u8;
+                strtoull(&text[i + 1], &end, 8) as i64
+            } else { e as i64 };
+        ((v as u64 as u8) as i8) as i64 as u64
+    }
+}

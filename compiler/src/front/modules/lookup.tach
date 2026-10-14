@@ -1,0 +1,677 @@
+// Names across modules: what a name stands for in a module's scope (a
+// binding), the `use` declarations and their resolution, lookups with
+// privacy, the names `*` imports and C header imports bring, the prelude,
+// and paths (`a::b::c`) resolved to what they name.
+
+use crate::base::{IntVec, alloc_array, grow, intern_c};
+use crate::base::diag::{
+    err_begin, err_end, err_end_soft, err_failed_name, err_str, err_sym, error_at, fail_name,
+};
+use crate::front::ast::{NODES, NodeKind, child};
+use crate::front::check::{PROGRAM, SELF_SYM, Try, attempt, name_error};
+use crate::front::check::collect::template_variant_named;
+use crate::front::modules::{
+    CUR_MOD, C_MODULE, MODULES, MODULE_COUNT, STD_MODULE, child_module, is_within, module_of,
+    qualified_if_known, qualify,
+};
+use crate::front::parser::items::ITEM_PUBLIC;
+use crate::front::types::{ENUMS, SYM_ENUM, VARIANTS, find_variant, item_node_of};
+use crate::middle::lower::ssa::HMap;
+use crate::tools::fix::note_private;
+use crate::tools::query::{QF_USE, qnote, qnote_module};
+
+// ---- Scopes ----
+
+// What a name stands for in a scope: nothing, an item (by key), a module,
+// a variant, or an item that is private there.
+pub const B_NONE: i64 = 0;
+
+pub const B_ITEM: i64 = 1;
+
+pub const B_MODULE: i64 = 2;
+
+pub const B_VARIANT: i64 = 3;
+
+pub const B_PRIVATE: i64 = 4;
+
+// A variant of a generic enum (0.6), by the enum's template (its ENUMS
+// index): its type arguments are inferred where it is used.
+pub const B_TVARIANT: i64 = 5;
+
+// An ambiguous name (0.6): two `*` imports bring different things (code
+// written for 0.7, being rewritten by --fix-imports).
+pub const B_AMBIGUOUS: i64 = -4;
+
+pub fn binding(kind: i64, value: i64) -> i64 {
+    kind + value * 8
+}
+
+pub fn binding_kind(b: i64) -> i64 {
+    b & 7
+}
+
+pub fn binding_value(b: i64) -> i64 {
+    b >> 3
+}
+
+// `use` items: one entry per imported name, one per `*`.
+struct UseEntry {
+    module: i64, name: i64, item: i64, path: i64, glob: bool, public: bool,
+    state: i64, result: i64, node: i64,
+}
+
+static mut USE_ENTRIES: *UseEntry = 0 as *UseEntry;
+
+static mut USE_ENTRY_COUNT: i64 = 0;
+
+static mut USE_ENTRY_CAP: i64 = 0;
+
+// Lookups by (module, name), once the items are known.
+static mut SCOPE_CACHE: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+static mut SCOPES_READY: bool = false;
+
+// Per module (below USES_INDEXED), the indices of its use entries in order.
+static mut MODULE_USES: *IntVec = 0 as *IntVec;
+
+static mut USES_INDEXED: i64 = 0;
+
+pub static mut SYM_CRATE: i64 = 0;
+
+pub static mut SYM_SUPER: i64 = 0;
+
+pub static mut SYM_STD: i64 = 0;
+
+fn add_use_entry(module: i64, name: i64, item: i64, path: i64, glob: bool, public: bool, node: i64) {
+    unsafe {
+        USE_ENTRIES = grow(USE_ENTRIES, USE_ENTRY_COUNT, &USE_ENTRY_CAP);
+        USE_ENTRIES[USE_ENTRY_COUNT] = UseEntry {
+            module: module, name: name, item: item, path: path, glob: glob, public: public,
+            state: 0, result: 0, node: node,
+        };
+    }
+    USE_ENTRY_COUNT += 1;
+}
+
+// The entries of the program's `use` and `import` items.
+pub fn collect_uses() {
+    unsafe {
+        SYM_CRATE = intern_c(c"crate");
+        SYM_SUPER = intern_c(c"super");
+        SYM_STD = intern_c(c"std");
+        for i in 0..NODES[PROGRAM].count {
+            let item = child(PROGRAM, i);
+            if NODES[item].kind != NodeKind::Use {
+                continue;
+            }
+            let m = module_of(item);
+            let public = (NODES[item].p & ITEM_PUBLIC) != 0;
+            if NODES[item].d == 2 {
+                // `import "h.h";` sees the C module's items; `import "h.h"
+                // as c;` names the module.
+                if C_MODULE < 0 {
+                    continue;
+                }
+                let entry = USE_ENTRY_COUNT;
+                if NODES[item].a == 0 {
+                    LEGACY_IMPORTS = true;
+                }
+                add_use_entry(m, NODES[item].a, 0, 0, NODES[item].a == 0, public, item);
+                USE_ENTRIES[entry].state = 2;
+                USE_ENTRIES[entry].result = binding(B_MODULE, C_MODULE);
+                continue;
+            }
+            let path = NODES[item].c;
+            if NODES[item].b == 1 {
+                LEGACY_IMPORTS = true;
+                add_use_entry(m, -1, 0, path, true, public, item);
+                continue;
+            }
+            for k in 0..NODES[item].count {
+                let id = child(item, k);
+                let name = if NODES[id].b != 0 { NODES[id].b } else { NODES[id].a };
+                let mut twice = false;
+                for e in 0..USE_ENTRY_COUNT {
+                    if USE_ENTRIES[e].module == m && USE_ENTRIES[e].name == name && !USE_ENTRIES[e].glob {
+                        twice = true;
+                    }
+                }
+                if twice {
+                    err_begin(NODES[id].start);
+                    err_str(c"'");
+                    err_sym(name);
+                    err_str(c"' is imported twice");
+                    err_end_soft();
+                    continue;
+                }
+                add_use_entry(m, name, id, path, false, public, item);
+            }
+        }
+        MODULE_USES = alloc_array::<IntVec>(MODULE_COUNT);
+        USES_INDEXED = MODULE_COUNT;
+        for u in 0..USE_ENTRY_COUNT {
+            MODULE_USES[USE_ENTRIES[u].module].push(u);
+        }
+        SCOPES_READY = true;
+    }
+}
+
+// What use entry u imports: for `use p::x`, what x names in p; for `use
+// p::*`, the module (or enum) p.
+fn resolve_use(u: i64) -> i64 {
+    unsafe {
+        if USE_ENTRIES[u].state == 2 {
+            return USE_ENTRIES[u].result;
+        }
+        if USE_ENTRIES[u].state == 1 {
+            error_at(NODES[USE_ENTRIES[u].node].start, c"this import depends on itself");
+        }
+        USE_ENTRIES[u].state = 1;
+        // (an import that fails imports nothing, and the errors saying
+        // its name is unknown follow from it: 0.10)
+        if !attempt(Try::Use, u) {
+            USE_ENTRIES[u].result = B_NONE;
+            if !USE_ENTRIES[u].glob {
+                fail_name(USE_ENTRIES[u].name);
+            }
+        }
+        USE_ENTRIES[u].state = 2;
+        USE_ENTRIES[u].result
+    }
+}
+
+pub fn resolve_use_of(u: i64) {
+    unsafe {
+        let m = USE_ENTRIES[u].module;
+        let path = USE_ENTRIES[u].path;
+        let prefix = resolve_path(m, path, NODES[path].count, NODES[path].start);
+        let mut result = 0;
+        if USE_ENTRIES[u].glob {
+            if binding_kind(prefix) == B_MODULE {
+                result = prefix;
+            } else if binding_kind(prefix) == B_ITEM && SYM_ENUM[binding_value(prefix)] != 0 {
+                result = prefix;
+            } else {
+                not_enum_or_module(path);
+            }
+        } else {
+            let id = USE_ENTRIES[u].item;
+            let name = NODES[id].a;
+            if binding_kind(prefix) == B_MODULE {
+                result = lookup_name(binding_value(prefix), name, m);
+                if binding_kind(result) == B_PRIVATE {
+                    access_error(result, NODES[id].start, name);
+                }
+                if result == B_NONE {
+                    unresolved_import(id, path);
+                }
+            } else if binding_kind(prefix) == B_ITEM && SYM_ENUM[binding_value(prefix)] != 0 {
+                let e = SYM_ENUM[binding_value(prefix)] - 1;
+                let v = enum_variant_binding(e, name);
+                if v == B_NONE {
+                    err_begin(NODES[id].start);
+                    err_str(c"enum '");
+                    err_sym(ENUMS[e].name);
+                    err_str(c"' has no variant '");
+                    err_sym(name);
+                    err_str(c"'");
+                    err_end();
+                }
+                result = v;
+            } else {
+                not_enum_or_module(path);
+            }
+        }
+        USE_ENTRIES[u].result = result;
+        note_import(USE_ENTRIES[u].item, result);
+    }
+}
+
+// `tachyonc query` (0.11): what the name `use` item `id` imports.
+fn note_import(id: i64, b: i64) {
+    unsafe {
+        if id == 0 {
+            return;
+        }
+        let pos = NODES[id].start;
+        let name = NODES[id].a;
+        let kind = binding_kind(b);
+        if kind == B_ITEM {
+            qnote(pos, name, item_node_of(binding_value(b)), QF_USE);
+        } else if kind == B_VARIANT {
+            qnote(pos, name, VARIANTS[binding_value(b)].node, QF_USE);
+        } else if kind == B_TVARIANT {
+            let item = ENUMS[binding_value(b)].node;
+            for i in 0..NODES[item].count {
+                if NODES[child(item, i)].a == name {
+                    qnote(pos, name, child(item, i), QF_USE);
+                }
+            }
+        } else if kind == B_MODULE {
+            qnote_module(pos, name, binding_value(b), QF_USE);
+        }
+    }
+}
+
+fn not_enum_or_module(path: i64) -> ! {
+    unsafe {
+        let last = child(path, NODES[path].count - 1);
+        name_error(NODES[last].start, c"'", NODES[last].a, c"' is not an enum or a module (use brings the variants of an enum, or the items of a module, into scope)")
+    }
+}
+
+// Every use is resolved (once the enums' variants are known), so that
+// unused imports are checked too.
+pub fn resolve_all_uses() {
+    for u in 0..USE_ENTRY_COUNT {
+        resolve_use(u);
+    }
+}
+
+fn unresolved_import(id: i64, path: i64) -> ! {
+    unsafe {
+        err_begin(NODES[id].start);
+        err_str(c"unresolved import '");
+        for i in 0..NODES[path].count {
+            err_sym(NODES[child(path, i)].a);
+            err_str(c"::");
+        }
+        err_sym(NODES[id].a);
+        err_str(c"'");
+        err_end()
+    }
+}
+
+pub fn private_error(pos: i64, name: i64) -> ! {
+    unsafe { name_error(pos, c"'", name, c"' is private") }
+}
+
+// The error for a binding that cannot be used: private, or (0.6) brought
+// by two `*` imports.
+pub fn access_error(b: i64, pos: i64, name: i64) -> ! {
+    note_private(b);
+    if b == B_AMBIGUOUS {
+        unsafe {
+            name_error(pos, c"'", name, c"' is ambiguous: more than one '*' import brings it (import it by name, or write its path)");
+        }
+    }
+    private_error(pos, name)
+}
+
+// What `name` stands for in module m, seen from code in module `from`.
+pub fn lookup_name(m: i64, name: i64, from: i64) -> i64 {
+    // (not while the imports are recorded: see LEGACY_IMPORTS)
+    let cacheable = SCOPES_READY && m == from && !LEGACY_IMPORTS;
+    let k = (name + 1) * 65536 + m;
+    if cacheable {
+        let known = SCOPE_CACHE.get(k);
+        if known != 0 {
+            return known - 1;
+        }
+    }
+    let result = lookup_uncached(m, name, from, 0);
+    if cacheable {
+        SCOPE_CACHE.put(k, result + 1);
+    }
+    result
+}
+
+fn lookup_uncached(m: i64, name: i64, from: i64, depth: i64) -> i64 {
+    unsafe {
+        let inside = is_within(from, m);
+        // (no symbol is made for the names looked for and not found)
+        let key = qualified_if_known(m, name);
+        let item = if key >= 0 { item_node_of(key) } else { 0 };
+        if item != 0 {
+            if inside || (NODES[item].p & ITEM_PUBLIC) != 0 || MODULES[m].is_c {
+                return binding(B_ITEM, key);
+            }
+            return binding(B_PRIVATE, key);
+        }
+        let c = child_module(m, name);
+        if c >= 0 {
+            if inside || MODULES[c].public {
+                return binding(B_MODULE, c);
+            }
+            return binding(B_PRIVATE, qualify(m, name));
+        }
+        if !SCOPES_READY || depth > 8 {
+            return B_NONE;
+        }
+        // (only the module's own entries: its imports, then its `*` imports)
+        let count = if m < USES_INDEXED { MODULE_USES[m].count } else { 0 };
+        for k in 0..count {
+            let u = MODULE_USES[m].data[k];
+            if USE_ENTRIES[u].name == name && !USE_ENTRIES[u].glob && (inside || USE_ENTRIES[u].public) {
+                return resolve_use(u);
+            }
+        }
+        // `*` imports: two that bring different things make the name
+        // ambiguous (an error where it is used; 0.6, before the first won).
+        let mut globbed = B_NONE;
+        let mut via = -1;
+        for k in 0..count {
+            let u = MODULE_USES[m].data[k];
+            if !USE_ENTRIES[u].glob || !(inside || USE_ENTRIES[u].public) {
+                continue;
+            }
+            let what = resolve_use(u);
+            let mut found = B_NONE;
+            if what == B_NONE {
+                // (an import that failed)
+                continue;
+            }
+            if binding_kind(what) == B_MODULE {
+                let item = lookup_uncached(binding_value(what), name, m, depth + 1);
+                let kind = binding_kind(item);
+                if kind == B_ITEM || kind == B_MODULE || kind == B_VARIANT || kind == B_TVARIANT {
+                    found = item;
+                }
+            } else {
+                found = enum_variant_binding(SYM_ENUM[binding_value(what)] - 1, name);
+            }
+            if found != B_NONE {
+                if globbed == B_NONE {
+                    globbed = found;
+                    via = u;
+                } else if globbed != found {
+                    return B_AMBIGUOUS;
+                }
+            }
+        }
+        if globbed != B_NONE {
+            if LOOKUP_QUIET == 0 {
+                note_glob_use(via, name, m == from && depth == 0);
+            }
+            return globbed;
+        }
+        if MODULES[m].is_c {
+            // The imported declarations see the root's names (its types
+            // replace the headers' of the same names).
+            return lookup_uncached(0, name, 0, depth + 1);
+        }
+        // The prelude is part of the scope of the code being checked, not an
+        // item of the modules its `*` imports and paths go through.
+        if STD_MODULE >= 0 && m != STD_MODULE && depth == 0 && m == from {
+            return prelude_lookup(name, m, depth);
+        }
+        B_NONE
+    }
+}
+
+// ---- What the `*` imports and the plain header imports bring (0.8) ----
+//
+// 0.8 removed `use a::b::*;`, `use E::*;` and `import "h.h";` (without
+// `as`). They are still parsed and resolved, so that `tachyonc
+// --fix-imports` can turn code written for 0.7 into explicit imports, and
+// the errors for them can name what replaces them. While a program has
+// one (LEGACY_IMPORTS), every name a lookup finds through a `*` is
+// recorded with the entry that brought it, and the scope cache is off
+// (a lookup that only asks, LOOKUP_QUIET, records nothing; its caller
+// repeats it with lookup_commit once the answer is used).
+
+pub static mut LEGACY_IMPORTS: bool = false;
+
+pub static mut LOOKUP_QUIET: i64 = 0;
+
+// (entry, name) pairs, in the order found; GLOB_SEEN: the same, as keys.
+pub static mut GLOB_USES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+static mut GLOB_SEEN: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+// The `*` entry (+ 1) a bare name of a module came through, by (module,
+// name).
+static mut GLOB_VIA: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+// The uses of C declarations through a plain `import "h.h";`: (position,
+// entry, name) triples, to be written `c::name`; QUAL_SEEN: by position,
+// and by (entry, name) for the names no longer imported by name.
+pub static mut C_QUALS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+static mut QUAL_SEEN: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+static mut QUAL_NAMES: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+// The positions of patterns (a constant cannot be written with its path
+// there), and the C declarations used in them: (entry, name) pairs, to be
+// imported by name (`use c::EOF;`).
+static mut PATTERN_POS: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+pub static mut C_BY_NAME: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+static mut BY_NAME_SEEN: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+// The name at `pos` is a pattern's.
+pub fn note_pattern_pos(pos: i64) {
+    if LEGACY_IMPORTS {
+        PATTERN_POS.put(pos + 1, 1);
+    }
+}
+
+fn glob_key(u: i64, name: i64) -> i64 {
+    (u + 1) * 16777216 + name + 1
+}
+
+fn note_glob_use(u: i64, name: i64, bare: bool) {
+    if bare {
+        unsafe { GLOB_VIA.put((name + 1) * 65536 + USE_ENTRIES[u].module, u + 1); }
+    }
+    let k = glob_key(u, name);
+    if GLOB_SEEN.get(k) == 0 {
+        GLOB_SEEN.put(k, 1);
+        GLOB_USES.push(u);
+        GLOB_USES.push(name);
+    }
+}
+
+// A lookup whose answer may go unused (records nothing).
+pub fn lookup_quiet(m: i64, name: i64, from: i64) -> i64 {
+    LOOKUP_QUIET += 1;
+    let b = lookup_name(m, name, from);
+    LOOKUP_QUIET -= 1;
+    b
+}
+
+// Bare name `name` at `pos`, looked up quietly in the current module, is
+// used.
+pub fn lookup_commit(name: i64, pos: i64) {
+    if LEGACY_IMPORTS {
+        note_c_use(pos, name, lookup_name(CUR_MOD, name, CUR_MOD));
+    }
+}
+
+// Bare name `name` at `pos` in the current module stands for b: when b is
+// a C declaration found through a `*` entry (a plain import, or a `*`
+// that leads to one), the use is recorded for --fix-imports.
+pub fn note_c_use(pos: i64, name: i64, b: i64) {
+    if !LEGACY_IMPORTS || LOOKUP_QUIET > 0 || C_MODULE < 0 || binding_kind(b) != B_ITEM {
+        return;
+    }
+    let via = GLOB_VIA.get((name + 1) * 65536 + CUR_MOD) - 1;
+    if via < 0 || qualified_if_known(C_MODULE, name) != binding_value(b) || QUAL_SEEN.get(pos + 1) != 0 {
+        return;
+    }
+    QUAL_SEEN.put(pos + 1, 1);
+    QUAL_NAMES.put(glob_key(via, name), 1);
+    if PATTERN_POS.get(pos + 1) != 0 {
+        if BY_NAME_SEEN.get(glob_key(via, name)) == 0 {
+            BY_NAME_SEEN.put(glob_key(via, name), 1);
+            C_BY_NAME.push(via);
+            C_BY_NAME.push(name);
+        }
+        return;
+    }
+    C_QUALS.push(pos);
+    C_QUALS.push(via);
+    C_QUALS.push(name);
+}
+
+// Whether the C declaration `name`, found through entry u, is written
+// with its path instead (so it is not imported by name).
+pub fn glob_name_qualified(u: i64, name: i64) -> bool {
+    QUAL_NAMES.get(glob_key(u, name)) != 0
+}
+
+pub fn use_entry_count() -> i64 {
+    USE_ENTRY_COUNT
+}
+
+// Entry u: its `use`/`import` node, module, and whether it is a `*` (or a
+// plain import, d = 2).
+pub fn use_entry_node(u: i64) -> i64 {
+    unsafe { USE_ENTRIES[u].node }
+}
+
+pub fn use_entry_module(u: i64) -> i64 {
+    unsafe { USE_ENTRIES[u].module }
+}
+
+pub fn use_entry_glob(u: i64) -> bool {
+    unsafe { USE_ENTRIES[u].glob }
+}
+
+// Variant `name` of enum e: B_VARIANT, or B_TVARIANT for a generic enum,
+// or B_NONE.
+pub fn enum_variant_binding(e: i64, name: i64) -> i64 {
+    if unsafe { ENUMS[e].generic > 0 } {
+        if template_variant_named(e, name) {
+            return binding(B_TVARIANT, e);
+        }
+        return B_NONE;
+    }
+    let v = find_variant(e, name);
+    if v >= 0 { binding(B_VARIANT, v) } else { B_NONE }
+}
+
+// ---- The prelude (0.6) ----
+//
+// Names every module sees without `use`, after everything else (its own
+// items, its imports): std's Option, Some, None, Result, Ok, Err, Vec,
+// print and println: a fixed list, not a `*` import (it stays in 0.8).
+// The standard library is loaded when a program names one of them (or
+// `std`).
+
+// The prelude's names, interned once: Option, Some, None, Result, Ok,
+// Err, Vec, print, println (it is asked about every identifier while the
+// modules load).
+static mut PRELUDE_NAMES: [i64; 17] = [0; 17];
+
+static mut PRELUDE_INTERNED: bool = false;
+
+fn prelude_name(i: i64) -> i64 {
+    if !PRELUDE_INTERNED {
+        // (0.9: and the traits of the operators, and Hash)
+        let names: [*u8; 17] = [c"Option", c"Some", c"None", c"Result", c"Ok", c"Err", c"Vec", c"print", c"println",
+            c"Add", c"Sub", c"Mul", c"Div", c"Neg", c"Eq", c"Ord", c"Hash"];
+        for k in 0..17 {
+            unsafe { PRELUDE_NAMES[k] = intern_c(names[k]); }
+        }
+        PRELUDE_INTERNED = true;
+    }
+    PRELUDE_NAMES[i]
+}
+
+pub fn is_prelude_name(name: i64) -> bool {
+    for i in 0..17 {
+        if name == prelude_name(i) {
+            return true;
+        }
+    }
+    false
+}
+
+fn prelude_lookup(name: i64, m: i64, depth: i64) -> i64 {
+    unsafe {
+        if !is_prelude_name(name) {
+            return B_NONE;
+        }
+        let some = name == prelude_name(1) || name == prelude_name(2);
+        let ok = name == prelude_name(4) || name == prelude_name(5);
+        if some || ok {
+            let e = lookup_uncached(STD_MODULE, if some { prelude_name(0) } else { prelude_name(3) }, m, depth + 1);
+            if binding_kind(e) != B_ITEM || SYM_ENUM[binding_value(e)] == 0 {
+                return B_NONE;
+            }
+            return enum_variant_binding(SYM_ENUM[binding_value(e)] - 1, name);
+        }
+        lookup_uncached(STD_MODULE, name, m, depth + 1)
+    }
+}
+
+// The module (or the item, for the last segment) named by the first
+// `count` segments of `path` (a Path node whose list holds Ident nodes),
+// from module m: `crate`, `self` and `super` first; `std`.
+fn resolve_path(m: i64, path: i64, count: i64, pos: i64) -> i64 {
+    unsafe {
+        let mut cur = binding(B_MODULE, m);
+        for i in 0..count {
+            let seg = child(path, i);
+            let name = NODES[seg].a;
+            if binding_kind(cur) != B_MODULE {
+                name_error(NODES[seg].start, c"'", NODES[child(path, i - 1)].a, c"' is not a module");
+            }
+            let here = binding_value(cur);
+            if i == 0 && name == SYM_CRATE {
+                cur = binding(B_MODULE, 0);
+                continue;
+            }
+            if i == 0 && name == SELF_SYM {
+                continue;
+            }
+            if name == SYM_SUPER && (i == 0 || NODES[child(path, i - 1)].a == SYM_SUPER) {
+                if MODULES[here].parent < 0 {
+                    error_at(NODES[seg].start, c"the root module has no 'super'");
+                }
+                cur = binding(B_MODULE, MODULES[here].parent);
+                continue;
+            }
+            let found = lookup_name(here, name, m);
+            if binding_kind(found) == B_PRIVATE {
+                access_error(found, NODES[seg].start, name);
+            }
+            if found == B_NONE {
+                if i == 0 && name == SYM_STD && STD_MODULE >= 0 {
+                    cur = binding(B_MODULE, STD_MODULE);
+                    continue;
+                }
+                err_begin(NODES[seg].start);
+                err_failed_name(name);
+                if i == 0 {
+                    err_str(c"unknown module '");
+                    err_sym(name);
+                    err_str(c"'");
+                } else {
+                    err_str(c"no '");
+                    err_sym(name);
+                    err_str(c"' in module '");
+                    if here == 0 {
+                        err_str(c"crate");
+                    } else {
+                        err_sym(MODULES[here].key);
+                    }
+                    err_str(c"'");
+                }
+                err_end();
+            }
+            cur = found;
+            if binding_kind(found) == B_MODULE {
+                qnote_module(NODES[seg].start, name, binding_value(found), 0);
+            }
+        }
+        let _ = pos;
+        cur
+    }
+}
+
+// The item a node names through a path of modules (h of a StructLit or a
+// PatVariant, the list of a TyName or a Path): the module after its
+// segments, from the module being checked.
+pub fn path_module(path: i64, count: i64) -> i64 {
+    unsafe {
+        let b = resolve_path(CUR_MOD, path, count, NODES[path].start);
+        if binding_kind(b) != B_MODULE {
+            name_error(NODES[child(path, count - 1)].start, c"'", NODES[child(path, count - 1)].a, c"' is not a module");
+        }
+        binding_value(b)
+    }
+}

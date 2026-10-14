@@ -6,16 +6,18 @@
 #      `seed` tag, built with cargo;
 #   2. every release, in order: built by the previous step's compiler, then
 #      by itself; the two emitted outputs must be identical (the fixpoint),
-#      and the release's own test suite must pass;
+#      and the release's own test suite must pass (by default only the
+#      last release's: see --history);
 #   3. HEAD (or the working tree), the same way, built by the last release.
 #
 # Everything is built for the host, which is detected first; each release
 # lists the hosts it supports. Only the host's tools are required: git,
 # cargo, a C compiler (cc, or $CC) and POSIX utilities.
 #
-# Built steps are cached under target/bootstrap/<host>/, so a rerun only
-# redoes HEAD. The final compiler is copied to target/tachyonc, where
-# tests/run.sh looks for it.
+# Built steps are cached under target/bootstrap/<host>/, by tag and
+# commit, so a rerun only redoes HEAD (and what --history full asks for
+# that the cache lacks). The final compiler is copied to target/tachyonc,
+# where tests/run.sh looks for it.
 #
 # usage: bootstrap/bootstrap.sh [options]
 #
@@ -36,6 +38,16 @@
 #   --cache DIR        the cache directory (default: target/bootstrap)
 #   --clean            empty the cache first
 #   --out PATH         also copy the final compiler here
+#   --history MODE     (0.11) what is checked of the releases before HEAD:
+#                      `fast` (the default) builds each and checks its
+#                      fixpoint, but runs the test suite of the last one
+#                      only; `full` runs every release's suite too, an
+#                      occasional complete replay (with --clean: from
+#                      nothing). A result in the cache counts for both
+#                      when it holds what the mode asks for.
+#   --no-head-tests    (0.11) build HEAD and check its fixpoint, but leave
+#                      its test suite to the caller (bootstrap/gate.sh runs
+#                      it at every level)
 #
 # See docs/releases.md.
 
@@ -53,6 +65,8 @@ HOST=""
 SEED_BIN=""
 CLEAN=0
 OUT=""
+HISTORY=fast
+RUN_HEAD_TESTS=1
 
 die() {
     echo "bootstrap: error: $*" >&2
@@ -92,11 +106,18 @@ while [ $# -gt 0 ]; do
         --cache) [ $# -ge 2 ] || die "--cache needs a directory"; CACHE=$2; shift ;;
         --clean) CLEAN=1 ;;
         --out) [ $# -ge 2 ] || die "--out needs a path"; OUT=$2; shift ;;
-        -h|--help) sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --history) [ $# -ge 2 ] || die "--history needs fast or full"; HISTORY=$2; shift ;;
+        --history=*) HISTORY=${1#--history=} ;;
+        --no-head-tests) RUN_HEAD_TESTS=0 ;;
+        -h|--help) sed -n '2,52p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown option '$1' (see --help)" ;;
     esac
     shift
 done
+case "$HISTORY" in
+    fast|full) ;;
+    *) die "--history is fast or full, not '$HISTORY'" ;;
+esac
 
 # ---- The host ----
 
@@ -159,7 +180,8 @@ fi
 # ---- The manifest ----
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-bootstrap.XXXXXX")
-trap 'rm -rf "$WORK"' EXIT INT TERM
+trap 'rm -rf "$WORK"' EXIT
+trap 'exit 130' INT TERM
 
 # One line per entry, fields separated by '|' (hosts comma-separated):
 #   seed|<tag>|<dir>
@@ -313,11 +335,11 @@ compile_with() { # <cli> <bin> <src> <root> <out>
 }
 
 # Builds the compiler in <tree>/<compiler> with <builder>, checks the
-# fixpoint and runs the tree's test suite; leaves <dir>/tachyonc and sets
-# TEST_TOTAL.
-build_and_check() { # <name> <tree> <compiler> <root> <cli> <tests> <builder_cli> <builder_bin> <builder_name> <dir>
+# fixpoint and, if <run_tests> is 1, runs the tree's test suite; leaves
+# <dir>/tachyonc and sets TEST_TOTAL.
+build_and_check() { # <name> <tree> <compiler> <root> <cli> <tests> <builder_cli> <builder_bin> <builder_name> <dir> <run_tests>
     bc_name=$1 bc_tree=$2 bc_src="$2/$3" bc_root=$4 bc_cli=$5 bc_tests=$6
-    bc_builder_cli=$7 bc_builder_bin=$8 bc_builder_name=$9 bc_dir=${10}
+    bc_builder_cli=$7 bc_builder_bin=$8 bc_builder_name=$9 bc_dir=${10} bc_run_tests=${11}
     mkdir -p "$bc_dir"
     step "$bc_name: building with $bc_builder_name"
     compile_with "$bc_builder_cli" "$bc_builder_bin" "$bc_src" "$bc_root" "$bc_dir/build1"
@@ -327,12 +349,20 @@ build_and_check() { # <name> <tree> <compiler> <root> <cli> <tests> <builder_cli
     cmp -s "$bc_dir/build2.$CW_EMITTED" "$bc_dir/build3.$CW_EMITTED" \
         || die "$bc_name: no fixpoint: $bc_dir/build2.$CW_EMITTED and build3.$CW_EMITTED differ (its output depends on how it was built)"
     cp "$bc_dir/build2" "$bc_dir/tachyonc"
-    step "$bc_name: running its test suite ($bc_tests)"
-    if ! (cd "$bc_tree" && "./$bc_tests" -c "$bc_dir/tachyonc" -t "$HOST") >"$bc_dir/tests.log" 2>&1; then
-        tail -40 "$bc_dir/tests.log" >&2
-        die "$bc_name: test suite failed (log: $bc_dir/tests.log)"
+    TEST_TOTAL="not run"
+    [ "$bc_run_tests" = 1 ] || return 0
+    run_suite "$bc_name" "$bc_tree" "$bc_tests" "$bc_dir"
+}
+
+# Runs the test suite of the tree <tree> with <dir>/tachyonc; sets
+# TEST_TOTAL.
+run_suite() { # <name> <tree> <tests> <dir>
+    step "$1: running its test suite ($3)"
+    if ! (cd "$2" && "./$3" -c "$4/tachyonc" -t "$HOST") >"$4/tests.log" 2>&1; then
+        tail -40 "$4/tests.log" >&2
+        die "$1: test suite failed (log: $4/tests.log)"
     fi
-    TEST_TOTAL=$(awk '$1 == "total" { print $2 " passed, " $3 " xfail" }' "$bc_dir/tests.log")
+    TEST_TOTAL=$(awk '$1 == "total" { print $2 " passed, " $3 " xfail" }' "$4/tests.log")
 }
 
 SUMMARY="$WORK/summary"
@@ -375,6 +405,14 @@ fi
 
 # ---- The releases ----
 
+# The last release of the chain (the one that builds HEAD, or --until's):
+# its suite runs whatever the --history.
+LAST_RELEASE=""
+while IFS='|' read -r _ version tag _; do
+    [ -n "$(tag_commit "$tag")" ] && LAST_RELEASE=$version
+    [ "$version" = "$UNTIL" ] && break
+done <"$WORK/releases"
+
 TEST_TOTAL=""
 PREV_BIN=$SEED
 PREV_CLI=seed
@@ -393,14 +431,32 @@ while IFS='|' read -r _ version tag compiler built_by cli tests _ root; do
     fi
     short=$(echo "$commit" | cut -c1-12)
     dir="$CACHE/$tag-$short"
+    # (In the cache, `ok` holds the result of the release's suite;
+    # `fixpoint` says it was built and reached its fixpoint.)
+    run_tests=0
+    if [ "$HISTORY" = full ] || [ "$version" = "$LAST_RELEASE" ]; then
+        run_tests=1
+    fi
     if [ -f "$dir/ok" ]; then
         step "$version: $tag ($short), built and tested before (cached)"
         TEST_TOTAL=$(cat "$dir/ok")
+    elif [ -f "$dir/fixpoint" ] && [ $run_tests -eq 0 ]; then
+        step "$version: $tag ($short), built and its fixpoint checked before (cached)"
+        TEST_TOTAL="not run (--history fast)"
+    elif [ -f "$dir/fixpoint" ] && [ -x "$dir/tachyonc" ] && [ -d "$dir/tree" ]; then
+        run_suite "$version" "$dir/tree" "$tests" "$dir" </dev/null
+        echo "$TEST_TOTAL" >"$dir/ok"
     else
+        rm -f "$dir/fixpoint"
         extract "$commit" "$dir/tree"
         build_and_check "$version" "$dir/tree" "$compiler" "$root" "$cli" "$tests" \
-            "$PREV_CLI" "$PREV_BIN" "$PREV_NAME" "$dir" </dev/null
-        echo "$TEST_TOTAL" >"$dir/ok"
+            "$PREV_CLI" "$PREV_BIN" "$PREV_NAME" "$dir" "$run_tests" </dev/null
+        : >"$dir/fixpoint"
+        if [ $run_tests -eq 1 ]; then
+            echo "$TEST_TOTAL" >"$dir/ok"
+        else
+            TEST_TOTAL="not run (--history fast)"
+        fi
     fi
     note "$version    $tag $short, built by $PREV_NAME, fixpoint ok, tests: $TEST_TOTAL"
     PREV_BIN="$dir/tachyonc"
@@ -430,7 +486,8 @@ if [ $STOPPED -eq 0 ]; then
         extract "$head_commit" "$head_tree"
     fi
     build_and_check head "$head_tree" "$HEAD_COMPILER" "$HEAD_ROOT" "$HEAD_CLI" "$HEAD_TESTS" \
-        "$PREV_CLI" "$PREV_BIN" "$PREV_NAME" "$head_dir"
+        "$PREV_CLI" "$PREV_BIN" "$PREV_NAME" "$head_dir" "$RUN_HEAD_TESTS"
+    [ "$RUN_HEAD_TESTS" = 1 ] || TEST_TOTAL="left to the caller (--no-head-tests)"
     note "head     $head_desc, built by $PREV_NAME, fixpoint ok, tests: $TEST_TOTAL"
     FINAL="$head_dir/tachyonc"
     mkdir -p "$ROOT/target"

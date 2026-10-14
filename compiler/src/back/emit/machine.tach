@@ -1,0 +1,302 @@
+// The machine layer of the emitter (emit/mod.tach): the target's
+// registers and argument locations, and the m_* operations, which
+// dispatch to mc_arm64.tach or mc_x86_64.tach.
+
+use crate::back::abi::{conv_returns_through_pointer, fn_type_uses_c, fn_uses_c};
+use crate::back::emit::{LABEL_BASE, MEM_INDEX, SPILL_BASE};
+use crate::back::emit::stats::{ST_FN, ST_MOVES, st_spill};
+use crate::back::mc_arm64::{
+    ma_copy, ma_extern_addr, ma_lea, ma_load, ma_load_fimm, ma_load_imm, ma_mov, ma_normalize,
+    ma_store, ma_string_addr, ma_symbol_addr,
+};
+use crate::back::mc_x86_64::{
+    mx_copy, mx_extern_addr, mx_lea, mx_load, mx_load_fimm, mx_load_imm, mx_mov, mx_normalize,
+    mx_store, mx_string_addr, mx_symbol_addr,
+};
+use crate::base::BUFS;
+use crate::front::types::{TY_U64, in_fregs, is_float, type_size};
+use crate::gen0::target::{CODE, emit_jump, ins};
+use crate::base::target::X86;
+use crate::middle::ir::{BLOCKS, Cond, INSTS, Op};
+use crate::middle::ir::Op::{Call, CallI};
+use crate::back::emit::calls::callee_result;
+use crate::back::mc_x86_64::ops::{
+    mx_branch_bool, mx_cmp, mx_cmp_branch, mx_conv, mx_div, mx_float_op, mx_int_imm_ok, mx_int_op,
+    mx_int_op_imm, mx_unary,
+};
+use crate::back::mc_arm64::ops::{
+    ma_branch_bool, ma_cmp, ma_cmp_branch, ma_conv, ma_float_op, ma_int_imm_ok, ma_int_op,
+    ma_int_op_imm, ma_unary,
+};
+
+// ---- Registers of the machine layer ----
+
+pub fn reg_sp() -> i64 { if X86 { 4 } else { 31 } }
+
+pub fn reg_fp() -> i64 { if X86 { 5 } else { 29 } }
+
+// Never allocated: the register that breaks cycles of parallel moves, and
+// the temporary for memory-to-memory moves (and for operands loaded or
+// rematerialized where they are needed).
+pub fn reg_cycle(float: bool) -> i64 {
+    if float { if X86 { 47 } else { 63 } } else if X86 { 10 } else { 17 }
+}
+
+pub fn reg_move_temp(float: bool) -> i64 {
+    if float { if X86 { 46 } else { 62 } } else if X86 { 11 } else { 16 }
+}
+
+pub fn reg_ret(float: bool) -> i64 { if float { 32 } else { 0 } }
+
+fn reg_result_ptr() -> i64 { if X86 { 7 } else { 8 } }
+
+pub fn reg_callee() -> i64 { if X86 { 11 } else { 16 } }
+
+// Argument locations in the back end, for both conventions (see
+// abi.tach): 0-31 the index of an int argument register, 32-63 of a
+// float one, XL_STACK + offset a slot of the stack argument area (outgoing:
+// from sp; incoming: from the frame pointer, 16 bytes up).
+const XL_FLOAT: i64 = 32;
+
+const XL_STACK: i64 = 64;
+
+pub fn xl_is_stack(location: i64) -> bool {
+    location >= XL_STACK
+}
+
+pub fn xl_offset(location: i64) -> i64 {
+    location - XL_STACK
+}
+
+// A location of the C convention (see arg_location) as a back-end one.
+pub fn xl_from_c(location: i64) -> i64 {
+    if location < 8 {
+        return location;
+    }
+    if location < 16 {
+        return XL_FLOAT + location - 8;
+    }
+    XL_STACK + location - 16
+}
+
+// The register of argument location `location`: C's argument registers
+// first, then the tachyon convention's further ones.
+pub fn arg_reg(location: i64) -> i64 {
+    if location >= XL_FLOAT {
+        let index = location - XL_FLOAT;
+        if X86 || index < 8 {
+            return 32 + index;
+        }
+        // d16-d23.
+        return 32 + 8 + index;
+    }
+    if !X86 {
+        return location;
+    }
+    if location == 0 { return 7; }
+    if location == 1 { return 6; }
+    if location == 2 { return 2; }
+    if location == 3 { return 1; }
+    if location == 4 { return 8; }
+    if location == 5 { return 9; }
+    0
+}
+
+// The tachyon convention's argument registers.
+fn t_int_args() -> i64 { if X86 { 7 } else { 16 } }
+
+fn t_float_args() -> i64 { if X86 { 14 } else { 16 } }
+
+// The location of the next scalar argument of type ty under the tachyon
+// convention: the next register of its class, else the next 8-byte stack
+// slot. `state` as for arg_location.
+pub fn t_arg_location(ty: i64, state: *i64) -> i64 {
+    unsafe {
+        if is_float(ty) {
+            if state[1] < t_float_args() {
+                state[1] += 1;
+                return XL_FLOAT + state[1] - 1;
+            }
+        } else if state[0] < t_int_args() {
+            state[0] += 1;
+            return state[0] - 1;
+        }
+        let offset = state[2];
+        state[2] += 8;
+        XL_STACK + offset
+    }
+}
+
+// Whether call v follows C's convention.
+pub fn call_uses_c(v: i64) -> bool {
+    unsafe {
+        let op = INSTS[v].op;
+        if op == Call { return fn_uses_c(INSTS[v].imm); }
+        if op == CallI { return fn_type_uses_c(INSTS[v].imm); }
+        true
+    }
+}
+
+pub fn call_returns_through_pointer(v: i64) -> bool {
+    conv_returns_through_pointer(call_uses_c(v), callee_result(v))
+}
+
+// The register of the result pointer: x8 / rdi in C's convention, the first
+// argument register in tachyon's.
+pub fn conv_result_ptr_reg(c: bool) -> i64 {
+    if c { reg_result_ptr() } else { arg_reg(0) }
+}
+
+// The type a spill slot is accessed with.
+pub fn spill_type(ty: i64) -> i64 {
+    if in_fregs(ty) { ty } else { TY_U64 }
+}
+
+pub fn spill_offset(loc: i64) -> i64 {
+    SPILL_BASE + 8 * (0 - loc - 1)
+}
+
+pub fn block_label(b: i64) -> i64 {
+    unsafe { LABEL_BASE + BLOCKS[b].order }
+}
+
+// ---- Dispatch to the machine layer ----
+
+// Post-allocation peepholes on what was just emitted (nothing else, not
+// even a label, since): a move back to where a value just came from is
+// none, and a load of the spill slot (or stack slot) just stored to is a
+// move from the register stored.
+static mut LAST_MOV_DST: i64 = -1;
+
+static mut LAST_MOV_SRC: i64 = -1;
+
+pub static mut LAST_MOV_END: i64 = -1;
+
+static mut LAST_STORE_REG: i64 = -1;
+
+static mut LAST_STORE_OFFSET: i64 = 0;
+
+static mut LAST_STORE_TYPE: i64 = 0;
+
+pub static mut LAST_STORE_END: i64 = -1;
+
+pub fn m_mov(dst: i64, src: i64, ty: i64) {
+    unsafe {
+        if dst == src { return; }
+        if BUFS[CODE].len == LAST_MOV_END && dst == LAST_MOV_SRC && src == LAST_MOV_DST {
+            return;
+        }
+        if X86 { mx_mov(dst, src, ty); } else { ma_mov(dst, src, ty); }
+        ST_FN[ST_MOVES] += 1;
+        LAST_MOV_DST = dst;
+        LAST_MOV_SRC = src;
+        LAST_MOV_END = BUFS[CODE].len;
+    }
+}
+
+pub fn m_load_imm(dst: i64, value: u64) {
+    if X86 { mx_load_imm(dst, value); } else { ma_load_imm(dst, value); }
+}
+
+pub fn m_load_fimm(dst: i64, bits: i64, ty: i64) {
+    if X86 { mx_load_fimm(dst, bits, ty); } else { ma_load_fimm(dst, bits, ty); }
+}
+
+pub fn m_load(ty: i64, dst: i64, base: i64, offset: i64) {
+    if unsafe { MEM_INDEX < 0 && base == reg_sp() && BUFS[CODE].len == LAST_STORE_END && offset == LAST_STORE_OFFSET
+        && ty == LAST_STORE_TYPE && type_size(ty) == 8 && (dst >= 32) == (LAST_STORE_REG >= 32) } {
+        m_mov(dst, LAST_STORE_REG, ty);
+        return;
+    }
+    st_spill(true, base, offset);
+    if X86 { mx_load(ty, dst, base, offset); } else { ma_load(ty, dst, base, offset); }
+}
+
+pub fn m_store(ty: i64, src: i64, base: i64, offset: i64) {
+    st_spill(false, base, offset);
+    if X86 { mx_store(ty, src, base, offset); } else { ma_store(ty, src, base, offset); }
+    if MEM_INDEX < 0 && base == reg_sp() {
+        LAST_STORE_REG = src;
+        LAST_STORE_OFFSET = offset;
+        LAST_STORE_TYPE = ty;
+        unsafe { LAST_STORE_END = BUFS[CODE].len; }
+    }
+}
+
+pub fn m_lea(dst: i64, base: i64, offset: i64) {
+    if X86 { mx_lea(dst, base, offset); } else { ma_lea(dst, base, offset); }
+}
+
+pub fn m_symbol_addr(dst: i64, prefix: *u8, name: i64) {
+    if X86 { mx_symbol_addr(dst, prefix, name); } else { ma_symbol_addr(dst, prefix, name); }
+}
+
+pub fn m_extern_addr(dst: i64, name: i64) {
+    if X86 { mx_extern_addr(dst, name); } else { ma_extern_addr(dst, name); }
+}
+
+pub fn m_string_addr(dst: i64, id: i64) {
+    if X86 { mx_string_addr(dst, id); } else { ma_string_addr(dst, id); }
+}
+
+pub fn m_normalize(r: i64, ty: i64) {
+    if X86 { mx_normalize(r, ty); } else { ma_normalize(r, ty); }
+}
+
+pub fn m_int_op(op: Op, ty: i64, dst: i64, a: i64, b: i64) {
+    if X86 { mx_int_op(op, ty, dst, a, b); } else { ma_int_op(op, ty, dst, a, b); }
+}
+
+// dst = a <op> imm when the target encodes it; false otherwise.
+pub fn m_int_op_imm(op: Op, ty: i64, dst: i64, a: i64, imm: i64) -> bool {
+    if X86 { mx_int_op_imm(op, ty, dst, a, imm) } else { ma_int_op_imm(op, ty, dst, a, imm) }
+}
+
+pub fn m_float_op(op: Op, ty: i64, dst: i64, a: i64, b: i64) {
+    if X86 { mx_float_op(op, ty, dst, a, b); } else { ma_float_op(op, ty, dst, a, b); }
+}
+
+pub fn m_unary(op: Op, ty: i64, dst: i64, a: i64) {
+    if X86 { mx_unary(op, ty, dst, a); } else { ma_unary(op, ty, dst, a); }
+}
+
+pub fn m_cmp(op: Cond, ty: i64, dst: i64, a: i64, b: i64) {
+    if X86 { mx_cmp(op, ty, dst, a, b); } else { ma_cmp(op, ty, dst, a, b); }
+}
+
+// Compares integers a and b (b an immediate when b_imm) and jumps to
+// `label` when a <op> b.
+pub fn m_cmp_branch(op: Cond, ty: i64, a: i64, b: i64, b_is_imm: bool, imm: i64, label: i64) {
+    if X86 { mx_cmp_branch(op, ty, a, b, b_is_imm, imm, label); } else { ma_cmp_branch(op, ty, a, b, b_is_imm, imm, label); }
+}
+
+pub fn m_branch_bool(r: i64, if_nonzero: bool, label: i64) {
+    if X86 { mx_branch_bool(r, if_nonzero, label); } else { ma_branch_bool(r, if_nonzero, label); }
+}
+
+pub fn m_jump(label: i64) {
+    emit_jump(label);
+}
+
+pub fn m_conv(from: i64, to: i64, dst: i64, src: i64) {
+    if X86 { mx_conv(from, to, dst, src); } else { ma_conv(from, to, dst, src); }
+}
+
+pub fn m_copy(dst: i64, src: i64, size: i64) {
+    if X86 { mx_copy(dst, src, size); } else { ma_copy(dst, src, size); }
+}
+
+pub fn m_div(op: Op, ty: i64, dst: i64, a: i64, b: i64, b_const: i64, b_is_const: bool) {
+    if X86 { mx_div(op, ty, dst, a, b, b_const, b_is_const); } else { ma_int_op(op, ty, dst, a, b); }
+}
+
+// Whether `dst = a <op> imm` is one instruction (m_int_op_imm emits it).
+pub fn m_int_imm_ok(op: Op, ty: i64, imm: i64) -> bool {
+    if X86 { mx_int_imm_ok(op, imm) } else { ma_int_imm_ok(op, imm) }
+}
+
+pub fn m_trap() {
+    unsafe {
+        if X86 { ins(c"ud2"); } else { ins(c"brk #1"); }
+    }
+}

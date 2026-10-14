@@ -1,0 +1,215 @@
+// Types: names with type arguments, pointers, slices, arrays, tuples and
+// function types; and the type arguments after a name (`Vec<T>`,
+// `f::<T>`), splitting the `>` off `>>`.
+
+use crate::base::intern_c;
+use crate::base::diag::error_at;
+use crate::front::ast::{NODES, NodeKind, list_begin, list_end, list_push, new_node};
+use crate::front::lexer::{STRS, TOKS};
+use crate::front::lexer::Tok::{
+    Arrow, Bang, ColonColon, Comma, Ellipsis, Eof, Eq, Extern, Fn, Gt, GtEq, Ident, LBracket,
+    LParen, Lt, RBracket, RParen, Reserved, Semi, Shr, ShrEq, Star, Str,
+};
+use crate::front::parser::{
+    NO_STRUCT, P, advance, at, cur, cur_start, eat, expect, expect_ident, prev_end, reserved_error,
+    syntax_error, with_no_struct,
+};
+use crate::front::parser::exprs::parse_expr;
+
+// `<A, B>` type arguments (after a type's name, or `::` in an
+// expression); the `>` of `>>` (and of `>=`, `>>=`) is split off.
+pub fn parse_type_args() -> i64 {
+    unsafe {
+        let n = new_node(NodeKind::Generics, cur_start(), 0);
+        expect(Lt);
+        let mark = list_begin();
+        while !at_gt() && !at(Eof) {
+            list_push(parse_type());
+            if !eat(Comma) {
+                break;
+            }
+        }
+        list_end(n, mark);
+        if NODES[n].count == 0 {
+            error_at(NODES[n].start, c"expected a type argument");
+        }
+        expect_gt();
+        NODES[n].end = prev_end();
+        n
+    }
+}
+
+fn at_gt() -> bool {
+    at(Gt) || at(Shr) || at(GtEq) || at(ShrEq)
+}
+
+fn expect_gt() {
+    let kind = cur();
+    if kind == Shr || kind == GtEq || kind == ShrEq {
+        // Keep the rest of the token: `>`, `=` or `>=`.
+        unsafe {
+            TOKS[P].kind = if kind == Shr { Gt } else if kind == GtEq { Eq } else { GtEq };
+            TOKS[P].start += 1;
+        }
+        return;
+    }
+    expect(Gt);
+}
+
+// Whether `name` is a primitive type's name: an integer's, a float's,
+// bool.
+fn is_primitive_name(name: i64) -> bool {
+    unsafe { is_int_type_name(name) || name == intern_c(c"f64") || name == intern_c(c"f32") || name == intern_c(c"bool") }
+}
+
+// Whether `name` is an integer type's name (for #[repr(u8)] and so on).
+pub fn is_int_type_name(name: i64) -> bool {
+    let names: [*u8; 8] = [c"i8", c"i16", c"i32", c"i64", c"u8", c"u16", c"u32", c"u64"];
+    for i in 0..8 {
+        if unsafe { name == intern_c(names[i]) } {
+            return true;
+        }
+    }
+    false
+}
+
+// ---- Types ----
+
+pub fn parse_type() -> i64 {
+    unsafe {
+        let start = cur_start();
+        let kind = cur();
+        if kind == Ident {
+            let n = new_node(NodeKind::TyName, start, 0);
+            NODES[n].a = expect_ident();
+            if at(ColonColon) {
+                // `a::b::T`: a type in a module (0.5); the segments before the
+                // name are the TyName's list.
+                let mark = list_begin();
+                while eat(ColonColon) {
+                    let seg = new_node(NodeKind::Ident, NODES[n].start, prev_end());
+                    NODES[seg].a = NODES[n].a;
+                    list_push(seg);
+                    NODES[n].a = expect_ident();
+                }
+                list_end(n, mark);
+            }
+            // (a primitive type takes no type arguments: `x as i64 < n`
+            // compares, 0.11)
+            if at(Lt) && !(NODES[n].list == 0 && is_primitive_name(NODES[n].a)) {
+                NODES[n].g = parse_type_args();
+            }
+            NODES[n].end = prev_end();
+            return n;
+        }
+        if kind == Star {
+            advance();
+            let n = new_node(NodeKind::TyPtr, start, 0);
+            NODES[n].a = parse_type();
+            NODES[n].end = prev_end();
+            return n;
+        }
+        if kind == Bang {
+            advance();
+            return new_node(NodeKind::TyNever, start, prev_end());
+        }
+        if kind == LParen {
+            return parse_paren_type(start);
+        }
+        if kind == LBracket {
+            return parse_array_type(start);
+        }
+        if kind == Fn {
+            return parse_fn_type(start);
+        }
+        if kind == Extern {
+            advance();
+            if at(Str) {
+                let abi = TOKS[P].value as i64;
+                if !(STRS[abi].len == 1 && STRS[abi].ptr[0] == 'C') {
+                    error_at(cur_start(), c"unsupported ABI; only \"C\" is supported");
+                }
+                advance();
+            }
+            let n = parse_fn_type(start);
+            NODES[n].d = 1;
+            return n;
+        }
+        if kind == Reserved {
+            reserved_error();
+        }
+        syntax_error(c"expected type")
+    }
+}
+
+fn parse_paren_type(start: i64) -> i64 {
+    expect(LParen);
+    if eat(RParen) {
+        return new_node(NodeKind::TyUnit, start, prev_end());
+    }
+    let first = parse_type();
+    if !eat(Comma) {
+        expect(RParen);
+        return first;
+    }
+    let n = new_node(NodeKind::TyTuple, start, 0);
+    let mark = list_begin();
+    list_push(first);
+    while !at(RParen) && !at(Eof) {
+        list_push(parse_type());
+        if !eat(Comma) {
+            break;
+        }
+    }
+    list_end(n, mark);
+    expect(RParen);
+    unsafe { NODES[n].end = prev_end(); }
+    n
+}
+
+fn parse_array_type(start: i64) -> i64 {
+    unsafe {
+        expect(LBracket);
+        let n = new_node(NodeKind::TyArray, start, 0);
+        NODES[n].a = parse_type();
+        if eat(RBracket) {
+            NODES[n].kind = NodeKind::TySlice;
+            NODES[n].end = prev_end();
+            return n;
+        }
+        expect(Semi);
+        let saved = with_no_struct(false);
+        NODES[n].b = parse_expr();
+        NO_STRUCT = saved;
+        expect(RBracket);
+        NODES[n].end = prev_end();
+        n
+    }
+}
+
+fn parse_fn_type(start: i64) -> i64 {
+    unsafe {
+        expect(Fn);
+        expect(LParen);
+        let n = new_node(NodeKind::TyFn, start, 0);
+        let mark = list_begin();
+        while !at(RParen) && !at(Eof) {
+            if at(Ellipsis) {
+                error_at(cur_start(), c"function pointer types cannot be variadic; call variadic functions directly");
+            }
+            list_push(parse_type());
+            if !eat(Comma) {
+                break;
+            }
+        }
+        list_end(n, mark);
+        expect(RParen);
+        if eat(Arrow) {
+            NODES[n].a = parse_type();
+        } else {
+            NODES[n].a = new_node(NodeKind::TyUnit, prev_end(), prev_end());
+        }
+        NODES[n].end = prev_end();
+        n
+    }
+}

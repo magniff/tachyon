@@ -1,0 +1,171 @@
+// Building the vector loop's code: the map from the loop's values to the
+// vector loop's (V_MAP), instructions appended to a block, values
+// materialized at a given iteration (eval_at), the vector form of a value
+// and the body on VF lanes (emit_body), and the identities of reductions.
+
+use crate::front::types::TY_BOOL;
+use crate::middle::ir::{BLOCKS, Cond, INSTS, Op, ir_append, ir_make, ir_val};
+use crate::middle::ir::Op::{And, Cmp, Const, Load, Mul, Neg, Phi, Store, VBin, VNeg, VSplat};
+use crate::middle::loops::invariant_in;
+use crate::middle::vectorize::{
+    VC_SKIP, VC_UNIFORM, VC_VECTOR, V_CHAIN, V_EVAL, V_IV, V_MAP, V_START, V_VT,
+};
+use crate::middle::vectorize::legality::{class_of, loads_in};
+
+pub fn map_get(v: i64) -> i64 {
+    unsafe {
+        let x = ir_val(v);
+        let mut k = 0;
+        while k < V_MAP.count {
+            if V_MAP.data[k] == x {
+                return V_MAP.data[k + 1];
+            }
+            k += 2;
+        }
+        x
+    }
+}
+
+pub fn map_put(v: i64, w: i64) {
+    unsafe {
+        V_MAP.push(v);
+        V_MAP.push(w);
+    }
+}
+
+pub fn append(b: i64, op: Op, ty: i64, a: i64, x: i64, imm: i64) -> i64 {
+    let v = ir_make(op, ty, a, x, imm);
+    ir_append(b, v);
+    v
+}
+
+pub fn konst(b: i64, value: i64, ty: i64) -> i64 {
+    append(b, Const, ty, 0, 0, value)
+}
+
+pub fn cmp(b: i64, cond: Cond, ty: i64, a: i64, x: i64) -> i64 {
+    let v = append(b, Cmp, TY_BOOL, a, x, 0);
+    unsafe {
+        INSTS[v].cond = cond;
+        INSTS[v].imm2 = ty;
+    }
+    v
+}
+
+// The value of uniform (or invariant) v when the induction variable is
+// `at`, computed in block b.
+pub fn eval_at(l: i64, v: i64, at: i64, b: i64) -> i64 {
+    unsafe {
+        let x = ir_val(v);
+        if x == V_IV {
+            return at;
+        }
+        if invariant_in(l, x) {
+            return x;
+        }
+        let mut k = 0;
+        while k < V_EVAL.count {
+            if V_EVAL.data[k] == x && V_EVAL.data[k + 1] == at {
+                return V_EVAL.data[k + 2];
+            }
+            k += 3;
+        }
+        let a = if INSTS[x].a != 0 { eval_at(l, INSTS[x].a, at, b) } else { 0 };
+        let y = if INSTS[x].b != 0 { eval_at(l, INSTS[x].b, at, b) } else { 0 };
+        let nv = ir_make(INSTS[x].op, INSTS[x].ty, a, y, INSTS[x].imm);
+        INSTS[nv].imm2 = INSTS[x].imm2;
+        INSTS[nv].cond = INSTS[x].cond;
+        ir_append(b, nv);
+        V_EVAL.push(x);
+        V_EVAL.push(at);
+        V_EVAL.push(nv);
+        nv
+    }
+}
+
+// ok = ok && c (as branches would cost blocks: and of bools, 0 or 1).
+pub fn and_into(b: i64, ok: i64, c: i64) -> i64 {
+    if ok == 0 {
+        return c;
+    }
+    append(b, And, TY_BOOL, ok, c, 0)
+}
+
+// The value of v for the vector loop: a vector (splat when v is the same
+// for all lanes; invariant ones in the vector preheader `vp`).
+fn vector_of(v: i64, vh: i64, vp: i64, l: i64) -> i64 {
+    unsafe {
+        let x = ir_val(v);
+        if class_of(x) == VC_VECTOR {
+            return map_get(x);
+        }
+        let key = -x - 1;
+        let mut k = 0;
+        while k < V_MAP.count {
+            if V_MAP.data[k] == key {
+                return V_MAP.data[k + 1];
+            }
+            k += 2;
+        }
+        if invariant_in(l, x) || !loads_in(l, x) {
+            // The same in every iteration (coefficient 0, no load): computed
+            // once, before the loop.
+            let s = ir_make(VSplat, V_VT, eval_at(l, x, V_START, vp), 0, 0);
+            ir_append(vp, s);
+            map_put(key, s);
+            return s;
+        }
+        let s = ir_make(VSplat, V_VT, map_get(x), 0, 0);
+        ir_append(vh, s);
+        s
+    }
+}
+
+// One copy of the loop's body in block vh (V_MAP maps the induction
+// variable and the reductions' phis).
+pub fn emit_body(l: i64, vh: i64, vp: i64) {
+    unsafe {
+        let vt = V_VT;
+        for k in 0..V_CHAIN.count {
+            let mut v = BLOCKS[V_CHAIN.data[k]].first;
+            while v != 0 {
+                let cls = class_of(v);
+                let op = INSTS[v].op;
+                if op == Phi || cls == VC_SKIP {
+                    v = INSTS[v].next;
+                    continue;
+                }
+                if cls == VC_UNIFORM {
+                    let nv = ir_make(op, INSTS[v].ty, map_get(INSTS[v].a), map_get(INSTS[v].b), INSTS[v].imm);
+                    INSTS[nv].imm2 = INSTS[v].imm2;
+                    INSTS[nv].cond = INSTS[v].cond;
+                    ir_append(vh, nv);
+                    map_put(v, nv);
+                } else if op == Load {
+                    let nv = append(vh, Load, vt, map_get(INSTS[v].a), 0, INSTS[v].imm);
+                    map_put(v, nv);
+                } else if op == Store {
+                    let value = vector_of(INSTS[v].b, vh, vp, l);
+                    let nv = append(vh, Store, 0, map_get(INSTS[v].a), value, INSTS[v].imm);
+                    INSTS[nv].imm2 = vt;
+                } else if op == Neg {
+                    let nv = append(vh, VNeg, vt, vector_of(INSTS[v].a, vh, vp, l), 0, 0);
+                    map_put(v, nv);
+                } else {
+                    let a = vector_of(INSTS[v].a, vh, vp, l);
+                    let b = vector_of(INSTS[v].b, vh, vp, l);
+                    let nv = append(vh, VBin, vt, a, b, op as i64);
+                    map_put(v, nv);
+                }
+                v = INSTS[v].next;
+            }
+        }
+    }
+}
+
+// The identity of reduction operation op.
+pub fn identity(op: Op) -> i64 {
+    if op == And { return -1; }
+    if op == Mul { return 1; }
+    0
+}

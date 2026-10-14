@@ -1,0 +1,471 @@
+// Loop strength reduction and loop unswitching (0.4).
+//
+// Strength reduction: in an innermost loop, the address of a load or a
+// store that is an affine function of an induction variable i (64-bit
+// arithmetic: k + s*i + c1*b1 + c2*b2, with b1 and b2 loop-invariant) and
+// costs a multiplication or a shift becomes a pointer induction variable:
+// a new header phi starting at the address for the first iteration and
+// advancing by s*step at the latch. Addresses that differ by a constant
+// share one pointer (the difference folds into the access's offset). All
+// of it is arithmetic modulo 2^64, as the addresses were.
+//
+// Unswitching: a branch inside a small innermost loop on a condition
+// defined outside it: the loop is cloned, the preheader branches on the
+// condition to the original (where the branch is now always taken one way)
+// or the copy (the other way).
+
+use crate::base::{IntVec, free};
+use crate::front::types::{TY_BOOL, TY_U64, int_bits, is_integer};
+use crate::middle::ir::{
+    ARGS, ARGTY, BLOCKS, INSTS, IRF, IRFUNCS, Term, ir_append, ir_arg, ir_make, ir_prepend,
+    ir_set_arg, ir_val,
+};
+use crate::middle::ir::cfg::pred_index;
+use crate::middle::ir::verify::verify_func;
+use crate::middle::opt::{resolve_all, simplify_cfg};
+use crate::middle::fold::{const_before, is_const, op_before};
+use crate::middle::loops::{
+    LP_LIST, LP_LIST2, LP_SEEN, LP_VALUES, add_pred_values, canonicalize_loops, clone_map,
+    clone_region, form_lcssa, innermost_loop, invariant_in, is_canonical, is_innermost, loop_block,
+    loop_count, loop_exits, loop_header, loop_inst_count, loop_latch, loop_preheader, loop_size,
+    mark_loop_blocks,
+};
+use crate::middle::scev::{append_const, append_inst, iv_start, iv_step};
+use crate::middle::ir::Op::{Add, Const, Conv, Load, Mul, Phi, Shl, Store, Sub};
+
+const LSR_MAX_POINTERS: i64 = 4;
+const UNSWITCH_MAX_SIZE: i64 = 48;
+
+// An affine form: AF[0] = k, AF[1] = s, then the terms (b1, c1), (b2, c2)
+// (b = 0: none), then (v, m): the value is k + c1*b1 + c2*b2 + (s + m*v)*i
+// (v invariant: a stride known at run time only).
+const AF_SIZE: i64 = 8;
+
+fn af_set(af: *i64, k: i64, s: i64, b1: i64, c1: i64, b2: i64, c2: i64) {
+    unsafe {
+        af[0] = k;
+        af[1] = s;
+        af[2] = b1;
+        af[3] = c1;
+        af[4] = b2;
+        af[5] = c2;
+        af[6] = 0;
+        af[7] = 0;
+    }
+}
+
+// Adds term (b, c) to af; false when there is no room.
+fn af_add_term(af: *i64, b: i64, c: i64) -> bool {
+    unsafe {
+        if b == 0 || c == 0 {
+            return true;
+        }
+        if af[2] == b {
+            af[3] = af[3] + c;
+            return true;
+        }
+        if af[4] == b {
+            af[5] = af[5] + c;
+            return true;
+        }
+        if af[2] == 0 || af[3] == 0 {
+            af[2] = b;
+            af[3] = c;
+            return true;
+        }
+        if af[4] == 0 || af[5] == 0 {
+            af[4] = b;
+            af[5] = c;
+            return true;
+        }
+        false
+    }
+}
+
+// af = x + m * y.
+fn af_combine(af: *i64, x: *i64, y: *i64, m: i64) -> bool {
+    unsafe {
+        af_set(af, x[0] + m * y[0], x[1] + m * y[1], x[2], x[3], x[4], x[5]);
+        if x[7] != 0 && y[7] != 0 && x[6] != y[6] {
+            return false;
+        }
+        af[6] = if x[7] != 0 { x[6] } else { y[6] };
+        af[7] = x[7] + m * y[7];
+        af_add_term(af, y[2], m * y[3]) && af_add_term(af, y[4], m * y[5])
+    }
+}
+
+fn af_scale(af: *i64, m: i64) {
+    unsafe {
+        af[0] = af[0] * m;
+        af[1] = af[1] * m;
+        af[3] = af[3] * m;
+        af[5] = af[5] * m;
+        af[7] = af[7] * m;
+    }
+}
+
+// The affine form of v in loop l over induction variable iv; *cost counts
+// the multiplications and shifts in it. False when it is not affine.
+fn affine_of(l: i64, iv: i64, v: i64, af: *i64, cost: *i64, depth: i64) -> bool {
+    unsafe {
+        let x = ir_val(v);
+        if x == iv {
+            af_set(af, 0, 1, 0, 0, 0, 0);
+            return true;
+        }
+        let ty = INSTS[x].ty;
+        if !is_integer(ty) || int_bits(ty) != 64 || depth > 8 {
+            return false;
+        }
+        if is_const(x) {
+            af_set(af, INSTS[x].imm, 0, 0, 0, 0, 0);
+            return true;
+        }
+        if invariant_in(l, x) {
+            af_set(af, 0, 0, x, 1, 0, 0);
+            return true;
+        }
+        let op = INSTS[x].op;
+        let mut fa: [i64; 8] = [0; 8];
+        let mut fb: [i64; 8] = [0; 8];
+        if op == Add || op == Sub {
+            if !affine_of(l, iv, INSTS[x].a, &fa[0], cost, depth + 1)
+                || !affine_of(l, iv, INSTS[x].b, &fb[0], cost, depth + 1) {
+                return false;
+            }
+            return af_combine(af, &fa[0], &fb[0], if op == Add { 1 } else { -1 });
+        }
+        if op == Mul || op == Shl {
+            let b = ir_val(INSTS[x].b);
+            let a = ir_val(INSTS[x].a);
+            let mut m = 0;
+            let mut operand = a;
+            if op == Shl && is_const(b) {
+                let k = INSTS[b].imm & 63;
+                m = 1 << k as u64;
+            } else if op == Mul && is_const(b) {
+                m = INSTS[b].imm;
+            } else if op == Mul && is_const(a) {
+                m = INSTS[a].imm;
+                operand = b;
+            } else if op == Mul && (invariant_in(l, b) || invariant_in(l, a)) {
+                // By a stride known at run time: the operand must be k + s*i.
+                let stride = if invariant_in(l, b) { b } else { a };
+                let other = if stride == b { a } else { b };
+                if !affine_of(l, iv, other, af, cost, depth + 1) || af[2] != 0 || af[4] != 0 || af[7] != 0 {
+                    return false;
+                }
+                let k = af[0];
+                let sc = af[1];
+                af_set(af, 0, 0, stride, k, 0, 0);
+                af[6] = stride;
+                af[7] = sc;
+                *cost = *cost + 1;
+                return true;
+            } else {
+                return false;
+            }
+            if !affine_of(l, iv, operand, af, cost, depth + 1) {
+                return false;
+            }
+            af_scale(af, m);
+            *cost = *cost + 1;
+            return true;
+        }
+        if op == Conv && is_integer(INSTS[x].imm2) && int_bits(INSTS[x].imm2) == 64 {
+            return affine_of(l, iv, INSTS[x].a, af, cost, depth + 1);
+        }
+        false
+    }
+}
+
+// Appends c1*b1 + c2*b2 + k (as u64) to block b; returns the value.
+fn materialize_affine(b: i64, af: *i64, k: i64) -> i64 {
+    unsafe {
+        let mut value = append_const(b, k, TY_U64);
+        for t in 0..2 {
+            let base = af[2 + 2 * t];
+            let c = af[3 + 2 * t];
+            if base == 0 || c == 0 {
+                continue;
+            }
+            let mut term = base;
+            if c != 1 {
+                term = append_inst(b, Mul, TY_U64, base, append_const(b, c, TY_U64));
+            }
+            value = append_inst(b, Add, TY_U64, value, term);
+        }
+        value
+    }
+}
+
+// Strength reduction of the addresses in innermost loop l.
+fn reduce_loop(fi: i64, l: i64) -> bool {
+    unsafe {
+        let h = loop_header(l);
+        let pre = loop_preheader(l);
+        let latch = loop_latch(l);
+        if pre == 0 || latch == 0 || BLOCKS[h].preds.count != 2 {
+            return false;
+        }
+        IRF = fi;
+        // The induction variable: the first 64-bit header phi with a constant
+        // step.
+        let mut iv = 0;
+        let mut step = 0;
+        let mut phi = BLOCKS[h].first;
+        while phi != 0 && INSTS[phi].op == Phi {
+            let mut s = 0;
+            if int_bits(INSTS[phi].ty) == 64 && iv_step(l, phi, &s) && s != 0 {
+                iv = phi;
+                step = s;
+                break;
+            }
+            phi = INSTS[phi].next;
+        }
+        if iv == 0 {
+            return false;
+        }
+        // Candidates: (access, group, k); groups: their form (6 each).
+        let mut cands = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut groups = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..loop_size(l) {
+            let mut v = BLOCKS[loop_block(l, i)].first;
+            while v != 0 {
+                let op = INSTS[v].op;
+                if op == Load || op == Store {
+                    let addr = ir_val(INSTS[v].a);
+                    let mut af: [i64; 8] = [0; 8];
+                    let mut cost = 0;
+                    if !invariant_in(l, addr) && addr != iv
+                        && affine_of(l, iv, addr, &af[0], &cost, 0) && cost > 0 && (af[1] != 0 || af[7] != 0) {
+                        let mut g = -1;
+                        for k in 0..groups.count / AF_SIZE {
+                            let mut same = true;
+                            for m in 1..AF_SIZE {
+                                if groups.data[AF_SIZE * k + m] != af[m] {
+                                    same = false;
+                                }
+                            }
+                            if same {
+                                g = k;
+                            }
+                        }
+                        if g < 0 && groups.count / AF_SIZE < LSR_MAX_POINTERS {
+                            g = groups.count / AF_SIZE;
+                            for k in 0..AF_SIZE {
+                                groups.push(af[k]);
+                            }
+                        }
+                        if g >= 0 {
+                            cands.push(v);
+                            cands.push(g);
+                            cands.push(af[0]);
+                        }
+                    }
+                }
+                v = INSTS[v].next;
+            }
+        }
+        let ngroups = groups.count / AF_SIZE;
+        let pre_index = pred_index(h, pre);
+        let latch_index = pred_index(h, latch);
+        let start = iv_start(l, iv);
+        for g in 0..ngroups {
+            let af = &groups.data[AF_SIZE * g];
+            let s = af[1];
+            // The smallest k of the group is the pointer's.
+            let mut k0 = 0;
+            let mut first = true;
+            for c in 0..cands.count / 3 {
+                if cands.data[3 * c + 1] == g && (first || cands.data[3 * c + 2] < k0) {
+                    k0 = cands.data[3 * c + 2];
+                    first = false;
+                }
+            }
+            // Start: the form at the induction variable's start.
+            let base = materialize_affine(pre, af, k0);
+            // The coefficient of the induction variable, s + m*v.
+            let mut coef = append_const(pre, s, TY_U64);
+            if af[7] != 0 {
+                let sym = append_inst(pre, Mul, TY_U64, af[6], append_const(pre, af[7], TY_U64));
+                coef = append_inst(pre, Add, TY_U64, coef, sym);
+            }
+            let scaled = append_inst(pre, Mul, TY_U64, start, coef);
+            let init = append_inst(pre, Add, TY_U64, base, scaled);
+            let stride = append_inst(pre, Mul, TY_U64, coef, append_const(pre, step, TY_U64));
+            let ptr = ir_make(Phi, TY_U64, 0, 0, 0);
+            INSTS[ptr].args = ARGS.count;
+            INSTS[ptr].nargs = 2;
+            ARGS.push(0);
+            ARGTY.push(0);
+            ARGS.push(0);
+            ARGTY.push(0);
+            ir_prepend(h, ptr);
+            let next = append_inst(latch, Add, TY_U64, ptr, stride);
+            ir_set_arg(ptr, pre_index, init);
+            ir_set_arg(ptr, latch_index, next);
+            for c in 0..cands.count / 3 {
+                if cands.data[3 * c + 1] != g {
+                    continue;
+                }
+                let v = cands.data[3 * c];
+                let d = cands.data[3 * c + 2] - k0;
+                let mut addr = ptr;
+                if d != 0 {
+                    addr = op_before(v, Add, TY_U64, ptr, const_before(v, d, TY_U64));
+                }
+                INSTS[v].a = addr;
+            }
+        }
+        free(cands.data as *u8);
+        free(groups.data as *u8);
+        ngroups > 0
+    }
+}
+
+// ---- Unswitching ----
+
+// Unswitches innermost loop l (canonical, in LCSSA form) on the first
+// branch of its blocks on an invariant condition. Returns whether it did.
+fn unswitch_loop(fi: i64, l: i64) -> bool {
+    unsafe {
+        let h = loop_header(l);
+        let pre = loop_preheader(l);
+        if pre == 0 || loop_latch(l) == 0 || loop_inst_count(l) > UNSWITCH_MAX_SIZE {
+            return false;
+        }
+        let mut at = 0;
+        for i in 0..loop_size(l) {
+            let b = loop_block(l, i);
+            if BLOCKS[b].term == Term::Branch && BLOCKS[b].s0 != BLOCKS[b].s1 {
+                let c = ir_val(BLOCKS[b].cond);
+                if !is_const(c) && invariant_in(l, c) {
+                    at = b;
+                    break;
+                }
+            }
+        }
+        if at == 0 {
+            return false;
+        }
+        let c = ir_val(BLOCKS[at].cond);
+        IRF = fi;
+        loop_exits(l);
+        let mut exits = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..LP_LIST.count {
+            exits.push(LP_LIST.data[i]);
+        }
+        let stamp = mark_loop_blocks(l);
+        let mut region = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..LP_LIST2.count {
+            region.push(LP_LIST2.data[i]);
+        }
+        clone_region(fi, &region, stamp);
+        // The exits get the copy's exiting blocks as predecessors, with the
+        // copies of their phis' operands.
+        for e in 0..exits.count {
+            let x = exits.data[e];
+            let n = BLOCKS[x].preds.count;
+            for k in 0..n {
+                let p = BLOCKS[x].preds.data[k];
+                if LP_SEEN[p] != stamp {
+                    continue;
+                }
+                let first = LP_VALUES.count;
+                let mut phi = BLOCKS[x].first;
+                while phi != 0 && INSTS[phi].op == Phi {
+                    LP_VALUES.push(clone_map(ir_val(ir_arg(phi, k)), stamp));
+                    phi = INSTS[phi].next;
+                }
+                add_pred_values(x, BLOCKS[p].aux, &LP_VALUES, first);
+                LP_VALUES.count = first;
+            }
+        }
+        // The preheader chooses; each copy's branch is decided.
+        let ch = BLOCKS[h].aux;
+        BLOCKS[pre].term = Term::Branch;
+        BLOCKS[pre].cond = c;
+        BLOCKS[pre].s0 = h;
+        BLOCKS[pre].s1 = ch;
+        let t = ir_make(Const, TY_BOOL, 0, 0, 1);
+        ir_append(at, t);
+        BLOCKS[at].cond = t;
+        let cat = BLOCKS[at].aux;
+        let f = ir_make(Const, TY_BOOL, 0, 0, 0);
+        ir_append(cat, f);
+        BLOCKS[cat].cond = f;
+        free(exits.data as *u8);
+        free(region.data as *u8);
+        true
+    }
+}
+
+// Whether small loop l branches on a condition defined outside it.
+fn has_invariant_branch(l: i64) -> bool {
+    unsafe {
+        if loop_inst_count(l) > UNSWITCH_MAX_SIZE {
+            return false;
+        }
+        for i in 0..loop_size(l) {
+            let b = loop_block(l, i);
+            if BLOCKS[b].term == Term::Branch && BLOCKS[b].s0 != BLOCKS[b].s1 {
+                let c = ir_val(BLOCKS[b].cond);
+                if !is_const(c) && invariant_in(l, c) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+// Strength reduction and unswitching over the innermost loops of fi.
+pub fn reduce_and_unswitch(fi: i64) -> bool {
+    unsafe {
+        let mut changed = false;
+        canonicalize_loops(fi);
+        let mut headers = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for l in 0..loop_count() {
+            if is_innermost(l) && loop_header(l) != IRFUNCS[fi].entry {
+                headers.push(loop_header(l));
+            }
+        }
+        // Unswitching, one loop at a time (the loops are found again after
+        // each), at most 4 per function.
+        let mut unswitched = 0;
+        for i in 0..headers.count {
+            if unswitched >= 4 {
+                break;
+            }
+            canonicalize_loops(fi);
+            let l = innermost_loop(headers.data[i]);
+            if l < 0 || loop_header(l) != headers.data[i] || !is_canonical(l) || !has_invariant_branch(l) {
+                continue;
+            }
+            form_lcssa(fi, l);
+            resolve_all(fi);
+            if unswitch_loop(fi, l) {
+                unswitched += 1;
+                changed = true;
+                resolve_all(fi);
+                simplify_cfg(fi);
+                verify_func(fi, c"unswitching");
+            }
+        }
+        canonicalize_loops(fi);
+        for l in 0..loop_count() {
+            if is_innermost(l) && loop_header(l) != IRFUNCS[fi].entry && is_canonical(l)
+                && reduce_loop(fi, l) {
+                changed = true;
+            }
+        }
+        free(headers.data as *u8);
+        if changed {
+            resolve_all(fi);
+            verify_func(fi, c"loop strength reduction");
+        }
+        changed
+    }
+}

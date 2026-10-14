@@ -8,12 +8,15 @@ accepts, positions and spans are the compiler's, and every problem is
 one line `SEVERITY CODE: MESSAGE` followed by `try:` lines, as there.
 
 ```
+tachyonc edit patch TARGET --old TEXT --new TEXT [--old TEXT --new TEXT]... [--loose]
+tachyonc edit patch TARGET [--loose] < PAIRS   (0.12; see "Edits inside an item")
+tachyonc edit insert --in TARGET --after|--before ANCHOR [--loose] < TEXT
 tachyonc edit replace NAME [ROOT] < TEXT       the item's text becomes TEXT
 tachyonc edit insert --after|--before NAME [ROOT] < TEXT
 tachyonc edit delete NAME [ROOT]
 tachyonc undo [--force]                        the last edit, undone
 tachyonc check [ROOT]                          the front end's errors, one per line
-tachyonc fix [ROOT] [--only imports,unused,pub,unsafe] [--in FILE|MODULE]
+tachyonc fix [ROOT] [--only imports,unused,pub,unsafe,tidy-imports,reexports] [--in FILE|MODULE]
 tachyonc same-output OLD [--corpus DIR|FILE]... [-j N] [--work DIR]
 tachyonc lint --max-lines N [ROOT]
 tachyonc query stats [MODULE|FILE] [--over N] [--all]
@@ -22,7 +25,7 @@ tachyonc query unused [MODULE|FILE] [--all]
 tachyonc query impact NAME
 ```
 
-The editing commands (edit, fix) also take `--dry-run`, `--no-check`,
+The editing commands (edit, fix) also take `--dry-run`, `--no-check`, `--show`,
 `--exact`, `--root ROOT` and `--target T`. ROOT is found as for query
 (`--root`, a last argument ending in `.tach`, `$TACHYON_ROOT`,
 `./main.tach`, `./compiler/src/main.tach`).
@@ -52,7 +55,7 @@ files, computed from the compiler's spans. It is applied atomically:
    one line says what changed:
 
 ```
-replaced crate::gvn::run_gvn→compiler/src/gvn.tach→+3 -5 lines
+replaced crate::middle::gvn::run_gvn→compiler/src/middle/gvn.tach→+3 -5 lines
 ```
 
 (`→` is a TAB; with several files, `N files`). Nothing outside the
@@ -66,6 +69,19 @@ are not new: an edit of a program with errors is checked against them.
 - `--no-check` writes an edit that adds errors anyway (a signature
   changed before its callers are), with `warning edit.breaks` and the
   errors; `tachyonc check` lists what is left.
+- `--show` (0.12; every edit, fix, rewrite and refactoring) prints, after
+  the summary line, the regions the edit changed as their new lines,
+  numbered, so that the edit need not be read back:
+
+```
+patched crate::one→main.tach→+2 -1 lines
+// main.tach:21-22
+21→    let twice = k + k;
+22→    unsafe { twice * abs(a) as i64 / 2 }
+```
+
+  (lines only removed: `// FILE:A: N lines removed after line A`).
+  `tachyonc query diff` prints the last journaled edit as a diff.
 
 ### The journal and undo
 
@@ -76,6 +92,104 @@ before and after. `tachyonc undo` restores the files of the last edit
 and forgets it; run again, it undoes the one before. It refuses when a
 file changed since the edit (`error undo.changed`, `try:` `undo --force`,
 which restores it anyway). Without a git checkout there is no journal.
+
+## Edits inside an item: edit patch, insert --in
+
+Most edits change a few lines of one function: a condition, a statement,
+an expression. `edit patch` makes them by text, as cheaply as a
+`s.replace(OLD, NEW)`, and with the engine's check, journal and undo:
+
+```
+$ tachyonc edit patch range::decide --old 'if a < b {' --new 'if a <= b {'
+patched crate::middle::range::decide→compiler/src/middle/range.tach→+1 -1 lines
+```
+
+- **TARGET** is a NAME as `query` takes it, or `FILE:LINE` (the innermost
+  item holding that line: the position of a compiler error), or a module
+  or a file of the program (all of its text: its `use` lines, its header
+  comment), or (0.12) `MODULE::use` (its `use` lines: from the first to
+  the last) or `MODULE::header` (the comment at the top of its file), as
+  `query show` prints them; the root module is `crate` or the root file's
+  name (`main::header`). An item's text is its lines with the comment and attribute
+  lines above it, as `query show` prints them.
+- **Each OLD must occur exactly once** in TARGET's text, matched byte for
+  byte. Every OLD is found in the text as it was before the edit, the
+  replacements must not overlap (`error patch.overlap`), and all pairs
+  are one edit: checked once, written all or not at all, undone by one
+  `undo`.
+- **No match**: `error patch.no-match` with the line of TARGET nearest to
+  OLD (by edit distance, blanks ignored), and `try:` the command with the
+  part of that line nearest to OLD as OLD (or with `--loose` when OLD is
+  there with other blanks; or `query show FILE:LINE`):
+
+```
+error patch.no-match: OLD 1 is not in crate::calc::clamp; nearest, line 5: if v < lo {
+try: tachyonc edit patch clamp --old 'v < lo' --new 'v <= lo'
+```
+
+- **Several matches**: `error patch.ambiguous` with their lines, and for
+  each (at most three) `try:` the command with OLD and NEW widened to the
+  lines around it, a line up and down at a time, until it is unique:
+
+```
+error patch.ambiguous: OLD 1 occurs 2 times in crate::calc::clamp, lines 6, 9; give more of the text around it
+try: tachyonc edit patch clamp --old 'return lo;' --new 'return 0 + lo;'
+try: tachyonc edit patch clamp --old 'return hi;' --new 'return 0 + hi;'
+```
+
+- A match of whole lines replaced by an empty NEW removes the lines (and
+  a blank line after them when one is before them, so that no two are
+  left together: 0.12).
+- `--loose`: a run of blanks (spaces, tabs, newlines) in OLD matches any
+  run of blanks, and OLD's first and last blanks are ignored; NEW is
+  indented like the text it replaces (its first line where OLD's
+  started, the others keeping their indentation relative to NEW's least
+  indented line, on top of the indentation OLD's least indented lines
+  have in the file).
+- `--dry-run` prints the diff (no context lines), `--no-check` writes an
+  edit that adds errors, as for every edit.
+- Only the summary line is printed, never the file.
+
+### Pairs on stdin
+
+Without `--old`, the pairs are read from stdin, for text of several
+lines without shell quoting. A pair is a block of whole lines:
+
+```
+<<<<<<< OLD
+    while i <= n {
+        total += i;
+=======
+    while i <= n {
+        // (one term)
+        total += i;
+>>>>>>> NEW
+```
+
+The markers are the line's first seven characters (`<<<<<<<`,
+`=======`, `>>>>>>>`), alone or followed by a blank and a word; blank
+lines between blocks are ignored, anything else outside a block is an
+error (`error patch.format: stdin line N: ...`). OLD and NEW are the
+lines between the markers, joined by newlines; OLD must match whole
+lines (from a line's start or its indentation to a line's end), so
+`    total` does not match inside `    total += i;`. An empty NEW removes
+OLD's lines.
+
+### insert --in
+
+`edit insert --in TARGET --after ANCHOR < TEXT` inserts TEXT's lines
+after the line where ANCHOR ends (`--before`: before the line where it
+starts). ANCHOR is matched as OLD is (once in TARGET's text, `--loose`
+too; the same diagnostics, with `try:` the command with a widened
+anchor). TEXT is indented like the anchor's line, one level (4 spaces)
+deeper after a line ending in `{` or before one starting with `}`: its
+least indented lines get that indentation, the others keep theirs
+relative to them.
+
+```
+$ tachyonc edit insert --in calc::sum_to --after 'while i <= n {' < stmt.tach
+inserted in crate::calc::sum_to→calc.tach→+3 -0 lines
+```
 
 ## Items as text
 
@@ -104,11 +218,26 @@ TEXT is read from stdin: blank lines first and last, and trailing
 blanks, are dropped; when none of its lines is indented and the item is
 (a method), every line gets the item's indentation.
 
+**A module's use lines and header (0.12).** `MODULE::use` and
+`MODULE::header` are NAMEs for `edit replace`, `insert` and `delete` too:
+`edit replace m::header < header.txt` replaces the comment at the top of
+m's file (or puts TEXT there, a blank line after it, when it has none);
+`edit replace m::use < uses.tach` replaces its first block of `use` lines
+with TEXT and removes the others (none: TEXT goes after the header);
+`edit insert --after|--before m::use` adds lines after the last `use`
+line or before the first; `edit delete` removes them. The header is the
+comment lines at the top of the file, except those right above the first
+item (its own comment; not above a `mod` or `use` line). A header is
+replaced, not inserted next to (`edit.layout`).
+
 An item that shares a line with other code (a field of
 `struct P { x: i64, y: i64 }`) is its exact bytes: replace replaces
 them, delete removes them with their `, `, insert is refused
 (`error edit.layout`).
 
+NAME may be `FILE:LINE`, for every edit and refactoring of an item (the
+innermost item holding that line, as for query): `edit replace
+gvn.tach:740`, `edit delete`, `refactor rename`, `signature`.
 NAME must name one definition of the program's own files; std's and
 the C headers' definitions are left out when one of the program's
 matches. When several match: `error query.ambiguous` with a `try:` line
@@ -143,10 +272,28 @@ fixed 2 missing imports, 3 unused imports, 1 pub, 1 unsafe block→3 files→+3 
 | `imports` | the `use` lines the errors for unknown names ask for (`help: add `use crate::m::name;``): merged into a `use` of that module when there is one (`use m::{a}` gains `, name`; `use m::a;` becomes `use m::{a, name};`), else a line after the module's last `use`; and 0.8's wildcard migration (`use a::*;` becomes the names it brings) |
 | `unused` | imports whose name is written nowhere else in their file, removed (the name of a list with its separator; the item when all go; `use p::{a}` left with one name becomes `use p::a`). `pub use` is kept |
 | `pub` | `pub` on the items other modules use while they are private (`error ... is private`) |
-| `unsafe` | the unsafe operations outside unsafe code, wrapped in unsafe blocks (the outermost unit around each: a statement, `let p = unsafe { e };`, an expression) |
+| `unsafe` | the unsafe operations outside unsafe code, wrapped in unsafe blocks (the outermost unit around each: a statement, `let p = unsafe { e };`, an expression); a function with several of them gets its whole body in one block, one level deeper, when its braces have lines of their own (0.12, the codebase's style; `--fix-unsafe` keeps 0.9's units) |
 
-By default all four, everywhere; `--in FILE|MODULE` keeps the fixes of
-one file or module (matched like query's `--in`; none:
+| `tidy-imports` | (0.12) the `use` lines in the codebase's style: the `use` items of a module with one path (and one `pub`) merged where the first is, their names sorted (byte order) and each once, `use p::a;` for one, `use p::{a, b};` when the line fits in 100 columns, else wrapped four spaces in, a line per name imported under another name (`use p::a as b;`); a `use` with a comment on its lines, or sharing a line, is left as it is, and one with a comment right above it is not merged into another |
+| `reexports` | (0.12) every import and path that reaches an item through a re-export (a `pub use` of another module, or an ancestor's import: `use crate::f` where the root imports f) is written from the module that defines the item (`mod` lines on the way made `pub` when needed); then the re-exports nothing goes through any more are removed, or made private imports when their file still names them |
+
+By default the first four (`imports`, `unused`, `pub`, `unsafe`),
+everywhere; `tidy-imports` and `reexports` only when asked for (`--only
+reexports,tidy-imports` does both: the rounds tidy what the first
+rewrote).
+
+**Re-exports kept: the interface.** A `pub use` with a comment line
+starting `// api:` right above it (in its comment lines) is the module's
+interface: `reexports` keeps it and the imports and paths through it. A
+program's own modules need none (the compiler has none); a library's
+modules mark what they offer. With `--in`, only the imports and paths
+there are rewritten, and only the re-exports there removed.
+
+`unused` (0.12) keeps an import that another module imports or names
+through (`use crate::f` reaching the root's `use util::f`): it is used,
+although its file does not name it; `query unused` likewise.
+
+`--in FILE|MODULE` keeps the fixes of one file or module (matched like query's `--in`; none:
 `error fix.bad-in`). A fix can let the checker see more: the checker
 stops at the first unknown name of a statement, so its second appears
 only once the first is imported. So fix runs again on the edited program
@@ -207,7 +354,7 @@ path with a `/`, or ending in `.tach`): its items, largest first, under
 a header:
 
 ```
-# crate::gvn→compiler/src/gvn.tach→834 lines→51 items
+# crate::middle::gvn→compiler/src/middle/gvn.tach→834 lines→51 items
 102→fn→memory_step
 76→fn→run_gvn
 ```
@@ -274,7 +421,7 @@ instances of a generic function (`instances→N→grow<i64> grow<Buf>
 largest first, each with the deps of its module:
 
 ```
-error lint.max-lines: compiler/src/check.tach: 4785 lines (at most 1000)
+error lint.max-lines: compiler/src/front/check.tach: 4785 lines (at most 1000)
 try: tachyonc query deps crate::check --max-lines 1000
 ```
 
@@ -286,7 +433,11 @@ Exit 1 when a file is over, 0 when none is.
 |---|---|---|---|---|
 | `edit.breaks` | error | 1 | the edit adds errors (they are printed); nothing written | the command with `--no-check` |
 | `edit.breaks` | warning | 1, 0 | the same with `--dry-run`, or `--no-check` (written) | `tachyonc check` |
-| `edit.no-text` | error | 2 | replace or insert without TEXT on stdin | the command `< new.tach` |
+| `edit.no-text` | error | 2 | replace or insert without TEXT on stdin; patch without pairs | the command `< new.tach`; with `--old OLD --new NEW` |
+| `patch.no-match` | error | 1 | an OLD or ANCHOR is not in TARGET (with the nearest line) | the command with that line's text, or with `--loose`, or `query show FILE:LINE` |
+| `patch.ambiguous` | error | 1 | an OLD or ANCHOR occurs several times (their lines) | the command with more context around each |
+| `patch.overlap` | error | 1 | two OLDs overlap | |
+| `patch.format` | error | 2 | the pairs on stdin are not blocks | |
 | `edit.not-source` | error | 1 | NAME is std's or a C header's | |
 | `edit.layout` | error | 1 | insert next to an item that shares its line | |
 | `edit.unchanged` | note | 0 | the edit changes nothing | |
@@ -297,6 +448,7 @@ Exit 1 when a file is over, 0 when none is.
 | `undo.empty` | error | 1 | no edit to undo | |
 | `undo.changed` | error | 1 | a file changed since the edit | `undo --force` |
 | `fix.none` | note | 0 | nothing to fix | |
+| `patch.no-region` | error | 1 | `MODULE::use` or `::header` to patch, and the module has none | `edit replace MODULE::use\|header`, which adds them |
 | `fix.bad-in` | error | 1 | `--in` names no file or module of the program | |
 | `lint.max-lines` | error | 1 | a file over N lines | `query deps MODULE --max-lines N` |
 | `same-output.differs` | error | 1 | compilations differ | the `diff`, the compilation |
@@ -309,6 +461,11 @@ Problems with ROOT are query's (`query.no-root`, `query.bad-root`), for
 every command.
 
 ## Known limits
+
+- `edit patch` matches text, not syntax: an OLD inside a comment or a
+  string is an occurrence like any other, and NEW is not re-indented
+  without `--loose` (wrapping a body in a new block re-indents every line
+  of it: `edit replace` the item).
 
 - The check compares errors by file and message: an edit that fixes one
   error and makes another with the same message in the same file is not
@@ -324,5 +481,5 @@ every command.
   `new-module`, `move-module`, `split` in
   [refactor-modules.md](refactor-modules.md); all on this engine
   (`edit_replace`, `edit_new_file`, `apply_edit` in
-  compiler/src/edit.tach), and a command registered in
-  compiler/src/commands.tach runs in scripts too.
+  compiler/src/tools/edit.tach), and a command registered in
+  compiler/src/tools/commands.tach runs in scripts too.

@@ -1,0 +1,224 @@
+// SSA construction during lowering (Braun et al., see mod.tach): the
+// current definition of each variable in each block, phis made on reads
+// in unsealed blocks and completed when the block is sealed, trivial phis
+// removed. Also HMap, the hash map the definitions are kept in (used by
+// other passes too).
+
+use crate::base::{IntVec, alloc_array, free, memset};
+use crate::front::check::{LOCALS, LOCAL_COUNT};
+use crate::middle::ir::{
+    ARGS, ARGTY, BLOCKS, INSTS, IRF, IRFUNCS, Op, ir_arg, ir_make, ir_prepend, ir_replace, ir_type,
+    ir_val,
+};
+
+// An open-addressing hash map from i64 keys (never 0) to i64 values.
+pub struct HMap { keys: *i64, vals: *i64, size: i64, count: i64 }
+
+impl HMap {
+    fn slot(self: *HMap, key: i64) -> i64 {
+        let mask = (*self).size - 1;
+        let mut slot = ((key as u64 * 11400714819323198485) >> 20) as i64 & mask;
+        while unsafe { (*self).keys[slot] != 0 && (*self).keys[slot] != key } {
+            slot = (slot + 1) & mask;
+        }
+        slot
+    }
+
+    fn get(self: *HMap, key: i64) -> i64 {
+        unsafe {
+            if (*self).size == 0 {
+                return 0;
+            }
+            let slot = self.slot(key);
+            if (*self).keys[slot] == key { (*self).vals[slot] } else { 0 }
+        }
+    }
+
+    fn put(self: *HMap, key: i64, value: i64) {
+        unsafe {
+            if ((*self).count + 1) * 2 > (*self).size {
+                self.rehash();
+            }
+            let slot = self.slot(key);
+            if (*self).keys[slot] == 0 {
+                (*self).count += 1;
+                (*self).keys[slot] = key;
+            }
+            (*self).vals[slot] = value;
+        }
+    }
+
+    fn rehash(self: *HMap) {
+        unsafe {
+            let old_keys = (*self).keys;
+            let old_vals = (*self).vals;
+            let old_size = (*self).size;
+            let mut size = old_size * 2;
+            if size < 256 {
+                size = 256;
+            }
+            (*self).keys = alloc_array::<i64>(size);
+            (*self).vals = alloc_array::<i64>(size);
+            (*self).size = size;
+            (*self).count = 0;
+            for i in 0..old_size {
+                if old_keys[i] != 0 {
+                    self.put(old_keys[i], old_vals[i]);
+                }
+            }
+            if old_size > 0 {
+                free(old_keys as *u8);
+                free(old_vals as *u8);
+            }
+        }
+    }
+
+    fn clear(self: *HMap) {
+        if (*self).size > 0 {
+            unsafe { memset((*self).keys as *u8, 0, ((*self).size * 8) as u64); }
+        }
+        (*self).count = 0;
+    }
+}
+
+// ---- SSA construction ----
+
+// The current definition of each variable in each block: key
+// (var + 1) << 32 | block.
+pub static mut DEFS: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+// Incomplete phis: triples (var, phi, next) linked from Block.incomplete
+// (index + 1).
+static mut INCOMPLETE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// Scratch stack for phi operands and call arguments.
+pub static mut SSA_STACK: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// Types of the synthetic variables (variable LOCAL_COUNT + i).
+static mut SYNTH_TY: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// Per local: whether it is an SSA variable, and the address of its
+// storage otherwise.
+pub static mut PROMOTE: *i64 = 0 as *i64;
+pub static mut LOCAL_ADDR: *i64 = 0 as *i64;
+
+fn def_key(var: i64, b: i64) -> i64 {
+    ((var + 1) << 32) | b
+}
+
+fn var_type(var: i64) -> i64 {
+    unsafe {
+        if var < LOCAL_COUNT {
+            return ir_type(LOCALS[var].ty);
+        }
+        SYNTH_TY.data[var - LOCAL_COUNT]
+    }
+}
+
+pub fn new_synth_var(ty: i64) -> i64 {
+    SYNTH_TY.push(ty);
+    LOCAL_COUNT + SYNTH_TY.count - 1
+}
+
+pub fn ssa_write(var: i64, b: i64, value: i64) {
+    DEFS.put(def_key(var, b), value);
+}
+
+pub fn ssa_read(var: i64, b: i64) -> i64 {
+    let v = DEFS.get(def_key(var, b));
+    if v != 0 {
+        return ir_val(v);
+    }
+    ssa_read_recursive(var, b)
+}
+
+// An undefined value of type `ty`: 0, placed in the entry block.
+pub fn ssa_undef(ty: i64) -> i64 {
+    let v = ir_make(Op::Const, ty, 0, 0, 0);
+    unsafe { ir_prepend(IRFUNCS[IRF].entry, v); }
+    v
+}
+
+fn new_phi(var: i64, b: i64) -> i64 {
+    let phi = ir_make(Op::Phi, var_type(var), 0, 0, 0);
+    ir_prepend(b, phi);
+    phi
+}
+
+fn ssa_read_recursive(var: i64, b: i64) -> i64 {
+    unsafe {
+        let mut value = 0;
+        let preds = BLOCKS[b].preds.count;
+        if BLOCKS[b].sealed == 0 {
+            value = new_phi(var, b);
+            INCOMPLETE.push(var);
+            INCOMPLETE.push(value);
+            INCOMPLETE.push(BLOCKS[b].incomplete);
+            BLOCKS[b].incomplete = INCOMPLETE.count / 3;
+        } else if preds == 1 {
+            value = ssa_read(var, BLOCKS[b].preds.data[0]);
+        } else if preds == 0 {
+            value = ssa_undef(var_type(var));
+        } else {
+            let phi = new_phi(var, b);
+            ssa_write(var, b, phi);
+            value = add_phi_operands(var, phi);
+        }
+        ssa_write(var, b, value);
+        value
+    }
+}
+
+fn add_phi_operands(var: i64, phi: i64) -> i64 {
+    unsafe {
+        let b = INSTS[phi].block;
+        let mark = SSA_STACK.count;
+        for i in 0..BLOCKS[b].preds.count {
+            let pred = BLOCKS[b].preds.data[i];
+            let value = ssa_read(var, pred);
+            SSA_STACK.push(value);
+        }
+        let count = SSA_STACK.count - mark;
+        INSTS[phi].args = ARGS.count;
+        INSTS[phi].nargs = count;
+        for i in 0..count {
+            ARGS.push(SSA_STACK.data[mark + i]);
+            ARGTY.push(0);
+        }
+        SSA_STACK.count = mark;
+        try_remove_trivial_phi(phi)
+    }
+}
+
+// A phi whose operands are all the same value (or itself) is that value.
+fn try_remove_trivial_phi(phi: i64) -> i64 {
+    unsafe {
+        let mut same = 0;
+        for i in 0..INSTS[phi].nargs {
+            let operand = ir_val(ir_arg(phi, i));
+            if operand == same || operand == phi {
+                continue;
+            }
+            if same != 0 {
+                return phi;
+            }
+            same = operand;
+        }
+        if same == 0 {
+            same = ssa_undef(INSTS[phi].ty);
+        }
+        ir_replace(phi, same);
+        same
+    }
+}
+
+pub fn ir_seal(b: i64) {
+    unsafe {
+        let mut entry = BLOCKS[b].incomplete;
+        while entry != 0 {
+            let at = (entry - 1) * 3;
+            let var = INCOMPLETE.data[at];
+            let phi = INCOMPLETE.data[at + 1];
+            add_phi_operands(var, phi);
+            entry = INCOMPLETE.data[at + 2];
+        }
+        BLOCKS[b].incomplete = 0;
+        BLOCKS[b].sealed = 1;
+    }
+}

@@ -1,0 +1,592 @@
+// `refactor signature FN`: a parameter added, removed, renamed, reordered
+// or retyped, in the function (with a trait's function, the trait's
+// declaration and every impl's) and in every call the checker resolved.
+
+use crate::base::{
+    FILES, IntVec, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, intern, intern_c,
+};
+use crate::front::ast::{NODES, NODE_COUNT, NodeKind};
+use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
+use crate::front::modules::file_of_pos;
+use crate::front::types::FNS;
+use crate::middle::lower::ssa::HMap;
+use crate::tools::edit::edit_replace;
+use crate::tools::edit::apply::{apply_edit, set_command};
+use crate::tools::query::{QF_CALL, QF_DEF, c_slice, root_or_diag};
+use crate::tools::query::defs::{
+    DEFS, DEF_COUNT, K_FN, K_IMPL_METHOD, K_METHOD, K_TRAIT_FN, def_of_node, trait_of,
+};
+use crate::tools::query::diagnostics::{
+    PROG, ROOT_GIVEN, TOOL, diag, put_root, put_word, try_end, write_diags,
+};
+use crate::tools::query::positions::{enclosing, put_loc, token_at};
+use crate::tools::query::refs::{R_FLAGS, R_POS};
+use crate::tools::refactor_shape::{
+    L_END, L_START, PROGRAM_END, SUB, find_byte, has_call, leading_name, list_insert, list_of_node,
+    list_of_params, list_permute, list_remove, load_and_find, name_token, opt, orig_of, put_count,
+    refs_of, replace_name, split_default, sym_text, take_args, text_buf, try_query_name,
+    try_refactor, try_show_at, usage_error,
+};
+use crate::tools::rewrite::sort_by_start;
+use crate::tools::rewrite::parsed::{pa, pb, pc, pchild, pcount, pend, pk, pstart};
+
+// ---- refactor signature ----
+
+pub fn run_signature(argc: i64, argv: **u8) -> i64 {
+    let status = signature_inner(argc, argv);
+    write_diags();
+    status
+}
+
+// The definitions changed with d: a trait's function and its impls' (d
+// is either), else d alone; d first.
+fn signature_group(d: i64, group: *IntVec) {
+    unsafe {
+        group.push(d);
+        let mut t = -1;
+        if DEFS[d].kind == K_TRAIT_FN {
+            t = d;
+        } else if DEFS[d].kind == K_IMPL_METHOD {
+            let td = trait_of(d);
+            for x in 0..DEF_COUNT {
+                if td >= 0 && DEFS[x].kind == K_TRAIT_FN && DEFS[x].parent == td && DEFS[x].name == DEFS[d].name {
+                    t = x;
+                }
+            }
+        }
+        if t < 0 {
+            return;
+        }
+        if t != d {
+            group.push(t);
+        }
+        for x in 0..DEF_COUNT {
+            if x != d && DEFS[x].kind == K_IMPL_METHOD && DEFS[x].name == DEFS[t].name && trait_of(x) == DEFS[t].parent {
+                group.push(x);
+            }
+        }
+    }
+}
+
+fn in_group(group: *IntVec, d: i64) -> bool {
+    unsafe {
+        for i in 0..(*group).count {
+            if (*group).data[i] == d {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// The calls of the functions of `group`, as written (Call or MethodCall
+// nodes; an operator's: its Binary, Unary, Index node), each once.
+fn calls_of(group: *IntVec, out: *IntVec) {
+    unsafe {
+        let mut seen = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        for n in 1..NODE_COUNT {
+            if NODES[n].kind != NodeKind::Call || NODES[n].x <= 0 {
+                continue;
+            }
+            let d = def_of_node(FNS[NODES[n].x - 1].node);
+            if d < 0 || !in_group(group, d) {
+                continue;
+            }
+            let mut o = orig_of(n, NodeKind::Call);
+            if o < 0 {
+                o = orig_of(n, NodeKind::MethodCall);
+            }
+            if o < 0 {
+                o = orig_of(n, NodeKind::Binary);
+            }
+            if o < 0 {
+                o = orig_of(n, NodeKind::Unary);
+            }
+            if o < 0 {
+                o = orig_of(n, NodeKind::Index);
+            }
+            if o < 0 {
+                o = orig_of(n, NodeKind::Assign);
+            }
+            if o < 0 || seen.get(o + 1) != 0 {
+                continue;
+            }
+            seen.put(o + 1, 1);
+            out.push(o);
+        }
+        sort_by_start(out);
+    }
+}
+
+// The index of the parameter named `name` of function node f, or -1.
+fn param_index(f: i64, name: i64) -> i64 {
+    for i in 0..pcount(f) {
+        if pa(pchild(f, i)) == name {
+            return i;
+        }
+    }
+    -1
+}
+
+fn has_self(f: i64) -> bool {
+    unsafe { pcount(f) > 0 && pa(pchild(f, 0)) == intern_c(c"self") }
+}
+
+// The parameters of f, `(a, b)`, for messages.
+fn put_params(out: i64, f: i64) {
+    unsafe {
+        buf_byte(out, '(');
+        for i in 0..pcount(f) {
+            if i > 0 {
+                buf_str(out, c", ");
+            }
+            buf_bytes(out, sym_text(pa(pchild(f, i))));
+        }
+        buf_byte(out, ')');
+    }
+}
+
+fn no_param(d: i64, f: i64, name: *u8) -> i64 {
+    unsafe {
+        let e = diag(c"error", c"refactor.no-param");
+        buf_bytes(e, sym_text(DEFS[d].fqn));
+        buf_str(e, c" has no parameter '");
+        buf_str(e, name);
+        buf_str(e, c"': ");
+        put_params(e, f);
+        buf_byte(e, '\n');
+        try_query_name(c"def", sym_text(DEFS[d].fqn));
+        1
+    }
+}
+
+// The uses of the names `name` in the body of function node f, as
+// written (an identifier, not a path's segment); the first's position
+// into *first.
+fn name_uses(f: i64, name: i64, out: *IntVec) {
+    unsafe {
+        let body = pc(f);
+        if body == 0 {
+            return;
+        }
+        for n in 1..PROGRAM_END {
+            if pk(n) != NodeKind::Ident || pa(n) != name || pstart(n) < pstart(body) || pend(n) > pend(body) {
+                continue;
+            }
+            // (`name::x` is a path)
+            let t = token_at(pend(n));
+            if t < TOK_COUNT && TOKS[t].kind == Tok::ColonColon {
+                continue;
+            }
+            out.push(n);
+        }
+    }
+}
+
+// Whether `name` is bound in the body of f (a let, a pattern).
+fn bound_in(f: i64, name: i64) -> i64 {
+    unsafe {
+        let body = pc(f);
+        if body == 0 {
+            return -1;
+        }
+        for n in 1..PROGRAM_END {
+            if pk(n) == NodeKind::PatBind && pa(n) == name && pstart(n) >= pstart(body) && pend(n) <= pend(body) {
+                return pstart(n);
+            }
+        }
+        -1
+    }
+}
+
+fn signature_inner(argc: i64, argv: **u8) -> i64 {
+    unsafe {
+        set_command(argc, argv);
+        PROG = argv[0];
+        TOOL = c"refactor";
+        SUB = c"signature";
+        let mut root = 0 as *u8;
+        let mut words = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut opts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let example = c"NAME --add 'x: i64 = 0' --dry-run";
+        if !take_args(argc, argv, c"--add=1 --at=1 --remove=1 --rename-param=2 --reorder=1 --type=2", &root, &words, &opts) {
+            return 2;
+        }
+        if words.count != 1 {
+            return usage_error(if words.count == 0 { c"a function NAME is needed" } else { c"one NAME at a time" }, example);
+        }
+        let add = opt(&opts, c"--add", false);
+        let at = opt(&opts, c"--at", false);
+        let remove = opt(&opts, c"--remove", false);
+        let rename = opt(&opts, c"--rename-param", false);
+        let reorder = opt(&opts, c"--reorder", false);
+        let retype = opt(&opts, c"--type", false);
+        let actions = (add != 0 as *u8) as i64 + (remove != 0 as *u8) as i64 + (rename != 0 as *u8) as i64
+            + (reorder != 0 as *u8) as i64 + (retype != 0 as *u8) as i64;
+        if actions != 1 {
+            return usage_error(c"one of --add, --remove, --rename-param, --reorder, --type", example);
+        }
+        if at != 0 as *u8 && add == 0 as *u8 {
+            return usage_error(c"--at goes with --add", example);
+        }
+        let name = c_slice(words.data[0] as *u8);
+        ROOT_GIVEN = root;
+        root = root_or_diag(root, SUB, name, true);
+        if root == 0 as *u8 {
+            return 2;
+        }
+        let mut status = 0;
+        let fn_kinds = (1 << K_FN) | (1 << K_METHOD) | (1 << K_IMPL_METHOD) | (1 << K_TRAIT_FN);
+        let d = load_and_find(root, name, fn_kinds, c"function", &status);
+        if d < 0 {
+            return status;
+        }
+        let f = DEFS[d].node;
+        let fqn = sym_text(DEFS[d].fqn);
+        if pk(f) == NodeKind::ExternFn || NODES[f].y == 1 {
+            let e = diag(c"error", c"refactor.extern");
+            buf_bytes(e, fqn);
+            buf_str(e, if pk(f) == NodeKind::ExternFn { c" is a C function: its signature is C's\n" }
+                else { c" is an extern \"C\" fn: C code calls it\n" });
+            return 1;
+        }
+        let mut group = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        signature_group(d, &group);
+        for i in 1..group.count {
+            if pcount(DEFS[group.data[i]].node) != pcount(f) {
+                let e = diag(c"error", c"refactor.trait");
+                buf_bytes(e, sym_text(DEFS[group.data[i]].fqn));
+                buf_str(e, c" has not the parameters of ");
+                buf_bytes(e, fqn);
+                buf_byte(e, '\n');
+                return 1;
+            }
+        }
+        let mut calls = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        calls_of(&group, &calls);
+        // The references that are no calls: a function used as a value
+        // (its type is its signature's).
+        if rename == 0 as *u8 {
+            refs_of(&group);
+            for r in 0..R_POS.count {
+                if (R_FLAGS.data[r] & (QF_CALL | QF_DEF)) != 0 || enclosing(R_POS.data[r]) < 0 {
+                    continue;
+                }
+                let e = diag(c"error", c"refactor.fn-value");
+                buf_bytes(e, fqn);
+                buf_str(e, c" is used as a value at ");
+                put_loc(e, R_POS.data[r]);
+                buf_str(e, c": its type would change; change that use first\n");
+                try_query_name(c"refs", fqn);
+                return 1;
+            }
+        }
+        for i in 0..calls.count {
+            let c = calls.data[i];
+            if pk(c) != NodeKind::Call && pk(c) != NodeKind::MethodCall && rename == 0 as *u8 {
+                let e = diag(c"error", c"refactor.operator");
+                buf_bytes(e, fqn);
+                buf_str(e, c" is called by an operator at ");
+                put_loc(e, pstart(c));
+                buf_str(e, c": its arguments are the operator's\n");
+                return 1;
+            }
+        }
+        let unchecked = unchecked_calls(DEFS[d].name, &calls);
+        let self_param = has_self(f);
+        let what = buf_new();
+        if add != 0 as *u8 {
+            let text = c_slice(add);
+            let mut vstart = -1;
+            let dend = split_default(text, &vstart);
+            let decl = text[0..dend];
+            let pname = leading_name(decl);
+            if pname < 0 || find_byte(decl, ':') < 0 {
+                return usage_error(c"--add takes 'NAME: TYPE = VALUE' (VALUE: the calls' argument)", example);
+            }
+            if param_index(f, pname) >= 0 {
+                let e = diag(c"error", c"refactor.clash");
+                buf_bytes(e, fqn);
+                buf_str(e, c" has a parameter '");
+                buf_bytes(e, sym_text(pname));
+                buf_str(e, c"' already\n");
+                return 1;
+            }
+            if vstart < 0 && calls.count > 0 {
+                let e = diag(c"error", c"refactor.no-default");
+                buf_str(e, c"the calls need a value for ");
+                buf_bytes(e, sym_text(pname));
+                buf_str(e, c": --add 'NAME: TYPE = VALUE'\n");
+                let out = try_refactor(fqn);
+                buf_str(out, c" --add");
+                let w = text_buf(decl);
+                buf_str(w, c" = 0");
+                put_word(out, buf_slice(w));
+                buf_str(out, c" --dry-run");
+                put_root(out);
+                try_end(out);
+                return 2;
+            }
+            let k = if at != 0 as *u8 { crate::tools::query::parse_count(at) } else { pcount(f) };
+            if k < 0 || k > pcount(f) || (k == 0 && self_param) {
+                let e = diag(c"error", c"refactor.usage");
+                buf_str(e, c"--at takes a position from ");
+                buf_int(e, self_param as i64);
+                buf_str(e, c" to ");
+                buf_int(e, pcount(f));
+                buf_str(e, c" among ");
+                put_params(e, f);
+                buf_byte(e, '\n');
+                return 2;
+            }
+            for g in 0..group.count {
+                let gd = group.data[g];
+                list_of_params(DEFS[gd].node, DEFS[gd].name_pos);
+                list_insert(k, decl);
+            }
+            let value = if vstart >= 0 { text[vstart..text.len] } else { text[0..0] };
+            for i in 0..calls.count {
+                let c = calls.data[i];
+                list_of_node(c);
+                let off = if pk(c) == NodeKind::MethodCall && self_param { 1 } else { 0 };
+                list_insert(k - off, value);
+            }
+            buf_str(what, c"added parameter ");
+            buf_bytes(what, decl);
+            buf_str(what, c" to ");
+        } else if remove != 0 as *u8 {
+            let pname = intern(c_slice(remove));
+            let k = param_index(f, pname);
+            if k < 0 {
+                return no_param(d, f, remove);
+            }
+            if k == 0 && self_param {
+                return usage_error(c"self is not removed: the function would be another kind (refactor move)", example);
+            }
+            for g in 0..group.count {
+                let gf = DEFS[group.data[g]].node;
+                let gname = pa(pchild(gf, k));
+                let mut uses = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+                name_uses(gf, gname, &uses);
+                if uses.count > 0 {
+                    let e = diag(c"error", c"refactor.used");
+                    buf_str(e, c"parameter ");
+                    buf_bytes(e, sym_text(gname));
+                    buf_str(e, c" is used in ");
+                    buf_bytes(e, sym_text(DEFS[group.data[g]].fqn));
+                    buf_str(e, c" at ");
+                    put_loc(e, pstart(uses.data[0]));
+                    buf_byte(e, '\n');
+                    try_show_at(pstart(uses.data[0]));
+                    return 1;
+                }
+            }
+            let mut effects = -1;
+            for g in 0..group.count {
+                let gd = group.data[g];
+                list_of_params(DEFS[gd].node, DEFS[gd].name_pos);
+                list_remove(k);
+            }
+            for i in 0..calls.count {
+                let c = calls.data[i];
+                list_of_node(c);
+                let off = if pk(c) == NodeKind::MethodCall && self_param { 1 } else { 0 };
+                if has_call(L_START.data[k - off], L_END.data[k - off]) && effects < 0 {
+                    effects = L_START.data[k - off];
+                }
+                list_remove(k - off);
+            }
+            if effects >= 0 {
+                let e = diag(c"warning", c"refactor.effects");
+                buf_str(e, c"a removed argument calls a function (first: ");
+                put_loc(e, effects);
+                buf_str(e, c"); its calls are gone\n");
+            }
+            buf_str(what, c"removed parameter ");
+            buf_bytes(what, sym_text(pname));
+            buf_str(what, c" of ");
+        } else if rename != 0 as *u8 {
+            let old = intern(c_slice(rename));
+            let new = intern(c_slice(opt(&opts, c"--rename-param", true)));
+            let k = param_index(f, old);
+            if k < 0 {
+                return no_param(d, f, rename);
+            }
+            if old == intern_c(c"self") || new == intern_c(c"self") {
+                return usage_error(c"self keeps its name (a method's first parameter is self)", example);
+            }
+            for g in 0..group.count {
+                let gf = DEFS[group.data[g]].node;
+                let p = pchild(gf, k);
+                let gold = pa(p);
+                if param_index(gf, new) >= 0 || bound_in(gf, new) >= 0 || bound_in(gf, gold) >= 0 || has_name(gf, new) {
+                    let e = diag(c"error", c"refactor.clash");
+                    buf_bytes(e, sym_text(new));
+                    buf_str(e, c" is a name in ");
+                    buf_bytes(e, sym_text(DEFS[group.data[g]].fqn));
+                    buf_str(e, if bound_in(gf, gold) >= 0 { c" (or the parameter is shadowed there); rename by hand\n" }
+                        else { c" already\n" });
+                    try_query_name(c"show", sym_text(DEFS[group.data[g]].fqn));
+                    return 1;
+                }
+                replace_name(name_token(pstart(p), pend(p), gold), gold, new);
+                let mut uses = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+                name_uses(gf, gold, &uses);
+                for u in 0..uses.count {
+                    replace_name(pstart(uses.data[u]), gold, new);
+                }
+            }
+            buf_str(what, c"renamed parameter ");
+            buf_bytes(what, sym_text(old));
+            buf_str(what, c" to ");
+            buf_bytes(what, sym_text(new));
+            buf_str(what, c" of ");
+        } else if reorder != 0 as *u8 {
+            // The new order: the names, self first.
+            let first = self_param as i64;
+            let mut perm = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            if self_param {
+                perm.push(0);
+            }
+            let s = c_slice(reorder);
+            let mut i = 0;
+            while i <= s.len {
+                let mut e = i;
+                while e < s.len && s[e] != ',' {
+                    e += 1;
+                }
+                let mut a = i;
+                while a < e && s[a] == ' ' {
+                    a += 1;
+                }
+                let mut b = e;
+                while b > a && s[b - 1] == ' ' {
+                    b -= 1;
+                }
+                if b > a {
+                    let k = param_index(f, intern(s[a..b]));
+                    if k < first {
+                        let nb = buf_new();
+                        buf_bytes(nb, s[a..b]);
+                        buf_byte(nb, 0);
+                        return no_param(d, f, crate::tools::proc::buf_cstr(nb));
+                    }
+                    perm.push(k);
+                }
+                i = e + 1;
+            }
+            let mut ok = perm.count == pcount(f);
+            for x in 0..perm.count {
+                for y in 0..x {
+                    if perm.data[x] == perm.data[y] {
+                        ok = false;
+                    }
+                }
+            }
+            if !ok {
+                let e = diag(c"error", c"refactor.usage");
+                buf_str(e, c"--reorder lists each parameter once");
+                buf_str(e, if self_param { c" (but self, which stays first): " } else { c": " });
+                put_params(e, f);
+                buf_byte(e, '\n');
+                return 2;
+            }
+            for g in 0..group.count {
+                let gd = group.data[g];
+                list_of_params(DEFS[gd].node, DEFS[gd].name_pos);
+                list_permute(&perm);
+            }
+            let mut moved = -1;
+            for c0 in 0..calls.count {
+                let c = calls.data[c0];
+                list_of_node(c);
+                let mut cperm = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+                let off = if pk(c) == NodeKind::MethodCall && self_param { 1 } else { 0 };
+                let mut effects = 0;
+                for x in off..perm.count {
+                    cperm.push(perm.data[x] - off);
+                    if has_call(L_START.data[x - off], L_END.data[x - off]) {
+                        effects += 1;
+                    }
+                }
+                if effects > 1 && moved < 0 {
+                    moved = pstart(c);
+                }
+                list_permute(&cperm);
+            }
+            if moved >= 0 {
+                let e = diag(c"warning", c"refactor.effects");
+                buf_str(e, c"arguments that call functions are evaluated in another order (first: ");
+                put_loc(e, moved);
+                buf_str(e, c")\n");
+            }
+            buf_str(what, c"reordered the parameters of ");
+        } else {
+            let pname = intern(c_slice(retype));
+            let k = param_index(f, pname);
+            if k < 0 {
+                return no_param(d, f, retype);
+            }
+            let ty = c_slice(opt(&opts, c"--type", true));
+            for g in 0..group.count {
+                let p = pchild(DEFS[group.data[g]].node, k);
+                let t = pb(p);
+                edit_replace(pstart(t), pend(t), text_buf(ty));
+            }
+            buf_str(what, c"changed parameter ");
+            buf_bytes(what, sym_text(pname));
+            buf_str(what, c" to ");
+            buf_bytes(what, ty);
+            buf_str(what, c" in ");
+        }
+        buf_bytes(what, fqn);
+        if group.count > 1 {
+            buf_str(what, c" and ");
+            put_count(what, group.count - 1, c"other definition", c"other definitions");
+        }
+        if rename == 0 as *u8 && retype == 0 as *u8 {
+            buf_str(what, c", ");
+            put_count(what, calls.count, c"call", c"calls");
+        }
+        if unchecked.count > 0 {
+            let e = diag(c"warning", c"refactor.unchecked");
+            put_count(e, unchecked.count, c"call", c"calls");
+            buf_str(e, c" named ");
+            buf_bytes(e, sym_text(DEFS[d].name));
+            buf_str(e, c" in code the checker did not see (a generic function never instantiated) are not changed; first: ");
+            put_loc(e, pstart(unchecked.data[0]));
+            buf_byte(e, '\n');
+        }
+        apply_edit(buf_slice(what), root)
+    }
+}
+
+// Whether `name` is written as an identifier in the body of f.
+fn has_name(f: i64, name: i64) -> bool {
+    let mut uses = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    name_uses(f, name, &uses);
+    uses.count > 0
+}
+
+// The calls written with name `name` that the checker never resolved
+// (in code it did not check), but `calls`.
+fn unchecked_calls(name: i64, calls: *IntVec) -> IntVec {
+    unsafe {
+        let mut out = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for n in 1..PROGRAM_END {
+            if in_group(calls, n) {
+                continue;
+            }
+            let k = pk(n);
+            let named = (k == NodeKind::MethodCall && pb(n) == name)
+                || (k == NodeKind::Call && pk(pa(n)) == NodeKind::Ident && pa(pa(n)) == name);
+            if !named || FILES[file_of_pos(pstart(n))].path[0] == '<' {
+                continue;
+            }
+            if NODES[n].kind == NodeKind::MethodCall || (NODES[n].kind == NodeKind::Call && NODES[n].x == 0 && NODES[NODES[n].a].res == crate::front::check::Res::None) {
+                out.push(n);
+            }
+        }
+        out
+    }
+}

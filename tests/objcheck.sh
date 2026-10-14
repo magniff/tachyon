@@ -23,7 +23,8 @@
 #   -c COMPILER   the tachyonc to check (default: target/tachyonc)
 #   -t TARGET     aarch64-macos, aarch64-linux, x86_64-linux or
 #                 x86_64-macos (default: the host)
-#   -j JOBS       programs checked at once (default: the number of CPUs)
+#   -j JOBS       programs checked at once (default: the number of CPUs,
+#                 or the slots of $TACHYON_JOBSERVER, see tests/run.sh)
 #   FILTER        only the programs whose path contains FILTER
 
 set -u
@@ -42,8 +43,8 @@ while [ $# -gt 0 ]; do
         -c) COMPILER=$2; shift 2 ;;
         -t) TARGET=$2; shift 2 ;;
         -j) JOBS=$2; shift 2 ;;
-        -h|--help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-        -*) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+        -h|--help) sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -*) sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
         *) FILTER=$1; shift ;;
     esac
 done
@@ -56,11 +57,27 @@ case "$TARGET" in
     aarch64-macos) LINK_FLAGS="-arch arm64" ;;
     x86_64-macos) LINK_FLAGS="-arch x86_64" ;;
 esac
-if [ -z "$JOBS" ]; then
-    JOBS=$(sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
-fi
 WORK="$ROOT/target/objcheck/$TARGET"
 mkdir -p "$WORK"
+
+# The C compiler, once more when it crashed (a signal, or gcc's "internal
+# compiler error"): an emulated toolchain (x86-64 Linux under Rosetta)
+# now and then does, and a crash of cc is not tachyon's. Its output (and
+# the crash's, if any) on stdout.
+cc_run() {
+    cr_out=$("$CC" "$@" 2>&1)
+    cr_rc=$?
+    if [ $cr_rc -ne 0 ]; then
+        case "$cr_rc:$cr_out" in
+            1[3-9][0-9]:*|2[0-9][0-9]:*|*"internal compiler error"*|*"Segmentation fault"*|*"Bus error"*)
+                printf '%s\n(%s crashed, exit %d: run again)\n' "$cr_out" "$CC" "$cr_rc"
+                cr_out=$("$CC" "$@" 2>&1)
+                cr_rc=$? ;;
+        esac
+    fi
+    [ -z "$cr_out" ] || printf '%s\n' "$cr_out"
+    return $cr_rc
+}
 
 # The code of an executable: instructions with their addresses, without
 # symbol names, comments or NOPs.
@@ -126,11 +143,11 @@ check() { # <file> <level> <dir> [-g]
     # shellcheck disable=SC2086
     "$COMPILER" --target "$TARGET" "-O$o" $g -S "$f" -o "$d/prog.s" >"$d/out" 2>&1 || { echo "FAIL $f -O$o $g: tachyonc -S"; return; }
     # shellcheck disable=SC2086
-    "$CC" $LINK_FLAGS -c "$d/prog.s" -o "$d/cc.o" >"$d/out" 2>&1 || { echo "FAIL $f -O$o: cc -c"; return; }
+    cc_run $LINK_FLAGS -c "$d/prog.s" -o "$d/cc.o" >"$d/out" 2>&1 || { echo "FAIL $f -O$o: cc -c"; return; }
     # shellcheck disable=SC2086
-    "$CC" $LINK_FLAGS -o "$d/ours" "$d/ours.o" -lm >"$d/out" 2>&1 || { echo "FAIL $f -O$o: linking ours: $(head -c 300 "$d/out")"; return; }
+    cc_run $LINK_FLAGS -o "$d/ours" "$d/ours.o" -lm >"$d/out" 2>&1 || { echo "FAIL $f -O$o: linking ours: $(head -c 300 "$d/out")"; return; }
     # shellcheck disable=SC2086
-    "$CC" $LINK_FLAGS -o "$d/cc" "$d/cc.o" -lm >"$d/out" 2>&1 || { echo "FAIL $f -O$o: linking cc's"; return; }
+    cc_run $LINK_FLAGS -o "$d/cc" "$d/cc.o" -lm >"$d/out" 2>&1 || { echo "FAIL $f -O$o: linking cc's"; return; }
     code "$d/ours" >"$d/ours.code"
     code "$d/cc" >"$d/cc.code"
     if ! cmp -s "$d/ours.code" "$d/cc.code"; then
@@ -176,23 +193,34 @@ for f in tests/run/*.tach tests/run/*/main.tach examples/*.tach bench/*.tach com
     grep -q '// ERROR\|// CSOURCE\|// CHEADER\|// FIXIMPORTS\|// FIXUNSAFE' "$f" && continue
     echo "$f" >>"$list"
 done
+# The slots: JOBS of them, or (0.11) the ones $TACHYON_JOBSERVER shares
+# between the runners of bootstrap/gate.sh (see tests/run.sh).
+if [ -z "$JOBS" ] && [ -n "${TACHYON_JOBSERVER:-}" ] && [ -p "$TACHYON_JOBSERVER" ]; then
+    exec 3<>"$TACHYON_JOBSERVER"
+else
+    [ -n "$JOBS" ] || JOBS=$(sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
+    rm -f "$WORK/slots"
+    mkfifo "$WORK/slots"
+    exec 3<>"$WORK/slots"
+    i=0
+    while [ "$i" -lt "$JOBS" ]; do
+        echo >&3
+        i=$((i + 1))
+    done
+fi
 n=0
-running=0
 while read -r f; do
     for og in 0 2 0g 2g; do
         n=$((n + 1))
         o=${og%g}
         g=""
         [ "$o" = "$og" ] || g=-g
-        check "$f" "$o" "$WORK/$n" $g >"$WORK/$n.result" &
-        running=$((running + 1))
-        if [ "$running" -ge "$JOBS" ]; then
-            wait
-            running=0
-        fi
+        read -r _ <&3
+        ( check "$f" "$o" "$WORK/$n" $g >"$WORK/$n.result"; echo >&3 ) &
     done
 done <"$list"
 wait
+exec 3>&-
 i=1
 ok=0
 failed=0

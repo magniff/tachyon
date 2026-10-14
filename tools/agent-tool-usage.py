@@ -139,7 +139,8 @@ def hook_report(path):
     kinds = Counter(r.get("kind") for r in recs)
     print("## The query-first hook\n")
     print("| event | count |\n|---|---|")
-    for k in ("query", "query-result", "blocked", "escape", "feedback", "read", "grep", "edit", "write", "multiedit", "read-unenforced"):
+    for k in ("query", "query-result", "blocked", "escape", "feedback", "read", "grep", "edit", "write", "multiedit",
+              "read-unenforced", "tool-result", "edit-blocked", "edit-escape"):
         if kinds.get(k):
             print(f"| {k} | {kinds[k]} |")
     subs = Counter()
@@ -165,6 +166,126 @@ def hook_report(path):
         print(f"\n## Where query was not enough ({len(esc)})\n")
         for r in esc:
             print(f"- {r.get('reason','')}  \n  `{r.get('command','')[:120]}`")
+    edit_report(recs)
+
+
+def path_kind(path):
+    """What a file is: compiler (its source: compiler/src, compiler/std),
+    tests (fixtures), docs, scratch (target/, /tmp) or other."""
+    if SCRATCH.search(path):
+        return "scratch"
+    if re.search(r"(^|/)compiler/(src|std)/", path):
+        return "compiler"
+    if re.search(r"(^|/)tests/", path):
+        return "tests"
+    if path.endswith(".md") or re.search(r"(^|/)docs/", path):
+        return "docs"
+    return "other"
+
+
+SCRATCH = re.compile(r"(^|/)(target|tmp|private/tmp|var/folders)/")
+PATHS = re.compile(r"[\w./~*-]*\.(?:tach|md|t)\b")
+
+
+def edit_report(recs):
+    """Edits to existing compiler source by the tools, against shell
+    rewrites and the Edit and Write tools; the other edits apart."""
+    counted = Counter()   # how -> edits of existing compiler source
+    per_agent = defaultdict(Counter)  # who -> how -> edits
+    by_tool = Counter()
+    other = Counter()     # what -> edits not counted
+    reasons = []
+    for r in recs:
+        kind = r.get("kind")
+        before = Counter(counted)
+        tally_edit(r, kind, counted, by_tool, other, reasons)
+        for how, n in (counted - before).items():
+            per_agent[agent_key(r)][how] += n
+    print_edit_report(counted, by_tool, other, reasons, per_agent)
+
+
+def agent_key(r):
+    """Who made a record: the harness's agent id, else the checkout (a
+    parallel agent's worktree), else the session (0.11's records)."""
+    if r.get("agent_id"):
+        return r["agent_id"]
+    if r.get("worktree"):
+        return os.path.basename(r["worktree"].rstrip("/")) or r["worktree"]
+    return "session " + (r.get("session") or "?")
+
+
+def tally_edit(r, kind, counted, by_tool, other, reasons):
+    """Counts record r (of kind) in the edit report's tallies."""
+    if True:
+        if kind == "tool-result":
+            if not r.get("written"):
+                other["tool dry runs, plans and refusals (nothing written)"] += 1
+            elif r.get("compiler"):
+                counted["tools"] += 1
+                by_tool[r.get("tool", "?")] += 1
+            else:
+                other["tool edits of test or scratch programs"] += 1
+        elif kind in ("edit", "edit-escape") and "command" in r:
+            # (a shell rewrite: sed -i, perl -pi, python; it ran)
+            command = r.get("command", "")
+            files = r.get("files") or PATHS.findall(command)
+            # (relative to the directory a `cd` went to)
+            cd = re.findall(r"\bcd\s+(\S+)", command)
+            if cd and not r.get("files"):
+                files = [f if f.startswith("/") else cd[-1].rstrip("/") + "/" + f for f in files]
+            kinds = {path_kind(f) for f in files} or {"other"}
+            if "compiler" in kinds:
+                counted["shell"] += 1
+                if kind == "edit-escape":
+                    reasons.append(r)
+            else:
+                other["shell rewrites of " + sorted(kinds)[0]] += 1
+        elif kind == "edit-blocked":
+            other["shell rewrites blocked (nothing written)"] += 1
+        elif kind in ("edit", "multiedit", "write") and "target" in r:
+            k = path_kind(r.get("target", ""))
+            existed = r.get("existed", True if kind != "write" else None)
+            if k == "compiler" and existed:
+                counted["Edit" if kind != "write" else "Write"] += 1
+            elif k == "compiler" and existed is None:
+                other["Write of compiler source, before existence was logged"] += 1
+            elif k == "compiler":
+                other["new compiler files (Write)"] += 1
+            else:
+                other[f"{kind.capitalize()} of {k}"] += 1
+
+
+def print_edit_report(counted, by_tool, other, reasons, per_agent):
+    total = sum(counted.values())
+    print("\n## Edits to existing compiler source\n")
+    print("Compiler source is compiler/src and compiler/std; new files, test "
+          "fixtures, docs and scratch programs (target/, /tmp) are apart.\n")
+    print("| how | edits |\n|---|---|")
+    tools = ", ".join(f"{k} {v}" for k, v in by_tool.most_common())
+    print(f"| `tachyonc` edit, refactor, fix, rewrite, undo (written){': ' + tools if tools else ''} | {counted['tools']} |")
+    print(f"| shell rewrites run (`sed -i`, `perl -pi`, Python) | {counted['shell']} |")
+    print(f"| Edit tool | {counted['Edit']} |")
+    print(f"| Write tool, over an existing file | {counted['Write']} |")
+    if total:
+        print(f"\n**Tool edits: {counted['tools']} of {total}, {100 * counted['tools'] / total:.0f}%** "
+              "(the tools against shell rewrites and Edit/Write of existing compiler files).")
+    else:
+        print("\n**Tool edits: no edits of existing compiler source logged.**")
+    if len(per_agent) > 1:
+        print("\nPer agent (the harness's agent id, else its worktree, else its session):\n")
+        print("| agent | tools | shell | Edit | Write | tool share |\n|---|---|---|---|---|---|")
+        for who, c in sorted(per_agent.items(), key=lambda kv: -sum(kv[1].values())):
+            n = sum(c.values())
+            print(f"| {who} | {c['tools']} | {c['shell']} | {c['Edit']} | {c['Write']} | "
+                  f"{100 * c['tools'] / n:.0f}% |")
+    if other:
+        print("\nNot counted:\n\n| what | count |\n|---|---|")
+        for k, v in other.most_common():
+            print(f"| {k} | {v} |")
+    if reasons:
+        print(f"\nWhy the shell (`# no-tool:`), {len(reasons)}:\n")
+        for r in reasons[:30]:
+            print(f"- {r.get('reason', '')}  \n  `{r.get('command', '')[:120]}`")
 
 
 def main():

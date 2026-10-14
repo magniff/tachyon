@@ -1,0 +1,191 @@
+// Jump threading on implied conditions: an edge into a block that only
+// tests what the facts on the edge already decide goes on to the outcome
+// directly, and a branch on a phi of `&&` or `||` is threaded from the
+// predecessor that decided it. EXPORTS marks the blocks with values used
+// outside them, which threading cannot skip.
+
+use crate::middle::ir::{
+    BLOCKS, BLOCK_COUNT, INSTS, IRFUNCS, Op, Term, ir_arg, ir_operand, ir_operand_count, ir_val,
+};
+use crate::middle::ir::cfg::{is_succ, pred_index, redirect_succ};
+use crate::middle::loops::{LP_VALUES, add_pred_values, block_array};
+use crate::middle::opt::{
+    add_pred_like, compute_dominators, remove_pred, remove_pred_at, remove_unreachable,
+};
+use crate::middle::range::{collect_facts, decide, edge_fact};
+use crate::middle::range::phi::forget_phi_ranges;
+
+// (0.11) A block holding nothing but a phi and a branch on it (what `&&`
+// and `||` leave), the phi used by the branch alone: a predecessor that
+// branched on the phi's operand for it decides the branch by the edge it
+// takes, and goes on to the outcome directly (as instruction selection
+// threads them; here, so that the facts on the way hold where the outcome
+// is: in `i < n && s[i] < x`, i < n wherever the whole is true). Returns
+// whether any edge was redirected.
+pub fn thread_phi_conditions(fi: i64) -> bool {
+    let mut changed = false;
+    compute_exports(fi);
+    unsafe {
+        for i in 0..IRFUNCS[fi].blocks.count {
+            let j = IRFUNCS[fi].blocks.data[i];
+            if BLOCKS[j].removed != 0 || BLOCKS[j].term != Term::Branch || j == IRFUNCS[fi].entry {
+                continue;
+            }
+            let phi = BLOCKS[j].first;
+            let s0 = BLOCKS[j].s0;
+            let s1 = BLOCKS[j].s1;
+            if phi == 0 || INSTS[phi].op != Op::Phi || INSTS[phi].next != 0 || ir_val(BLOCKS[j].cond) != phi
+                || used_outside_block(fi, j) || s0 == s1 || s0 == j || s1 == j
+                || INSTS[phi].nargs != BLOCKS[j].preds.count {
+                continue;
+            }
+            let mut k = 0;
+            while k < BLOCKS[j].preds.count {
+                let p = BLOCKS[j].preds.data[k];
+                let value = ir_val(ir_arg(phi, k));
+                if BLOCKS[p].term != Term::Branch || p == j || ir_val(BLOCKS[p].cond) != value
+                    || (BLOCKS[p].s0 == j) == (BLOCKS[p].s1 == j) {
+                    k += 1;
+                    continue;
+                }
+                let t = if BLOCKS[p].s0 == j { s0 } else { s1 };
+                let other = if BLOCKS[p].s0 == j { BLOCKS[p].s1 } else { BLOCKS[p].s0 };
+                if t == other || t == p {
+                    k += 1;
+                    continue;
+                }
+                redirect_succ(p, j, t);
+                add_pred_like(t, p, j);
+                remove_pred_at(j, k);
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+// A block that only tests: no phis, its instructions pure (or constants)
+// and used by its own branch alone.
+fn is_test_block(fi: i64, j: i64) -> bool {
+    unsafe {
+        if BLOCKS[j].term != Term::Branch || j == IRFUNCS[fi].entry || BLOCKS[j].s0 == BLOCKS[j].s1 {
+            return false;
+        }
+        let mut v = BLOCKS[j].first;
+        let mut n = 0;
+        while v != 0 {
+            let op = INSTS[v].op;
+            if op != Op::Const && !op.is_pure() {
+                return false;
+            }
+            n += 1;
+            v = INSTS[v].next;
+        }
+        n <= 4 && !used_outside_block(fi, j)
+    }
+}
+
+// Per block id: whether a value defined in it is used in another block
+// (compute_exports).
+static mut EXPORTS: *i64 = 0 as *i64;
+
+static mut EXPORTS_CAP: i64 = 0;
+
+pub fn compute_exports(fi: i64) {
+    unsafe {
+        EXPORTS = block_array(EXPORTS, &EXPORTS_CAP, fi);
+        for i in 0..IRFUNCS[fi].blocks.count {
+            let b = IRFUNCS[fi].blocks.data[i];
+            if BLOCKS[b].removed != 0 {
+                continue;
+            }
+            let mut v = BLOCKS[b].first;
+            while v != 0 {
+                for k in 0..ir_operand_count(v) {
+                    let w = ir_operand(v, k);
+                    if w != 0 && INSTS[w].block != 0 && INSTS[w].block != b {
+                        EXPORTS[INSTS[w].block] = 1;
+                    }
+                }
+                v = INSTS[v].next;
+            }
+            let c = BLOCKS[b].cond;
+            if c != 0 && INSTS[c].block != 0 && INSTS[c].block != b {
+                EXPORTS[INSTS[c].block] = 1;
+            }
+        }
+    }
+}
+
+// Whether a value defined in block j is used in another block.
+pub fn used_outside_block(fi: i64, j: i64) -> bool {
+    let _ = fi;
+    unsafe { j >= BLOCK_COUNT || EXPORTS[j] != 0 }
+}
+
+// Jump threading: a predecessor p of a test block j, where the test is
+// decided (by p's facts and the edge p -> j), goes to j's outcome directly.
+pub fn thread_implied(fi: i64) -> bool {
+    let mut changed = false;
+    compute_exports(fi);
+    // One edge at a time: the facts need the dominators of the current CFG.
+    for _ in 0..1000 {
+        let mut did = false;
+        compute_dominators(fi);
+        unsafe {
+            for i in 0..IRFUNCS[fi].blocks.count {
+                if did {
+                    break;
+                }
+                let j = IRFUNCS[fi].blocks.data[i];
+                if BLOCKS[j].removed != 0 || BLOCKS[j].order < 0 || BLOCKS[j].preds.count < 2 {
+                    continue;
+                }
+                if !is_test_block(fi, j) {
+                    continue;
+                }
+                let c = ir_val(BLOCKS[j].cond);
+                let mut k = 0;
+                while k < BLOCKS[j].preds.count {
+                    let p = BLOCKS[j].preds.data[k];
+                    k += 1;
+                    if BLOCKS[p].term == Term::Switch || BLOCKS[p].order < 0
+                        || (BLOCKS[p].term == Term::Branch && BLOCKS[p].s0 == BLOCKS[p].s1) {
+                        continue;
+                    }
+                    collect_facts(p);
+                    edge_fact(p, j);
+                    let d = decide(c);
+                    if d < 0 {
+                        continue;
+                    }
+                    let t = if d == 1 { BLOCKS[j].s0 } else { BLOCKS[j].s1 };
+                    if is_succ(p, t) || t == j {
+                        continue;
+                    }
+                    // p -> t: t's phis take their operand for j.
+                    let index = pred_index(t, j);
+                    let first = LP_VALUES.count;
+                    let mut phi = BLOCKS[t].first;
+                    while phi != 0 && INSTS[phi].op == Op::Phi {
+                        LP_VALUES.push(ir_arg(phi, index));
+                        phi = INSTS[phi].next;
+                    }
+                    redirect_succ(p, j, t);
+                    add_pred_values(t, p, &LP_VALUES, first);
+                    LP_VALUES.count = first;
+                    remove_pred(j, p);
+                    did = true;
+                    break;
+                }
+            }
+        }
+        if !did {
+            break;
+        }
+        changed = true;
+        remove_unreachable(fi);
+        forget_phi_ranges();
+    }
+    changed
+}

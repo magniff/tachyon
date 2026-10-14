@@ -1,0 +1,242 @@
+// An item's lines and text, for the edits that replace, insert and delete
+// items and for the refactorings that move them.
+
+use crate::base::{FILES, SRC, buf_byte, buf_bytes, buf_new};
+use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
+use crate::front::modules::file_of_pos;
+use crate::tools::query::defs::{DEFS, K_FIELD, K_VARIANT};
+use crate::tools::query::positions::{line_end, line_start, token_at};
+
+// ---- Items as text ----
+//
+// An item's text (what replace, insert and delete work on) is whole lines
+// when it has its lines to itself: from the line of its first token (its
+// attributes, `pub`, its keyword) to the line of its last (its `}` or
+// `;`; a field's or variant's `,`), with any comment after it on that
+// line. Above it, the comment and attribute lines directly over it (what
+// `query show` prints) belong to it for delete, and for replace when the
+// new text starts with a comment or an attribute. An item that shares a
+// line with other code (a field of a one-line struct) is its exact bytes.
+
+// The start of the item of definition d: its node's start, or before it
+// its `pub` and its attributes.
+pub fn item_head(d: i64) -> i64 {
+    unsafe { node_head(DEFS[d].start) }
+}
+
+// The start of an item whose node starts at `start`: there, or before it
+// at its `pub` and its attributes.
+pub fn node_head(start: i64) -> i64 {
+    unsafe {
+        let mut i = token_at(start);
+        loop {
+            if i > 0 && TOKS[i - 1].kind == Tok::Pub {
+                i -= 1;
+                continue;
+            }
+            if i > 1 && TOKS[i - 1].kind == Tok::RBracket {
+                // `#[...]`
+                let mut j = i - 1;
+                let mut depth = 0;
+                while j > 0 {
+                    if TOKS[j].kind == Tok::RBracket {
+                        depth += 1;
+                    } else if TOKS[j].kind == Tok::LBracket {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    j -= 1;
+                }
+                if j > 0 && TOKS[j - 1].kind == Tok::Hash {
+                    i = j - 1;
+                    continue;
+                }
+            }
+            break;
+        }
+        TOKS[i].start
+    }
+}
+
+// The end of the item of definition d: its node's end, and the `;` or (a
+// field, a variant) the `,` right after it.
+pub fn item_tail(d: i64) -> i64 {
+    unsafe {
+        let end = DEFS[d].end;
+        let i = token_at(end);
+        if i < TOK_COUNT && (TOKS[i].kind == Tok::Semi || TOKS[i].kind == Tok::Comma) && TOKS[i].start >= end
+            && file_of_pos(TOKS[i].start) == file_of_pos(end) {
+            let mut between = true;
+            for p in end..TOKS[i].start {
+                if SRC[p] != ' ' && SRC[p] != '\t' && SRC[p] != '\n' && SRC[p] != '\r' {
+                    between = false;
+                }
+            }
+            if between && (TOKS[i].kind == Tok::Semi || DEFS[d].kind == K_FIELD || DEFS[d].kind == K_VARIANT) {
+                return TOKS[i].end;
+            }
+        }
+        end
+    }
+}
+
+// Whether only blanks are in SRC[from..to).
+fn blank(from: i64, to: i64) -> bool {
+    unsafe {
+        for p in from..to {
+            if SRC[p] != ' ' && SRC[p] != '\t' && SRC[p] != '\r' {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// Whether SRC[from..to) is blanks and maybe a `//` comment.
+fn blank_or_comment(from: i64, to: i64) -> bool {
+    unsafe {
+        let mut p = from;
+        while p < to && (SRC[p] == ' ' || SRC[p] == '\t' || SRC[p] == '\r') {
+            p += 1;
+        }
+        p == to || (p + 1 < to && SRC[p] == '/' && SRC[p + 1] == '/')
+    }
+}
+
+// Whether definition d has its lines to itself.
+pub fn whole_lines(d: i64) -> bool {
+    let head = item_head(d);
+    let tail = item_tail(d);
+    blank(line_start(head), head) && blank_or_comment(tail, line_end(tail - 1))
+}
+
+// The indentation of the line of pos.
+pub fn indent_of(pos: i64) -> [u8] {
+    unsafe {
+        let a = line_start(pos);
+        let mut b = a;
+        while SRC[b] == ' ' || SRC[b] == '\t' {
+            b += 1;
+        }
+        SRC[a..b]
+    }
+}
+
+// The text of TEXT (stdin) as an item: without a `query show` header line
+// (`// PATH<TAB>FILE:A-B`), blank lines first and last, and trailing
+// blanks; indented by `indent` when it is not indented at all.
+pub fn item_text(input: [u8], indent: [u8]) -> i64 {
+    let mut a = 0;
+    // (a show header)
+    if input.len > 3 && input[0] == '/' && input[1] == '/' && input[2] == ' ' {
+        let mut e = 0;
+        let mut tab = false;
+        while e < input.len && input[e] != '\n' {
+            if input[e] == '\t' {
+                tab = true;
+            }
+            e += 1;
+        }
+        if tab {
+            a = e + 1;
+        }
+    }
+    // (blank lines first)
+    let mut p = a;
+    while p < input.len {
+        let mut e = p;
+        while e < input.len && (input[e] == ' ' || input[e] == '\t' || input[e] == '\r') {
+            e += 1;
+        }
+        if e < input.len && input[e] == '\n' {
+            p = e + 1;
+            a = p;
+        } else {
+            break;
+        }
+    }
+    let mut b = input.len;
+    while b > a && (input[b - 1] == '\n' || input[b - 1] == ' ' || input[b - 1] == '\t' || input[b - 1] == '\r') {
+        b -= 1;
+    }
+    let text = input[a..b];
+    // The least indentation of its lines.
+    let mut least = 1000000;
+    let mut i = 0;
+    while i < text.len {
+        let mut j = i;
+        while j < text.len && (text[j] == ' ' || text[j] == '\t') {
+            j += 1;
+        }
+        if j < text.len && text[j] != '\n' && j - i < least {
+            least = j - i;
+        }
+        while i < text.len && text[i] != '\n' {
+            i += 1;
+        }
+        i += 1;
+    }
+    let out = buf_new();
+    let reindent = least == 0 && indent.len > 0;
+    i = 0;
+    while i < text.len {
+        let mut e = i;
+        while e < text.len && text[e] != '\n' {
+            e += 1;
+        }
+        if reindent && e > i {
+            buf_bytes(out, indent);
+        }
+        buf_bytes(out, text[i..e]);
+        if e < text.len {
+            buf_byte(out, '\n');
+        }
+        i = e + 1;
+    }
+    out
+}
+
+// What text (an item's) starts with: a comment ('/'), an attribute
+// ('#'), or the item (0).
+pub fn leading(text: [u8]) -> u8 {
+    let mut i = 0;
+    while i < text.len && (text[i] == ' ' || text[i] == '\t') {
+        i += 1;
+    }
+    if i + 1 < text.len && text[i] == '/' && text[i + 1] == '/' {
+        return '/';
+    }
+    if i + 1 < text.len && text[i] == '#' && text[i + 1] == '[' {
+        return '#';
+    }
+    0
+}
+
+// The start of definition d's item without its attributes: its `pub`, or
+// its keyword.
+pub fn keyword_head(d: i64) -> i64 {
+    unsafe {
+        let i = token_at(DEFS[d].start);
+        if i > 0 && TOKS[i - 1].kind == Tok::Pub { TOKS[i - 1].start } else { TOKS[i].start }
+    }
+}
+
+// The position after the newline of the line of pos (its file's end for
+// the last line).
+pub fn after_line(pos: i64) -> i64 {
+    unsafe {
+        let e = line_end(pos);
+        let f = file_of_pos(pos);
+        if e >= FILES[f].end { FILES[f].end } else { e + 1 }
+    }
+}
+
+// Whether the line starting at pos is blank (pos: a line's start).
+pub fn blank_line(pos: i64) -> bool {
+    unsafe {
+        let f = file_of_pos(pos);
+        pos < FILES[f].end && blank(pos, line_end(pos))
+    }
+}
