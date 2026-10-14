@@ -589,7 +589,13 @@ feature new in release N enters the compiler's own source in N+1
   given to a fresh agent with only `tachyonc guide` and the docs;
   measured: success rate, tokens, tool calls, compile-fix iterations.
   Baseline on 0.13; no release may regress it, and language changes must
-  improve it
+  improve it. Each task has a Rust twin (same specification, same hidden
+  tests) as the control: a language the models know against one they do
+  not; tachyon runs in four conditions (compiler only, with the guide,
+  with the tools and `try:` diagnostics, with both) to show what each
+  contributes; models of several sizes, hosted (small, mid, large) and
+  local (e.g. Qwen3-Coder through any OpenAI-compatible server, driven by a
+  minimal agent loop in the runner with the same tools)
 - closures (`|x| x * 2`): capture by value, or by borrow when they do not
   escape; `Fn`/`FnMut` traits, monomorphized; a non-capturing closure is a
   `fn` pointer
