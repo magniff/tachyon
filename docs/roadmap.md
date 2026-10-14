@@ -773,8 +773,9 @@ From here a feature new in release N enters the compiler's own source in N+1
 Planned with the user on 2026-10-14, to start once 0.18 has shipped. The
 standard library is built with the language of 0.15–0.18 (allocators in
 effects, mutable value semantics, contracts), measured against Rust's and
-C's, and proven on one real program: a GPU-rendered terminal emulator.
-Each release may split into .x releases rather than be rushed.
+C's, and proven on a real program: a GPU-rendered terminal emulator,
+shipped as an example (not a release goal of its own). Each release may
+split into .x releases rather than be rushed.
 
 ## 0.19: collections, text and I/O
 
@@ -818,42 +819,44 @@ Each release may split into .x releases rather than be rushed.
   tests (in the manner of loom) and a race-detecting build mode; the
   fuzzer gains threads
 
-## 0.21: windows and the GPU, wgpu-shaped
+## 0.21: GPU support
 
-- a `gpu` library with wgpu's model and API shape (instance, adapter,
-  device, queue, buffers, textures, samplers, bind groups, render and
-  compute pipelines, command encoders, surfaces), written in tachyon
+- a native `gpu` library: wgpu's model (instance, adapter, device, queue,
+  buffers, textures, samplers, bind groups, render and compute pipelines,
+  command encoders, surfaces), but designed for tachyon rather than
+  ported: resources as values with destructors (0.17), allocation through
+  allocators (0.16), effects for what touches the device, traits for the
+  backend interface, contracts for the validation rules
 - backends: Metal first (macOS is the main platform), Vulkan second
-  (Linux); all through C interop: `import "..." as` for Vulkan and the
-  Objective-C runtime for Metal (`objc_msgSend` behind a typed binding)
+  (Linux); through C interop: `import "..." as` for Vulkan and the
+  Objective-C runtime for Metal (`objc_msgSend` behind typed bindings)
 - shaders: a WGSL subset compiled by a tachyon library to MSL and SPIR-V
   (a translator in the manner of naga; a compiler workload that dogfoods
   the language)
-- `wgpu-native` (its `webgpu.h` C API, imported through C interop) as a
-  test oracle: the same scenes rendered both ways and compared pixel by
-  pixel; porting wgpu itself stays an option once the native backends
-  show where they differ
-- windows and input: a small `window` library (Cocoa on macOS; Wayland,
-  then X11, on Linux): a window with a GPU surface, keyboard and mouse
-  events, resize, high-DPI scale, a frame clock; clipboard
+- tested headless: compute kernels against CPU results, render passes
+  read back and compared with reference images
 
-## 0.22: a terminal emulator in tachyon
+## 0.22: windows and input in std, and a terminal emulator
 
-The real program the standard library is proven on (`apps/term`):
-- a pty and a child shell (`posix_openpt`/`forkpty`), non-blocking I/O
-  on its own thread (0.20)
-- an xterm-compatible escape-sequence parser (a state machine in the
-  manner of vte), a grid with scrollback, alternate screen, colours (256
-  and true colour), attributes, wide and combining characters (0.19's
-  display width), resize and reflow
-- rendering on the GPU (0.21): fonts loaded and rasterized through the
-  platform (Core Text, FreeType) into a glyph atlas, then one instanced
-  draw of the cells per frame; damage tracking so idle costs nothing
-- input: keys with modifiers, mouse reporting, bracketed paste, selection
-  and copy
-- measured against Alacritty on the same machine: input latency,
-  throughput (`cat` of a large file), memory, frame time; a fuzzer for the
-  parser with a reference terminal's state as the oracle
+- a `window` library in std, in the manner of winit: an event loop,
+  windows with a GPU surface (0.21), keyboard (with modifiers and text
+  input), mouse, resize, high-DPI scale, a frame clock, clipboard; Cocoa
+  on macOS, Wayland then X11 on Linux
+- the terminal emulator, an example program (`examples/term`) that
+  proves the standard library:
+  - a pty and a child shell, its I/O on its own thread (0.20);
+  - an xterm-compatible escape-sequence parser (a state machine in the
+    manner of vte), a grid with scrollback, alternate screen, 256 and
+    true colours, attributes, wide and combining characters (0.19's
+    display width), resize and reflow;
+  - rendering: fonts rasterized through the platform (Core Text,
+    FreeType) into a glyph atlas, one instanced draw of the cells per
+    frame, damage tracking so idle costs nothing;
+  - input: keys with modifiers, mouse reporting, bracketed paste,
+    selection and copy;
+  - measured against Alacritty on the same machine (input latency, `cat`
+    throughput, memory, frame time); the parser fuzzed with a reference
+    terminal's state as the oracle
 - what writing it reveals feeds the surface-language rework of "Toward
   1.0"
 
