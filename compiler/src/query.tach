@@ -1,0 +1,1701 @@
+// `tachyonc query` (0.11): questions about a program, answered by the
+// front end (lexer, modules, parser, checker; no lowering, no code), for
+// agents that would otherwise read the source with grep and sed. See
+// docs/query.md for the commands and their output.
+//
+//   tachyonc query def NAME [ROOT] [--exact]       where NAME is defined
+//   tachyonc query show NAME [ROOT] [--exact]      its source text
+//   tachyonc query refs NAME [ROOT] [--count] [--exact]
+//                                                  every resolved reference
+//   tachyonc query callers NAME [ROOT] [--count] [--exact]
+//                                                  the references that call it
+//   tachyonc query items [MODULE] [ROOT]           a module's items, or the
+//                                                  module tree
+//
+// Every definition has a fully qualified path (`crate::gvn::run_gvn`,
+// `std::Vec::push`, `crate::ir::Inst.op`, `<crate::geom::V2 as Add>::add`),
+// printed first and accepted back as NAME; a partial path matches every
+// path it ends (by whole segments).
+//
+// The definitions are taken from the parsed program before the checker
+// rewrites it; the references are what the checker resolved: recorded on
+// the nodes it checked (identifiers, calls, fields, literals, variants),
+// and, for what the nodes do not keep (types, imports, module paths), by
+// the hooks that call `qnote`. A generic function is checked per instance
+// (copies of its nodes, at the same positions): references are counted
+// once per position.
+
+use crate::base::{
+    ERR_BAIL, ERR_KIND, FILES, FILE_COUNT, IntVec, RECOVER_DEPTH, SRC, STDERR, STDOUT, SYMS, _setjmp,
+    BUFS, alloc_array, alloc_zeroed, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
+    buf_write_fd, free, grow, has_errors, intern, intern_c, load_sources, strlen, write_errors,
+};
+use crate::lexer::{TOKS, TOK_COUNT, Tok, init_lexer, lex_range};
+use crate::cpp::file_exists;
+use crate::cimport::drop_shadowed_imports;
+use crate::ast::{NODES, NODE_COUNT, NodeKind, child, init_ast};
+use crate::parser::{ITEM_PUBLIC, parse_program};
+use crate::modules::{
+    C_MODULE, MODULES, STD_MODULE, child_module, file_of_pos, load_modules, module_at, module_count,
+    module_of,
+};
+use crate::types::{
+    CONSTS, ENUMS, FNS, METHODS, METHOD_COUNT, STATICS, STRUCTS, TYPES, TyKind, VARIANTS, init_declarations,
+    init_types,
+};
+use crate::check::{GMETHODS, GMETHOD_COUNT, Res, check_program};
+use crate::traits::impl_trait_node;
+use crate::target::{T_X86_64_LINUX, set_target};
+use crate::gen::MAIN_SYM;
+use crate::lower::HMap;
+use crate::{IMPORTED_START, host_target, import_c_headers, streq};
+
+extern "C" {
+    fn getenv(name: *u8) -> *u8;
+}
+
+// Set while a query runs: the hooks record what they resolve.
+pub static mut QUERY: bool = false;
+
+// Flags of a reference: a call, the definition itself, an import.
+pub const QF_CALL: i64 = 1;
+pub const QF_DEF: i64 = 2;
+pub const QF_USE: i64 = 4;
+
+// What the checker resolved that its nodes do not keep: (position the name
+// is looked for from, the name written there, the definition's node,
+// flags), in fours.
+static mut NOTES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The name `name` written at (or just after) `from` stands for the item
+// whose node is `def`.
+pub fn qnote(from: i64, name: i64, def: i64, flags: i64) {
+    if !QUERY || def <= 0 {
+        return;
+    }
+    NOTES.push(from);
+    NOTES.push(name);
+    NOTES.push(def);
+    NOTES.push(flags);
+}
+
+// ... for module m.
+pub fn qnote_module(from: i64, name: i64, m: i64, flags: i64) {
+    unsafe {
+        if !QUERY || m < 0 || m >= MOD_DEF.count || MOD_DEF.data[m] < 0 {
+            return;
+        }
+        qnote(from, name, DEFS[MOD_DEF.data[m]].node, flags);
+    }
+}
+
+// ---- Definitions ----
+
+const K_FN: i64 = 1;
+// A function of an impl block (`impl T { ... }`).
+const K_METHOD: i64 = 2;
+// A function of an `impl Trait for T` block.
+const K_IMPL_METHOD: i64 = 3;
+// A function declared by a trait (with or without a default body).
+const K_TRAIT_FN: i64 = 4;
+const K_STRUCT: i64 = 5;
+const K_ENUM: i64 = 6;
+const K_VARIANT: i64 = 7;
+const K_FIELD: i64 = 8;
+const K_TRAIT: i64 = 9;
+const K_CONST: i64 = 10;
+const K_STATIC: i64 = 11;
+const K_ALIAS: i64 = 12;
+const K_MOD: i64 = 13;
+
+fn kind_name(k: i64) -> *u8 {
+    if k == K_FN { return c"fn"; }
+    if k == K_METHOD || k == K_IMPL_METHOD { return c"impl method"; }
+    if k == K_TRAIT_FN { return c"trait method"; }
+    if k == K_STRUCT { return c"struct"; }
+    if k == K_ENUM { return c"enum"; }
+    if k == K_VARIANT { return c"variant"; }
+    if k == K_FIELD { return c"field"; }
+    if k == K_TRAIT { return c"trait"; }
+    if k == K_CONST { return c"const"; }
+    if k == K_STATIC { return c"static"; }
+    if k == K_ALIAS { return c"type alias"; }
+    c"mod"
+}
+
+// A definition: its item node (as parsed), name, module, the definition
+// it belongs to (a field's struct, a variant's enum, a function's trait;
+// -1), the position of its name, whether it is `pub`; after the checker,
+// its path (`fqn`), the path partial names are matched against (`path`:
+// a trait impl's function as `Type::f`), the path of its type (`owner`,
+// for functions of impl blocks) and of its trait (`tr`), as symbols.
+struct Def {
+    node: i64, kind: i64, name: i64, module: i64, parent: i64, start: i64, end: i64,
+    name_pos: i64, public: bool, impl_node: i64,
+    fqn: i64, path: i64, owner: i64, tr: i64,
+}
+
+static mut DEFS: *Def = 0 as *Def;
+static mut DEF_COUNT: i64 = 0;
+static mut DEF_CAP: i64 = 0;
+// Definition + 1 by the start of its node + 1 (a copy of a node made for
+// a generic instance starts where the node does).
+static mut DEF_AT: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+// Per module: the definition of its `mod` item, or -1.
+static mut MOD_DEF: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// The names of `use p::x as y;`: (y, the position of x), in pairs.
+static mut ALIASES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// The first `import "h.h" as c;`: its module and name (-1: none).
+static mut C_ALIAS_MODULE: i64 = -1;
+static mut C_ALIAS: i64 = -1;
+
+fn add_def(node: i64, kind: i64, name: i64, parent: i64) -> i64 {
+    unsafe {
+        DEFS = grow_defs();
+        let d = DEF_COUNT;
+        DEFS[d] = Def {
+            node: node, kind: kind, name: name, module: module_of(node), parent: parent,
+            start: NODES[node].start, end: NODES[node].end,
+            name_pos: name_position(NODES[node].start, name), public: (NODES[node].p & ITEM_PUBLIC) != 0,
+            impl_node: 0, fqn: -1, path: -1, owner: -1, tr: -1,
+        };
+        DEF_COUNT += 1;
+        DEF_AT.put(NODES[node].start + 1, d + 1);
+        d
+    }
+}
+
+fn grow_defs() -> *Def {
+    unsafe { grow(DEFS, DEF_COUNT, &DEF_CAP) }
+}
+
+// The definition whose node is n (or a copy of it), or -1.
+fn def_of_node(n: i64) -> i64 {
+    unsafe {
+        if n <= 0 {
+            return -1;
+        }
+        DEF_AT.get(NODES[n].start + 1) - 1
+    }
+}
+
+// The definitions of the program's items, as parsed.
+fn collect_defs(program: i64) {
+    unsafe {
+        for i in 0..NODES[program].count {
+            let item = child(program, i);
+            let kind = NODES[item].kind;
+            let name = NODES[item].a;
+            if kind == NodeKind::Fn {
+                add_def(item, if NODES[item].h != 0 { K_METHOD } else { K_FN }, name, -1);
+            } else if kind == NodeKind::ExternFn {
+                add_def(item, K_FN, name, -1);
+            } else if kind == NodeKind::Struct || kind == NodeKind::Enum || kind == NodeKind::Trait {
+                let k = if kind == NodeKind::Struct { K_STRUCT } else if kind == NodeKind::Enum { K_ENUM } else { K_TRAIT };
+                let d = add_def(item, k, name, -1);
+                let sub = if kind == NodeKind::Struct { K_FIELD } else if kind == NodeKind::Enum { K_VARIANT } else { K_TRAIT_FN };
+                for j in 0..NODES[item].count {
+                    let c = child(item, j);
+                    add_def(c, sub, NODES[c].a, d);
+                }
+            } else if kind == NodeKind::Const {
+                add_def(item, K_CONST, name, -1);
+            } else if kind == NodeKind::Static {
+                add_def(item, K_STATIC, name, -1);
+            } else if kind == NodeKind::TypeAlias {
+                add_def(item, K_ALIAS, name, -1);
+            } else if kind == NodeKind::Mod {
+                add_def(item, K_MOD, name, -1);
+            } else if kind == NodeKind::Use && NODES[item].d == 2 && NODES[item].a != 0 && C_ALIAS < 0 {
+                C_ALIAS = NODES[item].a;
+                C_ALIAS_MODULE = module_of(item);
+            } else if kind == NodeKind::Use && NODES[item].d != 2 {
+                for j in 0..NODES[item].count {
+                    let id = child(item, j);
+                    if NODES[id].b != 0 {
+                        ALIASES.push(NODES[id].b);
+                        ALIASES.push(NODES[id].start);
+                    }
+                }
+            }
+        }
+        // The functions of trait impls (pushed before their Impl node).
+        for i in 0..NODES[program].count {
+            let item = child(program, i);
+            if NODES[item].kind != NodeKind::Impl {
+                continue;
+            }
+            for j in 0..NODES[item].count {
+                let d = def_of_node(child(item, j));
+                if d >= 0 {
+                    DEFS[d].kind = K_IMPL_METHOD;
+                    DEFS[d].impl_node = item;
+                }
+            }
+        }
+        for _ in 0..module_count() {
+            MOD_DEF.push(-1);
+        }
+        for d in 0..DEF_COUNT {
+            if DEFS[d].kind == K_MOD {
+                let m = child_module(DEFS[d].module, DEFS[d].name);
+                if m >= 0 {
+                    MOD_DEF.data[m] = d;
+                }
+            }
+        }
+    }
+}
+
+// ---- Paths ----
+
+// The path of module m: `crate`, `crate::a::b`, `std`, or for the C
+// headers' declarations the name the first `import ... as c` gives them
+// (`crate::c`).
+static mut MOD_FQN: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+fn mod_fqn(m: i64) -> i64 {
+    unsafe {
+        while MOD_FQN.count < module_count() {
+            MOD_FQN.push(-1);
+        }
+        if m < 0 || m >= MOD_FQN.count {
+            return intern_c(c"crate");
+        }
+        if MOD_FQN.data[m] >= 0 {
+            return MOD_FQN.data[m];
+        }
+        let mut s = 0;
+        if m == 0 {
+            s = intern_c(c"crate");
+        } else if m == STD_MODULE {
+            s = intern_c(c"std");
+        } else if m == C_MODULE {
+            s = if C_ALIAS >= 0 { join(mod_fqn(C_ALIAS_MODULE), c"::", C_ALIAS) } else { intern_c(c"c") };
+        } else {
+            s = join(mod_fqn(MODULES[m].parent), c"::", MODULES[m].name);
+        }
+        MOD_FQN.data[m] = s;
+        s
+    }
+}
+
+fn join(a: i64, sep: *u8, b: i64) -> i64 {
+    unsafe {
+        let out = buf_new();
+        buf_bytes(out, SYMS[a].text);
+        buf_str(out, sep);
+        buf_bytes(out, SYMS[b].text);
+        intern(buf_slice(out))
+    }
+}
+
+// The text of node n's source, its whitespace collapsed.
+fn node_text(n: i64) -> i64 {
+    unsafe {
+        let out = buf_new();
+        collapse(out, NODES[n].start, NODES[n].end);
+        intern(buf_slice(out))
+    }
+}
+
+// The paths of the definitions, once the checker has resolved the types
+// of the impl blocks and the traits of the trait impls.
+fn finish_defs() {
+    unsafe {
+        // The type of each function of an impl block: its item node.
+        let mut owners = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        for i in 0..METHOD_COUNT {
+            let t = METHODS[i].ty;
+            let node = if TYPES[t].kind == TyKind::Struct {
+                STRUCTS[TYPES[t].a].node
+            } else if TYPES[t].kind == TyKind::Enum {
+                ENUMS[TYPES[t].a].node
+            } else {
+                0
+            };
+            if node != 0 {
+                owners.put(METHODS[i].f + 1, node);
+            }
+        }
+        for i in 0..GMETHOD_COUNT {
+            let tpl = GMETHODS[i].ty;
+            owners.put(GMETHODS[i].f + 1, if tpl > 0 { STRUCTS[tpl - 1].node } else { ENUMS[-tpl - 1].node });
+        }
+        let mut trait_names = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        for d in 0..DEF_COUNT {
+            let k = DEFS[d].kind;
+            if k == K_TRAIT {
+                trait_names.put(DEFS[d].name + 1, trait_names.get(DEFS[d].name + 1) + 1);
+            }
+            if DEFS[d].parent >= 0 || k == K_METHOD || k == K_IMPL_METHOD {
+                continue;
+            }
+            if k == K_MOD {
+                let m = child_module(DEFS[d].module, DEFS[d].name);
+                DEFS[d].fqn = if m >= 0 { mod_fqn(m) } else { join(mod_fqn(DEFS[d].module), c"::", DEFS[d].name) };
+            } else {
+                DEFS[d].fqn = join(mod_fqn(DEFS[d].module), c"::", DEFS[d].name);
+            }
+            DEFS[d].path = DEFS[d].fqn;
+        }
+        for d in 0..DEF_COUNT {
+            let k = DEFS[d].kind;
+            if DEFS[d].parent >= 0 {
+                let p = DEFS[d].parent;
+                DEFS[d].owner = DEFS[p].fqn;
+                DEFS[d].fqn = join(DEFS[p].fqn, if k == K_FIELD { c"." } else { c"::" }, DEFS[d].name);
+                DEFS[d].path = DEFS[d].fqn;
+                continue;
+            }
+            if k != K_METHOD && k != K_IMPL_METHOD {
+                continue;
+            }
+            let node = DEFS[d].node;
+            let f = NODES[node].x - 1;
+            let mut owner = -1;
+            if f >= 0 {
+                let od = def_of_node(owners.get(f + 1));
+                if od >= 0 {
+                    owner = DEFS[od].fqn;
+                }
+            }
+            if owner < 0 {
+                // (a builtin type, or an impl the checker left out)
+                let h = NODES[node].h;
+                owner = if NODES[h].kind == NodeKind::TyName { NODES[h].a } else { node_text(h) };
+            }
+            DEFS[d].owner = owner;
+            DEFS[d].path = join(owner, c"::", DEFS[d].name);
+            if k == K_METHOD {
+                DEFS[d].fqn = DEFS[d].path;
+                continue;
+            }
+            // `<Type as Trait>::f`: the trait by its name, or by its path
+            // when two traits have that name.
+            let mut tr = -1;
+            let mut shown = -1;
+            let td = if f >= 0 { def_of_node(impl_trait_node(f)) } else { -1 };
+            if td >= 0 {
+                tr = DEFS[td].fqn;
+                shown = if trait_names.get(DEFS[td].name + 1) > 1 { DEFS[td].fqn } else { DEFS[td].name };
+            } else {
+                tr = node_text(NODES[DEFS[d].impl_node].a);
+                shown = tr;
+            }
+            DEFS[d].tr = tr;
+            let out = buf_new();
+            buf_byte(out, '<');
+            buf_bytes(out, SYMS[owner].text);
+            buf_str(out, c" as ");
+            buf_bytes(out, SYMS[shown].text);
+            buf_str(out, c">::");
+            buf_bytes(out, SYMS[DEFS[d].name].text);
+            DEFS[d].fqn = intern(buf_slice(out));
+        }
+    }
+}
+
+// The trait definition of a trait impl's function, or -1.
+fn trait_of(d: i64) -> i64 {
+    unsafe {
+        if DEFS[d].kind != K_IMPL_METHOD {
+            return -1;
+        }
+        let f = NODES[DEFS[d].node].x - 1;
+        if f < 0 { -1 } else { def_of_node(impl_trait_node(f)) }
+    }
+}
+
+// ---- Matching names ----
+
+fn bytes_eq(a: [u8], b: [u8]) -> bool {
+    if a.len != b.len {
+        return false;
+    }
+    for i in 0..a.len {
+        if a[i] != b[i] {
+            return false;
+        }
+    }
+    true
+}
+
+// Whether path p ends with name s, by whole segments (or s is `.field`).
+fn ends_with(p: [u8], s: [u8], exact: bool) -> bool {
+    if s.len == 0 || s.len > p.len {
+        return false;
+    }
+    let k = p.len - s.len;
+    for i in 0..s.len {
+        if p[k + i] != s[i] {
+            return false;
+        }
+    }
+    if k == 0 {
+        return true;
+    }
+    if exact {
+        return false;
+    }
+    s[0] == '.' || (k >= 2 && p[k - 1] == ':' && p[k - 2] == ':')
+}
+
+// The index of `pat` in s at or after `from`, or -1.
+fn find_in(s: [u8], pat: *u8, from: i64) -> i64 {
+    let n = unsafe { strlen(pat) as i64 };
+    let mut i = from;
+    while i + n <= s.len {
+        let mut ok = true;
+        for j in 0..n {
+            if unsafe { s[i + j] != pat[j] } {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            return i;
+        }
+        i += 1;
+    }
+    -1
+}
+
+// Whether definition d answers to `name`.
+fn name_matches(d: i64, name: [u8], exact: bool) -> bool {
+    unsafe {
+        let fqn = SYMS[DEFS[d].fqn].text;
+        if bytes_eq(fqn, name) {
+            return true;
+        }
+        if name.len > 0 && name[0] == '<' {
+            // `<Type as Trait>::f`, each part full or partial.
+            if DEFS[d].kind != K_IMPL_METHOD {
+                return false;
+            }
+            let a = find_in(name, c" as ", 1);
+            let b = find_in(name, c">::", 1);
+            if a < 0 || b < a {
+                return false;
+            }
+            return ends_with(SYMS[DEFS[d].owner].text, name[1..a], exact)
+                && (ends_with(SYMS[DEFS[d].tr].text, name[a + 4..b], exact))
+                && bytes_eq(SYMS[DEFS[d].name].text, name[b + 3..name.len]);
+        }
+        ends_with(SYMS[DEFS[d].path].text, name, exact)
+    }
+}
+
+// The definitions answering to `name`, in order of position.
+fn find_defs(name: [u8], exact: bool, out: *IntVec) {
+    for d in 0..DEF_COUNT {
+        if unsafe { DEFS[d].fqn >= 0 } && name_matches(d, name, exact) {
+            out.push(d);
+        }
+    }
+    sort_by_position(out);
+}
+
+// Edit distance (Levenshtein) of a and b.
+fn distance(a: [u8], b: [u8]) -> i64 {
+    unsafe {
+        let prev = alloc_array::<i64>(b.len + 1);
+        let cur = alloc_array::<i64>(b.len + 1);
+        for j in 0..b.len + 1 {
+            prev[j] = j;
+        }
+        for i in 1..a.len + 1 {
+            cur[0] = i;
+            for j in 1..b.len + 1 {
+                let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+                let mut best = prev[j - 1] + cost;
+                if prev[j] + 1 < best {
+                    best = prev[j] + 1;
+                }
+                if cur[j - 1] + 1 < best {
+                    best = cur[j - 1] + 1;
+                }
+                cur[j] = best;
+            }
+            for j in 0..b.len + 1 {
+                prev[j] = cur[j];
+            }
+        }
+        let result = prev[b.len];
+        free(prev as *u8);
+        free(cur as *u8);
+        result
+    }
+}
+
+// The last segment of a name (after `::`, `.` or `>::`).
+fn last_segment(name: [u8]) -> [u8] {
+    let mut i = name.len;
+    while i > 0 && name[i - 1] != ':' && name[i - 1] != '.' {
+        i -= 1;
+    }
+    name[i..name.len]
+}
+
+// No definition answers to `name`: the error, with the nearest names.
+fn no_match(name: [u8], what: *u8) {
+    unsafe {
+        let out = buf_new();
+        buf_str(out, c"tachyonc query: no ");
+        buf_str(out, what);
+        buf_str(out, c" named '");
+        buf_bytes(out, name);
+        buf_str(out, c"'\n");
+        let want = last_segment(name);
+        let mut limit = want.len / 3;
+        if limit < 1 {
+            limit = 1;
+        }
+        let mut found = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut dist = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for d in 0..DEF_COUNT {
+            if DEFS[d].fqn < 0 {
+                continue;
+            }
+            let k = distance(want, SYMS[DEFS[d].name].text);
+            if k <= limit {
+                found.push(d);
+                dist.push(k);
+            }
+        }
+        // (nearest first, then by path)
+        for i in 1..found.count {
+            let mut j = i;
+            while j > 0 && (dist.data[j] < dist.data[j - 1] || (dist.data[j] == dist.data[j - 1]
+                && sym_less(DEFS[found.data[j]].fqn, DEFS[found.data[j - 1]].fqn))) {
+                let t = found.data[j];
+                found.data[j] = found.data[j - 1];
+                found.data[j - 1] = t;
+                let u = dist.data[j];
+                dist.data[j] = dist.data[j - 1];
+                dist.data[j - 1] = u;
+                j -= 1;
+            }
+        }
+        // An import's other name: what it imports.
+        let mut i = 0;
+        while i < ALIASES.count {
+            if bytes_eq(SYMS[ALIASES.data[i]].text, want) {
+                let mut k = 0;
+                while k < NOTES.count {
+                    let d = def_of_node(NOTES.data[k + 2]);
+                    if NOTES.data[k] == ALIASES.data[i + 1] && (NOTES.data[k + 3] & QF_USE) != 0 && d >= 0 {
+                        buf_str(out, c"'");
+                        buf_bytes(out, want);
+                        buf_str(out, c"' is the name an import gives (");
+                        put_loc(out, NOTES.data[k]);
+                        buf_str(out, c") to:\n  ");
+                        buf_bytes(out, SYMS[DEFS[d].fqn].text);
+                        buf_byte(out, '\n');
+                    }
+                    k += 4;
+                }
+            }
+            i += 2;
+        }
+        if found.count > 0 {
+            buf_str(out, c"did you mean:\n");
+            let shown = if found.count < 8 { found.count } else { 8 };
+            for i in 0..shown {
+                buf_str(out, c"  ");
+                buf_bytes(out, SYMS[DEFS[found.data[i]].fqn].text);
+                buf_byte(out, '\n');
+            }
+        }
+        buf_write_fd(out, STDERR);
+        if has_errors() {
+            write_errors();
+        }
+    }
+}
+
+fn sym_less(a: i64, b: i64) -> bool {
+    unsafe {
+        let x = SYMS[a].text;
+        let y = SYMS[b].text;
+        let n = if x.len < y.len { x.len } else { y.len };
+        for i in 0..n {
+            if x[i] != y[i] {
+                return x[i] < y[i];
+            }
+        }
+        x.len < y.len
+    }
+}
+
+// ---- Positions ----
+
+// The start of every line of SRC, in order.
+static mut LINES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// Per file, its rank in the output's order (by path; the files the
+// compiler makes, `<std>` and `<C import>`, last).
+static mut FILE_RANK: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+fn init_positions() {
+    unsafe {
+        let end = FILES[FILE_COUNT - 1].end;
+        LINES.push(0);
+        for i in 0..end {
+            if SRC[i] == '\n' {
+                LINES.push(i + 1);
+            }
+        }
+        for f in 0..FILE_COUNT {
+            let mut rank = 0;
+            for g in 0..FILE_COUNT {
+                if file_before(g, f) {
+                    rank += 1;
+                }
+            }
+            FILE_RANK.push(rank);
+        }
+    }
+}
+
+fn file_before(a: i64, b: i64) -> bool {
+    unsafe {
+        let x = FILES[a].path;
+        let y = FILES[b].path;
+        let xs = x[0] == '<';
+        let ys = y[0] == '<';
+        if xs != ys {
+            return ys;
+        }
+        let mut i = 0;
+        while x[i] != 0 && x[i] == y[i] {
+            i += 1;
+        }
+        if x[i] != y[i] {
+            return x[i] < y[i];
+        }
+        a < b
+    }
+}
+
+// The index in LINES of the line holding pos.
+fn line_index(pos: i64) -> i64 {
+    unsafe {
+        let mut lo = 0;
+        let mut hi = LINES.count - 1;
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2;
+            if LINES.data[mid] <= pos {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        lo
+    }
+}
+
+// The line number of pos in its file.
+fn line_of(pos: i64) -> i64 {
+    unsafe { line_index(pos) - line_index(FILES[file_of_pos(pos)].start) + 1 }
+}
+
+fn line_start(pos: i64) -> i64 {
+    unsafe { LINES.data[line_index(pos)] }
+}
+
+// The end of the line holding pos (its newline).
+fn line_end(pos: i64) -> i64 {
+    unsafe {
+        let i = line_index(pos);
+        if i + 1 < LINES.count { LINES.data[i + 1] - 1 } else { FILES[FILE_COUNT - 1].end }
+    }
+}
+
+fn put_path(out: i64, f: i64) {
+    unsafe {
+        let mut p = FILES[f].path;
+        while p[0] == '.' && p[1] == '/' {
+            p = &p[2];
+        }
+        buf_str(out, p);
+    }
+}
+
+// `file:line:col`.
+fn put_loc(out: i64, pos: i64) {
+    put_path(out, file_of_pos(pos));
+    buf_byte(out, ':');
+    buf_int(out, line_of(pos));
+    buf_byte(out, ':');
+    buf_int(out, pos - line_start(pos) + 1);
+}
+
+fn is_space(c: u8) -> bool {
+    c == ' ' || c == '\t' || c == '\r' || c == '\n'
+}
+
+// The text of from..to with each run of whitespace (and `//` comments)
+// one space, trimmed.
+fn collapse(out: i64, from: i64, to: i64) {
+    unsafe {
+        let mut space = false;
+        let mut any = false;
+        let mut i = from;
+        while i < to {
+            let c = SRC[i];
+            if c == '/' && i + 1 < to && SRC[i + 1] == '/' {
+                while i < to && SRC[i] != '\n' {
+                    i += 1;
+                }
+                space = true;
+                continue;
+            }
+            if is_space(c) {
+                space = true;
+            } else {
+                if space && any {
+                    buf_byte(out, ' ');
+                }
+                space = false;
+                any = true;
+                buf_byte(out, c);
+            }
+            i += 1;
+        }
+    }
+}
+
+// The first token starting at or after pos.
+fn token_at(pos: i64) -> i64 {
+    unsafe {
+        let mut lo = 0;
+        let mut hi = TOK_COUNT;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if TOKS[mid].start < pos {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+}
+
+// Where identifier `name` is written in from..to (to < 0: in the next
+// few tokens): its first occurrence, or its last; -1 if nowhere.
+fn find_name(from: i64, to: i64, name: i64, last: bool) -> i64 {
+    unsafe {
+        let mut i = token_at(from);
+        let mut seen = 0;
+        let mut found = -1;
+        while i < TOK_COUNT && TOKS[i].kind != Tok::Eof {
+            if to >= 0 && TOKS[i].start >= to {
+                break;
+            }
+            if to < 0 && seen > 24 {
+                break;
+            }
+            if TOKS[i].kind == Tok::Ident && TOKS[i].value as i64 == name {
+                found = TOKS[i].start;
+                if !last {
+                    return found;
+                }
+            }
+            seen += 1;
+            i += 1;
+        }
+        found
+    }
+}
+
+// The position of definition name `name` after `start` (its keyword).
+fn name_position(start: i64, name: i64) -> i64 {
+    let p = find_name(start, -1, name, false);
+    if p < 0 { start } else { p }
+}
+
+// ---- Sorting ----
+
+// Sorts the indices in v (merge sort) by key1, then key2 (arrays indexed
+// by the values).
+fn sort_by_keys(v: *IntVec, key1: *i64, key2: *i64) {
+    unsafe {
+        let n = (*v).count;
+        if n < 2 {
+            return;
+        }
+        let tmp = alloc_array::<i64>(n);
+        let mut width = 1;
+        let a = (*v).data;
+        while width < n {
+            let mut lo = 0;
+            while lo < n {
+                let mid = if lo + width < n { lo + width } else { n };
+                let hi = if lo + 2 * width < n { lo + 2 * width } else { n };
+                let mut i = lo;
+                let mut j = mid;
+                let mut k = lo;
+                while i < mid || j < hi {
+                    let take_j = i >= mid || (j < hi && (key1[a[j]] < key1[a[i]]
+                        || (key1[a[j]] == key1[a[i]] && key2[a[j]] < key2[a[i]])));
+                    if take_j {
+                        tmp[k] = a[j];
+                        j += 1;
+                    } else {
+                        tmp[k] = a[i];
+                        i += 1;
+                    }
+                    k += 1;
+                }
+                lo = hi;
+            }
+            for x in 0..n {
+                a[x] = tmp[x];
+            }
+            width *= 2;
+        }
+        free(tmp as *u8);
+    }
+}
+
+// The sort keys of positions: (file rank, position).
+fn rank_of(pos: i64) -> i64 {
+    unsafe { FILE_RANK.data[file_of_pos(pos)] }
+}
+
+// Sorts definitions by file, then position.
+fn sort_by_position(v: *IntVec) {
+    unsafe {
+        let n = DEF_COUNT;
+        let k1 = alloc_array::<i64>(n + 1);
+        let k2 = alloc_array::<i64>(n + 1);
+        for i in 0..(*v).count {
+            let d = (*v).data[i];
+            k1[d] = rank_of(DEFS[d].start);
+            k2[d] = DEFS[d].start;
+        }
+        sort_by_keys(v, k1, k2);
+    }
+}
+
+// ---- Enclosing definitions ----
+
+// The definitions that hold code (all but fields, variants and modules),
+// by position.
+static mut CONTAINERS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+fn init_containers() {
+    unsafe {
+        for d in 0..DEF_COUNT {
+            let k = DEFS[d].kind;
+            if k != K_FIELD && k != K_VARIANT && k != K_MOD {
+                CONTAINERS.push(d);
+            }
+        }
+        let k1 = alloc_array::<i64>(DEF_COUNT + 1);
+        let k2 = alloc_array::<i64>(DEF_COUNT + 1);
+        for d in 0..DEF_COUNT {
+            k1[d] = DEFS[d].start;
+            k2[d] = -DEFS[d].end;
+        }
+        sort_by_keys(&CONTAINERS, k1, k2);
+    }
+}
+
+// The innermost definition holding pos, or -1.
+fn enclosing(pos: i64) -> i64 {
+    unsafe {
+        let mut lo = 0;
+        let mut hi = CONTAINERS.count;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if DEFS[CONTAINERS.data[mid]].start <= pos {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        // (items do not overlap, except a trait and its functions: a few
+        // steps back at most)
+        let mut i = lo - 1;
+        let mut steps = 0;
+        while i >= 0 && steps < 64 {
+            let d = CONTAINERS.data[i];
+            if DEFS[d].end > pos {
+                return d;
+            }
+            i -= 1;
+            steps += 1;
+        }
+        -1
+    }
+}
+
+fn put_enclosing(out: i64, pos: i64) {
+    unsafe {
+        let d = enclosing(pos);
+        buf_bytes(out, SYMS[if d >= 0 { DEFS[d].fqn } else { mod_fqn(module_at(pos)) }].text);
+    }
+}
+
+// ---- References ----
+
+// The definitions asked about: GROUP maps a definition + 1 to the group
+// (the index in TARGETS) + 1 its references count for; a trait's function
+// also counts those of the functions implementing it.
+static mut TARGETS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut GROUP: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+// The references found: position, definition, group, flags.
+static mut R_POS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut R_DEF: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut R_GROUP: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut R_FLAGS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+fn set_targets(matches: *IntVec) {
+    unsafe {
+        for i in 0..(*matches).count {
+            let d = (*matches).data[i];
+            TARGETS.push(d);
+            GROUP.put(d + 1, i + 1);
+        }
+        for i in 0..(*matches).count {
+            let t = (*matches).data[i];
+            if DEFS[t].kind != K_TRAIT_FN {
+                continue;
+            }
+            for d in 0..DEF_COUNT {
+                if DEFS[d].kind == K_IMPL_METHOD && DEFS[d].name == DEFS[t].name && GROUP.get(d + 1) == 0
+                    && trait_of(d) == DEFS[t].parent {
+                    GROUP.put(d + 1, i + 1);
+                }
+            }
+        }
+    }
+}
+
+// A reference to the item of node `def` (or a copy of it), its name
+// looked for in from..to (first or last occurrence; at `at` when it is
+// not there).
+fn add_ref(def: i64, from: i64, to: i64, name: i64, last: bool, at: i64, flags: i64) {
+    unsafe {
+        let d = def_of_node(def);
+        if d < 0 {
+            return;
+        }
+        let g = GROUP.get(d + 1) - 1;
+        if g < 0 {
+            return;
+        }
+        let mut pos = at;
+        if name >= 0 {
+            let p = find_name(from, to, name, last);
+            if p >= 0 {
+                pos = p;
+            }
+        }
+        R_POS.push(pos);
+        R_DEF.push(d);
+        R_GROUP.push(g);
+        R_FLAGS.push(flags);
+    }
+}
+
+// Whether the token at pos is followed by `::` (a path, not a bare name).
+fn path_at(pos: i64) -> bool {
+    unsafe {
+        let i = token_at(pos);
+        i + 1 < TOK_COUNT && TOKS[i].start == pos && TOKS[i + 1].kind == Tok::ColonColon
+    }
+}
+
+// A reference written as an identifier or a path (node n).
+fn add_name_ref(def: i64, n: i64, flags: i64) {
+    unsafe {
+        let d = def_of_node(def);
+        if d < 0 {
+            return;
+        }
+        if path_at(NODES[n].start) {
+            add_ref(def, NODES[n].start, NODES[n].end, DEFS[d].name, true, NODES[n].start, flags);
+        } else {
+            add_ref(def, NODES[n].start, NODES[n].end, -1, false, NODES[n].start, flags);
+        }
+    }
+}
+
+// The struct item of struct type t (through a pointer), or 0.
+fn struct_node(t0: i64) -> i64 {
+    unsafe {
+        if t0 <= 0 {
+            return 0;
+        }
+        let t = if TYPES[t0].kind == TyKind::Ptr { TYPES[t0].a } else { t0 };
+        if t <= 0 || TYPES[t].kind != TyKind::Struct {
+            return 0;
+        }
+        STRUCTS[TYPES[t].a].node
+    }
+}
+
+// The field of struct item s at index i, if it is named `name`; or 0.
+fn field_node(s: i64, i: i64, name: i64) -> i64 {
+    unsafe {
+        if s == 0 || i < 0 || i >= NODES[s].count || NODES[child(s, i)].a != name {
+            return 0;
+        }
+        child(s, i)
+    }
+}
+
+// The references the checked nodes record, and the ones the hooks noted.
+fn collect_refs() {
+    unsafe {
+        for n in 1..NODE_COUNT {
+            let kind = NODES[n].kind;
+            if kind == NodeKind::Ident {
+                let y = NODES[n].y;
+                let res = NODES[n].res;
+                if res == Res::Fn {
+                    add_name_ref(FNS[y].node, n, 0);
+                } else if res == Res::Const {
+                    add_name_ref(CONSTS[y].node, n, 0);
+                } else if res == Res::Static {
+                    add_name_ref(STATICS[y].node, n, 0);
+                }
+            } else if kind == NodeKind::Call {
+                if NODES[n].x <= 0 {
+                    continue;
+                }
+                let f = NODES[n].x - 1;
+                let callee = NODES[n].a;
+                let def = FNS[f].node;
+                if callee != 0 {
+                    add_name_ref(def, callee, QF_CALL);
+                } else if NODES[n].count > 0 {
+                    // A method call: its name after the receiver (an
+                    // operator's call: at the operation).
+                    let recv = child(n, 0);
+                    add_ref(def, NODES[recv].end, NODES[n].end, NODES[def].a, false, NODES[n].start, QF_CALL);
+                }
+            } else if kind == NodeKind::FieldAccess {
+                if NODES[n].y == 2 {
+                    continue;
+                }
+                let s = struct_node(NODES[NODES[n].a].ty);
+                let field = field_node(s, NODES[n].x, NODES[n].b);
+                if field != 0 {
+                    add_ref(field, NODES[NODES[n].a].end, NODES[n].end, NODES[n].b, false, NODES[n].start, 0);
+                }
+            } else if kind == NodeKind::StructLit {
+                let s = struct_node(NODES[n].ty);
+                if s == 0 {
+                    continue;
+                }
+                if NODES[n].a == NODES[s].a {
+                    add_ref(s, NODES[n].start, NODES[n].end, NODES[n].a, false, NODES[n].start, 0);
+                }
+                for i in 0..NODES[n].count {
+                    let init = child(n, i);
+                    let field = field_node(s, NODES[init].x, NODES[init].a);
+                    if field != 0 {
+                        add_ref(field, NODES[init].start, -1, -1, false, NODES[init].start, 0);
+                    }
+                }
+            } else if kind == NodeKind::VariantLit {
+                let v = NODES[n].a;
+                add_ref(VARIANTS[v].node, NODES[n].start, NODES[n].end, VARIANTS[v].name, false, NODES[n].start, 0);
+            } else if kind == NodeKind::PatVariant {
+                let v = NODES[n].x;
+                if NODES[n].ty != 0 && v >= 0 && VARIANTS[v].name == NODES[n].b {
+                    add_ref(VARIANTS[v].node, NODES[n].start, NODES[n].end, NODES[n].b, false, NODES[n].start, 0);
+                }
+            }
+        }
+        let mut i = 0;
+        while i < NOTES.count {
+            add_ref(NOTES.data[i + 2], NOTES.data[i], -1, NOTES.data[i + 1], false, NOTES.data[i], NOTES.data[i + 3]);
+            i += 4;
+        }
+        // The definitions themselves.
+        for d in 0..DEF_COUNT {
+            if GROUP.get(d + 1) != 0 {
+                add_ref(DEFS[d].node, DEFS[d].name_pos, -1, -1, false, DEFS[d].name_pos, QF_DEF);
+            }
+        }
+    }
+}
+
+// The references in order (file, position, definition), each once: the
+// indices into R_*, in `out`.
+fn sorted_refs(out: *IntVec) {
+    unsafe {
+        let n = R_POS.count;
+        let k1 = alloc_array::<i64>(n + 1);
+        let k2 = alloc_array::<i64>(n + 1);
+        let mut all = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..n {
+            all.push(i);
+            k1[i] = rank_of(R_POS.data[i]) * 4294967296 + R_POS.data[i];
+            k2[i] = R_DEF.data[i];
+        }
+        sort_by_keys(&all, k1, k2);
+        let mut i = 0;
+        while i < all.count {
+            let r = all.data[i];
+            let mut j = i + 1;
+            while j < all.count && R_POS.data[all.data[j]] == R_POS.data[r] && R_DEF.data[all.data[j]] == R_DEF.data[r] {
+                R_FLAGS.data[r] |= R_FLAGS.data[all.data[j]];
+                j += 1;
+            }
+            out.push(r);
+            i = j;
+        }
+    }
+}
+
+// The line holding pos, trimmed.
+fn put_line(out: i64, pos: i64) {
+    unsafe {
+        let mut a = line_start(pos);
+        let mut b = line_end(pos);
+        while a < b && is_space(SRC[a]) {
+            a += 1;
+        }
+        while b > a && is_space(SRC[b - 1]) {
+            b -= 1;
+        }
+        buf_bytes(out, SRC[a..b]);
+    }
+}
+
+fn query_refs(matches: *IntVec, calls_only: bool, count: bool) {
+    unsafe {
+        set_targets(matches);
+        collect_refs();
+        let mut order = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        sorted_refs(&order);
+        let out = buf_new();
+        let groups = TARGETS.count;
+        let mut counts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for _ in 0..groups {
+            counts.push(0);
+        }
+        for g in 0..groups {
+            if groups > 1 && !count {
+                buf_str(out, c"// ");
+                buf_bytes(out, SYMS[DEFS[TARGETS.data[g]].fqn].text);
+                buf_byte(out, '\n');
+            }
+            for i in 0..order.count {
+                let r = order.data[i];
+                if R_GROUP.data[r] != g {
+                    continue;
+                }
+                let flags = R_FLAGS.data[r];
+                if calls_only && (flags & QF_CALL) == 0 {
+                    continue;
+                }
+                counts.data[g] += 1;
+                if count {
+                    continue;
+                }
+                let pos = R_POS.data[r];
+                let d = R_DEF.data[r];
+                put_loc(out, pos);
+                if (flags & QF_DEF) != 0 {
+                    buf_str(out, c"  def");
+                } else {
+                    buf_str(out, c"  in ");
+                    put_enclosing(out, pos);
+                }
+                if groups > 1 || d != TARGETS.data[g] {
+                    buf_str(out, c"  -> ");
+                    buf_bytes(out, SYMS[DEFS[d].fqn].text);
+                }
+                buf_str(out, c"  |  ");
+                put_line(out, pos);
+                buf_byte(out, '\n');
+            }
+        }
+        if count {
+            if groups == 1 {
+                buf_int(out, counts.data[0]);
+                buf_byte(out, '\n');
+            } else {
+                for g in 0..groups {
+                    buf_int(out, counts.data[g]);
+                    buf_str(out, c"  ");
+                    buf_bytes(out, SYMS[DEFS[TARGETS.data[g]].fqn].text);
+                    buf_byte(out, '\n');
+                }
+            }
+        }
+        buf_write_fd(out, STDOUT);
+    }
+}
+
+// ---- def, show, items ----
+
+// The end of definition d's signature (before its body or its value).
+fn signature_end(d: i64) -> i64 {
+    unsafe {
+        let node = DEFS[d].node;
+        let k = DEFS[d].kind;
+        if (k == K_FN || k == K_METHOD || k == K_IMPL_METHOD || k == K_TRAIT_FN)
+            && NODES[node].kind == NodeKind::Fn && NODES[node].c != 0 {
+            return NODES[NODES[node].c].start;
+        }
+        if k == K_STRUCT || k == K_ENUM || k == K_TRAIT {
+            let mut i = token_at(DEFS[d].name_pos);
+            while i < TOK_COUNT && TOKS[i].kind != Tok::LBrace && TOKS[i].kind != Tok::Semi
+                && TOKS[i].kind != Tok::Eof {
+                i += 1;
+            }
+            return TOKS[i].start;
+        }
+        if k == K_MOD {
+            return DEFS[d].name_pos + SYMS[DEFS[d].name].text.len;
+        }
+        let mut end = DEFS[d].end;
+        while end > DEFS[d].start && (SRC[end - 1] == ';' || SRC[end - 1] == ',' || is_space(SRC[end - 1])) {
+            end -= 1;
+        }
+        end
+    }
+}
+
+const LONG_SIGNATURE: i64 = 120;
+
+fn put_signature(out: i64, d: i64) {
+    unsafe {
+        if DEFS[d].public && DEFS[d].kind != K_IMPL_METHOD {
+            buf_str(out, c"pub ");
+        }
+        let mark = buf_slice(out).len;
+        collapse(out, DEFS[d].start, signature_end(d));
+        let k = DEFS[d].kind;
+        if (k == K_CONST || k == K_STATIC) && buf_slice(out).len - mark > LONG_SIGNATURE {
+            // A long value: cut at its `=`.
+            let text = buf_slice(out);
+            let eq = find_in(text, c" = ", mark);
+            if eq >= 0 {
+                BUFS[out].len = eq;
+                buf_str(out, c" = ...");
+            }
+        }
+    }
+}
+
+fn query_def(matches: *IntVec) {
+    unsafe {
+        let out = buf_new();
+        for i in 0..(*matches).count {
+            let d = (*matches).data[i];
+            buf_bytes(out, SYMS[DEFS[d].fqn].text);
+            buf_str(out, c"  ");
+            put_loc(out, DEFS[d].name_pos);
+            buf_str(out, c"  ");
+            buf_str(out, kind_name(DEFS[d].kind));
+            buf_str(out, c"  ");
+            put_signature(out, d);
+            buf_byte(out, '\n');
+        }
+        buf_write_fd(out, STDOUT);
+    }
+}
+
+// The start of the first line of definition d's text: the line of its
+// start, and the comment and attribute lines right above it.
+fn text_start(d: i64) -> i64 {
+    unsafe {
+        let mut first = line_start(DEFS[d].start);
+        let file_start = FILES[file_of_pos(first)].start;
+        while first > file_start {
+            let prev = line_start(first - 1);
+            let mut a = prev;
+            while a < first - 1 && (SRC[a] == ' ' || SRC[a] == '\t') {
+                a += 1;
+            }
+            let comment = a + 1 < first && SRC[a] == '/' && SRC[a + 1] == '/';
+            let attribute = a + 1 < first && SRC[a] == '#' && SRC[a + 1] == '[';
+            if !comment && !attribute {
+                break;
+            }
+            first = prev;
+        }
+        first
+    }
+}
+
+// More matches than this: `show` lists their paths only.
+const SHOW_MAX: i64 = 5;
+
+fn query_show(matches: *IntVec) {
+    unsafe {
+        let out = buf_new();
+        let n = (*matches).count;
+        if n > SHOW_MAX {
+            buf_int(out, n);
+            buf_str(out, c" definitions match; qualify the name (or use --exact) to show one:\n");
+            for i in 0..n {
+                let d = (*matches).data[i];
+                buf_bytes(out, SYMS[DEFS[d].fqn].text);
+                buf_str(out, c"  ");
+                put_loc(out, DEFS[d].name_pos);
+                buf_str(out, c"  ");
+                buf_str(out, kind_name(DEFS[d].kind));
+                buf_byte(out, '\n');
+            }
+            buf_write_fd(out, STDOUT);
+            return;
+        }
+        for i in 0..n {
+            let d = (*matches).data[i];
+            let first = text_start(d);
+            let last = line_end(if DEFS[d].end > DEFS[d].start { DEFS[d].end - 1 } else { DEFS[d].start });
+            buf_str(out, c"// ");
+            buf_bytes(out, SYMS[DEFS[d].fqn].text);
+            buf_str(out, c"  ");
+            put_path(out, file_of_pos(first));
+            buf_byte(out, ':');
+            buf_int(out, line_of(first));
+            buf_byte(out, '-');
+            buf_int(out, line_of(last));
+            buf_byte(out, '\n');
+            buf_bytes(out, SRC[first..last]);
+            buf_byte(out, '\n');
+        }
+        buf_write_fd(out, STDOUT);
+    }
+}
+
+// The modules answering to `name` (all of them for none), in `out`.
+fn find_modules(name: [u8], exact: bool, out: *IntVec) {
+    unsafe {
+        for m in 0..module_count() {
+            if MODULES[m].name < 0 && m != 0 {
+                continue;
+            }
+            let fqn = SYMS[mod_fqn(m)].text;
+            if name.len == 0 || bytes_eq(fqn, name) || ends_with(fqn, name, exact) {
+                out.push(m);
+            }
+        }
+    }
+}
+
+// The module tree: each module's path, file and number of items.
+fn query_modules() {
+    unsafe {
+        let out = buf_new();
+        let mut all = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        find_modules(SYMS[intern_c(c"")].text, false, &all);
+        for i in 0..all.count {
+            let m = all.data[i];
+            let mut items = 0;
+            let mut first = -1;
+            for d in 0..DEF_COUNT {
+                if DEFS[d].module == m && DEFS[d].parent < 0 {
+                    items += 1;
+                    if first < 0 {
+                        first = d;
+                    }
+                }
+            }
+            buf_bytes(out, SYMS[mod_fqn(m)].text);
+            buf_str(out, c"  ");
+            let f = module_file(m);
+            if f >= 0 {
+                put_path(out, f);
+            }
+            buf_str(out, c"  ");
+            buf_int(out, items);
+            buf_str(out, if items == 1 { c" item\n" } else { c" items\n" });
+        }
+        buf_write_fd(out, STDOUT);
+    }
+}
+
+// The file of module m (an inline module's is its parent's), or -1.
+fn module_file(m: i64) -> i64 {
+    unsafe {
+        for f in 0..FILE_COUNT {
+            if FILES[f].module == m {
+                return f;
+            }
+        }
+        if m > 0 && MODULES[m].parent >= 0 { module_file(MODULES[m].parent) } else { -1 }
+    }
+}
+
+// The `impl ... {` header of the impl block of function definition d.
+fn put_impl_header(out: i64, d: i64) {
+    unsafe {
+        let node = DEFS[d].node;
+        let mut from = 0;
+        if DEFS[d].impl_node != 0 {
+            from = NODES[DEFS[d].impl_node].start;
+        } else {
+            let mut i = token_at(NODES[NODES[node].h].start) - 1;
+            while i > 0 && TOKS[i].kind != Tok::Impl {
+                i -= 1;
+            }
+            from = TOKS[i].start;
+        }
+        let mut j = token_at(from);
+        while j < TOK_COUNT && TOKS[j].kind != Tok::LBrace && TOKS[j].kind != Tok::Eof {
+            j += 1;
+        }
+        buf_int(out, line_of(from));
+        buf_str(out, c"  impl  ");
+        collapse(out, from, TOKS[j].start);
+        buf_byte(out, '\n');
+    }
+}
+
+fn query_items(modules: *IntVec) {
+    unsafe {
+        let out = buf_new();
+        let mut all = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for d in 0..DEF_COUNT {
+            all.push(d);
+        }
+        sort_by_position(&all);
+        for i in 0..(*modules).count {
+            let m = (*modules).data[i];
+            buf_str(out, c"// ");
+            buf_bytes(out, SYMS[mod_fqn(m)].text);
+            let f = module_file(m);
+            if f >= 0 {
+                buf_str(out, c"  ");
+                put_path(out, f);
+            }
+            buf_byte(out, '\n');
+            let mut impl_of = -1;
+            for j in 0..all.count {
+                let d = all.data[j];
+                if DEFS[d].module != m || DEFS[d].parent >= 0 {
+                    continue;
+                }
+                let k = DEFS[d].kind;
+                if k == K_METHOD || k == K_IMPL_METHOD {
+                    // (the functions of one impl block share its type node)
+                    let block = if DEFS[d].impl_node != 0 { DEFS[d].impl_node } else { NODES[DEFS[d].node].h };
+                    if block != impl_of {
+                        put_impl_header(out, d);
+                        impl_of = block;
+                    }
+                } else {
+                    impl_of = -1;
+                }
+                buf_int(out, line_of(DEFS[d].name_pos));
+                buf_str(out, c"  ");
+                buf_str(out, kind_name(k));
+                buf_str(out, c"  ");
+                put_signature(out, d);
+                buf_byte(out, '\n');
+            }
+        }
+        buf_write_fd(out, STDOUT);
+    }
+}
+
+// ---- The command line ----
+
+fn query_usage() -> i64 {
+    unsafe {
+        let out = buf_new();
+        buf_str(out, c"usage: tachyonc query def|show|refs|callers NAME [ROOT] [--exact] [--count]\n");
+        buf_str(out, c"       tachyonc query items [MODULE] [ROOT]\n");
+        buf_str(out, c"NAME: a path (crate::m::f, std::Vec::push, m::T.field, <T as Trait>::f) or its end (f, T::f, T.field)\n");
+        buf_str(out, c"ROOT: the program's root file (default: $TACHYON_ROOT, ./main.tach or ./compiler/src/main.tach); see docs/query.md\n");
+        buf_write_fd(out, STDERR);
+    }
+    2
+}
+
+fn ends_with_c(s: *u8, suffix: *u8) -> bool {
+    unsafe {
+        let n = strlen(s) as i64;
+        let k = strlen(suffix) as i64;
+        n >= k && streq(&s[n - k], suffix)
+    }
+}
+
+// The program's root: ROOT, else $TACHYON_ROOT, ./main.tach or
+// ./compiler/src/main.tach; 0 when there is none.
+fn find_root(given: *u8) -> *u8 {
+    unsafe {
+        if given != 0 as *u8 {
+            return given;
+        }
+        let env = getenv(c"TACHYON_ROOT");
+        if env != 0 as *u8 && env[0] != 0 {
+            return env;
+        }
+        if file_exists(c"main.tach") {
+            return c"main.tach";
+        }
+        if file_exists(c"compiler/src/main.tach") {
+            return c"compiler/src/main.tach";
+        }
+        0 as *u8
+    }
+}
+
+// The front end, up to the checked program; an error that would end the
+// compilation jumps back to run_query (ERR_BAIL).
+fn front_end(root: *u8) {
+    unsafe {
+        ERR_KIND = c"tokenizer error";
+        let paths = alloc_array::<*u8>(1);
+        paths[0] = root;
+        load_sources(paths, 1);
+        init_lexer();
+        lex_range(FILES[0].start, FILES[0].end, false);
+        ERR_KIND = c"module error";
+        load_modules();
+        ERR_KIND = c"tokenizer error";
+        let mut target = host_target();
+        if target == 0 {
+            target = T_X86_64_LINUX;
+        }
+        set_target(target);
+        let dirs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        import_c_headers(target, &dirs, false, c"");
+        lex_range(FILES[FILE_COUNT - 1].end, FILES[FILE_COUNT - 1].end, true);
+        init_ast();
+        ERR_KIND = c"parser error";
+        let program = parse_program();
+        if IMPORTED_START >= 0 {
+            drop_shadowed_imports(program);
+        }
+        collect_defs(program);
+        PARSED = true;
+        MAIN_SYM = intern_c(c"main");
+        init_types();
+        init_declarations();
+        ERR_KIND = c"type error";
+        check_program(program);
+    }
+}
+
+// Whether the program was parsed (the definitions are known).
+static mut PARSED: bool = false;
+
+pub fn run_query(argc: i64, argv: **u8) -> i64 {
+    unsafe {
+        if argc < 3 {
+            return query_usage();
+        }
+        let cmd = argv[2];
+        let mut count = false;
+        let mut exact = false;
+        let mut args = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 3..argc {
+            let a = argv[i];
+            if streq(a, c"--count") {
+                count = true;
+            } else if streq(a, c"--exact") {
+                exact = true;
+            } else if a[0] == '-' && a[1] == '-' {
+                return query_usage();
+            } else {
+                args.push(a as i64);
+            }
+        }
+        let items = streq(cmd, c"items");
+        let is_refs = streq(cmd, c"refs") || streq(cmd, c"callers");
+        if !items && !is_refs && !streq(cmd, c"def") && !streq(cmd, c"show") {
+            return query_usage();
+        }
+        let mut name = 0 as *u8;
+        let mut root = 0 as *u8;
+        if items {
+            // `items [MODULE] [ROOT]` (a lone argument ending in .tach is ROOT)
+            if args.count == 1 && ends_with_c(args.data[0] as *u8, c".tach") {
+                root = args.data[0] as *u8;
+            } else if args.count >= 1 {
+                name = args.data[0] as *u8;
+                if args.count >= 2 {
+                    root = args.data[1] as *u8;
+                }
+            }
+            if args.count > 2 {
+                return query_usage();
+            }
+        } else {
+            if args.count < 1 || args.count > 2 {
+                return query_usage();
+            }
+            name = args.data[0] as *u8;
+            if args.count == 2 {
+                root = args.data[1] as *u8;
+            }
+        }
+        root = find_root(root);
+        if root == 0 as *u8 {
+            let out = buf_new();
+            buf_str(out, c"tachyonc query: no program to ask about: pass its root file (tachyonc query ");
+            buf_str(out, cmd);
+            buf_str(out, c" ... ROOT, e.g. compiler/src/main.tach), set TACHYON_ROOT, or run where ./main.tach or ./compiler/src/main.tach is\n");
+            buf_write_fd(out, STDERR);
+            return 2;
+        }
+        if !file_exists(root) {
+            let out = buf_new();
+            buf_str(out, c"tachyonc query: cannot read the root file '");
+            buf_str(out, root);
+            buf_str(out, c"'\n");
+            buf_write_fd(out, STDERR);
+            return 2;
+        }
+        QUERY = true;
+        ERR_BAIL = alloc_zeroed(512);
+        if _setjmp(ERR_BAIL) == 0 {
+            front_end(root);
+        }
+        RECOVER_DEPTH = 0;
+        ERR_BAIL = 0 as *u8;
+        QUERY = false;
+        if !PARSED {
+            // (nothing to answer with: the errors say why)
+            write_errors();
+            return 1;
+        }
+        init_positions();
+        finish_defs();
+        init_containers();
+        if items {
+            if name == 0 as *u8 {
+                query_modules();
+                return 0;
+            }
+            let mut modules = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            let text = SYMS[intern_c(name)].text;
+            find_modules(text, exact, &modules);
+            if modules.count == 0 {
+                no_match(text, c"module");
+                return 1;
+            }
+            query_items(&modules);
+            return 0;
+        }
+        let text = SYMS[intern_c(name)].text;
+        let mut matches = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        find_defs(text, exact, &matches);
+        if matches.count == 0 {
+            no_match(text, c"definition");
+            return 1;
+        }
+        if is_refs {
+            query_refs(&matches, streq(cmd, c"callers"), count);
+        } else if streq(cmd, c"show") {
+            query_show(&matches);
+        } else {
+            query_def(&matches);
+        }
+        0
+    }
+}

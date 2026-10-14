@@ -2,8 +2,9 @@
 # The test suite of this release, run with a tachyon compiler (no cargo
 # needed): every tests/run/*.tach, tests/run/*/main.tach (a program of
 # several modules, 0.5) and tests/examples/*.test case is
-# compiled, assembled and linked with the C compiler, run, and checked.
-# POSIX sh and awk only, so it runs the same on macOS and Linux.
+# compiled, assembled and linked with the C compiler, run, and checked;
+# then tests/query/run.sh (`tachyonc query`, 0.11). POSIX sh and awk
+# only, so it runs the same on macOS and Linux.
 #
 # usage: tests/run.sh [-c COMPILER] [-t TARGET] [-O LEVEL] [-j JOBS] [-a] [FILTER]
 #
@@ -85,7 +86,7 @@ JOBS=""
 OUT=prog.o
 
 usage() {
-    sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//' >&2
+    sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//' >&2
     exit 2
 }
 
@@ -548,6 +549,25 @@ while read -r name file; do
     fi
     count=$((count + 1))
 done <"$CASES"
+
+# `tachyonc query` (0.11): tests/query/run.sh, its transcripts and its
+# checks on the compiler's own source; category "query".
+case query in
+    *"$FILTER"*)
+        "$ROOT/tests/query/run.sh" -c "$COMPILER" >"$WORK/query.out" 2>&1
+        while read -r status _; do
+            case "$status" in
+                pass) echo "query pass" >>"$TALLY"; count=$((count + 1)) ;;
+                FAIL) echo "query fail" >>"$TALLY"; count=$((count + 1)) ;;
+            esac
+        done <"$WORK/query.out"
+        if ! grep -q '^pass' "$WORK/query.out"; then
+            echo "query fail" >>"$TALLY"
+            count=$((count + 1))
+        fi
+        awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/query.out" >>"$FAILURES"
+        ;;
+esac
 
 [ $count -gt 0 ] || { echo "run.sh: no cases match '$FILTER'" >&2; exit 2; }
 cat "$FAILURES"

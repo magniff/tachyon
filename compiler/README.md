@@ -16,7 +16,13 @@ $ tachyonc --tokens file.tach        # the token dump (same format as the seed's
 $ tachyonc --version                 # the release and the host
 $ tachyonc --profile-generate p.prof prog.tach -o prog.o   # instrument (0.10)
 $ tachyonc --profile-use p.prof prog.tach -o prog.o        # optimize with the counts
+$ tachyonc query def run_gvn compiler/src/main.tach       # questions about a program (0.11)
 ```
+
+`tachyonc query def|show|refs|callers|items` answers questions about a
+program from the front end (definitions, their source, the references
+the checker resolved, a module's items), for agents and editors; see
+[docs/query.md](../docs/query.md).
 
 It accepts the whole language of [docs/grammar.md](../docs/grammar.md) and
 emits assembly that `cc` assembles and links against libc, for one of:
@@ -60,6 +66,7 @@ e.g. `use crate::ir::Op::{Add, Sub};`; 0.8 has no `*` imports, and
 | `consteval.tach` | compile-time evaluation: constants, array lengths, static initializers |
 | `patterns.tach` | patterns: their checking, refutability, `match`, and exhaustiveness and reachability by usefulness |
 | `generics.tach` | generics: instances of structs, enums and functions (copies of their templates), inference of type arguments, symbols |
+| `query.tach` | `tachyonc query` (0.11): definitions, their source, resolved references and module items, from the front end (see [docs/query.md](../docs/query.md)) |
 | `gen.tach` | the driver of code generation, and the `-O0` code generator: walks the checked AST, in terms of the target interface |
 | `abi.tach` | C's calling convention for aggregates (AArch64 and System V): classification into pieces, locations |
 | `target.tach` | the target interface: targets, the machine model's virtual registers, object-format details (symbols, sections, labels), and dispatch to the instruction set |
