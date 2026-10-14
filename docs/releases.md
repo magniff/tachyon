@@ -543,6 +543,8 @@ $ tests/run.sh -c ./tachyonc -t x86_64-macos            # x86-64, under Rosetta
 $ tests/run.sh -c ./tachyonc -O 0                       # at another optimization level
 $ tests/fuzz/run.sh -c ./tachyonc -n 500                # random programs, -O0 vs -O1 vs -O2
 $ tests/abi/run.sh -c ./tachyonc -n 150                 # C interop: random signatures, both ways
+$ tests/objcheck.sh -c ./tachyonc                       # objects (and -g line tables) against cc -c
+$ tests/debug.sh -c ./tachyonc                          # -g under lldb or gdb (0.11)
 $ bench/run.sh -c ./tachyonc                            # benchmarks
 ```
 

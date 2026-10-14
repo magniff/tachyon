@@ -16,6 +16,7 @@ $ tachyonc --tokens file.tach        # the token dump (same format as the seed's
 $ tachyonc --version                 # the release and the host
 $ tachyonc --profile-generate p.prof prog.tach -o prog.o   # instrument (0.10)
 $ tachyonc --profile-use p.prof prog.tach -o prog.o        # optimize with the counts
+$ tachyonc -g prog.tach -o prog      # with DWARF line tables, for debuggers (0.11)
 ```
 
 It accepts the whole language of [docs/grammar.md](../docs/grammar.md) and
@@ -86,6 +87,9 @@ e.g. `use crate::ir::Op::{Add, Sub};`; 0.8 has no `*` imports, and
 | `emit.tach` | emission of the allocated IR: operands, parallel moves, calls, frames |
 | `mc_arm64.tach` | AArch64 instructions on physical registers |
 | `mc_x86_64.tach` | x86-64 instructions on physical registers |
+| `objfile.tach` | the assembler: Mach-O and ELF objects from the assembly text, line tables from `.loc`s, compact unwind from CFI (0.11) |
+| `enc_arm64.tach`, `enc_x86.tach` | instruction encoding for the assembler |
+| `dwarf.tach` | `-g` (0.11): `.file`/`.loc` from source positions, the compile unit and its functions (.debug_info), CFI on Mach-O |
 
 Two back ends share the front end. At `-O1` and `-O2` (the default) the
 checked AST is lowered to an SSA IR, optimized, register-allocated and

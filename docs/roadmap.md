@@ -488,7 +488,14 @@ The last release of the build-out.
   container
 - aarch64-linux host: done (cross-built by `bootstrap.sh --host
   aarch64-linux`, finished natively by `bootstrap/aarch64-linux-check.sh`)
-- DWARF line tables (`-g`): to do
+- DWARF line tables (`-g`): done (`.file`/`.loc` from statement
+  positions carried through the IR at every level; .debug_info with a
+  compile unit and its subprograms; the line program written by the object
+  writer for Mach-O and ELF; dsymutil after linking on macOS; CFI as compact
+  unwind on Mach-O, for lldb at -O0); objcheck compares the decoded line
+  tables with `cc -c`'s on every target, tests/debug.sh runs lldb and gdb
+  (breakpoints in two files, a crash's backtrace with file:line at -O0 and
+  -O2); the output without `-g` is unchanged
 
 ## Toward 1.0
 

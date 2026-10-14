@@ -31,6 +31,8 @@ use crate::types::{
     type_size, in_fregs, is_vector,
 };
 use crate::patterns::int_key;
+use crate::ast::NODES;
+use crate::dwarf::{DEBUG_INFO, dbg_function_begin, dbg_function_end, dbg_loc};
 use crate::gen::{fn_is_global, fn_symbol_prefix, static_symbol_prefix};
 use crate::abi::{
     ABI_PIECE_COUNT, ABI_PIECE_OFFSET, ABI_PIECE_TY, AbiClass, abi_classify, abi_piece_locations,
@@ -935,6 +937,9 @@ pub fn gen_ir_function(fi: i64) {
         EPILOGUE_USED = false;
         FELL_INTO_EPILOGUE = false;
         HAS_FRAME = SAVE >= 0;
+        LAST_LOC = 0;
+        let item = IRFUNCS[fi].item;
+        dbg_function_begin(f, fn_symbol_prefix(f), if item > 0 { NODES[item].start } else { -1 });
         ir_function_start(fn_symbol_prefix(f), FNS[f].name, fn_is_global(f), SAVE == 0);
         CUR_IN_FRAME = SAVE == 0;
         if SAVE == 0 {
@@ -964,6 +969,34 @@ pub fn gen_ir_function(fi: i64) {
             st_function_done(fi);
         }
         buf_bytes(ASM, buf_slice(CODE));
+        dbg_function_end();
+    }
+}
+
+// (-g) The source position (+ 1) of the last `.loc` written.
+static mut LAST_LOC: i64 = 0;
+
+// (-g) The `.loc` of instruction v, when it starts another statement. The
+// peepholes that look at what was just emitted see through it.
+fn emit_loc(v: i64) {
+    unsafe {
+        let loc = INSTS[v].loc;
+        if loc == 0 || loc == LAST_LOC {
+            return;
+        }
+        LAST_LOC = loc;
+        let before = BUFS[CODE].len;
+        dbg_loc(CODE, loc - 1);
+        let after = BUFS[CODE].len;
+        if LAST_MOV_END == before {
+            LAST_MOV_END = after;
+        }
+        if LAST_STORE_END == before {
+            LAST_STORE_END = after;
+        }
+        if LAST_SELECT_END == before {
+            LAST_SELECT_END = after;
+        }
     }
 }
 
@@ -1456,6 +1489,9 @@ fn emit_block_body(b: i64, next: i64) {
                 plan_gap_moves(CUR_POS - 1);
                 pm_resolve();
                 if is_emitted(v) && !is_fused_compare(v) {
+                    if DEBUG_INFO {
+                        emit_loc(v);
+                    }
                     emit_inst(v);
                 }
             }

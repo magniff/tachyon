@@ -9,6 +9,15 @@
 # build id, a hash of the whole file, symbol tables included). POSIX sh, cc
 # and objdump only, so it runs the same on macOS and Linux.
 #
+# (0.11) Each program is also compiled with -g at both levels: then the two
+# programs must have the same line table too, as decoded (the assemblers
+# encode it each their own way): `objdump --dwarf=decodedline` of the
+# executables on Linux, `dwarfdump --debug-line` of what dsymutil gathers
+# on macOS (where the debug information stays in the objects), with each
+# row's file named by its path; on macOS their .debug_info must be the
+# same as well (on Linux it is part of the executables' data, compared
+# above).
+#
 # usage: tests/objcheck.sh [-c COMPILER] [-t TARGET] [-j JOBS] [FILTER]
 #
 #   -c COMPILER   the tachyonc to check (default: target/tachyonc)
@@ -66,19 +75,56 @@ code() {
         }'
 }
 
-# The contents of every section but the code.
+# The contents of every section but the code (and the line table, whose
+# encoding is the assembler's).
 data() {
     objdump -s "$1" | awk '
-        /^Contents of section/ { skip = ($0 ~ /text|build-id/); print; next }
+        /^Contents of section/ { skip = ($0 ~ /text|build-id|debug_line/); print; next }
         /file format/ { next }
         !skip && /^ [0-9a-f]+ / { print }'
 }
 
-check() { # <file> <level> <dir>
-    f=$1 o=$2 d=$3
+# The rows of an executable's line table, decoded: address, line, column
+# (macOS), file (by its path), flags.
+lines() {
+    case "$TARGET" in
+        *-macos)
+            dwarfdump --debug-line "$1.dSYM" | awk '
+                /^debug_line\[/ { split("", dir); split("", name); split("", fdir) }
+                /^include_directories\[/ {
+                    i = $0; sub(/^include_directories\[ */, "", i); sub(/\].*/, "", i)
+                    v = $0; sub(/^[^"]*"/, "", v); sub(/"[^"]*$/, "", v)
+                    dir[i + 0] = v
+                }
+                /^file_names\[/ { f = $0; sub(/^file_names\[ */, "", f); sub(/\].*/, "", f); f += 0 }
+                /^ +name: / { v = $0; sub(/^[^"]*"/, "", v); sub(/"[^"]*$/, "", v); name[f] = v }
+                /^ +dir_index: / { fdir[f] = $2 + 0 }
+                /^0x[0-9a-f]+ / {
+                    path = (fdir[$4 + 0] > 0 ? dir[fdir[$4 + 0]] "/" : "") name[$4 + 0]
+                    flags = ""
+                    for (k = 8; k <= NF; k++) flags = flags " " $k
+                    print $1, $2, $3, path, flags
+                }' ;;
+        *)
+            objdump --dwarf=decodedline "$1" | awk 'NF >= 3 && $3 ~ /^0x/ { print }' ;;
+    esac
+}
+
+# dsymutil, when the debug information of an executable is to be read
+# (macOS); its notes on the relocations of cc's objects are not errors.
+dsym() {
+    case "$TARGET" in
+        *-macos) dsymutil "$1" >/dev/null 2>&1 ;;
+    esac
+}
+
+check() { # <file> <level> <dir> [-g]
+    f=$1 o=$2 d=$3 g=${4:-}
     mkdir -p "$d"
-    "$COMPILER" --target "$TARGET" "-O$o" -c "$f" -o "$d/ours.o" >"$d/out" 2>&1 || { echo "FAIL $f -O$o: tachyonc -c: $(head -c 300 "$d/out")"; return; }
-    "$COMPILER" --target "$TARGET" "-O$o" -S "$f" -o "$d/prog.s" >"$d/out" 2>&1 || { echo "FAIL $f -O$o: tachyonc -S"; return; }
+    # shellcheck disable=SC2086
+    "$COMPILER" --target "$TARGET" "-O$o" $g -c "$f" -o "$d/ours.o" >"$d/out" 2>&1 || { echo "FAIL $f -O$o $g: tachyonc -c: $(head -c 300 "$d/out")"; return; }
+    # shellcheck disable=SC2086
+    "$COMPILER" --target "$TARGET" "-O$o" $g -S "$f" -o "$d/prog.s" >"$d/out" 2>&1 || { echo "FAIL $f -O$o $g: tachyonc -S"; return; }
     # shellcheck disable=SC2086
     "$CC" $LINK_FLAGS -c "$d/prog.s" -o "$d/cc.o" >"$d/out" 2>&1 || { echo "FAIL $f -O$o: cc -c"; return; }
     # shellcheck disable=SC2086
@@ -88,16 +134,35 @@ check() { # <file> <level> <dir>
     code "$d/ours" >"$d/ours.code"
     code "$d/cc" >"$d/cc.code"
     if ! cmp -s "$d/ours.code" "$d/cc.code"; then
-        echo "FAIL $f -O$o: code differs: $(diff "$d/ours.code" "$d/cc.code" | sed -n 2,3p | tr '\n' ' ')"
+        echo "FAIL $f -O$o $g: code differs: $(diff "$d/ours.code" "$d/cc.code" | sed -n 2,3p | tr '\n' ' ')"
         return
     fi
     data "$d/ours" >"$d/ours.data"
     data "$d/cc" >"$d/cc.data"
     if ! cmp -s "$d/ours.data" "$d/cc.data"; then
-        echo "FAIL $f -O$o: data differs: $(diff "$d/ours.data" "$d/cc.data" | sed -n 2,3p | tr '\n' ' ')"
+        echo "FAIL $f -O$o $g: data differs: $(diff "$d/ours.data" "$d/cc.data" | sed -n 2,3p | tr '\n' ' ')"
         return
     fi
-    echo "ok $f -O$o"
+    if [ -n "$g" ]; then
+        dsym "$d/ours"
+        dsym "$d/cc"
+        lines "$d/ours" >"$d/ours.lines"
+        lines "$d/cc" >"$d/cc.lines"
+        if [ ! -s "$d/ours.lines" ] || ! cmp -s "$d/ours.lines" "$d/cc.lines"; then
+            echo "FAIL $f -O$o $g: line tables differ: $(diff "$d/ours.lines" "$d/cc.lines" | sed -n 2,3p | tr '\n' ' ')"
+            return
+        fi
+        case "$TARGET" in
+            *-macos)
+                dwarfdump --debug-info "$d/ours.dSYM" | grep -v 'file format' >"$d/ours.info"
+                dwarfdump --debug-info "$d/cc.dSYM" | grep -v 'file format' >"$d/cc.info"
+                if ! cmp -s "$d/ours.info" "$d/cc.info"; then
+                    echo "FAIL $f -O$o $g: debug information differs: $(diff "$d/ours.info" "$d/cc.info" | sed -n 2,3p | tr '\n' ' ')"
+                    return
+                fi ;;
+        esac
+    fi
+    echo "ok $f -O$o $g"
 }
 
 cd "$ROOT" || exit 1
@@ -114,9 +179,12 @@ done
 n=0
 running=0
 while read -r f; do
-    for o in 0 2; do
+    for og in 0 2 0g 2g; do
         n=$((n + 1))
-        check "$f" "$o" "$WORK/$n" >"$WORK/$n.result" &
+        o=${og%g}
+        g=""
+        [ "$o" = "$og" ] || g=-g
+        check "$f" "$o" "$WORK/$n" $g >"$WORK/$n.result" &
         running=$((running + 1))
         if [ "$running" -ge "$JOBS" ]; then
             wait
