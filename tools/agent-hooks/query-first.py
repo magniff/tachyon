@@ -143,9 +143,19 @@ def suggestion(prog, args):
     m = re.search(r"\b(?:fn|struct|enum|trait|const|static|type|mod)\s+(\w+)", pattern)
     if m:
         return f"tachyonc query show {m.group(1)}"
+    files = [a for a in file_args(prog, args) if a.endswith(".tach")]
+    # `sed -n 'N,Mp' FILE`: the item holding line N
+    m = re.match(r"^(\d+)(,\d+)?p$", pattern)
+    if prog == "sed" and m and files:
+        return f"tachyonc query show {files[0]}:{m.group(1)}"
     if prog in ("grep", "rg", "egrep", "fgrep"):
-        word = re.sub(r"[^\w:.]", "", pattern) or "NAME"
-        return f"tachyonc query refs {word}"
+        word = re.sub(r"[^\w:.]", "", pattern)
+        if word and not re.search(r"\s", pattern):
+            return f"tachyonc query refs {word}"
+        # (text, not a name: a comment, a string)
+        return "tachyonc query items MODULE | tachyonc query show FILE:LINE"
+    if files:
+        return f"tachyonc query stats {files[0]} | tachyonc query show FILE:LINE"
     return "tachyonc query show NAME | tachyonc query items MODULE"
 
 

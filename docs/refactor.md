@@ -123,8 +123,9 @@ main.tach:13:25: error[type error] undefined variable 'twice' | help: add `use c
 ```
 
 Exit 0 without errors (and then nothing is printed but warnings), 1 with
-them. `--diagnostics=human` prints the long form. About 40 ms on the
-compiler's source.
+them; at most 50 errors, as in a compilation. `--diagnostics=human`
+prints the long form. About 30 ms on the compiler's source (55,000
+lines).
 
 ## tachyonc fix
 
