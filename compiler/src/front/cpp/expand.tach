@@ -1,0 +1,349 @@
+// Macro expansion: the next macro-expanded token, the arguments of a
+// function-like macro, substitution with `#` and `##`, and the expansion
+// of a token list on its own (macro arguments, `#if` lines).
+
+use crate::base::{
+    BUFS, IntVec, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, intern, sym_name,
+};
+use crate::front::cpp::{
+    CINTS, CTOKS, CTOK_COUNT, C_EOF, MACROS, S_COMMA, S_COUNTER,
+    S_FILE, S_HASH, S_HASHHASH, S_LINE, S_LPAREN, S_PRAGMA_OP, S_RPAREN, S_VA_ARGS, c_error2, ctok_copy, ctok_is, ctok_text, hs_add, hs_has, hs_inter, hs_union, macro_of, macro_param_index,
+    macro_tok,
+};
+use crate::front::cpp::CK::{Char, Ident, Num, Punct, Str};
+use crate::front::cpp::input::{
+    CFILES, CPP_LIST_MODE, CPP_PENDING, c_lex, push_back, push_list, raw_next,
+};
+
+static mut CPP_COUNTER: i64 = 0;
+
+// ---- Expansion ----
+
+// The next macro-expanded token.
+pub fn cpp_next() -> i64 {
+    unsafe {
+        loop {
+            let t = raw_next();
+            if CTOKS[t].kind != Ident {
+                return t;
+            }
+            let sym = CTOKS[t].text;
+            if hs_has(CTOKS[t].hide, sym) {
+                return t;
+            }
+            if sym == S_PRAGMA_OP {
+                // _Pragma("...") is dropped.
+                let open = raw_next();
+                if !ctok_is(open, S_LPAREN) {
+                    push_back(open);
+                    return t;
+                }
+                let mut depth = 1;
+                while depth > 0 {
+                    let x = raw_next();
+                    if x == C_EOF {
+                        break;
+                    }
+                    if ctok_is(x, S_LPAREN) {
+                        depth += 1;
+                    } else if ctok_is(x, S_RPAREN) {
+                        depth -= 1;
+                    }
+                }
+                continue;
+            }
+            if sym == S_LINE || sym == S_COUNTER || sym == S_FILE {
+                let n = ctok_copy(t);
+                if sym == S_FILE {
+                    CTOKS[n].kind = Str;
+                    let b = buf_new();
+                    buf_byte(b, '"');
+                    if CTOKS[t].file >= 0 {
+                        buf_str(b, CFILES[CTOKS[t].file].path);
+                    }
+                    buf_byte(b, '"');
+                    CTOKS[n].text = intern(buf_slice(b));
+                } else {
+                    CTOKS[n].kind = Num;
+                    let b = buf_new();
+                    if sym == S_LINE {
+                        buf_int(b, CTOKS[t].line);
+                    } else {
+                        buf_int(b, CPP_COUNTER);
+                        CPP_COUNTER += 1;
+                    }
+                    CTOKS[n].text = intern(buf_slice(b));
+                }
+                return n;
+            }
+            let m = macro_of(sym);
+            if m < 0 {
+                return t;
+            }
+            if !MACROS[m].func {
+                let out = subst(m, 0 as *i64, 0);
+                finish_expansion(&out, t, hs_add(CTOKS[t].hide, sym));
+                continue;
+            }
+            let next = raw_next();
+            if !ctok_is(next, S_LPAREN) {
+                push_back(next);
+                return t;
+            }
+            let args = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            let rparen = collect_args(m, t, &args);
+            let out = subst(m, args.data, args.count);
+            finish_expansion(&out, t, hs_add(hs_inter(CTOKS[t].hide, CTOKS[rparen].hide), sym));
+        }
+    }
+}
+
+// Gives the expansion of the macro named by `t` its hide set and t's
+// leading space, and makes it the next input.
+fn finish_expansion(out: *IntVec, t: i64, hide: i64) {
+    unsafe {
+        for i in 0..(*out).count {
+            let n = ctok_copy((*out).data[i]);
+            CTOKS[n].hide = hs_union(CTOKS[n].hide, hide);
+            if i == 0 {
+                CTOKS[n].space = CTOKS[t].space;
+            }
+            (*out).data[i] = n;
+        }
+        push_list(out);
+    }
+}
+
+// The arguments of a call of function-like macro m (after its `(`):
+// `args` gets, per argument, the start of its tokens in CINTS and their
+// count. Returns the closing parenthesis.
+fn collect_args(m: i64, name: i64, args: *IntVec) -> i64 {
+    unsafe {
+        let mut depth = 0;
+        let pieces = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut toks = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut arg_start = 0;
+        let mut rparen = 0;
+        loop {
+            let t = raw_next();
+            if t == C_EOF {
+                c_error2(name, c"unterminated call of macro ", ctok_text(name));
+            }
+            if ctok_is(t, S_LPAREN) {
+                depth += 1;
+            } else if ctok_is(t, S_RPAREN) {
+                if depth == 0 {
+                    rparen = t;
+                    break;
+                }
+                depth -= 1;
+            } else if depth == 0 && ctok_is(t, S_COMMA) && CTOKS[t].kind == Punct {
+                let in_va = MACROS[m].variadic && pieces.count / 2 == MACROS[m].param_count - 1;
+                if !in_va {
+                    pieces.push(arg_start);
+                    pieces.push(toks.count - arg_start);
+                    arg_start = toks.count;
+                    continue;
+                }
+            }
+            toks.push(t);
+        }
+        pieces.push(arg_start);
+        pieces.push(toks.count - arg_start);
+        let mut given = pieces.count / 2;
+        // `f()` passes one empty argument; it is no argument for a macro
+        // without parameters.
+        if given == 1 && MACROS[m].param_count == 0 && toks.count == 0 {
+            given = 0;
+        }
+        if given < MACROS[m].param_count && MACROS[m].variadic && given == MACROS[m].param_count - 1 {
+            pieces.push(toks.count);
+            pieces.push(0);
+            given += 1;
+        }
+        if given != MACROS[m].param_count {
+            c_error2(name, c"wrong number of arguments in call of macro ", ctok_text(name));
+        }
+        for i in 0..given {
+            let start = CINTS.count;
+            for k in 0..pieces.data[2 * i + 1] {
+                CINTS.push(toks.data[pieces.data[2 * i] + k]);
+            }
+            (*args).push(start);
+            (*args).push(pieces.data[2 * i + 1]);
+        }
+        rparen
+    }
+}
+
+// The tokens of list (start, count) in CINTS, macro-expanded on their own.
+pub fn expand_list(start: i64, count: i64) -> IntVec {
+    let saved_pending = CPP_PENDING;
+    let saved_mode = CPP_LIST_MODE;
+    CPP_PENDING = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    CPP_LIST_MODE = true;
+    let mut i = count - 1;
+    while i >= 0 {
+        unsafe { CPP_PENDING.push(CINTS.data[start + i]); }
+        i -= 1;
+    }
+    let mut out = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    loop {
+        let t = cpp_next();
+        if t == C_EOF {
+            break;
+        }
+        out.push(t);
+    }
+    CPP_PENDING = saved_pending;
+    CPP_LIST_MODE = saved_mode;
+    out
+}
+
+// The replacement of macro m, its parameters replaced by the arguments
+// (`args`: start and count of each in CINTS), with # and ## applied.
+fn subst(m: i64, args: *i64, nargs: i64) -> IntVec {
+    unsafe {
+        let mut out = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let n = MACROS[m].body_count;
+        let mut i = 0;
+        while i < n {
+            let t = macro_tok(m, i);
+            let next = if i + 1 < n { macro_tok(m, i + 1) } else { -1 };
+            // # param: the argument as a string.
+            if MACROS[m].func && ctok_is(t, S_HASH) && next >= 0 {
+                let p = macro_param_index(m, CTOKS[next].text);
+                if p >= 0 {
+                    out.push(stringize(args[2 * p], args[2 * p + 1], t));
+                    i += 2;
+                    continue;
+                }
+            }
+            // x ## y
+            if ctok_is(t, S_HASHHASH) && next >= 0 {
+                let p = macro_param_index(m, CTOKS[next].text);
+                if p >= 0 {
+                    let start = args[2 * p];
+                    let count = args[2 * p + 1];
+                    // GNU: `, ## __VA_ARGS__` drops the comma when there are
+                    // no variable arguments, and pastes nothing otherwise.
+                    if out.count > 0 && ctok_is(out.data[out.count - 1], S_COMMA)
+                        && CTOKS[next].text == S_VA_ARGS {
+                        if count == 0 {
+                            out.pop();
+                        } else {
+                            for k in 0..count {
+                                out.push(CINTS.data[start + k]);
+                            }
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    if count > 0 {
+                        if out.count > 0 {
+                            out.data[out.count - 1] = paste(out.data[out.count - 1], CINTS.data[start]);
+                        } else {
+                            out.push(CINTS.data[start]);
+                        }
+                        for k in 1..count {
+                            out.push(CINTS.data[start + k]);
+                        }
+                    }
+                    i += 2;
+                    continue;
+                }
+                if out.count > 0 {
+                    out.data[out.count - 1] = paste(out.data[out.count - 1], next);
+                } else {
+                    out.push(next);
+                }
+                i += 2;
+                continue;
+            }
+            let p = if CTOKS[t].kind == Ident { macro_param_index(m, CTOKS[t].text) } else { -1 };
+            if p >= 0 {
+                let start = args[2 * p];
+                let count = args[2 * p + 1];
+                if next >= 0 && ctok_is(next, S_HASHHASH) {
+                    // The operand of ## is not expanded; an empty one leaves
+                    // the other operand.
+                    if count == 0 {
+                        let after = if i + 2 < n { macro_tok(m, i + 2) } else { -1 };
+                        let q = if after >= 0 && CTOKS[after].kind == Ident { macro_param_index(m, CTOKS[after].text) } else { -1 };
+                        if q >= 0 {
+                            for k in 0..args[2 * q + 1] {
+                                out.push(CINTS.data[args[2 * q] + k]);
+                            }
+                            i += 3;
+                        } else {
+                            i += 2;
+                        }
+                        continue;
+                    }
+                    for k in 0..count {
+                        out.push(CINTS.data[start + k]);
+                    }
+                    i += 1;
+                    continue;
+                }
+                let expanded = expand_list(start, count);
+                for k in 0..expanded.count {
+                    let x = ctok_copy(expanded.data[k]);
+                    if k == 0 {
+                        CTOKS[x].space = CTOKS[t].space;
+                    }
+                    out.push(x);
+                }
+                i += 1;
+                continue;
+            }
+            out.push(t);
+            i += 1;
+        }
+        out
+    }
+}
+
+fn stringize(start: i64, count: i64, at: i64) -> i64 {
+    unsafe {
+        let b = buf_new();
+        buf_byte(b, '"');
+        for k in 0..count {
+            let t = CINTS.data[start + k];
+            if k > 0 && CTOKS[t].space {
+                buf_byte(b, ' ');
+            }
+            let text = SYMS[CTOKS[t].text].text;
+            let quoted = CTOKS[t].kind == Str || CTOKS[t].kind == Char;
+            for j in 0..text.len as i64 {
+                let c = text[j];
+                if quoted && (c == '"' || c == '\\') {
+                    buf_byte(b, '\\');
+                }
+                buf_byte(b, c);
+            }
+        }
+        buf_byte(b, '"');
+        let n = ctok_copy(at);
+        CTOKS[n].kind = Str;
+        CTOKS[n].text = intern(buf_slice(b));
+        n
+    }
+}
+
+// The token spelled by a's text followed by b's (a's position).
+fn paste(a: i64, b: i64) -> i64 {
+    unsafe {
+        let buf = buf_new();
+        buf_bytes(buf, SYMS[CTOKS[a].text].text);
+        buf_bytes(buf, SYMS[CTOKS[b].text].text);
+        let first = c_lex(BUFS[buf].data, BUFS[buf].len, CTOKS[a].file, CTOKS[a].line);
+        if CTOK_COUNT - first != 1 {
+            c_error2(a, c"pasting does not give one token: ", sym_name(intern(buf_slice(buf))));
+        }
+        CTOKS[first].space = CTOKS[a].space;
+        CTOKS[first].bol = false;
+        CTOKS[first].hide = CTOKS[a].hide;
+        first
+    }
+}

@@ -1,0 +1,300 @@
+// C import (1/2): the C preprocessor, for `import "header.h" as c;`.
+//
+// Headers are read as the target's C compiler reads them: its predefined
+// macros and its include search path are asked from the compiler itself
+// (`cc -dM -E -v`, see cpp_query_compiler), so a header means to tachyon
+// what it means to C on this machine. The preprocessor follows C11 6.10
+// with the GNU extensions system headers rely on: `#include_next`,
+// `, ## __VA_ARGS__`, `__has_include`, `#pragma once`. Macro expansion
+// uses hide sets (Prosser's algorithm): every token carries the set of
+// macros whose expansion produced it, and a macro is not expanded again
+// inside its own expansion.
+//
+// The output is one stream of tokens for the declarations of all the
+// imported headers, read by cimport.tach.
+//
+// This file: C tokens, hide sets, errors in C code, the macro table and
+// the well-known symbols; the parts: input (the lexer, include frames),
+// expand (macro expansion), directives (`#define`, `#include`, `#if`,
+// `#pragma`), eval (constant expressions) and cc (the settings asked
+// from the C compiler).
+
+pub mod cc;
+pub mod eval;
+pub mod directives;
+pub mod expand;
+pub mod input;
+
+use crate::base::{
+    BUFS, ERR_KIND, IntVec, STDERR, buf_byte, buf_int, buf_new,
+    buf_str, buf_write_fd, err_end_text, error_at, exit, grow, intern_c, sym_name,
+};
+use crate::middle::lower::HMap;
+use CK::{Char, Eof, Ident, Num, Punct, Str};
+use crate::front::cpp::input::CFILES;
+
+// The preprocessor's interface to other modules.
+pub use cc::{c_compiler_given, cpp_query_compiler};
+pub use directives::{CDIRS, file_exists, path_dir, path_join};
+pub use eval::{EV_FAIL, EV_N, EV_POS, EV_TOKS, ev_convert, ev_peek, ev_unary, eval_tokens};
+pub use expand::{cpp_next, expand_list};
+pub use input::{c_load_text, push_frame};
+
+pub extern "C" {
+    fn snprintf(buf: *u8, size: u64, format: *u8, ...) -> i32;
+    fn strtoull(s: *u8, end: **u8, base: i32) -> u64;
+    fn strtof(s: *u8, end: **u8) -> f32;
+}
+
+// ---- Tokens ----
+
+pub enum CK { Eof, Ident, Num, Char, Str, Punct }
+
+// `text` is the token's spelling, interned; `space`: whitespace before it;
+// `bol`: first on its line; `hide`: its hide set (HS).
+struct CTok { kind: CK, space: bool, bol: bool, text: i64, file: i64, line: i64, hide: i64 }
+
+pub static mut CTOKS: *CTok = 0 as *CTok;
+static mut CTOK_COUNT: i64 = 0;
+static mut CTOK_CAP: i64 = 0;
+// Token lists (macro bodies, parameters) live here.
+pub static mut CINTS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// The end of the stream.
+pub static mut C_EOF: i64 = 0;
+
+fn ctok_new(kind: CK, text: i64, file: i64, line: i64, space: bool, bol: bool) -> i64 {
+    unsafe {
+        CTOKS = grow(CTOKS, CTOK_COUNT, &CTOK_CAP);
+        let t = CTOK_COUNT;
+        CTOKS[t] = CTok { kind: kind, space: space, bol: bol, text: text, file: file, line: line, hide: 0 };
+        CTOK_COUNT += 1;
+        t
+    }
+}
+
+pub fn ctok_copy(t: i64) -> i64 {
+    unsafe {
+        let n = ctok_new(CTOKS[t].kind, CTOKS[t].text, CTOKS[t].file, CTOKS[t].line, CTOKS[t].space, false);
+        CTOKS[n].hide = CTOKS[t].hide;
+        n
+    }
+}
+
+pub fn ctok_is(t: i64, sym: i64) -> bool {
+    unsafe { CTOKS[t].text == sym && CTOKS[t].kind != Str && CTOKS[t].kind != Char }
+}
+
+pub fn ctok_text(t: i64) -> *u8 {
+    unsafe { sym_name(CTOKS[t].text) }
+}
+
+// ---- Hide sets: linked lists of macro names, 0 the empty set ----
+
+struct HsNode { sym: i64, next: i64 }
+
+static mut HS: *HsNode = 0 as *HsNode;
+static mut HS_COUNT: i64 = 0;
+static mut HS_CAP: i64 = 0;
+
+fn hs_cons(sym: i64, next: i64) -> i64 {
+    unsafe {
+        HS = grow(HS, HS_COUNT, &HS_CAP);
+        HS[HS_COUNT] = HsNode { sym: sym, next: next };
+    }
+    HS_COUNT += 1;
+    HS_COUNT - 1
+}
+
+fn hs_has(h: i64, sym: i64) -> bool {
+    unsafe {
+        let mut p = h;
+        while p != 0 {
+            if HS[p].sym == sym {
+                return true;
+            }
+            p = HS[p].next;
+        }
+        false
+    }
+}
+
+fn hs_add(h: i64, sym: i64) -> i64 {
+    if hs_has(h, sym) { h } else { hs_cons(sym, h) }
+}
+
+fn hs_union(a: i64, b: i64) -> i64 {
+    let mut r = b;
+    let mut p = a;
+    while p != 0 {
+        unsafe {
+            r = hs_add(r, HS[p].sym);
+            p = HS[p].next;
+        }
+    }
+    r
+}
+
+fn hs_inter(a: i64, b: i64) -> i64 {
+    unsafe {
+        let mut r = 0;
+        let mut p = a;
+        while p != 0 {
+            if hs_has(b, HS[p].sym) {
+                r = hs_cons(HS[p].sym, r);
+            }
+            p = HS[p].next;
+        }
+        r
+    }
+}
+
+// ---- Errors in C code ----
+
+fn c_error(t: i64, message: *u8) -> ! {
+    unsafe {
+        // An error in the list of imports: at the `import` item.
+        if t > 0 && CTOKS[t].file == C_IMPORT_FILE && CTOKS[t].line - 1 < C_IMPORT_POS.count {
+            ERR_KIND = c"C import";
+            error_at(C_IMPORT_POS.data[CTOKS[t].line - 1], message);
+        }
+        let out = buf_new();
+        buf_str(out, c"error[C import]: ");
+        buf_str(out, message);
+        if t > 0 && CTOKS[t].file >= 0 {
+            buf_str(out, c"\n --> ");
+            buf_str(out, CFILES[CTOKS[t].file].path);
+            buf_str(out, c": line ");
+            buf_int(out, CTOKS[t].line);
+        }
+        buf_byte(out, '\n');
+        // (reported with the program's errors, at its first `import`)
+        err_end_text(if C_IMPORT_POS.count > 0 { C_IMPORT_POS.data[0] } else { 0 }, out)
+    }
+}
+
+fn c_error2(t: i64, message: *u8, detail: *u8) -> ! {
+    let b = buf_new();
+    buf_str(b, message);
+    buf_str(b, detail);
+    buf_byte(b, 0);
+    unsafe { c_error(t, BUFS[b].data) }
+}
+
+// Where the `import` items are in SRC, in order (the lines of `<import>`).
+pub static mut C_IMPORT_POS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut C_IMPORT_FILE: i64 = -1;
+
+// ---- Macros ----
+
+// `params`, `body`: lists in CINTS (parameter symbols; token indices).
+// `builtin`: predefined by the compiler (not imported as constants).
+struct Macro {
+    name: i64, func: bool, variadic: bool, builtin: bool,
+    params: i64, param_count: i64, body: i64, body_count: i64,
+}
+
+pub static mut MACROS: *Macro = 0 as *Macro;
+pub static mut MACRO_COUNT: i64 = 0;
+static mut MACRO_CAP: i64 = 0;
+// Symbol + 1 -> macro + 1 (0: not defined).
+static mut MACRO_OF: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+static mut DEFINING_BUILTINS: bool = false;
+
+pub fn macro_of(sym: i64) -> i64 {
+    MACRO_OF.get(sym + 1) - 1
+}
+
+fn macro_param(m: i64, i: i64) -> i64 {
+    unsafe { CINTS.data[MACROS[m].params + i] }
+}
+
+pub fn macro_tok(m: i64, i: i64) -> i64 {
+    unsafe { CINTS.data[MACROS[m].body + i] }
+}
+
+// The index of `sym` among the parameters of macro m, or -1.
+fn macro_param_index(m: i64, sym: i64) -> i64 {
+    unsafe {
+        if !MACROS[m].func {
+            return -1;
+        }
+        for i in 0..MACROS[m].param_count {
+            if macro_param(m, i) == sym {
+                return i;
+            }
+        }
+        -1
+    }
+}
+
+// ---- Well-known symbols ----
+
+static mut S_HASH: i64 = 0;
+static mut S_HASHHASH: i64 = 0;
+pub static mut S_LPAREN: i64 = 0;
+pub static mut S_RPAREN: i64 = 0;
+static mut S_COMMA: i64 = 0;
+static mut S_ELLIPSIS: i64 = 0;
+static mut S_VA_ARGS: i64 = 0;
+static mut S_DEFINED: i64 = 0;
+static mut S_LT: i64 = 0;
+static mut S_GT: i64 = 0;
+static mut S_PRAGMA_OP: i64 = 0;
+static mut S_HAS_INCLUDE: i64 = 0;
+static mut S_HAS_INCLUDE_NEXT: i64 = 0;
+static mut S_LINE: i64 = 0;
+static mut S_FILE: i64 = 0;
+static mut S_COUNTER: i64 = 0;
+static mut S_ONE: i64 = 0;
+static mut S_ZERO: i64 = 0;
+
+fn init_cpp_syms() {
+    unsafe {
+        S_HASH = intern_c(c"#");
+        S_HASHHASH = intern_c(c"##");
+        S_LPAREN = intern_c(c"(");
+        S_RPAREN = intern_c(c")");
+        S_COMMA = intern_c(c",");
+        S_ELLIPSIS = intern_c(c"...");
+        S_VA_ARGS = intern_c(c"__VA_ARGS__");
+        S_DEFINED = intern_c(c"defined");
+        S_LT = intern_c(c"<");
+        S_GT = intern_c(c">");
+        S_PRAGMA_OP = intern_c(c"_Pragma");
+        S_HAS_INCLUDE = intern_c(c"__has_include");
+        S_HAS_INCLUDE_NEXT = intern_c(c"__has_include_next");
+        S_LINE = intern_c(c"__LINE__");
+        S_FILE = intern_c(c"__FILE__");
+        S_COUNTER = intern_c(c"__COUNTER__");
+        S_ONE = intern_c(c"1");
+        S_ZERO = intern_c(c"0");
+    }
+}
+
+// Builtins that `#if` answers (and `defined` says are defined): every
+// feature query is answered "no", so headers take their plainest path.
+fn is_query_builtin(sym: i64) -> bool {
+    let names: [*u8; 14] = [c"__has_attribute", c"__has_cpp_attribute", c"__has_c_attribute",
+        c"__has_builtin", c"__has_feature", c"__has_extension", c"__has_warning",
+        c"__has_declspec_attribute", c"__building_module", c"__is_target_arch",
+        c"__is_target_vendor", c"__is_target_os", c"__is_target_environment", c"__has_embed"];
+    for i in 0..14 {
+        if unsafe { sym == intern_c(names[i]) } {
+            return true;
+        }
+    }
+    false
+}
+
+// ---- Initialization ----
+
+pub fn init_cpp() {
+    init_cpp_syms();
+    // Token 0: "no token"; C_EOF: the end of the input.
+    unsafe {
+        ctok_new(Eof, intern_c(c""), -1, 0, false, false);
+        C_EOF = ctok_new(Eof, intern_c(c""), -1, 0, false, true);
+    }
+    // Hide set 0 is the empty set.
+    hs_cons(-1, 0);
+}
