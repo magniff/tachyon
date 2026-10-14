@@ -318,6 +318,37 @@ $ refactor move util::COUNTER --to crate::geom --dry-run
 -// How many times `twice` ran.
 -pub static mut COUNTER: i64 = 0;
 +pub const LIMIT: i64 = 100;
+## An item imported alone (`use p::twice;`): the `use` lines get its new
+## path.
+$ refactor move util::twice --to crate::shapes --dry-run
+--- a/main.tach
++++ b/main.tach
+@@ -7 +7 @@
+-use util::twice;
++use crate::shapes::twice;
+--- a/geom.tach
++++ b/geom.tach
+@@ -3 +3 @@
+-use crate::util::twice;
++use crate::shapes::twice;
+--- a/shapes.tach
++++ b/shapes.tach
+@@ -3,0 +4 @@
++use crate::util::COUNTER;
+@@ -12,0 +14,5 @@
++}
++
++pub fn twice(x: i64) -> i64 {
++    unsafe { COUNTER += 1; }
++    x * 2
+--- a/util.tach
++++ b/util.tach
+@@ -5,5 +4,0 @@
+-
+-pub fn twice(x: i64) -> i64 {
+-    unsafe { COUNTER += 1; }
+-    x * 2
+-}
 ## Refused: the name is taken there; a method; no such module.
 $ refactor move geom::scale --to crate::shapes
 error refactor.collision: 'scale' is already a name in crate::shapes (fn crate::shapes::scale); nothing written
