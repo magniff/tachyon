@@ -1,17 +1,207 @@
 // `e?` (0.15; docs/design/errors-formatting.md): with `e: Option<T>` it
 // is the T, or returns None; with `e: Result<T, E>` the T, or returns
 // `Err(conv(err))` (convert::error_conversion), from the function or the
-// closure being checked (RETURN_TYPE). The Try node's `y` becomes a Match
-// (`std::Option::Some(__t) => __t, _ => return ...`, the `_` arm
-// ARM_SYNTHETIC), which the back ends lower.
-//
-// Phase 0: a stub.
+// closure being checked (RETURN_TYPE). The Try node's `y` becomes
+//     { let ?try = e; match ?try { std::Option::Some(?v) => ?v,
+//                                  std::Option::None => return None } }
+//     { let ?try = e; match ?try { std::Result::Ok(?v) => ?v,
+//                                  std::Result::Err(?e) => return Err(conv(?e)) } }
+// (the second arm ARM_SYNTHETIC; at -O2 the code is that of the match
+// written by hand, tests/run/try_ir), which the back ends lower. The `let`
+// binds e, checked once, by hand.
 
-use crate::front::ast::NODES;
-use crate::front::closures::unimplemented;
+use crate::base::intern_c;
+use crate::base::diag::{ERR_HELP, err_begin, err_end, err_help, err_str, err_sym};
+use crate::front::ast::{ARM_SYNTHETIC, NODES, NodeKind, list_begin, list_end, list_push, new_node};
+use crate::front::check::{
+    CUR_FN, DEFER_LOOP_BASE, RETURN_TYPE, has_error_type, pop_scope, push_scope,
+};
+use crate::front::check::check_mode::check_expr;
+use crate::front::check::synth_mode::synth_expr;
+use crate::front::closures::CLOSURE_STACK;
+use crate::front::convert::{error_conversion, std_enum_name, std_variant_pattern};
+use crate::front::patterns::check_pattern;
+use crate::front::types::{FNS, TLISTS, TY_ERROR, buf_type, err_type};
+
+// Which of Option (1) and Result (2) type t is (0: neither); its type
+// arguments in *targs.
+fn try_kind(t: i64, targs: *i64) -> i64 {
+    unsafe {
+        let name = std_enum_name(t, targs);
+        if name == 0 {
+            0
+        } else if name == intern_c(c"Option") {
+            1
+        } else if name == intern_c(c"Result") {
+            2
+        } else {
+            0
+        }
+    }
+}
+
+// The function or closure `?` returns from, for messages.
+fn err_returner() {
+    unsafe {
+        if CLOSURE_STACK.count > 0 || CUR_FN < 0 {
+            err_str(c"the closure");
+        } else {
+            err_str(c"'");
+            err_sym(FNS[CUR_FN].display);
+            err_str(c"'");
+        }
+    }
+}
 
 // The type of `e?` node n; `expected` is the type it is checked against
 // (0: synthesized).
 pub fn check_try(n: i64, expected: i64) -> i64 {
-    unsafe { unimplemented(NODES[n].end - 1, c"'?' expressions") }
+    unsafe {
+        let operand = NODES[n].a;
+        let pos = NODES[n].end - 1;
+        if DEFER_LOOP_BASE >= 0 {
+            err_begin(pos);
+            err_str(c"'?' inside a deferred statement: it cannot return from there");
+            err_help(c"match the value instead: 'match e { Some(v) => ..., None => ... }'");
+            err_end();
+        }
+        let t = synth_expr(operand);
+        if has_error_type(t) {
+            return TY_ERROR;
+        }
+        let mut targs = 0;
+        let kind = try_kind(t, &targs);
+        if kind == 0 {
+            err_begin(pos);
+            err_str(c"'?' needs an Option or a Result, got '");
+            err_type(t);
+            err_str(c"'");
+            err_end();
+        }
+        let r = RETURN_TYPE;
+        if has_error_type(r) {
+            return TY_ERROR;
+        }
+        let mut rargs = 0;
+        let rkind = try_kind(r, &rargs);
+        if rkind == 0 {
+            err_begin(pos);
+            err_str(c"'?' needs ");
+            err_returner();
+            err_str(c" to return Option or Result; it returns '");
+            err_type(r);
+            err_str(c"'");
+            err_help(c"make it return ");
+            if kind == 1 {
+                err_help(c"an Option: '-> Option<");
+                buf_type(ERR_HELP, r);
+                err_help(c">'");
+            } else {
+                err_help(c"a Result: '-> Result<");
+                buf_type(ERR_HELP, r);
+                err_help(c", ");
+                buf_type(ERR_HELP, TLISTS.data[targs + 1]);
+                err_help(c">'");
+            }
+            err_end();
+        }
+        if kind == 1 && rkind == 2 {
+            err_begin(pos);
+            err_str(c"'?' on an Option in ");
+            err_returner();
+            err_str(c", which returns '");
+            err_type(r);
+            err_str(c"': a None has no error to return");
+            err_help(c"make the None an error: 'e.ok_or(");
+            buf_type(ERR_HELP, TLISTS.data[rargs + 1]);
+            err_help(c"::...)?'");
+            err_end();
+        }
+        if kind == 2 && rkind == 1 {
+            err_begin(pos);
+            err_str(c"'?' on a Result in ");
+            err_returner();
+            err_str(c", which returns '");
+            err_type(r);
+            err_str(c"': the error would be lost");
+            err_help(c"drop it explicitly: 'e.ok()?', or return a Result");
+            err_end();
+        }
+        let start = NODES[n].start;
+        let end = NODES[n].end;
+        // let ?try = e;
+        let try_sym = intern_c(c"?try");
+        let bind = new_node(NodeKind::PatBind, start, end);
+        NODES[bind].a = try_sym;
+        let let_stmt = new_node(NodeKind::Let, start, end);
+        NODES[let_stmt].a = bind;
+        NODES[let_stmt].c = operand;
+        // Some(?v) => ?v  /  Ok(?v) => ?v
+        let v = intern_c(c"?v");
+        let vbind = new_node(NodeKind::PatBind, start, end);
+        NODES[vbind].a = v;
+        let value_arm = new_node(NodeKind::Arm, start, end);
+        NODES[value_arm].a = std_variant_pattern(if kind == 1 { c"Option" } else { c"Result" },
+            if kind == 1 { c"Some" } else { c"Ok" }, vbind, start, end);
+        NODES[value_arm].c = ident(v, start, end);
+        // _ => return None  /  Err(?e) => return Err(conv(?e))
+        let ret = new_node(NodeKind::Return, start, end);
+        let other_arm = new_node(NodeKind::Arm, start, end);
+        NODES[other_arm].p = ARM_SYNTHETIC;
+        NODES[other_arm].c = ret;
+        if kind == 1 {
+            NODES[other_arm].a = std_variant_pattern(c"Option", c"None", 0, start, end);
+            NODES[ret].a = variant_path(r, c"None", start, end);
+        } else {
+            let e = intern_c(c"?e");
+            let ebind = new_node(NodeKind::PatBind, start, end);
+            NODES[ebind].a = e;
+            NODES[other_arm].a = std_variant_pattern(c"Result", c"Err", ebind, start, end);
+            let conv = error_conversion(ident(e, start, end), TLISTS.data[targs + 1],
+                TLISTS.data[rargs + 1], pos);
+            let call = new_node(NodeKind::Call, start, end);
+            NODES[call].a = variant_path(r, c"Err", start, end);
+            let cmark = list_begin();
+            list_push(conv);
+            list_end(call, cmark);
+            NODES[ret].a = call;
+        }
+        let m = new_node(NodeKind::Match, start, end);
+        NODES[m].a = ident(try_sym, start, end);
+        let amark = list_begin();
+        list_push(value_arm);
+        list_push(other_arm);
+        list_end(m, amark);
+        let block = new_node(NodeKind::Block, start, end);
+        let bmark = list_begin();
+        list_push(let_stmt);
+        list_end(block, bmark);
+        NODES[block].a = m;
+        NODES[n].y = block;
+        // The `let` by hand (e is checked), then the match.
+        push_scope();
+        check_pattern(bind, t);
+        let ty = if expected != 0 { check_expr(m, expected) } else { synth_expr(m) };
+        pop_scope();
+        NODES[block].ty = NODES[m].ty;
+        ty
+    }
+}
+
+fn ident(sym: i64, start: i64, end: i64) -> i64 {
+    unsafe {
+        let id = new_node(NodeKind::Ident, start, end);
+        NODES[id].a = sym;
+        id
+    }
+}
+
+// `T::variant` (T the enum type t): a Path the checker resolves to t.
+fn variant_path(t: i64, variant: *u8, start: i64, end: i64) -> i64 {
+    unsafe {
+        let p = new_node(NodeKind::Path, start, end);
+        NODES[p].b = intern_c(variant);
+        NODES[p].y = t;
+        p
+    }
 }
