@@ -1,0 +1,258 @@
+// Bank ledger: commands on named accounts, errors per line, sorted reports.
+import "stdio.h" as c;
+use std::{Buf, HashMap, sort};
+
+struct Account {
+    name: [u8],
+    balance: i64,
+    txns: i64,
+}
+
+impl Ord for Account {
+    fn cmp(self: *Account, other: *Account) -> i64 {
+        self.name.cmp(&other.name)
+    }
+}
+
+enum Command {
+    Open([u8]),
+    Deposit([u8], i64),
+    Withdraw([u8], i64),
+    Transfer([u8], [u8], i64),
+    Close([u8]),
+    Balance([u8]),
+    Report,
+    Blank,
+    Bad([u8]),
+}
+
+fn valid_name(s: [u8]) -> bool {
+    if s.len == 0 || s.len > 16 {
+        return false;
+    }
+    for ch in s {
+        let ok = (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_';
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
+// The amount, or 0 when it is not valid.
+fn parse_amount(s: [u8]) -> i64 {
+    if s.len == 0 || s.len > 12 {
+        return 0;
+    }
+    let mut n = 0;
+    for ch in s {
+        if ch < '0' || ch > '9' {
+            return 0;
+        }
+        n = n * 10 + (ch - '0') as i64;
+    }
+    n
+}
+
+fn split_tokens(line: [u8]) -> Vec<[u8]> {
+    let mut tokens: Vec<[u8]> = Vec::new();
+    let mut i = 0;
+    while i < line.len {
+        if line[i] == ' ' {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < line.len && line[i] != ' ' {
+            i += 1;
+        }
+        tokens.push(line[start..i]);
+    }
+    tokens
+}
+
+fn parse_command(line: [u8]) -> Command {
+    let mut tokens = split_tokens(line);
+    defer tokens.free();
+    let t = tokens.as_slice();
+    if t.len == 0 {
+        return Command::Blank;
+    }
+    let (args, names, amount) = if t[0] == "open" || t[0] == "close" || t[0] == "balance" {
+        (1, 1, false)
+    } else if t[0] == "deposit" || t[0] == "withdraw" {
+        (2, 1, true)
+    } else if t[0] == "transfer" {
+        (3, 2, true)
+    } else if t[0] == "report" {
+        (0, 0, false)
+    } else {
+        return Command::Bad("error: bad command");
+    };
+    if t.len != args + 1 {
+        return Command::Bad("error: bad command");
+    }
+    for k in 1..names + 1 {
+        if !valid_name(t[k]) {
+            return Command::Bad("error: bad name");
+        }
+    }
+    let mut amt = 0;
+    if amount {
+        amt = parse_amount(t[args]);
+        if amt == 0 {
+            return Command::Bad("error: bad amount");
+        }
+    }
+    if t[0] == "open" {
+        Command::Open(t[1])
+    } else if t[0] == "close" {
+        Command::Close(t[1])
+    } else if t[0] == "balance" {
+        Command::Balance(t[1])
+    } else if t[0] == "deposit" {
+        Command::Deposit(t[1], amt)
+    } else if t[0] == "withdraw" {
+        Command::Withdraw(t[1], amt)
+    } else if t[0] == "transfer" {
+        Command::Transfer(t[1], t[2], amt)
+    } else {
+        Command::Report
+    }
+}
+
+fn push_account(out: *Buf, a: Account) {
+    out.push_str(a.name);
+    out.push(' ');
+    out.push_int(a.balance);
+    out.push(' ');
+    out.push_int(a.txns);
+    out.push('\n');
+}
+
+fn report(accounts: *HashMap<[u8], Account>, out: *Buf) {
+    let mut list: Vec<Account> = Vec::new();
+    defer list.free();
+    let mut total = 0;
+    for i in 0..accounts.slots() {
+        if let Some(a) = accounts.value_at(i) {
+            list.push(a);
+            total += a.balance;
+        }
+    }
+    sort(list.as_slice());
+    out.push_str("accounts: ");
+    out.push_int(list.len());
+    out.push_str(", total: ");
+    out.push_int(total);
+    out.push('\n');
+    for a in list.as_slice() {
+        push_account(out, a);
+    }
+}
+
+fn execute(cmd: Command, accounts: *HashMap<[u8], Account>, out: *Buf) -> Result<(), [u8]> {
+    match cmd {
+        Command::Blank => {}
+        Command::Bad(msg) => return Err(msg),
+        Command::Report => report(accounts, out),
+        Command::Open(name) => {
+            if accounts.contains(name) {
+                return Err("error: account exists");
+            }
+            accounts.insert(name, Account { name: name, balance: 0, txns: 0 });
+        }
+        Command::Balance(name) => match accounts.get(name) {
+            Some(a) => push_account(out, a),
+            None => return Err("error: no such account"),
+        },
+        Command::Close(name) => {
+            let a = match accounts.get(name) {
+                Some(a) => a,
+                None => return Err("error: no such account"),
+            };
+            if a.balance != 0 {
+                return Err("error: balance not zero");
+            }
+            accounts.remove(name);
+        }
+        Command::Deposit(name, amt) => {
+            let mut a = match accounts.get(name) {
+                Some(a) => a,
+                None => return Err("error: no such account"),
+            };
+            a.balance += amt;
+            a.txns += 1;
+            accounts.insert(name, a);
+        }
+        Command::Withdraw(name, amt) => {
+            let mut a = match accounts.get(name) {
+                Some(a) => a,
+                None => return Err("error: no such account"),
+            };
+            if a.balance < amt {
+                return Err("error: insufficient funds");
+            }
+            a.balance -= amt;
+            a.txns += 1;
+            accounts.insert(name, a);
+        }
+        Command::Transfer(from, to, amt) => {
+            let mut src = match accounts.get(from) {
+                Some(a) => a,
+                None => return Err("error: no such account"),
+            };
+            let mut dst = match accounts.get(to) {
+                Some(a) => a,
+                None => return Err("error: no such account"),
+            };
+            if from == to {
+                return Err("error: same account");
+            }
+            if src.balance < amt {
+                return Err("error: insufficient funds");
+            }
+            src.balance -= amt;
+            src.txns += 1;
+            dst.balance += amt;
+            dst.txns += 1;
+            accounts.insert(from, src);
+            accounts.insert(to, dst);
+        }
+    }
+    Ok(())
+}
+
+fn read_all() -> Buf {
+    let mut b = Buf::new();
+    loop {
+        let ch = unsafe { c::getchar() };
+        if ch < 0 {
+            break;
+        }
+        b.push(ch as u8);
+    }
+    b
+}
+
+fn main() -> i32 {
+    let mut buf = read_all();
+    defer buf.free();
+    let input = buf.as_slice();
+    let mut accounts: HashMap<[u8], Account> = HashMap::new();
+    defer accounts.free();
+    let mut out = Buf::new();
+    defer out.free();
+    let mut start = 0;
+    for i in 0..input.len + 1 {
+        if i == input.len || input[i] == '\n' {
+            if let Err(msg) = execute(parse_command(input[start..i]), &accounts, &out) {
+                out.push_str(msg);
+                out.push('\n');
+            }
+            start = i + 1;
+        }
+    }
+    print(out.as_slice());
+    0
+}
