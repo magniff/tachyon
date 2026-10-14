@@ -148,9 +148,10 @@ big=$(printf '%s\n' "$out" | awk -F "$TAB" '/^group / && $2 > 60 && $4 != "over"
     && printf '%s\n' "$out" | grep -q "^groups${TAB}[0-9]*${TAB}at most 60 lines${TAB}[0-9]* references between them\$" && ok=1
 check self_deps "$ok" "$(printf '%s\n' "$out" | head -3; printf '%s\n' "$out" | grep '^groups')"
 # unused: something, by file, and every listed definition really has no
-# reference.
+# reference; or (0.12, after the clean-up) nothing.
 out=$("$COMPILER" query unused --all 2>&1)
 ok=0
+[ "$out" = "note query.empty: nothing unused" ] && ok=1
 n=$(printf '%s\n' "$out" | grep -c "${TAB}compiler/src/[a-z_0-9/]*\.tach:[0-9]*:[0-9]*${TAB}")
 first=$(printf '%s\n' "$out" | grep "${TAB}fn\$" | head -1 | cut -f1)
 [ "$n" -ge 1 ] && [ -n "$first" ] && [ "$("$COMPILER" query refs --count "$first" 2>/dev/null)" = 1 ] \

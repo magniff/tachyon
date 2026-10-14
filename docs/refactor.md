@@ -137,7 +137,9 @@ try: tachyonc edit patch clamp --old 'return lo;' --new 'return 0 + lo;'
 try: tachyonc edit patch clamp --old 'return hi;' --new 'return 0 + hi;'
 ```
 
-- A match of whole lines replaced by an empty NEW removes the lines.
+- A match of whole lines replaced by an empty NEW removes the lines (and
+  a blank line after them when one is before them, so that no two are
+  left together: 0.12).
 - `--loose`: a run of blanks (spaces, tabs, newlines) in OLD matches any
   run of blanks, and OLD's first and last blanks are ignored; NEW is
   indented like the text it replaces (its first line where OLD's
