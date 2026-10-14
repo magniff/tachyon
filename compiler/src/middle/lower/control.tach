@@ -1,0 +1,193 @@
+// Lowering control flow: `if`, `loop`, `while` and `for`, `break` and
+// `continue`, and the joins that carry the value of an expression with
+// several exits (if, match, loop) to where they meet.
+
+use crate::base::IntVec;
+use crate::front::ast::{NODES, defer_loop_depth, defer_loop_enter, defer_loop_leave};
+use crate::front::ast::NodeKind::{Loop, While};
+use crate::front::types::{TY_NEVER, is_compound, is_void, type_size};
+use crate::middle::ir::{
+    CUR, Cond, Op, ir_binary, ir_cmp, ir_const, ir_new_block, ir_slot_addr, ir_type,
+};
+use crate::middle::lower::{
+    bind_pattern_ir, keep_value, lower_block, lower_branch, lower_copy, lower_defers, lower_jump,
+    new_slot_for, start_dead_block,
+};
+use crate::middle::lower::expr::{lower_expr, lower_operand, need_value};
+use crate::middle::lower::ssa::{ir_seal, new_synth_var, ssa_read, ssa_write};
+
+// The value of an expression with several exits (if, match, loop): an SSA
+// variable, or for a compound value of up to 128 bytes the address of a
+// frame slot every exit copies its value into (which scalar replacement
+// sees through), as JOIN_SLOT + the address.
+const JOIN_SLOT: i64 = 1 << 40;
+
+pub fn join_new(ty: i64) -> i64 {
+    if is_compound(ty) && type_size(ty) <= 128 {
+        return JOIN_SLOT + ir_slot_addr(new_slot_for(ty));
+    }
+    new_synth_var(ir_type(ty))
+}
+
+pub fn join_write(join: i64, value: i64, ty: i64) {
+    if join >= JOIN_SLOT {
+        lower_copy(join - JOIN_SLOT, need_value(value, ty), type_size(ty));
+    } else {
+        ssa_write(join, CUR, need_value(value, ty));
+    }
+}
+
+pub fn join_read(join: i64, b: i64) -> i64 {
+    if join >= JOIN_SLOT { join - JOIN_SLOT } else { ssa_read(join, b) }
+}
+
+pub fn lower_if(n: i64) -> i64 {
+    unsafe {
+        let ty = NODES[n].ty;
+        let has_value = !is_void(ty);
+        let mut result = 0;
+        if has_value {
+            result = join_new(ty);
+        }
+        let cond = lower_operand(NODES[n].a);
+        let then_block = ir_new_block();
+        let mut else_block = 0;
+        if NODES[n].c != 0 {
+            else_block = ir_new_block();
+        }
+        let join = ir_new_block();
+        lower_branch(cond, then_block, if else_block != 0 { else_block } else { join });
+        ir_seal(then_block);
+        CUR = then_block;
+        lower_branch_body(NODES[n].b, result, has_value, join);
+        if else_block != 0 {
+            ir_seal(else_block);
+            CUR = else_block;
+            lower_branch_body(NODES[n].c, result, has_value, join);
+        }
+        ir_seal(join);
+        CUR = join;
+        if has_value {
+            return join_read(result, join);
+        }
+        0
+    }
+}
+
+fn lower_branch_body(block: i64, result: i64, has_value: bool, join: i64) {
+    unsafe {
+        let value = lower_block(block);
+        if has_value && NODES[block].ty != TY_NEVER {
+            join_write(result, value, NODES[block].ty);
+        }
+        lower_jump(join);
+    }
+}
+
+// Per loop (NODES[loop].z): continue block, exit block, break variable.
+pub static mut LOOP_INFO: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+fn new_loop_info(n: i64, continue_block: i64, exit: i64, break_var: i64) {
+    unsafe { NODES[n].z = LOOP_INFO.count; }
+    LOOP_INFO.push(continue_block);
+    LOOP_INFO.push(exit);
+    LOOP_INFO.push(break_var);
+}
+
+// `loop` and `while`.
+pub fn lower_loop(n: i64) -> i64 {
+    unsafe {
+        let header = ir_new_block();
+        let exit = ir_new_block();
+        let mut break_var = -1;
+        if NODES[n].kind == Loop && NODES[n].x != 0 && !is_void(NODES[n].y) {
+            break_var = join_new(NODES[n].y);
+        }
+        new_loop_info(n, header, exit, break_var);
+        lower_jump(header);
+        CUR = header;
+        if NODES[n].kind == While {
+            let cond = lower_operand(NODES[n].b);
+            let body = ir_new_block();
+            lower_branch(cond, body, exit);
+            ir_seal(body);
+            CUR = body;
+            defer_loop_enter(n);
+            lower_block(NODES[n].c);
+        } else {
+            defer_loop_enter(n);
+            lower_block(NODES[n].b);
+        }
+        defer_loop_leave();
+        lower_jump(header);
+        ir_seal(header);
+        ir_seal(exit);
+        CUR = exit;
+        if break_var >= 0 {
+            return join_read(break_var, exit);
+        }
+        0
+    }
+}
+
+pub fn lower_break(n: i64) {
+    unsafe {
+        let info = NODES[NODES[n].x].z;
+        let value = NODES[n].b;
+        let break_var = LOOP_INFO.data[info + 2];
+        let depth = defer_loop_depth(NODES[n].x);
+        if value != 0 {
+            let v = keep_value(lower_expr(value), NODES[value].ty, depth);
+            if break_var >= 0 && NODES[value].ty != TY_NEVER {
+                join_write(break_var, v, NODES[value].ty);
+            }
+        }
+        lower_defers(depth);
+        lower_jump(LOOP_INFO.data[info + 1]);
+        start_dead_block();
+    }
+}
+
+// `for i in a..b`: the bounds are evaluated once; the loop variable is a
+// copy of the counter.
+pub fn lower_for(n: i64) {
+    unsafe {
+        let range = NODES[n].c;
+        let ty = NODES[range].ty;
+        let inclusive = NODES[range].c != 0;
+        let counter = new_synth_var(ty);
+        let start = lower_operand(NODES[range].a);
+        let end = lower_operand(NODES[range].b);
+        ssa_write(counter, CUR, start);
+        let test = ir_new_block();
+        let next = ir_new_block();
+        let exit = ir_new_block();
+        new_loop_info(n, next, exit, -1);
+        lower_jump(test);
+        CUR = test;
+        let value = ssa_read(counter, test);
+        let body = ir_new_block();
+        lower_branch(ir_cmp(if inclusive { Cond::Gt } else { Cond::Ge }, ty, value, end), exit, body);
+        ir_seal(body);
+        CUR = body;
+        bind_pattern_ir(NODES[n].b, ssa_read(counter, body), false);
+        defer_loop_enter(n);
+        lower_block(NODES[n].d);
+        defer_loop_leave();
+        lower_jump(next);
+        ir_seal(next);
+        CUR = next;
+        let current = ssa_read(counter, next);
+        if inclusive {
+            let step = ir_new_block();
+            lower_branch(ir_cmp(Cond::Eq, ty, current, end), exit, step);
+            ir_seal(step);
+            CUR = step;
+        }
+        ssa_write(counter, CUR, ir_binary(Op::Add, ty, current, ir_const(1, ty)));
+        lower_jump(test);
+        ir_seal(test);
+        ir_seal(exit);
+        CUR = exit;
+    }
+}
