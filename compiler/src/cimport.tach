@@ -31,7 +31,9 @@ use crate::cpp::{
 use crate::ast::{NODES, NodeKind, child, list_begin, list_end, list_push};
 use crate::modules::module_of;
 use crate::types::align_to;
-use crate::target::{T_AARCH64_MACOS, T_X86_64_LINUX, T_X86_64_MACOS, target_name};
+use crate::target::{
+    T_AARCH64_LINUX, T_AARCH64_MACOS, T_X86_64_MACOS, target_is_linux, target_name,
+};
 use crate::lower::HMap;
 use crate::{IMPORTED_START, host_target, streq};
 use CT::{Array, Bad, Bool, Enum, Float, Func, Int, Named, Ptr, Record, Void};
@@ -607,12 +609,28 @@ fn d_specifiers() -> (i64, i64) {
 static mut C_LONG_DOUBLE_64: bool = false;
 static mut C_VA_LIST: i64 = 0;
 static mut C_TARGET_X86: bool = false;
+static mut C_TARGET_A64_LINUX: bool = false;
 
 // __builtin_va_list: `char *` on Apple's arm64, an array of one
-// struct __va_list_tag on x86-64.
+// struct __va_list_tag on x86-64, struct __va_list on AArch64 Linux.
 fn c_va_list() -> i64 {
     unsafe {
         if C_VA_LIST != 0 {
+            return C_VA_LIST;
+        }
+        if C_TARGET_A64_LINUX {
+            let r = crec_new(intern_c(c"__va_list"), false);
+            TAG_OF.put(CRECS[r].tag + 1, r * 4 + 1);
+            let names: [*u8; 5] = [c"__stack", c"__gr_top", c"__vr_top", c"__gr_offs", c"__vr_offs"];
+            let start = CINTS.count;
+            for i in 0..5 {
+                let ty = if i < 3 { cty_ptr(CTY_VOID) } else { cty_int(32, true) };
+                CINTS.push(cfield_new(intern_c(names[i]), ty, -1, 0));
+            }
+            CRECS[r].fields = start;
+            CRECS[r].field_count = 5;
+            CRECS[r].complete = 1;
+            C_VA_LIST = CRECS[r].ty;
             return C_VA_LIST;
         }
         if !C_TARGET_X86 {
@@ -1879,7 +1897,7 @@ fn emit_record(r: i64) {
     unsafe {
         crec_layout(r);
         // The C spelling, when there is one.
-        if CRECS[r].tag >= 0 && CRECS[r].tag != intern_c(c"__va_list_tag") {
+        if CRECS[r].tag >= 0 && CRECS[r].tag != intern_c(c"__va_list_tag") && CRECS[r].tag != intern_c(c"__va_list") {
             out(if CRECS[r].is_union != 0 { c"// C: union " } else { c"// C: struct " });
             buf_bytes(OUTB, SYMS[CRECS[r].tag].text);
             out(c"\n");
@@ -2399,11 +2417,12 @@ pub fn c_import(names: *IntVec, dirs: *IntVec, include_dirs: *IntVec, target: i6
     unsafe {
         init_cpp();
         init_cimport();
-        C_TARGET_X86 = target != T_AARCH64_MACOS;
-        C_TARGET_ELF = target == T_X86_64_LINUX;
+        C_TARGET_X86 = target != T_AARCH64_MACOS && target != T_AARCH64_LINUX;
+        C_TARGET_A64_LINUX = target == T_AARCH64_LINUX;
+        C_TARGET_ELF = target_is_linux(target);
         let host = host_target();
-        let host_linux = host == T_X86_64_LINUX;
-        let target_linux = target == T_X86_64_LINUX;
+        let host_linux = target_is_linux(host);
+        let target_linux = target_is_linux(target);
         if (host == 0 || host_linux != target_linux || (target_linux && host != target)) && !c_compiler_given() {
             // (0.9) Cross-compiling: the target's headers and predefined
             // macros come from a C compiler for it, named by $TACHYON_CC.

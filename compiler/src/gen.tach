@@ -13,10 +13,15 @@
 // label (z + 2 the condition of a `for`).
 
 use crate::base::{
-    BUFS, ERR_KIND, IntVec, SYMS, buf_byte, buf_bytes, buf_clear, buf_int, buf_new, buf_slice,
+    BUFS, ERR_KIND, FILES, IntVec, SYMS, buf_byte, buf_bytes, buf_clear, buf_int, buf_new, buf_slice,
     buf_str, buf_write_file, exit, flush_warnings, intern_c,
 };
 use crate::objfile::write_output;
+use crate::dwarf::{
+    DEBUG_INFO, dbg_function_begin, dbg_function_end, dbg_loc, dbg_place_locs, dbg_sections,
+    dbg_text_end,
+};
+use crate::version;
 use crate::lexer::{STRS, STR_COUNT, Tok};
 use crate::cimport::drop_shadowed_imports;
 use crate::cheader::emit_c_header;
@@ -252,9 +257,18 @@ pub fn compile_program(output: *u8) {
         timer_add(T_CODEGEN, t);
         t = timer_now();
         emit_runtime();
+        dbg_text_end();
         gen_data();
         buf_bytes(ASM, buf_slice(DATA));
+        if DEBUG_INFO {
+            let producer = buf_new();
+            buf_str(producer, c"tachyonc ");
+            buf_str(producer, version());
+            buf_byte(producer, 0);
+            dbg_sections(FILES[0].path, BUFS[producer].data);
+        }
         emit_file_trailer();
+        dbg_place_locs();
         write_output(output);
         timer_add(T_OUTPUT, t);
         timer_report();
@@ -344,6 +358,8 @@ fn gen_function(item: i64) {
         FRAME_SIZE = 0;
         OVERALIGNED.count = 0;
         RETURN_LABEL = new_label();
+        STMT_POS = -1;
+        dbg_function_begin(f, fn_symbol_prefix(f), NODES[item].start);
         emit_function_start(fn_symbol_prefix(f), FNS[f].name, fn_is_global(f));
         let ret = FNS[f].ret;
         RESULT_SLOT = 0;
@@ -366,7 +382,17 @@ fn gen_function(item: i64) {
         emit_epilogue();
         emit_frame_reserve(FRAME_SIZE);
         buf_bytes(ASM, buf_slice(CODE));
+        dbg_function_end();
     }
+}
+
+// (-g) The position of the statement being generated (-1: none).
+static mut STMT_POS: i64 = -1;
+
+// (-g) Starts the code of the statement at `pos`.
+fn stmt_loc(pos: i64) {
+    STMT_POS = pos;
+    dbg_loc(CODE, pos);
 }
 
 // Stores the incoming parameters in their frame slots, in order (so a
@@ -492,8 +518,13 @@ fn gen_return_value(ret: i64) {
 fn gen_block(block: i64) {
     unsafe {
         let mark = DEFERS.count;
+        // (-g) After the block, the code is the enclosing statement's again.
+        let outer = STMT_POS;
         for i in 0..NODES[block].count {
             let stmt = child(block, i);
+            if DEBUG_INFO {
+                stmt_loc(NODES[stmt].start);
+            }
             if NODES[stmt].kind == Let {
                 gen_expr(NODES[stmt].c);
                 bind(NODES[stmt].a);
@@ -505,12 +536,19 @@ fn gen_block(block: i64) {
         }
         let tail = NODES[block].a;
         if tail != 0 {
+            if DEBUG_INFO {
+                stmt_loc(NODES[tail].start);
+            }
             gen_expr(tail);
         }
         if DEFERS.count > mark {
             gen_defers(mark, if tail != 0 { NODES[tail].ty } else { TY_UNIT });
             DEFERS.count = mark;
         }
+        if DEBUG_INFO && outer >= 0 {
+            stmt_loc(outer);
+        }
+        STMT_POS = outer;
     }
 }
 

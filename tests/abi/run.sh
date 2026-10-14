@@ -8,7 +8,7 @@
 #                         [-k DIR] [-j JOBS] [-i | -H]
 #
 #   -c COMPILER   the tachyonc to test (default: target/tachyonc)
-#   -t TARGET     aarch64-macos, x86_64-linux or x86_64-macos (default:
+#   -t TARGET     aarch64-macos, aarch64-linux, x86_64-linux or x86_64-macos (default:
 #                 the host)
 #   -n COUNT      number of programs (default 150; each has 5 to 11
 #                 signatures)
@@ -56,6 +56,7 @@ if [ -z "$TARGET" ]; then
         Darwin-arm64) TARGET=aarch64-macos ;;
         Darwin-x86_64) TARGET=x86_64-macos ;;
         Linux-x86_64) TARGET=x86_64-linux ;;
+        Linux-aarch64) TARGET=aarch64-linux ;;
         *) echo "abi: unknown host" >&2; exit 2 ;;
     esac
 fi

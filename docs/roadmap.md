@@ -480,6 +480,30 @@ The last release of the build-out.
   cost model for the loop vectorizer (from 0.10)
 - multi-error diagnostics: done (0.5, completed in 0.10)
 
+0.11 A status (DWARF line tables, aarch64-linux):
+
+- aarch64-linux target: done (AAPCS64 in abi.tach and both back ends, ELF
+  objects with R_AARCH64_* relocations and mapping symbols, `import`);
+  tests, fuzz, ABI (three modes) and objcheck pass in a linux/arm64
+  container
+- aarch64-linux host: done (cross-built by `bootstrap.sh --host
+  aarch64-linux`, finished natively by `bootstrap/aarch64-linux-check.sh`)
+- DWARF line tables (`-g`): done (`.file`/`.loc` from statement
+  positions carried through the IR at every level; .debug_info with a
+  compile unit and its subprograms; the line program written by the object
+  writer for Mach-O and ELF; dsymutil after linking on macOS; CFI as compact
+  unwind on Mach-O, for lldb at -O0); objcheck compares the decoded line
+  tables with `cc -c`'s on every target, tests/debug.sh runs lldb and gdb
+  (breakpoints in two files, a crash's backtrace with file:line at -O0 and
+  -O2); the output without `-g` is unchanged
+- gate: bootstrap --dev and the suite at -O0/1/2 on aarch64-macos;
+  linux-check (x86_64-linux: chain, all levels, fuzz, ABI, objcheck);
+  aarch64-linux-check (fixpoint, all levels, fuzz in every mode, ABI,
+  objcheck, gdb); compile time without -g as 0.10's. Not run: the suite
+  on x86_64-macos (Rosetta stopped running new programs on the test
+  machine after lldb attached to one; needs a reboot), gdb on x86_64-linux
+  (no ptrace under Rosetta for Linux)
+
 ## 0.11 (continued): tools for agents
 
 `tachyonc query` (def, show, refs, callers, items; fully qualified paths
