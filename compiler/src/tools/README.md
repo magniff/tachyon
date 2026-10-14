@@ -24,6 +24,7 @@ the edited program checked before anything is written, a journal for
 | `refactor_shape/` | `refactor signature`, `field`, `variant` |
 | `refactor_mod/` | `refactor rename`, `new-module`, `move-module`; the command line (`cli`); renaming a local (`local`, 0.14); the mentions in comments (`mentions`, 0.14) |
 | `refactor_move/` | `refactor move`, `split`: units and blocks (`units`), imports (`imports`) |
+| `conflicts/` | `query conflicts`, `edit resolve` (0.15): merge conflict regions read as text, their items; a region resolved by a side or a text (`resolve`) |
 | `script.tach` | `refactor --script`: commands checked once, one undo |
 | `batch.tach` | `tachyonc batch` (0.15): several commands in one call, each in a fork, outputs under header lines |
 | `commands.tach` | the table of the commands that change a program; `run_command`, every tool command (main, batch) |

@@ -197,6 +197,11 @@ range. Lines past the end: `error query.no-match` with the file's
 length and `try:` its last lines; a file that cannot be read: `error
 query.no-file`.
 
+`query conflicts [FILE|DIR|FILE:LINE...] [--show]` (0.15) lists the
+merge conflict regions of files read as text, one line each, with their
+items; `--show` prints both sides. `edit resolve` resolves them
+([refactor.md](refactor.md), "Merge conflicts").
+
 `query diff [ROOT]`: the last edit of the journal (what `undo` would take
 back, [refactor.md](refactor.md)): `# SUMMARY`, then its diff with no
 context lines. Nothing changes. In a git checkout the journal is in its

@@ -639,6 +639,64 @@ edit engine lays out the lines every edit writes the same way, and
 `tachyonc explain CODE` says what any code of this page means. See
 [fmt.md](fmt.md).
 
+## Merge conflicts: query conflicts, edit resolve (0.15)
+
+A merge leaves git's conflict markers in a file, and the file does not
+parse until they are gone, so neither `query` nor `edit` can read the
+program. These two read the files as text:
+
+```
+tachyonc query conflicts [FILE|DIR|FILE:LINE...] [--show]
+tachyonc edit resolve FILE:LINE|FILE|NAME --ours|--theirs|--both|--base [--all] [--in FILE]
+tachyonc edit resolve TARGET < TEXT
+```
+
+`query conflicts` prints one line per region (`<<<<<<<` to `>>>>>>>`;
+diff3's `|||||||` base side too): its lines, its items, and each side's
+size and label. Without a FILE it reads the `.tach` files with markers
+under the root's directory. The items are found from the text: the items
+whose header lines the region has (`fn f`, `struct S`, `use` lines; a
+method as `T::m`), else the item around it, `-` when none. `--show`
+prints each side's lines.
+
+```
+$ tachyonc query conflicts
+main.tach:4-8→use→ours 1 line (HEAD)→theirs 1 line (feature)
+shapes.tach:10-17→Shape::grow→ours 1 line (HEAD)→base 1 line (base)→theirs 2 lines (feature)
+shapes.tach:22-27→area→ours 1 line (HEAD)→theirs 2 lines (feature)
+$ tachyonc query conflicts shapes.tach:12 --show
+// shapes.tach:10-17→Shape::grow
+// ours (HEAD), line 11:
+        (*self).w += by;
+// base (base), line 13:
+        (*self).w = (*self).w + 1;
+// theirs (feature), lines 15-16:
+        (*self).w += by;
+        (*self).h += by;
+```
+
+`edit resolve` replaces a region by our side, theirs, both (ours then
+theirs; a blank line between two top-level items), the base, or TEXT
+from stdin. TARGET is a line of the region (`FILE:LINE`, a marker's
+line too), a FILE with one region, or an item's NAME (`area`,
+`Shape::grow`; `--in FILE` to look in one file). When several regions
+match: `error conflict.ambiguous` with a `try:` line for each, or
+`--all` resolves every one the same way. The file is written whole (a
+copy renamed onto it) and journaled: `undo` takes it back. `--dry-run`
+prints the diff, `--show` the new lines.
+
+```
+$ tachyonc edit resolve area --theirs
+resolved shapes.tach:22-27 (theirs)→shapes.tach→+0 -4 lines
+note conflict.left: 2 conflict regions left in 2 files
+try: tachyonc query conflicts
+```
+
+While regions are left, `note conflict.left` counts them. The resolve
+of the last one checks the program, and prints its errors with `warning
+conflict.check` (the resolve is written: the sides chosen may not fit
+together, as both sides' `use` lines importing a name twice).
+
 ## Diagnostics
 
 | code | severity | exit | when | try |
