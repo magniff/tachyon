@@ -324,6 +324,108 @@ else
     result FAIL guide-std "query items std failed:" "$(cat "$WORK/std/items")"
 fi
 
+# The guide by piece (0.15): --find prints the paragraphs about the
+# words under `# TOPIC#SECTION`, within its budget; TOPIC#SECTION one
+# section; TOPIC# the sections; --budget cuts any of it, with a note.
+"$COMPILER" guide --find read a line >"$WORK/find.out" 2>"$WORK/find.err"
+rc=$?
+if [ $rc -eq 0 ] && head -1 "$WORK/find.out" | grep -q '^# std#input$' \
+    && grep -q 'read_line(&buf)' "$WORK/find.out" \
+    && [ "$(wc -c <"$WORK/find.out" | tr -d ' ')" -le 4000 ]; then
+    result pass guide-find
+else
+    result FAIL guide-find "exit $rc:" "$(head -3 "$WORK/find.out")" "$(cat "$WORK/find.err")"
+fi
+"$COMPILER" guide --find xyzzy frobnicate >"$WORK/nofind.out" 2>&1
+rc=$?
+if [ $rc -eq 1 ] && grep -q '^error guide.no-match: ' "$WORK/nofind.out"; then
+    result pass guide-find-none
+else
+    result FAIL guide-find-none "exit $rc:" "$(cat "$WORK/nofind.out")"
+fi
+"$COMPILER" guide 'tools#' >"$WORK/secs.out" 2>&1
+"$COMPILER" guide 'tools#the-loop' >"$WORK/sec.out" 2>&1
+rc=$?
+if [ $rc -eq 0 ] && grep -q '^tools#the-loop$' "$WORK/secs.out" && head -1 "$WORK/sec.out" | grep -q '^## The loop$' \
+    && ! grep -q '^## The program' "$WORK/sec.out"; then
+    result pass guide-section
+else
+    result FAIL guide-section "exit $rc:" "$(head -3 "$WORK/sec.out")" "$(head -3 "$WORK/secs.out")"
+fi
+"$COMPILER" guide 'tools#nothing-like-it' >"$WORK/nosec.out" 2>&1
+rc=$?
+if [ $rc -eq 1 ] && grep -q '^error guide.no-section: ' "$WORK/nosec.out" \
+    && grep -q '^try: .* guide tools#the-loop$' "$WORK/nosec.out"; then
+    result pass guide-no-section
+else
+    result FAIL guide-no-section "exit $rc:" "$(cat "$WORK/nosec.out")"
+fi
+"$COMPILER" guide core --budget 300 >"$WORK/cut.out" 2>"$WORK/cut.err"
+if [ "$(wc -c <"$WORK/cut.out" | tr -d ' ')" -le 1200 ] && grep -q '^note guide.budget: ' "$WORK/cut.err" \
+    && grep -q '^try: .* guide core --budget [0-9]*$' "$WORK/cut.err"; then
+    result pass guide-budget-cut
+else
+    result FAIL guide-budget-cut "$(cat "$WORK/cut.err")"
+fi
+
+# explain WORDS that are no code: the guide's paragraphs (0.15).
+"$COMPILER" explain closure capture >"$WORK/ex.out" 2>"$WORK/ex.err"
+rc=$?
+if [ $rc -eq 0 ] && grep -q '^note explain.guide: ' "$WORK/ex.err" && grep -q '^# closures#' "$WORK/ex.out"; then
+    result pass explain-words
+else
+    result FAIL explain-words "exit $rc:" "$(cat "$WORK/ex.err")"
+fi
+
+# --help on every command (0.15): the command's rows, no error.
+for c in "" edit "edit patch" refactor "refactor signature" fix fmt check undo explain try "query context" rewrite lint same-output; do
+    # shellcheck disable=SC2086
+    if "$COMPILER" $c --help >"$WORK/help.out" 2>&1 && [ -s "$WORK/help.out" ] \
+        && [ "$(wc -l <"$WORK/help.out")" -le 15 ] && ! grep -q '^error' "$WORK/help.out"; then
+        :
+    else
+        result FAIL "help-$c" "$(head -3 "$WORK/help.out")"
+    fi
+done
+result pass help
+
+# tachyonc try (0.15): a snippet run with std; its last value and type,
+# its output, its errors at the snippet's lines, its exit code.
+try_case() { # <name> <expected output> <snippet...>
+    n=$1
+    want=$2
+    shift 2
+    got=$("$COMPILER" try "$@" 2>&1)
+    if [ "$got" = "$want" ]; then
+        result pass "try-$n"
+    else
+        result FAIL "try-$n" "expected:" "$want" "got:" "$got"
+    fi
+}
+try_case int 'i64 = 3' '1 + 2'
+try_case std 'Option<i64> = Some(42)' 'parse_int("42")'
+try_case vec 'Vec<i64> = [4, 5]' 'let mut v: Vec<i64> = Vec::new(); v.push(4); v.push(5); v'
+try_case output "hi
+[u8] = \"abc\"" 'println("hi"); "abc"'
+try_case item 'i64 = 49' 'fn sq(x: i64) -> i64 { x * x } sq(7)'
+try_case tuple '(i64, bool) = (1, true)' '(1, true)'
+try_case unit '' 'let x = 3;'
+try_case error "snippet:2:5: error[type error] expected 'i64', got '[u8]'" 'let a = 1;
+a + "b"'
+try_case panic 'index out of bounds: index 3, length 0
+exit 101' 'let v: Vec<i64> = Vec::new(); v.get(3)'
+printf 'struct P { x: i64 }\n\nlet p = P { x: 4 };\np.x * 10\n' >"$WORK/snip.tach"
+try_case file 'i64 = 40' --file "$WORK/snip.tach"
+got=$(printf '7\n' | "$COMPILER" try 'let mut b = Buf::new(); read_line(&b); parse_int(b.as_slice())' 2>&1)
+if [ "$got" = 'Option<i64> = Some(7)' ]; then result pass try-stdin; else result FAIL try-stdin "$got"; fi
+"$COMPILER" try >"$WORK/try.out" 2>&1
+rc=$?
+if [ $rc -eq 2 ] && grep -q '^error try.usage: ' "$WORK/try.out" && grep -q "^try: .* try 'let v" "$WORK/try.out"; then
+    result pass try-usage
+else
+    result FAIL try-usage "exit $rc:" "$(cat "$WORK/try.out")"
+fi
+
 check_blocks
 cat "$RESULTS"
 grep -q '^FAIL' "$RESULTS" && exit 1

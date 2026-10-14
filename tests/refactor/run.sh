@@ -228,10 +228,12 @@ check roundtrip "$([ $? = 0 ] && echo 1)" "$out"
 # compiler's errors (ERR_KIND) and warnings and keyed errors (their
 # third argument); and every entry is such a code.
 {
-    grep -rhoE 'c"(query|edit|patch|undo|check|fix|lint|fmt|same-output|refactor|rewrite|explain)\.[a-z-]+"' \
+    grep -rhoE 'c"(query|edit|patch|undo|check|fix|lint|fmt|same-output|refactor|rewrite|explain|try)\.[a-z-]+"' \
         compiler/src
     grep -rhoE 'ERR_KIND = c"[^"]*"' compiler/src
     grep -rhoE 'report_(warning|error_once)\([^,]*, [^,]*, c"[^"]*"' compiler/src
+    # (0.15: guide's codes, written into its own messages)
+    grep -rhoE '"(error|note) guide\.[a-z-]+' compiler/src | sed -e 's/^"[a-z]* \(.*\)$/c"\1"/'
 } | sed -e 's/.*c"\([^"]*\)"$/\1/' | sort -u >"$WORK/codes"
 "$COMPILER" explain --list | sort >"$WORK/explained"
 missing=$(comm -23 "$WORK/codes" "$WORK/explained")

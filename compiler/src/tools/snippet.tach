@@ -1,0 +1,982 @@
+// `tachyonc try 'STATEMENTS'` (0.15): a snippet compiled and run with
+// std, in a scratch directory, for learning what the language and std
+// accept without writing a probe program. The snippet's items (fn,
+// struct, use...) go to the top level and its statements into `fn
+// main`; the std names it uses are imported (`use std::{...}`, but the
+// prelude's); a snippet with `fn main` is a whole program. It is checked
+// first (errors at the snippet's own lines, `snippet:LINE:COL`), then the
+// type of its last expression is asked (`query type`), then it is built
+// with that value printed, and run. The output: the program's output,
+// then `TYPE = VALUE` (or `TYPE` alone when there is no printer for it:
+// numbers, bool, [u8], f64, and arrays, slices, Vec, Option and tuples
+// of those are printed), and `exit N` when it is not 0.
+//
+//   tachyonc try 'let v = [3, 1, 2]; v[..].len'      (i64 = 3)
+//   tachyonc try --file snippet.tach      (`-`: from stdin)
+
+use crate::base::{
+    IntVec, STDOUT, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, buf_write_fd, intern,
+    streq, strlen,
+};
+use crate::front::modules::lookup::is_prelude_name;
+use crate::front::stdsrc::std_source;
+use crate::tools::proc::{
+    buf_cstr, make_dirs, read_file_if, read_stdin, remove_dir, remove_file, run_capture,
+    write_file_if,
+};
+use crate::tools::query::diagnostics::{PROG, TOOL, diag, put_word, try_begin, try_end, write_diags};
+
+extern "C" {
+    fn getenv(name: *u8) -> *u8;
+    fn getpid() -> i32;
+    fn mkdir(path: *u8, mode: i32) -> i32;
+    fn kill(pid: i32, sig: i32) -> i32;
+    fn chmod(path: *u8, mode: i32) -> i32;
+}
+
+// What the program prints before the value (its output and the value
+// are told apart by it).
+fn mark() -> [u8] {
+    "<<tachyonc-try-value>>"
+}
+
+fn c_slice(s: *u8) -> [u8] {
+    unsafe { s[0..strlen(s) as i64] }
+}
+
+fn is_word(c: u8) -> bool {
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+}
+
+fn starts(s: [u8], p: [u8]) -> bool {
+    s.len >= p.len && s[0..p.len] == p
+}
+
+// ---- The snippet's parts ----
+
+// The end of the string or character literal, or comment, at s[i] (i
+// itself when there is none there).
+fn skip_literal(s: [u8], i: i64) -> i64 {
+    if s[i] == '/' && i + 1 < s.len && s[i + 1] == '/' {
+        let mut e = i;
+        while e < s.len && s[e] != '\n' {
+            e += 1;
+        }
+        return e;
+    }
+    if s[i] == '"' {
+        let mut e = i + 1;
+        while e < s.len && s[e] != '"' {
+            if s[e] == '\\' {
+                e += 1;
+            }
+            e += 1;
+        }
+        return if e < s.len { e + 1 } else { e };
+    }
+    if s[i] == '\'' && i + 2 < s.len && (s[i + 2] == '\'' || (s[i + 1] == '\\' && i + 3 < s.len)) {
+        let mut e = i + 1;
+        while e < s.len && s[e] != '\'' {
+            if s[e] == '\\' {
+                e += 1;
+            }
+            e += 1;
+        }
+        return if e < s.len { e + 1 } else { e };
+    }
+    i
+}
+
+// Whether s[i..] starts an item: `fn`, `struct`, `use`... (`unsafe fn`,
+// `pub ...`, `#[...]`); not `unsafe {`, `const` in a statement is one too.
+fn item_at(s: [u8], i: i64) -> bool {
+    let rest = s[i..s.len];
+    let kws = ["fn ", "struct ", "enum ", "impl", "trait ", "const ", "static ", "type ", "use ",
+        "mod ", "import ", "extern ", "#[", "pub ", "unsafe fn ", "unsafe impl"];
+    for k in 0..16 {
+        let kw = kws[k];
+        if starts(rest, kw) {
+            if kw == "impl" && rest.len > 4 && is_word(rest[4]) {
+                return false;
+            }
+            return true;
+        }
+    }
+    false
+}
+
+// The end of the item at s[i]: its `;` or its body's `}`, at depth 0.
+fn item_end(s: [u8], i: i64) -> i64 {
+    let mut depth = 0;
+    let mut e = i;
+    let attr = starts(s[i..s.len], "#[");
+    while e < s.len {
+        let l = skip_literal(s, e);
+        if l > e {
+            e = l;
+            continue;
+        }
+        let c = s[e];
+        if c == '{' || c == '(' || c == '[' {
+            depth += 1;
+        } else if c == '}' || c == ')' || c == ']' {
+            depth -= 1;
+            if depth == 0 && c == '}' {
+                return e + 1;
+            }
+            if depth == 0 && c == ']' && attr {
+                // (an attribute: the item after it)
+                let mut k = e + 1;
+                while k < s.len && (s[k] == ' ' || s[k] == '\n' || s[k] == '\t') {
+                    k += 1;
+                }
+                return if k < s.len { item_end(s, k) } else { s.len };
+            }
+        } else if c == ';' && depth == 0 {
+            return e + 1;
+        }
+        e += 1;
+    }
+    s.len
+}
+
+fn skip_blank(s: [u8], i0: i64) -> i64 {
+    let mut i = i0;
+    loop {
+        while i < s.len && (s[i] == ' ' || s[i] == '\n' || s[i] == '\t' || s[i] == '\r') {
+            i += 1;
+        }
+        if i + 1 < s.len && s[i] == '/' && s[i + 1] == '/' {
+            i = skip_literal(s, i);
+            continue;
+        }
+        return i;
+    }
+}
+
+// The snippet's leading items, as (start, end) pairs into items; the
+// start of its statements.
+fn split_items(s: [u8], items: *IntVec) -> i64 {
+    let mut i = skip_blank(s, 0);
+    while i < s.len && item_at(s, i) {
+        let e = item_end(s, i);
+        items.push(i);
+        items.push(e);
+        i = skip_blank(s, e);
+    }
+    i
+}
+
+// ---- Imports ----
+
+// The names std's source defines at its top level, `pub`.
+fn std_names(out: *IntVec) {
+    let b = buf_new();
+    std_source(b);
+    let s = buf_slice(b);
+    let mut i = 0;
+    while i < s.len {
+        let mut e = i;
+        while e < s.len && s[e] != '\n' {
+            e += 1;
+        }
+        let line = s[i..e];
+        let kws = ["pub fn ", "pub unsafe fn ", "pub struct ", "pub enum ", "pub trait ",
+            "pub const ", "pub static ", "pub type "];
+        for k in 0..8 {
+            let kw = kws[k];
+            if starts(line, kw) {
+                let mut a = kw.len;
+                if starts(line[a..line.len], "mut ") {
+                    a += 4;
+                }
+                let mut z = a;
+                while z < line.len && is_word(line[z]) {
+                    z += 1;
+                }
+                if z > a {
+                    out.push(intern(line[a..z]));
+                }
+            }
+        }
+        i = e + 1;
+    }
+}
+
+fn has(v: *IntVec, x: i64) -> bool {
+    unsafe {
+        for i in 0..(*v).count {
+            if (*v).data[i] == x {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// `use std::{...};` for the std names the snippet uses (not after `.` or
+// `::`), but the prelude's, those it defines and those it imports.
+fn std_imports(s: [u8], items: *IntVec, out: i64) {
+    unsafe {
+        let mut std = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        std_names(&std);
+        // (what the snippet's items define or import)
+        let mut own = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut k = 0;
+        while k < (*items).count {
+            let t = s[(*items).data[k]..(*items).data[k + 1]];
+            let is_use = starts(t, "use ") || starts(t, "pub use ");
+            let mut i = 0;
+            let mut next_own = false;
+            while i < t.len {
+                let l = skip_literal(t, i);
+                if l > i {
+                    i = l;
+                    continue;
+                }
+                if is_word(t[i]) && (i == 0 || !is_word(t[i - 1])) {
+                    let mut e = i;
+                    while e < t.len && is_word(t[e]) {
+                        e += 1;
+                    }
+                    let w = t[i..e];
+                    if is_use || (next_own && w != "mut") {
+                        own.push(intern(w));
+                    }
+                    if w != "mut" {
+                        next_own = w == "fn" || w == "struct" || w == "enum" || w == "trait"
+                            || w == "const" || w == "static" || w == "type";
+                    }
+                    i = e;
+                    continue;
+                }
+                i += 1;
+            }
+            k += 2;
+        }
+        let mut names = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut i = 0;
+        while i < s.len {
+            let l = skip_literal(s, i);
+            if l > i {
+                i = l;
+                continue;
+            }
+            if is_word(s[i]) && (i == 0 || !is_word(s[i - 1])) && !(s[i] >= '0' && s[i] <= '9') {
+                let mut e = i;
+                while e < s.len && is_word(s[e]) {
+                    e += 1;
+                }
+                let mut b = i;
+                while b > 0 && (s[b - 1] == ' ' || s[b - 1] == '\t') {
+                    b -= 1;
+                }
+                let after_path = (b >= 1 && s[b - 1] == '.')
+                    || (b >= 2 && s[b - 1] == ':' && s[b - 2] == ':');
+                let n = intern(s[i..e]);
+                if !after_path && has(&std, n) && !has(&own, n) && !has(&names, n)
+                    && !is_prelude_name(n) {
+                    names.push(n);
+                }
+                i = e;
+                continue;
+            }
+            i += 1;
+        }
+        if names.count == 0 {
+            return;
+        }
+        buf_str(out, c"use std::{");
+        for j in 0..names.count {
+            if j > 0 {
+                buf_str(out, c", ");
+            }
+            buf_bytes(out, crate::base::SYMS[names.data[j]].text);
+        }
+        buf_str(out, c"};");
+    }
+}
+
+// ---- The programs ----
+
+// Appends text (a part of the snippet starting at offset `from`) to the
+// program, its first line indented to its column in the snippet, each
+// line's snippet line into lines (1-based; 0 for the wrapper's).
+fn put_part(prog: i64, lines: *IntVec, s: [u8], from: i64, to: i64) {
+    let mut col = from;
+    while col > 0 && s[col - 1] != '\n' {
+        col -= 1;
+    }
+    let mut line = 1;
+    for k in 0..from {
+        if s[k] == '\n' {
+            line += 1;
+        }
+    }
+    for _ in col..from {
+        buf_byte(prog, ' ');
+    }
+    for k in from..to {
+        buf_byte(prog, s[k]);
+        if s[k] == '\n' {
+            lines.push(line);
+            line += 1;
+        }
+    }
+    buf_byte(prog, '\n');
+    lines.push(line);
+}
+
+fn put_line(prog: i64, lines: *IntVec, text: [u8]) {
+    buf_bytes(prog, text);
+    buf_byte(prog, '\n');
+    lines.push(0);
+}
+
+// ---- Printing the value ----
+
+static mut DEPTH: i64 = 0;
+static mut NEEDS_C: bool = false;
+
+fn is_int(t: [u8]) -> bool {
+    t == "i8" || t == "i16" || t == "i32" || t == "i64" || t == "u8" || t == "u16" || t == "u32"
+        || t == "u64" || t == "isize" || t == "usize"
+}
+
+// The end of the type at t[i..] (to a `,` or a closing bracket at depth 0).
+fn type_end(t: [u8], i: i64) -> i64 {
+    let mut depth = 0;
+    let mut e = i;
+    while e < t.len {
+        let c = t[e];
+        if c == '<' || c == '(' || c == '[' {
+            depth += 1;
+        } else if c == '>' || c == ')' || c == ']' {
+            if depth == 0 {
+                return e;
+            }
+            depth -= 1;
+        } else if (c == ',' || c == ';') && depth == 0 {
+            return e;
+        }
+        e += 1;
+    }
+    e
+}
+
+fn trim(t: [u8]) -> [u8] {
+    let mut a = 0;
+    let mut b = t.len;
+    while a < b && t[a] == ' ' {
+        a += 1;
+    }
+    while b > a && t[b - 1] == ' ' {
+        b -= 1;
+    }
+    t[a..b]
+}
+
+fn put_name(out: i64, base: *u8) {
+    unsafe {
+        buf_str(out, base);
+        buf_int(out, DEPTH);
+    }
+}
+
+// Statements that print the value `expr` of type t into out; false when
+// t has no printer.
+fn printer(out: i64, expr: [u8], t: [u8]) -> bool {
+    unsafe {
+        if is_int(t) {
+            buf_str(out, c"std::print_int((");
+            buf_bytes(out, expr);
+            buf_str(out, c") as i64); ");
+            return true;
+        }
+        if t == "bool" {
+            buf_str(out, c"if ");
+            buf_bytes(out, expr);
+            buf_str(out, c" { print(\"true\"); } else { print(\"false\"); } ");
+            return true;
+        }
+        if t == "f64" || t == "f32" {
+            NEEDS_C = true;
+            buf_str(out, c"unsafe { try_c::printf(c\"%g\", (");
+            buf_bytes(out, expr);
+            buf_str(out, c") as f64); } ");
+            return true;
+        }
+        if t == "[u8]" {
+            buf_str(out, c"print(\"\\\"\"); print(");
+            buf_bytes(out, expr);
+            buf_str(out, c"); print(\"\\\"\"); ");
+            return true;
+        }
+        DEPTH += 1;
+        let v = buf_new();
+        put_name(v, c"_try_v");
+        let i = buf_new();
+        put_name(i, c"_try_i");
+        let ok = compound(out, expr, t, buf_slice(v), buf_slice(i));
+        DEPTH -= 1;
+        ok
+    }
+}
+
+// Arrays, slices, Vec, Option and tuples (v, i: this level's names).
+fn compound(out: i64, expr: [u8], t: [u8], v: [u8], i: [u8]) -> bool {
+    // [T; N], [T]
+    if t.len > 2 && t[0] == '[' && t[t.len - 1] == ']' {
+        let e = type_end(t, 1);
+        let elem = trim(t[1..e]);
+        let body = buf_new();
+        let at = buf_new();
+        buf_bytes(at, v);
+        buf_byte(at, '[');
+        buf_bytes(at, i);
+        buf_byte(at, ']');
+        if !printer(body, buf_slice(at), elem) {
+            return false;
+        }
+        put_seq(out, expr, if e < t.len - 1 { "[..]" } else { "" }, ".len", v, i, buf_slice(body));
+        return true;
+    }
+    if starts(t, "Vec<") && t[t.len - 1] == '>' {
+        let elem = trim(t[4..t.len - 1]);
+        let body = buf_new();
+        let at = buf_new();
+        buf_bytes(at, v);
+        buf_bytes(at, ".get(");
+        buf_bytes(at, i);
+        buf_byte(at, ')');
+        if !printer(body, buf_slice(at), elem) {
+            return false;
+        }
+        put_seq(out, expr, "", ".len()", v, i, buf_slice(body));
+        return true;
+    }
+    if starts(t, "Option<") && t[t.len - 1] == '>' {
+        let elem = trim(t[7..t.len - 1]);
+        let body = buf_new();
+        if !printer(body, v, elem) {
+            return false;
+        }
+        buf_bytes(out, "match ");
+        buf_bytes(out, expr);
+        buf_bytes(out, " { Some(");
+        buf_bytes(out, v);
+        buf_bytes(out, ") => { print(\"Some(\"); ");
+        buf_bytes(out, buf_slice(body));
+        buf_bytes(out, "print(\")\"); } None => { print(\"None\"); } } ");
+        return true;
+    }
+    if t.len > 2 && t[0] == '(' && t[t.len - 1] == ')' {
+        let body = buf_new();
+        let mut k = 1;
+        let mut n = 0;
+        while k < t.len - 1 {
+            let e = type_end(t, k);
+            let field = buf_new();
+            buf_bytes(field, v);
+            buf_byte(field, '.');
+            buf_int(field, n);
+            if n > 0 {
+                buf_bytes(body, "print(\", \"); ");
+            }
+            if !printer(body, buf_slice(field), trim(t[k..e])) {
+                return false;
+            }
+            n += 1;
+            k = e + 1;
+        }
+        buf_bytes(out, "{ let ");
+        buf_bytes(out, v);
+        buf_bytes(out, " = ");
+        buf_bytes(out, expr);
+        buf_bytes(out, "; print(\"(\"); ");
+        buf_bytes(out, buf_slice(body));
+        buf_bytes(out, "print(\")\"); } ");
+        return true;
+    }
+    false
+}
+
+// `[a, b, ...]` of a sequence: `expr` bound to v (with `as_slice`), its
+// length by `len`, each element printed by body.
+fn put_seq(out: i64, expr: [u8], suffix: [u8], len: [u8], v: [u8], i: [u8], body: [u8]) {
+    buf_bytes(out, "{ let ");
+    buf_bytes(out, v);
+    buf_bytes(out, " = ");
+    buf_bytes(out, expr);
+    buf_bytes(out, suffix);
+    buf_bytes(out, "; print(\"[\"); for ");
+    buf_bytes(out, i);
+    buf_bytes(out, " in 0..");
+    buf_bytes(out, v);
+    buf_bytes(out, len);
+    buf_bytes(out, " { if ");
+    buf_bytes(out, i);
+    buf_bytes(out, " > 0 { print(\", \"); } ");
+    buf_bytes(out, body);
+    buf_bytes(out, "} print(\"]\"); } ");
+}
+
+// ---- Running ----
+
+// The scratch directory, made anew.
+fn scratch_dir() -> *u8 {
+    unsafe {
+        let b = buf_new();
+        let tmp = getenv(c"TMPDIR");
+        if tmp != 0 as *u8 && tmp[0] != 0 {
+            buf_str(b, tmp);
+        } else {
+            buf_str(b, c"/tmp");
+        }
+        if buf_slice(b)[buf_slice(b).len - 1] != '/' {
+            buf_byte(b, '/');
+        }
+        buf_str(b, c"tachyonc-try-");
+        buf_int(b, getpid() as i64);
+        let dir = buf_cstr(b);
+        make_dirs(dir);
+        dir
+    }
+}
+
+fn path_in(dir: *u8, name: *u8) -> *u8 {
+    let b = buf_new();
+    unsafe {
+        buf_str(b, dir);
+    }
+    buf_byte(b, '/');
+    unsafe {
+        buf_str(b, name);
+    }
+    buf_cstr(b)
+}
+
+// Runs PROG with the arguments (a 0-ended list), its stdout and stderr
+// into out: its exit status.
+fn run_self(args: **u8, n: i64, out: i64) -> i64 {
+    unsafe {
+        let argv = crate::base::alloc_array::<*u8>(n + 2);
+        argv[0] = PROG;
+        for k in 0..n {
+            argv[k + 1] = args[k];
+        }
+        argv[n + 1] = 0 as *u8;
+        run_capture(argv, out)
+    }
+}
+
+// The compiler's diagnostics about the program (path `file`), its
+// positions as the snippet's (`name:LINE:COL`, by lines), into out.
+fn put_mapped(out: i64, text: [u8], file: [u8], name: [u8], lines: *IntVec) {
+    unsafe {
+        let mut i = 0;
+        while i < text.len {
+            let mut e = i;
+            while e < text.len && text[e] != '\n' {
+                e += 1;
+            }
+            let line = text[i..e];
+            i = e + 1;
+            if line.len == 0 {
+                continue;
+            }
+            if starts(line, file) && line.len > file.len && line[file.len] == ':' {
+                let mut k = file.len + 1;
+                let mut l = 0;
+                while k < line.len && line[k] >= '0' && line[k] <= '9' {
+                    l = l * 10 + (line[k] - '0') as i64;
+                    k += 1;
+                }
+                let at = if l >= 1 && l <= (*lines).count { (*lines).data[l - 1] } else { 0 };
+                buf_bytes(out, name);
+                if at > 0 {
+                    buf_byte(out, ':');
+                    buf_int(out, at);
+                    buf_bytes(out, line[k..line.len]);
+                } else {
+                    // (in the wrapper: no position of the snippet's)
+                    let mut c = k;
+                    while c < line.len && line[c] != ' ' {
+                        c += 1;
+                    }
+                    buf_bytes(out, ":");
+                    buf_bytes(out, line[c..line.len]);
+                }
+            } else {
+                buf_bytes(out, line);
+            }
+            buf_byte(out, '\n');
+        }
+    }
+}
+
+fn usage(why: *u8) -> i64 {
+    unsafe {
+        let d = diag(c"error", c"try.usage");
+        buf_str(d, why);
+        buf_byte(d, '\n');
+        let t = try_begin(c"try", "", false);
+        put_word(t, "let v = [3, 1, 2]; v[..].len");
+        try_end(t);
+        2
+    }
+}
+
+// ---- Slots for the binary ----
+//
+// macOS checks an executable file the first time it runs (about 2 s); a
+// file written over in place is not checked again. So the binary is
+// copied into one of SLOTS files kept in $TMPDIR/tachyonc-try/, each
+// taken while it runs by a lock directory holding the taker's pid (a
+// dead taker's lock is taken over).
+
+const SLOTS: i64 = 16;
+
+fn slot_path(base: *u8, k: i64, ext: *u8) -> *u8 {
+    let b = buf_new();
+    unsafe {
+        buf_str(b, base);
+        buf_str(b, c"/slot-");
+        buf_int(b, k);
+        buf_str(b, ext);
+    }
+    buf_cstr(b)
+}
+
+// The slots' directory, $TMPDIR/tachyonc-try (made once); 0 when it
+// cannot be made.
+fn slots_dir() -> *u8 {
+    unsafe {
+        let b = buf_new();
+        let tmp = getenv(c"TMPDIR");
+        if tmp != 0 as *u8 && tmp[0] != 0 {
+            buf_str(b, tmp);
+        } else {
+            buf_str(b, c"/tmp");
+        }
+        if buf_slice(b)[buf_slice(b).len - 1] != '/' {
+            buf_byte(b, '/');
+        }
+        buf_str(b, c"tachyonc-try");
+        let dir = buf_cstr(b);
+        if make_dirs(dir) { dir } else { 0 as *u8 }
+    }
+}
+
+// Takes a slot: its number, or -1 when none is free.
+fn take_slot(base: *u8) -> i64 {
+    unsafe {
+        for k in 0..SLOTS {
+            let lock = slot_path(base, k, c".lock");
+            let pid_file = path_in(lock, c"pid");
+            if mkdir(lock, 448) != 0 {
+                // (taken: by a live process?)
+                let held = buf_new();
+                let mut pid = 0;
+                if read_file_if(pid_file, held) {
+                    let h = buf_slice(held);
+                    for i in 0..h.len {
+                        if h[i] >= '0' && h[i] <= '9' {
+                            pid = pid * 10 + (h[i] - '0') as i64;
+                        }
+                    }
+                }
+                if pid <= 0 || kill(pid as i32, 0) == 0 {
+                    continue;
+                }
+                remove_file(pid_file);
+                remove_dir(lock);
+                if mkdir(lock, 448) != 0 {
+                    continue;
+                }
+            }
+            let me = buf_new();
+            buf_int(me, getpid() as i64);
+            write_file_if(pid_file, buf_slice(me));
+            return k;
+        }
+        -1
+    }
+}
+
+fn release_slot(base: *u8, k: i64) {
+    unsafe {
+        let lock = slot_path(base, k, c".lock");
+        remove_file(path_in(lock, c"pid"));
+        remove_dir(lock);
+    }
+}
+
+// The binary `bin` as the executable to run: copied over slot k's file
+// in place (made executable).
+fn into_slot(bin: *u8, slot: *u8) -> bool {
+    unsafe {
+        let bytes = buf_new();
+        if !read_file_if(bin, bytes) || !write_file_if(slot, buf_slice(bytes)) {
+            return false;
+        }
+        chmod(slot, 493) == 0
+    }
+}
+
+// `tachyonc try ...`: the exit status (the program's, 1 when the snippet
+// does not compile, 2 for a usage error).
+pub fn run_try(argc: i64, argv: **u8) -> i64 {
+    unsafe {
+        PROG = argv[0];
+        TOOL = 0 as *u8;
+        let status = try_inner(argc, argv);
+        write_diags();
+        status
+    }
+}
+
+fn try_inner(argc: i64, argv: **u8) -> i64 {
+    unsafe {
+        let sb = buf_new();
+        let mut file = 0 as *u8;
+        let mut keep = false;
+        let mut k = 2;
+        while k < argc {
+            let a = argv[k];
+            if streq(a, c"--file") {
+                if k + 1 >= argc {
+                    return usage(c"--file needs a FILE");
+                }
+                file = argv[k + 1];
+                k += 2;
+                continue;
+            }
+            if streq(a, c"--keep") {
+                keep = true;
+            } else if streq(a, c"-") {
+                if !read_stdin(sb) {
+                    return usage(c"- reads the snippet from stdin, and nothing was piped in");
+                }
+            } else if a[0] == '-' && a[1] == '-' {
+                let d = diag(c"error", c"try.usage");
+                buf_str(d, c"unknown option '");
+                buf_str(d, a);
+                buf_str(d, c"' (--file FILE, --keep, -)\n");
+                return 2;
+            } else {
+                if buf_slice(sb).len > 0 {
+                    buf_byte(sb, ' ');
+                }
+                buf_str(sb, a);
+            }
+            k += 1;
+        }
+        if file != 0 as *u8 && !read_file_if(file, sb) {
+            let d = diag(c"error", c"try.no-file");
+            buf_str(d, c"cannot read '");
+            buf_str(d, file);
+            buf_str(d, c"'\n");
+            return 1;
+        }
+        let s = buf_slice(sb);
+        let mut blank = true;
+        for i in 0..s.len {
+            if s[i] != ' ' && s[i] != '\n' && s[i] != '\t' {
+                blank = false;
+            }
+        }
+        if blank {
+            return usage(c"a snippet is needed: STATEMENTS, --file FILE, or - (stdin)");
+        }
+        let name = if file != 0 as *u8 { c_slice(file) } else { "snippet" };
+        // The program: imports, the items, main around the statements.
+        let mut items = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let body = split_items(s, &items);
+        let mut whole = false;
+        let mut j = 0;
+        while j < items.count {
+            let t = s[items.data[j]..items.data[j + 1]];
+            if starts(t, "fn main(") || starts(t, "pub fn main(") {
+                whole = true;
+            }
+            j += 2;
+        }
+        let head = buf_new();
+        let mut lines = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let imports = buf_new();
+        std_imports(s, &items, imports);
+        if buf_slice(imports).len > 0 {
+            put_line(head, &lines, buf_slice(imports));
+        }
+        j = 0;
+        while j < items.count {
+            put_part(head, &lines, s, items.data[j], items.data[j + 1]);
+            j += 2;
+        }
+        let mut value_line = 0;
+        if !whole {
+            put_line(head, &lines, "fn main() {");
+            put_line(head, &lines, "    let _try_value = {");
+            value_line = lines.count;
+        }
+        if body < s.len {
+            put_part(head, &lines, s, body, s.len);
+        }
+        if !whole {
+            put_line(head, &lines, "    };");
+        }
+        let dir = scratch_dir();
+        let src = path_in(dir, c"snippet.tach");
+        let bin = path_in(dir, c"snippet");
+        let status = check_and_run(head, &lines, whole, value_line, src, bin, name);
+        if keep {
+            let d = diag(c"note", c"try.kept");
+            buf_str(d, c"the program and its binary: ");
+            buf_str(d, src);
+            buf_byte(d, '\n');
+        } else {
+            remove_file(src);
+            remove_file(bin);
+            remove_dir(dir);
+        }
+        status
+    }
+}
+
+// Checks the program (head, then `}` for a snippet), asks its value's
+// type, builds it with the value printed, runs it, prints what it did:
+// the exit status.
+fn check_and_run(head: i64, lines: *IntVec, whole: bool, value_line: i64, src: *u8, bin: *u8,
+    name: [u8]) -> i64 {
+    unsafe {
+        let a = buf_new();
+        buf_bytes(a, buf_slice(head));
+        if !whole {
+            buf_bytes(a, "}\n");
+        }
+        if !write_file_if(src, buf_slice(a)) {
+            let d = diag(c"error", c"try.no-file");
+            buf_str(d, c"cannot write '");
+            buf_str(d, src);
+            buf_str(d, c"'\n");
+            return 1;
+        }
+        let errs = buf_new();
+        let args = crate::base::alloc_array::<*u8>(6);
+        args[0] = c"check";
+        args[1] = src;
+        let checked = run_self(args, 2, errs);
+        if buf_slice(errs).len > 0 {
+            let out = buf_new();
+            put_mapped(out, buf_slice(errs), c_slice(src), name, lines);
+            buf_write_fd(out, crate::base::STDERR);
+        }
+        if checked != 0 {
+            return 1;
+        }
+        // The value's type: the block's, at `{` of `let _try_value = {`.
+        let ty = buf_new();
+        if !whole {
+            let at = buf_new();
+            buf_str(at, src);
+            buf_byte(at, ':');
+            buf_int(at, value_line);
+            buf_str(at, c":22");
+            args[0] = c"query";
+            args[1] = c"type";
+            args[2] = buf_cstr(at);
+            args[3] = c"--root";
+            args[4] = src;
+            let got = buf_new();
+            if run_self(args, 5, got) == 0 {
+                let g = buf_slice(got);
+                let mut e = 0;
+                while e < g.len && g[e] != '\t' && g[e] != '\n' {
+                    e += 1;
+                }
+                buf_bytes(ty, g[0..e]);
+            }
+        }
+        let t = buf_slice(ty);
+        let shows = t.len > 0 && t != "()";
+        // The program again, with the value printed.
+        let b = buf_new();
+        buf_bytes(b, buf_slice(head));
+        let print = buf_new();
+        NEEDS_C = false;
+        let printed = shows && printer(print, "_try_value", t);
+        if shows {
+            buf_bytes(b, "    print(\"");
+            buf_bytes(b, mark());
+            buf_bytes(b, "\");\n");
+            if printed {
+                buf_bytes(b, "    ");
+                buf_bytes(b, buf_slice(print));
+                buf_bytes(b, "\n");
+            }
+        }
+        if !whole {
+            buf_bytes(b, "}\n");
+        }
+        if NEEDS_C && printed {
+            buf_bytes(b, "import \"stdio.h\" as try_c;\n");
+        }
+        write_file_if(src, buf_slice(b));
+        let built = buf_new();
+        args[0] = src;
+        args[1] = c"-o";
+        args[2] = bin;
+        args[3] = c"--diagnostics=short";
+        if run_self(args, 4, built) != 0 {
+            let out = buf_new();
+            put_mapped(out, buf_slice(built), c_slice(src), name, lines);
+            buf_write_fd(out, crate::base::STDERR);
+            return 1;
+        }
+        // Run it (from a slot, when one is free: see SLOTS).
+        let ran = buf_new();
+        let run = crate::base::alloc_array::<*u8>(2);
+        run[0] = bin;
+        run[1] = 0 as *u8;
+        let base = slots_dir();
+        let k = if base != 0 as *u8 { take_slot(base) } else { -1 };
+        if k >= 0 && into_slot(bin, slot_path(base, k, c"")) {
+            run[0] = slot_path(base, k, c"");
+        }
+        let rc = run_capture(run, ran);
+        if k >= 0 {
+            release_slot(base, k);
+        }
+        let r = buf_slice(ran);
+        let m = mark();
+        let mut cut = r.len;
+        let mut i = 0;
+        while i + m.len <= r.len {
+            if r[i..i + m.len] == m {
+                cut = i;
+            }
+            i += 1;
+        }
+        let out = buf_new();
+        buf_bytes(out, r[0..cut]);
+        if cut > 0 && r[cut - 1] != '\n' {
+            buf_byte(out, '\n');
+        }
+        if shows && cut < r.len {
+            buf_bytes(out, t);
+            if printed {
+                buf_bytes(out, " = ");
+                buf_bytes(out, r[cut + m.len..r.len]);
+            }
+            buf_byte(out, '\n');
+        }
+        if rc != 0 {
+            buf_str(out, c"exit ");
+            buf_int(out, rc);
+            buf_byte(out, '\n');
+        }
+        buf_write_fd(out, STDOUT);
+        rc
+    }
+}
