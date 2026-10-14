@@ -496,6 +496,13 @@ The last release of the build-out.
   tables with `cc -c`'s on every target, tests/debug.sh runs lldb and gdb
   (breakpoints in two files, a crash's backtrace with file:line at -O0 and
   -O2); the output without `-g` is unchanged
+- gate: bootstrap --dev and the suite at -O0/1/2 on aarch64-macos;
+  linux-check (x86_64-linux: chain, all levels, fuzz, ABI, objcheck);
+  aarch64-linux-check (fixpoint, all levels, fuzz in every mode, ABI,
+  objcheck, gdb); compile time without -g as 0.10's. Not run: the suite
+  on x86_64-macos (Rosetta stopped running new programs on the test
+  machine after lldb attached to one; needs a reboot), gdb on x86_64-linux
+  (no ptrace under Rosetta for Linux)
 
 ## Toward 1.0
 
