@@ -16,7 +16,17 @@ x86_64-linux:
 - `bench/` results are recorded in this file;
 - compile times are recorded in this file (the compiler building itself
   at `-O0` and `-O2`, and end to end to an executable), and any regression
-  against the previous release is explained or fixed.
+  against the previous release is explained or fixed;
+- the generated code does not get slower: every `bench/` program against
+  the previous release and against `cc -O2` (and their geometric mean),
+  on an idle machine; a slowdown beyond noise blocks the release unless it
+  is understood and accepted in the notes. Language features ship only
+  when their idiomatic use compiles to code as fast as the hand-written
+  equivalent;
+- the agents' tool use is traced (`tools/agent-tool-usage.py`, the hook's
+  log): what share of reading, searching and editing went through
+  `tachyonc` rather than the shell, and why the rest did not; the gaps
+  feed the next release's tools.
 
 Principle: **no undefined behaviour.** Every operation safe code can
 write has defined behaviour (integer overflow wraps, division by zero,
@@ -25,9 +35,11 @@ checked (raw pointers, freeing memory, calls into C) is to be confined to
 `unsafe` blocks (0.9). For agents above all, a program that compiles
 should not be able to fail in ways no one can see in its text.
 
-Priorities, in order: correctness (the gate above); exact C interop where
-it is asked for; **compilation speed**, as fast as possible at every
-level, measured every release; then the speed of the generated code.
+Priorities: correctness (the gate above) first, then, never traded away,
+**the speed of the generated code** (what users get) and **compilation
+speed** (how fast anyone iterates), both measured every release; exact C
+interop where it is asked for; and tools that let agents do their work
+through the compiler.
 Compilation speed is weighed in every design: an optimization has to pay
 for its compile time.
 
