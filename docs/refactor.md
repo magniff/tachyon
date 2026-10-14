@@ -25,7 +25,7 @@ tachyonc query unused [MODULE|FILE] [--all]
 tachyonc query impact NAME
 ```
 
-The editing commands (edit, fix) also take `--dry-run`, `--no-check`,
+The editing commands (edit, fix) also take `--dry-run`, `--no-check`, `--show`,
 `--exact`, `--root ROOT` and `--target T`. ROOT is found as for query
 (`--root`, a last argument ending in `.tach`, `$TACHYON_ROOT`,
 `./main.tach`, `./compiler/src/main.tach`).
@@ -69,6 +69,19 @@ are not new: an edit of a program with errors is checked against them.
 - `--no-check` writes an edit that adds errors anyway (a signature
   changed before its callers are), with `warning edit.breaks` and the
   errors; `tachyonc check` lists what is left.
+- `--show` (0.12; every edit, fix, rewrite and refactoring) prints, after
+  the summary line, the regions the edit changed as their new lines,
+  numbered, so that the edit need not be read back:
+
+```
+patched crate::one→main.tach→+2 -1 lines
+// main.tach:21-22
+21→    let twice = k + k;
+22→    unsafe { twice * abs(a) as i64 / 2 }
+```
+
+  (lines only removed: `// FILE:A: N lines removed after line A`).
+  `tachyonc query diff` prints the last journaled edit as a diff.
 
 ### The journal and undo
 
@@ -242,7 +255,7 @@ fixed 2 missing imports, 3 unused imports, 1 pub, 1 unsafe block→3 files→+3 
 | `imports` | the `use` lines the errors for unknown names ask for (`help: add `use crate::m::name;``): merged into a `use` of that module when there is one (`use m::{a}` gains `, name`; `use m::a;` becomes `use m::{a, name};`), else a line after the module's last `use`; and 0.8's wildcard migration (`use a::*;` becomes the names it brings) |
 | `unused` | imports whose name is written nowhere else in their file, removed (the name of a list with its separator; the item when all go; `use p::{a}` left with one name becomes `use p::a`). `pub use` is kept |
 | `pub` | `pub` on the items other modules use while they are private (`error ... is private`) |
-| `unsafe` | the unsafe operations outside unsafe code, wrapped in unsafe blocks (the outermost unit around each: a statement, `let p = unsafe { e };`, an expression) |
+| `unsafe` | the unsafe operations outside unsafe code, wrapped in unsafe blocks (the outermost unit around each: a statement, `let p = unsafe { e };`, an expression); a function with several of them gets its whole body in one block, one level deeper, when its braces have lines of their own (0.12, the codebase's style) |
 
 By default all four, everywhere; `--in FILE|MODULE` keeps the fixes of
 one file or module (matched like query's `--in`; none:

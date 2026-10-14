@@ -232,19 +232,31 @@ def suggestion(prog, args):
     if m:
         return f"tachyonc query show {m.group(1)}"
     files = [a for a in file_args(prog, args) if a.endswith(".tach")]
-    # `sed -n 'N,Mp' FILE`: the item holding line N
-    m = re.match(r"^(\d+)(,\d+)?p$", pattern)
+    compiler = bool(files) and bool(compiler_paths(files[0]))
+    # `sed -n 'N,Mp' FILE`: the item holding line N, or the lines
+    m = re.match(r"^(\d+)(?:,(\d+))?p$", pattern)
     if prog == "sed" and m and files:
-        return f"tachyonc query show {files[0]}:{m.group(1)}"
+        a, b = m.group(1), m.group(2) or m.group(1)
+        text = f"tachyonc query text {files[0]}:{a}-{b}"
+        return f"tachyonc query show {files[0]}:{a} | {text}" if compiler else text
     if prog in ("grep", "rg", "egrep", "fgrep"):
         word = re.sub(r"[^\w:.]", "", pattern)
         if word and not re.search(r"\s", pattern):
             return f"tachyonc query refs {word}"
         # (text, not a name: a comment, a string)
         return "tachyonc query items MODULE | tachyonc query show FILE:LINE"
+    if files and prog == "head":
+        n = next((args[i + 1] for i, a in enumerate(args[:-1]) if a == "-n"), None) \
+            or next((a[1:] for a in args if re.match(r"^-\d+$", a)), "10")
+        text = f"tachyonc query text {files[0]}:1-{n}"
+        return f"tachyonc query show MODULE::header | MODULE::use | {text}" if compiler else text
+    if files and prog == "cat":
+        return f"tachyonc query show {files[0]} (a whole small file) | tachyonc query text {files[0]}:A-B"
     if files:
-        return f"tachyonc query stats {files[0]} | tachyonc query show FILE:LINE"
-    return "tachyonc query show NAME | tachyonc query items MODULE"
+        if not compiler:
+            return f"tachyonc query text {files[0]}:A-B"
+        return f"tachyonc query stats {files[0]} | tachyonc query show FILE:LINE | tachyonc query text {files[0]}:A-B"
+    return "tachyonc query show NAME | tachyonc query items MODULE | tachyonc query text FILE:A-B"
 
 
 def main():

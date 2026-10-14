@@ -61,7 +61,15 @@ def blocked(command):
 st, err = blocked("sed -n '120,180p' compiler/src/gvn.tach")
 case("read sed -n", (st, "query show compiler/src/gvn.tach:120" in err), (True, True))
 case("read grep", blocked("grep -n 'fn run_gvn' compiler/src/gvn.tach")[0], True)
-case("read docs", blocked("grep -n edit docs/refactor.md")[0], False)
+st, err = blocked("sed -n '120,180p' tests/run/loops.tach")
+case("read sed -n test file", "try: tachyonc query text tests/run/loops.tach:120-180 |" in err, True)
+st, err = blocked("head -40 tests/refactor/patch/calc.tach")
+case("read head test file", "try: tachyonc query text tests/refactor/patch/calc.tach:1-40 |" in err, True)
+st, err = blocked("head -n 30 compiler/src/gvn.tach")
+case("read head compiler", "MODULE::header" in err and "query text compiler/src/gvn.tach:1-30" in err, True)
+st, err = blocked("cat tests/refactor/patch/main.tach")
+case("read cat", "tachyonc query show tests/refactor/patch/main.tach" in err, True)
+case("read docs",blocked("grep -n edit docs/refactor.md")[0], False)
 case("read escape", blocked("sed -n '1,9p' compiler/src/gvn.tach  # no-query: the use lines")[0], False)
 
 # Rewriting compiler source in place: blocked, with `edit patch`.

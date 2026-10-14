@@ -25,7 +25,7 @@ use crate::base::{
 use crate::ast::{NODES, NodeKind};
 use crate::modules::{C_MODULE, STD_MODULE, file_of_pos};
 use crate::edit::edit_replace;
-use crate::query::ref_in;
+use crate::query::{DEFS, enclosing, ref_in};
 
 pub static mut FIX_UNSAFE: bool = false;
 
@@ -144,6 +144,77 @@ fn wrap_edit(s: i64, e: i64, kind: i64, edits: *IntVec) {
     }
 }
 
+// The body (a block node) of the function holding pos, or -1.
+fn body_of(pos: i64) -> i64 {
+    unsafe {
+        let d = enclosing(pos);
+        if d < 0 {
+            return -1;
+        }
+        let n = DEFS[d].node;
+        if n <= 0 || NODES[n].kind != NodeKind::Fn {
+            return -1;
+        }
+        let b = NODES[n].c;
+        if b <= 0 || pos < NODES[b].start || pos >= NODES[b].end {
+            return -1;
+        }
+        b
+    }
+}
+
+// How many of the ranges (start, end, kind) are in body b.
+fn sites_in(ranges: *IntVec, b: i64) -> i64 {
+    unsafe {
+        let mut n = 0;
+        let mut i = 0;
+        while i < (*ranges).count {
+            if body_of((*ranges).data[i]) == b {
+                n += 1;
+            }
+            i += 3;
+        }
+        n
+    }
+}
+
+// Whether body b's braces have lines of their own: `{` last on its line,
+// `}` first on its.
+fn wrappable(b: i64) -> bool {
+    unsafe {
+        let s = NODES[b].start;
+        let e = NODES[b].end;
+        SRC[s] == '{' && SRC[e - 1] == '}' && has_newline(s, e) && blank(s + 1, line_end(s))
+            && blank(line_start(e - 1), e - 1)
+    }
+}
+
+// The edit putting body b's lines in an unsafe block, indented one
+// level more.
+fn wrap_body(b: i64, edits: *IntVec) {
+    unsafe {
+        let first = line_end(NODES[b].start) + 1;
+        let last = line_start(NODES[b].end - 1);
+        let indent = SRC[last..NODES[b].end - 1];
+        let text = buf_new();
+        buf_bytes(text, indent);
+        buf_str(text, c"    unsafe {\n");
+        let mut p = first;
+        while p < last {
+            let e = line_end(p);
+            if !blank(p, e) {
+                buf_str(text, c"    ");
+                buf_bytes(text, SRC[p..e]);
+            }
+            buf_byte(text, '\n');
+            p = e + 1;
+        }
+        buf_bytes(text, indent);
+        buf_str(text, c"    }\n");
+        add_edit(edits, first, last - first, text);
+    }
+}
+
 // The edits wrapping the unsafe operations (to the edit engine,
 // edit.tach); returns the number of unsafe blocks made.
 pub fn fix_unsafe_edits() -> i64 {
@@ -216,11 +287,39 @@ pub fn fix_unsafe_edits() -> i64 {
             kept.push(e);
             kept.push(k);
         }
-        let mut edits = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        // A function with several unsafe operations: its whole body in
+        // one unsafe block (the codebase's style, 0.12), when its braces
+        // have lines of their own.
+        let mut bodies = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut rest = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let mut a = 0;
         while a < kept.count {
-            wrap_edit(kept.data[a], kept.data[a + 1], kept.data[a + 2], &edits);
+            let b = body_of(kept.data[a]);
+            if b >= 0 && sites_in(&ranges, b) >= 2 && wrappable(b) {
+                let mut seen = false;
+                for x in 0..bodies.count {
+                    if bodies.data[x] == b {
+                        seen = true;
+                    }
+                }
+                if !seen {
+                    bodies.push(b);
+                }
+            } else {
+                rest.push(kept.data[a]);
+                rest.push(kept.data[a + 1]);
+                rest.push(kept.data[a + 2]);
+            }
             a += 3;
+        }
+        let mut edits = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        a = 0;
+        while a < rest.count {
+            wrap_edit(rest.data[a], rest.data[a + 1], rest.data[a + 2], &edits);
+            a += 3;
+        }
+        for x in 0..bodies.count {
+            wrap_body(bodies.data[x], &edits);
         }
         // (in order of position; edits at one position keep their order)
         let m = edits.count / 3;
@@ -240,6 +339,6 @@ pub fn fix_unsafe_edits() -> i64 {
             edit_replace(edits.data[k], edits.data[k] + edits.data[k + 1], edits.data[k + 2]);
             k += 3;
         }
-        kept.count / 3
+        rest.count / 3 + bodies.count
     }
 }

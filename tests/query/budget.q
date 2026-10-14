@@ -180,7 +180,10 @@ error query.usage: no command
 try: tachyonc query items
 [exit 2]
 $ --help
-usage: tachyonc query def|show NAME... [--root ROOT] [--exact]
+usage: tachyonc query def|show NAME... [--root ROOT] [--exact] [--with-comments]
+       tachyonc query show FILE.tach | MODULE::use | MODULE::header | MODULE::extern
+       tachyonc query text FILE[:A[-B]]...
+       tachyonc query diff
        tachyonc query refs|callers NAME... [--exact] [--count] [--in FILE|MODULE] [--limit N] [--all]
        tachyonc query items [MODULE...]
        tachyonc query stats [MODULE|FILE] [--over N] [--all]
