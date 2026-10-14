@@ -94,7 +94,10 @@ Each edit is journaled in the git directory of the root's checkout,
 before and after. `tachyonc undo` restores the files of the last edit
 and forgets it; run again, it undoes the one before. It refuses when a
 file changed since the edit (`error undo.changed`, `try:` `undo --force`,
-which restores it anyway). Without a git checkout there is no journal.
+which restores it anyway). A program in no git checkout (0.14: a
+user's workspace) is journaled in `.tachyonc/edits/` next to its root;
+`undo` and `query diff` find it from the root, or from the current
+directory or one below it.
 
 ## Edits inside an item: edit patch, insert --in
 

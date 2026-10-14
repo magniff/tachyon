@@ -653,8 +653,7 @@ three, objcheck, layouts, gdb). Not run here: the benchmarks (`gate.sh
 
 ## 0.14: an agent eval; closures and iterators
 
-From here every release also passes an **agent-eval gate**, and a
-feature new in release N enters the compiler's own source in N+1
+From here a feature new in release N enters the compiler's own source in N+1
 (migrated with the refactoring tools; breaking changes come with a
 `tachyonc fix` migration).
 
@@ -670,7 +669,11 @@ feature new in release N enters the compiler's own source in N+1
   with the tools and `try:` diagnostics, with both) to show what each
   contributes; models of several sizes, hosted (small, mid, large) and
   local (e.g. Qwen3-Coder through any OpenAI-compatible server, driven by a
-  minimal agent loop in the runner with the same tools)
+  minimal agent loop in the runner with the same tools); run
+  periodically, not every release (decided after the 0.13 baseline: see
+  [docs/eval/0.13-findings.md](eval/0.13-findings.md), whose findings
+  added std input reading, std-aware did-you-mean and the user-program
+  tool fixes to 0.14)
 - closures (`|x| x * 2`): capture by value, or by borrow when they do not
   escape; `Fn`/`FnMut` traits, monomorphized; a non-capturing closure is a
   `fn` pointer
@@ -697,6 +700,12 @@ feature new in release N enters the compiler's own source in N+1
 - string interpolation, `"n = {n}, v = {v:?}"`, over `Display` / `Debug`
 - field shorthand `S { x, y }`; named and default arguments
 - the compiler's source moves to closures and iterators (0.14)
+- the agent eval, harder (the 0.13 baseline hit the ceiling: Claude
+  Haiku and Sonnet solved 59 of 60 runs each): larger multi-module tasks,
+  porting a C program, a compiler-like pass over an AST, tighter perf
+  limits, several runs per cell; the guide says when the tools pay off
+  (renames, moves, signatures, errors across files) and when reading a
+  small file is cheaper (tools-only cost more than the guide alone)
 
 ## 0.16: effects
 

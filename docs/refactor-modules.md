@@ -51,8 +51,34 @@ alias, `use a::f as g`, keeps its own name). For
 - a module: its parent must not have a NEW, and its file is renamed
   (`a.tach` -> `NEW.tach`, `a/` with it; `a/mod.tach`: the directory).
 
-Mentions in comments between backquotes, `` `old` ``, `` `m::old` ``,
-`` `old()` ``, are renamed too when no other definition is named old.
+PATH may be `FILE:LINE:COL` (0.14, as a compiler error has it): the
+local there (below), else the definition referred to or defined at
+that column (`edit.not-source` for one of std), else the innermost item
+holding the line.
+
+A local variable or parameter (0.14) is named by `FILE:LINE:COL` (its
+declaration or any use) or `FN::name` (`main::x`, `Catalog::add::qty`).
+What is renamed is the local the checker resolved: its declaration and
+every use, in each instance of a generic function too; a local of the
+same name that it shadows, or that shadows it, keeps its name
+(`FN::name` naming several is `error refactor.ambiguous-local`, `try:`
+each by its position). Refused (`refactor.collision`) when NEW is
+already a name in its scope: another local declared there, or a name
+used there that is not this local. `self` keeps its name.
+
+Mentions in comments are renamed only between backquotes on `//`
+lines, never other words, and only in these forms:
+
+- an item: `` `old` ``, `` `m::old` ``, `` `old()` ``, when no other
+  definition is named old; a bare `` `old` `` is left alone inside a
+  function that has a local or parameter named old, and in the comment
+  above it (it may mean that local);
+- a field, variant or method (here and in `refactor field|variant
+  --rename`): `` `Owner.old` ``, `` `Owner::old` ``, `` `Owner::old()` ``,
+  `` `m::Owner::old` ``, Owner its struct, enum, trait or impl type;
+  never a bare `` `old` `` (a parameter of that name is as likely);
+- a local: `` `old` `` in its scope; for a parameter, its function and
+  the comment above it.
 
 A name taken is `error refactor.collision: 'NEW' is already a name in
 MODULE (KIND PATH)`, `try:` the query that shows it.

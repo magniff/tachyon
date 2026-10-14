@@ -74,6 +74,22 @@ case("grep of text suggests query grep",
 case("grep of a name suggests refs and grep",
      "query refs run_gvn | tachyonc query grep run_gvn" in blocked("grep -rn run_gvn compiler/src")[1], True)
 case("read docs",blocked("grep -n edit docs/refactor.md")[0], False)
+# (0.14) Alternatives and regexes are never glued into one name.
+case("grep of alternatives: one query each",
+     blocked("grep -n 'cmd_add\\|qty' compiler/src/a.tach")[1].split("\n")[1],
+     "try: tachyonc query refs cmd_add qty | tachyonc query grep cmd_add | tachyonc query grep qty"
+     " | override: append '# no-query: <why query is not enough>'")
+case("grep -E of alternatives",
+     "query refs Item calc | tachyonc query grep Item | tachyonc query grep calc"
+     in blocked("grep -En 'Item|calc' compiler/src/a.tach")[1], True)
+case("grep -e twice", "query refs a_b c_d |" in blocked("grep -e a_b -e c_d compiler/src/a.tach")[1], True)
+case("grep of a word-bounded name", "query refs qty | tachyonc query grep qty"
+     in blocked("grep -n '\\bqty\\b' compiler/src/a.tach")[1], True)
+case("grep of a regex: its longest literal, not a glued name",
+     "query grep total_qty | " in blocked("grep -n 'total_qty.*(self' compiler/src/a.tach")[1]
+     and "total_qtyself" not in blocked("grep -n 'total_qty.*(self' compiler/src/a.tach")[1], True)
+case("grep of texts with alternatives", "query grep 'no root' | tachyonc query grep 'bad root'"
+     in blocked("grep -rn 'no root\\|bad root' compiler/src")[1], True)
 case("read escape", blocked("sed -n '1,9p' compiler/src/gvn.tach  # no-query: the use lines")[0], False)
 
 # Rewriting compiler source in place: blocked, with `edit patch`.

@@ -1,0 +1,403 @@
+// Renaming a local (0.14): `refactor rename FILE:LINE:COL NEW` at a local
+// variable or a parameter (its declaration or a use), or `refactor rename
+// FN::local NEW`. A local is what the checker resolved: each `let`,
+// pattern binding and parameter declares one of its own, so another local
+// of the same name (one it shadows, or one shadowing it) keeps its name.
+// Its declaration and every use are renamed, and the backquoted mentions
+// `old` in the comments of its scope (for a parameter: of its function,
+// the comment above it included). Refused when the new name is already a
+// name in that scope: another local declared there, or a name used there
+// that is not this local.
+
+use crate::base::{
+    FILES, IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, intern,
+};
+use crate::front::ast::{NODES, NODE_COUNT, NodeKind};
+use crate::front::check::{LOCALS, LOCAL_COUNT, Res};
+use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
+use crate::middle::lower::ssa::HMap;
+use crate::tools::query::{c_slice, parse_digits, trailing_number};
+use crate::tools::query::defs::{
+    DEFS, DEF_COUNT, K_FN, K_IMPL_METHOD, K_METHOD, K_TRAIT_FN, bytes_eq, find_defs,
+};
+use crate::tools::query::diagnostics::{diag, put_word, try_begin, try_end};
+use crate::tools::query::positions::{
+    LINES, enclosing, find_name, line_end, line_index, put_loc, token_at,
+};
+use crate::tools::query::refs::{R_DEF, R_POS};
+use crate::tools::query::show::text_start;
+use crate::tools::query::typeat::file_named;
+use crate::tools::refactor_mod::{REFS, put_edit, text_of};
+use crate::tools::refactor_mod::cli::{finish, user_pos};
+use crate::tools::refactor_mod::mentions::{MENTION_LOCAL, scan_mentions};
+use crate::tools::refactor_shape::body::{load_body, parent};
+
+// The position of the name of each local's declaration, by local (+ 1
+// both); the copies of a generic function's body in its instances
+// declare locals of their own at the same positions.
+static mut DECL_POS: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+// The position of the name the PatBind or Param node n declares, or -1
+// (n declares no local in a file of the program).
+pub fn decl_name_pos(n: i64) -> i64 {
+    unsafe {
+        let k = NODES[n].kind;
+        if k != NodeKind::PatBind && k != NodeKind::Param {
+            return -1;
+        }
+        let l = NODES[n].x;
+        if l < 0 || l >= LOCAL_COUNT || LOCALS[l].name != NODES[n].a
+            || NODES[n].end <= NODES[n].start || !user_pos(NODES[n].start) {
+            return -1;
+        }
+        find_name(NODES[n].start, NODES[n].end, NODES[n].a, false)
+    }
+}
+
+// Fills DECL_POS.
+pub fn load_decls() {
+    unsafe {
+        if DECL_POS.count > 0 {
+            return;
+        }
+        for n in 1..NODE_COUNT {
+            let p = decl_name_pos(n);
+            if p >= 0 && DECL_POS.get(NODES[n].x + 1) == 0 {
+                DECL_POS.put(NODES[n].x + 1, p + 1);
+            }
+        }
+    }
+}
+
+// The position of the declaration of the local node n names (an Ident),
+// or -1.
+pub fn use_decl(n: i64) -> i64 {
+    unsafe {
+        if NODES[n].kind != NodeKind::Ident || NODES[n].res != Res::Local {
+            return -1;
+        }
+        let l = NODES[n].y;
+        if l < 0 || l >= LOCAL_COUNT || LOCALS[l].name != NODES[n].a {
+            return -1;
+        }
+        DECL_POS.get(l + 1) - 1
+    }
+}
+
+// The start of the identifier at `FILE:LINE:COL` (the column anywhere in
+// it), or -1: NAME is not of that form, or no identifier is there.
+pub fn ident_at_column(name: [u8]) -> i64 {
+    unsafe {
+        let a = trailing_number(name);
+        if a <= 0 || name[a - 1] != ':' || (a >= 2 && name[a - 2] == ':') {
+            return -1;
+        }
+        let col = parse_digits(name[a..name.len]);
+        let rest = name[0..a - 1];
+        let b = trailing_number(rest);
+        if b <= 0 || rest[b - 1] != ':' || (b >= 2 && rest[b - 2] == ':') {
+            return -1;
+        }
+        let line = parse_digits(rest[b..rest.len]);
+        let f = file_named(rest[0..b - 1]);
+        if f < 0 || line < 1 || col < 1 {
+            return -1;
+        }
+        let idx = line_index(FILES[f].start) + line - 1;
+        if idx >= LINES.count || LINES.data[idx] >= FILES[f].end {
+            return -1;
+        }
+        let pos = LINES.data[idx] + col - 1;
+        if pos >= line_end(LINES.data[idx]) {
+            return -1;
+        }
+        let mut t = token_at(pos);
+        if t >= TOK_COUNT || TOKS[t].start > pos {
+            t -= 1;
+        }
+        if t < 0 || TOKS[t].kind != Tok::Ident || TOKS[t].start > pos || TOKS[t].end <= pos {
+            return -1;
+        }
+        TOKS[t].start
+    }
+}
+
+// The declaration of the local at position at (its declaration's name, or
+// a use), or -1.
+fn local_at(at: i64) -> i64 {
+    unsafe {
+        for n in 1..NODE_COUNT {
+            if NODES[n].start > at || NODES[n].end <= at {
+                continue;
+            }
+            if decl_name_pos(n) == at {
+                return at;
+            }
+            if NODES[n].start == at {
+                let d = use_decl(n);
+                if d >= 0 {
+                    return d;
+                }
+            }
+        }
+        -1
+    }
+}
+
+// `FILE:LINE:COL` at a reference or a definition's name (refs loaded):
+// that definition; -1 when NAME is not a position at one (rename takes
+// the innermost item holding the line), -2 after a diagnostic (one not in
+// a file of the program).
+pub fn def_at_column(name: [u8]) -> i64 {
+    unsafe {
+        let at = ident_at_column(name);
+        if at < 0 {
+            return -1;
+        }
+        let mut d = -1;
+        for k in 0..REFS.count {
+            let r = REFS.data[k];
+            if R_POS.data[r] == at {
+                d = R_DEF.data[r];
+                break;
+            }
+        }
+        if d < 0 {
+            for e in 0..DEF_COUNT {
+                if DEFS[e].name_pos == at {
+                    d = e;
+                    break;
+                }
+            }
+        }
+        if d >= 0 && !user_pos(DEFS[d].start) {
+            let e = diag(c"error", c"edit.not-source");
+            buf_bytes(e, SYMS[DEFS[d].fqn].text);
+            buf_str(e, c" is not in a file of the program\n");
+            return -2;
+        }
+        d
+    }
+}
+
+// Whether definition d is a function with a body.
+fn is_function(d: i64) -> bool {
+    unsafe {
+        let k = DEFS[d].kind;
+        (k == K_FN || k == K_METHOD || k == K_IMPL_METHOD || k == K_TRAIT_FN)
+            && user_pos(DEFS[d].start)
+    }
+}
+
+// `FN::local`: the declarations of the locals named by NAME's last segment
+// in the functions its other segments name, into out (their positions);
+// false when NAME is not of that form or names no function.
+fn locals_named(name: [u8], out: *IntVec) -> bool {
+    unsafe {
+        let mut i = name.len;
+        while i >= 2 && !(name[i - 1] == ':' && name[i - 2] == ':') {
+            i -= 1;
+        }
+        if i < 3 || i >= name.len {
+            return false;
+        }
+        let mut whole = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        find_defs(name, false, &whole);
+        if whole.count > 0 {
+            return false;
+        }
+        let mut fns = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        find_defs(name[0..i - 2], false, &fns);
+        let sym = intern(name[i..name.len]);
+        let mut any = false;
+        let mut seen = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        for k in 0..fns.count {
+            let d = fns.data[k];
+            if !is_function(d) {
+                continue;
+            }
+            any = true;
+            for n in 1..NODE_COUNT {
+                if NODES[n].a != sym || NODES[n].start < DEFS[d].start
+                    || NODES[n].start >= DEFS[d].end {
+                    continue;
+                }
+                let p = decl_name_pos(n);
+                if p >= 0 && seen.get(p + 1) == 0 {
+                    seen.put(p + 1, 1);
+                    (*out).push(p);
+                }
+            }
+        }
+        any
+    }
+}
+
+// `refactor rename` of a local, when NAME names one: the command's status;
+// -1 when NAME is not a local (a definition, or nothing: rename goes on).
+pub fn local_rename(name: [u8], new: [u8], root: *u8) -> i64 {
+    unsafe {
+        load_decls();
+        let at = ident_at_column(name);
+        let mut decl = -1;
+        if at >= 0 {
+            decl = local_at(at);
+        } else {
+            let mut found = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            if !locals_named(name, &found) {
+                return -1;
+            }
+            if found.count == 0 {
+                let e = diag(c"error", c"query.no-match");
+                buf_str(e, c"no definition or local '");
+                buf_bytes(e, name);
+                buf_str(e, c"'\n");
+                let mut i = name.len;
+                while i >= 2 && !(name[i - 1] == ':' && name[i - 2] == ':') {
+                    i -= 1;
+                }
+                try_end(try_begin(c"show", name[0..i - 2], true));
+                return 1;
+            }
+            if found.count > 1 {
+                let e = diag(c"error", c"refactor.ambiguous-local");
+                buf_bytes(e, name);
+                buf_str(e, c" is several locals (shadowing); name one by its position\n");
+                for k in 0..found.count {
+                    if k == 3 {
+                        break;
+                    }
+                    let loc = buf_new();
+                    put_loc(loc, found.data[k]);
+                    let out = try_begin(c"rename", buf_slice(loc), true);
+                    put_word(out, new);
+                    try_end(out);
+                }
+                return 1;
+            }
+            decl = found.data[0];
+        }
+        if decl < 0 {
+            return -1;
+        }
+        rename_local_at(decl, new, root)
+    }
+}
+
+// The scope of the local declared at decl, in function f, from *from to
+// the position returned: for a parameter, the function; for a `let`, from
+// the end of the statement (its value is not in it) to the end of the
+// block holding it; for another pattern, from the declaration to the end
+// of its match arm or loop.
+fn scope_of(f: i64, decl: i64, is_param: bool, from: *i64) -> i64 {
+    unsafe {
+        *from = if is_param { DEFS[f].start } else { decl };
+        if is_param {
+            return DEFS[f].end;
+        }
+        load_body(DEFS[f].node);
+        for n in 1..NODE_COUNT {
+            if NODES[n].kind != NodeKind::PatBind || decl_name_pos(n) != decl {
+                continue;
+            }
+            let mut p = parent(n);
+            if p > 0 && NODES[p].kind == NodeKind::Let {
+                *from = NODES[p].end;
+            }
+            while p > 0 {
+                let k = NODES[p].kind;
+                if k == NodeKind::Block || k == NodeKind::Arm || k == NodeKind::For
+                    || k == NodeKind::While || k == NodeKind::Loop {
+                    return NODES[p].end;
+                }
+                p = parent(p);
+            }
+        }
+        DEFS[f].end
+    }
+}
+
+// Renames the local declared at decl to new.
+fn rename_local_at(decl: i64, new: [u8], root: *u8) -> i64 {
+    unsafe {
+        let t = token_at(decl);
+        let old = TOKS[t].value as i64;
+        let o = SYMS[old].text;
+        let newsym = intern(new);
+        let f = enclosing(decl);
+        if f < 0 || !is_function(f) {
+            return -1;
+        }
+        let loc = buf_new();
+        put_loc(loc, decl);
+        if bytes_eq(o, new) {
+            let e = diag(c"note", c"edit.unchanged");
+            buf_str(e, c"nothing to change\n");
+            return 0;
+        }
+        if bytes_eq(o, c_slice(c"self")) || bytes_eq(new, c_slice(c"self")) {
+            let e = diag(c"error", c"refactor.usage");
+            buf_str(e, c"self keeps its name (a method's first parameter is self)\n");
+            return 2;
+        }
+        // The scope: a parameter's is its function, comment included.
+        let mut is_param = false;
+        for n in 1..NODE_COUNT {
+            if NODES[n].kind == NodeKind::Param && decl_name_pos(n) == decl {
+                is_param = true;
+                break;
+            }
+        }
+        let mut from = 0;
+        let to = scope_of(f, decl, is_param, &from);
+        // The new name must not be one in the scope already.
+        for n in 1..NODE_COUNT {
+            if NODES[n].a != newsym || NODES[n].start < from || NODES[n].start >= to {
+                continue;
+            }
+            let other_decl = decl_name_pos(n) >= 0;
+            let other_use = NODES[n].kind == NodeKind::Ident && use_decl(n) != decl;
+            if other_decl || other_use {
+                let e = diag(c"error", c"refactor.collision");
+                buf_byte(e, '\'');
+                buf_bytes(e, new);
+                buf_str(e, c"' is already a name in the scope of local ");
+                buf_bytes(e, o);
+                buf_str(e, c" (at ");
+                put_loc(e, NODES[n].start);
+                buf_str(e, c"); nothing written\n");
+                let out = try_begin(c"show", buf_slice(loc), true);
+                try_end(out);
+                return 1;
+            }
+        }
+        // The declaration and the uses.
+        let mut done = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        done.put(decl + 1, 1);
+        put_edit(decl, decl + o.len, text_of(new));
+        let mut uses = 0;
+        for n in 1..NODE_COUNT {
+            let p = NODES[n].start;
+            if use_decl(n) != decl || done.get(p + 1) != 0
+                || !bytes_eq(SRC[p..p + o.len], o) {
+                continue;
+            }
+            done.put(p + 1, 1);
+            put_edit(p, p + o.len, text_of(new));
+            uses += 1;
+        }
+        scan_mentions(if is_param { text_start(f) } else { decl }, to, o, new, MENTION_LOCAL,
+            o[0..0]);
+        let what = buf_new();
+        buf_str(what, if is_param { c"renamed parameter " } else { c"renamed local " });
+        buf_bytes(what, o);
+        buf_str(what, c" to ");
+        buf_bytes(what, new);
+        buf_str(what, c" in ");
+        buf_bytes(what, SYMS[DEFS[f].fqn].text);
+        buf_str(what, c", ");
+        buf_int(what, uses);
+        buf_str(what, if uses == 1 { c" use" } else { c" uses" });
+        finish(what, root)
+    }
+}
