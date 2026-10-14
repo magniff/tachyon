@@ -342,34 +342,18 @@ pub fn write_round() -> i64 {
 // then the files written (or the diff printed), the journal, the summary.
 pub fn finish_edit(what: [u8], root: *u8) -> i64 {
     unsafe {
+        // (0.14: edit replace, insert and patch, a step of a script: the
+        // imports the new text needs; unchecked, as the step is; a round
+        // per error the checker reports at a time)
+        if STEP_REPORT != 0 as *u8 && ADD_IMPORTS {
+            let mut rounds = 0;
+            while rounds < MAX_IMPORT_ROUNDS && imports_round(root) {
+                rounds += 1;
+            }
+            imports_note(rounds);
+        }
         // The diff (printed with --dry-run; it counts the lines).
-        let diff = buf_new();
-        for i in 0..CH_FILE.count {
-            let f = CH_FILE.data[i];
-            diff_texts(diff, file_text(f), SRC[FILES[f].start..FILES[f].end],
-                buf_slice(CH_TEXT.data[i]));
-        }
-        for i in 0..NEW_PATH.count {
-            let mut from = -1;
-            for k in 0..DEL_FILE.count {
-                if DEL_TO.data[k] == i {
-                    from = DEL_FILE.data[k];
-                }
-            }
-            if from >= 0 {
-                diff_moved(diff, file_text(from), shown_path(NEW_PATH.data[i] as *u8),
-                    SRC[FILES[from].start..FILES[from].end], buf_slice(NEW_TEXT.data[i]));
-            } else {
-                diff_texts(diff, shown_path(NEW_PATH.data[i] as *u8), SRC[0..0],
-                    buf_slice(NEW_TEXT.data[i]));
-            }
-        }
-        for k in 0..DEL_FILE.count {
-            let f = DEL_FILE.data[k];
-            if DEL_TO.data[k] < 0 {
-                diff_texts(diff, file_text(f), SRC[FILES[f].start..FILES[f].end], SRC[0..0]);
-            }
-        }
+        let mut diff = edit_diff();
         if STEP_REPORT != 0 as *u8 {
             return step_done(what);
         }
@@ -377,6 +361,22 @@ pub fn finish_edit(what: [u8], root: *u8) -> i64 {
         // 2, 3. The check.
         let mut added = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let checked = SKIP_CHECK || check_edited(root, &added);
+        // (0.14: edit replace, insert and patch: new errors, maybe names
+        // the new text uses from other modules; the imports `fix --only
+        // imports` adds, then the check again; not with --no-check, which
+        // asks for the errors)
+        if checked && added.count > 0 && ADD_IMPORTS && !SKIP_CHECK && !NO_CHECK {
+            let mut rounds = 0;
+            while added.count > 0 && rounds < MAX_IMPORT_ROUNDS && imports_round(root) {
+                added.count = 0;
+                check_edited(root, &added);
+                rounds += 1;
+            }
+            if rounds > 0 {
+                diff = edit_diff();
+            }
+            imports_note(rounds);
+        }
         if !checked {
             let d = diag(c"warning", c"edit.unchecked");
             buf_str(d, c"the edited program could not be checked (");
@@ -449,6 +449,114 @@ pub fn finish_edit(what: [u8], root: *u8) -> i64 {
             show_changes(buf_slice(diff));
         }
         if ok { 0 } else { 1 }
+    }
+}
+
+// (0.14) Whether finish_edit adds the imports an edit's new text needs
+// (edit replace, insert): a round of `fix --only imports` on the edited
+// files when the check finds new errors (in a script's step, always).
+pub static mut ADD_IMPORTS: bool = false;
+
+// The rounds of imports_round an edit runs at most (the checker reports
+// one unknown name of a function at a time).
+const MAX_IMPORT_ROUNDS: i64 = 4;
+
+// After `rounds` rounds of imports_round that added imports: the note.
+fn imports_note(rounds: i64) {
+    unsafe {
+        if rounds > 0 {
+            let d = diag(c"note", c"edit.imports");
+            buf_str(d, c"added the imports the new text needs (fix --only imports)\n");
+        }
+    }
+}
+
+// The round of `fix --round --only imports --in FILE` on the edited
+// program, for each file the edit changed: the copies of the files it
+// fixed have their new texts. Whether it added an import.
+fn imports_round(root: *u8) -> bool {
+    unsafe {
+        let mut any = false;
+        let n = CH_FILE.count;
+        for i in 0..n {
+            let mut args = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            args.push(PROG as i64);
+            args.push(c"fix" as i64);
+            args.push(c"--round" as i64);
+            args.push(c"--only" as i64);
+            args.push(c"imports" as i64);
+            args.push(c"--in" as i64);
+            // (as --in takes it: without `./`)
+            let mut path = FILES[CH_FILE.data[i]].path;
+            while path[0] == '.' && path[1] == '/' {
+                path = &path[2];
+            }
+            args.push(path as i64);
+            if TARGET_NAME != 0 as *u8 {
+                args.push(c"--target" as i64);
+                args.push(TARGET_NAME as i64);
+            }
+            overlay_args(&args);
+            args.push(root as i64);
+            args.push(0);
+            let out = buf_new();
+            if run_capture(args.data as **u8, out) != 0 {
+                continue;
+            }
+            let t = buf_slice(out);
+            let mut p = 0;
+            while p < t.len {
+                let mut e = p;
+                while e < t.len && t[e] != '\n' {
+                    e += 1;
+                }
+                let line = t[p..e];
+                if line.len > 5 && line[0] == 'f' && line[4] == '\t'
+                    && copy_rewritten(line[5..line.len]) {
+                    any = true;
+                }
+                p = e + 1;
+            }
+        }
+        any
+    }
+}
+
+// The diff of the edit (its new texts against the files), counting the
+// lines added and removed (ADDED, REMOVED): a buffer.
+fn edit_diff() -> i64 {
+    unsafe {
+        // (counted again: an edit may be diffed after a round of imports)
+        ADDED = 0;
+        REMOVED = 0;
+        let diff = buf_new();
+        for i in 0..CH_FILE.count {
+            let f = CH_FILE.data[i];
+            diff_texts(diff, file_text(f), SRC[FILES[f].start..FILES[f].end],
+                buf_slice(CH_TEXT.data[i]));
+        }
+        for i in 0..NEW_PATH.count {
+            let mut from = -1;
+            for k in 0..DEL_FILE.count {
+                if DEL_TO.data[k] == i {
+                    from = DEL_FILE.data[k];
+                }
+            }
+            if from >= 0 {
+                diff_moved(diff, file_text(from), shown_path(NEW_PATH.data[i] as *u8),
+                    SRC[FILES[from].start..FILES[from].end], buf_slice(NEW_TEXT.data[i]));
+            } else {
+                diff_texts(diff, shown_path(NEW_PATH.data[i] as *u8), SRC[0..0],
+                    buf_slice(NEW_TEXT.data[i]));
+            }
+        }
+        for k in 0..DEL_FILE.count {
+            let f = DEL_FILE.data[k];
+            if DEL_TO.data[k] < 0 {
+                diff_texts(diff, file_text(f), SRC[FILES[f].start..FILES[f].end], SRC[0..0]);
+            }
+        }
+        diff
     }
 }
 
