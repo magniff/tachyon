@@ -70,7 +70,14 @@ command -v docker >/dev/null 2>&1 || die "docker not found"
 command -v git >/dev/null 2>&1 || die "git not found"
 
 echo "==> building the image $IMAGE ($PLATFORM)" >&2
-docker build --quiet --platform "$PLATFORM" -t "$IMAGE" \
+# The base image by the digest of its manifest for this platform: the
+# legacy builder takes a multi-platform tag for the machine's own platform
+# once that one is stored (as the other Linux check stores it).
+BASE=$(docker manifest inspect debian:bookworm-slim | awk -v arch="${PLATFORM#linux/}" '
+    /"digest"/ { d = $2; gsub(/[",]/, "", d) }
+    /"architecture"/ { a = $2; gsub(/[",]/, "", a); if (a == arch && !found) { print d; found = 1 } }')
+[ -n "$BASE" ] || die "no $PLATFORM manifest of debian:bookworm-slim"
+docker build --quiet --platform "$PLATFORM" --build-arg BASE="debian@$BASE" -t "$IMAGE" \
     -f "$ROOT/bootstrap/ci/linux-x86_64.Dockerfile" "$ROOT/seed" >/dev/null
 
 SNAP=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-linux-check.XXXXXX")

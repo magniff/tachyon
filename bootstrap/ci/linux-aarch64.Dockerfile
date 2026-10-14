@@ -5,7 +5,10 @@
 # git, a C compiler with the libc headers, binutils (objdump, for
 # tests/objcheck.sh) and gdb (the debugger check), on Debian's slim image,
 # which has the POSIX utilities the scripts use.
-FROM debian:bookworm-slim
+# Debian bookworm-slim, by the digest of the manifest for the platform
+# (given by the check script).
+ARG BASE=debian:bookworm-slim
+FROM $BASE
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates git gcc libc6-dev binutils gdb \

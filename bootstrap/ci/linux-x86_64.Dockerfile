@@ -4,7 +4,10 @@
 # image, which has the POSIX utilities the scripts use, and gdb for the
 # debugger check (0.11). See bootstrap/linux-check.sh, which builds and
 # runs it.
-FROM debian:bookworm-slim
+# Debian bookworm-slim, by the digest of the manifest for the platform
+# (given by the check script).
+ARG BASE=debian:bookworm-slim
+FROM $BASE
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl git gcc libc6-dev gdb \
