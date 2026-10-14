@@ -1,8 +1,8 @@
 // tachyonc: the tachyon compiler, written in tachyon. This file is the root
-// of its module tree, one module per file of this directory (see
-// compiler/README.md): tokens -> AST -> modules and names -> checked AST ->
-// -O0's code generator, or (-O1, -O2) SSA IR -> the optimizer -> instruction
-// selection -> register allocation -> assembly.
+// of its module tree and the driver; the modules are in a folder per phase
+// (see compiler/README.md): tokens -> AST -> modules and names -> checked
+// AST -> -O0's code generator, or (-O1, -O2) SSA IR -> the optimizer ->
+// instruction selection -> register allocation -> assembly.
 //
 // The command line:
 //
@@ -67,170 +67,57 @@
 //   tachyonc --tokens <file.tach>   print the tokens of one file
 //   tachyonc --version              print the release and the host target
 
-// Basics: the C library, arrays, buffers, symbols, files, errors.
+// Basics: the C library, arrays, buffers, symbols, files, errors, timers.
 mod base;
-
-// The front end: tokens, C headers (import, --emit-header), the built-in
-// std, the AST and parser, modules, types, the checker, constants,
-// patterns, generics; `tachyonc query` (0.11), and the tools built on it
-// (0.11): the planning queries, processes, the edit engine, fix,
-// same-output.
-mod lexer;
-mod cpp;
-mod cimport;
-mod cheader;
-mod stdsrc;
-mod ast;
-mod parser;
-mod modules;
-mod types;
-mod check;
-mod consteval;
-mod patterns;
-mod generics;
-mod traits;
-mod fiximports;
-mod fixunsafe;
-mod query;
-mod query_text;
-mod plan;
-mod proc;
-mod edit;
-mod patch;
-mod fix;
-mod sameout;
-mod rewrite;
-mod refactor_shape;
-mod refactor_mod;
-mod refactor_move;
-mod script;
-mod commands;
-
-// Code generation: the driver and -O0's generator, C's convention, the
-// target interface, -O0's instruction sets.
-mod gen;
-mod abi;
-mod target;
-mod arm64;
-mod x86_64;
-
+// The front end: tokens, C imports and headers, std, the AST, modules,
+// types, the checker.
+mod front;
 // The middle end (-O1, -O2): the IR, lowering to SSA, the passes.
-mod ir;
-mod lower;
-mod adce;
-mod opt;
-mod fold;
-mod gvn;
-mod egraph;
-mod sroa;
-mod inline;
-mod licm;
-mod loops;
-mod lsr;
-mod range;
-mod scev;
-mod tre;
-mod ipo;
-mod promote;
-mod timer;
-mod vectorize;
-mod slp;
-mod profile;
-mod unsafecheck;
-
+mod middle;
 // The back end: instruction selection, register allocation, emission,
-// block layout, the machine instructions.
-mod isel;
-mod regalloc;
-mod emit;
-mod layout;
-mod mc_arm64;
-mod mc_x86_64;
-mod objfile;
-mod enc_arm64;
-mod enc_x86;
-// Debug information (0.11).
-mod dwarf;
+// machine code, object files.
+mod back;
+// -O0's code generator and its target interface.
+mod gen0;
+// The tools on the front end (0.11): query, edit, refactor, fix, same-output.
+mod tools;
 
 // The standard library, named here in the root: 0.5.0, which builds this
 // compiler, reads std only when the files of the command line name it.
 use std::Option;
 
 use base::{
-    BUFS, DENY_WARNINGS, DIAG_SHORT, ERRORS_AS_DUMP, ERR_KIND, FILES, FILE_COUNT, IntVec, RECOVER_DEPTH, STDERR,
-    STDOUT, SYMS, _setjmp, add_source, alloc_array, alloc_zeroed, buf_byte, buf_bytes, buf_clear,
-    buf_int, buf_new, buf_reserve, buf_slice, buf_str, buf_uint, buf_write_fd, buf_write_file, die,
-    die2, err_begin, err_end, err_help, err_str, err_sym, error_at, exit, exit_if_errors, fail_name,
-    find_sym, free, grow, intern, intern_c, load_sources, memcmp, memcpy, memset, read_file,
-    recover_enter, recover_leave, strlen, strtod, sym_name, sym_table,
+    DENY_WARNINGS, DIAG_SHORT, ERRORS_AS_DUMP, ERR_KIND, FILES, FILE_COUNT, IntVec, STDOUT,
+    alloc_zeroed, buf_new, buf_str, buf_write_fd, die, die2, load_sources, streq,
 };
-use lexer::{
-    STRS, STR_COUNT, TOKS, TOK_COUNT, Tok, add_string, dump_tokens, init_lexer, is_alpha, is_digit,
-    is_ident_byte, keyword_of_sym, lex_range,
+use crate::base::timer::TIME_PASSES;
+use crate::front::lexer::{dump_tokens, init_lexer, lex_range};
+use crate::front::modules::load_modules;
+use crate::front::cimport::import_c_headers;
+use crate::front::cheader::EMIT_HEADER;
+use crate::gen0::gen::{EMIT_IR, EMIT_MIR, compile_program};
+use crate::gen0::target::{
+    T_AARCH64_LINUX, T_AARCH64_MACOS, T_X86_64_LINUX, T_X86_64_MACOS, set_target, target_name,
+    target_of_name,
 };
-use cpp::{
-    CDIRS, CINTS, CK, CTOKS, C_EOF, C_IMPORT_FILE, C_IMPORT_POS, EV_FAIL, EV_N, EV_POS, EV_TOKS,
-    MACROS, MACRO_COUNT, S_LPAREN, S_RPAREN, c_load_text, cpp_next, cpp_query_compiler, ctok_copy,
-    ctok_is, ctok_text, ev_convert, ev_peek, ev_unary, eval_tokens, expand_list, file_exists,
-    init_cpp, macro_of, macro_tok, path_dir, path_join, push_frame, snprintf, strtof, strtoull,
-};
-use cimport::{
-    c_import, cdecl_eval_special, cdecl_ident_value, cty_bits, cty_int, cty_signed,
-    drop_shadowed_imports,
-};
-use modules::{C_MODULE, MODULES, add_module, load_modules, module_of, qualify};
-use gen::{EMIT_IR, EMIT_MIR, OVERALIGNED, compile_program, overaligned_slot};
-use dwarf::DEBUG_INFO;
-use target::{
-    ASM, CODE, DATA, DEPTH, ELF, LINK_NAMES, PANIC_INDEX_SIGNED, PANIC_INDEX_UNSIGNED,
-    PANIC_RANGE_SIGNED, PANIC_RANGE_UNSIGNED, R_ACC, R_ADDR, R_LOOP_COUNT, R_LOOP_PTR, R_RESULT,
-    R_SECOND, T_AARCH64_LINUX, T_AARCH64_MACOS, T_X86_64_LINUX, T_X86_64_MACOS, X86, arg_location, data_align,
-    data_bytes, data_label, data_section, data_string, emit_add_imm, emit_bitnot, emit_call,
-    emit_call_indirect, emit_compare, emit_compare_jump, emit_copy, emit_decrement, emit_drop_temps,
-    emit_epilogue, emit_extern_symbol_addr, emit_file_header, emit_file_trailer, emit_float_binary,
-    emit_float_to_float, emit_float_to_int, emit_frame_addr, emit_frame_reserve,
-    emit_function_start, emit_index_addr, emit_int_binary, emit_int_to_float, emit_jump,
-    emit_jump_if_nonzero, emit_jump_if_zero, emit_jump_unless_zero_result, emit_label, emit_load,
-    emit_load_arg_reg, emit_load_callee, emit_load_float, emit_load_imm, emit_load_param,
-    emit_load_reg, emit_local_symbol_addr, emit_move_to_second, emit_negate, emit_normalize,
-    emit_not_bool, emit_panic, emit_peek, emit_peek_at, emit_runtime, emit_sp_add, emit_sp_sub,
-    emit_stack_arg, emit_store, emit_store_offset, emit_string_addr, first_int_arg, function_prefix,
-    global_prefix, local_prefix, log2, new_label, pop_d, pop_x, push_value, push_x0, set_target,
-    static_prefix, target_name, target_of_name, variadic_arg_location,
-};
-use objfile::{
-    FX_A64_ADR, FX_A64_B14, FX_A64_B19, FX_A64_B26, FX_A64_GOTPAGE, FX_A64_GOTPAGEOFF, FX_A64_PAGE,
-    FX_A64_PAGEOFF, FX_X86_BRANCH, FX_X86_GOT, FX_X86_RIP, OP_COUNT, OP_END, OP_START, OUTPUT_MODE,
-    OUT_ASM, OUT_OBJECT, TAIL_JCC, TAIL_JMP, asm_error, asym, emit_relaxable, fixup, here,
-    is_digit_start, out16, out32, out64, out8, output_mode_of, parse_number, text_is, write_output,
-};
-use ir::{
-    ARGS, ARGTY, BLOCKS, Cond, INSTS, INST_COUNT, IRF, IRFUNCS, IRFUNC_COUNT, Op, PRINT_AFTER_ALL,
-    Term, VERIFY_IR, cond_of_token, ir_append, ir_arg, ir_insert_before, ir_make, ir_operand,
-    ir_operand_count, ir_set_arg, ir_unlink, ir_val, pred_index, print_ir_func, verify_func,
-};
-use opt::{
-    OPT_LEVEL, add_pred_like, eliminate_dead_code, optimize_program, remove_block, remove_pred,
-    remove_pred_at, remove_trivial_phis, remove_unreachable, resolve_all, simplify_cfg,
-};
-use ipo::PRINT_ATTRS;
-use timer::{
-    TIME_PASSES, T_CHECK, T_CODEGEN, T_ISEL, T_LOWER, T_OUTPUT, T_PARSE, timer_add, timer_now,
-    timer_report,
-};
-use regalloc::{LDEPTH, PRINT_REGALLOC, VERIFY_REGALLOC, count_uses, layout_blocks};
-use egraph::{EGRAPH, check_rules};
-use vectorize::{UNROLL_RUNTIME, VECTORIZE};
-use slp::SLP;
-use profile::{PROFILE_GENERATE, PROFILE_USE};
-use unsafecheck::CHECK_UNSAFE;
-use emit::STATS;
-use query::run_query;
-use edit::{run_check, run_edit, run_undo_command};
-use fix::{run_fix, run_fix_alias};
-use plan::run_lint;
-use sameout::run_same_output;
-use commands::run_tool;
+use crate::middle::ir::{PRINT_AFTER_ALL, VERIFY_IR};
+use crate::middle::opt::OPT_LEVEL;
+use crate::middle::ipo::PRINT_ATTRS;
+use crate::middle::egraph::{EGRAPH, check_rules};
+use crate::middle::vectorize::{UNROLL_RUNTIME, VECTORIZE};
+use crate::middle::slp::SLP;
+use crate::middle::profile::{PROFILE_GENERATE, PROFILE_USE};
+use crate::middle::unsafecheck::CHECK_UNSAFE;
+use crate::back::regalloc::{PRINT_REGALLOC, VERIFY_REGALLOC};
+use crate::back::emit::STATS;
+use crate::back::objfile::{OUTPUT_MODE, OUT_ASM, OUT_OBJECT, output_mode_of};
+use crate::back::dwarf::DEBUG_INFO;
+use crate::tools::query::run_query;
+use crate::tools::edit::{run_check, run_edit, run_undo_command};
+use crate::tools::fix::{run_fix, run_fix_alias};
+use crate::tools::plan::run_lint;
+use crate::tools::sameout::run_same_output;
+use crate::tools::commands::run_tool;
 
 extern "C" {
     fn uname(info: *u8) -> i32;
@@ -289,13 +176,6 @@ fn print_version() {
         buf_str(out, if host == 0 { c"unsupported" } else { target_name(host) });
         buf_str(out, c")\n");
         buf_write_fd(out, STDOUT);
-    }
-}
-
-pub fn streq(a: *u8, b: *u8) -> bool {
-    unsafe {
-        let n = strlen(a);
-        n == strlen(b) && memcmp(a, b, n) == 0
     }
 }
 
@@ -566,70 +446,5 @@ fn main(argc: i32, argv: **u8) -> i32 {
         lex_range(FILES[FILE_COUNT - 1].end, FILES[FILE_COUNT - 1].end, true);
         compile_program(output);
         0
-    }
-}
-
-// --emit-header: write the program's C header (cheader.tach).
-pub static mut EMIT_HEADER: bool = false;
-
-// The start in SRC of the declarations imported from C headers (-1: no
-// `import`).
-pub static mut IMPORTED_START: i64 = -1;
-
-// `import "header.h" as c;` items: the headers are read (cimport.tach) and
-// their declarations, as tachyon source, are added to the program.
-pub fn import_c_headers(target: i64, include_dirs: *IntVec, emit: bool, output: *u8) {
-    unsafe {
-        let mut names = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        let mut dirs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for i in 0..TOK_COUNT {
-            if TOKS[i].kind == Tok::Import && i + 1 < TOK_COUNT && TOKS[i + 1].kind == Tok::Str {
-                let name = STRS[TOKS[i + 1].value as i64].ptr;
-                let mut file = 0;
-                while file + 1 < FILE_COUNT && TOKS[i].start >= FILES[file + 1].start {
-                    file += 1;
-                }
-                names.push(name as i64);
-                C_IMPORT_POS.push(TOKS[i + 1].start);
-                dirs.push(path_dir(FILES[file].path) as i64);
-            }
-        }
-        if names.count == 0 {
-            if emit {
-                buf_write_file(buf_new(), output);
-                exit(0);
-            }
-            return;
-        }
-        // A recovery point (0.10): after an error in the headers, the
-        // program is checked without them; the names they would have
-        // brought (`c` in `import "h.h" as c;`) are failed names.
-        let depth = RECOVER_DEPTH;
-        let mut text = -1;
-        if _setjmp(recover_enter()) == 0 {
-            text = c_import(&names, &dirs, include_dirs, target);
-        }
-        recover_leave(depth);
-        if text < 0 {
-            for i in 0..TOK_COUNT {
-                if TOKS[i].kind == Tok::Import && i + 3 < TOK_COUNT && TOKS[i + 2].kind == Tok::As
-                    && TOKS[i + 3].kind == Tok::Ident {
-                    fail_name(TOKS[i + 3].value as i64);
-                }
-            }
-            if emit {
-                exit_if_errors();
-            }
-            return;
-        }
-        if emit {
-            buf_write_file(text, output);
-            exit(0);
-        }
-        IMPORTED_START = add_source(c"<C import>", text);
-        C_MODULE = add_module(intern_c(c"<c>"), 0, true);
-        MODULES[C_MODULE].is_c = true;
-        FILES[FILE_COUNT - 1].module = C_MODULE;
-        lex_range(IMPORTED_START, FILES[FILE_COUNT - 1].end, false);
     }
 }

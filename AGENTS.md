@@ -57,7 +57,7 @@ blocks shell commands that read `.tach` source and suggests the query
 that answers them. When the query is not enough, rerun the shell command
 with a trailing comment saying why:
 
-    sed -n '120,180p' compiler/src/gvn.tach  # no-query: need the comment block above run_gvn, show omits it
+    sed -n '120,180p' compiler/src/middle/gvn.tach  # no-query: need the comment block above run_gvn, show omits it
 
 The reason is recorded (`.git/agent-tools.jsonl`) and is how the tool
 gets better, so be specific: what you needed, and what query gave or

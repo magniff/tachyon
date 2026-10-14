@@ -125,13 +125,13 @@ TAB=$(printf '\t')
 out=$("$COMPILER" query stats --over 1000 2>&1)
 ok=0
 n=$(printf '%s\n' "$out" | grep -c "^[0-9]*${TAB}[0-9]*${TAB}compiler/src/[a-z_0-9/]*\.tach")
-[ "$n" -ge 40 ] && printf '%s\n' "$out" | head -5 | grep -q "${TAB}compiler/src/check.tach${TAB}over\$" \
+[ "$n" -ge 40 ] && printf '%s\n' "$out" | head -5 | grep -q "${TAB}compiler/src/front/check.tach${TAB}over\$" \
     && printf '%s\n' "$out" | grep -q "^[0-9]*${TAB}[0-9]*${TAB}total\$" \
     && printf '%s\n' "$out" | grep -q '^note query.over: [0-9]* files over 1000 lines$' && ok=1
 check self_stats "$ok" "$(printf '%s\n' "$out" | head -8)"
 out=$("$COMPILER" query stats gvn 2>&1)
 ok=0
-printf '%s\n' "$out" | head -1 | grep -q "^# crate::gvn${TAB}compiler/src/gvn.tach${TAB}[0-9]* lines${TAB}[0-9]* items\$" \
+printf '%s\n' "$out" | head -1 | grep -q "^# crate::middle::gvn${TAB}compiler/src/middle/gvn.tach${TAB}[0-9]* lines${TAB}[0-9]* items\$" \
     && printf '%s\n' "$out" | grep -q "^[0-9]*${TAB}fn${TAB}run_gvn\$" && ok=1
 check self_stats_module "$ok" "$(printf '%s\n' "$out" | head -5)"
 # deps: every item of a module, and groups of at most N lines, each at
@@ -158,7 +158,7 @@ check self_unused "$ok" "$(printf '%s\n' "$out" | head -5)"
 # impact: the calls of a function used in several files.
 out=$("$COMPILER" query impact base::grow 2>&1)
 ok=0
-printf '%s\n' "$out" | head -1 | grep -q "^crate::base::grow${TAB}compiler/src/base.tach:" \
+printf '%s\n' "$out" | head -1 | grep -q "^crate::base::grow${TAB}compiler/src/base/mod.tach:" \
     && printf '%s\n' "$out" | grep -q "^instances${TAB}[0-9]*${TAB}grow<" \
     && printf '%s\n' "$out" | grep -q "^total${TAB}[0-9]*${TAB}[0-9]*${TAB}[0-9]* files" && ok=1
 check self_impact "$ok" "$(printf '%s\n' "$out" | head -3)"
@@ -166,8 +166,8 @@ check self_impact "$ok" "$(printf '%s\n' "$out" | head -3)"
 out=$("$COMPILER" lint --max-lines 1000 2>&1)
 rc=$?
 ok=0
-[ $rc = 1 ] && printf '%s\n' "$out" | head -1 | grep -q '^error lint.max-lines: compiler/src/check.tach: [0-9]* lines (at most 1000)$' \
-    && printf '%s\n' "$out" | grep -q "^try: .* query deps crate::check --max-lines 1000\$" && ok=1
+[ $rc = 1 ] && printf '%s\n' "$out" | head -1 | grep -q '^error lint.max-lines: compiler/src/front/check.tach: [0-9]* lines (at most 1000)$' \
+    && printf '%s\n' "$out" | grep -q "^try: .* query deps crate::front::check --max-lines 1000\$" && ok=1
 check self_lint "$ok" "$(printf '%s\n' "$out" | head -4)"
 "$COMPILER" lint --max-lines 100000 >/dev/null 2>&1
 check self_lint_ok "$([ $? = 0 ] && echo 1)" "lint --max-lines 100000 failed"

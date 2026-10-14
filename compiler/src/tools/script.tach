@@ -1,0 +1,403 @@
+// `tachyonc refactor --script FILE [--dry-run] [--no-check] [--root R]`
+// (0.11; docs/refactor.md): the commands of FILE (refactor, rewrite,
+// edit, fix: one per line, as typed after `tachyonc`, quoted as in sh;
+// `#` comments; `< PATH` gives a command its stdin), applied in turn and
+// checked once, at the end: all or nothing.
+//
+// Each command runs in a copy of this process (fork), on the program as
+// the commands before it left it: their copies (`FILE.tachyon-edit~`)
+// read in place of the files (--overlay). It is a step (edit.tach's
+// STEP_REPORT): it prints its summary line and writes its copies, unchecked,
+// and lists their files. A command that fails ends the script: the
+// copies are removed, nothing is written. After the last one, the edit
+// engine runs on the copies as one edit (finish_edit): the check, then
+// the files written and journaled as one edit (one `undo`), or with
+// --dry-run the diff; and a total line.
+//
+// The commands come from commands.tach's table (run_tool), so a command
+// added there runs in scripts too.
+
+use crate::base::{IntVec, OVERLAY, alloc_array, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str};
+use crate::tools::query::{PROG, ROOT_GIVEN, TOOL, c_slice, diag, load_program, program_errors, put_root, root_or_diag, write_diags};
+use crate::tools::edit::{
+    DRY_RUN, NO_CHECK, STEP_REPORT, TARGET, TARGET_NAME, copy_made, copy_path, copy_rewritten, edit_remove_file,
+    finish_edit, gone_path, remove_empty_dirs, set_command, take_edit_option,
+};
+use crate::tools::proc::{buf_cstr, fork_worker, read_file_if, remove_file, wait_any, worker_exit};
+use crate::tools::commands::{is_tool, run_tool};
+use crate::base::streq;
+
+extern "C" {
+    fn open(path: *u8, flags: i32) -> i32;
+    fn dup2(from: i32, to: i32) -> i32;
+    fn close(fd: i32) -> i32;
+}
+
+// The files the steps changed (C strings), and what each is: 0 changed,
+// 1 made, 2 moved away (removed), 3 made and moved away again.
+static mut CHANGED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut MADE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+pub fn run_script(argc: i64, argv: **u8) -> i64 {
+    let status = script_inner(argc, argv);
+    write_diags();
+    status
+}
+
+fn usage(message: *u8) -> i64 {
+    unsafe {
+        let d = diag(c"error", c"refactor.usage");
+        buf_str(d, message);
+        buf_byte(d, '\n');
+        let out = crate::tools::query::diags();
+        buf_str(out, c"try:");
+        crate::tools::query::put_cword(out, PROG);
+        buf_str(out, c" refactor --script steps.txt --dry-run");
+        put_root(out);
+        crate::tools::query::try_end(out);
+        2
+    }
+}
+
+// The words of a line, as sh splits them (`'...'`, `"..."` with `\"` and
+// `\\`; a word starting with `#` starts a comment), into `words` (C
+// strings). False when a quote is not closed.
+fn split_words(line: [u8], words: *IntVec) -> bool {
+    unsafe {
+        let mut i = 0;
+        while i < line.len {
+            while i < line.len && (line[i] == ' ' || line[i] == '\t' || line[i] == '\r') {
+                i += 1;
+            }
+            if i >= line.len || line[i] == '#' {
+                break;
+            }
+            let w = buf_new();
+            while i < line.len && line[i] != ' ' && line[i] != '\t' && line[i] != '\r' {
+                let c = line[i];
+                if c == '\'' || c == '"' {
+                    i += 1;
+                    while i < line.len && line[i] != c {
+                        if c == '"' && line[i] == '\\' && i + 1 < line.len && (line[i + 1] == '"' || line[i + 1] == '\\') {
+                            i += 1;
+                        }
+                        buf_byte(w, line[i]);
+                        i += 1;
+                    }
+                    if i >= line.len {
+                        return false;
+                    }
+                    i += 1;
+                } else {
+                    buf_byte(w, c);
+                    i += 1;
+                }
+            }
+            words.push(buf_cstr(w) as i64);
+        }
+        true
+    }
+}
+
+fn note_file(path: [u8], state: i64) {
+    unsafe {
+        for i in 0..CHANGED.count {
+            if crate::tools::proc::same_bytes(c_slice(CHANGED.data[i] as *u8), path) {
+                let was = MADE.data[i];
+                if state == 2 {
+                    // (moved away: a file made by a step before is none)
+                    MADE.data[i] = if was == 1 { 3 } else { 2 };
+                    remove_file(copy_path(CHANGED.data[i] as *u8));
+                } else if state == 1 && was == 2 {
+                    MADE.data[i] = 0;
+                } else if state == 1 && was == 3 {
+                    MADE.data[i] = 1;
+                }
+                return;
+            }
+        }
+        let b = buf_new();
+        buf_bytes(b, path);
+        CHANGED.push(buf_cstr(b) as i64);
+        MADE.push(state);
+    }
+}
+
+// The files a step listed (`file PATH`, `new PATH`).
+fn read_report(path: *u8) {
+    unsafe {
+        let b = buf_new();
+        if !read_file_if(path, b) {
+            return;
+        }
+        let t = buf_slice(b);
+        let mut i = 0;
+        while i < t.len {
+            let mut e = i;
+            while e < t.len && t[e] != '\n' {
+                e += 1;
+            }
+            let line = t[i..e];
+            if line.len > 5 && line[0] == 'f' && line[4] == '\t' {
+                note_file(line[5..line.len], 0);
+            } else if line.len > 4 && line[0] == 'n' && line[3] == '\t' {
+                note_file(line[4..line.len], 1);
+            } else if line.len > 5 && line[0] == 'g' && line[4] == '\t' {
+                note_file(line[5..line.len], 2);
+            }
+            i = e + 1;
+        }
+    }
+}
+
+fn remove_all_copies() {
+    unsafe {
+        for i in 0..CHANGED.count {
+            remove_file(copy_path(CHANGED.data[i] as *u8));
+            if MADE.data[i] == 1 {
+                remove_empty_dirs(CHANGED.data[i] as *u8);
+            }
+        }
+    }
+}
+
+// Runs step `words` (stdin from `input`, when not 0) in a copy of this
+// process: its exit status.
+fn run_step(words: *IntVec, input: *u8, root: *u8, report: *u8) -> i64 {
+    unsafe {
+        let pid = fork_worker();
+        if pid < 0 {
+            return 1;
+        }
+        if pid == 0 {
+            // The copy: the program as the steps before left it.
+            for i in 0..CHANGED.count {
+                let p = CHANGED.data[i] as *u8;
+                OVERLAY.push(p as i64);
+                OVERLAY.push(if MADE.data[i] >= 2 { gone_path(p) } else { copy_path(p) } as i64);
+            }
+            STEP_REPORT = report;
+            DRY_RUN = false;
+            NO_CHECK = false;
+            if input != 0 as *u8 {
+                let fd = open(input, 0);
+                if fd < 0 {
+                    let d = diag(c"error", c"refactor.script");
+                    buf_str(d, c"cannot read '");
+                    buf_str(d, input);
+                    buf_str(d, c"'\n");
+                    write_diags();
+                    worker_exit(1);
+                }
+                dup2(fd, 0);
+                close(fd);
+            }
+            let n = (*words).count;
+            let args = alloc_array::<*u8>(n + 6);
+            args[0] = PROG;
+            for i in 0..n {
+                args[i + 1] = (*words).data[i] as *u8;
+            }
+            let mut argc = n + 1;
+            args[argc] = c"--root";
+            args[argc + 1] = root;
+            argc += 2;
+            if TARGET_NAME != 0 as *u8 {
+                args[argc] = c"--target";
+                args[argc + 1] = TARGET_NAME;
+                argc += 2;
+            }
+            args[argc] = 0 as *u8;
+            let status = run_tool(args[1], argc, args);
+            worker_exit(status);
+        }
+        let mut status = 0;
+        wait_any(&status);
+        status
+    }
+}
+
+fn script_inner(argc: i64, argv: **u8) -> i64 {
+    unsafe {
+        set_command(argc, argv);
+        PROG = argv[0];
+        TOOL = c"refactor";
+        let mut root = 0 as *u8;
+        let mut file = 0 as *u8;
+        let mut i = 3;
+        while i < argc {
+            let a = argv[i];
+            if take_edit_option(argc, argv, &i, &root) {
+                i += 1;
+                continue;
+            }
+            if a[0] == '-' && a[1] == '-' {
+                let d = diag(c"error", c"refactor.usage");
+                buf_str(d, c"unknown option '");
+                buf_str(d, a);
+                buf_str(d, c"' of refactor --script (--dry-run, --no-check, --root, --target)\n");
+                return 2;
+            }
+            if file == 0 as *u8 {
+                file = a;
+            } else if root == 0 as *u8 && crate::tools::query::ends_with_c(a, c".tach") {
+                root = a;
+            } else {
+                return usage(c"one FILE of commands");
+            }
+            i += 1;
+        }
+        if file == 0 as *u8 {
+            return usage(c"a FILE of commands is needed");
+        }
+        ROOT_GIVEN = root;
+        root = root_or_diag(root, c"--script", c_slice(file), true);
+        if root == 0 as *u8 {
+            return 2;
+        }
+        let text = buf_new();
+        if !read_file_if(file, text) {
+            let d = diag(c"error", c"refactor.script");
+            buf_str(d, c"cannot read '");
+            buf_str(d, file);
+            buf_str(d, c"'\n");
+            return 2;
+        }
+        // The steps: the words of each line, its stdin, its line number.
+        let mut steps = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut inputs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut numbers = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let t = buf_slice(text);
+        let mut p = 0;
+        let mut line_no = 0;
+        while p < t.len {
+            let mut e = p;
+            while e < t.len && t[e] != '\n' {
+                e += 1;
+            }
+            line_no += 1;
+            let words = alloc_array::<IntVec>(1);
+            words[0] = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            let ok = split_words(t[p..e], &words[0]);
+            p = e + 1;
+            let w = &words[0];
+            if !ok {
+                return line_error(file, line_no, c"a quote is not closed");
+            }
+            if (*w).count == 0 {
+                continue;
+            }
+            // (`< PATH`: stdin)
+            let mut input = 0 as *u8;
+            let n = (*w).count;
+            if n >= 2 && streq((*w).data[n - 2] as *u8, c"<") {
+                input = (*w).data[n - 1] as *u8;
+                (*w).count = n - 2;
+            } else if (*w).data[n - 1] as *u8 != 0 as *u8 && ((*w).data[n - 1] as *u8)[0] == '<' {
+                input = &((*w).data[n - 1] as *u8)[1];
+                (*w).count = n - 1;
+            }
+            let first = (*w).data[0] as *u8;
+            if !is_tool(first) || ((*w).count > 1 && streq(first, c"refactor") && streq((*w).data[1] as *u8, c"--script")) {
+                return line_error(file, line_no, c"not a command a script runs (refactor, rewrite, edit, fix)");
+            }
+            for k in 1..(*w).count {
+                if streq((*w).data[k] as *u8, c"--root") || streq((*w).data[k] as *u8, c"--target") {
+                    return line_error(file, line_no, c"--root and --target are the script's, not a line's");
+                }
+            }
+            steps.push(w as i64);
+            inputs.push(input as i64);
+            numbers.push(line_no);
+        }
+        if steps.count == 0 {
+            let d = diag(c"note", c"refactor.script");
+            buf_str(d, c"no commands in '");
+            buf_str(d, file);
+            buf_str(d, c"'\n");
+            return 0;
+        }
+        // The steps, in turn.
+        let report_buf = buf_new();
+        buf_str(report_buf, root);
+        buf_str(report_buf, c".tachyon-script~");
+        let report = buf_cstr(report_buf);
+        let dry = DRY_RUN;
+        let no_check = NO_CHECK;
+        for k in 0..steps.count {
+            remove_file(report);
+            write_diags();
+            let status = run_step(steps.data[k] as *IntVec, inputs.data[k] as *u8, root, report);
+            if status != 0 {
+                read_report(report);
+                remove_file(report);
+                remove_all_copies();
+                let d = diag(c"error", c"refactor.script");
+                buf_str(d, file);
+                buf_byte(d, ':');
+                buf_int(d, numbers.data[k]);
+                buf_str(d, c": the command failed (exit ");
+                buf_int(d, status);
+                buf_str(d, c"):");
+                let w = steps.data[k] as *IntVec;
+                for x in 0..(*w).count {
+                    crate::tools::query::put_word(d, c_slice((*w).data[x] as *u8));
+                }
+                buf_str(d, c"; nothing written\n");
+                return 1;
+            }
+            read_report(report);
+        }
+        remove_file(report);
+        DRY_RUN = dry;
+        NO_CHECK = no_check;
+        if CHANGED.count == 0 {
+            let d = diag(c"note", c"edit.unchanged");
+            buf_str(d, c"nothing to change\n");
+            return 0;
+        }
+        // One edit: the copies, checked once.
+        if !load_program(root, TARGET) {
+            program_errors(c"error", root, true);
+            remove_all_copies();
+            return 1;
+        }
+        for k in 0..CHANGED.count {
+            let path = CHANGED.data[k] as *u8;
+            let state = MADE.data[k];
+            if state == 3 {
+                continue;
+            }
+            let ok = if state == 2 { edit_remove_file(c_slice(path)) } else if state == 1 { copy_made(path) }
+                else { copy_rewritten(c_slice(path)) };
+            if !ok {
+                remove_all_copies();
+                let d = diag(c"error", c"edit.write");
+                buf_str(d, c"cannot read the copy of '");
+                buf_str(d, path);
+                buf_str(d, c"'\n");
+                return 1;
+            }
+        }
+        let what = buf_new();
+        buf_str(what, c"script ");
+        buf_str(what, file);
+        buf_str(what, c": ");
+        buf_int(what, steps.count);
+        buf_str(what, if steps.count == 1 { c" command" } else { c" commands" });
+        finish_edit(buf_slice(what), root)
+    }
+}
+
+fn line_error(file: *u8, line: i64, message: *u8) -> i64 {
+    unsafe {
+        let d = diag(c"error", c"refactor.script");
+        buf_str(d, file);
+        buf_byte(d, ':');
+        buf_int(d, line);
+        buf_str(d, c": ");
+        buf_str(d, message);
+        buf_str(d, c"; nothing run\n");
+    }
+    2
+}

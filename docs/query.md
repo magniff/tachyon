@@ -86,7 +86,7 @@ definition is named, and accepted back as NAME:
 | definition | path |
 |---|---|
 | item of the root module | `crate::main` |
-| item of a module (a file, or an inline `mod m { }`) | `crate::gvn::run_gvn`, `crate::sys::SockaddrIn` |
+| item of a module (a file, or an inline `mod m { }`) | `crate::middle::gvn::run_gvn`, `crate::sys::SockaddrIn` |
 | the standard library | `std::Vec`, `std::HashMap` |
 | a C header's declaration (`import "h.h" as c;`) | `crate::c::printf` (the importing module's path and the `as` name of the first such import) |
 | function of an `impl T { }` block | `crate::geom::V2::len`, `std::Vec::push` |
@@ -128,7 +128,7 @@ definition is named, and accepted back as NAME:
 One line per matching definition (shown here with the TABs as `→`):
 
 ```
-crate::gvn::run_gvn→compiler/src/gvn.tach:721:8→fn→pub fn run_gvn(fi: i64) -> bool
+crate::middle::gvn::run_gvn→compiler/src/middle/gvn.tach:721:8→fn→pub fn run_gvn(fi: i64) -> bool
 ```
 
 The position is the name's. The signature is the source up to the body
@@ -141,7 +141,7 @@ Each matching definition's exact source: a header, then whole lines from
 the comments and attributes directly above it through its end.
 
 ```
-// crate::gvn::run_gvn→compiler/src/gvn.tach:721-796
+// crate::middle::gvn::run_gvn→compiler/src/middle/gvn.tach:721-796
 pub fn run_gvn(fi: i64) -> bool {
     ...
 }
@@ -169,7 +169,7 @@ conflict markers. These are answered too:
 | `MODULE::extern` | its `extern "C" { ... }` blocks |
 | `FILE.tach` (every NAME a file) | the whole file, `// FILE:1-N` then its lines, when it has at most 200 lines; else `error query.too-long` with `try:` `query stats FILE` (compiler source) and `query text FILE:1-200` |
 
-Each region is printed as an item is (`// crate::gvn::use→compiler/src/gvn.tach:12-20`,
+Each region is printed as an item is (`// crate::middle::gvn::use→compiler/src/middle/gvn.tach:12-20`,
 then its lines); none: `note query.empty`. A module of an inline `mod m
 { }` has no file of its own: its name is matched as a NAME.
 
@@ -208,10 +208,10 @@ compiler.
 Every resolved reference, one per line, under a header per file:
 
 ```
-# compiler/src/gvn.tach
+# compiler/src/middle/gvn.tach
 721:8→def→pub fn run_gvn(fi: i64) -> bool {
-# compiler/src/opt.tach
-17:17→opt→use crate::gvn::run_gvn;
+# compiler/src/middle/opt.tach
+17:17→opt→use crate::middle::gvn::run_gvn;
 533:13→opt::simplify_function→run_gvn(fi);
 ```
 
@@ -259,11 +259,11 @@ More than 60 references (after `--in`) are not listed: refs prints how
 many each file has, and how to narrow the question:
 
 ```
-compiler/src/abi.tach→10
+compiler/src/back/abi.tach→10
 ...
-compiler/src/vectorize.tach→60
+compiler/src/middle/vectorize.tach→60
 note query.truncated: 645 refs in 44 files
-try: target/tachyonc query refs IntVec::push --in compiler/src/vectorize.tach
+try: target/tachyonc query refs IntVec::push --in compiler/src/middle/vectorize.tach
 try: target/tachyonc query refs IntVec::push --limit 60
 try: target/tachyonc query refs IntVec::push --all
 ```
@@ -327,7 +327,7 @@ when it was given, names quoted for the shell when they need it).
 
 ```
 error query.no-match: no definition 'run_gnv'
-try: target/tachyonc query def crate::gvn::run_gvn
+try: target/tachyonc query def crate::middle::gvn::run_gvn
 error query.alias: 'MyVec' is an import alias in crate
 try: target/tachyonc query refs crate::myvec::Vec
 error query.no-root: no root (TACHYON_ROOT, ./main.tach, ./compiler/src/main.tach)

@@ -55,7 +55,7 @@ files, computed from the compiler's spans. It is applied atomically:
    one line says what changed:
 
 ```
-replaced crate::gvn::run_gvn→compiler/src/gvn.tach→+3 -5 lines
+replaced crate::middle::gvn::run_gvn→compiler/src/middle/gvn.tach→+3 -5 lines
 ```
 
 (`→` is a TAB; with several files, `N files`). Nothing outside the
@@ -101,7 +101,7 @@ an expression. `edit patch` makes them by text, as cheaply as a
 
 ```
 $ tachyonc edit patch range::decide --old 'if a < b {' --new 'if a <= b {'
-patched crate::range::decide→compiler/src/range.tach→+1 -1 lines
+patched crate::middle::range::decide→compiler/src/middle/range.tach→+1 -1 lines
 ```
 
 - **TARGET** is a NAME as `query` takes it, or `FILE:LINE` (the innermost
@@ -319,7 +319,7 @@ path with a `/`, or ending in `.tach`): its items, largest first, under
 a header:
 
 ```
-# crate::gvn→compiler/src/gvn.tach→834 lines→51 items
+# crate::middle::gvn→compiler/src/middle/gvn.tach→834 lines→51 items
 102→fn→memory_step
 76→fn→run_gvn
 ```
@@ -386,7 +386,7 @@ instances of a generic function (`instances→N→grow<i64> grow<Buf>
 largest first, each with the deps of its module:
 
 ```
-error lint.max-lines: compiler/src/check.tach: 4785 lines (at most 1000)
+error lint.max-lines: compiler/src/front/check.tach: 4785 lines (at most 1000)
 try: tachyonc query deps crate::check --max-lines 1000
 ```
 
@@ -445,5 +445,5 @@ every command.
   `new-module`, `move-module`, `split` in
   [refactor-modules.md](refactor-modules.md); all on this engine
   (`edit_replace`, `edit_new_file`, `apply_edit` in
-  compiler/src/edit.tach), and a command registered in
-  compiler/src/commands.tach runs in scripts too.
+  compiler/src/tools/edit.tach), and a command registered in
+  compiler/src/tools/commands.tach runs in scripts too.

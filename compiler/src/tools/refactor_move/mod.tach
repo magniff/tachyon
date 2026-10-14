@@ -1,0 +1,607 @@
+// Moving items between modules, and splitting a module (0.11, phase 2a;
+// docs/refactor.md):
+//
+//   tachyonc refactor move PATH... --to MODULE
+//   tachyonc refactor split MODULE --into NEWMOD --items a,b,c
+//   tachyonc refactor split MODULE --plan|--auto [--max-lines N]
+//
+// What moves with an item: its text (its lines, with the comment and
+// attribute lines directly above it); the impl blocks of a type moved
+// (inherent and trait impls in its module; --keep-impls leaves them), and
+// the trait impls in its module of a trait moved for a type that is not an
+// item of that module; the banner of a group of items (a comment block
+// with blank lines around it, after some code: it heads the items up to
+// the next banner) when every item of the group moves to one module. Then
+// the references: paths naming a moved item are written from `crate`, the
+// `use` lines importing it import it from its new module, the code that
+// named it bare gets an import, the moved code gets the imports it needs
+// (what its old module imported, and the old module's items), `super::`
+// and `self::` paths in it are written from `crate`, items used from
+// where they are private become `pub` (and the modules on the way), and
+// the imports of the old module that nothing names any more are removed.
+// Nothing else changes, byte for byte.
+
+mod units;
+pub mod imports;
+
+use crate::base::{BUFS, FILES, FILE_COUNT, IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_int,
+    buf_new, buf_slice, buf_str, intern};
+use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
+use crate::front::ast::{NODES, NODE_COUNT, child};
+use crate::middle::lower::HMap;
+use crate::front::modules::{file_of_pos, module_at, module_count};
+use crate::tools::query::{
+    DEFS, K_IMPL_METHOD, K_METHOD, K_MOD, c_slice, diag, mod_fqn,
+    put_word, token_at, try_begin, try_end,
+};
+use crate::tools::edit::delete_lines;
+use crate::tools::refactor_mod::{
+    NM_BODY, NM_PATH, NM_USES, binding_of,
+    collision, emit_regions, is_new, item_binding, load_refs,
+    own_file, put_edit, ref_named,
+};
+use crate::tools::refactor_move::units::{UN_FIRST, import_anchor, make_blocks, split_plan, units_of};
+use crate::tools::refactor_move::imports::{
+    IM_REGION, REFUSED, analyze, emit_use_edits, region_uses, remove_use_names, rewrite_imports,
+};
+use crate::tools::refactor_mod::cli::{
+    OPT_AUTO, OPT_INTO, OPT_ITEMS, OPT_PLAN, finish, inline_module, make_path, module_named,
+    no_module, one_definition, path_segments,
+};
+
+// ---- Blocks: the text that moves ----
+
+// Per block: its range, where it goes, and for a function of an extern
+// block moved alone, the extern block's unit (its header wraps it).
+static mut BL_START: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut BL_END: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut BL_DEST: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut BL_WRAP: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The moves asked for: items and their regions.
+pub static mut MV_DEF: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut MV_DEST: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The region the code at pos is in after the edit.
+fn region_at(pos: i64) -> i64 {
+    unsafe {
+        let mut lo = 0;
+        let mut hi = BL_START.count;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if BL_START.data[mid] <= pos {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo > 0 && pos < BL_END.data[lo - 1] {
+            return BL_DEST.data[lo - 1];
+        }
+        module_at(pos)
+    }
+}
+
+fn add_block(start: i64, end: i64, dest: i64, wrap: i64) {
+    unsafe {
+        // (in order of position)
+        let mut k = BL_START.count;
+        BL_START.push(0);
+        BL_END.push(0);
+        BL_DEST.push(0);
+        BL_WRAP.push(0);
+        while k > 0 && BL_START.data[k - 1] > start {
+            BL_START.data[k] = BL_START.data[k - 1];
+            BL_END.data[k] = BL_END.data[k - 1];
+            BL_DEST.data[k] = BL_DEST.data[k - 1];
+            BL_WRAP.data[k] = BL_WRAP.data[k - 1];
+            k -= 1;
+        }
+        BL_START.data[k] = start;
+        BL_END.data[k] = end;
+        BL_DEST.data[k] = dest;
+        BL_WRAP.data[k] = wrap;
+    }
+}
+
+// Whether item d can move (diagnosed when not).
+fn movable(d: i64) -> bool {
+    unsafe {
+        let k = DEFS[d].kind;
+        let mut why = 0 as *u8;
+        if k == K_METHOD || k == K_IMPL_METHOD {
+            why = c" is a method: it moves with its type's impl block";
+        } else if DEFS[d].parent >= 0 {
+            why = c" is part of an item: move the item";
+        } else if k == K_MOD {
+            why = c" is a module: use move-module";
+        }
+        if why != 0 as *u8 {
+            let e = diag(c"error", c"refactor.not-movable");
+            buf_bytes(e, SYMS[DEFS[d].fqn].text);
+            buf_str(e, why);
+            buf_byte(e, '\n');
+            if k == K_MOD {
+                let out = try_begin(c"move-module", SYMS[DEFS[d].fqn].text, true);
+                buf_str(out, c" crate::NEW::PATH");
+                try_end(out);
+            }
+            return false;
+        }
+        let f = file_of_pos(DEFS[d].start);
+        if module_at(DEFS[d].start) != FILES[f].module {
+            inline_module(module_at(DEFS[d].start));
+            return false;
+        }
+        true
+    }
+}
+
+// ---- Edits inside moved text ----
+//
+// Every edit that may fall in moved text goes here first: at the end, the
+// ones inside a block are made in its copy, the others in the files.
+
+static mut L_START: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut L_END: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut L_TEXT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut L_AT: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+fn later_edit(a: i64, b: i64, text: i64) {
+    unsafe {
+        // (one edit per position)
+        if L_AT.get(a + 1) != 0 {
+            return;
+        }
+        L_AT.put(a + 1, 1);
+        L_START.push(a);
+        L_END.push(b);
+        L_TEXT.push(text);
+    }
+}
+
+// Block k's text, with the edits inside it, ending with a newline.
+fn block_text(k: i64) -> i64 {
+    unsafe {
+        let a = BL_START.data[k];
+        let b = BL_END.data[k];
+        let mut inner = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for e in 0..L_START.count {
+            if L_START.data[e] >= a && L_END.data[e] <= b && !(L_START.data[e] == b && L_END.data[e] == b) {
+                inner.push(e);
+            }
+        }
+        // (by position)
+        for i in 1..inner.count {
+            let mut j = i;
+            while j > 0 && L_START.data[inner.data[j]] < L_START.data[inner.data[j - 1]] {
+                let t = inner.data[j];
+                inner.data[j] = inner.data[j - 1];
+                inner.data[j - 1] = t;
+                j -= 1;
+            }
+        }
+        let out = buf_new();
+        let mut cur = a;
+        for i in 0..inner.count {
+            let e = inner.data[i];
+            buf_bytes(out, SRC[cur..L_START.data[e]]);
+            buf_bytes(out, buf_slice(L_TEXT.data[e]));
+            cur = L_END.data[e];
+        }
+        buf_bytes(out, SRC[cur..b]);
+        if BUFS[out].len > 0 && BUFS[out].data[BUFS[out].len - 1] != '\n' {
+            buf_byte(out, '\n');
+        }
+        out
+    }
+}
+
+fn in_block(pos: i64) -> bool {
+    unsafe {
+        for k in 0..BL_START.count {
+            if BL_START.data[k] <= pos && pos < BL_END.data[k] {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// ---- The analysis ----
+
+// The `super::` and `self::` paths of the moved code, written from `crate`.
+fn moved_relative_paths() {
+    unsafe {
+        let sup = intern(c_slice(c"super"));
+        let slf = intern(c_slice(c"self"));
+        for k in 0..BL_START.count {
+            let mut i = token_at(BL_START.data[k]);
+            while i + 1 < TOK_COUNT && TOKS[i].start < BL_END.data[k] {
+                let v = TOKS[i].value as i64;
+                if TOKS[i].kind != Tok::Ident || (v != sup && v != slf) || TOKS[i + 1].kind != Tok::ColonColon
+                    || (i > 0 && TOKS[i - 1].kind == Tok::ColonColon) {
+                    i += 1;
+                    continue;
+                }
+                let first = i;
+                let mut m = module_at(TOKS[i].start);
+                if v == slf {
+                    i += 2;
+                } else {
+                    while i + 1 < TOK_COUNT && TOKS[i].kind == Tok::Ident && TOKS[i].value as i64 == sup
+                        && TOKS[i + 1].kind == Tok::ColonColon {
+                        m = crate::tools::refactor_mod::region_parent(m);
+                        i += 2;
+                    }
+                }
+                if m < 0 {
+                    continue;
+                }
+                let b = buf_new();
+                buf_bytes(b, SYMS[mod_fqn(m)].text);
+                buf_str(b, c"::");
+                later_edit(TOKS[first].start, TOKS[i].start, b);
+            }
+        }
+    }
+}
+
+// The imports of the modules the moved code leaves that nothing there
+// names any more.
+fn unused_imports() {
+    unsafe {
+        let mut files = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for k in 0..BL_START.count {
+            let f = file_of_pos(BL_START.data[k]);
+            let mut seen = false;
+            for i in 0..files.count {
+                if files.data[i] == f {
+                    seen = true;
+                }
+            }
+            if !seen {
+                files.push(f);
+            }
+        }
+        for u in 1..NODE_COUNT {
+            if !crate::tools::refactor_mod::cli::is_name_use(u) || (NODES[u].p & crate::front::parser::ITEM_PUBLIC) != 0 {
+                continue;
+            }
+            let f = file_of_pos(NODES[u].start);
+            let mut mine = false;
+            for i in 0..files.count {
+                if files.data[i] == f {
+                    mine = true;
+                }
+            }
+            if !mine || in_block(NODES[u].start) {
+                continue;
+            }
+            for k in 0..NODES[u].count {
+                let id = child(u, k);
+                let name = crate::tools::refactor_mod::use_local(id);
+                let mut before = 0;
+                let mut after = 0;
+                let mut i = token_at(FILES[f].start);
+                while i < TOK_COUNT && TOKS[i].start < FILES[f].end {
+                    let s = TOKS[i].start;
+                    if TOKS[i].kind == Tok::Ident && TOKS[i].value as i64 == name && (s < NODES[u].start || s >= NODES[u].end) {
+                        before += 1;
+                        if !in_block(s) {
+                            after += 1;
+                        }
+                    }
+                    i += 1;
+                }
+                if before > 0 && after == 0 {
+                    remove_use_names(u, id);
+                }
+            }
+        }
+    }
+}
+
+// ---- The edit ----
+
+// Makes the moves of MV_DEF / MV_DEST (the references collected): false
+// after a diagnostic.
+pub fn move_edits() -> bool {
+    unsafe {
+        // Names taken where the items go.
+        for i in 0..MV_DEF.count {
+            let d = MV_DEF.data[i];
+            let r = MV_DEST.data[i];
+            for j in 0..i {
+                if MV_DEST.data[j] == r && DEFS[MV_DEF.data[j]].name == DEFS[d].name {
+                    collision(SYMS[DEFS[d].name].text, r, MV_DEF.data[j], false);
+                    return false;
+                }
+            }
+            if !is_new(r) {
+                let b = binding_of(r, DEFS[d].name);
+                if b >= 0 && b != d {
+                    collision(SYMS[DEFS[d].name].text, r, b, item_binding(r, DEFS[d].name) < 0);
+                    return false;
+                }
+            }
+        }
+        if !make_blocks() {
+            return false;
+        }
+        if !analyze() {
+            return false;
+        }
+        rewrite_imports();
+        if REFUSED {
+            return false;
+        }
+        moved_relative_paths();
+        unused_imports();
+        // The moved text, from where it was.
+        let mut texts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for k in 0..BL_START.count {
+            texts.push(block_text(k));
+        }
+        let mut k = 0;
+        while k < BL_START.count {
+            // (blocks with only blank lines between: one deletion)
+            let mut j = k;
+            while j + 1 < BL_START.count && file_of_pos(BL_START.data[j + 1]) == file_of_pos(BL_START.data[k])
+                && only_blank(BL_END.data[j], BL_START.data[j + 1]) {
+                j += 1;
+            }
+            delete_lines(BL_START.data[k], BL_END.data[j]);
+            k = j + 1;
+        }
+        // The other edits.
+        for e in 0..L_START.count {
+            if !in_block(L_START.data[e]) {
+                put_edit(L_START.data[e], L_END.data[e], L_TEXT.data[e]);
+            }
+        }
+        emit_use_edits();
+        // The imports, where they go.
+        let mut regions = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..IM_REGION.count {
+            push_once(&regions, IM_REGION.data[i]);
+        }
+        for i in 0..regions.count {
+            let r = regions.data[i];
+            let lines = region_uses(r);
+            if is_new(r) {
+                buf_bytes(NM_USES.data[r - module_count()], buf_slice(lines));
+                continue;
+            }
+            let mut after = false;
+            let at = import_anchor(r, &after);
+            let text = buf_new();
+            if after {
+                buf_byte(text, '\n');
+                let s = buf_slice(lines);
+                buf_bytes(text, s[0..s.len - 1]);
+            } else {
+                buf_bytes(text, buf_slice(lines));
+                if at < FILES[own_file(r)].end {
+                    buf_byte(text, '\n');
+                }
+            }
+            put_edit(at, at, text);
+        }
+        // The moved text, where it goes.
+        let mut dests = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for k in 0..BL_START.count {
+            push_once(&dests, BL_DEST.data[k]);
+        }
+        for i in 0..dests.count {
+            let r = dests.data[i];
+            let body = buf_new();
+            let mut k = 0;
+            while k < BL_START.count {
+                if BL_DEST.data[k] != r {
+                    k += 1;
+                    continue;
+                }
+                if BUFS[body].len > 0 {
+                    buf_byte(body, '\n');
+                }
+                let x = BL_WRAP.data[k];
+                if x < 0 {
+                    buf_bytes(body, buf_slice(texts.data[k]));
+                    k += 1;
+                    continue;
+                }
+                // Functions of an extern block: in one like it.
+                let t = UN_FIRST.data[x];
+                let mut lb = t;
+                while TOKS[lb].kind != Tok::LBrace {
+                    lb += 1;
+                }
+                buf_bytes(body, SRC[TOKS[t].start..TOKS[lb].end]);
+                buf_byte(body, '\n');
+                while k < BL_START.count && BL_DEST.data[k] == r && BL_WRAP.data[k] == x {
+                    buf_bytes(body, buf_slice(texts.data[k]));
+                    k += 1;
+                }
+                buf_str(body, c"}\n");
+            }
+            if is_new(r) {
+                buf_bytes(NM_BODY.data[r - module_count()], buf_slice(body));
+                continue;
+            }
+            let f = own_file(r);
+            let end = FILES[f].end;
+            let text = buf_new();
+            if end > FILES[f].start && SRC[end - 1] != '\n' {
+                buf_str(text, c"\n\n");
+            } else if end > FILES[f].start && !(end - 1 > FILES[f].start && SRC[end - 2] == '\n') {
+                buf_byte(text, '\n');
+            }
+            buf_bytes(text, buf_slice(body));
+            put_edit(end, end, text);
+        }
+        true
+    }
+}
+
+fn push_once(v: *IntVec, x: i64) {
+    unsafe {
+        for i in 0..(*v).count {
+            if (*v).data[i] == x {
+                return;
+            }
+        }
+        v.push(x);
+    }
+}
+
+fn only_blank(a: i64, b: i64) -> bool {
+    unsafe {
+        for p in a..b {
+            if SRC[p] != ' ' && SRC[p] != '\t' && SRC[p] != '\n' && SRC[p] != '\r' {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// ---- move ----
+
+// `refactor move PATH... --to MODULE`.
+pub fn run_move(words: *IntVec, to: *u8, root: *u8) -> i64 {
+    unsafe {
+        let t = module_named(c_slice(to));
+        if t < 0 {
+            return no_module(c_slice(to), c"new-module");
+        }
+        if own_file(t) < 0 {
+            return inline_module(t);
+        }
+        load_refs();
+        for i in 0..(*words).count {
+            let name = c_slice((*words).data[i] as *u8);
+            let d = one_definition(c"move", name, c_slice(c""));
+            if d < 0 || !movable(d) {
+                return 1;
+            }
+            if DEFS[d].module == t {
+                continue;
+            }
+            MV_DEF.push(d);
+            MV_DEST.push(t);
+        }
+        if MV_DEF.count == 0 {
+            let e = diag(c"note", c"edit.unchanged");
+            buf_str(e, c"nothing to change\n");
+            return 0;
+        }
+        if !move_edits() {
+            return 1;
+        }
+        emit_regions();
+        let what = buf_new();
+        buf_str(what, c"moved ");
+        if MV_DEF.count == 1 {
+            buf_bytes(what, SYMS[DEFS[MV_DEF.data[0]].fqn].text);
+        } else {
+            buf_int(what, MV_DEF.count);
+            buf_str(what, c" items");
+        }
+        buf_str(what, c" to ");
+        buf_bytes(what, SYMS[mod_fqn(t)].text);
+        finish(what, root)
+    }
+}
+
+// ---- split ----
+
+// `refactor split MODULE --into NEWMOD --items a,b,c`: the items move to
+// NEWMOD (made when it does not exist: a child of MODULE makes MODULE a
+// dir module). `--plan`: the split of MODULE into parts of at most
+// --max-lines lines (query deps's clustering, on its items with their impl
+// blocks), as the commands that make it; `--auto`: that split, made in one
+// edit.
+pub fn run_split(name: [u8], root: *u8) -> i64 {
+    unsafe {
+        let m = module_named(name);
+        if m < 0 {
+            return no_module(name, 0 as *u8);
+        }
+        let f = own_file(m);
+        if f < 0 {
+            return inline_module(m);
+        }
+        load_refs();
+        units_of(f);
+        if OPT_PLAN || OPT_AUTO {
+            return split_plan(m, f, root);
+        }
+        let mut segs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let into = c_slice(OPT_INTO);
+        if !path_segments(into, &segs) || segs.count == 0 {
+            return crate::tools::refactor_mod::cli::usage(c"--into takes a module path (crate::a::b)", 0 as *u8);
+        }
+        let mut converts = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        let mut t = make_path(&segs, segs.count, false, &converts);
+        if t == -2 {
+            t = module_named(into);
+        }
+        if t < 0 {
+            return 1;
+        }
+        if !is_new(t) && own_file(t) < 0 {
+            return inline_module(t);
+        }
+        // The items, by their names in MODULE (or their paths).
+        let items = c_slice(OPT_ITEMS);
+        let mut i = 0;
+        while i < items.len {
+            let mut e = i;
+            while e < items.len && items[e] != ',' {
+                e += 1;
+            }
+            let w = items[i..e];
+            i = e + 1;
+            if w.len == 0 {
+                continue;
+            }
+            let full = buf_new();
+            if !has_colons(w) {
+                buf_bytes(full, SYMS[mod_fqn(m)].text);
+                buf_str(full, c"::");
+            }
+            buf_bytes(full, w);
+            let d = one_definition(c"move", buf_slice(full), c_slice(c""));
+            if d < 0 || !movable(d) {
+                return 1;
+            }
+            MV_DEF.push(d);
+            MV_DEST.push(t);
+        }
+        if MV_DEF.count == 0 {
+            return crate::tools::refactor_mod::cli::usage(c"--items names no item", 0 as *u8);
+        }
+        if !move_edits() {
+            return 1;
+        }
+        emit_regions();
+        let what = buf_new();
+        buf_str(what, c"split ");
+        buf_bytes(what, SYMS[mod_fqn(m)].text);
+        buf_str(what, c": ");
+        buf_int(what, MV_DEF.count);
+        buf_str(what, if MV_DEF.count == 1 { c" item into " } else { c" items into " });
+        buf_bytes(what, into);
+        finish(what, root)
+    }
+}
+
+fn has_colons(s: [u8]) -> bool {
+    for i in 0..s.len {
+        if s[i] == ':' {
+            return true;
+        }
+    }
+    false
+}

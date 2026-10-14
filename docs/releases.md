@@ -553,9 +553,10 @@ how to invoke the builder; the release's `root` says what to give it.
 A new host (say `aarch64-linux`) needs:
 
 1. A backend for it in the compiler: an instruction set file next to
-   `compiler/src/arm64.tach` and `x86_64.tach` (or a new object
-   format and ABI in an existing one), a target name in
-   `compiler/src/target.tach`, and its detection in `host_target()` in
+   `compiler/src/gen0/arm64.tach` and `x86_64.tach`, and the back end's
+   `compiler/src/back/mc_arm64.tach` and `mc_x86_64.tach` (or a new
+   object format and ABI in an existing one), a target name in
+   `compiler/src/gen0/target.tach`, and its detection in `host_target()` in
    `main.tach`. The release that adds it is built on an existing host,
    and is checked on the new one by cross-compiling: its assembly for the
    new target must be the same wherever it is produced, and the suite must

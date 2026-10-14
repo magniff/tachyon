@@ -1,0 +1,2305 @@
+// The loop vectorizer (0.10): an innermost counted loop (induction
+// variable i from `start`, step 1, to `n`; scev.tach) whose body is a
+// chain of blocks that only branch out to checks that fail (to blocks
+// ending in `unreachable`), whose memory accesses are unit-stride loads
+// and stores of one scalar type T, and whose only values carried from one
+// iteration to the next are i and reductions (`r = r op x` on integers,
+// op one of + - * & | ^), gets a vector version: VF = 16 / size(T) lanes
+// per iteration, in vector instructions, run for the first
+// (n - start) & ~(VF - 1) iterations when it may be, the original loop
+// running the rest (the remainder) or all of them.
+//
+//     P:  jump C                        (the old preheader)
+//     C:  trips = n - start; ok = trips >= VF && checks && no overlap
+//         branch ok, VP, SP
+//     VP: splats, reductions' first vectors (the start value in lane 0,
+//         the identity in the others), vend = start + (trips & ~(VF - 1))
+//     VH: the body on VF lanes; iv += VF; branch iv != vend, VH, VX
+//     VX: reductions summed; branch vend == n, E, SP
+//     SP: i and the reductions from C or VX; jump H (the scalar loop)
+//
+// The vector loop runs only when nothing the scalar loop would check can
+// fail in any iteration (each check `idx <u len` with idx = i + k, k
+// invariant: idx at start >= 0, idx at n - 1 >= that, and below len) and
+// when no store overlaps another access of the loop at a different
+// address (ranges over the whole loop, compared at run time); the scalar
+// loop runs otherwise, and stops where it would. Results are exactly the
+// scalar loop's: lanewise float arithmetic is the same IEEE operations
+// (float reductions, which would reassociate, are not vectorized), and
+// integer reductions wrap. The scalar loop is marked (BLOCKS[h].novec) so
+// that it is not vectorized again.
+
+use crate::base::{IntVec, free};
+use crate::front::types::{
+    TY_BOOL, TY_F32, TY_F64, TY_I16, TY_I32, TY_I64, TY_I8, TY_U16, TY_U32, TY_U64, TY_U8, is_float, is_integer,
+    is_signed, type_size, vector_type, int_bits,
+};
+use crate::middle::ir::{
+    ARGS, ARGTY, BLOCKS, Cond, INSTS, IRF, IRFUNCS, Op, Term, ir_append, ir_arg, ir_make,
+    ir_new_block, ir_set_arg, ir_terminate, ir_val, pred_index, verify_func, ir_insert_before, ir_replace,
+};
+use crate::middle::opt::resolve_all;
+use crate::middle::fold::is_const;
+use crate::middle::loops::{
+    add_pred_values, canonicalize_loops, form_lcssa, innermost_loop, invariant_in, is_canonical,
+    is_innermost, loop_block, loop_contains, loop_count, loop_header, loop_latch, loop_preheader,
+    loop_size, new_phi_in, LP_PARENT, LP_LIST2, clone_region, mark_loop_blocks, clone_map,
+};
+use crate::middle::scev::{counted_loop, iv_step, full_unroll_trips};
+use crate::middle::gvn::address_base;
+use crate::middle::profile::{PROFILE_MAX, is_cold_block, is_hot_count};
+use crate::gen0::target::X86;
+use crate::middle::range::bits_of_value;
+use crate::middle::ir::Op::{
+    Add, And, Cmp, Const, Conv, Div, Load, Mul, Neg, Or, Phi, Shl, Store, Sub, VBin, VExt, VIns,
+    VNeg, VSplat, VSum, Xor,
+};
+
+// --no-vectorize turns it off (to compare).
+pub static mut VECTORIZE: bool = true;
+
+// Set by vectorize_loops when it left a loop to be unrolled whole (see
+// vectorize_loop).
+pub static mut UNROLL_WHOLE: bool = false;
+
+const VEC_MAX_INSTS: i64 = 160;
+const VEC_MAX_CHECKS: i64 = 8;
+const VEC_MAX_OVERLAPS: i64 = 16;
+const VEC_UNROLL_SIZE: i64 = 40;
+
+// The classes of the loop's instructions (INSTS[v].aux, while INSTS[v].mark
+// is the analysis' stamp).
+const VC_UNIFORM: i64 = 1;
+const VC_VECTOR: i64 = 2;
+const VC_SKIP: i64 = 3;
+
+static mut VSTAMP: i64 = 4398046511104;
+
+// The loop being vectorized.
+static mut V_IV: i64 = 0;
+static mut V_N: i64 = 0;
+static mut V_START: i64 = 0;
+// The inner loop's induction variable (outer loops, see below), or 0.
+static mut V_IV2: i64 = 0;
+// The inner loop's induction variable's last value (a constant).
+static mut V_LAST2: i64 = 0;
+// The number of instructions of the loop.
+static mut V_SIZE: i64 = 0;
+static mut V_NE: bool = false;
+static mut V_ELEM: i64 = 0;
+static mut V_VT: i64 = 0;
+static mut V_VF: i64 = 0;
+static mut V_HAS_STORE: bool = false;
+static mut V_HAS_ULOAD: bool = false;
+// The blocks of the body, in order, header first.
+static mut V_CHAIN: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// The checks: (compare, index, length) triples.
+static mut V_CHECKS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// The memory accesses: (instruction, address, size) triples.
+static mut V_ACCESS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// The reductions: (phi, next, op) triples.
+static mut V_REDS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// The vector loop's values of the loop's: (old, new) pairs.
+static mut V_MAP: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// Values materialized at an iteration (eval_at): (old, iteration, new)
+// triples.
+static mut V_EVAL: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+fn class_of(v: i64) -> i64 {
+    unsafe {
+        if v != 0 && INSTS[v].mark == VSTAMP { INSTS[v].aux } else { 0 }
+    }
+}
+
+fn set_class(v: i64, c: i64) {
+    unsafe {
+        INSTS[v].mark = VSTAMP;
+        INSTS[v].aux = c;
+    }
+}
+
+// The coefficient of the induction variable in v (a uniform value or an
+// invariant one): v = coef * i + (something invariant). NONAFFINE when v
+// is not such a value.
+const NONAFFINE: i64 = 9223372036854775807;
+
+fn coef(l: i64, v: i64) -> i64 {
+    coef_wrt(l, v, V_IV, V_IV2)
+}
+
+// The coefficient of induction variable `iv` in v, where `other` (another
+// induction variable, of an inner loop, or 0) counts as invariant.
+fn coef_wrt(l: i64, v: i64, iv: i64, other: i64) -> i64 {
+    unsafe {
+        let x = ir_val(v);
+        if x == iv {
+            return 1;
+        }
+        if x == other && other != 0 {
+            return 0;
+        }
+        if invariant_in(l, x) {
+            return 0;
+        }
+        if class_of(x) != VC_UNIFORM {
+            return NONAFFINE;
+        }
+        let op = INSTS[x].op;
+        let a = if INSTS[x].a != 0 { coef_wrt(l, INSTS[x].a, iv, other) } else { 0 };
+        let b = if INSTS[x].b != 0 { coef_wrt(l, INSTS[x].b, iv, other) } else { 0 };
+        if a == NONAFFINE || b == NONAFFINE {
+            return NONAFFINE;
+        }
+        if a == 0 && b == 0 {
+            // Computed from invariants alone (it would be hoisted).
+            return 0;
+        }
+        let wide = is_integer(INSTS[x].ty) && int_bits(INSTS[x].ty) == 64;
+        if !wide {
+            return NONAFFINE;
+        }
+        if op == Add {
+            return a + b;
+        }
+        if op == Sub {
+            return a - b;
+        }
+        if op == Mul && is_const(ir_val(INSTS[x].b)) && b == 0 {
+            return a * INSTS[ir_val(INSTS[x].b)].imm;
+        }
+        if op == Mul && is_const(ir_val(INSTS[x].a)) && a == 0 {
+            return b * INSTS[ir_val(INSTS[x].a)].imm;
+        }
+        if op == Shl && is_const(ir_val(INSTS[x].b)) && b == 0 {
+            let k = INSTS[ir_val(INSTS[x].b)].imm;
+            if k >= 0 && k < 16 {
+                return a << k as u64;
+            }
+        }
+        if op == Conv && is_integer(INSTS[x].imm2) && int_bits(INSTS[x].imm2) == 64 {
+            return a;
+        }
+        NONAFFINE
+    }
+}
+
+// The lane type of IR type t when it can be one (integers by their signed
+// type), else 0.
+fn lane_type(t: i64) -> i64 {
+    if t == TY_F32 || t == TY_F64 || t == TY_I64 || t == TY_I32 || t == TY_I16 || t == TY_I8 {
+        return t;
+    }
+    if t == TY_U64 { return TY_I64; }
+    if t == TY_U32 { return TY_I32; }
+    if t == TY_U16 { return TY_I16; }
+    if t == TY_U8 { return TY_I8; }
+    0
+}
+
+// Records T, the type of the loop's vectorized values; false when another
+// one was seen.
+fn use_elem(t: i64) -> bool {
+    unsafe {
+        let lt = lane_type(t);
+        if lt == 0 {
+            return false;
+        }
+        if V_ELEM == 0 {
+            V_ELEM = t;
+            return true;
+        }
+        V_ELEM == t
+    }
+}
+
+// Whether v (an operand of a vector operation) has a value: a vector, or
+// one value for all lanes (invariant, or uniform without the induction
+// variable).
+fn vector_operand_ok(l: i64, v: i64) -> bool {
+    let x = ir_val(v);
+    let c = class_of(x);
+    if c == VC_VECTOR {
+        return true;
+    }
+    coef(l, x) == 0
+}
+
+fn is_unreachable_exit(l: i64, b: i64) -> bool {
+    unsafe { !loop_contains(l, b) && BLOCKS[b].term == Term::Unreach }
+}
+
+// Records the check ending block b of loop l (into V_CHECKS), whose way on
+// is `next`, the other way an unreachable exit: false unless the way on
+// is `idx <u len` (64 bits, len invariant).
+fn record_check(l: i64, b: i64, next: i64) -> bool {
+    unsafe {
+        let c = ir_val(BLOCKS[b].cond);
+        if INSTS[c].op != Cmp || INSTS[c].block != b {
+            return false;
+        }
+        let mut cond = INSTS[c].cond;
+        if next != BLOCKS[b].s0 {
+            cond = cond.negate();
+        }
+        let mut idx = ir_val(INSTS[c].a);
+        let mut len = ir_val(INSTS[c].b);
+        if cond == Cond::Gt {
+            idx = ir_val(INSTS[c].b);
+            len = ir_val(INSTS[c].a);
+            cond = Cond::Lt;
+        }
+        if cond != Cond::Lt || is_signed(INSTS[c].imm2) || int_bits(INSTS[c].imm2) != 64 || !invariant_in(l, len) {
+            return false;
+        }
+        if V_CHECKS.count >= 3 * VEC_MAX_CHECKS {
+            return false;
+        }
+        V_CHECKS.push(c);
+        V_CHECKS.push(idx);
+        V_CHECKS.push(len);
+        true
+    }
+}
+
+// The run-time test, and'ed into ok in block c, that no check of
+// V_CHECKS fails from iteration `start` to `last`: each index (of
+// coefficient 1 or -1) at both ends, the lower at least 0 and the higher
+// below the length; `hi >= lo` rules out an index that wraps.
+fn check_tests(l: i64, c: i64, ok0: i64, start: i64, last: i64) -> i64 {
+    unsafe {
+        let mut ok = ok0;
+        for k in 0..V_CHECKS.count / 3 {
+            let idx = V_CHECKS.data[3 * k + 1];
+            let len = V_CHECKS.data[3 * k + 2];
+            let first = eval_at(l, idx, start, c);
+            let final = eval_at(l, idx, last, c);
+            let down = coef(l, idx) < 0;
+            let lo = if down { final } else { first };
+            let hi = if down { first } else { final };
+            ok = and_into(c, ok, cmp(c, Cond::Ge, TY_I64, lo, konst(c, 0, TY_I64)));
+            ok = and_into(c, ok, cmp(c, Cond::Ge, TY_I64, hi, lo));
+            ok = and_into(c, ok, cmp(c, Cond::Lt, TY_I64, hi, len));
+        }
+        ok
+    }
+}
+
+// Classifies the instructions of loop l; false when it cannot be
+// vectorized.
+fn analyze(l: i64, exit: *i64) -> bool {
+    unsafe {
+        VSTAMP += 1;
+        V_ELEM = 0;
+        V_HAS_STORE = false;
+        V_HAS_ULOAD = false;
+        V_IV2 = 0;
+        V_CHAIN.count = 0;
+        V_CHECKS.count = 0;
+        V_ACCESS.count = 0;
+        V_REDS.count = 0;
+        let h = loop_header(l);
+        let latch = loop_latch(l);
+        if BLOCKS[h].novec != 0 || is_cold_block(h) || latch == 0 || loop_preheader(l) == 0 || BLOCKS[latch].term != Term::Branch {
+            return false;
+        }
+        let mut iv = 0;
+        let mut step = 0;
+        let mut n = 0;
+        let mut ne = false;
+        if !counted_loop(l, &iv, &step, &n, &ne) || step != 1 || int_bits(INSTS[iv].ty) != 64 {
+            return false;
+        }
+        V_IV = iv;
+        V_N = n;
+        V_NE = ne;
+        // The chain of blocks.
+        let mut b = h;
+        let mut count = 0;
+        loop {
+            V_CHAIN.push(b);
+            if b == latch {
+                break;
+            }
+            if BLOCKS[b].term == Term::Jump && loop_contains(l, BLOCKS[b].s0) && BLOCKS[BLOCKS[b].s0].preds.count == 1 {
+                b = BLOCKS[b].s0;
+            } else if BLOCKS[b].term == Term::Branch {
+                let s0 = BLOCKS[b].s0;
+                let s1 = BLOCKS[b].s1;
+                let mut next = 0;
+                if loop_contains(l, s0) && is_unreachable_exit(l, s1) {
+                    next = s0;
+                } else if loop_contains(l, s1) && is_unreachable_exit(l, s0) {
+                    next = s1;
+                }
+                if next == 0 || BLOCKS[next].preds.count != 1 || !record_check(l, b, next) {
+                    return false;
+                }
+                b = next;
+            } else {
+                return false;
+            }
+            count += 1;
+            if count > 32 {
+                return false;
+            }
+        }
+        if V_CHAIN.count != loop_size(l) {
+            return false;
+        }
+        // The exit at the latch.
+        let s0 = BLOCKS[latch].s0;
+        let s1 = BLOCKS[latch].s1;
+        let e = if s0 == h { s1 } else { s0 };
+        if loop_contains(l, e) || BLOCKS[e].preds.count != 1 {
+            return false;
+        }
+        *exit = e;
+        let latch_cond = ir_val(BLOCKS[latch].cond);
+        // The header's phis: the induction variable and reductions.
+        let mut phi = BLOCKS[h].first;
+        while phi != 0 && INSTS[phi].op == Phi {
+            if phi != iv {
+                let next = ir_val(ir_arg(phi, pred_index(h, latch)));
+                if !is_integer(INSTS[phi].ty) || class_of(next) != 0 || INSTS[next].block == 0
+                    || !loop_contains(l, INSTS[next].block) {
+                    return false;
+                }
+                let op = INSTS[next].op;
+                if op != Add && op != Sub && op != Mul && op != And && op != Or && op != Xor {
+                    return false;
+                }
+                let a = ir_val(INSTS[next].a);
+                let bb = ir_val(INSTS[next].b);
+                if !(a == phi || (bb == phi && op != Sub)) || a == bb || INSTS[next].ty != INSTS[phi].ty {
+                    return false;
+                }
+                if !use_elem(INSTS[phi].ty) {
+                    return false;
+                }
+                set_class(phi, VC_VECTOR);
+                V_REDS.push(phi);
+                V_REDS.push(next);
+                V_REDS.push(op as i64);
+            } else {
+                set_class(phi, VC_UNIFORM);
+            }
+            phi = INSTS[phi].next;
+        }
+        // Every instruction, in order.
+        let mut total = 0;
+        for k in 0..V_CHAIN.count {
+            let mut v = BLOCKS[V_CHAIN.data[k]].first;
+            while v != 0 {
+                total += 1;
+                if total > VEC_MAX_INSTS {
+                    return false;
+                }
+                if !classify(l, v, latch_cond) {
+                    return false;
+                }
+                v = INSTS[v].next;
+            }
+        }
+        V_SIZE = total;
+        if V_ELEM == 0 {
+            return false;
+        }
+        V_VF = 16 / type_size(V_ELEM);
+        V_VT = vector_type(lane_type(V_ELEM), V_VF);
+        if V_VT == 0 {
+            return false;
+        }
+        // The reductions' phis are used by their next values alone, and the
+        // loop's values used after it are reductions' (LCSSA: the exit's
+        // phis).
+        for r in 0..V_REDS.count / 3 {
+            let p = V_REDS.data[3 * r];
+            if !only_used_by(l, p, V_REDS.data[3 * r + 1]) {
+                return false;
+            }
+        }
+        let mut x = BLOCKS[e].first;
+        while x != 0 && INSTS[x].op == Phi {
+            let w = ir_val(ir_arg(x, 0));
+            // (A uniform value: its value at the last iteration, computed
+            // after the vector loop.)
+            if !invariant_in(l, w) && reduction_of_next(w) < 0
+                && (class_of(w) != VC_UNIFORM || coef(l, w) == NONAFFINE || loads_in(l, w)) {
+                return false;
+            }
+            x = INSTS[x].next;
+        }
+        // Checks: on an index with coefficient 1. What is computed before the
+        // loop (indices and addresses at its first and last iterations)
+        // loads nothing.
+        for k in 0..V_CHECKS.count / 3 {
+            if coef(l, V_CHECKS.data[3 * k + 1]) != 1 || loads_in(l, V_CHECKS.data[3 * k + 1]) {
+                return false;
+            }
+        }
+        for k in 0..V_ACCESS.count / 3 {
+            if loads_in(l, V_ACCESS.data[3 * k + 1]) {
+                return false;
+            }
+        }
+        if overlap_pairs() > VEC_MAX_OVERLAPS {
+            return false;
+        }
+        true
+    }
+}
+
+// Whether uniform value v depends on a load in loop l.
+fn loads_in(l: i64, v: i64) -> bool {
+    unsafe {
+        let x = ir_val(v);
+        if x == 0 || x == V_IV || invariant_in(l, x) {
+            return false;
+        }
+        if INSTS[x].op == Load {
+            return true;
+        }
+        loads_in(l, INSTS[x].a) || loads_in(l, INSTS[x].b)
+    }
+}
+
+// Whether every use of v inside loop l is instruction u (or the phi it
+// came from).
+fn only_used_by(l: i64, v: i64, u: i64) -> bool {
+    unsafe {
+        for k in 0..V_CHAIN.count {
+            let mut x = BLOCKS[V_CHAIN.data[k]].first;
+            while x != 0 {
+                if x != u {
+                    let n = if INSTS[x].op == Phi { 3 + INSTS[x].nargs } else { 3 };
+                    for i in 0..n {
+                        let w = if i == 0 { INSTS[x].a } else if i == 1 { INSTS[x].b } else if i == 2 { INSTS[x].c } else { ir_arg(x, i - 3) };
+                        if w != 0 && ir_val(w) == v {
+                            return false;
+                        }
+                    }
+                }
+                x = INSTS[x].next;
+            }
+            let b = V_CHAIN.data[k];
+            if BLOCKS[b].cond != 0 && ir_val(BLOCKS[b].cond) == v {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// The reduction (index) whose next value is w, or -1.
+fn reduction_of_next(w: i64) -> i64 {
+    unsafe {
+        for r in 0..V_REDS.count / 3 {
+            if V_REDS.data[3 * r + 1] == w {
+                return r;
+            }
+        }
+        -1
+    }
+}
+
+fn is_check(c: i64) -> bool {
+    unsafe {
+        let mut k = 0;
+        while k < V_CHECKS.count {
+            if V_CHECKS.data[k] == c {
+                return true;
+            }
+            k += 3;
+        }
+        false
+    }
+}
+
+// The accesses grouped by the base of their address (the address less a
+// constant): (base, lowest offset, highest offset + size, whether one
+// stores) quadruples. An access's offset adds its constant to its
+// instruction's.
+static mut V_GROUPS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// Groups the accesses; false when a group stores and holds accesses at
+// different offsets (a dependence the overlap test would always find).
+fn build_groups() -> bool {
+    unsafe {
+        V_GROUPS.count = 0;
+        for i in 0..V_ACCESS.count / 3 {
+            let a = V_ACCESS.data[3 * i];
+            let mut off = INSTS[a].imm;
+            let base = ir_val(address_base(V_ACCESS.data[3 * i + 1], &off));
+            let end = off + V_ACCESS.data[3 * i + 2];
+            let store = INSTS[a].op == Store;
+            let mut g = 0;
+            while g < V_GROUPS.count && V_GROUPS.data[g] != base {
+                g += 4;
+            }
+            if g == V_GROUPS.count {
+                V_GROUPS.push(base);
+                V_GROUPS.push(off);
+                V_GROUPS.push(end);
+                V_GROUPS.push(if store { 1 } else { 0 });
+                continue;
+            }
+            let same = V_GROUPS.data[g + 1] == off && V_GROUPS.data[g + 2] == end;
+            if !same && (store || V_GROUPS.data[g + 3] != 0) {
+                return false;
+            }
+            if off < V_GROUPS.data[g + 1] { V_GROUPS.data[g + 1] = off; }
+            if end > V_GROUPS.data[g + 2] { V_GROUPS.data[g + 2] = end; }
+            if store { V_GROUPS.data[g + 3] = 1; }
+        }
+        true
+    }
+}
+
+// The number of runtime overlap tests the groups need (each storing group
+// against every other); a large number when they cannot be.
+fn overlap_pairs() -> i64 {
+    unsafe {
+        if !build_groups() {
+            return 1000000;
+        }
+        let n = V_GROUPS.count / 4;
+        let mut count = 0;
+        for i in 0..n {
+            if V_GROUPS.data[4 * i + 3] == 0 {
+                continue;
+            }
+            for j in 0..n {
+                if j != i && (V_GROUPS.data[4 * j + 3] == 0 || j > i) {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+}
+
+// Appends to block c the test that groups i and j do not overlap (over
+// all iterations: one wholly below the other) to *ok.
+fn group_test(l: i64, c: i64, i: i64, j: i64, ok: i64, start: i64, last: i64, start2: i64, last2: i64) -> i64 {
+    unsafe {
+        let below = group_below(l, c, i, j, start, last, start2, last2);
+        let above = group_below(l, c, j, i, start, last, start2, last2);
+        and_into(c, ok, append(c, Or, TY_BOOL, below, above, 0))
+    }
+}
+
+// Whether group g's bytes all come before group h's: every highest
+// corner of g (its end) at most every lowest corner of h.
+fn group_below(l: i64, c: i64, g: i64, h: i64, start: i64, last: i64, start2: i64, last2: i64) -> i64 {
+    unsafe {
+        let mut his: [i64; 2] = [0; 2];
+        let mut los: [i64; 2] = [0; 2];
+        let nh = group_corners(l, c, g, true, start, last, start2, last2, &his as *i64);
+        let nl = group_corners(l, c, h, false, start, last, start2, last2, &los as *i64);
+        let mut ok = 0;
+        for a in 0..nh {
+            let end = append(c, Add, TY_U64, his[a], konst(c, V_GROUPS.data[4 * g + 2], TY_U64), 0);
+            for b in 0..nl {
+                let begin = append(c, Add, TY_U64, los[b], konst(c, V_GROUPS.data[4 * h + 1], TY_U64), 0);
+                ok = and_into(c, ok, cmp(c, Cond::Le, TY_U64, end, begin));
+            }
+        }
+        ok
+    }
+}
+
+// The base of group g at its highest (or lowest) iterations, into out:
+// one value, or two when its coefficient of k has an unknown sign (k's
+// first and last value; j's coefficient is a constant).
+fn group_corners(l: i64, c: i64, g: i64, high: bool, start: i64, last: i64, start2: i64, last2: i64, out: *i64) -> i64 {
+    unsafe {
+        let base = V_GROUPS.data[4 * g];
+        let cj = coef_wrt(l, base, V_IV, V_IV2);
+        let jv = if (cj >= 0) == high { last } else { start };
+        if V_IV2 == 0 {
+            out[0] = eval_at(l, base, jv, c);
+            return 1;
+        }
+        let ck = coef_wrt(l, base, V_IV2, V_IV);
+        if ck != NONAFFINE {
+            let kv = if (ck >= 0) == high { last2 } else { start2 };
+            out[0] = eval_at2(l, base, jv, kv, c);
+            return 1;
+        }
+        out[0] = eval_at2(l, base, jv, start2, c);
+        out[1] = eval_at2(l, base, jv, last2, c);
+        2
+    }
+}
+
+// The overlap tests of all the groups, and'ed into ok.
+fn overlap_tests(l: i64, c: i64, ok0: i64, start: i64, last: i64, start2: i64, last2: i64) -> i64 {
+    unsafe {
+        let mut ok = ok0;
+        let n = V_GROUPS.count / 4;
+        for i in 0..n {
+            if V_GROUPS.data[4 * i + 3] == 0 {
+                continue;
+            }
+            for j in 0..n {
+                if j != i && (V_GROUPS.data[4 * j + 3] == 0 || j > i) {
+                    ok = group_test(l, c, i, j, ok, start, last, start2, last2);
+                }
+            }
+        }
+        ok
+    }
+}
+
+fn classify(l: i64, v: i64, latch_cond: i64) -> bool {
+    unsafe {
+        let op = INSTS[v].op;
+        if op == Phi {
+            return class_of(v) != 0;
+        }
+        if v == latch_cond || is_check(v) {
+            set_class(v, VC_SKIP);
+            return true;
+        }
+        if op == Load {
+            let ty = INSTS[v].ty;
+            let addr = ir_val(INSTS[v].a);
+            let c = coef(l, addr);
+            if c == 0 && (class_of(addr) == VC_UNIFORM || invariant_in(l, addr)) {
+                // An invariant address: the same value in every iteration (a
+                // store reaching it is ruled out by the overlap test).
+                V_HAS_ULOAD = true;
+                V_ACCESS.push(v);
+                V_ACCESS.push(addr);
+                V_ACCESS.push(type_size(ty));
+                set_class(v, VC_UNIFORM);
+                return true;
+            }
+            if c != type_size(ty) || !use_elem(ty) {
+                return false;
+            }
+            V_ACCESS.push(v);
+            V_ACCESS.push(addr);
+            V_ACCESS.push(type_size(ty));
+            set_class(v, VC_VECTOR);
+            return true;
+        }
+        if op == Store {
+            let ty = INSTS[v].imm2;
+            let addr = ir_val(INSTS[v].a);
+            if coef(l, addr) != type_size(ty) || !use_elem(ty) || !vector_operand_ok(l, INSTS[v].b) {
+                return false;
+            }
+            V_HAS_STORE = true;
+            V_ACCESS.push(v);
+            V_ACCESS.push(addr);
+            V_ACCESS.push(type_size(ty));
+            set_class(v, VC_VECTOR);
+            return true;
+        }
+        let a = if INSTS[v].a != 0 { class_of(ir_val(INSTS[v].a)) } else { 0 };
+        let b = if INSTS[v].b != 0 { class_of(ir_val(INSTS[v].b)) } else { 0 };
+        if a == VC_VECTOR || b == VC_VECTOR {
+            let ty = INSTS[v].ty;
+            let ok_op = op == Add || op == Sub || op == Mul || op == And || op == Or || op == Xor
+                || op == Neg || (op == Div && is_float(ty));
+            if !ok_op || (is_float(ty) && (op == And || op == Or || op == Xor)) || !use_elem(ty) {
+                return false;
+            }
+            if !vector_operand_ok(l, INSTS[v].a) || (INSTS[v].b != 0 && !vector_operand_ok(l, INSTS[v].b)) {
+                return false;
+            }
+            set_class(v, VC_VECTOR);
+            return true;
+        }
+        if a == VC_SKIP || b == VC_SKIP {
+            return false;
+        }
+        if op.is_pure() || op == Const {
+            if op == Op::Cmp || INSTS[v].ty == TY_BOOL {
+                // (A comparison that is no check: control flow, or a value.)
+                return false;
+            }
+            set_class(v, VC_UNIFORM);
+            return true;
+        }
+        false
+    }
+}
+
+// ---- Building ----
+
+fn map_get(v: i64) -> i64 {
+    unsafe {
+        let x = ir_val(v);
+        let mut k = 0;
+        while k < V_MAP.count {
+            if V_MAP.data[k] == x {
+                return V_MAP.data[k + 1];
+            }
+            k += 2;
+        }
+        x
+    }
+}
+
+fn map_put(v: i64, w: i64) {
+    unsafe {
+        V_MAP.push(v);
+        V_MAP.push(w);
+    }
+}
+
+fn append(b: i64, op: Op, ty: i64, a: i64, x: i64, imm: i64) -> i64 {
+    let v = ir_make(op, ty, a, x, imm);
+    ir_append(b, v);
+    v
+}
+
+fn konst(b: i64, value: i64, ty: i64) -> i64 {
+    append(b, Const, ty, 0, 0, value)
+}
+
+fn cmp(b: i64, cond: Cond, ty: i64, a: i64, x: i64) -> i64 {
+    let v = append(b, Cmp, TY_BOOL, a, x, 0);
+    unsafe {
+        INSTS[v].cond = cond;
+        INSTS[v].imm2 = ty;
+    }
+    v
+}
+
+// The value of uniform (or invariant) v when the induction variable is
+// `at`, computed in block b.
+fn eval_at(l: i64, v: i64, at: i64, b: i64) -> i64 {
+    unsafe {
+        let x = ir_val(v);
+        if x == V_IV {
+            return at;
+        }
+        if invariant_in(l, x) {
+            return x;
+        }
+        let mut k = 0;
+        while k < V_EVAL.count {
+            if V_EVAL.data[k] == x && V_EVAL.data[k + 1] == at {
+                return V_EVAL.data[k + 2];
+            }
+            k += 3;
+        }
+        let a = if INSTS[x].a != 0 { eval_at(l, INSTS[x].a, at, b) } else { 0 };
+        let y = if INSTS[x].b != 0 { eval_at(l, INSTS[x].b, at, b) } else { 0 };
+        let nv = ir_make(INSTS[x].op, INSTS[x].ty, a, y, INSTS[x].imm);
+        INSTS[nv].imm2 = INSTS[x].imm2;
+        INSTS[nv].cond = INSTS[x].cond;
+        ir_append(b, nv);
+        V_EVAL.push(x);
+        V_EVAL.push(at);
+        V_EVAL.push(nv);
+        nv
+    }
+}
+
+// ok = ok && c (as branches would cost blocks: and of bools, 0 or 1).
+fn and_into(b: i64, ok: i64, c: i64) -> i64 {
+    if ok == 0 {
+        return c;
+    }
+    append(b, And, TY_BOOL, ok, c, 0)
+}
+
+// The value of v for the vector loop: a vector (splat when v is the same
+// for all lanes; invariant ones in the vector preheader `vp`).
+fn vector_of(v: i64, vh: i64, vp: i64, l: i64) -> i64 {
+    unsafe {
+        let x = ir_val(v);
+        if class_of(x) == VC_VECTOR {
+            return map_get(x);
+        }
+        let key = -x - 1;
+        let mut k = 0;
+        while k < V_MAP.count {
+            if V_MAP.data[k] == key {
+                return V_MAP.data[k + 1];
+            }
+            k += 2;
+        }
+        if invariant_in(l, x) || !loads_in(l, x) {
+            // The same in every iteration (coefficient 0, no load): computed
+            // once, before the loop.
+            let s = ir_make(VSplat, V_VT, eval_at(l, x, V_START, vp), 0, 0);
+            ir_append(vp, s);
+            map_put(key, s);
+            return s;
+        }
+        let s = ir_make(VSplat, V_VT, map_get(x), 0, 0);
+        ir_append(vh, s);
+        s
+    }
+}
+
+// One copy of the loop's body in block vh (V_MAP maps the induction
+// variable and the reductions' phis).
+fn emit_body(l: i64, vh: i64, vp: i64) {
+    unsafe {
+        let vt = V_VT;
+        for k in 0..V_CHAIN.count {
+            let mut v = BLOCKS[V_CHAIN.data[k]].first;
+            while v != 0 {
+                let cls = class_of(v);
+                let op = INSTS[v].op;
+                if op == Phi || cls == VC_SKIP {
+                    v = INSTS[v].next;
+                    continue;
+                }
+                if cls == VC_UNIFORM {
+                    let nv = ir_make(op, INSTS[v].ty, map_get(INSTS[v].a), map_get(INSTS[v].b), INSTS[v].imm);
+                    INSTS[nv].imm2 = INSTS[v].imm2;
+                    INSTS[nv].cond = INSTS[v].cond;
+                    ir_append(vh, nv);
+                    map_put(v, nv);
+                } else if op == Load {
+                    let nv = append(vh, Load, vt, map_get(INSTS[v].a), 0, INSTS[v].imm);
+                    map_put(v, nv);
+                } else if op == Store {
+                    let value = vector_of(INSTS[v].b, vh, vp, l);
+                    let nv = append(vh, Store, 0, map_get(INSTS[v].a), value, INSTS[v].imm);
+                    INSTS[nv].imm2 = vt;
+                } else if op == Neg {
+                    let nv = append(vh, VNeg, vt, vector_of(INSTS[v].a, vh, vp, l), 0, 0);
+                    map_put(v, nv);
+                } else {
+                    let a = vector_of(INSTS[v].a, vh, vp, l);
+                    let b = vector_of(INSTS[v].b, vh, vp, l);
+                    let nv = append(vh, VBin, vt, a, b, op as i64);
+                    map_put(v, nv);
+                }
+                v = INSTS[v].next;
+            }
+        }
+    }
+}
+
+// The identity of reduction operation op.
+fn identity(op: Op) -> i64 {
+    if op == And { return -1; }
+    if op == Mul { return 1; }
+    0
+}
+
+// ---- The cost model (0.11) ----
+//
+// After the analysis, whether the vector loop pays, and how many copies of
+// the body it runs (U): costs are rough cycles of throughput. A scalar
+// iteration costs S (its instructions, a check two, a float division
+// four); a vector iteration, U * VF scalar ones, costs U * B + 3 (the
+// vector body: an instruction one, a lane-by-lane multiplication
+// 3 * VF; the induction variable, its test and branch); the decision
+// before the loop, the reductions' setup and their combination after it
+// cost G. With T iterations expected (exact for constant bounds, else
+// the profile's average: the header's count over the entries'), the
+// vector version costs G + (T / (U*VF)) * (U*B + 3) + (T % (U*VF)) * S
+// against T * S; U = 2 is tried for small bodies, then U = 1. Without an
+// expected T a vector iteration must only be cheaper than the scalar ones
+// it replaces, and U is 2 for small bodies, as in 0.10.
+
+// Whether integer multiplication of the loop's lanes is done lane by lane
+// (SSE2 has 16-bit lanes only; NEON lacks 64-bit lanes).
+fn lanewise_mul() -> bool {
+    unsafe {
+        let size = type_size(V_ELEM);
+        if is_float(V_ELEM) {
+            return false;
+        }
+        if X86 { size != 2 } else { size == 8 }
+    }
+}
+
+// v as x + c: returns x (0 for a constant) and adds c to *offset.
+fn const_base(v: i64, offset: *i64) -> i64 {
+    unsafe {
+        let mut x = ir_val(v);
+        for _ in 0..8 {
+            if is_const(x) {
+                *offset += INSTS[x].imm;
+                return 0;
+            }
+            if INSTS[x].op != Add || !is_const(ir_val(INSTS[x].b)) {
+                return x;
+            }
+            *offset += INSTS[ir_val(INSTS[x].b)].imm;
+            x = ir_val(INSTS[x].a);
+        }
+        x
+    }
+}
+
+// The expected number of iterations of loop l (analyzed) per entry, or -1.
+fn expected_trips(l: i64) -> i64 {
+    unsafe {
+        let h = loop_header(l);
+        let p = loop_preheader(l);
+        let start = ir_val(ir_arg(V_IV, pred_index(h, p)));
+        // (Constants, or one value plus two constants: an array's end.)
+        let mut off_n = 0;
+        let mut off_s = 0;
+        let n = const_base(V_N, &off_n);
+        let s = const_base(start, &off_s);
+        if n == s {
+            let t = off_n - off_s;
+            return if t > 0 { t } else { -1 };
+        }
+        let hc = BLOCKS[h].count;
+        if PROFILE_MAX <= 0 || hc < 0 {
+            return -1;
+        }
+        // The entries: the preheader's count, or the nearest one above it
+        // through single predecessors (blocks made after the profile was
+        // read have none).
+        let mut b = p;
+        for _ in 0..8 {
+            if BLOCKS[b].count > 0 {
+                return hc / BLOCKS[b].count;
+            }
+            if BLOCKS[b].count == 0 || BLOCKS[b].preds.count != 1 {
+                return -1;
+            }
+            b = BLOCKS[b].preds.data[0];
+        }
+        -1
+    }
+}
+
+// Whether v is computed from the induction variable and constants alone
+// (a constant in each copy of the loop fully unrolled from a constant
+// start), looking depth operations deep.
+fn constant_affine(v: i64, depth: i64) -> bool {
+    unsafe {
+        let x = ir_val(v);
+        if x == V_IV || is_const(x) {
+            return true;
+        }
+        let op = INSTS[x].op;
+        if depth == 0 || !(op == Add || op == Sub || op == Mul || op == Shl || op == Conv) {
+            return false;
+        }
+        constant_affine(INSTS[x].a, depth - 1) && (INSTS[x].b == 0 || constant_affine(INSTS[x].b, depth - 1))
+    }
+}
+
+// How many vector bodies an iteration of the vector loop of l (analyzed)
+// runs, 1 or 2; 0 when vectorizing does not pay. unrolled > 0: the scalar
+// alternative is the loop fully unrolled, that many times (the unroller
+// asks), whose copies keep only the work on each element: the induction
+// variable, the latch's test and the addresses affine in it become
+// constants and offsets, what is invariant leaves the loop, and a check
+// of a constant length on an index made of the induction variable and
+// constants (from a constant start) is decided.
+fn vector_unroll(l: i64, unrolled: i64) -> i64 {
+    unsafe {
+        let vf = V_VF;
+        let mut s = 2;
+        let mut su = 0;
+        let mut body = 0;
+        for k in 0..V_CHAIN.count {
+            let mut v = BLOCKS[V_CHAIN.data[k]].first;
+            while v != 0 {
+                let op = INSTS[v].op;
+                let cls = class_of(v);
+                let div = op == Div;
+                if op != Phi {
+                    let cost = if cls == VC_SKIP { 2 } else if div { 4 } else { 1 };
+                    s += cost;
+                    if unrolled > 0 && cls != VC_SKIP
+                        && (cls != VC_UNIFORM || (!invariant_in(l, v) && coef(l, v) == NONAFFINE)) {
+                        su += cost;
+                    }
+                }
+                if cls == VC_UNIFORM {
+                    body += 1;
+                } else if cls == VC_VECTOR && op != Phi {
+                    body += if op == Mul && lanewise_mul() { 3 * vf } else if div { 4 } else { 1 };
+                }
+                v = INSTS[v].next;
+            }
+        }
+        if unrolled > 0 {
+            let h = loop_header(l);
+            let start = ir_val(ir_arg(V_IV, pred_index(h, loop_preheader(l))));
+            for k in 0..V_CHECKS.count / 3 {
+                if !is_const(start) || !is_const(ir_val(V_CHECKS.data[3 * k + 2]))
+                    || !constant_affine(V_CHECKS.data[3 * k + 1], 8) {
+                    su += 2;
+                }
+            }
+        }
+        let nreds = V_REDS.count / 3;
+        let mut setup = 6 + 8 * (V_CHECKS.count / 3) + 10 * overlap_pairs();
+        for r in 0..nreds {
+            let raw = V_REDS.data[3 * r + 2];
+            let op = raw as Op;
+            setup += if op == Add || op == Sub { 4 } else { 2 + 2 * vf };
+        }
+        let small = V_SIZE <= VEC_UNROLL_SIZE;
+        let t = if unrolled > 0 { unrolled } else { expected_trips(l) };
+        if t < 0 {
+            let u = if small { 2 } else { 1 };
+            return if u * body + 3 < u * vf * s { u } else { 0 };
+        }
+        let scalar = if unrolled > 0 { t * su } else { t * s };
+        let mut best = 0;
+        let mut best_cost = scalar;
+        let mut u = if small { 2 } else { 1 };
+        while u >= 1 {
+            let w = u * vf;
+            if t >= w {
+                let cost = setup + nreds * (u - 1) + (t / w) * (u * body + 3) + (t % w) * s;
+                if cost < best_cost {
+                    best = u;
+                    best_cost = cost;
+                }
+            }
+            u -= 1;
+        }
+        best
+    }
+}
+
+fn vectorize_loop(fi: i64, l: i64) -> bool {
+    unsafe {
+        // (before the analysis, whose marks the trip count's evaluation
+        // would overwrite)
+        let whole = full_unroll_trips(l);
+        let mut e = 0;
+        if !analyze(l, &e) {
+            return false;
+        }
+        let unroll = vector_unroll(l, 0);
+        if unroll == 0 {
+            return false;
+        }
+        // (0.11: a loop of a few constant trips whose checks kept
+        // transform_loops from unrolling it whole, until the ranges removed
+        // them, is better unrolled whole when that is cheaper: then each
+        // copy keeps only its loads, stores and operations, which SLP may
+        // pack, and no test of the trip count or overlap is made)
+        if whole > 0 && vector_unroll(l, whole) == 0 {
+            UNROLL_WHOLE = true;
+            return false;
+        }
+        IRF = fi;
+        let h = loop_header(l);
+        let p = loop_preheader(l);
+        let start = ir_val(ir_arg(V_IV, pred_index(h, p)));
+        V_START = start;
+        let vf = V_VF;
+        let elem = V_ELEM;
+        let vt = V_VT;
+        let lt = lane_type(elem);
+        V_MAP.count = 0;
+        V_EVAL.count = 0;
+        // C: the decision.
+        let c = ir_new_block();
+        let vp = ir_new_block();
+        let vh = ir_new_block();
+        let vx = ir_new_block();
+        let sp = ir_new_block();
+        BLOCKS[c].sealed = 1;
+        BLOCKS[vp].sealed = 1;
+        BLOCKS[vh].sealed = 1;
+        BLOCKS[vx].sealed = 1;
+        BLOCKS[sp].sealed = 1;
+        BLOCKS[p].s0 = c;
+        BLOCKS[c].preds.push(p);
+        let n = V_N;
+        let trips = append(c, Sub, TY_I64, n, start, 0);
+        let mut ok = cmp(c, Cond::Ge, TY_U64, trips, konst(c, unroll * vf, TY_I64));
+        let last = append(c, Sub, TY_I64, n, konst(c, 1, TY_I64), 0);
+        ok = check_tests(l, c, ok, start, last);
+        build_groups();
+        ok = overlap_tests(l, c, ok, start, last, 0, 0);
+        ir_terminate(c, Term::Branch, ok, vp, sp);
+        // VP: the vector preheader.
+        let mask = konst(vp, 0 - unroll * vf, TY_I64);
+        let vtrips = append(vp, And, TY_I64, trips, mask, 0);
+        let vend = append(vp, Add, TY_I64, start, vtrips, 0);
+        let mut red_init = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut red_id = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for r in 0..V_REDS.count / 3 {
+            let phi = V_REDS.data[3 * r];
+            let raw = V_REDS.data[3 * r + 2];
+            let op = raw as Op;
+            let init = ir_val(ir_arg(phi, pred_index(h, p)));
+            let id = append(vp, VSplat, vt, konst(vp, identity(op), lt), 0, 0);
+            let first = append(vp, VIns, vt, id, init, 0);
+            red_init.push(first);
+            red_id.push(id);
+        }
+        ir_terminate(vp, Term::Jump, 0, vh, 0);
+        // VH: the vector loop, `unroll` copies of the body (each with its
+        // own accumulators, combined after the loop).
+        let viv = ir_make(Phi, INSTS[V_IV].ty, 0, 0, 0);
+        INSTS[viv].args = ARGS.count;
+        INSTS[viv].nargs = 2;
+        ARGS.push(start);
+        ARGTY.push(0);
+        ARGS.push(0);
+        ARGTY.push(0);
+        ir_append(vh, viv);
+        let mut red_phis = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut red_nexts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for u in 0..unroll {
+            for r in 0..V_REDS.count / 3 {
+                let rp = ir_make(Phi, vt, 0, 0, 0);
+                INSTS[rp].args = ARGS.count;
+                INSTS[rp].nargs = 2;
+                ARGS.push(if u == 0 { red_init.data[r] } else { red_id.data[r] });
+                ARGTY.push(0);
+                ARGS.push(0);
+                ARGTY.push(0);
+                ir_append(vh, rp);
+                red_phis.push(rp);
+            }
+        }
+        for u in 0..unroll {
+            // A fresh map per copy (the splats of invariants stay).
+            let mut k = 0;
+            let mut kept = 0;
+            while k < V_MAP.count {
+                if V_MAP.data[k] < 0 {
+                    V_MAP.data[kept] = V_MAP.data[k];
+                    V_MAP.data[kept + 1] = V_MAP.data[k + 1];
+                    kept += 2;
+                }
+                k += 2;
+            }
+            V_MAP.count = kept;
+            if u == 0 {
+                map_put(V_IV, viv);
+            } else {
+                map_put(V_IV, append(vh, Add, INSTS[V_IV].ty, viv, konst(vh, u * vf, INSTS[V_IV].ty), 0));
+            }
+            for r in 0..V_REDS.count / 3 {
+                map_put(V_REDS.data[3 * r], red_phis.data[u * (V_REDS.count / 3) + r]);
+            }
+            emit_body(l, vh, vp);
+            for r in 0..V_REDS.count / 3 {
+                red_nexts.push(map_get(V_REDS.data[3 * r + 1]));
+            }
+        }
+        let vnext = append(vh, Add, INSTS[V_IV].ty, viv, konst(vh, unroll * vf, INSTS[V_IV].ty), 0);
+        ir_set_arg(viv, 1, vnext);
+        for i in 0..red_phis.count {
+            ir_set_arg(red_phis.data[i], 1, red_nexts.data[i]);
+        }
+        let more = cmp(vh, Cond::Ne, TY_I64, vnext, vend);
+        // (Its predecessors: vp, then vh, the phis' operand order.)
+        ir_terminate(vh, Term::Branch, more, vh, vx);
+        // VX: the reductions summed.
+        let mut red_final = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let nr = V_REDS.count / 3;
+        for r in 0..nr {
+            let phi = V_REDS.data[3 * r];
+            let raw = V_REDS.data[3 * r + 2];
+            let op = raw as Op;
+            let ty = INSTS[phi].ty;
+            let mut vec = red_nexts.data[r];
+            for u in 1..unroll {
+                let comb = if op == Sub { Add } else { op };
+                vec = append(vx, VBin, vt, vec, red_nexts.data[u * nr + r], comb as i64);
+            }
+            let mut s = 0;
+            if op == Add || op == Sub {
+                s = append(vx, VSum, lt, vec, 0, 0);
+            } else {
+                s = append(vx, VExt, lt, vec, 0, 0);
+                for k in 1..vf {
+                    let x = append(vx, VExt, lt, vec, 0, k);
+                    s = append(vx, op, lt, s, x, 0);
+                }
+            }
+            if ty != lt {
+                s = append(vx, Conv, ty, s, 0, 0);
+                INSTS[s].imm2 = lt;
+            }
+            red_final.push(s);
+        }
+        let done = cmp(vx, Cond::Eq, TY_I64, vend, n);
+        ir_terminate(vx, Term::Branch, done, e, sp);
+        // SP: the scalar loop's preheader, from C or VX (its predecessors, in
+        // that order).
+        let mut vals = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        vals.push(start);
+        vals.push(vend);
+        let iv0 = new_phi_in(sp, INSTS[V_IV].ty, &vals, 0, 2);
+        let hp = pred_index(h, p);
+        ir_set_arg(V_IV, hp, iv0);
+        for r in 0..V_REDS.count / 3 {
+            let phi = V_REDS.data[3 * r];
+            vals.count = 0;
+            vals.push(ir_val(ir_arg(phi, hp)));
+            vals.push(red_final.data[r]);
+            let r0 = new_phi_in(sp, INSTS[phi].ty, &vals, 0, 2);
+            ir_set_arg(phi, hp, r0);
+        }
+        ir_terminate(sp, Term::Jump, 0, h, 0);
+        // (ir_terminate added sp to h's predecessors: it replaces p.)
+        BLOCKS[h].preds.count -= 1;
+        BLOCKS[h].preds.data[hp] = sp;
+        // E: from VX too, with the reductions' results.
+        vals.count = 0;
+        let mut x = BLOCKS[e].first;
+        while x != 0 && INSTS[x].op == Phi {
+            let w = ir_val(ir_arg(x, 0));
+            let r = reduction_of_next(w);
+            if r >= 0 {
+                vals.push(red_final.data[r]);
+            } else {
+                // (Uniform values at the last iteration.)
+                vals.push(eval_at(l, w, last, vx));
+            }
+            x = INSTS[x].next;
+        }
+        BLOCKS[e].preds.count -= 1;
+        add_pred_values(e, vx, &vals, 0);
+        BLOCKS[h].novec = 1;
+        free(vals.data as *u8);
+        free(red_init.data as *u8);
+        free(red_id.data as *u8);
+        free(red_nexts.data as *u8);
+        free(red_phis.data as *u8);
+        free(red_final.data as *u8);
+        true
+    }
+}
+
+// Whether loop l is no candidate at a glance: a call, a copy, no memory
+// access, or too big (before the costlier analysis).
+fn quick_reject(l: i64) -> bool {
+    unsafe {
+        let mut n = 0;
+        let mut memory = false;
+        for i in 0..loop_size(l) {
+            let mut v = BLOCKS[loop_block(l, i)].first;
+            while v != 0 {
+                let op = INSTS[v].op;
+                if op.is_call() || op == Op::Copy || op.is_vector() {
+                    return true;
+                }
+                if op == Load || op == Store {
+                    memory = true;
+                }
+                n += 1;
+                v = INSTS[v].next;
+            }
+        }
+        !memory || n > VEC_MAX_INSTS
+    }
+}
+
+// Vectorizes the innermost loops of fi that can be; returns whether any
+// was.
+pub fn vectorize_loops(fi: i64) -> bool {
+    unsafe {
+        UNROLL_WHOLE = false;
+        if !VECTORIZE {
+            return false;
+        }
+        canonicalize_loops(fi);
+        let mut headers = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut outer = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for l in 0..loop_count() {
+            if loop_header(l) == IRFUNCS[fi].entry || BLOCKS[loop_header(l)].novec != 0
+                || is_cold_block(loop_header(l)) || quick_reject(l) {
+                continue;
+            }
+            if is_innermost(l) {
+                headers.push(loop_header(l));
+                continue;
+            }
+            // (A loop holding one innermost loop.)
+            let mut child = -1;
+            let mut children = 0;
+            for x in 0..loop_count() {
+                if LP_PARENT.data[x] == l {
+                    child = x;
+                    children += 1;
+                }
+            }
+            if children == 1 && is_innermost(child) {
+                outer.push(loop_header(l));
+                outer.push(loop_header(child));
+            }
+        }
+        let mut changed = false;
+        let mut k = 0;
+        while k < outer.count {
+            canonicalize_loops(fi);
+            let l = innermost_loop(outer.data[k]);
+            let l2 = innermost_loop(outer.data[k + 1]);
+            k += 2;
+            if l < 0 || l2 < 0 || loop_header(l) != outer.data[k - 2] || loop_header(l2) != outer.data[k - 1]
+                || !is_canonical(l) || !is_canonical(l2) || LP_PARENT.data[l2] != l {
+                continue;
+            }
+            if form_lcssa(fi, l) {
+                resolve_all(fi);
+            }
+            if vectorize_outer(fi, l, l2) {
+                changed = true;
+                resolve_all(fi);
+                verify_func(fi, c"vectorization (outer loop)");
+            }
+        }
+        free(outer.data as *u8);
+        if changed {
+            canonicalize_loops(fi);
+        }
+        // (The loops are found again after a change only.)
+        let mut stale = false;
+        for i in 0..headers.count {
+            if stale {
+                canonicalize_loops(fi);
+                stale = false;
+            }
+            let l = innermost_loop(headers.data[i]);
+            if l < 0 || loop_header(l) != headers.data[i] || !is_canonical(l) {
+                continue;
+            }
+            if form_lcssa(fi, l) {
+                resolve_all(fi);
+            }
+            if vectorize_loop(fi, l) {
+                changed = true;
+                stale = true;
+                resolve_all(fi);
+                verify_func(fi, c"vectorization");
+            }
+        }
+        free(headers.data as *u8);
+        changed
+    }
+}
+
+// ---- Unrolling with run-time trip counts (0.11) ----
+//
+// An innermost counted loop (i from start, step 1, to n; any body, its only
+// exits the latch's and failing checks) whose trip count is not a constant
+// gets U copies of its body run per iteration, U = 4 or 2 within a size
+// budget, in the vectorizer's frame (the original loop is the remainder):
+//
+//     C:  trips = n - start; ok = trips >= U && no check fails
+//         branch ok, UP, SP
+//     UP: uend = start + (trips & -U)
+//     U0 .. U(U-1): the copies, chained; the checks dropped; the last
+//         latch: branch i' != uend, U0, UX
+//     UX: branch uend == n, E, SP
+//     SP: i and the header's other phis from C or UX; the scalar loop
+//
+// The checks are proved before the loop as the vectorizer's are (indices
+// of coefficient +1 or -1 in i), so the copies go without them; a loop
+// with another kind of check, or a call, is left alone. Each copy computes
+// exactly what the scalar iteration does, in order.
+
+const UNROLL_RT_SIZE: i64 = 64;
+const UNROLL_RT_TINY: i64 = 12;
+
+// The unrolling factor for loop l (canonical, innermost), or 0; sets V_IV,
+// V_N, V_CHECKS and the classes coef needs.
+fn runtime_factor(l: i64) -> i64 {
+    unsafe {
+        let h = loop_header(l);
+        let latch = loop_latch(l);
+        if BLOCKS[h].novec != 0 || is_cold_block(h) || latch == 0 || loop_preheader(l) == 0
+            || BLOCKS[latch].term != Term::Branch {
+            return 0;
+        }
+        let mut iv = 0;
+        let mut step = 0;
+        let mut n = 0;
+        let mut ne = false;
+        if !counted_loop(l, &iv, &step, &n, &ne) || step != 1 || int_bits(INSTS[iv].ty) != 64 {
+            return 0;
+        }
+        VSTAMP += 1;
+        V_IV = iv;
+        V_N = n;
+        V_NE = ne;
+        V_IV2 = 0;
+        V_CHECKS.count = 0;
+        V_EVAL.count = 0;
+        let s0 = BLOCKS[latch].s0;
+        let s1 = BLOCKS[latch].s1;
+        let e = if s0 == h { s1 } else { s0 };
+        if loop_contains(l, e) || BLOCKS[e].preds.count != 1 {
+            return 0;
+        }
+        let mut size = 0;
+        for i in 0..loop_size(l) {
+            let b = loop_block(l, i);
+            let mut v = BLOCKS[b].first;
+            while v != 0 {
+                let op = INSTS[v].op;
+                if op.is_call() || op == Op::Copy {
+                    return 0;
+                }
+                if (op.is_pure() && op != Cmp) || op == Const {
+                    set_class(v, VC_UNIFORM);
+                }
+                size += 1;
+                v = INSTS[v].next;
+            }
+            if b == latch {
+                continue;
+            }
+            let t = BLOCKS[b].term;
+            if t == Term::Branch {
+                let a = BLOCKS[b].s0;
+                let c = BLOCKS[b].s1;
+                if !loop_contains(l, a) || !loop_contains(l, c) {
+                    let next = if loop_contains(l, a) { a } else { c };
+                    let out = if next == a { c } else { a };
+                    if !loop_contains(l, next) || !is_unreachable_exit(l, out) || !record_check(l, b, next) {
+                        return 0;
+                    }
+                }
+            } else if t != Term::Jump || !loop_contains(l, BLOCKS[b].s0) {
+                return 0;
+            }
+        }
+        set_class(iv, VC_UNIFORM);
+        for k in 0..V_CHECKS.count / 3 {
+            let c = coef(l, V_CHECKS.data[3 * k + 1]);
+            if (c != 1 && c != -1) || loads_in(l, V_CHECKS.data[3 * k + 1]) {
+                return 0;
+            }
+        }
+        // It pays where checks go, or where the loop's own instructions (the
+        // induction variable, its test and branch) are a good part of it.
+        if V_CHECKS.count == 0 && size > UNROLL_RT_TINY {
+            return 0;
+        }
+        let budget = if is_hot_count(BLOCKS[h].count) { 2 * UNROLL_RT_SIZE } else { UNROLL_RT_SIZE };
+        let mut u = if 4 * size <= budget { 4 } else if 2 * size <= budget { 2 } else { 0 };
+        // (With a profile: enough iterations an entry for a few rounds.)
+        let t = expected_trips(l);
+        while u > 1 && t >= 0 && t < 2 * u {
+            u = u / 2;
+        }
+        if u < 2 { 0 } else { u }
+    }
+}
+
+// Unrolls loop l by `u` (see above).
+fn unroll_runtime(fi: i64, l: i64, u: i64) {
+    unsafe {
+        IRF = fi;
+        let h = loop_header(l);
+        let p = loop_preheader(l);
+        let latch = loop_latch(l);
+        let hp = pred_index(h, p);
+        let li = pred_index(h, latch);
+        let e = if BLOCKS[latch].s0 == h { BLOCKS[latch].s1 } else { BLOCKS[latch].s0 };
+        let start = ir_val(ir_arg(V_IV, hp));
+        let n = V_N;
+        let stamp = mark_loop_blocks(l);
+        let mut region = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..LP_LIST2.count {
+            region.push(LP_LIST2.data[i]);
+        }
+        let nb = region.count;
+        let mut phis = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut x = BLOCKS[h].first;
+        while x != 0 && INSTS[x].op == Phi {
+            phis.push(x);
+            x = INSTS[x].next;
+        }
+        let mut outs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        x = BLOCKS[e].first;
+        while x != 0 && INSTS[x].op == Phi {
+            outs.push(ir_val(ir_arg(x, 0)));
+            x = INSTS[x].next;
+        }
+        let np = phis.count;
+        let ne = outs.count;
+        // Per copy: its blocks (nb), header phis (np), next values (np), exit
+        // values (ne), and the induction variable's next value.
+        let mut blocks = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut cphi = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut next = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut outv = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut ivn = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for _ in 0..u {
+            clone_region(fi, &region, stamp);
+            for i in 0..nb {
+                blocks.push(BLOCKS[region.data[i]].aux);
+            }
+            for i in 0..np {
+                cphi.push(INSTS[phis.data[i]].aux);
+                next.push(clone_map(ir_val(ir_arg(phis.data[i], li)), stamp));
+            }
+            for i in 0..ne {
+                outv.push(clone_map(outs.data[i], stamp));
+            }
+            ivn.push(clone_map(ir_val(ir_arg(V_IV, li)), stamp));
+        }
+        // The copies' checks go: each branch to an unreachable exit jumps on.
+        for k in 0..u * nb {
+            let b = blocks.data[k];
+            if BLOCKS[b].term == Term::Branch {
+                let a = BLOCKS[b].s0;
+                let c = BLOCKS[b].s1;
+                let out_a = is_unreachable_exit(l, a) && !is_copy_block(&blocks, a);
+                let out_c = is_unreachable_exit(l, c) && !is_copy_block(&blocks, c);
+                if out_a != out_c {
+                    BLOCKS[b].term = Term::Jump;
+                    BLOCKS[b].cond = 0;
+                    BLOCKS[b].s0 = if out_a { c } else { a };
+                    BLOCKS[b].s1 = 0;
+                }
+            }
+        }
+        let hi = region_index(&region, h);
+        let lati = region_index(&region, latch);
+        let h0 = blocks.data[hi];
+        // Chained: copy k's header phis are copy k-1's next values.
+        for k in 1..u {
+            for i in 0..np {
+                ir_replace(cphi.data[k * np + i], next.data[(k - 1) * np + i]);
+            }
+            let ch = blocks.data[k * nb + hi];
+            BLOCKS[ch].preds.count = 0;
+            BLOCKS[ch].preds.push(blocks.data[(k - 1) * nb + lati]);
+            let pl = blocks.data[(k - 1) * nb + lati];
+            BLOCKS[pl].term = Term::Jump;
+            BLOCKS[pl].cond = 0;
+            BLOCKS[pl].s0 = ch;
+            BLOCKS[pl].s1 = 0;
+        }
+        let last = blocks.data[(u - 1) * nb + lati];
+        // C: the decision.
+        let c = ir_new_block();
+        let up = ir_new_block();
+        let ux = ir_new_block();
+        let sp = ir_new_block();
+        BLOCKS[c].sealed = 1;
+        BLOCKS[up].sealed = 1;
+        BLOCKS[ux].sealed = 1;
+        BLOCKS[sp].sealed = 1;
+        BLOCKS[p].s0 = c;
+        BLOCKS[c].preds.push(p);
+        let trips = append(c, Sub, TY_I64, n, start, 0);
+        let mut ok = cmp(c, Cond::Ge, TY_U64, trips, konst(c, u, TY_I64));
+        let lastv = append(c, Sub, TY_I64, n, konst(c, 1, TY_I64), 0);
+        ok = check_tests(l, c, ok, start, lastv);
+        ir_terminate(c, Term::Branch, ok, up, sp);
+        // UP: the end of the unrolled iterations.
+        let mask = konst(up, 0 - u, TY_I64);
+        let uend = append(up, Add, TY_I64, start, append(up, And, TY_I64, trips, mask, 0), 0);
+        BLOCKS[up].term = Term::Jump;
+        BLOCKS[up].s0 = h0;
+        BLOCKS[h0].preds.data[hp] = up;
+        BLOCKS[h0].preds.data[li] = last;
+        for i in 0..np {
+            ir_set_arg(cphi.data[i], li, next.data[(u - 1) * np + i]);
+        }
+        BLOCKS[h0].novec = 1;
+        // The last copy's latch.
+        let more = cmp(last, Cond::Ne, TY_I64, ivn.data[u - 1], uend);
+        BLOCKS[last].term = Term::Branch;
+        BLOCKS[last].cond = more;
+        BLOCKS[last].s0 = h0;
+        BLOCKS[last].s1 = ux;
+        BLOCKS[ux].preds.push(last);
+        // UX: done, or the rest in the scalar loop.
+        let done = cmp(ux, Cond::Eq, TY_I64, uend, n);
+        ir_terminate(ux, Term::Branch, done, e, sp);
+        BLOCKS[e].preds.count -= 1;
+        let mut vals = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..ne {
+            vals.push(outv.data[(u - 1) * ne + i]);
+        }
+        add_pred_values(e, ux, &vals, 0);
+        // SP: the scalar loop's preheader, from C or UX.
+        for i in 0..np {
+            vals.count = 0;
+            vals.push(ir_val(ir_arg(phis.data[i], hp)));
+            vals.push(next.data[(u - 1) * np + i]);
+            let r = new_phi_in(sp, INSTS[phis.data[i]].ty, &vals, 0, 2);
+            ir_set_arg(phis.data[i], hp, r);
+        }
+        ir_terminate(sp, Term::Jump, 0, h, 0);
+        BLOCKS[h].preds.count -= 1;
+        BLOCKS[h].preds.data[hp] = sp;
+        BLOCKS[h].novec = 1;
+        free(vals.data as *u8);
+        free(region.data as *u8);
+        free(phis.data as *u8);
+        free(outs.data as *u8);
+        free(blocks.data as *u8);
+        free(cphi.data as *u8);
+        free(next.data as *u8);
+        free(outv.data as *u8);
+        free(ivn.data as *u8);
+    }
+}
+
+fn is_copy_block(blocks: *IntVec, b: i64) -> bool {
+    for i in 0..(*blocks).count {
+        if unsafe { (*blocks).data[i] } == b {
+            return true;
+        }
+    }
+    false
+}
+
+fn region_index(region: *IntVec, b: i64) -> i64 {
+    for i in 0..(*region).count {
+        if unsafe { (*region).data[i] } == b {
+            return i;
+        }
+    }
+    -1
+}
+
+// --no-unroll-runtime turns it off (to compare).
+pub static mut UNROLL_RUNTIME: bool = true;
+
+// Unrolls the innermost counted loops of fi whose trip count is known at
+// run time only; returns whether any was (fresh: the loop forest is current).
+pub fn unroll_runtime_loops(fi: i64, fresh: bool) -> bool {
+    unsafe {
+        if !UNROLL_RUNTIME {
+            return false;
+        }
+        if !fresh {
+            canonicalize_loops(fi);
+        }
+        let mut headers = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for l in 0..loop_count() {
+            if loop_header(l) != IRFUNCS[fi].entry && is_innermost(l) && BLOCKS[loop_header(l)].novec == 0 {
+                headers.push(loop_header(l));
+            }
+        }
+        let mut changed = false;
+        let mut stale = false;
+        for i in 0..headers.count {
+            if stale {
+                canonicalize_loops(fi);
+                stale = false;
+            }
+            let l = innermost_loop(headers.data[i]);
+            if l < 0 || loop_header(l) != headers.data[i] || !is_canonical(l) {
+                continue;
+            }
+            if runtime_factor(l) == 0 {
+                continue;
+            }
+            if form_lcssa(fi, l) {
+                resolve_all(fi);
+            }
+            let u = runtime_factor(l);
+            if u > 0 {
+                unroll_runtime(fi, l, u);
+                changed = true;
+                stale = true;
+                resolve_all(fi);
+                verify_func(fi, c"unrolling (run-time trip count)");
+            }
+        }
+        free(headers.data as *u8);
+        changed
+    }
+}
+
+// Returns the lanes (0: not vectorizable). unrolled: the trip count when
+// the alternative is the loop fully unrolled (0: the loop as it is).
+pub fn vectorizable_lanes(l: i64, unrolled: i64) -> i64 {
+    let mut e = 0;
+    if VECTORIZE && analyze(l, &e) && vector_unroll(l, unrolled) > 0 { V_VF } else { 0 }
+}
+
+// ---- Outer loops (0.10) ----
+//
+// A loop L (induction variable j) whose body holds one inner loop L2
+// (induction variable k, its bounds invariant in L), and nothing else but
+// straight-line code before and after it, gets a vector version over j:
+// VF iterations of L at once, L2 run once for all of them with each lane's
+// values (its phis, accumulators over k, become vectors: each lane adds up
+// exactly what the scalar loop adds for its j, in the same order, so a
+// float sum vectorizes too). Values the same for all lanes (j's, k's, and
+// loads at addresses without j) stay scalar. matmul's `for j { sum = 0;
+// for k { sum += a[i][k] * b[k][j] } c[i][j] = sum }` is the case. As for
+// innermost loops, a run-time test before the loop requires enough
+// iterations and no store overlapping another access at another address
+// (ranges over all j and k); the original loop runs otherwise, and the
+// remainder.
+
+// Instructions' classes, saved (cloning uses INSTS[v].aux): (value,
+// class) pairs.
+static mut V_CLASS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// The blocks of L (and L2) in order: before L2, L2's, after it.
+static mut V_PRE: i64 = 0;
+
+fn saved_class(v: i64) -> i64 {
+    unsafe {
+        let x = ir_val(v);
+        let mut k = 0;
+        while k < V_CLASS.count {
+            if V_CLASS.data[k] == x {
+                return V_CLASS.data[k + 1];
+            }
+            k += 2;
+        }
+        0
+    }
+}
+
+// The chain of blocks from b to `to` (both in L, not in L2), each jumping
+// to the next, appended to V_CHAIN; false when there is another shape.
+fn chain_to(l: i64, l2: i64, from: i64, to: i64) -> bool {
+    unsafe {
+        let mut b = from;
+        for _ in 0..16 {
+            V_CHAIN.push(b);
+            if b == to {
+                return true;
+            }
+            let s = BLOCKS[b].s0;
+            if BLOCKS[b].term != Term::Jump || !loop_contains(l, s) || loop_contains(l2, s) || BLOCKS[s].preds.count != 1 {
+                return false;
+            }
+            b = s;
+        }
+        false
+    }
+}
+
+// The inner loop l2: a header phi (*iv) from a constant start, by a
+// constant step s > 0 (unrolling makes it more than 1), while its next
+// value is below a constant (or not equal to it, reached exactly); its
+// last value in *last.
+fn inner_counted(l2: i64, iv: *i64, last: *i64) -> bool {
+    unsafe {
+        let h = loop_header(l2);
+        let latch = loop_latch(l2);
+        let c = ir_val(BLOCKS[latch].cond);
+        if INSTS[c].op != Cmp || !is_integer(INSTS[c].imm2) || int_bits(INSTS[c].imm2) != 64 {
+            return false;
+        }
+        let mut cond = INSTS[c].cond;
+        let mut x = bits_of_value(INSTS[c].a);
+        let mut n = bits_of_value(INSTS[c].b);
+        if is_const(x) && !is_const(n) {
+            let t = x;
+            x = n;
+            n = t;
+            cond = cond.mirror();
+        }
+        if !is_const(n) || BLOCKS[latch].term != Term::Branch {
+            return false;
+        }
+        if BLOCKS[latch].s0 != h {
+            cond = cond.negate();
+        }
+        let mut phi = BLOCKS[h].first;
+        while phi != 0 && INSTS[phi].op == Phi {
+            let mut s = 0;
+            if ir_val(ir_arg(phi, pred_index(h, latch))) == x && iv_step(l2, phi, &s) && s > 0
+                && int_bits(INSTS[phi].ty) == 64 {
+                let k0v = ir_val(ir_arg(phi, pred_index(h, loop_preheader(l2))));
+                if !is_const(k0v) {
+                    return false;
+                }
+                let k0 = INSTS[k0v].imm;
+                let nn = INSTS[n].imm;
+                if k0 >= nn || nn - k0 > 1073741824 {
+                    return false;
+                }
+                if cond == Cond::Ne && (nn - k0) % s != 0 {
+                    return false;
+                }
+                if cond != Cond::Ne && cond != Cond::Lt {
+                    return false;
+                }
+                let trips = (nn - k0 + s - 1) / s;
+                *iv = phi;
+                *last = k0 + (trips - 1) * s;
+                return true;
+            }
+            phi = INSTS[phi].next;
+        }
+        false
+    }
+}
+
+fn analyze_outer(l: i64, l2: i64, exit: *i64) -> bool {
+    unsafe {
+        VSTAMP += 1;
+        V_ELEM = 0;
+        V_HAS_STORE = false;
+        V_HAS_ULOAD = false;
+        V_CHAIN.count = 0;
+        V_CHECKS.count = 0;
+        V_ACCESS.count = 0;
+        V_REDS.count = 0;
+        V_IV2 = 0;
+        let h = loop_header(l);
+        let latch = loop_latch(l);
+        let h2 = loop_header(l2);
+        let latch2 = loop_latch(l2);
+        let p2 = loop_preheader(l2);
+        if BLOCKS[h].novec != 0 || is_cold_block(h) || latch == 0 || loop_preheader(l) == 0 || latch2 == 0
+            || p2 == 0 || BLOCKS[latch].term != Term::Branch || BLOCKS[latch2].term != Term::Branch {
+            return false;
+        }
+        let mut iv = 0;
+        let mut step = 0;
+        let mut n = 0;
+        let mut ne = false;
+        if !counted_loop(l, &iv, &step, &n, &ne) || step != 1 || int_bits(INSTS[iv].ty) != 64 {
+            return false;
+        }
+        let mut iv2 = 0;
+        let mut last2 = 0;
+        if !inner_counted(l2, &iv2, &last2) {
+            return false;
+        }
+        V_IV = iv;
+        V_N = n;
+        V_NE = ne;
+        V_IV2 = iv2;
+        V_LAST2 = last2;
+        // L2's only exit is at its latch.
+        let s0 = BLOCKS[latch2].s0;
+        let s1 = BLOCKS[latch2].s1;
+        let e2 = if s0 == h2 { s1 } else { s0 };
+        if loop_contains(l2, e2) || !loop_contains(l, e2) || BLOCKS[e2].preds.count != 1 {
+            return false;
+        }
+        // The blocks: h ... p2, L2 (a chain of jumps), e2 ... latch.
+        if !chain_to(l, l2, h, p2) || BLOCKS[p2].s0 != h2 {
+            return false;
+        }
+        V_PRE = V_CHAIN.count;
+        let mut b = h2;
+        for _ in 0..16 {
+            V_CHAIN.push(b);
+            if b == latch2 {
+                break;
+            }
+            let s = BLOCKS[b].s0;
+            if BLOCKS[b].term != Term::Jump || !loop_contains(l2, s) || BLOCKS[s].preds.count != 1 {
+                return false;
+            }
+            b = s;
+        }
+        if V_CHAIN.data[V_CHAIN.count - 1] != latch2 || V_CHAIN.count - V_PRE != loop_size(l2) {
+            return false;
+        }
+        if !chain_to(l, l2, e2, latch) || V_CHAIN.count != loop_size(l) {
+            return false;
+        }
+        let ss0 = BLOCKS[latch].s0;
+        let e = if ss0 == h { BLOCKS[latch].s1 } else { ss0 };
+        if loop_contains(l, e) || BLOCKS[e].preds.count != 1 {
+            return false;
+        }
+        *exit = e;
+        // Phis: j alone in h; k and accumulators in h2; e2's (one operand)
+        // take their operand's class below.
+        let mut phi = BLOCKS[h].first;
+        while phi != 0 && INSTS[phi].op == Phi {
+            if phi != iv {
+                return false;
+            }
+            set_class(phi, VC_UNIFORM);
+            phi = INSTS[phi].next;
+        }
+        phi = BLOCKS[h2].first;
+        while phi != 0 && INSTS[phi].op == Phi {
+            if phi == iv2 {
+                set_class(phi, VC_UNIFORM);
+            } else {
+                if !use_elem(INSTS[phi].ty) {
+                    return false;
+                }
+                set_class(phi, VC_VECTOR);
+            }
+            phi = INSTS[phi].next;
+        }
+        let latch_cond = ir_val(BLOCKS[latch].cond);
+        let mut total = 0;
+        for k in 0..V_CHAIN.count {
+            let blk = V_CHAIN.data[k];
+            let mut v = BLOCKS[blk].first;
+            while v != 0 {
+                total += 1;
+                if total > VEC_MAX_INSTS {
+                    return false;
+                }
+                if INSTS[v].op == Phi {
+                    if blk == e2 {
+                        let w = ir_val(ir_arg(v, 0));
+                        let c = if class_of(w) != 0 { class_of(w) } else { VC_UNIFORM };
+                        if c == VC_SKIP {
+                            return false;
+                        }
+                        set_class(v, c);
+                    } else if class_of(v) == 0 {
+                        return false;
+                    }
+                } else if !classify_outer(l, v, latch_cond) {
+                    return false;
+                }
+                v = INSTS[v].next;
+            }
+        }
+        V_SIZE = total;
+        if V_ELEM == 0 {
+            return false;
+        }
+        V_VF = 16 / type_size(V_ELEM);
+        V_VT = vector_type(lane_type(V_ELEM), V_VF);
+        if V_VT == 0 {
+            return false;
+        }
+        // The accumulators' operands have values for every lane.
+        phi = BLOCKS[h2].first;
+        while phi != 0 && INSTS[phi].op == Phi {
+            if phi != iv2 {
+                for i in 0..INSTS[phi].nargs {
+                    if !vector_operand_ok(l, ir_arg(phi, i)) {
+                        return false;
+                    }
+                }
+            }
+            phi = INSTS[phi].next;
+        }
+        // What L leaves for after it: invariants only.
+        let mut x = BLOCKS[e].first;
+        while x != 0 && INSTS[x].op == Phi {
+            if !invariant_in(l, ir_val(ir_arg(x, 0))) {
+                return false;
+            }
+            x = INSTS[x].next;
+        }
+        // Addresses: affine in j and k, from no load.
+        for k in 0..V_ACCESS.count / 3 {
+            let a = V_ACCESS.data[3 * k + 1];
+            if !multi_affine(l, a) || loads_in(l, a) {
+                return false;
+            }
+        }
+        if overlap_pairs() > VEC_MAX_OVERLAPS {
+            return false;
+        }
+        true
+    }
+}
+
+fn classify_outer(l: i64, v: i64, latch_cond: i64) -> bool {
+    unsafe {
+        let op = INSTS[v].op;
+        if v == latch_cond {
+            set_class(v, VC_SKIP);
+            return true;
+        }
+        if op == Load || op == Store {
+            let ty = if op == Load { INSTS[v].ty } else { INSTS[v].imm2 };
+            let addr = ir_val(INSTS[v].a);
+            let c = coef(l, addr);
+            V_ACCESS.push(v);
+            V_ACCESS.push(addr);
+            V_ACCESS.push(type_size(ty));
+            if op == Load && c == 0 && (class_of(addr) == VC_UNIFORM || invariant_in(l, addr)) {
+                // The same for all lanes (stores are kept apart by the
+                // overlap test).
+                set_class(v, VC_UNIFORM);
+                return true;
+            }
+            if c != type_size(ty) || !use_elem(ty) {
+                return false;
+            }
+            if op == Store {
+                if !vector_operand_ok(l, INSTS[v].b) {
+                    return false;
+                }
+                V_HAS_STORE = true;
+            }
+            set_class(v, VC_VECTOR);
+            return true;
+        }
+        let a = if INSTS[v].a != 0 { class_of(ir_val(INSTS[v].a)) } else { 0 };
+        let b = if INSTS[v].b != 0 { class_of(ir_val(INSTS[v].b)) } else { 0 };
+        if a == VC_VECTOR || b == VC_VECTOR {
+            let ty = INSTS[v].ty;
+            let ok_op = op == Add || op == Sub || op == Mul || op == And || op == Or || op == Xor
+                || op == Neg || (op == Div && is_float(ty));
+            if !ok_op || (is_float(ty) && (op == And || op == Or || op == Xor)) || !use_elem(ty) {
+                return false;
+            }
+            if !vector_operand_ok(l, INSTS[v].a) || (INSTS[v].b != 0 && !vector_operand_ok(l, INSTS[v].b)) {
+                return false;
+            }
+            set_class(v, VC_VECTOR);
+            return true;
+        }
+        if a == VC_SKIP || b == VC_SKIP {
+            return false;
+        }
+        if op.is_pure() || op == Const {
+            // (A comparison: the inner loop's test; its operands are the same
+            // for all lanes.)
+            set_class(v, VC_UNIFORM);
+            return true;
+        }
+        false
+    }
+}
+
+// Whether v is affine in j and in k separately, with invariant (maybe
+// not constant) coefficients and no product of the two: its extremes over
+// the iterations are then at the corners.
+fn multi_affine(l: i64, v: i64) -> bool {
+    lin_mask(l, v) >= 0
+}
+
+// What v depends on: 1 for j, 2 for k (3 for both), -1 when not linear.
+fn lin_mask(l: i64, v: i64) -> i64 {
+    unsafe {
+        let x = ir_val(v);
+        if x == V_IV {
+            return 1;
+        }
+        if x == V_IV2 {
+            return 2;
+        }
+        if x == 0 || invariant_in(l, x) {
+            return 0;
+        }
+        if class_of(x) != VC_UNIFORM || INSTS[x].op == Load || INSTS[x].op == Phi {
+            return -1;
+        }
+        let op = INSTS[x].op;
+        let a = lin_mask(l, INSTS[x].a);
+        let b = lin_mask(l, INSTS[x].b);
+        if a < 0 || b < 0 {
+            return -1;
+        }
+        if a == 0 && b == 0 {
+            return 0;
+        }
+        if !is_integer(INSTS[x].ty) || int_bits(INSTS[x].ty) != 64 {
+            return -1;
+        }
+        if op == Add || op == Sub {
+            return a | b;
+        }
+        if op == Mul && (a == 0 || b == 0) {
+            return a | b;
+        }
+        if op == Shl && b == 0 && is_const(ir_val(INSTS[x].b)) {
+            return a;
+        }
+        if op == Conv && is_integer(INSTS[x].imm2) && int_bits(INSTS[x].imm2) == 64 {
+            return a;
+        }
+        -1
+    }
+}
+
+// The value of v (uniform, without loads) with j = `at` and k = `at2`, in
+// block b.
+fn eval_at2(l: i64, v: i64, at: i64, at2: i64, b: i64) -> i64 {
+    unsafe {
+        let x = ir_val(v);
+        if x == V_IV {
+            return at;
+        }
+        if x == V_IV2 {
+            return at2;
+        }
+        if invariant_in(l, x) {
+            return x;
+        }
+        let a = if INSTS[x].a != 0 { eval_at2(l, INSTS[x].a, at, at2, b) } else { 0 };
+        let y = if INSTS[x].b != 0 { eval_at2(l, INSTS[x].b, at, at2, b) } else { 0 };
+        let nv = ir_make(INSTS[x].op, INSTS[x].ty, a, y, INSTS[x].imm);
+        INSTS[nv].imm2 = INSTS[x].imm2;
+        INSTS[nv].cond = INSTS[x].cond;
+        ir_append(b, nv);
+        nv
+    }
+}
+
+// The vector value of operand w of copy nv (whose original's operand had
+// class `cls`): w itself, or a splat (in vp for invariants, else just
+// before nv).
+fn outer_vector(l: i64, w: i64, cls: i64, nv: i64, vp: i64) -> i64 {
+    unsafe {
+        if cls == VC_VECTOR {
+            return w;
+        }
+        let s = ir_make(VSplat, V_VT, w, 0, 0);
+        // (Copies are in no loop of the forest: in_clone tells them apart.)
+        if !in_clone(w) && invariant_in(l, w) {
+            ir_append(vp, s);
+        } else {
+            ir_insert_before(nv, s);
+        }
+        s
+    }
+}
+
+static mut V_CLONE_STAMP: i64 = 0;
+
+// Whether value w is in the copy of L.
+fn in_clone(w: i64) -> bool {
+    unsafe {
+        let b = INSTS[w].block;
+        b != 0 && BLOCKS[b].mark == V_CLONE_STAMP
+    }
+}
+
+fn vectorize_outer(fi: i64, l: i64, l2: i64) -> bool {
+    unsafe {
+        let mut e = 0;
+        if !analyze_outer(l, l2, &e) {
+            V_IV2 = 0;
+            return false;
+        }
+        IRF = fi;
+        let h = loop_header(l);
+        let p = loop_preheader(l);
+        let latch = loop_latch(l);
+        let h2 = loop_header(l2);
+        let p2 = loop_preheader(l2);
+        let start = ir_val(ir_arg(V_IV, pred_index(h, p)));
+        let start2 = ir_val(ir_arg(V_IV2, pred_index(h2, p2)));
+        let vf = V_VF;
+        let vt = V_VT;
+        let n = V_N;
+        // Classes, saved before cloning.
+        V_CLASS.count = 0;
+        for k in 0..V_CHAIN.count {
+            let mut v = BLOCKS[V_CHAIN.data[k]].first;
+            while v != 0 {
+                V_CLASS.push(v);
+                V_CLASS.push(class_of(v));
+                v = INSTS[v].next;
+            }
+        }
+        let c = ir_new_block();
+        let vp = ir_new_block();
+        let vx = ir_new_block();
+        let sp = ir_new_block();
+        BLOCKS[c].sealed = 1;
+        BLOCKS[vp].sealed = 1;
+        BLOCKS[vx].sealed = 1;
+        BLOCKS[sp].sealed = 1;
+        BLOCKS[p].s0 = c;
+        BLOCKS[c].preds.push(p);
+        let trips = append(c, Sub, TY_I64, n, start, 0);
+        let mut ok = cmp(c, Cond::Ge, TY_U64, trips, konst(c, vf, TY_I64));
+        let last = append(c, Sub, TY_I64, n, konst(c, 1, TY_I64), 0);
+        let last2 = konst(c, V_LAST2, TY_I64);
+        build_groups();
+        ok = overlap_tests(l, c, ok, start, last, start2, last2);
+        ir_terminate(c, Term::Branch, ok, vp, sp);
+        let vtrips = append(vp, And, TY_I64, trips, konst(vp, 0 - vf, TY_I64), 0);
+        let vend = append(vp, Add, TY_I64, start, vtrips, 0);
+        // The copy of L.
+        let stamp = mark_loop_blocks(l);
+        clone_region(fi, &LP_LIST2, stamp);
+        VSTAMP += 1;
+        V_CLONE_STAMP = VSTAMP;
+        for i in 0..LP_LIST2.count {
+            BLOCKS[BLOCKS[LP_LIST2.data[i]].aux].mark = V_CLONE_STAMP;
+        }
+        let h_c = BLOCKS[h].aux;
+        let latch_c = BLOCKS[latch].aux;
+        // Turn the copy's vector values into vectors.
+        for k in 0..V_CHAIN.count {
+            let mut v = BLOCKS[V_CHAIN.data[k]].first;
+            while v != 0 {
+                let nv = INSTS[v].aux;
+                let op = INSTS[v].op;
+                if saved_class(v) == VC_VECTOR {
+                    if op == Phi {
+                        INSTS[nv].ty = vt;
+                        let pb = INSTS[nv].block;
+                        for i in 0..INSTS[nv].nargs {
+                            let cls = saved_class(ir_arg(v, i));
+                            if cls != VC_VECTOR {
+                                // A splat at the end of the predecessor.
+                                let w = ir_arg(nv, i);
+                                let s = ir_make(VSplat, vt, w, 0, 0);
+                                ir_append(BLOCKS[pb].preds.data[i], s);
+                                ir_set_arg(nv, i, s);
+                            }
+                        }
+                    } else if op == Load {
+                        INSTS[nv].ty = vt;
+                    } else if op == Store {
+                        INSTS[nv].imm2 = vt;
+                        INSTS[nv].b = outer_vector(l, INSTS[nv].b, saved_class(INSTS[v].b), nv, vp);
+                    } else if op == Neg {
+                        INSTS[nv].op = VNeg;
+                        INSTS[nv].ty = vt;
+                        INSTS[nv].a = outer_vector(l, INSTS[nv].a, saved_class(INSTS[v].a), nv, vp);
+                    } else {
+                        INSTS[nv].imm = op as i64;
+                        INSTS[nv].op = VBin;
+                        INSTS[nv].ty = vt;
+                        INSTS[nv].a = outer_vector(l, INSTS[nv].a, saved_class(INSTS[v].a), nv, vp);
+                        INSTS[nv].b = outer_vector(l, INSTS[nv].b, saved_class(INSTS[v].b), nv, vp);
+                    }
+                }
+                v = INSTS[v].next;
+            }
+        }
+        // The copy's entry: from vp; its j steps by VF, to vend, out to vx.
+        let hp = pred_index(h_c, p);
+        BLOCKS[h_c].preds.data[hp] = vp;
+        BLOCKS[vp].term = Term::Jump;
+        BLOCKS[vp].s0 = h_c;
+        let jv = INSTS[V_IV].aux;
+        let jl = pred_index(h_c, latch_c);
+        let vnext = append(latch_c, Add, INSTS[V_IV].ty, jv, konst(latch_c, vf, INSTS[V_IV].ty), 0);
+        ir_set_arg(jv, jl, vnext);
+        let more = cmp(latch_c, Cond::Ne, TY_I64, vnext, vend);
+        BLOCKS[latch_c].term = Term::Branch;
+        BLOCKS[latch_c].cond = more;
+        BLOCKS[latch_c].s0 = h_c;
+        BLOCKS[latch_c].s1 = vx;
+        BLOCKS[vx].preds.push(latch_c);
+        let done = cmp(vx, Cond::Eq, TY_I64, vend, n);
+        ir_terminate(vx, Term::Branch, done, e, sp);
+        // SP: the scalar loop's preheader, from C or VX.
+        let mut vals = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        vals.push(start);
+        vals.push(vend);
+        let iv0 = new_phi_in(sp, INSTS[V_IV].ty, &vals, 0, 2);
+        let ohp = pred_index(h, p);
+        ir_set_arg(V_IV, ohp, iv0);
+        ir_terminate(sp, Term::Jump, 0, h, 0);
+        BLOCKS[h].preds.count -= 1;
+        BLOCKS[h].preds.data[ohp] = sp;
+        // E: from VX too (its phis' operands are invariants).
+        vals.count = 0;
+        let mut x = BLOCKS[e].first;
+        while x != 0 && INSTS[x].op == Phi {
+            vals.push(ir_val(ir_arg(x, 0)));
+            x = INSTS[x].next;
+        }
+        BLOCKS[e].preds.count -= 1;
+        add_pred_values(e, vx, &vals, 0);
+        BLOCKS[h].novec = 1;
+        BLOCKS[h2].novec = 1;
+        BLOCKS[BLOCKS[h2].aux].novec = 1;
+        free(vals.data as *u8);
+        V_IV2 = 0;
+        true
+    }
+}
