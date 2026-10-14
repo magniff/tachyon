@@ -5,10 +5,9 @@
 //
 //   tachyonc query def NAME [ROOT] [--exact]       where NAME is defined
 //   tachyonc query show NAME [ROOT] [--exact]      its source text
-//   tachyonc query refs NAME [ROOT] [--count] [--exact]
-//                                                  every resolved reference
-//   tachyonc query callers NAME [ROOT] [--count] [--exact]
-//                                                  the references that call it
+//   tachyonc query refs NAME [ROOT] [--count] [--exact] [--in FILE|MODULE]
+//                       [--limit N] [--all]        every resolved reference
+//   tachyonc query callers NAME [ROOT] [...]       the references that call it
 //   tachyonc query items [MODULE] [ROOT]           a module's items, or the
 //                                                  module tree
 //
@@ -24,11 +23,17 @@
 // the hooks that call `qnote`. A generic function is checked per instance
 // (copies of its nodes, at the same positions): references are counted
 // once per position.
+//
+// The output is for agents: one fact per line, fields separated by a
+// TAB, refs grouped under `# FILE` and cut to a per-file summary past
+// REFS_BUDGET; problems on stderr as `<severity> <code>: <message>` with
+// `try: <command>` lines (see Diagnostics).
 
 use crate::base::{
     ERR_BAIL, ERR_KIND, FILES, FILE_COUNT, IntVec, RECOVER_DEPTH, SRC, STDERR, STDOUT, SYMS, _setjmp,
     BUFS, alloc_array, alloc_zeroed, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
-    buf_write_fd, free, grow, has_errors, intern, intern_c, load_sources, strlen, write_errors,
+    buf_write_fd, buf_clear, free, grow, intern, intern_c, load_sources, strlen,
+    edit_distance, error_count, first_error_short,
 };
 use crate::lexer::{TOKS, TOK_COUNT, Tok, init_lexer, lex_range};
 use crate::cpp::file_exists;
@@ -110,8 +115,8 @@ const K_MOD: i64 = 13;
 
 fn kind_name(k: i64) -> *u8 {
     if k == K_FN { return c"fn"; }
-    if k == K_METHOD || k == K_IMPL_METHOD { return c"impl method"; }
-    if k == K_TRAIT_FN { return c"trait method"; }
+    if k == K_METHOD || k == K_IMPL_METHOD { return c"method"; }
+    if k == K_TRAIT_FN { return c"trait-method"; }
     if k == K_STRUCT { return c"struct"; }
     if k == K_ENUM { return c"enum"; }
     if k == K_VARIANT { return c"variant"; }
@@ -119,7 +124,7 @@ fn kind_name(k: i64) -> *u8 {
     if k == K_TRAIT { return c"trait"; }
     if k == K_CONST { return c"const"; }
     if k == K_STATIC { return c"static"; }
-    if k == K_ALIAS { return c"type alias"; }
+    if k == K_ALIAS { return c"type"; }
     c"mod"
 }
 
@@ -496,38 +501,6 @@ fn find_defs(name: [u8], exact: bool, out: *IntVec) {
     sort_by_position(out);
 }
 
-// Edit distance (Levenshtein) of a and b.
-fn distance(a: [u8], b: [u8]) -> i64 {
-    unsafe {
-        let prev = alloc_array::<i64>(b.len + 1);
-        let cur = alloc_array::<i64>(b.len + 1);
-        for j in 0..b.len + 1 {
-            prev[j] = j;
-        }
-        for i in 1..a.len + 1 {
-            cur[0] = i;
-            for j in 1..b.len + 1 {
-                let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
-                let mut best = prev[j - 1] + cost;
-                if prev[j] + 1 < best {
-                    best = prev[j] + 1;
-                }
-                if cur[j - 1] + 1 < best {
-                    best = cur[j - 1] + 1;
-                }
-                cur[j] = best;
-            }
-            for j in 0..b.len + 1 {
-                prev[j] = cur[j];
-            }
-        }
-        let result = prev[b.len];
-        free(prev as *u8);
-        free(cur as *u8);
-        result
-    }
-}
-
 // The last segment of a name (after `::`, `.` or `>::`).
 fn last_segment(name: [u8]) -> [u8] {
     let mut i = name.len;
@@ -537,46 +510,222 @@ fn last_segment(name: [u8]) -> [u8] {
     name[i..name.len]
 }
 
-// No definition answers to `name`: the error, with the nearest names.
-fn no_match(name: [u8], what: *u8) {
+// ---- Diagnostics ----
+//
+// On stderr, for agents and scripts (docs/query.md):
+//   <severity> <code>: <message>
+//   try: <command>          (0-3 lines, best first, ready to run)
+// The codes are stable: query.no-match, query.alias, query.ambiguous,
+// query.no-root, query.bad-root, query.program-errors, query.truncated,
+// query.empty, query.bad-in, query.usage.
+
+// The command line as given: how the compiler was run (argv[0]), the
+// command, ROOT when it was given, and the options.
+static mut PROG: *u8 = 0 as *u8;
+static mut CMD: *u8 = 0 as *u8;
+static mut ROOT_GIVEN: *u8 = 0 as *u8;
+static mut OPT_EXACT: bool = false;
+// The diagnostics so far (written last, after the answer).
+static mut DIAGS: i64 = -1;
+
+fn diags() -> i64 {
+    if DIAGS < 0 {
+        DIAGS = buf_new();
+    }
+    DIAGS
+}
+
+// Starts a diagnostic: `<severity> <code>: `; its message follows.
+fn diag(severity: *u8, code: *u8) -> i64 {
     unsafe {
-        let out = buf_new();
-        buf_str(out, c"tachyonc query: no ");
-        buf_str(out, what);
-        buf_str(out, c" named '");
-        buf_bytes(out, name);
-        buf_str(out, c"'\n");
-        let want = last_segment(name);
+        let out = diags();
+        buf_str(out, severity);
+        buf_byte(out, ' ');
+        buf_str(out, code);
+        buf_str(out, c": ");
+        out
+    }
+}
+
+// Whether s needs quoting for the shell.
+fn needs_quotes(s: [u8]) -> bool {
+    if s.len == 0 {
+        return true;
+    }
+    for i in 0..s.len {
+        let c = s[i];
+        let plain = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+            || c == '_' || c == ':' || c == '.' || c == '/' || c == '-' || c == '+' || c == '=' || c == ',';
+        if !plain {
+            return true;
+        }
+    }
+    false
+}
+
+// A word of a command: ` s`, quoted when the shell needs it.
+fn put_word(out: i64, s: [u8]) {
+    buf_byte(out, ' ');
+    if needs_quotes(s) {
+        buf_byte(out, '\'');
+        buf_bytes(out, s);
+        buf_byte(out, '\'');
+    } else {
+        buf_bytes(out, s);
+    }
+}
+
+fn put_cword(out: i64, s: *u8) {
+    unsafe { put_word(out, s[0..strlen(s) as i64]); }
+}
+
+// Starts a `try:` line: `try: PROG query CMD [NAME] [ROOT]` (NAME is a
+// full path, or the one asked about: --exact is not needed);
+// more words follow (put_word), then try_end.
+fn try_begin(cmd: *u8, name: [u8], with_name: bool) -> i64 {
+    unsafe {
+        let out = diags();
+        buf_str(out, c"try:");
+        put_cword(out, PROG);
+        buf_str(out, c" query ");
+        buf_str(out, cmd);
+        if with_name {
+            put_word(out, name);
+        }
+        if ROOT_GIVEN != 0 as *u8 {
+            put_cword(out, ROOT_GIVEN);
+        }
+        out
+    }
+}
+
+fn try_end(out: i64) {
+    buf_byte(out, '\n');
+}
+
+// `try: PROG query CMD NAME`.
+fn try_query(cmd: *u8, name: [u8]) {
+    try_end(try_begin(cmd, name, true));
+}
+
+fn write_diags() {
+    if DIAGS >= 0 {
+        buf_write_fd(DIAGS, STDERR);
+        buf_clear(DIAGS);
+    }
+}
+
+// The program had errors: their number (and, `first`, the first one), and
+// how to see them all.
+fn program_errors(severity: *u8, root: *u8, first: bool) {
+    unsafe {
+        if error_count() == 0 {
+            return;
+        }
+        let out = diag(severity, c"query.program-errors");
+        buf_int(out, error_count());
+        buf_str(out, if error_count() == 1 { c" error" } else { c" errors" });
+        buf_str(out, if PARSED { c" in the program; results may be incomplete" } else { c" in the program; nothing to answer with" });
+        if first {
+            buf_str(out, c"; first: ");
+            first_error_short(out);
+        }
+        buf_str(out, c"\ntry:");
+        put_cword(out, PROG);
+        buf_str(out, c" --diagnostics=short");
+        put_cword(out, root);
+        buf_str(out, c" -c -o /dev/null\n");
+    }
+}
+
+// The definitions nearest to `want` (its last segment), nearest first:
+// at most `max`, in `found`.
+fn nearest_defs(want: [u8], found: *IntVec, max: i64) {
+    unsafe {
         let mut limit = want.len / 3;
         if limit < 1 {
             limit = 1;
         }
-        let mut found = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let mut dist = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut all = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for d in 0..DEF_COUNT {
             if DEFS[d].fqn < 0 {
                 continue;
             }
-            let k = distance(want, SYMS[DEFS[d].name].text);
+            let k = edit_distance(want, SYMS[DEFS[d].name].text);
             if k <= limit {
-                found.push(d);
+                all.push(d);
                 dist.push(k);
             }
         }
         // (nearest first, then by path)
-        for i in 1..found.count {
+        for i in 1..all.count {
             let mut j = i;
             while j > 0 && (dist.data[j] < dist.data[j - 1] || (dist.data[j] == dist.data[j - 1]
-                && sym_less(DEFS[found.data[j]].fqn, DEFS[found.data[j - 1]].fqn))) {
-                let t = found.data[j];
-                found.data[j] = found.data[j - 1];
-                found.data[j - 1] = t;
+                && sym_less(DEFS[all.data[j]].fqn, DEFS[all.data[j - 1]].fqn))) {
+                let t = all.data[j];
+                all.data[j] = all.data[j - 1];
+                all.data[j - 1] = t;
                 let u = dist.data[j];
                 dist.data[j] = dist.data[j - 1];
                 dist.data[j - 1] = u;
                 j -= 1;
             }
         }
+        for i in 0..all.count {
+            if (*found).count >= max {
+                return;
+            }
+            push_once(found, all.data[i]);
+        }
+    }
+}
+
+fn push_once(v: *IntVec, x: i64) {
+    unsafe {
+        for i in 0..(*v).count {
+            if (*v).data[i] == x {
+                return;
+            }
+        }
+        v.push(x);
+    }
+}
+
+// The `try:` lines of an unanswered NAME: the definitions in `found`,
+// else the module listing that could hold it.
+fn try_found(cmd: *u8, name: [u8], found: *IntVec) {
+    unsafe {
+        for i in 0..(*found).count {
+            try_query(cmd, SYMS[DEFS[(*found).data[i]].fqn].text);
+        }
+        if (*found).count > 0 {
+            return;
+        }
+        // `m::x`: the items of m, if there is such a module.
+        let mut i = name.len - 1;
+        while i > 0 && !(name[i] == ':' && name[i - 1] == ':') {
+            i -= 1;
+        }
+        if i > 1 {
+            let mut modules = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            find_modules(name[0..i - 1], false, &modules);
+            if modules.count > 0 {
+                try_query(c"items", SYMS[mod_fqn(modules.data[0])].text);
+                return;
+            }
+        }
+        try_end(try_begin(c"items", name, false));
+    }
+}
+
+// No definition answers to `name`: what it is (an import's other name),
+// and the nearest names.
+fn no_match(cmd: *u8, name: [u8]) {
+    unsafe {
+        let want = last_segment(name);
+        let mut found = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut alias_at = -1;
         // An import's other name: what it imports.
         let mut i = 0;
         while i < ALIASES.count {
@@ -585,31 +734,58 @@ fn no_match(name: [u8], what: *u8) {
                 while k < NOTES.count {
                     let d = def_of_node(NOTES.data[k + 2]);
                     if NOTES.data[k] == ALIASES.data[i + 1] && (NOTES.data[k + 3] & QF_USE) != 0 && d >= 0 {
-                        buf_str(out, c"'");
-                        buf_bytes(out, want);
-                        buf_str(out, c"' is the name an import gives (");
-                        put_loc(out, NOTES.data[k]);
-                        buf_str(out, c") to:\n  ");
-                        buf_bytes(out, SYMS[DEFS[d].fqn].text);
-                        buf_byte(out, '\n');
+                        push_once(&found, d);
+                        if alias_at < 0 {
+                            alias_at = NOTES.data[k];
+                        }
                     }
                     k += 4;
                 }
             }
             i += 2;
         }
-        if found.count > 0 {
-            buf_str(out, c"did you mean:\n");
-            let shown = if found.count < 8 { found.count } else { 8 };
-            for i in 0..shown {
-                buf_str(out, c"  ");
-                buf_bytes(out, SYMS[DEFS[found.data[i]].fqn].text);
-                buf_byte(out, '\n');
+        if alias_at >= 0 {
+            let out = diag(c"error", c"query.alias");
+            buf_byte(out, '\'');
+            buf_bytes(out, want);
+            buf_str(out, c"' is an import alias in ");
+            buf_bytes(out, SYMS[mod_fqn(module_at(alias_at))].text);
+            buf_byte(out, '\n');
+        } else {
+            let out = diag(c"error", c"query.no-match");
+            buf_str(out, c"no definition '");
+            buf_bytes(out, name);
+            buf_str(out, c"'\n");
+        }
+        nearest_defs(want, &found, 3);
+        try_found(cmd, name, &found);
+    }
+}
+
+// No module answers to `name`.
+fn no_module(name: [u8]) {
+    unsafe {
+        let out = diag(c"error", c"query.no-match");
+        buf_str(out, c"no module '");
+        buf_bytes(out, name);
+        buf_str(out, c"'\n");
+        let want = last_segment(name);
+        let mut limit = want.len / 3;
+        if limit < 1 {
+            limit = 1;
+        }
+        let mut shown = 0;
+        for m in 0..module_count() {
+            if MODULES[m].name < 0 || shown >= 3 {
+                continue;
+            }
+            if edit_distance(want, last_segment(SYMS[mod_fqn(m)].text)) <= limit {
+                try_query(c"items", SYMS[mod_fqn(m)].text);
+                shown += 1;
             }
         }
-        buf_write_fd(out, STDERR);
-        if has_errors() {
-            write_errors();
+        if shown == 0 {
+            try_end(try_begin(c"items", name, false));
         }
     }
 }
@@ -932,13 +1108,6 @@ fn enclosing(pos: i64) -> i64 {
     }
 }
 
-fn put_enclosing(out: i64, pos: i64) {
-    unsafe {
-        let d = enclosing(pos);
-        buf_bytes(out, SYMS[if d >= 0 { DEFS[d].fqn } else { mod_fqn(module_at(pos)) }].text);
-    }
-}
-
 // ---- References ----
 
 // The definitions asked about: GROUP maps a definition + 1 to the group
@@ -1154,7 +1323,10 @@ fn sorted_refs(out: *IntVec) {
     }
 }
 
-// The line holding pos, trimmed.
+// Source lines longer than this are cut (with `…`).
+const LINE_MAX: i64 = 100;
+
+// The line holding pos, trimmed (and cut to LINE_MAX bytes).
 fn put_line(out: i64, pos: i64) {
     unsafe {
         let mut a = line_start(pos);
@@ -1165,73 +1337,280 @@ fn put_line(out: i64, pos: i64) {
         while b > a && is_space(SRC[b - 1]) {
             b -= 1;
         }
-        buf_bytes(out, SRC[a..b]);
+        if b - a <= LINE_MAX {
+            buf_bytes(out, SRC[a..b]);
+            return;
+        }
+        // (not inside a UTF-8 sequence)
+        let mut e = a + LINE_MAX - 1;
+        while e > a && (SRC[e] & 192) == 128 {
+            e -= 1;
+        }
+        buf_bytes(out, SRC[a..e]);
+        buf_byte(out, 226 as u8);
+        buf_byte(out, 128 as u8);
+        buf_byte(out, 166 as u8);
     }
 }
 
-fn query_refs(matches: *IntVec, calls_only: bool, count: bool) {
+// A path without its `crate::` prefixes (`gvn::run_gvn`,
+// `<geom::V2 as Add>::add`); `crate` stays.
+fn put_short(out: i64, sym: i64) {
     unsafe {
+        let p = SYMS[sym].text;
+        let mut i = 0;
+        while i < p.len {
+            let start = i == 0 || p[i - 1] == '<' || p[i - 1] == ' ';
+            if start && i + 7 <= p.len && p[i] == 'c' && p[i + 1] == 'r' && p[i + 2] == 'a' && p[i + 3] == 't'
+                && p[i + 4] == 'e' && p[i + 5] == ':' && p[i + 6] == ':' {
+                i += 7;
+                continue;
+            }
+            buf_byte(out, p[i]);
+            i += 1;
+        }
+    }
+}
+
+// More references than this: refs and callers print a summary per file
+// (unless --limit or --all).
+const REFS_BUDGET: i64 = 60;
+
+// The options of refs and callers.
+static mut OPT_COUNT: bool = false;
+static mut OPT_ALL: bool = false;
+static mut OPT_LIMIT: i64 = -1;
+static mut OPT_IN: *u8 = 0 as *u8;
+// --in: per file, per module, whether it is in.
+static mut IN_FILE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut IN_MODULE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The path of file f as printed.
+fn file_text(f: i64) -> [u8] {
+    unsafe {
+        let mut p = FILES[f].path;
+        while p[0] == '.' && p[1] == '/' {
+            p = &p[2];
+        }
+        p[0..strlen(p) as i64]
+    }
+}
+
+// Resolves --in X: a file (X has a `/`, ends in `.tach` or is `<std>`;
+// the path, or its end by whole components) or a module (matched like
+// NAME, with its inline modules). Whether anything matched.
+fn resolve_in(x: [u8]) -> bool {
+    unsafe {
+        let mut any = false;
+        for _ in 0..FILE_COUNT {
+            IN_FILE.push(0);
+        }
+        for _ in 0..module_count() {
+            IN_MODULE.push(0);
+        }
+        let is_file = x.len > 0 && (x[0] == '<' || find_in(x, c"/", 0) >= 0 || find_in(x, c".tach", 0) >= 0);
+        if is_file {
+            for f in 0..FILE_COUNT {
+                let p = file_text(f);
+                if bytes_eq(p, x) || (p.len > x.len && bytes_eq(p[p.len - x.len..p.len], x) && p[p.len - x.len - 1] == '/') {
+                    IN_FILE.data[f] = 1;
+                    any = true;
+                }
+            }
+            return any;
+        }
+        let mut modules = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        find_modules(x, false, &modules);
+        for i in 0..modules.count {
+            IN_MODULE.data[modules.data[i]] = 1;
+            any = true;
+        }
+        any
+    }
+}
+
+// Whether the reference at pos passes --in.
+fn ref_in(pos: i64) -> bool {
+    unsafe {
+        if OPT_IN == 0 as *u8 {
+            return true;
+        }
+        if IN_FILE.data[file_of_pos(pos)] != 0 {
+            return true;
+        }
+        let mut m = module_at(pos);
+        while m >= 0 {
+            if IN_MODULE.data[m] != 0 {
+                return true;
+            }
+            m = if m > 0 { MODULES[m].parent } else { -1 };
+        }
+        false
+    }
+}
+
+// A `try:` line for refs/callers with one more option (and its value),
+// keeping --in unless the option is another --in.
+fn try_refs(cmd: *u8, name: [u8], option: *u8, value: [u8]) {
+    unsafe {
+        let out = try_begin(cmd, name, true);
+        if OPT_IN != 0 as *u8 && !streq(option, c"--in") {
+            buf_str(out, c" --in");
+            put_cword(out, OPT_IN);
+        }
+        buf_byte(out, ' ');
+        buf_str(out, option);
+        if value.len > 0 {
+            put_word(out, value);
+        }
+        try_end(out);
+    }
+}
+
+fn query_refs(matches: *IntVec, cmd: *u8, name: [u8]) -> i64 {
+    unsafe {
+        let calls_only = streq(cmd, c"callers");
         set_targets(matches);
         collect_refs();
         let mut order = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         sorted_refs(&order);
+        let mut sel = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut multi = TARGETS.count > 1;
+        for i in 0..order.count {
+            let r = order.data[i];
+            if calls_only && (R_FLAGS.data[r] & QF_CALL) == 0 {
+                continue;
+            }
+            if !ref_in(R_POS.data[r]) {
+                continue;
+            }
+            sel.push(r);
+            if R_DEF.data[r] != TARGETS.data[R_GROUP.data[r]] {
+                multi = true;
+            }
+        }
         let out = buf_new();
         let groups = TARGETS.count;
-        let mut counts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for _ in 0..groups {
-            counts.push(0);
-        }
-        for g in 0..groups {
-            if groups > 1 && !count {
-                buf_str(out, c"// ");
-                buf_bytes(out, SYMS[DEFS[TARGETS.data[g]].fqn].text);
-                buf_byte(out, '\n');
-            }
-            for i in 0..order.count {
-                let r = order.data[i];
-                if R_GROUP.data[r] != g {
-                    continue;
-                }
-                let flags = R_FLAGS.data[r];
-                if calls_only && (flags & QF_CALL) == 0 {
-                    continue;
-                }
-                counts.data[g] += 1;
-                if count {
-                    continue;
-                }
-                let pos = R_POS.data[r];
-                let d = R_DEF.data[r];
-                put_loc(out, pos);
-                if (flags & QF_DEF) != 0 {
-                    buf_str(out, c"  def");
-                } else {
-                    buf_str(out, c"  in ");
-                    put_enclosing(out, pos);
-                }
-                if groups > 1 || d != TARGETS.data[g] {
-                    buf_str(out, c"  -> ");
-                    buf_bytes(out, SYMS[DEFS[d].fqn].text);
-                }
-                buf_str(out, c"  |  ");
-                put_line(out, pos);
-                buf_byte(out, '\n');
-            }
-        }
-        if count {
+        if OPT_COUNT {
             if groups == 1 {
-                buf_int(out, counts.data[0]);
+                buf_int(out, sel.count);
                 buf_byte(out, '\n');
             } else {
                 for g in 0..groups {
-                    buf_int(out, counts.data[g]);
-                    buf_str(out, c"  ");
+                    let mut n = 0;
+                    for i in 0..sel.count {
+                        if R_GROUP.data[sel.data[i]] == g {
+                            n += 1;
+                        }
+                    }
+                    buf_int(out, n);
+                    buf_byte(out, '\t');
                     buf_bytes(out, SYMS[DEFS[TARGETS.data[g]].fqn].text);
                     buf_byte(out, '\n');
                 }
             }
+            buf_write_fd(out, STDOUT);
+            return 0;
+        }
+        let noun = if calls_only { c"calls" } else { c"refs" };
+        let total = sel.count;
+        if total == 0 {
+            let d = diag(c"note", c"query.empty");
+            buf_str(d, c"0 ");
+            buf_str(d, noun);
+            if OPT_IN != 0 as *u8 {
+                buf_str(d, c" in ");
+                buf_str(d, OPT_IN);
+            }
+            buf_byte(d, '\n');
+            return 0;
+        }
+        // Per file: the number of references (files in order).
+        let mut files = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut per_file = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut biggest = -1;
+        let mut biggest_n = 0;
+        for i in 0..sel.count {
+            let f = file_of_pos(R_POS.data[sel.data[i]]);
+            if files.count == 0 || files.data[files.count - 1] != f {
+                files.push(f);
+                per_file.push(0);
+            }
+            per_file.data[per_file.count - 1] += 1;
+            if per_file.data[per_file.count - 1] > biggest_n {
+                biggest_n = per_file.data[per_file.count - 1];
+                biggest = f;
+            }
+        }
+        if OPT_LIMIT < 0 && !OPT_ALL && total > REFS_BUDGET {
+            for i in 0..files.count {
+                buf_bytes(out, file_text(files.data[i]));
+                buf_byte(out, '\t');
+                buf_int(out, per_file.data[i]);
+                buf_byte(out, '\n');
+            }
+            buf_write_fd(out, STDOUT);
+            let d = diag(c"note", c"query.truncated");
+            buf_int(d, total);
+            buf_byte(d, ' ');
+            buf_str(d, noun);
+            buf_str(d, c" in ");
+            buf_int(d, files.count);
+            buf_str(d, if files.count == 1 { c" file\n" } else { c" files\n" });
+            if files.count > 1 {
+                try_refs(cmd, name, c"--in", file_text(biggest));
+            }
+            try_refs(cmd, name, c"--limit 60", file_text(biggest)[0..0]);
+            try_refs(cmd, name, c"--all", file_text(biggest)[0..0]);
+            return 0;
+        }
+        let shown = if OPT_LIMIT >= 0 && OPT_LIMIT < total { OPT_LIMIT } else { total };
+        let mut cur = -1;
+        for i in 0..shown {
+            let r = sel.data[i];
+            let pos = R_POS.data[r];
+            let d = R_DEF.data[r];
+            let f = file_of_pos(pos);
+            if f != cur {
+                buf_str(out, c"# ");
+                buf_bytes(out, file_text(f));
+                buf_byte(out, '\n');
+                cur = f;
+            }
+            buf_int(out, line_of(pos));
+            buf_byte(out, ':');
+            buf_int(out, pos - line_start(pos) + 1);
+            buf_byte(out, '\t');
+            if (R_FLAGS.data[r] & QF_DEF) != 0 {
+                buf_str(out, c"def");
+            } else {
+                let e = enclosing(pos);
+                put_short(out, if e >= 0 { DEFS[e].fqn } else { mod_fqn(module_at(pos)) });
+            }
+            if multi {
+                buf_str(out, c"\t->");
+                put_short(out, DEFS[d].fqn);
+            }
+            buf_byte(out, '\t');
+            put_line(out, pos);
+            buf_byte(out, '\n');
         }
         buf_write_fd(out, STDOUT);
+        if shown < total {
+            let d = diag(c"note", c"query.truncated");
+            buf_str(d, c"showing ");
+            buf_int(d, shown);
+            buf_str(d, c" of ");
+            buf_int(d, total);
+            buf_byte(d, ' ');
+            buf_str(d, noun);
+            buf_byte(d, '\n');
+            if files.count > 1 {
+                try_refs(cmd, name, c"--in", file_text(biggest));
+            }
+            try_refs(cmd, name, c"--all", file_text(biggest)[0..0]);
+        }
+        0
     }
 }
 
@@ -1293,11 +1672,11 @@ fn query_def(matches: *IntVec) {
         for i in 0..(*matches).count {
             let d = (*matches).data[i];
             buf_bytes(out, SYMS[DEFS[d].fqn].text);
-            buf_str(out, c"  ");
+            buf_byte(out, '\t');
             put_loc(out, DEFS[d].name_pos);
-            buf_str(out, c"  ");
+            buf_byte(out, '\t');
             buf_str(out, kind_name(DEFS[d].kind));
-            buf_str(out, c"  ");
+            buf_byte(out, '\t');
             put_signature(out, d);
             buf_byte(out, '\n');
         }
@@ -1331,24 +1710,23 @@ fn text_start(d: i64) -> i64 {
 // More matches than this: `show` lists their paths only.
 const SHOW_MAX: i64 = 5;
 
-fn query_show(matches: *IntVec) {
+fn query_show(matches: *IntVec, name: [u8]) -> i64 {
     unsafe {
         let out = buf_new();
         let n = (*matches).count;
         if n > SHOW_MAX {
-            buf_int(out, n);
-            buf_str(out, c" definitions match; qualify the name (or use --exact) to show one:\n");
             for i in 0..n {
-                let d = (*matches).data[i];
-                buf_bytes(out, SYMS[DEFS[d].fqn].text);
-                buf_str(out, c"  ");
-                put_loc(out, DEFS[d].name_pos);
-                buf_str(out, c"  ");
-                buf_str(out, kind_name(DEFS[d].kind));
+                buf_bytes(out, SYMS[DEFS[(*matches).data[i]].fqn].text);
                 buf_byte(out, '\n');
             }
             buf_write_fd(out, STDOUT);
-            return;
+            let d = diag(c"error", c"query.ambiguous");
+            buf_int(d, n);
+            buf_str(d, c" definitions match '");
+            buf_bytes(d, name);
+            buf_str(d, c"'; showing paths only\n");
+            try_query(c"show", SYMS[DEFS[(*matches).data[0]].fqn].text);
+            return 1;
         }
         for i in 0..n {
             let d = (*matches).data[i];
@@ -1356,7 +1734,7 @@ fn query_show(matches: *IntVec) {
             let last = line_end(if DEFS[d].end > DEFS[d].start { DEFS[d].end - 1 } else { DEFS[d].start });
             buf_str(out, c"// ");
             buf_bytes(out, SYMS[DEFS[d].fqn].text);
-            buf_str(out, c"  ");
+            buf_byte(out, '\t');
             put_path(out, file_of_pos(first));
             buf_byte(out, ':');
             buf_int(out, line_of(first));
@@ -1367,6 +1745,7 @@ fn query_show(matches: *IntVec) {
             buf_byte(out, '\n');
         }
         buf_write_fd(out, STDOUT);
+        0
     }
 }
 
@@ -1404,14 +1783,14 @@ fn query_modules() {
                 }
             }
             buf_bytes(out, SYMS[mod_fqn(m)].text);
-            buf_str(out, c"  ");
+            buf_byte(out, '\t');
             let f = module_file(m);
             if f >= 0 {
                 put_path(out, f);
             }
-            buf_str(out, c"  ");
+            buf_byte(out, '\t');
             buf_int(out, items);
-            buf_str(out, if items == 1 { c" item\n" } else { c" items\n" });
+            buf_byte(out, '\n');
         }
         buf_write_fd(out, STDOUT);
     }
@@ -1448,7 +1827,7 @@ fn put_impl_header(out: i64, d: i64) {
             j += 1;
         }
         buf_int(out, line_of(from));
-        buf_str(out, c"  impl  ");
+        buf_str(out, c"\timpl\t");
         collapse(out, from, TOKS[j].start);
         buf_byte(out, '\n');
     }
@@ -1464,11 +1843,11 @@ fn query_items(modules: *IntVec) {
         sort_by_position(&all);
         for i in 0..(*modules).count {
             let m = (*modules).data[i];
-            buf_str(out, c"// ");
+            buf_str(out, c"# ");
             buf_bytes(out, SYMS[mod_fqn(m)].text);
             let f = module_file(m);
             if f >= 0 {
-                buf_str(out, c"  ");
+                buf_byte(out, '\t');
                 put_path(out, f);
             }
             buf_byte(out, '\n');
@@ -1490,9 +1869,9 @@ fn query_items(modules: *IntVec) {
                     impl_of = -1;
                 }
                 buf_int(out, line_of(DEFS[d].name_pos));
-                buf_str(out, c"  ");
+                buf_byte(out, '\t');
                 buf_str(out, kind_name(k));
-                buf_str(out, c"  ");
+                buf_byte(out, '\t');
                 put_signature(out, d);
                 buf_byte(out, '\n');
             }
@@ -1502,18 +1881,6 @@ fn query_items(modules: *IntVec) {
 }
 
 // ---- The command line ----
-
-fn query_usage() -> i64 {
-    unsafe {
-        let out = buf_new();
-        buf_str(out, c"usage: tachyonc query def|show|refs|callers NAME [ROOT] [--exact] [--count]\n");
-        buf_str(out, c"       tachyonc query items [MODULE] [ROOT]\n");
-        buf_str(out, c"NAME: a path (crate::m::f, std::Vec::push, m::T.field, <T as Trait>::f) or its end (f, T::f, T.field)\n");
-        buf_str(out, c"ROOT: the program's root file (default: $TACHYON_ROOT, ./main.tach or ./compiler/src/main.tach); see docs/query.md\n");
-        buf_write_fd(out, STDERR);
-    }
-    2
-}
 
 fn ends_with_c(s: *u8, suffix: *u8) -> bool {
     unsafe {
@@ -1584,34 +1951,135 @@ fn front_end(root: *u8) {
 // Whether the program was parsed (the definitions are known).
 static mut PARSED: bool = false;
 
-pub fn run_query(argc: i64, argv: **u8) -> i64 {
+// The commands, for `--help` and the nearest command to a misspelt one.
+fn put_usage(out: i64) {
     unsafe {
+        buf_str(out, c"usage: tachyonc query def|show NAME [ROOT] [--exact]\n");
+        buf_str(out, c"       tachyonc query refs|callers NAME [ROOT] [--exact] [--count] [--in FILE|MODULE] [--limit N] [--all]\n");
+        buf_str(out, c"       tachyonc query items [MODULE] [ROOT]\n");
+        buf_str(out, c"see docs/query.md\n");
+    }
+}
+
+// A usage error: `error query.usage: <message>`; the caller writes the
+// message, then its `try:` lines.
+fn usage_error() -> i64 {
+    unsafe { diag(c"error", c"query.usage") }
+}
+
+const N_COMMANDS: i64 = 5;
+
+fn command_name(i: i64) -> *u8 {
+    if i == 0 { c"def" } else if i == 1 { c"show" } else if i == 2 { c"refs" } else if i == 3 { c"callers" } else { c"items" }
+}
+
+// The command nearest to cmd (edit distance at most 2), or 0.
+fn nearest_command(cmd: *u8) -> *u8 {
+    unsafe {
+        let want = cmd[0..strlen(cmd) as i64];
+        let mut best = 0 as *u8;
+        let mut best_d = 3;
+        for i in 0..N_COMMANDS {
+            let c = command_name(i);
+            let d = edit_distance(want, c[0..strlen(c) as i64]);
+            if d < best_d {
+                best = c;
+                best_d = d;
+            }
+        }
+        best
+    }
+}
+
+fn c_slice(s: *u8) -> [u8] {
+    unsafe { s[0..strlen(s) as i64] }
+}
+
+pub fn run_query(argc: i64, argv: **u8) -> i64 {
+    let status = run_query_inner(argc, argv);
+    write_diags();
+    status
+}
+
+fn run_query_inner(argc: i64, argv: **u8) -> i64 {
+    unsafe {
+        PROG = argv[0];
         if argc < 3 {
-            return query_usage();
+            let out = usage_error();
+            buf_str(out, c"no command\n");
+            try_end(try_begin(c"items", c_slice(c""), false));
+            return 2;
         }
         let cmd = argv[2];
-        let mut count = false;
-        let mut exact = false;
+        CMD = cmd;
+        if streq(cmd, c"--help") || streq(cmd, c"-h") || streq(cmd, c"help") {
+            let out = buf_new();
+            put_usage(out);
+            buf_write_fd(out, STDOUT);
+            return 0;
+        }
         let mut args = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for i in 3..argc {
+        let mut bad = 0 as *u8;
+        let mut bad_value = false;
+        let mut i = 3;
+        while i < argc {
             let a = argv[i];
             if streq(a, c"--count") {
-                count = true;
+                OPT_COUNT = true;
             } else if streq(a, c"--exact") {
-                exact = true;
+                OPT_EXACT = true;
+            } else if streq(a, c"--all") {
+                OPT_ALL = true;
+            } else if streq(a, c"--in") || streq(a, c"--limit") {
+                if i + 1 >= argc || argv[i + 1][0] == '-' {
+                    bad = a;
+                    bad_value = true;
+                } else if streq(a, c"--in") {
+                    OPT_IN = argv[i + 1];
+                    i += 1;
+                } else {
+                    let v = argv[i + 1];
+                    let mut n = 0;
+                    let mut j = 0;
+                    while v[j] >= '0' && v[j] <= '9' {
+                        n = n * 10 + (v[j] - '0') as i64;
+                        j += 1;
+                    }
+                    if j == 0 || v[j] != 0 {
+                        bad = a;
+                        bad_value = true;
+                    } else {
+                        OPT_LIMIT = n;
+                    }
+                    i += 1;
+                }
             } else if a[0] == '-' && a[1] == '-' {
-                return query_usage();
+                bad = a;
             } else {
                 args.push(a as i64);
             }
+            i += 1;
         }
         let items = streq(cmd, c"items");
         let is_refs = streq(cmd, c"refs") || streq(cmd, c"callers");
         if !items && !is_refs && !streq(cmd, c"def") && !streq(cmd, c"show") {
-            return query_usage();
+            let out = usage_error();
+            buf_str(out, c"unknown command '");
+            buf_str(out, cmd);
+            buf_str(out, c"'\n");
+            let near = nearest_command(cmd);
+            if near != 0 as *u8 && args.count >= 1 {
+                try_query(near, c_slice(args.data[0] as *u8));
+            } else if args.count >= 1 {
+                try_query(c"def", c_slice(args.data[0] as *u8));
+            } else {
+                try_end(try_begin(c"items", c_slice(c""), false));
+            }
+            return 2;
         }
         let mut name = 0 as *u8;
         let mut root = 0 as *u8;
+        let mut extra = 0 as *u8;
         if items {
             // `items [MODULE] [ROOT]` (a lone argument ending in .tach is ROOT)
             if args.count == 1 && ends_with_c(args.data[0] as *u8, c".tach") {
@@ -1623,32 +2091,66 @@ pub fn run_query(argc: i64, argv: **u8) -> i64 {
                 }
             }
             if args.count > 2 {
-                return query_usage();
+                extra = args.data[2] as *u8;
             }
         } else {
-            if args.count < 1 || args.count > 2 {
-                return query_usage();
+            if args.count >= 1 {
+                name = args.data[0] as *u8;
             }
-            name = args.data[0] as *u8;
-            if args.count == 2 {
+            if args.count >= 2 {
                 root = args.data[1] as *u8;
             }
+            if args.count > 2 {
+                extra = args.data[2] as *u8;
+            }
+        }
+        ROOT_GIVEN = root;
+        let name_text = if name == 0 as *u8 { c_slice(c"") } else { c_slice(name) };
+        if !items && name == 0 as *u8 {
+            let out = usage_error();
+            buf_str(out, cmd);
+            buf_str(out, c" needs a NAME (a path or its end: f, m::f, T::f, T.field)\n");
+            try_end(try_begin(c"items", name_text, false));
+            return 2;
+        }
+        if bad != 0 as *u8 || extra != 0 as *u8 {
+            let out = usage_error();
+            if bad != 0 as *u8 && bad_value {
+                buf_str(out, bad);
+                buf_str(out, if streq(bad, c"--in") { c" needs a FILE or MODULE\n" } else { c" needs a number\n" });
+            } else if bad != 0 as *u8 {
+                buf_str(out, c"unknown option '");
+                buf_str(out, bad);
+                buf_str(out, c"'\n");
+            } else {
+                buf_str(out, c"unexpected argument '");
+                buf_str(out, extra);
+                buf_str(out, c"'\n");
+            }
+            if bad != 0 as *u8 && bad_value && streq(bad, c"--limit") {
+                try_refs(cmd, name_text, c"--limit 60", c_slice(c""));
+            } else {
+                try_end(try_begin(cmd, name_text, name != 0 as *u8));
+            }
+            return 2;
         }
         root = find_root(root);
         if root == 0 as *u8 {
-            let out = buf_new();
-            buf_str(out, c"tachyonc query: no program to ask about: pass its root file (tachyonc query ");
-            buf_str(out, cmd);
-            buf_str(out, c" ... ROOT, e.g. compiler/src/main.tach), set TACHYON_ROOT, or run where ./main.tach or ./compiler/src/main.tach is\n");
-            buf_write_fd(out, STDERR);
+            let out = diag(c"error", c"query.no-root");
+            buf_str(out, c"no root (TACHYON_ROOT, ./main.tach, ./compiler/src/main.tach)\n");
+            ROOT_GIVEN = c"path/to/main.tach";
+            try_end(try_begin(cmd, name_text, name != 0 as *u8));
             return 2;
         }
         if !file_exists(root) {
-            let out = buf_new();
-            buf_str(out, c"tachyonc query: cannot read the root file '");
+            let out = diag(c"error", c"query.bad-root");
+            buf_str(out, c"cannot read '");
             buf_str(out, root);
             buf_str(out, c"'\n");
-            buf_write_fd(out, STDERR);
+            ROOT_GIVEN = 0 as *u8;
+            if find_root(0 as *u8) != 0 as *u8 {
+                try_end(try_begin(cmd, name_text, name != 0 as *u8));
+            }
             return 2;
         }
         QUERY = true;
@@ -1661,12 +2163,21 @@ pub fn run_query(argc: i64, argv: **u8) -> i64 {
         QUERY = false;
         if !PARSED {
             // (nothing to answer with: the errors say why)
-            write_errors();
+            program_errors(c"error", root, true);
             return 1;
         }
         init_positions();
         finish_defs();
         init_containers();
+        let status = answer(cmd, name, items, is_refs);
+        program_errors(c"warning", root, status != 0);
+        status
+    }
+}
+
+// The answer to the command, once the program is known.
+fn answer(cmd: *u8, name: *u8, items: bool, is_refs: bool) -> i64 {
+    unsafe {
         if items {
             if name == 0 as *u8 {
                 query_modules();
@@ -1674,9 +2185,9 @@ pub fn run_query(argc: i64, argv: **u8) -> i64 {
             }
             let mut modules = IntVec { data: 0 as *i64, count: 0, cap: 0 };
             let text = SYMS[intern_c(name)].text;
-            find_modules(text, exact, &modules);
+            find_modules(text, OPT_EXACT, &modules);
             if modules.count == 0 {
-                no_match(text, c"module");
+                no_module(text);
                 return 1;
             }
             query_items(&modules);
@@ -1684,18 +2195,26 @@ pub fn run_query(argc: i64, argv: **u8) -> i64 {
         }
         let text = SYMS[intern_c(name)].text;
         let mut matches = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        find_defs(text, exact, &matches);
+        find_defs(text, OPT_EXACT, &matches);
         if matches.count == 0 {
-            no_match(text, c"definition");
+            no_match(cmd, text);
             return 1;
         }
         if is_refs {
-            query_refs(&matches, streq(cmd, c"callers"), count);
-        } else if streq(cmd, c"show") {
-            query_show(&matches);
-        } else {
-            query_def(&matches);
+            if OPT_IN != 0 as *u8 && !resolve_in(c_slice(OPT_IN)) {
+                let out = diag(c"error", c"query.bad-in");
+                buf_str(out, c"no file or module '");
+                buf_str(out, OPT_IN);
+                buf_str(out, c"' in the program\n");
+                try_end(try_begin(cmd, text, true));
+                return 1;
+            }
+            return query_refs(&matches, cmd, text);
         }
+        if streq(cmd, c"show") {
+            return query_show(&matches, text);
+        }
+        query_def(&matches);
         0
     }
 }

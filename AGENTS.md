@@ -14,13 +14,16 @@ sed, head, cat or awk ([docs/query.md](docs/query.md)):
 | you want | run |
 |---|---|
 | the source of a function, type, method | `target/tachyonc query show NAME` |
-| where something is used | `target/tachyonc query refs NAME` (`--count`) |
+| where something is used | `target/tachyonc query refs NAME` (`--count`, `--in FILE\|MODULE`) |
 | where it is defined, its signature | `target/tachyonc query def NAME` |
 | what a module contains | `target/tachyonc query items MODULE` |
 
 NAME is `foo`, `module::foo`, `Type::method`, `Enum::Variant` or
 `Struct.field`. The root defaults to `compiler/src/main.tach` (pass
-another root file as the last argument for other programs).
+another root file as the last argument for other programs). A problem
+is one stderr line, `error CODE: message`, then `try:` lines: commands to
+run as they are. Compile with `--diagnostics=short` for one line per
+error.
 
 **This is being tested.** A hook (`tools/agent-hooks/query-first.py`)
 blocks shell commands that read `.tach` source and suggests the query
