@@ -44,6 +44,7 @@ pub mod sections;
 pub mod typeat;
 pub mod cache;
 mod names;
+mod stdq;
 
 use crate::host_target;
 use crate::base::{
@@ -57,7 +58,7 @@ use crate::front::check::check_program;
 use crate::front::cimport::{IMPORTED_START, drop_shadowed_imports, import_c_headers};
 use crate::front::cpp::directives::file_exists;
 use crate::front::lexer::{init_lexer, lex_range};
-use crate::front::modules::{load_modules, module_at};
+use crate::front::modules::{STD_ALWAYS, STD_MODULE, load_modules, module_at};
 use crate::front::parser::parse_program;
 use crate::front::types::{ENUMS, STRUCTS, TYPES, TyKind, init_declarations, init_types};
 use crate::gen0::gen::MAIN_SYM;
@@ -93,6 +94,7 @@ use crate::base::timer::{
 };
 use crate::tools::query::cache::{cache_restore, cache_save};
 use names::{canonical_name, is_symbol, path_matches};
+use stdq::{all_std, ask_with_std, names_std, std_requested, std_root, wants_std};
 
 extern "C" {
     fn getenv(name: *u8) -> *u8;
@@ -553,6 +555,13 @@ fn run_query_inner(argc: i64, argv: **u8) -> i64 {
         if root == 0 as *u8 {
             root = infer_root(&args);
         }
+        // (0.15: std's names where there is no program: a program of
+        // nothing but std)
+        let mut std_only = false;
+        if find_root(root) == 0 as *u8 && !streq(cmd, c"grep") && all_std(&args) {
+            root = std_root();
+            std_only = root != 0 as *u8;
+        }
         root = root_or_diag(root, cmd, first, args.count > 0);
         if root == 0 as *u8 {
             return 2;
@@ -561,13 +570,29 @@ fn run_query_inner(argc: i64, argv: **u8) -> i64 {
         // when it holds for the program; else read in full, then cached.
         // grep and type need the tokens and nodes, which are not cached:
         // they read the program in full, and leave the cache as it is)
-        let cacheable = streq(cmd, c"def") || streq(cmd, c"show") || streq(cmd, c"refs")
-            || streq(cmd, c"callers") || items;
+        // (0.15: a question about std reads the program with std, and
+        // without the cache, which holds the program as it is)
+        let mut with_std = std_only || std_requested()
+            || (OPT_IN != 0 as *u8 && names_std(c_slice(OPT_IN)));
+        for k in 0..args.count {
+            if names_std(c_slice(args.data[k] as *u8)) {
+                with_std = true;
+            }
+        }
+        STD_ALWAYS = with_std;
+        let cacheable = (streq(cmd, c"def") || streq(cmd, c"show") || streq(cmd, c"refs")
+            || streq(cmd, c"callers") || items) && !with_std;
         let cached = cacheable && cache_restore(root, 0, is_refs);
         if !cached && !load_program(root, 0) {
             // (nothing to answer with: the errors say why)
             program_errors(c"error", root, true);
             return 1;
+        }
+        if !with_std && STD_MODULE < 0 && !items && !streq(cmd, c"grep") && !streq(cmd, c"type")
+            && wants_std(&args) {
+            // (a NAME std defines and the program does not: asked again
+            // with std)
+            ask_with_std(argv);
         }
         let t = timer_now();
         let status = answer(cmd, &args, items, is_refs);
@@ -745,7 +770,7 @@ fn module_def(name: [u8], out: *IntVec) -> bool {
             let d = diag(c"note", c"query.module");
             buf_byte(d, '\'');
             buf_bytes(d, name);
-            buf_str(d, c"' is the root module; its items:\n");
+            buf_str(d, c"' is a module without a `mod` item (the root, or std); its items:\n");
             query_items(&modules);
         }
         root

@@ -1,0 +1,208 @@
+// std in every program's queries (0.15): `query items std`, `show
+// std::read_line`, `def Vec::push`, `grep --in std` answer whether the
+// program uses std or not. A question that names std (`std`,
+// `std::...`, `<std>`) reads the program with std (STD_ALWAYS); a NAME
+// that the program does not define but std does is asked again, by the
+// same command run with std (TACHYON_QUERY_STD=1).
+
+use crate::base::{IntVec, SYMS, buf_bytes, buf_new, buf_slice, intern};
+use crate::front::cpp::directives::file_exists;
+use crate::front::modules::lookup::is_prelude_name;
+use crate::front::stdsrc::std_source;
+use crate::tools::proc::{buf_cstr, write_file_if};
+use crate::tools::query::defs::{DEFS, K_IMPL_METHOD, K_METHOD, find_defs, last_segment, mod_fqn};
+use crate::tools::query::names::canonical_name;
+
+extern "C" {
+    fn getenv(name: *u8) -> *u8;
+    fn setenv(name: *u8, value: *u8, overwrite: i32) -> i32;
+    fn execvp(file: *u8, argv: **u8) -> i32;
+}
+
+// Whether the query was run again with std (by ask_with_std).
+pub fn std_requested() -> bool {
+    unsafe {
+        let v = getenv(c"TACHYON_QUERY_STD");
+        v != 0 as *u8 && v[0] == '1'
+    }
+}
+
+// Whether argument a names std: `std`, `std::...`, `<std>...`, `std:...`.
+pub fn names_std(a: [u8]) -> bool {
+    let s = canonical_name(a);
+    if s == "std" || s == "<std>" {
+        return true;
+    }
+    (s.len > 5 && s[0..5] == "std::") || (s.len > 5 && s[0..5] == "<std>")
+        || (s.len > 4 && s[0..4] == "std:" && s[4] >= '0' && s[4] <= '9')
+}
+
+static mut STD_TEXT: i64 = -1;
+
+// std's source.
+fn std_text() -> [u8] {
+    unsafe {
+        if STD_TEXT < 0 {
+            STD_TEXT = buf_new();
+            std_source(STD_TEXT);
+        }
+        buf_slice(STD_TEXT)
+    }
+}
+
+fn is_word(c: u8) -> bool {
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+}
+
+// Whether std's source defines `word` (an item, a method, a variant), by
+// its text: the word after `fn `, `struct `, `enum `, `trait `, `type `,
+// `const ` or `static `, or a line's first word (a variant).
+pub fn std_defines(word: [u8]) -> bool {
+    if word.len == 0 {
+        return false;
+    }
+    let t = std_text();
+    let mut i = 0;
+    while i + word.len <= t.len {
+        if t[i] == word[0] && t[i..i + word.len] == word
+            && (i + word.len == t.len || !is_word(t[i + word.len]))
+            && (i == 0 || !is_word(t[i - 1])) {
+            // (what comes before it on its line)
+            let mut a = i;
+            while a > 0 && t[a - 1] != '\n' {
+                a -= 1;
+            }
+            let before = t[a..i];
+            let mut lead = 0;
+            while lead < before.len && before[lead] == ' ' {
+                lead += 1;
+            }
+            if lead == before.len && lead > 0 {
+                return true;
+            }
+            let kws = ["fn ", "struct ", "enum ", "trait ", "type ", "const ", "static mut ",
+                "static "];
+            for k in 0..8 {
+                let kw = kws[k];
+                if before.len >= kw.len && before[before.len - kw.len..before.len] == kw {
+                    return true;
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+// Whether some NAME of the command is one std defines and the program
+// does not (after the program is read without std).
+pub fn wants_std(args: *IntVec) -> bool {
+    unsafe {
+        for i in 0..(*args).count {
+            let name = canonical_name(crate::tools::query::c_slice((*args).data[i] as *u8));
+            if name.len == 0 || name[name.len - 1] >= '0' && name[name.len - 1] <= '9' {
+                continue;
+            }
+            let mut found = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            find_defs(name, false, &found);
+            if found.count == 0 && std_defines(last_segment(name)) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// Whether every NAME of args is one std defines (a question about std
+// asked where there is no program).
+pub fn all_std(args: *IntVec) -> bool {
+    unsafe {
+        if (*args).count == 0 {
+            return false;
+        }
+        for i in 0..(*args).count {
+            let a = crate::tools::query::c_slice((*args).data[i] as *u8);
+            if !names_std(a) && !std_defines(last_segment(canonical_name(a))) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// The root of a program of nothing but `fn main`, for std's questions
+// where there is no program (made in $TMPDIR once); 0 when it cannot be
+// written.
+pub fn std_root() -> *u8 {
+    unsafe {
+        let b = buf_new();
+        let tmp = getenv(c"TMPDIR");
+        if tmp != 0 as *u8 && tmp[0] != 0 {
+            crate::base::buf_str(b, tmp);
+        } else {
+            buf_bytes(b, "/tmp");
+        }
+        let s = buf_slice(b);
+        if s.len > 0 && s[s.len - 1] != '/' {
+            buf_bytes(b, "/");
+        }
+        buf_bytes(b, "tachyonc-std-query.tach");
+        let path = buf_cstr(b);
+        if !file_exists(path)
+            && !write_file_if(path,
+                "// std's questions where there is no program (tachyonc query).\nfn main() {}\n") {
+            return 0 as *u8;
+        }
+        path
+    }
+}
+
+// Runs this command again with std (the same arguments; never returns
+// when it can run).
+pub fn ask_with_std(argv: **u8) {
+    unsafe {
+        setenv(c"TACHYON_QUERY_STD", c"1", 1);
+        execvp(argv[0], argv);
+    }
+}
+
+// The `use` line that brings std's item `name` (a top-level name of std)
+// into a program: empty for a name of the prelude.
+pub fn std_use_line(out: i64, name: [u8]) {
+    if is_prelude_name(intern(name)) {
+        return;
+    }
+    crate::base::buf_bytes(out, "use std::");
+    crate::base::buf_bytes(out, name);
+    crate::base::buf_bytes(out, ";");
+}
+
+// Whether module m is std.
+pub fn is_std_module(m: i64) -> bool {
+    unsafe { SYMS[mod_fqn(m)].text == "std" }
+}
+
+// For definition d of std: `// use std::NAME;\n`, the line a program
+// needs to name it (its type's, for a method); nothing for the prelude
+// and for what is not std's.
+pub fn put_std_use(out: i64, d: i64) {
+    unsafe {
+        if !is_std_module(DEFS[d].module) {
+            return;
+        }
+        let k = DEFS[d].kind;
+        let mut name = SYMS[DEFS[d].name].text;
+        if k == K_METHOD && DEFS[d].owner >= 0 {
+            name = last_segment(SYMS[DEFS[d].owner].text);
+        } else if DEFS[d].parent >= 0 || k == K_IMPL_METHOD || k == K_METHOD {
+            return;
+        }
+        let line = buf_new();
+        std_use_line(line, name);
+        if buf_slice(line).len > 0 {
+            buf_bytes(out, "// ");
+            buf_bytes(out, buf_slice(line));
+            buf_bytes(out, "\n");
+        }
+    }
+}
