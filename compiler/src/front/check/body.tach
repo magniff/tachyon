@@ -11,19 +11,20 @@ use crate::front::ast::{
     BLOCK_UNSAFE, FN_LAZY, FN_UNSAFE, NODES, child, list_begin, list_end, list_push, new_node,
 };
 use crate::front::ast::NodeKind::{
-    Block, Defer, ExprStmt, FieldAccess, For, Ident, Index, Int, Let, Loop, PatBind, PatTuple, Path,
-    Range, While,
+    Block, Defer, ExprStmt, FieldAccess, For, Ident, If, Index, Int, Let, Loop, PatBind, PatTuple,
+    Path, Range, While,
 };
 use crate::front::check::{
     CUR_FN, DEFER_LOOP_BASE, ENV, LOCALS, LOCAL_COUNT, LOOP_BASE, LOOP_STACK, RETURN_TYPE, SCOPES,
-    SELF_TYPE, define_local, lookup_local, mismatch_error, name_error, poison_statement, pop_scope,
-    push_scope, restore_check_state, save_check_state, type_error, type_error_got,
+    SELF_TYPE, check_recovering, define_local, lookup_local, mismatch_error, name_error,
+    poison_statement, pop_scope, push_scope, restore_check_state, save_check_state, type_error,
+    type_error_got,
 };
 use crate::front::check::check_mode::check_expr;
 use crate::front::check::iterate::check_for_iter;
 use crate::front::check::resolve::resolve_type;
-use crate::front::check::synth_mode::{literal_takes_rhs_type, synth_expr};
-use crate::front::check::unsafety::{UNSAFE_DEPTH, WRAP_NODE, check_wrapped, is_borrow_param};
+use crate::front::check::synth_mode::{is_context_literal, literal_takes_rhs_type, synth_expr};
+use crate::front::check::unsafety::{UNSAFE_DEPTH, WRAP_NODE, is_borrow_param};
 use crate::front::closures::check_scope_exit;
 use crate::front::generics::{CUR_INST, TP_BASE, env_enter, env_leave, template_of_key};
 use crate::front::lexer::SUF_I64;
@@ -33,7 +34,8 @@ use crate::front::parser::UNDERSCORE;
 use crate::front::patterns::{check_irrefutable, check_pattern};
 use crate::front::traits::bounded_param_of_type;
 use crate::front::types::{
-    FNS, TYPES, TY_BOOL, TY_NEVER, TY_UNIT, TyKind, err_type, fn_param, is_integer,
+    FNS, TYPES, TY_BOOL, TY_ERROR, TY_NEVER, TY_UNIT, TyKind, err_type, fn_param, is_integer,
+    is_numeric,
 };
 
 // ---- Functions ----
@@ -206,7 +208,7 @@ fn check_let(stmt: i64) -> bool {
 
 pub fn check_if(n: i64, expected: i64) -> i64 {
     unsafe {
-        check_wrapped(NODES[n].a, TY_BOOL);
+        check_recovering(NODES[n].a, TY_BOOL);
         let else_block = NODES[n].c;
         if else_block == 0 {
             if expected != TY_UNIT {
@@ -250,23 +252,50 @@ fn tail_needs_context(b: i64) -> bool {
     }
 }
 
+// Whether branch b of an if takes its type from the other branch: it ends
+// in a variant of a generic enum without its type arguments, or (0.14) its
+// value is an unsuffixed literal (also through an `else if` chain of them).
+fn branch_takes_type(b: i64) -> bool {
+    unsafe {
+        if tail_needs_context(b) || is_context_literal(b) {
+            return true;
+        }
+        let mut e = b;
+        if NODES[e].kind == Block && NODES[e].count == 0 && NODES[e].a != 0 {
+            e = NODES[e].a;
+        }
+        NODES[e].kind == If && NODES[e].c != 0 && branch_takes_type(NODES[e].b)
+            && branch_takes_type(NODES[e].c)
+    }
+}
+
 pub fn synth_if(n: i64) -> i64 {
     unsafe {
-        check_wrapped(NODES[n].a, TY_BOOL);
+        check_recovering(NODES[n].a, TY_BOOL);
+        let then_block = NODES[n].b;
         let else_block = NODES[n].c;
-        // (0.9) `if c { None } else { Some(x) }`: the type from the other
-        // branch.
-        if else_block != 0 && NODES[else_block].kind == Block && tail_needs_context(NODES[n].b)
-            && !tail_needs_context(else_block) {
+        // (0.9) `if c { None } else { Some(x) }`, (0.14) `if c { 0 } else {
+        // b[i] }`: the type from the other branch.
+        let mut then_ty = 0;
+        if else_block != 0 && NODES[else_block].kind == Block && branch_takes_type(then_block)
+            && !branch_takes_type(else_block) {
             let else_ty = check_block(else_block, 0);
-            if else_ty != TY_NEVER {
-                check_branch(NODES[n].b, else_ty);
+            if else_ty == TY_NEVER {
+                return check_block(then_block, 0);
+            }
+            if tail_needs_context(then_block) || is_numeric(else_ty) {
+                check_branch(then_block, else_ty);
                 return else_ty;
             }
-            return check_block(NODES[n].b, 0);
+            then_ty = check_block(then_block, 0);
+            if then_ty == TY_NEVER {
+                return else_ty;
+            }
+            branch_types_error(n, then_ty, else_ty);
         }
-        let then_ty = check_block(NODES[n].b, 0);
-        if else_block != 0 && then_ty != TY_NEVER && tail_needs_context(else_block) {
+        then_ty = check_block(then_block, 0);
+        if else_block != 0 && then_ty != TY_NEVER && branch_takes_type(else_block)
+            && (tail_needs_context(else_block) || is_numeric(then_ty)) {
             check_branch(else_block, then_ty);
             return then_ty;
         }
@@ -283,6 +312,12 @@ pub fn synth_if(n: i64) -> i64 {
         if else_ty == TY_NEVER || then_ty == else_ty {
             return then_ty;
         }
+        branch_types_error(n, then_ty, else_ty)
+    }
+}
+
+fn branch_types_error(n: i64, then_ty: i64, else_ty: i64) -> ! {
+    unsafe {
         err_begin(NODES[n].start);
         err_str(c"if/else branches have different types: '");
         err_type(then_ty);
@@ -377,7 +412,7 @@ pub fn check_loop(n: i64, expected: i64) -> i64 {
 
 pub fn check_while(n: i64) -> i64 {
     unsafe {
-        check_wrapped(NODES[n].b, TY_BOOL);
+        check_recovering(NODES[n].b, TY_BOOL);
         check_loop_body(n, NODES[n].c);
     }
     TY_UNIT
@@ -422,7 +457,15 @@ pub fn check_for(n: i64) -> i64 {
 fn check_for_each(n: i64) -> i64 {
     unsafe {
         let seq = NODES[n].c;
-        let seq_ty = check_wrapped(seq, 0);
+        let seq_ty = check_recovering(seq, 0);
+        if seq_ty == TY_ERROR {
+            // (after an error in the sequence, the body is checked too)
+            push_scope();
+            check_pattern(NODES[n].b, TY_ERROR);
+            check_loop_body(n, NODES[n].d);
+            pop_scope();
+            return TY_UNIT;
+        }
         let kind = TYPES[seq_ty].kind;
         if kind != TyKind::Slice && kind != TyKind::Array {
             return check_for_iter(n);

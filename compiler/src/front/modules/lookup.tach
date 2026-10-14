@@ -3,16 +3,18 @@
 // privacy, the names `*` imports and C header imports bring, the prelude,
 // and paths (`a::b::c`) resolved to what they name.
 
-use crate::base::{IntVec, alloc_array, grow, intern_c};
+use crate::base::{FILES, IntVec, SRC, SYMS, SYM_COUNT, alloc_array, buf_bytes, grow, intern_c};
 use crate::base::diag::{
-    err_begin, err_end, err_end_soft, err_failed_name, err_str, err_sym, error_at, fail_name,
+    ERR_HELP, buf_position, err_begin, err_end, err_end_soft, err_failed_name, err_help,
+    err_help_sym, err_str, err_sym, error_at, fail_name,
 };
 use crate::front::ast::{NODES, NodeKind, child};
 use crate::front::check::{PROGRAM, SELF_SYM, Try, attempt, name_error};
 use crate::front::check::collect::template_variant_named;
+use crate::front::check::names::help_near_item;
 use crate::front::modules::{
-    CUR_MOD, C_MODULE, MODULES, MODULE_COUNT, STD_MODULE, child_module, is_within, module_of,
-    qualified_if_known, qualify,
+    CUR_MOD, C_MODULE, MODULES, MODULE_COUNT, STD_MODULE, child_module, file_of_pos, is_within,
+    module_of, qualified_if_known, qualify,
 };
 use crate::front::parser::items::ITEM_PUBLIC;
 use crate::front::types::{ENUMS, SYM_ENUM, VARIANTS, find_variant, item_node_of};
@@ -283,8 +285,83 @@ fn unresolved_import(id: i64, path: i64) -> ! {
     }
 }
 
-pub fn private_error(pos: i64, name: i64) -> ! {
-    unsafe { name_error(pos, c"'", name, c"' is private") }
+pub fn private_error(pos: i64, name: i64, key: i64) -> ! {
+    unsafe {
+        err_begin(pos);
+        err_str(c"'");
+        err_sym(name);
+        err_str(c"' is private");
+        help_make_public(key, name);
+        err_end()
+    }
+}
+
+// The help of a private item (by key): its declaration with `pub` (0.14),
+// `make it public: `pub fn f` at FILE: line L, column C`: the text of its
+// first line up to its name, where `tachyonc fix --only pub` writes `pub`.
+fn help_make_public(key: i64, name: i64) {
+    unsafe {
+        let item = if key >= 0 && key < SYM_COUNT { item_node_of(key) } else { 0 };
+        if item == 0 {
+            if child_module_key(key) {
+                err_help(c"make it public: `pub mod ");
+                err_help_sym(name);
+                err_help(c"`");
+            }
+            return;
+        }
+        let start = NODES[item].start;
+        if FILES[file_of_pos(start)].path[0] == '<' {
+            // (std's)
+            return;
+        }
+        let text = SYMS[name].text;
+        let mut e = start;
+        while e < NODES[item].end && SRC[e] != '\n' {
+            e += 1;
+        }
+        // The first whole word `name` on the line.
+        let mut stop = -1;
+        let mut i = start;
+        while i + text.len <= e && stop < 0 {
+            let mut same = true;
+            for k in 0..text.len {
+                if SRC[i + k] != text[k] {
+                    same = false;
+                    break;
+                }
+            }
+            if same && (i == start || !ident_byte(SRC[i - 1]))
+                && (i + text.len == e || !ident_byte(SRC[i + text.len])) {
+                stop = i + text.len;
+            }
+            i += 1;
+        }
+        err_help(c"make it public: `pub ");
+        if stop > 0 {
+            buf_bytes(ERR_HELP, SRC[start..stop]);
+        } else {
+            err_help_sym(name);
+        }
+        err_help(c"` at ");
+        buf_position(ERR_HELP, start);
+    }
+}
+
+fn ident_byte(c: u8) -> bool {
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+}
+
+// Whether key is a module's (`a::b` of `mod b;` in a).
+fn child_module_key(key: i64) -> bool {
+    unsafe {
+        for m in 1..MODULE_COUNT {
+            if MODULES[m].key == key {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 // The error for a binding that cannot be used: private, or (0.6) brought
@@ -296,7 +373,7 @@ pub fn access_error(b: i64, pos: i64, name: i64) -> ! {
             name_error(pos, c"'", name, c"' is ambiguous: more than one '*' import brings it (import it by name, or write its path)");
         }
     }
-    private_error(pos, name)
+    private_error(pos, name, binding_value(b))
 }
 
 // What `name` stands for in module m, seen from code in module `from`.
@@ -315,6 +392,32 @@ pub fn lookup_name(m: i64, name: i64, from: i64) -> i64 {
         SCOPE_CACHE.put(k, result + 1);
     }
     result
+}
+
+// What `name` stands for in module m, seen from `from`, where a value or a
+// type is wanted (0.14): when m has a child module `name` and imports an
+// item of that name too (`mod eval; use eval::eval;`), the item, as in
+// Rust; paths (`eval::other`) still go through the module.
+pub fn lookup_item(m: i64, name: i64, from: i64) -> i64 {
+    unsafe {
+        let b = lookup_name(m, name, from);
+        if binding_kind(b) != B_MODULE || !SCOPES_READY {
+            return b;
+        }
+        let inside = is_within(from, m);
+        let count = if m < USES_INDEXED { MODULE_USES[m].count } else { 0 };
+        for k in 0..count {
+            let u = MODULE_USES[m].data[k];
+            if USE_ENTRIES[u].name == name && !USE_ENTRIES[u].glob
+                && (inside || USE_ENTRIES[u].public) {
+                let item = resolve_use(u);
+                if binding_kind(item) == B_ITEM || binding_kind(item) == B_PRIVATE {
+                    return item;
+                }
+            }
+        }
+        b
+    }
 }
 
 fn lookup_uncached(m: i64, name: i64, from: i64, depth: i64) -> i64 {
@@ -657,6 +760,7 @@ fn resolve_path(m: i64, path: i64, count: i64, pos: i64) -> i64 {
                         err_sym(MODULES[here].key);
                     }
                     err_str(c"'");
+                    help_near_item(here, name);
                 }
                 err_end();
             }

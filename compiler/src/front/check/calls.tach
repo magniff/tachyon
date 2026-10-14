@@ -3,6 +3,7 @@
 // (`m::f`, `T::f`, `Enum::Variant`) and the calls through them, and
 // method calls (`x.m()`, with `&x` or `*x` as its `self` needs).
 
+use crate::base::SYMS;
 use crate::base::diag::{
     ERR_HELP, err_begin, err_end, err_failed_name, err_help, err_help_sym, err_int, err_str,
     err_sym, error_at,
@@ -17,8 +18,12 @@ use crate::front::check::{
 };
 use crate::front::check::assign::is_place;
 use crate::front::check::check_mode::check_expr;
-use crate::front::check::collect::{find_generic_method, template_variant_named};
-use crate::front::check::names::{NODE_RESOLVED, fn_value_type, unknown_name_error};
+use crate::front::check::collect::{
+    GMETHODS, GMETHOD_COUNT, find_generic_method, template_variant_named,
+};
+use crate::front::check::names::{
+    CALLEE_POS, NODE_RESOLVED, Near, fn_value_type, help_near_item, near_to, unknown_name_error,
+};
 use crate::front::check::resolve::{resolve_key, resolve_named};
 use crate::front::check::synth_mode::synth_expr;
 use crate::front::check::unsafety::{
@@ -37,13 +42,15 @@ use crate::front::lexer::Tok;
 use crate::front::modules::{CUR_MOD, C_MODULE, MODULES, STD_MODULE};
 use crate::front::modules::lookup::{
     B_ITEM, B_MODULE, B_NONE, B_PRIVATE, B_TVARIANT, B_VARIANT, SYM_CRATE, SYM_STD, SYM_SUPER,
-    access_error, binding, binding_kind, binding_value, lookup_name, note_c_use, path_module,
+    access_error, binding, binding_kind, binding_value, lookup_item, lookup_name, note_c_use,
+    path_module,
 };
 use crate::front::traits::{bounded_param, require_in_bounds};
 use crate::front::types::{
-    ENUMS, FNS, STRUCTS, SYM_FN, SYM_PRIMITIVE, TLISTS, TSCRATCH, TYPES, TyKind, VARIANTS, buf_type,
-    enum_type, err_type, find_field, find_method, find_variant, fn_param, is_compound, is_ffi_safe,
-    is_fn_type, is_pointer, is_vector, item_node_of, ptr_to, type_elem, variant_field,
+    ENUMS, FNS, METHODS, METHOD_COUNT, STRUCTS, SYM_FN, SYM_PRIMITIVE, TLISTS, TSCRATCH, TYPES,
+    TyKind, VARIANTS, buf_type, enum_type, enum_variant, err_type, find_field, find_method,
+    find_variant, fn_param, is_compound, is_ffi_safe, is_fn_type, is_pointer, is_vector,
+    item_node_of, ptr_to, type_elem, variant_field,
 };
 use crate::tools::query::{qnote, qnote_module};
 
@@ -73,7 +80,7 @@ pub fn synth_call(n: i64) -> i64 {
         if NODES[callee].kind == Ident && (NODES[callee].p & NODE_RESOLVED) == 0
             && lookup_local(NODES[callee].a).is_none() {
             let name = NODES[callee].a;
-            let b = lookup_name(CUR_MOD, name, CUR_MOD);
+            let b = lookup_item(CUR_MOD, name, CUR_MOD);
             note_c_use(NODES[callee].start, name, b);
             if binding_kind(b) == B_VARIANT {
                 // `V(a, b)` for a variant brought into scope by `use`.
@@ -101,6 +108,7 @@ pub fn synth_call(n: i64) -> i64 {
             && SYM_FN[NODES[callee].a] != 0 {
             return call_function(n, SYM_FN[NODES[callee].a] - 1, NODES[callee].g);
         }
+        CALLEE_POS = NODES[callee].start;
         let callee_ty = synth_expr(callee);
         if closure_of_type(callee_ty) != 0 {
             return closure_call(n, callee_ty);
@@ -285,6 +293,7 @@ fn path_target(n: i64) -> i64 {
                     err_sym(MODULES[target].key);
                 }
                 err_str(c"'");
+                help_near_item(target, member);
                 err_end();
             }
             NODES[n].kind = Ident;
@@ -444,6 +453,77 @@ fn method_of(t: i64, name: i64) -> i64 {
     }
 }
 
+// Offers near the names of type t's methods (with `self`; with
+// associated functions too unless methods_only), of its impl blocks and of
+// its template's (0.14: an unknown method's `did you mean`).
+pub fn offer_methods(near: *Near, t: i64, methods_only: bool) {
+    unsafe {
+        for i in 0..METHOD_COUNT {
+            if METHODS[i].ty == t && (!methods_only || is_method(METHODS[i].f)) {
+                near.offer(METHODS[i].name);
+            }
+        }
+        let kind = TYPES[t].kind;
+        let mut tpl = 0;
+        if kind == TyKind::Struct && STRUCTS[TYPES[t].a].tmpl != 0 {
+            tpl = STRUCTS[TYPES[t].a].tmpl;
+        } else if kind == TyKind::Enum && ENUMS[TYPES[t].a].tmpl != 0 {
+            tpl = -ENUMS[TYPES[t].a].tmpl;
+        }
+        if tpl != 0 {
+            offer_template_methods(near, tpl, methods_only);
+        }
+    }
+}
+
+// The same for the methods of template tpl (as find_generic_method).
+pub fn offer_template_methods(near: *Near, tpl: i64, methods_only: bool) {
+    unsafe {
+        for i in 0..GMETHOD_COUNT {
+            if GMETHODS[i].ty == tpl && (!methods_only || is_method(GMETHODS[i].f)) {
+                near.offer(GMETHODS[i].name);
+            }
+        }
+    }
+}
+
+// The help of an unknown method a Rust programmer calls on a slice, an
+// array or a Vec (0.14): what tachyon writes instead.
+fn rust_method_help(t: i64, name: i64) {
+    unsafe {
+        let text = SYMS[name].text;
+        let kind = TYPES[t].kind;
+        let seq = kind == TyKind::Slice || kind == TyKind::Array;
+        // (0.14 has `iter`: only the names it lacks)
+        let iter = text == "into_iter" || text == "chars" || text == "bytes";
+        if seq && text == "len" {
+            err_help(if kind == TyKind::Slice { c"`len` is a field of slices: `s.len`" }
+                else { c"an array's length is its slice's field: `a[..].len`" });
+        } else if (seq || is_std_vec(t)) && text == "iter_mut" {
+            err_help(c"no `iter_mut`: change elements by index, `s[i] = x` (a Vec: `v.set(i, x)`)");
+        } else if seq && iter {
+            err_help(c"`s.iter()`, or `for x in s`, goes over a slice's elements (a [u8]'s bytes)");
+        } else if seq && (text == "to_string" || text == "to_owned" || text == "to_vec"
+            || text == "clone" || text == "as_str" || text == "as_bytes") {
+            err_help(c"a string is a `[u8]` already; to copy it, push it into a `std::Buf` (`b.push_str(s)`)");
+        } else if iter && is_std_vec(t) {
+            err_help(c"`v.iter()`, or `for x in v`, goes over a Vec's elements");
+        }
+    }
+}
+
+// Whether t is a `Vec<T>` (std's), or a pointer to one.
+pub fn is_std_vec(t: i64) -> bool {
+    unsafe {
+        let mut s = t;
+        if TYPES[s].kind == TyKind::Ptr {
+            s = TYPES[s].a;
+        }
+        TYPES[s].kind == TyKind::Struct && STRUCTS[TYPES[s].a].tmpl != 0
+            && SYMS[template_name(STRUCTS[TYPES[s].a].tmpl)].text == "Vec"
+    }
+}
+
 fn path_member_error(n: i64, t: i64, member: i64) -> ! {
     unsafe {
         err_begin(NODES[n].start);
@@ -457,6 +537,15 @@ fn path_member_error(n: i64, t: i64, member: i64) -> ! {
         err_str(c"' in '");
         err_type(t);
         err_str(c"'");
+        let mut near = near_to(member);
+        if TYPES[t].kind == TyKind::Enum {
+            let e = TYPES[t].a;
+            for i in 0..ENUMS[e].variant_count {
+                near.offer(VARIANTS[enum_variant(e, i)].name);
+            }
+        }
+        offer_methods(&near, t, false);
+        near.help();
         err_end()
     }
 }
@@ -517,6 +606,9 @@ fn synth_path_call(n: i64, callee: i64) -> i64 {
                     err_str(c"' in '");
                     err_sym(template_name(tpl));
                     err_str(c"'");
+                    let mut near = near_to(member);
+                    offer_template_methods(&near, tpl, false);
+                    near.help();
                     err_end();
                 }
                 // `Vec::new()`: the type's arguments are inferred too.
@@ -631,6 +723,10 @@ pub fn synth_method(n: i64) -> i64 {
             if TYPES[t].kind == TyKind::Struct && find_field(TYPES[t].a, name) >= 0 {
                 err_help(c"to call a function stored in a field, write (s.f)(x)");
             }
+            rust_method_help(t, name);
+            let mut near = near_to(name);
+            offer_methods(&near, t, true);
+            near.help();
             err_end();
         }
         if !is_method(f) {
