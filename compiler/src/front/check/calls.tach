@@ -16,8 +16,12 @@ use crate::front::check::{
 };
 use crate::front::check::assign::is_place;
 use crate::front::check::check_mode::check_expr;
-use crate::front::check::collect::{find_generic_method, template_variant_named};
-use crate::front::check::names::{NODE_RESOLVED, fn_value_type, unknown_name_error};
+use crate::front::check::collect::{
+    GMETHODS, GMETHOD_COUNT, find_generic_method, template_variant_named,
+};
+use crate::front::check::names::{
+    NODE_RESOLVED, Near, fn_value_type, help_near_item, near_to, unknown_name_error,
+};
 use crate::front::check::resolve::{resolve_key, resolve_named};
 use crate::front::check::synth_mode::synth_expr;
 use crate::front::check::unsafety::{
@@ -39,9 +43,10 @@ use crate::front::modules::lookup::{
 };
 use crate::front::traits::{bounded_param, require_in_bounds};
 use crate::front::types::{
-    ENUMS, FNS, STRUCTS, SYM_FN, SYM_PRIMITIVE, TLISTS, TSCRATCH, TYPES, TyKind, VARIANTS, buf_type,
-    enum_type, err_type, find_field, find_method, find_variant, fn_param, is_compound, is_ffi_safe,
-    is_fn_type, is_pointer, is_vector, item_node_of, ptr_to, type_elem, variant_field,
+    ENUMS, FNS, METHODS, METHOD_COUNT, STRUCTS, SYM_FN, SYM_PRIMITIVE, TLISTS, TSCRATCH, TYPES,
+    TyKind, VARIANTS, buf_type, enum_type, enum_variant, err_type, find_field, find_method,
+    find_variant, fn_param, is_compound, is_ffi_safe, is_fn_type, is_pointer, is_vector,
+    item_node_of, ptr_to, type_elem, variant_field,
 };
 use crate::tools::query::{qnote, qnote_module};
 
@@ -279,6 +284,7 @@ fn path_target(n: i64) -> i64 {
                     err_sym(MODULES[target].key);
                 }
                 err_str(c"'");
+                help_near_item(target, member);
                 err_end();
             }
             NODES[n].kind = Ident;
@@ -433,6 +439,40 @@ fn method_of(t: i64, name: i64) -> i64 {
     }
 }
 
+// Offers near the names of type t's methods (with `self`; with
+// associated functions too unless methods_only), of its impl blocks and of
+// its template's (0.14: an unknown method's `did you mean`).
+pub fn offer_methods(near: *Near, t: i64, methods_only: bool) {
+    unsafe {
+        for i in 0..METHOD_COUNT {
+            if METHODS[i].ty == t && (!methods_only || is_method(METHODS[i].f)) {
+                near.offer(METHODS[i].name);
+            }
+        }
+        let kind = TYPES[t].kind;
+        let mut tpl = 0;
+        if kind == TyKind::Struct && STRUCTS[TYPES[t].a].tmpl != 0 {
+            tpl = STRUCTS[TYPES[t].a].tmpl;
+        } else if kind == TyKind::Enum && ENUMS[TYPES[t].a].tmpl != 0 {
+            tpl = -ENUMS[TYPES[t].a].tmpl;
+        }
+        if tpl != 0 {
+            offer_template_methods(near, tpl, methods_only);
+        }
+    }
+}
+
+// The same for the methods of template tpl (as find_generic_method).
+pub fn offer_template_methods(near: *Near, tpl: i64, methods_only: bool) {
+    unsafe {
+        for i in 0..GMETHOD_COUNT {
+            if GMETHODS[i].ty == tpl && (!methods_only || is_method(GMETHODS[i].f)) {
+                near.offer(GMETHODS[i].name);
+            }
+        }
+    }
+}
+
 fn path_member_error(n: i64, t: i64, member: i64) -> ! {
     unsafe {
         err_begin(NODES[n].start);
@@ -446,6 +486,15 @@ fn path_member_error(n: i64, t: i64, member: i64) -> ! {
         err_str(c"' in '");
         err_type(t);
         err_str(c"'");
+        let mut near = near_to(member);
+        if TYPES[t].kind == TyKind::Enum {
+            let e = TYPES[t].a;
+            for i in 0..ENUMS[e].variant_count {
+                near.offer(VARIANTS[enum_variant(e, i)].name);
+            }
+        }
+        offer_methods(&near, t, false);
+        near.help();
         err_end()
     }
 }
@@ -506,6 +555,9 @@ fn synth_path_call(n: i64, callee: i64) -> i64 {
                     err_str(c"' in '");
                     err_sym(template_name(tpl));
                     err_str(c"'");
+                    let mut near = near_to(member);
+                    offer_template_methods(&near, tpl, false);
+                    near.help();
                     err_end();
                 }
                 // `Vec::new()`: the type's arguments are inferred too.
@@ -620,6 +672,9 @@ pub fn synth_method(n: i64) -> i64 {
             if TYPES[t].kind == TyKind::Struct && find_field(TYPES[t].a, name) >= 0 {
                 err_help(c"to call a function stored in a field, write (s.f)(x)");
             }
+            let mut near = near_to(name);
+            offer_methods(&near, t, true);
+            near.help();
             err_end();
         }
         if !is_method(f) {

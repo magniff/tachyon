@@ -33,7 +33,7 @@ $ edit delete f --dry-run --no-check
 -    x + 1
 -}
 -
-main.tach:6:6: error[type error] undefined variable 'f' | help: did you mean 'K'?
+main.tach:6:6: error[type error] undefined variable 'f'
 warning edit.breaks: 1 new error (dry run)
 [exit 1]
 ## A comment after the item on its line is the item's.
@@ -43,6 +43,6 @@ $ edit delete K --dry-run
 @@ -9,2 +8,0 @@
 -const K: i64 = 3; // trailing
 -
-main.tach:10:8: error[type error] undefined variable 'K' | help: did you mean 'f'?
+main.tach:10:8: error[type error] undefined variable 'K'
 warning edit.breaks: 1 new error (dry run)
 [exit 1]

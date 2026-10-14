@@ -3,7 +3,7 @@
 // share, and the unknown-name error with its suggestions (a near name in
 // scope, or the `use` that would bring it).
 
-use crate::base::{SYMS, SYM_COUNT, buf_bytes, buf_new, buf_slice, buf_str, intern};
+use crate::base::{BUFS, SYMS, SYM_COUNT, buf_bytes, buf_new, buf_slice, buf_str, intern};
 use crate::base::diag::{
     ERR_HELP, edit_distance, err_begin, err_end, err_failed_name, err_help, err_help_sym, err_str,
     err_sym,
@@ -254,46 +254,153 @@ fn name_in_scope(name: i64, value: bool) -> bool {
     }
 }
 
-// The name in scope nearest to `name` (edit distance, at most a third of
-// its length), or -1.
+// The name in scope nearest to `name` (see name_distance), or -1.
 fn nearest_name(name: i64, value: bool) -> i64 {
     unsafe {
-        let want = SYMS[name].text;
-        let mut limit = want.len / 3;
-        if limit < 1 {
-            limit = 1;
-        }
-        let mut best = -1;
-        let mut best_d = limit + 1;
+        let mut near = near_to(name);
         for s in 0..SYM_COUNT {
-            let t = SYMS[s].text;
-            if s == name || t.len == 0 || t.len > want.len + limit || t.len + limit < want.len {
-                continue;
+            if near.close(s) && name_in_scope(s, value) {
+                near.take(s);
             }
-            let c = t[0];
-            if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_') {
-                continue;
-            }
-            let mut ident = true;
-            for i in 0..t.len {
-                let x = t[i];
-                if !((x >= 'a' && x <= 'z') || (x >= 'A' && x <= 'Z') || (x >= '0' && x <= '9')
-                    || x == '_') {
-                    ident = false;
-                    break;
+        }
+        near.best
+    }
+}
+
+// The help of an unknown item `name` of module m: the nearest name the
+// current module can use there (an item, a module, a variant).
+pub fn help_near_item(m: i64, name: i64) {
+    unsafe {
+        let mut near = near_to(name);
+        for s in 0..SYM_COUNT {
+            if near.close(s) {
+                let kind = binding_kind(lookup_quiet(m, s, CUR_MOD));
+                if kind == B_ITEM || kind == B_MODULE || kind == B_VARIANT || kind == B_TVARIANT {
+                    near.take(s);
                 }
             }
-            if !ident {
-                continue;
+        }
+        near.help();
+    }
+}
+
+// ---- Near names (0.14) ----
+//
+// The help of an unknown method, field, item or name: the closest known
+// one, by name_distance, only computed once the error is made.
+
+const NEAR_NONE: i64 = 1000000;
+
+// The best candidate so far for an unknown name `want`, at distance d.
+pub struct Near { pub want: i64, pub best: i64, pub d: i64 }
+
+// No candidate yet for unknown name `want`.
+pub fn near_to(want: i64) -> Near {
+    Near { want: want, best: -1, d: NEAR_NONE }
+}
+
+impl Near {
+    // Whether candidate `cand` (a symbol) is closer than the best so far.
+    pub fn close(self: *Near, cand: i64) -> bool {
+        unsafe {
+            if cand < 0 || cand == self.want {
+                return false;
             }
-            let d = edit_distance(want, t);
-            if d < best_d && name_in_scope(s, value) {
-                best = s;
-                best_d = d;
+            let d = name_distance(SYMS[self.want].text, SYMS[cand].text);
+            d >= 0 && d < self.d
+        }
+    }
+
+    pub fn take(self: *Near, cand: i64) {
+        unsafe {
+            self.d = name_distance(SYMS[self.want].text, SYMS[cand].text);
+            self.best = cand;
+        }
+    }
+
+    // Offers candidate `cand`.
+    pub fn offer(self: *Near, cand: i64) {
+        if self.close(cand) {
+            self.take(cand);
+        }
+    }
+
+    // The error's help, `did you mean 'x'?`, when there is a candidate and
+    // no other help.
+    pub fn help(self: *Near) {
+        unsafe {
+            if self.best >= 0 && BUFS[ERR_HELP].len == 0 {
+                err_help(c"did you mean '");
+                err_help_sym(self.best);
+                err_help(c"'?");
             }
         }
-        best
     }
+}
+
+// How far candidate name `cand` is from `want`, or -1 when it is not close:
+// 0 when they differ only in case and underscores (`pushStr`, `push_str`),
+// else their edit distance, at most a third of want's length (at least 1)
+// and less than either length (`y` is not near `f`). Only identifiers count.
+pub fn name_distance(want: [u8], cand: [u8]) -> i64 {
+    if cand.len == 0 || !is_ident_text(cand) {
+        return -1;
+    }
+    if loosely_equal(want, cand) {
+        return 0;
+    }
+    let mut limit = want.len / 3;
+    if limit < 1 {
+        limit = 1;
+    }
+    if cand.len > want.len + limit || cand.len + limit < want.len {
+        return -1;
+    }
+    let d = edit_distance(want, cand);
+    if d > limit || d >= want.len || d >= cand.len {
+        return -1;
+    }
+    d
+}
+
+fn is_ident_text(t: [u8]) -> bool {
+    let c = t[0];
+    if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_') {
+        return false;
+    }
+    for x in t {
+        if !((x >= 'a' && x <= 'z') || (x >= 'A' && x <= 'Z') || (x >= '0' && x <= '9')
+            || x == '_') {
+            return false;
+        }
+    }
+    true
+}
+
+// Whether a and b are the same name but for case and underscores.
+fn loosely_equal(a: [u8], b: [u8]) -> bool {
+    let mut i = 0;
+    let mut j = 0;
+    loop {
+        while i < a.len && a[i] == '_' {
+            i += 1;
+        }
+        while j < b.len && b[j] == '_' {
+            j += 1;
+        }
+        if i == a.len || j == b.len {
+            return i == a.len && j == b.len;
+        }
+        if lower(a[i]) != lower(b[j]) {
+            return false;
+        }
+        i += 1;
+        j += 1;
+    }
+}
+
+fn lower(c: u8) -> u8 {
+    if c >= 'A' && c <= 'Z' { c + 32 } else { c }
 }
 
 // The path of the module (`crate::a::b`, `std`) whose public item `name`
