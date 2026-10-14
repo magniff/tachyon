@@ -1182,3 +1182,48 @@ the same way, gathering dx and dy (which the distance also uses). Two
 pointers the analysis cannot tell apart are left alone (`q.a = q.a +
 r.a` ... may be one struct). Tested by `tests/run/opt_slp.tach`.
 `--no-slp` turns it off.
+
+**The gaps against clang -O2** on the new benchmarks, and what was done
+about the cheap and general ones:
+
+- *Branches on `&&`* (isel.tach). `a && b` leaves a block with a phi of
+  a's value and b's and a branch on it; the predecessor that branched on
+  a kept a materialized bool, tested twice (`cset`, `cbz`, and `cbz`
+  again), as only predecessors ending in a jump were threaded. Now one
+  that branched on the phi's value for it goes straight to the phi's
+  false (or true) way. bench/sort's heapsort (`child + 1 < end &&
+  s[child] < s[child + 1]`) is about 30% faster, a `csel` where clang
+  has one.
+- *Equalities from branches* (gvn.tach). Below the edge where `x == y`
+  holds (the true way of `==`, the false way of `!=`, into a block with no
+  other predecessor), uses of y take x in the blocks the edge dominates:
+  a constant when one side is one, else the older value; `conv(a) ==
+  conv(b)` of one width gives `a == b`. Integers only (0.0 == -0.0).
+  After `if a.len != b.len { return false; }` an index below a.len is
+  below b.len, so the range analysis drops the check of b[i] in std's
+  slice equality, which bench/wordcount's map runs for every word (about
+  8%); `tests/run/opt_equality.tach`.
+
+What remains, measured:
+
+- *Bounds checks* that need facts the ranges do not carry: sort's
+  `s[root]` (root is the previous iteration's child, checked then, but a
+  phi has no range) and `s[child]` after the `&&` (checked on one way
+  only). C has no checks; this is the safety tachyon keeps.
+- *Division by a constant* is `udiv`/`sdiv` (7 to 9 cycles on Apple
+  silicon) where clang multiplies by a magic number with `umulh`, which
+  neither back end nor encoder has yet (wordcount's `% 26` and `/ 26`,
+  json's and sort's random numbers, `Buf.push_int`). With only 64-bit
+  multiplication it could be done for dividends below 2^31, but the
+  hottest ones here are loop phis, which have no range.
+- *FMA*: clang contracts `a * b + c` by default (nbody: 27 ms against 29
+  with `-ffp-contract=off`); tachyon never does, as that changes results.
+- *Floats compared for a branch* are `fcmp`, `cset`, `cbnz` on AArch64
+  rather than `fcmp`, `b.cond` (`is_fused_compare` excludes floats).
+  Fusing them (with the unordered-aware negated conditions `pl`, `hi`,
+  `le`, `lt`) was tried and measured: no difference on mandelbrot or
+  nbody, so it was left out.
+- mandelbrot is within 6% and json, binarytrees and fannkuch are level
+  with clang or ahead; the rest of wordcount's gap is its hashing and
+  probing loops, which inlining everything (with a profile) does not
+  change.

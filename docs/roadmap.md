@@ -490,7 +490,9 @@ The last release of the build-out.
   frame, checks proved before the loop; optimizer.md, 0.11)
 - SLP vectorizer: done (stores to the lanes of a vector, packed bottom-up;
   last in the pipeline; optimizer.md, 0.11)
-- the gaps against clang on the new benchmarks: to do
+- the gaps against clang on the new benchmarks: branches on `&&` threaded
+  from the predecessor that branched (isel), equalities from branches
+  (GVN); what remains in optimizer.md, 0.11
 
 ## Toward 1.0
 
