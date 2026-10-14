@@ -1,0 +1,365 @@
+// Parses a query's tokens into a Query; conditions are nodes in an arena.
+
+use crate::lexer::{Kw, Tok, Token};
+use std::Buf;
+
+pub enum AggKind {
+    CountStar,
+    Count,
+    Sum,
+    Min,
+    Max,
+}
+
+pub enum Item {
+    Star,
+    Col([u8]),
+    // The column; empty for COUNT(*).
+    Agg(AggKind, [u8]),
+}
+
+pub enum Operand {
+    Name([u8]),
+    Int(i64),
+    Str([u8]),
+}
+
+pub enum CmpOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+// A condition node; children are indices in Query.nodes, always smaller
+// than the node's own index (a leaf comes before the leaves to its right).
+pub enum Node {
+    Or(i64, i64),
+    And(i64, i64),
+    Not(i64),
+    // true for IS NOT NULL
+    IsNull(Operand, bool),
+    Cmp(Operand, CmpOp, Operand),
+}
+
+pub struct OrderItem {
+    pub item: Item,
+    pub desc: bool,
+}
+
+pub struct Query {
+    pub items: Vec<Item>,
+    pub table: [u8],
+    pub nodes: Vec<Node>,
+    pub cond: Option<i64>,
+    pub group: Option<[u8]>,
+    pub order: Vec<OrderItem>,
+    pub limit: Option<i64>,
+}
+
+impl Query {
+    pub fn free(self: *Query) {
+        self.items.free();
+        self.nodes.free();
+        self.order.free();
+    }
+}
+
+struct Parser {
+    toks: [Token],
+    pos: i64,
+    nodes: Vec<Node>,
+}
+
+fn error_at(t: Token) -> [u8] {
+    if t.tok == Tok::End {
+        return "syntax error: unexpected end of query";
+    }
+    let mut m = Buf::new();
+    m.push_str("syntax error: unexpected ");
+    m.push_str(t.text);
+    m.as_slice()
+}
+
+impl Parser {
+    fn peek(self: *Parser) -> Tok {
+        self.toks[self.pos].tok
+    }
+
+    fn fail(self: *Parser) -> [u8] {
+        error_at(self.toks[self.pos])
+    }
+
+    fn is_kw(self: *Parser, k: Kw) -> bool {
+        self.peek() == Tok::Kw(k)
+    }
+
+    // Skips the next token if it is `t`; false if it is not.
+    fn accept(self: *Parser, t: Tok) -> bool {
+        if self.peek() == t {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn name(self: *Parser) -> Result<[u8], [u8]> {
+        if self.peek() == Tok::Name {
+            let text = self.toks[self.pos].text;
+            self.pos += 1;
+            Ok(text)
+        } else {
+            Err(self.fail())
+        }
+    }
+
+    // NAME or an aggregate.
+    fn item(self: *Parser) -> Result<Item, [u8]> {
+        let kind = match self.peek() {
+            Tok::Name => {
+                return match self.name() {
+                    Ok(n) => Ok(Item::Col(n)),
+                    Err(e) => Err(e),
+                };
+            }
+            Tok::Kw(Kw::Count) => AggKind::Count,
+            Tok::Kw(Kw::Sum) => AggKind::Sum,
+            Tok::Kw(Kw::Min) => AggKind::Min,
+            Tok::Kw(Kw::Max) => AggKind::Max,
+            _ => return Err(self.fail()),
+        };
+        self.pos += 1;
+        if !self.accept(Tok::LParen) {
+            return Err(self.fail());
+        }
+        if kind == AggKind::Count && self.peek() == Tok::Star {
+            self.pos += 1;
+            if !self.accept(Tok::RParen) {
+                return Err(self.fail());
+            }
+            return Ok(Item::Agg(AggKind::CountStar, ""));
+        }
+        let col = match self.name() {
+            Ok(n) => n,
+            Err(e) => return Err(e),
+        };
+        if !self.accept(Tok::RParen) {
+            return Err(self.fail());
+        }
+        Ok(Item::Agg(kind, col))
+    }
+
+    fn operand(self: *Parser) -> Result<Operand, [u8]> {
+        let op = match self.peek() {
+            Tok::Name => Operand::Name(self.toks[self.pos].text),
+            Tok::Int(v) => Operand::Int(v),
+            Tok::Str => Operand::Str(self.toks[self.pos].value),
+            _ => return Err(self.fail()),
+        };
+        self.pos += 1;
+        Ok(op)
+    }
+
+    fn push(self: *Parser, n: Node) -> i64 {
+        self.nodes.push(n);
+        self.nodes.len() - 1
+    }
+
+    fn or(self: *Parser) -> Result<i64, [u8]> {
+        let mut left = match self.and() {
+            Ok(i) => i,
+            Err(e) => return Err(e),
+        };
+        while self.is_kw(Kw::Or) {
+            self.pos += 1;
+            let right = match self.and() {
+                Ok(i) => i,
+                Err(e) => return Err(e),
+            };
+            left = self.push(Node::Or(left, right));
+        }
+        Ok(left)
+    }
+
+    fn and(self: *Parser) -> Result<i64, [u8]> {
+        let mut left = match self.not() {
+            Ok(i) => i,
+            Err(e) => return Err(e),
+        };
+        while self.is_kw(Kw::And) {
+            self.pos += 1;
+            let right = match self.not() {
+                Ok(i) => i,
+                Err(e) => return Err(e),
+            };
+            left = self.push(Node::And(left, right));
+        }
+        Ok(left)
+    }
+
+    fn not(self: *Parser) -> Result<i64, [u8]> {
+        if self.is_kw(Kw::Not) {
+            self.pos += 1;
+            let inner = match self.not() {
+                Ok(i) => i,
+                Err(e) => return Err(e),
+            };
+            return Ok(self.push(Node::Not(inner)));
+        }
+        self.atom()
+    }
+
+    fn atom(self: *Parser) -> Result<i64, [u8]> {
+        if self.peek() == Tok::LParen {
+            self.pos += 1;
+            let inner = match self.or() {
+                Ok(i) => i,
+                Err(e) => return Err(e),
+            };
+            if !self.accept(Tok::RParen) {
+                return Err(self.fail());
+            }
+            return Ok(inner);
+        }
+        let left = match self.operand() {
+            Ok(o) => o,
+            Err(e) => return Err(e),
+        };
+        if self.is_kw(Kw::Is) {
+            self.pos += 1;
+            let mut negated = false;
+            if self.is_kw(Kw::Not) {
+                self.pos += 1;
+                negated = true;
+            }
+            if !self.accept(Tok::Kw(Kw::Null)) {
+                return Err(self.fail());
+            }
+            return Ok(self.push(Node::IsNull(left, negated)));
+        }
+        let op = match self.peek() {
+            Tok::Eq => CmpOp::Eq,
+            Tok::Ne => CmpOp::Ne,
+            Tok::Lt => CmpOp::Lt,
+            Tok::Le => CmpOp::Le,
+            Tok::Gt => CmpOp::Gt,
+            Tok::Ge => CmpOp::Ge,
+            _ => return Err(self.fail()),
+        };
+        self.pos += 1;
+        let right = match self.operand() {
+            Ok(o) => o,
+            Err(e) => return Err(e),
+        };
+        Ok(self.push(Node::Cmp(left, op, right)))
+    }
+
+    fn query(self: *Parser, q: *Query) -> Result<bool, [u8]> {
+        if !self.accept(Tok::Kw(Kw::Select)) {
+            return Err(self.fail());
+        }
+        if self.peek() == Tok::Star {
+            self.pos += 1;
+            q.items.push(Item::Star);
+        } else {
+            loop {
+                match self.item() {
+                    Ok(it) => q.items.push(it),
+                    Err(e) => return Err(e),
+                }
+                if !self.accept(Tok::Comma) {
+                    break;
+                }
+            }
+        }
+        if !self.accept(Tok::Kw(Kw::From)) {
+            return Err(self.fail());
+        }
+        q.table = match self.name() {
+            Ok(n) => n,
+            Err(e) => return Err(e),
+        };
+        if self.is_kw(Kw::Where) {
+            self.pos += 1;
+            match self.or() {
+                Ok(c) => q.cond = Some(c),
+                Err(e) => return Err(e),
+            }
+        }
+        if self.is_kw(Kw::Group) {
+            self.pos += 1;
+            if !self.accept(Tok::Kw(Kw::By)) {
+                return Err(self.fail());
+            }
+            match self.name() {
+                Ok(n) => q.group = Some(n),
+                Err(e) => return Err(e),
+            }
+        }
+        if self.is_kw(Kw::Order) {
+            self.pos += 1;
+            if !self.accept(Tok::Kw(Kw::By)) {
+                return Err(self.fail());
+            }
+            loop {
+                let item = match self.item() {
+                    Ok(it) => it,
+                    Err(e) => return Err(e),
+                };
+                let mut desc = false;
+                if self.is_kw(Kw::Asc) {
+                    self.pos += 1;
+                } else if self.is_kw(Kw::Desc) {
+                    self.pos += 1;
+                    desc = true;
+                }
+                q.order.push(OrderItem { item: item, desc: desc });
+                if !self.accept(Tok::Comma) {
+                    break;
+                }
+            }
+        }
+        if self.is_kw(Kw::Limit) {
+            self.pos += 1;
+            match self.peek() {
+                Tok::Int(v) if v >= 0 && self.toks[self.pos].text[0] != '-' => {
+                    q.limit = Some(v);
+                    self.pos += 1;
+                }
+                _ => return Err(self.fail()),
+            }
+        }
+        if self.peek() != Tok::End {
+            return Err(self.fail());
+        }
+        Ok(true)
+    }
+}
+
+// The query, or an error message. The caller frees the query.
+pub fn parse(toks: [Token]) -> Result<Query, [u8]> {
+    let mut p = Parser { toks: toks, pos: 0, nodes: Vec::new() };
+    let mut q = Query {
+        items: Vec::new(),
+        table: "",
+        nodes: Vec::new(),
+        cond: None,
+        group: None,
+        order: Vec::new(),
+        limit: None,
+    };
+    match p.query(&q) {
+        Ok(_) => {
+            q.nodes = p.nodes;
+            Ok(q)
+        }
+        Err(e) => {
+            p.nodes.free();
+            q.free();
+            Err(e)
+        }
+    }
+}

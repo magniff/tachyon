@@ -1,0 +1,271 @@
+// Runs a checked query: filters the rows, groups and aggregates them,
+// orders, limits and prints the result.
+
+use crate::check::{Arg, Cond, Expr, Plan};
+use crate::parser::{AggKind, CmpOp};
+use crate::sort::sorted_order;
+use crate::table::{Table, Value, compare, is_null};
+use std::{Buf, HashMap};
+
+fn arg_value(t: *Table, row: i64, a: Arg) -> Value {
+    match a {
+        Arg::Col(c) => t.cell(row, c),
+        Arg::Lit(v) => v,
+    }
+}
+
+// Whether condition node i holds for the row.
+fn holds(p: *Plan, t: *Table, i: i64, row: i64) -> bool {
+    match p.conds.get(i) {
+        Cond::Or(a, b) => holds(p, t, a, row) || holds(p, t, b, row),
+        Cond::And(a, b) => holds(p, t, a, row) && holds(p, t, b, row),
+        Cond::Not(a) => !holds(p, t, a, row),
+        Cond::IsNull(a, negated) => is_null(arg_value(t, row, a)) != negated,
+        Cond::Cmp(a, op, b) => {
+            let x = arg_value(t, row, a);
+            let y = arg_value(t, row, b);
+            if is_null(x) || is_null(y) {
+                return false;
+            }
+            let c = compare(x, y);
+            match op {
+                CmpOp::Eq => c == 0,
+                CmpOp::Ne => c != 0,
+                CmpOp::Lt => c < 0,
+                CmpOp::Le => c <= 0,
+                CmpOp::Gt => c > 0,
+                CmpOp::Ge => c >= 0,
+            }
+        }
+    }
+}
+
+pub struct Groups {
+    // The first row of each group, in order of first appearance.
+    pub first: Vec<i64>,
+    // The group of each kept row.
+    pub group_of: Vec<i64>,
+}
+
+fn make_groups(p: *Plan, t: *Table, rows: [i64]) -> Groups {
+    let mut gs = Groups { first: Vec::new(), group_of: Vec::new() };
+    let g = match p.group {
+        Some(g) => g,
+        None => {
+            // one group of every kept row, even when there are none
+            gs.first.push(0);
+            for _ in rows {
+                gs.group_of.push(0);
+            }
+            return gs;
+        }
+    };
+    let mut ints: HashMap<i64, i64> = HashMap::new();
+    defer ints.free();
+    let mut strs: HashMap<[u8], i64> = HashMap::new();
+    defer strs.free();
+    let mut null_group: Option<i64> = None;
+    for r in rows {
+        let next = gs.first.len();
+        let found = match t.cell(r, g) {
+            Value::Null => match null_group {
+                Some(k) => Some(k),
+                None => {
+                    null_group = Some(next);
+                    None
+                }
+            },
+            Value::Int(v) => match ints.get(v) {
+                Some(k) => Some(k),
+                None => {
+                    ints.insert(v, next);
+                    None
+                }
+            },
+            Value::Str(s) => match strs.get(s) {
+                Some(k) => Some(k),
+                None => {
+                    strs.insert(s, next);
+                    None
+                }
+            },
+        };
+        match found {
+            Some(k) => gs.group_of.push(k),
+            None => {
+                gs.first.push(r);
+                gs.group_of.push(next);
+            }
+        }
+    }
+    gs
+}
+
+// The aggregates of every group: group k's are at [k * naggs ..]. The
+// caller frees the result.
+fn aggregate(p: *Plan, t: *Table, rows: [i64], gs: *Groups) -> Vec<Value> {
+    let naggs = p.aggs.len();
+    let mut vals: Vec<Value> = Vec::new();
+    for _ in 0..gs.first.len() {
+        for a in p.aggs.as_slice() {
+            vals.push(match a.kind {
+                AggKind::CountStar | AggKind::Count => Value::Int(0),
+                _ => Value::Null,
+            });
+        }
+    }
+    let vs = vals.as_slice();
+    for k in 0..rows.len {
+        let base = gs.group_of.get(k) * naggs;
+        for j in 0..naggs {
+            let a = p.aggs.get(j);
+            if a.kind == AggKind::CountStar {
+                if let Value::Int(n) = vs[base + j] {
+                    vs[base + j] = Value::Int(n + 1);
+                }
+                continue;
+            }
+            let v = t.cell(rows[k], a.col);
+            if is_null(v) {
+                continue;
+            }
+            let old = vs[base + j];
+            let new: Option<Value> = match a.kind {
+                AggKind::Count => match old {
+                    Value::Int(n) => Some(Value::Int(n + 1)),
+                    _ => None,
+                },
+                AggKind::Sum => match (old, v) {
+                    (Value::Int(s), Value::Int(x)) => Some(Value::Int(s + x)),
+                    (_, Value::Int(x)) => Some(Value::Int(x)),
+                    _ => None,
+                },
+                AggKind::Min => {
+                    if is_null(old) || compare(v, old) < 0 {
+                        Some(v)
+                    } else {
+                        None
+                    }
+                }
+                AggKind::Max => {
+                    if is_null(old) || compare(v, old) > 0 {
+                        Some(v)
+                    } else {
+                        None
+                    }
+                }
+                AggKind::CountStar => None,
+            };
+            if let Some(n) = new {
+                vs[base + j] = n;
+            }
+        }
+    }
+    vals
+}
+
+fn push_value(out: *Buf, v: Value) {
+    match v {
+        Value::Null => out.push_str("NULL"),
+        Value::Int(n) => out.push_int(n),
+        Value::Str(s) => out.push_str(s),
+    }
+}
+
+// The value of `e` for output row k: a column of `row`, or an aggregate.
+fn expr_value(t: *Table, e: Expr, row: i64, aggs: [Value], base: i64) -> Value {
+    match e {
+        Expr::Col(c) => t.cell(row, c),
+        Expr::Agg(a) => aggs[base + a],
+    }
+}
+
+pub fn run(p: *Plan, t: *Table, out: *Buf) {
+    let mut rows: Vec<i64> = Vec::new();
+    defer rows.free();
+    for r in 0..t.nrows {
+        let keep = match p.cond {
+            Some(c) => holds(p, t, c, r),
+            None => true,
+        };
+        if keep {
+            rows.push(r);
+        }
+    }
+    // Every output row's values, then its keys.
+    let mut vals: Vec<Value> = Vec::new();
+    defer vals.free();
+    let mut keys: Vec<Value> = Vec::new();
+    defer keys.free();
+    let mut n = 0;
+    if !p.grouped {
+        for r in rows.as_slice() {
+            for e in p.select.as_slice() {
+                vals.push(expr_value(t, e, r, [Value::Null][..], 0));
+            }
+            for o in p.order.as_slice() {
+                keys.push(expr_value(t, o.expr, r, [Value::Null][..], 0));
+            }
+        }
+        n = rows.len();
+    } else {
+        let mut gs = make_groups(p, t, rows.as_slice());
+        defer {
+            gs.first.free();
+            gs.group_of.free();
+        }
+        let mut aggs = aggregate(p, t, rows.as_slice(), &gs);
+        defer aggs.free();
+        let naggs = p.aggs.len();
+        n = gs.first.len();
+        for k in 0..n {
+            let first = gs.first.get(k);
+            for e in p.select.as_slice() {
+                vals.push(expr_value(t, e, first, aggs.as_slice(), k * naggs));
+            }
+            for o in p.order.as_slice() {
+                keys.push(expr_value(t, o.expr, first, aggs.as_slice(), k * naggs));
+            }
+        }
+    }
+    let mut desc: Vec<bool> = Vec::new();
+    defer desc.free();
+    for o in p.order.as_slice() {
+        desc.push(o.desc);
+    }
+    let mut order = sorted_order(keys.as_slice(), desc.as_slice(), n);
+    defer order.free();
+    let mut count = n;
+    if let Some(l) = p.limit {
+        if l < count {
+            count = l;
+        }
+    }
+
+    for i in 0..p.headers.len() {
+        if i > 0 {
+            out.push('|');
+        }
+        out.push_str(p.headers.get(i));
+    }
+    out.push('\n');
+    let nsel = p.select.len();
+    let vs = vals.as_slice();
+    for i in 0..count {
+        let r = order.get(i);
+        for j in 0..nsel {
+            if j > 0 {
+                out.push('|');
+            }
+            push_value(out, vs[r * nsel + j]);
+        }
+        out.push('\n');
+    }
+    if count == 1 {
+        out.push_str("(1 row)\n");
+    } else {
+        out.push('(');
+        out.push_int(count);
+        out.push_str(" rows)\n");
+    }
+}

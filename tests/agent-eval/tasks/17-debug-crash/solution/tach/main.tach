@@ -1,0 +1,172 @@
+// An event log aggregator: reads events and settings from stdin, one per
+// line, groups the events by key and prints a report at the end.
+
+mod report;
+mod stats;
+mod table;
+mod text;
+
+import "unistd.h" as c;
+
+use report::write_report;
+use stats::Group;
+use std::Buf;
+use table::Table;
+use text::{parse_int, split_words};
+
+// Everything read so far.
+pub struct State {
+    // The settings in effect (the last SPAN, WIDTH and TOP lines).
+    pub span: i64,
+    pub width: i64,
+    pub top: i64,
+    // The groups in order of their first event, and the table that finds
+    // a key's group.
+    pub groups: Vec<Group>,
+    pub table: Table,
+    // The words of every NOTE line, in order.
+    pub notes: Vec<[u8]>,
+    pub events: i64,
+    pub bad: i64,
+    // The time of the last accepted event (0 before the first).
+    pub now: i64,
+}
+
+impl State {
+    fn new() -> State {
+        State {
+            span: 60,
+            width: 40,
+            top: 0,
+            groups: Vec::new(),
+            table: Table::new(),
+            notes: Vec::new(),
+            events: 0,
+            bad: 0,
+            now: 0,
+        }
+    }
+}
+
+// SPAN n, WIDTH n (n at least 1) and TOP n (n at least 0); false when
+// the line is not a valid setting.
+fn handle_setting(st: *State, words: [[u8]]) -> bool {
+    if words.len != 2 {
+        return false;
+    }
+    let v = match parse_int(words[1]) {
+        Some(v) => v,
+        None => return false,
+    };
+    let name = words[0];
+    if name == "TOP" {
+        if v < 0 {
+            return false;
+        }
+        st.top = v;
+    } else {
+        if v < 1 {
+            return false;
+        }
+        if name == "SPAN" {
+            st.span = v;
+        } else {
+            st.width = v;
+        }
+    }
+    true
+}
+
+// TIME KEY VALUE; false when the line is not a valid event.
+fn handle_event(st: *State, words: [[u8]], line_no: i64) -> bool {
+    if words.len != 3 {
+        return false;
+    }
+    let time = match parse_int(words[0]) {
+        Some(t) => t,
+        None => return false,
+    };
+    let value = match parse_int(words[2]) {
+        Some(v) => v,
+        None => return false,
+    };
+    if time < 0 || time < st.now {
+        return false;
+    }
+    let key = words[1];
+    let g = match st.table.get(key) {
+        Some(g) => g,
+        None => {
+            let g = st.groups.len();
+            st.groups.push(Group::new(key, line_no));
+            st.table.insert(key, g);
+            g
+        }
+    };
+    st.groups.as_slice()[g].add(time, value);
+    st.now = time;
+    st.events += 1;
+    true
+}
+
+fn handle_line(st: *State, line: [u8], line_no: i64) {
+    let mut words = split_words(line);
+    defer words.free();
+    let w = words.as_slice();
+    if w.len == 0 || w[0][0] == '#' {
+        return;
+    }
+    let first = w[0];
+    let ok = if first == "NOTE" {
+        for x in w[1..] {
+            st.notes.push(x);
+        }
+        true
+    } else if first == "SPAN" || first == "WIDTH" || first == "TOP" {
+        handle_setting(st, w)
+    } else {
+        handle_event(st, w, line_no)
+    };
+    if !ok {
+        st.bad += 1;
+    }
+}
+
+// All of stdin.
+fn read_all() -> Buf {
+    let mut b = Buf::new();
+    let mut chunk = [0u8; 65536];
+    loop {
+        let n = unsafe { c::read(0, &chunk[0] as *u8, 65536) } as i64;
+        if n <= 0 {
+            break;
+        }
+        b.push_str(chunk[0..n]);
+    }
+    b
+}
+
+fn main() -> i32 {
+    let mut input = read_all();
+    defer input.free();
+    let text = input.as_slice();
+    let mut st = State::new();
+    let mut start = 0;
+    let mut line_no = 0;
+    for i in 0..text.len + 1 {
+        if i == text.len || text[i] == '\n' {
+            let mut end = i;
+            if end > start && text[end - 1] == '\r' {
+                end -= 1;
+            }
+            line_no += 1;
+            handle_line(&st, text[start..end], line_no);
+            start = i + 1;
+        }
+    }
+    let mut out = Buf::new();
+    defer out.free();
+    write_report(&st, &out);
+    print(out.as_slice());
+    0
+}

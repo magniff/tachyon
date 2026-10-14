@@ -1,0 +1,120 @@
+// The optimizing pass: constant folding and dead-branch elimination. It
+// adds new nodes to the tree and points the program at them; nothing it
+// does changes what the program prints.
+
+use crate::ast::{Ast, BinOp, Expr, Stmt};
+use crate::eval::{apply_binary, apply_unary};
+
+// The value of `e` if it is a number.
+fn literal(ast: &Ast, e: i64) -> Option<i64> {
+    match ast.expr(e) {
+        Expr::Num(v) => Some(v),
+        _ => None,
+    }
+}
+
+// `e` with its foldable parts folded, bottom-up.
+fn fold(ast: &mut Ast, e: i64) -> i64 {
+    match ast.expr(e) {
+        Expr::Num(_) | Expr::Var(_, _) => e,
+        Expr::Unary(op, a, line) => {
+            let a2 = fold(ast, a);
+            match literal(ast, a2) {
+                Some(v) => ast.add_expr(Expr::Num(apply_unary(op, v))),
+                None => ast.add_expr(Expr::Unary(op, a2, line)),
+            }
+        }
+        Expr::Binary(op, a, b, line) => {
+            let a2 = fold(ast, a);
+            let b2 = fold(ast, b);
+            let la = literal(ast, a2);
+            let lb = literal(ast, b2);
+            if op == BinOp::And && la == Some(0) {
+                return ast.add_expr(Expr::Num(0));
+            }
+            if op == BinOp::Or && la.is_some() && la != Some(0) {
+                return ast.add_expr(Expr::Num(1));
+            }
+            if let (Some(x), Some(y)) = (la, lb) {
+                if let Some(v) = apply_binary(op, x, y) {
+                    return ast.add_expr(Expr::Num(v));
+                }
+            }
+            ast.add_expr(Expr::Binary(op, a2, b2, line))
+        }
+    }
+}
+
+// A list of statements, optimized: a new list (first, count).
+fn opt_list(ast: &mut Ast, first: i64, count: i64) -> (i64, i64) {
+    let mut items: Vec<i64> = Vec::new();
+    for k in 0..count {
+        if let Some(s) = opt_stmt(ast, ast.list(first + k)) {
+            items.push(s);
+        }
+    }
+    let f = ast.add_list(&items);
+    (f, items.len() as i64)
+}
+
+// A statement, optimized; None when it is removed.
+fn opt_stmt(ast: &mut Ast, s: i64) -> Option<i64> {
+    let new = match ast.stmt(s) {
+        Stmt::Let(name, e) => Stmt::Let(name, fold(ast, e)),
+        Stmt::Set(name, e, line) => Stmt::Set(name, fold(ast, e), line),
+        Stmt::Print(first, count) => {
+            let mut items: Vec<i64> = Vec::new();
+            for k in 0..count {
+                let e = fold(ast, ast.list(first + k));
+                items.push(e);
+            }
+            let f = ast.add_list(&items);
+            Stmt::Print(f, count)
+        }
+        Stmt::If(cond, first, count, els) => {
+            let c = fold(ast, cond);
+            match literal(ast, c) {
+                Some(v) if v != 0 => {
+                    let (f, n) = opt_list(ast, first, count);
+                    Stmt::Block(f, n)
+                }
+                Some(_) => {
+                    if els < 0 {
+                        return None;
+                    }
+                    return opt_stmt(ast, els);
+                }
+                None => {
+                    let (f, n) = opt_list(ast, first, count);
+                    let mut e2: i64 = -1;
+                    if els >= 0 {
+                        if let Some(x) = opt_stmt(ast, els) {
+                            e2 = x;
+                        }
+                    }
+                    Stmt::If(c, f, n, e2)
+                }
+            }
+        }
+        Stmt::While(cond, first, count) => {
+            let c = fold(ast, cond);
+            if literal(ast, c) == Some(0) {
+                return None;
+            }
+            let (f, n) = opt_list(ast, first, count);
+            Stmt::While(c, f, n)
+        }
+        Stmt::Block(first, count) => {
+            let (f, n) = opt_list(ast, first, count);
+            Stmt::Block(f, n)
+        }
+    };
+    Some(ast.add_stmt(new))
+}
+
+// Optimizes the whole program.
+pub fn optimize(ast: &mut Ast) {
+    let (f, n) = opt_list(ast, ast.top_first, ast.top_count);
+    ast.top_first = f;
+    ast.top_count = n;
+}
