@@ -1,7 +1,7 @@
 # Tachyon grammar
 
 This is the grammar of tachyon 0.4, as the compiler implements it
-(`compiler/src/front/lexer.tach`, `compiler/src/front/parser.tach`; the seed
+(`compiler/src/front/lexer/`, `compiler/src/front/parser/`; the seed
 implements the language of 0.1 in `seed/src/lexer` and `seed/src/parser`).
 What 0.3 added is marked *(0.3)*, what 0.4 added *(0.4)*.
 Items and statements are parsed by recursive descent, expressions by a Pratt
@@ -46,7 +46,7 @@ since 0.14).
 
 **Reserved** (an error if used): the keywords `where dyn` (and `move` until
 0.14, a keyword since), and the
-tokens `?` `@`. `self` and `Self` are
+token `@` (and `?` until 0.15, an operator since). `self` and `Self` are
 ordinary names, with a meaning in methods (see Items).
 
 A token is *joint* when no whitespace follows it.
@@ -645,7 +645,8 @@ The module `std` is built into the compiler, read when a program names it
 `clear`, `free`), `Buf` (a byte buffer: `push`, `push_str`, `push_cstr`,
 `push_int`, `as_slice`), and `print`, `println`, `print_int`, `print_cstr`.
 Failures (`unwrap` of `None`, an index out of bounds) write a message to
-stderr and exit with 101. Its source is `compiler/std/std.tach`; the
+stderr and exit with 101. Its source is `compiler/std/std.tach` (0.15:
+with the files `compiler/std/embed.sh` appends to it); the
 whole API, from that source: `tachyonc guide std`.
 
 0.14 adds reading stdin without `unsafe` (`read_line(&buf)`, a line
@@ -1239,6 +1240,54 @@ does not name std; a private item gets the help
 `make it public: `pub fn f` at FILE:LINE:COL`; Rust habits (`&self`,
 `&str`, `&mut x`, `println!` and the other macros, `?`, `String`,
 `s.len()`, `.chars()`, `.iter_mut()`) get a help naming what tachyon writes.
+
+## Additions of 0.15
+
+(In progress: the syntax below parses; what is not checked yet is
+reported as `... are not implemented yet (check.unimplemented)`. The
+design is [design/errors-formatting.md](design/errors-formatting.md).)
+
+```ebnf
+postfix   += expr "?"                                    (* POSTFIX_BP, like . ( [ *)
+primary   += fstring
+fstring    = 'f"' { text | "{{" | "}}" | "{" expr [ ":" spec ] "}" } '"'
+spec       = [ "<" | ">" ] [ "0" ] [ digits ] [ "." digits ] [ "?" | "x" | "X" | "b" | "c" ]
+arg        = expr | ident ":" expr                       (* named; after all positional *)
+param     += ... [ "=" expr ]                            (* fn items and inherent methods only *)
+field_init = ident ":" expr | ident                      (* shorthand *)
+attr      += "#[" "derive" "(" path { "," path } [","] ")" "]"   (* before struct/enum; with repr *)
+trait      = "trait" ident [ "<" tparam { "," tparam } ">" ] "{" ... "}"
+bound      = path [ "<" ( type | ident "=" type ) { "," ... } ">" ]   (* From<U>, Iterator<Item = T> *)
+```
+
+`?` is a postfix operator (it was reserved). An f-string is lexed as
+pieces: `f"text{` (FHead), the hole's tokens, `}text{` (FMid, with the
+spec of the hole it closes), ..., `}text"` (FTail); a hole ends at its
+`}` or at a `:` outside brackets, so a hole expression with a top-level
+`:` needs parentheses; f-strings do not nest; the text takes the escapes
+of a string literal. A named argument is `name: value` (an argument
+`label: loop { ... }` is a named argument now, no longer a labelled
+loop). `S { x }` is `S { x: x }`.
+
+### Errors and `?`
+
+(To come.)
+
+### Widening and conversions
+
+(To come.)
+
+### Formatting
+
+(To come.)
+
+### Named arguments, defaults, shorthand
+
+(To come.)
+
+### derive
+
+(To come.)
 
 ## Importing C headers
 

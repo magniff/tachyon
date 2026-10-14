@@ -143,6 +143,9 @@ fn parse_impl(public: bool) {
                     else { c"expected 'fn' or '}' in an impl block" });
             }
             let f = parse_function();
+            if trait_name != 0 {
+                no_param_defaults(f, c"a trait's function");
+            }
             NODES[f].p |= flags;
             NODES[f].d = if NODES[self_type].kind == NodeKind::TyName { NODES[self_type].a }
                 else { UNDERSCORE };
@@ -230,16 +233,16 @@ fn take_assoc_types(from: i64, pos: i64) -> i64 {
     }
 }
 
-// `trait Name { fn m(self: *Self) -> T; fn d(self: *Self) { ... } }` (0.9).
+// `trait Name { fn m(self: *Self) -> T; fn d(self: *Self) { ... } }` (0.9;
+// 0.15: `trait Name<T> { ... }`).
 fn parse_trait() -> i64 {
     unsafe {
         let start = cur_start();
         expect(Trait);
         let n = new_node(NodeKind::Trait, start, 0);
         NODES[n].a = expect_binding_name();
-        if at(Lt) {
-            error_at(cur_start(), c"traits cannot have type parameters (yet)");
-        }
+        // (0.15: `trait From<T>`)
+        NODES[n].g = parse_generic_params();
         expect(LBrace);
         let mark = list_begin();
         while !at(RBrace) && !at(Eof) {
@@ -271,6 +274,7 @@ fn parse_trait() -> i64 {
             NODES[f].g = parse_generic_params();
             expect(LParen);
             parse_params(f, false);
+            no_param_defaults(f, c"a trait function");
             expect(RParen);
             NODES[f].b = parse_return_type();
             if !eat(Semi) {
@@ -584,7 +588,7 @@ fn check_fn_attributes(flags: i64, pos: i64) {
 }
 
 // Attributes, then the item: `#[repr(...)]` before a struct, union or
-// enum; `#[inline]`, `#[inline(never)]`, `#[cold]` (0.6) before a function.
+// enum; `#[derive(...)]` (0.15) before a struct or an enum; `#[inline]`, `#[inline(never)]`, `#[cold]` (0.6) before a function.
 // `pub` may come before the attributes or (0.6) after them.
 fn parse_attributed_item(public: bool) -> i64 {
     unsafe {
@@ -595,6 +599,8 @@ fn parse_attributed_item(public: bool) -> i64 {
         let mut pack = 0;
         let mut int_type = 0;
         let at_start = cur_start();
+        let mut derives = 0;
+        let mut derive_mark = 0;
         while at(Hash) {
             let attr_pos = cur_start();
             advance();
@@ -606,9 +612,28 @@ fn parse_attributed_item(public: bool) -> i64 {
                 expect(RBracket);
                 continue;
             }
+            if name == intern_c(c"derive") {
+                // `#[derive(Eq, Ord, ...)]` (0.15): the traits, TyNames in a
+                // holder (several derive attributes add to one)
+                if derives == 0 {
+                    derives = new_node(NodeKind::Generics, attr_pos, 0);
+                    derive_mark = list_begin();
+                }
+                expect(LParen);
+                while !at(RParen) && !at(Eof) {
+                    list_push(parse_type());
+                    if !eat(Comma) {
+                        break;
+                    }
+                }
+                expect(RParen);
+                expect(RBracket);
+                NODES[derives].end = prev_end();
+                continue;
+            }
             if name != intern_c(c"repr") {
                 name_error(TOKS[P - 1].start, c"unknown attribute '", name,
-                    c"' (expected repr, inline, inline(never) or cold)");
+                    c"' (expected repr, derive, inline, inline(never) or cold)");
             }
             repr = true;
             expect(LParen);
@@ -658,6 +683,17 @@ fn parse_attributed_item(public: bool) -> i64 {
             expect(RParen);
             expect(RBracket);
         }
+        if derives != 0 {
+            list_end(derives, derive_mark);
+            if NODES[derives].count == 0 {
+                error_at(NODES[derives].start,
+                    c"expected the traits to derive: '#[derive(Eq, Ord, Hash, Debug, Clone)]'");
+            }
+            if !at(Struct) && !at(Enum)
+                && !(at(Pub) && (tok_kind(1) == Struct || tok_kind(1) == Enum)) {
+                error_at(NODES[derives].start, c"#[derive(...)] goes before a struct or an enum");
+            }
+        }
         let item_public = eat(Pub) || public;
         if fn_flags != 0 {
             if repr {
@@ -682,6 +718,7 @@ fn parse_attributed_item(public: bool) -> i64 {
             error_at(at_start, c"a type cannot be both packed and aligned");
         }
         let item = parse_item();
+        NODES[item].h = derives;
         if NODES[item].kind == NodeKind::Enum {
             if (flags & REPR_PACKED) != 0 || align != 0 {
                 error_at(at_start, c"packed and align(N) are for structs and unions, not enums");
@@ -738,8 +775,30 @@ fn parse_param() -> i64 {
         expect(Colon);
         NODES[n].b = parse_type();
         NODES[n].c = mutable as i64;
+        if eat(Eq) {
+            // A default (0.15): checked by check_param_defaults
+            NODES[n].h = parse_expr();
+        }
         NODES[n].end = prev_end();
         n
+    }
+}
+
+// Function `f` (a Fn or ExternFn) is one whose parameters cannot have
+// defaults (0.15: those of trait functions and extern functions): an
+// error at the first one that has one.
+pub fn no_param_defaults(f: i64, what: *u8) {
+    unsafe {
+        for i in 0..NODES[f].count {
+            let p = child(f, i);
+            if NODES[p].h != 0 {
+                err_begin(NODES[NODES[p].h].start);
+                err_str(c"a default value is for a parameter of a function or an inherent method, not of ");
+                err_str(what);
+                err_help(c"remove the '= value'; the callers pass the argument");
+                err_end();
+            }
+        }
     }
 }
 

@@ -8,7 +8,7 @@ start from what it leaves: the AST, its types, the tables of items.
 
 | module | |
 |---|---|
-| `lexer.tach` | source text to tokens (`TOKS`), as the seed's lexer makes them |
+| `lexer/` | source text to tokens (`TOKS`), as the seed's lexer makes them; string, character and (0.15) f-string literals in `strings` |
 | `cpp/` | `import "h.h" as c;` (1/2): the C preprocessor, with the target C compiler's macros and include path (`cc`, `directives`, `eval`, `expand`, `input`) |
 | `cimport/` | `import` (2/2): C declarations and their layouts, written as tachyon (`decls`, `specifiers`, `layout`, `emit`) |
 | `cheader.tach` | `--emit-header`: the C header of a program |
@@ -17,10 +17,12 @@ start from what it leaves: the AST, its types, the tables of items.
 | `parser/` | tokens to the AST: items, statements and patterns by recursive descent, expressions by Pratt parsing, recovery after syntax errors (`items`, `stmts`, `exprs`, `types`, `foreign`) |
 | `modules/` | `mod` files and the module tree, item keys; scopes, `use` and privacy in `lookup` |
 | `types.tach` | interned types, layouts, the tables of structs, functions, constants and statics |
-| `check/` | the bidirectional type checker: declarations (`collect`, `resolve`), bodies (`body`), `check_mode` and `synth_mode`, `names`, `calls`, `assign`, `equality`, `vectors`, `unsafety`, `iterate` (0.14: `for` over iterators, ranges as values) |
+| `check/` | the bidirectional type checker: declarations (`collect`, `resolve`), bodies (`body`), `check_mode` and `synth_mode`, `names`, `calls`, `assign`, `equality`, `vectors`, `unsafety`, `iterate` (0.14: `for` over iterators, ranges as values); 0.15: `try_op` (`?`), `widen` (integer widening, joins), `args` (named arguments, defaults), `interp` (f-strings) |
 | `consteval.tach` | compile-time constants: `const` items, array lengths, static initializers |
 | `patterns/` | patterns: their checking, refutability, `match`; exhaustiveness and reachability in `usefulness` |
 | `generics/` | generics by monomorphization: instances of structs and enums; inference and function instances in `instantiate` |
 | `traits.tach` | traits: bounds, impls, operator traits |
 | `assoc.tach` | (0.14) associated types: `type Item;`, projections `T::Item`, `Item = T` constraints, lazy defaults |
 | `closures/` | (0.14) closures: their types (env structs), captures, calls (`mod.tach`); `Fn`/`FnMut` bounds and the closure arguments they type (`fn_bounds.tach`); the escape check (`escape.tach`) |
+| `convert.tach` | (0.15) generic traits (`From<T>`), impls and bounds with trait arguments, calls resolved among them, `x.into()`, `?`'s error conversion, `main -> Result` |
+| `derive.tach` | (0.15) `#[derive(...)]`: impls made from a struct's or enum's fields, before the names are collected |

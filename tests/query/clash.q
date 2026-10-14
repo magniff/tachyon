@@ -55,9 +55,9 @@ pub struct Point {
 $ def len
 crate::geom::V2::len	clash/geom.tach:15:12	method	pub fn len(self: *V2) -> i64
 crate::myvec::Vec::len	clash/myvec.tach:11:12	method	pub fn len(self: *Vec) -> i64
-std::Vec::len	<std>:120:12	method	pub fn len(self: *Vec<T>) -> i64
-std::Buf::len	<std>:275:12	method	pub fn len(self: *Buf) -> i64
-std::HashMap::len	<std>:912:12	method	pub fn len(self: *HashMap<K, V>) -> i64
+std::Vec::len	<std>:122:12	method	pub fn len(self: *Vec<T>) -> i64
+std::Buf::len	<std>:277:12	method	pub fn len(self: *Buf) -> i64
+std::HashMap::len	<std>:670:12	method	pub fn len(self: *HashMap<K, V>) -> i64
 $ refs V2::len
 # clash/geom.tach
 15:12	def	pub fn len(self: *V2) -> i64 {
@@ -127,8 +127,8 @@ $ refs crate::shapes::Area
 13:6	type	shapes	impl Area for Square {
 $ def push
 crate::myvec::Vec::push	clash/myvec.tach:7:12	method	pub fn push(self: *Vec, x: i64)
-std::Vec::push	<std>:172:12	method	pub fn push(self: *Vec<T>, x: T)
-std::Buf::push	<std>:279:12	method	pub fn push(self: *Buf, b: u8)
+std::Vec::push	<std>:174:12	method	pub fn push(self: *Vec<T>, x: T)
+std::Buf::push	<std>:281:12	method	pub fn push(self: *Buf, b: u8)
 $ refs Vec::push --count
 2	crate::myvec::Vec::push
 8	std::Vec::push
@@ -160,9 +160,9 @@ $ refs geom::V2
 2:20	type	shapes::Area::area	fn area(self: *Self) -> i64;
 4:21	type	shapes::Area::twice	fn twice(self: *Self) -> i64 {
 # <std>
-578:30	type	std::Add::add	pub trait Add { fn add(self: Self, other: Self) -> Self; }
-578:43	type	std::Add::add	pub trait Add { fn add(self: Self, other: Self) -> Self; }
-578:52	type	std::Add::add	pub trait Add { fn add(self: Self, other: Self) -> Self; }
+336:30	type	std::Add::add	pub trait Add { fn add(self: Self, other: Self) -> Self; }
+336:43	type	std::Add::add	pub trait Add { fn add(self: Self, other: Self) -> Self; }
+336:52	type	std::Add::add	pub trait Add { fn add(self: Self, other: Self) -> Self; }
 $ callers printf
 # clash/main.tach
 47:84	call	main	->printf	let total = twice_generic(&sq) + twice_generic(&v) + sq.twice() + mine.len() + printf(r);

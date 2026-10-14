@@ -41,9 +41,10 @@ error[parser error] expected identifier, got '&' | help: write the type of self:
 fn f(r: Result<i64, i64>) -> Result<i64, i64> { let x = r?; Ok(x) }
 ```
 ```err
-error[parser error] '?' is reserved for future use | help: `match r { Ok(v) => v, Err(e) => return Err(e) }` (the same for Option)
+error[type error] '?' expressions are not implemented yet (check.unimplemented)
 ```
-`let x = match r { Ok(v) => v, Err(e) => return Err(e) };`
+`?` is coming in 0.15; until then `let x = match r { Ok(v) => v, Err(e) =>
+return Err(e) };` (the same for Option).
 
 ```tach
 println!("{}", 1);
@@ -60,15 +61,6 @@ The help names what replaces `vec!`, `format!`, `assert!` and the others.
 error[tokenizer error] unterminated character literal
 ```
 Labels have no quote: `outer: for i in 0..3 { break :outer; }`.
-
-```tach
-struct P { x: i64, y: i64 }
-fn make(x: i64) -> P { P { x, y: 0 } }
-```
-```err
-error[parser error] expected ':', got ','
-```
-Every field is written `name: value`: `P { x: x, y: 0 }`; no `..base`.
 
 ```tach
 let o: Option<i64> = Some(1);
@@ -111,9 +103,10 @@ tuples.
 struct P { x: i64 }
 ```
 ```err
-error[parser error] unknown attribute 'derive'
+error[type error] #[derive] attributes are not implemented yet (check.unimplemented)
 ```
-`==` is structural without it; there is no `Debug` printing.
+`#[derive(Eq, Ord, Hash, Debug, Clone)]` is coming in 0.15; `==` is
+structural without it.
 
 ```tach
 fn f<T>(x: T) -> T where T: Ord { x }
@@ -403,13 +396,6 @@ fn f(x: *dyn A) -> i64 { 0 }
 error[parser error] 'dyn' is a reserved keyword
 ```
 No trait objects: `fn f<T: A>(x: *T)`, or an enum of the cases.
-
-```tach
-trait Conv<T> { fn conv(self: Self) -> T; }
-```
-```err
-error[parser error] traits cannot have type parameters (yet)
-```
 
 ## Modules and imports
 

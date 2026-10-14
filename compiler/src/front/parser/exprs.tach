@@ -3,13 +3,14 @@
 // (literals, paths, struct literals, tuples, arrays) and the expressions
 // with blocks: `if`, `if let`, `match` and the loops.
 
-use crate::base::intern_c;
-use crate::base::diag::{err_begin, err_end, err_help, err_str, error_at};
+use crate::base::{buf_bytes, intern_c};
+use crate::base::diag::{ERR, err_begin, err_end, err_help, err_str, error_at};
 use crate::front::ast::{
-    ARM_NO_ELSE, ARM_SYNTHETIC, BLOCK_UNSAFE, CLOSURE_MOVE, NODES, NodeKind, SCRATCH, list_begin,
+    ARM_NO_ELSE, ARM_SYNTHETIC, BLOCK_UNSAFE, CLOSURE_MOVE, FIELD_SHORTHAND, FMT_BIN, FMT_CHAR,
+    FMT_HEX, FMT_LEFT, FMT_RIGHT, FMT_UPPER, FMT_ZERO, NODES, NodeKind, SCRATCH, list_begin,
     list_end, list_push, new_node,
 };
-use crate::front::lexer::{SUF_NONE, TOKS, Tok};
+use crate::front::lexer::{STRS, SUF_NONE, TOKS, Tok, is_digit};
 use crate::front::lexer::Tok::{
     Amp, AmpAmp, AmpEq, Arrow, As, At, Bang, BangEq, Break, CStr, Caret, CaretEq, Char, Colon,
     ColonColon, Comma, Continue, Dot, DotDot, DotDotEq, Else, Eof, Eq, EqEq, False, FatArrow, Float,
@@ -71,7 +72,7 @@ fn is_assign_op(kind: Tok) -> bool {
 }
 
 fn is_reserved_punct(kind: Tok) -> bool {
-    kind == Hash || kind == Question || kind == At
+    kind == Hash || kind == At
 }
 
 // Non-associative level of an operator: 1 comparison, 2 range, 0 none.
@@ -95,6 +96,15 @@ fn parse_infix(first: i64, min_bp: i64) -> i64 {
             let kind = cur();
             if (kind == LParen || kind == LBracket || kind == Dot) && POSTFIX_BP >= min_bp {
                 lhs = parse_postfix(lhs);
+                built_by = 0;
+                continue;
+            }
+            if kind == Question && POSTFIX_BP >= min_bp {
+                // `e?` (0.15)
+                let n = new_node(NodeKind::Try, NODES[lhs].start, TOKS[P].end);
+                NODES[n].a = lhs;
+                advance();
+                lhs = n;
                 built_by = 0;
                 continue;
             }
@@ -406,16 +416,36 @@ fn parse_index() -> i64 {
     }
 }
 
-// `e, e, ...` up to `close` (not consumed), as the list of `n`.
+// The arguments of call `n`, `e, e, ...` up to `close` (not consumed), as
+// its list; 0.15: then the named ones, `name: e` (NamedArg nodes).
 fn parse_expr_list(n: i64, close: Tok) {
-    let mark = list_begin();
-    while !at(close) && !at(Eof) {
-        list_push(parse_expr());
-        if !eat(Comma) {
-            break;
+    unsafe {
+        let mark = list_begin();
+        let mut named = false;
+        while !at(close) && !at(Eof) {
+            if at(Ident) && tok_kind(1) == Colon {
+                let arg = new_node(NodeKind::NamedArg, cur_start(), 0);
+                NODES[arg].a = expect_binding_name();
+                advance();
+                NODES[arg].b = parse_expr();
+                NODES[arg].end = prev_end();
+                list_push(arg);
+                named = true;
+            } else {
+                let start = cur_start();
+                let arg = parse_expr();
+                if named {
+                    error_at(start,
+                        c"a positional argument after a named one: the named arguments come last");
+                }
+                list_push(arg);
+            }
+            if !eat(Comma) {
+                break;
+            }
         }
+        list_end(n, mark);
     }
-    list_end(n, mark);
 }
 
 fn literal_node(kind: NodeKind, start: i64, a: i64, b: i64) -> i64 {
@@ -439,6 +469,7 @@ pub fn parse_primary() -> i64 {
         if kind == Char { return literal_node(NodeKind::Char, start, value, 0); }
         if kind == Str { return literal_node(NodeKind::Str, start, value, 0); }
         if kind == CStr { return literal_node(NodeKind::CStr, start, value, 0); }
+        if kind == Tok::FHead { return parse_fstring(); }
         if kind == True { return literal_node(NodeKind::Bool, start, 1, 0); }
         if kind == False { return literal_node(NodeKind::Bool, start, 0, 0); }
         if kind == LParen {
@@ -489,6 +520,128 @@ pub fn parse_primary() -> i64 {
             reserved_error();
         }
         syntax_error(c"expected expression")
+    }
+}
+
+// An f-string (0.15): an Interp node, whose list is its texts (Str nodes,
+// the empty ones left out) and holes (InterpHole nodes), in order.
+fn parse_fstring() -> i64 {
+    unsafe {
+        let n = new_node(NodeKind::Interp, cur_start(), 0);
+        let mark = list_begin();
+        fstring_text();
+        let more = TOKS[P].suffix == 0;
+        advance();
+        if more {
+            let saved = with_no_struct(false);
+            loop {
+                let hole = new_node(NodeKind::InterpHole, cur_start(), 0);
+                NODES[hole].a = parse_expr();
+                NODES[hole].end = prev_end();
+                if !at(Tok::FMid) && !at(Tok::FTail) {
+                    syntax_error(c"expected '}' after the expression of an f-string hole");
+                }
+                parse_spec(hole, TOKS[P].suffix);
+                list_push(hole);
+                fstring_text();
+                let last = at(Tok::FTail);
+                advance();
+                if last {
+                    break;
+                }
+            }
+            NO_STRUCT = saved;
+        }
+        list_end(n, mark);
+        NODES[n].end = prev_end();
+        n
+    }
+}
+
+// The text of the f-string piece at P, a Str node pushed on the list being
+// built (none when it is empty).
+fn fstring_text() {
+    unsafe {
+        let id = TOKS[P].value as i64;
+        if STRS[id].len > 0 {
+            let s = new_node(NodeKind::Str, TOKS[P].start, TOKS[P].end);
+            NODES[s].a = id;
+            list_push(s);
+        }
+    }
+}
+
+// The spec of an f-string hole (0.15), string `spec` (-1: none), into the
+// InterpHole's fields: `[<|>][0][width][.precision][?|x|X|b|c]`.
+fn parse_spec(hole: i64, spec: i64) {
+    unsafe {
+        NODES[hole].c = -1;
+        NODES[hole].d = -1;
+        if spec < 0 {
+            return;
+        }
+        let s = STRS[spec];
+        let pos = TOKS[P].start + 1;
+        let mut i = 0;
+        let mut flags = 0;
+        if i < s.len && (s[i] == '<' || s[i] == '>') {
+            flags |= if s[i] == '<' { FMT_LEFT } else { FMT_RIGHT };
+            i += 1;
+        }
+        if i < s.len && s[i] == '0' {
+            flags |= FMT_ZERO;
+            i += 1;
+        }
+        if i < s.len && is_digit(s[i]) {
+            NODES[hole].c = 0;
+            while i < s.len && is_digit(s[i]) {
+                NODES[hole].c = NODES[hole].c * 10 + (s[i] - '0') as i64;
+                if NODES[hole].c > 65535 {
+                    error_at(pos, c"a format width is at most 65535");
+                }
+                i += 1;
+            }
+        }
+        if i < s.len && s[i] == '.' {
+            i += 1;
+            if i >= s.len || !is_digit(s[i]) {
+                error_at(pos, c"expected the precision's digits after '.' in a format spec");
+            }
+            NODES[hole].d = 0;
+            while i < s.len && is_digit(s[i]) {
+                NODES[hole].d = NODES[hole].d * 10 + (s[i] - '0') as i64;
+                if NODES[hole].d > 65535 {
+                    error_at(pos, c"a format precision is at most 65535");
+                }
+                i += 1;
+            }
+        }
+        if i < s.len {
+            let c = s[i];
+            if c == '?' {
+                NODES[hole].b = 1;
+            } else if c == 'x' {
+                flags |= FMT_HEX;
+            } else if c == 'X' {
+                flags |= FMT_HEX | FMT_UPPER;
+            } else if c == 'b' {
+                flags |= FMT_BIN;
+            } else if c == 'c' {
+                flags |= FMT_CHAR;
+            } else {
+                i = -1;
+            }
+            i += 1;
+        }
+        if i != s.len {
+            err_begin(pos);
+            err_str(c"invalid format spec ':");
+            buf_bytes(ERR, s);
+            err_str(c"'");
+            err_help(c"a spec is [<|>][0][width][.precision] then one of ? (Debug), x, X, b, c: '{x:>8.2}', '{v:?}', '{n:08x}'");
+            err_end();
+        }
+        NODES[hole].p = flags;
     }
 }
 
@@ -550,8 +703,16 @@ fn parse_name_or_struct_literal() -> i64 {
                 let init_start = cur_start();
                 let init = new_node(NodeKind::FieldInit, init_start, 0);
                 NODES[init].a = expect_binding_name();
-                expect(Colon);
-                NODES[init].b = parse_expr();
+                if at(Comma) || at(RBrace) {
+                    // `S { x }` (0.15): `S { x: x }`
+                    let value = new_node(NodeKind::Ident, init_start, prev_end());
+                    NODES[value].a = NODES[init].a;
+                    NODES[init].b = value;
+                    NODES[init].p |= FIELD_SHORTHAND;
+                } else {
+                    expect(Colon);
+                    NODES[init].b = parse_expr();
+                }
                 NODES[init].end = prev_end();
                 list_push(init);
                 if !eat(Comma) {

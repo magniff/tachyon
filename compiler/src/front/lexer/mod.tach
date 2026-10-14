@@ -4,6 +4,8 @@
 
 // ---- Token kinds ----
 
+mod strings;
+
 // (Numbered as in 0.3: the keywords and the punctuation are kept in the
 // ranges the token dump of the seed expects.)
 use Tok::{
@@ -16,10 +18,11 @@ use Tok::{
     Struct, Tilde, Trait, True, Union, Unsafe, Use, While,
 };
 use crate::base::{
-    BUFS, SRC, alloc_array, alloc_zeroed, buf_byte, buf_bytes, buf_clear, buf_hex, buf_int, buf_new,
-    buf_str, buf_uint, grow, intern, intern_c, memcpy, strtod, sym_name,
+    BUFS, SRC, alloc_array, buf_byte, buf_clear, buf_hex, buf_int, buf_new, buf_str, buf_uint, grow,
+    intern, intern_c, strtod, sym_name,
 };
-use crate::base::diag::{ERR, err_begin, err_end, err_str, error_at};
+use crate::base::diag::error_at;
+pub use strings::{add_string, hex_value, lex_char, lex_fstring, lex_string};
 
 pub enum Tok {
     Eof = 0, Int = 1, Float = 2, Char = 3, Str = 4, CStr = 5, Ident = 6,
@@ -45,6 +48,13 @@ pub enum Tok {
     Trait = 90,
     // Keywords of 0.14.
     Move = 91,
+    // The pieces of an f-string (0.15), `f"a{x}b{y:>4}c"`: FHead `f"a{`,
+    // the tokens of the hole `x`, FMid `}b{`, the tokens of `y`, FTail
+    // `:>4}c"`. `value` is the text (a string id, `{{` and `}}` unescaped);
+    // an FMid or FTail has the spec of the hole it closes in `suffix` (a
+    // string id, -1: none); an FHead has `suffix` 1 when the f-string has
+    // no hole (the token is the whole literal).
+    FHead = 92, FMid = 93, FTail = 94,
 }
 
 // Numeric literal suffixes (0: none).
@@ -173,6 +183,9 @@ impl Tok {
             Unsafe => c"unsafe",
             Trait => c"trait",
             Tok::Move => c"move",
+            Tok::FHead => c"f\"",
+            Tok::FMid => c"}",
+            Tok::FTail => c"}",
             PlusEq => c"+=",
             MinusEq => c"-=",
             StarEq => c"*=",
@@ -398,6 +411,8 @@ fn lex_token() {
         lex_string(LEX_POS, false);
     } else if c == 'c' && peek_at(1) == '"' {
         lex_string(LEX_POS, true);
+    } else if c == 'f' && peek_at(1) == '"' {
+        lex_fstring(LEX_POS);
     } else if c == '\'' {
         lex_char();
     } else if is_digit(c) {
@@ -528,206 +543,6 @@ fn lex_operator() {
     }
     LEX_POS += 1;
     push_token(kind, start, 0, 0);
-}
-
-// ---- Strings and characters ----
-
-pub fn add_string(bytes: [u8]) -> i64 {
-    unsafe {
-        STRS = grow(STRS, STR_COUNT, &STR_CAP);
-        let n = bytes.len as i64;
-        let copy = alloc_zeroed(n + 1);
-        memcpy(copy, bytes.ptr, n as u64);
-        STRS[STR_COUNT] = copy[0..n];
-        STR_COUNT += 1;
-        STR_COUNT - 1
-    }
-}
-
-// `"..."` or `c"..."` starting at `start`.
-fn lex_string(start: i64, is_c: bool) {
-    unsafe {
-        LEX_POS += if is_c { 2 } else { 1 };
-        buf_clear(LEX_SCRATCH);
-        loop {
-            if at_end() {
-                error_at(start, c"unterminated string literal");
-            }
-            let c = peek_at(0);
-            LEX_POS += 1;
-            if c == '"' {
-                break;
-            }
-            if c == '\n' {
-                error_at(LEX_POS - 1, c"newline in string literal");
-            }
-            if c == '\\' && !at_end()
-                && (peek_at(0) == '\n' || (peek_at(0) == '\r' && peek_at(1) == '\n')) {
-                // A line continuation (0.9): the backslash, the line break and
-                // the next line's leading whitespace are not part of the string.
-                while !at_end()
-                    && (peek_at(0) == ' ' || peek_at(0) == '\t' || peek_at(0) == '\n'
-                        || peek_at(0) == '\r') {
-                    LEX_POS += 1;
-                }
-                continue;
-            }
-            if c == '\\' {
-                lex_escape(LEX_SCRATCH, false);
-            } else {
-                buf_byte(LEX_SCRATCH, c);
-            }
-        }
-        let bytes = BUFS[LEX_SCRATCH].data;
-        let n = BUFS[LEX_SCRATCH].len;
-        if is_c {
-            for i in 0..n {
-                if bytes[i] == 0 {
-                    error_at(start, c"C string literal contains a NUL byte");
-                }
-            }
-        }
-        let id = add_string(bytes[0..n]);
-        push_token(if is_c { CStr } else { Str }, start, id as u64, 0);
-    }
-}
-
-fn hex_value(c: u8) -> i64 {
-    if c >= '0' && c <= '9' { return (c - '0') as i64; }
-    if c >= 'a' && c <= 'f' { return (c - 'a') as i64 + 10; }
-    if c >= 'A' && c <= 'F' { return (c - 'A') as i64 + 10; }
-    -1
-}
-
-fn lex_hex_digit() -> i64 {
-    unsafe {
-        if at_end() {
-            error_at(LEX_POS, c"expected hex digit");
-        }
-        let value = hex_value(peek_at(0));
-        if value < 0 {
-            error_at(LEX_POS, c"expected hex digit");
-        }
-        LEX_POS += 1;
-        value
-    }
-}
-
-// UTF-8 encoding of a code point.
-fn buf_utf8(out: i64, cp: i64) {
-    if cp < 0x80 {
-        buf_byte(out, cp as u8);
-    } else if cp < 0x800 {
-        buf_byte(out, (0xc0 | (cp >> 6)) as u8);
-        buf_byte(out, (0x80 | (cp & 0x3f)) as u8);
-    } else if cp < 0x10000 {
-        buf_byte(out, (0xe0 | (cp >> 12)) as u8);
-        buf_byte(out, (0x80 | ((cp >> 6) & 0x3f)) as u8);
-        buf_byte(out, (0x80 | (cp & 0x3f)) as u8);
-    } else {
-        buf_byte(out, (0xf0 | (cp >> 18)) as u8);
-        buf_byte(out, (0x80 | ((cp >> 12) & 0x3f)) as u8);
-        buf_byte(out, (0x80 | ((cp >> 6) & 0x3f)) as u8);
-        buf_byte(out, (0x80 | (cp & 0x3f)) as u8);
-    }
-}
-
-// An escape after '\'; appends its bytes to `out`.
-fn lex_escape(out: i64, in_char: bool) {
-    unsafe {
-        if at_end() {
-            error_at(LEX_POS, c"unterminated escape");
-        }
-        let escape_at = LEX_POS;
-        let c = peek_at(0);
-        LEX_POS += 1;
-        if c == 'n' { buf_byte(out, '\n'); return; }
-        if c == 't' { buf_byte(out, '\t'); return; }
-        if c == 'r' { buf_byte(out, '\r'); return; }
-        if c == '0' { buf_byte(out, 0); return; }
-        if c == '"' { buf_byte(out, '"'); return; }
-        if c == '\'' { buf_byte(out, '\''); return; }
-        if c == '\\' { buf_byte(out, '\\'); return; }
-        if c == 'x' {
-            let high = lex_hex_digit();
-            let low = lex_hex_digit();
-            buf_byte(out, ((high << 4) | low) as u8);
-            return;
-        }
-        if c == 'u' {
-            let cp = lex_unicode_escape(escape_at - 1, in_char);
-            buf_utf8(out, cp);
-            return;
-        }
-        error_at(escape_at, c"unknown escape");
-    }
-}
-
-fn lex_unicode_escape(backslash_at: i64, in_char: bool) -> i64 {
-    unsafe {
-        if peek_at(0) != '{' || at_end() {
-            error_at(LEX_POS, c"expected '{' after '\\u'");
-        }
-        LEX_POS += 1;
-        let mut value = 0;
-        let mut digits = 0;
-        while at_end() || peek_at(0) != '}' {
-            if digits == 6 {
-                error_at(LEX_POS, c"too many digits in '\\u{...}' escape");
-            }
-            value = value * 16 + lex_hex_digit();
-            digits += 1;
-        }
-        LEX_POS += 1;
-        if digits == 0 {
-            error_at(LEX_POS, c"empty '\\u{}' escape");
-        }
-        if value > 0x10ffff || (value >= 0xd800 && value <= 0xdfff) {
-            error_at(backslash_at, c"invalid unicode escape");
-        }
-        if in_char && value >= 0x80 {
-            error_at(backslash_at, c"character literal is not ASCII (a character is one byte, u8)");
-        }
-        value
-    }
-}
-
-fn lex_char() {
-    unsafe {
-        let start = LEX_POS;
-        LEX_POS += 1;
-        buf_clear(LEX_SCRATCH);
-        let c = peek_at(0);
-        if at_end() || c == '\n' {
-            error_at(start, c"unterminated character literal");
-        }
-        if c == '\'' {
-            error_at(start, c"empty character literal");
-        }
-        if c == '\\' {
-            LEX_POS += 1;
-            lex_escape(LEX_SCRATCH, true);
-        } else if c < 0x80 {
-            LEX_POS += 1;
-            buf_byte(LEX_SCRATCH, c);
-        } else {
-            // The character's UTF-8 bytes: the lead byte and its continuations.
-            let mut end = LEX_POS + 1;
-            while end < LEX_END && (SRC[end] & 0xc0) == 0x80 {
-                end += 1;
-            }
-            err_begin(start);
-            err_str(c"character literal '");
-            buf_bytes(ERR, SRC[LEX_POS..end]);
-            err_str(c"' is not ASCII (a character is one byte, u8)");
-            err_end();
-        }
-        if at_end() || peek_at(0) != '\'' {
-            error_at(start, c"unterminated character literal (expected ')");
-        }
-        LEX_POS += 1;
-        push_token(Char, start, BUFS[LEX_SCRATCH].data[0] as u64, 0);
-    }
 }
 
 // ---- Numbers ----
@@ -958,6 +773,16 @@ fn dump_token_text(out: i64, tok: *Token) {
         } else if kind == CStr {
             buf_str(out, c"cstr ");
             dump_hex_bytes(out, value as i64);
+        } else if kind == Tok::FHead || kind == Tok::FMid || kind == Tok::FTail {
+            // (0.15: an f-string's pieces, the spec after the text)
+            buf_str(out, if kind == Tok::FHead { c"fhead " } else if kind == Tok::FMid { c"fmid " }
+                else { c"ftail " });
+            dump_hex_bytes(out, value as i64);
+            if kind != Tok::FHead && (*tok).suffix >= 0 {
+                buf_str(out, c" spec ");
+                dump_hex_bytes(out, (*tok).suffix);
+            }
+            return;
         } else if kind == Ident {
             buf_str(out, c"ident ");
             buf_str(out, sym_name(value as i64));

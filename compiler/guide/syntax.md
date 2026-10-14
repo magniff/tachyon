@@ -11,7 +11,7 @@ The whole grammar is docs/grammar.md; this is what a program uses.
 - Keywords: `as break const continue defer else enum extern false fn for
   if impl import in let loop match mod mut pub return static struct
   trait true type union unsafe use while move` (0.14). Reserved (errors):
-  `where`, `dyn`, `?`, `@`. `self`, `Self`, `super`, `crate` are names.
+  `where`, `dyn`, `@`. `self`, `Self`, `super`, `crate` are names.
 - Integers: `42`, `1_000`, `0xff`, `0b1010`, with a type suffix
   `255u8`, `7i32`. Floats: `1.5`, `2e10`, `1.5f32`. Chars: `'a'`, `'\n'`,
   `'\x41'`, `'\''` (one byte, a `u8`). Strings: `"a\tb\n\"q\"\\"`,
@@ -102,9 +102,10 @@ From loosest to tightest (all left-associative except where noted):
 | prefix `-` `!` `~` `*` `&` | `!` on bool, `~` bitwise not |
 | `f()` `a[i]` `a[i..j]` `x.f` `x.0` `x.m()` | `*p.x` is `*(p.x)` |
 
-No `**` (power), no `?`, no ternary (`if c { a } else { b }` is an
-expression). `return`, `break`, `continue` have type `!` and fit
-anywhere: `let v = if ok { x } else { return 1 };`.
+No `**` (power), no ternary (`if c { a } else { b }` is an
+expression); `e?` parses (0.15), its checking is to come. `return`,
+`break`, `continue` have type `!` and fit anywhere:
+`let v = if ok { x } else { return 1 };`.
 
 In an `if`, `while`, `match` or `for` head, `Name {` starts the body: put
 a struct literal there in parentheses, `if p == (P { x: 1 }) { ... }`.

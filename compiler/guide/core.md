@@ -439,7 +439,7 @@ the one hole in safe code (no lifetimes).
 | `expected type, got '&'` | `*T` for `&T` and `&mut T` |
 | `expected identifier, got '&'` in `fn f(&self)` | `self: *T` |
 | `cannot infer the type of closure parameter 'x'` | `\|x: i64\| ...`, or pass it where an `Fn` bound or `fn` type gives it |
-| `'?' is reserved for future use` | `match` on the `Result` |
+| `'?' expressions are not implemented yet` | `match` on the `Result` (0.15 brings `?`) |
 | `expected ';', got '!'` | no macros: `println(...)`, `std::print_int(...)` |
 | `cannot assign to immutable variable 'x'` | `let mut x` |
 | `cannot index type 'Vec<i64>'` | `v.get(i)`, `v.as_slice()[i]` |

@@ -1,0 +1,116 @@
+// Generic traits and conversions (0.15; docs/design/errors-formatting.md):
+// traits with type parameters (`trait From<T>`), impls of them for
+// several arguments (`impl From<IoError> for AppError`), bounds with
+// arguments (`T: From<U>`), calls resolved among a type's generic-trait
+// impls by the arguments' types (`AppError::from(e)`, `x.into()`), the
+// intrinsic From of widening and Into, the conversion of `?`'s error, and
+// `fn main() -> Result<(), E>`.
+//
+// Phase 0: stubs. A trait may declare type parameters (std's From and
+// Into do); using them reports the feature unimplemented.
+
+use crate::base::intern_c;
+use crate::base::diag::{err_begin, err_end_soft, err_str};
+use crate::front::ast::{NODES, NodeKind, child};
+use crate::front::check::resolve::resolve_type;
+use crate::front::closures::unimplemented;
+use crate::front::modules::{CUR_MOD, module_of};
+use crate::front::traits::{IMPLS, TRAITS};
+use crate::front::types::{FNS, FN_COUNT, TLISTS, TSCRATCH};
+
+// The type parameters of trait tr (a TRAITS index; called by add_trait,
+// in the names phase): TraitInfo.params.
+pub fn collect_trait_params(tr: i64) {
+    unsafe { TRAITS[tr].params = NODES[TRAITS[tr].node].g; }
+}
+
+// The trait arguments of impl i (an IMPLS index; called by collect_impl
+// after its coherence check): ImplInfo.targs, resolved in the impl's
+// module with its own parameters in scope.
+pub fn impl_trait_args(i: i64) {
+    unsafe {
+        let written = NODES[NODES[IMPLS[i].node].a].g;
+        if written != 0 || TRAITS[IMPLS[i].tr].params != 0 {
+            unimplemented(NODES[NODES[IMPLS[i].node].a].start, c"generic traits");
+        }
+    }
+}
+
+// The trait arguments of bound b (a TyName with type arguments, `From<U>`)
+// resolved in its module (with the parameters in scope that are bound
+// now): a TLISTS index.
+pub fn bound_args(b: i64) -> i64 {
+    unsafe {
+        let g = NODES[b].g;
+        let saved = CUR_MOD;
+        CUR_MOD = module_of(b);
+        let mark = TSCRATCH.count;
+        for i in 0..NODES[g].count {
+            let t = resolve_type(child(g, i));
+            TSCRATCH.push(t);
+        }
+        CUR_MOD = saved;
+        let targs = TLISTS.count;
+        for i in mark..TSCRATCH.count {
+            TLISTS.push(TSCRATCH.data[i]);
+        }
+        TSCRATCH.count = mark;
+        targs
+    }
+}
+
+// Whether type t implements generic trait tr with arguments targs (a
+// TLISTS index): through an impl, or intrinsically (From of the type
+// itself and of the types that widen to it; Into exactly when the other
+// way From holds). tr < 0: a bound that named no trait (an error was
+// reported), which holds. (Phase 0: no type does, as no impl of a generic
+// trait is accepted yet.)
+pub fn implements_with(tr: i64, t: i64, targs: i64) -> bool {
+    tr < 0
+}
+
+// Call n (`T::member(args)`, or `x.member(args)` with t the receiver's
+// type) that found no ordinary function: resolved among t's generic-trait
+// impls by the types of the arguments, and checked (n becomes a Call with
+// x = f + 1, as synth_method makes); its type. -1 when t has no
+// generic-trait impl with a function `member` (the caller reports it).
+pub fn generic_trait_call(n: i64, t: i64, member: i64) -> i64 {
+    -1
+}
+
+// `x.into()` (n, a MethodCall named `into` without arguments) checked
+// against `expected`: `U::from(x)` with U = expected; its type. -1 when n
+// is not such a call or `into` is a method of x's type (the caller checks
+// it as any call).
+pub fn into_call(n: i64, expected: i64) -> i64 {
+    -1
+}
+
+// The error value `value` (of type `from`) that `?` returns from a
+// function whose error type is `to`: the value itself when they are the
+// same, a widening Cast, or `to::from(value)`; the node. An error at pos
+// when there is no conversion.
+pub fn error_conversion(value: i64, from: i64, to: i64, pos: i64) -> i64 {
+    if from == to {
+        return value;
+    }
+    unsafe { unimplemented(pos, c"conversions of an error by '?'") }
+}
+
+// `fn main() -> Result<(), E>` (called once the signatures are resolved):
+// a wrapper that prints `Error: {e:?}` to stderr and exits with 1 on Err.
+pub fn main_result_wrapper() {
+    unsafe {
+        let main = intern_c(c"main");
+        for f in 0..FN_COUNT {
+            let node = FNS[f].node;
+            if FNS[f].name == main && NODES[node].kind == NodeKind::Fn && NODES[node].d == 0
+                && NODES[node].b != 0 && NODES[NODES[node].b].kind == NodeKind::TyName
+                && NODES[NODES[node].b].a == intern_c(c"Result") {
+                err_begin(NODES[NODES[node].b].start);
+                err_str(c"'main' functions returning Result are not implemented yet (check.unimplemented)");
+                err_end_soft();
+            }
+        }
+    }
+}

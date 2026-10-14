@@ -1,0 +1,326 @@
+// The lexer's strings and characters (0.15: split from front/lexer.tach,
+// which calls them from lex_token): string, C string and f-string
+// literals (lex_fstring: FHead, the holes' tokens, FMid, FTail), character
+// literals and their escapes; STRS, the strings' table.
+
+use crate::base::{BUFS, SRC, alloc_zeroed, buf_byte, buf_bytes, buf_clear, grow, memcpy};
+use crate::base::diag::{ERR, err_begin, err_end, err_str, error_at};
+use crate::front::lexer::{
+    LEX_END, LEX_POS, LEX_SCRATCH, STRS, STR_CAP, STR_COUNT, TOK_COUNT, Tok, at_end, lex_token,
+    peek_at, push_token, skip_whitespace_and_comments,
+};
+use crate::front::lexer::Tok::{CStr, Char, Str};
+
+// ---- Strings and characters ----
+
+pub fn add_string(bytes: [u8]) -> i64 {
+    unsafe {
+        STRS = grow(STRS, STR_COUNT, &STR_CAP);
+        let n = bytes.len as i64;
+        let copy = alloc_zeroed(n + 1);
+        memcpy(copy, bytes.ptr, n as u64);
+        STRS[STR_COUNT] = copy[0..n];
+        STR_COUNT += 1;
+        STR_COUNT - 1
+    }
+}
+
+// After a backslash in a string: a line continuation (0.9) is skipped
+// (the line break and the next line's leading whitespace are not part of
+// the string), and true returned.
+fn line_continuation() -> bool {
+    if at_end() || !(peek_at(0) == '\n' || (peek_at(0) == '\r' && peek_at(1) == '\n')) {
+        return false;
+    }
+    while !at_end()
+        && (peek_at(0) == ' ' || peek_at(0) == '\t' || peek_at(0) == '\n' || peek_at(0) == '\r') {
+        LEX_POS += 1;
+    }
+    true
+}
+
+// `"..."` or `c"..."` starting at `start`.
+pub fn lex_string(start: i64, is_c: bool) {
+    unsafe {
+        LEX_POS += if is_c { 2 } else { 1 };
+        buf_clear(LEX_SCRATCH);
+        loop {
+            if at_end() {
+                error_at(start, c"unterminated string literal");
+            }
+            let c = peek_at(0);
+            LEX_POS += 1;
+            if c == '"' {
+                break;
+            }
+            if c == '\n' {
+                error_at(LEX_POS - 1, c"newline in string literal");
+            }
+            if c == '\\' && line_continuation() {
+                continue;
+            }
+            if c == '\\' {
+                lex_escape(LEX_SCRATCH, false);
+            } else {
+                buf_byte(LEX_SCRATCH, c);
+            }
+        }
+        let bytes = BUFS[LEX_SCRATCH].data;
+        let n = BUFS[LEX_SCRATCH].len;
+        if is_c {
+            for i in 0..n {
+                if bytes[i] == 0 {
+                    error_at(start, c"C string literal contains a NUL byte");
+                }
+            }
+        }
+        let id = add_string(bytes[0..n]);
+        push_token(if is_c { CStr } else { Str }, start, id as u64, 0);
+    }
+}
+
+// `f"..."` starting at `start` (0.15): FHead, then for each hole its
+// tokens and an FMid, the last one an FTail (see Tok). A hole ends at the
+// `}` that closes it, or at a `:` outside brackets, which starts its spec
+// (the bytes up to the `}`).
+pub fn lex_fstring(start: i64) {
+    unsafe {
+        LEX_POS += 2;
+        let mut more = lex_fstring_text(start);
+        let head = add_string(BUFS[LEX_SCRATCH].data[0..BUFS[LEX_SCRATCH].len]);
+        push_token(Tok::FHead, start, head as u64, if more { 0 } else { 1 });
+        while more {
+            let hole = LEX_POS;
+            let first = TOK_COUNT;
+            // (braces end the hole; any bracket protects a `:`; a string
+            // literal in a hole is a token of it)
+            let mut braces = 0;
+            let mut depth = 0;
+            loop {
+                skip_whitespace_and_comments();
+                if at_end() {
+                    error_at(start, c"unterminated f-string");
+                }
+                let c = peek_at(0);
+                if braces == 0 && c == '}' || depth == 0 && c == ':' && peek_at(1) != ':' {
+                    break;
+                }
+                if c == 'f' && peek_at(1) == '"' {
+                    error_at(LEX_POS,
+                        c"f-strings cannot be nested: compute the inner one in a 'let' first");
+                }
+                if c == '{' {
+                    braces += 1;
+                } else if c == '}' {
+                    braces -= 1;
+                }
+                if c == '(' || c == '[' || c == '{' {
+                    depth += 1;
+                } else if (c == ')' || c == ']' || c == '}') && depth > 0 {
+                    depth -= 1;
+                }
+                lex_token();
+            }
+            if TOK_COUNT == first {
+                error_at(hole - 1,
+                    c"an f-string hole needs an expression, as in '{x}'; write '{{' for a brace");
+            }
+            let piece = LEX_POS;
+            let mut spec = -1;
+            if peek_at(0) == ':' {
+                LEX_POS += 1;
+                let from = LEX_POS;
+                while !at_end() && peek_at(0) != '}' && peek_at(0) != '"' && peek_at(0) != '\n' {
+                    LEX_POS += 1;
+                }
+                if peek_at(0) != '}' {
+                    error_at(piece, c"unterminated format spec: expected '}'");
+                }
+                spec = add_string(SRC[from..LEX_POS]);
+            }
+            LEX_POS += 1;
+            more = lex_fstring_text(start);
+            let text = add_string(BUFS[LEX_SCRATCH].data[0..BUFS[LEX_SCRATCH].len]);
+            push_token(if more { Tok::FMid } else { Tok::FTail }, piece, text as u64, spec);
+        }
+    }
+}
+
+// The text of an f-string up to a hole (its `{` consumed: true) or the
+// end (the closing quote consumed: false), in LEX_SCRATCH.
+fn lex_fstring_text(start: i64) -> bool {
+    unsafe {
+        buf_clear(LEX_SCRATCH);
+        loop {
+            if at_end() {
+                error_at(start, c"unterminated string literal");
+            }
+            let c = peek_at(0);
+            LEX_POS += 1;
+            if c == '"' {
+                return false;
+            }
+            if c == '{' && peek_at(0) != '{' {
+                return true;
+            }
+            if c == '{' || c == '}' {
+                if peek_at(0) != c {
+                    error_at(LEX_POS - 1, c"a single '}' in an f-string: write '}}' for a brace");
+                }
+                LEX_POS += 1;
+                buf_byte(LEX_SCRATCH, c);
+                continue;
+            }
+            if c == '\n' {
+                error_at(LEX_POS - 1, c"newline in string literal");
+            }
+            if c == '\\' && line_continuation() {
+                continue;
+            }
+            if c == '\\' {
+                lex_escape(LEX_SCRATCH, false);
+            } else {
+                buf_byte(LEX_SCRATCH, c);
+            }
+        }
+        false
+    }
+}
+
+pub fn hex_value(c: u8) -> i64 {
+    if c >= '0' && c <= '9' { return (c - '0') as i64; }
+    if c >= 'a' && c <= 'f' { return (c - 'a') as i64 + 10; }
+    if c >= 'A' && c <= 'F' { return (c - 'A') as i64 + 10; }
+    -1
+}
+
+fn lex_hex_digit() -> i64 {
+    unsafe {
+        if at_end() {
+            error_at(LEX_POS, c"expected hex digit");
+        }
+        let value = hex_value(peek_at(0));
+        if value < 0 {
+            error_at(LEX_POS, c"expected hex digit");
+        }
+        LEX_POS += 1;
+        value
+    }
+}
+
+// UTF-8 encoding of a code point.
+fn buf_utf8(out: i64, cp: i64) {
+    if cp < 0x80 {
+        buf_byte(out, cp as u8);
+    } else if cp < 0x800 {
+        buf_byte(out, (0xc0 | (cp >> 6)) as u8);
+        buf_byte(out, (0x80 | (cp & 0x3f)) as u8);
+    } else if cp < 0x10000 {
+        buf_byte(out, (0xe0 | (cp >> 12)) as u8);
+        buf_byte(out, (0x80 | ((cp >> 6) & 0x3f)) as u8);
+        buf_byte(out, (0x80 | (cp & 0x3f)) as u8);
+    } else {
+        buf_byte(out, (0xf0 | (cp >> 18)) as u8);
+        buf_byte(out, (0x80 | ((cp >> 12) & 0x3f)) as u8);
+        buf_byte(out, (0x80 | ((cp >> 6) & 0x3f)) as u8);
+        buf_byte(out, (0x80 | (cp & 0x3f)) as u8);
+    }
+}
+
+// An escape after '\'; appends its bytes to `out`.
+fn lex_escape(out: i64, in_char: bool) {
+    unsafe {
+        if at_end() {
+            error_at(LEX_POS, c"unterminated escape");
+        }
+        let escape_at = LEX_POS;
+        let c = peek_at(0);
+        LEX_POS += 1;
+        if c == 'n' { buf_byte(out, '\n'); return; }
+        if c == 't' { buf_byte(out, '\t'); return; }
+        if c == 'r' { buf_byte(out, '\r'); return; }
+        if c == '0' { buf_byte(out, 0); return; }
+        if c == '"' { buf_byte(out, '"'); return; }
+        if c == '\'' { buf_byte(out, '\''); return; }
+        if c == '\\' { buf_byte(out, '\\'); return; }
+        if c == 'x' {
+            let high = lex_hex_digit();
+            let low = lex_hex_digit();
+            buf_byte(out, ((high << 4) | low) as u8);
+            return;
+        }
+        if c == 'u' {
+            let cp = lex_unicode_escape(escape_at - 1, in_char);
+            buf_utf8(out, cp);
+            return;
+        }
+        error_at(escape_at, c"unknown escape");
+    }
+}
+
+fn lex_unicode_escape(backslash_at: i64, in_char: bool) -> i64 {
+    unsafe {
+        if peek_at(0) != '{' || at_end() {
+            error_at(LEX_POS, c"expected '{' after '\\u'");
+        }
+        LEX_POS += 1;
+        let mut value = 0;
+        let mut digits = 0;
+        while at_end() || peek_at(0) != '}' {
+            if digits == 6 {
+                error_at(LEX_POS, c"too many digits in '\\u{...}' escape");
+            }
+            value = value * 16 + lex_hex_digit();
+            digits += 1;
+        }
+        LEX_POS += 1;
+        if digits == 0 {
+            error_at(LEX_POS, c"empty '\\u{}' escape");
+        }
+        if value > 0x10ffff || (value >= 0xd800 && value <= 0xdfff) {
+            error_at(backslash_at, c"invalid unicode escape");
+        }
+        if in_char && value >= 0x80 {
+            error_at(backslash_at, c"character literal is not ASCII (a character is one byte, u8)");
+        }
+        value
+    }
+}
+
+pub fn lex_char() {
+    unsafe {
+        let start = LEX_POS;
+        LEX_POS += 1;
+        buf_clear(LEX_SCRATCH);
+        let c = peek_at(0);
+        if at_end() || c == '\n' {
+            error_at(start, c"unterminated character literal");
+        }
+        if c == '\'' {
+            error_at(start, c"empty character literal");
+        }
+        if c == '\\' {
+            LEX_POS += 1;
+            lex_escape(LEX_SCRATCH, true);
+        } else if c < 0x80 {
+            LEX_POS += 1;
+            buf_byte(LEX_SCRATCH, c);
+        } else {
+            // The character's UTF-8 bytes: the lead byte and its continuations.
+            let mut end = LEX_POS + 1;
+            while end < LEX_END && (SRC[end] & 0xc0) == 0x80 {
+                end += 1;
+            }
+            err_begin(start);
+            err_str(c"character literal '");
+            buf_bytes(ERR, SRC[LEX_POS..end]);
+            err_str(c"' is not ASCII (a character is one byte, u8)");
+            err_end();
+        }
+        if at_end() || peek_at(0) != '\'' {
+            error_at(start, c"unterminated character literal (expected ')");
+        }
+        LEX_POS += 1;
+        push_token(Char, start, BUFS[LEX_SCRATCH].data[0] as u64, 0);
+    }
+}

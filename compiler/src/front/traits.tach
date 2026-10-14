@@ -44,6 +44,7 @@ use crate::front::check::equality::eq_unsupported;
 use crate::front::check::resolve::{resolve_type, type_name_key};
 use crate::front::check::synth_mode::synth_expr;
 use crate::front::closures::fn_bounds::{fn_bound_error, fn_bound_satisfied};
+use crate::front::convert::{bound_args, collect_trait_params, impl_trait_args, implements_with};
 use crate::front::generics::{
     CUR_INST, TPL_NONE, env_enter, env_leave, instance_of, instance_targs, mangle_type,
 };
@@ -56,10 +57,14 @@ use crate::front::types::{
     fn_param, is_fieldless_enum, is_numeric, is_pointer, make_type,
 };
 
-pub struct TraitInfo { name: i64, node: i64, module: i64 }
+// (0.15: params, the Generics node of a generic trait's type parameters,
+// 0 for none: convert::collect_trait_params)
+pub struct TraitInfo { name: i64, node: i64, module: i64, params: i64 }
 // An impl of trait `tr` for type `ty`, or (generic) for the instances of
-// template `tpl` (generics.tach's encoding).
-pub struct ImplInfo { node: i64, tr: i64, ty: i64, tpl: i64, module: i64 }
+// template `tpl` (generics.tach's encoding). (0.15: targs, the arguments
+// of a generic trait, `impl From<i64> for T`: a TLISTS index, as many as
+// the trait's parameters; convert::impl_trait_args.)
+pub struct ImplInfo { node: i64, tr: i64, ty: i64, tpl: i64, module: i64, targs: i64 }
 
 pub static mut TRAITS: *TraitInfo = 0 as *TraitInfo;
 pub static mut TRAIT_COUNT: i64 = 0;
@@ -79,10 +84,12 @@ pub fn init_traits() {
 pub fn add_trait(item: i64, key: i64, m: i64) {
     unsafe {
         TRAITS = grow(TRAITS, TRAIT_COUNT, &TRAIT_CAP);
-        TRAITS[TRAIT_COUNT] = TraitInfo { name: NODES[item].a, node: item, module: m };
+        TRAITS[TRAIT_COUNT] = TraitInfo { name: NODES[item].a, node: item, module: m, params: 0 };
         TRAIT_COUNT += 1;
         SYM_TRAIT[key] = TRAIT_COUNT;
         collect_trait_assoc(TRAIT_COUNT - 1);
+        // (0.15: `trait From<T>`)
+        collect_trait_params(TRAIT_COUNT - 1);
     }
 }
 
@@ -111,11 +118,11 @@ pub fn impl_trait_node(f: i64) -> i64 {
     }
 }
 
-// The trait named by type node n (in module CUR_MOD).
+// The trait named by type node n (in module CUR_MOD). (0.15: its type
+// arguments, `From<i64>`, are the caller's: impl_trait_args, bound_args.)
 pub fn trait_named(n: i64) -> i64 {
     unsafe {
-        let key = if NODES[n].kind == NodeKind::TyName && NODES[n].g == 0 { type_name_key(n) }
-            else { -1 };
+        let key = if NODES[n].kind == NodeKind::TyName { type_name_key(n) } else { -1 };
         if key < 0 || SYM_TRAIT[key] == 0 {
             err_begin(NODES[n].start);
             err_str(c"'");
@@ -289,7 +296,7 @@ pub fn collect_impl(node: i64) {
             ty = resolve_type(NODES[node].b);
         }
         IMPLS = grow(IMPLS, IMPL_COUNT, &IMPL_CAP);
-        IMPLS[IMPL_COUNT] = ImplInfo { node: node, tr: tr, ty: ty, tpl: tpl, module: m };
+        IMPLS[IMPL_COUNT] = ImplInfo { node: node, tr: tr, ty: ty, tpl: tpl, module: m, targs: 0 };
         IMPL_COUNT += 1;
         let me = IMPL_COUNT - 1;
         // Coherence: one impl per (trait, type).
@@ -311,6 +318,8 @@ pub fn collect_impl(node: i64) {
                 return;
             }
         }
+        // (0.15: `impl From<i64> for T`)
+        impl_trait_args(me);
         collect_impl_assoc(me);
         // Its functions: each one of the trait's.
         for i in 0..NODES[node].count {
@@ -525,7 +534,9 @@ fn satisfies(p: i64, t: i64) -> bool {
         }
         for i in 0..NODES[bounds].count {
             let b = child(bounds, i);
-            if !implements(bound_trait(b), t) {
+            // (0.15: `From<U>`, a generic trait's bound)
+            if NODES[b].g != 0 && !implements_with(bound_trait(b), t, bound_args(b))
+                || NODES[b].g == 0 && !implements(bound_trait(b), t) {
                 return false;
             }
             // (0.14: `Fn(A) -> R`, and constraints `Iterator<Item = A>`)
@@ -574,7 +585,10 @@ pub fn check_bounds(params: i64, targs: i64, count: i64, what: i64, pos: i64) {
                     }
                 }
                 let tr = bound_trait(b);
-                if !implements(tr, t) {
+                // (0.15: `From<U>`, a generic trait's bound)
+                let holds = if NODES[b].g != 0 { implements_with(tr, t, bound_args(b)) }
+                    else { implements(tr, t) };
+                if !holds {
                     err_begin(pos);
                     err_str(c"the trait '");
                     err_sym(TRAITS[tr].name);
