@@ -22,7 +22,7 @@ the edited program checked before anything is written, a journal for
 | `sameout.tach` | `tachyonc same-output` |
 | `rewrite/` | `tachyonc rewrite`: typed structural search and replace (`pattern`; the parsed nodes in `parsed`) |
 | `refactor_shape/` | `refactor signature`, `field`, `variant` |
-| `refactor_mod/` | `refactor rename`, `new-module`, `move-module`; the command line (`cli`) |
+| `refactor_mod/` | `refactor rename`, `new-module`, `move-module`; the command line (`cli`); renaming a local (`local`, 0.14); the mentions in comments (`mentions`, 0.14) |
 | `refactor_move/` | `refactor move`, `split`: units and blocks (`units`), imports (`imports`) |
 | `script.tach` | `refactor --script`: commands checked once, one undo |
 | `commands.tach` | the table of the commands that change a program |

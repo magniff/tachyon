@@ -402,6 +402,58 @@ def tool_target(command):
     return all(compiler_paths(r) for r in roots) and not any(SCRATCH.search(d + "/") for d in dirs)
 
 
+GREP_ANY = "tachyonc query grep TEXT [--comments|--strings|--code] | tachyonc query items MODULE --comments"
+NAME = re.compile(r"\w+(?:(?:::|\.)\w+)*")
+
+
+def grep_patterns(prog, args, first):
+    """The patterns of a grep: each `-e P` (or `--regexp=P`), else the first
+    operand; each split into its alternatives (`a\\|b`, `a|b`)."""
+    pats = [args[i + 1] for i, a in enumerate(args[:-1]) if a in ("-e", "--regexp")]
+    pats += [a.split("=", 1)[1] for a in args if a.startswith("--regexp=")]
+    if not pats:
+        pats = [first]
+    fixed = prog == "fgrep" or any(a in ("-F", "--fixed-strings") or
+                                   (re.match(r"^-[a-zA-Z]+$", a) and "F" in a) for a in args)
+    out = []
+    for p in pats:
+        out += [p] if fixed else [x for x in re.split(r"\\\||\|", p) if x]
+    return out, fixed
+
+
+def grep_suggestion(prog, args, first):
+    """(0.13: query grep, a literal search with each hit's item and whether
+    it is in code, a comment or a string; 0.14: a regex or several
+    alternatives are never glued into one name.) A name is suggested to
+    `query refs` (which takes several) and to `query grep`, one call each;
+    a regex to `query grep` of its longest literal run."""
+    alts, fixed = grep_patterns(prog, args, first)
+    if not alts:
+        return GREP_ANY
+    unescaped = [re.sub(r"\\([^\w])", r"\1", a) for a in alts]
+    # (`\bname\b`, `\<name\>`, `^name`: a name; `\w`, `\s`, `.*` are not)
+    names = [re.sub(r"^(\\b|\\<|\^)|(\\b|\\>|\$)$", "", a) for a in alts]
+    if all(NAME.fullmatch(n) for n in names):
+        if len(names) > 4:
+            return f"tachyonc query refs {' '.join(names)} | {GREP_ANY}"
+        greps = " | ".join(f"tachyonc query grep {n}" for n in names)
+        return f"tachyonc query refs {' '.join(names)} | {greps}"
+    ere = prog in ("egrep", "rg") or any(re.match(r"^-[a-zA-Z]*[EP]", a) for a in args)
+    special = r"[\[\]*()+?{}^$\\]|\.\*" if ere else r"[\[\]*^$\\]|\.\*"
+    literal = [u for u in unescaped if fixed or not re.search(special, u)]
+    if len(literal) == len(alts) and len(alts) <= 4:
+        return " | ".join(f"tachyonc query grep {shlex.quote(u)}" for u in literal)
+    # A regex: its longest literal run, for query grep to narrow it.
+    runs = []
+    for a in alts:
+        a = re.sub(r"\\[bBwWsSdD<>]|\[[^\]]*\]|[.*+?{}()^$|\\]", " ", a)
+        runs += [r for r in re.split(r"\s+", a) if len(r) >= 3]
+    if runs:
+        best = max(runs, key=len)
+        return f"tachyonc query grep {shlex.quote(best)} | {GREP_ANY}"
+    return GREP_ANY
+
+
 def suggestion(prog, args):
     pattern = next((a for a in args if not a.startswith("-")), "")
     m = re.search(r"\b(?:fn|struct|enum|trait|const|static|type|mod)\s+(\w+)", pattern)
@@ -416,15 +468,7 @@ def suggestion(prog, args):
         text = f"tachyonc query text {files[0]}:{a}-{b}"
         return f"tachyonc query show {files[0]}:{a} | {text}" if compiler else text
     if prog in ("grep", "rg", "egrep", "fgrep"):
-        # (0.13: query grep, a literal search with each hit's item and
-        # whether it is in code, a comment or a string)
-        word = re.sub(r"[^\w:.]", "", pattern)
-        literal = re.sub(r"\\(.)", r"\1", pattern)
-        if word and not re.search(r"\s", pattern):
-            return f"tachyonc query refs {word} | tachyonc query grep {word}"
-        if literal and not re.search(r"[\[\]()*+?|^$]", literal):
-            return f"tachyonc query grep {shlex.quote(literal)}"
-        return "tachyonc query grep TEXT [--comments|--strings|--code] | tachyonc query items MODULE --comments"
+        return grep_suggestion(prog, args, pattern)
     if files and prog == "head":
         n = next((args[i + 1] for i, a in enumerate(args[:-1]) if a == "-n"), None) \
             or next((a[1:] for a in args if re.match(r"^-\d+$", a)), "10")

@@ -1,0 +1,265 @@
+// The mentions of a renamed name in comments (0.14, docs/refactor.md,
+// "rename"). Only text between backquotes on a `//` line is a mention,
+// and only in these forms:
+//
+// - an item (a function, type, trait, constant, static, module): `old`,
+//   `a::b::old`, `old()`, when no other definition is named old; a bare
+//   `old` is left alone in a function that has a local or parameter named
+//   old, and in the comment above it (it may be about that local);
+// - a member (a field, method, variant, trait function): `Owner.old`,
+//   `Owner::old`, `Owner::old()`, `a::Owner::old`, Owner the name of its
+//   struct, enum, trait or impl type; never a bare `old` (a parameter or
+//   local of that name is as likely);
+// - a local (refactor_mod/local.tach): `old`, in its scope.
+//
+// Words outside backquotes are never changed.
+
+use crate::base::{FILES, FILE_COUNT, IntVec, SRC, SYMS};
+use crate::front::ast::{NODES, NODE_COUNT};
+use crate::front::lexer::{TOKS, TOK_COUNT};
+use crate::tools::query::c_slice;
+use crate::tools::query::defs::{
+    DEFS, DEF_COUNT, K_FIELD, K_IMPL_METHOD, K_METHOD, K_TRAIT_FN, K_VARIANT, bytes_eq,
+};
+use crate::tools::query::positions::{enclosing, token_at};
+use crate::tools::query::show::text_start;
+use crate::tools::refactor_mod::{put_edit, text_of};
+use crate::tools::refactor_mod::cli::is_ident;
+use crate::tools::refactor_mod::local::{decl_name_pos, load_decls};
+
+pub const MENTION_ITEM: i64 = 0;
+pub const MENTION_MEMBER: i64 = 1;
+pub const MENTION_LOCAL: i64 = 2;
+
+// The ranges (from, to pairs) where an item's bare mention is not
+// renamed: the functions with a local of its name, their comments
+// included.
+static mut KEEP_BARE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The mentions of the old name of the definitions of group (renamed to
+// new) in the comments of the program's files.
+pub fn doc_mentions(group: *IntVec, old: i64, new: [u8]) {
+    unsafe {
+        let d = (*group).data[0];
+        let k = DEFS[d].kind;
+        let o = SYMS[old].text;
+        let member = k == K_FIELD || k == K_VARIANT || k == K_METHOD || k == K_IMPL_METHOD
+            || k == K_TRAIT_FN;
+        let mut owner = o[0..0];
+        if member {
+            owner = owner_name(d);
+            if owner.len == 0 {
+                return;
+            }
+        } else {
+            for e in 0..DEF_COUNT {
+                if DEFS[e].name != old {
+                    continue;
+                }
+                let mut mine = false;
+                for i in 0..(*group).count {
+                    if (*group).data[i] == e {
+                        mine = true;
+                    }
+                }
+                if !mine {
+                    return;
+                }
+            }
+            // (the functions with a local of that name)
+            load_decls();
+            KEEP_BARE.count = 0;
+            for n in 1..NODE_COUNT {
+                if NODES[n].a != old {
+                    continue;
+                }
+                let p = decl_name_pos(n);
+                let f = if p >= 0 { enclosing(p) } else { -1 };
+                if f >= 0 {
+                    KEEP_BARE.push(text_start(f));
+                    KEEP_BARE.push(DEFS[f].end);
+                }
+            }
+        }
+        for f in 0..FILE_COUNT {
+            if FILES[f].path[0] == '<' {
+                continue;
+            }
+            scan_mentions(FILES[f].start, FILES[f].end, o, new,
+                if member { MENTION_MEMBER } else { MENTION_ITEM }, owner);
+        }
+    }
+}
+
+// The name of the struct, enum or trait member d belongs to, or of its
+// impl's type (its path's last segment); empty when unknown.
+fn owner_name(d: i64) -> [u8] {
+    unsafe {
+        if DEFS[d].parent >= 0 {
+            return SYMS[DEFS[DEFS[d].parent].name].text;
+        }
+        if DEFS[d].owner <= 0 {
+            return c_slice(c"");
+        }
+        let t = SYMS[DEFS[d].owner].text;
+        let mut e = 0;
+        while e < t.len && t[e] != '<' {
+            e += 1;
+        }
+        let mut s = e;
+        while s > 0 && t[s - 1] != ':' {
+            s -= 1;
+        }
+        t[s..e]
+    }
+}
+
+// The mentions in the comments of SRC[a..b) (a, b in one file, outside
+// tokens): the gaps between its tokens hold the comments.
+pub fn scan_mentions(a: i64, b: i64, old: [u8], new: [u8], mode: i64, owner: [u8]) {
+    unsafe {
+        let mut from = a;
+        let mut i = token_at(a);
+        loop {
+            let to = if i < TOK_COUNT && TOKS[i].start < b { TOKS[i].start } else { b };
+            mentions_in(from, to, old, new, mode, owner);
+            if to >= b {
+                break;
+            }
+            from = TOKS[i].end;
+            i += 1;
+        }
+    }
+}
+
+// The mentions in the comments of SRC[from..to) (no token in it).
+fn mentions_in(from: i64, to: i64, old: [u8], new: [u8], mode: i64, owner: [u8]) {
+    unsafe {
+        let mut p = from;
+        while p + 1 < to {
+            if SRC[p] != '/' || SRC[p + 1] != '/' {
+                p += 1;
+                continue;
+            }
+            // A comment: its backquoted spans.
+            let mut q = p + 2;
+            while q < to && SRC[q] != '\n' {
+                if SRC[q] != '`' {
+                    q += 1;
+                    continue;
+                }
+                let mut e = q + 1;
+                while e < to && SRC[e] != '`' && SRC[e] != '\n' {
+                    e += 1;
+                }
+                if e >= to || SRC[e] != '`' {
+                    break;
+                }
+                let s = SRC[q + 1..e];
+                let mut at = -1;
+                if mode == MENTION_LOCAL {
+                    if bytes_eq(s, old) {
+                        at = 0;
+                    }
+                } else if mode == MENTION_MEMBER {
+                    at = member_mention(s, old, owner);
+                } else {
+                    at = mention(s, old);
+                    if at == 0 && s.len == old.len && keeps_bare(q) {
+                        at = -1;
+                    }
+                }
+                if at >= 0 {
+                    put_edit(q + 1 + at, q + 1 + at + old.len, text_of(new));
+                }
+                q = e + 1;
+            }
+            p = q;
+        }
+    }
+}
+
+// Whether position p is in one of the KEEP_BARE ranges.
+fn keeps_bare(p: i64) -> bool {
+    unsafe {
+        let mut i = 0;
+        while i + 1 < KEEP_BARE.count {
+            if p >= KEEP_BARE.data[i] && p < KEEP_BARE.data[i + 1] {
+                return true;
+            }
+            i += 2;
+        }
+        false
+    }
+}
+
+// Where old is in s when s is `old`, `a::b::old` or `old()`, else -1.
+fn mention(s: [u8], old: [u8]) -> i64 {
+    let mut t = s;
+    if t.len > 2 && t[t.len - 2] == '(' && t[t.len - 1] == ')' {
+        t = t[0..t.len - 2];
+    }
+    if t.len < old.len || !bytes_eq(t[t.len - old.len..t.len], old) {
+        return -1;
+    }
+    let at = t.len - old.len;
+    if at == 0 {
+        return 0;
+    }
+    if at < 3 || t[at - 1] != ':' || t[at - 2] != ':' {
+        return -1;
+    }
+    if path_prefix(t[0..at - 2]) { at } else { -1 }
+}
+
+// Where old is in s when s is `Owner.old`, `Owner::old`, `Owner::old()`
+// or `a::Owner::old`, else -1.
+fn member_mention(s: [u8], old: [u8], owner: [u8]) -> i64 {
+    let mut t = s;
+    if t.len > 2 && t[t.len - 2] == '(' && t[t.len - 1] == ')' {
+        t = t[0..t.len - 2];
+    }
+    if t.len < old.len + 2 || !bytes_eq(t[t.len - old.len..t.len], old) {
+        return -1;
+    }
+    let at = t.len - old.len;
+    let mut end = at - 1;
+    if t[at - 1] == ':' {
+        if t[at - 2] != ':' {
+            return -1;
+        }
+        end = at - 2;
+    } else if t[at - 1] != '.' {
+        return -1;
+    }
+    if end < owner.len || !bytes_eq(t[end - owner.len..end], owner) {
+        return -1;
+    }
+    let start = end - owner.len;
+    if start == 0 {
+        return at;
+    }
+    if start < 3 || t[start - 1] != ':' || t[start - 2] != ':' {
+        return -1;
+    }
+    if path_prefix(t[0..start - 2]) { at } else { -1 }
+}
+
+// Whether s is a path: identifiers (`crate`, `super`) joined by `::`.
+fn path_prefix(s: [u8]) -> bool {
+    let mut i = 0;
+    while i < s.len {
+        let mut e = i;
+        while e < s.len && s[e] != ':' {
+            e += 1;
+        }
+        if unsafe {
+            !is_ident(s[i..e]) && !bytes_eq(s[i..e], c_slice(c"crate"))
+                && !bytes_eq(s[i..e], c_slice(c"super"))
+        } {
+            return false;
+        }
+        i = e + 2;
+    }
+    true
+}

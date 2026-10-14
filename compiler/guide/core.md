@@ -469,7 +469,8 @@ tachyonc query items [MODULE]           # a module's items with signatures, like
 tachyonc edit patch NAME --old 'a < b' --new 'a <= b'   # change text inside one item
 tachyonc edit replace NAME < new.tach   # replace an item; edit insert --after NAME; edit delete NAME
 tachyonc fix                            # missing imports, unused, pub, unsafe blocks
-tachyonc undo                           # take the last edit back (in a git checkout)
+tachyonc undo                           # take the last edit back
+tachyonc refactor rename main::x total  # a local (or FILE:LINE:COL), an item, a field, with every use
 ```
 
 ROOT is `--root FILE`, a last argument ending in `.tach`, or

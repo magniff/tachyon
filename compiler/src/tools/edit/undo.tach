@@ -13,18 +13,21 @@ use crate::tools::proc::{
     absolute_path, buf_cstr, make_dirs, read_file_if, remove_dir, remove_file, rename_file,
     same_bytes, write_file_if,
 };
-use crate::tools::query::c_slice;
+use crate::tools::query::{c_slice, find_root};
 use crate::tools::query::diagnostics::{diag, try_begin, try_end};
 
 // ---- The journal ----
 //
-// .git/tachyon-edits (the git directory of the root's checkout): `head`
-// holds the number N of the last edit; directory N/ holds its `summary`
+// .git/tachyon-edits (the git directory of the root's checkout), or, for
+// a program in no git checkout (0.14), .tachyonc/edits next to its root
+// (and found from below it): `head` holds the number N of the last edit; directory N/ holds its `summary`
 // line, its `files` (one `ABSOLUTE-PATH<TAB>NEW` per changed file, NEW 1
 // for a file the edit made) and each file's text before (`K.before`) and
 // after (`K.after`) the edit. `tachyonc undo` restores the last one.
 
-// The journal's directory (0: no git checkout around `from`).
+// The journal's directory: in the git directory of the checkout around
+// `from`; outside one (0.14), `.tachyonc/edits` in the nearest directory
+// up from `from` that has one, else in from's directory.
 pub fn journal_dir(from: *u8) -> *u8 {
     unsafe {
         let start = absolute_path(from);
@@ -39,6 +42,10 @@ pub fn journal_dir(from: *u8) -> *u8 {
                 BUFS[dir].len -= 1;
             }
         }
+        let own = buf_new();
+        buf_bytes(own, buf_slice(dir));
+        buf_str(own, c"/.tachyonc/edits");
+        let fallback = buf_cstr(own);
         loop {
             let git = buf_new();
             buf_bytes(git, buf_slice(dir));
@@ -74,8 +81,14 @@ pub fn journal_dir(from: *u8) -> *u8 {
                     return buf_cstr(out);
                 }
             }
+            let mine = buf_new();
+            buf_bytes(mine, buf_slice(dir));
+            buf_str(mine, c"/.tachyonc/edits");
+            if is_dir(buf_cstr(mine)) {
+                return buf_cstr(mine);
+            }
             if BUFS[dir].len <= 1 {
-                return 0 as *u8;
+                return fallback;
             }
             while BUFS[dir].len > 1 && BUFS[dir].data[BUFS[dir].len - 1] != '/' {
                 BUFS[dir].len -= 1;
@@ -203,11 +216,21 @@ pub fn journal(root: *u8, summary: [u8]) {
     }
 }
 
+// Where undo and query diff look for the journal: ROOT when given, else
+// the program's default root (./main.tach...), else the current directory.
+fn default_from(from: *u8) -> *u8 {
+    if from != 0 as *u8 {
+        return from;
+    }
+    let root = unsafe { find_root(0 as *u8) };
+    if root != 0 as *u8 { root } else { c"." }
+}
+
 // `tachyonc undo [--force] [ROOT]`: restores the files of the last edit
 // (refused when one changed since, unless --force).
 pub fn run_undo(force: bool, from: *u8) -> i64 {
     unsafe {
-        let dir = journal_dir(if from != 0 as *u8 { from } else { c"." });
+        let dir = journal_dir(default_from(from));
         let n = if dir == 0 as *u8 { 0 } else { read_number(path_in(dir, c"head")) };
         let files = buf_new();
         if n <= 0 || !read_file_if(entry_path(dir, n, -1, c"files"), files) {
@@ -303,7 +326,7 @@ pub fn run_undo(force: bool, from: *u8) -> i64 {
 // context lines; nothing changes.
 pub fn run_query_diff(from: *u8) -> i64 {
     unsafe {
-        let dir = journal_dir(if from != 0 as *u8 { from } else { c"." });
+        let dir = journal_dir(default_from(from));
         let n = if dir == 0 as *u8 { 0 } else { read_number(path_in(dir, c"head")) };
         let files = buf_new();
         if n <= 0 || !read_file_if(entry_path(dir, n, -1, c"files"), files) {
