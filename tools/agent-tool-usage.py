@@ -4,6 +4,7 @@ from the development transcripts, classified by what it was for, so that
 the common ones can become compiler queries (see docs/agents.md).
 
 usage: tools/agent-tool-usage.py TRANSCRIPT_DIR [--csv OUT.csv]
+       tools/agent-tool-usage.py --hook-log .git/agent-tools.jsonl
 
 TRANSCRIPT_DIR holds the session transcripts (*.jsonl, subagents/ too).
 Prints a markdown report on stdout. Development tooling only: not part of
@@ -124,7 +125,47 @@ def iter_transcripts(root):
                 yield os.path.join(dirpath, f)
 
 
+def hook_report(path):
+    """Summary of the query-first hook's log (tools/agent-hooks/query-first.py):
+    how often agents used `tachyonc query`, were blocked, or went around it,
+    and why."""
+    recs = []
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            try:
+                recs.append(json.loads(line))
+            except ValueError:
+                pass
+    kinds = Counter(r.get("kind") for r in recs)
+    print("## The query-first hook\n")
+    print("| event | count |\n|---|---|")
+    for k in ("query", "query-result", "blocked", "escape", "read", "grep", "edit", "read-unenforced"):
+        if kinds.get(k):
+            print(f"| {k} | {kinds[k]} |")
+    subs = Counter()
+    for r in recs:
+        if r.get("kind") == "query":
+            m = re.search(r"query\s+(\w+)", r.get("command", ""))
+            if m:
+                subs[m.group(1)] += 1
+    if subs:
+        print("\nQueries by command: " + ", ".join(f"`{k}` {v}" for k, v in subs.most_common()))
+    empty = [r for r in recs if r.get("kind") == "query-result" and (r.get("out_lines", 0) == 0 or r.get("stderr"))]
+    if empty:
+        print(f"\nQueries that answered nothing or failed: {len(empty)}\n")
+        for r in empty[:15]:
+            print(f"- `{r.get('command','')[:100]}` {r.get('stderr','')[:100]}")
+    esc = [r for r in recs if r.get("kind") == "escape"]
+    if esc:
+        print(f"\n## Where query was not enough ({len(esc)})\n")
+        for r in esc:
+            print(f"- {r.get('reason','')}  \n  `{r.get('command','')[:120]}`")
+
+
 def main():
+    if len(sys.argv) >= 3 and sys.argv[1] == "--hook-log":
+        hook_report(sys.argv[2])
+        return
     if len(sys.argv) < 2:
         print(__doc__)
         sys.exit(2)
