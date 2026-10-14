@@ -23,4 +23,4 @@ start from what it leaves: the AST, its types, the tables of items.
 | `generics/` | generics by monomorphization: instances of structs and enums; inference and function instances in `instantiate` |
 | `traits.tach` | traits: bounds, impls, operator traits |
 | `assoc.tach` | (0.14) associated types: `type Item;`, projections `T::Item`, `Item = T` constraints, lazy defaults |
-| `closures.tach` | (0.14) closures: their types (env structs), captures, calls, `Fn`/`FnMut` bounds |
+| `closures/` | (0.14) closures: their types (env structs), captures, calls (`mod.tach`); `Fn`/`FnMut` bounds and the closure arguments they type (`fn_bounds.tach`); the escape check (`escape.tach`) |

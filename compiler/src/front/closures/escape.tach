@@ -1,0 +1,85 @@
+// Escape (0.14): a value whose type holds a closure that borrows a
+// variable cannot leave that variable's scope (check_scope_exit).
+use crate::base::diag::{err_begin, err_end, err_help, err_help_sym, err_str, err_sym};
+use crate::front::check::LOCALS;
+use crate::front::closures::{CLOSURES, struct_field_of};
+use crate::front::types::{
+    ENUMS, STRUCTS, TYPES, TY_ERROR, TyKind, VARIANTS, enum_variant, type_elem,
+};
+use crate::middle::lower::ssa::HMap;
+
+// Whether some closure borrows a variable (check_scope_exit has work).
+pub static mut ANY_BORROW: bool = false;
+// type + 1 -> the deepest local a value of the type borrows + 2 (1 while
+// being computed); see type_borrow.
+static mut BORROWS: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+// ---- Escape ----
+
+// The deepest local a value of type t borrows through the closures it
+// holds (-1: none); memoized.
+pub fn type_borrow(t: i64) -> i64 {
+    unsafe {
+        if t <= 0 || t == TY_ERROR {
+            return -1;
+        }
+        let known = BORROWS.get(t + 1);
+        if known != 0 {
+            return known - 2;
+        }
+        BORROWS.put(t + 1, 1);
+        let mut b = -1;
+        let kind = TYPES[t].kind;
+        if kind == TyKind::Struct {
+            let s = TYPES[t].a;
+            if STRUCTS[s].closure != 0 {
+                b = CLOSURES[STRUCTS[s].closure - 1].borrow_depth;
+            } else {
+                for i in 0..STRUCTS[s].field_count {
+                    b = max_of(b, type_borrow((*struct_field_of(s, i)).ty));
+                }
+            }
+        } else if kind == TyKind::Tuple {
+            for i in 0..TYPES[t].count {
+                b = max_of(b, type_borrow(type_elem(t, i)));
+            }
+        } else if kind == TyKind::Ptr || kind == TyKind::Slice || kind == TyKind::Array {
+            b = type_borrow(TYPES[t].a);
+        } else if kind == TyKind::Enum {
+            let e = TYPES[t].a;
+            for i in 0..ENUMS[e].variant_count {
+                b = max_of(b, type_borrow(VARIANTS[enum_variant(e, i)].shape));
+            }
+        }
+        BORROWS.put(t + 1, b + 2);
+        b
+    }
+}
+
+fn max_of(a: i64, b: i64) -> i64 {
+    if a > b { a } else { b }
+}
+
+// A value of type ty leaves a scope (a block's tail, a `break` value, a
+// match arm's value) whose locals are those numbered from `depth` (a
+// LOCAL_COUNT mark): an error at pos if it holds a closure borrowing one.
+pub fn check_scope_exit(ty: i64, depth: i64, pos: i64) {
+    unsafe {
+        if !ANY_BORROW {
+            return;
+        }
+        let b = type_borrow(ty);
+        if b < depth {
+            return;
+        }
+        let name = LOCALS[b].name;
+        err_begin(pos);
+        err_str(c"this value holds a closure that borrows '");
+        err_sym(name);
+        err_str(c"', which does not live outside this block");
+        err_help(c"write `move`, or declare '");
+        err_help_sym(name);
+        err_help(c"' outside the block");
+        err_end();
+    }
+}

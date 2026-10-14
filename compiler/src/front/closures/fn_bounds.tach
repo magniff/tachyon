@@ -1,0 +1,272 @@
+// Fn bounds (0.14): whether a closure or a fn type satisfies an
+// `F: Fn(..)`/`FnMut(..)` bound, the errors when not, and the types a
+// bound gives a closure argument's parameters during inference.
+
+use crate::base::diag::{
+    err_begin, err_end, err_help, err_int, err_str, err_sym, errors_forget, errors_mark,
+};
+use crate::front::ast::{NODES, NodeKind, child};
+use crate::front::check::{LOCALS, SELF_TYPE, TRY_RESULT, Try, attempt};
+use crate::front::closures::{CLOSURES, check_closure_sig, closure_of_type};
+use crate::front::generics::{TP_BASE, TP_NAMES, TP_TYPES, env_leave};
+use crate::front::generics::instantiate::{
+    UNIFY_SELF, UNIFY_SELF_TY, mentions_unbound, tparam_index, unify,
+};
+use crate::front::modules::{CUR_MOD, module_of};
+use crate::front::types::{TSCRATCH, TYPES, TY_ERROR, TyKind, err_type, make_type, type_elem};
+use std::Option;
+
+// Type node n resolved, or 0 when it names nothing here (no error).
+fn resolve_quietly(n: i64) -> i64 {
+    let mark = errors_mark();
+    if attempt(Try::Type, n) {
+        return TRY_RESULT;
+    }
+    errors_forget(mark);
+    0
+}
+
+// The fn type bound `bound` (a TyFn node) stands for, in the current
+// scope of type parameters; 0 when a part of it is unknown.
+fn bound_sig(bound: i64) -> i64 {
+    unsafe {
+        let saved = CUR_MOD;
+        CUR_MOD = module_of(bound);
+        let mark = TSCRATCH.count;
+        let mut known = true;
+        for i in 0..NODES[bound].count {
+            let t = resolve_quietly(child(bound, i));
+            known = known && t != 0;
+            TSCRATCH.push(t);
+        }
+        let ret = resolve_quietly(NODES[bound].a);
+        CUR_MOD = saved;
+        if !known || ret == 0 {
+            TSCRATCH.count = mark;
+            return 0;
+        }
+        make_type(TyKind::Fn, ret, 0, mark)
+    }
+}
+
+// The fn type of a value of type t a bound can take: a closure's
+// signature, or a plain fn type; 0.
+fn callable_sig(t: i64) -> i64 {
+    unsafe {
+        let c = closure_of_type(t);
+        if c != 0 {
+            return CLOSURES[c - 1].sig;
+        }
+        if t > 0 && TYPES[t].kind == TyKind::Fn && TYPES[t].b == 0 {
+            return t;
+        }
+        0
+    }
+}
+
+// Whether type t satisfies the bound `bound` (a TyFn node, d = 2 for
+// `Fn`, 3 for `FnMut`), its type parameters in scope.
+pub fn fn_bound_satisfied(bound: i64, t: i64) -> bool {
+    unsafe {
+        if t == TY_ERROR {
+            return true;
+        }
+        let sig = callable_sig(t);
+        if sig == 0 || TYPES[sig].count != NODES[bound].count {
+            return false;
+        }
+        let c = closure_of_type(t);
+        if NODES[bound].d == 2 && c != 0 && CLOSURES[c - 1].writes {
+            return false;
+        }
+        let wanted = bound_sig(bound);
+        wanted == 0 || wanted == sig
+    }
+}
+
+// The error for a type t that does not satisfy bound `bound` of
+// parameter `param` (a name) of generic item `what`, at pos.
+pub fn fn_bound_error(bound: i64, t: i64, param: i64, what: i64, pos: i64) -> ! {
+    unsafe {
+        let c = closure_of_type(t);
+        let sig = callable_sig(t);
+        let wanted = bound_sig(bound);
+        err_begin(pos);
+        if c != 0 && NODES[bound].d == 2 && CLOSURES[c - 1].writes
+            && (wanted == 0 || wanted == sig) {
+            err_str(c"the closure assigns to '");
+            err_sym(LOCALS[CLOSURES[c - 1].write_local].name);
+            err_str(c"', so it is not 'Fn' as the bound of '");
+            err_sym(param);
+            err_str(c"' of '");
+            err_sym(what);
+            err_str(c"' asks");
+            err_help(c"make the bound 'FnMut(...)', or do not assign to captured variables in the closure");
+            err_end();
+        }
+        err_str(c"the type '");
+        err_type(t);
+        err_str(c"' does not satisfy the bound '");
+        err_sym(param);
+        err_str(if NODES[bound].d == 2 { c": Fn" } else { c": FnMut" });
+        if wanted != 0 {
+            err_str(c"(");
+            for i in 0..TYPES[wanted].count {
+                if i > 0 {
+                    err_str(c", ");
+                }
+                err_type(type_elem(wanted, i));
+            }
+            err_str(c") -> ");
+            err_type(TYPES[wanted].a);
+        } else {
+            err_str(c"(...)");
+        }
+        err_str(c"' of '");
+        err_sym(what);
+        err_str(c"'");
+        if sig == 0 {
+            err_help(c"pass a closure or a function");
+        }
+        err_end()
+    }
+}
+
+// The Fn or FnMut bound of type parameter k of `params` (0: none).
+fn fn_bound_of(params: i64, k: i64) -> i64 {
+    unsafe {
+        let bounds = NODES[child(params, k)].h;
+        if bounds == 0 {
+            return 0;
+        }
+        for i in 0..NODES[bounds].count {
+            let b = child(bounds, i);
+            if NODES[b].kind == NodeKind::TyFn && NODES[b].d >= 2 {
+                return b;
+            }
+        }
+        0
+    }
+}
+
+// Whether argument `arg` is inferred last (infer_from's third pass): a
+// closure, whose parameter types come from its parameter's bound.
+pub fn is_deferred_arg(arg: i64) -> bool {
+    unsafe { NODES[arg].kind == NodeKind::Closure && NODES[arg].x == 0 }
+}
+
+// infer_from's third pass (and infer_struct_literal's): closure `arg`
+// against parameter type node `p` of a template declared in module `tmod`
+// (bound[] holds what is inferred so far). Its parameter types (and
+// result) come from p's `Fn` bound, as far as they are known; then it
+// binds the parameter p names, and what the bound's types name.
+pub fn infer_closure_arg(params: i64, bound: *i64, tmod: i64, arg: i64, p: i64) {
+    unsafe {
+        let mut fnb = 0;
+        if NODES[p].kind == NodeKind::TyName && NODES[p].count == 0 && NODES[p].g == 0 {
+            match tparam_index(params, NODES[p].a) {
+                Option::Some(k) => fnb = fn_bound_of(params, k),
+                Option::None => {}
+            }
+        }
+        let count = NODES[arg].count;
+        let mark = TSCRATCH.count;
+        let mut ret = 0;
+        if fnb != 0 && NODES[fnb].count != count {
+            err_begin(NODES[arg].start);
+            err_str(c"this closure takes ");
+            err_int(count);
+            err_str(if count == 1 { c" parameter, but the bound of '" }
+                else { c" parameters, but the bound of '" });
+            err_sym(NODES[p].a);
+            err_str(c"' takes ");
+            err_int(NODES[fnb].count);
+            err_end();
+        }
+        if fnb != 0 {
+            // The bound's types, in the template's scope: its parameters
+            // bound so far, its module, its `Self`.
+            let saved_base = TP_BASE;
+            let saved_mod = CUR_MOD;
+            let saved_self = SELF_TYPE;
+            TP_BASE = TP_NAMES.count;
+            for k in 0..NODES[params].count {
+                if bound[k] != 0 {
+                    TP_NAMES.push(NODES[child(params, k)].a);
+                    TP_TYPES.push(bound[k]);
+                }
+            }
+            CUR_MOD = tmod;
+            SELF_TYPE = if UNIFY_SELF != 0
+                && !mentions_unbound(params, bound, UNIFY_SELF) {
+                // (in the impl's module: a trait default copied into an
+                // impl elsewhere is checked in the trait's)
+                CUR_MOD = module_of(UNIFY_SELF);
+                let t = resolve_quietly(UNIFY_SELF);
+                CUR_MOD = tmod;
+                t
+            } else {
+                UNIFY_SELF_TY
+            };
+            for i in 0..count {
+                let q = child(fnb, i);
+                TSCRATCH.push(if mentions_unbound(params, bound, q) { 0 }
+                    else { resolve_quietly(q) });
+            }
+            if !mentions_unbound(params, bound, NODES[fnb].a) {
+                ret = resolve_quietly(NODES[fnb].a);
+            }
+            env_leave(saved_base);
+            CUR_MOD = saved_mod;
+            SELF_TYPE = saved_self;
+        } else {
+            for _ in 0..count {
+                TSCRATCH.push(0);
+            }
+        }
+        let sig = check_closure_sig(arg, mark, ret);
+        let t = NODES[arg].ty;
+        if !unify(params, bound, tmod, p, t) {
+            err_begin(NODES[arg].start);
+            err_str(c"mismatched types: this is '");
+            err_type(t);
+            err_str(c"', which does not fit the type parameters inferred so far");
+            err_end();
+        }
+        if fnb != 0 {
+            unify_bound(params, bound, tmod, fnb, sig);
+        }
+    }
+}
+
+// What the types of Fn bound `fnb` name, bound from fn type `sig`.
+fn unify_bound(params: i64, bound: *i64, tmod: i64, fnb: i64, sig: i64) {
+    unsafe {
+        if TYPES[sig].count != NODES[fnb].count {
+            return;
+        }
+        for i in 0..NODES[fnb].count {
+            unify(params, bound, tmod, child(fnb, i), type_elem(sig, i));
+        }
+        unify(params, bound, tmod, NODES[fnb].a, TYPES[sig].a);
+    }
+}
+
+// After the arguments (infer_from): type parameter k, bound to a closure
+// or fn type, binds what its Fn bound's types name (`B` of
+// `F: FnMut(A) -> B` when a function is passed for F).
+pub fn infer_from_fn_bound(params: i64, bound: *i64, tmod: i64, k: i64) {
+    unsafe {
+        if bound[k] == 0 {
+            return;
+        }
+        let fnb = fn_bound_of(params, k);
+        if fnb == 0 {
+            return;
+        }
+        let sig = callable_sig(bound[k]);
+        if sig != 0 {
+            unify_bound(params, bound, tmod, fnb, sig);
+        }
+    }
+}
