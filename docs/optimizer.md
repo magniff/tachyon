@@ -1222,13 +1222,44 @@ about the cheap and general ones:
   unknown to the compiler) and a fuzz mode, `tests/fuzz/run.sh -D`
   (`gendiv.awk`: random constants and dividends, the extremes and exact
   multiples, every level against -O0).
+- *Ranges through phis* (range.tach). A phi's range is the union of its
+  operands' ranges, each at the end of its predecessor with the facts
+  there and on the edge. The phis of a loop header are found together by
+  induction: each is assumed in a range H, the operands coming back around
+  the loop are ranged under the assumptions, and when each falls in its
+  phi's H, every phi is in its H always (H holds the entry operands). H
+  starts as the entry operands' range, then takes in what came back (a
+  join), then is widened to what the facts on the edges back allow (an
+  induction variable below its loop's bound, with any step, even one read
+  from memory; a decreasing one above its floor), then to the type's
+  range, which proves nothing but holds. Phis of other blocks are ranged
+  likewise (their loop header's phis first); a range found under an
+  assumption about an enclosing phi is kept only for that assumption.
+  Facts comparing a value with another now bound it by the other's range
+  (`child < end` with end below 1000000), arithmetic shifts and 64-bit
+  conversions keep ranges, and an operation of one operand costs a
+  quarter of the depth of one of two (light cleanup leaves chains like
+  `0 + (n - 0) * 1`). A branch on the phi of `&&` or `||` is threaded from
+  the predecessor that decided it (as isel.tach does), so that in
+  `child + 1 < end && s[child] < s[child + 1]` the first test holds where
+  the whole one is true.
+
+  Phi ranges are found while the branch of a check is decided (one way
+  ends the program: a bounds check, an unwrap): elsewhere they cost more
+  than they find (the self-compile spent 4% more with them everywhere).
+  bench/sort's heapsort, inlined into main with its vector's length known,
+  keeps none of its 12 checks (16 checks before, 4 now, all in the generic
+  sift-down of the records, where `end <= s.len` is not known: its first
+  `s[root]` may fail). `tests/run/opt_range_phi.tach`: a step of 2, a
+  step read from memory, a decreasing index, a sift-down; and an index
+  that reaches past the end, whose check stays (and fails).
 
 What remains, measured:
 
-- *Bounds checks* that need facts the ranges do not carry: sort's
-  `s[root]` (root is the previous iteration's child, checked then, but a
-  phi has no range) and `s[child]` after the `&&` (checked on one way
-  only). C has no checks; this is the safety tachyon keeps.
+- *Bounds checks* that need facts the ranges do not carry: in a generic
+  sift-down, `end <= s.len` (so the first `s[root]`, with root the
+  caller's start, keeps its check). C has no checks; this is the safety
+  tachyon keeps.
 - *FMA*: clang contracts `a * b + c` by default (nbody: 27 ms against 29
   with `-ffp-contract=off`); tachyon never does, as that changes results.
 - *Floats compared for a branch* are `fcmp`, `cset`, `cbnz` on AArch64

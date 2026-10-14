@@ -5,7 +5,7 @@
 #
 # usage: tests/fuzz/run.sh [-c COMPILER] [-s SEED] [-t TARGET] [-n COUNT]
 #                          [-f FIRST] [-k DIR] [-j JOBS] [-l] [-g] [-p] [-C] [-N]
-#                          [-V] [-D]
+#                          [-V] [-D] [-R]
 #
 #   -c COMPILER   the tachyonc to test (default: target/tachyonc)
 #   -s SEED       also compare with the seed binary (divisors are then
@@ -25,6 +25,8 @@
 #                 (0.11), each also checked against a division by an
 #                 unknown divisor (a FAIL line is a failure; not run by
 #                 the seed, which traps on 0)
+#   -R            loops indexing arrays of fixed sizes with steps of any
+#                 kind, from genrange.awk (0.11: ranges through phis)
 #   -j JOBS       programs tested at once (default: the number of CPUs)
 
 set -u
@@ -54,8 +56,9 @@ while [ $# -gt 0 ]; do
         -N) LANG06=1; shift ;;
         -V) VECTOR=1; shift ;;
         -D) DIVIDE=1; shift ;;
+        -R) RANGES=1; shift ;;
         -j) JOBS=$2; shift 2 ;;
-        *) sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+        *) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
     esac
 done
 if [ -z "$TARGET" ]; then
@@ -89,6 +92,8 @@ test_seed() {
     program="$WORK/p$seed.tach"
     if [ "${VECTOR:-0}" = 1 ]; then
         awk -v seed="$seed" -f "$ROOT/tests/fuzz/genvec.awk" >"$program"
+    elif [ "${RANGES:-0}" = 1 ]; then
+        awk -v seed="$seed" -f "$ROOT/tests/fuzz/genrange.awk" >"$program"
     elif [ "${DIVIDE:-0}" = 1 ]; then
         awk -v seed="$seed" -v iterations=500 -f "$ROOT/tests/fuzz/gendiv.awk" >"$program"
     else
