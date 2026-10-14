@@ -11,6 +11,9 @@
 //   pub      `pub` on the items other modules use while they are private
 //   unsafe   unsafe operations outside unsafe code, wrapped in unsafe
 //            blocks (fixunsafe.tach)
+//   std015   (0.15, only when asked for) the calls of 0.14 std functions
+//            whose result became a Result, given the method that gives
+//            the old value back (fixstd015.tach)
 //
 // `tachyonc --fix-imports ROOT` and `--fix-unsafe ROOT` (0.8, 0.9) are
 // `fix --only imports` and `fix --only unsafe`, silent when there is
@@ -20,7 +23,7 @@ use crate::base::{
     BUFS, FILES, IntVec, OVERLAY, SRC, STDOUT, SYMS, buf_byte, buf_bytes, buf_int, buf_new,
     buf_slice, buf_str, buf_write_fd, intern, streq,
 };
-use crate::front::ast::{NODES, NODE_COUNT, NodeKind, child};
+use crate::front::ast::{KEEP_PARSED, NODES, NODE_COUNT, NodeKind, child};
 use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
 use crate::front::modules::{C_MODULE, MODULES, STD_MODULE, file_of_pos, module_count, module_of};
 use crate::front::modules::lookup::{B_PRIVATE, LEGACY_IMPORTS, binding_kind, binding_value};
@@ -33,6 +36,7 @@ use crate::tools::edit::apply::{
 use crate::tools::edit::cli::{delete_lines, take_edit_option};
 use crate::tools::edit::items::{after_line, indent_of, node_head};
 use crate::tools::fiximports::{FIX_IMPORTS, fix_imports_edits};
+use crate::tools::fixstd015::std015_edits;
 use crate::tools::fixunsafe::{FIX_UNSAFE, WHOLE_BODIES, fix_unsafe_edits};
 use crate::tools::query::{c_slice, load_program, root_or_diag};
 use crate::tools::query::defs::{DEFS, DEF_COUNT, MOD_DEF};
@@ -52,6 +56,8 @@ const F_UNSAFE: i64 = 8;
 // (0.12; not in the default: --only tidy-imports, --only reexports)
 const F_TIDY: i64 = 16;
 const F_REEXPORTS: i64 = 32;
+// (0.15: only when asked for, as tidy-imports and reexports: fixstd015.tach)
+const F_STD015: i64 = 64;
 const F_ALL: i64 = 15;
 
 // What the checker found to fix: the imports an unknown name asks for
@@ -620,10 +626,11 @@ fn run_fix_inner(argc: i64, argv: **u8, alias: i64) -> i64 {
                         else if word_is(w, c"pub") { F_PUB }
                         else if word_is(w, c"unsafe") { F_UNSAFE }
                         else if word_is(w, c"tidy-imports") { F_TIDY }
-                        else if word_is(w, c"reexports") { F_REEXPORTS } else { 0 };
+                        else if word_is(w, c"reexports") { F_REEXPORTS }
+                        else if word_is(w, c"std015") { F_STD015 } else { 0 };
                     if bit == 0 {
                         let d = diag(c"error", c"fix.usage");
-                        buf_str(d, c"--only takes imports, unused, pub, unsafe, tidy-imports or reexports, not '");
+                        buf_str(d, c"--only takes imports, unused, pub, unsafe, tidy-imports, reexports or std015, not '");
                         buf_bytes(d, w);
                         buf_str(d, c"'\n");
                         return 2;
@@ -664,6 +671,10 @@ fn run_fix_inner(argc: i64, argv: **u8, alias: i64) -> i64 {
         }
         FIX_IMPORTS = (only & F_IMPORTS) != 0;
         FIX_UNSAFE = (only & F_UNSAFE) != 0;
+        // (std015 reads the calls as written)
+        if (only & F_STD015) != 0 {
+            KEEP_PARSED = true;
+        }
         if !load_program(root, TARGET) {
             program_errors(c"error", root, true);
             return 1;
@@ -684,7 +695,9 @@ fn run_fix_inner(argc: i64, argv: **u8, alias: i64) -> i64 {
         let mut dropped = 0;
         let through = if (only & F_REEXPORTS) != 0 { reexport_edits(&dropped) } else { 0 };
         let tidied = if (only & F_TIDY) != 0 { tidy_import_edits() } else { 0 };
-        let mut counts = [imports, wild, unused, public, wrapped, through, dropped, tidied];
+        let migrated = if (only & F_STD015) != 0 { std015_edits() } else { 0 };
+        let mut counts = [imports, wild, unused, public, wrapped, through, dropped, tidied,
+            migrated];
         if round {
             // (a later round, on the edited program: what it fixed, the
             // copies it rewrote)
@@ -693,7 +706,7 @@ fn run_fix_inner(argc: i64, argv: **u8, alias: i64) -> i64 {
             }
             let out = buf_new();
             buf_str(out, c"count");
-            for k in 0..8 {
+            for k in 0..9 {
                 buf_byte(out, '\t');
                 buf_int(out, counts[k]);
             }
@@ -729,6 +742,7 @@ fn run_fix_inner(argc: i64, argv: **u8, alias: i64) -> i64 {
         put_count(what, counts[5], c"import through a re-export", c"imports through re-exports");
         put_count(what, counts[6], c"unused re-export", c"unused re-exports");
         put_count(what, counts[7], c"untidy use line", c"untidy use lines");
+        put_count(what, counts[8], c"call of 0.14's std", c"calls of 0.14's std");
         finish_edit(buf_slice(what), root)
     }
 }
@@ -736,7 +750,7 @@ fn run_fix_inner(argc: i64, argv: **u8, alias: i64) -> i64 {
 // A round of fix on the edited program (`PROG fix --round ... --overlay
 // FILE COPY... ROOT`): adds what it fixed to counts. Whether it fixed
 // anything.
-fn more_round(root: *u8, only_arg: *u8, counts: *[i64; 8]) -> bool {
+fn more_round(root: *u8, only_arg: *u8, counts: *[i64; 9]) -> bool {
     unsafe {
         let mut args = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         args.push(PROG as i64);
@@ -780,7 +794,7 @@ fn more_round(root: *u8, only_arg: *u8, counts: *[i64; 8]) -> bool {
             } else if line.len > 6 && line[0] == 'c' && line[5] == '\t' {
                 let mut k = 0;
                 let mut p = 6;
-                while p < line.len && k < 8 {
+                while p < line.len && k < 9 {
                     let mut n = 0;
                     while p < line.len && line[p] >= '0' && line[p] <= '9' {
                         n = n * 10 + (line[p] - '0') as i64;
