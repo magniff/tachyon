@@ -1,0 +1,679 @@
+// Synth mode: the type of an expression computed from the expression
+// alone (synth_expr), and the expressions that need no more than that:
+// suffixed literals, casts, indexing and slicing, fields and tuple fields,
+// arrays, the binary and unary operators, and the layout queries
+// (`size_of`, `align_of`) folded to constants.
+
+use crate::base::{
+    ERR, buf_uint, err_begin, err_end, err_help, err_help_sym, err_int, err_str, err_sym, intern_c,
+};
+use crate::front::ast::{
+    NODES, NODE_RAW, REPR_UNION, child, list_begin, list_end, list_push, new_node,
+};
+use crate::front::ast::NodeKind::{
+    Arm, Array, Assign, Binary, Block, Bool, Break, CStr, Call, Cast, Char, Continue, EnumPanic,
+    FieldAccess, Float, For, Ident, If, Index, Int, Loop, Match, MethodCall, PatBind, PatLit, Path,
+    Range, Repeat, Return, Str, StructLit, Tuple, TupleField, TyArray, TyFn, TyName, TyNever, TyPtr,
+    TySlice, TyTuple, TyUnit, Unary, Unit, VariantLit, VecOp, While,
+};
+use crate::front::check::{
+    lookup_local, type_error, type_error_got,
+};
+use crate::front::check::body::{
+    check_block, check_break, check_for, check_loop, check_return, check_while, find_loop, synth_if,
+};
+use crate::front::check::check_mode::{check_expr, check_struct_fields};
+use crate::front::check::resolve::resolve_type;
+use crate::front::check::unsafety::{
+    NODE_NO_READ, U_DEREF, U_FIELD, U_INDEX, U_INT_PTR, U_SLICE, U_UNION, is_borrow, mark_no_read,
+    unsafe_op,
+};
+use crate::front::consteval::eval_array_len;
+use crate::front::lexer::{
+    SUF_F32, SUF_I16, SUF_I32, SUF_I64, SUF_I8, SUF_ISIZE, SUF_NONE, SUF_U16, SUF_U32, SUF_U64,
+    SUF_U8, SUF_USIZE, Tok,
+};
+use crate::front::patterns::check_match;
+use crate::front::traits::{binary_op_trait, has_impl, negation_call, operator_call, std_trait};
+use crate::front::types::{
+    ENUMS, STRUCTS, TSCRATCH, TYPES, TY_BOOL, TY_ERROR, TY_F32, TY_F64, TY_I16, TY_I32, TY_I64,
+    TY_I8, TY_NEVER, TY_STRING, TY_U16, TY_U32, TY_U64, TY_U8, TY_U8_PTR, TY_UNIT, TyKind, VARIANTS,
+    array_of, enum_variant, err_type, find_field, find_method, int_bits, int_max, is_compound,
+    is_fieldless_enum, is_integer, is_numeric, is_pointer, is_signed, is_vector, make_type,
+    primitive_name, ptr_to, slice_of, struct_field, type_align, type_elem, type_size,
+};
+use crate::gen0::target::enum_panic_kind;
+use crate::front::check::names::{NODE_RESOLVED, synth_name};
+use crate::front::check::equality::{eq_unsupported, structural_eq};
+use crate::front::check::calls::{synth_call, synth_method, synth_path};
+use crate::front::check::vectors::{synth_vecop, vector_binary};
+use crate::front::check::assign::{check_assign, is_place};
+
+pub fn synth_expr(n: i64) -> i64 {
+    fold_layout_query(n);
+    let ty = synth_expr_inner(n);
+    unsafe { NODES[n].ty = ty; }
+    ty
+}
+
+fn synth_expr_inner(n: i64) -> i64 {
+    unsafe {
+        match NODES[n].kind {
+            Int | Float => {
+                if NODES[n].b != SUF_NONE {
+                    return suffixed_literal(n, false);
+                }
+                if NODES[n].kind == Int { TY_I64 } else { TY_F64 }
+            }
+            Char => TY_U8,
+            Bool => TY_BOOL,
+            Unit => TY_UNIT,
+            Str => TY_STRING,
+            CStr => TY_U8_PTR,
+            Ident => synth_name(n),
+            EnumPanic => {
+                synth_expr(NODES[n].a);
+                TY_NEVER
+            }
+            // Already checked (a path made a variant), when a rewrite checks
+            // an expression again.
+            VariantLit => NODES[n].ty,
+            VecOp => synth_vecop(n),
+            Binary => synth_binary(n),
+            Unary => synth_unary(n),
+            Cast => synth_cast(n),
+            Call => synth_call(n),
+            Index => synth_index(n),
+            FieldAccess => synth_field(n),
+            TupleField => synth_tuple_field(n),
+            Tuple => {
+                let mark = TSCRATCH.count;
+                for i in 0..NODES[n].count {
+                    let elem = synth_expr(child(n, i));
+                    TSCRATCH.push(elem);
+                }
+                make_type(TyKind::Tuple, 0, 0, mark)
+            }
+            Array => synth_array(n),
+            Repeat => {
+                let elem = synth_expr(NODES[n].a);
+                array_of(elem, eval_array_len(NODES[n].b))
+            }
+            StructLit => check_struct_fields(n, 0),
+            Block => check_block(n, 0),
+            If => synth_if(n),
+            Match => check_match(n, 0),
+            Path => synth_path(n),
+            MethodCall => synth_method(n),
+            Loop => check_loop(n, 0),
+            While => check_while(n),
+            For => check_for(n),
+            Range => type_error(n, c"ranges can only be used as the bounds of a 'for' loop"),
+            Assign => {
+                check_assign(n);
+                TY_UNIT
+            }
+            Return => check_return(n),
+            Break => {
+                check_break(n);
+                TY_NEVER
+            }
+            Continue => {
+                NODES[n].x = find_loop(n, c"continue");
+                TY_NEVER
+            }
+            _ => type_error(n, c"internal error: not an expression"),
+        }
+    }
+}
+
+fn suffix_type(suffix: i64) -> i64 {
+    if suffix == SUF_I8 { return TY_I8; }
+    if suffix == SUF_I16 { return TY_I16; }
+    if suffix == SUF_I32 { return TY_I32; }
+    if suffix == SUF_I64 || suffix == SUF_ISIZE { return TY_I64; }
+    if suffix == SUF_U8 { return TY_U8; }
+    if suffix == SUF_U16 { return TY_U16; }
+    if suffix == SUF_U32 { return TY_U32; }
+    if suffix == SUF_U64 || suffix == SUF_USIZE { return TY_U64; }
+    if suffix == SUF_F32 { return TY_F32; }
+    TY_F64
+}
+
+// `1u8`, `2.5f32`; `negated` allows `-128i8`.
+fn suffixed_literal(n: i64, negated: bool) -> i64 {
+    unsafe {
+        let ty = suffix_type(NODES[n].b);
+        if NODES[n].kind == Int && is_integer(ty) {
+            let value = NODES[n].a as u64;
+            let mut limit = value;
+            if negated && is_signed(ty) && value > 0 {
+                limit = value - 1;
+            }
+            if limit > int_max(ty) {
+                err_begin(NODES[n].start);
+                err_str(c"integer literal ");
+                if negated {
+                    err_str(c"-");
+                }
+                buf_uint(ERR, value);
+                err_str(c" does not fit in type '");
+                err_type(ty);
+                err_str(c"'");
+                err_end();
+            }
+        }
+        ty
+    }
+}
+
+fn is_valid_cast(from: i64, to: i64) -> bool {
+    if is_fieldless_enum(from) && is_integer(to) { return true; }
+    if is_integer(from) && is_fieldless_enum(to) { return true; }
+    if is_numeric(from) && is_numeric(to) { return true; }
+    if is_pointer(from) && is_pointer(to) { return true; }
+    if is_integer(from) && is_pointer(to) { return true; }
+    if is_pointer(from) && is_integer(to) { return true; }
+    if from == TY_BOOL && is_integer(to) { return true; }
+    from == TY_NEVER
+}
+
+fn synth_cast(n: i64) -> i64 {
+    unsafe {
+        let operand = NODES[n].a;
+        let from = synth_expr(operand);
+        let to = resolve_type(NODES[n].b);
+        if !is_valid_cast(from, to) {
+            err_begin(NODES[operand].start);
+            err_str(c"cannot cast '");
+            err_type(from);
+            err_str(c"' to '");
+            err_type(to);
+            err_str(c"'");
+            err_end();
+        }
+        if is_integer(from) && is_fieldless_enum(to) {
+            return enum_cast(n, operand, from, to);
+        }
+        if is_integer(from) && is_pointer(to) && !(NODES[operand].kind == Int && NODES[operand].a == 0) {
+            unsafe_op(n, U_INT_PTR, c"casting an integer to a pointer is unsafe");
+        }
+        to
+    }
+}
+
+// `n as E` for a fieldless enum E (0.4), checked: it becomes
+//   match n { d0 => E::V0, d1 => E::V1, ..., v => <panic: invalid value> }
+// (the discriminants the operand's type can hold).
+fn enum_cast(n: i64, operand: i64, from: i64, to: i64) -> i64 {
+    unsafe {
+        let e = TYPES[to].a;
+        let start = NODES[n].start;
+        let end = NODES[n].end;
+        let m = new_node(Match, start, end);
+        NODES[m].a = operand;
+        let mark = list_begin();
+        for i in 0..ENUMS[e].variant_count {
+            let v = enum_variant(e, i);
+            let d = VARIANTS[v].discr;
+            let fits = if is_signed(from) {
+                let half = 1 << (int_bits(from) - 1) as u64;
+                int_bits(from) == 64 || (d >= 0 - half && d < half)
+            } else {
+                d >= 0 && (int_bits(from) == 64 || d as u64 <= int_max(from))
+            };
+            if !fits {
+                continue;
+            }
+            let lit = new_node(Int, start, end);
+            NODES[lit].a = if d < 0 { 0 - d } else { d };
+            let mut value = lit;
+            if d < 0 {
+                value = new_node(Unary, start, end);
+                NODES[value].op = Tok::Minus;
+                NODES[value].b = lit;
+            }
+            let pat = new_node(PatLit, start, end);
+            NODES[pat].a = value;
+            let body = new_node(Path, start, end);
+            NODES[body].a = ENUMS[e].name;
+            NODES[body].b = VARIANTS[v].name;
+            let arm = new_node(Arm, start, end);
+            NODES[arm].a = pat;
+            NODES[arm].c = body;
+            list_push(arm);
+        }
+        let name = intern_c(c"__invalid_value");
+        let bind = new_node(PatBind, start, end);
+        NODES[bind].a = name;
+        let value = new_node(Ident, start, end);
+        NODES[value].a = name;
+        let panic = new_node(EnumPanic, start, end);
+        NODES[panic].a = value;
+        NODES[panic].x = enum_panic_kind(e);
+        let arm = new_node(Arm, start, end);
+        NODES[arm].a = bind;
+        NODES[arm].c = panic;
+        list_push(arm);
+        list_end(m, mark);
+        NODES[n] = NODES[m];
+        synth_expr(n)
+    }
+}
+
+// `T` as a type node: for casts the checker adds.
+fn type_name_node(t: i64, at: i64) -> i64 {
+    unsafe {
+        let node = new_node(TyName, NODES[at].start, NODES[at].end);
+        NODES[node].a = intern_c(primitive_name(t));
+        node
+    }
+}
+
+fn cast_node(e: i64, t: i64) -> i64 {
+    unsafe {
+        let c = new_node(Cast, NODES[e].start, NODES[e].end);
+        NODES[c].a = e;
+        NODES[c].b = type_name_node(t, e);
+        c
+    }
+}
+
+fn synth_index(n: i64) -> i64 {
+    unsafe {
+        let base = NODES[n].a;
+        let base_ty = synth_expr(base);
+        let base_kind = TYPES[base_ty].kind;
+        if base_kind != TyKind::Array && base_kind != TyKind::Ptr && base_kind != TyKind::Slice {
+            err_begin(NODES[base].start);
+            err_str(c"cannot index type '");
+            err_type(base_ty);
+            err_str(c"'");
+            err_end();
+        }
+        let index = NODES[n].b;
+        if base_kind == TyKind::Ptr {
+            // (0.10: what --check-unsafe checks)
+            NODES[n].p |= NODE_RAW;
+            if NODES[index].kind == Range {
+                unsafe_op(n, U_SLICE, c"slicing a raw pointer is unsafe");
+            } else {
+                unsafe_op(n, U_INDEX, c"indexing a raw pointer is unsafe");
+            }
+        }
+        if NODES[index].kind == Range {
+            // Slicing.
+            if NODES[index].a != 0 {
+                check_index_type(NODES[index].a);
+            }
+            if NODES[index].b != 0 {
+                check_index_type(NODES[index].b);
+            } else if base_kind == TyKind::Ptr {
+                type_error(index, c"slicing a pointer needs an end: 'p[lo..hi]'");
+            }
+            NODES[index].ty = TY_UNIT;
+            return slice_of(TYPES[base_ty].a);
+        }
+        check_index_type(index);
+        TYPES[base_ty].a
+    }
+}
+
+fn check_index_type(index: i64) {
+    unsafe {
+        let index_ty = synth_expr(index);
+        if !is_integer(index_ty) {
+            err_begin(NODES[index].start);
+            err_str(c"index must be integer, got '");
+            err_type(index_ty);
+            err_str(c"'");
+            err_end();
+        }
+    }
+}
+
+// Fields of structs (also through a pointer to one: y = 1) and the `ptr`
+// and `len` of slices (y = 2, x = 0 for ptr and 1 for len).
+fn synth_field(n: i64) -> i64 {
+    unsafe {
+        let mut base_ty = synth_expr(NODES[n].a);
+        let name = NODES[n].b;
+        NODES[n].y = 0;
+        if TYPES[base_ty].kind == TyKind::Slice {
+            NODES[n].y = 2;
+            if name == intern_c(c"len") {
+                // i64 (0.4; u64 before): lengths and indices mix without casts.
+                NODES[n].x = 1;
+                return TY_I64;
+            }
+            if name == intern_c(c"ptr") {
+                NODES[n].x = 0;
+                return ptr_to(TYPES[base_ty].a);
+            }
+            err_begin(NODES[n].start);
+            err_str(c"slices have the fields 'ptr' and 'len', not '");
+            err_sym(name);
+            err_str(c"'");
+            err_end();
+        }
+        if TYPES[base_ty].kind == TyKind::Ptr && TYPES[TYPES[base_ty].a].kind == TyKind::Struct {
+            NODES[n].y = 1;
+            base_ty = TYPES[base_ty].a;
+            if !is_borrow(NODES[n].a) {
+                NODES[n].p |= NODE_RAW;
+                unsafe_op(n, U_FIELD, c"access to a field through a raw pointer is unsafe");
+            }
+        }
+        if TYPES[base_ty].kind != TyKind::Struct {
+            err_begin(NODES[n].start);
+            err_str(c"cannot access field '");
+            err_sym(name);
+            err_str(c"' on type '");
+            err_type(base_ty);
+            err_str(c"'");
+            err_end();
+        }
+        let s = TYPES[base_ty].a;
+        let field = find_field(s, name);
+        if field < 0 {
+            err_begin(NODES[n].start);
+            err_str(c"struct '");
+            err_sym(STRUCTS[s].name);
+            err_str(c"' has no field '");
+            err_sym(name);
+            err_str(c"'");
+            if find_method(base_ty, name) >= 0 {
+                err_help(c"'");
+                err_help_sym(name);
+                err_help(c"' is a method: call it with '(...)'");
+            }
+            err_end();
+        }
+        NODES[n].x = field;
+        if (STRUCTS[s].repr & REPR_UNION) != 0 && (NODES[n].p & NODE_NO_READ) == 0 {
+            unsafe_op(n, U_UNION, c"reading a field of a union is unsafe");
+        }
+        (*struct_field(s, field)).ty
+    }
+}
+
+fn synth_tuple_field(n: i64) -> i64 {
+    unsafe {
+        let base_ty = synth_expr(NODES[n].a);
+        let index = NODES[n].b;
+        if TYPES[base_ty].kind != TyKind::Tuple {
+            err_begin(NODES[n].start);
+            err_str(c"cannot use tuple index on type '");
+            err_type(base_ty);
+            err_str(c"'");
+            err_end();
+        }
+        if index >= TYPES[base_ty].count {
+            err_begin(NODES[n].start);
+            err_str(c"tuple index ");
+            err_int(index);
+            err_str(c" out of range for tuple with ");
+            err_int(TYPES[base_ty].count);
+            err_str(c" elements");
+            err_end();
+        }
+        type_elem(base_ty, index)
+    }
+}
+
+fn synth_array(n: i64) -> i64 {
+    unsafe {
+        let count = NODES[n].count;
+        if count == 0 {
+            type_error(n, c"cannot infer the type of an empty array; annotate it");
+        }
+        let elem = synth_expr(child(n, 0));
+        for i in 1..count {
+            check_expr(child(n, i), elem);
+        }
+        array_of(elem, count)
+    }
+}
+
+// ---- Operators ----
+
+fn is_untyped_literal(n: i64) -> bool {
+    unsafe {
+        match NODES[n].kind {
+            Int | Float => NODES[n].b == SUF_NONE,
+            Char => true,
+            Unary if NODES[n].op == Tok::Minus => is_untyped_literal(NODES[n].b),
+            _ => false,
+        }
+    }
+}
+
+pub fn literal_takes_rhs_type(lhs: i64, rhs: i64) -> bool {
+    is_untyped_literal(lhs) && !is_untyped_literal(rhs)
+}
+
+// The common type of a non-shift operator's operands.
+fn synth_operands(lhs: i64, rhs: i64) -> i64 {
+    if literal_takes_rhs_type(lhs, rhs) {
+        let rhs_ty = synth_expr(rhs);
+        check_expr(lhs, rhs_ty);
+        return rhs_ty;
+    }
+    let lhs_ty = synth_expr(lhs);
+    check_expr(rhs, lhs_ty);
+    lhs_ty
+}
+
+fn synth_binary(n: i64) -> i64 {
+    unsafe {
+        let op = NODES[n].op;
+        let lhs = NODES[n].b;
+        let rhs = NODES[n].c;
+        if op == Tok::Shl || op == Tok::Shr {
+            let value_ty = synth_expr(lhs);
+            let amount_ty = synth_expr(rhs);
+            if !is_integer(value_ty) {
+                type_error_got(n, c"shift operator requires integer type", value_ty);
+            }
+            if !is_integer(amount_ty) {
+                type_error_got(n, c"shift amount must be integer", amount_ty);
+            }
+            return value_ty;
+        }
+        let ty = synth_operands(lhs, rhs);
+        if is_vector(ty) {
+            return vector_binary(n, op, ty);
+        }
+        // (0.9: an operator trait's impl for the type)
+        if binary_op_trait(op, ty) >= 0 {
+            return operator_call(n, ty);
+        }
+        if op == Tok::Plus || op == Tok::Minus || op == Tok::Star || op == Tok::Slash || op == Tok::Percent {
+            if !is_numeric(ty) {
+                type_error_got(n, c"arithmetic operator requires numeric type", ty);
+            }
+            return ty;
+        }
+        if (op == Tok::Lt || op == Tok::Gt || op == Tok::LtEq || op == Tok::GtEq) && is_fieldless_enum(ty) {
+            // 0.4: fieldless enums are ordered by declaration, which must be
+            // the order of their discriminants; compared as their tags.
+            let e = TYPES[ty].a;
+            for i in 1..ENUMS[e].variant_count {
+                if VARIANTS[enum_variant(e, i)].discr <= VARIANTS[enum_variant(e, i - 1)].discr {
+                    err_begin(NODES[n].start);
+                    err_str(c"'");
+                    err_sym(ENUMS[e].name);
+                    err_str(c"' cannot be ordered: its discriminants do not increase in declaration order");
+                    err_end();
+                }
+            }
+            NODES[n].b = cast_node(lhs, ENUMS[e].tag);
+            NODES[n].c = cast_node(rhs, ENUMS[e].tag);
+            synth_expr(NODES[n].b);
+            synth_expr(NODES[n].c);
+            return TY_BOOL;
+        }
+        if op == Tok::Lt || op == Tok::Gt || op == Tok::LtEq || op == Tok::GtEq {
+            if !(is_numeric(ty) || is_pointer(ty)) {
+                type_error_got(n, c"comparison requires numeric type", ty);
+            }
+            return TY_BOOL;
+        }
+        if op == Tok::EqEq || op == Tok::BangEq {
+            if ty == TY_NEVER || ty == TY_ERROR {
+                return TY_BOOL;
+            }
+            let bad = eq_unsupported(ty);
+            if bad != 0 {
+                if bad == ty {
+                    type_error_got(n, c"equality requires numeric, bool, pointer or enum type, or a struct, tuple or array of them", ty);
+                }
+                err_begin(NODES[n].start);
+                err_str(c"cannot compare '");
+                err_type(ty);
+                err_str(c"' with ==: it holds a '");
+                err_type(bad);
+                err_str(c"', which has no ==");
+                err_end();
+            }
+            if is_compound(ty) {
+                structural_eq(n, ty);
+            }
+            return TY_BOOL;
+        }
+        if op == Tok::AmpAmp || op == Tok::PipePipe {
+            if ty != TY_BOOL {
+                type_error_got(n, c"logical operator requires bool", ty);
+            }
+            return TY_BOOL;
+        }
+        if !is_integer(ty) {
+            type_error_got(n, c"bitwise operator requires integer type", ty);
+        }
+        ty
+    }
+}
+
+fn synth_unary(n: i64) -> i64 {
+    unsafe {
+        let op = NODES[n].op;
+        let operand = NODES[n].b;
+        if op == Tok::Minus {
+            let mut ty = 0;
+            if NODES[operand].kind == Int && NODES[operand].b != SUF_NONE {
+                ty = suffixed_literal(operand, true);
+                NODES[operand].ty = ty;
+            } else {
+                ty = synth_expr(operand);
+            }
+            if !is_numeric(ty) && !is_vector(ty) {
+                let neg = std_trait(c"Neg");
+                if neg >= 0 && has_impl(neg, ty) {
+                    return negation_call(n, ty);
+                }
+                type_error_got(n, c"unary '-' requires numeric type", ty);
+            }
+            return ty;
+        }
+        if op == Tok::Bang {
+            check_expr(operand, TY_BOOL);
+            return TY_BOOL;
+        }
+        if op == Tok::Tilde {
+            let ty = synth_expr(operand);
+            if !is_integer(ty) {
+                type_error_got(n, c"bitwise NOT requires integer type", ty);
+            }
+            return ty;
+        }
+        if op == Tok::Star {
+            let ty = synth_expr(operand);
+            if !is_pointer(ty) {
+                err_begin(NODES[n].start);
+                err_str(c"cannot deref non-pointer type '");
+                err_type(ty);
+                err_str(c"'");
+                err_end();
+            }
+            if !is_borrow(operand) {
+                NODES[n].p |= NODE_RAW;
+                unsafe_op(n, U_DEREF, c"dereference of a raw pointer is unsafe");
+            }
+            return TYPES[ty].a;
+        }
+        // Tok::Amp: taking an address reads nothing (a union's field too).
+        mark_no_read(operand);
+        let ty = synth_expr(operand);
+        if !is_place(operand) {
+            type_error(n, c"cannot take address of non-lvalue expression");
+        }
+        ptr_to(ty)
+    }
+}
+
+// `size_of(T)` and `align_of(T)` (0.4): integer constants, typed like an
+// integer literal. The argument, parsed as an expression, is read as a type
+// (`*T`, `[T; n]`, `[T]`, `(A, B)` and names are also expressions); the
+// call becomes the literal. They are builtins: no function, constant or
+// static may have their names (0.5; in 0.4 a function of the same name
+// replaced them).
+pub fn fold_layout_query(n: i64) {
+    unsafe {
+        if NODES[n].kind != Call || NODES[n].count != 1 {
+            return;
+        }
+        let callee = NODES[n].a;
+        if NODES[callee].kind != Ident || (NODES[callee].p & NODE_RESOLVED) != 0 {
+            return;
+        }
+        let name = NODES[callee].a;
+        let is_size = name == intern_c(c"size_of");
+        if !is_size && name != intern_c(c"align_of") {
+            return;
+        }
+        if lookup_local(name).is_some() {
+            return;
+        }
+        let t = resolve_type(expr_as_type(child(n, 0)));
+        let value = if is_size { type_size(t) } else { type_align(t) };
+        NODES[n].kind = Int;
+        NODES[n].a = value;
+        NODES[n].b = SUF_NONE;
+        NODES[n].count = 0;
+    }
+}
+
+// The expression `e` turned into the type node it spells.
+fn expr_as_type(e: i64) -> i64 {
+    unsafe {
+        let kind = NODES[e].kind;
+        if kind == TyName || kind == TyPtr || kind == TyUnit
+            || kind == TyNever || kind == TyTuple || kind == TyArray
+            || kind == TyFn || kind == TySlice {
+            // Parsed as a type already (0.5).
+            return e;
+        }
+        if kind == Ident {
+            NODES[e].kind = TyName;
+        } else if kind == Unary && NODES[e].op == Tok::Star {
+            NODES[e].kind = TyPtr;
+            NODES[e].a = expr_as_type(NODES[e].b);
+        } else if kind == Repeat {
+            NODES[e].kind = TyArray;
+            NODES[e].a = expr_as_type(NODES[e].a);
+        } else if kind == Array && NODES[e].count == 1 {
+            NODES[e].kind = TySlice;
+            NODES[e].a = expr_as_type(child(e, 0));
+        } else if kind == Tuple {
+            NODES[e].kind = TyTuple;
+            for i in 0..NODES[e].count {
+                expr_as_type(child(e, i));
+            }
+        } else if kind == Unit {
+            NODES[e].kind = TyUnit;
+        } else {
+            type_error(e, c"size_of and align_of take a type");
+        }
+        e
+    }
+}

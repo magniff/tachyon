@@ -1,0 +1,700 @@
+// Calls: direct calls and calls through a function value, their arguments
+// against the parameters (generic functions instantiated), paths
+// (`m::f`, `T::f`, `Enum::Variant`) and the calls through them, and
+// method calls (`x.m()`, with `&x` or `*x` as its `self` needs).
+
+use crate::base::{
+    ERR_HELP, err_begin, err_end, err_failed_name, err_help, err_help_sym, err_int, err_str,
+    err_sym, error_at,
+};
+use crate::front::ast::{
+    NODES, VK_LOAD, VK_NEW, VK_SPLAT, child, list_begin, list_end, list_push, new_node,
+};
+use crate::front::ast::NodeKind::{Call, Ident, Path, Unary, VariantLit};
+use crate::front::check::{
+    LOCALS, Res, SELF_SYM, SELF_TYPE, SELF_TYPE_SYM, lookup_local, name_error,
+};
+use crate::front::check::check_mode::check_expr;
+use crate::front::check::collect::{find_generic_method, template_variant_named};
+use crate::front::check::names::{NODE_RESOLVED, fn_value_type, unknown_name_error};
+use crate::front::check::resolve::{resolve_key, resolve_named};
+use crate::front::check::synth_mode::synth_expr;
+use crate::front::check::unsafety::{
+    U_C_CALL, U_METHOD, U_PTR_ARG, check_call_safety, is_borrow, unsafe_op,
+};
+use crate::front::generics::{
+    TPL_NONE, check_arg, env_lookup, hint_for, instance_targs, targ_count_error, template_instance,
+    template_name, template_of_key,
+};
+use crate::front::generics::instantiate::{
+    HINT_TY_PATH, fn_instance, infer_enum, instantiate_call, push_written_targs,
+};
+use crate::front::lexer::Tok;
+use crate::front::modules::{CUR_MOD, C_MODULE, MODULES, STD_MODULE};
+use crate::front::modules::lookup::{
+    B_ITEM, B_MODULE, B_NONE, B_PRIVATE, B_TVARIANT, B_VARIANT, SYM_CRATE, SYM_STD, SYM_SUPER,
+    access_error, binding, binding_kind, binding_value, lookup_name, note_c_use, path_module,
+};
+use crate::front::traits::{bounded_param, require_in_bounds};
+use crate::front::types::{
+    ENUMS, FNS, STRUCTS, SYM_FN, SYM_PRIMITIVE, TLISTS, TSCRATCH, TYPES, TyKind, VARIANTS, buf_type,
+    enum_type, err_type, find_field, find_method, find_variant, fn_param, is_compound, is_ffi_safe,
+    is_fn_type, is_pointer, is_vector, item_node_of, ptr_to, type_elem, variant_field,
+};
+use crate::tools::query::{qnote, qnote_module};
+use crate::front::check::vectors::{make_vecop, sym_is_c, vector_method};
+use crate::front::check::assign::is_place;
+
+// ---- Calls ----
+
+fn is_variadic_arg_type(t: i64) -> bool {
+    is_ffi_safe(t)
+}
+
+pub fn synth_call(n: i64) -> i64 {
+    unsafe {
+        let callee = NODES[n].a;
+        if callee == 0 && NODES[n].x != 0 {
+            // A method call, already checked (and made a call), when a rewrite
+            // checks an expression again (`for x in v.items()`).
+            return FNS[NODES[n].x - 1].ret;
+        }
+        if NODES[callee].kind == Path {
+            return synth_path_call(n, callee);
+        }
+        if NODES[callee].kind == Ident && (NODES[callee].p & NODE_RESOLVED) == 0
+            && lookup_local(NODES[callee].a).is_none() && env_lookup(NODES[callee].a) == 0
+            && is_vector(SYM_PRIMITIVE[NODES[callee].a]) {
+            // `v4f32(a, b, c, d)` (0.10).
+            return make_vecop(n, 0, VK_NEW, SYM_PRIMITIVE[NODES[callee].a]);
+        }
+        if NODES[callee].kind == Ident && (NODES[callee].p & NODE_RESOLVED) == 0
+            && lookup_local(NODES[callee].a).is_none() {
+            let name = NODES[callee].a;
+            let b = lookup_name(CUR_MOD, name, CUR_MOD);
+            note_c_use(NODES[callee].start, name, b);
+            if binding_kind(b) == B_VARIANT {
+                // `V(a, b)` for a variant brought into scope by `use`.
+                let v = binding_value(b);
+                NODES[callee].kind = Path;
+                NODES[callee].b = name;
+                NODES[callee].y = enum_type(VARIANTS[v].enum_id);
+                return synth_path_call(n, callee);
+            }
+            if binding_kind(b) == B_TVARIANT {
+                // ... of a generic enum (0.6), its type arguments inferred.
+                NODES[callee].kind = Path;
+                NODES[callee].b = name;
+                NODES[callee].y = -binding_value(b) - 1;
+                return synth_path_call(n, callee);
+            }
+            if binding_kind(b) == B_PRIVATE {
+                access_error(b, NODES[callee].start, name);
+            }
+            if binding_kind(b) == B_ITEM && SYM_FN[binding_value(b)] != 0 {
+                return call_function(n, SYM_FN[binding_value(b)] - 1, NODES[callee].g);
+            }
+        }
+        if NODES[callee].kind == Ident && (NODES[callee].p & NODE_RESOLVED) != 0
+            && SYM_FN[NODES[callee].a] != 0 {
+            return call_function(n, SYM_FN[NODES[callee].a] - 1, NODES[callee].g);
+        }
+        let callee_ty = synth_expr(callee);
+        if !is_fn_type(callee_ty) {
+            err_begin(NODES[callee].start);
+            err_str(c"cannot call non-function type '");
+            err_type(callee_ty);
+            err_str(c"'");
+            err_end();
+        }
+        if NODES[n].count != TYPES[callee_ty].count {
+            err_begin(NODES[n].start);
+            err_str(c"function pointer expects ");
+            err_int(TYPES[callee_ty].count);
+            err_str(c" arguments, got ");
+            err_int(NODES[n].count);
+            err_end();
+        }
+        if TYPES[callee_ty].b != 0 {
+            unsafe_op(n, U_C_CALL, c"calling an extern \"C\" function pointer is unsafe");
+        }
+        for i in 0..NODES[n].count {
+            let arg = child(n, i);
+            check_expr(arg, type_elem(callee_ty, i));
+            if TYPES[callee_ty].b == 0 && is_pointer(type_elem(callee_ty, i)) && !is_borrow(arg) {
+                unsafe_op(arg, U_PTR_ARG, c"passing a raw pointer through a function pointer is unsafe (the function may dereference it)");
+            }
+        }
+        TYPES[callee_ty].a
+    }
+}
+
+// A direct call of function f (a template is instantiated first, with
+// the turbofish `written`, a Generics node or 0).
+fn call_function(n: i64, f: i64, written: i64) -> i64 {
+    unsafe {
+        let mut g = f;
+        if FNS[f].generic > 0 {
+            g = instantiate_call(f, n, 0, 0, written);
+        } else if written != 0 {
+            err_begin(NODES[written].start);
+            err_str(c"function '");
+            err_sym(FNS[f].display);
+            err_str(c"' is not generic");
+            err_end();
+        }
+        NODES[n].x = g + 1;
+        check_direct_call(n, g)
+    }
+}
+
+fn check_direct_call(n: i64, f: i64) -> i64 {
+    unsafe {
+        let count = NODES[n].count;
+        let params = FNS[f].param_count;
+        let variadic = FNS[f].variadic;
+        let arity_ok = if variadic { count >= params } else { count == params };
+        if !arity_ok {
+            err_begin(NODES[n].start);
+            err_str(c"function '");
+            err_sym(FNS[f].display);
+            err_str(c"' expects ");
+            if variadic {
+                err_str(c"at least ");
+            }
+            err_int(params);
+            err_str(c" arguments, got ");
+            err_int(count);
+            err_end();
+        }
+        for i in 0..params {
+            check_arg(child(n, i), fn_param(f, i));
+        }
+        check_call_safety(n, f, 0);
+        for i in params..count {
+            let arg = child(n, i);
+            let ty = synth_expr(arg);
+            if !is_variadic_arg_type(ty) {
+                err_begin(NODES[arg].start);
+                err_str(c"cannot pass value of type '");
+                err_type(ty);
+                err_str(c"' as a variadic argument");
+                err_end();
+            }
+        }
+        FNS[f].ret
+    }
+}
+
+// ---- Paths, variants and methods ----
+
+// What the type part of a path `T::m` names: a type (returned), or a
+// generic struct or enum without its type arguments (PATH_TPL set, -1
+// returned). A path whose first part is a module (`m::f`, `a::b::T::m`)
+// names an item: the node becomes an Ident of it (-2 returned).
+static mut PATH_TPL: i64 = 0;
+
+fn path_target(n: i64) -> i64 {
+    unsafe {
+        if NODES[n].y > 0 {
+            // Made by the checker from a variant in scope.
+            return NODES[n].y;
+        }
+        if NODES[n].y < 0 {
+            // ... of a generic enum (0.6): its template.
+            PATH_TPL = NODES[n].y;
+            return -1;
+        }
+        let name = NODES[n].a;
+        let member = NODES[n].b;
+        let mut m = CUR_MOD;
+        let mut b = 0;
+        let segments = NODES[n].count;
+        if segments > 0 {
+            // `a::b::T::m` or `a::b::f`: the module of the next-to-last part.
+            m = path_module(n, segments - 2);
+            b = lookup_name(m, name, CUR_MOD);
+            // (`a::m::f`: m is a reference to the module too)
+            if binding_kind(b) == B_MODULE {
+                qnote_module(NODES[child(n, segments - 2)].start, name, binding_value(b), 0);
+            }
+        } else {
+            if env_lookup(name) != 0 || SYM_PRIMITIVE[name] != 0 || (name == SELF_TYPE_SYM && SELF_TYPE != 0) {
+                if NODES[n].g != 0 {
+                    name_error(NODES[n].start, c"'", name, c"' takes no type arguments");
+                }
+                return resolve_named(name, NODES[n].start);
+            }
+            if name == SYM_CRATE || name == SELF_SYM || name == SYM_SUPER {
+                m = if name == SYM_CRATE { 0 } else if name == SELF_SYM { CUR_MOD } else { MODULES[CUR_MOD].parent };
+                if m < 0 {
+                    error_at(NODES[n].start, c"the root module has no 'super'");
+                }
+                b = binding(B_MODULE, m);
+            } else {
+                b = lookup_name(m, name, CUR_MOD);
+                note_c_use(NODES[n].start, name, b);
+                if b == B_NONE && name == SYM_STD && STD_MODULE >= 0 {
+                    b = binding(B_MODULE, STD_MODULE);
+                }
+                if binding_kind(b) == B_MODULE {
+                    qnote_module(NODES[n].start, name, binding_value(b), 0);
+                }
+            }
+        }
+        if binding_kind(b) == B_PRIVATE {
+            access_error(b, NODES[n].start, name);
+        }
+        if binding_kind(b) == B_MODULE {
+            // `m::item`: the item, by key.
+            let target = binding_value(b);
+            let item = lookup_name(target, member, CUR_MOD);
+            if binding_kind(item) == B_PRIVATE {
+                access_error(item, NODES[n].start, member);
+            }
+            if binding_kind(item) == B_MODULE {
+                name_error(NODES[n].start, c"'", member, c"' is a module, not a value");
+            }
+            if binding_kind(item) == B_VARIANT {
+                let v = binding_value(item);
+                NODES[n].y = enum_type(VARIANTS[v].enum_id);
+                NODES[n].count = 0;
+                return NODES[n].y;
+            }
+            if binding_kind(item) != B_ITEM && target == C_MODULE {
+                // (`c::name`, through `import "h.h" as c;`)
+                unknown_name_error(NODES[n].start, c"no declaration in the C headers named '", member);
+            }
+            if binding_kind(item) != B_ITEM {
+                err_begin(NODES[n].start);
+                err_str(c"no '");
+                err_sym(member);
+                err_str(c"' in module '");
+                if target == 0 {
+                    err_str(c"crate");
+                } else {
+                    err_sym(MODULES[target].key);
+                }
+                err_str(c"'");
+                err_end();
+            }
+            NODES[n].kind = Ident;
+            NODES[n].a = binding_value(item);
+            NODES[n].p |= NODE_RESOLVED;
+            NODES[n].g = NODES[n].h;
+            NODES[n].count = 0;
+            return -2;
+        }
+        if binding_kind(b) != B_ITEM {
+            unknown_name_error(NODES[n].start, c"unknown type '", name);
+        }
+        let key = binding_value(b);
+        qnote(NODES[n].start, name, item_node_of(key), 0);
+        let tpl = template_of_key(key);
+        if tpl != TPL_NONE {
+            if NODES[n].g != 0 {
+                let mark = TSCRATCH.count;
+                push_written_targs(NODES[n].g);
+                return template_instance(tpl, mark, NODES[n].start);
+            }
+            PATH_TPL = tpl;
+            return -1;
+        }
+        if NODES[n].g != 0 {
+            name_error(NODES[n].start, c"'", name, c"' is not generic");
+        }
+        resolve_key(key, name, NODES[n].start)
+    }
+}
+
+// `T::m`: a variant without fields, or an associated function as a value.
+pub fn synth_path(n: i64) -> i64 {
+    unsafe {
+        let hint = hint_for(n);
+        let mut t = path_target(n);
+        if t == -2 {
+            return synth_expr(n);
+        }
+        let member = NODES[n].b;
+        if t == -1 {
+            if PATH_TPL < 0 && template_variant_named(-PATH_TPL - 1, member) {
+                HINT_TY_PATH = hint;
+                t = infer_enum(PATH_TPL, 0, member, 0, NODES[n].start);
+            } else {
+                err_begin(NODES[n].start);
+                err_str(c"'");
+                err_sym(template_name(PATH_TPL));
+                err_str(c"' is generic: write its type arguments ('");
+                err_sym(template_name(PATH_TPL));
+                err_str(c"::<...>::");
+                err_sym(member);
+                err_str(c"')");
+                err_end();
+            }
+        }
+        if TYPES[t].kind == TyKind::Enum {
+            let v = find_variant(TYPES[t].a, member);
+            if v >= 0 {
+                if VARIANTS[v].field_count > 0 {
+                    err_begin(NODES[n].start);
+                    err_str(c"variant '");
+                    err_type(t);
+                    err_str(c"::");
+                    err_sym(member);
+                    err_str(c"' has ");
+                    err_int(VARIANTS[v].field_count);
+                    err_str(if VARIANTS[v].field_count == 1 { c" field" } else { c" fields" });
+                    err_help(c"construct it with '");
+                    buf_type(ERR_HELP, t);
+                    err_help(c"::");
+                    err_help_sym(member);
+                    err_help(c"(...)'");
+                    err_end();
+                }
+                NODES[n].kind = VariantLit;
+                NODES[n].a = v;
+                NODES[n].count = 0;
+                return t;
+            }
+        }
+        let mut f = method_of(t, member);
+        if f < 0 {
+            path_member_error(n, t, member);
+        }
+        if FNS[f].generic > 0 {
+            if NODES[n].h == 0 && FNS[f].generic > impl_param_count(f) {
+                err_begin(NODES[n].start);
+                err_str(c"generic function '");
+                err_sym(member);
+                err_str(c"' needs its type arguments to be used as a value");
+                err_end();
+            }
+            let mark = TSCRATCH.count;
+            bind_impl_params(f, t);
+            if NODES[n].h != 0 {
+                push_written_targs(NODES[n].h);
+            }
+            if TSCRATCH.count - mark != FNS[f].generic {
+                targ_count_error(NODES[n].start, c"function", FNS[f].display, FNS[f].generic - impl_param_count(f),
+                    TSCRATCH.count - mark - impl_param_count(f));
+            }
+            f = fn_instance(f, mark, n);
+        }
+        NODES[n].kind = Ident;
+        NODES[n].a = FNS[f].name;
+        NODES[n].res = Res::Fn;
+        NODES[n].y = f;
+        NODES[n].count = 0;
+        fn_value_type(f)
+    }
+}
+
+// The number of a method template's parameters that are its impl's.
+fn impl_param_count(f: i64) -> i64 {
+    unsafe {
+        let item = FNS[f].node;
+        if NODES[item].h == 0 || NODES[item].g == 0 { 0 } else { NODES[NODES[item].g].a }
+    }
+}
+
+// Pushes on TSCRATCH the arguments of t's template that a method
+// template of it takes as its impl's parameters.
+fn bind_impl_params(f: i64, t: i64) {
+    let count = impl_param_count(f);
+    if count == 0 {
+        return;
+    }
+    let targs = instance_targs(t);
+    for i in 0..count {
+        unsafe { TSCRATCH.push(TLISTS.data[targs + i]); }
+    }
+}
+
+// The method or associated function `name` of type t: of its impl
+// blocks, or a template of the generic impl blocks of its template.
+fn method_of(t: i64, name: i64) -> i64 {
+    unsafe {
+        let f = find_method(t, name);
+        if f >= 0 {
+            return f;
+        }
+        let kind = TYPES[t].kind;
+        if kind == TyKind::Struct && STRUCTS[TYPES[t].a].tmpl != 0 {
+            return find_generic_method(STRUCTS[TYPES[t].a].tmpl, name);
+        }
+        if kind == TyKind::Enum && ENUMS[TYPES[t].a].tmpl != 0 {
+            return find_generic_method(-ENUMS[TYPES[t].a].tmpl, name);
+        }
+        -1
+    }
+}
+
+fn path_member_error(n: i64, t: i64, member: i64) -> ! {
+    unsafe {
+        err_begin(NODES[n].start);
+        if TYPES[t].kind == TyKind::Enum {
+            err_str(c"no variant or associated function '");
+        } else {
+            err_str(c"no associated function '");
+        }
+        err_sym(member);
+        err_failed_name(member);
+        err_str(c"' in '");
+        err_type(t);
+        err_str(c"'");
+        err_end()
+    }
+}
+
+// `T::m(args)`: a variant with fields, or a call of an associated function
+// (or of a method, with the receiver passed explicitly).
+fn synth_path_call(n: i64, callee: i64) -> i64 {
+    unsafe {
+        if NODES[callee].count == 0 && NODES[callee].y == 0 && env_lookup(NODES[callee].a) == 0
+            && is_vector(SYM_PRIMITIVE[NODES[callee].a]) {
+            // `v4f32::splat(x)`, `v4f32::load(s, i)` (0.10).
+            let vt = SYM_PRIMITIVE[NODES[callee].a];
+            let member = NODES[callee].b;
+            if NODES[callee].g != 0 {
+                name_error(NODES[callee].start, c"'", NODES[callee].a, c"' takes no type arguments");
+            }
+            if sym_is_c(member, c"splat") {
+                return make_vecop(n, 0, VK_SPLAT, vt);
+            }
+            if sym_is_c(member, c"load") {
+                return make_vecop(n, 0, VK_LOAD, vt);
+            }
+            err_begin(NODES[callee].start);
+            err_str(c"no associated function '");
+            err_sym(member);
+            err_failed_name(member);
+            err_str(c"' for vector type '");
+            err_type(vt);
+            err_str(c"'");
+            err_help(c"vector types have `splat(x)` and `load(slice, index)`");
+            err_end();
+            return vt;
+        }
+        let mut t = path_target(callee);
+        if t == -2 {
+            // `m::f(args)`: a call of an item of a module.
+            return synth_call(n);
+        }
+        let member = NODES[callee].b;
+        if NODES[callee].count == 0 && t >= 0 {
+            let bp = bounded_param(NODES[callee].a);
+            if bp != 0 {
+                require_in_bounds(bp, member, NODES[callee].start);
+            }
+        }
+        if t == -1 {
+            let tpl = PATH_TPL;
+            if tpl < 0 && template_variant_named(-tpl - 1, member) {
+                t = infer_enum(tpl, 0, member, n, NODES[callee].start);
+            } else {
+                let f = find_generic_method(tpl, member);
+                if f < 0 {
+                    err_begin(NODES[callee].start);
+                    err_str(c"no associated function '");
+                    err_sym(member);
+                    err_failed_name(member);
+                    err_str(c"' in '");
+                    err_sym(template_name(tpl));
+                    err_str(c"'");
+                    err_end();
+                }
+                // `Vec::new()`: the type's arguments are inferred too.
+                let g = instantiate_call(f, n, 0, 0, NODES[callee].h);
+                NODES[n].x = g + 1;
+                return check_direct_call(n, g);
+            }
+        }
+        if TYPES[t].kind == TyKind::Enum {
+            let v = find_variant(TYPES[t].a, member);
+            if v >= 0 {
+                let count = VARIANTS[v].field_count;
+                if count == 0 {
+                    err_begin(NODES[n].start);
+                    err_str(c"variant '");
+                    err_type(t);
+                    err_str(c"::");
+                    err_sym(member);
+                    err_str(c"' has no fields");
+                    err_help(c"write it without parentheses");
+                    err_end();
+                }
+                if NODES[n].count != count {
+                    err_begin(NODES[n].start);
+                    err_str(c"variant '");
+                    err_type(t);
+                    err_str(c"::");
+                    err_sym(member);
+                    err_str(c"' has ");
+                    err_int(count);
+                    err_str(if count == 1 { c" field" } else { c" fields" });
+                    err_str(c", got ");
+                    err_int(NODES[n].count);
+                    err_end();
+                }
+                for i in 0..count {
+                    check_arg(child(n, i), variant_field(v, i));
+                }
+                NODES[n].kind = VariantLit;
+                NODES[n].a = v;
+                return t;
+            }
+        }
+        let mut f = method_of(t, member);
+        if f < 0 {
+            path_member_error(callee, t, member);
+        }
+        if FNS[f].generic > 0 {
+            f = instantiate_call(f, n, 0, t, NODES[callee].h);
+        }
+        NODES[n].x = f + 1;
+        check_direct_call(n, f)
+    }
+}
+
+// Whether function f is a method: its first parameter is named `self`.
+fn is_method(f: i64) -> bool {
+    unsafe {
+        let item = FNS[f].node;
+        NODES[item].count > 0 && NODES[child(item, 0)].a == SELF_SYM
+    }
+}
+
+// A new node for the checker: `op operand` (`&` or `*`) of type `ty`.
+fn synthetic_unary(op: Tok, operand: i64, ty: i64) -> i64 {
+    unsafe {
+        let u = new_node(Unary, NODES[operand].start, NODES[operand].end);
+        NODES[u].op = op;
+        NODES[u].b = operand;
+        NODES[u].ty = ty;
+        u
+    }
+}
+
+// `x.m(args)`: a call of method m of x's type (or of the type x points
+// to), with `&x` or `*x` as needed for its `self`; becomes an NodeKind::Call.
+pub fn synth_method(n: i64) -> i64 {
+    unsafe {
+        let receiver = NODES[n].a;
+        let name = NODES[n].b;
+        let receiver_ty = synth_expr(receiver);
+        if is_vector(receiver_ty) {
+            return vector_method(n, name, receiver_ty);
+        }
+        let mut t = receiver_ty;
+        let mut through_pointer = false;
+        if is_pointer(t) && (TYPES[TYPES[t].a].kind == TyKind::Struct || TYPES[TYPES[t].a].kind == TyKind::Enum
+            || (method_of(t, name) < 0 && method_of(TYPES[t].a, name) >= 0)) {
+            t = TYPES[t].a;
+            through_pointer = true;
+        }
+        // (0.9: a value of a bounded parameter's type has its bounds' methods)
+        if NODES[receiver].kind == Ident && NODES[receiver].res == Res::Local && NODES[receiver].y >= 0
+            && LOCALS[NODES[receiver].y].tparam != 0 {
+            require_in_bounds(LOCALS[NODES[receiver].y].tparam, name, NODES[n].start);
+        }
+        let f0 = method_of(t, name);
+        let mut f = -1;
+        if TYPES[t].kind == TyKind::Struct || TYPES[t].kind == TyKind::Enum || f0 >= 0 {
+            f = f0;
+        }
+        if f < 0 {
+            err_begin(NODES[n].start);
+            err_str(c"no method '");
+            err_sym(name);
+            err_failed_name(name);
+            err_str(c"' on type '");
+            err_type(receiver_ty);
+            err_str(c"'");
+            if TYPES[t].kind == TyKind::Struct && find_field(TYPES[t].a, name) >= 0 {
+                err_help(c"to call a function stored in a field, write (s.f)(x)");
+            }
+            err_end();
+        }
+        if !is_method(f) {
+            err_begin(NODES[n].start);
+            err_str(c"'");
+            err_type(t);
+            err_str(c"::");
+            err_sym(name);
+            err_str(c"' is an associated function, not a method (it has no 'self' parameter)");
+            err_help(c"call it as '");
+            buf_type(ERR_HELP, t);
+            err_help(c"::");
+            err_help_sym(name);
+            err_help(c"(...)'");
+            err_end();
+        }
+        if FNS[f].generic > 0 {
+            // A method template: its impl's parameters from the receiver's
+            // type, its own from the arguments.
+            f = instantiate_call(f, n, 1, t, NODES[n].g);
+        } else if NODES[n].g != 0 {
+            name_error(NODES[n].start, c"method '", name, c"' is not generic");
+        }
+        let self_ty = fn_param(f, 0);
+        let mut arg = receiver;
+        if through_pointer && !is_borrow(receiver) {
+            unsafe_op(n, U_METHOD, c"calling a method through a raw pointer is unsafe");
+        }
+        if self_ty == t {
+            if through_pointer {
+                arg = synthetic_unary(Tok::Star, receiver, t);
+            }
+        } else if self_ty == ptr_to(t) {
+            if !through_pointer {
+                if !is_place(receiver) && !is_compound(t) {
+                    err_begin(NODES[n].start);
+                    err_str(c"method '");
+                    err_sym(name);
+                    err_str(c"' takes 'self: *");
+                    err_type(t);
+                    err_str(c"', but the receiver is a temporary value");
+                    err_help(c"bind it to a variable first");
+                    err_end();
+                }
+                arg = synthetic_unary(Tok::Amp, receiver, self_ty);
+            }
+        } else {
+            err_begin(NODES[n].start);
+            err_str(c"method '");
+            err_sym(name);
+            err_str(c"' has 'self' of type '");
+            err_type(self_ty);
+            err_str(c"'; a method's 'self' must be '");
+            err_type(t);
+            err_str(c"' or '*");
+            err_type(t);
+            err_str(c"'");
+            err_end();
+        }
+        let count = NODES[n].count;
+        if count + 1 != FNS[f].param_count {
+            err_begin(NODES[n].start);
+            err_str(c"method '");
+            err_sym(name);
+            err_str(c"' expects ");
+            err_int(FNS[f].param_count - 1);
+            err_str(c" arguments, got ");
+            err_int(count);
+            err_end();
+        }
+        let mark = list_begin();
+        list_push(arg);
+        for i in 0..count {
+            let a = child(n, i);
+            check_arg(a, fn_param(f, i + 1));
+            list_push(a);
+        }
+        list_end(n, mark);
+        NODES[n].kind = Call;
+        NODES[n].a = 0;
+        NODES[n].x = f + 1;
+        check_call_safety(n, f, 1);
+        FNS[f].ret
+    }
+}

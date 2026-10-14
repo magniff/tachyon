@@ -120,14 +120,14 @@ check() { # <name> <condition> <output>
 }
 cd "$ROOT" || exit 2
 TAB=$(printf '\t')
-# stats: every file of the compiler, largest first, check.tach among the
-# largest, a total.
-out=$("$COMPILER" query stats --over 1000 2>&1)
+# stats: every file of the compiler, largest first (the largest over 300
+# lines), a total.
+out=$("$COMPILER" query stats --over 300 2>&1)
 ok=0
 n=$(printf '%s\n' "$out" | grep -c "^[0-9]*${TAB}[0-9]*${TAB}compiler/src/[a-z_0-9/]*\.tach")
-[ "$n" -ge 40 ] && printf '%s\n' "$out" | head -5 | grep -q "${TAB}compiler/src/front/check.tach${TAB}over\$" \
+[ "$n" -ge 40 ] && printf '%s\n' "$out" | head -1 | grep -q "^[0-9]*${TAB}[0-9]*${TAB}compiler/src/[a-z_0-9/]*\.tach${TAB}over\$" \
     && printf '%s\n' "$out" | grep -q "^[0-9]*${TAB}[0-9]*${TAB}total\$" \
-    && printf '%s\n' "$out" | grep -q '^note query.over: [0-9]* files over 1000 lines$' && ok=1
+    && printf '%s\n' "$out" | grep -q '^note query.over: [0-9]* files over 300 lines$' && ok=1
 check self_stats "$ok" "$(printf '%s\n' "$out" | head -8)"
 out=$("$COMPILER" query stats gvn 2>&1)
 ok=0
@@ -136,15 +136,15 @@ printf '%s\n' "$out" | head -1 | grep -q "^# crate::middle::gvn${TAB}compiler/sr
 check self_stats_module "$ok" "$(printf '%s\n' "$out" | head -5)"
 # deps: every item of a module, and groups of at most N lines, each at
 # most N lines unless one item is larger.
-out=$("$COMPILER" query deps check --max-lines 1000 2>&1)
+out=$("$COMPILER" query deps check --max-lines 60 2>&1)
 ok=0
 items=$(printf '%s\n' "$out" | head -1 | sed -n "s/.*${TAB}\([0-9]*\) items\$/\1/p")
 rows=$(printf '%s\n' "$out" | grep -v "^groups${TAB}" | grep -c "^[A-Za-z_][A-Za-z_0-9:]*${TAB}[0-9]*${TAB}")
 groups=$(printf '%s\n' "$out" | grep -c "^group [0-9]*${TAB}")
-big=$(printf '%s\n' "$out" | awk -F "$TAB" '/^group / && $2 > 1000 && $4 != "over"' | wc -l | tr -d ' ')
+big=$(printf '%s\n' "$out" | awk -F "$TAB" '/^group / && $2 > 60 && $4 != "over"' | wc -l | tr -d ' ')
 [ -n "$items" ] && [ "$rows" = "$items" ] && [ "$groups" -ge 5 ] && [ "$big" = 0 ] \
     && printf '%s\n' "$out" | grep -q "^check_program${TAB}" \
-    && printf '%s\n' "$out" | grep -q "^groups${TAB}[0-9]*${TAB}at most 1000 lines${TAB}[0-9]* references between them\$" && ok=1
+    && printf '%s\n' "$out" | grep -q "^groups${TAB}[0-9]*${TAB}at most 60 lines${TAB}[0-9]* references between them\$" && ok=1
 check self_deps "$ok" "$(printf '%s\n' "$out" | head -3; printf '%s\n' "$out" | grep '^groups')"
 # unused: something, by file, and every listed definition really has no
 # reference.
@@ -162,12 +162,12 @@ printf '%s\n' "$out" | head -1 | grep -q "^crate::base::grow${TAB}compiler/src/b
     && printf '%s\n' "$out" | grep -q "^instances${TAB}[0-9]*${TAB}grow<" \
     && printf '%s\n' "$out" | grep -q "^total${TAB}[0-9]*${TAB}[0-9]*${TAB}[0-9]* files" && ok=1
 check self_impact "$ok" "$(printf '%s\n' "$out" | head -3)"
-# lint: the files over 1000 lines, each with the deps of its module.
-out=$("$COMPILER" lint --max-lines 1000 2>&1)
+# lint: the files over 300 lines, each with the deps of its module.
+out=$("$COMPILER" lint --max-lines 300 2>&1)
 rc=$?
 ok=0
-[ $rc = 1 ] && printf '%s\n' "$out" | head -1 | grep -q '^error lint.max-lines: compiler/src/front/check.tach: [0-9]* lines (at most 1000)$' \
-    && printf '%s\n' "$out" | grep -q "^try: .* query deps crate::front::check --max-lines 1000\$" && ok=1
+[ $rc = 1 ] && printf '%s\n' "$out" | head -1 | grep -q '^error lint.max-lines: compiler/src/[a-z_0-9/]*\.tach: [0-9]* lines (at most 300)$' \
+    && printf '%s\n' "$out" | grep -q "^try: .* query deps crate::[a-z_0-9:]* --max-lines 300\$" && ok=1
 check self_lint "$ok" "$(printf '%s\n' "$out" | head -4)"
 "$COMPILER" lint --max-lines 100000 >/dev/null 2>&1
 check self_lint_ok "$([ $? = 0 ] && echo 1)" "lint --max-lines 100000 failed"
