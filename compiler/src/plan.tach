@@ -415,124 +415,84 @@ fn put_names(out: i64, items: *IntVec, m: i64, weight: *i64, n: i64, i: i64, use
     }
 }
 
-// The grouping of the items into parts of at most OPT_MAX_LINES lines: a
-// greedy growth (from the most connected item, the item most connected to
-// the part that still fits), then parts merged while they fit (connected
-// ones first). Printed as `groups<TAB>N<TAB>at most MAX lines<TAB>CUT
-// references between them`, then `group K<TAB>LINES<TAB>ITEMS` each.
+// The grouping of the items into parts of at most OPT_MAX_LINES lines:
+// agglomerative, by average linkage: from one part per item, the two
+// parts with the most references between them per pair of their items
+// are merged while they fit together; then the parts with no references
+// between them are packed (first fit, largest first). Printed as
+// `groups<TAB>N<TAB>at most MAX lines<TAB>CUT references between them`,
+// then `group K<TAB>LINES<TAB>ITEMS` each.
 fn put_groups(out: i64, items: *IntVec, m: i64, weight: *i64, lines: *i64, n: i64) {
     unsafe {
         let max = OPT_MAX_LINES;
         let group = alloc_array::<i64>(n + 1);
-        for i in 0..n {
-            group[i] = -1;
-        }
-        // (the weight between items, both ways)
+        let size = alloc_array::<i64>(n + 1);
+        let count = alloc_array::<i64>(n + 1);
+        // (the references between parts, both ways)
         let w = alloc_array::<i64>(n * n + 1);
         for i in 0..n {
+            group[i] = i;
+            size[i] = lines[i];
+            count[i] = 1;
             for j in 0..n {
-                w[i * n + j] = weight[i * n + j] + weight[j * n + i];
+                w[i * n + j] = if i == j { 0 } else { weight[i * n + j] + weight[j * n + i] };
             }
         }
-        let mut groups = 0;
-        let size = alloc_array::<i64>(n + 1);
-        loop {
-            // The seed: the unassigned item most connected to unassigned
-            // ones (then the largest).
-            let mut seed = -1;
-            let mut best = -1;
-            for i in 0..n {
-                if group[i] >= 0 {
-                    continue;
-                }
-                let mut c = 0;
-                for j in 0..n {
-                    if group[j] < 0 && j != i {
-                        c += w[i * n + j];
-                    }
-                }
-                if c > best || (c == best && lines[i] > lines[seed]) {
-                    best = c;
-                    seed = i;
-                }
-            }
-            if seed < 0 {
-                break;
-            }
-            let g = groups;
-            groups += 1;
-            group[seed] = g;
-            size[g] = lines[seed];
-            loop {
-                let mut pick = -1;
-                let mut pick_w = 0;
-                for i in 0..n {
-                    if group[i] >= 0 || size[g] + lines[i] > max {
-                        continue;
-                    }
-                    let mut c = 0;
-                    for j in 0..n {
-                        if group[j] == g {
-                            c += w[i * n + j];
-                        }
-                    }
-                    if c > pick_w {
-                        pick_w = c;
-                        pick = i;
-                    }
-                }
-                if pick < 0 {
-                    break;
-                }
-                group[pick] = g;
-                size[g] += lines[pick];
-            }
-        }
-        // Merging: the pair of groups that fit together, most connected
-        // first (then the smallest), until none fits.
         loop {
             let mut ga = -1;
             let mut gb = -1;
-            let mut best_w = -1;
-            let mut best_size = 0;
-            for a in 0..groups {
+            let mut best_w = 0;
+            let mut best_c = 1;
+            for a in 0..n {
                 if size[a] < 0 {
                     continue;
                 }
-                for b in a + 1..groups {
-                    if size[b] < 0 || size[a] + size[b] > max {
+                for b in a + 1..n {
+                    if size[b] < 0 || w[a * n + b] == 0 || size[a] + size[b] > max {
                         continue;
                     }
-                    let mut c = 0;
-                    for i in 0..n {
-                        if group[i] != a {
-                            continue;
-                        }
-                        for j in 0..n {
-                            if group[j] == b {
-                                c += w[i * n + j];
-                            }
-                        }
-                    }
-                    if c > best_w || (c == best_w && size[a] + size[b] < best_size) {
-                        best_w = c;
-                        best_size = size[a] + size[b];
+                    // (w / (count a * count b), compared without division)
+                    let c = count[a] * count[b];
+                    let better = w[a * n + b] * best_c > best_w * c
+                        || (w[a * n + b] * best_c == best_w * c && ga >= 0 && size[a] + size[b] < size[ga] + size[gb]);
+                    if ga < 0 || better {
                         ga = a;
                         gb = b;
+                        best_w = w[a * n + b];
+                        best_c = c;
                     }
                 }
             }
             if ga < 0 {
                 break;
             }
-            for i in 0..n {
-                if group[i] == gb {
-                    group[i] = ga;
+            merge_group(group, size, count, w, n, ga, gb);
+        }
+        // Packing what has no references between: first fit, largest first.
+        let mut parts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for g in 0..n {
+            if size[g] >= 0 {
+                parts.push(g);
+            }
+        }
+        sort_desc(&parts, size);
+        let mut bins = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for k in 0..parts.count {
+            let g = parts.data[k];
+            let mut placed = false;
+            for x in 0..bins.count {
+                let b = bins.data[x];
+                if size[b] + size[g] <= max {
+                    merge_group(group, size, count, w, n, b, g);
+                    placed = true;
+                    break;
                 }
             }
-            size[ga] += size[gb];
-            size[gb] = -1;
+            if !placed {
+                bins.push(g);
+            }
         }
+        let groups = n;
         // The references between groups.
         let mut cut = 0;
         for i in 0..n {
@@ -580,6 +540,25 @@ fn put_groups(out: i64, items: *IntVec, m: i64, weight: *i64, lines: *i64, n: i6
             }
             buf_byte(out, '\n');
         }
+    }
+}
+
+// Merges part b into part a (their items, sizes, references).
+fn merge_group(group: *i64, size: *i64, count: *i64, w: *i64, n: i64, a: i64, b: i64) {
+    unsafe {
+        for i in 0..n {
+            if group[i] == b {
+                group[i] = a;
+            }
+        }
+        size[a] += size[b];
+        size[b] = -1;
+        count[a] += count[b];
+        for x in 0..n {
+            w[a * n + x] += w[b * n + x];
+            w[x * n + a] += w[x * n + b];
+        }
+        w[a * n + a] = 0;
     }
 }
 

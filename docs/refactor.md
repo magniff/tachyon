@@ -233,11 +233,14 @@ group 1→10→Token lex_digit check
 group 2→9→report describe summary
 ```
 
-found greedily: a part grows from the most connected item left, adding
-the item most connected to it that still fits; then parts are merged
-while two fit together, the most connected first. An item larger than N
-is a part of its own (`→over`). The references between parts are what a
-split would turn into imports.
+found by agglomerative clustering with average linkage: from one part
+per item, the two parts with the most references between them per pair
+of their items are merged, while they fit together; then the parts that
+have no references between them are packed, first fit, largest first.
+An item larger than N is a part of its own (`→over`). The references
+between parts are what a split would turn into imports (on the
+compiler's check.tach, 214 items in 5 parts of at most 1000 lines, 156
+references between them).
 
 ### query unused
 
