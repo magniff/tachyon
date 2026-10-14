@@ -59,8 +59,12 @@ static mut SYNTHED: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, cou
 pub static mut HINT_NODE: i64 = 0;
 pub static mut HINT_TY: i64 = 0;
 
-const MAX_INST_DEPTH: i64 = 64;
-const MAX_TYPE_DEPTH: i64 = 12;
+// The deepest nesting of instantiations in instantiations, and the largest
+// type argument (see type_size); in 0.14 from 64 instances and 12 levels
+// of type: iterator chains nest both a level per adapter.
+const MAX_INST_DEPTH: i64 = 2000;
+const MAX_TYPE_SIZE: i64 = 4096;
+static mut TYPE_SIZES: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
 
 // Binds the parameters `params` (a Generics node) to the `count` types at
 // TLISTS[targs...]; returns what env_leave restores.
@@ -216,32 +220,44 @@ pub fn mangle_type(out: i64, t: i64) {
     }
 }
 
-// How deeply type t nests (to stop instantiations that grow forever).
-fn type_depth(t: i64) -> i64 {
+// The size of type t as a tree (its nodes, a type argument counted each
+// time it appears), up to MAX_TYPE_SIZE + 1, memoized: instantiations whose
+// type arguments grow without end are stopped by it, whether they grow
+// deeper (`Option<Option<..>>`) or wider (`(x, x)`), while a chain of a
+// few hundred iterator adapters, deep but thin, is not (0.14).
+fn type_tree_size(t: i64) -> i64 {
     unsafe {
+        let known = TYPE_SIZES.get(t + 1);
+        if known != 0 {
+            return known - 1;
+        }
         let kind = TYPES[t].kind;
-        let mut depth = 0;
+        let mut size = 1;
         if kind == TyKind::Ptr || kind == TyKind::Slice || kind == TyKind::Array {
-            depth = type_depth(TYPES[t].a);
+            size += type_tree_size(TYPES[t].a);
         } else if kind == TyKind::Tuple || kind == TyKind::Fn {
             for i in 0..TYPES[t].count {
-                depth = max_i64(depth, type_depth(type_elem(t, i)));
+                size += type_tree_size(type_elem(t, i));
             }
             if kind == TyKind::Fn {
-                depth = max_i64(depth, type_depth(TYPES[t].a));
+                size += type_tree_size(TYPES[t].a);
             }
         } else if kind == TyKind::Struct && STRUCTS[TYPES[t].a].tmpl != 0 {
             let s = TYPES[t].a;
             for i in 0..STRUCTS[s].targ_count {
-                depth = max_i64(depth, type_depth(TLISTS.data[STRUCTS[s].targs + i]));
+                size += type_tree_size(TLISTS.data[STRUCTS[s].targs + i]);
             }
         } else if kind == TyKind::Enum && ENUMS[TYPES[t].a].tmpl != 0 {
             let e = TYPES[t].a;
             for i in 0..ENUMS[e].targ_count {
-                depth = max_i64(depth, type_depth(TLISTS.data[ENUMS[e].targs + i]));
+                size += type_tree_size(TLISTS.data[ENUMS[e].targs + i]);
             }
         }
-        depth + 1
+        if size > MAX_TYPE_SIZE {
+            size = MAX_TYPE_SIZE + 1;
+        }
+        TYPE_SIZES.put(t + 1, size + 1);
+        size
     }
 }
 
@@ -270,7 +286,7 @@ fn same_targs(targs: i64, count: i64, mark: i64) -> bool {
 fn check_targ_depth(mark: i64, pos: i64) {
     unsafe {
         for i in mark..TSCRATCH.count {
-            if type_depth(TSCRATCH.data[i]) > MAX_TYPE_DEPTH {
+            if type_tree_size(TSCRATCH.data[i]) > MAX_TYPE_SIZE {
                 error_at(pos, c"type arguments nested too deeply (does a generic type instantiate itself with ever larger arguments?)");
             }
         }
