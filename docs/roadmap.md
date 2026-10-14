@@ -703,3 +703,30 @@ with `--allow-unsafe`):
 
 The unsafe checks and traits cost nothing measurable; the e-graph's
 rewrite rules cost 4.7% at -O2 (within the 10% allowed).
+
+### 0.10
+
+aarch64-macos (Apple silicon, native; `bench/run.sh -r 5`; "0.9.0" is
+the previous release at its default level):
+
+| program | 0.9.0 | 0.10 -O0 | 0.10 -O1 | 0.10 -O2 | cc -O2 |
+|---|---|---|---|---|---|
+| collatz | 293 | 2443 | 292 | 291 | 292 |
+| fib | 13 | 54 | 22 | 13 | 14 |
+| interp | 42 | 444 | 77 | 44 | 40 |
+| matmul | 26 | 495 | 74 | 18 | 43 |
+| nbody | 33 | 296 | 32 | 32 | 28 |
+| sieve | 63 | 254 | 59 | 69 | 71 |
+| stencil | 16 | 242 | 21 | 10 | 10 |
+| md5 | 35 | 164 | 38 | 35 | - |
+
+The vectorizer makes matmul 2.4× faster than clang -O2 and brings stencil
+level with it. sieve's 63 against 69 is this machine's noise for that
+program (58 to 64 ms in repeated runs of either build). interp is about
+5% slower with the vectorizer than without it (`--no-vectorize`): its
+run-time guards on loops that gain nothing; a cost model for the
+vectorizer is for 0.11.
+
+Compile time, the compiler building itself to an object, best of 7:
+-O0 109 ms with 0.9.0, 113 ms with 0.10; -O2 791 ms and 816 ms (+3%, the
+vectorizer and profile support).

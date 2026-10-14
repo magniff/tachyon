@@ -40,6 +40,7 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.7.0 | `v0.7.0` | 0.6.0 | aarch64-macos, x86_64-linux, x86_64-macos | object files: an assembler in the compiler writes Mach-O and ELF objects, `cc` only links (the compiler builds itself 4.4× faster at `-O2`, 15.7× at `-O0`); fixed-array indexing is checked; the undefined behaviour left is documented |
 | 0.8.0 | `v0.8.0` | 0.7.0 | aarch64-macos, x86_64-linux, x86_64-macos | no wildcard imports: `use x::*` and `import "h.h";` without `as` are removed, every name a file uses is declared, imported by name or written with its path; `tachyonc --fix-imports` rewrites older code |
 | 0.9.0 | `v0.9.0` | 0.8.0 | aarch64-macos, x86_64-linux, x86_64-macos | `unsafe`, traits and an e-graph: `unsafe` blocks and functions (safe code has no undefined behaviour; a warning in 0.9, an error from 0.10), `--fix-unsafe`; traits, bounds, operator traits, std `HashMap` and `sort`; array constants, line continuations; GVN on an acyclic e-graph with rewrite rules checked by `--check-rules` |
+| 0.10.0 | `v0.10.0` | 0.9.0 | aarch64-macos, x86_64-linux, x86_64-macos | vectors and profiles: an unsafe operation outside `unsafe` is an error; vector types (`v4f32`, `v2f64`, ...) on NEON and SSE2; a loop vectorizer; profile-guided optimization; `--check-unsafe`; every error of a compilation reported |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
@@ -60,6 +61,29 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   at run time; `--no-vectorize`; `tests/fuzz/run.sh -V`.
 - **Profiles**: `--profile-generate FILE` and `--profile-use FILE` (block
   layout, inlining, unrolling).
+
+### What's new in 0.10
+
+- **`unsafe` is enforced** (breaking): an unsafe operation outside an
+  `unsafe` block or `unsafe fn` is an error, not a warning. Safe code has
+  no undefined behaviour. The compiler's own source moved to `unsafe`
+  blocks (its output byte-identical before and after).
+- **Vector types** `v2f64`, `v4f32`, `v2i64`, `v4i32`, `v8i16`, `v16i8`:
+  lanewise arithmetic, masks and `select`, lanes, horizontal sums, and
+  bounds-checked loads and stores; NEON on AArch64, SSE2 on x86-64. Not
+  allowed in `extern "C"` signatures yet.
+- **A loop vectorizer**: counted inner loops (maps, integer reductions)
+  and the loop around one inner loop (matmul), behind run-time checks
+  that prove the bounds and rule out overlap, the original loop kept as
+  the remainder; `--no-vectorize`. Float reductions are not vectorized
+  (that would reorder additions).
+- **Profile-guided optimization**: `--profile-generate`, then
+  `--profile-use FILE`; the counts steer block layout, inlining and
+  unrolling.
+- **`--check-unsafe`**: a checking mode for `unsafe` code.
+- **Every error of a compilation is reported**: declarations recover one
+  by one, and a syntax error no longer stops the type checking of
+  everything else.
 
 ### What's new in 0.9 (in progress)
 
