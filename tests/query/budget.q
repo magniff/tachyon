@@ -180,7 +180,13 @@ error query.usage: no command
 try: tachyonc query items
 [exit 2]
 $ --help
-usage: tachyonc query def|show NAME [ROOT] [--exact]
-       tachyonc query refs|callers NAME [ROOT] [--exact] [--count] [--in FILE|MODULE] [--limit N] [--all]
-       tachyonc query items [MODULE] [ROOT]
-see docs/query.md
+usage: tachyonc query def|show NAME... [--root ROOT] [--exact]
+       tachyonc query refs|callers NAME... [--exact] [--count] [--in FILE|MODULE] [--limit N] [--all]
+       tachyonc query items [MODULE...]
+       tachyonc query stats [MODULE|FILE] [--over N] [--all]
+       tachyonc query deps MODULE [--max-lines N]
+       tachyonc query unused [MODULE] [--all]
+       tachyonc query impact NAME
+NAME: a path or its end (f, m::f, T::f, T.field), or FILE:LINE
+ROOT: --root ROOT, a last argument ending in .tach, $TACHYON_ROOT, ./main.tach, ./compiler/src/main.tach
+see docs/query.md and docs/refactor.md
