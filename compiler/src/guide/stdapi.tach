@@ -1,0 +1,256 @@
+// std's API, for `tachyonc guide std` (0.13): every public item of the
+// standard library's source as this compiler embeds it
+// (front/stdsrc.tach), with the comment above it. Functions and methods
+// are their signatures, types and traits their declarations, and the
+// trait impls are summed up by trait at the end. It is made from the
+// source's text, written in one style: an item starts a line, and the
+// braces of a body balance on its lines (tests/guide/run.sh compares the
+// result with the compiler's item index).
+
+use crate::base::{buf_bytes, buf_clear, buf_new, buf_slice};
+use crate::front::stdsrc::std_source;
+
+// Whether s starts with p.
+fn starts(s: [u8], p: [u8]) -> bool {
+    s.len >= p.len && s[0..p.len] == p
+}
+
+// Where p first occurs in s, or -1.
+fn find(s: [u8], p: [u8]) -> i64 {
+    let mut i = 0;
+    while i + p.len <= s.len {
+        if s[i..i + p.len] == p {
+            return i;
+        }
+        i += 1;
+    }
+    -1
+}
+
+// s without its leading blanks.
+fn trim(s: [u8]) -> [u8] {
+    let mut i = 0;
+    while i < s.len && s[i] == ' ' {
+        i += 1;
+    }
+    s[i..]
+}
+
+// s without a leading `pub `.
+fn unpub(s: [u8]) -> [u8] {
+    if starts(s, "pub ") { s[4..] } else { s }
+}
+
+// What line s changes the depth of braces by; braces in strings,
+// characters and comments do not count.
+fn brace_delta(s: [u8]) -> i64 {
+    let mut d = 0;
+    let mut i = 0;
+    while i < s.len {
+        let ch = s[i];
+        if ch == '/' && i + 1 < s.len && s[i + 1] == '/' {
+            return d;
+        }
+        if ch == '"' || ch == '\'' {
+            i += 1;
+            while i < s.len && s[i] != ch {
+                if s[i] == '\\' {
+                    i += 1;
+                }
+                i += 1;
+            }
+        } else if ch == '{' {
+            d += 1;
+        } else if ch == '}' {
+            d -= 1;
+        }
+        i += 1;
+    }
+    d
+}
+
+// A function's signature: its line up to the body, without `pub`.
+fn signature(t: [u8]) -> [u8] {
+    let u = unpub(t);
+    let k = find(u, " {");
+    if k >= 0 { u[0..k] } else { u }
+}
+
+fn is_fn(t: [u8]) -> bool {
+    starts(t, "pub fn ") || starts(t, "pub unsafe fn ")
+}
+
+fn is_decl(t: [u8]) -> bool {
+    starts(t, "pub struct ") || starts(t, "pub enum ") || starts(t, "pub union ")
+        || starts(t, "pub trait ") || starts(t, "pub const ") || starts(t, "pub static ")
+        || starts(t, "pub type ")
+}
+
+// Writes line s to out, after `indent` and with a line break.
+fn put_line(out: i64, indent: [u8], s: [u8]) {
+    buf_bytes(out, indent);
+    buf_bytes(out, s);
+    buf_bytes(out, "\n");
+}
+
+// Writes the comment lines of buffer doc (each ends with a line break),
+// indented, and empties doc.
+fn put_doc(out: i64, doc: i64, indent: [u8]) {
+    let text = buf_slice(doc);
+    let mut start = 0;
+    while start < text.len {
+        let mut end = start;
+        while end < text.len && text[end] != '\n' {
+            end += 1;
+        }
+        put_line(out, indent, text[start..end]);
+        start = end + 1;
+    }
+    buf_clear(doc);
+}
+
+// `impl<T: Hash> Hash for Pair<T>` (a trait impl's header, without its
+// brace): the trait and the type.
+fn trait_impl_parts(head: [u8]) -> ([u8], [u8]) {
+    let mut rest = head[4..];
+    if starts(rest, "<") {
+        let close = find(rest, ">");
+        rest = rest[close + 1..];
+    }
+    rest = trim(rest);
+    let k = find(rest, " for ");
+    (rest[0..k], rest[k + 5..])
+}
+
+// Writes std's API to buffer out.
+pub fn std_api(out: i64) {
+    let src = buf_new();
+    std_source(src);
+    let text = buf_slice(src);
+    let doc = buf_new();
+    let decl = buf_new();
+    let mut impl_traits: Vec<[u8]> = Vec::new();
+    let mut impl_types: Vec<[u8]> = Vec::new();
+    defer impl_traits.free();
+    defer impl_types.free();
+    let mut depth = 0;
+    // In an impl of a type's own methods: its header, printed before its
+    // first public method.
+    let mut in_impl = false;
+    let mut impl_head: [u8] = "";
+    let mut head_done = false;
+    // A declaration whose braces close on a later line, joined into one.
+    let mut joining = false;
+    let mut start = 0;
+    while start < text.len {
+        let mut end = start;
+        while end < text.len && text[end] != '\n' {
+            end += 1;
+        }
+        let line = text[start..end];
+        start = end + 1;
+        let t = trim(line);
+        let before = depth;
+        depth += brace_delta(line);
+        if joining {
+            buf_bytes(decl, " ");
+            buf_bytes(decl, t);
+            if depth == 0 {
+                // (`a: i64, }`: the last field's comma goes)
+                let joined = buf_slice(decl);
+                let n = joined.len;
+                if n >= 3 && joined[n - 3..] == ", }" {
+                    buf_bytes(out, joined[0..n - 3]);
+                    put_line(out, "", " }");
+                } else {
+                    put_line(out, "", joined);
+                }
+                joining = false;
+            }
+            continue;
+        }
+        if before == 0 {
+            if starts(t, "//") {
+                put_line(doc, "", t);
+                continue;
+            }
+            if is_fn(t) {
+                put_doc(out, doc, "");
+                put_line(out, "", signature(t));
+            } else if is_decl(t) {
+                put_doc(out, doc, "");
+                if depth == 0 {
+                    put_line(out, "", unpub(t));
+                } else {
+                    buf_clear(decl);
+                    buf_bytes(decl, unpub(t));
+                    joining = true;
+                }
+            } else if starts(t, "impl") && depth > 0 {
+                let head = signature(t);
+                if find(head, " for ") >= 0 {
+                    let parts = trait_impl_parts(head);
+                    impl_traits.push(parts.0);
+                    impl_types.push(parts.1);
+                } else {
+                    in_impl = true;
+                    impl_head = head;
+                    head_done = false;
+                }
+            }
+            buf_clear(doc);
+            continue;
+        }
+        if in_impl && before == 1 {
+            if starts(t, "//") {
+                put_line(doc, "", t);
+                continue;
+            }
+            if is_fn(t) {
+                if !head_done {
+                    buf_bytes(out, impl_head);
+                    put_line(out, "", " {");
+                    head_done = true;
+                }
+                put_doc(out, doc, "    ");
+                put_line(out, "    ", signature(t));
+            }
+            buf_clear(doc);
+        }
+        if in_impl && depth == 0 {
+            if head_done {
+                put_line(out, "", "}");
+            }
+            in_impl = false;
+        }
+    }
+    // The trait impls, by trait, in the order of their first impl.
+    let traits = impl_traits.as_slice();
+    let types = impl_types.as_slice();
+    if traits.len > 0 {
+        put_line(out, "", "// Trait impls (their methods are the traits'):");
+    }
+    for i in 0..traits.len {
+        let mut first = true;
+        for j in 0..i {
+            if traits[j] == traits[i] {
+                first = false;
+            }
+        }
+        if !first {
+            continue;
+        }
+        buf_bytes(out, "impl ");
+        buf_bytes(out, traits[i]);
+        buf_bytes(out, " for ");
+        let mut sep = "";
+        for j in i..traits.len {
+            if traits[j] == traits[i] {
+                buf_bytes(out, sep);
+                buf_bytes(out, types[j]);
+                sep = ", ";
+            }
+        }
+        buf_bytes(out, "\n");
+    }
+}

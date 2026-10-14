@@ -61,6 +61,13 @@ full grammar is in [docs/grammar.md](docs/grammar.md).
 
 ## Built for agents
 
+**The compiler teaches the language.** A newcomer has never seen tachyon,
+so `tachyonc guide` prints a reference sized for a context window (about
+5k tokens; `--list` for the topics): where tachyon differs from Rust,
+std's API generated from its source, the first errors with their fixes.
+It is built into the compiler, so it matches its version, and every
+example in it is compiled and run by the test suite.
+
 **The compiler is the toolset.** Agents read and change code through
 `tachyonc` instead of `grep`, `sed` and whole-file rewrites. Names are
 resolved by the compiler, so a query sees uses through imports and

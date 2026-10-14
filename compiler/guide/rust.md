@@ -1,0 +1,239 @@
+# Rust -> tachyon
+
+What a Rust programmer reaches for, and what tachyon has instead.
+Tachyon looks like Rust, so the Rust habit compiles to an error more
+often than to something else; each error names the fix.
+
+## Text
+
+| Rust | tachyon |
+|---|---|
+| `&str`, `String`, `&[u8]` | `[u8]`: a pointer and a length; `"abc"` is one; no UTF-8 type |
+| `String::new()`, `push_str`, `format!` | `std::Buf`: `push`, `push_str`, `push_int`, `as_slice` |
+| `s.len()` | `s.len` (a field, `i64`) |
+| `s == "x"`, `s < t` | the same (std's `Eq` and `Ord` for `[u8]`, by bytes) |
+| `&s[1..3]` | `s[1..3]` (checked) |
+| `s.as_bytes()[0]`, `b'a'` | `s[0]`, `'a'` (a `u8`) |
+| `CString`, `.as_ptr()` | `c"text"` (a `*u8`); a slice is not NUL-terminated |
+| `match s { "a" => .. }` | `if s == "a" { .. } else if ...` |
+| `x.to_string()`, `s.parse()` | `Buf::push_int`; parse by hand, or C's `strtol` |
+
+```tach
+use std::Buf;
+
+fn parse_int(s: [u8]) -> Option<i64> {
+    if s.len == 0 { return None; }
+    let mut n = 0;
+    for ch in s {
+        if ch < '0' || ch > '9' { return None; }
+        n = n * 10 + (ch - '0') as i64;
+    }
+    Some(n)
+}
+
+fn main() -> i32 {
+    let mut b = Buf::new();
+    defer b.free();
+    b.push_str("sum=");
+    b.push_int(parse_int("40").unwrap() + parse_int("2").unwrap_or(0));
+    println(b.as_slice());
+    if parse_int("4x").is_none() { println("not a number"); }
+    0
+}
+```
+```out
+sum=42
+not a number
+```
+
+## References, ownership, memory
+
+| Rust | tachyon |
+|---|---|
+| `&T`, `&mut T` | `*T`; `&x` is the address of `x`; no lifetimes; `x` need not be `mut` to take `&x` |
+| `*r` on a reference | `*p`; safe on a borrow (`&place`, a pointer parameter), else `unsafe` |
+| `r.field` through a reference | `p.f` (auto-deref, one level) |
+| moves, `Clone`, `Copy` | every value is copied by `=` and by calls (bitwise); no moves |
+| `Drop`, RAII, scope guards | `defer stmt;` runs when the block exits; std types have `free()` |
+| `Box<T>`, `Rc<T>`, `Arc<T>` | none: a `Vec<T>`, or `malloc` in `unsafe` |
+| `Option<&T>` | `Option<*T>`, or an index |
+| `Mutex`, threads | none in tachyon (C's threads are C's business) |
+
+A `Vec`, `Buf` or `HashMap` value is a handle (a pointer, a length, a
+capacity). Copying it shares the memory; a push through one copy is not
+seen by the other's length. Pass `&v`:
+
+```tach
+fn fill(v: *Vec<i64>, n: i64) {          // v.push works through the pointer
+    for i in 0..n { v.push(i * i); }
+}
+
+fn main() -> i32 {
+    let mut v: Vec<i64> = Vec::new();
+    defer v.free();
+    fill(&v, 4);
+    std::print_int(v.len() + v.get(3));
+    println("");
+    0
+}
+```
+```out
+13
+```
+
+## Errors and Option
+
+| Rust | tachyon |
+|---|---|
+| `x?` | none until 0.15: `let v = match r { Ok(v) => v, Err(e) => return Err(e) };` |
+| `panic!("msg")` | `unsafe { std::panic(c"msg") }` (exit 101), or `return` an error |
+| `.map()`, `.and_then()`, `.ok_or()` | none: `match`, `if let` |
+| `.unwrap()`, `.unwrap_or(d)`, `.is_some()`, `.is_none()` | the same |
+| `.is_ok()`, `.is_err()`, `.ok()` | the same |
+| `assert!(c)`, `debug_assert!` | `if !c { unsafe { std::panic(c"...") } }` |
+| `std::process::exit(n)` | `return n;` from `main`, or C's `exit` in `unsafe` |
+
+```tach
+enum Error { Empty, TooBig(i64) }
+
+fn check(n: i64) -> Result<i64, Error> {
+    if n == 0 { return Err(Error::Empty); }
+    if n > 100 { return Err(Error::TooBig(n)); }
+    Ok(n * 2)
+}
+
+fn twice_checked(n: i64) -> Result<i64, Error> {
+    let v = match check(n) { Ok(v) => v, Err(e) => return Err(e) };   // what `?` would do
+    Ok(v + 1)
+}
+
+fn main() -> i32 {
+    match twice_checked(500) {
+        Ok(v) => std::print_int(v),
+        Err(Error::TooBig(n)) => { print("too big: "); std::print_int(n); }
+        Err(Error::Empty) => print("empty"),
+    }
+    println("");
+    std::print_int(twice_checked(4).unwrap());
+    println("");
+    0
+}
+```
+```out
+too big: 500
+9
+```
+
+## Iteration and closures
+
+| Rust | tachyon |
+|---|---|
+| `for x in v.iter()`, `for x in &v` | `for x in v.as_slice()` (a copy of each element) |
+| `for (i, x) in s.iter().enumerate()` | `for i in 0..s.len { let x = s[i]; ... }` |
+| `for x in v.iter_mut() { *x += 1 }` | `for i in 0..s.len { s[i] += 1; }` |
+| `.map()`, `.filter()`, `.sum()`, `.collect()` | a loop that pushes to a `Vec` or adds to a `mut` |
+| `\|x\| x + 1` | none in 0.13 (0.14): a named `fn` |
+| a closure capturing state | a `fn` taking a pointer to a context struct |
+| `(0..n).rev()` | `let mut i = n; while i > 0 { i -= 1; ... }` |
+| `.step_by(2)` | `while` with `i += 2` |
+| `sort()`, `sort_by_key` | `std::sort(s)` (`T: Ord`; not stable); implement `Ord` for another order |
+
+A function value is `fn(A) -> R`, a plain function, no environment.
+Using a function with pointer parameters as a value, and calling it
+with a pointer, is `unsafe` (its callee is not checked):
+
+```tach
+struct Sum { total: i64 }
+
+fn add(s: *Sum, x: i64) { s.total += x; }
+
+fn each(xs: [i64], f: fn(*Sum, i64), s: *Sum) {
+    for x in xs { unsafe { f(s, x); } }
+}
+
+fn square(x: i64) -> i64 { x * x }
+
+fn map_sum(xs: [i64], f: fn(i64) -> i64) -> i64 {
+    let mut t = 0;
+    for x in xs { t += f(x); }
+    t
+}
+
+fn main() -> i32 {
+    let mut s = Sum { total: 0 };
+    let xs = [1, 2, 3];
+    unsafe { each(xs[..], add, &s); }
+    std::print_int(s.total + map_sum(xs[..], square));
+    println("");
+    0
+}
+```
+```out
+20
+```
+
+## Types and numbers
+
+| Rust | tachyon |
+|---|---|
+| `usize` for lengths and indices | `i64` (`s.len`, `v.len()`); indexing takes any integer type |
+| implicit widening `i32` -> `i64` | none: `x as i64` (0.15 adds lossless widening) |
+| `i32::MAX`, `u8::MIN` | none: write the value |
+| overflow: panic in debug, wrap in release | always wraps (two's complement) |
+| `x / 0` panics | `x / 0 == 0`, `x % 0 == x` |
+| `!x` (bitwise not) | `~x` |
+| `x.pow(n)`, `x.abs()`, `f.sqrt()` | write it, or C's `pow`, `labs`, `sqrt` (`import "math.h" as m;`) |
+| `char`, a non-ASCII `char` literal | `u8`, ASCII literals only; `"\u{e9}"` in strings is UTF-8 bytes |
+| `()` | `()` |
+| `!` (never) | `!`: `fn fail() -> ! { ... }` |
+| `#[derive(PartialEq, Eq)]` | `==` is structural for structs, enums, tuples, arrays |
+| `#[derive(Clone, Copy, Debug, Default, Hash)]` | none needed for copies; write `impl Hash for T` yourself |
+| `impl Display`, `{:?}` | none: write a `fn show(self: *T, b: *Buf)` |
+| `type A = B;` | the same (`type Pair<T> = (T, T);` too) |
+| `const fn` | none; `const` items take constant expressions |
+
+## Syntax
+
+| Rust | tachyon |
+|---|---|
+| `fn f(&self)`, `&mut self`, `self` | `fn f(self: *T)`, `fn f(self: *T)`, `fn f(self: T)`; `Self` works |
+| `'a: loop { break 'a; }` | `a: loop { break :a; }` |
+| `let x;` then assign | `let x = ...;` always |
+| `let Some(x) = o else { .. };` | `let x = match o { Some(x) => x, None => return 1 };` |
+| `P { x, y }` shorthand, `..base` | `P { x: x, y: y }` |
+| `where T: Ord` | `<T: Ord>` |
+| `pub(crate)`, `pub(super)` | `pub`, or nothing (private to the module and its children) |
+| `fn` inside a `fn` | items only at module level |
+| `macro_rules!`, `println!`, `vec!`, `assert!` | none |
+| `impl<T> Trait for Vec<T>` | the same (one impl per trait and type) |
+| `dyn Trait`, `impl Trait` in argument position | generics: `fn f<T: Trait>(x: T)` |
+| `#[test]` | none yet (0.18); write a program and check its output |
+| `use a::b::*;` | `use a::b::{c, d};` |
+| `x as T` | the same; `bool as i64` works, an integer to an enum is checked |
+| `if let ... else if let ...`, `while let` | the same |
+| `match` guards, `a \| b`, `1..=9` | the same; no `x @ pat`, no slice patterns, no string patterns |
+
+## Modules and crates
+
+| Rust | tachyon |
+|---|---|
+| `mod m;` | the same: `m.tach` or `m/mod.tach` next to the file |
+| `use crate::a::b;`, `super::`, `self::` | the same |
+| `extern crate`, Cargo dependencies | none: one program from its files; C through headers |
+| `pub use` | the same |
+| `std::collections::HashMap` | `std::HashMap` |
+| `std::io::stdin().read_line` | C's `getchar` or `read` (see `tachyonc guide c-interop`) |
+| `std::env::args()` | `fn main(argc: i32, argv: **u8) -> i32` |
+
+## unsafe and C
+
+| Rust | tachyon |
+|---|---|
+| `unsafe { }`, `unsafe fn` | the same |
+| `extern "C" { fn f(); }` | the same; or `import "stdio.h" as c;` then `c::printf` |
+| `#[repr(C)]`, `#[repr(u8)]` | the same; also `packed`, `align(N)` |
+| `extern "C" fn cb()` | the same; a plain `fn` is not a C callback |
+| `std::ptr::null()` | `0 as *T` |
+| `p.add(i)`, `p.offset(i)` | `p[i]`, `&p[i]` (unsafe); no pointer arithmetic |
+| `std::mem::size_of::<T>()` | `size_of(T)`, `align_of(T)` |
+| `libc::malloc` | `extern "C" { fn malloc(n: u64) -> *u8; }` or `import "stdlib.h" as c;` |

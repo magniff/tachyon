@@ -616,6 +616,15 @@ compile times in "Benchmarks", 0.12. Not run: the suite on x86_64-macos
 What 0.12's refactoring showed the tools lacked, fixed and measured
 again.
 
+- `tachyonc guide` (`compiler/guide/`, `compiler/src/guide/`): the
+  language for a reader who has never seen it, built into the compiler:
+  the core guide by default (about 5k tokens: Rust habits and what
+  tachyon has instead, the essentials, std's API generated from std's
+  source, the first errors, the tools), `guide TOPIC` for the detail,
+  `guide --list` with each topic's size. `tests/guide/run.sh` (category
+  `guide`) compiles and runs every example, checks the std section
+  against the compiler's item index and the core guide's budget.
+
 ## 0.14: an agent eval; closures and iterators
 
 From here every release also passes an **agent-eval gate**, and a

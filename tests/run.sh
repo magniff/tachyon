@@ -3,9 +3,10 @@
 # needed): every tests/run/*.tach, tests/run/*/main.tach (a program of
 # several modules, 0.5) and tests/examples/*.test case is
 # compiled, assembled and linked with the C compiler, run, and checked;
-# alongside them, tests/query/run.sh (`tachyonc query`, 0.11) and
-# tests/refactor/run.sh (the refactoring tools, 0.11). POSIX sh and awk
-# only, so it runs the same on macOS and Linux.
+# alongside them, tests/query/run.sh (`tachyonc query`, 0.11),
+# tests/refactor/run.sh (the refactoring tools, 0.11) and
+# tests/guide/run.sh (`tachyonc guide`, 0.13). POSIX sh and awk only, so
+# it runs the same on macOS and Linux.
 #
 # usage: tests/run.sh [-c COMPILER] [-t TARGET] [-O LEVEL] [-j JOBS] [-a] [-d FORMAT] [FILTER]
 #
@@ -592,6 +593,9 @@ esac
 case refactor in
     *"$FILTER"*) "$ROOT/tests/refactor/run.sh" -c "$COMPILER" >"$WORK/refactor.out" 2>&1 & ;;
 esac
+case guide in
+    *"$FILTER"*) "$ROOT/tests/guide/run.sh" -c "$COMPILER" >"$WORK/guide.out" 2>&1 & ;;
+esac
 
 # The slots: JOBS of them in a FIFO of our own, or the shared ones of
 # $TACHYON_JOBSERVER (see above).
@@ -670,6 +674,25 @@ case refactor in
             count=$((count + 1))
         fi
         awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/refactor.out" >>"$FAILURES"
+        ;;
+esac
+
+# `tachyonc guide` (0.13): tests/guide/run.sh (run above), the guide's
+# examples compiled and run, its std section, its budget; category
+# "guide".
+case guide in
+    *"$FILTER"*)
+        while read -r status _; do
+            case "$status" in
+                pass) echo "guide pass" >>"$TALLY"; count=$((count + 1)) ;;
+                FAIL) echo "guide fail" >>"$TALLY"; count=$((count + 1)) ;;
+            esac
+        done <"$WORK/guide.out"
+        if ! grep -q '^pass' "$WORK/guide.out"; then
+            echo "guide fail" >>"$TALLY"
+            count=$((count + 1))
+        fi
+        awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/guide.out" >>"$FAILURES"
         ;;
 esac
 
