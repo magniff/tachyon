@@ -50,7 +50,7 @@ return Err(e) };` (the same for Option).
 println!("{}", 1);
 ```
 ```err
-error[parser error] 'println!' is a macro call: tachyon has no macros | help: `println(s)` and `print(s)` take a [u8]; numbers: `std::print_int(n)`; or build the text in a `std::Buf` (`push_str`, `push_int`) and print `b.as_slice()`
+error[parser error] 'println!' is a macro call: tachyon has no macros | help: write `println(f"{1}")`
 ```
 The help names what replaces `vec!`, `format!`, `assert!` and the others.
 

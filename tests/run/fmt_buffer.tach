@@ -1,0 +1,102 @@
+// std's output buffer (0.15): a Fmt to a file descriptor fills a static
+// 4 KB buffer that print writes out at its end; padding a hole that does
+// not fit in what is left, text longer than the buffer, another file
+// descriptor, and a print inside a Display impl keep every byte in order.
+// The bytes written to a pipe are read back and compared with format's.
+// EXPECT: cut 0: same, 4134 bytes
+// EXPECT: cut 3: same, 4131 bytes
+// EXPECT: cut 6: same, 4128 bytes
+// EXPECT: cut 4090: same, 41 bytes
+// EXPECT: huge: same, 12276 bytes
+// EXPECT: to stdout, to the pipe and back
+// EXPECT: a (nested)<7> b
+// EXPECT: [4134, 4131, 4128, 41]
+use std::{Buf, Fmt, format};
+
+extern "C" {
+    fn pipe(fds: *i32) -> i32;
+    fn read(fd: i32, data: *u8, count: u64) -> i64;
+    fn close(fd: i32) -> i32;
+}
+
+struct Noisy { n: i64 }
+
+impl Display for Noisy {
+    fn fmt(self: *Noisy, f: *Fmt) {
+        print("(nested)");
+        f.write(f"<{self.n}>");
+    }
+}
+
+// What fd's other end has, up to n bytes.
+fn drain(fd: i32, n: i64) -> Buf {
+    let mut b = Buf::new();
+    let mut chunk: [u8; 512] = [0; 512];
+    while b.len() < n {
+        let k = unsafe { read(fd, &chunk[0], 512) };
+        if k <= 0 {
+            break;
+        }
+        b.push_str(chunk[0..k]);
+    }
+    b
+}
+
+fn check<T: Display>(what: T, got: Buf, want: Buf) {
+    if got.as_slice() == want.as_slice() {
+        println(f"{what}: same, {got.len()} bytes");
+    } else {
+        println(f"{what}: differs: {got.len()} bytes, expected {want.len()}");
+    }
+}
+
+fn main() -> i32 {
+    let mut fds: [i32; 2] = [0, 0];
+    if unsafe { pipe(&fds[0]) } != 0 {
+        return 1;
+    }
+    let mut big = Buf::new();
+    for i in 0..4090 {
+        big.push('a' + (i % 26) as u8);
+    }
+    let text = big.as_slice();
+    let mut sizes: Vec<i64> = Vec::new();
+    // holes that start 6, 3 and 0 bytes before the end of the buffer
+    for cut in [0, 3, 6, 4090] {
+        let head = text[0..text.len - cut];
+        let n = -42;
+        let mut f = Fmt::to_fd(fds[1]);
+        f.write(f"{head}{n:>8}|{n:08}|{"ab":<5}|{head:.3}|{n:x}");
+        f.flush();
+        let want = format(f"{head}{n:>8}|{n:08}|{"ab":<5}|{head:.3}|{n:x}");
+        let got = drain(fds[0], want.len());
+        check(f"cut {cut}", got, want);
+        sizes.push(want.len());
+    }
+    // longer than the buffer: written directly, after what is buffered
+    let mut huge = Buf::new();
+    for i in 0..3 {
+        huge.push_str(text);
+    }
+    let mut f = Fmt::to_fd(fds[1]);
+    f.write(f"[{1}]{huge}[{2}]");
+    f.flush();
+    let want = format(f"[{1}]{huge}[{2}]");
+    check("huge", drain(fds[0], want.len()), want);
+    // stdout and another descriptor in turn
+    let mut g = Fmt::to_fd(fds[1]);
+    g.str("to the pipe ");
+    print("to stdout, ");
+    g.str("and back");
+    g.flush();
+    println(drain(fds[0], 20));
+    // a print inside a Display impl: written in order
+    let w = Noisy { n: 7 };
+    println(f"a {w} b");
+    println(f"{sizes:?}");
+    unsafe {
+        close(fds[0]);
+        close(fds[1]);
+    }
+    0
+}

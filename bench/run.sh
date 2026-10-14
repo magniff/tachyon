@@ -7,9 +7,11 @@
 # version of its time divided by cc -O2's (below 1: faster than C);
 # last (0.14), the time of bench/iterchain.tach (iterator chains) over
 # that of bench/iterloop.tach (the same loops by hand) at -O2, which fails
-# the run above 1.05. That ratio is measured on its own, robust to a busy
-# machine: the two -O2 programs run alternately, RUNS rounds of one run
-# each, and each side's time is its fastest round.
+# the run above 1.05, and (0.15) the same for bench/fmtloop.tach
+# (f-strings) over bench/fmtints.tach (Buf's push_int). Those ratios are
+# measured on their own, robust to a busy machine: the two -O2 programs
+# run alternately, RUNS rounds of one run each, and each side's time is
+# its fastest round.
 #
 # usage: bench/run.sh [-c COMPILER] [-p PREVIOUS] [-s SEED] [-r RUNS] [-t TARGET]
 #
@@ -37,7 +39,7 @@ while [ $# -gt 0 ]; do
         -s) SEED=$2; shift 2 ;;
         -r) RUNS=$2; shift 2 ;;
         -t) TARGET=$2; shift 2 ;;
-        *) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+        *) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
     esac
 done
 if [ -z "$TARGET" ]; then
@@ -112,6 +114,8 @@ for source in "$ROOT"/bench/*.tach "$ROOT/examples/md5.tach"; do
             case "$name" in
                 iterchain) CHAIN_MS=$ms ;;
                 iterloop) LOOP_MS=$ms ;;
+                fmtloop) FMT_MS=$ms ;;
+                fmtints) INTS_MS=$ms ;;
             esac
         fi
         if [ -z "$reference" ]; then
@@ -146,21 +150,32 @@ awk -v n="$(echo $VARIANTS | wc -w)" '
 # zero cost is a ratio of 1; above 1.05 is a failure. The two run
 # alternately, the fastest of RUNS rounds each (noise from other work on
 # the machine hits both sides alike, and the minimum drops most of it).
-if [ -n "${CHAIN_MS:-}" ] && [ -n "${LOOP_MS:-}" ]; then
+# (0.15) The same for f-strings (bench/fmtloop.tach) against the text
+# made by hand with Buf's push_int (bench/fmtints.tach).
+# usage: ratio NAME MS OTHER OTHER_MS WHAT
+ratio() {
+    a_ms=$2
+    b_ms=$4
     round=0
     while [ $round -lt "$RUNS" ]; do
-        ms=$("$WORK/timer" 1 "$WORK/empty" "$WORK/iterchain.round.out" "$WORK/iterchain.O2")
-        [ "$ms" -lt "$CHAIN_MS" ] && CHAIN_MS=$ms
-        ms=$("$WORK/timer" 1 "$WORK/empty" "$WORK/iterloop.round.out" "$WORK/iterloop.O2")
-        [ "$ms" -lt "$LOOP_MS" ] && LOOP_MS=$ms
+        ms=$("$WORK/timer" 1 "$WORK/empty" "$WORK/$1.round.out" "$WORK/$1.O2")
+        [ "$ms" -lt "$a_ms" ] && a_ms=$ms
+        ms=$("$WORK/timer" 1 "$WORK/empty" "$WORK/$3.round.out" "$WORK/$3.O2")
+        [ "$ms" -lt "$b_ms" ] && b_ms=$ms
         round=$((round + 1))
     done
-    printf "%-10s %9s %9s\n" "iterchain" "$CHAIN_MS" "(min of $((RUNS * 2)))"
-    printf "%-10s %9s\n" "iterloop" "$LOOP_MS"
-    ratio=$(awk -v a="$CHAIN_MS" -v b="$LOOP_MS" 'BEGIN { if (b < 1) b = 1; if (a < 1) a = 1; printf "%.3f", a / b }')
-    printf "%-10s %9s\n" "iterchain/iterloop" "$ratio"
-    if awk -v r="$ratio" 'BEGIN { exit !(r > 1.05) }'; then
-        echo "bench: iterchain/iterloop is $ratio, above 1.05: iterator chains are not zero cost" >&2
+    printf "%-10s %9s %9s\n" "$1" "$a_ms" "(min of $((RUNS * 2)))"
+    printf "%-10s %9s\n" "$3" "$b_ms"
+    r=$(awk -v a="$a_ms" -v b="$b_ms" 'BEGIN { if (b < 1) b = 1; if (a < 1) a = 1; printf "%.3f", a / b }')
+    printf "%-10s %9s\n" "$1/$3" "$r"
+    if awk -v r="$r" 'BEGIN { exit !(r > 1.05) }'; then
+        echo "bench: $1/$3 is $r, above 1.05: $5 are not zero cost" >&2
         exit 1
     fi
+}
+if [ -n "${CHAIN_MS:-}" ] && [ -n "${LOOP_MS:-}" ]; then
+    ratio iterchain "$CHAIN_MS" iterloop "$LOOP_MS" "iterator chains"
+fi
+if [ -n "${FMT_MS:-}" ] && [ -n "${INTS_MS:-}" ]; then
+    ratio fmtloop "$FMT_MS" fmtints "$INTS_MS" "f-strings"
 fi

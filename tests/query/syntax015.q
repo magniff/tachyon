@@ -3,7 +3,7 @@
 ## found.
 $ items
 crate	syntax015/main.tach	6
-std	<std>	226
+std	<std>	285
 warning query.program-errors: 5 errors in the program; results may be incomplete
 try: tachyonc --diagnostics=short syntax015/main.tach -c -o /dev/null
 $ show main
