@@ -79,7 +79,7 @@ shape 10
 - At most one impl per trait and type (a generic impl counts for all
   its instances).
 - `Eq`: every type with structural `==` has it (structs, enums, tuples,
-  arrays whose parts have `==`, a `[u8]` part compared by bytes); an
+  arrays, slices whose parts have `==`; a `[u8]` by bytes); an
   `impl Eq` replaces structural `==`, also for a part.
   `Ord`: numbers, pointers, fieldless enums have it.
 - Methods are called `x.m()` or `Type::m(&x)`; a trait's function
