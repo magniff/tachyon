@@ -40,7 +40,9 @@ use crate::tools::query::defs::{DEFS, K_FN, K_IMPL_METHOD, K_METHOD, K_MOD, def_
 use crate::tools::query::diagnostics::{
     PROG, ROOT_GIVEN, TOOL, diag, diags, put_cword, put_root, put_word, try_end, write_diags,
 };
-use crate::tools::query::positions::{enclosing, line_of, line_start, token_at};
+use crate::tools::query::positions::{
+    enclosing, line_of, line_start, shorthand_at, shorthand_text, token_at,
+};
 use crate::tools::query::refs::{R_DEF, R_FLAGS, R_POS};
 use crate::tools::query::show::text_start;
 use crate::tools::refactor_mod::{item_binding, load_refs, own_file, use_binding_id, use_node_of};
@@ -57,7 +59,7 @@ use crate::tools::refactor_shape::inline::text::{
     skip_indent, trim_blank_lines,
 };
 use crate::tools::rewrite::parsed::{
-    binding_level, expr_slots, pa, pchild, pcount, pend, pk, pstart,
+    binding_level, expr_slots, pa, pb, pchild, pcount, pend, ph, pk, pstart,
 };
 use crate::tools::tidyimports::tidy_round;
 
@@ -257,10 +259,12 @@ fn load_callee(d: i64, f: i64, fqn: [u8]) -> bool {
             }
             let k = NODES[n].kind;
             // (0.14: a closure's `return` leaves the closure)
-            if k == NodeKind::Return && closure_around(n) < 0 {
+            // (0.15: `e?` may return, as a `return` does)
+            if (k == NodeKind::Return || k == NodeKind::Try) && closure_around(n) < 0 {
                 let e = diag(c"error", c"refactor.escapes");
                 buf_bytes(e, fqn);
-                buf_str(e, c" returns early, on line ");
+                buf_str(e, if k == NodeKind::Try { c" may return early (`?`), on line " }
+                    else { c" returns early, on line " });
                 buf_int(e, line_of(NODES[n].start));
                 buf_str(e, c": inline takes a function that ends with its value\n");
                 try_at(NODES[n].start);
@@ -438,6 +442,45 @@ fn inline_call(d: i64, o: i64, n: i64, fqn: [u8]) -> bool {
         for i in 0..pcount(o) {
             args.push(pchild(o, i));
         }
+        // (0.15: by the parameters' order: a labelled argument's value,
+        // and a parameter's default where the call leaves it out)
+        if args.count <= P_LOCAL.count {
+            let first = args.count - pcount(o);
+            let mut by_param = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            for j in 0..P_LOCAL.count {
+                by_param.push(if j < first { args.data[j] } else { 0 });
+            }
+            let mut ok = true;
+            for i in 0..pcount(o) {
+                let a = pchild(o, i);
+                let mut j = first + i;
+                if pk(a) == NodeKind::NamedArg {
+                    j = -1;
+                    for k in 0..P_NAME.count {
+                        if P_NAME.data[k] == pa(a) {
+                            j = k;
+                        }
+                    }
+                }
+                if j < 0 || j >= by_param.count {
+                    ok = false;
+                } else {
+                    by_param.data[j] = if pk(a) == NodeKind::NamedArg { pb(a) } else { a };
+                }
+            }
+            for j in 0..by_param.count {
+                if by_param.data[j] == 0 {
+                    let dflt = ph(pchild(f, j));
+                    if dflt == 0 {
+                        ok = false;
+                    }
+                    by_param.data[j] = dflt;
+                }
+            }
+            if ok {
+                args = by_param;
+            }
+        }
         if args.count != P_LOCAL.count {
             let e = diag(c"error", c"refactor.internal");
             buf_str(e, c"the call on line ");
@@ -535,7 +578,12 @@ fn inline_call(d: i64, o: i64, n: i64, fqn: [u8]) -> bool {
             let j = U_PARAM.data[i];
             rs.push(U_START.data[i]);
             re.push(U_END.data[i]);
-            rt.push(u_text.data[j]);
+            if shorthand_at(U_START.data[i]) {
+                // (0.15: `S { x }` becomes `S { x: ARG }`)
+                rt.push(shorthand_text(SYMS[P_NAME.data[j]].text, buf_slice(u_text.data[j])));
+            } else {
+                rt.push(u_text.data[j]);
+            }
         }
         let call_indent = indent_of(pstart(o));
         let out = buf_new();

@@ -5,10 +5,10 @@
 // instance.
 
 use crate::base::{
-    FILES, FILE_COUNT, IntVec, SRC, STDOUT, buf_byte, buf_bytes, buf_int, buf_new, buf_slice,
+    FILES, FILE_COUNT, IntVec, SRC, STDOUT, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice,
     buf_str, buf_write_fd,
 };
-use crate::front::ast::{NODES, NODE_CAPTURE, NODE_COUNT, NodeKind};
+use crate::front::ast::{NODES, NODE_CAPTURE, NODE_COUNT, NODE_IMPLICIT, NodeKind};
 use crate::front::types::buf_type;
 use crate::middle::lower::ssa::HMap;
 use crate::tools::query::{parse_digits, trailing_number};
@@ -31,7 +31,8 @@ fn typed_kind(k: NodeKind) -> bool {
             | NodeKind::While | NodeKind::For | NodeKind::Range | NodeKind::Assign
             | NodeKind::Return | NodeKind::Break | NodeKind::Continue | NodeKind::Path
             | NodeKind::Match | NodeKind::MethodCall | NodeKind::VariantLit | NodeKind::EnumPanic
-            | NodeKind::VecOp | NodeKind::PatBind | NodeKind::Closure | NodeKind::Param => true,
+            | NodeKind::VecOp | NodeKind::PatBind | NodeKind::Closure | NodeKind::Param
+            | NodeKind::Try | NodeKind::Interp => true,
         _ => false,
     }
 }
@@ -50,6 +51,65 @@ pub fn file_named(file: [u8]) -> i64 {
 
 // Expression text longer than this is cut (with `…`).
 const EXPR_MAX: i64 = 100;
+
+// (0.15) Whether typed node n is one the compiler made, which the source
+// does not show: a hidden local (`__f0`, `__out`, `__t`) or what takes it
+// as its operand (`&__f0`, `__out.str(..)`), and inside an f-string
+// (the pairs `fstrings`) anything outside its holes' expressions (the
+// pairs `holes`) but the f-string itself.
+fn made_by_compiler(n: i64, fstrings: *IntVec, holes: *IntVec) -> bool {
+    unsafe {
+        if hidden_name(n) {
+            return true;
+        }
+        let k = NODES[n].kind;
+        if (k == NodeKind::Unary && hidden_name(NODES[n].b))
+            || ((k == NodeKind::MethodCall || k == NodeKind::FieldAccess)
+                && hidden_name(NODES[n].a)) {
+            return true;
+        }
+        if k == NodeKind::Interp {
+            return false;
+        }
+        let s = NODES[n].start;
+        let e = NODES[n].end;
+        let mut i = 0;
+        while i + 1 < (*fstrings).count {
+            if s >= (*fstrings).data[i] && e <= (*fstrings).data[i + 1] {
+                let mut j = 0;
+                while j + 1 < (*holes).count {
+                    if s >= (*holes).data[j] && e <= (*holes).data[j + 1] {
+                        return false;
+                    }
+                    j += 2;
+                }
+                return true;
+            }
+            i += 2;
+        }
+        false
+    }
+}
+
+// Whether node n is an identifier, binding or parameter whose name the
+// compiler made (`__` and more).
+fn hidden_name(n: i64) -> bool {
+    unsafe {
+        if n <= 0 {
+            return false;
+        }
+        let k = NODES[n].kind;
+        if k != NodeKind::Ident && k != NodeKind::PatBind && k != NodeKind::Param {
+            return false;
+        }
+        let a = NODES[n].a;
+        if a <= 0 {
+            return false;
+        }
+        let name = SYMS[a].text;
+        name.len > 2 && name[0] == '_' && name[1] == '_'
+    }
+}
 
 pub fn query_type(arg: [u8]) -> i64 {
     unsafe {
@@ -134,17 +194,37 @@ pub fn query_type(arg: [u8]) -> i64 {
         // (0.14: what a closure is lowered to, its environment's literal
         // or its function, has the closure's span: not shown)
         let mut spans = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        // (0.15: an f-string's spans, and its holes' expressions; the
+        // widened values, the copies an implicit cast holds, by type)
+        let mut fstrings = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut holes = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut widened = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
         for n in 1..NODE_COUNT {
-            if NODES[n].kind == NodeKind::Closure {
+            let k = NODES[n].kind;
+            if k == NodeKind::Closure {
                 spans.put(NODES[n].start + 1, NODES[n].end + 1);
+            } else if k == NodeKind::Interp {
+                fstrings.push(NODES[n].start);
+                fstrings.push(NODES[n].end);
+            } else if k == NodeKind::InterpHole && NODES[n].a > 0 {
+                holes.push(NODES[NODES[n].a].start);
+                holes.push(NODES[NODES[n].a].end);
+            } else if k == NodeKind::Cast && (NODES[n].p & NODE_IMPLICIT) != 0 && NODES[n].a > 0 {
+                widened.put(NODES[n].a + 1, NODES[n].ty);
             }
         }
         for n in 1..NODE_COUNT {
             if NODES[n].ty <= 0 || !typed_kind(NODES[n].kind) || hidden.get(n + 1) != 0 {
                 continue;
             }
-            if NODES[n].kind != NodeKind::Closure
+            if NODES[n].kind != NodeKind::Closure && NODES[n].kind != NodeKind::Interp
                 && spans.get(NODES[n].start + 1) == NODES[n].end + 1 {
+                continue;
+            }
+            // (0.15: an implicit cast is shown as the value it widens; what
+            // the compiler writes for an f-string or a `?` is not shown)
+            if (NODES[n].kind == NodeKind::Cast && (NODES[n].p & NODE_IMPLICIT) != 0)
+                || made_by_compiler(n, &fstrings, &holes) {
                 continue;
             }
             if col >= 1 && (NODES[n].start > pos || NODES[n].end <= pos) {
@@ -192,6 +272,13 @@ pub fn query_type(arg: [u8]) -> i64 {
             }
             types.push(t);
             buf_type(out, t);
+            let to = widened.get(n + 1);
+            if to > 0 {
+                // (0.15)
+                buf_str(out, c" (widened to ");
+                buf_type(out, to);
+                buf_byte(out, ')');
+            }
             buf_byte(out, '\t');
             let text = buf_new();
             collapse(text, NODES[n].start, NODES[n].end);
