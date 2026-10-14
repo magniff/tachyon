@@ -13,12 +13,10 @@
 // constant. A comparison is decided when the facts about the same operands,
 // or the ranges, leave only outcomes that agree.
 //
-// 0.11: phis have ranges (the union of their operands', a loop's found by
-// induction: below), while a check's branch is decided; facts comparing a
-// value with another bound it by the other's range; shifts and 64-bit
-// conversions keep ranges; and a branch on a phi of `&&` or `||` is
-// threaded from the predecessor that decided it, so that the facts on the
-// way hold where it leads.
+// 0.11: while a check's branch is decided, phis have ranges (the union of
+// their operands', a loop's found by induction: below) and facts comparing
+// a value with another bound it by the other's range; shifts and 64-bit
+// conversions keep ranges.
 
 // The facts at a block: pairs (comparison or bool value, holds).
 use crate::base::{IntVec, alloc_array, free};
@@ -30,7 +28,7 @@ use crate::ir::{
 };
 use crate::lower::SSA_STACK;
 use crate::opt::{
-    add_pred_like, compute_dominators, dominates, remove_pred, remove_pred_at, remove_trivial_phis,
+    compute_dominators, dominates, remove_pred, remove_pred_at, remove_trivial_phis,
     remove_unreachable, resolve_all, simplify_cfg,
 };
 use crate::fold::{is_const, shift_amount};
@@ -1165,15 +1163,9 @@ pub fn fold_by_ranges(fi: i64) -> bool {
     unsafe {
         IRF = fi;
         resolve_all(fi);
-        let mut changed = thread_phi_conditions(fi);
-        if changed {
-            resolve_all(fi);
-            remove_unreachable(fi);
-            remove_trivial_phis(fi);
-            resolve_all(fi);
-        }
         analyze_loops(fi);
         make_loop_facts();
+        let mut changed = false;
         for round in 0..3 {
             if round > 0 {
                 resolve_all(fi);
@@ -1220,55 +1212,6 @@ pub fn fold_by_ranges(fi: i64) -> bool {
         }
         changed
     }
-}
-
-// (0.11) A block holding nothing but a phi and a branch on it (what `&&`
-// and `||` leave), the phi used by the branch alone: a predecessor that
-// branched on the phi's operand for it decides the branch by the edge it
-// takes, and goes on to the outcome directly (as instruction selection
-// threads them; here, so that the facts on the way hold where the outcome
-// is: in `i < n && s[i] < x`, i < n wherever the whole is true). Returns
-// whether any edge was redirected.
-fn thread_phi_conditions(fi: i64) -> bool {
-    let mut changed = false;
-    compute_exports(fi);
-    unsafe {
-        for i in 0..IRFUNCS[fi].blocks.count {
-            let j = IRFUNCS[fi].blocks.data[i];
-            if BLOCKS[j].removed != 0 || BLOCKS[j].term != Term::Branch || j == IRFUNCS[fi].entry {
-                continue;
-            }
-            let phi = BLOCKS[j].first;
-            let s0 = BLOCKS[j].s0;
-            let s1 = BLOCKS[j].s1;
-            if phi == 0 || INSTS[phi].op != Op::Phi || INSTS[phi].next != 0 || ir_val(BLOCKS[j].cond) != phi
-                || used_outside_block(fi, j) || s0 == s1 || s0 == j || s1 == j
-                || INSTS[phi].nargs != BLOCKS[j].preds.count {
-                continue;
-            }
-            let mut k = 0;
-            while k < BLOCKS[j].preds.count {
-                let p = BLOCKS[j].preds.data[k];
-                let value = ir_val(ir_arg(phi, k));
-                if BLOCKS[p].term != Term::Branch || p == j || ir_val(BLOCKS[p].cond) != value
-                    || (BLOCKS[p].s0 == j) == (BLOCKS[p].s1 == j) {
-                    k += 1;
-                    continue;
-                }
-                let t = if BLOCKS[p].s0 == j { s0 } else { s1 };
-                let other = if BLOCKS[p].s0 == j { BLOCKS[p].s1 } else { BLOCKS[p].s0 };
-                if t == other || t == p {
-                    k += 1;
-                    continue;
-                }
-                redirect_succ(p, j, t);
-                add_pred_like(t, p, j);
-                remove_pred_at(j, k);
-                changed = true;
-            }
-        }
-    }
-    changed
 }
 
 // Whether block b is where a check fails: it ends the program.

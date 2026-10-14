@@ -1221,7 +1221,9 @@ about the cheap and general ones:
   kind of constant at every width, against divisions by the same numbers
   unknown to the compiler) and a fuzz mode, `tests/fuzz/run.sh -D`
   (`gendiv.awk`: random constants and dividends, the extremes and exact
-  multiples, every level against -O0).
+  multiples, every level against -O0). bench/wordcount (`% 26`, `/ 26`:
+  `umulh`, `lsr`, `msub`) is 3.5% faster, bench/json 3%; collatz divides
+  by 2 only, which was a shift already.
 - *Ranges through phis* (range.tach). A phi's range is the union of its
   operands' ranges, each at the end of its predecessor with the facts
   there and on the edge. The phis of a loop header are found together by
@@ -1239,27 +1241,33 @@ about the cheap and general ones:
   (`child < end` with end below 1000000), arithmetic shifts and 64-bit
   conversions keep ranges, and an operation of one operand costs a
   quarter of the depth of one of two (light cleanup leaves chains like
-  `0 + (n - 0) * 1`). A branch on the phi of `&&` or `||` is threaded from
-  the predecessor that decided it (as isel.tach does), so that in
-  `child + 1 < end && s[child] < s[child + 1]` the first test holds where
-  the whole one is true.
+  `0 + (n - 0) * 1`).
 
-  Phi ranges are found while the branch of a check is decided (one way
-  ends the program: a bounds check, an unwrap): elsewhere they cost more
-  than they find (the self-compile spent 4% more with them everywhere).
-  bench/sort's heapsort, inlined into main with its vector's length known,
-  keeps none of its 12 checks (16 checks before, 4 now, all in the generic
-  sift-down of the records, where `end <= s.len` is not known: its first
-  `s[root]` may fail). `tests/run/opt_range_phi.tach`: a step of 2, a
-  step read from memory, a decreasing index, a sift-down; and an index
-  that reaches past the end, whose check stays (and fails).
+  Phi ranges and facts between two values are taken while the branch of
+  a check is decided (one way ends the program: a bounds check, an
+  unwrap): everywhere, they cost 4% of the self-compile's instructions
+  for little more. bench/sort's heapsort, inlined into main with its
+  vector's length known, keeps 2 of its 12 checks (16 checks before, 6
+  now); bench/sort is 5% faster. `tests/run/opt_range_phi.tach`: a step
+  of 2, a step read from memory, a decreasing index, a sift-down; and an
+  index that reaches past the end, whose check stays (and fails); a fuzz
+  mode, `tests/fuzz/run.sh -R` (`genrange.awk`), of such loops (some
+  going past an end). Threading the branch on the phi of `&&` in the IR
+  (as isel.tach does) would drop sort's last two checks (`s[child]` after
+  `child + 1 < end && s[child] < s[child + 1]`, checked on one way only):
+  tried, it cost 6% of the loop passes' time and gained nothing measured.
 
 What remains, measured:
 
-- *Bounds checks* that need facts the ranges do not carry: in a generic
-  sift-down, `end <= s.len` (so the first `s[root]`, with root the
-  caller's start, keeps its check). C has no checks; this is the safety
-  tachyon keeps.
+- *Bounds checks* that need facts the ranges do not carry: `s[child]`
+  after an `&&` that checked it on one way only; in a generic sift-down,
+  `end <= s.len` (so the first `s[root]`, with root the caller's start,
+  keeps its check). C has no checks; this is the safety tachyon keeps.
+- *fannkuch* is 3% slower than before the ranges through phis: with its
+  checks proven, the copy of a 10-element permutation is vectorized, and its
+  16-byte loads read what 8-byte stores have just written, which no store
+  forwards (the vectorizer's cost model does not see it; `--no-vectorize`
+  gives the old time back). It stays ahead of clang.
 - *FMA*: clang contracts `a * b + c` by default (nbody: 27 ms against 29
   with `-ffp-contract=off`); tachyon never does, as that changes results.
 - *Floats compared for a branch* are `fcmp`, `cset`, `cbnz` on AArch64
