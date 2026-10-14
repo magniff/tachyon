@@ -2,7 +2,7 @@
 $ check
 ## --- signature ---
 ## A parameter added: the definition, and each call with the value.
-$ refactor signature area --add 'scale: i64 = 1' --dry-run
+$ refactor signature area --add 'scale: i64 = 1' --fill-calls --dry-run
 --- a/main.tach
 +++ b/main.tach
 @@ -16 +16 @@
@@ -27,6 +27,7 @@ $ refactor signature Point::scale --add 'extra: i64 = 0' --at 1 --dry-run
 @@ -46 +46 @@
 -    pub fn scale(self: *Point, k: i64) {
 +    pub fn scale(self: *Point, extra: i64, k: i64) {
+note refactor.fill-calls: the calls get the value (a default is on trailing parameters only, and a later one has none)
 ## A trait's function: the trait, every impl, the calls (in a generic
 ## function's instances too).
 $ refactor signature Shape::size --add 'bias: i64 = 0' --dry-run
@@ -49,6 +50,7 @@ $ refactor signature Shape::size --add 'bias: i64 = 0' --dry-run
 @@ -69 +69 @@
 -    s.size(1) + s.size(2)
 +    s.size(1, 0) + s.size(2, 0)
+note refactor.fill-calls: the calls get the value (a trait's function has no defaults)
 ## Named by an impl's function: the same.
 $ refactor signature Pair::size --remove unit --dry-run
 error refactor.used: parameter unit is used in <crate::geom::Pair as Shape>::size at geom.tach:64:36
@@ -103,7 +105,7 @@ warning edit.breaks: 1 new error (1 in crate::main, which the edit does not chan
 [exit 1]
 ## Refused: a function used as a value, a missing default, an unknown
 ## parameter, a parameter still used, a name taken.
-$ refactor signature twice --add 'y: i64 = 0'
+$ refactor signature twice --add 'y: i64 = 0' --fill-calls
 error refactor.fn-value: crate::geom::twice is used as a value at main.tach:22:19: its type would change; change that use first
 try: tachyonc query refs crate::geom::twice
 [exit 1]
@@ -156,7 +158,7 @@ try: tachyonc refactor signature area --type p i32 --no-check
 [exit 1]
 % git status --short
 ## Written, then undone.
-$ refactor signature area --add 'scale: i64 = 1'
+$ refactor signature area --add 'scale: i64 = 1' --fill-calls
 added parameter scale: i64 to crate::geom::area, 2 calls	2 files	+2 -2 lines
 % git diff --stat
  geom.tach | 2 +-
