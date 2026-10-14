@@ -55,6 +55,13 @@ static mut E_TEXT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 // string) and text (a buffer).
 static mut NEW_PATH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 static mut NEW_TEXT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// Files the edit moves (the module refactorings, 0.11): the file's index
+// and its new path. A moved file is a new file (its edited text) and a
+// removed one (DEL_FILE; DEL_TO: the new file it became).
+static mut RN_FILE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut RN_PATH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut DEL_FILE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut DEL_TO: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
 // The options every editing command takes.
 pub static mut DRY_RUN: bool = false;
@@ -99,8 +106,76 @@ pub fn edit_new_file(path: *u8, text: i64) {
     NEW_TEXT.push(text);
 }
 
+// Moves file f (an index into FILES) to `path` (new), with its edits.
+pub fn edit_move_file(f: i64, path: *u8) {
+    RN_FILE.push(f);
+    RN_PATH.push(path as i64);
+}
+
 pub fn edit_count() -> i64 {
-    E_START.count + NEW_PATH.count
+    E_START.count + NEW_PATH.count + RN_FILE.count
+}
+
+// The moved files, once their new texts are made: each is a new file and
+// a removed one.
+fn move_files() {
+    unsafe {
+        for i in 0..RN_FILE.count {
+            let f = RN_FILE.data[i];
+            let mut text = -1;
+            let mut k = 0;
+            while k < CH_FILE.count {
+                if CH_FILE.data[k] == f {
+                    text = CH_TEXT.data[k];
+                    CH_FILE.data[k] = CH_FILE.data[CH_FILE.count - 1];
+                    CH_TEXT.data[k] = CH_TEXT.data[CH_TEXT.count - 1];
+                    CH_FILE.count -= 1;
+                    CH_TEXT.count -= 1;
+                    break;
+                }
+                k += 1;
+            }
+            if text < 0 {
+                text = buf_new();
+                buf_bytes(text, SRC[FILES[f].start..FILES[f].end]);
+            }
+            NEW_PATH.push(RN_PATH.data[i]);
+            NEW_TEXT.push(text);
+            DEL_FILE.push(f);
+            DEL_TO.push(NEW_PATH.count - 1);
+        }
+    }
+}
+
+// The path a removed file is read from in the check: one that never
+// exists.
+fn gone_path(path: *u8) -> *u8 {
+    unsafe {
+        let b = buf_new();
+        buf_str(b, path);
+        buf_str(b, c".tachyon-gone~");
+        buf_cstr(b)
+    }
+}
+
+// Removes the directories of path that are left empty (up from its own).
+pub fn remove_empty_dirs(path: *u8) {
+    unsafe {
+        let b = buf_new();
+        buf_str(b, path);
+        loop {
+            while BUFS[b].len > 0 && BUFS[b].data[BUFS[b].len - 1] != '/' {
+                BUFS[b].len -= 1;
+            }
+            if BUFS[b].len <= 1 {
+                return;
+            }
+            BUFS[b].len -= 1;
+            if !remove_dir(buf_cstr(b)) {
+                return;
+            }
+        }
+    }
 }
 
 // The edits in order of position (a stable insertion sort; insertions
@@ -221,6 +296,50 @@ fn no_newline(text: [u8], starts: *IntVec, k: i64) -> bool {
 // (dynamic programming, on the differing middle only).
 fn diff_texts(out: i64, path: [u8], old: [u8], new: [u8]) {
     unsafe {
+        buf_str(out, c"--- a/");
+        buf_bytes(out, path);
+        buf_str(out, c"\n+++ b/");
+        buf_bytes(out, path);
+        buf_byte(out, '\n');
+    }
+    diff_lines(out, old, new);
+}
+
+// The diff of a file moved from `from` to `to` (and edited), with git's
+// rename lines.
+fn diff_moved(out: i64, from: [u8], to: [u8], old: [u8], new: [u8]) {
+    unsafe {
+        buf_str(out, c"diff --git a/");
+        buf_bytes(out, from);
+        buf_str(out, c" b/");
+        buf_bytes(out, to);
+        buf_str(out, c"\nrename from ");
+        buf_bytes(out, from);
+        buf_str(out, c"\nrename to ");
+        buf_bytes(out, to);
+        buf_str(out, c"\n--- a/");
+        buf_bytes(out, from);
+        buf_str(out, c"\n+++ b/");
+        buf_bytes(out, to);
+        buf_byte(out, '\n');
+    }
+    diff_lines(out, old, new);
+}
+
+// A path as printed (without a leading `./`).
+pub fn shown_path(path: *u8) -> [u8] {
+    unsafe {
+        let mut p = path;
+        while p[0] == '.' && p[1] == '/' {
+            p = &p[2];
+        }
+        p[0..strlen(p) as i64]
+    }
+}
+
+// The hunks of the diff of old and new (see diff_texts).
+fn diff_lines(out: i64, old: [u8], new: [u8]) {
+    unsafe {
         let mut a = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let mut b = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         split_lines(old, &a);
@@ -241,11 +360,6 @@ fn diff_texts(out: i64, path: [u8], old: [u8], new: [u8]) {
         }
         let m = na - head - tail;
         let n = nb - head - tail;
-        buf_str(out, c"--- a/");
-        buf_bytes(out, path);
-        buf_str(out, c"\n+++ b/");
-        buf_bytes(out, path);
-        buf_byte(out, '\n');
         // The middle: an LCS table when it is small, else one hunk.
         let mut ops = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         if m * n <= 4000000 {
@@ -521,6 +635,7 @@ pub fn prepare_edit() -> i64 {
         let mut order = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         sorted_edits(&order);
         new_texts(&order);
+        move_files();
         if CH_FILE.count == 0 && NEW_PATH.count == 0 {
             let d = diag(c"note", c"edit.unchanged");
             buf_str(d, c"nothing to change\n");
@@ -568,6 +683,11 @@ pub fn overlay_args(args: *IntVec) {
             args.push(c"--overlay" as i64);
             args.push(NEW_PATH.data[i]);
             args.push(copy_path(NEW_PATH.data[i] as *u8) as i64);
+        }
+        for i in 0..DEL_FILE.count {
+            args.push(c"--overlay" as i64);
+            args.push(FILES[DEL_FILE.data[i]].path as i64);
+            args.push(gone_path(FILES[DEL_FILE.data[i]].path) as i64);
         }
     }
 }
@@ -633,7 +753,18 @@ pub fn finish_edit(what: [u8], root: *u8) -> i64 {
             diff_texts(diff, file_text(f), SRC[FILES[f].start..FILES[f].end], buf_slice(CH_TEXT.data[i]));
         }
         for i in 0..NEW_PATH.count {
-            diff_texts(diff, c_slice(NEW_PATH.data[i] as *u8), SRC[0..0], buf_slice(NEW_TEXT.data[i]));
+            let mut from = -1;
+            for k in 0..DEL_FILE.count {
+                if DEL_TO.data[k] == i {
+                    from = DEL_FILE.data[k];
+                }
+            }
+            if from >= 0 {
+                diff_moved(diff, file_text(from), shown_path(NEW_PATH.data[i] as *u8),
+                    SRC[FILES[from].start..FILES[from].end], buf_slice(NEW_TEXT.data[i]));
+            } else {
+                diff_texts(diff, shown_path(NEW_PATH.data[i] as *u8), SRC[0..0], buf_slice(NEW_TEXT.data[i]));
+            }
         }
         let mut ok = true;
         // 2, 3. The check.
@@ -698,6 +829,11 @@ pub fn finish_edit(what: [u8], root: *u8) -> i64 {
                 ok = false;
             }
         }
+        for i in 0..DEL_FILE.count {
+            let path = FILES[DEL_FILE.data[i]].path;
+            remove_file(path);
+            remove_empty_dirs(path);
+        }
         buf_byte(summary, '\n');
         buf_write_fd(summary, STDOUT);
         if ok { 0 } else { 1 }
@@ -714,7 +850,7 @@ fn put_summary(out: i64, what: [u8]) {
             if CH_FILE.count == 1 {
                 buf_bytes(out, file_text(CH_FILE.data[0]));
             } else {
-                buf_str(out, NEW_PATH.data[0] as *u8);
+                buf_bytes(out, shown_path(NEW_PATH.data[0] as *u8));
             }
         } else {
             buf_int(out, files);
@@ -735,6 +871,7 @@ fn remove_copies() {
         }
         for i in 0..NEW_PATH.count {
             remove_file(copy_path(NEW_PATH.data[i] as *u8));
+            remove_empty_dirs(NEW_PATH.data[i] as *u8);
         }
     }
 }
@@ -927,6 +1064,15 @@ fn journal(root: *u8, summary: [u8]) {
             ok = ok && write_file_if(entry_path(dir, n, k, c"after"), buf_slice(NEW_TEXT.data[i]));
             k += 1;
         }
+        // (a removed file: its text before; none after)
+        for i in 0..DEL_FILE.count {
+            let f = DEL_FILE.data[i];
+            buf_str(files, absolute_path(FILES[f].path));
+            buf_str(files, c"\t2\n");
+            ok = ok && write_file_if(entry_path(dir, n, k, c"before"), SRC[FILES[f].start..FILES[f].end])
+                && write_file_if(entry_path(dir, n, k, c"after"), SRC[0..0]);
+            k += 1;
+        }
         ok = ok && write_file_if(entry_path(dir, n, -1, c"files"), buf_slice(files))
             && write_file_if(entry_path(dir, n, -1, c"summary"), summary)
             && write_number(path_in(dir, c"head"), n);
@@ -964,7 +1110,7 @@ fn run_undo(force: bool, from: *u8) -> i64 {
             let p = buf_new();
             buf_bytes(p, t[i..tab]);
             paths.push(buf_cstr(p) as i64);
-            made.push(if tab + 1 < t.len && t[tab + 1] == '1' { 1 } else { 0 });
+            made.push(if tab + 1 < t.len && t[tab + 1] == '1' { 1 } else if tab + 1 < t.len && t[tab + 1] == '2' { 2 } else { 0 });
             while i < t.len && t[i] != '\n' {
                 i += 1;
             }
@@ -976,8 +1122,12 @@ fn run_undo(force: bool, from: *u8) -> i64 {
                 let now = buf_new();
                 let after = buf_new();
                 let have = read_file_if(paths.data[k] as *u8, now);
-                if !have || !read_file_if(entry_path(dir, n, k, c"after"), after)
-                    || !same_bytes(buf_slice(now), buf_slice(after)) {
+                // (a file the edit removed must still be gone)
+                let changed = if made.data[k] == 2 { have } else {
+                    !have || !read_file_if(entry_path(dir, n, k, c"after"), after)
+                        || !same_bytes(buf_slice(now), buf_slice(after))
+                };
+                if changed {
                     let d = diag(c"error", c"undo.changed");
                     buf_str(d, c"'");
                     buf_str(d, paths.data[k] as *u8);
@@ -991,12 +1141,13 @@ fn run_undo(force: bool, from: *u8) -> i64 {
         let mut ok = true;
         for k in 0..paths.count {
             let path = paths.data[k] as *u8;
-            if made.data[k] != 0 {
+            if made.data[k] == 1 {
                 remove_file(path);
+                remove_empty_dirs(path);
                 continue;
             }
             let before = buf_new();
-            if !read_file_if(entry_path(dir, n, k, c"before"), before)
+            if !read_file_if(entry_path(dir, n, k, c"before"), before) || !make_parent(path)
                 || !write_file_if(copy_path(path), buf_slice(before)) || !rename_file(copy_path(path), path) {
                 cannot_write(path);
                 ok = false;
