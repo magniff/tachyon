@@ -43,6 +43,7 @@ pub mod grep;
 pub mod sections;
 pub mod typeat;
 pub mod cache;
+mod names;
 
 use crate::host_target;
 use crate::base::{
@@ -75,10 +76,13 @@ use diagnostics::{
     program_errors, push_once, try_begin, try_end, try_query, write_diags,
 };
 use grep::{G_CODE, G_COMMENT, G_STRING, OPT_WHERE, OPT_WORD, query_grep};
-use positions::{LINES, init_containers, init_positions, line_index, line_start, sort_by_position};
+use positions::{
+    LINES, init_containers, init_positions, line_end, line_index, line_of, line_start,
+    sort_by_position,
+};
 use refs::{
-    OPT_ALL, OPT_COUNT, OPT_IN, OPT_KIND, OPT_LIMIT, file_text, put_bad_in, query_refs, resolve_in,
-    try_refs,
+    OPT_ALL, OPT_COUNT, OPT_IN, OPT_KIND, OPT_LIMIT, def_used_at, file_text, put_bad_in, query_refs,
+    resolve_in, try_refs,
 };
 use sections::{OPT_BANNERS, show_section};
 use show::{find_modules, query_def, query_items, query_modules, query_show, text_start};
@@ -88,6 +92,7 @@ use crate::base::timer::{
     TIME_PASSES, T_ANSWER, T_CHECK, T_INDEX, T_LOAD, T_PARSE, timer_add, timer_now, timer_report,
 };
 use crate::tools::query::cache::{cache_restore, cache_save};
+use names::{canonical_name, is_symbol, path_matches};
 
 extern "C" {
     fn getenv(name: *u8) -> *u8;
@@ -579,10 +584,15 @@ fn run_query_inner(argc: i64, argv: **u8) -> i64 {
 // The definitions answering to NAME, in order of position (none: after
 // the diagnostic saying so, for command cmd). NAME is a path, or its end
 // (see name_matches), or `FILE:LINE` (`FILE:LINE:COL`, as a compiler's
-// error has it): the innermost item whose text holds that line.
-pub fn resolve_name(cmd: *u8, name: [u8], out: *IntVec) -> bool {
+// error has it): the innermost item whose text holds that line (0.15: on
+// a comment or blank line, the item below it; outside every item, as on
+// a `use` line, what the name at COL, or the first on the line, names).
+// Every spelling the tools print is taken (canonical_name).
+pub fn resolve_name(cmd: *u8, name0: [u8], out: *IntVec) -> bool {
     unsafe {
+        let name = canonical_name(name0);
         let mut line = -1;
+        let mut col = -1;
         let mut file = name[0..0];
         let a = trailing_number(name);
         if a > 0 && name[a - 1] == ':' && (a < 2 || name[a - 2] != ':') {
@@ -591,6 +601,7 @@ pub fn resolve_name(cmd: *u8, name: [u8], out: *IntVec) -> bool {
             let b = trailing_number(file);
             if b > 0 && file[b - 1] == ':' && (b < 2 || file[b - 2] != ':') {
                 // (FILE:LINE:COL)
+                col = line;
                 line = parse_digits(file[b..file.len]);
                 file = file[0..b - 1];
             }
@@ -612,6 +623,14 @@ pub fn resolve_name(cmd: *u8, name: [u8], out: *IntVec) -> bool {
                     sort_by_position(out);
                 }
             }
+            if (*out).count == 0 && name.len != name0.len && is_symbol(name0) {
+                // (a symbol of a trait's default function: `T::f` is the
+                // trait's `f`)
+                find_defs(last_segment(name), OPT_EXACT, out);
+            }
+            if (*out).count == 0 && module_def(name, out) {
+                return true;
+            }
             if (*out).count == 0 {
                 no_match(cmd, name);
                 return false;
@@ -621,9 +640,7 @@ pub fn resolve_name(cmd: *u8, name: [u8], out: *IntVec) -> bool {
         let mut f = -1;
         for g in 0..FILE_COUNT {
             let p = file_text(g);
-            if bytes_eq(p, file)
-                || (p.len > file.len && bytes_eq(p[p.len - file.len..p.len], file)
-                    && p[p.len - file.len - 1] == '/') {
+            if path_matches(p, file) {
                 f = g;
                 break;
             }
@@ -636,7 +653,27 @@ pub fn resolve_name(cmd: *u8, name: [u8], out: *IntVec) -> bool {
             try_end(try_begin(c"items", name[0..0], false));
             return false;
         }
-        let d = def_at_line(f, line);
+        let mut d = def_at_line(f, line);
+        if d < 0 {
+            d = item_below(f, line);
+        }
+        if d < 0 && line >= 1 {
+            let idx = line_index(FILES[f].start) + line - 1;
+            if idx < LINES.count && LINES.data[idx] < FILES[f].end {
+                let start = LINES.data[idx];
+                let end = line_end(start);
+                if col >= 1 && start + col - 1 <= end {
+                    // (the name holding COL: it starts at or before it)
+                    let mut p = start + col - 1;
+                    while p > start && is_name_char(SRC[p - 1]) {
+                        p -= 1;
+                    }
+                    d = def_used_at(p, end);
+                } else {
+                    d = def_used_at(start, end);
+                }
+            }
+        }
         if d < 0 {
             let e = diag(c"error", c"query.no-match");
             buf_str(e, c"no item at ");
@@ -647,6 +684,71 @@ pub fn resolve_name(cmd: *u8, name: [u8], out: *IntVec) -> bool {
         }
         out.push(d);
         true
+    }
+}
+
+fn is_name_char(c: u8) -> bool {
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+}
+
+// (0.15) The item that starts below line `line` of file f, when that line
+// is a comment or an attribute, and the ones down to the item are too or
+// blank (a `show` header's first line is its comment's); -1 otherwise.
+fn item_below(f: i64, line: i64) -> i64 {
+    unsafe {
+        let first = line_index(FILES[f].start);
+        let mut l = line;
+        while l >= 1 && first + l - 1 < LINES.count && LINES.data[first + l - 1] < FILES[f].end {
+            let mut p = LINES.data[first + l - 1];
+            let end = line_end(p);
+            while p < end && (SRC[p] == ' ' || SRC[p] == '\t') {
+                p += 1;
+            }
+            let blank = p >= end;
+            let comment = p + 1 < end && ((SRC[p] == '/' && SRC[p + 1] == '/')
+                || (SRC[p] == '#' && SRC[p + 1] == '['));
+            if blank && l == line {
+                return -1;
+            }
+            if !blank && !comment {
+                let d = def_at_line(f, l);
+                return if d >= 0 && line_of(DEFS[d].start) == l { d } else { -1 };
+            }
+            l += 1;
+        }
+        -1
+    }
+}
+
+// (0.15) NAME as a module (`crate`, `a::b`): the definitions of its `mod`
+// items, into out; for the root, which has none, a note and its items.
+fn module_def(name: [u8], out: *IntVec) -> bool {
+    unsafe {
+        let mut modules = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        find_modules(name, true, &modules);
+        if modules.count == 0 {
+            return false;
+        }
+        let mut root = false;
+        for i in 0..modules.count {
+            let m = modules.data[i];
+            if m < MOD_DEF.count && MOD_DEF.data[m] >= 0 {
+                out.push(MOD_DEF.data[m]);
+            } else {
+                root = true;
+            }
+        }
+        if (*out).count > 0 {
+            return true;
+        }
+        if root {
+            let d = diag(c"note", c"query.module");
+            buf_byte(d, '\'');
+            buf_bytes(d, name);
+            buf_str(d, c"' is the root module; its items:\n");
+            query_items(&modules);
+        }
+        root
     }
 }
 
@@ -726,8 +828,7 @@ pub fn file_named(file: [u8]) -> i64 {
     unsafe {
         for g in 0..FILE_COUNT {
             let p = file_text(g);
-            if p.len > 0 && p[0] != '<' && (bytes_eq(p, file) || (p.len > file.len
-                && bytes_eq(p[p.len - file.len..p.len], file) && p[p.len - file.len - 1] == '/')) {
+            if p.len > 0 && p[0] != '<' && path_matches(p, file) {
                 return g;
             }
         }
