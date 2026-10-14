@@ -3,13 +3,17 @@
 // code generator and the IR back end, so that every function follows C's
 // convention and can be handed to C.
 //
-// AArch64 (AAPCS64, as on macOS): a homogeneous float aggregate (one to
-// four floats of one type) goes in consecutive v registers, or entirely on
-// the stack (and no further v register is used); another aggregate of up
-// to 16 bytes goes in one or two x registers, or entirely on the stack (and
-// no further x register is used); a larger one is copied by the caller and
-// passed by reference. Results: an HFA in v0-v3, up to 16 bytes in x0/x1,
-// larger ones through the pointer in x8.
+// AArch64 (AAPCS64; Apple's variant on macOS): a homogeneous float
+// aggregate (one to four floats of one type) goes in consecutive v
+// registers, or entirely on the stack (and no further v register is used);
+// another aggregate of up to 16 bytes goes in one or two x registers (an
+// aligned pair for one aligned to 16, except on Apple's), or entirely on
+// the stack (and no further x register is used); a larger one is copied by
+// the caller and passed by reference. Results: an HFA in v0-v3, up to 16
+// bytes in x0/x1, larger ones through the pointer in x8. On the stack,
+// AAPCS64 gives every argument 8-byte slots; Apple's packs scalars and
+// homogeneous float aggregates at their alignment, and passes every
+// variadic argument on the stack, where AAPCS64 passes them as named ones.
 //
 // x86-64 (System V): an aggregate of up to 16 bytes is split into
 // eightbytes, each INTEGER (an rdi/rsi/... register) when it holds any
@@ -32,7 +36,8 @@ use crate::types::{
     variant_field_offset,
 };
 use crate::gen::MAIN_SYM;
-use crate::target::X86;
+use crate::target::{APPLE_A64, X86};
+use crate::ast::REPR_PACKED;
 use crate::ir::ir_type;
 use crate::opt::OPT_LEVEL;
 use crate::regalloc::min_i64;
@@ -255,12 +260,13 @@ fn is_hfa(total: i64, elem: *i64, count: *i64) -> bool {
 // The locations of the pieces of the aggregate of type `ty` just
 // classified (see arg_location for locations and `state`), in
 // `locations`. An aggregate aligned to 16 starts at a multiple of 16 on
-// the stack (Apple's AArch64 convention does not round it to an even x
-// register, unlike AAPCS64's).
+// the stack, and in an even x register under AAPCS64 (Apple's AArch64
+// convention does not round it).
 pub fn abi_piece_locations(ty: i64, state: *i64, locations: *i64) {
     unsafe {
         let size = type_size(ty);
-        let wide = type_align(ty) >= 16;
+        let aapcs = !X86 && !APPLE_A64;
+        let wide = (if aapcs { natural_align(ty) } else { type_align(ty) }) >= 16;
         let n = ABI_PIECE_COUNT;
         let mut ints = 0;
         let mut floats = 0;
@@ -272,6 +278,9 @@ pub fn abi_piece_locations(ty: i64, state: *i64, locations: *i64) {
             }
         }
         let int_limit = if X86 { 6 } else { 8 };
+        if aapcs && wide && ints > 0 {
+            state[0] = align_to(state[0], 2);
+        }
         if state[0] + ints <= int_limit && state[1] + floats <= 8 {
             for i in 0..n {
                 if is_float(ABI_PIECE_TY[i]) {
@@ -295,13 +304,35 @@ pub fn abi_piece_locations(ty: i64, state: *i64, locations: *i64) {
         // Apple's AArch64 convention passes a homogeneous float aggregate on
         // the stack as its elements: at the element's alignment, taking its
         // exact size (a union of three f32 takes 12 bytes at a multiple of 4),
-        // where other aggregates take 8-byte slots.
-        let hfa = !X86 && ints == 0 && !wide;
-        let base = align_to(state[2], if wide { type_align(ty) } else if hfa { type_size(ABI_PIECE_TY[0]) } else { 8 });
+        // where other aggregates take 8-byte slots (as every one does under
+        // AAPCS64).
+        let hfa = !X86 && APPLE_A64 && ints == 0 && !wide;
+        let base = align_to(state[2], if wide && aapcs { 16 } else if wide { type_align(ty) } else if hfa { type_size(ABI_PIECE_TY[0]) } else { 8 });
         for i in 0..n {
             locations[i] = 16 + base + ABI_PIECE_OFFSET[i];
         }
         state[2] = base + if hfa { size } else { align_to(size, 8) };
+    }
+}
+
+// The alignment AAPCS64 places an aggregate by (an even register pair, a
+// stack slot): its natural alignment, that of its fields (packing
+// included) without its own repr(align), as GCC and clang have it.
+fn natural_align(ty: i64) -> i64 {
+    unsafe {
+        if TYPES[ty].kind != TyKind::Struct {
+            return type_align(ty);
+        }
+        let s = TYPES[ty].a;
+        let mut align = 1;
+        for i in 0..STRUCTS[s].field_count {
+            let mut field = type_align((*struct_field(s, i)).ty);
+            if (STRUCTS[s].repr & REPR_PACKED) != 0 && field > STRUCTS[s].align {
+                field = STRUCTS[s].align;
+            }
+            align = max_i64(align, field);
+        }
+        align
     }
 }
 
@@ -317,8 +348,8 @@ pub fn abi_stack_location(ty: i64, state: *i64) -> i64 {
 }
 
 // The `...` arguments of a C function: aggregates are classified as named
-// ones; on x86-64 they also go where named ones would, on Apple's AArch64
-// every variadic argument goes on the stack (an aggregate in pieces as its
+// ones; on x86-64 and under AAPCS64 they also go where named ones would, on
+// Apple's AArch64 every variadic argument goes on the stack (an aggregate in pieces as its
 // bytes, homogeneous float aggregates of any size included; a larger one
 // by reference, in an 8-byte slot). Classifies ty.
 pub fn variadic_kind(ty: i64) -> AbiClass {
@@ -329,7 +360,7 @@ pub fn variadic_kind(ty: i64) -> AbiClass {
 // variadic_by_reference), classified just before.
 pub fn abi_variadic_piece_locations(ty: i64, state: *i64, locations: *i64) {
     unsafe {
-        if X86 {
+        if X86 || !APPLE_A64 {
             abi_piece_locations(ty, state, locations);
             return;
         }

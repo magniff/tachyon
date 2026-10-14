@@ -16,6 +16,7 @@ $ tachyonc --tokens file.tach        # the token dump (same format as the seed's
 $ tachyonc --version                 # the release and the host
 $ tachyonc --profile-generate p.prof prog.tach -o prog.o   # instrument (0.10)
 $ tachyonc --profile-use p.prof prog.tach -o prog.o        # optimize with the counts
+$ tachyonc -g prog.tach -o prog      # with DWARF line tables, for debuggers (0.11)
 $ tachyonc query def run_gvn compiler/src/main.tach       # questions about a program (0.11)
 $ tachyonc edit replace gvn::run_gvn < new.tach   # change an item by name, atomically (0.11)
 $ tachyonc check                     # the front end's errors, one per line (0.11)
@@ -39,6 +40,7 @@ emits assembly that `cc` assembles and links against libc, for one of:
 | `aarch64-macos` | AArch64, Apple's arm64 ABI, Mach-O | `cc -arch arm64` |
 | `x86_64-linux` | x86-64, System V ABI, ELF, position independent | `cc` (gcc or clang) |
 | `x86_64-macos` | x86-64, System V ABI, Mach-O | `cc -arch x86_64` |
+| `aarch64-linux` | AArch64, the standard AAPCS64, ELF, position independent (0.11) | `cc` (gcc or clang) |
 
 The default target is the host, found with `uname`; the assembly for a
 target does not depend on the host. Errors are reported in the seed's
@@ -82,7 +84,7 @@ e.g. `use crate::ir::Op::{Add, Sub};`; 0.8 has no `*` imports, and
 | `gen.tach` | the driver of code generation, and the `-O0` code generator: walks the checked AST, in terms of the target interface |
 | `abi.tach` | C's calling convention for aggregates (AArch64 and System V): classification into pieces, locations |
 | `target.tach` | the target interface: targets, the machine model's virtual registers, object-format details (symbols, sections, labels), and dispatch to the instruction set |
-| `arm64.tach` | AArch64 for `-O0`: instructions and Apple's arm64 calling convention |
+| `arm64.tach` | AArch64 for `-O0`: instructions, Apple's arm64 calling convention and AAPCS64's, Mach-O and ELF symbol syntax |
 | `x86_64.tach` | x86-64 for `-O0`: AT&T-syntax instructions and the System V calling convention |
 | `ir.tach` | the IR (`-O1` and up): instructions, blocks, functions, printing, verification |
 | `lower.tach` | the checked AST to IR, building SSA form (Braun et al.) |
@@ -98,12 +100,16 @@ e.g. `use crate::ir::Op::{Add, Sub};`; 0.8 has no `*` imports, and
 | `range.tach` | value ranges and facts: bounds-check elimination, comparison folding, jump threading, comparison chains to switches |
 | `scev.tach` | induction variables, trip counts, exit values, dead loop deletion, unrolling |
 | `tre.tach` | tail recursion elimination with accumulators |
-| `vectorize.tach` | the loop vectorizer (0.10): innermost and outer loops, run-time guards, remainders |
+| `vectorize.tach` | the loop vectorizer (0.10): innermost and outer loops, run-time guards, remainders; its cost model, and unrolling with run-time trip counts in its frame (0.11) |
+| `slp.tach` | the SLP vectorizer (0.11): groups of stores to the lanes of a vector, their values packed |
 | `profile.tach` | profiles (0.10): instrumentation, the runtime's source, reading a profile |
 | `regalloc.tach` | block layout, liveness, linear-scan register allocation |
 | `emit.tach` | emission of the allocated IR: operands, parallel moves, calls, frames |
 | `mc_arm64.tach` | AArch64 instructions on physical registers |
 | `mc_x86_64.tach` | x86-64 instructions on physical registers |
+| `objfile.tach` | the assembler: Mach-O and ELF objects from the assembly text, line tables from `.loc`s, compact unwind from CFI (0.11) |
+| `enc_arm64.tach`, `enc_x86.tach` | instruction encoding for the assembler |
+| `dwarf.tach` | `-g` (0.11): `.file`/`.loc` from source positions, the compile unit and its functions (.debug_info), CFI on Mach-O |
 
 Two back ends share the front end. At `-O1` and `-O2` (the default) the
 checked AST is lowered to an SSA IR, optimized, register-allocated and
@@ -193,6 +199,8 @@ tests of what they changed on purpose).
 
 ## Known limits
 
-- Targets: AArch64 macOS, x86-64 Linux and macOS. No AArch64 Linux yet.
+- Targets: AArch64 macOS and Linux, x86-64 Linux and macOS. On AArch64
+  Linux the bootstrap chain cannot run (see "aarch64-linux" in
+  [docs/releases.md](../docs/releases.md)): the compiler is cross-built.
 - The optimizer's limits are listed at the end of
   [docs/optimizer.md](../docs/optimizer.md).

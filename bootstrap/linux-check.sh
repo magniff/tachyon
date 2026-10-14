@@ -19,6 +19,7 @@
 #   --bench        also run the benchmarks (bench/run.sh)
 #   --objcheck     also check the compiler's objects against cc -c
 #                  (tests/objcheck.sh)
+#   --debugger     also check debug information with gdb (tests/debug.sh)
 #
 # Other options go to bootstrap.sh, e.g. --dev. After the chain, the md5
 # example is checked against md5sum.
@@ -37,6 +38,7 @@ FUZZ=0
 ABI=0
 BENCH=0
 OBJCHECK=0
+DEBUGGER=0
 
 die() {
     echo "linux-check: error: $*" >&2
@@ -57,7 +59,8 @@ for arg in "$@"; do
         --abi=*) ABI=${arg#--abi=} ;;
         --bench) BENCH=1 ;;
         --objcheck) OBJCHECK=1 ;;
-        -h|--help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --debugger) DEBUGGER=1 ;;
+        -h|--help) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) rest="$rest $(quote "$arg")" ;;
     esac
 done
@@ -67,7 +70,14 @@ command -v docker >/dev/null 2>&1 || die "docker not found"
 command -v git >/dev/null 2>&1 || die "git not found"
 
 echo "==> building the image $IMAGE ($PLATFORM)" >&2
-docker build --quiet --platform "$PLATFORM" -t "$IMAGE" \
+# The base image by the digest of its manifest for this platform: the
+# legacy builder takes a multi-platform tag for the machine's own platform
+# once that one is stored (as the other Linux check stores it).
+BASE=$(docker manifest inspect debian:bookworm-slim | awk -v arch="${PLATFORM#linux/}" '
+    /"digest"/ { d = $2; gsub(/[",]/, "", d) }
+    /"architecture"/ { a = $2; gsub(/[",]/, "", a); if (a == arch && !found) { print d; found = 1 } }')
+[ -n "$BASE" ] || die "no $PLATFORM manifest of debian:bookworm-slim"
+docker build --quiet --platform "$PLATFORM" --build-arg BASE="debian@$BASE" -t "$IMAGE" \
     -f "$ROOT/bootstrap/ci/linux-x86_64.Dockerfile" "$ROOT/seed" >/dev/null
 
 SNAP=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-linux-check.XXXXXX")
@@ -89,7 +99,8 @@ fi
 
 echo "==> running the chain in the container" >&2
 tar -C "$SNAP" -c -f - src | docker run --rm -i --cpus 4 --platform "$PLATFORM" -e SEED_TESTS="$SEED_TESTS" \
-    -e ALL_LEVELS="$ALL_LEVELS" -e FUZZ="$FUZZ" -e ABI="$ABI" -e BENCH="$BENCH" -e OBJCHECK="$OBJCHECK" "$IMAGE" sh -c '
+    -e ALL_LEVELS="$ALL_LEVELS" -e FUZZ="$FUZZ" -e ABI="$ABI" -e BENCH="$BENCH" -e OBJCHECK="$OBJCHECK" \
+    -e DEBUGGER="$DEBUGGER" "$IMAGE" sh -c '
     set -eu
     mkdir /work
     tar -x --no-same-owner -f - -C /work
@@ -131,6 +142,10 @@ tar -C "$SNAP" -c -f - src | docker run --rm -i --cpus 4 --platform "$PLATFORM" 
         tests/cimport/layout.sh stdio.h stdlib.h string.h math.h time.h \
             fcntl.h unistd.h signal.h sys/stat.h sys/time.h sys/socket.h \
             netinet/in.h dirent.h pthread.h | tail -5
+    fi
+    if [ "$DEBUGGER" = 1 ]; then
+        echo "==> debug information, with gdb" >&2
+        tests/debug.sh | tail -5
     fi
     if [ "$BENCH" = 1 ]; then
         echo "==> benchmarks" >&2

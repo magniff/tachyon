@@ -11,8 +11,9 @@
 #
 #   -c COMPILER   the tachyonc binary to test (default: target/tachyonc,
 #                 as left by bootstrap/bootstrap.sh)
-#   -t TARGET     aarch64-macos, x86_64-linux or x86_64-macos (default: the
-#                 host; x86_64-macos runs under Rosetta on Apple silicon)
+#   -t TARGET     aarch64-macos, aarch64-linux, x86_64-linux or x86_64-macos
+#                 (default: the host; x86_64-macos runs under Rosetta on
+#                 Apple silicon)
 #   -O LEVEL      the optimization level (0, 1 or 2; default: the
 #                 compiler's default)
 #   -j JOBS       cases run at once (default: the number of CPUs); the
@@ -127,6 +128,7 @@ if [ -z "$TARGET" ]; then
         Darwin-arm64) TARGET=aarch64-macos ;;
         Darwin-x86_64) TARGET=x86_64-macos ;;
         Linux-x86_64) TARGET=x86_64-linux ;;
+        Linux-aarch64) TARGET=aarch64-linux ;;
         *) echo "run.sh: no tachyon target for this host ($(uname -s) $(uname -m)); use -t" >&2; exit 2 ;;
     esac
 fi
@@ -134,7 +136,7 @@ fi
 case "$TARGET" in
     aarch64-macos) LINK_FLAGS="-arch arm64" ;;
     x86_64-macos) LINK_FLAGS="-arch x86_64" ;;
-    x86_64-linux) LINK_FLAGS="" ;;
+    x86_64-linux|aarch64-linux) LINK_FLAGS="" ;;
     *) echo "run.sh: unknown target '$TARGET'" >&2; exit 2 ;;
 esac
 
