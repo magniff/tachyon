@@ -75,9 +75,11 @@ fn main() -> i32 {
 }
 $ undo
 undid split crate::table: 2 items into crate::table::names	3 files	+17 -11 lines
-## The banner goes with most of its group: here, with describe and spare.
+## A banner goes with its group (0.13: all of it, or its first item and
+## most of it into a new module): Names with describe and spare; Weights
+## stays over its constants, and the new file gets a copy as its header.
 $ refactor split crate::table --into crate::table::names --items describe,spare,weight
-split crate::table: 3 items into crate::table::names	3 files	+22 -18 lines
+split crate::table: 3 items into crate::table::names	3 files	+22 -16 lines
 % cat table/names.tach
 // Weights
 
@@ -104,11 +106,13 @@ pub mod names;
 
 pub const KINDS: i64 = 3;
 
+// ---- Weights ----
+
 const W_LOW: i64 = 1;
 const W_MID: i64 = 2;
 const W_HIGH: i64 = 4;
 $ undo
-undid split crate::table: 3 items into crate::table::names	3 files	+22 -18 lines
+undid split crate::table: 3 items into crate::table::names	3 files	+22 -16 lines
 $ refactor split crate::table --into crate::table::names --items spare --no-tidy --dry-run
 --- a/table/names.tach
 +++ b/table/names.tach
