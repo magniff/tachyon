@@ -99,9 +99,43 @@ def source_reads(command):
             continue  # an edit, not a read (logged as such)
         if prog == "cat" and (">" in seg):
             continue  # writing a file
-        if any(SOURCE.search(a) for a in args if not a.startswith("-")):
+        if any(reads_source(a) for a in file_args(prog, args)):
             found.append((prog, args))
     return found
+
+
+SOURCE_DIRS = re.compile(r"^(\./)?(compiler/src|compiler/std|tests/run|examples|bench)/?$")
+
+
+def file_args(prog, args):
+    """The operands that are files: a grep pattern, a sed or awk script
+    (the first operand, unless given with -e/-f) is not one."""
+    operands, skip_next, given_script = [], False, False
+    for a in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if a in ("-e", "-f", "--regexp", "--file"):
+            skip_next, given_script = True, True
+            continue
+        if a in ("-n", "-c") and prog in ("head", "tail"):
+            skip_next = True
+            continue
+        if a in ("-A", "-B", "-C", "-m", "--max-count") and prog in ("grep", "rg", "egrep", "fgrep"):
+            skip_next = True
+            continue
+        if a.startswith("-"):
+            continue
+        operands.append(a)
+    if prog in ("grep", "rg", "egrep", "fgrep", "sed", "awk") and not given_script and operands:
+        operands = operands[1:]
+    return operands
+
+
+def reads_source(path):
+    """A .tach file, or a directory of them that grep -r would read."""
+    return path.endswith(".tach") or bool(SOURCE_DIRS.match(path)) or (
+        ("compiler/src" in path or "compiler/std" in path) and not path.endswith((".sh", ".md", ".toml", ".py", ".awk")))
 
 
 def suggestion(prog, args):
