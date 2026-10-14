@@ -1,0 +1,245 @@
+// Where moved text goes: move --after, --before (0.13)
+
+use crate::base::{FILES, SRC, buf_byte, buf_bytes, buf_new};
+use crate::front::lexer::{TOKS, Tok};
+use crate::front::modules::file_of_pos;
+use crate::tools::edit::items::{after_line, blank_line};
+use crate::tools::query::defs::DEFS;
+use crate::tools::query::positions::line_start;
+use crate::tools::refactor_mod::{comment_line, put_edit};
+use crate::tools::refactor_move::{PLACE_AT, PLACE_BEFORE};
+use crate::tools::refactor_move::units::{
+    UNIT_OF, UN_BANNER, UN_END, UN_FILE, UN_FIRST, UN_KIND, UN_LAST, UN_START, U_OTHER, closing,
+    lines_of, unit_at, units_of,
+};
+
+// Whether a banner moved with the text may head it where it goes: at a
+// module's end; else (move --after, --before) where a banner group ends
+// (after an item followed by a banner, or by nothing).
+pub fn place_ends_group() -> bool {
+    unsafe {
+        if PLACE_AT < 0 {
+            return true;
+        }
+        let f = UN_FILE.data[PLACE_AT];
+        if !PLACE_BEFORE {
+            let mut e = UN_END.data[PLACE_AT];
+            while e < FILES[f].end && blank_line(e) {
+                e = after_line(e);
+            }
+            if e >= FILES[f].end || (unit_starting(f, e) < 0 && comment_line(e)) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// The unit of item d (its file's units made), -1 when it has none of its
+// own (a method, a function of an extern block).
+pub fn anchor_unit(d: i64) -> i64 {
+    unsafe {
+        units_of(file_of_pos(DEFS[d].start));
+        UNIT_OF.get(d + 1) - 1
+    }
+}
+
+// The run key of the unit at pos: its keyword (after attributes and
+// `pub`) + 1 when its code is one line (a constant, a static, a `use`),
+// else 0. Items of one key are written in runs, without blank lines.
+pub fn run_key_at(pos: i64) -> i64 {
+    unsafe {
+        let u = unit_at(pos);
+        if u < 0 {
+            return 0;
+        }
+        run_key(u)
+    }
+}
+
+fn run_key(u: i64) -> i64 {
+    unsafe {
+        if u < 0 {
+            return 0;
+        }
+        let mut i = UN_FIRST.data[u];
+        while TOKS[i].kind == Tok::Hash && TOKS[i + 1].kind == Tok::LBracket {
+            i = closing(i + 1) + 1;
+        }
+        if TOKS[i].kind == Tok::Pub {
+            i += 1;
+        }
+        if line_start(TOKS[i].start) != line_start(TOKS[UN_LAST.data[u]].start) {
+            return 0;
+        }
+        TOKS[i].kind as i64 + 1
+    }
+}
+
+// The blank lines of SRC[a..b).
+fn newlines(a: i64, b: i64) -> i64 {
+    lines_of(a, b)
+}
+
+// The unit of file f ending at pos (-1), starting at pos (-1).
+fn unit_ending(f: i64, pos: i64) -> i64 {
+    unsafe {
+        for u in 0..UN_START.count {
+            if UN_FILE.data[u] == f && UN_END.data[u] == pos {
+                return u;
+            }
+        }
+        -1
+    }
+}
+
+fn unit_starting(f: i64, pos: i64) -> i64 {
+    unsafe {
+        for u in 0..UN_START.count {
+            if UN_FILE.data[u] == f && UN_START.data[u] == pos {
+                return u;
+            }
+        }
+        -1
+    }
+}
+
+// The blank lines a run of key k is written with here, from the units
+// around the gap (p before it, q after it, g blank lines between; g < 0:
+// p and q are not next to each other): p and q themselves, else p and
+// the one before it, else q and the one after, else the moved text's own
+// run (RUN_KEY, RUN_GAP); 0 when none tells.
+fn run_gap(k: i64, p: i64, q: i64, g: i64) -> i64 {
+    unsafe {
+        if g >= 0 && p >= 0 && q >= 0 && run_key(p) == k && run_key(q) == k {
+            return g;
+        }
+        if p > 0 && UN_FILE.data[p - 1] == UN_FILE.data[p] && run_key(p - 1) == k && run_key(p) == k
+            && UN_BANNER.data[p] < 0 {
+            return newlines(UN_END.data[p - 1], UN_START.data[p]);
+        }
+        if q >= 0 && q + 1 < UN_START.count && UN_FILE.data[q + 1] == UN_FILE.data[q] && run_key(q) == k
+            && run_key(q + 1) == k && UN_BANNER.data[q + 1] < 0 {
+            return newlines(UN_END.data[q], UN_START.data[q + 1]);
+        }
+        if RUN_KEY == k {
+            return RUN_GAP;
+        }
+        0
+    }
+}
+
+// The run of the text being moved: the key and blank lines of two of its
+// units next to each other with the same key (-1: none).
+pub static mut RUN_KEY: i64 = -1;
+pub static mut RUN_GAP: i64 = 0;
+
+// The moved text `body` (whole lines; its first and last units' run keys)
+// put next to unit a: after it, or before it (`before`), into the blank
+// lines between a and its neighbour. The blank lines there stay with the
+// unit after them; the text gets one blank line before it (none at the
+// file's start), or joins a run of one-line items of its kind (constants,
+// statics) as the run is written there. After a `use` line, a banner or a
+// header, the blank lines there stay before the text (other edits may
+// change what is above). So delete_moved, then this, put the lines back
+// as they were when the text had one blank line before it (or was in a
+// run).
+pub fn place_moved(a: i64, before: bool, body: [u8], first_key: i64, last_key: i64) {
+    unsafe {
+        let f = UN_FILE.data[a];
+        let mut gs = UN_END.data[a];
+        let mut ge = gs;
+        if before {
+            ge = UN_START.data[a];
+            gs = ge;
+            while gs > FILES[f].start && blank_line(line_start(gs - 1)) {
+                gs = line_start(gs - 1);
+            }
+        } else {
+            while ge < FILES[f].end && blank_line(ge) {
+                ge = after_line(ge);
+            }
+        }
+        let mut p = if before { unit_ending(f, gs) } else { a };
+        // (after a and a banner that heads nothing, before another banner
+        // or the file's end: under that banner)
+        if !before && ge < FILES[f].end && unit_starting(f, ge) < 0 && comment_line(ge) {
+            let mut be = ge;
+            while be < FILES[f].end && comment_line(be) {
+                be = after_line(be);
+            }
+            let mut ne = be;
+            while ne < FILES[f].end && blank_line(ne) {
+                ne = after_line(ne);
+            }
+            if ne >= FILES[f].end || (unit_starting(f, ne) < 0 && comment_line(ne)) {
+                gs = be;
+                ge = ne;
+                p = -1;
+            }
+        }
+        let q = if before { a } else { unit_starting(f, ge) };
+        let g = newlines(gs, ge);
+        let rp = first_key > 0 && run_key(p) == first_key;
+        let rq = last_key > 0 && run_key(q) == last_key;
+        let text = buf_new();
+        if gs == FILES[f].end && gs > FILES[f].start && SRC[gs - 1] != '\n' {
+            buf_byte(text, '\n');
+        }
+        let mut g1 = if gs == FILES[f].start { 0 } else if rp { run_gap(first_key, p, q, g) } else if rq { g } else { 1 };
+        let g2 = if ge >= FILES[f].end { g } else if rq { run_gap(last_key, p, q, g) } else if g == 0 { 1 } else { g };
+        if !rp && (p < 0 || UN_KIND.data[p] == U_OTHER) && ge < FILES[f].end && g > 0 {
+            gs = ge;
+            g1 = 0;
+        }
+        for _ in 0..g1 {
+            buf_byte(text, '\n');
+        }
+        buf_bytes(text, body);
+        for _ in 0..g2 {
+            buf_byte(text, '\n');
+        }
+        put_edit(gs, ge, text);
+    }
+}
+
+// The edit removing the moved lines SRC[a..b) (whole lines, at the top
+// level of a file; the run keys of their first and last units), with the
+// blank lines on one side: the ones after them stay, for the unit after
+// them; the ones before, when the lines start a run of one-line items
+// that goes on after them (or are at the file's start). Lines that were
+// inside a run of another kind (a function between two constants) leave
+// it joined, as the run is written there; lines that started in a run
+// and ended out of it, the blank lines before them. (After a `use` line, a banner
+// or a header, the blank lines after them go: those before stay with what
+// is above, which other edits may remove.)
+pub fn delete_moved(a: i64, b: i64, first_key: i64, last_key: i64) {
+    unsafe {
+        let f = file_of_pos(a);
+        let mut gs = a;
+        while gs > FILES[f].start && blank_line(line_start(gs - 1)) {
+            gs = line_start(gs - 1);
+        }
+        let mut ge = b;
+        while ge < FILES[f].end && blank_line(ge) {
+            ge = after_line(ge);
+        }
+        let p = unit_ending(f, gs);
+        let q = unit_starting(f, ge);
+        let rp = first_key > 0 && run_key(p) == first_key;
+        let rq = last_key > 0 && run_key(q) == last_key;
+        let k = run_key(p);
+        let joined = k > 0 && run_key(q) == k;
+        if !rp && !rq && joined && gs > FILES[f].start {
+            let text = buf_new();
+            for _ in 0..run_gap(k, p, q, -1) {
+                buf_byte(text, '\n');
+            }
+            put_edit(gs, ge, text);
+        } else if gs == FILES[f].start || (rq && !rp) || (rp && !rq && joined) || ((p < 0 || UN_KIND.data[p] == U_OTHER) && ge < FILES[f].end) {
+            put_edit(a, ge, buf_new());
+        } else {
+            put_edit(gs, b, buf_new());
+        }
+    }
+}

@@ -1,0 +1,976 @@
+// `refactor inline FN [--at FILE:LINE] [--keep]` (0.13): the calls of
+// function FN replaced by its body; with --at, the call on that line
+// only. Then FN, with no other use left, is deleted with its imports
+// (--keep: kept).
+//
+// An argument is put in for its parameter where the body uses it when it
+// is a name or a literal (and the body has no local of that name), or
+// when the body is one expression that uses the parameter once and the
+// argument is the only one that is neither; else it is bound first, in
+// order (`let x = ARG;`, `let mut x` when the body changes it; renamed
+// when its name is in an argument). The body becomes the call's value: an
+// expression in parentheses when it binds looser than the call's place,
+// else a block (`{ let x = ...; ...; tail }`). A method's receiver is
+// `self` (the receiver itself when the body uses `self` only as `self.f`
+// or `self.m(...)`).
+//
+// Refused: a body with a `return` (refactor.escapes), a call of FN in its
+// own body (refactor.recursive), a generic FN or an extern "C" one
+// (refactor.generic, refactor.extern), a body naming something that a
+// local hides where it is called (refactor.clash). Imports and `pub` the
+// moved code needs in another module are added (a round of `fix --only
+// imports,pub` on the edited program).
+
+use crate::base::{FILES, IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, intern, BUFS};
+use crate::front::ast::{NODES, NODE_COUNT, NodeKind, child};
+use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
+use crate::front::modules::{file_of_pos, module_at};
+use crate::front::types::FNS;
+use crate::tools::edit::edit_replace;
+use crate::tools::edit::apply::{finish_edit, prepare_edit, set_command};
+use crate::tools::edit::cli::delete_lines;
+use crate::tools::edit::items::{indent_of, item_tail, node_head, item_head, after_line};
+use crate::tools::fix::remove_use_name;
+use crate::tools::query::{QF_DEF, QF_USE, c_slice, root_or_diag};
+use crate::tools::query::defs::{DEFS, K_FN, K_METHOD, def_of_node, K_IMPL_METHOD, K_MOD};
+use crate::tools::query::diagnostics::{PROG, ROOT_GIVEN, TOOL, diag, diags, put_cword, put_root, put_word, try_end, write_diags};
+use crate::tools::query::positions::{enclosing, line_of, line_start, token_at};
+use crate::tools::query::refs::{R_FLAGS, R_POS, R_DEF};
+use crate::tools::query::show::text_start;
+use crate::tools::refactor_shape::{
+    PROGRAM_END, SUB, load_and_find, opt, orig_of, refs_of, sym_text, take_args, try_query_name, usage_error,
+};
+use crate::tools::refactor_shape::body::{
+    USE_FIELD_READ, USE_VALUE, fix_round, in_body, load_body, local_of, reindent, text_with, use_kind,
+};
+use crate::tools::rewrite::parsed::{binding_level, expr_slots, pa, pchild, pcount, pend, pk, pstart};
+use crate::tools::tidyimports::tidy_round;
+use crate::tools::refactor_mod::{item_binding, load_refs, own_file, use_binding_id, use_node_of};
+
+// The parameters of FN: their locals, names, the uses of each in its body
+// (Ident nodes), whether the body changes them.
+static mut P_LOCAL: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut P_NAME: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut P_USES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut P_CHANGED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// The uses of the parameters in the body: position, end, parameter.
+static mut U_START: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut U_END: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut U_PARAM: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// The names the body declares, and the ones it names that are not its
+// locals (functions, constants, statics).
+static mut BODY_LOCALS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut BODY_FREE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The items the body names (load_free_defs), and the ones made pub.
+static mut FREE_DEF: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut PUBBED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+static mut COPIED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+pub fn run_inline(argc: i64, argv: **u8) -> i64 {
+    let status = inline_inner(argc, argv);
+    write_diags();
+    status
+}
+
+fn inline_inner(argc: i64, argv: **u8) -> i64 {
+    unsafe {
+        set_command(argc, argv);
+        PROG = argv[0];
+        TOOL = c"refactor";
+        SUB = c"inline";
+        let mut root = 0 as *u8;
+        let mut words = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut opts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let example = c"FN [--at FILE:LINE] --dry-run";
+        if !take_args(argc, argv, c"--at=1 --keep=0", &root, &words, &opts) {
+            return 2;
+        }
+        if words.count != 1 {
+            return usage_error(if words.count == 0 { c"a function FN is needed" } else { c"one FN at a time" }, example);
+        }
+        let at = opt(&opts, c"--at", false);
+        let mut keep = at != 0 as *u8;
+        for i in 0..opts.count {
+            if bytes_is(c_slice(opts.data[i] as *u8), c"--keep") {
+                keep = true;
+            }
+        }
+        let mut at_file = 0 as *u8;
+        let mut at_line = 0;
+        if at != 0 as *u8 && !file_line(c_slice(at), &at_file, &at_line) {
+            return usage_error(c"--at takes FILE:LINE, the line of a call", example);
+        }
+        let name = c_slice(words.data[0] as *u8);
+        ROOT_GIVEN = root;
+        root = root_or_diag(root, SUB, name, true);
+        if root == 0 as *u8 {
+            return 2;
+        }
+        let mut status = 0;
+        let d = load_and_find(root, name, (1 << K_FN) | (1 << K_METHOD), c"function", &status);
+        if d < 0 {
+            return status;
+        }
+        let f = DEFS[d].node;
+        let body = NODES[f].c;
+        let fqn = sym_text(DEFS[d].fqn);
+        if NODES[f].y == 1 {
+            let e = diag(c"error", c"refactor.extern");
+            buf_bytes(e, fqn);
+            buf_str(e, c" is an extern \"C\" function: C code may call it\n");
+            return 1;
+        }
+        if body <= 0 || NODES[f].g != 0 || (NODES[f].h != 0 && NODES[NODES[f].h].g != 0) {
+            let e = diag(c"error", c"refactor.generic");
+            buf_bytes(e, fqn);
+            buf_str(e, if body <= 0 { c" has no body\n" } else { c" is generic: its body is checked once per instance\n" });
+            return 1;
+        }
+        if !load_callee(d, f, fqn) {
+            return 1;
+        }
+        // The calls (as written), each once; with --at, the one on that line.
+        let mut calls = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut checked = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for n in 1..NODE_COUNT {
+            if NODES[n].kind != NodeKind::Call || NODES[n].x <= 0 || def_of_node(FNS[NODES[n].x - 1].node) != d {
+                continue;
+            }
+            let mut o = orig_of(n, NodeKind::Call);
+            if o < 0 {
+                o = orig_of(n, NodeKind::MethodCall);
+            }
+            if o < 0 || contains(&calls, o) {
+                continue;
+            }
+            if at != 0 as *u8 && !(line_of(pstart(o)) == at_line && ends_with(FILES[file_of_pos(pstart(o))].path, c_slice(at_file))) {
+                continue;
+            }
+            calls.push(o);
+            checked.push(n);
+        }
+        if calls.count == 0 {
+            let e = diag(c"error", c"refactor.no-call");
+            buf_bytes(e, fqn);
+            buf_str(e, if at != 0 as *u8 { c" is not called on " } else { c" is not called\n" });
+            if at != 0 as *u8 {
+                buf_str(e, at);
+                buf_byte(e, '\n');
+            }
+            try_query_name(c"refs", fqn);
+            return 1;
+        }
+        if at != 0 as *u8 && calls.count > 1 {
+            let e = diag(c"error", c"refactor.ambiguous");
+            buf_str(e, at);
+            buf_str(e, c" has ");
+            buf_int(e, calls.count);
+            buf_str(e, c" calls of ");
+            buf_bytes(e, fqn);
+            buf_str(e, c"; inline them all, or put one on a line of its own\n");
+            return 1;
+        }
+        // (a call inside another's arguments: the outer one only)
+        let mut nested = 0;
+        let mut done = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..calls.count {
+            let o = calls.data[i];
+            let mut inner = false;
+            for j in 0..calls.count {
+                let q = calls.data[j];
+                if j != i && pstart(q) <= pstart(o) && pend(o) <= pend(q) && (pstart(q) < pstart(o) || pend(o) < pend(q)) {
+                    inner = true;
+                }
+            }
+            if inner {
+                nested += 1;
+                continue;
+            }
+            if !inline_call(d, o, checked.data[i], fqn) {
+                return 1;
+            }
+            done.push(o);
+        }
+        // FN, when nothing else uses it: deleted, with its imports.
+        let mut deleted = false;
+        if !keep && nested == 0 {
+            deleted = delete_unused(d, &done);
+        }
+        let status = prepare_edit();
+        if status >= 0 {
+            return status;
+        }
+        fix_round(root, c"imports,pub");
+        tidy_round(root);
+        let what = buf_new();
+        buf_str(what, c"inlined ");
+        buf_bytes(what, fqn);
+        buf_str(what, c" at ");
+        buf_int(what, done.count);
+        buf_str(what, if done.count == 1 { c" call" } else { c" calls" });
+        if deleted {
+            buf_str(what, c", deleted it");
+        }
+        if nested > 0 {
+            let e = diag(c"note", c"refactor.nested");
+            buf_int(e, nested);
+            buf_str(e, if nested == 1 { c" call is" } else { c" calls are" });
+            buf_str(e, c" in the arguments of another: inline again for them\n");
+        }
+        finish_edit(buf_slice(what), root)
+    }
+}
+
+// What inlining needs of FN's body (node f): its parameters and their
+// uses, its locals' names, the other names it uses. False after a
+// diagnostic (a `return`, a call of itself).
+fn load_callee(d: i64, f: i64, fqn: [u8]) -> bool {
+    unsafe {
+        load_free_defs(NODES[f].c);
+        load_body(f);
+        for n in 1..NODE_COUNT {
+            if !in_body(n) {
+                continue;
+            }
+            let k = NODES[n].kind;
+            if k == NodeKind::Return {
+                let e = diag(c"error", c"refactor.escapes");
+                buf_bytes(e, fqn);
+                buf_str(e, c" returns early, on line ");
+                buf_int(e, line_of(NODES[n].start));
+                buf_str(e, c": inline takes a function that ends with its value\n");
+                try_at(NODES[n].start);
+                return false;
+            }
+            if k == NodeKind::Call && NODES[n].x > 0 && def_of_node(FNS[NODES[n].x - 1].node) == d {
+                let e = diag(c"error", c"refactor.recursive");
+                buf_bytes(e, fqn);
+                buf_str(e, c" calls itself, on line ");
+                buf_int(e, line_of(NODES[n].start));
+                buf_byte(e, '\n');
+                return false;
+            }
+            if k == NodeKind::PatBind {
+                BODY_LOCALS.push(NODES[n].a);
+            }
+            if k == NodeKind::Ident && local_of(n) < 0 {
+                BODY_FREE.push(NODES[n].a);
+            }
+        }
+        for i in 0..NODES[f].count {
+            let p = child(f, i);
+            P_LOCAL.push(NODES[p].x);
+            P_NAME.push(NODES[p].a);
+            P_USES.push(0);
+            P_CHANGED.push(0);
+        }
+        for n in 1..NODE_COUNT {
+            let l = local_of(n);
+            if l < 0 || !in_body(n) {
+                continue;
+            }
+            for j in 0..P_LOCAL.count {
+                if P_LOCAL.data[j] != l {
+                    continue;
+                }
+                U_START.push(NODES[n].start);
+                U_END.push(NODES[n].end);
+                U_PARAM.push(j);
+                P_USES.data[j] += 1;
+                let k = use_kind(n);
+                if k != USE_VALUE && k != USE_FIELD_READ {
+                    P_CHANGED.data[j] = 1;
+                }
+            }
+        }
+        true
+    }
+}
+
+// The items FN's body (node body) names (FREE_DEF: functions, types,
+// constants, statics; not a variant, a field, a method): from every
+// reference the checker resolved (load_refs, which copy_imports needs too).
+fn load_free_defs(body: i64) {
+    unsafe {
+        load_refs();
+        for r in 0..R_POS.count {
+            let pos = R_POS.data[r];
+            let x = R_DEF.data[r];
+            let k = DEFS[x].kind;
+            if (R_FLAGS.data[r] & QF_DEF) == 0 && pos >= NODES[body].start && pos < NODES[body].end
+                && DEFS[x].parent < 0 && k != K_METHOD && k != K_IMPL_METHOD && k != K_MOD && !contains(&FREE_DEF, x) {
+                FREE_DEF.push(x);
+            }
+        }
+    }
+}
+
+// The items the body names that are private in another module than the
+// caller's (module m): made `pub` (once each), so that the imports the
+// fix round adds reach them.
+fn publish_free_defs(m: i64) {
+    unsafe {
+        for i in 0..FREE_DEF.count {
+            let x = FREE_DEF.data[i];
+            if DEFS[x].module == m || DEFS[x].public || contains(&PUBBED, x) || FILES[file_of_pos(DEFS[x].start)].path[0] == '<' {
+                continue;
+            }
+            PUBBED.push(x);
+            let at = item_head(x);
+            edit_replace(at, at, text_of_c(c"pub "));
+        }
+    }
+}
+
+// The imports of FN's module (m) its body names that the caller's
+// module (cm) lacks, added there: `use PATH::NAME;` after its last `use`
+// (a variant, `use crate::ir::Op::Const`, which fix cannot find).
+fn copy_imports(m: i64, cm: i64, body: i64) {
+    unsafe {
+        if m == cm {
+            return;
+        }
+        let f = own_file(cm);
+        if f < 0 {
+            return;
+        }
+        let mut t = token_at(NODES[body].start);
+        while t < TOK_COUNT && TOKS[t].start < NODES[body].end {
+            let s = TOKS[t].value as i64;
+            let after_dot = t > 0 && (TOKS[t - 1].kind == Tok::Dot || TOKS[t - 1].kind == Tok::ColonColon);
+            if TOKS[t].kind != Tok::Ident || after_dot || contains(&BODY_LOCALS, s) || contains(&P_NAME, s)
+                || contains(&COPIED, cm * 1000003 + s) {
+                t += 1;
+                continue;
+            }
+            let id = use_binding_id(m, s);
+            if id == 0 || item_binding(cm, s) >= 0 || use_binding_id(cm, s) != 0 {
+                t += 1;
+                continue;
+            }
+            let u = use_node_of(id);
+            let mut path = SRC[NODES[NODES[u].c].start..NODES[NODES[u].c].end];
+            if path.len > 2 && path[path.len - 1] == ':' {
+                path = path[0..path.len - 2];
+            }
+            if !(path.len > 7 && bytes_is(path[0..7], c"crate::")) && !(path.len > 5 && bytes_is(path[0..5], c"std::")) {
+                t += 1;
+                continue;
+            }
+            COPIED.push(cm * 1000003 + s);
+            let line = buf_new();
+            buf_str(line, c"use ");
+            buf_bytes(line, path);
+            buf_str(line, c"::");
+            buf_bytes(line, SYMS[NODES[id].a].text);
+            if NODES[id].b != 0 {
+                buf_str(line, c" as ");
+                buf_bytes(line, SYMS[NODES[id].b].text);
+            }
+            buf_str(line, c";\n");
+            // (after the module's last `use`, else before its first line
+            // of code)
+            let mut at = -1;
+            for v in 1..NODE_COUNT {
+                if NODES[v].kind == NodeKind::Use && file_of_pos(NODES[v].start) == f && after_line(NODES[v].end - 1) > at {
+                    at = after_line(NODES[v].end - 1);
+                }
+            }
+            if at < 0 {
+                at = line_start(TOKS[token_at(FILES[f].start)].start);
+                buf_byte(line, '\n');
+            }
+            edit_replace(at, at, line);
+            t += 1;
+        }
+    }
+}
+
+fn text_of_c(s: *u8) -> i64 {
+    unsafe {
+        let b = buf_new();
+        buf_str(b, s);
+        b
+    }
+}
+
+// The call o (as written; n, as checked) of FN replaced by its body:
+// false after a diagnostic.
+fn inline_call(d: i64, o: i64, n: i64, fqn: [u8]) -> bool {
+    unsafe {
+        let f = DEFS[d].node;
+        let body = NODES[f].c;
+        // The arguments, the receiver first.
+        let mut args = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        if pk(o) == NodeKind::MethodCall {
+            args.push(pa(o));
+        }
+        for i in 0..pcount(o) {
+            args.push(pchild(o, i));
+        }
+        if args.count != P_LOCAL.count {
+            let e = diag(c"error", c"refactor.internal");
+            buf_str(e, c"the call on line ");
+            buf_int(e, line_of(pstart(o)));
+            buf_str(e, c" has an argument per parameter of its own; nothing written\n");
+            return false;
+        }
+        // The names the caller's locals hide.
+        let c = enclosing(pstart(o));
+        let cf = if c >= 0 { DEFS[c].node } else { -1 };
+        for i in 0..BODY_FREE.count {
+            let name = BODY_FREE.data[i];
+            if cf > 0 && local_named(cf, name) {
+                let e = diag(c"error", c"refactor.clash");
+                buf_bytes(e, fqn);
+                buf_str(e, c" names ");
+                buf_bytes(e, SYMS[name].text);
+                buf_str(e, c", a local of ");
+                buf_bytes(e, SYMS[DEFS[c].fqn].text);
+                buf_str(e, c" where it is called (line ");
+                buf_int(e, line_of(pstart(o)));
+                buf_str(e, c"): rename the local first\n");
+                try_at(pstart(o));
+                return false;
+            }
+        }
+        publish_free_defs(module_at(pstart(o)));
+        copy_imports(DEFS[d].module, module_at(pstart(o)), body);
+        // Each parameter: the argument put in for it, or bound first.
+        let single = NODES[body].count == 0 && NODES[body].a > 0;
+        let mut complex = 0;
+        for j in 0..args.count {
+            if !simple_arg(args.data[j]) {
+                complex += 1;
+            }
+        }
+        let binds = buf_new();
+        let mut u_text = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut sub = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for j in 0..args.count {
+            let a = args.data[j];
+            let text = SRC[pstart(a)..pend(a)];
+            let t = buf_new();
+            if j == 0 && pk(o) == NodeKind::MethodCall && autoref(n) {
+                // (the receiver, a place the method took the address of)
+                if !self_as_base(f) || !place_path(text) {
+                    let e = diag(c"error", c"refactor.receiver");
+                    buf_str(e, c"the receiver on line ");
+                    buf_int(e, line_of(pstart(o)));
+                    buf_str(e, c" is borrowed, and ");
+                    buf_bytes(e, fqn);
+                    buf_str(e, c" uses self other than as self.f or self.m(...): bind it to a local first\n");
+                    try_at(pstart(o));
+                    return false;
+                }
+                buf_bytes(t, text);
+                sub.push(1);
+            } else if P_CHANGED.data[j] == 0 && P_USES.data[j] > 0 && simple_arg(a) {
+                buf_bytes(t, text);
+                sub.push(1);
+            } else if P_CHANGED.data[j] == 0 && P_USES.data[j] == 1 && single && complex == 1 {
+                if binding_level(a) < 99 {
+                    buf_byte(t, '(');
+                    buf_bytes(t, text);
+                    buf_byte(t, ')');
+                } else {
+                    buf_bytes(t, text);
+                }
+                sub.push(1);
+            } else {
+                // `let [mut] NAME = ARG;`, NAME renamed when an argument
+                // has it
+                let mut name = SYMS[P_NAME.data[j]].text;
+                if bytes_is(name, c"self") || named_in_args(&args, name) {
+                    name = fresh_name(name, &args);
+                }
+                buf_bytes(t, name);
+                buf_str(binds, c"let ");
+                if P_CHANGED.data[j] != 0 {
+                    buf_str(binds, c"mut ");
+                }
+                buf_bytes(binds, name);
+                buf_str(binds, c" = ");
+                buf_bytes(binds, text);
+                buf_str(binds, c";\n");
+                sub.push(0);
+            }
+            u_text.push(t);
+        }
+        // The uses of the parameters, replaced.
+        let mut rs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut re = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut rt = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..U_START.count {
+            let j = U_PARAM.data[i];
+            rs.push(U_START.data[i]);
+            re.push(U_END.data[i]);
+            rt.push(u_text.data[j]);
+        }
+        let call_indent = indent_of(pstart(o));
+        let out = buf_new();
+        let stmt = statement_of(o);
+        if stmt >= 0 && BUFS[binds].len == 0 && BODY_LOCALS.count == 0 {
+            // A statement of its own (`f(x);`), with no local to keep
+            // apart: the body's statements in its place.
+            let text = text_with(NODES[body].start + 1, NODES[body].end - 1, &rs, &re, &rt);
+            let lines = buf_new();
+            reindent(lines, trim_blank_lines(buf_slice(text)), call_indent);
+            let s = buf_slice(lines);
+            let tail = NODES[body].a;
+            buf_bytes(out, skip_indent(trim_blank_lines(s)));
+            if tail > 0 && !block_like(tail) {
+                buf_byte(out, ';');
+            }
+            edit_replace(pstart(o), statement_end(o, stmt), out);
+            return true;
+        }
+        if single && BUFS[binds].len == 0 {
+            // An expression: the tail, in parentheses when it binds
+            // looser than the call's place.
+            let tail = NODES[body].a;
+            let text = text_with(NODES[tail].start, NODES[tail].end, &rs, &re, &rt);
+            let parens = expr_level(tail) < slot_level(o);
+            if parens {
+                buf_byte(out, '(');
+            }
+            shift_lines(out, buf_slice(text), indent_of(NODES[tail].start).len, call_indent);
+            if parens {
+                buf_byte(out, ')');
+            }
+        } else {
+            // A block: the bindings, then the body's lines.
+            let inner = buf_new();
+            buf_bytes(inner, call_indent);
+            buf_str(inner, c"    ");
+            buf_str(out, c"{\n");
+            reindent(out, buf_slice(binds), buf_slice(inner));
+            let text = text_with(NODES[body].start + 1, NODES[body].end - 1, &rs, &re, &rt);
+            reindent(out, trim_blank_lines(buf_slice(text)), buf_slice(inner));
+            buf_bytes(out, call_indent);
+            buf_byte(out, '}');
+        }
+        edit_replace(pstart(o), pend(o), out);
+        true
+    }
+}
+
+// The statement call o is the whole of (`f(x);`, as written; not a
+// block's value), or -1.
+fn statement_of(o: i64) -> i64 {
+    unsafe {
+        for p in 1..PROGRAM_END {
+            if pk(p) == NodeKind::ExprStmt && pa(p) == o {
+                // (with its `;`)
+                let mut e = pend(o);
+                while SRC[e] == ' ' || SRC[e] == '\t' || SRC[e] == '\n' {
+                    e += 1;
+                }
+                return if SRC[e] == ';' { p } else { -1 };
+            }
+        }
+        -1
+    }
+}
+
+// The end of statement stmt of call o: after its `;`.
+fn statement_end(o: i64, stmt: i64) -> i64 {
+    unsafe {
+        let mut e = pend(o);
+        while e < pend(stmt) && SRC[e] != ';' {
+            e += 1;
+        }
+        if e < pend(stmt) && SRC[e] == ';' {
+            return e + 1;
+        }
+        e = pend(o);
+        while SRC[e] == ' ' || SRC[e] == '\t' {
+            e += 1;
+        }
+        if SRC[e] == ';' { e + 1 } else { pend(o) }
+    }
+}
+
+// Whether checked node n is an expression that stands as a statement
+// without `;` (if, match, a block, a loop).
+fn block_like(n: i64) -> bool {
+    unsafe {
+        let k = NODES[n].kind;
+        k == NodeKind::If || k == NodeKind::Match || k == NodeKind::Block || k == NodeKind::Loop || k == NodeKind::While
+            || k == NodeKind::For
+    }
+}
+
+// s from its first character that is not a blank.
+fn skip_indent(s: [u8]) -> [u8] {
+    let mut i = 0;
+    while i < s.len && (s[i] == ' ' || s[i] == '\t') {
+        i += 1;
+    }
+    s[i..s.len]
+}
+
+// FN deleted when nothing but the calls inlined (calls) uses it: its
+// text, and the names of the `use` lines importing it. Whether it is.
+fn delete_unused(d: i64, calls: *IntVec) -> bool {
+    unsafe {
+        let mut targets = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        targets.push(d);
+        refs_of(&targets);
+        let mut imports = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for r in 0..R_POS.count {
+            let pos = R_POS.data[r];
+            if R_DEF.data[r] != d || (R_FLAGS.data[r] & QF_DEF) != 0 {
+                continue;
+            }
+            let mut inlined = false;
+            for i in 0..(*calls).count {
+                let o = (*calls).data[i];
+                if pstart(o) <= pos && pos < pend(o) {
+                    inlined = true;
+                }
+            }
+            if inlined {
+                continue;
+            }
+            if (R_FLAGS.data[r] & QF_USE) == 0 {
+                return false;
+            }
+            imports.push(pos);
+        }
+        delete_lines(line_start(text_start(d)), item_tail(d));
+        for i in 0..imports.count {
+            let pos = imports.data[i];
+            for u in 1..NODE_COUNT {
+                if NODES[u].kind != NodeKind::Use || NODES[u].start > pos || NODES[u].end <= pos {
+                    continue;
+                }
+                for k in 0..NODES[u].count {
+                    let id = child(u, k);
+                    if NODES[id].start <= pos && pos < NODES[id].end {
+                        if NODES[u].count == 1 {
+                            delete_lines(line_start(node_head(NODES[u].start)), NODES[u].end);
+                        } else {
+                            remove_use_name(u, k);
+                        }
+                    }
+                }
+            }
+        }
+        true
+    }
+}
+
+// Whether a local of function node cf (a parameter, a binding) is named
+// `name`.
+fn local_named(cf: i64, name: i64) -> bool {
+    unsafe {
+        for n in 1..NODE_COUNT {
+            let k = NODES[n].kind;
+            if (k == NodeKind::PatBind || k == NodeKind::Param) && NODES[n].a == name && NODES[n].start >= NODES[cf].start
+                && NODES[n].end <= NODES[cf].end {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// An argument put in as it is: a name (not one the body declares), a
+// literal.
+fn simple_arg(a: i64) -> bool {
+    unsafe {
+        let k = pk(a);
+        if k == NodeKind::Ident {
+            for i in 0..BODY_LOCALS.count {
+                if BODY_LOCALS.data[i] == pa(a) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        k == NodeKind::Int || k == NodeKind::Float || k == NodeKind::Char || k == NodeKind::Bool || k == NodeKind::Str
+            || k == NodeKind::CStr || k == NodeKind::Unit
+    }
+}
+
+// Whether the checked call n takes the address of its receiver (`v.m()`
+// with `self: *T`, v a value).
+fn autoref(n: i64) -> bool {
+    unsafe {
+        if NODES[n].count == 0 {
+            return false;
+        }
+        let r = child(n, 0);
+        NODES[r].kind == NodeKind::Unary && NODES[r].op == Tok::Amp && NODES[r].start == NODES[NODES[r].b].start
+            && NODES[r].end == NODES[NODES[r].b].end
+    }
+}
+
+// Whether every `self` of FN's body (node f) is followed by `.`.
+fn self_as_base(f: i64) -> bool {
+    unsafe {
+        let body = NODES[f].c;
+        let mut i = token_at(NODES[body].start);
+        while i < TOK_COUNT && TOKS[i].start < NODES[body].end {
+            if TOKS[i].kind == Tok::Ident && bytes_is(SYMS[TOKS[i].value as i64].text, c"self")
+                && TOKS[i + 1].kind != Tok::Dot {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+}
+
+// Whether text is a place written with names, `.` and digits (`a.b.0`).
+fn place_path(s: [u8]) -> bool {
+    for i in 0..s.len {
+        let c = s[i];
+        if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '.') {
+            return false;
+        }
+    }
+    s.len > 0
+}
+
+// Whether `name` is a word of an argument's text.
+fn named_in_args(args: *IntVec, name: [u8]) -> bool {
+    unsafe {
+        for i in 0..(*args).count {
+            let a = (*args).data[i];
+            let mut t = token_at(pstart(a));
+            while t < TOK_COUNT && TOKS[t].start < pend(a) {
+                if TOKS[t].kind == Tok::Ident && bytes_eq_sym(TOKS[t].value as i64, name) {
+                    return true;
+                }
+                t += 1;
+            }
+        }
+        false
+    }
+}
+
+fn bytes_eq_sym(sym: i64, s: [u8]) -> bool {
+    unsafe {
+        let t = SYMS[sym].text;
+        if t.len != s.len {
+            return false;
+        }
+        for i in 0..s.len {
+            if t[i] != s[i] {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// `NAME_2`, `NAME_3`... the first that no argument, body local or other
+// name of the body has (`self`: `this`, then `this_2`...).
+fn fresh_name(name: [u8], args: *IntVec) -> [u8] {
+    unsafe {
+        let base = if bytes_is(name, c"self") { c_slice(c"this") } else { name };
+        let mut k = 1;
+        loop {
+            let b = buf_new();
+            buf_bytes(b, base);
+            if k > 1 {
+                buf_byte(b, '_');
+                buf_int(b, k);
+            }
+            let s = buf_slice(b);
+            let sym = intern(s);
+            let mut taken = named_in_args(args, s);
+            for i in 0..BODY_LOCALS.count {
+                if BODY_LOCALS.data[i] == sym {
+                    taken = true;
+                }
+            }
+            for i in 0..BODY_FREE.count {
+                if BODY_FREE.data[i] == sym {
+                    taken = true;
+                }
+            }
+            for i in 0..P_NAME.count {
+                if P_NAME.data[i] == sym {
+                    taken = true;
+                }
+            }
+            if !taken {
+                return s;
+            }
+            k += 1;
+        }
+    }
+}
+
+// How tightly the body's value (checked node n) binds: a block-like
+// expression (if, match, a block, a loop) as loosely as a binary one, so
+// that it stays apart from an operator after it.
+fn expr_level(n: i64) -> i64 {
+    unsafe {
+        let k = NODES[n].kind;
+        if k == NodeKind::If || k == NodeKind::Match || k == NodeKind::Block || k == NodeKind::Loop || k == NodeKind::While
+            || k == NodeKind::For {
+            return 1;
+        }
+        binding_level(n)
+    }
+}
+
+// The binding level the place of call o needs (0: an argument, a
+// statement, a `let`'s value).
+fn slot_level(o: i64) -> i64 {
+    unsafe {
+        let mut best = -1;
+        let mut level = 0;
+        for p in 1..PROGRAM_END {
+            if p == o || pstart(p) > pstart(o) || pend(p) < pend(o) {
+                continue;
+            }
+            if best >= 0 && pend(p) - pstart(p) >= pend(best) - pstart(best) {
+                continue;
+            }
+            let mut kids = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            let mut levels = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            expr_slots(p, &kids, &levels);
+            for i in 0..kids.count {
+                if kids.data[i] == o {
+                    best = p;
+                    level = levels.data[i];
+                }
+            }
+        }
+        level
+    }
+}
+
+// The lines of text s after its first, their first `from` columns of
+// indentation replaced by `to` (the first line as it is), into out.
+fn shift_lines(out: i64, s: [u8], from: i64, to: [u8]) {
+    let mut i = 0;
+    let mut first = true;
+    while i < s.len {
+        let mut e = i;
+        while e < s.len && s[e] != '\n' {
+            e += 1;
+        }
+        if first {
+            buf_bytes(out, s[i..e]);
+        } else {
+            let mut a = i;
+            while a < e && a - i < from && (s[a] == ' ' || s[a] == '\t') {
+                a += 1;
+            }
+            if a < e {
+                buf_bytes(out, to);
+            }
+            buf_bytes(out, s[a..e]);
+        }
+        if e < s.len {
+            buf_byte(out, '\n');
+        }
+        first = false;
+        i = e + 1;
+    }
+}
+
+// s without its first and last blank lines.
+fn trim_blank_lines(s: [u8]) -> [u8] {
+    let mut a = 0;
+    let mut i = 0;
+    while i < s.len && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r') {
+        if s[i] == '\n' {
+            a = i + 1;
+        }
+        i += 1;
+    }
+    let mut b = s.len;
+    while b > a && (s[b - 1] == ' ' || s[b - 1] == '\t' || s[b - 1] == '\n' || s[b - 1] == '\r') {
+        b -= 1;
+    }
+    s[a..b]
+}
+
+// FILE:LINE into *file (a C string) and *line.
+fn file_line(s: [u8], file: **u8, line: *i64) -> bool {
+    unsafe {
+        let mut c = s.len - 1;
+        while c > 0 && s[c] != ':' {
+            c -= 1;
+        }
+        if c <= 0 || c == s.len - 1 {
+            return false;
+        }
+        let mut n = 0;
+        for i in c + 1..s.len {
+            if s[i] < '0' || s[i] > '9' {
+                return false;
+            }
+            n = n * 10 + (s[i] - '0') as i64;
+        }
+        let b = buf_new();
+        buf_bytes(b, s[0..c]);
+        buf_byte(b, 0);
+        *file = BUFS[b].data;
+        *line = n;
+        n > 0
+    }
+}
+
+// Whether path ends with suffix (at a `/`, or whole): `src/calc.tach`
+// ends with `calc.tach`, `./calc.tach` too.
+fn ends_with(path: *u8, suffix: [u8]) -> bool {
+    unsafe {
+        let p = c_slice(path);
+        let mut s = suffix;
+        while s.len > 2 && s[0] == '.' && s[1] == '/' {
+            s = s[2..s.len];
+        }
+        if p.len < s.len {
+            return false;
+        }
+        let off = p.len - s.len;
+        for i in 0..s.len {
+            if p[off + i] != s[i] {
+                return false;
+            }
+        }
+        off == 0 || p[off - 1] == '/'
+    }
+}
+
+fn contains(v: *IntVec, x: i64) -> bool {
+    unsafe {
+        for i in 0..(*v).count {
+            if (*v).data[i] == x {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+fn bytes_is(s: [u8], c: *u8) -> bool {
+    unsafe { bytes_eq_sym(intern(c_slice(c)), s) }
+}
+
+// `try: PROG query show FILE:LINE` of pos.
+fn try_at(pos: i64) {
+    unsafe {
+        let out = diags();
+        buf_str(out, c"try:");
+        put_cword(out, PROG);
+        buf_str(out, c" query show");
+        let b = buf_new();
+        buf_str(b, FILES[file_of_pos(pos)].path);
+        buf_byte(b, ':');
+        buf_int(b, line_of(pos));
+        put_word(out, buf_slice(b));
+        put_root(out);
+        try_end(out);
+    }
+}

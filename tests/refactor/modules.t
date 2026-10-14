@@ -523,16 +523,19 @@ undid split crate::geom: 3 items into crate::geom::scaling	3 files	+21 -18 lines
 ## in one edit.
 $ refactor split crate::geom --plan --max-lines 20
 # crate::geom	36 lines	3 parts of at most 20 lines
-tachyonc refactor split crate::geom --into crate::geom::part2 --items area,half
-tachyonc refactor split crate::geom --into crate::geom::part3 --items scale,double
-note refactor.plan: the same in one edit: --auto
+# stays in crate::geom: the part most used from other modules
+# point: type Point: 1 of 2 items, 4 of 8 lines
+tachyonc refactor split crate::geom --into crate::geom::point --items area,half
+# scaling: banner '// ---- Scaling ----': 2 of 2 items, 7 of 7 lines
+tachyonc refactor split crate::geom --into crate::geom::scaling --items scale,double
+note refactor.plan: the same in one edit: --auto (other names: --names a,b)
 try: tachyonc refactor split crate::geom --auto --max-lines 20
 $ refactor split crate::geom --auto --max-lines 20
 split crate::geom into 2 modules	5 files	+32 -24 lines
 % find . -name '*.tach' | sort
 ./geom/mod.tach
-./geom/part2.tach
-./geom/part3.tach
+./geom/point.tach
+./geom/scaling.tach
 ./main.tach
 ./shapes.tach
 ./util.tach

@@ -1,0 +1,492 @@
+// The names of a split's parts (0.13): each part is named after what its
+// items share, the reason printed by `split --plan`:
+//
+//   banner   the banner most of its lines are under (`// ---- Scaling
+//            ----`: scaling)
+//   type     the type most of its lines operate on: a struct, enum or
+//            trait of the part (with its impl blocks), or the type of the
+//            first parameter of its functions (`Liveness`: liveness)
+//   prefix   the first word most of its items' names start with (emit_)
+//   suffix   the last word most of its items' names end with (_imports)
+//
+// The candidate covering the most of the part's lines wins (at least a
+// third of them; on a tie, in that order), when its name is an
+// identifier MODULE does not have and no part before took; else `partK`.
+
+use crate::base::{BUFS, IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, intern};
+use crate::front::ast::{NODES, NodeKind, child};
+use crate::front::modules::{child_module, module_count, module_at};
+use crate::tools::query::defs::{DEFS, K_ENUM, K_FN, K_STRUCT, K_TRAIT, mod_fqn};
+use crate::tools::query::{c_slice, OPT_MAX_LINES};
+use crate::tools::refactor_mod::{comment_line, item_binding, region_name, use_binding, REFS};
+use crate::tools::refactor_mod::cli::{is_ident, OPT_NAMES};
+use crate::tools::refactor_move::units::{UN_BANNER, UN_DEF, UN_FILE};
+use crate::tools::edit::items::after_line;
+use crate::tools::query::diagnostics::{diag, try_begin, try_end};
+use crate::middle::lower::ssa::HMap;
+use crate::tools::query::refs::{R_DEF, R_POS};
+
+const C_BANNER: i64 = 1;
+const C_TYPE: i64 = 2;
+const C_PREFIX: i64 = 3;
+const C_SUFFIX: i64 = 4;
+
+// The candidates of the part being named: kind, name, what it comes from
+// (a banner's start, a type's or a word's symbol), lines and items covered.
+static mut C_KIND: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut C_NAME: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut C_FROM: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut C_LINES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut C_ITEMS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+static mut C_TOTAL: i64 = 0;
+static mut C_COUNT: i64 = 0;
+
+// The types general_type has looked at (name + 1 -> 1, or 2: general).
+static mut GENERAL: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+// A name for part g of module m (the k-th part), the reason into buffer
+// why: items holds the units of the module's items, lines their lines
+// (with their impl blocks), group the part of each.
+pub fn part_name(m: i64, g: i64, group: *i64, items: *IntVec, lines: *i64, n: i64, taken: *IntVec, k: i64, why: i64) -> i64 {
+    unsafe {
+        collect(g, group, items, lines, n);
+        let best = best_candidate(m, taken);
+        if best < 0 {
+            let b = buf_new();
+            buf_str(b, c"part");
+            buf_int(b, k + 1);
+            buf_str(why, c"no banner, type, prefix or suffix shared by a third of its lines");
+            return intern(buf_slice(b));
+        }
+        let kind = C_KIND.data[best];
+        let from = C_FROM.data[best];
+        if kind == C_BANNER {
+            buf_str(why, c"banner '");
+            buf_bytes(why, banner_line(from));
+            buf_str(why, c"'");
+        } else if kind == C_TYPE {
+            buf_str(why, c"type ");
+            buf_bytes(why, SYMS[from].text);
+        } else if kind == C_PREFIX {
+            buf_str(why, c"prefix ");
+            buf_bytes(why, SYMS[from].text);
+            buf_byte(why, '_');
+        } else {
+            buf_str(why, c"suffix _");
+            buf_bytes(why, SYMS[from].text);
+        }
+        buf_str(why, c": ");
+        buf_int(why, C_ITEMS.data[best]);
+        buf_str(why, c" of ");
+        buf_int(why, C_COUNT);
+        buf_str(why, if C_COUNT == 1 { c" item, " } else { c" items, " });
+        buf_int(why, C_LINES.data[best]);
+        buf_str(why, c" of ");
+        buf_int(why, C_TOTAL);
+        buf_str(why, c" lines");
+        C_NAME.data[best]
+    }
+}
+
+// How well part g can be named (per mille of its lines its best name
+// covers, names taken or not): the parts are named best first, so that a
+// part does not take the name another fits better.
+pub fn part_score(m: i64, g: i64, group: *i64, items: *IntVec, lines: *i64, n: i64) -> i64 {
+    unsafe {
+        collect(g, group, items, lines, n);
+        let none = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let best = best_candidate(m, &none);
+        if best < 0 || C_TOTAL == 0 { 0 } else { C_LINES.data[best] * 1000 / C_TOTAL }
+    }
+}
+
+// The candidates of part g, with its lines (C_TOTAL) and items (C_COUNT).
+fn collect(g: i64, group: *i64, items: *IntVec, lines: *i64, n: i64) {
+    unsafe {
+        C_KIND.count = 0;
+        C_NAME.count = 0;
+        C_FROM.count = 0;
+        C_LINES.count = 0;
+        C_ITEMS.count = 0;
+        C_TOTAL = 0;
+        C_COUNT = 0;
+        for i in 0..n {
+            if group[i] != g {
+                continue;
+            }
+            let u = (*items).data[i];
+            let d = UN_DEF.data[u];
+            let l = lines[i];
+            C_TOTAL += l;
+            C_COUNT += 1;
+            let b = group_banner(u);
+            if b >= 0 {
+                let name = banner_name(b);
+                if name >= 0 {
+                    add_candidate(C_BANNER, name, b, l);
+                }
+            }
+            let t = operand_type(d);
+            if t >= 0 {
+                add_candidate(C_TYPE, snake(SYMS[t].text), t, l);
+            }
+            let s = SYMS[DEFS[d].name].text;
+            let first = word_at(s, true);
+            if first >= 0 {
+                add_candidate(C_PREFIX, first, first, l);
+            }
+            let last = word_at(s, false);
+            if last >= 0 && last != first {
+                add_candidate(C_SUFFIX, last, last, l);
+            }
+        }
+    }
+}
+
+// The best candidate whose name is free: the most lines (at least a third
+// of the part's), then the kind's order; a prefix or suffix of two items
+// or more. -1 for none.
+fn best_candidate(m: i64, taken: *IntVec) -> i64 {
+    unsafe {
+        let mut best = -1;
+        for c in 0..C_KIND.count {
+            if C_LINES.data[c] * 3 < C_TOTAL || !free_name(m, C_NAME.data[c], taken) {
+                continue;
+            }
+            if (C_KIND.data[c] == C_PREFIX || C_KIND.data[c] == C_SUFFIX) && C_ITEMS.data[c] < 2 {
+                continue;
+            }
+            if best < 0 || C_LINES.data[c] > C_LINES.data[best]
+                || (C_LINES.data[c] == C_LINES.data[best] && C_KIND.data[c] < C_KIND.data[best]) {
+                best = c;
+            }
+        }
+        best
+    }
+}
+
+// The names of --names (a,b,c) into out, for the `parts` parts that
+// leave m, in order (fewer: the others are found); false after a
+// diagnostic.
+pub fn names_given(m: i64, out: *IntVec, parts: i64) -> bool {
+    unsafe {
+        let s = c_slice(OPT_NAMES);
+        let mut i = 0;
+        while i < s.len {
+            let mut e = i;
+            while e < s.len && s[e] != ',' {
+                e += 1;
+            }
+            let w = s[i..e];
+            i = e + 1;
+            if w.len == 0 {
+                continue;
+            }
+            let name = intern(w);
+            if !free_name(m, name, out) {
+                let d = diag(c"error", c"refactor.collision");
+                buf_str(d, c"--names: '");
+                buf_bytes(d, w);
+                buf_str(d, c"' is not an identifier, or a name ");
+                buf_bytes(d, SYMS[mod_fqn(m)].text);
+                buf_str(d, c" or another part has\n");
+                return false;
+            }
+            out.push(name);
+        }
+        if (*out).count > parts {
+            let d = diag(c"error", c"refactor.usage");
+            buf_str(d, c"--names gives ");
+            buf_int(d, (*out).count);
+            buf_str(d, c" names for ");
+            buf_int(d, parts);
+            buf_str(d, if parts == 1 { c" part\n" } else { c" parts\n" });
+            let t = try_begin(c"split", SYMS[mod_fqn(m)].text, true);
+            buf_str(t, c" --plan --max-lines ");
+            buf_int(t, OPT_MAX_LINES);
+            try_end(t);
+            return false;
+        }
+        true
+    }
+}
+
+// Whether `name` can name a new child of m: an identifier, not a name m
+// has (nor m's own: `gen::gen`), nor one a part before took.
+pub fn free_name(m: i64, name: i64, taken: *IntVec) -> bool {
+    unsafe {
+        if !is_ident(SYMS[name].text) || item_binding(m, name) >= 0 || use_binding(m, name) >= 0
+            || child_module(m, name) >= 0 || name == region_name(m) {
+            return false;
+        }
+        for j in 0..(*taken).count {
+            if (*taken).data[j] == name {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// Adds l lines of an item to candidate (kind, name).
+fn add_candidate(kind: i64, name: i64, from: i64, l: i64) {
+    unsafe {
+        for c in 0..C_KIND.count {
+            if C_KIND.data[c] == kind && C_FROM.data[c] == from {
+                C_LINES.data[c] += l;
+                C_ITEMS.data[c] += 1;
+                return;
+            }
+        }
+        C_KIND.push(kind);
+        C_NAME.push(name);
+        C_FROM.push(from);
+        C_LINES.push(l);
+        C_ITEMS.push(1);
+    }
+}
+
+// The banner heading the group of unit u: its start, or -1.
+fn group_banner(u: i64) -> i64 {
+    unsafe {
+        let f = UN_FILE.data[u];
+        let mut v = u;
+        while v >= 0 && UN_FILE.data[v] == f {
+            if UN_BANNER.data[v] >= 0 {
+                return UN_BANNER.data[v];
+            }
+            v -= 1;
+        }
+        -1
+    }
+}
+
+// The first line of the banner at b, as written (without its indentation
+// and line end).
+fn banner_line(b: i64) -> [u8] {
+    unsafe {
+        let mut a = b;
+        while SRC[a] == ' ' || SRC[a] == '\t' {
+            a += 1;
+        }
+        let mut e = after_line(a);
+        while e > a && (SRC[e - 1] == '\n' || SRC[e - 1] == '\r' || SRC[e - 1] == ' ') {
+            e -= 1;
+        }
+        SRC[a..e]
+    }
+}
+
+// A name from the banner at b: the words of its first line (its rules
+// dropped, up to a `:`, `.`, `(` or `;`) but the small ones, the first
+// two joined by `_` (`// ---- Pattern matching ----`: pattern_matching);
+// -1 for none.
+fn banner_name(b: i64) -> i64 {
+    unsafe {
+        if !comment_line(b) {
+            return -1;
+        }
+        let s = banner_line(b);
+        let out = buf_new();
+        let mut words = 0;
+        let mut i = 2;
+        while i < s.len && words < 2 {
+            let c = s[i];
+            if c == ':' || c == '.' || c == '(' || c == ';' || c == ',' {
+                break;
+            }
+            if !is_alnum(c) {
+                i += 1;
+                continue;
+            }
+            let mut e = i;
+            while e < s.len && is_alnum(s[e]) {
+                e += 1;
+            }
+            let w = s[i..e];
+            // (`the type's`: the word is `type`)
+            if e < s.len && s[e] == '\'' {
+                e += 1;
+                while e < s.len && is_alnum(s[e]) {
+                    e += 1;
+                }
+            }
+            i = e;
+            if w.len < 2 || small_word(w) || (w[0] >= '0' && w[0] <= '9') {
+                continue;
+            }
+            if words > 0 {
+                buf_byte(out, '_');
+            }
+            for x in 0..w.len {
+                buf_byte(out, lower(w[x]));
+            }
+            words += 1;
+        }
+        if words == 0 {
+            return -1;
+        }
+        intern(buf_slice(out))
+    }
+}
+
+// The type item d operates on: a struct, enum or trait itself, or the
+// named type of a function's first parameter (behind pointers, slices
+// and arrays) that is not a primitive nor a one-letter generic; -1.
+fn operand_type(d: i64) -> i64 {
+    unsafe {
+        let k = DEFS[d].kind;
+        if k == K_STRUCT || k == K_ENUM || k == K_TRAIT {
+            return DEFS[d].name;
+        }
+        if k != K_FN {
+            return -1;
+        }
+        let f = DEFS[d].node;
+        if f <= 0 || NODES[f].kind != NodeKind::Fn || NODES[f].count == 0 {
+            return -1;
+        }
+        let mut t = NODES[child(f, 0)].b;
+        while t > 0 && (NODES[t].kind == NodeKind::TyPtr || NODES[t].kind == NodeKind::TySlice || NODES[t].kind == NodeKind::TyArray) {
+            t = NODES[t].a;
+        }
+        if t <= 0 || NODES[t].kind != NodeKind::TyName {
+            return -1;
+        }
+        let name = NODES[t].a;
+        let s = SYMS[name].text;
+        if s.len < 2 || primitive(s) || general_type(name) {
+            return -1;
+        }
+        name
+    }
+}
+
+// Whether the type named `name` is a general one (a vector, a map: used
+// in more than a quarter of the program's modules, and in five or more),
+// which names no part: what the items have in common is elsewhere.
+fn general_type(name: i64) -> bool {
+    unsafe {
+        let known = GENERAL.get(name + 1);
+        if known != 0 {
+            return known == 2;
+        }
+        let mut modules = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        let mut count = 0;
+        for k in 0..REFS.count {
+            let r = REFS.data[k];
+            let d = R_DEF.data[r];
+            let kind = DEFS[d].kind;
+            if DEFS[d].name != name || (kind != K_STRUCT && kind != K_ENUM && kind != K_TRAIT) {
+                continue;
+            }
+            let m = module_at(R_POS.data[r]);
+            if modules.get(m + 1) == 0 {
+                modules.put(m + 1, 1);
+                count += 1;
+            }
+        }
+        let general = count >= 5 && count * 4 > module_count();
+        GENERAL.put(name + 1, if general { 2 } else { 1 });
+        general
+    }
+}
+
+// The first (or last) word of a name, lower case: between underscores,
+// or at a capital after a small letter; -1 when it is the whole name, a
+// small word or shorter than 3.
+fn word_at(s: [u8], first: bool) -> i64 {
+    let mut a = 0;
+    let mut e = s.len;
+    if first {
+        e = 1;
+        while e < s.len && s[e] != '_' && !(is_upper(s[e]) && !is_upper(s[e - 1])) {
+            e += 1;
+        }
+    } else {
+        a = s.len - 1;
+        while a > 0 && s[a - 1] != '_' && !(is_upper(s[a]) && !is_upper(s[a - 1])) {
+            a -= 1;
+        }
+    }
+    if e - a == s.len || e - a < 3 {
+        return -1;
+    }
+    let w = s[a..e];
+    if small_word(w) {
+        return -1;
+    }
+    let out = buf_new();
+    for x in 0..w.len {
+        if w[x] != '_' {
+            buf_byte(out, lower(w[x]));
+        }
+    }
+    unsafe {
+        if BUFS[out].len < 3 {
+            return -1;
+        }
+    }
+    intern(buf_slice(out))
+}
+
+// A type's name in snake case: `IntVec` is int_vec, `HMap` hmap.
+fn snake(s: [u8]) -> i64 {
+    let out = buf_new();
+    for i in 0..s.len {
+        if i > 0 && is_upper(s[i]) && !is_upper(s[i - 1]) && s[i - 1] != '_' {
+            buf_byte(out, '_');
+        }
+        buf_byte(out, lower(s[i]));
+    }
+    intern(buf_slice(out))
+}
+
+fn is_alnum(c: u8) -> bool {
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+}
+
+fn is_upper(c: u8) -> bool {
+    c >= 'A' && c <= 'Z'
+}
+
+fn lower(c: u8) -> u8 {
+    if is_upper(c) { c + 32 } else { c }
+}
+
+// Whether w is a word too small to name a part (case ignored).
+fn small_word(w: [u8]) -> bool {
+    unsafe { in_list(w, c" a an the and or of for from with into to in on at by its it is are be as get put set new run add has all one two this that these those what how when which ") }
+}
+
+fn primitive(w: [u8]) -> bool {
+    unsafe { in_list(w, c" i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 bool Self ") }
+}
+
+// Whether w (case ignored) is one of the words of list (` a b `).
+fn in_list(w: [u8], list: *u8) -> bool {
+    unsafe {
+        let words = c_slice(list);
+        let mut i = 1;
+        while i < words.len {
+            let mut e = i;
+            while e < words.len && words[e] != ' ' {
+                e += 1;
+            }
+            if e - i == w.len {
+                let mut same = true;
+                for x in 0..w.len {
+                    if lower(w[x]) != words[i + x] && w[x] != words[i + x] {
+                        same = false;
+                    }
+                }
+                if same {
+                    return true;
+                }
+            }
+            i = e + 1;
+        }
+        false
+    }
+}

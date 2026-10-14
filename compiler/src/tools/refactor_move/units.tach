@@ -4,29 +4,29 @@
 
 use crate::front::ast::{NODES, NODE_COUNT, NodeKind, child};
 use crate::base::{
-    BUFS, FILES, IntVec, SRC, STDOUT, SYMS, alloc_array, buf_byte, buf_bytes, buf_int, buf_new,
-    buf_slice, buf_str, buf_write_fd, intern,
+    FILES, IntVec, SRC, STDOUT, SYMS, alloc_array, buf_byte, buf_bytes, buf_int, buf_new, buf_slice,
+    buf_str, buf_write_fd,
 };
 use crate::tools::edit::items::{after_line, blank_line, node_head};
 use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
 use crate::middle::lower::ssa::HMap;
-use crate::front::modules::{child_module, file_of_pos, module_at, module_of};
+use crate::front::modules::{file_of_pos, module_at, module_of};
 use crate::tools::plan::deps::cluster;
-use crate::tools::query::{OPT_MAX_LINES, QF_DEF, c_slice};
+use crate::tools::query::{OPT_MAX_LINES, QF_DEF};
 use crate::tools::query::defs::{
-    DEFS, DEF_COUNT, K_ENUM, K_IMPL_METHOD, K_METHOD, K_MOD, K_STRUCT, K_TRAIT, bytes_eq, mod_fqn,
+    DEFS, DEF_COUNT, K_ENUM, K_IMPL_METHOD, K_METHOD, K_MOD, K_STRUCT, K_TRAIT, mod_fqn,
 };
-use crate::tools::query::diagnostics::{
-    PROG, ROOT_GIVEN, diag, put_cword, sym_less, try_begin, try_end,
-};
+use crate::tools::query::diagnostics::{PROG, ROOT_GIVEN, diag, put_cword, try_begin, try_end};
 use crate::tools::query::refs::{R_DEF, R_FLAGS, R_POS};
 use crate::tools::query::positions::{line_end, line_start, token_at};
 use crate::tools::refactor_mod::{
-    REFS, comment_line, emit_regions, item_binding, make_module, own_file, region_name, use_binding,
+    REFS, comment_line, emit_regions, is_new, item_binding, make_module, own_file,
 };
 use crate::tools::refactor_move::{MV_DEF, MV_DEST, add_block, in_block, move_edits};
 use crate::tools::refactor_move::imports::DROPPED;
-use crate::tools::refactor_mod::cli::{OPT_KEEP_IMPLS, OPT_PLAN, finish, is_ident};
+use crate::tools::refactor_mod::cli::{OPT_KEEP_IMPLS, OPT_NAMES, OPT_PLAN, finish};
+use crate::tools::refactor_move::naming::{names_given, part_name, part_score};
+use crate::tools::refactor_move::place::place_ends_group;
 
 // ---- Units: the top-level pieces of a file ----
 
@@ -36,41 +36,41 @@ const U_IMPL: i64 = 2;
 
 const U_EXTERN: i64 = 3;
 
-const U_OTHER: i64 = 4;
+pub const U_OTHER: i64 = 4;
 
 // Per unit: its text (from the comment and attribute lines above it to
 // after its last line), its first and last tokens, its kind, its item (an
 // impl's type when it is an item of the module), an impl's trait, its
 // file, the start of the banner above it (-1), where it moves (-1).
-static mut UN_START: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut UN_START: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
-static mut UN_END: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut UN_END: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
 pub static mut UN_FIRST: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
-static mut UN_LAST: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut UN_LAST: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
-static mut UN_KIND: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut UN_KIND: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
-static mut UN_DEF: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut UN_DEF: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
 static mut UN_TRAIT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
-static mut UN_FILE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut UN_FILE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
-static mut UN_BANNER: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut UN_BANNER: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
 static mut UN_DEST: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
 // The unit of an item (definition + 1 -> unit + 1), files done.
-static mut UNIT_OF: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+pub static mut UNIT_OF: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
 
 static mut UNITS_DONE: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
 
 // The top-level definitions by the token index of their start.
 static mut DEF_TOK: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
 
-fn closing(i: i64) -> i64 {
+pub fn closing(i: i64) -> i64 {
     unsafe {
         let mut depth = 0;
         let mut j = i;
@@ -290,7 +290,7 @@ fn banners(f: i64, first: i64) {
 }
 
 // The unit holding position pos (of a file whose units are made), or -1.
-fn unit_at(pos: i64) -> i64 {
+pub fn unit_at(pos: i64) -> i64 {
     unsafe {
         for u in 0..UN_START.count {
             if UN_START.data[u] <= pos && pos < UN_END.data[u] {
@@ -409,9 +409,12 @@ pub fn make_blocks() -> bool {
             }
         }
         // The banners (0.12): each goes where most of its group's lines go
-        // (it stays when most of them do), above the group's first unit
-        // going there: with that unit's block when it is the group's
-        // first, else in a block of its own.
+        // (it stays when most of them do), with the block of the group's
+        // first unit. 0.13: with its whole group (into a new module, the
+        // part of a split: most of it, its first unit too), and into the
+        // middle of a module (move --after, --before) only where a group
+        // ends (it would head the units of another group there): so a move
+        // and the move back leave it where it was.
         let mut with_unit = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
         for u in 0..UN_START.count {
             if UN_BANNER.data[u] < 0 {
@@ -439,22 +442,14 @@ pub fn make_blocks() -> bool {
                 }
             }
             let to = dests.data[best];
-            if to < 0 {
+            if to < 0 || UN_DEST.data[u] != to || (dests.count > 1 && !is_new(to)) || !place_ends_group() {
                 continue;
-            }
-            let mut w = u;
-            while UN_DEST.data[w] != to {
-                w += 1;
             }
             let mut e = UN_BANNER.data[u];
             while comment_line(e) {
                 e = after_line(e);
             }
-            if w == u {
-                with_unit.put(u + 1, e + 1);
-            } else {
-                add_block(UN_BANNER.data[u], UN_START.data[u], to, -2, e);
-            }
+            with_unit.put(u + 1, e + 1);
         }
         // The units that move.
         for u in 0..UN_START.count {
@@ -508,7 +503,7 @@ pub fn import_anchor(m: i64, after: *bool) -> i64 {
 }
 
 // The lines of SRC[a..b).
-fn lines_of(a: i64, b: i64) -> i64 {
+pub fn lines_of(a: i64, b: i64) -> i64 {
     unsafe {
         let mut n = 0;
         for p in a..b {
@@ -628,11 +623,41 @@ pub fn split_plan(m: i64, f: i64, root: *u8) -> i64 {
                 stay = g;
             }
         }
-        // Their names.
+        // Their names (0.13): --names, else from what their items share.
         let mut names = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut whys = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut given = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        if OPT_NAMES != 0 as *u8 && !names_given(m, &given, parts.count - 1) {
+            return 2;
+        }
+        // (the parts --names does not name: the best named first)
+        let mut j = 0;
+        let score = alloc_array::<i64>(parts.count + 1);
         for k in 0..parts.count {
             let g = parts.data[k];
-            names.push(if g == stay { -1 } else { part_name(m, g, group, &items, n, &names, k) });
+            whys.push(buf_new());
+            names.push(-1);
+            score[k] = -1;
+            if g != stay && j < given.count {
+                names.data[k] = given.data[j];
+                buf_str(whys.data[k], c"--names");
+                j += 1;
+            } else if g != stay {
+                score[k] = part_score(m, g, group, &items, lines, n);
+            }
+        }
+        loop {
+            let mut next = -1;
+            for k in 0..parts.count {
+                if score[k] >= 0 && (next < 0 || score[k] > score[next]) {
+                    next = k;
+                }
+            }
+            if next < 0 {
+                break;
+            }
+            score[next] = -1;
+            names.data[next] = part_name(m, parts.data[next], group, &items, lines, n, &names, next, whys.data[next]);
         }
         if OPT_PLAN {
             let out = buf_new();
@@ -648,8 +673,16 @@ pub fn split_plan(m: i64, f: i64, root: *u8) -> i64 {
             for k in 0..parts.count {
                 let g = parts.data[k];
                 if g == stay {
+                    buf_str(out, c" # stays in ");
+                    buf_bytes(out, SYMS[mod_fqn(m)].text);
+                    buf_str(out, c": the part most used from other modules\n");
                     continue;
                 }
+                buf_str(out, c" # ");
+                buf_bytes(out, SYMS[names.data[k]].text);
+                buf_str(out, c": ");
+                buf_bytes(out, buf_slice(whys.data[k]));
+                buf_byte(out, '\n');
                 put_cword(out, PROG);
                 buf_str(out, c" refactor split ");
                 buf_bytes(out, SYMS[mod_fqn(m)].text);
@@ -677,7 +710,7 @@ pub fn split_plan(m: i64, f: i64, root: *u8) -> i64 {
             // (the out buffer starts with a space before each command)
             buf_write_fd(trim_lines(out), STDOUT);
             let e = diag(c"note", c"refactor.plan");
-            buf_str(e, c"the same in one edit: --auto\n");
+            buf_str(e, c"the same in one edit: --auto (other names: --names a,b)\n");
             let t = try_begin(c"split", SYMS[mod_fqn(m)].text, true);
             buf_str(t, c" --auto --max-lines ");
             buf_int(t, max);
@@ -733,103 +766,5 @@ fn trim_lines(b: i64) -> i64 {
             i += 1;
         }
         out
-    }
-}
-
-// A name for part g of module m (the k-th part): the word of its items'
-// names that is the most its own (weighted by their lines, against the
-// other parts'), not a name of m nor of a part before; `partK` else.
-fn part_name(m: i64, g: i64, group: *i64, items: *IntVec, n: i64, taken: *IntVec, k: i64) -> i64 {
-    unsafe {
-        let mut mine = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-        let mut theirs = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-        let mut words = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for i in 0..n {
-            let u = (*items).data[i];
-            let d = UN_DEF.data[u];
-            let l = 1000 + lines_of(UN_START.data[u], UN_END.data[u]);
-            let s = SYMS[DEFS[d].name].text;
-            let mut a = 0;
-            while a < s.len {
-                // (words: between underscores and at capitals)
-                let mut e = a + 1;
-                while e < s.len && s[e] != '_' && !(s[e] >= 'A' && s[e] <= 'Z' && s[e - 1] >= 'a' && s[e - 1] <= 'z') {
-                    e += 1;
-                }
-                let b = buf_new();
-                for x in a..e {
-                    let c = s[x];
-                    if c != '_' {
-                        buf_byte(b, if c >= 'A' && c <= 'Z' { c + 32 } else { c });
-                    }
-                }
-                if BUFS[b].len >= 3 {
-                    let w = intern(buf_slice(b));
-                    if group[i] == g {
-                        if mine.get(w + 1) == 0 {
-                            words.push(w);
-                        }
-                        mine.put(w + 1, mine.get(w + 1) + l);
-                    } else {
-                        theirs.put(w + 1, theirs.get(w + 1) + l);
-                    }
-                }
-                a = e;
-                while a < s.len && s[a] == '_' {
-                    a += 1;
-                }
-            }
-        }
-        let mut best = -1;
-        let mut best_score = 0;
-        for i in 0..words.count {
-            let w = words.data[i];
-            let text = SYMS[w].text;
-            // (not a name m has, nor m's own: `gen::gen`)
-            if !is_ident(text) || item_binding(m, w) >= 0 || use_binding(m, w) >= 0 || child_module(m, w) >= 0
-                || w == region_name(m) || stop_word(text) {
-                continue;
-            }
-            let mut used = false;
-            for j in 0..(*taken).count {
-                if (*taken).data[j] == w {
-                    used = true;
-                }
-            }
-            if used {
-                continue;
-            }
-            // (how much it is here, times how much it is only here)
-            let score = mine.get(w + 1) * mine.get(w + 1) / (mine.get(w + 1) + 2 * theirs.get(w + 1) + 1);
-            if best < 0 || score > best_score || (score == best_score && sym_less(w, best)) {
-                best = w;
-                best_score = score;
-            }
-        }
-        if best >= 0 {
-            return best;
-        }
-        let b = buf_new();
-        buf_str(b, c"part");
-        buf_int(b, k + 1);
-        intern(buf_slice(b))
-    }
-}
-
-fn stop_word(w: [u8]) -> bool {
-    unsafe {
-        let words = c_slice(c" the and for from with into get put set new run add has the all one two is_ ");
-        let mut i = 1;
-        while i < words.len {
-            let mut e = i;
-            while e < words.len && words[e] != ' ' {
-                e += 1;
-            }
-            if bytes_eq(words[i..e], w) {
-                return true;
-            }
-            i = e + 1;
-        }
-        false
     }
 }

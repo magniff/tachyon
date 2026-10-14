@@ -7,11 +7,11 @@ source into folders with no file over 1,000 lines.
 
 ```
 tachyonc refactor rename PATH NEW [ROOT]
-tachyonc refactor move PATH... --to MODULE [--keep-impls] [--no-tidy]     (or: move PATH MODULE)
+tachyonc refactor move PATH... --to MODULE [--after ITEM|--before ITEM] [--keep-impls] [--no-tidy]
 tachyonc refactor new-module crate::a::b [--file|--dir]
 tachyonc refactor move-module crate::a crate::x::b
 tachyonc refactor split MODULE --into NEWMOD --items a,b,c [--keep-impls] [--reexport] [--header TEXT]
-tachyonc refactor split MODULE --plan|--auto [--max-lines N] [--reexport]
+tachyonc refactor split MODULE --plan|--auto [--max-lines N] [--names a,b] [--reexport]
 ```
 
 Every one is one edit of the edit engine ([refactor.md](refactor.md)):
@@ -71,10 +71,13 @@ exception:
 **Banners.** A banner is a block of comment lines with a blank line
 after it, after some code in the file (a comment at the top of a file
 is the file's, and never moves): `// ---- Scaling ----`. It heads the
-items after it, up to the next banner: its group. It goes (0.12) where
-most of its group's lines go: above the first item of the group that
-goes there, with one blank line after it; it stays when most of them
-stay.
+items after it, up to the next banner: its group. It goes with its
+group, above it (0.13: with all of it, so that a move and the move back
+leave it where it was; into a new module, the part `split` makes, with
+the item right under it and most of the group's lines). It stays when
+the group does not all go, and with `--after`/`--before` unless the
+place ends a group (an item followed by a banner, or by nothing): it
+would head the items after it there.
 
 **Impl blocks.** A type's impl blocks in its module move with it: its
 inherent impls and its trait impls (`--keep-impls` leaves them). A
@@ -88,9 +91,28 @@ an `extern "C" { }` block of its own in the new module; the whole block
 moves when all its functions do.
 
 **Where it goes.** At the end of the module's file; into a new module's
-file after its imports. Items that were next to each other (no blank
-line between: a run of constants) stay so (0.12); the others get a
-blank line before them.
+file after its imports; with `--after ITEM` or `--before ITEM` (0.13),
+next to that item of the module (`refactor.anchor` when it has none of
+that name with lines of its own). Items that had only blank lines
+between them keep them, as many as there were (0.13; 0.12: a run of
+constants stayed one); the others get a blank line before them.
+
+**Blank lines (0.13).** The moved lines go with the blank lines on one
+side: the ones after them stay, for what follows; the ones before them
+when they start a run of one-line items of their kind (constants,
+statics) that goes on after them, or follow a `use` line, a banner or
+the file's start. Lines that were inside a run of another kind leave it
+joined, as the run is written there. Where they go, the blank lines
+there stay with what follows, and they get one blank line before them,
+or join a run of their kind as it is written there (from its items
+next to each other: none, or as many as the file has). A banner that
+heads nothing (its items moved out) takes items put `--after` the item
+before it. So a move and the move back, `--after` the item that was
+before (or `--before` the one after, for the first item of a banner's
+group), leave every file byte for byte as it was:
+`tests/refactor/roundtrip.sh` checks it on random items (40 in the
+suite; `-n 1000` for more). Not restored: a gap above an item larger
+than the one below it (two blank lines, then one).
 
 **A new file's header (0.12).** A module that `split` makes starts with
 a header comment: `--header TEXT` (with `--into`), else the banner its
@@ -176,11 +198,15 @@ most N lines, as the commands that make it, one per line, to run in
 order (or edit first):
 
 ```
-# crate::check→4785 lines→8 parts of at most 1000 lines
-tachyonc refactor split crate::check --into crate::check::index --items SCOPES,type_error,...
+# crate::middle::gvn→932 lines→6 parts of at most 300 lines
+# stays in crate::middle::gvn: the part most used from other modules
+# walk: banner '// ---- The walk ----': 1 of 8 items, 87 of 142 lines
+tachyonc refactor split crate::middle::gvn --into crate::middle::gvn::walk --items DOM_START,...
+# memory_values: banner '// ---- Memory values ----': 5 of 6 items, 136 of 141 lines
+tachyonc refactor split crate::middle::gvn --into crate::middle::gvn::memory_values --items copy_src,...
 ...
-note refactor.plan: the same in one edit: --auto
-try: tachyonc refactor split crate::check --auto --max-lines 1000
+note refactor.plan: the same in one edit: --auto (other names: --names a,b)
+try: tachyonc refactor split crate::middle::gvn --auto --max-lines 300
 ```
 
 The parts come from `query deps`'s clustering (average linkage, then
@@ -189,10 +215,25 @@ impl block counted with its type (or its trait), at most N lines less
 what stays in MODULE (its comments, imports, `mod` lines, extern blocks,
 impls of other types) and 20 for the imports. The part most used from
 other modules stays in MODULE; each other one becomes a child module,
-named after the word of its items' names most its own (`check::local`,
-`regalloc::live`; not a name MODULE has; `partK` else) — `refactor
-rename` renames it after. `--auto` makes the plan in one edit. A module
-of at most N lines: `note refactor.fits`.
+named (0.13) after what its items share, the reason on the line above
+its command:
+
+- `banner`: the banner most of its lines are under, its first two words
+  (`// ---- Pattern matching ----`: `pattern_matching`);
+- `type`: the type most of its lines operate on, a struct, enum or trait
+  of the part (with its impl blocks) or the type of its functions' first
+  parameter (`*Liveness`: `liveness`), not a general one (used in more
+  than a quarter of the program's modules: `IntVec`);
+- `prefix`, `suffix`: the first or last word most of its items' names
+  have (`emit_`, `_imports`), of two items or more.
+
+The candidate covering the most lines wins (a third of them at least;
+on a tie, in that order), when it is not a name MODULE has nor one a part
+took: the parts that name best are named first. Else `partK`, said so.
+`--names a,b` gives the names, in the order of the plan's parts (fewer:
+the others are found; more: `refactor.usage`; a name taken:
+`refactor.collision`). `--auto` makes the plan in one edit. A module of
+at most N lines: `note refactor.fits`.
 
 ## In a script
 
@@ -233,4 +274,3 @@ found no file over, the copy built with target/tachyonc, and
 - Paths written from `crate` are long (0.12: imports are tidied, merged
   into a `use` of the same path, but `use crate::a::b::f` and `use
   b::f` are two paths).
-- Names of `--plan`'s parts are guesses: rename them.

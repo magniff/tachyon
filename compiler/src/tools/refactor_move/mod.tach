@@ -21,8 +21,10 @@
 // the imports of the old module that nothing names any more are removed.
 // Nothing else changes, byte for byte.
 
+pub mod naming;
 mod units;
 pub mod imports;
+mod place;
 
 use crate::base::{
     BUFS, FILES, IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
@@ -49,8 +51,12 @@ use crate::tools::refactor_move::imports::{
     remove_use_names, rewrite_imports,
 };
 use crate::tools::refactor_mod::cli::{
-    OPT_AUTO, OPT_HEADER, OPT_INTO, OPT_ITEMS, OPT_PLAN, OPT_REEXPORT, TIDY_AFTER, finish,
-    inline_module, make_path, module_named, no_module, one_definition, path_segments,
+    OPT_AFTER, OPT_AUTO, OPT_BEFORE, OPT_HEADER, OPT_INTO, OPT_ITEMS, OPT_PLAN, OPT_REEXPORT,
+    TIDY_AFTER, finish, inline_module, make_path, module_named, no_module, one_definition,
+    path_segments,
+};
+use crate::tools::refactor_move::place::{
+    RUN_GAP, RUN_KEY, anchor_unit, delete_moved, place_moved, run_key_at,
 };
 
 // ---- Blocks: the text that moves ----
@@ -363,7 +369,12 @@ pub fn move_edits() -> bool {
                 && only_blank(BL_END.data[j], BL_START.data[j + 1]) {
                 j += 1;
             }
-            delete_lines(BL_START.data[k], BL_END.data[j]);
+            if BL_WRAP.data[k] >= 0 || BL_WRAP.data[j] >= 0 {
+                delete_lines(BL_START.data[k], BL_END.data[j]);
+            } else {
+                let last = if BL_WRAP.data[j] == -1 { run_key_at(BL_START.data[j]) } else { 0 };
+                delete_moved(BL_START.data[k], BL_END.data[j], if BL_WRAP.data[k] == -1 { run_key_at(BL_START.data[k]) } else { 0 }, last);
+            }
             k = j + 1;
         }
         // The other edits.
@@ -418,9 +429,12 @@ pub fn move_edits() -> bool {
             let r = dests.data[i];
             let body = buf_new();
             let mut k = 0;
-            // (the block before, to keep adjacent ones together: a run of
-            // constants stays one, 0.12)
+            // (the block before, to keep the blank lines between blocks
+            // that had only blank lines between them: a run of constants
+            // stays one, 0.12; as many blank lines as there were, 0.13)
             let mut prev = -1;
+            let mut first_key = -1;
+            let mut last_key = 0;
             while k < BL_START.count {
                 if BL_DEST.data[k] != r {
                     k += 1;
@@ -451,12 +465,33 @@ pub fn move_edits() -> bool {
                         text = text[0..text.len - 1];
                     }
                 }
-                let adjacent = prev >= 0 && BL_END.data[prev] == BL_START.data[k] && BL_WRAP.data[k] < 0
-                    && BL_WRAP.data[prev] == -1;
-                if BUFS[body].len > 0 && !adjacent && text.len > 0 {
-                    buf_byte(body, '\n');
+                let mut gap = 1;
+                let mut exact = false;
+                if prev >= 0 && BL_WRAP.data[k] < 0 && BL_WRAP.data[prev] == -1 && BL_END.data[prev] <= BL_START.data[k]
+                    && file_of_pos(BL_START.data[prev]) == file_of_pos(BL_START.data[k])
+                    && only_blank(BL_END.data[prev], BL_START.data[k]) {
+                    gap = 0;
+                    exact = true;
+                    for p in BL_END.data[prev]..BL_START.data[k] {
+                        if SRC[p] == '\n' {
+                            gap += 1;
+                        }
+                    }
+                }
+                if BUFS[body].len > 0 && text.len > 0 {
+                    for _ in 0..gap {
+                        buf_byte(body, '\n');
+                    }
                 }
                 let x = BL_WRAP.data[k];
+                let key = if x == -1 { run_key_at(BL_START.data[k]) } else { 0 };
+                if first_key < 0 {
+                    first_key = key;
+                } else if key > 0 && key == last_key && exact {
+                    RUN_KEY = key;
+                    RUN_GAP = gap;
+                }
+                last_key = key;
                 if x < 0 {
                     buf_bytes(body, text);
                     prev = k;
@@ -480,6 +515,10 @@ pub fn move_edits() -> bool {
             }
             if is_new(r) {
                 buf_bytes(NM_BODY.data[r - module_count()], buf_slice(body));
+                continue;
+            }
+            if PLACE_AT >= 0 && r == MV_DEST.data[0] {
+                place_moved(PLACE_AT, PLACE_BEFORE, buf_slice(body), first_key, last_key);
                 continue;
             }
             let f = own_file(r);
@@ -595,6 +634,9 @@ pub fn run_move(words: *IntVec, to: *u8, root: *u8) -> i64 {
             buf_str(e, c"nothing to change\n");
             return 0;
         }
+        if (OPT_AFTER != 0 as *u8 || OPT_BEFORE != 0 as *u8) && !find_anchor(t) {
+            return 1;
+        }
         if !move_edits() {
             return 1;
         }
@@ -610,6 +652,51 @@ pub fn run_move(words: *IntVec, to: *u8, root: *u8) -> i64 {
         buf_str(what, c" to ");
         buf_bytes(what, SYMS[mod_fqn(t)].text);
         finish(what, root)
+    }
+}
+
+// (0.13) move --after ITEM / --before ITEM: the unit of ITEM, an item
+// of the module the items move to, that they go after (or before); -1:
+// at the module's end.
+pub static mut PLACE_AT: i64 = -1;
+pub static mut PLACE_BEFORE: bool = false;
+
+// Finds the item of --after or --before in module t (by its name there,
+// or its path): false after a diagnostic.
+fn find_anchor(t: i64) -> bool {
+    unsafe {
+        PLACE_BEFORE = OPT_AFTER == 0 as *u8;
+        let name = c_slice(if PLACE_BEFORE { OPT_BEFORE } else { OPT_AFTER });
+        // (a name of module t, or a path)
+        let mut d = -1;
+        if has_colons(name) {
+            d = one_definition(c"move", name, c_slice(c""));
+            if d < 0 {
+                return false;
+            }
+        } else {
+            d = item_binding(t, intern(name));
+        }
+        let mut moved = false;
+        for i in 0..MV_DEF.count {
+            if MV_DEF.data[i] == d {
+                moved = true;
+            }
+        }
+        let u = if d >= 0 && DEFS[d].module == t && !moved { anchor_unit(d) } else { -1 };
+        if u < 0 {
+            let e = diag(c"error", c"refactor.anchor");
+            buf_str(e, if PLACE_BEFORE { c"--before " } else { c"--after " });
+            buf_bytes(e, name);
+            buf_str(e, c": not an item of ");
+            buf_bytes(e, SYMS[mod_fqn(t)].text);
+            buf_str(e, if moved { c" that stays there\n" } else { c" with lines of its own (a function, type, constant, static)\n" });
+            let tr = try_begin(c"items", SYMS[mod_fqn(t)].text, true);
+            try_end(tr);
+            return false;
+        }
+        PLACE_AT = u;
+        true
     }
 }
 

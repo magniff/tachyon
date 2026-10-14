@@ -17,6 +17,8 @@ tachyonc refactor signature FN --add 'x: T = VALUE' [--at N] | --remove x
 tachyonc refactor field STRUCT --add 'g: T = VALUE' | --remove g | --rename g h | --type g T
 tachyonc refactor variant ENUM --add 'X(T, ...)' [--arm EXPR] | --remove V | --rename V W
 tachyonc rewrite 'PATTERN' 'REPLACEMENT' [--where '$x: T']... [--in FILE|MODULE]
+tachyonc refactor extract-function FN --lines A-B --to NEW          (0.13)
+tachyonc refactor inline FN [--at FILE:LINE] [--keep]                 (0.13)
 tachyonc refactor --script FILE
 ```
 
@@ -148,6 +150,89 @@ Nothing matches: `note rewrite.none`, exit 0; when sites matched but for
 computed (a generic function never instantiated) are left,
 `note rewrite.untyped`.
 
+## refactor extract-function (0.13)
+
+`refactor extract-function FN --lines A-B --to NEW`: the statements of
+lines A to B of FN's file (whole statements of one block of FN, the
+comments among them too) become a new function NEW, right after FN,
+called where they were:
+
+```
+$ tachyonc refactor extract-function mean_to --lines 40-43 --to add_all --show
+extracted lines 40-43 of crate::calc::mean_to into add_all(i, n, acc) -> i64→calc.tach→+6 -1 lines
+// calc.tach:40-44
+40→    i = add_all(i, n, &acc);
+...
+44→fn add_all(mut i: i64, n: i64, acc: *Acc) -> i64 {
+```
+
+- **Parameters**: the locals of FN the lines use and do not declare, in
+  the order of their first use, typed as declared (`x: T` as written,
+  else as the checker has it): by value; `mut` and given back when the
+  lines assign them (or use their value and take their address); by
+  pointer (`acc: *Acc`, called with `&acc`, the lines' `&acc` then
+  `acc`) when they only take their address or write their fields
+  (`acc.add(i)`, `p.x = 0`; an array indexed is passed by value).
+- **Result**: the locals the lines declare and FN uses after them (`let
+  x = NEW(...);`, several: `let (a, b) = NEW(...);`, `mut` where they
+  change after), or the one local declared before them that they assign
+  (`x = NEW(...);`), or the value they end the block with.
+- In unsafe code (an `unsafe { }` around the lines, an `unsafe fn`),
+  NEW's body is an `unsafe { }` block; in a method whose lines use
+  `self`, NEW is a method of the same impl (`self.NEW(...)`); else a
+  function after FN (after its impl block, for a method).
+- Refused, nothing written: lines that cut a statement or are not in
+  FN's body (`refactor.range`, `try:` the whole statements' lines);
+  control flow leaving them, a `return`, a `break` or `continue` of a
+  loop around them, a `defer` (`refactor.escapes`, `try:` the lines
+  before it); several results of which one was declared before them, or
+  results with the block's value (`refactor.results`); `self` in a trait
+  impl's function (`refactor.self`); a generic FN (`refactor.generic`);
+  NEW taken (`refactor.collision`).
+
+## refactor inline (0.13)
+
+`refactor inline FN`: every call of FN replaced by its body, then FN,
+when nothing else uses it, deleted with the names of the `use` lines
+importing it (`--keep` keeps it); `--at FILE:LINE`: the call on that
+line only, FN kept.
+
+```
+$ tachyonc refactor inline quad
+inlined crate::calc::quad at 1 call, deleted it→2 files→+10 -12 lines
+```
+
+- An argument is put in for its parameter when it is a name (not one
+  the body declares) or a literal, or when the body is one expression
+  using the parameter once and the argument is the only one that is
+  neither; else it is bound first, in order: `let x = ARG;` (`let mut`
+  when the body changes the parameter; renamed `x_2` when an argument
+  names `x`). A method's receiver is `self`: the receiver itself when
+  the method takes its address (`v.m()`) and its body uses `self` only
+  as `self.f` or `self.m(...)`.
+- The body becomes the call's value: its expression (in parentheses
+  when it binds looser than the call's place: `twice(1) * k` is `(1 +
+  1) * k`), else a block (`{ let x = ARG; ...; tail }`); a call that is
+  a statement of its own (`f(x);`) of a body with no locals and nothing
+  bound gets the body's statements in its place.
+- Into another module: the items the body names that are private
+  there are made `pub`, the imports of FN's module it needs are copied
+  (`use crate::ir::Op::Const;`), then rounds of `fix --only imports,pub`
+  and the imports tidied.
+- Refused: a body with a `return` (`refactor.escapes`), a call of FN in
+  its body (`refactor.recursive`), a generic or bodiless FN
+  (`refactor.generic`), an `extern "C"` one (`refactor.extern`), a name
+  of the body hidden by a local where it is called (`refactor.clash`),
+  a borrowed receiver the body uses as `self` otherwise
+  (`refactor.receiver`), no call (`refactor.no-call`), several on the
+  line of `--at` (`refactor.ambiguous`). A call in another call's
+  arguments is left (`note refactor.nested`: run it again).
+
+On a copy of the compiler's source (0.13), 66 extractions of random
+lines (the refusals' `try:` commands run as they are) and 70 inlines of
+small functions: none added an error, the copy built, and `same-output`
+against the compiler was identical (4668 compilations).
+
 ## refactor --script
 
 ```
@@ -208,6 +293,13 @@ as it changes the program through the edit engine (`edit_replace`,
 | `refactor.layout` | warning | 0 | a `#[repr(C)]` struct's layout changes | |
 | `refactor.discriminant` | warning | 0 | a removed variant renumbers the ones after it, and the enum is cast | |
 | `refactor.unchecked` | warning | 0 | calls in code the checker did not see are not changed | |
+| `refactor.range` | error | 1 | extract-function: the lines cut a statement, or are not in FN's body | the whole statements' lines |
+| `refactor.escapes` | error | 1 | extract-function: a return, break, continue or defer leaves the lines; inline: FN returns early | the lines before it; `query show FILE:LINE` |
+| `refactor.results` | error | 1 | extract-function: results NEW cannot give back | `query show FILE:LINE` |
+| `refactor.self`, `refactor.receiver` | error | 1 | self in a trait impl's function; a borrowed receiver used as `self` | |
+| `refactor.generic`, `refactor.recursive` | error | 1 | a generic or bodiless function; inline: FN calls itself | |
+| `refactor.no-call`, `refactor.ambiguous` | error | 1 | inline: no call (on the line of `--at`), several there | `query refs` |
+| `refactor.nested` | note | 0 | inline: calls left in the arguments of others | |
 | `refactor.script` | error | 1, 2 | a line is no command, a command failed: nothing written | |
 | `rewrite.pattern`, `rewrite.unbound` | error | 2 | the pattern or replacement does not parse, a hole alone, `$x...` outside a list, a hole of the replacement not in the pattern | |
 | `rewrite.bad-in` | error | 1 | `--in` names no file or module | |
