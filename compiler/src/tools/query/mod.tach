@@ -42,6 +42,7 @@ pub mod show;
 pub mod grep;
 pub mod sections;
 pub mod typeat;
+pub mod cache;
 
 use crate::base::{
     FILES, FILE_COUNT, IntVec, SRC, STDOUT, SYMS, _setjmp, alloc_array, alloc_zeroed, buf_byte,
@@ -82,6 +83,11 @@ use refs::{
 use sections::{OPT_BANNERS, show_section};
 use show::{find_modules, query_def, query_items, query_modules, query_show, text_start};
 use typeat::query_type;
+
+use crate::base::timer::{
+    TIME_PASSES, T_ANSWER, T_CHECK, T_INDEX, T_LOAD, T_PARSE, timer_add, timer_now, timer_report,
+};
+use crate::tools::query::cache::{cache_restore, cache_save};
 
 extern "C" {
     fn getenv(name: *u8) -> *u8;
@@ -207,6 +213,7 @@ pub fn root_or_diag(given: *u8, cmd: *u8, name: [u8], with_name: bool) -> *u8 {
 // ERR_BAIL.
 pub fn front_end(root: *u8, target0: i64) {
     unsafe {
+        let mut t = timer_now();
         ERR_KIND = c"tokenizer error";
         let paths = alloc_array::<*u8>(1);
         paths[0] = root;
@@ -227,6 +234,8 @@ pub fn front_end(root: *u8, target0: i64) {
         let dirs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         import_c_headers(target, &dirs, false, c"");
         lex_range(FILES[FILE_COUNT - 1].end, FILES[FILE_COUNT - 1].end, true);
+        timer_add(T_LOAD, t);
+        t = timer_now();
         init_ast();
         ERR_KIND = c"parser error";
         let program = parse_program();
@@ -238,11 +247,14 @@ pub fn front_end(root: *u8, target0: i64) {
         }
         collect_defs(program);
         PARSED = true;
+        timer_add(T_PARSE, t);
+        t = timer_now();
         MAIN_SYM = intern_c(c"main");
         init_types();
         init_declarations();
         ERR_KIND = c"type error";
         check_program(program);
+        timer_add(T_CHECK, t);
     }
 }
 
@@ -267,11 +279,19 @@ pub fn load_program(root: *u8, target: i64) -> bool {
         if !PARSED {
             return false;
         }
-        init_positions();
-        finish_defs();
-        init_containers();
+        index_program();
         true
     }
+}
+
+// The paths and positions of the definitions of the program just read
+// (after its front end).
+pub fn index_program() {
+    let t = timer_now();
+    init_positions();
+    finish_defs();
+    init_containers();
+    timer_add(T_INDEX, t);
 }
 
 // The commands, for `--help` and the nearest command to a misspelt one.
@@ -352,6 +372,7 @@ pub static mut OPT_MAX_LINES: i64 = 1000;
 pub fn run_query(argc: i64, argv: **u8) -> i64 {
     let status = run_query_inner(argc, argv);
     write_diags();
+    timer_report();
     status
 }
 
@@ -387,6 +408,8 @@ fn run_query_inner(argc: i64, argv: **u8) -> i64 {
                 OPT_EXACT = true;
             } else if streq(a, c"--all") {
                 OPT_ALL = true;
+            } else if streq(a, c"--time-passes") {
+                TIME_PASSES = true;
             } else if streq(a, c"--with-comments") {
                 WITH_COMMENTS = true;
             } else if streq(a, c"--comments") {
@@ -519,13 +542,26 @@ fn run_query_inner(argc: i64, argv: **u8) -> i64 {
         if root == 0 as *u8 {
             return 2;
         }
-        if !load_program(root, 0) {
+        // (0.13: def, show, refs, callers and items from the tools' cache,
+        // when it holds for the program; else read in full, then cached.
+        // grep and type need the tokens and nodes, which are not cached:
+        // they read the program in full, and leave the cache as it is)
+        let cacheable = streq(cmd, c"def") || streq(cmd, c"show") || streq(cmd, c"refs")
+            || streq(cmd, c"callers") || items;
+        let cached = cacheable && cache_restore(root, 0, is_refs);
+        if !cached && !load_program(root, 0) {
             // (nothing to answer with: the errors say why)
             program_errors(c"error", root, true);
             return 1;
         }
+        let t = timer_now();
         let status = answer(cmd, &args, items, is_refs);
+        timer_add(T_ANSWER, t);
         program_errors(c"warning", root, status != 0);
+        write_diags();
+        if cacheable {
+            cache_save(root, 0);
+        }
         status
     }
 }

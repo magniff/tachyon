@@ -21,7 +21,8 @@ use crate::tools::edit::undo::run_undo;
 use crate::tools::patch::run_patch;
 use crate::tools::proc::read_stdin;
 use crate::tools::query::{
-    c_slice, ends_with_c, front_end, load_program, resolve_name, root_or_diag,
+    PARSED, QUERY, c_slice, ends_with_c, front_end, index_program, load_program, resolve_name,
+    root_or_diag,
 };
 use crate::tools::query::defs::{DEFS, K_FIELD, K_VARIANT, mod_fqn};
 use crate::tools::query::diagnostics::{
@@ -32,12 +33,15 @@ use crate::tools::query::show::text_start;
 use crate::tools::query_text::region_target;
 use crate::tools::edit::wrap::run_wrap;
 use crate::tools::edit::newfile::run_new_file;
+use crate::base::timer::{TIME_PASSES, timer_report};
+use crate::tools::query::cache::{cache_on, cache_restore, cache_save};
 
 // ---- The commands ----
 
 pub fn run_edit(argc: i64, argv: **u8) -> i64 {
     let status = run_edit_inner(argc, argv);
     write_diags();
+    timer_report();
     status
 }
 
@@ -62,6 +66,8 @@ pub fn take_edit_option(argc: i64, argv: **u8, i: *i64, root: **u8) -> bool {
             DRY_RUN = true;
         } else if streq(a, c"--show") {
             SHOW = true;
+        } else if streq(a, c"--time-passes") {
+            TIME_PASSES = true;
         } else if streq(a, c"--no-check") {
             NO_CHECK = true;
         } else if streq(a, c"--exact") {
@@ -171,7 +177,7 @@ fn run_edit_inner(argc: i64, argv: **u8) -> i64 {
         if root == 0 as *u8 {
             return 2;
         }
-        if !load_program(root, TARGET) {
+        if !cache_restore(root, TARGET, false) && !load_program(root, TARGET) {
             program_errors(c"error", root, true);
             return 1;
         }
@@ -515,17 +521,31 @@ pub fn run_check(argc: i64, argv: **u8) -> i64 {
             write_diags();
             return 2;
         }
-        ERR_BAIL = alloc_zeroed(512);
-        if _setjmp(ERR_BAIL) == 0 {
-            front_end(root, TARGET);
+        // (0.13: the errors from the tools' cache, when it holds for the
+        // program; else the front end, with the queries' notes and index
+        // for the cache)
+        if !cache_restore(root, TARGET, false) {
+            let cached = cache_on();
+            QUERY = cached;
+            ERR_BAIL = alloc_zeroed(512);
+            if _setjmp(ERR_BAIL) == 0 {
+                front_end(root, TARGET);
+            }
+            RECOVER_DEPTH = 0;
+            ERR_BAIL = 0 as *u8;
+            QUERY = false;
+            if cached && PARSED {
+                index_program();
+                cache_save(root, TARGET);
+            }
         }
-        RECOVER_DEPTH = 0;
-        ERR_BAIL = 0 as *u8;
         if error_count() > 0 {
             write_errors();
+            timer_report();
             return 1;
         }
         flush_warnings();
+        timer_report();
         0
     }
 }

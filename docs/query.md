@@ -443,6 +443,63 @@ nothing answered, and gives the compilation that prints them all with
 `--diagnostics=short` (one line each:
 `FILE:LINE:COL: error[KIND] MESSAGE | help: ...`).
 
+## Speed: the cache (0.13)
+
+A question reads the program as a compilation would: about 60 ms on the
+compiler's source (77,000 lines), of which reading and lexing take 18,
+parsing 9, checking 31 and the query's index 2 (`--time-passes` on
+`query`, `check` and `edit` prints the phases). Agents ask hundreds of
+questions of a program that has not changed between them, so a command
+that read a program in full leaves what the queries take from it in a
+cache, and the next question about the same program reads the cache and
+the program's files, and neither lexes, parses nor checks:
+
+| command (compiler/src) | 0.12 | 0.13, cache missed | 0.13, from the cache |
+|---|---|---|---|
+| `query show run_gvn` | 66 ms | 62 ms | 5.9 ms |
+| `query def run_gvn` | 64 ms | 65 ms | 6.1 ms |
+| `query refs run_gvn` | 69 ms | 68 ms | 6.5 ms |
+| `query refs IntVec::push --count` | 70 ms | 69 ms | 7.7 ms |
+| `query items gvn` | 61 ms | 62 ms | 6.0 ms |
+| `check` | 59 ms | 63 ms | 7.6 ms |
+| `edit patch run_gvn ...`, after a query or an edit | 129 ms | | 73 ms (its own reading) |
+| the query after that edit | 66 ms | | 7.8 ms |
+
+(wall time, best of 7; after `undo` the next command reads the program
+in full.) What is used from the cache: `query def`, `show` (with
+`MODULE::section`), `refs` (with the kinds), `callers`, `items` (with
+`--comments`); `check`; and the reading of `edit patch`, `insert`,
+`replace` and `delete` (their check of the edited program reads it in
+full). `query grep` and `query type` take the tokens and the checked
+nodes, which are not cached: they read the program in full and leave the
+cache as it is. The answers are the same code, on the same tables,
+byte for byte: tests/query/run.sh and tests/refactor/run.sh run every
+transcript without the cache and with it (a query twice: the second
+must come from the cache when the first made it).
+
+- Where: `target/tachyonc-cache/q-KEY.bin` and `q-KEY.refs` (every
+  reference, read by refs and callers only), KEY a hash of the root as
+  given, the current directory and the target. `$TACHYON_CACHE` names
+  another directory, or `off`; without it there is a cache only when the
+  current directory has a `target` directory.
+- When it holds: for the compiler that wrote it (a hash of its
+  executable), when every file of the program has the text it had (each
+  is read again and hashed: an edit by any means is seen), and when the
+  module files that were looked for and not found (`a.tach` before
+  `a/mod.tach`) still do not exist. Else the program is read in full and
+  the cache made anew.
+- Made: by the `query` commands that use it and `check` (which then
+  also records what the queries need), after the answer is out, by a copy of the process (fork) while
+  the command ends; in the process itself with `--time-passes` or
+  `$TACHYON_CACHE_TRACE` (a file that gets `hit`, `miss` or `save` per
+  use: the tests). `check --overlay` (an edit's check of the edited
+  program) makes `q-KEY.next.bin`: the cache once the edit is written,
+  taken over by the next command that finds it holds (else removed).
+- Not cached: a program that imports C headers (their text is not a
+  file of the program), one that could not be parsed. A damaged or
+  partly written file is not read (a hash of its contents; written
+  through a new file renamed over the old).
+
 ## Known limits
 
 - In a generic function that is never instantiated, the references that
