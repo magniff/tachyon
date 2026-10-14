@@ -1,0 +1,397 @@
+// The assembler proper (objfile): each line of the text is a label, a
+// directive or an instruction (encoded by enc_arm64.tach or enc_x86.tach),
+// appended to the object being built (mod.tach) as bytes, symbols and
+// fixups. Here: errors, scanning a line and its operands, numbers and
+// data values, AArch64 ELF mapping symbols, and the directives.
+
+use crate::back::enc_arm64::a64_instruction;
+use crate::back::enc_x86::x86_instruction;
+use crate::back::objfile::{
+    ASYMS, CUR_ATOM, CUR_SEC, FIXUPS, FIXUP_COUNT, FRAGS, FX_ABS32, FX_ABS64, FX_DIFF32, OBJ_BYTES,
+    OPEN, SEC_ALIGN, SEC_CONST, SEC_DATA, SEC_DEBUG_ABBREV, SEC_DEBUG_INFO, SEC_DEBUG_LINE,
+    SEC_NOTE, SEC_TEXT, TAIL_ALIGN, asym, end_frag, fixup, here, is_debug, is_temp, out32, out64,
+    out8, switch_section,
+};
+use crate::base::{
+    BUFS, IntVec, STDERR, buf_byte, buf_bytes, buf_new, buf_reserve, buf_str, buf_write_fd, exit,
+    memcmp, memset, strlen,
+};
+use crate::gen0::target::ASM;
+use crate::back::objfile::debug::{
+    LOC_COL, LOC_FILE, LOC_LINE, LOC_PENDING, cfi_directive, dwarf_file, line_row,
+};
+use crate::base::target::X86;
+
+// ---- Errors ----
+
+static mut LINE_START: i64 = 0;
+static mut LINE_END: i64 = 0;
+
+pub fn asm_error(message: *u8) -> ! {
+    unsafe {
+        let line = BUFS[ASM].data[LINE_START..LINE_END];
+        let out = buf_new();
+        buf_str(out, c"internal error: cannot assemble: ");
+        buf_str(out, message);
+        buf_str(out, c": ");
+        buf_bytes(out, line);
+        buf_byte(out, '\n');
+        buf_write_fd(out, STDERR);
+        exit(1)
+    }
+}
+
+// ---- Lines ----
+
+pub fn is_space(c: u8) -> bool {
+    c == ' ' || c == '\t'
+}
+
+// Whether bytes [a, b) of the text spell `word`.
+pub fn text_is(a: i64, b: i64, word: *u8) -> bool {
+    unsafe {
+        let n = strlen(word) as i64;
+        n == b - a && memcmp(&BUFS[ASM].data[a], word, n as u64) == 0
+    }
+}
+
+// The operands of the statement being assembled: [OP_START[i], OP_END[i])
+// of the text, split at commas outside brackets and parentheses.
+pub static mut OP_START: [i64; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
+pub static mut OP_END: [i64; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
+pub static mut OP_COUNT: i64 = 0;
+
+fn split_operands(a: i64, b: i64) {
+    unsafe {
+        let t = BUFS[ASM].data;
+        OP_COUNT = 0;
+        let mut i = a;
+        while i < b {
+            while i < b && is_space(t[i]) {
+                i += 1;
+            }
+            if i >= b {
+                break;
+            }
+            let start = i;
+            let mut depth = 0;
+            while i < b && !(t[i] == ',' && depth == 0) {
+                if t[i] == '[' || t[i] == '(' {
+                    depth += 1;
+                } else if t[i] == ']' || t[i] == ')' {
+                    depth -= 1;
+                }
+                i += 1;
+            }
+            let mut end = i;
+            while end > start && is_space(t[end - 1]) {
+                end -= 1;
+            }
+            if OP_COUNT == 8 {
+                asm_error(c"too many operands");
+            }
+            OP_START[OP_COUNT] = start;
+            OP_END[OP_COUNT] = end;
+            OP_COUNT += 1;
+            i += 1;
+        }
+    }
+}
+
+// A number at [a, b): decimal or 0x hex, maybe negative.
+pub fn parse_number(a: i64, b: i64) -> i64 {
+    unsafe {
+        let t = BUFS[ASM].data;
+        let mut i = a;
+        let mut neg = false;
+        if i < b && t[i] == '-' {
+            neg = true;
+            i += 1;
+        }
+        let mut v: u64 = 0;
+        if i + 1 < b && t[i] == '0' && (t[i + 1] == 'x' || t[i + 1] == 'X') {
+            i += 2;
+            while i < b {
+                let c = t[i];
+                let d = if c >= '0' && c <= '9' { (c - '0') as u64 } else if c >= 'a' && c <= 'f' { (c - 'a') as u64 + 10 } else if c >= 'A' && c <= 'F' { (c - 'A') as u64 + 10 } else { asm_error(c"bad number") };
+                v = v * 16 + d;
+                i += 1;
+            }
+        } else {
+            if i >= b {
+                asm_error(c"bad number");
+            }
+            while i < b {
+                let c = t[i];
+                if c < '0' || c > '9' {
+                    asm_error(c"bad number");
+                }
+                v = v * 10 + (c - '0') as u64;
+                i += 1;
+            }
+        }
+        if neg { 0 - v as i64 } else { v as i64 }
+    }
+}
+
+pub fn is_digit_start(c: u8) -> bool {
+    (c >= '0' && c <= '9') || c == '-'
+}
+
+// A data value: a number, a symbol, or `A - B` (two labels).
+fn data_value(a: i64, b: i64, size: i64) {
+    unsafe {
+        let t = BUFS[ASM].data;
+        if is_digit_start(t[a]) {
+            if size == 4 { out32(parse_number(a, b)); } else { out64(parse_number(a, b)); }
+            return;
+        }
+        let mut minus = a;
+        while minus < b && t[minus] != '-' {
+            minus += 1;
+        }
+        if minus < b {
+            let mut e1 = minus;
+            while e1 > a && is_space(t[e1 - 1]) {
+                e1 -= 1;
+            }
+            let mut s2 = minus + 1;
+            while s2 < b && is_space(t[s2]) {
+                s2 += 1;
+            }
+            if size != 4 {
+                asm_error(c"a difference of labels must be a .long");
+            }
+            let s1 = asym(t[a..e1]);
+            let s2sym = asym(t[s2..b]);
+            fixup(FX_DIFF32, here(), s1, 0, 0, false);
+            FIXUPS[FIXUP_COUNT - 1].sym2 = s2sym;
+            out32(0);
+            return;
+        }
+        if size == 4 {
+            // (0.11) A 32-bit reference: the offset of a debug section (ELF).
+            fixup(FX_ABS32, here(), asym(t[a..b]), 0, 0, false);
+            out32(0);
+            return;
+        }
+        fixup(FX_ABS64, here(), asym(t[a..b]), 0, 0, false);
+        out64(0);
+    }
+}
+
+// ---- AArch64 ELF mapping symbols ----
+//
+// The AArch64 ELF ABI marks where code ($x) and data ($d) start in a
+// section, as GNU as does (disassemblers show data in code, such as jump
+// tables, as data): (section, fragment, offset, kind) for each change.
+
+// Whether the object has mapping symbols (AArch64 ELF).
+pub static mut MAPPING: bool = false;
+// Whether an instruction may need more than its encoding: mapping symbols
+// or `.loc`s (one test on the common path).
+pub static mut HOOKS: bool = false;
+pub const MAP_CODE: i64 = 1;
+const MAP_DATA: i64 = 2;
+static mut MAP_STATE: [i64; 8] = [0; 8];
+pub static mut MAPS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+fn mapping(kind: i64) {
+    unsafe {
+        if MAP_STATE[CUR_SEC] == kind || is_debug(CUR_SEC) {
+            return;
+        }
+        MAP_STATE[CUR_SEC] = kind;
+        MAPS.push(CUR_SEC);
+        MAPS.push(OPEN);
+        MAPS.push(here() - FRAGS[OPEN].start);
+        MAPS.push(kind);
+    }
+}
+
+fn directive(a: i64, b: i64, rest: i64, end: i64) {
+    unsafe {
+        let t = BUFS[ASM].data;
+        if text_is(a, b, c".byte") {
+            if MAPPING {
+                mapping(MAP_DATA);
+            }
+            let mut i = rest;
+            while i < end {
+                let mut v = 0;
+                while i < end && t[i] >= '0' && t[i] <= '9' {
+                    v = v * 10 + (t[i] - '0') as i64;
+                    i += 1;
+                }
+                out8(v);
+                while i < end && (t[i] == ',' || is_space(t[i])) {
+                    i += 1;
+                }
+            }
+            return;
+        }
+        if text_is(a, b, c".long") || text_is(a, b, c".quad") {
+            if MAPPING {
+                mapping(MAP_DATA);
+            }
+            split_operands(rest, end);
+            for k in 0..OP_COUNT {
+                data_value(OP_START[k], OP_END[k], if t[b - 1] == 'g' { 4 } else { 8 });
+            }
+            return;
+        }
+        if text_is(a, b, c".p2align") {
+            let n = parse_number(rest, end);
+            if n > SEC_ALIGN[CUR_SEC] {
+                SEC_ALIGN[CUR_SEC] = n;
+            }
+            if n > 0 {
+                end_frag(TAIL_ALIGN, n, -1);
+            }
+            return;
+        }
+        if text_is(a, b, c".space") {
+            if MAPPING {
+                mapping(MAP_DATA);
+            }
+            let n = parse_number(rest, end);
+            buf_reserve(OBJ_BYTES, n);
+            memset(&BUFS[OBJ_BYTES].data[BUFS[OBJ_BYTES].len], 0, n as u64);
+            BUFS[OBJ_BYTES].len += n;
+            return;
+        }
+        if text_is(a, b, c".globl") {
+            let s = asym(t[rest..end]);
+            ASYMS[s].global = true;
+            return;
+        }
+        if text_is(a, b, c".text") {
+            switch_section(SEC_TEXT);
+            return;
+        }
+        if text_is(a, b, c".data") {
+            switch_section(SEC_DATA);
+            return;
+        }
+        if text_is(a, b, c".section") {
+            if text_is(rest, end, c"__TEXT,__text") {
+                switch_section(SEC_TEXT);
+            } else if text_is(rest, end, c"__TEXT,__const") || text_is(rest, end, c".rodata") {
+                switch_section(SEC_CONST);
+            } else if text_is(rest, end, c"__DATA,__data") {
+                switch_section(SEC_DATA);
+            } else if end - rest > 15 && text_is(rest, rest + 15, c".note.GNU-stack") {
+                switch_section(SEC_NOTE);
+            } else if text_is(rest, end, c"__DWARF,__debug_abbrev,regular,debug") || text_is(rest, end, c".debug_abbrev,\"\",@progbits") {
+                switch_section(SEC_DEBUG_ABBREV);
+            } else if text_is(rest, end, c"__DWARF,__debug_info,regular,debug") || text_is(rest, end, c".debug_info,\"\",@progbits") {
+                switch_section(SEC_DEBUG_INFO);
+            } else if text_is(rest, end, c"__DWARF,__debug_line,regular,debug") || text_is(rest, end, c".debug_line,\"\",@progbits") {
+                switch_section(SEC_DEBUG_LINE);
+            } else {
+                asm_error(c"unknown section");
+            }
+            return;
+        }
+        if text_is(a, b, c".loc") {
+            split_operands(rest, end);
+            // .loc file line column
+            let mut fields: [i64; 3] = [0, 0, 0];
+            let mut k = 0;
+            let mut i = rest;
+            while i < end && k < 3 {
+                while i < end && is_space(t[i]) {
+                    i += 1;
+                }
+                let start = i;
+                while i < end && !is_space(t[i]) {
+                    i += 1;
+                }
+                fields[k] = parse_number(start, i);
+                k += 1;
+            }
+            LOC_FILE = fields[0];
+            LOC_LINE = fields[1];
+            LOC_COL = fields[2];
+            LOC_PENDING = true;
+            HOOKS = true;
+            return;
+        }
+        if text_is(a, b, c".file") {
+            dwarf_file(rest, end);
+            return;
+        }
+        if end - rest >= 0 && b - a > 5 && text_is(a, a + 5, c".cfi_") {
+            cfi_directive(a, b);
+            return;
+        }
+        asm_error(c"unknown directive");
+    }
+}
+
+fn label(a: i64, b: i64) {
+    unsafe {
+        let s = asym(BUFS[ASM].data[a..b]);
+        if ASYMS[s].defined {
+            asm_error(c"label defined twice");
+        }
+        ASYMS[s].defined = true;
+        ASYMS[s].frag = OPEN;
+        ASYMS[s].off = here() - FRAGS[OPEN].start;
+        ASYMS[s].sec = CUR_SEC;
+        if !is_temp(s) {
+            CUR_ATOM[CUR_SEC] = s;
+        }
+        ASYMS[s].atom = CUR_ATOM[CUR_SEC];
+    }
+}
+
+pub fn assemble_line(a: i64, b: i64) {
+    unsafe {
+        let t = BUFS[ASM].data;
+        let mut i = a;
+        while i < b && is_space(t[i]) {
+            i += 1;
+        }
+        let mut e = b;
+        while e > i && is_space(t[e - 1]) {
+            e -= 1;
+        }
+        if i >= e {
+            return;
+        }
+        LINE_START = i;
+        LINE_END = e;
+        let mut w = i;
+        while w < e && !is_space(t[w]) {
+            w += 1;
+        }
+        if w == e && t[e - 1] == ':' {
+            label(i, e - 1);
+            return;
+        }
+        let mut r = w;
+        while r < e && is_space(t[r]) {
+            r += 1;
+        }
+        if t[i] == '.' {
+            directive(i, w, r, e);
+            return;
+        }
+        split_operands(r, e);
+        if HOOKS {
+            // (a row of the line table, a mapping symbol)
+            if LOC_PENDING {
+                line_row();
+            }
+            if MAPPING {
+                mapping(MAP_CODE);
+            }
+        }
+        if X86 {
+            x86_instruction(i, w);
+        } else {
+            a64_instruction(i, w);
+        }
+    }
+}
