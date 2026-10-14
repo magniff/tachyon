@@ -66,6 +66,11 @@ each by its position). Refused (`refactor.collision`) when NEW is
 already a name in its scope: another local declared there, or a name
 used there that is not this local. `self` keeps its name.
 
+A field shorthand (0.15), `S { x }`, is the field x and the value x at
+once: renaming the local, parameter, constant or static x writes `S {
+x: NEW }`; renaming the field (`S.x`, or `refactor field S --rename`)
+writes `S { NEW: x }`.
+
 Mentions in comments are renamed only between backquotes on `//`
 lines, never other words, and only in these forms:
 
@@ -192,7 +197,9 @@ an inline module (`refactor.inline`), a module that does not exist
 
 ## new-module, move-module
 
-`refactor new-module crate::a::b`: makes `b`'s file, empty, and its
+`refactor new-module crate::a::b` (0.15: or `a::b`; the module paths
+of new-module, move-module and split may leave out `crate::`): makes
+`b`'s file, empty, and its
 `mod b;` line in `a` (after `a`'s last `mod` line, else before its first
 item). `--dir` makes it a dir module (`b/mod.tach`). The modules of the
 path that do not exist are made too, as dir modules. A file module that

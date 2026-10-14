@@ -48,6 +48,10 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-query.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 trap 'exit 130' INT TERM
 STATUS=0
+# (0.15: a transcript with a line `## needs: 0.15 FEATURE...` is skipped
+# while the compiler lacks one of the features, tests/needs015.sh)
+. "$ROOT/tests/needs015.sh"
+MISSING015=$(missing_015 "$COMPILER" "$WORK")
 
 # One run of `tachyonc query ARGS` (in $1, the line's ARGS), its output as
 # the transcript has it, into $WORK/run.
@@ -103,6 +107,11 @@ transcript() {
 for file in "$HERE"/*.q; do
     [ -f "$file" ] || continue
     name=$(basename "$file" .q)
+    needs=$(sed -n 's/^## needs: //p' "$file" | head -1)
+    if [ -n "$needs" ] && ! needs_ok_015 "$MISSING015" - $needs; then
+        echo "skip $name (needs $needs; the compiler lacks: $MISSING015)"
+        continue
+    fi
     for mode in off cache; do
         transcript "$file" $mode >"$WORK/$name.got"
         if [ $UPDATE -eq 1 ] && [ $mode = off ]; then
@@ -224,4 +233,56 @@ out=$(cd "$HERE/clash" && "$COMPILER" query def a::helper 2>&1)
 ok=0
 [ "$out" = "crate::a::helper${TAB}a.tach:2:8${TAB}fn${TAB}pub fn helper() -> i64" ] && ok=1
 check default_root "$ok" "$out"
+# std where there is no program (0.15): its API by `items std` (no
+# private item), an item by a name std defines.
+mkdir -p "$WORK/empty"
+out=$(cd "$WORK/empty" && "$COMPILER" query items std 2>&1)
+ok=0
+[ "$(printf '%s\n' "$out" | wc -l)" -ge 100 ] && printf '%s\n' "$out" | head -1 | grep -q "^# std${TAB}<std>\$" \
+    && printf '%s\n' "$out" | grep -q "${TAB}pub fn read_line(line: \*Buf) -> Result<bool, IoError>\$" \
+    && ! printf '%s\n' "$out" | grep -q 'fn malloc' && ok=1
+check std_items_no_program "$ok" "$(printf '%s\n' "$out" | head -5)"
+out=$(cd "$WORK/empty" && "$COMPILER" query show HashMap::get_or_insert 2>&1)
+ok=0
+printf '%s\n' "$out" | head -2 | grep -q '^// use std::HashMap;$' && ok=1
+check std_show_no_program "$ok" "$(printf '%s\n' "$out" | head -5)"
+
+# Every name a tool prints is accepted back (0.15): the paths, positions
+# (FILE:L:C, FILE:A-B, FILE:L:C: of a short diagnostic), enclosing items
+# and modules that def, show, refs, callers, items, type and check print,
+# and the symbols of the generated code (closures, instances; not the
+# runtime's), each
+# given to `query def` (positions and modules to `show` and `items`).
+cd "$HERE" || exit 2
+roundtrip() { # <program dir> <seed names...>
+    prog=$1
+    shift
+    TACHYON_ROOT="$prog/main.tach"
+    export TACHYON_ROOT
+    {
+        "$COMPILER" query def "$@" 2>/dev/null | awk -F "$TAB" '{ print "def " $1; print "show " $2 }'
+        "$COMPILER" query show "$@" 2>/dev/null | awk -F "$TAB" '/^\/\/ [^ ]*\t/ { sub(/^\/\/ /, "", $1); print "def " $1; print "show " $2 }'
+        "$COMPILER" query refs "$@" --all 2>/dev/null | awk -F "$TAB" '
+            /^# / { file = substr($0, 3); next }
+            { print "show " file ":" $1; if ($2 != "def") print "def " $3 }'
+        "$COMPILER" query items 2>/dev/null | awk -F "$TAB" '{ print "items " $1; print "items " $2 }'
+        "$COMPILER" check --diagnostics=short "$prog/main.tach" 2>&1 | awk '/^[^ ]*:[0-9]+:[0-9]+:/ { print "show " $1 }'
+        "$COMPILER" "$prog/main.tach" -O0 -S -o "$WORK/rt.s" >/dev/null 2>&1 \
+            && awk '/^_?tachyon\.[^ \t]*:$/ && !/^_?tachyon\.rt\./ { sub(/:$/, ""); print "def " $0 }' "$WORK/rt.s"
+    } | sort -u >"$WORK/rt.names"
+    : >"$WORK/rt.bad"
+    n=0
+    while read -r cmd name; do
+        [ -n "$name" ] || continue
+        n=$((n + 1))
+        "$COMPILER" query "$cmd" "$name" >/dev/null 2>"$WORK/rt.err" \
+            || echo "query $cmd $name: $(head -1 "$WORK/rt.err")" >>"$WORK/rt.bad"
+    done <"$WORK/rt.names"
+    unset TACHYON_ROOT
+    ok=0
+    [ "$n" -ge 10 ] && [ ! -s "$WORK/rt.bad" ] && ok=1
+    check "roundtrip_$prog" "$ok" "$n names; $(cat "$WORK/rt.bad")"
+}
+roundtrip clash a::helper geom::V2::len main Shape::Circle MyVec::push
+roundtrip closures double apply main
 exit $STATUS

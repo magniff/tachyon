@@ -1,0 +1,173 @@
+// What `#[derive(...)]` makes (0.15), for the queries: the derived impls
+// have no source of their own (their spans are the attribute's), so
+// references from inside them are not the program's, and a derived
+// method is answered by the attribute that makes it.
+
+use crate::base::{IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_str};
+use crate::front::ast::{NODES, NodeKind, child};
+use crate::tools::query::defs::{DEFS, K_ENUM, K_STRUCT, find_defs, last_segment};
+use crate::tools::query::diagnostics::{diag, try_query};
+use crate::tools::query::positions::put_loc;
+
+// The derive attributes of the parsed program: the [start, end) of each
+// struct's or enum's #[derive(...)] holder (several attributes: from the
+// first to the last), in pairs.
+pub static mut DERIVE_SPANS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// Notes the derive attributes of the parsed program's items.
+pub fn collect_derive_spans(program: i64) {
+    unsafe {
+        DERIVE_SPANS.count = 0;
+        for i in 0..NODES[program].count {
+            let item = child(program, i);
+            let kind = NODES[item].kind;
+            let h = NODES[item].h;
+            if (kind == NodeKind::Struct || kind == NodeKind::Enum) && h > 0 {
+                DERIVE_SPANS.push(NODES[h].start);
+                DERIVE_SPANS.push(NODES[h].end);
+            }
+        }
+    }
+}
+
+// Whether source position pos is inside a derive attribute.
+pub fn in_derive(pos: i64) -> bool {
+    unsafe {
+        let mut i = 0;
+        while i + 1 < DERIVE_SPANS.count {
+            if pos >= DERIVE_SPANS.data[i] && pos < DERIVE_SPANS.data[i + 1] {
+                return true;
+            }
+            i += 2;
+        }
+        false
+    }
+}
+
+// The method that deriving trait `tr` makes ("": none, or not derivable).
+fn derived_method(tr: [u8]) -> [u8] {
+    if same(tr, "Eq") { "eq" } else if same(tr, "Ord") { "cmp" }
+    else if same(tr, "Hash") { "hash" } else if same(tr, "Debug") { "fmt_debug" }
+    else if same(tr, "Clone") { "clone" } else { "" }
+}
+
+fn same(a: [u8], b: [u8]) -> bool {
+    if a.len != b.len {
+        return false;
+    }
+    for i in 0..a.len {
+        if a[i] != b[i] {
+            return false;
+        }
+    }
+    true
+}
+
+fn ident_byte(c: u8) -> bool {
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+        || c == ':'
+}
+
+// The position of the trait whose derive makes method m, in the
+// attributes written from..to (`#[derive(A, std::B)]`), or -1.
+fn derive_of(from: i64, to: i64, m: [u8]) -> i64 {
+    unsafe {
+        let key = "derive(";
+        let mut p = from;
+        while p + key.len <= to {
+            let mut hit = true;
+            for k in 0..key.len {
+                if SRC[p + k] != key[k] {
+                    hit = false;
+                    break;
+                }
+            }
+            if !hit || (p > from && ident_byte(SRC[p - 1])) {
+                p += 1;
+                continue;
+            }
+            p += key.len;
+            while p < to && SRC[p] != ')' {
+                while p < to && !ident_byte(SRC[p]) && SRC[p] != ')' {
+                    p += 1;
+                }
+                let s = p;
+                while p < to && ident_byte(SRC[p]) {
+                    p += 1;
+                }
+                if p > s {
+                    let path = SRC[s..p];
+                    let name = last_segment(path);
+                    let mm = derived_method(name);
+                    if mm.len > 0 && same(mm, m) {
+                        return p - name.len;
+                    }
+                }
+            }
+        }
+        -1
+    }
+}
+
+// The start of the attribute lines (`#[...]`) right above the item that
+// starts at pos (pos when there is none): the item's span may leave them
+// out.
+fn attrs_start(pos: i64) -> i64 {
+    unsafe {
+        let mut start = pos;
+        let mut p = pos;
+        while p > 0 && SRC[p - 1] != '\n' {
+            p -= 1;
+        }
+        while p > 0 {
+            // (the line before p)
+            let mut q = p - 1;
+            while q > 0 && SRC[q - 1] != '\n' {
+                q -= 1;
+            }
+            let mut t = q;
+            while t < p && (SRC[t] == ' ' || SRC[t] == '\t') {
+                t += 1;
+            }
+            if t + 1 >= p || SRC[t] != '#' || SRC[t + 1] != '[' {
+                break;
+            }
+            start = t;
+            p = q;
+        }
+        start
+    }
+}
+
+// (0.15) When `name` (`Type::m`) is a method #[derive] makes for a struct
+// or enum of the program: `note query.derived` says where, and true.
+pub fn derived_note(cmd: *u8, name: [u8]) -> bool {
+    unsafe {
+        let m = last_segment(name);
+        if m.len + 2 > name.len {
+            return false;
+        }
+        let ty = name[0..name.len - m.len - 2];
+        let mut defs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        find_defs(ty, false, &defs);
+        for i in 0..defs.count {
+            let d = defs.data[i];
+            if DEFS[d].kind != K_STRUCT && DEFS[d].kind != K_ENUM {
+                continue;
+            }
+            let at = derive_of(attrs_start(DEFS[d].start), DEFS[d].name_pos, m);
+            if at < 0 {
+                continue;
+            }
+            let out = diag(c"note", c"query.derived");
+            buf_byte(out, '\'');
+            buf_bytes(out, name);
+            buf_str(out, c"' is derived, at ");
+            put_loc(out, at);
+            buf_str(out, c": #[derive] makes it; it has no source of its own\n");
+            try_query(c"show", SYMS[DEFS[d].fqn].text);
+            return true;
+        }
+        false
+    }
+}

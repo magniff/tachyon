@@ -15,11 +15,14 @@ use crate::tools::query::defs::{
     K_TRAIT, K_TRAIT_FN, bytes_eq, ends_with, find_in, kind_name, mod_fqn_text,
 };
 use crate::tools::query::diagnostics::{diag, try_query};
+use crate::tools::query::names::{canonical_name, path_matches};
 use crate::tools::query::positions::{
     collapse, is_space, line_end, line_of, line_start, put_loc, put_path, sort_by_position,
     token_at,
 };
+use crate::tools::query::refs::{OPT_ALL, file_text};
 use crate::tools::query::sections::{B_START, OPT_BANNERS, banners_of_module, put_banner_line};
+use crate::tools::query::stdq::{is_std_module, put_std_use};
 use crate::tools::query_text::section_start;
 
 // ---- def, show, items ----
@@ -160,6 +163,7 @@ pub fn query_show(matches: *IntVec, name: [u8]) -> i64 {
             buf_byte(out, '-');
             buf_int(out, line_of(last));
             buf_byte(out, '\n');
+            put_std_use(out, d);
             buf_bytes(out, SRC[first..last]);
             buf_byte(out, '\n');
         }
@@ -168,15 +172,25 @@ pub fn query_show(matches: *IntVec, name: [u8]) -> i64 {
     }
 }
 
-// The modules answering to `name` (all of them for none), in `out`.
-pub fn find_modules(name: [u8], exact: bool, out: *IntVec) {
+// The modules answering to `name` (all of them for none), in `out`; a
+// file's path (`x.tach`, `./x.tach`, `a/b/`) names the modules of its
+// files (0.15).
+pub fn find_modules(name0: [u8], exact: bool, out: *IntVec) {
     unsafe {
+        let name = canonical_name(name0);
+        let is_file = name.len > 0 && (name[0] == '<' || find_in(name, c"/", 0) >= 0
+            || find_in(name, c".tach", 0) >= 0);
         for m in 0..module_count() {
             if MODULES[m].name < 0 && m != 0 {
                 continue;
             }
             let fqn = mod_fqn_text(m);
-            if name.len == 0 || bytes_eq(fqn, name) || ends_with(fqn, name, exact) {
+            if is_file {
+                let f = module_file(m);
+                if f >= 0 && FILES[f].module == m && path_matches(file_text(f), name) {
+                    out.push(m);
+                }
+            } else if name.len == 0 || bytes_eq(fqn, name) || ends_with(fqn, name, exact) {
                 out.push(m);
             }
         }
@@ -301,6 +315,7 @@ pub fn query_items(modules: *IntVec) {
             }
             buf_byte(out, '\n');
             let mut impl_of = -1;
+            let std = is_std_module(m);
             // (--comments: the banners and comments before each item)
             let mut banners = IntVec { data: 0 as *i64, count: 0, cap: 0 };
             if OPT_BANNERS {
@@ -313,6 +328,10 @@ pub fn query_items(modules: *IntVec) {
                     continue;
                 }
                 let k = DEFS[d].kind;
+                if std && !OPT_ALL && !DEFS[d].public && k != K_IMPL_METHOD {
+                    // (0.15: std's API; --all: its private items too)
+                    continue;
+                }
                 let mut at = text_start(d);
                 if (k == K_METHOD || k == K_IMPL_METHOD) && impl_block(d) != impl_of {
                     at = impl_start(d);

@@ -182,6 +182,7 @@ try: tachyonc query items
 $ --help
 usage: tachyonc query def|show NAME... [--root ROOT] [--exact] [--with-comments]
        tachyonc query show FILE.tach | MODULE::use | MODULE::header | MODULE::extern
+       tachyonc query context NAME...|MODULE [--budget TOKENS]   (source, calls, types, callers)
        tachyonc query text FILE[:A[-B]]...
        tachyonc query diff
        tachyonc query refs|callers NAME... [--exact] [--count] [--in FILE|MODULE] [--limit N] [--all]
@@ -193,6 +194,8 @@ usage: tachyonc query def|show NAME... [--root ROOT] [--exact] [--with-comments]
        tachyonc query deps MODULE [--max-lines N]
        tachyonc query unused [MODULE] [--all]
        tachyonc query impact NAME
-NAME: a path or its end (f, m::f, T::f, T.field), or FILE:LINE
+       tachyonc query conflicts [FILE|DIR|FILE:LINE...] [--show]
+NAME: a path or its end (f, m::f, T::f, T.field), or FILE:LINE; std's too (std::f, Vec::push)
+--budget TOKENS: any answer cut to about TOKENS (default 8000; 0: no limit; context: 2000)
 ROOT: --root ROOT, a last argument ending in .tach, $TACHYON_ROOT, ./main.tach, ./compiler/src/main.tach
 see docs/query.md and docs/refactor.md

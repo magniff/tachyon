@@ -22,7 +22,9 @@ use crate::tools::query::defs::{
     DEFS, DEF_COUNT, K_ALIAS, K_ENUM, K_IMPL_METHOD, K_MOD, K_STRUCT, K_TRAIT, K_TRAIT_FN, bytes_eq,
     def_of_node, find_in, is_alias_name, mod_fqn, trait_of,
 };
+use crate::tools::query::derived::in_derive;
 use crate::tools::query::diagnostics::{diag, put_cword, put_word, try_begin, try_end};
+use crate::tools::query::names::{canonical_name, path_matches};
 use crate::tools::query::positions::{
     enclosing, find_name, is_space, line_end, line_of, line_start, rank_of, sort_by_keys, token_at,
 };
@@ -83,6 +85,11 @@ fn add_ref(def: i64, from: i64, to: i64, name: i64, last: bool, at: i64, flags: 
             if p >= 0 {
                 pos = p;
             }
+        }
+        // (0.15: what a #[derive] makes uses the type, its fields and std:
+        // not references of the program; the traits it names are)
+        if in_derive(pos) && DEFS[d].kind != K_TRAIT {
+            return;
         }
         R_POS.push(pos);
         R_DEF.push(d);
@@ -343,6 +350,34 @@ pub fn collect_all_refs(out: *IntVec) {
     }
 }
 
+// (0.15) The definition a reference in from..to names (the first one, an
+// import's path or a use outside every item: `query show FILE:LINE:COL`
+// on a `use` line), or -1. The references found are dropped after.
+pub fn def_used_at(from: i64, to: i64) -> i64 {
+    unsafe {
+        let mut all = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        collect_all_refs(&all);
+        TARGETS.count = 0;
+        R_POS.count = 0;
+        R_DEF.count = 0;
+        R_GROUP.count = 0;
+        R_FLAGS.count = 0;
+        GROUP = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        let mut best = -1;
+        let mut best_pos = to;
+        let mut i = 0;
+        while i < all.count {
+            let pos = all.data[i];
+            if pos >= from && pos < best_pos && (all.data[i + 2] & QF_DEF) == 0 {
+                best = all.data[i + 1];
+                best_pos = pos;
+            }
+            i += 3;
+        }
+        best
+    }
+}
+
 // The references in order (file, position, definition), each once: the
 // indices into R_*, in `out`.
 pub fn sorted_refs(out: *IntVec) {
@@ -455,8 +490,9 @@ pub fn file_text(f: i64) -> [u8] {
 // NAME, with its inline modules), or FILE:LINE (the item holding that
 // line: ref_in; its file for the fixes by module). Whether anything
 // matched.
-pub fn resolve_in(x: [u8]) -> bool {
+pub fn resolve_in(x0: [u8]) -> bool {
     unsafe {
+        let x = canonical_name(x0);
         let mut any = false;
         for _ in 0..FILE_COUNT {
             IN_FILE.push(0);
@@ -471,9 +507,7 @@ pub fn resolve_in(x: [u8]) -> bool {
             let file = x[0..a - 1];
             for f in 0..FILE_COUNT {
                 let p = file_text(f);
-                if bytes_eq(p, file)
-                    || (p.len > file.len && bytes_eq(p[p.len - file.len..p.len], file)
-                        && p[p.len - file.len - 1] == '/') {
+                if path_matches(p, file) {
                     let d = def_at_line(f, parse_digits(x[a..x.len]));
                     if d < 0 {
                         IN_NO_ITEM = true;
@@ -492,10 +526,7 @@ pub fn resolve_in(x: [u8]) -> bool {
         if is_file {
             for f in 0..FILE_COUNT {
                 let p = file_text(f);
-                if bytes_eq(p, x)
-                    || (p.len > x.len && bytes_eq(p[p.len - x.len..p.len], x)
-                        && p[p.len - x.len - 1] == '/')
-                    || dir_holds(p, x) {
+                if path_matches(p, x) || dir_holds(p, x) {
                     IN_FILE.data[f] = 1;
                     any = true;
                 }

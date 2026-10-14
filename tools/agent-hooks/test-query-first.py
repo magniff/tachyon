@@ -169,6 +169,21 @@ case("tool on a test program", [(r["written"], r["compiler"]) for r in recs], [(
 st, err, recs = bash("target/tachyonc undo", "PostToolUse", "undid patched crate::a\tcompiler/src/a.tach\t+1 -1 lines\n")
 case("tool undo", [(r["tool"], r["written"], r["compiler"]) for r in recs], [("undo", True, True)])
 
+# 0.15: tachyonc through a copy, a shell variable, the tools binary.
+st, err, recs = bash("T=target/tc0; $T edit patch clamp --old a --new b", "PostToolUse",
+                     "patched crate::range::clamp\tcompiler/src/range.tach\t+1 -1 lines\n")
+case("tool through $T", [(r["kind"], r["tool"], r["written"], r.get("via")) for r in recs],
+     [("tool-result", "edit", True, "target/tc0")])
+case("query through ${T}", [(r["kind"], r.get("via")) for r in bash("T=target/tc0 && ${T} query show f")[2]],
+     [("query", "target/tc0")])
+case("query through an unassigned $TC", [r.get("via") for r in bash('"$TC" query refs f')[2]], ["$VAR"])
+case("query through a copy", [r.get("via") for r in bash("target/tc-new query def f --json")[2]],
+     ["target/tc-new"])
+case("query through the tools binary", [r.get("via") for r in bash("target/tools/tachyonc query show f")[2]],
+     [None])
+case("not tachyonc: tclsh, $X ls", [r["kind"] for r in bash("tclsh query.tcl; $X ls; tcpdump -i en0")[2]], [])
+case("query inside $(...)", [r["kind"] for r in bash("n=$(tachyonc query refs f --count)")[2]], ["query"])
+
 # 0.12: writes are judged by the files written, not by every path named.
 case("python writes a doc naming source", blocked(
     "python3 - <<'EOF'\nopen('compiler/README.md', 'w').write('see compiler/std/std.tach')\nEOF")[0], False)

@@ -54,6 +54,10 @@ WORK=$(cd "$WORK" && pwd -P)
 trap 'rm -rf "$WORK"' EXIT
 trap 'exit 130' INT TERM
 STATUS=0
+# (0.15: a transcript with a line `## needs: 0.15 FEATURE...` is skipped
+# while the compiler lacks one of the features, tests/needs015.sh)
+. "$ROOT/tests/needs015.sh"
+MISSING015=$(missing_015 "$COMPILER" "$WORK")
 T=$HERE
 export T
 unset TACHYON_ROOT
@@ -100,6 +104,11 @@ transcript() {
 for file in "$HERE"/*.t; do
     [ -f "$file" ] || continue
     name=$(basename "$file" .t)
+    needs=$(sed -n 's/^## needs: //p' "$file" | head -1)
+    if [ -n "$needs" ] && ! needs_ok_015 "$MISSING015" - $needs; then
+        echo "skip $name (needs $needs; the compiler lacks: $MISSING015)"
+        continue
+    fi
     for mode in off cache; do
     transcript "$file" $mode >"$WORK/$name.got"
     if [ $UPDATE -eq 1 ] && [ $mode = off ]; then
@@ -223,15 +232,27 @@ check same_output_differs "$ok" "$out"
 # (0.13) items moved to another module and back: every file as it was.
 out=$(sh "$HERE/roundtrip.sh" -c "$COMPILER" -n 40 2>&1)
 check roundtrip "$([ $? = 0 ] && echo 1)" "$out"
+# (0.15) A module path without `crate::`, as a user writes it: made,
+# then an item moved to it.
+mkdir -p "$WORK/nocrate"
+printf 'fn helper() -> i64 {\n    2\n}\n\nfn main() -> i32 {\n    (helper() - 2) as i32\n}\n' >"$WORK/nocrate/main.tach"
+out=$(cd "$WORK/nocrate" && git init -q . 2>/dev/null; "$COMPILER" refactor new-module report 2>&1 \
+    && "$COMPILER" refactor move helper --to report 2>&1 && "$COMPILER" query def report::helper 2>&1)
+ok=0
+printf '%s\n' "$out" | grep -q '^made module report' \
+    && printf '%s\n' "$out" | grep -q "^crate::report::helper${TAB}report.tach:1:8${TAB}" && ok=1
+check module_path_without_crate "$ok" "$out"
 # explain (0.13): every code the compiler's source can print has an
 # entry: the tools' codes (`c"query.no-match"`), the kinds of the
 # compiler's errors (ERR_KIND) and warnings and keyed errors (their
 # third argument); and every entry is such a code.
 {
-    grep -rhoE 'c"(query|edit|patch|undo|check|fix|lint|fmt|same-output|refactor|rewrite|explain)\.[a-z-]+"' \
+    grep -rhoE 'c"(query|edit|patch|undo|check|fix|lint|fmt|same-output|refactor|rewrite|explain|batch|conflict|try)\.[a-z-]+"' \
         compiler/src
     grep -rhoE 'ERR_KIND = c"[^"]*"' compiler/src
     grep -rhoE 'report_(warning|error_once)\([^,]*, [^,]*, c"[^"]*"' compiler/src
+    # (0.15: guide's codes, written into its own messages)
+    grep -rhoE '"(error|note) guide\.[a-z-]+' compiler/src | sed -e 's/^"[a-z]* \(.*\)$/c"\1"/'
 } | sed -e 's/.*c"\([^"]*\)"$/\1/' | sort -u >"$WORK/codes"
 "$COMPILER" explain --list | sort >"$WORK/explained"
 missing=$(comm -23 "$WORK/codes" "$WORK/explained")

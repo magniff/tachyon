@@ -27,6 +27,11 @@
 #             with each line of this text in its diagnostics (short form)
 #   other     (sh, text, rust) not checked
 #
+# (0.15) A block fenced ```tach 0.15 FEATURE... uses features of 0.15 that
+# are built in parts: it is checked as a tach block when the compiler has
+# them all (tests/needs015.sh: try, from, widen, args, io, fmt, derive),
+# else skipped (`skip NAME`), with its in, out or err block.
+#
 # Prints `pass NAME` or `FAIL NAME` (and why) for each check; exits 1 if
 # one failed.
 
@@ -59,12 +64,14 @@ trap 'exit 130' INT TERM
 STATUS=0
 RESULTS="$WORK/results"
 : >"$RESULTS"
+. "$ROOT/tests/needs015.sh"
+MISSING015=$(missing_015 "$COMPILER" "$WORK")
 
 # Splits the guide text $1 (topic $2) into one directory per tach block
 # under $WORK/blocks: prog.tach (wrapped as its kind needs), and, when an
 # out or err block follows, out (with exit) or err.
 split_blocks() {
-    awk -v topic="$2" -v dir="$WORK/blocks" '
+    awk -v topic="$2" -v dir="$WORK/blocks" -v missing015=" $MISSING015" '
         function flush_pending() { pending = "" }
         function item_line(l) {
             return l ~ /^(pub |fn |struct |enum |union |impl|trait |const |static |type |use |mod |import |extern |unsafe fn |#\[|}|\/\/|$)/
@@ -85,7 +92,7 @@ split_blocks() {
             }
             if (line == "```") {
                 infence = 0
-                if (lang == "tach") {
+                if (lang == "tach" || lang ~ /^tach 0\.15( |$)/) {
                     n++
                     name = topic ":" start
                     d = dir "/" topic "-" sprintf("%05d", start)
@@ -114,6 +121,15 @@ split_blocks() {
                         print "}" > f
                     }
                     close(f)
+                    if (lang ~ /^tach 0\.15/) {
+                        nw = split(lang, w, " ")
+                        lacks = ""
+                        for (j = 3; j <= nw; j++) if (index(missing015, " " w[j] " ")) lacks = lacks " " w[j]
+                        if (lacks != "") {
+                            printf "0.15:%s", lacks > (d "/skip")
+                            close(d "/skip")
+                        }
+                    }
                     pending = d
                 } else if (lang == "in" && pending != "") {
                     printf "%s", body > (pending "/stdin")
@@ -151,6 +167,10 @@ trimmed() {
 check_block() {
     d=$1
     name=$(cat "$d/name")
+    if [ -f "$d/skip" ]; then
+        echo "skip $name (the compiler lacks $(cat "$d/skip"))" >"$d/result"
+        return
+    fi
     if [ -f "$d/err" ]; then
         "$COMPILER" --deny-warnings --diagnostics=short "$d/prog.tach" -o "$d/prog" >"$d/compile.out" 2>&1
         rc=$?
@@ -252,7 +272,7 @@ if ! "$COMPILER" guide --list >"$WORK/list" 2>&1; then
     result FAIL guide-list "tachyonc guide --list failed:" "$(cat "$WORK/list")"
 fi
 missing=""
-for t in core rust syntax types std errors unsafe c-interop modules generics traits closures iterators memory tools; do
+for t in core rust syntax types std errors unsafe c-interop modules generics traits closures iterators conversions formatting memory tools; do
     awk -F '\t' -v t="$t" '$1 == t { found = 1 } END { exit !found }' "$WORK/list" || missing="$missing $t"
 done
 if [ -n "$missing" ]; then
@@ -322,6 +342,108 @@ if (cd "$WORK/std" && "$COMPILER" query items std --root main.tach) >"$WORK/std/
     fi
 else
     result FAIL guide-std "query items std failed:" "$(cat "$WORK/std/items")"
+fi
+
+# The guide by piece (0.15): --find prints the paragraphs about the
+# words under `# TOPIC#SECTION`, within its budget; TOPIC#SECTION one
+# section; TOPIC# the sections; --budget cuts any of it, with a note.
+"$COMPILER" guide --find read a line >"$WORK/find.out" 2>"$WORK/find.err"
+rc=$?
+if [ $rc -eq 0 ] && head -1 "$WORK/find.out" | grep -q '^# std#input$' \
+    && grep -q 'read_line(&buf)' "$WORK/find.out" \
+    && [ "$(wc -c <"$WORK/find.out" | tr -d ' ')" -le 4000 ]; then
+    result pass guide-find
+else
+    result FAIL guide-find "exit $rc:" "$(head -3 "$WORK/find.out")" "$(cat "$WORK/find.err")"
+fi
+"$COMPILER" guide --find xyzzy frobnicate >"$WORK/nofind.out" 2>&1
+rc=$?
+if [ $rc -eq 1 ] && grep -q '^error guide.no-match: ' "$WORK/nofind.out"; then
+    result pass guide-find-none
+else
+    result FAIL guide-find-none "exit $rc:" "$(cat "$WORK/nofind.out")"
+fi
+"$COMPILER" guide 'tools#' >"$WORK/secs.out" 2>&1
+"$COMPILER" guide 'tools#the-loop' >"$WORK/sec.out" 2>&1
+rc=$?
+if [ $rc -eq 0 ] && grep -q '^tools#the-loop$' "$WORK/secs.out" && head -1 "$WORK/sec.out" | grep -q '^## The loop$' \
+    && ! grep -q '^## The program' "$WORK/sec.out"; then
+    result pass guide-section
+else
+    result FAIL guide-section "exit $rc:" "$(head -3 "$WORK/sec.out")" "$(head -3 "$WORK/secs.out")"
+fi
+"$COMPILER" guide 'tools#nothing-like-it' >"$WORK/nosec.out" 2>&1
+rc=$?
+if [ $rc -eq 1 ] && grep -q '^error guide.no-section: ' "$WORK/nosec.out" \
+    && grep -q '^try: .* guide tools#the-loop$' "$WORK/nosec.out"; then
+    result pass guide-no-section
+else
+    result FAIL guide-no-section "exit $rc:" "$(cat "$WORK/nosec.out")"
+fi
+"$COMPILER" guide core --budget 300 >"$WORK/cut.out" 2>"$WORK/cut.err"
+if [ "$(wc -c <"$WORK/cut.out" | tr -d ' ')" -le 1200 ] && grep -q '^note guide.budget: ' "$WORK/cut.err" \
+    && grep -q '^try: .* guide core --budget [0-9]*$' "$WORK/cut.err"; then
+    result pass guide-budget-cut
+else
+    result FAIL guide-budget-cut "$(cat "$WORK/cut.err")"
+fi
+
+# explain WORDS that are no code: the guide's paragraphs (0.15).
+"$COMPILER" explain closure capture >"$WORK/ex.out" 2>"$WORK/ex.err"
+rc=$?
+if [ $rc -eq 0 ] && grep -q '^note explain.guide: ' "$WORK/ex.err" && grep -q '^# closures#' "$WORK/ex.out"; then
+    result pass explain-words
+else
+    result FAIL explain-words "exit $rc:" "$(cat "$WORK/ex.err")"
+fi
+
+# --help on every command (0.15): the command's rows, no error.
+for c in "" edit "edit patch" refactor "refactor signature" fix fmt check undo explain try "query context" rewrite lint same-output; do
+    # shellcheck disable=SC2086
+    if "$COMPILER" $c --help >"$WORK/help.out" 2>&1 && [ -s "$WORK/help.out" ] \
+        && [ "$(wc -l <"$WORK/help.out")" -le 15 ] && ! grep -q '^error' "$WORK/help.out"; then
+        :
+    else
+        result FAIL "help-$c" "$(head -3 "$WORK/help.out")"
+    fi
+done
+result pass help
+
+# tachyonc try (0.15): a snippet run with std; its last value and type,
+# its output, its errors at the snippet's lines, its exit code.
+try_case() { # <name> <expected output> <snippet...>
+    n=$1
+    want=$2
+    shift 2
+    got=$("$COMPILER" try "$@" 2>&1)
+    if [ "$got" = "$want" ]; then
+        result pass "try-$n"
+    else
+        result FAIL "try-$n" "expected:" "$want" "got:" "$got"
+    fi
+}
+try_case int 'i64 = 3' '1 + 2'
+try_case std 'Option<i64> = Some(42)' 'parse_int("42").ok()'
+try_case vec 'Vec<i64> = [4, 5]' 'let mut v: Vec<i64> = Vec::new(); v.push(4); v.push(5); v'
+try_case output "hi
+[u8] = \"abc\"" 'println("hi"); "abc"'
+try_case item 'i64 = 49' 'fn sq(x: i64) -> i64 { x * x } sq(7)'
+try_case tuple '(i64, bool) = (1, true)' '(1, true)'
+try_case unit '' 'let x = 3;'
+try_case error "snippet:2:5: error[type error] expected 'i64', got '[u8]'" 'let a = 1;
+a + "b"'
+try_case panic 'index out of bounds: index 3, length 0
+exit 101' 'let v: Vec<i64> = Vec::new(); v.get(3)'
+printf 'struct P { x: i64 }\n\nlet p = P { x: 4 };\np.x * 10\n' >"$WORK/snip.tach"
+try_case file 'i64 = 40' --file "$WORK/snip.tach"
+got=$(printf '7\n' | "$COMPILER" try 'let mut b = Buf::new(); read_line(&b).unwrap(); parse_int(b.as_slice()).ok()' 2>&1)
+if [ "$got" = 'Option<i64> = Some(7)' ]; then result pass try-stdin; else result FAIL try-stdin "$got"; fi
+"$COMPILER" try >"$WORK/try.out" 2>&1
+rc=$?
+if [ $rc -eq 2 ] && grep -q '^error try.usage: ' "$WORK/try.out" && grep -q "^try: .* try 'let v" "$WORK/try.out"; then
+    result pass try-usage
+else
+    result FAIL try-usage "exit $rc:" "$(cat "$WORK/try.out")"
 fi
 
 check_blocks

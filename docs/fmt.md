@@ -85,6 +85,12 @@ Within that:
   `move |x| -> i64 { x }`, `|(a, b): (i64, i64)|`; a bar opens a closure
   where an operand starts (after `(`, `,`, `=`, `move`, `return`...), and
   `a | b`, `a || b` after an operand stay operators, spaced.
+  (0.15) An f-string's text is never touched; its holes are laid out as
+  expressions, with no space inside the braces or before a spec
+  (`f"{a + b:>8} {p:?}"`). `x?` is tight; a named argument and a field
+  are `name: value`, a default `x: i64 = 1`; `#[derive(Eq, Ord)]` as a
+  call's arguments; closers of nested type arguments stay together
+  (`Conv<Vec<i64>>>`).
 - **Blank lines**: at most one in a row; none at the start of the file,
   after an opening bracket or before a closing one; one between two items
   of a file, impl, trait, module or extern block when either is a
@@ -108,7 +114,8 @@ Within that:
   own (a `match`: an arm a line). The lines after it that continue it the
   same way (more arguments, more `&&`) are joined to it first and filled
   again. A line with a token too long for any line (a long string) is left
-  as it is.
+  as it is. (0.15) No line is broken inside an f-string: a long one goes
+  on a line of its own, whole (after its call's `(`).
 
 ### Edits are formatted
 

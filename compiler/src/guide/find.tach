@@ -1,0 +1,434 @@
+// The guide by piece (0.15): `guide --find WORDS` prints the paragraphs
+// about WORDS (each under `# TOPIC#SECTION`), `guide TOPIC#SECTION` one
+// section, `guide TOPIC#` the sections of a topic; `--budget N` keeps
+// any of it to about N tokens. A paragraph is a run of lines between
+// blank lines, a code block (and what follows it without a blank line)
+// whole; a section starts at a `## ` heading. `explain WORDS` falls back
+// on find (tools/explain).
+
+use crate::base::{IntVec, buf_byte, buf_bytes, buf_new, buf_slice};
+use crate::guide::render;
+use crate::guide::text::{TOPIC_COUNT, topic_name};
+
+// The budget of `--find` without --budget, in tokens.
+pub const FIND_BUDGET: i64 = 1000;
+
+// The paragraphs of every topic: their topic, text buffer, span, and the
+// span of their section's heading (or -1).
+static mut P_TOPIC: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut P_BUF: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut P_START: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut P_END: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut P_SEC: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut P_SEC_END: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+fn lower(c: u8) -> u8 {
+    if c >= 'A' && c <= 'Z' { c - 'A' + 'a' } else { c }
+}
+
+fn line_end(s: [u8], i: i64) -> i64 {
+    let mut e = i;
+    while e < s.len && s[e] != '\n' {
+        e += 1;
+    }
+    e
+}
+
+fn is_blank(s: [u8]) -> bool {
+    for i in 0..s.len {
+        if s[i] != ' ' && s[i] != '\t' {
+            return false;
+        }
+    }
+    true
+}
+
+fn starts(s: [u8], p: [u8]) -> bool {
+    s.len >= p.len && s[0..p.len] == p
+}
+
+// Splits every topic into paragraphs (once).
+fn split_all() {
+    unsafe {
+        if P_TOPIC.count > 0 {
+            return;
+        }
+        for t in 0..TOPIC_COUNT {
+            let b = buf_new();
+            render(t, b);
+            let s = buf_slice(b);
+            let mut sec = -1;
+            let mut sec_end = -1;
+            let mut i = 0;
+            let mut start = -1;
+            let mut fence = false;
+            while i < s.len {
+                let e = line_end(s, i);
+                let line = s[i..e];
+                if starts(line, "```") {
+                    fence = !fence;
+                }
+                let blank = !fence && is_blank(line);
+                let heading = !fence && (starts(line, "## ") || starts(line, "# "));
+                if (blank || heading) && start >= 0 {
+                    add_paragraph(t, b, start, i, sec, sec_end);
+                    start = -1;
+                }
+                if heading {
+                    sec = i + (if starts(line, "## ") { 3 } else { 2 });
+                    sec_end = e;
+                } else if !blank && start < 0 {
+                    start = i;
+                }
+                i = e + 1;
+            }
+            if start >= 0 {
+                add_paragraph(t, b, start, s.len, sec, sec_end);
+            }
+        }
+    }
+}
+
+fn add_paragraph(t: i64, b: i64, start: i64, end: i64, sec: i64, sec_end: i64) {
+    unsafe {
+        P_TOPIC.push(t);
+        P_BUF.push(b);
+        P_START.push(start);
+        P_END.push(end);
+        P_SEC.push(sec);
+        P_SEC_END.push(sec_end);
+    }
+}
+
+// `TOPIC#section-slug` of paragraph p, to out.
+fn put_where(out: i64, p: i64) {
+    unsafe {
+        buf_bytes(out, topic_name(P_TOPIC.data[p]));
+        buf_byte(out, '#');
+        if P_SEC.data[p] >= 0 {
+            let s = buf_slice(P_BUF.data[p]);
+            put_slug(out, s[P_SEC.data[p]..P_SEC_END.data[p]]);
+        }
+    }
+}
+
+// A heading as a slug: lower case, words joined by `-`, nothing but
+// letters, digits and `-`.
+fn put_slug(out: i64, h: [u8]) {
+    let mut dash = false;
+    let mut any = false;
+    for i in 0..h.len {
+        let c = lower(h[i]);
+        if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') {
+            if dash && any {
+                buf_byte(out, '-');
+            }
+            buf_byte(out, c);
+            dash = false;
+            any = true;
+        } else {
+            dash = true;
+        }
+    }
+}
+
+// Whether text holds word (lower case already), ignoring case.
+fn holds(text: [u8], word: [u8]) -> bool {
+    if word.len == 0 || word.len > text.len {
+        return false;
+    }
+    let mut i = 0;
+    while i + word.len <= text.len {
+        if lower(text[i]) == word[0] {
+            let mut k = 1;
+            while k < word.len && lower(text[i + k]) == word[k] {
+                k += 1;
+            }
+            if k == word.len {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+// The occurrences of word (lower case already) in text, ignoring case.
+fn count_in(text: [u8], word: [u8]) -> i64 {
+    if word.len == 0 || word.len > text.len {
+        return 0;
+    }
+    let mut n = 0;
+    let mut i = 0;
+    while i + word.len <= text.len {
+        let mut k = 0;
+        while k < word.len && lower(text[i + k]) == word[k] {
+            k += 1;
+        }
+        if k == word.len {
+            n += 1;
+            i += word.len;
+        } else {
+            i += 1;
+        }
+    }
+    n
+}
+
+// Words a question is made of that say nothing (`how to read a line`).
+fn is_stop_word(w: [u8]) -> bool {
+    let stops = ["a", "an", "the", "to", "of", "in", "is", "how", "do", "i", "what", "and", "or",
+        "on", "for", "with", "can", "my", "does"];
+    for k in 0..19 {
+        if w == stops[k] {
+            return true;
+        }
+    }
+    false
+}
+
+// The words of `query` (lower case, without the quotes and punctuation
+// around them; `a::b` and `[u8]` kept), as buffers.
+fn words_of(query: [u8], out: *IntVec) {
+    let mut i = 0;
+    while i < query.len {
+        while i < query.len && (query[i] == ' ' || query[i] == '\t' || query[i] == '\n') {
+            i += 1;
+        }
+        let mut e = i;
+        while e < query.len && query[e] != ' ' && query[e] != '\t' && query[e] != '\n' {
+            e += 1;
+        }
+        let mut a = i;
+        let mut b = e;
+        while a < b && !word_byte(query[a]) && query[a] != '[' && query[a] != '&'
+            && query[a] != '*' {
+            a += 1;
+        }
+        while b > a && !word_byte(query[b - 1]) && query[b - 1] != ']' && query[b - 1] != '!'
+            && query[b - 1] != ')' {
+            b -= 1;
+        }
+        if b - a >= 2 || (b - a == 1 && word_byte(query[a])) {
+            let w = buf_new();
+            for k in a..b {
+                buf_byte(w, lower(query[k]));
+            }
+            out.push(w);
+        }
+        i = e;
+    }
+    // (without the words that say nothing, unless nothing is left)
+    unsafe {
+        let mut kept = 0;
+        for k in 0..(*out).count {
+            if !is_stop_word(buf_slice((*out).data[k])) {
+                kept += 1;
+            }
+        }
+        if kept > 0 {
+            let mut j = 0;
+            for k in 0..(*out).count {
+                let w = (*out).data[k];
+                if !is_stop_word(buf_slice(w)) {
+                    (*out).data[j] = w;
+                    j += 1;
+                }
+            }
+            (*out).count = j;
+        }
+    }
+}
+
+fn word_byte(c: u8) -> bool {
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+}
+
+fn is_code(s: [u8]) -> bool {
+    starts(s, "```")
+}
+
+// `guide --find QUERY`: the paragraphs holding all of its words first,
+// then those holding most of them (at least 3 in 5), into out within
+// `budget` bytes; the number found (0: none), and in *left those left
+// out by the budget.
+pub fn guide_find(query: [u8], budget: i64, out: i64, left: *i64) -> i64 {
+    unsafe {
+        split_all();
+        let mut words = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        words_of(query, &words);
+        *left = 0;
+        if words.count == 0 {
+            return 0;
+        }
+        let n = P_TOPIC.count;
+        let score = crate::base::alloc_array::<i64>(n + 1);
+        let matched = crate::base::alloc_array::<i64>(n + 1);
+        let mut picked = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        // (the whole query, as a phrase)
+        let phrase = buf_new();
+        for w in 0..words.count {
+            if w > 0 {
+                buf_byte(phrase, ' ');
+            }
+            buf_bytes(phrase, buf_slice(words.data[w]));
+        }
+        let mut best = 0;
+        for p in 0..n {
+            let text = buf_slice(P_BUF.data[p])[P_START.data[p]..P_END.data[p]];
+            let mut k = 0;
+            let mut hits = 0;
+            let place = buf_new();
+            put_where(place, p);
+            for w in 0..words.count {
+                let c = count_in(text, buf_slice(words.data[w]));
+                if c > 0 {
+                    k += 1;
+                    hits += if c > 5 { 5 } else { c };
+                    // (a word of the topic or section name: about it)
+                    if holds(buf_slice(place), buf_slice(words.data[w])) {
+                        hits += 5;
+                    }
+                }
+            }
+            matched[p] = k;
+            score[p] = k * 100 + hits + (if words.count > 1 && holds(text, buf_slice(phrase)) { 50 }
+                else { 0 });
+            if k > best {
+                best = k;
+            }
+        }
+        // (all the words when some paragraph has them all; else most)
+        for p in 0..n {
+            let k = matched[p];
+            if k > 0 && (k == words.count || (best < words.count && k * 5 >= words.count * 3)) {
+                picked.push(p);
+            }
+        }
+        // (the best first; in the guide's order among equals)
+        for a in 1..picked.count {
+            let mut b = a;
+            while b > 0 && score[picked.data[b - 1]] < score[picked.data[b]] {
+                let t = picked.data[b];
+                picked.data[b] = picked.data[b - 1];
+                picked.data[b - 1] = t;
+                b -= 1;
+            }
+        }
+        let mut room = budget;
+        let mut shown = 0;
+        let mut last_where = buf_new();
+        for i in 0..picked.count {
+            let p = picked.data[i];
+            let piece = buf_new();
+            let w = buf_new();
+            put_where(w, p);
+            if buf_slice(w) != buf_slice(last_where) {
+                buf_bytes(piece, "# ");
+                buf_bytes(piece, buf_slice(w));
+                buf_byte(piece, '\n');
+            }
+            let s = buf_slice(P_BUF.data[p]);
+            buf_bytes(piece, s[P_START.data[p]..P_END.data[p]]);
+            // (a paragraph's example: the code block right after it)
+            if !is_code(s[P_START.data[p]..P_END.data[p]]) && p + 1 < n
+                && P_BUF.data[p + 1] == P_BUF.data[p]
+                && is_code(s[P_START.data[p + 1]..P_END.data[p + 1]])
+                && matched[p + 1] < words.count {
+                buf_bytes(piece, s[P_START.data[p + 1]..P_END.data[p + 1]]);
+            }
+            if buf_slice(piece).len > room {
+                *left = *left + 1;
+                continue;
+            }
+            buf_bytes(out, buf_slice(piece));
+            room -= buf_slice(piece).len;
+            last_where = w;
+            shown += 1;
+        }
+        picked.count
+    }
+}
+
+// `guide TOPIC#SECTION` (topic t): the section whose heading's slug is
+// `want` or starts with it (or holds it), from its heading to the next,
+// into out; false when there is none. `TOPIC#`: the sections' names.
+pub fn guide_section(t: i64, want0: [u8], out: i64) -> bool {
+    unsafe {
+        let b = buf_new();
+        render(t, b);
+        let s = buf_slice(b);
+        let want = buf_new();
+        put_slug(want, want0);
+        let w = buf_slice(want);
+        // The headings and their slugs.
+        let mut heads = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut i = 0;
+        let mut fence = false;
+        while i < s.len {
+            let e = line_end(s, i);
+            let line = s[i..e];
+            if starts(line, "```") {
+                fence = !fence;
+            }
+            if !fence && starts(line, "## ") {
+                heads.push(i);
+            }
+            i = e + 1;
+        }
+        if w.len == 0 {
+            for k in 0..heads.count {
+                buf_bytes(out, topic_name(t));
+                buf_byte(out, '#');
+                put_slug(out, s[heads.data[k] + 3..line_end(s, heads.data[k])]);
+                buf_byte(out, '\n');
+            }
+            return true;
+        }
+        // (the exact slug, else the first that starts with it, else holds it)
+        let mut found = -1;
+        for pass in 0..3 {
+            for k in 0..heads.count {
+                if found >= 0 {
+                    break;
+                }
+                let slug = buf_new();
+                put_slug(slug, s[heads.data[k] + 3..line_end(s, heads.data[k])]);
+                let g = buf_slice(slug);
+                if (pass == 0 && g == w) || (pass == 1 && starts(g, w))
+                    || (pass == 2 && holds(g, w)) {
+                    found = k;
+                }
+            }
+        }
+        if found < 0 {
+            return false;
+        }
+        let from = heads.data[found];
+        let to = if found + 1 < heads.count { heads.data[found + 1] } else { s.len };
+        buf_bytes(out, s[from..to]);
+        true
+    }
+}
+
+// `try:` lines naming the first sections of topic t (prog: the
+// compiler as it was run).
+pub fn put_sections_try(err: i64, prog: *u8, t: i64) {
+    let names = buf_new();
+    guide_section(t, "", names);
+    let s = buf_slice(names);
+    let mut i = 0;
+    let mut n = 0;
+    while i < s.len && n < 5 {
+        let e = line_end(s, i);
+        buf_bytes(err, "try: ");
+        unsafe {
+            crate::base::buf_str(err, prog);
+        }
+        buf_bytes(err, " guide ");
+        buf_bytes(err, s[i..e]);
+        buf_byte(err, '\n');
+        i = e + 1;
+        n += 1;
+    }
+}

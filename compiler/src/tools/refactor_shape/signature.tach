@@ -4,6 +4,7 @@
 
 use crate::base::{
     FILES, IntVec, SRC, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, intern, intern_c,
+    streq,
 };
 use crate::front::ast::{NODES, NODE_COUNT, NodeKind};
 use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
@@ -19,16 +20,16 @@ use crate::tools::query::defs::{
 use crate::tools::query::diagnostics::{
     PROG, ROOT_GIVEN, TOOL, diag, put_root, put_word, try_end, write_diags,
 };
-use crate::tools::query::positions::{enclosing, put_loc, token_at};
+use crate::tools::query::positions::{enclosing, put_loc, shorthand_at, shorthand_text, token_at};
 use crate::tools::query::refs::{R_FLAGS, R_POS};
 use crate::tools::refactor_shape::{
-    L_END, L_START, PROGRAM_END, SUB, find_byte, has_call, leading_name, list_insert, list_of_node,
-    list_of_params, list_permute, list_remove, load_and_find, name_token, opt, orig_of, put_count,
-    refs_of, replace_name, split_default, sym_text, take_args, text_buf, try_query_name,
-    try_refactor, try_show_at, usage_error,
+    L_CLOSE, L_END, L_OPEN, L_START, PROGRAM_END, SUB, find_byte, has_call, leading_name,
+    list_insert, list_of_node, list_of_params, list_permute, list_remove, load_and_find, name_token,
+    opt, orig_of, put_count, refs_of, replace_name, split_default, sym_text, take_args, text_buf,
+    try_query_name, try_refactor, try_show_at, usage_error,
 };
 use crate::tools::rewrite::sort_by_start;
-use crate::tools::rewrite::parsed::{pa, pb, pc, pchild, pcount, pend, pk, pstart};
+use crate::tools::rewrite::parsed::{pa, pb, pc, pchild, pcount, pend, ph, pk, pstart};
 
 // ---- refactor signature ----
 
@@ -130,6 +131,116 @@ fn param_index(f: i64, name: i64) -> i64 {
     -1
 }
 
+// Whether flag `name` (an option without a value) is in opts.
+fn has_flag(opts: *IntVec, name: *u8) -> bool {
+    unsafe {
+        for i in 0..(*opts).count {
+            if streq((*opts).data[i] as *u8, name) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// (0.15) The parameter of f (its index, self counted) that argument i of
+// call c gives as written: by its position, or by its label (`name:
+// value`; -1 for a name f has not). off: 1 for a method call's self.
+fn arg_param(f: i64, c: i64, i: i64, off: i64) -> i64 {
+    let a = pchild(c, i);
+    if pk(a) == NodeKind::NamedArg { param_index(f, pa(a)) } else { i + off }
+}
+
+// (0.15) The argument of call c (its index in the list as written) that
+// gives parameter k of f, or -1: none, it is left to its default.
+fn arg_for(f: i64, c: i64, k: i64, off: i64) -> i64 {
+    for i in 0..pcount(c) {
+        if arg_param(f, c, i, off) == k {
+            return i;
+        }
+    }
+    -1
+}
+
+// (0.15) Whether call c of f has a labelled argument or leaves a
+// parameter to its default.
+fn named_or_short(f: i64, c: i64, off: i64) -> bool {
+    if pcount(c) + off != pcount(f) {
+        return true;
+    }
+    for i in 0..pcount(c) {
+        if pk(pchild(c, i)) == NodeKind::NamedArg {
+            return true;
+        }
+    }
+    false
+}
+
+// (0.15) Argument `value` for new parameter k (named pname) inserted into
+// call c (its list read: list_of_node): by its position when every
+// parameter before it is given by position, else by its label, among the
+// labelled ones in the parameters' order.
+fn insert_argument(f: i64, c: i64, k: i64, off: i64, value: [u8], pname: i64) {
+    let mut positional = 0;
+    while positional < pcount(c) && pk(pchild(c, positional)) != NodeKind::NamedArg {
+        positional += 1;
+    }
+    if k - off <= positional {
+        list_insert(k - off, value);
+        return;
+    }
+    let b = buf_new();
+    buf_bytes(b, sym_text(pname));
+    buf_bytes(b, ": ");
+    buf_bytes(b, value);
+    let mut at = pcount(c);
+    for i in positional..pcount(c) {
+        if arg_param(f, c, i, off) >= k && at == pcount(c) {
+            at = i;
+        }
+    }
+    list_insert(at, buf_slice(b));
+}
+
+// (0.15) Call c of f written again with its arguments in the parameters'
+// new order perm (the old index of each; self first for a method): a
+// parameter left to its default stays so, and every argument after one,
+// or after a labelled one, is labelled. Whether two or more of them call
+// functions (their order of evaluation changes).
+fn reorder_named(f: i64, c: i64, off: i64, perm: *IntVec) -> bool {
+    unsafe {
+        let b = buf_new();
+        let mut named = false;
+        let mut first = true;
+        let mut effects = 0;
+        for j in off..(*perm).count {
+            let p = (*perm).data[j];
+            let i = arg_for(f, c, p, off);
+            if i < 0 {
+                named = true;
+                continue;
+            }
+            let a = pchild(c, i);
+            let v = if pk(a) == NodeKind::NamedArg { pb(a) } else { a };
+            if has_call(pstart(v), pend(v)) {
+                effects += 1;
+            }
+            if !first {
+                buf_bytes(b, ", ");
+            }
+            first = false;
+            if pk(a) == NodeKind::NamedArg || named {
+                named = true;
+                buf_bytes(b, sym_text(pa(pchild(f, p))));
+                buf_bytes(b, ": ");
+            }
+            buf_bytes(b, SRC[pstart(v)..pend(v)]);
+        }
+        edit_replace(L_OPEN, L_CLOSE, b);
+        effects > 1
+    }
+}
+
 fn has_self(f: i64) -> bool {
     unsafe { pcount(f) > 0 && pa(pchild(f, 0)) == intern_c(c"self") }
 }
@@ -213,7 +324,8 @@ fn signature_inner(argc: i64, argv: **u8) -> i64 {
         let mut words = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let mut opts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let example = c"NAME --add 'x: i64 = 0' --dry-run";
-        let options = c"--add=1 --at=1 --remove=1 --rename-param=2 --reorder=1 --type=2 --default=1";
+        let options =
+            c"--add=1 --at=1 --remove=1 --rename-param=2 --reorder=1 --type=2 --default=1 --fill-calls=0";
         if !take_args(argc, argv, options, &root, &words, &opts) {
             return 2;
         }
@@ -235,6 +347,10 @@ fn signature_inner(argc: i64, argv: **u8) -> i64 {
         }
         if at != 0 as *u8 && add == 0 as *u8 {
             return usage_error(c"--at goes with --add", example);
+        }
+        let fill = has_flag(&opts, c"--fill-calls");
+        if fill && add == 0 as *u8 {
+            return usage_error(c"--fill-calls goes with --add", example);
         }
         let default = opt(&opts, c"--default", false);
         if default != 0 as *u8 && retype == 0 as *u8 {
@@ -353,20 +469,56 @@ fn signature_inner(argc: i64, argv: **u8) -> i64 {
                 buf_byte(e, '\n');
                 return 2;
             }
+            // (0.15: `= VALUE` declares a default, and the calls stay as
+            // they are; but a trait's function has no defaults, a default
+            // is on trailing parameters only, and --fill-calls asks: then
+            // VALUE is written into every call, as 0.14 did)
+            let value = if vstart >= 0 { text[vstart..text.len] } else { text[0..0] };
+            let mut why = 0 as *u8;
+            if vstart >= 0 {
+                if fill {
+                    why = c"--fill-calls";
+                }
+                else if group.count > 1 || DEFS[d].kind == K_TRAIT_FN
+                    || DEFS[d].kind == K_IMPL_METHOD {
+                    why = c"a trait's function has no defaults";
+                } else {
+                    for j in k..pcount(f) {
+                        if ph(pchild(f, j)) == 0 && why == 0 as *u8 {
+                            why = c"a default is on trailing parameters only, and a later one has none";
+                        }
+                    }
+                }
+            }
+            let declare = vstart >= 0 && why == 0 as *u8;
+            // (filled: a default before it keeps this one's too)
+            let mut keep = declare;
+            for j in 0..k {
+                if ph(pchild(f, j)) != 0 {
+                    keep = true;
+                }
+            }
             for g in 0..group.count {
                 let gd = group.data[g];
                 list_of_params(DEFS[gd].node, DEFS[gd].name_pos);
-                list_insert(k, decl);
+                list_insert(k, if keep && vstart >= 0 { text } else { decl });
             }
-            let value = if vstart >= 0 { text[vstart..text.len] } else { text[0..0] };
-            for i in 0..calls.count {
-                let c = calls.data[i];
-                list_of_node(c);
-                let off = if pk(c) == NodeKind::MethodCall && self_param { 1 } else { 0 };
-                list_insert(k - off, value);
+            if !declare {
+                for i in 0..calls.count {
+                    let c = calls.data[i];
+                    list_of_node(c);
+                    let off = if pk(c) == NodeKind::MethodCall && self_param { 1 } else { 0 };
+                    insert_argument(f, c, k, off, value, pname);
+                }
+                if why != 0 as *u8 && !fill && calls.count > 0 {
+                    let e = diag(c"note", c"refactor.fill-calls");
+                    buf_str(e, c"the calls get the value (");
+                    buf_str(e, why);
+                    buf_str(e, c")\n");
+                }
             }
             buf_str(what, c"added parameter ");
-            buf_bytes(what, decl);
+            buf_bytes(what, if keep && vstart >= 0 { text } else { decl });
             buf_str(what, c" to ");
         } else if remove != 0 as *u8 {
             let pname = intern(c_slice(remove));
@@ -407,10 +559,15 @@ fn signature_inner(argc: i64, argv: **u8) -> i64 {
                 let c = calls.data[i];
                 list_of_node(c);
                 let off = if pk(c) == NodeKind::MethodCall && self_param { 1 } else { 0 };
-                if has_call(L_START.data[k - off], L_END.data[k - off]) && effects < 0 {
-                    effects = L_START.data[k - off];
+                // (0.15: the argument named, or none: left to its default)
+                let a = arg_for(f, c, k, off);
+                if a < 0 {
+                    continue;
                 }
-                list_remove(k - off);
+                if has_call(L_START.data[a], L_END.data[a]) && effects < 0 {
+                    effects = L_START.data[a];
+                }
+                list_remove(a);
             }
             if effects >= 0 {
                 let e = diag(c"warning", c"refactor.effects");
@@ -453,7 +610,24 @@ fn signature_inner(argc: i64, argv: **u8) -> i64 {
                 let mut uses = IntVec { data: 0 as *i64, count: 0, cap: 0 };
                 name_uses(gf, gold, &uses);
                 for u in 0..uses.count {
-                    replace_name(pstart(uses.data[u]), gold, new);
+                    let at = pstart(uses.data[u]);
+                    if shorthand_at(at) {
+                        // (0.15: `S { x }` becomes `S { x: y }`)
+                        edit_replace(at, at + sym_text(gold).len,
+                            shorthand_text(sym_text(gold), sym_text(new)));
+                    } else {
+                        replace_name(at, gold, new);
+                    }
+                }
+            }
+            // (0.15: and the calls' labels, `old: value`)
+            for i in 0..calls.count {
+                let c = calls.data[i];
+                for j in 0..pcount(c) {
+                    let a = pchild(c, j);
+                    if pk(a) == NodeKind::NamedArg && pa(a) == old {
+                        replace_name(pstart(a), old, new);
+                    }
                 }
             }
             buf_str(what, c"renamed parameter ");
@@ -522,6 +696,14 @@ fn signature_inner(argc: i64, argv: **u8) -> i64 {
                 list_of_node(c);
                 let mut cperm = IntVec { data: 0 as *i64, count: 0, cap: 0 };
                 let off = if pk(c) == NodeKind::MethodCall && self_param { 1 } else { 0 };
+                if named_or_short(f, c, off) {
+                    // (0.15: a call with labels, or leaving parameters to
+                    // their defaults: written again in the new order)
+                    if reorder_named(f, c, off, &perm) && moved < 0 {
+                        moved = pstart(c);
+                    }
+                    continue;
+                }
                 let mut effects = 0;
                 for x in off..perm.count {
                     cperm.push(perm.data[x] - off);
@@ -560,8 +742,17 @@ fn signature_inner(argc: i64, argv: **u8) -> i64 {
                     let c = calls.data[i];
                     list_of_node(c);
                     let off = if pk(c) == NodeKind::MethodCall && self_param { 1 } else { 0 };
-                    let a = L_START.data[k - off];
-                    let b = L_END.data[k - off];
+                    // (0.15: a named argument's value; none: left to the default)
+                    let i0 = arg_for(f, c, k, off);
+                    if i0 < 0 {
+                        continue;
+                    }
+                    let mut v = pchild(c, i0);
+                    if pk(v) == NodeKind::NamedArg {
+                        v = pb(v);
+                    }
+                    let a = pstart(v);
+                    let b = pend(v);
                     edit_replace(a, b, with_argument(c_slice(default), sym_text(pname), SRC[a..b]));
                 }
             }

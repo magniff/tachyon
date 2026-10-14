@@ -14,8 +14,12 @@
 
 pub mod text;
 mod stdapi;
+pub mod find;
 
-use crate::base::{STDERR, STDOUT, buf_bytes, buf_int, buf_new, buf_slice, buf_str, buf_write_fd};
+use crate::base::{
+    STDERR, STDOUT, buf_bytes, buf_int, buf_new, buf_slice, buf_str, buf_write_fd, streq,
+};
+use crate::guide::find::{FIND_BUDGET, guide_find, guide_section, put_sections_try};
 use crate::guide::stdapi::std_api;
 use crate::guide::text::{TOPIC_COUNT, topic_name, topic_summary, topic_text};
 
@@ -31,7 +35,7 @@ fn topic_of(name: [u8]) -> i64 {
 
 // Writes topic i to buffer out, with its placeholder lines filled in:
 // `@STD-API@` (std's API) and `@TOPICS@` (the other topics).
-fn render(i: i64, out: i64) {
+pub fn render(i: i64, out: i64) {
     let raw = buf_new();
     topic_text(i, raw);
     let text = buf_slice(raw);
@@ -81,15 +85,20 @@ fn list(out: i64) {
 }
 
 fn usage(out: i64) {
-    buf_bytes(out, "usage: tachyonc guide [TOPIC...] [--list] [--all]\n");
+    buf_bytes(out,
+        "usage: tachyonc guide [TOPIC[#SECTION]...] [--list] [--all] [--find WORDS] [--budget N]\n");
     buf_bytes(out, "  (no TOPIC)   the core guide: the language, Rust habits, errors, tools\n");
     buf_bytes(out, "  TOPIC...     the topics, in turn\n");
     buf_bytes(out, "  --list       the topics, with their sizes\n");
     buf_bytes(out, "  --all        every topic\n");
+    buf_bytes(out, "  TOPIC#SECTION  one section (TOPIC#: its sections)\n");
+    buf_bytes(out, "  --find WORDS   the paragraphs about WORDS, each under # TOPIC#SECTION\n");
+    buf_bytes(out, "  --budget N     about N tokens at most (--find: 1000 by default)\n");
 }
 
-// `tachyonc guide ...`; the exit status: 0, 1 (a topic that does not
-// exist; the others are printed) or 2 (a usage error).
+// `tachyonc guide ...`; the exit status: 0, 1 (a topic or section that
+// does not exist, or nothing found; the others are printed) or 2 (a
+// usage error).
 pub fn run_guide(argc: i64, argv: **u8) -> i64 {
     unsafe {
         let out = buf_new();
@@ -97,13 +106,51 @@ pub fn run_guide(argc: i64, argv: **u8) -> i64 {
         let prog = argv[0];
         let mut status = 0;
         let mut any = false;
+        // (0.15: --budget N anywhere; --find takes the words after it)
+        let mut budget = -1;
+        let mut find = -1;
         for k in 2..argc {
+            if streq(argv[k], c"--budget") {
+                let n = if k + 1 < argc { parse_tokens(argv[k + 1]) } else { -1 };
+                if n < 0 {
+                    buf_bytes(err, "error guide.usage: --budget needs a number of tokens\ntry: ");
+                    buf_str(err, prog);
+                    buf_bytes(err, " guide --find WORDS --budget 1000\n");
+                    buf_write_fd(err, STDERR);
+                    return 2;
+                }
+                budget = n;
+            }
+            if streq(argv[k], c"--find") && find < 0 {
+                find = k;
+            }
+        }
+        if find >= 0 {
+            let q = buf_new();
+            for k in find + 1..argc {
+                if streq(argv[k], c"--budget") {
+                    break;
+                }
+                if buf_slice(q).len > 0 {
+                    buf_bytes(q, " ");
+                }
+                buf_str(q, argv[k]);
+            }
+            return find_command(prog, buf_slice(q), budget);
+        }
+        let mut k = 2;
+        while k < argc {
             let arg = argv[k];
             let mut n = 0;
             while arg[n] != 0 {
                 n += 1;
             }
             let name = arg[0..n];
+            k += 1;
+            if name == "--budget" {
+                k += 1;
+                continue;
+            }
             any = true;
             if name == "--list" {
                 list(out);
@@ -123,14 +170,29 @@ pub fn run_guide(argc: i64, argv: **u8) -> i64 {
                 buf_write_fd(err, STDERR);
                 return 2;
             } else {
-                let i = topic_of(name);
+                // (TOPIC#SECTION, 0.15)
+                let mut hash = 0;
+                while hash < name.len && name[hash] != '#' {
+                    hash += 1;
+                }
+                let i = topic_of(name[0..hash]);
                 if i < 0 {
                     buf_bytes(err, "error guide.no-topic: no topic '");
-                    buf_bytes(err, name);
+                    buf_bytes(err, name[0..hash]);
                     buf_bytes(err, "'\ntry: ");
                     buf_str(err, prog);
                     buf_bytes(err, " guide --list\n");
                     status = 1;
+                } else if hash < name.len {
+                    if !guide_section(i, name[hash + 1..name.len], out) {
+                        buf_bytes(err, "error guide.no-section: no section '");
+                        buf_bytes(err, name[hash + 1..name.len]);
+                        buf_bytes(err, "' in ");
+                        buf_bytes(err, name[0..hash]);
+                        buf_bytes(err, "\n");
+                        put_sections_try(err, prog, i);
+                        status = 1;
+                    }
                 } else {
                     render(i, out);
                 }
@@ -139,8 +201,105 @@ pub fn run_guide(argc: i64, argv: **u8) -> i64 {
         if !any {
             render(0, out);
         }
-        buf_write_fd(out, STDOUT);
+        write_within(out, budget, argc, argv, err);
         buf_write_fd(err, STDERR);
         status
+    }
+}
+
+// A number of tokens, or -1.
+fn parse_tokens(s: *u8) -> i64 {
+    unsafe {
+        let mut n = 0;
+        let mut i = 0;
+        while s[i] != 0 {
+            if s[i] < '0' || s[i] > '9' {
+                return -1;
+            }
+            n = n * 10 + (s[i] - '0') as i64;
+            i += 1;
+        }
+        if i == 0 { -1 } else { n }
+    }
+}
+
+// `guide --find WORDS [--budget N]`: the exit status.
+fn find_command(prog: *u8, words: [u8], budget: i64) -> i64 {
+    unsafe {
+        let out = buf_new();
+        let err = buf_new();
+        if words.len == 0 {
+            buf_bytes(err, "error guide.usage: --find needs WORDS\ntry: ");
+            buf_str(err, prog);
+            buf_bytes(err, " guide --find 'read a line'\n");
+            buf_write_fd(err, STDERR);
+            return 2;
+        }
+        let tokens = if budget > 0 { budget } else if budget == 0 { 1 << 30 } else { FIND_BUDGET };
+        let mut left = 0;
+        let found = guide_find(words, tokens * 4, out, &left);
+        buf_write_fd(out, STDOUT);
+        if found == 0 {
+            buf_bytes(err, "error guide.no-match: no paragraph about '");
+            buf_bytes(err, words);
+            buf_bytes(err, "'\ntry: ");
+            buf_str(err, prog);
+            buf_bytes(err, " guide --list\n");
+            buf_write_fd(err, STDERR);
+            return 1;
+        }
+        if left > 0 {
+            buf_bytes(err, "note guide.budget: ");
+            buf_int(err, left);
+            buf_bytes(err, " more paragraphs over the budget of ");
+            buf_int(err, tokens);
+            buf_bytes(err, " tokens\ntry: ");
+            buf_str(err, prog);
+            buf_bytes(err, " guide --find '");
+            buf_bytes(err, words);
+            buf_bytes(err, "' --budget ");
+            buf_int(err, tokens * 3);
+            buf_bytes(err, "\n");
+            buf_write_fd(err, STDERR);
+        }
+        0
+    }
+}
+
+// Writes out to stdout, cut at a line to about `budget` tokens (-1, 0:
+// all), with a note and the command that prints it all into err.
+fn write_within(out: i64, budget: i64, argc: i64, argv: **u8, err: i64) {
+    unsafe {
+        let s = buf_slice(out);
+        if budget <= 0 || s.len <= budget * 4 {
+            buf_write_fd(out, STDOUT);
+            return;
+        }
+        let mut end = budget * 4;
+        while end > 0 && s[end - 1] != '\n' {
+            end -= 1;
+        }
+        let cut = buf_new();
+        buf_bytes(cut, s[0..end]);
+        buf_write_fd(cut, STDOUT);
+        buf_bytes(err, "note guide.budget: cut at about ");
+        buf_int(err, budget);
+        buf_bytes(err, " tokens (about ");
+        buf_int(err, (s.len + 3) / 4);
+        buf_bytes(err, " in all)\ntry: ");
+        buf_str(err, argv[0]);
+        let mut k = 1;
+        while k < argc {
+            if streq(argv[k], c"--budget") {
+                k += 2;
+                continue;
+            }
+            buf_bytes(err, " ");
+            buf_str(err, argv[k]);
+            k += 1;
+        }
+        buf_bytes(err, " --budget ");
+        buf_int(err, (s.len + 3) / 4 / 100 * 100 + 100);
+        buf_bytes(err, "\n");
     }
 }

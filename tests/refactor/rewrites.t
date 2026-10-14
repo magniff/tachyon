@@ -99,11 +99,11 @@ $ undo
 undid rewrote 1 site in 1 file	main.tach	+1 -1 lines
 ## A rewrite that breaks the program: nothing written.
 $ rewrite 'grow($v, $n)' 'grow($n, $v)'
-main.tach:10:10: error[type error] expected '*IntVec', got 'i64'
-main.tach:25:10: error[type error] expected '*IntVec', got 'i64'
-main.tach:26:10: error[type error] expected '*IntVec', got 'i64'
-main.tach:31:10: error[type error] expected '*IntVec', got 'i64' | note: in instantiation of 'grow_twice<i64>' at main.tach:20:5
-main.tach:32:10: error[type error] expected '*IntVec', got 'i64' | note: in instantiation of 'grow_twice<i64>' at main.tach:20:5
+main.tach:10:10: error[type error] expected '*IntVec', got 'i64'  [edited: crate::main]
+main.tach:25:10: error[type error] expected '*IntVec', got 'i64'  [edited: crate::more]
+main.tach:26:10: error[type error] expected '*IntVec', got 'i64'  [edited: crate::more]
+main.tach:31:10: error[type error] expected '*IntVec', got 'i64' | note: in instantiation of 'grow_twice<i64>' at main.tach:20:5  [edited: crate::grow_twice]
+main.tach:32:10: error[type error] expected '*IntVec', got 'i64' | note: in instantiation of 'grow_twice<i64>' at main.tach:20:5  [edited: crate::grow_twice]
 error edit.breaks: 5 new errors; nothing written
 try: tachyonc rewrite 'grow($v, $n)' 'grow($n, $v)' --no-check
 [exit 1]

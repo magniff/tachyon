@@ -15,6 +15,7 @@ compiler's own `<std>` and `<C import>` last), then line, then column.
 tachyonc query def NAME... [--root ROOT] [--exact]
 tachyonc query show NAME... [--root ROOT] [--exact] [--with-comments]
 tachyonc query show FILE.tach... | MODULE::use | MODULE::header | MODULE::extern
+tachyonc query context NAME...|MODULE [--budget TOKENS]     (0.15) source, calls, types, callers
 tachyonc query text FILE[:A[-B]]...                         (no program read)
 tachyonc query diff [ROOT]                                  the last journaled edit
 tachyonc query refs NAME... [--root ROOT] [--exact] [--count] [--in FILE|MODULE] [--kind K,...] [--limit N] [--all]
@@ -29,6 +30,10 @@ tachyonc query unused [MODULE|FILE] [--all]                (refactor.md)
 tachyonc query impact NAME                                 (refactor.md)
 tachyonc query --help
 ```
+
+Every command takes `--budget TOKENS` (0.15, [The output
+budget](#the-output-budget-015)), and answers about std from any program
+([std](#std-from-any-program-015)).
 
 `ROOT` is the program's root file: `--root ROOT`, or (the form of 0.11's
 first query) a last argument ending in `.tach` after the NAMEs (`items
@@ -64,6 +69,7 @@ One line of grammar per kind of line (`\t` is a TAB; `[...]` optional):
 | refs, callers `--count` | count | `COUNT`, or `COUNT \t PATH` per definition when several match |
 | grep | file header, hit | `# FILE`; `LINE:COL \t (code \| comment \| string) \t ENCLOSING \t SOURCE` |
 | type | type | `TYPE \t EXPRESSION` |
+| context | item | the show header (`\t section: TITLE` when in one), source, then `// calls (N)`, `// types (N)`, `// uses (N)` with def lines, `// callers (N)` with `ENCLOSING \t FILE:LINE:COL \t SOURCE` |
 | items MODULE | module header | `# PATH \t FILE` |
 | items MODULE | item | `LINE \t KIND \t SIGNATURE` |
 | items MODULE `--comments` | banner, comment | `FIRST-LAST \t (section \| comment) \t TITLE` |
@@ -130,6 +136,29 @@ definition is named, and accepted back as NAME:
   the (at most 3) definitions whose names are nearest to NAME's last
   segment (edit distance at most a third of its length).
 
+### Every spelling a tool prints (0.15)
+
+What one command prints, another takes back as NAME, FILE or MODULE
+(`query/names.tach`; `tests/query/run.sh` round-trips every name def,
+show, refs, items, check and the assembly print):
+
+| printed | taken as |
+|---|---|
+| `main.tach:12:5:` (a short diagnostic), `main.tach:12-30` (a show header) | `main.tach:12` |
+| `./main.tach`, `/home/me/prog/main.tach` | the program's `main.tach` (by whole components) |
+| `Vec<i64>::push`, `Vec::<i64>::new`, `twice<V2>` (an instance) | `Vec::push`, `Vec::new`, `twice` |
+| `main.0`, `main.0.1` (a closure's symbol) | `main` |
+| `_tachyon.std.Buf.new`, `tachyon.apply.GN6main.0`, `_tachyon.Tl.cmp` (a symbol of the generated code) | `std::Buf::new`, `apply`, `i64::cmp` |
+| `a::mod`, `f()` | `a`, `f` |
+| `std`, `std.tach`, `<std>` (a FILE) | std's source |
+| `crate`, `a::b` (a module) | its `mod` item; the root's items, with `note query.module` |
+
+`FILE:LINE` on a comment line is the item below it (a show header's
+first line); outside every item (a `use` line) it is what the name at
+COL (or the first on the line) names. `--in`, `items` and the
+refactorings' module paths take a file's path (`./catalog.tach`) and a
+path without `crate::` (`refactor new-module report`).
+
 ## def
 
 One line per matching definition (shown here with the TABs as `→`):
@@ -141,6 +170,13 @@ crate::middle::gvn::run_gvn→compiler/src/middle/gvn.tach:721:8→fn→pub fn r
 The position is the name's. The signature is the source up to the body
 or the `{`, its whitespace collapsed, with `pub` when the item is public;
 a long constant's value is cut to `...`.
+
+(0.15) A method `#[derive(...)]` makes (Eq's `eq`, Ord's `cmp`, Hash's
+`hash`, Debug's `fmt_debug`, Clone's `clone`) has no source of its own:
+`def P::cmp` (and show, refs, the refactorings' NAME) answers with the
+attribute, `note query.derived: 'P::cmp' is derived, at main.tach:6:14:
+#[derive] makes it; it has no source of its own` and `try: tachyonc
+query show crate::P` (exit 1).
 
 ## show
 
@@ -196,6 +232,11 @@ At most 200 lines: past them `note query.truncated` and `try:` the next
 range. Lines past the end: `error query.no-match` with the file's
 length and `try:` its last lines; a file that cannot be read: `error
 query.no-file`.
+
+`query conflicts [FILE|DIR|FILE:LINE...] [--show]` (0.15) lists the
+merge conflict regions of files read as text, one line each, with their
+items; `--show` prints both sides. `edit resolve` resolves them
+([refactor.md](refactor.md), "Merge conflicts").
 
 `query diff [ROOT]`: the last edit of the journal (what `undo` would take
 back, [refactor.md](refactor.md)): `# SUMMARY`, then its diff with no
@@ -277,6 +318,12 @@ references.
   function's (ENCLOSING names it). A closure's function and its
   environment struct are no definitions: refs, unused, stats and deps
   never list them; a call of a closure is no reference.
+- (0.15) What `#[derive]` makes (impls written at the attribute's
+  position) is no definition, and its uses of the type, its fields and
+  std are no references; a trait the attribute names is one. A field
+  shorthand `S { x }` is a reference to the field and to the value `x`
+  at one position. An argument's label (`f(b: 1)`) is no reference: the
+  call is `f`'s.
 - `--count` prints the number of references refs would print (the
   definition included); for several definitions, `N→PATH` per definition.
 - `callers` is `refs` restricted to calls (method and operator calls
@@ -308,6 +355,66 @@ try: target/tachyonc query refs IntVec::push --all
 (the `--in` suggestion is the file with the most). `--limit N` lists the
 first N, then `note query.truncated: showing N of M refs`; `--all` lists
 everything.
+
+## context (0.15)
+
+`query context NAME` answers in one call what takes three to five
+queries (show, then show of what it calls, then refs): the item's source
+with its comments (and the title of its section, `items --comments`),
+the def lines of what it calls (the most specific first: the least used
+in the program) and of the types and statics it uses (a short struct or
+enum whole), and its callers with their lines (`used by` for a type). It
+is fitted to a budget, 2000 tokens by default (`--budget N`): the source
+gets at least half; what does not fit is counted in a last note with
+the commands that print it:
+
+```
+$ tachyonc query context report --budget 120
+// crate::report→context/main.tach:9-15→section: Reports
+// The total, after restocking the empty items.
+fn report(items: *Vec<Item>) -> i64 {
+    ...
+}
+// calls (3)
+std::Vec::len→<std>:120:12→method→pub fn len(self: *Vec<T>) -> i64
+crate::stock::restock→context/stock.tach:10:8→fn→pub fn restock(items: *Vec<Item>, i: i64, n: i64)
+// callers (2)
+main→context/main.tach:21:13→let n = report(&items);
+note query.budget: over the budget of 120 tokens, left out: calls 1, types or uses 2, callers 1
+try: tachyonc query callers report
+try: tachyonc query context report --budget 360
+```
+
+`query context MODULE` prints `items MODULE --comments`, then the
+bodies of the module's functions, those its own code calls most first,
+then those called most from outside, as far as the budget goes.
+
+## The output budget (0.15)
+
+`--budget TOKENS` (4 bytes a token) on any query cuts the answer at a
+line, with `note query.budget: cut at about N tokens: L of M lines
+(about T tokens in all)` and `try:` the command with the budget it
+needs. Without --budget an answer over 8000 tokens is cut the same way
+(not with `--all`; `--budget 0` is no limit). The diagnostics come after
+the answer.
+
+## std from any program (0.15)
+
+std's items answer from every root, whether the program uses std or
+not, and where there is no program at all (a directory without
+`main.tach`):
+
+- a question that names std (`std`, `std::read_line`, `<std>`,
+  `std:A-B`, `--in std`) reads the program with std (and without the
+  cache);
+- a NAME that std defines and the program does not (`Vec::push`,
+  `read_line`) is asked again with std;
+- `items std` lists std's API: its `pub` items and trait impls (`--all`:
+  the rest);
+- `show` of a std item adds the `use` line a program needs (`// use
+  std::HashMap;`; none for the prelude);
+- `text std:A-B` prints std's source (as `<std>` numbers it), `grep
+  TEXT --in std` searches it.
 
 ## items
 
@@ -397,6 +504,14 @@ never checked): `error query.no-match`, `try:` the item at that line.
 captured local has the local's type (the environment the closure reads
 it from is not shown).
 
+(0.15) `e?` has the type of its value (`i64→half(v)?`); a value the
+checker widens is shown with its own type and what it becomes,
+`i32 (widened to i64)→n`; a hole of an f-string is an expression as any
+other (`{p.x + q.y:>4}`: `i64→p.x + q.y`), and a position on its text
+gives the f-string's type. What the compiler writes for an f-string or a
+`?` (the hidden locals `__f0`, `__out`, the match a `?` is) is never
+shown.
+
 ## Diagnostics
 
 Every problem is reported on stderr, after the answer, in one format:
@@ -447,6 +562,38 @@ try: target/tachyonc --diagnostics=short broken/main.tach -c -o /dev/null
 to fix it, an example; for every code of every tool, and the compiler's
 error kinds (`explain type-error`).
 
+## JSON, for a harness (0.15)
+
+`--json`, anywhere on the command line of any command (`query`, `check`,
+`edit`, `refactor`, `fix`, `undo`, a build), prints one JSON object per
+line instead of the text: for a harness, a hook or a script, not for
+the model, which reads the text form as well and in fewer tokens.
+
+- Each diagnostic (on stderr, where the text would be): the tools'
+  `SEVERITY CODE: MESSAGE` with its `try:` lines, a compiler error, an
+  edit's new errors (on stdout, as now):
+
+  ```
+  {"kind":"diagnostic","severity":"error","code":"type error","file":"main.tach","line":4,"col":5,
+   "message":"undefined variable 'prinln'","help":["did you mean 'println'?"],"notes":[],"try":[]}
+  {"kind":"diagnostic","severity":"error","code":"query.no-match","file":null,"line":null,"col":null,
+   "message":"no definition 'nosuch'","help":[],"notes":[],"try":["tachyonc query items"]}
+  ```
+
+  `code` is the tool's code or the compiler error's kind (`type error`,
+  `parser error`, ...); `file`, `line` and `col` are null without a
+  position; positions inside the texts are `FILE:LINE:COL`. `try` holds
+  the commands as the agent would run them (without `--json`).
+- Every other line of stdout: `{"kind":"output","fields":[...]}`, its
+  TAB-separated fields ([Output formats](#output-formats)); an edit's
+  summary is `["patched crate::add","main.tach","+1 -1 lines"]`.
+- Every key is always there, in this order; new keys may be added at
+  the end.
+
+tools/agent-hooks/check-after-edit.py (the check after every edit, in
+AGENTS.md) and the agent eval's `final_check` (tests/agent-eval) read
+`check --json`. tests/refactor/json.t has a transcript.
+
 ## Programs with errors
 
 The query runs the front end as a compilation would, with its error
@@ -455,7 +602,10 @@ program, references from what the checker resolved. The errors are never
 listed: `warning query.program-errors` counts them, names the first when
 nothing answered, and gives the compilation that prints them all with
 `--diagnostics=short` (one line each:
-`FILE:LINE:COL: error[KIND] MESSAGE | help: ...`).
+`FILE:LINE:COL: error[KIND] MESSAGE | help: ...`). (0.15) A build whose
+stderr is not a terminal (an agent's shell, a pipe, a file) prints that
+form by default, the same lines as `tachyonc check`;
+`--diagnostics=human` asks for the multi-line form.
 
 ## Speed: the cache (0.13)
 
@@ -513,6 +663,46 @@ must come from the cache when the first made it).
   file of the program), one that could not be parsed. A damaged or
   partly written file is not read (a hash of its contents; written
   through a new file renamed over the old).
+
+## Several commands in one call: batch (0.15)
+
+`tachyonc batch [FILE] [--root R] [--stop]` runs the commands of FILE
+(or stdin), one per line as typed after `tachyonc`: any tool command
+(`query`, `edit`, `undo`, `check`, `fix`, `fmt`, `refactor`, `rewrite`,
+`explain`, `guide`, `lint`, `same-output`), quoted as in sh, `#`
+comments, `< PATH` or `<<WORD` (the lines after it up to a line WORD)
+for a command's stdin, as `refactor --script` reads them. It is for the
+sequences agents run call after call: `query items` then `query show`,
+`show` then `refs`, an edit then `check` or `query show`.
+
+```
+$ tachyonc batch < cmds.txt        (query show clamp; query refs clamp --count)
+## $ tachyonc query show clamp
+// crate::calc::clamp→calc.tach:3-12
+...
+## $ tachyonc query refs clamp --count
+3
+```
+
+- Each command runs in turn, in a copy of the process (fork), as it
+  would alone: its stdout and stderr together, in the order written,
+  after a line `## $ tachyonc ARGS`, then `## exit N` when N is not 0.
+  A command without `<` or `<<` reads an empty stdin.
+- A command sees what the commands before it wrote (an edit is written
+  when its check passes, as alone). Unlike `refactor --script`, the
+  commands are not one edit: each edit is checked, written and undone
+  on its own.
+- A failing command does not end the batch; `--stop` ends it at the
+  first. The exit status is the first one that is not 0 (else 0).
+- `--root R` is every command's root (`$TACHYON_ROOT` in each).
+- The program is read once: the first command parses it and leaves it
+  in the cache (above), and each command after it restores it (about
+  10 ms on the compiler's source). Loading it in the batch process and
+  handing it to the commands would save little more, at the risk of
+  state one command leaves for the next; it is not done.
+- `error batch.format` (a quote not closed, `<<WORD` without its line
+  WORD): nothing runs. `error batch.usage`: the options, a FILE that
+  cannot be read, a line that is no tool command (`## exit 2`).
 
 ## Known limits
 

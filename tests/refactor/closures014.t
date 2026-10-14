@@ -14,7 +14,7 @@ $ query refs double
 $ query unused
 note query.empty: nothing unused
 ## The calls inside closures get the new argument.
-$ refactor signature double --add 'y: i64 = 0' --dry-run
+$ refactor signature double --add 'y: i64 = 0' --fill-calls --dry-run
 --- a/main.tach
 +++ b/main.tach
 @@ -8 +8 @@

@@ -4,8 +4,9 @@ Tachyon is a compiled systems language. Its syntax is close to Rust's,
 its model close to C's: structs, enums with exhaustive `match`, traits
 and generics (monomorphized), modules, checked slices, raw pointers,
 `unsafe`, exact C interop. There is no borrow checker, no lifetimes, no
-destructors, no macros. Closures and iterators are new in 0.14. Safe
-code has no undefined behaviour. This text matches this compiler;
+destructors, no macros. Closures and iterators are new in 0.14; `?`,
+f-strings, widening, `#[derive]`, named and default arguments in 0.15.
+Safe code has no undefined behaviour. This text matches this compiler;
 `tachyonc guide TOPIC` gives the detail (topics at the end).
 
 ## Build and run
@@ -39,11 +40,11 @@ files on the command line make one program; `mod name;` loads
 | `&T`, `&mut T`, `Box<T>` | `*T`, one raw pointer type; `&x` takes an address; no lifetimes, no borrow checker |
 | `fn f(&self)`, `fn f(&mut self)` | `fn f(self: *T)` (may write through it); `fn f(self: T)` takes a copy |
 | `use m::*;` | not allowed: `use m::{a, b};`, or the path `m::a` |
-| `println!("{}", x)`, `format!` | no macros: `print("x = "); std::print_int(x); println("");`; floats through C's `printf` |
+| `println!("{}", x)`, `format!` | no macros: `println(f"x = {x:>4} {v:?}")`, `format(f"..")` (a `Buf`) (0.15, `guide formatting`) |
 | `v[i]` on a `Vec` | `v.get(i)`, `v.set(i, x)`, `v.as_slice()[i]` |
 | closures, `.iter().map()` | the same (0.14): `\|x\| x + k`, `v.iter().map(\|x\| x * 2).sum()`; `F: Fn(i64) -> i64` bounds; no `dyn Fn`, `FnOnce`, `iter_mut` (`guide closures`, `guide iterators`) |
-| `x?` | the same (0.15), on Option and Result; the error converted by `From` |
-| `impl Trait for T`, `T: Trait` | the same; `type Item;` associated types (0.14); no `dyn`, `where`, supertraits, `#[derive]` |
+| `x?` | the same on `Option` and `Result` (0.15); `impl From<E> for F` converts the error; `main` may return `Result<(), E>` (`guide conversions`) |
+| `impl Trait for T`, `T: Trait` | the same; `type Item;` associated types (0.14); `#[derive(Eq, Ord, Hash, Debug, Clone)]` (0.15); no `dyn`, `where`, supertraits |
 | `Drop`, RAII | none: call `free()`, usually `defer v.free();` |
 | `'outer: loop`, `break 'outer` | `outer: loop`, `break :outer`, `continue :outer` |
 | `!x` on integers | `~x`; `!` is for `bool` only |
@@ -52,13 +53,15 @@ files on the command line make one program; `mod name;` loads
 | overflow panics, `/ 0` panics | integers wrap; `x / 0 == 0`, `x % 0 == x`; no panic |
 | `match s { "add" => ... }` | strings are not patterns: `if s == "add" { ... }` |
 | `char` | none: `'a'` is a `u8` (one ASCII byte) |
-| `P { x, ..base }` | every field written: `P { x: x, y: base.y }` |
+| `P { x, ..base }` | `P { x, y }` (0.15); no `..base`: `P { x, y: base.y }` |
 | `let x;` | every `let` has a value |
-| implicit `i32` -> `i64` | no implicit conversion: `a as i64` |
+| no default or named arguments | `fn f(a: i64, b: i64 = 2)`, `f(1, b: 3)` (0.15): named ones last, in order |
+| implicit `i32` -> `i64` | the same: lossless widening (0.15); `a as i32` narrows; `From`/`Into` |
 
 The prelude, in every module without `use`: `Option`, `Some`, `None`,
-`Result`, `Ok`, `Err`, `Vec`, `print`, `println`, and the traits `Add`,
-`Sub`, `Mul`, `Div`, `Neg`, `Eq`, `Ord`, `Hash`. The rest of std is used
+`Result`, `Ok`, `Err`, `Vec`, `print`, `println`, `eprint`, `eprintln`,
+`format`, and the traits `Add`, `Sub`, `Mul`, `Div`, `Neg`, `Eq`, `Ord`,
+`Hash`, `Display`, `Debug`, `Clone`, `From`, `Into`. The rest of std is used
 by path (`std::print_int(n)`) or imported (`use std::{Buf, HashMap};`).
 Calling C or an `unsafe fn`, and dereferencing or indexing a raw
 pointer, are allowed only in `unsafe { }` (`tachyonc guide rust`: the
@@ -119,6 +122,25 @@ positive
 
 The last expression of a block, without `;`, is its value; `if`, `match`,
 `loop` and blocks are expressions. There are no nested functions.
+Trailing parameters may have defaults; named arguments follow the
+positional ones, in parameter order (0.15):
+
+```tach 0.15 fmt args
+fn greet(name: [u8], times: i64 = 1, sep: [u8] = " ") {
+    for _ in 0..times { print(f"hi {name}{sep}"); }
+    println("");
+}
+
+fn main() -> i32 {
+    greet("ann");
+    greet("bob", times: 2, sep: "! ");
+    0
+}
+```
+```out
+hi ann
+hi bob! hi bob!
+```
 
 ## Structs, enums, match, methods
 
@@ -342,12 +364,13 @@ from its source in this compiler (every item is `pub`):
 
 ## Input, output, arguments
 
-std prints and reads stdin: `read_stdin()` (all of it, a `Buf`),
-`read_line(&buf)` (the next line; `Ok(false)` at the end), `Scanner`
-(tokens, numbers, lines), `parse_int`, `split`, `trim`. Files go
-through C (`fopen`):
+std prints and reads stdin: `read_stdin()` (all of it, a
+`Result<Buf, IoError>`), `read_line(&buf)` (the next line, without its
+`'\n'`; `Ok(false)` at the end), `Scanner` (tokens, numbers, lines of a
+text), `parse_int` (a `Result`), `split`, `trim` (`guide conversions`:
+Option means absent, Result failed). Files go through C (`fopen`):
 
-```tach
+```tach 0.15 io
 import "string.h" as c;
 use std::{Scanner, read_stdin};
 
@@ -356,7 +379,7 @@ fn main(argc: i32, argv: **u8) -> i32 {
     defer input.free();                   // the caller frees it
     let mut sc = Scanner::new(input.as_slice());
     let mut total = 0;
-    while let Ok(n) = sc.next_int() {     // Err at the end
+    while let Ok(n) = sc.next_int() {     // Err(ScanError::End) at the end
         total += n;
     }
     std::print_int(total);
@@ -439,14 +462,14 @@ the one hole in safe code (no lifetimes).
 | `expected type, got '&'` | `*T` for `&T` and `&mut T` |
 | `expected identifier, got '&'` in `fn f(&self)` | `self: *T` |
 | `cannot infer the type of closure parameter 'x'` | `\|x: i64\| ...`, or pass it where an `Fn` bound or `fn` type gives it |
-| `'?' needs 'f' to return Option or Result` | `-> Result<T, E>` or `Option<T>`; `main` too |
-| `expected ';', got '!'` | no macros: `println(...)`, `std::print_int(...)` |
+| `'?' needs 'f' to return Option or Result` | `fn f(..) -> Option<T>` or `-> Result<T, E>` |
+| `'println!' is a macro call` | no macros: `println(f"{x}")` |
 | `cannot assign to immutable variable 'x'` | `let mut x` |
 | `cannot index type 'Vec<i64>'` | `v.get(i)`, `v.as_slice()[i]` |
 | `'for' iterates over ... got 'i64'` | a range: `for x in 0..n`; a Vec, a HashMap, `v.iter()` and ranges as values iterate too (0.14) |
 | `no method 'len' on type '[u8]'` | `s.len`, a field |
 | `expected '[i64]', got '[i64; 3]'` | pass `a[..]` |
-| `expected 'i64', got 'i32'` | `x as i64` |
+| `expected 'i32', got 'i64'` | `x as i32`: only widening is implicit |
 | `cannot take address of non-lvalue expression` | `&` needs a place: `let p = P { x: 1 }; f(&p)` |
 | `non-exhaustive match: 'E::C' is not covered` | an arm, or `_ =>` |
 | `error[unsafe] calling a C function is unsafe` | `unsafe { ... }` |
@@ -459,11 +482,13 @@ the one hole in safe code (no lifetimes).
 
 ```sh
 tachyonc check [ROOT]                   # all errors, one line each: FILE:L:C: error[KIND] MSG | help: ...
-tachyonc --diagnostics=short f.tach -o f # the same form when compiling
+tachyonc f.tach -o f                    # the same lines when compiling, off a terminal
 tachyonc query show NAME                # an item's source: fn, Type::method, Enum::Variant, FILE:LINE
 tachyonc query def NAME                 # where it is defined, its signature
 tachyonc query refs NAME                # every resolved use (--count, --in FILE)
-tachyonc query items [MODULE]           # a module's items with signatures, like a header
+tachyonc query items [MODULE]           # a module's items with signatures (std: its API)
+tachyonc query context NAME             # source, what it calls, its types and callers, at once
+tachyonc try '7 / 2'                    # run a snippet with std: its output, TYPE = VALUE
 tachyonc edit patch NAME --old 'a < b' --new 'a <= b'   # change text inside one item
 tachyonc edit replace NAME < new.tach   # replace an item; edit insert --after NAME; edit delete NAME
 tachyonc fix                            # missing imports, unused, pub, unsafe blocks

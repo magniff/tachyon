@@ -12,7 +12,7 @@ CODE: MESSAGE` with `try:` lines ([query.md](query.md)). NAME is
 anything query accepts.
 
 ```
-tachyonc refactor signature FN --add 'x: T = VALUE' [--at N] | --remove x
+tachyonc refactor signature FN --add 'x: T [= VALUE]' [--at N] [--fill-calls] | --remove x
                                | --rename-param a b | --reorder b,a,c | --type x T [--default EXPR]
 tachyonc refactor field STRUCT --add 'g: T = VALUE' | --remove g | --rename g h | --type g T
 tachyonc refactor variant ENUM --add 'X(T, ...)' [--arm EXPR] [--arm-in SITE EXPR]... | --remove V | --rename V W
@@ -50,28 +50,48 @@ a)`, calls in generic instances, calls through a bound.
 
 ```
 $ tachyonc refactor signature area --add 'scale: i64 = 1'
+added parameter scale: i64 = 1 to crate::geom::area, 2 calls→geom.tach→+1 -1 lines
+$ tachyonc refactor signature area --add 'scale: i64 = 1' --fill-calls
 added parameter scale: i64 to crate::geom::area, 2 calls→2 files→+2 -2 lines
 ```
 
 - `--add 'x: T = VALUE'`: the parameter, at the end or before parameter
   N (`--at N`, counting from 0, `self` included: a method's first
-  position is 1); each call gets VALUE (as written; checked in each
-  caller). Without `= VALUE` only when there is no call.
+  position is 1). (0.15) VALUE is the parameter's default, and the calls
+  are left as they are. The calls get VALUE instead (as written; checked
+  in each caller), as 0.14 did, with `--fill-calls`, for a trait's
+  function (it has no defaults) and before a parameter without a default
+  (defaults are on trailing parameters only): `note refactor.fill-calls`
+  says why (not for --fill-calls). A call that leaves a parameter before
+  x to its default gets `x: VALUE`, among its labelled arguments in
+  order. Without `= VALUE` only when there is no call.
 - `--remove x`: refused while x is used in a body (`refactor.used`); each
-  call loses the argument (`warning refactor.effects` when it called a
-  function: that call is gone).
+  call loses the argument, given by position or (0.15) by its label;
+  a call that leaves x to its default is unchanged (`warning
+  refactor.effects` when the argument called a function: that call is
+  gone).
 - `--rename-param a b`: the parameter and its uses in the body; refused
   when b is a name there already or a is shadowed (`refactor.clash`).
-  Calls are unchanged.
+  (0.15) A label `a: value` in a call becomes `b: value`; a field
+  shorthand `S { a }` in the body becomes `S { a: b }`. Calls are
+  otherwise unchanged.
 - `--reorder b,a,c`: every parameter once (`self` stays first); each
   call's arguments follow (`warning refactor.effects` when two that call
-  functions change order: evaluation is left to right).
+  functions change order: evaluation is left to right). (0.15) A call
+  with a labelled argument, or one that leaves a parameter to its
+  default, is written again in the new order: by position up to the
+  first parameter it leaves out or labels, by label from there
+  (`area(2, 3, depth: 4)` with `--reorder w,depth,h` is `area(2, depth:
+  4, h: 3)`); its layout and comments are not kept. A default before a
+  parameter without one is refused by the check.
 - `--type x T`: the parameter's type; the check says which calls no
   longer fit (the edit is refused with their errors). `--default EXPR`
   (0.13) makes each call's argument EXPR, `$x` in it standing for the
   argument it had (in parentheses unless a name, a number or a path):
   `--type k i64 --default '$k as i64'` turns `scale(b, n + 1)` into
-  `scale(b, (n + 1) as i64)`; `--type full bool --default false`.
+  `scale(b, (n + 1) as i64)`; `--type full bool --default false`. (0.15)
+  A labelled argument's value is changed, a call that leaves x to its
+  default is not (nor is the default).
 
 Refused for any change of the type (all but `--rename-param`): a
 function used as a value (`let f = twice;`, `apply(twice, x)`:
@@ -89,7 +109,8 @@ accesses.
 - `--remove g`: refused while the field is read or written anywhere
   (`refactor.used`, the number of references and the first, `try:`
   `query refs Struct.g`); else from the struct and every literal.
-- `--rename g h`: every reference (definition, literals, accesses).
+- `--rename g h`: every reference (definition, literals, accesses); a
+  field shorthand (0.15) `S { g }` becomes `S { h: g }`.
 - `--type g T`: the field's type; the check says what no longer fits.
 
 A `#[repr(C)]` struct's layout changes with --add, --remove and --type:
@@ -227,6 +248,10 @@ extracted lines 40-43 of crate::calc::mean_to into add_all(i, n, acc) -> i64→c
   (a closure made before the lines and used in them, one used after
   them, `Map<I, F>`) has no name to write: refused (`refactor.closure`,
   `try:` the lines from the closure's `let`).
+- `?` (0.15): it may return from FN (None or Err), which NEW cannot do
+  for its caller: lines holding one are refused (`refactor.escapes`),
+  but a `?` inside a closure of the lines, which returns from the
+  closure.
 
 ## refactor inline (0.13)
 
@@ -260,7 +285,11 @@ inlined crate::calc::quad at 1 call, deleted it→2 files→+10 -12 lines
 - Calls inside closures are calls (0.14): inlined, renamed, given a new
   argument by `refactor signature`, like any other; a `return` inside a
   closure of the body is the closure's.
-- Refused: a body with a `return` (`refactor.escapes`), a call of FN in
+- Named and default arguments (0.15): each parameter's argument is the
+  one given by position or by label; one left to its default gets the
+  default as written in FN (checked where the call is). A parameter
+  put in for a field shorthand `S { x }` writes `S { x: ARG }`.
+- Refused: a body with a `return` or (0.15) a `?` (`refactor.escapes`), a call of FN in
   its body (`refactor.recursive`), a generic or bodiless FN
   (`refactor.generic`), an `extern "C"` one (`refactor.extern`), a name
   of the body hidden by a local where it is called (`refactor.clash`),
@@ -279,7 +308,7 @@ against the compiler was identical (4668 compilations).
 ```
 # steps.txt: the edit, then the calls it made
 refactor field Point --rename y height
-refactor signature area --add 'scale: i64 = 1'   # the calls get 1
+refactor signature area --add 'scale: i64 = 1' --fill-calls   # the calls get 1
 rewrite 'area($p, 1)' 'area($p, 2)'
 edit replace twice < twice.tach
 ```
@@ -363,7 +392,8 @@ as it changes the program through the edit engine (`edit_replace`,
 | `refactor.discriminant` | warning | 0 | a removed variant renumbers the ones after it, and the enum is cast | |
 | `refactor.unchecked` | warning | 0 | calls in code the checker did not see are not changed | |
 | `refactor.range` | error | 1 | extract-function: the lines cut a statement, or are not in FN's body | the whole statements' lines |
-| `refactor.escapes` | error | 1 | extract-function: a return, break, continue or defer leaves the lines; inline: FN returns early | the lines before it; `query show FILE:LINE` |
+| `refactor.escapes` | error | 1 | extract-function: a return, break, continue, defer or (0.15) `?` leaves the lines; inline: FN returns early or has a `?` | the lines before it; `query show FILE:LINE` |
+| `refactor.fill-calls` | note | 0 | signature --add (0.15): the calls get VALUE, not a default (a trait's function, a later parameter without a default) | |
 | `refactor.results` | error | 1 | extract-function: results NEW cannot give back | `query show FILE:LINE` |
 | `refactor.closure` | error | 1 | extract-function (0.14): a parameter or result of NEW would be a closure, whose type has no name | the lines from the closure's `let`; `query show FILE:LINE` |
 | `refactor.self`, `refactor.receiver` | error | 1 | self in a trait impl's function; a borrowed receiver used as `self` | |

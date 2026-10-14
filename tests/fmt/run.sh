@@ -101,9 +101,9 @@ printf '%s\n' $programs compiler/src/main.tach | awk -v w="$WORK/c" '{ print NR 
 compile_one() { # <n> <program>
     d="$WORK/c/$1"
     mkdir -p "$d"
-    "$COMPILER" -O2 -S "$ROOT/$2" -o "$d/a.s" >"$d/a.out" 2>&1
+    "$COMPILER" --diagnostics=human -O2 -S "$ROOT/$2" -o "$d/a.s" >"$d/a.out" 2>&1
     echo $? >"$d/a.rc"
-    "$COMPILER" -O2 -S "$COPY/$2" -o "$d/b.s" >"$d/b.out" 2>&1
+    "$COMPILER" --diagnostics=human -O2 -S "$COPY/$2" -o "$d/b.s" >"$d/b.out" 2>&1
     echo $? >"$d/b.rc"
     sed -e "s|$ROOT/||g" -e 's|line [0-9]*, column [0-9]*|POS|g' "$d/a.out" >"$d/a.msg"
     sed -e "s|$COPY/||g" -e 's|line [0-9]*, column [0-9]*|POS|g' "$d/b.out" >"$d/b.msg"

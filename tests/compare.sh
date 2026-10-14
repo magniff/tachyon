@@ -50,7 +50,9 @@ if [ "${1:-}" = "--job" ]; then
         done
         rm -rf "$rout.d"
         mkdir -p "$rout.d"
-        "$rc" "$@" >"$rout.stdout" 2>"$rout.stderr"
+        # (one form of the errors for both: from 0.15 a compiler whose
+        # stderr is not a terminal prints the short form by default)
+        "$rc" --diagnostics=human "$@" >"$rout.stdout" 2>"$rout.stderr"
         echo "exit $?" >>"$rout.stdout"
         if [ -f "$rout.d/out.s" ]; then mv "$rout.d/out.s" "$rout.s"; else : >"$rout.s"; fi
         rm -rf "$rout.d"

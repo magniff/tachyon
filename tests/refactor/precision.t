@@ -75,8 +75,8 @@ $ edit wrap sum_to --in '' --lines 17-21 --dry-run
 +            i += 1;
 +        }
 $ edit wrap sum_to --in '' --lines 16
-./calc.tach:21:9: error[type error] undefined variable 'total'
-./calc.tach:24:5: error[type error] undefined variable 'total'
+./calc.tach:21:9: error[type error] undefined variable 'total'  [edited: crate::calc::sum_to]
+./calc.tach:24:5: error[type error] undefined variable 'total'  [edited: crate::calc::sum_to]
 error edit.breaks: 2 new errors; nothing written
 try: tachyonc edit wrap sum_to --in '' --lines 16 --no-check
 [exit 1]
@@ -126,28 +126,35 @@ error edit.no-parent: no file of the program has nowhere/deep/x.tach as a child'
 try: tachyonc query items
 [exit 1]
 ## refactor signature --type with --default: a new argument at each call.
-$ refactor signature scale --type k i64 --default '$k as i64' --dry-run
+$ refactor signature scale --type k i16 --default '$k as i16' --dry-run
 --- a/main.tach
 +++ b/main.tach
 @@ -11 +11 @@
 -    let c = scale(a, 2) + scale(b, n + 1);
-+    let c = scale(a, 2 as i64) + scale(b, (n + 1) as i64);
++    let c = scale(a, 2 as i16) + scale(b, (n + 1) as i16);
 --- a/calc.tach
 +++ b/calc.tach
 @@ -28 +28 @@
 -pub fn scale(v: i64, k: i32) -> i64 {
-+pub fn scale(v: i64, k: i64) -> i64 {
-$ refactor signature scale --type k i64
-changed parameter k to i64 in crate::calc::scale	calc.tach	+1 -1 lines
++pub fn scale(v: i64, k: i16) -> i64 {
+$ refactor signature scale --type k i16
+main.tach:11:36: error[type error] expected 'i16', got 'i32'  [in crate::main]
+error edit.breaks: 1 new error (1 in crate::main, which the edit does not change); nothing written
+note edit.refactor: the uses of crate::calc::scale no longer fit its new shape: a refactoring changes them with it, then the rest of the edit
+try: tachyonc refactor signature crate::calc::scale --type k i16 --default '$k as i16'
+note edit.together: change crate::main in the same edit: one `edit apply FILE` with a block per item, or `edit patch --pairs FILE` with `@@ NAME` blocks
+try: tachyonc query show crate::main
+try: tachyonc refactor signature scale --type k i16 --no-check
+[exit 1]
 $ refactor signature clamp --add 'x: i64 = 0' --default 0
 error refactor.usage: --default goes with --type (the calls' new argument)
 try: tachyonc refactor signature NAME --type x T --default EXPR
 [exit 2]
 ## fix --in MODULE: its child modules too.
 $ edit patch lib/inner.tach --old 'use crate::calc::clamp;' --new '' --no-check
-./lib/inner.tach:4:5: error[type error] undefined variable 'clamp' | help: add `use crate::calc::clamp;`
+./lib/inner.tach:4:5: error[type error] undefined variable 'clamp' | help: add `use crate::calc::clamp;`  [in crate::lib::inner::double]
 patched crate::lib::inner	lib/inner.tach	+0 -1 lines
-warning edit.breaks: 1 new error; written anyway (--no-check)
+warning edit.breaks: 1 new error (1 in crate::lib::inner::double, which the edit does not change); written anyway (--no-check)
 try: tachyonc check
 $ fix --in crate::lib --dry-run
 --- a/lib/inner.tach

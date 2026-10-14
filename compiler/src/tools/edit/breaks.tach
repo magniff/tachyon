@@ -1,0 +1,999 @@
+// What an edit that adds errors broke (0.15; docs/refactor.md, "When an
+// edit breaks the program"): each new error tagged with the item it is in,
+// edited or not (`[edited: crate::f]`, `[in crate::main]`); then `edit.breaks`
+// counting both, and `try:` lines chosen by what broke:
+//
+//   - an edited item's shape changed (a function's name or parameters, a
+//     struct's fields, an enum's variants) and other items use it: the
+//     refactoring that changes the uses with it (`refactor signature F
+//     --add 'x: T = VALUE'`, `--remove`, `--rename-param`, `--type`,
+//     `--reorder`; `refactor rename`; `refactor field`, `refactor variant`),
+//     computed from the item's old and new text;
+//   - errors in items the edit does not change: their text (`query show`),
+//     to change them in the same edit (`edit apply`, `edit patch` with
+//     `@@ NAME` blocks);
+//   - last, the command with --no-check.
+//
+// The edited program's lines are mapped to the program's through the
+// edit's diff (its hunks: old lines A..A+B are new lines C..C+D).
+
+use crate::base::{
+    FILES, FILE_COUNT, IntVec, SRC, STDOUT, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice,
+    buf_str, buf_write_fd,
+};
+use crate::tools::edit::{ADDED, CH_FILE, CH_TEXT, DRY_RUN, NEW_PATH, REMOVED};
+use crate::tools::edit::apply::try_again;
+use crate::tools::edit::diff::diff_texts;
+use crate::tools::edit::items::item_tail;
+use crate::tools::proc::same_bytes;
+use crate::tools::query::{c_slice, def_at_line};
+use crate::tools::query::defs::{
+    DEFS, K_ENUM, K_FN, K_IMPL_METHOD, K_METHOD, K_STRUCT, K_TRAIT_FN, bytes_eq, find_in,
+};
+use crate::tools::query::diagnostics::{PROG, diag, diags, put_cword, put_root, put_word, try_end};
+use crate::tools::query::positions::line_of;
+use crate::tools::query::refs::file_text;
+use crate::tools::query::show::text_start;
+
+// Per new error: the definition it is in (-1: none known), whether the
+// edit changed it, whether it is in text the edit wrote.
+static mut E_DEF: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut E_EDITED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The new errors (lines, in buffers) of an edit: printed, tagged; then
+// `edit.breaks` and its `try:` lines (`refused`: nothing was written).
+pub fn report_breaks(added: *IntVec, refused: bool) {
+    unsafe {
+        E_DEF.count = 0;
+        E_EDITED.count = 0;
+        let lines = buf_new();
+        let mut in_edit = 0;
+        for i in 0..(*added).count {
+            let line = buf_slice((*added).data[i]);
+            let mut edited = false;
+            let d = error_item(line, &edited);
+            E_DEF.push(d);
+            E_EDITED.push(if edited { 1 } else { 0 });
+            buf_bytes(lines, line);
+            if edited {
+                in_edit += 1;
+                buf_str(lines, c"  [edited");
+                if d >= 0 {
+                    buf_str(lines, c": ");
+                    buf_bytes(lines, SYMS[DEFS[d].fqn].text);
+                }
+                buf_byte(lines, ']');
+            } else if d >= 0 {
+                buf_str(lines, c"  [in ");
+                buf_bytes(lines, SYMS[DEFS[d].fqn].text);
+                buf_byte(lines, ']');
+            }
+            buf_byte(lines, '\n');
+        }
+        buf_write_fd(lines, STDOUT);
+        // The items not edited that have errors, once each.
+        let mut others = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..E_DEF.count {
+            let d = E_DEF.data[i];
+            if E_EDITED.data[i] == 0 && d >= 0 && !has(&others, d) {
+                others.push(d);
+            }
+        }
+        let n = (*added).count;
+        let d = diag(if refused { c"error" } else { c"warning" }, c"edit.breaks");
+        buf_int(d, n);
+        buf_str(d, if n == 1 { c" new error" } else { c" new errors" });
+        if others.count > 0 {
+            buf_str(d, c" (");
+            if in_edit > 0 {
+                buf_int(d, in_edit);
+                buf_str(d, c" in the edited text, ");
+            }
+            buf_int(d, n - in_edit);
+            buf_str(d, c" in ");
+            put_names(d, &others);
+            buf_str(d, c", which the edit does not change)");
+        }
+        buf_str(d,
+            if refused { c"; nothing written\n" } else if DRY_RUN { c" (dry run)\n" }
+            else { c"; written anyway (--no-check)\n" });
+        if !refused {
+            if !DRY_RUN {
+                let out = diags();
+                buf_str(out, c"try:");
+                put_cword(out, PROG);
+                buf_str(out, c" check");
+                put_root(out);
+                try_end(out);
+            }
+            return;
+        }
+        // The refactorings that fit, for the edited items whose uses broke
+        // (errors outside the edited text: a `use` line too); with errors
+        // in the edited text only, a parameter renamed.
+        let outside = n - in_edit;
+        {
+            let mut seen = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            for i in 0..E_DEF.count {
+                let e = E_DEF.data[i];
+                if E_EDITED.data[i] != 0 && e >= 0 && !has(&seen, e) {
+                    seen.push(e);
+                }
+            }
+            // (an edited item whose own text has no error: from the hunks)
+            edited_items(&seen);
+            let tries = buf_new();
+            let mut n_try = 0;
+            let mut first = -1;
+            for i in 0..seen.count {
+                if n_try < 4 {
+                    let m = shape_tries(tries, seen.data[i], 4 - n_try, outside == 0);
+                    if m > 0 && first < 0 {
+                        first = seen.data[i];
+                    }
+                    n_try += m;
+                }
+            }
+            if n_try > 0 {
+                let r = diag(c"note", c"edit.refactor");
+                buf_str(r, c"the uses of ");
+                buf_bytes(r, SYMS[DEFS[first].fqn].text);
+                buf_str(r, c" no longer fit its new shape: a refactoring changes them with it");
+                let t = buf_slice(tries);
+                if find_in(t, c"VALUE", 0) >= 0 || find_in(t, c"EXPR", 0) >= 0 {
+                    buf_str(r, c" (VALUE, EXPR: to fill in)");
+                }
+                buf_str(r, c", then the rest of the edit\n");
+                buf_bytes(diags(), buf_slice(tries));
+            }
+        }
+        if others.count > 0 {
+            let t = diag(c"note", c"edit.together");
+            buf_str(t, c"change ");
+            put_names(t, &others);
+            buf_str(t,
+                c" in the same edit: one `edit apply FILE` with a block per item, or `edit patch --pairs FILE` with `@@ NAME` blocks\n");
+            let out = diags();
+            buf_str(out, c"try:");
+            put_cword(out, PROG);
+            buf_str(out, c" query show");
+            for i in 0..others.count {
+                if i < 5 {
+                    put_word(out, SYMS[DEFS[others.data[i]].fqn].text);
+                }
+            }
+            put_root(out);
+            try_end(out);
+        }
+        try_again(c"--no-check");
+    }
+}
+
+fn has(v: *IntVec, x: i64) -> bool {
+    unsafe {
+        for i in 0..(*v).count {
+            if (*v).data[i] == x {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// The paths of the definitions of v, `a, b and 2 more`.
+fn put_names(out: i64, v: *IntVec) {
+    unsafe {
+        let n = (*v).count;
+        for i in 0..n {
+            if i == 3 {
+                buf_str(out, c" and ");
+                buf_int(out, n - 3);
+                buf_str(out, c" more");
+                return;
+            }
+            if i > 0 {
+                buf_str(out, if i == n - 1 { c" and " } else { c", " });
+            }
+            buf_bytes(out, SYMS[DEFS[(*v).data[i]].fqn].text);
+        }
+    }
+}
+
+// ---- Lines of the edited program ----
+
+// The index in CH_FILE of file f, or -1 when the edit leaves it.
+fn changed_index(f: i64) -> i64 {
+    unsafe {
+        for i in 0..CH_FILE.count {
+            if CH_FILE.data[i] == f {
+                return i;
+            }
+        }
+        -1
+    }
+}
+
+// path without its leading `./`.
+fn plain_path(p: [u8]) -> [u8] {
+    let mut s = p;
+    while s.len >= 2 && s[0] == '.' && s[1] == '/' {
+        s = s[2..s.len];
+    }
+    s
+}
+
+// The file of path: an index into FILES, -2 for a file the edit makes,
+// -1 for neither.
+fn file_by_path(path: [u8]) -> i64 {
+    unsafe {
+        let p = plain_path(path);
+        for i in 0..CH_FILE.count {
+            let f = CH_FILE.data[i];
+            if same_bytes(file_text(f), p) {
+                return f;
+            }
+        }
+        for i in 0..NEW_PATH.count {
+            if same_bytes(plain_path(c_slice(NEW_PATH.data[i] as *u8)), p) {
+                return -2;
+            }
+        }
+        for f in 0..FILE_COUNT {
+            if FILES[f].path[0] != '<' && same_bytes(file_text(f), p) {
+                return f;
+            }
+        }
+        -1
+    }
+}
+
+// The file and line of a short diagnostic line (`PATH:LINE:COL: error[...]
+// ...`): as file_by_path, the line in *line.
+fn error_place(line: [u8], at_line: *i64) -> i64 {
+    let mut at = -1;
+    let mut i = 0;
+    while i + 8 <= line.len {
+        if line[i] == ':' && line[i + 1] == ' ' && line[i + 2] == 'e' && line[i + 3] == 'r'
+            && line[i + 4] == 'r' && line[i + 7] == '[' {
+            at = i;
+            break;
+        }
+        i += 1;
+    }
+    if at < 0 {
+        return -1;
+    }
+    let p = line[0..at];
+    let mut c2 = p.len - 1;
+    while c2 > 0 && p[c2] != ':' {
+        c2 -= 1;
+    }
+    let mut c1 = c2 - 1;
+    while c1 > 0 && p[c1] != ':' {
+        c1 -= 1;
+    }
+    if c1 <= 0 {
+        return -1;
+    }
+    let mut n = 0;
+    for k in c1 + 1..c2 {
+        if p[k] < '0' || p[k] > '9' {
+            return -1;
+        }
+        n = n * 10 + (p[k] - '0') as i64;
+    }
+    *at_line = n;
+    file_by_path(p[0..c1])
+}
+
+// The hunks of the diff of changed file i (CH_FILE's index): A, B, C, D
+// in fours (old lines A.. (B of them), new lines C.. (D of them)).
+fn hunks(i: i64, out: *IntVec) {
+    unsafe {
+        let a0 = ADDED;
+        let r0 = REMOVED;
+        let f = CH_FILE.data[i];
+        let b = buf_new();
+        diff_texts(b, file_text(f), SRC[FILES[f].start..FILES[f].end], buf_slice(CH_TEXT.data[i]));
+        ADDED = a0;
+        REMOVED = r0;
+        let t = buf_slice(b);
+        let mut p = 0;
+        while p < t.len {
+            let mut e = p;
+            while e < t.len && t[e] != '\n' {
+                e += 1;
+            }
+            let l = t[p..e];
+            if l.len > 4 && l[0] == '@' && l[1] == '@' && l[3] == '-' {
+                let mut k = 4;
+                let a = number(l, &k);
+                let mut nb = 1;
+                if k < l.len && l[k] == ',' {
+                    k += 1;
+                    nb = number(l, &k);
+                }
+                k += 2;
+                let c = number(l, &k);
+                let mut nd = 1;
+                if k < l.len && l[k] == ',' {
+                    k += 1;
+                    nd = number(l, &k);
+                }
+                out.push(a);
+                out.push(nb);
+                out.push(c);
+                out.push(nd);
+            }
+            p = e + 1;
+        }
+    }
+}
+
+fn number(l: [u8], k: *i64) -> i64 {
+    let mut n = 0;
+    while *k < l.len && l[*k] >= '0' && l[*k] <= '9' {
+        n = n * 10 + (l[*k] - '0') as i64;
+        *k += 1;
+    }
+    n
+}
+
+// New line `line` of a file whose hunks are h: its old line, or -1 when
+// the edit wrote it (then *anchor is the hunk's first old line, *insert
+// whether the hunk only adds lines, after line *anchor).
+fn old_line(h: *IntVec, line: i64, anchor: *i64, insert: *bool) -> i64 {
+    unsafe {
+        let mut delta = 0;
+        let mut k = 0;
+        while k < (*h).count {
+            let a = (*h).data[k];
+            let b = (*h).data[k + 1];
+            let c = (*h).data[k + 2];
+            let d = (*h).data[k + 3];
+            if d > 0 && line >= c && line < c + d {
+                *anchor = a;
+                *insert = b == 0;
+                return -1;
+            }
+            if (d > 0 && line < c) || (d == 0 && line <= c) {
+                return line - delta;
+            }
+            delta += d - b;
+            k += 4;
+        }
+        line - delta
+    }
+}
+
+// Old line `line`'s new line (`end`: as the last line of a range).
+fn new_line(h: *IntVec, line: i64, end: bool) -> i64 {
+    unsafe {
+        let mut delta = 0;
+        let mut k = 0;
+        while k < (*h).count {
+            let a = (*h).data[k];
+            let b = (*h).data[k + 1];
+            let c = (*h).data[k + 2];
+            let d = (*h).data[k + 3];
+            if b > 0 && line >= a && line < a + b {
+                if end {
+                    return if d > 0 { c + d - 1 } else { c };
+                }
+                return if d > 0 { c } else { c + 1 };
+            }
+            if (b > 0 && line < a) || (b == 0 && line <= a) {
+                return line + delta;
+            }
+            delta += d - b;
+            k += 4;
+        }
+        line + delta
+    }
+}
+
+// The first and last lines of definition d's text.
+fn def_lines(d: i64, first: *i64, last: *i64) {
+    unsafe {
+        *first = line_of(text_start(d));
+        *last = line_of(item_tail(d) - 1);
+    }
+}
+
+// Whether the hunks h change a line of definition d's text (or add lines
+// inside it).
+fn touched(h: *IntVec, d: i64) -> bool {
+    unsafe {
+        let mut s = 0;
+        let mut e = 0;
+        def_lines(d, &s, &e);
+        let mut k = 0;
+        while k < (*h).count {
+            let a = (*h).data[k];
+            let b = (*h).data[k + 1];
+            if b > 0 && a <= e && a + b - 1 >= s {
+                return true;
+            }
+            if b == 0 && a >= s && a < e {
+                return true;
+            }
+            k += 4;
+        }
+        false
+    }
+}
+
+// The definition a new error is in (-1: none), and whether the edit
+// changed it (*edited).
+fn error_item(line: [u8], edited: *bool) -> i64 {
+    let mut at = 0;
+    let f = error_place(line, &at);
+    if f == -2 {
+        *edited = true;
+        return -1;
+    }
+    if f < 0 {
+        *edited = false;
+        return -1;
+    }
+    let i = changed_index(f);
+    if i < 0 {
+        *edited = false;
+        return def_at_line(f, at);
+    }
+    let mut h = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    hunks(i, &h);
+    let mut anchor = 0;
+    let mut insert = false;
+    let old = old_line(&h, at, &anchor, &insert);
+    if old < 0 {
+        *edited = true;
+        let d = def_at_line(f, anchor);
+        if insert && d >= 0 && def_at_line(f, anchor + 1) != d {
+            return -1;
+        }
+        return d;
+    }
+    let d = def_at_line(f, old);
+    *edited = d >= 0 && touched(&h, d);
+    d
+}
+
+// The definitions the edit changes (from its hunks), added to v.
+fn edited_items(v: *IntVec) {
+    unsafe {
+        for i in 0..CH_FILE.count {
+            let f = CH_FILE.data[i];
+            let mut h = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            hunks(i, &h);
+            let mut k = 0;
+            while k < h.count {
+                let a = h.data[k];
+                let b = h.data[k + 1];
+                let mut l = a;
+                while l < a + (if b > 0 { b } else { 1 }) {
+                    let d = def_at_line(f, l);
+                    if d >= 0 && (b > 0 || def_at_line(f, l + 1) == d) && !has(v, d) {
+                        v.push(d);
+                    }
+                    l += 1;
+                }
+                k += 4;
+            }
+        }
+    }
+}
+
+// ---- Shapes: a function's parameters, a struct's fields, an enum's variants ----
+
+fn is_blank(c: u8) -> bool {
+    c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+fn is_word(c: u8) -> bool {
+    c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+}
+
+fn trimmed(t: [u8]) -> [u8] {
+    let mut a = 0;
+    let mut b = t.len;
+    while a < b && is_blank(t[a]) {
+        a += 1;
+    }
+    while b > a && is_blank(t[b - 1]) {
+        b -= 1;
+    }
+    t[a..b]
+}
+
+// text without its comments (`// ...` to the end of the line), a buffer.
+fn uncommented(t: [u8]) -> [u8] {
+    let out = buf_new();
+    let mut i = 0;
+    let mut quote = 0 as u8;
+    while i < t.len {
+        let c = t[i];
+        if quote != 0 {
+            buf_byte(out, c);
+            if c == '\\' && i + 1 < t.len {
+                buf_byte(out, t[i + 1]);
+                i += 2;
+                continue;
+            }
+            if c == quote {
+                quote = 0;
+            }
+        } else if c == '"' {
+            quote = c;
+            buf_byte(out, c);
+        } else if c == '/' && i + 1 < t.len && t[i + 1] == '/' {
+            while i < t.len && t[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        } else {
+            buf_byte(out, c);
+        }
+        i += 1;
+    }
+    buf_slice(out)
+}
+
+// The position of the item's keyword word `kw` (fn, struct, enum, ...) in
+// t, and the name after it into *name_s, *name_e; -1 when there is none.
+fn keyword_at(t: [u8], kw: *u8, name_s: *i64, name_e: *i64) -> i64 {
+    unsafe {
+        let k = c_slice(kw);
+        let mut i = 0;
+        while i + k.len < t.len {
+            if (i == 0 || !is_word(t[i - 1])) && bytes_eq(t[i..i + k.len], k)
+                && is_blank(t[i + k.len]) {
+                let mut a = i + k.len;
+                while a < t.len && is_blank(t[a]) {
+                    a += 1;
+                }
+                let mut b = a;
+                while b < t.len && is_word(t[b]) {
+                    b += 1;
+                }
+                if b > a {
+                    *name_s = a;
+                    *name_e = b;
+                    return i;
+                }
+            }
+            i += 1;
+        }
+        -1
+    }
+}
+
+// The group opened at t[from] (or after it): its inside, between `open` and
+// its matching `close` (nesting by ()[]{}<>, as far as the text shows).
+fn group(t: [u8], from: i64, open: u8, inside_s: *i64, inside_e: *i64) -> bool {
+    let mut i = from;
+    while i < t.len && t[i] != open {
+        if open == '(' && (t[i] == '{' || t[i] == ';') {
+            return false;
+        }
+        i += 1;
+    }
+    if i >= t.len {
+        return false;
+    }
+    let mut depth = 0;
+    let s = i + 1;
+    while i < t.len {
+        let c = t[i];
+        if c == '(' || c == '[' || c == '{' {
+            depth += 1;
+        } else if c == ')' || c == ']' || c == '}' {
+            depth -= 1;
+            if depth == 0 {
+                *inside_s = s;
+                *inside_e = i;
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+// The parts of t between top-level commas, trimmed (start, end pairs into
+// out); empty parts are left out.
+fn parts(t: [u8], out: *IntVec) {
+    let mut depth = 0;
+    let mut s = 0;
+    let mut i = 0;
+    while i <= t.len {
+        if i == t.len || (t[i] == ',' && depth == 0) {
+            let mut a = s;
+            let mut b = i;
+            while a < b && is_blank(t[a]) {
+                a += 1;
+            }
+            while b > a && is_blank(t[b - 1]) {
+                b -= 1;
+            }
+            if b > a {
+                out.push(a);
+                out.push(b);
+            }
+            s = i + 1;
+        } else if t[i] == '(' || t[i] == '[' || t[i] == '{' || t[i] == '<' {
+            depth += 1;
+        }
+        else if t[i] == ')' || t[i] == ']' || t[i] == '}'
+            || (t[i] == '>' && i > 0 && t[i - 1] != '-') {
+            depth -= 1;
+        }
+        i += 1;
+    }
+}
+
+// A part `NAME: TYPE` (`mut`, `pub`, `pub(crate)` before NAME left out;
+// `self` in any form is named `self`): its name and type.
+fn name_type(p: [u8], name: *[u8], ty: *[u8]) {
+    let mut s = trimmed(p);
+    if s.len > 4 && bytes_eq(s[0..4], "pub ") {
+        s = trimmed(s[4..s.len]);
+    } else if s.len > 4 && bytes_eq(s[0..4], "pub(") {
+        let mut i = 4;
+        while i < s.len && s[i] != ')' {
+            i += 1;
+        }
+        s = trimmed(s[i + 1..s.len]);
+    }
+    if s.len > 4 && bytes_eq(s[0..4], "mut ") {
+        s = trimmed(s[4..s.len]);
+    }
+    let mut c = 0;
+    while c < s.len && s[c] != ':' {
+        c += 1;
+    }
+    if c >= s.len {
+        // (`self`, `&self`, `*mut self`)
+        *name = if s.len >= 4 && bytes_eq(s[s.len - 4..s.len], "self") { "self" } else { s };
+        *ty = s[0..0];
+        return;
+    }
+    *name = trimmed(s[0..c]);
+    *ty = trimmed(s[c + 1..s.len]);
+}
+
+// A variant `NAME(...)`, `NAME { ... }`, `NAME = N`: its name and the rest.
+fn variant_parts(p: [u8], name: *[u8], rest: *[u8]) {
+    let s = trimmed(p);
+    let mut i = 0;
+    while i < s.len && is_word(s[i]) {
+        i += 1;
+    }
+    *name = s[0..i];
+    *rest = trimmed(s[i..s.len]);
+}
+
+// The elements of an item's text: a function's parameters ('f'), a
+// struct's fields ('s'), an enum's variants ('e'): names and types (or a
+// variant's payload) as slices of t, into names and types (pairs of
+// start and length in t); the item's name into *name. False when the text
+// does not show them.
+fn elements(t: [u8], what: u8, name: *[u8], names: *IntVec, types: *IntVec) -> bool {
+    unsafe {
+        let kw = if what == 'f' { c"fn" } else if what == 's' { c"struct" } else { c"enum" };
+        let mut ns = 0;
+        let mut ne = 0;
+        let at = keyword_at(t, kw, &ns, &ne);
+        if at < 0 {
+            return false;
+        }
+        *name = t[ns..ne];
+        let mut a = 0;
+        let mut b = 0;
+        if !group(t, ne, if what == 'f' { '(' } else { '{' }, &a, &b) {
+            return false;
+        }
+        let mut ps = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        parts(t[a..b], &ps);
+        let mut k = 0;
+        while k < ps.count {
+            let p = t[a + ps.data[k]..a + ps.data[k + 1]];
+            let mut n = p[0..0];
+            let mut ty = p[0..0];
+            if what == 'e' {
+                variant_parts(p, &n, &ty);
+            } else {
+                name_type(p, &n, &ty);
+            }
+            names.push(n.ptr as i64);
+            names.push(n.len);
+            types.push(ty.ptr as i64);
+            types.push(ty.len);
+            k += 2;
+        }
+        true
+    }
+}
+
+// Element k of v (as elements makes them).
+fn el(v: *IntVec, k: i64) -> [u8] {
+    unsafe { ((*v).data[2 * k] as *u8)[0..(*v).data[2 * k + 1]] }
+}
+
+fn el_count(v: *IntVec) -> i64 {
+    unsafe { (*v).count / 2 }
+}
+
+// The index of the element named n in names, or -1.
+fn el_index(names: *IntVec, n: [u8]) -> i64 {
+    for k in 0..el_count(names) {
+        if bytes_eq(el(names, k), n) {
+            return k;
+        }
+    }
+    -1
+}
+
+// The new text of definition d (the edited file's lines its old lines
+// became), or an empty slice.
+fn new_text(d: i64) -> [u8] {
+    unsafe {
+        let f = crate::front::modules::file_of_pos(DEFS[d].start);
+        let i = changed_index(f);
+        if i < 0 {
+            return SRC[0..0];
+        }
+        let mut h = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        hunks(i, &h);
+        let mut s = 0;
+        let mut e = 0;
+        def_lines(d, &s, &e);
+        let a = new_line(&h, s, false);
+        let b = new_line(&h, e, true);
+        let t = buf_slice(CH_TEXT.data[i]);
+        let mut line = 1;
+        let mut p = 0;
+        let mut from = if a == 1 { 0 } else { -1 };
+        while p < t.len {
+            if t[p] == '\n' {
+                if line == b {
+                    return if from >= 0 { t[from..p + 1] } else { t[0..0] };
+                }
+                line += 1;
+                if line == a {
+                    from = p + 1;
+                }
+            }
+            p += 1;
+        }
+        if from >= 0 { t[from..t.len] } else { t[0..0] }
+    }
+}
+
+// (0.15) A parameter's type text without its default (`i64 = 1`: `i64`).
+fn without_default(s: [u8]) -> [u8] {
+    let mut depth = 0;
+    for i in 0..s.len {
+        let c = s[i];
+        if c == '(' || c == '[' || c == '<' {
+            depth += 1;
+        } else if c == ')' || c == ']' || (c == '>' && i > 0 && s[i - 1] != '-') {
+            depth -= 1;
+        } else if c == '=' && depth == 0 {
+            let mut e = i;
+            while e > 0 && s[e - 1] == ' ' {
+                e -= 1;
+            }
+            return s[0..e];
+        }
+    }
+    s
+}
+
+// The `try:` lines of the refactorings that change definition d's uses
+// with it, at most `max`, appended to buffer out: their number.
+fn shape_tries(out: i64, d: i64, max: i64, renames_only: bool) -> i64 {
+    unsafe {
+        let k = DEFS[d].kind;
+        let what = if k == K_FN || k == K_METHOD || k == K_IMPL_METHOD || k == K_TRAIT_FN { 'f' }
+            else if k == K_STRUCT { 's' } else if k == K_ENUM { 'e' } else { ' ' };
+        if what == ' ' {
+            return 0;
+        }
+        let nt = new_text(d);
+        if nt.len == 0 {
+            return 0;
+        }
+        let old = uncommented(SRC[text_start(d)..item_tail(d)]);
+        let new = uncommented(nt);
+        let mut old_name = old[0..0];
+        let mut new_name = old[0..0];
+        let mut on = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut ot = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut nn = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut ntt = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        if !elements(old, what, &old_name, &on, &ot) || !elements(new, what, &new_name, &nn, &ntt) {
+            return 0;
+        }
+        let path = SYMS[DEFS[d].fqn].text;
+        let mut n = 0;
+        if !bytes_eq(old_name, new_name) && !renames_only {
+            put_try_head(out, c"refactor rename", path);
+            put_word(out, new_name);
+            put_root(out);
+            try_end(out);
+            n += 1;
+        }
+        let cmd = if what == 'f' { c"refactor signature" } else if what == 's' { c"refactor field" }
+            else { c"refactor variant" };
+        let oc = el_count(&on);
+        let nc = el_count(&nn);
+        // Renamed in place: as many, the same types, other names.
+        let mut renamed = oc == nc && oc > 0;
+        let mut any_rename = false;
+        if renamed {
+            for x in 0..oc {
+                if !bytes_eq(el(&ot, x), el(&ntt, x)) {
+                    renamed = false;
+                }
+                if !bytes_eq(el(&on, x), el(&nn, x)) {
+                    any_rename = true;
+                    if el_index(&nn, el(&on, x)) >= 0 {
+                        // (a name moved: a reorder)
+                        renamed = false;
+                    }
+                }
+            }
+        }
+        if renamed && any_rename {
+            for x in 0..oc {
+                if n < max && !bytes_eq(el(&on, x), el(&nn, x)) {
+                    put_try_head(out, cmd, path);
+                    buf_str(out, if what == 'f' { c" --rename-param" } else { c" --rename" });
+                    put_word(out, el(&on, x));
+                    put_word(out, el(&nn, x));
+                    put_root(out);
+                    try_end(out);
+                    n += 1;
+                }
+            }
+            return n;
+        }
+        if renames_only {
+            return n;
+        }
+        // Added (in the new text only), removed (in the old only), retyped.
+        for x in 0..nc {
+            let o = el_index(&on, el(&nn, x));
+            if n >= max {
+                break;
+            }
+            if o < 0 {
+                put_try_head(out, cmd, path);
+                buf_str(out, c" --add");
+                let part = buf_new();
+                buf_bytes(part, el(&nn, x));
+                if what == 'e' {
+                    buf_bytes(part, el(&ntt, x));
+                    put_word(out, buf_slice(part));
+                    buf_str(out, c" --arm 'EXPR'");
+                } else {
+                    buf_str(part, c": ");
+                    buf_bytes(part, el(&ntt, x));
+                    // (0.15: a default written is the value)
+                    if without_default(el(&ntt, x)).len == el(&ntt, x).len {
+                        buf_str(part, c" = VALUE");
+                    }
+                    put_word(out, buf_slice(part));
+                    if what == 'f' && x < nc - 1 {
+                        buf_str(out, c" --at ");
+                        buf_int(out, x);
+                    }
+                }
+                put_root(out);
+                try_end(out);
+                n += 1;
+            } else if what != 'e'
+                && !bytes_eq(without_default(el(&ot, o)), without_default(el(&ntt, x)))
+                && !bytes_eq(el(&nn, x), "self") {
+                put_try_head(out, cmd, path);
+                buf_str(out, c" --type");
+                put_word(out, el(&nn, x));
+                put_word(out, without_default(el(&ntt, x)));
+                if what == 'f' {
+                    // (each call's argument: converted, or to fill in)
+                    buf_str(out, c" --default");
+                    let conv = buf_new();
+                    if numeric(el(&ot, o)) && numeric(el(&ntt, x)) {
+                        buf_byte(conv, '$');
+                        buf_bytes(conv, el(&nn, x));
+                        buf_str(conv, c" as ");
+                        buf_bytes(conv, el(&ntt, x));
+                    } else {
+                        buf_str(conv, c"EXPR");
+                    }
+                    put_word(out, buf_slice(conv));
+                }
+                put_root(out);
+                try_end(out);
+                n += 1;
+            }
+        }
+        for x in 0..oc {
+            if n >= max {
+                break;
+            }
+            if el_index(&nn, el(&on, x)) < 0 {
+                if what == 's' {
+                    // (a field still used is not removed: its uses)
+                    buf_str(out, c"try:");
+                    put_cword(out, PROG);
+                    buf_str(out, c" query refs");
+                    let p = buf_new();
+                    buf_bytes(p, path);
+                    buf_byte(p, '.');
+                    buf_bytes(p, el(&on, x));
+                    put_word(out, buf_slice(p));
+                    put_root(out);
+                    try_end(out);
+                } else {
+                    put_try_head(out, cmd, path);
+                    buf_str(out, c" --remove");
+                    put_word(out, el(&on, x));
+                    put_root(out);
+                    try_end(out);
+                }
+                n += 1;
+            }
+        }
+        // The same elements in another order (a function's).
+        if n == 0 && what == 'f' && oc == nc && oc > 1 {
+            let mut same = true;
+            let mut moved = false;
+            for x in 0..oc {
+                let o = el_index(&on, el(&nn, x));
+                if o < 0 {
+                    same = false;
+                } else if o != x {
+                    moved = true;
+                }
+            }
+            if same && moved {
+                put_try_head(out, cmd, path);
+                buf_str(out, c" --reorder ");
+                let mut first = true;
+                for x in 0..nc {
+                    if !bytes_eq(el(&nn, x), "self") {
+                        if !first {
+                            buf_byte(out, ',');
+                        }
+                        buf_bytes(out, el(&nn, x));
+                        first = false;
+                    }
+                }
+                put_root(out);
+                try_end(out);
+                n += 1;
+            }
+        }
+        n
+    }
+}
+
+// Whether type t is a number's (an integer's or a float's).
+fn numeric(t: [u8]) -> bool {
+    (t.len >= 2 && t.len <= 3 && (t[0] == 'i' || t[0] == 'u' || t[0] == 'f')
+        && t[1] >= '0' && t[1] <= '9') || bytes_eq(t, "usize") || bytes_eq(t, "isize")
+}
+
+// `try: PROG CMD PATH` into out (more words follow, then put_root and
+// try_end).
+fn put_try_head(out: i64, cmd: *u8, path: [u8]) {
+    unsafe {
+        buf_str(out, c"try:");
+        put_cword(out, PROG);
+        buf_byte(out, ' ');
+        buf_str(out, cmd);
+        put_word(out, path);
+    }
+}

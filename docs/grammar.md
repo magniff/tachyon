@@ -1270,51 +1270,138 @@ does not name std; a private item gets the help
 
 ## Additions of 0.15
 
-(In progress: the syntax below parses; what is not checked yet is
-reported as `... are not implemented yet (check.unimplemented)`. The
-design is [design/errors-formatting.md](design/errors-formatting.md).)
+The design is [design/errors-formatting.md](design/errors-formatting.md);
+the guide's topics are `tachyonc guide conversions` and `tachyonc guide
+formatting`.
 
 ```ebnf
-postfix   += expr "?"                                    (* POSTFIX_BP, like . ( [ *)
-primary   += fstring
-fstring    = 'f"' { text | "{{" | "}}" | "{" expr [ ":" spec ] "}" } '"'
-spec       = [ "<" | ">" ] [ "0" ] [ digits ] [ "." digits ] [ "?" | "x" | "X" | "b" | "c" ]
-arg        = expr | ident ":" expr                       (* named; after all positional *)
-param     += ... [ "=" expr ]                            (* fn items and inherent methods only *)
-field_init = ident ":" expr | ident                      (* shorthand *)
-attr      += "#[" "derive" "(" path { "," path } [","] ")" "]"   (* before struct/enum; with repr *)
-trait      = "trait" ident [ "<" tparam { "," tparam } ">" ] "{" ... "}"
-bound      = path [ "<" ( type | ident "=" type ) { "," ... } ">" ]   (* From<U>, Iterator<Item = T> *)
+postfix    += expr "?"                                   (* as tight as . ( [ *)
+primary    += fstring
+fstring     = 'f"' { text | "{{" | "}}" | "{" expr [ ":" spec ] "}" } '"'
+spec        = [ "<" | ">" ] [ "0" ] [ digits ] [ "." digits ] [ "?" | "x" | "X" | "b" | "c" ]
+args        = [ arg { "," arg } [ "," ] ]
+arg         = expr | ident ":" expr                      (* named: after every positional one *)
+param      += ... [ "=" expr ]                           (* fn items and inherent methods only *)
+field_init  = ident ":" expr | ident                     (* `ident` alone: shorthand *)
+attr       += "#[" "derive" "(" path { "," path } [ "," ] ")" "]"   (* before struct, enum *)
+trait       = "trait" ident [ "<" tparam { "," tparam } ">" ] "{" { trait_item } "}"
+bound       = path [ "<" ( type | ident "=" type ) { "," ( type | ident "=" type ) } ">" ]
 ```
-
-`?` is a postfix operator (it was reserved). An f-string is lexed as
-pieces: `f"text{` (FHead), the hole's tokens, `}text{` (FMid, with the
-spec of the hole it closes), ..., `}text"` (FTail); a hole ends at its
-`}` or at a `:` outside brackets, so a hole expression with a top-level
-`:` needs parentheses; f-strings do not nest; the text takes the escapes
-of a string literal. A named argument is `name: value` (an argument
-`label: loop { ... }` is a named argument now, no longer a labelled
-loop). `S { x }` is `S { x: x }`.
 
 ### Errors and `?`
 
-(To come.)
+`e?` is a postfix operator (it was reserved before 0.15), binding as
+tightly as a call: `parse(s)?.len` is `(parse(s)?).len`, `-x?` is
+`-(x?)`.
+
+- On `e: Option<T>` it is a `T`, or the function returns `None`.
+- On `e: Result<T, E>` it is a `T`, or the function returns `Err(c)`,
+  where `c` is the error itself when `E` is the function's error type
+  `F`, the error widened when `E` widens to `F` (below), else
+  `F::from(err)` through an `impl From<E> for F`.
+- The function's result type decides: `?` in a function returning
+  neither is an error, and so is `?` on an Option in a function returning
+  a Result (`try: e.ok_or(VALUE)?`). Inside a closure `?` returns from the
+  closure, whose result type must then be known (`|x| -> Option<i64>
+  {..}`, as for `return`). `defer` blocks run, as for `return`.
+- `fn main() -> Result<(), E>` with `E: Debug`: on `Err(e)` the program
+  prints `Error: ` and `e`'s Debug text on stderr and exits with 1.
 
 ### Widening and conversions
 
-(To come.)
+`widens(A, B)` holds for integer types when `B` is wider with the same
+signedness (`i8 < i16 < i32 < i64`, `u8 < u16 < u32 < u64`), or `A` is
+unsigned and `B` signed and strictly wider (`u32` to `i64`); `isize` and
+`usize` are `i64` and `u64`. Nothing else widens: not int and float,
+not `bool`, not signed to unsigned, never narrower.
+
+- Wherever a value of type `A` meets an expected type `B` with
+  `widens(A, B)` (`let x: B = v`, assignment and compound assignment,
+  arguments, `return`, a block's tail, struct fields, variant payloads,
+  array and tuple elements), the value is converted. A value only: an
+  `*i32` never becomes an `*i64`, nor `[i32]`, `Vec<i32>`, `fn(i32)`, a
+  tuple value.
+- Where two integer types meet without an expected type, the binary
+  operators' operands (comparisons included), the branches of `if` and
+  `match`, two arguments binding one type parameter, the result is the
+  wider type if one widens to the other; else the types must be equal.
+- An expected type flows into arithmetic as for literals: in `let t: i64
+  = a * b` with `a, b: i32`, the multiplication is done in `i64`.
+
+Traits may have type parameters (`trait From<T>`), with these
+restrictions: no default bodies in a generic trait, the operator traits
+have none, an impl's trait arguments are concrete types or the impl's
+own parameters (`impl<T> From<T> for Wrap<T>`), and there is one impl
+per trait, trait arguments and type. A bound may pass arguments
+(`T: From<U>`) and constrain associated types (`I: Iterator<Item = T>`)
+in one list. A call `T::f(x)` or `x.f()` that finds no ordinary method
+chooses among `T`'s impls of generic traits by the argument types; none
+or several is an error listing them.
+
+std's `From<T>` is there without an impl for the identity and for
+widening; `Into<T>` cannot be implemented: `x.into()` is `U::from(x)`
+with `U` the expected type, and `t: Into<U>` holds when `U: From<t>`.
 
 ### Formatting
 
-(To come.)
+An f-string `f"..."` is an expression of an unnameable type (an
+`std::Interp` of a closure) implementing `std::Display`. Its text takes
+the escapes of a string literal; `{{` and `}}` are braces; `{expr}` is a
+hole, `{expr:spec}` one with a spec. The lexer reads it as pieces:
+`f"text{` (FHead), the hole's tokens, `:spec}text{` or `}text{` (FMid),
+..., `:spec}text"` (FTail); an f-string without holes is one FHead. A
+hole ends at its `}` at bracket depth 0 or at a `:` outside brackets
+that is not `::`, so an expression with a top-level `:` needs
+parentheses; string literals may appear in holes; f-strings do not
+nest; a hole may not be empty, and a lone `}` in the text is an error.
+
+The spec: `<` or `>` aligns (numbers right, text left by default), `0`
+pads with zeros, the digits are the width, `.N` the precision (floats:
+N decimals), and the last character picks Debug (`?`), hex (`x`, `X`),
+binary (`b`) or a byte (`c`, a `u8` written as the byte).
+
+The holes are evaluated where the f-string is, once each, left to
+right; the value holds copies of them. Its Display writes the text and
+each hole's `Display` (or `Debug`) in turn.
 
 ### Named arguments, defaults, shorthand
 
-(To come.)
+A trailing run of a function's parameters may have defaults, `b: i64 =
+2`, on `fn` items and inherent methods; not on trait functions (nor the
+functions of trait impls), extern functions, closures or `fn` types. A
+default may not name a parameter or a local; it is checked against the
+parameter's type once, and evaluated at each call that leaves it out, in
+the callee's module (a fresh `Vec::new()` each time).
+
+At a call, the positional arguments come first, then `name: value`
+arguments, in the order of the parameters (so arguments are evaluated
+in the written order). Each parameter is given once; `self` cannot be
+named; calls of trait functions take positional arguments only. A
+function used as a value has its whole signature (its defaults do not
+come with it). `f(label: loop { .. })` is a named argument: an argument
+cannot be a labelled loop (parenthesize it).
+
+In a struct literal, a field written alone, `P { x, y: 0 }`, is `x: x`.
 
 ### derive
 
-(To come.)
+`#[derive(Trait, ...)]` goes before a `struct` or an `enum` (with
+`#[repr]`, not with function attributes, not before a union); several
+derive attributes add up. The traits are `Eq`, `Ord`, `Hash`, `Debug`
+and `Clone`; each is an impl the compiler writes:
+
+- `Eq`: none (structural `==` is the derived equality); every field must
+  have `==`.
+- `Ord`: lexicographic over the fields in declaration order; for enums
+  the variant's order first, then the payload.
+- `Hash`: the fields' hashes mixed with `std::hash_mix`, the variant's
+  index first for enums.
+- `Debug`: Rust's text, `P { x: 1, y: 2 }`, `Circle(3)`, `Empty`.
+- `Clone`: field by field with `std::clone_of`.
+
+On a generic type every parameter gets the trait as a bound
+(`impl<T: Ord> Ord for P<T>`). A derived trait and a written impl of
+the same trait for the type are a coherence error.
 
 ## Importing C headers
 

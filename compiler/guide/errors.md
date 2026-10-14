@@ -1,8 +1,9 @@
 # Errors and their fixes
 
-Compile with `--diagnostics=short` (or run `tachyonc check`): one line
-per error, `FILE:LINE:COL: error[KIND] MESSAGE | help: HELP | note:
-NOTE`, every error of every file at once (up to 50), sorted by position.
+`tachyonc check`, and a build whose output is not a terminal (an
+agent's shell, a pipe; `--diagnostics=short` anywhere): one line per
+error, `FILE:LINE:COL: error[KIND] MESSAGE | help: HELP | note: NOTE`,
+every error of every file at once (up to 50), sorted by position.
 KIND is `tokenizer error`, `parser error`, `module error`, `type error`
 or `unsafe`. Fix the first errors first: a parser error can hide
 type errors in the same function. `tachyonc query show FILE:LINE` prints
@@ -38,22 +39,13 @@ error[parser error] expected identifier, got '&' | help: write the type of self:
 `self: P` for a copy.
 
 ```tach
-fn f(r: Result<i64, i64>) -> i64 { let x = r?; x }
-```
-```err
-error[type error] '?' needs 'f' to return Option or Result; it returns 'i64' | help: make it return a Result: '-> Result<i64, i64>'
-```
-`?` returns the None or the Err from the function, so the function
-returns an Option or a Result (an error converted by `From`); `fn main()
--> Result<(), E>` prints an Err and exits with 1.
-
-```tach
 println!("{}", 1);
 ```
 ```err
-error[parser error] 'println!' is a macro call: tachyon has no macros | help: `println(s)` and `print(s)` take a [u8]; numbers: `std::print_int(n)`; or build the text in a `std::Buf` (`push_str`, `push_int`) and print `b.as_slice()`
+error[parser error] 'println!' is a macro call: tachyon has no macros
 ```
-The help names what replaces `vec!`, `format!`, `assert!` and the others.
+`println(f"{x}")` (0.15, `tachyonc guide formatting`). The help names
+what replaces `vec!`, `format!`, `assert!` and the others.
 
 ```tach
 'outer: for i in 0..3 { break 'outer; }
@@ -100,16 +92,6 @@ error[parser error] expected a pattern, got 'string literal'
 tuples.
 
 ```tach
-#[derive(Debug)]
-struct P { x: i64 }
-```
-```err
-error[type error] #[derive] attributes are not implemented yet (check.unimplemented)
-```
-`#[derive(Eq, Ord, Hash, Debug, Clone)]` is coming in 0.15; `==` is
-structural without it.
-
-```tach
 fn f<T>(x: T) -> T where T: Ord { x }
 ```
 ```err
@@ -145,9 +127,9 @@ let b: i32 = a;
 ```err
 error[type error] expected 'i32', got 'i64'
 ```
-No implicit narrowing: `a as i32`. A narrower integer widens (i32 to
-i64, u8 to u32 or i16); never signed to unsigned, nor between integers
-and floats (`1 + 1.0`).
+Only widening is implicit (0.15: `i32` to `i64`, `u8` to `u32`, ...):
+narrowing is `a as i32`. The same for `1 + 1.0`, `u32` to `i32`, and
+for `main` returning an `i64` (`n as i32`).
 
 ```tach
 let b: u8 = 300;
@@ -367,6 +349,103 @@ write `move`
 ```
 The closure borrows `j` (a `let mut`), which ends with the block: `move
 |x: i64| x + j` takes a copy, or declare `j` before the block.
+
+## ?, conversions, arguments, formatting, derive (0.15)
+
+```tach 0.15 try
+fn first(v: Option<i64>) -> i64 { let x = v?; x }
+```
+```err
+'?' needs 'first' to return Option or Result; it returns 'i64'
+```
+Return `Option<i64>` (or `Result<i64, E>`), or `match` on the value.
+`?` on an Option inside a function returning a Result needs the error:
+`v.ok_or(MyError::Missing)?`.
+
+```tach 0.15 try io
+use std::{ParseIntError, parse_int};
+enum AppError { Bad }
+fn read(s: [u8]) -> Result<i64, AppError> { let n = parse_int(s)?; Ok(n) }
+```
+```err
+'?' cannot convert 'ParseIntError' into 'AppError'
+```
+The `try:` line is the impl to add: `impl From<ParseIntError> for
+AppError { fn from(e: ParseIntError) -> AppError { ... } }`.
+
+```tach 0.15 from
+struct M { m: i64 }
+impl Into<M> for i64 { fn into(self: i64) -> M { M { m: self } } }
+```
+```err
+From
+```
+Implement `From<i64> for M`; `Into` comes with it. `x.into()` needs the
+type it converts to: `let y: M = x.into();`.
+
+```tach
+fn f(a: i64, b: i64) -> i64 { a + b }
+fn main() -> i32 { f(b: 1, 2) as i32 }
+```
+```err
+a positional argument after a named one: the named arguments come last
+```
+Named arguments follow the positional ones, in the parameters' order
+(`f(1, c: 3, b: 2)` is an error whose `try:` is `f(1, b: 2, c: 3)`); a
+missing one without a default gets `try: f(1, b: VALUE)`, a misspelt
+name the nearest.
+
+```tach
+trait T { fn f(x: i64 = 1) -> i64; }
+```
+```err
+a default value is for a parameter of a function or an inherent method, not of a trait function
+```
+Defaults go on trailing parameters of `fn` items and inherent methods,
+not on trait or extern functions, closures or `fn` types.
+
+```tach 0.15 args
+struct P { x: i64, y: i64 }
+fn main() -> i32 { let x = 1; let p = P { x, y }; p.x as i32 }
+```
+```err
+undefined variable 'y'
+```
+The shorthand `P { x, y }` takes locals of the fields' names: write
+`y: VALUE`.
+
+```tach 0.15 derive
+#[derive(Debg)]
+struct P { x: i64 }
+```
+```err
+did you mean 'Debug'
+```
+Derivable: `Eq`, `Ord`, `Hash`, `Debug`, `Clone` (Display is written by
+hand). Deriving a trait and implementing it too is a coherence error
+whose help is `remove Ord from #[derive]`; deriving `Eq` needs `==` on
+every field.
+
+```tach 0.15 fmt
+struct P { x: i64 }
+fn main() -> i32 { let p = P { x: 1 }; println(f"{p}"); 0 }
+```
+```err
+the trait 'Display' is not implemented for 'P'
+```
+Implement it (`impl Display for P { fn fmt(self: *P, f: *std::Fmt) {
+f.write(f"P({self.x})"); } }`), or print with `{p:?}` and
+`#[derive(Debug)]`. Rust's `fn fmt(&self, f: &mut Formatter) ->
+fmt::Result` is `fn fmt(self: *P, f: *Fmt)`, with nothing to return.
+
+```tach
+fn main() -> i32 { let x = 1; println(f"{f"{x}"}"); 0 }
+```
+```err
+f-strings cannot be nested
+```
+Compute the inner one in a `let` first. A `:` outside brackets ends a
+hole (the spec follows): parenthesize, `{(|x: i64| x + 1)(n)}`.
 
 ## Generics and traits
 

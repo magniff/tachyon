@@ -118,7 +118,9 @@ while [ $# -gt 0 ]; do
 done
 FILTER=${1:-}
 case "$DIAG" in
-    human) DIAG_FLAG="" ;;
+    # (0.15: a compiler whose stderr is not a terminal prints the short
+    # form unless told otherwise)
+    human) DIAG_FLAG="--diagnostics=human" ;;
     short) DIAG_FLAG="--diagnostics=short" ;;
     *) usage ;;
 esac

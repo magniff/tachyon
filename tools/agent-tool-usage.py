@@ -16,7 +16,15 @@ import os
 import re
 import shlex
 import sys
+import types
 from collections import Counter, defaultdict
+
+# (0.15) tachyonc through copies (target/tc0) and shell variables ($T):
+# tools/agent-hooks/tachyonc_cmd.py, shared with the hooks.
+tc = types.ModuleType("tachyonc_cmd")
+tc.__file__ = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent-hooks", "tachyonc_cmd.py")
+with open(tc.__file__) as _fh:
+    exec(compile(_fh.read(), tc.__file__, "exec"), tc.__dict__)
 
 SOURCE_HINT = re.compile(r"\.tach\b|compiler/src|compiler/std|tests/run|examples/|bench/")
 
@@ -300,6 +308,8 @@ def main():
     rows = []
     tool_counts = Counter()
     prog_counts = Counter()
+    tach_subs = Counter()
+    tach_via = Counter()
     for path in iter_transcripts(root):
         who = "main session" if "subagents" not in path else "agent " + os.path.basename(path)[6:14]
         with open(path, errors="replace") as fh:
@@ -321,10 +331,18 @@ def main():
                     if name == "Bash":
                         cmd = inp.get("command", "")
                         desc = inp.get("description", "")
+                        for sub, _, path, _ in tc.calls(cmd):
+                            tach_subs[sub] += 1
+                            if os.path.basename(path) != "tachyonc":
+                                tach_via[path or "$VAR"] += 1
+                        assigns = {}
                         for seg in split_segments(cmd):
                             prog, args = program_of(seg)
                             if not prog:
                                 continue
+                            # (0.15) a copy or a variable running tachyonc
+                            if tc.program_name(seg, assigns) == "tachyonc":
+                                prog = "tachyonc"
                             prog_counts[prog] += 1
                             if not SOURCE_HINT.search(seg) and prog not in ("tachyonc",) and "tachyonc" not in prog:
                                 continue
@@ -359,6 +377,12 @@ def main():
     print("| program | runs |\n|---|---|")
     for p, n in prog_counts.most_common(25):
         print(f"| `{p}` | {n} |")
+    if tach_subs:
+        print("\n`tachyonc` invocations by subcommand (copies and shell variables included"
+              f"{': ' + str(sum(tach_via.values())) + ' through ' + ', '.join(f'`{p}`' for p, _ in tach_via.most_common(4)) if tach_via else ''}):\n")
+        print("| subcommand | runs |\n|---|---|")
+        for sub, n in tach_subs.most_common():
+            print(f"| {sub} | {n} |")
     print(f"\n## Reading and editing tachyon source: {len(rows)} operations\n")
     print("| purpose | operations | share | what could answer it |\n|---|---|---|---|")
     for key, what, query in CATEGORIES:

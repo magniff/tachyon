@@ -63,7 +63,7 @@ error patch.no-match: OLD 2 is not in crate::calc::sum_to; no line is near it
 try: tachyonc query show sum_to
 [exit 1]
 $ edit patch clamp --old 'return lo;' --new 'return true;'
-./calc.tach:6:16: error[type error] expected 'i64', got 'bool'
+./calc.tach:6:16: error[type error] expected 'i64', got 'bool'  [edited: crate::calc::clamp]
 error edit.breaks: 1 new error; nothing written
 try: tachyonc edit patch clamp --old 'return lo;' --new 'return true;' --no-check
 [exit 1]
@@ -260,9 +260,9 @@ $ edit replace crate::use --dry-run < $T/inputs/use_alias.tach
 +++ b/main.tach
 @@ -4 +3,0 @@
 -use calc::{clamp, sum_to};
-main.tach:7:13: error[type error] undefined variable 'clamp' | help: add `use crate::calc::clamp;`
-main.tach:8:13: error[type error] undefined variable 'sum_to' | help: add `use crate::calc::sum_to;`
-warning edit.breaks: 2 new errors (dry run)
+main.tach:7:13: error[type error] undefined variable 'clamp' | help: add `use crate::calc::clamp;`  [in crate::main]
+main.tach:8:13: error[type error] undefined variable 'sum_to' | help: add `use crate::calc::sum_to;`  [in crate::main]
+warning edit.breaks: 2 new errors (2 in crate::main, which the edit does not change) (dry run)
 [exit 1]
 $ edit delete crate::header
 deleted crate::header	main.tach	+0 -1 lines

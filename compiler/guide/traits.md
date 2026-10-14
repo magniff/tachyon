@@ -87,8 +87,12 @@ shape 10
 - A default function is checked, and compiled, only for the impls
   that use it (in a non-generic impl).
 - Not there: `dyn Trait` (use generics, or an enum of the cases),
-  supertraits, associated constants, generic traits, `impl Trait` in
-  argument or return position, blanket impls over all `T`, `#[derive]`.
+  supertraits, associated constants, `impl Trait` in argument or return
+  position, blanket impls over all `T`.
+- (0.15) Traits may take type parameters, `trait From<T>`; bounds take
+  arguments, `T: From<i64>` (`tachyonc guide conversions`).
+  `#[derive(Eq, Ord, Hash, Debug, Clone)]` writes impls (`tachyonc
+  guide formatting`).
 
 ## Associated types (0.14)
 

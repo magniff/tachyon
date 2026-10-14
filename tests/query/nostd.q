@@ -1,0 +1,29 @@
+## std from a program that does not use it (0.15): by path, by a name
+## the program does not define, its source by `std`, grep in it, a
+## show with the `use` line a program needs.
+$ def std::read_line Vec::push
+std::read_line	<std>:1552:8	fn	pub fn read_line(line: *Buf) -> Result<bool, IoError>
+std::Vec::push	<std>:185:12	method	pub fn push(self: *Vec<T>, x: T)
+$ def read_line twice
+std::read_line	<std>:1552:8	fn	pub fn read_line(line: *Buf) -> Result<bool, IoError>
+crate::twice	nostd/main.tach:4:4	fn	fn twice(x: i64) -> i64
+$ show std::print_int
+// std::print_int	<std>:1887-1892
+// use std::print_int;
+pub fn print_int(v: i64) {
+    let mut b = Buf::new();
+    b.push_int(v);
+    print(b.as_slice());
+    b.free();
+}
+$ text std:1-2
+// std:1-2
+1	// The standard library (0.5): the module `std`, built into the compiler
+2	// (compiler/std/embed.sh makes compiler/src/front/stdsrc.tach from this file
+$ grep 'pub fn read_line' --in std
+# <std>
+1552:1	code	std	pub fn read_line(line: *Buf) -> Result<bool, IoError> {
+$ def no_such_name
+error query.no-match: no definition 'no_such_name'
+try: tachyonc query items
+[exit 1]
