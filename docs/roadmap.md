@@ -437,9 +437,16 @@ written against 0.5's unbounded generics mean.
   compiler compiled with it compiles itself to the same output
 - done: interp: `vm.sp` is promoted (the 0.6 note): interp is level with
   cc -O2 (40 against 39-40 ms)
+- not done, measured: GVN-PRE. Of the compiler's 16,482 pure
+  instructions in two-way merge blocks at -O2, 26 are partially
+  redundant (an equal one on one way in), and none of bench/'s: a pass
+  would not pay for its compile time (LICM already moves what loops
+  repeat)
 - in progress: -
-- remaining: SLP vectorizer; scalar unrolling with run-time trip counts;
-  GVN-PRE
+- remaining (to 0.11): SLP vectorizer; scalar unrolling with run-time
+  trip counts; AVX2 (behind a --target-cpu, untestable under Rosetta);
+  hot/cold function splitting; PGO-aware register allocation and
+  scheduling
 
 Vectorization:
 - SLP vectorizer
