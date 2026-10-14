@@ -63,6 +63,20 @@ falls short, record it in one line:
 
     tools/agent-feedback "query refs" "misses uses inside never-instantiated generic fns"
 
+## The inner loop
+
+Check and test only what a change touches, and widen at milestones:
+
+- after an edit: `target/tachyonc check` (the front end, one line per
+  error) and the cases it concerns, `tests/run.sh FILTER` (cases whose
+  name contains FILTER; `-O 0` for another level);
+- the whole suite (`tests/run.sh`) only at milestones;
+- before committing a big change: `bootstrap/gate.sh --quick` (the chain
+  from the working tree, the suite at -O2, a short fuzz in every mode, a
+  few minutes; one table at the end);
+- a release: `bootstrap/gate.sh --release`, then `gate.sh --only bench`
+  on an idle machine ([docs/releases.md](docs/releases.md), "The gate").
+
 ## Conventions
 
 - Commit as `git -c user.name=magniff -c user.email=tinysnippets@gmail.com

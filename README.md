@@ -105,6 +105,9 @@ $ tests/abi/run.sh -n 150            # random C signatures, called both ways
 $ tests/fuzz/run.sh -n 500           # random programs: -O0, -O1 and -O2 must agree
 $ bench/run.sh                       # benchmarks against cc -O2
 $ bootstrap/linux-check.sh           # the whole chain on x86-64 Linux, in docker
+$ bootstrap/gate.sh --quick          # chain, suite at -O2, a short fuzz: a few minutes
+$ bootstrap/gate.sh --release        # the release gate: everything, at once, one table
+$ tests/fuzz/forever.sh              # fuzz every mode at low priority until target/fuzz-forever/stop
 $ cd seed && cargo test              # the seed's own tests
 ```
 
