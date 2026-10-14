@@ -1,0 +1,783 @@
+// The linear scan (regalloc/mod.tach): the registers each class of value
+// may get, intervals given free registers or registers taken from others,
+// splits at loop entries, and spill slots for the values that go to the
+// stack.
+
+use crate::back::regalloc::{
+    BEND, BSTART, CALLEE_USED, FIXED, IVS, LDEPTH, ON_STACK, ORDER, POS_MAX, RA_VALS, RV_FIRST,
+    RV_HINT, RV_HREG, RV_SLOT, SPILL_COUNT, SPILL_VECTORS, SPLIT_MOVES, UNASSIGNED, USE_REG,
+};
+use crate::back::regalloc::intervals::{
+    RETURNS_TWICE, block_at, covers, gap_before, min_i64, move_point_before, next_intersection,
+    next_use, ra_end, ra_start, split_at, split_point,
+};
+use crate::base::{IntVec, die, free};
+use crate::front::types::{in_fregs, is_vector, max_i64};
+use crate::gen0::target::X86;
+use crate::middle::ir::{BLOCKS, INSTS};
+use crate::middle::ir::Op::Phi;
+
+// ---- Registers ----
+
+// The registers allocated, in order of preference: caller-saved first.
+fn class_regs(float: bool, vector: bool, regs: *i64) -> i64 {
+    unsafe {
+        let mut n = 0;
+        if X86 {
+            if float {
+                for r in 2..14 { regs[n] = 32 + r; n += 1; }
+                regs[n] = 32; n += 1;
+                regs[n] = 33; n += 1;
+                return n;
+            }
+            let list: [i64; 12] = [6, 7, 8, 9, 0, 1, 2, 3, 12, 13, 14, 15];
+            for i in 0..12 {
+                if is_allocatable(list[i]) {
+                    regs[n] = list[i];
+                    n += 1;
+                }
+            }
+            return n;
+        }
+        if float {
+            for r in 16..30 { regs[n] = 32 + r; n += 1; }
+            for r in 0..8 { regs[n] = 32 + r; n += 1; }
+            if !vector {
+                for r in 8..16 { regs[n] = 32 + r; n += 1; }
+            }
+            return n;
+        }
+        for r in 9..16 { regs[n] = r; n += 1; }
+        for r in 0..9 { regs[n] = r; n += 1; }
+        for r in 19..29 { regs[n] = r; n += 1; }
+        n
+    }
+}
+
+// x86-64 keeps rax, rcx and rdx out of allocation while the machine layer
+// still uses them inside instructions.
+pub static mut X86_ALLOC_ACD: bool = true;
+
+pub fn is_allocatable(r: i64) -> bool {
+    if X86 {
+        if r >= 32 {
+            return r < 46;
+        }
+        if r == 0 || r == 1 || r == 2 {
+            return X86_ALLOC_ACD;
+        }
+        return r == 3 || r == 6 || r == 7 || r == 8 || r == 9 || (r >= 12 && r <= 15);
+    }
+    if r >= 32 {
+        return r < 62;
+    }
+    r <= 15 || (r >= 19 && r <= 28)
+}
+
+pub fn is_callee_saved_reg(r: i64) -> bool {
+    if X86 {
+        return r == 3 || (r >= 12 && r <= 15);
+    }
+    (r >= 19 && r <= 28) || (r >= 40 && r <= 47)
+}
+
+// ---- Linear scan ----
+
+static mut ACTIVE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+static mut INACTIVE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// Unhandled intervals: a binary heap by (start, id).
+static mut UNHANDLED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+static mut FREE_UNTIL: [i64; 64] = [0; 64];
+
+static mut USE_POS: [i64; 64] = [0; 64];
+
+static mut BLOCK_POS: [i64; 64] = [0; 64];
+
+fn heap_less(a: i64, b: i64) -> bool {
+    let sa = ra_start(a);
+    let sb = ra_start(b);
+    sa < sb || (sa == sb && a < b)
+}
+
+fn heap_push(i: i64) {
+    unsafe {
+        UNHANDLED.push(i);
+        let mut k = UNHANDLED.count - 1;
+        while k > 0 {
+            let parent = (k - 1) / 2;
+            if !heap_less(UNHANDLED.data[k], UNHANDLED.data[parent]) {
+                break;
+            }
+            let t = UNHANDLED.data[k];
+            UNHANDLED.data[k] = UNHANDLED.data[parent];
+            UNHANDLED.data[parent] = t;
+            k = parent;
+        }
+    }
+}
+
+fn heap_pop() -> i64 {
+    unsafe {
+        let top = UNHANDLED.data[0];
+        UNHANDLED.count -= 1;
+        let n = UNHANDLED.count;
+        if n > 0 {
+            UNHANDLED.data[0] = UNHANDLED.data[n];
+            let mut k = 0;
+            loop {
+                let l = 2 * k + 1;
+                let r = l + 1;
+                let mut m = k;
+                if l < n && heap_less(UNHANDLED.data[l], UNHANDLED.data[m]) {
+                    m = l;
+                }
+                if r < n && heap_less(UNHANDLED.data[r], UNHANDLED.data[m]) {
+                    m = r;
+                }
+                if m == k {
+                    break;
+                }
+                let t = UNHANDLED.data[k];
+                UNHANDLED.data[k] = UNHANDLED.data[m];
+                UNHANDLED.data[m] = t;
+                k = m;
+            }
+        }
+        top
+    }
+}
+
+fn iv_float(i: i64) -> bool {
+    unsafe { in_fregs(INSTS[RA_VALS.data[IVS[i].value]].ty) }
+}
+
+// A vector (0.10): in a float register, but never in one whose upper half
+// a call may change (d8-d15 keep only their low 64 bits on AArch64).
+fn iv_vector(i: i64) -> bool {
+    unsafe { is_vector(INSTS[RA_VALS.data[IVS[i].value]].ty) }
+}
+
+// Whether register r may hold interval i.
+fn reg_fits(i: i64, r: i64) -> bool {
+    r >= 0 && (r >= 32) == iv_float(i) && is_allocatable(r) && !(iv_vector(i) && !X86 && r >= 40 && r < 48)
+}
+
+fn iv_remat(i: i64) -> bool {
+    unsafe { INSTS[RA_VALS.data[IVS[i].value]].op.is_remat() }
+}
+
+// How soon a use at `pos` comes after `from`, for choosing what to spill:
+// uses in loops count as nearer (by 4 per level), remat values are cheap
+// to bring back; between equals, the nearer position.
+fn use_distance(i: i64, pos: i64, from: i64) -> i64 {
+    if pos >= POS_MAX {
+        return POS_MAX;
+    }
+    let depth = unsafe { min_i64(LDEPTH.data[block_at(pos)], 6) };
+    let raw = pos - from;
+    let mut d = raw >> (2 * depth) as u64;
+    // A constant is cheap to bring back, unless it is needed by the very
+    // next instruction (two constants needed there would take each
+    // other's register forever).
+    if iv_remat(i) && raw > 4 {
+        d = d * 4 + 3;
+    }
+    (d << 20) | min_i64(raw, 0xfffff)
+}
+
+// The register the value of interval i would like, or -1: its partner's
+// (a phi and its operands), else the register it arrives in or goes to.
+fn hint_reg(i: i64) -> i64 {
+    unsafe {
+        let t = IVS[i].value;
+        let mut other = RV_HINT[t];
+        // The partner's register, or (not allocated yet) its own partner's.
+        for _ in 0..2 {
+            if other < 0 || other == t {
+                break;
+            }
+            let mut j = RV_FIRST[other];
+            while j >= 0 {
+                if IVS[j].reg >= 0 {
+                    return IVS[j].reg;
+                }
+                j = IVS[j].next;
+            }
+            other = RV_HINT[other];
+        }
+        RV_HREG[t]
+    }
+}
+
+fn assign(i: i64, r: i64) {
+    unsafe { IVS[i].reg = r; }
+    if is_callee_saved_reg(r) {
+        CALLEE_USED[r] = 1;
+    }
+}
+
+// Dominators over the layout (a reverse post-order), computed once per
+// function when an entry split asks (Cooper, Harvey and Kennedy).
+static mut RA_IDOM: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+pub static mut RA_IDOM_READY: bool = false;
+
+fn ra_dominators() {
+    unsafe {
+        if RA_IDOM_READY {
+            return;
+        }
+        RA_IDOM_READY = true;
+        let n = ORDER.count;
+        RA_IDOM.count = 0;
+        for k in 0..n {
+            RA_IDOM.push(if k == 0 { 0 } else { -1 });
+        }
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for k in 1..n {
+                let b = ORDER.data[k];
+                let mut idom = -1;
+                for i in 0..BLOCKS[b].preds.count {
+                    let pk = BLOCKS[BLOCKS[b].preds.data[i]].order;
+                    if pk < 0 || RA_IDOM.data[pk] < 0 {
+                        continue;
+                    }
+                    if idom < 0 {
+                        idom = pk;
+                    } else {
+                        let mut x = pk;
+                        let mut y = idom;
+                        while x != y {
+                            while x > y {
+                                x = RA_IDOM.data[x];
+                            }
+                            while y > x {
+                                y = RA_IDOM.data[y];
+                            }
+                        }
+                        idom = x;
+                    }
+                }
+                if idom != RA_IDOM.data[k] {
+                    RA_IDOM.data[k] = idom;
+                    changed = true;
+                }
+            }
+        }
+    }
+}
+
+fn ra_dominates(a: i64, x: i64) -> bool {
+    let mut y = x;
+    while y > a {
+        unsafe { y = RA_IDOM.data[y]; }
+    }
+    y == a
+}
+
+// Whether interval i (a whole value) can move to its second location at
+// the start of block k (in no loop): k dominates every block at or after
+// it where the value lives. (A block in no loop reaches only blocks after
+// it in the layout, a reverse post-order: going back takes a back edge,
+// into a loop that would contain it. So no block before k where the value
+// lives can see the second location.)
+fn entry_split_ok(i: i64, k: i64) -> bool {
+    ra_dominators();
+    let n = ORDER.count;
+    unsafe {
+        for j in 0..IVS[i].ranges.count / 2 {
+            let from = IVS[i].ranges.data[2 * j];
+            let to = IVS[i].ranges.data[2 * j + 1];
+            let mut b = max_i64(block_at(from), k);
+            while b < n && BSTART.data[b] < to {
+                if !ra_dominates(k, b) {
+                    return false;
+                }
+                b += 1;
+            }
+        }
+    }
+    true
+}
+
+// A value defined in the entry block (a parameter, mostly) that would take
+// a callee-saved register for its whole lifetime: it keeps a caller-saved
+// one (its hint first) until just before that one is needed elsewhere (a
+// call, usually), when that is past the entry block, and the rest goes on.
+// Moving it into the callee-saved register there rather than at the entry
+// costs the same move, and leaves the paths that return before any call
+// without a frame (shrink-wrapping, see emit.tach).
+fn try_entry_split(cur: i64, hint: i64, regs: *i64, n: i64) -> bool {
+    unsafe {
+        let start = ra_start(cur);
+        if block_at(start) != 0 || RV_FIRST[IVS[cur].value] != cur || RETURNS_TWICE {
+            return false;
+        }
+        let mut c = -1;
+        if reg_fits(cur, hint) && !is_callee_saved_reg(hint)
+            && FREE_UNTIL[hint] > BEND.data[0] {
+            c = hint;
+        } else {
+            for k in 0..n {
+                let r = regs[k];
+                if !is_callee_saved_reg(r) && (c < 0 || FREE_UNTIL[r] > FREE_UNTIL[c]) {
+                    c = r;
+                }
+            }
+        }
+        if c < 0 || FREE_UNTIL[c] <= BEND.data[0] {
+            return false;
+        }
+        let end = ra_end(cur);
+        if FREE_UNTIL[c] >= end {
+            // Free all along: no callee-saved register is needed at all.
+            assign(cur, c);
+            return true;
+        }
+        // Out of loops, where every later use passes: in the block of the
+        // conflict, or at the start of the last block before it that is in no
+        // loop and dominates the rest of the value's blocks (in layout order,
+        // a loop run before it may come after it).
+        let limit = FREE_UNTIL[c];
+        let mut k = block_at(limit);
+        let mut split = -1;
+        if LDEPTH.data[k] == 0 && entry_split_ok(cur, k) {
+            split = move_point_before(limit, start + 1);
+        }
+        while split < 0 && k > 0 {
+            if LDEPTH.data[k] == 0 && BSTART.data[k] < limit && entry_split_ok(cur, k) {
+                split = BSTART.data[k];
+            }
+            k -= 1;
+        }
+        if split <= start || split >= end || block_at(split) == 0 {
+            return false;
+        }
+        assign(cur, c);
+        heap_push(split_at(cur, split));
+        true
+    }
+}
+
+// Whether v is a phi of a loop header (a block with a back edge into it).
+fn is_loop_phi(v: i64) -> bool {
+    unsafe {
+        if INSTS[v].op != Phi {
+            return false;
+        }
+        let b = INSTS[v].block;
+        let k = BLOCKS[b].order;
+        for i in 0..BLOCKS[b].preds.count {
+            if BLOCKS[BLOCKS[b].preds.data[i]].order >= k {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// Whether interval i lives across a call: every caller-saved register of
+// `regs` is clobbered somewhere in it.
+fn crosses_calls(i: i64, regs: *i64, n: i64) -> bool {
+    unsafe {
+        let mut any = false;
+        for k in 0..n {
+            let r = regs[k];
+            if is_callee_saved_reg(r) {
+                continue;
+            }
+            any = true;
+            if FIXED[r].count == 0 || next_intersection(&FIXED[r], &IVS[i].ranges, 0) == POS_MAX {
+                return false;
+            }
+        }
+        any
+    }
+}
+
+// Gives interval cur register r, free for its whole lifetime: unless r is
+// callee-saved and an entry split keeps it in a caller-saved one first.
+fn assign_whole(cur: i64, r: i64, hint: i64, regs: *i64, n: i64) {
+    if is_callee_saved_reg(r) && try_entry_split(cur, hint, regs, n) {
+        return;
+    }
+    assign(cur, r);
+}
+
+fn try_allocate_free(cur: i64) -> bool {
+    unsafe {
+        let mut regs: [i64; 32] = [0; 32];
+        let n = class_regs(iv_float(cur), iv_vector(cur), &regs as *i64);
+        let start = ra_start(cur);
+        let end = ra_end(cur);
+        for k in 0..n {
+            FREE_UNTIL[regs[k]] = POS_MAX;
+        }
+        for k in 0..ACTIVE.count {
+            FREE_UNTIL[IVS[ACTIVE.data[k]].reg] = 0;
+        }
+        for k in 0..INACTIVE.count {
+            let a = INACTIVE.data[k];
+            let r = IVS[a].reg;
+            if FREE_UNTIL[r] > 0 {
+                let x = next_intersection(&IVS[a].ranges, &IVS[cur].ranges, start);
+                if x < FREE_UNTIL[r] {
+                    FREE_UNTIL[r] = x;
+                }
+            }
+        }
+        for k in 0..n {
+            let r = regs[k];
+            if FREE_UNTIL[r] > 0 && FIXED[r].count > 0 {
+                let x = next_intersection(&FIXED[r], &IVS[cur].ranges, start);
+                if x < FREE_UNTIL[r] {
+                    FREE_UNTIL[r] = x;
+                }
+            }
+        }
+        let hint = hint_reg(cur);
+        // Out of loops, a value that lives across no call does not follow its
+        // hint into a callee-saved register: the move the hint saves runs
+        // once, the frame it may force on paths that need none (see
+        // shrink-wrapping in emit.tach) every time.
+        let cheap_hint = !is_callee_saved_reg(hint) || LDEPTH.data[block_at(start)] != 0
+            || crosses_calls(cur, &regs as *i64, n);
+        if reg_fits(cur, hint) && FREE_UNTIL[hint] >= end && cheap_hint {
+            assign_whole(cur, hint, hint, &regs as *i64, n);
+            return true;
+        }
+        // The partner not allocated yet will need a callee-saved register (it
+        // lives across a call): one free now can be both's.
+        let partner = RV_HINT[IVS[cur].value];
+        if hint < 0 && partner >= 0 && partner != IVS[cur].value && RV_FIRST[partner] >= 0
+            && is_loop_phi(RA_VALS.data[IVS[cur].value])
+            && IVS[RV_FIRST[partner]].reg == UNASSIGNED && crosses_calls(RV_FIRST[partner], &regs as *i64, n) {
+            for k in 0..n {
+                let r = regs[k];
+                if is_callee_saved_reg(r) && FREE_UNTIL[r] >= end {
+                    assign_whole(cur, r, hint, &regs as *i64, n);
+                    return true;
+                }
+            }
+        }
+        // Else the argument or result register the value goes to, when the
+        // partner's is taken.
+        let to = RV_HREG[IVS[cur].value];
+        if to != hint && reg_fits(cur, to) && FREE_UNTIL[to] >= end {
+            assign_whole(cur, to, hint, &regs as *i64, n);
+            return true;
+        }
+        let mut best = regs[0];
+        for k in 0..n {
+            let r = regs[k];
+            if FREE_UNTIL[r] >= end {
+                assign_whole(cur, r, hint, &regs as *i64, n);
+                return true;
+            }
+            if FREE_UNTIL[r] > FREE_UNTIL[best] {
+                best = r;
+            }
+        }
+        if FREE_UNTIL[best] <= start {
+            return false;
+        }
+        // Free for a first part only.
+        let split = split_point(start + 1, FREE_UNTIL[best]);
+        if split <= start {
+            return false;
+        }
+        assign(cur, best);
+        heap_push(split_at(cur, split));
+        true
+    }
+}
+
+// Interval a gives up its register from pos on: the rest goes to the
+// stack until just before its next use in a register.
+fn spill_from(a: i64, pos: i64) {
+    unsafe {
+        let mut rest = a;
+        if ra_start(a) < pos {
+            rest = split_at(a, pos);
+        }
+        IVS[rest].reg = ON_STACK;
+        let start = ra_start(rest);
+        let u = next_use(rest, start, USE_REG);
+        if u == POS_MAX {
+            return;
+        }
+        let split = split_point(start + 1, gap_before(u));
+        if split <= start {
+            // Needed in a register right away: allocate it again.
+            IVS[rest].reg = UNASSIGNED;
+            heap_push(rest);
+            return;
+        }
+        heap_push(split_at(rest, split));
+    }
+}
+
+fn remove_at(list: *IntVec, k: i64) {
+    unsafe { list.data[k] = list.data[list.count - 1]; }
+    list.count -= 1;
+}
+
+fn allocate_blocked(cur: i64) {
+    unsafe {
+        let mut regs: [i64; 32] = [0; 32];
+        let n = class_regs(iv_float(cur), iv_vector(cur), &regs as *i64);
+        let start = ra_start(cur);
+        for k in 0..n {
+            USE_POS[regs[k]] = POS_MAX;
+            BLOCK_POS[regs[k]] = POS_MAX;
+        }
+        for k in 0..ACTIVE.count {
+            let a = ACTIVE.data[k];
+            let r = IVS[a].reg;
+            let u = use_distance(a, next_use(a, start, USE_REG), start);
+            if u < USE_POS[r] {
+                USE_POS[r] = u;
+            }
+        }
+        for k in 0..INACTIVE.count {
+            let a = INACTIVE.data[k];
+            let r = IVS[a].reg;
+            if next_intersection(&IVS[a].ranges, &IVS[cur].ranges, start) < POS_MAX {
+                let u = use_distance(a, next_use(a, start, USE_REG), start);
+                if u < USE_POS[r] {
+                    USE_POS[r] = u;
+                }
+            }
+        }
+        let end = ra_end(cur);
+        let first = next_use(cur, start, USE_REG);
+        if first == POS_MAX {
+            IVS[cur].reg = ON_STACK;
+            return;
+        }
+        // A register is a candidate when no fixed interval takes it before
+        // the first use, nor before a place to give it back; the best one is
+        // taken from the intervals whose next use is farthest.
+        let mut best = -1;
+        for k in 0..n {
+            let r = regs[k];
+            if FIXED[r].count > 0 {
+                let x = next_intersection(&FIXED[r], &IVS[cur].ranges, start);
+                BLOCK_POS[r] = x;
+                if x <= first || (x < end && split_point(start + 1, x) <= start) {
+                    continue;
+                }
+            }
+            if best < 0 || USE_POS[r] > USE_POS[best] {
+                best = r;
+            }
+        }
+        let split = split_point(start + 1, gap_before(first));
+        if split > start && (best < 0 || USE_POS[best] <= use_distance(cur, first, start)) {
+            // Every register is needed as soon: to the stack until its first
+            // use.
+            IVS[cur].reg = ON_STACK;
+            heap_push(split_at(cur, split));
+            return;
+        }
+        if best < 0 {
+            die(c"internal error: no register for an operand");
+        }
+        assign(cur, best);
+        if BLOCK_POS[best] < ra_end(cur) {
+            let at = split_point(start + 1, BLOCK_POS[best]);
+            if at <= start {
+                die(c"internal error: no place to split before a fixed register");
+            }
+            heap_push(split_at(cur, at));
+        }
+        // Take the register from the intervals holding it.
+        let mut k = 0;
+        while k < ACTIVE.count {
+            let a = ACTIVE.data[k];
+            if IVS[a].reg == best {
+                remove_at(&ACTIVE, k);
+                spill_from(a, start);
+            } else {
+                k += 1;
+            }
+        }
+        k = 0;
+        while k < INACTIVE.count {
+            let a = INACTIVE.data[k];
+            if IVS[a].reg == best && next_intersection(&IVS[a].ranges, &IVS[cur].ranges, start) < POS_MAX {
+                remove_at(&INACTIVE, k);
+                spill_from(a, start);
+            } else {
+                k += 1;
+            }
+        }
+    }
+}
+
+pub fn linear_scan() {
+    unsafe {
+        for r in 0..64 {
+            CALLEE_USED[r] = 0;
+        }
+        ACTIVE.count = 0;
+        INACTIVE.count = 0;
+        UNHANDLED.count = 0;
+        for t in 0..RA_VALS.count {
+            heap_push(RV_FIRST[t]);
+        }
+        let mut steps = 0;
+        while UNHANDLED.count > 0 {
+            let cur = heap_pop();
+            steps += 1;
+            if steps > 64 * (RA_VALS.count + 16) * 16 {
+                die(c"internal error: register allocation does not finish");
+            }
+            let pos = ra_start(cur);
+            let mut k = 0;
+            while k < ACTIVE.count {
+                let a = ACTIVE.data[k];
+                if ra_end(a) <= pos {
+                    remove_at(&ACTIVE, k);
+                } else if !covers(a, pos) {
+                    remove_at(&ACTIVE, k);
+                    INACTIVE.push(a);
+                } else {
+                    k += 1;
+                }
+            }
+            k = 0;
+            while k < INACTIVE.count {
+                let a = INACTIVE.data[k];
+                if ra_end(a) <= pos {
+                    remove_at(&INACTIVE, k);
+                } else if covers(a, pos) {
+                    remove_at(&INACTIVE, k);
+                    ACTIVE.push(a);
+                } else {
+                    k += 1;
+                }
+            }
+            if !try_allocate_free(cur) {
+                allocate_blocked(cur);
+            }
+            if IVS[cur].reg >= 0 {
+                ACTIVE.push(cur);
+            }
+        }
+        sort_split_moves();
+        assign_spill_slots();
+    }
+}
+
+fn sort_split_moves() {
+    unsafe {
+        // Insertion sort by gap (stable), on (gap, value) pairs.
+        let n = SPLIT_MOVES.count / 2;
+        for i in 1..n {
+            let g = SPLIT_MOVES.data[2 * i];
+            let t = SPLIT_MOVES.data[2 * i + 1];
+            let mut j = i;
+            while j > 0 && SPLIT_MOVES.data[2 * (j - 1)] > g {
+                SPLIT_MOVES.data[2 * j] = SPLIT_MOVES.data[2 * (j - 1)];
+                SPLIT_MOVES.data[2 * j + 1] = SPLIT_MOVES.data[2 * (j - 1) + 1];
+                j -= 1;
+            }
+            SPLIT_MOVES.data[2 * j] = g;
+            SPLIT_MOVES.data[2 * j + 1] = t;
+        }
+    }
+}
+
+// Spill slots: a value that is on the stack anywhere gets one, shared
+// with values whose lifetimes (from definition to last use) do not
+// overlap its own.
+fn assign_spill_slots() {
+    unsafe {
+        SPILL_COUNT = 0;
+        let mut spilled = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for t in 0..RA_VALS.count {
+            if INSTS[RA_VALS.data[t]].op.is_remat() {
+                continue;
+            }
+            let mut i = RV_FIRST[t];
+            while i >= 0 {
+                if IVS[i].reg == ON_STACK {
+                    spilled.push(t);
+                    break;
+                }
+                i = IVS[i].next;
+            }
+        }
+        // By start of lifetime (values are numbered in layout order, but phis
+        // and parameters come first in their block: sort to be sure).
+        let n = spilled.count;
+        for i in 1..n {
+            let t = spilled.data[i];
+            let s = value_start(t);
+            let mut j = i;
+            while j > 0 && value_start(spilled.data[j - 1]) > s {
+                spilled.data[j] = spilled.data[j - 1];
+                j -= 1;
+            }
+            spilled.data[j] = t;
+        }
+        // slot_end[i]: where the lifetime of the value in slot i ends. A
+        // vector (0.10) takes two slots, the first of them even (the spill
+        // area is then 16-aligned).
+        let mut slot_end = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        SPILL_VECTORS = false;
+        for i in 0..n {
+            let t = spilled.data[i];
+            let s = value_start(t);
+            let wide = is_vector(INSTS[RA_VALS.data[t]].ty);
+            let step = if wide { 2 } else { 1 };
+            let mut slot = -1;
+            let mut k = 0;
+            while k + step <= slot_end.count {
+                if slot_end.data[k] <= s && (!wide || slot_end.data[k + 1] <= s) && !RETURNS_TWICE {
+                    slot = k;
+                    break;
+                }
+                k += step;
+            }
+            if slot < 0 {
+                if wide && slot_end.count % 2 == 1 {
+                    slot_end.push(0);
+                }
+                slot = slot_end.count;
+                for _ in 0..step {
+                    slot_end.push(0);
+                }
+            }
+            slot_end.data[slot] = value_end(t);
+            if wide {
+                slot_end.data[slot + 1] = value_end(t);
+                SPILL_VECTORS = true;
+            }
+            RV_SLOT[t] = slot;
+        }
+        SPILL_COUNT = slot_end.count;
+        free(spilled.data as *u8);
+        free(slot_end.data as *u8);
+    }
+}
+
+pub fn value_start(t: i64) -> i64 {
+    unsafe { ra_start(RV_FIRST[t]) }
+}
+
+fn value_end(t: i64) -> i64 {
+    unsafe {
+        let mut i = RV_FIRST[t];
+        while IVS[i].next >= 0 {
+            i = IVS[i].next;
+        }
+        ra_end(i)
+    }
+}

@@ -1,0 +1,209 @@
+// Register allocation for the IR back end: linear scan on SSA form, with
+// lifetime holes and interval splitting (C. Wimmer and H. Mössenböck,
+// "Optimized Interval Splitting in a Linear Scan Register Allocator", VEE
+// 2005; C. Wimmer and M. Franz, "Linear Scan Register Allocation on SSA
+// Form", CGO 2010).
+//
+// Positions. Blocks are laid out in reverse post-order (ORDER); block k
+// starts at BSTART[k], a multiple of 4, where its phis (and in the entry
+// block the parameters) are defined. Its instructions follow 4 apart: the
+// one at p reads its operands at p, clobbers registers at p + 1 (a call:
+// every caller-saved register) and writes its result at p + 2, and p - 1
+// is the gap before it, where moves go. The terminator reads its operands
+// at BEND[k]; values live out of the block reach BEND[k] + 2.
+//
+// Intervals. A value's lifetime is a list of ranges [from, to), with holes,
+// and the positions where it is used, with what each use needs: USE_REG a
+// register, USE_ANY a register or the stack (call arguments, phi operands,
+// returned values: they are moved into place). Uses as immediates or as
+// frame addresses are not uses at all. Liveness comes from the usual
+// backward data flow over the blocks. Constants and addresses (is_remat)
+// get an interval only when some use needs them in a register; on the
+// stack, they are rematerialized.
+//
+// Allocation walks the intervals by start. An interval gets a register
+// that is free for its whole lifetime when there is one (its hint first:
+// the register of a phi partner, or the argument or result register it
+// goes to), else the register free longest, for a first part: the rest is
+// split off and allocated later. When none is free at all, the register
+// whose next use is farthest (uses in loops count as nearer) is taken
+// from the intervals holding it, which go to the stack until just before
+// their next use; or, when its own first use is farther still, the
+// interval itself goes to the stack until then. Splits that reload a value
+// move to a block boundary outside loops when there is one between the
+// last and the next use. Registers clobbered by calls (or fixed by an
+// instruction) are fixed intervals.
+//
+// Spilling. A value that goes to the stack anywhere is stored once, right
+// after its definition (Wimmer's spill store elimination): going to the
+// stack costs nothing, coming back is one load. Values whose lifetimes do
+// not overlap share spill slots.
+//
+// Resolution. A split inside a block becomes a move in the gap where it
+// falls. On each edge (critical edges are split first), the locations of
+// the values live into the successor and of its phis are reconciled by
+// one parallel move, at the end of the predecessor (when it has a single
+// successor) or at the start of the successor. emit.tach emits these
+// moves; the checker (check.tach, --verify-regalloc) simulates them.
+//
+// Locations (vloc): 0-31 the integer registers (hardware numbers), 32-63
+// the float registers (32 + n), -(1 + i) spill slot i, LOC_REMAT a value
+// rematerialized where it is needed, LOC_NONE no location.
+
+pub mod prepare;
+pub mod intervals;
+mod scan;
+pub mod locations;
+pub mod check;
+
+use crate::base::{IntVec, SYMS, buf_bytes, buf_int, buf_new, buf_str, buf_write_fd};
+use crate::front::types::FNS;
+use crate::middle::ir::{IRF, IRFUNCS};
+use crate::back::regalloc::prepare::{
+    compute_liveness, mark_reg_uses, number_positions, split_critical_edges,
+};
+use crate::back::regalloc::intervals::{RETURNS_TWICE, build_intervals};
+use crate::back::regalloc::scan::{RA_IDOM_READY, linear_scan};
+
+// What other modules import from the allocator, from its parts.
+pub use prepare::{count_uses, layout_blocks};
+pub use intervals::{calls_returns_twice, min_i64};
+
+pub const LOC_NONE: i64 = 1000000;
+pub const LOC_REMAT: i64 = 1000001;
+// An interval's register when it is on the stack, or not allocated yet.
+const ON_STACK: i64 = -1;
+const UNASSIGNED: i64 = -2;
+const POS_MAX: i64 = 0x3fffffffffffffff;
+
+// What a use needs.
+pub const USE_NONE: i64 = 0;
+const USE_ANY: i64 = 1;
+const USE_REG: i64 = 2;
+
+// A part of a value's lifetime, with one location.
+struct Interval {
+    // The value (a dense index into RA_VALS) and its location: a register,
+    // ON_STACK or UNASSIGNED.
+    value: i64, reg: i64,
+    // [from, to) pairs and (position, kind) pairs, ascending.
+    ranges: IntVec, uses: IntVec,
+    // The next part of the same value (split off this one), or -1.
+    next: i64,
+}
+
+// The function being allocated: its blocks in layout order, and per
+// layout index the positions of the block's start and terminator, and its
+// loop depth.
+pub static mut ORDER: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut BSTART: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut BEND: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut LDEPTH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// Allocated values: value ids by dense index (INSTS[v].aux = index + 1).
+static mut RA_VALS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut IVS: *Interval = 0 as *Interval;
+static mut IV_COUNT: i64 = 0;
+static mut IV_CAP: i64 = 0;
+// Per dense index: the first interval, the spill slot (-1: never on the
+// stack), the value whose register it would like (-1), the register it
+// would like (-1).
+static mut RV_FIRST: *i64 = 0 as *i64;
+pub static mut RV_SLOT: *i64 = 0 as *i64;
+static mut RV_HINT: *i64 = 0 as *i64;
+static mut RV_HREG: *i64 = 0 as *i64;
+static mut RV_CAP: i64 = 0;
+// Fixed intervals: per register, the ranges where it is not available.
+static mut FIXED: *IntVec = 0 as *IntVec;
+// Moves inside blocks: (gap, dense index) pairs, sorted by gap.
+pub static mut SPLIT_MOVES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut SPILL_COUNT: i64 = 0;
+// Whether a vector is spilled (the spill area is then 16-aligned).
+pub static mut SPILL_VECTORS: bool = false;
+// Per register: whether a callee-saved register is used.
+pub static mut CALLEE_USED: [i64; 64] = [0; 64];
+// Uses of each instruction (indexed by value id), for the whole program,
+// and whether some use needs the value in a register.
+pub static mut USES: *i64 = 0 as *i64;
+static mut REG_USED: *i64 = 0 as *i64;
+// Liveness: bit sets of dense value indices, per layout index.
+static mut LIVE_IN: *u64 = 0 as *u64;
+static mut LIVE_OUT: *u64 = 0 as *u64;
+static mut LIVE_WORDS: i64 = 0;
+// --verify-regalloc: check every allocation by simulating its moves.
+pub static mut VERIFY_REGALLOC: bool = false;
+
+// ---- The allocation ----
+
+// Allocates function `fi`: layout, positions, liveness, intervals and
+// locations.
+pub fn allocate_registers(fi: i64) {
+    IRF = fi;
+    RA_IDOM_READY = false;
+    RETURNS_TWICE = calls_returns_twice(fi);
+    split_critical_edges(fi);
+    layout_blocks(fi);
+    mark_reg_uses();
+    number_positions();
+    compute_liveness();
+    build_intervals();
+    linear_scan();
+    if PRINT_REGALLOC {
+        print_allocation();
+    }
+}
+
+// --print-regalloc: the blocks' positions and every value's intervals,
+// on stderr.
+pub static mut PRINT_REGALLOC: bool = false;
+
+fn print_allocation() {
+    unsafe {
+        let out = buf_new();
+        buf_str(out, c"regalloc ");
+        buf_bytes(out, SYMS[FNS[IRFUNCS[IRF].f].name].text);
+        buf_str(out, c":\n");
+        for k in 0..ORDER.count {
+            buf_str(out, c"  b");
+            buf_int(out, ORDER.data[k]);
+            buf_str(out, c" [");
+            buf_int(out, BSTART.data[k]);
+            buf_str(out, c", ");
+            buf_int(out, BEND.data[k]);
+            buf_str(out, c"] depth ");
+            buf_int(out, LDEPTH.data[k]);
+            buf_str(out, c"\n");
+        }
+        for t in 0..RA_VALS.count {
+            buf_str(out, c"  v");
+            buf_int(out, RA_VALS.data[t]);
+            if RV_HINT[t] >= 0 {
+                buf_str(out, c" hint v");
+                buf_int(out, RA_VALS.data[RV_HINT[t]]);
+            }
+            if RV_HREG[t] >= 0 {
+                buf_str(out, c" hint r");
+                buf_int(out, RV_HREG[t]);
+            }
+            let mut i = RV_FIRST[t];
+            while i >= 0 {
+                buf_str(out, c" |");
+                if IVS[i].reg >= 0 {
+                    buf_str(out, c" r");
+                    buf_int(out, IVS[i].reg);
+                } else {
+                    buf_str(out, c" stack");
+                }
+                for r in 0..IVS[i].ranges.count / 2 {
+                    buf_str(out, c" [");
+                    buf_int(out, IVS[i].ranges.data[2 * r]);
+                    buf_str(out, c",");
+                    buf_int(out, IVS[i].ranges.data[2 * r + 1]);
+                    buf_str(out, c")");
+                }
+                i = IVS[i].next;
+            }
+            buf_str(out, c"\n");
+        }
+        buf_write_fd(out, 2);
+    }
+}

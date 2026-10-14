@@ -1,0 +1,358 @@
+// The branches instruction selection (isel/mod.tach) reshapes before
+// tiling: diamonds and triangles that do little become selects (step 1),
+// and branches on phis are threaded into their predecessors (step 0).
+
+use crate::back::emit::blocks::fits_cmp_imm;
+use crate::back::isel::{ISEL_USES, isel_const, isel_count_uses};
+use crate::base::die;
+use crate::front::types::{TY_U64, is_float, is_vector};
+use crate::gen0::target::X86;
+use crate::middle::ir::{
+    ARGS, ARGTY, BLOCKS, Cond, INSTS, IRFUNCS, Term, ir_append, ir_arg, ir_make, ir_set_arg,
+    ir_unlink, ir_val, pred_index,
+};
+use crate::middle::ir::Op::{Cmp, Conv, Div, Phi, Rem, Select};
+use crate::middle::opt::{
+    add_pred_like, remove_block, remove_pred, remove_pred_at, remove_trivial_phis,
+    remove_unreachable, resolve_all, simplify_cfg,
+};
+
+// ---- Selects ----
+
+// The instructions an arm of a select may hold: pure, cheap ones (no
+// division: its checks and, on x86-64, its fixed registers cost more than
+// a branch).
+fn is_speculable(v: i64) -> bool {
+    unsafe {
+        let op = INSTS[v].op;
+        if op.is_remat() {
+            return true;
+        }
+        op.is_pure() && op != Div && op != Rem
+            && !(op == Conv && (is_float(INSTS[v].ty) || is_float(INSTS[v].imm2)))
+    }
+}
+
+// The number of instructions of arm block `b` that cost something, or -1
+// when it holds one it may not.
+fn arm_cost(b: i64) -> i64 {
+    unsafe {
+        let mut cost = 0;
+        let mut v = BLOCKS[b].first;
+        while v != 0 {
+            if !is_speculable(v) {
+                return -1;
+            }
+            if !INSTS[v].op.is_remat() {
+                cost += 1;
+            }
+            v = INSTS[v].next;
+        }
+        cost
+    }
+}
+
+fn selectable_type(ty: i64) -> bool {
+    if is_vector(ty) {
+        return false;
+    }
+    if is_float(ty) {
+        return !X86;
+    }
+    ty != 0
+}
+
+// Whether block b is an arm: only reached from h, only jumping on.
+fn is_arm(b: i64, h: i64) -> bool {
+    unsafe { BLOCKS[b].preds.count == 1 && BLOCKS[b].preds.data[0] == h && BLOCKS[b].term == Term::Jump }
+}
+
+// Turns small diamonds and triangles into selects; returns whether any was.
+pub fn form_selects(fi: i64) -> bool {
+    unsafe {
+        let mut changed = false;
+        for _ in 0..2 {
+            let mut round = false;
+            let count = IRFUNCS[fi].blocks.count;
+            for i in 0..count {
+                let h = IRFUNCS[fi].blocks.data[i];
+                if BLOCKS[h].removed == 0 && BLOCKS[h].term == Term::Branch && try_select(h) {
+                    round = true;
+                }
+            }
+            if !round {
+                break;
+            }
+            changed = true;
+            resolve_all(fi);
+            remove_trivial_phis(fi);
+            resolve_all(fi);
+            simplify_cfg(fi);
+            resolve_all(fi);
+        }
+        changed
+    }
+}
+
+fn try_select(h: i64) -> bool {
+    unsafe {
+        let t = BLOCKS[h].s0;
+        let e = BLOCKS[h].s1;
+        if t == e || t == h || e == h {
+            return false;
+        }
+        // The meeting block and the arms (0: the arm is the edge itself).
+        let mut join = 0;
+        let mut arm_t = 0;
+        let mut arm_e = 0;
+        if is_arm(t, h) && is_arm(e, h) && BLOCKS[t].s0 == BLOCKS[e].s0 {
+            join = BLOCKS[t].s0;
+            arm_t = t;
+            arm_e = e;
+        } else if is_arm(t, h) && BLOCKS[t].s0 == e {
+            join = e;
+            arm_t = t;
+        } else if is_arm(e, h) && BLOCKS[e].s0 == t {
+            join = t;
+            arm_e = e;
+        } else {
+            return false;
+        }
+        if join == h || join == t && arm_t != 0 || join == e && arm_e != 0 {
+            return false;
+        }
+        let cost_t = if arm_t != 0 { arm_cost(arm_t) } else { 0 };
+        let cost_e = if arm_e != 0 { arm_cost(arm_e) } else { 0 };
+        if cost_t < 0 || cost_e < 0 || cost_t > 2 || cost_e > 2 {
+            return false;
+        }
+        // The comparison.
+        let cond = BLOCKS[h].cond;
+        let mut lhs = cond;
+        let mut rhs = 0;
+        let mut imm = 0;
+        let mut cmp_ty = TY_U64;
+        let mut op = Cond::Ne;
+        if INSTS[cond].op == Cmp {
+            cmp_ty = INSTS[cond].imm2;
+            if is_float(cmp_ty) && X86 {
+                return false;
+            }
+            lhs = INSTS[cond].a;
+            rhs = INSTS[cond].b;
+            op = INSTS[cond].cond;
+            let mut value = 0;
+            if isel_const(rhs, &value) && fits_cmp_imm(value) {
+                rhs = 0;
+                imm = value;
+            }
+        }
+        // The phis of the meeting block, and their values from each way.
+        let index_t = pred_index(join, if arm_t != 0 { arm_t } else { h });
+        let index_e = pred_index(join, if arm_e != 0 { arm_e } else { h });
+        if index_t < 0 || index_e < 0 {
+            return false;
+        }
+        let mut selects = 0;
+        let mut phi = BLOCKS[join].first;
+        while phi != 0 && INSTS[phi].op == Phi {
+            if ir_val(ir_arg(phi, index_t)) != ir_val(ir_arg(phi, index_e)) {
+                if !selectable_type(INSTS[phi].ty) {
+                    return false;
+                }
+                selects += 1;
+            }
+            phi = INSTS[phi].next;
+        }
+        if selects == 0 || selects > 2 || cost_t + cost_e + selects > 4 {
+            return false;
+        }
+        // The arms' instructions move up into h.
+        if arm_t != 0 {
+            move_instructions(arm_t, h);
+        }
+        if arm_e != 0 {
+            move_instructions(arm_e, h);
+        }
+        // One select per phi that picks; the phi then gets it from h.
+        phi = BLOCKS[join].first;
+        while phi != 0 && INSTS[phi].op == Phi {
+            let value_t = ir_val(ir_arg(phi, index_t));
+            let value_e = ir_val(ir_arg(phi, index_e));
+            let mut picked = value_t;
+            if value_t != value_e {
+                let sel = ir_make(Select, INSTS[phi].ty, value_t, value_e, imm);
+                INSTS[sel].cond = op;
+                INSTS[sel].imm2 = cmp_ty;
+                INSTS[sel].args = ARGS.count;
+                ARGS.push(lhs);
+                ARGTY.push(0);
+                ARGS.push(rhs);
+                ARGTY.push(0);
+                INSTS[sel].nargs = 2;
+                ir_append(h, sel);
+                picked = sel;
+            }
+            ir_set_arg(phi, index_t, picked);
+            ir_set_arg(phi, index_e, picked);
+            phi = INSTS[phi].next;
+        }
+        // h now jumps to the meeting block, once.
+        let removed_index = if arm_e != 0 { index_e } else { index_t };
+        let kept = if arm_e != 0 { arm_t } else { arm_e };
+        BLOCKS[h].term = Term::Jump;
+        BLOCKS[h].cond = 0;
+        BLOCKS[h].s0 = join;
+        BLOCKS[h].s1 = 0;
+        remove_pred_at(join, removed_index);
+        if kept != 0 {
+            // The other way's predecessor entry becomes h.
+            BLOCKS[join].preds.data[pred_index(join, kept)] = h;
+        } else if arm_e == 0 && arm_t == 0 {
+            die(c"internal error: select without arms");
+        }
+        if arm_t != 0 {
+            drop_arm(arm_t);
+        }
+        if arm_e != 0 {
+            drop_arm(arm_e);
+        }
+        true
+    }
+}
+
+// Moves the instructions of block `from` to the end of block `to`.
+fn move_instructions(from: i64, to: i64) {
+    unsafe {
+        let mut v = BLOCKS[from].first;
+        while v != 0 {
+            let next = INSTS[v].next;
+            ir_unlink(v);
+            ir_append(to, v);
+            v = next;
+        }
+    }
+}
+
+// Removes an emptied arm (its edges are already redirected).
+fn drop_arm(b: i64) {
+    unsafe {
+        BLOCKS[b].removed = 1;
+        BLOCKS[b].term = Term::None;
+        BLOCKS[b].preds.count = 0;
+        BLOCKS[b].first = 0;
+        BLOCKS[b].last = 0;
+    }
+}
+
+// ---- Branches on phis ----
+
+pub fn thread_phi_branches(fi: i64) -> bool {
+    unsafe {
+        let mut changed = decide_repeated_branches(fi);
+        isel_count_uses(fi);
+        let count = IRFUNCS[fi].blocks.count;
+        for i in 0..count {
+            let b = IRFUNCS[fi].blocks.data[i];
+            if BLOCKS[b].removed != 0 || BLOCKS[b].term != Term::Branch {
+                continue;
+            }
+            let p = BLOCKS[b].first;
+            let s0 = BLOCKS[b].s0;
+            let s1 = BLOCKS[b].s1;
+            // Only the phi, used by the branch alone.
+            if p == 0 || p != BLOCKS[b].cond || INSTS[p].op != Phi || INSTS[p].next != 0 || ISEL_USES[p] != 1
+                || s0 == s1 || s0 == b || s1 == b {
+                continue;
+            }
+            let mut k = 0;
+            while k < BLOCKS[b].preds.count {
+                let pred = BLOCKS[b].preds.data[k];
+                let value = ir_val(ir_arg(p, k));
+                // (0.11) A predecessor branching on the phi's value for it
+                // (`a && b` when a is false): the edge decides it.
+                if BLOCKS[pred].term == Term::Branch && ir_val(BLOCKS[pred].cond) == value
+                    && pred != b && (BLOCKS[pred].s0 == b) != (BLOCKS[pred].s1 == b) {
+                    let target = if BLOCKS[pred].s0 == b { s0 } else { s1 };
+                    let other = if BLOCKS[pred].s0 == b { BLOCKS[pred].s1 } else { BLOCKS[pred].s0 };
+                    if target != other && target != pred {
+                        if BLOCKS[pred].s0 == b {
+                            BLOCKS[pred].s0 = target;
+                        } else {
+                            BLOCKS[pred].s1 = target;
+                        }
+                        add_pred_like(target, pred, b);
+                        remove_pred_at(b, k);
+                        changed = true;
+                        continue;
+                    }
+                }
+                if BLOCKS[pred].term != Term::Jump || pred == b || pred == s0 || pred == s1 {
+                    k += 1;
+                    continue;
+                }
+                let mut known = 0;
+                if isel_const(value, &known) {
+                    let target = if known != 0 { s0 } else { s1 };
+                    BLOCKS[pred].s0 = target;
+                    add_pred_like(target, pred, b);
+                } else {
+                    BLOCKS[pred].term = Term::Branch;
+                    BLOCKS[pred].cond = value;
+                    BLOCKS[pred].s0 = s0;
+                    BLOCKS[pred].s1 = s1;
+                    add_pred_like(s0, pred, b);
+                    add_pred_like(s1, pred, b);
+                }
+                remove_pred_at(b, k);
+                changed = true;
+            }
+            if BLOCKS[b].preds.count == 0 {
+                remove_block(b);
+            }
+        }
+        if changed {
+            resolve_all(fi);
+            remove_unreachable(fi);
+            remove_trivial_phis(fi);
+            resolve_all(fi);
+        }
+        changed
+    }
+}
+
+// A branch on the condition its block's only predecessor branched on is
+// decided by the edge that leads there: it becomes a jump. Returns whether
+// any did.
+fn decide_repeated_branches(fi: i64) -> bool {
+    let mut changed = false;
+    unsafe {
+        for i in 0..IRFUNCS[fi].blocks.count {
+            let b = IRFUNCS[fi].blocks.data[i];
+            // (A branch both ways to one block is two predecessor entries there:
+            // left alone.)
+            if BLOCKS[b].removed != 0 || BLOCKS[b].term != Term::Branch || BLOCKS[b].preds.count != 1
+                || BLOCKS[b].s0 == BLOCKS[b].s1 {
+                continue;
+            }
+            let p = BLOCKS[b].preds.data[0];
+            let cond = ir_val(BLOCKS[b].cond);
+            if p == b || BLOCKS[p].term != Term::Branch || ir_val(BLOCKS[p].cond) != cond
+                || BLOCKS[p].s0 == BLOCKS[p].s1 {
+                continue;
+            }
+            let taken = BLOCKS[p].s0 == b;
+            let keep = if taken { BLOCKS[b].s0 } else { BLOCKS[b].s1 };
+            let drop = if taken { BLOCKS[b].s1 } else { BLOCKS[b].s0 };
+            if keep != drop {
+                remove_pred(drop, b);
+            }
+            BLOCKS[b].term = Term::Jump;
+            BLOCKS[b].cond = 0;
+            BLOCKS[b].s0 = keep;
+            BLOCKS[b].s1 = 0;
+            changed = true;
+        }
+    }
+    changed
+}
