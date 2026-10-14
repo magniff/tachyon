@@ -44,6 +44,8 @@ sed, head, cat or awk ([docs/query.md](docs/query.md)):
 | what nothing uses | `target/tachyonc query unused [MODULE\|FILE]` |
 | what a signature change touches | `target/tachyonc query impact NAME` |
 | files over a size | `target/tachyonc lint --max-lines 1000` |
+| lay code out (indentation, spaces, wrapping, `use` lines; edits do it too) | `target/tachyonc fmt FILE\|MODULE` (`--check`, `--dry-run`; `--all` the tree) |
+| what a diagnostic code means, how to fix it | `target/tachyonc explain CODE` (`explain TOOL` lists its codes) |
 
 NAME is `foo`, `module::foo`, `Type::method`, `Enum::Variant`,
 `Struct.field` or `FILE:LINE`; several in one call. The root defaults to

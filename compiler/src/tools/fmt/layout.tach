@@ -1,0 +1,605 @@
+// The layout of `tachyonc fmt` (0.13): where lines start, how far each
+// is indented, the blank lines between them and the spaces between the
+// pieces of a line. Line breaks are the source's (a line is never
+// joined), plus the ones wrap adds to lines of more than WIDTH columns.
+//
+// Indentation is four spaces a level, from the brackets:
+//
+//   - a line of a bracket's contents is one level deeper than the
+//     bracket's base, and a line starting with its closing bracket is at
+//     its base;
+//   - a `(` or `[` has the base of the line it is on; a `{` has the base
+//     of its line when that line starts a statement (or is an `else`),
+//     else the base of the statement the line continues (so the body of
+//     `if a\n    && b {` is one level deeper than the `if`);
+//   - a line that continues a statement (the line before does not end it
+//     with `;`, `{`, `}`, `,`, an opening bracket or an attribute) is one
+//     level deeper than the statement's first line; an `else` continues
+//     an expression, but is at the level of an `if` statement;
+//   - a line of comments is at the level of the line after it (inside the
+//     block, before a closing bracket).
+//
+// Blank lines: at most one in a row, none at the start of the file,
+// after an opening bracket or before a closing one; between two items of
+// a file, impl, trait, module or extern block, one when either is a
+// function, type, impl, trait or block of several lines.
+//
+// With ranges (an edit's lines, edit/), only the lines in them are laid
+// out; the others are copied as they are.
+
+use crate::base::{IntVec, buf_byte, buf_bytes};
+use crate::front::lexer::Tok;
+use crate::tools::fmt::pieces::{
+    BLOCK_COMMENT, FT, LINE_COMMENT, MATCH, P_END, P_KIND, P_NL, P_START, is_close, is_comment,
+    is_open, kind, piece,
+};
+use crate::tools::fmt::wrap::wrap_line;
+
+pub const WIDTH: i64 = 100;
+
+// Per piece: a line starts there; a blank line before it; its line's
+// level and the innermost bracket open at its start (-1: none), at line
+// starts; its line is laid out (else copied).
+pub static mut BRK: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut BLANK: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut IND: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut LOPEN: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut RANGED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// The pieces of type arguments (mark_generics).
+static mut GEN: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The open brackets (frames) while lines are indented: the base level,
+// the level of the statement being written in it, the kind of its first
+// token, whether it is an attribute's `[`, whether it holds items, the
+// first keyword of its current item or statement, its current item, and
+// the bracket piece (-1: the file).
+static mut FR_BASE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut FR_STMT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut FR_FIRST: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut FR_ATTR: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut FR_ITEMS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut FR_KW: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut FR_ITEM: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut FR_OPEN: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The items found: the piece of their first line (their comments'), the
+// number of lines with code, the item before them in their block (-1),
+// their keyword.
+static mut IT_FIRST: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut IT_LINES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut IT_PREV: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut IT_KW: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+fn set(v: *IntVec, n: i64, value: i64) {
+    unsafe {
+        (*v).count = 0;
+        for i in 0..n {
+            (*v).push(value);
+        }
+    }
+}
+
+// The end of the line starting at piece i (the next line's start).
+pub fn line_end_piece(i: i64) -> i64 {
+    unsafe {
+        let mut e = i + 1;
+        while e < P_KIND.count && BRK.data[e] == 0 {
+            e += 1;
+        }
+        e
+    }
+}
+
+// The line's first piece of code, or -1 (a line of comments).
+fn first_code(i: i64, e: i64) -> i64 {
+    for k in i..e {
+        if !is_comment(kind(k)) {
+            return k;
+        }
+    }
+    -1
+}
+
+// Whether a token ends a statement or a list element, for the line after
+// it: `;`, `,`, a brace or an opening bracket.
+fn ends_element(k: i64) -> bool {
+    k == Tok::Semi as i64 || k == Tok::Comma as i64 || k == Tok::LBrace as i64
+        || k == Tok::RBrace as i64 || k == Tok::LParen as i64 || k == Tok::LBracket as i64
+}
+
+// Whether an item of this keyword is a block of lines that gets a blank
+// line around it.
+fn block_item(k: i64) -> bool {
+    k == Tok::Fn as i64 || k == Tok::Struct as i64 || k == Tok::Enum as i64
+        || k == Tok::Union as i64 || k == Tok::Impl as i64 || k == Tok::Trait as i64
+        || k == Tok::Mod as i64 || k == Tok::Extern as i64
+}
+
+fn push_frame(base: i64, stmt: i64, attr: bool, items: bool, open: i64) {
+    FR_BASE.push(base);
+    FR_STMT.push(stmt);
+    FR_FIRST.push(-1);
+    FR_ATTR.push(if attr { 1 } else { 0 });
+    FR_ITEMS.push(if items { 1 } else { 0 });
+    FR_KW.push(-1);
+    FR_ITEM.push(-1);
+    FR_OPEN.push(open);
+}
+
+fn pop_frame() {
+    FR_BASE.pop();
+    FR_STMT.pop();
+    FR_FIRST.pop();
+    FR_ATTR.pop();
+    FR_ITEMS.pop();
+    FR_KW.pop();
+    FR_ITEM.pop();
+    FR_OPEN.pop();
+}
+
+// IND of every line; with `items`, the items too (IT_*).
+pub fn indent_lines(items: bool) {
+    unsafe {
+        let n = P_KIND.count;
+        set(&IND, n, 0);
+        set(&LOPEN, n, -1);
+        set(&FR_BASE, 0, 0);
+        set(&FR_STMT, 0, 0);
+        set(&FR_FIRST, 0, 0);
+        set(&FR_ATTR, 0, 0);
+        set(&FR_ITEMS, 0, 0);
+        set(&FR_KW, 0, 0);
+        set(&FR_ITEM, 0, 0);
+        set(&FR_OPEN, 0, 0);
+        set(&IT_FIRST, 0, 0);
+        set(&IT_LINES, 0, 0);
+        set(&IT_PREV, 0, 0);
+        set(&IT_KW, 0, 0);
+        push_frame(-1, 0, false, true, -1);
+        let mut pending = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut prev = -1;
+        let mut after_attr = false;
+        let mut i = 0;
+        while i < n {
+            let e = line_end_piece(i);
+            let f = first_code(i, e);
+            if f < 0 {
+                pending.push(i);
+                i = e;
+                continue;
+            }
+            let top = FR_BASE.count - 1;
+            LOPEN.data[i] = FR_OPEN.data[top];
+            let kf = kind(f);
+            let closer = is_close(kf);
+            let mut cont = false;
+            let mut ind = 0;
+            if closer {
+                ind = FR_BASE.data[top];
+            } else {
+                cont = (prev >= 0 && !ends_element(kind(prev)) && !after_attr)
+                    || kf == Tok::Else as i64;
+                if kf == Tok::Else as i64 && prev >= 0 && kind(prev) == Tok::RBrace as i64
+                    && FR_FIRST.data[top] == Tok::If as i64 {
+                    ind = FR_STMT.data[top];
+                } else if cont {
+                    ind = FR_STMT.data[top] + 1;
+                } else {
+                    ind = FR_BASE.data[top] + 1;
+                    FR_STMT.data[top] = ind;
+                    FR_FIRST.data[top] = kf;
+                    FR_KW.data[top] = -1;
+                }
+            }
+            for p in 0..pending.count {
+                IND.data[pending.data[p]] = if closer { FR_BASE.data[top] + 1 } else { ind };
+            }
+            IND.data[i] = ind;
+            // The item this line starts or continues, in the innermost
+            // block of items around it.
+            let mut g = if closer { top - 1 } else { top };
+            while g > 0 && FR_ITEMS.data[g] == 0 {
+                g -= 1;
+            }
+            if items {
+                if g == top && !closer && !cont && !after_attr {
+                    IT_FIRST.push(if pending.count > 0 { pending.data[0] } else { i });
+                    IT_LINES.push(1);
+                    IT_PREV.push(FR_ITEM.data[g]);
+                    IT_KW.push(-1);
+                    FR_ITEM.data[g] = IT_FIRST.count - 1;
+                } else if FR_ITEM.data[g] >= 0 {
+                    IT_LINES.data[FR_ITEM.data[g]] += 1;
+                }
+            }
+            pending.count = 0;
+            let start_open = FR_OPEN.data[top];
+            for k in i..e {
+                let kk = kind(k);
+                if is_comment(kk) {
+                    continue;
+                }
+                let cur = FR_BASE.count - 1;
+                if FR_KW.data[cur] == -1 && kk != Tok::Pub as i64 && kk != Tok::Unsafe as i64
+                    && kk != Tok::Hash as i64 {
+                    FR_KW.data[cur] = kk;
+                }
+                if is_open(kk) {
+                    let mut base = ind;
+                    if kk == Tok::LBrace as i64 && !closer
+                        && !(FR_OPEN.data[cur] == start_open && (!cont || kf == Tok::Else as i64)) {
+                        base = FR_STMT.data[cur];
+                    }
+                    let attr = kk == Tok::LBracket as i64 && prev >= 0
+                        && kind(prev) == Tok::Hash as i64;
+                    let kw = FR_KW.data[cur];
+                    let holds = FR_ITEMS.data[cur] != 0 && kk == Tok::LBrace as i64
+                        && (kw == Tok::Impl as i64 || kw == Tok::Trait as i64
+                            || kw == Tok::Mod as i64
+                            || (kw == Tok::Extern as i64 && prev >= 0
+                                && kind(prev) == Tok::Str as i64));
+                    push_frame(base, ind, attr, holds, k);
+                    after_attr = false;
+                } else if is_close(kk) {
+                    after_attr = FR_ATTR.data[cur] != 0;
+                    if FR_BASE.count > 1 {
+                        pop_frame();
+                    }
+                } else {
+                    after_attr = false;
+                }
+                prev = k;
+            }
+            if items && g < FR_BASE.count && FR_ITEM.data[g] >= 0
+                && IT_KW.data[FR_ITEM.data[g]] == -1 {
+                IT_KW.data[FR_ITEM.data[g]] = FR_KW.data[g];
+            }
+            i = e;
+        }
+        for p in 0..pending.count {
+            IND.data[pending.data[p]] = 0;
+        }
+    }
+}
+
+// BLANK, from the source and the rules (laid out lines only).
+fn blank_lines() {
+    unsafe {
+        let n = P_KIND.count;
+        set(&BLANK, n, 0);
+        let mut i = 0;
+        while i < n {
+            let e = line_end_piece(i);
+            if i > 0 && P_NL.data[i] >= 2 {
+                BLANK.data[i] = 1;
+            }
+            if RANGED.data[i] != 0 && i > 0 {
+                let f = first_code(i, e);
+                let mut j = i - 1;
+                if kind(j) == LINE_COMMENT && j > 0 && BRK.data[j] == 0 {
+                    j -= 1;
+                }
+                if (f == i && is_close(kind(f))) || is_open(kind(j)) {
+                    BLANK.data[i] = 0;
+                }
+            }
+            i = e;
+        }
+        for y in 0..IT_FIRST.count {
+            let x = IT_PREV.data[y];
+            if x < 0 {
+                continue;
+            }
+            let p = IT_FIRST.data[y];
+            if RANGED.data[p] != 0 && ((block_item(IT_KW.data[x]) && IT_LINES.data[x] > 1)
+                || (block_item(IT_KW.data[y]) && IT_LINES.data[y] > 1)) {
+                BLANK.data[p] = 1;
+            }
+        }
+    }
+}
+
+// Whether a `<` at piece i opens type arguments or parameters (not a
+// comparison): after `::` (`max::<u8>`) or `impl`, after the name an
+// item declares (`fn grow<T>`, `struct Pair<T>`), or after a type's name
+// (`Vec<i64>`: a capital, then a small letter or nothing).
+fn opens_generics(i: i64) -> bool {
+    unsafe {
+        if i == 0 {
+            return false;
+        }
+        let k = kind(i - 1);
+        if k == Tok::ColonColon as i64 || k == Tok::Impl as i64 {
+            return true;
+        }
+        if k != Tok::Ident as i64 {
+            return false;
+        }
+        if i > 1 {
+            let d = kind(i - 2);
+            if d == Tok::Fn as i64 || d == Tok::Struct as i64 || d == Tok::Enum as i64
+                || d == Tok::Union as i64
+                || d == Tok::Type as i64 || d == Tok::Trait as i64 {
+                return true;
+            }
+        }
+        let name = piece(i - 1);
+        if name[0] < 'A' || name[0] > 'Z' {
+            return false;
+        }
+        if name.len == 1 {
+            return true;
+        }
+        for j in 1..name.len {
+            if name[j] >= 'a' && name[j] <= 'z' {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// GEN: the `<`, `>` and `>>` pieces of type arguments (a `>>` closing
+// two). A `;` or a brace closes any left open.
+fn mark_generics() {
+    unsafe {
+        let n = P_KIND.count;
+        set(&GEN, n, 0);
+        let mut open = 0;
+        for i in 0..n {
+            let k = kind(i);
+            // (as written: `Vec<T>` is tight, `E::A < E::B` compares)
+            if k == Tok::Lt as i64 && opens_generics(i) && i + 1 < n
+                && P_START.data[i + 1] == P_END.data[i] {
+                GEN.data[i] = 1;
+                open += 1;
+            } else if k == Tok::Gt as i64 && open > 0 {
+                GEN.data[i] = 1;
+                open -= 1;
+            } else if k == Tok::Shr as i64 && open > 1 {
+                GEN.data[i] = 1;
+                open -= 2;
+            } else if k == Tok::Semi as i64 || k == Tok::LBrace as i64 || k == Tok::RBrace as i64 {
+                open = 0;
+            }
+        }
+    }
+}
+
+// Whether piece i is a `<`, `>` or `>>` of type arguments.
+pub fn generic(i: i64) -> bool {
+    unsafe { GEN.data[i] != 0 }
+}
+
+// Lays the pieces out: line starts (wrapping), levels, blank lines.
+pub fn lay_out() {
+    unsafe {
+        let n = P_KIND.count;
+        mark_generics();
+        set(&BRK, n, 0);
+        for i in 0..n {
+            if i == 0 || P_NL.data[i] > 0 {
+                BRK.data[i] = 1;
+            }
+        }
+        let mut pass = 0;
+        while pass < 40 {
+            indent_lines(false);
+            let mut changed = false;
+            let mut i = 0;
+            while i < n {
+                let e = line_end_piece(i);
+                if RANGED.data[i] != 0 && wrap_line(i, e) {
+                    changed = true;
+                }
+                // (past the lines a reflow joined)
+                i = e;
+                while i < n && BRK.data[i] == 0 {
+                    i += 1;
+                }
+            }
+            if !changed {
+                break;
+            }
+            pass += 1;
+        }
+        indent_lines(true);
+        blank_lines();
+    }
+}
+
+// ---- Spaces ----
+
+fn in2(k: i64, a: Tok, b: Tok) -> bool {
+    k == a as i64 || k == b as i64
+}
+
+// Whether a token can end an operand (so that a `-`, `*` or `&` after it
+// is binary).
+fn ends_operand(k: i64) -> bool {
+    k == Tok::Ident as i64 || k == Tok::Int as i64 || k == Tok::Float as i64
+        || k == Tok::Char as i64 || k == Tok::Str as i64 || k == Tok::CStr as i64
+        || k == Tok::True as i64 || k == Tok::False as i64 || k == Tok::RParen as i64
+        || k == Tok::RBracket as i64 || k == Tok::Question as i64 || k == Tok::Reserved as i64
+}
+
+// Whether piece i is a prefix `-`, `*` or `&` (not after an operand; a
+// `}` on the same line counts as one).
+pub fn is_unary(i: i64) -> bool {
+    unsafe {
+        let k = kind(i);
+        if k != Tok::Minus as i64 && k != Tok::Star as i64 && k != Tok::Amp as i64 {
+            return false;
+        }
+        let mut j = i - 1;
+        while j >= 0 && is_comment(kind(j)) {
+            j -= 1;
+        }
+        if j < 0 {
+            return true;
+        }
+        if kind(j) == Tok::RBrace as i64 {
+            return !(j == i - 1 && BRK.data[i] == 0);
+        }
+        !ends_operand(kind(j))
+    }
+}
+
+// Whether brace piece i is the brace of a `use` list (`::{`).
+fn tight(i: i64) -> bool {
+    unsafe {
+        let o = if kind(i) == Tok::LBrace as i64 { i } else { MATCH.data[i] };
+        o > 0 && kind(o - 1) == Tok::ColonColon as i64
+    }
+}
+
+// Whether the two texts written together would lex as other tokens.
+fn would_join(a: [u8], b: [u8]) -> bool {
+    unsafe {
+        let x = a[a.len - 1];
+        let y = b[0];
+        if y == '='
+            && (x == '+' || x == '-' || x == '*' || x == '/' || x == '%' || x == '&' || x == '|'
+                || x == '^' || x == '!' || x == '=' || x == '<' || x == '>' || x == '.') {
+            return true;
+        }
+        if x == '/' && (y == '/' || y == '*') {
+            return true;
+        }
+        (x == y && (x == '<' || x == '>' || x == '&' || x == '|' || x == '.' || x == ':'))
+            || (y == '>' && (x == '-' || x == '='))
+    }
+}
+
+// Whether there was a blank between pieces a and b in the source.
+fn spaced(a: i64, b: i64) -> i64 {
+    unsafe { if P_START.data[b] > P_END.data[a] { 1 } else { 0 } }
+}
+
+// The spaces between pieces a and b of one line (0 or 1).
+pub fn space(a: i64, b: i64) -> i64 {
+    let s = space_rule(a, b);
+    if s == 0 && !is_comment(kind(a)) && !is_comment(kind(b)) && would_join(piece(a), piece(b)) {
+        return 1;
+    }
+    s
+}
+
+fn space_rule(a: i64, b: i64) -> i64 {
+    let ka = kind(a);
+    let kb = kind(b);
+    if kb == LINE_COMMENT {
+        return 1;
+    }
+    if ka == BLOCK_COMMENT || kb == BLOCK_COMMENT {
+        return spaced(a, b);
+    }
+    // (type arguments: `Vec<i64>`, `max::<u8>(x)`; else `<` and `>` compare)
+    if (generic(a) && ka == Tok::Lt as i64) || generic(b) {
+        return 0;
+    }
+    if generic(a) && (kb == Tok::LParen as i64 || kb == Tok::LBracket as i64) {
+        return 0;
+    }
+    if in2(kb, Tok::Comma, Tok::Semi) || in2(kb, Tok::RParen, Tok::RBracket)
+        || in2(kb, Tok::Dot, Tok::Question)
+        || kb == Tok::ColonColon as i64 {
+        return 0;
+    }
+    if kb == Tok::Colon as i64 {
+        return if in2(ka, Tok::Break, Tok::Continue) { 1 } else { 0 };
+    }
+    if in2(ka, Tok::Comma, Tok::Semi) {
+        return 1;
+    }
+    if ka == Tok::Colon as i64 {
+        return if a > 0 && in2(kind(a - 1), Tok::Break, Tok::Continue) { 0 } else { 1 };
+    }
+    if in2(ka, Tok::LParen, Tok::LBracket) || in2(ka, Tok::Dot, Tok::ColonColon)
+        || ka == Tok::Hash as i64 {
+        return 0;
+    }
+    if in2(ka, Tok::Bang, Tok::Tilde) {
+        return if kb == Tok::LBrace as i64 { 1 } else { 0 };
+    }
+    if is_unary(a) {
+        return 0;
+    }
+    if in2(ka, Tok::DotDot, Tok::DotDotEq) {
+        return if kb == Tok::RBrace as i64 { 1 } else { 0 };
+    }
+    if in2(kb, Tok::DotDot, Tok::DotDotEq) {
+        return if ends_operand(ka) { 0 } else { 1 };
+    }
+    if kb == Tok::LBracket as i64 {
+        return if ends_operand(ka) && !in2(ka, Tok::True, Tok::False) { 0 } else { 1 };
+    }
+    if kb == Tok::LParen as i64 {
+        return if in2(ka, Tok::Ident, Tok::Fn) || in2(ka, Tok::RParen, Tok::RBracket) { 0 }
+            else { 1 };
+    }
+    if kb == Tok::LBrace as i64 {
+        return 1;
+    }
+    if ka == Tok::LBrace as i64 {
+        return if kb == Tok::RBrace as i64 || tight(a) { 0 } else { 1 };
+    }
+    if kb == Tok::RBrace as i64 {
+        return if tight(b) { 0 } else { 1 };
+    }
+    1
+}
+
+// ---- Writing ----
+
+// The bytes of the source line(s) holding pieces i..e, as they are.
+fn source_lines(i: i64, e: i64) -> [u8] {
+    unsafe {
+        let t = FT;
+        let mut s = P_START.data[i];
+        while s > 0 && t[s - 1] != '\n' {
+            s -= 1;
+        }
+        let mut x = P_END.data[e - 1];
+        while x < t.len && t[x] != '\n' {
+            x += 1;
+        }
+        t[s..x]
+    }
+}
+
+// The laid out text, into buffer out.
+pub fn write_layout(out: i64) {
+    unsafe {
+        let n = P_KIND.count;
+        let mut i = 0;
+        while i < n {
+            let e = line_end_piece(i);
+            if RANGED.data[i] == 0 {
+                if i > 0 {
+                    for b in 1..P_NL.data[i] {
+                        buf_byte(out, '\n');
+                    }
+                }
+                buf_bytes(out, source_lines(i, e));
+                buf_byte(out, '\n');
+                i = e;
+                continue;
+            }
+            if BLANK.data[i] != 0 {
+                buf_byte(out, '\n');
+            }
+            for s in 0..IND.data[i] {
+                buf_bytes(out, "    ");
+            }
+            for k in i..e {
+                if k > i && space(k - 1, k) > 0 {
+                    buf_byte(out, ' ');
+                }
+                buf_bytes(out, piece(k));
+            }
+            buf_byte(out, '\n');
+            i = e;
+        }
+    }
+}

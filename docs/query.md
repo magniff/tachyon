@@ -336,6 +336,10 @@ warning query.program-errors: 4 errors in the program; results may be incomplete
 try: target/tachyonc --diagnostics=short broken/main.tach -c -o /dev/null
 ```
 
+`tachyonc explain CODE` (0.13; [fmt.md](fmt.md)): what a code means, how
+to fix it, an example; for every code of every tool, and the compiler's
+error kinds (`explain type-error`).
+
 ## Programs with errors
 
 The query runs the front end as a compilation would, with its error

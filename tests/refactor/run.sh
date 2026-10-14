@@ -203,4 +203,25 @@ ok=0
     && printf '%s\n' "$out" | grep -q '^error same-output.differs: [0-9]* of [0-9]* compilations differ' \
     && printf '%s\n' "$out" | grep -q '^try: diff .*/old/out.s .*/new/out.s$' && ok=1
 check same_output_differs "$ok" "$out"
+# explain (0.13): every code the compiler's source can print has an
+# entry: the tools' codes (`c"query.no-match"`), the kinds of the
+# compiler's errors (ERR_KIND) and warnings and keyed errors (their
+# third argument); and every entry is such a code.
+{
+    grep -rhoE 'c"(query|edit|patch|undo|check|fix|lint|fmt|same-output|refactor|rewrite|explain)\.[a-z-]+"' \
+        compiler/src
+    grep -rhoE 'ERR_KIND = c"[^"]*"' compiler/src
+    grep -rhoE 'report_(warning|error_once)\([^,]*, [^,]*, c"[^"]*"' compiler/src
+} | sed -e 's/.*c"\([^"]*\)"$/\1/' | sort -u >"$WORK/codes"
+"$COMPILER" explain --list | sort >"$WORK/explained"
+missing=$(comm -23 "$WORK/codes" "$WORK/explained")
+extra=$(comm -13 "$WORK/codes" "$WORK/explained")
+bad=
+while IFS= read -r code; do
+    "$COMPILER" explain "$code" >"$WORK/explain.out" 2>&1 \
+        && [ "$(sed -n 1p "$WORK/explain.out")" != "" ] && grep -q '^fix: ' "$WORK/explain.out" \
+        && grep -q '^example:$' "$WORK/explain.out" || bad="$bad $code"
+done <"$WORK/codes"
+check self_explain "$([ "$(wc -l <"$WORK/codes")" -ge 90 ] && [ -z "$missing$extra$bad" ] && echo 1)" \
+    "$(wc -l <"$WORK/codes") codes; no entry:$(echo $missing); not a code:$(echo $extra); bad:$bad"
 exit $STATUS

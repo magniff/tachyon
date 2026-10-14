@@ -427,6 +427,14 @@ try: tachyonc query deps crate::check --max-lines 1000
 
 Exit 1 when a file is over, 0 when none is.
 
+## tachyonc fmt (0.13)
+
+`tachyonc fmt [FILE|DIR...|MODULE|--all] [--check] [--dry-run]`: one
+layout for tachyon source, written as one edit (journaled, `undo`); the
+edit engine lays out the lines every edit writes the same way, and
+`tachyonc explain CODE` says what any code of this page means. See
+[fmt.md](fmt.md).
+
 ## Diagnostics
 
 | code | severity | exit | when | try |

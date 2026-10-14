@@ -3,9 +3,10 @@
 # needed): every tests/run/*.tach, tests/run/*/main.tach (a program of
 # several modules, 0.5) and tests/examples/*.test case is
 # compiled, assembled and linked with the C compiler, run, and checked;
-# alongside them, tests/query/run.sh (`tachyonc query`, 0.11) and
-# tests/refactor/run.sh (the refactoring tools, 0.11). POSIX sh and awk
-# only, so it runs the same on macOS and Linux.
+# alongside them, tests/query/run.sh (`tachyonc query`, 0.11),
+# tests/refactor/run.sh (the refactoring tools, 0.11) and tests/fmt/run.sh
+# (`tachyonc fmt --check` of the tree, and formatting changes no program,
+# 0.13). POSIX sh and awk only, so it runs the same on macOS and Linux.
 #
 # usage: tests/run.sh [-c COMPILER] [-t TARGET] [-O LEVEL] [-j JOBS] [-a] [-d FORMAT] [FILTER]
 #
@@ -592,6 +593,9 @@ esac
 case refactor in
     *"$FILTER"*) "$ROOT/tests/refactor/run.sh" -c "$COMPILER" >"$WORK/refactor.out" 2>&1 & ;;
 esac
+case fmt in
+    *"$FILTER"*) "$ROOT/tests/fmt/run.sh" -c "$COMPILER" -j 1 >"$WORK/fmt.out" 2>&1 & ;;
+esac
 
 # The slots: JOBS of them in a FIFO of our own, or the shared ones of
 # $TACHYON_JOBSERVER (see above).
@@ -670,6 +674,25 @@ case refactor in
             count=$((count + 1))
         fi
         awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/refactor.out" >>"$FAILURES"
+        ;;
+esac
+
+# The formatter (0.13): tests/fmt/run.sh (run above): the tree is
+# formatted (`fmt --all --check`), and formatting changes no program;
+# category "fmt".
+case fmt in
+    *"$FILTER"*)
+        while read -r status _; do
+            case "$status" in
+                pass) echo "fmt pass" >>"$TALLY"; count=$((count + 1)) ;;
+                FAIL) echo "fmt fail" >>"$TALLY"; count=$((count + 1)) ;;
+            esac
+        done <"$WORK/fmt.out"
+        if ! grep -q '^pass' "$WORK/fmt.out"; then
+            echo "fmt fail" >>"$TALLY"
+            count=$((count + 1))
+        fi
+        awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/fmt.out" >>"$FAILURES"
         ;;
 esac
 

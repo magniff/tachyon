@@ -230,14 +230,15 @@ $ refactor move geom::Point --to crate::shapes
 moved crate::geom::Point to crate::shapes	3 files	+16 -14 lines
 % git diff
 diff --git a/geom.tach b/geom.tach
-index bf000c1..ddad9af 100644
+index bf000c1..872f916 100644
 --- a/geom.tach
 +++ b/geom.tach
-@@ -1,18 +1,7 @@
+@@ -1,19 +1,8 @@
  // Points and their areas.
  
++use crate::shapes::Point;
  use crate::util::twice;
--
+ 
 -pub struct Point {
 -    pub x: i64,
 -    pub y: i64,
@@ -249,25 +250,24 @@ index bf000c1..ddad9af 100644
 -        self.x + self.y
 -    }
 -}
-+use crate::shapes::Point;
- 
+-
  // The area of the rectangle from the origin to p.
  pub fn area(p: Point) -> i64 {
+     p.x * p.y
 diff --git a/main.tach b/main.tach
-index 620be80..2bc17f7 100644
+index 620be80..9888618 100644
 --- a/main.tach
 +++ b/main.tach
-@@ -3,8 +3,9 @@ mod geom;
+@@ -3,7 +3,8 @@ mod geom;
  mod shapes;
  mod util;
  
 -use geom::{Point, area};
++use crate::shapes::Point;
 +use geom::area;
  use util::twice;
-+use crate::shapes::Point;
  
  fn main() -> i32 {
-     let p = Point { x: 2, y: 3 };
 diff --git a/shapes.tach b/shapes.tach
 index 0c40caf..2869d54 100644
 --- a/shapes.tach
@@ -323,9 +323,10 @@ $ refactor move util::COUNTER --to crate::geom --dry-run
 $ refactor move util::twice --to crate::shapes --dry-run
 --- a/main.tach
 +++ b/main.tach
-@@ -7 +7 @@
--use util::twice;
+@@ -5,0 +6 @@
 +use crate::shapes::twice;
+@@ -7 +7,0 @@
+-use util::twice;
 --- a/geom.tach
 +++ b/geom.tach
 @@ -3 +3 @@

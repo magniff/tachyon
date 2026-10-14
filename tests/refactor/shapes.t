@@ -242,7 +242,7 @@ $ refactor field Label --add 'size: i64 = 4' --dry-run
 ## An arm that does not check: nothing written.
 $ refactor variant Kind --add 'Ring(i64, i64)' --arm 'oops'
 ./kinds.tach:16:29: error[type error] undefined variable 'oops'
-./kinds.tach:35:109: error[type error] undefined variable 'oops'
+./kinds.tach:39:29: error[type error] undefined variable 'oops'
 error edit.breaks: 2 new errors; nothing written
 try: tachyonc refactor variant Kind --add 'Ring(i64, i64)' --arm oops --no-check
 [exit 1]
@@ -255,9 +255,14 @@ $ refactor variant Kind --add 'Ring(i64, i64)' --arm 0 --dry-run
 +    Ring(i64, i64),
 @@ -14,0 +16 @@
 +        Kind::Ring(_, _) => 0,
-@@ -33 +35 @@
+@@ -33 +35,6 @@
 -    match k { Kind::Circle(_) => 0, Kind::Dot | Kind::Square(_) => 4, Kind::Empty => 0 }
-+    match k { Kind::Circle(_) => 0, Kind::Dot | Kind::Square(_) => 4, Kind::Empty => 0, Kind::Ring(_, _) => 0 }
++    match k {
++        Kind::Circle(_) => 0,
++        Kind::Dot | Kind::Square(_) => 4,
++        Kind::Empty => 0,
++        Kind::Ring(_, _) => 0
++    }
 ## Without --arm: the matches that need one.
 $ refactor variant Kind --add 'Ring(i64, i64)'
 kinds.tach:9:5	kinds::weight

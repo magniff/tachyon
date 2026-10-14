@@ -26,3 +26,5 @@ the edited program checked before anything is written, a journal for
 | `refactor_move/` | `refactor move`, `split`: units and blocks (`units`), imports (`imports`) |
 | `script.tach` | `refactor --script`: commands checked once, one undo |
 | `commands.tach` | the table of the commands that change a program |
+| `fmt/` | `tachyonc fmt` (0.13, docs/fmt.md): the pieces of a text (`pieces`), lines and levels (`layout`), wrapping (`wrap`), `use` runs (`uses`); the edit engine formats its edits with it |
+| `explain/` | `tachyonc explain CODE` (0.13): the table of every diagnostic code (`tools_table`, `refactor_table`) |
