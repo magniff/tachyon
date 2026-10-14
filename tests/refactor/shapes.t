@@ -120,9 +120,9 @@ error refactor.used: parameter p is used in crate::geom::area at geom.tach:18:5
 try: tachyonc query show geom.tach:18
 [exit 1]
 $ refactor signature Point::scale --rename-param k self
-error refactor.clash: self is a name in crate::geom::Point::scale already
-try: tachyonc query show crate::geom::Point::scale
-[exit 1]
+error refactor.usage: self keeps its name (a method's first parameter is self)
+try: tachyonc refactor signature NAME --add 'x: i64 = 0' --dry-run
+[exit 2]
 ## Renaming a parameter changes no type: a function used as a value is fine.
 $ refactor signature twice --rename-param x n --dry-run
 --- a/geom.tach

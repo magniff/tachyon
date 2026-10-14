@@ -128,3 +128,17 @@ error rewrite.usage: --where names $w, which the pattern has not (or has as '$w.
 [exit 2]
 $ rewrite 'nothing($x)' '$x'
 note rewrite.none: nothing matches 'nothing($x)'
+## Holes for types and for a let's binding (a hole's type name takes no
+## `<`: parentheses).
+$ rewrite '($a as $T) < $b' '$b > ($a as $T)' --dry-run
+--- a/main.tach
++++ b/main.tach
+@@ -14 +14 @@
+-    if n as i64 < v.len {
++    if v.len > (n as i64) {
+$ rewrite 'let $v = 3;' 'let $v = 4;' --dry-run
+--- a/main.tach
++++ b/main.tach
+@@ -13 +13 @@
+-    let n = 3;
++    let n = 4;
