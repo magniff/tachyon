@@ -117,7 +117,7 @@ check self_refs_count "$ok" "$out"
 out=$("$COMPILER" query refs IntVec::push 2>"$WORK/err")
 err=$(cat "$WORK/err")
 ok=0
-n=$(printf '%s\n' "$out" | grep -c "^compiler/src/[a-z_0-9]*\.tach${TAB}[0-9]*\$")
+n=$(printf '%s\n' "$out" | grep -c "^compiler/src/[a-z_0-9/]*\.tach${TAB}[0-9]*\$")
 [ "$n" -ge 10 ] && [ "$n" = "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" ] \
     && printf '%s\n' "$err" | head -1 | grep -q '^note query.truncated: [0-9]* refs in [0-9]* files$' \
     && [ "$(printf '%s\n' "$err" | grep -c '^try: .* query refs IntVec::push --')" = 3 ] && ok=1
