@@ -246,10 +246,32 @@ fn diff_texts(out: i64, path: [u8], old: [u8], new: [u8]) {
         buf_str(out, c"\n+++ b/");
         buf_bytes(out, path);
         buf_byte(out, '\n');
-        // The middle: an LCS table when it is small, else one hunk.
+        // The middle: an LCS table when it is small; else, with as many
+        // lines on both sides (a rewrite of lines in place), line by line;
+        // else one hunk.
         let mut ops = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         if m * n <= 4000000 {
             lcs_ops(old, &a, new, &b, head, m, n, &ops);
+        } else if m == n {
+            let mut i = 0;
+            while i < m {
+                if same_bytes(line_text(old, &a, head + i), line_text(new, &b, head + i)) {
+                    ops.push(0);
+                    i += 1;
+                    continue;
+                }
+                let mut e = i;
+                while e < m && !same_bytes(line_text(old, &a, head + e), line_text(new, &b, head + e)) {
+                    e += 1;
+                }
+                for x in i..e {
+                    ops.push(-(head + x) - 1);
+                }
+                for x in i..e {
+                    ops.push(head + x + 1);
+                }
+                i = e;
+            }
         } else {
             for i in 0..m {
                 ops.push(-(head + i) - 1);
@@ -374,7 +396,7 @@ fn lcs_ops(old: [u8], a: *IntVec, new: [u8], b: *IntVec, head: i64, m: i64, n: i
 // ---- Checking the edited program ----
 
 // The suffix of an edited file's copy.
-fn copy_path(path: *u8) -> *u8 {
+pub fn copy_path(path: *u8) -> *u8 {
     unsafe {
         let b = buf_new();
         buf_str(b, path);
@@ -485,7 +507,7 @@ pub fn set_command(argc: i64, argv: **u8) {
 }
 
 // The command as it was run, with one more option (for a `try:` line).
-fn try_again(option: *u8) {
+pub fn try_again(option: *u8) {
     unsafe {
         let out = diags();
         buf_str(out, c"try:");
@@ -556,9 +578,21 @@ pub fn prepare_edit() -> i64 {
 }
 
 // The `--overlay FILE COPY` arguments of the edited files (for a command
-// that runs on the edited program).
+// that runs on the edited program), and of the files this program was
+// read with in place of others (a step of a script: the edits of the
+// steps before).
 pub fn overlay_args(args: *IntVec) {
     unsafe {
+        let mut k = 0;
+        while k < OVERLAY.count {
+            let p = OVERLAY.data[k] as *u8;
+            if !edited_path(p) {
+                args.push(c"--overlay" as i64);
+                args.push(p as i64);
+                args.push(OVERLAY.data[k + 1]);
+            }
+            k += 2;
+        }
         for i in 0..CH_FILE.count {
             args.push(c"--overlay" as i64);
             args.push(FILES[CH_FILE.data[i]].path as i64);
@@ -569,6 +603,35 @@ pub fn overlay_args(args: *IntVec) {
             args.push(NEW_PATH.data[i]);
             args.push(copy_path(NEW_PATH.data[i] as *u8) as i64);
         }
+    }
+}
+
+// Whether the edit changes or makes file `path`.
+fn edited_path(path: *u8) -> bool {
+    unsafe {
+        for i in 0..CH_FILE.count {
+            if streq(FILES[CH_FILE.data[i]].path, path) {
+                return true;
+            }
+        }
+        for i in 0..NEW_PATH.count {
+            if streq(NEW_PATH.data[i] as *u8, path) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// A file the steps of a script made (script.tach): its text is its copy's.
+pub fn copy_made(path: *u8) -> bool {
+    unsafe {
+        let text = buf_new();
+        if !read_file_if(copy_path(path), text) {
+            return false;
+        }
+        edit_new_file(path, text);
+        true
     }
 }
 
@@ -634,6 +697,9 @@ pub fn finish_edit(what: [u8], root: *u8) -> i64 {
         }
         for i in 0..NEW_PATH.count {
             diff_texts(diff, c_slice(NEW_PATH.data[i] as *u8), SRC[0..0], buf_slice(NEW_TEXT.data[i]));
+        }
+        if STEP_REPORT != 0 as *u8 {
+            return step_done(what);
         }
         let mut ok = true;
         // 2, 3. The check.
@@ -701,6 +767,38 @@ pub fn finish_edit(what: [u8], root: *u8) -> i64 {
         buf_byte(summary, '\n');
         buf_write_fd(summary, STDOUT);
         if ok { 0 } else { 1 }
+    }
+}
+
+// A step of a `refactor --script` (0.11, script.tach) is neither
+// checked nor written: its copies stay, for the next steps (which read
+// them, --overlay) and the check at the end; its files are listed in
+// STEP_REPORT (`file PATH`, `new PATH`), and its summary line printed.
+pub static mut STEP_REPORT: *u8 = 0 as *u8;
+
+fn step_done(what: [u8]) -> i64 {
+    unsafe {
+        let report = buf_new();
+        for i in 0..CH_FILE.count {
+            buf_str(report, c"file\t");
+            buf_str(report, FILES[CH_FILE.data[i]].path);
+            buf_byte(report, '\n');
+        }
+        for i in 0..NEW_PATH.count {
+            buf_str(report, c"new\t");
+            buf_str(report, NEW_PATH.data[i] as *u8);
+            buf_byte(report, '\n');
+        }
+        if !write_file_if(STEP_REPORT, buf_slice(report)) {
+            cannot_write(STEP_REPORT);
+            remove_copies();
+            return 1;
+        }
+        let summary = buf_new();
+        put_summary(summary, what);
+        buf_byte(summary, '\n');
+        buf_write_fd(summary, STDOUT);
+        0
     }
 }
 
@@ -1528,7 +1626,7 @@ fn starts_with_brace(pos: i64) -> bool {
 
 // Leaves out of matches the definitions that are not in a file of the
 // program (std's, the C headers'), unless all are.
-fn source_only(matches: *IntVec) {
+pub fn source_only(matches: *IntVec) {
     unsafe {
         let mut kept = 0;
         for i in 0..(*matches).count {
@@ -1546,7 +1644,7 @@ fn source_only(matches: *IntVec) {
 
 // NAME matches several definitions: refused, with the first three paths
 // (and the query listing them all, when there are more).
-fn ambiguous(what: *u8, name: [u8], matches: *IntVec) {
+pub fn ambiguous(what: *u8, name: [u8], matches: *IntVec) {
     unsafe {
         let n = (*matches).count;
         let d = diag(c"error", c"query.ambiguous");

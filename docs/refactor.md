@@ -318,7 +318,10 @@ every command.
 - `query unused` and `query deps` see references the checker resolved:
   a generic function never instantiated is not checked (see
   [query.md](query.md), Known limits).
-- Phase 2 (0.11, next): `refactor rename`, `move`, `signature`, `field`,
-  `variant`, `new-module`, `move-module`, `split`, a typed `rewrite`,
-  `--script` batches, `--undo`; all on this engine (`edit_replace`,
-  `edit_new_file`, `apply_edit` in compiler/src/edit.tach).
+- Phase 2 (0.11): `refactor signature`, `field`, `variant`, the typed
+  `rewrite` and `refactor --script` are in
+  [refactor-shape.md](refactor-shape.md); `refactor rename`, `move`,
+  `new-module`, `move-module`, `split` are next; all on this engine
+  (`edit_replace`, `edit_new_file`, `apply_edit` in
+  compiler/src/edit.tach), and a command registered in
+  compiler/src/commands.tach runs in scripts too.

@@ -1,0 +1,1266 @@
+// `tachyonc rewrite 'PATTERN' 'REPLACEMENT' [--where '$v: TYPE']...
+// [--in FILE|MODULE] [--dry-run]` (0.11; docs/refactor.md): typed
+// structural search and replace over the program's expressions and
+// statements, in one atomic edit (edit.tach).
+//
+// PATTERN and REPLACEMENT are tachyon expressions (statements, when the
+// pattern ends with `;` or starts with `let`) with holes: `$x` matches
+// any expression (or type), `$x...` any number of arguments of a call, a
+// tuple or an array; a hole written twice matches equal code (the same
+// tokens). `--where '$x: T'` keeps the sites where the checker gave $x
+// type T. Both are parsed by the compiler's parser (each hole an
+// identifier, `__tachyon_hole_x`), and the pattern is matched against
+// the program's nodes as parsed (ast.tach's PARSED_NODES: the checker
+// changes nodes in place), node by node; a part of the pattern without
+// holes matches code with the same tokens. A site's replacement is
+// REPLACEMENT with each hole replaced by the exact text it matched,
+// parenthesized where the operators around it need it (and the whole
+// replacement too, for the operators around the site). Sites inside a
+// rewritten site are left for another run.
+//
+// Output: `rewrote N sites in M files<TAB>FILES<TAB>+A -R lines`, or with
+// --dry-run the diff.
+
+use crate::base::{
+    BUFS, ERR, FILES, IntVec, RECOVER_DEPTH, SRC, _setjmp, add_source, alloc_array, buf_byte,
+    buf_bytes, buf_int, buf_new, buf_slice, buf_str, errors_forget, errors_mark, intern, recover_enter,
+    recover_leave,
+};
+use crate::lexer::{TOKS, TOK_COUNT, Tok, lex_range};
+use crate::ast::{KEEP_PARSED, NODES, NodeKind, PARSED_COUNT, PARSED_NODES, keep_parsed, parsed_child};
+use crate::parser::{infix_left_bp, is_comparison, parse_fragment};
+use crate::modules::file_of_pos;
+use crate::types::buf_type;
+use crate::query::{
+    OPT_IN, PROG, ROOT_GIVEN, TOOL, bytes_eq, c_slice, diag, diags, load_program, program_errors, put_cword,
+    put_loc, put_root, put_word, ref_in, resolve_in, root_or_diag, token_at, try_end, write_diags,
+};
+use crate::edit::{TARGET, apply_edit, edit_replace, set_command, take_edit_option};
+use crate::lower::HMap;
+use crate::streq;
+
+// ---- The program as parsed ----
+//
+// PARSED_NODES holds every node as the parser made it (the program's,
+// then the pattern's and the replacement's): these read it.
+
+pub fn pk(n: i64) -> NodeKind {
+    unsafe { PARSED_NODES[n].kind }
+}
+
+pub fn pa(n: i64) -> i64 {
+    unsafe { PARSED_NODES[n].a }
+}
+
+pub fn pb(n: i64) -> i64 {
+    unsafe { PARSED_NODES[n].b }
+}
+
+pub fn pc(n: i64) -> i64 {
+    unsafe { PARSED_NODES[n].c }
+}
+
+pub fn pd(n: i64) -> i64 {
+    unsafe { PARSED_NODES[n].d }
+}
+
+pub fn pg(n: i64) -> i64 {
+    unsafe { PARSED_NODES[n].g }
+}
+
+pub fn ph(n: i64) -> i64 {
+    unsafe { PARSED_NODES[n].h }
+}
+
+pub fn pflags(n: i64) -> i64 {
+    unsafe { PARSED_NODES[n].p }
+}
+
+pub fn pop(n: i64) -> Tok {
+    unsafe { PARSED_NODES[n].op }
+}
+
+pub fn pcount(n: i64) -> i64 {
+    unsafe { PARSED_NODES[n].count }
+}
+
+pub fn pchild(n: i64, i: i64) -> i64 {
+    parsed_child(n, i)
+}
+
+pub fn pstart(n: i64) -> i64 {
+    unsafe { PARSED_NODES[n].start }
+}
+
+pub fn pend(n: i64) -> i64 {
+    unsafe { PARSED_NODES[n].end }
+}
+
+// Whether SRC[a0..a1) and SRC[b0..b1) have the same tokens (comments and
+// spacing aside).
+pub fn same_tokens(a0: i64, a1: i64, b0: i64, b1: i64) -> bool {
+    unsafe {
+        let mut i = token_at(a0);
+        let mut j = token_at(b0);
+        loop {
+            let more_a = i < TOK_COUNT && TOKS[i].kind != Tok::Eof && TOKS[i].start < a1;
+            let more_b = j < TOK_COUNT && TOKS[j].kind != Tok::Eof && TOKS[j].start < b1;
+            if !more_a || !more_b {
+                return more_a == more_b;
+            }
+            if TOKS[i].kind != TOKS[j].kind
+                || !bytes_eq(SRC[TOKS[i].start..TOKS[i].end], SRC[TOKS[j].start..TOKS[j].end]) {
+                return false;
+            }
+            i += 1;
+            j += 1;
+        }
+    }
+}
+
+// Whether node n's text is in parentheses of its own: `(a + b)` (the
+// parser widens a parenthesized expression's span to its parentheses).
+pub fn parenthesized(n: i64) -> bool {
+    unsafe {
+        let k = pk(n);
+        if k == NodeKind::Tuple || k == NodeKind::Unit {
+            return false;
+        }
+        let s = pstart(n);
+        let e = pend(n);
+        if e - s < 2 || SRC[s] != '(' || SRC[e - 1] != ')' {
+            return false;
+        }
+        let mut i = token_at(s);
+        let mut depth = 0;
+        while i < TOK_COUNT && TOKS[i].start < e {
+            let t = TOKS[i].kind;
+            if t == Tok::LParen || t == Tok::LBracket || t == Tok::LBrace {
+                depth += 1;
+            } else if t == Tok::RParen || t == Tok::RBracket || t == Tok::RBrace {
+                depth -= 1;
+                if depth == 0 {
+                    return TOKS[i].start == e - 1;
+                }
+            }
+            i += 1;
+        }
+        false
+    }
+}
+
+// How tightly expression n binds (the binding power levels of
+// docs/grammar.md): 1 an assignment, 2 a range, 3 to 11 the binary
+// operators, 12 a cast, 13 a prefix operator, 99 a postfix expression,
+// a primary or anything in parentheses; 0 `return`, `break`.
+pub fn binding_level(n: i64) -> i64 {
+    let k = pk(n);
+    if parenthesized(n) {
+        return 99;
+    }
+    if k == NodeKind::Binary {
+        return infix_left_bp(pop(n)) / 2;
+    }
+    if k == NodeKind::Assign {
+        return 1;
+    }
+    if k == NodeKind::Range {
+        return 2;
+    }
+    if k == NodeKind::Cast {
+        return 12;
+    }
+    if k == NodeKind::Unary {
+        return 13;
+    }
+    if k == NodeKind::Return || k == NodeKind::Break || k == NodeKind::Continue {
+        return 0;
+    }
+    99
+}
+
+// The expressions inside node n, each with the binding level an
+// expression needs there to stand without parentheses.
+pub fn expr_slots(n: i64, kids: *IntVec, levels: *IntVec) {
+    unsafe {
+        let k = pk(n);
+        if k == NodeKind::Binary {
+            let lv = infix_left_bp(pop(n)) / 2;
+            kids.push(pb(n));
+            levels.push(if is_comparison(pop(n)) { lv + 1 } else { lv });
+            kids.push(pc(n));
+            levels.push(lv + 1);
+        } else if k == NodeKind::Assign {
+            kids.push(pb(n));
+            levels.push(13);
+            kids.push(pc(n));
+            levels.push(1);
+        } else if k == NodeKind::Range {
+            kids.push(pa(n));
+            levels.push(3);
+            kids.push(pb(n));
+            levels.push(3);
+        } else if k == NodeKind::Unary {
+            kids.push(pb(n));
+            levels.push(13);
+        } else if k == NodeKind::Cast {
+            kids.push(pa(n));
+            levels.push(12);
+        } else if k == NodeKind::Call || k == NodeKind::MethodCall {
+            kids.push(pa(n));
+            levels.push(99);
+            for i in 0..pcount(n) {
+                kids.push(pchild(n, i));
+                levels.push(0);
+            }
+        } else if k == NodeKind::Index {
+            kids.push(pa(n));
+            levels.push(99);
+            kids.push(pb(n));
+            levels.push(0);
+        } else if k == NodeKind::FieldAccess || k == NodeKind::TupleField {
+            kids.push(pa(n));
+            levels.push(99);
+        } else if k == NodeKind::Tuple || k == NodeKind::Array || k == NodeKind::StructLit || k == NodeKind::Match {
+            if k == NodeKind::Match {
+                kids.push(pa(n));
+                levels.push(0);
+            }
+            for i in 0..pcount(n) {
+                kids.push(pchild(n, i));
+                levels.push(0);
+            }
+        } else if k == NodeKind::Block {
+            for i in 0..pcount(n) {
+                kids.push(pchild(n, i));
+                levels.push(0);
+            }
+            kids.push(pa(n));
+            levels.push(0);
+        } else if k == NodeKind::FieldInit || k == NodeKind::ExprStmt || k == NodeKind::Defer {
+            kids.push(if k == NodeKind::FieldInit { pb(n) } else { pa(n) });
+            levels.push(0);
+        } else if k == NodeKind::Repeat || k == NodeKind::If || k == NodeKind::Let || k == NodeKind::Arm
+            || k == NodeKind::While || k == NodeKind::For || k == NodeKind::Loop || k == NodeKind::Return
+            || k == NodeKind::Break {
+            // (a, b, c, d: the expressions of each, in order; a Let's
+            // pattern and type, a loop's label are not)
+            if k == NodeKind::Repeat || k == NodeKind::If || k == NodeKind::Return {
+                kids.push(pa(n));
+                levels.push(0);
+            }
+            if k == NodeKind::Repeat || k == NodeKind::If || k == NodeKind::Arm || k == NodeKind::While
+                || k == NodeKind::Loop || k == NodeKind::Break {
+                kids.push(pb(n));
+                levels.push(0);
+            }
+            if k == NodeKind::If || k == NodeKind::Let || k == NodeKind::Arm || k == NodeKind::While || k == NodeKind::For {
+                kids.push(pc(n));
+                levels.push(0);
+            }
+            if k == NodeKind::For {
+                kids.push(pd(n));
+                levels.push(0);
+            }
+        }
+    }
+}
+
+// The level each node of first..last needs where it is (0 when it is in
+// no expression of them), indexed by node.
+fn slot_levels(first: i64, last: i64) -> *i64 {
+    unsafe {
+        let levels = alloc_array::<i64>(PARSED_COUNT + 1);
+        let mut kids = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut lv = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for n in first..last {
+            kids.count = 0;
+            lv.count = 0;
+            expr_slots(n, &kids, &lv);
+            for i in 0..kids.count {
+                let c = kids.data[i];
+                if c > 0 && c < PARSED_COUNT {
+                    levels[c] = lv.data[i];
+                }
+            }
+        }
+        levels
+    }
+}
+
+// ---- Holes ----
+
+// Per hole: its identifier's symbol, its name as written (a buffer:
+// `$x`), whether it is `$x...`, its --where type (a buffer, without
+// spaces; -1: none).
+static mut H_SYM: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut H_NAME: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut H_REST: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut H_TYPE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// What each hole matched at the site being tried: B_NODE the node (-1:
+// nothing yet, -2: arguments, from B_START to B_END; -3: no arguments).
+static mut B_NODE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut B_START: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut B_END: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The pattern's hole nodes.
+static mut PAT_HOLES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// Sites left out by a --where type: how many, and the first one (its
+// node, hole, type).
+static mut TYPE_MISSES: i64 = 0;
+static mut MISS_NODE: i64 = 0;
+static mut MISS_HOLE: i64 = 0;
+static mut MISS_TYPE: i64 = 0;
+// Sites left out because the checker did not type their code.
+static mut UNTYPED: i64 = 0;
+
+fn is_name_byte(c: u8) -> bool {
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+}
+
+fn hole_named(name: [u8], rest: bool) -> i64 {
+    unsafe {
+        for h in 0..H_SYM.count {
+            if bytes_eq(buf_slice(H_NAME.data[h]), name) && (H_REST.data[h] != 0) == rest {
+                return h;
+            }
+        }
+        -1
+    }
+}
+
+// Writes `text` into buffer `out` with each hole an identifier; the
+// pattern's holes are added (`add`), the replacement's must be the
+// pattern's. False after the diagnostic.
+fn holes_to_idents(text: *u8, out: i64, add: bool) -> bool {
+    unsafe {
+        let s = c_slice(text);
+        let mut i = 0;
+        while i < s.len {
+            let c = s[i];
+            if c == '"' || c == '\'' {
+                // (a string or a character: as it is)
+                buf_byte(out, c);
+                i += 1;
+                while i < s.len && s[i] != c {
+                    if s[i] == '\\' && i + 1 < s.len {
+                        buf_byte(out, s[i]);
+                        i += 1;
+                    }
+                    buf_byte(out, s[i]);
+                    i += 1;
+                }
+                if i < s.len {
+                    buf_byte(out, s[i]);
+                    i += 1;
+                }
+                continue;
+            }
+            if c != '$' {
+                buf_byte(out, c);
+                i += 1;
+                continue;
+            }
+            let mut e = i + 1;
+            while e < s.len && is_name_byte(s[e]) {
+                e += 1;
+            }
+            if e == i + 1 {
+                let d = diag(c"error", c"rewrite.pattern");
+                buf_str(d, c"'$' without a name in '");
+                buf_bytes(d, s);
+                buf_str(d, c"': holes are $name, or $name... for arguments\n");
+                return false;
+            }
+            let name = s[i..e];
+            let rest = e + 3 <= s.len && s[e] == '.' && s[e + 1] == '.' && s[e + 2] == '.';
+            let ident = buf_new();
+            buf_str(ident, if rest { c"__tachyon_rest_" } else { c"__tachyon_hole_" });
+            buf_bytes(ident, s[i + 1..e]);
+            let mut h = hole_named(name, rest);
+            if h < 0 {
+                if hole_named(name, !rest) >= 0 {
+                    let d = diag(c"error", c"rewrite.pattern");
+                    buf_bytes(d, name);
+                    buf_str(d, c" is written both with and without '...'\n");
+                    return false;
+                }
+                if !add {
+                    let d = diag(c"error", c"rewrite.unbound");
+                    buf_str(d, c"the replacement's ");
+                    buf_bytes(d, name);
+                    if rest {
+                        buf_str(d, c"...");
+                    }
+                    buf_str(d, c" is not in the pattern\n");
+                    return false;
+                }
+                h = H_SYM.count;
+                H_SYM.push(intern(buf_slice(ident)));
+                let nb = buf_new();
+                buf_bytes(nb, name);
+                H_NAME.push(nb);
+                H_REST.push(rest as i64);
+                H_TYPE.push(-1);
+            }
+            buf_bytes(out, buf_slice(ident));
+            i = if rest { e + 3 } else { e };
+        }
+        true
+    }
+}
+
+// The hole node n is (an identifier, a type name or a binding of a
+// hole), or -1.
+fn hole_of(n: i64) -> i64 {
+    unsafe {
+        if n <= 0 {
+            return -1;
+        }
+        let k = pk(n);
+        if k != NodeKind::Ident && k != NodeKind::TyName && k != NodeKind::PatBind {
+            return -1;
+        }
+        if k == NodeKind::Ident && pg(n) != 0 {
+            return -1;
+        }
+        let sym = pa(n);
+        for h in 0..H_SYM.count {
+            if H_SYM.data[h] == sym {
+                return h;
+            }
+        }
+        -1
+    }
+}
+
+// Parses buffer `text` (the statements, `stmts`) after the program: its
+// node, or 0 after the diagnostic (`what`: the pattern or the
+// replacement).
+fn parse_text(text: i64, stmts: bool, what: *u8) -> i64 {
+    unsafe {
+        let start = add_source(c"<rewrite>", text);
+        let first = TOK_COUNT;
+        let mark = errors_mark();
+        let depth = RECOVER_DEPTH;
+        let mut n = 0;
+        if _setjmp(recover_enter()) == 0 {
+            lex_range(start, start + BUFS[text].len, true);
+            n = parse_fragment(first, stmts);
+        } else {
+            n = 0;
+            let d = diag(c"error", c"rewrite.pattern");
+            buf_str(d, c"the ");
+            buf_str(d, what);
+            buf_str(d, c" is no tachyon ");
+            buf_str(d, if stmts { c"statement" } else { c"expression" });
+            buf_str(d, c": ");
+            buf_bytes(d, buf_slice(ERR));
+            buf_byte(d, '\n');
+        }
+        recover_leave(depth);
+        errors_forget(mark);
+        keep_parsed();
+        n
+    }
+}
+
+// ---- Matching ----
+
+fn has_hole(p: i64) -> bool {
+    unsafe {
+        for i in 0..PAT_HOLES.count {
+            let h = PAT_HOLES.data[i];
+            if pstart(p) <= pstart(h) && pend(h) <= pend(p) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// The type of checked node n as written in --where (no spaces), into a
+// new buffer.
+fn type_key(t: i64) -> i64 {
+    unsafe {
+        let out = buf_new();
+        let text = buf_new();
+        buf_type(text, t);
+        let s = buf_slice(text);
+        for i in 0..s.len {
+            if s[i] != ' ' {
+                buf_byte(out, s[i]);
+            }
+        }
+        out
+    }
+}
+
+// The checked nodes made by the checker (a generic function's
+// instances are clones of its body: generics.tach), by span and kind.
+static mut CLONES: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+fn span_key(start: i64, end: i64, kind: NodeKind) -> i64 {
+    ((start * 128 + kind as i64) * 65536 + (end - start) % 65536) + 1
+}
+
+fn note_clones(first: i64, last: i64) {
+    unsafe {
+        for n in first..last {
+            let key = span_key(NODES[n].start, NODES[n].end, NODES[n].kind);
+            if NODES[n].ty > 0 && CLONES.get(key) == 0 {
+                CLONES.put(key, n + 1);
+            }
+        }
+    }
+}
+
+// The type the checker gave node n (as parsed): its own, or in a generic
+// function, its first instance's; 0 when it was not checked.
+fn checked_type(n: i64) -> i64 {
+    unsafe {
+        if NODES[n].ty > 0 {
+            return NODES[n].ty;
+        }
+        let mut c = CLONES.get(span_key(pstart(n), pend(n), pk(n))) - 1;
+        if c < 0 && pk(n) == NodeKind::MethodCall {
+            c = CLONES.get(span_key(pstart(n), pend(n), NodeKind::Call)) - 1;
+        }
+        if c < 0 { 0 } else { NODES[c].ty }
+    }
+}
+
+// Hole h matches node n (a repeated hole: the same tokens as before).
+fn bind(h: i64, n: i64) -> bool {
+    unsafe {
+        if H_REST.data[h] != 0 {
+            return false;
+        }
+        if B_NODE.data[h] != -1 {
+            return B_NODE.data[h] >= 0 && same_tokens(B_START.data[h], B_END.data[h], pstart(n), pend(n));
+        }
+        if H_TYPE.data[h] >= 0 && pk(n) != NodeKind::TyName && pk(n) != NodeKind::PatBind {
+            let t = checked_type(n);
+            if t <= 0 {
+                UNTYPED += 1;
+                return false;
+            }
+            let key = type_key(t);
+            if !bytes_eq(buf_slice(key), buf_slice(H_TYPE.data[h])) {
+                if TYPE_MISSES == 0 {
+                    MISS_NODE = n;
+                    MISS_HOLE = h;
+                    MISS_TYPE = t;
+                }
+                TYPE_MISSES += 1;
+                return false;
+            }
+        }
+        B_NODE.data[h] = n;
+        B_START.data[h] = pstart(n);
+        B_END.data[h] = pend(n);
+        true
+    }
+}
+
+// Hole h (`$x...`) matches the elements from..to of node n's list.
+fn bind_rest(h: i64, n: i64, from: i64, to: i64) -> bool {
+    unsafe {
+        let s = if from < to { pstart(pchild(n, from)) } else { -1 };
+        let e = if from < to { pend(pchild(n, to - 1)) } else { -1 };
+        if B_NODE.data[h] != -1 {
+            if B_NODE.data[h] == -3 || from == to {
+                return B_NODE.data[h] == -3 && from == to;
+            }
+            return same_tokens(B_START.data[h], B_END.data[h], s, e);
+        }
+        B_NODE.data[h] = if from < to { -2 } else { -3 };
+        B_START.data[h] = s;
+        B_END.data[h] = e;
+        true
+    }
+}
+
+fn match_list(p: i64, n: i64) -> bool {
+    let np = pcount(p);
+    let nn = pcount(n);
+    let mut v = -1;
+    let mut vh = -1;
+    for i in 0..np {
+        let h = hole_of(pchild(p, i));
+        if h >= 0 && unsafe { H_REST.data[h] } != 0 {
+            v = i;
+            vh = h;
+            break;
+        }
+    }
+    if v < 0 {
+        if np != nn {
+            return false;
+        }
+        for i in 0..np {
+            if !match_node(pchild(p, i), pchild(n, i)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    let after = np - v - 1;
+    if nn < np - 1 {
+        return false;
+    }
+    for i in 0..v {
+        if !match_node(pchild(p, i), pchild(n, i)) {
+            return false;
+        }
+    }
+    for j in 0..after {
+        if !match_node(pchild(p, v + 1 + j), pchild(n, nn - after + j)) {
+            return false;
+        }
+    }
+    bind_rest(vh, n, v, nn - after)
+}
+
+// Whether pattern node p matches program node n (binding the holes).
+fn match_node(p: i64, n: i64) -> bool {
+    if p == 0 || n == 0 {
+        return p == n;
+    }
+    let h = hole_of(p);
+    if h >= 0 {
+        return bind(h, n);
+    }
+    if !has_hole(p) {
+        return same_tokens(pstart(p), pend(p), pstart(n), pend(n));
+    }
+    let k = pk(p);
+    if k != pk(n) {
+        return false;
+    }
+    if k == NodeKind::Binary || k == NodeKind::Assign {
+        return pop(p) == pop(n) && match_node(pb(p), pb(n)) && match_node(pc(p), pc(n));
+    }
+    if k == NodeKind::Unary {
+        return pop(p) == pop(n) && match_node(pb(p), pb(n));
+    }
+    if k == NodeKind::Cast || k == NodeKind::Index || k == NodeKind::Repeat {
+        return match_node(pa(p), pa(n)) && match_node(pb(p), pb(n));
+    }
+    if k == NodeKind::Call {
+        return match_node(pa(p), pa(n)) && match_list(p, n);
+    }
+    if k == NodeKind::MethodCall {
+        return pb(p) == pb(n) && same_part(pg(p), pg(n)) && match_node(pa(p), pa(n)) && match_list(p, n);
+    }
+    if k == NodeKind::FieldAccess || k == NodeKind::TupleField {
+        return pb(p) == pb(n) && match_node(pa(p), pa(n));
+    }
+    if k == NodeKind::Tuple || k == NodeKind::Array {
+        return match_list(p, n);
+    }
+    if k == NodeKind::Range {
+        return pc(p) == pc(n) && match_node(pa(p), pa(n)) && match_node(pb(p), pb(n));
+    }
+    if k == NodeKind::Return || k == NodeKind::Defer {
+        return match_node(pa(p), pa(n));
+    }
+    if k == NodeKind::Break {
+        return pa(p) == pa(n) && match_node(pb(p), pb(n));
+    }
+    if k == NodeKind::StructLit {
+        if pa(p) != pa(n) || !same_part(ph(p), ph(n)) || !same_part(pg(p), pg(n)) || pcount(p) != pcount(n) {
+            return false;
+        }
+        for i in 0..pcount(p) {
+            let a = pchild(p, i);
+            let b = pchild(n, i);
+            if pa(a) != pa(b) || !match_node(pb(a), pb(b)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if k == NodeKind::If {
+        return match_node(pa(p), pa(n)) && match_node(pb(p), pb(n)) && match_node(pc(p), pc(n));
+    }
+    if k == NodeKind::While {
+        return pa(p) == pa(n) && match_node(pb(p), pb(n)) && match_node(pc(p), pc(n));
+    }
+    if k == NodeKind::Loop {
+        return pa(p) == pa(n) && match_node(pb(p), pb(n));
+    }
+    if k == NodeKind::Block {
+        return pflags(p) == pflags(n) && match_list(p, n) && match_node(pa(p), pa(n));
+    }
+    if k == NodeKind::ExprStmt {
+        return pb(p) == pb(n) && match_node(pa(p), pa(n));
+    }
+    if k == NodeKind::Let {
+        return match_node(pa(p), pa(n)) && match_node(pb(p), pb(n)) && match_node(pc(p), pc(n));
+    }
+    false
+}
+
+// Optional parts without holes (type arguments, a path's prefix, a let's
+// pattern): both absent, or the same tokens.
+fn same_part(p: i64, n: i64) -> bool {
+    if p == 0 || n == 0 {
+        return p == n;
+    }
+    same_tokens(pstart(p), pend(p), pstart(n), pend(n))
+}
+
+// ---- Replacing ----
+
+// The replacement: its node, its text (SRC[R_START..R_END)), its holes'
+// nodes in order, and the level each of its nodes needs.
+static mut R_ROOT: i64 = 0;
+static mut R_START: i64 = 0;
+static mut R_END: i64 = 0;
+static mut R_HOLES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut R_LEVELS: *i64 = 0 as *i64;
+static mut P_LEVELS: *i64 = 0 as *i64;
+static mut STMTS: bool = false;
+
+// The list node holding replacement node q as an element, and its index
+// (-1 when none).
+fn list_of(q: i64, index: *i64) -> i64 {
+    unsafe {
+        for n in 1..PARSED_COUNT {
+            if pstart(n) < R_START || pend(n) > R_END {
+                continue;
+            }
+            let k = pk(n);
+            if k != NodeKind::Call && k != NodeKind::MethodCall && k != NodeKind::Tuple && k != NodeKind::Array {
+                continue;
+            }
+            for i in 0..pcount(n) {
+                if pchild(n, i) == q {
+                    *index = i;
+                    return n;
+                }
+            }
+        }
+        -1
+    }
+}
+
+// The level of what hole h matched (99: arguments).
+fn bound_level(h: i64) -> i64 {
+    unsafe {
+        let n = B_NODE.data[h];
+        if n < 0 { 99 } else { binding_level(n) }
+    }
+}
+
+// The text replacing the site, from the holes' bindings, into a buffer.
+fn replacement_text() -> i64 {
+    unsafe {
+        let out = buf_new();
+        let mut cur = R_START;
+        for i in 0..R_HOLES.count {
+            let q = R_HOLES.data[i];
+            let h = hole_of(q);
+            let mut from = pstart(q);
+            let mut to = pend(q);
+            if H_REST.data[h] != 0 && B_NODE.data[h] == -3 {
+                // (no arguments: the hole goes, with a comma next to it)
+                let mut k = 0;
+                let list = list_of(q, &k);
+                if list >= 0 && pcount(list) > 1 {
+                    if k > 0 {
+                        from = pend(pchild(list, k - 1));
+                    } else {
+                        to = pstart(pchild(list, 1));
+                    }
+                }
+                if from < cur {
+                    from = cur;
+                }
+                buf_bytes(out, SRC[cur..from]);
+                cur = to;
+                continue;
+            }
+            buf_bytes(out, SRC[cur..from]);
+            let wrap = H_REST.data[h] == 0 && bound_level(h) < R_LEVELS[q];
+            if wrap {
+                buf_byte(out, '(');
+            }
+            buf_bytes(out, SRC[B_START.data[h]..B_END.data[h]]);
+            if wrap {
+                buf_byte(out, ')');
+            }
+            cur = to;
+        }
+        buf_bytes(out, SRC[cur..R_END]);
+        out
+    }
+}
+
+// The level of the replacement as a whole, at the site being replaced.
+fn replacement_level() -> i64 {
+    let h = hole_of(unsafe { R_ROOT });
+    if h >= 0 {
+        return bound_level(h);
+    }
+    binding_level(unsafe { R_ROOT })
+}
+
+// ---- The command ----
+
+pub fn run_rewrite(argc: i64, argv: **u8) -> i64 {
+    let status = run_rewrite_inner(argc, argv);
+    write_diags();
+    status
+}
+
+fn usage(message: *u8) -> i64 {
+    unsafe {
+        let d = diag(c"error", c"rewrite.usage");
+        buf_str(d, message);
+        buf_byte(d, '\n');
+        let out = try_rewrite(c"grow($v, $n)", c"$v.reserve($n)");
+        buf_str(out, c" --where '$v: IntVec' --dry-run");
+        put_root(out);
+        try_end(out);
+        2
+    }
+}
+
+// Starts a `try:` line `PROG rewrite PATTERN REPLACEMENT`; options and
+// put_root follow.
+fn try_rewrite(pattern: *u8, replacement: *u8) -> i64 {
+    unsafe {
+        let out = diags();
+        buf_str(out, c"try:");
+        put_cword(out, PROG);
+        buf_str(out, c" rewrite");
+        put_word(out, c_slice(pattern));
+        put_word(out, c_slice(replacement));
+        out
+    }
+}
+
+// Whether text (trimmed) is statements: it ends with `;` or starts with
+// `let `.
+fn is_statement(text: *u8) -> bool {
+    unsafe {
+        let s = c_slice(text);
+        let mut a = 0;
+        let mut b = s.len;
+        while a < b && (s[a] == ' ' || s[a] == '\n' || s[a] == '\t') {
+            a += 1;
+        }
+        while b > a && (s[b - 1] == ' ' || s[b - 1] == '\n' || s[b - 1] == '\t') {
+            b -= 1;
+        }
+        (b > a && s[b - 1] == ';') || (b - a > 4 && s[a] == 'l' && s[a + 1] == 'e' && s[a + 2] == 't' && s[a + 3] == ' ')
+    }
+}
+
+// --where `$x: T` (several: `$x: T, $y: U`): the holes' types. False
+// after the diagnostic.
+fn take_where(w: *u8) -> bool {
+    unsafe {
+        let s = c_slice(w);
+        let mut i = 0;
+        while i < s.len {
+            while i < s.len && (s[i] == ' ' || s[i] == ',') {
+                i += 1;
+            }
+            if i >= s.len {
+                break;
+            }
+            if s[i] != '$' {
+                usage(c"--where takes '$x: TYPE' (several: '$x: T, $y: U')");
+                return false;
+            }
+            let mut e = i + 1;
+            while e < s.len && is_name_byte(s[e]) {
+                e += 1;
+            }
+            let name = s[i..e];
+            let mut c = e;
+            while c < s.len && s[c] == ' ' {
+                c += 1;
+            }
+            if c >= s.len || s[c] != ':' {
+                usage(c"--where takes '$x: TYPE' (several: '$x: T, $y: U')");
+                return false;
+            }
+            // (the type: to the next `, $`, spaces dropped)
+            let mut t = c + 1;
+            let ty = buf_new();
+            while t < s.len && !(s[t] == ',' && next_is_hole(s, t + 1)) {
+                if s[t] != ' ' {
+                    buf_byte(ty, s[t]);
+                }
+                t += 1;
+            }
+            let h = hole_named(name, false);
+            if h < 0 {
+                let d = diag(c"error", c"rewrite.usage");
+                buf_str(d, c"--where names ");
+                buf_bytes(d, name);
+                buf_str(d, c", which the pattern has not (or has as '");
+                buf_bytes(d, name);
+                buf_str(d, c"...')\n");
+                return false;
+            }
+            H_TYPE.data[h] = ty;
+            i = t;
+        }
+        true
+    }
+}
+
+fn next_is_hole(s: [u8], from: i64) -> bool {
+    let mut i = from;
+    while i < s.len && s[i] == ' ' {
+        i += 1;
+    }
+    i < s.len && s[i] == '$'
+}
+
+fn run_rewrite_inner(argc: i64, argv: **u8) -> i64 {
+    unsafe {
+        set_command(argc, argv);
+        PROG = argv[0];
+        TOOL = 0 as *u8;
+        let mut root = 0 as *u8;
+        let mut words = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut wheres = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut i = 2;
+        while i < argc {
+            let a = argv[i];
+            if streq(a, c"--where") && i + 1 < argc {
+                wheres.push(argv[i + 1] as i64);
+                i += 2;
+                continue;
+            }
+            if streq(a, c"--in") && i + 1 < argc {
+                OPT_IN = argv[i + 1];
+                i += 2;
+                continue;
+            }
+            if take_edit_option(argc, argv, &i, &root) {
+                i += 1;
+                continue;
+            }
+            if a[0] == '-' && a[1] == '-' {
+                let d = diag(c"error", c"rewrite.usage");
+                buf_str(d, c"unknown option '");
+                buf_str(d, a);
+                buf_str(d, c"' (--where, --in, --dry-run, --no-check, --root)\n");
+                return 2;
+            }
+            words.push(a as i64);
+            i += 1;
+        }
+        if words.count == 3 && root == 0 as *u8 && crate::query::ends_with_c(words.data[2] as *u8, c".tach") {
+            root = words.data[2] as *u8;
+            words.count = 2;
+        }
+        if words.count != 2 {
+            return usage(if words.count < 2 { c"a PATTERN and a REPLACEMENT are needed" } else { c"one PATTERN and one REPLACEMENT" });
+        }
+        let pattern = words.data[0] as *u8;
+        let replacement = words.data[1] as *u8;
+        ROOT_GIVEN = root;
+        root = root_or_diag(root, c"rewrite", c_slice(pattern), true);
+        if root == 0 as *u8 {
+            return 2;
+        }
+        KEEP_PARSED = true;
+        if !load_program(root, TARGET) {
+            program_errors(c"error", root, true);
+            return 1;
+        }
+        if OPT_IN != 0 as *u8 && !resolve_in(c_slice(OPT_IN)) {
+            let d = diag(c"error", c"rewrite.bad-in");
+            buf_str(d, c"no file or module '");
+            buf_str(d, OPT_IN);
+            buf_str(d, c"' in the program\n");
+            return 1;
+        }
+        let program_end = PARSED_COUNT;
+        note_clones(program_end, crate::ast::NODE_COUNT);
+        // The pattern, then the replacement.
+        STMTS = is_statement(pattern);
+        let ptext = buf_new();
+        if !holes_to_idents(pattern, ptext, true) {
+            return 2;
+        }
+        let rtext = buf_new();
+        if !holes_to_idents(replacement, rtext, false) {
+            return 2;
+        }
+        for w in 0..wheres.count {
+            if !take_where(wheres.data[w] as *u8) {
+                return 2;
+            }
+        }
+        let pfirst = PARSED_COUNT;
+        let mut proot = parse_text(ptext, STMTS, c"pattern");
+        if proot == 0 {
+            return 2;
+        }
+        if STMTS {
+            // (one statement)
+            if pcount(proot) != 1 {
+                let d = diag(c"error", c"rewrite.pattern");
+                buf_str(d, c"the pattern is one statement, or an expression\n");
+                return 2;
+            }
+            proot = pchild(proot, 0);
+        }
+        let plast = PARSED_COUNT;
+        for n in pfirst..plast {
+            if hole_of(n) >= 0 {
+                PAT_HOLES.push(n);
+            }
+        }
+        if hole_of(proot) >= 0 {
+            let d = diag(c"error", c"rewrite.pattern");
+            buf_str(d, c"the pattern is a hole alone: it would match every expression\n");
+            return 2;
+        }
+        if !rest_holes_in_lists(pfirst, plast) {
+            return 2;
+        }
+        let rfirst = PARSED_COUNT;
+        R_ROOT = parse_text(rtext, STMTS, c"replacement");
+        if R_ROOT == 0 {
+            return 2;
+        }
+        let rlast = PARSED_COUNT;
+        if !rest_holes_in_lists(rfirst, rlast) {
+            return 2;
+        }
+        // (the replacement's text: its source, trimmed)
+        R_START = pstart(R_ROOT);
+        R_END = pend(R_ROOT);
+        if STMTS {
+            R_START = if pcount(R_ROOT) > 0 { pstart(pchild(R_ROOT, 0)) } else { R_END };
+        }
+        for n in rfirst..rlast {
+            if hole_of(n) >= 0 && pstart(n) >= R_START && pend(n) <= R_END {
+                R_HOLES.push(n);
+            }
+        }
+        sort_by_start(&R_HOLES);
+        R_LEVELS = slot_levels(rfirst, rlast);
+        P_LEVELS = slot_levels(1, program_end);
+        for _ in 0..H_SYM.count {
+            B_NODE.push(-1);
+            B_START.push(-1);
+            B_END.push(-1);
+        }
+        // The sites: start, end and replacement of each.
+        let mut s_start = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut s_end = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut s_text = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let pkind = pk(proot);
+        for n in 1..program_end {
+            if pk(n) != pkind {
+                continue;
+            }
+            let f = file_of_pos(pstart(n));
+            if FILES[f].path[0] == '<' || !ref_in(pstart(n)) {
+                continue;
+            }
+            for h in 0..H_SYM.count {
+                B_NODE.data[h] = -1;
+            }
+            if !match_node(proot, n) {
+                continue;
+            }
+            let mut text = replacement_text();
+            let mut from = pstart(n);
+            let mut to = pend(n);
+            if !STMTS {
+                if parenthesized(n) {
+                    from += 1;
+                    to -= 1;
+                } else if replacement_level() < P_LEVELS[n] {
+                    let wrapped = buf_new();
+                    buf_byte(wrapped, '(');
+                    buf_bytes(wrapped, buf_slice(text));
+                    buf_byte(wrapped, ')');
+                    text = wrapped;
+                }
+            }
+            s_start.push(from);
+            s_end.push(to);
+            s_text.push(text);
+        }
+        // Outermost first; a site inside another is left.
+        let mut order = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for k in 0..s_start.count {
+            order.push(k);
+        }
+        let v = order.data;
+        for a in 1..order.count {
+            let mut j = a;
+            while j > 0 && (s_start.data[v[j]] < s_start.data[v[j - 1]]
+                || (s_start.data[v[j]] == s_start.data[v[j - 1]] && s_end.data[v[j]] > s_end.data[v[j - 1]])) {
+                let t = v[j];
+                v[j] = v[j - 1];
+                v[j - 1] = t;
+                j -= 1;
+            }
+        }
+        let mut sites = 0;
+        let mut nested = 0;
+        let mut files = 0;
+        let mut last_end = -1;
+        let mut last_file = -1;
+        for a in 0..order.count {
+            let k = v[a];
+            if s_start.data[k] < last_end {
+                nested += 1;
+                continue;
+            }
+            edit_replace(s_start.data[k], s_end.data[k], s_text.data[k]);
+            last_end = s_end.data[k];
+            sites += 1;
+            let f = file_of_pos(s_start.data[k]);
+            if f != last_file {
+                files += 1;
+                last_file = f;
+            }
+        }
+        if sites == 0 {
+            let d = diag(c"note", c"rewrite.none");
+            buf_str(d, c"nothing matches '");
+            buf_str(d, pattern);
+            buf_str(d, c"'\n");
+            notes(pattern, replacement);
+            return 0;
+        }
+        if nested > 0 {
+            let d = diag(c"note", c"rewrite.nested");
+            buf_int(d, nested);
+            buf_str(d, if nested == 1 { c" site inside a rewritten one is" } else { c" sites inside rewritten ones are" });
+            buf_str(d, c" left; run the rewrite again\n");
+        }
+        notes(pattern, replacement);
+        let what = buf_new();
+        buf_str(what, c"rewrote ");
+        buf_int(what, sites);
+        buf_str(what, if sites == 1 { c" site in " } else { c" sites in " });
+        buf_int(what, files);
+        buf_str(what, if files == 1 { c" file" } else { c" files" });
+        apply_edit(buf_slice(what), root)
+    }
+}
+
+// The notes on sites left out: for their types (with the command that
+// takes the first one's type), for code the checker did not see.
+fn notes(pattern: *u8, replacement: *u8) {
+    unsafe {
+        if TYPE_MISSES > 0 {
+            let d = diag(c"note", c"rewrite.types");
+            buf_int(d, TYPE_MISSES);
+            buf_str(d, if TYPE_MISSES == 1 { c" site matches" } else { c" sites match" });
+            buf_str(d, c" but for --where; first: ");
+            buf_bytes(d, buf_slice(H_NAME.data[MISS_HOLE]));
+            buf_str(d, c" is ");
+            buf_type(d, MISS_TYPE);
+            buf_str(d, c" at ");
+            put_loc(d, pstart(MISS_NODE));
+            buf_byte(d, '\n');
+            let out = try_rewrite(pattern, replacement);
+            // (the --where of that type)
+            let w = buf_new();
+            for h in 0..H_SYM.count {
+                if H_TYPE.data[h] < 0 {
+                    continue;
+                }
+                if BUFS[w].len > 0 {
+                    buf_str(w, c", ");
+                }
+                buf_bytes(w, buf_slice(H_NAME.data[h]));
+                buf_str(w, c": ");
+                if h == MISS_HOLE {
+                    buf_type(w, MISS_TYPE);
+                } else {
+                    buf_bytes(w, buf_slice(H_TYPE.data[h]));
+                }
+            }
+            buf_str(out, c" --where");
+            put_word(out, buf_slice(w));
+            if OPT_IN != 0 as *u8 {
+                buf_str(out, c" --in");
+                put_word(out, c_slice(OPT_IN));
+            }
+            buf_str(out, c" --dry-run");
+            put_root(out);
+            try_end(out);
+        }
+        if UNTYPED > 0 {
+            let d = diag(c"note", c"rewrite.untyped");
+            buf_int(d, UNTYPED);
+            buf_str(d, if UNTYPED == 1 { c" site is" } else { c" sites are" });
+            buf_str(d, c" left: the checker gave no type there (a generic function never instantiated)\n");
+        }
+    }
+}
+
+// Each `$x...` of nodes first..last is an element of a list (the
+// arguments of a call, a tuple, an array), one per list. False after the
+// diagnostic.
+fn rest_holes_in_lists(first: i64, last: i64) -> bool {
+    unsafe {
+        let mut rests = 0;
+        let mut listed = 0;
+        for n in first..last {
+            let h = hole_of(n);
+            if h >= 0 && H_REST.data[h] != 0 {
+                rests += 1;
+            }
+            let k = pk(n);
+            if k != NodeKind::Call && k != NodeKind::MethodCall && k != NodeKind::Tuple && k != NodeKind::Array {
+                continue;
+            }
+            let mut here = 0;
+            for i in 0..pcount(n) {
+                let e = hole_of(pchild(n, i));
+                if e >= 0 && H_REST.data[e] != 0 {
+                    here += 1;
+                }
+            }
+            if here > 1 {
+                let d = diag(c"error", c"rewrite.pattern");
+                buf_str(d, c"one $x... per list of arguments\n");
+                return false;
+            }
+            listed += here;
+        }
+        if rests != listed {
+            let d = diag(c"error", c"rewrite.pattern");
+            buf_str(d, c"$x... stands for arguments: write it in the arguments of a call, a tuple or an array\n");
+            return false;
+        }
+        true
+    }
+}
+
+// Sorts nodes by position.
+pub fn sort_by_start(v: *IntVec) {
+    unsafe {
+        let d = (*v).data;
+        for i in 1..(*v).count {
+            let mut j = i;
+            while j > 0 && pstart(d[j]) < pstart(d[j - 1]) {
+                let t = d[j];
+                d[j] = d[j - 1];
+                d[j - 1] = t;
+                j -= 1;
+            }
+        }
+    }
+}

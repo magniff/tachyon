@@ -81,6 +81,10 @@ e.g. `use crate::ir::Op::{Add, Sub};`; 0.8 has no `*` imports, and
 | `edit.tach` | the edit engine (0.11): byte-range replacements applied atomically (checked by the front end before they are written), diffs, the journal; `tachyonc edit`, `undo`, `check` |
 | `fix.tach` | `tachyonc fix` (0.11): missing and unused imports, `pub`, unsafe blocks, wildcard imports, as one edit |
 | `sameout.tach` | `tachyonc same-output` (0.11): this compiler's output against another's, on a corpus |
+| `rewrite.tach` | `tachyonc rewrite` (0.11): typed structural search and replace on the nodes as parsed (see [docs/refactor-shape.md](../docs/refactor-shape.md)) |
+| `refactor_shape.tach` | `tachyonc refactor signature`, `field`, `variant` (0.11): a definition's shape changed with every use |
+| `script.tach` | `tachyonc refactor --script` (0.11): commands run in turn on each other's copies, checked once |
+| `commands.tach` | the table of the commands that change a program (0.11), shared by the command line and scripts |
 | `gen.tach` | the driver of code generation, and the `-O0` code generator: walks the checked AST, in terms of the target interface |
 | `abi.tach` | C's calling convention for aggregates (AArch64 and System V): classification into pieces, locations |
 | `target.tach` | the target interface: targets, the machine model's virtual registers, object-format details (symbols, sections, labels), and dispatch to the instruction set |

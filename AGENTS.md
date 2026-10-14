@@ -20,6 +20,11 @@ sed, head, cat or awk ([docs/query.md](docs/query.md)):
 | the item at a compiler error's position | `target/tachyonc query show FILE:LINE` |
 | replace, add or remove an item by name | `target/tachyonc edit replace NAME < new.tach`, `edit insert --after\|--before NAME`, `edit delete NAME` (`--dry-run` for the diff) |
 | take the last edit back | `target/tachyonc undo` |
+| add, remove, rename, reorder or retype a parameter, with every call | `target/tachyonc refactor signature FN --add 'x: i64 = 0'` (`--remove x`, `--rename-param a b`, `--reorder b,a`, `--type x T`) |
+| add, remove, rename or retype a field, with every literal and access | `target/tachyonc refactor field STRUCT --add 'g: i64 = 0'` (`--remove g`, `--rename g h`, `--type g T`) |
+| add a variant (an arm in each match that needs one), remove, rename one | `target/tachyonc refactor variant ENUM --add 'X(i64)' --arm 'EXPR'` (`--remove V`, `--rename V W`) |
+| replace an idiom everywhere, typed | `target/tachyonc rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: *IntVec' --dry-run` |
+| several changes, checked once, all or nothing | `target/tachyonc refactor --script steps.txt` (one command per line) |
 | the errors, one per line (front end only) | `target/tachyonc check` |
 | missing/unused imports, `pub`, `unsafe` blocks | `target/tachyonc fix` (`--only imports,unused,pub,unsafe`, `--in FILE\|MODULE`, `--dry-run`) |
 | prove a refactoring changed no output | `target/tachyonc same-output OLD_TACHYONC` |
