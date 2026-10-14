@@ -440,7 +440,7 @@ the one hole in safe code (no lifetimes).
 | `unknown type 'String'` (or `char`, `Box`) | `[u8]`, `u8`, `*T` or `Vec<T>` |
 | `expected type, got '&'` | `*T` for `&T` and `&mut T` |
 | `expected identifier, got '&'` in `fn f(&self)` | `self: *T` |
-| `closures are not implemented yet` | (0.14 in progress) a named `fn`, or a loop |
+| `cannot infer the type of closure parameter 'x'` | `\|x: i64\| ...`, or pass it where an `Fn` bound or `fn` type gives it |
 | `'?' is reserved for future use` | `match` on the `Result` |
 | `expected ';', got '!'` | no macros: `println(...)`, `std::print_int(...)` |
 | `cannot assign to immutable variable 'x'` | `let mut x` |

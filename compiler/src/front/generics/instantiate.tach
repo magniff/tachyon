@@ -21,7 +21,7 @@ use crate::front::check::{Res, SELF_TYPE, SELF_TYPE_SYM};
 use crate::front::check::collect::{add_fn, template_of_type_node};
 use crate::front::check::resolve::{resolve_signature, resolve_type, type_name_key};
 use crate::front::check::synth_mode::synth_expr;
-use crate::front::closures::{infer_closure_arg, is_deferred_arg};
+use crate::front::closures::{infer_closure_arg, infer_from_fn_bound, is_deferred_arg};
 use crate::front::generics::{
     CUR_INST, INST_QUEUE, MAX_INST_DEPTH, TPL_NONE, check_targ_depth, env_enter, env_leave,
     env_lookup, generic_symbol, hint_for, instance_of, instance_targs, is_untyped_literal_expr,
@@ -39,7 +39,7 @@ use std::Option;
 
 // Bindings of the parameters `params` (a Generics node) being inferred:
 // bound[i] is the type of parameter i, 0 while unknown.
-fn tparam_index(params: i64, name: i64) -> Option<i64> {
+pub fn tparam_index(params: i64, name: i64) -> Option<i64> {
     if params == 0 {
         return Option::None;
     }
@@ -64,7 +64,7 @@ fn is_self_name(p: i64) -> bool {
 }
 
 // Whether type node p (of a template) mentions a parameter not yet bound.
-fn mentions_unbound(params: i64, bound: *i64, p: i64) -> bool {
+pub fn mentions_unbound(params: i64, bound: *i64, p: i64) -> bool {
     unsafe {
         if p == 0 {
             return false;
@@ -269,6 +269,7 @@ fn infer_from(params: i64, bound: *i64, tmod: i64, args: i64, first: i64, types:
                 if is_deferred_arg(arg) {
                     if pass == 2 {
                         infer_closure_arg(params, bound, tmod, arg, p);
+                        mark_synthed(arg);
                     }
                     continue;
                 }
@@ -287,6 +288,7 @@ fn infer_from(params: i64, bound: *i64, tmod: i64, args: i64, first: i64, types:
             }
         }
         for k in 0..NODES[params].count {
+            infer_from_fn_bound(params, bound, tmod, k);
             infer_from_assoc(params, bound, tmod, k);
         }
     }
@@ -345,7 +347,6 @@ pub fn fn_instance(tf: i64, mark: i64, origin: i64) -> i64 {
         }
         let targs = take_targs(mark);
         let template = FNS[tf].node;
-        check_bounds(NODES[template].g, targs, count, FNS[tf].display, NODES[origin].start);
         let item = clone_node(template);
         NODES[item].g = 0;
         add_fn(item, generic_symbol(FNS[tf].name, targs, count), 0);
@@ -371,6 +372,9 @@ pub fn fn_instance(tf: i64, mark: i64, origin: i64) -> i64 {
             SELF_TYPE = 0;
         }
         FNS[f].self_ty = SELF_TYPE;
+        // (0.14: checked with the parameters and `Self` of the instance in
+        // scope, which an `Fn(Self::Item)` bound names)
+        check_bounds(NODES[template].g, targs, count, FNS[tf].display, NODES[origin].start);
         FNS[f].display = instance_display(f, tf);
         resolve_signature(f);
         // Found from now on (not when its signature failed to resolve).
@@ -524,6 +528,17 @@ pub fn infer_struct_literal(s: i64, n: i64, expected: i64) -> i64 {
                     continue;
                 }
                 let value = NODES[init].b;
+                // (0.14: a closure, from the field's bound, after the rest)
+                if is_deferred_arg(value) {
+                    if pass == 1 {
+                        let saved_self = UNIFY_SELF;
+                        UNIFY_SELF = 0;
+                        infer_closure_arg(params, bound, STRUCTS[s].module, value, NODES[field].b);
+                        UNIFY_SELF = saved_self;
+                        mark_synthed(value);
+                    }
+                    continue;
+                }
                 if pass == 0 && is_untyped_literal_expr(value) {
                     continue;
                 }

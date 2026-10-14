@@ -10,9 +10,9 @@ use crate::base::diag::{
 use crate::front::ast::{BLOCK_UNSAFE, FN_LAZY, FN_UNSAFE, NODES, child};
 use crate::front::ast::NodeKind::{Block, Defer, Ident, Let, Loop, PatTuple, Path, Range, While};
 use crate::front::check::{
-    DEFER_LOOP_BASE, ENV, LOCALS, LOCAL_COUNT, LOOP_STACK, RETURN_TYPE, SCOPES, SELF_TYPE,
-    define_local, lookup_local, mismatch_error, name_error, poison_statement, pop_scope, push_scope,
-    restore_check_state, save_check_state, type_error, type_error_got,
+    CUR_FN, DEFER_LOOP_BASE, ENV, LOCALS, LOCAL_COUNT, LOOP_BASE, LOOP_STACK, RETURN_TYPE, SCOPES,
+    SELF_TYPE, define_local, lookup_local, mismatch_error, name_error, poison_statement, pop_scope,
+    push_scope, restore_check_state, save_check_state, type_error, type_error_got,
 };
 use crate::front::check::check_mode::check_expr;
 use crate::front::check::iterate::check_for_iter;
@@ -47,6 +47,12 @@ pub fn check_function(item: i64) {
         }
         SELF_TYPE = FNS[f].self_ty;
         RETURN_TYPE = FNS[f].ret;
+        // (0.14: for the closures in it; a lazy default is checked inside
+        // another function)
+        let saved_fn = CUR_FN;
+        let saved_base = LOOP_BASE;
+        CUR_FN = f;
+        LOOP_BASE = 0;
         LOOP_STACK.count = 0;
         DEFER_LOOP_BASE = -1;
         ENV.count = 0;
@@ -78,6 +84,8 @@ pub fn check_function(item: i64) {
             err_end();
         }
         SELF_TYPE = 0;
+        CUR_FN = saved_fn;
+        LOOP_BASE = saved_base;
         if FNS[f].tmpl != 0 {
             env_leave(saved_env);
         }
@@ -289,6 +297,17 @@ fn leave_defer_error(n: i64, keyword: *u8) {
     }
 }
 
+// (0.14) A closure's body is a function of its own.
+fn leave_closure_error(n: i64, keyword: *u8) {
+    unsafe {
+        err_begin(NODES[n].start);
+        err_str(c"'");
+        err_str(keyword);
+        err_str(c"' cannot leave a closure (its body is a function of its own)");
+        err_end();
+    }
+}
+
 // The loop a `break`/`continue` refers to.
 pub fn find_loop(n: i64, keyword: *u8) -> i64 {
     unsafe {
@@ -300,6 +319,9 @@ pub fn find_loop(n: i64, keyword: *u8) -> i64 {
                 err_str(c" outside of loop");
                 err_end();
             }
+            if LOOP_BASE >= LOOP_STACK.count {
+                leave_closure_error(n, keyword);
+            }
             if DEFER_LOOP_BASE >= LOOP_STACK.count {
                 leave_defer_error(n, keyword);
             }
@@ -309,6 +331,9 @@ pub fn find_loop(n: i64, keyword: *u8) -> i64 {
         while i >= 0 {
             let lp = LOOP_STACK.data[i];
             if NODES[lp].a == label {
+                if LOOP_BASE > i {
+                    leave_closure_error(n, keyword);
+                }
                 if DEFER_LOOP_BASE > i {
                     leave_defer_error(n, keyword);
                 }

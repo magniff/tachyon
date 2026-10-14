@@ -39,13 +39,23 @@ error[parser error] expected identifier, got '&'
 `self: P` for a copy.
 
 ```tach
-let f = |x: i64| x + 1;
+let f = |x| x + 1;
 ```
 ```err
-error[type error] closures are not implemented yet (check.unimplemented)
+error[type error] cannot infer the type of closure parameter 'x' | help: write its type: '|x: i64| ...'
 ```
-(0.14 in progress: closures parse, and are checked once implemented.) Until
-then: a named `fn`, passed as `fn(i64) -> i64`, or a loop.
+A closure's parameter types come from where it is passed (an `fn(..)`
+type, an `F: Fn(..)` bound) or are written: `|x: i64| x + 1`.
+
+```tach
+fn call(f: fn(i64) -> i64) -> i64 { f(1) }
+fn main() { let k = 2; call(|x| x + k); }
+```
+```err
+error[type error] a closure that captures variables cannot be a 'fn(i64) -> i64' (it captures 'k') | help: make the parameter generic: `fn apply<F: Fn(i64) -> i64>(f: F)`
+```
+Only a closure that captures nothing becomes a `fn`; take any other as
+a generic `F: Fn(i64) -> i64` (`FnMut` if it assigns what it captures).
 
 ```tach
 fn f(r: Result<i64, i64>) -> Result<i64, i64> { let x = r?; Ok(x) }
