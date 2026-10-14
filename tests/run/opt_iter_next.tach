@@ -1,0 +1,167 @@
+// 0.14: iterators driven by `next`, hand-desugared as the front end makes
+// them: `for x in it` is `loop { match it.next() { Some(x) => .., None =>
+// break } }`. Once `next` is inlined, each of its returns builds the
+// Option's tag as a constant: the match is threaded on it (tags.tach), and
+// a loop testing `n != 0` and then `pos < len` (take over a slice) is made
+// a counted loop of the smaller trip count (exits.tach), which the
+// vectorizer takes like the hand-written one. The fold of max keeps an
+// Option in its accumulator: threaded too, a plain maximum.
+// EXPECT: 124750 124750
+// EXPECT: 499500 499500
+// EXPECT: 999 999
+// CHECK: fn take_sum:
+// CHECK-NOT: switch
+// CHECK-NOT: u8 = phi
+// CHECK: v2i64 = load
+// CHECK-NOT: u8 = phi
+// CHECK: fn map_sum_next:
+// CHECK-NOT: switch
+// CHECK: v2i64 = load
+// CHECK-NOT: u8 = phi
+// CHECK: fn max_fold:
+// CHECK-NOT: switch
+// CHECK-NOT: u8 = phi
+// CHECK: fn main:
+struct SliceIter { s: [i64], pos: i64 }
+
+impl SliceIter {
+    #[inline]
+    fn next(self: *SliceIter) -> Option<i64> {
+        if self.pos < self.s.len {
+            let x = self.s[self.pos];
+            self.pos += 1;
+            Some(x)
+        } else {
+            None
+        }
+    }
+    #[inline]
+    fn fold<B, G>(self: SliceIter, init: B, g: G) -> B {
+        let mut acc = init;
+        for k in self.pos..self.s.len {
+            acc = g.call(acc, self.s[k]);
+        }
+        acc
+    }
+}
+
+struct Take<I> { it: I, n: i64 }
+
+impl<I> Take<I> {
+    #[inline]
+    fn next(self: *Take<I>) -> Option<i64> {
+        if self.n == 0 {
+            None
+        } else {
+            self.n -= 1;
+            self.it.next()
+        }
+    }
+}
+
+struct Map<I, F> { it: I, f: F }
+
+impl<I, F> Map<I, F> {
+    #[inline]
+    fn next(self: *Map<I, F>) -> Option<i64> {
+        match self.it.next() {
+            Some(x) => Some(self.f.call(x)),
+            None => None,
+        }
+    }
+}
+
+struct Triple {}
+
+impl Triple {
+    fn call(self: *Triple, x: i64) -> i64 {
+        x * 3
+    }
+}
+
+struct MaxFold {}
+
+impl MaxFold {
+    fn call(self: *MaxFold, best: Option<i64>, x: i64) -> Option<i64> {
+        match best {
+            None => Some(x),
+            Some(m) => Some(if x > m { x } else { m }),
+        }
+    }
+}
+
+#[inline]
+fn iter(v: *Vec<i64>) -> SliceIter {
+    SliceIter { s: v.as_slice(), pos: 0 }
+}
+
+#[inline]
+fn take<I>(it: I, n: i64) -> Take<I> {
+    Take { it: it, n: n }
+}
+
+#[inline]
+fn map<I, F>(it: I, f: F) -> Map<I, F> {
+    Map { it: it, f: f }
+}
+
+// for x in v.iter().take(n) { t += x }
+#[inline(never)]
+fn take_sum(v: *Vec<i64>, n: i64) -> i64 {
+    let mut t = 0;
+    {
+        let mut for_iter = take(iter(v), n);
+        loop {
+            let x = match for_iter.next() {
+                Some(item) => item,
+                None => break,
+            };
+            t += x;
+        }
+    }
+    t
+}
+
+// v.iter().map(|x| x * 3), summed by `while let`
+#[inline(never)]
+fn map_sum_next(v: *Vec<i64>) -> i64 {
+    let mut it = map(iter(v), Triple {});
+    let mut s = 0;
+    while let Some(x) = it.next() {
+        s = s + x;
+    }
+    s
+}
+
+// v.iter().max().unwrap_or(-1), on fold
+#[inline(never)]
+fn max_fold(v: *Vec<i64>) -> i64 {
+    let none: Option<i64> = None;
+    iter(v).fold(none, MaxFold {}).unwrap_or(-1)
+}
+
+fn main() -> i32 {
+    let mut v: Vec<i64> = Vec::new();
+    defer v.free();
+    for i in 0..1000 {
+        v.push(i);
+    }
+    let s = v.as_slice();
+    let mut hand = 0;
+    for k in 0..500 {
+        hand += s[k];
+    }
+    std::print_int(take_sum(&v, 500));
+    print(" ");
+    std::print_int(hand);
+    println("");
+    std::print_int(map_sum_next(&v) / 3);
+    print(" ");
+    std::print_int(take_sum(&v, 5000));
+    println("");
+    std::print_int(max_fold(&v));
+    print(" ");
+    std::print_int(take_sum(&v, 1) + 999);
+    println("");
+    0
+}

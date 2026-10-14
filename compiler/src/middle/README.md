@@ -20,6 +20,9 @@ again. `back` takes the optimized IR.
 | `gvn.tach` | global value numbering, alias analysis, memory forwarding, dead stores |
 | `egraph.tach` | rewrite rules by equality saturation, inside GVN |
 | `sroa.tach` | scalar replacement of aggregates, constant tables |
+| `copies.tach` | copy elision: a slot copied once into another (or a field of one) is that part (0.14) |
+| `tags.tach` | jump threading on constant tags: `match it.next()` once `next` is inlined (0.14) |
+| `exits.tach` | loops with several counted exits made counted loops; equal induction variables merged (0.14) |
 | `adce.tach` | aggressive dead code elimination over control dependence |
 | `inline.tach` | inlining over the call graph's components |
 | `ipo.tach` | interprocedural attributes, constant propagation, devirtualization, heap to stack |

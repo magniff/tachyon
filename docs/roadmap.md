@@ -768,6 +768,98 @@ From here a feature new in release N enters the compiler's own source in N+1
 - after 0.18 the type system has settled: the language specification is
   written (see "Toward 1.0")
 
+## After 0.18: a standard library, and a real program on it
+
+Planned with the user on 2026-10-14, to start once 0.18 has shipped. The
+standard library is built with the language of 0.15–0.18 (allocators in
+effects, mutable value semantics, contracts), measured against Rust's and
+C's, and proven on a real program: a GPU-rendered terminal emulator,
+shipped as an example (not a release goal of its own). Each release may
+split into .x releases rather than be rushed.
+
+## 0.19: collections, text and I/O
+
+- collections, each allocator-aware (0.16), with value semantics (0.17),
+  iterators, `derive`d traits and contracts:
+  - `Vec` (reworked);
+  - `VecDeque`;
+  - `HashMap` and `HashSet`: an open-addressing, SIMD-probed table, with
+    a seeded hash where inputs are untrusted;
+  - `BTreeMap` and `BTreeSet`;
+  - `BinaryHeap`;
+  - a small-vector and a bitset;
+  - stable and unstable sorts, binary search;
+- text:
+  - an owned UTF-8 `String` and `str` views;
+  - chars, graphemes and display width (needed by the terminal);
+  - formatting and parsing of numbers and floats (shortest round-trip);
+  - interpolation (0.15) on top of it;
+- I/O and the system:
+  - files, buffered readers and writers, paths, directories, environment;
+  - processes and pipes; time and clocks; random numbers;
+  - `std::io` errors with `?` (0.15);
+- benchmarks against Rust's std and C on the same operations (a bench/
+  pair each); a property test per collection against a model (0.18)
+
+## 0.20: concurrency, atomics and synchronization
+
+- threads: `spawn`/`join`, scoped threads that may borrow the parent's
+  values (second-class references, 0.17), thread-locals
+- atomics on integers and pointers with C11 orderings (`Relaxed`,
+  `Acquire`, `Release`, `AcqRel`, `SeqCst`), compare-exchange and fences,
+  lowered to arm64's LDAR/STLR/LSE and x86's locked instructions
+- synchronization: `Mutex` (owning its data), `RwLock`, `Condvar`,
+  `Once`/lazy statics, `Barrier`, a semaphore; channels (unbounded and
+  bounded MPSC, MPMC); a work-stealing thread pool and parallel iterators
+- no data races in safe code, so no UB: what may cross threads is
+  inferred like Rust's Send/Sync, from value semantics and effects
+  (`thread` and `sync` effects, `query effects` shows them); shared
+  mutable state only through atomics and locks
+- testing built in: a schedule-exploring checker for small concurrent
+  tests (in the manner of loom) and a race-detecting build mode; the
+  fuzzer gains threads
+
+## 0.21: GPU support
+
+- a native `gpu` library: wgpu's model (instance, adapter, device, queue,
+  buffers, textures, samplers, bind groups, render and compute pipelines,
+  command encoders, surfaces), but designed for tachyon rather than
+  ported: resources as values with destructors (0.17), allocation through
+  allocators (0.16), effects for what touches the device, traits for the
+  backend interface, contracts for the validation rules
+- backends: Metal first (macOS is the main platform), Vulkan second
+  (Linux); through C interop: `import "..." as` for Vulkan and the
+  Objective-C runtime for Metal (`objc_msgSend` behind typed bindings)
+- shaders: a WGSL subset compiled by a tachyon library to MSL and SPIR-V
+  (a translator in the manner of naga; a compiler workload that dogfoods
+  the language)
+- tested headless: compute kernels against CPU results, render passes
+  read back and compared with reference images
+
+## 0.22: windows and input in std, and a terminal emulator
+
+- a `window` library in std, in the manner of winit: an event loop,
+  windows with a GPU surface (0.21), keyboard (with modifiers and text
+  input), mouse, resize, high-DPI scale, a frame clock, clipboard; Cocoa
+  on macOS, Wayland then X11 on Linux
+- the terminal emulator, an example program (`examples/term`) that
+  proves the standard library:
+  - a pty and a child shell, its I/O on its own thread (0.20);
+  - an xterm-compatible escape-sequence parser (a state machine in the
+    manner of vte), a grid with scrollback, alternate screen, 256 and
+    true colours, attributes, wide and combining characters (0.19's
+    display width), resize and reflow;
+  - rendering: fonts rasterized through the platform (Core Text,
+    FreeType) into a glyph atlas, one instanced draw of the cells per
+    frame, damage tracking so idle costs nothing;
+  - input: keys with modifiers, mouse reporting, bracketed paste,
+    selection and copy;
+  - measured against Alacritty on the same machine (input latency, `cat`
+    throughput, memory, frame time); the parser fuzzed with a reference
+    terminal's state as the oracle
+- what writing it reveals feeds the surface-language rework of "Toward
+  1.0"
+
 ## Toward 1.0
 
 1.0 is not a feature milestone: it ships when the language is thought

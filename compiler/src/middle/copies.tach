@@ -1,0 +1,250 @@
+// Copy elision (0.14): a whole frame slot copied into another (all of it,
+// or a part at a constant offset: a field), by a copy that runs once (in
+// no loop), where the source is only used before the copy, and the part
+// of the destination only after it, is that part: the source's uses use
+// it, and the copy goes. Adapters taking `self: Self` make these chains:
+// each level of an iterator chain copies the level below into its own
+// struct (memcpy calls above INLINE_COPY_MAX bytes, which scalar
+// replacement does not look through). Neither slot's address may escape
+// (gvn.tach's find_escaping_slots).
+
+use crate::base::IntVec;
+
+use crate::middle::ir::{
+    BLOCKS, INSTS, IRF, IRFUNCS, Op, SLOTS, ir_arg, ir_insert_before, ir_make, ir_operand,
+    ir_operand_count, ir_unlink, ir_val,
+};
+
+use crate::middle::gvn::{address_base, copy_dst, copy_src, find_escaping_slots, is_copy, root_of};
+
+use crate::middle::opt::{dominates, resolve_all};
+
+use crate::front::types::{TY_U64, type_size};
+use crate::middle::loops::{analyze_loops, innermost_loop};
+
+// (slot, user instruction) for every use of a slot's address.
+static mut USES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// The copies that are candidates.
+static mut CANDIDATES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The slot that address v is the start of (a SLOT instruction), or -1.
+fn whole_slot(v: i64) -> i64 {
+    unsafe {
+        let x = ir_val(v);
+        if INSTS[x].op == Op::Slot { INSTS[x].imm } else { -1 }
+    }
+}
+
+// The slot address v points into at a constant offset (in *offset), or -1.
+fn slot_at(v: i64, offset: *i64) -> i64 {
+    unsafe {
+        let base = address_base(ir_val(v), offset);
+        if INSTS[base].op == Op::Slot { INSTS[base].imm } else { -1 }
+    }
+}
+
+// The size copy v moves (a constant).
+fn copy_size(v: i64) -> i64 {
+    unsafe {
+        if INSTS[v].op == Op::Copy { INSTS[v].imm } else { INSTS[ir_val(ir_arg(v, 2))].imm }
+    }
+}
+
+// Whether instruction u comes strictly before instruction v (u's block
+// dominates v's; INSTS[].aux numbers each block's instructions).
+fn before(u: i64, v: i64) -> bool {
+    unsafe {
+        let bu = INSTS[u].block;
+        let bv = INSTS[v].block;
+        if bu == bv { INSTS[u].aux < INSTS[v].aux } else { dominates(bu, bv) }
+    }
+}
+
+// Whether instruction u accesses no byte of slot d in [lo, hi): a load,
+// store or copy at constant offsets elsewhere (an address computation is
+// not an access: its own uses are).
+fn misses(u: i64, d: i64, lo: i64, hi: i64) -> bool {
+    unsafe {
+        let op = INSTS[u].op;
+        if op == Op::Add {
+            return true;
+        }
+        let mut addrs = 0;
+        let mut size = 0;
+        if op == Op::Load {
+            addrs = 1;
+            size = type_size(INSTS[u].ty);
+        } else if op == Op::Store {
+            addrs = 1;
+            size = type_size(INSTS[u].imm2);
+        } else if is_copy(u) {
+            addrs = 2;
+            size = copy_size(u);
+        } else {
+            return false;
+        }
+        for k in 0..addrs {
+            let a = if op == Op::Load || op == Op::Store { INSTS[u].a }
+                else if k == 0 { copy_dst(u) } else { copy_src(u) };
+            let root = root_of(ir_val(a));
+            if root == 0 || INSTS[root].op != Op::Slot || INSTS[root].imm != d {
+                continue;
+            }
+            let mut offset = 0;
+            if slot_at(a, &offset) != d {
+                return false;
+            }
+            if op == Op::Load || op == Op::Store {
+                offset += INSTS[u].imm;
+            }
+            if offset < hi && offset + size > lo {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// Whether copy c of slot s to slot d at `offset` can be elided: every
+// other use of s comes before it, every use of d's part after it (or
+// before, elsewhere in d).
+fn elidable(c: i64, s: i64, d: i64, offset: i64) -> bool {
+    unsafe {
+        let n = SLOTS[s].size;
+        for k in 0..USES.count / 2 {
+            let slot = USES.data[2 * k];
+            let u = USES.data[2 * k + 1];
+            if u == c || INSTS[u].block == 0 {
+                continue;
+            }
+            if slot == s && !before(u, c) {
+                return false;
+            }
+            if slot == d && !before(c, u) && !(before(u, c) && misses(u, d, offset, offset + n)) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// Slot s becomes the part of slot d at `offset`: its SLOT instructions
+// compute that address.
+fn place_slot(fi: i64, s: i64, d: i64, offset: i64) {
+    unsafe {
+        for j in 0..IRFUNCS[fi].blocks.count {
+            let b = IRFUNCS[fi].blocks.data[j];
+            if BLOCKS[b].removed != 0 {
+                continue;
+            }
+            let mut v = BLOCKS[b].first;
+            while v != 0 {
+                if INSTS[v].op == Op::Slot && INSTS[v].imm == s {
+                    if offset == 0 {
+                        INSTS[v].imm = d;
+                    } else {
+                        let base = ir_make(Op::Slot, TY_U64, 0, 0, d);
+                        let k = ir_make(Op::Const, TY_U64, 0, 0, offset);
+                        ir_insert_before(v, base);
+                        ir_insert_before(v, k);
+                        INSTS[base].aux = INSTS[v].aux;
+                        INSTS[k].aux = INSTS[v].aux;
+                        INSTS[v].op = Op::Add;
+                        INSTS[v].a = base;
+                        INSTS[v].b = k;
+                        INSTS[v].imm = 0;
+                    }
+                }
+                v = INSTS[v].next;
+            }
+        }
+        for k in 0..USES.count / 2 {
+            if USES.data[2 * k] == s {
+                USES.data[2 * k] = d;
+            }
+        }
+        if SLOTS[s].align > SLOTS[d].align {
+            SLOTS[d].align = SLOTS[s].align;
+        }
+    }
+}
+
+// Elides the copies of function fi that can be. Returns whether any was.
+pub fn elide_copies(fi: i64) -> bool {
+    unsafe {
+        IRF = fi;
+        CANDIDATES.count = 0;
+        for i in 0..IRFUNCS[fi].blocks.count {
+            let b = IRFUNCS[fi].blocks.data[i];
+            if BLOCKS[b].removed != 0 {
+                continue;
+            }
+            let mut v = BLOCKS[b].first;
+            while v != 0 {
+                if is_copy(v) {
+                    let mut offset = 0;
+                    let d = slot_at(copy_dst(v), &offset);
+                    let s = whole_slot(copy_src(v));
+                    let n = copy_size(v);
+                    if d >= 0 && s >= 0 && d != s && SLOTS[s].size == n
+                        && offset >= 0 && offset + n <= SLOTS[d].size {
+                        CANDIDATES.push(v);
+                    }
+                }
+                v = INSTS[v].next;
+            }
+        }
+        if CANDIDATES.count == 0 {
+            return false;
+        }
+        resolve_all(fi);
+        find_escaping_slots(fi);
+        analyze_loops(fi);
+        // The uses of the slots' addresses; the instructions numbered.
+        USES.count = 0;
+        for i in 0..IRFUNCS[fi].blocks.count {
+            let b = IRFUNCS[fi].blocks.data[i];
+            if BLOCKS[b].removed != 0 {
+                continue;
+            }
+            let mut n = 0;
+            let mut v = BLOCKS[b].first;
+            while v != 0 {
+                INSTS[v].aux = n;
+                n += 1;
+                for k in 0..ir_operand_count(v) {
+                    let w = ir_operand(v, k);
+                    if w == 0 {
+                        continue;
+                    }
+                    let root = root_of(ir_val(w));
+                    if root != 0 && INSTS[root].op == Op::Slot {
+                        USES.push(INSTS[root].imm);
+                        USES.push(v);
+                    }
+                }
+                v = INSTS[v].next;
+            }
+        }
+        let mut changed = false;
+        for i in 0..CANDIDATES.count {
+            let c = CANDIDATES.data[i];
+            let mut offset = 0;
+            let d = slot_at(copy_dst(c), &offset);
+            let s = whole_slot(copy_src(c));
+            let b = INSTS[c].block;
+            if d < 0 || s < 0 || d == s || SLOTS[d].escapes != 0 || SLOTS[s].escapes != 0
+                || offset % SLOTS[s].align != 0 || BLOCKS[b].order < 0 || innermost_loop(b) >= 0
+                || !elidable(c, s, d, offset) {
+                continue;
+            }
+            place_slot(fi, s, d, offset);
+            ir_unlink(c);
+            changed = true;
+        }
+        if changed {
+            resolve_all(fi);
+        }
+        changed
+    }
+}

@@ -15,6 +15,7 @@ use crate::back::abi::{
 };
 use crate::back::regalloc::intervals::calls_returns_twice;
 use crate::base::{IntVec, alloc_array, free};
+use crate::front::ast::{FN_CLOSURE, NODES};
 use crate::front::types::{FNS, fn_attr_cold, fn_attr_inline, fn_param, is_void, type_size};
 use crate::gen0::gen::fn_is_global;
 use crate::middle::fold::is_const;
@@ -36,6 +37,10 @@ const INLINE_SMALL: i64 = 30;
 const INLINE_ONCE: i64 = 400;
 const INLINE_BUDGET: i64 = 3000;
 const INLINE_ROUNDS: i64 = 3;
+
+// (0.14) The cost of a callee inlined whatever the budgets (see
+// should_inline).
+const INLINE_TINY: i64 = 2;
 // The size a hot call site's callee may have (0.10, profiles).
 const INLINE_HOT: i64 = 240;
 // The bonus per constant argument whose parameter decides a branch, a
@@ -387,11 +392,24 @@ fn should_inline(fi: i64, g: i64, call: i64) -> bool {
         if hint == HINT_ALWAYS {
             return true;
         }
-        if FN_SIZE[fi] + FN_SIZE[g] > INLINE_BUDGET || PROGRAM_SIZE + FN_SIZE[g] > PROGRAM_BUDGET {
-            return false;
+        // (0.14) A callee about as big as its call is inlined whatever the
+        // caller's size: the chain of small closures an iterator chain calls,
+        // `as_slice`.
+        if inline_cost(g, call) <= INLINE_TINY && PROGRAM_SIZE + FN_SIZE[g] <= PROGRAM_BUDGET {
+            return true;
         }
         let b = INSTS[call].block;
         let once = FN_CALLS[g] == 1 && FN_ADDRESS[g] == 0 && !fn_is_global(gf);
+        // A closure called once is inlined whatever its size: it is moved,
+        // not copied, and its size before its environment is known (the
+        // loads through it) says little of what it becomes (a closure
+        // calling closures, the fold of an iterator chain).
+        if once && is_closure_fn(g) {
+            return true;
+        }
+        if FN_SIZE[fi] + FN_SIZE[g] > INLINE_BUDGET || PROGRAM_SIZE + FN_SIZE[g] > PROGRAM_BUDGET {
+            return false;
+        }
         // (0.10: with a profile, a call that never ran is cold, and a hot one
         // takes a callee up to INLINE_HOT)
         if site_cold(b) || is_cold_block(b) {
@@ -413,6 +431,21 @@ fn should_inline(fi: i64, g: i64, call: i64) -> bool {
             threshold *= 2;
         }
         inline_cost(g, call) <= threshold
+    }
+}
+
+// Whether inlining function g is charged to the budgets only for what it
+// adds once simplified (see inline_calls): `#[inline]` functions (the std
+// iterator methods are) and closures' functions.
+fn counted_after(g: i64) -> bool {
+    unsafe { fn_attr_inline(IRFUNCS[g].f) == HINT_ALWAYS || is_closure_fn(g) }
+}
+
+// Whether IR function g is a closure's (FN_CLOSURE, 0.14).
+fn is_closure_fn(g: i64) -> bool {
+    unsafe {
+        let node = FNS[IRFUNCS[g].f].node;
+        node != 0 && (NODES[node].p & FN_CLOSURE) != 0
     }
 }
 
@@ -438,8 +471,14 @@ pub fn inline_calls(fi: i64) -> bool {
                 let next = INSTS[v].next;
                 let g = ir_callee(v);
                 if g >= 0 && should_inline(fi, g, v) {
-                    FN_SIZE[fi] += FN_SIZE[g];
-                    PROGRAM_SIZE += FN_SIZE[g];
+                    // (0.14) A function made to be inlined counts for its size
+                    // once simplified, when inline_rounds measures it: its
+                    // size alone, before its arguments are known, would use
+                    // up the budgets in the middle of an iterator chain.
+                    if !counted_after(g) {
+                        FN_SIZE[fi] += FN_SIZE[g];
+                        PROGRAM_SIZE += FN_SIZE[g];
+                    }
                     FN_CALLS[g] -= 1;
                     // The continuation block keeps the call site's loop depth
                     // and coldness.
@@ -506,7 +545,10 @@ pub fn inline_rounds(fi: i64) -> bool {
             let before = FN_SIZE[fi];
             optimize_after_inlining(fi);
             let after = func_size(fi);
-            PROGRAM_SIZE += after - before;
+            // (0.14: not a function that goes once inlined everywhere)
+            if !inlined_everywhere(fi) {
+                PROGRAM_SIZE += after - before;
+            }
             FN_SIZE[fi] = after;
         }
         any
@@ -518,7 +560,7 @@ pub fn start_inlining_budget() {
     unsafe {
         PROGRAM_SIZE = 0;
         for fi in 0..IRFUNC_COUNT {
-            if FN_LIVE[fi] != 0 {
+            if FN_LIVE[fi] != 0 && !inlined_everywhere(fi) {
                 PROGRAM_SIZE += FN_SIZE[fi];
             }
         }
@@ -741,5 +783,18 @@ fn replace_pieces(call: i64, cont: i64, returns: *IntVec) {
                 ir_unlink(pack);
             }
         }
+    }
+}
+
+// Whether function fi is going to be inlined into each of its callers
+// (0.14): `#[inline]`, its address not taken, not visible outside. Its
+// loop passes wait (they do better in the callers, where its arguments
+// are known: an iterator source's `fold` sees its position is 0 only
+// there; opt.tach), and its size does not count in the program's, which
+// it leaves once inlined.
+pub fn inlined_everywhere(fi: i64) -> bool {
+    unsafe {
+        let f = IRFUNCS[fi].f;
+        fn_attr_inline(f) == 1 && FN_ADDRESS[fi] == 0 && !fn_is_global(f)
     }
 }

@@ -117,6 +117,9 @@ pointer) and every arithmetic rule.
 | dead stores | within a block, a store (or a copy) overwritten before anything may read it; a store or copy into a private slot that nothing reads | `gvn.tach` |
 | switches | a `match` on an integer, a fieldless enum or an enum's tag whose arms are literals, ranges, alternatives of them, or variants whose fields only bind (and no guards), is a `switch`; SCCP decides switches on constants and prunes them to their reachable successor | `lower.tach`, `fold.tach`, `opt.tach` |
 | inlining | strongly connected components of the call graph (Tarjan), callees first, so a callee is already optimized and recursion is never inlined; a callee is inlined when it has at most 30 instructions, or when this is its only call site and it has at most 400 (and is neither `main` nor address-taken); callers grow to at most 3,000 instructions. The callee's blocks are copied, parameters become the arguments, frame slots are copied, returns jump to a continuation block with a phi for the result | `inline.tach` |
+| copy elision (0.14) | a whole slot copied once (outside loops) into another slot or a field of one, the source used only before, the destination's part only after, neither escaping: the source is that part, the copy goes | `copies.tach` |
+| threading on tags (0.14) | a switch on a phi, or a branch comparing one with a constant, whose operands are constants or phis: the block (or a chain of single-predecessor blocks from the phi's) is copied for each predecessor giving a constant, going to its outcome; uses repaired by the SSA updater | `tags.tach` |
+| exit merging (0.14) | several exits at a loop's top testing induction variables against invariants: one counter tested against the smallest trip count; header phis with one start and step merged | `exits.tach` |
 
 The pipeline (`optimize_program` in `opt.tach`) runs the cleanup on
 every function, then the `-O1` pipeline twice per function, then at `-O2`
@@ -693,6 +696,16 @@ around the per-function passes. In order:
    program takes stays, even when every call through the address was
    made direct and inlined (a function used as a value is part of what
    the program is; the IR and assembly tests rely on it).
+   Before all of this (0.14, at -O1 and -O2), the functions of std that
+   no function of the program reaches, through calls and addresses, are
+   dropped (`drop_unreachable_std`): they are neither cleaned up nor
+   optimized. std grew with 0.14 and every one of its non-generic
+   functions is lowered; optimizing them was most of the time of
+   compiling a small program (a 7-line program: 7 ms of CPU, now 3 ms;
+   0.13: 2 ms). The program's own unused functions stay roots, as before.
+   At -O2 the remaining std functions have fewer callers, which can change
+   what is inlined (a `print_int` called once is inlined) and which
+   arguments are constants; -O0 does not go through here.
 
 **The inliner's cost model.** The cost of inlining callee g at a call
 site is g's size (instructions that become code, after g was itself
@@ -1304,3 +1317,148 @@ What remains, measured:
   with clang or ahead; the rest of wordcount's gap is its hashing and
   probing loops, which inlining everything (with a profile) does not
   change.
+
+## 0.14: zero-cost iterators
+
+The closures and iterators of 0.14 (docs/design/closures-iterators.md)
+come to the optimizer as ordinary code: a closure is a struct of its
+captures (a by-reference capture a pointer field) with a function taking
+it by pointer (`FN_CLOSURE`); an adapter is a generic struct holding the
+iterator below and a closure, taken by value (`self: Self`); a consumer is
+a `fold`, which sources and adapters override with a counted loop, its
+closure capturing the adapter's closure by reference and the outer one by
+value; `for x in it` over anything but a range or a slice is `loop {
+match it.next() { Some(x) => .., None => break } }`. Every std iterator
+method is `#[inline]`. A chain is zero cost when, once inlined, this is
+the loop written by hand: no call, no frame slot, the same vector loop.
+What was missing, in pipeline order:
+
+- **Loop passes of `#[inline]` functions wait** (`inlined_everywhere`,
+  `loop_pipeline` in `opt.tach`). Bottom-up, a callee's loops were
+  rotated, vectorized and unrolled before it was inlined: a source's
+  `fold` loops from `self.pos`, unknown there, so its bounds check stayed
+  and the vector loop got run-time checks and a checked scalar
+  remainder, which the caller, where `pos` is 0, could not undo. A
+  function that is `#[inline]`, not address-taken and not visible outside
+  now skips the loop passes, LICM and scalar promotion; they run after
+  inlining for those still called somewhere. Its size also stays out of
+  the program's inlining budget (it leaves the program once inlined).
+- **Copy elision** (`copies.tach`, before SROA). A frame slot copied
+  whole into another slot or into a part of one at a constant offset (a
+  field), by a copy outside loops, where the source is used only before
+  the copy and that part of the destination only after it (or elsewhere
+  in it before), neither slot's address escaping: the source becomes that
+  part, the copy goes. Each adapter level copies the level below into its
+  struct, by memcpy above 128 bytes, which SROA does not look through: a
+  chain of 20 capturing maps was 20 memcpy calls.
+- **SROA to a fixpoint** (`run_sroa`). A slot whose address was stored
+  into a slot that is replaced (a variable captured by reference, held by
+  the closure's environment) is not a candidate in that round; its address
+  then reaches its uses directly, and SROA runs again (at most 4 rounds).
+- **Threading on constant tags** (`tags.tach`, at the end of the first
+  round of the scalar pipeline). A block whose switch decides on a phi
+  (`match` on an enum's tag), or whose branch compares one with a
+  constant, is copied for each predecessor giving that phi a constant,
+  and the copy jumps to that constant's outcome. The phi may be in an
+  earlier block when the blocks between have one predecessor each (a
+  loop's header testing its exit before the match): the chain is copied
+  (at most 4 blocks, 12 instructions). A predecessor holding only phis
+  that feed the tag (what the arms of an `if` leave) is merged into the
+  block first. The values the chain defines are then read where they are
+  used through the SSA updater, as rotation does. Only phis whose operands
+  are constants or phis are tags: an induction variable's loop is left to
+  rotation, and bool phis (`&&`, `||`) to range::thread. Once `next` is
+  inlined, each of its returns made the `Option`'s tag a constant: `match
+  it.next()` becomes a plain loop; a fold whose accumulator is an `Option`
+  (`max`) is peeled once and then keeps a plain maximum.
+- **Counted loops out of several exits; equal induction variables**
+  (`exits.tach`, before rotation). A loop whose header, and blocks after
+  it that have no effects and one predecessor each, test several exits to
+  one block (past the exit blocks canonical form makes), each an induction
+  variable with a step of ±1 against an invariant (`!=` either way, `<`
+  going up, `>` going down, signed or not), runs min(T₁, …) times, Tₖ
+  computed in the preheader as unsigned numbers (n - start, or 0 when the
+  loop is not entered, without branches). A new induction variable c from
+  0 replaces the first test by c != T and the others by true; the exit's
+  phis must take one value from every test. `for x in v.iter().take(n)`
+  over `next` (n != 0, then pos < len) becomes a loop the vectorizer
+  takes. Then header phis with the same start and step are one
+  induction variable (the counter above and the slice position; next-based
+  `enumerate` and `zip`).
+- **The inliner's budgets** (`should_inline`, `inline_calls`). A callee
+  whose cost is at most 2 (about its call's) is inlined whatever the
+  caller's size, while the program's budget lasts: the chain of small
+  closures, `as_slice`. A closure called once (`FN_CLOSURE`, single call
+  site) is inlined whatever its size: it is moved, not copied, and its
+  size before its environment is known (loads through it) says little of
+  what it becomes (a closure calling closures: the fold of a chain).
+  `#[inline]` functions and closures are charged to the budgets only for
+  what they add once simplified (the recount after each round), not their
+  size beforehand.
+- **CFG**: a branch to two empty blocks that jump to one block, whose phis
+  take one value from both, is a jump (what a threaded `cmp(a, b) < 0`
+  leaves).
+- **Front end**: the limit on type arguments is their size as a tree
+  (4096 nodes, memoized), not their depth (12); nested instantiations may
+  go 2000 deep (64). A chain nests a level per adapter.
+
+The invariant closures rely on (design, section 2): a local whose address
+is taken keeps its own frame slot for the whole function. Copy elision
+merges slots only when neither address escapes (all uses are loads,
+stores and copies the analysis sees), and nothing colours the stack.
+
+The key kernel, `v.iter().map(|x| x * 3).sum()` hand-desugared
+(`tests/run/opt_iter_map_sum.tach`): before, 111 lines of IR, the
+callee's vector loop with its run-time check (`cmp.ge`, `cmp.lt` and
+`and`s before it), a scalar remainder with a bounds check and a
+`callc rt.panic`; after, the hand loop's 77 lines, instruction for
+instruction:
+
+```
+b333 <- b332 b333:
+    v1365: u64 = phi v1279, v1366
+    v1325: i64 = phi v1280, v1351
+    v1326: v2i64 = phi v1324, v1336
+    v1327: v2i64 = phi v1323, v1347
+    v1331: v2i64 = load v1365
+    v1335: v2i64 = vbin.mul v1331, v1334
+    v1336: v2i64 = vbin.add v1326, v1335
+    v1344: v2i64 = load v1365 +16
+    v1346: v2i64 = vbin.mul v1344, v1334
+    v1347: v2i64 = vbin.add v1327, v1346
+    v1351: i64 = add v1325, v1315
+    v1352: bool = cmp.ne v1320, v1351 from i64
+    v1366: u64 = add v1365, v1364
+    branch v1352, b333, b334
+```
+
+Tests: `tests/run/opt_iter_map_sum.tach` (no call, no slot, the vector
+loop), `opt_iter_next.tach` (`take` over `next` vectorized, `while let`
+over `map`, `max` with an `Option` accumulator: no switch, no tag phi
+left), `opt_iter_deep.tach` (60 capturing maps: one vector loop, no
+memcpy), all three hand-desugared, and `opt_iter_real.tach`: the same
+kernels (and filter, zip, enumerate, count) written with std's
+iterators and closures as the front end makes them, with the same
+checks. bench/iterchain.tach (six kernels as chains of std's iterators
+and closures) against bench/iterloop.tach (the same by hand), with C
+twins; bench/run.sh prints the ratio of their -O2 times, the fastest of
+RUNS rounds each, run alternately, and fails above 1.05.
+
+With the front end's own output (after the merge of the closures and
+iterators), best of 5 per kernel on a busy machine, chain/hand in ms:
+filter-map-sum 68/71, dot 106/112, enumerate 54/55, max+count 158/162,
+take over `next` 26/26, collect+sort_by 19/16; the whole program
+497/511 (0.97). The last kernel's gap is std's `sort_by` (one loop for
+both heap phases) against the hand-written heapsort, not the chain: the
+collect alone is even, and the inlined comparator compiles to the same
+instructions; the two sorts differ in block layout only.
+
+Compile time: the compiler compiles itself as fast as before (1.59 s
+against 1.59 s, best of five); a chain of 200 capturing maps compiles in
+0.8 s, one vector loop.
+
+Not done: a loop with an early exit at the header and its counted exit
+at the latch (a rotated `while i < n && i < m`) is not merged (the tests
+must be at the top); next-based `filter` keeps a bounds check the hand
+loop does not have (its position is a phi of two loops' phis); the
+sort kernel's comparator, threaded, still leaves an unused comparison.
