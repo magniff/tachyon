@@ -1,0 +1,100 @@
+// The instructions of the stack machine: their names, costs and kinds.
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum Op {
+    // Pushes a constant.
+    Push(i64),
+    // Drops the top value.
+    Pop,
+    // Pushes a copy of the top value.
+    Dup,
+    // Swaps the top two values.
+    Swap,
+    // Pushes a copy of the value under the top.
+    Over,
+    // Pushes a copy of the value `n` places below the top: pick 0 is dup.
+    Pick(i64),
+    // The binary operations pop b, then a, and push `a op b`.
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    // 1 if a < b, else 0.
+    Lt,
+    // 1 if a == b, else 0.
+    Eq,
+    // Jumps to an instruction.
+    Jmp(i64),
+    // Pops a value; jumps if it is zero.
+    Jz(i64),
+    // Pops a value and prints it on a line.
+    Print,
+    // Stops the machine.
+    Halt,
+}
+
+// The kinds of instruction, counted separately when the machine runs.
+pub const STACK: usize = 0;
+pub const ARITH: usize = 1;
+pub const CONTROL: usize = 2;
+pub const IO: usize = 3;
+
+pub fn kind_name(k: usize) -> &'static str {
+    if k == STACK {
+        "stack"
+    } else if k == ARITH {
+        "arith"
+    } else if k == CONTROL {
+        "control"
+    } else {
+        "io"
+    }
+}
+
+// The instruction's name in source and listings.
+pub fn mnemonic(op: Op) -> &'static str {
+    match op {
+        Op::Push(_) => "push",
+        Op::Pop => "pop",
+        Op::Dup => "dup",
+        Op::Swap => "swap",
+        Op::Over => "over",
+        Op::Pick(_) => "pick",
+        Op::Add => "add",
+        Op::Sub => "sub",
+        Op::Mul => "mul",
+        Op::Div => "div",
+        Op::Mod => "mod",
+        Op::Lt => "lt",
+        Op::Eq => "eq",
+        Op::Jmp(_) => "jmp",
+        Op::Jz(_) => "jz",
+        Op::Print => "print",
+        Op::Halt => "halt",
+    }
+}
+
+// What executing the instruction costs.
+pub fn cost(op: Op) -> i64 {
+    match op {
+        Op::Push(_) | Op::Pop | Op::Dup | Op::Swap | Op::Over => 1,
+        Op::Add | Op::Sub | Op::Lt | Op::Eq => 1,
+        Op::Pick(_) => 2,
+        Op::Mul => 3,
+        Op::Div | Op::Mod => 10,
+        Op::Jmp(_) | Op::Jz(_) => 2,
+        Op::Print => 5,
+        Op::Halt => 0,
+    }
+}
+
+// The instruction's kind: STACK, ARITH, CONTROL or IO.
+pub fn kind(op: Op) -> usize {
+    match op {
+        Op::Push(_) | Op::Pop | Op::Dup | Op::Swap | Op::Over | Op::Pick(_) => STACK,
+        Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod | Op::Lt | Op::Eq => ARITH,
+        Op::Jmp(_) | Op::Jz(_) | Op::Halt => CONTROL,
+        Op::Print => IO,
+    }
+}

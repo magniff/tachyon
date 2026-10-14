@@ -1,0 +1,224 @@
+// Reads a program's text: one instruction per line, labels, comments.
+
+use crate::op::{Op, mnemonic};
+use std::Buf;
+
+pub struct Program {
+    pub ops: Vec<Op>,
+    // Whether the program asked for a listing (a `.list` line).
+    pub list: bool,
+}
+
+pub struct ParseError {
+    // Counted from 1.
+    pub line: i64,
+    pub message: [u8],
+}
+
+// A label and the instruction it names.
+struct Label {
+    name: [u8],
+    pc: i64,
+}
+
+fn is_space(ch: u8) -> bool {
+    ch == ' ' || ch == '\t' || ch == '\r'
+}
+
+// The line without its comment (from `;`), as words separated by spaces
+// or tabs.
+fn words(line: [u8]) -> Vec<[u8]> {
+    let mut code = line;
+    for i in 0..line.len {
+        if line[i] == ';' {
+            code = line[..i];
+            break;
+        }
+    }
+    let mut v: Vec<[u8]> = Vec::new();
+    let mut i = 0;
+    while i < code.len {
+        while i < code.len && is_space(code[i]) {
+            i += 1;
+        }
+        let start = i;
+        while i < code.len && !is_space(code[i]) {
+            i += 1;
+        }
+        if i > start {
+            v.push(code[start..i]);
+        }
+    }
+    v
+}
+
+fn is_digit(ch: u8) -> bool {
+    ch >= '0' && ch <= '9'
+}
+
+// A label is a letter or `_`, then letters, digits and `_`.
+fn is_label(name: [u8]) -> bool {
+    if name.len == 0 || is_digit(name[0]) {
+        return false;
+    }
+    for ch in name {
+        let ok = is_digit(ch) || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_';
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
+// A decimal integer, `-` allowed, at most 18 digits.
+pub fn parse_number(word: [u8]) -> Option<i64> {
+    let neg = word.len > 0 && word[0] == '-';
+    let digits = if neg { word[1..] } else { word };
+    if digits.len == 0 || digits.len > 18 {
+        return None;
+    }
+    let mut n = 0;
+    for ch in digits {
+        if !is_digit(ch) {
+            return None;
+        }
+        n = n * 10 + (ch - '0') as i64;
+    }
+    Some(if neg { -n } else { n })
+}
+
+// `what 'word'`, as text that lives until the program ends.
+fn quoted(what: [u8], word: [u8]) -> [u8] {
+    let mut s = Buf::new();
+    s.push_str(what);
+    s.push_str(" '");
+    s.push_str(word);
+    s.push('\'');
+    s.as_slice()
+}
+
+// The operand of a jump: a label or an instruction number.
+fn jump_target(word: [u8], labels: [Label]) -> Result<i64, [u8]> {
+    if let Some(n) = parse_number(word) {
+        return Ok(n);
+    }
+    for l in labels {
+        if l.name == word {
+            return Ok(l.pc);
+        }
+    }
+    Err(quoted("unknown label", word))
+}
+
+// One instruction from its words.
+fn parse_op(w: [[u8]], labels: [Label]) -> Result<Op, [u8]> {
+    let name = w[0];
+    let with_operand = name == "push" || name == "pick" || name == "jmp" || name == "jz";
+    if with_operand && w.len < 2 {
+        return Err("missing operand");
+    }
+    if (with_operand && w.len > 2) || (!with_operand && w.len > 1) {
+        return Err("extra operand");
+    }
+    if name == "push" {
+        return match parse_number(w[1]) {
+            Some(n) => Ok(Op::Push(n)),
+            None => Err(quoted("bad number", w[1])),
+        };
+    }
+    if name == "pick" {
+        return match parse_number(w[1]) {
+            Some(n) if n >= 0 => Ok(Op::Pick(n)),
+            Some(_) => Err(quoted("bad depth", w[1])),
+            None => Err(quoted("bad number", w[1])),
+        };
+    }
+    if name == "jmp" {
+        return match jump_target(w[1], labels) {
+            Ok(t) => Ok(Op::Jmp(t)),
+            Err(e) => Err(e),
+        };
+    }
+    if name == "jz" {
+        return match jump_target(w[1], labels) {
+            Ok(t) => Ok(Op::Jz(t)),
+            Err(e) => Err(e),
+        };
+    }
+    let plain = [
+        Op::Pop, Op::Dup, Op::Swap, Op::Over, Op::Add, Op::Sub, Op::Mul, Op::Div,
+        Op::Mod, Op::Lt, Op::Eq, Op::Print, Op::Halt,
+    ];
+    for op in plain {
+        if mnemonic(op) == name {
+            return Ok(op);
+        }
+    }
+    Err(quoted("unknown instruction", name))
+}
+
+fn is_label_line(w: [[u8]]) -> bool {
+    w.len == 1 && w[0].len > 0 && w[0][w[0].len - 1] == ':'
+}
+
+// The program in `text`, or the first problem in it. Labels are found
+// first, so a jump may name a label further down.
+pub fn parse(text: [u8]) -> Result<Program, ParseError> {
+    let mut lines: Vec<[u8]> = Vec::new();
+    defer lines.free();
+    let mut start = 0;
+    for i in 0..text.len + 1 {
+        if i == text.len || text[i] == '\n' {
+            lines.push(text[start..i]);
+            start = i + 1;
+        }
+    }
+    let mut labels: Vec<Label> = Vec::new();
+    defer labels.free();
+    let mut list = false;
+    let mut count = 0;
+    for i in 0..lines.len() {
+        let mut w = words(lines.get(i));
+        defer w.free();
+        if w.len() == 0 {
+            continue;
+        }
+        let first = w.get(0);
+        if first == ".list" {
+            list = true;
+        } else if is_label_line(w.as_slice()) {
+            let name = first[..first.len - 1];
+            let mut taken = false;
+            for l in labels.as_slice() {
+                if l.name == name {
+                    taken = true;
+                }
+            }
+            if !is_label(name) {
+                return Err(ParseError { line: i + 1, message: quoted("bad label", name) });
+            }
+            if taken {
+                return Err(ParseError { line: i + 1, message: quoted("duplicate label", name) });
+            }
+            labels.push(Label { name: name, pc: count });
+        } else {
+            count += 1;
+        }
+    }
+    let mut ops: Vec<Op> = Vec::new();
+    for i in 0..lines.len() {
+        let mut w = words(lines.get(i));
+        defer w.free();
+        if w.len() == 0 || w.get(0) == ".list" || is_label_line(w.as_slice()) {
+            continue;
+        }
+        match parse_op(w.as_slice(), labels.as_slice()) {
+            Ok(op) => ops.push(op),
+            Err(message) => {
+                ops.free();
+                return Err(ParseError { line: i + 1, message: message });
+            }
+        }
+    }
+    Ok(Program { ops: ops, list: list })
+}
