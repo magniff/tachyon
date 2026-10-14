@@ -504,6 +504,20 @@ The last release of the build-out.
   machine after lldb attached to one; needs a reboot), gdb on x86_64-linux
   (no ptrace under Rosetta for Linux)
 
+0.11 B status (performance):
+- broader bench/: done (binarytrees, fannkuch, json, mandelbrot, sort,
+  wordcount, each with its C version; `bench/run.sh` prints the
+  geometric mean of each column against cc -O2)
+- cost model for the loop vectorizer: done (expected trips from constant
+  bounds or the profile; optimizer.md, 0.11)
+- scalar unrolling with run-time trip counts: done (in the vectorizer's
+  frame, checks proved before the loop; optimizer.md, 0.11)
+- SLP vectorizer: done (stores to the lanes of a vector, packed bottom-up;
+  last in the pipeline; optimizer.md, 0.11)
+- the gaps against clang on the new benchmarks: branches on `&&` threaded
+  from the predecessor that branched (isel), equalities from branches
+  (GVN); what remains in optimizer.md, 0.11
+
 ## 0.11 (continued): tools for agents
 
 `tachyonc query` (def, show, refs, callers, items; fully qualified paths
@@ -795,3 +809,44 @@ vectorizer is for 0.11.
 Compile time, the compiler building itself to an object, best of 7:
 -O0 109 ms with 0.9.0, 113 ms with 0.10; -O2 791 ms and 816 ms (+3%, the
 vectorizer and profile support).
+
+### 0.11 (performance)
+
+aarch64-macos (Apple silicon, native; `bench/run.sh -p <0.10.0> -r 5`;
+"0.10.0" is the previous release at its default level; the last row is
+the geometric mean of each column over cc -O2's, programs with a C
+version only):
+
+| program | 0.10.0 | 0.11 -O0 | 0.11 -O1 | 0.11 -O2 | cc -O2 |
+|---|---|---|---|---|---|
+| binarytrees | 176 | 198 | 169 | 156 | 155 |
+| collatz | 292 | 2439 | 292 | 291 | 292 |
+| fannkuch | 121 | 482 | 130 | 116 | 138 |
+| fib | 14 | 54 | 22 | 14 | 14 |
+| interp | 41 | 446 | 81 | 42 | 40 |
+| json | 112 | 487 | 141 | 109 | 92 |
+| mandelbrot | 165 | 1764 | 162 | 161 | 156 |
+| matmul | 18 | 504 | 75 | 18 | 43 |
+| nbody | 32 | 297 | 33 | 31 | 28 |
+| sieve | 62 | 264 | 59 | 63 | 72 |
+| sort | 90 | 363 | 75 | 66 | 57 |
+| stencil | 9 | 241 | 22 | 9 | 10 |
+| wordcount | 93 | 557 | 118 | 87 | 69 |
+| md5 | 35 | 166 | 38 | 36 | - |
+| geomean vs cc -O2 | 1.003 | 6.694 | 1.336 | 0.959 | 1 |
+
+sort is 27% faster (branches on `&&` threaded from the predecessor that
+branched), wordcount 7% (equalities from branches drop the check in
+slice equality), fannkuch 4% (unrolling with run-time trip counts),
+nbody 3% (SLP). json, mandelbrot and binarytrees moved within this
+machine's noise (binarytrees ran 155 to 176 ms in repeated runs of
+either build). The gaps that remain (bounds checks, division by
+constants, FMA) are in optimizer.md, 0.11. interp is not slower with the
+vectorizer: it vectorizes no loop of interp (the IR is the same with
+`--no-vectorize`), so 0.10's 5% was noise.
+
+Compile time, the compiler building itself (the 0.11 source) to an
+object, `--time-passes` total, best of 7: -O0 99 ms with 0.10.0, 94 ms
+with 0.11; -O2 832 ms and 859 ms (+3%: the SLP vectorizer about 0.5%,
+runtime unrolling's analysis about as much, the rest the GVN equalities
+and the cost model; the machine was shared, so ±2%).
