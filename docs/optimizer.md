@@ -1105,6 +1105,29 @@ iterations it replaces. Unrolling asks the same question
 (`vectorizable_lanes`), so a loop the vectorizer turns down is unrolled
 as before.
 
+*Against full unrolling.* A loop of a few constant trips is unrolled
+whole by `transform_loops` (scev.tach: at most 16 trips and 160
+instructions), and there the scalar alternative is not the loop: each
+copy keeps only its loads, stores and operations (the induction variable,
+the latch's test and the addresses affine in it become constants and
+offsets, what is invariant leaves, a check of a constant length on an
+index of the induction variable and constants is decided), and SLP may
+pack them. With `unrolled` = the trip count, `vector_unroll` weighs the
+vector loop against T times that. The unroller asks so before unrolling;
+and a loop whose checks kept the unroller from it (an exit other than the
+latch's) until the ranges removed them is left by the vectorizer when
+unrolling whole is cheaper (`full_unroll_trips`), with transform_loops run
+again after the vectorizer (only then). bench/fannkuch's copy of a
+10-element permutation had been a vector loop since the ranges through
+phis proved its checks: a run-time overlap test of the two arrays (both
+on the stack), five vector iterations, the scalar loop as fallback, the
+loop not unrolled; it is now ten loads and stores, which SLP makes five
+16-byte copies, as with `--no-vectorize`: about 5% faster, which takes
+back the 3% it had lost (it was not the forwarding of 8-byte stores to
+16-byte loads, as first thought: the unrolled copy has those too).
+`tests/run/opt_vectorize_unrolled.tach`. The compiler's own code is
+unchanged.
+
 In 0.10, `[0; 20]` became a loop of two 16-byte stores an iteration,
 which never ran (20 < 32); it is now one vector store and four scalar
 ones. A loop the profile shows running two iterations an entry over
@@ -1203,19 +1226,70 @@ about the cheap and general ones:
   below b.len, so the range analysis drops the check of b[i] in std's
   slice equality, which bench/wordcount's map runs for every word (about
   8%); `tests/run/opt_equality.tach`.
+- *Division by a constant* (isel.tach, before tiling). `x / d` and
+  `x % d` for a constant d multiply by a magic number (Granlund and
+  Montgomery; Hacker's Delight, chapter 10) with a new machine operation,
+  `mulh` (the high half of the 128-bit product: `umulh`, `smulh` on
+  AArch64, one-operand `mulq`, `imulq` into rdx on x86-64, which the
+  allocator keeps free as for a division). Unsigned values up to 32 bits
+  take one `mulh` by 2^64 / d rounded up (exact below 2^32, as d < 2^32);
+  u64 a `mulh` and a shift, with the add fix-up when the magic number has
+  65 bits; signed values up to 32 bits a 64-bit product by the 33-bit magic
+  number and an arithmetic shift, i64 a `smulh` with its corrections; then
+  one more when negative (`sub q, t, t, asr #63`). The remainder is
+  `x - q * d` (`msub`), sharing q with a quotient of the same operands in
+  the block. Tachyon's results are kept: division by 0 is left to the
+  division instruction (x / 0 is 0, x % 0 is x), x / -1 is -x (MIN / -1
+  wraps to MIN). Tested by `tests/run/opt_divide_constant.tach` (every
+  kind of constant at every width, against divisions by the same numbers
+  unknown to the compiler) and a fuzz mode, `tests/fuzz/run.sh -D`
+  (`gendiv.awk`: random constants and dividends, the extremes and exact
+  multiples, every level against -O0). bench/wordcount (`% 26`, `/ 26`:
+  `umulh`, `lsr`, `msub`) is 3.5% faster, bench/json 3%; collatz divides
+  by 2 only, which was a shift already.
+- *Ranges through phis* (range.tach). A phi's range is the union of its
+  operands' ranges, each at the end of its predecessor with the facts
+  there and on the edge. The phis of a loop header are found together by
+  induction: each is assumed in a range H, the operands coming back around
+  the loop are ranged under the assumptions, and when each falls in its
+  phi's H, every phi is in its H always (H holds the entry operands). H
+  starts as the entry operands' range, then takes in what came back (a
+  join), then is widened to what the facts on the edges back allow (an
+  induction variable below its loop's bound, with any step, even one read
+  from memory; a decreasing one above its floor), then to the type's
+  range, which proves nothing but holds. Phis of other blocks are ranged
+  likewise (their loop header's phis first); a range found under an
+  assumption about an enclosing phi is kept only for that assumption.
+  Facts comparing a value with another now bound it by the other's range
+  (`child < end` with end below 1000000), arithmetic shifts and 64-bit
+  conversions keep ranges, and an operation of one operand costs a
+  quarter of the depth of one of two (light cleanup leaves chains like
+  `0 + (n - 0) * 1`). A branch on the phi of `&&` or `||` (a block of the
+  phi and the branch alone) is threaded from each predecessor that
+  branched on the phi's operand for it, as isel.tach does, but before the
+  ranges: in `child + 1 < end && s[child] < s[child + 1]`, the first test
+  then holds wherever the whole is true.
+
+  Phi ranges and facts between two values are taken while the branch of
+  a check is decided (one way ends the program: a bounds check, an
+  unwrap): everywhere, they cost 4% of the self-compile's instructions
+  for little more. bench/sort's heapsort, inlined into main with its
+  vector's length known, keeps none of its 12 checks (16 checks before, 4
+  now, in the generic sift-down of the records); bench/sort is 5% faster.
+  The threading costs the loop passes about 6% of their time, and pays it
+  back: the compiler built with it builds itself in 2.6% fewer
+  instructions. `tests/run/opt_range_phi.tach`: a step of 2, a step read
+  from memory, a decreasing index, a sift-down; and an index that reaches
+  past the end, whose check stays (and fails); a fuzz mode,
+  `tests/fuzz/run.sh -R` (`genrange.awk`), of such loops (some going past
+  an end).
 
 What remains, measured:
 
-- *Bounds checks* that need facts the ranges do not carry: sort's
-  `s[root]` (root is the previous iteration's child, checked then, but a
-  phi has no range) and `s[child]` after the `&&` (checked on one way
-  only). C has no checks; this is the safety tachyon keeps.
-- *Division by a constant* is `udiv`/`sdiv` (7 to 9 cycles on Apple
-  silicon) where clang multiplies by a magic number with `umulh`, which
-  neither back end nor encoder has yet (wordcount's `% 26` and `/ 26`,
-  json's and sort's random numbers, `Buf.push_int`). With only 64-bit
-  multiplication it could be done for dividends below 2^31, but the
-  hottest ones here are loop phis, which have no range.
+- *Bounds checks* that need facts the ranges do not carry: in a generic
+  sift-down, `end <= s.len` (so the first `s[root]`, with root the
+  caller's start, keeps its check). C has no checks; this is the safety
+  tachyon keeps.
 - *FMA*: clang contracts `a * b + c` by default (nbody: 27 ms against 29
   with `-ffp-contract=off`); tachyon never does, as that changes results.
 - *Floats compared for a branch* are `fcmp`, `cset`, `cbnz` on AArch64

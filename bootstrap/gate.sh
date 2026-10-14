@@ -36,8 +36,8 @@
 #
 # Steps: chain; suite-O0, suite-O1, suite-O2; fuzz-plain, fuzz-loops,
 # fuzz-generics, fuzz-pressure, fuzz-calls, fuzz-lang06, fuzz-vector,
-# fuzz-seed (against the Rust seed); abi-plain, abi-import, abi-header;
-# objcheck; layout (tests/cimport/layout.sh); debug (tests/debug.sh);
+# fuzz-div, fuzz-range, fuzz-seed (against the Rust seed); abi-plain,
+# abi-import, abi-header; objcheck; layout (tests/cimport/layout.sh); debug (tests/debug.sh);
 # linux-x86_64 (bootstrap/linux-check.sh); linux-aarch64
 # (bootstrap/aarch64-linux-check.sh); bench.
 #
@@ -139,7 +139,7 @@ esac
 [ -z "$FUZZ_N" ] || { FZ=$FUZZ_N; XFZ=$FUZZ_N; AFZ=$FUZZ_N; }
 [ -z "$ABI_N" ] || { AB=$ABI_N; XAB=$ABI_N; AAB=$ABI_N; }
 
-FUZZ_STEPS="fuzz-plain fuzz-loops fuzz-generics fuzz-pressure fuzz-calls fuzz-lang06 fuzz-vector fuzz-seed"
+FUZZ_STEPS="fuzz-plain fuzz-loops fuzz-generics fuzz-pressure fuzz-calls fuzz-lang06 fuzz-vector fuzz-div fuzz-range fuzz-seed"
 ABI_STEPS="abi-plain abi-import abi-header"
 HOST_STEPS="suite-O0 suite-O1 suite-O2 $FUZZ_STEPS $ABI_STEPS objcheck layout debug"
 LINUX_STEPS="linux-x86_64 linux-aarch64"
@@ -253,6 +253,8 @@ run_step() {
         fuzz-calls) sh "$ROOT/tests/fuzz/run.sh" -c "$C" -n "$FZ" -k "$k" -C ;;
         fuzz-lang06) sh "$ROOT/tests/fuzz/run.sh" -c "$C" -n "$FZ" -k "$k" -N ;;
         fuzz-vector) sh "$ROOT/tests/fuzz/run.sh" -c "$C" -n "$FZ" -k "$k" -V ;;
+        fuzz-div) sh "$ROOT/tests/fuzz/run.sh" -c "$C" -n "$FZ" -k "$k" -D ;;
+        fuzz-range) sh "$ROOT/tests/fuzz/run.sh" -c "$C" -n "$FZ" -k "$k" -R ;;
         fuzz-seed)
             seed=$(find_seed)
             if [ -z "$seed" ]; then

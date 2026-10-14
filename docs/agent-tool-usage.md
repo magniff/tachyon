@@ -214,3 +214,77 @@ Programs run from the shell (every simple command of every command line):
 - `Bash:perl` `perl -0pi -e 's/\$ tachyonc --tokens file\.tach        # the token dump/\$ tachyonc --emit-imports prog.tach -`: Finish docs, usage, README; commit
 - `Bash:perl` `perl -0pi -e 's/\[--emit-ir\] \[--verify-ir\] <file\.tach>\.\.\. \[-o out\.s\]/[--emit-ir] [--verify-ir] [--em`: Finish docs, usage, README; commit
 
+
+## 0.11: with the compiler's tools
+
+From the query-first hook going live (2026-10-14, 10:33, when `tachyonc
+query` first answered) to the 0.11.0 release, about 3.5 hours of agent
+work (the toolkit itself, the 0.11 performance work, the release).
+Sources: the hook's log (`tools/agent-tool-usage.py --hook-log
+.git/agent-tools.jsonl`) for reads, the transcripts for edits.
+
+**Reading and searching source.** 234 shell attempts or queries:
+
+| how | commands | share |
+|---|---|---|
+| `tachyonc query` (show 84, items 30, refs 19, def 7, stats 5, callers 3, deps 2) | 150 | 64% |
+| shell, with a `# no-query:` reason | 61 | 26% |
+| shell, blocked by the hook (then a query or an escape) | 23 | 10% |
+
+Besides these, 49 Read-tool reads of `.tach` files (logged, not
+blocked). Over all the transcripts (0.2 to 0.11, `tools/agent-tool-usage.py
+TRANSCRIPT_DIR`), 56% of source operations are still line-range reads;
+the hook period is where that changed.
+
+**Editing source** (the compiler's tree, not scratch copies):
+
+| how | edits | share |
+|---|---|---|
+| `tachyonc edit`, `refactor`, `fix`, `undo` (written) | 15 | 8% |
+| shell: Python and `sed -i` rewrites | 117 | 65% |
+| Write (mostly new modules) | 28 | 16% |
+| Edit | 20 | 11% |
+
+Also 54 dry runs and plans, and 39 written edits of scratch copies while
+the refactorings were built and tested. Edits went through the tools
+where one fit the change (a whole item, a signature, imports, a
+version); everything inside an item went through Python or `sed`.
+
+**Why the shell: the 61 escape reasons, by cause.**
+
+| cause | count |
+|---|---|
+| not compiler source: tests' directives (`// CHECK`, `// EXPECT`), fixtures, generated programs, scratch copies, a shell script | 19 |
+| reading back an edit just made with Python or `sed` | 17 |
+| a module's `use` lines, header comment, `extern` block or `mod` list | 12 |
+| lines of a long item, or around a reported line or a section comment | 10 |
+| merge conflicts (a file with markers does not parse) | 3 |
+
+**Feedback** (`tools/agent-feedback`, 33 entries, one a test):
+
+| cause | count |
+|---|---|
+| module text no query or edit reaches: `use` blocks, header and section comments, `extern` blocks, line ranges, whole small files | 12 |
+| query precision: types at a position, reads vs writes of a field, several names at once, `FILE:LINE`, `--root` in `try:` lines (some fixed in 0.11) | 7 |
+| refactoring output: imports not merged, long paths, `fix --only unsafe` per statement, `split`'s part names, one-hunk diffs, `--type` without a new default | 6 |
+| the hook: false positives (patterns, writes, generated programs, scripts) | 5 |
+| merge conflicts | 2 |
+
+**The top gaps, for 0.13:**
+
+1. **Module text by name**: `query show`/`edit` of a module's `use`
+   block, header comment, `extern` blocks and `mod` list; comments and
+   section markers findable; `query show FILE:A-B` for a range
+   (escapes 22, feedback 12).
+2. **Edits inside an item** (replace text anchored in NAME, or lines of
+   it), with the diff printed: the 117 Python and `sed` rewrites and the
+   17 read-backs that checked them.
+3. **Test files and other programs**: directives shown by `query`, a
+   file outside the compiler's tree answered with its own root (and the
+   `try:` line saying so), the hook counting only reads of compiler
+   source (19 escapes, 5 feedback).
+4. **Query precision**: the type at a position, references by kind
+   (read, write, literal), merge-conflict regions.
+5. **Refactoring output in the codebase's style**: new imports merged
+   into existing `use` lines with short paths, `unsafe` at function
+   level, named split parts.

@@ -543,6 +543,17 @@ The last release of the build-out.
   from the predecessor that branched (isel), equalities from branches
   (GVN); what remains in optimizer.md, 0.11
 
+0.11.0 release gate (2026-10-14): bootstrap --dev (fixpoint, 412 tests)
+and the suite at -O0/1/2 on aarch64-macos; fuzz 100 in each of the nine
+modes, ABI 40 (plain, `-i`, `-H`), objcheck (904 of 904); linux-check
+(x86_64-linux: the chain from the seed, all levels, fuzz 60 and 60 `-D`,
+ABI 30 in three modes, header layouts, objcheck); aarch64-linux-check
+(the cross-built fixpoint, all levels, fuzz 100 in the seven modes it
+runs, ABI 40 in three modes, header layouts, objcheck, gdb); benchmarks
+and compile times in "Benchmarks", 0.11; the agents' tool use in
+agent-tool-usage.md, "0.11: with the compiler's tools". Not run: the
+suite on x86_64-macos (Rosetta on the test machine, as for part A).
+
 ## 0.11 (continued): tools for agents
 
 `tachyonc query` (def, show, refs, callers, items; fully qualified paths
@@ -917,43 +928,57 @@ Compile time, the compiler building itself to an object, best of 7:
 -O0 109 ms with 0.9.0, 113 ms with 0.10; -O2 791 ms and 816 ms (+3%, the
 vectorizer and profile support).
 
-### 0.11 (performance)
+### 0.11
 
-aarch64-macos (Apple silicon, native; `bench/run.sh -p <0.10.0> -r 5`;
-"0.10.0" is the previous release at its default level; the last row is
-the geometric mean of each column over cc -O2's, programs with a C
-version only):
+aarch64-macos (Apple silicon, native, idle machine; `bench/run.sh -p
+<0.10.0> -r 9`, the fastest of 9 runs in ms; "0.10.0" is the previous
+release at its default level; the last row is the geometric mean of each
+column over cc -O2's, programs with a C version only):
 
-| program | 0.10.0 | 0.11 -O0 | 0.11 -O1 | 0.11 -O2 | cc -O2 |
-|---|---|---|---|---|---|
-| binarytrees | 176 | 198 | 169 | 156 | 155 |
-| collatz | 292 | 2439 | 292 | 291 | 292 |
-| fannkuch | 121 | 482 | 130 | 116 | 138 |
-| fib | 14 | 54 | 22 | 14 | 14 |
-| interp | 41 | 446 | 81 | 42 | 40 |
-| json | 112 | 487 | 141 | 109 | 92 |
-| mandelbrot | 165 | 1764 | 162 | 161 | 156 |
-| matmul | 18 | 504 | 75 | 18 | 43 |
-| nbody | 32 | 297 | 33 | 31 | 28 |
-| sieve | 62 | 264 | 59 | 63 | 72 |
-| sort | 90 | 363 | 75 | 66 | 57 |
-| stencil | 9 | 241 | 22 | 9 | 10 |
-| wordcount | 93 | 557 | 118 | 87 | 69 |
-| md5 | 35 | 166 | 38 | 36 | - |
-| geomean vs cc -O2 | 1.003 | 6.694 | 1.336 | 0.959 | 1 |
+| program | 0.10.0 | 0.11 -O2 | cc -O2 |
+|---|---|---|---|
+| binarytrees | 169 | 156 | 163 |
+| collatz | 291 | 292 | 295 |
+| fannkuch | 125 | 118 | 142 |
+| fib | 14 | 14 | 14 |
+| interp | 42 | 41 | 42 |
+| json | 115 | 109 | 93 |
+| mandelbrot | 170 | 171 | 166 |
+| matmul | 20 | 19 | 44 |
+| nbody | 33 | 32 | 29 |
+| sieve | 67 | 70 | 79 |
+| sort | 92 | 64 | 59 |
+| stencil | 8 | 8 | 8 |
+| wordcount | 96 | 89 | 71 |
+| md5 | 37 | 37 | - |
+| geomean vs cc -O2 | 1.004 | 0.953 | 1 |
 
-sort is 27% faster (branches on `&&` threaded from the predecessor that
-branched), wordcount 7% (equalities from branches drop the check in
-slice equality), fannkuch 4% (unrolling with run-time trip counts),
-nbody 3% (SLP). json, mandelbrot and binarytrees moved within this
-machine's noise (binarytrees ran 155 to 176 ms in repeated runs of
-either build). The gaps that remain (bounds checks, division by
-constants, FMA) are in optimizer.md, 0.11. interp is not slower with the
-vectorizer: it vectorizes no loop of interp (the IR is the same with
-`--no-vectorize`), so 0.10's 5% was noise.
+(-O0 and -O1 in the same run: geomean 6.689 and 1.344.) No program is
+slower than with 0.10.0 beyond noise. The three rows where 0.11 is not
+ahead were measured again, alternating the two builds, best of 25:
+sieve's object is byte for byte 0.10.0's (62.7 against 63.5 ms: noise),
+collatz's runs 291.9 against 291.8 ms, mandelbrot 165.4 against 161.1
+ms. sort is 30% faster (branches on `&&` threaded, ranges through phis),
+wordcount 7% and json 5% (equalities from branches, division by
+constants), fannkuch 6% (unrolling with run-time trip counts; its copy of
+10 elements unrolled whole rather than vectorized, which had cost it 5%
+since the ranges through phis: optimizer.md, 0.11); binarytrees' 8% is
+mostly this machine's spread for it (155 to 176 ms with either build).
+What remains against clang (bounds checks, FMA) is in optimizer.md, 0.11.
 
-Compile time, the compiler building itself (the 0.11 source) to an
-object, `--time-passes` total, best of 7: -O0 99 ms with 0.10.0, 94 ms
-with 0.11; -O2 832 ms and 859 ms (+3%: the SLP vectorizer about 0.5%,
-runtime unrolling's analysis about as much, the rest the GVN equalities
-and the cost model; the machine was shared, so ±2%).
+Compile time (aarch64-macos, idle machine, wall time, best of 7, the two
+compilers alternating on the same input: the 0.11 source, 71,900 lines):
+
+| | 0.10.0 | 0.11 |
+|---|---|---|
+| the compiler to an object, -O0 | 157 ms | 143 ms |
+| the compiler to an object, -O2 | 1208 ms | 1206 ms |
+| to an executable (`cc` links), -O0 | 184 ms | 171 ms |
+| to an executable (`cc` links), -O2 | 1231 ms | 1232 ms |
+| `tachyonc check compiler/src/main.tach` | | 44 ms |
+| `tachyonc query refs vector_unroll` | | 49 ms |
+
+The 0.11 compiler, built by itself, compiles the same input at -O2 as
+fast as 0.10.0 (its new passes cost about what its better-optimized code
+saves) and 9% faster at -O0. `check` (the front end only) and a query
+answer in under 50 ms.

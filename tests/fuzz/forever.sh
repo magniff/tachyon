@@ -79,7 +79,7 @@ for s in "$ROOT"/target/bootstrap/"$HOSTDIR"/seed-*/target/release/tachyon; do
     [ -x "$s" ] && { SEED=$s; break; }
 done
 
-MODES="plain loops generics pressure calls lang06 vector seed abi-plain abi-import abi-header"
+MODES="plain loops generics pressure calls lang06 vector div range seed abi-plain abi-import abi-header"
 [ -n "$SEED" ] || MODES=$(echo "$MODES" | sed 's/ seed//')
 
 take_compiler
@@ -101,6 +101,8 @@ while :; do
             calls) set -- fuzz -C ;;
             lang06) set -- fuzz -N ;;
             vector) set -- fuzz -V ;;
+            div) set -- fuzz -D ;;
+            range) set -- fuzz -R ;;
             seed) set -- fuzz -s "$SEED" ;;
             abi-plain) set -- abi ;;
             abi-import) set -- abi -i ;;
