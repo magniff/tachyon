@@ -2,20 +2,447 @@
 // checked as the block
 //
 //   { let __f0 = e0; ...; std::Interp { f: move |__out: *std::Fmt| {
-//       __out.str("a "); __out.spec(w, p, flags); __out.display(&__f0);
-//       __out.end_spec(); ... } } }
+//       __out.str("a "); __out.display(&__f0);
+//       let __s1 = __out.spec(w, p, flags); __out.debug(&__f1); __out.end_spec(__s1);
+//       ... } } }
 //
-// (its `y`, which the back ends lower): the holes are evaluated where the
-// f-string is written, left to right, once; a hole with `?` in its spec
-// is written with `debug`.
-//
-// Phase 0: a stub.
+// (its `y`, which the back ends lower; its type, `std::Interp<closure>`,
+// is the Interp's): the holes are evaluated where the f-string is written,
+// left to right, once; a hole with `?` in its spec is written with
+// `debug`, one with a spec between `spec` and `end_spec` (which pads it).
+// A hole of type `*T`, where T has the trait and `*T` has not, is written
+// as the T it points to (`__f0.fmt(__out)`). Texts of up to SHORT_TEXT
+// bytes are written with `byte`.
 
-use crate::front::ast::NODES;
-use crate::front::closures::unimplemented;
+use crate::base::{
+    SRC, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, intern, intern_c,
+};
+use crate::base::diag::{ERR_HELP, err_begin, err_end, err_help, err_str, report_warning};
+use crate::front::ast::{
+    CLOSURE_MOVE, FMT_BIN, FMT_CHAR, FMT_HEX, NODES, NodeKind, child, list_begin, list_end,
+    list_push, new_node,
+};
+use crate::front::check::{
+    CONST_CONTEXT, LOCALS, lookup_local, mismatch_error, pop_scope, push_scope, type_error,
+};
+use crate::front::check::synth_mode::synth_expr;
+use crate::front::check::unsafety::is_borrow;
+use crate::front::lexer::{STRS, SUF_I64, Tok};
+use crate::front::modules::STD_MODULE;
+use crate::front::patterns::check_pattern;
+use crate::front::traits::{implements, std_trait};
+use crate::front::types::{
+    FNS, TYPES, TY_ERROR, TY_U8, TyKind, buf_type, err_type, is_integer, is_pointer,
+};
+
+// Texts up to this long are written byte by byte (Fmt::byte is inlined,
+// Fmt::str is a call).
+const SHORT_TEXT: i64 = 2;
 
 // The type of f-string n; `expected` is the type it is checked against
 // (0: synthesized).
 pub fn check_interp(n: i64, expected: i64) -> i64 {
-    unsafe { unimplemented(NODES[n].start, c"f-strings") }
+    unsafe {
+        if NODES[n].y == 0 {
+            NODES[n].ty = expand(n);
+        }
+        let t = NODES[n].ty;
+        if expected == 0 || expected == t || expected == TY_ERROR || t == TY_ERROR {
+            return t;
+        }
+        if TYPES[expected].kind == TyKind::Slice {
+            err_begin(NODES[n].start);
+            err_str(c"an f-string is a 'std::Interp' (a value that prints), not '");
+            err_type(expected);
+            err_str(c"'");
+            err_help(c"make the text with 'format(f\"...\")' (a Buf: '.as_slice()' views it, '.free()' frees it), or pass the f-string where a 'T: Display' is taken (print, println, Buf::push_fmt)");
+            err_end();
+        }
+        mismatch_error(n, expected, t)
+    }
+}
+
+// Call n of function f (0.15): a plain string literal holding `{name}`,
+// where name is a local, passed to std's print, println, eprint, eprintln
+// or format was probably meant as an f-string; a warning.
+pub fn brace_warning(n: i64, f: i64) {
+    unsafe {
+        if NODES[n].count == 0 || STD_MODULE < 0 || FNS[f].module != STD_MODULE {
+            return;
+        }
+        let name = SYMS[NODES[FNS[f].node].a].text;
+        if !(name == "print" || name == "println" || name == "eprint" || name == "eprintln"
+            || name == "format") {
+            return;
+        }
+        let arg = child(n, 0);
+        if NODES[arg].kind != NodeKind::Str || SRC[NODES[arg].start] != '"' {
+            return;
+        }
+        let s = STRS[NODES[arg].a];
+        let mut k = 0;
+        while k < s.len {
+            let hole = local_hole(s, k);
+            if hole > 0 {
+                let message = buf_new();
+                buf_str(message, c"this string has '");
+                buf_bytes(message, s[k..k + hole]);
+                buf_str(message, c"' in it, as text: it is not an f-string");
+                buf_byte(message, 0);
+                // The literal as an f-string: the locals' holes kept, other
+                // braces doubled.
+                let raw = SRC[NODES[arg].start + 1..NODES[arg].end - 1];
+                let help = buf_new();
+                buf_str(help, c"an f-string writes the local's value: '");
+                buf_bytes(help, name);
+                buf_str(help, c"(f\"");
+                let mut i = 0;
+                while i < raw.len {
+                    let h = local_hole(raw, i);
+                    if h > 0 {
+                        buf_bytes(help, raw[i..i + h]);
+                        i += h;
+                        continue;
+                    }
+                    if raw[i] == '{' || raw[i] == '}' {
+                        buf_byte(help, raw[i]);
+                    }
+                    buf_byte(help, raw[i]);
+                    i += 1;
+                }
+                buf_str(help, c"\")'");
+                buf_byte(help, 0);
+                report_warning(NODES[arg].start, 1, c"format", buf_slice(message).ptr,
+                    buf_slice(help).ptr);
+                return;
+            }
+            k += 1;
+        }
+    }
+}
+
+// The length of `{name}` or `{name:spec}` at s[k], name a local in scope
+// (not after a `{`); 0 when there is none.
+fn local_hole(s: [u8], k: i64) -> i64 {
+    unsafe {
+        if s[k] != '{' || k > 0 && s[k - 1] == '{' {
+            return 0;
+        }
+        let mut j = k + 1;
+        while j < s.len && (is_alnum(s[j]) || s[j] == '_') {
+            j += 1;
+        }
+        if j == k + 1 || j >= s.len || s[j] != '}' && s[j] != ':'
+            || lookup_local(intern(s[k + 1..j])).is_none() {
+            return 0;
+        }
+        while j < s.len && s[j] != '}' {
+            j += 1;
+        }
+        if j < s.len { j + 1 - k } else { 0 }
+    }
+}
+
+fn is_alnum(c: u8) -> bool {
+    c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
+}
+
+// Checks f-string n and makes its block (NODES[n].y); its type.
+fn expand(n: i64) -> i64 {
+    unsafe {
+        let start = NODES[n].start;
+        let end = NODES[n].end;
+        let count = NODES[n].count;
+        if CONST_CONTEXT {
+            type_error(n,
+                c"an f-string cannot be used in a constant expression: it is made when it runs");
+        }
+        // The holes, left to right, once.
+        let mut failed = false;
+        for i in 0..count {
+            let item = child(n, i);
+            if NODES[item].kind == NodeKind::InterpHole {
+                let t = synth_expr(NODES[item].a);
+                NODES[item].ty = t;
+                if t == TY_ERROR {
+                    failed = true;
+                } else {
+                    check_hole(item, t);
+                }
+            }
+        }
+        if failed {
+            NODES[n].y = new_node(NodeKind::Block, start, end);
+            return TY_ERROR;
+        }
+        let out = intern_c(c"__out");
+        let lets = list_begin();
+        let mut holes = 0;
+        for i in 0..count {
+            let item = child(n, i);
+            if NODES[item].kind == NodeKind::InterpHole {
+                let bind = new_node(NodeKind::PatBind, NODES[item].start, NODES[item].end);
+                NODES[bind].a = hidden(c"__f", holes);
+                let binding = new_node(NodeKind::Let, NODES[item].start, NODES[item].end);
+                NODES[binding].a = bind;
+                NODES[binding].c = NODES[item].a;
+                list_push(binding);
+                holes += 1;
+            }
+        }
+        let block = new_node(NodeKind::Block, start, end);
+        list_end(block, lets);
+        // The closure's body.
+        let stmts = list_begin();
+        holes = 0;
+        for i in 0..count {
+            let item = child(n, i);
+            if NODES[item].kind == NodeKind::Str {
+                // (a short text: its bytes, `__out.byte(b'a')`, inlined)
+                let text = STRS[NODES[item].a];
+                if text.len <= SHORT_TEXT {
+                    for k in 0..text.len {
+                        let c = new_node(NodeKind::Char, NODES[item].start, NODES[item].end);
+                        NODES[c].a = text[k] as i64;
+                        list_push(stmt(call1(ident(out, item), c"byte", c)));
+                    }
+                } else {
+                    list_push(stmt(call1(ident(out, item), c"str", item)));
+                }
+                continue;
+            }
+            let name = hidden(c"__f", holes);
+            let debug = NODES[item].b == 1;
+            // (`__out.display(&__f0)`; through a pointer, `__f0.fmt(__out)`:
+            // a pointer value is passed as a receiver)
+            let write = if takes_pointer(item) {
+                call1(ident(name, item), if debug { c"fmt_debug" } else { c"fmt" },
+                    ident(out, item))
+            } else {
+                call1(ident(out, item), if debug { c"debug" } else { c"display" },
+                    unary(Tok::Amp, ident(name, item)))
+            };
+            let flags = NODES[item].p;
+            if NODES[item].c > 0 || NODES[item].d >= 0 || flags != 0 {
+                // let __sN = __out.spec(w, p, flags); write; __out.end_spec(__sN);
+                let saved = hidden(c"__s", holes);
+                let spec = method_call(ident(out, item), c"spec");
+                let amark = list_begin();
+                list_push(int_node(if NODES[item].c > 0 { NODES[item].c } else { 0 }, item));
+                list_push(int_node(NODES[item].d, item));
+                list_push(int_node(flags, item));
+                list_end(spec, amark);
+                let bind = new_node(NodeKind::PatBind, NODES[item].start, NODES[item].end);
+                NODES[bind].a = saved;
+                let binding = new_node(NodeKind::Let, NODES[item].start, NODES[item].end);
+                NODES[binding].a = bind;
+                NODES[binding].c = spec;
+                list_push(binding);
+                list_push(stmt(write));
+                list_push(stmt(call1(ident(out, item), c"end_spec", ident(saved, item))));
+            } else {
+                list_push(stmt(write));
+            }
+            holes += 1;
+        }
+        let body = new_node(NodeKind::Block, start, end);
+        list_end(body, stmts);
+        // move |__out: *std::Fmt| body
+        let fmt_name = new_node(NodeKind::TyName, start, end);
+        NODES[fmt_name].a = intern_c(c"Fmt");
+        let smark = list_begin();
+        list_push(std_ident(n));
+        list_end(fmt_name, smark);
+        let fmt_ptr = new_node(NodeKind::TyPtr, start, end);
+        NODES[fmt_ptr].a = fmt_name;
+        let param = new_node(NodeKind::Param, start, end);
+        NODES[param].a = out;
+        NODES[param].b = fmt_ptr;
+        let closure = new_node(NodeKind::Closure, start, end);
+        NODES[closure].c = CLOSURE_MOVE;
+        NODES[closure].a = body;
+        let pmark = list_begin();
+        list_push(param);
+        list_end(closure, pmark);
+        // std::Interp { f: closure }
+        let lit = new_node(NodeKind::StructLit, start, end);
+        NODES[lit].a = intern_c(c"Interp");
+        let prefix = new_node(NodeKind::Path, start, end);
+        let prefix_mark = list_begin();
+        list_push(std_ident(n));
+        list_end(prefix, prefix_mark);
+        NODES[lit].h = prefix;
+        let field = new_node(NodeKind::FieldInit, start, end);
+        NODES[field].a = intern_c(c"f");
+        NODES[field].b = closure;
+        let fmark = list_begin();
+        list_push(field);
+        list_end(lit, fmark);
+        NODES[block].a = lit;
+        // The `let`s by hand (their values are checked), then the literal.
+        push_scope();
+        let mut k = 0;
+        for i in 0..count {
+            let item = child(n, i);
+            if NODES[item].kind == NodeKind::InterpHole {
+                let bind = NODES[child(block, k)].a;
+                check_pattern(bind, NODES[item].ty);
+                // (`{self}`, `{&p}`: a borrow, as passed directly)
+                if is_pointer(NODES[item].ty) && is_borrow(NODES[item].a) {
+                    LOCALS[NODES[bind].x].borrow = true;
+                }
+                k += 1;
+            }
+        }
+        let t = synth_expr(lit);
+        pop_scope();
+        NODES[block].ty = t;
+        NODES[n].y = block;
+        t
+    }
+}
+
+// Hole h, of type t (not the error type): the trait its spec needs, and
+// the integer its `x`, `X`, `b`, `c` need.
+fn check_hole(h: i64, t: i64) {
+    unsafe {
+        let debug = NODES[h].b == 1;
+        let tr = std_trait(if debug { c"Debug" } else { c"Display" });
+        if tr < 0 {
+            return;
+        }
+        let shown = if takes_pointer(h) { TYPES[t].a } else { t };
+        if !implements(tr, shown) {
+            missing_trait(h, shown, debug);
+        }
+        let flags = NODES[h].p;
+        if (flags & FMT_CHAR) != 0 && shown != TY_U8 {
+            spec_error(h, shown, c"'c' writes a byte: it needs a 'u8', got '");
+        }
+        if (flags & (FMT_HEX | FMT_BIN)) != 0 && !is_integer(shown) {
+            spec_error(h, shown,
+                c"'x', 'X' and 'b' write an integer's digits: they need an integer, got '");
+        }
+    }
+}
+
+// Whether hole h (checked) is written through its value: a pointer to a
+// type with the trait, the pointer type having none.
+fn takes_pointer(h: i64) -> bool {
+    unsafe {
+        let t = NODES[h].ty;
+        if !is_pointer(t) || TYPES[t].a == 0 {
+            return false;
+        }
+        let tr = std_trait(if NODES[h].b == 1 { c"Debug" } else { c"Display" });
+        tr >= 0 && !implements(tr, t) && implements(tr, TYPES[t].a)
+    }
+}
+
+fn missing_trait(h: i64, t: i64, debug: bool) -> ! {
+    unsafe {
+        err_begin(NODES[NODES[h].a].start);
+        err_str(c"'");
+        err_type(t);
+        err_str(if debug {
+            c"' does not implement Debug, which '{x:?}' needs"
+        } else {
+            c"' does not implement Display, which '{x}' needs"
+        });
+        if TYPES[t].kind == TyKind::Struct || TYPES[t].kind == TyKind::Enum {
+            if debug {
+                err_help(
+                    c"derive it: '#[derive(Debug)]' before the type, or write 'impl Debug for ");
+                buf_type(ERR_HELP, t);
+                err_help(c" { fn fmt_debug(self: *");
+            } else {
+                err_help(c"write 'impl Display for ");
+                buf_type(ERR_HELP, t);
+                err_help(c" { fn fmt(self: *");
+            }
+            buf_type(ERR_HELP, t);
+            err_help(c", f: *std::Fmt) { f.write(f\"...\"); } }'");
+        } else if !debug {
+            err_help(c"write it with Debug, '{x:?}', or format its parts");
+        }
+        err_end()
+    }
+}
+
+fn spec_error(h: i64, t: i64, message: *u8) -> ! {
+    unsafe {
+        err_begin(NODES[NODES[h].a].start);
+        err_str(message);
+        err_type(t);
+        err_str(c"'");
+        err_end()
+    }
+}
+
+// `__f3`, `__s3`: a hidden local's name.
+fn hidden(prefix: *u8, i: i64) -> i64 {
+    let out = buf_new();
+    buf_str(out, prefix);
+    buf_int(out, i);
+    intern(buf_slice(out))
+}
+
+fn ident(sym: i64, at: i64) -> i64 {
+    unsafe {
+        let id = new_node(NodeKind::Ident, NODES[at].start, NODES[at].end);
+        NODES[id].a = sym;
+        id
+    }
+}
+
+fn std_ident(at: i64) -> i64 {
+    unsafe { ident(intern_c(c"std"), at) }
+}
+
+fn unary(op: Tok, e: i64) -> i64 {
+    unsafe {
+        let u = new_node(NodeKind::Unary, NODES[e].start, NODES[e].end);
+        NODES[u].op = op;
+        NODES[u].b = e;
+        u
+    }
+}
+
+// An i64 literal of value v (a negative one as `-v`), at node at.
+fn int_node(v: i64, at: i64) -> i64 {
+    unsafe {
+        let lit = new_node(NodeKind::Int, NODES[at].start, NODES[at].end);
+        NODES[lit].a = if v < 0 { -v } else { v };
+        NODES[lit].b = SUF_I64;
+        if v < 0 { unary(Tok::Minus, lit) } else { lit }
+    }
+}
+
+// `receiver.name()`, its arguments to be added.
+fn method_call(receiver: i64, name: *u8) -> i64 {
+    unsafe {
+        let c = new_node(NodeKind::MethodCall, NODES[receiver].start, NODES[receiver].end);
+        NODES[c].a = receiver;
+        NODES[c].b = intern_c(name);
+        c
+    }
+}
+
+// `receiver.name(arg)`.
+fn call1(receiver: i64, name: *u8, arg: i64) -> i64 {
+    let c = method_call(receiver, name);
+    let mark = list_begin();
+    list_push(arg);
+    list_end(c, mark);
+    c
+}
+
+// `e;`
+fn stmt(e: i64) -> i64 {
+    unsafe {
+        let s = new_node(NodeKind::ExprStmt, NODES[e].start, NODES[e].end);
+        NODES[s].a = e;
+        NODES[s].b = 1;
+        s
+    }
 }

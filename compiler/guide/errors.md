@@ -42,7 +42,7 @@ error[parser error] expected identifier, got '&' | help: write the type of self:
 println!("{}", 1);
 ```
 ```err
-error[parser error] 'println!' is a macro call: tachyon has no macros
+error[parser error] 'println!' is a macro call: tachyon has no macros | help: write `println(f"{1}")`
 ```
 `println(f"{x}")` (0.15, `tachyonc guide formatting`). The help names
 what replaces `vec!`, `format!`, `assert!` and the others.
@@ -431,7 +431,7 @@ struct P { x: i64 }
 fn main() -> i32 { let p = P { x: 1 }; println(f"{p}"); 0 }
 ```
 ```err
-the trait 'Display' is not implemented for 'P'
+'P' does not implement Display
 ```
 Implement it (`impl Display for P { fn fmt(self: *P, f: *std::Fmt) {
 f.write(f"P({self.x})"); } }`), or print with `{p:?}` and

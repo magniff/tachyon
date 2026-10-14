@@ -4,7 +4,7 @@
 ## A method #[derive] makes: the attribute answers (0.15).
 $ items
 crate	syntax015/main.tach	6
-std	<std>	259
+std	<std>	316
 warning query.program-errors: 2 errors in the program; results may be incomplete
 try: tachyonc --diagnostics=short syntax015/main.tach -c -o /dev/null
 $ show main

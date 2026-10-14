@@ -5,46 +5,92 @@
 // (`{x}`, print) and Debug (`{x:?}`), the formatter Fmt they write to, and
 // Interp, the value of an f-string (docs/design/errors-formatting.md).
 //
-// The functions of Display and Debug impls and Fmt's are #[inline]: std's
-// #[inline] functions are checked and emitted only where they are used.
+// Output to stdout and stderr goes through one static buffer of 4 KB
+// (not the heap), written out at the end of each print call: one `write`
+// per print, whatever its argument is made of. A Fmt to a file descriptor
+// only fills that buffer: `flush` writes it out.
+
+extern "C" {
+    fn snprintf(buf: *u8, n: u64, format: *u8, ...) -> i32;
+    fn strtod(s: *u8, end: **u8) -> f64;
+    fn strtof(s: *u8, end: **u8) -> f32;
+}
 
 // ---- Printing ----
 
-pub fn print(s: [u8]) {
-    unsafe {
-        write(1, s.ptr, s.len as u64);
-    }
+// x's Display (`print("text")`, `print(f"{a} {b:?}")`): one `write`.
+pub fn print<T: Display>(x: T) {
+    let mut f = Fmt::to_fd(1);
+    x.fmt(&f);
+    f.flush();
 }
 
-pub fn println(s: [u8]) {
-    print(s);
-    print("\n");
+pub fn println<T: Display>(x: T) {
+    let mut f = Fmt::to_fd(1);
+    x.fmt(&f);
+    f.byte('\n');
+    f.flush();
 }
 
 pub fn print_int(v: i64) {
-    let mut b = Buf::new();
-    b.push_int(v);
-    print(b.as_slice());
-    b.free();
+    let mut f = Fmt::to_fd(1);
+    f.int(v);
+    f.flush();
 }
 
 // A C string (up to its NUL).
 pub unsafe fn print_cstr(s: *u8) {
-    let mut b = Buf::new();
-    b.push_cstr(s);
-    print(b.as_slice());
-    b.free();
+    let mut n = 0;
+    while s[n] != 0 {
+        n += 1;
+    }
+    let mut f = Fmt::to_fd(1);
+    f.str(s[0..n]);
+    f.flush();
 }
 
 // ---- Display, Debug and Fmt (0.15) ----
 
-// `{x}` in an f-string.
+// x's Display on stderr.
+pub fn eprint<T: Display>(x: T) {
+    let mut f = Fmt::to_fd(2);
+    x.fmt(&f);
+    f.flush();
+}
+
+pub fn eprintln<T: Display>(x: T) {
+    let mut f = Fmt::to_fd(2);
+    x.fmt(&f);
+    f.byte('\n');
+    f.flush();
+}
+
+// x's Display in a new Buf (the caller frees it): `format(f"{x:>8}")`.
+pub fn format<T: Display>(x: T) -> Buf {
+    let mut b = Buf::new();
+    let mut f = Fmt::to_buf(&b);
+    x.fmt(&f);
+    b
+}
+
+impl Buf {
+    // Appends x's Display: `b.push_fmt(f"{k}={v};")`.
+    pub fn push_fmt<T: Display>(self: *Buf, x: T) {
+        let mut f = Fmt::to_buf(self);
+        x.fmt(&f);
+    }
+}
+
+// `{x}` in an f-string, and what print writes.
 pub trait Display { fn fmt(self: *Self, f: *Fmt); }
 
 // `{x:?}`: as the code that makes it.
 pub trait Debug { fn fmt_debug(self: *Self, f: *Fmt); }
 
-// A spec's flags (front/ast.tach's FMT_*): `<`, `>`, `0`, `x`, `X`, `b`, `c`.
+// A spec's flags (front/ast.tach's FMT_*): `<`, `>`, `0`, `x`, `X`, `b`,
+// `c`; spec adds FMT_PAD to a hole with a width or a precision, and a
+// number written first in such a hole adds FMT_NUM (right-aligned,
+// zero-padded after its sign, not cut by the precision).
 const FMT_LEFT: i64 = 1;
 const FMT_RIGHT: i64 = 2;
 const FMT_ZERO: i64 = 4;
@@ -52,8 +98,153 @@ const FMT_HEX: i64 = 8;
 const FMT_UPPER: i64 = 16;
 const FMT_BIN: i64 = 32;
 const FMT_CHAR: i64 = 64;
+const FMT_NUM: i64 = 128;
+const FMT_PAD: i64 = 256;
 
-// What Display and Debug write to: `buf`, or `fd` when `buf` is null.
+// The buffer of stdout and stderr: FMT_LEN bytes for FMT_FD; FMT_DONE
+// bytes were written out before them (FMT_DONE + FMT_LEN: the position a
+// spec marks).
+const FMT_CAP: i64 = 4096;
+static mut FMT_OUT: [u8; 4096] = [0; 4096];
+static mut FMT_LEN: i64 = 0;
+static mut FMT_FD: i32 = 1;
+static mut FMT_DONE: i64 = 0;
+
+// Writes the buffer out.
+#[inline(never)]
+fn fmt_flush() {
+    let mut i = 0;
+    while i < FMT_LEN {
+        let rest = FMT_OUT[i..FMT_LEN];
+        let n = unsafe { write(FMT_FD, rest.ptr, rest.len as u64) };
+        if n <= 0 {
+            break;
+        }
+        i += n;
+    }
+    FMT_DONE += FMT_LEN;
+    FMT_LEN = 0;
+}
+
+// The next n bytes of f's destination, taken, when they fit (the buffer
+// holds FMT_FD's bytes, the Buf has the capacity); else an empty slice.
+#[inline]
+fn fmt_room(f: *Fmt, n: i64) -> [u8] {
+    if f.fd >= 0 {
+        if f.fd == FMT_FD && FMT_LEN + n <= FMT_CAP {
+            let at = FMT_LEN;
+            FMT_LEN = at + n;
+            return FMT_OUT[at..at + n];
+        }
+    } else {
+        unsafe {
+            let v = &(*f.buf).bytes;
+            if v.len + n <= v.cap {
+                let at = v.len;
+                v.len = at + n;
+                return v.ptr[at..at + n];
+            }
+        }
+    }
+    FMT_OUT[0..0]
+}
+
+// fmt_room after making the room (n: at most FMT_CAP): the buffer written
+// out, or the Buf grown.
+#[inline(never)]
+fn fmt_make_room(f: *Fmt, n: i64) -> [u8] {
+    if f.fd >= 0 {
+        fmt_flush();
+        FMT_FD = f.fd;
+    } else {
+        unsafe {
+            (*f.buf).bytes.reserve(n);
+        }
+    }
+    fmt_room(f, n)
+}
+
+// Fmt::str (not inlined: an f-string's text is a call).
+#[inline(never)]
+fn fmt_str(f: *Fmt, s: [u8]) {
+    let n = s.len;
+    let mut out = fmt_room(f, n);
+    if out.len != n {
+        if f.fd >= 0 && n > FMT_CAP {
+            // (written directly)
+            fmt_flush();
+            FMT_FD = f.fd;
+            let mut i = 0;
+            while i < n {
+                let rest = s[i..n];
+                let k = unsafe { write(f.fd, rest.ptr, rest.len as u64) };
+                if k <= 0 {
+                    break;
+                }
+                i += k;
+            }
+            FMT_DONE += n;
+            return;
+        }
+        out = fmt_make_room(f, n);
+    }
+    for i in 0..n {
+        out[i] = s[i];
+    }
+}
+
+// Fmt::byte when it does not fit (not inlined).
+#[inline(never)]
+fn fmt_byte(f: *Fmt, b: u8) {
+    let out = fmt_make_room(f, 1);
+    out[0] = b;
+}
+
+// u's decimal digits, after a '-' when negative.
+#[inline]
+fn fmt_decimal(f: *Fmt, u: u64, negative: bool) {
+    let mut n = 1;
+    let mut ten: u64 = 10;
+    while n < 20 && u >= ten {
+        n += 1;
+        ten *= 10;
+    }
+    let len = if negative { n + 1 } else { n };
+    let mut out = fmt_room(f, len);
+    if out.len != len {
+        out = fmt_make_room(f, len);
+    }
+    // (two digits at a time)
+    let pairs = "00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899";
+    let mut x = u;
+    let mut i = len;
+    unsafe {
+        let p = out.ptr;
+        while x >= 100 {
+            let q = x / 100;
+            let r = (x - q * 100) as i64 * 2;
+            i -= 2;
+            p[i] = pairs.ptr[r];
+            p[i + 1] = pairs.ptr[r + 1];
+            x = q;
+        }
+        if x >= 10 {
+            let r = x as i64 * 2;
+            p[i - 2] = pairs.ptr[r];
+            p[i - 1] = pairs.ptr[r + 1];
+        } else {
+            p[i - 1] = '0' + x as u8;
+        }
+        if negative {
+            p[0] = '-';
+        }
+    }
+}
+
+// What Display and Debug write to: `buf`, or file descriptor `fd` (through
+// std's buffer: `flush` writes it out) when `buf` is null. `width`, `prec`
+// (-1: none) and `flags` are the spec of the hole being written, `mark`
+// the position it started at.
 pub struct Fmt { buf: *Buf, fd: i32, width: i64, prec: i64, flags: i64, mark: i64 }
 
 impl Fmt {
@@ -69,26 +260,44 @@ impl Fmt {
 
     #[inline]
     pub fn str(self: *Fmt, s: [u8]) {
-        if self.fd >= 0 {
-            unsafe {
-                write(self.fd, s.ptr, s.len as u64);
-            }
-        } else {
-            unsafe {
-                (*self.buf).push_str(s);
-            }
-        }
+        fmt_str(self, s);
     }
 
     #[inline]
     pub fn byte(self: *Fmt, b: u8) {
-        let one: [u8; 1] = [b];
-        self.str(one[0..1]);
+        if self.fd == FMT_FD && FMT_LEN < FMT_CAP {
+            let out: *u8 = &FMT_OUT[0];
+            unsafe {
+                out[FMT_LEN] = b;
+            }
+            FMT_LEN += 1;
+            return;
+        }
+        if self.fd < 0 {
+            unsafe {
+                let v = &(*self.buf).bytes;
+                if v.len < v.cap {
+                    v.ptr[v.len] = b;
+                    v.len += 1;
+                    return;
+                }
+            }
+        }
+        fmt_byte(self, b);
     }
 
-    // (nothing is buffered yet: a Fmt to a file descriptor writes at once)
+    // Writes out what a Fmt to a file descriptor has buffered (print does).
     #[inline]
     pub fn flush(self: *Fmt) {
+        if self.fd >= 0 {
+            fmt_flush();
+        }
+    }
+
+    // x's Display: `f.write(f"({self.x}, {self.y})")` in a Display impl.
+    #[inline]
+    pub fn write<T: Display>(self: *Fmt, x: T) {
+        x.fmt(self);
     }
 
     #[inline]
@@ -100,45 +309,489 @@ impl Fmt {
     pub fn debug<T: Debug>(self: *Fmt, x: *T) {
         x.fmt_debug(self);
     }
-}
 
-// v in decimal.
-#[inline]
-fn fmt_int(f: *Fmt, v: i64) {
-    let mut digits: [u8; 20] = [0; 20];
-    let mut n = 20;
-    let mut u = if v < 0 { (-(v + 1)) as u64 + 1 } else { v as u64 };
-    loop {
-        n -= 1;
-        digits[n] = '0' + (u % 10) as u8;
-        u = u / 10;
-        if u == 0 {
-            break;
+    // The position written to.
+    fn pos(self: *Fmt) -> i64 {
+        if self.fd >= 0 {
+            FMT_DONE + FMT_LEN
+        } else {
+            unsafe { (*self.buf).len() }
         }
     }
-    if v < 0 {
-        f.byte('-');
+
+    // Starts a hole with a spec (width w, precision p, -1: none; FMT_*
+    // flags): what is written up to end_spec, given the result, is padded
+    // to w. The buffer is first written out unless w bytes fit in it, so
+    // the hole's text is either all in it or at least w long.
+    #[inline]
+    pub fn spec(self: *Fmt, w: i64, p: i64, flags: i64) -> Fmt {
+        let old = *self;
+        self.flags = flags;
+        if w > 0 || p >= 0 {
+            if self.fd >= 0 && (self.fd != FMT_FD || FMT_CAP - FMT_LEN < w) {
+                fmt_flush();
+                FMT_FD = self.fd;
+            }
+            self.width = w;
+            self.prec = p;
+            self.flags = flags | FMT_PAD;
+            self.mark = self.pos();
+        }
+        old
     }
-    f.str(digits[n..20]);
+
+    // Ends the hole `spec` started (`old`: what it returned).
+    #[inline]
+    pub fn end_spec(self: *Fmt, old: Fmt) {
+        if (self.flags & FMT_PAD) != 0 {
+            fmt_pad(self);
+        }
+        self.width = old.width;
+        self.prec = old.prec;
+        self.flags = old.flags;
+        self.mark = old.mark;
+    }
+
+    // v in decimal (x, X, b: in hex or binary, as a u64; c: its low byte).
+    #[inline(never)]
+    pub fn int(self: *Fmt, v: i64) {
+        if self.flags != 0 {
+            if (self.flags & (FMT_HEX | FMT_BIN | FMT_CHAR)) != 0 {
+                fmt_radix(self, v as u64);
+                return;
+            }
+            fmt_number_start(self);
+        }
+        let negative = v < 0;
+        fmt_decimal(self, if negative { (-(v + 1)) as u64 + 1 } else { v as u64 }, negative);
+    }
+
+    // v in decimal, hex (x, X), binary (b), or as a byte (c).
+    #[inline(never)]
+    pub fn uint(self: *Fmt, v: u64) {
+        if self.flags != 0 {
+            if (self.flags & (FMT_HEX | FMT_BIN | FMT_CHAR)) != 0 {
+                fmt_radix(self, v);
+                return;
+            }
+            fmt_number_start(self);
+        }
+        fmt_decimal(self, v, false);
+    }
+
+    // v as Display writes it: the shortest decimal that reads back as v,
+    // never with an exponent; with a precision, that many decimals.
+    pub fn float(self: *Fmt, v: f64) {
+        fmt_float(self, v, false, false);
+    }
 }
 
-// An f-string's value.
+// A number starts here: when nothing of the hole is written yet, the hole
+// is a number's (right-aligned, zero-padded after the sign).
+fn fmt_number_start(f: *Fmt) {
+    if (f.flags & FMT_PAD) != 0 && f.pos() == f.mark {
+        f.flags |= FMT_NUM;
+    }
+}
+
+// v in hex or binary, or its low byte (c).
+#[inline(never)]
+fn fmt_radix(f: *Fmt, v: u64) {
+    let flags = f.flags;
+    if (flags & FMT_CHAR) != 0 {
+        f.byte(v as u8);
+        return;
+    }
+    fmt_number_start(f);
+    let shift: u64 = if (flags & FMT_HEX) != 0 { 4 } else { 1 };
+    let mask = (1u64 << shift) - 1;
+    let digits = if (flags & FMT_UPPER) != 0 { "0123456789ABCDEF" } else { "0123456789abcdef" };
+    let mut n = 1;
+    let mut bits = shift;
+    while bits < 64 && (v >> bits) != 0 {
+        n += 1;
+        bits += shift;
+    }
+    let mut out = fmt_room(f, n);
+    if out.len != n {
+        out = fmt_make_room(f, n);
+    }
+    let mut u = v;
+    let mut i = n;
+    unsafe {
+        let p = out.ptr;
+        while i > 0 {
+            i -= 1;
+            p[i] = digits.ptr[(u & mask) as i64];
+            u = u >> shift;
+        }
+    }
+}
+
+// A signed integer of `bits` bits: in hex or binary as its unsigned value
+// of that size (Rust's `{:x}` of -1i8 is ff).
+fn fmt_signed(f: *Fmt, v: i64, bits: u64) {
+    if v < 0 && (f.flags & (FMT_HEX | FMT_BIN)) != 0 {
+        f.uint((v as u64) & ((1u64 << bits) - 1));
+    } else {
+        f.int(v);
+    }
+}
+
+// The padding and truncation of the hole f.spec started.
+#[inline(never)]
+fn fmt_pad(f: *Fmt) {
+    let flags = f.flags;
+    let start = f.mark;
+    let mut end = f.pos();
+    let number = (flags & FMT_NUM) != 0;
+    let reach = if f.fd >= 0 { start >= FMT_DONE && f.fd == FMT_FD } else { true };
+    // (a precision cuts text)
+    if f.prec >= 0 && !number && end - start > f.prec && reach {
+        end = start + f.prec;
+        if f.fd >= 0 {
+            FMT_LEN = end - FMT_DONE;
+        } else {
+            unsafe {
+                (*f.buf).bytes.len = end;
+            }
+        }
+    }
+    let pad = f.width - (end - start);
+    if pad <= 0 {
+        return;
+    }
+    if (flags & FMT_LEFT) != 0 || (flags & FMT_RIGHT) == 0 && !number {
+        for i in 0..pad {
+            f.byte(' ');
+        }
+        return;
+    }
+    if !reach {
+        return;
+    }
+    // Right-aligned: the text moves right by pad, after the sign when zeros
+    // fill.
+    let zeros = number && (flags & FMT_ZERO) != 0;
+    let mut text: *u8 = 0 as *u8;
+    let mut base = 0;
+    if f.fd >= 0 {
+        // (spec made room for the width)
+        text = &FMT_OUT[0];
+        base = FMT_DONE;
+        FMT_LEN += pad;
+    } else {
+        unsafe {
+            (*f.buf).bytes.reserve(pad);
+            text = (*f.buf).bytes.ptr;
+            (*f.buf).bytes.len += pad;
+        }
+    }
+    let mut at = start - base;
+    unsafe {
+        if zeros && end > start && (text[at] == '-' || text[at] == '+') {
+            at += 1;
+        }
+        let mut i = end - base - at;
+        while i > 0 {
+            i -= 1;
+            text[at + pad + i] = text[at + i];
+        }
+        for k in 0..pad {
+            text[at + k] = if zeros { '0' } else { ' ' };
+        }
+    }
+}
+
+// v in decimal (single: an f32's value): the shortest digits that read
+// back as v (15 to 17 of them, 6 to 9 for an f32), never with an exponent
+// for Display; Debug as Rust writes it (`1.0`, `1e16`, `1e-7`). With a
+// precision, that many decimals (C's %.Nf).
+#[inline(never)]
+fn fmt_float(f: *Fmt, v: f64, single: bool, debug: bool) {
+    if f.flags != 0 {
+        fmt_number_start(f);
+    }
+    if v != v {
+        f.str("NaN");
+        return;
+    }
+    if v - v != 0.0 {
+        f.str(if v > 0.0 { "inf" } else { "-inf" });
+        return;
+    }
+    let mut tmp: [u8; 64] = [0; 64];
+    if f.prec >= 0 {
+        let n = unsafe { snprintf(&tmp[0], 64, c"%.*f", f.prec as i32, v) } as i64;
+        if n < 64 {
+            f.str(tmp[0..n]);
+        } else {
+            unsafe {
+                let big = malloc((n + 1) as u64);
+                snprintf(big, (n + 1) as u64, c"%.*f", f.prec as i32, v);
+                f.str(big[0..n]);
+                free(big);
+            }
+        }
+        return;
+    }
+    let mut digits = if single { 6 } else { 15 };
+    let last = if single { 9 } else { 17 };
+    let mut n = 0;
+    loop {
+        n = unsafe { snprintf(&tmp[0], 64, c"%.*e", (digits - 1) as i32, v) } as i64;
+        if digits == last {
+            break;
+        }
+        let same = if single {
+            let back = unsafe { strtof(&tmp[0], 0 as **u8) };
+            back == v as f32
+        } else {
+            let back = unsafe { strtod(&tmp[0], 0 as **u8) };
+            back == v
+        };
+        if same {
+            break;
+        }
+        digits += 1;
+    }
+    // tmp: [-]d[.ddd]e(+|-)dd: the digits (without the point) and the
+    // exponent of the first.
+    let mut i = 0;
+    let negative = tmp[0] == '-';
+    if negative {
+        i = 1;
+    }
+    let mut ds: [u8; 24] = [0; 24];
+    let mut k = 0;
+    while i < n && tmp[i] != 'e' {
+        if tmp[i] != '.' {
+            ds[k] = tmp[i];
+            k += 1;
+        }
+        i += 1;
+    }
+    while k > 1 && ds[k - 1] == '0' {
+        k -= 1;
+    }
+    i += 1;
+    let exp_negative = tmp[i] == '-';
+    i += 1;
+    let mut exp = 0;
+    while i < n {
+        exp = exp * 10 + (tmp[i] - '0') as i64;
+        i += 1;
+    }
+    if exp_negative {
+        exp = -exp;
+    }
+    if negative {
+        f.byte('-');
+    }
+    if debug && (exp < -4 || exp >= 16) {
+        f.byte(ds[0]);
+        if k > 1 {
+            f.byte('.');
+            f.str(ds[1..k]);
+        }
+        f.byte('e');
+        f.int(exp);
+        return;
+    }
+    if exp < 0 {
+        f.str("0.");
+        for z in 0..-exp - 1 {
+            f.byte('0');
+        }
+        f.str(ds[0..k]);
+        return;
+    }
+    if k <= exp + 1 {
+        f.str(ds[0..k]);
+        for z in 0..exp + 1 - k {
+            f.byte('0');
+        }
+        if debug {
+            f.str(".0");
+        }
+        return;
+    }
+    f.str(ds[0..exp + 1]);
+    f.byte('.');
+    f.str(ds[exp + 1..k]);
+}
+
+// Text in quotes, escaped as Rust's Debug of a str does.
+#[inline(never)]
+fn fmt_quoted(f: *Fmt, s: [u8]) {
+    f.byte('"');
+    let mut from = 0;
+    for i in 0..s.len {
+        let c = s[i];
+        if c == '"' || c == '\\' || c < 32 || c == 127 {
+            f.str(s[from..i]);
+            from = i + 1;
+            f.byte('\\');
+            if c == '\n' {
+                f.byte('n');
+            } else if c == '\t' {
+                f.byte('t');
+            } else if c == '\r' {
+                f.byte('r');
+            } else if c == 0 {
+                f.byte('0');
+            } else if c == '"' || c == '\\' {
+                f.byte(c);
+            } else {
+                let hex = "0123456789abcdef";
+                f.str("u{");
+                if c >= 16 {
+                    f.byte(hex[(c >> 4) as i64]);
+                }
+                f.byte(hex[(c & 15) as i64]);
+                f.byte('}');
+            }
+        }
+    }
+    f.str(s[from..s.len]);
+    f.byte('"');
+}
+
+// The elements of s, as Debug writes a Vec: `[1, 2, 3]`.
+pub fn debug_list<T: Debug>(f: *Fmt, s: [T]) {
+    f.byte('[');
+    for i in 0..s.len {
+        if i > 0 {
+            f.str(", ");
+        }
+        let x = s[i];
+        f.debug(&x);
+    }
+    f.byte(']');
+}
+
+// An f-string's value: its holes' values, and a closure that writes the
+// text.
 pub struct Interp<F> { f: F }
 
 impl<F: Fn(*Fmt)> Display for Interp<F> {
+    #[inline]
     fn fmt(self: *Interp<F>, out: *Fmt) {
         (self.f)(out);
     }
 }
 
+// ---- Display and Debug of std's types (0.15) ----
+
+impl Display for i8 {
+    #[inline]
+    fn fmt(self: *i8, f: *Fmt) { fmt_signed(f, *self as i64, 8); }
+}
+
+impl Debug for i8 {
+    #[inline]
+    fn fmt_debug(self: *i8, f: *Fmt) { fmt_signed(f, *self as i64, 8); }
+}
+
+impl Display for i16 {
+    #[inline]
+    fn fmt(self: *i16, f: *Fmt) { fmt_signed(f, *self as i64, 16); }
+}
+
+impl Debug for i16 {
+    #[inline]
+    fn fmt_debug(self: *i16, f: *Fmt) { fmt_signed(f, *self as i64, 16); }
+}
+
+impl Display for i32 {
+    #[inline]
+    fn fmt(self: *i32, f: *Fmt) { fmt_signed(f, *self as i64, 32); }
+}
+
+impl Debug for i32 {
+    #[inline]
+    fn fmt_debug(self: *i32, f: *Fmt) { fmt_signed(f, *self as i64, 32); }
+}
+
 impl Display for i64 {
     #[inline]
-    fn fmt(self: *i64, f: *Fmt) { fmt_int(f, *self); }
+    fn fmt(self: *i64, f: *Fmt) { f.int(*self); }
 }
 
 impl Debug for i64 {
     #[inline]
-    fn fmt_debug(self: *i64, f: *Fmt) { fmt_int(f, *self); }
+    fn fmt_debug(self: *i64, f: *Fmt) { f.int(*self); }
+}
+
+// (a number, as in Rust: `{c:c}` writes the byte)
+impl Display for u8 {
+    #[inline]
+    fn fmt(self: *u8, f: *Fmt) { f.uint(*self as u64); }
+}
+
+impl Debug for u8 {
+    #[inline]
+    fn fmt_debug(self: *u8, f: *Fmt) { f.uint(*self as u64); }
+}
+
+impl Display for u16 {
+    #[inline]
+    fn fmt(self: *u16, f: *Fmt) { f.uint(*self as u64); }
+}
+
+impl Debug for u16 {
+    #[inline]
+    fn fmt_debug(self: *u16, f: *Fmt) { f.uint(*self as u64); }
+}
+
+impl Display for u32 {
+    #[inline]
+    fn fmt(self: *u32, f: *Fmt) { f.uint(*self as u64); }
+}
+
+impl Debug for u32 {
+    #[inline]
+    fn fmt_debug(self: *u32, f: *Fmt) { f.uint(*self as u64); }
+}
+
+impl Display for u64 {
+    #[inline]
+    fn fmt(self: *u64, f: *Fmt) { f.uint(*self); }
+}
+
+impl Debug for u64 {
+    #[inline]
+    fn fmt_debug(self: *u64, f: *Fmt) { f.uint(*self); }
+}
+
+impl Display for f64 {
+    #[inline]
+    fn fmt(self: *f64, f: *Fmt) { fmt_float(f, *self, false, false); }
+}
+
+impl Debug for f64 {
+    #[inline]
+    fn fmt_debug(self: *f64, f: *Fmt) { fmt_float(f, *self, false, true); }
+}
+
+impl Display for f32 {
+    #[inline]
+    fn fmt(self: *f32, f: *Fmt) { fmt_float(f, *self as f64, true, false); }
+}
+
+impl Debug for f32 {
+    #[inline]
+    fn fmt_debug(self: *f32, f: *Fmt) { fmt_float(f, *self as f64, true, true); }
+}
+
+impl Display for bool {
+    #[inline]
+    fn fmt(self: *bool, f: *Fmt) { f.str(if *self { "true" } else { "false" }); }
+}
+
+impl Debug for bool {
+    #[inline]
+    fn fmt_debug(self: *bool, f: *Fmt) { f.str(if *self { "true" } else { "false" }); }
 }
 
 impl Display for [u8] {
@@ -146,12 +799,72 @@ impl Display for [u8] {
     fn fmt(self: *[u8], f: *Fmt) { f.str(*self); }
 }
 
-// (quoted; the escapes are to come)
+// (quoted and escaped: `"a\n"`)
 impl Debug for [u8] {
     #[inline]
-    fn fmt_debug(self: *[u8], f: *Fmt) {
-        f.byte('"');
-        f.str(*self);
-        f.byte('"');
+    fn fmt_debug(self: *[u8], f: *Fmt) { fmt_quoted(f, *self); }
+}
+
+impl Display for Buf {
+    #[inline]
+    fn fmt(self: *Buf, f: *Fmt) { f.str(self.as_slice()); }
+}
+
+impl Debug for Buf {
+    #[inline]
+    fn fmt_debug(self: *Buf, f: *Fmt) { fmt_quoted(f, self.as_slice()); }
+}
+
+impl<T: Debug> Debug for Option<T> {
+    fn fmt_debug(self: *Option<T>, f: *Fmt) {
+        match *self {
+            Option::Some(x) => {
+                f.str("Some(");
+                f.debug(&x);
+                f.byte(')');
+            }
+            Option::None => f.str("None"),
+        }
+    }
+}
+
+impl<T: Debug, E: Debug> Debug for Result<T, E> {
+    fn fmt_debug(self: *Result<T, E>, f: *Fmt) {
+        match *self {
+            Result::Ok(x) => {
+                f.str("Ok(");
+                f.debug(&x);
+            }
+            Result::Err(e) => {
+                f.str("Err(");
+                f.debug(&e);
+            }
+        }
+        f.byte(')');
+    }
+}
+
+impl<T: Debug> Debug for Vec<T> {
+    fn fmt_debug(self: *Vec<T>, f: *Fmt) { debug_list(f, self.as_slice()); }
+}
+
+// `{k: v, ...}`, in slot order.
+impl<K: Hash + Eq + Debug, V: Debug> Debug for HashMap<K, V> {
+    fn fmt_debug(self: *HashMap<K, V>, f: *Fmt) {
+        f.byte('{');
+        let mut first = true;
+        for i in 0..self.slots() {
+            if let Option::Some(k) = self.key_at(i) {
+                if !first {
+                    f.str(", ");
+                }
+                first = false;
+                let v = self.value_at(i).unwrap();
+                f.debug(&k);
+                f.str(": ");
+                f.debug(&v);
+            }
+        }
+        f.byte('}');
     }
 }

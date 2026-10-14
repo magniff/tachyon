@@ -8,13 +8,12 @@ $ def read_line twice
 std::read_line	<std>:1552:8	fn	pub fn read_line(line: *Buf) -> Result<bool, IoError>
 crate::twice	nostd/main.tach:4:4	fn	fn twice(x: i64) -> i64
 $ show std::print_int
-// std::print_int	<std>:1887-1892
+// std::print_int	<std>:1898-1902
 // use std::print_int;
 pub fn print_int(v: i64) {
-    let mut b = Buf::new();
-    b.push_int(v);
-    print(b.as_slice());
-    b.free();
+    let mut f = Fmt::to_fd(1);
+    f.int(v);
+    f.flush();
 }
 $ text std:1-2
 // std:1-2
