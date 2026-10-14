@@ -140,7 +140,7 @@ def hook_report(path):
     print("## The query-first hook\n")
     print("| event | count |\n|---|---|")
     for k in ("query", "query-result", "blocked", "escape", "feedback", "read", "grep", "edit", "write", "multiedit",
-              "read-unenforced", "tool-result", "edit-blocked", "edit-escape"):
+              "read-unenforced", "read-fixture", "tool-result", "edit-blocked", "edit-escape"):
         if kinds.get(k):
             print(f"| {k} | {kinds[k]} |")
     subs = Counter()

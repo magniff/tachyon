@@ -185,7 +185,7 @@ fn main() -> i32 {
 | `char`, a non-ASCII `char` literal | `u8`, ASCII literals only; `"\u{e9}"` in strings is UTF-8 bytes |
 | `()` | `()` |
 | `!` (never) | `!`: `fn fail() -> ! { ... }` |
-| `#[derive(PartialEq, Eq)]` | `==` is structural for structs, enums, tuples, arrays |
+| `#[derive(PartialEq, Eq)]` | `==` is structural for structs, enums, tuples, arrays, slices |
 | `#[derive(Clone, Copy, Debug, Default, Hash)]` | none needed for copies; write `impl Hash for T` yourself |
 | `impl Display`, `{:?}` | none: write a `fn show(self: *T, b: *Buf)` |
 | `type A = B;` | the same (`type Pair<T> = (T, T);` too) |

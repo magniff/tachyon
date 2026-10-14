@@ -697,12 +697,14 @@ optimizer, which never change what a program does. `#[inline]` and
 `#[inline(never)]` together are an error. Attributes may now come before
 `pub` (`#[repr(C)] pub struct`) as well as after it.
 
-**Structural equality.** `==` and `!=` work on structs, tuples, arrays and
-enums with fields whose parts all have `==`: they compare field by field
+**Structural equality.** `==` and `!=` work on structs, tuples, arrays,
+slices (0.14: the lengths, then the elements; std or not) and enums with
+fields whose parts all have `==`: they compare field by field
 (for enums, the variant, then its fields), floats as floats (so a value
 holding a NaN is not equal to itself). Each operand is evaluated once.
-Unions and slices have no `==`; comparing a type that holds one is an error
-naming it.
+A part whose type has an `impl Eq` is compared by it, as `==` on it alone
+is (0.14). Unions have no `==`; comparing a type that holds one (a slice
+of them too) is an error naming it.
 
 **The prelude.** Every module sees `Option`, `Some`, `None`, `Result`,
 `Ok`, `Err`, `Vec`, `print` and `println` (from `std`) without `use`. The
