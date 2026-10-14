@@ -124,7 +124,7 @@ TAB=$(printf '\t')
 # largest, a total.
 out=$("$COMPILER" query stats --over 1000 2>&1)
 ok=0
-n=$(printf '%s\n' "$out" | grep -c "^[0-9]*${TAB}[0-9]*${TAB}compiler/src/[a-z_0-9]*\.tach")
+n=$(printf '%s\n' "$out" | grep -c "^[0-9]*${TAB}[0-9]*${TAB}compiler/src/[a-z_0-9/]*\.tach")
 [ "$n" -ge 40 ] && printf '%s\n' "$out" | head -5 | grep -q "${TAB}compiler/src/check.tach${TAB}over\$" \
     && printf '%s\n' "$out" | grep -q "^[0-9]*${TAB}[0-9]*${TAB}total\$" \
     && printf '%s\n' "$out" | grep -q '^note query.over: [0-9]* files over 1000 lines$' && ok=1
@@ -150,7 +150,7 @@ check self_deps "$ok" "$(printf '%s\n' "$out" | head -3; printf '%s\n' "$out" | 
 # reference.
 out=$("$COMPILER" query unused --all 2>&1)
 ok=0
-n=$(printf '%s\n' "$out" | grep -c "${TAB}compiler/src/[a-z_0-9]*\.tach:[0-9]*:[0-9]*${TAB}")
+n=$(printf '%s\n' "$out" | grep -c "${TAB}compiler/src/[a-z_0-9/]*\.tach:[0-9]*:[0-9]*${TAB}")
 first=$(printf '%s\n' "$out" | grep "${TAB}fn\$" | head -1 | cut -f1)
 [ "$n" -ge 1 ] && [ -n "$first" ] && [ "$("$COMPILER" query refs --count "$first" 2>/dev/null)" = 1 ] \
     && ! printf '%s\n' "$out" | grep -q "^crate::main${TAB}" && ok=1

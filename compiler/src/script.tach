@@ -20,8 +20,8 @@
 use crate::base::{IntVec, OVERLAY, alloc_array, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str};
 use crate::query::{PROG, ROOT_GIVEN, TOOL, c_slice, diag, load_program, program_errors, put_root, root_or_diag, write_diags};
 use crate::edit::{
-    DRY_RUN, NO_CHECK, STEP_REPORT, TARGET, TARGET_NAME, copy_made, copy_path, copy_rewritten, finish_edit,
-    set_command, take_edit_option,
+    DRY_RUN, NO_CHECK, STEP_REPORT, TARGET, TARGET_NAME, copy_made, copy_path, copy_rewritten, edit_remove_file,
+    finish_edit, gone_path, remove_empty_dirs, set_command, take_edit_option,
 };
 use crate::proc::{buf_cstr, fork_worker, read_file_if, remove_file, wait_any, worker_exit};
 use crate::commands::{is_tool, run_tool};
@@ -33,7 +33,8 @@ extern "C" {
     fn close(fd: i32) -> i32;
 }
 
-// The files the steps changed (C strings), and whether each is new.
+// The files the steps changed (C strings), and what each is: 0 changed,
+// 1 made, 2 moved away (removed), 3 made and moved away again.
 static mut CHANGED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 static mut MADE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
@@ -98,17 +99,27 @@ fn split_words(line: [u8], words: *IntVec) -> bool {
     }
 }
 
-fn note_file(path: [u8], made: bool) {
+fn note_file(path: [u8], state: i64) {
     unsafe {
         for i in 0..CHANGED.count {
             if crate::proc::same_bytes(c_slice(CHANGED.data[i] as *u8), path) {
+                let was = MADE.data[i];
+                if state == 2 {
+                    // (moved away: a file made by a step before is none)
+                    MADE.data[i] = if was == 1 { 3 } else { 2 };
+                    remove_file(copy_path(CHANGED.data[i] as *u8));
+                } else if state == 1 && was == 2 {
+                    MADE.data[i] = 0;
+                } else if state == 1 && was == 3 {
+                    MADE.data[i] = 1;
+                }
                 return;
             }
         }
         let b = buf_new();
         buf_bytes(b, path);
         CHANGED.push(buf_cstr(b) as i64);
-        MADE.push(made as i64);
+        MADE.push(state);
     }
 }
 
@@ -128,9 +139,11 @@ fn read_report(path: *u8) {
             }
             let line = t[i..e];
             if line.len > 5 && line[0] == 'f' && line[4] == '\t' {
-                note_file(line[5..line.len], false);
+                note_file(line[5..line.len], 0);
             } else if line.len > 4 && line[0] == 'n' && line[3] == '\t' {
-                note_file(line[4..line.len], true);
+                note_file(line[4..line.len], 1);
+            } else if line.len > 5 && line[0] == 'g' && line[4] == '\t' {
+                note_file(line[5..line.len], 2);
             }
             i = e + 1;
         }
@@ -141,6 +154,9 @@ fn remove_all_copies() {
     unsafe {
         for i in 0..CHANGED.count {
             remove_file(copy_path(CHANGED.data[i] as *u8));
+            if MADE.data[i] == 1 {
+                remove_empty_dirs(CHANGED.data[i] as *u8);
+            }
         }
     }
 }
@@ -158,7 +174,7 @@ fn run_step(words: *IntVec, input: *u8, root: *u8, report: *u8) -> i64 {
             for i in 0..CHANGED.count {
                 let p = CHANGED.data[i] as *u8;
                 OVERLAY.push(p as i64);
-                OVERLAY.push(copy_path(p) as i64);
+                OVERLAY.push(if MADE.data[i] >= 2 { gone_path(p) } else { copy_path(p) } as i64);
             }
             STEP_REPORT = report;
             DRY_RUN = false;
@@ -348,7 +364,12 @@ fn script_inner(argc: i64, argv: **u8) -> i64 {
         }
         for k in 0..CHANGED.count {
             let path = CHANGED.data[k] as *u8;
-            let ok = if MADE.data[k] != 0 { copy_made(path) } else { copy_rewritten(c_slice(path)) };
+            let state = MADE.data[k];
+            if state == 3 {
+                continue;
+            }
+            let ok = if state == 2 { edit_remove_file(c_slice(path)) } else if state == 1 { copy_made(path) }
+                else { copy_rewritten(c_slice(path)) };
             if !ok {
                 remove_all_copies();
                 let d = diag(c"error", c"edit.write");
