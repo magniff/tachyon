@@ -1241,28 +1241,32 @@ about the cheap and general ones:
   (`child < end` with end below 1000000), arithmetic shifts and 64-bit
   conversions keep ranges, and an operation of one operand costs a
   quarter of the depth of one of two (light cleanup leaves chains like
-  `0 + (n - 0) * 1`).
+  `0 + (n - 0) * 1`). A branch on the phi of `&&` or `||` (a block of the
+  phi and the branch alone) is threaded from each predecessor that
+  branched on the phi's operand for it, as isel.tach does, but before the
+  ranges: in `child + 1 < end && s[child] < s[child + 1]`, the first test
+  then holds wherever the whole is true.
 
   Phi ranges and facts between two values are taken while the branch of
   a check is decided (one way ends the program: a bounds check, an
   unwrap): everywhere, they cost 4% of the self-compile's instructions
   for little more. bench/sort's heapsort, inlined into main with its
-  vector's length known, keeps 2 of its 12 checks (16 checks before, 6
-  now); bench/sort is 5% faster. `tests/run/opt_range_phi.tach`: a step
-  of 2, a step read from memory, a decreasing index, a sift-down; and an
-  index that reaches past the end, whose check stays (and fails); a fuzz
-  mode, `tests/fuzz/run.sh -R` (`genrange.awk`), of such loops (some
-  going past an end). Threading the branch on the phi of `&&` in the IR
-  (as isel.tach does) would drop sort's last two checks (`s[child]` after
-  `child + 1 < end && s[child] < s[child + 1]`, checked on one way only):
-  tried, it cost 6% of the loop passes' time and gained nothing measured.
+  vector's length known, keeps none of its 12 checks (16 checks before, 4
+  now, in the generic sift-down of the records); bench/sort is 5% faster.
+  The threading costs the loop passes about 6% of their time, and pays it
+  back: the compiler built with it builds itself in 2.6% fewer
+  instructions. `tests/run/opt_range_phi.tach`: a step of 2, a step read
+  from memory, a decreasing index, a sift-down; and an index that reaches
+  past the end, whose check stays (and fails); a fuzz mode,
+  `tests/fuzz/run.sh -R` (`genrange.awk`), of such loops (some going past
+  an end).
 
 What remains, measured:
 
-- *Bounds checks* that need facts the ranges do not carry: `s[child]`
-  after an `&&` that checked it on one way only; in a generic sift-down,
-  `end <= s.len` (so the first `s[root]`, with root the caller's start,
-  keeps its check). C has no checks; this is the safety tachyon keeps.
+- *Bounds checks* that need facts the ranges do not carry: in a generic
+  sift-down, `end <= s.len` (so the first `s[root]`, with root the
+  caller's start, keeps its check). C has no checks; this is the safety
+  tachyon keeps.
 - *fannkuch* is 3% slower than before the ranges through phis: with its
   checks proven, the copy of a 10-element permutation is vectorized, and its
   16-byte loads read what 8-byte stores have just written, which no store
