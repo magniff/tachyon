@@ -6,6 +6,13 @@ in [docs/releases.md](docs/releases.md) and
 [docs/roadmap.md](docs/roadmap.md); the language in
 [docs/grammar.md](docs/grammar.md).
 
+**New to tachyon? Run `target/tachyonc guide` first**: the language in
+about 5k tokens, for a reader who knows Rust (what differs, std's API,
+the first errors and their fixes, the tools); `guide --list` lists the
+topics (`guide errors`, `guide std`, `guide unsafe`, ...). Its text is
+`compiler/guide/*.md`; every example in it is compiled and run by
+`tests/run.sh guide`.
+
 ## Read source through the compiler
 
 Ask `tachyonc` about the program instead of reading files with grep,

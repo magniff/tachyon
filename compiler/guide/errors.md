@@ -1,0 +1,490 @@
+# Errors and their fixes
+
+Compile with `--diagnostics=short` (or run `tachyonc check`): one line
+per error, `FILE:LINE:COL: error[KIND] MESSAGE | help: HELP | note:
+NOTE`, every error of every file at once (up to 50), sorted by position.
+KIND is `tokenizer error`, `parser error`, `module error`, `type error`
+or `unsafe`. Fix the first errors first: a parser error can hide
+type errors in the same function. `tachyonc query show FILE:LINE` prints
+the item at an error's position. Below: what a newcomer writes, the
+error (short form, without the position), and the fix.
+
+## Rust habits
+
+```tach
+let s: String = String::new();
+```
+```err
+error[type error] unknown type 'String'
+```
+Text is `[u8]`; build it with `std::Buf`. Also `char` (use `u8`), `Box`,
+`usize` indices (use `i64`).
+
+```tach
+fn get(x: &i64) -> i64 { *x }
+```
+```err
+error[parser error] expected type, got '&'
+```
+`*i64`: one pointer type for `&T` and `&mut T`.
+
+```tach
+struct P { x: i64 }
+impl P { fn get(&self) -> i64 { self.x } }
+```
+```err
+error[parser error] expected identifier, got '&'
+```
+`fn get(self: *P) -> i64`; `fn get(self)` is an error too: write
+`self: P` for a copy.
+
+```tach
+let f = |x: i64| x + 1;
+```
+```err
+error[parser error] expected expression, got '|'
+```
+No closures in 0.13: a named `fn`, passed as `fn(i64) -> i64`, or a loop.
+
+```tach
+fn f(r: Result<i64, i64>) -> Result<i64, i64> { let x = r?; Ok(x) }
+```
+```err
+error[parser error] '?' is reserved for future use
+```
+`let x = match r { Ok(v) => v, Err(e) => return Err(e) };`
+
+```tach
+println!("{}", 1);
+```
+```err
+error[parser error] expected ';' or '}' after expression, got '!'
+```
+No macros: `std::print_int(1); println("");`. Also `vec!`, `format!`,
+`assert!`.
+
+```tach
+'outer: for i in 0..3 { break 'outer; }
+```
+```err
+error[tokenizer error] unterminated character literal
+```
+Labels have no quote: `outer: for i in 0..3 { break :outer; }`.
+
+```tach
+struct P { x: i64, y: i64 }
+fn make(x: i64) -> P { P { x, y: 0 } }
+```
+```err
+error[parser error] expected ':', got ','
+```
+Every field is written `name: value`: `P { x: x, y: 0 }`; no `..base`.
+
+```tach
+let o: Option<i64> = Some(1);
+let Some(x) = o;
+```
+```err
+error[type error] refutable pattern in 'let'
+```
+`let x = match o { Some(x) => x, None => return 1 };` (no `let else`).
+
+```tach
+let n = 5;
+let m = !n;
+```
+```err
+error[type error] expected 'bool', got 'i64'
+```
+Bitwise not is `~n`.
+
+```tach
+let big = i64::MAX;
+```
+```err
+error[type error] no associated function 'MAX' in 'i64'
+```
+Write the value: `9223372036854775807`.
+
+```tach
+let s = "add";
+match s { "add" => println("a"), _ => println("b") }
+```
+```err
+error[parser error] expected a pattern, got 'string literal'
+```
+`if s == "add" { ... }`: patterns are integers, bytes, bools, variants,
+tuples.
+
+```tach
+#[derive(Debug)]
+struct P { x: i64 }
+```
+```err
+error[parser error] unknown attribute 'derive'
+```
+`==` is structural without it; there is no `Debug` printing.
+
+```tach
+fn f<T>(x: T) -> T where T: Ord { x }
+```
+```err
+error[parser error] expected '{', got 'where'
+```
+Bounds go in the list: `fn f<T: Ord>(x: T) -> T`.
+
+```tach
+fn main() -> i32 {
+    fn helper() -> i64 { 3 }
+    helper() as i32
+}
+```
+```err
+items cannot be nested in blocks
+```
+Move `helper` to the module level.
+
+## Types
+
+```tach
+let x = 1;
+x = 2;
+```
+```err
+error[type error] cannot assign to immutable variable 'x' | help: make it mutable: `let mut x`
+```
+
+```tach
+let a: i32 = 1;
+let b: i64 = a;
+```
+```err
+error[type error] expected 'i64', got 'i32'
+```
+No implicit conversion: `a as i64`. The same for `1 + 1.0`, and for
+`main` returning an `i64` (`n as i32`).
+
+```tach
+let b: u8 = 300;
+```
+```err
+error[type error] integer literal 300 does not fit in type 'u8'
+```
+
+```tach
+let x = 1;
+if x { }
+```
+```err
+error[type error] expected 'bool', got 'i64'
+```
+`if x != 0`.
+
+```tach
+let a = 1;
+if 0 < a < 2 { }
+```
+```err
+error[parser error] comparison operators cannot be chained; use parentheses
+```
+`if 0 < a && a < 2`.
+
+```tach
+fn f() -> i64 { 1; }
+```
+```err
+error[type error] function 'f' body has type '()', expected 'i64'
+```
+The value is the last expression without `;`: `fn f() -> i64 { 1 }`.
+
+```tach
+let x: i64;
+```
+```err
+error[parser error] 'let' without an initializer is not supported
+```
+
+```tach
+struct P { x: i64, y: i64 }
+fn make() -> P { P { x: 1 } }
+```
+```err
+error[type error] missing field 'y' in struct 'P' constructor
+```
+
+```tach
+fn f(a: i64, b: i64) -> i64 { a + b }
+fn g() -> i64 { f(1) }
+```
+```err
+error[type error] function 'f' expects 2 arguments, got 1
+```
+
+```tach
+enum E { A, B, C }
+fn f(e: E) -> i64 { match e { E::A => 1, E::B => 2 } }
+```
+```err
+error[type error] non-exhaustive match: 'E::C' is not covered | help: add an arm for it, or a wildcard arm '_ =>'
+```
+
+```tach
+enum E { A(i64), B }
+fn f(e: E) -> i64 { match e { A(x) => x, B => 0 } }
+```
+```err
+error[type error] unknown variant 'A'
+```
+`E::A(x)`, or `use E::{A, B};` once.
+
+```tach
+struct P { x: i64 }
+fn main() -> i32 {
+    let p = P { x: 1 };
+    if p == P { x: 1 } { println("same"); }
+    0
+}
+```
+```err
+error[parser error] expected ';' or '}' after expression, got ':'
+```
+In a condition, parenthesize a struct literal: `if p == (P { x: 1 })`.
+
+## Slices, Vec, std
+
+```tach
+let mut v: Vec<i64> = Vec::new();
+v.push(1);
+let a = v[0];
+```
+```err
+error[type error] cannot index type 'Vec<i64>'
+```
+`v.get(0)`, `v.set(0, x)`, `v.as_slice()[0]`.
+
+```tach
+let mut v: Vec<i64> = Vec::new();
+for x in v.iter() { }
+```
+```err
+error[type error] no method 'iter' on type 'Vec<i64>'
+```
+`for x in v.as_slice() { }`.
+
+```tach
+let mut v: Vec<i64> = Vec::new();
+for x in v { }
+```
+```err
+error[type error] 'for' loops iterate over integer ranges ('a..b'), slices and arrays, got 'Vec<i64>'
+```
+
+```tach
+let s = "abc";
+let n = s.len();
+```
+```err
+error[type error] no method 'len' on type '[u8]'
+```
+`s.len` is a field of slices (`Vec` has the method `len()`).
+
+```tach
+fn sum(s: [i64]) -> i64 { s[0] }
+fn main() -> i32 { let a = [1, 2, 3]; sum(a) as i32 }
+```
+```err
+error[type error] expected '[i64]', got '[i64; 3]'
+```
+`sum(a[..])`. An array has no `.len` either: `a[..].len`.
+
+```tach
+let b = Buf::new();
+```
+```err
+error[type error] unknown type 'Buf'
+```
+`use std::Buf;` (only the prelude names need no import).
+
+```tach
+use std::HashMap;
+struct K { a: i64 }
+fn main() -> i32 { let m: HashMap<K, i64> = HashMap::new(); 0 }
+```
+```err
+error[type error] the trait 'Hash' is not implemented for 'K' | help: required by the bound 'K: Hash' of 'HashMap'
+```
+`impl Hash for K { fn hash(self: *K) -> u64 { std::hash_u64(self.a as u64) } }`.
+
+## Generics and traits
+
+```tach
+fn biggest<T>(a: T, b: T) -> T { if a > b { a } else { b } }
+struct P { x: i64 }
+fn main() -> i32 { let p = biggest(P { x: 1 }, P { x: 2 }); 0 }
+```
+```err
+error[type error] comparison requires numeric type, got 'P' | note: in instantiation of 'biggest<P>'
+```
+A generic body is checked per use; the note names the instance.
+Implement `Ord` for `P`, or bound `T: Ord` to say what it needs.
+
+```tach
+trait A { fn a(self: *Self) -> i64; fn b(self: *Self) -> i64; }
+struct S { }
+impl A for S { fn a(self: *S) -> i64 { 1 } }
+```
+```err
+error[type error] the impl of trait 'A' is missing 'b' | help: it has no default: write it in the impl
+```
+
+```tach
+trait A { fn a(self: *Self) -> i64; }
+fn f(x: *dyn A) -> i64 { 0 }
+```
+```err
+error[parser error] 'dyn' is a reserved keyword
+```
+No trait objects: `fn f<T: A>(x: *T)`, or an enum of the cases.
+
+```tach
+trait Conv<T> { fn conv(self: Self) -> T; }
+```
+```err
+error[parser error] traits cannot have type parameters (yet)
+```
+
+## Modules and imports
+
+```tach
+use std::*;
+```
+```err
+error[module error] wildcard imports are not allowed
+```
+`use std::{Buf, HashMap};`; `tachyonc fix --only imports` writes them.
+
+```tach
+mod m { pub fn helper() -> i64 { 1 } }
+fn main() -> i32 { helper() as i32 }
+```
+```err
+error[type error] undefined variable 'helper' | help: add `use crate::m::helper;`
+```
+Add the `use` line the help names, or run `tachyonc fix`.
+
+```tach
+fn main() -> i32 { let total = 1; std::print_int(totl); 0 }
+```
+```err
+error[type error] undefined variable 'totl' | help: did you mean 'total'?
+```
+
+```tach
+mod m { fn hidden() -> i64 { 1 } }
+fn main() -> i32 { m::hidden() as i32 }
+```
+```err
+error[type error] 'hidden' is private
+```
+`pub fn hidden`. Child modules see their parent's private items, not
+the reverse.
+
+## unsafe
+
+```tach
+extern "C" { fn abs(x: i32) -> i32; }
+fn main() -> i32 { abs(-3) }
+```
+```err
+error[unsafe] calling a C function is unsafe
+```
+`unsafe { abs(-3) }`. `tachyonc fix --only unsafe` wraps every such
+place.
+
+```tach
+struct P { x: i64 }
+fn main() -> i32 {
+    let mut p = P { x: 1 };
+    let q = &p;
+    q.x = 9;
+    0
+}
+```
+```err
+error[unsafe] access to a field through a raw pointer is unsafe
+```
+A local holding a pointer is raw. Use `p.x = 9;`, or pass `&p` to a
+function taking `*P` (a borrow, safe there).
+
+```tach
+struct P { x: i64 }
+fn get(p: *P) -> i64 { p.x }
+fn main() -> i32 { get(&P { x: 1 }) as i32 }
+```
+```err
+error[type error] cannot take address of non-lvalue expression
+```
+`&` takes the address of a place (a variable, a field, an element):
+`let p = P { x: 1 }; get(&p)`.
+
+```tach
+fn first(p: *i64) -> i64 { p[1] }
+```
+```err
+error[unsafe] indexing a raw pointer is unsafe
+```
+A pointer is one value; for many, take a slice `[i64]`.
+
+```tach
+fn read(x: *i64) -> i64 { *x }
+struct H { p: *i64 }
+fn get(h: H) -> i64 { read(h.p) }
+```
+```err
+error[unsafe] passing a raw pointer to a pointer parameter is unsafe
+```
+Only `&place` and pointer parameters are borrows; vouch for others in
+`unsafe { read(h.p) }`.
+
+```tach
+fn add(p: *i64, x: i64) { *p += x; }
+fn main() -> i32 { let f = add; 0 }
+```
+```err
+error[unsafe] using an `unsafe fn`, or a function with pointer parameters, as a value is unsafe
+```
+`let f = unsafe { add };` and call it in `unsafe` too.
+
+```tach
+fn main() -> i32 { std::print_cstr(c"x"); 0 }
+```
+```err
+error[unsafe] calling an `unsafe fn` is unsafe
+```
+`std::panic`, `print_cstr` and `Buf::push_cstr` take C strings and are
+`unsafe fn`; for literals use `print("x")`.
+
+## At run time
+
+A failed check prints one line on stderr and exits with code 101:
+`index out of bounds: index I, length N`, `slice range out of bounds:
+...`, `called unwrap on None`, `called unwrap on Err`, `invalid value V
+for enum E`. Arithmetic never fails (it wraps; `/ 0` is 0). Runaway
+recursion is stopped by the operating system (a signal, no message).
+
+```tach
+enum Level { Low, High }
+
+fn main() -> i32 {
+    let v: Option<i64> = None;
+    std::print_int(v.unwrap_or(5));
+    println("");
+    let e = 3 as Level;
+    std::print_int(e as i64);
+    0
+}
+```
+```out (exit 101)
+5
+invalid value 3 for enum Level
+```

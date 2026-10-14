@@ -14,7 +14,8 @@ compiler has to be the teacher.
 ## 1. The compiler teaches the language
 
 - `tachyonc guide`: a compact, version-matched reference sized for a
-  context window (grammar, idioms, the std API).
+  context window (grammar, idioms, the std API). Done in 0.13: the core
+  guide and topics, from `compiler/guide/`, every example tested.
 - `tachyonc doc std::Vec`: documentation from the binary itself, never the
   wrong version from the web.
 - Diagnostics that show the right form, not only what is wrong ("`extern

@@ -1,0 +1,106 @@
+# Memory
+
+Tachyon manages no memory for you: there are no destructors, no
+garbage collector, no reference counting. Values live on the stack, in
+statics, or on the heap through std's types (`Vec`, `Buf`, `HashMap`,
+which call C's `malloc`/`realloc`/`free`) and C's allocator.
+
+## Copies
+
+Every value is copied by `=`, by a call and by a return, bit for bit;
+nothing is moved. For plain values (numbers, arrays, structs of them)
+the copy is independent. A `Vec`, `Buf` or `HashMap` is a small handle
+(a pointer, a length, a capacity): its copy points to the same memory,
+and a push through one copy is not seen by the other.
+
+```tach
+fn add_one(v: *Vec<i64>) { v.push(1); }   // through a pointer: the caller's Vec
+
+fn lost(v: Vec<i64>) {                    // a copy of the handle
+    let mut w = v;
+    w.push(2);                            // the caller's len does not change
+}
+
+fn main() -> i32 {
+    let mut v: Vec<i64> = Vec::new();
+    defer v.free();
+    add_one(&v);
+    add_one(&v);
+    std::print_int(v.len());
+    print(" ");
+    let a = [1, 2, 3];
+    let mut b = a;                        // arrays are values
+    b[0] = 9;
+    std::print_int(a[0]);
+    println("");
+    0
+}
+```
+```out
+2 1
+```
+
+Write functions that change a container to take `*Vec<T>` and pass
+`&v`; return a new container by value (`fn make() -> Vec<i64>`), which
+the caller then owns and frees.
+
+## Freeing: defer
+
+`defer stmt;` (or `defer { ... }`) runs when control leaves the block:
+at its end, or by `return`, `break` or `continue`, last deferred first.
+The value a block returns is computed before the deferred statements
+run. They do not run on `exit` or a failed check (exit 101).
+
+```tach
+use std::Buf;
+
+fn describe(n: i64) -> i64 {
+    let mut b = Buf::new();
+    defer b.free();                       // on every path out
+    if n < 0 { return -1; }
+    b.push_int(n);
+    b.len()                               // computed before the free
+}
+
+fn main() -> i32 {
+    defer println("done");
+    std::print_int(describe(12345) + describe(-5));
+    println("");
+    0
+}
+```
+```out
+4
+done
+```
+
+## Views
+
+A slice (`[T]`) does not own memory. One from `v.as_slice()` is valid
+until `v` grows (a push may reallocate) or is freed; one of an array,
+while the array lives (not after the function holding it returns).
+Using a view after its memory is gone is undefined behaviour, the one
+case in safe code (tachyon has no lifetimes yet). Take the slice again
+after pushing:
+
+```tach
+let mut v: Vec<i64> = Vec::new();
+defer v.free();
+v.push(1);
+let s = v.as_slice();
+std::print_int(s[0]);
+for i in 0..100 { v.push(i); }            // may move the elements
+let s2 = v.as_slice();                    // a fresh view; do not use s now
+std::print_int(s2.len);
+println("");
+```
+```out
+1101
+```
+
+## Raw memory
+
+`malloc` and `free` from C, in `unsafe` (see `tachyonc guide unsafe`).
+`tachyonc --check-unsafe -O1` checks heap accesses through raw pointers
+at run time. Memory nobody wrote (from `malloc`) has an unspecified
+value: write it before reading it.
