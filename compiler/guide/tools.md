@@ -56,6 +56,7 @@ Output is one fact per line, fields separated by a TAB.
 | add statements inside an item | `tachyonc edit insert --in NAME --after 'ANCHOR' < text` |
 | see the result | `--show` on any edit; `tachyonc query diff` |
 | undo the last edit | `tachyonc undo` (the journal: in `.git`, else in `.tachyonc/` next to main.tach) |
+| merge conflicts | `tachyonc query conflicts --show`, then `tachyonc edit resolve FILE:LINE --ours` (`--theirs`, `--both`, `< text`) |
 | rename anything, with every use | `tachyonc refactor rename PATH NEW` |
 | rename a local or parameter | `tachyonc refactor rename FILE:LINE:COL NEW` or `refactor rename FN::x NEW` (shadowing respected) |
 | a parameter, with every call | `tachyonc refactor signature FN --add 'x: i64 = 0'` (`--remove`, `--rename-param`, `--reorder`, `--type`) |
