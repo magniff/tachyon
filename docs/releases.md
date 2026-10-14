@@ -44,8 +44,87 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.11.0 | `v0.11.0` | 0.10.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | feature-complete, and tools for agents: DWARF line tables (`-g`); aarch64-linux as a target and a host; a broader `bench/`, a cost model for the loop vectorizer, unrolling with run-time trip counts, an SLP vectorizer, division by constants, value ranges through phis; `tachyonc query`, `check`, `fix`, `lint`, `same-output`, `edit` by name and semantic refactorings (`refactor rename`, `move`, `signature`, `field`, `variant`, `split`, `rewrite`, scripts, `undo`) |
 | 0.12.0 | `v0.12.0` | 0.11.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | the compiler's source reorganized through its own tools: folders by phase, no file over 1,000 lines, no re-exports, tidy imports, output identical to 0.11's; `edit patch`, `edit insert --in`, `query text`, a module's `use` lines and header as targets, `fix --only reexports` and `tidy-imports`, `split --reexport`; the release gate in one command (`bootstrap/gate.sh`) |
 | 0.13.0 | `v0.13.0` | 0.12.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | the tools, improved from 0.12's record: `edit patch` inside a line, `--pairs`, `edit wrap`, `edit new-file`, `signature --default`, `fix --in` over a subtree; section banners, `query grep`, `query type`, kinds of references; an on-disk cache (a query or `check` of an unchanged program in about 6 to 8 ms); `split` part names, layout kept by `move` and `split`, `refactor extract-function` and `inline`; `tachyonc fmt` (the tree formatted), `explain` and `guide` |
+| 0.14.0 | `v0.14.0` | 0.13.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | closures and iterators: closures (captures by value or by reference, `move`, `Fn`/`FnMut` bounds, a non-capturing closure is a `fn`, an escape check); associated types; an `Iterator` trait, `for` over anything iterable, ranges as values, std's sources, adapters and consumers, chains compiled to the hand-written loop; std reads stdin (`read_line`, `read_stdin`, `Scanner`), text helpers, values changed in place, an introsort; did-you-mean across the program and std, helps for Rust habits; the tools on a user's program; the agent eval (`tests/agent-eval/`) and its 0.13 baseline |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.14
+
+- **Closures** (docs/grammar.md, "Additions of 0.14"; `tachyonc guide
+  closures`): `|x| x + k`, `move`, `|x| -> T { .. }`, patterns as
+  parameters. Each closure has its own type; an immutable variable is
+  captured by value (by reference above 32 bytes or when the closure
+  takes its address), a `let mut` one by reference, everything by value
+  with `move`. `Fn(A) -> R` and `FnMut(A) -> R` bounds, monomorphized,
+  type the closure's parameters and bind what their result names; a
+  closure that captures nothing coerces to a `fn`. A value holding a
+  closure that borrows a variable cannot leave that variable's block.
+- **Associated types**: `type Item;` in a trait, `type Item = T;` in its
+  impls, projections `T::Item` and `Self::Item`, `F::Output` of fn types
+  and closures, constraints `I: Iterator<Item = T>` (checked, and used
+  for inference); a trait default copied into a non-generic impl is
+  checked and compiled only when used; `impl<T> [T]` and `impl<T> Tr for
+  [T]` for slices.
+- **Iterators** (`tachyonc guide iterators`): the `Iterator` trait in
+  the prelude; `for` over slices, arrays, `Vec`, ranges, iterators and
+  types with an `iter()` method, or a pointer to one; `a..b` and `a..=b`
+  as values; std's sources (`v.iter()`, ranges, `HashMap::iter`, `keys`,
+  `values`), adapters (`map`, `filter`, `enumerate`, `zip`, `take`) and
+  consumers on `fold` (`for_each`, `count`, `sum`, `min`, `max`,
+  `collect` into a `Vec`), `sort_by` with an `FnMut` comparison.
+- **Zero cost** (docs/optimizer.md, "0.14: zero-cost iterators"): an
+  iterator chain, once inlined, is the hand-written loop, with no call,
+  no frame slot and the same vector loop: copy elision, SROA to a
+  fixpoint, threading on constant tags, the merging of counted exits,
+  #[inline] functions optimized after inlining, closures called once
+  always inlined. `bench/iterchain.tach` (six kernels with std's
+  iterators and closures) against `bench/iterloop.tach` (the same
+  loops by hand): `bench/run.sh` fails above a ratio of 1.05.
+- **std** (`tachyonc guide std`): `read_line(&buf)`, `read_stdin()` and
+  a `Scanner` read stdin without `unsafe`; `parse_int`, `trim`, `split`,
+  `split_whitespace`, `is_space`, `is_digit`; `Vec::last`, `swap`,
+  `insert`, `remove`, `truncate`, `extend_from_slice`;
+  `HashMap::contains_key`, `get_mut`, `get_or_insert` (a one-element
+  slice: `counts.get_or_insert(w, 0)[0] += 1`); `sort` is an introsort
+  (4M random i64: 302 to 195 ms). std's functions that the program does
+  not reach are dropped before the optimizer.
+- **Diagnostics for newcomers**: did-you-mean for methods, fields,
+  associated functions, variants and module items; an unknown name that
+  std has gets its `use` line (and `tachyonc fix` writes it), one with
+  no close match points to `tachyonc guide std`; helps for Rust habits
+  (macros, `&str`, `&self`, `?`, `String`, `.chars()`, ...); a private
+  item's help makes it `pub`; errors past a failed condition are
+  reported in the same pass; `const S: [u8] = "..."`; an unsuffixed
+  literal takes the type of the other branch or arm; `mod eval; use
+  eval::eval;` as in Rust.
+- **Tools on a user's program** (docs/refactor.md, docs/query.md):
+  `undo` and `query diff` without git; `refactor rename` of a local or
+  parameter (`FILE:LINE:COL`, `FN::local`), its captured uses included;
+  comment mentions renamed only in backquotes; `refactor variant --add
+  --arm-in SITE EXPR`; `edit patch FILE:LINE` between items; edits add
+  the imports their new text needs; `refactor --script` heredocs; import
+  paths in the file's style. query, refactor, rewrite and fmt know
+  closures.
+- **The agent eval** (`tests/agent-eval/`, docs/eval/): twelve tasks
+  (write, fix, extend, refactor, perf) with hidden tests and Rust twins;
+  `run.py` puts Claude Code or an Ollama model on each task in five
+  conditions and reports. The 0.13 baseline (Claude Haiku and Sonnet,
+  59 of 60 runs each; a partial Qwen3-Coder run) and what it changed are
+  in docs/eval/0.13-findings.md.
+- **No undefined behaviour, fixed**: slicing (and vector loads and
+  stores) read the slice after its bounds, so a bound that grew the
+  storage read freed memory; `Buf::push_str` of its own view read freed
+  memory; the compiler indexed its tables through calls that can move
+  them (a wrong struct or a crash on generic literals). The gate's new
+  `stress-grow` step moves every table growth of the compiler and
+  checks the self-compile and the suite.
+- **Also**: `==` on slices without std and on types holding a part with
+  an `impl Eq`; bounds of declared types (`HashMap<i64, i64>` as a
+  field) checked once every impl is known; generic instances limited by
+  the size of their type arguments (chains of hundreds of adapters);
+  worktrees share the main checkout's release cache.
+- **Breaking**: nothing (`move`, reserved before, is now a keyword; a
+  program's own `Iterator` comes before the prelude's).
 
 ### What's new in 0.13
 
@@ -648,7 +727,16 @@ once, `suite-O0`, `suite-O1`, `suite-O2`; `fuzz-plain`, `fuzz-loops`,
 `fuzz-vector`, `fuzz-div`, `fuzz-range` and `fuzz-seed` (the seed as a
 third oracle); `abi-plain`, `abi-import`, `abi-header`; `objcheck`;
 `layout` (`tests/cimport/layout.sh` on the system headers); `debug`
-(`tests/debug.sh`); and the two containers: `linux-x86_64`
+(`tests/debug.sh`); `stress-grow` (0.14, not in `--quick`: the compiler
+run with `TACHYON_STRESS_GROW=1`, under which every growth of its tables,
+`base::grow`, `buf_reserve` and the symbol tables, moves them, by half
+their size from a capacity of 1, and fills the old block with 0xAA bytes
+and keeps it; a read through a table pointer taken before a growth then
+finds garbage instead of, by luck, the old data. Its self-compile must
+give the same object as without, and the suite pass at -O0 and -O2. The
+mode is for finding such reads, as `TYPES[template_instance(..)].a` was
+before 0.14 read TYPES before the call that grew it; it costs little
+time and about twice the memory); and the two containers: `linux-x86_64`
 (`bootstrap/linux-check.sh`, which builds its own chain and so starts at
 once) and `linux-aarch64` (`bootstrap/aarch64-linux-check.sh --compiler`:
 the chain's compiler cross-compiles the tree). Inside each container the

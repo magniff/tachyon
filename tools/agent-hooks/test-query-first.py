@@ -61,14 +61,28 @@ def blocked(command):
 st, err = blocked("sed -n '120,180p' compiler/src/gvn.tach")
 case("read sed -n", (st, "query show compiler/src/gvn.tach:120" in err), (True, True))
 case("read grep", blocked("grep -n 'fn run_gvn' compiler/src/gvn.tach")[0], True)
-st, err = blocked("sed -n '120,180p' tests/run/loops.tach")
-case("read sed -n test file", "try: tachyonc query text tests/run/loops.tach:120-180 |" in err, True)
-st, err = blocked("head -40 tests/refactor/patch/calc.tach")
-case("read head test file", "try: tachyonc query text tests/refactor/patch/calc.tach:1-40 |" in err, True)
-st, err = blocked("head -n 30 compiler/src/gvn.tach")
-case("read head compiler", "MODULE::header" in err and "query text compiler/src/gvn.tach:1-30" in err, True)
-st, err = blocked("cat tests/refactor/patch/main.tach")
-case("read cat", "tachyonc query show tests/refactor/patch/main.tach" in err, True)
+st, err = blocked("sed -n '120,180p' examples/loops.tach")
+case("read sed -n example program", "try: tachyonc query text examples/loops.tach:120-180 |" in err, True)
+st, err = blocked("head -40 bench/calc.tach")
+case("read head program", "try: tachyonc query text bench/calc.tach:1-40 |" in err, True)
+st, err = blocked("cat examples/main.tach")
+case("read cat", "tachyonc query show examples/main.tach" in err, True)
+case("read a program outside tests", blocked("cat /home/u/proj/src/main.tach")[0], True)
+
+# (0.14) Test data under tests/ (cases, fixtures, eval tasks): read freely, logged.
+st, err, recs = bash("sed -n '120,180p' tests/run/loops.tach")
+case("read test case", (st, [r["kind"] for r in recs]), (0, ["read-fixture"]))
+case("read head fixture", blocked("head -40 tests/refactor/patch/calc.tach")[0], False)
+case("read cat fixture", blocked("cat tests/refactor/patch/main.tach")[0], False)
+case("read eval task data", blocked("cat tests/agent-eval/tasks/07-fix-bugs/tach/main.tach")[0], False)
+case("grep eval task data", blocked("grep -n 'fn main' tests/agent-eval/tasks/*/tach/*.tach")[0], False)
+case("grep -r test cases", blocked("grep -rn 'EXPECT' tests/run")[0], False)
+case("read fixture after cd", blocked("cd tests/agent-eval/tasks/02-rpn && cat tach/main.tach")[0], False)
+case("read absolute fixture", blocked("cat " + os.path.join(os.path.dirname(os.path.dirname(HERE)),
+                                                            "tests/run/loops.tach"))[0], False)
+case("fixture and source: blocked", blocked("cat tests/run/a.tach compiler/src/main.tach")[0], True)
+case("cd tests, then source", blocked("cd tests && cat ../compiler/src/main.tach")[0], True)
+
 case("grep of text suggests query grep",
      "query grep 'no definition'" in blocked("grep -rn 'no definition' compiler/src")[1], True)
 case("grep of a name suggests refs and grep",

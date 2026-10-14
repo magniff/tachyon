@@ -70,9 +70,13 @@ that adds an error writes nothing and prints the errors
 ([docs/refactor.md](docs/refactor.md)).
 
 **This is being tested.** A hook (`tools/agent-hooks/query-first.py`)
-blocks shell commands that read `.tach` source and suggests the query
-that answers them. When the query is not enough, rerun the shell command
-with a trailing comment saying why:
+blocks shell commands that read `.tach` source (the compiler's,
+compiler/src and compiler/std, and any program being worked on:
+examples/, bench/, a `.tach` elsewhere) and suggests the query that
+answers them. Test data is read freely: a `.tach` under a `tests/`
+directory (a case, a refactoring fixture, an agent-eval task's
+program) is not blocked, only logged. When the query is not enough,
+rerun the shell command with a trailing comment saying why:
 
     sed -n '120,180p' compiler/src/middle/gvn.tach  # no-query: need the comment block above run_gvn, show omits it
 

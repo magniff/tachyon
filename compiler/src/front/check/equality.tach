@@ -24,17 +24,25 @@ use crate::front::check::{pop_scope, push_scope};
 use crate::front::check::check_mode::check_expr;
 use crate::front::lexer::{SUF_NONE, Tok};
 use crate::front::patterns::check_pattern;
+use crate::front::traits::{has_impl, std_trait};
 use crate::front::types::{
     ENUMS, STRUCTS, TYPES, TY_BOOL, TyKind, VARIANTS, enum_variant, is_fieldless_enum, is_fn_type,
     is_numeric, is_pointer, struct_field, type_elem, variant_field,
 };
 
 // 0 when values of type `ty` can be compared with ==, else a type in it
-// that cannot.
+// that cannot: the scalars, the types with an `impl Eq`, and the
+// compounds (slices too) whose parts all can.
 pub fn eq_unsupported(ty: i64) -> i64 {
     unsafe {
         if is_numeric(ty) || ty == TY_BOOL || is_pointer(ty) || is_fn_type(ty)
             || is_fieldless_enum(ty) {
+            return 0;
+        }
+        // (0.14: a part with its own `==`, an `impl Eq`, is compared by
+        // it, as `==` on it alone is; a slice of comparable elements by
+        // its elements, std loaded or not)
+        if has_impl(std_trait(c"Eq"), ty) {
             return 0;
         }
         let kind = TYPES[ty].kind;
@@ -56,7 +64,7 @@ pub fn eq_unsupported(ty: i64) -> i64 {
             }
             return 0;
         }
-        if kind == TyKind::Array {
+        if kind == TyKind::Array || kind == TyKind::Slice {
             return eq_unsupported(TYPES[ty].a);
         }
         if kind == TyKind::Enum {
@@ -101,6 +109,16 @@ fn eq_int(value: i64, pos: i64) -> i64 {
     unsafe {
         NODES[n].a = value;
         NODES[n].b = SUF_NONE;
+    }
+    n
+}
+
+// `name.len`, the length of the slice named `name`.
+fn eq_len(name: i64, pos: i64) -> i64 {
+    let n = new_node(FieldAccess, pos, pos);
+    unsafe {
+        NODES[n].a = eq_ident(name, pos);
+        NODES[n].b = intern_c(c"len");
     }
     n
 }
@@ -191,7 +209,9 @@ fn eq_compare(ty: i64, l: i64, r: i64, pos: i64) -> i64 {
             }
             return eq_and(mark, pos);
         }
-        if kind == TyKind::Array {
+        // (0.14: a slice the same way, its length first: `[u8] == [u8]`
+        // needs no std)
+        if kind == TyKind::Array || kind == TyKind::Slice {
             let i_name = intern_c(c"==i");
             let e_name = intern_c(c"==e");
             let block = new_node(Block, pos, pos);
@@ -209,12 +229,18 @@ fn eq_compare(ty: i64, l: i64, r: i64, pos: i64) -> i64 {
                 pos));
             list_end(body, body_mark);
             let w = new_node(While, pos, pos);
+            let len = if kind == TyKind::Slice { eq_len(l, pos) } else { eq_int(TYPES[ty].b, pos) };
             NODES[w].b = eq_binary(Tok::AmpAmp, eq_ident(e_name, pos),
-                eq_binary(Tok::Lt, eq_ident(i_name, pos), eq_int(TYPES[ty].b, pos), pos), pos);
+                eq_binary(Tok::Lt, eq_ident(i_name, pos), len, pos), pos);
+            let same_len = if kind == TyKind::Slice {
+                eq_binary(Tok::EqEq, eq_len(l, pos), eq_len(r, pos), pos)
+            } else {
+                eq_bool(true, pos)
+            };
             NODES[w].c = body;
             let mark = list_begin();
             list_push(eq_let(eq_bind(i_name, true, pos), eq_int(0, pos), pos));
-            list_push(eq_let(eq_bind(e_name, true, pos), eq_bool(true, pos), pos));
+            list_push(eq_let(eq_bind(e_name, true, pos), same_len, pos));
             list_push(eq_stmt(w, pos));
             list_end(block, mark);
             NODES[block].a = eq_ident(e_name, pos);

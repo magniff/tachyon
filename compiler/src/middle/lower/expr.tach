@@ -20,7 +20,7 @@ use crate::front::types::{
     scalar_type, struct_field, tuple_offset, type_elem, type_size, variant_field,
     variant_field_offset,
 };
-use crate::gen0::gen::expr::{field_offset_of, panic_kind};
+use crate::gen0::gen::expr::{field_offset_of, panic_kind, pointer_place};
 use crate::middle::ir::{
     CUR, Cond, INSTS, Op, Term, cond_of_token, emit_ir, ir_binary, ir_cmp, ir_const, ir_load,
     ir_new_block, ir_offset, ir_slot_addr, ir_store, ir_type,
@@ -182,6 +182,35 @@ fn lower_ident(n: i64) -> i64 {
     }
 }
 
+// The pointer base of `p[i]` or `p[lo..hi]`, before its index or bounds:
+// a place's address (`pointer_place`), 0 for a promoted local, else its
+// value. `late_pointer` gives the pointer after them.
+fn early_pointer(base: i64) -> i64 {
+    unsafe {
+        if NODES[base].kind == Ident && NODES[base].res == Res::Local
+            && PROMOTE[NODES[base].y] != 0 {
+            return 0;
+        }
+        if pointer_place(base) {
+            return lower_addr(base);
+        }
+        lower_operand(base)
+    }
+}
+
+fn late_pointer(base: i64, early: i64) -> i64 {
+    unsafe {
+        if NODES[base].kind == Ident && NODES[base].res == Res::Local
+            && PROMOTE[NODES[base].y] != 0 {
+            return lower_operand(base);
+        }
+        if pointer_place(base) {
+            return ir_load(TY_U64, early, 0);
+        }
+        early
+    }
+}
+
 // The address of a place (or of a compound value).
 pub fn lower_addr(n: i64) -> i64 {
     unsafe {
@@ -214,9 +243,14 @@ pub fn lower_addr(n: i64) -> i64 {
                 let base = NODES[n].a;
                 let base_ty = NODES[base].ty;
                 let elem_size = type_size(TYPES[base_ty].a);
-                let mut addr = lower_operand(base);
+                // A slice's address (its pointer and length are read after
+                // the index), an array's, or a pointer read after it.
+                let is_pointer = TYPES[base_ty].kind == TyKind::Ptr;
+                let mut addr = if is_pointer { early_pointer(base) } else { lower_operand(base) };
                 let index = lower_operand(NODES[n].b);
-                if is_slice(base_ty) {
+                if is_pointer {
+                    addr = late_pointer(base, addr);
+                } else if is_slice(base_ty) {
                     let length = ir_load(TY_U64, addr, 8);
                     lower_check(ir_cmp(Cond::Lt, TY_U64, index, length),
                         panic_kind(NODES[NODES[n].b].ty, false), index, length, 0);
@@ -396,15 +430,11 @@ fn lower_slicing(n: i64) -> i64 {
         let high = NODES[range].b;
         let inclusive = NODES[range].c != 0;
         let elem_size = type_size(TYPES[base_ty].a);
-        let value = lower_operand(base);
-        let mut pointer = value;
-        let mut length = 0;
-        if is_slice(base_ty) {
-            pointer = ir_load(TY_U64, value, 0);
-            length = ir_load(TY_U64, value, 8);
-        } else if TYPES[base_ty].kind == TyKind::Array {
-            length = ir_const(TYPES[base_ty].b, TY_U64);
-        }
+        // The base first (a slice's address, a pointer's location or
+        // value, an array's address), then the bounds, then what the base
+        // holds, so that bounds that change it are seen.
+        let is_pointer = TYPES[base_ty].kind == TyKind::Ptr;
+        let value = if is_pointer { early_pointer(base) } else { lower_operand(base) };
         let mut bound_ty = TY_U64;
         let mut lo = 0;
         if low != 0 {
@@ -417,7 +447,18 @@ fn lower_slicing(n: i64) -> i64 {
         if high != 0 {
             hi = lower_operand(high);
             bound_ty = NODES[high].ty;
-        } else {
+        }
+        let mut pointer = value;
+        let mut length = 0;
+        if is_pointer {
+            pointer = late_pointer(base, value);
+        } else if is_slice(base_ty) {
+            pointer = ir_load(TY_U64, value, 0);
+            length = ir_load(TY_U64, value, 8);
+        } else if TYPES[base_ty].kind == TyKind::Array {
+            length = ir_const(TYPES[base_ty].b, TY_U64);
+        }
+        if high == 0 {
             hi = length;
         }
         let mut end = hi;
