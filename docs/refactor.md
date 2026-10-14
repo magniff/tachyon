@@ -21,7 +21,7 @@ tachyonc edit insert --after|--before NAME [ROOT] < TEXT
 tachyonc edit delete NAME [ROOT]
 tachyonc undo [--force]                        the last edit, undone
 tachyonc check [ROOT]                          the front end's errors, one per line
-tachyonc fix [ROOT] [--only imports,unused,pub,unsafe,tidy-imports,reexports] [--in FILE|MODULE]
+tachyonc fix [ROOT] [--only imports,unused,pub,unsafe,tidy-imports,reexports,std015] [--in FILE|MODULE]
 tachyonc same-output OLD [--corpus DIR|FILE]... [-j N] [--work DIR]
 tachyonc lint --max-lines N [ROOT]
 tachyonc query stats [MODULE|FILE] [--over N] [--all]
@@ -478,11 +478,12 @@ fixed 2 missing imports, 3 unused imports, 1 pub, 1 unsafe block→3 files→+3 
 
 | `tidy-imports` | (0.12) the `use` lines in the codebase's style: the paths of a module's child modules written as most of its `use` lines that could be written either way write them (0.14: relative, `use a::x;`, or from `crate`, `use crate::m::a::x;`; a tie, as the first), the `use` items of a module with one path (and one `pub`) merged where the first is, their names sorted (byte order) and each once, `use p::a;` for one, `use p::{a, b};` when the line fits in 100 columns, else wrapped four spaces in, a line per name imported under another name (`use p::a as b;`); a `use` with a comment on its lines, or sharing a line, is left as it is, and one with a comment right above it is not merged into another |
 | `reexports` | (0.12) every import and path that reaches an item through a re-export (a `pub use` of another module, or an ancestor's import: `use crate::f` where the root imports f) is written from the module that defines the item (`mod` lines on the way made `pub` when needed); then the re-exports nothing goes through any more are removed, or made private imports when their file still names them |
+| `std015` | (0.15) a program written against 0.14's std moved to 0.15's I/O API, where failure is a Result with a typed error: each call the checker resolved to std's `parse_int` or `Scanner::next_int` gets `.ok()` (the old `Option<i64>`), `read_line` `.unwrap_or(false)` (the old `bool`), `read_stdin` `.unwrap()` (the old `Buf`), so the program means what it meant (exactly, but for `read_stdin` on a read error, which 0.14 read as empty input). Calls in generic functions are found through their instances; a function of the program with one of those names is not std's. A call whose value is already handled as a Result is left as it is, so a second run finds nothing: the operand of `?`; the receiver of `ok`, `err`, `map_err`, `is_ok`, `is_err`, `unwrap`, `unwrap_or`, `expect`, or `unwrap_or_else` with a one-parameter closure (for `read_line` and `read_stdin`, whose old types had none of Result's methods: of `unwrap_or_else`, `map`, `and_then` too); the scrutinee of a `match` or `if let` with an `Ok` or `Err` pattern; the value of a `let` whose type is written `Result<...>`. A Result kept in a local and handled further on (`let r = parse_int(s); match r { Ok(..) .. }`) is not recognised: run it once, on 0.14 code |
 
 By default the first four (`imports`, `unused`, `pub`, `unsafe`),
-everywhere; `tidy-imports` and `reexports` only when asked for (`--only
-reexports,tidy-imports` does both: the rounds tidy what the first
-rewrote).
+everywhere; `tidy-imports`, `reexports` and `std015` only when asked
+for (`--only reexports,tidy-imports` does both: the rounds tidy what the
+first rewrote).
 
 **Re-exports kept: the interface.** A `pub use` with a comment line
 starting `// api:` right above it (in its comment lines) is the module's
