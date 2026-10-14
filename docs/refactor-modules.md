@@ -200,9 +200,10 @@ order (or edit first):
 ```
 # crate::middle::gvn→932 lines→6 parts of at most 300 lines
 # stays in crate::middle::gvn: the part most used from other modules
+# walk: banner '// ---- The walk ----': 1 of 8 items, 87 of 142 lines
+tachyonc refactor split crate::middle::gvn --into crate::middle::gvn::walk --items DOM_START,...
 # memory_values: banner '// ---- Memory values ----': 5 of 6 items, 136 of 141 lines
 tachyonc refactor split crate::middle::gvn --into crate::middle::gvn::memory_values --items copy_src,...
-# unused: prefix unused_: 2 of 8 items, 87 of 168 lines
 ...
 note refactor.plan: the same in one edit: --auto (other names: --names a,b)
 try: tachyonc refactor split crate::middle::gvn --auto --max-lines 300
