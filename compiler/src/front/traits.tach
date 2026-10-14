@@ -29,6 +29,7 @@ use crate::base::{IntVec, buf_byte, buf_new, buf_slice, grow, intern, intern_c, 
 use crate::base::diag::{
     err_begin, err_end, err_end_soft, err_help, err_help_sym, err_str, err_sym, fail_name,
 };
+use crate::front::assoc::{assoc_constraints_hold, collect_impl_assoc, collect_trait_assoc};
 use crate::front::ast::{
     FN_SIG_FAILED, NODES, NodeKind, child, list_begin, list_end, list_push, new_node,
 };
@@ -40,6 +41,7 @@ use crate::front::check::collect::{add_fn, template_of_type_node};
 use crate::front::check::equality::eq_unsupported;
 use crate::front::check::resolve::{resolve_type, type_name_key};
 use crate::front::check::synth_mode::synth_expr;
+use crate::front::closures::fn_bound_satisfied;
 use crate::front::generics::{CUR_INST, TPL_NONE, instance_of, instance_targs, mangle_type};
 use crate::front::generics::instantiate::clone_node;
 use crate::front::lexer::{SUF_NONE, Tok};
@@ -53,13 +55,13 @@ use crate::front::types::{
 pub struct TraitInfo { name: i64, node: i64, module: i64 }
 // An impl of trait `tr` for type `ty`, or (generic) for the instances of
 // template `tpl` (generics.tach's encoding).
-struct ImplInfo { node: i64, tr: i64, ty: i64, tpl: i64, module: i64 }
+pub struct ImplInfo { node: i64, tr: i64, ty: i64, tpl: i64, module: i64 }
 
 pub static mut TRAITS: *TraitInfo = 0 as *TraitInfo;
 pub static mut TRAIT_COUNT: i64 = 0;
 static mut TRAIT_CAP: i64 = 0;
-static mut IMPLS: *ImplInfo = 0 as *ImplInfo;
-static mut IMPL_COUNT: i64 = 0;
+pub static mut IMPLS: *ImplInfo = 0 as *ImplInfo;
+pub static mut IMPL_COUNT: i64 = 0;
 static mut IMPL_CAP: i64 = 0;
 // Per key: trait + 1.
 pub static mut SYM_TRAIT: *i64 = 0 as *i64;
@@ -76,6 +78,7 @@ pub fn add_trait(item: i64, key: i64, m: i64) {
         TRAITS[TRAIT_COUNT] = TraitInfo { name: NODES[item].a, node: item, module: m };
         TRAIT_COUNT += 1;
         SYM_TRAIT[key] = TRAIT_COUNT;
+        collect_trait_assoc(TRAIT_COUNT - 1);
     }
 }
 
@@ -126,9 +129,13 @@ pub fn trait_named(n: i64) -> i64 {
 
 // The trait of bound node b (a TyName in a parameter's bounds), resolved
 // in its own module once; -1 when it names none (0.10: an error recorded,
-// and the bound holds for every type).
+// and the bound holds for every type; 0.14: or it is an `Fn` bound).
 pub fn bound_trait(b: i64) -> i64 {
     unsafe {
+        // (0.14: `Fn(A) -> R` names no trait: fn_bound_satisfied)
+        if NODES[b].kind == NodeKind::TyFn {
+            return -1;
+        }
         if NODES[b].x == 0 {
             let saved = CUR_MOD;
             CUR_MOD = module_of(b);
@@ -296,6 +303,7 @@ pub fn collect_impl(node: i64) {
                 return;
             }
         }
+        collect_impl_assoc(me);
         // Its functions: each one of the trait's.
         for i in 0..NODES[node].count {
             let f = child(node, i);
@@ -498,7 +506,13 @@ fn satisfies(p: i64, t: i64) -> bool {
             return true;
         }
         for i in 0..NODES[bounds].count {
-            if !implements(bound_trait(child(bounds, i)), t) {
+            let b = child(bounds, i);
+            if !implements(bound_trait(b), t) {
+                return false;
+            }
+            // (0.14: `Fn(A) -> R`, and constraints `Iterator<Item = A>`)
+            if NODES[b].kind == NodeKind::TyFn && !fn_bound_satisfied(b, t)
+                || NODES[b].h != 0 && !assoc_constraints_hold(b, t) {
                 return false;
             }
         }
@@ -524,7 +538,21 @@ pub fn check_bounds(params: i64, targs: i64, count: i64, what: i64, pos: i64) {
                 continue;
             }
             for i in 0..NODES[bounds].count {
-                let tr = bound_trait(child(bounds, i));
+                let b = child(bounds, i);
+                // (0.14: `Fn(A) -> R`, and constraints `Iterator<Item = A>`)
+                if NODES[b].kind == NodeKind::TyFn && !fn_bound_satisfied(b, t)
+                    || NODES[b].h != 0 && !assoc_constraints_hold(b, t) {
+                    err_begin(pos);
+                    err_str(c"the type '");
+                    err_type(t);
+                    err_str(c"' does not satisfy the bound of '");
+                    err_sym(NODES[p].a);
+                    err_str(c"' of '");
+                    err_sym(what);
+                    err_str(c"'");
+                    err_end();
+                }
+                let tr = bound_trait(b);
                 if !implements(tr, t) {
                     err_begin(pos);
                     err_str(c"the trait '");

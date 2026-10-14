@@ -9,16 +9,19 @@ use crate::base::{
     intern,
 };
 use crate::base::diag::{buf_position, err_begin, err_end, err_help, err_str, err_sym};
+use crate::front::assoc::{infer_from_assoc, is_projection_node};
 use crate::front::ast::{NODES, NodeKind, child, list_begin, list_end, list_push, new_node};
 use crate::front::ast::NodeKind::{
-    Arm, Assign, Binary, Block, Break, Call, Cast, Defer, EnumPanic, ExprStmt, FieldAccess,
-    FieldInit, Fn, For, If, Index, Let, Loop, Match, MethodCall, Param, PatLit, PatRange, Range,
-    Repeat, Return, TupleField, TyArray, TyFn, TyName, TyPtr, TySlice, TyTuple, Unary, While,
+    Arm, Assign, AssocType, Binary, Block, Break, Call, Cast, Closure, Defer, EnumPanic, ExprStmt,
+    FieldAccess, FieldInit, Fn, For, If, Index, Let, Loop, Match, MethodCall, Param, PatLit,
+    PatRange, Range, Repeat, Return, TupleField, TyArray, TyFn, TyName, TyPtr, TySlice, TyTuple,
+    Unary, While,
 };
 use crate::front::check::{Res, SELF_TYPE, SELF_TYPE_SYM};
 use crate::front::check::collect::{add_fn, template_of_type_node};
 use crate::front::check::resolve::{resolve_signature, resolve_type, type_name_key};
 use crate::front::check::synth_mode::synth_expr;
+use crate::front::closures::{infer_closure_arg, is_deferred_arg};
 use crate::front::generics::{
     CUR_INST, INST_QUEUE, MAX_INST_DEPTH, TPL_NONE, check_targ_depth, env_enter, env_leave,
     env_lookup, generic_symbol, hint_for, instance_of, instance_targs, is_untyped_literal_expr,
@@ -151,6 +154,10 @@ fn unify(params: i64, bound: *i64, tmod: i64, p: i64, t: i64) -> bool {
         let kind = NODES[p].kind;
         let tk = TYPES[t].kind;
         if kind == TyName {
+            // (0.14: `I::Item` binds nothing here: infer_from_assoc)
+            if is_projection_node(p) {
+                return true;
+            }
             if is_self_name(p) {
                 return unify(params, bound, tmod, UNIFY_SELF, t);
             }
@@ -246,7 +253,9 @@ fn infer_from(params: i64, bound: *i64, tmod: i64, args: i64, first: i64, types:
                 }
             }
         }
-        for pass in 0..2 {
+        // (0.14: pass 2, the closures, typed from their parameters' bounds;
+        // then what the bounds' constraints bind)
+        for pass in 0..3 {
             for i in first..NODES[args].count {
                 let k = first_type + i - first;
                 if k >= NODES[types].count {
@@ -257,7 +266,13 @@ fn infer_from(params: i64, bound: *i64, tmod: i64, args: i64, first: i64, types:
                     continue;
                 }
                 let arg = child(args, i);
-                if pass == 0 && is_untyped_literal_expr(arg) {
+                if is_deferred_arg(arg) {
+                    if pass == 2 {
+                        infer_closure_arg(params, bound, tmod, arg, p);
+                    }
+                    continue;
+                }
+                if pass == 0 && is_untyped_literal_expr(arg) || pass == 2 {
                     continue;
                 }
                 let t = synth_expr(arg);
@@ -270,6 +285,9 @@ fn infer_from(params: i64, bound: *i64, tmod: i64, args: i64, first: i64, types:
                     err_end();
                 }
             }
+        }
+        for k in 0..NODES[params].count {
+            infer_from_assoc(params, bound, tmod, k);
         }
     }
 }
@@ -552,7 +570,7 @@ pub fn clone_node(n: i64) -> i64 {
                 | Call | Match | MethodCall | FieldAccess
                 | TupleField | Block | PatLit | PatRange
                 | TyPtr | TyArray | TySlice | TyFn
-                | EnumPanic | Defer => {
+                | EnumPanic | Defer | Closure | AssocType => {
                 if node_field_a(kind) {
                     NODES[c].a = clone_node(NODES[n].a);
                 }
@@ -562,7 +580,8 @@ pub fn clone_node(n: i64) -> i64 {
                 if node_field_c(kind) {
                     NODES[c].c = clone_node(NODES[n].c);
                 }
-                if kind == For {
+                // (0.14: a closure parameter's pattern)
+                if kind == For || kind == Param {
                     NODES[c].d = clone_node(NODES[n].d);
                 }
             }
@@ -592,7 +611,7 @@ fn node_field_a(kind: NodeKind) -> bool {
             | Call | Match | MethodCall | FieldAccess
             | TupleField | Block | PatLit | PatRange
             | TyPtr | TyArray | TySlice | TyFn
-            | EnumPanic | Defer => true,
+            | EnumPanic | Defer | Closure => true,
         _ => false,
     }
 }
@@ -602,7 +621,7 @@ fn node_field_b(kind: NodeKind) -> bool {
         Param | Let | Cast | Index | Repeat
             | If | Loop | While | For | Range
             | Assign | Break | Arm | Binary
-            | Unary | FieldInit | PatRange | TyArray => true,
+            | Unary | FieldInit | PatRange | TyArray | Closure | AssocType => true,
         _ => false,
     }
 }

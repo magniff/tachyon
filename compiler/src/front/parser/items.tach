@@ -23,7 +23,7 @@ use crate::front::parser::{
 use crate::front::parser::exprs::parse_expr;
 use crate::front::parser::foreign::parse_extern;
 use crate::front::parser::stmts::parse_block;
-use crate::front::parser::types::{is_int_type_name, parse_type};
+use crate::front::parser::types::{is_int_type_name, parse_bound, parse_type};
 
 // One item (or the several items of an impl or extern block), pushed to
 // the program's list.
@@ -124,6 +124,13 @@ fn parse_impl(public: bool) {
         let fns = SCRATCH.count;
         expect(LBrace);
         while !at(RBrace) && !at(Eof) {
+            if at(Type) {
+                if trait_name == 0 {
+                    error_at(cur_start(), c"associated types are declared in an impl of a trait");
+                }
+                list_push(parse_assoc_type(true));
+                continue;
+            }
             let attrs_start = cur_start();
             let flags = parse_fn_attributes();
             let item_public = eat(Pub) || public;
@@ -131,7 +138,8 @@ fn parse_impl(public: bool) {
                 if flags != 0 {
                     error_at(attrs_start, c"#[inline] and #[cold] go before a function");
                 }
-                syntax_error(c"expected 'fn' or '}' in an impl block");
+                syntax_error(if trait_name != 0 { c"expected 'fn', 'type' or '}' in an impl block" }
+                    else { c"expected 'fn' or '}' in an impl block" });
             }
             let f = parse_function();
             NODES[f].p |= flags;
@@ -146,11 +154,13 @@ fn parse_impl(public: bool) {
             list_push(f);
         }
         expect(RBrace);
+        let assoc = take_assoc_types(fns, impl_start);
         if trait_name != 0 {
             let n = new_node(NodeKind::Impl, impl_start, prev_end());
             NODES[n].a = trait_name;
             NODES[n].b = self_type;
             NODES[n].g = params;
+            NODES[n].c = assoc;
             let end = SCRATCH.count;
             let mark = list_begin();
             for i in fns..end {
@@ -159,6 +169,63 @@ fn parse_impl(public: bool) {
             list_end(n, mark);
             list_push(n);
         }
+    }
+}
+
+// `type Name;` in a trait, `type Name = T;` in an impl (0.14): an
+// AssocType node.
+fn parse_assoc_type(in_impl: bool) -> i64 {
+    unsafe {
+        let start = cur_start();
+        expect(Type);
+        let n = new_node(NodeKind::AssocType, start, 0);
+        NODES[n].a = expect_binding_name();
+        if in_impl {
+            expect(Eq);
+            NODES[n].b = parse_type();
+        } else if at(Eq) {
+            error_at(cur_start(), c"an associated type has no default: write 'type Name;'");
+        } else if at(Colon) {
+            error_at(cur_start(), c"an associated type has no bounds: write 'type Name;'");
+        }
+        expect(Semi);
+        NODES[n].end = prev_end();
+        n
+    }
+}
+
+// The AssocType nodes among SCRATCH[from..] moved to a holder node (a
+// Generics node, 0.14), the others kept in order; 0 when there are none.
+fn take_assoc_types(from: i64, pos: i64) -> i64 {
+    unsafe {
+        let end = SCRATCH.count;
+        let mut found = false;
+        for i in from..end {
+            if NODES[SCRATCH.data[i]].kind == NodeKind::AssocType {
+                found = true;
+            }
+        }
+        if !found {
+            return 0;
+        }
+        let holder = new_node(NodeKind::Generics, pos, prev_end());
+        let mark = list_begin();
+        for i in from..end {
+            if NODES[SCRATCH.data[i]].kind == NodeKind::AssocType {
+                list_push(SCRATCH.data[i]);
+            }
+        }
+        list_end(holder, mark);
+        let mut w = from;
+        for i in from..end {
+            let x = SCRATCH.data[i];
+            if NODES[x].kind != NodeKind::AssocType {
+                SCRATCH.data[w] = x;
+                w += 1;
+            }
+        }
+        SCRATCH.count = w;
+        holder
     }
 }
 
@@ -175,6 +242,10 @@ fn parse_trait() -> i64 {
         expect(LBrace);
         let mark = list_begin();
         while !at(RBrace) && !at(Eof) {
+            if at(Type) {
+                list_push(parse_assoc_type(false));
+                continue;
+            }
             let attrs_start = cur_start();
             let flags = parse_fn_attributes();
             if at(Pub) {
@@ -185,7 +256,7 @@ fn parse_trait() -> i64 {
                 if flags != 0 {
                     error_at(attrs_start, c"#[inline] and #[cold] go before a function");
                 }
-                syntax_error(c"expected 'fn' or '}' in a trait");
+                syntax_error(c"expected 'fn', 'type' or '}' in a trait");
             }
             let fstart = cur_start();
             let is_unsafe = eat(Unsafe);
@@ -207,6 +278,7 @@ fn parse_trait() -> i64 {
             NODES[f].end = prev_end();
             list_push(f);
         }
+        NODES[n].b = take_assoc_types(mark, start);
         list_end(n, mark);
         expect(RBrace);
         NODES[n].end = prev_end();
@@ -248,11 +320,12 @@ fn parse_generic_params() -> i64 {
             NODES[param].a = expect_binding_name();
             NODES[param].end = prev_end();
             if eat(Colon) {
-                // Bounds (0.9): `T: Hash + Eq`, a Generics node of trait names.
+                // Bounds (0.9): `T: Hash + Eq`, a Generics node of trait names
+                // (0.14: or `Fn(A) -> R`, `Iterator<Item = A>`: parse_bound).
                 let bounds = new_node(NodeKind::Generics, cur_start(), 0);
                 let bmark = list_begin();
                 loop {
-                    list_push(parse_type());
+                    list_push(parse_bound());
                     if !eat(Plus) {
                         break;
                     }

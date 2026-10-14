@@ -40,10 +40,12 @@ directly by other letters (`3e` and `1foo` are errors).
 
 **Keywords:** `as break const continue defer else enum extern false fn for
 if impl import in let loop match mod mut pub return static struct trait true
-type union unsafe use while` (`import` and `use` since 0.4, `pub` and `mod`
-since 0.5, `defer` since 0.6, `unsafe` and `trait` since 0.9).
+type union unsafe use while move` (`import` and `use` since 0.4, `pub` and
+`mod` since 0.5, `defer` since 0.6, `unsafe` and `trait` since 0.9, `move`
+since 0.14).
 
-**Reserved** (an error if used): the keywords `where dyn move`, and the
+**Reserved** (an error if used): the keywords `where dyn` (and `move` until
+0.14, a keyword since), and the
 tokens `?` `@`. `self` and `Self` are
 ordinary names, with a meaning in methods (see Items).
 
@@ -1022,6 +1024,44 @@ pointer type or static cannot hold one (C's vector types and their
 conventions are not supported; pass a pointer to the lanes or an array).
 In tachyon's own convention a vector is passed like a struct of its
 lanes.
+
+## Additions of 0.14
+
+(In progress: the syntax below parses; what is not checked yet is
+reported as `... are not implemented yet (check.unimplemented)`. The
+design is [design/closures-iterators.md](design/closures-iterators.md).)
+
+```ebnf
+prefix     += [ "move" ] ( "||" | "|" [ cparam { "," cparam } [ "," ] ] "|" )
+              ( "->" type block | expr )
+cparam      = single_pattern [ ":" type ]   (* no `|` alternatives *)
+tparam      = ident [ ":" bound { "+" bound } ]
+bound       = path [ "<" ident "=" type { "," ident "=" type } ">" ]
+            | ( "Fn" | "FnMut" ) "(" [ type { "," type } ] ")" [ "->" type ]
+trait_item += "type" ident ";"
+impl_item  += "type" ident "=" type ";"     (* in an impl of a trait *)
+type       += path "::" ident               (* T::Item, Self::Item, F::Output *)
+```
+
+`move` is a keyword (it was reserved). A closure's body has binding power
+0, as in Rust: `|x| x + 1` is `|x| (x + 1)`; with a written result type
+the body is a block. `Fn` and `FnMut` are bounds, not traits (and not
+keywords): `F: FnMut(i64) -> i64`.
+
+### Closures
+
+(To come: types, captures, `move`, calls, `Fn`/`FnMut` bounds, coercion
+to `fn` types, the escape rule.)
+
+### Associated types
+
+(To come: `type Item;`, projections, `Iterator<Item = T>` constraints.)
+
+### Iterators
+
+(To come: the `Iterator` trait, in the prelude; std's sources and
+adapters; `for` over iterators; `a..b` as a value. The standard library is
+also loaded when a program uses a range as a value.)
 
 ## Importing C headers
 

@@ -42,9 +42,10 @@ error[parser error] expected identifier, got '&'
 let f = |x: i64| x + 1;
 ```
 ```err
-error[parser error] expected expression, got '|'
+error[type error] closures are not implemented yet (check.unimplemented)
 ```
-No closures in 0.13: a named `fn`, passed as `fn(i64) -> i64`, or a loop.
+(0.14 in progress: closures parse, and are checked once implemented.) Until
+then: a named `fn`, passed as `fn(i64) -> i64`, or a loop.
 
 ```tach
 fn f(r: Result<i64, i64>) -> Result<i64, i64> { let x = r?; Ok(x) }
