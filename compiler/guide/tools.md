@@ -71,7 +71,9 @@ prints the diff instead; `--no-check` writes anyway.
 
 ## Diagnostics
 
-Compiler errors, with `--diagnostics=short` or from `tachyonc check`:
+Compiler errors, from `tachyonc check` or a build whose output is not a
+terminal (`--diagnostics=short` anywhere, `--diagnostics=human` for the
+multi-line form):
 
 ```text
 main.tach:4:20: error[type error] undefined variable 'totl' | help: did you mean 'total'?

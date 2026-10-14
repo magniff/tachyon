@@ -459,7 +459,7 @@ the one hole in safe code (no lifetimes).
 
 ```sh
 tachyonc check [ROOT]                   # all errors, one line each: FILE:L:C: error[KIND] MSG | help: ...
-tachyonc --diagnostics=short f.tach -o f # the same form when compiling
+tachyonc f.tach -o f                    # the same lines when compiling, off a terminal
 tachyonc query show NAME                # an item's source: fn, Type::method, Enum::Variant, FILE:LINE
 tachyonc query def NAME                 # where it is defined, its signature
 tachyonc query refs NAME                # every resolved use (--count, --in FILE)
