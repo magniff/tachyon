@@ -19,6 +19,7 @@ use crate::tools::query::positions::{
     token_at,
 };
 use crate::tools::query_text::section_start;
+use crate::tools::query::sections::{B_START, OPT_BANNERS, banners_of_module, put_banner_line};
 
 // ---- def, show, items ----
 
@@ -220,20 +221,32 @@ pub fn module_file(m: i64) -> i64 {
     }
 }
 
+// The block of a function of an impl block (the functions of one block
+// share its node, or for an inherent impl its type node).
+fn impl_block(d: i64) -> i64 {
+    unsafe {
+        if DEFS[d].impl_node != 0 { DEFS[d].impl_node } else { NODES[DEFS[d].node].h }
+    }
+}
+
+// The start of the `impl` of the impl block of function definition d.
+fn impl_start(d: i64) -> i64 {
+    unsafe {
+        if DEFS[d].impl_node != 0 {
+            return NODES[DEFS[d].impl_node].start;
+        }
+        let mut i = token_at(NODES[NODES[DEFS[d].node].h].start) - 1;
+        while i > 0 && TOKS[i].kind != Tok::Impl {
+            i -= 1;
+        }
+        TOKS[i].start
+    }
+}
+
 // The `impl ... {` header of the impl block of function definition d.
 fn put_impl_header(out: i64, d: i64) {
     unsafe {
-        let node = DEFS[d].node;
-        let mut from = 0;
-        if DEFS[d].impl_node != 0 {
-            from = NODES[DEFS[d].impl_node].start;
-        } else {
-            let mut i = token_at(NODES[NODES[node].h].start) - 1;
-            while i > 0 && TOKS[i].kind != Tok::Impl {
-                i -= 1;
-            }
-            from = TOKS[i].start;
-        }
+        let from = impl_start(d);
         let mut j = token_at(from);
         while j < TOK_COUNT && TOKS[j].kind != Tok::LBrace && TOKS[j].kind != Tok::Eof {
             j += 1;
@@ -264,15 +277,29 @@ pub fn query_items(modules: *IntVec) {
             }
             buf_byte(out, '\n');
             let mut impl_of = -1;
+            // (--comments: the banners and comments before each item)
+            let mut banners = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            if OPT_BANNERS {
+                banners_of_module(m, &banners);
+            }
+            let mut bk = 0;
             for j in 0..all.count {
                 let d = all.data[j];
                 if DEFS[d].module != m || DEFS[d].parent >= 0 {
                     continue;
                 }
                 let k = DEFS[d].kind;
+                let mut at = text_start(d);
+                if (k == K_METHOD || k == K_IMPL_METHOD) && impl_block(d) != impl_of {
+                    at = impl_start(d);
+                }
+                while bk < banners.count && B_START.data[banners.data[bk]] < at {
+                    put_banner_line(out, banners.data[bk]);
+                    bk += 1;
+                }
                 if k == K_METHOD || k == K_IMPL_METHOD {
                     // (the functions of one impl block share its type node)
-                    let block = if DEFS[d].impl_node != 0 { DEFS[d].impl_node } else { NODES[DEFS[d].node].h };
+                    let block = impl_block(d);
                     if block != impl_of {
                         put_impl_header(out, d);
                         impl_of = block;
@@ -286,6 +313,10 @@ pub fn query_items(modules: *IntVec) {
                 buf_byte(out, '\t');
                 put_signature(out, d);
                 buf_byte(out, '\n');
+            }
+            while bk < banners.count {
+                put_banner_line(out, banners.data[bk]);
+                bk += 1;
             }
         }
         buf_write_fd(out, STDOUT);

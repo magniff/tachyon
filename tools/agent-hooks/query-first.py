@@ -416,11 +416,15 @@ def suggestion(prog, args):
         text = f"tachyonc query text {files[0]}:{a}-{b}"
         return f"tachyonc query show {files[0]}:{a} | {text}" if compiler else text
     if prog in ("grep", "rg", "egrep", "fgrep"):
+        # (0.13: query grep, a literal search with each hit's item and
+        # whether it is in code, a comment or a string)
         word = re.sub(r"[^\w:.]", "", pattern)
+        literal = re.sub(r"\\(.)", r"\1", pattern)
         if word and not re.search(r"\s", pattern):
-            return f"tachyonc query refs {word}"
-        # (text, not a name: a comment, a string)
-        return "tachyonc query items MODULE | tachyonc query show FILE:LINE"
+            return f"tachyonc query refs {word} | tachyonc query grep {word}"
+        if literal and not re.search(r"[\[\]()*+?|^$]", literal):
+            return f"tachyonc query grep {shlex.quote(literal)}"
+        return "tachyonc query grep TEXT [--comments|--strings|--code] | tachyonc query items MODULE --comments"
     if files and prog == "head":
         n = next((args[i + 1] for i, a in enumerate(args[:-1]) if a == "-n"), None) \
             or next((a[1:] for a in args if re.match(r"^-\d+$", a)), "10")

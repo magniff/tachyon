@@ -1,0 +1,179 @@
+// `query type FILE:LINE[:COL]...` (0.13; docs/query.md): the type the
+// checker gave the innermost expression holding that position (without
+// COL: the line's first non-blank byte), `TYPE<TAB>EXPRESSION`; one line
+// per type when the expression is in a generic function checked once per
+// instance.
+
+use crate::base::{
+    FILES, FILE_COUNT, IntVec, SRC, STDOUT, buf_byte, buf_bytes, buf_int, buf_new, buf_slice,
+    buf_str, buf_write_fd,
+};
+use crate::front::ast::{NODES, NODE_COUNT, NodeKind};
+use crate::front::types::buf_type;
+use crate::tools::query::{parse_digits, trailing_number};
+use crate::tools::query::defs::bytes_eq;
+use crate::tools::query::diagnostics::{diag, try_begin, try_end, try_query};
+use crate::tools::query::positions::{LINES, collapse, line_end, line_index};
+use crate::tools::query::refs::file_text;
+
+// Whether nodes of kind k are expressions (or bindings) the checker types.
+fn typed_kind(k: NodeKind) -> bool {
+    match k {
+        NodeKind::Int | NodeKind::Float | NodeKind::Char | NodeKind::Str | NodeKind::CStr | NodeKind::Bool
+        | NodeKind::Unit | NodeKind::Ident | NodeKind::Binary | NodeKind::Unary | NodeKind::Cast
+        | NodeKind::Call | NodeKind::Index | NodeKind::FieldAccess | NodeKind::TupleField
+        | NodeKind::Tuple | NodeKind::Array | NodeKind::Repeat | NodeKind::StructLit | NodeKind::Block
+        | NodeKind::If | NodeKind::Loop | NodeKind::While | NodeKind::For | NodeKind::Range
+        | NodeKind::Assign | NodeKind::Return | NodeKind::Break | NodeKind::Continue | NodeKind::Path
+        | NodeKind::Match | NodeKind::MethodCall | NodeKind::VariantLit | NodeKind::EnumPanic
+        | NodeKind::VecOp | NodeKind::PatBind => true,
+        _ => false,
+    }
+}
+
+// The file of the program named `file` (its path, or its end by whole
+// components), or -1.
+pub fn file_named(file: [u8]) -> i64 {
+    for g in 0..FILE_COUNT {
+        let p = file_text(g);
+        if bytes_eq(p, file) || (p.len > file.len && bytes_eq(p[p.len - file.len..p.len], file) && p[p.len - file.len - 1] == '/') {
+            return g;
+        }
+    }
+    -1
+}
+
+// Expression text longer than this is cut (with `…`).
+const EXPR_MAX: i64 = 100;
+
+pub fn query_type(arg: [u8]) -> i64 {
+    unsafe {
+        // FILE:LINE[:COL]
+        let mut line = -1;
+        let mut col = -1;
+        let mut file = arg[0..0];
+        let a = trailing_number(arg);
+        if a > 0 && arg[a - 1] == ':' {
+            line = parse_digits(arg[a..arg.len]);
+            file = arg[0..a - 1];
+            let b = trailing_number(file);
+            if b > 0 && file[b - 1] == ':' {
+                col = line;
+                line = parse_digits(file[b..file.len]);
+                file = file[0..b - 1];
+            }
+        }
+        if line < 1 {
+            let d = diag(c"error", c"query.usage");
+            buf_str(d, c"type needs a position, FILE:LINE:COL (not '");
+            buf_bytes(d, arg);
+            buf_str(d, c"')\n");
+            return 2;
+        }
+        let f = file_named(file);
+        if f < 0 {
+            let d = diag(c"error", c"query.no-match");
+            buf_str(d, c"no file '");
+            buf_bytes(d, file);
+            buf_str(d, c"' in the program\n");
+            try_end(try_begin(c"items", arg[0..0], false));
+            return 1;
+        }
+        let idx = line_index(FILES[f].start) + line - 1;
+        if idx >= LINES.count || LINES.data[idx] >= FILES[f].end {
+            let d = diag(c"error", c"query.no-match");
+            buf_bytes(d, file_text(f));
+            buf_str(d, c" has no line ");
+            buf_int(d, line);
+            buf_byte(d, '\n');
+            return 1;
+        }
+        let ls = LINES.data[idx];
+        let le = line_end(ls);
+        let mut pos = ls;
+        if col >= 1 {
+            pos = ls + col - 1;
+        } else {
+            while pos < le && (SRC[pos] == ' ' || SRC[pos] == '\t') {
+                pos += 1;
+            }
+        }
+        if pos > le {
+            pos = le;
+        }
+        // The innermost typed nodes holding pos (copies of one in each
+        // instance of a generic function); without COL, the outermost
+        // that starts on the line.
+        let mut best = 0;
+        let mut have = false;
+        let mut found = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for n in 1..NODE_COUNT {
+            if NODES[n].ty <= 0 || !typed_kind(NODES[n].kind) {
+                continue;
+            }
+            if col >= 1 && (NODES[n].start > pos || NODES[n].end <= pos) {
+                continue;
+            }
+            if col < 1 && (NODES[n].start < pos || NODES[n].start >= le) {
+                continue;
+            }
+            let size = if col >= 1 { NODES[n].end - NODES[n].start } else { NODES[n].start - NODES[n].end };
+            if !have || size < best {
+                have = true;
+                best = size;
+                found.count = 0;
+            }
+            if size == best {
+                found.push(n);
+            }
+        }
+        if found.count == 0 {
+            let d = diag(c"error", c"query.no-match");
+            buf_str(d, c"no checked expression at ");
+            buf_bytes(d, arg);
+            buf_byte(d, '\n');
+            let w = buf_new();
+            buf_bytes(w, file_text(f));
+            buf_byte(w, ':');
+            crate::base::buf_int(w, line);
+            try_query(c"show", buf_slice(w));
+            return 1;
+        }
+        let out = buf_new();
+        let mut types = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..found.count {
+            let n = found.data[i];
+            let t = NODES[n].ty;
+            let mut seen = false;
+            for j in 0..types.count {
+                if types.data[j] == t {
+                    seen = true;
+                }
+            }
+            if seen {
+                continue;
+            }
+            types.push(t);
+            buf_type(out, t);
+            buf_byte(out, '\t');
+            let text = buf_new();
+            collapse(text, NODES[n].start, NODES[n].end);
+            let s = buf_slice(text);
+            if s.len <= EXPR_MAX {
+                buf_bytes(out, s);
+            } else {
+                let mut e = EXPR_MAX - 1;
+                while e > 0 && (s[e] & 192) == 128 {
+                    e -= 1;
+                }
+                buf_bytes(out, s[0..e]);
+                buf_byte(out, 226 as u8);
+                buf_byte(out, 128 as u8);
+                buf_byte(out, 166 as u8);
+            }
+            buf_byte(out, '\n');
+        }
+        buf_write_fd(out, STDOUT);
+        0
+    }
+}

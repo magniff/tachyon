@@ -39,6 +39,9 @@ pub mod diagnostics;
 pub mod positions;
 pub mod refs;
 pub mod show;
+pub mod grep;
+pub mod sections;
+pub mod typeat;
 
 use crate::base::{
     FILES, FILE_COUNT, IntVec, SRC, STDOUT, SYMS, _setjmp, alloc_array, alloc_zeroed, buf_byte,
@@ -50,8 +53,8 @@ use crate::front::cpp::directives::file_exists;
 use crate::front::cimport::{IMPORTED_START, drop_shadowed_imports, import_c_headers};
 use crate::front::ast::{KEEP_PARSED, init_ast, keep_parsed};
 use crate::front::parser::parse_program;
-use crate::front::modules::load_modules;
-use crate::front::types::{init_declarations, init_types};
+use crate::front::modules::{load_modules, module_at};
+use crate::front::types::{ENUMS, STRUCTS, TYPES, TyKind, init_declarations, init_types};
 use crate::front::check::check_program;
 use crate::base::target::{T_X86_64_LINUX, set_target};
 use crate::gen0::gen::MAIN_SYM;
@@ -62,18 +65,23 @@ use crate::tools::query_text::{
     WITH_COMMENTS, all_files, infer_root, run_text, show_files, show_region,
 };
 use crate::tools::edit::undo::run_query_diff;
-use defs::{collect_defs, find_defs, finish_defs};
-use diagnostics::{
-    CMD, OPT_EXACT, PROG, ROOT_GIVEN, diag, is_query_command, no_match, no_module, program_errors,
-    push_once, try_begin, try_end, try_query, write_diags,
+use defs::{
+    DEFS, DEF_COUNT, K_FIELD, K_VARIANT, MOD_DEF, bytes_eq, collect_defs, find_defs, finish_defs,
+    last_segment, mod_fqn,
 };
+use diagnostics::{
+    CMD, OPT_EXACT, PROG, ROOT_GIVEN, alias_defs, diag, is_query_command, no_match, no_module,
+    program_errors, push_once, try_begin, try_end, try_query, write_diags,
+};
+use grep::{G_CODE, G_COMMENT, G_STRING, OPT_WHERE, OPT_WORD, query_grep};
 use positions::{LINES, init_containers, init_positions, line_index, line_start, sort_by_position};
 use refs::{
-    OPT_ALL, OPT_COUNT, OPT_IN, OPT_LIMIT, file_text, put_bad_in, query_refs, resolve_in, try_refs,
+    OPT_ALL, OPT_COUNT, OPT_IN, OPT_KIND, OPT_LIMIT, file_text, put_bad_in, query_refs, resolve_in,
+    try_refs,
 };
+use sections::{OPT_BANNERS, show_section};
 use show::{find_modules, query_def, query_items, query_modules, query_show, text_start};
-
-use defs::{DEFS, DEF_COUNT, K_FIELD, K_VARIANT, MOD_DEF, bytes_eq, mod_fqn};
+use typeat::query_type;
 
 extern "C" {
     fn getenv(name: *u8) -> *u8;
@@ -86,6 +94,11 @@ pub static mut QUERY: bool = false;
 pub const QF_CALL: i64 = 1;
 pub const QF_DEF: i64 = 2;
 pub const QF_USE: i64 = 4;
+// (0.13) An assignment's target, a struct literal or a constructed variant,
+// a pattern.
+pub const QF_WRITE: i64 = 8;
+pub const QF_INIT: i64 = 16;
+pub const QF_PAT: i64 = 32;
 
 // What the checker resolved that its nodes do not keep: (position the name
 // is looked for from, the name written there, the definition's node,
@@ -111,6 +124,22 @@ pub fn qnote_module(from: i64, name: i64, m: i64, flags: i64) {
             return;
         }
         qnote(from, name, DEFS[MOD_DEF.data[m]].node, flags);
+    }
+}
+
+// `Self` written at pos stands for type t (0.13): a reference to its
+// struct or enum.
+pub fn qnote_self(pos: i64, name: i64, t: i64) {
+    unsafe {
+        if !QUERY || t <= 0 {
+            return;
+        }
+        let k = TYPES[t].kind;
+        if k == TyKind::Struct {
+            qnote(pos, name, STRUCTS[TYPES[t].a].node, 0);
+        } else if k == TyKind::Enum {
+            qnote(pos, name, ENUMS[TYPES[t].a].node, 0);
+        }
     }
 }
 
@@ -253,7 +282,10 @@ fn put_usage(out: i64) {
         buf_str(out, c"       tachyonc query text FILE[:A[-B]]...\n");
         buf_str(out, c"       tachyonc query diff\n");
         buf_str(out, c"       tachyonc query refs|callers NAME... [--exact] [--count] [--in FILE|MODULE] [--limit N] [--all]\n");
-        buf_str(out, c"       tachyonc query items [MODULE...]\n");
+        buf_str(out, c"       tachyonc query items [MODULE...] [--comments]\n");
+        buf_str(out, c"       tachyonc query show MODULE::section TITLE\n");
+        buf_str(out, c"       tachyonc query grep PATTERN... [--in FILE|MODULE] [--code] [--comments] [--strings] [--word] [--count] [--limit N] [--all]\n");
+        buf_str(out, c"       tachyonc query type FILE:LINE[:COL]...\n");
         buf_str(out, c"       tachyonc query stats [MODULE|FILE] [--over N] [--all]\n");
         buf_str(out, c"       tachyonc query deps MODULE [--max-lines N]\n");
         buf_str(out, c"       tachyonc query unused [MODULE] [--all]\n");
@@ -270,12 +302,12 @@ fn usage_error() -> i64 {
     unsafe { diag(c"error", c"query.usage") }
 }
 
-const N_COMMANDS: i64 = 11;
+const N_COMMANDS: i64 = 13;
 
 fn command_name(i: i64) -> *u8 {
     if i == 0 { c"def" } else if i == 1 { c"show" } else if i == 2 { c"refs" } else if i == 3 { c"callers" }
     else if i == 4 { c"items" } else if i == 5 { c"stats" } else if i == 6 { c"deps" } else if i == 7 { c"unused" }
-    else if i == 8 { c"impact" } else if i == 9 { c"text" } else { c"diff" }
+    else if i == 8 { c"impact" } else if i == 9 { c"text" } else if i == 10 { c"diff" } else if i == 11 { c"grep" } else { c"type" }
 }
 
 // The command nearest to cmd (edit distance at most 2), or 0.
@@ -348,7 +380,7 @@ fn run_query_inner(argc: i64, argv: **u8) -> i64 {
         while i < argc {
             let a = argv[i];
             let valued = streq(a, c"--in") || streq(a, c"--limit") || streq(a, c"--root") || streq(a, c"--over")
-                || streq(a, c"--max-lines");
+                || streq(a, c"--max-lines") || streq(a, c"--kind");
             if streq(a, c"--count") {
                 OPT_COUNT = true;
             } else if streq(a, c"--exact") {
@@ -357,6 +389,15 @@ fn run_query_inner(argc: i64, argv: **u8) -> i64 {
                 OPT_ALL = true;
             } else if streq(a, c"--with-comments") {
                 WITH_COMMENTS = true;
+            } else if streq(a, c"--comments") {
+                OPT_WHERE |= G_COMMENT;
+                OPT_BANNERS = true;
+            } else if streq(a, c"--code") {
+                OPT_WHERE |= G_CODE;
+            } else if streq(a, c"--strings") {
+                OPT_WHERE |= G_STRING;
+            } else if streq(a, c"--word") {
+                OPT_WORD = true;
             } else if valued {
                 if i + 1 >= argc || argv[i + 1][0] == '-' {
                     bad = a;
@@ -366,6 +407,9 @@ fn run_query_inner(argc: i64, argv: **u8) -> i64 {
                     i += 1;
                 } else if streq(a, c"--root") {
                     root = argv[i + 1];
+                    i += 1;
+                } else if streq(a, c"--kind") {
+                    OPT_KIND = argv[i + 1];
                     i += 1;
                 } else {
                     let n = parse_count(argv[i + 1]);
@@ -389,7 +433,7 @@ fn run_query_inner(argc: i64, argv: **u8) -> i64 {
             i += 1;
         }
         let items = streq(cmd, c"items");
-        let is_refs = streq(cmd, c"refs") || streq(cmd, c"callers");
+        let is_refs = streq(cmd, c"refs") || streq(cmd, c"callers") || streq(cmd, c"grep");
         if !is_query_command(cmd) {
             let out = usage_error();
             buf_str(out, c"unknown command '");
@@ -450,7 +494,8 @@ fn run_query_inner(argc: i64, argv: **u8) -> i64 {
             let out = usage_error();
             if bad != 0 as *u8 && bad_value {
                 buf_str(out, bad);
-                buf_str(out, if streq(bad, c"--in") { c" needs a FILE or MODULE\n" } else if streq(bad, c"--root") { c" needs a root file\n" } else { c" needs a number\n" });
+                buf_str(out, if streq(bad, c"--in") { c" needs a FILE or MODULE\n" } else if streq(bad, c"--root") { c" needs a root file\n" }
+                    else if streq(bad, c"--kind") { c" needs a KIND (read, write, call, init, type, use, mod, pat, def)\n" } else { c" needs a number\n" });
             } else if bad != 0 as *u8 {
                 buf_str(out, c"unknown option '");
                 buf_str(out, bad);
@@ -506,6 +551,21 @@ pub fn resolve_name(cmd: *u8, name: [u8], out: *IntVec) -> bool {
         }
         if line < 0 {
             find_defs(name, OPT_EXACT, out);
+            if (*out).count == 0 && !OPT_EXACT {
+                // (0.13: an import's other name, for what it imports)
+                let at = alias_defs(last_segment(name), out);
+                if at >= 0 {
+                    let d = diag(c"note", c"query.alias");
+                    buf_byte(d, '\'');
+                    buf_bytes(d, last_segment(name));
+                    buf_str(d, c"' is an import alias in ");
+                    buf_bytes(d, SYMS[mod_fqn(module_at(at))].text);
+                    buf_str(d, c", for ");
+                    buf_bytes(d, SYMS[DEFS[(*out).data[0]].fqn].text);
+                    buf_byte(d, '\n');
+                    sort_by_position(out);
+                }
+            }
             if (*out).count == 0 {
                 no_match(cmd, name);
                 return false;
@@ -635,10 +695,37 @@ fn answer(cmd: *u8, args: *IntVec, items: bool, is_refs: bool) -> i64 {
                 return 1;
             }
         }
+        if streq(cmd, c"grep") {
+            return query_grep(args);
+        }
         let mut status = 0;
         let mut all = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut title_next = false;
         for i in 0..n {
             let text = c_slice((*args).data[i] as *u8);
+            if title_next {
+                title_next = false;
+                continue;
+            }
+            if streq(cmd, c"type") {
+                if query_type(text) != 0 {
+                    status = 1;
+                }
+                continue;
+            }
+            if streq(cmd, c"show") && ends_with_c((*args).data[i] as *u8, c"::section") {
+                // (MODULE::section TITLE)
+                let title = if i + 1 < n { c_slice((*args).data[i + 1] as *u8) } else { text[0..0] };
+                title_next = true;
+                let r = show_section(text, title);
+                if r >= 0 {
+                    if r != 0 {
+                        status = r;
+                    }
+                    continue;
+                }
+                title_next = false;
+            }
             if streq(cmd, c"show") {
                 // (MODULE::use, ::header, ::extern)
                 let r = show_region(text);

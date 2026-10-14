@@ -299,8 +299,8 @@ fn quad(x: i64) -> i64 {
 ## --in FILE:LINE: the item holding that line.
 $ refs twice --in text/main.tach:22
 # text/main.tach
-21:5	quad	twice(twice(x))
-21:11	quad	twice(twice(x))
+21:5	call	quad	twice(twice(x))
+21:11	call	quad	twice(twice(x))
 $ refs twice --in text/main.tach:3
 error query.bad-in: no item at text/main.tach:3
 try: tachyonc query refs twice

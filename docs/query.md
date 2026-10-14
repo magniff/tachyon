@@ -17,9 +17,12 @@ tachyonc query show NAME... [--root ROOT] [--exact] [--with-comments]
 tachyonc query show FILE.tach... | MODULE::use | MODULE::header | MODULE::extern
 tachyonc query text FILE[:A[-B]]...                         (no program read)
 tachyonc query diff [ROOT]                                  the last journaled edit
-tachyonc query refs NAME... [--root ROOT] [--exact] [--count] [--in FILE|MODULE] [--limit N] [--all]
+tachyonc query refs NAME... [--root ROOT] [--exact] [--count] [--in FILE|MODULE] [--kind K,...] [--limit N] [--all]
 tachyonc query callers NAME... [--root ROOT] [--exact] [--count] [--in FILE|MODULE] [--limit N] [--all]
-tachyonc query items [MODULE...] [--root ROOT]
+tachyonc query items [MODULE...] [--root ROOT] [--comments]
+tachyonc query show MODULE::section TITLE                   (0.13)
+tachyonc query grep PATTERN... [--in FILE|MODULE] [--code] [--comments] [--strings] [--word] [--count] [--limit N] [--all]
+tachyonc query type FILE:LINE[:COL]...                      (0.13)
 tachyonc query stats [MODULE|FILE] [--over N] [--all]      (refactor.md)
 tachyonc query deps MODULE [--max-lines N]                 (refactor.md)
 tachyonc query unused [MODULE|FILE] [--all]                (refactor.md)
@@ -56,11 +59,14 @@ One line of grammar per kind of line (`\t` is a TAB; `[...]` optional):
 | show | header | `// PATH \t FILE:FIRST-LAST`, then the source lines, verbatim |
 | show, > 5 matches | path | `PATH` (stdout), then `error query.ambiguous` |
 | refs, callers | file header | `# FILE` |
-| refs, callers | reference | `LINE:COL \t (def \| ENCLOSING) [\t ->TARGET] \t SOURCE` |
-| refs, callers, > 60 | summary | `FILE \t COUNT`, then `note query.truncated` |
+| refs, callers | reference | `LINE:COL \t (def \| REFKIND \t ENCLOSING) [\t ->TARGET] \t SOURCE` |
+| refs, callers, grep, > 60 | summary | `FILE \t COUNT`, then `note query.truncated` |
 | refs, callers `--count` | count | `COUNT`, or `COUNT \t PATH` per definition when several match |
+| grep | file header, hit | `# FILE`; `LINE:COL \t (code \| comment \| string) \t ENCLOSING \t SOURCE` |
+| type | type | `TYPE \t EXPRESSION` |
 | items MODULE | module header | `# PATH \t FILE` |
 | items MODULE | item | `LINE \t KIND \t SIGNATURE` |
+| items MODULE `--comments` | banner, comment | `FIRST-LAST \t (section \| comment) \t TITLE` |
 | items | module | `PATH \t FILE \t ITEMS` |
 | (stderr) | diagnostic | `SEVERITY CODE: MESSAGE` |
 | (stderr) | recovery | `try: COMMAND` |
@@ -116,9 +122,10 @@ definition is named, and accepted back as NAME:
   A line between items: `error query.no-match: no item at FILE:LINE`,
   `try:` the items of its module; an unknown file: `no file 'FILE' in
   the program`.
-- Import aliases are not definitions: `use a::f as g;` makes `g` a
-  reference to `crate::a::f`, but `query def g` finds nothing
-  (`error query.alias`, with `try:` the same query of what `g` imports).
+- An import alias (0.13): `use a::f as g;` makes `g` a reference to
+  `crate::a::f`, and `g` as NAME answers for what it imports (when no
+  definition is named `g`), with `note query.alias: 'g' is an import
+  alias in crate, for crate::a::f`. `--exact` does not follow aliases.
 - No match: exit 1, `error query.no-match`, and a `try:` line for each of
   the (at most 3) definitions whose names are nearest to NAME's last
   segment (edit distance at most a third of its length).
@@ -211,14 +218,30 @@ Every resolved reference, one per line, under a header per file:
 # compiler/src/middle/gvn.tach
 721:8→def→pub fn run_gvn(fi: i64) -> bool {
 # compiler/src/middle/opt.tach
-17:17→opt→use crate::middle::gvn::run_gvn;
-533:13→opt::simplify_function→run_gvn(fi);
+17:17→use→opt→use crate::middle::gvn::run_gvn;
+533:13→call→opt::simplify_function→run_gvn(fi);
 ```
 
-ENCLOSING (the second field) is the innermost definition holding the
+The second field is the reference's kind (0.13), one word:
+
+| kind | the reference is |
+|---|---|
+| `def` | the definition itself (no ENCLOSING follows) |
+| `call` | a call (a method or operator call too) |
+| `read` | a value read: a constant, a static, a field, a function as a value |
+| `write` | the target of an assignment (`=`, `+=`...), or part of it: in `A.b[i].c = x`, `A`, `b` and `c`; not what a pointer it goes through points to, nor a method call's receiver (`V.push(x)` reads `V`) |
+| `init` | a struct literal (its type and its fields), a constructed variant |
+| `pat` | a variant in a pattern |
+| `type` | a struct, enum, trait or alias in a type, an `impl` header or a path (`T::f`) |
+| `mod` | a module in a path |
+| `use` | an import |
+
+`--kind K[,K...]` keeps those kinds (`refs COUNT --kind write`).
+
+ENCLOSING (the third field) is the innermost definition holding the
 reference (a function, or the struct, constant, trait... whose
 declaration it is in), else the module (a `use`, an `impl` header), by
-its short path. The definition itself is the line marked `def`.
+its short path.
 
 References are what the compiler resolved, never text: calls, functions
 used as values, constants and statics, types (in signatures, fields,
@@ -227,7 +250,8 @@ accesses and the fields of struct literals, variants (constructed or
 matched), method calls (resolved through the receiver's type, and
 through a bound's impl in generic code), operator calls of trait impls
 (`a + b` calls `<T as Add>::add`; at the start of the operation),
-module paths, and `use` imports. A local that shadows a function,
+module paths, `Self` (0.13: a reference to the type of its impl block),
+and `use` imports. A local that shadows a function,
 another module's item of the same name, comments and strings are never
 references.
 
@@ -240,7 +264,14 @@ references.
   Trait>::f`); the functions of a trait impl that do not override a
   default are the default's references.
 - Generic code is checked once per instance; a reference in it is
-  listed once per position (and target).
+  listed once per position (and target). A generic function no code
+  instantiates (0.13) is checked for a query as an instance whose type
+  arguments are the error type: its references that do not depend on
+  them are found (calls, constants, statics, types, struct literals);
+  what does (a method of `T`, through a bound) is not.
+- A function whose body has a syntax error (0.13) is checked for a query
+  as far as it was parsed (the statement with the error left out, and
+  the names it would have bound unknown, without errors).
 - `--count` prints the number of references refs would print (the
   definition included); for several definitions, `N→PATH` per definition.
 - `callers` is `refs` restricted to calls (method and operator calls
@@ -250,7 +281,8 @@ references.
   components, `gvn.tach`) or a module (matched like NAME, its inline
   modules included: `gvn`, `crate::ir`), or the item holding a line,
   `FILE:LINE` (0.12; `rewrite --in` too; `fix --in FILE:LINE` fixes that
-  line's module).
+  line's module), or (0.13) a directory, by whole components
+  (`compiler/src/front/`, `front/check`).
 - None left: `note query.empty: 0 refs` (exit 0).
 
 ### The budget
@@ -291,6 +323,70 @@ functions. MODULE is a module path, matched like NAME (`gvn`,
 `crate::gvn`, `crate`, `std`). `items` alone lists the module tree:
 `PATH→FILE→ITEMS` per module.
 
+### Banners and comments (0.13)
+
+`items MODULE --comments` lists, between the items, the module's
+section banners and its comments that belong to no item, each with the
+lines it spans:
+
+```
+# crate::middle::gvn→compiler/src/middle/gvn.tach
+58-156→section→The value table
+62→static→static mut VT_KEYS: IntVec = ...
+...
+158-361→section→Alias analysis
+```
+
+A banner (`section`) is a block of comment lines outside every item
+whose first line is a rule: `// ---- Title ----` (a run of `-`, `=`, `#`,
+`*` or `~`; a run of two or three needs another after the title); its
+section runs to the next banner of its file, or the file's end (its
+trailing blank lines left out). A `comment` is any other block of
+comment lines outside the items that no item follows directly (a blank
+line, or nothing, comes after it) and that is not the file's header;
+its title is its first line.
+
+`show MODULE::section TITLE` (`main::section` for the root) prints a
+section, as show prints an item: `// MODULE::section Title→FILE:A-B`,
+then its lines (at most 200: then `note query.truncated` and `try:` the
+next lines with `query text`). TITLE matches a title exactly, else but
+for case, else as a part of it (`value table`); a section before a
+comment. None: `error query.no-match`, `try:` the listing.
+
+## grep (0.13)
+
+`grep PATTERN...` searches the program's files for the text (any of
+the PATTERNs, literally), for what is not a name: a message, a word in
+the comments, part of an identifier. Each hit is printed as a reference
+is, under its file, with where it is and the item holding it:
+
+```
+# compiler/src/tools/query/diagnostics.tach
+23:42→comment→tools::query::diagnostics→// The codes are stable: query.no-match, query.alias, ...
+288:40→string→tools::query::diagnostics::no_match→let out = diag(c"error", c"query.alias");
+```
+
+Code, comment or string (a string or character literal) comes from the
+lexer's tokens. `--code`, `--comments`, `--strings` keep the hits there
+(any of them); `--word` the hits that are whole identifiers. `--in`,
+`--count`, `--limit N`, `--all` and the budget are refs'. The files the
+compiler makes (`<std>`, `<C import>`) are searched only when `--in`
+names them. No hit: `note query.empty`.
+
+## type (0.13)
+
+`type FILE:LINE:COL` prints the type the checker gave the innermost
+expression holding that position, and the expression; without COL, the
+outermost expression that starts on the line:
+
+```
+i64→area(s) + area(s) + unsafe { COUNT }
+```
+
+In a generic function, one line per type its instances give it. A
+position in no checked expression (a declaration, a type, a function
+never checked): `error query.no-match`, `try:` the item at that line.
+
 ## Diagnostics
 
 Every problem is reported on stderr, after the answer, in one format:
@@ -309,7 +405,9 @@ when it was given, names quoted for the shell when they need it).
 | code | severity | exit | when | try |
 |---|---|---|---|---|
 | `query.no-match` | error | 1 | no definition (or module, for items) answers to NAME | the nearest definitions by edit distance (the same command with their paths); else the items of the module NAME names, or the module tree |
-| `query.alias` | error | 1 | NAME is the other name an import gives (`use a::f as g;`), not a definition | the same command with what it imports |
+| `query.alias` | note | (the answer's) | NAME is the other name an import gives (`use a::f as g;`), answered for what it imports (0.13) | |
+| `query.empty` | note | 0 | grep found nothing | |
+| `query.no-match` | error | 1 | `show MODULE::section TITLE`: no such title; `type`: no checked expression there | `items MODULE --comments`; `show FILE:LINE` |
 | `query.ambiguous` | error | 1 | `show` matches more than 5 definitions (their paths on stdout) | `show` of the first |
 | `query.truncated` | note | 0 | refs/callers past the budget, or cut by `--limit` | `--in` the file with the most, `--limit 60`, `--all` |
 | `query.empty` | note | 0 | refs/callers found nothing (after `--in`) | |
@@ -328,8 +426,7 @@ when it was given, names quoted for the shell when they need it).
 ```
 error query.no-match: no definition 'run_gnv'
 try: target/tachyonc query def crate::middle::gvn::run_gvn
-error query.alias: 'MyVec' is an import alias in crate
-try: target/tachyonc query refs crate::myvec::Vec
+note query.alias: 'MyVec' is an import alias in crate, for crate::myvec::Vec
 error query.no-root: no root (TACHYON_ROOT, ./main.tach, ./compiler/src/main.tach)
 try: target/tachyonc query def main path/to/main.tach
 warning query.program-errors: 4 errors in the program; results may be incomplete
@@ -348,16 +445,18 @@ nothing answered, and gives the compilation that prints them all with
 
 ## Known limits
 
-- A generic function that is never instantiated is never checked: the
-  references in its body are missing (its definition is found).
-- A function whose body has a syntax error is not checked (no references
-  in it); in a function with a type error, the references after the
-  error in the failing statement or expression may be missing.
+- In a generic function that is never instantiated, the references that
+  depend on its type parameters (methods of `T`, through its bounds) are
+  missing.
+- In a function whose body has a syntax error, the statement holding it
+  is left out (and, when the parser lost its place, what follows it);
+  in a function with a type error, the references after the error in
+  the failing statement or expression may be missing.
 - Operator calls are placed at the start of the operation, not at the
   operator.
-- `Self` in a struct literal or a type is not a reference to the type.
-- Import aliases (`use a::f as g`) are not names of definitions;
-  module references are the `mod` item, `use` and paths (`m::f`), not
+- `write` is an assignment's target: a method that changes its receiver
+  (`V.push(x)`) or a pointer passed on reads it.
+- Module references are the `mod` item, `use` and paths (`m::f`), not
   the module's file.
 - Items the parser skipped after a syntax error are not defined.
 - The C headers' declarations are shown as the compiler writes them out

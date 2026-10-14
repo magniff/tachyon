@@ -125,13 +125,13 @@ n=$(printf '%s\n' "$out" | grep -c "^compiler/src/[a-z_0-9/]*\.tach${TAB}[0-9]*\
 check self_refs_budget "$ok" "$(printf '%s\n' "$out" "$err" | tail -6)"
 out=$("$COMPILER" query refs IntVec::push --in compiler/src/base/mod.tach 2>&1)
 ok=0
-n=$(printf '%s\n' "$out" | grep -c "^[0-9]*:[0-9]*${TAB}base::[A-Za-z_:]*${TAB}")
+n=$(printf '%s\n' "$out" | grep -c "^[0-9]*:[0-9]*${TAB}call${TAB}base::[A-Za-z_:]*${TAB}")
 [ "$n" -ge 1 ] && printf '%s\n' "$out" | head -1 | grep -q '^# compiler/src/base/mod.tach$' \
     && printf '%s\n' "$out" | grep -q "^[0-9]*:[0-9]*${TAB}def${TAB}fn push(" && ok=1
 check self_refs_in_file "$ok" "$(printf '%s\n' "$out" | head -5)"
 out=$("$COMPILER" query refs IntVec::push --in gvn --limit 5 2>&1)
 ok=0
-[ "$(printf '%s\n' "$out" | grep -c "^[0-9]*:[0-9]*${TAB}middle::gvn::")" = 5 ] \
+[ "$(printf '%s\n' "$out" | grep -c "^[0-9]*:[0-9]*${TAB}call${TAB}middle::gvn::")" = 5 ] \
     && printf '%s\n' "$out" | grep -q '^note query.truncated: showing 5 of [0-9]* refs$' && ok=1
 check self_refs_in_module_limit "$ok" "$out"
 n=$("$COMPILER" query refs IntVec::push --all 2>/dev/null | grep -c "^[0-9]*:[0-9]*${TAB}")
@@ -140,7 +140,7 @@ ok=0
 check self_refs_all "$ok" "$n"
 out=$("$COMPILER" query callers check_program 2>&1)
 ok=0
-printf '%s\n' "$out" | grep -q "^[0-9]*:[0-9]*${TAB}gen0::gen::compile_program${TAB}" && ok=1
+printf '%s\n' "$out" | grep -q "^[0-9]*:[0-9]*${TAB}call${TAB}gen0::gen::compile_program${TAB}" && ok=1
 check self_callers "$ok" "$out"
 out=$("$COMPILER" query def NodeKind::Fn 2>&1)
 ok=0
@@ -164,6 +164,24 @@ out=$("$COMPILER" query refs IntVec::push --in vectorize --all 2>&1 | awk -F "$T
 ok=0
 [ -z "$out" ] && ok=1
 check self_line_max "$ok" "$out"
+# Banners and text search (0.13).
+out=$("$COMPILER" query items gvn --comments 2>&1)
+ok=0
+printf '%s\n' "$out" | grep -q "^[0-9]*-[0-9]*${TAB}section${TAB}The value table\$" && ok=1
+check self_banners "$ok" "$(printf '%s\n' "$out" | head -5)"
+out=$("$COMPILER" query show gvn::section 'value table' 2>&1)
+ok=0
+printf '%s\n' "$out" | head -1 | grep -q "^// crate::middle::gvn::section The value table${TAB}compiler/src/middle/gvn.tach:[0-9]*-[0-9]*\$" \
+    && [ "$(printf '%s\n' "$out" | sed -n 2p)" = "// ---- The value table ----" ] && ok=1
+check self_section "$ok" "$(printf '%s\n' "$out" | head -3)"
+out=$("$COMPILER" query grep 'fn run_gvn(' 2>&1)
+ok=0
+printf '%s\n' "$out" | grep -q "^[0-9]*:[0-9]*${TAB}code${TAB}middle::gvn::run_gvn${TAB}pub fn run_gvn(" && ok=1
+check self_grep "$ok" "$out"
+n=$("$COMPILER" query grep 'query.no-match' --strings --in compiler/src/tools/ --count 2>&1)
+ok=0
+[ "$n" -ge 3 ] 2>/dev/null && ok=1
+check self_grep_strings "$ok" "$n"
 # (./main.tach, found by default)
 out=$(cd "$HERE/clash" && "$COMPILER" query def a::helper 2>&1)
 ok=0
