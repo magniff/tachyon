@@ -98,6 +98,13 @@ println("");
 1101
 ```
 
+Views without a name count too: `for x in v` and `v.iter()` view `v`
+for the whole loop (do not push to `v` inside it; collect into another
+Vec), and in `f(v.as_slice(), g(&v))` the slice is taken before `g`
+runs. A view kept in a variable or a field and re-taken after each push
+is fine, even inside an index: in `s[grow(&v, &s)]` the slice `s` is
+read after `grow` returns (0.14).
+
 ## Raw memory
 
 `malloc` and `free` from C, in `unsafe` (see `tachyonc guide unsafe`).

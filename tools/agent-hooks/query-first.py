@@ -10,6 +10,10 @@ Edit, Write) and PostToolUse (Bash). Reads the hook event (JSON) on stdin.
   tail, cat, awk, less or more is blocked (exit status 2; the message on
   stderr goes back to the agent) with the query that answers it, unless it
   carries `# no-query: <reason>`: then it runs, and the reason is logged.
+  Source is the compiler's (compiler/src, compiler/std) and any program
+  being worked on (examples/, bench/, a .tach elsewhere); a .tach under a
+  tests/ directory (a test case, a refactoring fixture, an agent-eval
+  task's data) is read freely, and logged as `read-fixture` (0.14).
 - A shell command that rewrites compiler source (a .tach file under
   compiler/src or compiler/std) with `sed -i`, `perl -pi` or Python
   (`.write(`) is blocked with the `tachyonc edit patch` command that
@@ -190,9 +194,11 @@ def segments(command):
     return [seg.strip() for seg in out if seg.strip()]
 
 
-def source_reads(command):
-    """(program, words) of each simple command reading .tach source."""
+def source_reads(command, cwd=None, fixtures=None):
+    """(program, words) of each simple command reading .tach source; the
+    commands that read only test data (fixture) are added to `fixtures`."""
     found = []
+    base = ""
     for seg in segments(command):
         seg = seg.strip()
         if not seg or "#" == seg[:1]:
@@ -206,6 +212,10 @@ def source_reads(command):
         if not words:
             continue
         prog = os.path.basename(words[0])
+        if prog == "cd" and len(words) > 1:
+            # (relative paths after `cd tests/x` are test data)
+            base = os.path.join(base, words[1])
+            continue
         if prog not in READERS:
             continue
         args = without_outputs(words[1:])
@@ -213,9 +223,22 @@ def source_reads(command):
             continue  # an edit, not a read (logged as such)
         if prog == "cat" and (">" in seg):
             continue  # writing a file
-        if any(reads_source(a) for a in file_args(prog, args)):
+        files = [a for a in file_args(prog, args) if reads_source(a)]
+        if any(not fixture(a, base, cwd) for a in files):
             found.append((prog, args))
+        elif files and fixtures is not None:
+            fixtures.append((prog, args))
     return found
+
+
+def fixture(path, base, cwd):
+    """Whether path (after `cd base`, from cwd) is under a tests/ directory
+    of the checkout: a test case, a fixture, an eval task's data."""
+    full = os.path.normpath(os.path.join(cwd or os.getcwd(), base, path))
+    root = checkout_of(cwd)[0] if cwd else None
+    if root and (full + "/").startswith(root.rstrip("/") + "/"):
+        full = os.path.relpath(full, root)
+    return bool(FIXTURE.search(full))
 
 
 def without_outputs(args):
@@ -234,7 +257,9 @@ def without_outputs(args):
     return out
 
 
-SOURCE_DIRS = re.compile(r"^(\./)?(compiler/src|compiler/std|tests/run|examples|bench)/?$")
+SOURCE_DIRS = re.compile(r"^(\./)?(compiler/src|compiler/std|examples|bench)/?$")
+# (0.14) Test data: a case, a fixture, an eval task's program; read freely.
+FIXTURE = re.compile(r"(^|/)tests/")
 
 
 def file_args(prog, args):
@@ -533,8 +558,11 @@ def main():
                              "try: %s | override: append '# no-tool: <why the tools are not enough>'\n"
                              % (prog, files[0], edit_suggestion(prog, files, script)))
             return 2
-        reads = source_reads(command)
+        fixtures = []
+        reads = source_reads(command, cwd, fixtures)
         if not reads:
+            if fixtures:
+                log(gd, {"kind": "read-fixture", "program": fixtures[0][0], "command": command[:300]})
             return 0
         esc = ESCAPE.search(command)
         if esc:

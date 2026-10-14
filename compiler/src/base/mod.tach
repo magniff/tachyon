@@ -27,6 +27,7 @@ pub extern "C" {
     fn fclose(file: *u8) -> i32;
     fn write(fd: i32, buf: *u8, n: u64) -> i64;
     fn exit(code: i32) -> !;
+    fn getenv(name: *u8) -> *u8;
 }
 
 pub const STDOUT: i32 = 1;
@@ -41,6 +42,11 @@ pub fn grow<T>(data: *T, count: i64, cap: *i64) -> *T {
         if count < *cap {
             return data;
         }
+        if stress_grow() {
+            let old = *cap;
+            *cap = stress_cap(old, count + 1);
+            return moved_block(data as *u8, old * size_of(T), *cap * size_of(T)) as *T;
+        }
         let mut new_cap = *cap * 2;
         if new_cap < 64 {
             new_cap = 64;
@@ -52,6 +58,49 @@ pub fn grow<T>(data: *T, count: i64, cap: *i64) -> *T {
         }
         grown as *T
     }
+}
+
+// The stress-grow mode (0.14), for finding reads through a table's old
+// storage (an index whose evaluation grows the table it indexes): with
+// TACHYON_STRESS_GROW=1 in the environment, every growth of a table
+// (`grow`, `buf_reserve`, the symbol tables) moves it, by half its size
+// from a capacity of 1, and the old block is filled with 0xAA bytes and
+// kept (never freed, never reused), so such a read finds garbage. The
+// gate's stress-grow step runs the suite and a self-compile with it.
+static mut STRESS_GROW: i64 = -1;
+
+pub fn stress_grow() -> bool {
+    unsafe {
+        if STRESS_GROW < 0 {
+            let value = getenv(c"TACHYON_STRESS_GROW");
+            STRESS_GROW = if value != 0 as *u8 && *value == '1' { 1 } else { 0 };
+        }
+        STRESS_GROW == 1
+    }
+}
+
+// The capacity after `cap` under stress_grow: room for `needed`.
+fn stress_cap(cap: i64, needed: i64) -> i64 {
+    let mut new_cap = cap + cap / 2 + 1;
+    while new_cap < needed {
+        new_cap = new_cap + new_cap / 2 + 1;
+    }
+    new_cap
+}
+
+// A new block of new_size bytes holding the first old_size bytes of
+// data, which is poisoned and kept (stress_grow). The caller keeps
+// data's contract: old_size bytes of a malloc'ed block (or none).
+unsafe fn moved_block(data: *u8, old_size: i64, new_size: i64) -> *u8 {
+    let moved = malloc(new_size as u64);
+    if moved == 0 as *u8 {
+        die(c"out of memory");
+    }
+    if old_size > 0 {
+        memcpy(moved, data, old_size as u64);
+        memset(data, 0xAA, old_size as u64);
+    }
+    moved
 }
 
 // An array of `n` elements of T, zeroed.
@@ -115,6 +164,12 @@ pub fn buf_reserve(b: i64, extra: i64) {
     unsafe {
         let needed = BUFS[b].len + extra;
         if needed <= BUFS[b].cap {
+            return;
+        }
+        if stress_grow() {
+            let new_cap = stress_cap(BUFS[b].cap, needed);
+            BUFS[b].data = moved_block(BUFS[b].data, BUFS[b].len, new_cap);
+            BUFS[b].cap = new_cap;
             return;
         }
         let mut new_cap = BUFS[b].cap * 2;
@@ -390,7 +445,11 @@ fn grow_sym_tables() {
             let slot = SYM_TABLES.data[i] as **i64;
             let table = alloc_array::<i64>(cap);
             memcpy(table as *u8, *slot as *u8, (old * 8) as u64);
-            free(*slot as *u8);
+            if stress_grow() {
+                memset(*slot as *u8, 0xAA, (old * 8) as u64);
+            } else {
+                free(*slot as *u8);
+            }
             *slot = table;
         }
         SYM_TABLES_CAP = cap;

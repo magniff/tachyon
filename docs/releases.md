@@ -648,7 +648,16 @@ once, `suite-O0`, `suite-O1`, `suite-O2`; `fuzz-plain`, `fuzz-loops`,
 `fuzz-vector`, `fuzz-div`, `fuzz-range` and `fuzz-seed` (the seed as a
 third oracle); `abi-plain`, `abi-import`, `abi-header`; `objcheck`;
 `layout` (`tests/cimport/layout.sh` on the system headers); `debug`
-(`tests/debug.sh`); and the two containers: `linux-x86_64`
+(`tests/debug.sh`); `stress-grow` (0.14, not in `--quick`: the compiler
+run with `TACHYON_STRESS_GROW=1`, under which every growth of its tables,
+`base::grow`, `buf_reserve` and the symbol tables, moves them, by half
+their size from a capacity of 1, and fills the old block with 0xAA bytes
+and keeps it; a read through a table pointer taken before a growth then
+finds garbage instead of, by luck, the old data. Its self-compile must
+give the same object as without, and the suite pass at -O0 and -O2. The
+mode is for finding such reads, as `TYPES[template_instance(..)].a` was
+before 0.14 read TYPES before the call that grew it; it costs little
+time and about twice the memory); and the two containers: `linux-x86_64`
 (`bootstrap/linux-check.sh`, which builds its own chain and so starts at
 once) and `linux-aarch64` (`bootstrap/aarch64-linux-check.sh --compiler`:
 the chain's compiler cross-compiles the tree). Inside each container the
