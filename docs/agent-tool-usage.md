@@ -458,3 +458,148 @@ another branch, and lines around a banner or a table.
    --ours|--theirs|--both N` on files that do not parse.
 4. `fix --only imports` for std types and private items; one-line items
    kept together by `edit insert` and `delete` as `move` keeps them.
+
+## 0.14: the language through the tools, and the first agent eval
+
+0.14 (2026-10-14, 20:00 to 22:56) was made by 11 agents in parallel
+worktrees:
+
+- phase 0, the interfaces;
+- in parallel, std, the diagnostics, tools part 1 and part 2;
+- the language tracks: T1 closures, T2 associated types, T3 iterators,
+  T4 the optimizer, T5 the tools for closures;
+- the integration.
+
+Beside them, five agents wrote the agent eval: the runner and the task
+authors. The 0.13 baseline ran on it (Haiku and Sonnet, 12 tasks; see
+[eval/0.13-findings.md](eval/0.13-findings.md)).
+
+Sources:
+
+- the hook's log from 20:00 on: 1,360 records, without the 0.13
+  release agents;
+- the 17 agents' transcripts (aggregates only);
+- the eval transcripts.
+
+The details, the sequences of calls and the ranked gaps are in
+[tool-gaps-014.md](tool-gaps-014.md).
+
+**Edits to existing compiler source, through `tachyonc`: 225 of 266,
+85%.**
+
+| agent | tools | shell | Edit | Write | tool share |
+|---|---|---|---|---|---|
+| phase 0 | 36 | 0 | 1 | 0 | 97% |
+| tools part 2 | 18 | 0 | 0 | 0 | 100% |
+| diag | 39 | 0 | 0 | 0 | 100% |
+| T4 optimizer | 41 | 1 | 2 | 0 | 93% |
+| tools part 1 | 27 | 1 | 1 | 0 | 93% |
+| T5 tools for closures | 21 | 0 | 0 | 0 | 100% |
+| T1 closures | 14 | 2 | 0 | 1 | 82% |
+| T2 associated types | 10 | 3 | 4 | 1 | 56% |
+| T3 iterators | 11 | 4 | 6 | 1 | 50% |
+| std | 4 | 2 | 10 | 0 | 25% |
+| the integration | 4 | 1 | 0 | 0 | 80% |
+
+How the table was counted:
+
+- **The tool edits** come from the transcripts. The hook's report
+  (`--hook-log`) counts 91 of 131 (69%). The difference: five agents
+  ran a copy of the compiler (`T=target/tc0; $T edit ...`), because
+  their own builds replaced `target/tachyonc`. The hook did not
+  recognize these, so 51 tool edits and about 280 queries are missing
+  from its log.
+- **Edit** comes from the transcripts too; **shell rewrites and Write**
+  come from the hook, which knows whether a written file existed.
+
+The low shares are std's and its users':
+
+- The std agent edited `compiler/std/std.tach` with the Edit tool
+  (10 edits). No query or edit reaches std as a program ("std.tach is a
+  separate program root").
+- T3 drafted std's iterators in staged copies and edited them with
+  Python.
+- T2 made "several related additions" across items in one Python
+  script, where `edit patch` takes one item per call.
+
+**Queries:** 922 in the transcripts (`show` 391, `text` 131, `grep`
+121, `refs` 113, `items` 93, `def` 42, `type` 13), of which the hook
+logged 467.
+
+**Blocked and escaped:**
+
+- 43 shell reads blocked (`grep` 20, `cat` 13, `sed` 5, `head` 4).
+- 63 went around the hook with `# no-query`:
+  - 26 read test fixtures, eval tasks and docs, which are not the
+    program;
+  - 8 were merge conflicts;
+  - 7 were std;
+  - 6 read whole modules past `query text`'s 200 lines;
+  - 6 were text searches across worktrees;
+  - the rest were scratch files.
+- 14 shell edits went around it with `# no-tool`: std 6, conflict
+  resolution 3, several edits at once 2, the agent's own new file 2,
+  scratch 1.
+
+**Tool errors:** 102 of the 995 calls that ran a tool (10%). 75% of
+them were retried at once with the tool, and 11 were given up for Edit,
+Write or a shell rewrite. The codes: `query.no-match` 31, `edit.breaks`
+25, `edit.usage` 15 (`--help` refused, a second TARGET), `undo.empty`
+9, `patch.no-match` 8, `fmt.unformatted` 8, `query.no-root` 5.
+
+**The shortfalls** (36 feedback entries), and what 0.14 did:
+
+| shortfall | entries | 0.14 |
+|---|---|---|
+| tools on a user's program: `undo` and `query diff` need git; a local cannot be renamed; renaming a field rewrote a comment's same-named parameter; `move` writes `use crate::...` where the file says `use catalog::...` | 6 | fixed (undo without git, locals, precise mentions, import paths in the file's style) |
+| language and diagnostics met by the eval authors: `const` of `[u8]`, no stdin reader, privacy errors reported late and without a fix, no did-you-mean for methods, a module and a fn of one name, a literal not typed from the other branch | 6 | fixed (std, diag) |
+| `edit patch` targets: a comment line between items, a banner by `MODULE::section`, a `mod` line, a file outside the default root | 4 | between items fixed; the rest (0.15) |
+| imports: a new item or patch needing imports fails `edit.breaks`; `fix --only imports` misses a private parent's fn and a bare enum variant | 4 | edits add the imports their text needs; `fix` (0.15) |
+| `edit patch` UX: one item per call; an ambiguous OLD suggesting the wrong occurrence first; `edit.breaks` not naming the error | 3 | (0.15: tool-gaps-014 gaps 2, 5) |
+| `tests/query/run.sh -u` moving `##` comment lines of a passing transcript | 3 | (0.15) |
+| std as a program: `query grep --root compiler/std/std.tach` finds nothing; a std item not found unless the program uses std | 2 | (0.15: gap 4) |
+| `fix --in` refusing `./catalog.tach` and `front::check::mod` | 2 | (0.15: gap 6) |
+| the hook: an alternation glued into one name; `-o` of a compile seen as a Python write target | 2 | the first fixed |
+| `split --items` leaving a banner behind; merge conflicts out of reach; uses of a C-string const missing from `refs`; `query items` with no argument listing modules; the default root (a note) | 5 | the banner fixed; the rest (0.15) |
+
+**In the eval**, the tools condition (the tools table in the prompt,
+no guide) was the costliest:
+
+| condition | Haiku | Sonnet |
+|---|---|---|
+| tools | 11.5M | 3.35M |
+| bare | 7.9M | 2.28M |
+| both | 7.4M | 2.09M |
+| guide | 7.3M | 2.03M |
+
+- **The tools won where they were built to:** renames and moves
+  (10-refactor: Sonnet 105k tokens, 163k in Rust), a new variant
+  (Sonnet 120k against 196k with the guide), compile errors across
+  files.
+- **They lost on programs written from a spec:**
+  - The agents looked std up through the tools, which cannot show it
+    (`query.no-file: cannot read 'std'`), or ran `strings` on the
+    binary.
+  - They wrote 56 probe programs to learn what compiles, against 3–4
+    with the guide.
+  - Each new item went into a file and then through `edit replace <
+    FILE`, one call per item.
+
+**The remaining gaps, for 0.15** (ranked in
+[tool-gaps-014.md](tool-gaps-014.md)):
+
+1. `query context NAME --budget N`: definition, body, callers, callees'
+   signatures and types in one sized answer. 89 dev pairs of `query
+   show > query show`.
+2. Several edits, one checked call: `edit patch --pairs FILE` with `@@
+   TARGET` blocks, and `edit apply FILE` (items replaced or inserted by
+   name).
+3. Feedback without calls: a PostToolUse hook that checks after every
+   Write or Edit of a `.tach`, and builds that print `check`'s lines.
+   124 eval checks came right after a write.
+4. std in every program's queries, std's files as edit targets, and
+   `tachyonc try 'STATEMENTS'` for probing.
+5. `edit.breaks` that points to the refactoring that fits; every
+   spelling of a name the tools print, accepted, with did-you-mean;
+   `--help` everywhere; `query conflicts` and `edit resolve`; a tools
+   binary the agent's own builds do not replace.
