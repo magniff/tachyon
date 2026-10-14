@@ -61,7 +61,7 @@ pub static mut DRY_RUN: bool = false;
 pub static mut NO_CHECK: bool = false;
 // --target T (0: the host), passed on to the check.
 pub static mut TARGET: i64 = 0;
-static mut TARGET_NAME: *u8 = 0 as *u8;
+pub static mut TARGET_NAME: *u8 = 0 as *u8;
 // The command line, for the `try:` line of a refused edit.
 static mut ARGC: i64 = 0;
 static mut ARGV: **u8 = 0 as **u8;
@@ -446,16 +446,7 @@ fn check_edited(root: *u8, added: *IntVec) -> bool {
             args.push(c"--target" as i64);
             args.push(TARGET_NAME as i64);
         }
-        for i in 0..CH_FILE.count {
-            args.push(c"--overlay" as i64);
-            args.push(FILES[CH_FILE.data[i]].path as i64);
-            args.push(copy_path(FILES[CH_FILE.data[i]].path) as i64);
-        }
-        for i in 0..NEW_PATH.count {
-            args.push(c"--overlay" as i64);
-            args.push(NEW_PATH.data[i]);
-            args.push(copy_path(NEW_PATH.data[i] as *u8) as i64);
-        }
+        overlay_args(&args);
         args.push(root as i64);
         args.push(0);
         let out = buf_new();
@@ -487,6 +478,12 @@ fn check_edited(root: *u8, added: *IntVec) -> bool {
     }
 }
 
+// The command line (for the `try:` line of a refused edit).
+pub fn set_command(argc: i64, argv: **u8) {
+    ARGC = argc;
+    ARGV = argv;
+}
+
 // The command as it was run, with one more option (for a `try:` line).
 fn try_again(option: *u8) {
     unsafe {
@@ -510,6 +507,16 @@ fn try_again(option: *u8) {
 // journals it, and prints `what` with the files and the lines changed.
 // The exit status: 0 done, 1 refused (nothing written).
 pub fn apply_edit(what: [u8], root: *u8) -> i64 {
+    let status = prepare_edit();
+    if status >= 0 {
+        return status;
+    }
+    finish_edit(what, root)
+}
+
+// Step 1: the new texts, and their copies. -1 when they are ready, else
+// the exit status (0: nothing to change).
+pub fn prepare_edit() -> i64 {
     unsafe {
         let mut order = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         sorted_edits(&order);
@@ -519,16 +526,6 @@ pub fn apply_edit(what: [u8], root: *u8) -> i64 {
             buf_str(d, c"nothing to change\n");
             return 0;
         }
-        // The diff (printed with --dry-run; it counts the lines).
-        let diff = buf_new();
-        for i in 0..CH_FILE.count {
-            let f = CH_FILE.data[i];
-            diff_texts(diff, file_text(f), SRC[FILES[f].start..FILES[f].end], buf_slice(CH_TEXT.data[i]));
-        }
-        for i in 0..NEW_PATH.count {
-            diff_texts(diff, c_slice(NEW_PATH.data[i] as *u8), SRC[0..0], buf_slice(NEW_TEXT.data[i]));
-        }
-        // 1. The copies.
         let mut ok = true;
         for i in 0..CH_FILE.count {
             let path = FILES[CH_FILE.data[i]].path;
@@ -550,16 +547,105 @@ pub fn apply_edit(what: [u8], root: *u8) -> i64 {
                 cannot_write(path);
             }
         }
+        if !ok {
+            remove_copies();
+            return 1;
+        }
+        -1
+    }
+}
+
+// The `--overlay FILE COPY` arguments of the edited files (for a command
+// that runs on the edited program).
+pub fn overlay_args(args: *IntVec) {
+    unsafe {
+        for i in 0..CH_FILE.count {
+            args.push(c"--overlay" as i64);
+            args.push(FILES[CH_FILE.data[i]].path as i64);
+            args.push(copy_path(FILES[CH_FILE.data[i]].path) as i64);
+        }
+        for i in 0..NEW_PATH.count {
+            args.push(c"--overlay" as i64);
+            args.push(NEW_PATH.data[i]);
+            args.push(copy_path(NEW_PATH.data[i] as *u8) as i64);
+        }
+    }
+}
+
+// File `path`'s copy was rewritten (by a later round of fix): its new
+// text is the copy's. False when path is no file of the program.
+pub fn copy_rewritten(path: [u8]) -> bool {
+    unsafe {
+        for f in 0..FILE_COUNT {
+            if !same_bytes(c_slice(FILES[f].path), path) {
+                continue;
+            }
+            let text = buf_new();
+            if !read_file_if(copy_path(FILES[f].path), text) {
+                return false;
+            }
+            for i in 0..CH_FILE.count {
+                if CH_FILE.data[i] == f {
+                    CH_TEXT.data[i] = text;
+                    return true;
+                }
+            }
+            CH_FILE.push(f);
+            CH_TEXT.push(text);
+            return true;
+        }
+        false
+    }
+}
+
+// The new texts of the edit as copies, without a check (a round of fix
+// run on an edited program: `fix --round`): prints `file<TAB>PATH` per
+// copy written.
+pub fn write_round() -> i64 {
+    unsafe {
+        let mut order = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        sorted_edits(&order);
+        new_texts(&order);
+        let out = buf_new();
+        for i in 0..CH_FILE.count {
+            let path = FILES[CH_FILE.data[i]].path;
+            if !write_file_if(copy_path(path), buf_slice(CH_TEXT.data[i])) {
+                cannot_write(path);
+                return 1;
+            }
+            buf_str(out, c"file\t");
+            buf_str(out, path);
+            buf_byte(out, '\n');
+        }
+        buf_write_fd(out, STDOUT);
+        0
+    }
+}
+
+// Steps 2 to 4, once the copies are written (prepare_edit): the check,
+// then the files written (or the diff printed), the journal, the summary.
+pub fn finish_edit(what: [u8], root: *u8) -> i64 {
+    unsafe {
+        // The diff (printed with --dry-run; it counts the lines).
+        let diff = buf_new();
+        for i in 0..CH_FILE.count {
+            let f = CH_FILE.data[i];
+            diff_texts(diff, file_text(f), SRC[FILES[f].start..FILES[f].end], buf_slice(CH_TEXT.data[i]));
+        }
+        for i in 0..NEW_PATH.count {
+            diff_texts(diff, c_slice(NEW_PATH.data[i] as *u8), SRC[0..0], buf_slice(NEW_TEXT.data[i]));
+        }
+        let mut ok = true;
         // 2, 3. The check.
         let mut added = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        let checked = ok && check_edited(root, &added);
-        if ok && !checked {
+        let checked = check_edited(root, &added);
+        if !checked {
             let d = diag(c"warning", c"edit.unchecked");
             buf_str(d, c"the edited program could not be checked (");
             buf_str(d, PROG);
             buf_str(d, c" check did not run)\n");
         }
-        if DRY_RUN || !ok || (added.count > 0 && !NO_CHECK) {
+        if DRY_RUN || (added.count > 0 && !NO_CHECK) {
             remove_copies();
         }
         if DRY_RUN {
@@ -584,8 +670,8 @@ pub fn apply_edit(what: [u8], root: *u8) -> i64 {
                 try_end(out);
             }
         }
-        if !ok || DRY_RUN {
-            return if ok && added.count == 0 { 0 } else { 1 };
+        if DRY_RUN {
+            return if added.count == 0 { 0 } else { 1 };
         }
         if added.count > 0 && !NO_CHECK {
             return 1;
@@ -951,8 +1037,14 @@ fn run_undo(force: bool, from: *u8) -> i64 {
 // The start of the item of definition d: its node's start, or before it
 // its `pub` and its attributes.
 fn item_head(d: i64) -> i64 {
+    unsafe { node_head(DEFS[d].start) }
+}
+
+// The start of an item whose node starts at `start`: there, or before it
+// at its `pub` and its attributes.
+pub fn node_head(start: i64) -> i64 {
     unsafe {
-        let mut i = token_at(DEFS[d].start);
+        let mut i = token_at(start);
         loop {
             if i > 0 && TOKS[i - 1].kind == Tok::Pub {
                 i -= 1;
@@ -1037,7 +1129,7 @@ fn whole_lines(d: i64) -> bool {
 }
 
 // The indentation of the line of pos.
-fn indent_of(pos: i64) -> [u8] {
+pub fn indent_of(pos: i64) -> [u8] {
     unsafe {
         let a = line_start(pos);
         let mut b = a;
@@ -1133,7 +1225,7 @@ fn has_prefix(text: [u8]) -> bool {
 
 // The position after the newline of the line of pos (its file's end for
 // the last line).
-fn after_line(pos: i64) -> i64 {
+pub fn after_line(pos: i64) -> i64 {
     unsafe {
         let e = line_end(pos);
         let f = file_of_pos(pos);
@@ -1142,7 +1234,7 @@ fn after_line(pos: i64) -> i64 {
 }
 
 // Whether the line starting at pos is blank (pos: a line's start).
-fn blank_line(pos: i64) -> bool {
+pub fn blank_line(pos: i64) -> bool {
     unsafe {
         let f = file_of_pos(pos);
         pos < FILES[f].end && blank(pos, line_end(pos))
@@ -1170,7 +1262,7 @@ fn usage(message: *u8) -> i64 {
 
 // The options the editing commands share: --dry-run, --no-check, --exact,
 // --root R, --target T. Whether a[i] is one (*i moves past its value).
-fn edit_option(argc: i64, argv: **u8, i: *i64, root: **u8) -> bool {
+pub fn take_edit_option(argc: i64, argv: **u8, i: *i64, root: **u8) -> bool {
     unsafe {
         let a = argv[*i];
         if streq(a, c"--dry-run") {
@@ -1226,7 +1318,7 @@ fn run_edit_inner(argc: i64, argv: **u8) -> i64 {
                 after = true;
             } else if streq(a, c"--before") {
                 before = true;
-            } else if edit_option(argc, argv, &i, &root) {
+            } else if take_edit_option(argc, argv, &i, &root) {
             } else if a[0] == '-' && a[1] == '-' {
                 let d = diag(c"error", c"edit.usage");
                 buf_str(d, c"unknown option '");
@@ -1364,10 +1456,19 @@ fn delete_item(d: i64, whole: bool, head: i64, tail: i64) {
             edit_replace(a, b, buf_new());
             return;
         }
-        let mut a = line_start(text_start(d));
+        delete_lines(line_start(text_start(d)), tail);
+    }
+}
+
+// The edit deleting the lines from `first` (a line's start) through the
+// line of tail - 1, and one blank line next to them, so that no two are
+// left together (nor one after an opening brace, or before a closing
+// one).
+pub fn delete_lines(first: i64, tail: i64) {
+    unsafe {
+        let f = file_of_pos(first);
+        let mut a = first;
         let mut b = after_line(tail - 1);
-        // One blank line goes with it, so that no two are left together
-        // (or one after an opening brace, or before a closing one).
         let prev = if a > FILES[f].start { line_start(a - 1) } else { -1 };
         let prev_blank = prev >= 0 && blank_line(prev);
         let opens = prev >= 0 && !prev_blank && ends_with_brace(prev, a - 1);
@@ -1483,7 +1584,7 @@ pub fn run_check(argc: i64, argv: **u8) -> i64 {
             }
             if streq(a, c"--diagnostics=human") || streq(a, c"--diagnostics=short") {
                 DIAG_SHORT = streq(a, c"--diagnostics=short");
-            } else if edit_option(argc, argv, &i, &root) {
+            } else if take_edit_option(argc, argv, &i, &root) {
             } else if a[0] == '-' {
                 let d = diag(c"error", c"check.usage");
                 buf_str(d, c"unknown option '");
