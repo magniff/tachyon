@@ -1,0 +1,743 @@
+// Expressions: a Pratt parser with the binding powers of docs/grammar.md
+// (infix, prefix and postfix operators), the primary expressions
+// (literals, paths, struct literals, tuples, arrays) and the expressions
+// with blocks: `if`, `if let`, `match` and the loops.
+
+use crate::base::{error_at, intern_c};
+use crate::front::ast::{
+    ARM_NO_ELSE, ARM_SYNTHETIC, BLOCK_UNSAFE, NODES, NodeKind, SCRATCH, list_begin, list_end,
+    list_push, new_node,
+};
+use crate::front::lexer::{SUF_NONE, TOKS, Tok};
+use crate::front::lexer::Tok::{
+    Amp, AmpAmp, AmpEq, As, At, Bang, BangEq, Break, CStr, Caret, CaretEq, Char, Colon, ColonColon,
+    Comma, Continue, Dot, DotDot, DotDotEq, Else, Eof, Eq, EqEq, False, FatArrow, Float, For, Gt,
+    GtEq, Hash, Ident, If, In, Int, LBrace, LBracket, LParen, Let, Loop, Lt, LtEq, Match, Minus,
+    MinusEq, Percent, PercentEq, Pipe, PipeEq, PipePipe, Plus, PlusEq, Question, RBrace, RBracket,
+    RParen, Reserved, Return, Semi, Shl, ShlEq, Shr, ShrEq, Slash, SlashEq, Star, StarEq, Str,
+    Tilde, True, Unsafe, While,
+};
+use crate::front::parser::{
+    NO_STRUCT, P, UNDERSCORE, advance, at, cur, cur_start, eat, expect,
+    expect_binding_name, expect_ident, prev_end, reserved_error, syntax_error, tok_kind, with_no_struct,
+};
+use crate::front::parser::stmts::{at_block_like, at_label, parse_block, parse_pattern};
+use crate::front::parser::types::{parse_type, parse_type_args};
+
+const AS_BP: i64 = 24;
+const PREFIX_BP: i64 = 25;
+const POSTFIX_BP: i64 = 27;
+
+pub fn parse_expr() -> i64 {
+    parse_expr_bp(0)
+}
+
+fn parse_expr_no_struct() -> i64 {
+    let saved = with_no_struct(true);
+    let e = parse_expr_bp(0);
+    NO_STRUCT = saved;
+    e
+}
+
+// Left and right binding powers of an infix operator token, 0 if none.
+pub fn infix_left_bp(kind: Tok) -> i64 {
+    match kind {
+        Eq | PlusEq | MinusEq | StarEq | SlashEq | PercentEq
+            | AmpEq | PipeEq | CaretEq | ShlEq | ShrEq => 2,
+        DotDot | DotDotEq => 4,
+        PipePipe => 6,
+        AmpAmp => 8,
+        EqEq | BangEq | Lt | Gt | LtEq | GtEq => 10,
+        Pipe => 12,
+        Caret => 14,
+        Amp => 16,
+        Shl | Shr => 18,
+        Plus | Minus => 20,
+        Star | Slash | Percent => 22,
+        _ => 0,
+    }
+}
+
+pub fn is_comparison(kind: Tok) -> bool {
+    infix_left_bp(kind) == 10
+}
+
+fn is_assign_op(kind: Tok) -> bool {
+    infix_left_bp(kind) == 2
+}
+
+fn is_reserved_punct(kind: Tok) -> bool {
+    kind == Hash || kind == Question || kind == At
+}
+
+// Non-associative level of an operator: 1 comparison, 2 range, 0 none.
+fn non_assoc_level(kind: Tok) -> i64 {
+    if is_comparison(kind) { return 1; }
+    if kind == DotDot || kind == DotDotEq { return 2; }
+    0
+}
+
+fn parse_expr_bp(min_bp: i64) -> i64 {
+    let lhs = parse_prefix();
+    parse_infix(lhs, min_bp)
+}
+
+// Continues an expression whose first operand `first` is parsed.
+fn parse_infix(first: i64, min_bp: i64) -> i64 {
+    unsafe {
+        let mut lhs = first;
+        let mut built_by = 0;
+        loop {
+            let kind = cur();
+            if (kind == LParen || kind == LBracket || kind == Dot) && POSTFIX_BP >= min_bp {
+                lhs = parse_postfix(lhs);
+                built_by = 0;
+                continue;
+            }
+            if kind == As && AS_BP >= min_bp {
+                advance();
+                let n = new_node(NodeKind::Cast, NODES[lhs].start, 0);
+                NODES[n].a = lhs;
+                NODES[n].b = parse_type();
+                NODES[n].end = prev_end();
+                lhs = n;
+                built_by = 0;
+                continue;
+            }
+            if is_reserved_punct(kind) {
+                reserved_error();
+            }
+            let left_bp = infix_left_bp(kind);
+            if left_bp == 0 || left_bp < min_bp {
+                break;
+            }
+            let level = non_assoc_level(kind);
+            if level != 0 && built_by == level {
+                if level == 1 {
+                    error_at(cur_start(), c"comparison operators cannot be chained; use parentheses");
+                }
+                error_at(cur_start(), c"range operators cannot be chained; use parentheses");
+            }
+            advance();
+            // Assignment is right-associative; everything else left.
+            let right_bp = if left_bp == 2 { 1 } else { left_bp + 1 };
+            let rhs = parse_expr_bp(right_bp);
+            lhs = make_infix(kind, lhs, rhs);
+            built_by = level;
+        }
+        lhs
+    }
+}
+
+fn make_infix(kind: Tok, lhs: i64, rhs: i64) -> i64 {
+    unsafe {
+        let start = NODES[lhs].start;
+        let end = NODES[rhs].end;
+        if is_assign_op(kind) {
+            let n = new_node(NodeKind::Assign, start, end);
+            NODES[n].op = kind;
+            NODES[n].b = lhs;
+            NODES[n].c = rhs;
+            return n;
+        }
+        if kind == DotDot || kind == DotDotEq {
+            let n = new_node(NodeKind::Range, start, end);
+            NODES[n].a = lhs;
+            NODES[n].b = rhs;
+            NODES[n].c = (kind == DotDotEq) as i64;
+            return n;
+        }
+        let n = new_node(NodeKind::Binary, start, end);
+        NODES[n].op = kind;
+        NODES[n].b = lhs;
+        NODES[n].c = rhs;
+        n
+    }
+}
+
+fn starts_expr(kind: Tok) -> bool {
+    kind == Int || kind == Float || kind == Char || kind == Str || kind == CStr
+        || kind == Ident || kind == True || kind == False || kind == LParen
+        || kind == LBracket || kind == LBrace || kind == Minus || kind == Bang
+        || kind == Tilde || kind == Star || kind == Amp || kind == AmpAmp
+        || kind == If || kind == Loop || kind == While || kind == For
+        || kind == Return || kind == Break || kind == Continue || kind == Match
+        || kind == Unsafe
+}
+
+pub fn make_unary(op: Tok, operand: i64, start: i64) -> i64 {
+    unsafe {
+        let n = new_node(NodeKind::Unary, start, NODES[operand].end);
+        NODES[n].op = op;
+        NODES[n].b = operand;
+        n
+    }
+}
+
+fn parse_prefix() -> i64 {
+    unsafe {
+        let kind = cur();
+        let start = cur_start();
+        if kind == Minus || kind == Bang || kind == Tilde || kind == Star || kind == Amp {
+            advance();
+            let operand = parse_expr_bp(PREFIX_BP);
+            return make_unary(kind, operand, start);
+        }
+        if kind == AmpAmp {
+            // `&&x` is `& &x`.
+            advance();
+            let operand = parse_expr_bp(PREFIX_BP);
+            let inner = make_unary(Amp, operand, start + 1);
+            return make_unary(Amp, inner, start);
+        }
+        if kind == Plus {
+            error_at(start, c"unary '+' is not supported");
+        }
+        if kind == Return {
+            advance();
+            let n = new_node(NodeKind::Return, start, 0);
+            NODES[n].a = parse_jump_value();
+            NODES[n].end = prev_end();
+            return n;
+        }
+        if kind == Break {
+            advance();
+            let n = new_node(NodeKind::Break, start, 0);
+            NODES[n].a = parse_jump_label();
+            NODES[n].b = parse_jump_value();
+            NODES[n].end = prev_end();
+            return n;
+        }
+        if kind == Continue {
+            advance();
+            let n = new_node(NodeKind::Continue, start, 0);
+            NODES[n].a = parse_jump_label();
+            NODES[n].end = prev_end();
+            return n;
+        }
+        if kind == DotDot || kind == DotDotEq {
+            error_at(start, c"a range needs a start: write 'a..b'");
+        }
+        parse_primary()
+    }
+}
+
+fn parse_jump_value() -> i64 {
+    if starts_expr(cur()) { parse_expr_bp(0) } else { 0 }
+}
+
+fn parse_jump_label() -> i64 {
+    if at(Colon) && tok_kind(1) == Ident {
+        advance();
+        return expect_ident();
+    }
+    0
+}
+
+fn parse_postfix(lhs: i64) -> i64 {
+    unsafe {
+        let start = NODES[lhs].start;
+        if at(LParen) && NODES[lhs].kind == NodeKind::Ident && NODES[lhs].g == 0
+            && (NODES[lhs].a == intern_c(c"size_of") || NODES[lhs].a == intern_c(c"align_of")) {
+            // `size_of(T)`, `align_of(T)` (builtins, 0.5): the argument is a
+            // type (`size_of(Node<T>)`).
+            advance();
+            let n = new_node(NodeKind::Call, start, 0);
+            NODES[n].a = lhs;
+            let mark = list_begin();
+            list_push(parse_type());
+            list_end(n, mark);
+            expect(RParen);
+            NODES[n].end = prev_end();
+            return n;
+        }
+        if eat(LParen) {
+            let n = new_node(NodeKind::Call, start, 0);
+            NODES[n].a = lhs;
+            let saved = with_no_struct(false);
+            parse_expr_list(n, RParen);
+            NO_STRUCT = saved;
+            expect(RParen);
+            NODES[n].end = prev_end();
+            return n;
+        }
+        if eat(LBracket) {
+            let n = new_node(NodeKind::Index, start, 0);
+            NODES[n].a = lhs;
+            let saved = with_no_struct(false);
+            NODES[n].b = parse_index();
+            NO_STRUCT = saved;
+            expect(RBracket);
+            NODES[n].end = prev_end();
+            return n;
+        }
+        expect(Dot);
+        if at(Ident) {
+            if tok_kind(1) == LParen || (tok_kind(1) == ColonColon && tok_kind(2) == Lt) {
+                let n = new_node(NodeKind::MethodCall, start, 0);
+                NODES[n].a = lhs;
+                NODES[n].b = expect_ident();
+                if eat(ColonColon) {
+                    NODES[n].g = parse_type_args();
+                }
+                expect(LParen);
+                let saved = with_no_struct(false);
+                parse_expr_list(n, RParen);
+                NO_STRUCT = saved;
+                expect(RParen);
+                NODES[n].end = prev_end();
+                return n;
+            }
+            let n = new_node(NodeKind::FieldAccess, start, 0);
+            NODES[n].a = lhs;
+            NODES[n].b = expect_ident();
+            NODES[n].end = prev_end();
+            return n;
+        }
+        if at(Int) && TOKS[P].suffix == SUF_NONE {
+            let n = new_node(NodeKind::TupleField, start, TOKS[P].end);
+            NODES[n].a = lhs;
+            NODES[n].b = TOKS[P].value as i64;
+            advance();
+            return n;
+        }
+        syntax_error(c"expected field name or index after '.'")
+    }
+}
+
+// The inside of `[...]`: an index, or a range with optional ends
+// (`lo..hi`, `lo..`, `..hi`, `..`, `lo..=hi`, `..=hi`) for slicing.
+fn parse_index() -> i64 {
+    unsafe {
+        let start = cur_start();
+        let mut low = 0;
+        if !at(DotDot) && !at(DotDotEq) {
+            // Stops before a range operator.
+            low = parse_expr_bp(5);
+            if !at(DotDot) && !at(DotDotEq) {
+                return parse_infix(low, 0);
+            }
+        }
+        let inclusive = at(DotDotEq);
+        advance();
+        let n = new_node(NodeKind::Range, start, 0);
+        NODES[n].a = low;
+        NODES[n].c = inclusive as i64;
+        if !at(RBracket) {
+            NODES[n].b = parse_expr_bp(5);
+        } else if inclusive {
+            syntax_error(c"an inclusive range needs an end");
+        }
+        NODES[n].end = prev_end();
+        n
+    }
+}
+
+// `e, e, ...` up to `close` (not consumed), as the list of `n`.
+fn parse_expr_list(n: i64, close: Tok) {
+    let mark = list_begin();
+    while !at(close) && !at(Eof) {
+        list_push(parse_expr());
+        if !eat(Comma) {
+            break;
+        }
+    }
+    list_end(n, mark);
+}
+
+fn literal_node(kind: NodeKind, start: i64, a: i64, b: i64) -> i64 {
+    advance();
+    let n = new_node(kind, start, prev_end());
+    unsafe {
+        NODES[n].a = a;
+        NODES[n].b = b;
+    }
+    n
+}
+
+pub fn parse_primary() -> i64 {
+    unsafe {
+        let kind = cur();
+        let start = cur_start();
+        let value = TOKS[P].value as i64;
+        let suffix = TOKS[P].suffix;
+        if kind == Int { return literal_node(NodeKind::Int, start, value, suffix); }
+        if kind == Float { return literal_node(NodeKind::Float, start, value, suffix); }
+        if kind == Char { return literal_node(NodeKind::Char, start, value, 0); }
+        if kind == Str { return literal_node(NodeKind::Str, start, value, 0); }
+        if kind == CStr { return literal_node(NodeKind::CStr, start, value, 0); }
+        if kind == True { return literal_node(NodeKind::Bool, start, 1, 0); }
+        if kind == False { return literal_node(NodeKind::Bool, start, 0, 0); }
+        if kind == LParen {
+            let saved = with_no_struct(false);
+            let e = parse_paren_expr();
+            NO_STRUCT = saved;
+            return e;
+        }
+        if kind == LBracket {
+            let saved = with_no_struct(false);
+            let e = parse_array_literal();
+            NO_STRUCT = saved;
+            return e;
+        }
+        if kind == LBrace { return parse_block(); }
+        if kind == Unsafe {
+            // `unsafe { ... }` (0.9): a block of unsafe code.
+            advance();
+            if !at(LBrace) {
+                syntax_error(c"expected '{' after 'unsafe' (an unsafe block), or 'unsafe fn' as an item");
+            }
+            let block = parse_block();
+            NODES[block].start = start;
+            NODES[block].p |= BLOCK_UNSAFE;
+            return block;
+        }
+        if kind == If { return parse_if(); }
+        if kind == Match { return parse_match(); }
+        if kind == Loop || kind == While || kind == For {
+            return parse_loop(0, start);
+        }
+        if kind == Ident && at_label() {
+            let label = expect_ident();
+            expect(Colon);
+            return parse_loop(label, start);
+        }
+        if kind == Ident && value == UNDERSCORE {
+            error_at(start, c"'_' can only be used in patterns");
+        }
+        if kind == Ident {
+            return parse_name_or_struct_literal();
+        }
+        if is_reserved_punct(kind) || kind == Reserved {
+            reserved_error();
+        }
+        syntax_error(c"expected expression")
+    }
+}
+
+// One segment of a path in an expression: a name, with type arguments
+// after `::<` (an Ident node, g = the arguments).
+fn parse_path_segment() -> i64 {
+    unsafe {
+        let seg = new_node(NodeKind::Ident, cur_start(), 0);
+        NODES[seg].a = expect_ident();
+        if at(ColonColon) && tok_kind(1) == Lt {
+            advance();
+            NODES[seg].g = parse_type_args();
+        }
+        NODES[seg].end = prev_end();
+        seg
+    }
+}
+
+// A name (`x`, `max::<i64>`), a path (`T::m`, `a::b::c`), or a struct
+// literal (`P { x: 1 }`, `Pair::<i64> { ... }`, `m::P { ... }`).
+//
+// A path of two segments is a Path node (a, b: the names, g: the first
+// one's type arguments, h: the second's); with more, its list holds all
+// the segments, and a, b, g, h describe the last two.
+fn parse_name_or_struct_literal() -> i64 {
+    unsafe {
+        let start = cur_start();
+        let first = parse_path_segment();
+        let mark = list_begin();
+        list_push(first);
+        while at(ColonColon) && tok_kind(1) == Ident {
+            advance();
+            list_push(parse_path_segment());
+        }
+        let count = SCRATCH.count - mark;
+        if at(ColonColon) {
+            advance();
+            syntax_error(c"expected a name after '::'");
+        }
+        let last = SCRATCH.data[SCRATCH.count - 1];
+        if !NO_STRUCT && at(LBrace) {
+            advance();
+            let n = new_node(NodeKind::StructLit, start, 0);
+            NODES[n].a = NODES[last].a;
+            NODES[n].g = NODES[last].g;
+            if count > 1 {
+                // The module path of the struct: h, a Path of the segments
+                // before its name.
+                let prefix = new_node(NodeKind::Path, start, NODES[last].start);
+                SCRATCH.count -= 1;
+                list_end(prefix, mark);
+                NODES[n].h = prefix;
+            } else {
+                SCRATCH.count = mark;
+            }
+            let saved = with_no_struct(false);
+            let inits = list_begin();
+            while !at(RBrace) && !at(Eof) {
+                let init_start = cur_start();
+                let init = new_node(NodeKind::FieldInit, init_start, 0);
+                NODES[init].a = expect_binding_name();
+                expect(Colon);
+                NODES[init].b = parse_expr();
+                NODES[init].end = prev_end();
+                list_push(init);
+                if !eat(Comma) {
+                    break;
+                }
+            }
+            list_end(n, inits);
+            NO_STRUCT = saved;
+            expect(RBrace);
+            NODES[n].end = prev_end();
+            return n;
+        }
+        if count == 1 {
+            SCRATCH.count = mark;
+            return first;
+        }
+        let n = new_node(NodeKind::Path, start, prev_end());
+        let before = SCRATCH.data[SCRATCH.count - 2];
+        NODES[n].a = NODES[before].a;
+        NODES[n].g = NODES[before].g;
+        NODES[n].b = NODES[last].a;
+        NODES[n].h = NODES[last].g;
+        if count == 2 {
+            SCRATCH.count = mark;
+        } else {
+            list_end(n, mark);
+        }
+        n
+    }
+}
+
+// `()`, `(e)`, `(e,)` or `(e, e, ...)`
+fn parse_paren_expr() -> i64 {
+    unsafe {
+        let start = cur_start();
+        expect(LParen);
+        if eat(RParen) {
+            return new_node(NodeKind::Unit, start, prev_end());
+        }
+        let first = parse_expr();
+        if eat(Comma) {
+            let n = new_node(NodeKind::Tuple, start, 0);
+            let mark = list_begin();
+            list_push(first);
+            while !at(RParen) && !at(Eof) {
+                list_push(parse_expr());
+                if !eat(Comma) {
+                    break;
+                }
+            }
+            list_end(n, mark);
+            expect(RParen);
+            NODES[n].end = prev_end();
+            return n;
+        }
+        expect(RParen);
+        NODES[first].start = start;
+        NODES[first].end = prev_end();
+        first
+    }
+}
+
+// `[]`, `[e; n]` or `[e, e, ...]`
+fn parse_array_literal() -> i64 {
+    unsafe {
+        let start = cur_start();
+        expect(LBracket);
+        if eat(RBracket) {
+            return new_node(NodeKind::Array, start, prev_end());
+        }
+        let first = parse_expr();
+        if eat(Semi) {
+            let n = new_node(NodeKind::Repeat, start, 0);
+            NODES[n].a = first;
+            NODES[n].b = parse_expr();
+            expect(RBracket);
+            NODES[n].end = prev_end();
+            return n;
+        }
+        let n = new_node(NodeKind::Array, start, 0);
+        let mark = list_begin();
+        list_push(first);
+        if eat(Comma) {
+            while !at(RBracket) && !at(Eof) {
+                list_push(parse_expr());
+                if !eat(Comma) {
+                    break;
+                }
+            }
+        }
+        list_end(n, mark);
+        expect(RBracket);
+        NODES[n].end = prev_end();
+        n
+    }
+}
+
+fn parse_if() -> i64 {
+    unsafe {
+        let start = cur_start();
+        expect(If);
+        if at(Let) {
+            return parse_if_let(start);
+        }
+        let n = new_node(NodeKind::If, start, 0);
+        NODES[n].a = parse_expr_no_struct();
+        NODES[n].b = parse_block();
+        if eat(Else) {
+            NODES[n].c = parse_else_part();
+        }
+        NODES[n].end = prev_end();
+        n
+    }
+}
+
+// The else part of an `if` (after `else`): a block, or a block holding
+// just the inner `if` of an `else if`.
+fn parse_else_part() -> i64 {
+    unsafe {
+        if at(If) {
+            let inner = parse_if();
+            let block = new_node(NodeKind::Block, NODES[inner].start, NODES[inner].end);
+            NODES[block].a = inner;
+            return block;
+        }
+        parse_block()
+    }
+}
+
+// A match arm made by the parser: `pattern => body`.
+fn synthetic_arm(pattern: i64, body: i64, flags: i64) -> i64 {
+    unsafe {
+        let arm = new_node(NodeKind::Arm, NODES[pattern].start, NODES[body].end);
+        NODES[arm].a = pattern;
+        NODES[arm].c = body;
+        NODES[arm].p = flags;
+        arm
+    }
+}
+
+// `if let P = e { A } else { B }` (0.6), after `if`: the match
+// `match e { P => { A }, _ => { B } }` (B: an empty block without `else`).
+// The bindings of P are in scope in A only; P may be refutable or not.
+fn parse_if_let(start: i64) -> i64 {
+    unsafe {
+        expect(Let);
+        let pattern = parse_pattern();
+        expect(Eq);
+        let n = new_node(NodeKind::Match, start, 0);
+        NODES[n].a = parse_expr_no_struct();
+        let then = parse_block();
+        let mut flags = ARM_SYNTHETIC;
+        let otherwise = if eat(Else) {
+            parse_else_part()
+        } else {
+            flags = ARM_SYNTHETIC | ARM_NO_ELSE;
+            new_node(NodeKind::Block, prev_end(), prev_end())
+        };
+        let wild = new_node(NodeKind::PatWild, NODES[otherwise].start, NODES[otherwise].start);
+        let mark = list_begin();
+        list_push(synthetic_arm(pattern, then, 0));
+        list_push(synthetic_arm(wild, otherwise, flags));
+        list_end(n, mark);
+        NODES[n].end = prev_end();
+        n
+    }
+}
+
+// `match e { pattern [if guard] => body, ... }`
+fn parse_match() -> i64 {
+    unsafe {
+        let start = cur_start();
+        expect(Match);
+        let n = new_node(NodeKind::Match, start, 0);
+        NODES[n].a = parse_expr_no_struct();
+        expect(LBrace);
+        let saved = with_no_struct(false);
+        let mark = list_begin();
+        while !at(RBrace) && !at(Eof) {
+            let arm = new_node(NodeKind::Arm, cur_start(), 0);
+            NODES[arm].a = parse_pattern();
+            if eat(If) {
+                NODES[arm].b = parse_expr();
+            }
+            expect(FatArrow);
+            if at_block_like() {
+                // Ends at its closing brace, like a statement.
+                NODES[arm].c = parse_primary();
+                eat(Comma);
+            } else {
+                NODES[arm].c = parse_expr();
+                if !at(RBrace) {
+                    if !at(Comma) {
+                        syntax_error(c"expected ',' or '}' after a match arm");
+                    }
+                    advance();
+                }
+            }
+            NODES[arm].end = prev_end();
+            list_push(arm);
+        }
+        list_end(n, mark);
+        NO_STRUCT = saved;
+        expect(RBrace);
+        NODES[n].end = prev_end();
+        n
+    }
+}
+
+// `while let P = e { body }` (0.6), after `while`: the loop
+// `loop { match e { P => { body }, _ => break } }`, keeping the label.
+fn parse_while_let(label: i64, start: i64) -> i64 {
+    unsafe {
+        expect(Let);
+        let pattern = parse_pattern();
+        expect(Eq);
+        let m = new_node(NodeKind::Match, start, 0);
+        NODES[m].a = parse_expr_no_struct();
+        let body = parse_block();
+        let brk = new_node(NodeKind::Break, NODES[body].end, NODES[body].end);
+        let wild = new_node(NodeKind::PatWild, NODES[body].end, NODES[body].end);
+        let mark = list_begin();
+        list_push(synthetic_arm(pattern, body, 0));
+        list_push(synthetic_arm(wild, brk, ARM_SYNTHETIC));
+        list_end(m, mark);
+        NODES[m].end = prev_end();
+        let block = new_node(NodeKind::Block, start, prev_end());
+        NODES[block].a = m;
+        let n = new_node(NodeKind::Loop, start, prev_end());
+        NODES[n].a = label;
+        NODES[n].b = block;
+        n
+    }
+}
+
+fn parse_loop(label: i64, start: i64) -> i64 {
+    unsafe {
+        if eat(Loop) {
+            let n = new_node(NodeKind::Loop, start, 0);
+            NODES[n].a = label;
+            NODES[n].b = parse_block();
+            NODES[n].end = prev_end();
+            return n;
+        }
+        if eat(While) {
+            if at(Let) {
+                return parse_while_let(label, start);
+            }
+            let n = new_node(NodeKind::While, start, 0);
+            NODES[n].a = label;
+            NODES[n].b = parse_expr_no_struct();
+            NODES[n].c = parse_block();
+            NODES[n].end = prev_end();
+            return n;
+        }
+        expect(For);
+        let n = new_node(NodeKind::For, start, 0);
+        NODES[n].a = label;
+        NODES[n].b = parse_pattern();
+        expect(In);
+        NODES[n].c = parse_expr_no_struct();
+        NODES[n].d = parse_block();
+        NODES[n].end = prev_end();
+        n
+    }
+}

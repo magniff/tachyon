@@ -1,0 +1,166 @@
+// `extern "C"` items: blocks of C declarations (functions and statics,
+// with their link names), functions with the C convention, and statics
+// with a C symbol.
+
+use crate::base::{error_at, intern, intern_c};
+use crate::front::ast::{NODES, NodeKind, list_push, new_node};
+use crate::front::check::name_error;
+use crate::front::lexer::{STRS, TOKS};
+use crate::front::lexer::Tok::{
+    Arrow, Colon, Eof, Eq, Extern, Fn, Hash, LBrace, LBracket, LParen, Mut, RBrace, RBracket,
+    RParen, Semi, Static, Str,
+};
+use crate::front::parser::{
+    P, advance, at, cur_start, eat, expect, expect_binding_name, expect_ident, prev_end, syntax_error, tok_kind,
+};
+use crate::front::parser::exprs::parse_expr;
+use crate::front::parser::types::parse_type;
+use crate::gen0::target::LINK_NAMES;
+use crate::front::parser::items::{parse_function, parse_params, parse_return_type};
+
+// After `extern "C"`: a block of C declarations, `extern "C" { fn f(...)
+// -> T; static mut x: T; }`; a function with the C convention and an
+// unmangled symbol, `extern "C" fn f(...) -> T { ... }`; or a static with
+// a C symbol, `extern "C" static mut x: T = v;`. Items are pushed to the
+// program's list. (0.2's single declarations, `extern fn f(...) -> T;`,
+// were removed in 0.4.)
+pub fn parse_extern() {
+    unsafe {
+        let start = cur_start();
+        expect(Extern);
+        if !at(Str) {
+            error_at(start, c_fn_outside_block());
+        }
+        let abi = TOKS[P].value as i64;
+        if !(STRS[abi].len == 1 && STRS[abi].ptr[0] == 'C') {
+            error_at(cur_start(), c"unsupported ABI; only \"C\" is supported");
+        }
+        advance();
+        if eat(LBrace) {
+            while !at(RBrace) && !at(Eof) {
+                let link = parse_link_name();
+                let item = if at(Fn) {
+                    parse_c_function(cur_start(), true)
+                } else if at(Static) {
+                    parse_c_static(cur_start(), false)
+                } else {
+                    syntax_error(c"expected 'fn', 'static' or '}' in an extern block")
+                };
+                if link >= 0 {
+                    if NODES[item].kind != NodeKind::ExternFn && !(NODES[item].kind == NodeKind::Static && NODES[item].y == 1) {
+                        error_at(NODES[item].start, c"#[link_name] is for the functions and statics of an extern block");
+                    }
+                    LINK_NAMES.put(NODES[item].a + 1, link + 1);
+                }
+                list_push(item);
+            }
+            expect(RBrace);
+            return;
+        }
+        if at(Static) {
+            list_push(parse_c_static(start, true));
+            return;
+        }
+        list_push(parse_c_function(start, false));
+    }
+}
+
+fn c_fn_outside_block() -> *u8 {
+    c"C functions are declared in an extern block: `extern \"C\" { fn f(...) -> T; }` (the 0.2 form `extern fn f(...) -> T;` was removed in 0.4)"
+}
+
+// `#[link_name = "symbol"]` before a declaration in an extern block: the
+// C symbol it stands for, when that is not its name. -1: none.
+fn parse_link_name() -> i64 {
+    unsafe {
+        if !at(Hash) {
+            return -1;
+        }
+        advance();
+        expect(LBracket);
+        let pos = cur_start();
+        let name = expect_ident();
+        if name != intern_c(c"link_name") {
+            name_error(pos, c"unknown attribute '", name, c"' in an extern block (expected link_name)");
+        }
+        expect(Eq);
+        if !at(Str) {
+            syntax_error(c"expected the symbol's name as a string");
+        }
+        let sym = intern(STRS[TOKS[P].value as i64]);
+        advance();
+        expect(RBracket);
+        sym
+    }
+}
+
+// `fn f(...) -> T;` (a C function, only in an extern block) or `fn
+// f(...) -> T { ... }` (one with the C convention, defined here).
+fn parse_c_function(start: i64, in_block: bool) -> i64 {
+    unsafe {
+        if tok_kind(2) == LParen {
+            // Look past the parameters for the body.
+            let saved = P;
+            advance();
+            advance();
+            let mut depth = 0;
+            while !at(Eof) {
+                if at(LParen) {
+                    depth += 1;
+                } else if at(RParen) {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                advance();
+            }
+            advance();
+            if eat(Arrow) {
+                parse_type();
+            }
+            let has_body = at(LBrace);
+            P = saved;
+            if has_body {
+                let f = parse_function();
+                NODES[f].start = start;
+                NODES[f].y = 1;
+                return f;
+            }
+        }
+        if !in_block {
+            error_at(start, c_fn_outside_block());
+        }
+        expect(Fn);
+        let n = new_node(NodeKind::ExternFn, start, 0);
+        NODES[n].a = expect_binding_name();
+        expect(LParen);
+        NODES[n].d = parse_params(n, true) as i64;
+        expect(RParen);
+        NODES[n].b = parse_return_type();
+        expect(Semi);
+        NODES[n].end = prev_end();
+        n
+    }
+}
+
+// `static [mut] x: T;` (defined in C) or, when `defines`, also `static
+// [mut] x: T = v;` (defined here, with a C symbol).
+fn parse_c_static(start: i64, defines: bool) -> i64 {
+    unsafe {
+        expect(Static);
+        let n = new_node(NodeKind::Static, start, 0);
+        NODES[n].d = eat(Mut) as i64;
+        NODES[n].a = expect_binding_name();
+        expect(Colon);
+        NODES[n].b = parse_type();
+        NODES[n].y = 1;
+        if defines && eat(Eq) {
+            NODES[n].c = parse_expr();
+            NODES[n].y = 2;
+        }
+        expect(Semi);
+        NODES[n].end = prev_end();
+        n
+    }
+}

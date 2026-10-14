@@ -1,0 +1,321 @@
+// Parser: tokens to the AST. Items and statements by recursive descent,
+// expressions by a Pratt parser with the binding powers of
+// docs/grammar.md. After a syntax error the parser goes on at the next
+// statement or item (see parse_program and parse_block).
+//
+// This file: the token cursor, syntax errors, the program's loop with
+// its recovery, and fragments; the parts: items (and their attributes),
+// foreign (`extern "C"`), types, stmts (blocks, statements, patterns)
+// and exprs.
+
+pub mod exprs;
+mod stmts;
+mod types;
+mod foreign;
+pub mod items;
+
+use crate::base::{
+    ERR, IntVec, RECOVER_DEPTH, SRC, _setjmp, buf_bytes, err_begin, err_end, err_str, err_sym,
+    error_at, fail_name, intern_c, recover_enter, recover_leave,
+};
+use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
+use crate::front::ast::{
+    NODES, NodeKind, SCRATCH, list_begin, list_end, list_push, new_node,
+};
+use crate::front::lexer::Tok::{
+    CStr, Char, Const, Else, Enum, Eof, Float, Fn, Hash, Ident, Impl, Import, Int,
+    LBrace, LBracket, LParen, Mod, Pub, RBrace, RBracket, RParen,
+    Reserved, Semi, Static, Str,
+    Struct, Trait, Type, Union, Unsafe, Use,
+};
+use crate::front::parser::exprs::parse_expr;
+use crate::front::parser::stmts::{is_item_start, parse_stmt};
+use crate::front::parser::items::parse_top_item;
+
+// The parser's interface to other modules.
+pub use exprs::{infix_left_bp, is_comparison};
+pub use items::ITEM_PUBLIC;
+
+static mut P: i64 = 0;
+// In `if`/`while` conditions and `for` ranges, `Name {` starts the body.
+static mut NO_STRUCT: bool = false;
+
+fn tok_kind(offset: i64) -> Tok {
+    let i = P + offset;
+    if i >= TOK_COUNT { Eof } else { unsafe { TOKS[i].kind } }
+}
+
+fn cur() -> Tok {
+    unsafe { TOKS[P].kind }
+}
+
+fn at(kind: Tok) -> bool {
+    unsafe { TOKS[P].kind == kind }
+}
+
+fn cur_start() -> i64 {
+    unsafe { TOKS[P].start }
+}
+
+// The end of the previous token.
+fn prev_end() -> i64 {
+    if P == 0 { 0 } else { unsafe { TOKS[P - 1].end } }
+}
+
+fn advance() {
+    if unsafe { TOKS[P].kind != Eof } {
+        P += 1;
+    }
+}
+
+fn eat(kind: Tok) -> bool {
+    if at(kind) {
+        advance();
+        return true;
+    }
+    false
+}
+
+fn err_token(i: i64) {
+    unsafe {
+        let kind = TOKS[i].kind;
+        if kind == Ident || kind == Reserved || kind.is_keyword() {
+            err_sym(TOKS[i].value as i64);
+        } else if kind == Int || kind == Float || kind == Char {
+            buf_bytes(ERR, SRC[TOKS[i].start..TOKS[i].end]);
+        } else if kind == Str || kind == CStr {
+            err_str(c"string literal");
+        } else {
+            err_str(kind.text());
+        }
+    }
+}
+
+fn syntax_error(message: *u8) -> ! {
+    unsafe {
+        err_begin(cur_start());
+        err_str(message);
+        err_str(c", got '");
+        err_token(P);
+        err_str(c"'");
+        err_end()
+    }
+}
+
+fn expect(kind: Tok) {
+    unsafe {
+        if !at(kind) {
+            err_begin(cur_start());
+            err_str(c"expected '");
+            err_str(kind.text());
+            err_str(c"', got '");
+            err_token(P);
+            err_str(c"'");
+            err_end();
+        }
+        advance();
+    }
+}
+
+fn reserved_error() -> ! {
+    unsafe {
+        err_begin(cur_start());
+        err_str(c"'");
+        err_token(P);
+        if at(Reserved) {
+            err_str(c"' is a reserved keyword (reserved for future use)");
+        } else {
+            err_str(c"' is reserved for future use");
+        }
+        err_end()
+    }
+}
+
+pub static mut UNDERSCORE: i64 = -1;
+
+fn expect_ident() -> i64 {
+    unsafe {
+        if at(Reserved) {
+            reserved_error();
+        }
+        if !at(Ident) {
+            syntax_error(c"expected identifier");
+        }
+        let sym = TOKS[P].value as i64;
+        advance();
+        sym
+    }
+}
+
+// A name being declared: an identifier other than `_`.
+fn expect_binding_name() -> i64 {
+    unsafe {
+        if at(Ident) && TOKS[P].value as i64 == UNDERSCORE {
+            error_at(cur_start(), c"'_' cannot be used as a name here");
+        }
+        expect_ident()
+    }
+}
+
+fn with_no_struct(value: bool) -> bool {
+    let saved = NO_STRUCT;
+    NO_STRUCT = value;
+    saved
+}
+
+// ---- The program, and going on after errors ----
+
+pub fn parse_program() -> i64 {
+    unsafe {
+        UNDERSCORE = intern_c(c"_");
+        let program = new_node(NodeKind::None, 0, 0);
+        let mark = list_begin();
+        while !at(Eof) {
+            // A recovery point (see err_end): after an error, the parser goes
+            // on at the next item.
+            let depth = RECOVER_DEPTH;
+            let items = SCRATCH.count;
+            let start = P;
+            BODY_FAILED = false;
+            if _setjmp(recover_enter()) == 0 {
+                parse_top_item();
+                if BODY_FAILED {
+                    // A syntax error in a block outside a function's body (a
+                    // constant's initializer...): the item is left out.
+                    for i in items..SCRATCH.count {
+                        let kind = NODES[SCRATCH.data[i]].kind;
+                        if kind != NodeKind::Impl && kind != NodeKind::Use {
+                            fail_name(NODES[SCRATCH.data[i]].a);
+                        }
+                    }
+                    SCRATCH.count = items;
+                }
+            } else {
+                SCRATCH.count = items;
+                NO_STRUCT = false;
+                skip_to_item(start);
+                fail_names(start, P);
+            }
+            recover_leave(depth);
+        }
+        list_end(program, mark);
+        program
+    }
+}
+
+// Whether a statement of the block being parsed had a syntax error (and
+// was left out).
+static mut BODY_FAILED: bool = false;
+
+// After an error in the item starting at token `start`: on to the next
+// token after it that starts an item at the beginning of a line.
+fn skip_to_item(start: i64) {
+    unsafe {
+        P = start + 1;
+        while !at(Eof) {
+            let pos = TOKS[P].start;
+            let line_start = pos == 0 || SRC[pos - 1] == '\n';
+            if line_start && (is_item_start(cur()) || at(Pub) || at(Use) || at(Mod)
+                || at(Import) || at(Hash) || at(Impl) || at(Unsafe) || at(Trait)) {
+                return;
+            }
+            advance();
+        }
+    }
+}
+
+// The names the items in tokens start..end (skipped after an error)
+// declare, and those a `use` among them imports, are failed names: the
+// errors saying they are unknown are not reported (see err_failed_name).
+fn fail_names(start: i64, end: i64) {
+    unsafe {
+        let mut in_use = false;
+        for i in start..end {
+            let kind = TOKS[i].kind;
+            if kind == Use || kind == Import {
+                in_use = true;
+            } else if kind == Semi {
+                in_use = false;
+            }
+            if i + 1 < end && TOKS[i + 1].kind == Ident && (in_use || kind == Fn || kind == Struct
+                || kind == Union || kind == Enum || kind == Const || kind == Static || kind == Type
+                || kind == Trait || kind == Mod) {
+                fail_name(TOKS[i + 1].value as i64);
+            }
+        }
+    }
+}
+
+// After an error in the statement starting at token `start`: past its `;`,
+// or up to the `}` closing its block.
+fn skip_statement(start: i64) {
+    P = start;
+    // The brackets open in the statement (a `}` also closes the `(` and
+    // `[` left open inside its `{`).
+    let mut open = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    while !at(Eof) {
+        let kind = cur();
+        if kind == LBrace || kind == LParen || kind == LBracket {
+            open.push(kind as i64);
+        } else if kind == RBrace || kind == RParen || kind == RBracket {
+            if kind == RBrace {
+                while unsafe { open.count > 0 && open.data[open.count - 1] != LBrace as i64 } {
+                    open.count -= 1;
+                }
+            }
+            if open.count == 0 {
+                if kind == RBrace {
+                    return;
+                }
+                // (a stray `)` or `]` is part of the statement that failed)
+                advance();
+                continue;
+            }
+            open.count -= 1;
+            let depth = open.count;
+            if depth == 0 && kind == RBrace && P > start {
+                // A statement ending with a block (`if`, `while`, ...),
+                // unless an `else` follows.
+                advance();
+                if !at(Else) {
+                    return;
+                }
+                continue;
+            }
+        } else if kind == Semi && open.count == 0 {
+            advance();
+            return;
+        }
+        advance();
+    }
+}
+
+// ---- Fragments ----
+
+// The expression (`stmts`: the statements, in a Block) of the tokens
+// from `first` to the next Eof (0.11: the patterns of `tachyonc
+// rewrite`, parsed after the program).
+pub fn parse_fragment(first: i64, stmts: bool) -> i64 {
+    unsafe {
+        P = first;
+        NO_STRUCT = false;
+        if !stmts {
+            let n = parse_expr();
+            if !at(Eof) {
+                syntax_error(c"expected the end of the expression");
+            }
+            return n;
+        }
+        let block = new_node(NodeKind::Block, cur_start(), 0);
+        let mark = list_begin();
+        while !at(Eof) {
+            if eat(Semi) {
+                continue;
+            }
+            list_push(parse_stmt());
+        }
+        list_end(block, mark);
+        NODES[block].end = prev_end();
+        block
+    }
+}
