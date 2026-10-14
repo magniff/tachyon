@@ -1325,3 +1325,77 @@ output identical). Without the cache, `query refs` is a few ms slower
 than 0.12.0's (best of 15 again: 87 against 91 ms); with the cache warm,
 `check` and `query refs` answer in about 7 ms, ten times faster than
 reading the program.
+
+### 0.14
+
+aarch64-macos (Apple silicon, native; `bench/run.sh -p <0.13.0> -r 9`,
+the fastest of 9 runs in ms, run after the gate on a machine with other
+agents' work on it, load average falling from 10 to 4 during the run;
+"0.13.0" is the previous release at its default level; the geometric
+means are over cc -O2's, programs with a C version only):
+
+| program | 0.13.0 | 0.14 -O2 | cc -O2 |
+|---|---|---|---|
+| binarytrees | 157 | 160 | 158 |
+| collatz | 317 | 328 | 316 |
+| fannkuch | 126 | 120 | 145 |
+| fib | 14 | 14 | 14 |
+| interp | 43 | 44 | 43 |
+| iterchain | - | 420 | 199 |
+| iterloop | 408 | 407 | 186 |
+| json | 110 | 109 | 95 |
+| mandelbrot | 173 | 175 | 167 |
+| matmul | 19 | 19 | 46 |
+| nbody | 32 | 32 | 29 |
+| sieve | 67 | 66 | 73 |
+| sort | 65 | 60 | 57 |
+| stencil | 8 | 8 | 8 |
+| wordcount | 87 | 92 | 75 |
+| md5 | 38 | 39 | - |
+| geomean vs cc -O2, the 14 programs both compile | 1.017 | 1.016 | 1 |
+| geomean vs cc -O2, with iterchain (run.sh's) | | 1.067 | 1 |
+
+(-O0 and -O1 in the same run: geomean 7.998 and 1.643, with iterchain.)
+iterchain (0.14's iterators and closures; 0.13.0 cannot compile it) over
+iterloop (the same six kernels as loops by hand), alternating, fastest
+of 18 rounds: 420 against 407 ms, a ratio of **1.032** (the limit is
+1.05). Both are about 2.2 times cc -O2's (186 to 199 ms): the hand loops
+themselves, not the iterators, are what C does better there.
+
+The generated code changed (the optimizer's passes for iterator chains,
+std's introsort, std's unreachable functions dropped), so the
+differences can be real. An alternating rerun of the programs that
+moved (fastest of 15 each, load average 4) tells which: sort is faster,
+65 against 60 ms both times, std's introsort (bench/sort.c follows it,
+so cc's time moved too: 60 to 57); wordcount (95 against 93 ms),
+collatz (314 against 315), fannkuch (120 against 118), binarytrees (157
+against 160) and json (110 against 109) are the same within noise. The
+geomean over the programs both compile is the same; the one run.sh
+prints is higher because it counts iterchain, new, and at about 2.1
+times C, like its hand-written twin.
+
+Compile time (aarch64-macos, wall time, best of 7, the two compilers
+alternating on the same input: the 0.14 source, 98,000 lines in 221
+files; load average about 3.5; two runs, the first shown, the second
+the same within a few percent each way but for a busier `check`):
+
+| | 0.13.0 | 0.14 |
+|---|---|---|
+| the compiler to an object, -O0 | 226 ms | 231 ms |
+| the compiler to an object, -O2 | 1901 ms | 1950 ms |
+| `tachyonc check compiler/src/main.tach`, no cache | 79 ms | 81 ms |
+| `tachyonc query refs run_gvn`, no cache (`TACHYON_CACHE=off`) | 93 ms | 103 ms |
+| `tachyonc check compiler/src/main.tach`, cache warm | 6.7 ms | 6.9 ms |
+| `tachyonc query refs run_gvn`, cache warm | 7.0 ms | 7.3 ms |
+| a 7-line std program to an object, -O2 | 4.4 ms | 4.7 ms |
+
+0.14 is 2 to 3% slower to compile the compiler, in both runs: at -O2,
+`--time-passes` puts the difference in the scalar pipeline (176 against
+190 ms) and the loop passes (598 against 611 ms), where the passes for
+iterator chains run (copy elision, SROA to a fixpoint, threading on
+constant tags, exit merging); the front end is the same (check 45 ms in
+both). `query refs` without the cache is about 10% slower in both runs
+(93 against 103, 105 against 118 ms), not investigated; with the cache
+warm, every query is about 7 ms as in 0.13. The tiny std program
+compiles in about the time 0.13.0 takes (std's unreachable functions
+dropped before the optimizer).
