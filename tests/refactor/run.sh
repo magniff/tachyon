@@ -10,7 +10,7 @@
 #
 # Each tests/refactor/NAME.t is a transcript run in a fresh copy of the
 # program tests/refactor/NAME/ (a git repository of its own, so that
-# edits are journaled for undo):
+# edits are journaled for undo; plain*.t: a directory that is none):
 #   $ ARGS    runs `tachyonc ARGS` there (ARGS are evaluated by the shell:
 #             `< $T/inputs/x.tach` gives stdin from tests/refactor/inputs)
 #   % CMD     runs shell command CMD there (`cat geom.tach`, to see what
@@ -74,8 +74,13 @@ transcript() {
     rm -rf "$dir"
     mkdir -p "$dir"
     [ -d "$HERE/$name" ] && cp -R "$HERE/$name/." "$dir/"
-    (cd "$dir" && git init -q . && git -c user.name=t -c user.email=t@t add -A \
-        && git -c user.name=t -c user.email=t@t commit -q -m fixture) >/dev/null 2>&1
+    # (0.14: plain*.t run in a directory that is no git checkout, as a
+    # user's program may be: the journal is then .tachyonc/edits)
+    case "$name" in
+        plain*) ;;
+        *) (cd "$dir" && git init -q . && git -c user.name=t -c user.email=t@t add -A \
+            && git -c user.name=t -c user.email=t@t commit -q -m fixture) >/dev/null 2>&1 ;;
+    esac
     grep -E '^[$%] ' "$1" | while IFS= read -r line; do
         printf '%s\n' "$line"
         args=${line#? }

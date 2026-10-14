@@ -48,8 +48,9 @@ Output is one fact per line, fields separated by a TAB.
 | replace, add, remove an item | `tachyonc edit replace NAME < new.tach`, `edit insert --after NAME < item.tach`, `edit delete NAME` |
 | add statements inside an item | `tachyonc edit insert --in NAME --after 'ANCHOR' < text` |
 | see the result | `--show` on any edit; `tachyonc query diff` |
-| undo the last edit | `tachyonc undo` (in a git checkout: the journal is in `.git`) |
+| undo the last edit | `tachyonc undo` (the journal: in `.git`, else in `.tachyonc/` next to main.tach) |
 | rename anything, with every use | `tachyonc refactor rename PATH NEW` |
+| rename a local or parameter | `tachyonc refactor rename FILE:LINE:COL NEW` or `refactor rename FN::x NEW` (shadowing respected) |
 | a parameter, with every call | `tachyonc refactor signature FN --add 'x: i64 = 0'` (`--remove`, `--rename-param`, `--reorder`, `--type`) |
 | a field, with every literal | `tachyonc refactor field STRUCT --add 'g: i64 = 0'` |
 | a variant, with every match | `tachyonc refactor variant ENUM --add 'X(i64)' --arm 'EXPR'` |

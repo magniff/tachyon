@@ -199,7 +199,8 @@ query.no-file`.
 
 `query diff [ROOT]`: the last edit of the journal (what `undo` would take
 back, [refactor.md](refactor.md)): `# SUMMARY`, then its diff with no
-context lines. Nothing changes.
+context lines. Nothing changes. In a git checkout the journal is in its
+git directory; elsewhere (0.14) in `.tachyonc/edits/` next to the root.
 
 ### A file outside the compiler's source (0.12)
 

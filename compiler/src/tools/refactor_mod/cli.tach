@@ -2,11 +2,9 @@
 // `refactor split crate::refactor_mod --auto`, then renamed).
 
 use crate::base::{
-    FILES, FILE_COUNT, IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, intern,
-    streq,
+    FILES, IntVec, SYMS, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, intern, streq,
 };
 use crate::front::ast::{NODES, NodeKind};
-use crate::front::lexer::{TOKS, TOK_COUNT};
 use crate::front::modules::{MODULES, child_module, file_of_pos};
 use crate::middle::lower::ssa::HMap;
 use crate::tools::edit::apply::{apply_edit, finish_edit, prepare_edit, set_command};
@@ -20,12 +18,13 @@ use crate::tools::query::defs::{
 use crate::tools::query::diagnostics::{
     PROG, ROOT_GIVEN, TOOL, diag, program_errors, put_word, try_begin, try_end, write_diags,
 };
-use crate::tools::query::positions::token_at;
 use crate::tools::query::show::find_modules;
 use crate::tools::refactor_mod::{
-    emit_regions, load_refs, make_module, own_file, put_edit, relocate_module, rename_collides,
-    rename_refs, text_of, within,
+    emit_regions, load_refs, make_module, own_file, relocate_module, rename_collides, rename_refs,
+    within,
 };
+use crate::tools::refactor_mod::local::{def_at_column, local_rename};
+use crate::tools::refactor_mod::mentions::doc_mentions;
 use crate::tools::refactor_move::{run_move, run_split};
 use crate::tools::tidyimports::tidy_round;
 
@@ -416,12 +415,23 @@ fn run_inner(argc: i64, argv: **u8) -> i64 {
 // `refactor rename PATH NEW`: the definition and every reference to it
 // (its uses, imports and paths) get the new name; a module's file (or
 // directory) is renamed too. A trait impl's function is renamed with the
-// trait's: the trait's function and every impl's. Backquoted mentions in
-// comments (`name`, `a::name`, `name()`) are renamed when no other
-// definition has the old name.
+// trait's: the trait's function and every impl's. At FILE:LINE:COL (0.14):
+// the local there (local.tach), else the definition referred to or
+// defined there. Backquoted mentions in comments: mentions.tach.
 fn run_rename(name: [u8], new: [u8], root: *u8) -> i64 {
     unsafe {
-        let mut d = one_definition(c"rename", name, new);
+        let local = local_rename(name, new, root);
+        if local >= 0 {
+            return local;
+        }
+        load_refs();
+        let mut d = def_at_column(name);
+        if d == -2 {
+            return 1;
+        }
+        if d < 0 {
+            d = one_definition(c"rename", name, new);
+        }
         if d < 0 {
             return 1;
         }
@@ -451,7 +461,6 @@ fn run_rename(name: [u8], new: [u8], root: *u8) -> i64 {
             buf_str(e, c"nothing to change\n");
             return 0;
         }
-        load_refs();
         // The definitions renamed together: a trait's function and its impls'.
         let mut group = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         group.push(d);
@@ -490,114 +499,6 @@ fn finish_rename(d: i64, new: [u8], root: *u8) -> i64 {
         buf_bytes(what, new);
         finish(what, root)
     }
-}
-
-// The mentions of the old name in comments: `old`, `a::old`, `old()`
-// between backquotes; only when no definition outside group is named old.
-fn doc_mentions(group: *IntVec, old: i64, new: [u8]) {
-    unsafe {
-        for e in 0..DEF_COUNT {
-            if DEFS[e].name != old {
-                continue;
-            }
-            let mut mine = false;
-            for i in 0..(*group).count {
-                if (*group).data[i] == e {
-                    mine = true;
-                }
-            }
-            if !mine {
-                return;
-            }
-        }
-        let o = SYMS[old].text;
-        for f in 0..FILE_COUNT {
-            if FILES[f].path[0] == '<' {
-                continue;
-            }
-            // The gaps between tokens hold the comments.
-            let mut from = FILES[f].start;
-            let mut i = token_at(FILES[f].start);
-            loop {
-                let to = if i < TOK_COUNT && TOKS[i].start < FILES[f].end { TOKS[i].start }
-                    else { FILES[f].end };
-                mentions_in(from, to, o, new);
-                if to >= FILES[f].end {
-                    break;
-                }
-                from = TOKS[i].end;
-                i += 1;
-            }
-        }
-    }
-}
-
-// The mentions in the comments of SRC[from..to).
-fn mentions_in(from: i64, to: i64, old: [u8], new: [u8]) {
-    unsafe {
-        let mut p = from;
-        while p + 1 < to {
-            if SRC[p] != '/' || SRC[p + 1] != '/' {
-                p += 1;
-                continue;
-            }
-            // A comment: its backquoted spans.
-            let mut q = p + 2;
-            while q < to && SRC[q] != '\n' {
-                if SRC[q] != '`' {
-                    q += 1;
-                    continue;
-                }
-                let mut e = q + 1;
-                while e < to && SRC[e] != '`' && SRC[e] != '\n' {
-                    e += 1;
-                }
-                if e >= to || SRC[e] != '`' {
-                    break;
-                }
-                let at = mention(SRC[q + 1..e], old);
-                if at >= 0 {
-                    put_edit(q + 1 + at, q + 1 + at + old.len, text_of(new));
-                }
-                q = e + 1;
-            }
-            p = q;
-        }
-    }
-}
-
-// Where old is in s when s is `old`, `a::b::old` or `old()`, else -1.
-fn mention(s: [u8], old: [u8]) -> i64 {
-    let mut t = s;
-    if t.len > 2 && t[t.len - 2] == '(' && t[t.len - 1] == ')' {
-        t = t[0..t.len - 2];
-    }
-    if t.len < old.len || !bytes_eq(t[t.len - old.len..t.len], old) {
-        return -1;
-    }
-    let at = t.len - old.len;
-    if at == 0 {
-        return 0;
-    }
-    if at < 3 || t[at - 1] != ':' || t[at - 2] != ':' {
-        return -1;
-    }
-    // (the segments before are identifiers)
-    let mut i = 0;
-    while i < at - 2 {
-        let mut e = i;
-        while e < at - 2 && t[e] != ':' {
-            e += 1;
-        }
-        if unsafe {
-            !is_ident(t[i..e]) && !bytes_eq(t[i..e], c_slice(c"crate"))
-                && !bytes_eq(t[i..e], c_slice(c"super"))
-        } {
-            return -1;
-        }
-        i = e + 2;
-    }
-    at
 }
 
 // `refactor new-module crate::a::b [--file|--dir]`: makes the module's
