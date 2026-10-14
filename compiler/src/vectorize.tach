@@ -47,7 +47,8 @@ use crate::loops::{
 };
 use crate::scev::{counted_loop, iv_step};
 use crate::gvn::address_base;
-use crate::profile::is_cold_block;
+use crate::profile::{PROFILE_MAX, is_cold_block};
+use crate::target::X86;
 use crate::range::bits_of_value;
 use crate::ir::Op::{
     Add, And, Cmp, Const, Conv, Div, Load, Mul, Neg, Or, Phi, Shl, Store, Sub, VBin, VExt, VIns,
@@ -851,10 +852,153 @@ fn identity(op: Op) -> i64 {
     0
 }
 
+// ---- The cost model (0.11) ----
+//
+// After the analysis, whether the vector loop pays, and how many copies of
+// the body it runs (U): costs are rough cycles of throughput. A scalar
+// iteration costs S (its instructions, a check two, a float division
+// four); a vector iteration, U * VF scalar ones, costs U * B + 3 (the
+// vector body: an instruction one, a lane-by-lane multiplication
+// 3 * VF; the induction variable, its test and branch); the decision
+// before the loop, the reductions' setup and their combination after it
+// cost G. With T iterations expected (exact for constant bounds, else
+// the profile's average: the header's count over the entries'), the
+// vector version costs G + (T / (U*VF)) * (U*B + 3) + (T % (U*VF)) * S
+// against T * S; U = 2 is tried for small bodies, then U = 1. Without an
+// expected T a vector iteration must only be cheaper than the scalar ones
+// it replaces, and U is 2 for small bodies, as in 0.10.
+
+// Whether integer multiplication of the loop's lanes is done lane by lane
+// (SSE2 has 16-bit lanes only; NEON lacks 64-bit lanes).
+fn lanewise_mul() -> bool {
+    unsafe {
+        let size = type_size(V_ELEM);
+        if is_float(V_ELEM) {
+            return false;
+        }
+        if X86 { size != 2 } else { size == 8 }
+    }
+}
+
+// v as x + c: returns x (0 for a constant) and adds c to *offset.
+fn const_base(v: i64, offset: *i64) -> i64 {
+    unsafe {
+        let mut x = ir_val(v);
+        for _ in 0..8 {
+            if is_const(x) {
+                *offset += INSTS[x].imm;
+                return 0;
+            }
+            if INSTS[x].op != Add || !is_const(ir_val(INSTS[x].b)) {
+                return x;
+            }
+            *offset += INSTS[ir_val(INSTS[x].b)].imm;
+            x = ir_val(INSTS[x].a);
+        }
+        x
+    }
+}
+
+// The expected number of iterations of loop l (analyzed) per entry, or -1.
+fn expected_trips(l: i64) -> i64 {
+    unsafe {
+        let h = loop_header(l);
+        let p = loop_preheader(l);
+        let start = ir_val(ir_arg(V_IV, pred_index(h, p)));
+        // (Constants, or one value plus two constants: an array's end.)
+        let mut off_n = 0;
+        let mut off_s = 0;
+        let n = const_base(V_N, &off_n);
+        let s = const_base(start, &off_s);
+        if n == s {
+            let t = off_n - off_s;
+            return if t > 0 { t } else { -1 };
+        }
+        let hc = BLOCKS[h].count;
+        if PROFILE_MAX <= 0 || hc < 0 {
+            return -1;
+        }
+        // The entries: the preheader's count, or the nearest one above it
+        // through single predecessors (blocks made after the profile was
+        // read have none).
+        let mut b = p;
+        for _ in 0..8 {
+            if BLOCKS[b].count > 0 {
+                return hc / BLOCKS[b].count;
+            }
+            if BLOCKS[b].count == 0 || BLOCKS[b].preds.count != 1 {
+                return -1;
+            }
+            b = BLOCKS[b].preds.data[0];
+        }
+        -1
+    }
+}
+
+// How many vector bodies an iteration of the vector loop of l (analyzed)
+// runs, 1 or 2; 0 when vectorizing does not pay.
+fn vector_unroll(l: i64) -> i64 {
+    unsafe {
+        let vf = V_VF;
+        let mut s = 2;
+        let mut body = 0;
+        for k in 0..V_CHAIN.count {
+            let mut v = BLOCKS[V_CHAIN.data[k]].first;
+            while v != 0 {
+                let op = INSTS[v].op;
+                let cls = class_of(v);
+                let div = op == Div;
+                if op != Phi {
+                    s += if cls == VC_SKIP { 2 } else if div { 4 } else { 1 };
+                }
+                if cls == VC_UNIFORM {
+                    body += 1;
+                } else if cls == VC_VECTOR && op != Phi {
+                    body += if op == Mul && lanewise_mul() { 3 * vf } else if div { 4 } else { 1 };
+                }
+                v = INSTS[v].next;
+            }
+        }
+        let nreds = V_REDS.count / 3;
+        let mut setup = 6 + 8 * (V_CHECKS.count / 3) + 10 * overlap_pairs();
+        for r in 0..nreds {
+            let raw = V_REDS.data[3 * r + 2];
+            let op = raw as Op;
+            setup += if op == Add || op == Sub { 4 } else { 2 + 2 * vf };
+        }
+        let small = V_SIZE <= VEC_UNROLL_SIZE;
+        let t = expected_trips(l);
+        if t < 0 {
+            let u = if small { 2 } else { 1 };
+            return if u * body + 3 < u * vf * s { u } else { 0 };
+        }
+        let scalar = t * s;
+        let mut best = 0;
+        let mut best_cost = scalar;
+        let mut u = if small { 2 } else { 1 };
+        while u >= 1 {
+            let w = u * vf;
+            if t >= w {
+                let cost = setup + nreds * (u - 1) + (t / w) * (u * body + 3) + (t % w) * s;
+                if cost < best_cost {
+                    best = u;
+                    best_cost = cost;
+                }
+            }
+            u -= 1;
+        }
+        best
+    }
+}
+
 fn vectorize_loop(fi: i64, l: i64) -> bool {
     unsafe {
         let mut e = 0;
         if !analyze(l, &e) {
+            return false;
+        }
+        let unroll = vector_unroll(l);
+        if unroll == 0 {
             return false;
         }
         IRF = fi;
@@ -883,8 +1027,6 @@ fn vectorize_loop(fi: i64, l: i64) -> bool {
         BLOCKS[c].preds.push(p);
         let n = V_N;
         let trips = append(c, Sub, TY_I64, n, start, 0);
-        // Small bodies run two vectors an iteration.
-        let unroll = if V_SIZE <= VEC_UNROLL_SIZE { 2 } else { 1 };
         let mut ok = cmp(c, Cond::Ge, TY_U64, trips, konst(c, unroll * vf, TY_I64));
         let last = append(c, Sub, TY_I64, n, konst(c, 1, TY_I64), 0);
         for k in 0..V_CHECKS.count / 3 {
@@ -1163,7 +1305,7 @@ pub fn vectorize_loops(fi: i64) -> bool {
 // Returns the lanes (0: not vectorizable).
 pub fn vectorizable_lanes(l: i64) -> i64 {
     let mut e = 0;
-    if VECTORIZE && analyze(l, &e) { V_VF } else { 0 }
+    if VECTORIZE && analyze(l, &e) && vector_unroll(l) > 0 { V_VF } else { 0 }
 }
 
 // ---- Outer loops (0.10) ----

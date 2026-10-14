@@ -484,7 +484,8 @@ The last release of the build-out.
 - broader bench/: done (binarytrees, fannkuch, json, mandelbrot, sort,
   wordcount, each with its C version; `bench/run.sh` prints the
   geometric mean of each column against cc -O2)
-- cost model for the loop vectorizer: to do
+- cost model for the loop vectorizer: done (expected trips from constant
+  bounds or the profile; optimizer.md, 0.11)
 - scalar unrolling with run-time trip counts: to do
 - SLP vectorizer: to do
 - the gaps against clang on the new benchmarks: to do

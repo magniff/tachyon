@@ -1082,3 +1082,33 @@ test runner's `PROFILE` directive compiles a case with
 the rare way of a branch out of the fall-through, a hot call inlined)
 and `opt_profile_stale.tach` (a checked-in profile, stale for one
 function).
+
+## 0.11: performance
+
+**The vectorizer's cost model** (`vector_unroll` in `vectorize.tach`).
+After the analysis, the loop is vectorized only when the vector version
+is expected to be cheaper, in rough cycles of throughput: a scalar
+iteration costs S (an instruction 1, a check 2, a float division 4), a
+vector iteration of U copies of the body U·B + 3 (B: an instruction 1, a
+multiplication done lane by lane 3·VF: SSE2 has only 16-bit lanes for
+it, NEON no 64-bit ones), and the decision before the loop, the
+reductions' first vectors and their combination G (6, 8 a check, 10 an
+overlap test, 4 a sum, 2 + 2·VF another reduction). The expected number
+of iterations T is exact when the bounds are constants or one value plus
+two constants (an array's end: `[0; 20]` has 20), else the profile's
+average (the header's count over the entries', from the preheader or the
+nearest block above it with a count). With T the vector version costs
+G + ⌊T / U·VF⌋·(U·B + 3) + (T mod U·VF)·S against T·S, for U = 2 (small
+bodies, as in 0.10) and U = 1; the cheaper wins, or the scalar loop
+stays. Without T, a vector iteration need only be cheaper than the scalar
+iterations it replaces. Unrolling asks the same question
+(`vectorizable_lanes`), so a loop the vectorizer turns down is unrolled
+as before.
+
+In 0.10, `[0; 20]` became a loop of two 16-byte stores an iteration,
+which never ran (20 < 32); it is now one vector store and four scalar
+ones. A loop the profile shows running two iterations an entry over
+`i32`s (four lanes) stays scalar (`tests/run/opt_vectorize_cost.tach`).
+bench/interp, which 0.10 measured 5% slower with the vectorizer, has no
+loop the vectorizer takes: its IR is the same with `--no-vectorize`, and
+the difference was noise.
