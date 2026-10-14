@@ -216,10 +216,21 @@ if [ -n "$COMPILER" ]; then
 fi
 C="$RUN/tachyonc"
 
+# The bootstrap caches: this checkout's, then the shared one (bootstrap.sh:
+# $TACHYON_BOOTSTRAP_CACHE, or the main checkout's in a linked worktree).
+BOOT_CACHES="$ROOT/target/bootstrap"
+if [ -n "${TACHYON_BOOTSTRAP_CACHE:-}" ]; then
+    BOOT_CACHES="$BOOT_CACHES $TACHYON_BOOTSTRAP_CACHE"
+else
+    common=$(cd "$ROOT" && git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+    [ -z "$common" ] || [ "$(dirname "$common")" = "$ROOT" ] \
+        || BOOT_CACHES="$BOOT_CACHES $(dirname "$common")/target/bootstrap"
+fi
+
 # The seed (the third oracle of fuzz-seed): given, or the bootstrap's.
 find_seed() {
     [ -n "$SEED_BIN" ] && { echo "$SEED_BIN"; return; }
-    for s in "$ROOT"/target/bootstrap/"$HOST"/seed-*/target/release/tachyon; do
+    for s in $(for b in $BOOT_CACHES; do echo "$b"/"$HOST"/seed-*/target/release/tachyon; done); do
         [ -x "$s" ] && { echo "$s"; return; }
     done
 }
@@ -229,8 +240,10 @@ find_seed() {
 find_previous() {
     fp=""
     for tag in $(sh "$ROOT/bootstrap/release-tags.sh"); do
-        for p in "$ROOT"/target/bootstrap/"$HOST"/"$tag"-*/tachyonc; do
-            [ -x "$p" ] && fp=$p
+        for b in $BOOT_CACHES; do
+            for p in "$b"/"$HOST"/"$tag"-*/tachyonc; do
+                [ -x "$p" ] && { fp=$p; break 2; }
+            done
         done
     done
     echo "$fp"

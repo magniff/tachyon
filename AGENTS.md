@@ -96,6 +96,10 @@ falls short, record it in one line:
 
 Check and test only what a change touches, and widen at milestones:
 
+- in a fresh git worktree, `bootstrap/bootstrap.sh --dev` builds
+  `target/tachyonc` in about 20 s: the releases come from the main
+  checkout's cache, only HEAD is built;
+
 - after an edit: `target/tachyonc check` (the front end, one line per
   error) and the cases it concerns, `tests/run.sh FILTER` (cases whose
   name contains FILTER; `-O 0` for another level);
