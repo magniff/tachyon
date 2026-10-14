@@ -68,7 +68,8 @@ use crate::tools::query::QUERY;
 use std::Option;
 
 // What other modules use of the parts.
-use crate::front::closures::CLOSURE_FNS;
+pub use body::check_block;
+use crate::front::closures::{CLOSURE_FNS, CLOSURE_STACK};
 use resolve::resolve_type;
 
 // What an identifier names.
@@ -89,10 +90,16 @@ static mut LOCAL_CAP: i64 = 0;
 // Locals in scope (innermost last), and where each scope starts in it.
 pub static mut ENV: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 static mut SCOPES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static mut LOOP_STACK: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut LOOP_STACK: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 // While checking a deferred statement (0.6): the LOOP_STACK depth at it
 // (loops below it cannot be left from it); -1 elsewhere.
-static mut DEFER_LOOP_BASE: i64 = -1;
+pub static mut DEFER_LOOP_BASE: i64 = -1;
+// While checking the body of a closure (0.14): the LOOP_STACK depth at it
+// (the loops below it are not its to leave); 0 elsewhere.
+pub static mut LOOP_BASE: i64 = 0;
+// The function whose body is being checked (FNS index; -1: none), for the
+// closures in it (0.14).
+pub static mut CUR_FN: i64 = -1;
 pub static mut RETURN_TYPE: i64 = 0;
 // In constant expressions no locals are visible.
 pub static mut CONST_CONTEXT: bool = false;
@@ -287,6 +294,7 @@ fn check_unchecked(program: i64) {
     unsafe {
         let mark = errors_mark();
         let queued = INST_QUEUE.count;
+        let closures = CLOSURE_FNS.count;
         CHECK_UNCHECKED = true;
         let fns = FN_COUNT;
         for i in 0..NODES[program].count {
@@ -335,6 +343,7 @@ fn check_unchecked(program: i64) {
         }
         CHECK_UNCHECKED = false;
         INST_QUEUE.count = queued;
+        CLOSURE_FNS.count = closures;
         errors_forget(mark);
     }
 }
@@ -344,7 +353,7 @@ fn check_unchecked(program: i64) {
 struct CheckState {
     env: i64, scopes: i64, loops: i64, module: i64, self_ty: i64, tp_base: i64, tp_count: i64,
     inst: i64, ret: i64, tscratch: i64, scratch: i64, const_context: bool,
-    defer_base: i64, unsafe_depth: i64, wrap: i64,
+    defer_base: i64, unsafe_depth: i64, wrap: i64, loop_base: i64, cur_fn: i64, closures: i64,
 }
 
 fn save_check_state() -> CheckState {
@@ -353,7 +362,7 @@ fn save_check_state() -> CheckState {
         self_ty: SELF_TYPE, tp_base: TP_BASE, tp_count: TP_NAMES.count, inst: CUR_INST,
         ret: RETURN_TYPE, tscratch: TSCRATCH.count, scratch: SCRATCH.count,
         const_context: CONST_CONTEXT, defer_base: DEFER_LOOP_BASE, unsafe_depth: UNSAFE_DEPTH,
-        wrap: WRAP_NODE,
+        wrap: WRAP_NODE, loop_base: LOOP_BASE, cur_fn: CUR_FN, closures: CLOSURE_STACK.count,
     }
 }
 
@@ -374,6 +383,9 @@ fn restore_check_state(s: CheckState) {
     CONST_CONTEXT = s.const_context;
     UNSAFE_DEPTH = s.unsafe_depth;
     WRAP_NODE = s.wrap;
+    LOOP_BASE = s.loop_base;
+    CUR_FN = s.cur_fn;
+    CLOSURE_STACK.count = s.closures;
     OR_MODE = false;
     UNIFY_SELF = 0;
 }
