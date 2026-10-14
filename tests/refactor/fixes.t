@@ -46,6 +46,16 @@ $ fix --only pub,unsafe --dry-run
 @@ -19 +19 @@
 -fn hidden() -> i64 {
 +pub fn hidden() -> i64 {
+## One file's fixes.
+$ fix --only unused --in shapes.tach --dry-run
+--- a/shapes.tach
++++ b/shapes.tach
+@@ -3,2 +2,0 @@
+-    twice,
+-    cube,
+$ fix --in nowhere
+error fix.bad-in: no file or module 'nowhere' in the program
+[exit 1]
 $ fix
 fixed 2 missing imports, 3 unused imports, 1 pub, 1 unsafe block	3 files	+3 -5 lines
 $ check

@@ -1,4 +1,5 @@
-// `tachyonc fix [ROOT] [--only imports|unused|pub|unsafe] [--dry-run]`
+// `tachyonc fix [ROOT] [--only imports|unused|pub|unsafe] [--in FILE|MODULE]
+// [--dry-run]`
 // (0.11; docs/refactor.md): every fix the compiler can make by itself, in
 // one atomic edit (edit.tach), one summary line:
 //
@@ -28,8 +29,9 @@ use crate::modules::{
 };
 use crate::types::item_node_of;
 use crate::query::{
-    DEFS, DEF_COUNT, MOD_DEF, PROG, ROOT_GIVEN, TOOL, c_slice, diag, line_end, line_start, load_program,
-    program_errors, root_or_diag, sym_less, text_start, try_begin, try_end, write_diags,
+    DEFS, DEF_COUNT, IN_FILE, IN_MODULE, MOD_DEF, OPT_IN, PROG, ROOT_GIVEN, TOOL, c_slice, diag, line_end,
+    line_start, load_program, program_errors, ref_in, resolve_in, root_or_diag, sym_less, text_start,
+    try_begin, try_end, write_diags,
 };
 use crate::edit::{
     TARGET, TARGET_NAME, after_line, copy_rewritten, delete_lines, edit_count, edit_replace,
@@ -78,6 +80,24 @@ pub fn note_private(b: i64) {
         }
     }
     PRIVATE.push(b);
+}
+
+// Whether module m passes --in (its file or itself).
+fn module_in(m: i64) -> bool {
+    unsafe {
+        if OPT_IN == 0 as *u8 {
+            return true;
+        }
+        if IN_MODULE.data[m] != 0 {
+            return true;
+        }
+        for f in 0..crate::base::FILE_COUNT {
+            if FILES[f].module == m && IN_FILE.data[f] != 0 {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 // Whether module m's code is in a file of the program (not std's, the C
@@ -143,7 +163,7 @@ fn missing_use_edits() -> i64 {
             let m = MISSING.data[i];
             let p = MISSING.data[i + 1];
             i += 3;
-            if !user_module(m) {
+            if !user_module(m) || !module_in(m) {
                 continue;
             }
             // (once per module and path, with all its names)
@@ -315,7 +335,7 @@ fn unused_import_edits(only_report: *IntVec) -> i64 {
             if NODES[u].kind != NodeKind::Use || NODES[u].d == 2 || NODES[u].b == 1 || (NODES[u].p & ITEM_PUBLIC) != 0 {
                 continue;
             }
-            if !user_pos(NODES[u].start) || !user_module(module_of(u)) {
+            if !user_pos(NODES[u].start) || !user_module(module_of(u)) || !ref_in(NODES[u].start) {
                 continue;
             }
             let f = file_of_pos(NODES[u].start);
@@ -474,7 +494,7 @@ fn pub_edits() -> i64 {
                     }
                 }
             }
-            if node == 0 || (NODES[node].p & ITEM_PUBLIC) != 0 || !user_pos(NODES[node].start) {
+            if node == 0 || (NODES[node].p & ITEM_PUBLIC) != 0 || !user_pos(NODES[node].start) || !ref_in(NODES[node].start) {
                 continue;
             }
             let text = buf_new();
@@ -539,6 +559,11 @@ fn run_fix_inner(argc: i64, argv: **u8, alias: i64) -> i64 {
             if streq(a, c"--round") {
                 round = true;
                 i += 1;
+                continue;
+            }
+            if streq(a, c"--in") && i + 1 < argc {
+                OPT_IN = argv[i + 1];
+                i += 2;
                 continue;
             }
             if streq(a, c"--overlay") && i + 2 < argc {
@@ -608,6 +633,13 @@ fn run_fix_inner(argc: i64, argv: **u8, alias: i64) -> i64 {
             program_errors(c"error", root, true);
             return 1;
         }
+        if OPT_IN != 0 as *u8 && !resolve_in(c_slice(OPT_IN)) {
+            let d = diag(c"error", c"fix.bad-in");
+            buf_str(d, c"no file or module '");
+            buf_str(d, OPT_IN);
+            buf_str(d, c"' in the program\n");
+            return 1;
+        }
         // The fixes (an edit overlapping one made before is left for the
         // next run).
         let wild = if (only & F_IMPORTS) != 0 && LEGACY_IMPORTS { fix_imports_edits() } else { 0 };
@@ -673,6 +705,10 @@ fn more_round(root: *u8, only_arg: *u8, counts: *[i64; 5]) -> bool {
         if only_arg != 0 as *u8 {
             args.push(c"--only" as i64);
             args.push(only_arg as i64);
+        }
+        if OPT_IN != 0 as *u8 {
+            args.push(c"--in" as i64);
+            args.push(OPT_IN as i64);
         }
         if TARGET_NAME != 0 as *u8 {
             args.push(c"--target" as i64);

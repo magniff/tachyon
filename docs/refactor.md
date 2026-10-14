@@ -13,7 +13,7 @@ tachyonc edit insert --after|--before NAME [ROOT] < TEXT
 tachyonc edit delete NAME [ROOT]
 tachyonc undo [--force]                        the last edit, undone
 tachyonc check [ROOT]                          the front end's errors, one per line
-tachyonc fix [ROOT] [--only imports,unused,pub,unsafe]
+tachyonc fix [ROOT] [--only imports,unused,pub,unsafe] [--in FILE|MODULE]
 tachyonc same-output OLD [--corpus DIR|FILE]... [-j N] [--work DIR]
 tachyonc lint --max-lines N [ROOT]
 tachyonc query stats [MODULE|FILE] [--over N] [--all]
@@ -145,7 +145,9 @@ fixed 2 missing imports, 3 unused imports, 1 pub, 1 unsafe block→3 files→+3 
 | `pub` | `pub` on the items other modules use while they are private (`error ... is private`) |
 | `unsafe` | the unsafe operations outside unsafe code, wrapped in unsafe blocks (the outermost unit around each: a statement, `let p = unsafe { e };`, an expression) |
 
-By default all four. A fix can let the checker see more: the checker
+By default all four, everywhere; `--in FILE|MODULE` keeps the fixes of
+one file or module (matched like query's `--in`; none:
+`error fix.bad-in`). A fix can let the checker see more: the checker
 stops at the first unknown name of a statement, so its second appears
 only once the first is imported. So fix runs again on the edited program
 (`fix --round`, with the copies as overlays; up to four more rounds)
@@ -295,6 +297,7 @@ Exit 1 when a file is over, 0 when none is.
 | `undo.empty` | error | 1 | no edit to undo | |
 | `undo.changed` | error | 1 | a file changed since the edit | `undo --force` |
 | `fix.none` | note | 0 | nothing to fix | |
+| `fix.bad-in` | error | 1 | `--in` names no file or module of the program | |
 | `lint.max-lines` | error | 1 | a file over N lines | `query deps MODULE --max-lines N` |
 | `same-output.differs` | error | 1 | compilations differ | the `diff`, the compilation |
 | `same-output.no-compiler`, `same-output.no-corpus`, `same-output.work` | error | 2 | OLD cannot be run, no programs, no work directory | |
