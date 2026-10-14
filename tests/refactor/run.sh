@@ -203,4 +203,7 @@ ok=0
     && printf '%s\n' "$out" | grep -q '^error same-output.differs: [0-9]* of [0-9]* compilations differ' \
     && printf '%s\n' "$out" | grep -q '^try: diff .*/old/out.s .*/new/out.s$' && ok=1
 check same_output_differs "$ok" "$out"
+# (0.13) items moved to another module and back: every file as it was.
+out=$(sh "$HERE/roundtrip.sh" -c "$COMPILER" -n 40 2>&1)
+check roundtrip "$([ $? = 0 ] && echo 1)" "$out"
 exit $STATUS
