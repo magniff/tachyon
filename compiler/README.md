@@ -53,105 +53,46 @@ reports up to 50 errors.
 The root, `main.tach`, is the driver: the command line, host detection,
 and the `mod` items of six folders, one per phase (0.12; before, every
 module was a file of `compiler/src`), each a module whose `mod.tach`
-declares its files:
+declares its files. A file of more than about 1,000 lines became a
+folder of its own, by concern (0.12: `tachyonc lint --max-lines 1000` is
+clean). Each folder's README lists its modules, in pipeline order where
+there is one:
 
 ```
 compiler/src/
   main.tach    the driver
-  base/        the C library, arrays, buffers, symbols, files, errors, timers
-  front/       tokens, C imports and headers, std, the AST, modules, types, the checker
-  middle/      the IR (-O1, -O2), lowering to SSA, the optimizer's passes
+  base/        the C library, arrays, buffers, symbols, files, diagnostics, the target, timers
+  front/       tokens, C imports and headers, std, the AST and parser, modules, types, the checker
+  middle/      the IR (-O1, -O2), lowering to SSA, the optimizer's passes and their pipeline
   back/        instruction selection, register allocation, emission, machine code, objects
   gen0/        -O0's code generator and its target interface; the driver of every level
   tools/       query, edit, fix, rewrite, the refactorings, same-output
 ```
 
-Items are private unless another module uses them, and then `pub`; a
-module imports by name what it uses from the others, `use
-crate::front::ast::{NODES, child};` (and its main enum's variants, e.g.
-`use crate::middle::ir::Op::{Add, Sub};`; 0.8 has no `*` imports, and
-`tachyonc --fix-imports` wrote these lists from the `*` imports before).
-The modules mirror the numbered files of 0.1 to 0.5 (`00_base.tach` is
-`base/mod.tach`, `46_opt.tach` is `middle/opt.tach`, and so on). The
-folders were made with `tachyonc refactor move-module`, in one script, and
-proven to change no output with `tachyonc same-output`
-([docs/refactor-modules.md](../docs/refactor-modules.md)).
-
-| file | |
+| folder | its modules ([base](src/base/README.md), [front](src/front/README.md), [middle](src/middle/README.md), [back](src/back/README.md), [gen0](src/gen0/README.md), [tools](src/tools/README.md)) |
 |---|---|
-| `main.tach` | the root and the driver: the `mod` items of the folders, the command line, and host detection |
-| **base/** | |
-| `base/mod.tach` | C library declarations, growable arrays, byte buffers, the symbol interner and its growing tables, source files, error reporting and recovery (several errors at once) |
-| `base/timer.tach` | `--time-passes`: the CPU time of each phase |
-| **front/** | |
-| `front/lexer.tach` | source text to tokens; token for token the same as the seed's lexer |
-| `front/cpp.tach` | `import` (1/2): the C preprocessor, with the target C compiler's macros and include path |
-| `front/cimport.tach` | `import` (2/2): C declarations and layouts, written out as tachyon source |
-| `front/cheader.tach` | `--emit-header`: the C header of a program |
-| `front/stdsrc.tach` | the standard library's source, built in (generated from `compiler/std/std.tach` by `compiler/std/embed.sh`) |
-| `front/ast.tach` | the AST: an arena of uniform nodes (`NODES`), child lists in `LISTS` |
-| `front/parser.tach` | recursive descent for items and statements, a Pratt parser for expressions; recovery at statements and items |
-| `front/modules.tach` | modules: loading `mod` files, the module tree, item keys, scopes (`use`, `pub`, paths) |
-| `front/types.tach` | interned types, layouts, the tables of structs, functions, constants and statics |
-| `front/check.tach` | the bidirectional type checker; records a type on every expression node |
-| `front/consteval.tach` | compile-time evaluation: constants, array lengths, static initializers |
-| `front/patterns.tach` | patterns: their checking, refutability, `match`, and exhaustiveness and reachability by usefulness |
-| `front/generics.tach` | generics: instances of structs, enums and functions (copies of their templates), inference of type arguments, symbols |
-| `front/traits.tach` | traits (0.9): bounded generics, by monomorphization |
-| **middle/** | |
-| `middle/ir.tach` | the IR (`-O1` and up): instructions, blocks, functions, printing, verification |
-| `middle/lower.tach` | the checked AST to IR, building SSA form (Braun et al.) |
-| `middle/opt.tach` | CFG cleanups, dominators, dead code elimination, and the pass pipeline |
-| `middle/adce.tach` | aggressive dead code elimination over control dependence (post-dominators) |
-| `middle/fold.tach` | constant folding, SCCP, instruction combining |
-| `middle/gvn.tach` | global value numbering, alias analysis, load and store forwarding, dead stores |
-| `middle/egraph.tach` | rewrite rules by equality saturation, in GVN (0.9) |
-| `middle/sroa.tach` | scalar replacement of aggregates; constant local tables to read-only data |
-| `middle/inline.tach` | inlining over the call graph's components |
-| `middle/ipo.tach` | interprocedural analyses: function attributes over the call graph (0.6) |
-| `middle/licm.tach` | natural loops and loop-invariant code motion |
-| `middle/loops.tach` | the loop forest, canonical loops, LCSSA, the SSA updater, cloning, loop rotation |
-| `middle/lsr.tach` | loop strength reduction (pointer induction variables), loop unswitching |
-| `middle/range.tach` | value ranges and facts: bounds-check elimination, comparison folding, jump threading, comparison chains to switches |
-| `middle/scev.tach` | induction variables, trip counts, exit values, dead loop deletion, unrolling |
-| `middle/tre.tach` | tail recursion elimination with accumulators |
-| `middle/promote.tach` | scalar promotion of memory locations in loops (0.6) |
-| `middle/vectorize.tach` | the loop vectorizer (0.10): innermost and outer loops, run-time guards, remainders; its cost model, and unrolling with run-time trip counts in its frame (0.11) |
-| `middle/slp.tach` | the SLP vectorizer (0.11): groups of stores to the lanes of a vector, their values packed |
-| `middle/profile.tach` | profiles (0.10): instrumentation, the runtime's source, reading a profile |
-| `middle/unsafecheck.tach` | `--check-unsafe` (0.10): unsafe code's raw-pointer accesses checked at run time |
-| **back/** | |
-| `back/isel.tach` | instruction selection: the optimized IR to machine operations |
-| `back/regalloc.tach` | liveness, linear-scan register allocation |
-| `back/layout.tach` | block layout: the order blocks are emitted in |
-| `back/emit.tach` | emission of the allocated IR: operands, parallel moves, calls, frames |
-| `back/abi.tach` | C's calling convention for aggregates (AArch64 and System V): classification into pieces, locations; shared with `-O0` |
-| `back/mc_arm64.tach` | AArch64 instructions on physical registers |
-| `back/mc_x86_64.tach` | x86-64 instructions on physical registers |
-| `back/objfile.tach` | the assembler: Mach-O and ELF objects from the assembly text, line tables from `.loc`s, compact unwind from CFI (0.11) |
-| `back/enc_arm64.tach`, `back/enc_x86.tach` | instruction encoding for the assembler |
-| `back/dwarf.tach` | `-g` (0.11): `.file`/`.loc` from source positions, the compile unit and its functions (.debug_info), CFI on Mach-O |
-| **gen0/** | |
-| `gen0/gen.tach` | the driver of code generation (every level), and the `-O0` code generator: walks the checked AST, in terms of the target interface |
-| `gen0/target.tach` | the target interface: targets, the machine model's virtual registers, object-format details (symbols, sections, labels), and dispatch to the instruction set |
-| `gen0/arm64.tach` | AArch64 for `-O0`: instructions, Apple's arm64 calling convention and AAPCS64's, Mach-O and ELF symbol syntax |
-| `gen0/x86_64.tach` | x86-64 for `-O0`: AT&T-syntax instructions and the System V calling convention |
-| **tools/** | |
-| `tools/query.tach` | `tachyonc query` (0.11): definitions, their source, resolved references and module items, from the front end (see [docs/query.md](../docs/query.md)) |
-| `tools/query_text.tach` | `query text`, `query show FILE`, a module's regions (0.12) |
-| `tools/plan.tach` | the planning queries (0.11): `query stats`, `deps`, `unused`, `impact`; `tachyonc lint` (see [docs/refactor.md](../docs/refactor.md)) |
-| `tools/proc.tach` | processes and files for the tools: running a program for its output, workers, renames, directories |
-| `tools/edit.tach` | the edit engine (0.11): byte-range replacements applied atomically (checked by the front end before they are written), diffs, the journal; `tachyonc edit`, `undo`, `check` |
-| `tools/patch.tach` | `edit patch`, `edit insert --in` (0.12): edits inside an item, by its text |
-| `tools/fix.tach` | `tachyonc fix` (0.11): missing and unused imports, `pub`, unsafe blocks, wildcard imports, as one edit |
-| `tools/fiximports.tach`, `tools/fixunsafe.tach` | `fix --only imports` (0.8's `--fix-imports`) and `fix --only unsafe` (0.9's `--fix-unsafe`) |
-| `tools/sameout.tach` | `tachyonc same-output` (0.11): this compiler's output against another's, on a corpus |
-| `tools/rewrite.tach` | `tachyonc rewrite` (0.11): typed structural search and replace on the nodes as parsed (see [docs/refactor-shape.md](../docs/refactor-shape.md)) |
-| `tools/refactor_shape.tach` | `tachyonc refactor signature`, `field`, `variant` (0.11): a definition's shape changed with every use |
-| `tools/refactor_mod/` | `refactor rename`, `new-module`, `move-module` (0.11; see [docs/refactor-modules.md](../docs/refactor-modules.md)) |
-| `tools/refactor_move/` | `refactor move` and `split` (0.11) |
-| `tools/script.tach` | `tachyonc refactor --script` (0.11): commands run in turn on each other's copies, checked once |
-| `tools/commands.tach` | the table of the commands that change a program (0.11), shared by the command line and scripts |
+| `base/` | `mod.tach` (C library, arrays, buffers, symbols, files), `diag.tach`, `target.tach`, `timer.tach` |
+| `front/` | `lexer.tach`, `cpp/`, `cimport/`, `cheader.tach`, `stdsrc.tach`, `ast.tach`, `parser/`, `modules/`, `types.tach`, `check/`, `consteval.tach`, `patterns/`, `generics/`, `traits.tach` |
+| `middle/` | `ir/`, `lower/`, `opt.tach` (the pipeline), `fold.tach`, `gvn.tach`, `egraph.tach`, `sroa.tach`, `adce.tach`, `inline.tach`, `ipo.tach`, `tre.tach`, `loops.tach`, `scev.tach`, `range/`, `vectorize/`, `slp.tach`, `lsr.tach`, `licm.tach`, `promote.tach`, `profile.tach`, `unsafecheck.tach` |
+| `back/` | `isel/`, `regalloc/`, `layout.tach`, `emit/`, `mc_arm64/`, `mc_x86_64/`, `abi.tach`, `objfile/`, `enc_arm64.tach`, `enc_x86.tach`, `dwarf.tach` |
+| `gen0/` | `gen/` (the driver and -O0's generator), `target.tach`, `arm64.tach`, `x86_64.tach` |
+| `tools/` | `query/`, `query_text.tach`, `plan/`, `proc.tach`, `edit/`, `patch/`, `fix.tach`, `fiximports.tach`, `fixunsafe.tach`, `tidyimports.tach`, `reexports.tach`, `sameout.tach`, `rewrite/`, `refactor_shape/`, `refactor_mod/`, `refactor_move/`, `script.tach`, `commands.tach` |
+
+Items are private unless another module uses them, and then `pub`; a
+module imports by name what it uses from the others, from the module
+that defines it: `use crate::front::ast::{NODES, child};` (and its main
+enum's variants, e.g. `use crate::middle::ir::Op::{Add, Sub};`; 0.8 has
+no `*` imports, and `tachyonc --fix-imports` wrote these lists from the
+`*` imports before). There are no re-exports (0.12: `tachyonc fix --only
+reexports` rewrote the imports that went through the `pub use` lines the
+splits had kept, then removed them), and the `use` lines are merged by
+path, sorted and wrapped at 100 columns (`fix --only tidy-imports`). The
+modules mirror the numbered files of 0.1 to 0.5 (`00_base.tach` is
+`base/mod.tach`, `46_opt.tach` is `middle/opt.tach`, and so on). The
+folders were made with `tachyonc refactor move-module`, in one script,
+the files split with `refactor split`, and both proven to change no
+output with `tachyonc same-output`
+([docs/refactor-modules.md](../docs/refactor-modules.md)).
 
 Two back ends share the front end. At `-O1` and `-O2` (the default) the
 checked AST is lowered to an SSA IR, optimized, register-allocated and
@@ -215,12 +156,13 @@ Not used yet: enums with fields, function pointer types, `#[repr]` types,
 std's `Vec`. Most data lives in global arrays indexed by id (`NODES[n]`,
 `INSTS[v]`, `TYPES[t]`), `pub static mut` in the module that owns them.
 
-0.5.0 reads `std` only when the files of the command line name it (fixed
-in 0.6), so `main.tach` names it (`use std::Option;`).
+0.5.0 read `std` only when the files of the command line named it (fixed
+in 0.6), so `main.tach` named it (`use std::Option;`, removed in 0.12 as
+unused: from 0.6 a prelude name loads std).
 
 Features new in 0.6 enter this source in 0.7.
 
-Error recovery uses `_setjmp`/`_longjmp` (see `err_end` in `base/mod.tach`): a
+Error recovery uses `_setjmp`/`_longjmp` (see `err_end` in `base/diag.tach`): a
 function that sets a recovery point calls the work and then more code,
 never the work as a tail call, so its frame is alive when the jump comes
 back.
