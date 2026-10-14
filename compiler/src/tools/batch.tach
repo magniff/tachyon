@@ -1,0 +1,221 @@
+// `tachyonc batch [FILE] [--root R] [--stop]` (0.15; docs/query.md):
+// several tool commands in one call. The commands of FILE (or stdin), one
+// per line as typed after `tachyonc` (query, edit, undo, check, fix, fmt,
+// refactor, rewrite, explain, guide, lint: what main's run_command runs;
+// quoted as in sh, `#` comments, `< PATH` or `<<WORD` for a command's
+// stdin, as refactor --script reads them) run in turn, each in a copy of
+// this process (fork): its output after a header line
+//
+//   ## $ tachyonc ARGS
+//
+// stdout and stderr together, in the order written, then `## exit N` when
+// N is not 0. A command sees what the commands before it wrote. A command
+// that fails does not end the batch (`--stop`: it does); the exit status
+// is the first command's that is not 0.
+//
+// Nothing is loaded here: each command reads the program as it would run
+// alone, from the tools' cache (query/cache) once the first command has
+// parsed it, about 10 ms a command. `--root R` is TACHYON_ROOT for every
+// command.
+
+use crate::base::{
+    IntVec, STDOUT, alloc_array, buf_byte, buf_int, buf_new, buf_slice, buf_str, buf_write_fd,
+    streq,
+};
+use crate::tools::commands::run_command;
+use crate::tools::proc::{
+    buf_cstr, fork_worker, read_file_if, read_stdin, remove_file, wait_any, worker_exit,
+    write_file_if,
+};
+use crate::tools::query::c_slice;
+use crate::tools::query::diagnostics::{PROG, TOOL, diag, put_cword, put_word, write_diags};
+use crate::tools::script::read_commands;
+
+extern "C" {
+    fn open(path: *u8, flags: i32) -> i32;
+    fn dup2(from: i32, to: i32) -> i32;
+    fn close(fd: i32) -> i32;
+    fn getenv(name: *u8) -> *u8;
+    fn getpid() -> i32;
+    fn setenv(name: *u8, value: *u8, overwrite: i32) -> i32;
+}
+
+pub fn run_batch(argc: i64, argv: **u8) -> i64 {
+    let status = batch_inner(argc, argv);
+    write_diags();
+    status
+}
+
+fn usage(message: *u8) -> i64 {
+    unsafe {
+        let d = diag(c"error", c"batch.usage");
+        buf_str(d, message);
+        buf_str(d, c"; usage: tachyonc batch [FILE] [--root R] [--stop], one command per line\n");
+        2
+    }
+}
+
+fn batch_inner(argc: i64, argv: **u8) -> i64 {
+    unsafe {
+        PROG = argv[0];
+        TOOL = c"batch";
+        let mut root = 0 as *u8;
+        let mut file = 0 as *u8;
+        let mut stop = false;
+        let mut i = 2;
+        while i < argc {
+            let a = argv[i];
+            if streq(a, c"--stop") {
+                stop = true;
+            } else if streq(a, c"--root") && i + 1 < argc {
+                root = argv[i + 1];
+                i += 1;
+            } else if a[0] == '-' && a[1] == '-' {
+                let d = diag(c"error", c"batch.usage");
+                buf_str(d, c"unknown option '");
+                buf_str(d, a);
+                buf_str(d, c"' (--root R, --stop)\n");
+                return 2;
+            } else if file == 0 as *u8 {
+                file = a;
+            } else {
+                return usage(c"one FILE of commands");
+            }
+            i += 1;
+        }
+        let text = buf_new();
+        if file != 0 as *u8 {
+            if !read_file_if(file, text) {
+                let d = diag(c"error", c"batch.usage");
+                buf_str(d, c"cannot read '");
+                buf_str(d, file);
+                buf_str(d, c"'\n");
+                return 2;
+            }
+        } else if !read_stdin(text) {
+            return usage(c"no commands: give a FILE or pipe them in");
+        }
+        let name = if file != 0 as *u8 { file } else { c"stdin" };
+        let mut steps = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut inputs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut bodies = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut numbers = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        if !read_commands(buf_slice(text), name, c"batch.format", &steps, &inputs, &bodies,
+            &numbers) {
+            return 2;
+        }
+        if steps.count == 0 {
+            let d = diag(c"note", c"batch.usage");
+            buf_str(d, c"no commands in ");
+            buf_str(d, name);
+            buf_byte(d, '\n');
+            return 0;
+        }
+        // (the text after `<<WORD`: in a file of its own while the command
+        // runs)
+        let tmp = buf_new();
+        let dir = getenv(c"TMPDIR");
+        buf_str(tmp, if dir != 0 as *u8 && dir[0] != 0 { dir } else { c"/tmp" });
+        buf_str(tmp, c"/tachyon-batch-");
+        buf_int(tmp, getpid() as i64);
+        buf_str(tmp, c".stdin~");
+        let stdin_path = buf_cstr(tmp);
+        let mut first = 0;
+        for k in 0..steps.count {
+            let w = steps.data[k] as *IntVec;
+            let head = buf_new();
+            buf_str(head, c"## $ tachyonc");
+            for x in 0..(*w).count {
+                put_cword(head, (*w).data[x] as *u8);
+            }
+            let mut input = inputs.data[k] as *u8;
+            if bodies.data[k] >= 0 {
+                buf_str(head, c" <<");
+                buf_str(head, input);
+                if !write_file_if(stdin_path, buf_slice(bodies.data[k])) {
+                    let d = diag(c"error", c"batch.usage");
+                    buf_str(d, c"cannot write '");
+                    buf_str(d, stdin_path);
+                    buf_str(d, c"'\n");
+                    return 2;
+                }
+                input = stdin_path;
+            } else if input != 0 as *u8 {
+                buf_str(head, c" <");
+                put_word(head, c_slice(input));
+            }
+            buf_byte(head, '\n');
+            buf_write_fd(head, STDOUT);
+            write_diags();
+            let status = run_one(w, input, root);
+            if bodies.data[k] >= 0 {
+                remove_file(stdin_path);
+            }
+            if status != 0 {
+                let tail = buf_new();
+                buf_str(tail, c"## exit ");
+                buf_int(tail, status);
+                buf_byte(tail, '\n');
+                buf_write_fd(tail, STDOUT);
+                if first == 0 {
+                    first = status;
+                }
+                if stop {
+                    break;
+                }
+            }
+        }
+        first
+    }
+}
+
+// Runs command `words` (stdin from file `input`, else none) in a copy of
+// this process, its stderr on its stdout: its exit status.
+fn run_one(words: *IntVec, input: *u8, root: *u8) -> i64 {
+    unsafe {
+        let pid = fork_worker();
+        if pid < 0 {
+            let d = diag(c"error", c"batch.usage");
+            buf_str(d, c"cannot start a command (fork failed)\n");
+            return 1;
+        }
+        if pid == 0 {
+            dup2(1, 2);
+            let fd = open(if input != 0 as *u8 { input } else { c"/dev/null" }, 0);
+            if fd < 0 {
+                let d = diag(c"error", c"batch.usage");
+                buf_str(d, c"cannot read '");
+                buf_str(d, input);
+                buf_str(d, c"'\n");
+                write_diags();
+                worker_exit(2);
+            }
+            dup2(fd, 0);
+            close(fd);
+            if root != 0 as *u8 {
+                setenv(c"TACHYON_ROOT", root, 1);
+            }
+            let n = (*words).count;
+            let args = alloc_array::<*u8>(n + 2);
+            args[0] = PROG;
+            for i in 0..n {
+                args[i + 1] = (*words).data[i] as *u8;
+            }
+            args[n + 1] = 0 as *u8;
+            let mut status = run_command(n + 1, args);
+            if status < 0 {
+                let d = diag(c"error", c"batch.usage");
+                buf_str(d, c"'");
+                buf_str(d, args[1]);
+                buf_str(d,
+                    c"' is not a command batch runs (query, edit, undo, check, fix, fmt, refactor, rewrite, explain, guide, lint)\n");
+                write_diags();
+                status = 2;
+            }
+            worker_exit(status);
+        }
+        let mut status = 0;
+        wait_any(&status);
+        status
+    }
+}

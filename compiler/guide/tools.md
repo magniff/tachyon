@@ -47,6 +47,12 @@ NAME is `f`, `module::f`, `Type::method`, `Enum::Variant`,
 `Struct.field`, `<Type as Trait>::f` or `FILE:LINE`; several in one call.
 Output is one fact per line, fields separated by a TAB.
 
+Several commands in one call: `tachyonc batch < cmds.txt`, one command
+per line as typed after `tachyonc` (`<<END` ... `END` gives one its
+stdin); each output follows a line `## $ tachyonc ARGS`. Chain what you
+would run in turn: `query items` then `query show`, `show` then `refs`,
+an edit then `check`.
+
 ## Changing
 
 | to | run |

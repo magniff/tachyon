@@ -48,6 +48,7 @@ sed, head, cat or awk ([docs/query.md](docs/query.md)):
 | make a module; move one (file, folder, paths) | `target/tachyonc refactor new-module crate::a::b`, `refactor move-module crate::a crate::x::a` |
 | split a module into files | `target/tachyonc refactor split MODULE --plan` (then `--auto`, or `--into M --items a,b`; `--names a,b`; `--reexport` leaves code outside as it is; `--header TEXT`) |
 | several changes, checked once, all or nothing | `target/tachyonc refactor --script steps.txt` (one command per line; `<<END` ... `END` gives one its stdin) |
+| several queries and edits in one call, outputs under `## $ tachyonc ARGS` lines | `target/tachyonc batch < cmds.txt` (one command per line; `--stop` at the first failure) |
 | the errors, one per line (front end only) | `target/tachyonc check` |
 | missing/unused imports, `pub`, `unsafe` blocks | `target/tachyonc fix` (`--only imports,unused,pub,unsafe`, `--in FILE\|MODULE`, `--dry-run`) |
 | imports through re-exports, then the re-exports; merged, sorted, wrapped `use` lines | `target/tachyonc fix --only reexports,tidy-imports` (`// api:` above a `pub use` keeps it) |
