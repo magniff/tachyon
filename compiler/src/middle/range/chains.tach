@@ -1,0 +1,192 @@
+// Comparison chains turned into switches: a run of blocks each testing the
+// same value for equality with a constant (what a chain of `if x == k`,
+// `else if x == k2` leaves) becomes one switch on the value.
+
+use crate::base::{IntVec, free};
+use crate::front::types::is_integer;
+use crate::middle::fold::is_const;
+use crate::middle::ir::{BLOCKS, INSTS, IRFUNCS, Op, Term, ir_val};
+use crate::middle::ir::Cond::{Eq, Ne};
+use crate::middle::ir::cfg::{ir_switch_no_preds, pred_index};
+use crate::middle::lower::SSA_STACK;
+use crate::middle::opt::{compute_dominators, remove_pred_at, remove_unreachable};
+use crate::middle::range::thread::{compute_exports, used_outside_block};
+
+const CHAIN_MIN_CASES: i64 = 4;
+
+// The value block b tests for equality with a constant (its branch's
+// condition `x == k` or `x != k`): x, with *k and *equal (the successor
+// taken when equal) and *other (taken otherwise); 0 when it is not such a
+// test.
+fn equality_test(b: i64, k: *i64, equal: *i64, other: *i64) -> i64 {
+    unsafe {
+        if BLOCKS[b].term != Term::Branch || BLOCKS[b].s0 == BLOCKS[b].s1 {
+            return 0;
+        }
+        let c = ir_val(BLOCKS[b].cond);
+        if INSTS[c].op != Op::Cmp || !is_integer(INSTS[c].imm2) {
+            return 0;
+        }
+        let cond = INSTS[c].cond;
+        if cond != Eq && cond != Ne {
+            return 0;
+        }
+        let mut x = ir_val(INSTS[c].a);
+        let mut kv = ir_val(INSTS[c].b);
+        if is_const(x) {
+            let t = x;
+            x = kv;
+            kv = t;
+        }
+        if !is_const(kv) || is_const(x) {
+            return 0;
+        }
+        *k = INSTS[kv].imm;
+        if cond == Eq {
+            *equal = BLOCKS[b].s0;
+            *other = BLOCKS[b].s1;
+        } else {
+            *equal = BLOCKS[b].s1;
+            *other = BLOCKS[b].s0;
+        }
+        x
+    }
+}
+
+// Whether block b holds only constants and the comparison of its branch,
+// none used elsewhere.
+fn only_test(fi: i64, b: i64) -> bool {
+    unsafe {
+        let c = ir_val(BLOCKS[b].cond);
+        let mut v = BLOCKS[b].first;
+        while v != 0 {
+            if v != c && INSTS[v].op != Op::Const {
+                return false;
+            }
+            v = INSTS[v].next;
+        }
+        !used_outside_block(fi, b)
+    }
+}
+
+pub fn chains_to_switches(fi: i64) -> bool {
+    let mut changed = false;
+    compute_dominators(fi);
+    compute_exports(fi);
+    unsafe {
+        for i in 0..IRFUNCS[fi].blocks.count {
+            let b = IRFUNCS[fi].blocks.data[i];
+            if BLOCKS[b].removed != 0 || BLOCKS[b].order < 0
+                || (BLOCKS[b].preds.count == 0 && b != IRFUNCS[fi].entry) {
+                continue;
+            }
+            let mut k = 0;
+            let mut eq = 0;
+            let mut ne = 0;
+            let x = equality_test(b, &k, &eq, &ne);
+            if x == 0 {
+                continue;
+            }
+            // The chain: b, then blocks reached when not equal, each with b's
+            // chain as its only predecessor, testing x against a constant.
+            let mut cases = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            let mut chain = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            cases.push(k);
+            cases.push(eq);
+            chain.push(b);
+            let mut tail = ne;
+            loop {
+                let mut k2 = 0;
+                let mut eq2 = 0;
+                let mut ne2 = 0;
+                if BLOCKS[tail].preds.count != 1 || tail == b || equality_test(tail, &k2, &eq2, &ne2) != x
+                    || !only_test(fi, tail) {
+                    break;
+                }
+                let mut dup = false;
+                for m in 0..cases.count / 2 {
+                    if cases.data[2 * m] == k2 {
+                        dup = true;
+                    }
+                }
+                if dup {
+                    break;
+                }
+                cases.push(k2);
+                cases.push(eq2);
+                chain.push(tail);
+                tail = ne2;
+            }
+            if cases.count / 2 >= CHAIN_MIN_CASES && chain_targets_ok(&cases, &chain, tail) {
+                make_chain_switch(b, x, &cases, &chain, tail);
+                changed = true;
+            }
+            free(cases.data as *u8);
+            free(chain.data as *u8);
+        }
+    }
+    if changed {
+        remove_unreachable(fi);
+    }
+    changed
+}
+
+// Whether the chain's targets can take the switch block as their
+// predecessor: a target reached by several edges of the chain must have no
+// phis; no target is a block of the chain.
+fn chain_targets_ok(cases: *IntVec, chain: *IntVec, default: i64) -> bool {
+    unsafe {
+        let n = (*cases).count / 2;
+        for i in 0..n + 1 {
+            let t = if i < n { (*cases).data[2 * i + 1] } else { default };
+            for m in 0..(*chain).count {
+                if (*chain).data[m] == t {
+                    return false;
+                }
+            }
+            let mut edges = 0;
+            for m in 0..n + 1 {
+                let u = if m < n { (*cases).data[2 * m + 1] } else { default };
+                if u == t {
+                    edges += 1;
+                }
+            }
+            let first = BLOCKS[t].first;
+            if edges > 1 && first != 0 && INSTS[first].op == Op::Phi {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+fn make_chain_switch(b: i64, x: i64, cases: *IntVec, chain: *IntVec, default: i64) {
+    unsafe {
+        let n = (*cases).count / 2;
+        // The targets lose the chain blocks as predecessors and get b once.
+        for i in 0..n + 1 {
+            let t = if i < n { (*cases).data[2 * i + 1] } else { default };
+            let from = if i < n { (*chain).data[i] } else { (*chain).data[(*chain).count - 1] };
+            let index = pred_index(t, from);
+            if index < 0 {
+                continue;
+            }
+            if pred_index(t, b) >= 0 && b != from {
+                remove_pred_at(t, index);
+            } else {
+                BLOCKS[t].preds.data[index] = b;
+            }
+        }
+        // The other chain blocks lose their predecessor (they become
+        // unreachable).
+        for m in 1..(*chain).count {
+            BLOCKS[(*chain).data[m]].preds.count = 0;
+        }
+        let mark = SSA_STACK.count;
+        for i in 0..n {
+            SSA_STACK.push((*cases).data[2 * i]);
+            SSA_STACK.push((*cases).data[2 * i + 1]);
+        }
+        ir_switch_no_preds(b, x, default, mark);
+    }
+}
