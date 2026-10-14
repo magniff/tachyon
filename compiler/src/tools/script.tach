@@ -280,99 +280,26 @@ fn script_inner(argc: i64, argv: **u8) -> i64 {
         let mut inputs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let mut bodies = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let mut numbers = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        let t = buf_slice(text);
-        let mut p = 0;
-        let mut line_no = 0;
-        while p < t.len {
-            let mut e = p;
-            while e < t.len && t[e] != '\n' {
-                e += 1;
-            }
-            line_no += 1;
-            let words = alloc_array::<IntVec>(1);
-            words[0] = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-            let ok = split_words(t[p..e], &words[0]);
-            p = e + 1;
-            let w = &words[0];
-            if !ok {
-                return line_error(file, line_no, c"a quote is not closed");
-            }
-            if (*w).count == 0 {
-                continue;
-            }
-            // (`< PATH`: stdin; 0.14: `<<WORD`, the lines after it up to
-            // a line WORD)
-            let cmd_line = line_no;
-            let mut input = 0 as *u8;
-            let mut body = -1;
-            let n = (*w).count;
-            let last = (*w).data[n - 1] as *u8;
-            let mut word = 0 as *u8;
-            if n >= 2 && streq((*w).data[n - 2] as *u8, c"<<") {
-                word = last;
-                (*w).count = n - 2;
-            } else if last[0] == '<' && last[1] == '<' && last[2] != 0 {
-                word = &last[2];
-                (*w).count = n - 1;
-            }
-            if word != 0 as *u8 {
-                body = buf_new();
-                let mut found = false;
-                while p < t.len && !found {
-                    let mut e2 = p;
-                    while e2 < t.len && t[e2] != '\n' {
-                        e2 += 1;
-                    }
-                    line_no += 1;
-                    let mut b = e2;
-                    while b > p && (t[b - 1] == ' ' || t[b - 1] == '\t' || t[b - 1] == '\r') {
-                        b -= 1;
-                    }
-                    if bytes_eq(t[p..b], c_slice(word)) {
-                        found = true;
-                    } else {
-                        buf_bytes(body, t[p..e2]);
-                        buf_byte(body, '\n');
-                    }
-                    p = e2 + 1;
-                }
-                if !found {
-                    let d = diag(c"error", c"refactor.script");
-                    buf_str(d, file);
-                    buf_byte(d, ':');
-                    buf_int(d, cmd_line);
-                    buf_str(d, c": no line '");
-                    buf_str(d, word);
-                    buf_str(d, c"' ends the text of <<");
-                    buf_str(d, word);
-                    buf_byte(d, '\n');
-                    return 2;
-                }
-            } else if n >= 2 && streq((*w).data[n - 2] as *u8, c"<") {
-                input = (*w).data[n - 1] as *u8;
-                (*w).count = n - 2;
-            } else if (*w).data[n - 1] as *u8 != 0 as *u8 && ((*w).data[n - 1] as *u8)[0] == '<' {
-                input = &((*w).data[n - 1] as *u8)[1];
-                (*w).count = n - 1;
-            }
+        if !read_commands(buf_slice(text), file, c"refactor.script", &steps, &inputs, &bodies,
+            &numbers) {
+            return 2;
+        }
+        for k in 0..steps.count {
+            let w = steps.data[k] as *IntVec;
             let first = (*w).data[0] as *u8;
             if !is_tool(first)
                 || ((*w).count > 1 && streq(first, c"refactor")
                     && streq((*w).data[1] as *u8, c"--script")) {
-                return line_error(file, cmd_line,
+                return line_error(file, numbers.data[k],
                     c"not a command a script runs (refactor, rewrite, edit, fix)");
             }
-            for k in 1..(*w).count {
-                if streq((*w).data[k] as *u8, c"--root")
-                    || streq((*w).data[k] as *u8, c"--target") {
-                    return line_error(file, cmd_line,
+            for x in 1..(*w).count {
+                if streq((*w).data[x] as *u8, c"--root")
+                    || streq((*w).data[x] as *u8, c"--target") {
+                    return line_error(file, numbers.data[k],
                         c"--root and --target are the script's, not a line's");
                 }
             }
-            steps.push(w as i64);
-            inputs.push(input as i64);
-            bodies.push(body);
-            numbers.push(cmd_line);
         }
         if steps.count == 0 {
             let d = diag(c"note", c"refactor.script");
@@ -472,7 +399,113 @@ fn script_inner(argc: i64, argv: **u8) -> i64 {
 
 fn line_error(file: *u8, line: i64, message: *u8) -> i64 {
     unsafe {
-        let d = diag(c"error", c"refactor.script");
+        format_error(c"refactor.script", file, line, message);
+    }
+    2
+}
+
+// The commands of text t (of FILE, for messages), one per line, as typed
+// after `tachyonc` (0.15: refactor --script's and batch's): per command
+// its words (an IntVec of C strings, as split_words splits them), its
+// stdin (`< PATH`: the path; `<<WORD`: WORD), the text after `<<WORD` (a
+// buffer, else -1) and its line. False after the diagnostic (`code`:
+// refactor.script, batch.format).
+pub fn read_commands(t: [u8], file: *u8, code: *u8, steps: *IntVec, inputs: *IntVec,
+    bodies: *IntVec, numbers: *IntVec) -> bool {
+    unsafe {
+        let mut p = 0;
+        let mut line_no = 0;
+        while p < t.len {
+            let mut e = p;
+            while e < t.len && t[e] != '\n' {
+                e += 1;
+            }
+            line_no += 1;
+            let words = alloc_array::<IntVec>(1);
+            words[0] = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            let ok = split_words(t[p..e], &words[0]);
+            p = e + 1;
+            let w = &words[0];
+            if !ok {
+                format_error(code, file, line_no, c"a quote is not closed");
+                return false;
+            }
+            if (*w).count == 0 {
+                continue;
+            }
+            // (`< PATH`: stdin; 0.14: `<<WORD`, the lines after it up to
+            // a line WORD)
+            let cmd_line = line_no;
+            let mut input = 0 as *u8;
+            let mut body = -1;
+            let n = (*w).count;
+            let last = (*w).data[n - 1] as *u8;
+            let mut word = 0 as *u8;
+            if n >= 2 && streq((*w).data[n - 2] as *u8, c"<<") {
+                word = last;
+                (*w).count = n - 2;
+            } else if last[0] == '<' && last[1] == '<' && last[2] != 0 {
+                word = &last[2];
+                (*w).count = n - 1;
+            }
+            if word != 0 as *u8 {
+                input = word;
+                body = buf_new();
+                let mut found = false;
+                while p < t.len && !found {
+                    let mut e2 = p;
+                    while e2 < t.len && t[e2] != '\n' {
+                        e2 += 1;
+                    }
+                    line_no += 1;
+                    let mut b = e2;
+                    while b > p && (t[b - 1] == ' ' || t[b - 1] == '\t' || t[b - 1] == '\r') {
+                        b -= 1;
+                    }
+                    if bytes_eq(t[p..b], c_slice(word)) {
+                        found = true;
+                    } else {
+                        buf_bytes(body, t[p..e2]);
+                        buf_byte(body, '\n');
+                    }
+                    p = e2 + 1;
+                }
+                if !found {
+                    let d = diag(c"error", code);
+                    buf_str(d, file);
+                    buf_byte(d, ':');
+                    buf_int(d, cmd_line);
+                    buf_str(d, c": no line '");
+                    buf_str(d, word);
+                    buf_str(d, c"' ends the text of <<");
+                    buf_str(d, word);
+                    buf_byte(d, '\n');
+                    return false;
+                }
+            } else if n >= 2 && streq((*w).data[n - 2] as *u8, c"<") {
+                input = (*w).data[n - 1] as *u8;
+                (*w).count = n - 2;
+            } else if (*w).data[n - 1] as *u8 != 0 as *u8 && ((*w).data[n - 1] as *u8)[0] == '<' {
+                input = &((*w).data[n - 1] as *u8)[1];
+                (*w).count = n - 1;
+            }
+            if (*w).count == 0 {
+                format_error(code, file, cmd_line, c"stdin is given, but no command");
+                return false;
+            }
+            steps.push(w as i64);
+            inputs.push(input as i64);
+            bodies.push(body);
+            numbers.push(cmd_line);
+        }
+        true
+    }
+}
+
+// `CODE: FILE:LINE: MESSAGE; nothing run`.
+pub fn format_error(code: *u8, file: *u8, line: i64, message: *u8) {
+    unsafe {
+        let d = diag(c"error", code);
         buf_str(d, file);
         buf_byte(d, ':');
         buf_int(d, line);
@@ -480,5 +513,4 @@ fn line_error(file: *u8, line: i64, message: *u8) -> i64 {
         buf_str(d, message);
         buf_str(d, c"; nothing run\n");
     }
-    2
 }
