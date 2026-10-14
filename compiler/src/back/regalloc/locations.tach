@@ -1,0 +1,218 @@
+// Where the allocation (regalloc/mod.tach) put each value: its location
+// at a position, the blocks that need the frame, and the moves that
+// reconcile locations inside blocks and on edges.
+
+use crate::back::emit::operands::{PM_LOC, PM_REMAT, pm_add};
+use crate::back::regalloc::{
+    BEND, BSTART, IVS, LIVE_IN, LIVE_WORDS, LOC_NONE, LOC_REMAT, ON_STACK, ORDER, RA_VALS, RV_FIRST,
+    RV_SLOT, SPLIT_MOVES, UNASSIGNED,
+};
+use crate::back::regalloc::intervals::{block_at, ra_start, trailing_zeros};
+use crate::back::regalloc::prepare::{live_set, tracked};
+use crate::back::regalloc::scan::{is_callee_saved_reg, value_start};
+use crate::base::die;
+use crate::front::types::max_i64;
+use crate::middle::ir::{BLOCKS, INSTS, Term, ir_arg, pred_index, succ_count};
+use crate::middle::ir::Op::Phi;
+
+// The interval of dense index t holding position pos.
+fn interval_at(t: i64, pos: i64) -> i64 {
+    unsafe {
+        let mut i = RV_FIRST[t];
+        while IVS[i].next >= 0 && ra_start(IVS[i].next) <= pos {
+            i = IVS[i].next;
+        }
+        i
+    }
+}
+
+// The location of dense index t at position pos.
+pub fn tloc(t: i64, pos: i64) -> i64 {
+    unsafe {
+        let r = IVS[interval_at(t, pos)].reg;
+        if r >= 0 {
+            return r;
+        }
+        if r == UNASSIGNED {
+            die(c"internal error: an interval without a location");
+        }
+        if INSTS[RA_VALS.data[t]].op.is_remat() {
+            return LOC_REMAT;
+        }
+        0 - (1 + RV_SLOT[t])
+    }
+}
+
+// The location of value v at position pos.
+pub fn vloc(v: i64, pos: i64) -> i64 {
+    let t = tracked(v);
+    if t < 0 {
+        return LOC_NONE;
+    }
+    tloc(t, pos)
+}
+
+// Whether value v (dense index t) is stored to its spill slot when it is
+// defined.
+pub fn stored_at_def(t: i64) -> bool {
+    unsafe { RV_SLOT[t] >= 0 }
+}
+
+// Shrink-wrapping (see emit.tach): marks in `need` (per layout index)
+// the blocks where some value is in a callee-saved register or on the
+// stack, or is stored to its spill slot, and the predecessors of a block
+// that starts with one there (their edge moves may write it).
+pub fn mark_frame_blocks(need: *i64) {
+    unsafe {
+        for t in 0..RA_VALS.count {
+            let v = RA_VALS.data[t];
+            let mut i = RV_FIRST[t];
+            if i < 0 {
+                continue;
+            }
+            if RV_SLOT[t] >= 0 {
+                need[block_at(value_start(t))] = 1;
+            }
+            while i >= 0 {
+                let r = IVS[i].reg;
+                if (r >= 0 && is_callee_saved_reg(r)) || (r == ON_STACK && !INSTS[v].op.is_remat()) {
+                    for j in 0..IVS[i].ranges.count / 2 {
+                        mark_frame_range(need, IVS[i].ranges.data[2 * j], IVS[i].ranges.data[2 * j + 1]);
+                    }
+                }
+                i = IVS[i].next;
+            }
+        }
+    }
+}
+
+fn mark_frame_range(need: *i64, from: i64, to: i64) {
+    unsafe {
+        let mut k = max_i64(block_at(from), 0);
+        while k < ORDER.count && BSTART.data[k] < to {
+            need[k] = 1;
+            if from <= BSTART.data[k] {
+                let b = ORDER.data[k];
+                for i in 0..BLOCKS[b].preds.count {
+                    let p = BLOCKS[b].preds.data[i];
+                    if BLOCKS[p].order >= 0 {
+                        need[BLOCKS[p].order] = 1;
+                    }
+                }
+            }
+            k += 1;
+        }
+    }
+}
+
+// ---- Moves ----
+//
+// The moves of the allocation, shared by the emitter (which emits them)
+// and the checker (which simulates them): each adds to PM (see 51_emit).
+
+// Value v (dense index t) goes from `from` to `to`, where it is live
+// across: a register or the stack. The stack needs no move (the value is
+// there since its definition, or is rematerialized).
+fn add_relocation(t: i64, from: i64, to: i64) {
+    unsafe {
+        if from == to || to < 0 || to == LOC_REMAT {
+            return;
+        }
+        let v = RA_VALS.data[t];
+        if from == LOC_REMAT {
+            pm_add(to, PM_REMAT, v, INSTS[v].ty, v, v);
+        } else {
+            pm_add(to, PM_LOC, from, INSTS[v].ty, v, v);
+        }
+    }
+}
+
+// The moves in the gap at q.
+pub fn plan_gap_moves(q: i64) {
+    unsafe {
+        let n = SPLIT_MOVES.count / 2;
+        let mut i = gap_index(q);
+        while i < n && SPLIT_MOVES.data[2 * i] == q {
+            let t = SPLIT_MOVES.data[2 * i + 1];
+            add_relocation(t, tloc(t, q - 1), tloc(t, q));
+            i += 1;
+        }
+    }
+}
+
+// The first entry of SPLIT_MOVES at gap q or later.
+pub fn gap_index(q: i64) -> i64 {
+    let mut lo = 0;
+    let mut hi = SPLIT_MOVES.count / 2;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if unsafe { SPLIT_MOVES.data[2 * mid] < q } {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+// The moves of the edge from b to s: the values live into s, and its phis.
+fn plan_edge_moves(b: i64, s: i64) {
+    unsafe {
+        let from_pos = BEND.data[BLOCKS[b].order] + 1;
+        let to_pos = BSTART.data[BLOCKS[s].order];
+        let live_in = live_set(LIVE_IN, BLOCKS[s].order);
+        for w in 0..LIVE_WORDS {
+            let mut bits = live_in[w];
+            while bits != 0 {
+                let bit = trailing_zeros(bits);
+                bits &= bits - 1;
+                let t = w * 64 + bit;
+                add_relocation(t, tloc(t, from_pos), tloc(t, to_pos));
+            }
+        }
+        let index = pred_index(s, b);
+        let mut phi = BLOCKS[s].first;
+        while phi != 0 && INSTS[phi].op == Phi {
+            let t = tracked(phi);
+            if t >= 0 {
+                let dst = tloc(t, to_pos);
+                let arg = ir_arg(phi, index);
+                let a = tracked(arg);
+                if INSTS[arg].op.is_remat() || a < 0 {
+                    pm_add(dst, PM_REMAT, arg, INSTS[phi].ty, arg, phi);
+                } else {
+                    let src = tloc(a, from_pos);
+                    if src == LOC_REMAT {
+                        pm_add(dst, PM_REMAT, arg, INSTS[phi].ty, arg, phi);
+                    } else {
+                        pm_add(dst, PM_LOC, src, INSTS[phi].ty, arg, phi);
+                    }
+                }
+            }
+            phi = INSTS[phi].next;
+        }
+    }
+}
+
+// The moves at the start of block b: those of its edge when its single
+// predecessor has other successors.
+pub fn plan_start_moves(b: i64) {
+    unsafe {
+        if BLOCKS[b].preds.count == 1 {
+            let p = BLOCKS[b].preds.data[0];
+            if succ_count(p) > 1 {
+                plan_edge_moves(p, b);
+            }
+        }
+    }
+}
+
+// The moves at the end of block b, after its last instruction: those of
+// its edge when it has a single successor.
+pub fn plan_end_moves(b: i64) {
+    unsafe {
+        if BLOCKS[b].term == Term::Jump {
+            plan_edge_moves(b, BLOCKS[b].s0);
+        }
+    }
+}

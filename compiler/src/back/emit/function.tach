@@ -1,0 +1,696 @@
+// A function's code around its blocks (emit/mod.tach): the frame layout,
+// callee-saved registers, the parameters' locations and the entry moves,
+// gen_ir_function, debug line locations, returns and the epilogue, and
+// shrink-wrapping.
+
+use crate::back::abi::{
+    ABI_PIECE_COUNT, ABI_PIECE_TY, AbiClass, abi_piece_locations, abi_stack_location, conv_classify,
+    conv_returns_through_pointer, fn_uses_c,
+};
+use crate::back::dwarf::{dbg_function_begin, dbg_function_end, dbg_loc};
+use crate::back::emit::{
+    EPILOGUE_LABEL, FRAME_OUT, FRAME_TOTAL, LABEL_BASE, SAVE_BASE,
+    SHORT_BRANCHES, SPILL_BASE,
+};
+use crate::back::emit::blocks::{emit_ir_block, find_trivial_jumps};
+use crate::back::emit::machine::{
+    LAST_MOV_END, LAST_STORE_END, arg_reg, conv_result_ptr_reg, m_jump, m_load, m_normalize,
+    m_store, reg_move_temp, reg_sp, spill_offset, t_arg_location, xl_from_c, xl_is_stack, xl_offset,
+};
+use crate::back::emit::operands::{PM_ADDR, PM_LOC, PM_STACK, pm_add, pm_resolve, result_done};
+use crate::back::emit::stats::{STATS, ST_FN, ST_FRAME, ST_FRAMES, ST_SAVES, st_function_done};
+use crate::back::layout::{EMIT, layout_emission};
+use crate::back::mc_arm64::{ma_frame_link, ma_frame_unlink};
+use crate::back::mc_x86_64::{mx_frame_link, mx_frame_unlink};
+use crate::back::regalloc::{
+    CALLEE_USED, LDEPTH, LOC_NONE, ORDER, SPILL_COUNT, SPILL_VECTORS, USES, VERIFY_REGALLOC,
+    allocate_registers,
+};
+use crate::back::regalloc::check::check_allocation;
+use crate::back::regalloc::intervals::RETURNS_TWICE;
+use crate::back::regalloc::locations::{mark_frame_blocks, tloc, vloc};
+use crate::back::regalloc::prepare::{is_emitted, tracked};
+use crate::base::{BUFS, IntVec, buf_bytes, buf_clear, buf_slice, die, free, memcmp, strlen};
+use crate::front::ast::NODES;
+use crate::front::types::{
+    FNS, TY_BOOL, TY_F64, TY_U64, TY_U8, align_to, fn_param, int_bits, is_compound, is_integer,
+    is_void, max_i64, scalar_type, type_align,
+};
+use crate::gen0::arm64::{a64_align_down, a64_epilogue, a64_frame_reserve};
+use crate::gen0::gen::{fn_is_global, fn_symbol_prefix};
+use crate::gen0::target::{
+    ASM, CODE, LABEL_COUNT, X86, arg_location, emit_function_start, emit_label, first_int_arg, ins,
+    new_label,
+};
+use crate::gen0::x86_64::{x64_epilogue, x64_frame_reserve, x64_imm};
+use crate::middle::ir::{
+    ARGTY, BLOCKS, INSTS, INST_LOC, IRF, IRFUNCS, SLOTS, Term, VARIADIC_PIECE, ir_operand,
+    ir_operand_count, succ, succ_count,
+};
+use crate::middle::ir::Op::{CallC, Param, Phi, Slot};
+use crate::back::emit::insts::{LAST_SELECT, LAST_SELECT_END};
+use crate::back::emit::calls::{USES_SLOTS, call_stack_size, callee_param, callee_param_count};
+use crate::back::mc_arm64::ops::ma_pair;
+
+// ---- Functions ----
+
+// Assigns the frame offsets (after register allocation).
+// Whether the function being emitted calls anything.
+static mut HAS_CALLS: bool = false;
+
+// The alignment of the frame (above 16: sp is realigned in the prologue,
+// for slots, and stack arguments, aligned above 16).
+static mut FRAME_ALIGN: i64 = 16;
+
+fn layout_frame(fi: i64) {
+    unsafe {
+        FRAME_OUT = 0;
+        FRAME_ALIGN = 16;
+        HAS_CALLS = false;
+        USES_SLOTS = false;
+        // Slots no instruction refers to any more (scalar replacement took
+        // them apart) get no room: offset -1.
+        for i in 0..IRFUNCS[fi].slots.count {
+            SLOTS[IRFUNCS[fi].slots.data[i]].offset = -1;
+        }
+        for i in 0..ORDER.count {
+            let mut v = BLOCKS[ORDER.data[i]].first;
+            while v != 0 {
+                if INSTS[v].op.is_call() && is_emitted(v) {
+                    HAS_CALLS = true;
+                }
+                if INSTS[v].op == Slot && USES[v] > 0 {
+                    SLOTS[INSTS[v].imm].offset = 0;
+                    USES_SLOTS = true;
+                }
+                if INSTS[v].op.is_call() {
+                    let size = call_stack_size(v);
+                    if size > FRAME_OUT {
+                        FRAME_OUT = size;
+                    }
+                    if INSTS[v].op != CallC {
+                        for k in 0..callee_param_count(v) {
+                            FRAME_ALIGN = max_i64(FRAME_ALIGN, type_align(callee_param(v, k)));
+                        }
+                    }
+                    // Aggregates passed to `...` (their first piece carries the
+                    // type, negated).
+                    for k in 0..INSTS[v].nargs {
+                        let declared = ARGTY.data[INSTS[v].args + k];
+                        if declared < 0 && declared != VARIADIC_PIECE {
+                            FRAME_ALIGN = max_i64(FRAME_ALIGN, type_align(0 - declared));
+                        }
+                    }
+                }
+                v = INSTS[v].next;
+            }
+        }
+        let mut offset = align_to(FRAME_OUT, if SPILL_VECTORS { 16 } else { 8 });
+        SPILL_BASE = offset;
+        offset += 8 * SPILL_COUNT;
+        SAVE_BASE = offset;
+        for r in 0..64 {
+            if CALLEE_USED[r] != 0 {
+                offset += 8;
+            }
+        }
+        if offset > 32760 {
+            die(c"internal error: too many spill slots");
+        }
+        for i in 0..IRFUNCS[fi].slots.count {
+            let s = IRFUNCS[fi].slots.data[i];
+            if SLOTS[s].offset < 0 {
+                continue;
+            }
+            offset = align_to(offset, SLOTS[s].align);
+            SLOTS[s].offset = offset;
+            offset += SLOTS[s].size;
+            FRAME_ALIGN = max_i64(FRAME_ALIGN, SLOTS[s].align);
+        }
+        FRAME_TOTAL = align_to(offset, 16);
+    }
+}
+
+// Saves (or restores) the callee-saved registers used: on AArch64 two at
+// a time (stp, ldp) when they are of one kind.
+fn save_callee_saved(restore: bool) {
+    let mut offset = SAVE_BASE;
+    let mut pending = -1;
+    for r in 0..64 {
+        if CALLEE_USED[r] == 0 {
+            continue;
+        }
+        if !X86 && pending >= 0 && (pending >= 32) == (r >= 32) && offset - 8 <= 504 {
+            ma_pair(restore, pending, r, offset - 8);
+            pending = -1;
+        } else {
+            if pending >= 0 {
+                save_one(restore, pending, offset - 8);
+            }
+            pending = r;
+        }
+        offset += 8;
+    }
+    if pending >= 0 {
+        save_one(restore, pending, offset - 8);
+    }
+}
+
+fn save_one(restore: bool, r: i64, offset: i64) {
+    let ty = if r >= 32 { TY_F64 } else { TY_U64 };
+    if restore {
+        m_load(ty, r, reg_sp(), offset);
+    } else {
+        m_store(ty, r, reg_sp(), offset);
+    }
+}
+
+// The location of each parameter of function `f` (by its convention): of
+// parameter i at locations[i], or of its pieces at pieces[4 * i + k] (see
+// abi.tach).
+pub fn param_locations(f: i64, locations: *i64, pieces: *i64) {
+    unsafe {
+        let c = fn_uses_c(f);
+        let ret = FNS[f].ret;
+        let first = if c { first_int_arg(ret) } else if conv_returns_through_pointer(false, ret) { 1 } else { 0 };
+        let mut state: [i64; 3] = [first, 0, 0];
+        for i in 0..FNS[f].param_count {
+            let ty = fn_param(f, i);
+            if is_void(ty) {
+                continue;
+            }
+            let kind = conv_classify(c, ty);
+            if !c {
+                if kind == AbiClass::Pieces {
+                    for k in 0..ABI_PIECE_COUNT {
+                        pieces[4 * i + k] = t_arg_location(ABI_PIECE_TY[k], &state as *i64);
+                    }
+                } else {
+                    locations[i] = t_arg_location(if kind == AbiClass::Ref { TY_U64 } else { scalar_type(ty) }, &state as *i64);
+                }
+                continue;
+            }
+            if kind == AbiClass::Pieces {
+                abi_piece_locations(ty, &state as *i64, &pieces[4 * i]);
+                for k in 0..ABI_PIECE_COUNT {
+                    pieces[4 * i + k] = xl_from_c(pieces[4 * i + k]);
+                }
+            } else if kind == AbiClass::Stack {
+                locations[i] = xl_from_c(abi_stack_location(ty, &state as *i64));
+            } else {
+                locations[i] = xl_from_c(arg_location(if kind == AbiClass::Ref { TY_U64 } else { scalar_type(ty) }, &state as *i64));
+            }
+        }
+    }
+}
+
+// Moves the parameters from where the caller put them to their locations.
+fn emit_entry_moves(fi: i64) {
+    unsafe {
+        let f = IRFUNCS[fi].f;
+        let mut locations: [i64; 64] = [0; 64];
+        let mut pieces: [i64; 256] = [0; 256];
+        if FNS[f].param_count > 64 {
+            die(c"too many parameters (at most 64 are supported)");
+        }
+        param_locations(f, &locations as *i64, &pieces as *i64);
+        let entry = IRFUNCS[fi].entry;
+        let mut v = BLOCKS[entry].first;
+        while v != 0 {
+            let loc = vloc(v, 0);
+            if INSTS[v].op == Param && loc != LOC_NONE {
+                let ty = INSTS[v].ty;
+                let index = INSTS[v].imm;
+                let piece = INSTS[v].imm2;
+                if index < 0 {
+                    pm_add(loc, PM_LOC, conv_result_ptr_reg(fn_uses_c(f)), TY_U64, 0, v);
+                } else {
+                    let location = if piece > 0 { pieces[4 * index + piece - 1] } else { locations[index] };
+                    // Stack arguments are 16 bytes above the frame pointer.
+                    if piece < 0 {
+                        pm_add(loc, PM_ADDR, 16 + xl_offset(location), TY_U64, 0, v);
+                    } else if xl_is_stack(location) {
+                        let param_ty = fn_param(f, index);
+                        let load_ty = if is_compound(param_ty) && piece == 0 { TY_U64 } else { ty };
+                        pm_add(loc, PM_STACK, 16 + xl_offset(location), load_ty, 0, v);
+                    } else {
+                        pm_add(loc, PM_LOC, arg_reg(location), ty, 0, v);
+                    }
+                }
+            }
+            v = INSTS[v].next;
+        }
+        pm_resolve();
+        // Narrow integers from C callers may carry garbage above their width;
+        // parameters that go to the stack are stored there.
+        v = BLOCKS[entry].first;
+        while v != 0 {
+            let ty = INSTS[v].ty;
+            let t = tracked(v);
+            if INSTS[v].op == Param && t >= 0 {
+                let narrow = INSTS[v].imm >= 0 && (ty == TY_BOOL || (is_integer(ty) && int_bits(ty) < 64));
+                let loc = tloc(t, 0);
+                if loc >= 0 {
+                    if narrow {
+                        m_normalize(loc, if ty == TY_BOOL { TY_U8 } else { ty });
+                    }
+                    result_done(v, loc);
+                } else if narrow {
+                    let r = reg_move_temp(false);
+                    m_load(TY_U64, r, reg_sp(), spill_offset(loc));
+                    m_normalize(r, if ty == TY_BOOL { TY_U8 } else { ty });
+                    m_store(TY_U64, r, reg_sp(), spill_offset(loc));
+                }
+            }
+            v = INSTS[v].next;
+        }
+    }
+}
+
+pub fn gen_ir_function(fi: i64) {
+    unsafe {
+        IRF = fi;
+        let f = IRFUNCS[fi].f;
+        allocate_registers(fi);
+        if VERIFY_REGALLOC {
+            check_allocation(fi);
+        }
+        layout_frame(fi);
+        shrink_wrap(fi);
+        SHORT_BRANCHES = function_size(fi) <= 800;
+        find_trivial_jumps();
+        layout_emission();
+        buf_clear(CODE);
+        // The peepholes' memory of what was just emitted belongs to the code of
+        // the function before (whose length the new one's may match).
+        LAST_MOV_END = -1;
+        LAST_STORE_END = -1;
+        LAST_SELECT = 0;
+        LAST_SELECT_END = -1;
+        LABEL_BASE = LABEL_COUNT + 1;
+        LABEL_COUNT += ORDER.count;
+        EPILOGUE_LABEL = new_label();
+        EPILOGUE_USED = false;
+        FELL_INTO_EPILOGUE = false;
+        HAS_FRAME = SAVE >= 0;
+        LAST_LOC = 0;
+        let item = IRFUNCS[fi].item;
+        dbg_function_begin(f, fn_symbol_prefix(f), if item > 0 { NODES[item].start } else { -1 });
+        ir_function_start(fn_symbol_prefix(f), FNS[f].name, fn_is_global(f), SAVE == 0);
+        CUR_IN_FRAME = SAVE == 0;
+        if SAVE == 0 {
+            emit_frame_setup();
+        }
+        emit_entry_moves(fi);
+        for j in 0..EMIT.count {
+            emit_ir_block(EMIT.data[j], j);
+        }
+        // The epilogue, when a block jumps to it or the last one falls into it
+        // (blocks in the frame's region only).
+        if EPILOGUE_USED || FELL_INTO_EPILOGUE {
+            CUR_IN_FRAME = true;
+            emit_label(EPILOGUE_LABEL);
+            emit_ir_epilogue();
+        }
+        if STATS > 0 {
+            if HAS_FRAME {
+                ST_FN[ST_FRAMES] = 1;
+                ST_FN[ST_FRAME] = FRAME_TOTAL + 16;
+            }
+            for r in 0..64 {
+                if CALLEE_USED[r] != 0 {
+                    ST_FN[ST_SAVES] += 1;
+                }
+            }
+            st_function_done(fi);
+        }
+        buf_bytes(ASM, buf_slice(CODE));
+        dbg_function_end();
+    }
+}
+
+// (-g) The source position (+ 1) of the last `.loc` written.
+static mut LAST_LOC: i64 = 0;
+
+// (-g) The `.loc` of instruction v, when it starts another statement. The
+// peepholes that look at what was just emitted see through it.
+pub fn emit_loc(v: i64) {
+    unsafe {
+        let loc = INST_LOC.data[v];
+        if loc == 0 || loc == LAST_LOC {
+            return;
+        }
+        LAST_LOC = loc;
+        let before = BUFS[CODE].len;
+        dbg_loc(CODE, loc - 1);
+        let after = BUFS[CODE].len;
+        if LAST_MOV_END == before {
+            LAST_MOV_END = after;
+        }
+        if LAST_STORE_END == before {
+            LAST_STORE_END = after;
+        }
+        if LAST_SELECT_END == before {
+            LAST_SELECT_END = after;
+        }
+    }
+}
+
+// Whether a jump to the epilogue was emitted.
+static mut EPILOGUE_USED: bool = false;
+
+// Whether the code emitted last returns, in the frame's region, by
+// falling into the epilogue.
+pub static mut FELL_INTO_EPILOGUE: bool = false;
+
+// Whether the function being emitted has a frame.
+static mut HAS_FRAME: bool = false;
+
+fn emit_ir_epilogue() {
+    unsafe {
+        if !CUR_IN_FRAME {
+            ins(c"ret");
+            return;
+        }
+        save_callee_saved(true);
+        if !HAS_FRAME {
+            ins(c"ret");
+        } else if X86 {
+            x64_epilogue();
+        } else {
+            a64_epilogue();
+        }
+    }
+}
+
+// A return from a block that is not the last: the epilogue itself when it
+// is short (at most 4 registers to restore), else a jump to it.
+pub fn emit_return() {
+    if !CUR_IN_FRAME {
+        unsafe { ins(c"ret"); }
+        return;
+    }
+    let mut saved = 0;
+    for r in 0..64 {
+        if CALLEE_USED[r] != 0 {
+            saved += 1;
+        }
+    }
+    if saved <= 4 {
+        emit_ir_epilogue();
+    } else {
+        EPILOGUE_USED = true;
+        m_jump(EPILOGUE_LABEL);
+    }
+}
+
+// The number of instructions of function fi.
+fn function_size(fi: i64) -> i64 {
+    unsafe {
+        let mut n = 0;
+        for i in 0..ORDER.count {
+            let mut v = BLOCKS[ORDER.data[i]].first;
+            while v != 0 {
+                n += 1;
+                v = INSTS[v].next;
+            }
+        }
+        n
+    }
+}
+
+// Whether function fi has parameters on the stack (read from the frame
+// pointer: the frame is then set up at its entry).
+fn has_stack_params(fi: i64) -> bool {
+    unsafe {
+        let f = IRFUNCS[fi].f;
+        let mut locations: [i64; 64] = [0; 64];
+        let mut pieces: [i64; 256] = [0; 256];
+        if FNS[f].param_count > 64 {
+            return true;
+        }
+        param_locations(f, &locations as *i64, &pieces as *i64);
+        let mut v = BLOCKS[IRFUNCS[fi].entry].first;
+        while v != 0 {
+            if INSTS[v].op == Param && INSTS[v].imm >= 0 {
+                let index = INSTS[v].imm;
+                let piece = INSTS[v].imm2;
+                let location = if piece > 0 { pieces[4 * index + piece - 1] } else { locations[index] };
+                if piece < 0 || xl_is_stack(location) {
+                    return true;
+                }
+            }
+            v = INSTS[v].next;
+        }
+        false
+    }
+}
+
+// ---- Shrink-wrapping ----
+//
+// The frame (the saved frame pointer and return address, the reserved
+// area, the saved callee-saved registers) is set up at the start of block
+// SAVE (a layout index): the nearest common dominator of the blocks that
+// need it (a call, a frame slot, a value in a callee-saved register or on
+// the stack, see mark_frame_blocks), moved up the dominator tree out of
+// loops. Its region is the blocks it dominates; a jump out of the region
+// (with critical edges split, only a block ending in a jump leaves it)
+// tears the frame down after the edge's moves, and the blocks outside run
+// without a frame: no path re-enters the region but through SAVE, and
+// SAVE is in no loop, so the frame is set up and torn down at most once.
+// Blocks outside return with a bare `ret`; a block outside that ends in a
+// call that does not return (a panic) links a frame of its own first
+// (x86-64 calls need an aligned stack). SAVE is 0 (the entry) when the frame is set up with the
+// function, -1 when it has none. Functions calling setjmp and the like,
+// realigning their frame or taking parameters on the stack keep theirs
+// at the entry.
+pub static mut SAVE: i64 = -1;
+
+// Per layout index: whether the block runs with the frame set up, and its
+// immediate dominator.
+pub static mut IN_FRAME: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+static mut SW_IDOM: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// Whether the block being emitted runs with the frame set up.
+pub static mut CUR_IN_FRAME: bool = true;
+
+// Whether block b ends in a call that does not return, passing nothing
+// on the stack (its frame can be its own).
+pub fn is_noreturn_call_block(b: i64) -> bool {
+    unsafe {
+        let v = BLOCKS[b].last;
+        BLOCKS[b].term == Term::Unreach && v != 0 && INSTS[v].op.is_call() && call_stack_size(v) == 0
+    }
+}
+
+fn sw_intersect(a: i64, b: i64) -> i64 {
+    unsafe {
+        let mut x = a;
+        let mut y = b;
+        while x != y {
+            while x > y {
+                x = SW_IDOM.data[x];
+            }
+            while y > x {
+                y = SW_IDOM.data[y];
+            }
+        }
+        x
+    }
+}
+
+// Whether layout index a dominates layout index x.
+fn sw_dominates(a: i64, x: i64) -> bool {
+    let mut y = x;
+    while y > a {
+        unsafe { y = SW_IDOM.data[y]; }
+    }
+    y == a
+}
+
+// Dominators over the layout (a reverse post-order): Cooper, Harvey and
+// Kennedy's iteration.
+fn sw_dominators() {
+    unsafe {
+        let n = ORDER.count;
+        SW_IDOM.count = 0;
+        for k in 0..n {
+            SW_IDOM.push(if k == 0 { 0 } else { -1 });
+        }
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for k in 1..n {
+                let b = ORDER.data[k];
+                let mut idom = -1;
+                for i in 0..BLOCKS[b].preds.count {
+                    let pk = BLOCKS[BLOCKS[b].preds.data[i]].order;
+                    if pk < 0 || SW_IDOM.data[pk] < 0 {
+                        continue;
+                    }
+                    idom = if idom < 0 { pk } else { sw_intersect(pk, idom) };
+                }
+                if idom != SW_IDOM.data[k] {
+                    SW_IDOM.data[k] = idom;
+                    changed = true;
+                }
+            }
+        }
+    }
+}
+
+// Whether the frame can be set up at layout index s: s is in no loop, no
+// block of its region leads back to it, and only jumps leave the region.
+fn sw_valid(s: i64) -> bool {
+    unsafe {
+        if s == 0 {
+            return true;
+        }
+        if LDEPTH.data[s] != 0 {
+            return false;
+        }
+        for k in s..ORDER.count {
+            if !sw_dominates(s, k) {
+                continue;
+            }
+            let b = ORDER.data[k];
+            for i in 0..succ_count(b) {
+                let sk = BLOCKS[succ(b, i)].order;
+                if sk == s || sk < 0 || (!sw_dominates(s, sk) && BLOCKS[b].term != Term::Jump) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
+// Tears the frame down (on a jump out of its region): restores the
+// callee-saved registers, sp, the frame pointer and the return address.
+pub fn emit_frame_teardown() {
+    save_callee_saved(true);
+    if X86 { mx_frame_unlink(); } else { ma_frame_unlink(); }
+}
+
+fn shrink_wrap(fi: i64) {
+    unsafe {
+        let n = ORDER.count;
+        let mut need = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for _ in 0..n {
+            need.push(0);
+        }
+        for k in 0..n {
+            let b = ORDER.data[k];
+            let mut v = BLOCKS[b].first;
+            while v != 0 {
+                let op = INSTS[v].op;
+                if op.is_call() && is_emitted(v) && !(v == BLOCKS[b].last && is_noreturn_call_block(b)) {
+                    need.data[k] = 1;
+                }
+                if op == Slot && is_emitted(v) {
+                    need.data[k] = 1;
+                }
+                for i in 0..ir_operand_count(v) {
+                    let u = ir_operand(v, i);
+                    if u != 0 && INSTS[u].op == Slot {
+                        need.data[k] = 1;
+                        if op == Phi {
+                            for j in 0..BLOCKS[b].preds.count {
+                                let pk = BLOCKS[BLOCKS[b].preds.data[j]].order;
+                                if pk >= 0 {
+                                    need.data[pk] = 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                v = INSTS[v].next;
+            }
+            let cond = BLOCKS[b].cond;
+            if cond != 0 && INSTS[cond].op == Slot {
+                need.data[k] = 1;
+            }
+        }
+        mark_frame_blocks(need.data);
+        let mut any = false;
+        for k in 0..n {
+            if need.data[k] != 0 {
+                any = true;
+            }
+        }
+        if RETURNS_TWICE || FRAME_ALIGN > 16 || has_stack_params(fi) || (FRAME_TOTAL > 0 && !any) {
+            need.data[0] = 1;
+            any = true;
+        }
+        IN_FRAME.count = 0;
+        for _ in 0..n {
+            IN_FRAME.push(0);
+        }
+        SAVE = -1;
+        if any {
+            sw_dominators();
+            let mut s = -1;
+            for k in 0..n {
+                if need.data[k] != 0 {
+                    s = if s < 0 { k } else { sw_intersect(s, k) };
+                }
+            }
+            while !sw_valid(s) {
+                s = SW_IDOM.data[s];
+            }
+            SAVE = s;
+            for k in 0..n {
+                if sw_dominates(s, k) {
+                    IN_FRAME.data[k] = 1;
+                }
+            }
+        }
+        free(need.data as *u8);
+    }
+}
+
+// Links a frame: saves the frame pointer and the return address.
+pub fn emit_frame_link() {
+    if X86 { mx_frame_link(); } else { ma_frame_link(); }
+}
+
+// Reserves the frame's area, realigns it, saves the callee-saved
+// registers.
+pub fn emit_frame_setup() {
+    unsafe {
+        if FRAME_TOTAL > 0 {
+            if X86 { x64_frame_reserve(FRAME_TOTAL); } else { a64_frame_reserve(FRAME_TOTAL); }
+            if FRAME_ALIGN > 16 {
+                // The frame is addressed from sp: aligned, its slots are (the
+                // epilogue restores sp from the frame pointer).
+                if X86 {
+                    x64_imm(c"andq", 0 - FRAME_ALIGN, c"%rsp");
+                } else {
+                    ins(c"mov x16, sp");
+                    a64_align_down(16, FRAME_ALIGN);
+                    ins(c"mov sp, x16");
+                }
+            }
+        }
+        save_callee_saved(false);
+    }
+}
+
+// The function's label (as the shared emit_function_start writes it), and
+// the saving of the frame pointer and return address when it has a frame.
+fn ir_function_start(prefix: *u8, name: i64, global: bool, frame: bool) {
+    unsafe {
+        emit_function_start(prefix, name, global);
+        if frame {
+            return;
+        }
+        let prologue = if X86 { c"    pushq %rbp\n    movq %rsp, %rbp\n" } else { c"    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n" };
+        let n = strlen(prologue) as i64;
+        let len = BUFS[ASM].len;
+        if len < n || memcmp(&BUFS[ASM].data[len - n], prologue, n as u64) != 0 {
+            die(c"internal error: unexpected function prologue");
+        }
+        BUFS[ASM].len = len - n;
+    }
+}

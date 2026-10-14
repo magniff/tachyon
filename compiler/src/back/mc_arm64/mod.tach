@@ -1,0 +1,411 @@
+// AArch64 instructions for the IR back end (emit/), on physical
+// registers: 0-30 are x0-x30, 31 is sp (as a base or an addition source),
+// 32 + n is d<n> (s<n> for f32).
+//
+// Use of the registers: x0-x15 (caller-saved; x0-x7 also carry arguments,
+// x8 the result pointer) and x19-x28 (callee-saved) are allocated; x16
+// holds the callee of indirect calls and is the parallel moves' temporary;
+// x17 breaks parallel move cycles and is the temporary for addresses and
+// constants here; x18 is reserved by the platform. d0-d29 are allocated
+// (d8-d15 callee-saved); d30 and d31 are the parallel moves' registers.
+//
+// Here: registers and memory operands, moves, constants, loads, stores,
+// addresses, the frame link and block copies. The operations are in
+// ops.tach, the vector instructions in vector.tach.
+
+pub mod ops;
+pub mod vector;
+
+use crate::base::BUFS;
+use crate::front::types::{
+    TY_F32, TY_F64, TY_I16, TY_I32, TY_I8, TY_U16, TY_U32, TY_U8, is_float, type_size, is_vector,
+};
+use crate::front::consteval::{f32_bits, f64_of_bits};
+use crate::gen0::target::{CODE, end_i, global_prefix, ins, o, oi, on};
+use crate::gen0::arm64::{
+    A64_GOTPAGE, A64_GOTPAGEOFF, A64_PAGE, A64_PAGEOFF, a64_load_imm, a64_str_sym, a64_sym,
+};
+use crate::back::emit::{MEM_INDEX, MEM_SCALE};
+use crate::back::mc_arm64::vector::ma_v;
+
+fn ma_r(r: i64) {
+    unsafe {
+        if r == 31 {
+            o(c"sp");
+        } else {
+            o(c"x");
+            oi(r);
+        }
+    }
+}
+
+fn ma_w(r: i64) {
+    unsafe { o(c"w"); }
+    oi(r);
+}
+
+// The float register r (32 + n) for a value of type ty (q<n> for a
+// vector).
+fn ma_f(r: i64, ty: i64) {
+    unsafe { o(if is_vector(ty) { c"q" } else if ty == TY_F32 { c"s" } else { c"d" }); }
+    oi(r - 32);
+}
+
+// "    <mnemonic> x<d>, x<a>, x<b>\n"
+fn ma_rrr(mnemonic: *u8, d: i64, a: i64, b: i64) {
+    unsafe {
+        o(c"    ");
+        o(mnemonic);
+        o(c" ");
+        ma_r(d);
+        o(c", ");
+        ma_r(a);
+        o(c", ");
+        ma_r(b);
+        on();
+    }
+}
+
+fn ma_rr(mnemonic: *u8, d: i64, a: i64) {
+    unsafe {
+        o(c"    ");
+        o(mnemonic);
+        o(c" ");
+        ma_r(d);
+        o(c", ");
+        ma_r(a);
+        on();
+    }
+}
+
+pub fn ma_mov(dst: i64, src: i64, ty: i64) {
+    unsafe {
+        if dst >= 32 && is_vector(ty) {
+            o(c"    mov ");
+            ma_v(dst, c"16b");
+            o(c", ");
+            ma_v(src, c"16b");
+            on();
+        } else if dst >= 32 {
+            o(c"    fmov ");
+            ma_f(dst, TY_F64);
+            o(c", ");
+            ma_f(src, TY_F64);
+            on();
+        } else {
+            ma_rr(c"mov", dst, src);
+        }
+    }
+}
+
+pub fn ma_load_imm(dst: i64, value: u64) {
+    unsafe {
+        let signed = value as i64;
+        // One instruction: movz, or movn for small negative values.
+        if (signed >= 0 && signed < 65536) || (signed < 0 && signed >= -65536) {
+            o(c"    mov ");
+            ma_r(dst);
+            o(c", #");
+            oi(signed);
+            on();
+            return;
+        }
+        a64_load_imm(dst, value);
+    }
+}
+
+pub fn ma_load_fimm(dst: i64, bits: i64, ty: i64) {
+    unsafe {
+        if bits == 0 {
+            o(c"    fmov ");
+            ma_f(dst, ty);
+            o(if ty == TY_F32 { c", wzr\n" } else { c", xzr\n" });
+            return;
+        }
+        if ty == TY_F32 {
+            a64_load_imm(17, f32_bits(f64_of_bits(bits)) as u64);
+            o(c"    fmov ");
+            ma_f(dst, ty);
+            o(c", w17\n");
+        } else {
+            a64_load_imm(17, bits as u64);
+            o(c"    fmov ");
+            ma_f(dst, ty);
+            o(c", x17\n");
+        }
+    }
+}
+
+// dst = base + offset.
+pub fn ma_lea(dst: i64, base: i64, offset: i64) {
+    unsafe {
+        if offset == 0 {
+            if dst != base {
+                ma_rr(c"mov", dst, base);
+            }
+            return;
+        }
+        if offset > 0 && offset < 4096 {
+            ma_rr(c"add", dst, base);
+            o_back_imm(offset);
+            return;
+        }
+        if offset < 0 && offset > -4096 {
+            ma_rr(c"sub", dst, base);
+            o_back_imm(0 - offset);
+            return;
+        }
+        a64_load_imm(17, offset as u64);
+        ma_rrr(c"add", dst, base, 17);
+    }
+}
+
+// Replaces the newline just written with ", #<value>\n".
+fn o_back_imm(value: i64) {
+    unsafe {
+        BUFS[CODE].len -= 1;
+        o(c", #");
+    }
+    oi(value);
+    on();
+}
+
+// "[x<base>, #offset]" when encodable as an unsigned scaled offset;
+// otherwise the address is computed into x17 first (call before starting
+// the instruction's line).
+fn ma_address(base: i64, offset: i64, size: i64) -> i64 {
+    if offset >= 0 && offset % size == 0 && offset / size < 4096 {
+        return offset;
+    }
+    ma_lea(17, base, offset);
+    -1
+}
+
+fn ma_mem_operand(base: i64, offset: i64) {
+    unsafe {
+        o(c"[");
+        if MEM_INDEX >= 0 {
+            // [base, index, lsl #s] (no offset: see isel.tach).
+            ma_r(base);
+            o(c", ");
+            ma_r(MEM_INDEX);
+            if MEM_SCALE != 0 {
+                o(c", lsl #");
+                oi(MEM_SCALE);
+            }
+            o(c"]");
+            return;
+        }
+        if offset < 0 {
+            o(c"x17]");
+            return;
+        }
+        ma_r(base);
+        if offset != 0 {
+            o(c", #");
+            oi(offset);
+        }
+        o(c"]");
+    }
+}
+
+pub fn ma_load(ty: i64, dst: i64, base: i64, offset: i64) {
+    unsafe {
+        let size = type_size(ty);
+        let at = if MEM_INDEX >= 0 { 0 } else { ma_address(base, offset, size) };
+        o(c"    ");
+        if is_float(ty) || is_vector(ty) {
+            o(c"ldr ");
+            ma_f(dst, ty);
+        } else if ty == TY_I8 {
+            o(c"ldrsb ");
+            ma_r(dst);
+        } else if size == 1 {
+            o(c"ldrb ");
+            ma_w(dst);
+        } else if ty == TY_I16 {
+            o(c"ldrsh ");
+            ma_r(dst);
+        } else if size == 2 {
+            o(c"ldrh ");
+            ma_w(dst);
+        } else if ty == TY_I32 {
+            o(c"ldrsw ");
+            ma_r(dst);
+        } else if size == 4 {
+            o(c"ldr ");
+            ma_w(dst);
+        } else {
+            o(c"ldr ");
+            ma_r(dst);
+        }
+        o(c", ");
+        ma_mem_operand(base, at);
+        on();
+    }
+}
+
+pub fn ma_store(ty: i64, src: i64, base: i64, offset: i64) {
+    unsafe {
+        let size = type_size(ty);
+        let at = if MEM_INDEX >= 0 { 0 } else { ma_address(base, offset, size) };
+        o(c"    ");
+        if is_float(ty) || is_vector(ty) {
+            o(c"str ");
+            ma_f(src, ty);
+        } else if size == 1 {
+            o(c"strb ");
+            ma_w(src);
+        } else if size == 2 {
+            o(c"strh ");
+            ma_w(src);
+        } else if size == 4 {
+            o(c"str ");
+            ma_w(src);
+        } else {
+            o(c"str ");
+            ma_r(src);
+        }
+        o(c", ");
+        ma_mem_operand(base, at);
+        on();
+    }
+}
+
+pub fn ma_symbol_addr(dst: i64, prefix: *u8, name: i64) {
+    unsafe {
+        o(c"    adrp ");
+        ma_r(dst);
+        o(c", ");
+        a64_sym(prefix, name, A64_PAGE);
+        o(c"\n    add ");
+        ma_r(dst);
+        o(c", ");
+        ma_r(dst);
+        o(c", ");
+        a64_sym(prefix, name, A64_PAGEOFF);
+        on();
+    }
+}
+
+pub fn ma_extern_addr(dst: i64, name: i64) {
+    unsafe {
+        o(c"    adrp ");
+        ma_r(dst);
+        o(c", ");
+        a64_sym(global_prefix(), name, A64_GOTPAGE);
+        o(c"\n    ldr ");
+        ma_r(dst);
+        o(c", [");
+        ma_r(dst);
+        o(c", ");
+        a64_sym(global_prefix(), name, A64_GOTPAGEOFF);
+        o(c"]\n");
+    }
+}
+
+pub fn ma_string_addr(dst: i64, id: i64) {
+    unsafe {
+        o(c"    adrp ");
+        ma_r(dst);
+        o(c", ");
+        a64_str_sym(id, A64_PAGE);
+        o(c"\n    add ");
+        ma_r(dst);
+        o(c", ");
+        ma_r(dst);
+        o(c", ");
+        a64_str_sym(id, A64_PAGEOFF);
+        on();
+    }
+}
+
+pub fn ma_normalize(r: i64, ty: i64) {
+    unsafe {
+        if ty == TY_I8 {
+            o(c"    sxtb ");
+            ma_r(r);
+            o(c", ");
+            ma_w(r);
+            on();
+        } else if ty == TY_U8 {
+            ma_rr(c"and", r, r);
+            o_back_imm(0xff);
+        } else if ty == TY_I16 {
+            o(c"    sxth ");
+            ma_r(r);
+            o(c", ");
+            ma_w(r);
+            on();
+        } else if ty == TY_U16 {
+            ma_rr(c"and", r, r);
+            o_back_imm(0xffff);
+        } else if ty == TY_I32 {
+            o(c"    sxtw ");
+            ma_r(r);
+            o(c", ");
+            ma_w(r);
+            on();
+        } else if ty == TY_U32 {
+            o(c"    mov ");
+            ma_w(r);
+            o(c", ");
+            ma_w(r);
+            on();
+        }
+    }
+}
+
+// Links a frame: saves the frame pointer and the return address, points
+// the frame pointer at them.
+pub fn ma_frame_link() {
+    unsafe {
+        ins(c"stp x29, x30, [sp, #-16]!");
+        ins(c"mov x29, sp");
+    }
+}
+
+// Unlinks it: sp from the frame pointer, which and the return address are
+// restored.
+pub fn ma_frame_unlink() {
+    unsafe {
+        ins(c"mov sp, x29");
+        ins(c"ldp x29, x30, [sp], #16");
+    }
+}
+
+pub fn ma_copy(dst: i64, src: i64, size: i64) {
+    unsafe {
+        let mut offset = 0;
+        while offset + 8 <= size {
+            ma_copy_chunk(c"ldr x17", c"str x17", dst, src, offset);
+            offset += 8;
+        }
+        if offset + 4 <= size {
+            ma_copy_chunk(c"ldr w17", c"str w17", dst, src, offset);
+            offset += 4;
+        }
+        if offset + 2 <= size {
+            ma_copy_chunk(c"ldrh w17", c"strh w17", dst, src, offset);
+            offset += 2;
+        }
+        if offset < size {
+            ma_copy_chunk(c"ldrb w17", c"strb w17", dst, src, offset);
+        }
+    }
+}
+
+fn ma_copy_chunk(load: *u8, store: *u8, dst: i64, src: i64, offset: i64) {
+    unsafe {
+        o(c"    ");
+        o(load);
+        o(c", [");
+        ma_r(src);
+        end_i(c", #", offset, c"]");
+        o(c"    ");
+        o(store);
+        o(c", [");
+        ma_r(dst);
+        end_i(c", #", offset, c"]");
+    }
+}
