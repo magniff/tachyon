@@ -1,0 +1,379 @@
+// Lowering `match`: the arms in order, each pattern tested by branches to
+// the next arm (as gen.tach), its bindings made; or, for a match with no
+// guards on literals, ranges or variants, one switch on the value.
+
+use crate::base::IntVec;
+use crate::front::ast::{NODES, child};
+use crate::front::ast::NodeKind::{PatBind, PatLit, PatOr, PatRange, PatTuple, PatVariant, PatWild};
+use crate::front::check::LOCALS;
+use crate::front::consteval::wrap_int;
+use crate::front::patterns::{binding_count, int_key, is_irrefutable};
+use crate::front::types::{
+    ENUMS, TYPES, TY_NEVER, VARIANTS, is_compound, is_enum, is_integer, is_void, scalar_type,
+    tuple_offset, type_elem, type_size, variant_field, variant_field_offset,
+};
+use crate::middle::ir::{
+    BLOCK_COUNT, CUR, Cond, Term, ir_cmp, ir_const, ir_load, ir_new_block, ir_offset, ir_slot_addr,
+    ir_store, ir_type,
+};
+use crate::middle::ir::cfg::{ir_switch, ir_terminate};
+use crate::middle::lower::{is_dead_block, lower_branch, lower_copy, lower_jump, new_slot_for};
+use crate::middle::lower::control::{join_new, join_read, join_write};
+use crate::middle::lower::expr::{lower_expr, lower_operand, need_value};
+use crate::middle::lower::ssa::{LOCAL_ADDR, PROMOTE, SSA_STACK, ir_seal, ssa_write};
+
+// ---- match ----
+
+// As gen_match (gen.tach): the arms in order, each pattern tested by
+// branches to the next arm.
+pub fn lower_match(n: i64) -> i64 {
+    unsafe {
+        let ty = NODES[n].ty;
+        let scrutinee = NODES[n].a;
+        let st = NODES[scrutinee].ty;
+        let has_value = !is_void(ty);
+        let mut result = 0;
+        if has_value {
+            result = join_new(ty);
+        }
+        let value = lower_operand(scrutinee);
+        if st == TY_NEVER {
+            return 0;
+        }
+        let join = ir_new_block();
+        if switch_cases(n, st) {
+            lower_match_switch(n, st, value, result, join);
+            ir_seal(join);
+            CUR = join;
+            if has_value {
+                return join_read(result, join);
+            }
+            return 0;
+        }
+        for i in 0..NODES[n].count {
+            let arm = child(n, i);
+            let fail = ir_new_block();
+            alloc_pattern_locals(NODES[arm].a);
+            lower_pattern_test(NODES[arm].a, st, value, fail);
+            if NODES[arm].b != 0 {
+                let guard = lower_operand(NODES[arm].b);
+                let body = ir_new_block();
+                lower_branch(guard, body, fail);
+                ir_seal(body);
+                CUR = body;
+            }
+            let body = NODES[arm].c;
+            let v = lower_expr(body);
+            if has_value && NODES[body].ty != TY_NEVER {
+                join_write(result, v, ty);
+            }
+            lower_jump(join);
+            ir_seal(fail);
+            CUR = fail;
+        }
+        if !is_dead_block(CUR) {
+            ir_terminate(CUR, Term::Unreach, 0, 0, 0);
+        }
+        ir_seal(join);
+        CUR = join;
+        if has_value {
+            return join_read(result, join);
+        }
+        0
+    }
+}
+
+// The storage of the locals a pattern binds that live in memory (once: the
+// alternatives of an or-pattern bind the same locals).
+fn alloc_pattern_locals(p: i64) {
+    unsafe {
+        let kind = NODES[p].kind;
+        if kind == PatBind {
+            let local = NODES[p].x;
+            let ty = LOCALS[local].ty;
+            if PROMOTE[local] == 0 && !is_void(ty) {
+                LOCAL_ADDR[local] = ir_slot_addr(new_slot_for(ty));
+            }
+            return;
+        }
+        if kind == PatTuple || kind == PatVariant || kind == PatOr {
+            for i in 0..NODES[p].count {
+                alloc_pattern_locals(child(p, i));
+            }
+        }
+    }
+}
+
+// Branches to `fail` unless `value` (of checker type ty; the address of a
+// compound value) matches pattern p; binds its variables.
+fn lower_pattern_test(p: i64, ty: i64, value: i64, fail: i64) {
+    unsafe {
+        let kind = NODES[p].kind;
+        if ty == TY_NEVER {
+            return;
+        }
+        match kind {
+            PatWild => return,
+            PatBind => {
+                let local = NODES[p].x;
+                if is_void(ty) {
+                    return;
+                }
+                if PROMOTE[local] != 0 {
+                    ssa_write(local, CUR, need_value(value, ty));
+                } else if is_compound(ty) {
+                    lower_copy(LOCAL_ADDR[local], value, type_size(ty));
+                } else {
+                    ir_store(ir_type(ty), LOCAL_ADDR[local], need_value(value, ty), 0);
+                }
+                return;
+            }
+            PatLit => {
+                let t = ir_type(ty);
+                test_or_fail(ir_cmp(Cond::Eq, t, value, ir_const(NODES[p].x, t)), fail);
+                return;
+            }
+            PatRange => {
+                let t = ir_type(ty);
+                test_or_fail(ir_cmp(Cond::Ge, t, value, ir_const(NODES[p].x, t)), fail);
+                test_or_fail(ir_cmp(Cond::Le, t, value, ir_const(NODES[p].y, t)), fail);
+                return;
+            }
+            PatOr => {
+                let ok = ir_new_block();
+                let last = NODES[p].count - 1;
+                for i in 0..last {
+                    let next = ir_new_block();
+                    lower_pattern_test(child(p, i), ty, value, next);
+                    lower_jump(ok);
+                    ir_seal(next);
+                    CUR = next;
+                }
+                lower_pattern_test(child(p, last), ty, value, fail);
+                lower_jump(ok);
+                ir_seal(ok);
+                CUR = ok;
+                return;
+            }
+            PatVariant => {
+                let v = NODES[p].x;
+                let tag = ENUMS[TYPES[ty].a].tag;
+                let tag_value = if is_compound(ty) { ir_load(tag, value, 0) } else { value };
+                test_or_fail(ir_cmp(Cond::Eq, tag, tag_value, ir_const(wrap_int(VARIANTS[v].discr, tag), tag)), fail);
+            }
+            _ => {}
+        }
+        for i in 0..NODES[p].count {
+            let sub = child(p, i);
+            if NODES[sub].kind == PatWild {
+                continue;
+            }
+            let mut elem_ty = 0;
+            let mut offset = 0;
+            if kind == PatVariant {
+                elem_ty = variant_field(NODES[p].x, i);
+                offset = variant_field_offset(NODES[p].x, i);
+            } else {
+                elem_ty = type_elem(ty, i);
+                offset = tuple_offset(ty, i);
+            }
+            let mut elem = 0;
+            if is_compound(elem_ty) {
+                elem = ir_offset(value, offset);
+            } else if !is_void(elem_ty) {
+                elem = ir_load(ir_type(elem_ty), value, offset);
+            }
+            lower_pattern_test(sub, elem_ty, elem, fail);
+        }
+    }
+}
+
+// ---- match as a switch ----
+
+// The cases of a match lowered to a switch: (value, arm index) pairs, and
+// the arm matching every other value (-1: none).
+static mut SW_CASES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+static mut SW_DEFAULT: i64 = -1;
+
+// Whether match n (on type st) is a switch: no guards; an integer (or
+// fieldless enum) scrutinee matched against literals, ranges and their
+// alternatives, or an enum matched by variant (whose fields only bind);
+// a wildcard or binding last. Collects SW_CASES and SW_DEFAULT.
+fn switch_cases(n: i64, st: i64) -> bool {
+    let integer = is_integer(scalar_type(st));
+    if !integer && !(is_enum(st) && is_compound(st)) {
+        return false;
+    }
+    SW_CASES.count = 0;
+    SW_DEFAULT = -1;
+    unsafe {
+        for i in 0..NODES[n].count {
+            let arm = child(n, i);
+            let p = NODES[arm].a;
+            if NODES[arm].b != 0 {
+                return false;
+            }
+            let kind = NODES[p].kind;
+            if kind == PatWild || kind == PatBind {
+                SW_DEFAULT = i;
+                break;
+            }
+            if !add_switch_values(p, i) {
+                return false;
+            }
+        }
+    }
+    SW_CASES.count >= 6 || (is_compound(st) && SW_CASES.count >= 4)
+}
+
+// Adds the values pattern p matches (for arm i, unless an earlier arm has
+// them); false when p is not a set of values.
+fn add_switch_values(p: i64, arm: i64) -> bool {
+    unsafe {
+        match NODES[p].kind {
+            PatLit => {
+                add_switch_value(NODES[p].x, arm);
+                true
+            }
+            PatRange => {
+                let ty = scalar_type(NODES[p].ty);
+                let count = int_key(NODES[p].y, ty) - int_key(NODES[p].x, ty) + 1;
+                if count < 1 || count > 256 || SW_CASES.count + 2 * count > 2048 {
+                    return false;
+                }
+                for k in 0..count {
+                    add_switch_value(wrap_int(NODES[p].x + k, ty), arm);
+                }
+                true
+            }
+            PatVariant => {
+                for i in 0..NODES[p].count {
+                    if !is_irrefutable(child(p, i)) {
+                        return false;
+                    }
+                }
+                let v = NODES[p].x;
+                add_switch_value(wrap_int(VARIANTS[v].discr, ENUMS[VARIANTS[v].enum_id].tag), arm);
+                true
+            }
+            PatOr => {
+                if binding_count(p) != 0 {
+                    return false;
+                }
+                for i in 0..NODES[p].count {
+                    if !add_switch_values(child(p, i), arm) {
+                        return false;
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+fn add_switch_value(value: i64, arm: i64) {
+    let mut i = 0;
+    while i < SW_CASES.count {
+        if unsafe { SW_CASES.data[i] == value } {
+            return;
+        }
+        i += 2;
+    }
+    SW_CASES.push(value);
+    SW_CASES.push(arm);
+}
+
+// Match n as a switch on the scrutinee (or its tag): every arm in a block
+// of its own, which binds the pattern's variables and evaluates the body.
+fn lower_match_switch(n: i64, st: i64, value: i64, result: i64, join: i64) {
+    unsafe {
+        let mut key = value;
+        if is_compound(st) {
+            let tag = ENUMS[TYPES[st].a].tag;
+            key = ir_load(tag, value, 0);
+        }
+        // (Matches in the arms reuse SW_CASES and SW_DEFAULT.)
+        let catch_all = SW_DEFAULT;
+        let first = BLOCK_COUNT;
+        for _ in 0..NODES[n].count {
+            ir_new_block();
+        }
+        let mut default = 0;
+        if catch_all >= 0 {
+            default = first + catch_all;
+        } else {
+            default = ir_new_block();
+        }
+        let unreachable = default;
+        if is_dead_block(CUR) {
+            ir_terminate(CUR, Term::Unreach, 0, 0, 0);
+        } else {
+            let mark = SSA_STACK.count;
+            let mut i = 0;
+            while i < SW_CASES.count {
+                SSA_STACK.push(SW_CASES.data[i]);
+                SSA_STACK.push(first + SW_CASES.data[i + 1]);
+                i += 2;
+            }
+            ir_switch(CUR, key, default, mark);
+        }
+        let has_value = !is_void(NODES[n].ty);
+        for i in 0..NODES[n].count {
+            let arm = child(n, i);
+            let p = NODES[arm].a;
+            CUR = first + i;
+            ir_seal(CUR);
+            alloc_pattern_locals(p);
+            lower_pattern_binds(p, st, value);
+            let body = NODES[arm].c;
+            let v = lower_expr(body);
+            if has_value && NODES[body].ty != TY_NEVER {
+                join_write(result, v, NODES[n].ty);
+            }
+            lower_jump(join);
+        }
+        if catch_all < 0 {
+            CUR = unreachable;
+            ir_seal(CUR);
+            ir_terminate(CUR, Term::Unreach, 0, 0, 0);
+        }
+    }
+}
+
+// Binds the variables of pattern p, known to match `value`: its fields
+// for a variant, the value for a binding.
+fn lower_pattern_binds(p: i64, ty: i64, value: i64) {
+    unsafe {
+        let kind = NODES[p].kind;
+        if kind == PatBind || kind == PatWild {
+            lower_pattern_test(p, ty, value, 0);
+            return;
+        }
+        if kind != PatVariant {
+            return;
+        }
+        let v = NODES[p].x;
+        for i in 0..NODES[p].count {
+            let sub = child(p, i);
+            let elem_ty = variant_field(v, i);
+            let offset = variant_field_offset(v, i);
+            let mut elem = 0;
+            if is_compound(elem_ty) {
+                elem = ir_offset(value, offset);
+            } else if !is_void(elem_ty) {
+                elem = ir_load(ir_type(elem_ty), value, offset);
+            }
+            lower_pattern_test(sub, elem_ty, elem, 0);
+        }
+    }
+}
+
+// Continues in a new block when `cond` holds, else goes to `fail`.
+fn test_or_fail(cond: i64, fail: i64) {
+    let next = ir_new_block();
+    lower_branch(cond, next, fail);
+    ir_seal(next);
+    CUR = next;
+}

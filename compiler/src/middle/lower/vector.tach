@@ -1,0 +1,162 @@
+// Lowering vector expressions (0.10).
+//
+// A vector expression's value is an address, as for other compound types;
+// its operations load their operands (once, in order: the value is taken
+// before the next operand is evaluated, as -O0 copies it), compute with
+// the vector instructions, and store the result into a new slot. Scalar
+// replacement turns those slots into values.
+
+use crate::front::ast::{
+    NODES, VK_LANE, VK_LOAD, VK_NEW, VK_SELECT, VK_SPLAT, VK_STORE, VK_SUM, child,
+};
+use crate::front::lexer::Tok;
+use crate::front::parser::is_comparison;
+use crate::front::types::{TYPES, TY_I64, TY_U64, is_slice, type_size, vec_elem, vec_lanes};
+use crate::gen0::target::{PANIC_INDEX_SIGNED, PANIC_RANGE_SIGNED};
+use crate::middle::ir::{
+    Cond, INSTS, Op, cond_of_token, emit_ir, ir_binary, ir_cmp, ir_const, ir_load, ir_slot_addr,
+    ir_store, ir_type,
+};
+use crate::middle::lower::new_slot_for;
+use crate::middle::lower::calls::lower_check;
+use crate::middle::lower::expr::{arith_op, lower_operand};
+
+pub fn arith_token_of(t: Tok) -> Tok {
+    t
+}
+
+// The value of vector expression e (of its vector type).
+pub fn vec_operand(e: i64) -> i64 {
+    unsafe {
+        let addr = lower_operand(e);
+        ir_load(NODES[e].ty, addr, 0)
+    }
+}
+
+// The address of a new slot holding vector `value`.
+pub fn vec_result(value: i64, vt: i64) -> i64 {
+    let base = ir_slot_addr(new_slot_for(vt));
+    ir_store(vt, base, value, 0);
+    base
+}
+
+// a <token> b on vectors of type vt; the result of type `result_ty`.
+pub fn vector_operator(token: Tok, vt: i64, result_ty: i64, a: i64, b: i64) -> i64 {
+    if is_comparison(token) {
+        let v = emit_ir(Op::VCmp, result_ty, a, b, 0);
+        unsafe {
+            INSTS[v].cond = cond_of_token(token);
+            INSTS[v].imm2 = vt;
+        }
+        return v;
+    }
+    emit_ir(Op::VBin, vt, a, b, arith_op(token) as i64)
+}
+
+// The first element's address and the length of the slice or array that
+// expression s is.
+fn lower_elements(s: i64, len: *i64) -> i64 {
+    unsafe {
+        let ty = NODES[s].ty;
+        let value = lower_operand(s);
+        if is_slice(ty) {
+            *len = ir_load(TY_U64, value, 8);
+            return ir_load(TY_U64, value, 0);
+        }
+        *len = ir_const(TYPES[ty].b, TY_U64);
+        value
+    }
+}
+
+// The address of lanes index..index + lanes of s (checked).
+fn lower_vector_address(s: i64, index: i64, vt: i64) -> i64 {
+    let mut len = 0;
+    let base = lower_elements(s, &len);
+    let idx = lower_operand(index);
+    let lanes = vec_lanes(vt);
+    let end = ir_binary(Op::Add, TY_I64, idx, ir_const(lanes, TY_I64));
+    let room = ir_binary(Op::Sub, TY_I64, len, ir_const(lanes, TY_I64));
+    lower_check(ir_cmp(Cond::Le, TY_I64, idx, room), PANIC_RANGE_SIGNED, idx, end, len);
+    lower_check(ir_cmp(Cond::Ge, TY_I64, idx, ir_const(0, TY_I64)), PANIC_RANGE_SIGNED, idx, end, len);
+    let size = type_size(vec_elem(vt));
+    ir_binary(Op::Add, TY_U64, base, ir_binary(Op::Mul, TY_U64, idx, ir_const(size, TY_U64)))
+}
+
+// The lane index `index` (an expression), checked against vt's lanes.
+fn lower_lane_index(index: i64, vt: i64) -> i64 {
+    let idx = lower_operand(index);
+    let lanes = ir_const(vec_lanes(vt), TY_U64);
+    lower_check(ir_cmp(Cond::Lt, TY_U64, idx, lanes), PANIC_INDEX_SIGNED, idx, lanes, 0);
+    idx
+}
+
+// The constant value of IR value v (-1 when not a constant).
+fn const_lane(v: i64) -> i64 {
+    unsafe {
+        if INSTS[v].op == Op::Const && INSTS[v].imm >= 0 && INSTS[v].imm < 16 {
+            return INSTS[v].imm;
+        }
+        -1
+    }
+}
+
+pub fn lower_vecop(n: i64) -> i64 {
+    unsafe {
+        let kind = NODES[n].x;
+        let vt = NODES[n].y;
+        let elem = vec_elem(vt);
+        let lanes = vec_lanes(vt);
+        let esize = type_size(elem);
+        if kind == VK_NEW || kind == VK_SPLAT {
+            let first = lower_operand(child(n, 0));
+            let mut v = emit_ir(Op::VSplat, vt, first, 0, 0);
+            if kind == VK_NEW {
+                for i in 1..lanes {
+                    let x = lower_operand(child(n, i));
+                    v = emit_ir(Op::VIns, vt, v, x, i);
+                }
+            }
+            return vec_result(v, vt);
+        }
+        if kind == VK_LOAD {
+            let addr = lower_vector_address(child(n, 0), child(n, 1), vt);
+            return vec_result(ir_load(vt, addr, 0), vt);
+        }
+        let a = vec_operand(NODES[n].a);
+        if kind == VK_STORE {
+            let addr = lower_vector_address(child(n, 0), child(n, 1), vt);
+            ir_store(vt, addr, a, 0);
+            return 0;
+        }
+        if kind == VK_SUM {
+            return emit_ir(Op::VSum, ir_type(elem), a, 0, 0);
+        }
+        if kind == VK_SELECT {
+            let x = vec_operand(child(n, 0));
+            let y = vec_operand(child(n, 1));
+            let ty = NODES[child(n, 0)].ty;
+            let v = emit_ir(Op::VSel, ty, a, x, 0);
+            INSTS[v].c = y;
+            return vec_result(v, ty);
+        }
+        let idx = lower_lane_index(child(n, 0), vt);
+        let lane = const_lane(idx);
+        if kind == VK_LANE {
+            if lane >= 0 {
+                return emit_ir(Op::VExt, ir_type(elem), a, 0, lane);
+            }
+            let base = vec_result(a, vt);
+            let at = ir_binary(Op::Add, TY_U64, base, ir_binary(Op::Mul, TY_U64, idx, ir_const(esize, TY_U64)));
+            return ir_load(ir_type(elem), at, 0);
+        }
+        // VK_WITH
+        let x = lower_operand(child(n, 1));
+        if lane >= 0 {
+            return vec_result(emit_ir(Op::VIns, vt, a, x, lane), vt);
+        }
+        let base = vec_result(a, vt);
+        let at = ir_binary(Op::Add, TY_U64, base, ir_binary(Op::Mul, TY_U64, idx, ir_const(esize, TY_U64)));
+        ir_store(ir_type(elem), at, x, 0);
+        base
+    }
+}
