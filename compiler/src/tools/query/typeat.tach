@@ -8,15 +8,18 @@ use crate::base::{
     FILES, FILE_COUNT, IntVec, SRC, STDOUT, buf_byte, buf_bytes, buf_int, buf_new, buf_slice,
     buf_str, buf_write_fd,
 };
-use crate::front::ast::{NODES, NODE_COUNT, NodeKind};
+use crate::front::ast::{NODES, NODE_CAPTURE, NODE_COUNT, NodeKind};
 use crate::front::types::buf_type;
+use crate::middle::lower::ssa::HMap;
 use crate::tools::query::{parse_digits, trailing_number};
 use crate::tools::query::defs::bytes_eq;
 use crate::tools::query::diagnostics::{diag, try_begin, try_end, try_query};
 use crate::tools::query::positions::{LINES, collapse, line_end, line_index};
 use crate::tools::query::refs::file_text;
 
-// Whether nodes of kind k are expressions (or bindings) the checker types.
+// Whether nodes of kind k are expressions (or bindings) the checker types
+// (0.14: a closure, its type `closure(i64) -> i64 at FILE:LINE:COL`; a
+// closure's parameter).
 fn typed_kind(k: NodeKind) -> bool {
     match k {
         NodeKind::Int | NodeKind::Float | NodeKind::Char | NodeKind::Str | NodeKind::CStr
@@ -27,7 +30,7 @@ fn typed_kind(k: NodeKind) -> bool {
             | NodeKind::While | NodeKind::For | NodeKind::Range | NodeKind::Assign
             | NodeKind::Return | NodeKind::Break | NodeKind::Continue | NodeKind::Path
             | NodeKind::Match | NodeKind::MethodCall | NodeKind::VariantLit | NodeKind::EnumPanic
-            | NodeKind::VecOp | NodeKind::PatBind => true,
+            | NodeKind::VecOp | NodeKind::PatBind | NodeKind::Closure | NodeKind::Param => true,
         _ => false,
     }
 }
@@ -110,8 +113,27 @@ pub fn query_type(arg: [u8]) -> i64 {
         let mut best = 0;
         let mut have = false;
         let mut found = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        // (0.14: the closure's environment that a captured use reads,
+        // written nowhere: not shown)
+        let mut hidden = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
         for n in 1..NODE_COUNT {
-            if NODES[n].ty <= 0 || !typed_kind(NODES[n].kind) {
+            if (NODES[n].p & NODE_CAPTURE) == 0 {
+                continue;
+            }
+            let mut q = n;
+            while q > 0
+                && (NODES[q].kind == NodeKind::Unary || NODES[q].kind == NodeKind::FieldAccess) {
+                if q != n {
+                    hidden.put(q + 1, 1);
+                }
+                q = if NODES[q].kind == NodeKind::Unary { NODES[q].b } else { NODES[q].a };
+            }
+            if q > 0 && q != n {
+                hidden.put(q + 1, 1);
+            }
+        }
+        for n in 1..NODE_COUNT {
+            if NODES[n].ty <= 0 || !typed_kind(NODES[n].kind) || hidden.get(n + 1) != 0 {
                 continue;
             }
             if col >= 1 && (NODES[n].start > pos || NODES[n].end <= pos) {

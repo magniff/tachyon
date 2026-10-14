@@ -54,6 +54,11 @@ WORK=$(cd "$WORK" && pwd -P)
 trap 'rm -rf "$WORK"' EXIT
 trap 'exit 130' INT TERM
 STATUS=0
+# (0.14: a transcript with a line `## needs: 0.14` needs closures and
+# iterators; skipped while the compiler does not check them)
+. "$ROOT/tests/needs014.sh"
+HAS014=0
+has_014 "$COMPILER" "$WORK" && HAS014=1
 T=$HERE
 export T
 unset TACHYON_ROOT
@@ -95,6 +100,10 @@ transcript() {
 for file in "$HERE"/*.t; do
     [ -f "$file" ] || continue
     name=$(basename "$file" .t)
+    if [ $HAS014 = 0 ] && grep -q '^## needs: 0.14' "$file"; then
+        echo "skip $name (0.14: the compiler does not check closures and iterators yet)"
+        continue
+    fi
     for mode in off cache; do
     transcript "$file" $mode >"$WORK/$name.got"
     if [ $UPDATE -eq 1 ] && [ $mode = off ]; then
