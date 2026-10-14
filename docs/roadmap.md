@@ -480,6 +480,41 @@ The last release of the build-out.
   cost model for the loop vectorizer (from 0.10)
 - multi-error diagnostics: done (0.5, completed in 0.10)
 
+## 0.11 (continued): tools for agents
+
+`tachyonc query` (def, show, refs, callers, items; fully qualified paths
+in and out; see docs/query.md) and the agent harness's query-first test
+(AGENTS.md, tools/agent-hooks/), then the refactoring toolkit, measured
+by docs/agent-tool-usage.md:
+
+- edit by name: `tachyonc edit replace|insert|delete NAME` (no reading a
+  file to change one item)
+- `tachyonc check` (front end only, short diagnostics), `tachyonc fix`
+  (every machine-applicable fix), `tachyonc same-output OLD` (a pure
+  refactor proven to change nothing)
+- semantic refactors, atomic (checked after editing, nothing written on
+  failure), one summary line each: `refactor rename`, `move`, `signature`,
+  `field`, `variant`, `new-module`, `move-module`, `split`; typed
+  structural `rewrite`; `refactor --script` batches; `--dry-run`, `--undo`
+- planning queries: `query stats` (sizes), `query deps` (what references
+  what inside a module), `query unused`, `query impact`
+- `tachyonc lint --max-lines N`
+- every diagnostic: one line with a stable code, then `try:` lines with
+  the exact command; large outputs summarized
+
+## 0.12: the compiler's source, reorganized with those tools
+
+`compiler/src` split into folders by phase (front end, middle end, back
+end, object writing, driver), no file over 1,000 lines (checked by the
+test suite from then on), done with 0.11's own refactoring commands and
+proven output-identical with `same-output`. Every place the tools fell
+short is recorded (tools/agent-feedback, the hook's log).
+
+## 0.13: the tools, improved from that record
+
+What 0.12's refactoring showed the tools lacked, fixed and measured
+again.
+
 ## Toward 1.0
 
 1.0 is not a feature milestone: it ships when the language is thought
