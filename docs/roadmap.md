@@ -469,12 +469,16 @@ Profile-guided:
 
 ## 0.11: feature-complete
 
-The last release of the build-out: everything planned above, finished.
+The last release of the build-out.
 
-- multi-error diagnostics (done in 0.5); DWARF line tables
-- aarch64-linux host
-- within 10% of clang -O2 on `bench/`
-- a written language specification describing 0.10 as it is
+- DWARF line tables (debuggers and backtraces see source lines), in the
+  assembly and in the objects the compiler writes
+- aarch64-linux as a target and a host
+- performance: a broader `bench/` (allocation-heavy, branchy, string and
+  hash-map code, not only numeric kernels), measured against clang -O2;
+  the SLP vectorizer, scalar unrolling with run-time trip counts and a
+  cost model for the loop vectorizer (from 0.10)
+- multi-error diagnostics: done (0.5, completed in 0.10)
 
 ## Toward 1.0
 
@@ -490,6 +494,8 @@ through and stable, after as many 0.11.x / 0.12+ iterations as that takes:
   compiler, no known miscompiles
 - making the language and its tools work for agents as well as people:
   ideas collected in [agents.md](agents.md)
+- a written language specification, once the type system and the
+  agent-facing design have settled
 - 1.0 freezes compatibility, not features: from 1.0 on, additions are minor
   releases and breaking changes wait for 2.0
 
