@@ -689,6 +689,49 @@ From here a feature new in release N enters the compiler's own source in N+1
   line outside items; merge conflicts in `.tach` files (a query of the
   regions, `edit resolve`)
 
+Done (0.14.0). The agent eval first (twelve tasks with Rust twins,
+`tests/agent-eval/run.py`, the 0.13 baseline with Claude Haiku and Sonnet
+and six runs of Qwen3-Coder; local runs off until re-enabled), and what
+its findings asked for: std's stdin reading, text helpers, in-place map
+and vector updates and an introsort; did-you-mean across the program and
+std, helps for Rust habits; the tools on a user's program (`undo` without
+git, local renames, `variant --arm-in`, imports added by edits). Then the
+design (docs/design/closures-iterators.md), an interface commit and five
+parallel tasks: closures (`Fn`/`FnMut` bounds, captures by value or by
+reference, `move`, an escape check, a non-capturing closure a `fn`);
+associated types (needed by `Iterator`, with constraints and lazy
+defaults); iterators (`for` over anything iterable, ranges as values,
+`map`, `filter`, `enumerate`, `zip`, `take`, `fold`, `for_each`,
+`count`, `sum`, `min`, `max`, `collect`, `sort_by`; slices, `Vec`,
+ranges and `HashMap` iterable); zero cost (bench/iterchain.tach against
+bench/iterloop.tach, held by `bench/run.sh` at a ratio of at most 1.05);
+the tools, fmt and the guide on closures. Of 0.13's tool candidates,
+`edit insert` adding imports, `split` moving a banner with its group and
+`edit patch FILE:LINE` between items are done. Moved: merge conflicts in
+`.tach` files (docs/tool-gaps-014.md, gap 8) to a later release;
+`iter_mut` to 0.17's value semantics (indexing until then); `collect`
+into anything but a `Vec`, and returning closures (`impl Fn`), to a
+later release. Fixed on the way: three reads of freed memory (slicing
+whose bounds grow the storage, `Buf::push_str` of its own view, the
+compiler's tables indexed through calls that move them), and the gate's
+`stress-grow` step that keeps them fixed. 85% of the edits to existing
+compiler source went through the tools (agent-tool-usage.md, "0.14");
+630 tests.
+
+0.14.0 release gate (2026-10-15): `bootstrap/gate.sh --release`, 30:02
+wall (other agents' work on the machine, load average 6 to 24), every
+step passed: the chain (fixpoint, built by 0.13.0) and the suite at
+-O0/1/2 (630 tests) on aarch64-macos; fuzz 60 in each of the ten modes
+(the seed in one), ABI 100 in three modes, objcheck (1048 of 1048),
+header layouts, the lldb check, and the new stress-grow step (the
+self-compile the same, the suite at -O0 and -O2, with every table growth
+moving); x86_64-linux (its own chain, the suite at every level, fuzz 50
+in ten modes, ABI 40 in three, objcheck, layouts); aarch64-linux (the
+cross-built fixpoint, the suite, fuzz 300 in nine modes, ABI 150 in
+three, objcheck, layouts, gdb). Benchmarks and compile times in
+"Benchmarks", 0.14. Not run: the suite on x86_64-macos (Rosetta on the
+test machine).
+
 ## 0.15: errors, conversions, less boilerplate
 
 - `?` on `Result` and `Option`; typed error enums as the std convention;
