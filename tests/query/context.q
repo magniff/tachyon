@@ -12,12 +12,12 @@ fn report(items: *Vec<Item>) -> i64 {
     total(items)
 }
 // calls (3)
-std::Vec::len	<std>:120:12	method	pub fn len(self: *Vec<T>) -> i64
+std::Vec::len	<std>:122:12	method	pub fn len(self: *Vec<T>) -> i64
 crate::stock::restock	context/stock.tach:10:8	fn	pub fn restock(items: *Vec<Item>, i: i64, n: i64)
 crate::stock::total	context/stock.tach:19:8	fn	pub fn total(items: *Vec<Item>) -> i64
 // types (2)
 crate::stock::Item	context/stock.tach:4:12	struct	pub struct Item { pub name: [u8], pub count: i64 }
-std::Vec	<std>:107:12	struct	pub struct Vec<T> { ptr: *T, len: i64, cap: i64 }
+std::Vec	<std>:109:12	struct	pub struct Vec<T> { ptr: *T, len: i64, cap: i64 }
 // callers (2)
 main	context/main.tach:21:13	let n = report(&items);
 main	context/main.tach:24:13	let m = report(&items);
@@ -32,11 +32,11 @@ pub fn restock(items: *Vec<Item>, i: i64, n: i64) {
     }
 }
 // calls (2)
-std::Vec::set	<std>:195:12	method	pub fn set(self: *Vec<T>, i: i64, x: T)
-std::Vec::get	<std>:191:12	method	pub fn get(self: *Vec<T>, i: i64) -> T
+std::Vec::set	<std>:197:12	method	pub fn set(self: *Vec<T>, i: i64, x: T)
+std::Vec::get	<std>:193:12	method	pub fn get(self: *Vec<T>, i: i64) -> T
 // types (2)
 crate::stock::Item	context/stock.tach:4:12	struct	pub struct Item { pub name: [u8], pub count: i64 }
-std::Vec	<std>:107:12	struct	pub struct Vec<T> { ptr: *T, len: i64, cap: i64 }
+std::Vec	<std>:109:12	struct	pub struct Vec<T> { ptr: *T, len: i64, cap: i64 }
 // uses (1)
 crate::stock::MAX	context/stock.tach:7:11	const	pub const MAX: i64 = 100
 // callers (1)
@@ -51,11 +51,11 @@ pub fn total(items: *Vec<Item>) -> i64 {
     t
 }
 // calls (2)
-std::Vec::len	<std>:120:12	method	pub fn len(self: *Vec<T>) -> i64
-std::Vec::get	<std>:191:12	method	pub fn get(self: *Vec<T>, i: i64) -> T
+std::Vec::len	<std>:122:12	method	pub fn len(self: *Vec<T>) -> i64
+std::Vec::get	<std>:193:12	method	pub fn get(self: *Vec<T>, i: i64) -> T
 // types (2)
 crate::stock::Item	context/stock.tach:4:12	struct	pub struct Item { pub name: [u8], pub count: i64 }
-std::Vec	<std>:107:12	struct	pub struct Vec<T> { ptr: *T, len: i64, cap: i64 }
+std::Vec	<std>:109:12	struct	pub struct Vec<T> { ptr: *T, len: i64, cap: i64 }
 // callers (1)
 report	context/main.tach:14:5	total(items)
 $ context Item
@@ -103,7 +103,7 @@ fn report(items: *Vec<Item>) -> i64 {
     total(items)
 }
 // calls (3)
-std::Vec::len	<std>:120:12	method	pub fn len(self: *Vec<T>) -> i64
+std::Vec::len	<std>:122:12	method	pub fn len(self: *Vec<T>) -> i64
 crate::stock::restock	context/stock.tach:10:8	fn	pub fn restock(items: *Vec<Item>, i: i64, n: i64)
 // callers (2)
 main	context/main.tach:21:13	let n = report(&items);

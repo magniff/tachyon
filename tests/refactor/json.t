@@ -4,18 +4,18 @@
 ## them, without --json.
 $ check --json
 $ query def add --json
-{"kind":"output","fields":["crate::add","main.tach:3:4","fn","fn add(a: i64, b: i64) -> i64"]}
-{"kind":"output","fields":["std::Add::add","<std>:578:20","trait-method","fn add(self: Self, other: Self) -> Self"]}
+crate::add	main.tach:3:4	fn	fn add(a: i64, b: i64) -> i64
+std::Add::add	<std>:336:20	trait-method	fn add(self: Self, other: Self) -> Self
 ## (quotes and tabs escaped)
 $ query grep bad --json
-{"kind":"output","fields":["# main.tach"]}
-{"kind":"output","fields":["9:18","string","main","println(\"bad\");"]}
+# main.tach
+9:18	string	main	println("bad");
 $ query show nosuch --json
 {"kind":"diagnostic","severity":"error","code":"query.no-match","file":null,"line":null,"col":null,"message":"no definition 'nosuch'","help":[],"notes":[],"try":["tachyonc query items"]}
 [exit 1]
 ## An edit's new errors, its refusal, its summary.
 $ edit patch add --old 'a + b' --new 'a + q' --json
-{"kind":"diagnostic","severity":"error","code":"type error","file":"main.tach","line":4,"col":9,"message":"undefined variable 'q'","help":[],"notes":[],"try":[]}
+{"kind":"diagnostic","severity":"error","code":"type error","file":"main.tach","line":4,"col":9,"message":"undefined variable 'q'  [edited: crate::add]","help":[],"notes":[],"try":[]}
 {"kind":"diagnostic","severity":"error","code":"edit.breaks","file":null,"line":null,"col":null,"message":"1 new error; nothing written","help":[],"notes":[],"try":["tachyonc edit patch add --old 'a + b' --new 'a + q' --no-check"]}
 [exit 1]
 $ edit patch add --old 'a + b' --new 'b + a' --json
