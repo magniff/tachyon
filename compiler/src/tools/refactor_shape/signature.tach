@@ -3,7 +3,7 @@
 // declaration and every impl's) and in every call the checker resolved.
 
 use crate::base::{
-    FILES, IntVec, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, intern, intern_c,
+    FILES, IntVec, SRC, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, intern, intern_c,
 };
 use crate::front::ast::{NODES, NODE_COUNT, NodeKind};
 use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
@@ -14,7 +14,7 @@ use crate::tools::edit::edit_replace;
 use crate::tools::edit::apply::{apply_edit, set_command};
 use crate::tools::query::{QF_CALL, QF_DEF, c_slice, root_or_diag};
 use crate::tools::query::defs::{
-    DEFS, DEF_COUNT, K_FN, K_IMPL_METHOD, K_METHOD, K_TRAIT_FN, def_of_node, trait_of,
+    DEFS, DEF_COUNT, K_FN, K_IMPL_METHOD, K_METHOD, K_TRAIT_FN, bytes_eq, def_of_node, trait_of,
 };
 use crate::tools::query::diagnostics::{
     PROG, ROOT_GIVEN, TOOL, diag, put_root, put_word, try_end, write_diags,
@@ -209,7 +209,8 @@ fn signature_inner(argc: i64, argv: **u8) -> i64 {
         let mut words = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let mut opts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let example = c"NAME --add 'x: i64 = 0' --dry-run";
-        if !take_args(argc, argv, c"--add=1 --at=1 --remove=1 --rename-param=2 --reorder=1 --type=2", &root, &words, &opts) {
+        let options = c"--add=1 --at=1 --remove=1 --rename-param=2 --reorder=1 --type=2 --default=1";
+        if !take_args(argc, argv, options, &root, &words, &opts) {
             return 2;
         }
         if words.count != 1 {
@@ -228,6 +229,10 @@ fn signature_inner(argc: i64, argv: **u8) -> i64 {
         }
         if at != 0 as *u8 && add == 0 as *u8 {
             return usage_error(c"--at goes with --add", example);
+        }
+        let default = opt(&opts, c"--default", false);
+        if default != 0 as *u8 && retype == 0 as *u8 {
+            return usage_error(c"--default goes with --type (the calls' new argument)", c"NAME --type x T --default EXPR");
         }
         let name = c_slice(words.data[0] as *u8);
         ROOT_GIVEN = root;
@@ -533,6 +538,17 @@ fn signature_inner(argc: i64, argv: **u8) -> i64 {
                 let t = pb(p);
                 edit_replace(pstart(t), pend(t), text_buf(ty));
             }
+            // (--default: each call's argument becomes EXPR, 0.13)
+            if default != 0 as *u8 {
+                for i in 0..calls.count {
+                    let c = calls.data[i];
+                    list_of_node(c);
+                    let off = if pk(c) == NodeKind::MethodCall && self_param { 1 } else { 0 };
+                    let a = L_START.data[k - off];
+                    let b = L_END.data[k - off];
+                    edit_replace(a, b, with_argument(c_slice(default), sym_text(pname), SRC[a..b]));
+                }
+            }
             buf_str(what, c"changed parameter ");
             buf_bytes(what, sym_text(pname));
             buf_str(what, c" to ");
@@ -544,7 +560,7 @@ fn signature_inner(argc: i64, argv: **u8) -> i64 {
             buf_str(what, c" and ");
             put_count(what, group.count - 1, c"other definition", c"other definitions");
         }
-        if rename == 0 as *u8 && retype == 0 as *u8 {
+        if rename == 0 as *u8 && (retype == 0 as *u8 || default != 0 as *u8) {
             buf_str(what, c", ");
             put_count(what, calls.count, c"call", c"calls");
         }
@@ -559,6 +575,41 @@ fn signature_inner(argc: i64, argv: **u8) -> i64 {
         }
         apply_edit(buf_slice(what), root)
     }
+}
+
+// --default EXPR for a call whose argument was `arg`: EXPR with `$NAME`
+// (the parameter's name) replaced by the argument, in parentheses unless
+// it is a name, a number or a path (0.13). A buffer.
+fn with_argument(expr: [u8], name: [u8], arg: [u8]) -> i64 {
+    let out = buf_new();
+    let mut plain = arg.len > 0;
+    for i in 0..arg.len {
+        let c = arg[i];
+        if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '.'
+            || c == ':') {
+            plain = false;
+        }
+    }
+    let mut i = 0;
+    while i < expr.len {
+        let e = i + 1 + name.len;
+        let ends = e >= expr.len || !(expr[e] == '_' || (expr[e] >= 'a' && expr[e] <= 'z')
+            || (expr[e] >= 'A' && expr[e] <= 'Z') || (expr[e] >= '0' && expr[e] <= '9'));
+        if expr[i] == '$' && e <= expr.len && bytes_eq(expr[i + 1..e], name) && ends {
+            if !plain {
+                buf_byte(out, '(');
+            }
+            buf_bytes(out, arg);
+            if !plain {
+                buf_byte(out, ')');
+            }
+            i = e;
+        } else {
+            buf_byte(out, expr[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 // Whether `name` is written as an identifier in the body of f.

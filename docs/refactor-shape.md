@@ -13,7 +13,7 @@ anything query accepts.
 
 ```
 tachyonc refactor signature FN --add 'x: T = VALUE' [--at N] | --remove x
-                               | --rename-param a b | --reorder b,a,c | --type x T
+                               | --rename-param a b | --reorder b,a,c | --type x T [--default EXPR]
 tachyonc refactor field STRUCT --add 'g: T = VALUE' | --remove g | --rename g h | --type g T
 tachyonc refactor variant ENUM --add 'X(T, ...)' [--arm EXPR] | --remove V | --rename V W
 tachyonc rewrite 'PATTERN' 'REPLACEMENT' [--where '$x: T']... [--in FILE|MODULE]
@@ -65,7 +65,11 @@ added parameter scale: i64 to crate::geom::area, 2 calls→2 files→+2 -2 lines
   call's arguments follow (`warning refactor.effects` when two that call
   functions change order: evaluation is left to right).
 - `--type x T`: the parameter's type; the check says which calls no
-  longer fit (the edit is refused with their errors).
+  longer fit (the edit is refused with their errors). `--default EXPR`
+  (0.13) makes each call's argument EXPR, `$x` in it standing for the
+  argument it had (in parentheses unless a name, a number or a path):
+  `--type k i64 --default '$k as i64'` turns `scale(b, n + 1)` into
+  `scale(b, (n + 1) as i64)`; `--type full bool --default false`.
 
 Refused for any change of the type (all but `--rename-param`): a
 function used as a value (`let f = twice;`, `apply(twice, x)`:
