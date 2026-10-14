@@ -460,7 +460,7 @@ the one hole in safe code (no lifetimes).
 | `expected ';', got '!'` | no macros: `println(...)`, `std::print_int(...)` |
 | `cannot assign to immutable variable 'x'` | `let mut x` |
 | `cannot index type 'Vec<i64>'` | `v.get(i)`, `v.as_slice()[i]` |
-| `'for' loops iterate over ... got 'Vec<i64>'` | `for x in v.as_slice()` |
+| `'for' iterates over ... got 'i64'` | a range: `for x in 0..n`; a Vec, a HashMap, `v.iter()` and ranges as values iterate too (0.14) |
 | `no method 'len' on type '[u8]'` | `s.len`, a field |
 | `expected '[i64]', got '[i64; 3]'` | pass `a[..]` |
 | `expected 'i64', got 'i32'` | `x as i64` |

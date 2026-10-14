@@ -1059,9 +1059,39 @@ to `fn` types, the escape rule.)
 
 ### Iterators
 
-(To come: the `Iterator` trait, in the prelude; std's sources and
-adapters; `for` over iterators; `a..b` as a value. The standard library is
-also loaded when a program uses a range as a value.)
+`for p in e body`, where `e` is not a range literal, iterates `e` by its
+type; `e` is evaluated once, into a hidden `let`:
+
+| `e` | the loop |
+|---|---|
+| a slice, an array | `for i in 0..len { let p = e[i]; body }` (0.4) |
+| `Vec<T>`, `std::SliceIter<T>` (`v.iter()`) | the same over `e.as_slice()`: a counted loop, no `next` call |
+| `std::Range<T>`, `std::RangeInclusive<T>` (`a..b`, `a..=b` as values) | `for p in e.start..e.end body` (`..=`; nothing once `e.done`) |
+| a type with a `next(self: *T) -> Option<Item>` method (an `Iterator`) | `label: loop { match e.next() { Some(p) => body, _ => break } }` |
+| a type with an `iter()` method (`HashMap`, user types) | `for p in e.iter() body` |
+| `*T` of any of these | the same through the pointer (`for x in &v`; `for x in &it` advances `it`) |
+
+Anything else is the error `'for' iterates over ranges, slices, arrays,
+iterators and types with an 'iter' method, got 'T'`. The pattern is
+irrefutable (a `let`'s); labels, `break`, `continue` and `defer` in the
+body behave as in any loop. Items are copies.
+
+`a..b` and `a..=b` outside a `for` head, a slicing and a pattern are
+values: `std::Range { start: a, end: b }` and `std::RangeInclusive {
+start: a, end: b, done: false }`, both ends of one type (`0..=255u8` is a
+`RangeInclusive<u8>`, which ends without overflow). A program that uses a
+range as a value loads std. std's sources: `Range`, `RangeInclusive`,
+`SliceIter` (`v.iter()`, and `as_slice()`: the items left),
+`HashMapIter` (`m.iter()`, items `(K, V)` in slot order), `Keys`
+(`m.keys()`), `Values` (`m.values()`); each has `next`, `exact_len` (the
+items left, or -1), `at(k)` and a counted `fold`. `std::sort_by(s, f)`
+and `v.sort_by(f)` sort by `f(a: *T, b: *T) -> i64` (negative: `a`
+first).
+
+(To come with associated types and closures: the sources implement the
+`Iterator` trait, in the prelude, with the adapters `map`, `filter`,
+`enumerate`, `zip`, `take` and the consumers `fold`, `for_each`, `count`,
+`sum`, `min`, `max`, `collect`; `s.iter()` and `s.sort_by(f)` on slices.)
 
 ## Importing C headers
 

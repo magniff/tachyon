@@ -3,17 +3,12 @@
 // statement), statements (`let`, `defer`), `if` in both modes, loops and
 // the jumps out of them (`break`, `continue`, `return`).
 
-use crate::base::{_setjmp, intern_c};
+use crate::base::_setjmp;
 use crate::base::diag::{
     RECOVER_DEPTH, err_begin, err_end, err_str, err_sym, recover_enter, recover_leave,
 };
-use crate::front::ast::{
-    BLOCK_UNSAFE, FN_UNSAFE, NODES, child, list_begin, list_end, list_push, new_node,
-};
-use crate::front::ast::NodeKind::{
-    Block, Defer, ExprStmt, FieldAccess, For, Ident, Index, Int, Let, Loop, PatBind, PatTuple, Path,
-    Range, While,
-};
+use crate::front::ast::{BLOCK_UNSAFE, FN_UNSAFE, NODES, child};
+use crate::front::ast::NodeKind::{Block, Defer, Ident, Let, Loop, PatTuple, Path, Range, While};
 use crate::front::check::{
     DEFER_LOOP_BASE, ENV, LOCALS, LOCAL_COUNT, LOOP_STACK, RETURN_TYPE, SCOPES, SELF_TYPE,
     define_local, lookup_local, mismatch_error, name_error, poison_statement, pop_scope, push_scope,
@@ -26,15 +21,12 @@ use crate::front::check::synth_mode::{literal_takes_rhs_type, synth_expr};
 use crate::front::check::unsafety::{UNSAFE_DEPTH, WRAP_NODE, check_wrapped, is_borrow_param};
 use crate::front::closures::check_scope_exit;
 use crate::front::generics::{CUR_INST, TP_BASE, env_enter, env_leave, template_of_key};
-use crate::front::lexer::SUF_I64;
 use crate::front::modules::CUR_MOD;
 use crate::front::modules::lookup::{B_ITEM, B_TVARIANT, binding_kind, binding_value, lookup_quiet};
 use crate::front::parser::UNDERSCORE;
 use crate::front::patterns::{check_irrefutable, check_pattern};
 use crate::front::traits::bounded_param_of_type;
-use crate::front::types::{
-    FNS, TYPES, TY_BOOL, TY_NEVER, TY_UNIT, TyKind, err_type, fn_param, is_integer,
-};
+use crate::front::types::{FNS, TY_BOOL, TY_NEVER, TY_UNIT, err_type, fn_param, is_integer};
 
 // ---- Functions ----
 
@@ -387,85 +379,14 @@ pub fn check_for(n: i64) -> i64 {
     }
 }
 
-// `for p in s` over a slice or an array (0.4), by value:
-//   { let s' = s; for i' in 0..len { let p = s'[i']; body } }
-// The sequence is evaluated once; the loop keeps its label.
+// `for p in e` where e is not a range literal (0.4: slices and arrays;
+// 0.14: iterators, Vec, ranges as values, ...): e is checked here, once,
+// and the loop desugared by its type (iterate.tach).
 fn check_for_each(n: i64) -> i64 {
     unsafe {
-        let seq = NODES[n].c;
-        let seq_ty = check_wrapped(seq, 0);
-        let kind = TYPES[seq_ty].kind;
-        if kind != TyKind::Slice && kind != TyKind::Array {
-            return check_for_iter(n);
-        }
-        let start = NODES[n].start;
-        let end = NODES[n].end;
-        // (Fixed names: an inner loop's shadow the outer's, which are read
-        // before it. Interned before the symbol tables, see init_declarations.)
-        let seq_sym = intern_c(c"__for_seq");
-        let index_sym = intern_c(c"__for_index");
-        // let s' = s;
-        let seq_bind = new_node(PatBind, start, end);
-        NODES[seq_bind].a = seq_sym;
-        let seq_let = new_node(Let, start, end);
-        NODES[seq_let].a = seq_bind;
-        NODES[seq_let].c = seq;
-        // 0..len
-        let zero = new_node(Int, start, end);
-        let len = if kind == TyKind::Slice {
-            let s_ref = new_node(Ident, start, end);
-            NODES[s_ref].a = seq_sym;
-            let field = new_node(FieldAccess, start, end);
-            NODES[field].a = s_ref;
-            NODES[field].b = intern_c(c"len");
-            field
-        } else {
-            let count = new_node(Int, start, end);
-            NODES[count].a = TYPES[seq_ty].b;
-            NODES[count].b = SUF_I64;
-            count
-        };
-        NODES[zero].b = SUF_I64;
-        let range = new_node(Range, start, end);
-        NODES[range].a = zero;
-        NODES[range].b = len;
-        // let p = s'[i'];
-        let s_ref = new_node(Ident, start, end);
-        NODES[s_ref].a = seq_sym;
-        let i_ref = new_node(Ident, start, end);
-        NODES[i_ref].a = index_sym;
-        let elem = new_node(Index, start, end);
-        NODES[elem].a = s_ref;
-        NODES[elem].b = i_ref;
-        let elem_let = new_node(Let, start, end);
-        NODES[elem_let].a = NODES[n].b;
-        NODES[elem_let].c = elem;
-        // The body, after it.
-        let body = new_node(Block, start, end);
-        let mark = list_begin();
-        list_push(elem_let);
-        let old_body = new_node(ExprStmt, start, end);
-        NODES[old_body].a = NODES[n].d;
-        list_push(old_body);
-        list_end(body, mark);
-        // The loop, then the block around it, which takes the loop's place.
-        let index_bind = new_node(PatBind, start, end);
-        NODES[index_bind].a = index_sym;
-        let lp = new_node(For, start, end);
-        NODES[lp] = NODES[n];
-        NODES[lp].b = index_bind;
-        NODES[lp].c = range;
-        NODES[lp].d = body;
-        let outer = new_node(Block, start, end);
-        let mark2 = list_begin();
-        list_push(seq_let);
-        let loop_stmt = new_node(ExprStmt, start, end);
-        NODES[loop_stmt].a = lp;
-        list_push(loop_stmt);
-        list_end(outer, mark2);
-        NODES[n] = NODES[outer];
-        synth_expr(n)
+        check_wrapped(NODES[n].c, 0);
     }
+    check_for_iter(n)
 }
 
 pub fn check_break(n: i64) {

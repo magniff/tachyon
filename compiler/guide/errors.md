@@ -264,21 +264,13 @@ error[type error] cannot index type 'Vec<i64>'
 `v.get(0)`, `v.set(0, x)`, `v.as_slice()[0]`.
 
 ```tach
-let mut v: Vec<i64> = Vec::new();
-for x in v.iter() { }
+let n = 3;
+for x in n { }
 ```
 ```err
-error[type error] no method 'iter' on type 'Vec<i64>'
+error[type error] 'for' iterates over ranges, slices, arrays, iterators and types with an 'iter' method, got 'i64'
 ```
-`for x in v.as_slice() { }`.
-
-```tach
-let mut v: Vec<i64> = Vec::new();
-for x in v { }
-```
-```err
-error[type error] 'for' loops iterate over integer ranges ('a..b'), slices and arrays, got 'Vec<i64>'
-```
+`for x in 0..n { }`.
 
 ```tach
 let s = "abc";
