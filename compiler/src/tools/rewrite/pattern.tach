@@ -1,0 +1,540 @@
+// A rewrite's pattern and replacement: their holes (`$x`, `$x...`, the
+// --where types), parsed as tachyon; the matching of the pattern against a
+// node, with the types the checker gave; and a site's replacement text.
+
+use crate::base::{
+    BUFS, ERR, IntVec, RECOVER_DEPTH, SRC, _setjmp, add_source, buf_byte, buf_bytes, buf_new,
+    buf_slice, buf_str, errors_forget, errors_mark, intern, recover_enter, recover_leave,
+};
+use crate::front::ast::{NODES, NodeKind, PARSED_COUNT, keep_parsed};
+use crate::front::lexer::{TOK_COUNT, lex_range};
+use crate::front::parser::parse_fragment;
+use crate::front::types::buf_type;
+use crate::middle::lower::HMap;
+use crate::tools::query::c_slice;
+use crate::tools::query::defs::bytes_eq;
+use crate::tools::query::diagnostics::diag;
+use crate::tools::rewrite::parsed::{
+    binding_level, pa, pb, pc, pchild, pcount, pend, pflags, pg, ph, pk, pop, pstart, same_tokens,
+};
+
+// ---- Holes ----
+
+// Per hole: its identifier's symbol, its name as written (a buffer:
+// `$x`), whether it is `$x...`, its --where type (a buffer, without
+// spaces; -1: none).
+pub static mut H_SYM: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut H_NAME: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut H_REST: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut H_TYPE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// What each hole matched at the site being tried: B_NODE the node (-1:
+// nothing yet, -2: arguments, from B_START to B_END; -3: no arguments).
+pub static mut B_NODE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut B_START: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut B_END: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The pattern's hole nodes.
+pub static mut PAT_HOLES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// Sites left out by a --where type: how many, and the first one (its
+// node, hole, type).
+pub static mut TYPE_MISSES: i64 = 0;
+pub static mut MISS_NODE: i64 = 0;
+pub static mut MISS_HOLE: i64 = 0;
+pub static mut MISS_TYPE: i64 = 0;
+// Sites left out because the checker did not type their code.
+pub static mut UNTYPED: i64 = 0;
+
+pub fn is_name_byte(c: u8) -> bool {
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+}
+
+pub fn hole_named(name: [u8], rest: bool) -> i64 {
+    unsafe {
+        for h in 0..H_SYM.count {
+            if bytes_eq(buf_slice(H_NAME.data[h]), name) && (H_REST.data[h] != 0) == rest {
+                return h;
+            }
+        }
+        -1
+    }
+}
+
+// Writes `text` into buffer `out` with each hole an identifier; the
+// pattern's holes are added (`add`), the replacement's must be the
+// pattern's. False after the diagnostic.
+pub fn holes_to_idents(text: *u8, out: i64, add: bool) -> bool {
+    unsafe {
+        let s = c_slice(text);
+        let mut i = 0;
+        while i < s.len {
+            let c = s[i];
+            if c == '"' || c == '\'' {
+                // (a string or a character: as it is)
+                buf_byte(out, c);
+                i += 1;
+                while i < s.len && s[i] != c {
+                    if s[i] == '\\' && i + 1 < s.len {
+                        buf_byte(out, s[i]);
+                        i += 1;
+                    }
+                    buf_byte(out, s[i]);
+                    i += 1;
+                }
+                if i < s.len {
+                    buf_byte(out, s[i]);
+                    i += 1;
+                }
+                continue;
+            }
+            if c != '$' {
+                buf_byte(out, c);
+                i += 1;
+                continue;
+            }
+            let mut e = i + 1;
+            while e < s.len && is_name_byte(s[e]) {
+                e += 1;
+            }
+            if e == i + 1 {
+                let d = diag(c"error", c"rewrite.pattern");
+                buf_str(d, c"'$' without a name in '");
+                buf_bytes(d, s);
+                buf_str(d, c"': holes are $name, or $name... for arguments\n");
+                return false;
+            }
+            let name = s[i..e];
+            let rest = e + 3 <= s.len && s[e] == '.' && s[e + 1] == '.' && s[e + 2] == '.';
+            let ident = buf_new();
+            buf_str(ident, if rest { c"__tachyon_rest_" } else { c"__tachyon_hole_" });
+            buf_bytes(ident, s[i + 1..e]);
+            let mut h = hole_named(name, rest);
+            if h < 0 {
+                if hole_named(name, !rest) >= 0 {
+                    let d = diag(c"error", c"rewrite.pattern");
+                    buf_bytes(d, name);
+                    buf_str(d, c" is written both with and without '...'\n");
+                    return false;
+                }
+                if !add {
+                    let d = diag(c"error", c"rewrite.unbound");
+                    buf_str(d, c"the replacement's ");
+                    buf_bytes(d, name);
+                    if rest {
+                        buf_str(d, c"...");
+                    }
+                    buf_str(d, c" is not in the pattern\n");
+                    return false;
+                }
+                h = H_SYM.count;
+                H_SYM.push(intern(buf_slice(ident)));
+                let nb = buf_new();
+                buf_bytes(nb, name);
+                H_NAME.push(nb);
+                H_REST.push(rest as i64);
+                H_TYPE.push(-1);
+            }
+            buf_bytes(out, buf_slice(ident));
+            i = if rest { e + 3 } else { e };
+        }
+        true
+    }
+}
+
+// The hole node n is (an identifier, a type name or a binding of a
+// hole), or -1.
+pub fn hole_of(n: i64) -> i64 {
+    unsafe {
+        if n <= 0 {
+            return -1;
+        }
+        let k = pk(n);
+        if k != NodeKind::Ident && k != NodeKind::TyName && k != NodeKind::PatBind {
+            return -1;
+        }
+        if k == NodeKind::Ident && pg(n) != 0 {
+            return -1;
+        }
+        let sym = pa(n);
+        for h in 0..H_SYM.count {
+            if H_SYM.data[h] == sym {
+                return h;
+            }
+        }
+        -1
+    }
+}
+
+// Parses buffer `text` (the statements, `stmts`) after the program: its
+// node, or 0 after the diagnostic (`what`: the pattern or the
+// replacement).
+pub fn parse_text(text: i64, stmts: bool, what: *u8) -> i64 {
+    unsafe {
+        let start = add_source(c"<rewrite>", text);
+        let first = TOK_COUNT;
+        let mark = errors_mark();
+        let depth = RECOVER_DEPTH;
+        let mut n = 0;
+        if _setjmp(recover_enter()) == 0 {
+            lex_range(start, start + BUFS[text].len, true);
+            n = parse_fragment(first, stmts);
+        } else {
+            n = 0;
+            let d = diag(c"error", c"rewrite.pattern");
+            buf_str(d, c"the ");
+            buf_str(d, what);
+            buf_str(d, c" is no tachyon ");
+            buf_str(d, if stmts { c"statement" } else { c"expression" });
+            buf_str(d, c": ");
+            buf_bytes(d, buf_slice(ERR));
+            buf_byte(d, '\n');
+        }
+        recover_leave(depth);
+        errors_forget(mark);
+        keep_parsed();
+        n
+    }
+}
+
+// ---- Matching ----
+
+fn has_hole(p: i64) -> bool {
+    unsafe {
+        for i in 0..PAT_HOLES.count {
+            let h = PAT_HOLES.data[i];
+            if pstart(p) <= pstart(h) && pend(h) <= pend(p) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// The type of checked node n as written in --where (no spaces), into a
+// new buffer.
+fn type_key(t: i64) -> i64 {
+    unsafe {
+        let out = buf_new();
+        let text = buf_new();
+        buf_type(text, t);
+        let s = buf_slice(text);
+        for i in 0..s.len {
+            if s[i] != ' ' {
+                buf_byte(out, s[i]);
+            }
+        }
+        out
+    }
+}
+
+// The checked nodes made by the checker (a generic function's
+// instances are clones of its body: generics.tach), by span and kind.
+static mut CLONES: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+fn span_key(start: i64, end: i64, kind: NodeKind) -> i64 {
+    ((start * 128 + kind as i64) * 65536 + (end - start) % 65536) + 1
+}
+
+pub fn note_clones(first: i64, last: i64) {
+    unsafe {
+        for n in first..last {
+            let key = span_key(NODES[n].start, NODES[n].end, NODES[n].kind);
+            if NODES[n].ty > 0 && CLONES.get(key) == 0 {
+                CLONES.put(key, n + 1);
+            }
+        }
+    }
+}
+
+// The type the checker gave node n (as parsed): its own, or in a generic
+// function, its first instance's; 0 when it was not checked.
+fn checked_type(n: i64) -> i64 {
+    unsafe {
+        if NODES[n].ty > 0 {
+            return NODES[n].ty;
+        }
+        let mut c = CLONES.get(span_key(pstart(n), pend(n), pk(n))) - 1;
+        if c < 0 && pk(n) == NodeKind::MethodCall {
+            c = CLONES.get(span_key(pstart(n), pend(n), NodeKind::Call)) - 1;
+        }
+        if c < 0 { 0 } else { NODES[c].ty }
+    }
+}
+
+// Hole h matches node n (a repeated hole: the same tokens as before).
+fn bind(h: i64, n: i64) -> bool {
+    unsafe {
+        if H_REST.data[h] != 0 {
+            return false;
+        }
+        if B_NODE.data[h] != -1 {
+            return B_NODE.data[h] >= 0 && same_tokens(B_START.data[h], B_END.data[h], pstart(n), pend(n));
+        }
+        if H_TYPE.data[h] >= 0 && pk(n) != NodeKind::TyName && pk(n) != NodeKind::PatBind {
+            let t = checked_type(n);
+            if t <= 0 {
+                UNTYPED += 1;
+                return false;
+            }
+            let key = type_key(t);
+            if !bytes_eq(buf_slice(key), buf_slice(H_TYPE.data[h])) {
+                if TYPE_MISSES == 0 {
+                    MISS_NODE = n;
+                    MISS_HOLE = h;
+                    MISS_TYPE = t;
+                }
+                TYPE_MISSES += 1;
+                return false;
+            }
+        }
+        B_NODE.data[h] = n;
+        B_START.data[h] = pstart(n);
+        B_END.data[h] = pend(n);
+        true
+    }
+}
+
+// Hole h (`$x...`) matches the elements from..to of node n's list.
+fn bind_rest(h: i64, n: i64, from: i64, to: i64) -> bool {
+    unsafe {
+        let s = if from < to { pstart(pchild(n, from)) } else { -1 };
+        let e = if from < to { pend(pchild(n, to - 1)) } else { -1 };
+        if B_NODE.data[h] != -1 {
+            if B_NODE.data[h] == -3 || from == to {
+                return B_NODE.data[h] == -3 && from == to;
+            }
+            return same_tokens(B_START.data[h], B_END.data[h], s, e);
+        }
+        B_NODE.data[h] = if from < to { -2 } else { -3 };
+        B_START.data[h] = s;
+        B_END.data[h] = e;
+        true
+    }
+}
+
+fn match_list(p: i64, n: i64) -> bool {
+    let np = pcount(p);
+    let nn = pcount(n);
+    let mut v = -1;
+    let mut vh = -1;
+    for i in 0..np {
+        let h = hole_of(pchild(p, i));
+        if h >= 0 && unsafe { H_REST.data[h] } != 0 {
+            v = i;
+            vh = h;
+            break;
+        }
+    }
+    if v < 0 {
+        if np != nn {
+            return false;
+        }
+        for i in 0..np {
+            if !match_node(pchild(p, i), pchild(n, i)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    let after = np - v - 1;
+    if nn < np - 1 {
+        return false;
+    }
+    for i in 0..v {
+        if !match_node(pchild(p, i), pchild(n, i)) {
+            return false;
+        }
+    }
+    for j in 0..after {
+        if !match_node(pchild(p, v + 1 + j), pchild(n, nn - after + j)) {
+            return false;
+        }
+    }
+    bind_rest(vh, n, v, nn - after)
+}
+
+// Whether pattern node p matches program node n (binding the holes).
+pub fn match_node(p: i64, n: i64) -> bool {
+    if p == 0 || n == 0 {
+        return p == n;
+    }
+    let h = hole_of(p);
+    if h >= 0 {
+        return bind(h, n);
+    }
+    if !has_hole(p) {
+        return same_tokens(pstart(p), pend(p), pstart(n), pend(n));
+    }
+    let k = pk(p);
+    if k != pk(n) {
+        return false;
+    }
+    if k == NodeKind::Binary || k == NodeKind::Assign {
+        return pop(p) == pop(n) && match_node(pb(p), pb(n)) && match_node(pc(p), pc(n));
+    }
+    if k == NodeKind::Unary {
+        return pop(p) == pop(n) && match_node(pb(p), pb(n));
+    }
+    if k == NodeKind::Cast || k == NodeKind::Index || k == NodeKind::Repeat {
+        return match_node(pa(p), pa(n)) && match_node(pb(p), pb(n));
+    }
+    if k == NodeKind::Call {
+        return match_node(pa(p), pa(n)) && match_list(p, n);
+    }
+    if k == NodeKind::MethodCall {
+        return pb(p) == pb(n) && same_part(pg(p), pg(n)) && match_node(pa(p), pa(n)) && match_list(p, n);
+    }
+    if k == NodeKind::FieldAccess || k == NodeKind::TupleField {
+        return pb(p) == pb(n) && match_node(pa(p), pa(n));
+    }
+    if k == NodeKind::Tuple || k == NodeKind::Array {
+        return match_list(p, n);
+    }
+    if k == NodeKind::Range {
+        return pc(p) == pc(n) && match_node(pa(p), pa(n)) && match_node(pb(p), pb(n));
+    }
+    if k == NodeKind::Return || k == NodeKind::Defer {
+        return match_node(pa(p), pa(n));
+    }
+    if k == NodeKind::Break {
+        return pa(p) == pa(n) && match_node(pb(p), pb(n));
+    }
+    if k == NodeKind::StructLit {
+        if pa(p) != pa(n) || !same_part(ph(p), ph(n)) || !same_part(pg(p), pg(n)) || pcount(p) != pcount(n) {
+            return false;
+        }
+        for i in 0..pcount(p) {
+            let a = pchild(p, i);
+            let b = pchild(n, i);
+            if pa(a) != pa(b) || !match_node(pb(a), pb(b)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if k == NodeKind::If {
+        return match_node(pa(p), pa(n)) && match_node(pb(p), pb(n)) && match_node(pc(p), pc(n));
+    }
+    if k == NodeKind::While {
+        return pa(p) == pa(n) && match_node(pb(p), pb(n)) && match_node(pc(p), pc(n));
+    }
+    if k == NodeKind::Loop {
+        return pa(p) == pa(n) && match_node(pb(p), pb(n));
+    }
+    if k == NodeKind::Block {
+        return pflags(p) == pflags(n) && match_list(p, n) && match_node(pa(p), pa(n));
+    }
+    if k == NodeKind::ExprStmt {
+        return pb(p) == pb(n) && match_node(pa(p), pa(n));
+    }
+    if k == NodeKind::Let {
+        return match_node(pa(p), pa(n)) && match_node(pb(p), pb(n)) && match_node(pc(p), pc(n));
+    }
+    false
+}
+
+// Optional parts without holes (type arguments, a path's prefix, a let's
+// pattern): both absent, or the same tokens.
+fn same_part(p: i64, n: i64) -> bool {
+    if p == 0 || n == 0 {
+        return p == n;
+    }
+    same_tokens(pstart(p), pend(p), pstart(n), pend(n))
+}
+
+// ---- Replacing ----
+
+// The replacement: its node, its text (SRC[R_START..R_END)), its holes'
+// nodes in order, and the level each of its nodes needs.
+pub static mut R_ROOT: i64 = 0;
+pub static mut R_START: i64 = 0;
+pub static mut R_END: i64 = 0;
+pub static mut R_HOLES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut R_LEVELS: *i64 = 0 as *i64;
+pub static mut P_LEVELS: *i64 = 0 as *i64;
+pub static mut STMTS: bool = false;
+
+// The list node holding replacement node q as an element, and its index
+// (-1 when none).
+fn list_of(q: i64, index: *i64) -> i64 {
+    unsafe {
+        for n in 1..PARSED_COUNT {
+            if pstart(n) < R_START || pend(n) > R_END {
+                continue;
+            }
+            let k = pk(n);
+            if k != NodeKind::Call && k != NodeKind::MethodCall && k != NodeKind::Tuple && k != NodeKind::Array {
+                continue;
+            }
+            for i in 0..pcount(n) {
+                if pchild(n, i) == q {
+                    *index = i;
+                    return n;
+                }
+            }
+        }
+        -1
+    }
+}
+
+// The level of what hole h matched (99: arguments).
+fn bound_level(h: i64) -> i64 {
+    unsafe {
+        let n = B_NODE.data[h];
+        if n < 0 { 99 } else { binding_level(n) }
+    }
+}
+
+// The text replacing the site, from the holes' bindings, into a buffer.
+pub fn replacement_text() -> i64 {
+    unsafe {
+        let out = buf_new();
+        let mut cur = R_START;
+        for i in 0..R_HOLES.count {
+            let q = R_HOLES.data[i];
+            let h = hole_of(q);
+            let mut from = pstart(q);
+            let mut to = pend(q);
+            if H_REST.data[h] != 0 && B_NODE.data[h] == -3 {
+                // (no arguments: the hole goes, with a comma next to it)
+                let mut k = 0;
+                let list = list_of(q, &k);
+                if list >= 0 && pcount(list) > 1 {
+                    if k > 0 {
+                        from = pend(pchild(list, k - 1));
+                    } else {
+                        to = pstart(pchild(list, 1));
+                    }
+                }
+                if from < cur {
+                    from = cur;
+                }
+                buf_bytes(out, SRC[cur..from]);
+                cur = to;
+                continue;
+            }
+            buf_bytes(out, SRC[cur..from]);
+            let wrap = H_REST.data[h] == 0 && bound_level(h) < R_LEVELS[q];
+            if wrap {
+                buf_byte(out, '(');
+            }
+            buf_bytes(out, SRC[B_START.data[h]..B_END.data[h]]);
+            if wrap {
+                buf_byte(out, ')');
+            }
+            cur = to;
+        }
+        buf_bytes(out, SRC[cur..R_END]);
+        out
+    }
+}
+
+// The level of the replacement as a whole, at the site being replaced.
+pub fn replacement_level() -> i64 {
+    let h = hole_of(unsafe { R_ROOT });
+    if h >= 0 {
+        return bound_level(h);
+    }
+    binding_level(unsafe { R_ROOT })
+}

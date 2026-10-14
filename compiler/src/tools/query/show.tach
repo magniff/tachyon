@@ -1,0 +1,293 @@
+// `query def`, `query show` and `query items`: a definition's location and
+// signature, its source text with the comments above it, the module tree,
+// and a module's items with their signatures.
+
+use crate::base::{
+    BUFS, FILES, FILE_COUNT, IntVec, SRC, STDOUT, SYMS, buf_byte, buf_bytes, buf_int, buf_new,
+    buf_slice, buf_str, buf_write_fd, intern_c,
+};
+use crate::front::ast::{NODES, NodeKind};
+use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
+use crate::front::modules::{MODULES, file_of_pos, module_count};
+use crate::tools::query::defs::{
+    DEFS, DEF_COUNT, K_CONST, K_ENUM, K_FN, K_IMPL_METHOD, K_METHOD, K_MOD, K_STATIC, K_STRUCT,
+    K_TRAIT, K_TRAIT_FN, bytes_eq, ends_with, find_in, kind_name, mod_fqn,
+};
+use crate::tools::query::diagnostics::{diag, try_query};
+use crate::tools::query::positions::{
+    collapse, is_space, line_end, line_of, line_start, put_loc, put_path, sort_by_position,
+    token_at,
+};
+use crate::tools::query_text::section_start;
+
+// ---- def, show, items ----
+
+// The end of definition d's signature (before its body or its value).
+pub fn signature_end(d: i64) -> i64 {
+    unsafe {
+        let node = DEFS[d].node;
+        let k = DEFS[d].kind;
+        if (k == K_FN || k == K_METHOD || k == K_IMPL_METHOD || k == K_TRAIT_FN)
+            && NODES[node].kind == NodeKind::Fn && NODES[node].c != 0 {
+            return NODES[NODES[node].c].start;
+        }
+        if k == K_STRUCT || k == K_ENUM || k == K_TRAIT {
+            let mut i = token_at(DEFS[d].name_pos);
+            while i < TOK_COUNT && TOKS[i].kind != Tok::LBrace && TOKS[i].kind != Tok::Semi
+                && TOKS[i].kind != Tok::Eof {
+                i += 1;
+            }
+            return TOKS[i].start;
+        }
+        if k == K_MOD {
+            return DEFS[d].name_pos + SYMS[DEFS[d].name].text.len;
+        }
+        let mut end = DEFS[d].end;
+        while end > DEFS[d].start && (SRC[end - 1] == ';' || SRC[end - 1] == ',' || is_space(SRC[end - 1])) {
+            end -= 1;
+        }
+        end
+    }
+}
+
+const LONG_SIGNATURE: i64 = 120;
+
+pub fn put_signature(out: i64, d: i64) {
+    unsafe {
+        if DEFS[d].public && DEFS[d].kind != K_IMPL_METHOD {
+            buf_str(out, c"pub ");
+        }
+        let mark = buf_slice(out).len;
+        collapse(out, DEFS[d].start, signature_end(d));
+        let k = DEFS[d].kind;
+        if (k == K_CONST || k == K_STATIC) && buf_slice(out).len - mark > LONG_SIGNATURE {
+            // A long value: cut at its `=`.
+            let text = buf_slice(out);
+            let eq = find_in(text, c" = ", mark);
+            if eq >= 0 {
+                BUFS[out].len = eq;
+                buf_str(out, c" = ...");
+            }
+        }
+    }
+}
+
+pub fn query_def(matches: *IntVec) {
+    unsafe {
+        let out = buf_new();
+        for i in 0..(*matches).count {
+            query_def_one(out, (*matches).data[i]);
+        }
+        buf_write_fd(out, STDOUT);
+    }
+}
+
+// `PATH<TAB>FILE:LINE:COL<TAB>KIND<TAB>SIGNATURE` of definition d.
+pub fn query_def_one(out: i64, d: i64) {
+    unsafe {
+        buf_bytes(out, SYMS[DEFS[d].fqn].text);
+        buf_byte(out, '\t');
+        put_loc(out, DEFS[d].name_pos);
+        buf_byte(out, '\t');
+        buf_str(out, kind_name(DEFS[d].kind));
+        buf_byte(out, '\t');
+        put_signature(out, d);
+        buf_byte(out, '\n');
+    }
+}
+
+// The start of the first line of definition d's text: the line of its
+// start, and the comment and attribute lines right above it.
+pub fn text_start(d: i64) -> i64 {
+    unsafe {
+        let mut first = line_start(DEFS[d].start);
+        let file_start = FILES[file_of_pos(first)].start;
+        while first > file_start {
+            let prev = line_start(first - 1);
+            let mut a = prev;
+            while a < first - 1 && (SRC[a] == ' ' || SRC[a] == '\t') {
+                a += 1;
+            }
+            let comment = a + 1 < first && SRC[a] == '/' && SRC[a + 1] == '/';
+            let attribute = a + 1 < first && SRC[a] == '#' && SRC[a + 1] == '[';
+            if !comment && !attribute {
+                break;
+            }
+            first = prev;
+        }
+        first
+    }
+}
+
+// More matches than this: `show` lists their paths only.
+const SHOW_MAX: i64 = 5;
+
+pub fn query_show(matches: *IntVec, name: [u8]) -> i64 {
+    unsafe {
+        let out = buf_new();
+        let n = (*matches).count;
+        if n > SHOW_MAX {
+            for i in 0..n {
+                buf_bytes(out, SYMS[DEFS[(*matches).data[i]].fqn].text);
+                buf_byte(out, '\n');
+            }
+            buf_write_fd(out, STDOUT);
+            let d = diag(c"error", c"query.ambiguous");
+            buf_int(d, n);
+            buf_str(d, c" definitions match '");
+            buf_bytes(d, name);
+            buf_str(d, c"'; showing paths only\n");
+            try_query(c"show", SYMS[DEFS[(*matches).data[0]].fqn].text);
+            return 1;
+        }
+        for i in 0..n {
+            let d = (*matches).data[i];
+            let first = section_start(text_start(d));
+            let last = line_end(if DEFS[d].end > DEFS[d].start { DEFS[d].end - 1 } else { DEFS[d].start });
+            buf_str(out, c"// ");
+            buf_bytes(out, SYMS[DEFS[d].fqn].text);
+            buf_byte(out, '\t');
+            put_path(out, file_of_pos(first));
+            buf_byte(out, ':');
+            buf_int(out, line_of(first));
+            buf_byte(out, '-');
+            buf_int(out, line_of(last));
+            buf_byte(out, '\n');
+            buf_bytes(out, SRC[first..last]);
+            buf_byte(out, '\n');
+        }
+        buf_write_fd(out, STDOUT);
+        0
+    }
+}
+
+// The modules answering to `name` (all of them for none), in `out`.
+pub fn find_modules(name: [u8], exact: bool, out: *IntVec) {
+    unsafe {
+        for m in 0..module_count() {
+            if MODULES[m].name < 0 && m != 0 {
+                continue;
+            }
+            let fqn = SYMS[mod_fqn(m)].text;
+            if name.len == 0 || bytes_eq(fqn, name) || ends_with(fqn, name, exact) {
+                out.push(m);
+            }
+        }
+    }
+}
+
+// The module tree: each module's path, file and number of items.
+pub fn query_modules() {
+    unsafe {
+        let out = buf_new();
+        let mut all = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        find_modules(SYMS[intern_c(c"")].text, false, &all);
+        for i in 0..all.count {
+            let m = all.data[i];
+            let mut items = 0;
+            let mut first = -1;
+            for d in 0..DEF_COUNT {
+                if DEFS[d].module == m && DEFS[d].parent < 0 {
+                    items += 1;
+                    if first < 0 {
+                        first = d;
+                    }
+                }
+            }
+            buf_bytes(out, SYMS[mod_fqn(m)].text);
+            buf_byte(out, '\t');
+            let f = module_file(m);
+            if f >= 0 {
+                put_path(out, f);
+            }
+            buf_byte(out, '\t');
+            buf_int(out, items);
+            buf_byte(out, '\n');
+        }
+        buf_write_fd(out, STDOUT);
+    }
+}
+
+// The file of module m (an inline module's is its parent's), or -1.
+pub fn module_file(m: i64) -> i64 {
+    unsafe {
+        for f in 0..FILE_COUNT {
+            if FILES[f].module == m {
+                return f;
+            }
+        }
+        if m > 0 && MODULES[m].parent >= 0 { module_file(MODULES[m].parent) } else { -1 }
+    }
+}
+
+// The `impl ... {` header of the impl block of function definition d.
+fn put_impl_header(out: i64, d: i64) {
+    unsafe {
+        let node = DEFS[d].node;
+        let mut from = 0;
+        if DEFS[d].impl_node != 0 {
+            from = NODES[DEFS[d].impl_node].start;
+        } else {
+            let mut i = token_at(NODES[NODES[node].h].start) - 1;
+            while i > 0 && TOKS[i].kind != Tok::Impl {
+                i -= 1;
+            }
+            from = TOKS[i].start;
+        }
+        let mut j = token_at(from);
+        while j < TOK_COUNT && TOKS[j].kind != Tok::LBrace && TOKS[j].kind != Tok::Eof {
+            j += 1;
+        }
+        buf_int(out, line_of(from));
+        buf_str(out, c"\timpl\t");
+        collapse(out, from, TOKS[j].start);
+        buf_byte(out, '\n');
+    }
+}
+
+pub fn query_items(modules: *IntVec) {
+    unsafe {
+        let out = buf_new();
+        let mut all = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for d in 0..DEF_COUNT {
+            all.push(d);
+        }
+        sort_by_position(&all);
+        for i in 0..(*modules).count {
+            let m = (*modules).data[i];
+            buf_str(out, c"# ");
+            buf_bytes(out, SYMS[mod_fqn(m)].text);
+            let f = module_file(m);
+            if f >= 0 {
+                buf_byte(out, '\t');
+                put_path(out, f);
+            }
+            buf_byte(out, '\n');
+            let mut impl_of = -1;
+            for j in 0..all.count {
+                let d = all.data[j];
+                if DEFS[d].module != m || DEFS[d].parent >= 0 {
+                    continue;
+                }
+                let k = DEFS[d].kind;
+                if k == K_METHOD || k == K_IMPL_METHOD {
+                    // (the functions of one impl block share its type node)
+                    let block = if DEFS[d].impl_node != 0 { DEFS[d].impl_node } else { NODES[DEFS[d].node].h };
+                    if block != impl_of {
+                        put_impl_header(out, d);
+                        impl_of = block;
+                    }
+                } else {
+                    impl_of = -1;
+                }
+                buf_int(out, line_of(DEFS[d].name_pos));
+                buf_byte(out, '\t');
+                buf_str(out, kind_name(k));
+                buf_byte(out, '\t');
+                put_signature(out, d);
+                buf_byte(out, '\n');
+            }
+        }
+        buf_write_fd(out, STDOUT);
+    }
+}

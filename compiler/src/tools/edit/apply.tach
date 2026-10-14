@@ -1,0 +1,617 @@
+// Applying an edit of the engine: the edited files' copies, the check of
+// the edited program (an error it has and the program had not refuses the
+// edit), then the copies renamed onto the files, the journal and the
+// summary line; or with --dry-run the diff. A script's step writes its
+// copies unchecked (STEP_REPORT).
+
+use crate::base::{
+    FILES, FILE_COUNT, IntVec, OVERLAY, SRC, STDOUT, buf_byte, buf_bytes, buf_int, buf_new,
+    buf_slice, buf_str, buf_write_fd, errors_short, streq, strlen,
+};
+use crate::front::cpp::file_exists;
+use crate::tools::edit::{
+    ADDED, ARGC, ARGV, CH_FILE, CH_TEXT, DEL_FILE, DEL_TO, DRY_RUN, NEW_PATH, NEW_TEXT, NO_CHECK,
+    REMOVED, SHOW, TARGET_NAME, edit_new_file, gone_path, move_files, new_texts,
+    remove_empty_dirs, sorted_edits,
+};
+use crate::tools::edit::diff::{diff_moved, diff_texts, shown_path};
+use crate::tools::proc::{
+    buf_cstr, make_dirs, read_file_if, remove_file, rename_file, run_capture, same_bytes,
+    write_file_if,
+};
+use crate::tools::query::c_slice;
+use crate::tools::query::diagnostics::{PROG, diag, diags, put_cword, put_root, try_end};
+use crate::tools::query::refs::file_text;
+use crate::tools::edit::undo::journal;
+
+// ---- Checking the edited program ----
+
+// The suffix of an edited file's copy.
+pub fn copy_path(path: *u8) -> *u8 {
+    unsafe {
+        let b = buf_new();
+        buf_str(b, path);
+        buf_str(b, c".tachyon-edit~");
+        buf_cstr(b)
+    }
+}
+
+// The key of a short diagnostic line: its file and message, without its
+// line and column (which an edit moves); empty for a line that is not an
+// error.
+fn error_key(line: [u8], out: i64) -> bool {
+    let mut i = 0;
+    while i + 8 <= line.len {
+        if line[i] == ':' && line[i + 1] == ' ' && line[i + 2] == 'e' && line[i + 3] == 'r' && line[i + 4] == 'r'
+            && line[i + 5] == 'o' && line[i + 6] == 'r' && line[i + 7] == '[' {
+            let mut f = 0;
+            while f < i && line[f] != ':' {
+                f += 1;
+            }
+            buf_bytes(out, line[0..f]);
+            buf_bytes(out, line[i + 1..line.len]);
+            return true;
+        }
+        i += 1;
+    }
+    if line.len >= 6 && line[0] == 'e' && line[5] == '[' {
+        buf_bytes(out, line);
+        return true;
+    }
+    false
+}
+
+// The error lines of text (one diagnostic per line): their keys and the
+// lines, in pairs of buffers.
+fn error_lines(text: [u8], out: *IntVec) {
+    let mut i = 0;
+    while i < text.len {
+        let mut e = i;
+        while e < text.len && text[e] != '\n' {
+            e += 1;
+        }
+        let key = buf_new();
+        if error_key(text[i..e], key) {
+            let line = buf_new();
+            buf_bytes(line, text[i..e]);
+            out.push(key);
+            out.push(line);
+        }
+        i = e + 1;
+    }
+}
+
+// The errors of the edited program that the program had not (each old
+// error matches one new error of the same key): their lines, into `added`.
+// Whether the check could run.
+fn check_edited(root: *u8, added: *IntVec) -> bool {
+    unsafe {
+        let before = buf_new();
+        errors_short(before);
+        let mut old = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        error_lines(buf_slice(before), &old);
+        // `PROG check --diagnostics=short [--target T] --overlay FILE COPY... ROOT`
+        let mut args = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        args.push(PROG as i64);
+        args.push(c"check" as i64);
+        args.push(c"--diagnostics=short" as i64);
+        if TARGET_NAME != 0 as *u8 {
+            args.push(c"--target" as i64);
+            args.push(TARGET_NAME as i64);
+        }
+        overlay_args(&args);
+        args.push(root as i64);
+        args.push(0);
+        let out = buf_new();
+        let status = run_capture(args.data as **u8, out);
+        if status != 0 && status != 1 {
+            return false;
+        }
+        let mut now = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        error_lines(buf_slice(out), &now);
+        let used = crate::base::alloc_array::<bool>(old.count / 2 + 1);
+        let mut i = 0;
+        while i < now.count {
+            let mut found = false;
+            let mut j = 0;
+            while j < old.count {
+                if !used[j / 2] && same_bytes(buf_slice(old.data[j]), buf_slice(now.data[i])) {
+                    used[j / 2] = true;
+                    found = true;
+                    break;
+                }
+                j += 2;
+            }
+            if !found {
+                added.push(now.data[i + 1]);
+            }
+            i += 2;
+        }
+        true
+    }
+}
+
+// The command line (for the `try:` line of a refused edit).
+pub fn set_command(argc: i64, argv: **u8) {
+    ARGC = argc;
+    ARGV = argv;
+}
+
+// The command as it was run, with one more option (for a `try:` line).
+pub fn try_again(option: *u8) {
+    unsafe {
+        let out = diags();
+        buf_str(out, c"try:");
+        put_cword(out, PROG);
+        for i in 1..ARGC {
+            put_cword(out, ARGV[i]);
+        }
+        if option != 0 as *u8 {
+            buf_byte(out, ' ');
+            buf_str(out, option);
+        }
+        try_end(out);
+    }
+}
+
+// ---- Applying ----
+
+// Applies the edit: checks it, writes it (or with --dry-run prints it),
+// journals it, and prints `what` with the files and the lines changed.
+// The exit status: 0 done, 1 refused (nothing written).
+pub fn apply_edit(what: [u8], root: *u8) -> i64 {
+    let status = prepare_edit();
+    if status >= 0 {
+        return status;
+    }
+    finish_edit(what, root)
+}
+
+// Step 1: the new texts, and their copies. -1 when they are ready, else
+// the exit status (0: nothing to change).
+pub fn prepare_edit() -> i64 {
+    unsafe {
+        let mut order = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        sorted_edits(&order);
+        new_texts(&order);
+        move_files();
+        if CH_FILE.count == 0 && NEW_PATH.count == 0 {
+            let d = diag(c"note", c"edit.unchanged");
+            buf_str(d, c"nothing to change\n");
+            return 0;
+        }
+        let mut ok = true;
+        for i in 0..CH_FILE.count {
+            let path = FILES[CH_FILE.data[i]].path;
+            if !write_file_if(copy_path(path), buf_slice(CH_TEXT.data[i])) {
+                ok = false;
+                cannot_write(path);
+            }
+        }
+        for i in 0..NEW_PATH.count {
+            let path = NEW_PATH.data[i] as *u8;
+            if file_exists(path) {
+                let d = diag(c"error", c"edit.exists");
+                buf_str(d, c"'");
+                buf_str(d, path);
+                buf_str(d, c"' exists already\n");
+                ok = false;
+            } else if !make_parent(path) || !write_file_if(copy_path(path), buf_slice(NEW_TEXT.data[i])) {
+                ok = false;
+                cannot_write(path);
+            }
+        }
+        if !ok {
+            remove_copies();
+            return 1;
+        }
+        -1
+    }
+}
+
+// The `--overlay FILE COPY` arguments of the edited files (for a command
+// that runs on the edited program), and of the files this program was
+// read with in place of others (a step of a script: the edits of the
+// steps before).
+pub fn overlay_args(args: *IntVec) {
+    unsafe {
+        let mut k = 0;
+        while k < OVERLAY.count {
+            let p = OVERLAY.data[k] as *u8;
+            if !edited_path(p) {
+                args.push(c"--overlay" as i64);
+                args.push(p as i64);
+                args.push(OVERLAY.data[k + 1]);
+            }
+            k += 2;
+        }
+        for i in 0..CH_FILE.count {
+            args.push(c"--overlay" as i64);
+            args.push(FILES[CH_FILE.data[i]].path as i64);
+            args.push(copy_path(FILES[CH_FILE.data[i]].path) as i64);
+        }
+        for i in 0..NEW_PATH.count {
+            args.push(c"--overlay" as i64);
+            args.push(NEW_PATH.data[i]);
+            args.push(copy_path(NEW_PATH.data[i] as *u8) as i64);
+        }
+        for i in 0..DEL_FILE.count {
+            args.push(c"--overlay" as i64);
+            args.push(FILES[DEL_FILE.data[i]].path as i64);
+            args.push(gone_path(FILES[DEL_FILE.data[i]].path) as i64);
+        }
+    }
+}
+
+// Whether the edit changes or makes file `path`.
+fn edited_path(path: *u8) -> bool {
+    unsafe {
+        for i in 0..CH_FILE.count {
+            if streq(FILES[CH_FILE.data[i]].path, path) {
+                return true;
+            }
+        }
+        for i in 0..NEW_PATH.count {
+            if streq(NEW_PATH.data[i] as *u8, path) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// A file the steps of a script made (script.tach): its text is its copy's.
+pub fn copy_made(path: *u8) -> bool {
+    unsafe {
+        let text = buf_new();
+        if !read_file_if(copy_path(path), text) {
+            return false;
+        }
+        edit_new_file(path, text);
+        true
+    }
+}
+
+// File `path`'s copy was rewritten (by a later round of fix): its new
+// text is the copy's. False when path is no file of the program.
+pub fn copy_rewritten(path: [u8]) -> bool {
+    unsafe {
+        for f in 0..FILE_COUNT {
+            if !same_bytes(c_slice(FILES[f].path), path) {
+                continue;
+            }
+            let text = buf_new();
+            if !read_file_if(copy_path(FILES[f].path), text) {
+                return false;
+            }
+            for i in 0..CH_FILE.count {
+                if CH_FILE.data[i] == f {
+                    CH_TEXT.data[i] = text;
+                    return true;
+                }
+            }
+            CH_FILE.push(f);
+            CH_TEXT.push(text);
+            return true;
+        }
+        false
+    }
+}
+
+// The new texts of the edit as copies, without a check (a round of fix
+// run on an edited program: `fix --round`): prints `file<TAB>PATH` per
+// copy written.
+pub fn write_round() -> i64 {
+    unsafe {
+        let mut order = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        sorted_edits(&order);
+        new_texts(&order);
+        let out = buf_new();
+        for i in 0..CH_FILE.count {
+            let path = FILES[CH_FILE.data[i]].path;
+            if !write_file_if(copy_path(path), buf_slice(CH_TEXT.data[i])) {
+                cannot_write(path);
+                return 1;
+            }
+            buf_str(out, c"file\t");
+            buf_str(out, path);
+            buf_byte(out, '\n');
+        }
+        buf_write_fd(out, STDOUT);
+        0
+    }
+}
+
+// Steps 2 to 4, once the copies are written (prepare_edit): the check,
+// then the files written (or the diff printed), the journal, the summary.
+pub fn finish_edit(what: [u8], root: *u8) -> i64 {
+    unsafe {
+        // The diff (printed with --dry-run; it counts the lines).
+        let diff = buf_new();
+        for i in 0..CH_FILE.count {
+            let f = CH_FILE.data[i];
+            diff_texts(diff, file_text(f), SRC[FILES[f].start..FILES[f].end], buf_slice(CH_TEXT.data[i]));
+        }
+        for i in 0..NEW_PATH.count {
+            let mut from = -1;
+            for k in 0..DEL_FILE.count {
+                if DEL_TO.data[k] == i {
+                    from = DEL_FILE.data[k];
+                }
+            }
+            if from >= 0 {
+                diff_moved(diff, file_text(from), shown_path(NEW_PATH.data[i] as *u8),
+                    SRC[FILES[from].start..FILES[from].end], buf_slice(NEW_TEXT.data[i]));
+            } else {
+                diff_texts(diff, shown_path(NEW_PATH.data[i] as *u8), SRC[0..0], buf_slice(NEW_TEXT.data[i]));
+            }
+        }
+        for k in 0..DEL_FILE.count {
+            let f = DEL_FILE.data[k];
+            if DEL_TO.data[k] < 0 {
+                diff_texts(diff, file_text(f), SRC[FILES[f].start..FILES[f].end], SRC[0..0]);
+            }
+        }
+        if STEP_REPORT != 0 as *u8 {
+            return step_done(what);
+        }
+        let mut ok = true;
+        // 2, 3. The check.
+        let mut added = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let checked = check_edited(root, &added);
+        if !checked {
+            let d = diag(c"warning", c"edit.unchecked");
+            buf_str(d, c"the edited program could not be checked (");
+            buf_str(d, PROG);
+            buf_str(d, c" check did not run)\n");
+        }
+        if DRY_RUN || (added.count > 0 && !NO_CHECK) {
+            remove_copies();
+        }
+        if DRY_RUN {
+            buf_write_fd(diff, STDOUT);
+        }
+        if added.count > 0 {
+            let lines = buf_new();
+            for i in 0..added.count {
+                buf_bytes(lines, buf_slice(added.data[i]));
+                buf_byte(lines, '\n');
+            }
+            buf_write_fd(lines, STDOUT);
+            let refused = !NO_CHECK && !DRY_RUN;
+            let d = diag(if refused { c"error" } else { c"warning" }, c"edit.breaks");
+            buf_int(d, added.count);
+            buf_str(d, if added.count == 1 { c" new error" } else { c" new errors" });
+            buf_str(d, if refused { c"; nothing written\n" } else if DRY_RUN { c" (dry run)\n" } else { c"; written anyway (--no-check)\n" });
+            if refused {
+                try_again(c"--no-check");
+            } else if !DRY_RUN {
+                let out = diags();
+                buf_str(out, c"try:");
+                put_cword(out, PROG);
+                buf_str(out, c" check");
+                put_root(out);
+                try_end(out);
+            }
+        }
+        if DRY_RUN {
+            return if added.count == 0 { 0 } else { 1 };
+        }
+        if added.count > 0 && !NO_CHECK {
+            return 1;
+        }
+        // 4. Journal, then rename.
+        let summary = buf_new();
+        put_summary(summary, what);
+        journal(root, buf_slice(summary));
+        for i in 0..CH_FILE.count {
+            let path = FILES[CH_FILE.data[i]].path;
+            if !rename_file(copy_path(path), path) {
+                cannot_write(path);
+                ok = false;
+            }
+        }
+        for i in 0..NEW_PATH.count {
+            let path = NEW_PATH.data[i] as *u8;
+            if !rename_file(copy_path(path), path) {
+                cannot_write(path);
+                ok = false;
+            }
+        }
+        for i in 0..DEL_FILE.count {
+            let path = FILES[DEL_FILE.data[i]].path;
+            remove_file(path);
+            remove_empty_dirs(path);
+        }
+        buf_byte(summary, '\n');
+        buf_write_fd(summary, STDOUT);
+        if SHOW {
+            show_changes(buf_slice(diff));
+        }
+        if ok { 0 } else { 1 }
+    }
+}
+
+// --show (0.12): after an edit, the regions it changed, as their new lines
+// numbered (from the edit's diff): `// FILE:A-B` then `LINE<TAB>TEXT`;
+// lines only removed: `// FILE:A: N lines removed after line A`.
+fn show_changes(diff: [u8]) {
+    unsafe {
+        let out = buf_new();
+        let mut file = diff[0..0];
+        let mut line = 0;
+        let mut header = false;
+        let mut i = 0;
+        while i < diff.len {
+            let mut e = i;
+            while e < diff.len && diff[e] != '\n' {
+                e += 1;
+            }
+            let l = diff[i..e];
+            if header && l.len >= 6 && l[0] == '+' && l[1] == '+' && l[2] == '+' {
+                file = l[6..l.len];
+                header = false;
+            } else if l.len >= 6 && l[0] == '-' && l[1] == '-' && l[2] == '-' && l[3] == ' ' {
+                header = true;
+            } else if l.len > 2 && l[0] == '@' && l[1] == '@' {
+                // `@@ -A[,B] +C[,D] @@`
+                let mut p = 4;
+                let mut removed = 1;
+                while p < l.len && l[p] >= '0' && l[p] <= '9' {
+                    p += 1;
+                }
+                if p < l.len && l[p] == ',' {
+                    p += 1;
+                    removed = 0;
+                    while p < l.len && l[p] >= '0' && l[p] <= '9' {
+                        removed = removed * 10 + (l[p] - '0') as i64;
+                        p += 1;
+                    }
+                }
+                p += 2;
+                let mut c = 0;
+                while p < l.len && l[p] >= '0' && l[p] <= '9' {
+                    c = c * 10 + (l[p] - '0') as i64;
+                    p += 1;
+                }
+                let mut d = 1;
+                if p < l.len && l[p] == ',' {
+                    p += 1;
+                    d = 0;
+                    while p < l.len && l[p] >= '0' && l[p] <= '9' {
+                        d = d * 10 + (l[p] - '0') as i64;
+                        p += 1;
+                    }
+                }
+                line = c;
+                buf_str(out, c"// ");
+                buf_bytes(out, file);
+                buf_byte(out, ':');
+                buf_int(out, c);
+                if d == 0 {
+                    buf_str(out, c": ");
+                    buf_int(out, removed);
+                    buf_str(out, if removed == 1 { c" line removed after line " } else { c" lines removed after line " });
+                    buf_int(out, c);
+                } else if d > 1 {
+                    buf_byte(out, '-');
+                    buf_int(out, c + d - 1);
+                }
+                buf_byte(out, '\n');
+            } else if l.len > 0 && l[0] == '+' {
+                buf_int(out, line);
+                buf_byte(out, '\t');
+                buf_bytes(out, l[1..l.len]);
+                buf_byte(out, '\n');
+                line += 1;
+            }
+            i = e + 1;
+        }
+        buf_write_fd(out, STDOUT);
+    }
+}
+
+// A step of a `refactor --script` (0.11, script.tach) is neither
+// checked nor written: its copies stay, for the next steps (which read
+// them, --overlay) and the check at the end; its files are listed in
+// STEP_REPORT (`file PATH`, `new PATH`), and its summary line printed.
+pub static mut STEP_REPORT: *u8 = 0 as *u8;
+
+fn step_done(what: [u8]) -> i64 {
+    unsafe {
+        let report = buf_new();
+        for i in 0..CH_FILE.count {
+            buf_str(report, c"file\t");
+            buf_str(report, FILES[CH_FILE.data[i]].path);
+            buf_byte(report, '\n');
+        }
+        for i in 0..NEW_PATH.count {
+            buf_str(report, c"new\t");
+            buf_str(report, NEW_PATH.data[i] as *u8);
+            buf_byte(report, '\n');
+        }
+        // (the files it moved away: `gone PATH`)
+        for i in 0..DEL_FILE.count {
+            buf_str(report, c"gone\t");
+            buf_str(report, FILES[DEL_FILE.data[i]].path);
+            buf_byte(report, '\n');
+        }
+        if !write_file_if(STEP_REPORT, buf_slice(report)) {
+            cannot_write(STEP_REPORT);
+            remove_copies();
+            return 1;
+        }
+        let summary = buf_new();
+        put_summary(summary, what);
+        buf_byte(summary, '\n');
+        buf_write_fd(summary, STDOUT);
+        0
+    }
+}
+
+// `WHAT<TAB>FILE<TAB>+A -R lines` (or `N files`).
+fn put_summary(out: i64, what: [u8]) {
+    unsafe {
+        buf_bytes(out, what);
+        buf_byte(out, '\t');
+        let mut files = CH_FILE.count + NEW_PATH.count;
+        for k in 0..DEL_FILE.count {
+            if DEL_TO.data[k] < 0 {
+                files += 1;
+            }
+        }
+        if files == 1 {
+            if CH_FILE.count == 1 {
+                buf_bytes(out, file_text(CH_FILE.data[0]));
+            } else {
+                buf_bytes(out, shown_path(NEW_PATH.data[0] as *u8));
+            }
+        } else {
+            buf_int(out, files);
+            buf_str(out, c" files");
+        }
+        buf_str(out, c"\t+");
+        buf_int(out, ADDED);
+        buf_str(out, c" -");
+        buf_int(out, REMOVED);
+        buf_str(out, c" lines");
+    }
+}
+
+fn remove_copies() {
+    unsafe {
+        for i in 0..CH_FILE.count {
+            remove_file(copy_path(FILES[CH_FILE.data[i]].path));
+        }
+        for i in 0..NEW_PATH.count {
+            remove_file(copy_path(NEW_PATH.data[i] as *u8));
+            remove_empty_dirs(NEW_PATH.data[i] as *u8);
+        }
+    }
+}
+
+pub fn cannot_write(path: *u8) {
+    unsafe {
+        let d = diag(c"error", c"edit.write");
+        buf_str(d, c"cannot write '");
+        buf_str(d, path);
+        buf_str(d, c"'\n");
+    }
+}
+
+// Makes the directory of path (for a new file).
+pub fn make_parent(path: *u8) -> bool {
+    unsafe {
+        let n = strlen(path) as i64;
+        let mut i = n - 1;
+        while i > 0 && path[i] != '/' {
+            i -= 1;
+        }
+        if i <= 0 {
+            return true;
+        }
+        let b = buf_new();
+        buf_bytes(b, path[0..i]);
+        make_dirs(buf_cstr(b))
+    }
+}

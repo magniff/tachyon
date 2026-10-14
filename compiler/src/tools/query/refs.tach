@@ -1,0 +1,579 @@
+// `query refs` and `query callers`: the references the checker resolved to
+// the definitions asked about (the TARGETS, a trait function with its
+// impls), collected from the checked nodes and the NOTES, kept to `--in
+// FILE|MODULE`, and printed by file, cut to a summary past REFS_BUDGET.
+
+use crate::base::{
+    FILES, FILE_COUNT, IntVec, SRC, STDOUT, SYMS, alloc_array, buf_byte, buf_bytes, buf_int,
+    buf_new, buf_str, buf_write_fd, streq, strlen,
+};
+use crate::front::ast::{NODES, NODE_COUNT, NodeKind, child};
+use crate::front::check::Res;
+use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
+use crate::front::modules::{MODULES, file_of_pos, module_at, module_count};
+use crate::front::types::{CONSTS, FNS, STATICS, STRUCTS, TYPES, TyKind, VARIANTS};
+use crate::middle::lower::HMap;
+use crate::tools::query::{
+    NOTES, QF_CALL, QF_DEF, def_at_line, parse_digits, trailing_number,
+};
+use crate::tools::query::defs::{
+    DEFS, DEF_COUNT, K_IMPL_METHOD, K_TRAIT_FN, bytes_eq, def_of_node, find_in, mod_fqn, trait_of,
+};
+use crate::tools::query::diagnostics::{diag, put_cword, put_word, try_begin, try_end};
+use crate::tools::query::positions::{
+    enclosing, find_name, is_space, line_end, line_of, line_start, rank_of, sort_by_keys, token_at,
+};
+use crate::tools::query::show::{find_modules, text_start};
+
+// ---- References ----
+
+// The definitions asked about: GROUP maps a definition + 1 to the group
+// (the index in TARGETS) + 1 its references count for; a trait's function
+// also counts those of the functions implementing it.
+pub static mut TARGETS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut GROUP: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+// The references found: position, definition, group, flags.
+pub static mut R_POS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut R_DEF: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut R_GROUP: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut R_FLAGS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+pub fn set_targets(matches: *IntVec) {
+    unsafe {
+        for i in 0..(*matches).count {
+            let d = (*matches).data[i];
+            TARGETS.push(d);
+            GROUP.put(d + 1, i + 1);
+        }
+        for i in 0..(*matches).count {
+            let t = (*matches).data[i];
+            if DEFS[t].kind != K_TRAIT_FN {
+                continue;
+            }
+            for d in 0..DEF_COUNT {
+                if DEFS[d].kind == K_IMPL_METHOD && DEFS[d].name == DEFS[t].name && GROUP.get(d + 1) == 0
+                    && trait_of(d) == DEFS[t].parent {
+                    GROUP.put(d + 1, i + 1);
+                }
+            }
+        }
+    }
+}
+
+// A reference to the item of node `def` (or a copy of it), its name
+// looked for in from..to (first or last occurrence; at `at` when it is
+// not there).
+fn add_ref(def: i64, from: i64, to: i64, name: i64, last: bool, at: i64, flags: i64) {
+    unsafe {
+        let d = def_of_node(def);
+        if d < 0 {
+            return;
+        }
+        let g = GROUP.get(d + 1) - 1;
+        if g < 0 {
+            return;
+        }
+        let mut pos = at;
+        if name >= 0 {
+            let p = find_name(from, to, name, last);
+            if p >= 0 {
+                pos = p;
+            }
+        }
+        R_POS.push(pos);
+        R_DEF.push(d);
+        R_GROUP.push(g);
+        R_FLAGS.push(flags);
+    }
+}
+
+// Whether the token at pos is followed by `::` (a path, not a bare name).
+fn path_at(pos: i64) -> bool {
+    unsafe {
+        let i = token_at(pos);
+        i + 1 < TOK_COUNT && TOKS[i].start == pos && TOKS[i + 1].kind == Tok::ColonColon
+    }
+}
+
+// A reference written as an identifier or a path (node n).
+fn add_name_ref(def: i64, n: i64, flags: i64) {
+    unsafe {
+        let d = def_of_node(def);
+        if d < 0 {
+            return;
+        }
+        if path_at(NODES[n].start) {
+            add_ref(def, NODES[n].start, NODES[n].end, DEFS[d].name, true, NODES[n].start, flags);
+        } else {
+            add_ref(def, NODES[n].start, NODES[n].end, -1, false, NODES[n].start, flags);
+        }
+    }
+}
+
+// The struct item of struct type t (through a pointer), or 0.
+fn struct_node(t0: i64) -> i64 {
+    unsafe {
+        if t0 <= 0 {
+            return 0;
+        }
+        let t = if TYPES[t0].kind == TyKind::Ptr { TYPES[t0].a } else { t0 };
+        if t <= 0 || TYPES[t].kind != TyKind::Struct {
+            return 0;
+        }
+        STRUCTS[TYPES[t].a].node
+    }
+}
+
+// The field of struct item s at index i, if it is named `name`; or 0.
+fn field_node(s: i64, i: i64, name: i64) -> i64 {
+    unsafe {
+        if s == 0 || i < 0 || i >= NODES[s].count || NODES[child(s, i)].a != name {
+            return 0;
+        }
+        child(s, i)
+    }
+}
+
+// The references the checked nodes record, and the ones the hooks noted.
+pub fn collect_refs() {
+    unsafe {
+        for n in 1..NODE_COUNT {
+            let kind = NODES[n].kind;
+            if kind == NodeKind::Ident {
+                let y = NODES[n].y;
+                let res = NODES[n].res;
+                if res == Res::Fn {
+                    add_name_ref(FNS[y].node, n, 0);
+                } else if res == Res::Const {
+                    add_name_ref(CONSTS[y].node, n, 0);
+                } else if res == Res::Static {
+                    add_name_ref(STATICS[y].node, n, 0);
+                }
+            } else if kind == NodeKind::Call {
+                if NODES[n].x <= 0 {
+                    continue;
+                }
+                let f = NODES[n].x - 1;
+                let callee = NODES[n].a;
+                let def = FNS[f].node;
+                if callee != 0 {
+                    add_name_ref(def, callee, QF_CALL);
+                } else if NODES[n].count > 0 {
+                    // A method call: its name after the receiver (an
+                    // operator's call: at the operation).
+                    let recv = child(n, 0);
+                    add_ref(def, NODES[recv].end, NODES[n].end, NODES[def].a, false, NODES[n].start, QF_CALL);
+                }
+            } else if kind == NodeKind::FieldAccess {
+                if NODES[n].y == 2 {
+                    continue;
+                }
+                let s = struct_node(NODES[NODES[n].a].ty);
+                let field = field_node(s, NODES[n].x, NODES[n].b);
+                if field != 0 {
+                    add_ref(field, NODES[NODES[n].a].end, NODES[n].end, NODES[n].b, false, NODES[n].start, 0);
+                }
+            } else if kind == NodeKind::StructLit {
+                let s = struct_node(NODES[n].ty);
+                if s == 0 {
+                    continue;
+                }
+                if NODES[n].a == NODES[s].a {
+                    add_ref(s, NODES[n].start, NODES[n].end, NODES[n].a, false, NODES[n].start, 0);
+                }
+                for i in 0..NODES[n].count {
+                    let init = child(n, i);
+                    let field = field_node(s, NODES[init].x, NODES[init].a);
+                    if field != 0 {
+                        add_ref(field, NODES[init].start, -1, -1, false, NODES[init].start, 0);
+                    }
+                }
+            } else if kind == NodeKind::VariantLit {
+                let v = NODES[n].a;
+                add_ref(VARIANTS[v].node, NODES[n].start, NODES[n].end, VARIANTS[v].name, false, NODES[n].start, 0);
+            } else if kind == NodeKind::PatVariant {
+                let v = NODES[n].x;
+                if NODES[n].ty != 0 && v >= 0 && VARIANTS[v].name == NODES[n].b {
+                    add_ref(VARIANTS[v].node, NODES[n].start, NODES[n].end, NODES[n].b, false, NODES[n].start, 0);
+                }
+            }
+        }
+        let mut i = 0;
+        while i < NOTES.count {
+            add_ref(NOTES.data[i + 2], NOTES.data[i], -1, NOTES.data[i + 1], false, NOTES.data[i], NOTES.data[i + 3]);
+            i += 4;
+        }
+        // The definitions themselves.
+        for d in 0..DEF_COUNT {
+            if GROUP.get(d + 1) != 0 {
+                add_ref(DEFS[d].node, DEFS[d].name_pos, -1, -1, false, DEFS[d].name_pos, QF_DEF);
+            }
+        }
+    }
+}
+
+// The references in order (file, position, definition), each once: the
+// indices into R_*, in `out`.
+pub fn sorted_refs(out: *IntVec) {
+    unsafe {
+        let n = R_POS.count;
+        let k1 = alloc_array::<i64>(n + 1);
+        let k2 = alloc_array::<i64>(n + 1);
+        let mut all = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..n {
+            all.push(i);
+            k1[i] = rank_of(R_POS.data[i]) * 4294967296 + R_POS.data[i];
+            k2[i] = R_DEF.data[i];
+        }
+        sort_by_keys(&all, k1, k2);
+        let mut i = 0;
+        while i < all.count {
+            let r = all.data[i];
+            let mut j = i + 1;
+            while j < all.count && R_POS.data[all.data[j]] == R_POS.data[r] && R_DEF.data[all.data[j]] == R_DEF.data[r] {
+                R_FLAGS.data[r] |= R_FLAGS.data[all.data[j]];
+                j += 1;
+            }
+            out.push(r);
+            i = j;
+        }
+    }
+}
+
+// Source lines longer than this are cut (with `…`).
+const LINE_MAX: i64 = 100;
+
+// The line holding pos, trimmed (and cut to LINE_MAX bytes).
+pub fn put_line(out: i64, pos: i64) {
+    unsafe {
+        let mut a = line_start(pos);
+        let mut b = line_end(pos);
+        while a < b && is_space(SRC[a]) {
+            a += 1;
+        }
+        while b > a && is_space(SRC[b - 1]) {
+            b -= 1;
+        }
+        if b - a <= LINE_MAX {
+            buf_bytes(out, SRC[a..b]);
+            return;
+        }
+        // (not inside a UTF-8 sequence)
+        let mut e = a + LINE_MAX - 1;
+        while e > a && (SRC[e] & 192) == 128 {
+            e -= 1;
+        }
+        buf_bytes(out, SRC[a..e]);
+        buf_byte(out, 226 as u8);
+        buf_byte(out, 128 as u8);
+        buf_byte(out, 166 as u8);
+    }
+}
+
+// A path without its `crate::` prefixes (`gvn::run_gvn`,
+// `<geom::V2 as Add>::add`); `crate` stays.
+pub fn put_short(out: i64, sym: i64) {
+    unsafe {
+        let p = SYMS[sym].text;
+        let mut i = 0;
+        while i < p.len {
+            let start = i == 0 || p[i - 1] == '<' || p[i - 1] == ' ';
+            if start && i + 7 <= p.len && p[i] == 'c' && p[i + 1] == 'r' && p[i + 2] == 'a' && p[i + 3] == 't'
+                && p[i + 4] == 'e' && p[i + 5] == ':' && p[i + 6] == ':' {
+                i += 7;
+                continue;
+            }
+            buf_byte(out, p[i]);
+            i += 1;
+        }
+    }
+}
+
+// More references than this: refs and callers print a summary per file
+// (unless --limit or --all).
+pub const REFS_BUDGET: i64 = 60;
+
+// The options of refs and callers.
+pub static mut OPT_COUNT: bool = false;
+pub static mut OPT_ALL: bool = false;
+pub static mut OPT_LIMIT: i64 = -1;
+pub static mut OPT_IN: *u8 = 0 as *u8;
+// --in: per file, per module, whether it is in.
+pub static mut IN_FILE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut IN_MODULE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// --in FILE:LINE: the text of the item holding that line, [IN_START, IN_END).
+pub static mut IN_START: i64 = -1;
+pub static mut IN_END: i64 = -1;
+pub static mut IN_NO_ITEM: bool = false;
+
+// The path of file f as printed.
+pub fn file_text(f: i64) -> [u8] {
+    unsafe {
+        let mut p = FILES[f].path;
+        while p[0] == '.' && p[1] == '/' {
+            p = &p[2];
+        }
+        p[0..strlen(p) as i64]
+    }
+}
+
+// Resolves --in X: a file (X has a `/`, ends in `.tach` or is `<std>`;
+// the path, or its end by whole components) or a module (matched like
+// NAME, with its inline modules), or FILE:LINE (the item holding that
+// line: ref_in; its file for the fixes by module). Whether anything
+// matched.
+pub fn resolve_in(x: [u8]) -> bool {
+    unsafe {
+        let mut any = false;
+        for _ in 0..FILE_COUNT {
+            IN_FILE.push(0);
+        }
+        for _ in 0..module_count() {
+            IN_MODULE.push(0);
+        }
+        // (FILE:LINE: the item holding that line; its file for what works by
+        // file or module)
+        let a = trailing_number(x);
+        if a > 0 && x[a - 1] == ':' && (a < 2 || x[a - 2] != ':') {
+            let file = x[0..a - 1];
+            for f in 0..FILE_COUNT {
+                let p = file_text(f);
+                if bytes_eq(p, file) || (p.len > file.len && bytes_eq(p[p.len - file.len..p.len], file)
+                    && p[p.len - file.len - 1] == '/') {
+                    let d = def_at_line(f, parse_digits(x[a..x.len]));
+                    if d < 0 {
+                        IN_NO_ITEM = true;
+                        return false;
+                    }
+                    IN_START = text_start(d);
+                    IN_END = DEFS[d].end;
+                    IN_FILE.data[f] = 1;
+                    return true;
+                }
+            }
+            return false;
+        }
+        let is_file = x.len > 0 && (x[0] == '<' || find_in(x, c"/", 0) >= 0 || find_in(x, c".tach", 0) >= 0);
+        if is_file {
+            for f in 0..FILE_COUNT {
+                let p = file_text(f);
+                if bytes_eq(p, x) || (p.len > x.len && bytes_eq(p[p.len - x.len..p.len], x) && p[p.len - x.len - 1] == '/') {
+                    IN_FILE.data[f] = 1;
+                    any = true;
+                }
+            }
+            return any;
+        }
+        let mut modules = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        find_modules(x, false, &modules);
+        for i in 0..modules.count {
+            IN_MODULE.data[modules.data[i]] = 1;
+            any = true;
+        }
+        any
+    }
+}
+
+// The message of a --in that resolve_in did not resolve (after `diag`):
+// no such file or module, or (FILE:LINE) no item at that line.
+pub fn put_bad_in(d: i64, x: *u8) {
+    unsafe {
+        if IN_NO_ITEM {
+            buf_str(d, c"no item at ");
+            buf_str(d, x);
+            buf_byte(d, '\n');
+            return;
+        }
+        buf_str(d, c"no file or module '");
+        buf_str(d, x);
+        buf_str(d, c"' in the program\n");
+    }
+}
+
+// Whether the reference at pos passes --in.
+pub fn ref_in(pos: i64) -> bool {
+    unsafe {
+        if OPT_IN == 0 as *u8 {
+            return true;
+        }
+        if IN_START >= 0 {
+            return pos >= IN_START && pos < IN_END;
+        }
+        if IN_FILE.data[file_of_pos(pos)] != 0 {
+            return true;
+        }
+        let mut m = module_at(pos);
+        while m >= 0 {
+            if IN_MODULE.data[m] != 0 {
+                return true;
+            }
+            m = if m > 0 { MODULES[m].parent } else { -1 };
+        }
+        false
+    }
+}
+
+// A `try:` line for refs/callers with one more option (and its value),
+// keeping --in unless the option is another --in.
+pub fn try_refs(cmd: *u8, name: [u8], option: *u8, value: [u8]) {
+    unsafe {
+        let out = try_begin(cmd, name, true);
+        if OPT_IN != 0 as *u8 && !streq(option, c"--in") {
+            buf_str(out, c" --in");
+            put_cword(out, OPT_IN);
+        }
+        buf_byte(out, ' ');
+        buf_str(out, option);
+        if value.len > 0 {
+            put_word(out, value);
+        }
+        try_end(out);
+    }
+}
+
+pub fn query_refs(matches: *IntVec, cmd: *u8, name: [u8]) -> i64 {
+    unsafe {
+        let calls_only = streq(cmd, c"callers");
+        set_targets(matches);
+        collect_refs();
+        let mut order = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        sorted_refs(&order);
+        let mut sel = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut multi = TARGETS.count > 1;
+        for i in 0..order.count {
+            let r = order.data[i];
+            if calls_only && (R_FLAGS.data[r] & QF_CALL) == 0 {
+                continue;
+            }
+            if !ref_in(R_POS.data[r]) {
+                continue;
+            }
+            sel.push(r);
+            if R_DEF.data[r] != TARGETS.data[R_GROUP.data[r]] {
+                multi = true;
+            }
+        }
+        let out = buf_new();
+        let groups = TARGETS.count;
+        if OPT_COUNT {
+            if groups == 1 {
+                buf_int(out, sel.count);
+                buf_byte(out, '\n');
+            } else {
+                for g in 0..groups {
+                    let mut n = 0;
+                    for i in 0..sel.count {
+                        if R_GROUP.data[sel.data[i]] == g {
+                            n += 1;
+                        }
+                    }
+                    buf_int(out, n);
+                    buf_byte(out, '\t');
+                    buf_bytes(out, SYMS[DEFS[TARGETS.data[g]].fqn].text);
+                    buf_byte(out, '\n');
+                }
+            }
+            buf_write_fd(out, STDOUT);
+            return 0;
+        }
+        let noun = if calls_only { c"calls" } else { c"refs" };
+        let total = sel.count;
+        if total == 0 {
+            let d = diag(c"note", c"query.empty");
+            buf_str(d, c"0 ");
+            buf_str(d, noun);
+            if OPT_IN != 0 as *u8 {
+                buf_str(d, c" in ");
+                buf_str(d, OPT_IN);
+            }
+            buf_byte(d, '\n');
+            return 0;
+        }
+        // Per file: the number of references (files in order).
+        let mut files = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut per_file = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut biggest = -1;
+        let mut biggest_n = 0;
+        for i in 0..sel.count {
+            let f = file_of_pos(R_POS.data[sel.data[i]]);
+            if files.count == 0 || files.data[files.count - 1] != f {
+                files.push(f);
+                per_file.push(0);
+            }
+            per_file.data[per_file.count - 1] += 1;
+            if per_file.data[per_file.count - 1] > biggest_n {
+                biggest_n = per_file.data[per_file.count - 1];
+                biggest = f;
+            }
+        }
+        if OPT_LIMIT < 0 && !OPT_ALL && total > REFS_BUDGET {
+            for i in 0..files.count {
+                buf_bytes(out, file_text(files.data[i]));
+                buf_byte(out, '\t');
+                buf_int(out, per_file.data[i]);
+                buf_byte(out, '\n');
+            }
+            buf_write_fd(out, STDOUT);
+            let d = diag(c"note", c"query.truncated");
+            buf_int(d, total);
+            buf_byte(d, ' ');
+            buf_str(d, noun);
+            buf_str(d, c" in ");
+            buf_int(d, files.count);
+            buf_str(d, if files.count == 1 { c" file\n" } else { c" files\n" });
+            if files.count > 1 {
+                try_refs(cmd, name, c"--in", file_text(biggest));
+            }
+            try_refs(cmd, name, c"--limit 60", file_text(biggest)[0..0]);
+            try_refs(cmd, name, c"--all", file_text(biggest)[0..0]);
+            return 0;
+        }
+        let shown = if OPT_LIMIT >= 0 && OPT_LIMIT < total { OPT_LIMIT } else { total };
+        let mut cur = -1;
+        for i in 0..shown {
+            let r = sel.data[i];
+            let pos = R_POS.data[r];
+            let d = R_DEF.data[r];
+            let f = file_of_pos(pos);
+            if f != cur {
+                buf_str(out, c"# ");
+                buf_bytes(out, file_text(f));
+                buf_byte(out, '\n');
+                cur = f;
+            }
+            buf_int(out, line_of(pos));
+            buf_byte(out, ':');
+            buf_int(out, pos - line_start(pos) + 1);
+            buf_byte(out, '\t');
+            if (R_FLAGS.data[r] & QF_DEF) != 0 {
+                buf_str(out, c"def");
+            } else {
+                let e = enclosing(pos);
+                put_short(out, if e >= 0 { DEFS[e].fqn } else { mod_fqn(module_at(pos)) });
+            }
+            if multi {
+                buf_str(out, c"\t->");
+                put_short(out, DEFS[d].fqn);
+            }
+            buf_byte(out, '\t');
+            put_line(out, pos);
+            buf_byte(out, '\n');
+        }
+        buf_write_fd(out, STDOUT);
+        if shown < total {
+            let d = diag(c"note", c"query.truncated");
+            buf_str(d, c"showing ");
+            buf_int(d, shown);
+            buf_str(d, c" of ");
+            buf_int(d, total);
+            buf_byte(d, ' ');
+            buf_str(d, noun);
+            buf_byte(d, '\n');
+            if files.count > 1 {
+                try_refs(cmd, name, c"--in", file_text(biggest));
+            }
+            try_refs(cmd, name, c"--all", file_text(biggest)[0..0]);
+        }
+        0
+    }
+}

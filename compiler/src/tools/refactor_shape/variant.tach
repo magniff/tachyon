@@ -1,0 +1,539 @@
+// `refactor variant ENUM`: a variant added (with an arm in each match that
+// needs one), removed (with its arms, alternatives and imports) or
+// renamed, in the enum and every construction and pattern of it.
+
+use crate::base::{FILES, IntVec, SRC, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, intern};
+use crate::front::ast::{ARM_SYNTHETIC, NODES, NODE_COUNT, NodeKind};
+use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
+use crate::front::modules::file_of_pos;
+use crate::front::types::{ENUMS, TYPES, TyKind, VARIANTS};
+use crate::middle::lower::HMap;
+use crate::tools::edit::edit_replace;
+use crate::tools::edit::apply::{apply_edit, set_command};
+use crate::tools::edit::items::{after_line, indent_of};
+use crate::tools::fix::remove_use_name;
+use crate::tools::query::{QF_DEF, c_slice, root_or_diag};
+use crate::tools::query::defs::{DEFS, K_ENUM};
+use crate::tools::query::diagnostics::{
+    PROG, ROOT_GIVEN, TOOL, diag, put_root, put_word, try_end, write_diags,
+};
+use crate::tools::query::positions::{enclosing, line_start, put_loc, token_at};
+use crate::tools::query::refs::{R_FLAGS, R_POS};
+use crate::tools::refactor_shape::{
+    PROGRAM_END, SUB, comment_head, find_byte, leading_name, list_insert, list_of_node, list_remove,
+    load_and_find, newline_in, opt, orig_of, put_count, refs_of, rest_blank, starts_line, sym_text,
+    take_args, text_buf, try_query_name, try_refactor, try_show_at, usage_error,
+};
+use crate::tools::refactor_shape::field::{member_def, no_member, rename_refs};
+use crate::tools::rewrite::{pa, pb, pchild, pcount, pend, pflags, pk, pstart, sort_by_start};
+
+// ---- refactor variant ----
+
+pub fn run_variant(argc: i64, argv: **u8) -> i64 {
+    let status = variant_inner(argc, argv);
+    write_diags();
+    status
+}
+
+// Whether checked type t is enum node e's (an instance's of it too).
+fn is_enum_of(t: i64, e: i64) -> bool {
+    unsafe { t > 0 && TYPES[t].kind == TyKind::Enum && ENUMS[TYPES[t].a].node == e }
+}
+
+// The variant names of enum node e: whether `name` is one.
+fn variant_named(e: i64, name: i64) -> bool {
+    for i in 0..pcount(e) {
+        if pa(pchild(e, i)) == name {
+            return true;
+        }
+    }
+    false
+}
+
+// Whether pattern p (checked) matches every value: `_`, a binding, an or
+// of one.
+fn catch_all(p: i64, e: i64) -> bool {
+    unsafe {
+        let k = NODES[p].kind;
+        if k == NodeKind::PatWild {
+            return true;
+        }
+        if k == NodeKind::PatBind {
+            // (unchecked: a name of a variant brought by `use` is no binding)
+            return NODES[p].ty != 0 || !variant_named(e, NODES[p].a);
+        }
+        if k == NodeKind::PatOr {
+            for i in 0..pcount(p) {
+                if catch_all(pchild(p, i), e) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+// Whether pattern p (as written) names enum node e: `E::V(..)`, a variant
+// of e.
+fn names_enum(p: i64, e: i64) -> bool {
+    unsafe {
+        let k = pk(p);
+        if k == NodeKind::PatVariant {
+            return pa(p) == NODES[e].a || (pa(p) == 0 && variant_named(e, pb(p)));
+        }
+        if k == NodeKind::PatOr {
+            for i in 0..pcount(p) {
+                if names_enum(pchild(p, i), e) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+// The matches on enum node e, as written: each once.
+fn matches_on(e: i64, out: *IntVec) {
+    unsafe {
+        let mut seen = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        for n in 1..NODE_COUNT {
+            if NODES[n].kind != NodeKind::Match {
+                continue;
+            }
+            let o = orig_of(n, NodeKind::Match);
+            if o < 0 || seen.get(o + 1) != 0 || FILES[file_of_pos(pstart(o))].path[0] == '<' {
+                continue;
+            }
+            let t = NODES[NODES[n].a].ty;
+            let mut on = is_enum_of(t, e);
+            if t <= 0 {
+                for i in 0..pcount(o) {
+                    if names_enum(pa(pchild(o, i)), e) {
+                        on = true;
+                    }
+                }
+            }
+            if on {
+                seen.put(o + 1, 1);
+                out.push(o);
+            }
+        }
+        sort_by_start(out);
+    }
+}
+
+// The text written before the variant's name in a pattern of match m
+// (`Kind::`, `crate::ast::Kind::`), or 0 when its arms name variants
+// alone.
+fn variant_prefix(m: i64) -> i64 {
+    unsafe {
+        for i in 0..pcount(m) {
+            let mut p = pa(pchild(m, i));
+            if pk(p) == NodeKind::PatOr && pcount(p) > 0 {
+                p = pchild(p, 0);
+            }
+            if pk(p) != NodeKind::PatVariant || pa(p) == 0 {
+                continue;
+            }
+            // (the name after the last `::` before a `(`)
+            let mut t = token_at(pstart(p));
+            let mut name_at = -1;
+            while t < TOK_COUNT && TOKS[t].start < pend(p) && TOKS[t].kind != Tok::LParen {
+                if TOKS[t].kind == Tok::ColonColon {
+                    name_at = TOKS[t].end;
+                }
+                t += 1;
+            }
+            if name_at > pstart(p) {
+                return text_buf(SRC[pstart(p)..name_at]);
+            }
+        }
+        0
+    }
+}
+
+fn variant_inner(argc: i64, argv: **u8) -> i64 {
+    unsafe {
+        set_command(argc, argv);
+        PROG = argv[0];
+        TOOL = c"refactor";
+        SUB = c"variant";
+        let mut root = 0 as *u8;
+        let mut words = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut opts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let example = c"ENUM --add 'X(i64)' --arm 'EXPR' --dry-run";
+        if !take_args(argc, argv, c"--add=1 --arm=1 --remove=1 --rename=2", &root, &words, &opts) {
+            return 2;
+        }
+        if words.count != 1 {
+            return usage_error(if words.count == 0 { c"an ENUM is needed" } else { c"one ENUM at a time" }, example);
+        }
+        let add = opt(&opts, c"--add", false);
+        let arm = opt(&opts, c"--arm", false);
+        let remove = opt(&opts, c"--remove", false);
+        let rename = opt(&opts, c"--rename", false);
+        let actions = (add != 0 as *u8) as i64 + (remove != 0 as *u8) as i64 + (rename != 0 as *u8) as i64;
+        if actions != 1 {
+            return usage_error(c"one of --add, --remove, --rename", example);
+        }
+        if arm != 0 as *u8 && add == 0 as *u8 {
+            return usage_error(c"--arm goes with --add", example);
+        }
+        let name = c_slice(words.data[0] as *u8);
+        ROOT_GIVEN = root;
+        root = root_or_diag(root, SUB, name, true);
+        if root == 0 as *u8 {
+            return 2;
+        }
+        let mut status = 0;
+        let d = load_and_find(root, name, 1 << K_ENUM, c"enum", &status);
+        if d < 0 {
+            return status;
+        }
+        let e = DEFS[d].node;
+        let fqn = sym_text(DEFS[d].fqn);
+        let what = buf_new();
+        if add != 0 as *u8 {
+            let text = c_slice(add);
+            let vname = leading_name(text);
+            if vname < 0 {
+                return usage_error(c"--add takes the variant: 'X', 'X(T, ...)'", example);
+            }
+            if variant_named(e, vname) {
+                let x = diag(c"error", c"refactor.clash");
+                buf_bytes(x, fqn);
+                buf_str(x, c" has a variant '");
+                buf_bytes(x, sym_text(vname));
+                buf_str(x, c"' already\n");
+                return 1;
+            }
+            // (its fields: the commas between its parentheses, plus one)
+            let mut fields = 0;
+            let open = find_byte(text, '(');
+            if open >= 0 {
+                fields = 1;
+                let mut depth = 0;
+                for i in open + 1..text.len {
+                    let c = text[i];
+                    if c == '(' || c == '[' || c == '<' {
+                        depth += 1;
+                    } else if c == ')' || c == ']' || c == '>' {
+                        depth -= 1;
+                    } else if c == ',' && depth == 0 {
+                        fields += 1;
+                    }
+                }
+            }
+            let mut ms = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            matches_on(e, &ms);
+            let mut open_ms = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            for i in 0..ms.count {
+                let m = ms.data[i];
+                let mut covered = false;
+                for j in 0..pcount(m) {
+                    let a = pchild(m, j);
+                    if pb(a) == 0 && catch_all(pa(a), e) {
+                        covered = true;
+                    }
+                }
+                if !covered {
+                    open_ms.push(m);
+                }
+            }
+            if open_ms.count > 0 && arm == 0 as *u8 {
+                let out = buf_new();
+                for i in 0..open_ms.count {
+                    let m = open_ms.data[i];
+                    put_loc(out, pstart(m));
+                    buf_byte(out, '\t');
+                    let x = enclosing(pstart(m));
+                    if x >= 0 {
+                        crate::tools::query::put_short(out, DEFS[x].fqn);
+                    }
+                    buf_byte(out, '\n');
+                }
+                crate::base::buf_write_fd(out, crate::base::STDOUT);
+                let x = diag(c"error", c"refactor.non-exhaustive");
+                put_count(x, open_ms.count, c"match", c"matches");
+                buf_str(x, c" on ");
+                buf_bytes(x, fqn);
+                buf_str(x, c" would not cover ");
+                buf_bytes(x, sym_text(vname));
+                buf_str(x, c"; nothing written\n");
+                for i in 0..open_ms.count {
+                    if i == 2 {
+                        break;
+                    }
+                    try_show_at(pstart(open_ms.data[i]));
+                }
+                let out2 = try_refactor(fqn);
+                buf_str(out2, c" --add");
+                put_word(out2, text);
+                buf_str(out2, c" --arm 'EXPR' --dry-run");
+                put_root(out2);
+                try_end(out2);
+                return 1;
+            }
+            list_of_node(e);
+            list_insert(pcount(e), text);
+            for i in 0..open_ms.count {
+                let m = open_ms.data[i];
+                let pat = buf_new();
+                let prefix = variant_prefix(m);
+                if prefix != 0 {
+                    buf_bytes(pat, buf_slice(prefix));
+                } else {
+                    buf_bytes(pat, fqn);
+                    buf_str(pat, c"::");
+                }
+                buf_bytes(pat, sym_text(vname));
+                if fields > 0 {
+                    buf_byte(pat, '(');
+                    for k in 0..fields {
+                        buf_str(pat, if k > 0 { c", _" } else { c"_" });
+                    }
+                    buf_byte(pat, ')');
+                }
+                buf_str(pat, c" => ");
+                buf_str(pat, arm);
+                insert_arm(m, buf_slice(pat));
+            }
+            buf_str(what, c"added variant ");
+            buf_bytes(what, text);
+            buf_str(what, c" to ");
+            buf_bytes(what, fqn);
+            if open_ms.count > 0 {
+                buf_str(what, c", an arm in ");
+                put_count(what, open_ms.count, c"match", c"matches");
+            }
+        } else if remove != 0 as *u8 {
+            let vname = intern(c_slice(remove));
+            let mut k = -1;
+            for i in 0..pcount(e) {
+                if pa(pchild(e, i)) == vname {
+                    k = i;
+                }
+            }
+            if k < 0 {
+                return no_member(d, e, remove, c"variant");
+            }
+            let vnode = pchild(e, k);
+            let vd = member_def(d, vname);
+            // Constructed: refused.
+            for n in 1..NODE_COUNT {
+                if NODES[n].kind == NodeKind::VariantLit && VARIANTS[NODES[n].a].node == vnode {
+                    let x = diag(c"error", c"refactor.constructed");
+                    buf_bytes(x, sym_text(DEFS[vd].fqn));
+                    buf_str(x, c" is constructed at ");
+                    put_loc(x, NODES[n].start);
+                    buf_str(x, c"; change those first\n");
+                    try_query_name(c"refs", sym_text(DEFS[vd].fqn));
+                    return 1;
+                }
+            }
+            // Matched: its arms go (an or loses it).
+            let mut arms = 0;
+            let mut seen = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+            for n in 1..NODE_COUNT {
+                if NODES[n].kind != NodeKind::PatVariant || NODES[n].x < 0 || NODES[n].ty == 0
+                    || VARIANTS[NODES[n].x].node != vnode {
+                    continue;
+                }
+                let mut p = orig_of(n, NodeKind::PatVariant);
+                if p < 0 {
+                    p = orig_of(n, NodeKind::PatBind);
+                }
+                if p < 0 || seen.get(p + 1) != 0 {
+                    continue;
+                }
+                seen.put(p + 1, 1);
+                let r = remove_pattern(p);
+                if r != 0 {
+                    let x = diag(c"error", if r == 1 { c"refactor.nested" } else { c"refactor.if-let" });
+                    buf_bytes(x, sym_text(DEFS[vd].fqn));
+                    buf_str(x, if r == 1 { c" is matched inside another pattern at " } else { c" is matched by an `if let` or `while let` at " });
+                    put_loc(x, pstart(p));
+                    buf_str(x, c"; change it first\n");
+                    try_show_at(pstart(p));
+                    return 1;
+                }
+                arms += 1;
+            }
+            // Imported: the name goes from its `use`.
+            let mut targets = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            targets.push(vd);
+            refs_of(&targets);
+            for r in 0..R_POS.count {
+                if (R_FLAGS.data[r] & QF_DEF) != 0 || enclosing(R_POS.data[r]) >= 0 {
+                    continue;
+                }
+                remove_import(R_POS.data[r]);
+            }
+            list_of_node(e);
+            list_remove(k);
+            if pcount(e) > k + 1 && fieldless_cast(e) {
+                let x = diag(c"warning", c"refactor.discriminant");
+                buf_bytes(x, fqn);
+                buf_str(x, c" is cast to an integer somewhere: the variants after ");
+                buf_bytes(x, sym_text(vname));
+                buf_str(x, c" change their numbers\n");
+            }
+            buf_str(what, c"removed variant ");
+            buf_bytes(what, sym_text(vname));
+            buf_str(what, c" of ");
+            buf_bytes(what, fqn);
+            buf_str(what, c", ");
+            put_count(what, arms, c"arm", c"arms");
+        } else {
+            let old = intern(c_slice(rename));
+            let new = intern(c_slice(opt(&opts, c"--rename", true)));
+            if !variant_named(e, old) {
+                return no_member(d, e, rename, c"variant");
+            }
+            if variant_named(e, new) {
+                let x = diag(c"error", c"refactor.clash");
+                buf_bytes(x, fqn);
+                buf_str(x, c" has a variant '");
+                buf_bytes(x, sym_text(new));
+                buf_str(x, c"' already\n");
+                return 1;
+            }
+            let mut targets = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            targets.push(member_def(d, old));
+            refs_of(&targets);
+            let n = rename_refs(old, new);
+            buf_str(what, c"renamed variant ");
+            buf_bytes(what, sym_text(old));
+            buf_str(what, c" to ");
+            buf_bytes(what, sym_text(new));
+            buf_str(what, c" of ");
+            buf_bytes(what, fqn);
+            buf_str(what, c", ");
+            put_count(what, n - 1, c"use", c"uses");
+        }
+        apply_edit(buf_slice(what), root)
+    }
+}
+
+// The arm `text` (`PATTERN => EXPR`) after the last arm of match m.
+fn insert_arm(m: i64, text: [u8]) {
+    unsafe {
+        let n = pcount(m);
+        if n == 0 {
+            return;
+        }
+        let last = pchild(m, n - 1);
+        let e = pend(last);
+        let ends = SRC[e - 1] == ',' || SRC[e - 1] == '}';
+        let b = buf_new();
+        if starts_line(pstart(last)) && newline_in(e, pend(m) - 1) {
+            if !ends {
+                edit_replace(e, e, text_buf(c_slice(c",")));
+            }
+            buf_bytes(b, indent_of(pstart(last)));
+            buf_bytes(b, text);
+            buf_str(b, c",\n");
+            let at = after_line(e);
+            edit_replace(at, at, b);
+            return;
+        }
+        // (on the line of the last: with a comma after it when it has one)
+        buf_str(b, if ends { c" " } else { c", " });
+        buf_bytes(b, text);
+        if ends {
+            buf_byte(b, ',');
+        }
+        edit_replace(e, e, b);
+    }
+}
+
+// Removes pattern p (as written) from its arm: the arm, or the
+// alternative of an or. 0 done, 1 p is inside another pattern, 2 the
+// match is an `if let`'s.
+fn remove_pattern(p: i64) -> i64 {
+    unsafe {
+        for m in 1..PROGRAM_END {
+            if pk(m) != NodeKind::Match {
+                continue;
+            }
+            for i in 0..pcount(m) {
+                let a = pchild(m, i);
+                let pat = pa(a);
+                let direct = pat == p;
+                let mut alt = -1;
+                if pk(pat) == NodeKind::PatOr {
+                    for j in 0..pcount(pat) {
+                        if pchild(pat, j) == p {
+                            alt = j;
+                        }
+                    }
+                }
+                if !direct && alt < 0 {
+                    continue;
+                }
+                for j in 0..pcount(m) {
+                    if (pflags(pchild(m, j)) & ARM_SYNTHETIC) != 0 {
+                        return 2;
+                    }
+                }
+                if alt >= 0 && pcount(pat) > 1 {
+                    // `A | V | B`: V and a `|` next to it
+                    if alt + 1 < pcount(pat) {
+                        edit_replace(pstart(p), pstart(pchild(pat, alt + 1)), buf_new());
+                    } else {
+                        edit_replace(pend(pchild(pat, alt - 1)), pend(p), buf_new());
+                    }
+                    return 0;
+                }
+                // The arm: its lines, or its text and what separates it.
+                let s = pstart(a);
+                let e = pend(a);
+                if starts_line(s) && rest_blank(e) {
+                    edit_replace(comment_head(s), after_line(e), buf_new());
+                } else if i + 1 < pcount(m) {
+                    edit_replace(s, pstart(pchild(m, i + 1)), buf_new());
+                } else if i > 0 {
+                    edit_replace(pend(pchild(m, i - 1)), e, buf_new());
+                } else {
+                    edit_replace(s, e, buf_new());
+                }
+                return 0;
+            }
+        }
+        1
+    }
+}
+
+// Removes the import at pos (a name of a `use`).
+fn remove_import(pos: i64) {
+    unsafe {
+        for u in 1..PROGRAM_END {
+            if pk(u) != NodeKind::Use || pos < pstart(u) || pos >= pend(u) {
+                continue;
+            }
+            for k in 0..pcount(u) {
+                let id = pchild(u, k);
+                if pstart(id) <= pos && pos < pend(id) {
+                    if pcount(u) == 1 {
+                        edit_replace(line_start(pstart(u)), after_line(pend(u)), buf_new());
+                    } else {
+                        remove_use_name(u, k);
+                    }
+                    return;
+                }
+            }
+        }
+    }
+}
+
+// Whether a value of enum node e is cast (`as`) somewhere.
+fn fieldless_cast(e: i64) -> bool {
+    unsafe {
+        for n in 1..NODE_COUNT {
+            if NODES[n].kind == NodeKind::Cast && is_enum_of(NODES[NODES[n].a].ty, e) {
+                return true;
+            }
+        }
+        false
+    }
+}
