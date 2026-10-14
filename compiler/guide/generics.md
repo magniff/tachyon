@@ -72,5 +72,4 @@ fn main() -> i32 {
   bound's functions may be called on `T`'s values.
 - `size_of(T)` and `align_of(T)` work on type parameters.
 - Not there: const generics (`[T; N]` with `N` a parameter), generic
-  traits (`trait Conv<T>`), associated types, `where` clauses,
-  variadic generics.
+  traits (`trait Conv<T>`), `where` clauses, variadic generics.

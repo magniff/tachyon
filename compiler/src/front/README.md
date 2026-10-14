@@ -17,8 +17,10 @@ start from what it leaves: the AST, its types, the tables of items.
 | `parser/` | tokens to the AST: items, statements and patterns by recursive descent, expressions by Pratt parsing, recovery after syntax errors (`items`, `stmts`, `exprs`, `types`, `foreign`) |
 | `modules/` | `mod` files and the module tree, item keys; scopes, `use` and privacy in `lookup` |
 | `types.tach` | interned types, layouts, the tables of structs, functions, constants and statics |
-| `check/` | the bidirectional type checker: declarations (`collect`, `resolve`), bodies (`body`), `check_mode` and `synth_mode`, `names`, `calls`, `assign`, `equality`, `vectors`, `unsafety` |
+| `check/` | the bidirectional type checker: declarations (`collect`, `resolve`), bodies (`body`), `check_mode` and `synth_mode`, `names`, `calls`, `assign`, `equality`, `vectors`, `unsafety`, `iterate` (0.14: `for` over iterators, ranges as values) |
 | `consteval.tach` | compile-time constants: `const` items, array lengths, static initializers |
 | `patterns/` | patterns: their checking, refutability, `match`; exhaustiveness and reachability in `usefulness` |
 | `generics/` | generics by monomorphization: instances of structs and enums; inference and function instances in `instantiate` |
 | `traits.tach` | traits: bounds, impls, operator traits |
+| `assoc.tach` | (0.14) associated types: `type Item;`, projections `T::Item`, `Item = T` constraints, lazy defaults |
+| `closures.tach` | (0.14) closures: their types (env structs), captures, calls, `Fn`/`FnMut` bounds |

@@ -12,7 +12,7 @@ use crate::front::lexer::Tok::{
 };
 use crate::front::parser::{
     NO_STRUCT, P, advance, at, cur, cur_start, eat, expect, expect_ident, prev_end, reserved_error,
-    syntax_error, with_no_struct,
+    syntax_error, tok_kind, with_no_struct,
 };
 use crate::front::parser::exprs::parse_expr;
 
@@ -78,25 +78,81 @@ pub fn is_int_type_name(name: i64) -> bool {
 
 // ---- Types ----
 
+// A type's name, `T` or `a::b::T` (0.5: a type in a module; the segments
+// before the name are the TyName's list; 0.14: also a projection, `I::Item`).
+fn parse_type_name(start: i64) -> i64 {
+    unsafe {
+        let n = new_node(NodeKind::TyName, start, 0);
+        NODES[n].a = expect_ident();
+        if at(ColonColon) {
+            let mark = list_begin();
+            while eat(ColonColon) {
+                let seg = new_node(NodeKind::Ident, NODES[n].start, prev_end());
+                NODES[seg].a = NODES[n].a;
+                list_push(seg);
+                NODES[n].a = expect_ident();
+            }
+            list_end(n, mark);
+        }
+        n
+    }
+}
+
+// A bound of a type parameter (0.9; 0.14: the built-in `Fn(A) -> R` and
+// `FnMut(A) -> R`, a TyFn with d = 2 or 3, and a trait's associated-type
+// constraints, `Iterator<Item = T>`: AssocType nodes in the holder `h`).
+pub fn parse_bound() -> i64 {
+    unsafe {
+        let start = cur_start();
+        if !at(Ident) {
+            return parse_type();
+        }
+        if tok_kind(1) == LParen {
+            let name = TOKS[P].value as i64;
+            let d = if name == intern_c(c"Fn") { 2 }
+                else if name == intern_c(c"FnMut") { 3 }
+                else { 0 };
+            if d != 0 {
+                advance();
+                let n = parse_fn_type_rest(start);
+                NODES[n].d = d;
+                return n;
+            }
+        }
+        let n = parse_type_name(start);
+        if at(Lt) && tok_kind(1) == Ident && tok_kind(2) == Eq {
+            let holder = new_node(NodeKind::Generics, cur_start(), 0);
+            advance();
+            let mark = list_begin();
+            while !at_gt() && !at(Eof) {
+                let c = new_node(NodeKind::AssocType, cur_start(), 0);
+                NODES[c].a = expect_ident();
+                expect(Eq);
+                NODES[c].b = parse_type();
+                NODES[c].end = prev_end();
+                list_push(c);
+                if !eat(Comma) {
+                    break;
+                }
+            }
+            list_end(holder, mark);
+            expect_gt();
+            NODES[holder].end = prev_end();
+            NODES[n].h = holder;
+        } else if at(Lt) {
+            NODES[n].g = parse_type_args();
+        }
+        NODES[n].end = prev_end();
+        n
+    }
+}
+
 pub fn parse_type() -> i64 {
     unsafe {
         let start = cur_start();
         let kind = cur();
         if kind == Ident {
-            let n = new_node(NodeKind::TyName, start, 0);
-            NODES[n].a = expect_ident();
-            if at(ColonColon) {
-                // `a::b::T`: a type in a module (0.5); the segments before the
-                // name are the TyName's list.
-                let mark = list_begin();
-                while eat(ColonColon) {
-                    let seg = new_node(NodeKind::Ident, NODES[n].start, prev_end());
-                    NODES[seg].a = NODES[n].a;
-                    list_push(seg);
-                    NODES[n].a = expect_ident();
-                }
-                list_end(n, mark);
-            }
+            let n = parse_type_name(start);
             // (a primitive type takes no type arguments: `x as i64 < n`
             // compares, 0.11)
             if at(Lt) && !(NODES[n].list == 0 && is_primitive_name(NODES[n].a)) {
@@ -191,8 +247,13 @@ fn parse_array_type(start: i64) -> i64 {
 }
 
 fn parse_fn_type(start: i64) -> i64 {
+    expect(Fn);
+    parse_fn_type_rest(start)
+}
+
+// `(A, B) -> R` after `fn` (or a bound's `Fn`, 0.14).
+fn parse_fn_type_rest(start: i64) -> i64 {
     unsafe {
-        expect(Fn);
         expect(LParen);
         let n = new_node(NodeKind::TyFn, start, 0);
         let mark = list_begin();

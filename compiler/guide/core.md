@@ -43,7 +43,7 @@ files on the command line make one program; `mod name;` loads
 | `v[i]` on a `Vec` | `v.get(i)`, `v.set(i, x)`, `v.as_slice()[i]` |
 | closures, `.iter().map()` | none in 0.13 (coming in 0.14): `for i in 0..s.len { ... s[i] ... }`, `for x in slice` |
 | `x?` | none yet (0.15): `match r { Ok(v) => v, Err(e) => return Err(e) }` |
-| `impl Trait for T`, `T: Trait` | the same; no `dyn`, `where`, associated types, supertraits, `#[derive]` |
+| `impl Trait for T`, `T: Trait` | the same; `type Item;` associated types (0.14); no `dyn`, `where`, supertraits, `#[derive]` |
 | `Drop`, RAII | none: call `free()`, usually `defer v.free();` |
 | `'outer: loop`, `break 'outer` | `outer: loop`, `break :outer`, `continue :outer` |
 | `!x` on integers | `~x`; `!` is for `bool` only |
@@ -440,7 +440,7 @@ the one hole in safe code (no lifetimes).
 | `unknown type 'String'` (or `char`, `Box`) | `[u8]`, `u8`, `*T` or `Vec<T>` |
 | `expected type, got '&'` | `*T` for `&T` and `&mut T` |
 | `expected identifier, got '&'` in `fn f(&self)` | `self: *T` |
-| `expected expression, got '\|'` | no closures: a named `fn`, or a loop |
+| `closures are not implemented yet` | (0.14 in progress) a named `fn`, or a loop |
 | `'?' is reserved for future use` | `match` on the `Result` |
 | `expected ';', got '!'` | no macros: `println(...)`, `std::print_int(...)` |
 | `cannot assign to immutable variable 'x'` | `let mut x` |

@@ -10,8 +10,8 @@ The whole grammar is docs/grammar.md; this is what a program uses.
   `r#type` is the identifier `type` (C names that are keywords).
 - Keywords: `as break const continue defer else enum extern false fn for
   if impl import in let loop match mod mut pub return static struct
-  trait true type union unsafe use while`. Reserved (errors): `where`,
-  `dyn`, `move`, `?`, `@`. `self`, `Self`, `super`, `crate` are names.
+  trait true type union unsafe use while move` (0.14). Reserved (errors):
+  `where`, `dyn`, `?`, `@`. `self`, `Self`, `super`, `crate` are names.
 - Integers: `42`, `1_000`, `0xff`, `0b1010`, with a type suffix
   `255u8`, `7i32`. Floats: `1.5`, `2e10`, `1.5f32`. Chars: `'a'`, `'\n'`,
   `'\x41'`, `'\''` (one byte, a `u8`). Strings: `"a\tb\n\"q\"\\"`,

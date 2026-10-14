@@ -29,18 +29,24 @@ use crate::base::{IntVec, buf_byte, buf_new, buf_slice, grow, intern, intern_c, 
 use crate::base::diag::{
     err_begin, err_end, err_end_soft, err_help, err_help_sym, err_str, err_sym, fail_name,
 };
+use crate::front::assoc::{
+    assoc_constraints_hold, collect_impl_assoc, collect_trait_assoc, constraint_error,
+};
 use crate::front::ast::{
-    FN_SIG_FAILED, NODES, NodeKind, child, list_begin, list_end, list_push, new_node,
+    FN_LAZY, FN_SIG_FAILED, NODES, NodeKind, child, list_begin, list_end, list_push, new_node,
 };
 use crate::front::check::{
     CHECK_UNCHECKED, PROGRAM, SELF_TYPE, TRY_RESULT, Try, attempt, has_error_type, pop_scope,
     push_scope, resolve_type_or_error,
 };
-use crate::front::check::collect::{add_fn, template_of_type_node};
+use crate::front::check::collect::{add_fn, slice_template, template_of_type_node};
 use crate::front::check::equality::eq_unsupported;
 use crate::front::check::resolve::{resolve_type, type_name_key};
 use crate::front::check::synth_mode::synth_expr;
-use crate::front::generics::{CUR_INST, TPL_NONE, instance_of, instance_targs, mangle_type};
+use crate::front::closures::fn_bound_satisfied;
+use crate::front::generics::{
+    CUR_INST, TPL_NONE, env_enter, env_leave, instance_of, instance_targs, mangle_type,
+};
 use crate::front::generics::instantiate::clone_node;
 use crate::front::lexer::{SUF_NONE, Tok};
 use crate::front::modules::{CUR_MOD, STD_MODULE, module_of, qualify};
@@ -53,13 +59,13 @@ use crate::front::types::{
 pub struct TraitInfo { name: i64, node: i64, module: i64 }
 // An impl of trait `tr` for type `ty`, or (generic) for the instances of
 // template `tpl` (generics.tach's encoding).
-struct ImplInfo { node: i64, tr: i64, ty: i64, tpl: i64, module: i64 }
+pub struct ImplInfo { node: i64, tr: i64, ty: i64, tpl: i64, module: i64 }
 
 pub static mut TRAITS: *TraitInfo = 0 as *TraitInfo;
 pub static mut TRAIT_COUNT: i64 = 0;
 static mut TRAIT_CAP: i64 = 0;
-static mut IMPLS: *ImplInfo = 0 as *ImplInfo;
-static mut IMPL_COUNT: i64 = 0;
+pub static mut IMPLS: *ImplInfo = 0 as *ImplInfo;
+pub static mut IMPL_COUNT: i64 = 0;
 static mut IMPL_CAP: i64 = 0;
 // Per key: trait + 1.
 pub static mut SYM_TRAIT: *i64 = 0 as *i64;
@@ -76,6 +82,7 @@ pub fn add_trait(item: i64, key: i64, m: i64) {
         TRAITS[TRAIT_COUNT] = TraitInfo { name: NODES[item].a, node: item, module: m };
         TRAIT_COUNT += 1;
         SYM_TRAIT[key] = TRAIT_COUNT;
+        collect_trait_assoc(TRAIT_COUNT - 1);
     }
 }
 
@@ -126,9 +133,13 @@ pub fn trait_named(n: i64) -> i64 {
 
 // The trait of bound node b (a TyName in a parameter's bounds), resolved
 // in its own module once; -1 when it names none (0.10: an error recorded,
-// and the bound holds for every type).
+// and the bound holds for every type; 0.14: or it is an `Fn` bound).
 pub fn bound_trait(b: i64) -> i64 {
     unsafe {
+        // (0.14: `Fn(A) -> R` names no trait: fn_bound_satisfied)
+        if NODES[b].kind == NodeKind::TyFn {
+            return -1;
+        }
         if NODES[b].x == 0 {
             let saved = CUR_MOD;
             CUR_MOD = module_of(b);
@@ -265,6 +276,10 @@ pub fn collect_impl(node: i64) {
         let mut tpl = TPL_NONE;
         if impl_is_generic(node) {
             tpl = template_of_type_node(NODES[node].b);
+            // (0.14: `impl<T> Tr for [T]`)
+            if tpl == TPL_NONE {
+                tpl = slice_template(NODES[node].b, NODES[node].g);
+            }
             if tpl == TPL_NONE {
                 err_begin(NODES[NODES[node].b].start);
                 err_str(c"a generic impl is for a generic struct or enum, with the impl's parameters as its arguments: 'impl<T> Hash for Vec<T>'");
@@ -296,6 +311,7 @@ pub fn collect_impl(node: i64) {
                 return;
             }
         }
+        collect_impl_assoc(me);
         // Its functions: each one of the trait's.
         for i in 0..NODES[node].count {
             let f = child(node, i);
@@ -342,9 +358,15 @@ pub fn collect_impl(node: i64) {
                 NODES[f].g = merged_generics(NODES[node].g, NODES[f].g);
             }
             NODES[f].p |= 1;
+            // (0.14: checked only when used, ensure_checked; `sum` is no
+            // error for an iterator of slices that never sums)
+            if NODES[f].g == 0 {
+                NODES[f].p |= FN_LAZY;
+            }
             add_fn(f, NODES[f].a, NODES[f].a);
-            // (checked in the impl's module, as if written there)
-            FNS[FN_COUNT - 1].module = m;
+            // (checked in the trait's module, where it is written; 0.13:
+            // the impl's, which does not see the names a std default uses)
+            FNS[FN_COUNT - 1].module = TRAITS[tr].module;
             set_fn_impl(FN_COUNT - 1, me);
             IMPL_EXTRA.push(f);
         }
@@ -457,12 +479,16 @@ pub fn has_impl(tr: i64, t: i64) -> bool {
                 // ... when its arguments satisfy the impl's bounds.
                 let params = NODES[IMPLS[i].node].g;
                 let targs = instance_targs(t);
+                // (0.14: the parameters bound, for the constraints)
+                let saved = env_enter(params, targs, NODES[params].count);
+                let mut ok = true;
                 for k in 0..NODES[params].count {
                     if !satisfies(child(params, k), TLISTS.data[targs + k]) {
-                        return false;
+                        ok = false;
                     }
                 }
-                return true;
+                env_leave(saved);
+                return ok;
             }
         }
         false
@@ -498,7 +524,13 @@ fn satisfies(p: i64, t: i64) -> bool {
             return true;
         }
         for i in 0..NODES[bounds].count {
-            if !implements(bound_trait(child(bounds, i)), t) {
+            let b = child(bounds, i);
+            if !implements(bound_trait(b), t) {
+                return false;
+            }
+            // (0.14: `Fn(A) -> R`, and constraints `Iterator<Item = A>`)
+            if NODES[b].kind == NodeKind::TyFn && !fn_bound_satisfied(b, t)
+                || NODES[b].h != 0 && !assoc_constraints_hold(b, t) {
                 return false;
             }
         }
@@ -513,6 +545,8 @@ pub fn check_bounds(params: i64, targs: i64, count: i64, what: i64, pos: i64) {
         if params == 0 {
             return;
         }
+        // (0.14: the parameters bound, for the constraints, `Item = T`)
+        let saved = env_enter(params, targs, count);
         for k in 0..count {
             let p = child(params, k);
             let bounds = NODES[p].h;
@@ -524,7 +558,23 @@ pub fn check_bounds(params: i64, targs: i64, count: i64, what: i64, pos: i64) {
                 continue;
             }
             for i in 0..NODES[bounds].count {
-                let tr = bound_trait(child(bounds, i));
+                let b = child(bounds, i);
+                // (0.14: `Fn(A) -> R`, and constraints `Iterator<Item = A>`)
+                if NODES[b].h != 0 && !assoc_constraints_hold(b, t) {
+                    constraint_error(b, t, NODES[p].a, what, pos);
+                }
+                if NODES[b].kind == NodeKind::TyFn && !fn_bound_satisfied(b, t) {
+                    err_begin(pos);
+                    err_str(c"the type '");
+                    err_type(t);
+                    err_str(c"' does not satisfy the bound of '");
+                    err_sym(NODES[p].a);
+                    err_str(c"' of '");
+                    err_sym(what);
+                    err_str(c"'");
+                    err_end();
+                }
+                let tr = bound_trait(b);
                 if !implements(tr, t) {
                     err_begin(pos);
                     err_str(c"the trait '");
@@ -543,6 +593,7 @@ pub fn check_bounds(params: i64, targs: i64, count: i64, what: i64, pos: i64) {
                 }
             }
         }
+        env_leave(saved);
     }
 }
 

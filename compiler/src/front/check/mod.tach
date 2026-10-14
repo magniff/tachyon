@@ -31,6 +31,7 @@ pub mod equality;
 mod calls;
 mod vectors;
 mod assign;
+mod iterate;
 
 use crate::base::{IntVec, _setjmp, grow, intern_c};
 use crate::base::diag::{
@@ -38,7 +39,7 @@ use crate::base::diag::{
     exit_if_errors, recover_enter, recover_leave,
 };
 use crate::front::ast::{
-    FN_BODY_FAILED, FN_SIG_FAILED, NODES, SCRATCH, child, list_begin, list_end, list_push,
+    FN_BODY_FAILED, FN_LAZY, FN_SIG_FAILED, NODES, SCRATCH, child, list_begin, list_end, list_push,
 };
 use crate::front::ast::NodeKind::{
     Array, Const, Enum, Fn, Impl, Let, PatBind, Static, Struct, Tuple, Use,
@@ -61,12 +62,16 @@ use crate::front::patterns::OR_MODE;
 use crate::front::traits::{
     check_impl_signatures, collect_impl, collect_impls, init_traits, trait_named,
 };
-use crate::front::types::{FNS, FN_COUNT, TSCRATCH, TYPES, TY_ERROR, TyKind, err_type, type_elem};
+use crate::front::types::{
+    ENUMS, FNS, FN_COUNT, STRUCTS, TLISTS, TSCRATCH, TYPES, TY_ERROR, TyKind, err_type, type_elem,
+};
 use crate::tools::fiximports::report_legacy_imports;
 use crate::tools::query::QUERY;
 use std::Option;
 
 // What other modules use of the parts.
+use crate::front::assoc::ensure_checked;
+use crate::front::closures::CLOSURE_FNS;
 use resolve::resolve_type;
 
 // What an identifier names.
@@ -199,7 +204,9 @@ pub fn check_program(program: i64) {
         for i in 0..NODES[program].count {
             let item = child(program, i);
             // (x is 0 for a function left out by its declaration's error)
-            if NODES[item].kind == Fn && NODES[item].x != 0 && FNS[NODES[item].x - 1].generic == 0 {
+            // (0.14: a lazy default is checked when first used: ensure_checked)
+            if NODES[item].kind == Fn && NODES[item].x != 0 && FNS[NODES[item].x - 1].generic == 0
+                && (NODES[item].p & FN_LAZY) == 0 {
                 check_function_recovering(item);
             }
         }
@@ -293,6 +300,10 @@ fn check_unchecked(program: i64) {
             }
             let f = NODES[item].x - 1;
             if FNS[f].generic == 0 {
+                // (0.14: a lazy default no one uses, for its references)
+                if (NODES[item].p & FN_LAZY) != 0 {
+                    ensure_checked(f, item);
+                }
                 if (NODES[item].p & FN_BODY_FAILED) != 0 {
                     check_function_recovering(item);
                 }
@@ -435,6 +446,23 @@ pub fn has_error_type(t: i64) -> bool {
         if kind == TyKind::Fn && has_error_type(TYPES[t].a) {
             return true;
         }
+        // (0.14: `Option<{error}>`, from an associated type an impl lacks)
+        if kind == TyKind::Struct && STRUCTS[TYPES[t].a].tmpl != 0 {
+            let s = TYPES[t].a;
+            for i in 0..STRUCTS[s].targ_count {
+                if has_error_type(TLISTS.data[STRUCTS[s].targs + i]) {
+                    return true;
+                }
+            }
+        }
+        if kind == TyKind::Enum && ENUMS[TYPES[t].a].tmpl != 0 {
+            let e = TYPES[t].a;
+            for i in 0..ENUMS[e].targ_count {
+                if has_error_type(TLISTS.data[ENUMS[e].targs + i]) {
+                    return true;
+                }
+            }
+        }
         if kind == TyKind::Tuple || kind == TyKind::Fn {
             for i in 0..TYPES[t].count {
                 if has_error_type(type_elem(t, i)) {
@@ -472,7 +500,8 @@ fn poison_pattern(p: i64) {
 }
 
 // The program's list, for the code generators: its items without the
-// generic templates, then the instances of generic functions.
+// generic templates (0.14: and the lazy defaults never used), then the
+// instances of generic functions, then the closures' functions.
 fn finish_program(program: i64) {
     unsafe {
         let mark = list_begin();
@@ -482,10 +511,18 @@ fn finish_program(program: i64) {
             if (kind == Fn || kind == Struct || kind == Enum) && NODES[item].g != 0 {
                 continue;
             }
+            // (0.14: a lazy default never used)
+            if kind == Fn && (NODES[item].p & FN_LAZY) != 0 {
+                continue;
+            }
             list_push(item);
         }
         for q in 0..INST_QUEUE.count {
             list_push(FNS[INST_QUEUE.data[q]].node);
+        }
+        // (0.14: then the closures' functions)
+        for i in 0..CLOSURE_FNS.count {
+            list_push(CLOSURE_FNS.data[i]);
         }
         list_end(program, mark);
     }

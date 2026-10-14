@@ -6,23 +6,25 @@
 use crate::base::intern_c;
 use crate::base::diag::error_at;
 use crate::front::ast::{
-    ARM_NO_ELSE, ARM_SYNTHETIC, BLOCK_UNSAFE, NODES, NodeKind, SCRATCH, list_begin, list_end,
-    list_push, new_node,
+    ARM_NO_ELSE, ARM_SYNTHETIC, BLOCK_UNSAFE, CLOSURE_MOVE, NODES, NodeKind, SCRATCH, list_begin,
+    list_end, list_push, new_node,
 };
 use crate::front::lexer::{SUF_NONE, TOKS, Tok};
 use crate::front::lexer::Tok::{
-    Amp, AmpAmp, AmpEq, As, At, Bang, BangEq, Break, CStr, Caret, CaretEq, Char, Colon, ColonColon,
-    Comma, Continue, Dot, DotDot, DotDotEq, Else, Eof, Eq, EqEq, False, FatArrow, Float, For, Gt,
-    GtEq, Hash, Ident, If, In, Int, LBrace, LBracket, LParen, Let, Loop, Lt, LtEq, Match, Minus,
-    MinusEq, Percent, PercentEq, Pipe, PipeEq, PipePipe, Plus, PlusEq, Question, RBrace, RBracket,
-    RParen, Reserved, Return, Semi, Shl, ShlEq, Shr, ShrEq, Slash, SlashEq, Star, StarEq, Str,
-    Tilde, True, Unsafe, While,
+    Amp, AmpAmp, AmpEq, Arrow, As, At, Bang, BangEq, Break, CStr, Caret, CaretEq, Char, Colon,
+    ColonColon, Comma, Continue, Dot, DotDot, DotDotEq, Else, Eof, Eq, EqEq, False, FatArrow, Float,
+    For, Gt, GtEq, Hash, Ident, If, In, Int, LBrace, LBracket, LParen, Let, Loop, Lt, LtEq, Match,
+    Minus, MinusEq, Percent, PercentEq, Pipe, PipeEq, PipePipe, Plus, PlusEq, Question, RBrace,
+    RBracket, RParen, Reserved, Return, Semi, Shl, ShlEq, Shr, ShrEq, Slash, SlashEq, Star, StarEq,
+    Str, Tilde, True, Unsafe, While,
 };
 use crate::front::parser::{
     NO_STRUCT, P, UNDERSCORE, advance, at, cur, cur_start, eat, expect, expect_binding_name,
     expect_ident, prev_end, reserved_error, syntax_error, tok_kind, with_no_struct,
 };
-use crate::front::parser::stmts::{at_block_like, at_label, parse_block, parse_pattern};
+use crate::front::parser::stmts::{
+    at_block_like, at_label, parse_block, parse_pattern, parse_single_pattern,
+};
 use crate::front::parser::types::{parse_type, parse_type_args};
 
 const AS_BP: i64 = 24;
@@ -164,7 +166,7 @@ fn starts_expr(kind: Tok) -> bool {
         || kind == Tilde || kind == Star || kind == Amp || kind == AmpAmp
         || kind == If || kind == Loop || kind == While || kind == For
         || kind == Return || kind == Break || kind == Continue || kind == Match
-        || kind == Unsafe
+        || kind == Unsafe || kind == Pipe || kind == PipePipe || kind == Tok::Move
 }
 
 pub fn make_unary(op: Tok, operand: i64, start: i64) -> i64 {
@@ -220,7 +222,68 @@ fn parse_prefix() -> i64 {
         if kind == DotDot || kind == DotDotEq {
             error_at(start, c"a range needs a start: write 'a..b'");
         }
+        if kind == Pipe || kind == PipePipe || kind == Tok::Move {
+            return parse_closure();
+        }
         parse_primary()
+    }
+}
+
+// A closure (0.14): `move |a, (b, c): (i64, i64)| expr`, `|| -> T { ... }`.
+// The body has binding power 0, as in Rust.
+fn parse_closure() -> i64 {
+    unsafe {
+        let start = cur_start();
+        let n = new_node(NodeKind::Closure, start, 0);
+        if eat(Tok::Move) {
+            NODES[n].c = CLOSURE_MOVE;
+        }
+        let mark = list_begin();
+        if !eat(PipePipe) {
+            expect(Pipe);
+            while !at(Pipe) && !at(Eof) {
+                list_push(parse_closure_param());
+                if !eat(Comma) {
+                    break;
+                }
+            }
+            expect(Pipe);
+        }
+        list_end(n, mark);
+        if eat(Arrow) {
+            NODES[n].b = parse_type();
+            if !at(LBrace) {
+                syntax_error(
+                    c"expected '{' after a closure's result type: '|x: i64| -> i64 { x + 1 }'");
+            }
+            NODES[n].a = parse_block();
+        } else {
+            NODES[n].a = parse_expr_bp(0);
+        }
+        NODES[n].end = prev_end();
+        n
+    }
+}
+
+// A closure's parameter: a pattern (no `|` alternatives), then `: type`
+// unless it is inferred. A Param node: a=the name (0: a pattern) b=the
+// type (0: none) c=mutable d=the pattern (0: a plain name).
+fn parse_closure_param() -> i64 {
+    unsafe {
+        let start = cur_start();
+        let n = new_node(NodeKind::Param, start, 0);
+        let pattern = parse_single_pattern();
+        if NODES[pattern].kind == NodeKind::PatBind {
+            NODES[n].a = NODES[pattern].a;
+            NODES[n].c = NODES[pattern].b;
+        } else {
+            NODES[n].d = pattern;
+        }
+        if eat(Colon) {
+            NODES[n].b = parse_type();
+        }
+        NODES[n].end = prev_end();
+        n
     }
 }
 
