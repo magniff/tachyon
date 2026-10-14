@@ -27,7 +27,7 @@
 
 use crate::base::{IntVec, buf_byte, buf_new, buf_slice, grow, intern, intern_c, sym_table};
 use crate::base::diag::{
-    err_begin, err_end, err_end_soft, err_help, err_help_sym, err_str, err_sym, fail_name,
+    ERR_HELP, err_begin, err_end, err_end_soft, err_help, err_help_sym, err_str, err_sym, fail_name,
 };
 use crate::front::assoc::{
     assoc_constraints_hold, collect_impl_assoc, collect_trait_assoc, constraint_error,
@@ -44,7 +44,10 @@ use crate::front::check::equality::eq_unsupported;
 use crate::front::check::resolve::{resolve_type, type_name_key};
 use crate::front::check::synth_mode::synth_expr;
 use crate::front::closures::fn_bounds::{fn_bound_error, fn_bound_satisfied};
-use crate::front::convert::{bound_args, collect_trait_params, impl_trait_args, implements_with};
+use crate::front::convert::{
+    bound_args, buf_bound, collect_trait_params, err_bound, impl_trait_args, implements_with,
+    same_trait_args, trait_param_count,
+};
 use crate::front::generics::{
     CUR_INST, TPL_NONE, env_enter, env_leave, instance_of, instance_targs, mangle_type,
 };
@@ -158,7 +161,7 @@ pub fn bound_trait(b: i64) -> i64 {
 }
 
 // The function of trait tr named `name` (a Fn node), or 0.
-fn trait_fn(tr: i64, name: i64) -> i64 {
+pub fn trait_fn(tr: i64, name: i64) -> i64 {
     if tr < 0 {
         return 0;
     }
@@ -299,7 +302,10 @@ pub fn collect_impl(node: i64) {
         IMPLS[IMPL_COUNT] = ImplInfo { node: node, tr: tr, ty: ty, tpl: tpl, module: m, targs: 0 };
         IMPL_COUNT += 1;
         let me = IMPL_COUNT - 1;
-        // Coherence: one impl per (trait, type).
+        // (0.15: `impl From<i64> for T`)
+        impl_trait_args(me);
+        // Coherence: one impl per (trait, type) (0.15: per trait arguments
+        // too, `From<i64>` and `From<[u8]>`).
         for j in 0..me {
             if IMPLS[j].tr != tr {
                 continue;
@@ -307,7 +313,7 @@ pub fn collect_impl(node: i64) {
             let same = (ty != 0 && IMPLS[j].ty == ty) || (tpl != TPL_NONE && IMPLS[j].tpl == tpl)
                 || (ty != 0 && IMPLS[j].tpl != TPL_NONE && instance_of(ty, IMPLS[j].tpl))
                 || (tpl != TPL_NONE && IMPLS[j].ty != 0 && instance_of(IMPLS[j].ty, tpl));
-            if same {
+            if same && same_trait_args(j, me) {
                 impl_type_error(node, c"conflicting impls of trait '", tr,
                     c" (one impl per trait and type)");
                 // (its functions are left out: the first impl's are the
@@ -318,8 +324,6 @@ pub fn collect_impl(node: i64) {
                 return;
             }
         }
-        // (0.15: `impl From<i64> for T`)
-        impl_trait_args(me);
         collect_impl_assoc(me);
         // Its functions: each one of the trait's.
         for i in 0..NODES[node].count {
@@ -345,7 +349,9 @@ pub fn collect_impl(node: i64) {
                     found = true;
                 }
             }
-            if found {
+            // (0.15: a generic trait's function without a body was
+            // reported by collect_trait_params)
+            if found || trait_param_count(tr) != 0 && NODES[decl].c != 0 {
                 continue;
             }
             if NODES[decl].c == 0 {
@@ -401,12 +407,24 @@ pub fn check_impl_signatures() {
             let saved_self = SELF_TYPE;
             CUR_MOD = TRAITS[tr].module;
             SELF_TYPE = FNS[f].self_ty;
+            // (0.15: a generic trait's parameters are the impl's arguments)
+            let count = trait_param_count(tr);
+            if count != 0 && IMPLS[i].targs < 0 {
+                CUR_MOD = saved_mod;
+                SELF_TYPE = saved_self;
+                continue;
+            }
+            let saved_env = if count != 0 { env_enter(TRAITS[tr].params, IMPLS[i].targs, count) }
+                else { 0 };
             let mark = TSCRATCH.count;
             for k in 0..NODES[decl].count {
                 TSCRATCH.push(resolve_type_or_error(NODES[child(decl, k)].b));
             }
             let ret = if NODES[decl].b == 0 { TY_UNIT }
                 else { resolve_type_or_error(NODES[decl].b) };
+            if count != 0 {
+                env_leave(saved_env);
+            }
             CUR_MOD = saved_mod;
             SELF_TYPE = saved_self;
             let count = TSCRATCH.count - mark;
@@ -526,7 +544,7 @@ pub fn implements(tr: i64, t: i64) -> bool {
 }
 
 // Whether type t satisfies the bounds of parameter node p.
-fn satisfies(p: i64, t: i64) -> bool {
+pub fn satisfies(p: i64, t: i64) -> bool {
     unsafe {
         let bounds = NODES[p].h;
         if bounds == 0 {
@@ -586,19 +604,28 @@ pub fn check_bounds(params: i64, targs: i64, count: i64, what: i64, pos: i64) {
                 }
                 let tr = bound_trait(b);
                 // (0.15: `From<U>`, a generic trait's bound)
-                let holds = if NODES[b].g != 0 { implements_with(tr, t, bound_args(b)) }
+                let bargs = if NODES[b].g != 0 { bound_args(b) } else { -1 };
+                let holds = if bargs >= 0 { implements_with(tr, t, bargs) }
                     else { implements(tr, t) };
                 if !holds {
                     err_begin(pos);
                     err_str(c"the trait '");
-                    err_sym(TRAITS[tr].name);
+                    if bargs >= 0 {
+                        err_bound(tr, bargs);
+                    } else {
+                        err_sym(TRAITS[tr].name);
+                    }
                     err_str(c"' is not implemented for '");
                     err_type(t);
                     err_str(c"'");
                     err_help(c"required by the bound '");
                     err_help_sym(NODES[p].a);
                     err_help(c": ");
-                    err_help_sym(TRAITS[tr].name);
+                    if bargs >= 0 {
+                        buf_bound(ERR_HELP, tr, bargs);
+                    } else {
+                        err_help_sym(TRAITS[tr].name);
+                    }
                     err_help(c"' of '");
                     err_help_sym(what);
                     err_help(c"'");

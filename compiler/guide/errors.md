@@ -38,13 +38,14 @@ error[parser error] expected identifier, got '&' | help: write the type of self:
 `self: P` for a copy.
 
 ```tach
-fn f(r: Result<i64, i64>) -> Result<i64, i64> { let x = r?; Ok(x) }
+fn f(r: Result<i64, i64>) -> i64 { let x = r?; x }
 ```
 ```err
-error[type error] '?' expressions are not implemented yet (check.unimplemented)
+error[type error] '?' needs 'f' to return Option or Result; it returns 'i64' | help: make it return a Result: '-> Result<i64, i64>'
 ```
-`?` is coming in 0.15; until then `let x = match r { Ok(v) => v, Err(e) =>
-return Err(e) };` (the same for Option).
+`?` returns the None or the Err from the function, so the function
+returns an Option or a Result (an error converted by `From`); `fn main()
+-> Result<(), E>` prints an Err and exits with 1.
 
 ```tach
 println!("{}", 1);

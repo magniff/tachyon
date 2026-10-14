@@ -1,0 +1,922 @@
+// Generic traits and conversions (0.15; docs/design/errors-formatting.md):
+// traits with type parameters (`trait From<T>`), impls of them for
+// several arguments (`impl From<IoError> for AppError`), bounds with
+// arguments (`T: From<U>`), calls resolved among a type's generic-trait
+// impls by the arguments' types (`AppError::from(e)`, `x.into()`), the
+// intrinsic From of widening and Into, the conversion of `?`'s error, and
+// `fn main() -> Result<(), E>`.
+//
+// The functions of a generic trait's impls are not in METHODS (two impls
+// of From for one type both define `from`): collect_method gives each a
+// symbol of its own (`T.from.N`, N the impl), and a call that finds no
+// ordinary function asks generic_trait_call, which picks the impl whose
+// function takes the arguments' types.
+
+mod try_main;
+
+use crate::base::{
+    IntVec, SYMS, alloc_array, buf_bytes, buf_int, buf_new, buf_slice, buf_str, intern, intern_c,
+};
+use crate::base::diag::{
+    ERR_HELP, err_begin, err_end, err_end_soft, err_help, err_help_sym, err_int, err_str, err_sym,
+};
+use crate::front::assoc::ensure_checked;
+use crate::front::ast::{
+    FN_SIG_FAILED, NODES, NodeKind, child, list_begin, list_end, list_push, new_node,
+};
+use crate::front::check::{SELF_SYM, SELF_TYPE, has_error_type, resolve_type_or_error};
+use crate::front::check::calls::{check_direct_call, method_of, synthetic_unary};
+use crate::front::check::check_mode::check_expr;
+use crate::front::check::resolve::resolve_type;
+use crate::front::check::synth_mode::synth_expr;
+use crate::front::check::unsafety::{U_METHOD, check_call_safety, is_borrow, unsafe_op};
+use crate::front::check::widen::widens;
+use crate::front::generics::{
+    TPL_NONE, check_arg, env_enter, env_leave, hint_for, instance_of, instance_targs, mark_synthed,
+    template_name,
+};
+use crate::front::generics::instantiate::instantiate_call;
+use crate::front::lexer::{SUF_NONE, Tok};
+use crate::front::modules::{CUR_MOD, module_of};
+use crate::front::traits::{IMPLS, IMPL_COUNT, TRAITS, implements, satisfies, std_trait, trait_fn};
+use crate::front::types::{
+    ENUMS, FNS, TLISTS, TSCRATCH, TYPES, TY_ERROR, TY_NEVER, TyKind, VARIANTS, buf_type,
+    enum_variant, err_type, fn_param, is_float, is_integer, is_pointer, primitive_name, ptr_to,
+    variant_field,
+};
+pub use try_main::{main_result_wrapper, std_enum_name, std_variant_pattern};
+
+// ---- Generic traits ----
+
+// The number of type parameters of trait tr (0: not generic).
+pub fn trait_param_count(tr: i64) -> i64 {
+    unsafe {
+        if tr < 0 || TRAITS[tr].params == 0 {
+            return 0;
+        }
+        NODES[TRAITS[tr].params].count
+    }
+}
+
+// The type parameters of trait tr (a TRAITS index; called by add_trait,
+// in the names phase): TraitInfo.params. A generic trait's functions have
+// no default body (the default would be checked per argument).
+pub fn collect_trait_params(tr: i64) {
+    unsafe {
+        let node = TRAITS[tr].node;
+        TRAITS[tr].params = NODES[node].g;
+        if NODES[node].g == 0 {
+            return;
+        }
+        for i in 0..NODES[node].count {
+            let decl = child(node, i);
+            if NODES[decl].c != 0 {
+                err_begin(NODES[decl].start);
+                err_str(c"a function of a generic trait has no default body: '");
+                err_sym(NODES[decl].a);
+                err_str(c"' of '");
+                err_sym(TRAITS[tr].name);
+                err_str(c"'");
+                err_help(c"declare it without a body ('fn ");
+                err_help_sym(NODES[decl].a);
+                err_help(c"(...);'), and write it in each impl");
+                err_end_soft();
+            }
+        }
+    }
+}
+
+// Type nodes `g` (a Generics holder) resolved in module m under the
+// current environment, pushed to TLISTS: its index.
+fn resolve_args(g: i64, m: i64) -> i64 {
+    unsafe {
+        let saved = CUR_MOD;
+        CUR_MOD = m;
+        let mark = TSCRATCH.count;
+        for i in 0..NODES[g].count {
+            let t = resolve_type(child(g, i));
+            TSCRATCH.push(t);
+        }
+        CUR_MOD = saved;
+        let targs = TLISTS.count;
+        for i in mark..TSCRATCH.count {
+            TLISTS.push(TSCRATCH.data[i]);
+        }
+        TSCRATCH.count = mark;
+        targs
+    }
+}
+
+// One type as a TLISTS list.
+fn list_of(t: i64) -> i64 {
+    unsafe {
+        let at = TLISTS.count;
+        TLISTS.push(t);
+        at
+    }
+}
+
+// The trait arguments of impl i (an IMPLS index; called by collect_impl
+// before its coherence check): ImplInfo.targs, resolved in the impl's
+// module; -1 for a generic impl (`impl<T> From<T> for W<T>`: resolved for
+// each instance, impl_targs) or when they failed.
+pub fn impl_trait_args(i: i64) {
+    unsafe {
+        let tr = IMPLS[i].tr;
+        let tname = NODES[IMPLS[i].node].a;
+        let written = NODES[tname].g;
+        let count = trait_param_count(tr);
+        if count == 0 {
+            if written != 0 {
+                err_begin(NODES[tname].start);
+                err_str(c"trait '");
+                err_sym(TRAITS[tr].name);
+                err_str(c"' takes no type arguments");
+                err_end();
+            }
+            return;
+        }
+        IMPLS[i].targs = -1;
+        let got = if written == 0 { 0 } else { NODES[written].count };
+        if got != count {
+            err_begin(NODES[tname].start);
+            err_str(c"trait '");
+            err_sym(TRAITS[tr].name);
+            err_str(c"' takes ");
+            err_int_words(count, c" type argument", c" type arguments");
+            err_str(c", got ");
+            err_int(got);
+            err_help(c"write them: '");
+            err_help_sym(TRAITS[tr].name);
+            err_help(c"<T>'");
+            err_end();
+        }
+        let into = std_trait(c"Into");
+        if tr == into {
+            err_begin(NODES[tname].start);
+            err_str(
+                c"Into is not implemented directly: it holds exactly when From does the other way");
+            err_help(c"implement From instead: 'impl From<");
+            buf_type(ERR_HELP, IMPLS[i].ty);
+            err_help(c"> for U { fn from(x: ");
+            buf_type(ERR_HELP, IMPLS[i].ty);
+            err_help(c") -> U { ... } }' gives 'let u: U = x.into();'");
+            err_end();
+        }
+        if IMPLS[i].tpl != TPL_NONE {
+            return;
+        }
+        IMPLS[i].targs = resolve_args(written, IMPLS[i].module);
+        let from = std_trait(c"From");
+        if tr == from && TLISTS.data[IMPLS[i].targs] == IMPLS[i].ty {
+            err_begin(NODES[tname].start);
+            err_str(c"every type converts from itself already: 'impl From<");
+            err_type(IMPLS[i].ty);
+            err_str(c"> for ");
+            err_type(IMPLS[i].ty);
+            err_str(c"' conflicts with it");
+            err_end();
+        }
+    }
+}
+
+fn err_int_words(n: i64, one: *u8, many: *u8) {
+    err_int(n);
+    unsafe { err_str(if n == 1 { one } else { many }); }
+}
+
+// Whether impls j and i (of the same generic trait, for overlapping
+// types) have the same trait arguments: a conflict. Unknown (a generic
+// impl's, resolved per instance) is no conflict here: a call they both
+// fit is reported as ambiguous.
+pub fn same_trait_args(j: i64, i: i64) -> bool {
+    unsafe {
+        let count = trait_param_count(IMPLS[i].tr);
+        if count == 0 {
+            return true;
+        }
+        let a = IMPLS[j].targs;
+        let b = IMPLS[i].targs;
+        if a < 0 || b < 0 {
+            return false;
+        }
+        same_list(a, b, count)
+    }
+}
+
+fn same_list(a: i64, b: i64, count: i64) -> bool {
+    unsafe {
+        for k in 0..count {
+            if TLISTS.data[a + k] != TLISTS.data[b + k] {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// The impl a function belongs to when that impl is of a generic trait
+// (its functions are found by generic_trait_call, not by name); -1
+// otherwise.
+pub fn generic_trait_impl(i: i64) -> i64 {
+    unsafe {
+        if i < 0 || trait_param_count(IMPLS[i].tr) == 0 {
+            return -1;
+        }
+        i
+    }
+}
+
+// The symbol of function `sym` of generic-trait impl i: `T.from.N`.
+pub fn impl_fn_symbol(sym: i64, i: i64) -> i64 {
+    unsafe {
+        let out = buf_new();
+        buf_bytes(out, SYMS[sym].text);
+        buf_str(out, c".");
+        buf_int(out, i);
+        intern(buf_slice(out))
+    }
+}
+
+// Whether impl i is for type t (for a generic impl: t is an instance of
+// its type, and the arguments satisfy the impl's bounds).
+fn impl_covers(i: i64, t: i64) -> bool {
+    unsafe {
+        if IMPLS[i].ty != 0 {
+            return IMPLS[i].ty == t;
+        }
+        if IMPLS[i].tpl == TPL_NONE || !instance_of(t, IMPLS[i].tpl) {
+            return false;
+        }
+        let params = NODES[IMPLS[i].node].g;
+        let targs = instance_targs(t);
+        let saved = env_enter(params, targs, NODES[params].count);
+        let mut ok = true;
+        for k in 0..NODES[params].count {
+            if !satisfies(child(params, k), TLISTS.data[targs + k]) {
+                ok = false;
+            }
+        }
+        env_leave(saved);
+        ok
+    }
+}
+
+// The trait arguments of impl i for type t (which it covers): a TLISTS
+// index, -1 when unknown.
+fn impl_targs(i: i64, t: i64) -> i64 {
+    unsafe {
+        if IMPLS[i].tpl == TPL_NONE {
+            return IMPLS[i].targs;
+        }
+        let params = NODES[IMPLS[i].node].g;
+        let saved = env_enter(params, instance_targs(t), NODES[params].count);
+        let r = resolve_args(NODES[NODES[IMPLS[i].node].a].g, IMPLS[i].module);
+        env_leave(saved);
+        r
+    }
+}
+
+// The trait arguments of bound b (a TyName with type arguments, `From<U>`)
+// resolved in its module (with the parameters in scope that are bound
+// now): a TLISTS index.
+pub fn bound_args(b: i64) -> i64 {
+    unsafe { resolve_args(NODES[b].g, module_of(b)) }
+}
+
+// From's intrinsic impls: every type from itself, an integer type from
+// the ones that widen to it.
+fn intrinsic_from(from: i64, to: i64) -> bool {
+    from == to || widens(from, to)
+}
+
+// Whether type t implements generic trait tr with arguments targs (a
+// TLISTS index): through an impl, or intrinsically (From of the type
+// itself and of the types that widen to it; Into exactly when the other
+// way From holds). tr < 0: a bound that named no trait (an error was
+// reported), which holds.
+pub fn implements_with(tr: i64, t: i64, targs: i64) -> bool {
+    unsafe {
+        if tr < 0 || has_error_type(t) || t == TY_NEVER {
+            return true;
+        }
+        let count = trait_param_count(tr);
+        if count == 0 {
+            return implements(tr, t);
+        }
+        for k in 0..count {
+            if has_error_type(TLISTS.data[targs + k]) {
+                return true;
+            }
+        }
+        let from = std_trait(c"From");
+        if tr == std_trait(c"Into") {
+            return from >= 0 && implements_with(from, TLISTS.data[targs], list_of(t));
+        }
+        if tr == from && intrinsic_from(TLISTS.data[targs], t) {
+            return true;
+        }
+        for i in 0..IMPL_COUNT {
+            if IMPLS[i].tr != tr || !impl_covers(i, t) {
+                continue;
+            }
+            let a = impl_targs(i, t);
+            if a >= 0 && same_list(a, targs, count) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// Bound b's trait with its arguments, for messages: `From<i64>`.
+pub fn buf_bound(out: i64, tr: i64, targs: i64) {
+    unsafe {
+        buf_bytes(out, SYMS[TRAITS[tr].name].text);
+        let count = trait_param_count(tr);
+        if count == 0 {
+            return;
+        }
+        buf_str(out, c"<");
+        for k in 0..count {
+            if k > 0 {
+                buf_str(out, c", ");
+            }
+            buf_type(out, TLISTS.data[targs + k]);
+        }
+        buf_str(out, c">");
+    }
+}
+
+pub fn err_bound(tr: i64, targs: i64) {
+    let out = buf_new();
+    buf_bound(out, tr, targs);
+    err_sym(intern(buf_slice(out)));
+}
+
+// ---- Calls of a generic trait's functions ----
+
+// The candidates of a call: pairs (impl, function) from CAND_MARK on.
+static mut CANDS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The function `member` of impl i (an FNS index), -1 when it has none.
+fn impl_fn(i: i64, member: i64) -> i64 {
+    unsafe {
+        let node = IMPLS[i].node;
+        for k in 0..NODES[node].count {
+            let f = child(node, k);
+            if NODES[f].a == member && NODES[f].x != 0 && (NODES[f].p & FN_SIG_FAILED) == 0 {
+                return NODES[f].x - 1;
+            }
+        }
+        -1
+    }
+}
+
+// Whether argument node a is a literal without a suffix, which takes the
+// type it is checked against (0: no; 1: an integer; 2: a float).
+fn literal_kind(a: i64) -> i64 {
+    unsafe {
+        let mut e = a;
+        if NODES[e].kind == NodeKind::Unary && NODES[e].op == Tok::Minus {
+            e = NODES[e].b;
+        }
+        if NODES[e].kind == NodeKind::Int && NODES[e].b == SUF_NONE {
+            return 1;
+        }
+        if NODES[e].kind == NodeKind::Float && NODES[e].b == SUF_NONE {
+            return 2;
+        }
+        0
+    }
+}
+
+// Parameter k of trait function decl (of trait tr) for impl i of type t:
+// with the trait's parameters its arguments there and Self t.
+fn decl_param(tr: i64, decl: i64, targs: i64, t: i64, k: i64) -> i64 {
+    unsafe {
+        let saved_mod = CUR_MOD;
+        let saved_self = SELF_TYPE;
+        CUR_MOD = TRAITS[tr].module;
+        SELF_TYPE = t;
+        let saved = env_enter(TRAITS[tr].params, targs, trait_param_count(tr));
+        let ty = resolve_type_or_error(NODES[child(decl, k)].b);
+        env_leave(saved);
+        CUR_MOD = saved_mod;
+        SELF_TYPE = saved_self;
+        ty
+    }
+}
+
+// Whether candidate c (an index of CANDS, a pair) takes the arguments of
+// call n, of types tys[..] (0 for a literal, kinds[..] its kind); `skip`
+// is 1 for a method call (its receiver is the decl's self).
+fn takes(c: i64, n: i64, t: i64, tys: *i64, kinds: *i64, skip: i64) -> bool {
+    unsafe {
+        let i = CANDS.data[c];
+        let tr = IMPLS[i].tr;
+        let decl = trait_fn(tr, NODES[FNS[CANDS.data[c + 1]].node].a);
+        let has_self = NODES[decl].count > 0 && NODES[child(decl, 0)].a == SELF_SYM;
+        if skip == 1 && !has_self {
+            return false;
+        }
+        let count = NODES[n].count;
+        if NODES[decl].count - skip != count {
+            return false;
+        }
+        let targs = impl_targs(i, t);
+        if targs < 0 {
+            return false;
+        }
+        for k in 0..count {
+            let p = decl_param(tr, decl, targs, t, k + skip);
+            let a = tys[k];
+            if a == 0 {
+                if kinds[k] == 1 && !is_integer(p) || kinds[k] == 2 && !is_float(p) {
+                    return false;
+                }
+            } else if a != p && a != TY_NEVER && !has_error_type(p) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// Call n (`T::member(args)`, or `x.member(args)` with t the receiver's
+// type) that found no ordinary function: resolved among t's generic-trait
+// impls by the types of the arguments, and checked (n becomes a Call with
+// x = f + 1, as synth_method makes); its type. -1 when t has no
+// generic-trait impl with a function `member` (the caller reports it).
+pub fn generic_trait_call(n: i64, t: i64, member: i64) -> i64 {
+    dispatch(n, t, member, 0)
+}
+
+// `W::from(x)` with W a generic type written without its arguments (n a
+// Call, tpl W's template): a generic-trait call on the instance expected
+// there; its type. -1 when tpl has no generic-trait impl with a function
+// `member` (the caller reports it).
+pub fn template_trait_call(n: i64, tpl: i64, member: i64) -> i64 {
+    unsafe {
+        let mut found = false;
+        for i in 0..IMPL_COUNT {
+            if IMPLS[i].tpl == tpl && trait_param_count(IMPLS[i].tr) != 0
+                && impl_fn(i, member) >= 0 {
+                found = true;
+            }
+        }
+        if !found {
+            return -1;
+        }
+        let hint = hint_for(n);
+        if hint <= 0 || !instance_of(hint, tpl) {
+            err_begin(NODES[n].start);
+            err_str(c"'");
+            err_sym(template_name(tpl));
+            err_str(c"::");
+            err_sym(member);
+            err_str(c"' needs the type arguments of '");
+            err_sym(template_name(tpl));
+            err_str(c"'");
+            err_help(c"write them: '");
+            err_help_sym(template_name(tpl));
+            err_help(c"::<T>::");
+            err_help_sym(member);
+            err_help(c"(...)', or the type expected: 'let w: ");
+            err_help_sym(template_name(tpl));
+            err_help(c"<T> = ...'");
+            err_end();
+        }
+        dispatch(n, hint, member, 0)
+    }
+}
+
+// generic_trait_call, the first `pre` arguments synthesized already.
+fn dispatch(n: i64, t: i64, member: i64, pre: i64) -> i64 {
+    unsafe {
+        if t < 0 || has_error_type(t) {
+            return -1;
+        }
+        let method = NODES[n].kind == NodeKind::MethodCall;
+        let from = std_trait(c"From");
+        let is_from = !method && from >= 0 && member == intern_c(c"from");
+        if method && member == intern_c(c"into") && NODES[n].count == 0
+            && std_trait(c"Into") >= 0 {
+            err_begin(NODES[n].start);
+            err_str(c"'into' needs the type it converts to: '");
+            err_type(t);
+            err_str(c"' into what?");
+            err_help(c"write the type: 'let y: T = x.into();', or call 'T::from(x)'");
+            err_end();
+        }
+        let mark = CANDS.count;
+        for i in 0..IMPL_COUNT {
+            if trait_param_count(IMPLS[i].tr) == 0 || !impl_covers(i, t) {
+                continue;
+            }
+            let f = impl_fn(i, member);
+            if f >= 0 {
+                CANDS.push(i);
+                CANDS.push(f);
+            }
+        }
+        if CANDS.count == mark && !is_from {
+            return -1;
+        }
+        // The arguments' types; literals without a suffix are left for
+        // last: they fit any type of their kind.
+        let count = NODES[n].count;
+        let tys = alloc_array::<i64>(count + 1);
+        let kinds = alloc_array::<i64>(count + 1);
+        let mut failed = false;
+        for k in 0..count {
+            let a = child(n, k);
+            kinds[k] = if k < pre { 0 } else { literal_kind(a) };
+            if k < pre {
+                tys[k] = NODES[a].ty;
+            } else if kinds[k] != 0 {
+                tys[k] = 0;
+            } else {
+                tys[k] = synth_expr(a);
+                mark_synthed(a);
+            }
+            if tys[k] != 0 && has_error_type(tys[k]) {
+                failed = true;
+            }
+        }
+        if failed {
+            CANDS.count = mark;
+            return TY_ERROR;
+        }
+        let skip = if method { 1 } else { 0 };
+        let mut chosen = -1;
+        let mut matches = 0;
+        let mut c = mark;
+        while c < CANDS.count {
+            if takes(c, n, t, tys, kinds, skip) {
+                matches += 1;
+                chosen = c;
+            }
+            c += 2;
+        }
+        if matches > 1 {
+            ambiguous_call(n, t, member, mark, tys, kinds, skip);
+        }
+        if matches == 1 {
+            let f = CANDS.data[chosen + 1];
+            CANDS.count = mark;
+            return if method { method_call(n, t, f) } else { path_call(n, t, f) };
+        }
+        // From's intrinsic impls: the type itself, a narrower integer.
+        if is_from && count == 1 {
+            let a = child(n, 0);
+            let at = tys[0];
+            if at == 0 && (kinds[0] == 1 && is_integer(t) || kinds[0] == 2 && is_float(t))
+                || at == t {
+                CANDS.count = mark;
+                if at == 0 {
+                    check_expr(a, t);
+                }
+                become_value(n, a, t);
+                return t;
+            }
+            if at != 0 && widens(at, t) {
+                CANDS.count = mark;
+                become_cast(n, a, t);
+                return t;
+            }
+        }
+        no_impl_error(n, t, member, mark, tys, kinds, is_from, from);
+    }
+}
+
+// Call n of generic-trait function f (`T::from(x)`), checked.
+fn path_call(n: i64, t: i64, f0: i64) -> i64 {
+    unsafe {
+        let mut f = f0;
+        if FNS[f].generic > 0 {
+            let callee = NODES[n].a;
+            let written = if callee != 0 && NODES[callee].kind == NodeKind::Path { NODES[callee].h }
+                else { 0 };
+            f = instantiate_call(f, n, 0, t, written);
+        }
+        NODES[n].x = f + 1;
+        check_direct_call(n, f)
+    }
+}
+
+// Method call n (`x.m(args)`, x of type t or a pointer to one) of
+// generic-trait function f: a Call with the receiver (borrowed or
+// dereferenced as f's self takes it) first, checked.
+fn method_call(n: i64, t: i64, f0: i64) -> i64 {
+    unsafe {
+        let mut f = f0;
+        if FNS[f].generic > 0 {
+            f = instantiate_call(f, n, 1, t, NODES[n].g);
+        }
+        let receiver = NODES[n].a;
+        let through = NODES[receiver].ty != t;
+        let self_ty = fn_param(f, 0);
+        let mut arg = receiver;
+        if through && !is_borrow(receiver) {
+            unsafe_op(n, U_METHOD, c"calling a method through a raw pointer is unsafe");
+        }
+        if self_ty == t && through {
+            arg = synthetic_unary(Tok::Star, receiver, t);
+        } else if self_ty == ptr_to(t) && !through {
+            arg = synthetic_unary(Tok::Amp, receiver, self_ty);
+        }
+        mark_synthed(arg);
+        let mark = list_begin();
+        list_push(arg);
+        for k in 0..NODES[n].count {
+            list_push(child(n, k));
+        }
+        list_end(n, mark);
+        NODES[n].kind = NodeKind::Call;
+        NODES[n].a = 0;
+        NODES[n].x = f + 1;
+        // (as synth_method: the receiver is not an argument for the
+        // safety of the call)
+        ensure_checked(f, n);
+        for k in 0..NODES[n].count {
+            check_arg(child(n, k), fn_param(f, k));
+        }
+        check_call_safety(n, f, 1);
+        FNS[f].ret
+    }
+}
+
+// Call n becomes its checked argument a (of type t): `{ a }`, so that the
+// nodes that refer to a still do.
+fn become_value(n: i64, a: i64, t: i64) {
+    unsafe {
+        let (start, end) = (NODES[n].start, NODES[n].end);
+        NODES[n] = NODES[0];
+        NODES[n].kind = NodeKind::Block;
+        NODES[n].start = start;
+        NODES[n].end = end;
+        NODES[n].a = a;
+        NODES[n].ty = t;
+    }
+}
+
+// Call n becomes `a as t` (a checked, of an integer type that widens to t).
+fn become_cast(n: i64, a: i64, t: i64) {
+    unsafe {
+        let (start, end) = (NODES[n].start, NODES[n].end);
+        let ty = new_node(NodeKind::TyName, start, end);
+        NODES[ty].a = intern_c(primitive_name(t));
+        NODES[ty].ty = t;
+        NODES[n] = NODES[0];
+        NODES[n].kind = NodeKind::Cast;
+        NODES[n].start = start;
+        NODES[n].end = end;
+        NODES[n].a = a;
+        NODES[n].b = ty;
+        NODES[n].ty = t;
+    }
+}
+
+// The arguments' types, for messages: `(i64, [u8])`.
+fn err_arg_types(n: i64, tys: *i64, kinds: *i64) {
+    unsafe {
+        err_str(c"(");
+        for k in 0..NODES[n].count {
+            if k > 0 {
+                err_str(c", ");
+            }
+            if tys[k] != 0 {
+                err_type(tys[k]);
+            } else if kinds[k] == 1 {
+                err_str(c"{integer}");
+            } else {
+                err_str(c"{float}");
+            }
+        }
+        err_str(c")");
+    }
+}
+
+// The candidates from mark on, for a help line: `From<i64>, From<[u8]>`.
+fn help_candidates(mark: i64, t: i64) {
+    unsafe {
+        let mut c = mark;
+        while c < CANDS.count {
+            if c > mark {
+                err_help(c", ");
+            }
+            let i = CANDS.data[c];
+            let targs = impl_targs(i, t);
+            if targs >= 0 {
+                buf_bound(ERR_HELP, IMPLS[i].tr, targs);
+            } else {
+                err_help_sym(TRAITS[IMPLS[i].tr].name);
+            }
+            c += 2;
+        }
+    }
+}
+
+fn ambiguous_call(n: i64, t: i64, member: i64, mark: i64, tys: *i64, kinds: *i64, skip: i64)
+    -> ! {
+    unsafe {
+        err_begin(NODES[n].start);
+        err_str(c"'");
+        err_type(t);
+        err_str(c"::");
+        err_sym(member);
+        err_str(c"' is ambiguous for arguments ");
+        err_arg_types(n, tys, kinds);
+        err_help(c"more than one impl takes them: ");
+        let mut c = mark;
+        let mut first = true;
+        while c < CANDS.count {
+            if takes(c, n, t, tys, kinds, skip) {
+                if !first {
+                    err_help(c", ");
+                }
+                first = false;
+                let i = CANDS.data[c];
+                let targs = impl_targs(i, t);
+                buf_bound(ERR_HELP, IMPLS[i].tr, targs);
+            }
+            c += 2;
+        }
+        let mut lit = false;
+        for k in 0..NODES[n].count {
+            if kinds[k] != 0 {
+                lit = true;
+            }
+        }
+        if lit {
+            err_help(c"; give the literal a type: '3i32', '3i64', '2.5f32'");
+        }
+        err_end()
+    }
+}
+
+fn no_impl_error(n: i64, t: i64, member: i64, mark: i64, tys: *i64, kinds: *i64, is_from: bool,
+    from: i64) -> ! {
+    unsafe {
+        err_begin(NODES[n].start);
+        if is_from && NODES[n].count == 1 && tys[0] != 0 {
+            err_str(c"cannot convert '");
+            err_type(tys[0]);
+            err_str(c"' into '");
+            err_type(t);
+            err_str(c"': no impl of 'From<");
+            err_type(tys[0]);
+            err_str(c">' for '");
+            err_type(t);
+            err_str(c"'");
+            help_from_impl(tys[0], t);
+            if CANDS.count > mark {
+                err_help(c" (its impls: ");
+                help_candidates(mark, t);
+                err_help(c")");
+            }
+        } else {
+            err_str(c"no impl of '");
+            err_type(t);
+            err_str(c"::");
+            err_sym(member);
+            err_str(c"' takes arguments ");
+            err_arg_types(n, tys, kinds);
+            if CANDS.count > mark {
+                err_help(c"its impls: ");
+                help_candidates(mark, t);
+            }
+        }
+        CANDS.count = mark;
+        err_end()
+    }
+}
+
+// help: the impl From<from> for to that would convert (a variant of `to`
+// holding a `from` when it has one).
+fn help_from_impl(from: i64, to: i64) {
+    unsafe {
+        err_help(c"implement it: 'impl From<");
+        buf_type(ERR_HELP, from);
+        err_help(c"> for ");
+        buf_type(ERR_HELP, to);
+        err_help(c" { fn from(e: ");
+        buf_type(ERR_HELP, from);
+        err_help(c") -> ");
+        buf_type(ERR_HELP, to);
+        err_help(c" { ");
+        let v = variant_holding(to, from);
+        buf_type(ERR_HELP, to);
+        if v >= 0 {
+            err_help(c"::");
+            err_help_sym(VARIANTS[v].name);
+            err_help(c"(e)");
+        } else if TYPES[to].kind == TyKind::Enum {
+            err_help(c"::...(e)");
+        } else {
+            err_help(c" { ... }");
+        }
+        err_help(c" } }'");
+    }
+}
+
+// A variant of enum `to` with one field, of type `from`; -1 when none.
+fn variant_holding(to: i64, from: i64) -> i64 {
+    unsafe {
+        if TYPES[to].kind != TyKind::Enum {
+            return -1;
+        }
+        let e = TYPES[to].a;
+        for k in 0..ENUMS[e].variant_count {
+            let v = enum_variant(e, k);
+            if VARIANTS[v].field_count == 1
+                && variant_field(v, 0) == from {
+                return v;
+            }
+        }
+        -1
+    }
+}
+
+// `x.into()` (n, a MethodCall named `into` without arguments) checked
+// against `expected`: `U::from(x)` with U = expected; its type. -1 when n
+// is not such a call or `into` is a method of x's type (the caller checks
+// it as any call).
+pub fn into_call(n: i64, expected: i64) -> i64 {
+    unsafe {
+        if expected == 0 || NODES[n].g != 0 || std_trait(c"Into") < 0
+            || std_trait(c"From") < 0 {
+            return -1;
+        }
+        let into = intern_c(c"into");
+        let receiver = NODES[n].a;
+        // (an ordinary method `into` of x's type is that method: the call
+        // is checked as any other, x synthesized once more)
+        let rt = synth_expr(receiver);
+        let mut own = method_of(rt, into);
+        if own < 0 && is_pointer(rt) {
+            own = method_of(TYPES[rt].a, into);
+        }
+        if own >= 0 {
+            return -1;
+        }
+        if has_error_type(rt) || has_error_type(expected) {
+            return expected;
+        }
+        mark_synthed(receiver);
+        let callee = new_node(NodeKind::Path, NODES[n].start, NODES[n].end);
+        NODES[callee].b = intern_c(c"from");
+        NODES[callee].y = expected;
+        let mark = list_begin();
+        list_push(receiver);
+        list_end(n, mark);
+        NODES[n].kind = NodeKind::Call;
+        NODES[n].a = callee;
+        NODES[n].b = 0;
+        let r = dispatch(n, expected, intern_c(c"from"), 1);
+        if r < 0 { expected } else { r }
+    }
+}
+
+// The error value `value` (of type `from`) that `?` returns from a
+// function whose error type is `to`: the value itself when they are the
+// same, a widening Cast, or `to::from(value)`; the node. An error at pos
+// when there is no conversion.
+pub fn error_conversion(value: i64, from: i64, to: i64, pos: i64) -> i64 {
+    unsafe {
+        if from == to || has_error_type(from) || has_error_type(to) {
+            return value;
+        }
+        let (start, end) = (NODES[value].start, NODES[value].end);
+        if widens(from, to) {
+            let c = new_node(NodeKind::Cast, start, end);
+            let ty = new_node(NodeKind::TyName, start, end);
+            NODES[ty].a = intern_c(primitive_name(to));
+            NODES[ty].ty = to;
+            NODES[c].a = value;
+            NODES[c].b = ty;
+            return c;
+        }
+        let tr = std_trait(c"From");
+        if tr < 0 || !implements_with(tr, to, list_of(from)) {
+            err_begin(pos);
+            err_str(c"'?' cannot convert the error '");
+            err_type(from);
+            err_str(c"' into '");
+            err_type(to);
+            err_str(c"', the function's error type");
+            help_from_impl(from, to);
+            err_end();
+        }
+        let callee = new_node(NodeKind::Path, start, end);
+        NODES[callee].b = intern_c(c"from");
+        NODES[callee].y = to;
+        let call = new_node(NodeKind::Call, start, end);
+        NODES[call].a = callee;
+        let mark = list_begin();
+        list_push(value);
+        list_end(call, mark);
+        call
+    }
+}

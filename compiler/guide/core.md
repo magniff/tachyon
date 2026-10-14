@@ -42,7 +42,7 @@ files on the command line make one program; `mod name;` loads
 | `println!("{}", x)`, `format!` | no macros: `print("x = "); std::print_int(x); println("");`; floats through C's `printf` |
 | `v[i]` on a `Vec` | `v.get(i)`, `v.set(i, x)`, `v.as_slice()[i]` |
 | closures, `.iter().map()` | the same (0.14): `\|x\| x + k`, `v.iter().map(\|x\| x * 2).sum()`; `F: Fn(i64) -> i64` bounds; no `dyn Fn`, `FnOnce`, `iter_mut` (`guide closures`, `guide iterators`) |
-| `x?` | none yet (0.15): `match r { Ok(v) => v, Err(e) => return Err(e) }` |
+| `x?` | the same (0.15), on Option and Result; the error converted by `From` |
 | `impl Trait for T`, `T: Trait` | the same; `type Item;` associated types (0.14); no `dyn`, `where`, supertraits, `#[derive]` |
 | `Drop`, RAII | none: call `free()`, usually `defer v.free();` |
 | `'outer: loop`, `break 'outer` | `outer: loop`, `break :outer`, `continue :outer` |
@@ -439,7 +439,7 @@ the one hole in safe code (no lifetimes).
 | `expected type, got '&'` | `*T` for `&T` and `&mut T` |
 | `expected identifier, got '&'` in `fn f(&self)` | `self: *T` |
 | `cannot infer the type of closure parameter 'x'` | `\|x: i64\| ...`, or pass it where an `Fn` bound or `fn` type gives it |
-| `'?' expressions are not implemented yet` | `match` on the `Result` (0.15 brings `?`) |
+| `'?' needs 'f' to return Option or Result` | `-> Result<T, E>` (or `Option<T>`); `main` may return `Result<(), E>` |
 | `expected ';', got '!'` | no macros: `println(...)`, `std::print_int(...)` |
 | `cannot assign to immutable variable 'x'` | `let mut x` |
 | `cannot index type 'Vec<i64>'` | `v.get(i)`, `v.as_slice()[i]` |
