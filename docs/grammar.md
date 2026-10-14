@@ -645,7 +645,19 @@ The module `std` is built into the compiler, read when a program names it
 `clear`, `free`), `Buf` (a byte buffer: `push`, `push_str`, `push_cstr`,
 `push_int`, `as_slice`), and `print`, `println`, `print_int`, `print_cstr`.
 Failures (`unwrap` of `None`, an index out of bounds) write a message to
-stderr and exit with 101. Its source is `compiler/std/std.tach`.
+stderr and exit with 101. Its source is `compiler/std/std.tach`; the
+whole API, from that source: `tachyonc guide std`.
+
+0.14 adds reading stdin without `unsafe` (`read_line(&buf)`, a line
+without its `'\n'`, false at the end of input; `read_stdin()`, all of
+it), text helpers (`parse_int` to an `Option<i64>`, `trim`, `split`,
+`split_whitespace`, `is_space`, `is_digit`, and `Scanner`: `next_token`,
+`next_int`, `next_line`), `Vec`'s `last`, `swap`, `insert`, `remove`,
+`truncate`, and `HashMap`'s `contains_key`, `get_mut` and
+`get_or_insert`. The last two give the value in place as a one-element
+slice (`m.get_or_insert(k, 0)[0] += 1`): a slice is safe to index, and
+like `as_slice()` it is valid until the map's next insert, remove or
+free.
 
 ### Keywords
 
@@ -914,7 +926,7 @@ fieldless enums `Ord`. Compound assignment (`+=`) stays numeric.
 `Hash` (`fn hash(self: *Self) -> u64`), in the prelude; impls of `Eq`,
 `Ord` and `Hash` for the integer types, `bool` and `[u8]` (byte strings:
 by bytes, lexicographically, FNV-1a); `sort<T: Ord>(s: [T])` (in place,
-a heapsort, not stable); and `HashMap<K: Hash + Eq, V>` (open addressing
+not stable; a heapsort, an introsort from 0.14); and `HashMap<K: Hash + Eq, V>` (open addressing
 with linear probing): `new`, `insert` (returns the old value),
 `get`, `contains`, `remove`, `len`, `is_empty`, `free`, and iteration by
 slot: `slots()`, `key_at(i)` and `value_at(i)` (`None` for an empty
@@ -1055,7 +1067,42 @@ to `fn` types, the escape rule.)
 
 ### Associated types
 
-(To come: `type Item;`, projections, `Iterator<Item = T>` constraints.)
+```tach
+trait Source {
+    type Item;                                  // declared: no default, no bounds
+    fn get(self: *Self) -> Self::Item;
+}
+impl Source for Counter {
+    type Item = i64;                            // every declared name is defined
+    fn get(self: *Counter) -> i64 { self.n }
+}
+fn first<I: Source>(it: I) -> I::Item { ... }
+fn total<I: Iterator<Item = T>, T: Add>(it: I) -> T { ... }
+```
+
+- A trait declares `type Name;` and each impl of it defines `type Name =
+  T;` (an impl lacking one is an error: "the impl of trait 'Iterator' is
+  missing 'type Item'"). A generic impl's definition may use its
+  parameters and their projections (`type Item = (I::Item, I::Item);`).
+- `X::Name` (a *projection*) is written with `X` a type parameter or
+  `Self`. Generic code is checked per instance, where `X` is a concrete
+  type: `X::Name` is the type its impl defines. Two traits defining the
+  same name for a type make `X::Name` ambiguous (an error); there is no
+  `<T as Tr>::Name`.
+- `F::Output`, built in, is the result type of a fn type or a closure.
+- A bound may constrain the trait's associated types, `I: Iterator<Item
+  = i64>`: checked when an instance is made ("'Small::Item' is 'u8', but
+  the bound 'I: Iterator<Item = i64>' of 'f' requires 'i64'"), and used to
+  infer the parameters it names (`T` above, from `I`'s `Item`).
+- A trait's default function copied into a non-generic impl is checked,
+  and compiled, only when the program uses it: `sum`, which needs `0 as
+  Self::Item`, is no error for an iterator of `[u8]` that never sums. Its
+  errors note where it was first used. A default is checked in the
+  trait's module (0.13: the impl's).
+
+**Impls for slices.** `impl<T> [T] { ... }` gives methods to every slice
+type, and `impl<T> Tr for [T] { ... }` implements a trait for them (the
+impl's only parameter is the element type): `s.second()` on a `[i64]`.
 
 ### Iterators
 

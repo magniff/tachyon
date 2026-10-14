@@ -83,7 +83,67 @@ shape 10
   `Ord`: numbers, pointers, fieldless enums have it.
 - Methods are called `x.m()` or `Type::m(&x)`; a trait's function
   without `self` is called `Type::f()`.
+- A default function is checked, and compiled, only for the impls
+  that use it (in a non-generic impl).
 - Not there: `dyn Trait` (use generics, or an enum of the cases),
-  supertraits, associated types and constants, generic traits, `impl
-  Trait` in argument or return position, blanket impls over all `T`,
-  `#[derive]`.
+  supertraits, associated constants, generic traits, `impl Trait` in
+  argument or return position, blanket impls over all `T`, `#[derive]`.
+
+## Associated types (0.14)
+
+A trait declares `type Name;`, each impl defines it, and `T::Name` (or
+`Self::Name`) is that type. A bound can fix it: `I: Iterator<Item =
+i64>`. Slices get impls too: `impl<T> [T] { ... }`, `impl<T> Tr for [T]`.
+
+```tach
+use std::print_int;
+
+struct Countdown { n: i64 }
+
+impl Iterator for Countdown {           // std's trait, in the prelude
+    type Item = i64;
+    fn next(self: *Countdown) -> Option<i64> {
+        if self.n == 0 { return None; }
+        self.n -= 1;
+        Some(self.n + 1)
+    }
+}
+
+fn first<I: Iterator>(it: I) -> Option<I::Item> {
+    let mut it = it;
+    it.next()
+}
+
+fn total<I: Iterator<Item = i64>>(it: I) -> i64 {
+    it.sum()                            // a default of Iterator
+}
+
+impl<T> [T] {
+    fn second(self: [T]) -> T { self[1] }
+}
+
+fn main() -> i32 {
+    print_int(first(Countdown { n: 3 }).unwrap());
+    print(" ");
+    print_int(total(Countdown { n: 4 }));
+    print(" ");
+    print_int(Countdown { n: 5 }.count());
+    print(" ");
+    let c: [u8; 1] = ["xyz".second()];
+    print(c[0..1]);
+    println("");
+    0
+}
+```
+```out
+3 10 5 y
+```
+
+- Every declared name must be defined: "the impl of trait 'Iterator' is
+  missing 'type Item'".
+- `X::Name` needs `X` to be a type parameter or `Self`; two traits
+  defining the name for one type is an ambiguity error. No defaults or
+  bounds on associated types, no `<T as Tr>::Name`.
+- A constraint that does not hold: "'Small::Item' is 'u8', but the bound
+  'I: Iterator<Item = i64>' of 'total' requires 'i64'".
+- `F::Output` is the result type of a fn type (or a closure).

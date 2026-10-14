@@ -67,8 +67,8 @@ fn spare() -> i64 {
 // A program to split (tests/refactor/splits.t).
 mod table;
 
-use crate::table::names::describe;
 use table::{KINDS, weight};
+use table::names::describe;
 
 fn main() -> i32 {
     if describe(1) + weight(2) + KINDS == 10 { 0 } else { 1 }

@@ -43,7 +43,7 @@ files on the command line make one program; `mod name;` loads
 | `v[i]` on a `Vec` | `v.get(i)`, `v.set(i, x)`, `v.as_slice()[i]` |
 | closures, `.iter().map()` | none in 0.13 (coming in 0.14): `for i in 0..s.len { ... s[i] ... }`, `for x in slice` |
 | `x?` | none yet (0.15): `match r { Ok(v) => v, Err(e) => return Err(e) }` |
-| `impl Trait for T`, `T: Trait` | the same; no `dyn`, `where`, associated types, supertraits, `#[derive]` |
+| `impl Trait for T`, `T: Trait` | the same; `type Item;` associated types (0.14); no `dyn`, `where`, supertraits, `#[derive]` |
 | `Drop`, RAII | none: call `free()`, usually `defer v.free();` |
 | `'outer: loop`, `break 'outer` | `outer: loop`, `break :outer`, `continue :outer` |
 | `!x` on integers | `~x`; `!` is for `bool` only |
@@ -344,37 +344,22 @@ from its source in this compiler (every item is `pub`):
 
 ## Input, output, arguments
 
-std prints; reading goes through C (`getchar`, `read`, `fopen`):
+std prints and reads stdin: `read_stdin()` (all of it, a `Buf`),
+`read_line(&buf)` (the next line, without its `'\n'`; false at the end),
+`Scanner` (tokens, numbers, lines of a text), `parse_int`, `split`,
+`trim`. Files go through C (`fopen`):
 
 ```tach
-import "stdio.h" as c;
 import "string.h" as c;
-use std::Buf;
-
-fn read_all() -> Buf {                    // all of stdin
-    let mut b = Buf::new();
-    loop {
-        let ch = unsafe { c::getchar() };
-        if ch < 0 { break; }              // EOF
-        b.push(ch as u8);
-    }
-    b                                     // the caller frees it
-}
+use std::{Scanner, read_stdin};
 
 fn main(argc: i32, argv: **u8) -> i32 {
-    let mut input = read_all();
-    defer input.free();
-    let text = input.as_slice();
+    let mut input = read_stdin();         // all of stdin
+    defer input.free();                   // the caller frees it
+    let mut sc = Scanner::new(input.as_slice());
     let mut total = 0;
-    let mut start = 0;
-    for i in 0..text.len + 1 {            // each line, the last one too
-        if i == text.len || text[i] == '\n' {
-            let line = text[start..i];
-            let mut n = 0;
-            for ch in line { if ch >= '0' && ch <= '9' { n = n * 10 + (ch - '0') as i64; } }
-            total += n;
-            start = i + 1;
-        }
+    while let Some(n) = sc.next_int() {   // None at the end
+        total += n;
     }
     std::print_int(total);
     println("");

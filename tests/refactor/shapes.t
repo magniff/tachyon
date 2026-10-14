@@ -271,6 +271,7 @@ error refactor.non-exhaustive: 2 matches on crate::kinds::Kind would not cover R
 try: tachyonc query show kinds.tach:9
 try: tachyonc query show kinds.tach:33
 try: tachyonc refactor variant crate::kinds::Kind --add 'Ring(i64, i64)' --arm 'EXPR' --dry-run
+try: tachyonc refactor variant crate::kinds::Kind --add 'Ring(i64, i64)' --arm-in kinds::weight 'EXPR' --arm-in kinds::sides 'EXPR' --dry-run
 [exit 1]
 $ refactor variant Kind --rename Empty Nothing --dry-run
 --- a/main.tach

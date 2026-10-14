@@ -31,15 +31,15 @@ sed, head, cat or awk ([docs/query.md](docs/query.md)):
 | a module's `use` lines, header comment, extern blocks | `target/tachyonc query show MODULE::use` (`::header`, `::extern`) |
 | change a module's `use` lines or header comment | `target/tachyonc edit patch\|replace MODULE::use` (`MODULE::header`; `edit insert --after MODULE::use`, `edit delete`) |
 | lines of any file (a test, a fixture, conflict markers), a small file | `target/tachyonc query text FILE:A-B`, `query show FILE.tach` |
-| change a few lines inside an item (a condition, a statement) | `target/tachyonc edit patch NAME\|FILE:LINE --old 'TEXT' --new 'TEXT'` (pairs repeat; several lines: `< pairs` or `--pairs FILE`, blocks `<<<<<<< OLD` / `=======` / `>>>>>>> NEW`; `--loose` for other indentation) |
+| change a few lines inside an item (a condition, a statement; FILE:LINE: a comment between items too) | `target/tachyonc edit patch NAME\|FILE:LINE --old 'TEXT' --new 'TEXT'` (pairs repeat; several lines: `< pairs` or `--pairs FILE`, blocks `<<<<<<< OLD` / `=======` / `>>>>>>> NEW`; `--loose` for other indentation) |
 | add statements inside an item | `target/tachyonc edit insert --in NAME --after\|--before 'ANCHOR' < text` |
-| replace, add or remove an item by name | `target/tachyonc edit replace NAME < new.tach`, `edit insert --after\|--before NAME`, `edit delete NAME` (`--dry-run` for the diff) |
+| replace, add or remove an item by name | `target/tachyonc edit replace NAME < new.tach`, `edit insert --after\|--before NAME`, `edit delete NAME` (`--dry-run` for the diff; the `use` lines new text needs are added) |
 | see what an edit changed, without reading the file back | `--show` on any edit or refactoring; `target/tachyonc query diff` (the last one) |
 | wrap a body or lines in a block (`unsafe`, `loop`), re-indented; make a file with its `mod` line | `target/tachyonc edit wrap NAME --in unsafe [--lines A-B]`, `edit new-file PATH < text` |
 | take the last edit back | `target/tachyonc undo` |
 | add, remove, rename, reorder or retype a parameter, with every call | `target/tachyonc refactor signature FN --add 'x: i64 = 0'` (`--remove x`, `--rename-param a b`, `--reorder b,a`, `--type x T --default '$x as T'`) |
 | add, remove, rename or retype a field, with every literal and access | `target/tachyonc refactor field STRUCT --add 'g: i64 = 0'` (`--remove g`, `--rename g h`, `--type g T`) |
-| add a variant (an arm in each match that needs one), remove, rename one | `target/tachyonc refactor variant ENUM --add 'X(i64)' --arm 'EXPR'` (`--remove V`, `--rename V W`) |
+| add a variant (an arm in each match that needs one), remove, rename one | `target/tachyonc refactor variant ENUM --add 'X(i64)' --arm 'EXPR'` (`--arm-in FN 'EXPR'` per match; `--remove V`, `--rename V W`) |
 | move lines of a function into a new one, parameters and result computed | `target/tachyonc refactor extract-function FN --lines A-B --to NEW` |
 | put a small function's body where it is called (and delete it) | `target/tachyonc refactor inline FN` (`--at FILE:LINE`: one call) |
 | replace an idiom everywhere, typed | `target/tachyonc rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: *IntVec' --dry-run` |
@@ -47,7 +47,7 @@ sed, head, cat or awk ([docs/query.md](docs/query.md)):
 | move items to another module, imports and `pub` fixed | `target/tachyonc refactor move PATH... --to MODULE` (`--after\|--before ITEM`: where) |
 | make a module; move one (file, folder, paths) | `target/tachyonc refactor new-module crate::a::b`, `refactor move-module crate::a crate::x::a` |
 | split a module into files | `target/tachyonc refactor split MODULE --plan` (then `--auto`, or `--into M --items a,b`; `--names a,b`; `--reexport` leaves code outside as it is; `--header TEXT`) |
-| several changes, checked once, all or nothing | `target/tachyonc refactor --script steps.txt` (one command per line) |
+| several changes, checked once, all or nothing | `target/tachyonc refactor --script steps.txt` (one command per line; `<<END` ... `END` gives one its stdin) |
 | the errors, one per line (front end only) | `target/tachyonc check` |
 | missing/unused imports, `pub`, `unsafe` blocks | `target/tachyonc fix` (`--only imports,unused,pub,unsafe`, `--in FILE\|MODULE`, `--dry-run`) |
 | imports through re-exports, then the re-exports; merged, sorted, wrapped `use` lines | `target/tachyonc fix --only reexports,tidy-imports` (`// api:` above a `pub use` keeps it) |
