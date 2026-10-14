@@ -83,7 +83,10 @@ shape 10
   `Ord`: numbers, pointers, fieldless enums have it.
 - Methods are called `x.m()` or `Type::m(&x)`; a trait's function
   without `self` is called `Type::f()`.
+- Associated types (0.14): `type Item;` in a trait, `type Item = i64;`
+  in each impl, named `Self::Item` and `T::Item`; no defaults or bounds
+  on them, no `<T as Tr>::Item`.
 - Not there: `dyn Trait` (use generics, or an enum of the cases),
-  supertraits, associated types and constants, generic traits, `impl
-  Trait` in argument or return position, blanket impls over all `T`,
+  supertraits, associated constants, generic traits, `impl Trait` in
+  argument or return position, blanket impls over all `T`,
   `#[derive]`.

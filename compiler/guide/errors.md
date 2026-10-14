@@ -39,15 +39,6 @@ error[parser error] expected identifier, got '&'
 `self: P` for a copy.
 
 ```tach
-let f = |x: i64| x + 1;
-```
-```err
-error[type error] closures are not implemented yet (check.unimplemented)
-```
-(0.14 in progress: closures parse, and are checked once implemented.) Until
-then: a named `fn`, passed as `fn(i64) -> i64`, or a loop.
-
-```tach
 fn f(r: Result<i64, i64>) -> Result<i64, i64> { let x = r?; Ok(x) }
 ```
 ```err
@@ -263,22 +254,15 @@ error[type error] cannot index type 'Vec<i64>'
 ```
 `v.get(0)`, `v.set(0, x)`, `v.as_slice()[0]`.
 
-```tach
-let mut v: Vec<i64> = Vec::new();
-for x in v.iter() { }
+```tach 0.14
+let n = 5;
+for x in n { }
 ```
 ```err
-error[type error] no method 'iter' on type 'Vec<i64>'
+error[type error] 'for' iterates over ranges, slices, arrays, iterators and types with an 'iter' method
 ```
-`for x in v.as_slice() { }`.
-
-```tach
-let mut v: Vec<i64> = Vec::new();
-for x in v { }
-```
-```err
-error[type error] 'for' loops iterate over integer ranges ('a..b'), slices and arrays, got 'Vec<i64>'
-```
+`for x in 0..n`. A type of yours iterates with `impl Iterator for T`, or
+an `iter` method returning one (`tachyonc guide iterators`).
 
 ```tach
 let s = "abc";
@@ -315,6 +299,60 @@ fn main() -> i32 { let m: HashMap<K, i64> = HashMap::new(); 0 }
 error[type error] the trait 'Hash' is not implemented for 'K' | help: required by the bound 'K: Hash' of 'HashMap'
 ```
 `impl Hash for K { fn hash(self: *K) -> u64 { std::hash_u64(self.a as u64) } }`.
+
+## Closures and iterators (0.14)
+
+```tach 0.14
+let f = |x| x + 1;
+```
+```err
+error[type error] cannot infer the type of closure parameter 'x'
+```
+`|x: i64| x + 1`: in a `let`, nothing says what `x` is; as an argument
+for `F: Fn(i64) -> i64` or `fn(i64) -> i64` the type comes from there.
+
+```tach 0.14
+fn run(f: fn(i64) -> i64) -> i64 { f(1) }
+fn main() -> i32 {
+    let k = 2;
+    run(|x| x + k) as i32
+}
+```
+```err
+make the parameter generic
+```
+A closure that captures is no plain `fn`: `fn run<F: Fn(i64) -> i64>(f:
+F) -> i64`. One that captures nothing converts.
+
+```tach 0.14
+fn apply<F: Fn(i64)>(f: F) { f(1); }
+fn main() -> i32 {
+    let mut total = 0;
+    apply(|x| { total += x; });
+    total as i32
+}
+```
+```err
+FnMut
+```
+`Fn` takes closures that assign no captured variable: bound `F:
+FnMut(i64)` (and call it from a `mut f: F`).
+
+```tach 0.14
+fn apply<F: Fn(i64) -> i64>(f: F) -> i64 { f(1) }
+fn main() -> i32 {
+    let f = {
+        let mut j = 1;
+        |x: i64| x + j
+    };
+    apply(f) as i32
+}
+```
+```err
+write `move`
+```
+The closure borrows `j` (a `let mut`), which ends with the block: `move
+|x: i64| x + j` takes a copy, or declare `j` before the block.
 
 ## Generics and traits
 

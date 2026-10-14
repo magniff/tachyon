@@ -27,6 +27,10 @@
 #             with each line of this text in its diagnostics (short form)
 #   other     (sh, text, rust) not checked
 #
+# (0.14) A block fenced ```tach 0.14 uses closures or iterators: it is
+# checked as a tach block when the compiler checks them (tests/needs014.sh),
+# else skipped (`skip NAME`), with its in, out or err block.
+#
 # Prints `pass NAME` or `FAIL NAME` (and why) for each check; exits 1 if
 # one failed.
 
@@ -59,12 +63,15 @@ trap 'exit 130' INT TERM
 STATUS=0
 RESULTS="$WORK/results"
 : >"$RESULTS"
+. "$ROOT/tests/needs014.sh"
+HAS014=0
+has_014 "$COMPILER" "$WORK" && HAS014=1
 
 # Splits the guide text $1 (topic $2) into one directory per tach block
 # under $WORK/blocks: prog.tach (wrapped as its kind needs), and, when an
 # out or err block follows, out (with exit) or err.
 split_blocks() {
-    awk -v topic="$2" -v dir="$WORK/blocks" '
+    awk -v topic="$2" -v dir="$WORK/blocks" -v has014="$HAS014" '
         function flush_pending() { pending = "" }
         function item_line(l) {
             return l ~ /^(pub |fn |struct |enum |union |impl|trait |const |static |type |use |mod |import |extern |unsafe fn |#\[|}|\/\/|$)/
@@ -85,7 +92,7 @@ split_blocks() {
             }
             if (line == "```") {
                 infence = 0
-                if (lang == "tach") {
+                if (lang == "tach" || lang == "tach 0.14") {
                     n++
                     name = topic ":" start
                     d = dir "/" topic "-" sprintf("%05d", start)
@@ -114,6 +121,10 @@ split_blocks() {
                         print "}" > f
                     }
                     close(f)
+                    if (lang == "tach 0.14" && has014 != 1) {
+                        printf "1" > (d "/skip")
+                        close(d "/skip")
+                    }
                     pending = d
                 } else if (lang == "in" && pending != "") {
                     printf "%s", body > (pending "/stdin")
@@ -151,6 +162,10 @@ trimmed() {
 check_block() {
     d=$1
     name=$(cat "$d/name")
+    if [ -f "$d/skip" ]; then
+        echo "skip $name (0.14: the compiler does not check closures and iterators yet)" >"$d/result"
+        return
+    fi
     if [ -f "$d/err" ]; then
         "$COMPILER" --deny-warnings --diagnostics=short "$d/prog.tach" -o "$d/prog" >"$d/compile.out" 2>&1
         rc=$?
@@ -252,7 +267,7 @@ if ! "$COMPILER" guide --list >"$WORK/list" 2>&1; then
     result FAIL guide-list "tachyonc guide --list failed:" "$(cat "$WORK/list")"
 fi
 missing=""
-for t in core rust syntax types std errors unsafe c-interop modules generics traits memory tools; do
+for t in core rust syntax types std errors unsafe c-interop modules generics traits closures iterators memory tools; do
     awk -F '\t' -v t="$t" '$1 == t { found = 1 } END { exit !found }' "$WORK/list" || missing="$missing $t"
 done
 if [ -n "$missing" ]; then

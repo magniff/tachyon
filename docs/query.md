@@ -272,6 +272,10 @@ references.
 - A function whose body has a syntax error (0.13) is checked for a query
   as far as it was parsed (the statement with the error left out, and
   the names it would have bound unknown, without errors).
+- A reference inside a closure's body (0.14) is the enclosing
+  function's (ENCLOSING names it). A closure's function and its
+  environment struct are no definitions: refs, unused, stats and deps
+  never list them; a call of a closure is no reference.
 - `--count` prints the number of references refs would print (the
   definition included); for several definitions, `N→PATH` per definition.
 - `callers` is `refs` restricted to calls (method and operator calls
@@ -386,6 +390,11 @@ i64→area(s) + area(s) + unsafe { COUNT }
 In a generic function, one line per type its instances give it. A
 position in no checked expression (a declaration, a type, a function
 never checked): `error query.no-match`, `try:` the item at that line.
+
+(0.14) A closure's type is written `closure(i64) -> i64 at FILE:LINE:COL`
+(where it is written); a closure's parameter has its type; a use of a
+captured local has the local's type (the environment the closure reads
+it from is not shown).
 
 ## Diagnostics
 
