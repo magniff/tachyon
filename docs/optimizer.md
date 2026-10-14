@@ -1149,3 +1149,36 @@ Compile time: the self-compile at -O2 is within 0.5% (the candidates
 are rejected before LCSSA is formed, and the vectorizer's loop forest is
 reused when it changed nothing). fannkuch's flips and rotations run about
 5% faster.
+
+**The SLP vectorizer** (`slp.tach`, last of the -O2 pipeline, on each
+function as it will be emitted: run earlier, vector stores would hide
+their values from the loads of the functions they are inlined into). In
+a block, the stores writing the VF lanes of one 16-byte vector (one base,
+consecutive offsets, one scalar type) are a seed; their values are packed
+bottom-up, lane by lane: one value in every lane is a splat; loads of
+consecutive addresses in the block, a vector load; the same operation in
+every lane (`+ - * & | ^`, negation, `/` on floats), that operation on
+the vectors of its operands; anything else is gathered (a splat and
+`vins`). A lane is exactly its scalar code: float lanes are the same IEEE
+operations, nothing is reassociated. The vector code goes just before the
+group's last store, which a vector store replaces; scalars left unused go
+with dead code elimination.
+
+That moves the group's loads and stores down to its last store, which the
+memory between must allow (gvn.tach's `may_alias`): no call or other
+side effect in between, no store in between that may write what a moved
+load reads, no access in between to what a moved store writes, no moved
+load reading a store of the group made before it. Cost: the vector
+instructions (a gather VF, a multiplication done lane by lane 3·VF) must
+be fewer than the scalar instructions that go: the stores, and each
+lane's load or operation whose every use goes. A load or an operation
+whose scalars all stay (used elsewhere) is gathered from them instead
+when that is cheaper.
+
+nbody's position update (`b.x += dt * b.vx; b.y += dt * b.vy`) is one
+`v2f64` load of the velocities, a multiplication by the splat of dt, an
+addition to the loaded positions, one store; its velocity updates pack
+the same way, gathering dx and dy (which the distance also uses). Two
+pointers the analysis cannot tell apart are left alone (`q.a = q.a +
+r.a` ... may be one struct). Tested by `tests/run/opt_slp.tach`.
+`--no-slp` turns it off.

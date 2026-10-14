@@ -488,7 +488,8 @@ The last release of the build-out.
   bounds or the profile; optimizer.md, 0.11)
 - scalar unrolling with run-time trip counts: done (in the vectorizer's
   frame, checks proved before the loop; optimizer.md, 0.11)
-- SLP vectorizer: to do
+- SLP vectorizer: done (stores to the lanes of a vector, packed bottom-up;
+  last in the pipeline; optimizer.md, 0.11)
 - the gaps against clang on the new benchmarks: to do
 
 ## Toward 1.0
