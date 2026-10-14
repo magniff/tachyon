@@ -4,7 +4,10 @@
 # given, and the C equivalents (bench/*.c) by cc -O2. Prints the fastest of
 # RUNS runs of each, in milliseconds, and checks that all outputs agree;
 # then, for each variant, the geometric mean over the programs with a C
-# version of its time divided by cc -O2's (below 1: faster than C).
+# version of its time divided by cc -O2's (below 1: faster than C);
+# last (0.14), the time of bench/iterchain.tach (iterator chains) over
+# that of bench/iterloop.tach (the same loops by hand) at -O2, which fails
+# the run above 1.05.
 #
 # usage: bench/run.sh [-c COMPILER] [-p PREVIOUS] [-s SEED] [-r RUNS] [-t TARGET]
 #
@@ -103,6 +106,12 @@ for source in "$ROOT"/bench/*.tach "$ROOT/examples/md5.tach"; do
         ms=$("$WORK/timer" "$RUNS" "$input" "$WORK/$name.$v.out" "$WORK/$name.$v")
         printf " %9s" "$ms"
         row="$row $ms"
+        if [ "$v" = O2 ]; then
+            case "$name" in
+                iterchain) CHAIN_MS=$ms ;;
+                iterloop) LOOP_MS=$ms ;;
+            esac
+        fi
         if [ -z "$reference" ]; then
             reference="$WORK/$name.$v.out"
         elif ! cmp -s "$reference" "$WORK/$name.$v.out"; then
@@ -130,3 +139,14 @@ awk -v n="$(echo $VARIANTS | wc -w)" '
     END { for (i = 1; i <= n; i++) {
               if (cnt[i] > 0) printf " %9.3f", exp(sum[i] / cnt[i]); else printf " %9s", "-" }
           printf " %9s\n", "1" }' "$WORK/times"
+
+# (0.14) Iterator chains against the same loops written by hand, at -O2:
+# zero cost is a ratio of 1; above 1.05 is a failure.
+if [ -n "${CHAIN_MS:-}" ] && [ -n "${LOOP_MS:-}" ]; then
+    ratio=$(awk -v a="$CHAIN_MS" -v b="$LOOP_MS" 'BEGIN { if (b < 1) b = 1; if (a < 1) a = 1; printf "%.3f", a / b }')
+    printf "%-10s %9s\n" "iterchain/iterloop" "$ratio"
+    if awk -v r="$ratio" 'BEGIN { exit !(r > 1.05) }'; then
+        echo "bench: iterchain/iterloop is $ratio, above 1.05: iterator chains are not zero cost" >&2
+        exit 1
+    fi
+fi

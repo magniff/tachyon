@@ -1,0 +1,106 @@
+// 0.14: `v.iter().map(|x| x * 3).sum()`, hand-desugared into the shapes
+// the front end makes of it (docs/design/closures-iterators.md, section
+// 3): the closure a struct with a `call` taking it by pointer, the adapter
+// a generic struct, `sum` a fold whose closure captures the map's closure
+// by reference; the source's fold a counted loop. Once inlined, it is the
+// hand-written loop: no call, no frame slot, the same vector loop.
+// EXPECT: 14850
+// EXPECT: 14850
+// CHECK: fn kernel:
+// CHECK-NOT: call
+// CHECK-NOT: slot
+// CHECK: v2i64 = load
+// CHECK: vbin.mul
+// CHECK-NOT: call
+// CHECK-NOT: slot
+// CHECK: fn hand:
+// CHECK: v2i64 = load
+trait Call { fn call(self: *Self, x: i64) -> i64; }
+trait Call2 { fn call(self: *Self, a: i64, b: i64) -> i64; }
+
+struct SliceIter { s: [i64], pos: i64 }
+
+impl SliceIter {
+    #[inline]
+    fn fold<G: Call2>(self: SliceIter, init: i64, g: G) -> i64 {
+        let mut acc = init;
+        for k in self.pos..self.s.len {
+            acc = g.call(acc, self.s[k]);
+        }
+        acc
+    }
+}
+
+struct Map<I, F> { it: I, f: F }
+
+// |acc, x| g(acc, f(x)): f captured by reference, g by value
+struct MapFold<F, G> { f: *F, g: G }
+
+impl<F: Call, G: Call2> Call2 for MapFold<F, G> {
+    fn call(self: *MapFold<F, G>, acc: i64, x: i64) -> i64 {
+        unsafe { self.g.call(acc, self.f.call(x)) }
+    }
+}
+
+impl<I, F: Call> Map<I, F> {
+    #[inline]
+    fn fold<G: Call2>(self: Map<I, F>, init: i64, g: G) -> i64 {
+        let mut f = self.f;
+        self.it.fold(init, MapFold { f: &f, g: g })
+    }
+    #[inline]
+    fn sum(self: Map<I, F>) -> i64 {
+        self.fold(0, SumFold {})
+    }
+}
+
+struct SumFold {}
+
+impl Call2 for SumFold {
+    fn call(self: *SumFold, a: i64, b: i64) -> i64 { a + b }
+}
+
+// |x| x * 3
+struct Closure0 {}
+
+impl Call for Closure0 {
+    fn call(self: *Closure0, x: i64) -> i64 { x * 3 }
+}
+
+#[inline]
+fn iter(v: *Vec<i64>) -> SliceIter {
+    SliceIter { s: v.as_slice(), pos: 0 }
+}
+
+#[inline]
+fn map<I, F>(it: I, f: F) -> Map<I, F> {
+    Map { it: it, f: f }
+}
+
+#[inline(never)]
+fn kernel(v: *Vec<i64>) -> i64 {
+    map(iter(v), Closure0 {}).sum()
+}
+
+#[inline(never)]
+fn hand(v: *Vec<i64>) -> i64 {
+    let s = v.as_slice();
+    let mut t = 0;
+    for k in 0..s.len {
+        t += s[k] * 3;
+    }
+    t
+}
+
+fn main() -> i32 {
+    let mut v: Vec<i64> = Vec::new();
+    defer v.free();
+    for i in 0..100 {
+        v.push(i);
+    }
+    std::print_int(kernel(&v));
+    println("");
+    std::print_int(hand(&v));
+    println("");
+    0
+}
