@@ -79,6 +79,12 @@ for o in 0 2; do
                 -ex 'bt 1' -ex kill "$exe") >>"$WORK/log$o" 2>&1
         fi
     done
+    if grep -q "Couldn't get registers" "$WORK/log$o"; then
+        # (gdb under an emulator without ptrace, as Rosetta runs x86-64
+        # Linux on Apple silicon)
+        echo "debug: $DEBUGGER cannot control programs here (an emulated machine?): not checked"
+        exit 0
+    fi
     # The patterns, in order, each on a later line than the one before.
     if ! awk -v logfile="$WORK/log$o" '
         { want[++n] = $0 }
