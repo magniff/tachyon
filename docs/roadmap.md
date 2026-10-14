@@ -553,6 +553,88 @@ short is recorded (tools/agent-feedback, the hook's log).
 What 0.12's refactoring showed the tools lacked, fixed and measured
 again.
 
+## 0.14: an agent eval; closures and iterators
+
+From here every release also passes an **agent-eval gate**, and a
+feature new in release N enters the compiler's own source in N+1
+(migrated with the refactoring tools; breaking changes come with a
+`tachyonc fix` migration).
+
+- the agent eval (`tests/agent-eval/`): about twelve fixed tasks (write a
+  hash map, fix a parser bug, port a C program, add a compiler pass,
+  refactor a module, a CLI tool, ...) with hidden acceptance tests, each
+  given to a fresh agent with only `tachyonc guide` and the docs;
+  measured: success rate, tokens, tool calls, compile-fix iterations.
+  Baseline on 0.13; no release may regress it, and language changes must
+  improve it
+- closures (`|x| x * 2`): capture by value, or by borrow when they do not
+  escape; `Fn`/`FnMut` traits, monomorphized; a non-capturing closure is a
+  `fn` pointer
+- iterators: an `Iterator` trait, `for` over anything iterable, `map`,
+  `filter`, `enumerate`, `zip`, `take`, `sum`, `min`, `max`, `collect`;
+  slices, `Vec`, ranges and `HashMap` iterable
+- zero cost: closures inlined and iterator chains fused into loops (a
+  benchmark pair, iterator chain against hand loop, must time the same)
+- query and refactor understand closures
+
+## 0.15: errors, conversions, less boilerplate
+
+- `?` on `Result` and `Option`; typed error enums as the std convention;
+  std I/O returning `Result`
+- lossless implicit widening (narrower to wider integer of the same
+  signedness, unsigned to wider signed); everything else stays an
+  explicit `as`; `From` / `Into`
+- `#[derive(Eq, Ord, Hash, Debug, Clone)]`
+- string interpolation, `"n = {n}, v = {v:?}"`, over `Display` / `Debug`
+- field shorthand `S { x, y }`; named and default arguments
+- the compiler's source moves to closures and iterators (0.14)
+
+## 0.16: effects
+
+- inferred effect sets per function: `alloc`, `io`, `panic`, `global`
+  (reads or writes statics), `unsafe`, `diverge`; shown by `query
+  effects`, in `query def` / `show`, in diagnostics
+- declarable and checked transitively: `#[pure]`, `#[no_panic]`,
+  `#[no_alloc]`, `#[no_io]`; effect bounds on trait methods; generics'
+  effects inferred per instantiation
+- writing a `static mut` needs the `global` effect (denied in pure code)
+- the optimizer uses them: pure calls numbered, hoisted and memoized in
+  the e-graph
+- the compiler's source moves to `?`, `derive`, interpolation and widening
+  (0.15)
+
+## 0.17: memory safety by mutable value semantics
+
+- values are values: assigning a type owning memory (`Vec`, `Buf`,
+  `HashMap`, user types with `Drop`) moves it; destructors at the end of
+  the scope replace manual `free` (and most `defer`); `.clone()` explicit
+- references are second-class: `&x` / `inout x` parameters pass down the
+  call chain but are never stored in a struct, returned, or captured by
+  an escaping closure; slices become views under the same rule. This
+  closes the dangling-borrow gap without lifetime annotations
+- raw pointers stay the escape hatch, in `unsafe`, checked by
+  `--check-unsafe`
+- `tachyonc fix --values` migrates the common patterns (manual `free` to
+  destructors, stored slices to owned copies or indices) and gives exact
+  diagnostics for the rest
+- the largest design change of the plan: a design document and a
+  prototype first, then the implementation; it may become 0.17 and 0.17.1
+  rather than be rushed
+- the compiler's source moves to effect annotations (0.16)
+
+## 0.18: contracts and verification in the language
+
+- `requires` / `ensures` / `invariant`: checked at run time (a violation
+  exits with 101, like any check); the optimizer removes a check only
+  where range analysis proves it, never by assuming it
+- `test` blocks; `#[property]` tests with generators derived from the
+  types; `#[fuzz]` entry points; snapshot tests; `tachyonc test` (with the
+  `-O0` against `-O2` comparison built in) and `tachyonc reduce`
+- `type X = distinct T`; non-null pointer types
+- the compiler's source moves to mutable value semantics (0.17)
+- after 0.18 the type system has settled: the language specification is
+  written (see "Toward 1.0")
+
 ## Toward 1.0
 
 1.0 is not a feature milestone: it ships when the language is thought
