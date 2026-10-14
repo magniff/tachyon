@@ -486,7 +486,8 @@ The last release of the build-out.
   geometric mean of each column against cc -O2)
 - cost model for the loop vectorizer: done (expected trips from constant
   bounds or the profile; optimizer.md, 0.11)
-- scalar unrolling with run-time trip counts: to do
+- scalar unrolling with run-time trip counts: done (in the vectorizer's
+  frame, checks proved before the loop; optimizer.md, 0.11)
 - SLP vectorizer: to do
 - the gaps against clang on the new benchmarks: to do
 

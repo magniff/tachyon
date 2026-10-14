@@ -1112,3 +1112,40 @@ ones. A loop the profile shows running two iterations an entry over
 bench/interp, which 0.10 measured 5% slower with the vectorizer, has no
 loop the vectorizer takes: its IR is the same with `--no-vectorize`, and
 the difference was noise.
+
+**Unrolling with run-time trip counts** (`unroll_runtime_loops` in
+`vectorize.tach`, after the vectorizer, in its frame). An innermost
+counted loop (i from start, step 1, to n) whose trip count is not a
+constant, whose only exits are the latch's and failing checks, and which
+has no call, gets U copies of its body per iteration:
+
+```
+C:  trips = n - start; ok = trips >= U && no check fails over [start, n)
+    branch ok, UP, SP
+UP: uend = start + (trips & -U)
+U0..U(U-1): the copies, chained (copy k's header phis are copy k-1's
+    next values), without their checks; branch i' != uend, U0, UX
+UX: branch uend == n, E, SP
+SP: the header's phis from C or UX; the original loop (the remainder)
+```
+
+The checks are proved before the loop as the vectorizer's are, now for
+indices of coefficient -1 as well (`s[n - 1 - i]`); a loop with any other
+kind of check is left alone. The copies compute exactly what the
+iterations do, in order, so recurrences of any kind, float ones included,
+are fine. It pays where checks go, or where the loop's own instructions
+are a good part of a small body: a loop is unrolled when it has checks or
+at most 12 instructions, by 4 within 64 instructions (128 for a hot loop),
+else by 2; with a profile, by less (or not) when the loop runs fewer than
+2U iterations an entry. Two instcombine rules make the copies' addresses
+offsets of one base: `y + (x + c)` is `(y + x) + c` for addresses (u64;
+loads and stores take c as their offset, and GVN shares y + x), and
+`(x + c) - x` is c. The headers of both loops are marked `novec`.
+`--no-unroll-runtime` turns it off. Tested by
+`tests/run/opt_unroll_runtime.tach` (a recurrence and a reversed copy,
+every length from 0 to 10, a check failing part way).
+
+Compile time: the self-compile at -O2 is within 0.5% (the candidates
+are rejected before LCSSA is formed, and the vectorizer's loop forest is
+reused when it changed nothing). fannkuch's flips and rotations run about
+5% faster.
