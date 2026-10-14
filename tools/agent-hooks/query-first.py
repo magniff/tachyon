@@ -108,11 +108,11 @@ def suggestion(prog, args):
     pattern = next((a for a in args if not a.startswith("-")), "")
     m = re.search(r"\b(?:fn|struct|enum|trait|const|static|type|mod)\s+(\w+)", pattern)
     if m:
-        return f"tachyonc query show {m.group(1)}   (or: query def {m.group(1)})"
+        return f"tachyonc query show {m.group(1)}"
     if prog in ("grep", "rg", "egrep", "fgrep"):
         word = re.sub(r"[^\w:.]", "", pattern) or "NAME"
-        return f"tachyonc query refs {word}   (or: query def / show {word})"
-    return "tachyonc query show NAME   (one item's source), or: tachyonc query items MODULE   (what a module contains)"
+        return f"tachyonc query refs {word}"
+    return "tachyonc query show NAME | tachyonc query items MODULE"
 
 
 def main():
@@ -157,13 +157,9 @@ def main():
         prog, args = reads[0]
         log(gd, {"kind": "blocked", "session": session, "agent": agent,
                  "program": prog, "command": command[:300]})
-        sys.stderr.write(
-            "Reading tachyon source with %s is disabled (testing the compiler's query commands).\n"
-            "Use instead:  %s\n"
-            "Root defaults to compiler/src/main.tach; see docs/query.md.\n"
-            "If query cannot answer what you need, rerun the command with a trailing\n"
-            "  # no-query: <why query was not enough, specifically>\n"
-            "and it will run; the reason is recorded to improve the tool.\n" % (prog, suggestion(prog, args)))
+        sys.stderr.write("blocked hook.query-first: %s on .tach source\n"
+                         "try: %s | override: append '# no-query: <why query is not enough>'\n"
+                         % (prog, suggestion(prog, args)))
         return 2
 
     if tool in ("Read", "Grep") and phase == "PreToolUse":
