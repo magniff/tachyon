@@ -689,6 +689,49 @@ From here a feature new in release N enters the compiler's own source in N+1
   line outside items; merge conflicts in `.tach` files (a query of the
   regions, `edit resolve`)
 
+Done (0.14.0). The agent eval first (twelve tasks with Rust twins,
+`tests/agent-eval/run.py`, the 0.13 baseline with Claude Haiku and Sonnet
+and six runs of Qwen3-Coder; local runs off until re-enabled), and what
+its findings asked for: std's stdin reading, text helpers, in-place map
+and vector updates and an introsort; did-you-mean across the program and
+std, helps for Rust habits; the tools on a user's program (`undo` without
+git, local renames, `variant --arm-in`, imports added by edits). Then the
+design (docs/design/closures-iterators.md), an interface commit and five
+parallel tasks: closures (`Fn`/`FnMut` bounds, captures by value or by
+reference, `move`, an escape check, a non-capturing closure a `fn`);
+associated types (needed by `Iterator`, with constraints and lazy
+defaults); iterators (`for` over anything iterable, ranges as values,
+`map`, `filter`, `enumerate`, `zip`, `take`, `fold`, `for_each`,
+`count`, `sum`, `min`, `max`, `collect`, `sort_by`; slices, `Vec`,
+ranges and `HashMap` iterable); zero cost (bench/iterchain.tach against
+bench/iterloop.tach, held by `bench/run.sh` at a ratio of at most 1.05);
+the tools, fmt and the guide on closures. Of 0.13's tool candidates,
+`edit insert` adding imports, `split` moving a banner with its group and
+`edit patch FILE:LINE` between items are done. Moved: merge conflicts in
+`.tach` files (docs/tool-gaps-014.md, gap 8) to a later release;
+`iter_mut` to 0.17's value semantics (indexing until then); `collect`
+into anything but a `Vec`, and returning closures (`impl Fn`), to a
+later release. Fixed on the way: three reads of freed memory (slicing
+whose bounds grow the storage, `Buf::push_str` of its own view, the
+compiler's tables indexed through calls that move them), and the gate's
+`stress-grow` step that keeps them fixed. 85% of the edits to existing
+compiler source went through the tools (agent-tool-usage.md, "0.14");
+630 tests.
+
+0.14.0 release gate (2026-10-15): `bootstrap/gate.sh --release`, 30:02
+wall (other agents' work on the machine, load average 6 to 24), every
+step passed: the chain (fixpoint, built by 0.13.0) and the suite at
+-O0/1/2 (630 tests) on aarch64-macos; fuzz 60 in each of the ten modes
+(the seed in one), ABI 100 in three modes, objcheck (1048 of 1048),
+header layouts, the lldb check, and the new stress-grow step (the
+self-compile the same, the suite at -O0 and -O2, with every table growth
+moving); x86_64-linux (its own chain, the suite at every level, fuzz 50
+in ten modes, ABI 40 in three, objcheck, layouts); aarch64-linux (the
+cross-built fixpoint, the suite, fuzz 300 in nine modes, ABI 150 in
+three, objcheck, layouts, gdb). Benchmarks and compile times in
+"Benchmarks", 0.14. Not run: the suite on x86_64-macos (Rosetta on the
+test machine).
+
 ## 0.15: errors, conversions, less boilerplate
 
 - `?` on `Result` and `Option`; typed error enums as the std convention;
@@ -1226,3 +1269,133 @@ split into 172 files costs nothing measurable).
 The gate (`bootstrap/gate.sh --release`, every step at once on
 aarch64-macos and in the two Linux containers): 11:54 wall, every step
 passed.
+
+### 0.13
+
+aarch64-macos (Apple silicon, native; `bench/run.sh -p <0.12.0> -r 9`,
+the fastest of 9 runs in ms, run after the gate on a machine with other
+agents' work on it, load average 5 to 7; "0.12.0" is the previous
+release at its default level; the last row is the geometric mean over
+cc -O2's, programs with a C version only):
+
+| program | 0.12.0 | 0.13 -O2 | cc -O2 |
+|---|---|---|---|
+| binarytrees | 179 | 189 | 189 |
+| collatz | 323 | 316 | 333 |
+| fannkuch | 132 | 135 | 157 |
+| fib | 16 | 15 | 19 |
+| interp | 64 | 47 | 47 |
+| json | 127 | 110 | 97 |
+| mandelbrot | 175 | 173 | 168 |
+| matmul | 19 | 19 | 46 |
+| nbody | 32 | 32 | 29 |
+| sieve | 64 | 66 | 70 |
+| sort | 64 | 69 | 60 |
+| stencil | 8 | 8 | 8 |
+| wordcount | 86 | 85 | 72 |
+| md5 | 36 | 36 | - |
+| geomean vs cc -O2 | 0.966 | 0.939 | 1 |
+
+(-O0 and -O1 in the same run: geomean 6.770 and 1.359.) The generated
+code is 0.12.0's byte for byte: `tachyonc same-output` against the
+0.12.0 compiler is identical over the whole corpus (4,668 compilations,
+as for 0.12), so the differences above are this machine's spread under
+load: interp's 64 against 47 ms and json's 127 against 110 are the same
+code, and a first run a few minutes earlier, load average 9 to 11, had
+binarytrees at 319 against 224 ms and a geomean of 0.983 against 0.987.
+
+Compile time (aarch64-macos, wall time, best of 7, the two compilers
+alternating on the same input: the 0.13 source, 90,000 lines in 209
+files; the same loaded machine, load average 5 to 7, so every row is
+slower than 0.12's on an emptier one):
+
+| | 0.12.0 | 0.13 |
+|---|---|---|
+| the compiler to an object, -O0 | 205 ms | 204 ms |
+| the compiler to an object, -O2 | 1613 ms | 1633 ms |
+| to an executable (`cc` links), -O0 | 230 ms | 228 ms |
+| to an executable (`cc` links), -O2 | 1713 ms | 1738 ms |
+| `tachyonc check compiler/src/main.tach`, no cache | 74 ms | 73 ms |
+| `tachyonc query refs run_gvn`, no cache (`TACHYON_CACHE=off`) | 80 ms | 86 ms |
+| `tachyonc check compiler/src/main.tach`, cache warm | | 6.8 ms |
+| `tachyonc query refs run_gvn`, cache warm | | 7.2 ms |
+
+Compiling is the same within noise (the -O2 rows 1 to 1.5% apart, the
+output identical). Without the cache, `query refs` is a few ms slower
+than 0.12.0's (best of 15 again: 87 against 91 ms); with the cache warm,
+`check` and `query refs` answer in about 7 ms, ten times faster than
+reading the program.
+
+### 0.14
+
+aarch64-macos (Apple silicon, native; `bench/run.sh -p <0.13.0> -r 9`,
+the fastest of 9 runs in ms, run after the gate on a machine with other
+agents' work on it, load average falling from 10 to 4 during the run;
+"0.13.0" is the previous release at its default level; the geometric
+means are over cc -O2's, programs with a C version only):
+
+| program | 0.13.0 | 0.14 -O2 | cc -O2 |
+|---|---|---|---|
+| binarytrees | 157 | 160 | 158 |
+| collatz | 317 | 328 | 316 |
+| fannkuch | 126 | 120 | 145 |
+| fib | 14 | 14 | 14 |
+| interp | 43 | 44 | 43 |
+| iterchain | - | 420 | 199 |
+| iterloop | 408 | 407 | 186 |
+| json | 110 | 109 | 95 |
+| mandelbrot | 173 | 175 | 167 |
+| matmul | 19 | 19 | 46 |
+| nbody | 32 | 32 | 29 |
+| sieve | 67 | 66 | 73 |
+| sort | 65 | 60 | 57 |
+| stencil | 8 | 8 | 8 |
+| wordcount | 87 | 92 | 75 |
+| md5 | 38 | 39 | - |
+| geomean vs cc -O2, the 14 programs both compile | 1.017 | 1.016 | 1 |
+| geomean vs cc -O2, with iterchain (run.sh's) | | 1.067 | 1 |
+
+(-O0 and -O1 in the same run: geomean 7.998 and 1.643, with iterchain.)
+iterchain (0.14's iterators and closures; 0.13.0 cannot compile it) over
+iterloop (the same six kernels as loops by hand), alternating, fastest
+of 18 rounds: 420 against 407 ms, a ratio of **1.032** (the limit is
+1.05). Both are about 2.2 times cc -O2's (186 to 199 ms): the hand loops
+themselves, not the iterators, are what C does better there.
+
+The generated code changed (the optimizer's passes for iterator chains,
+std's introsort, std's unreachable functions dropped), so the
+differences can be real. An alternating rerun of the programs that
+moved (fastest of 15 each, load average 4) tells which: sort is faster,
+65 against 60 ms both times, std's introsort (bench/sort.c follows it,
+so cc's time moved too: 60 to 57); wordcount (95 against 93 ms),
+collatz (314 against 315), fannkuch (120 against 118), binarytrees (157
+against 160) and json (110 against 109) are the same within noise. The
+geomean over the programs both compile is the same; the one run.sh
+prints is higher because it counts iterchain, new, and at about 2.1
+times C, like its hand-written twin.
+
+Compile time (aarch64-macos, wall time, best of 7, the two compilers
+alternating on the same input: the 0.14 source, 98,000 lines in 221
+files; load average about 3.5; two runs, the first shown, the second
+the same within a few percent each way but for a busier `check`):
+
+| | 0.13.0 | 0.14 |
+|---|---|---|
+| the compiler to an object, -O0 | 226 ms | 231 ms |
+| the compiler to an object, -O2 | 1901 ms | 1950 ms |
+| `tachyonc check compiler/src/main.tach`, no cache | 79 ms | 81 ms |
+| `tachyonc query refs run_gvn`, no cache (`TACHYON_CACHE=off`) | 93 ms | 103 ms |
+| `tachyonc check compiler/src/main.tach`, cache warm | 6.7 ms | 6.9 ms |
+| `tachyonc query refs run_gvn`, cache warm | 7.0 ms | 7.3 ms |
+| a 7-line std program to an object, -O2 | 4.4 ms | 4.7 ms |
+
+0.14 is 2 to 3% slower to compile the compiler, in both runs: at -O2,
+`--time-passes` puts the difference in the scalar pipeline (176 against
+190 ms) and the loop passes (598 against 611 ms), where the passes for
+iterator chains run (copy elision, SROA to a fixpoint, threading on
+constant tags, exit merging); the front end is the same (check 45 ms in
+both). `query refs` without the cache is about 10% slower in both runs
+(93 against 103, 105 against 118 ms), not investigated; with the cache
+warm, every query is about 7 ms as in 0.13. The tiny std program
+compiles in about the time 0.13.0 takes (std's unreachable functions
+dropped before the optimizer).
