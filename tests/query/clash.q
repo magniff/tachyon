@@ -131,7 +131,7 @@ std::Vec::push	<std>:172:12	method	pub fn push(self: *Vec<T>, x: T)
 std::Buf::push	<std>:279:12	method	pub fn push(self: *Buf, b: u8)
 $ refs Vec::push --count
 2	crate::myvec::Vec::push
-7	std::Vec::push
+8	std::Vec::push
 $ callers crate::myvec::Vec::push
 # clash/main.tach
 40:10	call	main	mine.push(v.len());

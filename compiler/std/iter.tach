@@ -1,12 +1,18 @@
 // ---- Iterators (0.14) ----
 //
 // compiler/std/embed.sh appends this file to std.tach: the same module,
-// `std`. The Iterator trait (in the prelude) and its adapters; `for x in
-// it` iterates any type implementing it (docs/design/closures-iterators.md).
+// `std`. The Iterator trait (in the prelude), its sources and adapters;
+// `for x in it` iterates any type implementing it
+// (docs/design/closures-iterators.md).
 //
-// Every method is #[inline], so that a chain becomes one loop. The
-// consumers here call `next`; the sources and the adapters (their impls
-// are to come) override `fold` with a counted loop.
+// Every method is #[inline], so that a chain becomes one loop: the
+// sources and adapters override `fold` with a counted loop (internal
+// iteration). `exact_len` and `at` let zip and enumerate index both
+// sides when they know their length.
+//
+// (Staged until closures land: the consumers below call `next`, and
+// sort_by's F has no bound; compiler/std/iter_t1t2.tach is this file with
+// the consumers on `fold` and `F: FnMut(*T, *T) -> i64`.)
 
 pub trait Iterator {
     type Item;
@@ -134,25 +140,236 @@ pub trait Iterator {
     }
 }
 
-// The adapters (their Iterator impls are to come).
+// ---- Adapters ----
+
 pub struct Map<I, F> { it: I, f: F }
+
+impl<I: Iterator, M> Iterator for Map<I, M> {
+    type Item = M::Output;
+
+    #[inline]
+    fn next(self: *Map<I, M>) -> Option<M::Output> {
+        match self.it.next() {
+            Option::Some(x) => Option::Some((self.f)(x)),
+            Option::None => Option::None,
+        }
+    }
+
+    #[inline]
+    fn exact_len(self: *Map<I, M>) -> i64 {
+        self.it.exact_len()
+    }
+
+    #[inline]
+    fn at(self: *Map<I, M>, k: i64) -> M::Output {
+        (self.f)(self.it.at(k))
+    }
+
+    #[inline]
+    fn fold<B, F: FnMut(B, M::Output) -> B>(self: Map<I, M>, init: B, f: F) -> B {
+        let mut m = self.f;
+        let mut g = f;
+        self.it.fold(init, | acc, x | g(acc, m(x)))
+    }
+}
+
 pub struct Filter<I, F> { it: I, f: F }
+
+impl<I: Iterator, P> Iterator for Filter<I, P> {
+    type Item = I::Item;
+
+    #[inline]
+    fn next(self: *Filter<I, P>) -> Option<I::Item> {
+        loop {
+            match self.it.next() {
+                Option::Some(x) => {
+                    if (self.f)(x) {
+                        return Option::Some(x);
+                    }
+                }
+                Option::None => return Option::None,
+            }
+        }
+    }
+
+    #[inline]
+    fn fold<B, F: FnMut(B, I::Item) -> B>(self: Filter<I, P>, init: B, f: F) -> B {
+        let mut p = self.f;
+        let mut g = f;
+        self.it.fold(init, | acc, x | if p(x) { g(acc, x) } else { acc })
+    }
+}
+
 pub struct Enumerate<I> { it: I, k: i64 }
+
+impl<I: Iterator> Iterator for Enumerate<I> {
+    type Item = (i64, I::Item);
+
+    #[inline]
+    fn next(self: *Enumerate<I>) -> Option<(i64, I::Item)> {
+        match self.it.next() {
+            Option::Some(x) => {
+                let k = self.k;
+                self.k = k + 1;
+                Option::Some((k, x))
+            }
+            Option::None => Option::None,
+        }
+    }
+
+    #[inline]
+    fn exact_len(self: *Enumerate<I>) -> i64 {
+        self.it.exact_len()
+    }
+
+    #[inline]
+    fn at(self: *Enumerate<I>, k: i64) -> (i64, I::Item) {
+        (self.k + k, self.it.at(k))
+    }
+
+    #[inline]
+    fn fold<B, F: FnMut(B, (i64, I::Item)) -> B>(self: Enumerate<I>, init: B, f: F) -> B {
+        let mut e = self;
+        let mut g = f;
+        let mut acc = init;
+        let n = e.it.exact_len();
+        if n >= 0 {
+            for k in 0..n {
+                acc = g(acc, (e.k + k, e.it.at(k)));
+            }
+        } else {
+            while let Option::Some(p) = e.next() {
+                acc = g(acc, p);
+            }
+        }
+        acc
+    }
+}
+
 pub struct Zip<I, J> { a: I, b: J }
+
+impl<A: Iterator, J: Iterator> Iterator for Zip<A, J> {
+    type Item = (A::Item, J::Item);
+
+    #[inline]
+    fn next(self: *Zip<A, J>) -> Option<(A::Item, J::Item)> {
+        match self.a.next() {
+            Option::Some(x) => match self.b.next() {
+                Option::Some(y) => Option::Some((x, y)),
+                Option::None => Option::None,
+            },
+            Option::None => Option::None,
+        }
+    }
+
+    #[inline]
+    fn exact_len(self: *Zip<A, J>) -> i64 {
+        let n = self.a.exact_len();
+        let m = self.b.exact_len();
+        if n < 0 || m < 0 {
+            -1
+        } else if n < m {
+            n
+        } else {
+            m
+        }
+    }
+
+    #[inline]
+    fn at(self: *Zip<A, J>, k: i64) -> (A::Item, J::Item) {
+        (self.a.at(k), self.b.at(k))
+    }
+
+    #[inline]
+    fn fold<B, F: FnMut(B, (A::Item, J::Item)) -> B>(self: Zip<A, J>, init: B, f: F) -> B {
+        let mut z = self;
+        let mut g = f;
+        let mut acc = init;
+        let n = z.exact_len();
+        if n >= 0 {
+            for k in 0..n {
+                acc = g(acc, (z.a.at(k), z.b.at(k)));
+            }
+        } else {
+            while let Option::Some(p) = z.next() {
+                acc = g(acc, p);
+            }
+        }
+        acc
+    }
+}
+
 pub struct Take<I> { it: I, n: i64 }
+
+impl<I: Iterator> Iterator for Take<I> {
+    type Item = I::Item;
+
+    #[inline]
+    fn next(self: *Take<I>) -> Option<I::Item> {
+        if self.n <= 0 {
+            return Option::None;
+        }
+        self.n -= 1;
+        self.it.next()
+    }
+
+    #[inline]
+    fn exact_len(self: *Take<I>) -> i64 {
+        let m = self.it.exact_len();
+        if m < 0 {
+            -1
+        } else if self.n <= 0 {
+            0
+        } else if m < self.n {
+            m
+        } else {
+            self.n
+        }
+    }
+
+    #[inline]
+    fn at(self: *Take<I>, k: i64) -> I::Item {
+        self.it.at(k)
+    }
+
+    #[inline]
+    fn fold<B, F: FnMut(B, I::Item) -> B>(self: Take<I>, init: B, f: F) -> B {
+        let mut t = self;
+        let mut g = f;
+        let mut acc = init;
+        let n = t.exact_len();
+        if n >= 0 {
+            for k in 0..n {
+                acc = g(acc, t.it.at(k));
+            }
+        } else {
+            while t.n > 0 {
+                match t.it.next() {
+                    Option::Some(x) => {
+                        t.n -= 1;
+                        acc = g(acc, x);
+                    }
+                    Option::None => break,
+                }
+            }
+        }
+        acc
+    }
+}
 
 // ---- Sources ----
 //
-// (0.14, staged: until associated types land, the sources' Iterator
-// methods are inherent; `for` finds `next` by name. Each overrides `fold`
-// with a counted loop.)
+// `for` over a SliceIter, a Range or a RangeInclusive is a counted loop
+// (front/check/iterate.tach); their `fold` is one too.
 
 // `a..b` as a value: start, start + 1, ..., up to end, end excluded.
 pub struct Range<T> { pub start: T, pub end: T }
 
-impl<T> Range<T> {
+impl<T> Iterator for Range<T> {
+    type Item = T;
+
     #[inline]
-    pub fn next(self: *Range<T>) -> Option<T> {
+    fn next(self: *Range<T>) -> Option<T> {
         if self.start < self.end {
             let x = self.start;
             self.start = x + 1;
@@ -163,17 +380,17 @@ impl<T> Range<T> {
     }
 
     #[inline]
-    pub fn exact_len(self: *Range<T>) -> i64 {
+    fn exact_len(self: *Range<T>) -> i64 {
         if self.start < self.end { (self.end - self.start) as i64 } else { 0 }
     }
 
     #[inline]
-    pub fn at(self: *Range<T>, k: i64) -> T {
+    fn at(self: *Range<T>, k: i64) -> T {
         self.start + k as T
     }
 
     #[inline]
-    pub fn fold<B, F>(self: Range<T>, init: B, f: F) -> B {
+    fn fold<B, F: FnMut(B, T) -> B>(self: Range<T>, init: B, f: F) -> B {
         let mut g = f;
         let mut acc = init;
         for x in self.start..self.end {
@@ -183,13 +400,14 @@ impl<T> Range<T> {
     }
 }
 
-// `a..=b` as a value: start, ..., end, end included; `done` once `next`
-// has given end.
+// `a..=b` as a value: end included; `done` once `next` gave end.
 pub struct RangeInclusive<T> { pub start: T, pub end: T, pub done: bool }
 
-impl<T> RangeInclusive<T> {
+impl<T> Iterator for RangeInclusive<T> {
+    type Item = T;
+
     #[inline]
-    pub fn next(self: *RangeInclusive<T>) -> Option<T> {
+    fn next(self: *RangeInclusive<T>) -> Option<T> {
         if self.done || self.start > self.end {
             return Option::None;
         }
@@ -203,17 +421,17 @@ impl<T> RangeInclusive<T> {
     }
 
     #[inline]
-    pub fn exact_len(self: *RangeInclusive<T>) -> i64 {
+    fn exact_len(self: *RangeInclusive<T>) -> i64 {
         if self.done || self.start > self.end { 0 } else { (self.end - self.start) as i64 + 1 }
     }
 
     #[inline]
-    pub fn at(self: *RangeInclusive<T>, k: i64) -> T {
+    fn at(self: *RangeInclusive<T>, k: i64) -> T {
         self.start + k as T
     }
 
     #[inline]
-    pub fn fold<B, F>(self: RangeInclusive<T>, init: B, f: F) -> B {
+    fn fold<B, F: FnMut(B, T) -> B>(self: RangeInclusive<T>, init: B, f: F) -> B {
         let mut g = f;
         let mut acc = init;
         if !self.done {
@@ -228,9 +446,11 @@ impl<T> RangeInclusive<T> {
 // The items of a slice, by value: `v.iter()`, `s.iter()`.
 pub struct SliceIter<T> { s: [T], pos: i64 }
 
-impl<T> SliceIter<T> {
+impl<T> Iterator for SliceIter<T> {
+    type Item = T;
+
     #[inline]
-    pub fn next(self: *SliceIter<T>) -> Option<T> {
+    fn next(self: *SliceIter<T>) -> Option<T> {
         if self.pos < self.s.len {
             let x = self.s[self.pos];
             self.pos += 1;
@@ -241,23 +461,17 @@ impl<T> SliceIter<T> {
     }
 
     #[inline]
-    pub fn exact_len(self: *SliceIter<T>) -> i64 {
+    fn exact_len(self: *SliceIter<T>) -> i64 {
         self.s.len - self.pos
     }
 
     #[inline]
-    pub fn at(self: *SliceIter<T>, k: i64) -> T {
+    fn at(self: *SliceIter<T>, k: i64) -> T {
         self.s[self.pos + k]
     }
 
-    // The items left, as a slice.
     #[inline]
-    pub fn as_slice(self: *SliceIter<T>) -> [T] {
-        self.s[self.pos..self.s.len]
-    }
-
-    #[inline]
-    pub fn fold<B, F>(self: SliceIter<T>, init: B, f: F) -> B {
+    fn fold<B, F: FnMut(B, T) -> B>(self: SliceIter<T>, init: B, f: F) -> B {
         let mut g = f;
         let mut acc = init;
         let s = self.s;
@@ -265,6 +479,28 @@ impl<T> SliceIter<T> {
             acc = g(acc, s[k]);
         }
         acc
+    }
+}
+
+impl<T> SliceIter<T> {
+    // The items left, as a slice.
+    #[inline]
+    pub fn as_slice(self: *SliceIter<T>) -> [T] {
+        self.s[self.pos..self.s.len]
+    }
+}
+
+impl<T>[T] {
+    // Its items, by value.
+    #[inline]
+    pub fn iter(self: [T]) -> SliceIter<T> {
+        SliceIter { s: self, pos: 0 }
+    }
+
+    // Sorts it in place by f (see sort_by).
+    #[inline]
+    pub fn sort_by<F>(self: [T], f: F) {
+        sort_by(self, f);
     }
 }
 
@@ -283,13 +519,14 @@ impl<T> Vec<T> {
     }
 }
 
-// The entries of a HashMap, (key, value), in slot order: `m.iter()`. A
-// view, valid until the map changes or is freed.
+// `m.iter()`: (key, value) in slot order, until the map changes.
 pub struct HashMapIter<K, V> { keys: *K, values: *V, states: *u8, cap: i64, pos: i64, left: i64 }
 
-impl<K, V> HashMapIter<K, V> {
+impl<K, V> Iterator for HashMapIter<K, V> {
+    type Item = (K, V);
+
     #[inline]
-    pub fn next(self: *HashMapIter<K, V>) -> Option<(K, V)> {
+    fn next(self: *HashMapIter<K, V>) -> Option<(K, V)> {
         while self.pos < self.cap {
             let i = self.pos;
             self.pos = i + 1;
@@ -302,17 +539,12 @@ impl<K, V> HashMapIter<K, V> {
     }
 
     #[inline]
-    pub fn exact_len(self: *HashMapIter<K, V>) -> i64 {
+    fn exact_len(self: *HashMapIter<K, V>) -> i64 {
         self.left
     }
 
     #[inline]
-    pub fn at(self: *HashMapIter<K, V>, k: i64) -> (K, V) {
-        self.next().unwrap()
-    }
-
-    #[inline]
-    pub fn fold<B, F>(self: HashMapIter<K, V>, init: B, f: F) -> B {
+    fn fold<B, F: FnMut(B, (K, V)) -> B>(self: HashMapIter<K, V>, init: B, f: F) -> B {
         let mut g = f;
         let mut acc = init;
         for i in self.pos..self.cap {
@@ -324,12 +556,13 @@ impl<K, V> HashMapIter<K, V> {
     }
 }
 
-// The keys of a HashMap: `m.keys()`.
 pub struct Keys<K, V> { it: HashMapIter<K, V> }
 
-impl<K, V> Keys<K, V> {
+impl<K, V> Iterator for Keys<K, V> {
+    type Item = K;
+
     #[inline]
-    pub fn next(self: *Keys<K, V>) -> Option<K> {
+    fn next(self: *Keys<K, V>) -> Option<K> {
         match self.it.next() {
             Option::Some(e) => Option::Some(e.0),
             Option::None => Option::None,
@@ -337,22 +570,24 @@ impl<K, V> Keys<K, V> {
     }
 
     #[inline]
-    pub fn exact_len(self: *Keys<K, V>) -> i64 {
+    fn exact_len(self: *Keys<K, V>) -> i64 {
         self.it.left
     }
 
     #[inline]
-    pub fn at(self: *Keys<K, V>, k: i64) -> K {
-        self.next().unwrap()
+    fn fold<B, F: FnMut(B, K) -> B>(self: Keys<K, V>, init: B, f: F) -> B {
+        let mut g = f;
+        self.it.fold(init, | acc, e | g(acc, e.0))
     }
 }
 
-// The values of a HashMap: `m.values()`.
 pub struct Values<K, V> { it: HashMapIter<K, V> }
 
-impl<K, V> Values<K, V> {
+impl<K, V> Iterator for Values<K, V> {
+    type Item = V;
+
     #[inline]
-    pub fn next(self: *Values<K, V>) -> Option<V> {
+    fn next(self: *Values<K, V>) -> Option<V> {
         match self.it.next() {
             Option::Some(e) => Option::Some(e.1),
             Option::None => Option::None,
@@ -360,13 +595,14 @@ impl<K, V> Values<K, V> {
     }
 
     #[inline]
-    pub fn exact_len(self: *Values<K, V>) -> i64 {
+    fn exact_len(self: *Values<K, V>) -> i64 {
         self.it.left
     }
 
     #[inline]
-    pub fn at(self: *Values<K, V>, k: i64) -> V {
-        self.next().unwrap()
+    fn fold<B, F: FnMut(B, V) -> B>(self: Values<K, V>, init: B, f: F) -> B {
+        let mut g = f;
+        self.it.fold(init, | acc, e | g(acc, e.1))
     }
 }
 
