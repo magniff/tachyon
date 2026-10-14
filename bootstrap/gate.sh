@@ -371,7 +371,7 @@ trap cleanup INT TERM
 
 [ $INSIDE -eq 1 ] || {
     echo "gate: $MODE on $HOST, $JOBS slots${COMPILER:+, compiler $COMPILER}; logs in $RUN"
-    echo "  steps: $([ $CHAIN -eq 1 ] && echo "chain ")$(echo $STEPS)$([ $BENCH -eq 1 ] && echo " bench")"
+    echo "  steps: $(echo $([ $CHAIN -eq 1 ] && echo chain) $STEPS $([ $BENCH -eq 1 ] && echo bench))"
 }
 
 # On macOS, the first launch of every new executable waits for the
