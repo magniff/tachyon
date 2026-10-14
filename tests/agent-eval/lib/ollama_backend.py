@@ -85,10 +85,32 @@ def _cut(text):
 
 
 class Tools:
-    def __init__(self, ws, bin_dir):
+    def __init__(self, ws, bin_dir, check_hook=None):
         self.ws = os.path.realpath(ws)
         self.env = base_env(bin_dir)
         self.profile = sandbox_profile(ws)
+        self.check_hook = check_hook
+
+    def after(self, name, a, result):
+        """(--check-hook) The hook Claude Code would run after this call,
+        its context appended to the result."""
+        if not self.check_hook or name not in ("write_file", "edit_file", "bash"):
+            return result
+        if name == "bash":
+            event = {"tool_name": "Bash", "tool_input": {"command": a.get("command", "")},
+                     "tool_response": {"stdout": result, "stderr": ""}}
+        else:
+            event = {"tool_name": "Write" if name == "write_file" else "Edit",
+                     "tool_input": {"file_path": os.path.join(self.ws, a.get("path", ""))}}
+        event.update(hook_event_name="PostToolUse", cwd=self.ws)
+        env = dict(self.env, TACHYON_CHECK_HOOK_LOG=self.check_hook[1])
+        try:
+            r = subprocess.run(["/usr/bin/python3", "-I", self.check_hook[0]], input=json.dumps(event),
+                               capture_output=True, text=True, env=env, timeout=60)
+            ctx = json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"] if r.stdout.strip() else ""
+        except (OSError, ValueError, KeyError, subprocess.TimeoutExpired):
+            ctx = ""
+        return result + "\n" + ctx if ctx else result
 
     def _path(self, p):
         full = os.path.realpath(os.path.join(self.ws, p))
@@ -151,8 +173,8 @@ def chat(model, messages, timeout):
         return json.loads(r.read())
 
 
-def run(prompt, ws, bin_dir, model, timeout_s, rdir):
-    tools = Tools(ws, bin_dir)
+def run(prompt, ws, bin_dir, model, timeout_s, rdir, check_hook=None):
+    tools = Tools(ws, bin_dir, check_hook)
     messages = [{"role": "system", "content": SYSTEM},
                 {"role": "user", "content": prompt}]
     tpath = os.path.join(rdir, "transcript.jsonl")
@@ -203,7 +225,7 @@ def run(prompt, ws, bin_dir, model, timeout_s, rdir):
                         a = {}
                 calls += 1
                 kinds.update(classify_call(name, a))
-                result = tools.call(name, a)
+                result = tools.after(name, a, tools.call(name, a))
                 tm = {"role": "tool", "content": result, "tool_name": name}
                 messages.append(tm)
                 tr.write(json.dumps({"message": tm}) + "\n")

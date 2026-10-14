@@ -25,6 +25,7 @@ unreadable) and is auto-allowed there; anything else is denied at once
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import time
@@ -56,12 +57,22 @@ ALLOW = ["tachyonc", "rustc", "./prog", "prog", "cat", "ls", "echo", "printf",
 PERMS = "allowlist"
 
 
-def settings(deny_read):
+def settings(deny_read, check_hook=None):
     home = os.path.realpath(os.path.expanduser("~"))
     deny = ["Read(/%s/**)" % p for p in deny_read]
     if PERMS == "bypass":
         deny.append("Edit(/%s/**)" % home)
+    extra = {}
+    if check_hook:
+        # (--check-hook) `tachyonc check` after every change to a .tach
+        # file, its errors added to the tool result (hooks run outside the
+        # sandbox; the script is a copy outside the repository)
+        extra["hooks"] = {"PostToolUse": [{
+            "matcher": "Write|Edit|MultiEdit|Bash",
+            "hooks": [{"type": "command",
+                       "command": "/usr/bin/python3 -I " + shlex.quote(check_hook)}]}]}
     return {
+        **extra,
         "sandbox": {
             "enabled": True,
             "autoAllowBashIfSandboxed": True,
@@ -75,7 +86,7 @@ def settings(deny_read):
     }
 
 
-def command(prompt, model):
+def command(prompt, model, check_hook=None):
     claude = shutil.which("claude")
     if not claude:
         raise SystemExit("claude not found on PATH")
@@ -84,7 +95,7 @@ def command(prompt, model):
         "--model", model,
         "--output-format", "stream-json", "--verbose",
         "--setting-sources", "",
-        "--settings", json.dumps(settings(private_paths())),
+        "--settings", json.dumps(settings(private_paths(), check_hook)),
         "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
         "--tools", TOOLS,
         "--permission-mode", "bypassPermissions" if PERMS == "bypass" else "acceptEdits",
@@ -102,15 +113,19 @@ def env(bin_dir):
     return e
 
 
-def run(prompt, ws, bin_dir, model, timeout_s, rdir):
+def run(prompt, ws, bin_dir, model, timeout_s, rdir, check_hook=None):
     """Runs the agent in `ws`; the stream goes to rdir/transcript.jsonl.
-    Returns the agent's half of result.json."""
+    Returns the agent's half of result.json. check_hook: (the hook
+    script, its log) for --check-hook, or None."""
     tpath = os.path.join(rdir, "transcript.jsonl")
     epath = os.path.join(rdir, "agent.stderr")
     t0 = time.time()
     timed_out = False
     with open(tpath, "wb") as out, open(epath, "wb") as err:
-        p = subprocess.Popen(command(prompt, model), cwd=ws, env=env(bin_dir),
+        e = env(bin_dir)
+        if check_hook:
+            e["TACHYON_CHECK_HOOK_LOG"] = check_hook[1]
+        p = subprocess.Popen(command(prompt, model, check_hook and check_hook[0]), cwd=ws, env=e,
                              stdin=subprocess.DEVNULL, stdout=out, stderr=err,
                              start_new_session=True)
         try:

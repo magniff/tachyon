@@ -13,6 +13,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(EVAL_DIR))
 DEFAULT_TASKS_DIR = os.path.join(EVAL_DIR, "tasks")
 DEFAULT_RESULTS_DIR = os.path.join(EVAL_DIR, "results")
 PROMPTS_DIR = os.path.join(EVAL_DIR, "prompts")
+HOOKS_DIR = os.path.join(REPO_ROOT, "tools", "agent-hooks")
 
 TACH_CONDS = ("bare", "guide", "tools", "both")
 ALL_CONDS = TACH_CONDS + ("rust",)
@@ -257,3 +258,58 @@ def write_json(path, obj):
 def tail(b, n=2000):
     s = b.decode("utf-8", "replace") if isinstance(b, bytes) else b
     return s if len(s) <= n else "..." + s[-n:]
+
+
+def install_check_hook(ws_root):
+    """The check hook (tools/agent-hooks/check-after-edit.py and the module
+    it loads) copied out of the repository, which the agent's sandbox
+    cannot read: its path."""
+    d = os.path.join(ws_root, "hooks")
+    os.makedirs(d, exist_ok=True)
+    for f in ("check-after-edit.py", "tachyonc_cmd.py"):
+        shutil.copyfile(os.path.join(HOOKS_DIR, f), os.path.join(d, f))
+    return os.path.join(d, "check-after-edit.py")
+
+
+def check_hook_summary(log_path):
+    """result.json's check_hook: what the hook did in a run (its log, one
+    JSON line per check)."""
+    recs = []
+    try:
+        with open(log_path) as fh:
+            for line in fh:
+                try:
+                    recs.append(json.loads(line))
+                except ValueError:
+                    pass
+    except OSError:
+        pass
+    codes = {}
+    for r in recs:
+        for c in r.get("codes") or []:
+            codes[c] = codes.get(c, 0) + 1
+    ms = sorted(r.get("ms") or 0 for r in recs)
+    return {"checks": len(recs),
+            "with_errors": sum(1 for r in recs if r.get("errors")),
+            "errors": sum(r.get("errors") or 0 for r in recs),
+            "codes": codes,
+            "ms_median": ms[len(ms) // 2] if ms else None}
+
+
+def final_check(ws, env):
+    """`tachyonc check --json` on the finished workspace: its errors by code
+    (None when the compiler has no --json, before 0.15)."""
+    rc, out, err, _ = run_proc(["tachyonc", "check", "--json"], ws, env, 60)
+    if rc not in (0, 1) or b"unknown option" in err:
+        return None
+    codes = {}
+    n = 0
+    for line in (err + out).decode("utf-8", "replace").splitlines():
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(d, dict) and d.get("kind") == "diagnostic" and d.get("severity") == "error":
+            n += 1
+            codes[d.get("code") or ""] = codes.get(d.get("code") or "", 0) + 1
+    return {"errors": n, "codes": codes}

@@ -35,6 +35,16 @@ tests/agent-eval/run.py report tests/agent-eval/results/0.14-* --md docs/eval/0.
   [prompts/tools.md](prompts/tools.md)), `both`, `rust`.
 - `--tasks-dir D` for another task set (`devtasks/` holds two tiny ones
   for working on the runner); `--tasks a,b` picks some.
+- `--check-hook` (0.15): in the tools and both conditions,
+  tools/agent-hooks/check-after-edit.py runs after every change to a
+  `.tach` file (Write, Edit, a `tachyonc edit` that wrote) and adds
+  `tachyonc check`'s errors to that tool result, as it does for the
+  agents working on the compiler; the prompt says so
+  ([prompts/check-hook.md](prompts/check-hook.md)). Claude: a PostToolUse
+  hook in `--settings` (a copy of the script outside the repository);
+  Ollama: the loop runs the same script after write_file, edit_file and
+  bash. result.json gets `check_hook` (checks, with_errors, errors,
+  codes, ms_median; the log is kept as `check-hook.jsonl`).
 - Resumable: a run whose `result.json` exists is skipped, so rerun the
   same command (same `--out`) after an interruption. A run directory
   without `result.json` is redone from scratch.
@@ -75,7 +85,10 @@ tests_total build_ok check_ok wall_s turns tool_calls tool_calls_by_kind
 input_tokens output_tokens cache_read_tokens cost_usd error`, and
 `permission_denials` (count and the denied calls), `leftover_processes`,
 `agent_env` (Claude's own report of its tools, MCP servers, skills,
-plugins, permission mode), `compiler`, `model_id`.
+plugins, permission mode), `compiler`, `model_id`; for tachyon,
+`final_check` (0.15: the errors left in the finished workspace by code,
+from `tachyonc check --json`; null for a compiler before 0.15) and with
+`--check-hook`, `check_hook`.
 
 - `input_tokens` is every prompt token the model read, summed over its
   calls: for Claude fresh + cache writes + cache reads

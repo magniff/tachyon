@@ -19,7 +19,7 @@ def guide_text(tach_bin):
     return out.decode("utf-8").strip()
 
 
-def preamble(cond, guide=None, env_note=None):
+def preamble(cond, guide=None, env_note=None, check_hook=False):
     if cond == "rust":
         parts = [_read("rust.md")]
     else:
@@ -28,12 +28,14 @@ def preamble(cond, guide=None, env_note=None):
             parts.append(_read("guide-intro.md") + "\n\n" + guide)
         if cond in ("tools", "both"):
             parts.append(_read("tools.md"))
+            if check_hook:
+                parts.append(_read("check-hook.md"))
     if env_note:  # what the backend's harness allows
         parts.append(_read(env_note))
     parts.append(_read("ending.md"))
     return "\n\n".join(parts)
 
 
-def build_prompt(cond, task_text, guide=None, env_note=None):
-    return (preamble(cond, guide, env_note) + "\n\n---\n\n"
+def build_prompt(cond, task_text, guide=None, env_note=None, check_hook=False):
+    return (preamble(cond, guide, env_note, check_hook) + "\n\n---\n\n"
             + task_text.strip() + "\n")
