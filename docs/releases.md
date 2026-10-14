@@ -461,6 +461,10 @@ native on Apple silicon, e.g. with colima):
 $ bootstrap/aarch64-linux-check.sh --worktree --dev --all-levels --fuzz=100 --abi=40 --objcheck --debugger
 ```
 
+With `--compiler C` it skips step 1's chain: C (built and tested here
+from the same tree, as `bootstrap/gate.sh` does) cross-compiles the
+tree's compiler.
+
 In `releases.toml`, `aarch64-linux` is a host of HEAD (and so of 0.11 and
 every later release), and of no release before; the releases before 0.11
 and their checks are unchanged.
@@ -526,17 +530,111 @@ Say the last release is 0.2.0 and you have implemented a feature on main.
    summary = "What 0.3.0 introduced."
    ```
    and a row to the table above.
-5. Run the whole chain with the new entry, in working-tree mode (the tag
-   does not exist yet, so the new release is the working tree), on every
-   host it lists:
+5. Run the gate (below, and [roadmap.md](roadmap.md)): the chain with the
+   new entry, in working-tree mode (the tag does not exist yet, so the new
+   release is the working tree), and every check, on every host it lists:
    ```
-   $ bootstrap/bootstrap.sh --worktree --dev
-   $ bootstrap/linux-check.sh --worktree --dev       # x86_64-linux, in a container
+   $ bootstrap/gate.sh --release        # everything, at once (docker running)
+   $ bootstrap/gate.sh --only bench     # then alone, on an idle machine: the benchmarks
    ```
    Then commit, and tag the commit: `git tag v0.3.0`. From now on,
    `bootstrap/bootstrap.sh` builds the seed, 0.1.0, 0.2.0, then 0.3.0 from
    its tag, then HEAD.
 6. Now (and not before) the compiler's source may use the new feature.
+
+### The gate
+
+`bootstrap/gate.sh` runs the whole gate in one command, as parallel as
+the machine allows, and ends with one table (each step, its result and
+time, a line about it) and the failures' details; it exits 1 when a step
+failed. Its logs are in `target/gate/<date>/` (`target/gate/last`), one
+file per step.
+
+```
+$ bootstrap/gate.sh --quick            # before committing a big change: chain, suite at -O2, a short fuzz
+$ bootstrap/gate.sh                    # every step, modest fuzz counts
+$ bootstrap/gate.sh --release          # every step, the release's fuzz counts
+$ bootstrap/gate.sh --no-linux         # without the containers
+$ bootstrap/gate.sh --only 'fuzz-*,objcheck'   # some steps (--list shows them)
+$ bootstrap/gate.sh --release --bench  # the gate, then the benchmarks alone
+$ bootstrap/gate.sh --only bench       # only the benchmarks
+```
+
+The steps: `chain` (`bootstrap.sh --dev --no-head-tests`: the releases,
+then the working tree, built and checked for its fixpoint); then, at
+once, `suite-O0`, `suite-O1`, `suite-O2`; `fuzz-plain`, `fuzz-loops`,
+`fuzz-generics`, `fuzz-pressure`, `fuzz-calls`, `fuzz-lang06`,
+`fuzz-vector`, `fuzz-div`, `fuzz-range` and `fuzz-seed` (the seed as a
+third oracle); `abi-plain`, `abi-import`, `abi-header`; `objcheck`;
+`layout` (`tests/cimport/layout.sh` on the system headers); `debug`
+(`tests/debug.sh`); and the two containers: `linux-x86_64`
+(`bootstrap/linux-check.sh`, which builds its own chain and so starts at
+once) and `linux-aarch64` (`bootstrap/aarch64-linux-check.sh --compiler`:
+the chain's compiler cross-compiles the tree). Inside each container the
+same steps run at once (`gate.sh --inside`), and their rows appear in the
+table under the container's. `bench` runs alone, at the end: benchmarks
+need an idle machine.
+
+It stays parallel without overloading the machine: the test runners
+(`tests/run.sh`, `tests/fuzz/run.sh`, `tests/abi/run.sh`,
+`tests/objcheck.sh`) take their slots from one pool, a FIFO named by
+`$TACHYON_JOBSERVER` that the gate fills with `-j` lines (by default one
+per CPU). Twenty steps share the CPUs, none waits for another's tail, and
+no program runs late enough to hit its timeout.
+
+**macOS checks every new program.** The first launch of an executable
+that was just linked waits for syspolicyd and XProtect to check it:
+0.2–0.4 s, against milliseconds for the compilation and the link of a
+test (measured on 0.11, one test at a time: compile 5 ms, link 40 ms,
+first launch 240 ms, a second launch 2 ms). Every test, random program
+and ABI program is a new executable, so on macOS this wait is most of the
+suite's time, and the checks are taken about one at a time, whatever the
+number of CPUs: the gate's release run on macOS (8,300 programs at the
+0.11 counts) took 33 minutes with the CPUs mostly idle, while the same
+suite runs in 15 s in the aarch64-linux container. More slots do not help
+(`--quick` took 3:53 with two slots per CPU, 2:27 with one). So on macOS
+the gate runs a modest number of random programs, and the volume runs
+in the aarch64-linux container, the same code generator. Ad-hoc signing
+does not change it (the linker signs already). It does not apply to
+programs a *developer tool* starts: add the terminal that runs the gate
+to System Settings → Privacy & Security → Developer Tools (`spctl
+developer-mode enable-terminal` makes Terminal appear in that list).
+`gate.sh` times one launch when it starts and says when it is slow.
+
+The containers get `--cpus N` each (default 8; at most what docker has:
+with colima, `colima start --cpu 10 --memory 12`); x86_64-linux runs
+emulated (Rosetta, in colima's VM), aarch64-linux natively, both at once.
+Emulated, gcc and ld now and then crash (a segmentation fault in
+collect2, two in one release run): the runners run `cc` once more when
+it crashed (a signal, or gcc's "internal compiler error"), and say so in
+the case's output; a crash of `cc` is not tachyon's.
+An image is built again only when its recipe (the Dockerfile and the
+files it copies) changes (`--rebuild-image` forces it, for a newer base
+image). The x86_64-linux chain keeps its built releases in a docker
+volume (`tachyon-bootstrap-x86_64-linux`), by tag and commit as
+`bootstrap.sh` caches them, so a rerun builds only the working tree;
+`gate.sh --fresh` (`linux-check.sh --fresh`) starts from nothing, as a
+new machine does.
+
+The history: `bootstrap.sh` checks every release's fixpoint but, by
+default (`--history fast`), runs only the last release's test suite (the
+release that builds HEAD); a suite that passed before for the same tag
+and commit (in the cache) is not run again in either mode.
+`--history full` runs every release's suite: an occasional complete
+replay (with `--clean`, from nothing; `gate.sh --history full --fresh`
+does it on this host and in the x86_64-linux container).
+
+Between releases, `tests/fuzz/forever.sh` fuzzes in every mode, batch
+after batch on new seeds, at the lowest priority (nice 19), so the gate's
+fuzz counts can stay modest. It logs to `target/fuzz-forever/log`, keeps
+failing programs in `target/fuzz-forever/failures/MODE/`, goes on from
+where it stopped, and stops after the current batch once
+`target/fuzz-forever/stop` exists:
+
+```
+$ tests/fuzz/forever.sh &      # --follow: test each new target/tachyonc
+$ touch target/fuzz-forever/stop
+```
 
 If a release changes how its binary is invoked or what it emits (another
 command line), give it a new `cli` value and teach `compile_with` in
@@ -636,9 +734,10 @@ $ bootstrap/bootstrap.sh
 ```
 
 This builds the seed from the `seed` tag with cargo, builds 0.1.0 (from
-`v0.1.0`) with the seed, checks 0.1.0's fixpoint, runs 0.1.0's test suite,
-does the same for every later release (0.2.0 is built by 0.1.0), and
-finally for HEAD. It prints a
+`v0.1.0`) with the seed, checks 0.1.0's fixpoint, does the same for every
+later release (0.2.0 is built by 0.1.0), runs the last release's test
+suite, and finally builds, checks and tests HEAD (`--history full` runs
+every release's test suite as well). It prints a
 summary and leaves the HEAD compiler in `target/tachyonc`.
 
 To check the Linux chain from any machine with docker:
@@ -646,14 +745,17 @@ To check the Linux chain from any machine with docker:
 ```
 $ bootstrap/linux-check.sh                   # HEAD and the tags, from a fresh clone
 $ bootstrap/linux-check.sh --seed-tests      # also the seed's cargo tests on Linux
-$ bootstrap/linux-check.sh --all-levels --fuzz=200   # also -O0/-O1/-O2 and random programs
+$ bootstrap/linux-check.sh --all-levels --fuzz=200   # also -O0/-O1/-O2 and random programs (each mode)
 $ bootstrap/linux-check.sh --abi=150 --bench          # also C interop fuzzing and the benchmarks
+$ bootstrap/linux-check.sh --fresh --history full     # without the cache volume, every release tested
 ```
 
 It builds a minimal Debian image (`bootstrap/ci/linux-x86_64.Dockerfile`:
-only git, gcc, libc6-dev, curl, ca-certificates and rustup), clones the
-repository inside it, runs `bootstrap.sh`, and checks the md5 example
-against `md5sum`.
+only git, gcc, libc6-dev, curl, ca-certificates and rustup; again only
+when that recipe changes), clones the repository inside it, runs
+`bootstrap.sh` (its cache in a docker volume, see "The gate"), checks the
+md5 example against `md5sum`, then runs the checks asked for at once
+(`bootstrap/gate.sh --inside`).
 
 Built steps are cached in `target/bootstrap/<host>/`; a rerun only rebuilds
 HEAD. Options of `bootstrap.sh`:
@@ -667,4 +769,7 @@ HEAD. Options of `bootstrap.sh`:
 --seed-bin PATH    use an existing seed binary
 --clean            empty the cache first
 --out PATH         also copy the final compiler to PATH
+--history MODE     fast (the default): every release's fixpoint, the last
+                   one's suite; full: every release's suite too
+--no-head-tests    build HEAD and check its fixpoint, not its suite
 ```

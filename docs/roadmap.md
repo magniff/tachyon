@@ -28,6 +28,19 @@ x86_64-linux:
   `tachyonc` rather than the shell, and why the rest did not; the gaps
   feed the next release's tools.
 
+The gate is one command (from 0.11; [releases.md](releases.md), "The
+gate"): `bootstrap/gate.sh --release` builds the chain (every release's
+fixpoint, the last release's suite, the working tree), then runs at once
+the suite at every level, the random programs in every mode (the seed in
+one), the C interop fuzzer in its three modes, objcheck, the header
+layouts and the debugger check, next to the two Linux containers
+(x86_64-linux from its own chain, aarch64-linux cross-built), and prints
+one table. The benchmarks run alone afterwards, on an idle machine
+(`gate.sh --only bench`). Between releases `tests/fuzz/forever.sh`
+fuzzes every mode at low priority, so the gate's fuzz counts stay
+modest; `bootstrap.sh --history full` (every release's suite) is an
+occasional complete replay, not part of every gate.
+
 Principle: **no undefined behaviour.** Every operation safe code can
 write has defined behaviour (integer overflow wraps, division by zero,
 shifts and conversions are defined, indexing is checked); what cannot be

@@ -45,7 +45,8 @@ esac
 [ -x "$COMPILER" ] || { echo "query/run.sh: no compiler at $COMPILER" >&2; exit 2; }
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-query.XXXXXX")
-trap 'rm -rf "$WORK"' EXIT INT TERM
+trap 'rm -rf "$WORK"' EXIT
+trap 'exit 130' INT TERM
 STATUS=0
 
 # The transcript of test file $1 (its `$` lines run again), on stdout.

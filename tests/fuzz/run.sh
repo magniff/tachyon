@@ -27,7 +27,8 @@
 #                 the seed, which traps on 0)
 #   -R            loops indexing arrays of fixed sizes with steps of any
 #                 kind, from genrange.awk (0.11: ranges through phis)
-#   -j JOBS       programs tested at once (default: the number of CPUs)
+#   -j JOBS       programs tested at once (default: the number of CPUs,
+#                 or the slots of $TACHYON_JOBSERVER, see tests/run.sh)
 
 set -u
 LC_ALL=C
@@ -58,7 +59,7 @@ while [ $# -gt 0 ]; do
         -D) DIVIDE=1; shift ;;
         -R) RANGES=1; shift ;;
         -j) JOBS=$2; shift 2 ;;
-        *) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+        *) sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
     esac
 done
 if [ -z "$TARGET" ]; then
@@ -78,13 +79,28 @@ esac
 NONZERO=0
 [ -n "$SEED" ] && NONZERO=1
 
-if [ -z "$JOBS" ]; then
-    JOBS=$(sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 4)
-    case "$JOBS" in ''|*[!0-9]*) JOBS=4 ;; esac
-fi
-
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-fuzz.XXXXXX")
-trap 'rm -rf "$WORK"' EXIT INT TERM
+trap 'rm -rf "$WORK"' EXIT
+trap 'exit 130' INT TERM
+
+# The C compiler, once more when it crashed (a signal, or gcc's "internal
+# compiler error"): an emulated toolchain (x86-64 Linux under Rosetta)
+# now and then does, and a crash of cc is not tachyon's. Its output (and
+# the crash's, if any) on stdout.
+cc_run() {
+    cr_out=$("$CC" "$@" 2>&1)
+    cr_rc=$?
+    if [ $cr_rc -ne 0 ]; then
+        case "$cr_rc:$cr_out" in
+            1[3-9][0-9]:*|2[0-9][0-9]:*|*"internal compiler error"*|*"Segmentation fault"*|*"Bus error"*)
+                printf '%s\n(%s crashed, exit %d: run again)\n' "$cr_out" "$CC" "$cr_rc"
+                cr_out=$("$CC" "$@" 2>&1)
+                cr_rc=$? ;;
+        esac
+    fi
+    [ -z "$cr_out" ] || printf '%s\n' "$cr_out"
+    return $cr_rc
+}
 
 # Tests program $1 (a random seed); why it fails, if it does, in
 # $WORK/p$1.why.
@@ -113,7 +129,7 @@ test_seed() {
             "$COMPILER" --target "$TARGET" "-$level" --deny-warnings --verify-ir "$program" -o "$exe.o" >"$exe.log" 2>&1 \
                 || { why="-$level failed to compile it: $(head -3 "$exe.log")"; break; }
             # shellcheck disable=SC2086
-            "$CC" $ARCH -o "$exe" "$exe.o" >>"$exe.log" 2>&1 || { why="-$level: cc failed"; break; }
+            cc_run $ARCH -o "$exe" "$exe.o" >>"$exe.log" 2>&1 || { why="-$level: cc failed"; break; }
         fi
         # The exit status is part of the output (a bounds check exits
         # with 101, alike at every level).
@@ -134,13 +150,23 @@ test_seed() {
     rm -f "$WORK/p$seed".O* "$WORK/p$seed".seed*
 }
 
-mkfifo "$WORK/slots"
-exec 3<>"$WORK/slots"
-i=0
-while [ "$i" -lt "$JOBS" ]; do
-    echo >&3
-    i=$((i + 1))
-done
+# The slots: JOBS of them, or (0.11) the ones $TACHYON_JOBSERVER shares
+# between the runners of bootstrap/gate.sh (see tests/run.sh).
+if [ -z "$JOBS" ] && [ -n "${TACHYON_JOBSERVER:-}" ] && [ -p "$TACHYON_JOBSERVER" ]; then
+    exec 3<>"$TACHYON_JOBSERVER"
+else
+    if [ -z "$JOBS" ]; then
+        JOBS=$(sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 4)
+        case "$JOBS" in ''|*[!0-9]*) JOBS=4 ;; esac
+    fi
+    mkfifo "$WORK/slots"
+    exec 3<>"$WORK/slots"
+    i=0
+    while [ "$i" -lt "$JOBS" ]; do
+        echo >&3
+        i=$((i + 1))
+    done
+fi
 last=$((FIRST + COUNT))
 seed=$FIRST
 while [ "$seed" -lt "$last" ]; do
