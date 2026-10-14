@@ -1,0 +1,481 @@
+// What the references need once items move: the imports to add and to
+// remove, the `use` paths to rewrite (made by `refactor split
+// crate::refactor_move --auto`, then renamed).
+
+use crate::ast::{NODES, NODE_COUNT, NodeKind, child};
+use crate::base::{
+    BUFS, IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, intern,
+};
+use crate::edit::{delete_lines, node_head};
+use crate::lexer::{TOKS, TOK_COUNT, Tok};
+use crate::lower::HMap;
+use crate::modules::{module_at, module_of};
+use crate::query::{
+    DEFS, K_IMPL_METHOD, K_METHOD, K_VARIANT, QF_DEF, QF_USE, R_DEF, R_FLAGS, R_POS, bytes_eq,
+    c_slice, line_end, line_start, sym_less, token_at,
+};
+use crate::refactor_mod::{
+    REFS, chain_public, collision, is_new, item_binding, path_start, put_edit, put_region_path,
+    qualified, text_of, use_binding, use_id_at, use_node_of, within,
+};
+use crate::refactor_move::{MV_DEF, MV_DEST, later_edit, region_at};
+use crate::refactor_mod::cli::user_pos;
+
+// ---- Imports ----
+
+// The imports to add: region, definition, the name it is imported as.
+pub static mut IM_REGION: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+static mut IM_DEF: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+static mut IM_NAME: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The `use` names removed (Ident node -> 1), and the Use nodes whose path
+// becomes another (node -> text).
+pub static mut DROPPED: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+static mut DROP_USES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+static mut REPATH: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+// The imports of a moved item to rewrite: Ident node, the path of its new
+// module.
+static mut MU_ID: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+static mut MU_DEF: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+static mut MU_PATH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+pub static mut REFUSED: bool = false;
+
+// Name id of Use node u is removed.
+pub fn remove_use_names(u: i64, id: i64) {
+    unsafe {
+        if DROPPED.get(id) != 0 {
+            return;
+        }
+        DROPPED.put(id, 1);
+        let mut seen = false;
+        for i in 0..DROP_USES.count {
+            if DROP_USES.data[i] == u {
+                seen = true;
+            }
+        }
+        if !seen {
+            DROP_USES.push(u);
+        }
+    }
+}
+
+// The path definition d is imported from once the edit is made (its
+// module's, or for a variant its enum's): `crate::a::b`.
+fn import_path(out: i64, d: i64) {
+    unsafe {
+        let it = if DEFS[d].kind == K_VARIANT { DEFS[d].parent } else { d };
+        let h = home(it);
+        put_region_path(out, h);
+        if it != d {
+            buf_str(out, c"::");
+            buf_bytes(out, SYMS[DEFS[it].name].text);
+        }
+    }
+}
+
+// The region an item is in after the edit.
+fn home(d: i64) -> i64 {
+    unsafe {
+        if !user_pos(DEFS[d].start) {
+            return module_at(DEFS[d].start);
+        }
+        region_at(DEFS[d].start)
+    }
+}
+
+// Region r needs definition d under name `name` (`again`: its import
+// there is removed).
+fn need_import(r: i64, d: i64, name: i64) {
+    add_import(r, d, name, false);
+}
+
+fn add_import(r: i64, d: i64, name: i64, again: bool) {
+    unsafe {
+        for i in 0..IM_REGION.count {
+            if IM_REGION.data[i] == r && IM_NAME.data[i] == name {
+                if IM_DEF.data[i] != d && !REFUSED {
+                    REFUSED = true;
+                    collision(SYMS[name].text, r, IM_DEF.data[i], true);
+                }
+                return;
+            }
+        }
+        if !is_new(r) {
+            // What the name is there now: d (nothing to do), something
+            // else that stays (a collision), or what leaves.
+            let ib = item_binding(r, name);
+            let uid = crate::refactor_mod::use_binding_id(r, name);
+            let ub = use_binding(r, name);
+            if ib >= 0 && home(ib) == r {
+                if ib != d && !REFUSED {
+                    REFUSED = true;
+                    collision(SYMS[name].text, r, ib, false);
+                }
+                return;
+            }
+            if ib < 0 && uid != 0 && DROPPED.get(uid) == 0 {
+                if ub != d && !REFUSED {
+                    REFUSED = true;
+                    collision(SYMS[name].text, r, ub, true);
+                }
+                if ub != d || !again {
+                    return;
+                }
+            }
+        }
+        // (an item moved there with that name)
+        for i in 0..MV_DEF.count {
+            let x = MV_DEF.data[i];
+            if MV_DEST.data[i] == r && DEFS[x].name == name && x != d && !REFUSED {
+                REFUSED = true;
+                collision(SYMS[name].text, r, x, false);
+                return;
+            }
+        }
+        IM_REGION.push(r);
+        IM_DEF.push(d);
+        IM_NAME.push(name);
+    }
+}
+
+// The `use` line text of the imports of region r with path p (a buffer):
+// `use p::a;`, `use p::{a, b};` (wrapped at 100 columns), and a line of
+// its own for each name imported under another name.
+fn put_use_lines(out: i64, p: [u8], names: *IntVec, defs: *IntVec) {
+    unsafe {
+        let mut plain = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..(*names).count {
+            let n = (*names).data[i];
+            let d = (*defs).data[i];
+            if n != DEFS[d].name {
+                buf_str(out, c"use ");
+                buf_bytes(out, p);
+                buf_str(out, c"::");
+                buf_bytes(out, SYMS[DEFS[d].name].text);
+                buf_str(out, c" as ");
+                buf_bytes(out, SYMS[n].text);
+                buf_str(out, c";\n");
+            } else {
+                plain.push(n);
+            }
+        }
+        if plain.count == 0 {
+            return;
+        }
+        let line = buf_new();
+        buf_str(line, c"use ");
+        buf_bytes(line, p);
+        buf_str(line, c"::");
+        if plain.count == 1 {
+            buf_bytes(line, SYMS[plain.data[0]].text);
+            buf_str(line, c";\n");
+            buf_bytes(out, buf_slice(line));
+            return;
+        }
+        buf_byte(line, '{');
+        for i in 0..plain.count {
+            if i > 0 {
+                buf_str(line, c", ");
+            }
+            buf_bytes(line, SYMS[plain.data[i]].text);
+        }
+        buf_str(line, c"};\n");
+        if BUFS[line].len <= 101 {
+            buf_bytes(out, buf_slice(line));
+            return;
+        }
+        buf_str(out, c"use ");
+        buf_bytes(out, p);
+        buf_str(out, c"::{\n");
+        let mut col = 0;
+        for i in 0..plain.count {
+            let w = SYMS[plain.data[i]].text;
+            if col > 0 && col + 2 + w.len + 1 > 100 {
+                buf_str(out, c",\n");
+                col = 0;
+            } else if col > 0 {
+                buf_str(out, c", ");
+                col += 2;
+            }
+            if col == 0 {
+                buf_str(out, c"    ");
+                col = 4;
+            }
+            buf_bytes(out, w);
+            col += w.len;
+        }
+        buf_str(out, c",\n};\n");
+    }
+}
+
+// The import lines of region r (sorted by path, then name).
+pub fn region_uses(r: i64) -> i64 {
+    unsafe {
+        let mut idx = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut paths = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..IM_REGION.count {
+            if IM_REGION.data[i] == r {
+                idx.push(i);
+                let b = buf_new();
+                import_path(b, IM_DEF.data[i]);
+                paths.push(intern(buf_slice(b)));
+            }
+        }
+        // (by path, then name)
+        for i in 1..idx.count {
+            let mut j = i;
+            while j > 0 && (sym_less(paths.data[j], paths.data[j - 1])
+                || (paths.data[j] == paths.data[j - 1] && sym_less(IM_NAME.data[idx.data[j]], IM_NAME.data[idx.data[j - 1]]))) {
+                let t = idx.data[j];
+                idx.data[j] = idx.data[j - 1];
+                idx.data[j - 1] = t;
+                let s = paths.data[j];
+                paths.data[j] = paths.data[j - 1];
+                paths.data[j - 1] = s;
+                j -= 1;
+            }
+        }
+        let out = buf_new();
+        let mut i = 0;
+        while i < idx.count {
+            let mut names = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            let mut defs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            let mut j = i;
+            while j < idx.count && paths.data[j] == paths.data[i] {
+                names.push(IM_NAME.data[idx.data[j]]);
+                defs.push(IM_DEF.data[idx.data[j]]);
+                j += 1;
+            }
+            put_use_lines(out, SYMS[paths.data[i]].text, &names, &defs);
+            i = j;
+        }
+        out
+    }
+}
+
+// The references of the program, in turn: what each needs once the moves
+// are made. False after a diagnostic.
+pub fn analyze() -> bool {
+    unsafe {
+        let mut pubbed = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        for k in 0..REFS.count {
+            let r = REFS.data[k];
+            let p = R_POS.data[r];
+            let d = R_DEF.data[r];
+            let flags = R_FLAGS.data[r];
+            if (flags & QF_DEF) != 0 || !user_pos(p) {
+                continue;
+            }
+            let kd = DEFS[d].kind;
+            let mut it = d;
+            if kd == K_VARIANT {
+                it = DEFS[d].parent;
+            } else if DEFS[d].parent >= 0 || kd == K_METHOD || kd == K_IMPL_METHOD {
+                continue;
+            }
+            let old_home = module_at(DEFS[it].start);
+            let new_home = home(it);
+            let old_reg = module_at(p);
+            let new_reg = region_at(p);
+            let moved_item = old_home != new_home;
+            let moved_code = old_reg != new_reg;
+            if !moved_item && !moved_code {
+                continue;
+            }
+            let ti = token_at(p);
+            if ti >= TOK_COUNT || TOKS[ti].start != p || TOKS[ti].kind != Tok::Ident {
+                continue;
+            }
+            let name = TOKS[ti].value as i64;
+            let use_ref = (flags & QF_USE) != 0;
+            // Visible from where it is used.
+            let from = if use_ref { old_reg } else { new_reg };
+            if user_pos(DEFS[it].start) && !DEFS[it].public && !within(from, new_home) && pubbed.get(it + 1) == 0 {
+                pubbed.put(it + 1, 1);
+                later_edit(DEFS[it].start, DEFS[it].start, text_of(c_slice(c"pub ")));
+            }
+            chain_public(from, new_home);
+            if use_ref {
+                if moved_item {
+                    let id = use_id_at(p);
+                    if id != 0 {
+                        if old_reg == new_home && d == it && NODES[id].b == 0 {
+                            remove_use_names(use_node_of(id), id);
+                        } else {
+                            MU_ID.push(id);
+                            MU_DEF.push(d);
+                            let b = buf_new();
+                            import_path(b, d);
+                            MU_PATH.push(b);
+                        }
+                    }
+                }
+                continue;
+            }
+            if qualified(p) {
+                if moved_item && d == it {
+                    let b = buf_new();
+                    put_region_path(b, new_home);
+                    buf_str(b, c"::");
+                    later_edit(path_start(p), p, b);
+                }
+                continue;
+            }
+            let via_import = use_binding(old_reg, name) == d;
+            let was_local = old_home == old_reg && d == it && name == DEFS[d].name && !via_import;
+            if new_home == new_reg && d == it {
+                continue;
+            }
+            if !moved_code {
+                if was_local {
+                    need_import(new_reg, d, name);
+                }
+                continue;
+            }
+            if via_import || was_local {
+                need_import(new_reg, d, name);
+            }
+        }
+        !REFUSED
+    }
+}
+
+// The imports of moved items: a `use` whose names all move to one module
+// gets that module's path; else the names leave it for `use` lines of
+// their own.
+pub fn rewrite_imports() {
+    unsafe {
+        for i in 0..MU_ID.count {
+            let id = MU_ID.data[i];
+            let u = use_node_of(id);
+            if REPATH.get(u) != 0 || DROPPED.get(id) != 0 {
+                continue;
+            }
+            // Every name of u moves, to one place?
+            let mut all = true;
+            for k in 0..NODES[u].count {
+                let c = child(u, k);
+                let mut found = false;
+                for j in 0..MU_ID.count {
+                    if MU_ID.data[j] == c && same_bytes_buf(MU_PATH.data[j], MU_PATH.data[i]) {
+                        found = true;
+                    }
+                }
+                if !found || DROPPED.get(c) != 0 {
+                    all = false;
+                }
+            }
+            if all {
+                REPATH.put(u, MU_PATH.data[i]);
+                continue;
+            }
+        }
+        for i in 0..MU_ID.count {
+            let id = MU_ID.data[i];
+            let u = use_node_of(id);
+            if REPATH.get(u) != 0 {
+                continue;
+            }
+            remove_use_names(u, id);
+            add_import(module_of(u), MU_DEF.data[i], crate::refactor_mod::use_local(id), true);
+        }
+    }
+}
+
+fn same_bytes_buf(a: i64, b: i64) -> bool {
+    bytes_eq(buf_slice(a), buf_slice(b))
+}
+
+// Whether only blanks are before pos on its line, and after end (or a
+// comment).
+fn alone_on_lines(pos: i64, end: i64) -> bool {
+    unsafe {
+        let mut p = line_start(pos);
+        while p < pos && (SRC[p] == ' ' || SRC[p] == '\t') {
+            p += 1;
+        }
+        if p != pos {
+            return false;
+        }
+        let e = line_end(end);
+        let mut q = end;
+        while q < e && (SRC[q] == ' ' || SRC[q] == '\t' || SRC[q] == '\r') {
+            q += 1;
+        }
+        q == e || (q + 1 < e && SRC[q] == '/' && SRC[q + 1] == '/')
+    }
+}
+
+// The edits of the `use` items: the names removed, the paths rewritten.
+pub fn emit_use_edits() {
+    unsafe {
+        for i in 0..DROP_USES.count {
+            let u = DROP_USES.data[i];
+            let n = NODES[u].count;
+            let mut gone = 0;
+            for k in 0..n {
+                if DROPPED.get(child(u, k)) != 0 {
+                    gone += 1;
+                }
+            }
+            if gone == n {
+                let head = node_head(NODES[u].start);
+                if alone_on_lines(head, NODES[u].end) {
+                    delete_lines(line_start(head), NODES[u].end);
+                } else {
+                    put_edit(head, NODES[u].end, buf_new());
+                }
+                continue;
+            }
+            // (each name with what follows it up to the next; the last ones
+            // from the end of the one before)
+            let mut last_kept = -1;
+            for k in 0..n {
+                if DROPPED.get(child(u, k)) == 0 {
+                    last_kept = k;
+                }
+            }
+            if n - gone == 1 && crate::refactor_mod::braced(u) && line_start(NODES[u].start) == line_start(NODES[u].end) {
+                // (one name left: `use p::{a};` is `use p::a;`)
+                let mut open = NODES[NODES[u].c].end;
+                while SRC[open] != '{' {
+                    open += 1;
+                }
+                let mut close = NODES[u].end;
+                while SRC[close] != '}' {
+                    close -= 1;
+                }
+                let kept = child(u, last_kept);
+                put_edit(open, close + 1, text_of(SRC[NODES[kept].start..NODES[kept].end]));
+                continue;
+            }
+            for k in 0..n {
+                if DROPPED.get(child(u, k)) == 0 {
+                    continue;
+                }
+                if k < last_kept {
+                    put_edit(NODES[child(u, k)].start, NODES[child(u, k + 1)].start, buf_new());
+                } else {
+                    put_edit(NODES[child(u, last_kept)].end, NODES[child(u, n - 1)].end, buf_new());
+                    break;
+                }
+            }
+        }
+        for u in 1..NODE_COUNT {
+            let t = REPATH.get(u);
+            if t != 0 && NODES[u].kind == NodeKind::Use {
+                // (the path's segments: its node goes on to the names)
+                let c = NODES[u].c;
+                put_edit(NODES[c].start, NODES[child(c, NODES[c].count - 1)].end, t);
+            }
+        }
+    }
+}

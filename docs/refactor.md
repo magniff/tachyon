@@ -321,7 +321,8 @@ every command.
 - Phase 2 (0.11): `refactor signature`, `field`, `variant`, the typed
   `rewrite` and `refactor --script` are in
   [refactor-shape.md](refactor-shape.md); `refactor rename`, `move`,
-  `new-module`, `move-module`, `split` are next; all on this engine
+  `new-module`, `move-module`, `split` in
+  [refactor-modules.md](refactor-modules.md); all on this engine
   (`edit_replace`, `edit_new_file`, `apply_edit` in
   compiler/src/edit.tach), and a command registered in
   compiler/src/commands.tach runs in scripts too.

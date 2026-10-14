@@ -24,6 +24,10 @@ sed, head, cat or awk ([docs/query.md](docs/query.md)):
 | add, remove, rename or retype a field, with every literal and access | `target/tachyonc refactor field STRUCT --add 'g: i64 = 0'` (`--remove g`, `--rename g h`, `--type g T`) |
 | add a variant (an arm in each match that needs one), remove, rename one | `target/tachyonc refactor variant ENUM --add 'X(i64)' --arm 'EXPR'` (`--remove V`, `--rename V W`) |
 | replace an idiom everywhere, typed | `target/tachyonc rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: *IntVec' --dry-run` |
+| rename anything (a module: its file too), with every reference | `target/tachyonc refactor rename PATH NEW` |
+| move items to another module, imports and `pub` fixed | `target/tachyonc refactor move PATH... --to MODULE` |
+| make a module; move one (file, folder, paths) | `target/tachyonc refactor new-module crate::a::b`, `refactor move-module crate::a crate::x::a` |
+| split a module into files | `target/tachyonc refactor split MODULE --plan` (then `--auto`, or `--into M --items a,b`) |
 | several changes, checked once, all or nothing | `target/tachyonc refactor --script steps.txt` (one command per line) |
 | the errors, one per line (front end only) | `target/tachyonc check` |
 | missing/unused imports, `pub`, `unsafe` blocks | `target/tachyonc fix` (`--only imports,unused,pub,unsafe`, `--in FILE\|MODULE`, `--dry-run`) |
