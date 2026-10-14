@@ -64,8 +64,10 @@ fn is_order(c: Cond) -> bool {
 // A comparison instruction outside any block, for a fact.
 fn fact_cmp(cond: Cond, ty: i64, a: i64, b: i64) -> i64 {
     let v = ir_make(Op::Cmp, TY_BOOL, a, b, 0);
-    INSTS[v].cond = cond;
-    INSTS[v].imm2 = ty;
+    unsafe {
+        INSTS[v].cond = cond;
+        INSTS[v].imm2 = ty;
+    }
     v
 }
 
@@ -87,7 +89,7 @@ fn make_loop_facts() {
         if loop_preheader(l) != 0 && loop_latch(l) != 0
             && counted_loop(l, &iv, &step, &n, &ne) && !ne {
             let latch = loop_latch(l);
-            let ty = INSTS[BLOCKS[latch].cond].imm2;
+            let ty = unsafe { INSTS[BLOCKS[latch].cond].imm2 };
             let start = iv_start(l, iv);
             if step == 1 {
                 lt = fact_cmp(Lt, ty, iv, n);
@@ -104,53 +106,57 @@ fn make_loop_facts() {
 
 // The facts at the start of block b into FACTS.
 fn collect_facts(b: i64) {
-    FACTS.count = 0;
-    let mut x = b;
-    let mut steps = 0;
-    while steps < 64 {
-        steps += 1;
-        if BLOCKS[x].preds.count == 1 {
-            let p = BLOCKS[x].preds.data[0];
-            edge_fact(p, x);
+    unsafe {
+        FACTS.count = 0;
+        let mut x = b;
+        let mut steps = 0;
+        while steps < 64 {
+            steps += 1;
+            if BLOCKS[x].preds.count == 1 {
+                let p = BLOCKS[x].preds.data[0];
+                edge_fact(p, x);
+            }
+            let up = BLOCKS[x].idom;
+            if up == x || up == 0 {
+                break;
+            }
+            x = up;
         }
-        let up = BLOCKS[x].idom;
-        if up == x || up == 0 {
-            break;
+        let mut l = innermost_loop(b);
+        while l >= 0 {
+            if l < LOOP_FACT_LT.count && LOOP_FACT_LT.data[l] != 0 {
+                FACTS.push(LOOP_FACT_LT.data[l]);
+                FACTS.push(1);
+                FACTS.push(LOOP_FACT_GE.data[l]);
+                FACTS.push(1);
+            }
+            l = LP_PARENT.data[l];
         }
-        x = up;
-    }
-    let mut l = innermost_loop(b);
-    while l >= 0 {
-        if l < LOOP_FACT_LT.count && LOOP_FACT_LT.data[l] != 0 {
-            FACTS.push(LOOP_FACT_LT.data[l]);
-            FACTS.push(1);
-            FACTS.push(LOOP_FACT_GE.data[l]);
-            FACTS.push(1);
-        }
-        l = LP_PARENT.data[l];
     }
 }
 
 // The fact the edge p -> x gives (x reached by it), if any.
 fn edge_fact(p: i64, x: i64) {
-    if BLOCKS[p].term == Term::Branch && BLOCKS[p].s0 != BLOCKS[p].s1 {
-        FACTS.push(ir_val(BLOCKS[p].cond));
-        FACTS.push(if BLOCKS[p].s0 == x { 1 } else { 0 });
-    } else if BLOCKS[p].term == Term::Switch && BLOCKS[p].s0 != x {
-        // x is the target of exactly one case: the value is that case's.
-        let mut found = -1;
-        let mut count = 0;
-        for i in 0..BLOCKS[p].ncases {
-            if case_target(p, i) == x {
-                found = i;
-                count += 1;
+    unsafe {
+        if BLOCKS[p].term == Term::Branch && BLOCKS[p].s0 != BLOCKS[p].s1 {
+            FACTS.push(ir_val(BLOCKS[p].cond));
+            FACTS.push(if BLOCKS[p].s0 == x { 1 } else { 0 });
+        } else if BLOCKS[p].term == Term::Switch && BLOCKS[p].s0 != x {
+            // x is the target of exactly one case: the value is that case's.
+            let mut found = -1;
+            let mut count = 0;
+            for i in 0..BLOCKS[p].ncases {
+                if case_target(p, i) == x {
+                    found = i;
+                    count += 1;
+                }
             }
-        }
-        if count == 1 {
-            let v = ir_val(BLOCKS[p].cond);
-            let ty = INSTS[v].ty;
-            FACTS.push(fact_cmp(Eq, ty, v, fact_const(case_value(p, found), ty)));
-            FACTS.push(1);
+            if count == 1 {
+                let v = ir_val(BLOCKS[p].cond);
+                let ty = INSTS[v].ty;
+                FACTS.push(fact_cmp(Eq, ty, v, fact_const(case_value(p, found), ty)));
+                FACTS.push(1);
+            }
         }
     }
 }
@@ -158,12 +164,14 @@ fn edge_fact(p: i64, x: i64) {
 // v with conversions between 64-bit integer types (which change no bits)
 // looked through: values equal as bits compare equal.
 pub fn bits_of_value(v: i64) -> i64 {
-    let mut x = ir_val(v);
-    while INSTS[x].op == Op::Conv && is_integer(INSTS[x].ty) && is_integer(INSTS[x].imm2)
-        && int_bits(INSTS[x].ty) == 64 && int_bits(INSTS[x].imm2) == 64 {
-        x = ir_val(INSTS[x].a);
+    unsafe {
+        let mut x = ir_val(v);
+        while INSTS[x].op == Op::Conv && is_integer(INSTS[x].ty) && is_integer(INSTS[x].imm2)
+            && int_bits(INSTS[x].ty) == 64 && int_bits(INSTS[x].imm2) == 64 {
+            x = ir_val(INSTS[x].a);
+        }
+        x
     }
-    x
 }
 
 // ---- Ranges ----
@@ -201,105 +209,107 @@ fn type_max(ty: i64) -> i64 {
 
 // The range of v (context-free): *lo and *hi.
 fn range_of(v: i64, lo: *i64, hi: *i64, depth: i64) {
-    let ty = INSTS[v].ty;
-    *lo = type_min(ty);
-    *hi = type_max(ty);
-    let op = INSTS[v].op;
-    if op == Op::Const {
-        *lo = INSTS[v].imm;
-        *hi = INSTS[v].imm;
-        return;
-    }
-    if depth > 6 || !is_integer(ty) {
-        return;
-    }
-    let a = INSTS[v].a;
-    let b = INSTS[v].b;
-    if op == Op::And {
-        let m = if is_const(b) { INSTS[b].imm } else if is_const(a) { INSTS[a].imm } else { -1 };
-        if m >= 0 {
-            *lo = 0;
-            if m < *hi {
-                *hi = m;
-            }
+    unsafe {
+        let ty = INSTS[v].ty;
+        *lo = type_min(ty);
+        *hi = type_max(ty);
+        let op = INSTS[v].op;
+        if op == Op::Const {
+            *lo = INSTS[v].imm;
+            *hi = INSTS[v].imm;
+            return;
         }
-    } else if op == Op::Rem && is_const(b) && INSTS[b].imm != 0 {
-        let c = INSTS[b].imm;
-        if !is_signed(ty) && c > 0 {
-            *lo = 0;
-            *hi = c - 1;
-        } else if is_signed(ty) && c > 0 - 9223372036854775807 {
-            let m = if c < 0 { 0 - c } else { c };
-            let mut alo = 0;
-            let mut ahi = 0;
-            range_with_facts(a, &alo, &ahi, depth + 1);
-            *lo = if alo >= 0 { 0 } else { 1 - m };
-            *hi = if ahi <= 0 { 0 } else { m - 1 };
+        if depth > 6 || !is_integer(ty) {
+            return;
         }
-    } else if op == Op::Shr && is_const(b) && !is_signed(ty) {
-        let k = shift_amount(INSTS[b].imm, ty);
-        if k > 0 {
-            *lo = 0;
-            let max = if int_bits(ty) == 64 { 0 - 1 } else { type_max(ty) };
-            *hi = ((max as u64) >> k) as i64;
-        }
-    } else if op == Op::Conv && is_integer(INSTS[v].imm2) {
-        let from = INSTS[v].imm2;
-        if int_bits(from) < int_bits(ty) || (int_bits(from) == int_bits(ty) && is_signed(from) == is_signed(ty)) {
-            let mut alo = 0;
-            let mut ahi = 0;
-            range_with_facts(a, &alo, &ahi, depth + 1);
-            // Widening keeps the value when it fits the new type.
-            if alo >= type_min(ty) && ahi <= type_max(ty) && (is_signed(ty) || alo >= 0) {
-                *lo = alo;
-                *hi = ahi;
-            }
-        }
-    } else if op == Op::Add || op == Op::Sub || op == Op::Mul || op == Op::Shl {
-        // Interval arithmetic on the operands' ranges (with the facts of
-        // the block applied to them), given up when a bound could leave
-        // the type or overflow.
-        let mut alo = 0;
-        let mut ahi = 0;
-        let mut blo = 0;
-        let mut bhi = 0;
-        range_with_facts(a, &alo, &ahi, depth + 1);
-        range_with_facts(b, &blo, &bhi, depth + 1);
-        let big = 4611686018427387904;
-        let small = 2147483648;
-        let mut rlo = 0;
-        let mut rhi = 0;
-        let mut ok = false;
-        if op == Op::Add || op == Op::Sub {
-            if alo > 0 - big && ahi < big && blo > 0 - big && bhi < big {
-                ok = true;
-                if op == Op::Add {
-                    rlo = alo + blo;
-                    rhi = ahi + bhi;
-                } else {
-                    rlo = alo - bhi;
-                    rhi = ahi - blo;
+        let a = INSTS[v].a;
+        let b = INSTS[v].b;
+        if op == Op::And {
+            let m = if is_const(b) { INSTS[b].imm } else if is_const(a) { INSTS[a].imm } else { -1 };
+            if m >= 0 {
+                *lo = 0;
+                if m < *hi {
+                    *hi = m;
                 }
             }
-        } else if op == Op::Mul {
-            if alo > 0 - small && ahi < small && blo > 0 - small && bhi < small {
-                ok = true;
-                let p1 = alo * blo;
-                let p2 = alo * bhi;
-                let p3 = ahi * blo;
-                let p4 = ahi * bhi;
-                rlo = lesser(lesser(p1, p2), lesser(p3, p4));
-                rhi = greater(greater(p1, p2), greater(p3, p4));
+        } else if op == Op::Rem && is_const(b) && INSTS[b].imm != 0 {
+            let c = INSTS[b].imm;
+            if !is_signed(ty) && c > 0 {
+                *lo = 0;
+                *hi = c - 1;
+            } else if is_signed(ty) && c > 0 - 9223372036854775807 {
+                let m = if c < 0 { 0 - c } else { c };
+                let mut alo = 0;
+                let mut ahi = 0;
+                range_with_facts(a, &alo, &ahi, depth + 1);
+                *lo = if alo >= 0 { 0 } else { 1 - m };
+                *hi = if ahi <= 0 { 0 } else { m - 1 };
             }
-        } else if blo == bhi && blo >= 0 && blo < 32 && alo >= 0 && ahi < small {
-            ok = true;
-            rlo = alo << blo as u64;
-            rhi = ahi << blo as u64;
-        }
-        if ok && rlo >= type_min(ty) && rhi <= type_max(ty)
-            && (is_signed(ty) || int_bits(ty) < 64 || rlo >= 0) {
-            *lo = rlo;
-            *hi = rhi;
+        } else if op == Op::Shr && is_const(b) && !is_signed(ty) {
+            let k = shift_amount(INSTS[b].imm, ty);
+            if k > 0 {
+                *lo = 0;
+                let max = if int_bits(ty) == 64 { 0 - 1 } else { type_max(ty) };
+                *hi = ((max as u64) >> k) as i64;
+            }
+        } else if op == Op::Conv && is_integer(INSTS[v].imm2) {
+            let from = INSTS[v].imm2;
+            if int_bits(from) < int_bits(ty) || (int_bits(from) == int_bits(ty) && is_signed(from) == is_signed(ty)) {
+                let mut alo = 0;
+                let mut ahi = 0;
+                range_with_facts(a, &alo, &ahi, depth + 1);
+                // Widening keeps the value when it fits the new type.
+                if alo >= type_min(ty) && ahi <= type_max(ty) && (is_signed(ty) || alo >= 0) {
+                    *lo = alo;
+                    *hi = ahi;
+                }
+            }
+        } else if op == Op::Add || op == Op::Sub || op == Op::Mul || op == Op::Shl {
+            // Interval arithmetic on the operands' ranges (with the facts of
+            // the block applied to them), given up when a bound could leave
+            // the type or overflow.
+            let mut alo = 0;
+            let mut ahi = 0;
+            let mut blo = 0;
+            let mut bhi = 0;
+            range_with_facts(a, &alo, &ahi, depth + 1);
+            range_with_facts(b, &blo, &bhi, depth + 1);
+            let big = 4611686018427387904;
+            let small = 2147483648;
+            let mut rlo = 0;
+            let mut rhi = 0;
+            let mut ok = false;
+            if op == Op::Add || op == Op::Sub {
+                if alo > 0 - big && ahi < big && blo > 0 - big && bhi < big {
+                    ok = true;
+                    if op == Op::Add {
+                        rlo = alo + blo;
+                        rhi = ahi + bhi;
+                    } else {
+                        rlo = alo - bhi;
+                        rhi = ahi - blo;
+                    }
+                }
+            } else if op == Op::Mul {
+                if alo > 0 - small && ahi < small && blo > 0 - small && bhi < small {
+                    ok = true;
+                    let p1 = alo * blo;
+                    let p2 = alo * bhi;
+                    let p3 = ahi * blo;
+                    let p4 = ahi * bhi;
+                    rlo = lesser(lesser(p1, p2), lesser(p3, p4));
+                    rhi = greater(greater(p1, p2), greater(p3, p4));
+                }
+            } else if blo == bhi && blo >= 0 && blo < 32 && alo >= 0 && ahi < small {
+                ok = true;
+                rlo = alo << blo as u64;
+                rhi = ahi << blo as u64;
+            }
+            if ok && rlo >= type_min(ty) && rhi <= type_max(ty)
+                && (is_signed(ty) || int_bits(ty) < 64 || rlo >= 0) {
+                *lo = rlo;
+                *hi = rhi;
+            }
         }
     }
 }
@@ -341,65 +351,67 @@ pub fn value_range_at(v: i64, b: i64, lo: *i64, hi: *i64) {
 // Narrows [*lo, *hi], the range of v, by the facts in FACTS comparing v
 // with a constant.
 fn narrow_by_facts(v: i64, lo: *i64, hi: *i64) {
-    let mut i = 0;
-    while i < FACTS.count {
-        let f = FACTS.data[i];
-        let holds = FACTS.data[i + 1] != 0;
-        i += 2;
-        if INSTS[f].op != Op::Cmp || !is_integer(INSTS[f].imm2) {
-            continue;
-        }
-        let mut cond = INSTS[f].cond;
-        if !holds {
-            cond = cond.negate();
-        }
-        let fa = bits_of_value(INSTS[f].a);
-        let fb = bits_of_value(INSTS[f].b);
-        let mut k = 0;
-        if fa == bits_of_value(v) && is_const(fb) {
-            k = INSTS[fb].imm;
-        } else if fb == bits_of_value(v) && is_const(fa) {
-            k = INSTS[fa].imm;
-            cond = cond.mirror();
-        } else {
-            continue;
-        }
-        let signed = is_signed(INSTS[f].imm2);
-        let min = 0 - 9223372036854775807 - 1;
-        let max = 9223372036854775807;
-        match cond {
-            Eq => {
-                *lo = k;
-                *hi = k;
+    unsafe {
+        let mut i = 0;
+        while i < FACTS.count {
+            let f = FACTS.data[i];
+            let holds = FACTS.data[i + 1] != 0;
+            i += 2;
+            if INSTS[f].op != Op::Cmp || !is_integer(INSTS[f].imm2) {
+                continue;
             }
-            Ne => {
-                if *lo == k && k != max {
-                    *lo = k + 1;
-                } else if *hi == k && k != min {
-                    *hi = k - 1;
+            let mut cond = INSTS[f].cond;
+            if !holds {
+                cond = cond.negate();
+            }
+            let fa = bits_of_value(INSTS[f].a);
+            let fb = bits_of_value(INSTS[f].b);
+            let mut k = 0;
+            if fa == bits_of_value(v) && is_const(fb) {
+                k = INSTS[fb].imm;
+            } else if fb == bits_of_value(v) && is_const(fa) {
+                k = INSTS[fa].imm;
+                cond = cond.mirror();
+            } else {
+                continue;
+            }
+            let signed = is_signed(INSTS[f].imm2);
+            let min = 0 - 9223372036854775807 - 1;
+            let max = 9223372036854775807;
+            match cond {
+                Eq => {
+                    *lo = k;
+                    *hi = k;
                 }
-            }
-            Lt | Le => {
-                let bound = if cond == Lt { if k == min { min } else { k - 1 } } else { k };
-                if signed || (k >= 0 && *lo >= 0) {
-                    if bound < *hi {
-                        *hi = bound;
-                    }
-                } else if k >= 0 {
-                    // Unsigned: below a non-negative bound, so non-negative.
-                    if *lo < 0 {
-                        *lo = 0;
-                    }
-                    if bound < *hi {
-                        *hi = bound;
+                Ne => {
+                    if *lo == k && k != max {
+                        *lo = k + 1;
+                    } else if *hi == k && k != min {
+                        *hi = k - 1;
                     }
                 }
-            }
-            _ => {
-                let bound = if cond == Gt { if k == max { max } else { k + 1 } } else { k };
-                if signed || (k >= 0 && *lo >= 0) {
-                    if bound > *lo {
-                        *lo = bound;
+                Lt | Le => {
+                    let bound = if cond == Lt { if k == min { min } else { k - 1 } } else { k };
+                    if signed || (k >= 0 && *lo >= 0) {
+                        if bound < *hi {
+                            *hi = bound;
+                        }
+                    } else if k >= 0 {
+                        // Unsigned: below a non-negative bound, so non-negative.
+                        if *lo < 0 {
+                            *lo = 0;
+                        }
+                        if bound < *hi {
+                            *hi = bound;
+                        }
+                    }
+                }
+                _ => {
+                    let bound = if cond == Gt { if k == max { max } else { k + 1 } } else { k };
+                    if signed || (k >= 0 && *lo >= 0) {
+                        if bound > *lo {
+                            *lo = bound;
+                        }
                     }
                 }
             }
@@ -425,72 +437,74 @@ fn interval_outcomes(alo: i64, ahi: i64, blo: i64, bhi: i64) -> i64 {
 // Whether comparison or bool c holds at a block with facts FACTS: 1 true,
 // 0 false, -1 unknown.
 fn decide(c: i64) -> i64 {
-    let mut i = 0;
-    while i < FACTS.count {
-        if FACTS.data[i] == c {
-            return FACTS.data[i + 1];
+    unsafe {
+        let mut i = 0;
+        while i < FACTS.count {
+            if FACTS.data[i] == c {
+                return FACTS.data[i + 1];
+            }
+            i += 2;
         }
-        i += 2;
-    }
-    if INSTS[c].op != Op::Cmp || !is_integer(INSTS[c].imm2) {
-        return -1;
-    }
-    let a = bits_of_value(INSTS[c].a);
-    let b = bits_of_value(INSTS[c].b);
-    let q = cond_set(INSTS[c].cond);
-    let signed = is_signed(INSTS[c].imm2);
-    let mut alo = 0;
-    let mut ahi = 0;
-    let mut blo = 0;
-    let mut bhi = 0;
-    range_at(a, &alo, &ahi);
-    range_at(b, &blo, &bhi);
-    let nonneg = alo >= 0 && blo >= 0;
-    let mut outcomes = 7;
-    if a == b {
-        outcomes = 2;
-    }
-    if signed || nonneg || !is_order(INSTS[c].cond) {
-        outcomes &= interval_outcomes(alo, ahi, blo, bhi);
-    }
-    i = 0;
-    while i < FACTS.count {
-        let f = FACTS.data[i];
-        let holds = FACTS.data[i + 1] != 0;
-        i += 2;
-        if INSTS[f].op != Op::Cmp || !is_integer(INSTS[f].imm2) {
-            continue;
+        if INSTS[c].op != Op::Cmp || !is_integer(INSTS[c].imm2) {
+            return -1;
         }
-        let fa = bits_of_value(INSTS[f].a);
-        let fb = bits_of_value(INSTS[f].b);
-        let mut fs = cond_set(INSTS[f].cond);
-        if !holds {
-            fs = 7 & ~fs;
+        let a = bits_of_value(INSTS[c].a);
+        let b = bits_of_value(INSTS[c].b);
+        let q = cond_set(INSTS[c].cond);
+        let signed = is_signed(INSTS[c].imm2);
+        let mut alo = 0;
+        let mut ahi = 0;
+        let mut blo = 0;
+        let mut bhi = 0;
+        range_at(a, &alo, &ahi);
+        range_at(b, &blo, &bhi);
+        let nonneg = alo >= 0 && blo >= 0;
+        let mut outcomes = 7;
+        if a == b {
+            outcomes = 2;
         }
-        if fa == b && fb == a {
-            fs = mirror_set(fs);
-        } else if fa != a || fb != b {
-            continue;
+        if signed || nonneg || !is_order(INSTS[c].cond) {
+            outcomes &= interval_outcomes(alo, ahi, blo, bhi);
         }
-        let fsigned = is_signed(INSTS[f].imm2);
-        if fs == 2 || fs == 5 || fsigned == signed || nonneg {
-            outcomes &= fs;
-        } else if fsigned && !signed && alo >= 0 && (fs & 4) == 0 {
-            // a <s b (or <=) with a >= 0: both are non-negative, and the
-            // unsigned order is the same.
-            outcomes &= fs;
+        i = 0;
+        while i < FACTS.count {
+            let f = FACTS.data[i];
+            let holds = FACTS.data[i + 1] != 0;
+            i += 2;
+            if INSTS[f].op != Op::Cmp || !is_integer(INSTS[f].imm2) {
+                continue;
+            }
+            let fa = bits_of_value(INSTS[f].a);
+            let fb = bits_of_value(INSTS[f].b);
+            let mut fs = cond_set(INSTS[f].cond);
+            if !holds {
+                fs = 7 & ~fs;
+            }
+            if fa == b && fb == a {
+                fs = mirror_set(fs);
+            } else if fa != a || fb != b {
+                continue;
+            }
+            let fsigned = is_signed(INSTS[f].imm2);
+            if fs == 2 || fs == 5 || fsigned == signed || nonneg {
+                outcomes &= fs;
+            } else if fsigned && !signed && alo >= 0 && (fs & 4) == 0 {
+                // a <s b (or <=) with a >= 0: both are non-negative, and the
+                // unsigned order is the same.
+                outcomes &= fs;
+            }
         }
+        if outcomes == 0 {
+            return -1;
+        }
+        if (outcomes & ~q) == 0 {
+            return 1;
+        }
+        if (outcomes & q) == 0 {
+            return 0;
+        }
+        -1
     }
-    if outcomes == 0 {
-        return -1;
-    }
-    if (outcomes & ~q) == 0 {
-        return 1;
-    }
-    if (outcomes & q) == 0 {
-        return 0;
-    }
-    -1
 }
 
 // ---- The pass ----
@@ -499,98 +513,104 @@ fn decide(c: i64) -> i64 {
 // threads edges past blocks whose test the edge decides, and turns chains
 // of equality tests into switches. Returns whether anything changed.
 pub fn fold_by_ranges(fi: i64) -> bool {
-    IRF = fi;
-    resolve_all(fi);
-    analyze_loops(fi);
-    make_loop_facts();
-    let mut changed = false;
-    for round in 0..3 {
-        if round > 0 {
-            resolve_all(fi);
-            analyze_loops(fi);
-        }
-        let mut folded = false;
-        for i in 0..IRFUNCS[fi].blocks.count {
-            let b = IRFUNCS[fi].blocks.data[i];
-            if BLOCKS[b].removed != 0 || BLOCKS[b].order < 0 || BLOCKS[b].term != Term::Branch {
-                continue;
-            }
-            let c = ir_val(BLOCKS[b].cond);
-            if is_const(c) {
-                continue;
-            }
-            let d = decide_branch(b, c);
-            if d >= 0 {
-                let k = ir_make(Op::Const, TY_BOOL, 0, 0, d);
-                ir_append(b, k);
-                BLOCKS[b].cond = k;
-                folded = true;
-            }
-        }
-        if folded {
-            simplify_cfg(fi);
-        }
-        let threaded = thread_implied(fi);
-        if !folded && !threaded {
-            break;
-        }
-        changed = true;
-    }
-    if chains_to_switches(fi) {
-        changed = true;
-    }
-    if changed {
+    unsafe {
+        IRF = fi;
         resolve_all(fi);
-        remove_unreachable(fi);
-        remove_trivial_phis(fi);
-        verify_func(fi, c"value ranges");
+        analyze_loops(fi);
+        make_loop_facts();
+        let mut changed = false;
+        for round in 0..3 {
+            if round > 0 {
+                resolve_all(fi);
+                analyze_loops(fi);
+            }
+            let mut folded = false;
+            for i in 0..IRFUNCS[fi].blocks.count {
+                let b = IRFUNCS[fi].blocks.data[i];
+                if BLOCKS[b].removed != 0 || BLOCKS[b].order < 0 || BLOCKS[b].term != Term::Branch {
+                    continue;
+                }
+                let c = ir_val(BLOCKS[b].cond);
+                if is_const(c) {
+                    continue;
+                }
+                let d = decide_branch(b, c);
+                if d >= 0 {
+                    let k = ir_make(Op::Const, TY_BOOL, 0, 0, d);
+                    ir_append(b, k);
+                    BLOCKS[b].cond = k;
+                    folded = true;
+                }
+            }
+            if folded {
+                simplify_cfg(fi);
+            }
+            let threaded = thread_implied(fi);
+            if !folded && !threaded {
+                break;
+            }
+            changed = true;
+        }
+        if chains_to_switches(fi) {
+            changed = true;
+        }
+        if changed {
+            resolve_all(fi);
+            remove_unreachable(fi);
+            remove_trivial_phis(fi);
+            verify_func(fi, c"value ranges");
+        }
+        changed
     }
-    changed
 }
 
 // Whether the condition c of block b's branch is decided: by the facts at
 // b, or, for a phi of b, by the facts on each incoming edge alike.
 fn decide_branch(b: i64, c: i64) -> i64 {
-    collect_facts(b);
-    let d = decide(c);
-    if d >= 0 || INSTS[c].op != Op::Phi || INSTS[c].block != b {
-        return d;
-    }
-    let mut all = -1;
-    for k in 0..INSTS[c].nargs {
-        let p = BLOCKS[b].preds.data[k];
-        if BLOCKS[p].term == Term::Switch
-            || (BLOCKS[p].term == Term::Branch && BLOCKS[p].s0 == BLOCKS[p].s1) {
-            return -1;
+    unsafe {
+        collect_facts(b);
+        let d = decide(c);
+        if d >= 0 || INSTS[c].op != Op::Phi || INSTS[c].block != b {
+            return d;
         }
-        collect_facts(p);
-        edge_fact(p, b);
-        let dk = decide(ir_val(ir_arg(c, k)));
-        if dk < 0 || (all >= 0 && dk != all) {
-            return -1;
+        let mut all = -1;
+        for k in 0..INSTS[c].nargs {
+            let p = BLOCKS[b].preds.data[k];
+            if BLOCKS[p].term == Term::Switch
+                || (BLOCKS[p].term == Term::Branch && BLOCKS[p].s0 == BLOCKS[p].s1) {
+                return -1;
+            }
+            collect_facts(p);
+            edge_fact(p, b);
+            let dk = decide(ir_val(ir_arg(c, k)));
+            if dk < 0 || (all >= 0 && dk != all) {
+                return -1;
+            }
+            all = dk;
         }
-        all = dk;
+        all
     }
-    all
 }
 
 // A block that only tests: no phis, its instructions pure (or constants)
 // and used by its own branch alone.
 fn is_test_block(fi: i64, j: i64) -> bool {
-    if BLOCKS[j].term != Term::Branch || j == IRFUNCS[fi].entry || BLOCKS[j].s0 == BLOCKS[j].s1 {
-        return false;
-    }
-    let mut v = BLOCKS[j].first;
-    let mut n = 0;
-    while v != 0 {
-        let op = INSTS[v].op;
-        if op != Op::Const && !op.is_pure() {
+    unsafe {
+        if BLOCKS[j].term != Term::Branch || j == IRFUNCS[fi].entry || BLOCKS[j].s0 == BLOCKS[j].s1 {
             return false;
         }
-        n += 1;
-        v = INSTS[v].next;
+        let mut v = BLOCKS[j].first;
+        let mut n = 0;
+        while v != 0 {
+            let op = INSTS[v].op;
+            if op != Op::Const && !op.is_pure() {
+                return false;
+            }
+            n += 1;
+            v = INSTS[v].next;
+        }
+        n <= 4 && !used_outside_block(fi, j)
     }
-    n <= 4 && !used_outside_block(fi, j)
 }
 
 // Per block id: whether a value defined in it is used in another block
@@ -599,25 +619,27 @@ static mut EXPORTS: *i64 = 0 as *i64;
 static mut EXPORTS_CAP: i64 = 0;
 
 fn compute_exports(fi: i64) {
-    EXPORTS = block_array(EXPORTS, &EXPORTS_CAP, fi);
-    for i in 0..IRFUNCS[fi].blocks.count {
-        let b = IRFUNCS[fi].blocks.data[i];
-        if BLOCKS[b].removed != 0 {
-            continue;
-        }
-        let mut v = BLOCKS[b].first;
-        while v != 0 {
-            for k in 0..ir_operand_count(v) {
-                let w = ir_operand(v, k);
-                if w != 0 && INSTS[w].block != 0 && INSTS[w].block != b {
-                    EXPORTS[INSTS[w].block] = 1;
-                }
+    unsafe {
+        EXPORTS = block_array(EXPORTS, &EXPORTS_CAP, fi);
+        for i in 0..IRFUNCS[fi].blocks.count {
+            let b = IRFUNCS[fi].blocks.data[i];
+            if BLOCKS[b].removed != 0 {
+                continue;
             }
-            v = INSTS[v].next;
-        }
-        let c = BLOCKS[b].cond;
-        if c != 0 && INSTS[c].block != 0 && INSTS[c].block != b {
-            EXPORTS[INSTS[c].block] = 1;
+            let mut v = BLOCKS[b].first;
+            while v != 0 {
+                for k in 0..ir_operand_count(v) {
+                    let w = ir_operand(v, k);
+                    if w != 0 && INSTS[w].block != 0 && INSTS[w].block != b {
+                        EXPORTS[INSTS[w].block] = 1;
+                    }
+                }
+                v = INSTS[v].next;
+            }
+            let c = BLOCKS[b].cond;
+            if c != 0 && INSTS[c].block != 0 && INSTS[c].block != b {
+                EXPORTS[INSTS[c].block] = 1;
+            }
         }
     }
 }
@@ -625,7 +647,7 @@ fn compute_exports(fi: i64) {
 // Whether a value defined in block j is used in another block.
 fn used_outside_block(fi: i64, j: i64) -> bool {
     let _ = fi;
-    j >= BLOCK_COUNT || EXPORTS[j] != 0
+    unsafe { j >= BLOCK_COUNT || EXPORTS[j] != 0 }
 }
 
 // Jump threading: a predecessor p of a test block j, where the test is
@@ -637,50 +659,52 @@ fn thread_implied(fi: i64) -> bool {
     for _ in 0..1000 {
         let mut did = false;
         compute_dominators(fi);
-        for i in 0..IRFUNCS[fi].blocks.count {
-            if did {
-                break;
-            }
-            let j = IRFUNCS[fi].blocks.data[i];
-            if BLOCKS[j].removed != 0 || BLOCKS[j].order < 0 || BLOCKS[j].preds.count < 2 {
-                continue;
-            }
-            if !is_test_block(fi, j) {
-                continue;
-            }
-            let c = ir_val(BLOCKS[j].cond);
-            let mut k = 0;
-            while k < BLOCKS[j].preds.count {
-                let p = BLOCKS[j].preds.data[k];
-                k += 1;
-                if BLOCKS[p].term == Term::Switch || BLOCKS[p].order < 0
-                    || (BLOCKS[p].term == Term::Branch && BLOCKS[p].s0 == BLOCKS[p].s1) {
+        unsafe {
+            for i in 0..IRFUNCS[fi].blocks.count {
+                if did {
+                    break;
+                }
+                let j = IRFUNCS[fi].blocks.data[i];
+                if BLOCKS[j].removed != 0 || BLOCKS[j].order < 0 || BLOCKS[j].preds.count < 2 {
                     continue;
                 }
-                collect_facts(p);
-                edge_fact(p, j);
-                let d = decide(c);
-                if d < 0 {
+                if !is_test_block(fi, j) {
                     continue;
                 }
-                let t = if d == 1 { BLOCKS[j].s0 } else { BLOCKS[j].s1 };
-                if is_succ(p, t) || t == j {
-                    continue;
+                let c = ir_val(BLOCKS[j].cond);
+                let mut k = 0;
+                while k < BLOCKS[j].preds.count {
+                    let p = BLOCKS[j].preds.data[k];
+                    k += 1;
+                    if BLOCKS[p].term == Term::Switch || BLOCKS[p].order < 0
+                        || (BLOCKS[p].term == Term::Branch && BLOCKS[p].s0 == BLOCKS[p].s1) {
+                        continue;
+                    }
+                    collect_facts(p);
+                    edge_fact(p, j);
+                    let d = decide(c);
+                    if d < 0 {
+                        continue;
+                    }
+                    let t = if d == 1 { BLOCKS[j].s0 } else { BLOCKS[j].s1 };
+                    if is_succ(p, t) || t == j {
+                        continue;
+                    }
+                    // p -> t: t's phis take their operand for j.
+                    let index = pred_index(t, j);
+                    let first = LP_VALUES.count;
+                    let mut phi = BLOCKS[t].first;
+                    while phi != 0 && INSTS[phi].op == Op::Phi {
+                        LP_VALUES.push(ir_arg(phi, index));
+                        phi = INSTS[phi].next;
+                    }
+                    redirect_succ(p, j, t);
+                    add_pred_values(t, p, &LP_VALUES, first);
+                    LP_VALUES.count = first;
+                    remove_pred(j, p);
+                    did = true;
+                    break;
                 }
-                // p -> t: t's phis take their operand for j.
-                let index = pred_index(t, j);
-                let first = LP_VALUES.count;
-                let mut phi = BLOCKS[t].first;
-                while phi != 0 && INSTS[phi].op == Op::Phi {
-                    LP_VALUES.push(ir_arg(phi, index));
-                    phi = INSTS[phi].next;
-                }
-                redirect_succ(p, j, t);
-                add_pred_values(t, p, &LP_VALUES, first);
-                LP_VALUES.count = first;
-                remove_pred(j, p);
-                did = true;
-                break;
             }
         }
         if !did {
@@ -701,105 +725,111 @@ const CHAIN_MIN_CASES: i64 = 4;
 // taken when equal) and *other (taken otherwise); 0 when it is not such a
 // test.
 fn equality_test(b: i64, k: *i64, equal: *i64, other: *i64) -> i64 {
-    if BLOCKS[b].term != Term::Branch || BLOCKS[b].s0 == BLOCKS[b].s1 {
-        return 0;
+    unsafe {
+        if BLOCKS[b].term != Term::Branch || BLOCKS[b].s0 == BLOCKS[b].s1 {
+            return 0;
+        }
+        let c = ir_val(BLOCKS[b].cond);
+        if INSTS[c].op != Op::Cmp || !is_integer(INSTS[c].imm2) {
+            return 0;
+        }
+        let cond = INSTS[c].cond;
+        if cond != Eq && cond != Ne {
+            return 0;
+        }
+        let mut x = ir_val(INSTS[c].a);
+        let mut kv = ir_val(INSTS[c].b);
+        if is_const(x) {
+            let t = x;
+            x = kv;
+            kv = t;
+        }
+        if !is_const(kv) || is_const(x) {
+            return 0;
+        }
+        *k = INSTS[kv].imm;
+        if cond == Eq {
+            *equal = BLOCKS[b].s0;
+            *other = BLOCKS[b].s1;
+        } else {
+            *equal = BLOCKS[b].s1;
+            *other = BLOCKS[b].s0;
+        }
+        x
     }
-    let c = ir_val(BLOCKS[b].cond);
-    if INSTS[c].op != Op::Cmp || !is_integer(INSTS[c].imm2) {
-        return 0;
-    }
-    let cond = INSTS[c].cond;
-    if cond != Eq && cond != Ne {
-        return 0;
-    }
-    let mut x = ir_val(INSTS[c].a);
-    let mut kv = ir_val(INSTS[c].b);
-    if is_const(x) {
-        let t = x;
-        x = kv;
-        kv = t;
-    }
-    if !is_const(kv) || is_const(x) {
-        return 0;
-    }
-    *k = INSTS[kv].imm;
-    if cond == Eq {
-        *equal = BLOCKS[b].s0;
-        *other = BLOCKS[b].s1;
-    } else {
-        *equal = BLOCKS[b].s1;
-        *other = BLOCKS[b].s0;
-    }
-    x
 }
 
 // Whether block b holds only constants and the comparison of its branch,
 // none used elsewhere.
 fn only_test(fi: i64, b: i64) -> bool {
-    let c = ir_val(BLOCKS[b].cond);
-    let mut v = BLOCKS[b].first;
-    while v != 0 {
-        if v != c && INSTS[v].op != Op::Const {
-            return false;
+    unsafe {
+        let c = ir_val(BLOCKS[b].cond);
+        let mut v = BLOCKS[b].first;
+        while v != 0 {
+            if v != c && INSTS[v].op != Op::Const {
+                return false;
+            }
+            v = INSTS[v].next;
         }
-        v = INSTS[v].next;
+        !used_outside_block(fi, b)
     }
-    !used_outside_block(fi, b)
 }
 
 fn chains_to_switches(fi: i64) -> bool {
     let mut changed = false;
     compute_dominators(fi);
     compute_exports(fi);
-    for i in 0..IRFUNCS[fi].blocks.count {
-        let b = IRFUNCS[fi].blocks.data[i];
-        if BLOCKS[b].removed != 0 || BLOCKS[b].order < 0
-            || (BLOCKS[b].preds.count == 0 && b != IRFUNCS[fi].entry) {
-            continue;
-        }
-        let mut k = 0;
-        let mut eq = 0;
-        let mut ne = 0;
-        let x = equality_test(b, &k, &eq, &ne);
-        if x == 0 {
-            continue;
-        }
-        // The chain: b, then blocks reached when not equal, each with b's
-        // chain as its only predecessor, testing x against a constant.
-        let mut cases = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        let mut chain = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        cases.push(k);
-        cases.push(eq);
-        chain.push(b);
-        let mut tail = ne;
-        loop {
-            let mut k2 = 0;
-            let mut eq2 = 0;
-            let mut ne2 = 0;
-            if BLOCKS[tail].preds.count != 1 || tail == b || equality_test(tail, &k2, &eq2, &ne2) != x
-                || !only_test(fi, tail) {
-                break;
+    unsafe {
+        for i in 0..IRFUNCS[fi].blocks.count {
+            let b = IRFUNCS[fi].blocks.data[i];
+            if BLOCKS[b].removed != 0 || BLOCKS[b].order < 0
+                || (BLOCKS[b].preds.count == 0 && b != IRFUNCS[fi].entry) {
+                continue;
             }
-            let mut dup = false;
-            for m in 0..cases.count / 2 {
-                if cases.data[2 * m] == k2 {
-                    dup = true;
+            let mut k = 0;
+            let mut eq = 0;
+            let mut ne = 0;
+            let x = equality_test(b, &k, &eq, &ne);
+            if x == 0 {
+                continue;
+            }
+            // The chain: b, then blocks reached when not equal, each with b's
+            // chain as its only predecessor, testing x against a constant.
+            let mut cases = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            let mut chain = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            cases.push(k);
+            cases.push(eq);
+            chain.push(b);
+            let mut tail = ne;
+            loop {
+                let mut k2 = 0;
+                let mut eq2 = 0;
+                let mut ne2 = 0;
+                if BLOCKS[tail].preds.count != 1 || tail == b || equality_test(tail, &k2, &eq2, &ne2) != x
+                    || !only_test(fi, tail) {
+                    break;
                 }
+                let mut dup = false;
+                for m in 0..cases.count / 2 {
+                    if cases.data[2 * m] == k2 {
+                        dup = true;
+                    }
+                }
+                if dup {
+                    break;
+                }
+                cases.push(k2);
+                cases.push(eq2);
+                chain.push(tail);
+                tail = ne2;
             }
-            if dup {
-                break;
+            if cases.count / 2 >= CHAIN_MIN_CASES && chain_targets_ok(&cases, &chain, tail) {
+                make_chain_switch(b, x, &cases, &chain, tail);
+                changed = true;
             }
-            cases.push(k2);
-            cases.push(eq2);
-            chain.push(tail);
-            tail = ne2;
+            free(cases.data as *u8);
+            free(chain.data as *u8);
         }
-        if cases.count / 2 >= CHAIN_MIN_CASES && chain_targets_ok(&cases, &chain, tail) {
-            make_chain_switch(b, x, &cases, &chain, tail);
-            changed = true;
-        }
-        free(cases.data as *u8);
-        free(chain.data as *u8);
     }
     if changed {
         remove_unreachable(fi);
@@ -811,54 +841,58 @@ fn chains_to_switches(fi: i64) -> bool {
 // predecessor: a target reached by several edges of the chain must have no
 // phis; no target is a block of the chain.
 fn chain_targets_ok(cases: *IntVec, chain: *IntVec, default: i64) -> bool {
-    let n = (*cases).count / 2;
-    for i in 0..n + 1 {
-        let t = if i < n { (*cases).data[2 * i + 1] } else { default };
-        for m in 0..(*chain).count {
-            if (*chain).data[m] == t {
+    unsafe {
+        let n = (*cases).count / 2;
+        for i in 0..n + 1 {
+            let t = if i < n { (*cases).data[2 * i + 1] } else { default };
+            for m in 0..(*chain).count {
+                if (*chain).data[m] == t {
+                    return false;
+                }
+            }
+            let mut edges = 0;
+            for m in 0..n + 1 {
+                let u = if m < n { (*cases).data[2 * m + 1] } else { default };
+                if u == t {
+                    edges += 1;
+                }
+            }
+            let first = BLOCKS[t].first;
+            if edges > 1 && first != 0 && INSTS[first].op == Op::Phi {
                 return false;
             }
         }
-        let mut edges = 0;
-        for m in 0..n + 1 {
-            let u = if m < n { (*cases).data[2 * m + 1] } else { default };
-            if u == t {
-                edges += 1;
-            }
-        }
-        let first = BLOCKS[t].first;
-        if edges > 1 && first != 0 && INSTS[first].op == Op::Phi {
-            return false;
-        }
+        true
     }
-    true
 }
 
 fn make_chain_switch(b: i64, x: i64, cases: *IntVec, chain: *IntVec, default: i64) {
-    let n = (*cases).count / 2;
-    // The targets lose the chain blocks as predecessors and get b once.
-    for i in 0..n + 1 {
-        let t = if i < n { (*cases).data[2 * i + 1] } else { default };
-        let from = if i < n { (*chain).data[i] } else { (*chain).data[(*chain).count - 1] };
-        let index = pred_index(t, from);
-        if index < 0 {
-            continue;
+    unsafe {
+        let n = (*cases).count / 2;
+        // The targets lose the chain blocks as predecessors and get b once.
+        for i in 0..n + 1 {
+            let t = if i < n { (*cases).data[2 * i + 1] } else { default };
+            let from = if i < n { (*chain).data[i] } else { (*chain).data[(*chain).count - 1] };
+            let index = pred_index(t, from);
+            if index < 0 {
+                continue;
+            }
+            if pred_index(t, b) >= 0 && b != from {
+                remove_pred_at(t, index);
+            } else {
+                BLOCKS[t].preds.data[index] = b;
+            }
         }
-        if pred_index(t, b) >= 0 && b != from {
-            remove_pred_at(t, index);
-        } else {
-            BLOCKS[t].preds.data[index] = b;
+        // The other chain blocks lose their predecessor (they become
+        // unreachable).
+        for m in 1..(*chain).count {
+            BLOCKS[(*chain).data[m]].preds.count = 0;
         }
+        let mark = SSA_STACK.count;
+        for i in 0..n {
+            SSA_STACK.push((*cases).data[2 * i]);
+            SSA_STACK.push((*cases).data[2 * i + 1]);
+        }
+        ir_switch_no_preds(b, x, default, mark);
     }
-    // The other chain blocks lose their predecessor (they become
-    // unreachable).
-    for m in 1..(*chain).count {
-        BLOCKS[(*chain).data[m]].preds.count = 0;
-    }
-    let mark = SSA_STACK.count;
-    for i in 0..n {
-        SSA_STACK.push((*cases).data[2 * i]);
-        SSA_STACK.push((*cases).data[2 * i + 1]);
-    }
-    ir_switch_no_preds(b, x, default, mark);
 }

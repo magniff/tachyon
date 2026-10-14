@@ -266,6 +266,15 @@ compile_with() { # <cli> <bin> <src> <root> <out>
             "$CC" $LINK_FLAGS -o "$cw_out" "$cw_out.o" -lm || die "$CC failed to link $cw_out.o"
             CW_EMITTED=o
             ;;
+        tachyonc-0.10)
+            # As 0.7: the compiler's own source is in unsafe code (0.10
+            # has no --allow-unsafe; unsafe operations outside unsafe code
+            # are errors).
+            "$cw_bin" --target "$HOST" "$@" -o "$cw_out.o" || die "$cw_bin failed to compile $cw_src"
+            # shellcheck disable=SC2086
+            "$CC" $LINK_FLAGS -o "$cw_out" "$cw_out.o" -lm || die "$CC failed to link $cw_out.o"
+            CW_EMITTED=o
+            ;;
         *)
             die "unknown compiler interface '$cw_cli' (bootstrap.sh needs to learn it)"
             ;;

@@ -394,6 +394,66 @@ written against 0.5's unbounded generics mean.
 
 ## 0.10: vectorization and profiles
 
+**0.10 status** (work in progress on branch `release-0.10`):
+
+- done: the compiler's own source migrated to unsafe code (whole
+  function bodies in `unsafe { ... }` where a function has several
+  unsafe operations, `tachyonc --fix-unsafe` for the rest; the compilers
+  built before and after are byte-identical, and tests/compare.sh finds
+  9281 of 9281 compilations identical); unsafe operations outside unsafe
+  code are errors (`error[unsafe]`), `--allow-unsafe` is gone, and the
+  bootstrap interface `tachyonc-0.10` builds HEAD
+- done: vector types (`v2f64` ... `v16i8`; grammar.md "Additions of
+  0.10"): lanewise operators, masks, select, lanes, sums, checked loads
+  and stores; -O0 lane by lane; IR vector instructions (vbin, vcmp,
+  vsplat, vext, vins, vsum, vneg, vsel), scalar replacement keeps vectors
+  whole; NEON and SSE2 (red zone for what SSE2 lacks) in both text
+  emitters and both encoders; vectors in the float registers (never
+  d8-d15, whose upper halves calls do not keep), 16-byte spill slots;
+  not FFI-safe
+- done: loop vectorizer (vectorize.tach): innermost counted loops with
+  unit-stride loads and stores of one type and integer reductions, a
+  vector loop guarded at run time (bounds checks proven for the whole
+  loop, no overlap between stores and other accesses) and the original
+  loop as the remainder and the fallback; `--no-vectorize`
+- done: `tests/fuzz/run.sh -V` (genvec.awk): reductions, maps, stencils
+  and explicit vector code over slices of random lengths and starts,
+  overlapping slices, checks failing part way
+- done: vector loops of small bodies run two vectors an iteration (own
+  accumulators); invariant splats before the loop; optimizer.md "0.10"
+- done: profile-guided optimization (profile.tach): `--profile-generate
+  FILE` (block counters, written at exit by a small runtime added to the
+  program), `--profile-use FILE` (counts per function, checked by a
+  checksum of its IR: stale profiles ignored with a warning) for block
+  layout, inlining (hot call sites), unrolling and vectorization (cold
+  loops); the test runner's `PROFILE` directive
+- done: outer-loop vectorization (a loop around one inner loop, over the
+  outer index: matmul, whose inner loop is a float sum that may not be
+  reassociated); loads at invariant addresses kept scalar under the
+  overlap test; overlap tests by groups of accesses
+- done: a checking mode for unsafe code (`--check-unsafe`,
+  unsafecheck.tach): raw-pointer accesses checked against the heap blocks
+  the program allocated (out of bounds, use after free, double free); the
+  compiler compiled with it compiles itself to the same output
+- done: every error in one compilation (grammar.md "Error recovery"):
+  the checker runs after syntax errors (skipping the bodies that had
+  them) and recovers per declaration and per field, parameter and result
+  type (the error type, with the errors that follow from it suppressed);
+  impls, bounds, imports, missing module files and C header errors
+  recover too
+- done: interp: `vm.sp` is promoted (the 0.6 note): interp is level with
+  cc -O2 (40 against 39-40 ms)
+- not done, measured: GVN-PRE. Of the compiler's 16,482 pure
+  instructions in two-way merge blocks at -O2, 26 are partially
+  redundant (an equal one on one way in), and none of bench/'s: a pass
+  would not pay for its compile time (LICM already moves what loops
+  repeat)
+- in progress: -
+- remaining (to 0.11): SLP vectorizer; scalar unrolling with run-time
+  trip counts; AVX2 (behind a --target-cpu, untestable under Rosetta);
+  hot/cold function splitting; PGO-aware register allocation and
+  scheduling
+
 Vectorization:
 - SLP vectorizer
 - loop vectorizer for counted loops with simple dependences
@@ -643,3 +703,30 @@ with `--allow-unsafe`):
 
 The unsafe checks and traits cost nothing measurable; the e-graph's
 rewrite rules cost 4.7% at -O2 (within the 10% allowed).
+
+### 0.10
+
+aarch64-macos (Apple silicon, native; `bench/run.sh -r 5`; "0.9.0" is
+the previous release at its default level):
+
+| program | 0.9.0 | 0.10 -O0 | 0.10 -O1 | 0.10 -O2 | cc -O2 |
+|---|---|---|---|---|---|
+| collatz | 293 | 2443 | 292 | 291 | 292 |
+| fib | 13 | 54 | 22 | 13 | 14 |
+| interp | 42 | 444 | 77 | 44 | 40 |
+| matmul | 26 | 495 | 74 | 18 | 43 |
+| nbody | 33 | 296 | 32 | 32 | 28 |
+| sieve | 63 | 254 | 59 | 69 | 71 |
+| stencil | 16 | 242 | 21 | 10 | 10 |
+| md5 | 35 | 164 | 38 | 35 | - |
+
+The vectorizer makes matmul 2.4× faster than clang -O2 and brings stencil
+level with it. sieve's 63 against 69 is this machine's noise for that
+program (58 to 64 ms in repeated runs of either build). interp is about
+5% slower with the vectorizer than without it (`--no-vectorize`): its
+run-time guards on loops that gain nothing; a cost model for the
+vectorizer is for 0.11.
+
+Compile time, the compiler building itself to an object, best of 7:
+-O0 109 ms with 0.9.0, 113 ms with 0.10; -O2 791 ms and 816 ms (+3%, the
+vectorizer and profile support).

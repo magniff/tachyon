@@ -17,8 +17,10 @@ tmp=$(mktemp)
     echo "use crate::base::buf_str;"
     echo ""
     echo "pub fn std_source(out: i64) {"
+    echo "    unsafe {"
     # (sed, not awk: awks differ on backslashes in replacements.)
-    sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/^/    buf_str(out, c"/' -e 's/$/\\n");/' compiler/std/std.tach
+    sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/^/        buf_str(out, c"/' -e 's/$/\\n");/' compiler/std/std.tach
+    echo "    }"
     echo "}"
 } >"$tmp"
 if [ "${1:-}" = "-c" ]; then

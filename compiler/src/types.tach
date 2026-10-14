@@ -9,7 +9,7 @@ use crate::base::{
     sym_name, sym_table,
 };
 use crate::ast::{FN_COLD, FN_INLINE, FN_NO_INLINE, REPR_C, REPR_INT, REPR_PACKED, REPR_UNION};
-use TyKind::{Array, Enum, Fn, Prim, Ptr, Slice, Struct, Tuple};
+use TyKind::{Array, Enum, Fn, Prim, Ptr, Slice, Struct, Tuple, Vector};
 
 pub const TY_I8: i64 = 1;
 pub const TY_I16: i64 = 2;
@@ -30,8 +30,9 @@ const FIRST_CONSTRUCTED: i64 = 14;
 // The kinds of types: the primitives (by id: TY_I8 ... TY_NEVER), and the
 // constructed ones: Ptr a=pointee, Array a=elem b=length, Tuple
 // list=elements, Struct a=struct, Fn list=params a=result b=1 for
-// `extern "C" fn` (C's convention), Enum a=enum, Slice a=elem.
-pub enum TyKind { None, Prim, Ptr, Array, Tuple, Struct, Fn, Enum, Slice }
+// `extern "C" fn` (C's convention), Enum a=enum, Slice a=elem, Vector
+// (0.10) a=lane type b=lanes.
+pub enum TyKind { None, Prim, Ptr, Array, Tuple, Struct, Fn, Enum, Slice, Vector }
 
 // `size` is -1 until computed.
 pub struct Type { kind: TyKind, a: i64, b: i64, list: i64, count: i64, size: i64, align: i64 }
@@ -48,41 +49,54 @@ pub static mut TY_U8_PTR: i64 = 0;
 // The type of what failed to check (0.5): errors that name it follow from
 // an earlier error and are not reported (see err_end).
 pub static mut TY_ERROR: i64 = 0;
+// The vector types (0.10): 16 bytes each.
+pub static mut TY_V2F64: i64 = 0;
+pub static mut TY_V4F32: i64 = 0;
+pub static mut TY_V2I64: i64 = 0;
+pub static mut TY_V4I32: i64 = 0;
+pub static mut TY_V8I16: i64 = 0;
+pub static mut TY_V16I8: i64 = 0;
 
 fn add_type(kind: TyKind, a: i64, b: i64, list: i64, count: i64) -> i64 {
-    TYPES = grow(TYPES, TYPE_COUNT, &TYPE_CAP);
-    TYPES[TYPE_COUNT] = Type { kind: kind, a: a, b: b, list: list, count: count, size: -1, align: 1 };
+    unsafe {
+        TYPES = grow(TYPES, TYPE_COUNT, &TYPE_CAP);
+        TYPES[TYPE_COUNT] = Type { kind: kind, a: a, b: b, list: list, count: count, size: -1, align: 1 };
+    }
     TYPE_COUNT += 1;
     TYPE_COUNT - 1
 }
 
 pub fn type_elem(t: i64, i: i64) -> i64 {
-    TLISTS.data[TYPES[t].list + i]
+    unsafe { TLISTS.data[TYPES[t].list + i] }
 }
 
 // The interned type with these fields and the elements TSCRATCH[mark..],
 // which are popped.
 pub fn make_type(kind: TyKind, a: i64, b: i64, mark: i64) -> i64 {
-    let count = TSCRATCH.count - mark;
-    for t in FIRST_CONSTRUCTED..TYPE_COUNT {
-        if TYPES[t].kind == kind && TYPES[t].a == a && TYPES[t].b == b && TYPES[t].count == count
-            && same_elems(t, mark) {
-            TSCRATCH.count = mark;
-            return t;
+    unsafe {
+        let count = TSCRATCH.count - mark;
+        for t in FIRST_CONSTRUCTED..TYPE_COUNT {
+            if TYPES[t].kind == kind && TYPES[t].a == a && TYPES[t].b == b && TYPES[t].count == count
+                && same_elems(t, mark) {
+                TSCRATCH.count = mark;
+                return t;
+            }
         }
+        let list = TLISTS.count;
+        for i in mark..TSCRATCH.count {
+            TLISTS.push(TSCRATCH.data[i]);
+        }
+        TSCRATCH.count = mark;
+        add_type(kind, a, b, list, count)
     }
-    let list = TLISTS.count;
-    for i in mark..TSCRATCH.count {
-        TLISTS.push(TSCRATCH.data[i]);
-    }
-    TSCRATCH.count = mark;
-    add_type(kind, a, b, list, count)
 }
 
 fn same_elems(t: i64, mark: i64) -> bool {
-    for i in 0..TYPES[t].count {
-        if type_elem(t, i) != TSCRATCH.data[mark + i] {
-            return false;
+    unsafe {
+        for i in 0..TYPES[t].count {
+            if type_elem(t, i) != TSCRATCH.data[mark + i] {
+                return false;
+            }
         }
     }
     true
@@ -117,6 +131,59 @@ pub fn init_types() {
     // A string literal is a `[u8]` (0.6; a `(*u8, u64)` tuple before).
     TY_STRING = slice_of(TY_U8);
     TY_ERROR = add_type(TyKind::None, 1, 0, 0, 0);
+    TY_V2F64 = make_type(Vector, TY_F64, 2, TSCRATCH.count);
+    TY_V4F32 = make_type(Vector, TY_F32, 4, TSCRATCH.count);
+    TY_V2I64 = make_type(Vector, TY_I64, 2, TSCRATCH.count);
+    TY_V4I32 = make_type(Vector, TY_I32, 4, TSCRATCH.count);
+    TY_V8I16 = make_type(Vector, TY_I16, 8, TSCRATCH.count);
+    TY_V16I8 = make_type(Vector, TY_I8, 16, TSCRATCH.count);
+}
+
+// ---- Vector types (0.10) ----
+
+pub fn is_vector(t: i64) -> bool {
+    unsafe { TYPES[t].kind == Vector }
+}
+
+// The lane type and the number of lanes of vector type t.
+pub fn vec_elem(t: i64) -> i64 {
+    unsafe { TYPES[t].a }
+}
+
+pub fn vec_lanes(t: i64) -> i64 {
+    unsafe { TYPES[t].b }
+}
+
+// Whether values of type t live in the float registers: floats, and the
+// vectors (in their 128-bit form, v0-v31 / xmm0-xmm15).
+pub fn in_fregs(t: i64) -> bool {
+    is_float(t) || is_vector(t)
+}
+
+pub fn is_float_vector(t: i64) -> bool {
+    is_vector(t) && is_float(vec_elem(t))
+}
+
+// The vector type of `lanes` lanes of type `elem` (one of the six), or 0.
+pub fn vector_type(elem: i64, lanes: i64) -> i64 {
+    unsafe {
+        let all: [i64; 6] = [TY_V2F64, TY_V4F32, TY_V2I64, TY_V4I32, TY_V8I16, TY_V16I8];
+        for i in 0..6 {
+            if TYPES[all[i]].a == elem && TYPES[all[i]].b == lanes {
+                return all[i];
+            }
+        }
+        0
+    }
+}
+
+// The mask type of vector type t: the integer vector of its lane width.
+pub fn vec_mask_type(t: i64) -> i64 {
+    unsafe {
+        if t == TY_V2F64 { return TY_V2I64; }
+        if t == TY_V4F32 { return TY_V4I32; }
+        t
+    }
 }
 
 pub fn is_integer(t: i64) -> bool {
@@ -136,40 +203,44 @@ pub fn is_numeric(t: i64) -> bool {
 }
 
 pub fn is_pointer(t: i64) -> bool {
-    TYPES[t].kind == Ptr
+    unsafe { TYPES[t].kind == Ptr }
 }
 
 pub fn is_fn_type(t: i64) -> bool {
-    TYPES[t].kind == Fn
+    unsafe { TYPES[t].kind == Fn }
 }
 
 // Held in memory; expressions of these types produce an address. An enum
 // with fields lives in memory; a fieldless one is its tag, a scalar.
 pub fn is_compound(t: i64) -> bool {
-    let kind = TYPES[t].kind;
-    kind == Array || kind == Tuple || kind == Struct || kind == Slice
-        || (kind == Enum && ENUMS[TYPES[t].a].has_fields)
+    unsafe {
+        let kind = TYPES[t].kind;
+        kind == Array || kind == Tuple || kind == Struct || kind == Slice || kind == Vector
+            || (kind == Enum && ENUMS[TYPES[t].a].has_fields)
+    }
 }
 
 pub fn is_enum(t: i64) -> bool {
-    TYPES[t].kind == Enum
+    unsafe { TYPES[t].kind == Enum }
 }
 
 pub fn is_fieldless_enum(t: i64) -> bool {
-    TYPES[t].kind == Enum && !ENUMS[TYPES[t].a].has_fields
+    unsafe { TYPES[t].kind == Enum && !ENUMS[TYPES[t].a].has_fields }
 }
 
 pub fn is_slice(t: i64) -> bool {
-    TYPES[t].kind == Slice
+    unsafe { TYPES[t].kind == Slice }
 }
 
 // The machine type of a scalar: the tag type for a fieldless enum, else
 // the type itself.
 pub fn scalar_type(t: i64) -> i64 {
-    if TYPES[t].kind == Enum && !ENUMS[TYPES[t].a].has_fields {
-        return ENUMS[TYPES[t].a].tag;
+    unsafe {
+        if TYPES[t].kind == Enum && !ENUMS[TYPES[t].a].has_fields {
+            return ENUMS[TYPES[t].a].tag;
+        }
+        t
     }
-    t
 }
 
 pub fn is_void(t: i64) -> bool {
@@ -197,53 +268,59 @@ pub fn int_max(t: i64) -> u64 {
 // ---- Type names, for messages ----
 
 pub fn buf_type(out: i64, t: i64) {
-    if t == TY_ERROR && t != 0 {
-        ERR_POISONED = true;
-        buf_str(out, c"{error}");
-        return;
-    }
-    let kind = TYPES[t].kind;
-    if kind == TyKind::None || kind == Prim {
-        buf_str(out, primitive_name(t));
-    } else if kind == Ptr {
-        buf_byte(out, '*');
-        buf_type(out, TYPES[t].a);
-    } else if kind == Array {
-        buf_byte(out, '[');
-        buf_type(out, TYPES[t].a);
-        buf_str(out, c"; ");
-        buf_int(out, TYPES[t].b);
-        buf_byte(out, ']');
-    } else if kind == Struct {
-        buf_str(out, sym_name(STRUCTS[TYPES[t].a].name));
-    } else if kind == Enum {
-        buf_str(out, sym_name(ENUMS[TYPES[t].a].name));
-    } else if kind == Slice {
-        buf_byte(out, '[');
-        buf_type(out, TYPES[t].a);
-        buf_byte(out, ']');
-    } else if kind == Tuple {
-        buf_byte(out, '(');
-        for i in 0..TYPES[t].count {
-            if i > 0 {
-                buf_str(out, c", ");
+    unsafe {
+        if t == TY_ERROR && t != 0 {
+            ERR_POISONED = true;
+            buf_str(out, c"{error}");
+            return;
+        }
+        let kind = TYPES[t].kind;
+        if kind == TyKind::None || kind == Prim {
+            buf_str(out, primitive_name(t));
+        } else if kind == Vector {
+            buf_byte(out, 'v');
+            buf_int(out, TYPES[t].b);
+            buf_str(out, primitive_name(TYPES[t].a));
+        } else if kind == Ptr {
+            buf_byte(out, '*');
+            buf_type(out, TYPES[t].a);
+        } else if kind == Array {
+            buf_byte(out, '[');
+            buf_type(out, TYPES[t].a);
+            buf_str(out, c"; ");
+            buf_int(out, TYPES[t].b);
+            buf_byte(out, ']');
+        } else if kind == Struct {
+            buf_str(out, sym_name(STRUCTS[TYPES[t].a].name));
+        } else if kind == Enum {
+            buf_str(out, sym_name(ENUMS[TYPES[t].a].name));
+        } else if kind == Slice {
+            buf_byte(out, '[');
+            buf_type(out, TYPES[t].a);
+            buf_byte(out, ']');
+        } else if kind == Tuple {
+            buf_byte(out, '(');
+            for i in 0..TYPES[t].count {
+                if i > 0 {
+                    buf_str(out, c", ");
+                }
+                buf_type(out, type_elem(t, i));
             }
-            buf_type(out, type_elem(t, i));
-        }
-        buf_byte(out, ')');
-    } else {
-        if TYPES[t].b != 0 {
-            buf_str(out, c"extern \"C\" ");
-        }
-        buf_str(out, c"fn(");
-        for i in 0..TYPES[t].count {
-            if i > 0 {
-                buf_str(out, c", ");
+            buf_byte(out, ')');
+        } else {
+            if TYPES[t].b != 0 {
+                buf_str(out, c"extern \"C\" ");
             }
-            buf_type(out, type_elem(t, i));
+            buf_str(out, c"fn(");
+            for i in 0..TYPES[t].count {
+                if i > 0 {
+                    buf_str(out, c", ");
+                }
+                buf_type(out, type_elem(t, i));
+            }
+            buf_str(out, c") -> ");
+            buf_type(out, TYPES[t].a);
         }
-        buf_str(out, c") -> ");
-        buf_type(out, TYPES[t].a);
     }
 }
 
@@ -304,14 +381,16 @@ pub struct FnInfo {
 
 // #[inline] (1), #[inline(never)] (-1) or neither (0) on function f (0.6).
 pub fn fn_attr_inline(f: i64) -> i64 {
-    if (FNS[f].attrs & FN_INLINE) != 0 { return 1; }
-    if (FNS[f].attrs & FN_NO_INLINE) != 0 { return -1; }
-    0
+    unsafe {
+        if (FNS[f].attrs & FN_INLINE) != 0 { return 1; }
+        if (FNS[f].attrs & FN_NO_INLINE) != 0 { return -1; }
+        0
+    }
 }
 
 // #[cold] on function f (0.6): rarely called.
 pub fn fn_attr_cold(f: i64) -> bool {
-    (FNS[f].attrs & FN_COLD) != 0
+    unsafe { (FNS[f].attrs & FN_COLD) != 0 }
 }
 // state: 0 not evaluated, 1 being evaluated, 2 done.
 pub struct ConstInfo { node: i64, ty: i64, value: i64, state: i64 }
@@ -376,100 +455,120 @@ pub static mut ALIAS_BUSY: *i64 = 0 as *i64;
 pub static mut SYM_ITEM: *i64 = 0 as *i64;
 
 pub fn item_node_of(key: i64) -> i64 {
-    SYM_ITEM[key]
+    unsafe { SYM_ITEM[key] }
 }
 
 
 pub fn init_declarations() {
-    // Names the checker makes (0.4): interned before the tables indexed
-    // by symbol are allocated.
-    let made: [*u8; 5] = [c"__for_seq", c"__for_index", c"__invalid_value", c"size_of", c"align_of"];
-    for i in 0..5 {
-        intern_c(made[i]);
-    }
-    let i8_sym = intern_c(c"i8");
-    let names: [*u8; 13] = [c"i8", c"i16", c"i32", c"i64", c"u8", c"u16", c"u32", c"u64",
-        c"f32", c"f64", c"bool", c"isize", c"usize"];
-    let types: [i64; 13] = [TY_I8, TY_I16, TY_I32, TY_I64, TY_U8, TY_U16, TY_U32, TY_U64,
-        TY_F32, TY_F64, TY_BOOL, TY_I64, TY_U64];
-    let mut syms: [i64; 13] = [0; 13];
-    for i in 0..13 {
-        syms[i] = intern_c(names[i]);
-    }
-    sym_table(&SYM_STRUCT);
-    sym_table(&SYM_ENUM);
-    sym_table(&SYM_ALIAS);
-    sym_table(&SYM_FN);
-    sym_table(&SYM_CONST);
-    sym_table(&SYM_STATIC);
-    sym_table(&SYM_PRIMITIVE);
-    sym_table(&ALIAS_TYPE);
-    sym_table(&ALIAS_BUSY);
-    sym_table(&SYM_ITEM);
-    for i in 0..13 {
-        SYM_PRIMITIVE[syms[i]] = types[i];
-    }
-    if i8_sym != syms[0] {
-        die(c"internal error: symbol table");
+    unsafe {
+        // Names the checker makes (0.4): interned before the tables indexed
+        // by symbol are allocated.
+        let made: [*u8; 5] = [c"__for_seq", c"__for_index", c"__invalid_value", c"size_of", c"align_of"];
+        for i in 0..5 {
+            intern_c(made[i]);
+        }
+        let i8_sym = intern_c(c"i8");
+        let names: [*u8; 13] = [c"i8", c"i16", c"i32", c"i64", c"u8", c"u16", c"u32", c"u64",
+            c"f32", c"f64", c"bool", c"isize", c"usize"];
+        let types: [i64; 13] = [TY_I8, TY_I16, TY_I32, TY_I64, TY_U8, TY_U16, TY_U32, TY_U64,
+            TY_F32, TY_F64, TY_BOOL, TY_I64, TY_U64];
+        let mut syms: [i64; 13] = [0; 13];
+        for i in 0..13 {
+            syms[i] = intern_c(names[i]);
+        }
+        let vnames: [*u8; 6] = [c"v2f64", c"v4f32", c"v2i64", c"v4i32", c"v8i16", c"v16i8"];
+        let vtypes: [i64; 6] = [TY_V2F64, TY_V4F32, TY_V2I64, TY_V4I32, TY_V8I16, TY_V16I8];
+        let mut vsyms: [i64; 6] = [0; 6];
+        for i in 0..6 {
+            vsyms[i] = intern_c(vnames[i]);
+        }
+        sym_table(&SYM_STRUCT);
+        sym_table(&SYM_ENUM);
+        sym_table(&SYM_ALIAS);
+        sym_table(&SYM_FN);
+        sym_table(&SYM_CONST);
+        sym_table(&SYM_STATIC);
+        sym_table(&SYM_PRIMITIVE);
+        sym_table(&ALIAS_TYPE);
+        sym_table(&ALIAS_BUSY);
+        sym_table(&SYM_ITEM);
+        for i in 0..13 {
+            SYM_PRIMITIVE[syms[i]] = types[i];
+        }
+        // The vector types (0.10).
+        for i in 0..6 {
+            SYM_PRIMITIVE[vsyms[i]] = vtypes[i];
+        }
+        if i8_sym != syms[0] {
+            die(c"internal error: symbol table");
+        }
     }
 }
 
 pub fn struct_field(s: i64, i: i64) -> *FieldInfo {
-    &FIELDS[STRUCTS[s].fields + i]
+    unsafe { &FIELDS[STRUCTS[s].fields + i] }
 }
 
 // The index of field `name` of struct `s`, or -1.
 pub fn find_field(s: i64, name: i64) -> i64 {
-    for i in 0..STRUCTS[s].field_count {
-        if (*struct_field(s, i)).name == name {
-            return i;
+    unsafe {
+        for i in 0..STRUCTS[s].field_count {
+            if (*struct_field(s, i)).name == name {
+                return i;
+            }
         }
     }
     -1
 }
 
 pub fn fn_param(f: i64, i: i64) -> i64 {
-    TLISTS.data[FNS[f].params + i]
+    unsafe { TLISTS.data[FNS[f].params + i] }
 }
 
 pub fn enum_variant(e: i64, i: i64) -> i64 {
-    ENUMS[e].variants + i
+    unsafe { ENUMS[e].variants + i }
 }
 
 // The variant of enum `e` named `name`, or -1.
 pub fn find_variant(e: i64, name: i64) -> i64 {
-    for i in 0..ENUMS[e].variant_count {
-        if VARIANTS[enum_variant(e, i)].name == name {
-            return enum_variant(e, i);
+    unsafe {
+        for i in 0..ENUMS[e].variant_count {
+            if VARIANTS[enum_variant(e, i)].name == name {
+                return enum_variant(e, i);
+            }
         }
     }
     -1
 }
 
 pub fn variant_field(v: i64, i: i64) -> i64 {
-    TLISTS.data[VARIANTS[v].fields + i]
+    unsafe { TLISTS.data[VARIANTS[v].fields + i] }
 }
 
 // The offset of field `i` of variant `v` (of an enum with fields): in the
 // tuple (tag, fields...), or for #[repr(C)] in the struct of its fields
 // after the tag (RFC 2195's layout: a C int, then a union of structs).
 pub fn variant_field_offset(v: i64, i: i64) -> i64 {
-    let e = VARIANTS[v].enum_id;
-    if (ENUMS[e].repr & REPR_C) != 0 {
-        compute_layout(enum_type(e));
-        return ENUMS[e].payload + tuple_offset(VARIANTS[v].shape, i);
+    unsafe {
+        let e = VARIANTS[v].enum_id;
+        if (ENUMS[e].repr & REPR_C) != 0 {
+            compute_layout(enum_type(e));
+            return ENUMS[e].payload + tuple_offset(VARIANTS[v].shape, i);
+        }
+        tuple_offset(VARIANTS[v].shape, i + 1)
     }
-    tuple_offset(VARIANTS[v].shape, i + 1)
 }
 
 // The method or associated function `name` of type `t`, or -1.
 pub fn find_method(t: i64, name: i64) -> i64 {
-    for i in 0..METHOD_COUNT {
-        if METHODS[i].ty == t && METHODS[i].name == name {
-            return METHODS[i].f;
+    unsafe {
+        for i in 0..METHOD_COUNT {
+            if METHODS[i].ty == t && METHODS[i].name == name {
+                return METHODS[i].f;
+            }
         }
+        -1
     }
-    -1
 }
 
 // ---- Layout ----
@@ -480,115 +579,120 @@ pub fn align_to(offset: i64, align: i64) -> i64 {
 
 pub fn type_size(t: i64) -> i64 {
     compute_layout(t);
-    TYPES[t].size
+    unsafe { TYPES[t].size }
 }
 
 pub fn type_align(t: i64) -> i64 {
     compute_layout(t);
-    TYPES[t].align
+    unsafe { TYPES[t].align }
 }
 
 pub fn compute_layout(t: i64) {
-    if TYPES[t].size >= 0 {
-        return;
-    }
-    let kind = TYPES[t].kind;
-    let mut size = 0;
-    let mut align = 1;
-    if t == TY_I8 || t == TY_U8 || t == TY_BOOL {
-        size = 1;
-    } else if t == TY_I16 || t == TY_U16 {
-        size = 2;
-    } else if t == TY_I32 || t == TY_U32 || t == TY_F32 {
-        size = 4;
-    } else if t == TY_I64 || t == TY_U64 || t == TY_F64 || kind == Ptr || kind == Fn {
-        size = 8;
-    } else if kind == Slice {
-        size = 16;
-        align = 8;
-    } else if kind == Enum {
-        let e = TYPES[t].a;
-        size = type_size(ENUMS[e].tag);
-        align = size;
-        let mut largest = 0;
-        let mut widest = 1;
-        for i in 0..ENUMS[e].variant_count {
-            let shape = VARIANTS[enum_variant(e, i)].shape;
-            if shape != 0 {
-                largest = max_i64(largest, type_size(shape));
-                widest = max_i64(widest, type_align(shape));
-            }
+    unsafe {
+        if TYPES[t].size >= 0 {
+            return;
         }
-        if (ENUMS[e].repr & REPR_C) != 0 && ENUMS[e].has_fields {
-            ENUMS[e].payload = align_to(size, widest);
-            size = ENUMS[e].payload + largest;
-        } else {
-            size = max_i64(size, largest);
-        }
-        align = max_i64(align, widest);
-        size = align_to(size, align);
-    } else if kind == Array {
-        size = type_size(TYPES[t].a) * TYPES[t].b;
-        align = type_align(TYPES[t].a);
-    } else if kind == Tuple {
-        let mut offset = 0;
-        for i in 0..TYPES[t].count {
-            let elem = type_elem(t, i);
-            align = max_i64(align, type_align(elem));
-            offset = align_to(offset, type_align(elem)) + type_size(elem);
-        }
-        size = align_to(offset, align);
-    } else if kind == Struct {
-        let s = TYPES[t].a;
-        let repr = STRUCTS[s].repr;
-        let n = STRUCTS[s].field_count;
-        // The order of the fields in memory: as declared for C, by
-        // alignment (largest first, which leaves the least padding)
-        // otherwise.
-        let order = alloc_array::<i64>(n + 1);
-        for i in 0..n {
-            order[i] = i;
-        }
-        if (repr & REPR_C) == 0 {
-            for i in 1..n {
-                let mut j = i;
-                while j > 0 && type_align((*struct_field(s, order[j - 1])).ty) < type_align((*struct_field(s, order[j])).ty) {
-                    let swap = order[j];
-                    order[j] = order[j - 1];
-                    order[j - 1] = swap;
-                    j -= 1;
+        let kind = TYPES[t].kind;
+        let mut size = 0;
+        let mut align = 1;
+        if t == TY_I8 || t == TY_U8 || t == TY_BOOL {
+            size = 1;
+        } else if t == TY_I16 || t == TY_U16 {
+            size = 2;
+        } else if t == TY_I32 || t == TY_U32 || t == TY_F32 {
+            size = 4;
+        } else if t == TY_I64 || t == TY_U64 || t == TY_F64 || kind == Ptr || kind == Fn {
+            size = 8;
+        } else if kind == Slice {
+            size = 16;
+            align = 8;
+        } else if kind == Vector {
+            size = 16;
+            align = 16;
+        } else if kind == Enum {
+            let e = TYPES[t].a;
+            size = type_size(ENUMS[e].tag);
+            align = size;
+            let mut largest = 0;
+            let mut widest = 1;
+            for i in 0..ENUMS[e].variant_count {
+                let shape = VARIANTS[enum_variant(e, i)].shape;
+                if shape != 0 {
+                    largest = max_i64(largest, type_size(shape));
+                    widest = max_i64(widest, type_align(shape));
                 }
             }
-        }
-        let mut offset = 0;
-        for k in 0..n {
-            let field = struct_field(s, order[k]);
-            let field_ty = (*field).ty;
-            // Packed: aligned to at most the packing (`align` holds it).
-            let natural = type_align(field_ty);
-            let field_align = if (repr & REPR_PACKED) != 0 && natural > STRUCTS[s].align { STRUCTS[s].align } else { natural };
-            align = max_i64(align, field_align);
-            if (repr & REPR_UNION) != 0 {
-                (*field).offset = 0;
-                offset = max_i64(offset, type_size(field_ty));
+            if (ENUMS[e].repr & REPR_C) != 0 && ENUMS[e].has_fields {
+                ENUMS[e].payload = align_to(size, widest);
+                size = ENUMS[e].payload + largest;
             } else {
-                offset = align_to(offset, field_align);
-                (*field).offset = offset;
-                offset += type_size(field_ty);
+                size = max_i64(size, largest);
             }
+            align = max_i64(align, widest);
+            size = align_to(size, align);
+        } else if kind == Array {
+            size = type_size(TYPES[t].a) * TYPES[t].b;
+            align = type_align(TYPES[t].a);
+        } else if kind == Tuple {
+            let mut offset = 0;
+            for i in 0..TYPES[t].count {
+                let elem = type_elem(t, i);
+                align = max_i64(align, type_align(elem));
+                offset = align_to(offset, type_align(elem)) + type_size(elem);
+            }
+            size = align_to(offset, align);
+        } else if kind == Struct {
+            let s = TYPES[t].a;
+            let repr = STRUCTS[s].repr;
+            let n = STRUCTS[s].field_count;
+            // The order of the fields in memory: as declared for C, by
+            // alignment (largest first, which leaves the least padding)
+            // otherwise.
+            let order = alloc_array::<i64>(n + 1);
+            for i in 0..n {
+                order[i] = i;
+            }
+            if (repr & REPR_C) == 0 {
+                for i in 1..n {
+                    let mut j = i;
+                    while j > 0 && type_align((*struct_field(s, order[j - 1])).ty) < type_align((*struct_field(s, order[j])).ty) {
+                        let swap = order[j];
+                        order[j] = order[j - 1];
+                        order[j - 1] = swap;
+                        j -= 1;
+                    }
+                }
+            }
+            let mut offset = 0;
+            for k in 0..n {
+                let field = struct_field(s, order[k]);
+                let field_ty = (*field).ty;
+                // Packed: aligned to at most the packing (`align` holds it).
+                let natural = type_align(field_ty);
+                let field_align = if (repr & REPR_PACKED) != 0 && natural > STRUCTS[s].align { STRUCTS[s].align } else { natural };
+                align = max_i64(align, field_align);
+                if (repr & REPR_UNION) != 0 {
+                    (*field).offset = 0;
+                    offset = max_i64(offset, type_size(field_ty));
+                } else {
+                    offset = align_to(offset, field_align);
+                    (*field).offset = offset;
+                    offset += type_size(field_ty);
+                }
+            }
+            free(order as *u8);
+            if (repr & REPR_PACKED) == 0 {
+                align = max_i64(align, STRUCTS[s].align);
+            }
+            size = align_to(offset, align);
         }
-        free(order as *u8);
-        if (repr & REPR_PACKED) == 0 {
-            align = max_i64(align, STRUCTS[s].align);
+        if size > 0 && kind != Array && kind != Tuple && kind != Struct && kind != Enum
+            && kind != Slice {
+            align = size;
         }
-        size = align_to(offset, align);
+        TYPES[t].size = size;
+        TYPES[t].align = align;
     }
-    if size > 0 && kind != Array && kind != Tuple && kind != Struct && kind != Enum
-        && kind != Slice {
-        align = size;
-    }
-    TYPES[t].size = size;
-    TYPES[t].align = align;
 }
 
 pub fn max_i64(a: i64, b: i64) -> i64 {
@@ -611,7 +715,7 @@ pub fn tuple_offset(t: i64, i: i64) -> i64 {
 // The offset of field `i` of struct `s`.
 pub fn field_offset(s: i64, i: i64) -> i64 {
     compute_layout(struct_type(s));
-    (*struct_field(s, i)).offset
+    unsafe { (*struct_field(s, i)).offset }
 }
 
 // ---- C interoperability ----
@@ -621,47 +725,51 @@ pub fn field_offset(s: i64, i: i64) -> i64 {
 // is fine), `extern "C" fn` pointers, and #[repr(C)] (or, for enums,
 // #[repr(int)]) types made of those; `()` and `!` as results.
 pub fn is_ffi_safe(t: i64) -> bool {
-    let kind = TYPES[t].kind;
-    if is_numeric(t) || t == TY_BOOL || kind == Ptr {
-        return true;
-    }
-    if kind == Fn {
-        return TYPES[t].b != 0;
-    }
-    if kind == Struct {
-        let s = TYPES[t].a;
-        if (STRUCTS[s].repr & REPR_C) == 0 {
-            return false;
+    unsafe {
+        let kind = TYPES[t].kind;
+        if is_numeric(t) || t == TY_BOOL || kind == Ptr {
+            return true;
         }
-        for i in 0..STRUCTS[s].field_count {
-            if !is_ffi_field(( *struct_field(s, i)).ty) {
+        if kind == Fn {
+            return TYPES[t].b != 0;
+        }
+        if kind == Struct {
+            let s = TYPES[t].a;
+            if (STRUCTS[s].repr & REPR_C) == 0 {
                 return false;
             }
-        }
-        return true;
-    }
-    if kind == Enum {
-        let e = TYPES[t].a;
-        if (ENUMS[e].repr & (REPR_C | REPR_INT)) == 0 {
-            return false;
-        }
-        for i in 0..ENUMS[e].variant_count {
-            let v = enum_variant(e, i);
-            for k in 0..VARIANTS[v].field_count {
-                if !is_ffi_field(variant_field(v, k)) {
+            for i in 0..STRUCTS[s].field_count {
+                if !is_ffi_field(( *struct_field(s, i)).ty) {
                     return false;
                 }
             }
+            return true;
         }
-        return true;
+        if kind == Enum {
+            let e = TYPES[t].a;
+            if (ENUMS[e].repr & (REPR_C | REPR_INT)) == 0 {
+                return false;
+            }
+            for i in 0..ENUMS[e].variant_count {
+                let v = enum_variant(e, i);
+                for k in 0..VARIANTS[v].field_count {
+                    if !is_ffi_field(variant_field(v, k)) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
+        false
     }
-    false
 }
 
 // The same for a field of a C type: arrays of such types too.
 pub fn is_ffi_field(t: i64) -> bool {
-    if TYPES[t].kind == Array {
-        return is_ffi_field(TYPES[t].a);
+    unsafe {
+        if TYPES[t].kind == Array {
+            return is_ffi_field(TYPES[t].a);
+        }
+        is_ffi_safe(t)
     }
-    is_ffi_safe(t)
 }

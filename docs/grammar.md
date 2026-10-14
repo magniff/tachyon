@@ -354,11 +354,24 @@ safe to use: tachyon has no threads of its own (threads started through
 C are C's business). Runaway recursion still exhausts the stack, which
 the operating system stops (a guard page) without corrupting memory.
 
-**Transition.** In 0.9 an unsafe operation outside unsafe code is a
-*warning* (`warning[unsafe]`; `--deny-warnings` makes it an error); in
-0.10 it is an error. `tachyonc --fix-unsafe` wraps the operations in
-unsafe blocks. The compiler's own source, built by 0.8.0, migrates in
-0.10; until then the bootstrap builds it with `--allow-unsafe`.
+**Errors.** An unsafe operation outside unsafe code is an error
+(`error[unsafe]`, from 0.10; 0.9 reported it as a warning).
+`tachyonc --fix-unsafe` wraps such operations in unsafe blocks.
+
+**Checking unsafe code** (0.10). `tachyonc --check-unsafe` (at `-O1` or
+`-O2`) checks unsafe code's raw-pointer accesses at run time: every
+dereference of a raw pointer (`*p`, the whole pointee), index (`p[i]`,
+the element), field through one (`p.f`, the field) and slice made from
+one (`p[a..b]`, its bytes). The heap blocks the program allocates
+through C's `malloc`, `calloc`, `realloc` and `free` (std's included)
+are recorded; an access that starts in a live block and runs past its
+end, starts just past the end of one, runs into a block from below, or
+falls in one of the last 4096 blocks freed, stops the program with
+`unsafe access <what>: N bytes at offset K of a block of M bytes` and the
+access's place in the source (exit code 101), as do freeing a freed
+block. What it does not see is not checked: the stack and statics, memory
+C allocates, pointers C code dereferences, a function pointer to
+`malloc`. Programs run tens of times slower.
 
 ## Layout, conventions and C
 
@@ -445,12 +458,33 @@ function.
 *(0.5)* The compiler reports several errors at once, sorted by position (up
 to 50); the exit status is 1. After a syntax error the parser goes on at the
 next statement of the block (past its `;`, or up to the `}` that closes the
-block) or, outside a function, at the next item that starts a line; a
-program with syntax errors is not type-checked. The type checker goes on at
-the next statement of the function (or at the next function); the names a
-failed `let` binds have the error type, and errors that follow from it are
-not reported. An error in the declarations (struct fields, signatures,
-constants...) ends the checking. (0.4 stopped at the first error.)
+block) or, outside a function, at the next item that starts a line. The
+type checker goes on at the next statement of the function (or at the next
+function); the names a failed `let` binds have the error type, and errors
+that follow from it are not reported. (0.4 stopped at the first error.)
+
+*(0.10)* One compilation reports every error (up to 50), from every file
+of the program:
+
+- A program with syntax errors is type-checked too: every item that
+  parsed is checked, except the body of a function that had a syntax
+  error (its signature is). An item the parser skipped is unknown, and so
+  is what it declared: the errors saying so are not reported.
+- The declarations recover item by item, and within an item part by part
+  (a field's, a parameter's, the result's type...): a type that names
+  nothing is the error type; a duplicate (item, field, variant,
+  parameter, import, conflicting impl) is left out; a constant whose
+  initializer fails is 0; a cycle of fields is reported once and broken.
+  An import that fails, or a module whose file is missing, imports
+  nothing, and errors about its names are not reported. A function whose
+  impl block fails (an unknown trait or type) is left out.
+- An error in a C header is reported with the program's errors (at its
+  first `import`), and the program is checked without the headers.
+- An error in an instance of a generic function is reported once, with
+  the instantiation chain of the first instance that has it.
+- Errors print sorted by position (the files in the order they are
+  loaded); the same message at the same position is printed once. Only a
+  tokenizer error still ends the compilation at once.
 
 ## Additions of 0.4
 
@@ -783,24 +817,21 @@ does not say whether its function borrows: calling one with a pointer
 argument that is not a borrow is unsafe, and so is making a function
 with pointer parameters into a value (`let f = add_one;`).
 
-**Diagnostics.** An unsafe operation outside unsafe code is reported as
-`warning[unsafe]` (each place once, at most 50, in source order); the
-program still compiles. Options:
+**Diagnostics.** An unsafe operation outside unsafe code is an error,
+`error[unsafe]` (each place once, in source order, with the other
+errors; 0.9 reported it as a warning). Options:
 
-- `--deny-warnings`: warnings are errors (`error[unsafe]`); the test suite
-  compiles every case so.
-- `--allow-unsafe`: no unsafe warnings at all. The bootstrap passes it
-  (interface `tachyonc-0.9` in `bootstrap/releases.toml`) when it builds
-  the compiler's own source, which 0.8.0 compiles and which uses raw
-  pointers everywhere; releases before 0.9 are built as before.
+- `--deny-warnings`: warnings are errors. There are no warnings at the
+  moment (0.9's unsafe warnings are errors now); the option stays for
+  future ones, and the test suite compiles every case with it.
 - `tachyonc --fix-unsafe FILE...`: rewrites the program in place, putting
   each unsafe operation outside unsafe code in an unsafe block: the
   statement around it (consecutive statements share one block), a
   `let`'s value, a condition, a match arm or a block's tail. Nothing else
   changes; a second run finds nothing to do.
 
-In 0.10 the warning becomes an error (and the compiler's source is
-migrated with `--fix-unsafe`).
+0.9's `--allow-unsafe` (no unsafe warnings, for the compiler's own source,
+which 0.10 migrated) is gone: 0.10 rejects it.
 
 **std.** `panic`, `Buf::push_cstr` and `print_cstr` take C strings, which
 must end with a NUL: they are `unsafe fn` now (breaking). Everything else
@@ -903,6 +934,88 @@ slot).
   may name a C compiler for another system, e.g. `TACHYON_CC="clang
   --target=x86_64-linux-gnu --sysroot=DIR"` on macOS for `--target
   x86_64-linux`; without it, the error says so.
+
+## Additions of 0.10
+
+### Vector types
+
+Six types of 16 bytes (aligned to 16) hold several values ("lanes") of
+one scalar type, computed together (SIMD: NEON on AArch64, SSE2 on
+x86-64):
+
+| type | lanes | | type | lanes |
+|---|---|---|---|---|
+| `v2f64` | 2 × `f64` | | `v4i32` | 4 × `i32` |
+| `v4f32` | 4 × `f32` | | `v8i16` | 8 × `i16` |
+| `v2i64` | 2 × `i64` | | `v16i8` | 16 × `i8` |
+
+Their names are reserved like the primitive types' (no item may take
+one; a local of that name shadows the constructor). A vector is a value:
+it is copied by `=`, passed and returned like a struct; lane `i` lives
+at byte `i × size_of(lane)` (`[T; N]`'s layout), and a vector in memory
+may be read lane by lane through a pointer. Integer lanes are signed;
+there are no unsigned vector types.
+
+**Making vectors.**
+
+- `v4f32(a, b, c, d)`: one argument per lane, of the lane type, in order
+  (the lane count must match);
+- `v4f32::splat(x)`: every lane `x`;
+- `v4f32::load(s, i)`: lanes `s[i]`, `s[i + 1]`, ... `s[i + N - 1]` of `s`,
+  a slice or an array of the lane type; `i` is an `i64`. Checked: unless
+  `0 <= i` and `i + N <= len(s)`, the program stops with `slice range out
+  of bounds: i..i+N, length len` (exit code 101), as a bad slicing does.
+
+**Operations** (lane by lane, `a` and `b` of one vector type):
+
+- `a + b`, `a - b`, `a * b`, `-a`: on every vector type. Integer lanes
+  wrap at their width (two's complement, as the scalar operators); float
+  lanes follow IEEE 754 (binary64 or binary32, round to nearest even, one
+  rounding per operation: no fused multiply-add), NaN propagating.
+  `-a` on floats flips the sign bit (`-0.0` from `0.0`).
+- `a / b`: float vectors only (IEEE). **Integer vectors have no
+  division** (none of the targets has an instruction for it; write the
+  loop over the lanes).
+- `a & b`, `a | b`, `a ^ b`: integer vectors only, on the bits.
+- `a == b`, `a != b`, `a < b`, `a <= b`, `a > b`, `a >= b`: a **mask**,
+  the integer vector of the lanes' width (`v2i64` for `v2f64`, `v4i32`
+  for `v4f32`, the type itself for the integer vectors), each lane `-1`
+  (all bits set) where the comparison holds and `0` where it does not.
+  Integer comparisons are signed. Float comparisons are IEEE: with a NaN
+  lane, `==`, `<`, `<=`, `>`, `>=` are false and `!=` is true. (So
+  `a == b` is not a `bool`: `if a == b` is a type error.)
+- `m.select(a, b)`, for a mask `m` (an integer vector) and vectors `a`,
+  `b` whose mask type is `m`'s: `(a & m) | (b & ~m)` on the bits, so a
+  lane of `a` where `m`'s is `-1` and of `b` where it is `0`.
+- `+=`, `-=`, `*=`, `/=`, `&=`, `|=`, `^=`: as the operators, on a
+  vector place.
+
+**Lanes.**
+
+- `v.lane(i)`: lane `i` (an `i64`), of the lane type. Checked: unless `0
+  <= i < N`, the program stops with `index out of bounds: index i, length
+  N`.
+- `v.with_lane(i, x)`: `v` with lane `i` replaced by `x` (checked the
+  same way, before `x` is evaluated).
+- `v.sum()`: the sum of the lanes, of the lane type. Integer sums wrap.
+  Float sums are pairwise, which fixes the rounding: `l0 + l1` for two
+  lanes, `(l0 + l1) + (l2 + l3)` for four.
+- `v.store(s, i)`: writes the lanes to `s[i]` ... `s[i + N - 1]`, of a
+  slice or an array place (assigned, so a mutable one) of the lane type;
+  checked as `load`.
+
+A static (or a constant aggregate) may hold vectors made by `vNtT(...)`
+or `vNtT::splat(x)` of constant lanes.
+
+Operands are evaluated left to right, the receiver of a method first;
+each vector operand's value is taken when it is evaluated. Nothing about
+vectors is undefined behaviour.
+
+**C.** Vectors are not FFI-safe: an `extern "C"` signature, function
+pointer type or static cannot hold one (C's vector types and their
+conventions are not supported; pass a pointer to the lanes or an array).
+In tachyon's own convention a vector is passed like a struct of its
+lanes.
 
 ## Importing C headers
 

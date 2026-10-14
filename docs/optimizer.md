@@ -914,3 +914,171 @@ arithmetic: wrapping, shifts modulo the width), 2,000 times per rule and
 type; a rule that differs once fails. `--no-egraph` turns the rules off,
 to compare. The e-graph costs about 3% of the compiler's self-compile at
 `-O2`.
+
+## 0.10: vectors
+
+**Vector values.** The vector types of the language (`v2f64`, `v4f32`,
+`v2i64`, `v4i32`, `v8i16`, `v16i8`; grammar.md) are compound in the
+front end: an expression's value is the address of its 16 bytes, as for
+a struct. Lowering loads a vector operand once (when it is evaluated),
+computes with the vector instructions (`vbin.op`, `vcmp.cond`, `vsplat`,
+`vext`, `vins`, `vsum`, `vneg`, `vsel`) and stores the result into a new
+slot; scalar replacement keeps a vector slot's leaf whole, so the slots
+become SSA values. `-O0` computes lane by lane, through frame slots: it
+shares nothing with the vector instructions, and stays the oracle. Calls
+pass vectors as structs of their lanes (tachyon's convention); C's
+conventions for vectors are not supported (vectors are not FFI-safe).
+
+The vector instructions are pure, GVN numbers them and LICM moves them;
+nothing folds them, and the e-graph's rules (integer patterns) never
+match them. In the back end a vector lives in a float register as its
+128 bits: q/v registers on AArch64 (never d8-d15, whose upper halves a
+call does not keep: a vector interval's register class leaves them out),
+xmm on x86-64, both caller-saved; spills take two adjacent 8-byte slots,
+the spill area then 16-aligned. Each instruction is one NEON instruction
+on AArch64, except a 64-bit multiplication (lane by lane in x16 and
+x17). SSE2 has no 8-, 32- or 64-bit multiplication, no 64-bit
+comparison, and moves lanes to and from the integer registers poorly:
+those go lane by lane through the red zone below `%rsp` (System V
+leaves 128 bytes there for the function; nothing else in the generated
+code uses it). Both encoders (`enc_arm64.tach`, `enc_x86.tach`) learned
+the instructions; `tests/objcheck.sh` checks them against `cc -c`. AVX2
+is not used: Rosetta, where x86-64 is tested on Apple silicon, has none.
+
+**The loop vectorizer** (`vectorize.tach`, after the value ranges and
+before strength reduction). A candidate is an innermost counted loop
+(an induction variable `i` from `start`, step 1, to `n`, the latch's test
+`i + 1 < n` or `!=`) whose blocks form a chain from the header to the
+latch, each branching out only to checks that fail (blocks ending in
+`unreachable`). Every instruction is classified:
+
+- *uniform*: computed from `i` and loop invariants by pure operations
+  (addresses, indices), with its coefficient of `i` when it is affine
+  (`coef`); copied into the vector loop, where `i` is the first lane's;
+- *vector*: a load or store whose address has coefficient size(T)
+  (unit stride), arithmetic on such values (`+ - *`, `/` on floats,
+  `& | ^`, negation), and reductions: a header phi `r` whose next value is
+  `r op x` (op one of `+ - * & | ^`, integers only: a float sum would be
+  reassociated, which changes its rounding); the other operand of a
+  vector operation is a vector or the same in every iteration (a splat);
+- *skipped*: the latch's test and the checks (`idx <u len` with idx
+  uniform of coefficient 1, len invariant).
+
+All vector values have one element type T (an unsigned type uses the
+signed vector of its width; reductions convert back), so VF = 16 /
+size(T) lanes. Loops with calls, other phis, other control flow,
+non-unit or unknown strides, comparisons that are values, or a load from
+an invariant address in a loop that stores, are left alone.
+
+The transformation keeps the original loop as the remainder and the
+fallback, and puts before it:
+
+```
+C:  trips = n - start
+    ok = trips >= U*VF
+         && for each check: lo = idx(start) >= 0 && hi = idx(n-1) >= lo && hi < len
+         && for each store S and access A at another address:
+            [S(start), S(n-1)+size) and [A(start), A(n-1)+size) disjoint
+    branch ok, VP, SP
+VP: splats of invariants, the reductions' first vectors (the scalar start
+    in lane 0, the identity in the others; zeros for the further copies),
+    vend = start + (trips & -(U*VF))
+VH: U copies of the body (U = 2 for bodies of up to 40 instructions,
+    each copy with its own accumulators); i += U*VF; branch i != vend
+VX: accumulators combined, summed across lanes; branch vend == n, E, SP
+SP: i and the reductions from C or from VX; the scalar loop
+```
+
+`hi >= lo` catches an index that would wrap (the trip count is below
+2^63). The overlap tests go by groups of accesses whose addresses differ
+by a constant (one range each; a storing group whose accesses are at
+different offsets is a dependence, and the loop is left alone), so
+`v[0] ... v[6]` cost one test. A load at an address the same in every
+iteration is a scalar, its range part of the tests. So the vector loop runs exactly when the scalar loop would run
+every iteration without a failing check and without a store reaching
+memory another access (at a different address) reads or writes; else the
+scalar loop runs from where the vector loop stopped, or from the start,
+and stops where it would, at the same iteration. Exit values: the
+reductions' results, and uniform values at the last iteration (computed
+after the vector loop). The scalar loop's header is marked (`novec`,
+kept by inlining and cloning) so that it is not vectorized again;
+partial unrolling leaves the loops the vectorizer takes to it.
+
+**Outer loops.** A loop over j whose body is straight-line code around
+one inner loop over k (from a constant to a constant, by any step:
+unrolling may have made it 4) is vectorized over j: the copy of the
+whole nest (`clone_region`) runs VF values of j at once, the inner
+loop's phis that are not k become vectors (each lane accumulates exactly
+the scalar loop's sequence for its j: a float sum is fine here, nothing
+is reassociated), loads whose address has no j stay scalars (a splat
+where a vector needs them), and loads and stores at unit stride in j
+become vector accesses. The overlap test takes each group's range over
+both j and k: addresses affine in each (no j·k product), with the
+corners evaluated before the loop (both values of k when its coefficient
+is not a constant, `b[k * n + j]`). This is matmul's
+`for j { sum = 0.0; for k { sum += a[i][k] * b[k][j] } c[i][j] = sum }`.
+Scalar evolution's entry test (`entry_implies`) now also finds the guard
+in a block dominating the preheader (an inner loop's guard that the outer
+loop's made redundant was not found before).
+
+Tested by `tests/run/opt_vectorize.tach` (IR and assembly checks, every
+level, overlapping slices, a check failing part way),
+`opt_vectorize_outer.tach` (matrix-vector and matrix products, f64 and
+f32, an output overlapping the input),
+`tests/run/vector_*.tach`, and `tests/fuzz/run.sh -V`: random
+reductions, maps, stencils and explicit vector code over slices of
+random lengths and starts, overlapping slices of one array, slices too
+short for the loop, nested loops over raw pointers (an output overlapping
+the input now and then). `--no-vectorize` turns the vectorizer off.
+
+## 0.10: profiles
+
+`tachyonc --profile-generate FILE` (at `-O1` or `-O2`) instruments the
+program: after lowering, every IR block starts by incrementing its
+counter (a 64-bit load, add and store), and `main` starts with a call to
+the runtime (`profile.tach` holds its source, added to the program as the
+module `__profile`), which allocates the counters and registers, with
+`atexit`, the function writing them to FILE when the program exits (also
+through `exit`, a failed check included):
+
+```
+tachyon-profile 1
+fn <symbol> <checksum> <blocks>
+<count of block 0>
+...
+```
+
+Functions are in the compiler's order, so the file is deterministic for a
+deterministic program; a run overwrites it. `--profile-use FILE` reads it
+at the same point, where the IR of a function is exactly what its source
+gives (the same in both compilations): the counts go to the blocks
+(`BLOCKS[b].count`, -1 where unknown) of each function whose symbol and
+checksum (of its blocks' operations, terminators and successors, in
+order) match. A function changed since keeps no counts, with
+`warning[profile]: the profile of 'f' is stale ...`; a file that cannot
+be read is a warning too. `-O0` ignores `--profile-use`.
+
+The counts are hints. Passes that copy blocks keep them (inlining scales
+a callee's counts by the call site's over the callee's entry; loop
+cloning copies them); blocks made later are unknown. They decide:
+
+- **block layout** (`layout.tach`): the counts are the blocks'
+  frequencies (unknown ones estimated: an edge's block as the lesser of
+  its ends, others from their predecessors' shares), a branch's
+  successors share in proportion to their counts, and blocks that never
+  ran go last with the cold ones;
+- **inlining**: a call site that never ran is cold (inlined only if that
+  costs no size), a hot one (a 32nd of the profile's largest count, 64 at
+  least) takes callees up to 240 instructions (30, doubled per loop level,
+  otherwise);
+- **unrolling and vectorization**: a loop that never ran is neither
+  unrolled nor vectorized; a hot one may grow twice as much (192
+  instructions) when unrolled partially.
+
+Not done: hot/cold function splitting, profile-guided register
+allocation and scheduling. Tested by `tests/run/opt_profile.tach` (the
+test runner's `PROFILE` directive compiles a case with
+`--profile-generate`, runs it, then checks it compiled with the profile:
+the rare way of a branch out of the fall-through, a hot call inlined)
+and `opt_profile_stale.tach` (a checked-in profile, stale for one
+function).

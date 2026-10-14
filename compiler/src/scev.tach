@@ -30,6 +30,8 @@ use crate::loops::{
     loop_latch, loop_preheader, loop_size, mark_loop_blocks,
 };
 use crate::range::bits_of_value;
+use crate::vectorize::vectorizable_lanes;
+use crate::profile::{is_cold_block, is_hot_count};
 use crate::ir::Op::{Add, Cmp, Const, Conv, Mul, Phi, Sub};
 
 const UNROLL_FULL_TRIPS: i64 = 16;
@@ -39,76 +41,80 @@ const SIM_MAX_TRIPS: i64 = 4096;
 
 // The exit block of loop l when its only exit is the latch's branch, else 0.
 fn latch_exit(l: i64) -> i64 {
-    let h = loop_header(l);
-    let latch = loop_latch(l);
-    if latch == 0 || loop_preheader(l) == 0 || BLOCKS[latch].term != Term::Branch {
-        return 0;
-    }
-    let s0 = BLOCKS[latch].s0;
-    let s1 = BLOCKS[latch].s1;
-    if (s0 == h) == (s1 == h) {
-        return 0;
-    }
-    let exit = if s0 == h { s1 } else { s0 };
-    if loop_contains(l, exit) {
-        return 0;
-    }
-    for i in 0..loop_size(l) {
-        let b = loop_block(l, i);
-        if b == latch {
-            continue;
+    unsafe {
+        let h = loop_header(l);
+        let latch = loop_latch(l);
+        if latch == 0 || loop_preheader(l) == 0 || BLOCKS[latch].term != Term::Branch {
+            return 0;
         }
-        for k in 0..succ_count(b) {
-            if !loop_contains(l, succ(b, k)) {
-                return 0;
+        let s0 = BLOCKS[latch].s0;
+        let s1 = BLOCKS[latch].s1;
+        if (s0 == h) == (s1 == h) {
+            return 0;
+        }
+        let exit = if s0 == h { s1 } else { s0 };
+        if loop_contains(l, exit) {
+            return 0;
+        }
+        for i in 0..loop_size(l) {
+            let b = loop_block(l, i);
+            if b == latch {
+                continue;
+            }
+            for k in 0..succ_count(b) {
+                if !loop_contains(l, succ(b, k)) {
+                    return 0;
+                }
             }
         }
+        if BLOCKS[exit].preds.count != 1 {
+            return 0;
+        }
+        exit
     }
-    if BLOCKS[exit].preds.count != 1 {
-        return 0;
-    }
-    exit
 }
 
 // The constant step of header phi `phi` of loop l (an induction variable),
 // in *step; false when it is not one.
 pub fn iv_step(l: i64, phi: i64, step: *i64) -> bool {
-    let latch = loop_latch(l);
-    let h = loop_header(l);
-    if INSTS[phi].op != Phi || INSTS[phi].block != h || !is_integer(INSTS[phi].ty) {
-        return false;
-    }
-    let next = ir_val(ir_arg(phi, pred_index(h, latch)));
-    if INSTS[next].ty != INSTS[phi].ty {
-        return false;
-    }
-    // A chain of additions and subtractions of constants (as unrolling
-    // leaves them), back to the phi.
-    let ty = INSTS[phi].ty;
-    let mut total = 0;
-    let mut x = next;
-    for _ in 0..16 {
-        if x == phi {
-            *step = wrap_int(total, ty);
-            return x != next;
-        }
-        let op = INSTS[x].op;
-        let a = ir_val(INSTS[x].a);
-        let b = ir_val(INSTS[x].b);
-        if INSTS[x].ty != ty || (op != Add && op != Sub) {
+    unsafe {
+        let latch = loop_latch(l);
+        let h = loop_header(l);
+        if INSTS[phi].op != Phi || INSTS[phi].block != h || !is_integer(INSTS[phi].ty) {
             return false;
         }
-        if is_const(b) {
-            total = if op == Add { total + INSTS[b].imm } else { total - INSTS[b].imm };
-            x = a;
-        } else if op == Add && is_const(a) {
-            total += INSTS[a].imm;
-            x = b;
-        } else {
+        let next = ir_val(ir_arg(phi, pred_index(h, latch)));
+        if INSTS[next].ty != INSTS[phi].ty {
             return false;
         }
+        // A chain of additions and subtractions of constants (as unrolling
+        // leaves them), back to the phi.
+        let ty = INSTS[phi].ty;
+        let mut total = 0;
+        let mut x = next;
+        for _ in 0..16 {
+            if x == phi {
+                *step = wrap_int(total, ty);
+                return x != next;
+            }
+            let op = INSTS[x].op;
+            let a = ir_val(INSTS[x].a);
+            let b = ir_val(INSTS[x].b);
+            if INSTS[x].ty != ty || (op != Add && op != Sub) {
+                return false;
+            }
+            if is_const(b) {
+                total = if op == Add { total + INSTS[b].imm } else { total - INSTS[b].imm };
+                x = a;
+            } else if op == Add && is_const(a) {
+                total += INSTS[a].imm;
+                x = b;
+            } else {
+                return false;
+            }
+        }
+        false
     }
-    false
 }
 
 pub fn iv_start(l: i64, phi: i64) -> i64 {
@@ -131,112 +137,116 @@ static mut SIM_STAMP: i64 = 1099511627776;
 // The value of v in the current iteration of loop l, computed from the
 // header phis' values; *ok becomes false when it cannot be.
 fn sim_eval(l: i64, v: i64, ok: *bool) -> i64 {
-    if !*ok || v == 0 {
-        *ok = false;
-        return 0;
-    }
-    let op = INSTS[v].op;
-    if op == Const {
-        return INSTS[v].imm;
-    }
-    let b = INSTS[v].block;
-    if b == 0 || !loop_contains(l, b) {
-        *ok = false;
-        return 0;
-    }
-    if INSTS[v].mark == SIM_STAMP {
-        return INSTS[v].aux;
-    }
-    let mut result = 0;
-    if op == Phi {
-        let mut found = false;
-        for i in 0..SIM_PHIS.count {
-            if SIM_PHIS.data[i] == v && SIM_KNOWN.data[i] != 0 {
-                result = SIM_VALUE.data[i];
-                found = true;
+    unsafe {
+        if !*ok || v == 0 {
+            *ok = false;
+            return 0;
+        }
+        let op = INSTS[v].op;
+        if op == Const {
+            return INSTS[v].imm;
+        }
+        let b = INSTS[v].block;
+        if b == 0 || !loop_contains(l, b) {
+            *ok = false;
+            return 0;
+        }
+        if INSTS[v].mark == SIM_STAMP {
+            return INSTS[v].aux;
+        }
+        let mut result = 0;
+        if op == Phi {
+            let mut found = false;
+            for i in 0..SIM_PHIS.count {
+                if SIM_PHIS.data[i] == v && SIM_KNOWN.data[i] != 0 {
+                    result = SIM_VALUE.data[i];
+                    found = true;
+                }
             }
-        }
-        if !found {
+            if !found {
+                *ok = false;
+                return 0;
+            }
+        } else if op.is_pure() {
+            let a = sim_eval(l, INSTS[v].a, ok);
+            let mut bv = 0;
+            if op.is_binary() || op == Cmp {
+                bv = sim_eval(l, INSTS[v].b, ok);
+            }
+            if !*ok {
+                return 0;
+            }
+            result = fold_value(v, a, bv);
+            if fold_makes_nan(v, result) {
+                *ok = false;
+                return 0;
+            }
+        } else {
             *ok = false;
             return 0;
         }
-    } else if op.is_pure() {
-        let a = sim_eval(l, INSTS[v].a, ok);
-        let mut bv = 0;
-        if op.is_binary() || op == Cmp {
-            bv = sim_eval(l, INSTS[v].b, ok);
-        }
-        if !*ok {
-            return 0;
-        }
-        result = fold_value(v, a, bv);
-        if fold_makes_nan(v, result) {
-            *ok = false;
-            return 0;
-        }
-    } else {
-        *ok = false;
-        return 0;
+        INSTS[v].mark = SIM_STAMP;
+        INSTS[v].aux = result;
+        result
     }
-    INSTS[v].mark = SIM_STAMP;
-    INSTS[v].aux = result;
-    result
 }
 
 // The trip count of loop l (exit at the latch, `exit` its exit block) when
 // it is a constant up to `max`, else -1.
 fn constant_trip_count(l: i64, max: i64) -> i64 {
-    let h = loop_header(l);
-    let latch = loop_latch(l);
-    let pre = loop_preheader(l);
-    SIM_PHIS.count = 0;
-    SIM_KNOWN.count = 0;
-    SIM_VALUE.count = 0;
-    let mut phi = BLOCKS[h].first;
-    while phi != 0 && INSTS[phi].op == Phi {
-        let start = ir_val(ir_arg(phi, pred_index(h, pre)));
-        SIM_PHIS.push(phi);
-        SIM_KNOWN.push(if is_const(start) { 1 } else { 0 });
-        SIM_VALUE.push(if is_const(start) { INSTS[start].imm } else { 0 });
-        phi = INSTS[phi].next;
-    }
-    let continue_if = BLOCKS[latch].s0 == h;
-    let latch_index = pred_index(h, latch);
-    let mut nexts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-    for i in 0..SIM_PHIS.count {
-        nexts.push(ir_val(ir_arg(SIM_PHIS.data[i], latch_index)));
-    }
-    let mut trips = -1;
-    let mut k = 1;
-    while k <= max {
-        SIM_STAMP += 1;
-        let mut ok = true;
-        let c = sim_eval(l, BLOCKS[latch].cond, &ok);
-        if !ok {
-            break;
+    unsafe {
+        let h = loop_header(l);
+        let latch = loop_latch(l);
+        let pre = loop_preheader(l);
+        SIM_PHIS.count = 0;
+        SIM_KNOWN.count = 0;
+        SIM_VALUE.count = 0;
+        let mut phi = BLOCKS[h].first;
+        while phi != 0 && INSTS[phi].op == Phi {
+            let start = ir_val(ir_arg(phi, pred_index(h, pre)));
+            SIM_PHIS.push(phi);
+            SIM_KNOWN.push(if is_const(start) { 1 } else { 0 });
+            SIM_VALUE.push(if is_const(start) { INSTS[start].imm } else { 0 });
+            phi = INSTS[phi].next;
         }
-        if (c != 0) != continue_if {
-            trips = k;
-            break;
-        }
-        // The phis' values in the next iteration.
+        let continue_if = BLOCKS[latch].s0 == h;
+        let latch_index = pred_index(h, latch);
+        let mut nexts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for i in 0..SIM_PHIS.count {
-            let mut ok2 = true;
-            let value = sim_eval(l, nexts.data[i], &ok2);
-            SIM_KNOWN.push(if ok2 { 1 } else { 0 });
-            SIM_VALUE.push(value);
+            nexts.push(ir_val(ir_arg(SIM_PHIS.data[i], latch_index)));
         }
-        let n = SIM_PHIS.count;
-        for i in 0..n {
-            SIM_KNOWN.data[i] = SIM_KNOWN.data[n + i];
-            SIM_VALUE.data[i] = SIM_VALUE.data[n + i];
+        let mut trips = -1;
+        let mut k = 1;
+        while k <= max {
+            SIM_STAMP += 1;
+            let mut ok = true;
+            let c = sim_eval(l, BLOCKS[latch].cond, &ok);
+            if !ok {
+                break;
+            }
+            if (c != 0) != continue_if {
+                trips = k;
+                break;
+            }
+            // The phis' values in the next iteration.
+            for i in 0..SIM_PHIS.count {
+                let mut ok2 = true;
+                let value = sim_eval(l, nexts.data[i], &ok2);
+                SIM_KNOWN.push(if ok2 { 1 } else { 0 });
+                SIM_VALUE.push(value);
+            }
+            let n = SIM_PHIS.count;
+            for i in 0..n {
+                SIM_KNOWN.data[i] = SIM_KNOWN.data[n + i];
+                SIM_VALUE.data[i] = SIM_VALUE.data[n + i];
+            }
+            SIM_KNOWN.count = n;
+            SIM_VALUE.count = n;
+            k += 1;
         }
-        SIM_KNOWN.count = n;
-        SIM_VALUE.count = n;
-        k += 1;
+        free(nexts.data as *u8);
+        trips
     }
-    free(nexts.data as *u8);
-    trips
 }
 
 // ---- Counted loops and exit values ----
@@ -245,180 +255,194 @@ fn constant_trip_count(l: i64, max: i64) -> i64 {
 // constant step (+1 or -1), the bound (*bound) and whether the test is
 // `!=` (*ne); false when the latch's test is not one.
 pub fn counted_loop(l: i64, iv: *i64, step: *i64, bound: *i64, ne: *bool) -> bool {
-    let h = loop_header(l);
-    let latch = loop_latch(l);
-    let c = BLOCKS[latch].cond;
-    if INSTS[c].op != Cmp || !is_integer(INSTS[c].imm2) {
-        return false;
-    }
-    let mut cond = INSTS[c].cond;
-    let mut x = bits_of_value(INSTS[c].a);
-    let mut n = bits_of_value(INSTS[c].b);
-    if !invariant_in(l, n) {
-        let t = x;
-        x = n;
-        n = t;
-        cond = cond.mirror();
-    }
-    if !invariant_in(l, n) || invariant_in(l, x) {
-        return false;
-    }
-    if BLOCKS[latch].s0 != h {
-        cond = cond.negate();
-    }
-    // x must be the next value of a header phi.
-    let mut phi = BLOCKS[h].first;
-    while phi != 0 && INSTS[phi].op == Phi {
-        let mut s = 0;
-        if iv_next(l, phi) == x && iv_step(l, phi, &s)
-            && int_bits(INSTS[phi].ty) == int_bits(INSTS[c].imm2) {
-            let signed = is_signed(INSTS[c].imm2);
-            if s == 1 && (cond == Cond::Ne || cond == Cond::Lt) {
-                if cond == Cond::Lt && !entry_implies(l, iv_start(l, phi), n, Cond::Lt, signed) {
-                    return false;
-                }
-                *iv = phi;
-                *step = 1;
-                *bound = n;
-                *ne = cond == Cond::Ne;
-                return true;
-            }
-            if s == -1 && (cond == Cond::Ne || cond == Cond::Gt) {
-                if cond == Cond::Gt && !entry_implies(l, iv_start(l, phi), n, Cond::Gt, signed) {
-                    return false;
-                }
-                *iv = phi;
-                *step = -1;
-                *bound = n;
-                *ne = cond == Cond::Ne;
-                return true;
-            }
+    unsafe {
+        let h = loop_header(l);
+        let latch = loop_latch(l);
+        let c = BLOCKS[latch].cond;
+        if INSTS[c].op != Cmp || !is_integer(INSTS[c].imm2) {
             return false;
         }
-        phi = INSTS[phi].next;
+        let mut cond = INSTS[c].cond;
+        let mut x = bits_of_value(INSTS[c].a);
+        let mut n = bits_of_value(INSTS[c].b);
+        if !invariant_in(l, n) {
+            let t = x;
+            x = n;
+            n = t;
+            cond = cond.mirror();
+        }
+        if !invariant_in(l, n) || invariant_in(l, x) {
+            return false;
+        }
+        if BLOCKS[latch].s0 != h {
+            cond = cond.negate();
+        }
+        // x must be the next value of a header phi.
+        let mut phi = BLOCKS[h].first;
+        while phi != 0 && INSTS[phi].op == Phi {
+            let mut s = 0;
+            if iv_next(l, phi) == x && iv_step(l, phi, &s)
+                && int_bits(INSTS[phi].ty) == int_bits(INSTS[c].imm2) {
+                let signed = is_signed(INSTS[c].imm2);
+                if s == 1 && (cond == Cond::Ne || cond == Cond::Lt) {
+                    if cond == Cond::Lt && !entry_implies(l, iv_start(l, phi), n, Cond::Lt, signed) {
+                        return false;
+                    }
+                    *iv = phi;
+                    *step = 1;
+                    *bound = n;
+                    *ne = cond == Cond::Ne;
+                    return true;
+                }
+                if s == -1 && (cond == Cond::Ne || cond == Cond::Gt) {
+                    if cond == Cond::Gt && !entry_implies(l, iv_start(l, phi), n, Cond::Gt, signed) {
+                        return false;
+                    }
+                    *iv = phi;
+                    *step = -1;
+                    *bound = n;
+                    *ne = cond == Cond::Ne;
+                    return true;
+                }
+                return false;
+            }
+            phi = INSTS[phi].next;
+        }
+        false
     }
-    false
 }
 
 // Whether `a cond b` holds whenever loop l is entered: both constants, or a
 // branch on that comparison (the guard loop rotation leaves) decides the
-// way to the preheader through blocks with a single predecessor.
+// way to the preheader: through blocks with a single predecessor, or
+// (0.10) from a block dominating it (a guard an outer loop's made
+// redundant).
 fn entry_implies(l: i64, a: i64, b: i64, cond: Cond, signed: bool) -> bool {
-    let ty = if signed { TY_I64 } else { TY_U64 };
-    if is_const(a) && is_const(b) {
-        return fold_compare(cond, ty, INSTS[a].imm, INSTS[b].imm);
-    }
-    let mut x = loop_preheader(l);
-    for _ in 0..8 {
-        if BLOCKS[x].preds.count != 1 {
-            return false;
+    unsafe {
+        let ty = if signed { TY_I64 } else { TY_U64 };
+        if is_const(a) && is_const(b) {
+            return fold_compare(cond, ty, INSTS[a].imm, INSTS[b].imm);
         }
-        let p = BLOCKS[x].preds.data[0];
-        if BLOCKS[p].term == Term::Branch && BLOCKS[p].s0 != BLOCKS[p].s1 {
-            let c = BLOCKS[p].cond;
-            if INSTS[c].op == Cmp && is_signed(INSTS[c].imm2) == signed {
-                let mut k = INSTS[c].cond;
-                if BLOCKS[p].s0 != x {
-                    k = k.negate();
+        let mut x = loop_preheader(l);
+        for _ in 0..16 {
+            if BLOCKS[x].preds.count != 1 {
+                x = BLOCKS[x].idom;
+                if x == 0 {
+                    return false;
                 }
-                let ca = bits_of_value(INSTS[c].a);
-                let cb = bits_of_value(INSTS[c].b);
-                if ca == a && cb == b && k == cond {
-                    return true;
-                }
-                if ca == b && cb == a && k.mirror() == cond {
-                    return true;
+                continue;
+            }
+            let p = BLOCKS[x].preds.data[0];
+            if BLOCKS[p].term == Term::Branch && BLOCKS[p].s0 != BLOCKS[p].s1 {
+                let c = BLOCKS[p].cond;
+                if INSTS[c].op == Cmp && is_signed(INSTS[c].imm2) == signed {
+                    let mut k = INSTS[c].cond;
+                    if BLOCKS[p].s0 != x {
+                        k = k.negate();
+                    }
+                    let ca = bits_of_value(INSTS[c].a);
+                    let cb = bits_of_value(INSTS[c].b);
+                    if ca == a && cb == b && k == cond {
+                        return true;
+                    }
+                    if ca == b && cb == a && k.mirror() == cond {
+                        return true;
+                    }
                 }
             }
+            x = p;
         }
-        x = p;
+        false
     }
-    false
 }
 
 // Replaces the exit values of induction variables of counted loop l (the
 // operands of the exit block's phis) by expressions computed in the
 // preheader. Returns whether any was.
 fn replace_exit_values(fi: i64, l: i64, exit: i64) -> bool {
-    let mut iv = 0;
-    let mut step = 0;
-    let mut n = 0;
-    let mut ne = false;
-    if !counted_loop(l, &iv, &step, &n, &ne) {
-        return false;
+    unsafe {
+        let mut iv = 0;
+        let mut step = 0;
+        let mut n = 0;
+        let mut ne = false;
+        if !counted_loop(l, &iv, &step, &n, &ne) {
+            return false;
+        }
+        IRF = fi;
+        let pre = loop_preheader(l);
+        let h = loop_header(l);
+        let ty = INSTS[iv].ty;
+        let start = iv_start(l, iv);
+        let mut trips = 0;
+        let mut changed = false;
+        let mut phi = BLOCKS[exit].first;
+        while phi != 0 && INSTS[phi].op == Phi {
+            let w = ir_val(ir_arg(phi, 0));
+            phi = INSTS[phi].next;
+            if invariant_in(l, w) {
+                continue;
+            }
+            // w is a header phi p or its next value, p {s2, +, c2}.
+            let mut p = 0;
+            let mut is_next = false;
+            let mut x = BLOCKS[h].first;
+            while x != 0 && INSTS[x].op == Phi {
+                if x == w {
+                    p = x;
+                    is_next = false;
+                    break;
+                }
+                if p == 0 && iv_next(l, x) == w {
+                    p = x;
+                    is_next = true;
+                }
+                x = INSTS[x].next;
+            }
+            let mut c2 = 0;
+            if p == 0 || !iv_step(l, p, &c2) || int_bits(INSTS[p].ty) > int_bits(ty) {
+                continue;
+            }
+            let ty2 = INSTS[p].ty;
+            let mut value = 0;
+            if p == iv && is_next {
+                value = n;
+                if INSTS[n].ty != ty {
+                    value = append_inst(pre, Conv, ty, n, 0);
+                    INSTS[value].imm2 = INSTS[n].ty;
+                }
+            } else {
+                if trips == 0 {
+                    trips = append_inst(pre, Sub, ty, if step == 1 { n } else { start },
+                        if step == 1 { start } else { n });
+                }
+                let mut count = trips;
+                if ty2 != ty {
+                    count = append_inst(pre, Conv, ty2, trips, 0);
+                    INSTS[count].imm2 = ty;
+                }
+                if !is_next {
+                    count = append_inst(pre, Sub, ty2, count, append_const(pre, 1, ty2));
+                }
+                let scaled = append_inst(pre, Mul, ty2, count, append_const(pre, c2, ty2));
+                value = append_inst(pre, Add, ty2, iv_start(l, p), scaled);
+            }
+            set_exit_operand(exit, w, value);
+            changed = true;
+        }
+        changed
     }
-    IRF = fi;
-    let pre = loop_preheader(l);
-    let h = loop_header(l);
-    let ty = INSTS[iv].ty;
-    let start = iv_start(l, iv);
-    let mut trips = 0;
-    let mut changed = false;
-    let mut phi = BLOCKS[exit].first;
-    while phi != 0 && INSTS[phi].op == Phi {
-        let w = ir_val(ir_arg(phi, 0));
-        phi = INSTS[phi].next;
-        if invariant_in(l, w) {
-            continue;
-        }
-        // w is a header phi p or its next value, p {s2, +, c2}.
-        let mut p = 0;
-        let mut is_next = false;
-        let mut x = BLOCKS[h].first;
-        while x != 0 && INSTS[x].op == Phi {
-            if x == w {
-                p = x;
-                is_next = false;
-                break;
-            }
-            if p == 0 && iv_next(l, x) == w {
-                p = x;
-                is_next = true;
-            }
-            x = INSTS[x].next;
-        }
-        let mut c2 = 0;
-        if p == 0 || !iv_step(l, p, &c2) || int_bits(INSTS[p].ty) > int_bits(ty) {
-            continue;
-        }
-        let ty2 = INSTS[p].ty;
-        let mut value = 0;
-        if p == iv && is_next {
-            value = n;
-            if INSTS[n].ty != ty {
-                value = append_inst(pre, Conv, ty, n, 0);
-                INSTS[value].imm2 = INSTS[n].ty;
-            }
-        } else {
-            if trips == 0 {
-                trips = append_inst(pre, Sub, ty, if step == 1 { n } else { start },
-                    if step == 1 { start } else { n });
-            }
-            let mut count = trips;
-            if ty2 != ty {
-                count = append_inst(pre, Conv, ty2, trips, 0);
-                INSTS[count].imm2 = ty;
-            }
-            if !is_next {
-                count = append_inst(pre, Sub, ty2, count, append_const(pre, 1, ty2));
-            }
-            let scaled = append_inst(pre, Mul, ty2, count, append_const(pre, c2, ty2));
-            value = append_inst(pre, Add, ty2, iv_start(l, p), scaled);
-        }
-        set_exit_operand(exit, w, value);
-        changed = true;
-    }
-    changed
 }
 
 // Sets the operand w of the phis of block `exit` (one predecessor) to v.
 fn set_exit_operand(exit: i64, w: i64, v: i64) {
-    let mut phi = BLOCKS[exit].first;
-    while phi != 0 && INSTS[phi].op == Phi {
-        if ir_val(ir_arg(phi, 0)) == w {
-            ir_set_arg(phi, 0, v);
+    unsafe {
+        let mut phi = BLOCKS[exit].first;
+        while phi != 0 && INSTS[phi].op == Phi {
+            if ir_val(ir_arg(phi, 0)) == w {
+                ir_set_arg(phi, 0, v);
+            }
+            phi = INSTS[phi].next;
         }
-        phi = INSTS[phi].next;
     }
 }
 
@@ -446,41 +470,43 @@ fn loop_is_finite(l: i64) -> bool {
 // Removes loop l (innermost, exit at the latch to `exit`) when it is
 // finite, has no side effects and none of its values is used after it.
 fn delete_dead_loop(fi: i64, l: i64, exit: i64) -> bool {
-    if !is_innermost(l) {
-        return false;
-    }
-    for i in 0..loop_size(l) {
-        let mut v = BLOCKS[loop_block(l, i)].first;
-        while v != 0 {
-            if has_effect(v) {
-                return false;
-            }
-            v = INSTS[v].next;
-        }
-    }
-    let mut phi = BLOCKS[exit].first;
-    while phi != 0 && INSTS[phi].op == Phi {
-        if !invariant_in(l, ir_val(ir_arg(phi, 0))) {
+    unsafe {
+        if !is_innermost(l) {
             return false;
         }
-        phi = INSTS[phi].next;
+        for i in 0..loop_size(l) {
+            let mut v = BLOCKS[loop_block(l, i)].first;
+            while v != 0 {
+                if has_effect(v) {
+                    return false;
+                }
+                v = INSTS[v].next;
+            }
+        }
+        let mut phi = BLOCKS[exit].first;
+        while phi != 0 && INSTS[phi].op == Phi {
+            if !invariant_in(l, ir_val(ir_arg(phi, 0))) {
+                return false;
+            }
+            phi = INSTS[phi].next;
+        }
+        if !loop_is_finite(l) {
+            return false;
+        }
+        let pre = loop_preheader(l);
+        let latch = loop_latch(l);
+        // The preheader jumps to the exit instead (its phis keep their
+        // operands, all defined before the loop).
+        BLOCKS[exit].preds.data[0] = pre;
+        BLOCKS[pre].s0 = exit;
+        remove_pred(loop_header(l), pre);
+        BLOCKS[latch].term = Term::Jump;
+        BLOCKS[latch].s0 = loop_header(l);
+        BLOCKS[latch].s1 = 0;
+        BLOCKS[latch].cond = 0;
+        remove_unreachable(fi);
+        true
     }
-    if !loop_is_finite(l) {
-        return false;
-    }
-    let pre = loop_preheader(l);
-    let latch = loop_latch(l);
-    // The preheader jumps to the exit instead (its phis keep their
-    // operands, all defined before the loop).
-    BLOCKS[exit].preds.data[0] = pre;
-    BLOCKS[pre].s0 = exit;
-    remove_pred(loop_header(l), pre);
-    BLOCKS[latch].term = Term::Jump;
-    BLOCKS[latch].s0 = loop_header(l);
-    BLOCKS[latch].s1 = 0;
-    BLOCKS[latch].cond = 0;
-    remove_unreachable(fi);
-    true
 }
 
 // ---- Unrolling ----
@@ -491,104 +517,106 @@ fn delete_dead_loop(fi: i64, l: i64, exit: i64) -> bool {
 // then chained: each copy's header phis become the previous copy's values
 // for the next iteration, each latch but the last jumps to the next copy.
 fn unroll_loop(fi: i64, l: i64, exit: i64, trips: i64, factor: i64) {
-    IRF = fi;
-    let h = loop_header(l);
-    let latch = loop_latch(l);
-    let latch_index = pred_index(h, latch);
-    let stamp = mark_loop_blocks(l);
-    let mut region = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-    for i in 0..LP_LIST2.count {
-        region.push(LP_LIST2.data[i]);
-    }
-    let mut phis = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-    let mut phi = BLOCKS[h].first;
-    while phi != 0 && INSTS[phi].op == Phi {
-        phis.push(phi);
-        phi = INSTS[phi].next;
-    }
-    let mut exits = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-    phi = BLOCKS[exit].first;
-    while phi != 0 && INSTS[phi].op == Phi {
-        exits.push(phi);
-        phi = INSTS[phi].next;
-    }
-    let np = phis.count;
-    let ne = exits.count;
-    // Per copy k: header, latch, header phis (np), next values (np), exit
-    // values (ne).
-    let mut hdr = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-    let mut lat = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-    let mut cphi = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-    let mut next = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-    let mut outv = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-    hdr.push(h);
-    lat.push(latch);
-    for i in 0..np {
-        cphi.push(phis.data[i]);
-        next.push(ir_val(ir_arg(phis.data[i], latch_index)));
-    }
-    for i in 0..ne {
-        outv.push(ir_val(ir_arg(exits.data[i], 0)));
-    }
-    for _ in 1..factor {
-        clone_region(fi, &region, stamp);
-        hdr.push(BLOCKS[h].aux);
-        lat.push(BLOCKS[latch].aux);
+    unsafe {
+        IRF = fi;
+        let h = loop_header(l);
+        let latch = loop_latch(l);
+        let latch_index = pred_index(h, latch);
+        let stamp = mark_loop_blocks(l);
+        let mut region = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..LP_LIST2.count {
+            region.push(LP_LIST2.data[i]);
+        }
+        let mut phis = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut phi = BLOCKS[h].first;
+        while phi != 0 && INSTS[phi].op == Phi {
+            phis.push(phi);
+            phi = INSTS[phi].next;
+        }
+        let mut exits = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        phi = BLOCKS[exit].first;
+        while phi != 0 && INSTS[phi].op == Phi {
+            exits.push(phi);
+            phi = INSTS[phi].next;
+        }
+        let np = phis.count;
+        let ne = exits.count;
+        // Per copy k: header, latch, header phis (np), next values (np), exit
+        // values (ne).
+        let mut hdr = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut lat = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut cphi = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut next = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut outv = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        hdr.push(h);
+        lat.push(latch);
         for i in 0..np {
-            cphi.push(INSTS[phis.data[i]].aux);
-            next.push(clone_map(ir_val(ir_arg(phis.data[i], latch_index)), stamp));
+            cphi.push(phis.data[i]);
+            next.push(ir_val(ir_arg(phis.data[i], latch_index)));
         }
         for i in 0..ne {
-            outv.push(clone_map(ir_val(ir_arg(exits.data[i], 0)), stamp));
+            outv.push(ir_val(ir_arg(exits.data[i], 0)));
         }
-    }
-    for k in 1..factor {
-        for i in 0..np {
-            ir_replace(cphi.data[k * np + i], next.data[(k - 1) * np + i]);
+        for _ in 1..factor {
+            clone_region(fi, &region, stamp);
+            hdr.push(BLOCKS[h].aux);
+            lat.push(BLOCKS[latch].aux);
+            for i in 0..np {
+                cphi.push(INSTS[phis.data[i]].aux);
+                next.push(clone_map(ir_val(ir_arg(phis.data[i], latch_index)), stamp));
+            }
+            for i in 0..ne {
+                outv.push(clone_map(ir_val(ir_arg(exits.data[i], 0)), stamp));
+            }
         }
-        let ch = hdr.data[k];
-        BLOCKS[ch].preds.count = 0;
-        BLOCKS[ch].preds.push(lat.data[k - 1]);
-        let pl = lat.data[k - 1];
-        BLOCKS[pl].term = Term::Jump;
-        BLOCKS[pl].cond = 0;
-        BLOCKS[pl].s0 = ch;
-        BLOCKS[pl].s1 = 0;
-    }
-    let last = lat.data[factor - 1];
-    if factor == trips {
-        BLOCKS[last].term = Term::Jump;
-        BLOCKS[last].cond = 0;
-        BLOCKS[last].s0 = exit;
-        BLOCKS[last].s1 = 0;
-        remove_pred(h, latch);
-    } else {
-        // The last copy's branch went back to its own header.
-        let own = hdr.data[factor - 1];
-        if BLOCKS[last].s0 == own {
-            BLOCKS[last].s0 = h;
+        for k in 1..factor {
+            for i in 0..np {
+                ir_replace(cphi.data[k * np + i], next.data[(k - 1) * np + i]);
+            }
+            let ch = hdr.data[k];
+            BLOCKS[ch].preds.count = 0;
+            BLOCKS[ch].preds.push(lat.data[k - 1]);
+            let pl = lat.data[k - 1];
+            BLOCKS[pl].term = Term::Jump;
+            BLOCKS[pl].cond = 0;
+            BLOCKS[pl].s0 = ch;
+            BLOCKS[pl].s1 = 0;
+        }
+        let last = lat.data[factor - 1];
+        if factor == trips {
+            BLOCKS[last].term = Term::Jump;
+            BLOCKS[last].cond = 0;
+            BLOCKS[last].s0 = exit;
+            BLOCKS[last].s1 = 0;
+            remove_pred(h, latch);
         } else {
-            BLOCKS[last].s1 = h;
+            // The last copy's branch went back to its own header.
+            let own = hdr.data[factor - 1];
+            if BLOCKS[last].s0 == own {
+                BLOCKS[last].s0 = h;
+            } else {
+                BLOCKS[last].s1 = h;
+            }
+            BLOCKS[h].preds.data[latch_index] = last;
+            for i in 0..np {
+                ir_set_arg(phis.data[i], latch_index, next.data[(factor - 1) * np + i]);
+            }
         }
-        BLOCKS[h].preds.data[latch_index] = last;
-        for i in 0..np {
-            ir_set_arg(phis.data[i], latch_index, next.data[(factor - 1) * np + i]);
+        BLOCKS[exit].preds.data[0] = last;
+        for i in 0..ne {
+            ir_set_arg(exits.data[i], 0, outv.data[(factor - 1) * ne + i]);
         }
+        free(region.data as *u8);
+        free(phis.data as *u8);
+        free(exits.data as *u8);
+        free(hdr.data as *u8);
+        free(lat.data as *u8);
+        free(cphi.data as *u8);
+        free(next.data as *u8);
+        free(outv.data as *u8);
+        resolve_all(fi);
+        remove_trivial_phis(fi);
     }
-    BLOCKS[exit].preds.data[0] = last;
-    for i in 0..ne {
-        ir_set_arg(exits.data[i], 0, outv.data[(factor - 1) * ne + i]);
-    }
-    free(region.data as *u8);
-    free(phis.data as *u8);
-    free(exits.data as *u8);
-    free(hdr.data as *u8);
-    free(lat.data as *u8);
-    free(cphi.data as *u8);
-    free(next.data as *u8);
-    free(outv.data as *u8);
-    resolve_all(fi);
-    remove_trivial_phis(fi);
 }
 
 // Unrolls loop l when its trip count allows; returns whether it did.
@@ -598,25 +626,39 @@ fn try_unroll(fi: i64, l: i64, exit: i64) -> bool {
     if trips < 1 {
         return false;
     }
+    // (0.10: with a profile, a loop that never ran stays as it is, and a
+    // hot one may grow twice as much)
+    let h = loop_header(l);
+    if is_cold_block(h) && trips > 1 {
+        return false;
+    }
+    let partial = if is_hot_count(unsafe { BLOCKS[h].count }) { 2 * UNROLL_PARTIAL_SIZE } else { UNROLL_PARTIAL_SIZE };
     let mut factor = 0;
     if trips <= UNROLL_FULL_TRIPS && trips * size <= UNROLL_FULL_SIZE {
         factor = trips;
-    } else if is_innermost(l) && trips % 4 == 0 && 4 * size <= UNROLL_PARTIAL_SIZE {
+    } else if is_innermost(l) && trips % 4 == 0 && 4 * size <= partial {
         factor = 4;
-    } else if is_innermost(l) && trips % 2 == 0 && 2 * size <= UNROLL_PARTIAL_SIZE {
+    } else if is_innermost(l) && trips % 2 == 0 && 2 * size <= partial {
         factor = 2;
     }
     if factor < 2 && factor != trips {
+        return false;
+    }
+    // (0.10: a loop the vectorizer takes, when it runs a vector iteration)
+    let lanes = vectorizable_lanes(l);
+    if lanes > 0 && trips >= lanes {
         return false;
     }
     if factor == 1 {
         // One trip: the loop is its body; dropping the back edge is all.
         let latch = loop_latch(l);
         let h = loop_header(l);
-        BLOCKS[latch].term = Term::Jump;
-        BLOCKS[latch].cond = 0;
-        BLOCKS[latch].s0 = exit;
-        BLOCKS[latch].s1 = 0;
+        unsafe {
+            BLOCKS[latch].term = Term::Jump;
+            BLOCKS[latch].cond = 0;
+            BLOCKS[latch].s0 = exit;
+            BLOCKS[latch].s1 = 0;
+        }
         remove_pred(h, latch);
         resolve_all(fi);
         remove_trivial_phis(fi);
@@ -631,58 +673,60 @@ fn try_unroll(fi: i64, l: i64, exit: i64) -> bool {
 // Exit values, dead loops and unrolling over the loops of fi, innermost
 // first. Returns whether anything changed.
 pub fn transform_loops(fi: i64) -> bool {
-    let mut changed = false;
-    // Each loop is unrolled at most once: its header is remembered.
-    let mut done = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-    for _ in 0..200 {
-        canonicalize_loops(fi);
-        let mut did = false;
-        // Deepest loops first.
-        let mut best_depth = 0;
-        for l in 0..loop_count() {
-            if LP_DEPTH.data[l] > best_depth {
-                best_depth = LP_DEPTH.data[l];
-            }
-        }
-        let mut depth = best_depth;
-        while depth >= 1 && !did {
+    unsafe {
+        let mut changed = false;
+        // Each loop is unrolled at most once: its header is remembered.
+        let mut done = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for _ in 0..200 {
+            canonicalize_loops(fi);
+            let mut did = false;
+            // Deepest loops first.
+            let mut best_depth = 0;
             for l in 0..loop_count() {
-                if LP_DEPTH.data[l] != depth || loop_header(l) == IRFUNCS[fi].entry {
-                    continue;
+                if LP_DEPTH.data[l] > best_depth {
+                    best_depth = LP_DEPTH.data[l];
                 }
-                let h = loop_header(l);
-                let mut seen = false;
-                for i in 0..done.count {
-                    if done.data[i] == h {
-                        seen = true;
+            }
+            let mut depth = best_depth;
+            while depth >= 1 && !did {
+                for l in 0..loop_count() {
+                    if LP_DEPTH.data[l] != depth || loop_header(l) == IRFUNCS[fi].entry {
+                        continue;
+                    }
+                    let h = loop_header(l);
+                    let mut seen = false;
+                    for i in 0..done.count {
+                        if done.data[i] == h {
+                            seen = true;
+                        }
+                    }
+                    if seen || !is_canonical(l) {
+                        continue;
+                    }
+                    let exit = latch_exit(l);
+                    if exit == 0 {
+                        continue;
+                    }
+                    done.push(h);
+                    form_lcssa(fi, l);
+                    resolve_all(fi);
+                    let replaced = replace_exit_values(fi, l, exit);
+                    if delete_dead_loop(fi, l, exit) || try_unroll(fi, l, exit) || replaced {
+                        did = true;
+                        break;
                     }
                 }
-                if seen || !is_canonical(l) {
-                    continue;
-                }
-                let exit = latch_exit(l);
-                if exit == 0 {
-                    continue;
-                }
-                done.push(h);
-                form_lcssa(fi, l);
-                resolve_all(fi);
-                let replaced = replace_exit_values(fi, l, exit);
-                if delete_dead_loop(fi, l, exit) || try_unroll(fi, l, exit) || replaced {
-                    did = true;
-                    break;
-                }
+                depth -= 1;
             }
-            depth -= 1;
+            if !did {
+                break;
+            }
+            changed = true;
+            resolve_all(fi);
+            remove_trivial_phis(fi);
+            verify_func(fi, c"loop transformations");
         }
-        if !did {
-            break;
-        }
-        changed = true;
-        resolve_all(fi);
-        remove_trivial_phis(fi);
-        verify_func(fi, c"loop transformations");
+        free(done.data as *u8);
+        changed
     }
-    free(done.data as *u8);
-    changed
 }

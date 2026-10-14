@@ -21,8 +21,8 @@ use crate::lexer::{STRS, STR_COUNT, Tok};
 use crate::cimport::drop_shadowed_imports;
 use crate::cheader::emit_c_header;
 use crate::ast::{
-    DEFERS, DEFER_LOOPS, NODES, NodeKind, child, defer_loop_depth, defer_loop_enter,
-    defer_loop_leave, init_ast,
+    DEFERS, DEFER_LOOPS, NODES, NodeKind, VK_LANE, VK_LOAD, VK_NEW, VK_SELECT, VK_SPLAT, VK_STORE,
+    VK_SUM, VK_WITH, child, defer_loop_depth, defer_loop_enter, defer_loop_leave, init_ast,
 };
 use crate::parser::{is_comparison, parse_program};
 use crate::types::{
@@ -30,7 +30,7 @@ use crate::types::{
     TY_U8, TY_UNIT, TyKind, VARIANTS, align_to, field_offset, fn_param, init_declarations,
     init_types, is_compound, is_float, is_integer, is_signed, is_slice, is_void, max_i64,
     scalar_type, struct_field, tuple_offset, type_align, type_elem, type_size, variant_field,
-    variant_field_offset,
+    variant_field_offset, TY_I64, is_vector, vec_elem, vec_lanes, vec_mask_type,
 };
 use crate::check::{LOCALS, Res, check_program, type_error};
 use crate::consteval::{CONST_RELOCS, const_emit, const_value, f64_of_bits, float_const, wrap_int};
@@ -58,6 +58,7 @@ use crate::target::{
 use crate::x86_64::{x64_realign_pushed, x64_restore_sp};
 use crate::ir::{Cond, IRFUNC_COUNT, cond_of_token, print_ir_func};
 use crate::lower::{is_fresh, lower_program};
+use crate::profile::profile_after_lowering;
 use crate::opt::{OPT_LEVEL, optimize_program};
 use crate::inline::FN_LIVE;
 use crate::isel::select_instructions;
@@ -118,15 +119,17 @@ fn alloc_slot(size: i64, align: i64) -> i64 {
 // a slot, or of a field inside one: `slot - field`), as its index in
 // OVERALIGNED, or -1.
 pub fn overaligned_slot(offset: i64) -> i64 {
-    let mut i = 0;
-    while i < OVERALIGNED.count {
-        let slot = OVERALIGNED.data[i];
-        if offset <= slot && offset > slot - OVERALIGNED.data[i + 2] {
-            return i;
+    unsafe {
+        let mut i = 0;
+        while i < OVERALIGNED.count {
+            let slot = OVERALIGNED.data[i];
+            if offset <= slot && offset > slot - OVERALIGNED.data[i + 2] {
+                return i;
+            }
+            i += 3;
         }
-        i += 3;
+        -1
     }
-    -1
 }
 
 // A frame slot for a value of type `ty`; compound values get a multiple
@@ -137,140 +140,168 @@ fn alloc_slot_for(ty: i64) -> i64 {
 }
 
 pub fn fn_symbol_prefix(f: i64) -> *u8 {
-    if FNS[f].is_extern || FNS[f].export || FNS[f].name == MAIN_SYM { global_prefix() } else { function_prefix() }
+    if unsafe { FNS[f].is_extern || FNS[f].export || FNS[f].name == MAIN_SYM } { global_prefix() } else { function_prefix() }
 }
 
 // Whether function f has a global (C-visible) symbol.
 pub fn fn_is_global(f: i64) -> bool {
-    FNS[f].name == MAIN_SYM || FNS[f].export
+    unsafe { FNS[f].name == MAIN_SYM || FNS[f].export }
 }
 
 // R_ACC (or `reg` with the machine layer) = the address of static `name`:
 // through the GOT when C defines it.
 fn emit_static_addr(name: i64) {
-    let s = SYM_STATIC[name] - 1;
-    let linkage = STATICS[s].linkage;
-    if linkage == 1 {
-        emit_extern_symbol_addr(name);
-    } else {
-        emit_local_symbol_addr(static_symbol_prefix(s), name);
+    unsafe {
+        let s = SYM_STATIC[name] - 1;
+        let linkage = STATICS[s].linkage;
+        if linkage == 1 {
+            emit_extern_symbol_addr(name);
+        } else {
+            emit_local_symbol_addr(static_symbol_prefix(s), name);
+        }
     }
 }
 
 pub fn static_symbol_prefix(s: i64) -> *u8 {
-    if STATICS[s].linkage != 0 { global_prefix() } else { static_prefix() }
+    if unsafe { STATICS[s].linkage != 0 } { global_prefix() } else { static_prefix() }
 }
 
 // ---- The program ----
 
 pub fn compile_program(output: *u8) {
-    let mut t = timer_now();
-    init_ast();
-    ERR_KIND = c"parser error";
-    let program = parse_program();
-    if IMPORTED_START >= 0 {
-        drop_shadowed_imports(program);
-    }
-    timer_add(T_PARSE, t);
-    t = timer_now();
-    MAIN_SYM = intern_c(c"main");
-    init_types();
-    init_declarations();
-    ERR_KIND = c"type error";
-    check_program(program);
-    timer_add(T_CHECK, t);
-    if FIX_IMPORTS {
-        fix_imports();
-        exit(0);
-    }
-    if FIX_UNSAFE {
-        fix_unsafe();
-        exit(0);
-    }
-    flush_warnings();
-    if EMIT_HEADER {
-        emit_c_header(program, output);
-        return;
-    }
-    ASM = buf_new();
-    DATA = buf_new();
-    CODE = buf_new();
-    if OPT_LEVEL > 0 || EMIT_IR {
+    unsafe {
+        let mut t = timer_now();
+        init_ast();
+        ERR_KIND = c"parser error";
+        let program = parse_program();
+        if IMPORTED_START >= 0 {
+            drop_shadowed_imports(program);
+        }
+        timer_add(T_PARSE, t);
         t = timer_now();
-        lower_program(program);
-        timer_add(T_LOWER, t);
-        optimize_program();
-        if EMIT_IR {
-            for fi in 0..IRFUNC_COUNT {
-                if FN_LIVE[fi] != 0 {
-                    print_ir_func(ASM, fi);
-                }
-            }
-            buf_write_file(ASM, output);
+        MAIN_SYM = intern_c(c"main");
+        init_types();
+        init_declarations();
+        ERR_KIND = c"type error";
+        check_program(program);
+        timer_add(T_CHECK, t);
+        if FIX_IMPORTS {
+            fix_imports();
+            exit(0);
+        }
+        if FIX_UNSAFE {
+            fix_unsafe();
+            exit(0);
+        }
+        flush_warnings();
+        if EMIT_HEADER {
+            emit_c_header(program, output);
             return;
         }
+        ASM = buf_new();
+        DATA = buf_new();
+        CODE = buf_new();
+        if OPT_LEVEL > 0 || EMIT_IR {
+            t = timer_now();
+            lower_program(program);
+            // (0.10: profiles, on the IR as lowered)
+            profile_after_lowering();
+            flush_warnings();
+            timer_add(T_LOWER, t);
+            optimize_program();
+            if EMIT_IR {
+                for fi in 0..IRFUNC_COUNT {
+                    if FN_LIVE[fi] != 0 {
+                        print_ir_func(ASM, fi);
+                    }
+                }
+                buf_write_file(ASM, output);
+                return;
+            }
+            t = timer_now();
+            select_instructions();
+            timer_add(T_ISEL, t);
+            if EMIT_MIR {
+                for fi in 0..IRFUNC_COUNT {
+                    if FN_LIVE[fi] != 0 {
+                        print_ir_func(ASM, fi);
+                    }
+                }
+                buf_write_file(ASM, output);
+                return;
+            }
+            count_uses();
+        }
         t = timer_now();
-        select_instructions();
-        timer_add(T_ISEL, t);
-        if EMIT_MIR {
+        emit_file_header();
+        if OPT_LEVEL > 0 {
             for fi in 0..IRFUNC_COUNT {
                 if FN_LIVE[fi] != 0 {
-                    print_ir_func(ASM, fi);
+                    gen_ir_function(fi);
                 }
             }
-            buf_write_file(ASM, output);
-            return;
-        }
-        count_uses();
-    }
-    t = timer_now();
-    emit_file_header();
-    if OPT_LEVEL > 0 {
-        for fi in 0..IRFUNC_COUNT {
-            if FN_LIVE[fi] != 0 {
-                gen_ir_function(fi);
+            print_stats();
+        } else {
+            for i in 0..NODES[program].count {
+                let item = child(program, i);
+                if NODES[item].kind == Fn {
+                    gen_function(item);
+                }
             }
         }
-        print_stats();
-    } else {
-        for i in 0..NODES[program].count {
-            let item = child(program, i);
-            if NODES[item].kind == Fn {
-                gen_function(item);
-            }
-        }
+        timer_add(T_CODEGEN, t);
+        t = timer_now();
+        emit_runtime();
+        gen_data();
+        buf_bytes(ASM, buf_slice(DATA));
+        emit_file_trailer();
+        write_output(output);
+        timer_add(T_OUTPUT, t);
+        timer_report();
     }
-    timer_add(T_CODEGEN, t);
-    t = timer_now();
-    emit_runtime();
-    gen_data();
-    buf_bytes(ASM, buf_slice(DATA));
-    emit_file_trailer();
-    write_output(output);
-    timer_add(T_OUTPUT, t);
-    timer_report();
 }
 
 fn gen_data() {
-    data_section(false);
-    for id in 0..STR_COUNT {
-        data_string(id);
-    }
-    let scratch = buf_new();
-    for s in 0..STATIC_COUNT {
-        let item = STATICS[s].node;
-        let ty = STATICS[s].ty;
-        if STATICS[s].linkage == 1 {
-            // Defined in C.
-            continue;
+    unsafe {
+        data_section(false);
+        for id in 0..STR_COUNT {
+            data_string(id);
         }
-        buf_clear(scratch);
-        let init = NODES[item].c;
-        if NODES[init].kind == CStr {
-            // A C string (0.4): the address of its bytes. (In the
-            // writable section: the address is relocated at load time.)
-            data_section(true);
-            data_align(8);
+        let scratch = buf_new();
+        for s in 0..STATIC_COUNT {
+            let item = STATICS[s].node;
+            let ty = STATICS[s].ty;
+            if STATICS[s].linkage == 1 {
+                // Defined in C.
+                continue;
+            }
+            buf_clear(scratch);
+            let init = NODES[item].c;
+            if NODES[init].kind == CStr {
+                // A C string (0.4): the address of its bytes. (In the
+                // writable section: the address is relocated at load time.)
+                data_section(true);
+                data_align(8);
+                if STATICS[s].linkage == 2 {
+                    buf_str(DATA, c".globl ");
+                    buf_str(DATA, global_prefix());
+                    buf_bytes(DATA, SYMS[NODES[item].a].text);
+                    buf_byte(DATA, '\n');
+                }
+                data_label(static_symbol_prefix(s), NODES[item].a);
+                buf_str(DATA, c"    .quad ");
+                buf_str(DATA, local_prefix());
+                buf_str(DATA, c"str.");
+                buf_int(DATA, NODES[init].a);
+                buf_byte(DATA, '\n');
+                continue;
+            }
+            const_emit(init, ty, scratch);
+            // (with addresses in it, in the writable section: relocated at
+            // load time)
+            let relocs = CONST_RELOCS.count > 0;
+            data_section(STATICS[s].mutable || relocs);
+            data_align(type_align(ty));
             if STATICS[s].linkage == 2 {
                 buf_str(DATA, c".globl ");
                 buf_str(DATA, global_prefix());
@@ -278,43 +309,24 @@ fn gen_data() {
                 buf_byte(DATA, '\n');
             }
             data_label(static_symbol_prefix(s), NODES[item].a);
-            buf_str(DATA, c"    .quad ");
-            buf_str(DATA, local_prefix());
-            buf_str(DATA, c"str.");
-            buf_int(DATA, NODES[init].a);
-            buf_byte(DATA, '\n');
-            continue;
-        }
-        const_emit(init, ty, scratch);
-        // (with addresses in it, in the writable section: relocated at
-        // load time)
-        let relocs = CONST_RELOCS.count > 0;
-        data_section(STATICS[s].mutable || relocs);
-        data_align(type_align(ty));
-        if STATICS[s].linkage == 2 {
-            buf_str(DATA, c".globl ");
-            buf_str(DATA, global_prefix());
-            buf_bytes(DATA, SYMS[NODES[item].a].text);
-            buf_byte(DATA, '\n');
-        }
-        data_label(static_symbol_prefix(s), NODES[item].a);
-        let bytes = buf_slice(scratch);
-        let mut done = 0;
-        let mut r = 0;
-        while r < CONST_RELOCS.count {
-            let at = CONST_RELOCS.data[r];
-            data_bytes(bytes[done..at]);
-            buf_str(DATA, c"    .quad ");
-            buf_str(DATA, local_prefix());
-            buf_str(DATA, c"str.");
-            buf_int(DATA, CONST_RELOCS.data[r + 1]);
-            buf_byte(DATA, '\n');
-            done = at + 8;
-            r += 2;
-        }
-        data_bytes(bytes[done..bytes.len]);
-        if BUFS[scratch].len == 0 {
-            buf_str(DATA, c"    .space 1\n");
+            let bytes = buf_slice(scratch);
+            let mut done = 0;
+            let mut r = 0;
+            while r < CONST_RELOCS.count {
+                let at = CONST_RELOCS.data[r];
+                data_bytes(bytes[done..at]);
+                buf_str(DATA, c"    .quad ");
+                buf_str(DATA, local_prefix());
+                buf_str(DATA, c"str.");
+                buf_int(DATA, CONST_RELOCS.data[r + 1]);
+                buf_byte(DATA, '\n');
+                done = at + 8;
+                r += 2;
+            }
+            data_bytes(bytes[done..bytes.len]);
+            if BUFS[scratch].len == 0 {
+                buf_str(DATA, c"    .space 1\n");
+            }
         }
     }
 }
@@ -322,37 +334,39 @@ fn gen_data() {
 // ---- Functions ----
 
 fn gen_function(item: i64) {
-    let f = NODES[item].x - 1;
-    CUR_FN = f;
-    DEFERS.count = 0;
-    DEFER_LOOPS.count = 0;
-    buf_clear(CODE);
-    DEPTH = 0;
-    FRAME_SIZE = 0;
-    OVERALIGNED.count = 0;
-    RETURN_LABEL = new_label();
-    emit_function_start(fn_symbol_prefix(f), FNS[f].name, fn_is_global(f));
-    let ret = FNS[f].ret;
-    RESULT_SLOT = 0;
-    if returns_through_pointer(ret) {
-        RESULT_SLOT = alloc_slot(8, 8);
-        emit_frame_addr(R_ADDR, RESULT_SLOT);
-        emit_store(TY_U64, R_RESULT, R_ADDR);
+    unsafe {
+        let f = NODES[item].x - 1;
+        CUR_FN = f;
+        DEFERS.count = 0;
+        DEFER_LOOPS.count = 0;
+        buf_clear(CODE);
+        DEPTH = 0;
+        FRAME_SIZE = 0;
+        OVERALIGNED.count = 0;
+        RETURN_LABEL = new_label();
+        emit_function_start(fn_symbol_prefix(f), FNS[f].name, fn_is_global(f));
+        let ret = FNS[f].ret;
+        RESULT_SLOT = 0;
+        if returns_through_pointer(ret) {
+            RESULT_SLOT = alloc_slot(8, 8);
+            emit_frame_addr(R_ADDR, RESULT_SLOT);
+            emit_store(TY_U64, R_RESULT, R_ADDR);
+        }
+        gen_params(item, f);
+        let body = NODES[item].c;
+        gen_block(body);
+        if NODES[body].ty != TY_NEVER {
+            gen_return_value(ret);
+        }
+        emit_label(RETURN_LABEL);
+        if is_void(ret) && FNS[f].name == MAIN_SYM {
+            // `main` without a result exits with 0.
+            emit_load_imm(R_ACC, 0);
+        }
+        emit_epilogue();
+        emit_frame_reserve(FRAME_SIZE);
+        buf_bytes(ASM, buf_slice(CODE));
     }
-    gen_params(item, f);
-    let body = NODES[item].c;
-    gen_block(body);
-    if NODES[body].ty != TY_NEVER {
-        gen_return_value(ret);
-    }
-    emit_label(RETURN_LABEL);
-    if is_void(ret) && FNS[f].name == MAIN_SYM {
-        // `main` without a result exits with 0.
-        emit_load_imm(R_ACC, 0);
-    }
-    emit_epilogue();
-    emit_frame_reserve(FRAME_SIZE);
-    buf_bytes(ASM, buf_slice(CODE));
 }
 
 // Stores the incoming parameters in their frame slots, in order (so a
@@ -360,81 +374,83 @@ fn gen_function(item: i64) {
 // Aggregates in registers are stored piece by piece; those passed by
 // reference or on the stack are copied once every register is saved.
 fn gen_params(item: i64, f: i64) {
-    let mut state: [i64; 3] = [first_int_arg(FNS[f].ret), 0, 0];
-    let mut pending: [i64; 64] = [0; 64];
-    let mut pending_count = 0;
-    let mut pieces: [i64; 4] = [0; 4];
-    for i in 0..FNS[f].param_count {
-        let ty = fn_param(f, i);
-        if is_void(ty) {
-            continue;
-        }
-        let kind = abi_classify(ty);
-        let local = NODES[child(item, i)].x;
-        if kind == AbiClass::Pieces {
-            abi_piece_locations(ty, &state as *i64, &pieces as *i64);
+    unsafe {
+        let mut state: [i64; 3] = [first_int_arg(FNS[f].ret), 0, 0];
+        let mut pending: [i64; 64] = [0; 64];
+        let mut pending_count = 0;
+        let mut pieces: [i64; 4] = [0; 4];
+        for i in 0..FNS[f].param_count {
+            let ty = fn_param(f, i);
+            if is_void(ty) {
+                continue;
+            }
+            let kind = abi_classify(ty);
+            let local = NODES[child(item, i)].x;
+            if kind == AbiClass::Pieces {
+                abi_piece_locations(ty, &state as *i64, &pieces as *i64);
+                if local < 0 {
+                    continue;
+                }
+                let slot = alloc_slot_for(ty);
+                LOCALS[local].offset = slot;
+                for k in 0..ABI_PIECE_COUNT {
+                    // On x86-64 a piece on the stack is copied as an integer of
+                    // its size: through the float accumulator it would
+                    // overwrite the first float argument register (xmm0),
+                    // which a later parameter may still be in. Not on AArch64,
+                    // whose int accumulator is x0, the first int argument
+                    // register (an HFA on the stack, after the float registers
+                    // ran out, may come before int parameters still in
+                    // registers); its float registers are all taken by earlier
+                    // parameters then.
+                    let mut piece_ty = ABI_PIECE_TY[k];
+                    if X86 && pieces[k] >= 16 && is_float(piece_ty) {
+                        piece_ty = if piece_ty == TY_F32 { TY_U32 } else { TY_U64 };
+                    }
+                    emit_load_param(pieces[k], piece_ty);
+                    store_to_frame(piece_ty, slot - ABI_PIECE_OFFSET[k]);
+                }
+                continue;
+            }
+            let mut location = 0;
+            if kind == AbiClass::Stack {
+                location = abi_stack_location(ty, &state as *i64);
+            } else {
+                location = arg_location(if kind == AbiClass::Ref { TY_U64 } else { ty }, &state as *i64);
+            }
             if local < 0 {
                 continue;
             }
             let slot = alloc_slot_for(ty);
             LOCALS[local].offset = slot;
-            for k in 0..ABI_PIECE_COUNT {
-                // On x86-64 a piece on the stack is copied as an integer of
-                // its size: through the float accumulator it would
-                // overwrite the first float argument register (xmm0),
-                // which a later parameter may still be in. Not on AArch64,
-                // whose int accumulator is x0, the first int argument
-                // register (an HFA on the stack, after the float registers
-                // ran out, may come before int parameters still in
-                // registers); its float registers are all taken by earlier
-                // parameters then.
-                let mut piece_ty = ABI_PIECE_TY[k];
-                if X86 && pieces[k] >= 16 && is_float(piece_ty) {
-                    piece_ty = if piece_ty == TY_F32 { TY_U32 } else { TY_U64 };
-                }
-                emit_load_param(pieces[k], piece_ty);
-                store_to_frame(piece_ty, slot - ABI_PIECE_OFFSET[k]);
+            if kind == AbiClass::Scalar {
+                emit_load_param(location, ty);
+                emit_frame_addr(R_ADDR, slot);
+                emit_store(ty, R_ACC, R_ADDR);
+                continue;
             }
-            continue;
+            // The accumulator = the address of the caller's copy.
+            if kind == AbiClass::Stack {
+                m_lea(0, reg_fp(), location);
+            } else {
+                emit_load_param(location, TY_U64);
+            }
+            let pointer_slot = alloc_slot(8, 8);
+            emit_frame_addr(R_ADDR, pointer_slot);
+            emit_store(TY_U64, R_ACC, R_ADDR);
+            pending[pending_count] = local;
+            pending[pending_count + 1] = pointer_slot;
+            pending_count += 2;
         }
-        let mut location = 0;
-        if kind == AbiClass::Stack {
-            location = abi_stack_location(ty, &state as *i64);
-        } else {
-            location = arg_location(if kind == AbiClass::Ref { TY_U64 } else { ty }, &state as *i64);
+        let mut i = 0;
+        while i < pending_count {
+            let local = pending[i];
+            emit_frame_addr(R_ADDR, pending[i + 1]);
+            emit_load_reg(R_ACC, R_ADDR);
+            emit_frame_addr(R_SECOND, LOCALS[local].offset);
+            emit_copy(type_size(LOCALS[local].ty));
+            i += 2;
         }
-        if local < 0 {
-            continue;
-        }
-        let slot = alloc_slot_for(ty);
-        LOCALS[local].offset = slot;
-        if kind == AbiClass::Scalar {
-            emit_load_param(location, ty);
-            emit_frame_addr(R_ADDR, slot);
-            emit_store(ty, R_ACC, R_ADDR);
-            continue;
-        }
-        // The accumulator = the address of the caller's copy.
-        if kind == AbiClass::Stack {
-            m_lea(0, reg_fp(), location);
-        } else {
-            emit_load_param(location, TY_U64);
-        }
-        let pointer_slot = alloc_slot(8, 8);
-        emit_frame_addr(R_ADDR, pointer_slot);
-        emit_store(TY_U64, R_ACC, R_ADDR);
-        pending[pending_count] = local;
-        pending[pending_count + 1] = pointer_slot;
-        pending_count += 2;
-    }
-    let mut i = 0;
-    while i < pending_count {
-        let local = pending[i];
-        emit_frame_addr(R_ADDR, pending[i + 1]);
-        emit_load_reg(R_ACC, R_ADDR);
-        emit_frame_addr(R_SECOND, LOCALS[local].offset);
-        emit_copy(type_size(LOCALS[local].ty));
-        i += 2;
     }
 }
 
@@ -474,25 +490,27 @@ fn gen_return_value(ret: i64) {
 // ---- Statements ----
 
 fn gen_block(block: i64) {
-    let mark = DEFERS.count;
-    for i in 0..NODES[block].count {
-        let stmt = child(block, i);
-        if NODES[stmt].kind == Let {
-            gen_expr(NODES[stmt].c);
-            bind(NODES[stmt].a);
-        } else if NODES[stmt].kind == Defer {
-            DEFERS.push(stmt);
-        } else {
-            gen_expr(NODES[stmt].a);
+    unsafe {
+        let mark = DEFERS.count;
+        for i in 0..NODES[block].count {
+            let stmt = child(block, i);
+            if NODES[stmt].kind == Let {
+                gen_expr(NODES[stmt].c);
+                bind(NODES[stmt].a);
+            } else if NODES[stmt].kind == Defer {
+                DEFERS.push(stmt);
+            } else {
+                gen_expr(NODES[stmt].a);
+            }
         }
-    }
-    let tail = NODES[block].a;
-    if tail != 0 {
-        gen_expr(tail);
-    }
-    if DEFERS.count > mark {
-        gen_defers(mark, if tail != 0 { NODES[tail].ty } else { TY_UNIT });
-        DEFERS.count = mark;
+        let tail = NODES[block].a;
+        if tail != 0 {
+            gen_expr(tail);
+        }
+        if DEFERS.count > mark {
+            gen_defers(mark, if tail != 0 { NODES[tail].ty } else { TY_UNIT });
+            DEFERS.count = mark;
+        }
     }
 }
 
@@ -511,7 +529,7 @@ fn gen_defers(depth: i64, ty: i64) {
     }
     let mut i = DEFERS.count - 1;
     while i >= depth {
-        gen_expr(NODES[DEFERS.data[i]].a);
+        unsafe { gen_expr(NODES[DEFERS.data[i]].a); }
         i -= 1;
     }
     if keep {
@@ -536,105 +554,110 @@ fn store_to_frame(ty: i64, offset: i64) {
 
 // Binds a pattern to the value in the accumulator (of the pattern's type).
 fn bind(pattern: i64) {
-    let kind = NODES[pattern].kind;
-    let ty = NODES[pattern].ty;
-    if kind == PatWild || ty == TY_NEVER {
-        return;
-    }
-    if kind == PatBind {
-        let local = NODES[pattern].x;
-        let slot = alloc_slot_for(ty);
-        LOCALS[local].offset = slot;
-        store_to_frame(ty, slot);
-        return;
-    }
-    if NODES[pattern].count == 0 {
-        return;
-    }
-    // A tuple, or the only variant of an enum: the accumulator is its
-    // address.
-    push_x0();
-    for i in 0..NODES[pattern].count {
-        let mut elem_ty = 0;
-        let mut offset = 0;
-        if kind == PatVariant {
-            elem_ty = variant_field(NODES[pattern].x, i);
-            offset = variant_field_offset(NODES[pattern].x, i);
-        } else {
-            elem_ty = type_elem(ty, i);
-            offset = tuple_offset(ty, i);
+    unsafe {
+        let kind = NODES[pattern].kind;
+        let ty = NODES[pattern].ty;
+        if kind == PatWild || ty == TY_NEVER {
+            return;
         }
-        emit_peek(R_ACC);
-        emit_add_imm(R_ACC, offset);
-        if !is_compound(elem_ty) && !is_void(elem_ty) {
-            emit_load(elem_ty, R_ACC);
+        if kind == PatBind {
+            let local = NODES[pattern].x;
+            let slot = alloc_slot_for(ty);
+            LOCALS[local].offset = slot;
+            store_to_frame(ty, slot);
+            return;
         }
-        bind(child(pattern, i));
+        if NODES[pattern].count == 0 {
+            return;
+        }
+        // A tuple, or the only variant of an enum: the accumulator is its
+        // address.
+        push_x0();
+        for i in 0..NODES[pattern].count {
+            let mut elem_ty = 0;
+            let mut offset = 0;
+            if kind == PatVariant {
+                elem_ty = variant_field(NODES[pattern].x, i);
+                offset = variant_field_offset(NODES[pattern].x, i);
+            } else {
+                elem_ty = type_elem(ty, i);
+                offset = tuple_offset(ty, i);
+            }
+            emit_peek(R_ACC);
+            emit_add_imm(R_ACC, offset);
+            if !is_compound(elem_ty) && !is_void(elem_ty) {
+                emit_load(elem_ty, R_ACC);
+            }
+            bind(child(pattern, i));
+        }
+        pop_x(R_ACC);
     }
-    pop_x(R_ACC);
 }
 
 // ---- Expressions ----
 
 fn gen_expr(n: i64) {
-    let ty = NODES[n].ty;
-    match NODES[n].kind {
-        Int | Char => emit_load_imm(R_ACC, wrap_int(NODES[n].a, ty) as u64),
-        Float => emit_load_float(float_const(f64_of_bits(NODES[n].a), ty), ty),
-        Bool => emit_load_imm(R_ACC, NODES[n].a as u64),
-        Unit => {}
-        Str => gen_string(n),
-        CStr => emit_string_addr(NODES[n].a),
-        Ident => gen_ident(n),
-        Binary => gen_binary(n),
-        Unary => gen_unary(n),
-        Cast => {
-            gen_expr(NODES[n].a);
-            gen_cast(NODES[NODES[n].a].ty, ty);
-        }
-        Call => gen_call(n),
-        Index if NODES[NODES[n].b].kind == Range => gen_slicing(n),
-        Index | FieldAccess | TupleField => {
-            gen_addr(n);
-            load_from_x0(ty);
-        }
-        Tuple | Array | StructLit => gen_aggregate(n),
-        Repeat => gen_repeat(n),
-        NodeKind::Block => gen_block(n),
-        If => gen_if(n),
-        Match => gen_match(n),
-        VariantLit => gen_variant(n),
-        Loop | While => gen_loop(n),
-        For => gen_for(n),
-        Assign => gen_assign(n),
-        EnumPanic => {
-            gen_expr(NODES[n].a);
-            emit_panic(NODES[n].x);
-        }
-        Return => {
-            if NODES[n].a != 0 {
+    unsafe {
+        let ty = NODES[n].ty;
+        match NODES[n].kind {
+            Int | Char => emit_load_imm(R_ACC, wrap_int(NODES[n].a, ty) as u64),
+            Float => emit_load_float(float_const(f64_of_bits(NODES[n].a), ty), ty),
+            Bool => emit_load_imm(R_ACC, NODES[n].a as u64),
+            Unit => {}
+            Str => gen_string(n),
+            CStr => emit_string_addr(NODES[n].a),
+            Ident => gen_ident(n),
+            Binary => gen_binary(n),
+            Unary => gen_unary(n),
+            Cast => {
                 gen_expr(NODES[n].a);
-                gen_defers(0, NODES[NODES[n].a].ty);
-                gen_return_value(FNS[CUR_FN].ret);
-            } else {
-                gen_defers(0, TY_UNIT);
+                gen_cast(NODES[NODES[n].a].ty, ty);
             }
-            emit_jump(RETURN_LABEL);
-        }
-        Break => {
-            let mut ty = TY_UNIT;
-            if NODES[n].b != 0 {
-                gen_expr(NODES[n].b);
-                ty = NODES[NODES[n].b].ty;
+            Call => gen_call(n),
+            Index if NODES[NODES[n].b].kind == Range => gen_slicing(n),
+            Index | FieldAccess | TupleField => {
+                gen_addr(n);
+                load_from_x0(ty);
             }
-            gen_defers(defer_loop_depth(NODES[n].x), ty);
-            jump_out_to_loop(NODES[n].x, 1);
+            Tuple | Array | StructLit => gen_aggregate(n),
+            Repeat => gen_repeat(n),
+            NodeKind::Block => gen_block(n),
+            If => gen_if(n),
+            Match => gen_match(n),
+            VariantLit => gen_variant(n),
+            NodeKind::VecOp => gen_vecop(n),
+            Loop | While => gen_loop(n),
+            For => gen_for(n),
+            Assign => gen_assign(n),
+            EnumPanic => {
+                gen_expr(NODES[n].a);
+                emit_panic(NODES[n].x);
+            }
+            Return => {
+                if NODES[n].a != 0 {
+                    gen_expr(NODES[n].a);
+                    gen_defers(0, NODES[NODES[n].a].ty);
+                    gen_return_value(FNS[CUR_FN].ret);
+                } else {
+                    gen_defers(0, TY_UNIT);
+                }
+                emit_jump(RETURN_LABEL);
+            }
+            Break => {
+                let mut ty = TY_UNIT;
+                if NODES[n].b != 0 {
+                    gen_expr(NODES[n].b);
+                    ty = NODES[NODES[n].b].ty;
+                }
+                gen_defers(defer_loop_depth(NODES[n].x), ty);
+                jump_out_to_loop(NODES[n].x, 1);
+            }
+            Continue => {
+                gen_defers(defer_loop_depth(NODES[n].x), TY_UNIT);
+                jump_out_to_loop(NODES[n].x, 0);
+            }
+            _ => type_error(n, c"internal error: unexpected node in code generation"),
         }
-        Continue => {
-            gen_defers(defer_loop_depth(NODES[n].x), TY_UNIT);
-            jump_out_to_loop(NODES[n].x, 0);
-        }
-        _ => type_error(n, c"internal error: unexpected node in code generation"),
     }
 }
 
@@ -648,77 +671,87 @@ fn load_from_x0(ty: i64) {
 
 // A string literal is a (pointer, length) tuple.
 fn gen_string(n: i64) {
-    let slot = alloc_slot(16, 8);
-    emit_string_addr(NODES[n].a);
-    emit_frame_addr(R_ADDR, slot);
-    emit_store(TY_U64, R_ACC, R_ADDR);
-    emit_load_imm(R_ACC, STRS[NODES[n].a].len as u64);
-    emit_store_offset(R_ACC, R_ADDR, 8);
-    emit_frame_addr(R_ACC, slot);
+    unsafe {
+        let slot = alloc_slot(16, 8);
+        emit_string_addr(NODES[n].a);
+        emit_frame_addr(R_ADDR, slot);
+        emit_store(TY_U64, R_ACC, R_ADDR);
+        emit_load_imm(R_ACC, STRS[NODES[n].a].len as u64);
+        emit_store_offset(R_ACC, R_ADDR, 8);
+        emit_frame_addr(R_ACC, slot);
+    }
 }
 
 fn gen_ident(n: i64) {
-    let ty = NODES[n].ty;
-    let resolution = NODES[n].res;
-    let index = NODES[n].y;
-    if resolution == Res::Local {
-        emit_frame_addr(R_ACC, LOCALS[index].offset);
-        load_from_x0(ty);
-    } else if resolution == Res::Const {
-        let value = const_value(index);
-        if is_float(ty) {
-            emit_load_float(value, ty);
+    unsafe {
+        let ty = NODES[n].ty;
+        let resolution = NODES[n].res;
+        let index = NODES[n].y;
+        if resolution == Res::Local {
+            emit_frame_addr(R_ACC, LOCALS[index].offset);
+            load_from_x0(ty);
+        } else if resolution == Res::Const {
+            let value = const_value(index);
+            if is_float(ty) {
+                emit_load_float(value, ty);
+            } else {
+                emit_load_imm(R_ACC, value as u64);
+            }
+        } else if resolution == Res::Static {
+            emit_static_addr(NODES[n].a);
+            load_from_x0(ty);
         } else {
-            emit_load_imm(R_ACC, value as u64);
+            gen_fn_address(index);
         }
-    } else if resolution == Res::Static {
-        emit_static_addr(NODES[n].a);
-        load_from_x0(ty);
-    } else {
-        gen_fn_address(index);
     }
 }
 
 fn gen_fn_address(f: i64) {
-    if FNS[f].is_extern {
-        emit_extern_symbol_addr(FNS[f].name);
-    } else {
-        emit_local_symbol_addr(fn_symbol_prefix(f), FNS[f].name);
+    unsafe {
+        if FNS[f].is_extern {
+            emit_extern_symbol_addr(FNS[f].name);
+        } else {
+            emit_local_symbol_addr(fn_symbol_prefix(f), FNS[f].name);
+        }
     }
 }
 
 // The accumulator = the address of a place (or of a compound value).
 fn gen_addr(n: i64) {
-    match NODES[n].kind {
-        Ident if NODES[n].res == Res::Local => emit_frame_addr(R_ACC, LOCALS[NODES[n].y].offset),
-        Ident if NODES[n].res == Res::Static => emit_static_addr(NODES[n].a),
-        Unary if NODES[n].op == Tok::Star => gen_expr(NODES[n].b),
-        FieldAccess => {
-            // The struct's (or slice's) address, or the pointer to the struct.
-            gen_expr(NODES[n].a);
-            emit_add_imm(R_ACC, field_offset_of(n));
+    unsafe {
+        match NODES[n].kind {
+            Ident if NODES[n].res == Res::Local => emit_frame_addr(R_ACC, LOCALS[NODES[n].y].offset),
+            Ident if NODES[n].res == Res::Static => emit_static_addr(NODES[n].a),
+            Unary if NODES[n].op == Tok::Star => gen_expr(NODES[n].b),
+            FieldAccess => {
+                // The struct's (or slice's) address, or the pointer to the struct.
+                gen_expr(NODES[n].a);
+                emit_add_imm(R_ACC, field_offset_of(n));
+            }
+            TupleField => {
+                let base = NODES[n].a;
+                gen_expr(base);
+                emit_add_imm(R_ACC, tuple_offset(NODES[base].ty, NODES[n].b));
+            }
+            Index => gen_index_addr(n),
+            _ => gen_expr(n),
         }
-        TupleField => {
-            let base = NODES[n].a;
-            gen_expr(base);
-            emit_add_imm(R_ACC, tuple_offset(NODES[base].ty, NODES[n].b));
-        }
-        Index => gen_index_addr(n),
-        _ => gen_expr(n),
     }
 }
 
 // The offset of the field of NodeKind::FieldAccess n in its base: a struct (also through
 // a pointer), or a slice.
 pub fn field_offset_of(n: i64) -> i64 {
-    let base_ty = NODES[NODES[n].a].ty;
-    if NODES[n].y == 2 {
-        return NODES[n].x * 8;
+    unsafe {
+        let base_ty = NODES[NODES[n].a].ty;
+        if NODES[n].y == 2 {
+            return NODES[n].x * 8;
+        }
+        if NODES[n].y == 1 {
+            return field_offset(TYPES[TYPES[base_ty].a].a, NODES[n].x);
+        }
+        field_offset(TYPES[base_ty].a, NODES[n].x)
     }
-    if NODES[n].y == 1 {
-        return field_offset(TYPES[TYPES[base_ty].a].a, NODES[n].x);
-    }
-    field_offset(TYPES[base_ty].a, NODES[n].x)
 }
 
 pub fn panic_kind(index_ty: i64, range: bool) -> i64 {
@@ -730,62 +763,70 @@ pub fn panic_kind(index_ty: i64, range: bool) -> i64 {
 }
 
 fn gen_index_addr(n: i64) {
-    let base = NODES[n].a;
-    let base_ty = NODES[base].ty;
-    let elem_size = type_size(TYPES[base_ty].a);
-    gen_expr(base);
-    push_x0();
-    gen_expr(NODES[n].b);
-    if is_slice(base_ty) {
-        // Checked: the index against the slice's length.
-        emit_peek(R_SECOND);
-        emit_add_imm(R_SECOND, 8);
-        emit_load_reg(R_SECOND, R_SECOND);
-        let ok = new_label();
-        emit_compare_jump(Cond::Lt, false, ok);
-        emit_panic(panic_kind(NODES[NODES[n].b].ty, false));
-        emit_label(ok);
+    unsafe {
+        let base = NODES[n].a;
+        let base_ty = NODES[base].ty;
+        let elem_size = type_size(TYPES[base_ty].a);
+        gen_expr(base);
+        push_x0();
+        gen_expr(NODES[n].b);
+        if is_slice(base_ty) {
+            // Checked: the index against the slice's length.
+            emit_peek(R_SECOND);
+            emit_add_imm(R_SECOND, 8);
+            emit_load_reg(R_SECOND, R_SECOND);
+            let ok = new_label();
+            emit_compare_jump(Cond::Lt, false, ok);
+            emit_panic(panic_kind(NODES[NODES[n].b].ty, false));
+            emit_label(ok);
+            pop_x(R_SECOND);
+            emit_load_reg(R_SECOND, R_SECOND);
+            emit_index_addr(elem_size);
+            return;
+        }
+        if TYPES[base_ty].kind == TyKind::Array {
+            // Checked (0.7): the index against the array's length.
+            emit_load_imm(R_SECOND, TYPES[base_ty].b as u64);
+            let ok = new_label();
+            emit_compare_jump(Cond::Lt, false, ok);
+            emit_panic(panic_kind(NODES[NODES[n].b].ty, false));
+            emit_label(ok);
+        }
         pop_x(R_SECOND);
-        emit_load_reg(R_SECOND, R_SECOND);
         emit_index_addr(elem_size);
-        return;
     }
-    if TYPES[base_ty].kind == TyKind::Array {
-        // Checked (0.7): the index against the array's length.
-        emit_load_imm(R_SECOND, TYPES[base_ty].b as u64);
-        let ok = new_label();
-        emit_compare_jump(Cond::Lt, false, ok);
-        emit_panic(panic_kind(NODES[NODES[n].b].ty, false));
-        emit_label(ok);
-    }
-    pop_x(R_SECOND);
-    emit_index_addr(elem_size);
 }
 
 // ---- Operators ----
 
 fn gen_binary(n: i64) {
-    let op = NODES[n].op;
-    let lhs = NODES[n].b;
-    let rhs = NODES[n].c;
-    if op == Tok::AmpAmp || op == Tok::PipePipe {
-        let end = new_label();
-        gen_expr(lhs);
-        if op == Tok::AmpAmp {
-            emit_jump_if_zero(end);
-        } else {
-            emit_jump_if_nonzero(end);
+    unsafe {
+        let op = NODES[n].op;
+        let lhs = NODES[n].b;
+        let rhs = NODES[n].c;
+        if op == Tok::AmpAmp || op == Tok::PipePipe {
+            let end = new_label();
+            gen_expr(lhs);
+            if op == Tok::AmpAmp {
+                emit_jump_if_zero(end);
+            } else {
+                emit_jump_if_nonzero(end);
+            }
+            gen_expr(rhs);
+            emit_label(end);
+            return;
         }
+        let operand_ty = NODES[lhs].ty;
+        if is_vector(operand_ty) {
+            gen_vector_binary(op, lhs, rhs, NODES[n].ty);
+            return;
+        }
+        gen_expr(lhs);
+        push_value(operand_ty);
         gen_expr(rhs);
-        emit_label(end);
-        return;
+        pop_second_operand(operand_ty);
+        gen_operator(op, operand_ty, NODES[n].ty);
     }
-    let operand_ty = NODES[lhs].ty;
-    gen_expr(lhs);
-    push_value(operand_ty);
-    gen_expr(rhs);
-    pop_second_operand(operand_ty);
-    gen_operator(op, operand_ty, NODES[n].ty);
 }
 
 // Moves the accumulator to the second operand and pops the first one into
@@ -811,23 +852,29 @@ fn gen_operator(op: Tok, operand_ty: i64, result_ty: i64) {
 }
 
 fn gen_unary(n: i64) {
-    let op = NODES[n].op;
-    let operand = NODES[n].b;
-    let ty = NODES[n].ty;
-    if op == Tok::Amp {
-        gen_addr(operand);
-        return;
-    }
-    gen_expr(operand);
-    if op == Tok::Minus {
-        emit_negate(ty);
-    } else if op == Tok::Bang {
-        emit_not_bool();
-    } else if op == Tok::Tilde {
-        emit_bitnot(ty);
-    } else {
-        // Deref: the accumulator is the pointer.
-        load_from_x0(ty);
+    unsafe {
+        let op = NODES[n].op;
+        let operand = NODES[n].b;
+        let ty = NODES[n].ty;
+        if op == Tok::Amp {
+            gen_addr(operand);
+            return;
+        }
+        if op == Tok::Minus && is_vector(ty) {
+            gen_vector_negate(operand, ty);
+            return;
+        }
+        gen_expr(operand);
+        if op == Tok::Minus {
+            emit_negate(ty);
+        } else if op == Tok::Bang {
+            emit_not_bool();
+        } else if op == Tok::Tilde {
+            emit_bitnot(ty);
+        } else {
+            // Deref: the accumulator is the pointer.
+            load_from_x0(ty);
+        }
     }
 }
 
@@ -852,75 +899,79 @@ fn gen_cast(from: i64, to: i64) {
 
 // A struct, tuple or array literal, built in a new frame slot.
 fn gen_aggregate(n: i64) {
-    let ty = NODES[n].ty;
-    let kind = NODES[n].kind;
-    let slot = alloc_slot_for(ty);
-    for i in 0..NODES[n].count {
-        let elem = child(n, i);
-        let mut value = elem;
-        let mut offset = 0;
-        let mut elem_ty = 0;
-        if kind == StructLit {
-            let s = TYPES[ty].a;
-            value = NODES[elem].b;
-            offset = field_offset(s, NODES[elem].x);
-            elem_ty = (*struct_field(s, NODES[elem].x)).ty;
-        } else if kind == Tuple {
-            offset = tuple_offset(ty, i);
-            elem_ty = type_elem(ty, i);
-        } else {
-            elem_ty = TYPES[ty].a;
-            offset = i * type_size(elem_ty);
+    unsafe {
+        let ty = NODES[n].ty;
+        let kind = NODES[n].kind;
+        let slot = alloc_slot_for(ty);
+        for i in 0..NODES[n].count {
+            let elem = child(n, i);
+            let mut value = elem;
+            let mut offset = 0;
+            let mut elem_ty = 0;
+            if kind == StructLit {
+                let s = TYPES[ty].a;
+                value = NODES[elem].b;
+                offset = field_offset(s, NODES[elem].x);
+                elem_ty = (*struct_field(s, NODES[elem].x)).ty;
+            } else if kind == Tuple {
+                offset = tuple_offset(ty, i);
+                elem_ty = type_elem(ty, i);
+            } else {
+                elem_ty = TYPES[ty].a;
+                offset = i * type_size(elem_ty);
+            }
+            gen_expr(value);
+            store_to_frame(elem_ty, slot - offset);
         }
-        gen_expr(value);
-        store_to_frame(elem_ty, slot - offset);
+        emit_frame_addr(R_ACC, slot);
     }
-    emit_frame_addr(R_ACC, slot);
 }
 
 // `[value; count]`: the value is evaluated once.
 fn gen_repeat(n: i64) {
-    let ty = NODES[n].ty;
-    let elem_ty = TYPES[ty].a;
-    let count = TYPES[ty].b;
-    let elem_size = type_size(elem_ty);
-    let slot = alloc_slot_for(ty);
-    gen_expr(NODES[n].a);
-    if count > 0 && !is_void(elem_ty) && elem_size > 0 {
-        let top = new_label();
-        if is_compound(elem_ty) {
-            // Copies from the value's address, keeping the cursor and the
-            // count in frame slots (copies may call memcpy).
-            let source = alloc_slot(8, 8);
-            let cursor = alloc_slot(8, 8);
-            let remaining = alloc_slot(8, 8);
-            store_reg_to_frame(R_ACC, source);
-            emit_frame_addr(R_ACC, slot);
-            store_reg_to_frame(R_ACC, cursor);
-            emit_load_imm(R_ACC, count as u64);
-            store_reg_to_frame(R_ACC, remaining);
-            emit_label(top);
-            load_reg_from_frame(R_SECOND, cursor);
-            load_reg_from_frame(R_ACC, source);
-            emit_copy(elem_size);
-            load_reg_from_frame(R_ACC, cursor);
-            emit_add_imm(R_ACC, elem_size);
-            emit_store(TY_U64, R_ACC, R_ADDR);
-            load_reg_from_frame(R_ACC, remaining);
-            emit_decrement(R_ACC);
-            emit_store(TY_U64, R_ACC, R_ADDR);
-            emit_jump_unless_zero_result(top);
-        } else {
-            emit_frame_addr(R_LOOP_PTR, slot);
-            emit_load_imm(R_LOOP_COUNT, count as u64);
-            emit_label(top);
-            emit_store(elem_ty, R_ACC, R_LOOP_PTR);
-            emit_add_imm(R_LOOP_PTR, elem_size);
-            emit_decrement(R_LOOP_COUNT);
-            emit_jump_unless_zero_result(top);
+    unsafe {
+        let ty = NODES[n].ty;
+        let elem_ty = TYPES[ty].a;
+        let count = TYPES[ty].b;
+        let elem_size = type_size(elem_ty);
+        let slot = alloc_slot_for(ty);
+        gen_expr(NODES[n].a);
+        if count > 0 && !is_void(elem_ty) && elem_size > 0 {
+            let top = new_label();
+            if is_compound(elem_ty) {
+                // Copies from the value's address, keeping the cursor and the
+                // count in frame slots (copies may call memcpy).
+                let source = alloc_slot(8, 8);
+                let cursor = alloc_slot(8, 8);
+                let remaining = alloc_slot(8, 8);
+                store_reg_to_frame(R_ACC, source);
+                emit_frame_addr(R_ACC, slot);
+                store_reg_to_frame(R_ACC, cursor);
+                emit_load_imm(R_ACC, count as u64);
+                store_reg_to_frame(R_ACC, remaining);
+                emit_label(top);
+                load_reg_from_frame(R_SECOND, cursor);
+                load_reg_from_frame(R_ACC, source);
+                emit_copy(elem_size);
+                load_reg_from_frame(R_ACC, cursor);
+                emit_add_imm(R_ACC, elem_size);
+                emit_store(TY_U64, R_ACC, R_ADDR);
+                load_reg_from_frame(R_ACC, remaining);
+                emit_decrement(R_ACC);
+                emit_store(TY_U64, R_ACC, R_ADDR);
+                emit_jump_unless_zero_result(top);
+            } else {
+                emit_frame_addr(R_LOOP_PTR, slot);
+                emit_load_imm(R_LOOP_COUNT, count as u64);
+                emit_label(top);
+                emit_store(elem_ty, R_ACC, R_LOOP_PTR);
+                emit_add_imm(R_LOOP_PTR, elem_size);
+                emit_decrement(R_LOOP_COUNT);
+                emit_jump_unless_zero_result(top);
+            }
         }
+        emit_frame_addr(R_ACC, slot);
     }
-    emit_frame_addr(R_ACC, slot);
 }
 
 // The 8 bytes of frame slot `offset` = <reg> (R_ADDR keeps the address).
@@ -939,108 +990,112 @@ fn load_reg_from_frame(reg: i64, offset: i64) {
 
 // `E::V(...)`: a fieldless enum's tag, or a new value in a frame slot.
 fn gen_variant(n: i64) {
-    let ty = NODES[n].ty;
-    let v = NODES[n].a;
-    let tag = ENUMS[TYPES[ty].a].tag;
-    if !is_compound(ty) {
+    unsafe {
+        let ty = NODES[n].ty;
+        let v = NODES[n].a;
+        let tag = ENUMS[TYPES[ty].a].tag;
+        if !is_compound(ty) {
+            emit_load_imm(R_ACC, wrap_int(VARIANTS[v].discr, tag) as u64);
+            return;
+        }
+        let slot = alloc_slot_for(ty);
+        for i in 0..NODES[n].count {
+            gen_expr(child(n, i));
+            store_to_frame(variant_field(v, i), slot - variant_field_offset(v, i));
+        }
         emit_load_imm(R_ACC, wrap_int(VARIANTS[v].discr, tag) as u64);
-        return;
+        store_to_frame(tag, slot);
+        emit_frame_addr(R_ACC, slot);
     }
-    let slot = alloc_slot_for(ty);
-    for i in 0..NODES[n].count {
-        gen_expr(child(n, i));
-        store_to_frame(variant_field(v, i), slot - variant_field_offset(v, i));
-    }
-    emit_load_imm(R_ACC, wrap_int(VARIANTS[v].discr, tag) as u64);
-    store_to_frame(tag, slot);
-    emit_frame_addr(R_ACC, slot);
 }
 
 // `a[lo..hi]` (and the other ranges) of an array, a slice or a pointer: a
 // new slice in a frame slot. Arrays and slices are checked: lo <= hi <=
 // the length (lo <= hi + 1 and hi < the length for `..=`).
 fn gen_slicing(n: i64) {
-    let base = NODES[n].a;
-    let base_ty = NODES[base].ty;
-    let range = NODES[n].b;
-    let low = NODES[range].a;
-    let high = NODES[range].b;
-    let inclusive = NODES[range].c != 0;
-    let elem_size = type_size(TYPES[base_ty].a);
-    // The result: the pointer at `slot`, the length at `slot - 8`.
-    let slot = alloc_slot(16, 8);
-    let length = alloc_slot(8, 8);
-    let low_slot = alloc_slot(8, 8);
-    let high_slot = alloc_slot(8, 8);
-    gen_expr(base);
-    if is_slice(base_ty) {
-        emit_move_to_second(TY_U64);
-        emit_load_reg(R_ACC, R_SECOND);
-        store_reg_to_frame(R_ACC, slot);
-        emit_add_imm(R_SECOND, 8);
-        emit_load_reg(R_ACC, R_SECOND);
-        store_reg_to_frame(R_ACC, length);
-    } else {
-        store_reg_to_frame(R_ACC, slot);
-        if TYPES[base_ty].kind == TyKind::Array {
-            emit_load_imm(R_ACC, TYPES[base_ty].b as u64);
+    unsafe {
+        let base = NODES[n].a;
+        let base_ty = NODES[base].ty;
+        let range = NODES[n].b;
+        let low = NODES[range].a;
+        let high = NODES[range].b;
+        let inclusive = NODES[range].c != 0;
+        let elem_size = type_size(TYPES[base_ty].a);
+        // The result: the pointer at `slot`, the length at `slot - 8`.
+        let slot = alloc_slot(16, 8);
+        let length = alloc_slot(8, 8);
+        let low_slot = alloc_slot(8, 8);
+        let high_slot = alloc_slot(8, 8);
+        gen_expr(base);
+        if is_slice(base_ty) {
+            emit_move_to_second(TY_U64);
+            emit_load_reg(R_ACC, R_SECOND);
+            store_reg_to_frame(R_ACC, slot);
+            emit_add_imm(R_SECOND, 8);
+            emit_load_reg(R_ACC, R_SECOND);
             store_reg_to_frame(R_ACC, length);
+        } else {
+            store_reg_to_frame(R_ACC, slot);
+            if TYPES[base_ty].kind == TyKind::Array {
+                emit_load_imm(R_ACC, TYPES[base_ty].b as u64);
+                store_reg_to_frame(R_ACC, length);
+            }
         }
-    }
-    let mut bound_ty = TY_U64;
-    if low != 0 {
-        gen_expr(low);
-        bound_ty = NODES[low].ty;
-    } else {
-        emit_load_imm(R_ACC, 0);
-    }
-    store_reg_to_frame(R_ACC, low_slot);
-    if high != 0 {
-        gen_expr(high);
-        bound_ty = NODES[high].ty;
-    } else {
-        load_reg_from_frame(R_ACC, length);
-    }
-    store_reg_to_frame(R_ACC, high_slot);
-    if TYPES[base_ty].kind != TyKind::Ptr {
-        let ok = new_label();
-        let fail = new_label();
-        // hi <= length (hi < length for `..=`), then lo <= hi (+ 1).
-        load_reg_from_frame(R_SECOND, length);
+        let mut bound_ty = TY_U64;
+        if low != 0 {
+            gen_expr(low);
+            bound_ty = NODES[low].ty;
+        } else {
+            emit_load_imm(R_ACC, 0);
+        }
+        store_reg_to_frame(R_ACC, low_slot);
+        if high != 0 {
+            gen_expr(high);
+            bound_ty = NODES[high].ty;
+        } else {
+            load_reg_from_frame(R_ACC, length);
+        }
+        store_reg_to_frame(R_ACC, high_slot);
+        if TYPES[base_ty].kind != TyKind::Ptr {
+            let ok = new_label();
+            let fail = new_label();
+            // hi <= length (hi < length for `..=`), then lo <= hi (+ 1).
+            load_reg_from_frame(R_SECOND, length);
+            load_reg_from_frame(R_ACC, high_slot);
+            emit_compare_jump(if inclusive { Cond::Ge } else { Cond::Gt }, false, fail);
+            if inclusive {
+                emit_add_imm(R_ACC, 1);
+            }
+            emit_move_to_second(TY_U64);
+            load_reg_from_frame(R_ACC, low_slot);
+            emit_compare_jump(Cond::Le, false, ok);
+            emit_label(fail);
+            load_reg_from_frame(R_ACC, length);
+            push_x0();
+            load_reg_from_frame(R_SECOND, high_slot);
+            if inclusive {
+                emit_add_imm(R_SECOND, 1);
+            }
+            load_reg_from_frame(R_ACC, low_slot);
+            pop_x(R_ADDR);
+            emit_panic(panic_kind(bound_ty, true));
+            emit_label(ok);
+        }
+        // ptr += lo * size; len = hi (+ 1) - lo.
+        load_reg_from_frame(R_ACC, low_slot);
+        load_reg_from_frame(R_SECOND, slot);
+        emit_index_addr(elem_size);
+        store_reg_to_frame(R_ACC, slot);
+        load_reg_from_frame(R_ACC, low_slot);
+        emit_move_to_second(TY_U64);
         load_reg_from_frame(R_ACC, high_slot);
-        emit_compare_jump(if inclusive { Cond::Ge } else { Cond::Gt }, false, fail);
         if inclusive {
             emit_add_imm(R_ACC, 1);
         }
-        emit_move_to_second(TY_U64);
-        load_reg_from_frame(R_ACC, low_slot);
-        emit_compare_jump(Cond::Le, false, ok);
-        emit_label(fail);
-        load_reg_from_frame(R_ACC, length);
-        push_x0();
-        load_reg_from_frame(R_SECOND, high_slot);
-        if inclusive {
-            emit_add_imm(R_SECOND, 1);
-        }
-        load_reg_from_frame(R_ACC, low_slot);
-        pop_x(R_ADDR);
-        emit_panic(panic_kind(bound_ty, true));
-        emit_label(ok);
+        emit_int_binary(Tok::Minus, TY_U64);
+        store_reg_to_frame(R_ACC, slot - 8);
+        emit_frame_addr(R_ACC, slot);
     }
-    // ptr += lo * size; len = hi (+ 1) - lo.
-    load_reg_from_frame(R_ACC, low_slot);
-    load_reg_from_frame(R_SECOND, slot);
-    emit_index_addr(elem_size);
-    store_reg_to_frame(R_ACC, slot);
-    load_reg_from_frame(R_ACC, low_slot);
-    emit_move_to_second(TY_U64);
-    load_reg_from_frame(R_ACC, high_slot);
-    if inclusive {
-        emit_add_imm(R_ACC, 1);
-    }
-    emit_int_binary(Tok::Minus, TY_U64);
-    store_reg_to_frame(R_ACC, slot - 8);
-    emit_frame_addr(R_ACC, slot);
 }
 
 // ---- match ----
@@ -1049,49 +1104,53 @@ fn gen_slicing(n: i64) {
 // compound one stays where it is: its address is kept), every arm's
 // pattern is tested in order, its bindings copied, its guard evaluated.
 fn gen_match(n: i64) {
-    let scrutinee = NODES[n].a;
-    let st = NODES[scrutinee].ty;
-    gen_expr(scrutinee);
-    if st == TY_NEVER {
-        return;
-    }
-    let held = alloc_slot(8, 8);
-    if is_compound(st) {
-        store_reg_to_frame(R_ACC, held);
-    } else {
-        store_to_frame(st, held);
-    }
-    let end = new_label();
-    for i in 0..NODES[n].count {
-        let arm = child(n, i);
-        let next = new_label();
-        alloc_pattern_slots(NODES[arm].a);
-        gen_pattern_test(NODES[arm].a, st, held, next);
-        if NODES[arm].b != 0 {
-            gen_expr(NODES[arm].b);
-            emit_jump_if_zero(next);
+    unsafe {
+        let scrutinee = NODES[n].a;
+        let st = NODES[scrutinee].ty;
+        gen_expr(scrutinee);
+        if st == TY_NEVER {
+            return;
         }
-        gen_expr(NODES[arm].c);
-        emit_jump(end);
-        emit_label(next);
+        let held = alloc_slot(8, 8);
+        if is_compound(st) {
+            store_reg_to_frame(R_ACC, held);
+        } else {
+            store_to_frame(st, held);
+        }
+        let end = new_label();
+        for i in 0..NODES[n].count {
+            let arm = child(n, i);
+            let next = new_label();
+            alloc_pattern_slots(NODES[arm].a);
+            gen_pattern_test(NODES[arm].a, st, held, next);
+            if NODES[arm].b != 0 {
+                gen_expr(NODES[arm].b);
+                emit_jump_if_zero(next);
+            }
+            gen_expr(NODES[arm].c);
+            emit_jump(end);
+            emit_label(next);
+        }
+        emit_label(end);
     }
-    emit_label(end);
 }
 
 // Frame slots for the locals a pattern binds (once: the alternatives of an
 // or-pattern bind the same locals).
 fn alloc_pattern_slots(p: i64) {
-    let kind = NODES[p].kind;
-    if kind == PatBind {
-        let local = NODES[p].x;
-        if LOCALS[local].offset == 0 {
-            LOCALS[local].offset = alloc_slot_for(LOCALS[local].ty);
+    unsafe {
+        let kind = NODES[p].kind;
+        if kind == PatBind {
+            let local = NODES[p].x;
+            if LOCALS[local].offset == 0 {
+                LOCALS[local].offset = alloc_slot_for(LOCALS[local].ty);
+            }
+            return;
         }
-        return;
-    }
-    if kind == PatTuple || kind == PatVariant || kind == PatOr {
-        for i in 0..NODES[p].count {
-            alloc_pattern_slots(child(p, i));
+        if kind == PatTuple || kind == PatVariant || kind == PatOr {
+            for i in 0..NODES[p].count {
+                alloc_pattern_slots(child(p, i));
+            }
         }
     }
 }
@@ -1099,86 +1158,88 @@ fn alloc_pattern_slots(p: i64) {
 // Jumps to `fail` unless the value of type `ty` in frame slot `held` (the
 // address of a compound value) matches pattern p; binds its variables.
 fn gen_pattern_test(p: i64, ty: i64, held: i64, fail: i64) {
-    let kind = NODES[p].kind;
-    if ty == TY_NEVER {
-        return;
-    }
-    match kind {
-        PatWild => return,
-        PatBind => {
-            if !is_void(ty) {
+    unsafe {
+        let kind = NODES[p].kind;
+        if ty == TY_NEVER {
+            return;
+        }
+        match kind {
+            PatWild => return,
+            PatBind => {
+                if !is_void(ty) {
+                    load_held(ty, held);
+                    store_to_frame(ty, LOCALS[NODES[p].x].offset);
+                }
+                return;
+            }
+            PatLit => {
                 load_held(ty, held);
-                store_to_frame(ty, LOCALS[NODES[p].x].offset);
+                emit_load_imm(R_SECOND, NODES[p].x as u64);
+                emit_compare_jump(Cond::Ne, is_signed(scalar_type(ty)), fail);
+                return;
             }
-            return;
-        }
-        PatLit => {
-            load_held(ty, held);
-            emit_load_imm(R_SECOND, NODES[p].x as u64);
-            emit_compare_jump(Cond::Ne, is_signed(scalar_type(ty)), fail);
-            return;
-        }
-        PatRange => {
-            let signed = is_signed(scalar_type(ty));
-            load_held(ty, held);
-            emit_load_imm(R_SECOND, NODES[p].x as u64);
-            emit_compare_jump(Cond::Lt, signed, fail);
-            emit_load_imm(R_SECOND, NODES[p].y as u64);
-            emit_compare_jump(Cond::Gt, signed, fail);
-            return;
-        }
-        PatOr => {
-            let ok = new_label();
-            let last = NODES[p].count - 1;
-            for i in 0..last {
-                let next = new_label();
-                gen_pattern_test(child(p, i), ty, held, next);
-                emit_jump(ok);
-                emit_label(next);
+            PatRange => {
+                let signed = is_signed(scalar_type(ty));
+                load_held(ty, held);
+                emit_load_imm(R_SECOND, NODES[p].x as u64);
+                emit_compare_jump(Cond::Lt, signed, fail);
+                emit_load_imm(R_SECOND, NODES[p].y as u64);
+                emit_compare_jump(Cond::Gt, signed, fail);
+                return;
             }
-            gen_pattern_test(child(p, last), ty, held, fail);
-            emit_label(ok);
-            return;
+            PatOr => {
+                let ok = new_label();
+                let last = NODES[p].count - 1;
+                for i in 0..last {
+                    let next = new_label();
+                    gen_pattern_test(child(p, i), ty, held, next);
+                    emit_jump(ok);
+                    emit_label(next);
+                }
+                gen_pattern_test(child(p, last), ty, held, fail);
+                emit_label(ok);
+                return;
+            }
+            PatVariant => {
+                let v = NODES[p].x;
+                let tag = ENUMS[TYPES[ty].a].tag;
+                if is_compound(ty) {
+                    load_reg_from_frame(R_ACC, held);
+                    emit_load(tag, R_ACC);
+                } else {
+                    load_held(ty, held);
+                }
+                emit_load_imm(R_SECOND, wrap_int(VARIANTS[v].discr, tag) as u64);
+                emit_compare_jump(Cond::Ne, is_signed(tag), fail);
+            }
+            _ => {}
         }
-        PatVariant => {
-            let v = NODES[p].x;
-            let tag = ENUMS[TYPES[ty].a].tag;
-            if is_compound(ty) {
-                load_reg_from_frame(R_ACC, held);
-                emit_load(tag, R_ACC);
+        // The elements of a tuple, the fields of a variant.
+        for i in 0..NODES[p].count {
+            let sub = child(p, i);
+            if NODES[sub].kind == PatWild {
+                continue;
+            }
+            let mut elem_ty = 0;
+            let mut offset = 0;
+            if kind == PatVariant {
+                elem_ty = variant_field(NODES[p].x, i);
+                offset = variant_field_offset(NODES[p].x, i);
             } else {
-                load_held(ty, held);
+                elem_ty = type_elem(ty, i);
+                offset = tuple_offset(ty, i);
             }
-            emit_load_imm(R_SECOND, wrap_int(VARIANTS[v].discr, tag) as u64);
-            emit_compare_jump(Cond::Ne, is_signed(tag), fail);
+            let elem_held = alloc_slot(8, 8);
+            load_reg_from_frame(R_ACC, held);
+            emit_add_imm(R_ACC, offset);
+            if is_compound(elem_ty) {
+                store_reg_to_frame(R_ACC, elem_held);
+            } else if !is_void(elem_ty) {
+                emit_load(elem_ty, R_ACC);
+                store_to_frame(elem_ty, elem_held);
+            }
+            gen_pattern_test(sub, elem_ty, elem_held, fail);
         }
-        _ => {}
-    }
-    // The elements of a tuple, the fields of a variant.
-    for i in 0..NODES[p].count {
-        let sub = child(p, i);
-        if NODES[sub].kind == PatWild {
-            continue;
-        }
-        let mut elem_ty = 0;
-        let mut offset = 0;
-        if kind == PatVariant {
-            elem_ty = variant_field(NODES[p].x, i);
-            offset = variant_field_offset(NODES[p].x, i);
-        } else {
-            elem_ty = type_elem(ty, i);
-            offset = tuple_offset(ty, i);
-        }
-        let elem_held = alloc_slot(8, 8);
-        load_reg_from_frame(R_ACC, held);
-        emit_add_imm(R_ACC, offset);
-        if is_compound(elem_ty) {
-            store_reg_to_frame(R_ACC, elem_held);
-        } else if !is_void(elem_ty) {
-            emit_load(elem_ty, R_ACC);
-            store_to_frame(elem_ty, elem_held);
-        }
-        gen_pattern_test(sub, elem_ty, elem_held, fail);
     }
 }
 
@@ -1196,84 +1257,92 @@ fn load_held(ty: i64, held: i64) {
 // ---- Control flow ----
 
 fn gen_if(n: i64) {
-    let else_label = new_label();
-    let end_label = new_label();
-    gen_expr(NODES[n].a);
-    emit_jump_if_zero(else_label);
-    gen_block(NODES[n].b);
-    if NODES[n].c != 0 {
-        emit_jump(end_label);
-        emit_label(else_label);
-        gen_block(NODES[n].c);
-        emit_label(end_label);
-    } else {
-        emit_label(else_label);
+    unsafe {
+        let else_label = new_label();
+        let end_label = new_label();
+        gen_expr(NODES[n].a);
+        emit_jump_if_zero(else_label);
+        gen_block(NODES[n].b);
+        if NODES[n].c != 0 {
+            emit_jump(end_label);
+            emit_label(else_label);
+            gen_block(NODES[n].c);
+            emit_label(end_label);
+        } else {
+            emit_label(else_label);
+        }
     }
 }
 
 fn new_loop_labels(n: i64, count: i64) -> i64 {
-    let first = new_label();
-    for _ in 1..count {
-        new_label();
+    unsafe {
+        let first = new_label();
+        for _ in 1..count {
+            new_label();
+        }
+        NODES[n].z = first;
+        while LABEL_DEPTH.count <= first {
+            LABEL_DEPTH.push(0);
+        }
+        LABEL_DEPTH.data[first] = DEPTH;
+        first
     }
-    NODES[n].z = first;
-    while LABEL_DEPTH.count <= first {
-        LABEL_DEPTH.push(0);
-    }
-    LABEL_DEPTH.data[first] = DEPTH;
-    first
 }
 
 // `loop` and `while`.
 fn gen_loop(n: i64) {
-    let top = new_loop_labels(n, 2);
-    emit_label(top);
-    if NODES[n].kind == While {
-        gen_expr(NODES[n].b);
-        emit_jump_if_zero(top + 1);
-        defer_loop_enter(n);
-        gen_block(NODES[n].c);
-    } else {
-        defer_loop_enter(n);
-        gen_block(NODES[n].b);
+    unsafe {
+        let top = new_loop_labels(n, 2);
+        emit_label(top);
+        if NODES[n].kind == While {
+            gen_expr(NODES[n].b);
+            emit_jump_if_zero(top + 1);
+            defer_loop_enter(n);
+            gen_block(NODES[n].c);
+        } else {
+            defer_loop_enter(n);
+            gen_block(NODES[n].b);
+        }
+        defer_loop_leave();
+        emit_jump(top);
+        emit_label(top + 1);
     }
-    defer_loop_leave();
-    emit_jump(top);
-    emit_label(top + 1);
 }
 
 // `for i in a..b`: the bounds are evaluated once; the loop variable is a
 // copy of the counter.
 fn gen_for(n: i64) {
-    let range = NODES[n].c;
-    let ty = NODES[range].ty;
-    let inclusive = NODES[range].c != 0;
-    let counter = alloc_slot(8, 8);
-    let end = alloc_slot(8, 8);
-    gen_expr(NODES[range].a);
-    store_reg_to_frame(R_ACC, counter);
-    gen_expr(NODES[range].b);
-    store_reg_to_frame(R_ACC, end);
-    let labels = new_loop_labels(n, 3);
-    let next = labels;
-    let exit = labels + 1;
-    let test = labels + 2;
-    emit_label(test);
-    load_counter_and_end(counter, end);
-    emit_compare_jump(if inclusive { Cond::Gt } else { Cond::Ge }, is_signed(ty), exit);
-    bind(NODES[n].b);
-    defer_loop_enter(n);
-    gen_block(NODES[n].d);
-    defer_loop_leave();
-    emit_label(next);
-    load_counter_and_end(counter, end);
-    if inclusive {
-        emit_compare_jump(Cond::Eq, is_signed(ty), exit);
+    unsafe {
+        let range = NODES[n].c;
+        let ty = NODES[range].ty;
+        let inclusive = NODES[range].c != 0;
+        let counter = alloc_slot(8, 8);
+        let end = alloc_slot(8, 8);
+        gen_expr(NODES[range].a);
+        store_reg_to_frame(R_ACC, counter);
+        gen_expr(NODES[range].b);
+        store_reg_to_frame(R_ACC, end);
+        let labels = new_loop_labels(n, 3);
+        let next = labels;
+        let exit = labels + 1;
+        let test = labels + 2;
+        emit_label(test);
+        load_counter_and_end(counter, end);
+        emit_compare_jump(if inclusive { Cond::Gt } else { Cond::Ge }, is_signed(ty), exit);
+        bind(NODES[n].b);
+        defer_loop_enter(n);
+        gen_block(NODES[n].d);
+        defer_loop_leave();
+        emit_label(next);
+        load_counter_and_end(counter, end);
+        if inclusive {
+            emit_compare_jump(Cond::Eq, is_signed(ty), exit);
+        }
+        emit_add_imm(R_ACC, 1);
+        store_reg_to_frame(R_ACC, counter);
+        emit_jump(test);
+        emit_label(exit);
     }
-    emit_add_imm(R_ACC, 1);
-    store_reg_to_frame(R_ACC, counter);
-    emit_jump(test);
-    emit_label(exit);
 }
 
 // The accumulator = the counter, the second operand = the end.
@@ -1284,9 +1353,11 @@ fn load_counter_and_end(counter: i64, end: i64) {
 
 // `break` (to_end 1) or `continue` (to_end 0) out of loop `lp`.
 fn jump_out_to_loop(lp: i64, to_end: i64) {
-    let label = NODES[lp].z;
-    emit_drop_temps(DEPTH - LABEL_DEPTH.data[label]);
-    emit_jump(label + to_end);
+    unsafe {
+        let label = NODES[lp].z;
+        emit_drop_temps(DEPTH - LABEL_DEPTH.data[label]);
+        emit_jump(label + to_end);
+    }
 }
 
 // ---- Assignment ----
@@ -1309,45 +1380,350 @@ pub fn arith_op_of_assign(op: Tok) -> Tok {
 // The right-hand side is evaluated first, then the target's address; a
 // compound assignment then reads the old value.
 fn gen_assign(n: i64) {
-    let op = NODES[n].op;
-    let target = NODES[n].b;
-    let value = NODES[n].c;
-    let ty = NODES[target].ty;
-    gen_expr(value);
-    if op == Tok::Eq {
-        if is_void(ty) {
+    unsafe {
+        let op = NODES[n].op;
+        let target = NODES[n].b;
+        let value = NODES[n].c;
+        let ty = NODES[target].ty;
+        gen_expr(value);
+        if op == Tok::Eq {
+            if is_void(ty) {
+                gen_addr(target);
+                return;
+            }
+            // The value (the source's address for compound values) waits on the
+            // stack while the target's address is computed.
+            push_value(ty);
             gen_addr(target);
+            emit_move_to_second(TY_U64);
+            if is_float(ty) {
+                pop_d(0);
+            } else {
+                pop_x(R_ACC);
+            }
+            if is_compound(ty) {
+                emit_copy(type_size(ty));
+            } else {
+                emit_store(ty, R_ACC, R_SECOND);
+            }
             return;
         }
-        // The value (the source's address for compound values) waits on the
-        // stack while the target's address is computed.
-        push_value(ty);
+        let value_ty = NODES[value].ty;
+        if is_vector(ty) {
+            gen_vector_assign(arith_op_of_assign(op), target, ty);
+            return;
+        }
+        push_value(value_ty);
         gen_addr(target);
-        emit_move_to_second(TY_U64);
-        if is_float(ty) {
-            pop_d(0);
+        push_x0();
+        emit_peek(R_ADDR);
+        emit_load(ty, R_ADDR);
+        emit_peek_at(R_SECOND, 1, is_float(value_ty));
+        gen_operator(arith_op_of_assign(op), ty, ty);
+        pop_x(R_ADDR);
+        emit_store(ty, R_ACC, R_ADDR);
+        emit_drop_temps(1);
+        DEPTH -= 1;
+    }
+}
+
+// ---- Vectors (0.10) ----
+//
+// Lane by lane, with the scalar operations: each vector operand is first
+// copied into a frame slot of its own (so that evaluating the next operand
+// cannot change it), each lane is loaded from there, and the result is
+// built in a new slot, whose address is the value.
+
+fn lane_size(vt: i64) -> i64 {
+    type_size(vec_elem(vt))
+}
+
+// The integer type of the lanes of vector type vt (a float vector's
+// lanes as bits).
+fn lane_int_type(vt: i64) -> i64 {
+    vec_elem(vec_mask_type(vt))
+}
+
+// Evaluates vector expression e into a new slot; returns its offset.
+fn gen_vector_to_slot(e: i64) -> i64 {
+    let slot = alloc_slot(16, 16);
+    gen_expr(e);
+    emit_frame_addr(R_SECOND, slot);
+    emit_copy(16);
+    slot
+}
+
+// Evaluates scalar expression e (of type ty) into a new slot.
+fn gen_scalar_to_slot(e: i64, ty: i64) -> i64 {
+    let slot = alloc_slot(8, 8);
+    gen_expr(e);
+    store_to_frame(ty, slot);
+    slot
+}
+
+// Accumulator = the scalar of type ty at frame offset `offset`.
+fn load_frame_scalar(ty: i64, offset: i64) {
+    emit_frame_addr(R_ACC, offset);
+    emit_load(ty, R_ACC);
+}
+
+// Accumulator = lane i (of type ty) of the vector in slot `slot`.
+fn load_lane(slot: i64, ty: i64, i: i64) {
+    load_frame_scalar(ty, slot - i * type_size(ty));
+}
+
+// Lane i of the vector in slot `slot` = the accumulator (of type ty).
+fn store_lane(slot: i64, ty: i64, i: i64) {
+    store_to_frame(ty, slot - i * type_size(ty));
+}
+
+// Accumulator = lane i of slot a <op> lane i of slot b (the operands of
+// type ty); a comparison gives -1 or 0 (of type result_ty).
+fn gen_lane_operator(op: Tok, a: i64, b: i64, ty: i64, result_ty: i64, i: i64) {
+    load_lane(a, ty, i);
+    push_value(ty);
+    load_lane(b, ty, i);
+    pop_second_operand(ty);
+    if is_comparison(op) {
+        emit_compare(cond_of_token(op), ty);
+        emit_negate(result_ty);
+    } else if is_float(ty) {
+        emit_float_binary(op, ty);
+    } else {
+        emit_int_binary(op, ty);
+    }
+}
+
+fn gen_vector_binary(op: Tok, lhs: i64, rhs: i64, result_vt: i64) {
+    let vt = unsafe { NODES[lhs].ty };
+    let a = gen_vector_to_slot(lhs);
+    let b = gen_vector_to_slot(rhs);
+    let r = alloc_slot(16, 16);
+    let elem = vec_elem(vt);
+    let result_elem = vec_elem(result_vt);
+    for i in 0..vec_lanes(vt) {
+        gen_lane_operator(op, a, b, elem, result_elem, i);
+        store_lane(r, result_elem, i);
+    }
+    emit_frame_addr(R_ACC, r);
+}
+
+fn gen_vector_negate(operand: i64, vt: i64) {
+    let a = gen_vector_to_slot(operand);
+    let elem = vec_elem(vt);
+    for i in 0..vec_lanes(vt) {
+        load_lane(a, elem, i);
+        emit_negate(elem);
+        store_lane(a, elem, i);
+    }
+    emit_frame_addr(R_ACC, a);
+}
+
+// `target <op>= value` on a vector: the value is in the accumulator (its
+// address).
+fn gen_vector_assign(op: Tok, target: i64, vt: i64) {
+    let b = alloc_slot(16, 16);
+    emit_frame_addr(R_SECOND, b);
+    emit_copy(16);
+    let addr = alloc_slot(8, 8);
+    gen_addr(target);
+    store_reg_to_frame(R_ACC, addr);
+    let elem = vec_elem(vt);
+    let size = type_size(elem);
+    for i in 0..vec_lanes(vt) {
+        load_reg_from_frame(R_ACC, addr);
+        emit_add_imm(R_ACC, i * size);
+        emit_load(elem, R_ACC);
+        push_value(elem);
+        load_lane(b, elem, i);
+        pop_second_operand(elem);
+        if is_float(elem) {
+            emit_float_binary(op, elem);
         } else {
-            pop_x(R_ACC);
+            emit_int_binary(op, elem);
         }
-        if is_compound(ty) {
-            emit_copy(type_size(ty));
+        load_reg_from_frame(R_ADDR, addr);
+        emit_add_imm(R_ADDR, i * size);
+        emit_store(elem, R_ACC, R_ADDR);
+    }
+}
+
+// The memory of a vector load or store, `s` (a slice or an array), and its
+// index: slots holding the address of the first lane, after checking
+// that the lanes are in bounds (a range i..i + lanes of s).
+fn gen_vector_address(s: i64, index: i64, lanes: i64, elem: i64) -> i64 {
+    unsafe {
+        let s_ty = NODES[s].ty;
+        let ptr = alloc_slot(8, 8);
+        let len = alloc_slot(8, 8);
+        gen_expr(s);
+        if is_slice(s_ty) {
+            emit_move_to_second(TY_U64);
+            emit_load_reg(R_ACC, R_SECOND);
+            store_reg_to_frame(R_ACC, ptr);
+            emit_add_imm(R_SECOND, 8);
+            emit_load_reg(R_ACC, R_SECOND);
+            store_reg_to_frame(R_ACC, len);
         } else {
-            emit_store(ty, R_ACC, R_SECOND);
+            store_reg_to_frame(R_ACC, ptr);
+            emit_load_imm(R_ACC, TYPES[s_ty].b as u64);
+            store_reg_to_frame(R_ACC, len);
         }
+        let idx = gen_scalar_to_slot(index, TY_I64);
+        // index <= len - lanes (signed: len - lanes may be negative), and
+        // 0 <= index.
+        let ok = new_label();
+        let fail = new_label();
+        load_reg_from_frame(R_SECOND, len);
+        emit_add_imm(R_SECOND, 0 - lanes);
+        load_reg_from_frame(R_ACC, idx);
+        emit_compare_jump(Cond::Gt, true, fail);
+        emit_load_imm(R_SECOND, 0);
+        emit_compare_jump(Cond::Ge, true, ok);
+        emit_label(fail);
+        load_reg_from_frame(R_SECOND, idx);
+        emit_add_imm(R_SECOND, lanes);
+        load_reg_from_frame(R_ACC, idx);
+        emit_frame_addr(R_ADDR, len);
+        emit_load_reg(R_ADDR, R_ADDR);
+        emit_panic(PANIC_RANGE_SIGNED);
+        emit_label(ok);
+        load_reg_from_frame(R_SECOND, ptr);
+        load_reg_from_frame(R_ACC, idx);
+        emit_index_addr(type_size(elem));
+        store_reg_to_frame(R_ACC, ptr);
+        ptr
+    }
+}
+
+// The address of lane `index` (an expression) of the vector in slot
+// `slot`, checked, in the accumulator.
+fn gen_lane_address(slot: i64, index: i64, vt: i64) {
+    let idx = gen_scalar_to_slot(index, TY_I64);
+    let ok = new_label();
+    load_reg_from_frame(R_ACC, idx);
+    emit_load_imm(R_SECOND, vec_lanes(vt) as u64);
+    emit_compare_jump(Cond::Lt, false, ok);
+    emit_panic(PANIC_INDEX_SIGNED);
+    emit_label(ok);
+    emit_frame_addr(R_SECOND, slot);
+    load_reg_from_frame(R_ACC, idx);
+    emit_index_addr(lane_size(vt));
+}
+
+// The float sum of lanes lo..hi of slot a (pairwise: the sum of the first
+// half plus the sum of the second), in the accumulator.
+fn gen_float_sum(a: i64, elem: i64, lo: i64, hi: i64) {
+    if hi - lo == 1 {
+        load_lane(a, elem, lo);
         return;
     }
-    let value_ty = NODES[value].ty;
-    push_value(value_ty);
-    gen_addr(target);
-    push_x0();
-    emit_peek(R_ADDR);
-    emit_load(ty, R_ADDR);
-    emit_peek_at(R_SECOND, 1, is_float(value_ty));
-    gen_operator(arith_op_of_assign(op), ty, ty);
-    pop_x(R_ADDR);
-    emit_store(ty, R_ACC, R_ADDR);
-    emit_drop_temps(1);
-    DEPTH -= 1;
+    let mid = lo + (hi - lo) / 2;
+    gen_float_sum(a, elem, lo, mid);
+    push_value(elem);
+    gen_float_sum(a, elem, mid, hi);
+    pop_second_operand(elem);
+    emit_float_binary(Tok::Plus, elem);
+}
+
+fn gen_vecop(n: i64) {
+    unsafe {
+        let kind = NODES[n].x;
+        let vt = NODES[n].y;
+        let elem = vec_elem(vt);
+        let lanes = vec_lanes(vt);
+        if kind == VK_NEW {
+            gen_aggregate(n);
+            return;
+        }
+        if kind == VK_SPLAT {
+            let r = alloc_slot(16, 16);
+            gen_expr(child(n, 0));
+            for i in 0..lanes {
+                store_lane(r, elem, i);
+            }
+            emit_frame_addr(R_ACC, r);
+            return;
+        }
+        if kind == VK_LOAD {
+            let ptr = gen_vector_address(child(n, 0), child(n, 1), lanes, elem);
+            let r = alloc_slot(16, 16);
+            for i in 0..lanes {
+                load_reg_from_frame(R_ACC, ptr);
+                emit_add_imm(R_ACC, i * type_size(elem));
+                emit_load(elem, R_ACC);
+                store_lane(r, elem, i);
+            }
+            emit_frame_addr(R_ACC, r);
+            return;
+        }
+        let a = gen_vector_to_slot(NODES[n].a);
+        if kind == VK_STORE {
+            let ptr = gen_vector_address(child(n, 0), child(n, 1), lanes, elem);
+            for i in 0..lanes {
+                load_lane(a, elem, i);
+                load_reg_from_frame(R_ADDR, ptr);
+                emit_add_imm(R_ADDR, i * type_size(elem));
+                emit_store(elem, R_ACC, R_ADDR);
+            }
+            return;
+        }
+        if kind == VK_LANE {
+            gen_lane_address(a, child(n, 0), vt);
+            emit_load(elem, R_ACC);
+            return;
+        }
+        if kind == VK_WITH {
+            let addr = alloc_slot(8, 8);
+            gen_lane_address(a, child(n, 0), vt);
+            store_reg_to_frame(R_ACC, addr);
+            let x = gen_scalar_to_slot(child(n, 1), elem);
+            load_frame_scalar(elem, x);
+            load_reg_from_frame(R_SECOND, addr);
+            emit_store(elem, R_ACC, R_SECOND);
+            emit_frame_addr(R_ACC, a);
+            return;
+        }
+        if kind == VK_SUM {
+            if is_float(elem) {
+                gen_float_sum(a, elem, 0, lanes);
+                return;
+            }
+            load_lane(a, elem, 0);
+            for i in 1..lanes {
+                push_value(elem);
+                load_lane(a, elem, i);
+                pop_second_operand(elem);
+                emit_int_binary(Tok::Plus, elem);
+            }
+            return;
+        }
+        // VK_SELECT: mask a; (x & a) | (y & ~a), on the lanes' bits.
+        let x = gen_vector_to_slot(child(n, 0));
+        let y = gen_vector_to_slot(child(n, 1));
+        let it = vec_elem(vt);
+        let t = alloc_slot(8, 8);
+        for i in 0..lanes {
+            load_lane(a, it, i);
+            emit_bitnot(it);
+            push_value(it);
+            load_lane(y, it, i);
+            pop_second_operand(it);
+            emit_int_binary(Tok::Amp, it);
+            store_to_frame(it, t);
+            load_lane(x, it, i);
+            push_value(it);
+            load_lane(a, it, i);
+            pop_second_operand(it);
+            emit_int_binary(Tok::Amp, it);
+            push_value(it);
+            load_frame_scalar(it, t);
+            pop_second_operand(it);
+            emit_int_binary(Tok::Pipe, it);
+            store_lane(x, it, i);
+        }
+        emit_frame_addr(R_ACC, x);
+    }
 }
 
 // ---- Calls ----
@@ -1355,62 +1731,66 @@ fn gen_assign(n: i64) {
 // Expressions whose compound value lives in a place another expression can
 // change: passed by value, they are copied first.
 fn is_place_kind(n: i64) -> bool {
-    let kind = NODES[n].kind;
-    kind == Ident || kind == FieldAccess || kind == TupleField || kind == Index
-        || (kind == Unary && NODES[n].op == Tok::Star)
+    unsafe {
+        let kind = NODES[n].kind;
+        kind == Ident || kind == FieldAccess || kind == TupleField || kind == Index
+            || (kind == Unary && NODES[n].op == Tok::Star)
+    }
 }
 
 fn gen_call(n: i64) {
-    let callee = NODES[n].a;
-    let direct = NODES[n].x - 1;
-    let mut param_count = 0;
-    let mut ret = 0;
-    let mut variadic = false;
-    let mut callee_ty = 0;
-    if direct >= 0 {
-        param_count = FNS[direct].param_count;
-        ret = FNS[direct].ret;
-        variadic = FNS[direct].variadic;
-    } else {
-        callee_ty = NODES[callee].ty;
-        param_count = TYPES[callee_ty].count;
-        ret = TYPES[callee_ty].a;
-    }
-    let count = NODES[n].count;
-    if count > 64 {
-        type_error(n, c"too many arguments (at most 64 are supported)");
-    }
-    // The type of each passed argument (0 for unit arguments, not passed).
-    let mut arg_types: [i64; 64] = [0; 64];
-    let mut pushed = 0;
-    for i in 0..count {
-        let arg = child(n, i);
-        let mut ty = NODES[arg].ty;
-        if i < param_count {
-            ty = if direct >= 0 { fn_param(direct, i) } else { type_elem(callee_ty, i) };
+    unsafe {
+        let callee = NODES[n].a;
+        let direct = NODES[n].x - 1;
+        let mut param_count = 0;
+        let mut ret = 0;
+        let mut variadic = false;
+        let mut callee_ty = 0;
+        if direct >= 0 {
+            param_count = FNS[direct].param_count;
+            ret = FNS[direct].ret;
+            variadic = FNS[direct].variadic;
+        } else {
+            callee_ty = NODES[callee].ty;
+            param_count = TYPES[callee_ty].count;
+            ret = TYPES[callee_ty].a;
         }
-        gen_expr(arg);
-        if is_void(ty) {
-            continue;
+        let count = NODES[n].count;
+        if count > 64 {
+            type_error(n, c"too many arguments (at most 64 are supported)");
         }
-        // A private copy, of a multiple of 8 bytes (read in pieces), unless
-        // the value is a new temporary.
-        if is_compound(ty) && !is_fresh(arg) {
-            let copy = alloc_slot_for(ty);
-            emit_frame_addr(R_SECOND, copy);
-            emit_copy(type_size(ty));
-            emit_frame_addr(R_ACC, copy);
+        // The type of each passed argument (0 for unit arguments, not passed).
+        let mut arg_types: [i64; 64] = [0; 64];
+        let mut pushed = 0;
+        for i in 0..count {
+            let arg = child(n, i);
+            let mut ty = NODES[arg].ty;
+            if i < param_count {
+                ty = if direct >= 0 { fn_param(direct, i) } else { type_elem(callee_ty, i) };
+            }
+            gen_expr(arg);
+            if is_void(ty) {
+                continue;
+            }
+            // A private copy, of a multiple of 8 bytes (read in pieces), unless
+            // the value is a new temporary.
+            if is_compound(ty) && !is_fresh(arg) {
+                let copy = alloc_slot_for(ty);
+                emit_frame_addr(R_SECOND, copy);
+                emit_copy(type_size(ty));
+                emit_frame_addr(R_ACC, copy);
+            }
+            push_value(ty);
+            arg_types[i] = ty;
+            pushed += 1;
         }
-        push_value(ty);
-        arg_types[i] = ty;
-        pushed += 1;
+        if direct < 0 {
+            gen_expr(callee);
+            push_x0();
+            pushed += 1;
+        }
+        gen_call_sequence(n, direct, &arg_types as *i64, count, param_count, variadic, pushed, ret);
     }
-    if direct < 0 {
-        gen_expr(callee);
-        push_x0();
-        pushed += 1;
-    }
-    gen_call_sequence(n, direct, &arg_types as *i64, count, param_count, variadic, pushed, ret);
 }
 
 // Where each argument goes (see arg_location): `locations[i]` for scalars,
@@ -1421,29 +1801,31 @@ fn gen_call(n: i64) {
 fn assign_arg_locations(arg_types: *i64, count: i64, param_count: i64, variadic: bool,
                         ret: i64, locations: *i64, pieces: *i64, kinds: *AbiClass,
                         float_regs: *i64) -> i64 {
-    let mut state: [i64; 3] = [first_int_arg(ret), 0, 0];
-    for i in 0..count {
-        let ty = arg_types[i];
-        if ty == 0 {
-            continue;
+    unsafe {
+        let mut state: [i64; 3] = [first_int_arg(ret), 0, 0];
+        for i in 0..count {
+            let ty = arg_types[i];
+            if ty == 0 {
+                continue;
+            }
+            let extra = variadic && i >= param_count;
+            let kind = if extra { variadic_kind(ty) } else { abi_classify(ty) };
+            kinds[i] = kind;
+            if extra && kind == AbiClass::Pieces {
+                abi_variadic_piece_locations(ty, &state as *i64, &pieces[4 * i]);
+            } else if extra && kind != AbiClass::Stack {
+                locations[i] = variadic_arg_location(if kind == AbiClass::Ref { TY_U64 } else { ty }, &state as *i64);
+            } else if kind == AbiClass::Pieces {
+                abi_piece_locations(ty, &state as *i64, &pieces[4 * i]);
+            } else if kind == AbiClass::Stack {
+                locations[i] = abi_stack_location(ty, &state as *i64);
+            } else {
+                locations[i] = arg_location(if kind == AbiClass::Ref { TY_U64 } else { ty }, &state as *i64);
+            }
         }
-        let extra = variadic && i >= param_count;
-        let kind = if extra { variadic_kind(ty) } else { abi_classify(ty) };
-        kinds[i] = kind;
-        if extra && kind == AbiClass::Pieces {
-            abi_variadic_piece_locations(ty, &state as *i64, &pieces[4 * i]);
-        } else if extra && kind != AbiClass::Stack {
-            locations[i] = variadic_arg_location(if kind == AbiClass::Ref { TY_U64 } else { ty }, &state as *i64);
-        } else if kind == AbiClass::Pieces {
-            abi_piece_locations(ty, &state as *i64, &pieces[4 * i]);
-        } else if kind == AbiClass::Stack {
-            locations[i] = abi_stack_location(ty, &state as *i64);
-        } else {
-            locations[i] = arg_location(if kind == AbiClass::Ref { TY_U64 } else { ty }, &state as *i64);
-        }
+        *float_regs = state[1];
+        align_to(state[2], 16)
     }
-    *float_regs = state[1];
-    align_to(state[2], 16)
 }
 
 // Moves the pushed arguments into their registers and stack slots. The
@@ -1451,54 +1833,56 @@ fn assign_arg_locations(arg_types: *i64, count: i64, param_count: i64, variadic:
 // aggregate's temporary holds its address (of a private copy).
 fn place_args(arg_types: *i64, count: i64, param_count: i64, variadic: bool,
               locations: *i64, pieces: *i64, kinds: *AbiClass, stack_size: i64, pushed: i64) {
-    let scratch = if X86 { 10 } else { 16 };
-    let temp_int = if X86 { 11 } else { 17 };
-    let temp_float = if X86 { 40 } else { 48 };
-    let mut k = 0;
-    for i in 0..count {
-        let ty = arg_types[i];
-        if ty == 0 {
-            continue;
-        }
-        let from = stack_size + 16 * (pushed - 1 - k);
-        k += 1;
-        let kind = kinds[i];
-        if kind == AbiClass::Pieces {
-            abi_classify(ty);
-            m_load(TY_U64, scratch, reg_sp(), from);
-            for p in 0..ABI_PIECE_COUNT {
-                let location = pieces[4 * i + p];
-                let piece_ty = ABI_PIECE_TY[p];
-                let offset = ABI_PIECE_OFFSET[p];
-                if location < 16 {
-                    m_load(piece_ty, arg_reg(xl_from_c(location)), scratch, offset);
-                } else {
-                    let temp = if is_float(piece_ty) { temp_float } else { temp_int };
-                    m_load(piece_ty, temp, scratch, offset);
-                    m_store(piece_ty, temp, reg_sp(), location - 16);
+    unsafe {
+        let scratch = if X86 { 10 } else { 16 };
+        let temp_int = if X86 { 11 } else { 17 };
+        let temp_float = if X86 { 40 } else { 48 };
+        let mut k = 0;
+        for i in 0..count {
+            let ty = arg_types[i];
+            if ty == 0 {
+                continue;
+            }
+            let from = stack_size + 16 * (pushed - 1 - k);
+            k += 1;
+            let kind = kinds[i];
+            if kind == AbiClass::Pieces {
+                abi_classify(ty);
+                m_load(TY_U64, scratch, reg_sp(), from);
+                for p in 0..ABI_PIECE_COUNT {
+                    let location = pieces[4 * i + p];
+                    let piece_ty = ABI_PIECE_TY[p];
+                    let offset = ABI_PIECE_OFFSET[p];
+                    if location < 16 {
+                        m_load(piece_ty, arg_reg(xl_from_c(location)), scratch, offset);
+                    } else {
+                        let temp = if is_float(piece_ty) { temp_float } else { temp_int };
+                        m_load(piece_ty, temp, scratch, offset);
+                        m_store(piece_ty, temp, reg_sp(), location - 16);
+                    }
                 }
+                continue;
             }
-            continue;
-        }
-        let location = locations[i];
-        if kind == AbiClass::Stack {
-            // The aggregate's bytes, in 8-byte pieces (its copy is a
-            // multiple of 8 bytes).
-            m_load(TY_U64, scratch, reg_sp(), from);
-            let mut offset = 0;
-            while offset < type_size(ty) {
-                m_load(TY_U64, temp_int, scratch, offset);
-                m_store(TY_U64, temp_int, reg_sp(), location - 16 + offset);
-                offset += 8;
+            let location = locations[i];
+            if kind == AbiClass::Stack {
+                // The aggregate's bytes, in 8-byte pieces (its copy is a
+                // multiple of 8 bytes).
+                m_load(TY_U64, scratch, reg_sp(), from);
+                let mut offset = 0;
+                while offset < type_size(ty) {
+                    m_load(TY_U64, temp_int, scratch, offset);
+                    m_store(TY_U64, temp_int, reg_sp(), location - 16 + offset);
+                    offset += 8;
+                }
+                continue;
             }
-            continue;
-        }
-        let value_ty = if kind == AbiClass::Ref { TY_U64 } else { ty };
-        let promote = variadic && i >= param_count;
-        if location >= 16 {
-            emit_stack_arg(value_ty, from, location - 16, promote);
-        } else {
-            emit_load_arg_reg(location, value_ty, from, promote);
+            let value_ty = if kind == AbiClass::Ref { TY_U64 } else { ty };
+            let promote = variadic && i >= param_count;
+            if location >= 16 {
+                emit_stack_arg(value_ty, from, location - 16, promote);
+            } else {
+                emit_load_arg_reg(location, value_ty, from, promote);
+            }
         }
     }
 }
@@ -1508,68 +1892,70 @@ fn place_args(arg_types: *i64, count: i64, param_count: i64, variadic: bool,
 // from the result registers).
 fn gen_call_sequence(n: i64, direct: i64, arg_types: *i64, count: i64, param_count: i64,
                      variadic: bool, pushed: i64, ret: i64) {
-    let mut locations: [i64; 64] = [0; 64];
-    let mut pieces: [i64; 256] = [0; 256];
-    let mut kinds: [AbiClass; 64] = [AbiClass::Scalar; 64];
-    let mut float_regs = 0;
-    let stack_size = assign_arg_locations(arg_types, count, param_count, variadic, ret,
-                                          &locations as *i64, &pieces as *i64,
-                                          &kinds as *AbiClass, &float_regs);
-    // An aggregate aligned above 16 copied onto the stack (x86-64) must be
-    // aligned there: the pushed arguments move down so that the stack area
-    // is, and sp is restored from a frame slot after the call.
-    let mut over = 0;
-    for i in 0..count {
-        if kinds[i] == AbiClass::Stack {
-            let t = if arg_types[i] < 0 { 0 - arg_types[i] } else { arg_types[i] };
-            over = max_i64(over, type_align(t));
-        }
-    }
-    let mut saved_sp = 0;
-    if over > 16 && X86 {
-        saved_sp = alloc_slot(8, 8);
-        x64_realign_pushed(pushed, stack_size, over, saved_sp);
-    }
-    if stack_size > 0 {
-        emit_sp_sub(stack_size);
-    }
-    place_args(arg_types, count, param_count, variadic, &locations as *i64, &pieces as *i64,
-               &kinds as *AbiClass, stack_size, pushed);
-    if direct < 0 {
-        emit_load_callee(stack_size);
-    }
-    let mut result_slot = 0;
-    let through_pointer = returns_through_pointer(ret);
-    if is_compound(ret) {
-        result_slot = alloc_slot_for(ret);
-    }
-    if through_pointer {
-        emit_frame_addr(R_RESULT, result_slot);
-    }
-    if direct >= 0 {
-        emit_call(fn_symbol_prefix(direct), FNS[direct].name,
-                  FNS[direct].is_extern || FNS[direct].export, variadic, float_regs);
-    } else {
-        emit_call_indirect();
-    }
-    if saved_sp != 0 {
-        x64_restore_sp(saved_sp);
-        DEPTH -= pushed;
-    } else {
-        emit_drop_temps_now(stack_size, pushed);
-    }
-    if is_compound(ret) {
-        if !through_pointer {
-            abi_classify(ret);
-            emit_frame_addr(R_ADDR, result_slot);
-            let base = if X86 { 11 } else { 9 };
-            for k in 0..ABI_PIECE_COUNT {
-                m_store(ABI_PIECE_TY[k], return_piece_reg(k), base, ABI_PIECE_OFFSET[k]);
+    unsafe {
+        let mut locations: [i64; 64] = [0; 64];
+        let mut pieces: [i64; 256] = [0; 256];
+        let mut kinds: [AbiClass; 64] = [AbiClass::Scalar; 64];
+        let mut float_regs = 0;
+        let stack_size = assign_arg_locations(arg_types, count, param_count, variadic, ret,
+                                              &locations as *i64, &pieces as *i64,
+                                              &kinds as *AbiClass, &float_regs);
+        // An aggregate aligned above 16 copied onto the stack (x86-64) must be
+        // aligned there: the pushed arguments move down so that the stack area
+        // is, and sp is restored from a frame slot after the call.
+        let mut over = 0;
+        for i in 0..count {
+            if kinds[i] == AbiClass::Stack {
+                let t = if arg_types[i] < 0 { 0 - arg_types[i] } else { arg_types[i] };
+                over = max_i64(over, type_align(t));
             }
         }
-        emit_frame_addr(R_ACC, result_slot);
-    } else if is_integer(scalar_type(ret)) || ret == TY_BOOL {
-        emit_normalize(if ret == TY_BOOL { TY_U8 } else { ret });
+        let mut saved_sp = 0;
+        if over > 16 && X86 {
+            saved_sp = alloc_slot(8, 8);
+            x64_realign_pushed(pushed, stack_size, over, saved_sp);
+        }
+        if stack_size > 0 {
+            emit_sp_sub(stack_size);
+        }
+        place_args(arg_types, count, param_count, variadic, &locations as *i64, &pieces as *i64,
+                   &kinds as *AbiClass, stack_size, pushed);
+        if direct < 0 {
+            emit_load_callee(stack_size);
+        }
+        let mut result_slot = 0;
+        let through_pointer = returns_through_pointer(ret);
+        if is_compound(ret) {
+            result_slot = alloc_slot_for(ret);
+        }
+        if through_pointer {
+            emit_frame_addr(R_RESULT, result_slot);
+        }
+        if direct >= 0 {
+            emit_call(fn_symbol_prefix(direct), FNS[direct].name,
+                      FNS[direct].is_extern || FNS[direct].export, variadic, float_regs);
+        } else {
+            emit_call_indirect();
+        }
+        if saved_sp != 0 {
+            x64_restore_sp(saved_sp);
+            DEPTH -= pushed;
+        } else {
+            emit_drop_temps_now(stack_size, pushed);
+        }
+        if is_compound(ret) {
+            if !through_pointer {
+                abi_classify(ret);
+                emit_frame_addr(R_ADDR, result_slot);
+                let base = if X86 { 11 } else { 9 };
+                for k in 0..ABI_PIECE_COUNT {
+                    m_store(ABI_PIECE_TY[k], return_piece_reg(k), base, ABI_PIECE_OFFSET[k]);
+                }
+            }
+            emit_frame_addr(R_ACC, result_slot);
+        } else if is_integer(scalar_type(ret)) || ret == TY_BOOL {
+            emit_normalize(if ret == TY_BOOL { TY_U8 } else { ret });
+        }
     }
 }
 

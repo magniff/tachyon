@@ -126,11 +126,11 @@ static mut PP: i64 = 0;
 static mut PVARS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
 fn rule_error(message: *u8) -> ! {
-    die2(message, PT)
+    unsafe { die2(message, PT) }
 }
 
 fn skip_space() {
-    while PT[PP] == ' ' {
+    while unsafe { PT[PP] == ' ' } {
         PP += 1;
     }
 }
@@ -141,28 +141,32 @@ fn is_word_byte(c: u8) -> bool {
 
 // The word at PP: its start; PP moves past it.
 fn word() -> i64 {
-    skip_space();
-    let start = PP;
-    while is_word_byte(PT[PP]) {
-        PP += 1;
+    unsafe {
+        skip_space();
+        let start = PP;
+        while is_word_byte(PT[PP]) {
+            PP += 1;
+        }
+        if PP == start {
+            rule_error(c"internal error: a rewrite rule is malformed: ");
+        }
+        start
     }
-    if PP == start {
-        rule_error(c"internal error: a rewrite rule is malformed: ");
-    }
-    start
 }
 
 fn word_is(start: i64, text: *u8) -> bool {
-    let n = strlen(text) as i64;
-    if PP - start != n {
-        return false;
-    }
-    for i in 0..n {
-        if PT[start + i] != text[i] {
+    unsafe {
+        let n = strlen(text) as i64;
+        if PP - start != n {
             return false;
         }
+        for i in 0..n {
+            if PT[start + i] != text[i] {
+                return false;
+            }
+        }
+        true
     }
-    true
 }
 
 fn new_pattern(kind: i64, op: i64, a: i64, b: i64, val: i64) -> i64 {
@@ -178,124 +182,130 @@ fn new_pattern(kind: i64, op: i64, a: i64, b: i64, val: i64) -> i64 {
 // The variable named by the word at [start, PP), numbered in order of
 // appearance.
 fn variable(start: i64) -> i64 {
-    let second = if PP - start > 1 { PT[start + 1] as i64 } else { 0 };
-    let key = (PP - start) * 65536 + (PT[start] as i64) * 256 + second;
-    for i in 0..PVARS.count {
-        if PVARS.data[i] == key {
-            return i;
+    unsafe {
+        let second = if PP - start > 1 { PT[start + 1] as i64 } else { 0 };
+        let key = (PP - start) * 65536 + (PT[start] as i64) * 256 + second;
+        for i in 0..PVARS.count {
+            if PVARS.data[i] == key {
+                return i;
+            }
         }
+        PVARS.push(key);
+        PVARS.count - 1
     }
-    PVARS.push(key);
-    PVARS.count - 1
 }
 
 fn parse_pattern(rhs: bool) -> i64 {
-    skip_space();
-    if PT[PP] != '(' {
+    unsafe {
+        skip_space();
+        if PT[PP] != '(' {
+            let start = word();
+            let c = PT[start];
+            if c == '-' || (c >= '0' && c <= '9') {
+                let mut value = 0;
+                let mut i = start;
+                let negative = c == '-';
+                if negative {
+                    i += 1;
+                }
+                while i < PP {
+                    value = value * 10 + (PT[i] - '0') as i64;
+                    i += 1;
+                }
+                return new_pattern(K_LIT, 0, 0, 0, if negative { 0 - value } else { value });
+            }
+            let var = variable(start);
+            if rhs && var >= R_VARS_NOW {
+                rule_error(c"internal error: a rewrite rule's right side has a new variable: ");
+            }
+            return new_pattern(if c == 'c' { K_CVAR } else { K_VAR }, 0, 0, 0, var);
+        }
+        PP += 1;
         let start = word();
-        let c = PT[start];
-        if c == '-' || (c >= '0' && c <= '9') {
-            let mut value = 0;
-            let mut i = start;
-            let negative = c == '-';
-            if negative {
-                i += 1;
-            }
-            while i < PP {
-                value = value * 10 + (PT[i] - '0') as i64;
-                i += 1;
-            }
-            return new_pattern(K_LIT, 0, 0, 0, if negative { 0 - value } else { value });
+        let mut kind = K_OP;
+        let mut op = 0;
+        let mut cond = 0;
+        let mut arity = 2;
+        if word_is(start, c"add") { op = Add as i64; }
+        else if word_is(start, c"sub") { op = Sub as i64; }
+        else if word_is(start, c"mul") { op = Mul as i64; }
+        else if word_is(start, c"and") { op = And as i64; }
+        else if word_is(start, c"or") { op = Or as i64; }
+        else if word_is(start, c"xor") { op = Xor as i64; }
+        else if word_is(start, c"shl") { op = Shl as i64; }
+        else if word_is(start, c"neg") { op = Neg as i64; arity = 1; }
+        else if word_is(start, c"bnot") { op = BNot as i64; arity = 1; }
+        else if word_is(start, c"eq") { op = Cmp as i64; cond = Cond::Eq as i64; }
+        else if word_is(start, c"ne") { op = Cmp as i64; cond = Cond::Ne as i64; }
+        else {
+            kind = K_CEXPR;
+            if word_is(start, c"+") { op = C_ADD; }
+            else if word_is(start, c"-") { op = C_SUB; }
+            else if word_is(start, c"*") { op = C_MUL; }
+            else if word_is(start, c"&") { op = C_AND; }
+            else if word_is(start, c"|") { op = C_OR; }
+            else if word_is(start, c"^") { op = C_XOR; }
+            else if word_is(start, c"negc") { op = C_NEG; arity = 1; }
+            else if word_is(start, c"log2") { op = C_LOG2; arity = 1; }
+            else { rule_error(c"internal error: unknown operation in a rewrite rule: "); }
         }
-        let var = variable(start);
-        if rhs && var >= R_VARS_NOW {
-            rule_error(c"internal error: a rewrite rule's right side has a new variable: ");
+        let a = parse_pattern(rhs);
+        let b = if arity == 2 { parse_pattern(rhs) } else { -1 };
+        skip_space();
+        if PT[PP] != ')' {
+            rule_error(c"internal error: expected ')' in a rewrite rule: ");
         }
-        return new_pattern(if c == 'c' { K_CVAR } else { K_VAR }, 0, 0, 0, var);
+        PP += 1;
+        let p = new_pattern(kind, op, a, b, 0);
+        P_COND.data[p] = cond;
+        p
     }
-    PP += 1;
-    let start = word();
-    let mut kind = K_OP;
-    let mut op = 0;
-    let mut cond = 0;
-    let mut arity = 2;
-    if word_is(start, c"add") { op = Add as i64; }
-    else if word_is(start, c"sub") { op = Sub as i64; }
-    else if word_is(start, c"mul") { op = Mul as i64; }
-    else if word_is(start, c"and") { op = And as i64; }
-    else if word_is(start, c"or") { op = Or as i64; }
-    else if word_is(start, c"xor") { op = Xor as i64; }
-    else if word_is(start, c"shl") { op = Shl as i64; }
-    else if word_is(start, c"neg") { op = Neg as i64; arity = 1; }
-    else if word_is(start, c"bnot") { op = BNot as i64; arity = 1; }
-    else if word_is(start, c"eq") { op = Cmp as i64; cond = Cond::Eq as i64; }
-    else if word_is(start, c"ne") { op = Cmp as i64; cond = Cond::Ne as i64; }
-    else {
-        kind = K_CEXPR;
-        if word_is(start, c"+") { op = C_ADD; }
-        else if word_is(start, c"-") { op = C_SUB; }
-        else if word_is(start, c"*") { op = C_MUL; }
-        else if word_is(start, c"&") { op = C_AND; }
-        else if word_is(start, c"|") { op = C_OR; }
-        else if word_is(start, c"^") { op = C_XOR; }
-        else if word_is(start, c"negc") { op = C_NEG; arity = 1; }
-        else if word_is(start, c"log2") { op = C_LOG2; arity = 1; }
-        else { rule_error(c"internal error: unknown operation in a rewrite rule: "); }
-    }
-    let a = parse_pattern(rhs);
-    let b = if arity == 2 { parse_pattern(rhs) } else { -1 };
-    skip_space();
-    if PT[PP] != ')' {
-        rule_error(c"internal error: expected ')' in a rewrite rule: ");
-    }
-    PP += 1;
-    let p = new_pattern(kind, op, a, b, 0);
-    P_COND.data[p] = cond;
-    p
 }
 
 static mut R_VARS_NOW: i64 = 0;
 
 fn init_rules() {
-    if RULES_READY {
-        return;
-    }
-    RULES_READY = true;
-    for r in 0..RULE_COUNT {
-        PT = rule_text(r);
-        PP = 0;
-        PVARS.count = 0;
-        R_VARS_NOW = 1000;
-        let lhs = parse_pattern(false);
-        let mut guard = -1;
-        let at = word();
-        if word_is(at, c"if") {
-            skip_space();
-            PP += 1;
-            let pred = word();
-            if !word_is(pred, c"pow2") {
-                rule_error(c"internal error: unknown guard in a rewrite rule: ");
-            }
-            let v = word();
-            guard = variable(v);
-            skip_space();
-            PP += 1;
-            let arrow = word();
-            if !word_is(arrow, c"=>") {
+    unsafe {
+        if RULES_READY {
+            return;
+        }
+        RULES_READY = true;
+        for r in 0..RULE_COUNT {
+            PT = rule_text(r);
+            PP = 0;
+            PVARS.count = 0;
+            R_VARS_NOW = 1000;
+            let lhs = parse_pattern(false);
+            let mut guard = -1;
+            let at = word();
+            if word_is(at, c"if") {
+                skip_space();
+                PP += 1;
+                let pred = word();
+                if !word_is(pred, c"pow2") {
+                    rule_error(c"internal error: unknown guard in a rewrite rule: ");
+                }
+                let v = word();
+                guard = variable(v);
+                skip_space();
+                PP += 1;
+                let arrow = word();
+                if !word_is(arrow, c"=>") {
+                    rule_error(c"internal error: expected '=>' in a rewrite rule: ");
+                }
+            } else if !word_is(at, c"=>") {
                 rule_error(c"internal error: expected '=>' in a rewrite rule: ");
             }
-        } else if !word_is(at, c"=>") {
-            rule_error(c"internal error: expected '=>' in a rewrite rule: ");
+            R_VARS_NOW = PVARS.count;
+            let rhs = parse_pattern(true);
+            if P_KIND.data[lhs] != K_OP {
+                rule_error(c"internal error: a rewrite rule's left side is not an operation: ");
+            }
+            R_LHS.push(lhs);
+            R_RHS.push(rhs);
+            R_GUARD.push(guard);
+            R_VARS.push(PVARS.count);
         }
-        R_VARS_NOW = PVARS.count;
-        let rhs = parse_pattern(true);
-        if P_KIND.data[lhs] != K_OP {
-            rule_error(c"internal error: a rewrite rule's left side is not an operation: ");
-        }
-        R_LHS.push(lhs);
-        R_RHS.push(rhs);
-        R_GUARD.push(guard);
-        R_VARS.push(PVARS.count);
     }
 }
 
@@ -326,27 +336,33 @@ pub fn egraph_start() {
 }
 
 fn ec_touch(v: i64) {
-    while EC_STAMP.count <= v {
-        EC_STAMP.push(0);
-        EC_START.push(0);
-        EC_LEN.push(0);
-        EC_COST.push(0);
-    }
-    if EC_STAMP.data[v] != RUN {
-        EC_STAMP.data[v] = RUN;
-        EC_START.data[v] = 0;
-        EC_LEN.data[v] = 0;
-        EC_COST.data[v] = 0;
+    unsafe {
+        while EC_STAMP.count <= v {
+            EC_STAMP.push(0);
+            EC_START.push(0);
+            EC_LEN.push(0);
+            EC_COST.push(0);
+        }
+        if EC_STAMP.data[v] != RUN {
+            EC_STAMP.data[v] = RUN;
+            EC_START.data[v] = 0;
+            EC_LEN.data[v] = 0;
+            EC_COST.data[v] = 0;
+        }
     }
 }
 
 fn member_count(v: i64) -> i64 {
-    ec_touch(v);
-    if EC_LEN.data[v] == 0 { 1 } else { EC_LEN.data[v] }
+    unsafe {
+        ec_touch(v);
+        if EC_LEN.data[v] == 0 { 1 } else { EC_LEN.data[v] }
+    }
 }
 
 fn member(v: i64, i: i64) -> i64 {
-    if EC_LEN.data[v] == 0 { v } else { ALTS.data[EC_START.data[v] + i] }
+    unsafe {
+        if EC_LEN.data[v] == 0 { v } else { ALTS.data[EC_START.data[v] + i] }
+    }
 }
 
 fn is_member(v: i64, w: i64) -> bool {
@@ -375,18 +391,20 @@ fn op_cost(op: Op) -> i64 {
 
 // The cost of node m: its operation's, with its operands' best.
 fn node_cost(m: i64) -> i64 {
-    let mut cost = op_cost(INSTS[m].op);
-    let a = INSTS[m].a;
-    let b = INSTS[m].b;
-    if a != 0 {
-        ec_touch(a);
-        cost += EC_COST.data[a];
+    unsafe {
+        let mut cost = op_cost(INSTS[m].op);
+        let a = INSTS[m].a;
+        let b = INSTS[m].b;
+        if a != 0 {
+            ec_touch(a);
+            cost += EC_COST.data[a];
+        }
+        if b != 0 {
+            ec_touch(b);
+            cost += EC_COST.data[b];
+        }
+        cost
     }
-    if b != 0 {
-        ec_touch(b);
-        cost += EC_COST.data[b];
-    }
-    cost
 }
 
 // ---- Matching ----
@@ -412,7 +430,7 @@ fn bind(var: i64, v: i64) -> bool {
 }
 
 fn is_commutative_pattern(p: i64) -> bool {
-    let op = P_OP.data[p];
+    let op = unsafe { P_OP.data[p] };
     op == Add as i64 || op == Mul as i64 || op == And as i64 || op == Or as i64 || op == Xor as i64
         || op == Cmp as i64
 }
@@ -420,49 +438,51 @@ fn is_commutative_pattern(p: i64) -> bool {
 // Whether pattern p matches value v (of integer type ty): a member of
 // v's class, for an operation.
 fn pmatch(p: i64, v: i64, ty: i64) -> bool {
-    let kind = P_KIND.data[p];
-    if kind == K_VAR {
-        return bind(P_VAL.data[p], v);
-    }
-    if kind == K_CVAR || kind == K_LIT {
-        let c = const_member(v);
-        if c == 0 {
-            return false;
+    unsafe {
+        let kind = P_KIND.data[p];
+        if kind == K_VAR {
+            return bind(P_VAL.data[p], v);
         }
-        if kind == K_LIT {
-            return INSTS[c].imm == wrap_int(P_VAL.data[p], ty);
+        if kind == K_CVAR || kind == K_LIT {
+            let c = const_member(v);
+            if c == 0 {
+                return false;
+            }
+            if kind == K_LIT {
+                return INSTS[c].imm == wrap_int(P_VAL.data[p], ty);
+            }
+            return bind(P_VAL.data[p], c);
         }
-        return bind(P_VAL.data[p], c);
-    }
-    let op = P_OP.data[p];
-    let is_cmp = op == Cmp as i64;
-    let n = member_count(v);
-    for k in 0..n {
-        let m = member(v, k);
-        let mop = INSTS[m].op;
-        if mop as i64 == op && (if is_cmp {
-            INSTS[m].cond as i64 == P_COND.data[p] && INSTS[m].ty == TY_BOOL
-        } else {
-            INSTS[m].ty == ty
-        }) {
-            let child_ty = if is_cmp { INSTS[m].imm2 } else { ty };
-            if is_integer(child_ty) {
-                let mark = TRAIL.count;
-                if pmatch(P_A.data[p], INSTS[m].a, child_ty)
-                    && (P_B.data[p] < 0 || pmatch(P_B.data[p], INSTS[m].b, child_ty)) {
-                    return true;
-                }
-                undo_to(mark);
-                if P_B.data[p] >= 0 && is_commutative_pattern(p) {
-                    if pmatch(P_A.data[p], INSTS[m].b, child_ty) && pmatch(P_B.data[p], INSTS[m].a, child_ty) {
+        let op = P_OP.data[p];
+        let is_cmp = op == Cmp as i64;
+        let n = member_count(v);
+        for k in 0..n {
+            let m = member(v, k);
+            let mop = INSTS[m].op;
+            if mop as i64 == op && (if is_cmp {
+                INSTS[m].cond as i64 == P_COND.data[p] && INSTS[m].ty == TY_BOOL
+            } else {
+                INSTS[m].ty == ty
+            }) {
+                let child_ty = if is_cmp { INSTS[m].imm2 } else { ty };
+                if is_integer(child_ty) {
+                    let mark = TRAIL.count;
+                    if pmatch(P_A.data[p], INSTS[m].a, child_ty)
+                        && (P_B.data[p] < 0 || pmatch(P_B.data[p], INSTS[m].b, child_ty)) {
                         return true;
                     }
                     undo_to(mark);
+                    if P_B.data[p] >= 0 && is_commutative_pattern(p) {
+                        if pmatch(P_A.data[p], INSTS[m].b, child_ty) && pmatch(P_B.data[p], INSTS[m].a, child_ty) {
+                            return true;
+                        }
+                        undo_to(mark);
+                    }
                 }
             }
         }
+        false
     }
-    false
 }
 
 // A constant member of v's class, or 0.
@@ -470,7 +490,7 @@ fn const_member(v: i64) -> i64 {
     let n = member_count(v);
     for k in 0..n {
         let m = member(v, k);
-        if INSTS[m].op == Const {
+        if unsafe { INSTS[m].op == Const } {
             return m;
         }
     }
@@ -486,32 +506,36 @@ fn fold2(op: Op, ty: i64, x: i64, y: i64) -> i64 {
     if SCRATCH_INST == 0 || SCRATCH_INST >= INST_COUNT {
         SCRATCH_INST = ir_make(op, ty, 0, 0, 0);
     }
-    INSTS[SCRATCH_INST].op = op;
-    INSTS[SCRATCH_INST].ty = ty;
+    unsafe {
+        INSTS[SCRATCH_INST].op = op;
+        INSTS[SCRATCH_INST].ty = ty;
+    }
     fold_value(SCRATCH_INST, x, y)
 }
 
 // The value of constant expression p (of type ty), with BIND's constants.
 fn const_value_of(p: i64, ty: i64, consts: *i64) -> i64 {
-    let kind = P_KIND.data[p];
-    if kind == K_LIT {
-        return wrap_int(P_VAL.data[p], ty);
+    unsafe {
+        let kind = P_KIND.data[p];
+        if kind == K_LIT {
+            return wrap_int(P_VAL.data[p], ty);
+        }
+        if kind == K_CVAR {
+            return consts[P_VAL.data[p]];
+        }
+        let x = const_value_of(P_A.data[p], ty, consts);
+        let op = P_OP.data[p];
+        if op == C_NEG {
+            return fold2(Neg, ty, x, 0);
+        }
+        if op == C_LOG2 {
+            return log2(x);
+        }
+        let y = const_value_of(P_B.data[p], ty, consts);
+        let fop = if op == C_ADD { Add } else if op == C_SUB { Sub } else if op == C_MUL { Mul }
+            else if op == C_AND { And } else if op == C_OR { Or } else { Xor };
+        fold2(fop, ty, x, y)
     }
-    if kind == K_CVAR {
-        return consts[P_VAL.data[p]];
-    }
-    let x = const_value_of(P_A.data[p], ty, consts);
-    let op = P_OP.data[p];
-    if op == C_NEG {
-        return fold2(Neg, ty, x, 0);
-    }
-    if op == C_LOG2 {
-        return log2(x);
-    }
-    let y = const_value_of(P_B.data[p], ty, consts);
-    let fop = if op == C_ADD { Add } else if op == C_SUB { Sub } else if op == C_MUL { Mul }
-        else if op == C_AND { And } else if op == C_OR { Or } else { Xor };
-    fold2(fop, ty, x, y)
 }
 
 static mut CONSTS: [i64; 8] = [0; 8];
@@ -519,41 +543,45 @@ static mut CONSTS: [i64; 8] = [0; 8];
 // A node (op, ty, a, b) before instruction `at`: an equal one the table
 // knows, or a new one.
 fn make_node(at: i64, op: Op, cond: i64, ty: i64, operand_ty: i64, a: i64, b: i64, imm: i64) -> i64 {
-    let n = ir_make(op, ty, a, b, imm);
-    if op == Cmp {
-        INSTS[n].cond = if cond == Cond::Ne as i64 { Cond::Ne } else { Cond::Eq };
-        INSTS[n].imm2 = operand_ty;
+    unsafe {
+        let n = ir_make(op, ty, a, b, imm);
+        if op == Cmp {
+            INSTS[n].cond = if cond == Cond::Ne as i64 { Cond::Ne } else { Cond::Eq };
+            INSTS[n].imm2 = operand_ty;
+        }
+        if b != 0 && is_commutative_op(n) && operands_out_of_order(a, b) {
+            INSTS[n].a = b;
+            INSTS[n].b = a;
+        }
+        ir_insert_before(at, n);
+        let w = gvn_find_or_add(n);
+        if w != 0 {
+            ir_replace(n, w);
+            return w;
+        }
+        ec_touch(n);
+        EC_COST.data[n] = node_cost(n);
+        n
     }
-    if b != 0 && is_commutative_op(n) && operands_out_of_order(a, b) {
-        INSTS[n].a = b;
-        INSTS[n].b = a;
-    }
-    ir_insert_before(at, n);
-    let w = gvn_find_or_add(n);
-    if w != 0 {
-        ir_replace(n, w);
-        return w;
-    }
-    ec_touch(n);
-    EC_COST.data[n] = node_cost(n);
-    n
 }
 
 fn build(at: i64, p: i64, ty: i64) -> i64 {
-    let kind = P_KIND.data[p];
-    if kind == K_VAR || kind == K_CVAR {
-        return BIND[P_VAL.data[p]];
+    unsafe {
+        let kind = P_KIND.data[p];
+        if kind == K_VAR || kind == K_CVAR {
+            return BIND[P_VAL.data[p]];
+        }
+        if kind == K_LIT || kind == K_CEXPR {
+            return make_node(at, Const, 0, ty, 0, 0, 0, const_value_of(p, ty, &CONSTS as *i64));
+        }
+        let op = P_OP.data[p];
+        let is_cmp = op == Cmp as i64;
+        let child_ty = if is_cmp { BUILD_CMP_TY } else { ty };
+        let a = build(at, P_A.data[p], child_ty);
+        let b = if P_B.data[p] >= 0 { build(at, P_B.data[p], child_ty) } else { 0 };
+        let iop = op_of(op);
+        make_node(at, iop, P_COND.data[p], if is_cmp { TY_BOOL } else { ty }, child_ty, a, b, 0)
     }
-    if kind == K_LIT || kind == K_CEXPR {
-        return make_node(at, Const, 0, ty, 0, 0, 0, const_value_of(p, ty, &CONSTS as *i64));
-    }
-    let op = P_OP.data[p];
-    let is_cmp = op == Cmp as i64;
-    let child_ty = if is_cmp { BUILD_CMP_TY } else { ty };
-    let a = build(at, P_A.data[p], child_ty);
-    let b = if P_B.data[p] >= 0 { build(at, P_B.data[p], child_ty) } else { 0 };
-    let iop = op_of(op);
-    make_node(at, iop, P_COND.data[p], if is_cmp { TY_BOOL } else { ty }, child_ty, a, b, 0)
 }
 
 static mut BUILD_CMP_TY: i64 = 0;
@@ -578,78 +606,80 @@ fn is_pow2(x: i64) -> bool {
 // The rules on instruction v (new to GVN's table, its operands resolved):
 // returns the value standing for it (v itself, or a cheaper equal one).
 pub fn egraph_rewrite(v: i64) -> i64 {
-    let op = INSTS[v].op;
-    let is_cmp = op == Cmp;
-    let ty = INSTS[v].ty;
-    let operand_ty = if is_cmp { INSTS[v].imm2 } else { ty };
-    ec_touch(v);
-    EC_COST.data[v] = node_cost(v);
-    if !is_integer(operand_ty) || (is_cmp && INSTS[v].cond != Cond::Eq && INSTS[v].cond != Cond::Ne) {
-        return v;
-    }
-    FOUND.count = 0;
-    FOUND.push(v);
-    for r in 0..RULE_COUNT {
-        let lhs = R_LHS.data[r];
-        if P_OP.data[lhs] != op as i64 {
-            continue;
+    unsafe {
+        let op = INSTS[v].op;
+        let is_cmp = op == Cmp;
+        let ty = INSTS[v].ty;
+        let operand_ty = if is_cmp { INSTS[v].imm2 } else { ty };
+        ec_touch(v);
+        EC_COST.data[v] = node_cost(v);
+        if !is_integer(operand_ty) || (is_cmp && INSTS[v].cond != Cond::Eq && INSTS[v].cond != Cond::Ne) {
+            return v;
         }
-        for i in 0..8 {
-            BIND[i] = 0;
-        }
-        TRAIL.count = 0;
-        if !pmatch(lhs, v, ty) {
-            continue;
-        }
-        // The constants bound, as values of their type.
-        for i in 0..R_VARS.data[r] {
-            CONSTS[i] = if BIND[i] != 0 && INSTS[BIND[i]].op == Const { INSTS[BIND[i]].imm } else { 0 };
-        }
-        let guard = R_GUARD.data[r];
-        if guard >= 0 && !is_pow2(CONSTS[guard]) {
-            continue;
-        }
-        BUILD_CMP_TY = operand_ty;
-        let w = build(v, R_RHS.data[r], ty);
-        if INSTS[w].ty != ty {
-            continue;
-        }
-        // w and its members join v's class.
-        let n = member_count(w);
-        for k in 0..n {
-            let m = member(w, k);
-            let mut known = false;
-            for j in 0..FOUND.count {
-                if FOUND.data[j] == m {
-                    known = true;
+        FOUND.count = 0;
+        FOUND.push(v);
+        for r in 0..RULE_COUNT {
+            let lhs = R_LHS.data[r];
+            if P_OP.data[lhs] != op as i64 {
+                continue;
+            }
+            for i in 0..8 {
+                BIND[i] = 0;
+            }
+            TRAIL.count = 0;
+            if !pmatch(lhs, v, ty) {
+                continue;
+            }
+            // The constants bound, as values of their type.
+            for i in 0..R_VARS.data[r] {
+                CONSTS[i] = if BIND[i] != 0 && INSTS[BIND[i]].op == Const { INSTS[BIND[i]].imm } else { 0 };
+            }
+            let guard = R_GUARD.data[r];
+            if guard >= 0 && !is_pow2(CONSTS[guard]) {
+                continue;
+            }
+            BUILD_CMP_TY = operand_ty;
+            let w = build(v, R_RHS.data[r], ty);
+            if INSTS[w].ty != ty {
+                continue;
+            }
+            // w and its members join v's class.
+            let n = member_count(w);
+            for k in 0..n {
+                let m = member(w, k);
+                let mut known = false;
+                for j in 0..FOUND.count {
+                    if FOUND.data[j] == m {
+                        known = true;
+                    }
+                }
+                if !known {
+                    FOUND.push(m);
                 }
             }
-            if !known {
-                FOUND.push(m);
+        }
+        if FOUND.count == 1 {
+            return v;
+        }
+        EC_START.data[v] = ALTS.count;
+        EC_LEN.data[v] = FOUND.count;
+        for j in 0..FOUND.count {
+            ALTS.push(FOUND.data[j]);
+        }
+        // Extraction: the cheapest member (v on a tie).
+        let mut best = v;
+        let mut best_cost = EC_COST.data[v];
+        for j in 1..FOUND.count {
+            let m = FOUND.data[j];
+            ec_touch(m);
+            if EC_COST.data[m] < best_cost {
+                best = m;
+                best_cost = EC_COST.data[m];
             }
         }
+        EC_COST.data[v] = best_cost;
+        best
     }
-    if FOUND.count == 1 {
-        return v;
-    }
-    EC_START.data[v] = ALTS.count;
-    EC_LEN.data[v] = FOUND.count;
-    for j in 0..FOUND.count {
-        ALTS.push(FOUND.data[j]);
-    }
-    // Extraction: the cheapest member (v on a tie).
-    let mut best = v;
-    let mut best_cost = EC_COST.data[v];
-    for j in 1..FOUND.count {
-        let m = FOUND.data[j];
-        ec_touch(m);
-        if EC_COST.data[m] < best_cost {
-            best = m;
-            best_cost = EC_COST.data[m];
-        }
-    }
-    EC_COST.data[v] = best_cost;
-    best
 }
 
 static mut FOUND: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -691,82 +721,86 @@ static mut EVAL_VARS: [i64; 8] = [0; 8];
 // Pattern p evaluated with EVAL_VARS (integers of type ty; comparisons as
 // 0 or 1).
 fn eval_pattern(p: i64, ty: i64, cmp_ty: i64) -> i64 {
-    let kind = P_KIND.data[p];
-    if kind == K_VAR || kind == K_CVAR {
-        return EVAL_VARS[P_VAL.data[p]];
+    unsafe {
+        let kind = P_KIND.data[p];
+        if kind == K_VAR || kind == K_CVAR {
+            return EVAL_VARS[P_VAL.data[p]];
+        }
+        if kind == K_LIT || kind == K_CEXPR {
+            return const_value_of(p, ty, &EVAL_VARS as *i64);
+        }
+        let op = P_OP.data[p];
+        if op == Cmp as i64 {
+            let x = eval_pattern(P_A.data[p], cmp_ty, cmp_ty);
+            let y = eval_pattern(P_B.data[p], cmp_ty, cmp_ty);
+            let cond = if P_COND.data[p] == Cond::Ne as i64 { Cond::Ne } else { Cond::Eq };
+            return fold_compare(cond, cmp_ty, x, y) as i64;
+        }
+        let x = eval_pattern(P_A.data[p], ty, cmp_ty);
+        let y = if P_B.data[p] >= 0 { eval_pattern(P_B.data[p], ty, cmp_ty) } else { 0 };
+        fold2(op_of(op), ty, x, y)
     }
-    if kind == K_LIT || kind == K_CEXPR {
-        return const_value_of(p, ty, &EVAL_VARS as *i64);
-    }
-    let op = P_OP.data[p];
-    if op == Cmp as i64 {
-        let x = eval_pattern(P_A.data[p], cmp_ty, cmp_ty);
-        let y = eval_pattern(P_B.data[p], cmp_ty, cmp_ty);
-        let cond = if P_COND.data[p] == Cond::Ne as i64 { Cond::Ne } else { Cond::Eq };
-        return fold_compare(cond, cmp_ty, x, y) as i64;
-    }
-    let x = eval_pattern(P_A.data[p], ty, cmp_ty);
-    let y = if P_B.data[p] >= 0 { eval_pattern(P_B.data[p], ty, cmp_ty) } else { 0 };
-    fold2(op_of(op), ty, x, y)
 }
 
 // Checks every rule on random values at every integer width; prints a
 // line per failure and a summary; returns the number of failures.
 pub fn check_rules(trials: i64) -> i64 {
-    init_rules();
-    let types: [i64; 8] = [TY_I8, TY_I16, TY_I32, TY_I64, TY_U8, TY_U16, TY_U32, TY_U64];
-    let out = buf_new();
-    let mut failures = 0;
-    let mut checked = 0;
-    for r in 0..RULE_COUNT {
-        let lhs = R_LHS.data[r];
-        let is_cmp = P_OP.data[lhs] == Cmp as i64;
-        for t in 0..8 {
-            let ty = types[t];
-            let value_ty = if is_cmp { TY_BOOL } else { ty };
-            let mut failed = false;
-            for _ in 0..trials {
-                for i in 0..R_VARS.data[r] {
-                    EVAL_VARS[i] = random_value(ty);
-                }
-                let guard = R_GUARD.data[r];
-                if guard >= 0 && !is_pow2(EVAL_VARS[guard]) {
-                    EVAL_VARS[guard] = wrap_int(1 << ((rand64() & 7) as u64), ty);
-                    if !is_pow2(EVAL_VARS[guard]) {
-                        continue;
-                    }
-                }
-                checked += 1;
-                let left = eval_pattern(lhs, value_ty, ty);
-                let right = eval_pattern(R_RHS.data[r], value_ty, ty);
-                if left != right && !failed {
-                    failed = true;
-                    failures += 1;
-                    buf_str(out, c"rule failed: ");
-                    buf_str(out, rule_text(r));
-                    buf_str(out, c" (type ");
-                    buf_int(out, t);
-                    buf_str(out, c", variables");
+    unsafe {
+        init_rules();
+        let types: [i64; 8] = [TY_I8, TY_I16, TY_I32, TY_I64, TY_U8, TY_U16, TY_U32, TY_U64];
+        let out = buf_new();
+        let mut failures = 0;
+        let mut checked = 0;
+        for r in 0..RULE_COUNT {
+            let lhs = R_LHS.data[r];
+            let is_cmp = P_OP.data[lhs] == Cmp as i64;
+            for t in 0..8 {
+                let ty = types[t];
+                let value_ty = if is_cmp { TY_BOOL } else { ty };
+                let mut failed = false;
+                for _ in 0..trials {
                     for i in 0..R_VARS.data[r] {
-                        buf_byte(out, ' ');
-                        buf_int(out, EVAL_VARS[i]);
+                        EVAL_VARS[i] = random_value(ty);
                     }
-                    buf_str(out, c": ");
-                    buf_int(out, left);
-                    buf_str(out, c" vs ");
-                    buf_int(out, right);
-                    buf_str(out, c")\n");
+                    let guard = R_GUARD.data[r];
+                    if guard >= 0 && !is_pow2(EVAL_VARS[guard]) {
+                        EVAL_VARS[guard] = wrap_int(1 << ((rand64() & 7) as u64), ty);
+                        if !is_pow2(EVAL_VARS[guard]) {
+                            continue;
+                        }
+                    }
+                    checked += 1;
+                    let left = eval_pattern(lhs, value_ty, ty);
+                    let right = eval_pattern(R_RHS.data[r], value_ty, ty);
+                    if left != right && !failed {
+                        failed = true;
+                        failures += 1;
+                        buf_str(out, c"rule failed: ");
+                        buf_str(out, rule_text(r));
+                        buf_str(out, c" (type ");
+                        buf_int(out, t);
+                        buf_str(out, c", variables");
+                        for i in 0..R_VARS.data[r] {
+                            buf_byte(out, ' ');
+                            buf_int(out, EVAL_VARS[i]);
+                        }
+                        buf_str(out, c": ");
+                        buf_int(out, left);
+                        buf_str(out, c" vs ");
+                        buf_int(out, right);
+                        buf_str(out, c")\n");
+                    }
                 }
             }
         }
+        buf_str(out, c"rewrite rules: ");
+        buf_int(out, RULE_COUNT);
+        buf_str(out, c" rules, ");
+        buf_int(out, checked);
+        buf_str(out, c" checks, ");
+        buf_int(out, failures);
+        buf_str(out, c" failed\n");
+        buf_write_fd(out, STDOUT);
+        failures
     }
-    buf_str(out, c"rewrite rules: ");
-    buf_int(out, RULE_COUNT);
-    buf_str(out, c" rules, ");
-    buf_int(out, checked);
-    buf_str(out, c" checks, ");
-    buf_int(out, failures);
-    buf_str(out, c" failed\n");
-    buf_write_fd(out, STDOUT);
-    failures
 }

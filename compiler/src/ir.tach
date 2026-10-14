@@ -38,6 +38,16 @@
 //           argument as the callee sees it (negated for the `...` of a
 //           variadic function: an aggregate passed in pieces there has its
 //           negated type on the first, VARIADIC_PIECE on the others).
+//   Vectors (0.10; ty or imm2 a vector type, a value of 16 bytes in a
+//   float register; LOAD and STORE move them too):
+//   VBIN    a <imm> b lanewise, imm = ADD SUB MUL DIV (floats) AND OR XOR
+//   VCMP    a <cond> b lanewise, operands of vector type imm2; ty is the
+//           mask type (each lane -1 or 0)
+//   VSPLAT  every lane = a;  VNEG  -a lanewise
+//   VEXT    lane imm of a (ty: the lane type, canonical)
+//   VINS    a with lane imm = b
+//   VSUM    the sum of a's lanes (floats: pairwise)
+//   VSEL    (b & a) | (c & ~a) on the bits: a is a mask, b and c of type ty
 //
 // Block terminators: JUMP s0; BRANCH cond ? s0 : s1; RET cond (0: no
 // value; for an aggregate returned in registers, its address); UNREACH;
@@ -55,14 +65,14 @@ use crate::base::{
 use crate::lexer::Tok;
 use crate::types::{
     FNS, FN_COUNT, TY_BOOL, TY_U64, buf_type, is_fieldless_enum, is_float, is_integer, is_void,
-    scalar_type,
+    scalar_type, is_vector,
 };
 use crate::lower::SSA_STACK;
 use crate::opt::{compute_dominators, dominates};
 use Op::{
     Add, And, BNot, Call, CallC, CallI, Cmp, Const, Conv, Copy, Div, FAddr, FMath, GAddr, Lea, Load,
     LoadX, MAdd, MSub, Mul, Neg, Not, Or, Pack, Param, Phi, Piece, Rem, SAddr, Select, ShOp, Shl,
-    Shr, Store, StoreX, Sub, Test, Ubfx, Xor,
+    Shr, Store, StoreX, Sub, Test, Ubfx, Xor, VBin, VCmp, VSplat, VExt, VIns, VSum, VNeg, VSel,
 };
 
 pub enum Op {
@@ -80,6 +90,8 @@ pub enum Op {
     // just before register allocation; nothing else sees them.
     LoadX = 33, StoreX = 34, Lea = 35, MAdd = 36, MSub = 37, ShOp = 38, Ubfx = 39,
     Test = 40, Select = 41, FMath = 42,
+    // Vectors (0.10), not machine operations.
+    VBin = 43, VCmp = 44, VSplat = 45, VExt = 46, VIns = 47, VSum = 48, VNeg = 49, VSel = 50,
 }
 
 // The comparison of a CMP instruction (and of the -O0 code generator's
@@ -120,6 +132,12 @@ pub struct Block {
     func: i64, removed: i64,
     // Scratch fields for the passes and the back end.
     order: i64, idom: i64, mark: i64, aux: i64, loop_depth: i64,
+    // The header of a loop the vectorizer made a scalar remainder of (or
+    // one copied from such): not vectorized again (0.10).
+    novec: i64,
+    // How often the block ran in the profile (--profile-use, 0.10; see
+    // profile.tach), or -1.
+    count: i64,
     // SWITCH terminators.
     cases: i64, ncases: i64, succs: i64, nsucc: i64,
 }
@@ -162,27 +180,29 @@ pub static mut IRF: i64 = 0;
 pub static mut CUR: i64 = 0;
 
 pub fn init_ir() {
-    // Instruction 0 and block 0 stand for "none".
-    INSTS = grow(INSTS, INST_COUNT, &INST_CAP);
-    INSTS[0] = Inst { op: Op::None, cond: Cond::Eq, ty: 0, a: 0, b: 0, c: 0, imm: 0, imm2: 0, args: 0, nargs: 0,
-                      block: 0, prev: 0, next: 0, repl: 0, mark: 0, aux: 0, scale: 0 };
-    INST_COUNT = 1;
-    BLOCKS = grow(BLOCKS, BLOCK_COUNT, &BLOCK_CAP);
-    BLOCKS[0] = empty_block(0);
-    BLOCK_COUNT = 1;
-    SLOTS = grow(SLOTS, SLOT_COUNT, &SLOT_CAP);
-    SLOTS[0] = Slot { size: 0, align: 1, offset: 0, escapes: 0, ty: 0 };
-    SLOT_COUNT = 1;
-    ARGS.push(0);
-    ARGTY.push(0);
-    FN_IR = alloc_array::<i64>(FN_COUNT + 1);
+    unsafe {
+        // Instruction 0 and block 0 stand for "none".
+        INSTS = grow(INSTS, INST_COUNT, &INST_CAP);
+        INSTS[0] = Inst { op: Op::None, cond: Cond::Eq, ty: 0, a: 0, b: 0, c: 0, imm: 0, imm2: 0, args: 0, nargs: 0,
+                          block: 0, prev: 0, next: 0, repl: 0, mark: 0, aux: 0, scale: 0 };
+        INST_COUNT = 1;
+        BLOCKS = grow(BLOCKS, BLOCK_COUNT, &BLOCK_CAP);
+        BLOCKS[0] = empty_block(0);
+        BLOCK_COUNT = 1;
+        SLOTS = grow(SLOTS, SLOT_COUNT, &SLOT_CAP);
+        SLOTS[0] = Slot { size: 0, align: 1, offset: 0, escapes: 0, ty: 0 };
+        SLOT_COUNT = 1;
+        ARGS.push(0);
+        ARGTY.push(0);
+        FN_IR = alloc_array::<i64>(FN_COUNT + 1);
+    }
 }
 
 fn empty_block(func: i64) -> Block {
     Block {
         first: 0, last: 0, preds: IntVec { data: 0 as *i64, count: 0, cap: 0 },
         term: Term::None, cond: 0, s0: 0, s1: 0, sealed: 0, incomplete: 0, func: func, removed: 0,
-        order: 0, idom: 0, mark: 0, aux: 0, loop_depth: 0,
+        order: 0, idom: 0, mark: 0, aux: 0, loop_depth: 0, novec: 0, count: -1,
         cases: 0, ncases: 0, succs: 0, nsucc: 0,
     }
 }
@@ -192,7 +212,7 @@ pub fn ir_type(t: i64) -> i64 {
     if is_void(t) {
         return 0;
     }
-    if is_integer(t) || is_float(t) || t == TY_BOOL {
+    if is_integer(t) || is_float(t) || t == TY_BOOL || is_vector(t) {
         return t;
     }
     if is_fieldless_enum(t) {
@@ -204,140 +224,160 @@ pub fn ir_type(t: i64) -> i64 {
 // ---- Functions, blocks and slots ----
 
 pub fn ir_new_func(f: i64, item: i64) -> i64 {
-    IRFUNCS = grow(IRFUNCS, IRFUNC_COUNT, &IRFUNC_CAP);
-    let id = IRFUNC_COUNT;
-    IRFUNCS[id] = IRFunc {
-        f: f, item: item, entry: 0,
-        blocks: IntVec { data: 0 as *i64, count: 0, cap: 0 },
-        slots: IntVec { data: 0 as *i64, count: 0, cap: 0 },
-        result_ptr: 0,
-    };
-    IRFUNC_COUNT += 1;
-    FN_IR[f] = id + 1;
-    id
+    unsafe {
+        IRFUNCS = grow(IRFUNCS, IRFUNC_COUNT, &IRFUNC_CAP);
+        let id = IRFUNC_COUNT;
+        IRFUNCS[id] = IRFunc {
+            f: f, item: item, entry: 0,
+            blocks: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+            slots: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+            result_ptr: 0,
+        };
+        IRFUNC_COUNT += 1;
+        FN_IR[f] = id + 1;
+        id
+    }
 }
 
 pub fn ir_new_block() -> i64 {
-    BLOCKS = grow(BLOCKS, BLOCK_COUNT, &BLOCK_CAP);
-    let b = BLOCK_COUNT;
-    BLOCKS[b] = empty_block(IRF);
-    BLOCK_COUNT += 1;
-    IRFUNCS[IRF].blocks.push(b);
-    b
+    unsafe {
+        BLOCKS = grow(BLOCKS, BLOCK_COUNT, &BLOCK_CAP);
+        let b = BLOCK_COUNT;
+        BLOCKS[b] = empty_block(IRF);
+        BLOCK_COUNT += 1;
+        IRFUNCS[IRF].blocks.push(b);
+        b
+    }
 }
 
 pub fn ir_new_slot(size: i64, align: i64) -> i64 {
-    SLOTS = grow(SLOTS, SLOT_COUNT, &SLOT_CAP);
-    let s = SLOT_COUNT;
-    let mut a = align;
-    if a < 1 {
-        a = 1;
+    unsafe {
+        SLOTS = grow(SLOTS, SLOT_COUNT, &SLOT_CAP);
+        let s = SLOT_COUNT;
+        let mut a = align;
+        if a < 1 {
+            a = 1;
+        }
+        SLOTS[s] = Slot { size: size, align: a, offset: 0, escapes: 0, ty: 0 };
+        SLOT_COUNT += 1;
+        IRFUNCS[IRF].slots.push(s);
+        s
     }
-    SLOTS[s] = Slot { size: size, align: a, offset: 0, escapes: 0, ty: 0 };
-    SLOT_COUNT += 1;
-    IRFUNCS[IRF].slots.push(s);
-    s
 }
 
 // ---- Instructions ----
 
 // A new instruction, not yet in a block.
 pub fn ir_make(op: Op, ty: i64, a: i64, b: i64, imm: i64) -> i64 {
-    INSTS = grow(INSTS, INST_COUNT, &INST_CAP);
-    let v = INST_COUNT;
-    INSTS[v] = Inst { op: op, cond: Cond::Eq, ty: ty, a: a, b: b, c: 0, imm: imm, imm2: 0, args: 0, nargs: 0,
-                      block: 0, prev: 0, next: 0, repl: 0, mark: 0, aux: 0, scale: 0 };
-    INST_COUNT += 1;
-    v
+    unsafe {
+        INSTS = grow(INSTS, INST_COUNT, &INST_CAP);
+        let v = INST_COUNT;
+        INSTS[v] = Inst { op: op, cond: Cond::Eq, ty: ty, a: a, b: b, c: 0, imm: imm, imm2: 0, args: 0, nargs: 0,
+                          block: 0, prev: 0, next: 0, repl: 0, mark: 0, aux: 0, scale: 0 };
+        INST_COUNT += 1;
+        v
+    }
 }
 
 // Appends instruction `v` to block `b`.
 pub fn ir_append(b: i64, v: i64) {
-    let last = BLOCKS[b].last;
-    INSTS[v].block = b;
-    INSTS[v].prev = last;
-    INSTS[v].next = 0;
-    if last == 0 {
-        BLOCKS[b].first = v;
-    } else {
-        INSTS[last].next = v;
+    unsafe {
+        let last = BLOCKS[b].last;
+        INSTS[v].block = b;
+        INSTS[v].prev = last;
+        INSTS[v].next = 0;
+        if last == 0 {
+            BLOCKS[b].first = v;
+        } else {
+            INSTS[last].next = v;
+        }
+        BLOCKS[b].last = v;
     }
-    BLOCKS[b].last = v;
 }
 
 // Inserts instruction `v` at the start of block `b`.
 pub fn ir_prepend(b: i64, v: i64) {
-    let first = BLOCKS[b].first;
-    INSTS[v].block = b;
-    INSTS[v].prev = 0;
-    INSTS[v].next = first;
-    if first == 0 {
-        BLOCKS[b].last = v;
-    } else {
-        INSTS[first].prev = v;
+    unsafe {
+        let first = BLOCKS[b].first;
+        INSTS[v].block = b;
+        INSTS[v].prev = 0;
+        INSTS[v].next = first;
+        if first == 0 {
+            BLOCKS[b].last = v;
+        } else {
+            INSTS[first].prev = v;
+        }
+        BLOCKS[b].first = v;
     }
-    BLOCKS[b].first = v;
 }
 
 // Inserts instruction `v` before instruction `at` (in the same block).
 pub fn ir_insert_before(at: i64, v: i64) {
-    let b = INSTS[at].block;
-    let prev = INSTS[at].prev;
-    INSTS[v].block = b;
-    INSTS[v].prev = prev;
-    INSTS[v].next = at;
-    INSTS[at].prev = v;
-    if prev == 0 {
-        BLOCKS[b].first = v;
-    } else {
-        INSTS[prev].next = v;
+    unsafe {
+        let b = INSTS[at].block;
+        let prev = INSTS[at].prev;
+        INSTS[v].block = b;
+        INSTS[v].prev = prev;
+        INSTS[v].next = at;
+        INSTS[at].prev = v;
+        if prev == 0 {
+            BLOCKS[b].first = v;
+        } else {
+            INSTS[prev].next = v;
+        }
     }
 }
 
 // Removes instruction `v` from its block (it stays in INSTS).
 pub fn ir_unlink(v: i64) {
-    let b = INSTS[v].block;
-    let prev = INSTS[v].prev;
-    let next = INSTS[v].next;
-    if prev == 0 {
-        BLOCKS[b].first = next;
-    } else {
-        INSTS[prev].next = next;
+    unsafe {
+        let b = INSTS[v].block;
+        let prev = INSTS[v].prev;
+        let next = INSTS[v].next;
+        if prev == 0 {
+            BLOCKS[b].first = next;
+        } else {
+            INSTS[prev].next = next;
+        }
+        if next == 0 {
+            BLOCKS[b].last = prev;
+        } else {
+            INSTS[next].prev = prev;
+        }
+        INSTS[v].block = 0;
+        INSTS[v].prev = 0;
+        INSTS[v].next = 0;
     }
-    if next == 0 {
-        BLOCKS[b].last = prev;
-    } else {
-        INSTS[next].prev = prev;
-    }
-    INSTS[v].block = 0;
-    INSTS[v].prev = 0;
-    INSTS[v].next = 0;
 }
 
 // The value `v` stands for now (following replacements).
 pub fn ir_val(v: i64) -> i64 {
-    let mut r = v;
-    while r != 0 && INSTS[r].repl != 0 {
-        r = INSTS[r].repl;
+    unsafe {
+        let mut r = v;
+        while r != 0 && INSTS[r].repl != 0 {
+            r = INSTS[r].repl;
+        }
+        // Path compression.
+        let mut w = v;
+        while w != 0 && INSTS[w].repl != 0 && INSTS[w].repl != r {
+            let next = INSTS[w].repl;
+            INSTS[w].repl = r;
+            w = next;
+        }
+        r
     }
-    // Path compression.
-    let mut w = v;
-    while w != 0 && INSTS[w].repl != 0 && INSTS[w].repl != r {
-        let next = INSTS[w].repl;
-        INSTS[w].repl = r;
-        w = next;
-    }
-    r
 }
 
 // Replaces every use of `v` by `by` (and removes `v` from its block).
 pub fn ir_replace(v: i64, by: i64) {
-    if v == by {
-        return;
-    }
-    INSTS[v].repl = by;
-    if INSTS[v].block != 0 {
-        ir_unlink(v);
+    unsafe {
+        if v == by {
+            return;
+        }
+        INSTS[v].repl = by;
+        if INSTS[v].block != 0 {
+            ir_unlink(v);
+        }
     }
 }
 
@@ -358,8 +398,10 @@ pub fn ir_binary(op: Op, ty: i64, a: i64, b: i64) -> i64 {
 
 pub fn ir_cmp(cond: Cond, operand_ty: i64, a: i64, b: i64) -> i64 {
     let v = emit_ir(Cmp, TY_BOOL, a, b, 0);
-    INSTS[v].cond = cond;
-    INSTS[v].imm2 = operand_ty;
+    unsafe {
+        INSTS[v].cond = cond;
+        INSTS[v].imm2 = operand_ty;
+    }
     v
 }
 
@@ -369,7 +411,7 @@ pub fn ir_load(ty: i64, addr: i64, offset: i64) -> i64 {
 
 pub fn ir_store(ty: i64, addr: i64, value: i64, offset: i64) {
     let v = emit_ir(Store, 0, addr, value, offset);
-    INSTS[v].imm2 = ty;
+    unsafe { INSTS[v].imm2 = ty; }
 }
 
 pub fn ir_slot_addr(slot: i64) -> i64 {
@@ -414,7 +456,13 @@ impl Op {
 
     // The machine operations of instruction selection.
     fn is_machine(self: Op) -> bool {
-        self as i64 >= LoadX as i64
+        self as i64 >= LoadX as i64 && self as i64 <= FMath as i64
+    }
+
+    // The vector operations (0.10): pure, computed from their operands
+    // alone, never trapping.
+    fn is_vector(self: Op) -> bool {
+        self as i64 >= VBin as i64 && self as i64 <= VSel as i64
     }
 
     // The binary arithmetic and bitwise operations.
@@ -429,36 +477,42 @@ impl Op {
 
 // Operand list `args` of a phi or call.
 pub fn ir_arg(v: i64, i: i64) -> i64 {
-    ARGS.data[INSTS[v].args + i]
+    unsafe { ARGS.data[INSTS[v].args + i] }
 }
 
 pub fn ir_set_arg(v: i64, i: i64, value: i64) {
-    ARGS.data[INSTS[v].args + i] = value;
+    unsafe { ARGS.data[INSTS[v].args + i] = value; }
 }
 
 // The operands of `v` are ir_operand(v, i) for i below ir_operand_count(v)
 // (some may be 0): a, b, c, then the ARGS of phis and calls.
 pub fn ir_operand_count(v: i64) -> i64 {
-    let op = INSTS[v].op;
-    if op == Phi || op.is_call() || op == Pack || op == Select {
-        return INSTS[v].nargs + 3;
+    unsafe {
+        let op = INSTS[v].op;
+        if op == Phi || op.is_call() || op == Pack || op == Select {
+            return INSTS[v].nargs + 3;
+        }
+        3
     }
-    3
 }
 
 // Operand `i` of `v` (0 when there is none): a, b, c, then the ARGS.
 pub fn ir_operand(v: i64, i: i64) -> i64 {
-    if i == 0 { return INSTS[v].a; }
-    if i == 1 { return INSTS[v].b; }
-    if i == 2 { return INSTS[v].c; }
-    ir_arg(v, i - 3)
+    unsafe {
+        if i == 0 { return INSTS[v].a; }
+        if i == 1 { return INSTS[v].b; }
+        if i == 2 { return INSTS[v].c; }
+        ir_arg(v, i - 3)
+    }
 }
 
 pub fn ir_set_operand(v: i64, i: i64, value: i64) {
-    if i == 0 { INSTS[v].a = value; }
-    else if i == 1 { INSTS[v].b = value; }
-    else if i == 2 { INSTS[v].c = value; }
-    else { ir_set_arg(v, i - 3, value); }
+    unsafe {
+        if i == 0 { INSTS[v].a = value; }
+        else if i == 1 { INSTS[v].b = value; }
+        else if i == 2 { INSTS[v].c = value; }
+        else { ir_set_arg(v, i - 3, value); }
+    }
 }
 
 // Resolves every operand of `v` (and of the block's terminator).
@@ -474,15 +528,17 @@ pub fn ir_resolve_operands(v: i64) {
 // ---- Terminators ----
 
 fn ir_add_pred(b: i64, pred: i64) {
-    BLOCKS[b].preds.push(pred);
+    unsafe { BLOCKS[b].preds.push(pred); }
 }
 
 // Ends block `b`.
 pub fn ir_terminate(b: i64, term: Term, cond: i64, s0: i64, s1: i64) {
-    BLOCKS[b].term = term;
-    BLOCKS[b].cond = cond;
-    BLOCKS[b].s0 = s0;
-    BLOCKS[b].s1 = s1;
+    unsafe {
+        BLOCKS[b].term = term;
+        BLOCKS[b].cond = cond;
+        BLOCKS[b].s0 = s0;
+        BLOCKS[b].s1 = s1;
+    }
     if s0 != 0 {
         ir_add_pred(s0, b);
     }
@@ -492,18 +548,22 @@ pub fn ir_terminate(b: i64, term: Term, cond: i64, s0: i64, s1: i64) {
 }
 
 pub fn succ_count(b: i64) -> i64 {
-    let term = BLOCKS[b].term;
-    if term == Term::Jump { return 1; }
-    if term == Term::Branch { return 2; }
-    if term == Term::Switch { return BLOCKS[b].nsucc; }
-    0
+    unsafe {
+        let term = BLOCKS[b].term;
+        if term == Term::Jump { return 1; }
+        if term == Term::Branch { return 2; }
+        if term == Term::Switch { return BLOCKS[b].nsucc; }
+        0
+    }
 }
 
 pub fn succ(b: i64, i: i64) -> i64 {
-    if BLOCKS[b].term == Term::Switch {
-        return SWCASES.data[BLOCKS[b].succs + i];
+    unsafe {
+        if BLOCKS[b].term == Term::Switch {
+            return SWCASES.data[BLOCKS[b].succs + i];
+        }
+        if i == 0 { BLOCKS[b].s0 } else { BLOCKS[b].s1 }
     }
-    if i == 0 { BLOCKS[b].s0 } else { BLOCKS[b].s1 }
 }
 
 // Whether s is a successor of b.
@@ -517,118 +577,132 @@ pub fn is_succ(b: i64, s: i64) -> bool {
 }
 
 pub fn case_value(b: i64, i: i64) -> i64 {
-    SWCASES.data[BLOCKS[b].cases + 2 * i]
+    unsafe { SWCASES.data[BLOCKS[b].cases + 2 * i] }
 }
 
 pub fn case_target(b: i64, i: i64) -> i64 {
-    SWCASES.data[BLOCKS[b].cases + 2 * i + 1]
+    unsafe { SWCASES.data[BLOCKS[b].cases + 2 * i + 1] }
 }
 
 // Ends block b with a switch on `value`: `count` cases as (value, block)
 // pairs at SSA_STACK[mark..], popped, and the default block.
 pub fn ir_switch(b: i64, value: i64, default: i64, mark: i64) {
     ir_switch_no_preds(b, value, default, mark);
-    for i in 0..BLOCKS[b].nsucc {
-        ir_add_pred(succ(b, i), b);
+    unsafe {
+        for i in 0..BLOCKS[b].nsucc {
+            ir_add_pred(succ(b, i), b);
+        }
     }
 }
 
 // The same, without adding b to the predecessors of its successors.
 pub fn ir_switch_no_preds(b: i64, value: i64, default: i64, mark: i64) {
-    let count = (SSA_STACK.count - mark) / 2;
-    BLOCKS[b].term = Term::Switch;
-    BLOCKS[b].cond = value;
-    BLOCKS[b].s0 = default;
-    BLOCKS[b].s1 = 0;
-    BLOCKS[b].cases = SWCASES.count;
-    BLOCKS[b].ncases = count;
-    for i in 0..2 * count {
-        SWCASES.push(SSA_STACK.data[mark + i]);
+    unsafe {
+        let count = (SSA_STACK.count - mark) / 2;
+        BLOCKS[b].term = Term::Switch;
+        BLOCKS[b].cond = value;
+        BLOCKS[b].s0 = default;
+        BLOCKS[b].s1 = 0;
+        BLOCKS[b].cases = SWCASES.count;
+        BLOCKS[b].ncases = count;
+        for i in 0..2 * count {
+            SWCASES.push(SSA_STACK.data[mark + i]);
+        }
+        SSA_STACK.count = mark;
+        switch_rebuild_succs(b);
     }
-    SSA_STACK.count = mark;
-    switch_rebuild_succs(b);
 }
 
 // Rebuilds the list of distinct successors of switch b (the default
 // first, then in case order).
 pub fn switch_rebuild_succs(b: i64) {
-    let start = SWCASES.count;
-    SWCASES.push(BLOCKS[b].s0);
-    for i in 0..BLOCKS[b].ncases {
-        let t = case_target(b, i);
-        let mut seen = false;
-        for k in start..SWCASES.count {
-            if SWCASES.data[k] == t {
-                seen = true;
+    unsafe {
+        let start = SWCASES.count;
+        SWCASES.push(BLOCKS[b].s0);
+        for i in 0..BLOCKS[b].ncases {
+            let t = case_target(b, i);
+            let mut seen = false;
+            for k in start..SWCASES.count {
+                if SWCASES.data[k] == t {
+                    seen = true;
+                }
+            }
+            if !seen {
+                SWCASES.push(t);
             }
         }
-        if !seen {
-            SWCASES.push(t);
-        }
+        BLOCKS[b].succs = start;
+        BLOCKS[b].nsucc = SWCASES.count - start;
     }
-    BLOCKS[b].succs = start;
-    BLOCKS[b].nsucc = SWCASES.count - start;
 }
 
 // The block switch b goes to for the constant `value`.
 pub fn switch_target(b: i64, value: i64) -> i64 {
-    for i in 0..BLOCKS[b].ncases {
-        if case_value(b, i) == value {
-            return case_target(b, i);
+    unsafe {
+        for i in 0..BLOCKS[b].ncases {
+            if case_value(b, i) == value {
+                return case_target(b, i);
+            }
         }
+        BLOCKS[b].s0
     }
-    BLOCKS[b].s0
 }
 
 // Makes the edge from b to `from` go to `to` (the predecessor lists are
 // the caller's business). A switch whose cases already reach `to` is not
 // changed (that would make two edges into `to`): returns false.
 pub fn redirect_succ(b: i64, from: i64, to: i64) -> bool {
-    let term = BLOCKS[b].term;
-    if term == Term::Switch {
-        if is_succ(b, to) {
-            return false;
+    unsafe {
+        let term = BLOCKS[b].term;
+        if term == Term::Switch {
+            if is_succ(b, to) {
+                return false;
+            }
+            let start = SWCASES.count;
+            for i in 0..BLOCKS[b].ncases {
+                SWCASES.push(case_value(b, i));
+                let t = case_target(b, i);
+                SWCASES.push(if t == from { to } else { t });
+            }
+            BLOCKS[b].cases = start;
+            if BLOCKS[b].s0 == from {
+                BLOCKS[b].s0 = to;
+            }
+            switch_rebuild_succs(b);
+            return true;
         }
-        let start = SWCASES.count;
-        for i in 0..BLOCKS[b].ncases {
-            SWCASES.push(case_value(b, i));
-            let t = case_target(b, i);
-            SWCASES.push(if t == from { to } else { t });
-        }
-        BLOCKS[b].cases = start;
         if BLOCKS[b].s0 == from {
             BLOCKS[b].s0 = to;
         }
-        switch_rebuild_succs(b);
-        return true;
+        if term == Term::Branch && BLOCKS[b].s1 == from {
+            BLOCKS[b].s1 = to;
+        }
+        true
     }
-    if BLOCKS[b].s0 == from {
-        BLOCKS[b].s0 = to;
-    }
-    if term == Term::Branch && BLOCKS[b].s1 == from {
-        BLOCKS[b].s1 = to;
-    }
-    true
 }
 
 // Copies the terminator of block `from` to block `to` (successors as they
 // are; the predecessor lists are the caller's business).
 pub fn copy_terminator(to: i64, from: i64) {
-    BLOCKS[to].term = BLOCKS[from].term;
-    BLOCKS[to].cond = BLOCKS[from].cond;
-    BLOCKS[to].s0 = BLOCKS[from].s0;
-    BLOCKS[to].s1 = BLOCKS[from].s1;
-    BLOCKS[to].cases = BLOCKS[from].cases;
-    BLOCKS[to].ncases = BLOCKS[from].ncases;
-    BLOCKS[to].succs = BLOCKS[from].succs;
-    BLOCKS[to].nsucc = BLOCKS[from].nsucc;
+    unsafe {
+        BLOCKS[to].term = BLOCKS[from].term;
+        BLOCKS[to].cond = BLOCKS[from].cond;
+        BLOCKS[to].s0 = BLOCKS[from].s0;
+        BLOCKS[to].s1 = BLOCKS[from].s1;
+        BLOCKS[to].cases = BLOCKS[from].cases;
+        BLOCKS[to].ncases = BLOCKS[from].ncases;
+        BLOCKS[to].succs = BLOCKS[from].succs;
+        BLOCKS[to].nsucc = BLOCKS[from].nsucc;
+    }
 }
 
 // The index of `pred` among the predecessors of `b`, or -1.
 pub fn pred_index(b: i64, pred: i64) -> i64 {
-    for i in 0..BLOCKS[b].preds.count {
-        if BLOCKS[b].preds.data[i] == pred {
-            return i;
+    unsafe {
+        for i in 0..BLOCKS[b].preds.count {
+            if BLOCKS[b].preds.data[i] == pred {
+                return i;
+            }
         }
     }
     -1
@@ -680,6 +754,14 @@ impl Op {
             Test => c"test",
             Select => c"select",
             FMath => c"fmath",
+            VBin => c"vbin",
+            VCmp => c"vcmp",
+            VSplat => c"vsplat",
+            VExt => c"vext",
+            VIns => c"vins",
+            VSum => c"vsum",
+            VNeg => c"vneg",
+            VSel => c"vsel",
         }
     }
 }
@@ -734,7 +816,7 @@ pub fn cond_of_token(op: Tok) -> Cond {
 
 fn buf_value(out: i64, v: i64) {
     if v == 0 {
-        buf_str(out, c"_");
+        unsafe { buf_str(out, c"_"); }
         return;
     }
     buf_byte(out, 'v');
@@ -743,80 +825,91 @@ fn buf_value(out: i64, v: i64) {
 
 fn buf_ir_type(out: i64, t: i64) {
     if t == 0 {
-        buf_str(out, c"void");
+        unsafe { buf_str(out, c"void"); }
     } else {
         buf_type(out, t);
     }
 }
 
 fn print_inst(out: i64, v: i64) {
-    let op = INSTS[v].op;
-    buf_str(out, c"    ");
-    if INSTS[v].ty != 0 {
-        buf_value(out, v);
-        buf_str(out, c": ");
-        buf_ir_type(out, INSTS[v].ty);
-        buf_str(out, c" = ");
-    }
-    buf_str(out, op.name());
-    if op == Cmp || op == Test || op == Select {
-        buf_byte(out, '.');
-        buf_str(out, INSTS[v].cond.name());
-    }
-    if op == Const {
-        buf_byte(out, ' ');
-        if is_float(INSTS[v].ty) {
-            buf_str(out, c"0x");
-            buf_hex(out, INSTS[v].imm as u64, 16);
-        } else {
-            buf_int(out, INSTS[v].imm);
+    unsafe {
+        let op = INSTS[v].op;
+        buf_str(out, c"    ");
+        if INSTS[v].ty != 0 {
+            buf_value(out, v);
+            buf_str(out, c": ");
+            buf_ir_type(out, INSTS[v].ty);
+            buf_str(out, c" = ");
         }
-    } else if op == GAddr || op == CallC {
-        buf_byte(out, ' ');
-        buf_str(out, sym_name(INSTS[v].imm));
-    } else if op == Call || op == FAddr {
-        buf_byte(out, ' ');
-        buf_str(out, sym_name(FNS[INSTS[v].imm].name));
-    } else if op == Param || op == Op::Slot || op == SAddr || op == Piece {
-        buf_byte(out, ' ');
-        buf_int(out, INSTS[v].imm);
-    }
-    let mut first = true;
-    for i in 0..ir_operand_count(v) {
-        let operand = ir_operand(v, i);
-        if operand == 0 && i < 3 {
-            continue;
+        buf_str(out, op.name());
+        if op == Cmp || op == Test || op == Select || op == VCmp {
+            buf_byte(out, '.');
+            buf_str(out, INSTS[v].cond.name());
         }
-        buf_str(out, if first { c" " } else { c", " });
-        first = false;
-        buf_value(out, ir_val(operand));
-    }
-    if op == Load || op == Store {
-        if INSTS[v].imm != 0 {
-            buf_str(out, c" +");
-            buf_int(out, INSTS[v].imm);
+        if op == VBin {
+            buf_byte(out, '.');
+            let raw = INSTS[v].imm;
+            let bop = raw as Op;
+            buf_str(out, bop.name());
         }
-        if op == Store {
+        if op == Const {
             buf_byte(out, ' ');
-            buf_ir_type(out, INSTS[v].imm2);
+            if is_float(INSTS[v].ty) {
+                buf_str(out, c"0x");
+                buf_hex(out, INSTS[v].imm as u64, 16);
+            } else {
+                buf_int(out, INSTS[v].imm);
+            }
+        } else if op == GAddr || op == CallC {
+            buf_byte(out, ' ');
+            buf_str(out, sym_name(INSTS[v].imm));
+        } else if op == Call || op == FAddr {
+            buf_byte(out, ' ');
+            buf_str(out, sym_name(FNS[INSTS[v].imm].name));
+        } else if op == Param || op == Op::Slot || op == SAddr || op == Piece {
+            buf_byte(out, ' ');
+            buf_int(out, INSTS[v].imm);
         }
-    } else if op == Copy {
-        buf_str(out, c" size ");
-        buf_int(out, INSTS[v].imm);
-    } else if op == Conv || op == Cmp {
-        buf_str(out, c" from ");
-        buf_ir_type(out, INSTS[v].imm2);
-    } else if op.is_machine() {
-        // imm, imm2 and scale as they are (see isel.tach).
-        buf_str(out, c" [");
-        buf_int(out, INSTS[v].imm);
-        buf_str(out, c", ");
-        buf_int(out, INSTS[v].imm2);
-        buf_str(out, c", ");
-        buf_int(out, INSTS[v].scale);
-        buf_byte(out, ']');
+        let mut first = true;
+        for i in 0..ir_operand_count(v) {
+            let operand = ir_operand(v, i);
+            if operand == 0 && i < 3 {
+                continue;
+            }
+            buf_str(out, if first { c" " } else { c", " });
+            first = false;
+            buf_value(out, ir_val(operand));
+        }
+        if op == Load || op == Store {
+            if INSTS[v].imm != 0 {
+                buf_str(out, c" +");
+                buf_int(out, INSTS[v].imm);
+            }
+            if op == Store {
+                buf_byte(out, ' ');
+                buf_ir_type(out, INSTS[v].imm2);
+            }
+        } else if op == Copy {
+            buf_str(out, c" size ");
+            buf_int(out, INSTS[v].imm);
+        } else if op == Conv || op == Cmp || op == VCmp {
+            buf_str(out, c" from ");
+            buf_ir_type(out, INSTS[v].imm2);
+        } else if op == VExt || op == VIns {
+            buf_str(out, c" lane ");
+            buf_int(out, INSTS[v].imm);
+        } else if op.is_machine() {
+            // imm, imm2 and scale as they are (see isel.tach).
+            buf_str(out, c" [");
+            buf_int(out, INSTS[v].imm);
+            buf_str(out, c", ");
+            buf_int(out, INSTS[v].imm2);
+            buf_str(out, c", ");
+            buf_int(out, INSTS[v].scale);
+            buf_byte(out, ']');
+        }
+        buf_byte(out, '\n');
     }
-    buf_byte(out, '\n');
 }
 
 fn buf_block(out: i64, b: i64) {
@@ -825,68 +918,72 @@ fn buf_block(out: i64, b: i64) {
 }
 
 fn print_block(out: i64, b: i64) {
-    buf_block(out, b);
-    if BLOCKS[b].preds.count > 0 {
-        buf_str(out, c" <-");
-        for i in 0..BLOCKS[b].preds.count {
-            buf_byte(out, ' ');
-            buf_block(out, BLOCKS[b].preds.data[i]);
+    unsafe {
+        buf_block(out, b);
+        if BLOCKS[b].preds.count > 0 {
+            buf_str(out, c" <-");
+            for i in 0..BLOCKS[b].preds.count {
+                buf_byte(out, ' ');
+                buf_block(out, BLOCKS[b].preds.data[i]);
+            }
         }
-    }
-    buf_str(out, c":\n");
-    let mut v = BLOCKS[b].first;
-    while v != 0 {
-        print_inst(out, v);
-        v = INSTS[v].next;
-    }
-    let term = BLOCKS[b].term;
-    buf_str(out, c"    ");
-    if term == Term::Jump {
-        buf_str(out, c"jump ");
-        buf_block(out, BLOCKS[b].s0);
-    } else if term == Term::Branch {
-        buf_str(out, c"branch ");
-        buf_value(out, ir_val(BLOCKS[b].cond));
-        buf_str(out, c", ");
-        buf_block(out, BLOCKS[b].s0);
-        buf_str(out, c", ");
-        buf_block(out, BLOCKS[b].s1);
-    } else if term == Term::Ret {
-        buf_str(out, c"ret");
-        if BLOCKS[b].cond != 0 {
-            buf_byte(out, ' ');
+        buf_str(out, c":\n");
+        let mut v = BLOCKS[b].first;
+        while v != 0 {
+            print_inst(out, v);
+            v = INSTS[v].next;
+        }
+        let term = BLOCKS[b].term;
+        buf_str(out, c"    ");
+        if term == Term::Jump {
+            buf_str(out, c"jump ");
+            buf_block(out, BLOCKS[b].s0);
+        } else if term == Term::Branch {
+            buf_str(out, c"branch ");
             buf_value(out, ir_val(BLOCKS[b].cond));
-        }
-    } else if term == Term::Unreach {
-        buf_str(out, c"unreachable");
-    } else if term == Term::Switch {
-        buf_str(out, c"switch ");
-        buf_value(out, ir_val(BLOCKS[b].cond));
-        buf_str(out, c", default ");
-        buf_block(out, BLOCKS[b].s0);
-        for i in 0..BLOCKS[b].ncases {
             buf_str(out, c", ");
-            buf_int(out, case_value(b, i));
-            buf_str(out, c" -> ");
-            buf_block(out, case_target(b, i));
+            buf_block(out, BLOCKS[b].s0);
+            buf_str(out, c", ");
+            buf_block(out, BLOCKS[b].s1);
+        } else if term == Term::Ret {
+            buf_str(out, c"ret");
+            if BLOCKS[b].cond != 0 {
+                buf_byte(out, ' ');
+                buf_value(out, ir_val(BLOCKS[b].cond));
+            }
+        } else if term == Term::Unreach {
+            buf_str(out, c"unreachable");
+        } else if term == Term::Switch {
+            buf_str(out, c"switch ");
+            buf_value(out, ir_val(BLOCKS[b].cond));
+            buf_str(out, c", default ");
+            buf_block(out, BLOCKS[b].s0);
+            for i in 0..BLOCKS[b].ncases {
+                buf_str(out, c", ");
+                buf_int(out, case_value(b, i));
+                buf_str(out, c" -> ");
+                buf_block(out, case_target(b, i));
+            }
+        } else {
+            buf_str(out, c"(no terminator)");
         }
-    } else {
-        buf_str(out, c"(no terminator)");
+        buf_byte(out, '\n');
     }
-    buf_byte(out, '\n');
 }
 
 pub fn print_ir_func(out: i64, fi: i64) {
-    buf_str(out, c"fn ");
-    buf_str(out, sym_name(FNS[IRFUNCS[fi].f].name));
-    buf_str(out, c":\n");
-    for i in 0..IRFUNCS[fi].blocks.count {
-        let b = IRFUNCS[fi].blocks.data[i];
-        if BLOCKS[b].removed == 0 {
-            print_block(out, b);
+    unsafe {
+        buf_str(out, c"fn ");
+        buf_str(out, sym_name(FNS[IRFUNCS[fi].f].name));
+        buf_str(out, c":\n");
+        for i in 0..IRFUNCS[fi].blocks.count {
+            let b = IRFUNCS[fi].blocks.data[i];
+            if BLOCKS[b].removed == 0 {
+                print_block(out, b);
+            }
         }
+        buf_byte(out, '\n');
     }
-    buf_byte(out, '\n');
 }
 
 // ---- Verification (--verify-ir) ----
@@ -897,127 +994,133 @@ static mut VERIFY_PASS: *u8 = 0 as *u8;
 pub static mut PRINT_AFTER_ALL: bool = false;
 
 fn ir_fail(fi: i64, b: i64, v: i64, message: *u8) -> ! {
-    let out = buf_new();
-    buf_str(out, c"internal error: invalid IR after ");
-    buf_str(out, VERIFY_PASS);
-    buf_str(out, c" in fn ");
-    buf_str(out, sym_name(FNS[IRFUNCS[fi].f].name));
-    buf_str(out, c", ");
-    buf_block(out, b);
-    if v != 0 {
+    unsafe {
+        let out = buf_new();
+        buf_str(out, c"internal error: invalid IR after ");
+        buf_str(out, VERIFY_PASS);
+        buf_str(out, c" in fn ");
+        buf_str(out, sym_name(FNS[IRFUNCS[fi].f].name));
         buf_str(out, c", ");
-        buf_value(out, v);
+        buf_block(out, b);
+        if v != 0 {
+            buf_str(out, c", ");
+            buf_value(out, v);
+        }
+        buf_str(out, c": ");
+        buf_str(out, message);
+        buf_byte(out, '\n');
+        print_ir_func(out, fi);
+        buf_write_fd(out, STDERR);
+        exit(101)
     }
-    buf_str(out, c": ");
-    buf_str(out, message);
-    buf_byte(out, '\n');
-    print_ir_func(out, fi);
-    buf_write_fd(out, STDERR);
-    exit(101)
 }
 
 // Checks the structure of function `fi`: terminators, predecessor lists,
 // phis, and that every operand is a live instruction that dominates its
 // use (dominators must be up to date: see compute_dominators).
 pub fn verify_func(fi: i64, pass: *u8) {
-    if PRINT_AFTER_ALL {
-        let out = buf_new();
-        buf_str(out, c"; after ");
-        buf_str(out, pass);
-        buf_byte(out, '\n');
-        print_ir_func(out, fi);
-        buf_write_fd(out, STDERR);
-    }
-    if !VERIFY_IR {
-        return;
-    }
-    VERIFY_PASS = pass;
-    compute_dominators(fi);
-    for i in 0..IRFUNCS[fi].blocks.count {
-        let b = IRFUNCS[fi].blocks.data[i];
-        if BLOCKS[b].removed == 0 {
-            verify_block(fi, b);
+    unsafe {
+        if PRINT_AFTER_ALL {
+            let out = buf_new();
+            buf_str(out, c"; after ");
+            buf_str(out, pass);
+            buf_byte(out, '\n');
+            print_ir_func(out, fi);
+            buf_write_fd(out, STDERR);
+        }
+        if !VERIFY_IR {
+            return;
+        }
+        VERIFY_PASS = pass;
+        compute_dominators(fi);
+        for i in 0..IRFUNCS[fi].blocks.count {
+            let b = IRFUNCS[fi].blocks.data[i];
+            if BLOCKS[b].removed == 0 {
+                verify_block(fi, b);
+            }
         }
     }
 }
 
 fn verify_block(fi: i64, b: i64) {
-    let term = BLOCKS[b].term;
-    if term == Term::None {
-        ir_fail(fi, b, 0, c"no terminator");
-    }
-    for i in 0..succ_count(b) {
-        let s = succ(b, i);
-        if BLOCKS[s].removed != 0 {
-            ir_fail(fi, b, 0, c"successor removed");
+    unsafe {
+        let term = BLOCKS[b].term;
+        if term == Term::None {
+            ir_fail(fi, b, 0, c"no terminator");
         }
-        if pred_index(s, b) < 0 {
-            ir_fail(fi, b, 0, c"not a predecessor of its successor");
-        }
-    }
-    for i in 0..BLOCKS[b].preds.count {
-        let p = BLOCKS[b].preds.data[i];
-        if BLOCKS[p].removed != 0 {
-            ir_fail(fi, b, 0, c"predecessor removed");
-        }
-        if !is_succ(p, b) {
-            ir_fail(fi, b, 0, c"predecessor does not branch here");
-        }
-        for j in 0..i {
-            if BLOCKS[b].preds.data[j] == p && BLOCKS[p].term == Term::Switch {
-                ir_fail(fi, b, 0, c"a switch is a predecessor twice");
+        for i in 0..succ_count(b) {
+            let s = succ(b, i);
+            if BLOCKS[s].removed != 0 {
+                ir_fail(fi, b, 0, c"successor removed");
+            }
+            if pred_index(s, b) < 0 {
+                ir_fail(fi, b, 0, c"not a predecessor of its successor");
             }
         }
-    }
-    let reachable = BLOCKS[b].order >= 0;
-    let mut v = BLOCKS[b].first;
-    let mut past_phis = false;
-    while v != 0 {
-        if INSTS[v].block != b {
-            ir_fail(fi, b, v, c"instruction list broken");
-        }
-        if INSTS[v].repl != 0 {
-            ir_fail(fi, b, v, c"replaced instruction still in a block");
-        }
-        let op = INSTS[v].op;
-        if op == Phi {
-            if past_phis {
-                ir_fail(fi, b, v, c"phi after a non-phi instruction");
+        for i in 0..BLOCKS[b].preds.count {
+            let p = BLOCKS[b].preds.data[i];
+            if BLOCKS[p].removed != 0 {
+                ir_fail(fi, b, 0, c"predecessor removed");
             }
-            if INSTS[v].nargs != BLOCKS[b].preds.count {
-                ir_fail(fi, b, v, c"phi operand count differs from the predecessor count");
+            if !is_succ(p, b) {
+                ir_fail(fi, b, 0, c"predecessor does not branch here");
             }
-            for k in 0..INSTS[v].nargs {
-                verify_operand(fi, b, v, ir_arg(v, k), BLOCKS[b].preds.data[k], reachable);
-            }
-        } else {
-            past_phis = true;
-            for k in 0..ir_operand_count(v) {
-                let operand = ir_operand(v, k);
-                if operand != 0 {
-                    verify_operand(fi, b, v, operand, b, reachable);
+            for j in 0..i {
+                if BLOCKS[b].preds.data[j] == p && BLOCKS[p].term == Term::Switch {
+                    ir_fail(fi, b, 0, c"a switch is a predecessor twice");
                 }
             }
         }
-        v = INSTS[v].next;
-    }
-    if (term == Term::Branch || term == Term::Ret || term == Term::Switch) && BLOCKS[b].cond != 0 {
-        verify_operand(fi, b, 0, BLOCKS[b].cond, b, reachable);
-    }
-    if (term == Term::Branch || term == Term::Switch) && BLOCKS[b].cond == 0 {
-        ir_fail(fi, b, 0, c"branch without a condition");
-    }
-    if term == Term::Switch {
-        if !is_succ(b, BLOCKS[b].s0) {
-            ir_fail(fi, b, 0, c"switch default not among its successors");
-        }
-        for i in 0..BLOCKS[b].ncases {
-            if !is_succ(b, case_target(b, i)) {
-                ir_fail(fi, b, 0, c"switch case not among its successors");
+        let reachable = BLOCKS[b].order >= 0;
+        let mut v = BLOCKS[b].first;
+        let mut past_phis = false;
+        while v != 0 {
+            if INSTS[v].block != b {
+                ir_fail(fi, b, v, c"instruction list broken");
             }
-            for j in 0..i {
-                if case_value(b, j) == case_value(b, i) {
-                    ir_fail(fi, b, 0, c"switch case value repeated");
+            if INSTS[v].repl != 0 {
+                ir_fail(fi, b, v, c"replaced instruction still in a block");
+            }
+            let op = INSTS[v].op;
+            if op == Phi {
+                if past_phis {
+                    ir_fail(fi, b, v, c"phi after a non-phi instruction");
+                }
+                if INSTS[v].nargs != BLOCKS[b].preds.count {
+                    ir_fail(fi, b, v, c"phi operand count differs from the predecessor count");
+                }
+                for k in 0..INSTS[v].nargs {
+                    verify_operand(fi, b, v, ir_arg(v, k), BLOCKS[b].preds.data[k], reachable);
+                }
+            } else {
+                past_phis = true;
+                for k in 0..ir_operand_count(v) {
+                    let operand = ir_operand(v, k);
+                    if operand != 0 {
+                        verify_operand(fi, b, v, operand, b, reachable);
+                    }
+                }
+            }
+            v = INSTS[v].next;
+        }
+        if (term == Term::Branch || term == Term::Ret || term == Term::Switch) && BLOCKS[b].cond != 0 {
+            verify_operand(fi, b, 0, BLOCKS[b].cond, b, reachable);
+        }
+        if (term == Term::Branch || term == Term::Switch) && BLOCKS[b].cond == 0 {
+            ir_fail(fi, b, 0, c"branch without a condition");
+        }
+        if term == Term::Switch {
+            if !is_succ(b, BLOCKS[b].s0) {
+                ir_fail(fi, b, 0, c"switch default not among its successors");
+            }
+            for i in 0..BLOCKS[b].ncases {
+                if !is_succ(b, case_target(b, i)) {
+                    ir_fail(fi, b, 0, c"switch case not among its successors");
+                }
+                for j in 0..i {
+                    if case_value(b, j) == case_value(b, i) {
+                        ir_fail(fi, b, 0, c"switch case value repeated");
+                    }
                 }
             }
         }
@@ -1027,34 +1130,36 @@ fn verify_block(fi: i64, b: i64) {
 // `operand` of `user` (0: the terminator), used at the end of block `at`
 // for phis or in block `at` otherwise.
 fn verify_operand(fi: i64, b: i64, user: i64, operand: i64, at: i64, reachable: bool) {
-    if operand <= 0 || operand >= INST_COUNT {
-        ir_fail(fi, b, user, c"operand out of range");
-    }
-    if INSTS[operand].repl != 0 {
-        ir_fail(fi, b, user, c"operand was replaced (not resolved)");
-    }
-    let def_block = INSTS[operand].block;
-    if def_block == 0 {
-        ir_fail(fi, b, user, c"operand not in any block");
-    }
-    if BLOCKS[def_block].func != fi {
-        ir_fail(fi, b, user, c"operand from another function");
-    }
-    if !reachable || BLOCKS[at].order < 0 {
-        return;
-    }
-    if def_block == at && user != 0 && INSTS[user].op != Phi {
-        // Defined before the use in the same block.
-        let mut w = INSTS[user].prev;
-        while w != 0 && w != operand {
-            w = INSTS[w].prev;
+    unsafe {
+        if operand <= 0 || operand >= INST_COUNT {
+            ir_fail(fi, b, user, c"operand out of range");
         }
-        if w == 0 {
-            ir_fail(fi, b, user, c"operand defined after its use");
+        if INSTS[operand].repl != 0 {
+            ir_fail(fi, b, user, c"operand was replaced (not resolved)");
         }
-        return;
-    }
-    if !dominates(def_block, at) {
-        ir_fail(fi, b, user, c"operand does not dominate its use");
+        let def_block = INSTS[operand].block;
+        if def_block == 0 {
+            ir_fail(fi, b, user, c"operand not in any block");
+        }
+        if BLOCKS[def_block].func != fi {
+            ir_fail(fi, b, user, c"operand from another function");
+        }
+        if !reachable || BLOCKS[at].order < 0 {
+            return;
+        }
+        if def_block == at && user != 0 && INSTS[user].op != Phi {
+            // Defined before the use in the same block.
+            let mut w = INSTS[user].prev;
+            while w != 0 && w != operand {
+                w = INSTS[w].prev;
+            }
+            if w == 0 {
+                ir_fail(fi, b, user, c"operand defined after its use");
+            }
+            return;
+        }
+        if !dominates(def_block, at) {
+            ir_fail(fi, b, user, c"operand does not dominate its use");
+        }
     }
 }

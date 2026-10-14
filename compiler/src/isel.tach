@@ -81,6 +81,7 @@
 use crate::base::{alloc_array, die, free, sym_name};
 use crate::types::{
     FNS, TY_F32, TY_F64, TY_U64, fn_param, int_bits, is_float, is_integer, is_signed, type_size,
+    is_vector,
 };
 use crate::target::{ELF, LINK_NAMES, X86, log2};
 use crate::x86_64::fits_i32;
@@ -107,58 +108,62 @@ static mut ISEL_USES: *i64 = 0 as *i64;
 static mut ISEL_CAP: i64 = 0;
 
 pub fn select_instructions() {
-    for fi in 0..IRFUNC_COUNT {
-        if FN_LIVE[fi] == 0 {
-            continue;
-        }
-        IRF = fi;
-        let threaded = thread_phi_branches(fi);
-        if form_selects(fi) || threaded {
+    unsafe {
+        for fi in 0..IRFUNC_COUNT {
+            if FN_LIVE[fi] == 0 {
+                continue;
+            }
+            IRF = fi;
+            let threaded = thread_phi_branches(fi);
+            if form_selects(fi) || threaded {
+                eliminate_dead_code(fi);
+            }
+            isel_function(fi);
             eliminate_dead_code(fi);
+            schedule_function(fi);
+            verify_func(fi, c"instruction selection");
         }
-        isel_function(fi);
-        eliminate_dead_code(fi);
-        schedule_function(fi);
-        verify_func(fi, c"instruction selection");
     }
 }
 
 // ---- Use counts ----
 
 fn isel_count_uses(fi: i64) {
-    if ISEL_CAP < INST_COUNT + 1 {
-        free(ISEL_USES as *u8);
-        ISEL_CAP = 2 * INST_COUNT + 1024;
-        ISEL_USES = alloc_array::<i64>(ISEL_CAP);
-    }
-    for i in 0..IRFUNCS[fi].blocks.count {
-        let b = IRFUNCS[fi].blocks.data[i];
-        if BLOCKS[b].removed != 0 {
-            continue;
+    unsafe {
+        if ISEL_CAP < INST_COUNT + 1 {
+            free(ISEL_USES as *u8);
+            ISEL_CAP = 2 * INST_COUNT + 1024;
+            ISEL_USES = alloc_array::<i64>(ISEL_CAP);
         }
-        let mut v = BLOCKS[b].first;
-        while v != 0 {
-            ISEL_USES[v] = 0;
-            v = INSTS[v].next;
-        }
-    }
-    for i in 0..IRFUNCS[fi].blocks.count {
-        let b = IRFUNCS[fi].blocks.data[i];
-        if BLOCKS[b].removed != 0 {
-            continue;
-        }
-        let mut v = BLOCKS[b].first;
-        while v != 0 {
-            for k in 0..ir_operand_count(v) {
-                let operand = ir_operand(v, k);
-                if operand != 0 {
-                    ISEL_USES[operand] += 1;
-                }
+        for i in 0..IRFUNCS[fi].blocks.count {
+            let b = IRFUNCS[fi].blocks.data[i];
+            if BLOCKS[b].removed != 0 {
+                continue;
             }
-            v = INSTS[v].next;
+            let mut v = BLOCKS[b].first;
+            while v != 0 {
+                ISEL_USES[v] = 0;
+                v = INSTS[v].next;
+            }
         }
-        if BLOCKS[b].cond != 0 {
-            ISEL_USES[BLOCKS[b].cond] += 1;
+        for i in 0..IRFUNCS[fi].blocks.count {
+            let b = IRFUNCS[fi].blocks.data[i];
+            if BLOCKS[b].removed != 0 {
+                continue;
+            }
+            let mut v = BLOCKS[b].first;
+            while v != 0 {
+                for k in 0..ir_operand_count(v) {
+                    let operand = ir_operand(v, k);
+                    if operand != 0 {
+                        ISEL_USES[operand] += 1;
+                    }
+                }
+                v = INSTS[v].next;
+            }
+            if BLOCKS[b].cond != 0 {
+                ISEL_USES[BLOCKS[b].cond] += 1;
+            }
         }
     }
 }
@@ -166,20 +171,22 @@ fn isel_count_uses(fi: i64) {
 // One use of `v` less; when it was the last, `v` is dead and so are its
 // own uses.
 fn isel_release(v: i64) {
-    if v == 0 {
-        return;
-    }
-    ISEL_USES[v] -= 1;
-    if ISEL_USES[v] == 0 && !INSTS[v].op.has_side_effect() {
-        for k in 0..ir_operand_count(v) {
-            isel_release(ir_operand(v, k));
+    unsafe {
+        if v == 0 {
+            return;
+        }
+        ISEL_USES[v] -= 1;
+        if ISEL_USES[v] == 0 && !INSTS[v].op.has_side_effect() {
+            for k in 0..ir_operand_count(v) {
+                isel_release(ir_operand(v, k));
+            }
         }
     }
 }
 
 fn isel_retain(v: i64) {
     if v != 0 {
-        ISEL_USES[v] += 1;
+        unsafe { ISEL_USES[v] += 1; }
     }
 }
 
@@ -187,33 +194,39 @@ fn isel_retain(v: i64) {
 // `user`: an integer instruction `op` of the same block used by `user`
 // alone.
 fn coverable(v: i64, op: Op, user: i64) -> bool {
-    v != 0 && INSTS[v].op == op && INSTS[v].block == INSTS[user].block && ISEL_USES[v] == 1
-        && !is_float(INSTS[v].ty)
+    unsafe {
+        v != 0 && INSTS[v].op == op && INSTS[v].block == INSTS[user].block && ISEL_USES[v] == 1
+            && !is_float(INSTS[v].ty)
+    }
 }
 
 fn isel_const(v: i64, out: *i64) -> bool {
-    if v != 0 && INSTS[v].op == Const && !is_float(INSTS[v].ty) {
-        *out = INSTS[v].imm;
-        return true;
+    unsafe {
+        if v != 0 && INSTS[v].op == Const && !is_float(INSTS[v].ty) {
+            *out = INSTS[v].imm;
+            return true;
+        }
+        false
     }
-    false
 }
 
 // Rewrites root `v`'s operands to a, b, c (counting the new uses before
 // releasing the old ones, so that shared leaves stay alive).
 fn isel_set_operands(v: i64, a: i64, b: i64, c: i64) {
-    let old_a = INSTS[v].a;
-    let old_b = INSTS[v].b;
-    let old_c = INSTS[v].c;
-    INSTS[v].a = a;
-    INSTS[v].b = b;
-    INSTS[v].c = c;
-    isel_retain(a);
-    isel_retain(b);
-    isel_retain(c);
-    isel_release(old_a);
-    isel_release(old_b);
-    isel_release(old_c);
+    unsafe {
+        let old_a = INSTS[v].a;
+        let old_b = INSTS[v].b;
+        let old_c = INSTS[v].c;
+        INSTS[v].a = a;
+        INSTS[v].b = b;
+        INSTS[v].c = c;
+        isel_retain(a);
+        isel_retain(b);
+        isel_retain(c);
+        isel_release(old_a);
+        isel_release(old_b);
+        isel_release(old_c);
+    }
 }
 
 // ---- Selects ----
@@ -222,32 +235,39 @@ fn isel_set_operands(v: i64, a: i64, b: i64, c: i64) {
 // division: its checks and, on x86-64, its fixed registers cost more than
 // a branch).
 fn is_speculable(v: i64) -> bool {
-    let op = INSTS[v].op;
-    if op.is_remat() {
-        return true;
+    unsafe {
+        let op = INSTS[v].op;
+        if op.is_remat() {
+            return true;
+        }
+        op.is_pure() && op != Div && op != Rem
+            && !(op == Conv && (is_float(INSTS[v].ty) || is_float(INSTS[v].imm2)))
     }
-    op.is_pure() && op != Div && op != Rem
-        && !(op == Conv && (is_float(INSTS[v].ty) || is_float(INSTS[v].imm2)))
 }
 
 // The number of instructions of arm block `b` that cost something, or -1
 // when it holds one it may not.
 fn arm_cost(b: i64) -> i64 {
-    let mut cost = 0;
-    let mut v = BLOCKS[b].first;
-    while v != 0 {
-        if !is_speculable(v) {
-            return -1;
+    unsafe {
+        let mut cost = 0;
+        let mut v = BLOCKS[b].first;
+        while v != 0 {
+            if !is_speculable(v) {
+                return -1;
+            }
+            if !INSTS[v].op.is_remat() {
+                cost += 1;
+            }
+            v = INSTS[v].next;
         }
-        if !INSTS[v].op.is_remat() {
-            cost += 1;
-        }
-        v = INSTS[v].next;
+        cost
     }
-    cost
 }
 
 fn selectable_type(ty: i64) -> bool {
+    if is_vector(ty) {
+        return false;
+    }
     if is_float(ty) {
         return !X86;
     }
@@ -256,177 +276,185 @@ fn selectable_type(ty: i64) -> bool {
 
 // Whether block b is an arm: only reached from h, only jumping on.
 fn is_arm(b: i64, h: i64) -> bool {
-    BLOCKS[b].preds.count == 1 && BLOCKS[b].preds.data[0] == h && BLOCKS[b].term == Term::Jump
+    unsafe { BLOCKS[b].preds.count == 1 && BLOCKS[b].preds.data[0] == h && BLOCKS[b].term == Term::Jump }
 }
 
 // Turns small diamonds and triangles into selects; returns whether any was.
 fn form_selects(fi: i64) -> bool {
-    let mut changed = false;
-    for _ in 0..2 {
-        let mut round = false;
-        let count = IRFUNCS[fi].blocks.count;
-        for i in 0..count {
-            let h = IRFUNCS[fi].blocks.data[i];
-            if BLOCKS[h].removed == 0 && BLOCKS[h].term == Term::Branch && try_select(h) {
-                round = true;
+    unsafe {
+        let mut changed = false;
+        for _ in 0..2 {
+            let mut round = false;
+            let count = IRFUNCS[fi].blocks.count;
+            for i in 0..count {
+                let h = IRFUNCS[fi].blocks.data[i];
+                if BLOCKS[h].removed == 0 && BLOCKS[h].term == Term::Branch && try_select(h) {
+                    round = true;
+                }
             }
+            if !round {
+                break;
+            }
+            changed = true;
+            resolve_all(fi);
+            remove_trivial_phis(fi);
+            resolve_all(fi);
+            simplify_cfg(fi);
+            resolve_all(fi);
         }
-        if !round {
-            break;
-        }
-        changed = true;
-        resolve_all(fi);
-        remove_trivial_phis(fi);
-        resolve_all(fi);
-        simplify_cfg(fi);
-        resolve_all(fi);
+        changed
     }
-    changed
 }
 
 fn try_select(h: i64) -> bool {
-    let t = BLOCKS[h].s0;
-    let e = BLOCKS[h].s1;
-    if t == e || t == h || e == h {
-        return false;
-    }
-    // The meeting block and the arms (0: the arm is the edge itself).
-    let mut join = 0;
-    let mut arm_t = 0;
-    let mut arm_e = 0;
-    if is_arm(t, h) && is_arm(e, h) && BLOCKS[t].s0 == BLOCKS[e].s0 {
-        join = BLOCKS[t].s0;
-        arm_t = t;
-        arm_e = e;
-    } else if is_arm(t, h) && BLOCKS[t].s0 == e {
-        join = e;
-        arm_t = t;
-    } else if is_arm(e, h) && BLOCKS[e].s0 == t {
-        join = t;
-        arm_e = e;
-    } else {
-        return false;
-    }
-    if join == h || join == t && arm_t != 0 || join == e && arm_e != 0 {
-        return false;
-    }
-    let cost_t = if arm_t != 0 { arm_cost(arm_t) } else { 0 };
-    let cost_e = if arm_e != 0 { arm_cost(arm_e) } else { 0 };
-    if cost_t < 0 || cost_e < 0 || cost_t > 2 || cost_e > 2 {
-        return false;
-    }
-    // The comparison.
-    let cond = BLOCKS[h].cond;
-    let mut lhs = cond;
-    let mut rhs = 0;
-    let mut imm = 0;
-    let mut cmp_ty = TY_U64;
-    let mut op = Cond::Ne;
-    if INSTS[cond].op == Cmp {
-        cmp_ty = INSTS[cond].imm2;
-        if is_float(cmp_ty) && X86 {
+    unsafe {
+        let t = BLOCKS[h].s0;
+        let e = BLOCKS[h].s1;
+        if t == e || t == h || e == h {
             return false;
         }
-        lhs = INSTS[cond].a;
-        rhs = INSTS[cond].b;
-        op = INSTS[cond].cond;
-        let mut value = 0;
-        if isel_const(rhs, &value) && fits_cmp_imm(value) {
-            rhs = 0;
-            imm = value;
+        // The meeting block and the arms (0: the arm is the edge itself).
+        let mut join = 0;
+        let mut arm_t = 0;
+        let mut arm_e = 0;
+        if is_arm(t, h) && is_arm(e, h) && BLOCKS[t].s0 == BLOCKS[e].s0 {
+            join = BLOCKS[t].s0;
+            arm_t = t;
+            arm_e = e;
+        } else if is_arm(t, h) && BLOCKS[t].s0 == e {
+            join = e;
+            arm_t = t;
+        } else if is_arm(e, h) && BLOCKS[e].s0 == t {
+            join = t;
+            arm_e = e;
+        } else {
+            return false;
         }
-    }
-    // The phis of the meeting block, and their values from each way.
-    let index_t = pred_index(join, if arm_t != 0 { arm_t } else { h });
-    let index_e = pred_index(join, if arm_e != 0 { arm_e } else { h });
-    if index_t < 0 || index_e < 0 {
-        return false;
-    }
-    let mut selects = 0;
-    let mut phi = BLOCKS[join].first;
-    while phi != 0 && INSTS[phi].op == Phi {
-        if ir_val(ir_arg(phi, index_t)) != ir_val(ir_arg(phi, index_e)) {
-            if !selectable_type(INSTS[phi].ty) {
+        if join == h || join == t && arm_t != 0 || join == e && arm_e != 0 {
+            return false;
+        }
+        let cost_t = if arm_t != 0 { arm_cost(arm_t) } else { 0 };
+        let cost_e = if arm_e != 0 { arm_cost(arm_e) } else { 0 };
+        if cost_t < 0 || cost_e < 0 || cost_t > 2 || cost_e > 2 {
+            return false;
+        }
+        // The comparison.
+        let cond = BLOCKS[h].cond;
+        let mut lhs = cond;
+        let mut rhs = 0;
+        let mut imm = 0;
+        let mut cmp_ty = TY_U64;
+        let mut op = Cond::Ne;
+        if INSTS[cond].op == Cmp {
+            cmp_ty = INSTS[cond].imm2;
+            if is_float(cmp_ty) && X86 {
                 return false;
             }
-            selects += 1;
+            lhs = INSTS[cond].a;
+            rhs = INSTS[cond].b;
+            op = INSTS[cond].cond;
+            let mut value = 0;
+            if isel_const(rhs, &value) && fits_cmp_imm(value) {
+                rhs = 0;
+                imm = value;
+            }
         }
-        phi = INSTS[phi].next;
-    }
-    if selects == 0 || selects > 2 || cost_t + cost_e + selects > 4 {
-        return false;
-    }
-    // The arms' instructions move up into h.
-    if arm_t != 0 {
-        move_instructions(arm_t, h);
-    }
-    if arm_e != 0 {
-        move_instructions(arm_e, h);
-    }
-    // One select per phi that picks; the phi then gets it from h.
-    phi = BLOCKS[join].first;
-    while phi != 0 && INSTS[phi].op == Phi {
-        let value_t = ir_val(ir_arg(phi, index_t));
-        let value_e = ir_val(ir_arg(phi, index_e));
-        let mut picked = value_t;
-        if value_t != value_e {
-            let sel = ir_make(Select, INSTS[phi].ty, value_t, value_e, imm);
-            INSTS[sel].cond = op;
-            INSTS[sel].imm2 = cmp_ty;
-            INSTS[sel].args = ARGS.count;
-            ARGS.push(lhs);
-            ARGTY.push(0);
-            ARGS.push(rhs);
-            ARGTY.push(0);
-            INSTS[sel].nargs = 2;
-            ir_append(h, sel);
-            picked = sel;
+        // The phis of the meeting block, and their values from each way.
+        let index_t = pred_index(join, if arm_t != 0 { arm_t } else { h });
+        let index_e = pred_index(join, if arm_e != 0 { arm_e } else { h });
+        if index_t < 0 || index_e < 0 {
+            return false;
         }
-        ir_set_arg(phi, index_t, picked);
-        ir_set_arg(phi, index_e, picked);
-        phi = INSTS[phi].next;
+        let mut selects = 0;
+        let mut phi = BLOCKS[join].first;
+        while phi != 0 && INSTS[phi].op == Phi {
+            if ir_val(ir_arg(phi, index_t)) != ir_val(ir_arg(phi, index_e)) {
+                if !selectable_type(INSTS[phi].ty) {
+                    return false;
+                }
+                selects += 1;
+            }
+            phi = INSTS[phi].next;
+        }
+        if selects == 0 || selects > 2 || cost_t + cost_e + selects > 4 {
+            return false;
+        }
+        // The arms' instructions move up into h.
+        if arm_t != 0 {
+            move_instructions(arm_t, h);
+        }
+        if arm_e != 0 {
+            move_instructions(arm_e, h);
+        }
+        // One select per phi that picks; the phi then gets it from h.
+        phi = BLOCKS[join].first;
+        while phi != 0 && INSTS[phi].op == Phi {
+            let value_t = ir_val(ir_arg(phi, index_t));
+            let value_e = ir_val(ir_arg(phi, index_e));
+            let mut picked = value_t;
+            if value_t != value_e {
+                let sel = ir_make(Select, INSTS[phi].ty, value_t, value_e, imm);
+                INSTS[sel].cond = op;
+                INSTS[sel].imm2 = cmp_ty;
+                INSTS[sel].args = ARGS.count;
+                ARGS.push(lhs);
+                ARGTY.push(0);
+                ARGS.push(rhs);
+                ARGTY.push(0);
+                INSTS[sel].nargs = 2;
+                ir_append(h, sel);
+                picked = sel;
+            }
+            ir_set_arg(phi, index_t, picked);
+            ir_set_arg(phi, index_e, picked);
+            phi = INSTS[phi].next;
+        }
+        // h now jumps to the meeting block, once.
+        let removed_index = if arm_e != 0 { index_e } else { index_t };
+        let kept = if arm_e != 0 { arm_t } else { arm_e };
+        BLOCKS[h].term = Term::Jump;
+        BLOCKS[h].cond = 0;
+        BLOCKS[h].s0 = join;
+        BLOCKS[h].s1 = 0;
+        remove_pred_at(join, removed_index);
+        if kept != 0 {
+            // The other way's predecessor entry becomes h.
+            BLOCKS[join].preds.data[pred_index(join, kept)] = h;
+        } else if arm_e == 0 && arm_t == 0 {
+            die(c"internal error: select without arms");
+        }
+        if arm_t != 0 {
+            drop_arm(arm_t);
+        }
+        if arm_e != 0 {
+            drop_arm(arm_e);
+        }
+        true
     }
-    // h now jumps to the meeting block, once.
-    let removed_index = if arm_e != 0 { index_e } else { index_t };
-    let kept = if arm_e != 0 { arm_t } else { arm_e };
-    BLOCKS[h].term = Term::Jump;
-    BLOCKS[h].cond = 0;
-    BLOCKS[h].s0 = join;
-    BLOCKS[h].s1 = 0;
-    remove_pred_at(join, removed_index);
-    if kept != 0 {
-        // The other way's predecessor entry becomes h.
-        BLOCKS[join].preds.data[pred_index(join, kept)] = h;
-    } else if arm_e == 0 && arm_t == 0 {
-        die(c"internal error: select without arms");
-    }
-    if arm_t != 0 {
-        drop_arm(arm_t);
-    }
-    if arm_e != 0 {
-        drop_arm(arm_e);
-    }
-    true
 }
 
 // Moves the instructions of block `from` to the end of block `to`.
 fn move_instructions(from: i64, to: i64) {
-    let mut v = BLOCKS[from].first;
-    while v != 0 {
-        let next = INSTS[v].next;
-        ir_unlink(v);
-        ir_append(to, v);
-        v = next;
+    unsafe {
+        let mut v = BLOCKS[from].first;
+        while v != 0 {
+            let next = INSTS[v].next;
+            ir_unlink(v);
+            ir_append(to, v);
+            v = next;
+        }
     }
 }
 
 // Removes an emptied arm (its edges are already redirected).
 fn drop_arm(b: i64) {
-    BLOCKS[b].removed = 1;
-    BLOCKS[b].term = Term::None;
-    BLOCKS[b].preds.count = 0;
-    BLOCKS[b].first = 0;
-    BLOCKS[b].last = 0;
+    unsafe {
+        BLOCKS[b].removed = 1;
+        BLOCKS[b].term = Term::None;
+        BLOCKS[b].preds.count = 0;
+        BLOCKS[b].first = 0;
+        BLOCKS[b].last = 0;
+    }
 }
 
 // ---- Tiling ----
@@ -434,48 +462,52 @@ fn drop_arm(b: i64) {
 fn isel_function(fi: i64) {
     resolve_all(fi);
     isel_count_uses(fi);
-    for i in 0..IRFUNCS[fi].blocks.count {
-        let b = IRFUNCS[fi].blocks.data[i];
-        if BLOCKS[b].removed != 0 {
-            continue;
-        }
-        isel_branch(b);
-        let mut v = BLOCKS[b].last;
-        while v != 0 {
-            let prev = INSTS[v].prev;
-            if ISEL_USES[v] > 0 || INSTS[v].op.has_side_effect() {
-                isel_inst(v);
+    unsafe {
+        for i in 0..IRFUNCS[fi].blocks.count {
+            let b = IRFUNCS[fi].blocks.data[i];
+            if BLOCKS[b].removed != 0 {
+                continue;
             }
-            v = prev;
+            isel_branch(b);
+            let mut v = BLOCKS[b].last;
+            while v != 0 {
+                let prev = INSTS[v].prev;
+                if ISEL_USES[v] > 0 || INSTS[v].op.has_side_effect() {
+                    isel_inst(v);
+                }
+                v = prev;
+            }
         }
     }
 }
 
 fn isel_inst(v: i64) {
-    let op = INSTS[v].op;
-    if op == Call {
-        isel_libcall(v);
-    } else if op == Load || op == Store {
-        isel_address(v);
-    } else if op == Select {
-        isel_select_test(v);
-        isel_select_increment(v);
-    } else if is_float(INSTS[v].ty) {
-        return;
-    } else if X86 {
-        if op == Add || op == Sub {
-            isel_lea(v);
-        }
-    } else if op == Add || op == Sub {
-        if !isel_madd(v) {
+    unsafe {
+        let op = INSTS[v].op;
+        if op == Call {
+            isel_libcall(v);
+        } else if op == Load || op == Store {
+            isel_address(v);
+        } else if op == Select {
+            isel_select_test(v);
+            isel_select_increment(v);
+        } else if is_float(INSTS[v].ty) {
+            return;
+        } else if X86 {
+            if op == Add || op == Sub {
+                isel_lea(v);
+            }
+        } else if op == Add || op == Sub {
+            if !isel_madd(v) {
+                isel_shop(v);
+            }
+        } else if op == And {
+            if !isel_ubfx(v) {
+                isel_shop(v);
+            }
+        } else if op == Or || op == Xor {
             isel_shop(v);
         }
-    } else if op == And {
-        if !isel_ubfx(v) {
-            isel_shop(v);
-        }
-    } else if op == Or || op == Xor {
-        isel_shop(v);
     }
 }
 
@@ -486,210 +518,220 @@ fn is_wide_int(ty: i64) -> bool {
 
 // load/store of base + (index << s) (or base + index).
 fn isel_address(v: i64) {
-    let addr = INSTS[v].a;
-    let store = INSTS[v].op == Store;
-    let ty = if store { INSTS[v].imm2 } else { INSTS[v].ty };
-    let offset = INSTS[v].imm;
-    if !coverable(addr, Add, v) || !is_wide_int(INSTS[addr].ty) {
-        return;
-    }
-    if !X86 && offset != 0 {
-        return;
-    }
-    if X86 && !fits_i32(offset) {
-        return;
-    }
-    let size = type_size(ty);
-    let mut chosen_base = 0;
-    let mut chosen_index = 0;
-    let mut chosen_scale = -1;
-    // A shifted index first, then a plain one.
-    for side in 0..2 {
-        let base = if side == 0 { INSTS[addr].a } else { INSTS[addr].b };
-        let index = if side == 0 { INSTS[addr].b } else { INSTS[addr].a };
-        let mut k = 0;
-        if chosen_scale < 0 && coverable(index, Shl, addr) && is_wide_int(INSTS[index].ty)
-            && isel_const(INSTS[index].b, &k) && base_ok(base) {
-            let s = k & 63;
-            if (X86 && s <= 3) || (!X86 && (s == 0 || (1 << s as u64) == size)) {
-                chosen_base = base;
-                chosen_index = INSTS[index].a;
-                chosen_scale = s;
-            }
-        }
-    }
-    if chosen_scale < 0 {
-        let base = INSTS[addr].a;
-        let index = INSTS[addr].b;
-        if INSTS[index].op.is_remat() && !INSTS[base].op.is_remat() {
-            // A constant or an address is the base (a slot from %rsp).
-            if !base_ok(index) {
-                return;
-            }
-            chosen_base = index;
-            chosen_index = base;
-        } else {
-            if !base_ok(base) {
-                return;
-            }
-            chosen_base = base;
-            chosen_index = index;
-        }
-        if INSTS[chosen_index].op == Const {
-            // base + constant: instcombine folds those into the offset.
+    unsafe {
+        let addr = INSTS[v].a;
+        let store = INSTS[v].op == Store;
+        let ty = if store { INSTS[v].imm2 } else { INSTS[v].ty };
+        let offset = INSTS[v].imm;
+        if !coverable(addr, Add, v) || !is_wide_int(INSTS[addr].ty) {
             return;
         }
-        chosen_scale = 0;
+        if !X86 && offset != 0 {
+            return;
+        }
+        if X86 && !fits_i32(offset) {
+            return;
+        }
+        let size = type_size(ty);
+        let mut chosen_base = 0;
+        let mut chosen_index = 0;
+        let mut chosen_scale = -1;
+        // A shifted index first, then a plain one.
+        for side in 0..2 {
+            let base = if side == 0 { INSTS[addr].a } else { INSTS[addr].b };
+            let index = if side == 0 { INSTS[addr].b } else { INSTS[addr].a };
+            let mut k = 0;
+            if chosen_scale < 0 && coverable(index, Shl, addr) && is_wide_int(INSTS[index].ty)
+                && isel_const(INSTS[index].b, &k) && base_ok(base) {
+                let s = k & 63;
+                if (X86 && s <= 3) || (!X86 && (s == 0 || (1 << s as u64) == size)) {
+                    chosen_base = base;
+                    chosen_index = INSTS[index].a;
+                    chosen_scale = s;
+                }
+            }
+        }
+        if chosen_scale < 0 {
+            let base = INSTS[addr].a;
+            let index = INSTS[addr].b;
+            if INSTS[index].op.is_remat() && !INSTS[base].op.is_remat() {
+                // A constant or an address is the base (a slot from %rsp).
+                if !base_ok(index) {
+                    return;
+                }
+                chosen_base = index;
+                chosen_index = base;
+            } else {
+                if !base_ok(base) {
+                    return;
+                }
+                chosen_base = base;
+                chosen_index = index;
+            }
+            if INSTS[chosen_index].op == Const {
+                // base + constant: instcombine folds those into the offset.
+                return;
+            }
+            chosen_scale = 0;
+        }
+        if store {
+            let value = INSTS[v].b;
+            INSTS[v].op = StoreX;
+            isel_set_operands(v, chosen_base, chosen_index, value);
+        } else {
+            INSTS[v].op = LoadX;
+            isel_set_operands(v, chosen_base, chosen_index, 0);
+        }
+        INSTS[v].scale = chosen_scale;
     }
-    if store {
-        let value = INSTS[v].b;
-        INSTS[v].op = StoreX;
-        isel_set_operands(v, chosen_base, chosen_index, value);
-    } else {
-        INSTS[v].op = LoadX;
-        isel_set_operands(v, chosen_base, chosen_index, 0);
-    }
-    INSTS[v].scale = chosen_scale;
 }
 
 // Whether `base` may be the base of an indexed access: a frame slot only
 // on x86-64 (from %rsp, the slot's offset in the displacement).
 fn base_ok(base: i64) -> bool {
-    base != 0 && (X86 || INSTS[base].op != Slot)
+    unsafe { base != 0 && (X86 || INSTS[base].op != Slot) }
 }
 
 // x86-64: a + (b << s), a + b, a + k, a - k into any register.
 fn isel_lea(v: i64) {
-    let ty = INSTS[v].ty;
-    if !is_wide_int(ty) {
-        return;
-    }
-    let a = INSTS[v].a;
-    let b = INSTS[v].b;
-    let mut k = 0;
-    if isel_const(b, &k) {
-        let disp = if INSTS[v].op == Sub { 0 - k } else { k };
-        if !fits_i32(k) || !fits_i32(disp) || INSTS[a].op.is_remat() {
+    unsafe {
+        let ty = INSTS[v].ty;
+        if !is_wide_int(ty) {
+            return;
+        }
+        let a = INSTS[v].a;
+        let b = INSTS[v].b;
+        let mut k = 0;
+        if isel_const(b, &k) {
+            let disp = if INSTS[v].op == Sub { 0 - k } else { k };
+            if !fits_i32(k) || !fits_i32(disp) || INSTS[a].op.is_remat() {
+                return;
+            }
+            INSTS[v].op = Lea;
+            INSTS[v].imm = disp;
+            INSTS[v].scale = 0;
+            // (x * 3) + k = k(x, x, 2), and (x + y) + k = k(x, y).
+            let mut m = 0;
+            if coverable(a, Mul, v) && INSTS[a].ty == ty && isel_const(INSTS[a].b, &m)
+                && (m == 3 || m == 5 || m == 9) {
+                INSTS[v].scale = log2(m - 1);
+                isel_set_operands(v, INSTS[a].a, INSTS[a].a, 0);
+                return;
+            }
+            if coverable(a, Add, v) && INSTS[a].ty == ty && !INSTS[INSTS[a].a].op.is_remat()
+                && !INSTS[INSTS[a].b].op.is_remat() {
+                isel_set_operands(v, INSTS[a].a, INSTS[a].b, 0);
+                return;
+            }
+            isel_set_operands(v, a, 0, 0);
+            return;
+        }
+        if INSTS[v].op != Add || INSTS[a].op == Const || INSTS[b].op == Const {
+            return;
+        }
+        for side in 0..2 {
+            let base = if side == 0 { a } else { b };
+            let index = if side == 0 { b } else { a };
+            let mut s = 0;
+            if coverable(index, Shl, v) && INSTS[index].ty == ty && isel_const(INSTS[index].b, &s)
+                && (s & 63) <= 3 && INSTS[base].op != Slot {
+                INSTS[v].op = Lea;
+                INSTS[v].imm = 0;
+                INSTS[v].scale = s & 63;
+                isel_set_operands(v, base, INSTS[index].a, 0);
+                return;
+            }
+        }
+        if INSTS[a].op == Slot || INSTS[b].op == Slot {
             return;
         }
         INSTS[v].op = Lea;
-        INSTS[v].imm = disp;
+        INSTS[v].imm = 0;
         INSTS[v].scale = 0;
-        // (x * 3) + k = k(x, x, 2), and (x + y) + k = k(x, y).
-        let mut m = 0;
-        if coverable(a, Mul, v) && INSTS[a].ty == ty && isel_const(INSTS[a].b, &m)
-            && (m == 3 || m == 5 || m == 9) {
-            INSTS[v].scale = log2(m - 1);
-            isel_set_operands(v, INSTS[a].a, INSTS[a].a, 0);
-            return;
-        }
-        if coverable(a, Add, v) && INSTS[a].ty == ty && !INSTS[INSTS[a].a].op.is_remat()
-            && !INSTS[INSTS[a].b].op.is_remat() {
-            isel_set_operands(v, INSTS[a].a, INSTS[a].b, 0);
-            return;
-        }
-        isel_set_operands(v, a, 0, 0);
-        return;
+        isel_set_operands(v, a, b, 0);
     }
-    if INSTS[v].op != Add || INSTS[a].op == Const || INSTS[b].op == Const {
-        return;
-    }
-    for side in 0..2 {
-        let base = if side == 0 { a } else { b };
-        let index = if side == 0 { b } else { a };
-        let mut s = 0;
-        if coverable(index, Shl, v) && INSTS[index].ty == ty && isel_const(INSTS[index].b, &s)
-            && (s & 63) <= 3 && INSTS[base].op != Slot {
-            INSTS[v].op = Lea;
-            INSTS[v].imm = 0;
-            INSTS[v].scale = s & 63;
-            isel_set_operands(v, base, INSTS[index].a, 0);
-            return;
-        }
-    }
-    if INSTS[a].op == Slot || INSTS[b].op == Slot {
-        return;
-    }
-    INSTS[v].op = Lea;
-    INSTS[v].imm = 0;
-    INSTS[v].scale = 0;
-    isel_set_operands(v, a, b, 0);
 }
 
 // AArch64: c + a * b, c - a * b.
 fn isel_madd(v: i64) -> bool {
-    let ty = INSTS[v].ty;
-    let sub = INSTS[v].op == Sub;
-    for side in 0..2 {
-        if sub && side == 1 {
-            break;
+    unsafe {
+        let ty = INSTS[v].ty;
+        let sub = INSTS[v].op == Sub;
+        for side in 0..2 {
+            if sub && side == 1 {
+                break;
+            }
+            let m = if side == 0 { INSTS[v].b } else { INSTS[v].a };
+            let other = if side == 0 { INSTS[v].a } else { INSTS[v].b };
+            let mut k = 0;
+            if coverable(m, Mul, v) && INSTS[m].ty == ty && INSTS[other].op != Const
+                && !(isel_const(INSTS[m].b, &k) && ma_int_imm_ok(Mul, k)) {
+                INSTS[v].op = if sub { MSub } else { MAdd };
+                isel_set_operands(v, INSTS[m].a, INSTS[m].b, other);
+                return true;
+            }
         }
-        let m = if side == 0 { INSTS[v].b } else { INSTS[v].a };
-        let other = if side == 0 { INSTS[v].a } else { INSTS[v].b };
-        let mut k = 0;
-        if coverable(m, Mul, v) && INSTS[m].ty == ty && INSTS[other].op != Const
-            && !(isel_const(INSTS[m].b, &k) && ma_int_imm_ok(Mul, k)) {
-            INSTS[v].op = if sub { MSub } else { MAdd };
-            isel_set_operands(v, INSTS[m].a, INSTS[m].b, other);
-            return true;
-        }
+        false
     }
-    false
 }
 
 // AArch64: x op (y sh k).
 fn isel_shop(v: i64) -> bool {
-    let ty = INSTS[v].ty;
-    let op = INSTS[v].op;
-    let commutative = op != Sub;
-    for side in 0..2 {
-        if !commutative && side == 1 {
-            break;
+    unsafe {
+        let ty = INSTS[v].ty;
+        let op = INSTS[v].op;
+        let commutative = op != Sub;
+        for side in 0..2 {
+            if !commutative && side == 1 {
+                break;
+            }
+            let s = if side == 0 { INSTS[v].b } else { INSTS[v].a };
+            let other = if side == 0 { INSTS[v].a } else { INSTS[v].b };
+            if other == 0 || INSTS[other].op == Const || s == 0 {
+                continue;
+            }
+            let mut k = 0;
+            let sop = INSTS[s].op;
+            if (sop == Shl || sop == Shr) && coverable(s, sop, v) && INSTS[s].ty == ty
+                && isel_const(INSTS[s].b, &k) {
+                let amount = k & (if int_bits(ty) == 64 { 63 } else { 31 });
+                let kind = if sop == Shl { 0 } else if is_signed(ty) { 2 } else { 1 };
+                INSTS[v].op = ShOp;
+                INSTS[v].imm = amount;
+                INSTS[v].imm2 = 4 * (op as i64) + kind;
+                isel_set_operands(v, other, INSTS[s].a, 0);
+                return true;
+            }
         }
-        let s = if side == 0 { INSTS[v].b } else { INSTS[v].a };
-        let other = if side == 0 { INSTS[v].a } else { INSTS[v].b };
-        if other == 0 || INSTS[other].op == Const || s == 0 {
-            continue;
-        }
-        let mut k = 0;
-        let sop = INSTS[s].op;
-        if (sop == Shl || sop == Shr) && coverable(s, sop, v) && INSTS[s].ty == ty
-            && isel_const(INSTS[s].b, &k) {
-            let amount = k & (if int_bits(ty) == 64 { 63 } else { 31 });
-            let kind = if sop == Shl { 0 } else if is_signed(ty) { 2 } else { 1 };
-            INSTS[v].op = ShOp;
-            INSTS[v].imm = amount;
-            INSTS[v].imm2 = 4 * (op as i64) + kind;
-            isel_set_operands(v, other, INSTS[s].a, 0);
-            return true;
-        }
+        false
     }
-    false
 }
 
 // AArch64: (x >> k) & (2^n - 1), the field within the type.
 fn isel_ubfx(v: i64) -> bool {
-    let ty = INSTS[v].ty;
-    let s = INSTS[v].a;
-    let mut mask = 0;
-    let mut k = 0;
-    if !isel_const(INSTS[v].b, &mask) || mask <= 0 || !coverable(s, Shr, v) || INSTS[s].ty != ty
-        || !isel_const(INSTS[s].b, &k) {
-        return false;
+    unsafe {
+        let ty = INSTS[v].ty;
+        let s = INSTS[v].a;
+        let mut mask = 0;
+        let mut k = 0;
+        if !isel_const(INSTS[v].b, &mask) || mask <= 0 || !coverable(s, Shr, v) || INSTS[s].ty != ty
+            || !isel_const(INSTS[s].b, &k) {
+            return false;
+        }
+        if (mask & (mask + 1)) != 0 {
+            return false;
+        }
+        let n = log2(mask + 1);
+        let amount = k & (if int_bits(ty) == 64 { 63 } else { 31 });
+        if n < 1 || amount + n > int_bits(ty) {
+            return false;
+        }
+        INSTS[v].op = Ubfx;
+        INSTS[v].imm = amount;
+        INSTS[v].imm2 = n;
+        isel_set_operands(v, INSTS[s].a, 0, 0);
+        true
     }
-    if (mask & (mask + 1)) != 0 {
-        return false;
-    }
-    let n = log2(mask + 1);
-    let amount = k & (if int_bits(ty) == 64 { 63 } else { 31 });
-    if n < 1 || amount + n > int_bits(ty) {
-        return false;
-    }
-    INSTS[v].op = Ubfx;
-    INSTS[v].imm = amount;
-    INSTS[v].imm2 = n;
-    isel_set_operands(v, INSTS[s].a, 0, 0);
-    true
 }
 
 // The mask of a test as an immediate, when the target encodes it.
@@ -699,174 +741,184 @@ fn test_imm_ok(mask: i64) -> bool {
 
 // The branch ending block b on (x & y) == 0 or != 0: a test.
 fn isel_branch(b: i64) {
-    let c = BLOCKS[b].cond;
-    if BLOCKS[b].term != Term::Branch || BLOCKS[b].s0 == BLOCKS[b].s1 || c == 0 || INSTS[c].op != Cmp
-        || ISEL_USES[c] != 1
-        || INSTS[c].block != b || INSTS[c].next != 0 || is_float(INSTS[c].imm2) {
-        return;
-    }
-    let op = INSTS[c].cond;
-    let mut zero = 1;
-    if (op != Cond::Eq && op != Cond::Ne) || !isel_const(INSTS[c].b, &zero) || zero != 0 {
-        return;
-    }
-    let and = INSTS[c].a;
-    if !coverable(and, And, c) {
-        return;
-    }
-    let mut mask = 0;
-    INSTS[c].op = Test;
-    if isel_const(INSTS[and].b, &mask) && test_imm_ok(mask) {
-        INSTS[c].imm = mask;
-        isel_set_operands(c, INSTS[and].a, 0, 0);
-    } else {
-        isel_set_operands(c, INSTS[and].a, INSTS[and].b, 0);
+    unsafe {
+        let c = BLOCKS[b].cond;
+        if BLOCKS[b].term != Term::Branch || BLOCKS[b].s0 == BLOCKS[b].s1 || c == 0 || INSTS[c].op != Cmp
+            || ISEL_USES[c] != 1
+            || INSTS[c].block != b || INSTS[c].next != 0 || is_float(INSTS[c].imm2) {
+            return;
+        }
+        let op = INSTS[c].cond;
+        let mut zero = 1;
+        if (op != Cond::Eq && op != Cond::Ne) || !isel_const(INSTS[c].b, &zero) || zero != 0 {
+            return;
+        }
+        let and = INSTS[c].a;
+        if !coverable(and, And, c) {
+            return;
+        }
+        let mut mask = 0;
+        INSTS[c].op = Test;
+        if isel_const(INSTS[and].b, &mask) && test_imm_ok(mask) {
+            INSTS[c].imm = mask;
+            isel_set_operands(c, INSTS[and].a, 0, 0);
+        } else {
+            isel_set_operands(c, INSTS[and].a, INSTS[and].b, 0);
+        }
     }
 }
 
 // A select on (x & y) == 0 or != 0 tests instead of comparing.
 fn isel_select_test(v: i64) {
-    let lhs = ir_arg(v, 0);
-    let op = INSTS[v].cond;
-    if INSTS[v].scale != 0 || ir_arg(v, 1) != 0 || INSTS[v].imm != 0 || (op != Cond::Eq && op != Cond::Ne)
-        || !coverable(lhs, And, v) {
-        return;
+    unsafe {
+        let lhs = ir_arg(v, 0);
+        let op = INSTS[v].cond;
+        if INSTS[v].scale != 0 || ir_arg(v, 1) != 0 || INSTS[v].imm != 0 || (op != Cond::Eq && op != Cond::Ne)
+            || !coverable(lhs, And, v) {
+            return;
+        }
+        let mut mask = 0;
+        INSTS[v].scale = 1;
+        isel_retain(INSTS[lhs].a);
+        ir_set_arg(v, 0, INSTS[lhs].a);
+        if isel_const(INSTS[lhs].b, &mask) && test_imm_ok(mask) {
+            INSTS[v].imm = mask;
+        } else {
+            isel_retain(INSTS[lhs].b);
+            ir_set_arg(v, 1, INSTS[lhs].b);
+        }
+        isel_release(lhs);
     }
-    let mut mask = 0;
-    INSTS[v].scale = 1;
-    isel_retain(INSTS[lhs].a);
-    ir_set_arg(v, 0, INSTS[lhs].a);
-    if isel_const(INSTS[lhs].b, &mask) && test_imm_ok(mask) {
-        INSTS[v].imm = mask;
-    } else {
-        isel_retain(INSTS[lhs].b);
-        ir_set_arg(v, 1, INSTS[lhs].b);
-    }
-    isel_release(lhs);
 }
 
 // AArch64: a select of an increment adds it itself (csinc): c ? a : b + 1;
 // for c ? a + 1 : b, the condition is inverted (integer comparisons and
 // tests only: a negated float comparison is not the opposite one).
 fn isel_select_increment(v: i64) {
-    // 64-bit integers only: csinc adds without wrapping at a narrower width.
-    if X86 || !is_wide_int(INSTS[v].ty) || (INSTS[v].scale & 2) != 0 {
-        return;
-    }
-    let mut one = 0;
-    let other = INSTS[v].b;
-    if coverable(other, Add, v) && INSTS[other].ty == INSTS[v].ty && isel_const(INSTS[other].b, &one)
-        && one == 1 {
-        INSTS[v].scale = INSTS[v].scale | 2;
-        isel_set_operands(v, INSTS[v].a, INSTS[other].a, 0);
-        return;
-    }
-    let then = INSTS[v].a;
-    let invertible = (INSTS[v].scale & 1) == 1 || !is_float(INSTS[v].imm2);
-    if invertible && coverable(then, Add, v) && INSTS[then].ty == INSTS[v].ty
-        && isel_const(INSTS[then].b, &one) && one == 1 {
-        INSTS[v].scale = INSTS[v].scale | 2;
-        INSTS[v].cond = INSTS[v].cond.negate();
-        isel_set_operands(v, INSTS[v].b, INSTS[then].a, 0);
+    unsafe {
+        // 64-bit integers only: csinc adds without wrapping at a narrower width.
+        if X86 || !is_wide_int(INSTS[v].ty) || (INSTS[v].scale & 2) != 0 {
+            return;
+        }
+        let mut one = 0;
+        let other = INSTS[v].b;
+        if coverable(other, Add, v) && INSTS[other].ty == INSTS[v].ty && isel_const(INSTS[other].b, &one)
+            && one == 1 {
+            INSTS[v].scale = INSTS[v].scale | 2;
+            isel_set_operands(v, INSTS[v].a, INSTS[other].a, 0);
+            return;
+        }
+        let then = INSTS[v].a;
+        let invertible = (INSTS[v].scale & 1) == 1 || !is_float(INSTS[v].imm2);
+        if invertible && coverable(then, Add, v) && INSTS[then].ty == INSTS[v].ty
+            && isel_const(INSTS[then].b, &one) && one == 1 {
+            INSTS[v].scale = INSTS[v].scale | 2;
+            INSTS[v].cond = INSTS[v].cond.negate();
+            isel_set_operands(v, INSTS[v].b, INSTS[then].a, 0);
+        }
     }
 }
 
 // A call of one of the C library's math functions that is one instruction
 // (of a function declared with its C signature, under its own name).
 fn isel_libcall(v: i64) {
-    let f = INSTS[v].imm;
-    if !FNS[f].is_extern || FNS[f].variadic || FNS[f].param_count != 1 || INSTS[v].nargs != 1 || INSTS[v].c != 0 {
-        return;
+    unsafe {
+        let f = INSTS[v].imm;
+        if !FNS[f].is_extern || FNS[f].variadic || FNS[f].param_count != 1 || INSTS[v].nargs != 1 || INSTS[v].c != 0 {
+            return;
+        }
+        let ty = FNS[f].ret;
+        if (ty != TY_F64 && ty != TY_F32) || fn_param(f, 0) != ty || LINK_NAMES.get(FNS[f].name + 1) > 0 {
+            return;
+        }
+        let single = ty == TY_F32;
+        let name = sym_name(FNS[f].name);
+        let mut kind = -1;
+        if streq(name, if single { c"sqrtf" } else { c"sqrt" }) {
+            kind = 0;
+        } else if streq(name, if single { c"fabsf" } else { c"fabs" }) {
+            kind = 1;
+        } else if streq(name, if single { c"floorf" } else { c"floor" }) {
+            kind = 2;
+        } else if streq(name, if single { c"ceilf" } else { c"ceil" }) {
+            kind = 3;
+        } else if streq(name, if single { c"truncf" } else { c"trunc" }) {
+            kind = 4;
+        } else if streq(name, if single { c"roundf" } else { c"round" }) {
+            kind = 5;
+        }
+        // glibc's sqrt sets errno for negative arguments; x86-64 has the others
+        // only from SSE4.1 on.
+        if kind < 0 || (kind == 0 && ELF) || (kind > 0 && X86) {
+            return;
+        }
+        let arg = ir_arg(v, 0);
+        INSTS[v].op = FMath;
+        INSTS[v].a = arg;
+        INSTS[v].b = 0;
+        INSTS[v].c = 0;
+        INSTS[v].imm = kind;
+        INSTS[v].args = 0;
+        INSTS[v].nargs = 0;
     }
-    let ty = FNS[f].ret;
-    if (ty != TY_F64 && ty != TY_F32) || fn_param(f, 0) != ty || LINK_NAMES.get(FNS[f].name + 1) > 0 {
-        return;
-    }
-    let single = ty == TY_F32;
-    let name = sym_name(FNS[f].name);
-    let mut kind = -1;
-    if streq(name, if single { c"sqrtf" } else { c"sqrt" }) {
-        kind = 0;
-    } else if streq(name, if single { c"fabsf" } else { c"fabs" }) {
-        kind = 1;
-    } else if streq(name, if single { c"floorf" } else { c"floor" }) {
-        kind = 2;
-    } else if streq(name, if single { c"ceilf" } else { c"ceil" }) {
-        kind = 3;
-    } else if streq(name, if single { c"truncf" } else { c"trunc" }) {
-        kind = 4;
-    } else if streq(name, if single { c"roundf" } else { c"round" }) {
-        kind = 5;
-    }
-    // glibc's sqrt sets errno for negative arguments; x86-64 has the others
-    // only from SSE4.1 on.
-    if kind < 0 || (kind == 0 && ELF) || (kind > 0 && X86) {
-        return;
-    }
-    let arg = ir_arg(v, 0);
-    INSTS[v].op = FMath;
-    INSTS[v].a = arg;
-    INSTS[v].b = 0;
-    INSTS[v].c = 0;
-    INSTS[v].imm = kind;
-    INSTS[v].args = 0;
-    INSTS[v].nargs = 0;
 }
 
 // ---- Branches on phis ----
 
 fn thread_phi_branches(fi: i64) -> bool {
-    let mut changed = decide_repeated_branches(fi);
-    isel_count_uses(fi);
-    let count = IRFUNCS[fi].blocks.count;
-    for i in 0..count {
-        let b = IRFUNCS[fi].blocks.data[i];
-        if BLOCKS[b].removed != 0 || BLOCKS[b].term != Term::Branch {
-            continue;
-        }
-        let p = BLOCKS[b].first;
-        let s0 = BLOCKS[b].s0;
-        let s1 = BLOCKS[b].s1;
-        // Only the phi, used by the branch alone.
-        if p == 0 || p != BLOCKS[b].cond || INSTS[p].op != Phi || INSTS[p].next != 0 || ISEL_USES[p] != 1
-            || s0 == s1 || s0 == b || s1 == b {
-            continue;
-        }
-        let mut k = 0;
-        while k < BLOCKS[b].preds.count {
-            let pred = BLOCKS[b].preds.data[k];
-            if BLOCKS[pred].term != Term::Jump || pred == b || pred == s0 || pred == s1 {
-                k += 1;
+    unsafe {
+        let mut changed = decide_repeated_branches(fi);
+        isel_count_uses(fi);
+        let count = IRFUNCS[fi].blocks.count;
+        for i in 0..count {
+            let b = IRFUNCS[fi].blocks.data[i];
+            if BLOCKS[b].removed != 0 || BLOCKS[b].term != Term::Branch {
                 continue;
             }
-            let value = ir_val(ir_arg(p, k));
-            let mut known = 0;
-            if isel_const(value, &known) {
-                let target = if known != 0 { s0 } else { s1 };
-                BLOCKS[pred].s0 = target;
-                add_pred_like(target, pred, b);
-            } else {
-                BLOCKS[pred].term = Term::Branch;
-                BLOCKS[pred].cond = value;
-                BLOCKS[pred].s0 = s0;
-                BLOCKS[pred].s1 = s1;
-                add_pred_like(s0, pred, b);
-                add_pred_like(s1, pred, b);
+            let p = BLOCKS[b].first;
+            let s0 = BLOCKS[b].s0;
+            let s1 = BLOCKS[b].s1;
+            // Only the phi, used by the branch alone.
+            if p == 0 || p != BLOCKS[b].cond || INSTS[p].op != Phi || INSTS[p].next != 0 || ISEL_USES[p] != 1
+                || s0 == s1 || s0 == b || s1 == b {
+                continue;
             }
-            remove_pred_at(b, k);
-            changed = true;
+            let mut k = 0;
+            while k < BLOCKS[b].preds.count {
+                let pred = BLOCKS[b].preds.data[k];
+                if BLOCKS[pred].term != Term::Jump || pred == b || pred == s0 || pred == s1 {
+                    k += 1;
+                    continue;
+                }
+                let value = ir_val(ir_arg(p, k));
+                let mut known = 0;
+                if isel_const(value, &known) {
+                    let target = if known != 0 { s0 } else { s1 };
+                    BLOCKS[pred].s0 = target;
+                    add_pred_like(target, pred, b);
+                } else {
+                    BLOCKS[pred].term = Term::Branch;
+                    BLOCKS[pred].cond = value;
+                    BLOCKS[pred].s0 = s0;
+                    BLOCKS[pred].s1 = s1;
+                    add_pred_like(s0, pred, b);
+                    add_pred_like(s1, pred, b);
+                }
+                remove_pred_at(b, k);
+                changed = true;
+            }
+            if BLOCKS[b].preds.count == 0 {
+                remove_block(b);
+            }
         }
-        if BLOCKS[b].preds.count == 0 {
-            remove_block(b);
+        if changed {
+            resolve_all(fi);
+            remove_unreachable(fi);
+            remove_trivial_phis(fi);
+            resolve_all(fi);
         }
+        changed
     }
-    if changed {
-        resolve_all(fi);
-        remove_unreachable(fi);
-        remove_trivial_phis(fi);
-        resolve_all(fi);
-    }
-    changed
 }
 
 // A branch on the condition its block's only predecessor branched on is
@@ -874,31 +926,33 @@ fn thread_phi_branches(fi: i64) -> bool {
 // any did.
 fn decide_repeated_branches(fi: i64) -> bool {
     let mut changed = false;
-    for i in 0..IRFUNCS[fi].blocks.count {
-        let b = IRFUNCS[fi].blocks.data[i];
-        // (A branch both ways to one block is two predecessor entries there:
-        // left alone.)
-        if BLOCKS[b].removed != 0 || BLOCKS[b].term != Term::Branch || BLOCKS[b].preds.count != 1
-            || BLOCKS[b].s0 == BLOCKS[b].s1 {
-            continue;
+    unsafe {
+        for i in 0..IRFUNCS[fi].blocks.count {
+            let b = IRFUNCS[fi].blocks.data[i];
+            // (A branch both ways to one block is two predecessor entries there:
+            // left alone.)
+            if BLOCKS[b].removed != 0 || BLOCKS[b].term != Term::Branch || BLOCKS[b].preds.count != 1
+                || BLOCKS[b].s0 == BLOCKS[b].s1 {
+                continue;
+            }
+            let p = BLOCKS[b].preds.data[0];
+            let cond = ir_val(BLOCKS[b].cond);
+            if p == b || BLOCKS[p].term != Term::Branch || ir_val(BLOCKS[p].cond) != cond
+                || BLOCKS[p].s0 == BLOCKS[p].s1 {
+                continue;
+            }
+            let taken = BLOCKS[p].s0 == b;
+            let keep = if taken { BLOCKS[b].s0 } else { BLOCKS[b].s1 };
+            let drop = if taken { BLOCKS[b].s1 } else { BLOCKS[b].s0 };
+            if keep != drop {
+                remove_pred(drop, b);
+            }
+            BLOCKS[b].term = Term::Jump;
+            BLOCKS[b].cond = 0;
+            BLOCKS[b].s0 = keep;
+            BLOCKS[b].s1 = 0;
+            changed = true;
         }
-        let p = BLOCKS[b].preds.data[0];
-        let cond = ir_val(BLOCKS[b].cond);
-        if p == b || BLOCKS[p].term != Term::Branch || ir_val(BLOCKS[p].cond) != cond
-            || BLOCKS[p].s0 == BLOCKS[p].s1 {
-            continue;
-        }
-        let taken = BLOCKS[p].s0 == b;
-        let keep = if taken { BLOCKS[b].s0 } else { BLOCKS[b].s1 };
-        let drop = if taken { BLOCKS[b].s1 } else { BLOCKS[b].s0 };
-        if keep != drop {
-            remove_pred(drop, b);
-        }
-        BLOCKS[b].term = Term::Jump;
-        BLOCKS[b].cond = 0;
-        BLOCKS[b].s0 = keep;
-        BLOCKS[b].s1 = 0;
-        changed = true;
     }
     changed
 }
@@ -906,45 +960,47 @@ fn decide_repeated_branches(fi: i64) -> bool {
 // ---- Scheduling ----
 
 fn schedule_function(fi: i64) {
-    isel_count_uses(fi);
-    let entry = IRFUNCS[fi].entry;
-    // Loop depths (by layout index), from the allocator's layout.
-    layout_blocks(fi);
-    // Constants go after the entry's parameters (and before its branch's
-    // comparison, which stays last).
-    let mut at = BLOCKS[entry].first;
-    while at != 0 && INSTS[at].op == Param {
-        at = INSTS[at].next;
-    }
-    let mut hoisted = 0;
-    for i in 0..IRFUNCS[fi].blocks.count {
-        let b = IRFUNCS[fi].blocks.data[i];
-        if BLOCKS[b].removed != 0 || BLOCKS[b].order < 0 {
-            continue;
+    unsafe {
+        isel_count_uses(fi);
+        let entry = IRFUNCS[fi].entry;
+        // Loop depths (by layout index), from the allocator's layout.
+        layout_blocks(fi);
+        // Constants go after the entry's parameters (and before its branch's
+        // comparison, which stays last).
+        let mut at = BLOCKS[entry].first;
+        while at != 0 && INSTS[at].op == Param {
+            at = INSTS[at].next;
         }
-        // The branch's comparison (or test), used by it alone, last.
-        let c = BLOCKS[b].cond;
-        if BLOCKS[b].term == Term::Branch && c != 0 && INSTS[c].block == b && INSTS[c].next != 0
-            && (INSTS[c].op == Cmp || INSTS[c].op == Test) && ISEL_USES[c] == 1 {
-            ir_unlink(c);
-            ir_append(b, c);
-        }
-        if b == entry || LDEPTH.data[BLOCKS[b].order] == 0 {
-            continue;
-        }
-        let mut v = BLOCKS[b].first;
-        while v != 0 {
-            let next = INSTS[v].next;
-            if INSTS[v].op == Const && ISEL_USES[v] > 0 && hoisted < 16 {
-                ir_unlink(v);
-                if at == 0 {
-                    ir_append(entry, v);
-                } else {
-                    ir_insert_before(at, v);
-                }
-                hoisted += 1;
+        let mut hoisted = 0;
+        for i in 0..IRFUNCS[fi].blocks.count {
+            let b = IRFUNCS[fi].blocks.data[i];
+            if BLOCKS[b].removed != 0 || BLOCKS[b].order < 0 {
+                continue;
             }
-            v = next;
+            // The branch's comparison (or test), used by it alone, last.
+            let c = BLOCKS[b].cond;
+            if BLOCKS[b].term == Term::Branch && c != 0 && INSTS[c].block == b && INSTS[c].next != 0
+                && (INSTS[c].op == Cmp || INSTS[c].op == Test) && ISEL_USES[c] == 1 {
+                ir_unlink(c);
+                ir_append(b, c);
+            }
+            if b == entry || LDEPTH.data[BLOCKS[b].order] == 0 {
+                continue;
+            }
+            let mut v = BLOCKS[b].first;
+            while v != 0 {
+                let next = INSTS[v].next;
+                if INSTS[v].op == Const && ISEL_USES[v] > 0 && hoisted < 16 {
+                    ir_unlink(v);
+                    if at == 0 {
+                        ir_append(entry, v);
+                    } else {
+                        ir_insert_before(at, v);
+                    }
+                    hoisted += 1;
+                }
+                v = next;
+            }
         }
     }
 }
