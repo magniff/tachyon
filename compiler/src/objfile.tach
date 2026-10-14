@@ -435,6 +435,11 @@ fn data_value(a: i64, b: i64, size: i64) {
 // section, as GNU as does (disassemblers show data in code, such as jump
 // tables, as data): (section, fragment, offset, kind) for each change.
 
+// Whether the object has mapping symbols (AArch64 ELF).
+static mut MAPPING: bool = false;
+// Whether an instruction may need more than its encoding: mapping symbols
+// or `.loc`s (one test on the common path).
+static mut HOOKS: bool = false;
 const MAP_CODE: i64 = 1;
 const MAP_DATA: i64 = 2;
 static mut MAP_STATE: [i64; 8] = [0; 8];
@@ -442,7 +447,7 @@ static mut MAPS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
 fn mapping(kind: i64) {
     unsafe {
-        if !ELF || X86 || MAP_STATE[CUR_SEC] == kind || is_debug(CUR_SEC) {
+        if MAP_STATE[CUR_SEC] == kind || is_debug(CUR_SEC) {
             return;
         }
         MAP_STATE[CUR_SEC] = kind;
@@ -456,10 +461,10 @@ fn mapping(kind: i64) {
 fn directive(a: i64, b: i64, rest: i64, end: i64) {
     unsafe {
         let t = BUFS[ASM].data;
-        if text_is(a, b, c".byte") || text_is(a, b, c".long") || text_is(a, b, c".quad") || text_is(a, b, c".space") {
-            mapping(MAP_DATA);
-        }
         if text_is(a, b, c".byte") {
+            if MAPPING {
+                mapping(MAP_DATA);
+            }
             let mut i = rest;
             while i < end {
                 let mut v = 0;
@@ -475,6 +480,9 @@ fn directive(a: i64, b: i64, rest: i64, end: i64) {
             return;
         }
         if text_is(a, b, c".long") || text_is(a, b, c".quad") {
+            if MAPPING {
+                mapping(MAP_DATA);
+            }
             split_operands(rest, end);
             for k in 0..OP_COUNT {
                 data_value(OP_START[k], OP_END[k], if t[b - 1] == 'g' { 4 } else { 8 });
@@ -492,6 +500,9 @@ fn directive(a: i64, b: i64, rest: i64, end: i64) {
             return;
         }
         if text_is(a, b, c".space") {
+            if MAPPING {
+                mapping(MAP_DATA);
+            }
             let n = parse_number(rest, end);
             buf_reserve(OBJ_BYTES, n);
             memset(&BUFS[OBJ_BYTES].data[BUFS[OBJ_BYTES].len], 0, n as u64);
@@ -552,6 +563,7 @@ fn directive(a: i64, b: i64, rest: i64, end: i64) {
             LOC_LINE = fields[1];
             LOC_COL = fields[2];
             LOC_PENDING = true;
+            HOOKS = true;
             return;
         }
         if text_is(a, b, c".file") {
@@ -616,13 +628,18 @@ fn assemble_line(a: i64, b: i64) {
             return;
         }
         split_operands(r, e);
-        if LOC_PENDING {
-            line_row();
+        if HOOKS {
+            // (a row of the line table, a mapping symbol)
+            if LOC_PENDING {
+                line_row();
+            }
+            if MAPPING {
+                mapping(MAP_CODE);
+            }
         }
         if X86 {
             x86_instruction(i, w);
         } else {
-            mapping(MAP_CODE);
             a64_instruction(i, w);
         }
     }
@@ -1451,6 +1468,9 @@ fn macho_write(path: *u8) {
             pad_to(out, sec_off[sec]);
             let start = BUFS[out].len;
             buf_bytes(out, buf_slice(SEC_BUF[sec]));
+            if !is_debug(sec) && sec != SEC_UNWIND {
+                continue;
+            }
             for r in 0..RELOC_COUNT {
                 if RELOCS[r].sec == sec && RELOCS[r].sym < 0 {
                     let at = start + RELOCS[r].offset;
@@ -1746,6 +1766,8 @@ static mut SECSYM: [i64; 8] = [0; 8];
 pub fn write_object(path: *u8) {
     unsafe {
         OBJ_BYTES = buf_new();
+        MAPPING = ELF && !X86;
+        HOOKS = MAPPING;
         CUR_SEC = SEC_TEXT;
         SEC_USED[SEC_TEXT] = true;
         new_frag(SEC_TEXT);

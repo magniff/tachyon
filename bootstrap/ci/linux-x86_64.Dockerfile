@@ -1,12 +1,13 @@
 # A minimal x86-64 Linux for checking the bootstrap chain from a fresh
 # clone: nothing but what docs/releases.md lists for x86_64-linux (git, a
 # C compiler with the libc headers, Rust through rustup) on Debian's slim
-# image, which has the POSIX utilities the scripts use. See
-# bootstrap/linux-check.sh, which builds and runs it.
+# image, which has the POSIX utilities the scripts use, and gdb for the
+# debugger check (0.11). See bootstrap/linux-check.sh, which builds and
+# runs it.
 FROM debian:bookworm-slim
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl git gcc libc6-dev \
+ && apt-get install -y --no-install-recommends ca-certificates curl git gcc libc6-dev gdb \
  && rm -rf /var/lib/apt/lists/*
 
 ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo PATH=/usr/local/cargo/bin:$PATH
