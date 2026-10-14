@@ -57,7 +57,7 @@ crate::geom::V2::len	clash/geom.tach:15:12	method	pub fn len(self: *V2) -> i64
 crate::myvec::Vec::len	clash/myvec.tach:11:12	method	pub fn len(self: *Vec) -> i64
 std::Vec::len	<std>:122:12	method	pub fn len(self: *Vec<T>) -> i64
 std::Buf::len	<std>:277:12	method	pub fn len(self: *Buf) -> i64
-std::HashMap::len	<std>:670:12	method	pub fn len(self: *HashMap<K, V>) -> i64
+std::HashMap::len	<std>:755:12	method	pub fn len(self: *HashMap<K, V>) -> i64
 $ refs V2::len
 # clash/geom.tach
 15:12	def	pub fn len(self: *V2) -> i64 {
@@ -131,7 +131,7 @@ std::Vec::push	<std>:174:12	method	pub fn push(self: *Vec<T>, x: T)
 std::Buf::push	<std>:281:12	method	pub fn push(self: *Buf, b: u8)
 $ refs Vec::push --count
 2	crate::myvec::Vec::push
-8	std::Vec::push
+9	std::Vec::push
 $ callers crate::myvec::Vec::push
 # clash/main.tach
 40:10	call	main	mine.push(v.len());

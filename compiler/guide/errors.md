@@ -99,14 +99,14 @@ error[parser error] expected a pattern, got 'string literal'
 tuples.
 
 ```tach
-#[derive(Debug)]
+#[derive(PartialEq, Debug)]
 struct P { x: i64 }
 ```
 ```err
-error[type error] #[derive] attributes are not implemented yet (check.unimplemented)
+error[type error] cannot derive 'PartialEq' (derivable: Eq, Ord, Hash, Debug, Clone)
 ```
-`#[derive(Eq, Ord, Hash, Debug, Clone)]` is coming in 0.15; `==` is
-structural without it.
+`#[derive(Eq, Ord, Hash, Debug, Clone)]` (0.15): Eq is Rust's PartialEq
+and Eq, Ord its PartialOrd and Ord; there is no Copy (every type copies).
 
 ```tach
 fn f<T>(x: T) -> T where T: Ord { x }

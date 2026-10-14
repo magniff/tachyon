@@ -1,8 +1,12 @@
 // ---- Clone and hashing (0.15) ----
 //
 // compiler/std/embed.sh appends this file to std.tach: the same module,
-// `std`. Clone, and the helpers `#[derive(Hash)]` uses
-// (docs/design/errors-formatting.md).
+// `std`. Clone, and the helpers `#[derive(Eq, Ord, Hash, Clone)]` calls on
+// each field (docs/design/errors-formatting.md). Numbers, bool, pointers,
+// slices, fn types, fieldless enums, and tuples and arrays of them clone
+// by copying, without an impl; tuples of Eq, Ord, Hash or Clone types are
+// Eq, Ord (lexicographic), Hash and Clone (element-wise), through the
+// functions at the end of this file, which the compiler calls.
 
 // A copy owning its memory (a Vec's elements are cloned).
 pub trait Clone { fn clone(self: *Self) -> Self; }
@@ -11,4 +15,238 @@ pub trait Clone { fn clone(self: *Self) -> Self; }
 #[inline]
 pub fn hash_mix(h: u64, x: u64) -> u64 {
     hash_u64(h ^ (x + 0x9e3779b97f4a7c15u64 + (h << 6) + (h >> 2)))
+}
+
+// `*a == *b`: structural, or the type's Eq impl (`[u8]`: by bytes).
+#[inline]
+pub fn eq_of<T: Eq>(a: *T, b: *T) -> bool {
+    *a == *b
+}
+
+// `a.cmp(b)`: negative, zero or positive as *a goes before, with or after
+// *b.
+#[inline]
+pub fn cmp_of<T: Ord>(a: *T, b: *T) -> i64 {
+    a.cmp(b)
+}
+
+// `x.hash()`.
+#[inline]
+pub fn hash_of<T: Hash>(x: *T) -> u64 {
+    x.hash()
+}
+
+// `x.clone()`.
+#[inline]
+pub fn clone_of<T: Clone>(x: *T) -> T {
+    x.clone()
+}
+
+// A new Vec of clones of the elements.
+impl<T: Clone> Clone for Vec<T> {
+    fn clone(self: *Vec<T>) -> Vec<T> {
+        let s = self.as_slice();
+        let mut v: Vec<T> = Vec::with_capacity(s.len);
+        for i in 0..s.len {
+            v.push(clone_of(&s[i]));
+        }
+        v
+    }
+}
+
+impl Clone for Buf {
+    #[inline]
+    fn clone(self: *Buf) -> Buf {
+        let mut b = Buf::new();
+        b.push_str(self.as_slice());
+        b
+    }
+}
+
+// A new map of clones of the entries.
+impl<K: Hash + Eq + Clone, V: Clone> Clone for HashMap<K, V> {
+    fn clone(self: *HashMap<K, V>) -> HashMap<K, V> {
+        let mut m: HashMap<K, V> = HashMap::new();
+        for i in 0..self.slots() {
+            if let Some(k) = self.key_at(i) {
+                let v = self.value_at(i).unwrap();
+                m.insert(clone_of(&k), clone_of(&v));
+            }
+        }
+        m
+    }
+}
+
+impl<T: Clone> Clone for Option<T> {
+    fn clone(self: *Option<T>) -> Option<T> {
+        match *self {
+            Some(x) => Some(clone_of(&x)),
+            None => None,
+        }
+    }
+}
+
+impl<T: Clone, E: Clone> Clone for Result<T, E> {
+    fn clone(self: *Result<T, E>) -> Result<T, E> {
+        match *self {
+            Ok(x) => Ok(clone_of(&x)),
+            Err(e) => Err(clone_of(&e)),
+        }
+    }
+}
+
+// ---- Clone, Eq, Ord and Hash without an impl (0.15) ----
+//
+// `x.clone()` on a type that copies (a number, bool, pointer, slice, fn,
+// fieldless enum, or a tuple or array of them) is copy_clone; `x.cmp(&y)`
+// on a float, pointer or fieldless enum is scalar_cmp; on a tuple of 2 to
+// 6 elements, `eq` (== when the structural one does not apply), `cmp` (<),
+// `hash` and `clone` are tupleN_eq, tupleN_cmp, tupleN_hash and
+// tupleN_clone (front/derive/intrinsic.tach). They are private: the
+// compiler calls them.
+
+#[inline]
+fn copy_clone<T>(self: *T) -> T {
+    *self
+}
+
+#[inline]
+fn scalar_cmp<T>(self: *T, other: *T) -> i64 {
+    if *self < *other { -1 } else if *other < *self { 1 } else { 0 }
+}
+
+fn tuple2_cmp<A: Ord, B: Ord>(self: *(A, B), other: *(A, B)) -> i64 {
+    let c = cmp_of(&(*self).0, &(*other).0);
+    if c != 0 { return c; }
+    cmp_of(&(*self).1, &(*other).1)
+}
+
+fn tuple3_cmp<A: Ord, B: Ord, C: Ord>(self: *(A, B, C), other: *(A, B, C)) -> i64 {
+    let mut c = cmp_of(&(*self).0, &(*other).0);
+    if c != 0 { return c; }
+    c = cmp_of(&(*self).1, &(*other).1);
+    if c != 0 { return c; }
+    cmp_of(&(*self).2, &(*other).2)
+}
+
+fn tuple4_cmp<A: Ord, B: Ord, C: Ord,
+D: Ord>(self: *(A, B, C, D), other: *(A, B, C, D)) -> i64 {
+    let mut c = cmp_of(&(*self).0, &(*other).0);
+    if c != 0 { return c; }
+    c = cmp_of(&(*self).1, &(*other).1);
+    if c != 0 { return c; }
+    c = cmp_of(&(*self).2, &(*other).2);
+    if c != 0 { return c; }
+    cmp_of(&(*self).3, &(*other).3)
+}
+
+fn tuple5_cmp<A: Ord, B: Ord, C: Ord, D: Ord, E: Ord>(self: *(A, B, C, D, E),
+    other: *(A, B, C, D, E)) -> i64 {
+    let mut c = cmp_of(&(*self).0, &(*other).0);
+    if c != 0 { return c; }
+    c = cmp_of(&(*self).1, &(*other).1);
+    if c != 0 { return c; }
+    c = cmp_of(&(*self).2, &(*other).2);
+    if c != 0 { return c; }
+    c = cmp_of(&(*self).3, &(*other).3);
+    if c != 0 { return c; }
+    cmp_of(&(*self).4, &(*other).4)
+}
+
+fn tuple6_cmp<A: Ord, B: Ord, C: Ord, D: Ord, E: Ord, F: Ord>(self: *(A, B, C, D, E, F),
+    other: *(A, B, C, D, E, F)) -> i64 {
+    let mut c = cmp_of(&(*self).0, &(*other).0);
+    if c != 0 { return c; }
+    c = cmp_of(&(*self).1, &(*other).1);
+    if c != 0 { return c; }
+    c = cmp_of(&(*self).2, &(*other).2);
+    if c != 0 { return c; }
+    c = cmp_of(&(*self).3, &(*other).3);
+    if c != 0 { return c; }
+    c = cmp_of(&(*self).4, &(*other).4);
+    if c != 0 { return c; }
+    cmp_of(&(*self).5, &(*other).5)
+}
+
+fn tuple2_eq<A: Eq, B: Eq>(self: *(A, B), other: *(A, B)) -> bool {
+    eq_of(&(*self).0, &(*other).0) && eq_of(&(*self).1, &(*other).1)
+}
+
+fn tuple3_eq<A: Eq, B: Eq, C: Eq>(self: *(A, B, C), other: *(A, B, C)) -> bool {
+    eq_of(&(*self).0, &(*other).0) && eq_of(&(*self).1, &(*other).1)
+        && eq_of(&(*self).2, &(*other).2)
+}
+
+fn tuple4_eq<A: Eq, B: Eq, C: Eq, D: Eq>(self: *(A, B, C, D), other: *(A, B, C, D)) -> bool {
+    eq_of(&(*self).0, &(*other).0) && eq_of(&(*self).1, &(*other).1)
+        && eq_of(&(*self).2, &(*other).2) && eq_of(&(*self).3, &(*other).3)
+}
+
+fn tuple5_eq<A: Eq, B: Eq, C: Eq, D: Eq, E: Eq>(self: *(A, B, C, D, E),
+    other: *(A, B, C, D, E)) -> bool {
+    eq_of(&(*self).0, &(*other).0) && eq_of(&(*self).1, &(*other).1)
+        && eq_of(&(*self).2, &(*other).2) && eq_of(&(*self).3, &(*other).3)
+        && eq_of(&(*self).4, &(*other).4)
+}
+
+fn tuple6_eq<A: Eq, B: Eq, C: Eq, D: Eq, E: Eq, F: Eq>(self: *(A, B, C, D, E, F),
+    other: *(A, B, C, D, E, F)) -> bool {
+    eq_of(&(*self).0, &(*other).0) && eq_of(&(*self).1, &(*other).1)
+        && eq_of(&(*self).2, &(*other).2) && eq_of(&(*self).3, &(*other).3)
+        && eq_of(&(*self).4, &(*other).4) && eq_of(&(*self).5, &(*other).5)
+}
+
+fn tuple2_hash<A: Hash, B: Hash>(self: *(A, B)) -> u64 {
+    hash_mix(hash_of(&(*self).0), hash_of(&(*self).1))
+}
+
+fn tuple3_hash<A: Hash, B: Hash, C: Hash>(self: *(A, B, C)) -> u64 {
+    let h = hash_mix(hash_of(&(*self).0), hash_of(&(*self).1));
+    hash_mix(h, hash_of(&(*self).2))
+}
+
+fn tuple4_hash<A: Hash, B: Hash, C: Hash, D: Hash>(self: *(A, B, C, D)) -> u64 {
+    let mut h = hash_mix(hash_of(&(*self).0), hash_of(&(*self).1));
+    h = hash_mix(h, hash_of(&(*self).2));
+    hash_mix(h, hash_of(&(*self).3))
+}
+
+fn tuple5_hash<A: Hash, B: Hash, C: Hash, D: Hash, E: Hash>(self: *(A, B, C, D, E)) -> u64 {
+    let mut h = hash_mix(hash_of(&(*self).0), hash_of(&(*self).1));
+    h = hash_mix(h, hash_of(&(*self).2));
+    h = hash_mix(h, hash_of(&(*self).3));
+    hash_mix(h, hash_of(&(*self).4))
+}
+
+fn tuple6_hash<A: Hash, B: Hash, C: Hash, D: Hash, E: Hash, F: Hash>(
+    self: *(A, B, C, D, E, F)) -> u64 {
+    let mut h = hash_mix(hash_of(&(*self).0), hash_of(&(*self).1));
+    h = hash_mix(h, hash_of(&(*self).2));
+    h = hash_mix(h, hash_of(&(*self).3));
+    h = hash_mix(h, hash_of(&(*self).4));
+    hash_mix(h, hash_of(&(*self).5))
+}
+
+fn tuple2_clone<A: Clone, B: Clone>(self: *(A, B)) -> (A, B) {
+    (clone_of(&(*self).0), clone_of(&(*self).1))
+}
+
+fn tuple3_clone<A: Clone, B: Clone, C: Clone>(self: *(A, B, C)) -> (A, B, C) {
+    (clone_of(&(*self).0), clone_of(&(*self).1), clone_of(&(*self).2))
+}
+
+fn tuple4_clone<A: Clone, B: Clone, C: Clone, D: Clone>(self: *(A, B, C, D)) -> (A, B, C, D) {
+    (clone_of(&(*self).0), clone_of(&(*self).1), clone_of(&(*self).2), clone_of(&(*self).3))
+}
+
+fn tuple5_clone<A: Clone, B: Clone, C: Clone, D: Clone, E: Clone>(self: *(A, B, C, D, E))
+    -> (A, B, C, D, E) {
+    (clone_of(&(*self).0), clone_of(&(*self).1), clone_of(&(*self).2), clone_of(&(*self).3),
+        clone_of(&(*self).4))
+}
+
+fn tuple6_clone<A: Clone, B: Clone, C: Clone, D: Clone, E: Clone, F: Clone>(
+    self: *(A, B, C, D, E, F)) -> (A, B, C, D, E, F) {
+    (clone_of(&(*self).0), clone_of(&(*self).1), clone_of(&(*self).2), clone_of(&(*self).3),
+        clone_of(&(*self).4), clone_of(&(*self).5))
 }
