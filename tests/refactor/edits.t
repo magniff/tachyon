@@ -101,18 +101,24 @@ $ edit delete Corner::High --dry-run
 -pub enum Corner { Low, High }
 +pub enum Corner { Low }
 $ edit delete Point.y
-main.tach:13:27: error[type error] unknown field 'y' in struct 'Point'
-main.tach:14:33: error[type error] unknown field 'y' in struct 'Point'
-./geom.tach:9:11: error[type error] struct 'Point' has no field 'y'
-./geom.tach:13:25: error[type error] unknown field 'y' in struct 'Point'
-./geom.tach:19:18: error[type error] struct 'Point' has no field 'y'
-error edit.breaks: 5 new errors; nothing written
+main.tach:13:27: error[type error] unknown field 'y' in struct 'Point'  [in crate::main]
+main.tach:14:33: error[type error] unknown field 'y' in struct 'Point'  [in crate::main]
+./geom.tach:9:11: error[type error] struct 'Point' has no field 'y'  [in crate::geom::area]
+./geom.tach:13:25: error[type error] unknown field 'y' in struct 'Point'  [in crate::geom::scale]
+./geom.tach:19:18: error[type error] struct 'Point' has no field 'y'  [in crate::geom::Point::sum]
+error edit.breaks: 5 new errors (5 in crate::main, crate::geom::area, crate::geom::scale and 1 more, which the edit does not change); nothing written
+note edit.refactor: the uses of crate::geom::Point no longer fit its new shape: a refactoring changes them with it, then the rest of the edit
+try: tachyonc query refs crate::geom::Point.y
+note edit.together: change crate::main, crate::geom::area, crate::geom::scale and 1 more in the same edit: one `edit apply FILE` with a block per item, or `edit patch --pairs FILE` with `@@ NAME` blocks
+try: tachyonc query show crate::main crate::geom::area crate::geom::scale crate::geom::Point::sum
 try: tachyonc edit delete Point.y --no-check
 [exit 1]
 ## An edit that adds an error writes nothing (--dry-run says so too).
 $ edit replace geom::area < $T/inputs/area_bool.tach
-main.tach:9:5: error[type error] expected 'i64', got 'bool'
-error edit.breaks: 1 new error; nothing written
+main.tach:9:5: error[type error] expected 'i64', got 'bool'  [in crate::total]
+error edit.breaks: 1 new error (1 in crate::total, which the edit does not change); nothing written
+note edit.together: change crate::total in the same edit: one `edit apply FILE` with a block per item, or `edit patch --pairs FILE` with `@@ NAME` blocks
+try: tachyonc query show crate::total
 try: tachyonc edit replace geom::area --no-check
 [exit 1]
 % git status --short
@@ -125,8 +131,8 @@ $ edit replace geom::area --dry-run < $T/inputs/area_bool.tach
 -    p.x * p.y
 +pub fn area(p: Point) -> bool {
 +    p.x > p.y
-main.tach:9:5: error[type error] expected 'i64', got 'bool'
-warning edit.breaks: 1 new error (dry run)
+main.tach:9:5: error[type error] expected 'i64', got 'bool'  [in crate::total]
+warning edit.breaks: 1 new error (1 in crate::total, which the edit does not change) (dry run)
 [exit 1]
 ## NAME must name one definition; replace needs its text on stdin.
 $ edit delete area
@@ -143,7 +149,7 @@ error edit.no-text: the new text is read from stdin; none was given
 try: tachyonc edit replace geom::area < new.tach
 [exit 2]
 $ edit move geom::area
-error edit.usage: unknown command 'move' (patch, replace, insert, delete, wrap, new-file)
+error edit.usage: unknown command 'move' (patch, apply, replace, insert, delete, wrap, new-file)
 [exit 2]
 ## Undo, edit by edit; a file changed since is not undone (--force does).
 $ undo
@@ -158,9 +164,9 @@ $ undo
 error undo.empty: no edit to undo
 [exit 1]
 $ edit delete shapes::area --no-check
-main.tach:15:27: error[type error] no 'area' in module 'shapes'
+main.tach:15:27: error[type error] no 'area' in module 'shapes'  [in crate::main]
 deleted crate::shapes::area	shapes.tach	+0 -4 lines
-warning edit.breaks: 1 new error; written anyway (--no-check)
+warning edit.breaks: 1 new error (1 in crate::main, which the edit does not change); written anyway (--no-check)
 try: tachyonc check
 $ check
 main.tach:15:27: error[type error] no 'area' in module 'shapes'
