@@ -10,7 +10,10 @@ one line `SEVERITY CODE: MESSAGE` followed by `try:` lines, as there.
 ```
 tachyonc edit patch TARGET --old TEXT --new TEXT [--old TEXT --new TEXT]... [--loose]
 tachyonc edit patch TARGET [--loose] < PAIRS   (0.12; see "Edits inside an item")
+tachyonc edit patch TARGET --pairs FILE [--loose]   (0.13)
 tachyonc edit insert --in TARGET --after|--before ANCHOR [--loose] < TEXT
+tachyonc edit wrap TARGET --in HEAD [--body | --lines A-B]   (0.13)
+tachyonc edit new-file PATH [--pub] < TEXT     (0.13) the file and its mod line
 tachyonc edit replace NAME [ROOT] < TEXT       the item's text becomes TEXT
 tachyonc edit insert --after|--before NAME [ROOT] < TEXT
 tachyonc edit delete NAME [ROOT]
@@ -113,7 +116,11 @@ patched crate::middle::range::decide→compiler/src/middle/range.tach→+1 -1 li
   name (`main::header`). An item's text is its lines with the comment and attribute
   lines above it, as `query show` prints them.
 - **Each OLD must occur exactly once** in TARGET's text, matched byte for
-  byte. Every OLD is found in the text as it was before the edit, the
+  byte; it may start and end inside a line, in every form (0.13). When
+  some of its matches are whole lines (from a line's start or its
+  indentation to a line's end), only those count: `total` names the line
+  `    total`, not a part of `    total += i;`. Every OLD is found in the
+  text as it was before the edit, the
   replacements must not overlap (`error patch.overlap`), and all pairs
   are one edit: checked once, written all or not at all, undone by one
   `undo`.
@@ -127,6 +134,14 @@ error patch.no-match: OLD 1 is not in crate::calc::clamp; nearest, line 5: if v 
 try: tachyonc edit patch clamp --old 'v < lo' --new 'v <= lo'
 ```
 
+  An OLD of several lines whose first lines are there together says
+  where they match and how its next line differs (0.13):
+
+```
+error patch.no-match: OLD 1 is not in crate::calc::sum_to; its lines 1-2 match lines 18-19, then its line 3 'i += 2;' is not line 20 'i += 1;'
+try: tachyonc query text calc.tach:18-20
+```
+
 - **Several matches**: `error patch.ambiguous` with their lines, and for
   each (at most three) `try:` the command with OLD and NEW widened to the
   lines around it, a line up and down at a time, until it is unique:
@@ -135,6 +150,16 @@ try: tachyonc edit patch clamp --old 'v < lo' --new 'v <= lo'
 error patch.ambiguous: OLD 1 occurs 2 times in crate::calc::clamp, lines 6, 9; give more of the text around it
 try: tachyonc edit patch clamp --old 'return lo;' --new 'return 0 + lo;'
 try: tachyonc edit patch clamp --old 'return hi;' --new 'return 0 + hi;'
+```
+
+  Pairs of several lines, and pairs given as blocks, are not put on the
+  command line (agent harnesses refuse `$'...'` quoting): they are
+  written to `try-N.pairs` in the journal's directory, and the `try:`
+  line is the command with `--pairs` (0.13; `$'...'` without a git
+  checkout):
+
+```
+try: tachyonc edit patch clamp --pairs .git/tachyon-edits/try-1.pairs
 ```
 
 - A match of whole lines replaced by an empty NEW removes the lines (and
@@ -150,10 +175,12 @@ try: tachyonc edit patch clamp --old 'return hi;' --new 'return 0 + hi;'
   edit that adds errors, as for every edit.
 - Only the summary line is printed, never the file.
 
-### Pairs on stdin
+### Pairs on stdin, or in a file
 
 Without `--old`, the pairs are read from stdin, for text of several
-lines without shell quoting. A pair is a block of whole lines:
+lines without shell quoting; `--pairs FILE` (0.13) reads them from FILE,
+for harnesses that refuse a redirection or `$'...'`. A pair is a block
+of lines:
 
 ```
 <<<<<<< OLD
@@ -169,10 +196,10 @@ lines without shell quoting. A pair is a block of whole lines:
 The markers are the line's first seven characters (`<<<<<<<`,
 `=======`, `>>>>>>>`), alone or followed by a blank and a word; blank
 lines between blocks are ignored, anything else outside a block is an
-error (`error patch.format: stdin line N: ...`). OLD and NEW are the
-lines between the markers, joined by newlines; OLD must match whole
-lines (from a line's start or its indentation to a line's end), so
-`    total` does not match inside `    total += i;`. An empty NEW removes
+error (`error patch.format: stdin line N: ...`, `FILE line N`). OLD and
+NEW are the lines between the markers, joined by newlines; OLD is
+matched as on the command line (0.13: its first and last lines may be
+parts of lines; before, they had to be whole). An empty NEW removes
 OLD's lines.
 
 ### insert --in
@@ -190,6 +217,47 @@ relative to them.
 $ tachyonc edit insert --in calc::sum_to --after 'while i <= n {' < stmt.tach
 inserted in crate::calc::sum_to→calc.tach→+3 -0 lines
 ```
+
+## edit wrap
+
+`edit wrap TARGET --in HEAD [--body | --lines A-B]` (0.13) puts a
+function's body (`--body`, the default; its braces on lines of their
+own) or lines A to B of TARGET (the file's line numbers, as `query show`
+prints them; `--lines A` for one) in a block `HEAD { ... }`, every line
+one level (4 spaces) deeper; HEAD is `unsafe`, `loop`, `if c`, or `''`
+for a bare block. One edit: a wrap that breaks the program (a `let`
+whose name is used after the block) is refused with the errors.
+
+```
+$ tachyonc edit wrap calc::first --in unsafe
+wrapped the body of crate::calc::first in unsafe→calc.tach→+4 -2 lines
+$ tachyonc edit wrap calc.tach:19 --in '' --lines 17-21
+wrapped lines 17-21 of crate::calc::sum_to in a block→calc.tach→+6 -4 lines
+```
+
+`error edit.wrap` when TARGET is no function with a body (give
+`--lines`) or the lines are not all in it; `error edit.layout` when the
+body's braces share their lines with code.
+
+## edit new-file
+
+`edit new-file PATH [--pub] < TEXT` (0.13) makes file PATH with TEXT and
+its `mod NAME;` line (`pub mod` with `--pub`) in the file of the module
+whose child it is, as the module loader finds children (next to the
+root or a `mod.tach`; else in the directory named after the parent's
+file; `a/b/mod.tach` for a module with children of its own), in one
+checked edit: the new module is at once a TARGET of `edit patch` and the
+other commands. The `mod` line goes after the parent's last `mod NAME;`
+line, as `refactor new-module` puts it.
+
+```
+$ tachyonc edit new-file lib/extra.tach --pub < extra.tach
+made crate::lib::extra→2 files→+6 -0 lines
+```
+
+`error edit.exists` when PATH exists; `error edit.no-parent` when no
+file of the program would have it as a child's file (`refactor
+new-module` makes the modules of a path).
 
 ## Items as text
 
@@ -293,7 +361,7 @@ there are rewritten, and only the re-exports there removed.
 through (`use crate::f` reaching the root's `use util::f`): it is used,
 although its file does not name it; `query unused` likewise.
 
-`--in FILE|MODULE` keeps the fixes of one file or module (matched like query's `--in`; none:
+`--in FILE|MODULE` keeps the fixes of one file or module, its child modules included for every fix (0.13; before, missing imports were fixed in the module alone) (matched like query's `--in`; none:
 `error fix.bad-in`). A fix can let the checker see more: the checker
 stops at the first unknown name of a statement, so its second appears
 only once the first is imported. So fix runs again on the edited program
@@ -437,9 +505,11 @@ Exit 1 when a file is over, 0 when none is.
 | `patch.no-match` | error | 1 | an OLD or ANCHOR is not in TARGET (with the nearest line) | the command with that line's text, or with `--loose`, or `query show FILE:LINE` |
 | `patch.ambiguous` | error | 1 | an OLD or ANCHOR occurs several times (their lines) | the command with more context around each |
 | `patch.overlap` | error | 1 | two OLDs overlap | |
-| `patch.format` | error | 2 | the pairs on stdin are not blocks | |
+| `patch.format` | error | 2 | the pairs on stdin (or in --pairs FILE) are not blocks | |
 | `edit.not-source` | error | 1 | NAME is std's or a C header's | |
-| `edit.layout` | error | 1 | insert next to an item that shares its line | |
+| `edit.layout` | error | 1 | insert next to an item that shares its line; wrap a body whose braces share lines with code | |
+| `edit.wrap` | error | 1 | (0.13) wrap: no function with a body, or lines not in TARGET | `query show NAME` |
+| `edit.no-parent` | error | 1 | (0.13) new-file: no file of the program would hold PATH as a child's file | |
 | `edit.unchanged` | note | 0 | the edit changes nothing | |
 | `edit.unchecked` | warning | | the check could not run | |
 | `edit.exists`, `edit.write` | error | 1 | a file to make exists, a file cannot be written | |
@@ -464,8 +534,7 @@ every command.
 
 - `edit patch` matches text, not syntax: an OLD inside a comment or a
   string is an occurrence like any other, and NEW is not re-indented
-  without `--loose` (wrapping a body in a new block re-indents every line
-  of it: `edit replace` the item).
+  without `--loose` (wrapping lines in a new block: `edit wrap`, 0.13).
 
 - The check compares errors by file and message: an edit that fixes one
   error and makes another with the same message in the same file is not

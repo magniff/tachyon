@@ -35,9 +35,9 @@ try: tachyonc edit patch sum_to --old 'i += 1;' --new 'i -= 1;'
 [exit 1]
 $ edit patch clamp --old '}' --new '} '
 error patch.ambiguous: OLD 1 occurs 3 times in crate::calc::clamp, lines 7, 10, 12; give more of the text around it
-try: tachyonc edit patch clamp --old $'return lo;\n    }\n    if v >= hi {' --new $'return lo;\n    } \n    if v >= hi {'
-try: tachyonc edit patch clamp --old $'return hi;\n    }\n    v' --new $'return hi;\n    } \n    v'
-try: tachyonc edit patch clamp --old $'v\n}' --new $'v\n} '
+try: tachyonc edit patch clamp --pairs .git/tachyon-edits/try-1.pairs
+try: tachyonc edit patch clamp --pairs .git/tachyon-edits/try-2.pairs
+try: tachyonc edit patch clamp --pairs .git/tachyon-edits/try-3.pairs
 [exit 1]
 ## OLD nowhere: the nearest line, and the command with its text.
 $ edit patch clamp --old 'v < low' --new 'v <= lo'
@@ -109,7 +109,7 @@ try: tachyonc edit patch sum_to --old OLD --new NEW
 ## --loose: other indentation; NEW indented like the text it replaces.
 $ edit patch clamp < $T/inputs/clamp_loose.patch
 error patch.no-match: OLD 1 is not in crate::calc::clamp as written; with other blanks, at line 8
-try: tachyonc edit patch clamp --loose < pairs.txt
+try: tachyonc edit patch clamp --pairs .git/tachyon-edits/try-1.pairs --loose
 [exit 1]
 $ edit patch clamp --loose < $T/inputs/clamp_loose.patch
 patched crate::calc::clamp	calc.tach	+1 -0 lines
@@ -207,12 +207,19 @@ index 10b99a1..2c6ae04 100644
      total
 $ undo
 undid inserted in crate::calc::sum_to	calc.tach	+3 -0 lines
-$ edit insert --in sum_to --before 'total' < $T/inputs/stmt.tach
-error patch.ambiguous: ANCHOR occurs 3 times in crate::calc::sum_to, lines 16, 19, 22; give more of the text around it
+$ edit insert --in sum_to --before 'mut' < $T/inputs/stmt.tach
+error patch.ambiguous: ANCHOR occurs 2 times in crate::calc::sum_to, lines 16, 17; give more of the text around it
 try: tachyonc edit insert --in sum_to --before 'let mut total = 0;' < text.tach
-try: tachyonc edit insert --in sum_to --before 'total += i;' < text.tach
-try: tachyonc edit insert --in sum_to --before $'total\n}' < text.tach
+try: tachyonc edit insert --in sum_to --before 'let mut i = 1;' < text.tach
 [exit 1]
+## (0.13: an anchor that is a whole line somewhere names that line)
+$ edit insert --in sum_to --before 'total' --dry-run < $T/inputs/stmt.tach
+--- a/calc.tach
++++ b/calc.tach
+@@ -21,0 +22,3 @@
++    if i == 3 {
++        total += 0;
++    }
 $ edit insert --in sum_to --after 'i = 1;' < $T/inputs/stmt.tach
 inserted in crate::calc::sum_to	calc.tach	+3 -0 lines
 $ edit insert --in sum_to --after 'i += 1;'

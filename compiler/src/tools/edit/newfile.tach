@@ -1,0 +1,153 @@
+// `edit new-file` (0.13; docs/refactor.md): a file of the program made
+// with its `mod` line,
+//
+//   tachyonc edit new-file PATH [--pub] [ROOT] < TEXT
+//
+// PATH (`a/b.tach`, or `a/b/mod.tach`) is made with TEXT, and `mod b;`
+// (`pub mod b;` with --pub) goes into the file of the module whose child
+// it is, as the module loader finds children (next to the root or a
+// `mod.tach`, else in the directory named after the parent's file): one
+// edit of the engine, checked, so the new module is at once a TARGET of
+// `edit patch` and the other commands.
+
+use crate::base::{
+    BUFS, FILES, FILE_COUNT, IntVec, SYMS, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, streq,
+};
+use crate::front::cpp::directives::file_exists;
+use crate::tools::edit::{TARGET, edit_new_file};
+use crate::tools::edit::apply::apply_edit;
+use crate::tools::edit::cli::take_edit_option;
+use crate::tools::proc::{absolute_path, read_stdin};
+use crate::tools::query::{c_slice, ends_with_c, load_program, root_or_diag};
+use crate::tools::query::defs::mod_fqn;
+use crate::tools::query::diagnostics::{ROOT_GIVEN, diag, program_errors, try_begin, try_end};
+use crate::tools::refactor_mod::{add_mod_line, base_name, child_path, is_mod_file};
+use crate::tools::refactor_mod::cli::is_ident;
+
+pub fn run_new_file(argc: i64, argv: **u8) -> i64 {
+    unsafe {
+        let mut root = 0 as *u8;
+        let mut words = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut public = false;
+        let mut i = 3;
+        while i < argc {
+            let a = argv[i];
+            if streq(a, c"--pub") {
+                public = true;
+            } else if take_edit_option(argc, argv, &i, &root) {
+            } else if a[0] == '-' && a[1] == '-' {
+                return usage(a, c": an unknown option");
+            } else {
+                words.push(a as i64);
+            }
+            i += 1;
+        }
+        if words.count == 2 && root == 0 as *u8 && ends_with_c(words.data[1] as *u8, c".tach") {
+            root = words.data[1] as *u8;
+            words.count = 1;
+        }
+        if words.count != 1 {
+            return usage(c"new-file", if words.count == 0 { c": a PATH is needed" } else { c": one PATH at a time" });
+        }
+        let path = words.data[0] as *u8;
+        if !ends_with_c(path, c".tach") {
+            return usage(path, c": PATH is a .tach file");
+        }
+        // The module's name: the file's, or its directory's for a mod.tach.
+        let dir = is_mod_file(path);
+        let mut name = base_name(path);
+        name = name[0..name.len - 5];
+        if dir {
+            let p = c_slice(path);
+            let e = if p.len > 9 { p.len - 9 } else { 0 };
+            let mut s = e;
+            while s > 0 && p[s - 1] != '/' {
+                s -= 1;
+            }
+            name = p[s..e];
+        }
+        if !is_ident(name) {
+            return usage(path, c": the module's name is not a name");
+        }
+        let input = buf_new();
+        if !read_stdin(input) || BUFS[input].len == 0 {
+            let d = diag(c"error", c"edit.no-text");
+            buf_str(d, c"the file's text is read from stdin; none was given\n");
+            let out = try_begin(c"new-file", c_slice(path), true);
+            buf_str(out, c" < new.tach");
+            try_end(out);
+            return 2;
+        }
+        ROOT_GIVEN = root;
+        root = root_or_diag(root, c"new-file", c_slice(path), true);
+        if root == 0 as *u8 {
+            return 2;
+        }
+        if !load_program(root, TARGET) {
+            program_errors(c"error", root, true);
+            return 1;
+        }
+        if file_exists(path) {
+            let d = diag(c"error", c"edit.exists");
+            buf_str(d, c"'");
+            buf_str(d, path);
+            buf_str(d, c"' exists already; nothing written\n");
+            return 1;
+        }
+        // The parent: the file of the program whose child's file is PATH.
+        let want = absolute_path(path);
+        // (the file is made as the program spells it: the overlay of the
+        // check is found by that name)
+        let mut parent = -1;
+        let mut spelled = path;
+        for g in 0..FILE_COUNT {
+            if FILES[g].path[0] == '<' {
+                continue;
+            }
+            let c = child_path(FILES[g].path, FILES[g].module == 0, name, dir);
+            if streq(c, path) || streq(absolute_path(c), want) {
+                parent = g;
+                spelled = c;
+                break;
+            }
+        }
+        if parent < 0 {
+            let d = diag(c"error", c"edit.no-parent");
+            buf_str(d, c"no file of the program has ");
+            buf_str(d, path);
+            buf_str(d, c" as a child's file (a mod.tach or the root next to it, or the file its directory is named after)\n");
+            try_end(try_begin(c"items", c_slice(c""), false));
+            return 1;
+        }
+        let line = buf_new();
+        buf_str(line, if public { c"pub mod " } else { c"mod " });
+        buf_bytes(line, name);
+        buf_byte(line, ';');
+        add_mod_line(parent, buf_slice(line));
+        let text = buf_new();
+        buf_bytes(text, buf_slice(input));
+        while BUFS[text].len > 0 && (BUFS[text].data[BUFS[text].len - 1] == '\n' || BUFS[text].data[BUFS[text].len - 1] == ' ') {
+            BUFS[text].len -= 1;
+        }
+        buf_byte(text, '\n');
+        edit_new_file(spelled, text);
+        let what = buf_new();
+        buf_str(what, c"made ");
+        buf_bytes(what, SYMS[mod_fqn(FILES[parent].module)].text);
+        buf_str(what, c"::");
+        buf_bytes(what, name);
+        apply_edit(buf_slice(what), root)
+    }
+}
+
+fn usage(what: *u8, message: *u8) -> i64 {
+    unsafe {
+        let d = diag(c"error", c"edit.usage");
+        buf_str(d, what);
+        buf_str(d, message);
+        buf_byte(d, '\n');
+        let out = try_begin(c"new-file a/b.tach < b.tach", c_slice(c""), false);
+        try_end(out);
+        2
+    }
+}
