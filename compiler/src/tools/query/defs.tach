@@ -1,0 +1,434 @@
+// The definitions `query` answers about (0.11): every item of the program
+// as parsed, a Def (kind, name, module, position, `pub`), collected before
+// the checker runs; their paths (`fqn`, the `path` partial names match,
+// `owner`, `tr`) once it has; and the matching of a NAME against those
+// paths, by whole segments.
+
+use crate::base::{
+    IntVec, SYMS, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, grow, intern, intern_c, strlen,
+};
+use crate::front::ast::{NODES, NodeKind, child};
+use crate::front::check::{GMETHODS, GMETHOD_COUNT};
+use crate::front::modules::{C_MODULE, MODULES, STD_MODULE, child_module, module_count, module_of};
+use crate::front::parser::ITEM_PUBLIC;
+use crate::front::traits::impl_trait_node;
+use crate::front::types::{ENUMS, METHODS, METHOD_COUNT, STRUCTS, TYPES, TyKind};
+use crate::middle::lower::HMap;
+use crate::tools::query::positions::{collapse, name_position, sort_by_position};
+
+// ---- Definitions ----
+
+pub const K_FN: i64 = 1;
+// A function of an impl block (`impl T { ... }`).
+pub const K_METHOD: i64 = 2;
+// A function of an `impl Trait for T` block.
+pub const K_IMPL_METHOD: i64 = 3;
+// A function declared by a trait (with or without a default body).
+pub const K_TRAIT_FN: i64 = 4;
+pub const K_STRUCT: i64 = 5;
+pub const K_ENUM: i64 = 6;
+pub const K_VARIANT: i64 = 7;
+pub const K_FIELD: i64 = 8;
+pub const K_TRAIT: i64 = 9;
+pub const K_CONST: i64 = 10;
+pub const K_STATIC: i64 = 11;
+pub const K_ALIAS: i64 = 12;
+pub const K_MOD: i64 = 13;
+
+pub fn kind_name(k: i64) -> *u8 {
+    if k == K_FN { return c"fn"; }
+    if k == K_METHOD || k == K_IMPL_METHOD { return c"method"; }
+    if k == K_TRAIT_FN { return c"trait-method"; }
+    if k == K_STRUCT { return c"struct"; }
+    if k == K_ENUM { return c"enum"; }
+    if k == K_VARIANT { return c"variant"; }
+    if k == K_FIELD { return c"field"; }
+    if k == K_TRAIT { return c"trait"; }
+    if k == K_CONST { return c"const"; }
+    if k == K_STATIC { return c"static"; }
+    if k == K_ALIAS { return c"type"; }
+    c"mod"
+}
+
+// A definition: its item node (as parsed), name, module, the definition
+// it belongs to (a field's struct, a variant's enum, a function's trait;
+// -1), the position of its name, whether it is `pub`; after the checker,
+// its path (`fqn`), the path partial names are matched against (`path`:
+// a trait impl's function as `Type::f`), the path of its type (`owner`,
+// for functions of impl blocks) and of its trait (`tr`), as symbols.
+pub struct Def {
+    pub node: i64, pub kind: i64, pub name: i64, pub module: i64, pub parent: i64, pub start: i64,
+    pub end: i64, pub name_pos: i64, pub public: bool, pub impl_node: i64,
+    pub fqn: i64, pub path: i64, pub owner: i64, pub tr: i64,
+}
+
+pub static mut DEFS: *Def = 0 as *Def;
+pub static mut DEF_COUNT: i64 = 0;
+static mut DEF_CAP: i64 = 0;
+// Definition + 1 by the start of its node + 1 (a copy of a node made for
+// a generic instance starts where the node does).
+static mut DEF_AT: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+// Per module: the definition of its `mod` item, or -1.
+pub static mut MOD_DEF: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// The names of `use p::x as y;`: (y, the position of x), in pairs.
+pub static mut ALIASES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The first `import "h.h" as c;`: its module and name (-1: none).
+static mut C_ALIAS_MODULE: i64 = -1;
+static mut C_ALIAS: i64 = -1;
+
+fn add_def(node: i64, kind: i64, name: i64, parent: i64) -> i64 {
+    unsafe {
+        DEFS = grow_defs();
+        let d = DEF_COUNT;
+        DEFS[d] = Def {
+            node: node, kind: kind, name: name, module: module_of(node), parent: parent,
+            start: NODES[node].start, end: NODES[node].end,
+            name_pos: name_position(NODES[node].start, name), public: (NODES[node].p & ITEM_PUBLIC) != 0,
+            impl_node: 0, fqn: -1, path: -1, owner: -1, tr: -1,
+        };
+        DEF_COUNT += 1;
+        DEF_AT.put(NODES[node].start + 1, d + 1);
+        d
+    }
+}
+
+fn grow_defs() -> *Def {
+    unsafe { grow(DEFS, DEF_COUNT, &DEF_CAP) }
+}
+
+// The definition whose node is n (or a copy of it), or -1.
+pub fn def_of_node(n: i64) -> i64 {
+    unsafe {
+        if n <= 0 {
+            return -1;
+        }
+        DEF_AT.get(NODES[n].start + 1) - 1
+    }
+}
+
+// The definitions of the program's items, as parsed.
+pub fn collect_defs(program: i64) {
+    unsafe {
+        for i in 0..NODES[program].count {
+            let item = child(program, i);
+            let kind = NODES[item].kind;
+            let name = NODES[item].a;
+            if kind == NodeKind::Fn {
+                add_def(item, if NODES[item].h != 0 { K_METHOD } else { K_FN }, name, -1);
+            } else if kind == NodeKind::ExternFn {
+                add_def(item, K_FN, name, -1);
+            } else if kind == NodeKind::Struct || kind == NodeKind::Enum || kind == NodeKind::Trait {
+                let k = if kind == NodeKind::Struct { K_STRUCT } else if kind == NodeKind::Enum { K_ENUM } else { K_TRAIT };
+                let d = add_def(item, k, name, -1);
+                let sub = if kind == NodeKind::Struct { K_FIELD } else if kind == NodeKind::Enum { K_VARIANT } else { K_TRAIT_FN };
+                for j in 0..NODES[item].count {
+                    let c = child(item, j);
+                    add_def(c, sub, NODES[c].a, d);
+                }
+            } else if kind == NodeKind::Const {
+                add_def(item, K_CONST, name, -1);
+            } else if kind == NodeKind::Static {
+                add_def(item, K_STATIC, name, -1);
+            } else if kind == NodeKind::TypeAlias {
+                add_def(item, K_ALIAS, name, -1);
+            } else if kind == NodeKind::Mod {
+                add_def(item, K_MOD, name, -1);
+            } else if kind == NodeKind::Use && NODES[item].d == 2 && NODES[item].a != 0 && C_ALIAS < 0 {
+                C_ALIAS = NODES[item].a;
+                C_ALIAS_MODULE = module_of(item);
+            } else if kind == NodeKind::Use && NODES[item].d != 2 {
+                for j in 0..NODES[item].count {
+                    let id = child(item, j);
+                    if NODES[id].b != 0 {
+                        ALIASES.push(NODES[id].b);
+                        ALIASES.push(NODES[id].start);
+                    }
+                }
+            }
+        }
+        // The functions of trait impls (pushed before their Impl node).
+        for i in 0..NODES[program].count {
+            let item = child(program, i);
+            if NODES[item].kind != NodeKind::Impl {
+                continue;
+            }
+            for j in 0..NODES[item].count {
+                let d = def_of_node(child(item, j));
+                if d >= 0 {
+                    DEFS[d].kind = K_IMPL_METHOD;
+                    DEFS[d].impl_node = item;
+                }
+            }
+        }
+        for _ in 0..module_count() {
+            MOD_DEF.push(-1);
+        }
+        for d in 0..DEF_COUNT {
+            if DEFS[d].kind == K_MOD {
+                let m = child_module(DEFS[d].module, DEFS[d].name);
+                if m >= 0 {
+                    MOD_DEF.data[m] = d;
+                }
+            }
+        }
+    }
+}
+
+// ---- Paths ----
+
+// The path of module m: `crate`, `crate::a::b`, `std`, or for the C
+// headers' declarations the name the first `import ... as c` gives them
+// (`crate::c`).
+static mut MOD_FQN: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+pub fn mod_fqn(m: i64) -> i64 {
+    unsafe {
+        while MOD_FQN.count < module_count() {
+            MOD_FQN.push(-1);
+        }
+        if m < 0 || m >= MOD_FQN.count {
+            return intern_c(c"crate");
+        }
+        if MOD_FQN.data[m] >= 0 {
+            return MOD_FQN.data[m];
+        }
+        let mut s = 0;
+        if m == 0 {
+            s = intern_c(c"crate");
+        } else if m == STD_MODULE {
+            s = intern_c(c"std");
+        } else if m == C_MODULE {
+            s = if C_ALIAS >= 0 { join(mod_fqn(C_ALIAS_MODULE), c"::", C_ALIAS) } else { intern_c(c"c") };
+        } else {
+            s = join(mod_fqn(MODULES[m].parent), c"::", MODULES[m].name);
+        }
+        MOD_FQN.data[m] = s;
+        s
+    }
+}
+
+fn join(a: i64, sep: *u8, b: i64) -> i64 {
+    unsafe {
+        let out = buf_new();
+        buf_bytes(out, SYMS[a].text);
+        buf_str(out, sep);
+        buf_bytes(out, SYMS[b].text);
+        intern(buf_slice(out))
+    }
+}
+
+// The text of node n's source, its whitespace collapsed.
+fn node_text(n: i64) -> i64 {
+    unsafe {
+        let out = buf_new();
+        collapse(out, NODES[n].start, NODES[n].end);
+        intern(buf_slice(out))
+    }
+}
+
+// The paths of the definitions, once the checker has resolved the types
+// of the impl blocks and the traits of the trait impls.
+pub fn finish_defs() {
+    unsafe {
+        // The type of each function of an impl block: its item node.
+        let mut owners = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        for i in 0..METHOD_COUNT {
+            let t = METHODS[i].ty;
+            let node = if TYPES[t].kind == TyKind::Struct {
+                STRUCTS[TYPES[t].a].node
+            } else if TYPES[t].kind == TyKind::Enum {
+                ENUMS[TYPES[t].a].node
+            } else {
+                0
+            };
+            if node != 0 {
+                owners.put(METHODS[i].f + 1, node);
+            }
+        }
+        for i in 0..GMETHOD_COUNT {
+            let tpl = GMETHODS[i].ty;
+            owners.put(GMETHODS[i].f + 1, if tpl > 0 { STRUCTS[tpl - 1].node } else { ENUMS[-tpl - 1].node });
+        }
+        let mut trait_names = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        for d in 0..DEF_COUNT {
+            let k = DEFS[d].kind;
+            if k == K_TRAIT {
+                trait_names.put(DEFS[d].name + 1, trait_names.get(DEFS[d].name + 1) + 1);
+            }
+            if DEFS[d].parent >= 0 || k == K_METHOD || k == K_IMPL_METHOD {
+                continue;
+            }
+            if k == K_MOD {
+                let m = child_module(DEFS[d].module, DEFS[d].name);
+                DEFS[d].fqn = if m >= 0 { mod_fqn(m) } else { join(mod_fqn(DEFS[d].module), c"::", DEFS[d].name) };
+            } else {
+                DEFS[d].fqn = join(mod_fqn(DEFS[d].module), c"::", DEFS[d].name);
+            }
+            DEFS[d].path = DEFS[d].fqn;
+        }
+        for d in 0..DEF_COUNT {
+            let k = DEFS[d].kind;
+            if DEFS[d].parent >= 0 {
+                let p = DEFS[d].parent;
+                DEFS[d].owner = DEFS[p].fqn;
+                DEFS[d].fqn = join(DEFS[p].fqn, if k == K_FIELD { c"." } else { c"::" }, DEFS[d].name);
+                DEFS[d].path = DEFS[d].fqn;
+                continue;
+            }
+            if k != K_METHOD && k != K_IMPL_METHOD {
+                continue;
+            }
+            let node = DEFS[d].node;
+            let f = NODES[node].x - 1;
+            let mut owner = -1;
+            if f >= 0 {
+                let od = def_of_node(owners.get(f + 1));
+                if od >= 0 {
+                    owner = DEFS[od].fqn;
+                }
+            }
+            if owner < 0 {
+                // (a builtin type, or an impl the checker left out)
+                let h = NODES[node].h;
+                owner = if NODES[h].kind == NodeKind::TyName { NODES[h].a } else { node_text(h) };
+            }
+            DEFS[d].owner = owner;
+            DEFS[d].path = join(owner, c"::", DEFS[d].name);
+            if k == K_METHOD {
+                DEFS[d].fqn = DEFS[d].path;
+                continue;
+            }
+            // `<Type as Trait>::f`: the trait by its name, or by its path
+            // when two traits have that name.
+            let mut tr = -1;
+            let mut shown = -1;
+            let td = if f >= 0 { def_of_node(impl_trait_node(f)) } else { -1 };
+            if td >= 0 {
+                tr = DEFS[td].fqn;
+                shown = if trait_names.get(DEFS[td].name + 1) > 1 { DEFS[td].fqn } else { DEFS[td].name };
+            } else {
+                tr = node_text(NODES[DEFS[d].impl_node].a);
+                shown = tr;
+            }
+            DEFS[d].tr = tr;
+            let out = buf_new();
+            buf_byte(out, '<');
+            buf_bytes(out, SYMS[owner].text);
+            buf_str(out, c" as ");
+            buf_bytes(out, SYMS[shown].text);
+            buf_str(out, c">::");
+            buf_bytes(out, SYMS[DEFS[d].name].text);
+            DEFS[d].fqn = intern(buf_slice(out));
+        }
+    }
+}
+
+// The trait definition of a trait impl's function, or -1.
+pub fn trait_of(d: i64) -> i64 {
+    unsafe {
+        if DEFS[d].kind != K_IMPL_METHOD {
+            return -1;
+        }
+        let f = NODES[DEFS[d].node].x - 1;
+        if f < 0 { -1 } else { def_of_node(impl_trait_node(f)) }
+    }
+}
+
+// ---- Matching names ----
+
+pub fn bytes_eq(a: [u8], b: [u8]) -> bool {
+    if a.len != b.len {
+        return false;
+    }
+    for i in 0..a.len {
+        if a[i] != b[i] {
+            return false;
+        }
+    }
+    true
+}
+
+// Whether path p ends with name s, by whole segments (or s is `.field`).
+pub fn ends_with(p: [u8], s: [u8], exact: bool) -> bool {
+    if s.len == 0 || s.len > p.len {
+        return false;
+    }
+    let k = p.len - s.len;
+    for i in 0..s.len {
+        if p[k + i] != s[i] {
+            return false;
+        }
+    }
+    if k == 0 {
+        return true;
+    }
+    if exact {
+        return false;
+    }
+    s[0] == '.' || (k >= 2 && p[k - 1] == ':' && p[k - 2] == ':')
+}
+
+// The index of `pat` in s at or after `from`, or -1.
+pub fn find_in(s: [u8], pat: *u8, from: i64) -> i64 {
+    let n = unsafe { strlen(pat) as i64 };
+    let mut i = from;
+    while i + n <= s.len {
+        let mut ok = true;
+        for j in 0..n {
+            if unsafe { s[i + j] != pat[j] } {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            return i;
+        }
+        i += 1;
+    }
+    -1
+}
+
+// Whether definition d answers to `name`.
+fn name_matches(d: i64, name: [u8], exact: bool) -> bool {
+    unsafe {
+        let fqn = SYMS[DEFS[d].fqn].text;
+        if bytes_eq(fqn, name) {
+            return true;
+        }
+        if name.len > 0 && name[0] == '<' {
+            // `<Type as Trait>::f`, each part full or partial.
+            if DEFS[d].kind != K_IMPL_METHOD {
+                return false;
+            }
+            let a = find_in(name, c" as ", 1);
+            let b = find_in(name, c">::", 1);
+            if a < 0 || b < a {
+                return false;
+            }
+            return ends_with(SYMS[DEFS[d].owner].text, name[1..a], exact)
+                && (ends_with(SYMS[DEFS[d].tr].text, name[a + 4..b], exact))
+                && bytes_eq(SYMS[DEFS[d].name].text, name[b + 3..name.len]);
+        }
+        ends_with(SYMS[DEFS[d].path].text, name, exact)
+    }
+}
+
+// The definitions answering to `name`, in order of position.
+pub fn find_defs(name: [u8], exact: bool, out: *IntVec) {
+    for d in 0..DEF_COUNT {
+        if unsafe { DEFS[d].fqn >= 0 } && name_matches(d, name, exact) {
+            out.push(d);
+        }
+    }
+    sort_by_position(out);
+}
+
+// The last segment of a name (after `::`, `.` or `>::`).
+pub fn last_segment(name: [u8]) -> [u8] {
+    let mut i = name.len;
+    while i > 0 && name[i - 1] != ':' && name[i - 1] != '.' {
+        i -= 1;
+    }
+    name[i..name.len]
+}
