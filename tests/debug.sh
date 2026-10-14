@@ -40,7 +40,8 @@ if [ "$TARGET" = x86_64-macos ] && [ "$(uname -m)" = arm64 ]; then
 fi
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-debug.XXXXXX")
-trap 'rm -rf "$WORK"' EXIT INT TERM
+trap 'rm -rf "$WORK"' EXIT
+trap 'exit 130' INT TERM
 
 # What the debugger must print, one pattern per line, in order: a
 # breakpoint in each file (with its frame), then the frames of the crash.

@@ -20,7 +20,8 @@
 #   -C            the calls mode of gen.awk (aggregates passed and returned)
 #   -N            the 0.6 language mode of gen.awk (defer, if let, ==, strings)
 #   -V            vectorizable loops and vector code, from genvec.awk (0.10)
-#   -j JOBS       programs tested at once (default: the number of CPUs)
+#   -j JOBS       programs tested at once (default: the number of CPUs,
+#                 or the slots of $TACHYON_JOBSERVER, see tests/run.sh)
 
 set -u
 LC_ALL=C
@@ -69,13 +70,9 @@ esac
 NONZERO=0
 [ -n "$SEED" ] && NONZERO=1
 
-if [ -z "$JOBS" ]; then
-    JOBS=$(sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 4)
-    case "$JOBS" in ''|*[!0-9]*) JOBS=4 ;; esac
-fi
-
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-fuzz.XXXXXX")
-trap 'rm -rf "$WORK"' EXIT INT TERM
+trap 'rm -rf "$WORK"' EXIT
+trap 'exit 130' INT TERM
 
 # Tests program $1 (a random seed); why it fails, if it does, in
 # $WORK/p$1.why.
@@ -117,13 +114,23 @@ test_seed() {
     rm -f "$WORK/p$seed".O* "$WORK/p$seed".seed*
 }
 
-mkfifo "$WORK/slots"
-exec 3<>"$WORK/slots"
-i=0
-while [ "$i" -lt "$JOBS" ]; do
-    echo >&3
-    i=$((i + 1))
-done
+# The slots: JOBS of them, or (0.11) the ones $TACHYON_JOBSERVER shares
+# between the runners of bootstrap/gate.sh (see tests/run.sh).
+if [ -z "$JOBS" ] && [ -n "${TACHYON_JOBSERVER:-}" ] && [ -p "$TACHYON_JOBSERVER" ]; then
+    exec 3<>"$TACHYON_JOBSERVER"
+else
+    if [ -z "$JOBS" ]; then
+        JOBS=$(sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 4)
+        case "$JOBS" in ''|*[!0-9]*) JOBS=4 ;; esac
+    fi
+    mkfifo "$WORK/slots"
+    exec 3<>"$WORK/slots"
+    i=0
+    while [ "$i" -lt "$JOBS" ]; do
+        echo >&3
+        i=$((i + 1))
+    done
+fi
 last=$((FIRST + COUNT))
 seed=$FIRST
 while [ "$seed" -lt "$last" ]; do

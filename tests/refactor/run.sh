@@ -51,7 +51,8 @@ esac
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-refactor.XXXXXX")
 WORK=$(cd "$WORK" && pwd -P)
-trap 'rm -rf "$WORK"' EXIT INT TERM
+trap 'rm -rf "$WORK"' EXIT
+trap 'exit 130' INT TERM
 STATUS=0
 T=$HERE
 export T

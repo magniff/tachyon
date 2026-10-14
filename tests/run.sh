@@ -3,8 +3,8 @@
 # needed): every tests/run/*.tach, tests/run/*/main.tach (a program of
 # several modules, 0.5) and tests/examples/*.test case is
 # compiled, assembled and linked with the C compiler, run, and checked;
-# then tests/query/run.sh (`tachyonc query`, 0.11) and tests/refactor/run.sh
-# (the refactoring tools, 0.11). POSIX sh and awk
+# alongside them, tests/query/run.sh (`tachyonc query`, 0.11) and
+# tests/refactor/run.sh (the refactoring tools, 0.11). POSIX sh and awk
 # only, so it runs the same on macOS and Linux.
 #
 # usage: tests/run.sh [-c COMPILER] [-t TARGET] [-O LEVEL] [-j JOBS] [-a] [-d FORMAT] [FILTER]
@@ -16,8 +16,9 @@
 #                 Apple silicon)
 #   -O LEVEL      the optimization level (0, 1 or 2; default: the
 #                 compiler's default)
-#   -j JOBS       cases run at once (default: the number of CPUs); the
-#                 report is the same for every JOBS
+#   -j JOBS       cases run at once (default: the number of CPUs, or the
+#                 slots of $TACHYON_JOBSERVER); the report is the same for
+#                 every JOBS
 #   -a            programs go through assembly (tachyonc -S, then cc), as
 #                 before 0.7, instead of the compiler's own objects
 #   -d FORMAT     the compiler's diagnostics: human (the default) or short
@@ -26,6 +27,10 @@
 #   FILTER        run only the cases whose name contains FILTER
 #
 # Environment: CC is the linker (and the assembler with -a; default cc).
+# TACHYON_JOBSERVER (0.11), when -j is not given, names a FIFO holding
+# one line per free slot, shared by every runner bootstrap/gate.sh starts
+# (tests/run.sh, tests/fuzz/run.sh, tests/abi/run.sh, tests/objcheck.sh):
+# a case takes a line before it starts and puts it back when done.
 #
 # Directives, in `//` comments of the case file:
 #   // ARGS: a b c       command-line arguments (whitespace separated)
@@ -141,7 +146,8 @@ case "$TARGET" in
 esac
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-tests.XXXXXX")
-trap 'rm -rf "$WORK"' EXIT INT TERM
+trap 'rm -rf "$WORK"' EXIT
+trap 'exit 130' INT TERM
 FAILURES="$WORK/failures"
 TALLY="$WORK/tally"
 : >"$FAILURES"
@@ -516,7 +522,6 @@ cpu_count() {
         *) echo "$n" ;;
     esac
 }
-[ -n "$JOBS" ] || JOBS=$(cpu_count)
 
 # Runs case $1 in directory $2: its outcome in $2/status.
 run_case() {
@@ -546,12 +551,12 @@ CASES="$WORK/cases"
 : >"$CASES"
 for file in "$ROOT"/tests/run/*.tach "$ROOT"/tests/run/*/main.tach "$ROOT"/tests/examples/*.test; do
     [ -f "$file" ] || continue
-    base=$(basename "$file")
+    base=${file##*/}
     name=${base%.*}
     case "$file" in
         *.test) name="example_$name" ;;
         # A program of several modules: a directory with main.tach (0.5).
-        */main.tach) name=$(basename "$(dirname "$file")") ;;
+        */main.tach) name=${file%/main.tach}; name=${name##*/} ;;
     esac
     case "$name" in
         *"$FILTER"*) ;;
@@ -559,13 +564,30 @@ for file in "$ROOT"/tests/run/*.tach "$ROOT"/tests/run/*/main.tach "$ROOT"/tests
     esac
     echo "$name $file" >>"$CASES"
 done
-mkfifo "$WORK/slots"
-exec 3<>"$WORK/slots"
-i=0
-while [ "$i" -lt "$JOBS" ]; do
-    echo >&3
-    i=$((i + 1))
-done
+
+# The tools' suites (below) run alongside the cases: they are serial, and
+# take seconds.
+case query in
+    *"$FILTER"*) "$ROOT/tests/query/run.sh" -c "$COMPILER" >"$WORK/query.out" 2>&1 & ;;
+esac
+case refactor in
+    *"$FILTER"*) "$ROOT/tests/refactor/run.sh" -c "$COMPILER" >"$WORK/refactor.out" 2>&1 & ;;
+esac
+
+# The slots: JOBS of them in a FIFO of our own, or the shared ones of
+# $TACHYON_JOBSERVER (see above).
+if [ -z "$JOBS" ] && [ -n "${TACHYON_JOBSERVER:-}" ] && [ -p "$TACHYON_JOBSERVER" ]; then
+    exec 3<>"$TACHYON_JOBSERVER"
+else
+    [ -n "$JOBS" ] || JOBS=$(cpu_count)
+    mkfifo "$WORK/slots"
+    exec 3<>"$WORK/slots"
+    i=0
+    while [ "$i" -lt "$JOBS" ]; do
+        echo >&3
+        i=$((i + 1))
+    done
+fi
 while read -r name file; do
     dir="$WORK/$name"
     mkdir -p "$dir"
@@ -581,7 +603,8 @@ while read -r name file; do
     dir="$WORK/$name"
     category=${name%%_*}
     [ -s "$dir/errors" ] && category=error
-    status=$(cat "$dir/status" 2>/dev/null || echo fail)
+    status=fail
+    [ -f "$dir/status" ] && read -r status <"$dir/status"
     if [ "$status" = xpass ]; then
         echo "$category fail" >>"$TALLY"
         echo "XPASS $name: passes but is marked XFAIL ($(cat "$dir/xfail")); remove the directive" >>"$FAILURES"
@@ -594,11 +617,10 @@ while read -r name file; do
     count=$((count + 1))
 done <"$CASES"
 
-# `tachyonc query` (0.11): tests/query/run.sh, its transcripts and its
-# checks on the compiler's own source; category "query".
+# `tachyonc query` (0.11): tests/query/run.sh (run above), its transcripts
+# and its checks on the compiler's own source; category "query".
 case query in
     *"$FILTER"*)
-        "$ROOT/tests/query/run.sh" -c "$COMPILER" >"$WORK/query.out" 2>&1
         while read -r status _; do
             case "$status" in
                 pass) echo "query pass" >>"$TALLY"; count=$((count + 1)) ;;
@@ -614,10 +636,10 @@ case query in
 esac
 
 # The refactoring tools (0.11: edit, undo, check, fix, lint, same-output,
-# the planning queries): tests/refactor/run.sh; category "refactor".
+# the planning queries): tests/refactor/run.sh (run above); category
+# "refactor".
 case refactor in
     *"$FILTER"*)
-        "$ROOT/tests/refactor/run.sh" -c "$COMPILER" >"$WORK/refactor.out" 2>&1
         while read -r status _; do
             case "$status" in
                 pass) echo "refactor pass" >>"$TALLY"; count=$((count + 1)) ;;

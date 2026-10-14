@@ -14,7 +14,8 @@
 #                 signatures)
 #   -f FIRST      the first random seed (default 1)
 #   -k DIR        where to keep failing programs (default: tests/abi/failures)
-#   -j JOBS       programs tested at once (default: the number of CPUs)
+#   -j JOBS       programs tested at once (default: the number of CPUs,
+#                 or the slots of $TACHYON_JOBSERVER, see tests/run.sh)
 #   -i            import mode: the C declarations are in a header, which the
 #                 C half includes and the tachyon half imports (`import`);
 #                 the tachyon half declares only its enums (which shadow C's)
@@ -65,13 +66,10 @@ case "$TARGET" in
     x86_64-macos) ARCH="-arch x86_64" ;;
     *) ARCH="" ;;
 esac
-if [ -z "$JOBS" ]; then
-    JOBS=$(sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 4)
-    case "$JOBS" in ''|*[!0-9]*) JOBS=4 ;; esac
-fi
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-abi.XXXXXX")
-trap 'rm -rf "$WORK"' EXIT INT TERM
+trap 'rm -rf "$WORK"' EXIT
+trap 'exit 130' INT TERM
 
 # Tests program $1; why it fails in $WORK/p$1.why; its signature count in
 # $WORK/p$1.count.
@@ -104,13 +102,23 @@ test_seed() {
     rm -f "$WORK/p$seed".O*
 }
 
-mkfifo "$WORK/slots"
-exec 3<>"$WORK/slots"
-i=0
-while [ "$i" -lt "$JOBS" ]; do
-    echo >&3
-    i=$((i + 1))
-done
+# The slots: JOBS of them, or (0.11) the ones $TACHYON_JOBSERVER shares
+# between the runners of bootstrap/gate.sh (see tests/run.sh).
+if [ -z "$JOBS" ] && [ -n "${TACHYON_JOBSERVER:-}" ] && [ -p "$TACHYON_JOBSERVER" ]; then
+    exec 3<>"$TACHYON_JOBSERVER"
+else
+    if [ -z "$JOBS" ]; then
+        JOBS=$(sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 4)
+        case "$JOBS" in ''|*[!0-9]*) JOBS=4 ;; esac
+    fi
+    mkfifo "$WORK/slots"
+    exec 3<>"$WORK/slots"
+    i=0
+    while [ "$i" -lt "$JOBS" ]; do
+        echo >&3
+        i=$((i + 1))
+    done
+fi
 last=$((FIRST + COUNT))
 seed=$FIRST
 while [ "$seed" -lt "$last" ]; do
