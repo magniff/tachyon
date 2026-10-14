@@ -549,3 +549,199 @@ $ refactor split crate::geom
 error refactor.usage: split takes MODULE and --into NEWMOD --items a,b,c, or --plan, or --auto
 try: tachyonc refactor split crate::m --plan
 [exit 2]
+## ---- in a script ----
+## File moves and other edits, checked once, written as one edit; one
+## undo takes all back.
+$ refactor --script steps.txt --dry-run
+moved module crate::shapes to crate::figures::shapes	3 files	+3 -2 lines
+rewrote 1 site in 1 file	figures/shapes.tach	+1 -1 lines
+split crate::geom: 3 items into crate::geom::scaling	3 files	+21 -18 lines
+--- a/main.tach
++++ b/main.tach
+@@ -3 +2,0 @@
+-mod shapes;
+@@ -4,0 +4 @@
++mod figures;
+@@ -11 +11 @@
+-    let n = twice(area(p)) + shapes::perimeter(p) + util::LIMIT + p.sum();
++    let n = twice(area(p)) + crate::figures::shapes::perimeter(p) + util::LIMIT + p.sum();
+--- a/figures/mod.tach
++++ b/figures/mod.tach
+@@ -0,0 +1 @@
++pub mod shapes;
+--- a/figures/shapes.tach
++++ b/figures/shapes.tach
+@@ -0,0 +1,14 @@
++// Shapes made of points.
++
++use crate::geom::{Point, area};
++use crate::geom::scaling::double;
++
++pub fn perimeter(p: Point) -> i64 {
++    let q = double(p);
++    (p.x + p.y) * scale() + area(q) - area(q)
++}
++
++// How many times a side counts.
++fn scale() -> i64 {
++    2
++}
+--- a/geom/scaling.tach
++++ b/geom/scaling.tach
+@@ -0,0 +1,18 @@
++use crate::geom::Point;
++use crate::util::twice;
++
++// ---- Scaling ----
++
++// p, k times larger.
++pub fn scale(p: Point, k: i64) -> Point {
++    Point { x: p.x * k, y: p.y * k }
++}
++
++// Half of x.
++fn half(x: i64) -> i64 {
++    x / 2
++}
++
++pub fn double(p: Point) -> Point {
++    scale(p, half(twice(2)))
++}
+--- a/geom/mod.tach
++++ b/geom/mod.tach
+@@ -0,0 +1,20 @@
++// Points and their areas.
++
++pub mod scaling;
++
++pub struct Point {
++    pub x: i64,
++    pub y: i64,
++}
++
++impl Point {
++    // x + y.
++    pub fn sum(self: *Point) -> i64 {
++        self.x + self.y
++    }
++}
++
++// The area of the rectangle from the origin to p.
++pub fn area(p: Point) -> i64 {
++    p.x * p.y
++}
+--- a/shapes.tach
++++ b/shapes.tach
+@@ -1,13 +0,0 @@
+-// Shapes made of points.
+-
+-use crate::geom::{Point, area, double};
+-
+-pub fn perimeter(p: Point) -> i64 {
+-    let q = double(p);
+-    scale() * (p.x + p.y) + area(q) - area(q)
+-}
+-
+-// How many times a side counts.
+-fn scale() -> i64 {
+-    2
+-}
+--- a/geom.tach
++++ b/geom.tach
+@@ -1,36 +0,0 @@
+-// Points and their areas.
+-
+-use crate::util::twice;
+-
+-pub struct Point {
+-    pub x: i64,
+-    pub y: i64,
+-}
+-
+-impl Point {
+-    // x + y.
+-    pub fn sum(self: *Point) -> i64 {
+-        self.x + self.y
+-    }
+-}
+-
+-// The area of the rectangle from the origin to p.
+-pub fn area(p: Point) -> i64 {
+-    p.x * p.y
+-}
+-
+-// ---- Scaling ----
+-
+-// p, k times larger.
+-pub fn scale(p: Point, k: i64) -> Point {
+-    Point { x: p.x * k, y: p.y * k }
+-}
+-
+-// Half of x.
+-fn half(x: i64) -> i64 {
+-    x / 2
+-}
+-
+-pub fn double(p: Point) -> Point {
+-    scale(p, half(twice(2)))
+-}
+$ refactor --script steps.txt
+moved module crate::shapes to crate::figures::shapes	3 files	+3 -2 lines
+rewrote 1 site in 1 file	figures/shapes.tach	+1 -1 lines
+split crate::geom: 3 items into crate::geom::scaling	3 files	+21 -18 lines
+script steps.txt: 3 commands	7 files	+55 -51 lines
+% find . -name '*.tach' | sort
+./figures/mod.tach
+./figures/shapes.tach
+./geom/mod.tach
+./geom/scaling.tach
+./main.tach
+./util.tach
+% git diff main.tach
+diff --git a/main.tach b/main.tach
+index 620be80..b915abc 100644
+--- a/main.tach
++++ b/main.tach
+@@ -1,13 +1,13 @@
+ // A program of four modules to reorganize (tests/refactor/modules.t).
+ mod geom;
+-mod shapes;
+ mod util;
++mod figures;
+ 
+ use geom::{Point, area};
+ use util::twice;
+ 
+ fn main() -> i32 {
+     let p = Point { x: 2, y: 3 };
+-    let n = twice(area(p)) + shapes::perimeter(p) + util::LIMIT + p.sum();
++    let n = twice(area(p)) + crate::figures::shapes::perimeter(p) + util::LIMIT + p.sum();
+     if n == 127 { 0 } else { 1 }
+ }
+% cat figures/shapes.tach
+// Shapes made of points.
+
+use crate::geom::{Point, area};
+use crate::geom::scaling::double;
+
+pub fn perimeter(p: Point) -> i64 {
+    let q = double(p);
+    (p.x + p.y) * scale() + area(q) - area(q)
+}
+
+// How many times a side counts.
+fn scale() -> i64 {
+    2
+}
+$ main.tach -o prog
+% ./prog; echo "exit $?"
+exit 0
+$ undo
+undid script steps.txt: 3 commands	7 files	+55 -51 lines
+% git status --short
+?? prog
+% find . -name '*.tach' | sort
+./geom.tach
+./main.tach
+./shapes.tach
+./util.tach
