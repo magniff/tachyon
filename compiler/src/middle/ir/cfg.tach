@@ -1,0 +1,189 @@
+// Block terminators and the edges of the control flow graph: ending a
+// block (jump, branch, return, switch), walking and redirecting its
+// successors, the cases of a switch, and the index of a predecessor.
+
+use crate::middle::ir::{BLOCKS, SWCASES, Term};
+use crate::middle::lower::SSA_STACK;
+
+// ---- Terminators ----
+
+fn ir_add_pred(b: i64, pred: i64) {
+    unsafe { BLOCKS[b].preds.push(pred); }
+}
+
+// Ends block `b`.
+pub fn ir_terminate(b: i64, term: Term, cond: i64, s0: i64, s1: i64) {
+    unsafe {
+        BLOCKS[b].term = term;
+        BLOCKS[b].cond = cond;
+        BLOCKS[b].s0 = s0;
+        BLOCKS[b].s1 = s1;
+    }
+    if s0 != 0 {
+        ir_add_pred(s0, b);
+    }
+    if s1 != 0 {
+        ir_add_pred(s1, b);
+    }
+}
+
+pub fn succ_count(b: i64) -> i64 {
+    unsafe {
+        let term = BLOCKS[b].term;
+        if term == Term::Jump { return 1; }
+        if term == Term::Branch { return 2; }
+        if term == Term::Switch { return BLOCKS[b].nsucc; }
+        0
+    }
+}
+
+pub fn succ(b: i64, i: i64) -> i64 {
+    unsafe {
+        if BLOCKS[b].term == Term::Switch {
+            return SWCASES.data[BLOCKS[b].succs + i];
+        }
+        if i == 0 { BLOCKS[b].s0 } else { BLOCKS[b].s1 }
+    }
+}
+
+// Whether s is a successor of b.
+pub fn is_succ(b: i64, s: i64) -> bool {
+    for i in 0..succ_count(b) {
+        if succ(b, i) == s {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn case_value(b: i64, i: i64) -> i64 {
+    unsafe { SWCASES.data[BLOCKS[b].cases + 2 * i] }
+}
+
+pub fn case_target(b: i64, i: i64) -> i64 {
+    unsafe { SWCASES.data[BLOCKS[b].cases + 2 * i + 1] }
+}
+
+// Ends block b with a switch on `value`: `count` cases as (value, block)
+// pairs at SSA_STACK[mark..], popped, and the default block.
+pub fn ir_switch(b: i64, value: i64, default: i64, mark: i64) {
+    ir_switch_no_preds(b, value, default, mark);
+    unsafe {
+        for i in 0..BLOCKS[b].nsucc {
+            ir_add_pred(succ(b, i), b);
+        }
+    }
+}
+
+// The same, without adding b to the predecessors of its successors.
+pub fn ir_switch_no_preds(b: i64, value: i64, default: i64, mark: i64) {
+    unsafe {
+        let count = (SSA_STACK.count - mark) / 2;
+        BLOCKS[b].term = Term::Switch;
+        BLOCKS[b].cond = value;
+        BLOCKS[b].s0 = default;
+        BLOCKS[b].s1 = 0;
+        BLOCKS[b].cases = SWCASES.count;
+        BLOCKS[b].ncases = count;
+        for i in 0..2 * count {
+            SWCASES.push(SSA_STACK.data[mark + i]);
+        }
+        SSA_STACK.count = mark;
+        switch_rebuild_succs(b);
+    }
+}
+
+// Rebuilds the list of distinct successors of switch b (the default
+// first, then in case order).
+pub fn switch_rebuild_succs(b: i64) {
+    unsafe {
+        let start = SWCASES.count;
+        SWCASES.push(BLOCKS[b].s0);
+        for i in 0..BLOCKS[b].ncases {
+            let t = case_target(b, i);
+            let mut seen = false;
+            for k in start..SWCASES.count {
+                if SWCASES.data[k] == t {
+                    seen = true;
+                }
+            }
+            if !seen {
+                SWCASES.push(t);
+            }
+        }
+        BLOCKS[b].succs = start;
+        BLOCKS[b].nsucc = SWCASES.count - start;
+    }
+}
+
+// The block switch b goes to for the constant `value`.
+pub fn switch_target(b: i64, value: i64) -> i64 {
+    unsafe {
+        for i in 0..BLOCKS[b].ncases {
+            if case_value(b, i) == value {
+                return case_target(b, i);
+            }
+        }
+        BLOCKS[b].s0
+    }
+}
+
+// Makes the edge from b to `from` go to `to` (the predecessor lists are
+// the caller's business). A switch whose cases already reach `to` is not
+// changed (that would make two edges into `to`): returns false.
+pub fn redirect_succ(b: i64, from: i64, to: i64) -> bool {
+    unsafe {
+        let term = BLOCKS[b].term;
+        if term == Term::Switch {
+            if is_succ(b, to) {
+                return false;
+            }
+            let start = SWCASES.count;
+            for i in 0..BLOCKS[b].ncases {
+                SWCASES.push(case_value(b, i));
+                let t = case_target(b, i);
+                SWCASES.push(if t == from { to } else { t });
+            }
+            BLOCKS[b].cases = start;
+            if BLOCKS[b].s0 == from {
+                BLOCKS[b].s0 = to;
+            }
+            switch_rebuild_succs(b);
+            return true;
+        }
+        if BLOCKS[b].s0 == from {
+            BLOCKS[b].s0 = to;
+        }
+        if term == Term::Branch && BLOCKS[b].s1 == from {
+            BLOCKS[b].s1 = to;
+        }
+        true
+    }
+}
+
+// Copies the terminator of block `from` to block `to` (successors as they
+// are; the predecessor lists are the caller's business).
+pub fn copy_terminator(to: i64, from: i64) {
+    unsafe {
+        BLOCKS[to].term = BLOCKS[from].term;
+        BLOCKS[to].cond = BLOCKS[from].cond;
+        BLOCKS[to].s0 = BLOCKS[from].s0;
+        BLOCKS[to].s1 = BLOCKS[from].s1;
+        BLOCKS[to].cases = BLOCKS[from].cases;
+        BLOCKS[to].ncases = BLOCKS[from].ncases;
+        BLOCKS[to].succs = BLOCKS[from].succs;
+        BLOCKS[to].nsucc = BLOCKS[from].nsucc;
+    }
+}
+
+// The index of `pred` among the predecessors of `b`, or -1.
+pub fn pred_index(b: i64, pred: i64) -> i64 {
+    unsafe {
+        for i in 0..BLOCKS[b].preds.count {
+            if BLOCKS[b].preds.data[i] == pred {
+                return i;
+            }
+        }
+    }
+    -1
+}
