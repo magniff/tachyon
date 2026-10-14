@@ -55,9 +55,9 @@ pub struct Point {
 $ def len
 crate::geom::V2::len	clash/geom.tach:15:12	method	pub fn len(self: *V2) -> i64
 crate::myvec::Vec::len	clash/myvec.tach:11:12	method	pub fn len(self: *Vec) -> i64
-std::Vec::len	<std>:117:12	method	pub fn len(self: *Vec<T>) -> i64
-std::Buf::len	<std>:193:12	method	pub fn len(self: *Buf) -> i64
-std::HashMap::len	<std>:525:12	method	pub fn len(self: *HashMap<K, V>) -> i64
+std::Vec::len	<std>:120:12	method	pub fn len(self: *Vec<T>) -> i64
+std::Buf::len	<std>:244:12	method	pub fn len(self: *Buf) -> i64
+std::HashMap::len	<std>:883:12	method	pub fn len(self: *HashMap<K, V>) -> i64
 $ refs V2::len
 # clash/geom.tach
 15:12	def	pub fn len(self: *V2) -> i64 {
@@ -127,11 +127,11 @@ $ refs crate::shapes::Area
 13:6	type	shapes	impl Area for Square {
 $ def push
 crate::myvec::Vec::push	clash/myvec.tach:7:12	method	pub fn push(self: *Vec, x: i64)
-std::Vec::push	<std>:138:12	method	pub fn push(self: *Vec<T>, x: T)
-std::Buf::push	<std>:197:12	method	pub fn push(self: *Buf, b: u8)
+std::Vec::push	<std>:141:12	method	pub fn push(self: *Vec<T>, x: T)
+std::Buf::push	<std>:248:12	method	pub fn push(self: *Buf, b: u8)
 $ refs Vec::push --count
 2	crate::myvec::Vec::push
-5	std::Vec::push
+9	std::Vec::push
 $ callers crate::myvec::Vec::push
 # clash/main.tach
 40:10	call	main	mine.push(v.len());
@@ -160,9 +160,9 @@ $ refs geom::V2
 2:20	type	shapes::Area::area	fn area(self: *Self) -> i64;
 4:21	type	shapes::Area::twice	fn twice(self: *Self) -> i64 {
 # <std>
-282:30	type	std::Add::add	pub trait Add { fn add(self: Self, other: Self) -> Self; }
-282:43	type	std::Add::add	pub trait Add { fn add(self: Self, other: Self) -> Self; }
-282:52	type	std::Add::add	pub trait Add { fn add(self: Self, other: Self) -> Self; }
+549:30	type	std::Add::add	pub trait Add { fn add(self: Self, other: Self) -> Self; }
+549:43	type	std::Add::add	pub trait Add { fn add(self: Self, other: Self) -> Self; }
+549:52	type	std::Add::add	pub trait Add { fn add(self: Self, other: Self) -> Self; }
 $ callers printf
 # clash/main.tach
 47:84	call	main	->printf	let total = twice_generic(&sq) + twice_generic(&v) + sq.twice() + mine.len() + printf(r);

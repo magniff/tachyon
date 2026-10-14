@@ -2,14 +2,16 @@
 // (compiler/std/embed.sh makes compiler/src/front/stdsrc.tach from this file).
 // A program that names `std` gets it: `std::Vec<i64>`, `use std::{Buf, Vec};`.
 //
-// Option and Result, a growable vector, a byte buffer and printing.
+// Option and Result, a growable vector, a byte buffer, printing, reading
+// stdin and text, the operator traits, sorting and a hash map.
 // Failures (unwrapping None, an index out of bounds) print a message on
 // stderr and exit with 101, like the language's own checks.
 //
 // Unsafe code (0.9): the safe functions here have no undefined behaviour
 // as long as a Vec's and a Buf's fields are changed by their methods only
-// (tachyon has no private fields yet), and a slice from `as_slice` is not
-// used after the Vec grows or is freed. The functions taking C strings
+// (tachyon has no private fields yet), and a slice from `as_slice` (or a
+// HashMap's `get_mut`, `get_or_insert`) is not used after the Vec grows
+// (the map gets a new key) or is freed. The functions taking C strings
 // are `unsafe fn`: the string must end with a NUL.
 
 extern "C" {
@@ -17,6 +19,7 @@ extern "C" {
     fn realloc(p: *u8, size: u64) -> *u8;
     fn free(p: *u8);
     fn write(fd: i32, data: *u8, count: u64) -> i64;
+    fn read(fd: i32, data: *u8, count: u64) -> i64;
     fn exit(code: i32) -> !;
 }
 
@@ -162,6 +165,54 @@ impl<T> Vec<T> {
         self.as_slice()[i] = x;
     }
 
+    // The last element, if there is one (the Vec keeps it; `pop` takes it).
+    pub fn last(self: *Vec<T>) -> Option<T> {
+        if self.len == 0 { Option::None } else { Option::Some(self.get(self.len - 1)) }
+    }
+
+    // Exchanges elements i and j (checked).
+    pub fn swap(self: *Vec<T>, i: i64, j: i64) {
+        let s = self.as_slice();
+        let t = s[i];
+        s[i] = s[j];
+        s[j] = t;
+    }
+
+    // Puts x at index i, 0 to len (checked), moving the elements from i
+    // on up by one.
+    pub fn insert(self: *Vec<T>, i: i64, x: T) {
+        if i < 0 || i > self.len {
+            unsafe { panic(c"Vec::insert: index out of bounds") }
+        }
+        self.push(x);
+        let s = self.as_slice();
+        let mut k = s.len - 1;
+        while k > i {
+            s[k] = s[k - 1];
+            k -= 1;
+        }
+        s[i] = x;
+    }
+
+    // Takes element i out (checked) and returns it, moving the elements
+    // after it down by one.
+    pub fn remove(self: *Vec<T>, i: i64) -> T {
+        let s = self.as_slice();
+        let x = s[i];
+        for k in i..s.len - 1 {
+            s[k] = s[k + 1];
+        }
+        self.len -= 1;
+        x
+    }
+
+    // Keeps the first n elements (all of them when there are fewer).
+    pub fn truncate(self: *Vec<T>, n: i64) {
+        if n >= 0 && n < self.len {
+            self.len = n;
+        }
+    }
+
     pub fn as_slice(self: *Vec<T>) -> [T] {
         unsafe { self.ptr[0..self.len] }
     }
@@ -270,6 +321,222 @@ pub unsafe fn print_cstr(s: *u8) {
     b.push_cstr(s);
     print(b.as_slice());
     b.free();
+}
+
+// ---- Reading stdin (0.14) ----
+
+// `read_line` and `read_stdin` share one buffer: they can be mixed, but
+// not with C's stdio reading (getchar, scanf, fgets), which has its own.
+static mut STDIN_BUF: *u8 = 0 as *u8;
+static mut STDIN_POS: i64 = 0;
+static mut STDIN_LEN: i64 = 0;
+const STDIN_BLOCK: i64 = 65536;
+
+// Bytes in STDIN_BUF[STDIN_POS..STDIN_LEN], read if there were none;
+// false at the end of input.
+fn stdin_fill() -> bool {
+    if STDIN_POS < STDIN_LEN {
+        return true;
+    }
+    if STDIN_BUF == 0 as *u8 {
+        STDIN_BUF = unsafe { malloc(STDIN_BLOCK as u64) };
+    }
+    let n = unsafe { read(0, STDIN_BUF, STDIN_BLOCK as u64) };
+    STDIN_POS = 0;
+    STDIN_LEN = if n > 0 { n } else { 0 };
+    n > 0
+}
+
+// The next line of stdin into `line` (emptied first), without its '\n';
+// false at the end of input (an empty line is true, an empty `line`).
+pub fn read_line(line: *Buf) -> bool {
+    line.clear();
+    let mut any = false;
+    while stdin_fill() {
+        any = true;
+        let block = unsafe { STDIN_BUF[STDIN_POS..STDIN_LEN] };
+        for i in 0..block.len {
+            if block[i] == '\n' {
+                line.push_str(block[..i]);
+                STDIN_POS += i + 1;
+                return true;
+            }
+        }
+        line.push_str(block);
+        STDIN_POS = STDIN_LEN;
+    }
+    any
+}
+
+// All of stdin that is left, in a new Buf (the caller frees it). It
+// shares a buffer with read_line, not with C's getchar or scanf.
+pub fn read_stdin() -> Buf {
+    let mut b = Buf::new();
+    if STDIN_POS < STDIN_LEN {
+        b.push_str(unsafe { STDIN_BUF[STDIN_POS..STDIN_LEN] });
+        STDIN_POS = STDIN_LEN;
+    }
+    loop {
+        b.bytes.reserve(STDIN_BLOCK);
+        let room = b.bytes.cap - b.bytes.len;
+        let n = unsafe { read(0, &b.bytes.ptr[b.bytes.len], room as u64) };
+        if n <= 0 {
+            return b;
+        }
+        b.bytes.len += n;
+    }
+}
+
+// ---- Text (0.14) ----
+
+// ASCII whitespace: ' ', '\t', '\n', '\r', vertical tab, form feed.
+pub fn is_space(b: u8) -> bool {
+    b == ' ' || b == '\t' || b == '\n' || b == '\r' || b == 11 || b == 12
+}
+
+// '0' to '9'.
+pub fn is_digit(b: u8) -> bool {
+    b >= '0' && b <= '9'
+}
+
+// s without the whitespace (`is_space`) at its start and end.
+pub fn trim(s: [u8]) -> [u8] {
+    let mut a = 0;
+    let mut b = s.len;
+    while a < b && is_space(s[a]) {
+        a += 1;
+    }
+    while b > a && is_space(s[b - 1]) {
+        b -= 1;
+    }
+    s[a..b]
+}
+
+// s as an integer: an optional '-' or '+', then decimal digits, nothing
+// else (no spaces). None if s is not one or does not fit in an i64.
+pub fn parse_int(s: [u8]) -> Option<i64> {
+    let mut i = 0;
+    if s.len > 0 && (s[0] == '-' || s[0] == '+') {
+        i = 1;
+    }
+    if i == s.len {
+        return Option::None;
+    }
+    // Summed as a negative number, which reaches the smallest i64.
+    let min = -9223372036854775807 - 1;
+    let mut n = 0;
+    while i < s.len {
+        if !is_digit(s[i]) {
+            return Option::None;
+        }
+        let d = (s[i] - '0') as i64;
+        if n < min / 10 || (n == min / 10 && d > -(min % 10)) {
+            return Option::None;
+        }
+        n = n * 10 - d;
+        i += 1;
+    }
+    if s[0] == '-' {
+        Option::Some(n)
+    } else if n == min {
+        Option::None
+    } else {
+        Option::Some(-n)
+    }
+}
+
+// The parts of s between `sep` bytes, empty ones too, as views of s
+// (`split("a,,b", ',')`: "a", "", "b"). The caller frees the Vec.
+pub fn split(s: [u8], sep: u8) -> Vec<[u8]> {
+    let mut parts: Vec<[u8]> = Vec::new();
+    let mut start = 0;
+    for i in 0..s.len {
+        if s[i] == sep {
+            parts.push(s[start..i]);
+            start = i + 1;
+        }
+    }
+    parts.push(s[start..]);
+    parts
+}
+
+// The runs of non-whitespace in s, as views of s. The caller frees it.
+pub fn split_whitespace(s: [u8]) -> Vec<[u8]> {
+    let mut words: Vec<[u8]> = Vec::new();
+    let mut sc = Scanner::new(s);
+    while let Option::Some(w) = sc.next_token() {
+        words.push(w);
+    }
+    words
+}
+
+// Reads a text (`read_stdin().as_slice()`) front to back, by tokens
+// (runs of non-whitespace) and lines, as views of the text.
+pub struct Scanner { text: [u8], pos: i64 }
+
+impl Scanner {
+    pub fn new(text: [u8]) -> Scanner {
+        Scanner { text: text, pos: 0 }
+    }
+
+    // The next token; None when only whitespace is left.
+    pub fn next_token(self: *Scanner) -> Option<[u8]> {
+        let s = self.text;
+        let mut i = self.pos;
+        while i < s.len && is_space(s[i]) {
+            i += 1;
+        }
+        if i == s.len {
+            self.pos = i;
+            return Option::None;
+        }
+        let start = i;
+        while i < s.len && !is_space(s[i]) {
+            i += 1;
+        }
+        self.pos = i;
+        Option::Some(s[start..i])
+    }
+
+    // The next token as an integer (`parse_int`); None at the end, or if
+    // it is not one (it is consumed all the same).
+    pub fn next_int(self: *Scanner) -> Option<i64> {
+        match self.next_token() {
+            Option::Some(t) => parse_int(t),
+            Option::None => Option::None,
+        }
+    }
+
+    // The rest of the line, without its '\n'; None at the end of the
+    // text ("a\n\nb": "a", "", "b"; "a\n": "a").
+    pub fn next_line(self: *Scanner) -> Option<[u8]> {
+        let s = self.text;
+        if self.pos >= s.len {
+            return Option::None;
+        }
+        let start = self.pos;
+        let mut i = start;
+        while i < s.len && s[i] != '\n' {
+            i += 1;
+        }
+        self.pos = if i < s.len { i + 1 } else { i };
+        Option::Some(s[start..i])
+    }
+
+    // Whether nothing but whitespace is left.
+    pub fn is_done(self: *Scanner) -> bool {
+        let s = self.text;
+        let mut i = self.pos;
+        while i < s.len && is_space(s[i]) {
+            i += 1;
+        }
+        i == s.len
+    }
+
+    // What is left of the text.
+    pub fn rest(self: *Scanner) -> [u8] {
+        self.text[self.pos..]
+    }
 }
 
 // ---- Traits (0.9) ----
@@ -465,8 +732,99 @@ impl Hash for [u8] {
     }
 }
 
-// Sorts s in place, smallest first (a heapsort: not stable).
+// Sorts s in place, smallest first; not stable (equal elements may change
+// order). An introsort: quicksort around the median of three, insertion
+// sort for short runs, heapsort where the quicksort goes too deep, so
+// O(n log n) comparisons at worst. A `cmp` that is not a total order
+// leaves s in some order, never out of bounds.
 pub fn sort<T: Ord>(s: [T]) {
+    let mut depth = 0;
+    let mut n = s.len;
+    while n > 1 {
+        depth += 2;
+        n /= 2;
+    }
+    quicksort::<T>(s, 0, s.len, depth);
+}
+
+// Short runs are sorted by insertion.
+const SORT_SMALL: i64 = 24;
+
+// Sorts s[lo..hi]; below `depth` more partitions, by heapsort.
+fn quicksort<T: Ord>(s: [T], lo: i64, hi: i64, depth: i64) {
+    let mut lo = lo;
+    let mut hi = hi;
+    let mut depth = depth;
+    while hi - lo > SORT_SMALL {
+        if depth == 0 {
+            heapsort::<T>(s[lo..hi]);
+            return;
+        }
+        depth -= 1;
+        // The median of the first, middle and last elements, at lo.
+        let mid = lo + (hi - lo) / 2;
+        if s[mid] < s[lo] {
+            swap::<T>(s, mid, lo);
+        }
+        if s[hi - 1] < s[mid] {
+            swap::<T>(s, hi - 1, mid);
+            if s[mid] < s[lo] {
+                swap::<T>(s, mid, lo);
+            }
+        }
+        swap::<T>(s, lo, mid);
+        // Hoare's partition: s[lo..p] <= pivot <= s[p + 1..hi]. Equal
+        // elements stop both scans, so many equal keys split evenly.
+        let pivot = s[lo];
+        let mut i = lo;
+        let mut j = hi;
+        loop {
+            i += 1;
+            while i < hi && s[i] < pivot {
+                i += 1;
+            }
+            j -= 1;
+            while j > lo && pivot < s[j] {
+                j -= 1;
+            }
+            if i >= j {
+                break;
+            }
+            swap::<T>(s, i, j);
+        }
+        swap::<T>(s, lo, j);
+        // The shorter side by recursion, the longer by the loop: a stack
+        // of O(log n).
+        if j - lo < hi - j - 1 {
+            quicksort::<T>(s, lo, j, depth);
+            lo = j + 1;
+        } else {
+            quicksort::<T>(s, j + 1, hi, depth);
+            hi = j;
+        }
+    }
+    insertion_sort::<T>(s, lo, hi);
+}
+
+fn insertion_sort<T: Ord>(s: [T], lo: i64, hi: i64) {
+    for i in lo + 1..hi {
+        let x = s[i];
+        let mut j = i;
+        while j > lo && x < s[j - 1] {
+            s[j] = s[j - 1];
+            j -= 1;
+        }
+        s[j] = x;
+    }
+}
+
+fn swap<T>(s: [T], i: i64, j: i64) {
+    let t = s[i];
+    s[i] = s[j];
+    s[j] = t;
+}
+
+fn heapsort<T: Ord>(s: [T]) {
     let n = s.len;
     let mut start = n / 2;
     while start > 0 {
@@ -553,9 +911,35 @@ impl<K: Hash + Eq, V> HashMap<K, V> {
         self.slot_of(&key) >= 0
     }
 
+    // The same as `contains` (Rust's name).
+    pub fn contains_key(self: *HashMap<K, V>, key: K) -> bool {
+        self.slot_of(&key) >= 0
+    }
+
+    // A copy of the value of `key`, if it has one (`get_mut` changes it).
     pub fn get(self: *HashMap<K, V>, key: K) -> Option<V> {
         let i = self.slot_of(&key);
         if i < 0 { Option::None } else { Option::Some(unsafe { self.values[i] }) }
+    }
+
+    // The value of `key` in place, as a view of one element, if it has
+    // one: `if let Some(a) = m.get_mut(k) { a[0].balance += 10; }`. The
+    // view is valid until the map's next insert, remove or free (like a
+    // Vec's `as_slice()`).
+    pub fn get_mut(self: *HashMap<K, V>, key: K) -> Option<[V]> {
+        let i = self.slot_of(&key);
+        if i < 0 { Option::None } else { Option::Some(unsafe { self.values[i..i + 1] }) }
+    }
+
+    // The value of `key` in place (a view of one element, as `get_mut`),
+    // inserted as `default` first if the key has none; Rust's
+    // `entry(k).or_insert(d)`. Counting: `counts.get_or_insert(w, 0)[0] += 1;`.
+    pub fn get_or_insert(self: *HashMap<K, V>, key: K, default: V) -> [V] {
+        let mut i = self.slot_of(&key);
+        if i < 0 {
+            i = self.insert_new(key, default);
+        }
+        unsafe { self.values[i..i + 1] }
     }
 
     // Sets the value of `key`; returns its old value, if it had one.
@@ -568,6 +952,12 @@ impl<K: Hash + Eq, V> HashMap<K, V> {
             }
             return Option::Some(old);
         }
+        self.insert_new(key, value);
+        Option::None
+    }
+
+    // Adds `key`, which the map does not have; returns its slot.
+    fn insert_new(self: *HashMap<K, V>, key: K, value: V) -> i64 {
         if (self.used + 1) * 4 > self.cap * 3 {
             self.rehash();
         }
@@ -585,7 +975,7 @@ impl<K: Hash + Eq, V> HashMap<K, V> {
             self.values[j] = value;
         }
         self.len += 1;
-        Option::None
+        j
     }
 
     // Removes `key`; returns its value, if it had one.
