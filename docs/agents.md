@@ -24,6 +24,9 @@ compiler has to be the teacher.
 
 ## 2. Ask the compiler instead of reading source
 
+(Measured: [agent-tool-usage.md](agent-tool-usage.md) records how agents
+actually read and searched tachyon's source while building it.)
+
 A batch, token-efficient query interface (an LSP for programs, not
 editors): `type-at file:line:col`, `callers f`, `refs Node::kind`,
 `layout S` (offsets), `api module` (signatures and doc lines only, like a
