@@ -8,3 +8,7 @@ because of their form, not their purpose: lines with shell variables
 files with the Write tool (a script, a test input), then run one simple
 command at a time, e.g. `tachyonc main.tach -o prog`, `sh check.sh`,
 `./prog < input.txt`.
+
+The program reads standard input: run it as `./prog < input.txt`; a
+bare `./prog` waits for input that never comes until the command times
+out.
