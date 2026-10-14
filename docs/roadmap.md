@@ -480,6 +480,15 @@ The last release of the build-out.
   cost model for the loop vectorizer (from 0.10)
 - multi-error diagnostics: done (0.5, completed in 0.10)
 
+0.11 B status (performance):
+- broader bench/: done (binarytrees, fannkuch, json, mandelbrot, sort,
+  wordcount, each with its C version; `bench/run.sh` prints the
+  geometric mean of each column against cc -O2)
+- cost model for the loop vectorizer: to do
+- scalar unrolling with run-time trip counts: to do
+- SLP vectorizer: to do
+- the gaps against clang on the new benchmarks: to do
+
 ## Toward 1.0
 
 1.0 is not a feature milestone: it ships when the language is thought
