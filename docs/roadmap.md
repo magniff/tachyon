@@ -616,6 +616,13 @@ compile times in "Benchmarks", 0.12. Not run: the suite on x86_64-macos
 What 0.12's refactoring showed the tools lacked, fixed and measured
 again.
 
+- `tachyonc guide`: a compact reference for models that have never seen
+  tachyon, embedded in the compiler (version-matched): what Rust habits
+  map to in tachyon, the essentials with one example each, the std API
+  generated from its source, common errors and their fixes, the tools in
+  a few lines; every example compiled by the tests. The 0.14 agent eval
+  gives agents this guide
+
 ## 0.14: an agent eval; closures and iterators
 
 From here every release also passes an **agent-eval gate**, and a
