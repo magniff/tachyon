@@ -84,12 +84,14 @@ to itself, from the line of its first token (its attributes, `pub`, its
 keyword) to the line of its last (`}`, or the `;` of a constant; the `,`
 of a field or variant), a comment after it on that line included. The
 comment and attribute lines directly above it (what `query show`
-prints) belong to it:
+prints) belong to it as follows:
 
-- **replace**: when TEXT starts with a comment or an attribute (`//`,
-  `#[`), it replaces them too; otherwise they stay and only the item's
-  lines are replaced. So `query show NAME`, changed and given back, is a
-  round trip; its header line (`// PATH<TAB>FILE:A-B`) is dropped.
+- **replace**: what TEXT has, it replaces. TEXT starting with a comment
+  (`//`) replaces the item's comment and attribute lines too; starting
+  with an attribute (`#[`), its attribute lines (its comment stays);
+  otherwise both stay, and only the lines from its `pub` or keyword are
+  replaced. So `query show NAME`, changed and given back, is a round
+  trip; its header line (`// PATH<TAB>FILE:A-B`) is dropped.
 - **insert --after**: TEXT goes after the item's last line, a blank line
   between them (no blank line for a field or a variant).
 - **insert --before**: TEXT goes before the item's comments, a blank
