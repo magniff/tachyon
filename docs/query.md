@@ -194,7 +194,9 @@ references.
 - `--in FILE|MODULE` keeps the references in a file (an argument with a
   `/`, ending in `.tach` or `<std>`: the path, or its end by whole
   components, `gvn.tach`) or a module (matched like NAME, its inline
-  modules included: `gvn`, `crate::ir`).
+  modules included: `gvn`, `crate::ir`), or the item holding a line,
+  `FILE:LINE` (0.12; `rewrite --in` too; `fix --in FILE:LINE` fixes that
+  line's module).
 - None left: `note query.empty: 0 refs` (exit 0).
 
 ### The budget
