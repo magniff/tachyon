@@ -100,8 +100,10 @@ is the file's, and never moves): `// ---- Scaling ----`. It heads the
 items after it, up to the next banner: its group. It goes with its
 group, above it (0.13: with all of it, so that a move and the move back
 leave it where it was; into a new module, the part `split` makes, with
-the item right under it and most of the group's lines). It stays when
-the group does not all go, and with `--after`/`--before` unless the
+the item right under it and most of the group's lines; 0.14: or without
+that item, when most of the group's items and lines go there: then it
+goes alone, above the first of them). It stays when the group does not
+all go, and with `--after`/`--before` unless the
 place ends a group (an item followed by a banner, or by nothing): it
 would head the items after it there.
 
@@ -161,6 +163,11 @@ edited program, before the check.
   becomes that module's (`use crate::new::f;`); else the name leaves it
   for a `use` line of its own; in the module it moves to, the import is
   dropped (the item is local there);
+- a `use` path is written from `crate`, or (0.14) relative, `use
+  new::f;`, when the item's module is inside the importing one and that
+  module writes its child modules' paths so (as most of its `use` lines
+  that could be written either way are; `fix --only tidy-imports`
+  below);
 - code that named it bare (its old module's) gets a `use` line;
 - the moved code gets the imports it needs: what its old module imported
   that it names, and its old module's items it names (`use

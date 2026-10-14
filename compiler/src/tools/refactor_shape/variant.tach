@@ -2,7 +2,10 @@
 // needs one), removed (with its arms, alternatives and imports) or
 // renamed, in the enum and every construction and pattern of it.
 
-use crate::base::{FILES, IntVec, SRC, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, intern};
+use crate::base::{
+    FILES, IntVec, SRC, STDOUT, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
+    buf_write_fd, intern, streq,
+};
 use crate::front::ast::{ARM_SYNTHETIC, NODES, NODE_COUNT, NodeKind};
 use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
 use crate::front::modules::file_of_pos;
@@ -12,18 +15,19 @@ use crate::tools::edit::edit_replace;
 use crate::tools::edit::apply::{apply_edit, set_command};
 use crate::tools::edit::items::{after_line, indent_of};
 use crate::tools::fix::remove_use_name;
-use crate::tools::query::{QF_DEF, c_slice, root_or_diag};
+use crate::tools::query::{QF_DEF, c_slice, file_line, file_named, resolve_name, root_or_diag};
 use crate::tools::query::defs::{DEFS, K_ENUM};
 use crate::tools::query::diagnostics::{
     PROG, ROOT_GIVEN, TOOL, diag, put_root, put_word, try_end, write_diags,
 };
-use crate::tools::query::positions::{enclosing, line_start, put_loc, token_at};
-use crate::tools::query::refs::{R_FLAGS, R_POS};
+use crate::tools::query::positions::{enclosing, line_of, line_start, put_loc, put_path, token_at};
+use crate::tools::query::refs::{R_FLAGS, R_POS, put_short};
 use crate::tools::refactor_mod::mentions::doc_mentions;
 use crate::tools::refactor_shape::{
     PROGRAM_END, SUB, comment_head, find_byte, leading_name, list_insert, list_of_node, list_remove,
-    load_and_find, newline_in, opt, orig_of, put_count, refs_of, rest_blank, starts_line, sym_text,
-    take_args, text_buf, try_query_name, try_refactor, try_show_at, usage_error,
+    load_and_find, newline_in, opt, option_values, orig_of, put_count, refs_of, rest_blank,
+    starts_line, sym_text, take_args, text_buf, try_query_name, try_refactor, try_show_at,
+    usage_error,
 };
 use crate::tools::refactor_shape::field::{member_def, no_member, rename_refs};
 use crate::tools::rewrite::sort_by_start;
@@ -164,7 +168,7 @@ fn variant_inner(argc: i64, argv: **u8) -> i64 {
         let mut words = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let mut opts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let example = c"ENUM --add 'X(i64)' --arm 'EXPR' --dry-run";
-        if !take_args(argc, argv, c"--add=1 --arm=1 --remove=1 --rename=2", &root, &words, &opts) {
+        if !take_args(argc, argv, variant_options(), &root, &words, &opts) {
             return 2;
         }
         if words.count != 1 {
@@ -179,8 +183,8 @@ fn variant_inner(argc: i64, argv: **u8) -> i64 {
         if actions != 1 {
             return usage_error(c"one of --add, --remove, --rename", example);
         }
-        if arm != 0 as *u8 && add == 0 as *u8 {
-            return usage_error(c"--arm goes with --add", example);
+        if (arm != 0 as *u8 || opt(&opts, c"--arm-in", false) != 0 as *u8) && add == 0 as *u8 {
+            return usage_error(c"--arm and --arm-in go with --add", example);
         }
         let name = c_slice(words.data[0] as *u8);
         ROOT_GIVEN = root;
@@ -243,39 +247,33 @@ fn variant_inner(argc: i64, argv: **u8) -> i64 {
                     open_ms.push(m);
                 }
             }
-            if open_ms.count > 0 && arm == 0 as *u8 {
-                let out = buf_new();
-                for i in 0..open_ms.count {
-                    let m = open_ms.data[i];
-                    put_loc(out, pstart(m));
-                    buf_byte(out, '\t');
-                    let x = enclosing(pstart(m));
-                    if x >= 0 {
-                        crate::tools::query::refs::put_short(out, DEFS[x].fqn);
-                    }
-                    buf_byte(out, '\n');
+            // (0.14) Each match's arm: the first --arm-in naming it (the
+            // function it is in, or FILE:LINE of a line of it), else --arm.
+            let mut arms = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            for i in 0..open_ms.count {
+                arms.push(0);
+            }
+            if !site_arms(&opts, &open_ms, &arms, fqn) {
+                return 1;
+            }
+            let mut missing = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            for i in 0..open_ms.count {
+                if arms.data[i] == 0 {
+                    arms.data[i] = arm as i64;
                 }
-                crate::base::buf_write_fd(out, crate::base::STDOUT);
+                if arms.data[i] == 0 {
+                    missing.push(open_ms.data[i]);
+                }
+            }
+            if missing.count > 0 {
                 let x = diag(c"error", c"refactor.non-exhaustive");
-                put_count(x, open_ms.count, c"match", c"matches");
+                put_count(x, missing.count, c"match", c"matches");
                 buf_str(x, c" on ");
                 buf_bytes(x, fqn);
                 buf_str(x, c" would not cover ");
                 buf_bytes(x, sym_text(vname));
                 buf_str(x, c"; nothing written\n");
-                for i in 0..open_ms.count {
-                    if i == 2 {
-                        break;
-                    }
-                    try_show_at(pstart(open_ms.data[i]));
-                }
-                let out2 = try_refactor(fqn);
-                buf_str(out2, c" --add");
-                put_word(out2, text);
-                buf_str(out2, c" --arm 'EXPR' --dry-run");
-                put_root(out2);
-                try_end(out2);
-                return 1;
+                return non_exhaustive(fqn, text, &missing, &opts);
             }
             list_of_node(e);
             list_insert(pcount(e), text);
@@ -298,7 +296,7 @@ fn variant_inner(argc: i64, argv: **u8) -> i64 {
                     buf_byte(pat, ')');
                 }
                 buf_str(pat, c" => ");
-                buf_str(pat, arm);
+                buf_str(pat, arms.data[i] as *u8);
                 insert_arm(m, buf_slice(pat));
             }
             buf_str(what, c"added variant ");
@@ -419,6 +417,169 @@ fn variant_inner(argc: i64, argv: **u8) -> i64 {
             put_count(what, n - 1, c"use", c"uses");
         }
         apply_edit(buf_slice(what), root)
+    }
+}
+
+// The options of `refactor variant` and their numbers of values.
+fn variant_options() -> *u8 {
+    c"--add=1 --arm=1 --arm-in=2 --remove=1 --rename=2"
+}
+
+// (0.14) The arms of `--arm-in SITE EXPR` options: each match of ms that
+// SITE names (the function, or any item, it is in; or `FILE:LINE` of a
+// line of it) gets EXPR in arms (the first that names it). False after a
+// diagnostic: SITE names nothing, or no match of ms.
+fn site_arms(opts: *IntVec, ms: *IntVec, arms: *IntVec, fqn: [u8]) -> bool {
+    unsafe {
+        let mut i = 0;
+        while i < (*opts).count {
+            let a = (*opts).data[i] as *u8;
+            let n = option_values(variant_options(), a);
+            if !streq(a, c"--arm-in") {
+                i += n + 1;
+                continue;
+            }
+            let site = c_slice((*opts).data[i + 1] as *u8);
+            let expr = (*opts).data[i + 2];
+            i += 3;
+            let mut line = 0;
+            let fl = file_line(site, &line);
+            let mut file = -1;
+            let mut defs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            if fl >= 0 {
+                file = file_named(site[0..fl]);
+            } else if !resolve_name(SUB, site, &defs) {
+                return false;
+            }
+            let mut hit = false;
+            for k in 0..(*ms).count {
+                let m = (*ms).data[k];
+                let mut named = false;
+                if fl >= 0 {
+                    named = file >= 0 && file_of_pos(pstart(m)) == file
+                        && line >= line_of(pstart(m)) && line <= line_of(pend(m) - 1);
+                }
+                for j in 0..defs.count {
+                    let d = defs.data[j];
+                    if DEFS[d].start <= pstart(m) && pstart(m) < DEFS[d].end {
+                        named = true;
+                    }
+                }
+                if named {
+                    hit = true;
+                    if (*arms).data[k] == 0 {
+                        (*arms).data[k] = expr;
+                    }
+                }
+            }
+            if !hit {
+                let x = diag(c"error", c"refactor.no-site");
+                buf_str(x, c"--arm-in ");
+                buf_bytes(x, site);
+                buf_str(x, c" names no match on ");
+                buf_bytes(x, fqn);
+                buf_str(x, c" that needs an arm; nothing written\n");
+                put_sites(ms);
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// The matches of ms, one per line on stdout: `FILE:LINE:COL<TAB>ITEM`.
+fn put_sites(ms: *IntVec) {
+    unsafe {
+        let out = buf_new();
+        for i in 0..(*ms).count {
+            let m = (*ms).data[i];
+            put_loc(out, pstart(m));
+            buf_byte(out, '\t');
+            let x = enclosing(pstart(m));
+            if x >= 0 {
+                put_short(out, DEFS[x].fqn);
+            }
+            buf_byte(out, '\n');
+        }
+        buf_write_fd(out, STDOUT);
+    }
+}
+
+// The site of match m for `--arm-in`: the item it is in (as `query refs`
+// writes it) when that holds no other match of ms and is a plain path,
+// else `FILE:LINE`.
+fn put_site(out: i64, m: i64, ms: *IntVec) {
+    unsafe {
+        let x = enclosing(pstart(m));
+        let mut alone = x >= 0;
+        for i in 0..(*ms).count {
+            let o = (*ms).data[i];
+            if o != m && enclosing(pstart(o)) == x {
+                alone = false;
+            }
+        }
+        if alone {
+            let b = buf_new();
+            put_short(b, DEFS[x].fqn);
+            let s = buf_slice(b);
+            if find_byte(s, '<') < 0 && find_byte(s, ' ') < 0 {
+                put_word(out, s);
+                return;
+            }
+        }
+        let b = buf_new();
+        put_path(b, file_of_pos(pstart(m)));
+        buf_byte(b, ':');
+        buf_int(b, line_of(pstart(m)));
+        put_word(out, buf_slice(b));
+    }
+}
+
+// After `error refactor.non-exhaustive`: the matches without an arm (on
+// stdout), and the commands that give them one: `--arm` (when no
+// `--arm-in` was given), and the command given with an `--arm-in` for
+// each. The exit status.
+fn non_exhaustive(fqn: [u8], text: [u8], missing: *IntVec, opts: *IntVec) -> i64 {
+    unsafe {
+        put_sites(missing);
+        for i in 0..(*missing).count {
+            if i == 2 {
+                break;
+            }
+            try_show_at(pstart((*missing).data[i]));
+        }
+        let given = opt(opts, c"--arm-in", false) != 0 as *u8;
+        if !given {
+            let out = try_refactor(fqn);
+            buf_str(out, c" --add");
+            put_word(out, text);
+            buf_str(out, c" --arm 'EXPR' --dry-run");
+            put_root(out);
+            try_end(out);
+        }
+        let out = try_refactor(fqn);
+        buf_str(out, c" --add");
+        put_word(out, text);
+        let mut i = 0;
+        while i < (*opts).count {
+            let a = (*opts).data[i] as *u8;
+            let n = option_values(variant_options(), a);
+            if streq(a, c"--arm-in") {
+                buf_str(out, c" --arm-in");
+                put_word(out, c_slice((*opts).data[i + 1] as *u8));
+                put_word(out, c_slice((*opts).data[i + 2] as *u8));
+            }
+            i += n + 1;
+        }
+        for i in 0..(*missing).count {
+            buf_str(out, c" --arm-in");
+            put_site(out, (*missing).data[i], missing);
+            buf_str(out, c" 'EXPR'");
+        }
+        buf_str(out, c" --dry-run");
+        put_root(out);
+        try_end(out);
+        1
     }
 }
 

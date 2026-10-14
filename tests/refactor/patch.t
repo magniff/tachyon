@@ -176,8 +176,8 @@ main.tach:4:12: error[type error] unresolved import 'calc::clamp'
 warning edit.breaks: 1 new error (dry run)
 [exit 1]
 $ edit patch calc.tach:13 --old 'v' --new 'w'
-error query.no-match: no item at calc.tach:13
-try: tachyonc query items crate::calc
+error patch.no-match: OLD 1 is not in calc.tach:13; no line is near it
+try: tachyonc query show calc.tach:13
 [exit 1]
 ## insert --in: at a text anchor, indented like its line (inside a block
 ## after a `{`).

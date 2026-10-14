@@ -79,7 +79,7 @@ error refactor.usage: --names gives 3 names for 2 parts
 try: tachyonc refactor split crate::shapes --plan --max-lines 25
 [exit 2]
 $ refactor split crate::shapes --auto --max-lines 25 --names measures
-split crate::shapes into 2 modules	4 files	+39 -31 lines
+split crate::shapes into 2 modules	4 files	+41 -33 lines
 % ls shapes
 measures.tach
 mod.tach

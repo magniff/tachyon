@@ -344,37 +344,22 @@ from its source in this compiler (every item is `pub`):
 
 ## Input, output, arguments
 
-std prints; reading goes through C (`getchar`, `read`, `fopen`):
+std prints and reads stdin: `read_stdin()` (all of it, a `Buf`),
+`read_line(&buf)` (the next line, without its `'\n'`; false at the end),
+`Scanner` (tokens, numbers, lines of a text), `parse_int`, `split`,
+`trim`. Files go through C (`fopen`):
 
 ```tach
-import "stdio.h" as c;
 import "string.h" as c;
-use std::Buf;
-
-fn read_all() -> Buf {                    // all of stdin
-    let mut b = Buf::new();
-    loop {
-        let ch = unsafe { c::getchar() };
-        if ch < 0 { break; }              // EOF
-        b.push(ch as u8);
-    }
-    b                                     // the caller frees it
-}
+use std::{Scanner, read_stdin};
 
 fn main(argc: i32, argv: **u8) -> i32 {
-    let mut input = read_all();
-    defer input.free();
-    let text = input.as_slice();
+    let mut input = read_stdin();         // all of stdin
+    defer input.free();                   // the caller frees it
+    let mut sc = Scanner::new(input.as_slice());
     let mut total = 0;
-    let mut start = 0;
-    for i in 0..text.len + 1 {            // each line, the last one too
-        if i == text.len || text[i] == '\n' {
-            let line = text[start..i];
-            let mut n = 0;
-            for ch in line { if ch >= '0' && ch <= '9' { n = n * 10 + (ch - '0') as i64; } }
-            total += n;
-            start = i + 1;
-        }
+    while let Some(n) = sc.next_int() {   // None at the end
+        total += n;
     }
     std::print_int(total);
     println("");

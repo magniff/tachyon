@@ -53,7 +53,7 @@ Output is one fact per line, fields separated by a TAB.
 | rename a local or parameter | `tachyonc refactor rename FILE:LINE:COL NEW` or `refactor rename FN::x NEW` (shadowing respected) |
 | a parameter, with every call | `tachyonc refactor signature FN --add 'x: i64 = 0'` (`--remove`, `--rename-param`, `--reorder`, `--type`) |
 | a field, with every literal | `tachyonc refactor field STRUCT --add 'g: i64 = 0'` |
-| a variant, with every match | `tachyonc refactor variant ENUM --add 'X(i64)' --arm 'EXPR'` |
+| a variant, with every match | `tachyonc refactor variant ENUM --add 'X(i64)' --arm 'EXPR'` (`--arm-in FN 'EXPR'` per match) |
 | move items to a module | `tachyonc refactor move PATH --to MODULE` |
 | an idiom everywhere, typed | `tachyonc rewrite 'old($a)' 'new($a)' --dry-run` |
 | imports, unused, pub, unsafe | `tachyonc fix` (`--only imports,unused,pub,unsafe`, `--dry-run`) |
