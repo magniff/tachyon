@@ -7,7 +7,9 @@
 # version of its time divided by cc -O2's (below 1: faster than C);
 # last (0.14), the time of bench/iterchain.tach (iterator chains) over
 # that of bench/iterloop.tach (the same loops by hand) at -O2, which fails
-# the run above 1.05.
+# the run above 1.05. That ratio is measured on its own, robust to a busy
+# machine: the two -O2 programs run alternately, RUNS rounds of one run
+# each, and each side's time is its fastest round.
 #
 # usage: bench/run.sh [-c COMPILER] [-p PREVIOUS] [-s SEED] [-r RUNS] [-t TARGET]
 #
@@ -141,8 +143,20 @@ awk -v n="$(echo $VARIANTS | wc -w)" '
           printf " %9s\n", "1" }' "$WORK/times"
 
 # (0.14) Iterator chains against the same loops written by hand, at -O2:
-# zero cost is a ratio of 1; above 1.05 is a failure.
+# zero cost is a ratio of 1; above 1.05 is a failure. The two run
+# alternately, the fastest of RUNS rounds each (noise from other work on
+# the machine hits both sides alike, and the minimum drops most of it).
 if [ -n "${CHAIN_MS:-}" ] && [ -n "${LOOP_MS:-}" ]; then
+    round=0
+    while [ $round -lt "$RUNS" ]; do
+        ms=$("$WORK/timer" 1 "$WORK/empty" "$WORK/iterchain.round.out" "$WORK/iterchain.O2")
+        [ "$ms" -lt "$CHAIN_MS" ] && CHAIN_MS=$ms
+        ms=$("$WORK/timer" 1 "$WORK/empty" "$WORK/iterloop.round.out" "$WORK/iterloop.O2")
+        [ "$ms" -lt "$LOOP_MS" ] && LOOP_MS=$ms
+        round=$((round + 1))
+    done
+    printf "%-10s %9s %9s\n" "iterchain" "$CHAIN_MS" "(min of $((RUNS * 2)))"
+    printf "%-10s %9s\n" "iterloop" "$LOOP_MS"
     ratio=$(awk -v a="$CHAIN_MS" -v b="$LOOP_MS" 'BEGIN { if (b < 1) b = 1; if (a < 1) a = 1; printf "%.3f", a / b }')
     printf "%-10s %9s\n" "iterchain/iterloop" "$ratio"
     if awk -v r="$ratio" 'BEGIN { exit !(r > 1.05) }'; then

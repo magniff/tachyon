@@ -696,6 +696,16 @@ around the per-function passes. In order:
    program takes stays, even when every call through the address was
    made direct and inlined (a function used as a value is part of what
    the program is; the IR and assembly tests rely on it).
+   Before all of this (0.14, at -O1 and -O2), the functions of std that
+   no function of the program reaches, through calls and addresses, are
+   dropped (`drop_unreachable_std`): they are neither cleaned up nor
+   optimized. std grew with 0.14 and every one of its non-generic
+   functions is lowered; optimizing them was most of the time of
+   compiling a small program (a 7-line program: 7 ms of CPU, now 3 ms;
+   0.13: 2 ms). The program's own unused functions stay roots, as before.
+   At -O2 the remaining std functions have fewer callers, which can change
+   what is inlined (a `print_int` called once is inlined) and which
+   arguments are constants; -O0 does not go through here.
 
 **The inliner's cost model.** The cost of inlining callee g at a call
 site is g's size (instructions that become code, after g was itself
@@ -1426,10 +1436,22 @@ Tests: `tests/run/opt_iter_map_sum.tach` (no call, no slot, the vector
 loop), `opt_iter_next.tach` (`take` over `next` vectorized, `while let`
 over `map`, `max` with an `Option` accumulator: no switch, no tag phi
 left), `opt_iter_deep.tach` (60 capturing maps: one vector loop, no
-memcpy). bench/iterchain.tach (six kernels as chains, hand-desugared
-until the front end lands) against bench/iterloop.tach (the same by
-hand), with C twins; bench/run.sh prints the ratio of their -O2 times
-and fails above 1.05.
+memcpy), all three hand-desugared, and `opt_iter_real.tach`: the same
+kernels (and filter, zip, enumerate, count) written with std's
+iterators and closures as the front end makes them, with the same
+checks. bench/iterchain.tach (six kernels as chains of std's iterators
+and closures) against bench/iterloop.tach (the same by hand), with C
+twins; bench/run.sh prints the ratio of their -O2 times, the fastest of
+RUNS rounds each, run alternately, and fails above 1.05.
+
+With the front end's own output (after the merge of the closures and
+iterators), best of 5 per kernel on a busy machine, chain/hand in ms:
+filter-map-sum 68/71, dot 106/112, enumerate 54/55, max+count 158/162,
+take over `next` 26/26, collect+sort_by 19/16; the whole program
+497/511 (0.97). The last kernel's gap is std's `sort_by` (one loop for
+both heap phases) against the hand-written heapsort, not the chain: the
+collect alone is even, and the inlined comparator compiles to the same
+instructions; the two sorts differ in block layout only.
 
 Compile time: the compiler compiles itself as fast as before (1.59 s
 against 1.59 s, best of five); a chain of 200 capturing maps compiles in

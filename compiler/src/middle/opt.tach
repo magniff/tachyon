@@ -11,6 +11,8 @@ use crate::base::timer::{
     T_ATTRS, T_GLOBAL_DCE, T_HEAP, T_INLINE, T_IPCP, T_LICM, T_LOOPS, T_PROMOTE, T_SCALAR, T_SLP,
     T_TRE, timer_add, timer_now,
 };
+use crate::front::modules::{STD_MODULE, module_of};
+use crate::front::types::FNS;
 use crate::gen0::gen::fn_is_global;
 use crate::middle::adce::aggressive_dce;
 use crate::middle::copies::elide_copies;
@@ -19,15 +21,15 @@ use crate::middle::fold::{instcombine, sccp};
 use crate::middle::gvn::run_gvn;
 use crate::middle::inline::{
     FN_ADDRESS, FN_CALLS, FN_LIVE, FN_SCC, FN_SIZE, SCC_ORDER, compute_sccs, count_call_sites,
-    func_size, inline_rounds, inlined_everywhere, start_inlining_budget,
+    func_size, inline_rounds, inlined_everywhere, ir_callee, start_inlining_budget,
 };
 use crate::middle::ipo::{
     PRINT_ATTRS, has_effect, heap_to_stack, infer_component_attrs, init_attrs, print_attrs,
     propagate_constants,
 };
 use crate::middle::ir::{
-    ARGS, ARGTY, BLOCKS, INSTS, IRF, IRFUNCS, IRFUNC_COUNT, Op, Term, ir_append, ir_arg, ir_operand,
-    ir_operand_count, ir_replace, ir_resolve_operands, ir_unlink, ir_val,
+    ARGS, ARGTY, BLOCKS, FN_IR, INSTS, IRF, IRFUNCS, IRFUNC_COUNT, Op, Term, ir_append, ir_arg,
+    ir_operand, ir_operand_count, ir_replace, ir_resolve_operands, ir_unlink, ir_val,
 };
 use crate::middle::ir::cfg::{
     copy_terminator, is_succ, pred_index, redirect_succ, succ, succ_count, switch_target,
@@ -597,16 +599,23 @@ pub fn optimize_program() {
         FN_LIVE = alloc_array::<i64>(IRFUNC_COUNT + 1);
         for fi in 0..IRFUNC_COUNT {
             FN_LIVE[fi] = 1;
-            IRF = fi;
-            cleanup_function(fi);
+        }
+        drop_unreachable_std();
+        for fi in 0..IRFUNC_COUNT {
+            if FN_LIVE[fi] != 0 {
+                IRF = fi;
+                cleanup_function(fi);
+            }
         }
         if OPT_LEVEL == 0 {
             return;
         }
         let mut t = timer_now();
         for fi in 0..IRFUNC_COUNT {
-            IRF = fi;
-            simplify_function(fi);
+            if FN_LIVE[fi] != 0 {
+                IRF = fi;
+                simplify_function(fi);
+            }
         }
         timer_add(T_SCALAR, t);
         if OPT_LEVEL < 2 {
@@ -641,6 +650,14 @@ pub fn optimize_program() {
         let mut component_start = 0;
         for i in 0..SCC_ORDER.count {
             let fi = SCC_ORDER.data[i];
+            // (0.14: a std function the program cannot reach, and so its
+            // whole component)
+            if FN_LIVE[fi] == 0 {
+                if i + 1 == SCC_ORDER.count || FN_SCC[SCC_ORDER.data[i + 1]] != FN_SCC[fi] {
+                    component_start = i + 1;
+                }
+                continue;
+            }
             IRF = fi;
             t = timer_now();
             if eliminate_tail_recursion(fi) {
@@ -829,5 +846,58 @@ fn remove_dead_functions() {
                 }
             }
         }
+    }
+}
+
+// (0.14) std's functions the program cannot reach are not optimized or
+// emitted, at every level: std grew with 0.14 (iterators, sort_by, input),
+// and its non-generic functions, all lowered, cost most of the time of
+// compiling a small program. The roots are every function not from std
+// (a program's own unused functions stay, as before); a std function is
+// reachable when a reachable function calls it or takes its address.
+fn drop_unreachable_std() {
+    unsafe {
+        if STD_MODULE < 0 {
+            return;
+        }
+        let reach = alloc_array::<i64>(IRFUNC_COUNT + 1);
+        let mut work = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for fi in 0..IRFUNC_COUNT {
+            reach[fi] = 0;
+            let f = IRFUNCS[fi].f;
+            if fn_is_global(f) || module_of(FNS[f].node) != STD_MODULE {
+                reach[fi] = 1;
+                work.push(fi);
+            }
+        }
+        while work.count > 0 {
+            work.count -= 1;
+            let fi = work.data[work.count];
+            for i in 0..IRFUNCS[fi].blocks.count {
+                let b = IRFUNCS[fi].blocks.data[i];
+                if BLOCKS[b].removed != 0 {
+                    continue;
+                }
+                let mut v = BLOCKS[b].first;
+                while v != 0 {
+                    let mut g = ir_callee(v);
+                    if INSTS[v].op == Op::FAddr && FN_IR[INSTS[v].imm] != 0 {
+                        g = FN_IR[INSTS[v].imm] - 1;
+                    }
+                    if g >= 0 && reach[g] == 0 {
+                        reach[g] = 1;
+                        work.push(g);
+                    }
+                    v = INSTS[v].next;
+                }
+            }
+        }
+        for fi in 0..IRFUNC_COUNT {
+            if reach[fi] == 0 {
+                FN_LIVE[fi] = 0;
+            }
+        }
+        free(work.data as *u8);
+        free(reach as *u8);
     }
 }
