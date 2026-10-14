@@ -1,0 +1,322 @@
+// `query deps MODULE`: for each item of a module, its lines, what of the
+// module it uses and what uses it; then a grouping of the items into parts
+// of at most N lines (average-linkage clustering of the references between
+// them, then packing), which `refactor split --plan` starts from.
+
+use crate::base::{
+    IntVec, STDOUT, SYMS, alloc_array, buf_byte, buf_bytes, buf_int, buf_new, buf_str, buf_write_fd,
+};
+use crate::front::modules::{file_of_pos, module_at};
+use crate::tools::plan::{def_lines, sort_desc, user_file};
+use crate::tools::proc::same_bytes;
+use crate::tools::query::{OPT_MAX_LINES, QF_DEF};
+use crate::tools::query::defs::{DEFS, DEF_COUNT, K_MOD, mod_fqn};
+use crate::tools::query::positions::{enclosing, sort_by_position};
+use crate::tools::query::refs::{
+    R_DEF, R_FLAGS, R_POS, collect_refs, file_text, put_short, set_targets, sorted_refs,
+};
+use crate::tools::query::show::{find_modules, module_file};
+
+// ---- deps ----
+
+// The item a definition belongs to (a field's struct, a variant's enum, a
+// trait's function's trait), or -1.
+fn item_of(d: i64) -> i64 {
+    unsafe {
+        let mut x = d;
+        while x >= 0 && DEFS[x].parent >= 0 {
+            x = DEFS[x].parent;
+        }
+        x
+    }
+}
+
+// The name of item d in its module: its path without the module's.
+pub fn put_local(out: i64, d: i64, m: i64) {
+    unsafe {
+        let p = SYMS[DEFS[d].fqn].text;
+        let mp = SYMS[mod_fqn(m)].text;
+        if p.len > mp.len + 2 && same_bytes(p[0..mp.len], mp) && p[mp.len] == ':' {
+            buf_bytes(out, p[mp.len + 2..p.len]);
+        } else {
+            put_short(out, DEFS[d].fqn);
+        }
+    }
+}
+
+// `query deps MODULE`: per item (in order), its lines, the items of the
+// module it uses, the ones that use it, and the references from other
+// modules; then groups of at most --max-lines lines (connected items
+// together), and the references between groups.
+pub fn query_deps(name: [u8]) -> i64 {
+    unsafe {
+        let mut modules = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        find_modules(name, false, &modules);
+        if modules.count == 0 {
+            crate::tools::query::no_module(name);
+            return 1;
+        }
+        let m = modules.data[0];
+        // The module's items (and their fields, variants, functions) are
+        // the targets.
+        let mut items = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut targets = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for d in 0..DEF_COUNT {
+            if DEFS[d].module == m && DEFS[d].kind != K_MOD && user_file(file_of_pos(DEFS[d].start)) {
+                targets.push(d);
+                if DEFS[d].parent < 0 {
+                    items.push(d);
+                }
+            }
+        }
+        sort_by_position(&items);
+        let n = items.count;
+        // index of each item in `items` (+1), by definition
+        let index = alloc_array::<i64>(DEF_COUNT + 1);
+        for i in 0..n {
+            index[items.data[i]] = i + 1;
+        }
+        set_targets(&targets);
+        collect_refs();
+        let mut order = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        sorted_refs(&order);
+        // weight[a * n + b]: the references from item a to item b.
+        let weight = alloc_array::<i64>(n * n + 1);
+        let outside = alloc_array::<i64>(n + 1);
+        for k in 0..order.count {
+            let r = order.data[k];
+            if (R_FLAGS.data[r] & QF_DEF) != 0 {
+                continue;
+            }
+            let t = item_of(R_DEF.data[r]);
+            if t < 0 || index[t] == 0 {
+                continue;
+            }
+            let e = enclosing(R_POS.data[r]);
+            let s = if e >= 0 { item_of(e) } else { -1 };
+            if s < 0 || index[s] == 0 {
+                if module_at(R_POS.data[r]) != m {
+                    outside[index[t] - 1] += 1;
+                }
+                continue;
+            }
+            if s != t {
+                weight[(index[s] - 1) * n + index[t] - 1] += 1;
+            }
+        }
+        let lines = alloc_array::<i64>(n + 1);
+        let mut total = 0;
+        for i in 0..n {
+            lines[i] = def_lines(items.data[i]);
+            total += lines[i];
+        }
+        let out = buf_new();
+        buf_str(out, c"# ");
+        buf_bytes(out, SYMS[mod_fqn(m)].text);
+        let file = module_file(m);
+        if file >= 0 {
+            buf_byte(out, '\t');
+            buf_bytes(out, file_text(file));
+        }
+        buf_byte(out, '\t');
+        buf_int(out, total);
+        buf_str(out, c" lines\t");
+        buf_int(out, n);
+        buf_str(out, c" items\n");
+        for i in 0..n {
+            put_local(out, items.data[i], m);
+            buf_byte(out, '\t');
+            buf_int(out, lines[i]);
+            buf_byte(out, '\t');
+            put_names(out, &items, m, weight, n, i, true);
+            buf_byte(out, '\t');
+            put_names(out, &items, m, weight, n, i, false);
+            buf_byte(out, '\t');
+            buf_int(out, outside[i]);
+            buf_byte(out, '\n');
+        }
+        put_groups(out, &items, m, weight, lines, n);
+        buf_write_fd(out, STDOUT);
+        0
+    }
+}
+
+// The items item i uses (or, !uses, that use it), space-separated; `-`
+// for none.
+fn put_names(out: i64, items: *IntVec, m: i64, weight: *i64, n: i64, i: i64, uses: bool) {
+    unsafe {
+        let mut any = false;
+        for j in 0..n {
+            let w = if uses { weight[i * n + j] } else { weight[j * n + i] };
+            if w == 0 {
+                continue;
+            }
+            if any {
+                buf_byte(out, ' ');
+            }
+            put_local(out, (*items).data[j], m);
+            any = true;
+        }
+        if !any {
+            buf_byte(out, '-');
+        }
+    }
+}
+
+// The grouping of the items into parts of at most OPT_MAX_LINES lines
+// (cluster), printed as
+// `groups<TAB>N<TAB>at most MAX lines<TAB>CUT references between them`,
+// then `group K<TAB>LINES<TAB>ITEMS` each.
+fn put_groups(out: i64, items: *IntVec, m: i64, weight: *i64, lines: *i64, n: i64) {
+    unsafe {
+        let max = OPT_MAX_LINES;
+        let group = alloc_array::<i64>(n + 1);
+        let size = alloc_array::<i64>(n + 1);
+        cluster(weight, lines, n, max, group, size);
+        let groups = n;
+        // The references between groups.
+        let mut cut = 0;
+        for i in 0..n {
+            for j in 0..n {
+                if group[i] != group[j] {
+                    cut += weight[i * n + j];
+                }
+            }
+        }
+        // The groups, largest first.
+        let mut order = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for g in 0..groups {
+            if size[g] >= 0 {
+                order.push(g);
+            }
+        }
+        sort_desc(&order, size);
+        buf_str(out, c"groups\t");
+        buf_int(out, order.count);
+        buf_str(out, c"\tat most ");
+        buf_int(out, max);
+        buf_str(out, c" lines\t");
+        buf_int(out, cut);
+        buf_str(out, if cut == 1 { c" reference between them\n" } else { c" references between them\n" });
+        for k in 0..order.count {
+            let g = order.data[k];
+            buf_str(out, c"group ");
+            buf_int(out, k + 1);
+            buf_byte(out, '\t');
+            buf_int(out, size[g]);
+            buf_byte(out, '\t');
+            let mut first = true;
+            for i in 0..n {
+                if group[i] != g {
+                    continue;
+                }
+                if !first {
+                    buf_byte(out, ' ');
+                }
+                put_local(out, (*items).data[i], m);
+                first = false;
+            }
+            if size[g] > max {
+                buf_str(out, c"\tover");
+            }
+            buf_byte(out, '\n');
+        }
+    }
+}
+
+// The grouping of n items (weight[a * n + b]: the references from item a
+// to item b; lines[i]: item i's lines) into parts of at most max lines:
+// agglomerative, by average linkage: from one part per item, the two
+// parts with the most references between them per pair of their items
+// are merged while they fit together; then the parts with no references
+// between them are packed (first fit, largest first). group[i] is item
+// i's part (the index of one of its items), size[g] the lines of part g
+// (-1 for an index that is no part's).
+pub fn cluster(weight: *i64, lines: *i64, n: i64, max: i64, group: *i64, size: *i64) {
+    unsafe {
+        let count = alloc_array::<i64>(n + 1);
+        // (the references between parts, both ways)
+        let w = alloc_array::<i64>(n * n + 1);
+        for i in 0..n {
+            group[i] = i;
+            size[i] = lines[i];
+            count[i] = 1;
+            for j in 0..n {
+                w[i * n + j] = if i == j { 0 } else { weight[i * n + j] + weight[j * n + i] };
+            }
+        }
+        loop {
+            let mut ga = -1;
+            let mut gb = -1;
+            let mut best_w = 0;
+            let mut best_c = 1;
+            for a in 0..n {
+                if size[a] < 0 {
+                    continue;
+                }
+                for b in a + 1..n {
+                    if size[b] < 0 || w[a * n + b] == 0 || size[a] + size[b] > max {
+                        continue;
+                    }
+                    // (w / (count a * count b), compared without division)
+                    let c = count[a] * count[b];
+                    let better = w[a * n + b] * best_c > best_w * c
+                        || (w[a * n + b] * best_c == best_w * c && ga >= 0 && size[a] + size[b] < size[ga] + size[gb]);
+                    if ga < 0 || better {
+                        ga = a;
+                        gb = b;
+                        best_w = w[a * n + b];
+                        best_c = c;
+                    }
+                }
+            }
+            if ga < 0 {
+                break;
+            }
+            merge_group(group, size, count, w, n, ga, gb);
+        }
+        // Packing what has no references between: first fit, largest first.
+        let mut parts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for g in 0..n {
+            if size[g] >= 0 {
+                parts.push(g);
+            }
+        }
+        sort_desc(&parts, size);
+        let mut bins = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for k in 0..parts.count {
+            let g = parts.data[k];
+            let mut placed = false;
+            for x in 0..bins.count {
+                let b = bins.data[x];
+                if size[b] + size[g] <= max {
+                    merge_group(group, size, count, w, n, b, g);
+                    placed = true;
+                    break;
+                }
+            }
+            if !placed {
+                bins.push(g);
+            }
+        }
+    }
+}
+
+// Merges part b into part a (their items, sizes, references).
+fn merge_group(group: *i64, size: *i64, count: *i64, w: *i64, n: i64, a: i64, b: i64) {
+    unsafe {
+        for i in 0..n {
+            if group[i] == b {
+                group[i] = a;
+            }
+        }
+        size[a] += size[b];
+        size[b] = -1;
+        count[a] += count[b];
+        for x in 0..n {
+            w[a * n + x] += w[b * n + x];
+            w[x * n + a] += w[x * n + b];
+        }
+        w[a * n + a] = 0;
+    }
+}
