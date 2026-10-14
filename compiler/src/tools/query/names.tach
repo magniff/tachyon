@@ -11,7 +11,12 @@
 //   with symbol S is `S.k`): the function;
 // - `a::mod`, `crate::a::mod`: the module `a`; `f()`: `f`.
 
-use crate::base::{BUFS, buf_byte, buf_bytes, buf_new, buf_slice};
+use crate::base::{BUFS, FILES, IntVec, SRC, buf_byte, buf_bytes, buf_new, buf_slice, buf_str};
+use crate::tools::query::def_at_line;
+use crate::tools::query::defs::{DEFS, MOD_DEF};
+use crate::tools::query::diagnostics::diag;
+use crate::tools::query::positions::{LINES, line_end, line_index, line_of};
+use crate::tools::query::show::{find_modules, query_items};
 
 fn is_digit(c: u8) -> bool {
     c >= '0' && c <= '9'
@@ -235,4 +240,69 @@ pub fn path_matches(p: [u8], x0: [u8]) -> bool {
         return p[p.len - x.len - 1] == '/' && p[p.len - x.len..p.len] == x;
     }
     x.len > p.len && p[0] != '<' && x[x.len - p.len - 1] == '/' && x[x.len - p.len..x.len] == p
+}
+
+pub fn is_name_char(c: u8) -> bool {
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+}
+
+// (0.15) The item that starts below line `line` of file f, when that line
+// is a comment or an attribute, and the ones down to the item are too or
+// blank (a `show` header's first line is its comment's); -1 otherwise.
+pub fn item_below(f: i64, line: i64) -> i64 {
+    unsafe {
+        let first = line_index(FILES[f].start);
+        let mut l = line;
+        while l >= 1 && first + l - 1 < LINES.count && LINES.data[first + l - 1] < FILES[f].end {
+            let mut p = LINES.data[first + l - 1];
+            let end = line_end(p);
+            while p < end && (SRC[p] == ' ' || SRC[p] == '\t') {
+                p += 1;
+            }
+            let blank = p >= end;
+            let comment = p + 1 < end && ((SRC[p] == '/' && SRC[p + 1] == '/')
+                || (SRC[p] == '#' && SRC[p + 1] == '['));
+            if blank && l == line {
+                return -1;
+            }
+            if !blank && !comment {
+                let d = def_at_line(f, l);
+                return if d >= 0 && line_of(DEFS[d].start) == l { d } else { -1 };
+            }
+            l += 1;
+        }
+        -1
+    }
+}
+
+// (0.15) NAME as a module (`crate`, `a::b`): the definitions of its `mod`
+// items, into out; for the root, which has none, a note and its items.
+pub fn module_def(name: [u8], out: *IntVec) -> bool {
+    unsafe {
+        let mut modules = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        find_modules(name, true, &modules);
+        if modules.count == 0 {
+            return false;
+        }
+        let mut root = false;
+        for i in 0..modules.count {
+            let m = modules.data[i];
+            if m < MOD_DEF.count && MOD_DEF.data[m] >= 0 {
+                out.push(MOD_DEF.data[m]);
+            } else {
+                root = true;
+            }
+        }
+        if (*out).count > 0 {
+            return true;
+        }
+        if root {
+            let d = diag(c"note", c"query.module");
+            buf_byte(d, '\'');
+            buf_bytes(d, name);
+            buf_str(d, c"' is a module without a `mod` item (the root, or std); its items:\n");
+            query_items(&modules);
+        }
+        root
+    }
 }

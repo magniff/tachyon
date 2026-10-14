@@ -15,6 +15,7 @@ compiler's own `<std>` and `<C import>` last), then line, then column.
 tachyonc query def NAME... [--root ROOT] [--exact]
 tachyonc query show NAME... [--root ROOT] [--exact] [--with-comments]
 tachyonc query show FILE.tach... | MODULE::use | MODULE::header | MODULE::extern
+tachyonc query context NAME...|MODULE [--budget TOKENS]     (0.15) source, calls, types, callers
 tachyonc query text FILE[:A[-B]]...                         (no program read)
 tachyonc query diff [ROOT]                                  the last journaled edit
 tachyonc query refs NAME... [--root ROOT] [--exact] [--count] [--in FILE|MODULE] [--kind K,...] [--limit N] [--all]
@@ -29,6 +30,10 @@ tachyonc query unused [MODULE|FILE] [--all]                (refactor.md)
 tachyonc query impact NAME                                 (refactor.md)
 tachyonc query --help
 ```
+
+Every command takes `--budget TOKENS` (0.15, [The output
+budget](#the-output-budget-015)), and answers about std from any program
+([std](#std-from-any-program-015)).
 
 `ROOT` is the program's root file: `--root ROOT`, or (the form of 0.11's
 first query) a last argument ending in `.tach` after the NAMEs (`items
@@ -64,6 +69,7 @@ One line of grammar per kind of line (`\t` is a TAB; `[...]` optional):
 | refs, callers `--count` | count | `COUNT`, or `COUNT \t PATH` per definition when several match |
 | grep | file header, hit | `# FILE`; `LINE:COL \t (code \| comment \| string) \t ENCLOSING \t SOURCE` |
 | type | type | `TYPE \t EXPRESSION` |
+| context | item | the show header (`\t section: TITLE` when in one), source, then `// calls (N)`, `// types (N)`, `// uses (N)` with def lines, `// callers (N)` with `ENCLOSING \t FILE:LINE:COL \t SOURCE` |
 | items MODULE | module header | `# PATH \t FILE` |
 | items MODULE | item | `LINE \t KIND \t SIGNATURE` |
 | items MODULE `--comments` | banner, comment | `FIRST-LAST \t (section \| comment) \t TITLE` |
@@ -129,6 +135,29 @@ definition is named, and accepted back as NAME:
 - No match: exit 1, `error query.no-match`, and a `try:` line for each of
   the (at most 3) definitions whose names are nearest to NAME's last
   segment (edit distance at most a third of its length).
+
+### Every spelling a tool prints (0.15)
+
+What one command prints, another takes back as NAME, FILE or MODULE
+(`query/names.tach`; `tests/query/run.sh` round-trips every name def,
+show, refs, items, check and the assembly print):
+
+| printed | taken as |
+|---|---|
+| `main.tach:12:5:` (a short diagnostic), `main.tach:12-30` (a show header) | `main.tach:12` |
+| `./main.tach`, `/home/me/prog/main.tach` | the program's `main.tach` (by whole components) |
+| `Vec<i64>::push`, `Vec::<i64>::new`, `twice<V2>` (an instance) | `Vec::push`, `Vec::new`, `twice` |
+| `main.0`, `main.0.1` (a closure's symbol) | `main` |
+| `_tachyon.std.Buf.new`, `tachyon.apply.GN6main.0`, `_tachyon.Tl.cmp` (a symbol of the generated code) | `std::Buf::new`, `apply`, `i64::cmp` |
+| `a::mod`, `f()` | `a`, `f` |
+| `std`, `std.tach`, `<std>` (a FILE) | std's source |
+| `crate`, `a::b` (a module) | its `mod` item; the root's items, with `note query.module` |
+
+`FILE:LINE` on a comment line is the item below it (a show header's
+first line); outside every item (a `use` line) it is what the name at
+COL (or the first on the line) names. `--in`, `items` and the
+refactorings' module paths take a file's path (`./catalog.tach`) and a
+path without `crate::` (`refactor new-module report`).
 
 ## def
 
@@ -308,6 +337,66 @@ try: target/tachyonc query refs IntVec::push --all
 (the `--in` suggestion is the file with the most). `--limit N` lists the
 first N, then `note query.truncated: showing N of M refs`; `--all` lists
 everything.
+
+## context (0.15)
+
+`query context NAME` answers in one call what takes three to five
+queries (show, then show of what it calls, then refs): the item's source
+with its comments (and the title of its section, `items --comments`),
+the def lines of what it calls (the most specific first: the least used
+in the program) and of the types and statics it uses (a short struct or
+enum whole), and its callers with their lines (`used by` for a type). It
+is fitted to a budget, 2000 tokens by default (`--budget N`): the source
+gets at least half; what does not fit is counted in a last note with
+the commands that print it:
+
+```
+$ tachyonc query context report --budget 120
+// crate::report→context/main.tach:9-15→section: Reports
+// The total, after restocking the empty items.
+fn report(items: *Vec<Item>) -> i64 {
+    ...
+}
+// calls (3)
+std::Vec::len→<std>:120:12→method→pub fn len(self: *Vec<T>) -> i64
+crate::stock::restock→context/stock.tach:10:8→fn→pub fn restock(items: *Vec<Item>, i: i64, n: i64)
+// callers (2)
+main→context/main.tach:21:13→let n = report(&items);
+note query.budget: over the budget of 120 tokens, left out: calls 1, types or uses 2, callers 1
+try: tachyonc query callers report
+try: tachyonc query context report --budget 360
+```
+
+`query context MODULE` prints `items MODULE --comments`, then the
+bodies of the module's functions, those its own code calls most first,
+then those called most from outside, as far as the budget goes.
+
+## The output budget (0.15)
+
+`--budget TOKENS` (4 bytes a token) on any query cuts the answer at a
+line, with `note query.budget: cut at about N tokens: L of M lines
+(about T tokens in all)` and `try:` the command with the budget it
+needs. Without --budget an answer over 8000 tokens is cut the same way
+(not with `--all`; `--budget 0` is no limit). The diagnostics come after
+the answer.
+
+## std from any program (0.15)
+
+std's items answer from every root, whether the program uses std or
+not, and where there is no program at all (a directory without
+`main.tach`):
+
+- a question that names std (`std`, `std::read_line`, `<std>`,
+  `std:A-B`, `--in std`) reads the program with std (and without the
+  cache);
+- a NAME that std defines and the program does not (`Vec::push`,
+  `read_line`) is asked again with std;
+- `items std` lists std's API: its `pub` items and trait impls (`--all`:
+  the rest);
+- `show` of a std item adds the `use` line a program needs (`// use
+  std::HashMap;`; none for the prelude);
+- `text std:A-B` prints std's source (as `<std>` numbers it), `grep
+  TEXT --in std` searches it.
 
 ## items
 

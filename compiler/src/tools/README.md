@@ -9,7 +9,7 @@ the edited program checked before anything is written, a journal for
 
 | module | |
 |---|---|
-| `query/` | `tachyonc query`: definitions (`defs`), positions, references (`refs`), `def`/`show`/`items` (`show`), diagnostics and `try:` lines; the tools' cache under target/ (`cache`, 0.13) |
+| `query/` | `tachyonc query`: definitions (`defs`), positions, references (`refs`), `def`/`show`/`items` (`show`), diagnostics and `try:` lines; the tools' cache under target/ (`cache`, 0.13); every printed spelling of a name (`names`), std from any program (`stdq`), `--budget` (`budget`), `query context` (`context`) (0.15) |
 | `query_text.tach` | `query text`, `query show FILE`, a module's regions (`::use`, `::header`, `::extern`) |
 | `plan/` | the planning queries: `stats`, `deps` (with the clustering), `unused`, `impact`; `lint` |
 | `proc.tach` | processes and files: running a program, workers, renames |
@@ -27,4 +27,6 @@ the edited program checked before anything is written, a journal for
 | `script.tach` | `refactor --script`: commands checked once, one undo |
 | `commands.tach` | the table of the commands that change a program |
 | `fmt/` | `tachyonc fmt` (0.13, docs/fmt.md): the pieces of a text (`pieces`), lines and levels (`layout`), wrapping (`wrap`), `use` runs (`uses`); the edit engine formats its edits with it |
+| `help.tach` | `--help` on every command (0.15): the tools table's rows for it |
+| `snippet.tach` | `tachyonc try` (0.15): a snippet compiled and run with std, its value printed |
 | `explain/` | `tachyonc explain CODE` (0.13): the table of every diagnostic code (`tools_table`, `refactor_table`) |

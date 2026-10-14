@@ -20,6 +20,7 @@ sed, head, cat or awk ([docs/query.md](docs/query.md)):
 
 | you want | run |
 |---|---|
+| an item with what it calls, its types and callers, in one answer | `target/tachyonc query context NAME` (`--budget N`; a MODULE: its items and central bodies) |
 | the source of a function, type, method | `target/tachyonc query show NAME` |
 | where something is used | `target/tachyonc query refs NAME` (`--count`, `--in FILE\|MODULE`, `--kind write,call,...`) |
 | text that is not a name (a message, a comment), with its item | `target/tachyonc query grep TEXT` (`--comments`, `--strings`, `--code`, `--word`, `--in`) |
@@ -58,10 +59,17 @@ sed, head, cat or awk ([docs/query.md](docs/query.md)):
 | what a signature change touches | `target/tachyonc query impact NAME` |
 | files over a size | `target/tachyonc lint --max-lines 1000` |
 | lay code out (indentation, spaces, wrapping, `use` lines; edits do it too) | `target/tachyonc fmt FILE\|MODULE` (`--check`, `--dry-run`; `--all` the tree) |
-| what a diagnostic code means, how to fix it | `target/tachyonc explain CODE` (`explain TOOL` lists its codes) |
+| what a diagnostic code means, how to fix it | `target/tachyonc explain CODE` (`explain TOOL` lists its codes; `explain WORDS`: the guide on them) |
+| std's API, a std item (from any program, or none) | `target/tachyonc query items std`, `query show std::read_line`, `query def Vec::push` |
+| what an expression or a few statements do, with std | `target/tachyonc try 'STATEMENTS'` (prints the output and `TYPE = VALUE`; `--file F`) |
+| the language on a word, an error message; one section | `target/tachyonc guide --find WORDS`, `guide TOPIC#SECTION` (`guide TOPIC#`: its sections) |
+| a command's options | `target/tachyonc CMD [SUB] --help` |
 
 NAME is `foo`, `module::foo`, `Type::method`, `Enum::Variant`,
-`Struct.field` or `FILE:LINE`; several in one call. The root defaults to
+`Struct.field` or `FILE:LINE`; several in one call; every spelling a
+tool prints is taken back (`FILE:L:C:`, `FILE:A-B`, `Vec<i64>::push`,
+`main.0`, `./x.tach`). Any query takes `--budget N` (tokens; answers over
+8000 are cut, with the command that prints the rest). The root defaults to
 `compiler/src/main.tach` (`--root ROOT`, or a last argument ending in
 `.tach`, for other programs). A problem is one stderr line, `error CODE:
 message`, then `try:` lines: commands to run as they are. Compile with

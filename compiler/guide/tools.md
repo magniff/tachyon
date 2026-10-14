@@ -32,6 +32,7 @@ files are the modules it loads.
 
 | to | run |
 |---|---|
+| an item with what it calls, its types and callers | `tachyonc query context NAME` (`--budget N`) |
 | an item's source | `tachyonc query show NAME` (`--with-comments`) |
 | the item at an error | `tachyonc query show FILE:LINE` |
 | where it is defined, its signature | `tachyonc query def NAME` |
@@ -42,10 +43,15 @@ files are the modules it loads.
 | lines of any file | `tachyonc query text FILE:A-B` |
 | what nothing uses | `tachyonc query unused` |
 | sizes, dependencies | `tachyonc query stats`, `query deps MODULE` |
+| std's API, a std item | `tachyonc query items std`, `query show std::read_line` (any program) |
+| what a snippet does | `tachyonc try 'let v = [3, 1]; v[..].len'` prints `i64 = 2` |
+| the guide on some words | `tachyonc guide --find WORDS`, `guide TOPIC#SECTION`, `explain WORDS` |
 
 NAME is `f`, `module::f`, `Type::method`, `Enum::Variant`,
-`Struct.field`, `<Type as Trait>::f` or `FILE:LINE`; several in one call.
-Output is one fact per line, fields separated by a TAB.
+`Struct.field`, `<Type as Trait>::f` or `FILE:LINE`; several in one call;
+every name a tool prints is taken back. Output is one fact per line,
+fields separated by a TAB; `--budget N` keeps it to about N tokens.
+`CMD --help` lists a command's options.
 
 ## Changing
 
