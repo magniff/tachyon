@@ -3,7 +3,8 @@
 # needed): every tests/run/*.tach, tests/run/*/main.tach (a program of
 # several modules, 0.5) and tests/examples/*.test case is
 # compiled, assembled and linked with the C compiler, run, and checked;
-# then tests/query/run.sh (`tachyonc query`, 0.11). POSIX sh and awk
+# then tests/query/run.sh (`tachyonc query`, 0.11) and tests/refactor/run.sh
+# (the refactoring tools, 0.11). POSIX sh and awk
 # only, so it runs the same on macOS and Linux.
 #
 # usage: tests/run.sh [-c COMPILER] [-t TARGET] [-O LEVEL] [-j JOBS] [-a] [-d FORMAT] [FILTER]
@@ -607,6 +608,25 @@ case query in
             count=$((count + 1))
         fi
         awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/query.out" >>"$FAILURES"
+        ;;
+esac
+
+# The refactoring tools (0.11: edit, undo, check, fix, lint, same-output,
+# the planning queries): tests/refactor/run.sh; category "refactor".
+case refactor in
+    *"$FILTER"*)
+        "$ROOT/tests/refactor/run.sh" -c "$COMPILER" >"$WORK/refactor.out" 2>&1
+        while read -r status _; do
+            case "$status" in
+                pass) echo "refactor pass" >>"$TALLY"; count=$((count + 1)) ;;
+                FAIL) echo "refactor fail" >>"$TALLY"; count=$((count + 1)) ;;
+            esac
+        done <"$WORK/refactor.out"
+        if ! grep -q '^pass' "$WORK/refactor.out"; then
+            echo "refactor fail" >>"$TALLY"
+            count=$((count + 1))
+        fi
+        awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/refactor.out" >>"$FAILURES"
         ;;
 esac
 
