@@ -58,9 +58,18 @@ T=$HERE
 export T
 unset TACHYON_ROOT
 
-# The transcript of test file $1, run in a copy of its program, on stdout.
+# The transcript of test file $1, run in a copy of its program, on stdout;
+# (0.13) with $2 `off`, without the tools' cache, with `cache`, with a
+# cache of its own (the queries and checks after each edit see the files
+# changed under it).
 transcript() {
     name=$(basename "$1" .t)
+    if [ "$2" = off ]; then
+        TACHYON_CACHE=off
+    else
+        TACHYON_CACHE="$WORK/cache-$name"
+    fi
+    export TACHYON_CACHE
     dir="$WORK/$name"
     rm -rf "$dir"
     mkdir -p "$dir"
@@ -86,8 +95,9 @@ transcript() {
 for file in "$HERE"/*.t; do
     [ -f "$file" ] || continue
     name=$(basename "$file" .t)
-    transcript "$file" >"$WORK/$name.got"
-    if [ $UPDATE -eq 1 ]; then
+    for mode in off cache; do
+    transcript "$file" $mode >"$WORK/$name.got"
+    if [ $UPDATE -eq 1 ] && [ $mode = off ]; then
         # (each comment stays before the command it was before)
         awk 'NR == FNR {
                 if ($0 ~ /^##/) { pending = pending $0 "\n" }
@@ -101,13 +111,15 @@ for file in "$HERE"/*.t; do
     fi
     grep -v '^##' "$file" >"$WORK/$name.want"
     if cmp -s "$WORK/$name.want" "$WORK/$name.got"; then
-        echo "pass $name"
+        echo "pass $name ($mode)"
     else
-        echo "FAIL $name: the transcript differs (< expected, > got):"
+        echo "FAIL $name ($mode): the transcript differs (< expected, > got):"
         diff "$WORK/$name.want" "$WORK/$name.got" | sed 's/^/    /' | head -40
         STATUS=1
     fi
+    done
 done
+unset TACHYON_CACHE
 
 # The compiler's own source.
 check() { # <name> <condition> <output>

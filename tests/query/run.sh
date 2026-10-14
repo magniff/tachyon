@@ -49,7 +49,25 @@ trap 'rm -rf "$WORK"' EXIT
 trap 'exit 130' INT TERM
 STATUS=0
 
-# The transcript of test file $1 (its `$` lines run again), on stdout.
+# One run of `tachyonc query ARGS` (in $1, the line's ARGS), its output as
+# the transcript has it, into $WORK/run.
+run_line() {
+    (
+        cd "$HERE" || exit 1
+        eval "set -- $1"
+        "$COMPILER" query "$@" >"$WORK/out" 2>"$WORK/err"
+        rc=$?
+        # (`try:` lines name the compiler as it was run: `tachyonc` here)
+        cat "$WORK/out" "$WORK/err" | sed "s|$COMPILER|tachyonc|g"
+        [ $rc -eq 0 ] || echo "[exit $rc]"
+    ) >"$WORK/run"
+}
+
+# The transcript of test file $1 (its `$` lines run again), on stdout, in
+# mode $2 (0.13): `off`, without the tools' cache; `cache`, each line run
+# twice with a cache of its own ($WORK/cache): the first run may make it,
+# the second must answer the same, and from the cache when the first made
+# it (TACHYON_CACHE_TRACE says which).
 transcript() {
     name=$(basename "$1" .q)
     if [ -d "$HERE/$name" ]; then
@@ -61,35 +79,54 @@ transcript() {
     grep '^\$ ' "$1" | while IFS= read -r line; do
         printf '%s\n' "$line"
         args=${line#\$ }
-        (
-            cd "$HERE" || exit 1
-            eval "set -- $args"
-            "$COMPILER" query "$@" >"$WORK/out" 2>"$WORK/err"
-            rc=$?
-            # (`try:` lines name the compiler as it was run: `tachyonc` here)
-            cat "$WORK/out" "$WORK/err" | sed "s|$COMPILER|tachyonc|g"
-            [ $rc -eq 0 ] || echo "[exit $rc]"
-        )
+        if [ "$2" = off ]; then
+            TACHYON_CACHE=off run_line "$args"
+            cat "$WORK/run"
+            continue
+        fi
+        : >"$WORK/trace"
+        TACHYON_CACHE="$WORK/cache" TACHYON_CACHE_TRACE="$WORK/trace" run_line "$args"
+        mv "$WORK/run" "$WORK/run1"
+        saved=$(grep -c '^save$' "$WORK/trace")
+        : >"$WORK/trace"
+        TACHYON_CACHE="$WORK/cache" TACHYON_CACHE_TRACE="$WORK/trace" run_line "$args"
+        cat "$WORK/run"
+        cmp -s "$WORK/run1" "$WORK/run" || echo "[cache: the second run answered otherwise]"
+        if [ "$saved" != 0 ]; then
+            grep -q '^hit$' "$WORK/trace" || echo "[cache: made, then not used]"
+        fi
+        grep '^hit$' "$WORK/trace" >>"$WORK/hits"
     done
 }
 
+: >"$WORK/hits"
 for file in "$HERE"/*.q; do
     [ -f "$file" ] || continue
     name=$(basename "$file" .q)
-    transcript "$file" >"$WORK/$name.got"
-    if [ $UPDATE -eq 1 ]; then
-        { grep '^##' "$file"; cat "$WORK/$name.got"; } >"$WORK/$name.new"
-        cp "$WORK/$name.new" "$file"
-    fi
-    grep -v '^##' "$file" >"$WORK/$name.want"
-    if cmp -s "$WORK/$name.want" "$WORK/$name.got"; then
-        echo "pass $name"
-    else
-        echo "FAIL $name: the transcript differs (< expected, > got):"
-        diff "$WORK/$name.want" "$WORK/$name.got" | sed 's/^/    /' | head -40
-        STATUS=1
-    fi
+    for mode in off cache; do
+        transcript "$file" $mode >"$WORK/$name.got"
+        if [ $UPDATE -eq 1 ] && [ $mode = off ]; then
+            { grep '^##' "$file"; cat "$WORK/$name.got"; } >"$WORK/$name.new"
+            cp "$WORK/$name.new" "$file"
+        fi
+        grep -v '^##' "$file" >"$WORK/$name.want"
+        if cmp -s "$WORK/$name.want" "$WORK/$name.got"; then
+            echo "pass $name ($mode)"
+        else
+            echo "FAIL $name ($mode): the transcript differs (< expected, > got):"
+            diff "$WORK/$name.want" "$WORK/$name.got" | sed 's/^/    /' | head -40
+            STATUS=1
+        fi
+    done
 done
+# (the cache was made and used: by some lines of every program)
+hits=$(grep -c hit "$WORK/hits")
+if [ "$hits" -ge 10 ]; then
+    echo "pass cache_used ($hits lines)"
+else
+    echo "FAIL cache_used: the cache answered $hits lines"
+    STATUS=1
+fi
 
 # The compiler's own source.
 check() { # <name> <condition> <output>
