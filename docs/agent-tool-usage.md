@@ -388,3 +388,73 @@ ones (0.13).
    names from the banners.
 4. Per-agent numbers from the log itself (0.12's hook logs the agent id
    and worktree; the report prints a table per agent).
+
+## 0.13: the tools, built with the tools
+
+0.13 (2026-10-14, 17:24 to 19:53) was made by six agents in parallel
+worktrees, one per area (edit, query, the cache, refactor, fmt and
+explain, the guide), then one integrating them (the merges, `tachyonc
+fmt --all`, two files split that formatting had grown past 1,000 lines).
+Source: the hook's log from the 0.12.0 release on
+(`tools/agent-tool-usage.py --hook-log`, the log cut by time); 0.12's
+hook logs the agent id, so the table per agent is the report's own.
+
+**Edits to existing compiler source, through `tachyonc`: 151 of 182,
+83%.**
+
+| agent | tools | shell | Edit | Write | tool share |
+|---|---|---|---|---|---|
+| edit | 14 | 0 | 0 | 0 | 100% |
+| query | 27 | 1 | 5 | 0 | 82% |
+| the cache | 51 | 1 | 0 | 1 | 96% |
+| refactor | 33 | 0 | 6 | 0 | 85% |
+| fmt and explain | 20 | 1 | 11 | 0 | 62% |
+| the guide | 4 | 0 | 0 | 0 | 100% |
+| the integration | 2 | 3 | 2 | 0 | 29% |
+
+The tools: `edit` 127, `fix` 13, `refactor` 6, `undo` 5. Of the 31
+other edits, 26 were to files new in 0.13 that the agent had written
+itself in the same session (`tools/query/sections.tach`, `cache.tach`,
+`tools/fmt/`, `refactor_shape/extract.tach` and `inline.tach`): drafts,
+some before their `mod` line existed, where the hook counts a file as
+existing once written. On the files that existed before they began,
+every edit of the six feature agents went through the tools. The
+integration's five: two merges whose conflict markers left
+`main.tach` and others unparseable (Python, as the Edit tool would),
+ten entries of the explain table at once (Python), and the banner that
+`refactor split` left behind in `back/enc_arm64/mod.tach` moved by hand
+(Edit, two files).
+
+Queries: 278 (`show` 133, `text` 39, `refs` 22, `items` 21, `def` 12,
+`stats` 10, `unused` 7, `grep` 2); 11 shell reads blocked by the hook,
+17 gone around it (`# no-query`): 10 of them text searches (string
+literals, banner styles, extern declarations, a static's initializer),
+which `query grep`, built in the same hours, now answers; the rest
+searches of a tree mid-merge, which does not parse, a comparison with
+another branch, and lines around a banner or a table.
+
+**The shortfalls** (32 feedback entries), and what 0.13 did:
+
+| shortfall | entries | 0.13 |
+|---|---|---|
+| `fix --in MODULE` not reaching the children for missing imports | 3 | fixed (the edit branch; the others branched before it) |
+| `edit patch` with an OLD that ends inside a line; multi-line pairs on the command line refused by the harness | 3 | fixed: partial-line pairs, `--pairs FILE` |
+| `edit insert` and `delete` next to a run of one-line items (`mod`, `static`, `const`) adding or leaving a blank line | 4 | (0.14) |
+| `fix --only imports`: a same-named static from another module chosen; no import of, nor `help:` for, std types (`use std::Buf`); a private static not offered as `pub` plus import; a relative and a `crate::` spelling of one path not merged | 6 | where it puts a new line: fixed (an edit tidies the `use` runs it touches); the rest (0.14) |
+| `edit insert` of a new item that needs imports fails `edit.breaks` (`--no-check`, then `fix`) | 1 | (0.14) |
+| `refactor split --items` of a banner's section leaving the banner behind | 1 | (0.14) |
+| `edit patch FILE:LINE` on a comment line between items: no item | 1 | (0.14) |
+| no tool for merge conflicts in `.tach` files (they do not parse; `query text` only) | 1 | (0.14) |
+| unwrapping a block (the opposite of `edit wrap`); `edit delete` of one NAME only; `MODULE::extern` not an edit target | 3 | (0.14) |
+| arguments and `try:` lines: `query show FILE --root R`, `query stats` and `query unused` of one module without its children, `edit patch FILE:LINE` outside the default root, `query.ambiguous` dropping `--old`/`--new`, `undo` outside a repository, `tests/query/run.sh -u` moving comments, the harness refusing shell variables | 9 | (0.14) |
+
+**The remaining gaps, for 0.14:**
+
+1. `edit insert --imports`: a new item's imports added in the same
+   checked edit.
+2. Comments outside items as targets: `edit patch FILE:LINE` on a banner
+   or comment line; `split --items` moving a section's banner with it.
+3. Merge conflicts: `query conflicts FILE` and `edit resolve FILE
+   --ours|--theirs|--both N` on files that do not parse.
+4. `fix --only imports` for std types and private items; one-line items
+   kept together by `edit insert` and `delete` as `move` keeps them.

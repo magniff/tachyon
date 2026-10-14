@@ -625,6 +625,32 @@ again.
   `guide`) compiles and runs every example, checks the std section
   against the compiler's item index and the core guide's budget.
 
+Done (0.13.0). Six agents in parallel worktrees, one per area, then the
+integration: edit precision (`edit patch` inside a line, `--pairs`,
+`edit wrap`, `edit new-file`, `signature --default`, `fix --in` over a
+subtree); query completeness (banners and sections, `query grep`, `query
+type`, kinds of references); the tools' cache (a query or `check` of an
+unchanged program in about 6 to 8 ms instead of about 60); refactor
+(`split` part names, layout kept so a move and the move back change
+nothing, `extract-function`, `inline`); `tachyonc fmt`, with the tree
+formatted (same-output identical to 0.12.0), and `tachyonc explain`;
+`tachyonc guide`. 83% of the edits to existing compiler source went
+through the tools, every one of the feature agents' on files that existed
+before they began (agent-tool-usage.md, "0.13: the tools, built with the
+tools").
+
+0.13.0 release gate (2026-10-14): `bootstrap/gate.sh --release`, 15:02
+wall (other agents' work on the machine), every step passed: the chain
+(fixpoint, built by 0.12.0) and the suite at -O0/1/2 (552 tests) on
+aarch64-macos; fuzz 60 in each of the ten modes (the seed in one), ABI
+100 in three modes, objcheck (904 of 904), header layouts, the lldb
+check; x86_64-linux (its own chain, the suite at every level, fuzz 50 in
+ten modes, ABI 40 in three, objcheck, layouts); aarch64-linux (the
+cross-built fixpoint, the suite, fuzz 300 in nine modes, ABI 150 in
+three, objcheck, layouts, gdb). Not run here: the benchmarks (`gate.sh
+--only bench`, on an idle machine) and the suite on x86_64-macos
+(Rosetta on the test machine).
+
 ## 0.14: an agent eval; closures and iterators
 
 From here every release also passes an **agent-eval gate**, and a
@@ -654,6 +680,11 @@ feature new in release N enters the compiler's own source in N+1
 - zero cost: closures inlined and iterator chains fused into loops (a
   benchmark pair, iterator chain against hand loop, must time the same)
 - query and refactor understand closures
+- candidates from 0.13's record (agent-tool-usage.md, "0.13"): `edit
+  insert` adding a new item's imports in the same edit; `split --items`
+  moving a section's banner with it; `edit patch FILE:LINE` on a comment
+  line outside items; merge conflicts in `.tach` files (a query of the
+  regions, `edit resolve`)
 
 ## 0.15: errors, conversions, less boilerplate
 

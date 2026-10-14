@@ -43,8 +43,57 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.10.0 | `v0.10.0` | 0.9.0 | aarch64-macos, x86_64-linux, x86_64-macos | vectors and profiles: an unsafe operation outside `unsafe` is an error; vector types (`v4f32`, `v2f64`, ...) on NEON and SSE2; a loop vectorizer; profile-guided optimization; `--check-unsafe`; every error of a compilation reported |
 | 0.11.0 | `v0.11.0` | 0.10.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | feature-complete, and tools for agents: DWARF line tables (`-g`); aarch64-linux as a target and a host; a broader `bench/`, a cost model for the loop vectorizer, unrolling with run-time trip counts, an SLP vectorizer, division by constants, value ranges through phis; `tachyonc query`, `check`, `fix`, `lint`, `same-output`, `edit` by name and semantic refactorings (`refactor rename`, `move`, `signature`, `field`, `variant`, `split`, `rewrite`, scripts, `undo`) |
 | 0.12.0 | `v0.12.0` | 0.11.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | the compiler's source reorganized through its own tools: folders by phase, no file over 1,000 lines, no re-exports, tidy imports, output identical to 0.11's; `edit patch`, `edit insert --in`, `query text`, a module's `use` lines and header as targets, `fix --only reexports` and `tidy-imports`, `split --reexport`; the release gate in one command (`bootstrap/gate.sh`) |
+| 0.13.0 | `v0.13.0` | 0.12.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | the tools, improved from 0.12's record: `edit patch` inside a line, `--pairs`, `edit wrap`, `edit new-file`, `signature --default`, `fix --in` over a subtree; section banners, `query grep`, `query type`, kinds of references; an on-disk cache (a query or `check` of an unchanged program in about 6 to 8 ms); `split` part names, layout kept by `move` and `split`, `refactor extract-function` and `inline`; `tachyonc fmt` (the tree formatted), `explain` and `guide` |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.13
+
+- **Edits** (docs/refactor.md): `edit patch` takes an OLD that starts
+  or ends inside a line, in every form, and says where a multi-line OLD
+  stops matching; `--pairs FILE` reads the pairs from a file (and `try:`
+  lines with pairs of several lines suggest it); `edit wrap TARGET --in
+  HEAD` puts a body or a range of lines in a block, re-indented; `edit
+  new-file PATH` writes a file and its `mod` line in one checked edit;
+  `refactor signature --type x T --default EXPR` rewrites each call's
+  argument; `fix --in MODULE` covers the module's children for every fix.
+- **Queries** (docs/query.md): `query items MODULE --comments` lists the
+  section banners and the comments outside items, `query show
+  MODULE::section TITLE` prints a section; `query grep` searches the
+  program's text, each hit with its item and whether it is code, a
+  comment or a string; `query type FILE:LINE[:COL]` gives an
+  expression's checked type; `refs` and `callers` print each
+  reference's kind (read, write, call, init, type, use, mod, pat), and
+  `--kind` keeps some. The hook suggests `query grep` for text searches.
+- **A cache** (docs/query.md, "Speed: the cache"): a command that reads
+  a program in full leaves its front end under `target/tachyonc-cache`,
+  and `query def`, `show`, `refs`, `callers`, `items`, `check` and the
+  reading of `edit` take it from there while the program's files are
+  unchanged: about 6 to 8 ms on the compiler's source instead of about
+  60. `TACHYON_CACHE` names another directory, or `off`. The answers are
+  the same: the tools' tests run every transcript with and without it.
+- **Refactorings** (docs/refactor-modules.md, docs/refactor-shape.md):
+  `split --plan` names each part from its banner, the type its items
+  operate on or a common prefix (`--names` gives them); `move --after`
+  and `--before ITEM`; the blank lines around moved items and their
+  banners kept, so a move and the move back leave every file as it was
+  (tests/refactor/roundtrip.sh); `refactor extract-function FN --lines
+  A-B --to NEW` (parameters and result computed) and `refactor inline
+  FN` (a small function's body at its calls).
+- **`tachyonc fmt`** (docs/fmt.md): one layout for tachyon source, with
+  no options; a formatted text must lex to the same tokens and comments
+  or the file is left as it is. Every edit, fix and refactoring lays out
+  the lines it writes the same way. The tree is formatted (only blanks
+  changed: `same-output` against 0.12.0 is identical), and
+  tests/fmt/run.sh keeps it so. **`tachyonc explain CODE`**: what a
+  diagnostic code means, how to fix it, an example, for every code the
+  tools print and the compiler's error and warning kinds.
+- **`tachyonc guide`**: the language for a reader who knows Rust, built
+  into the compiler (the core guide about 5k tokens, `guide TOPIC`,
+  `--list`, `--all`; std's API made from std's own source); every
+  example in it is compiled and run by `tests/run.sh guide`.
+- **Breaking**: nothing in the language. `query refs` and `callers`
+  print a kind column in each line.
 
 ### What's new in 0.12
 
