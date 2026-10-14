@@ -1082,3 +1082,222 @@ test runner's `PROFILE` directive compiles a case with
 the rare way of a branch out of the fall-through, a hot call inlined)
 and `opt_profile_stale.tach` (a checked-in profile, stale for one
 function).
+
+## 0.11: performance
+
+**The vectorizer's cost model** (`vector_unroll` in `vectorize.tach`).
+After the analysis, the loop is vectorized only when the vector version
+is expected to be cheaper, in rough cycles of throughput: a scalar
+iteration costs S (an instruction 1, a check 2, a float division 4), a
+vector iteration of U copies of the body U·B + 3 (B: an instruction 1, a
+multiplication done lane by lane 3·VF: SSE2 has only 16-bit lanes for
+it, NEON no 64-bit ones), and the decision before the loop, the
+reductions' first vectors and their combination G (6, 8 a check, 10 an
+overlap test, 4 a sum, 2 + 2·VF another reduction). The expected number
+of iterations T is exact when the bounds are constants or one value plus
+two constants (an array's end: `[0; 20]` has 20), else the profile's
+average (the header's count over the entries', from the preheader or the
+nearest block above it with a count). With T the vector version costs
+G + ⌊T / U·VF⌋·(U·B + 3) + (T mod U·VF)·S against T·S, for U = 2 (small
+bodies, as in 0.10) and U = 1; the cheaper wins, or the scalar loop
+stays. Without T, a vector iteration need only be cheaper than the scalar
+iterations it replaces. Unrolling asks the same question
+(`vectorizable_lanes`), so a loop the vectorizer turns down is unrolled
+as before.
+
+*Against full unrolling.* A loop of a few constant trips is unrolled
+whole by `transform_loops` (scev.tach: at most 16 trips and 160
+instructions), and there the scalar alternative is not the loop: each
+copy keeps only its loads, stores and operations (the induction variable,
+the latch's test and the addresses affine in it become constants and
+offsets, what is invariant leaves, a check of a constant length on an
+index of the induction variable and constants is decided), and SLP may
+pack them. With `unrolled` = the trip count, `vector_unroll` weighs the
+vector loop against T times that. The unroller asks so before unrolling;
+and a loop whose checks kept the unroller from it (an exit other than the
+latch's) until the ranges removed them is left by the vectorizer when
+unrolling whole is cheaper (`full_unroll_trips`), with transform_loops run
+again after the vectorizer (only then). bench/fannkuch's copy of a
+10-element permutation had been a vector loop since the ranges through
+phis proved its checks: a run-time overlap test of the two arrays (both
+on the stack), five vector iterations, the scalar loop as fallback, the
+loop not unrolled; it is now ten loads and stores, which SLP makes five
+16-byte copies, as with `--no-vectorize`: about 5% faster, which takes
+back the 3% it had lost (it was not the forwarding of 8-byte stores to
+16-byte loads, as first thought: the unrolled copy has those too).
+`tests/run/opt_vectorize_unrolled.tach`. The compiler's own code is
+unchanged.
+
+In 0.10, `[0; 20]` became a loop of two 16-byte stores an iteration,
+which never ran (20 < 32); it is now one vector store and four scalar
+ones. A loop the profile shows running two iterations an entry over
+`i32`s (four lanes) stays scalar (`tests/run/opt_vectorize_cost.tach`).
+bench/interp, which 0.10 measured 5% slower with the vectorizer, has no
+loop the vectorizer takes: its IR is the same with `--no-vectorize`, and
+the difference was noise.
+
+**Unrolling with run-time trip counts** (`unroll_runtime_loops` in
+`vectorize.tach`, after the vectorizer, in its frame). An innermost
+counted loop (i from start, step 1, to n) whose trip count is not a
+constant, whose only exits are the latch's and failing checks, and which
+has no call, gets U copies of its body per iteration:
+
+```
+C:  trips = n - start; ok = trips >= U && no check fails over [start, n)
+    branch ok, UP, SP
+UP: uend = start + (trips & -U)
+U0..U(U-1): the copies, chained (copy k's header phis are copy k-1's
+    next values), without their checks; branch i' != uend, U0, UX
+UX: branch uend == n, E, SP
+SP: the header's phis from C or UX; the original loop (the remainder)
+```
+
+The checks are proved before the loop as the vectorizer's are, now for
+indices of coefficient -1 as well (`s[n - 1 - i]`); a loop with any other
+kind of check is left alone. The copies compute exactly what the
+iterations do, in order, so recurrences of any kind, float ones included,
+are fine. It pays where checks go, or where the loop's own instructions
+are a good part of a small body: a loop is unrolled when it has checks or
+at most 12 instructions, by 4 within 64 instructions (128 for a hot loop),
+else by 2; with a profile, by less (or not) when the loop runs fewer than
+2U iterations an entry. Two instcombine rules make the copies' addresses
+offsets of one base: `y + (x + c)` is `(y + x) + c` for addresses (u64;
+loads and stores take c as their offset, and GVN shares y + x), and
+`(x + c) - x` is c. The headers of both loops are marked `novec`.
+`--no-unroll-runtime` turns it off. Tested by
+`tests/run/opt_unroll_runtime.tach` (a recurrence and a reversed copy,
+every length from 0 to 10, a check failing part way).
+
+Compile time: the self-compile at -O2 is within 0.5% (the candidates
+are rejected before LCSSA is formed, and the vectorizer's loop forest is
+reused when it changed nothing). fannkuch's flips and rotations run about
+5% faster.
+
+**The SLP vectorizer** (`slp.tach`, last of the -O2 pipeline, on each
+function as it will be emitted: run earlier, vector stores would hide
+their values from the loads of the functions they are inlined into). In
+a block, the stores writing the VF lanes of one 16-byte vector (one base,
+consecutive offsets, one scalar type) are a seed; their values are packed
+bottom-up, lane by lane: one value in every lane is a splat; loads of
+consecutive addresses in the block, a vector load; the same operation in
+every lane (`+ - * & | ^`, negation, `/` on floats), that operation on
+the vectors of its operands; anything else is gathered (a splat and
+`vins`). A lane is exactly its scalar code: float lanes are the same IEEE
+operations, nothing is reassociated. The vector code goes just before the
+group's last store, which a vector store replaces; scalars left unused go
+with dead code elimination.
+
+That moves the group's loads and stores down to its last store, which the
+memory between must allow (gvn.tach's `may_alias`): no call or other
+side effect in between, no store in between that may write what a moved
+load reads, no access in between to what a moved store writes, no moved
+load reading a store of the group made before it. Cost: the vector
+instructions (a gather VF, a multiplication done lane by lane 3·VF) must
+be fewer than the scalar instructions that go: the stores, and each
+lane's load or operation whose every use goes. A load or an operation
+whose scalars all stay (used elsewhere) is gathered from them instead
+when that is cheaper.
+
+nbody's position update (`b.x += dt * b.vx; b.y += dt * b.vy`) is one
+`v2f64` load of the velocities, a multiplication by the splat of dt, an
+addition to the loaded positions, one store; its velocity updates pack
+the same way, gathering dx and dy (which the distance also uses). Two
+pointers the analysis cannot tell apart are left alone (`q.a = q.a +
+r.a` ... may be one struct). Tested by `tests/run/opt_slp.tach`.
+`--no-slp` turns it off.
+
+**The gaps against clang -O2** on the new benchmarks, and what was done
+about the cheap and general ones:
+
+- *Branches on `&&`* (isel.tach). `a && b` leaves a block with a phi of
+  a's value and b's and a branch on it; the predecessor that branched on
+  a kept a materialized bool, tested twice (`cset`, `cbz`, and `cbz`
+  again), as only predecessors ending in a jump were threaded. Now one
+  that branched on the phi's value for it goes straight to the phi's
+  false (or true) way. bench/sort's heapsort (`child + 1 < end &&
+  s[child] < s[child + 1]`) is about 30% faster, a `csel` where clang
+  has one.
+- *Equalities from branches* (gvn.tach). Below the edge where `x == y`
+  holds (the true way of `==`, the false way of `!=`, into a block with no
+  other predecessor), uses of y take x in the blocks the edge dominates:
+  a constant when one side is one, else the older value; `conv(a) ==
+  conv(b)` of one width gives `a == b`. Integers only (0.0 == -0.0).
+  After `if a.len != b.len { return false; }` an index below a.len is
+  below b.len, so the range analysis drops the check of b[i] in std's
+  slice equality, which bench/wordcount's map runs for every word (about
+  8%); `tests/run/opt_equality.tach`.
+- *Division by a constant* (isel.tach, before tiling). `x / d` and
+  `x % d` for a constant d multiply by a magic number (Granlund and
+  Montgomery; Hacker's Delight, chapter 10) with a new machine operation,
+  `mulh` (the high half of the 128-bit product: `umulh`, `smulh` on
+  AArch64, one-operand `mulq`, `imulq` into rdx on x86-64, which the
+  allocator keeps free as for a division). Unsigned values up to 32 bits
+  take one `mulh` by 2^64 / d rounded up (exact below 2^32, as d < 2^32);
+  u64 a `mulh` and a shift, with the add fix-up when the magic number has
+  65 bits; signed values up to 32 bits a 64-bit product by the 33-bit magic
+  number and an arithmetic shift, i64 a `smulh` with its corrections; then
+  one more when negative (`sub q, t, t, asr #63`). The remainder is
+  `x - q * d` (`msub`), sharing q with a quotient of the same operands in
+  the block. Tachyon's results are kept: division by 0 is left to the
+  division instruction (x / 0 is 0, x % 0 is x), x / -1 is -x (MIN / -1
+  wraps to MIN). Tested by `tests/run/opt_divide_constant.tach` (every
+  kind of constant at every width, against divisions by the same numbers
+  unknown to the compiler) and a fuzz mode, `tests/fuzz/run.sh -D`
+  (`gendiv.awk`: random constants and dividends, the extremes and exact
+  multiples, every level against -O0). bench/wordcount (`% 26`, `/ 26`:
+  `umulh`, `lsr`, `msub`) is 3.5% faster, bench/json 3%; collatz divides
+  by 2 only, which was a shift already.
+- *Ranges through phis* (range.tach). A phi's range is the union of its
+  operands' ranges, each at the end of its predecessor with the facts
+  there and on the edge. The phis of a loop header are found together by
+  induction: each is assumed in a range H, the operands coming back around
+  the loop are ranged under the assumptions, and when each falls in its
+  phi's H, every phi is in its H always (H holds the entry operands). H
+  starts as the entry operands' range, then takes in what came back (a
+  join), then is widened to what the facts on the edges back allow (an
+  induction variable below its loop's bound, with any step, even one read
+  from memory; a decreasing one above its floor), then to the type's
+  range, which proves nothing but holds. Phis of other blocks are ranged
+  likewise (their loop header's phis first); a range found under an
+  assumption about an enclosing phi is kept only for that assumption.
+  Facts comparing a value with another now bound it by the other's range
+  (`child < end` with end below 1000000), arithmetic shifts and 64-bit
+  conversions keep ranges, and an operation of one operand costs a
+  quarter of the depth of one of two (light cleanup leaves chains like
+  `0 + (n - 0) * 1`). A branch on the phi of `&&` or `||` (a block of the
+  phi and the branch alone) is threaded from each predecessor that
+  branched on the phi's operand for it, as isel.tach does, but before the
+  ranges: in `child + 1 < end && s[child] < s[child + 1]`, the first test
+  then holds wherever the whole is true.
+
+  Phi ranges and facts between two values are taken while the branch of
+  a check is decided (one way ends the program: a bounds check, an
+  unwrap): everywhere, they cost 4% of the self-compile's instructions
+  for little more. bench/sort's heapsort, inlined into main with its
+  vector's length known, keeps none of its 12 checks (16 checks before, 4
+  now, in the generic sift-down of the records); bench/sort is 5% faster.
+  The threading costs the loop passes about 6% of their time, and pays it
+  back: the compiler built with it builds itself in 2.6% fewer
+  instructions. `tests/run/opt_range_phi.tach`: a step of 2, a step read
+  from memory, a decreasing index, a sift-down; and an index that reaches
+  past the end, whose check stays (and fails); a fuzz mode,
+  `tests/fuzz/run.sh -R` (`genrange.awk`), of such loops (some going past
+  an end).
+
+What remains, measured:
+
+- *Bounds checks* that need facts the ranges do not carry: in a generic
+  sift-down, `end <= s.len` (so the first `s[root]`, with root the
+  caller's start, keeps its check). C has no checks; this is the safety
+  tachyon keeps.
+- *FMA*: clang contracts `a * b + c` by default (nbody: 27 ms against 29
+  with `-ffp-contract=off`); tachyon never does, as that changes results.
+- *Floats compared for a branch* are `fcmp`, `cset`, `cbnz` on AArch64
+  rather than `fcmp`, `b.cond` (`is_fused_compare` excludes floats).
+  Fusing them (with the unordered-aware negated conditions `pl`, `hi`,
+  `le`, `lt`) was tried and measured: no difference on mandelbrot or
+  nbody, so it was left out.
+- mandelbrot is within 6% and json, binarytrees and fannkuch are level
+  with clang or ahead; the rest of wordcount's gap is its hashing and
+  probing loops, which inlining everything (with a profile) does not
+  change.

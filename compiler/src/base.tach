@@ -393,9 +393,29 @@ pub static mut FILES: *SourceFile = 0 as *SourceFile;
 pub static mut FILE_COUNT: i64 = 0;
 static mut FILE_CAP: i64 = 0;
 
+// Files read from elsewhere (0.11: the edited copies an edit checks
+// before it writes them, see edit.tach): (path, copy) pairs of C strings.
+pub static mut OVERLAY: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The file to read for `path`: its copy in OVERLAY, or itself.
+pub fn overlay_of(path: *u8) -> *u8 {
+    unsafe {
+        let mut i = 0;
+        while i < OVERLAY.count {
+            let p = OVERLAY.data[i] as *u8;
+            let n = strlen(p);
+            if n == strlen(path) && memcmp(p, path, n) == 0 {
+                return OVERLAY.data[i + 1] as *u8;
+            }
+            i += 2;
+        }
+        path
+    }
+}
+
 pub fn read_file(path: *u8, out: i64) {
     unsafe {
-        let file = fopen(path, c"rb");
+        let file = fopen(overlay_of(path), c"rb");
         if file == 0 as *u8 {
             die2(c"cannot read ", path);
         }
@@ -642,7 +662,7 @@ pub fn flush_warnings() {
         let out = buf_new();
         let shown = if n < MAX_WARNINGS { n } else { MAX_WARNINGS };
         for i in 0..shown {
-            buf_bytes(out, buf_slice(WARNINGS.data[3 * i + 1]));
+            put_diagnostic(out, buf_slice(WARNINGS.data[3 * i + 1]));
         }
         if n > shown {
             buf_str(out, c"warning: ");
@@ -654,14 +674,248 @@ pub fn flush_warnings() {
     }
 }
 
+// `tachyonc query` (0.11): where an error that would end the compilation
+// goes instead (a jump buffer; 0: none), so the query answers with what
+// the front end got to.
+pub static mut ERR_BAIL: *u8 = 0 as *u8;
+
 // Prints the recorded errors and exits with 1, if there are any.
 pub fn exit_if_errors() {
     unsafe {
         if ERROR_COUNT == 0 {
             return;
         }
+        if ERR_BAIL != 0 as *u8 {
+            _longjmp(ERR_BAIL, 1);
+        }
+        write_errors();
+        exit(1);
+    }
+}
+
+// Prints the recorded errors (and the warnings), sorted by position.
+pub fn write_errors() {
+    unsafe {
         flush_warnings();
-        // Sorted by position (stable: an insertion sort of the pairs).
+        sort_errors();
+        let n = ERRORS.count / 2;
+        let out = buf_new();
+        for i in 0..n {
+            put_diagnostic(out, buf_slice(ERRORS.data[2 * i + 1]));
+        }
+        if ERROR_COUNT >= MAX_ERRORS {
+            buf_str(out, c"error: too many errors; stopping after ");
+            buf_int(out, MAX_ERRORS);
+            buf_byte(out, '\n');
+        }
+        buf_write_fd(out, STDERR);
+    }
+}
+
+// The number of errors recorded.
+// The number of errors recorded, and forgetting the errors recorded
+// since (0.11: a rewrite's pattern is parsed after the program, and its
+// syntax error is not the program's).
+pub fn errors_mark() -> i64 {
+    unsafe { ERRORS.count }
+}
+
+pub fn errors_forget(mark: i64) {
+    unsafe {
+        ERRORS.count = mark;
+        ERROR_KEYS.count = mark;
+        ERROR_COUNT = mark / 2;
+    }
+}
+
+pub fn error_count() -> i64 {
+    ERROR_COUNT
+}
+
+// The first error (by position) in the short form, without its help and
+// notes, and without a newline (`tachyonc query`, 0.11).
+pub fn first_error_short(out: i64) {
+    unsafe {
+        if ERRORS.count == 0 {
+            return;
+        }
+        sort_errors();
+        short_diagnostic(out, buf_slice(ERRORS.data[1]), false);
+    }
+}
+
+// Every recorded error in the short form, one per line, sorted by
+// position (0.11: what an edit is checked against).
+pub fn errors_short(out: i64) {
+    unsafe {
+        sort_errors();
+        let n = ERRORS.count / 2;
+        for i in 0..n {
+            short_diagnostic(out, buf_slice(ERRORS.data[2 * i + 1]), true);
+            buf_byte(out, '\n');
+        }
+    }
+}
+
+// ---- Short diagnostics (0.11) ----
+//
+// `--diagnostics=short`: each diagnostic on one line, for tools and
+// agents:
+//   <file>:<line>:<col>: error[<kind>] <message> | help: <help> | note: <note>
+// made from the human form (error_text) when it is printed.
+pub static mut DIAG_SHORT: bool = false;
+
+// Diagnostic `text` (in the human form) as it is printed.
+fn put_diagnostic(out: i64, text: [u8]) {
+    unsafe {
+        if DIAG_SHORT {
+            short_diagnostic(out, text, true);
+            buf_byte(out, '\n');
+        } else {
+            buf_bytes(out, text);
+        }
+    }
+}
+
+// The one-line form of diagnostic `text`: its position first, then its
+// head (`error[kind] message`), then (with `tails`) its help and notes.
+fn short_diagnostic(out: i64, text: [u8], tails: bool) {
+    unsafe {
+        // The lines of text: the head, ` --> position`, `  = help: ...`.
+        let mut head_end = 0;
+        while head_end < text.len && text[head_end] != '\n' {
+            head_end += 1;
+        }
+        let mut i = head_end + 1;
+        let mut pos_from = -1;
+        let mut pos_to = -1;
+        let mut rest = i;
+        if i + 5 <= text.len && text[i] == ' ' && text[i + 1] == '-' && text[i + 2] == '-' && text[i + 3] == '>' {
+            pos_from = i + 5;
+            while i < text.len && text[i] != '\n' {
+                i += 1;
+            }
+            pos_to = i;
+            rest = i + 1;
+        }
+        if pos_from >= 0 {
+            put_short_positions(out, text[pos_from..pos_to]);
+            buf_str(out, c": ");
+        }
+        // `error[kind]: message` -> `error[kind] message`
+        let head = text[0..head_end];
+        let mut k = 0;
+        while k + 2 < head.len && !(head[k] == ']' && head[k + 1] == ':' && head[k + 2] == ' ') {
+            k += 1;
+        }
+        if k + 2 < head.len && head[0] != ' ' {
+            buf_bytes(out, head[0..k + 1]);
+            put_short_positions(out, head[k + 2..head.len]);
+        } else {
+            put_short_positions(out, head);
+        }
+        if !tails {
+            return;
+        }
+        i = rest;
+        while i < text.len {
+            let mut e = i;
+            while e < text.len && text[e] != '\n' {
+                e += 1;
+            }
+            let mut a = i;
+            while a < e && (text[a] == ' ' || text[a] == '=') {
+                a += 1;
+            }
+            if a < e {
+                buf_str(out, c" | ");
+                put_short_positions(out, text[a..e]);
+            }
+            i = e + 1;
+        }
+    }
+}
+
+// Text s with each `<file>: line <l>, column <c>` as `<file>:<l>:<c>` (and
+// `<file>: line <l>` as `<file>:<l>`).
+fn put_short_positions(out: i64, s: [u8]) {
+    unsafe {
+        let mut i = 0;
+        while i < s.len {
+            if i + 7 <= s.len && s[i] == ':' && s[i + 1] == ' ' && s[i + 2] == 'l' && s[i + 3] == 'i'
+                && s[i + 4] == 'n' && s[i + 5] == 'e' && s[i + 6] == ' ' {
+                let mut j = i + 7;
+                while j < s.len && s[j] >= '0' && s[j] <= '9' {
+                    j += 1;
+                }
+                if j > i + 7 {
+                    buf_byte(out, ':');
+                    buf_bytes(out, s[i + 7..j]);
+                    // `, column <c>`
+                    if j + 9 < s.len && s[j] == ',' && s[j + 1] == ' ' && s[j + 2] == 'c' && s[j + 8] == ' ' {
+                        let mut c = j + 9;
+                        while c < s.len && s[c] >= '0' && s[c] <= '9' {
+                            c += 1;
+                        }
+                        if c > j + 9 {
+                            buf_byte(out, ':');
+                            buf_bytes(out, s[j + 9..c]);
+                            j = c;
+                        }
+                    }
+                    i = j;
+                    continue;
+                }
+            }
+            buf_byte(out, s[i]);
+            i += 1;
+        }
+    }
+}
+
+// Edit distance of a and b: insertions, deletions, substitutions and
+// transpositions of neighbours (optimal string alignment), each 1.
+pub fn edit_distance(a: [u8], b: [u8]) -> i64 {
+    unsafe {
+        let before = alloc_array::<i64>(b.len + 1);
+        let prev = alloc_array::<i64>(b.len + 1);
+        let cur = alloc_array::<i64>(b.len + 1);
+        for j in 0..b.len + 1 {
+            prev[j] = j;
+        }
+        for i in 1..a.len + 1 {
+            cur[0] = i;
+            for j in 1..b.len + 1 {
+                let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+                let mut best = prev[j - 1] + cost;
+                if prev[j] + 1 < best {
+                    best = prev[j] + 1;
+                }
+                if cur[j - 1] + 1 < best {
+                    best = cur[j - 1] + 1;
+                }
+                if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] && before[j - 2] + 1 < best {
+                    best = before[j - 2] + 1;
+                }
+                cur[j] = best;
+            }
+            for j in 0..b.len + 1 {
+                before[j] = prev[j];
+                prev[j] = cur[j];
+            }
+        }
+        let result = prev[b.len];
+        free(before as *u8);
+        free(prev as *u8);
+        free(cur as *u8);
+        result
+    }
+}
+
+// Sorts the recorded errors by position (stable: an insertion sort of the
+// pairs).
+fn sort_errors() {
+    unsafe {
         let n = ERRORS.count / 2;
         for i in 1..n {
             let mut j = i;
@@ -675,17 +929,6 @@ pub fn exit_if_errors() {
                 j -= 1;
             }
         }
-        let out = buf_new();
-        for i in 0..n {
-            buf_bytes(out, buf_slice(ERRORS.data[2 * i + 1]));
-        }
-        if ERROR_COUNT >= MAX_ERRORS {
-            buf_str(out, c"error: too many errors; stopping after ");
-            buf_int(out, MAX_ERRORS);
-            buf_byte(out, '\n');
-        }
-        buf_write_fd(out, STDERR);
-        exit(1);
     }
 }
 
@@ -741,6 +984,9 @@ fn err_jump() -> ! {
             _longjmp(RECOVER_BUFS.data[RECOVER_DEPTH - 1] as *u8, 1);
         }
         exit_if_errors();
+        if ERR_BAIL != 0 as *u8 {
+            _longjmp(ERR_BAIL, 1);
+        }
         exit(1)
     }
 }

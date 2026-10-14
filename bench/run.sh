@@ -2,7 +2,9 @@
 # Benchmarks: every bench/*.tach (and examples/md5.tach over 8 MB) compiled
 # by tachyon at -O0, -O1 and -O2, by the previous release and the seed when
 # given, and the C equivalents (bench/*.c) by cc -O2. Prints the fastest of
-# RUNS runs of each, in milliseconds, and checks that all outputs agree.
+# RUNS runs of each, in milliseconds, and checks that all outputs agree;
+# then, for each variant, the geometric mean over the programs with a C
+# version of its time divided by cc -O2's (below 1: faster than C).
 #
 # usage: bench/run.sh [-c COMPILER] [-p PREVIOUS] [-s SEED] [-r RUNS] [-t TARGET]
 #
@@ -53,6 +55,7 @@ trap 'rm -rf "$WORK"' EXIT INT TERM
 "$CC" -O2 -o "$WORK/timer" "$ROOT/bench/timer.c"
 dd if=/dev/zero of="$WORK/md5.in" bs=1048576 count=8 2>/dev/null
 : >"$WORK/empty"
+: >"$WORK/times"
 
 # Builds variant $2 of program $1 (a .tach file) into $3; fails when that
 # compiler does not know the program's language (the previous release and
@@ -89,13 +92,16 @@ for source in "$ROOT"/bench/*.tach "$ROOT/examples/md5.tach"; do
     [ "$name" = md5 ] && input="$WORK/md5.in"
     printf "%-10s" "$name"
     reference=""
+    row=""
     for v in $VARIANTS; do
         if ! build "$source" "$v" "$WORK/$name.$v"; then
             printf " %9s" "-"
+            row="$row -"
             continue
         fi
         ms=$("$WORK/timer" "$RUNS" "$input" "$WORK/$name.$v.out" "$WORK/$name.$v")
         printf " %9s" "$ms"
+        row="$row $ms"
         if [ -z "$reference" ]; then
             reference="$WORK/$name.$v.out"
         elif ! cmp -s "$reference" "$WORK/$name.$v.out"; then
@@ -109,7 +115,17 @@ for source in "$ROOT"/bench/*.tach "$ROOT/examples/md5.tach"; do
         ms=$("$WORK/timer" "$RUNS" "$input" "$WORK/$name.c.out" "$WORK/$name.c.bin")
         cmp -s "$reference" "$WORK/$name.c.out" || { echo; echo "bench: $name: the C output differs" >&2; exit 1; }
         printf " %9s\n" "$ms"
+        echo "$row $ms" >>"$WORK/times"
     else
         printf " %9s\n" "-"
     fi
 done
+
+# The geometric means of the ratios to cc -O2 (a time of 0 counts as 1 ms).
+printf "%-10s" "geomean"
+awk -v n="$(echo $VARIANTS | wc -w)" '
+    { c = $NF < 1 ? 1 : $NF
+      for (i = 1; i <= n; i++) if ($i != "-") { t = $i < 1 ? 1 : $i; sum[i] += log(t / c); cnt[i]++ } }
+    END { for (i = 1; i <= n; i++) {
+              if (cnt[i] > 0) printf " %9.3f", exp(sum[i] / cnt[i]); else printf " %9s", "-" }
+          printf " %9s\n", "1" }' "$WORK/times"

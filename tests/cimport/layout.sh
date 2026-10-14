@@ -30,7 +30,7 @@ arch=
 case $target in
     aarch64-macos) tflag="--target $target"; arch="-arch arm64" ;;
     x86_64-macos) tflag="--target $target"; arch="-arch x86_64" ;;
-    x86_64-linux) tflag="--target $target" ;;
+    x86_64-linux|aarch64-linux) tflag="--target $target" ;;
 esac
 
 dir=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-layout.XXXXXX")

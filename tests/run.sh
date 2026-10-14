@@ -2,21 +2,27 @@
 # The test suite of this release, run with a tachyon compiler (no cargo
 # needed): every tests/run/*.tach, tests/run/*/main.tach (a program of
 # several modules, 0.5) and tests/examples/*.test case is
-# compiled, assembled and linked with the C compiler, run, and checked.
-# POSIX sh and awk only, so it runs the same on macOS and Linux.
+# compiled, assembled and linked with the C compiler, run, and checked;
+# then tests/query/run.sh (`tachyonc query`, 0.11) and tests/refactor/run.sh
+# (the refactoring tools, 0.11). POSIX sh and awk
+# only, so it runs the same on macOS and Linux.
 #
-# usage: tests/run.sh [-c COMPILER] [-t TARGET] [-O LEVEL] [-j JOBS] [-a] [FILTER]
+# usage: tests/run.sh [-c COMPILER] [-t TARGET] [-O LEVEL] [-j JOBS] [-a] [-d FORMAT] [FILTER]
 #
 #   -c COMPILER   the tachyonc binary to test (default: target/tachyonc,
 #                 as left by bootstrap/bootstrap.sh)
-#   -t TARGET     aarch64-macos, x86_64-linux or x86_64-macos (default: the
-#                 host; x86_64-macos runs under Rosetta on Apple silicon)
+#   -t TARGET     aarch64-macos, aarch64-linux, x86_64-linux or x86_64-macos
+#                 (default: the host; x86_64-macos runs under Rosetta on
+#                 Apple silicon)
 #   -O LEVEL      the optimization level (0, 1 or 2; default: the
 #                 compiler's default)
 #   -j JOBS       cases run at once (default: the number of CPUs); the
 #                 report is the same for every JOBS
 #   -a            programs go through assembly (tachyonc -S, then cc), as
 #                 before 0.7, instead of the compiler's own objects
+#   -d FORMAT     the compiler's diagnostics: human (the default) or short
+#                 (--diagnostics=short, 0.11); the ERROR and WARNING
+#                 directives are written for human and hold for both
 #   FILTER        run only the cases whose name contains FILTER
 #
 # Environment: CC is the linker (and the assembler with -a; default cc).
@@ -83,9 +89,10 @@ OPT=""
 TIMEOUT=20
 JOBS=""
 OUT=prog.o
+DIAG=human
 
 usage() {
-    sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//' >&2
+    sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//' >&2
     exit 2
 }
 
@@ -96,12 +103,18 @@ while [ $# -gt 0 ]; do
         -O) [ $# -ge 2 ] || usage; OPT="-O$2"; shift 2 ;;
         -j) [ $# -ge 2 ] || usage; JOBS=$2; shift 2 ;;
         -a) OUT=prog.s; shift ;;
+        -d) [ $# -ge 2 ] || usage; DIAG=$2; shift 2 ;;
         -h|--help) usage ;;
         -*) usage ;;
         *) break ;;
     esac
 done
 FILTER=${1:-}
+case "$DIAG" in
+    human) DIAG_FLAG="" ;;
+    short) DIAG_FLAG="--diagnostics=short" ;;
+    *) usage ;;
+esac
 
 case "$COMPILER" in
     /*) ;;
@@ -115,6 +128,7 @@ if [ -z "$TARGET" ]; then
         Darwin-arm64) TARGET=aarch64-macos ;;
         Darwin-x86_64) TARGET=x86_64-macos ;;
         Linux-x86_64) TARGET=x86_64-linux ;;
+        Linux-aarch64) TARGET=aarch64-linux ;;
         *) echo "run.sh: no tachyon target for this host ($(uname -s) $(uname -m)); use -t" >&2; exit 2 ;;
     esac
 fi
@@ -122,7 +136,7 @@ fi
 case "$TARGET" in
     aarch64-macos) LINK_FLAGS="-arch arm64" ;;
     x86_64-macos) LINK_FLAGS="-arch x86_64" ;;
-    x86_64-linux) LINK_FLAGS="" ;;
+    x86_64-linux|aarch64-linux) LINK_FLAGS="" ;;
     *) echo "run.sh: unknown target '$TARGET'" >&2; exit 2 ;;
 esac
 
@@ -132,6 +146,49 @@ FAILURES="$WORK/failures"
 TALLY="$WORK/tally"
 : >"$FAILURES"
 : >"$TALLY"
+
+# The first message of directives file $1 (ERROR or WARNING texts) that
+# the compiler's output $2 lacks, each after the one before it; nothing
+# when all are there. With -d short a diagnostic is one line
+# (`file:line:col: error[kind] message | help: ...`): a directive
+# `line L, column C` is looked for as `:L:C:` in the line of the message
+# before it, `error[kind]: ` as `error[kind] `, and the next directive may
+# be later in the same line.
+missing_message() {
+    awk -v out="$2" -v short="$( [ "$DIAG" = short ] && echo 1 || echo 0)" '
+        BEGIN { while ((getline line < out) > 0) text[++n] = line; at = 0; col = 0 }
+        {
+            want = $0
+            from_start = 0
+            if (short) {
+                if (match(want, /^line [0-9]+, column [0-9]+$/)) {
+                    split(want, f, /[ ,]+/)
+                    want = ":" f[2] ":" f[4] ":"
+                    from_start = 1
+                }
+                while ((k = index(want, "]: ")) > 0) want = substr(want, 1, k) " " substr(want, k + 3)
+            }
+            if (!short) {
+                while (at < n && index(text[at + 1], want) == 0) at++
+                if (at >= n) { print $0; exit }
+                at++
+                next
+            }
+            # (short: from the previous match on, within its line first)
+            if (at > 0) {
+                rest = from_start ? text[at] : substr(text[at], col + 1)
+                k = index(rest, want)
+                if (k > 0) {
+                    col = (from_start ? 0 : col) + k + length(want) - 1
+                    next
+                }
+            }
+            while (at < n && index(text[at + 1], want) == 0) at++
+            if (at >= n) { print $0; exit }
+            at++
+            col = index(text[at], want) + length(want) - 1
+        }' "$1"
+}
 
 # Writes the directives of case file $1 into directory $2: one file per
 # directive (args, stdin, expect, exit, errors, xfail, source, build).
@@ -236,7 +293,7 @@ check_case() {
         2) fix_case "$source" "$dir" --fix-unsafe || return 1 ;;
     esac
     # The compiler's options for the case (0.9).
-    FLAGS="--deny-warnings $(sed "s|@ROOT@|$ROOT|g" "$dir/flags")"
+    FLAGS="--deny-warnings $DIAG_FLAG $(sed "s|@ROOT@|$ROOT|g" "$dir/flags")"
     # (--check-unsafe needs the IR: such a case runs at -O1 when -O0 is
     # asked for, 0.10.)
     if [ "$OPT" = -O0 ] && grep -q -- --check-unsafe "$dir/flags"; then
@@ -246,7 +303,7 @@ check_case() {
     if [ "$OPT" = -O0 ] && grep -q -- --profile-use "$dir/flags"; then
         : >"$dir/warnings"
     fi
-    [ -s "$dir/warnings" ] && FLAGS=$(sed "s|@ROOT@|$ROOT|g" "$dir/flags")
+    [ -s "$dir/warnings" ] && FLAGS="$DIAG_FLAG $(sed "s|@ROOT@|$ROOT|g" "$dir/flags")"
     if [ -s "$dir/errors" ]; then
         # shellcheck disable=SC2086
         "$COMPILER" --target "$TARGET" $OPT $FLAGS "$source" -o "$dir/prog.s" >"$dir/compile.out" 2>&1
@@ -256,19 +313,13 @@ check_case() {
             return 1
         fi
         # Each message, in order (several errors are reported at once).
-        missing=$(awk -v out="$dir/compile.out" '
-            BEGIN { while ((getline line < out) > 0) text[++n] = line }
-            {
-                while (at < n && index(text[at + 1], $0) == 0) at++
-                if (at >= n) { print $0; exit }
-                at++
-            }' "$dir/errors")
+        missing=$(missing_message "$dir/errors" "$dir/compile.out")
         if [ -n "$missing" ]; then
             { echo "expected an error containing '$missing' (after the ones before it), got:"; cat "$dir/compile.out"; } >"$dir/why"
             return 1
         fi
         if [ -s "$dir/errcount" ]; then
-            got=$(grep -c '^error\[' "$dir/compile.out")
+            got=$(grep -c -E '^error\[|^[^ ]*: error\[' "$dir/compile.out")
             if [ "$got" -ne "$(cat "$dir/errcount")" ]; then
                 { echo "expected $(cat "$dir/errcount") errors, got $got:"; cat "$dir/compile.out"; } >"$dir/why"
                 return 1
@@ -294,13 +345,7 @@ check_case() {
         return 1
     fi
     if [ -s "$dir/warnings" ]; then
-        missing=$(awk -v out="$dir/compile.out" '
-            BEGIN { while ((getline line < out) > 0) text[++n] = line }
-            {
-                while (at < n && index(text[at + 1], $0) == 0) at++
-                if (at >= n) { print $0; exit }
-                at++
-            }' "$dir/warnings")
+        missing=$(missing_message "$dir/warnings" "$dir/compile.out")
         if [ -n "$missing" ]; then
             { echo "expected a warning containing '$missing' (after the ones before it), got:"; cat "$dir/compile.out"; } >"$dir/why"
             return 1
@@ -548,6 +593,44 @@ while read -r name file; do
     fi
     count=$((count + 1))
 done <"$CASES"
+
+# `tachyonc query` (0.11): tests/query/run.sh, its transcripts and its
+# checks on the compiler's own source; category "query".
+case query in
+    *"$FILTER"*)
+        "$ROOT/tests/query/run.sh" -c "$COMPILER" >"$WORK/query.out" 2>&1
+        while read -r status _; do
+            case "$status" in
+                pass) echo "query pass" >>"$TALLY"; count=$((count + 1)) ;;
+                FAIL) echo "query fail" >>"$TALLY"; count=$((count + 1)) ;;
+            esac
+        done <"$WORK/query.out"
+        if ! grep -q '^pass' "$WORK/query.out"; then
+            echo "query fail" >>"$TALLY"
+            count=$((count + 1))
+        fi
+        awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/query.out" >>"$FAILURES"
+        ;;
+esac
+
+# The refactoring tools (0.11: edit, undo, check, fix, lint, same-output,
+# the planning queries): tests/refactor/run.sh; category "refactor".
+case refactor in
+    *"$FILTER"*)
+        "$ROOT/tests/refactor/run.sh" -c "$COMPILER" >"$WORK/refactor.out" 2>&1
+        while read -r status _; do
+            case "$status" in
+                pass) echo "refactor pass" >>"$TALLY"; count=$((count + 1)) ;;
+                FAIL) echo "refactor fail" >>"$TALLY"; count=$((count + 1)) ;;
+            esac
+        done <"$WORK/refactor.out"
+        if ! grep -q '^pass' "$WORK/refactor.out"; then
+            echo "refactor fail" >>"$TALLY"
+            count=$((count + 1))
+        fi
+        awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/refactor.out" >>"$FAILURES"
+        ;;
+esac
 
 [ $count -gt 0 ] || { echo "run.sh: no cases match '$FILTER'" >&2; exit 2; }
 cat "$FAILURES"

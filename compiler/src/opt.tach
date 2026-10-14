@@ -25,7 +25,8 @@ use crate::loops::{rotate_loops, seal_all};
 use crate::lsr::reduce_and_unswitch;
 use crate::range::fold_by_ranges;
 use crate::scev::transform_loops;
-use crate::vectorize::vectorize_loops;
+use crate::vectorize::{VECTORIZE, unroll_runtime_loops, vectorize_loops, UNROLL_WHOLE};
+use crate::slp::slp_vectorize;
 use crate::tre::eliminate_tail_recursion;
 use crate::ipo::{
     PRINT_ATTRS, has_effect, heap_to_stack, infer_component_attrs, init_attrs, print_attrs,
@@ -33,7 +34,7 @@ use crate::ipo::{
 };
 use crate::promote::promote_loop_memory;
 use crate::timer::{
-    T_ATTRS, T_GLOBAL_DCE, T_HEAP, T_INLINE, T_IPCP, T_LICM, T_LOOPS, T_PROMOTE, T_SCALAR, T_TRE,
+    T_ATTRS, T_GLOBAL_DCE, T_HEAP, T_INLINE, T_IPCP, T_LICM, T_LOOPS, T_PROMOTE, T_SCALAR, T_SLP, T_TRE,
     timer_add, timer_now,
 };
 use crate::regalloc::{ORDER, layout_blocks};
@@ -634,6 +635,19 @@ pub fn optimize_program() {
         t = timer_now();
         remove_dead_functions();
         timer_add(T_GLOBAL_DCE, t);
+        // (0.11: last, on the code as it will be emitted: stores packed
+        // earlier would hide their values from the loads of the functions
+        // they are inlined into)
+        t = timer_now();
+        for fi in 0..IRFUNC_COUNT {
+            if FN_LIVE[fi] != 0 && slp_vectorize(fi) {
+                IRF = fi;
+                resolve_all(fi);
+                eliminate_dead_code(fi);
+                verify_func(fi, c"SLP vectorization");
+            }
+        }
+        timer_add(T_SLP, t);
         if PRINT_ATTRS {
             print_attrs();
         }
@@ -665,7 +679,25 @@ fn optimize_loops(fi: i64) -> bool {
         }
         // (0.10: after the checks the ranges remove, before strength
         // reduction rewrites the addresses)
-        if vectorize_loops(fi) {
+        let vectorized = vectorize_loops(fi);
+        if vectorized {
+            changed = true;
+            light_cleanup(fi);
+        }
+        // (0.11: the loops the vectorizer left to be unrolled whole, which
+        // their checks kept transform_loops from before the ranges)
+        let mut unrolled = false;
+        if UNROLL_WHOLE {
+            unrolled = transform_loops(fi);
+            // (and the LCSSA phis of the loops it left)
+            resolve_all(fi);
+            remove_trivial_phis(fi);
+            changed = true;
+            light_cleanup(fi);
+        }
+        // (0.11: the loops the vectorizer left, in its frame; the loop forest
+        // it found is current when it changed nothing)
+        if unroll_runtime_loops(fi, !vectorized && !unrolled && VECTORIZE) {
             changed = true;
             light_cleanup(fi);
         }

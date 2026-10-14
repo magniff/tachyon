@@ -29,10 +29,12 @@ use crate::profile::{PROFILE_GENERATE, PROFILE_MODULE, profile_runtime_source};
 use crate::unsafecheck::{CHECK_MODULE, CHECK_UNSAFE, check_runtime_source};
 use crate::ast::{NODES, NodeKind, child};
 use crate::parser::ITEM_PUBLIC;
-use crate::types::{ENUMS, SYM_ENUM, find_variant, item_node_of};
+use crate::types::{ENUMS, SYM_ENUM, VARIANTS, find_variant, item_node_of};
+use crate::query::{QF_USE, qnote, qnote_module};
 use crate::check::{PROGRAM, SELF_SYM, Try, attempt, name_error, template_variant_named};
 use crate::lower::HMap;
 use crate::streq;
+use crate::fix::note_private;
 
 struct Module {
     name: i64, parent: i64, key: i64, sym: i64, public: bool, is_c: bool,
@@ -121,6 +123,12 @@ fn qualified_if_known(m: i64, name: i64) -> i64 {
     unsafe { find_sym(joined(MODULES[m].key, c"::", name)) }
 }
 
+// The key of item `name` of module m, if it has one, else -1 (0.11:
+// suggestions for unknown names).
+pub fn item_key_if_known(m: i64, name: i64) -> i64 {
+    qualified_if_known(m, name)
+}
+
 // The assembly symbol of item `name` of module m.
 pub fn item_symbol(m: i64, name: i64) -> i64 {
     if m <= 0 { name } else { unsafe { join_sym(MODULES[m].sym, c".", name) } }
@@ -152,7 +160,7 @@ static mut INLINE_MODS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
 // The module of the code at position `pos`: the innermost inline module
 // around it, else its file's.
-fn module_at(pos: i64) -> i64 {
+pub fn module_at(pos: i64) -> i64 {
     unsafe {
         let mut best = -1;
         let mut best_start = -1;
@@ -170,6 +178,10 @@ fn module_at(pos: i64) -> i64 {
         }
         FILES[file_of(pos)].module
     }
+}
+
+pub fn module_count() -> i64 {
+    MODULE_COUNT
 }
 
 pub fn child_module(m: i64, name: i64) -> i64 {
@@ -572,6 +584,33 @@ pub fn resolve_use_of(u: i64) {
             }
         }
         USE_ENTRIES[u].result = result;
+        note_import(USE_ENTRIES[u].item, result);
+    }
+}
+
+// `tachyonc query` (0.11): what the name `use` item `id` imports.
+fn note_import(id: i64, b: i64) {
+    unsafe {
+        if id == 0 {
+            return;
+        }
+        let pos = NODES[id].start;
+        let name = NODES[id].a;
+        let kind = binding_kind(b);
+        if kind == B_ITEM {
+            qnote(pos, name, item_node_of(binding_value(b)), QF_USE);
+        } else if kind == B_VARIANT {
+            qnote(pos, name, VARIANTS[binding_value(b)].node, QF_USE);
+        } else if kind == B_TVARIANT {
+            let item = ENUMS[binding_value(b)].node;
+            for i in 0..NODES[item].count {
+                if NODES[child(item, i)].a == name {
+                    qnote(pos, name, child(item, i), QF_USE);
+                }
+            }
+        } else if kind == B_MODULE {
+            qnote_module(pos, name, binding_value(b), QF_USE);
+        }
     }
 }
 
@@ -611,6 +650,7 @@ pub fn private_error(pos: i64, name: i64) -> ! {
 // The error for a binding that cannot be used: private, or (0.6) brought
 // by two `*` imports.
 pub fn access_error(b: i64, pos: i64, name: i64) -> ! {
+    note_private(b);
     if b == B_AMBIGUOUS {
         unsafe {
             name_error(pos, c"'", name, c"' is ambiguous: more than one '*' import brings it (import it by name, or write its path)");
@@ -968,6 +1008,9 @@ fn resolve_path(m: i64, path: i64, count: i64, pos: i64) -> i64 {
                 err_end();
             }
             cur = found;
+            if binding_kind(found) == B_MODULE {
+                qnote_module(NODES[seg].start, name, binding_value(found), 0);
+            }
         }
         let _ = pos;
         cur

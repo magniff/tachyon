@@ -24,6 +24,9 @@ compiler has to be the teacher.
 
 ## 2. Ask the compiler instead of reading source
 
+(Measured: [agent-tool-usage.md](agent-tool-usage.md) records how agents
+actually read and searched tachyon's source while building it.)
+
 A batch, token-efficient query interface (an LSP for programs, not
 editors): `type-at file:line:col`, `callers f`, `refs Node::kind`,
 `layout S` (offsets), `api module` (signatures and doc lines only, like a
@@ -94,6 +97,19 @@ One canonical formatter without options (minimal diffs); regular,
 unambiguous syntax with one way to do each thing; explicit types at
 function boundaries, inference inside; no dependence on declaration order.
 For agents ambiguity costs more than verbosity.
+
+## Later: a compiler server (MCP, then LSP)
+
+`tachyonc serve`: the program kept resolved in memory and re-checked
+incrementally, so queries and edits answer in milliseconds instead of a
+35 ms re-check each; its tools (query, edit, check, fix, refactor) typed,
+over MCP for agents and later over LSP for editors, one core for both.
+Keep the tool set small (its schemas sit in every agent's context) and
+keep the CLI for one-off calls. Not a language model inside the compiler:
+its answers must stay exact and reproducible, and the caller is already a
+model. Fuzzy questions ("where is X handled?") could get an optional,
+clearly approximate semantic search outside the build, if the tool-usage
+log (`# no-query:` reasons) ever shows demand for it.
 
 ## If only three
 

@@ -31,6 +31,8 @@ use crate::types::{
     type_size, in_fregs, is_vector,
 };
 use crate::patterns::int_key;
+use crate::ast::NODES;
+use crate::dwarf::{DEBUG_INFO, dbg_function_begin, dbg_function_end, dbg_loc};
 use crate::gen::{fn_is_global, fn_symbol_prefix, static_symbol_prefix};
 use crate::abi::{
     ABI_PIECE_COUNT, ABI_PIECE_OFFSET, ABI_PIECE_TY, AbiClass, abi_classify, abi_piece_locations,
@@ -39,14 +41,14 @@ use crate::abi::{
     variadic_kind,
 };
 use crate::target::{
-    ASM, CODE, ELF, LABEL_COUNT, X86, arg_location, emit_call, emit_function_start, emit_jump,
+    APPLE_A64, ASM, CODE, ELF, LABEL_COUNT, X86, arg_location, emit_call, emit_function_start, emit_jump,
     emit_label, emit_symbol_ref, first_int_arg, function_prefix, global_prefix, ins, new_label, o,
     on, rt_panic_sym, variadic_arg_location,
 };
 use crate::arm64::{a64_align_down, a64_call_indirect, a64_epilogue, a64_frame_reserve};
 use crate::x86_64::{fits_i32, x64_call_indirect, x64_epilogue, x64_frame_reserve, x64_imm};
 use crate::ir::{
-    ARGTY, BLOCKS, Cond, INSTS, IRF, IRFUNCS, Op, SLOTS, Term, VARIADIC_PIECE, case_target,
+    ARGTY, BLOCKS, Cond, INSTS, INST_LOC, IRF, IRFUNCS, Op, SLOTS, Term, VARIADIC_PIECE, case_target,
     case_value, ir_arg, ir_operand, ir_operand_count, ir_type, pred_index, succ, succ_count,
 };
 use crate::opt::OPT_LEVEL;
@@ -60,21 +62,21 @@ use crate::layout::{EMIT, layout_emission};
 use crate::mc_arm64::{
     ma_branch_bool, ma_cmp, ma_cmp_branch, ma_cmp_imm, ma_conv, ma_copy, ma_extern_addr,
     ma_float_op, ma_fmath, ma_frame_link, ma_frame_unlink, ma_int_imm_ok, ma_int_op, ma_int_op_imm,
-    ma_jump_table, ma_lea, ma_load, ma_load_fimm, ma_load_imm, ma_madd, ma_mov, ma_normalize,
+    ma_jump_table, ma_lea, ma_load, ma_load_fimm, ma_load_imm, ma_madd, ma_mov, ma_mulh, ma_normalize,
     ma_pair, ma_select, ma_shop, ma_store, ma_string_addr, ma_symbol_addr, ma_test_branch, ma_ubfx,
     ma_unary, ma_vbin, ma_vcmp, ma_vext, ma_vins, ma_vneg, ma_vsel, ma_vsplat, ma_vsum,
 };
 use crate::mc_x86_64::{
     mx_branch_bool, mx_cmp, mx_cmp_branch, mx_cmp_imm, mx_conv, mx_copy, mx_div, mx_extern_addr,
     mx_float_op, mx_frame_link, mx_frame_unlink, mx_int_imm_ok, mx_int_op, mx_int_op_imm,
-    mx_jump_table, mx_lea, mx_load, mx_load_fimm, mx_load_imm, mx_mov, mx_normalize, mx_select,
+    mx_jump_table, mx_lea, mx_load, mx_load_fimm, mx_load_imm, mx_mov, mx_mulh, mx_normalize, mx_select,
     mx_sqrt, mx_store, mx_string_addr, mx_symbol_addr, mx_test_branch, mx_unary, mx_vbin, mx_vcmp,
     mx_vext, mx_vins, mx_vneg, mx_vsel, mx_vsplat, mx_vsum,
 };
 use crate::ir::Op::{
     BNot, Call, CallC, CallI, Cmp, Const, Conv, Copy, Div, FMath, GAddr, Lea, Load, LoadX, MAdd,
-    MSub, Neg, Not, Pack, Param, Phi, Piece, Rem, SAddr, Select, ShOp, Slot, Store, StoreX, Test,
-    Ubfx, VBin, VCmp, VExt, VIns, VNeg, VSel, VSplat, VSum,
+    MSub, MulH, Neg, Not, Pack, Param, Phi, Piece, Rem, SAddr, Select, ShOp, Slot, Store, StoreX,
+    Test, Ubfx, VBin, VCmp, VExt, VIns, VNeg, VSel, VSplat, VSum,
 };
 
 static mut FRAME_OUT: i64 = 0;
@@ -935,6 +937,9 @@ pub fn gen_ir_function(fi: i64) {
         EPILOGUE_USED = false;
         FELL_INTO_EPILOGUE = false;
         HAS_FRAME = SAVE >= 0;
+        LAST_LOC = 0;
+        let item = IRFUNCS[fi].item;
+        dbg_function_begin(f, fn_symbol_prefix(f), if item > 0 { NODES[item].start } else { -1 });
         ir_function_start(fn_symbol_prefix(f), FNS[f].name, fn_is_global(f), SAVE == 0);
         CUR_IN_FRAME = SAVE == 0;
         if SAVE == 0 {
@@ -964,6 +969,34 @@ pub fn gen_ir_function(fi: i64) {
             st_function_done(fi);
         }
         buf_bytes(ASM, buf_slice(CODE));
+        dbg_function_end();
+    }
+}
+
+// (-g) The source position (+ 1) of the last `.loc` written.
+static mut LAST_LOC: i64 = 0;
+
+// (-g) The `.loc` of instruction v, when it starts another statement. The
+// peepholes that look at what was just emitted see through it.
+fn emit_loc(v: i64) {
+    unsafe {
+        let loc = INST_LOC.data[v];
+        if loc == 0 || loc == LAST_LOC {
+            return;
+        }
+        LAST_LOC = loc;
+        let before = BUFS[CODE].len;
+        dbg_loc(CODE, loc - 1);
+        let after = BUFS[CODE].len;
+        if LAST_MOV_END == before {
+            LAST_MOV_END = after;
+        }
+        if LAST_STORE_END == before {
+            LAST_STORE_END = after;
+        }
+        if LAST_SELECT_END == before {
+            LAST_SELECT_END = after;
+        }
     }
 }
 
@@ -1456,6 +1489,9 @@ fn emit_block_body(b: i64, next: i64) {
                 plan_gap_moves(CUR_POS - 1);
                 pm_resolve();
                 if is_emitted(v) && !is_fused_compare(v) {
+                    if DEBUG_INFO {
+                        emit_loc(v);
+                    }
                     emit_inst(v);
                 }
             }
@@ -1757,6 +1793,16 @@ fn emit_inst(v: i64) {
             result_done(v, r);
         } else if op.is_vector() {
             emit_vector(v);
+        } else if op == MulH {
+            let a = operand_reg(INSTS[v].a);
+            let b = operand_reg(INSTS[v].b);
+            let r = result_reg(v);
+            if X86 {
+                mx_mulh(INSTS[v].imm == 1, r, a, b);
+            } else {
+                ma_mulh(INSTS[v].imm == 1, r, a, b);
+            }
+            result_done(v, r);
         } else if op == MAdd || op == MSub || op == ShOp || op == Ubfx {
             // AArch64 only (see isel.tach).
             let a = operand_reg(INSTS[v].a);
@@ -2245,7 +2291,7 @@ fn emit_call_inst(v: i64) {
                 // Apple's arm64 ABI packs fixed stack arguments at their size;
                 // everything else takes 8 bytes.
                 store_ty = TY_U64;
-                if c && !X86 && !variadic && !is_compound(ty) && type_size(ty) < 8 {
+                if c && APPLE_A64 && !variadic && !is_compound(ty) && type_size(ty) < 8 {
                     store_ty = ty;
                 }
             }

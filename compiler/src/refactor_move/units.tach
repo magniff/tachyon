@@ -1,0 +1,770 @@
+// The top-level pieces of a file (units), what moves of them (blocks),
+// and the plan of a split (made by `refactor split crate::refactor_move
+// --auto`, then renamed).
+
+use crate::ast::{NODES, NODE_COUNT, NodeKind, child};
+use crate::base::{
+    BUFS, FILES, IntVec, SRC, STDOUT, SYMS, alloc_array, buf_byte, buf_bytes, buf_int, buf_new,
+    buf_slice, buf_str, buf_write_fd, intern,
+};
+use crate::edit::{after_line, blank_line, node_head};
+use crate::lexer::{TOKS, TOK_COUNT, Tok};
+use crate::lower::HMap;
+use crate::modules::{child_module, file_of_pos, module_at, module_of};
+use crate::plan::cluster;
+use crate::query::{
+    DEFS, DEF_COUNT, K_ENUM, K_IMPL_METHOD, K_METHOD, K_MOD, K_STRUCT, K_TRAIT, OPT_MAX_LINES, PROG,
+    QF_DEF, ROOT_GIVEN, R_DEF, R_FLAGS, R_POS, bytes_eq, c_slice, diag, line_end, line_start,
+    mod_fqn, put_cword, sym_less, token_at, try_begin, try_end,
+};
+use crate::refactor_mod::{
+    REFS, comment_line, emit_regions, item_binding,
+    make_module, own_file, region_name, use_binding,
+};
+use crate::refactor_move::{MV_DEF, MV_DEST, add_block, in_block, move_edits};
+use crate::refactor_move::imports::DROPPED;
+use crate::refactor_mod::cli::{OPT_KEEP_IMPLS, OPT_PLAN, finish, is_ident};
+
+// ---- Units: the top-level pieces of a file ----
+
+const U_ITEM: i64 = 1;
+
+const U_IMPL: i64 = 2;
+
+const U_EXTERN: i64 = 3;
+
+const U_OTHER: i64 = 4;
+
+// Per unit: its text (from the comment and attribute lines above it to
+// after its last line), its first and last tokens, its kind, its item (an
+// impl's type when it is an item of the module), an impl's trait, its
+// file, the start of the banner above it (-1), where it moves (-1).
+static mut UN_START: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+static mut UN_END: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+pub static mut UN_FIRST: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+static mut UN_LAST: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+static mut UN_KIND: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+static mut UN_DEF: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+static mut UN_TRAIT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+static mut UN_FILE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+static mut UN_BANNER: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+static mut UN_DEST: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The unit of an item (definition + 1 -> unit + 1), files done.
+static mut UNIT_OF: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+static mut UNITS_DONE: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+// The top-level definitions by the token index of their start.
+static mut DEF_TOK: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+fn closing(i: i64) -> i64 {
+    unsafe {
+        let mut depth = 0;
+        let mut j = i;
+        while j < TOK_COUNT && TOKS[j].kind != Tok::Eof {
+            let k = TOKS[j].kind;
+            if k == Tok::LBrace || k == Tok::LParen || k == Tok::LBracket {
+                depth += 1;
+            } else if k == Tok::RBrace || k == Tok::RParen || k == Tok::RBracket {
+                depth -= 1;
+                if depth == 0 {
+                    return j;
+                }
+            }
+            j += 1;
+        }
+        j - 1
+    }
+}
+
+// The units of file f, in order.
+pub fn units_of(f: i64) {
+    unsafe {
+        if UNITS_DONE.get(f + 1) != 0 {
+            return;
+        }
+        UNITS_DONE.put(f + 1, 1);
+        if DEF_TOK.count == 0 {
+            for d in 0..DEF_COUNT {
+                if DEFS[d].parent < 0 && DEFS[d].kind != K_METHOD && DEFS[d].kind != K_IMPL_METHOD {
+                    DEF_TOK.put(token_at(DEFS[d].start) + 1, d + 1);
+                }
+            }
+        }
+        let first_unit = UN_START.count;
+        let mut i = token_at(FILES[f].start);
+        while i < TOK_COUNT && TOKS[i].kind != Tok::Eof && TOKS[i].start < FILES[f].end {
+            let head = i;
+            while TOKS[i].kind == Tok::Hash && TOKS[i + 1].kind == Tok::LBracket {
+                i = closing(i + 1) + 1;
+            }
+            if TOKS[i].kind == Tok::Pub {
+                i += 1;
+            }
+            let kw = TOKS[i].kind;
+            let braced = kw == Tok::Fn || kw == Tok::Struct || kw == Tok::Enum || kw == Tok::Union || kw == Tok::Impl
+                || kw == Tok::Trait || kw == Tok::Extern || kw == Tok::Mod || kw == Tok::Unsafe;
+            let mut j = i;
+            let mut depth = 0;
+            loop {
+                let k = TOKS[j].kind;
+                if k == Tok::Eof || TOKS[j].start >= FILES[f].end {
+                    j -= 1;
+                    break;
+                }
+                if k == Tok::LBrace || k == Tok::LParen || k == Tok::LBracket {
+                    depth += 1;
+                } else if k == Tok::RBrace || k == Tok::RParen || k == Tok::RBracket {
+                    depth -= 1;
+                    if depth == 0 && k == Tok::RBrace && braced {
+                        break;
+                    }
+                } else if k == Tok::Semi && depth == 0 {
+                    break;
+                }
+                j += 1;
+            }
+            let u = UN_START.count;
+            UN_START.push(unit_text_start(f, TOKS[head].start));
+            UN_END.push(after_line(TOKS[j].end - 1));
+            UN_FIRST.push(head);
+            UN_LAST.push(j);
+            UN_FILE.push(f);
+            UN_BANNER.push(-1);
+            UN_DEST.push(-1);
+            UN_TRAIT.push(-1);
+            let m = module_at(TOKS[i].start);
+            if kw == Tok::Impl {
+                UN_KIND.push(U_IMPL);
+                impl_names(i, m);
+            } else if kw == Tok::Extern && TOKS[i + 1].kind == Tok::Str && TOKS[i + 2].kind == Tok::LBrace {
+                UN_KIND.push(U_EXTERN);
+                UN_DEF.push(-1);
+            } else if kw == Tok::Use || kw == Tok::Import || kw == Tok::Mod {
+                UN_KIND.push(U_OTHER);
+                UN_DEF.push(-1);
+            } else {
+                let mut d = -1;
+                let mut t = i;
+                while t <= j && t <= i + 3 && d < 0 {
+                    d = DEF_TOK.get(t + 1) - 1;
+                    t += 1;
+                }
+                UN_KIND.push(if d >= 0 { U_ITEM } else { U_OTHER });
+                UN_DEF.push(d);
+                if d >= 0 {
+                    UNIT_OF.put(d + 1, u + 1);
+                }
+            }
+            i = j + 1;
+        }
+        banners(f, first_unit);
+    }
+}
+
+// The start of the text of an item whose first token is at pos: its line,
+// and the comment and attribute lines directly above.
+fn unit_text_start(f: i64, pos: i64) -> i64 {
+    unsafe {
+        let mut first = line_start(pos);
+        while first > FILES[f].start {
+            let prev = line_start(first - 1);
+            let mut a = prev;
+            while a < first - 1 && (SRC[a] == ' ' || SRC[a] == '\t') {
+                a += 1;
+            }
+            let comment = a + 1 < first && SRC[a] == '/' && SRC[a + 1] == '/';
+            let attribute = a + 1 < first && SRC[a] == '#' && SRC[a + 1] == '[';
+            if !comment && !attribute {
+                break;
+            }
+            first = prev;
+        }
+        first
+    }
+}
+
+// The type and the trait of the impl block at token i (`impl`), when they
+// are items of module m: UN_DEF and UN_TRAIT.
+fn impl_names(i: i64, m: i64) {
+    unsafe {
+        let mut t = i + 1;
+        if TOKS[t].kind == Tok::Lt {
+            let mut depth = 0;
+            loop {
+                let k = TOKS[t].kind;
+                if k == Tok::Lt {
+                    depth += 1;
+                } else if k == Tok::Gt {
+                    depth -= 1;
+                } else if k == Tok::Shr {
+                    depth -= 2;
+                }
+                t += 1;
+                if depth <= 0 || k == Tok::LBrace || k == Tok::Eof {
+                    break;
+                }
+            }
+        }
+        let mut angle = 0;
+        let mut last = -1;
+        let mut tr = -1;
+        while TOKS[t].kind != Tok::LBrace && TOKS[t].kind != Tok::Eof {
+            let k = TOKS[t].kind;
+            if k == Tok::Lt {
+                angle += 1;
+            } else if k == Tok::Gt {
+                angle -= 1;
+            } else if k == Tok::Shr {
+                angle -= 2;
+            } else if k == Tok::For && angle == 0 {
+                tr = last;
+                last = -1;
+            } else if k == Tok::Ident && angle == 0 {
+                last = t;
+            }
+            t += 1;
+        }
+        let mut ty = -1;
+        if last >= 0 {
+            let d = item_binding(m, TOKS[last].value as i64);
+            if d >= 0 && (DEFS[d].kind == K_STRUCT || DEFS[d].kind == K_ENUM) {
+                ty = d;
+            }
+        }
+        UN_DEF.push(ty);
+        if tr >= 0 {
+            let d = item_binding(m, TOKS[tr].value as i64);
+            if d >= 0 && DEFS[d].kind == K_TRAIT {
+                UN_TRAIT.data[UN_TRAIT.count - 1] = d;
+            }
+        }
+    }
+}
+
+// The banners above the units of file f (from unit `first`): a block of
+// comment lines, a blank line after it and one before it (or code), with
+// code somewhere before it in the file (the comment at the top of a file
+// is the file's).
+fn banners(f: i64, first: i64) {
+    unsafe {
+        let code_start = if first < UN_START.count { TOKS[UN_FIRST.data[first]].start } else { FILES[f].end };
+        for u in first..UN_START.count {
+            let a = UN_START.data[u];
+            if a <= FILES[f].start {
+                continue;
+            }
+            let mut q = line_start(a - 1);
+            if !blank_line(q) {
+                continue;
+            }
+            while q > FILES[f].start && blank_line(q) {
+                q = line_start(q - 1);
+            }
+            if !comment_line(q) {
+                continue;
+            }
+            let mut cs = q;
+            while cs > FILES[f].start && comment_line(line_start(cs - 1)) {
+                cs = line_start(cs - 1);
+            }
+            if cs < code_start || (u > first && cs < UN_END.data[u - 1]) {
+                continue;
+            }
+            UN_BANNER.data[u] = cs;
+        }
+    }
+}
+
+// The unit holding position pos (of a file whose units are made), or -1.
+fn unit_at(pos: i64) -> i64 {
+    unsafe {
+        for u in 0..UN_START.count {
+            if UN_START.data[u] <= pos && pos < UN_END.data[u] {
+                return u;
+            }
+        }
+        -1
+    }
+}
+
+// The blocks of the moves: each item's unit (or its line in an extern
+// block), the impl blocks that go with it, the banners. False after a
+// diagnostic.
+pub fn make_blocks() -> bool {
+    unsafe {
+        let mut seen = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        for i in 0..MV_DEF.count {
+            let d = MV_DEF.data[i];
+            let f = file_of_pos(DEFS[d].start);
+            units_of(f);
+            let u = UNIT_OF.get(d + 1) - 1;
+            if u >= 0 {
+                UN_DEST.data[u] = MV_DEST.data[i];
+                continue;
+            }
+            // A function of an extern block.
+            let x = unit_at(DEFS[d].start);
+            if x < 0 || UN_KIND.data[x] != U_EXTERN {
+                let e = diag(c"error", c"refactor.not-movable");
+                buf_bytes(e, SYMS[DEFS[d].fqn].text);
+                buf_str(e, c" is not an item of its file that the refactorings know how to move\n");
+                return false;
+            }
+            seen.put(d + 1, MV_DEST.data[i] + 1);
+        }
+        // The extern blocks: whole when all their functions go to one
+        // place, else function by function.
+        for x in 0..UN_START.count {
+            if UN_KIND.data[x] != U_EXTERN {
+                continue;
+            }
+            let mut dest = -2;
+            let mut all = true;
+            for d in 0..DEF_COUNT {
+                if DEFS[d].parent >= 0 || DEFS[d].start < TOKS[UN_FIRST.data[x]].start || DEFS[d].start > TOKS[UN_LAST.data[x]].start {
+                    continue;
+                }
+                let g = seen.get(d + 1) - 1;
+                if g < 0 {
+                    all = false;
+                } else if dest == -2 {
+                    dest = g;
+                } else if dest != g {
+                    all = false;
+                }
+            }
+            if dest == -2 {
+                continue;
+            }
+            if all {
+                UN_DEST.data[x] = dest;
+                continue;
+            }
+            for d in 0..DEF_COUNT {
+                let g = seen.get(d + 1) - 1;
+                if g >= 0 && DEFS[d].start >= TOKS[UN_FIRST.data[x]].start && DEFS[d].start <= TOKS[UN_LAST.data[x]].start {
+                    let f = UN_FILE.data[x];
+                    let tail = TOKS[token_at(DEFS[d].end - 1)].end;
+                    add_block(unit_text_start(f, node_head(DEFS[d].start)), after_line(tail - 1), g, x);
+                }
+            }
+        }
+        // The impl blocks go with their type (or their trait).
+        for x in 0..UN_START.count {
+            if UN_KIND.data[x] != U_IMPL || UN_DEST.data[x] >= 0 {
+                continue;
+            }
+            let ty = UN_DEF.data[x];
+            let tr = UN_TRAIT.data[x];
+            if ty >= 0 && !OPT_KEEP_IMPLS {
+                let tu = UNIT_OF.get(ty + 1) - 1;
+                if tu >= 0 && UN_DEST.data[tu] >= 0 {
+                    UN_DEST.data[x] = UN_DEST.data[tu];
+                }
+            } else if ty < 0 && tr >= 0 {
+                let tu = UNIT_OF.get(tr + 1) - 1;
+                if tu >= 0 && UN_DEST.data[tu] >= 0 {
+                    UN_DEST.data[x] = UN_DEST.data[tu];
+                }
+            }
+        }
+        // The units that move, with their banners.
+        for u in 0..UN_START.count {
+            if UN_DEST.data[u] < 0 {
+                continue;
+            }
+            let mut start = UN_START.data[u];
+            if UN_BANNER.data[u] >= 0 {
+                let mut whole = true;
+                let mut v = u;
+                while v < UN_START.count && UN_FILE.data[v] == UN_FILE.data[u] && (v == u || UN_BANNER.data[v] < 0) {
+                    if UN_DEST.data[v] != UN_DEST.data[u] {
+                        whole = false;
+                    }
+                    v += 1;
+                }
+                if whole {
+                    start = UN_BANNER.data[u];
+                }
+            }
+            add_block(start, UN_END.data[u], UN_DEST.data[u], -1);
+        }
+        true
+    }
+}
+
+// Where imports go in module m's file: after its last `use` that stays
+// (true), or before its first unit that stays.
+pub fn import_anchor(m: i64, after: *bool) -> i64 {
+    unsafe {
+        let f = own_file(m);
+        let mut last = -1;
+        for u in 1..NODE_COUNT {
+            if NODES[u].kind != NodeKind::Use || module_of(u) != m || file_of_pos(NODES[u].start) != f {
+                continue;
+            }
+            let mut gone = 0;
+            for k in 0..NODES[u].count {
+                if DROPPED.get(child(u, k)) != 0 {
+                    gone += 1;
+                }
+            }
+            if NODES[u].count > 0 && gone == NODES[u].count {
+                continue;
+            }
+            if last < 0 || NODES[u].start > NODES[last].start {
+                last = u;
+            }
+        }
+        if last >= 0 {
+            *after = true;
+            return line_end(NODES[last].end - 1);
+        }
+        *after = false;
+        units_of(f);
+        for u in 0..UN_START.count {
+            if UN_FILE.data[u] == f && !in_block(UN_START.data[u]) {
+                return if UN_BANNER.data[u] >= 0 { UN_BANNER.data[u] } else { UN_START.data[u] };
+            }
+        }
+        FILES[f].end
+    }
+}
+
+// The lines of SRC[a..b).
+fn lines_of(a: i64, b: i64) -> i64 {
+    unsafe {
+        let mut n = 0;
+        for p in a..b {
+            if SRC[p] == '\n' {
+                n += 1;
+            }
+        }
+        n
+    }
+}
+
+// The split of module m (file f) into parts: printed as commands
+// (--plan), or made (--auto).
+pub fn split_plan(m: i64, f: i64, root: *u8) -> i64 {
+    unsafe {
+        let total = lines_of(FILES[f].start, FILES[f].end);
+        let max = OPT_MAX_LINES;
+        if total <= max {
+            let e = diag(c"note", c"refactor.fits");
+            buf_bytes(e, SYMS[mod_fqn(m)].text);
+            buf_str(e, c" has ");
+            buf_int(e, total);
+            buf_str(e, c" lines (at most ");
+            buf_int(e, max);
+            buf_str(e, c"); nothing to split\n");
+            return 0;
+        }
+        // The items that can move (an impl block counts with its type, or
+        // its trait), their lines; what stays (the rest) and its lines.
+        let mut items = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let owner = alloc_array::<i64>(UN_START.count + 1);
+        for u in 0..UN_START.count {
+            owner[u] = -1;
+            if UN_FILE.data[u] == f && UN_KIND.data[u] == U_ITEM && DEFS[UN_DEF.data[u]].kind != K_MOD {
+                owner[u] = items.count;
+                items.push(u);
+            }
+        }
+        let n = items.count;
+        let lines = alloc_array::<i64>(n + 1);
+        let mut pinned = total;
+        for u in 0..UN_START.count {
+            if UN_FILE.data[u] != f {
+                continue;
+            }
+            if UN_KIND.data[u] == U_IMPL {
+                let ty = UN_DEF.data[u];
+                let tr = UN_TRAIT.data[u];
+                let tu = if ty >= 0 { UNIT_OF.get(ty + 1) - 1 } else if tr >= 0 { UNIT_OF.get(tr + 1) - 1 } else { -1 };
+                if tu >= 0 && owner[tu] >= 0 {
+                    owner[u] = owner[tu];
+                }
+            }
+            if owner[u] >= 0 {
+                let l = lines_of(UN_START.data[u], UN_END.data[u]);
+                lines[owner[u]] += l;
+                pinned -= l;
+            }
+        }
+        // The references between items, and from other modules.
+        let weight = alloc_array::<i64>(n * n + 1);
+        let outside = alloc_array::<i64>(n + 1);
+        for k in 0..REFS.count {
+            let r = REFS.data[k];
+            if (R_FLAGS.data[r] & QF_DEF) != 0 {
+                continue;
+            }
+            let tu = unit_at(DEFS[R_DEF.data[r]].start);
+            if tu < 0 || owner[tu] < 0 {
+                continue;
+            }
+            let t = owner[tu];
+            let p = R_POS.data[r];
+            if file_of_pos(p) != f {
+                if module_at(p) != m {
+                    outside[t] += 1;
+                }
+                continue;
+            }
+            let su = unit_at(p);
+            if su >= 0 && owner[su] >= 0 && owner[su] != t {
+                weight[owner[su] * n + t] += 1;
+            }
+        }
+        let mut budget = max - pinned - 20;
+        if budget < max / 2 {
+            budget = max / 2;
+        }
+        let group = alloc_array::<i64>(n + 1);
+        let size = alloc_array::<i64>(n + 1);
+        cluster(weight, lines, n, budget, group, size);
+        // The parts, largest first; the one most used from outside stays.
+        let mut parts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for g in 0..n {
+            if size[g] >= 0 {
+                let mut k = parts.count;
+                parts.push(g);
+                while k > 0 && size[parts.data[k - 1]] < size[g] {
+                    parts.data[k] = parts.data[k - 1];
+                    k -= 1;
+                }
+                parts.data[k] = g;
+            }
+        }
+        let mut stay = -1;
+        let mut best = -1;
+        for k in 0..parts.count {
+            let g = parts.data[k];
+            let mut o = 0;
+            for i in 0..n {
+                if group[i] == g {
+                    o += outside[i];
+                }
+            }
+            if o > best {
+                best = o;
+                stay = g;
+            }
+        }
+        // Their names.
+        let mut names = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for k in 0..parts.count {
+            let g = parts.data[k];
+            names.push(if g == stay { -1 } else { part_name(m, g, group, &items, n, &names, k) });
+        }
+        if OPT_PLAN {
+            let out = buf_new();
+            buf_str(out, c"# ");
+            buf_bytes(out, SYMS[mod_fqn(m)].text);
+            buf_byte(out, '\t');
+            buf_int(out, total);
+            buf_str(out, c" lines\t");
+            buf_int(out, parts.count);
+            buf_str(out, c" parts of at most ");
+            buf_int(out, max);
+            buf_str(out, c" lines\n");
+            for k in 0..parts.count {
+                let g = parts.data[k];
+                if g == stay {
+                    continue;
+                }
+                put_cword(out, PROG);
+                buf_str(out, c" refactor split ");
+                buf_bytes(out, SYMS[mod_fqn(m)].text);
+                buf_str(out, c" --into ");
+                buf_bytes(out, SYMS[mod_fqn(m)].text);
+                buf_str(out, c"::");
+                buf_bytes(out, SYMS[names.data[k]].text);
+                buf_str(out, c" --items ");
+                let mut first = true;
+                for i in 0..n {
+                    if group[i] != g {
+                        continue;
+                    }
+                    if !first {
+                        buf_byte(out, ',');
+                    }
+                    first = false;
+                    buf_bytes(out, SYMS[DEFS[UN_DEF.data[items.data[i]]].name].text);
+                }
+                if ROOT_GIVEN != 0 as *u8 {
+                    crate::query::put_root(out);
+                }
+                buf_byte(out, '\n');
+            }
+            // (the out buffer starts with a space before each command)
+            buf_write_fd(trim_lines(out), STDOUT);
+            let e = diag(c"note", c"refactor.plan");
+            buf_str(e, c"the same in one edit: --auto\n");
+            let t = try_begin(c"split", SYMS[mod_fqn(m)].text, true);
+            buf_str(t, c" --auto --max-lines ");
+            buf_int(t, max);
+            try_end(t);
+            return 0;
+        }
+        // --auto: the parts, made.
+        let mut converts = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        let mut made = 0;
+        for k in 0..parts.count {
+            let g = parts.data[k];
+            if g == stay {
+                continue;
+            }
+            let r = make_module(m, names.data[k], false, &converts);
+            if r < 0 {
+                return 1;
+            }
+            made += 1;
+            for i in 0..n {
+                if group[i] == g {
+                    MV_DEF.push(UN_DEF.data[items.data[i]]);
+                    MV_DEST.push(r);
+                }
+            }
+        }
+        if !move_edits() {
+            return 1;
+        }
+        emit_regions();
+        let what = buf_new();
+        buf_str(what, c"split ");
+        buf_bytes(what, SYMS[mod_fqn(m)].text);
+        buf_str(what, c" into ");
+        buf_int(what, made);
+        buf_str(what, if made == 1 { c" module" } else { c" modules" });
+        finish(what, root)
+    }
+}
+
+// The lines of buffer b without the space put_cword puts first.
+fn trim_lines(b: i64) -> i64 {
+    unsafe {
+        let s = buf_slice(b);
+        let out = buf_new();
+        let mut i = 0;
+        let mut start = true;
+        while i < s.len {
+            if !(start && s[i] == ' ') {
+                buf_byte(out, s[i]);
+            }
+            start = s[i] == '\n';
+            i += 1;
+        }
+        out
+    }
+}
+
+// A name for part g of module m (the k-th part): the word of its items'
+// names that is the most its own (weighted by their lines, against the
+// other parts'), not a name of m nor of a part before; `partK` else.
+fn part_name(m: i64, g: i64, group: *i64, items: *IntVec, n: i64, taken: *IntVec, k: i64) -> i64 {
+    unsafe {
+        let mut mine = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        let mut theirs = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        let mut words = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..n {
+            let u = (*items).data[i];
+            let d = UN_DEF.data[u];
+            let l = 1000 + lines_of(UN_START.data[u], UN_END.data[u]);
+            let s = SYMS[DEFS[d].name].text;
+            let mut a = 0;
+            while a < s.len {
+                // (words: between underscores and at capitals)
+                let mut e = a + 1;
+                while e < s.len && s[e] != '_' && !(s[e] >= 'A' && s[e] <= 'Z' && s[e - 1] >= 'a' && s[e - 1] <= 'z') {
+                    e += 1;
+                }
+                let b = buf_new();
+                for x in a..e {
+                    let c = s[x];
+                    if c != '_' {
+                        buf_byte(b, if c >= 'A' && c <= 'Z' { c + 32 } else { c });
+                    }
+                }
+                if BUFS[b].len >= 3 {
+                    let w = intern(buf_slice(b));
+                    if group[i] == g {
+                        if mine.get(w + 1) == 0 {
+                            words.push(w);
+                        }
+                        mine.put(w + 1, mine.get(w + 1) + l);
+                    } else {
+                        theirs.put(w + 1, theirs.get(w + 1) + l);
+                    }
+                }
+                a = e;
+                while a < s.len && s[a] == '_' {
+                    a += 1;
+                }
+            }
+        }
+        let mut best = -1;
+        let mut best_score = 0;
+        for i in 0..words.count {
+            let w = words.data[i];
+            let text = SYMS[w].text;
+            // (not a name m has, nor m's own: `gen::gen`)
+            if !is_ident(text) || item_binding(m, w) >= 0 || use_binding(m, w) >= 0 || child_module(m, w) >= 0
+                || w == region_name(m) || stop_word(text) {
+                continue;
+            }
+            let mut used = false;
+            for j in 0..(*taken).count {
+                if (*taken).data[j] == w {
+                    used = true;
+                }
+            }
+            if used {
+                continue;
+            }
+            // (how much it is here, times how much it is only here)
+            let score = mine.get(w + 1) * mine.get(w + 1) / (mine.get(w + 1) + 2 * theirs.get(w + 1) + 1);
+            if best < 0 || score > best_score || (score == best_score && sym_less(w, best)) {
+                best = w;
+                best_score = score;
+            }
+        }
+        if best >= 0 {
+            return best;
+        }
+        let b = buf_new();
+        buf_str(b, c"part");
+        buf_int(b, k + 1);
+        intern(buf_slice(b))
+    }
+}
+
+fn stop_word(w: [u8]) -> bool {
+    unsafe {
+        let words = c_slice(c" the and for from with into get put set new run add has the all one two is_ ");
+        let mut i = 1;
+        while i < words.len {
+            let mut e = i;
+            while e < words.len && words[e] != ' ' {
+                e += 1;
+            }
+            if bytes_eq(words[i..e], w) {
+                return true;
+            }
+            i = e + 1;
+        }
+        false
+    }
+}

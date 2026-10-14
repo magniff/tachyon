@@ -36,18 +36,19 @@ use crate::types::{
 };
 use crate::ir::{
     ARGS, ARGTY, BLOCKS, Cond, INSTS, IRF, IRFUNCS, Op, Term, ir_append, ir_arg, ir_make,
-    ir_new_block, ir_set_arg, ir_terminate, ir_val, pred_index, verify_func, ir_insert_before,
+    ir_new_block, ir_set_arg, ir_terminate, ir_val, pred_index, verify_func, ir_insert_before, ir_replace,
 };
 use crate::opt::resolve_all;
 use crate::fold::is_const;
 use crate::loops::{
     add_pred_values, canonicalize_loops, form_lcssa, innermost_loop, invariant_in, is_canonical,
     is_innermost, loop_block, loop_contains, loop_count, loop_header, loop_latch, loop_preheader,
-    loop_size, new_phi_in, LP_PARENT, LP_LIST2, clone_region, mark_loop_blocks,
+    loop_size, new_phi_in, LP_PARENT, LP_LIST2, clone_region, mark_loop_blocks, clone_map,
 };
-use crate::scev::{counted_loop, iv_step};
+use crate::scev::{counted_loop, iv_step, full_unroll_trips};
 use crate::gvn::address_base;
-use crate::profile::is_cold_block;
+use crate::profile::{PROFILE_MAX, is_cold_block, is_hot_count};
+use crate::target::X86;
 use crate::range::bits_of_value;
 use crate::ir::Op::{
     Add, And, Cmp, Const, Conv, Div, Load, Mul, Neg, Or, Phi, Shl, Store, Sub, VBin, VExt, VIns,
@@ -56,6 +57,10 @@ use crate::ir::Op::{
 
 // --no-vectorize turns it off (to compare).
 pub static mut VECTORIZE: bool = true;
+
+// Set by vectorize_loops when it left a loop to be unrolled whole (see
+// vectorize_loop).
+pub static mut UNROLL_WHOLE: bool = false;
 
 const VEC_MAX_INSTS: i64 = 160;
 const VEC_MAX_CHECKS: i64 = 8;
@@ -223,6 +228,62 @@ fn is_unreachable_exit(l: i64, b: i64) -> bool {
     unsafe { !loop_contains(l, b) && BLOCKS[b].term == Term::Unreach }
 }
 
+// Records the check ending block b of loop l (into V_CHECKS), whose way on
+// is `next`, the other way an unreachable exit: false unless the way on
+// is `idx <u len` (64 bits, len invariant).
+fn record_check(l: i64, b: i64, next: i64) -> bool {
+    unsafe {
+        let c = ir_val(BLOCKS[b].cond);
+        if INSTS[c].op != Cmp || INSTS[c].block != b {
+            return false;
+        }
+        let mut cond = INSTS[c].cond;
+        if next != BLOCKS[b].s0 {
+            cond = cond.negate();
+        }
+        let mut idx = ir_val(INSTS[c].a);
+        let mut len = ir_val(INSTS[c].b);
+        if cond == Cond::Gt {
+            idx = ir_val(INSTS[c].b);
+            len = ir_val(INSTS[c].a);
+            cond = Cond::Lt;
+        }
+        if cond != Cond::Lt || is_signed(INSTS[c].imm2) || int_bits(INSTS[c].imm2) != 64 || !invariant_in(l, len) {
+            return false;
+        }
+        if V_CHECKS.count >= 3 * VEC_MAX_CHECKS {
+            return false;
+        }
+        V_CHECKS.push(c);
+        V_CHECKS.push(idx);
+        V_CHECKS.push(len);
+        true
+    }
+}
+
+// The run-time test, and'ed into ok in block c, that no check of
+// V_CHECKS fails from iteration `start` to `last`: each index (of
+// coefficient 1 or -1) at both ends, the lower at least 0 and the higher
+// below the length; `hi >= lo` rules out an index that wraps.
+fn check_tests(l: i64, c: i64, ok0: i64, start: i64, last: i64) -> i64 {
+    unsafe {
+        let mut ok = ok0;
+        for k in 0..V_CHECKS.count / 3 {
+            let idx = V_CHECKS.data[3 * k + 1];
+            let len = V_CHECKS.data[3 * k + 2];
+            let first = eval_at(l, idx, start, c);
+            let final = eval_at(l, idx, last, c);
+            let down = coef(l, idx) < 0;
+            let lo = if down { final } else { first };
+            let hi = if down { first } else { final };
+            ok = and_into(c, ok, cmp(c, Cond::Ge, TY_I64, lo, konst(c, 0, TY_I64)));
+            ok = and_into(c, ok, cmp(c, Cond::Ge, TY_I64, hi, lo));
+            ok = and_into(c, ok, cmp(c, Cond::Lt, TY_I64, hi, len));
+        }
+        ok
+    }
+}
+
 // Classifies the instructions of loop l; false when it cannot be
 // vectorized.
 fn analyze(l: i64, exit: *i64) -> bool {
@@ -270,34 +331,9 @@ fn analyze(l: i64, exit: *i64) -> bool {
                 } else if loop_contains(l, s1) && is_unreachable_exit(l, s0) {
                     next = s1;
                 }
-                if next == 0 || BLOCKS[next].preds.count != 1 {
+                if next == 0 || BLOCKS[next].preds.count != 1 || !record_check(l, b, next) {
                     return false;
                 }
-                // The check: the way on is `idx <u len`.
-                let c = ir_val(BLOCKS[b].cond);
-                if INSTS[c].op != Cmp || INSTS[c].block != b {
-                    return false;
-                }
-                let mut cond = INSTS[c].cond;
-                if next != s0 {
-                    cond = cond.negate();
-                }
-                let mut idx = ir_val(INSTS[c].a);
-                let mut len = ir_val(INSTS[c].b);
-                if cond == Cond::Gt {
-                    idx = ir_val(INSTS[c].b);
-                    len = ir_val(INSTS[c].a);
-                    cond = Cond::Lt;
-                }
-                if cond != Cond::Lt || is_signed(INSTS[c].imm2) || int_bits(INSTS[c].imm2) != 64 || !invariant_in(l, len) {
-                    return false;
-                }
-                if V_CHECKS.count >= 3 * VEC_MAX_CHECKS {
-                    return false;
-                }
-                V_CHECKS.push(c);
-                V_CHECKS.push(idx);
-                V_CHECKS.push(len);
                 b = next;
             } else {
                 return false;
@@ -851,10 +887,204 @@ fn identity(op: Op) -> i64 {
     0
 }
 
+// ---- The cost model (0.11) ----
+//
+// After the analysis, whether the vector loop pays, and how many copies of
+// the body it runs (U): costs are rough cycles of throughput. A scalar
+// iteration costs S (its instructions, a check two, a float division
+// four); a vector iteration, U * VF scalar ones, costs U * B + 3 (the
+// vector body: an instruction one, a lane-by-lane multiplication
+// 3 * VF; the induction variable, its test and branch); the decision
+// before the loop, the reductions' setup and their combination after it
+// cost G. With T iterations expected (exact for constant bounds, else
+// the profile's average: the header's count over the entries'), the
+// vector version costs G + (T / (U*VF)) * (U*B + 3) + (T % (U*VF)) * S
+// against T * S; U = 2 is tried for small bodies, then U = 1. Without an
+// expected T a vector iteration must only be cheaper than the scalar ones
+// it replaces, and U is 2 for small bodies, as in 0.10.
+
+// Whether integer multiplication of the loop's lanes is done lane by lane
+// (SSE2 has 16-bit lanes only; NEON lacks 64-bit lanes).
+fn lanewise_mul() -> bool {
+    unsafe {
+        let size = type_size(V_ELEM);
+        if is_float(V_ELEM) {
+            return false;
+        }
+        if X86 { size != 2 } else { size == 8 }
+    }
+}
+
+// v as x + c: returns x (0 for a constant) and adds c to *offset.
+fn const_base(v: i64, offset: *i64) -> i64 {
+    unsafe {
+        let mut x = ir_val(v);
+        for _ in 0..8 {
+            if is_const(x) {
+                *offset += INSTS[x].imm;
+                return 0;
+            }
+            if INSTS[x].op != Add || !is_const(ir_val(INSTS[x].b)) {
+                return x;
+            }
+            *offset += INSTS[ir_val(INSTS[x].b)].imm;
+            x = ir_val(INSTS[x].a);
+        }
+        x
+    }
+}
+
+// The expected number of iterations of loop l (analyzed) per entry, or -1.
+fn expected_trips(l: i64) -> i64 {
+    unsafe {
+        let h = loop_header(l);
+        let p = loop_preheader(l);
+        let start = ir_val(ir_arg(V_IV, pred_index(h, p)));
+        // (Constants, or one value plus two constants: an array's end.)
+        let mut off_n = 0;
+        let mut off_s = 0;
+        let n = const_base(V_N, &off_n);
+        let s = const_base(start, &off_s);
+        if n == s {
+            let t = off_n - off_s;
+            return if t > 0 { t } else { -1 };
+        }
+        let hc = BLOCKS[h].count;
+        if PROFILE_MAX <= 0 || hc < 0 {
+            return -1;
+        }
+        // The entries: the preheader's count, or the nearest one above it
+        // through single predecessors (blocks made after the profile was
+        // read have none).
+        let mut b = p;
+        for _ in 0..8 {
+            if BLOCKS[b].count > 0 {
+                return hc / BLOCKS[b].count;
+            }
+            if BLOCKS[b].count == 0 || BLOCKS[b].preds.count != 1 {
+                return -1;
+            }
+            b = BLOCKS[b].preds.data[0];
+        }
+        -1
+    }
+}
+
+// Whether v is computed from the induction variable and constants alone
+// (a constant in each copy of the loop fully unrolled from a constant
+// start), looking depth operations deep.
+fn constant_affine(v: i64, depth: i64) -> bool {
+    unsafe {
+        let x = ir_val(v);
+        if x == V_IV || is_const(x) {
+            return true;
+        }
+        let op = INSTS[x].op;
+        if depth == 0 || !(op == Add || op == Sub || op == Mul || op == Shl || op == Conv) {
+            return false;
+        }
+        constant_affine(INSTS[x].a, depth - 1) && (INSTS[x].b == 0 || constant_affine(INSTS[x].b, depth - 1))
+    }
+}
+
+// How many vector bodies an iteration of the vector loop of l (analyzed)
+// runs, 1 or 2; 0 when vectorizing does not pay. unrolled > 0: the scalar
+// alternative is the loop fully unrolled, that many times (the unroller
+// asks), whose copies keep only the work on each element: the induction
+// variable, the latch's test and the addresses affine in it become
+// constants and offsets, what is invariant leaves the loop, and a check
+// of a constant length on an index made of the induction variable and
+// constants (from a constant start) is decided.
+fn vector_unroll(l: i64, unrolled: i64) -> i64 {
+    unsafe {
+        let vf = V_VF;
+        let mut s = 2;
+        let mut su = 0;
+        let mut body = 0;
+        for k in 0..V_CHAIN.count {
+            let mut v = BLOCKS[V_CHAIN.data[k]].first;
+            while v != 0 {
+                let op = INSTS[v].op;
+                let cls = class_of(v);
+                let div = op == Div;
+                if op != Phi {
+                    let cost = if cls == VC_SKIP { 2 } else if div { 4 } else { 1 };
+                    s += cost;
+                    if unrolled > 0 && cls != VC_SKIP
+                        && (cls != VC_UNIFORM || (!invariant_in(l, v) && coef(l, v) == NONAFFINE)) {
+                        su += cost;
+                    }
+                }
+                if cls == VC_UNIFORM {
+                    body += 1;
+                } else if cls == VC_VECTOR && op != Phi {
+                    body += if op == Mul && lanewise_mul() { 3 * vf } else if div { 4 } else { 1 };
+                }
+                v = INSTS[v].next;
+            }
+        }
+        if unrolled > 0 {
+            let h = loop_header(l);
+            let start = ir_val(ir_arg(V_IV, pred_index(h, loop_preheader(l))));
+            for k in 0..V_CHECKS.count / 3 {
+                if !is_const(start) || !is_const(ir_val(V_CHECKS.data[3 * k + 2]))
+                    || !constant_affine(V_CHECKS.data[3 * k + 1], 8) {
+                    su += 2;
+                }
+            }
+        }
+        let nreds = V_REDS.count / 3;
+        let mut setup = 6 + 8 * (V_CHECKS.count / 3) + 10 * overlap_pairs();
+        for r in 0..nreds {
+            let raw = V_REDS.data[3 * r + 2];
+            let op = raw as Op;
+            setup += if op == Add || op == Sub { 4 } else { 2 + 2 * vf };
+        }
+        let small = V_SIZE <= VEC_UNROLL_SIZE;
+        let t = if unrolled > 0 { unrolled } else { expected_trips(l) };
+        if t < 0 {
+            let u = if small { 2 } else { 1 };
+            return if u * body + 3 < u * vf * s { u } else { 0 };
+        }
+        let scalar = if unrolled > 0 { t * su } else { t * s };
+        let mut best = 0;
+        let mut best_cost = scalar;
+        let mut u = if small { 2 } else { 1 };
+        while u >= 1 {
+            let w = u * vf;
+            if t >= w {
+                let cost = setup + nreds * (u - 1) + (t / w) * (u * body + 3) + (t % w) * s;
+                if cost < best_cost {
+                    best = u;
+                    best_cost = cost;
+                }
+            }
+            u -= 1;
+        }
+        best
+    }
+}
+
 fn vectorize_loop(fi: i64, l: i64) -> bool {
     unsafe {
+        // (before the analysis, whose marks the trip count's evaluation
+        // would overwrite)
+        let whole = full_unroll_trips(l);
         let mut e = 0;
         if !analyze(l, &e) {
+            return false;
+        }
+        let unroll = vector_unroll(l, 0);
+        if unroll == 0 {
+            return false;
+        }
+        // (0.11: a loop of a few constant trips whose checks kept
+        // transform_loops from unrolling it whole, until the ranges removed
+        // them, is better unrolled whole when that is cheaper: then each
+        // copy keeps only its loads, stores and operations, which SLP may
+        // pack, and no test of the trip count or overlap is made)
+        if whole > 0 && vector_unroll(l, whole) == 0 {
+            UNROLL_WHOLE = true;
             return false;
         }
         IRF = fi;
@@ -883,19 +1113,9 @@ fn vectorize_loop(fi: i64, l: i64) -> bool {
         BLOCKS[c].preds.push(p);
         let n = V_N;
         let trips = append(c, Sub, TY_I64, n, start, 0);
-        // Small bodies run two vectors an iteration.
-        let unroll = if V_SIZE <= VEC_UNROLL_SIZE { 2 } else { 1 };
         let mut ok = cmp(c, Cond::Ge, TY_U64, trips, konst(c, unroll * vf, TY_I64));
         let last = append(c, Sub, TY_I64, n, konst(c, 1, TY_I64), 0);
-        for k in 0..V_CHECKS.count / 3 {
-            let idx = V_CHECKS.data[3 * k + 1];
-            let len = V_CHECKS.data[3 * k + 2];
-            let lo = eval_at(l, idx, start, c);
-            let hi = eval_at(l, idx, last, c);
-            ok = and_into(c, ok, cmp(c, Cond::Ge, TY_I64, lo, konst(c, 0, TY_I64)));
-            ok = and_into(c, ok, cmp(c, Cond::Ge, TY_I64, hi, lo));
-            ok = and_into(c, ok, cmp(c, Cond::Lt, TY_I64, hi, len));
-        }
+        ok = check_tests(l, c, ok, start, last);
         build_groups();
         ok = overlap_tests(l, c, ok, start, last, 0, 0);
         ir_terminate(c, Term::Branch, ok, vp, sp);
@@ -1081,6 +1301,7 @@ fn quick_reject(l: i64) -> bool {
 // was.
 pub fn vectorize_loops(fi: i64) -> bool {
     unsafe {
+        UNROLL_WHOLE = false;
         if !VECTORIZE {
             return false;
         }
@@ -1160,10 +1381,342 @@ pub fn vectorize_loops(fi: i64) -> bool {
     }
 }
 
-// Returns the lanes (0: not vectorizable).
-pub fn vectorizable_lanes(l: i64) -> i64 {
+// ---- Unrolling with run-time trip counts (0.11) ----
+//
+// An innermost counted loop (i from start, step 1, to n; any body, its only
+// exits the latch's and failing checks) whose trip count is not a constant
+// gets U copies of its body run per iteration, U = 4 or 2 within a size
+// budget, in the vectorizer's frame (the original loop is the remainder):
+//
+//     C:  trips = n - start; ok = trips >= U && no check fails
+//         branch ok, UP, SP
+//     UP: uend = start + (trips & -U)
+//     U0 .. U(U-1): the copies, chained; the checks dropped; the last
+//         latch: branch i' != uend, U0, UX
+//     UX: branch uend == n, E, SP
+//     SP: i and the header's other phis from C or UX; the scalar loop
+//
+// The checks are proved before the loop as the vectorizer's are (indices
+// of coefficient +1 or -1 in i), so the copies go without them; a loop
+// with another kind of check, or a call, is left alone. Each copy computes
+// exactly what the scalar iteration does, in order.
+
+const UNROLL_RT_SIZE: i64 = 64;
+const UNROLL_RT_TINY: i64 = 12;
+
+// The unrolling factor for loop l (canonical, innermost), or 0; sets V_IV,
+// V_N, V_CHECKS and the classes coef needs.
+fn runtime_factor(l: i64) -> i64 {
+    unsafe {
+        let h = loop_header(l);
+        let latch = loop_latch(l);
+        if BLOCKS[h].novec != 0 || is_cold_block(h) || latch == 0 || loop_preheader(l) == 0
+            || BLOCKS[latch].term != Term::Branch {
+            return 0;
+        }
+        let mut iv = 0;
+        let mut step = 0;
+        let mut n = 0;
+        let mut ne = false;
+        if !counted_loop(l, &iv, &step, &n, &ne) || step != 1 || int_bits(INSTS[iv].ty) != 64 {
+            return 0;
+        }
+        VSTAMP += 1;
+        V_IV = iv;
+        V_N = n;
+        V_NE = ne;
+        V_IV2 = 0;
+        V_CHECKS.count = 0;
+        V_EVAL.count = 0;
+        let s0 = BLOCKS[latch].s0;
+        let s1 = BLOCKS[latch].s1;
+        let e = if s0 == h { s1 } else { s0 };
+        if loop_contains(l, e) || BLOCKS[e].preds.count != 1 {
+            return 0;
+        }
+        let mut size = 0;
+        for i in 0..loop_size(l) {
+            let b = loop_block(l, i);
+            let mut v = BLOCKS[b].first;
+            while v != 0 {
+                let op = INSTS[v].op;
+                if op.is_call() || op == Op::Copy {
+                    return 0;
+                }
+                if (op.is_pure() && op != Cmp) || op == Const {
+                    set_class(v, VC_UNIFORM);
+                }
+                size += 1;
+                v = INSTS[v].next;
+            }
+            if b == latch {
+                continue;
+            }
+            let t = BLOCKS[b].term;
+            if t == Term::Branch {
+                let a = BLOCKS[b].s0;
+                let c = BLOCKS[b].s1;
+                if !loop_contains(l, a) || !loop_contains(l, c) {
+                    let next = if loop_contains(l, a) { a } else { c };
+                    let out = if next == a { c } else { a };
+                    if !loop_contains(l, next) || !is_unreachable_exit(l, out) || !record_check(l, b, next) {
+                        return 0;
+                    }
+                }
+            } else if t != Term::Jump || !loop_contains(l, BLOCKS[b].s0) {
+                return 0;
+            }
+        }
+        set_class(iv, VC_UNIFORM);
+        for k in 0..V_CHECKS.count / 3 {
+            let c = coef(l, V_CHECKS.data[3 * k + 1]);
+            if (c != 1 && c != -1) || loads_in(l, V_CHECKS.data[3 * k + 1]) {
+                return 0;
+            }
+        }
+        // It pays where checks go, or where the loop's own instructions (the
+        // induction variable, its test and branch) are a good part of it.
+        if V_CHECKS.count == 0 && size > UNROLL_RT_TINY {
+            return 0;
+        }
+        let budget = if is_hot_count(BLOCKS[h].count) { 2 * UNROLL_RT_SIZE } else { UNROLL_RT_SIZE };
+        let mut u = if 4 * size <= budget { 4 } else if 2 * size <= budget { 2 } else { 0 };
+        // (With a profile: enough iterations an entry for a few rounds.)
+        let t = expected_trips(l);
+        while u > 1 && t >= 0 && t < 2 * u {
+            u = u / 2;
+        }
+        if u < 2 { 0 } else { u }
+    }
+}
+
+// Unrolls loop l by `u` (see above).
+fn unroll_runtime(fi: i64, l: i64, u: i64) {
+    unsafe {
+        IRF = fi;
+        let h = loop_header(l);
+        let p = loop_preheader(l);
+        let latch = loop_latch(l);
+        let hp = pred_index(h, p);
+        let li = pred_index(h, latch);
+        let e = if BLOCKS[latch].s0 == h { BLOCKS[latch].s1 } else { BLOCKS[latch].s0 };
+        let start = ir_val(ir_arg(V_IV, hp));
+        let n = V_N;
+        let stamp = mark_loop_blocks(l);
+        let mut region = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..LP_LIST2.count {
+            region.push(LP_LIST2.data[i]);
+        }
+        let nb = region.count;
+        let mut phis = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut x = BLOCKS[h].first;
+        while x != 0 && INSTS[x].op == Phi {
+            phis.push(x);
+            x = INSTS[x].next;
+        }
+        let mut outs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        x = BLOCKS[e].first;
+        while x != 0 && INSTS[x].op == Phi {
+            outs.push(ir_val(ir_arg(x, 0)));
+            x = INSTS[x].next;
+        }
+        let np = phis.count;
+        let ne = outs.count;
+        // Per copy: its blocks (nb), header phis (np), next values (np), exit
+        // values (ne), and the induction variable's next value.
+        let mut blocks = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut cphi = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut next = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut outv = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut ivn = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for _ in 0..u {
+            clone_region(fi, &region, stamp);
+            for i in 0..nb {
+                blocks.push(BLOCKS[region.data[i]].aux);
+            }
+            for i in 0..np {
+                cphi.push(INSTS[phis.data[i]].aux);
+                next.push(clone_map(ir_val(ir_arg(phis.data[i], li)), stamp));
+            }
+            for i in 0..ne {
+                outv.push(clone_map(outs.data[i], stamp));
+            }
+            ivn.push(clone_map(ir_val(ir_arg(V_IV, li)), stamp));
+        }
+        // The copies' checks go: each branch to an unreachable exit jumps on.
+        for k in 0..u * nb {
+            let b = blocks.data[k];
+            if BLOCKS[b].term == Term::Branch {
+                let a = BLOCKS[b].s0;
+                let c = BLOCKS[b].s1;
+                let out_a = is_unreachable_exit(l, a) && !is_copy_block(&blocks, a);
+                let out_c = is_unreachable_exit(l, c) && !is_copy_block(&blocks, c);
+                if out_a != out_c {
+                    BLOCKS[b].term = Term::Jump;
+                    BLOCKS[b].cond = 0;
+                    BLOCKS[b].s0 = if out_a { c } else { a };
+                    BLOCKS[b].s1 = 0;
+                }
+            }
+        }
+        let hi = region_index(&region, h);
+        let lati = region_index(&region, latch);
+        let h0 = blocks.data[hi];
+        // Chained: copy k's header phis are copy k-1's next values.
+        for k in 1..u {
+            for i in 0..np {
+                ir_replace(cphi.data[k * np + i], next.data[(k - 1) * np + i]);
+            }
+            let ch = blocks.data[k * nb + hi];
+            BLOCKS[ch].preds.count = 0;
+            BLOCKS[ch].preds.push(blocks.data[(k - 1) * nb + lati]);
+            let pl = blocks.data[(k - 1) * nb + lati];
+            BLOCKS[pl].term = Term::Jump;
+            BLOCKS[pl].cond = 0;
+            BLOCKS[pl].s0 = ch;
+            BLOCKS[pl].s1 = 0;
+        }
+        let last = blocks.data[(u - 1) * nb + lati];
+        // C: the decision.
+        let c = ir_new_block();
+        let up = ir_new_block();
+        let ux = ir_new_block();
+        let sp = ir_new_block();
+        BLOCKS[c].sealed = 1;
+        BLOCKS[up].sealed = 1;
+        BLOCKS[ux].sealed = 1;
+        BLOCKS[sp].sealed = 1;
+        BLOCKS[p].s0 = c;
+        BLOCKS[c].preds.push(p);
+        let trips = append(c, Sub, TY_I64, n, start, 0);
+        let mut ok = cmp(c, Cond::Ge, TY_U64, trips, konst(c, u, TY_I64));
+        let lastv = append(c, Sub, TY_I64, n, konst(c, 1, TY_I64), 0);
+        ok = check_tests(l, c, ok, start, lastv);
+        ir_terminate(c, Term::Branch, ok, up, sp);
+        // UP: the end of the unrolled iterations.
+        let mask = konst(up, 0 - u, TY_I64);
+        let uend = append(up, Add, TY_I64, start, append(up, And, TY_I64, trips, mask, 0), 0);
+        BLOCKS[up].term = Term::Jump;
+        BLOCKS[up].s0 = h0;
+        BLOCKS[h0].preds.data[hp] = up;
+        BLOCKS[h0].preds.data[li] = last;
+        for i in 0..np {
+            ir_set_arg(cphi.data[i], li, next.data[(u - 1) * np + i]);
+        }
+        BLOCKS[h0].novec = 1;
+        // The last copy's latch.
+        let more = cmp(last, Cond::Ne, TY_I64, ivn.data[u - 1], uend);
+        BLOCKS[last].term = Term::Branch;
+        BLOCKS[last].cond = more;
+        BLOCKS[last].s0 = h0;
+        BLOCKS[last].s1 = ux;
+        BLOCKS[ux].preds.push(last);
+        // UX: done, or the rest in the scalar loop.
+        let done = cmp(ux, Cond::Eq, TY_I64, uend, n);
+        ir_terminate(ux, Term::Branch, done, e, sp);
+        BLOCKS[e].preds.count -= 1;
+        let mut vals = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..ne {
+            vals.push(outv.data[(u - 1) * ne + i]);
+        }
+        add_pred_values(e, ux, &vals, 0);
+        // SP: the scalar loop's preheader, from C or UX.
+        for i in 0..np {
+            vals.count = 0;
+            vals.push(ir_val(ir_arg(phis.data[i], hp)));
+            vals.push(next.data[(u - 1) * np + i]);
+            let r = new_phi_in(sp, INSTS[phis.data[i]].ty, &vals, 0, 2);
+            ir_set_arg(phis.data[i], hp, r);
+        }
+        ir_terminate(sp, Term::Jump, 0, h, 0);
+        BLOCKS[h].preds.count -= 1;
+        BLOCKS[h].preds.data[hp] = sp;
+        BLOCKS[h].novec = 1;
+        free(vals.data as *u8);
+        free(region.data as *u8);
+        free(phis.data as *u8);
+        free(outs.data as *u8);
+        free(blocks.data as *u8);
+        free(cphi.data as *u8);
+        free(next.data as *u8);
+        free(outv.data as *u8);
+        free(ivn.data as *u8);
+    }
+}
+
+fn is_copy_block(blocks: *IntVec, b: i64) -> bool {
+    for i in 0..(*blocks).count {
+        if unsafe { (*blocks).data[i] } == b {
+            return true;
+        }
+    }
+    false
+}
+
+fn region_index(region: *IntVec, b: i64) -> i64 {
+    for i in 0..(*region).count {
+        if unsafe { (*region).data[i] } == b {
+            return i;
+        }
+    }
+    -1
+}
+
+// --no-unroll-runtime turns it off (to compare).
+pub static mut UNROLL_RUNTIME: bool = true;
+
+// Unrolls the innermost counted loops of fi whose trip count is known at
+// run time only; returns whether any was (fresh: the loop forest is current).
+pub fn unroll_runtime_loops(fi: i64, fresh: bool) -> bool {
+    unsafe {
+        if !UNROLL_RUNTIME {
+            return false;
+        }
+        if !fresh {
+            canonicalize_loops(fi);
+        }
+        let mut headers = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for l in 0..loop_count() {
+            if loop_header(l) != IRFUNCS[fi].entry && is_innermost(l) && BLOCKS[loop_header(l)].novec == 0 {
+                headers.push(loop_header(l));
+            }
+        }
+        let mut changed = false;
+        let mut stale = false;
+        for i in 0..headers.count {
+            if stale {
+                canonicalize_loops(fi);
+                stale = false;
+            }
+            let l = innermost_loop(headers.data[i]);
+            if l < 0 || loop_header(l) != headers.data[i] || !is_canonical(l) {
+                continue;
+            }
+            if runtime_factor(l) == 0 {
+                continue;
+            }
+            if form_lcssa(fi, l) {
+                resolve_all(fi);
+            }
+            let u = runtime_factor(l);
+            if u > 0 {
+                unroll_runtime(fi, l, u);
+                changed = true;
+                stale = true;
+                resolve_all(fi);
+                verify_func(fi, c"unrolling (run-time trip count)");
+            }
+        }
+        free(headers.data as *u8);
+        changed
+    }
+}
+
+// Returns the lanes (0: not vectorizable). unrolled: the trip count when
+// the alternative is the loop fully unrolled (0: the loop as it is).
+pub fn vectorizable_lanes(l: i64, unrolled: i64) -> i64 {
     let mut e = 0;
-    if VECTORIZE && analyze(l, &e) { V_VF } else { 0 }
+    if VECTORIZE && analyze(l, &e) && vector_unroll(l, unrolled) > 0 { V_VF } else { 0 }
 }
 
 // ---- Outer loops (0.10) ----

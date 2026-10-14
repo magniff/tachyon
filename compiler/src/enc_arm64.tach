@@ -12,6 +12,7 @@ use crate::objfile::{
     text_is,
 };
 use crate::ASM;
+use crate::target::ELF;
 
 // Operand kinds.
 const K_REG: i64 = 1;
@@ -140,6 +141,8 @@ const A_FCMGE: i64 = 84;
 const A_BSL: i64 = 85;
 const A_BIT: i64 = 86;
 const A_BIF: i64 = 87;
+const A_SMULH: i64 = 88;
+const A_UMULH: i64 = 89;
 
 fn def(name: *u8, code: i64) {
     let id = intern_c(name);
@@ -156,6 +159,7 @@ pub fn init_a64() {
         def(c"movz", A_MOVZ); def(c"movk", A_MOVK); def(c"mvn", A_MVN); def(c"neg", A_NEG);
         def(c"lsl", A_LSL); def(c"lsr", A_LSR); def(c"asr", A_ASR); def(c"mul", A_MUL);
         def(c"madd", A_MADD); def(c"msub", A_MSUB); def(c"sdiv", A_SDIV); def(c"udiv", A_UDIV);
+        def(c"smulh", A_SMULH); def(c"umulh", A_UMULH);
         def(c"sxtb", A_SXTB); def(c"sxth", A_SXTH); def(c"sxtw", A_SXTW); def(c"ubfx", A_UBFX);
         def(c"cset", A_CSET); def(c"csel", A_CSEL); def(c"csinc", A_CSINC); def(c"fcsel", A_FCSEL);
         def(c"b", A_B); def(c"bl", A_BL); def(c"br", A_BR); def(c"blr", A_BLR); def(c"ret", A_RET);
@@ -299,9 +303,31 @@ fn skip_spaces(i: i64, b: i64) -> i64 {
     k
 }
 
-// A symbol with an optional @modifier at [a, b).
+// A symbol with an optional modifier at [a, b): `sym@PAGEOFF`... on
+// Mach-O, `:lo12:sym`, `:got:sym`, `:got_lo12:sym` on ELF (where adrp's
+// plain `sym` is its page).
 fn parse_sym(a: i64, b: i64, op: *AOp) {
     unsafe {
+        if tchar(a) == ':' {
+            let mut colon = a + 1;
+            while colon < b && tchar(colon) != ':' {
+                colon += 1;
+            }
+            if colon >= b {
+                asm_error(c"bad symbol modifier");
+            }
+            (*op).sym = asym(BUFS[ASM].data[colon + 1..b]);
+            if text_is(a + 1, colon, c"lo12") {
+                (*op).modifier = M_PAGEOFF;
+            } else if text_is(a + 1, colon, c"got") {
+                (*op).modifier = M_GOTPAGE;
+            } else if text_is(a + 1, colon, c"got_lo12") {
+                (*op).modifier = M_GOTPAGEOFF;
+            } else {
+                asm_error(c"unknown symbol modifier");
+            }
+            return;
+        }
         let mut at = a;
         while at < b && tchar(at) != '@' {
             at += 1;
@@ -852,6 +878,9 @@ pub fn a64_instruction(a: i64, b: i64) {
         } else if code == A_MADD || code == A_MSUB {
             let o0 = if code == A_MSUB { 1 << 15 } else { 0 };
             word(sf(0) | 0x1b000000 | o0 | r(2) << 16 | r(3) << 10 | r(1) << 5 | r(0));
+        } else if code == A_SMULH || code == A_UMULH {
+            // (0.11) 64-bit only.
+            word(0x9b407c00 | (if code == A_UMULH { 0x800000 } else { 0 }) | r(2) << 16 | r(1) << 5 | r(0));
         } else if code == A_SDIV || code == A_UDIV {
             word(sf(0) | 0x1ac00000 | (if code == A_SDIV { 0xc00 } else { 0x800 }) | r(2) << 16 | r(1) << 5 | r(0));
         } else if code == A_SXTB || code == A_SXTH || code == A_SXTW {
@@ -895,7 +924,7 @@ pub fn a64_instruction(a: i64, b: i64) {
             fixup(FX_A64_ADR, here(), OPS[1].sym, 0, 0, false);
             word(0x10000000 | r(0));
         } else if code == A_ADRP {
-            let kind = if OPS[1].modifier == M_GOTPAGE { FX_A64_GOTPAGE } else if OPS[1].modifier == M_PAGE { FX_A64_PAGE } else { asm_error(c"expected @PAGE") };
+            let kind = if OPS[1].modifier == M_GOTPAGE { FX_A64_GOTPAGE } else if OPS[1].modifier == M_PAGE || (ELF && OPS[1].modifier == M_NONE) { FX_A64_PAGE } else { asm_error(c"expected @PAGE") };
             fixup(kind, here(), OPS[1].sym, 0, 0, false);
             word(0x90000000 | r(0));
         } else if code == A_LDR || code == A_STR {
