@@ -36,7 +36,7 @@ use crate::tools::edit::{TARGET, edit_replace};
 use crate::tools::edit::apply::{ADD_IMPORTS, apply_edit};
 use crate::tools::edit::cli::{ambiguous, source_only, take_edit_option};
 use crate::tools::edit::items::{after_line, blank_line, indent_of, item_tail};
-use crate::tools::proc::{read_file_if, read_stdin};
+use crate::tools::proc::{buf_cstr, read_file_if, read_stdin};
 use crate::tools::query::{
     c_slice, def_at_line, ends_with_c, file_line, file_named, load_program, resolve_name,
     root_or_diag,
@@ -70,6 +70,54 @@ pub static mut PAIRS_FILE: *u8 = 0 as *u8;
 // `try:` line are written).
 pub static mut ROOT_PATH: *u8 = 0 as *u8;
 
+// (0.15) The targets of the pairs, as named (C strings), in order; per
+// pair, its target's index (-1 while it is the command line's TARGET,
+// before own_targets); the target of the pairs that follow (`--in NAME`,
+// `@@ NAME`).
+pub static mut TARGETS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut PAIR_TARGET: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut CUR_TARGET: i64 = -1;
+
+// The index of target `name` in TARGETS (added when new).
+fn target_index(name: [u8]) -> i64 {
+    unsafe {
+        for t in 0..TARGETS.count {
+            if bytes_eq(c_slice(TARGETS.data[t] as *u8), name) {
+                return t;
+            }
+        }
+        let b = buf_new();
+        buf_bytes(b, name);
+        TARGETS.push(buf_cstr(b) as i64);
+        TARGETS.count - 1
+    }
+}
+
+// Every pair given its target: those named by none get the command line's
+// (`first`, -1 when there is none). False after the diagnostic.
+fn own_targets(first: i64) -> bool {
+    unsafe {
+        if TARGETS.count == 0 {
+            usage(c"a TARGET is needed");
+            return false;
+        }
+        for k in 0..OLDS.count {
+            if PAIR_TARGET.data[k] < 0 {
+                if first < 0 {
+                    let d = diag(c"error", c"edit.usage");
+                    buf_str(d, c"pair ");
+                    buf_int(d, k + 1);
+                    buf_str(d, c" has no TARGET: name one before the pairs, or put `@@ NAME` above its block\n");
+                    usage_try();
+                    return false;
+                }
+                PAIR_TARGET.data[k] = first;
+            }
+        }
+        true
+    }
+}
+
 // `edit patch ...`, and `edit insert --in ...`: the exit status (the
 // diagnostics are written by run_edit).
 pub fn run_patch(argc: i64, argv: **u8) -> i64 {
@@ -86,7 +134,10 @@ pub fn run_patch(argc: i64, argv: **u8) -> i64 {
             let valued = if insert {
                 streq(a, c"--in") || streq(a, c"--after") || streq(a, c"--before")
             }
-                else { streq(a, c"--old") || streq(a, c"--new") || streq(a, c"--pairs") };
+                else {
+                    streq(a, c"--old") || streq(a, c"--new") || streq(a, c"--pairs")
+                        || streq(a, c"--in")
+                };
             if valued {
                 if i + 1 >= argc {
                     let d = diag(c"error", c"edit.usage");
@@ -100,6 +151,7 @@ pub fn run_patch(argc: i64, argv: **u8) -> i64 {
                         return usage(c"each --old needs its --new");
                     }
                     OLDS.push(text_buffer(c_slice(v)));
+                    PAIR_TARGET.push(CUR_TARGET);
                 } else if streq(a, c"--new") {
                     if NEWS.count + 1 != OLDS.count {
                         return usage(c"each --new follows its --old");
@@ -107,6 +159,12 @@ pub fn run_patch(argc: i64, argv: **u8) -> i64 {
                     NEWS.push(text_buffer(c_slice(v)));
                 } else if streq(a, c"--pairs") {
                     PAIRS_FILE = v;
+                } else if streq(a, c"--in") && !insert {
+                    // (0.15: the pairs after it are NAME's)
+                    if OLDS.count != NEWS.count {
+                        return usage(c"each --old needs its --new");
+                    }
+                    CUR_TARGET = target_index(c_slice(v));
                 } else if streq(a, c"--in") {
                     names.push(v as i64);
                 } else {
@@ -142,10 +200,18 @@ pub fn run_patch(argc: i64, argv: **u8) -> i64 {
             root = names.data[1] as *u8;
             names.count = 1;
         }
-        if names.count != 1 {
-            return usage(if names.count
-                == 0 { if insert { c"--in NAME is needed" } else { c"a TARGET is needed" } }
+        if insert && names.count != 1 {
+            return usage(if names.count == 0 { c"--in NAME is needed" }
                 else { c"one TARGET at a time" });
+        }
+        if names.count > 1 {
+            return usage(c"one TARGET on the command line; the pairs of others follow --in NAME (or `@@ NAME` in --pairs FILE)");
+        }
+        // (0.15) The command line's TARGET: the pairs before any --in or
+        // `@@ NAME` are its.
+        let mut first_target = -1;
+        if !insert && names.count == 1 {
+            first_target = target_index(c_slice(names.data[0] as *u8));
         }
         if OLDS.count != NEWS.count {
             return usage(c"each --old needs its --new");
@@ -156,7 +222,8 @@ pub fn run_patch(argc: i64, argv: **u8) -> i64 {
         if insert && anchor == 0 as *u8 {
             return usage(c"insert --in needs --after ANCHOR or --before ANCHOR");
         }
-        TARGET_ARG = names.data[0] as *u8;
+        TARGET_ARG = if names.count == 1 { names.data[0] as *u8 }
+            else if TARGETS.count > 0 { TARGETS.data[0] as *u8 } else { c"" };
         ROOT_GIVEN = root;
         // The texts first: nothing is read when there are none.
         let input = buf_new();
@@ -197,6 +264,9 @@ pub fn run_patch(argc: i64, argv: **u8) -> i64 {
                 }
             }
         }
+        if !insert && !own_targets(first_target) {
+            return 2;
+        }
         for k in 0..OLDS.count {
             if BUFS[OLDS.data[k]].len == 0 || (LOOSE && trimmed(buf_slice(OLDS.data[k])).len == 0) {
                 let d = diag(c"error", c"edit.usage");
@@ -215,24 +285,47 @@ pub fn run_patch(argc: i64, argv: **u8) -> i64 {
             program_errors(c"error", root, true);
             return 1;
         }
-        if !find_scope() {
-            return 1;
-        }
         let summary = buf_new();
         if insert {
+            if !find_scope() {
+                return 1;
+            }
             if !insert_at(c_slice(anchor), after, buf_slice(input)) {
                 return 1;
             }
             buf_str(summary, c"inserted in ");
+            buf_bytes(summary, buf_slice(SCOPE_NAME));
         } else {
-            for k in 0..OLDS.count {
-                if !patch_pair(k) {
+            // (0.15) Target by target, in the order they were named; every
+            // OLD is found in the text as it was before the edit.
+            buf_str(summary, c"patched ");
+            let mut done = 0;
+            for t in 0..TARGETS.count {
+                let mut any = false;
+                for k in 0..OLDS.count {
+                    if PAIR_TARGET.data[k] == t {
+                        any = true;
+                    }
+                }
+                if !any {
+                    continue;
+                }
+                TARGET_ARG = TARGETS.data[t] as *u8;
+                if !find_scope() {
                     return 1;
                 }
+                for k in 0..OLDS.count {
+                    if PAIR_TARGET.data[k] == t && !patch_pair(k) {
+                        return 1;
+                    }
+                }
+                if done > 0 {
+                    buf_str(summary, c", ");
+                }
+                buf_bytes(summary, buf_slice(SCOPE_NAME));
+                done += 1;
             }
-            buf_str(summary, c"patched ");
         }
-        buf_bytes(summary, buf_slice(SCOPE_NAME));
         // (0.14: the imports the new text needs, when it has new errors)
         ADD_IMPORTS = true;
         apply_edit(buf_slice(summary), root)
@@ -323,11 +416,19 @@ fn read_pairs(input: [u8]) -> bool {
                     state = 1;
                     text = buf_new();
                     lines = 0;
+                } else if line.len >= 2 && line[0] == '@' && line[1] == '@' {
+                    // (0.15) `@@ TARGET`: the blocks after it are TARGET's
+                    let name = trimmed(line[2..line.len]);
+                    if name.len == 0 {
+                        return format_error(n, c"@@ needs a TARGET (`@@ NAME`)");
+                    }
+                    CUR_TARGET = target_index(name);
                 } else if trimmed(line).len > 0 {
                     return format_error(n, c"text outside a block");
                 }
             } else if state == 1 && is_marker(line, c"=======") {
                 OLDS.push(text);
+                PAIR_TARGET.push(CUR_TARGET);
                 state = 2;
                 text = buf_new();
                 lines = 0;

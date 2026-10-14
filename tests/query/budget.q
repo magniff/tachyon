@@ -193,6 +193,7 @@ usage: tachyonc query def|show NAME... [--root ROOT] [--exact] [--with-comments]
        tachyonc query deps MODULE [--max-lines N]
        tachyonc query unused [MODULE] [--all]
        tachyonc query impact NAME
+       tachyonc query conflicts [FILE|DIR|FILE:LINE...] [--show]
 NAME: a path or its end (f, m::f, T::f, T.field), or FILE:LINE
 ROOT: --root ROOT, a last argument ending in .tach, $TACHYON_ROOT, ./main.tach, ./compiler/src/main.tach
 see docs/query.md and docs/refactor.md

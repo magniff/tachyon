@@ -197,6 +197,11 @@ range. Lines past the end: `error query.no-match` with the file's
 length and `try:` its last lines; a file that cannot be read: `error
 query.no-file`.
 
+`query conflicts [FILE|DIR|FILE:LINE...] [--show]` (0.15) lists the
+merge conflict regions of files read as text, one line each, with their
+items; `--show` prints both sides. `edit resolve` resolves them
+([refactor.md](refactor.md), "Merge conflicts").
+
 `query diff [ROOT]`: the last edit of the journal (what `undo` would take
 back, [refactor.md](refactor.md)): `# SUMMARY`, then its diff with no
 context lines. Nothing changes. In a git checkout the journal is in its
@@ -513,6 +518,46 @@ must come from the cache when the first made it).
   file of the program), one that could not be parsed. A damaged or
   partly written file is not read (a hash of its contents; written
   through a new file renamed over the old).
+
+## Several commands in one call: batch (0.15)
+
+`tachyonc batch [FILE] [--root R] [--stop]` runs the commands of FILE
+(or stdin), one per line as typed after `tachyonc`: any tool command
+(`query`, `edit`, `undo`, `check`, `fix`, `fmt`, `refactor`, `rewrite`,
+`explain`, `guide`, `lint`, `same-output`), quoted as in sh, `#`
+comments, `< PATH` or `<<WORD` (the lines after it up to a line WORD)
+for a command's stdin, as `refactor --script` reads them. It is for the
+sequences agents run call after call: `query items` then `query show`,
+`show` then `refs`, an edit then `check` or `query show`.
+
+```
+$ tachyonc batch < cmds.txt        (query show clamp; query refs clamp --count)
+## $ tachyonc query show clamp
+// crate::calc::clamp→calc.tach:3-12
+...
+## $ tachyonc query refs clamp --count
+3
+```
+
+- Each command runs in turn, in a copy of the process (fork), as it
+  would alone: its stdout and stderr together, in the order written,
+  after a line `## $ tachyonc ARGS`, then `## exit N` when N is not 0.
+  A command without `<` or `<<` reads an empty stdin.
+- A command sees what the commands before it wrote (an edit is written
+  when its check passes, as alone). Unlike `refactor --script`, the
+  commands are not one edit: each edit is checked, written and undone
+  on its own.
+- A failing command does not end the batch; `--stop` ends it at the
+  first. The exit status is the first one that is not 0 (else 0).
+- `--root R` is every command's root (`$TACHYON_ROOT` in each).
+- The program is read once: the first command parses it and leaves it
+  in the cache (above), and each command after it restores it (about
+  10 ms on the compiler's source). Loading it in the batch process and
+  handing it to the commands would save little more, at the risk of
+  state one command leaves for the next; it is not done.
+- `error batch.format` (a quote not closed, `<<WORD` without its line
+  WORD): nothing runs. `error batch.usage`: the options, a FILE that
+  cannot be read, a line that is no tool command (`## exit 2`).
 
 ## Known limits
 

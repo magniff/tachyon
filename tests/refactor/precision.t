@@ -75,8 +75,8 @@ $ edit wrap sum_to --in '' --lines 17-21 --dry-run
 +            i += 1;
 +        }
 $ edit wrap sum_to --in '' --lines 16
-./calc.tach:21:9: error[type error] undefined variable 'total'
-./calc.tach:24:5: error[type error] undefined variable 'total'
+./calc.tach:21:9: error[type error] undefined variable 'total'  [edited: crate::calc::sum_to]
+./calc.tach:24:5: error[type error] undefined variable 'total'  [edited: crate::calc::sum_to]
 error edit.breaks: 2 new errors; nothing written
 try: tachyonc edit wrap sum_to --in '' --lines 16 --no-check
 [exit 1]
@@ -138,8 +138,12 @@ $ refactor signature scale --type k i64 --default '$k as i64' --dry-run
 -pub fn scale(v: i64, k: i32) -> i64 {
 +pub fn scale(v: i64, k: i64) -> i64 {
 $ refactor signature scale --type k i64
-main.tach:11:36: error[type error] expected 'i64', got 'i32'
-error edit.breaks: 1 new error; nothing written
+main.tach:11:36: error[type error] expected 'i64', got 'i32'  [in crate::main]
+error edit.breaks: 1 new error (1 in crate::main, which the edit does not change); nothing written
+note edit.refactor: the uses of crate::calc::scale no longer fit its new shape: a refactoring changes them with it, then the rest of the edit
+try: tachyonc refactor signature crate::calc::scale --type k i64 --default '$k as i64'
+note edit.together: change crate::main in the same edit: one `edit apply FILE` with a block per item, or `edit patch --pairs FILE` with `@@ NAME` blocks
+try: tachyonc query show crate::main
 try: tachyonc refactor signature scale --type k i64 --no-check
 [exit 1]
 $ refactor signature clamp --add 'x: i64 = 0' --default 0
@@ -148,9 +152,9 @@ try: tachyonc refactor signature NAME --type x T --default EXPR
 [exit 2]
 ## fix --in MODULE: its child modules too.
 $ edit patch lib/inner.tach --old 'use crate::calc::clamp;' --new '' --no-check
-./lib/inner.tach:4:5: error[type error] undefined variable 'clamp' | help: add `use crate::calc::clamp;`
+./lib/inner.tach:4:5: error[type error] undefined variable 'clamp' | help: add `use crate::calc::clamp;`  [in crate::lib::inner::double]
 patched crate::lib::inner	lib/inner.tach	+0 -1 lines
-warning edit.breaks: 1 new error; written anyway (--no-check)
+warning edit.breaks: 1 new error (1 in crate::lib::inner::double, which the edit does not change); written anyway (--no-check)
 try: tachyonc check
 $ fix --in crate::lib --dry-run
 --- a/lib/inner.tach

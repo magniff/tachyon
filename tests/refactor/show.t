@@ -52,7 +52,7 @@ patched crate::one	main.tach	+2 -1 lines
 21	    let twice = k + k;
 22	    unsafe { twice * abs(a) as i64 / 2 }
 $ edit patch spread --old '        let y = abs(b) as i64;' --new '' --no-check --show
-main.tach:13:13: error[type error] undefined variable 'y'
+main.tach:13:13: error[type error] undefined variable 'y'  [edited: crate::spread]
 patched crate::spread	main.tach	+0 -1 lines
 // main.tach:11: 1 line removed after line 11
 warning edit.breaks: 1 new error; written anyway (--no-check)

@@ -47,6 +47,12 @@ NAME is `f`, `module::f`, `Type::method`, `Enum::Variant`,
 `Struct.field`, `<Type as Trait>::f` or `FILE:LINE`; several in one call.
 Output is one fact per line, fields separated by a TAB.
 
+Several commands in one call: `tachyonc batch < cmds.txt`, one command
+per line as typed after `tachyonc` (`<<END` ... `END` gives one its
+stdin); each output follows a line `## $ tachyonc ARGS`. Chain what you
+would run in turn: `query items` then `query show`, `show` then `refs`,
+an edit then `check`.
+
 ## Changing
 
 | to | run |
@@ -54,8 +60,10 @@ Output is one fact per line, fields separated by a TAB.
 | change text inside an item | `tachyonc edit patch NAME --old 'TEXT' --new 'TEXT'` (pairs repeat) |
 | replace, add, remove an item | `tachyonc edit replace NAME < new.tach`, `edit insert --after NAME < item.tach`, `edit delete NAME` |
 | add statements inside an item | `tachyonc edit insert --in NAME --after 'ANCHOR' < text` |
+| several items at once, one edit | `tachyonc edit apply items.tach`: `@@ NAME` then its new text, `@@ new after NAME`, `@@ delete NAME` (or `query show A B`'s output, edited) |
 | see the result | `--show` on any edit; `tachyonc query diff` |
 | undo the last edit | `tachyonc undo` (the journal: in `.git`, else in `.tachyonc/` next to main.tach) |
+| merge conflicts | `tachyonc query conflicts --show`, then `tachyonc edit resolve FILE:LINE --ours` (`--theirs`, `--both`, `< text`) |
 | rename anything, with every use | `tachyonc refactor rename PATH NEW` |
 | rename a local or parameter | `tachyonc refactor rename FILE:LINE:COL NEW` or `refactor rename FN::x NEW` (shadowing respected) |
 | a parameter, with every call | `tachyonc refactor signature FN --add 'x: i64 = 0'` (`--remove`, `--rename-param`, `--reorder`, `--type`) |
@@ -66,8 +74,10 @@ Output is one fact per line, fields separated by a TAB.
 | imports, unused, pub, unsafe | `tachyonc fix` (`--only imports,unused,pub,unsafe`, `--dry-run`) |
 
 Every edit is atomic: the edited program is checked first, and an edit
-that adds an error writes nothing and prints the errors. `--dry-run`
-prints the diff instead; `--no-check` writes anyway.
+that adds an error writes nothing and prints the errors, each tagged
+`[edited: PATH]` or `[in PATH]` (an item the edit did not change: change
+it in the same `edit apply`, or run the refactoring the `try:` line
+names). `--dry-run` prints the diff instead; `--no-check` writes anyway.
 
 ## Diagnostics
 

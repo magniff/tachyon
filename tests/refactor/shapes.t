@@ -98,8 +98,8 @@ $ refactor signature area --type p '*Point' --dry-run
 @@ -17 +17 @@
 -pub fn area(p: Point) -> i64 {
 +pub fn area(p: *Point) -> i64 {
-main.tach:16:18: error[type error] expected '*Point', got 'Point'
-warning edit.breaks: 1 new error (dry run)
+main.tach:16:18: error[type error] expected '*Point', got 'Point'  [in crate::main]
+warning edit.breaks: 1 new error (1 in crate::main, which the edit does not change) (dry run)
 [exit 1]
 ## Refused: a function used as a value, a missing default, an unknown
 ## parameter, a parameter still used, a name taken.
@@ -145,9 +145,13 @@ try: tachyonc query def Point
 [exit 1]
 ## A change that breaks the program: nothing written.
 $ refactor signature area --type p i32
-main.tach:16:18: error[type error] expected 'i32', got 'Point'
-./geom.tach:18:5: error[type error] cannot access field 'x' on type 'i32'
-error edit.breaks: 2 new errors; nothing written
+main.tach:16:18: error[type error] expected 'i32', got 'Point'  [in crate::main]
+./geom.tach:18:5: error[type error] cannot access field 'x' on type 'i32'  [edited: crate::geom::area]
+error edit.breaks: 2 new errors (1 in the edited text, 1 in crate::main, which the edit does not change); nothing written
+note edit.refactor: the uses of crate::geom::area no longer fit its new shape: a refactoring changes them with it (VALUE, EXPR: to fill in), then the rest of the edit
+try: tachyonc refactor signature crate::geom::area --type p i32 --default EXPR
+note edit.together: change crate::main in the same edit: one `edit apply FILE` with a block per item, or `edit patch --pairs FILE` with `@@ NAME` blocks
+try: tachyonc query show crate::main
 try: tachyonc refactor signature area --type p i32 --no-check
 [exit 1]
 % git status --short
@@ -199,10 +203,14 @@ $ refactor field Point --rename y height --dry-run
 -        (self.x + self.y) * unit
 +        (self.x + self.height) * unit
 $ refactor field Point --type x i32
-./geom.tach:18:5: error[type error] expected 'i64', got 'i32'
-./geom.tach:47:27: error[type error] expected 'i32', got 'i64'
-./geom.tach:58:10: error[type error] expected 'i64', got 'i32'
-error edit.breaks: 3 new errors; nothing written
+./geom.tach:18:5: error[type error] expected 'i64', got 'i32'  [in crate::geom::area]
+./geom.tach:47:27: error[type error] expected 'i32', got 'i64'  [in crate::geom::Point::scale]
+./geom.tach:58:10: error[type error] expected 'i64', got 'i32'  [in <crate::geom::Point as Shape>::size]
+error edit.breaks: 3 new errors (3 in crate::geom::area, crate::geom::Point::scale and <crate::geom::Point as Shape>::size, which the edit does not change); nothing written
+note edit.refactor: the uses of crate::geom::Point no longer fit its new shape: a refactoring changes them with it, then the rest of the edit
+try: tachyonc refactor field crate::geom::Point --type x i32
+note edit.together: change crate::geom::area, crate::geom::Point::scale and <crate::geom::Point as Shape>::size in the same edit: one `edit apply FILE` with a block per item, or `edit patch --pairs FILE` with `@@ NAME` blocks
+try: tachyonc query show crate::geom::area crate::geom::Point::scale '<crate::geom::Point as Shape>::size'
 try: tachyonc refactor field Point --type x i32 --no-check
 [exit 1]
 $ refactor field Point --remove y
@@ -241,8 +249,8 @@ $ refactor field Label --add 'size: i64 = 4' --dry-run
 ## --- variant ---
 ## An arm that does not check: nothing written.
 $ refactor variant Kind --add 'Ring(i64, i64)' --arm 'oops'
-./kinds.tach:16:29: error[type error] undefined variable 'oops'
-./kinds.tach:39:29: error[type error] undefined variable 'oops'
+./kinds.tach:16:29: error[type error] undefined variable 'oops'  [edited: crate::kinds::weight]
+./kinds.tach:39:29: error[type error] undefined variable 'oops'  [edited: crate::kinds::sides]
 error edit.breaks: 2 new errors; nothing written
 try: tachyonc refactor variant Kind --add 'Ring(i64, i64)' --arm oops --no-check
 [exit 1]
@@ -398,9 +406,14 @@ error refactor.script: refused.txt:2: the command failed (exit 1): refactor fiel
 $ refactor --script broken.txt
 renamed parameter x to n of crate::geom::twice	geom.tach	+2 -2 lines
 changed parameter p to i32 in crate::geom::area	geom.tach	+1 -1 lines
-main.tach:16:18: error[type error] expected 'i32', got 'Point'
-./geom.tach:18:5: error[type error] cannot access field 'x' on type 'i32'
-error edit.breaks: 2 new errors; nothing written
+main.tach:16:18: error[type error] expected 'i32', got 'Point'  [in crate::main]
+./geom.tach:18:5: error[type error] cannot access field 'x' on type 'i32'  [edited: crate::geom::area]
+error edit.breaks: 2 new errors (1 in the edited text, 1 in crate::main, which the edit does not change); nothing written
+note edit.refactor: the uses of crate::geom::area no longer fit its new shape: a refactoring changes them with it (VALUE, EXPR: to fill in), then the rest of the edit
+try: tachyonc refactor signature crate::geom::area --type p i32 --default EXPR
+try: tachyonc refactor signature crate::geom::twice --rename-param x n
+note edit.together: change crate::main in the same edit: one `edit apply FILE` with a block per item, or `edit patch --pairs FILE` with `@@ NAME` blocks
+try: tachyonc query show crate::main
 try: tachyonc refactor --script broken.txt --no-check
 [exit 1]
 % git status --short

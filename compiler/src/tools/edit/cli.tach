@@ -12,8 +12,10 @@ use crate::base::diag::{
 use crate::base::target::target_of_name;
 use crate::base::timer::{TIME_PASSES, timer_report};
 use crate::front::modules::file_of_pos;
+use crate::tools::conflicts::resolve::run_resolve;
 use crate::tools::edit::{ARGC, ARGV, DRY_RUN, NO_CHECK, SHOW, TARGET, TARGET_NAME, edit_replace};
 use crate::tools::edit::apply::{ADD_IMPORTS, apply_edit};
+use crate::tools::edit::applyfile::run_apply;
 use crate::tools::edit::items::{
     after_line, blank_line, indent_of, item_head, item_tail, item_text, keyword_head, leading,
     whole_lines,
@@ -105,17 +107,23 @@ fn run_edit_inner(argc: i64, argv: **u8) -> i64 {
         ARGC = argc;
         ARGV = argv;
         if argc < 3 {
-            return usage(c"no command (patch, replace, insert, delete)");
+            return usage(c"no command (patch, apply, replace, insert, delete)");
         }
         let cmd = argv[2];
         if streq(cmd, c"patch") || (streq(cmd, c"insert") && has_arg(argc, argv, c"--in")) {
             return run_patch(argc, argv);
+        }
+        if streq(cmd, c"resolve") {
+            return run_resolve(argc, argv);
         }
         if streq(cmd, c"wrap") {
             return run_wrap(argc, argv);
         }
         if streq(cmd, c"new-file") {
             return run_new_file(argc, argv);
+        }
+        if streq(cmd, c"apply") {
+            return run_apply(argc, argv);
         }
         let replace = streq(cmd, c"replace");
         let insert = streq(cmd, c"insert");
@@ -124,7 +132,7 @@ fn run_edit_inner(argc: i64, argv: **u8) -> i64 {
             let d = diag(c"error", c"edit.usage");
             buf_str(d, c"unknown command '");
             buf_str(d, cmd);
-            buf_str(d, c"' (patch, replace, insert, delete, wrap, new-file)\n");
+            buf_str(d, c"' (patch, apply, replace, insert, delete, wrap, new-file, resolve)\n");
             return 2;
         }
         let mut after = false;
@@ -191,10 +199,9 @@ fn run_edit_inner(argc: i64, argv: **u8) -> i64 {
         if r == 1 {
             return 1;
         }
+        let how = if replace { 'r' } else if insert { if after { 'a' } else { 'b' } } else { 'd' };
         if r == 0 {
-            return edit_region(rf, rk, &spans,
-                if replace { 'r' } else if insert { if after { 'a' } else { 'b' } } else { 'd' },
-                input, root);
+            return edit_region(rf, rk, &spans, how, input, root);
         }
         let mut matches = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         if !resolve_name(what, name, &matches) {
@@ -218,56 +225,76 @@ fn run_edit_inner(argc: i64, argv: **u8) -> i64 {
         let summary = buf_new();
         // (0.14: the imports the new text needs, when it has new errors)
         ADD_IMPORTS = !delete;
+        if !item_edit(how, d, input, summary) {
+            return 1;
+        }
+        apply_edit(buf_slice(summary), root)
+    }
+}
+
+// The edit of item d (0.15: for edit apply too): `how` 'r' replace it by
+// the text of buffer input, 'a' or 'b' insert that text after or before
+// it, 'd' delete it (see Items as text); its words in summary (`replaced
+// crate::f`). False after the diagnostic.
+pub fn item_edit(how: u8, d: i64, input: i64, summary: i64) -> bool {
+    unsafe {
         let whole = whole_lines(d);
         let head = item_head(d);
         let tail = item_tail(d);
         let member = DEFS[d].kind == K_FIELD || DEFS[d].kind == K_VARIANT;
-        if replace {
+        let mut added = true;
+        if how == 'r' {
             let text = item_text(buf_slice(input), if whole { indent_of(head) } else { SRC[0..0] });
             if whole {
                 // (what the text has, it replaces: comments, attributes)
                 let lead = leading(buf_slice(text));
                 let from = if lead == '/' { line_start(text_start(d)) }
                     else if lead == '#' { line_start(head) } else { line_start(keyword_head(d)) };
-                edit_replace(from, line_end(tail - 1), text);
+                added = edit_replace(from, line_end(tail - 1), text);
             } else {
-                edit_replace(head, tail, text);
+                added = edit_replace(head, tail, text);
             }
             buf_str(summary, c"replaced ");
-        } else if insert {
+        } else if how == 'a' || how == 'b' {
             if !whole {
                 let e = diag(c"error", c"edit.layout");
                 buf_bytes(e, SYMS[DEFS[d].fqn].text);
                 buf_str(e,
                     c" shares its line with other code; insert needs an item on lines of its own\n");
-                return 1;
+                return false;
             }
             let text = item_text(buf_slice(input), indent_of(head));
             let sep = if member { c"\n" } else { c"\n\n" };
             let out = buf_new();
-            if after {
+            if how == 'a' {
                 buf_str(out, sep);
                 buf_bytes(out, buf_slice(text));
-                edit_replace(line_end(tail - 1), line_end(tail - 1), out);
+                added = edit_replace(line_end(tail - 1), line_end(tail - 1), out);
                 buf_str(summary, c"inserted after ");
             } else {
                 buf_bytes(out, buf_slice(text));
                 buf_str(out, sep);
                 let at = line_start(text_start(d));
-                edit_replace(at, at, out);
+                added = edit_replace(at, at, out);
                 buf_str(summary, c"inserted before ");
             }
         } else {
-            delete_item(d, whole, head, tail);
+            added = delete_item(d, whole, head, tail);
             buf_str(summary, c"deleted ");
         }
         buf_bytes(summary, SYMS[DEFS[d].fqn].text);
-        apply_edit(buf_slice(summary), root)
+        if !added {
+            let e = diag(c"error", c"edit.overlap");
+            buf_bytes(e, SYMS[DEFS[d].fqn].text);
+            buf_str(e, c" is changed twice in one edit; give each item one block\n");
+            return false;
+        }
+        true
     }
 }
 
 // The edit deleting definition d (its text, see Items as text).
-fn delete_item(d: i64, whole: bool, head: i64, tail: i64) {
+fn delete_item(d: i64, whole: bool, head: i64, tail: i64) -> bool {
     unsafe {
         let f = file_of_pos(head);
         if !whole {
@@ -294,10 +321,9 @@ fn delete_item(d: i64, whole: bool, head: i64, tail: i64) {
                     b += 1;
                 }
             }
-            edit_replace(a, b, buf_new());
-            return;
+            return edit_replace(a, b, buf_new());
         }
-        delete_lines(line_start(text_start(d)), tail);
+        delete_lines(line_start(text_start(d)), tail)
     }
 }
 
@@ -307,9 +333,19 @@ fn delete_item(d: i64, whole: bool, head: i64, tail: i64) {
 // goes at the top of the file, after its header for use lines), 'a' or
 // 'b' insert (after the last use line, before the first), 'd' delete.
 fn edit_region(f: i64, kind: i64, spans: *IntVec, how: u8, input: i64, root: *u8) -> i64 {
+    let summary = buf_new();
+    let status = region_edit(f, kind, spans, how, input, summary);
+    if status >= 0 {
+        return status;
+    }
+    apply_edit(buf_slice(summary), root)
+}
+
+// The edit of edit_region, its words in summary (`replaced crate::m::use`):
+// -1 when it is made, else the exit status (after the diagnostic).
+pub fn region_edit(f: i64, kind: i64, spans: *IntVec, how: u8, input: i64, summary: i64) -> i64 {
     unsafe {
         let n = (*spans).count;
-        let summary = buf_new();
         let text = if how == 'd' { buf_new() } else { item_text(buf_slice(input), SRC[0..0]) };
         if (how == 'a' || how == 'b') && kind != 1 {
             let e = diag(c"error", c"edit.layout");
@@ -369,7 +405,7 @@ fn edit_region(f: i64, kind: i64, spans: *IntVec, how: u8, input: i64, root: *u8
         }
         buf_bytes(summary, mod_fqn_text(FILES[f].module));
         buf_str(summary, if kind == 1 { c"::use" } else { c"::header" });
-        apply_edit(buf_slice(summary), root)
+        -1
     }
 }
 
@@ -388,7 +424,7 @@ fn comment_at(pos: i64) -> bool {
 // line of tail - 1, and one blank line next to them, so that no two are
 // left together (nor one after an opening brace, or before a closing
 // one).
-pub fn delete_lines(first: i64, tail: i64) {
+pub fn delete_lines(first: i64, tail: i64) -> bool {
     unsafe {
         let f = file_of_pos(first);
         let mut a = first;
@@ -401,7 +437,7 @@ pub fn delete_lines(first: i64, tail: i64) {
         } else if prev_blank && (b >= FILES[f].end || starts_with_brace(b)) {
             a = prev;
         }
-        edit_replace(a, b, buf_new());
+        edit_replace(a, b, buf_new())
     }
 }
 
