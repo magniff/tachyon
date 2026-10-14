@@ -1062,8 +1062,49 @@ keywords): `F: FnMut(i64) -> i64`.
 
 ### Closures
 
-(To come: types, captures, `move`, calls, `Fn`/`FnMut` bounds, coercion
-to `fn` types, the escape rule.)
+```tach
+fn apply<F: Fn(i64) -> i64>(f: F, x: i64) -> i64 { f(x) }
+let k = 10;
+apply(|x| x + k, 1);                 // 11: x's type from the bound
+let mut n = 0;
+let mut bump = || n += 1;            // FnMut: it assigns n
+let add = |a: i64, b: i64| a + b;    // types written: no context needed
+let g: fn(i64) -> i64 = |x| x * 2;   // captures nothing: a plain fn
+```
+
+- **Types.** Each closure expression (in each instance of the generic
+  function it is in) has its own anonymous type, shown as
+  `closure(i64) -> i64 at f.tach:4:15`; it cannot be written, so a closure
+  is passed to a generic `F` or kept in a local or a generic struct.
+- **Parameters** take their types from the annotation, else from the
+  expected `fn(..)` type or the `Fn`/`FnMut` bound of the parameter the
+  closure is passed for; otherwise "cannot infer the type of closure
+  parameter 'x'". A parameter may be a pattern: `|(a, b): (i64, i64)|`.
+  The result is the written type (`|x| -> T { ... }`, needed when the body
+  has a `return`), else the expected one, else the body's. `return`
+  returns from the closure; `break` and `continue` cannot leave it; an
+  `unsafe` block around it covers its body.
+- **Captures**, decided per variable: an immutable binding by value (a
+  copy; by reference above 32 bytes, or when the closure takes its
+  address, `&x` or the receiver of a `self: *T` method, so that
+  `|| v.push(1)` changes `v`); a `let mut` binding by reference (the
+  closure sees changes and makes them); with `move`, everything by value
+  (assignments change the closure's own copy).
+- **Calls.** `f(x)` of a closure value calls its function directly
+  (`(h.f)(x)` for a field). A closure that captures nothing coerces to a
+  plain `fn` type with its signature; one that captures is an error there
+  (take a generic `F: Fn(..)` instead).
+- **Bounds.** A type satisfies `FnMut(A..) -> R` if it is a closure with
+  exactly that signature or the plain `fn(A..) -> R`; `Fn(A..) -> R` also
+  asks that a closure assigns none of the variables it captures. There is
+  no `FnOnce`. A bound's types, as far as they are known, type the
+  closure's parameters; its result binds what it names (`B` of
+  `F: FnMut(A) -> B`).
+- **Escape.** A value whose type holds a closure that borrows a variable
+  (captures it by reference) cannot leave the block, `match` arm or
+  `loop` (`break` value) that variable is declared in: "write `move`, or
+  declare 'j' outside the block". Borrowed variables keep their frame
+  slot for the whole function, so a borrow cannot dangle.
 
 ### Associated types
 

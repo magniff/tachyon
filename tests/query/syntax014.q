@@ -2,7 +2,7 @@
 ## program has errors): items, a closure-holding function shown.
 $ items
 crate	syntax014/main.tach	5
-warning query.program-errors: 4 errors in the program; results may be incomplete
+warning query.program-errors: 1 error in the program; results may be incomplete
 try: tachyonc --diagnostics=short syntax014/main.tach -c -o /dev/null
 $ show main
 // crate::main	syntax014/main.tach:23-29
@@ -13,10 +13,10 @@ fn main() -> i64 {
     let none = || k;
     apply(|x| x + 1, C { n: k })
 }
-warning query.program-errors: 4 errors in the program; results may be incomplete
+warning query.program-errors: 1 error in the program; results may be incomplete
 try: tachyonc --diagnostics=short syntax014/main.tach -c -o /dev/null
 $ grep 'move' --code
 # syntax014/main.tach
 26:16	code	main	let pair = move |(a, b): (i64, i64), _, mut c| -> i64 { a + b + c };
-warning query.program-errors: 4 errors in the program; results may be incomplete
+warning query.program-errors: 1 error in the program; results may be incomplete
 try: tachyonc --diagnostics=short syntax014/main.tach -c -o /dev/null
