@@ -71,6 +71,25 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-abi.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 trap 'exit 130' INT TERM
 
+# The C compiler, once more when it crashed (a signal, or gcc's "internal
+# compiler error"): an emulated toolchain (x86-64 Linux under Rosetta)
+# now and then does, and a crash of cc is not tachyon's. Its output (and
+# the crash's, if any) on stdout.
+cc_run() {
+    cr_out=$("$CC" "$@" 2>&1)
+    cr_rc=$?
+    if [ $cr_rc -ne 0 ]; then
+        case "$cr_rc:$cr_out" in
+            1[3-9][0-9]:*|2[0-9][0-9]:*|*"internal compiler error"*|*"Segmentation fault"*|*"Bus error"*)
+                printf '%s\n(%s crashed, exit %d: run again)\n' "$cr_out" "$CC" "$cr_rc"
+                cr_out=$("$CC" "$@" 2>&1)
+                cr_rc=$? ;;
+        esac
+    fi
+    [ -z "$cr_out" ] || printf '%s\n' "$cr_out"
+    return $cr_rc
+}
+
 # Tests program $1; why it fails in $WORK/p$1.why; its signature count in
 # $WORK/p$1.count.
 test_seed() {
@@ -85,13 +104,13 @@ test_seed() {
             || { echo "--emit-header failed: $(head -3 "$c.log")" >"$WORK/p$seed.why"; return; }
     fi
     # shellcheck disable=SC2086
-    "$CC" $ARCH -c -w -o "$c.o" "$c" >"$c.log" 2>&1 || { echo "cc failed on the C half: $(head -3 "$c.log")" >"$WORK/p$seed.why"; return; }
+    cc_run $ARCH -c -w -o "$c.o" "$c" >"$c.log" 2>&1 || { echo "cc failed on the C half: $(head -3 "$c.log")" >"$WORK/p$seed.why"; return; }
     for level in O0 O1 O2; do
         exe="$WORK/p$seed.$level"
         "$COMPILER" --target "$TARGET" "-$level" --deny-warnings --verify-ir "$t" -o "$exe.o" >"$exe.log" 2>&1 \
             || { echo "-$level failed to compile it: $(head -3 "$exe.log")" >"$WORK/p$seed.why"; return; }
         # shellcheck disable=SC2086
-        "$CC" $ARCH -o "$exe" "$exe.o" "$c.o" >>"$exe.log" 2>&1 \
+        cc_run $ARCH -o "$exe" "$exe.o" "$c.o" >>"$exe.log" 2>&1 \
             || { echo "-$level: cc failed: $(head -3 "$exe.log")" >"$WORK/p$seed.why"; return; }
         out=$("$exe" 2>&1)
         if [ "$out" != ok ]; then

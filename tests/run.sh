@@ -153,6 +153,25 @@ TALLY="$WORK/tally"
 : >"$FAILURES"
 : >"$TALLY"
 
+# The C compiler, once more when it crashed (a signal, or gcc's "internal
+# compiler error"): an emulated toolchain (x86-64 Linux under Rosetta)
+# now and then does, and a crash of cc is not tachyon's. Its output (and
+# the crash's, if any) on stdout.
+cc_run() {
+    cr_out=$("$CC" "$@" 2>&1)
+    cr_rc=$?
+    if [ $cr_rc -ne 0 ]; then
+        case "$cr_rc:$cr_out" in
+            1[3-9][0-9]:*|2[0-9][0-9]:*|*"internal compiler error"*|*"Segmentation fault"*|*"Bus error"*)
+                printf '%s\n(%s crashed, exit %d: run again)\n' "$cr_out" "$CC" "$cr_rc"
+                cr_out=$("$CC" "$@" 2>&1)
+                cr_rc=$? ;;
+        esac
+    fi
+    [ -z "$cr_out" ] || printf '%s\n' "$cr_out"
+    return $cr_rc
+}
+
 # The first message of directives file $1 (ERROR or WARNING texts) that
 # the compiler's output $2 lacks, each after the one before it; nothing
 # when all are there. With -d short a diagnostic is one line
@@ -371,7 +390,7 @@ check_case() {
         csources="-I $dir $csources"
     fi
     # shellcheck disable=SC2086
-    if ! "$CC" $LINK_FLAGS -o "$dir/prog" "$dir/$OUT" $csources -lm >"$dir/link.out" 2>&1; then
+    if ! cc_run $LINK_FLAGS -o "$dir/prog" "$dir/$OUT" $csources -lm >"$dir/link.out" 2>&1; then
         { echo "$CC failed:"; cat "$dir/link.out"; } >"$dir/why"
         return 1
     fi
@@ -444,7 +463,7 @@ profile_case() {
         return 1
     fi
     # shellcheck disable=SC2086
-    if ! "$CC" $LINK_FLAGS -o "$2/prog" "$2/$OUT" -lm >"$2/link.out" 2>&1; then
+    if ! cc_run $LINK_FLAGS -o "$2/prog" "$2/$OUT" -lm >"$2/link.out" 2>&1; then
         { echo "link failed (instrumented):"; cat "$2/link.out"; } >"$2/why"
         return 1
     fi

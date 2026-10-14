@@ -578,27 +578,36 @@ need an idle machine.
 It stays parallel without overloading the machine: the test runners
 (`tests/run.sh`, `tests/fuzz/run.sh`, `tests/abi/run.sh`,
 `tests/objcheck.sh`) take their slots from one pool, a FIFO named by
-`$TACHYON_JOBSERVER` that the gate fills with `-j` lines (by default two
-per CPU on macOS, one elsewhere). Twenty steps share the CPUs, none waits
-for another's tail, and no program runs late enough to hit its timeout.
+`$TACHYON_JOBSERVER` that the gate fills with `-j` lines (by default one
+per CPU). Twenty steps share the CPUs, none waits for another's tail, and
+no program runs late enough to hit its timeout.
 
 **macOS checks every new program.** The first launch of an executable
 that was just linked waits for syspolicyd and XProtect to check it:
-0.2–0.3 s on an idle machine, more under load, against milliseconds for
-the compilation and the link of a test (measured on 0.11, one test at a
-time: compile 11 ms, link 30 ms, first launch 230–280 ms, a second launch
-7 ms). Every test, random program and ABI program is a new executable, so
-on macOS this wait is most of the suite's time. Ad-hoc signing does not
-change it (the linker signs already). It does not apply to programs a
-*developer tool* starts: add the terminal that runs the gate to System
-Settings → Privacy & Security → Developer Tools (`spctl developer-mode
-enable-terminal` makes Terminal appear in that list). `gate.sh` times
-one launch when it starts and says when it is slow; its two slots per CPU
-keep the CPUs busy while programs wait.
+0.2–0.4 s, against milliseconds for the compilation and the link of a
+test (measured on 0.11, one test at a time: compile 5 ms, link 40 ms,
+first launch 240 ms, a second launch 2 ms). Every test, random program
+and ABI program is a new executable, so on macOS this wait is most of the
+suite's time, and the checks are taken about one at a time, whatever the
+number of CPUs: the gate's release run on macOS (8,300 programs at the
+0.11 counts) took 33 minutes with the CPUs mostly idle, while the same
+suite runs in 15 s in the aarch64-linux container. More slots do not help
+(`--quick` took 3:53 with two slots per CPU, 2:27 with one). So on macOS
+the gate runs a modest number of random programs, and the volume runs
+in the aarch64-linux container, the same code generator. Ad-hoc signing
+does not change it (the linker signs already). It does not apply to
+programs a *developer tool* starts: add the terminal that runs the gate
+to System Settings → Privacy & Security → Developer Tools (`spctl
+developer-mode enable-terminal` makes Terminal appear in that list).
+`gate.sh` times one launch when it starts and says when it is slow.
 
 The containers get `--cpus N` each (default 8; at most what docker has:
 with colima, `colima start --cpu 10 --memory 12`); x86_64-linux runs
 emulated (Rosetta, in colima's VM), aarch64-linux natively, both at once.
+Emulated, gcc and ld now and then crash (a segmentation fault in
+collect2, two in one release run): the runners run `cc` once more when
+it crashed (a signal, or gcc's "internal compiler error"), and say so in
+the case's output; a crash of `cc` is not tachyon's.
 An image is built again only when its recipe (the Dockerfile and the
 files it copies) changes (`--rebuild-image` forces it, for a newer base
 image). The x86_64-linux chain keeps its built releases in a docker

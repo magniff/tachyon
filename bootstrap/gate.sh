@@ -21,9 +21,8 @@
 #                    (they need an idle machine); `--only bench` for just
 #                    them
 #   -j N             slots for the macOS (or host) steps, shared by all of
-#                    them through $TACHYON_JOBSERVER (default: 2 per CPU
-#                    on macOS, where a new program waits for its first
-#                    launch check; 1 per CPU elsewhere)
+#                    them through $TACHYON_JOBSERVER (default: the number
+#                    of CPUs)
 #   --cpus N         CPUs of each container (default 8, at most docker's)
 #   --fuzz N         random programs per fuzz mode (overrides the mode's)
 #   --abi N          C interop programs per ABI mode (the same)
@@ -117,24 +116,24 @@ case "$(uname -s)-$(uname -m)" in
 esac
 NCPU=$(sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 4)
 case "$NCPU" in ''|*[!0-9]*) NCPU=4 ;; esac
-if [ -z "$JOBS" ]; then
-    # A new executable's first launch on macOS waits for the system's
-    # check of it (see docs/releases.md, "The gate"), a wait that holds a
-    # slot but no CPU.
-    case "$HOST" in
-        *-macos) JOBS=$((NCPU * 2)) ;;
-        *) JOBS=$NCPU ;;
-    esac
-fi
+# (On macOS more slots than CPUs do not help: a new program's first launch
+# waits for the system's check of it, and those checks are taken about
+# one at a time; more programs waiting made the gate slower. See
+# docs/releases.md, "The gate".)
+[ -n "$JOBS" ] || JOBS=$NCPU
 
 # ---- The steps ----
 
-# The counts of each mode: macOS (or the host) fuzz and ABI programs per
-# mode, then the containers' (x86_64-linux runs emulated on Apple silicon).
+# The counts of each mode: this host's fuzz and ABI programs per mode,
+# then x86_64-linux's (emulated on Apple silicon) and aarch64-linux's.
+# On macOS every program costs a launch check (docs/releases.md, "The
+# gate"), so the volume of random programs is in aarch64-linux, the same
+# code generator, natively; tests/fuzz/forever.sh adds more between
+# releases.
 case "$MODE" in
-    quick) FZ=25; AB=20; XFZ=0; XAB=0; AFZ=0; AAB=0 ;;
-    default) FZ=100; AB=60; XFZ=25; XAB=20; AFZ=50; AAB=30 ;;
-    release) FZ=200; AB=150; XFZ=50; XAB=40; AFZ=100; AAB=40 ;;
+    quick) FZ=10; AB=20; XFZ=0; XAB=0; AFZ=0; AAB=0 ;;
+    default) FZ=30; AB=30; XFZ=25; XAB=20; AFZ=100; AAB=60 ;;
+    release) FZ=60; AB=100; XFZ=50; XAB=40; AFZ=300; AAB=150 ;;
 esac
 [ -z "$FUZZ_N" ] || { FZ=$FUZZ_N; XFZ=$FUZZ_N; AFZ=$FUZZ_N; }
 [ -z "$ABI_N" ] || { AB=$ABI_N; XAB=$ABI_N; AAB=$ABI_N; }
@@ -372,7 +371,7 @@ trap cleanup INT TERM
 
 [ $INSIDE -eq 1 ] || {
     echo "gate: $MODE on $HOST, $JOBS slots${COMPILER:+, compiler $COMPILER}; logs in $RUN"
-    echo "  steps:$([ $CHAIN -eq 1 ] && echo " chain")$STEPS$([ $BENCH -eq 1 ] && echo " bench")"
+    echo "  steps: $([ $CHAIN -eq 1 ] && echo "chain ")$(echo $STEPS)$([ $BENCH -eq 1 ] && echo " bench")"
 }
 
 # On macOS, the first launch of every new executable waits for the
