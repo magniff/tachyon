@@ -3,6 +3,7 @@
 
 use crate::back::emit::{MEM_INDEX, MEM_SCALE};
 use crate::back::emit::blocks::is_cmp_imm_operand;
+use crate::back::emit::calls::emit_call_inst;
 use crate::back::emit::machine::{
     m_cmp, m_conv, m_copy, m_div, m_float_op, m_int_op, m_int_op_imm, m_lea, m_load, m_store,
     m_unary, reg_move_temp, reg_sp,
@@ -14,24 +15,23 @@ use crate::back::emit::operands::{
 use crate::back::mc_arm64::ops::{
     ma_cmp_imm, ma_fmath, ma_madd, ma_mulh, ma_select, ma_shop, ma_ubfx,
 };
+use crate::back::mc_arm64::vector::{
+    ma_vbin, ma_vcmp, ma_vext, ma_vins, ma_vneg, ma_vsel, ma_vsplat, ma_vsum,
+};
 use crate::back::mc_x86_64::ops::{mx_cmp_imm, mx_mulh, mx_select, mx_sqrt};
+use crate::back::mc_x86_64::vector::{
+    mx_vbin, mx_vcmp, mx_vext, mx_vins, mx_vneg, mx_vsel, mx_vsplat, mx_vsum,
+};
 use crate::back::regalloc::USE_NONE;
 use crate::back::regalloc::prepare::{is_zero_operand, use_kind};
 use crate::base::{BUFS, die};
+use crate::base::target::X86;
 use crate::front::types::is_float;
 use crate::gen0::target::CODE;
-use crate::base::target::X86;
 use crate::middle::ir::{INSTS, Op, SLOTS, ir_arg};
 use crate::middle::ir::Op::{
     BNot, Cmp, Conv, Copy, Div, FMath, Lea, Load, LoadX, MAdd, MSub, MulH, Neg, Not, Rem, Select,
     ShOp, Slot, Store, StoreX, Ubfx, VBin, VCmp, VExt, VIns, VNeg, VSplat, VSum,
-};
-use crate::back::emit::calls::emit_call_inst;
-use crate::back::mc_x86_64::vector::{
-    mx_vbin, mx_vcmp, mx_vext, mx_vins, mx_vneg, mx_vsel, mx_vsplat, mx_vsum,
-};
-use crate::back::mc_arm64::vector::{
-    ma_vbin, ma_vcmp, ma_vext, ma_vins, ma_vneg, ma_vsel, ma_vsplat, ma_vsum,
 };
 
 // ---- Instructions ----
@@ -165,13 +165,15 @@ fn emit_vector(v: i64) {
         let a = operand_reg(INSTS[v].a);
         let b = if INSTS[v].b != 0 { operand_reg(INSTS[v].b) } else { -1 };
         let r = result_reg(v);
-        let vt = if op == VCmp { INSTS[v].imm2 } else if op == VExt || op == VSum { INSTS[INSTS[v].a].ty } else { ty };
+        let vt = if op == VCmp { INSTS[v].imm2 }
+            else if op == VExt || op == VSum { INSTS[INSTS[v].a].ty } else { ty };
         if op == VBin {
             let raw = INSTS[v].imm;
             let bop = raw as Op;
             if X86 { mx_vbin(bop, vt, r, a, b); } else { ma_vbin(bop, vt, r, a, b); }
         } else if op == VCmp {
-            if X86 { mx_vcmp(INSTS[v].cond, vt, r, a, b); } else { ma_vcmp(INSTS[v].cond, vt, r, a, b); }
+            if X86 { mx_vcmp(INSTS[v].cond, vt, r, a, b); }
+            else { ma_vcmp(INSTS[v].cond, vt, r, a, b); }
         } else if op == VNeg {
             if X86 { mx_vneg(vt, r, a); } else { ma_vneg(vt, r, a); }
         } else if op == VSplat {
@@ -179,7 +181,8 @@ fn emit_vector(v: i64) {
         } else if op == VExt {
             if X86 { mx_vext(vt, r, a, INSTS[v].imm); } else { ma_vext(vt, r, a, INSTS[v].imm); }
         } else if op == VIns {
-            if X86 { mx_vins(vt, r, a, b, INSTS[v].imm); } else { ma_vins(vt, r, a, b, INSTS[v].imm); }
+            if X86 { mx_vins(vt, r, a, b, INSTS[v].imm); }
+            else { ma_vins(vt, r, a, b, INSTS[v].imm); }
         } else if op == VSum {
             if X86 { mx_vsum(vt, r, a); } else { ma_vsum(vt, r, a); }
         } else {
@@ -210,10 +213,12 @@ fn emit_select(v: i64) {
             // The flags of the select just before, when it compared the same and
             // nothing was emitted since (a rematerialized 0 is an xorl).
             let p = INSTS[v].prev;
-            let same = p != 0 && p == LAST_SELECT && BUFS[CODE].len == LAST_SELECT_END && ir_arg(p, 0) == ir_arg(v, 0)
-                && ir_arg(p, 1) == ir_arg(v, 1) && INSTS[p].imm == INSTS[v].imm && INSTS[p].imm2 == INSTS[v].imm2
+            let same = p != 0 && p == LAST_SELECT && BUFS[CODE].len == LAST_SELECT_END
+                && ir_arg(p, 0) == ir_arg(v, 0) && ir_arg(p, 1) == ir_arg(v, 1)
+                && INSTS[p].imm == INSTS[v].imm && INSTS[p].imm2 == INSTS[v].imm2
                 && INSTS[p].scale == INSTS[v].scale;
-            mx_select(INSTS[v].cond, test, !same, INSTS[v].imm2, lhs, rhs, INSTS[v].imm, r, then, other);
+            mx_select(INSTS[v].cond, test, !same, INSTS[v].imm2, lhs, rhs, INSTS[v].imm, r, then,
+                other);
             LAST_SELECT = v;
             LAST_SELECT_END = BUFS[CODE].len;
         } else {
@@ -221,11 +226,11 @@ fn emit_select(v: i64) {
             // (nothing between them on AArch64 touches the flags: moves,
             // loads, stores and rematerializations do not).
             let p = INSTS[v].prev;
-            let same = p != 0 && INSTS[p].op == Select && ir_arg(p, 0) == ir_arg(v, 0) && ir_arg(p, 1) == ir_arg(v, 1)
-                && INSTS[p].imm == INSTS[v].imm && INSTS[p].imm2 == INSTS[v].imm2
-                && (INSTS[p].scale & 1) == (INSTS[v].scale & 1);
-            ma_select(INSTS[v].cond, test, !same, INSTS[v].imm2, lhs, rhs, INSTS[v].imm, INSTS[v].ty, r, then, other,
-                (INSTS[v].scale & 2) != 0);
+            let same = p != 0 && INSTS[p].op == Select && ir_arg(p, 0) == ir_arg(v, 0)
+                && ir_arg(p, 1) == ir_arg(v, 1) && INSTS[p].imm == INSTS[v].imm
+                && INSTS[p].imm2 == INSTS[v].imm2 && (INSTS[p].scale & 1) == (INSTS[v].scale & 1);
+            ma_select(INSTS[v].cond, test, !same, INSTS[v].imm2, lhs, rhs, INSTS[v].imm,
+                INSTS[v].ty, r, then, other, (INSTS[v].scale & 2) != 0);
         }
         result_done(v, r);
     }

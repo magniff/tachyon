@@ -25,31 +25,40 @@ mod control;
 mod vector;
 mod call;
 
-use crate::base::{
-    BUFS, FILES, IntVec, SYMS, buf_byte, buf_bytes, buf_clear, buf_int, buf_new, buf_slice, buf_str,
-    buf_write_file, intern_c,
+use crate::version;
+use crate::back::abi::{
+    ABI_PIECE_COUNT, ABI_PIECE_OFFSET, ABI_PIECE_TY, AbiClass, abi_classify, abi_piece_locations,
+    abi_stack_location, return_piece_reg, returns_through_pointer,
 };
-use crate::back::objfile::write_output;
 use crate::back::dwarf::{
     DEBUG_INFO, dbg_function_begin, dbg_function_end, dbg_loc, dbg_place_locs, dbg_sections,
     dbg_text_end,
 };
-use crate::version;
-use crate::front::lexer::STR_COUNT;
-use crate::front::cimport::{IMPORTED_START, drop_shadowed_imports};
-use crate::front::cheader::{EMIT_HEADER, emit_c_header};
+use crate::back::emit::function::gen_ir_function;
+use crate::back::emit::machine::{m_lea, m_load, m_mov, reg_fp};
+use crate::back::emit::stats::print_stats;
+use crate::back::isel::select_instructions;
+use crate::back::objfile::write_output;
+use crate::back::regalloc::prepare::count_uses;
+use crate::base::{
+    BUFS, FILES, IntVec, SYMS, buf_byte, buf_bytes, buf_clear, buf_int, buf_new, buf_slice, buf_str,
+    buf_write_file, intern_c,
+};
+use crate::base::timer::{
+    T_CHECK, T_CODEGEN, T_ISEL, T_LOWER, T_OUTPUT, T_PARSE, timer_add, timer_now, timer_report,
+};
 use crate::front::ast::{DEFERS, DEFER_LOOPS, NODES, NodeKind, child, init_ast};
+use crate::front::ast::NodeKind::{CStr, Defer, Fn, Let, PatBind, PatVariant, PatWild};
+use crate::front::cheader::{EMIT_HEADER, emit_c_header};
+use crate::front::check::{LOCALS, check_program};
+use crate::front::cimport::{IMPORTED_START, drop_shadowed_imports};
+use crate::front::consteval::{CONST_RELOCS, const_emit};
+use crate::front::lexer::STR_COUNT;
 use crate::front::parser::parse_program;
 use crate::front::types::{
     FNS, STATICS, STATIC_COUNT, TY_F32, TY_NEVER, TY_U32, TY_U64, TY_UNIT, align_to, fn_param,
     init_declarations, init_types, is_compound, is_float, is_void, tuple_offset, type_align,
     type_elem, type_size, variant_field, variant_field_offset,
-};
-use crate::front::check::{LOCALS, check_program};
-use crate::front::consteval::{CONST_RELOCS, const_emit};
-use crate::back::abi::{
-    ABI_PIECE_COUNT, ABI_PIECE_OFFSET, ABI_PIECE_TY, AbiClass, abi_classify, abi_piece_locations,
-    abi_stack_location, return_piece_reg, returns_through_pointer,
 };
 use crate::gen0::target::{
     ASM, CODE, DATA, DEPTH, R_ACC, R_ADDR, R_RESULT, R_SECOND, arg_location, data_align, data_bytes,
@@ -59,21 +68,12 @@ use crate::gen0::target::{
     emit_runtime, emit_store, first_int_arg, function_prefix, global_prefix, local_prefix,
     new_label, pop_d, pop_x, push_x0, static_prefix,
 };
+use crate::middle::inline::FN_LIVE;
 use crate::middle::ir::IRFUNC_COUNT;
 use crate::middle::ir::print::print_ir_func;
 use crate::middle::lower::lower_program;
-use crate::middle::profile::profile_after_lowering;
 use crate::middle::opt::{OPT_LEVEL, optimize_program};
-use crate::middle::inline::FN_LIVE;
-use crate::back::isel::select_instructions;
-use crate::back::regalloc::prepare::count_uses;
-use crate::back::emit::function::gen_ir_function;
-use crate::back::emit::machine::{m_lea, m_load, m_mov, reg_fp};
-use crate::back::emit::stats::print_stats;
-use crate::base::timer::{
-    T_CHECK, T_CODEGEN, T_ISEL, T_LOWER, T_OUTPUT, T_PARSE, timer_add, timer_now, timer_report,
-};
-use crate::front::ast::NodeKind::{CStr, Defer, Fn, Let, PatBind, PatVariant, PatWild};
+use crate::middle::profile::profile_after_lowering;
 use expr::gen_expr;
 
 // Used by lower.tach.
@@ -139,7 +139,8 @@ fn alloc_slot_for(ty: i64) -> i64 {
 }
 
 pub fn fn_symbol_prefix(f: i64) -> *u8 {
-    if unsafe { FNS[f].is_extern || FNS[f].export || FNS[f].name == MAIN_SYM } { global_prefix() } else { function_prefix() }
+    if unsafe { FNS[f].is_extern || FNS[f].export || FNS[f].name == MAIN_SYM } { global_prefix() }
+    else { function_prefix() }
 }
 
 // Whether function f has a global (C-visible) symbol.
@@ -414,7 +415,8 @@ fn gen_params(item: i64, f: i64) {
             if kind == AbiClass::Stack {
                 location = abi_stack_location(ty, &state as *i64);
             } else {
-                location = arg_location(if kind == AbiClass::Ref { TY_U64 } else { ty }, &state as *i64);
+                location = arg_location(if kind == AbiClass::Ref { TY_U64 } else { ty },
+                    &state as *i64);
             }
             if local < 0 {
                 continue;

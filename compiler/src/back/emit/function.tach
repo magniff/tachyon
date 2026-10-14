@@ -12,6 +12,8 @@ use crate::back::emit::{
     EPILOGUE_LABEL, FRAME_OUT, FRAME_TOTAL, LABEL_BASE, SAVE_BASE, SHORT_BRANCHES, SPILL_BASE,
 };
 use crate::back::emit::blocks::{emit_ir_block, find_trivial_jumps};
+use crate::back::emit::calls::{USES_SLOTS, call_stack_size, callee_param, callee_param_count};
+use crate::back::emit::insts::{LAST_SELECT, LAST_SELECT_END};
 use crate::back::emit::machine::{
     LAST_MOV_END, LAST_STORE_END, arg_reg, conv_result_ptr_reg, m_jump, m_load, m_normalize,
     m_store, reg_move_temp, reg_sp, spill_offset, t_arg_location, xl_from_c, xl_is_stack, xl_offset,
@@ -20,6 +22,7 @@ use crate::back::emit::operands::{PM_ADDR, PM_LOC, PM_STACK, pm_add, pm_resolve,
 use crate::back::emit::stats::{STATS, ST_FN, ST_FRAME, ST_FRAMES, ST_SAVES, st_function_done};
 use crate::back::layout::{EMIT, layout_emission};
 use crate::back::mc_arm64::{ma_frame_link, ma_frame_unlink};
+use crate::back::mc_arm64::ops::ma_pair;
 use crate::back::mc_x86_64::{mx_frame_link, mx_frame_unlink};
 use crate::back::regalloc::{
     CALLEE_USED, LDEPTH, LOC_NONE, ORDER, SPILL_COUNT, SPILL_VECTORS, USES, VERIFY_REGALLOC,
@@ -30,6 +33,7 @@ use crate::back::regalloc::intervals::RETURNS_TWICE;
 use crate::back::regalloc::locations::{mark_frame_blocks, tloc, vloc};
 use crate::back::regalloc::prepare::{is_emitted, tracked};
 use crate::base::{BUFS, IntVec, buf_bytes, buf_clear, buf_slice, die, free, memcmp, strlen};
+use crate::base::target::X86;
 use crate::front::ast::NODES;
 use crate::front::types::{
     FNS, TY_BOOL, TY_F64, TY_U64, TY_U8, align_to, fn_param, int_bits, is_compound, is_integer,
@@ -41,17 +45,13 @@ use crate::gen0::target::{
     ASM, CODE, LABEL_COUNT, arg_location, emit_function_start, emit_label, first_int_arg, ins,
     new_label,
 };
-use crate::base::target::X86;
 use crate::gen0::x86_64::{x64_epilogue, x64_frame_reserve, x64_imm};
 use crate::middle::ir::{
     ARGTY, BLOCKS, INSTS, INST_LOC, IRF, IRFUNCS, SLOTS, Term, VARIADIC_PIECE, ir_operand,
     ir_operand_count,
 };
-use crate::middle::ir::cfg::{succ, succ_count};
 use crate::middle::ir::Op::{CallC, Param, Phi, Slot};
-use crate::back::emit::insts::{LAST_SELECT, LAST_SELECT_END};
-use crate::back::emit::calls::{USES_SLOTS, call_stack_size, callee_param, callee_param_count};
-use crate::back::mc_arm64::ops::ma_pair;
+use crate::middle::ir::cfg::{succ, succ_count};
 
 // ---- Functions ----
 
@@ -173,7 +173,8 @@ pub fn param_locations(f: i64, locations: *i64, pieces: *i64) {
     unsafe {
         let c = fn_uses_c(f);
         let ret = FNS[f].ret;
-        let first = if c { first_int_arg(ret) } else if conv_returns_through_pointer(false, ret) { 1 } else { 0 };
+        let first = if c { first_int_arg(ret) }
+            else if conv_returns_through_pointer(false, ret) { 1 } else { 0 };
         let mut state: [i64; 3] = [first, 0, 0];
         for i in 0..FNS[f].param_count {
             let ty = fn_param(f, i);
@@ -187,7 +188,8 @@ pub fn param_locations(f: i64, locations: *i64, pieces: *i64) {
                         pieces[4 * i + k] = t_arg_location(ABI_PIECE_TY[k], &state as *i64);
                     }
                 } else {
-                    locations[i] = t_arg_location(if kind == AbiClass::Ref { TY_U64 } else { scalar_type(ty) }, &state as *i64);
+                    locations[i] = t_arg_location(if kind == AbiClass::Ref { TY_U64 }
+                        else { scalar_type(ty) }, &state as *i64);
                 }
                 continue;
             }
@@ -199,7 +201,8 @@ pub fn param_locations(f: i64, locations: *i64, pieces: *i64) {
             } else if kind == AbiClass::Stack {
                 locations[i] = xl_from_c(abi_stack_location(ty, &state as *i64));
             } else {
-                locations[i] = xl_from_c(arg_location(if kind == AbiClass::Ref { TY_U64 } else { scalar_type(ty) }, &state as *i64));
+                locations[i] = xl_from_c(arg_location(if kind == AbiClass::Ref { TY_U64 }
+                    else { scalar_type(ty) }, &state as *i64));
             }
         }
     }
@@ -226,7 +229,8 @@ fn emit_entry_moves(fi: i64) {
                 if index < 0 {
                     pm_add(loc, PM_LOC, conv_result_ptr_reg(fn_uses_c(f)), TY_U64, 0, v);
                 } else {
-                    let location = if piece > 0 { pieces[4 * index + piece - 1] } else { locations[index] };
+                    let location = if piece > 0 { pieces[4 * index + piece - 1] }
+                        else { locations[index] };
                     // Stack arguments are 16 bytes above the frame pointer.
                     if piece < 0 {
                         pm_add(loc, PM_ADDR, 16 + xl_offset(location), TY_U64, 0, v);
@@ -249,7 +253,8 @@ fn emit_entry_moves(fi: i64) {
             let ty = INSTS[v].ty;
             let t = tracked(v);
             if INSTS[v].op == Param && t >= 0 {
-                let narrow = INSTS[v].imm >= 0 && (ty == TY_BOOL || (is_integer(ty) && int_bits(ty) < 64));
+                let narrow = INSTS[v].imm >= 0
+                    && (ty == TY_BOOL || (is_integer(ty) && int_bits(ty) < 64));
                 let loc = tloc(t, 0);
                 if loc >= 0 {
                     if narrow {
@@ -436,7 +441,8 @@ fn has_stack_params(fi: i64) -> bool {
             if INSTS[v].op == Param && INSTS[v].imm >= 0 {
                 let index = INSTS[v].imm;
                 let piece = INSTS[v].imm2;
-                let location = if piece > 0 { pieces[4 * index + piece - 1] } else { locations[index] };
+                let location = if piece > 0 { pieces[4 * index + piece - 1] }
+                    else { locations[index] };
                 if piece < 0 || xl_is_stack(location) {
                     return true;
                 }
@@ -481,7 +487,8 @@ pub static mut CUR_IN_FRAME: bool = true;
 pub fn is_noreturn_call_block(b: i64) -> bool {
     unsafe {
         let v = BLOCKS[b].last;
-        BLOCKS[b].term == Term::Unreach && v != 0 && INSTS[v].op.is_call() && call_stack_size(v) == 0
+        BLOCKS[b].term == Term::Unreach && v != 0 && INSTS[v].op.is_call()
+            && call_stack_size(v) == 0
     }
 }
 
@@ -586,7 +593,8 @@ fn shrink_wrap(fi: i64) {
             let mut v = BLOCKS[b].first;
             while v != 0 {
                 let op = INSTS[v].op;
-                if op.is_call() && is_emitted(v) && !(v == BLOCKS[b].last && is_noreturn_call_block(b)) {
+                if op.is_call() && is_emitted(v)
+                    && !(v == BLOCKS[b].last && is_noreturn_call_block(b)) {
                     need.data[k] = 1;
                 }
                 if op == Slot && is_emitted(v) {
@@ -686,7 +694,8 @@ fn ir_function_start(prefix: *u8, name: i64, global: bool, frame: bool) {
         if frame {
             return;
         }
-        let prologue = if X86 { c"    pushq %rbp\n    movq %rsp, %rbp\n" } else { c"    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n" };
+        let prologue = if X86 { c"    pushq %rbp\n    movq %rsp, %rbp\n" }
+            else { c"    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n" };
         let n = strlen(prologue) as i64;
         let len = BUFS[ASM].len;
         if len < n || memcmp(&BUFS[ASM].data[len - n], prologue, n as u64) != 0 {

@@ -44,28 +44,28 @@ pub mod sections;
 pub mod typeat;
 pub mod cache;
 
+use crate::host_target;
 use crate::base::{
     FILES, FILE_COUNT, IntVec, SRC, STDOUT, SYMS, _setjmp, alloc_array, alloc_zeroed, buf_byte,
     buf_bytes, buf_new, buf_str, buf_write_fd, intern_c, load_sources, streq, strlen,
 };
 use crate::base::diag::{ERR_BAIL, ERR_KIND, RECOVER_DEPTH, edit_distance};
-use crate::front::lexer::{init_lexer, lex_range};
-use crate::front::cpp::directives::file_exists;
-use crate::front::cimport::{IMPORTED_START, drop_shadowed_imports, import_c_headers};
-use crate::front::ast::{KEEP_PARSED, init_ast, keep_parsed};
-use crate::front::parser::parse_program;
-use crate::front::modules::{load_modules, module_at};
-use crate::front::types::{ENUMS, STRUCTS, TYPES, TyKind, init_declarations, init_types};
-use crate::front::check::check_program;
 use crate::base::target::{T_X86_64_LINUX, set_target};
+use crate::front::ast::{KEEP_PARSED, init_ast, keep_parsed};
+use crate::front::check::check_program;
+use crate::front::cimport::{IMPORTED_START, drop_shadowed_imports, import_c_headers};
+use crate::front::cpp::directives::file_exists;
+use crate::front::lexer::{init_lexer, lex_range};
+use crate::front::modules::{load_modules, module_at};
+use crate::front::parser::parse_program;
+use crate::front::types::{ENUMS, STRUCTS, TYPES, TyKind, init_declarations, init_types};
 use crate::gen0::gen::MAIN_SYM;
-use crate::host_target;
+use crate::tools::edit::undo::run_query_diff;
 use crate::tools::plan::{query_impact, query_stats, query_unused};
 use crate::tools::plan::deps::query_deps;
 use crate::tools::query_text::{
     WITH_COMMENTS, all_files, infer_root, run_text, show_files, show_region,
 };
-use crate::tools::edit::undo::run_query_diff;
 use defs::{
     DEFS, DEF_COUNT, K_FIELD, K_VARIANT, MOD_DEF, bytes_eq, collect_defs, find_defs, finish_defs,
     last_segment, mod_fqn,
@@ -297,7 +297,8 @@ pub fn index_program() {
 // The commands, for `--help` and the nearest command to a misspelt one.
 fn put_usage(out: i64) {
     unsafe {
-        buf_str(out, c"usage: tachyonc query def|show NAME... [--root ROOT] [--exact] [--with-comments]\n");
+        buf_str(out,
+            c"usage: tachyonc query def|show NAME... [--root ROOT] [--exact] [--with-comments]\n");
         buf_str(out, c"       tachyonc query show FILE.tach | MODULE::use | MODULE::header | MODULE::extern\n");
         buf_str(out, c"       tachyonc query text FILE[:A[-B]]...\n");
         buf_str(out, c"       tachyonc query diff\n");
@@ -325,9 +326,11 @@ fn usage_error() -> i64 {
 const N_COMMANDS: i64 = 13;
 
 fn command_name(i: i64) -> *u8 {
-    if i == 0 { c"def" } else if i == 1 { c"show" } else if i == 2 { c"refs" } else if i == 3 { c"callers" }
-    else if i == 4 { c"items" } else if i == 5 { c"stats" } else if i == 6 { c"deps" } else if i == 7 { c"unused" }
-    else if i == 8 { c"impact" } else if i == 9 { c"text" } else if i == 10 { c"diff" } else if i == 11 { c"grep" } else { c"type" }
+    if i == 0 { c"def" } else if i == 1 { c"show" } else if i == 2 { c"refs" }
+    else if i == 3 { c"callers" } else if i == 4 { c"items" } else if i == 5 { c"stats" }
+    else if i == 6 { c"deps" } else if i == 7 { c"unused" } else if i == 8 { c"impact" }
+    else if i == 9 { c"text" } else if i == 10 { c"diff" } else if i == 11 { c"grep" }
+    else { c"type" }
 }
 
 // The command nearest to cmd (edit distance at most 2), or 0.
@@ -400,8 +403,8 @@ fn run_query_inner(argc: i64, argv: **u8) -> i64 {
         let mut i = 3;
         while i < argc {
             let a = argv[i];
-            let valued = streq(a, c"--in") || streq(a, c"--limit") || streq(a, c"--root") || streq(a, c"--over")
-                || streq(a, c"--max-lines") || streq(a, c"--kind");
+            let valued = streq(a, c"--in") || streq(a, c"--limit") || streq(a, c"--root")
+                || streq(a, c"--over") || streq(a, c"--max-lines") || streq(a, c"--kind");
             if streq(a, c"--count") {
                 OPT_COUNT = true;
             } else if streq(a, c"--exact") {
@@ -485,14 +488,16 @@ fn run_query_inner(argc: i64, argv: **u8) -> i64 {
         // ROOT: --root, else a last argument ending in .tach after the
         // NAMEs (or alone, for items: its MODULE is optional; for stats
         // and unused a lone FILE.tach is a file of the program).
-        if root == 0 as *u8 && args.count >= 1 && ends_with_c(args.data[args.count - 1] as *u8, c".tach")
+        if root == 0 as *u8 && args.count >= 1
+            && ends_with_c(args.data[args.count - 1] as *u8, c".tach")
             && (args.count >= 2 || items) {
             args.count -= 1;
             root = args.data[args.count] as *u8;
         }
         ROOT_GIVEN = root;
         let needs_name = !items && !streq(cmd, c"unused") && !streq(cmd, c"stats");
-        let single = streq(cmd, c"deps") || streq(cmd, c"impact") || streq(cmd, c"stats") || streq(cmd, c"unused");
+        let single = streq(cmd, c"deps") || streq(cmd, c"impact") || streq(cmd, c"stats")
+            || streq(cmd, c"unused");
         let first = if args.count == 0 { c_slice(c"") } else { c_slice(args.data[0] as *u8) };
         if needs_name && args.count == 0 {
             let out = usage_error();
@@ -500,7 +505,8 @@ fn run_query_inner(argc: i64, argv: **u8) -> i64 {
             if streq(cmd, c"deps") {
                 buf_str(out, c" needs a MODULE\n");
             } else {
-                buf_str(out, c" needs a NAME (a path or its end: f, m::f, T::f, T.field; or FILE:LINE)\n");
+                buf_str(out,
+                    c" needs a NAME (a path or its end: f, m::f, T::f, T.field; or FILE:LINE)\n");
             }
             try_end(try_begin(c"items", first, false));
             return 2;
@@ -517,8 +523,12 @@ fn run_query_inner(argc: i64, argv: **u8) -> i64 {
             let out = usage_error();
             if bad != 0 as *u8 && bad_value {
                 buf_str(out, bad);
-                buf_str(out, if streq(bad, c"--in") { c" needs a FILE or MODULE\n" } else if streq(bad, c"--root") { c" needs a root file\n" }
-                    else if streq(bad, c"--kind") { c" needs a KIND (read, write, call, init, type, use, mod, pat, def)\n" } else { c" needs a number\n" });
+                buf_str(out,
+                    if streq(bad, c"--in") { c" needs a FILE or MODULE\n" }
+                    else if streq(bad, c"--root") { c" needs a root file\n" }
+                    else if streq(bad, c"--kind") {
+                        c" needs a KIND (read, write, call, init, type, use, mod, pat, def)\n"
+                    } else { c" needs a number\n" });
             } else if bad != 0 as *u8 {
                 buf_str(out, c"unknown option '");
                 buf_str(out, bad);
@@ -611,7 +621,9 @@ pub fn resolve_name(cmd: *u8, name: [u8], out: *IntVec) -> bool {
         let mut f = -1;
         for g in 0..FILE_COUNT {
             let p = file_text(g);
-            if bytes_eq(p, file) || (p.len > file.len && bytes_eq(p[p.len - file.len..p.len], file) && p[p.len - file.len - 1] == '/') {
+            if bytes_eq(p, file)
+                || (p.len > file.len && bytes_eq(p[p.len - file.len..p.len], file)
+                    && p[p.len - file.len - 1] == '/') {
                 f = g;
                 break;
             }
@@ -671,7 +683,8 @@ pub fn def_at_line(f: i64, line: i64) -> i64 {
         let mut best_size = 0;
         for d in 0..DEF_COUNT {
             let k = DEFS[d].kind;
-            if k == K_FIELD || k == K_VARIANT || DEFS[d].start < FILES[f].start || DEFS[d].start >= FILES[f].end {
+            if k == K_FIELD || k == K_VARIANT || DEFS[d].start < FILES[f].start
+                || DEFS[d].start >= FILES[f].end {
                 continue;
             }
             if pos >= DEFS[d].end || pos < line_start(DEFS[d].start) {
@@ -751,7 +764,8 @@ fn answer(cmd: *u8, args: *IntVec, items: bool, is_refs: bool) -> i64 {
             }
             if streq(cmd, c"show") && ends_with_c((*args).data[i] as *u8, c"::section") {
                 // (MODULE::section TITLE)
-                let title = if i + 1 < n { c_slice((*args).data[i + 1] as *u8) } else { text[0..0] };
+                let title = if i + 1 < n { c_slice((*args).data[i + 1] as *u8) }
+                    else { text[0..0] };
                 title_next = true;
                 let r = show_section(text, title);
                 if r >= 0 {

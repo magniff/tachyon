@@ -5,14 +5,17 @@
 // immediate is movz, movn or orr; `cmp x, #-1` is `cmn`), the choice is
 // the one LLVM's assembler makes, so that the object matches `cc -c`.
 
-use crate::base::{BUFS, alloc_array, intern, intern_c, sym_table};
+mod operands;
+
+use crate::back::enc_arm64::operands::parse_operand;
 use crate::back::objfile::{
     FX_A64_ADR, FX_A64_B14, FX_A64_B19, FX_A64_B26, FX_A64_GOTPAGE, FX_A64_GOTPAGEOFF, FX_A64_PAGE,
-    FX_A64_PAGEOFF, asym, fixup, here, out32,
+    FX_A64_PAGEOFF, fixup, here, out32,
 };
-use crate::back::objfile::assemble::{OP_COUNT, OP_END, OP_START, asm_error, parse_number, text_is};
-use crate::gen0::target::ASM;
+use crate::back::objfile::assemble::{OP_COUNT, asm_error, text_is};
+use crate::base::{BUFS, alloc_array, intern, intern_c, sym_table};
 use crate::base::target::ELF;
+use crate::gen0::target::ASM;
 
 // Operand kinds.
 const K_REG: i64 = 1;
@@ -47,7 +50,10 @@ const M_GOTPAGEOFF: i64 = 4;
 // base `reg`; an offset `imm`, or an index register `index` (with `amount`
 // of lsl), or a symbol `sym` with `modifier`; `pre`: written back (`!`).
 // Shifts: `shift` (0 lsl, 1 lsr, 2 asr) by `amount`.
-struct AOp { kind: i64, reg: i64, cls: i64, sp: bool, imm: i64, index: i64, index_cls: i64, amount: i64, sym: i64, modifier: i64, shift: i64, pre: bool }
+struct AOp {
+    kind: i64, reg: i64, cls: i64, sp: bool, imm: i64, index: i64, index_cls: i64, amount: i64,
+    sym: i64, modifier: i64, shift: i64, pre: bool
+}
 
 static mut OPS: *AOp = 0 as *AOp;
 
@@ -174,13 +180,12 @@ pub fn init_a64() {
         def(c"ldrsw", A_LDRSW); def(c"ldp", A_LDP); def(c"stp", A_STP);
         def(c"fadd", A_FADD); def(c"fsub", A_FSUB); def(c"fmul", A_FMUL); def(c"fdiv", A_FDIV);
         def(c"fcmp", A_FCMP); def(c"fneg", A_FNEG); def(c"fabs", A_FABS); def(c"fsqrt", A_FSQRT);
-        def(c"frintm", A_FRINTM); def(c"frinta", A_FRINTA); def(c"frintp", A_FRINTP); def(c"frintz", A_FRINTZ);
+        def(c"frintm", A_FRINTM); def(c"frinta", A_FRINTA); def(c"frintp", A_FRINTP);
+        def(c"frintz", A_FRINTZ);
         def(c"fmov", A_FMOV); def(c"fcvt", A_FCVT); def(c"scvtf", A_SCVTF); def(c"ucvtf", A_UCVTF);
         def(c"fcvtzs", A_FCVTZS); def(c"fcvtzu", A_FCVTZU);
     }
 }
-
-// ---- Operands ----
 
 fn tchar(i: i64) -> u8 {
     unsafe { BUFS[ASM].data[i] }
@@ -191,55 +196,14 @@ fn cond_code(a: i64, b: i64) -> i64 {
     if b - a != 2 {
         return -1;
     }
-    let names: [*u8; 16] = [c"eq", c"ne", c"hs", c"lo", c"mi", c"pl", c"vs", c"vc", c"hi", c"ls", c"ge", c"lt", c"gt", c"le", c"cs", c"cc"];
+    let names: [*u8; 16] = [c"eq", c"ne", c"hs", c"lo", c"mi", c"pl", c"vs", c"vc", c"hi", c"ls",
+        c"ge", c"lt", c"gt", c"le", c"cs", c"cc"];
     for i in 0..16 {
         if unsafe { text_is(a, b, names[i]) } {
             return if i == 14 { 2 } else if i == 15 { 3 } else { i };
         }
     }
     -1
-}
-
-// A register at [a, b): sets op.reg, op.cls, op.sp; false if not one.
-fn parse_reg(a: i64, b: i64, op: *AOp) -> bool {
-    unsafe {
-        if text_is(a, b, c"sp") {
-            (*op).reg = 31;
-            (*op).cls = C_X;
-            (*op).sp = true;
-            return true;
-        }
-        if text_is(a, b, c"xzr") || text_is(a, b, c"wzr") {
-            (*op).reg = 31;
-            (*op).cls = if tchar(a) == 'x' { C_X } else { C_W };
-            (*op).sp = false;
-            return true;
-        }
-        if tchar(a) == 'v' && parse_vreg(a, b, op) {
-            return true;
-        }
-        if b - a < 2 || b - a > 3 {
-            return false;
-        }
-        let c = tchar(a);
-        let cls = if c == 'x' { C_X } else if c == 'w' { C_W } else if c == 'd' { C_D } else if c == 's' { C_S }
-            else if c == 'q' { C_Q } else if c == 'h' { C_H } else if c == 'b' { C_B } else { 0 };
-        if cls == 0 {
-            return false;
-        }
-        let mut n = 0;
-        for i in a + 1..b {
-            let d = tchar(i);
-            if d < '0' || d > '9' {
-                return false;
-            }
-            n = n * 10 + (d - '0') as i64;
-        }
-        (*op).reg = n;
-        (*op).cls = cls;
-        (*op).sp = false;
-        true
-    }
 }
 
 // The element size of letter c (b h s d: 0 to 3), or -1.
@@ -249,186 +213,6 @@ fn elem_size_of(c: u8) -> i64 {
     if c == 's' { return 2; }
     if c == 'd' { return 3; }
     -1
-}
-
-// v<n>.<arrangement> or v<n>.<e>[i] at [a, b) (0.10).
-fn parse_vreg(a: i64, b: i64, op: *AOp) -> bool {
-    unsafe {
-        let mut i = a + 1;
-        let mut n = 0;
-        while i < b && tchar(i) >= '0' && tchar(i) <= '9' {
-            n = n * 10 + (tchar(i) - '0') as i64;
-            i += 1;
-        }
-        if i == a + 1 || i >= b || tchar(i) != '.' {
-            return false;
-        }
-        i += 1;
-        (*op).reg = n;
-        (*op).sp = false;
-        if i + 1 < b && tchar(i + 1) == '[' {
-            let size = elem_size_of(tchar(i));
-            if size < 0 || tchar(b - 1) != ']' {
-                return false;
-            }
-            (*op).cls = C_VL;
-            (*op).imm = size;
-            (*op).amount = parse_number(i + 2, b - 1);
-            return true;
-        }
-        let mut lanes = 0;
-        while i < b && tchar(i) >= '0' && tchar(i) <= '9' {
-            lanes = lanes * 10 + (tchar(i) - '0') as i64;
-            i += 1;
-        }
-        if i + 1 != b {
-            return false;
-        }
-        let size = elem_size_of(tchar(i));
-        if size < 0 {
-            return false;
-        }
-        (*op).cls = C_V;
-        (*op).imm = size;
-        (*op).shift = if lanes << size as u64 == 16 { 1 } else { 0 };
-        true
-    }
-}
-
-fn skip_spaces(i: i64, b: i64) -> i64 {
-    let mut k = i;
-    while k < b && (tchar(k) == ' ' || tchar(k) == '\t') {
-        k += 1;
-    }
-    k
-}
-
-// A symbol with an optional modifier at [a, b): `sym@PAGEOFF`... on
-// Mach-O, `:lo12:sym`, `:got:sym`, `:got_lo12:sym` on ELF (where adrp's
-// plain `sym` is its page).
-fn parse_sym(a: i64, b: i64, op: *AOp) {
-    unsafe {
-        if tchar(a) == ':' {
-            let mut colon = a + 1;
-            while colon < b && tchar(colon) != ':' {
-                colon += 1;
-            }
-            if colon >= b {
-                asm_error(c"bad symbol modifier");
-            }
-            (*op).sym = asym(BUFS[ASM].data[colon + 1..b]);
-            if text_is(a + 1, colon, c"lo12") {
-                (*op).modifier = M_PAGEOFF;
-            } else if text_is(a + 1, colon, c"got") {
-                (*op).modifier = M_GOTPAGE;
-            } else if text_is(a + 1, colon, c"got_lo12") {
-                (*op).modifier = M_GOTPAGEOFF;
-            } else {
-                asm_error(c"unknown symbol modifier");
-            }
-            return;
-        }
-        let mut at = a;
-        while at < b && tchar(at) != '@' {
-            at += 1;
-        }
-        (*op).sym = asym(BUFS[ASM].data[a..at]);
-        (*op).modifier = M_NONE;
-        if at < b {
-            if text_is(at + 1, b, c"PAGE") {
-                (*op).modifier = M_PAGE;
-            } else if text_is(at + 1, b, c"PAGEOFF") {
-                (*op).modifier = M_PAGEOFF;
-            } else if text_is(at + 1, b, c"GOTPAGE") {
-                (*op).modifier = M_GOTPAGE;
-            } else if text_is(at + 1, b, c"GOTPAGEOFF") {
-                (*op).modifier = M_GOTPAGEOFF;
-            } else {
-                asm_error(c"unknown symbol modifier");
-            }
-        }
-    }
-}
-
-fn parse_operand(k: i64) {
-    unsafe {
-        let a = OP_START[k];
-        let b = OP_END[k];
-        let mut op = AOp { kind: 0, reg: 0, cls: 0, sp: false, imm: 0, index: -1, index_cls: 0, amount: 0, sym: -1, modifier: 0, shift: 0, pre: false };
-        let c = tchar(a);
-        if c == '#' {
-            op.kind = K_IMM;
-            op.imm = parse_number(a + 1, b);
-        } else if c == '[' {
-            op.kind = K_MEM;
-            let mut e = b;
-            if tchar(e - 1) == '!' {
-                op.pre = true;
-                e -= 1;
-            }
-            if tchar(e - 1) != ']' {
-                asm_error(c"bad memory operand");
-            }
-            e -= 1;
-            // [base(, x)*]
-            let mut i = a + 1;
-            let mut j = i;
-            while j < e && tchar(j) != ',' {
-                j += 1;
-            }
-            if !parse_reg(i, j, &op) {
-                asm_error(c"bad base register");
-            }
-            if j < e {
-                i = skip_spaces(j + 1, e);
-                j = i;
-                while j < e && tchar(j) != ',' {
-                    j += 1;
-                }
-                if tchar(i) == '#' {
-                    op.imm = parse_number(i + 1, j);
-                } else {
-                    let mut idx = AOp { kind: 0, reg: 0, cls: 0, sp: false, imm: 0, index: -1, index_cls: 0, amount: 0, sym: -1, modifier: 0, shift: 0, pre: false };
-                    if parse_reg(i, j, &idx) {
-                        op.index = idx.reg;
-                        op.index_cls = idx.cls;
-                        if j < e {
-                            i = skip_spaces(j + 1, e);
-                            if !text_is(i, i + 5, c"lsl #") {
-                                asm_error(c"bad index shift");
-                            }
-                            op.amount = parse_number(i + 5, e);
-                        }
-                    } else {
-                        let base_reg = op.reg;
-                        let base_cls = op.cls;
-                        let base_sp = op.sp;
-                        parse_sym(i, j, &op);
-                        op.reg = base_reg;
-                        op.cls = base_cls;
-                        op.sp = base_sp;
-                    }
-                }
-            }
-        } else if text_is(a, a + 4, c"lsl ") || text_is(a, a + 4, c"lsr ") || text_is(a, a + 4, c"asr ") {
-            op.kind = K_SHIFT;
-            op.shift = if c == 'l' { if tchar(a + 2) == 'l' { 0 } else { 1 } } else { 2 };
-            let i = skip_spaces(a + 4, b);
-            if tchar(i) != '#' {
-                asm_error(c"bad shift");
-            }
-            op.amount = parse_number(i + 1, b);
-        } else if parse_reg(a, b, &op) {
-            op.kind = K_REG;
-        } else if cond_code(a, b) >= 0 {
-            op.kind = K_COND;
-            op.imm = cond_code(a, b);
-        } else {
-            op.kind = K_SYM;
-            parse_sym(a, b, &op);
-        }
-        OPS[k] = op;
-    }
 }
 
 // ---- Helpers ----
@@ -570,7 +354,8 @@ fn addsub(op: i64, s: i64, rd: i64, rn_k: i64, m_k: i64) {
             shift = OPS[m_k + 1].shift;
             amount = OPS[m_k + 1].amount;
         }
-        word(x | op << 30 | s << 29 | 0x0b000000 | shift << 22 | r(m_k) << 16 | amount << 10 | r(rn_k) << 5 | rd);
+        word(x | op << 30 | s << 29 | 0x0b000000 | shift << 22 | r(m_k) << 16 | amount << 10
+            | r(rn_k) << 5 | rd);
     }
 }
 
@@ -592,7 +377,8 @@ fn logical(opc: i64, rd: i64, rn_k: i64, m_k: i64) {
             shift = OPS[m_k + 1].shift;
             amount = OPS[m_k + 1].amount;
         }
-        word(x | opc << 29 | 0x0a000000 | shift << 22 | r(m_k) << 16 | amount << 10 | r(rn_k) << 5 | rd);
+        word(x | opc << 29 | 0x0a000000 | shift << 22 | r(m_k) << 16 | amount << 10 | r(rn_k) << 5
+            | rd);
     }
 }
 
@@ -651,7 +437,9 @@ fn load_store(unscaled: i64, size: i64) {
             return;
         }
         if m.sym >= 0 {
-            let kind = if m.modifier == M_GOTPAGEOFF { FX_A64_GOTPAGEOFF } else if m.modifier == M_PAGEOFF { FX_A64_PAGEOFF } else { asm_error(c"expected @PAGEOFF") };
+            let kind = if m.modifier == M_GOTPAGEOFF { FX_A64_GOTPAGEOFF }
+                else if m.modifier == M_PAGEOFF { FX_A64_PAGEOFF }
+                else { asm_error(c"expected @PAGEOFF") };
             fixup(kind, here(), m.sym, 0, 0, false);
             word(unscaled | 1 << 24 | m.reg << 5 | rt);
             return;
@@ -671,7 +459,8 @@ fn load_store(unscaled: i64, size: i64) {
 
 // The unscaled opcode (ldur form) for ldr/str of register class cls.
 fn ldst_opcode(load: bool, cls: i64) -> i64 {
-    let base = if cls == C_X { 0xf8000000 } else if cls == C_W { 0xb8000000 } else if cls == C_D { 0xfc000000 } else { 0xbc000000 };
+    let base = if cls == C_X { 0xf8000000 } else if cls == C_W { 0xb8000000 }
+        else if cls == C_D { 0xfc000000 } else { 0xbc000000 };
     if load { base | 0x00400000 } else { base }
 }
 
@@ -683,7 +472,9 @@ fn ldst_size(cls: i64) -> i64 {
 fn pair(load: bool) {
     unsafe {
         let cls = OPS[0].cls;
-        let base = if cls == C_X { 0x28000000 | 2 << 30 } else if cls == C_D { 0x2c000000 | 1 << 30 } else if cls == C_W { 0x28000000 } else { 0x2c000000 };
+        let base = if cls == C_X { 0x28000000 | 2 << 30 }
+            else if cls == C_D { 0x2c000000 | 1 << 30 } else if cls == C_W { 0x28000000 }
+            else { 0x2c000000 };
         let l = if load { 1 << 22 } else { 0 };
         let scale = if cls == C_X || cls == C_D { 8 } else { 4 };
         let m = OPS[2];
@@ -723,7 +514,8 @@ fn imm5(size: i64, index: i64) -> i64 {
 fn is_simd(k: i64) -> bool {
     unsafe {
         let cls = OPS[k].cls;
-        OPS[k].kind == K_REG && (cls == C_V || cls == C_VL || cls == C_Q || cls == C_H || cls == C_B)
+        OPS[k].kind == K_REG
+            && (cls == C_V || cls == C_VL || cls == C_Q || cls == C_H || cls == C_B)
     }
 }
 
@@ -771,22 +563,26 @@ fn a64_simd(code: i64) {
             word(0x0ea01c00 | q | r(1) << 16 | rr);
         } else if (code == A_NEG || code == A_FNEG || code == A_MVN) && o0.cls == C_V {
             let sz = (if o0.imm == 3 { 1 } else { 0 }) << 22;
-            let w = if code == A_NEG { 0x2e20b800 | o0.imm << 22 } else if code == A_FNEG { 0x2ea0f800 | sz } else { 0x2e205800 };
+            let w = if code == A_NEG { 0x2e20b800 | o0.imm << 22 }
+                else if code == A_FNEG { 0x2ea0f800 | sz } else { 0x2e205800 };
             word(w | q | rr);
         } else if code == A_DUP && o1.cls == C_VL {
             word(0x0e000400 | q | imm5(o1.imm, o1.amount) << 16 | rr);
         } else if code == A_DUP {
             word(0x0e000c00 | q | imm5(o0.imm, 0) << 16 | rr);
         } else if code == A_MOV && o0.cls == C_VL && o1.cls == C_VL {
-            word(0x6e000400 | imm5(o0.imm, o0.amount) << 16 | (o1.amount << o1.imm as u64) << 11 | rr);
+            word(0x6e000400 | imm5(o0.imm, o0.amount) << 16 | (o1.amount << o1.imm as u64) << 11
+                | rr);
         } else if code == A_MOV && o0.cls == C_VL {
             word(0x4e001c00 | imm5(o0.imm, o0.amount) << 16 | rr);
         } else if code == A_MOV && (o0.cls == C_X || o0.cls == C_W) {
-            word((if o0.cls == C_X { 0x4e003c00 } else { 0x0e003c00 }) | imm5(o1.imm, o1.amount) << 16 | rr);
+            word((if o0.cls == C_X { 0x4e003c00 } else { 0x0e003c00 })
+                | imm5(o1.imm, o1.amount) << 16 | rr);
         } else if code == A_MOV {
             word(0x5e000400 | imm5(o1.imm, o1.amount) << 16 | rr);
         } else if code == A_SMOV {
-            word((if o0.cls == C_X { 0x4e002c00 } else { 0x0e002c00 }) | imm5(o1.imm, o1.amount) << 16 | rr);
+            word((if o0.cls == C_X { 0x4e002c00 } else { 0x0e002c00 })
+                | imm5(o1.imm, o1.amount) << 16 | rr);
         } else if code == A_ADDV {
             word(0x0e31b800 | o1.shift << 30 | o1.imm << 22 | rr);
         } else if code == A_ADDP {
@@ -832,7 +628,8 @@ pub fn a64_instruction(a: i64, b: i64) {
         } else if code == A_CMP || code == A_CMN {
             addsub(if code == A_CMP { 1 } else { 0 }, 1, 31, 0, 1);
         } else if code == A_AND || code == A_ORR || code == A_EOR || code == A_ANDS {
-            let opc = if code == A_AND { 0 } else if code == A_ORR { 1 } else if code == A_EOR { 2 } else { 3 };
+            let opc = if code == A_AND { 0 } else if code == A_ORR { 1 } else if code == A_EOR { 2 }
+                else { 3 };
             logical(opc, r(0), 1, 2);
         } else if code == A_TST {
             logical(3, 31, 0, 1);
@@ -860,13 +657,15 @@ pub fn a64_instruction(a: i64, b: i64) {
                 let n = if x != 0 { 1 << 22 } else { 0 };
                 let s = OPS[2].imm;
                 if code == A_LSL {
-                    word(x | n | 0x53000000 | ((width - s) % width) << 16 | (width - 1 - s) << 10 | r(1) << 5 | r(0));
+                    word(x | n | 0x53000000 | ((width - s) % width) << 16 | (width - 1 - s) << 10
+                        | r(1) << 5 | r(0));
                 } else {
                     let base = if code == A_LSR { 0x53000000 } else { 0x13000000 };
                     word(x | n | base | s << 16 | (width - 1) << 10 | r(1) << 5 | r(0));
                 }
             } else {
-                let op2 = if code == A_LSL { 0x2000 } else if code == A_LSR { 0x2400 } else { 0x2800 };
+                let op2 = if code == A_LSL { 0x2000 } else if code == A_LSR { 0x2400 }
+                    else { 0x2800 };
                 word(x | 0x1ac00000 | op2 | r(2) << 16 | r(1) << 5 | r(0));
             }
         } else if code == A_MUL {
@@ -876,9 +675,11 @@ pub fn a64_instruction(a: i64, b: i64) {
             word(sf(0) | 0x1b000000 | o0 | r(2) << 16 | r(3) << 10 | r(1) << 5 | r(0));
         } else if code == A_SMULH || code == A_UMULH {
             // (0.11) 64-bit only.
-            word(0x9b407c00 | (if code == A_UMULH { 0x800000 } else { 0 }) | r(2) << 16 | r(1) << 5 | r(0));
+            word(0x9b407c00 | (if code == A_UMULH { 0x800000 } else { 0 }) | r(2) << 16 | r(1) << 5
+                | r(0));
         } else if code == A_SDIV || code == A_UDIV {
-            word(sf(0) | 0x1ac00000 | (if code == A_SDIV { 0xc00 } else { 0x800 }) | r(2) << 16 | r(1) << 5 | r(0));
+            word(sf(0) | 0x1ac00000 | (if code == A_SDIV { 0xc00 } else { 0x800 }) | r(2) << 16
+                | r(1) << 5 | r(0));
         } else if code == A_SXTB || code == A_SXTH || code == A_SXTW {
             let x = sf(0);
             let n = if x != 0 { 1 << 22 } else { 0 };
@@ -913,14 +714,18 @@ pub fn a64_instruction(a: i64, b: i64) {
         } else if code == A_TBZ || code == A_TBNZ {
             let bit = OPS[1].imm;
             fixup(FX_A64_B14, here(), OPS[2].sym, 0, 0, false);
-            word((bit >> 5) << 31 | (if code == A_TBZ { 0x36000000 } else { 0x37000000 }) | (bit & 31) << 19 | r(0));
+            word((bit >> 5) << 31 | (if code == A_TBZ { 0x36000000 } else { 0x37000000 })
+                | (bit & 31) << 19 | r(0));
         } else if code == A_BRK {
             word(0xd4200000 | (OPS[0].imm & 0xffff) << 5);
         } else if code == A_ADR {
             fixup(FX_A64_ADR, here(), OPS[1].sym, 0, 0, false);
             word(0x10000000 | r(0));
         } else if code == A_ADRP {
-            let kind = if OPS[1].modifier == M_GOTPAGE { FX_A64_GOTPAGE } else if OPS[1].modifier == M_PAGE || (ELF && OPS[1].modifier == M_NONE) { FX_A64_PAGE } else { asm_error(c"expected @PAGE") };
+            let kind = if OPS[1].modifier == M_GOTPAGE { FX_A64_GOTPAGE }
+                else if OPS[1].modifier == M_PAGE
+                || (ELF && OPS[1].modifier == M_NONE) { FX_A64_PAGE }
+                else { asm_error(c"expected @PAGE") };
             fixup(kind, here(), OPS[1].sym, 0, 0, false);
             word(0x90000000 | r(0));
         } else if code == A_LDR || code == A_STR {
@@ -932,7 +737,8 @@ pub fn a64_instruction(a: i64, b: i64) {
         } else if code == A_LDRSB || code == A_LDRSH {
             let w = OPS[0].cls == C_W;
             let base = if code == A_LDRSB { 0x38000000 } else { 0x78000000 };
-            load_store(base | (if w { 0x00c00000 } else { 0x00800000 }), if code == A_LDRSB { 0 } else { 1 });
+            load_store(base | (if w { 0x00c00000 } else { 0x00800000 }),
+                if code == A_LDRSB { 0 } else { 1 });
         } else if code == A_LDRSW {
             load_store(0xb8800000, 2);
         } else if code == A_LDP || code == A_STP {

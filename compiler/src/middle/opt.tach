@@ -4,8 +4,25 @@
 // and jump threading, and dead code elimination. The pass pipeline is
 // optimize_program, at the end.
 
+use crate::back::regalloc::ORDER;
+use crate::back::regalloc::prepare::layout_blocks;
 use crate::base::{IntVec, alloc_array, die, free};
+use crate::base::timer::{
+    T_ATTRS, T_GLOBAL_DCE, T_HEAP, T_INLINE, T_IPCP, T_LICM, T_LOOPS, T_PROMOTE, T_SCALAR, T_SLP,
+    T_TRE, timer_add, timer_now,
+};
 use crate::gen0::gen::fn_is_global;
+use crate::middle::adce::aggressive_dce;
+use crate::middle::fold::{instcombine, sccp};
+use crate::middle::gvn::run_gvn;
+use crate::middle::inline::{
+    FN_ADDRESS, FN_CALLS, FN_LIVE, FN_SCC, FN_SIZE, SCC_ORDER, compute_sccs, count_call_sites,
+    func_size, inline_rounds, start_inlining_budget,
+};
+use crate::middle::ipo::{
+    PRINT_ATTRS, has_effect, heap_to_stack, infer_component_attrs, init_attrs, print_attrs,
+    propagate_constants,
+};
 use crate::middle::ir::{
     ARGS, ARGTY, BLOCKS, INSTS, IRF, IRFUNCS, IRFUNC_COUNT, Op, Term, ir_append, ir_arg, ir_operand,
     ir_operand_count, ir_replace, ir_resolve_operands, ir_unlink, ir_val,
@@ -14,35 +31,18 @@ use crate::middle::ir::cfg::{
     copy_terminator, is_succ, pred_index, redirect_succ, succ, succ_count, switch_target,
 };
 use crate::middle::ir::verify::verify_func;
-use crate::middle::lower::ssa::ssa_undef;
-use crate::middle::adce::aggressive_dce;
-use crate::middle::fold::{instcombine, sccp};
-use crate::middle::gvn::run_gvn;
-use crate::middle::sroa::{promote_constant_slots, run_sroa};
-use crate::middle::inline::{
-    FN_ADDRESS, FN_CALLS, FN_LIVE, FN_SCC, FN_SIZE, SCC_ORDER, compute_sccs, count_call_sites,
-    func_size, inline_rounds, start_inlining_budget,
-};
 use crate::middle::licm::run_licm;
 use crate::middle::loops::{rotate_loops, seal_all};
+use crate::middle::lower::ssa::ssa_undef;
 use crate::middle::lsr::reduce_and_unswitch;
+use crate::middle::promote::promote_loop_memory;
 use crate::middle::range::fold_by_ranges;
 use crate::middle::scev::transform_loops;
+use crate::middle::slp::slp_vectorize;
+use crate::middle::sroa::{promote_constant_slots, run_sroa};
+use crate::middle::tre::eliminate_tail_recursion;
 use crate::middle::vectorize::{UNROLL_WHOLE, VECTORIZE, vectorize_loops};
 use crate::middle::vectorize::unroll::unroll_runtime_loops;
-use crate::middle::slp::slp_vectorize;
-use crate::middle::tre::eliminate_tail_recursion;
-use crate::middle::ipo::{
-    PRINT_ATTRS, has_effect, heap_to_stack, infer_component_attrs, init_attrs, print_attrs,
-    propagate_constants,
-};
-use crate::middle::promote::promote_loop_memory;
-use crate::base::timer::{
-    T_ATTRS, T_GLOBAL_DCE, T_HEAP, T_INLINE, T_IPCP, T_LICM, T_LOOPS, T_PROMOTE, T_SCALAR, T_SLP,
-    T_TRE, timer_add, timer_now,
-};
-use crate::back::regalloc::ORDER;
-use crate::back::regalloc::prepare::layout_blocks;
 
 pub static mut OPT_LEVEL: i64 = 2;
 
@@ -301,7 +301,8 @@ pub fn simplify_cfg(fi: i64) -> bool {
             }
             // A branch on a constant is a jump.
             if BLOCKS[b].term == Term::Branch && INSTS[BLOCKS[b].cond].op == Op::Const {
-                let taken = if INSTS[BLOCKS[b].cond].imm != 0 { BLOCKS[b].s0 } else { BLOCKS[b].s1 };
+                let taken = if INSTS[BLOCKS[b].cond].imm != 0 { BLOCKS[b].s0 }
+                    else { BLOCKS[b].s1 };
                 let dropped = if taken == BLOCKS[b].s0 { BLOCKS[b].s1 } else { BLOCKS[b].s0 };
                 remove_pred(dropped, b);
                 BLOCKS[b].term = Term::Jump;
@@ -313,7 +314,8 @@ pub fn simplify_cfg(fi: i64) -> bool {
             // So is a switch on a constant, or with one successor.
             if BLOCKS[b].term == Term::Switch
                 && (INSTS[BLOCKS[b].cond].op == Op::Const || BLOCKS[b].nsucc == 1) {
-                let taken = if BLOCKS[b].nsucc == 1 { BLOCKS[b].s0 } else { switch_target(b, INSTS[BLOCKS[b].cond].imm) };
+                let taken = if BLOCKS[b].nsucc == 1 { BLOCKS[b].s0 }
+                    else { switch_target(b, INSTS[BLOCKS[b].cond].imm) };
                 switch_to_jump(b, taken);
                 changed = true;
             }
