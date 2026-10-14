@@ -66,6 +66,11 @@ each by its position). Refused (`refactor.collision`) when NEW is
 already a name in its scope: another local declared there, or a name
 used there that is not this local. `self` keeps its name.
 
+A field shorthand (0.15), `S { x }`, is the field x and the value x at
+once: renaming the local, parameter, constant or static x writes `S {
+x: NEW }`; renaming the field (`S.x`, or `refactor field S --rename`)
+writes `S { NEW: x }`.
+
 Mentions in comments are renamed only between backquotes on `//`
 lines, never other words, and only in these forms:
 

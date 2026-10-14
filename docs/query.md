@@ -171,6 +171,13 @@ The position is the name's. The signature is the source up to the body
 or the `{`, its whitespace collapsed, with `pub` when the item is public;
 a long constant's value is cut to `...`.
 
+(0.15) A method `#[derive(...)]` makes (Eq's `eq`, Ord's `cmp`, Hash's
+`hash`, Debug's `fmt_debug`, Clone's `clone`) has no source of its own:
+`def P::cmp` (and show, refs, the refactorings' NAME) answers with the
+attribute, `note query.derived: 'P::cmp' is derived, at main.tach:6:14:
+#[derive] makes it; it has no source of its own` and `try: tachyonc
+query show crate::P` (exit 1).
+
 ## show
 
 Each matching definition's exact source: a header, then whole lines from
@@ -311,6 +318,12 @@ references.
   function's (ENCLOSING names it). A closure's function and its
   environment struct are no definitions: refs, unused, stats and deps
   never list them; a call of a closure is no reference.
+- (0.15) What `#[derive]` makes (impls written at the attribute's
+  position) is no definition, and its uses of the type, its fields and
+  std are no references; a trait the attribute names is one. A field
+  shorthand `S { x }` is a reference to the field and to the value `x`
+  at one position. An argument's label (`f(b: 1)`) is no reference: the
+  call is `f`'s.
 - `--count` prints the number of references refs would print (the
   definition included); for several definitions, `N→PATH` per definition.
 - `callers` is `refs` restricted to calls (method and operator calls
@@ -490,6 +503,14 @@ never checked): `error query.no-match`, `try:` the item at that line.
 (where it is written); a closure's parameter has its type; a use of a
 captured local has the local's type (the environment the closure reads
 it from is not shown).
+
+(0.15) `e?` has the type of its value (`i64→half(v)?`); a value the
+checker widens is shown with its own type and what it becomes,
+`i32 (widened to i64)→n`; a hole of an f-string is an expression as any
+other (`{p.x + q.y:>4}`: `i64→p.x + q.y`), and a position on its text
+gives the f-string's type. What the compiler writes for an f-string or a
+`?` (the hidden locals `__f0`, `__out`, the match a `?` is) is never
+shown.
 
 ## Diagnostics
 
