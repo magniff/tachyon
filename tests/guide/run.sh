@@ -27,6 +27,11 @@
 #             with each line of this text in its diagnostics (short form)
 #   other     (sh, text, rust) not checked
 #
+# (0.15) A block fenced ```tach 0.15 FEATURE... uses features of 0.15 that
+# are built in parts: it is checked as a tach block when the compiler has
+# them all (tests/needs015.sh: try, from, widen, args, io, fmt, derive),
+# else skipped (`skip NAME`), with its in, out or err block.
+#
 # Prints `pass NAME` or `FAIL NAME` (and why) for each check; exits 1 if
 # one failed.
 
@@ -59,12 +64,14 @@ trap 'exit 130' INT TERM
 STATUS=0
 RESULTS="$WORK/results"
 : >"$RESULTS"
+. "$ROOT/tests/needs015.sh"
+MISSING015=$(missing_015 "$COMPILER" "$WORK")
 
 # Splits the guide text $1 (topic $2) into one directory per tach block
 # under $WORK/blocks: prog.tach (wrapped as its kind needs), and, when an
 # out or err block follows, out (with exit) or err.
 split_blocks() {
-    awk -v topic="$2" -v dir="$WORK/blocks" '
+    awk -v topic="$2" -v dir="$WORK/blocks" -v missing015=" $MISSING015" '
         function flush_pending() { pending = "" }
         function item_line(l) {
             return l ~ /^(pub |fn |struct |enum |union |impl|trait |const |static |type |use |mod |import |extern |unsafe fn |#\[|}|\/\/|$)/
@@ -85,7 +92,7 @@ split_blocks() {
             }
             if (line == "```") {
                 infence = 0
-                if (lang == "tach") {
+                if (lang == "tach" || lang ~ /^tach 0\.15( |$)/) {
                     n++
                     name = topic ":" start
                     d = dir "/" topic "-" sprintf("%05d", start)
@@ -114,6 +121,15 @@ split_blocks() {
                         print "}" > f
                     }
                     close(f)
+                    if (lang ~ /^tach 0\.15/) {
+                        nw = split(lang, w, " ")
+                        lacks = ""
+                        for (j = 3; j <= nw; j++) if (index(missing015, " " w[j] " ")) lacks = lacks " " w[j]
+                        if (lacks != "") {
+                            printf "0.15:%s", lacks > (d "/skip")
+                            close(d "/skip")
+                        }
+                    }
                     pending = d
                 } else if (lang == "in" && pending != "") {
                     printf "%s", body > (pending "/stdin")
@@ -151,6 +167,10 @@ trimmed() {
 check_block() {
     d=$1
     name=$(cat "$d/name")
+    if [ -f "$d/skip" ]; then
+        echo "skip $name (the compiler lacks $(cat "$d/skip"))" >"$d/result"
+        return
+    fi
     if [ -f "$d/err" ]; then
         "$COMPILER" --deny-warnings --diagnostics=short "$d/prog.tach" -o "$d/prog" >"$d/compile.out" 2>&1
         rc=$?
