@@ -1,0 +1,393 @@
+// Counted loops out of loops with several exits, and equal induction
+// variables merged (0.14), before rotation (opt.tach's optimize_loops).
+//
+// A loop whose header, and the blocks that follow it alone, test several
+// exits to one block, each a comparison of an induction variable with an
+// invariant, runs as many times as the smallest of their trip counts:
+// `loop { match it.next() { .. } }` over `take(n)` of a slice iterator
+// becomes, once threaded (tags.tach), a header testing n != 0, then
+// pos < len. The trip counts are computed in the preheader (as unsigned
+// numbers), their minimum T, and the loop gets a new induction variable c
+// from 0: the first test becomes c != T, the others are always true. The
+// loop then has one exit, which rotation and SCEV count and the
+// vectorizer takes. The blocks between the first test and the last have
+// no effects (the last iteration skips them), and the exit block's phis
+// take one value from all the tests.
+//
+// Two header phis with the same start and the same constant step are one
+// induction variable (an index counted twice, as enumerate and zip over
+// `next` do, or the counter above beside the slice position).
+
+use crate::middle::ir::{
+    ARGS, ARGTY, BLOCKS, Cond, INSTS, IRF, IRFUNCS, Op, Term, ir_append, ir_arg, ir_make,
+    ir_prepend, ir_replace, ir_val,
+};
+
+use crate::base::IntVec;
+
+use crate::middle::range::bits_of_value;
+
+use crate::middle::fold::is_const;
+
+use crate::middle::loops::{
+    canonicalize_loops, invariant_in, loop_contains, loop_count, loop_header, loop_latch,
+    loop_preheader,
+};
+
+use crate::front::types::{TY_BOOL, TY_I64, TY_U64, int_bits, is_integer, is_signed};
+use crate::middle::ipo::has_effect;
+use crate::middle::ir::cfg::pred_index;
+use crate::middle::opt::resolve_all;
+use crate::middle::scev::{append_const, append_inst, iv_start, iv_step};
+
+// The tests of one loop: (block, induction variable phi, offset, invariant
+// bound, condition to stay) per test; COUNT_STRIDE values each.
+static mut TESTS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+const COUNT_STRIDE: i64 = 5;
+// At most this many tests in a chain.
+const MAX_TESTS: i64 = 8;
+
+// The induction variable value x is (a header phi of loop l, plus a
+// constant): the phi in *phi, the constant in *offset; false when x is not
+// one with a step of 1 or -1 (in *step) and 64 bits.
+fn affine_iv(l: i64, x: i64, phi: *i64, offset: *i64, step: *i64) -> bool {
+    unsafe {
+        let mut v = bits_of_value(x);
+        let mut c = 0;
+        for _ in 0..4 {
+            if INSTS[v].op == Op::Phi {
+                break;
+            }
+            let op = INSTS[v].op;
+            if op != Op::Add && op != Op::Sub {
+                return false;
+            }
+            let a = bits_of_value(INSTS[v].a);
+            let b = bits_of_value(INSTS[v].b);
+            if is_const(b) {
+                c = if op == Op::Add { c + INSTS[b].imm } else { c - INSTS[b].imm };
+                v = a;
+            } else if op == Op::Add && is_const(a) {
+                c += INSTS[a].imm;
+                v = b;
+            } else {
+                return false;
+            }
+        }
+        let mut s = 0;
+        if INSTS[v].op != Op::Phi || INSTS[v].block != loop_header(l) || !is_integer(INSTS[v].ty)
+            || int_bits(INSTS[v].ty) != 64 || !iv_step(l, v, &s) || (s != 1 && s != -1) {
+            return false;
+        }
+        *phi = v;
+        *offset = c;
+        *step = s;
+        true
+    }
+}
+
+// Records the test of block b's branch (`stay` is true when the loop goes
+// on along s0): x <cond> bound, x an induction variable. False when it is
+// not a test that has a trip count.
+fn record_test(l: i64, b: i64, stay_s0: bool) -> bool {
+    unsafe {
+        let c = ir_val(BLOCKS[b].cond);
+        if INSTS[c].op != Op::Cmp || !is_integer(INSTS[c].imm2) || int_bits(INSTS[c].imm2) != 64 {
+            return false;
+        }
+        let mut cond = INSTS[c].cond;
+        let mut x = ir_val(INSTS[c].a);
+        let mut n = bits_of_value(INSTS[c].b);
+        if !invariant_in(l, n) {
+            n = bits_of_value(INSTS[c].a);
+            x = ir_val(INSTS[c].b);
+            cond = cond.mirror();
+        }
+        if !invariant_in(l, n) {
+            return false;
+        }
+        if !stay_s0 {
+            cond = cond.negate();
+        }
+        let mut phi = 0;
+        let mut offset = 0;
+        let mut step = 0;
+        if !affine_iv(l, x, &phi, &offset, &step) {
+            return false;
+        }
+        // (the condition to stay: x != n either way; x < n going up; x > n
+        // going down; signedness from the comparison)
+        let ok = cond == Cond::Ne || (cond == Cond::Lt && step == 1)
+            || (cond == Cond::Gt && step == -1);
+        if !ok {
+            return false;
+        }
+        TESTS.push(b);
+        TESTS.push(phi);
+        TESTS.push(offset);
+        TESTS.push(n);
+        // cond, and the comparison's signedness
+        TESTS.push(cond as i64 * 2 + if is_signed(INSTS[c].imm2) { 1 } else { 0 });
+        true
+    }
+}
+
+// The number of iterations test k lets the loop run (an unsigned 64-bit
+// value), computed at the end of block pre.
+fn trip_count(l: i64, k: i64, pre: i64) -> i64 {
+    unsafe {
+        let phi = TESTS.data[COUNT_STRIDE * k + 1];
+        let offset = TESTS.data[COUNT_STRIDE * k + 2];
+        let n = TESTS.data[COUNT_STRIDE * k + 3];
+        let code = TESTS.data[COUNT_STRIDE * k + 4];
+        let signed = (code & 1) != 0;
+        let cond = code / 2;
+        let mut start = iv_start(l, phi);
+        if offset != 0 {
+            start = append_inst(pre, Op::Add, TY_I64, start, append_const(pre, offset, TY_I64));
+        }
+        if cond == Cond::Ne as i64 {
+            let mut step = 0;
+            iv_step(l, phi, &step);
+            return if step == 1 { append_inst(pre, Op::Sub, TY_I64, n, start) }
+                else { append_inst(pre, Op::Sub, TY_I64, start, n) };
+        }
+        // x < n going up: n - start when start < n, else 0 (x > n down: the
+        // mirror).
+        let lt = cond == Cond::Lt as i64;
+        let a = if lt { start } else { n };
+        let b = if lt { n } else { start };
+        let diff = append_inst(pre, Op::Sub, TY_I64, b, a);
+        let enter = append_cmp(pre, Cond::Lt, if signed { TY_I64 } else { TY_U64 }, a, b);
+        and_mask(pre, diff, enter)
+    }
+}
+
+// v when bool `keep` holds, else 0 (no branch: v & -keep).
+fn and_mask(b: i64, v: i64, keep: i64) -> i64 {
+    unsafe {
+        let wide = ir_make(Op::Conv, TY_I64, keep, 0, 0);
+        INSTS[wide].imm2 = TY_BOOL;
+        ir_append(b, wide);
+        let mask = append_inst(b, Op::Neg, TY_I64, wide, 0);
+        append_inst(b, Op::And, TY_I64, v, mask)
+    }
+}
+
+// The smaller of unsigned x and y: y ^ ((x ^ y) & -(x < y)).
+fn umin(b: i64, x: i64, y: i64) -> i64 {
+    let less = append_cmp(b, Cond::Lt, TY_U64, x, y);
+    let diff = append_inst(b, Op::Xor, TY_I64, x, y);
+    append_inst(b, Op::Xor, TY_I64, y, and_mask(b, diff, less))
+}
+
+fn append_cmp(b: i64, cond: Cond, ty: i64, x: i64, y: i64) -> i64 {
+    unsafe {
+        let v = ir_make(Op::Cmp, TY_BOOL, x, y, 0);
+        INSTS[v].cond = cond;
+        INSTS[v].imm2 = ty;
+        ir_append(b, v);
+        v
+    }
+}
+
+// The exit blocks of the tests (OUTS[k] for test k).
+static mut OUTS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The block an exit edge leads to: past an exit block of the loop's own
+// (canonical form gives each exiting edge one) holding only phis of one
+// operand and a jump.
+fn forward(out: i64) -> i64 {
+    unsafe {
+        if BLOCKS[out].term != Term::Jump || BLOCKS[out].preds.count != 1 {
+            return out;
+        }
+        let mut v = BLOCKS[out].first;
+        while v != 0 {
+            if INSTS[v].op != Op::Phi || INSTS[v].nargs != 1 {
+                return out;
+            }
+            v = INSTS[v].next;
+        }
+        BLOCKS[out].s0
+    }
+}
+
+// The value phi x (of the exit) takes when the loop leaves from test block
+// t through its exit block `out`.
+fn value_from(x: i64, t: i64, out: i64) -> i64 {
+    unsafe {
+        let exit = INSTS[x].block;
+        if out == exit {
+            return ir_val(ir_arg(x, pred_index(exit, t)));
+        }
+        let w = ir_val(ir_arg(x, pred_index(exit, out)));
+        if INSTS[w].op == Op::Phi && INSTS[w].block == out { ir_val(ir_arg(w, 0)) } else { w }
+    }
+}
+
+// Loop l with several counted exits at its top made a counted loop (see
+// the header). Returns whether it was.
+fn merge_exits(l: i64) -> bool {
+    unsafe {
+        let h = loop_header(l);
+        let pre = loop_preheader(l);
+        let latch = loop_latch(l);
+        if pre == 0 || latch == 0 {
+            return false;
+        }
+        TESTS.count = 0;
+        OUTS.count = 0;
+        let mut exit = 0;
+        let mut b = h;
+        for _ in 0..MAX_TESTS {
+            if BLOCKS[b].term != Term::Branch {
+                break;
+            }
+            let s0 = BLOCKS[b].s0;
+            let s1 = BLOCKS[b].s1;
+            let in0 = loop_contains(l, s0);
+            if in0 == loop_contains(l, s1) {
+                break;
+            }
+            let out = if in0 { s1 } else { s0 };
+            let next = if in0 { s0 } else { s1 };
+            if exit != 0 && forward(out) != exit {
+                break;
+            }
+            if b != h && !no_effects(b) {
+                break;
+            }
+            if !record_test(l, b, in0) {
+                break;
+            }
+            exit = forward(out);
+            OUTS.push(out);
+            if next == h || BLOCKS[next].preds.count != 1 {
+                break;
+            }
+            b = next;
+        }
+        let count = TESTS.count / COUNT_STRIDE;
+        if count < 2 {
+            return false;
+        }
+        // The exit's phis take one value from every test.
+        let mut x = BLOCKS[exit].first;
+        while x != 0 && INSTS[x].op == Op::Phi {
+            let first = value_from(x, h, OUTS.data[0]);
+            for k in 1..count {
+                if value_from(x, TESTS.data[COUNT_STRIDE * k], OUTS.data[k]) != first {
+                    return false;
+                }
+            }
+            x = INSTS[x].next;
+        }
+        // T, the smallest trip count.
+        let mut trips = trip_count(l, 0, pre);
+        for k in 1..count {
+            trips = umin(pre, trips, trip_count(l, k, pre));
+        }
+        // c: 0, 1, ... with c != T the first test, the others true.
+        let zero = append_const(pre, 0, TY_I64);
+        let c = ir_make(Op::Phi, TY_I64, 0, 0, 0);
+        INSTS[c].args = ARGS.count;
+        INSTS[c].nargs = BLOCKS[h].preds.count;
+        let one = append_const(latch, 1, TY_I64);
+        let next = append_inst(latch, Op::Add, TY_I64, c, one);
+        for k in 0..BLOCKS[h].preds.count {
+            ARGS.push(if BLOCKS[h].preds.data[k] == pre { zero } else { next });
+            ARGTY.push(0);
+        }
+        ir_prepend(h, c);
+        let stay_s0 = loop_contains(l, BLOCKS[h].s0);
+        BLOCKS[h].cond = append_cmp(h, if stay_s0 { Cond::Ne } else { Cond::Eq }, TY_I64, c, trips);
+        for k in 1..count {
+            let t = TESTS.data[COUNT_STRIDE * k];
+            let stay = loop_contains(l, BLOCKS[t].s0);
+            BLOCKS[t].cond = append_const(t, if stay { 1 } else { 0 }, TY_BOOL);
+        }
+        true
+    }
+}
+
+// Whether block b's instructions have no effects (they may be skipped).
+fn no_effects(b: i64) -> bool {
+    unsafe {
+        let mut v = BLOCKS[b].first;
+        while v != 0 {
+            if has_effect(v) {
+                return false;
+            }
+            v = INSTS[v].next;
+        }
+        true
+    }
+}
+
+// Merges the header phis of loop l that are one induction variable: the
+// same start, the same constant step. Returns whether any was.
+fn merge_equal_ivs(l: i64) -> bool {
+    unsafe {
+        let h = loop_header(l);
+        if loop_preheader(l) == 0 || loop_latch(l) == 0 {
+            return false;
+        }
+        let mut changed = false;
+        let mut p = BLOCKS[h].first;
+        while p != 0 && INSTS[p].op == Op::Phi {
+            let mut s1 = 0;
+            if ir_val(p) == p && is_integer(INSTS[p].ty) && iv_step(l, p, &s1) {
+                let start = iv_start(l, p);
+                let mut q = INSTS[p].next;
+                while q != 0 && INSTS[q].op == Op::Phi {
+                    let mut s2 = 0;
+                    if ir_val(q) == q && INSTS[q].ty == INSTS[p].ty && iv_step(l, q, &s2)
+                        && s1 == s2
+                        && same_value(iv_start(l, q), start) {
+                        ir_replace(q, p);
+                        changed = true;
+                    }
+                    q = INSTS[q].next;
+                }
+            }
+            p = INSTS[p].next;
+        }
+        changed
+    }
+}
+
+// Whether a and b are one value (or equal constants).
+fn same_value(a: i64, b: i64) -> bool {
+    unsafe {
+        a == b || (is_const(a) && is_const(b) && INSTS[a].imm == INSTS[b].imm
+            && INSTS[a].ty == INSTS[b].ty)
+    }
+}
+
+// Both, on every loop of function fi (canonical form first). Returns
+// whether anything changed.
+pub fn count_loop_exits(fi: i64) -> bool {
+    unsafe {
+        IRF = fi;
+        canonicalize_loops(fi);
+        let mut changed = false;
+        for l in 0..loop_count() {
+            if loop_header(l) == IRFUNCS[fi].entry {
+                continue;
+            }
+            if merge_equal_ivs(l) {
+                changed = true;
+                resolve_all(fi);
+            }
+            if merge_exits(l) {
+                changed = true;
+                resolve_all(fi);
+                if merge_equal_ivs(l) {
+                    resolve_all(fi);
+                }
+            }
+        }
+        changed
+    }
+}

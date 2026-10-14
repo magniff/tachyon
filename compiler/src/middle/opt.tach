@@ -13,11 +13,13 @@ use crate::base::timer::{
 };
 use crate::gen0::gen::fn_is_global;
 use crate::middle::adce::aggressive_dce;
+use crate::middle::copies::elide_copies;
+use crate::middle::exits::count_loop_exits;
 use crate::middle::fold::{instcombine, sccp};
 use crate::middle::gvn::run_gvn;
 use crate::middle::inline::{
     FN_ADDRESS, FN_CALLS, FN_LIVE, FN_SCC, FN_SIZE, SCC_ORDER, compute_sccs, count_call_sites,
-    func_size, inline_rounds, start_inlining_budget,
+    func_size, inline_rounds, inlined_everywhere, start_inlining_budget,
 };
 use crate::middle::ipo::{
     PRINT_ATTRS, has_effect, heap_to_stack, infer_component_attrs, init_attrs, print_attrs,
@@ -40,6 +42,7 @@ use crate::middle::range::fold_by_ranges;
 use crate::middle::scev::transform_loops;
 use crate::middle::slp::slp_vectorize;
 use crate::middle::sroa::{promote_constant_slots, run_sroa};
+use crate::middle::tags::thread_tags;
 use crate::middle::tre::eliminate_tail_recursion;
 use crate::middle::vectorize::{UNROLL_WHOLE, VECTORIZE, vectorize_loops};
 use crate::middle::vectorize::unroll::unroll_runtime_loops;
@@ -279,6 +282,29 @@ pub fn dominates(a: i64, b: i64) -> bool {
 
 // ---- CFG simplification ----
 
+// Whether blocks x and y (two of them) hold nothing and jump to one block,
+// whose phis take the same value from both.
+fn same_forward(x: i64, y: i64) -> bool {
+    unsafe {
+        if x == y || BLOCKS[x].first != 0 || BLOCKS[y].first != 0 || BLOCKS[x].term != Term::Jump
+            || BLOCKS[y].term != Term::Jump || BLOCKS[x].s0 != BLOCKS[y].s0
+            || BLOCKS[x].preds.count != 1 || BLOCKS[y].preds.count != 1 {
+            return false;
+        }
+        let t = BLOCKS[x].s0;
+        let ix = pred_index(t, x);
+        let iy = pred_index(t, y);
+        let mut phi = BLOCKS[t].first;
+        while phi != 0 && INSTS[phi].op == Op::Phi {
+            if ir_val(ir_arg(phi, ix)) != ir_val(ir_arg(phi, iy)) {
+                return false;
+            }
+            phi = INSTS[phi].next;
+        }
+        true
+    }
+}
+
 // Merges blocks into their only predecessor when it has no other
 // successor, and threads jumps through empty blocks. Returns whether
 // anything changed.
@@ -308,6 +334,17 @@ pub fn simplify_cfg(fi: i64) -> bool {
                 BLOCKS[b].term = Term::Jump;
                 BLOCKS[b].cond = 0;
                 BLOCKS[b].s0 = taken;
+                BLOCKS[b].s1 = 0;
+                changed = true;
+            }
+            // (0.14) So is a branch to two empty blocks that go on to one
+            // block, where its phis take the same value from both (what a
+            // threaded comparison of -1, 0 and 1 leaves).
+            if BLOCKS[b].term == Term::Branch && same_forward(BLOCKS[b].s0, BLOCKS[b].s1) {
+                let dropped = BLOCKS[b].s1;
+                remove_pred(dropped, b);
+                BLOCKS[b].term = Term::Jump;
+                BLOCKS[b].cond = 0;
                 BLOCKS[b].s1 = 0;
                 changed = true;
             }
@@ -530,6 +567,9 @@ pub fn simplify_function(fi: i64) {
             verify_func(fi, c"sccp");
             instcombine(fi);
             verify_func(fi, c"instcombine");
+            if round == 0 && elide_copies(fi) {
+                verify_func(fi, c"copy elision");
+            }
             if round == 0 && run_sroa(fi) {
                 verify_func(fi, c"sroa");
             }
@@ -544,6 +584,9 @@ pub fn simplify_function(fi: i64) {
             verify_func(fi, c"dead code elimination");
             simplify_cfg(fi);
             verify_func(fi, c"simplify_cfg");
+            if round == 0 && thread_tags(fi) {
+                verify_func(fi, c"threading on tags");
+            }
         }
         remove_trivial_phis(fi);
     }
@@ -584,6 +627,7 @@ pub fn optimize_program() {
         // every call through the address is made direct (see
         // remove_dead_functions).
         FN_TAKEN = alloc_array::<i64>(IRFUNC_COUNT + 1);
+        DEFERRED = alloc_array::<i64>(IRFUNC_COUNT + 1);
         for fi in 0..IRFUNC_COUNT {
             FN_TAKEN[fi] = FN_ADDRESS[fi];
         }
@@ -612,25 +656,11 @@ pub fn optimize_program() {
                 simplify_function(fi);
             }
             timer_add(T_HEAP, t);
-            t = timer_now();
-            if optimize_loops(fi) {
-                simplify_function(fi);
+            if inlined_everywhere(fi) {
+                DEFERRED[fi] = 1;
+            } else {
+                loop_pipeline(fi);
             }
-            timer_add(T_LOOPS, t);
-            t = timer_now();
-            if run_licm(fi) {
-                resolve_all(fi);
-                verify_func(fi, c"licm");
-                simplify_function(fi);
-            }
-            timer_add(T_LICM, t);
-            // After LICM: the addresses of slots and statics are out of the
-            // loops by then.
-            t = timer_now();
-            if promote_loop_memory(fi) {
-                simplify_function(fi);
-            }
-            timer_add(T_PROMOTE, t);
             t = timer_now();
             FN_SIZE[fi] = func_size(fi);
             if i + 1 == SCC_ORDER.count || FN_SCC[SCC_ORDER.data[i + 1]] != FN_SCC[fi] {
@@ -642,6 +672,14 @@ pub fn optimize_program() {
         t = timer_now();
         remove_dead_functions();
         timer_add(T_GLOBAL_DCE, t);
+        // The functions whose loop passes waited for their callers, and that
+        // are still called somewhere.
+        for fi in 0..IRFUNC_COUNT {
+            if DEFERRED[fi] != 0 && FN_LIVE[fi] != 0 {
+                IRF = fi;
+                loop_pipeline(fi);
+            }
+        }
         // (0.11: last, on the code as it will be emitted: stores packed
         // earlier would hide their values from the loads of the functions
         // they are inlined into)
@@ -661,6 +699,36 @@ pub fn optimize_program() {
     }
 }
 
+// Functions whose loop passes wait until inlining is done (see
+// inlined_everywhere).
+static mut DEFERRED: *i64 = 0 as *i64;
+
+// The loop passes, LICM and scalar promotion of function fi, each followed
+// by the scalar pipeline when it changed something.
+fn loop_pipeline(fi: i64) {
+    unsafe {
+        let mut t = timer_now();
+        if optimize_loops(fi) {
+            simplify_function(fi);
+        }
+        timer_add(T_LOOPS, t);
+        t = timer_now();
+        if run_licm(fi) {
+            resolve_all(fi);
+            verify_func(fi, c"licm");
+            simplify_function(fi);
+        }
+        timer_add(T_LICM, t);
+        // After LICM: the addresses of slots and statics are out of the
+        // loops by then.
+        t = timer_now();
+        if promote_loop_memory(fi) {
+            simplify_function(fi);
+        }
+        timer_add(T_PROMOTE, t);
+    }
+}
+
 // -O2's loop passes (loops.tach and the files after it), before LICM.
 // Returns whether anything changed.
 fn optimize_loops(fi: i64) -> bool {
@@ -672,6 +740,10 @@ fn optimize_loops(fi: i64) -> bool {
         // Between the passes a light cleanup only; the scalar pipeline runs
         // once after them (in optimize_program).
         let mut changed = false;
+        if count_loop_exits(fi) {
+            changed = true;
+            light_cleanup(fi);
+        }
         if rotate_loops(fi) {
             changed = true;
             light_cleanup(fi);

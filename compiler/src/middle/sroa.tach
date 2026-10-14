@@ -34,6 +34,8 @@ use crate::middle::opt::{compute_dominators, dominates, remove_trivial_phis, res
 
 const SROA_MAX_LEAVES: i64 = 32;
 
+const SROA_ROUNDS: i64 = 4;
+
 // Per slot: 1 while a candidate; its leaves are (offset, IR type) pairs at
 // SR_LEAVES[SR_FIRST[s]..] (SR_COUNT[s] of them, by offset), and their
 // variables start at SR_VAR[s].
@@ -241,6 +243,14 @@ fn sroa_scan(fi: i64) {
                     }
                     if !ok {
                         SR_STATE[s] = 0;
+                        // (an address stored into a candidate: see run_sroa)
+                        if op == Store && k == 1 {
+                            let mut d_off = 0;
+                            let d = sroa_slot(INSTS[v].a, &d_off);
+                            if d != 0 {
+                                SR_HELD.push(d);
+                            }
+                        }
                     }
                 }
                 v = INSTS[v].next;
@@ -364,7 +374,39 @@ fn sroa_copy(b: i64, v: i64) {
     }
 }
 
+// Slots holding the address of another slot (a closure's environment
+// holding a variable captured by reference): when they are replaced, the
+// other slot's address reaches its uses directly, and it may be replaced
+// in turn (0.14).
+static mut SR_HELD: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// Scalar replacement, to a fixpoint: again while a slot replaced held the
+// address of another (at most SROA_ROUNDS times). Returns whether any slot
+// was replaced.
 pub fn run_sroa(fi: i64) -> bool {
+    unsafe {
+        let mut any = false;
+        for _ in 0..SROA_ROUNDS {
+            SR_HELD.count = 0;
+            if !sroa_once(fi) {
+                break;
+            }
+            any = true;
+            let mut again = false;
+            for i in 0..SR_HELD.count {
+                if SR_STATE[SR_HELD.data[i]] != 0 {
+                    again = true;
+                }
+            }
+            if !again {
+                break;
+            }
+        }
+        any
+    }
+}
+
+fn sroa_once(fi: i64) -> bool {
     unsafe {
         IRF = fi;
         resolve_all(fi);
