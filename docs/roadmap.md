@@ -1269,3 +1269,59 @@ split into 172 files costs nothing measurable).
 The gate (`bootstrap/gate.sh --release`, every step at once on
 aarch64-macos and in the two Linux containers): 11:54 wall, every step
 passed.
+
+### 0.13
+
+aarch64-macos (Apple silicon, native; `bench/run.sh -p <0.12.0> -r 9`,
+the fastest of 9 runs in ms, run after the gate on a machine with other
+agents' work on it, load average 5 to 7; "0.12.0" is the previous
+release at its default level; the last row is the geometric mean over
+cc -O2's, programs with a C version only):
+
+| program | 0.12.0 | 0.13 -O2 | cc -O2 |
+|---|---|---|---|
+| binarytrees | 179 | 189 | 189 |
+| collatz | 323 | 316 | 333 |
+| fannkuch | 132 | 135 | 157 |
+| fib | 16 | 15 | 19 |
+| interp | 64 | 47 | 47 |
+| json | 127 | 110 | 97 |
+| mandelbrot | 175 | 173 | 168 |
+| matmul | 19 | 19 | 46 |
+| nbody | 32 | 32 | 29 |
+| sieve | 64 | 66 | 70 |
+| sort | 64 | 69 | 60 |
+| stencil | 8 | 8 | 8 |
+| wordcount | 86 | 85 | 72 |
+| md5 | 36 | 36 | - |
+| geomean vs cc -O2 | 0.966 | 0.939 | 1 |
+
+(-O0 and -O1 in the same run: geomean 6.770 and 1.359.) The generated
+code is 0.12.0's byte for byte: `tachyonc same-output` against the
+0.12.0 compiler is identical over the whole corpus (4,668 compilations,
+as for 0.12), so the differences above are this machine's spread under
+load: interp's 64 against 47 ms and json's 127 against 110 are the same
+code, and a first run a few minutes earlier, load average 9 to 11, had
+binarytrees at 319 against 224 ms and a geomean of 0.983 against 0.987.
+
+Compile time (aarch64-macos, wall time, best of 7, the two compilers
+alternating on the same input: the 0.13 source, 90,000 lines in 209
+files; the same loaded machine, load average 5 to 7, so every row is
+slower than 0.12's on an emptier one):
+
+| | 0.12.0 | 0.13 |
+|---|---|---|
+| the compiler to an object, -O0 | 205 ms | 204 ms |
+| the compiler to an object, -O2 | 1613 ms | 1633 ms |
+| to an executable (`cc` links), -O0 | 230 ms | 228 ms |
+| to an executable (`cc` links), -O2 | 1713 ms | 1738 ms |
+| `tachyonc check compiler/src/main.tach`, no cache | 74 ms | 73 ms |
+| `tachyonc query refs run_gvn`, no cache (`TACHYON_CACHE=off`) | 80 ms | 86 ms |
+| `tachyonc check compiler/src/main.tach`, cache warm | | 6.8 ms |
+| `tachyonc query refs run_gvn`, cache warm | | 7.2 ms |
+
+Compiling is the same within noise (the -O2 rows 1 to 1.5% apart, the
+output identical). Without the cache, `query refs` is a few ms slower
+than 0.12.0's (best of 15 again: 87 against 91 ms); with the cache warm,
+`check` and `query refs` answer in about 7 ms, ten times faster than
+reading the program.
