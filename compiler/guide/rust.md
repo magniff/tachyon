@@ -9,17 +9,17 @@ often than to something else; each error names the fix.
 | Rust | tachyon |
 |---|---|
 | `&str`, `String`, `&[u8]` | `[u8]`: a pointer and a length; `"abc"` is one; no UTF-8 type |
-| `String::new()`, `push_str`, `format!` | `std::Buf`: `push`, `push_str`, `push_int`, `as_slice` |
+| `String::new()`, `push_str`, `format!` | `std::Buf`: `push`, `push_str`, `push_int`, `push_fmt(f"..")`, `as_slice`; `format(f"..")` (0.15) |
 | `s.len()` | `s.len` (a field, `i64`) |
 | `s == "x"`, `s < t` | the same (std's `Eq` and `Ord` for `[u8]`, by bytes) |
 | `&s[1..3]` | `s[1..3]` (checked) |
 | `s.as_bytes()[0]`, `b'a'` | `s[0]`, `'a'` (a `u8`) |
 | `CString`, `.as_ptr()` | `c"text"` (a `*u8`); a slice is not NUL-terminated |
 | `match s { "a" => .. }` | `if s == "a" { .. } else if ...` |
-| `x.to_string()`, `s.parse::<i64>()` | `Buf::push_int`; `std::parse_int(s)` (an `Option<i64>`) |
+| `x.to_string()`, `s.parse::<i64>()` | `Buf::push_int`; `std::parse_int(s)` (a `Result<i64, ParseIntError>`, 0.15) |
 | `s.trim()`, `s.split(',')`, `s.split_whitespace()` | `std::trim(s)`; `std::split(s, ',')`, `std::split_whitespace(s)`: a `Vec<[u8]>` of views of `s` (free it) |
 
-```tach
+```tach 0.15 io
 use std::{Buf, parse_int, split};
 
 fn main() -> i32 {
@@ -34,7 +34,7 @@ fn main() -> i32 {
     }
     b.push_int(sum);
     println(b.as_slice());
-    if parse_int("4x").is_none() { println("not a number"); }
+    if parse_int("4x").is_err() { println("not a number"); }
     0
 }
 ```
@@ -84,15 +84,16 @@ fn main() -> i32 {
 
 | Rust | tachyon |
 |---|---|
-| `x?` | none until 0.15: `let v = match r { Ok(v) => v, Err(e) => return Err(e) };` |
+| `x?` | the same (0.15), on `Option` and `Result`; the error goes through `From` |
 | `panic!("msg")` | `unsafe { std::panic(c"msg") }` (exit 101), or `return` an error |
-| `.map()`, `.and_then()`, `.ok_or()` | none: `match`, `if let` |
+| `.map()`, `.and_then()`, `.ok_or()`, `.map_err()` | the same (0.15), and `unwrap_or_else` |
 | `.unwrap()`, `.unwrap_or(d)`, `.is_some()`, `.is_none()` | the same |
 | `.is_ok()`, `.is_err()`, `.ok()` | the same |
 | `assert!(c)`, `debug_assert!` | `if !c { unsafe { std::panic(c"...") } }` |
 | `std::process::exit(n)` | `return n;` from `main`, or C's `exit` in `unsafe` |
+| `fn main() -> Result<(), E>` | the same (0.15): `Err(e)` prints `Error: ` and `e`'s Debug, exit 1 |
 
-```tach
+```tach 0.15 try
 enum Error { Empty, TooBig(i64) }
 
 fn check(n: i64) -> Result<i64, Error> {
@@ -102,7 +103,7 @@ fn check(n: i64) -> Result<i64, Error> {
 }
 
 fn twice_checked(n: i64) -> Result<i64, Error> {
-    let v = match check(n) { Ok(v) => v, Err(e) => return Err(e) };   // what `?` would do
+    let v = check(n)?;                    // Err(e) returns Err(e)
     Ok(v + 1)
 }
 
@@ -176,7 +177,7 @@ fn main() -> i32 {
 | Rust | tachyon |
 |---|---|
 | `usize` for lengths and indices | `i64` (`s.len`, `v.len()`); indexing takes any integer type |
-| implicit widening `i32` -> `i64` | none: `x as i64` (0.15 adds lossless widening) |
+| implicit widening `i32` -> `i64` | the same (0.15), lossless only; `i64::from(x)`; narrowing is `x as i32` |
 | `i32::MAX`, `u8::MIN` | none: write the value |
 | overflow: panic in debug, wrap in release | always wraps (two's complement) |
 | `x / 0` panics | `x / 0 == 0`, `x % 0 == x` |
@@ -185,9 +186,10 @@ fn main() -> i32 {
 | `char`, a non-ASCII `char` literal | `u8`, ASCII literals only; `"\u{e9}"` in strings is UTF-8 bytes |
 | `()` | `()` |
 | `!` (never) | `!`: `fn fail() -> ! { ... }` |
-| `#[derive(PartialEq, Eq)]` | `==` is structural for structs, enums, tuples, arrays |
-| `#[derive(Clone, Copy, Debug, Default, Hash)]` | none needed for copies; write `impl Hash for T` yourself |
-| `impl Display`, `{:?}` | none: write a `fn show(self: *T, b: *Buf)` |
+| `#[derive(PartialEq, Eq)]` | `==` is structural for structs, enums, tuples, arrays; `#[derive(Eq)]` checks it |
+| `#[derive(Clone, Copy, Debug, Default, Hash)]` | `#[derive(Clone, Debug, Hash, Ord)]` (0.15); every value copies, no `Copy`, no `Default` |
+| `impl Display`, `{:?}` | `impl Display for T { fn fmt(self: *T, f: *Fmt) {..} }`, `{x:?}` (0.15, `guide formatting`) |
+| `impl From<A> for B`, `.into()` | the same (0.15, `guide conversions`) |
 | `type A = B;` | the same (`type Pair<T> = (T, T);` too) |
 | `const fn` | none; `const` items take constant expressions |
 
@@ -199,11 +201,12 @@ fn main() -> i32 {
 | `'a: loop { break 'a; }` | `a: loop { break :a; }` |
 | `let x;` then assign | `let x = ...;` always |
 | `let Some(x) = o else { .. };` | `let x = match o { Some(x) => x, None => return 1 };` |
-| `P { x, y }` shorthand, `..base` | `P { x: x, y: y }` |
+| `P { x, y }` shorthand, `..base` | the shorthand (0.15); no `..base` |
 | `where T: Ord` | `<T: Ord>` |
 | `pub(crate)`, `pub(super)` | `pub`, or nothing (private to the module and its children) |
 | `fn` inside a `fn` | items only at module level |
-| `macro_rules!`, `println!`, `vec!`, `assert!` | none |
+| `macro_rules!`, `println!`, `vec!`, `assert!` | none: `println(f"{x}")` (0.15) |
+| default arguments (none in Rust) | `fn f(a: i64, b: i64 = 2)`, `f(1, b: 3)` (0.15) |
 | `impl<T> Trait for Vec<T>` | the same (one impl per trait and type) |
 | `dyn Trait`, `impl Trait` in argument position | generics: `fn f<T: Trait>(x: T)` |
 | `#[test]` | none yet (0.18); write a program and check its output |
@@ -221,8 +224,8 @@ fn main() -> i32 {
 | `extern crate`, Cargo dependencies | none: one program from its files; C through headers |
 | `pub use` | the same |
 | `std::collections::HashMap` | `std::HashMap` |
-| `std::io::stdin().read_line(&mut s)` | `std::read_line(&buf)`: the line without its `'\n'`, false at the end of input |
-| `io::read_to_string(io::stdin())` | `std::read_stdin()`, a `Buf`; `std::Scanner` for its tokens, numbers and lines |
+| `std::io::stdin().read_line(&mut s)` | `std::read_line(&buf)`: the line without its `'\n'`; `Ok(false)` at the end of input |
+| `io::read_to_string(io::stdin())` | `std::read_stdin()`, a `Result<Buf, IoError>`; `std::Scanner` for its tokens, numbers and lines |
 | `std::env::args()` | `fn main(argc: i32, argv: **u8) -> i32` |
 
 ## unsafe and C

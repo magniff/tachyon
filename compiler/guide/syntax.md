@@ -15,7 +15,8 @@ The whole grammar is docs/grammar.md; this is what a program uses.
 - Integers: `42`, `1_000`, `0xff`, `0b1010`, with a type suffix
   `255u8`, `7i32`. Floats: `1.5`, `2e10`, `1.5f32`. Chars: `'a'`, `'\n'`,
   `'\x41'`, `'\''` (one byte, a `u8`). Strings: `"a\tb\n\"q\"\\"`,
-  `"\x41"`, `"\u{e9}"` (UTF-8 bytes); `c"..."` is NUL-terminated. A
+  `"\x41"`, `"\u{e9}"` (UTF-8 bytes); `c"..."` is NUL-terminated;
+  `f"x = {x:>4}"` is an f-string (0.15, `guide formatting`). A
   backslash at the end of a line inside a string continues it, leaving
   out the line break and the next line's indentation.
 
@@ -103,7 +104,8 @@ From loosest to tightest (all left-associative except where noted):
 | `f()` `a[i]` `a[i..j]` `x.f` `x.0` `x.m()` | `*p.x` is `*(p.x)` |
 
 No `**` (power), no ternary (`if c { a } else { b }` is an
-expression); `e?` parses (0.15), its checking is to come. `return`,
+expression). `e?` (0.15) is postfix, as tight as a call: `parse(s)?.len`
+(`tachyonc guide conversions`). `return`,
 `break`, `continue` have type `!` and fit anywhere:
 `let v = if ok { x } else { return 1 };`.
 

@@ -18,8 +18,9 @@
 
 ## Numbers
 
-Nothing converts implicitly: both sides of `+`, `==`, `=` have one type,
-and `as` converts between numeric types (and `bool` to an integer,
+Only widening converts implicitly (0.15: a narrower integer to a wider
+one, `tachyonc guide conversions`); otherwise both sides of `+`, `==`,
+`=` have one type, and `as` converts between numeric types (and `bool` to an integer,
 fieldless enums to integers and back). An unsuffixed literal takes the
 type the context needs (`let b: u8 = 7;`, `x + 1` with `x: u32`), and
 must fit: `let b: u8 = 300;` is an error.
