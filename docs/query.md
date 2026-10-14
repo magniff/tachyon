@@ -12,18 +12,33 @@ line saying what went wrong followed by the commands that recover
 compiler's own `<std>` and `<C import>` last), then line, then column.
 
 ```
-tachyonc query def NAME [ROOT] [--exact]
-tachyonc query show NAME [ROOT] [--exact]
-tachyonc query refs NAME [ROOT] [--exact] [--count] [--in FILE|MODULE] [--limit N] [--all]
-tachyonc query callers NAME [ROOT] [--exact] [--count] [--in FILE|MODULE] [--limit N] [--all]
-tachyonc query items [MODULE] [ROOT]
+tachyonc query def NAME... [--root ROOT] [--exact]
+tachyonc query show NAME... [--root ROOT] [--exact]
+tachyonc query refs NAME... [--root ROOT] [--exact] [--count] [--in FILE|MODULE] [--limit N] [--all]
+tachyonc query callers NAME... [--root ROOT] [--exact] [--count] [--in FILE|MODULE] [--limit N] [--all]
+tachyonc query items [MODULE...] [--root ROOT]
+tachyonc query stats [MODULE|FILE] [--over N] [--all]      (refactor.md)
+tachyonc query deps MODULE [--max-lines N]                 (refactor.md)
+tachyonc query unused [MODULE|FILE] [--all]                (refactor.md)
+tachyonc query impact NAME                                 (refactor.md)
 tachyonc query --help
 ```
 
-`ROOT` is the program's root file. Without it: `$TACHYON_ROOT`, else
-`./main.tach`, else `./compiler/src/main.tach`. Positions are
-`file:line:col`, 1-based, with the file as the module loader names it
-(relative to the current directory when ROOT is).
+`ROOT` is the program's root file: `--root ROOT`, or (the form of 0.11's
+first query) a last argument ending in `.tach` after the NAMEs (`items
+ROOT` alone too). Without it: `$TACHYON_ROOT`, else `./main.tach`, else
+`./compiler/src/main.tach`. Positions are `file:line:col`, 1-based, with
+the file as the module loader names it (relative to the current
+directory when ROOT is).
+
+Several NAMEs are answered in one call, in turn (`show A B C`); refs and
+callers list the references to all of them together, each line naming
+its target. A NAME that matches nothing gets its diagnostic and the
+others are still answered (exit 1).
+
+The tools that change a program by name (`tachyonc edit`, `undo`,
+`check`, `fix`, `lint`, `same-output`) and the planning queries (stats,
+deps, unused, impact) are in [refactor.md](refactor.md).
 
 Exit status: 0 answered, 1 no answer (nothing matches, an ambiguous
 `show`, a program that could not be read), 2 usage error (or no root).
@@ -91,6 +106,13 @@ definition is named, and accepted back as NAME:
   `<Type as Trait>::f` with each part full or partial
   (`<V2 as Add>::add`).
 - `--exact`: only a full path matches.
+- `FILE:LINE` (or `FILE:LINE:COL`, as a compiler error has it) is the
+  innermost item whose text (its comments and attributes included)
+  holds that line: `query show gvn.tach:740` after an error there. FILE
+  is matched like `--in`'s (the path, or its end by whole components).
+  A line between items: `error query.no-match: no item at FILE:LINE`,
+  `try:` the items of its module; an unknown file: `no file 'FILE' in
+  the program`.
 - Import aliases are not definitions: `use a::f as g;` makes `g` a
   reference to `crate::a::f`, but `query def g` finds nothing
   (`error query.alias`, with `try:` the same query of what `g` imports).

@@ -10,19 +10,26 @@ $ tachyonc --target x86_64-linux compiler/src/main.tach -o linux.s   # cross-com
 $ tachyonc -O0 examples/md5.tach -o md5.s     # -O0, -O1 or -O2 (the default)
 $ tachyonc --emit-ir examples/md5.tach -o md5.ir    # the optimized IR
 $ tachyonc --emit-imports prog.tach -o decls.tach   # what `import "x.h" as c;` declares
-$ tachyonc --fix-imports prog.tach   # rewrite 0.7's `*` imports and plain header imports (0.8)
+$ tachyonc --fix-imports prog.tach   # rewrite 0.7's `*` imports and plain header imports (0.8; `fix --only imports`)
 $ tachyonc --emit-header prog.tach -o prog.h        # the program's C header
 $ tachyonc --tokens file.tach        # the token dump (same format as the seed's `tachyon tokens`)
 $ tachyonc --version                 # the release and the host
 $ tachyonc --profile-generate p.prof prog.tach -o prog.o   # instrument (0.10)
 $ tachyonc --profile-use p.prof prog.tach -o prog.o        # optimize with the counts
 $ tachyonc query def run_gvn compiler/src/main.tach       # questions about a program (0.11)
+$ tachyonc edit replace gvn::run_gvn < new.tach   # change an item by name, atomically (0.11)
+$ tachyonc check                     # the front end's errors, one per line (0.11)
+$ tachyonc fix                       # imports, pub, unsafe blocks: every machine-applicable fix (0.11)
+$ tachyonc same-output old/tachyonc  # this compiler's output is OLD's, on the corpus (0.11)
 ```
 
 `tachyonc query def|show|refs|callers|items` answers questions about a
 program from the front end (definitions, their source, the references
 the checker resolved, a module's items), for agents and editors; see
-[docs/query.md](../docs/query.md).
+[docs/query.md](../docs/query.md). `tachyonc edit`, `undo`, `check`,
+`fix`, `lint`, `same-output` and the planning queries (`query stats`,
+`deps`, `unused`, `impact`) change a program by name, atomically; see
+[docs/refactor.md](../docs/refactor.md).
 
 It accepts the whole language of [docs/grammar.md](../docs/grammar.md) and
 emits assembly that `cc` assembles and links against libc, for one of:
@@ -67,6 +74,11 @@ e.g. `use crate::ir::Op::{Add, Sub};`; 0.8 has no `*` imports, and
 | `patterns.tach` | patterns: their checking, refutability, `match`, and exhaustiveness and reachability by usefulness |
 | `generics.tach` | generics: instances of structs, enums and functions (copies of their templates), inference of type arguments, symbols |
 | `query.tach` | `tachyonc query` (0.11): definitions, their source, resolved references and module items, from the front end (see [docs/query.md](../docs/query.md)) |
+| `plan.tach` | the planning queries (0.11): `query stats`, `deps`, `unused`, `impact`; `tachyonc lint` (see [docs/refactor.md](../docs/refactor.md)) |
+| `proc.tach` | processes and files for the tools: running a program for its output, workers, renames, directories |
+| `edit.tach` | the edit engine (0.11): byte-range replacements applied atomically (checked by the front end before they are written), diffs, the journal; `tachyonc edit`, `undo`, `check` |
+| `fix.tach` | `tachyonc fix` (0.11): missing and unused imports, `pub`, unsafe blocks, wildcard imports, as one edit |
+| `sameout.tach` | `tachyonc same-output` (0.11): this compiler's output against another's, on a corpus |
 | `gen.tach` | the driver of code generation, and the `-O0` code generator: walks the checked AST, in terms of the target interface |
 | `abi.tach` | C's calling convention for aggregates (AArch64 and System V): classification into pieces, locations |
 | `target.tach` | the target interface: targets, the machine model's virtual registers, object-format details (symbols, sections, labels), and dispatch to the instruction set |
