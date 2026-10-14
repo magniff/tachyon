@@ -435,6 +435,12 @@ written against 0.5's unbounded generics mean.
   unsafecheck.tach): raw-pointer accesses checked against the heap blocks
   the program allocated (out of bounds, use after free, double free); the
   compiler compiled with it compiles itself to the same output
+- done: every error in one compilation (grammar.md "Error recovery"):
+  the checker runs after syntax errors (skipping the bodies that had
+  them) and recovers per declaration and per field, parameter and result
+  type (the error type, with the errors that follow from it suppressed);
+  impls, bounds, imports, missing module files and C header errors
+  recover too
 - done: interp: `vm.sp` is promoted (the 0.6 note): interp is level with
   cc -O2 (40 against 39-40 ms)
 - not done, measured: GVN-PRE. Of the compiler's 16,482 pure

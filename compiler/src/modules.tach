@@ -18,8 +18,9 @@
 // the prefix of its items' symbols in the assembly.
 use crate::base::{
     BUFS, FILES, FILE_COUNT, IntVec, SYMS, add_source, alloc_array, buf_byte, buf_bytes, buf_clear,
-    buf_new, buf_slice, buf_str, err_begin, err_end, err_help, err_str, err_sym, error_at, find_sym,
-    grow, intern, intern_c, read_file, strlen,
+    buf_new, buf_slice, buf_str, err_begin, err_end, err_end_soft, err_failed_name, err_help,
+    err_str, err_sym, error_at, error_at_soft, fail_name, find_sym, grow, intern, intern_c,
+    read_file, strlen,
 };
 use crate::lexer::{TOKS, TOK_COUNT, Tok, lex_range};
 use crate::cpp::{file_exists, path_dir};
@@ -29,7 +30,7 @@ use crate::unsafecheck::{CHECK_MODULE, CHECK_UNSAFE, check_runtime_source};
 use crate::ast::{NODES, NodeKind, child};
 use crate::parser::ITEM_PUBLIC;
 use crate::types::{ENUMS, SYM_ENUM, find_variant, item_node_of};
-use crate::check::{PROGRAM, SELF_SYM, name_error, template_variant_named};
+use crate::check::{PROGRAM, SELF_SYM, Try, attempt, name_error, template_variant_named};
 use crate::lower::HMap;
 use crate::streq;
 
@@ -207,10 +208,13 @@ pub fn load_modules() {
         while i + 2 < TOK_COUNT {
             if TOKS[i].kind == Tok::Mod && TOKS[i + 1].kind == Tok::Ident && TOKS[i + 2].kind == Tok::Semi {
                 let f = file_of(TOKS[i].start);
+                // (after an error, on with the next one: 0.10)
                 if module_at(TOKS[i].start) != FILES[f].module {
-                    error_at(TOKS[i].start, c"'mod name;' cannot be inside an inline module (a module's file is found from its file's module)");
+                    error_at_soft(TOKS[i].start, c"'mod name;' cannot be inside an inline module (a module's file is found from its file's module)");
+                    fail_name(TOKS[i + 1].value as i64);
+                } else {
+                    load_module(f, i);
                 }
-                load_module(f, i);
             }
             if TOKS[i].kind == Tok::Mod && TOKS[i + 1].kind == Tok::Ident && TOKS[i + 2].kind == Tok::LBrace {
                 add_inline_module(i);
@@ -271,7 +275,7 @@ fn add_inline_module(i: i64) {
             err_str(c"module '");
             err_sym(name);
             err_str(c"' is declared twice");
-            err_end();
+            err_end_soft();
         }
         let public = i > 0 && TOKS[i - 1].kind == Tok::Pub;
         // The matching closing brace.
@@ -304,7 +308,8 @@ fn load_module(f: i64, i: i64) {
             err_str(c"module '");
             err_sym(name);
             err_str(c"' is declared twice");
-            err_end();
+            err_end_soft();
+            return;
         }
         let public = i > 0 && TOKS[i - 1].kind == Tok::Pub;
         let path = module_file(f, name);
@@ -317,7 +322,10 @@ fn load_module(f: i64, i: i64) {
             err_help(module_candidate(f, name, false));
             err_help(c" and ");
             err_help(module_candidate(f, name, true));
-            err_end();
+            err_end_soft();
+            // (what it would have declared is unknown: no errors for it)
+            fail_name(name);
+            return;
         }
         let m = add_module(name, parent, public);
         let text = buf_new();
@@ -471,10 +479,19 @@ pub fn collect_uses() {
             for k in 0..NODES[item].count {
                 let id = child(item, k);
                 let name = if NODES[id].b != 0 { NODES[id].b } else { NODES[id].a };
+                let mut twice = false;
                 for e in 0..USE_ENTRY_COUNT {
                     if USE_ENTRIES[e].module == m && USE_ENTRIES[e].name == name && !USE_ENTRIES[e].glob {
-                        name_error(NODES[id].start, c"'", name, c"' is imported twice");
+                        twice = true;
                     }
+                }
+                if twice {
+                    err_begin(NODES[id].start);
+                    err_str(c"'");
+                    err_sym(name);
+                    err_str(c"' is imported twice");
+                    err_end_soft();
+                    continue;
                 }
                 add_use_entry(m, name, id, path, false, public, item);
             }
@@ -499,6 +516,21 @@ fn resolve_use(u: i64) -> i64 {
             error_at(NODES[USE_ENTRIES[u].node].start, c"this import depends on itself");
         }
         USE_ENTRIES[u].state = 1;
+        // (an import that fails imports nothing, and the errors saying
+        // its name is unknown follow from it: 0.10)
+        if !attempt(Try::Use, u) {
+            USE_ENTRIES[u].result = B_NONE;
+            if !USE_ENTRIES[u].glob {
+                fail_name(USE_ENTRIES[u].name);
+            }
+        }
+        USE_ENTRIES[u].state = 2;
+        USE_ENTRIES[u].result
+    }
+}
+
+pub fn resolve_use_of(u: i64) {
+    unsafe {
         let m = USE_ENTRIES[u].module;
         let path = USE_ENTRIES[u].path;
         let prefix = resolve_path(m, path, NODES[path].count, NODES[path].start);
@@ -539,9 +571,7 @@ fn resolve_use(u: i64) -> i64 {
                 not_enum_or_module(path);
             }
         }
-        USE_ENTRIES[u].state = 2;
         USE_ENTRIES[u].result = result;
-        result
     }
 }
 
@@ -648,6 +678,10 @@ fn lookup_uncached(m: i64, name: i64, from: i64, depth: i64) -> i64 {
             }
             let what = resolve_use(u);
             let mut found = B_NONE;
+            if what == B_NONE {
+                // (an import that failed)
+                continue;
+            }
             if binding_kind(what) == B_MODULE {
                 let item = lookup_uncached(binding_value(what), name, m, depth + 1);
                 let kind = binding_kind(item);
@@ -915,6 +949,7 @@ fn resolve_path(m: i64, path: i64, count: i64, pos: i64) -> i64 {
                     continue;
                 }
                 err_begin(NODES[seg].start);
+                err_failed_name(name);
                 if i == 0 {
                     err_str(c"unknown module '");
                     err_sym(name);

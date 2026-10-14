@@ -458,12 +458,33 @@ function.
 *(0.5)* The compiler reports several errors at once, sorted by position (up
 to 50); the exit status is 1. After a syntax error the parser goes on at the
 next statement of the block (past its `;`, or up to the `}` that closes the
-block) or, outside a function, at the next item that starts a line; a
-program with syntax errors is not type-checked. The type checker goes on at
-the next statement of the function (or at the next function); the names a
-failed `let` binds have the error type, and errors that follow from it are
-not reported. An error in the declarations (struct fields, signatures,
-constants...) ends the checking. (0.4 stopped at the first error.)
+block) or, outside a function, at the next item that starts a line. The
+type checker goes on at the next statement of the function (or at the next
+function); the names a failed `let` binds have the error type, and errors
+that follow from it are not reported. (0.4 stopped at the first error.)
+
+*(0.10)* One compilation reports every error (up to 50), from every file
+of the program:
+
+- A program with syntax errors is type-checked too: every item that
+  parsed is checked, except the body of a function that had a syntax
+  error (its signature is). An item the parser skipped is unknown, and so
+  is what it declared: the errors saying so are not reported.
+- The declarations recover item by item, and within an item part by part
+  (a field's, a parameter's, the result's type...): a type that names
+  nothing is the error type; a duplicate (item, field, variant,
+  parameter, import, conflicting impl) is left out; a constant whose
+  initializer fails is 0; a cycle of fields is reported once and broken.
+  An import that fails, or a module whose file is missing, imports
+  nothing, and errors about its names are not reported. A function whose
+  impl block fails (an unknown trait or type) is left out.
+- An error in a C header is reported with the program's errors (at its
+  first `import`), and the program is checked without the headers.
+- An error in an instance of a generic function is reported once, with
+  the instantiation chain of the first instance that has it.
+- Errors print sorted by position (the files in the order they are
+  loaded); the same message at the same position is printed once. Only a
+  tokenizer error still ends the compilation at once.
 
 ## Additions of 0.4
 

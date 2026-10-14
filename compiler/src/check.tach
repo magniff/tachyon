@@ -3,8 +3,8 @@
 // type into an expression (literals, aggregates, branches, arithmetic
 // operands take it), `synth` computes a type from the expression alone.
 // Every expression node gets its type in `ty`: the expected type in check
-// mode, the computed one in synth mode. The first error ends the
-// compilation.
+// mode, the computed one in synth mode. After an error the checking goes
+// on (see "Recovery" below).
 //
 // Resolutions recorded on nodes:
 //   NodeKind::Ident  res = what it names, y = its index
@@ -18,15 +18,15 @@
 use std::Option;
 use crate::base::{
     ERR, ERR_HELP, IntVec, RECOVER_DEPTH, SYMS, _setjmp, buf_byte, buf_bytes, buf_int, buf_new,
-    buf_slice, buf_str, buf_uint, err_begin, err_end, err_help, err_help_sym, err_int, err_str,
-    err_sym, error_at, exit_if_errors, grow, has_errors, intern, intern_c, recover_enter,
-    recover_leave, report_error_once,
+    buf_slice, buf_str, buf_uint, err_begin, err_end, err_end_soft, err_failed_name, err_help,
+    err_help_sym, err_int, err_str, err_sym, error_at, error_at_soft, exit_if_errors, grow, intern,
+    intern_c, recover_enter, recover_leave, report_error_once,
 };
 use crate::fixunsafe::{FIX_UNSAFE, note_unsafe_site};
 use crate::traits::{
     SYM_TRAIT, add_trait, binary_op_trait, bounded_param, bounded_param_of_type,
-    builtin_type_symbol, check_impl_signatures, collect_impls, impl_of_fn, init_traits,
-    negation_call, operator_call, require_in_bounds, std_trait, has_impl,
+    builtin_type_symbol, check_impl_signatures, collect_impl, collect_impls, impl_of_fn, init_traits,
+    negation_call, operator_call, require_in_bounds, std_trait, has_impl, trait_named,
 };
 use crate::fiximports::report_legacy_imports;
 use crate::lexer::{
@@ -36,7 +36,7 @@ use crate::lexer::{
 use crate::cimport::c_import_skip_reason;
 use crate::ast::{
     ARM_SYNTHETIC, BLOCK_UNSAFE, NODE_RAW, VK_LANE, VK_LOAD, VK_NEW, VK_SELECT, VK_SPLAT, VK_STORE, VK_SUM,
-    VK_WITH, FN_COLD, FN_INLINE, FN_NO_INLINE, FN_UNSAFE, NODES, REPR_C, REPR_INT,
+    VK_WITH, FN_BODY_FAILED, FN_COLD, FN_SIG_FAILED, FN_INLINE, FN_NO_INLINE, FN_UNSAFE, NODES, REPR_C, REPR_INT,
     REPR_UNION, SCRATCH,
     child, list_begin, list_end, list_push, new_node,
 };
@@ -46,7 +46,7 @@ use crate::modules::{
     STD_MODULE,
     SYM_CRATE, SYM_STD, SYM_SUPER, access_error, binding, binding_kind, binding_value, child_module,
     collect_uses, init_modules, item_symbol, join_sym, lookup_name, lookup_quiet, module_of,
-    note_c_use, path_module, qualify, resolve_all_uses,
+    note_c_use, path_module, qualify, resolve_all_uses, resolve_use_of,
 };
 use crate::types::{
     ALIAS_BUSY, ALIAS_TYPE, CONSTS, CONST_CAP, CONST_COUNT, ConstInfo, ENUMS, ENUM_CAP, ENUM_COUNT,
@@ -63,7 +63,7 @@ use crate::types::{
     variant_field, is_vector, is_float_vector, vec_elem, vec_lanes, vec_mask_type,
 };
 use crate::consteval::{
-    check_const_expr, const_emit, const_eval, const_value, eval_array_len, wrap_int,
+    check_const_expr, const_emit, const_eval, const_value, const_value_of, eval_array_len, wrap_int,
 };
 use crate::patterns::{OR_MODE, check_irrefutable, check_match, check_pattern};
 use crate::generics::{
@@ -341,17 +341,16 @@ pub fn check_program(program: i64) {
         SELF_SYM = intern_c(c"self");
         init_modules();
         init_traits();
-        // The declarations, one phase after the other (see collect_phase).
+        // The declarations, one phase after the other (see collect_phase),
+        // then every function body, whatever errors the declarations had
+        // (0.10: what failed in them is the error type, or left out).
         for phase in 0..PHASE_COUNT {
             collect_phase(phase);
         }
-        if has_errors() {
-            report_legacy_imports(false);
-        }
-        exit_if_errors();
         for i in 0..NODES[program].count {
             let item = child(program, i);
-            if NODES[item].kind == Fn && FNS[NODES[item].x - 1].generic == 0 {
+            // (x is 0 for a function left out by its declaration's error)
+            if NODES[item].kind == Fn && NODES[item].x != 0 && FNS[NODES[item].x - 1].generic == 0 {
                 check_function_recovering(item);
             }
         }
@@ -371,8 +370,8 @@ pub fn check_program(program: i64) {
 
 const PHASE_COUNT: i64 = 14;
 
-// One phase of the declarations; its first error ends the checking (the
-// errors of function bodies, checked after, are reported together).
+// One phase of the declarations. Each item recovers from its errors on
+// its own (see attempt); an error none of them catches ends the checking.
 fn collect_phase(phase: i64) {
     let depth = RECOVER_DEPTH;
     let state = save_check_state();
@@ -403,6 +402,11 @@ fn collect_phase(phase: i64) {
 }
 
 fn check_function_recovering(item: i64) {
+    // (not a function whose body had a syntax error, or whose declaration
+    // failed)
+    if unsafe { (NODES[item].p & (FN_BODY_FAILED | FN_SIG_FAILED)) != 0 } {
+        return;
+    }
     let depth = RECOVER_DEPTH;
     let state = save_check_state();
     if unsafe { _setjmp(recover_enter()) == 0 } {
@@ -450,6 +454,78 @@ fn restore_check_state(s: CheckState) {
     WRAP_NODE = s.wrap;
     OR_MODE = false;
     UNIFY_SELF = 0;
+}
+
+// ---- Recovery (0.10) ----
+//
+// The declarations recover from errors item by item, and the parts of an
+// item one by one (a field's, a parameter's type...): what failed becomes
+// the error type (an unresolvable type) or is left out (a duplicate), and
+// the errors that would follow from it are not reported. The function
+// bodies recover statement by statement (see check_block); a function
+// whose body had a syntax error, or whose declaration failed, is not
+// checked.
+
+// What `attempt` does.
+pub enum Try { Name, Type, Method, Static, Const, Use, Impl, Bound, Discr }
+
+// The result of the attempt that went through.
+pub static mut TRY_RESULT: i64 = 0;
+
+// Does `what` for `arg` with a recovery point: whether it went through
+// (an error was recorded otherwise, and the checker's state is as it was).
+pub fn attempt(what: Try, arg: i64) -> bool {
+    let depth = RECOVER_DEPTH;
+    let state = save_check_state();
+    let mut ok = true;
+    if unsafe { _setjmp(recover_enter()) == 0 } {
+        match what {
+            Try::Name => collect_name(arg),
+            Try::Type => TRY_RESULT = resolve_type(arg),
+            Try::Method => collect_method(arg),
+            Try::Static => check_static(arg),
+            Try::Const => const_value_of(arg),
+            Try::Use => resolve_use_of(arg),
+            Try::Impl => collect_impl(arg),
+            Try::Bound => TRY_RESULT = trait_named(arg),
+            Try::Discr => TRY_RESULT = eval_discriminant(arg),
+        }
+    } else {
+        restore_check_state(state);
+        ok = false;
+    }
+    recover_leave(depth);
+    ok
+}
+
+// The type node n names; the error type (an error recorded) when it
+// names none.
+pub fn resolve_type_or_error(n: i64) -> i64 {
+    if attempt(Try::Type, n) { TRY_RESULT } else { TY_ERROR }
+}
+
+// Whether type t is or holds the error type (a type that failed).
+pub fn has_error_type(t: i64) -> bool {
+    unsafe {
+        if t == TY_ERROR {
+            return true;
+        }
+        let kind = TYPES[t].kind;
+        if kind == TyKind::Ptr || kind == TyKind::Slice || kind == TyKind::Array {
+            return has_error_type(TYPES[t].a);
+        }
+        if kind == TyKind::Fn && has_error_type(TYPES[t].a) {
+            return true;
+        }
+        if kind == TyKind::Tuple || kind == TyKind::Fn {
+            for i in 0..TYPES[t].count {
+                if has_error_type(type_elem(t, i)) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
 }
 
 // After an error in statement `stmt`: the names its `let` binds stand for
@@ -512,111 +588,118 @@ fn duplicate_error(item: i64, kind: *u8) -> ! {
 fn collect_names() {
     unsafe {
         for i in 0..NODES[PROGRAM].count {
-            let item = child(PROGRAM, i);
-            let mut kind = NODES[item].kind;
-            if kind == Impl {
-                continue;
-            }
-            if kind == Const && NODES[item].b != 0 && NODES[NODES[item].b].kind == TyArray {
-                // An array constant (0.9) is an immutable static: memory
-                // holding its elements.
-                NODES[item].kind = Static;
-                NODES[item].d = 0;
-                NODES[item].y = 0;
-                kind = Static;
-            }
-            let name = NODES[item].a;
-            let m = module_of(item);
-            if MODULES[m].is_c {
-                NODES[item].p |= ITEM_PUBLIC;
-            }
-            let key = qualify(m, name);
-            match kind {
-                Struct | TypeAlias | Enum => {
-                    if SYM_STRUCT[key] != 0 || SYM_ENUM[key] != 0 || SYM_ALIAS[key] != 0
-                        || SYM_PRIMITIVE[name] != 0 || name == SELF_TYPE_SYM {
-                        duplicate_error(item, match kind {
-                            Struct => c"struct",
-                            Enum => c"enum",
-                            _ => c"type",
-                        });
-                    }
-                    match kind {
-                        Struct => add_struct(item, key, m),
-                        Enum => add_enum(item, key, m),
-                        _ => SYM_ALIAS[key] = item,
-                    }
-                    SYM_ITEM[key] = item;
-                    continue;
+            attempt(Try::Name, child(PROGRAM, i));
+        }
+    }
+}
+
+// The name item declares (a duplicate is left out: a function's x stays
+// 0).
+fn collect_name(item: i64) {
+    unsafe {
+        let mut kind = NODES[item].kind;
+        if kind == Impl {
+            return;
+        }
+        if kind == Const && NODES[item].b != 0 && NODES[NODES[item].b].kind == TyArray {
+            // An array constant (0.9) is an immutable static: memory
+            // holding its elements.
+            NODES[item].kind = Static;
+            NODES[item].d = 0;
+            NODES[item].y = 0;
+            kind = Static;
+        }
+        let name = NODES[item].a;
+        let m = module_of(item);
+        if MODULES[m].is_c {
+            NODES[item].p |= ITEM_PUBLIC;
+        }
+        let key = qualify(m, name);
+        match kind {
+            Struct | TypeAlias | Enum => {
+                if SYM_STRUCT[key] != 0 || SYM_ENUM[key] != 0 || SYM_ALIAS[key] != 0
+                    || SYM_PRIMITIVE[name] != 0 || name == SELF_TYPE_SYM {
+                    duplicate_error(item, match kind {
+                        Struct => c"struct",
+                        Enum => c"enum",
+                        _ => c"type",
+                    });
                 }
-                Use => continue,
-                Trait => {
-                    if item_node_of(key) != 0 || SYM_PRIMITIVE[name] != 0 {
-                        duplicate_error(item, c"name");
-                    }
-                    SYM_ITEM[key] = item;
-                    add_trait(item, key, m);
-                    continue;
-                }
-                Mod => {
-                    if item_node_of(key) != 0 {
-                        duplicate_error(item, c"name");
-                    }
-                    continue;
-                }
-                Fn if NODES[item].d != 0 => {
-                    // A method or associated function: found through METHODS
-                    // (see collect_methods), which also names it.
-                    add_fn(item, name, name);
-                    continue;
-                }
-                _ => {}
-            }
-            if SYM_FN[key] != 0 || SYM_CONST[key] != 0 || SYM_STATIC[key] != 0 {
                 match kind {
-                    Const => duplicate_error(item, c"constant"),
-                    Static => duplicate_error(item, c"static"),
-                    _ => duplicate_error(item, c"function"),
+                    Struct => add_struct(item, key, m),
+                    Enum => add_enum(item, key, m),
+                    _ => SYM_ALIAS[key] = item,
                 }
+                SYM_ITEM[key] = item;
+                return;
             }
-            if child_module(m, name) >= 0 {
-                duplicate_error(item, c"name (a module has it)");
+            Use => return,
+            Trait => {
+                if item_node_of(key) != 0 || SYM_PRIMITIVE[name] != 0 {
+                    duplicate_error(item, c"name");
+                }
+                SYM_ITEM[key] = item;
+                add_trait(item, key, m);
+                return;
             }
-            if name == intern_c(c"size_of") || name == intern_c(c"align_of") {
-                name_error(NODES[item].start, c"'", name, c"' is a builtin (size_of(T) and align_of(T)); choose another name");
+            Mod => {
+                if item_node_of(key) != 0 {
+                    duplicate_error(item, c"name");
+                }
+                return;
             }
-            SYM_ITEM[key] = item;
+            Fn if NODES[item].d != 0 => {
+                // A method or associated function: found through METHODS
+                // (see collect_methods), which also names it.
+                add_fn(item, name, name);
+                return;
+            }
+            _ => {}
+        }
+        if SYM_FN[key] != 0 || SYM_CONST[key] != 0 || SYM_STATIC[key] != 0 {
             match kind {
-                Fn | ExternFn => {
-                    // C functions and `extern "C" fn` definitions keep their
-                    // names as symbols; others are prefixed by their module.
-                    let c_name = kind == ExternFn || NODES[item].y != 0;
-                    add_fn(item, if c_name { name } else { item_symbol(m, name) }, key);
-                    SYM_FN[key] = FN_COUNT;
-                }
-                Const => {
-                    CONSTS = grow(CONSTS, CONST_COUNT, &CONST_CAP);
-                    CONSTS[CONST_COUNT] = ConstInfo { node: item, ty: 0, value: 0, state: 0 };
-                    CONST_COUNT += 1;
-                    SYM_CONST[key] = CONST_COUNT;
-                }
-                Static => {
-                    STATICS = grow(STATICS, STATIC_COUNT, &STATIC_CAP);
-                    STATICS[STATIC_COUNT] = StaticInfo {
-                        node: item, ty: 0, mutable: NODES[item].d != 0, linkage: NODES[item].y,
-                    };
-                    STATIC_COUNT += 1;
-                    SYM_STATIC[key] = STATIC_COUNT;
-                    // The static's symbol (its name for C, prefixed by its
-                    // module otherwise) is its item's name from now on, and
-                    // also finds it (the code generators look statics up by
-                    // symbol).
-                    let sym = if NODES[item].y != 0 { name } else { item_symbol(m, name) };
-                    SYM_STATIC[sym] = STATIC_COUNT;
-                    NODES[item].a = sym;
-                }
-                _ => {}
+                Const => duplicate_error(item, c"constant"),
+                Static => duplicate_error(item, c"static"),
+                _ => duplicate_error(item, c"function"),
             }
+        }
+        if child_module(m, name) >= 0 {
+            duplicate_error(item, c"name (a module has it)");
+        }
+        if name == intern_c(c"size_of") || name == intern_c(c"align_of") {
+            name_error(NODES[item].start, c"'", name, c"' is a builtin (size_of(T) and align_of(T)); choose another name");
+        }
+        SYM_ITEM[key] = item;
+        match kind {
+            Fn | ExternFn => {
+                // C functions and `extern "C" fn` definitions keep their
+                // names as symbols; others are prefixed by their module.
+                let c_name = kind == ExternFn || NODES[item].y != 0;
+                add_fn(item, if c_name { name } else { item_symbol(m, name) }, key);
+                SYM_FN[key] = FN_COUNT;
+            }
+            Const => {
+                CONSTS = grow(CONSTS, CONST_COUNT, &CONST_CAP);
+                CONSTS[CONST_COUNT] = ConstInfo { node: item, ty: 0, value: 0, state: 0 };
+                CONST_COUNT += 1;
+                SYM_CONST[key] = CONST_COUNT;
+            }
+            Static => {
+                STATICS = grow(STATICS, STATIC_COUNT, &STATIC_CAP);
+                STATICS[STATIC_COUNT] = StaticInfo {
+                    node: item, ty: 0, mutable: NODES[item].d != 0, linkage: NODES[item].y,
+                };
+                STATIC_COUNT += 1;
+                SYM_STATIC[key] = STATIC_COUNT;
+                // The static's symbol (its name for C, prefixed by its
+                // module otherwise) is its item's name from now on, and
+                // also finds it (the code generators look statics up by
+                // symbol).
+                let sym = if NODES[item].y != 0 { name } else { item_symbol(m, name) };
+                SYM_STATIC[sym] = STATIC_COUNT;
+                NODES[item].a = sym;
+            }
+            _ => {}
         }
     }
 }
@@ -710,7 +793,7 @@ fn collect_const_types() {
         for c in 0..CONST_COUNT {
             let item = CONSTS[c].node;
             CUR_MOD = module_of(item);
-            let ty = resolve_type(NODES[item].b);
+            let mut ty = resolve_type_or_error(NODES[item].b);
             // 0.4: fieldless enums, and C strings (`const S: *u8 = c"...";`).
             let string = is_pointer(ty) && NODES[NODES[item].c].kind == CStr;
             if !(is_numeric(ty) || ty == TY_BOOL || is_fieldless_enum(ty) || string) {
@@ -720,7 +803,8 @@ fn collect_const_types() {
                 err_str(c"' has type '");
                 err_type(ty);
                 err_str(c"'; constants must be integers, floats or bool");
-                err_end();
+                err_end_soft();
+                ty = TY_ERROR;
             }
             CONSTS[c].ty = ty;
         }
@@ -755,10 +839,11 @@ pub fn collect_struct_fields(s: i64) {
                     err_str(c"' in struct '");
                     err_sym(NODES[item].a);
                     err_str(c"'");
-                    err_end();
+                    err_end_soft();
+                    break;
                 }
             }
-            let ty = resolve_type(NODES[field].b);
+            let ty = resolve_type_or_error(NODES[field].b);
             TSCRATCH.push(ty);
         }
         // Instances made while resolving the types added fields of their own:
@@ -815,22 +900,24 @@ pub fn collect_enum_variants(e: i64) {
                     err_str(c"' in enum '");
                     err_sym(NODES[item].a);
                     err_str(c"'");
-                    err_end();
+                    err_end_soft();
+                    break;
                 }
             }
             if NODES[node].c != 0 && NODES[node].count == 0 {
-                type_error(node, c"a tuple variant needs at least one field; write the variant without '()'");
+                error_at_soft(NODES[node].start, c"a tuple variant needs at least one field; write the variant without '()'");
             }
             for k in 0..NODES[node].count {
-                let ty = resolve_type(child(node, k));
+                let ty = resolve_type_or_error(child(node, k));
                 TSCRATCH.push(ty);
             }
             let mut discr = next;
             if NODES[node].b != 0 {
                 if has_fields {
-                    type_error(NODES[node].b, c"explicit discriminants are only allowed in enums without fields");
+                    error_at_soft(NODES[NODES[node].b].start, c"explicit discriminants are only allowed in enums without fields");
+                } else if attempt(Try::Discr, NODES[node].b) {
+                    discr = TRY_RESULT;
                 }
-                discr = eval_discriminant(NODES[node].b);
             }
             for j in 0..i {
                 if discrs.data[j] == discr {
@@ -842,7 +929,8 @@ pub fn collect_enum_variants(e: i64) {
                     err_str(c"' is already used by '");
                     err_sym(NODES[child(item, j)].a);
                     err_str(c"'");
-                    err_end();
+                    err_end_soft();
+                    break;
                 }
             }
             discrs.push(discr);
@@ -909,7 +997,7 @@ fn enum_tag_type(e: i64, item: i64, low: i64, high: i64) -> i64 {
             err_str(c"' do not fit its tag type '");
             err_type(tag);
             err_str(c"'");
-            err_end();
+            err_end_soft();
         }
         tag
     }
@@ -953,78 +1041,89 @@ fn collect_methods() {
     unsafe {
         for f in 0..FN_COUNT {
             let item = FNS[f].node;
-            let self_node = NODES[item].h;
-            if FNS[f].is_extern || self_node == 0 {
+            if FNS[f].is_extern || NODES[item].h == 0 || (NODES[item].p & FN_SIG_FAILED) != 0 {
                 continue;
             }
-            CUR_MOD = FNS[f].module;
-            let name = NODES[item].a;
-            let tpl = impl_template(item);
-            if tpl != TPL_NONE {
-                for i in 0..GMETHOD_COUNT {
-                    if GMETHODS[i].ty == tpl && GMETHODS[i].name == name {
-                        err_begin(NODES[item].start);
-                        err_str(c"duplicate method '");
-                        err_sym(name);
-                        err_str(c"' for type '");
-                        err_sym(template_name(tpl));
-                        err_str(c"'");
-                        err_end();
-                    }
-                }
-                if tpl < 0 && template_variant_named(-tpl - 1, name) {
-                    variant_and_method_error(item, template_name(tpl));
-                }
-                GMETHODS = grow(GMETHODS, GMETHOD_COUNT, &GMETHOD_CAP);
-                GMETHODS[GMETHOD_COUNT] = MethodInfo { ty: tpl, name: name, f: f };
-                GMETHOD_COUNT += 1;
-                let base = if tpl > 0 { STRUCTS[tpl - 1].sym } else { ENUMS[-tpl - 1].sym };
-                FNS[f].name = method_symbol(base, name);
-                FNS[f].display = join_sym(template_name(tpl), c"::", name);
-                continue;
+            if !attempt(Try::Method, f) {
+                // (its Self is unknown: neither its signature nor its body
+                // is checked)
+                NODES[item].p |= FN_SIG_FAILED;
             }
-            if NODES[self_node].kind == TyName && NODES[self_node].count == 0 && NODES[self_node].g == 0
-                && type_name_key(self_node) < 0
-                && SYM_PRIMITIVE[NODES[self_node].a] == 0 && env_lookup(NODES[self_node].a) == 0 {
-                name_error(NODES[item].start, c"impl for unknown type '", NODES[self_node].a, c"'");
-            }
-            let t = resolve_type(self_node);
-            let kind = TYPES[t].kind;
-            if kind != TyKind::Struct && kind != TyKind::Enum && impl_of_fn(f) < 0 {
-                err_begin(NODES[item].start);
-                err_str(c"impl blocks are only allowed for structs and enums, not '");
-                err_type(t);
-                err_str(c"'");
-                err_end();
-            }
-            if find_method(t, name) >= 0 {
-                err_begin(NODES[item].start);
-                err_str(c"duplicate method '");
-                err_sym(name);
-                err_str(c"' for type '");
-                err_type(t);
-                err_str(c"'");
-                err_end();
-            }
-            if kind == TyKind::Enum && find_variant(TYPES[t].a, name) >= 0 {
-                let out = buf_new();
-                buf_type(out, t);
-                variant_and_method_error(item, intern(buf_slice(out)));
-            }
-            if FNS[f].generic == 0 {
-                FNS[f].self_ty = t;
-            }
-            FNS[f].name = method_symbol(type_symbol(t), name);
-            let out = buf_new();
-            buf_type(out, t);
-            buf_str(out, c"::");
-            buf_bytes(out, SYMS[name].text);
-            FNS[f].display = intern(buf_slice(out));
-            METHODS = grow(METHODS, METHOD_COUNT, &METHOD_CAP);
-            METHODS[METHOD_COUNT] = MethodInfo { ty: t, name: name, f: f };
-            METHOD_COUNT += 1;
         }
         CUR_MOD = 0;
+    }
+}
+
+fn collect_method(f: i64) {
+    unsafe {
+        let item = FNS[f].node;
+        let self_node = NODES[item].h;
+        CUR_MOD = FNS[f].module;
+        let name = NODES[item].a;
+        let tpl = impl_template(item);
+        if tpl != TPL_NONE {
+            for i in 0..GMETHOD_COUNT {
+                if GMETHODS[i].ty == tpl && GMETHODS[i].name == name {
+                    err_begin(NODES[item].start);
+                    err_str(c"duplicate method '");
+                    err_sym(name);
+                    err_str(c"' for type '");
+                    err_sym(template_name(tpl));
+                    err_str(c"'");
+                    err_end();
+                }
+            }
+            if tpl < 0 && template_variant_named(-tpl - 1, name) {
+                variant_and_method_error(item, template_name(tpl));
+            }
+            GMETHODS = grow(GMETHODS, GMETHOD_COUNT, &GMETHOD_CAP);
+            GMETHODS[GMETHOD_COUNT] = MethodInfo { ty: tpl, name: name, f: f };
+            GMETHOD_COUNT += 1;
+            let base = if tpl > 0 { STRUCTS[tpl - 1].sym } else { ENUMS[-tpl - 1].sym };
+            FNS[f].name = method_symbol(base, name);
+            FNS[f].display = join_sym(template_name(tpl), c"::", name);
+            return;
+        }
+        if NODES[self_node].kind == TyName && NODES[self_node].count == 0 && NODES[self_node].g == 0
+            && type_name_key(self_node) < 0
+            && SYM_PRIMITIVE[NODES[self_node].a] == 0 && env_lookup(NODES[self_node].a) == 0 {
+            name_error(NODES[item].start, c"impl for unknown type '", NODES[self_node].a, c"'");
+        }
+        let t = resolve_type(self_node);
+        let kind = TYPES[t].kind;
+        if kind != TyKind::Struct && kind != TyKind::Enum && impl_of_fn(f) < 0 {
+            err_begin(NODES[item].start);
+            err_str(c"impl blocks are only allowed for structs and enums, not '");
+            err_type(t);
+            err_str(c"'");
+            err_end();
+        }
+        if find_method(t, name) >= 0 {
+            err_begin(NODES[item].start);
+            err_str(c"duplicate method '");
+            err_sym(name);
+            err_str(c"' for type '");
+            err_type(t);
+            err_str(c"'");
+            err_end();
+        }
+        if kind == TyKind::Enum && find_variant(TYPES[t].a, name) >= 0 {
+            let out = buf_new();
+            buf_type(out, t);
+            variant_and_method_error(item, intern(buf_slice(out)));
+        }
+        if FNS[f].generic == 0 {
+            FNS[f].self_ty = t;
+        }
+        FNS[f].name = method_symbol(type_symbol(t), name);
+        let out = buf_new();
+        buf_type(out, t);
+        buf_str(out, c"::");
+        buf_bytes(out, SYMS[name].text);
+        FNS[f].display = intern(buf_slice(out));
+        METHODS = grow(METHODS, METHOD_COUNT, &METHOD_CAP);
+        METHODS[METHOD_COUNT] = MethodInfo { ty: t, name: name, f: f };
+        METHOD_COUNT += 1;
     }
 }
 
@@ -1135,82 +1234,135 @@ pub fn reset_layout_states() {
     }
 }
 
+// Each struct or enum on a cycle of fields is reported, and the cycle is
+// broken: its fields that hold it have the error type.
 fn check_struct_cycles() {
     unsafe {
         for s in 0..STRUCT_COUNT {
-            reset_layout_states();
-            if struct_has_cycle(s) {
-                err_begin(NODES[STRUCTS[s].node].start);
-                err_str(c"struct '");
-                err_sym(STRUCTS[s].name);
-                err_str(c"' has infinite size due to recursive field (use a pointer to break the cycle)");
-                err_end();
+            if STRUCTS[s].generic == 0 {
+                struct_cycle_error(s, NODES[STRUCTS[s].node].start);
             }
         }
         for e in 0..ENUM_COUNT {
-            reset_layout_states();
-            if enum_has_cycle(e) {
-                err_begin(NODES[ENUMS[e].node].start);
-                err_str(c"enum '");
-                err_sym(ENUMS[e].name);
-                err_str(c"' has infinite size due to a recursive field (use a pointer to break the cycle)");
-                err_end();
+            if ENUMS[e].generic == 0 {
+                enum_cycle_error(e, NODES[ENUMS[e].node].start);
             }
         }
     }
 }
 
-pub fn enum_has_cycle(e: i64) -> bool {
+// Reports (at pos) that struct s holds itself through its fields, and
+// breaks the cycle; whether it does.
+pub fn struct_cycle_error(s: i64, pos: i64) -> bool {
     unsafe {
-        if ENUMS[e].layout_state == 1 {
-            return true;
+        let mut found = false;
+        for i in 0..STRUCTS[s].field_count {
+            let field = struct_field(s, i);
+            reset_layout_states();
+            if holds((*field).ty, s + 1) {
+                (*field).ty = TY_ERROR;
+                found = true;
+            }
         }
-        ENUMS[e].layout_state = 1;
+        reset_layout_states();
+        if found {
+            err_begin(pos);
+            err_str(c"struct '");
+            err_sym(STRUCTS[s].name);
+            err_str(c"' has infinite size due to recursive field (use a pointer to break the cycle)");
+            err_end_soft();
+        }
+        found
+    }
+}
+
+pub fn enum_cycle_error(e: i64, pos: i64) -> bool {
+    unsafe {
+        let mut found = false;
         for i in 0..ENUMS[e].variant_count {
             let v = enum_variant(e, i);
             for k in 0..VARIANTS[v].field_count {
-                if embeds_cycle(variant_field(v, k)) {
-                    return true;
+                reset_layout_states();
+                if holds(variant_field(v, k), -(e + 1)) {
+                    TLISTS.data[VARIANTS[v].fields + k] = TY_ERROR;
+                    found = true;
                 }
             }
         }
-        ENUMS[e].layout_state = 0;
-        false
-    }
-}
-
-// layout_state: 1 while visiting.
-pub fn struct_has_cycle(s: i64) -> bool {
-    unsafe {
-        if STRUCTS[s].layout_state == 1 {
-            return true;
+        reset_layout_states();
+        if !found {
+            return false;
         }
-        STRUCTS[s].layout_state = 1;
-        for i in 0..STRUCTS[s].field_count {
-            if embeds_cycle((*struct_field(s, i)).ty) {
-                return true;
+        // (the variants' shapes hold their field types)
+        if ENUMS[e].has_fields {
+            let repr_c = (ENUMS[e].repr & REPR_C) != 0;
+            for i in 0..ENUMS[e].variant_count {
+                let v = enum_variant(e, i);
+                let mark = TSCRATCH.count;
+                if !repr_c {
+                    TSCRATCH.push(ENUMS[e].tag);
+                }
+                for k in 0..VARIANTS[v].field_count {
+                    TSCRATCH.push(variant_field(v, k));
+                }
+                VARIANTS[v].shape = make_type(TyKind::Tuple, 0, 0, mark);
             }
         }
-        STRUCTS[s].layout_state = 0;
-        false
+        err_begin(pos);
+        err_str(c"enum '");
+        err_sym(ENUMS[e].name);
+        err_str(c"' has infinite size due to a recursive field (use a pointer to break the cycle)");
+        err_end_soft();
+        true
     }
 }
 
-fn embeds_cycle(t: i64) -> bool {
+// Whether a value of type t holds the struct or enum `at` (struct s as
+// s + 1, enum e as -(e + 1)); layout_state 2 marks the ones seen.
+fn holds(t: i64, at: i64) -> bool {
     unsafe {
         let kind = TYPES[t].kind;
         if kind == TyKind::Struct {
-            return struct_has_cycle(TYPES[t].a);
+            let s = TYPES[t].a;
+            if s + 1 == at {
+                return true;
+            }
+            if STRUCTS[s].layout_state != 0 {
+                return false;
+            }
+            STRUCTS[s].layout_state = 2;
+            for i in 0..STRUCTS[s].field_count {
+                if holds((*struct_field(s, i)).ty, at) {
+                    return true;
+                }
+            }
+            return false;
         }
         if kind == TyKind::Enum {
-            return enum_has_cycle(TYPES[t].a);
+            let e = TYPES[t].a;
+            if -(e + 1) == at {
+                return true;
+            }
+            if ENUMS[e].layout_state != 0 {
+                return false;
+            }
+            ENUMS[e].layout_state = 2;
+            for i in 0..ENUMS[e].variant_count {
+                let v = enum_variant(e, i);
+                for k in 0..VARIANTS[v].field_count {
+                    if holds(variant_field(v, k), at) {
+                        return true;
+                    }
+                }
+            }
+            return false;
         }
         if kind == TyKind::Array {
-            return embeds_cycle(TYPES[t].a);
+            return holds(TYPES[t].a, at);
         }
         if kind == TyKind::Tuple {
             for i in 0..TYPES[t].count {
-                if embeds_cycle(type_elem(t, i)) {
+                if holds(type_elem(t, i), at) {
                     return true;
                 }
             }
@@ -1234,21 +1386,29 @@ fn collect_functions() {
 }
 
 // The parameter and result types of function f.
+// (A type that names nothing is the error type; 0.10. So are all of them
+// for a function whose declaration failed.)
 pub fn resolve_signature(f: i64) {
     unsafe {
         let item = FNS[f].node;
+        let failed = (NODES[item].p & FN_SIG_FAILED) != 0;
         let mark = TSCRATCH.count;
         for i in 0..NODES[item].count {
             let param = child(item, i);
             let name = NODES[param].a;
-            if name != UNDERSCORE {
+            if name != UNDERSCORE && !failed {
                 for j in 0..i {
                     if NODES[child(item, j)].a == name {
-                        name_error(NODES[param].start, c"duplicate parameter '", name, c"'");
+                        err_begin(NODES[param].start);
+                        err_str(c"duplicate parameter '");
+                        err_sym(name);
+                        err_str(c"'");
+                        err_end_soft();
+                        break;
                     }
                 }
             }
-            let ty = resolve_type(NODES[param].b);
+            let ty = if failed { TY_ERROR } else { resolve_type_or_error(NODES[param].b) };
             TSCRATCH.push(ty);
         }
         FNS[f].params = TLISTS.count;
@@ -1257,8 +1417,14 @@ pub fn resolve_signature(f: i64) {
             TLISTS.push(TSCRATCH.data[i]);
         }
         TSCRATCH.count = mark;
-        FNS[f].ret = if NODES[item].b == 0 { TY_UNIT } else { resolve_type(NODES[item].b) };
-        if FNS[f].is_extern || FNS[f].export {
+        FNS[f].ret = if failed {
+            TY_ERROR
+        } else if NODES[item].b == 0 {
+            TY_UNIT
+        } else {
+            resolve_type_or_error(NODES[item].b)
+        };
+        if (FNS[f].is_extern || FNS[f].export) && !failed {
             check_c_function(f);
         }
     }
@@ -1294,7 +1460,7 @@ fn check_c_signature(fn_ty: i64, n: i64, what: *u8) {
 
 fn check_ffi_type(t: i64, n: i64, what: *u8) {
     unsafe {
-        if is_ffi_safe(t) {
+        if is_ffi_safe(t) || has_error_type(t) {
             return;
         }
         err_begin(NODES[n].start);
@@ -1315,7 +1481,7 @@ fn check_ffi_type(t: i64, n: i64, what: *u8) {
         } else if kind == TyKind::Array {
             err_help(c"pass a pointer to its first element, or wrap it in a #[repr(C)] struct");
         }
-        err_end();
+        err_end_soft();
     }
 }
 
@@ -1324,26 +1490,36 @@ fn collect_statics() {
         for s in 0..STATIC_COUNT {
             let item = STATICS[s].node;
             CUR_MOD = module_of(item);
-            let ty = resolve_type(NODES[item].b);
+            let ty = resolve_type_or_error(NODES[item].b);
             STATICS[s].ty = ty;
             // A static shared with C is memory with C's layout: arrays of
             // FFI-safe types too (0.4).
             if STATICS[s].linkage != 0 && !is_ffi_field(ty) {
                 check_ffi_type(ty, NODES[item].b, c"static");
             }
-            if STATICS[s].linkage == 1 {
+            if STATICS[s].linkage == 1 || has_error_type(ty) {
                 continue;
             }
-            check_const_expr(NODES[item].c, ty);
-            if NODES[NODES[item].c].kind == CStr {
-                // A C string (0.4): the address of the literal.
-                continue;
-            }
-            // Evaluated now to report non-constant initializers; the code
-            // generator evaluates it again into the data section.
-            let scratch = buf_new();
-            const_emit(NODES[item].c, ty, scratch);
+            attempt(Try::Static, s);
         }
+        CUR_MOD = 0;
+    }
+}
+
+// The initializer of static s.
+fn check_static(s: i64) {
+    unsafe {
+        let item = STATICS[s].node;
+        let ty = STATICS[s].ty;
+        check_const_expr(NODES[item].c, ty);
+        if NODES[NODES[item].c].kind == CStr {
+            // A C string (0.4): the address of the literal.
+            return;
+        }
+        // Evaluated now to report non-constant initializers; the code
+        // generator evaluates it again into the data section.
+        let scratch = buf_new();
+        const_emit(NODES[item].c, ty, scratch);
     }
 }
 
@@ -1468,7 +1644,7 @@ fn generic_alias(key: i64, g: i64, pos: i64) -> i64 {
         TSCRATCH.count = mark;
         CUR_MOD = module_of(alias);
         ALIAS_BUSY[key] = 1;
-        let t = resolve_type(NODES[alias].b);
+        let t = resolve_type_or_error(NODES[alias].b);
         ALIAS_BUSY[key] = 0;
         CUR_MOD = saved_mod;
         TP_NAMES.count = TP_BASE;
@@ -1578,7 +1754,7 @@ fn resolve_alias(key: i64, pos: i64) -> i64 {
         ALIAS_BUSY[key] = 1;
         let saved = CUR_MOD;
         CUR_MOD = module_of(alias);
-        let resolved = resolve_type(NODES[alias].b);
+        let resolved = resolve_type_or_error(NODES[alias].b);
         CUR_MOD = saved;
         ALIAS_BUSY[key] = 0;
         ALIAS_TYPE[key] = resolved;
@@ -1829,7 +2005,9 @@ fn check_expr_inner(n: i64, expected: i64) -> i64 {
     if actual == TY_NEVER {
         return actual;
     }
-    if actual != expected {
+    // (a value of the error type, or one where it is expected, follows
+    // from an earlier error: nothing to report)
+    if actual != expected && actual != TY_ERROR && expected != TY_ERROR {
         mismatch_error(n, expected, actual);
     }
     expected
@@ -1947,7 +2125,7 @@ fn check_struct_fields(n: i64, expected: i64) -> i64 {
         let name = NODES[n].a;
         let mut s = struct_of_literal(n);
         if s < 0 {
-            name_error(NODES[n].start, c"unknown struct '", name, c"'");
+            unknown_name_error(NODES[n].start, c"unknown struct '", name);
         }
         if STRUCTS[s].generic > 0 {
             s = infer_struct_literal(s, n, expected);
@@ -2325,6 +2503,7 @@ pub fn unknown_name_error(pos: i64, before: *u8, name: i64) -> ! {
         err_str(before);
         err_sym(name);
         err_str(c"'");
+        err_failed_name(name);
         let reason = c_import_skip_reason(name);
         if reason != 0 as *u8 {
             err_help(c"'");
@@ -3605,6 +3784,7 @@ fn path_member_error(n: i64, t: i64, member: i64) -> ! {
             err_str(c"no associated function '");
         }
         err_sym(member);
+        err_failed_name(member);
         err_str(c"' in '");
         err_type(t);
         err_str(c"'");
@@ -3633,6 +3813,7 @@ fn synth_path_call(n: i64, callee: i64) -> i64 {
             err_begin(NODES[callee].start);
             err_str(c"no associated function '");
             err_sym(member);
+            err_failed_name(member);
             err_str(c"' for vector type '");
             err_type(vt);
             err_str(c"'");
@@ -3662,6 +3843,7 @@ fn synth_path_call(n: i64, callee: i64) -> i64 {
                     err_begin(NODES[callee].start);
                     err_str(c"no associated function '");
                     err_sym(member);
+                    err_failed_name(member);
                     err_str(c"' in '");
                     err_sym(template_name(tpl));
                     err_str(c"'");
@@ -3770,6 +3952,7 @@ fn synth_method(n: i64) -> i64 {
             err_begin(NODES[n].start);
             err_str(c"no method '");
             err_sym(name);
+            err_failed_name(name);
             err_str(c"' on type '");
             err_type(receiver_ty);
             err_str(c"'");
@@ -3905,6 +4088,7 @@ fn vector_method(n: i64, name: i64, vt: i64) -> i64 {
         err_begin(NODES[n].start);
         err_str(c"no method '");
         err_sym(name);
+        err_failed_name(name);
         err_str(c"' on vector type '");
         err_type(vt);
         err_str(c"'");

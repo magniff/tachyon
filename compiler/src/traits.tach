@@ -26,8 +26,8 @@
 // There are no trait objects (`dyn`): dispatch is static.
 
 use crate::base::{
-    IntVec, buf_byte, buf_new, buf_slice, err_begin, err_end, err_help,
-    err_help_sym, err_str, err_sym, grow, intern, intern_c, sym_table,
+    IntVec, buf_byte, buf_new, buf_slice, err_begin, err_end, err_end_soft, err_help,
+    err_help_sym, err_str, err_sym, fail_name, grow, intern, intern_c, sym_table,
 };
 use crate::ast::{NODES, NodeKind, child, list_begin, list_end, list_push, new_node};
 use crate::lexer::{SUF_NONE, Tok};
@@ -37,9 +37,11 @@ use crate::types::{
     err_type, fn_param, is_fieldless_enum, is_numeric, is_pointer, make_type,
 };
 use crate::check::{
-    PROGRAM, SELF_TYPE, add_fn, eq_unsupported, push_scope, pop_scope, resolve_type,
-    synth_expr, template_of_type_node, type_name_key,
+    PROGRAM, SELF_TYPE, TRY_RESULT, Try, add_fn, attempt, eq_unsupported, has_error_type,
+    push_scope, pop_scope, resolve_type, resolve_type_or_error, synth_expr, template_of_type_node,
+    type_name_key,
 };
+use crate::ast::FN_SIG_FAILED;
 use crate::patterns::check_pattern;
 use crate::generics::{CUR_INST, TPL_NONE, clone_node, instance_of, instance_targs, mangle_type};
 
@@ -85,7 +87,7 @@ pub fn impl_of_fn(f: i64) -> i64 {
 }
 
 // The trait named by type node n (in module CUR_MOD).
-fn trait_named(n: i64) -> i64 {
+pub fn trait_named(n: i64) -> i64 {
     unsafe {
         let key = if NODES[n].kind == NodeKind::TyName && NODES[n].g == 0 { type_name_key(n) } else { -1 };
         if key < 0 || SYM_TRAIT[key] == 0 {
@@ -104,21 +106,25 @@ fn trait_named(n: i64) -> i64 {
 }
 
 // The trait of bound node b (a TyName in a parameter's bounds), resolved
-// in its own module once.
+// in its own module once; -1 when it names none (0.10: an error recorded,
+// and the bound holds for every type).
 pub fn bound_trait(b: i64) -> i64 {
     unsafe {
         if NODES[b].x == 0 {
             let saved = CUR_MOD;
             CUR_MOD = module_of(b);
-            NODES[b].x = trait_named(b) + 1;
+            NODES[b].x = if attempt(Try::Bound, b) { TRY_RESULT + 1 } else { -1 };
             CUR_MOD = saved;
         }
-        NODES[b].x - 1
+        if NODES[b].x < 0 { -1 } else { NODES[b].x - 1 }
     }
 }
 
 // The function of trait tr named `name` (a Fn node), or 0.
 fn trait_fn(tr: i64, name: i64) -> i64 {
+    if tr < 0 {
+        return 0;
+    }
     unsafe {
         let node = TRAITS[tr].node;
         for i in 0..NODES[node].count {
@@ -131,7 +137,7 @@ fn trait_fn(tr: i64, name: i64) -> i64 {
 }
 
 pub fn trait_declares(tr: i64, name: i64) -> bool {
-    trait_fn(tr, name) != 0
+    tr < 0 || trait_fn(tr, name) != 0
 }
 
 // `impl<A> Tr for T<A>`: the impl's parameters, then f's own.
@@ -157,7 +163,7 @@ fn impl_is_generic(node: i64) -> bool {
     unsafe { NODES[node].g != 0 && NODES[NODES[node].g].count > 0 }
 }
 
-fn impl_type_error(node: i64, before: *u8, tr: i64, after: *u8) -> ! {
+fn impl_type_error(node: i64, before: *u8, tr: i64, after: *u8) {
     unsafe {
         err_begin(NODES[node].start);
         err_str(before);
@@ -171,7 +177,7 @@ fn impl_type_error(node: i64, before: *u8, tr: i64, after: *u8) -> ! {
         }
         err_str(c"'");
         err_str(after);
-        err_end()
+        err_end_soft();
     }
 }
 
@@ -197,104 +203,128 @@ pub fn collect_impls() {
                 }
             }
         }
-        let mut extra = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        IMPL_EXTRA.count = 0;
         for k in 0..NODES[PROGRAM].count {
             let node = child(PROGRAM, k);
             if NODES[node].kind != NodeKind::Impl {
                 continue;
             }
-            let m = module_of(node);
-            CUR_MOD = m;
-            let tr = trait_named(NODES[node].a);
-            let mut ty = 0;
-            let mut tpl = TPL_NONE;
-            if impl_is_generic(node) {
-                tpl = template_of_type_node(NODES[node].b);
-                if tpl == TPL_NONE {
-                    err_begin(NODES[NODES[node].b].start);
-                    err_str(c"a generic impl is for a generic struct or enum, with the impl's parameters as its arguments: 'impl<T> Hash for Vec<T>'");
-                    err_end();
+            if !attempt(Try::Impl, node) {
+                // (its trait or type is unknown: its functions are left out)
+                for i in 0..NODES[node].count {
+                    let f = child(node, i);
+                    NODES[f].p |= FN_SIG_FAILED;
+                    fail_name(NODES[f].a);
                 }
-            } else {
-                ty = resolve_type(NODES[node].b);
-            }
-            IMPLS = grow(IMPLS, IMPL_COUNT, &IMPL_CAP);
-            IMPLS[IMPL_COUNT] = ImplInfo { node: node, tr: tr, ty: ty, tpl: tpl, module: m };
-            IMPL_COUNT += 1;
-            let me = IMPL_COUNT - 1;
-            // Coherence: one impl per (trait, type).
-            for j in 0..me {
-                if IMPLS[j].tr != tr {
-                    continue;
-                }
-                let same = (ty != 0 && IMPLS[j].ty == ty) || (tpl != TPL_NONE && IMPLS[j].tpl == tpl)
-                    || (ty != 0 && IMPLS[j].tpl != TPL_NONE && instance_of(ty, IMPLS[j].tpl))
-                    || (tpl != TPL_NONE && IMPLS[j].ty != 0 && instance_of(IMPLS[j].ty, tpl));
-                if same {
-                    impl_type_error(node, c"conflicting impls of trait '", tr, c" (one impl per trait and type)");
-                }
-            }
-            // Its functions: each one of the trait's.
-            for i in 0..NODES[node].count {
-                let f = child(node, i);
-                set_fn_impl(NODES[f].x - 1, me);
-                if trait_fn(tr, NODES[f].a) == 0 {
-                    err_begin(NODES[f].start);
-                    err_str(c"'");
-                    err_sym(NODES[f].a);
-                    err_str(c"' is not a function of trait '");
-                    err_sym(TRAITS[tr].name);
-                    err_str(c"'");
-                    err_end();
-                }
-            }
-            // The trait's functions it leaves out: their defaults.
-            let tnode = TRAITS[tr].node;
-            for i in 0..NODES[tnode].count {
-                let decl = child(tnode, i);
-                let mut found = false;
-                for j in 0..NODES[node].count {
-                    if NODES[child(node, j)].a == NODES[decl].a {
-                        found = true;
-                    }
-                }
-                if found {
-                    continue;
-                }
-                if NODES[decl].c == 0 {
-                    err_begin(NODES[node].start);
-                    err_str(c"the impl of trait '");
-                    err_sym(TRAITS[tr].name);
-                    err_str(c"' is missing '");
-                    err_sym(NODES[decl].a);
-                    err_str(c"'");
-                    err_help(c"it has no default: write it in the impl");
-                    err_end();
-                }
-                let f = clone_node(decl);
-                NODES[f].d = if NODES[NODES[node].b].kind == NodeKind::TyName { NODES[NODES[node].b].a } else { intern_c(c"_") };
-                NODES[f].h = NODES[node].b;
-                if impl_is_generic(node) {
-                    NODES[f].g = merged_generics(NODES[node].g, NODES[f].g);
-                }
-                NODES[f].p |= 1;
-                add_fn(f, NODES[f].a, NODES[f].a);
-                // (checked in the impl's module, as if written there)
-                FNS[FN_COUNT - 1].module = m;
-                set_fn_impl(FN_COUNT - 1, me);
-                extra.push(f);
             }
         }
         CUR_MOD = 0;
-        if extra.count > 0 {
+        if IMPL_EXTRA.count > 0 {
             let mark = list_begin();
             for i in 0..NODES[PROGRAM].count {
                 list_push(child(PROGRAM, i));
             }
-            for i in 0..extra.count {
-                list_push(extra.data[i]);
+            for i in 0..IMPL_EXTRA.count {
+                list_push(IMPL_EXTRA.data[i]);
             }
             list_end(PROGRAM, mark);
+        }
+    }
+}
+
+// The trait's functions impls leave out, copied into them.
+static mut IMPL_EXTRA: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// Impl block `node`.
+pub fn collect_impl(node: i64) {
+    unsafe {
+        let m = module_of(node);
+        CUR_MOD = m;
+        let tr = trait_named(NODES[node].a);
+        let mut ty = 0;
+        let mut tpl = TPL_NONE;
+        if impl_is_generic(node) {
+            tpl = template_of_type_node(NODES[node].b);
+            if tpl == TPL_NONE {
+                err_begin(NODES[NODES[node].b].start);
+                err_str(c"a generic impl is for a generic struct or enum, with the impl's parameters as its arguments: 'impl<T> Hash for Vec<T>'");
+                err_end();
+            }
+        } else {
+            ty = resolve_type(NODES[node].b);
+        }
+        IMPLS = grow(IMPLS, IMPL_COUNT, &IMPL_CAP);
+        IMPLS[IMPL_COUNT] = ImplInfo { node: node, tr: tr, ty: ty, tpl: tpl, module: m };
+        IMPL_COUNT += 1;
+        let me = IMPL_COUNT - 1;
+        // Coherence: one impl per (trait, type).
+        for j in 0..me {
+            if IMPLS[j].tr != tr {
+                continue;
+            }
+            let same = (ty != 0 && IMPLS[j].ty == ty) || (tpl != TPL_NONE && IMPLS[j].tpl == tpl)
+                || (ty != 0 && IMPLS[j].tpl != TPL_NONE && instance_of(ty, IMPLS[j].tpl))
+                || (tpl != TPL_NONE && IMPLS[j].ty != 0 && instance_of(IMPLS[j].ty, tpl));
+            if same {
+                impl_type_error(node, c"conflicting impls of trait '", tr, c" (one impl per trait and type)");
+                // (its functions are left out: the first impl's are the
+                // type's)
+                for i in 0..NODES[node].count {
+                    NODES[child(node, i)].p |= FN_SIG_FAILED;
+                }
+                return;
+            }
+        }
+        // Its functions: each one of the trait's.
+        for i in 0..NODES[node].count {
+            let f = child(node, i);
+            set_fn_impl(NODES[f].x - 1, me);
+            if trait_fn(tr, NODES[f].a) == 0 {
+                err_begin(NODES[f].start);
+                err_str(c"'");
+                err_sym(NODES[f].a);
+                err_str(c"' is not a function of trait '");
+                err_sym(TRAITS[tr].name);
+                err_str(c"'");
+                err_end_soft();
+            }
+        }
+        // The trait's functions it leaves out: their defaults.
+        let tnode = TRAITS[tr].node;
+        for i in 0..NODES[tnode].count {
+            let decl = child(tnode, i);
+            let mut found = false;
+            for j in 0..NODES[node].count {
+                if NODES[child(node, j)].a == NODES[decl].a {
+                    found = true;
+                }
+            }
+            if found {
+                continue;
+            }
+            if NODES[decl].c == 0 {
+                err_begin(NODES[node].start);
+                err_str(c"the impl of trait '");
+                err_sym(TRAITS[tr].name);
+                err_str(c"' is missing '");
+                err_sym(NODES[decl].a);
+                err_str(c"'");
+                err_help(c"it has no default: write it in the impl");
+                err_end_soft();
+                continue;
+            }
+            let f = clone_node(decl);
+            NODES[f].d = if NODES[NODES[node].b].kind == NodeKind::TyName { NODES[NODES[node].b].a } else { intern_c(c"_") };
+            NODES[f].h = NODES[node].b;
+            if impl_is_generic(node) {
+                NODES[f].g = merged_generics(NODES[node].g, NODES[f].g);
+            }
+            NODES[f].p |= 1;
+            add_fn(f, NODES[f].a, NODES[f].a);
+            // (checked in the impl's module, as if written there)
+            FNS[FN_COUNT - 1].module = m;
+            set_fn_impl(FN_COUNT - 1, me);
+            IMPL_EXTRA.push(f);
         }
     }
 }
@@ -305,7 +335,7 @@ pub fn check_impl_signatures() {
     unsafe {
         for f in 0..FN_COUNT {
             let i = impl_of_fn(f);
-            if i < 0 || FNS[f].generic > 0 || FNS[f].tmpl != 0 {
+            if i < 0 || FNS[f].generic > 0 || FNS[f].tmpl != 0 || (NODES[FNS[f].node].p & FN_SIG_FAILED) != 0 {
                 continue;
             }
             let tr = IMPLS[i].tr;
@@ -319,9 +349,9 @@ pub fn check_impl_signatures() {
             SELF_TYPE = FNS[f].self_ty;
             let mark = TSCRATCH.count;
             for k in 0..NODES[decl].count {
-                TSCRATCH.push(resolve_type(NODES[child(decl, k)].b));
+                TSCRATCH.push(resolve_type_or_error(NODES[child(decl, k)].b));
             }
-            let ret = if NODES[decl].b == 0 { TY_UNIT } else { resolve_type(NODES[decl].b) };
+            let ret = if NODES[decl].b == 0 { TY_UNIT } else { resolve_type_or_error(NODES[decl].b) };
             CUR_MOD = saved_mod;
             SELF_TYPE = saved_self;
             let count = TSCRATCH.count - mark;
@@ -334,7 +364,29 @@ pub fn check_impl_signatures() {
                     }
                 }
             }
-            if !same {
+            // (a type that failed, in either, follows from an earlier error)
+            let mut failed = has_error_type(ret) || has_error_type(FNS[f].ret);
+            for k in 0..count {
+                if has_error_type(TSCRATCH.data[mark + k]) {
+                    failed = true;
+                }
+            }
+            for k in 0..FNS[f].param_count {
+                if has_error_type(fn_param(f, k)) {
+                    failed = true;
+                }
+            }
+            if !same && !failed {
+                // (what differs is the error type from now on: the uses of
+                // the function report nothing more about it)
+                if ret != FNS[f].ret {
+                    FNS[f].ret = TY_ERROR;
+                }
+                for k in 0..FNS[f].param_count {
+                    if k >= count || TSCRATCH.data[mark + k] != fn_param(f, k) {
+                        TLISTS.data[FNS[f].params + k] = TY_ERROR;
+                    }
+                }
                 let expected = make_type(TyKind::Fn, ret, 0, mark);
                 err_begin(NODES[FNS[f].node].start);
                 err_str(c"'");
@@ -347,7 +399,7 @@ pub fn check_impl_signatures() {
                 }
                 err_type(expected);
                 err_str(c"'");
-                err_end();
+                err_end_soft();
             }
             TSCRATCH.count = mark;
         }
@@ -411,7 +463,7 @@ fn intrinsic(tr: i64, t: i64) -> bool {
 }
 
 pub fn implements(tr: i64, t: i64) -> bool {
-    t == TY_ERROR || t == TY_NEVER || has_impl(tr, t) || intrinsic(tr, t)
+    tr < 0 || has_error_type(t) || t == TY_NEVER || has_impl(tr, t) || intrinsic(tr, t)
 }
 
 // Whether type t satisfies the bounds of parameter node p.

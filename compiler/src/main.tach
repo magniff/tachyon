@@ -114,11 +114,12 @@ mod enc_x86;
 use std::Option;
 
 use base::{
-    BUFS, DENY_WARNINGS, ERRORS_AS_DUMP, ERR_KIND, FILES, FILE_COUNT, IntVec, STDERR, STDOUT, SYMS, add_source,
-    alloc_array, alloc_zeroed, buf_byte, buf_bytes, buf_clear, buf_int, buf_new, buf_reserve,
-    buf_slice, buf_str, buf_uint, buf_write_fd, buf_write_file, die, die2, err_begin, err_end,
-    err_help, err_str, err_sym, error_at, exit, find_sym, free, grow, intern, intern_c,
-    load_sources, memcmp, memcpy, memset, read_file, strlen, strtod, sym_name, sym_table,
+    BUFS, DENY_WARNINGS, ERRORS_AS_DUMP, ERR_KIND, FILES, FILE_COUNT, IntVec, RECOVER_DEPTH, STDERR,
+    STDOUT, SYMS, _setjmp, add_source, alloc_array, alloc_zeroed, buf_byte, buf_bytes, buf_clear,
+    buf_int, buf_new, buf_reserve, buf_slice, buf_str, buf_uint, buf_write_fd, buf_write_file, die,
+    die2, err_begin, err_end, err_help, err_str, err_sym, error_at, exit, exit_if_errors, fail_name,
+    find_sym, free, grow, intern, intern_c, load_sources, memcmp, memcpy, memset, read_file,
+    recover_enter, recover_leave, strlen, strtod, sym_name, sym_table,
 };
 use lexer::{
     STRS, STR_COUNT, TOKS, TOK_COUNT, Tok, add_string, dump_tokens, init_lexer, is_alpha, is_digit,
@@ -504,7 +505,27 @@ fn import_c_headers(target: i64, include_dirs: *IntVec, emit: bool, output: *u8)
             }
             return;
         }
-        let text = c_import(&names, &dirs, include_dirs, target);
+        // A recovery point (0.10): after an error in the headers, the
+        // program is checked without them; the names they would have
+        // brought (`c` in `import "h.h" as c;`) are failed names.
+        let depth = RECOVER_DEPTH;
+        let mut text = -1;
+        if _setjmp(recover_enter()) == 0 {
+            text = c_import(&names, &dirs, include_dirs, target);
+        }
+        recover_leave(depth);
+        if text < 0 {
+            for i in 0..TOK_COUNT {
+                if TOKS[i].kind == Tok::Import && i + 3 < TOK_COUNT && TOKS[i + 2].kind == Tok::As
+                    && TOKS[i + 3].kind == Tok::Ident {
+                    fail_name(TOKS[i + 3].value as i64);
+                }
+            }
+            if emit {
+                exit_if_errors();
+            }
+            return;
+        }
         if emit {
             buf_write_file(text, output);
             exit(0);

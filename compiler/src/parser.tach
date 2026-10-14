@@ -1,14 +1,15 @@
 // Parser: tokens to the AST. Items and statements by recursive descent,
 // expressions by a Pratt parser with the binding powers of
-// docs/grammar.md. The first syntax error ends the compilation.
+// docs/grammar.md. After a syntax error the parser goes on at the next
+// statement or item (see parse_program and parse_block).
 
 use crate::base::{
     ERR, IntVec, RECOVER_DEPTH, SRC, _setjmp, buf_bytes, err_begin, err_end, err_str, err_sym,
-    error_at, exit_if_errors, intern, intern_c, recover_enter, recover_leave,
+    error_at, fail_name, intern, intern_c, recover_enter, recover_leave,
 };
 use crate::lexer::{STRS, SUF_NONE, TOKS, TOK_COUNT, Tok};
 use crate::ast::{
-    ARM_NO_ELSE, ARM_SYNTHETIC, BLOCK_UNSAFE, FN_COLD, FN_INLINE, FN_NO_INLINE, FN_UNSAFE, NODES, NodeKind, REPR_C, REPR_INT,
+    ARM_NO_ELSE, ARM_SYNTHETIC, BLOCK_UNSAFE, FN_BODY_FAILED, FN_COLD, FN_INLINE, FN_NO_INLINE, FN_UNSAFE, NODES, NodeKind, REPR_C, REPR_INT,
     REPR_PACKED, REPR_UNION, SCRATCH, child, list_begin, list_end, list_push, new_node,
 };
 use crate::check::name_error;
@@ -167,20 +168,36 @@ pub fn parse_program() -> i64 {
             let depth = RECOVER_DEPTH;
             let items = SCRATCH.count;
             let start = P;
+            BODY_FAILED = false;
             if _setjmp(recover_enter()) == 0 {
                 parse_top_item();
+                if BODY_FAILED {
+                    // A syntax error in a block outside a function's body (a
+                    // constant's initializer...): the item is left out.
+                    for i in items..SCRATCH.count {
+                        let kind = NODES[SCRATCH.data[i]].kind;
+                        if kind != NodeKind::Impl && kind != NodeKind::Use {
+                            fail_name(NODES[SCRATCH.data[i]].a);
+                        }
+                    }
+                    SCRATCH.count = items;
+                }
             } else {
                 SCRATCH.count = items;
                 NO_STRUCT = false;
                 skip_to_item(start);
+                fail_names(start, P);
             }
             recover_leave(depth);
         }
         list_end(program, mark);
-        exit_if_errors();
         program
     }
 }
+
+// Whether a statement of the block being parsed had a syntax error (and
+// was left out).
+static mut BODY_FAILED: bool = false;
 
 // After an error in the item starting at token `start`: on to the next
 // token after it that starts an item at the beginning of a line.
@@ -195,6 +212,28 @@ fn skip_to_item(start: i64) {
                 return;
             }
             advance();
+        }
+    }
+}
+
+// The names the items in tokens start..end (skipped after an error)
+// declare, and those a `use` among them imports, are failed names: the
+// errors saying they are unknown are not reported (see err_failed_name).
+fn fail_names(start: i64, end: i64) {
+    unsafe {
+        let mut in_use = false;
+        for i in start..end {
+            let kind = TOKS[i].kind;
+            if kind == Use || kind == Import {
+                in_use = true;
+            } else if kind == Semi {
+                in_use = false;
+            }
+            if i + 1 < end && TOKS[i + 1].kind == Ident && (in_use || kind == Fn || kind == Struct
+                || kind == Union || kind == Enum || kind == Const || kind == Static || kind == Type
+                || kind == Trait || kind == Mod) {
+                fail_name(TOKS[i + 1].value as i64);
+            }
         }
     }
 }
@@ -217,7 +256,12 @@ fn skip_statement(start: i64) {
                 }
             }
             if open.count == 0 {
-                return;
+                if kind == RBrace {
+                    return;
+                }
+                // (a stray `)` or `]` is part of the statement that failed)
+                advance();
+                continue;
             }
             open.count -= 1;
             let depth = open.count;
@@ -412,7 +456,7 @@ fn parse_trait() -> i64 {
             expect(RParen);
             NODES[f].b = parse_return_type();
             if !eat(Semi) {
-                NODES[f].c = parse_block();
+                NODES[f].c = parse_fn_body(f);
             }
             NODES[f].end = prev_end();
             list_push(f);
@@ -591,9 +635,24 @@ fn parse_function() -> i64 {
         parse_params(n, false);
         expect(RParen);
         NODES[n].b = parse_return_type();
-        NODES[n].c = parse_block();
+        NODES[n].c = parse_fn_body(n);
         NODES[n].end = prev_end();
         n
+    }
+}
+
+// The body of function n; one with a syntax error is marked so (the
+// checker leaves it out).
+fn parse_fn_body(n: i64) -> i64 {
+    unsafe {
+        let saved = BODY_FAILED;
+        BODY_FAILED = false;
+        let body = parse_block();
+        if BODY_FAILED {
+            NODES[n].p |= FN_BODY_FAILED;
+        }
+        BODY_FAILED = saved;
+        body
     }
 }
 
@@ -1293,6 +1352,7 @@ fn parse_block() -> i64 {
                 SCRATCH.count = stmts;
                 NO_STRUCT = false;
                 skip_statement(start);
+                BODY_FAILED = true;
             }
             recover_leave(depth);
             if stmt == 0 {

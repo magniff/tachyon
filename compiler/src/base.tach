@@ -483,7 +483,9 @@ pub fn err_begin(pos: i64) {
 // end of a phase that had errors, they are all printed, sorted by
 // position, and the compiler exits with 1. An error whose message names
 // the error type (the type given to what failed, see TY_ERROR) follows
-// from an earlier one and is not reported.
+// from an earlier one and is not reported. (0.10) The phases go on after
+// errors (the checker after the parser's); an error whose caller makes do
+// without jumping is recorded by err_end_soft.
 //
 // A recovery point:
 //     let depth = RECOVER_DEPTH;
@@ -504,6 +506,8 @@ pub static mut RECOVER_DEPTH: i64 = 0;
 // The recorded errors: position and message (a buffer), in pairs.
 static mut ERRORS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 static mut ERROR_COUNT: i64 = 0;
+// (position, message symbol) of each recorded error, in pairs.
+static mut ERROR_KEYS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 // Whether the message being made names the error type.
 pub static mut ERR_POISONED: bool = false;
 
@@ -712,18 +716,48 @@ pub fn err_int(value: i64) {
 //     = help: <help>
 pub fn err_end() -> ! {
     unsafe {
-        let out = buf_new();
-        let mut file = 0;
-        while file + 1 < FILE_COUNT && ERR_POS >= FILES[file + 1].start {
-            file += 1;
-        }
         if ERRORS_AS_DUMP {
+            let mut file = 0;
+            while file + 1 < FILE_COUNT && ERR_POS >= FILES[file + 1].start {
+                file += 1;
+            }
+            let out = buf_new();
             buf_str(out, c"error ");
             buf_int(out, ERR_POS - FILES[file].start);
             buf_byte(out, '\n');
             buf_write_fd(out, STDOUT);
             exit(0);
         }
+        record_error(error_text());
+        err_jump()
+    }
+}
+
+// On after the innermost recovery point; at none (or after too many
+// errors), the errors are printed and the compiler exits.
+fn err_jump() -> ! {
+    unsafe {
+        if RECOVER_DEPTH > 0 && ERROR_COUNT < MAX_ERRORS {
+            _longjmp(RECOVER_BUFS.data[RECOVER_DEPTH - 1] as *u8, 1);
+        }
+        exit_if_errors();
+        exit(1)
+    }
+}
+
+// An error whose text, `out`, is made by the caller (an error in a C
+// header, which is not part of the source), sorted as if at pos.
+pub fn err_end_text(pos: i64, out: i64) -> ! {
+    err_begin(pos);
+    buf_bytes(ERR, buf_slice(out));
+    record_error(out);
+    err_jump()
+}
+
+// The error being made, as printed.
+fn error_text() -> i64 {
+    unsafe {
+        let out = buf_new();
         buf_str(out, c"error[");
         buf_str(out, ERR_KIND);
         buf_str(out, c"]: ");
@@ -737,16 +771,78 @@ pub fn err_end() -> ! {
             buf_byte(out, '\n');
         }
         instantiation_notes(out);
-        if !ERR_POISONED {
-            ERRORS.push(ERR_POS);
-            ERRORS.push(out);
-            ERROR_COUNT += 1;
+        out
+    }
+}
+
+// Records the error being made (its text in `out`), unless it names the
+// error type or is already recorded: the same message at the same
+// position (a generic function is checked per instance; 0.10).
+fn record_error(out: i64) {
+    unsafe {
+        if ERR_POISONED {
+            return;
         }
-        if RECOVER_DEPTH > 0 && ERROR_COUNT < MAX_ERRORS {
-            _longjmp(RECOVER_BUFS.data[RECOVER_DEPTH - 1] as *u8, 1);
+        let key = intern(buf_slice(ERR));
+        let mut i = 0;
+        while i < ERROR_KEYS.count {
+            if ERROR_KEYS.data[i] == ERR_POS && ERROR_KEYS.data[i + 1] == key {
+                return;
+            }
+            i += 2;
         }
+        ERROR_KEYS.push(ERR_POS);
+        ERROR_KEYS.push(key);
+        ERRORS.push(ERR_POS);
+        ERRORS.push(out);
+        ERROR_COUNT += 1;
+    }
+}
+
+// Like err_end, but the work goes on after the error (0.10): for errors
+// that leave nothing undone, or whose callers make do (an unknown type is
+// the error type, a duplicate is left out...).
+pub fn err_end_soft() {
+    record_error(error_text());
+    if ERROR_COUNT >= MAX_ERRORS {
         exit_if_errors();
-        exit(1)
+    }
+}
+
+pub fn error_at_soft(pos: i64, message: *u8) {
+    err_begin(pos);
+    err_str(message);
+    err_end_soft();
+}
+
+// ---- Names whose declaration failed (0.10) ----
+//
+// An item the parser skipped, an import that could not be resolved, a
+// module whose file is missing: the errors saying that such a name is
+// unknown follow from the first one and are not reported (see
+// err_failed_name).
+static mut FAILED_NAMES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+pub fn fail_name(name: i64) {
+    FAILED_NAMES.push(name);
+}
+
+pub fn name_failed(name: i64) -> bool {
+    unsafe {
+        for i in 0..FAILED_NAMES.count {
+            if FAILED_NAMES.data[i] == name {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// The error being made says that `name` is unknown: it is not reported
+// when name's declaration failed.
+pub fn err_failed_name(name: i64) {
+    if name_failed(name) {
+        ERR_POISONED = true;
     }
 }
 
