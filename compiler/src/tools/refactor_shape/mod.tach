@@ -1,0 +1,691 @@
+// The refactorings that change a definition's shape (0.11, phase 2;
+// docs/refactor.md), each one atomic edit (edit.tach) of the definition
+// and of every use the checker resolved:
+//
+//   refactor signature FN --add 'x: T = VALUE' [--at N] | --remove x
+//            | --rename-param a b | --reorder b,a,c | --type x T
+//       the function (with a trait's function: the trait's declaration
+//       and every impl's) and its calls (`f(..)`, `x.f(..)`, `T::f(..)`,
+//       in generic instances too); a function used as a value is refused
+//       for a change of its type
+//   refactor field STRUCT --add 'g: T = VALUE' | --remove g | --rename g h
+//            | --type g T
+//       the struct, its literals, its field accesses
+//   refactor variant ENUM --add 'X(T)' [--arm EXPR] | --remove V
+//            | --rename V W
+//       the enum, its constructions, the matches on it
+//
+// Changes are computed on the program as parsed (ast.tach's
+// PARSED_NODES), from the checked nodes' resolutions; a generic
+// function's instances are clones of its nodes (generics.tach), mapped
+// back to the nodes as written by their span. Lists (parameters,
+// arguments, fields, variants, arms) keep their layout: an element on
+// lines of its own is added or removed with its lines.
+//
+// This file holds what the three share: the command line, finding the
+// definition, the nodes as written, lines and lists; each refactoring is
+// a part: signature, field, variant.
+
+pub mod signature;
+pub mod field;
+pub mod variant;
+
+use crate::base::{
+    FILES, IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, intern,
+};
+use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
+use crate::front::ast::{KEEP_PARSED, NODES, NodeKind, PARSED_COUNT};
+use crate::front::modules::file_of_pos;
+use crate::tools::query::{
+    DEFS, PROG, TOOL, bytes_eq, c_slice, collect_refs, diag, diags, line_start, load_program,
+    program_errors, put_cword, put_loc, put_root, put_word, resolve_name, set_targets, token_at,
+    try_end,
+};
+use crate::tools::edit::{
+    TARGET, after_line, ambiguous, edit_replace, indent_of, source_only, take_edit_option,
+};
+use crate::tools::rewrite::{pcount, pchild, pend, pk, pstart};
+use crate::middle::lower::HMap;
+use crate::base::streq;
+
+// The commands, by their old paths.
+pub use field::run_field;
+pub use signature::run_signature;
+pub use variant::run_variant;
+
+// ---- Common ----
+
+// The subcommand being run (`signature`, ...), for messages.
+static mut SUB: *u8 = 0 as *u8;
+// The nodes of the program (the pattern's and others come after).
+static mut PROGRAM_END: i64 = 0;
+// The nodes as written, by span and kind (see orig_of).
+static mut ORIG: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+fn text_buf(s: [u8]) -> i64 {
+    let b = buf_new();
+    buf_bytes(b, s);
+    b
+}
+
+fn sym_text(sym: i64) -> [u8] {
+    unsafe { SYMS[sym].text }
+}
+
+fn usage_error(message: *u8, example: *u8) -> i64 {
+    unsafe {
+        let d = diag(c"error", c"refactor.usage");
+        buf_str(d, message);
+        buf_byte(d, '\n');
+        let out = diags();
+        buf_str(out, c"try:");
+        put_cword(out, PROG);
+        buf_str(out, c" refactor ");
+        buf_str(out, SUB);
+        buf_byte(out, ' ');
+        buf_str(out, example);
+        put_root(out);
+        try_end(out);
+        2
+    }
+}
+
+// Starts a `try:` line `PROG refactor SUB NAME`; words and put_root
+// follow.
+fn try_refactor(name: [u8]) -> i64 {
+    unsafe {
+        let out = diags();
+        buf_str(out, c"try:");
+        put_cword(out, PROG);
+        buf_str(out, c" refactor ");
+        buf_str(out, SUB);
+        put_word(out, name);
+        out
+    }
+}
+
+// Starts a `try:` line `PROG query CMD NAME`, ending it.
+fn try_query_name(cmd: *u8, name: [u8]) {
+    unsafe {
+        let out = diags();
+        buf_str(out, c"try:");
+        put_cword(out, PROG);
+        buf_str(out, c" query ");
+        buf_str(out, cmd);
+        put_word(out, name);
+        put_root(out);
+        try_end(out);
+    }
+}
+
+// `try: PROG query show FILE:LINE` of the code at pos.
+fn try_show_at(pos: i64) {
+    unsafe {
+        let out = diags();
+        buf_str(out, c"try:");
+        put_cword(out, PROG);
+        buf_str(out, c" query show ");
+        let at = buf_new();
+        put_loc(at, pos);
+        // (FILE:LINE: the column dropped)
+        let s = buf_slice(at);
+        let mut e = s.len;
+        while e > 0 && s[e - 1] != ':' {
+            e -= 1;
+        }
+        buf_bytes(out, s[0..e - 1]);
+        put_root(out);
+        try_end(out);
+    }
+}
+
+// The options and words of `refactor SUB NAME ...`: the edit options are
+// taken, `--x` options with `values` values each go to `opts` (the option,
+// then its values), the rest to `words`. False after a usage error.
+fn take_args(argc: i64, argv: **u8, options: *u8, root: **u8, words: *IntVec, opts: *IntVec) -> bool {
+    unsafe {
+        let mut i = 3;
+        while i < argc {
+            let a = argv[i];
+            if take_edit_option(argc, argv, &i, root) {
+                i += 1;
+                continue;
+            }
+            if a[0] == '-' && a[1] == '-' {
+                let n = option_values(options, a);
+                if n < 0 {
+                    let d = diag(c"error", c"refactor.usage");
+                    buf_str(d, c"unknown option '");
+                    buf_str(d, a);
+                    buf_str(d, c"' of refactor ");
+                    buf_str(d, SUB);
+                    buf_byte(d, '\n');
+                    return false;
+                }
+                if i + n >= argc {
+                    let d = diag(c"error", c"refactor.usage");
+                    buf_str(d, a);
+                    buf_str(d, if n == 1 { c" needs a value\n" } else { c" needs two values\n" });
+                    return false;
+                }
+                opts.push(a as i64);
+                for k in 0..n {
+                    opts.push(argv[i + 1 + k] as i64);
+                }
+                i += n + 1;
+                continue;
+            }
+            words.push(a as i64);
+            i += 1;
+        }
+        if (*words).count == 2 && *root == 0 as *u8 && crate::tools::query::ends_with_c((*words).data[1] as *u8, c".tach") {
+            *root = (*words).data[1] as *u8;
+            (*words).count = 1;
+        }
+        true
+    }
+}
+
+// The number of values of option `a` in `options` (`--add=1 --at=1 ...`),
+// or -1 when it is none.
+fn option_values(options: *u8, a: *u8) -> i64 {
+    unsafe {
+        let s = c_slice(options);
+        let w = c_slice(a);
+        let mut i = 0;
+        while i < s.len {
+            let mut e = i;
+            while e < s.len && s[e] != '=' {
+                e += 1;
+            }
+            if bytes_eq(s[i..e], w) {
+                return (s[e + 1] - '0') as i64;
+            }
+            while e < s.len && s[e] != ' ' {
+                e += 1;
+            }
+            i = e + 1;
+        }
+        -1
+    }
+}
+
+// The value of option `name` in opts (its first value; `second`: its
+// second), or 0.
+fn opt(opts: *IntVec, name: *u8, second: bool) -> *u8 {
+    unsafe {
+        let mut i = 0;
+        while i < (*opts).count {
+            if streq((*opts).data[i] as *u8, name) {
+                return (*opts).data[if second { i + 2 } else { i + 1 }] as *u8;
+            }
+            i += 1;
+        }
+        0 as *u8
+    }
+}
+
+// Loads the program and finds NAME, a definition of kind k1 or k2...
+// (as a mask of 1 << K_*): the definition, or -1 after the diagnostic
+// (*status: the exit status).
+fn load_and_find(root: *u8, name: [u8], kinds: i64, what: *u8, status: *i64) -> i64 {
+    unsafe {
+        KEEP_PARSED = true;
+        if !load_program(root, TARGET) {
+            program_errors(c"error", root, true);
+            *status = 1;
+            return -1;
+        }
+        PROGRAM_END = PARSED_COUNT;
+        let mut matches = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        TOOL = c"refactor";
+        if !resolve_name(SUB, name, &matches) {
+            *status = 1;
+            return -1;
+        }
+        source_only(&matches);
+        // (only the definitions of the kinds asked for, when some are)
+        let mut kept = 0;
+        for i in 0..matches.count {
+            let d = matches.data[i];
+            if (kinds & (1 << DEFS[d].kind)) != 0 {
+                matches.data[kept] = d;
+                kept += 1;
+            }
+        }
+        if kept == 0 {
+            let d = matches.data[0];
+            let e = diag(c"error", c"refactor.kind");
+            buf_bytes(e, sym_text(DEFS[d].fqn));
+            buf_str(e, c" is a ");
+            buf_str(e, crate::tools::query::kind_name(DEFS[d].kind));
+            buf_str(e, c", not a ");
+            buf_str(e, what);
+            buf_byte(e, '\n');
+            try_query_name(c"def", name);
+            *status = 1;
+            return -1;
+        }
+        matches.count = kept;
+        if matches.count > 1 {
+            ambiguous(SUB, name, &matches);
+            *status = 1;
+            return -1;
+        }
+        let d = matches.data[0];
+        if FILES[file_of_pos(DEFS[d].start)].path[0] == '<' {
+            let e = diag(c"error", c"edit.not-source");
+            buf_bytes(e, sym_text(DEFS[d].fqn));
+            buf_str(e, c" is in ");
+            buf_str(e, FILES[file_of_pos(DEFS[d].start)].path);
+            buf_str(e, c", not in a file of the program\n");
+            *status = 1;
+            return -1;
+        }
+        // The nodes as written, by span and kind.
+        for n in 1..PROGRAM_END {
+            let key = orig_key(pstart(n), pend(n), pk(n));
+            if ORIG.get(key) == 0 {
+                ORIG.put(key, n + 1);
+            }
+        }
+        d
+    }
+}
+
+fn orig_key(start: i64, end: i64, kind: NodeKind) -> i64 {
+    ((start * 128 + kind as i64) * 65536 + (end - start) % 65536) + 1
+}
+
+// The node as written of checked node n, of kind `kind` as parsed: n
+// itself, or for a clone (an instance's body), the node it copies; -1.
+fn orig_of(n: i64, kind: NodeKind) -> i64 {
+    unsafe {
+        if n < PROGRAM_END {
+            return if pk(n) == kind { n } else { -1 };
+        }
+        ORIG.get(orig_key(NODES[n].start, NODES[n].end, kind)) - 1
+    }
+}
+
+// Whether only spaces are between pos and the start of its line.
+fn starts_line(pos: i64) -> bool {
+    unsafe {
+        let mut p = pos;
+        while p > 0 && (SRC[p - 1] == ' ' || SRC[p - 1] == '\t') {
+            p -= 1;
+        }
+        p == 0 || SRC[p - 1] == '\n'
+    }
+}
+
+// Whether a newline is in SRC[a..b).
+fn newline_in(a: i64, b: i64) -> bool {
+    unsafe {
+        for p in a..b {
+            if SRC[p] == '\n' {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// Whether the rest of the line after pos is blank, but for a `,` and a
+// comment.
+fn rest_blank(pos: i64) -> bool {
+    unsafe {
+        let mut p = pos;
+        while SRC[p] == ' ' || SRC[p] == '\t' {
+            p += 1;
+        }
+        if SRC[p] == ',' {
+            p += 1;
+        }
+        while SRC[p] == ' ' || SRC[p] == '\t' {
+            p += 1;
+        }
+        if SRC[p] == '/' && SRC[p + 1] == '/' {
+            return true;
+        }
+        SRC[p] == '\n' || SRC[p] == 0
+    }
+}
+
+// The start of the comment lines directly above the line of pos (that
+// line's start when there are none).
+fn comment_head(pos: i64) -> i64 {
+    unsafe {
+        let f = file_of_pos(pos);
+        let mut p = line_start(pos);
+        while p > FILES[f].start {
+            let prev = line_start(p - 1);
+            let mut q = prev;
+            while SRC[q] == ' ' || SRC[q] == '\t' {
+                q += 1;
+            }
+            if SRC[q] == '/' && SRC[q + 1] == '/' {
+                p = prev;
+            } else {
+                break;
+            }
+        }
+        p
+    }
+}
+
+// The token index of the bracket matching the one at token i: back from
+// a closing one (`back`), forward from an opening one; -1.
+fn matching(i0: i64, back: bool) -> i64 {
+    unsafe {
+        let mut depth = 0;
+        let mut i = i0;
+        while i >= 0 && i < TOK_COUNT {
+            let k = TOKS[i].kind;
+            let close = k == Tok::RParen || k == Tok::RBracket || k == Tok::RBrace;
+            let open = k == Tok::LParen || k == Tok::LBracket || k == Tok::LBrace;
+            if (close && back) || (open && !back) {
+                depth += 1;
+            } else if open || close {
+                depth -= 1;
+            }
+            if depth == 0 {
+                return i;
+            }
+            i = if back { i - 1 } else { i + 1 };
+        }
+        -1
+    }
+}
+
+// ---- Lists ----
+//
+// The list being changed: the position after its opening bracket, the
+// position of its closing one, its elements' spans.
+
+static mut L_OPEN: i64 = 0;
+static mut L_CLOSE: i64 = 0;
+static mut L_START: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut L_END: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The list of node n's elements (its list as parsed), between the
+// bracket closing at n's end and the one it matches.
+fn list_of_node(n: i64) {
+    unsafe {
+        let close = token_at(pend(n) - 1);
+        let open = matching(close, true);
+        L_OPEN = TOKS[open].end;
+        L_CLOSE = TOKS[close].start;
+        L_START.count = 0;
+        L_END.count = 0;
+        for i in 0..pcount(n) {
+            let c = pchild(n, i);
+            L_START.push(pstart(c));
+            L_END.push(pend(c));
+        }
+    }
+}
+
+// The parameter list of function node f: after the `(` following its
+// name.
+fn list_of_params(f: i64, name_pos: i64) {
+    unsafe {
+        let mut i = token_at(name_pos);
+        while i < TOK_COUNT && TOKS[i].kind != Tok::LParen {
+            i += 1;
+        }
+        let close = matching(i, false);
+        L_OPEN = TOKS[i].end;
+        L_CLOSE = TOKS[close].start;
+        L_START.count = 0;
+        L_END.count = 0;
+        for k in 0..pcount(f) {
+            let c = pchild(f, k);
+            L_START.push(pstart(c));
+            L_END.push(pend(c));
+        }
+    }
+}
+
+// Inserts `text` as element k (k == count: at the end).
+fn list_insert(k: i64, text: [u8]) {
+    unsafe {
+        let n = L_START.count;
+        let brace = SRC[L_OPEN - 1] == '{';
+        if n == 0 {
+            let b = buf_new();
+            if brace {
+                buf_byte(b, ' ');
+            }
+            buf_bytes(b, text);
+            if brace {
+                buf_byte(b, ' ');
+            }
+            edit_replace(L_OPEN, L_CLOSE, b);
+            return;
+        }
+        if k < n {
+            let s = L_START.data[k];
+            let b = buf_new();
+            if starts_line(s) {
+                buf_bytes(b, indent_of(s));
+                buf_bytes(b, text);
+                buf_str(b, c",\n");
+                let at = comment_head(s);
+                edit_replace(at, at, b);
+            } else {
+                buf_bytes(b, text);
+                buf_str(b, c", ");
+                edit_replace(s, s, b);
+            }
+            return;
+        }
+        let last = L_START.data[n - 1];
+        let e = L_END.data[n - 1];
+        if starts_line(last) && newline_in(e, L_CLOSE) {
+            // (on a line of its own, after the last one's; with a comma
+            // when the last one has one)
+            let mut p = e;
+            while SRC[p] == ' ' || SRC[p] == '\t' {
+                p += 1;
+            }
+            let comma = SRC[p] == ',' || SRC[e - 1] == ',';
+            if !comma {
+                edit_replace(e, e, text_buf(c_slice(c",")));
+            }
+            let b = buf_new();
+            buf_bytes(b, indent_of(last));
+            buf_bytes(b, text);
+            if comma {
+                buf_byte(b, ',');
+            }
+            buf_byte(b, '\n');
+            let at = after_line(e);
+            edit_replace(at, at, b);
+            return;
+        }
+        let b = buf_new();
+        buf_str(b, if SRC[e - 1] == ',' { c" " } else { c", " });
+        buf_bytes(b, text);
+        edit_replace(e, e, b);
+    }
+}
+
+// Removes element k with its separator (its lines, when it has lines of
+// its own).
+fn list_remove(k: i64) {
+    unsafe {
+        let n = L_START.count;
+        let s = L_START.data[k];
+        let e = L_END.data[k];
+        if starts_line(s) && rest_blank(e) && newline_in(e, L_CLOSE) {
+            edit_replace(comment_head(s), after_line(e), buf_new());
+            if k == n - 1 && k > 0 && SRC[e - 1] != ',' && !has_comma_after(e) {
+                // (the one before is the last now: like this one, without
+                // a comma)
+                let pe = L_END.data[k - 1];
+                if has_comma_after(pe) {
+                    let mut p = pe;
+                    while SRC[p] != ',' {
+                        p += 1;
+                    }
+                    edit_replace(p, p + 1, buf_new());
+                }
+            }
+            return;
+        }
+        if n == 1 {
+            edit_replace(L_OPEN, L_CLOSE, buf_new());
+        } else if k < n - 1 {
+            edit_replace(s, L_START.data[k + 1], buf_new());
+        } else {
+            edit_replace(L_END.data[k - 1], e, buf_new());
+        }
+    }
+}
+
+fn has_comma_after(e: i64) -> bool {
+    unsafe {
+        let mut p = e;
+        while SRC[p] == ' ' || SRC[p] == '\t' {
+            p += 1;
+        }
+        SRC[p] == ','
+    }
+}
+
+// Element j becomes element perm[j] (each its text, layout kept).
+fn list_permute(perm: *IntVec) {
+    unsafe {
+        for j in 0..(*perm).count {
+            let from = (*perm).data[j];
+            if from != j {
+                edit_replace(L_START.data[j], L_END.data[j], text_buf(SRC[L_START.data[from]..L_END.data[from]]));
+            }
+        }
+    }
+}
+
+// Whether SRC[a..b) has a call (an argument whose removal, or move,
+// changes what the program does).
+fn has_call(a: i64, b: i64) -> bool {
+    unsafe {
+        let mut i = token_at(a);
+        while i < TOK_COUNT && TOKS[i].start < b {
+            if TOKS[i].kind == Tok::LParen && i > 0 && TOKS[i - 1].kind == Tok::Ident {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+}
+
+// `NAME: T = VALUE` (or `NAME: T`): the end of the declaration, the
+// start of VALUE (-1 for none) in s.
+fn split_default(s: [u8], value: *i64) -> i64 {
+    unsafe {
+        let mut depth = 0;
+        for i in 0..s.len {
+            let c = s[i];
+            if c == '(' || c == '[' || c == '{' || c == '<' {
+                depth += 1;
+            } else if c == ')' || c == ']' || c == '}' || (c == '>' && i > 0 && s[i - 1] != '-') {
+                depth -= 1;
+            } else if c == '=' && depth == 0 && (i + 1 >= s.len || (s[i + 1] != '=' && s[i + 1] != '>'))
+                && (i == 0 || (s[i - 1] != '=' && s[i - 1] != '!' && s[i - 1] != '<' && s[i - 1] != '>')) {
+                let mut e = i;
+                while e > 0 && s[e - 1] == ' ' {
+                    e -= 1;
+                }
+                let mut v = i + 1;
+                while v < s.len && s[v] == ' ' {
+                    v += 1;
+                }
+                *value = v;
+                return e;
+            }
+        }
+        *value = -1;
+        let mut e = s.len;
+        while e > 0 && s[e - 1] == ' ' {
+            e -= 1;
+        }
+        e
+    }
+}
+
+// The name a declaration `[pub] [mut] NAME ...` starts with, as a symbol
+// (-1: none).
+fn leading_name(s: [u8]) -> i64 {
+    let mut i = 0;
+    while i < s.len && s[i] == ' ' {
+        i += 1;
+    }
+    let mut word = word_at(s, i);
+    if (word == 3 && s[i] == 'p' && s[i + 1] == 'u' && s[i + 2] == 'b')
+        || (word == 3 && s[i] == 'm' && s[i + 1] == 'u' && s[i + 2] == 't') {
+        i += word;
+        while i < s.len && s[i] == ' ' {
+            i += 1;
+        }
+        word = word_at(s, i);
+    }
+    if word == 0 {
+        return -1;
+    }
+    intern(s[i..i + word])
+}
+
+fn word_at(s: [u8], i: i64) -> i64 {
+    let mut e = i;
+    while e < s.len && ((s[e] >= 'a' && s[e] <= 'z') || (s[e] >= 'A' && s[e] <= 'Z') || s[e] == '_'
+        || (e > i && s[e] >= '0' && s[e] <= '9')) {
+        e += 1;
+    }
+    e - i
+}
+
+// The position of the name token `name` at or after pos (a parameter's
+// name after `mut`), or -1.
+fn name_token(pos: i64, end: i64, name: i64) -> i64 {
+    unsafe {
+        let mut i = token_at(pos);
+        while i < TOK_COUNT && TOKS[i].start < end {
+            if TOKS[i].kind == Tok::Ident && TOKS[i].value as i64 == name {
+                return TOKS[i].start;
+            }
+            i += 1;
+        }
+        -1
+    }
+}
+
+fn replace_name(pos: i64, old: i64, new: i64) {
+    edit_replace(pos, pos + sym_text(old).len, text_buf(sym_text(new)));
+}
+
+// The references to the definitions of `targets` (query's refs): into
+// R_POS, R_FLAGS.
+fn refs_of(targets: *IntVec) {
+    set_targets(targets);
+    collect_refs();
+}
+
+fn put_count(out: i64, n: i64, one: *u8, many: *u8) {
+    unsafe {
+        buf_int(out, n);
+        buf_byte(out, ' ');
+        buf_str(out, if n == 1 { one } else { many });
+    }
+}
+
+// The index of the first byte c of s, or -1.
+fn find_byte(s: [u8], c: u8) -> i64 {
+    for i in 0..s.len {
+        if s[i] == c {
+            return i;
+        }
+    }
+    -1
+}
