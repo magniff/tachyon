@@ -1,0 +1,442 @@
+// Iterator chains (0.14): six kernels over a vector of 2^20 integers, as
+// chains of adapters and closures; bench/iterloop.tach computes the same
+// with hand-written loops, and bench/run.sh prints the ratio of the two
+// times (zero cost: about 1).
+//
+// Until the front end of closures and iterators lands, this file is the
+// chains hand-desugared into exactly the shapes it makes
+// (docs/design/closures-iterators.md, section 3): a closure is a struct of
+// its captures with a `call` method taking it by pointer, an adapter a
+// generic struct holding the iterator below and a closure, every consumer
+// a `fold`, which the source and the adapters override with a counted
+// loop, and the closure of each adapter's `fold` captures the adapter's
+// closure by reference (a `let mut`) and the outer one by value.
+//
+//   1. v.iter().filter(|x| x & 1 == 0).map(|x| x * x + r).sum()
+//   2. v.iter().zip(w.iter()).map(|(a, b)| a * b + r).sum()
+//   3. v.iter().enumerate().map(|(i, x)| i * x + r).sum()
+//   4. v.iter().map(|x| x ^ r).max().unwrap(), v.iter().filter(|x| x > r).count()
+//   5. for x in v.iter().take(n - r) { t += x }       (next, not fold)
+//   6. let mut u = v.iter().take(m).map(|x| x ^ r).collect();
+//      u.sort_by(|a, b| b.cmp(a))
+
+extern "C" {
+    fn printf(format: *u8, ...) -> i32;
+}
+
+// ---- The source ----
+
+struct SliceIter { s: [i64], pos: i64 }
+
+impl SliceIter {
+    #[inline]
+    fn next(self: *SliceIter) -> Option<i64> {
+        if self.pos < self.s.len {
+            let x = self.s[self.pos];
+            self.pos += 1;
+            Some(x)
+        } else {
+            None
+        }
+    }
+    #[inline]
+    fn exact_len(self: *SliceIter) -> i64 {
+        self.s.len - self.pos
+    }
+    #[inline]
+    fn at(self: *SliceIter, k: i64) -> i64 {
+        self.s[self.pos + k]
+    }
+    #[inline]
+    fn fold<B, G>(self: SliceIter, init: B, g: G) -> B {
+        let mut acc = init;
+        for k in self.pos..self.s.len {
+            acc = g.call(acc, self.s[k]);
+        }
+        acc
+    }
+}
+
+#[inline]
+fn iter(v: *Vec<i64>) -> SliceIter {
+    SliceIter { s: v.as_slice(), pos: 0 }
+}
+
+// The adapters' constructors (the trait's methods: v.iter().map(f) is
+// map(iter(v), f)).
+#[inline]
+fn map<I, F>(it: I, f: F) -> Map<I, F> {
+    Map { it: it, f: f }
+}
+
+#[inline]
+fn map2<I, F>(it: I, f: F) -> Map2<I, F> {
+    Map2 { it: it, f: f }
+}
+
+#[inline]
+fn filter<I, P>(it: I, p: P) -> Filter<I, P> {
+    Filter { it: it, p: p }
+}
+
+#[inline]
+fn enumerate<I>(it: I) -> Enumerate<I> {
+    Enumerate { it: it, k: 0 }
+}
+
+#[inline]
+fn zip<I, J>(a: I, b: J) -> Zip<I, J> {
+    Zip { a: a, b: b }
+}
+
+#[inline]
+fn take<I>(it: I, n: i64) -> Take<I> {
+    Take { it: it, n: n }
+}
+
+// ---- Adapters ----
+
+// map: fold's closure is |acc, x| g(acc, f(x)).
+struct Map<I, F> { it: I, f: F }
+struct MapFold<F, G> { f: *F, g: G }
+
+impl<F, G> MapFold<F, G> {
+    fn call<B>(self: *MapFold<F, G>, acc: B, x: i64) -> B {
+        unsafe { self.g.call(acc, self.f.call(x)) }
+    }
+}
+
+impl<I, F> Map<I, F> {
+    #[inline]
+    fn fold<B, G>(self: Map<I, F>, init: B, g: G) -> B {
+        let mut f = self.f;
+        self.it.fold(init, MapFold { f: &f, g: g })
+    }
+}
+
+// map over pairs (zip, enumerate)
+struct Map2<I, F> { it: I, f: F }
+struct Map2Fold<F, G> { f: *F, g: G }
+
+impl<F, G> Map2Fold<F, G> {
+    fn call<B>(self: *Map2Fold<F, G>, acc: B, p: (i64, i64)) -> B {
+        unsafe { self.g.call(acc, self.f.call(p)) }
+    }
+}
+
+impl<I, F> Map2<I, F> {
+    #[inline]
+    fn fold<B, G>(self: Map2<I, F>, init: B, g: G) -> B {
+        let mut f = self.f;
+        self.it.fold(init, Map2Fold { f: &f, g: g })
+    }
+}
+
+// filter: |acc, x| if p(x) { g(acc, x) } else { acc }
+struct Filter<I, P> { it: I, p: P }
+struct FilterFold<P, G> { p: *P, g: G }
+
+impl<P, G> FilterFold<P, G> {
+    fn call<B>(self: *FilterFold<P, G>, acc: B, x: i64) -> B {
+        unsafe {
+            if self.p.call(x) { self.g.call(acc, x) } else { acc }
+        }
+    }
+}
+
+impl<I, P> Filter<I, P> {
+    #[inline]
+    fn fold<B, G>(self: Filter<I, P>, init: B, g: G) -> B {
+        let mut p = self.p;
+        self.it.fold(init, FilterFold { p: &p, g: g })
+    }
+}
+
+// enumerate: exact_len and at when the source has them
+struct Enumerate<I> { it: I, k: i64 }
+
+impl<I> Enumerate<I> {
+    #[inline]
+    fn fold<B, G>(self: Enumerate<I>, init: B, g: G) -> B {
+        let mut it = self.it;
+        let n = it.exact_len();
+        let mut acc = init;
+        for k in 0..n {
+            acc = g.call(acc, (self.k + k, it.at(k)));
+        }
+        acc
+    }
+}
+
+// zip: exact_len and at of both
+struct Zip<I, J> { a: I, b: J }
+
+impl<I, J> Zip<I, J> {
+    #[inline]
+    fn fold<B, G>(self: Zip<I, J>, init: B, g: G) -> B {
+        let mut a = self.a;
+        let mut b = self.b;
+        let na = a.exact_len();
+        let nb = b.exact_len();
+        let n = if na < nb { na } else { nb };
+        let mut acc = init;
+        for k in 0..n {
+            acc = g.call(acc, (a.at(k), b.at(k)));
+        }
+        acc
+    }
+}
+
+// take: next, and fold through it
+struct Take<I> { it: I, n: i64 }
+
+impl<I> Take<I> {
+    #[inline]
+    fn next(self: *Take<I>) -> Option<i64> {
+        if self.n == 0 {
+            None
+        } else {
+            self.n -= 1;
+            self.it.next()
+        }
+    }
+    #[inline]
+    fn fold<B, G>(self: Take<I>, init: B, g: G) -> B {
+        let mut it = self;
+        let mut acc = init;
+        loop {
+            match it.next() {
+                Some(x) => acc = g.call(acc, x),
+                None => break,
+            }
+        }
+        acc
+    }
+}
+
+// ---- Consumers, on fold ----
+
+struct SumFold {}
+
+impl SumFold {
+    fn call(self: *SumFold, acc: i64, x: i64) -> i64 {
+        acc + x
+    }
+}
+
+struct CountFold {}
+
+impl CountFold {
+    fn call(self: *CountFold, acc: i64, x: i64) -> i64 {
+        acc + 1
+    }
+}
+
+struct MaxFold {}
+
+impl MaxFold {
+    fn call(self: *MaxFold, best: Option<i64>, x: i64) -> Option<i64> {
+        match best {
+            None => Some(x),
+            Some(m) => Some(if x > m { x } else { m }),
+        }
+    }
+}
+
+struct PushFold {}
+
+impl PushFold {
+    fn call(self: *PushFold, v: Vec<i64>, x: i64) -> Vec<i64> {
+        let mut u = v;
+        u.push(x);
+        u
+    }
+}
+
+#[inline]
+fn sum<I>(it: I) -> i64 {
+    it.fold(0, SumFold {})
+}
+
+#[inline]
+fn count<I>(it: I) -> i64 {
+    it.fold(0, CountFold {})
+}
+
+#[inline]
+fn max<I>(it: I) -> Option<i64> {
+    it.fold(None, MaxFold {})
+}
+
+#[inline]
+fn collect<I>(it: I) -> Vec<i64> {
+    it.fold(Vec::new(), PushFold {})
+}
+
+// sort_by: std's heapsort, with a closure comparing by pointer.
+#[inline]
+fn sift_down<F>(s: [i64], start: i64, end: i64, f: *F) {
+    let mut root = start;
+    loop {
+        let mut child = 2 * root + 1;
+        if child >= end {
+            return;
+        }
+        if child + 1 < end && f.call(&s[child], &s[child + 1]) < 0 {
+            child += 1;
+        }
+        if f.call(&s[root], &s[child]) >= 0 {
+            return;
+        }
+        let t = s[root];
+        s[root] = s[child];
+        s[child] = t;
+        root = child;
+    }
+}
+
+// (a library function, as std's sort is: not inlined into its caller)
+#[inline(never)]
+fn sort_by<F>(s: [i64], f: F) {
+    let n = s.len;
+    let mut start = n / 2;
+    while start > 0 {
+        start -= 1;
+        sift_down(s, start, n, &f);
+    }
+    let mut end = n;
+    while end > 1 {
+        end -= 1;
+        let top = s[0];
+        s[0] = s[end];
+        s[end] = top;
+        sift_down(s, 0, end, &f);
+    }
+}
+
+// ---- The closures of the kernels ----
+
+struct IsEven {}
+
+impl IsEven {
+    fn call(self: *IsEven, x: i64) -> bool {
+        x & 1 == 0
+    }
+}
+
+struct SqPlus { r: i64 }
+
+impl SqPlus {
+    fn call(self: *SqPlus, x: i64) -> i64 {
+        x * x + self.r
+    }
+}
+
+struct MulPlus { r: i64 }
+
+impl MulPlus {
+    fn call(self: *MulPlus, p: (i64, i64)) -> i64 {
+        p.0 * p.1 + self.r
+    }
+}
+
+struct XorR { r: i64 }
+
+impl XorR {
+    fn call(self: *XorR, x: i64) -> i64 {
+        x ^ self.r
+    }
+}
+
+struct Above { r: i64 }
+
+impl Above {
+    fn call(self: *Above, x: i64) -> bool {
+        x > self.r
+    }
+}
+
+struct Desc {}
+
+impl Desc {
+    fn call(self: *Desc, a: *i64, b: *i64) -> i64 {
+        b.cmp(a)
+    }
+}
+
+// ---- The kernels ----
+
+#[inline(never)]
+fn filter_map_sum(v: *Vec<i64>, r: i64) -> i64 {
+    sum(map(filter(iter(v), IsEven {}), SqPlus { r: r }))
+}
+
+#[inline(never)]
+fn dot(v: *Vec<i64>, w: *Vec<i64>, r: i64) -> i64 {
+    sum(map2(zip(iter(v), iter(w)), MulPlus { r: r }))
+}
+
+#[inline(never)]
+fn enumerate_sum(v: *Vec<i64>, r: i64) -> i64 {
+    sum(map2(enumerate(iter(v)), MulPlus { r: r }))
+}
+
+#[inline(never)]
+fn max_count(v: *Vec<i64>, r: i64) -> i64 {
+    max(map(iter(v), XorR { r: r })).unwrap() + count(filter(iter(v), Above { r: r }))
+}
+
+#[inline(never)]
+fn take_loop(v: *Vec<i64>, n: i64) -> i64 {
+    let mut t = 0;
+    {
+        let mut for_iter = take(iter(v), n);
+        loop {
+            let x = match for_iter.next() {
+                Some(item) => item,
+                None => break,
+            };
+            t += x;
+        }
+    }
+    t
+}
+
+#[inline(never)]
+fn collect_sort(v: *Vec<i64>, m: i64, r: i64) -> i64 {
+    let mut u = collect(map(take(iter(v), m), XorR { r: r }));
+    defer u.free();
+    sort_by(u.as_slice(), Desc {});
+    u.get(0) - u.get(m - 1) + u.get(m / 2)
+}
+
+fn main() -> i32 {
+    let n = 1048576;
+    let reps = 200;
+    let mut v: Vec<i64> = Vec::with_capacity(n);
+    defer v.free();
+    let mut w: Vec<i64> = Vec::with_capacity(n);
+    defer w.free();
+    for i in 0..n {
+        v.push(i * 2654435761 % 1000003 % 1001 - 500);
+        w.push(i % 17 - 8);
+    }
+    let mut c1 = 0;
+    let mut c2 = 0;
+    let mut c3 = 0;
+    let mut c4 = 0;
+    let mut c5 = 0;
+    for r in 0..reps {
+        c1 += filter_map_sum(&v, r);
+        c2 += dot(&v, &w, r);
+        c3 += enumerate_sum(&v, r);
+        c4 += max_count(&v, r * 4999);
+        c5 += take_loop(&v, n - r);
+    }
+    let mut c6 = 0;
+    for r in 0..10 {
+        c6 += collect_sort(&v, 65536, r);
+    }
+    unsafe { printf(c"%ld %ld %ld %ld %ld %ld\n", c1, c2, c3, c4, c5, c6); }
+    0
+}
