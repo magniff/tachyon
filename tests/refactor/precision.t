@@ -138,10 +138,7 @@ $ refactor signature scale --type k i64 --default '$k as i64' --dry-run
 -pub fn scale(v: i64, k: i32) -> i64 {
 +pub fn scale(v: i64, k: i64) -> i64 {
 $ refactor signature scale --type k i64
-main.tach:11:36: error[type error] expected 'i64', got 'i32'
-error edit.breaks: 1 new error; nothing written
-try: tachyonc refactor signature scale --type k i64 --no-check
-[exit 1]
+changed parameter k to i64 in crate::calc::scale	calc.tach	+1 -1 lines
 $ refactor signature clamp --add 'x: i64 = 0' --default 0
 error refactor.usage: --default goes with --type (the calls' new argument)
 try: tachyonc refactor signature NAME --type x T --default EXPR

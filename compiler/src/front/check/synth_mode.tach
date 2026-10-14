@@ -16,6 +16,7 @@ use crate::front::ast::NodeKind::{
     TyNever, TyPtr, TySlice, TyTuple, TyUnit, Unary, Unit, VariantLit, VecOp, While,
 };
 use crate::front::check::{lookup_local, type_error, type_error_got};
+use crate::front::check::args::misplaced_named_arg;
 use crate::front::check::assign::{check_assign, is_place};
 use crate::front::check::body::{
     check_block, check_break, check_for, check_loop, check_return, check_while, find_loop, synth_if,
@@ -33,7 +34,8 @@ use crate::front::check::unsafety::{
     unsafe_op,
 };
 use crate::front::check::vectors::{synth_vecop, vector_binary};
-use crate::front::closures::{check_closure, unimplemented};
+use crate::front::check::widen::{join_operands, takes_context};
+use crate::front::closures::check_closure;
 use crate::front::consteval::eval_array_len;
 use crate::front::lexer::{
     SUF_F32, SUF_I16, SUF_I32, SUF_I64, SUF_I8, SUF_ISIZE, SUF_NONE, SUF_U16, SUF_U32, SUF_U64,
@@ -114,7 +116,7 @@ fn synth_expr_inner(n: i64) -> i64 {
             // (0.15)
             NodeKind::Try => check_try(n, 0),
             NodeKind::Interp => check_interp(n, 0),
-            NodeKind::NamedArg => unimplemented(NODES[n].start, c"named arguments"),
+            NodeKind::NamedArg => misplaced_named_arg(n),
             Assign => {
                 check_assign(n);
                 TY_UNIT
@@ -494,14 +496,21 @@ pub fn is_context_literal(e: i64) -> bool {
     }
 }
 
-// The common type of a non-shift operator's operands.
+// The common type of a non-shift operator's operands. (0.15) Two integer
+// types join to the wider one: an operand of a definite type is
+// synthesized first (widen::takes_context), and the narrower is widened;
+// an operand whose type comes from context (a literal, `None`) takes the
+// other's.
 fn synth_operands(lhs: i64, rhs: i64) -> i64 {
-    if literal_takes_rhs_type(lhs, rhs) {
+    if literal_takes_rhs_type(lhs, rhs) || takes_context(lhs) && !takes_context(rhs) {
         let rhs_ty = synth_expr(rhs);
         check_expr(lhs, rhs_ty);
         return rhs_ty;
     }
     let lhs_ty = synth_expr(lhs);
+    if is_integer(lhs_ty) && !takes_context(rhs) {
+        return join_operands(lhs, lhs_ty, rhs);
+    }
     check_expr(rhs, lhs_ty);
     lhs_ty
 }

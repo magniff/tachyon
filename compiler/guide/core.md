@@ -343,20 +343,20 @@ from its source in this compiler (every item is `pub`):
 ## Input, output, arguments
 
 std prints and reads stdin: `read_stdin()` (all of it, a `Buf`),
-`read_line(&buf)` (the next line, without its `'\n'`; false at the end),
-`Scanner` (tokens, numbers, lines of a text), `parse_int`, `split`,
-`trim`. Files go through C (`fopen`):
+`read_line(&buf)` (the next line; `Ok(false)` at the end), `Scanner`
+(tokens, numbers, lines), `parse_int`, `split`, `trim`. Files go
+through C (`fopen`):
 
 ```tach
 import "string.h" as c;
 use std::{Scanner, read_stdin};
 
 fn main(argc: i32, argv: **u8) -> i32 {
-    let mut input = read_stdin();         // all of stdin
+    let mut input = read_stdin().unwrap(); // all of stdin
     defer input.free();                   // the caller frees it
     let mut sc = Scanner::new(input.as_slice());
     let mut total = 0;
-    while let Some(n) = sc.next_int() {   // None at the end
+    while let Ok(n) = sc.next_int() {     // Err at the end
         total += n;
     }
     std::print_int(total);

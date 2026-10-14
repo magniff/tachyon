@@ -16,7 +16,7 @@ often than to something else; each error names the fix.
 | `s.as_bytes()[0]`, `b'a'` | `s[0]`, `'a'` (a `u8`) |
 | `CString`, `.as_ptr()` | `c"text"` (a `*u8`); a slice is not NUL-terminated |
 | `match s { "a" => .. }` | `if s == "a" { .. } else if ...` |
-| `x.to_string()`, `s.parse::<i64>()` | `Buf::push_int`; `std::parse_int(s)` (an `Option<i64>`) |
+| `x.to_string()`, `s.parse::<i64>()` | `Buf::push_int`; `std::parse_int(s)` (a `Result<i64, ParseIntError>`) |
 | `s.trim()`, `s.split(',')`, `s.split_whitespace()` | `std::trim(s)`; `std::split(s, ',')`, `std::split_whitespace(s)`: a `Vec<[u8]>` of views of `s` (free it) |
 
 ```tach
@@ -34,7 +34,7 @@ fn main() -> i32 {
     }
     b.push_int(sum);
     println(b.as_slice());
-    if parse_int("4x").is_none() { println("not a number"); }
+    if parse_int("4x").is_err() { println("not a number"); }
     0
 }
 ```
@@ -221,8 +221,8 @@ fn main() -> i32 {
 | `extern crate`, Cargo dependencies | none: one program from its files; C through headers |
 | `pub use` | the same |
 | `std::collections::HashMap` | `std::HashMap` |
-| `std::io::stdin().read_line(&mut s)` | `std::read_line(&buf)`: the line without its `'\n'`, false at the end of input |
-| `io::read_to_string(io::stdin())` | `std::read_stdin()`, a `Buf`; `std::Scanner` for its tokens, numbers and lines |
+| `std::io::stdin().read_line(&mut s)` | `std::read_line(&buf)`: the line without its `'\n'`, `Ok(false)` at the end of input |
+| `io::read_to_string(io::stdin())` | `std::read_stdin()`, a `Result<Buf, IoError>`; `std::Scanner` for its tokens, numbers and lines |
 | `std::env::args()` | `fn main(argc: i32, argv: **u8) -> i32` |
 
 ## unsafe and C

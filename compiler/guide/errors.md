@@ -84,9 +84,9 @@ Bitwise not is `~n`.
 let big = i64::MAX;
 ```
 ```err
-error[type error] no associated function 'MAX' in 'i64'
+error[type error] no associated function 'MAX' in 'i64' | help: std has the limits: 'std::I64_MAX'
 ```
-Write the value: `9223372036854775807`.
+std has the limits: `std::I64_MAX`, `std::U8_MAX`, ...
 
 ```tach
 let s = "add";
@@ -138,14 +138,15 @@ error[type error] cannot assign to immutable variable 'x' | help: make it mutabl
 ```
 
 ```tach
-let a: i32 = 1;
-let b: i64 = a;
+let a: i64 = 1;
+let b: i32 = a;
 ```
 ```err
-error[type error] expected 'i64', got 'i32'
+error[type error] expected 'i32', got 'i64'
 ```
-No implicit conversion: `a as i64`. The same for `1 + 1.0`, and for
-`main` returning an `i64` (`n as i32`).
+No implicit narrowing: `a as i32`. A narrower integer widens (i32 to
+i64, u8 to u32 or i16); never signed to unsigned, nor between integers
+and floats (`1 + 1.0`).
 
 ```tach
 let b: u8 = 300;
@@ -420,7 +421,7 @@ Add the `use` line the help names, or run `tachyonc fix`.
 fn main() -> i32 { let text = read_to_string(); 0 }
 ```
 ```err
-error[type error] undefined variable 'read_to_string' | help: std reads stdin: `std::read_stdin()` (all of it, a Buf), `std::read_line(&buf)` (one line, false at the end), `std::Scanner` (tokens)
+error[type error] undefined variable 'read_to_string' | help: std reads stdin: `std::read_stdin()` (all of it, a Buf), `std::read_line(&buf)` (one line, Ok(false) at the end), `std::Scanner` (tokens)
 ```
 std's items get their `use` line (`add `use std::read_line;``) or the
 nearest std name; an unknown function with neither points to `tachyonc

@@ -67,12 +67,16 @@ c=10 a=3 b=1
 ## Input
 
 `read_line(&buf)` reads stdin a line at a time: the line goes into the
-`Buf` without its `'\n'`, and the result is false at the end of input
-(an empty line is true with an empty `buf`). `read_stdin()` returns all
-of stdin that is left; the two share a buffer, so they mix, but not with
+`Buf` without its `'\n'`, and the result is `Ok(false)` at the end of
+input (an empty line is `Ok(true)` with an empty `buf`), `Err(IoError)`
+when reading fails. `read_stdin()` returns all of stdin that is left (a
+`Result<Buf, IoError>`); the two share a buffer, so they mix, but not with
 C's `getchar` or `scanf`. A `Scanner` reads a text's tokens
-(`next_token`, `next_int`) and lines (`next_line`); `parse_int`,
-`split`, `split_whitespace` and `trim` work on any `[u8]`. What they
+(`next_token`, `next_int`) and lines (`next_line`); `parse_int`
+(a `Result<i64, ParseIntError>`), `split`, `split_whitespace` and `trim`
+work on any `[u8]`. An Option means absence (the end, nothing found), a
+Result a failure: `.ok()` turns one into the other, `.unwrap_or(x)`
+gives a default. What they
 return are views of the text: keep the `Buf` until done with them. The
 next `read_line` overwrites the line, so to keep a part of it (a map's
 key), read all of stdin and take lines with `Scanner::next_line`.
@@ -83,12 +87,12 @@ use std::{Buf, Scanner, parse_int, read_line, read_stdin, split_whitespace};
 fn main() -> i32 {
     let mut line = Buf::new();
     defer line.free();
-    read_line(&line);                     // the header: "n m"
+    read_line(&line).unwrap();            // the header: "n m"
     let mut header = split_whitespace(line.as_slice());
     defer header.free();
     let n = parse_int(header.get(0)).unwrap();
     let m = parse_int(header.get(1)).unwrap_or(0);
-    let mut rest = read_stdin();          // everything after it
+    let mut rest = read_stdin().unwrap(); // everything after it
     defer rest.free();
     let mut sc = Scanner::new(rest.as_slice());
     let mut sum = 0;

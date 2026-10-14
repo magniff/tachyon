@@ -5,15 +5,20 @@
 // (operands, branches, two arguments for one type parameter) the result
 // is the wider one. Never between integers and floats, from bool, signed
 // to unsigned, or narrowing; never inside other types (`*i32`, `[i32]`).
-//
-// Phase 0: widens and widen_node are real, try_widen and join_int stubs
-// (which change nothing).
 
-use crate::base::intern_c;
-use crate::front::ast::{NODES, NODE_IMPLICIT, NodeKind, new_node};
-use crate::front::check::Res;
-use crate::front::lexer::Tok;
-use crate::front::types::{int_bits, is_integer, is_signed, primitive_name};
+use crate::base::{SRC, buf_bytes, intern_c};
+use crate::base::diag::{ERR_HELP, err_begin, err_end, err_help, err_str};
+use crate::front::ast::{NODES, NODE_IMPLICIT, NodeKind, child, new_node};
+use crate::front::check::{Res, mismatch_error};
+use crate::front::check::body::names_context_variant;
+use crate::front::check::synth_mode::{fold_layout_query, is_context_literal, synth_expr};
+use crate::front::check::unsafety::check_wrapped;
+use crate::front::check::vectors::sym_is_c;
+use crate::front::generics::{HINT_NODE, HINT_TY};
+use crate::front::lexer::{SUF_NONE, Tok};
+use crate::front::types::{
+    TY_ERROR, TY_I64, TY_NEVER, buf_type, err_type, int_bits, is_integer, is_signed, primitive_name,
+};
 
 // Whether integer type a widens to integer type b (a != b): from i8 to
 // i16, i32, i64; from u8 to u16, u32, u64 and to i16, i32, i64; ...
@@ -53,14 +58,211 @@ pub fn widen_node(n: i64, to: i64) {
 }
 
 // Value n of type `actual` where `expected` is expected (they differ):
-// widened (widen_node) when actual widens to expected, and true; false
+// widened (widen_value) when actual widens to expected, and true; false
 // otherwise (the caller reports the mismatch).
 pub fn try_widen(n: i64, actual: i64, expected: i64) -> bool {
-    false
+    if !widens(actual, expected) {
+        return false;
+    }
+    widen_value(n, expected);
+    true
 }
 
 // The join of integer types a and b: the wider when one widens to the
 // other (a when they are the same), 0 otherwise.
 pub fn join_int(a: i64, b: i64) -> i64 {
+    if a == b {
+        return if is_integer(a) { a } else { 0 };
+    }
+    if widens(a, b) {
+        return b;
+    }
+    if widens(b, a) {
+        return a;
+    }
     0
+}
+
+// Checked value n (of an integer type that widens to `to`, or `!`) as a
+// value of type `to`: a block, `if` or `match` where its values are (the
+// tail, each branch, each arm), so that they keep their shape; any other
+// expression becomes a Cast (widen_node).
+pub fn widen_value(n: i64, to: i64) {
+    unsafe {
+        let t = NODES[n].ty;
+        if t == to || t == TY_NEVER || t == TY_ERROR {
+            return;
+        }
+        match NODES[n].kind {
+            NodeKind::Block if NODES[n].a != 0 => widen_value(NODES[n].a, to),
+            NodeKind::If if NODES[n].c != 0 => {
+                widen_value(NODES[n].b, to);
+                widen_value(NODES[n].c, to);
+            }
+            NodeKind::Match => {
+                for i in 0..NODES[n].count {
+                    widen_value(NODES[child(n, i)].c, to);
+                }
+            }
+            _ => {
+                widen_node(n, to);
+                return;
+            }
+        }
+        NODES[n].ty = to;
+    }
+}
+
+// Two values that meet without an expected type (the branches of an `if`,
+// the arms of a `match`, an operator's operands), a of type at and b of
+// type bt: when one type widens to the other, the narrower value is
+// widened and the join is returned; 0 otherwise (nothing changed).
+pub fn join_values(a: i64, at: i64, b: i64, bt: i64) -> i64 {
+    let j = join_int(at, bt);
+    if j != 0 {
+        widen_value(a, j);
+        widen_value(b, j);
+    }
+    j
+}
+
+// Arm i of match n, whose body is of a definite type (!takes_context),
+// when the arms before it have integer type `result` and no type is
+// expected: synthesized, then joined with them (the narrower widened;
+// earlier arms left for later, the context literals, are not checked
+// yet). The arm's type: `!`, or the join.
+pub fn join_arm(n: i64, i: i64, body: i64, result: i64, later: bool) -> i64 {
+    let t = check_wrapped(body, 0);
+    if t == result || t == TY_NEVER {
+        return t;
+    }
+    if t == TY_ERROR {
+        return result;
+    }
+    let j = join_int(result, t);
+    if j == 0 {
+        mismatch_error(body, result, t);
+    }
+    if j == result {
+        widen_value(body, j);
+        return j;
+    }
+    unsafe {
+        for k in 0..i {
+            let b = NODES[child(n, k)].c;
+            if !(later && is_context_literal(b)) {
+                widen_value(b, j);
+            }
+        }
+    }
+    j
+}
+
+// Whether expression e takes its type from the code around it, before it
+// is checked: an unsuffixed literal (also negated, or in arithmetic of
+// such), a variant of a generic enum without its type arguments (`None`),
+// `x.into()`, a block or `if` whose values are such, and (conservatively)
+// the compound expressions whose type their parts decide (`match`, loops,
+// closures, literals of tuples, arrays and structs). An operand or a
+// match arm of a definite type (a local, a field, a call, a cast, ...) can
+// be synthesized first, and joined.
+pub fn takes_context(e: i64) -> bool {
+    fold_layout_query(e);
+    unsafe {
+        match NODES[e].kind {
+            NodeKind::Int | NodeKind::Float => NODES[e].b == SUF_NONE,
+            NodeKind::Char => true,
+            NodeKind::Unary if NODES[e].op == Tok::Minus || NODES[e].op == Tok::Tilde => {
+                takes_context(NODES[e].b)
+            }
+            NodeKind::Binary => {
+                let op = NODES[e].op;
+                if op == Tok::Shl || op == Tok::Shr {
+                    return takes_context(NODES[e].b);
+                }
+                if is_arith_op(op) {
+                    return takes_context(NODES[e].b) && takes_context(NODES[e].c);
+                }
+                false
+            }
+            NodeKind::Ident | NodeKind::Path => names_context_variant(e),
+            NodeKind::MethodCall => NODES[e].count == 0 && sym_is_c(NODES[e].b, c"into"),
+            // (a block by its tail, an `if` by its branches)
+            NodeKind::Block => NODES[e].a != 0 && takes_context(NODES[e].a),
+            NodeKind::If => NODES[e].c != 0 && takes_context(NODES[e].b)
+                && takes_context(NODES[e].c),
+            NodeKind::Match | NodeKind::Loop
+                | NodeKind::Closure | NodeKind::Tuple | NodeKind::Array | NodeKind::Repeat
+                | NodeKind::StructLit | NodeKind::Range | NodeKind::Try | NodeKind::Interp => true,
+            _ => false,
+        }
+    }
+}
+
+// The arithmetic and bitwise operators, whose operands and result have one
+// type.
+fn is_arith_op(op: Tok) -> bool {
+    op == Tok::Plus || op == Tok::Minus || op == Tok::Star || op == Tok::Slash
+        || op == Tok::Percent || op == Tok::Amp || op == Tok::Pipe || op == Tok::Caret
+}
+
+// The operands of a non-shift operator (synth_operands), lhs already
+// synthesized, of integer type lhs_ty, and rhs of a definite type
+// (!takes_context): rhs is synthesized (with lhs_ty as its hint, as
+// check_expr would give it), then the two join: the narrower is widened.
+// Their common type.
+pub fn join_operands(lhs: i64, lhs_ty: i64, rhs: i64) -> i64 {
+    unsafe {
+        HINT_NODE = rhs;
+        HINT_TY = lhs_ty;
+        let rhs_ty = synth_expr(rhs);
+        if rhs_ty == lhs_ty || rhs_ty == TY_ERROR || lhs_ty == TY_ERROR {
+            return lhs_ty;
+        }
+        if rhs_ty == TY_NEVER {
+            NODES[rhs].ty = lhs_ty;
+            return lhs_ty;
+        }
+        let j = join_values(lhs, lhs_ty, rhs, rhs_ty);
+        if j != 0 {
+            return j;
+        }
+        if !is_integer(rhs_ty) {
+            mismatch_error(rhs, lhs_ty, rhs_ty);
+        }
+        int_mismatch_error(lhs, lhs_ty, rhs, rhs_ty)
+    }
+}
+
+// Two integer values of types that do not widen one to the other (`i32`
+// and `u32`, `i64` and `u64`): the mismatch, with the conversion to write
+// (both to i64 when both widen to it, else the right one to the left's
+// type).
+fn int_mismatch_error(lhs: i64, lhs_ty: i64, rhs: i64, rhs_ty: i64) -> ! {
+    unsafe {
+        err_begin(NODES[rhs].start);
+        err_str(c"expected '");
+        err_type(lhs_ty);
+        err_str(c"', got '");
+        err_type(rhs_ty);
+        err_str(c"'");
+        let both = widens(lhs_ty, TY_I64) && widens(rhs_ty, TY_I64);
+        err_help(c"convert explicitly: '");
+        if both {
+            err_help(c"(");
+            buf_bytes(ERR_HELP, SRC[NODES[lhs].start..NODES[lhs].end]);
+            err_help(c" as i64)");
+            buf_bytes(ERR_HELP, SRC[NODES[lhs].end..NODES[rhs].start]);
+        }
+        err_help(c"(");
+        buf_bytes(ERR_HELP, SRC[NODES[rhs].start..NODES[rhs].end]);
+        err_help(c" as ");
+        if both {
+            err_help(c"i64");
+        } else {
+            buf_type(ERR_HELP, lhs_ty);
+        }
+        err_help(c")'");
+        err_end()
+    }
 }

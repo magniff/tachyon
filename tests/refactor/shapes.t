@@ -199,10 +199,8 @@ $ refactor field Point --rename y height --dry-run
 -        (self.x + self.y) * unit
 +        (self.x + self.height) * unit
 $ refactor field Point --type x i32
-./geom.tach:18:5: error[type error] expected 'i64', got 'i32'
 ./geom.tach:47:27: error[type error] expected 'i32', got 'i64'
-./geom.tach:58:10: error[type error] expected 'i64', got 'i32'
-error edit.breaks: 3 new errors; nothing written
+error edit.breaks: 1 new error; nothing written
 try: tachyonc refactor field Point --type x i32 --no-check
 [exit 1]
 $ refactor field Point --remove y
