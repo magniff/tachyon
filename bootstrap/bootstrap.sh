@@ -17,7 +17,9 @@
 # Built steps are cached under target/bootstrap/<host>/, by tag and
 # commit, so a rerun only redoes HEAD (and what --history full asks for
 # that the cache lacks). The final compiler is copied to target/tachyonc,
-# where tests/run.sh looks for it. (0.14) In a linked git worktree the
+# where tests/run.sh looks for it, and (0.15), when its test suite ran and
+# passed, to target/tools/tachyonc: the binary agents query and edit with,
+# which their own builds of target/tachyonc do not replace. (0.14) In a linked git worktree the
 # releases come from the main checkout's cache (or $TACHYON_BOOTSTRAP_CACHE),
 # so a fresh worktree builds only HEAD; HEAD itself is always built in the
 # worktree's own target/bootstrap.
@@ -116,7 +118,7 @@ while [ $# -gt 0 ]; do
         --history) [ $# -ge 2 ] || die "--history needs fast or full"; HISTORY=$2; shift ;;
         --history=*) HISTORY=${1#--history=} ;;
         --no-head-tests) RUN_HEAD_TESTS=0 ;;
-        -h|--help) sed -n '2,58p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown option '$1' (see --help)" ;;
     esac
     shift
@@ -516,6 +518,15 @@ if [ $STOPPED -eq 0 ]; then
     FINAL="$head_dir/tachyonc"
     mkdir -p "$ROOT/target"
     cp "$FINAL" "$ROOT/target/tachyonc"
+    # (0.15) The tools binary: a compiler that passed its fixpoint and its
+    # test suite, for querying and editing while target/tachyonc is under
+    # test (an agent's own builds replace that one); replaced by rename, so
+    # a query running at that moment keeps its file.
+    if [ "$RUN_HEAD_TESTS" = 1 ]; then
+        mkdir -p "$ROOT/target/tools"
+        cp "$FINAL" "$ROOT/target/tools/tachyonc.new"
+        mv -f "$ROOT/target/tools/tachyonc.new" "$ROOT/target/tools/tachyonc"
+    fi
 fi
 
 if [ -n "$CROSS" ]; then

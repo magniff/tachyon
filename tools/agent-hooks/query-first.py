@@ -17,7 +17,10 @@ Edit, Write) and PostToolUse (Bash). Reads the hook event (JSON) on stdin.
   Test fixtures, docs and scratch copies (target/, /tmp) are not
   affected.
 - `tachyonc query ...` calls are logged, with their outcome; `tachyonc
-  edit/refactor/fix/rewrite/undo` calls with whether they wrote.
+  edit/refactor/fix/rewrite/undo` calls with whether they wrote. (0.15)
+  tachyonc is recognised through copies (`target/tc0`,
+  `target/tools/tachyonc`) and shell variables (`T=...; $T query`), by
+  tachyonc_cmd.py; such a record says `via` what it ran.
 - Read and Grep calls on .tach files are logged, not blocked (Edit needs
   a prior Read); Edit and Write calls on .tach files are logged (whether
   the file existed), never blocked.
@@ -45,6 +48,15 @@ import shlex
 import subprocess
 import sys
 import time
+import types
+
+# (0.15) tachyonc through copies and shell variables: tachyonc_cmd.py, next
+# to this file, loaded by path (`python3 -I` leaves this directory out of
+# sys.path; importlib.util would cost 40 ms of imports on every call).
+tc = types.ModuleType("tachyonc_cmd")
+tc.__file__ = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tachyonc_cmd.py")
+with open(tc.__file__) as _fh:
+    exec(compile(_fh.read(), tc.__file__, "exec"), tc.__dict__)
 
 READERS = {"grep", "rg", "egrep", "fgrep", "sed", "head", "tail", "cat", "awk", "less", "more"}
 SOURCE = re.compile(r"(\.tach\b|compiler/src\b|compiler/std\b)")
@@ -53,7 +65,7 @@ ESCAPE = re.compile(r"#\s*no-(?:query|tool):\s*(.+)")
 # A .tach file of the compiler's own source (not a test, a doc, a copy).
 COMPILER_TACH = re.compile(r"((?:[\w.~-]+/)*compiler/(?:src|std)/[\w./*-]*\.tach)\b")
 SCRATCH = re.compile(r"(^|/)(target|tmp|private/tmp|var/folders)/")
-TOOLS = re.compile(r"tachyonc\"?\s+(edit|refactor|fix|rewrite|undo)\b")
+TOOL_SUBS = ("edit", "refactor", "fix", "rewrite", "undo")
 SUMMARY = re.compile(r"^(undid|patched|replaced|inserted|deleted|fixed|renamed|moved|rewrote|"
                      r"added|removed|changed|made|split|script)\b.*\t", re.M)
 
@@ -483,6 +495,13 @@ def suggestion(prog, args):
     return "tachyonc query show NAME | tachyonc query items MODULE | tachyonc query text FILE:A-B"
 
 
+def via(calls):
+    """{"via": PATH} when the tachyonc run was not plain `tachyonc` (a copy,
+    a shell variable): the record says how the agent ran it."""
+    paths = sorted({c[2] or "$VAR" for c in calls if os.path.basename(c[2]) != "tachyonc"})
+    return {"via": " ".join(paths)[:120]} if paths else {}
+
+
 def main():
     try:
         event = json.load(sys.stdin)
@@ -497,24 +516,25 @@ def main():
 
     if tool == "Bash":
         command = inp.get("command", "")
+        calls = tc.calls(command)
         if phase == "PostToolUse":
             resp = event.get("tool_response") or {}
             out = (resp.get("stdout") or "") if isinstance(resp, dict) else str(resp)
             err = (resp.get("stderr") or "") if isinstance(resp, dict) else ""
-            if "tachyonc query" in command or "tachyonc\" query" in command:
-                log(gd, {"kind": "query-result",
+            if any(c[0] == "query" for c in calls):
+                log(gd, {"kind": "query-result", **via(calls),
                          "command": command[:300], "out_lines": out.count("\n"),
                          "out_bytes": len(out), "stderr": err[:300]})
-            m = TOOLS.search(command)
-            if m:
+            tool_call = next((c for c in calls if c[0] in TOOL_SUBS), None)
+            if tool_call:
                 # (written: a summary line; not a dry run's diff, not a refusal)
                 written = bool(SUMMARY.search(out)) and "--dry-run" not in command
-                log(gd, {"kind": "tool-result", "tool": m.group(1),
+                log(gd, {"kind": "tool-result", "tool": tool_call[0], **via(calls),
                          "command": command[:300], "written": written,
                          "compiler": tool_target(command), "stderr": err[:300]})
             return 0
-        if "tachyonc query" in command or "tachyonc\" query" in command:
-            log(gd, {"kind": "query", "command": command[:300]})
+        if any(c[0] == "query" for c in calls):
+            log(gd, {"kind": "query", **via(calls), "command": command[:300]})
         rewrites = source_rewrites(command)
         if rewrites:
             prog, files, script = rewrites[0]

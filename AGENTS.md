@@ -68,10 +68,22 @@ NAME is `foo`, `module::foo`, `Type::method`, `Enum::Variant`,
 `Struct.field` or `FILE:LINE`; several in one call. The root defaults to
 `compiler/src/main.tach` (`--root ROOT`, or a last argument ending in
 `.tach`, for other programs). A problem is one stderr line, `error CODE:
-message`, then `try:` lines: commands to run as they are. Compile with
-`--diagnostics=short` for one line per error. Edits are atomic: an edit
-that adds an error writes nothing and prints the errors
-([docs/refactor.md](docs/refactor.md)).
+message`, then `try:` lines: commands to run as they are. A build prints
+its errors as `check` does, one line each, when its output is not a
+terminal (`--diagnostics=human` for the long form), so a `check` before
+a build is redundant. Edits are atomic: an edit that adds an error
+writes nothing and prints the errors ([docs/refactor.md](docs/refactor.md)).
+`--json` on any command prints JSON lines, for scripts and hooks
+([docs/query.md](docs/query.md), "JSON").
+
+**Query and edit with `target/tools/tachyonc` while you change the
+compiler.** Your own builds replace `target/tachyonc` (and a broken one
+breaks `query`); `bootstrap/bootstrap.sh --dev` copies its compiler to
+`target/tools/tachyonc` only after the fixpoint and the test suite
+pass, so that one always works and knows the newest syntax that passed.
+Use it instead of copies such as `T=target/tc0; $T query ...`. The
+commands below say `target/tachyonc`; either works when the tree is
+healthy.
 
 **This is being tested.** A hook (`tools/agent-hooks/query-first.py`)
 blocks shell commands that read `.tach` source and suggests the query
@@ -91,7 +103,17 @@ patch` that does the same, checked and undoable. When the tools cannot
 make the edit, append `# no-tool: <what the tools could not do>`. The
 Edit and Write tools, test fixtures and docs are not affected.
 
-When any tachyon tool (query, edit, refactor, check, fix, the hook)
+**Checks come by themselves.** A second hook
+(`tools/agent-hooks/check-after-edit.py`) runs `tachyonc check` after
+every Write, Edit or MultiEdit of a `.tach` file and after every
+`tachyonc edit|refactor|fix|rewrite|undo` that wrote: the program's
+errors, at most 10, one line each, are added to that call's result.
+Nothing added means the program checks clean: do not run `check` after
+an edit. (The root is compiler/src/main.tach for the compiler's source,
+else the nearest main.tach; the compiler is `target/tools/tachyonc`
+when it exists.)
+
+When any tachyon tool (query, edit, refactor, check, fix, the hooks)
 falls short, record it in one line:
 
     tools/agent-feedback "query refs" "misses uses inside never-instantiated generic fns"
@@ -102,10 +124,11 @@ Check and test only what a change touches, and widen at milestones:
 
 - in a fresh git worktree, `bootstrap/bootstrap.sh --dev` builds
   `target/tachyonc` in about 20 s: the releases come from the main
-  checkout's cache, only HEAD is built;
+  checkout's cache, only HEAD is built; when its suite passes it is also
+  `target/tools/tachyonc`, the binary to query and edit with;
 
-- after an edit: `target/tachyonc check` (the front end, one line per
-  error) and the cases it concerns, `tests/run.sh FILTER` (cases whose
+- after an edit: the check hook's errors (or `target/tachyonc check`
+  when the hook is not there) and the cases it concerns, `tests/run.sh FILTER` (cases whose
   name contains FILTER; `-O 0` for another level);
 - the whole suite (`tests/run.sh`) only at milestones;
 - before committing a big change: `bootstrap/gate.sh --quick` (the chain

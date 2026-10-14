@@ -50,6 +50,10 @@ def main(argv):
                    default="allowlist",
                    help="claude backend: acceptEdits + sandbox + Bash allowlist "
                    "(default), or bypassPermissions inside the same sandbox")
+    p.add_argument("--check-hook", action="store_true",
+                   help="tools and both conditions: tools/agent-hooks/check-after-edit.py "
+                   "after every change to a .tach file (its errors appended to the "
+                   "tool result); result.json gets check_hook")
     p.add_argument("--keep-workspaces", action="store_true",
                    help="keep the live workspaces (a tarball is kept anyway)")
 

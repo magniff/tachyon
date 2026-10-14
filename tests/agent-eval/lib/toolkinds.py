@@ -85,7 +85,11 @@ def classify_command(seg):
         return None
     head = w[0].strip("'\"")
     base = os.path.basename(head)
-    if base == "tachyonc":
+    # (0.15) a copy (tachyonc-old, tc0) or a variable ($T) running a
+    # tachyonc subcommand counts as tachyonc
+    sub_next = len(w) > 1 and w[1] in TACH_SUBS
+    if (base.startswith("tachyonc") or (re.match(r"^tc[\w.+-]*$", base) and sub_next)
+            or (re.match(r"^\$\{?\w+\}?$", head) and sub_next)):
         for a in w[1:]:
             if a.startswith("-"):
                 continue

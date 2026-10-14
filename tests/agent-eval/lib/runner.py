@@ -12,8 +12,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 from lib import claude_backend, ollama_backend
 from lib.common import (ALL_CONDS, DEFAULT_RESULTS_DIR, REPO_ROOT, base_env,
-                        copy_tree, kill_leftovers, lang_of, load_tasks,
-                        write_json)
+                        check_hook_summary, copy_tree, final_check,
+                        install_check_hook, kill_leftovers, lang_of,
+                        load_tasks, write_json)
 from lib.grade import grade_dir, prepare_bins, tool_version
 from lib.prompts import build_prompt, guide_text
 
@@ -78,9 +79,13 @@ def one_run(ctx, task, cond, rep):
     copy_tree(os.path.join(task.path, lang), ws)
     git_init(ws, base_env(bin_dir))
 
+    # (--check-hook) the tools and both conditions: check after each change
+    hook = ((ctx["check_hook"], os.path.join(base, "check-hook.jsonl"))
+            if ctx.get("check_hook") and cond in ("tools", "both") else None)
     prompt = build_prompt(cond, task.text(), ctx.get("guide"),
                           "claude-env.md" if ctx["backend"] == "claude"
-                          and claude_backend.PERMS == "allowlist" else None)
+                          and claude_backend.PERMS == "allowlist" else None,
+                          check_hook=bool(hook))
     with open(os.path.join(rdir, "prompt.md"), "w") as fh:
         fh.write(prompt)
     backend, name = ctx["backend"], ctx["model_name"]
@@ -88,10 +93,17 @@ def one_run(ctx, task, cond, rep):
     t0 = time.time()
     try:
         mod = claude_backend if backend == "claude" else ollama_backend
-        agent = mod.run(prompt, ws, bin_dir, name, task.timeout_s, rdir)
+        agent = mod.run(prompt, ws, bin_dir, name, task.timeout_s, rdir, check_hook=hook)
     except Exception as e:  # a broken backend still leaves a result
         agent = {"error": "runner: %r" % e, "wall_s": round(time.time() - t0, 1)}
     agent["leftover_processes"] = kill_leftovers(ws)
+    if hook:
+        agent["check_hook"] = check_hook_summary(hook[1])
+        if os.path.exists(hook[1]):
+            shutil.copyfile(hook[1], os.path.join(rdir, "check-hook.jsonl"))
+    if lang == "tach":
+        # (0.15) the errors left in the workspace, by code (check --json)
+        agent["final_check"] = final_check(ws, base_env(bin_dir))
     try:
         g = grade_dir(task, lang, ws, os.path.join(base, "grade"), bin_dir)
     except Exception as e:
@@ -148,6 +160,7 @@ def main(args):
     ctx = {"model": args.model, "backend": backend, "model_name": model_name,
            "out": out, "ws_root": ws_root, "bins": bins,
            "keep_ws": args.keep_workspaces,
+           "check_hook": install_check_hook(ws_root) if args.check_hook else None,
            "versions": {"tach": tool_version(bins["tach"], "tach"),
                         "rust": tool_version(bins["rust"], "rust")}}
     if any(c in ("guide", "both") for c in conds):
@@ -158,6 +171,7 @@ def main(args):
             "date": time.strftime("%Y-%m-%dT%H:%M:%S"), "model": args.model,
             "conds": conds, "tasks": [t.id for t in tasks], "reps": args.reps,
             "claude_permissions": args.claude_permissions,
+            "check_hook": bool(args.check_hook),
             "tachyonc": os.path.abspath(args.tachyonc),
             "versions": ctx["versions"], "ws_root": ws_root}) + "\n")
     jobs = [(t, c, r) for r in range(1, args.reps + 1) for t in tasks for c in conds]

@@ -1,8 +1,9 @@
 # Errors and their fixes
 
-Compile with `--diagnostics=short` (or run `tachyonc check`): one line
-per error, `FILE:LINE:COL: error[KIND] MESSAGE | help: HELP | note:
-NOTE`, every error of every file at once (up to 50), sorted by position.
+`tachyonc check`, and a build whose output is not a terminal (an
+agent's shell, a pipe; `--diagnostics=short` anywhere): one line per
+error, `FILE:LINE:COL: error[KIND] MESSAGE | help: HELP | note: NOTE`,
+every error of every file at once (up to 50), sorted by position.
 KIND is `tokenizer error`, `parser error`, `module error`, `type error`
 or `unsafe`. Fix the first errors first: a parser error can hide
 type errors in the same function. `tachyonc query show FILE:LINE` prints

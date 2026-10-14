@@ -452,6 +452,38 @@ try: target/tachyonc --diagnostics=short broken/main.tach -c -o /dev/null
 to fix it, an example; for every code of every tool, and the compiler's
 error kinds (`explain type-error`).
 
+## JSON, for a harness (0.15)
+
+`--json`, anywhere on the command line of any command (`query`, `check`,
+`edit`, `refactor`, `fix`, `undo`, a build), prints one JSON object per
+line instead of the text: for a harness, a hook or a script, not for
+the model, which reads the text form as well and in fewer tokens.
+
+- Each diagnostic (on stderr, where the text would be): the tools'
+  `SEVERITY CODE: MESSAGE` with its `try:` lines, a compiler error, an
+  edit's new errors (on stdout, as now):
+
+  ```
+  {"kind":"diagnostic","severity":"error","code":"type error","file":"main.tach","line":4,"col":5,
+   "message":"undefined variable 'prinln'","help":["did you mean 'println'?"],"notes":[],"try":[]}
+  {"kind":"diagnostic","severity":"error","code":"query.no-match","file":null,"line":null,"col":null,
+   "message":"no definition 'nosuch'","help":[],"notes":[],"try":["tachyonc query items"]}
+  ```
+
+  `code` is the tool's code or the compiler error's kind (`type error`,
+  `parser error`, ...); `file`, `line` and `col` are null without a
+  position; positions inside the texts are `FILE:LINE:COL`. `try` holds
+  the commands as the agent would run them (without `--json`).
+- Every other line of stdout: `{"kind":"output","fields":[...]}`, its
+  TAB-separated fields ([Output formats](#output-formats)); an edit's
+  summary is `["patched crate::add","main.tach","+1 -1 lines"]`.
+- Every key is always there, in this order; new keys may be added at
+  the end.
+
+tools/agent-hooks/check-after-edit.py (the check after every edit, in
+AGENTS.md) and the agent eval's `final_check` (tests/agent-eval) read
+`check --json`. tests/refactor/json.t has a transcript.
+
 ## Programs with errors
 
 The query runs the front end as a compilation would, with its error
@@ -460,7 +492,10 @@ program, references from what the checker resolved. The errors are never
 listed: `warning query.program-errors` counts them, names the first when
 nothing answered, and gives the compilation that prints them all with
 `--diagnostics=short` (one line each:
-`FILE:LINE:COL: error[KIND] MESSAGE | help: ...`).
+`FILE:LINE:COL: error[KIND] MESSAGE | help: ...`). (0.15) A build whose
+stderr is not a terminal (an agent's shell, a pipe, a file) prints that
+form by default, the same lines as `tachyonc check`;
+`--diagnostics=human` asks for the multi-line form.
 
 ## Speed: the cache (0.13)
 
