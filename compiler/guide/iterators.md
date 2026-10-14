@@ -16,7 +16,7 @@ std's sources and adapters are small structs whose methods are
 `#[inline]`: a chain of them compiles to the loop written by hand (the
 same machine code at -O2, vectorized where the loop would be).
 
-```tach 0.14
+```tach
 fn main() -> i32 {
     let mut v: Vec<i64> = Vec::new();
     defer v.free();
@@ -78,7 +78,7 @@ over the indices: `for i in 0..v.len() { v.set(i, v.get(i) * 2); }`.
 
 ## Your own iterator
 
-```tach 0.14
+```tach
 struct Countdown { n: i64 }
 
 impl Iterator for Countdown {

@@ -1039,9 +1039,7 @@ lanes.
 
 ## Additions of 0.14
 
-(In progress: the syntax below parses; what is not checked yet is
-reported as `... are not implemented yet (check.unimplemented)`. The
-design is [design/closures-iterators.md](design/closures-iterators.md).)
+(The design is [design/closures-iterators.md](design/closures-iterators.md).)
 
 ```ebnf
 prefix     += [ "move" ] ( "||" | "|" [ cparam { "," cparam } [ "," ] ] "|" )
@@ -1147,9 +1145,61 @@ impl's only parameter is the element type): `s.second()` on a `[i64]`.
 
 ### Iterators
 
-(To come: the `Iterator` trait, in the prelude; std's sources and
-adapters; `for` over iterators; `a..b` as a value. The standard library is
-also loaded when a program uses a range as a value.)
+`for p in e body`, where `e` is not a range literal, iterates `e` by its
+type; `e` is evaluated once, into a hidden `let`:
+
+| `e` | the loop |
+|---|---|
+| a slice, an array | `for i in 0..len { let p = e[i]; body }` (0.4) |
+| `Vec<T>`, `std::SliceIter<T>` (`v.iter()`) | the same over `e.as_slice()`: a counted loop, no `next` call |
+| `std::Range<T>`, `std::RangeInclusive<T>` (`a..b`, `a..=b` as values) | `for p in e.start..e.end body` (`..=`; nothing once `e.done`) |
+| a type implementing `Iterator` | `label: loop { match e.next() { Some(p) => body, _ => break } }` |
+| a type with an `iter()` method (`HashMap`, user types) | `for p in e.iter() body` |
+| `*T` of any of these | the same through the pointer (`for x in &v`; `for x in &it` advances `it`) |
+
+Anything else is the error `'for' iterates over ranges, slices, arrays,
+iterators and types with an 'iter' method, got 'T'`. The pattern is
+irrefutable (a `let`'s); labels, `break`, `continue` and `defer` in the
+body behave as in any loop. Items are copies.
+
+`a..b` and `a..=b` outside a `for` head, a slicing and a pattern are
+values: `std::Range { start: a, end: b }` and `std::RangeInclusive {
+start: a, end: b, done: false }`, both ends of one type (`0..=255u8` is a
+`RangeInclusive<u8>`, which ends without overflow). A program that uses a
+range as a value loads std.
+
+The `Iterator` trait (in the prelude):
+
+```
+pub trait Iterator {
+    type Item;
+    fn next(self: *Self) -> Option<Self::Item>;
+    fn exact_len(self: *Self) -> i64                 // items left, or -1 (default)
+    fn at(self: *Self, k: i64) -> Self::Item         // k-th left: k = 0, 1, 2, ... while exact_len > k
+    fn map, filter, enumerate, zip, take             // adapters: Map, Filter, Enumerate, Zip, Take
+    fn fold, for_each, count, sum, min, max, collect // consumers (collect: a Vec)
+}
+```
+
+std's sources implement it: `Range`, `RangeInclusive`, `SliceIter`
+(`v.iter()`, `s.iter()` on a slice, and `as_slice()`: the items left),
+`HashMapIter` (`m.iter()`, items `(K, V)` in slot order), `Keys`
+(`m.keys()`) and `Values` (`m.values()`); each overrides `fold` with a
+counted loop, and all but the HashMap ones have an indexed `at`.
+`std::sort_by(s, f)`, `s.sort_by(f)` and `v.sort_by(f)` sort by `f(a: *T,
+b: *T) -> i64` (negative: `a` first; a heapsort). Every std iterator
+method is `#[inline]`, so that a chain becomes one loop.
+
+```
+let v: Vec<i64> = ...;
+let total = v.iter().filter(|x| x % 2 == 0).map(|x| x * x).sum();
+let mut w = v.iter().enumerate().map(|(i, x)| i * x).collect();   // a Vec: free it
+w.sort_by(|a, b| b.cmp(a));
+for (x, k) in v.iter().zip(0..10).take(3) { ... }
+```
+
+### Literals, constants, names, errors
+
 **The type of an unsuffixed literal from its neighbours.** An integer
 or float literal without a suffix (`0`, `-1`, `2.5`, a character) whose
 type no expected type gives takes the type of what stands beside it:

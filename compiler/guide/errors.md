@@ -264,12 +264,12 @@ error[type error] cannot index type 'Vec<i64>'
 ```
 `v.get(0)`, `v.set(0, x)`, `v.as_slice()[0]`.
 
-```tach 0.14
-let n = 5;
+```tach
+let n = 3;
 for x in n { }
 ```
 ```err
-error[type error] 'for' iterates over ranges, slices, arrays, iterators and types with an 'iter' method
+error[type error] 'for' iterates over ranges, slices, arrays, iterators and types with an 'iter' method, got 'i64'
 ```
 `for x in 0..n`. A type of yours iterates with `impl Iterator for T`, or
 an `iter` method returning one (`tachyonc guide iterators`).

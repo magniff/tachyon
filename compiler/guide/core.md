@@ -298,7 +298,7 @@ fn main() -> i32 {
     v.push(20);
     sort(v.as_slice());                    // in place
     v.set(0, v.get(0) + 1);                // get/set are checked
-    for x in v.as_slice() { std::print_int(x); print(" "); }
+    for x in v { std::print_int(x); print(" "); }   // also &v, v.iter()
     println("");
     let last = v.pop();                    // Option<i64>
     std::print_int(last.unwrap_or(-1));
@@ -310,9 +310,7 @@ fn main() -> i32 {
     m.insert("b", 2);
     match m.get("a") { Some(x) => std::print_int(x), None => print("none") }
     println("");
-    for i in 0..m.slots() {                // iterate by slot
-        if let Some(k) = m.key_at(i) { print(k); }
-    }
+    for (k, _) in m.iter() { print(k); }   // (K, V) pairs, in slot order
     println("");
 
     let mut b = Buf::new();                // text builder
@@ -445,6 +443,7 @@ the one hole in safe code (no lifetimes).
 | `expected ';', got '!'` | no macros: `println(...)`, `std::print_int(...)` |
 | `cannot assign to immutable variable 'x'` | `let mut x` |
 | `cannot index type 'Vec<i64>'` | `v.get(i)`, `v.as_slice()[i]` |
+| `'for' iterates over ... got 'i64'` | a range: `for x in 0..n`; a Vec, a HashMap, `v.iter()` and ranges as values iterate too (0.14) |
 | `no method 'len' on type '[u8]'` | `s.len`, a field |
 | `expected '[i64]', got '[i64; 3]'` | pass `a[..]` |
 | `expected 'i64', got 'i32'` | `x as i64` |

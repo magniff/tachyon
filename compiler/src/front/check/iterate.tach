@@ -1,27 +1,387 @@
-// `for` over iterators and ranges as values (0.14;
+// `for` over slices, arrays, iterators and ranges as values (0.14;
 // docs/design/closures-iterators.md): `for p in e` where e is not a range
-// literal, a slice or an array iterates `e` if it implements Iterator,
-// else `e.iter()`; `a..b` and `a..=b` outside `for` and slicing are
-// std's Range and RangeInclusive.
+// literal goes through check_for_iter; `a..b` and `a..=b` outside `for`
+// and slicing are std's Range and RangeInclusive (range_value).
 //
-// Phase 0: the interface, with stubs (the desugaring is the iterators
-// task's).
+// `for p in e body` becomes a block whose first statement binds e's value
+// to `__for_seq`, then a loop over it by e's type:
+//
+//   slice, array          for __for_index in 0..len { let p = __for_seq[__for_index]; body }
+//   *slice, *array        for p in *__for_seq body
+//   std's Vec, SliceIter  for p in __for_seq.as_slice() body
+//   std's Range           for p in __for_seq.start..__for_seq.end body
+//   std's RangeInclusive  if !__for_seq.done { for p in __for_seq.start..=__for_seq.end body }
+//   an Iterator           label: loop { match __for_seq.next() { std::Option::Some(p) => body, _ => break } }
+//   a type with `iter`    for p in __for_seq.iter() body
+//
+// (`*T` for a struct or enum T: the same, through the pointer.) e is
+// checked once, by the caller; the `let` is checked here, so that the
+// rest, made of new nodes, is the only part checked after it. The
+// counted forms stay counted loops, with no `next` call. `iter` is found
+// by name (Vec, HashMap, user types); `next` only through Iterator.
 
-use crate::front::ast::NODES;
-use crate::front::check::{type_error, type_error_got};
+use crate::base::intern_c;
+use crate::base::diag::{ERR_HELP, err_begin, err_end, err_help, err_str};
+use crate::front::ast::{ARM_SYNTHETIC, NODES, list_begin, list_end, list_push, new_node};
+use crate::front::ast::NodeKind::{
+    Arm, Block, Bool, Break, ExprStmt, FieldAccess, FieldInit, For, Ident, If, Index, Int, Let,
+    Loop, Match, MethodCall, PatBind, PatVariant, PatWild, Path, Range, StructLit, Unary,
+};
+use crate::front::check::{LOCALS, pop_scope, push_scope, type_error};
+use crate::front::check::calls::method_of;
+use crate::front::check::check_mode::check_expr;
+use crate::front::check::synth_mode::synth_expr;
+use crate::front::check::unsafety::is_borrow;
+use crate::front::lexer::{SUF_I64, Tok};
+use crate::front::modules::STD_MODULE;
+use crate::front::patterns::check_pattern;
+use crate::front::traits::{implements, std_trait};
+use crate::front::types::{
+    STRUCTS, TYPES, TY_ERROR, TY_UNIT, TyKind, buf_type, err_type, is_pointer,
+};
 
-// `for` loop n whose sequence (NODES[n].c, checked: its `ty` is set) is
-// not a range, a slice or an array: its type.
+// On a `for` made by the `iter` form: its sequence is the result of
+// `iter()`, which must not need another `iter()`.
+const FOR_VIA_ITER: i64 = 1 << 29;
+
+// `for` loop n whose sequence (NODES[n].c) is checked (its type is set)
+// and is not a range literal: the loop, rewritten in place as above. Its
+// type.
 pub fn check_for_iter(n: i64) -> i64 {
     unsafe {
         let seq = NODES[n].c;
-        type_error_got(seq, c"'for' loops iterate over integer ranges ('a..b'), slices and arrays",
-            NODES[seq].ty)
+        let seq_ty = NODES[seq].ty;
+        let mut t = seq_ty;
+        let through = is_pointer(t) && TYPES[t].a != 0 && is_iterable_kind(TYPES[TYPES[t].a].kind);
+        if through {
+            t = TYPES[t].a;
+        }
+        let kind = TYPES[t].kind;
+        let std_name = std_struct_name(t);
+        let iterator = std_trait(c"Iterator");
+        let is_iterator = seq_ty != TY_ERROR && iterator >= 0 && implements(iterator, t);
+        let iter_f = if seq_ty == TY_ERROR { -1 } else { method_of(t, intern_c(c"iter")) };
+        let is_slice = kind == TyKind::Slice || kind == TyKind::Array;
+        let counted = std_name == intern_c(c"Vec") || std_name == intern_c(c"SliceIter")
+            || std_name == intern_c(c"Range") || std_name == intern_c(c"RangeInclusive");
+        if seq_ty == TY_ERROR || !is_slice && !counted && !is_iterator
+            && (iter_f < 0 || (NODES[n].p & FOR_VIA_ITER) != 0) {
+            not_iterable(n, seq, seq_ty, t);
+        }
+        let start = NODES[n].start;
+        let end = NODES[n].end;
+        let seq_sym = intern_c(c"__for_seq");
+        // let __for_seq = e;   (`mut` for `next`)
+        let bind = new_node(PatBind, start, end);
+        NODES[bind].a = seq_sym;
+        let by_next = !is_slice && !counted && is_iterator;
+        NODES[bind].b = (by_next && !through) as i64;
+        let let_stmt = new_node(Let, start, end);
+        NODES[let_stmt].a = bind;
+        NODES[let_stmt].c = seq;
+        // The loop over it.
+        let pattern = NODES[n].b;
+        let body = NODES[n].d;
+        let mut rest = 0;
+        if is_slice && !through {
+            rest = index_loop(n, seq_ty);
+        } else if is_slice {
+            rest = for_copy(n, pattern, deref(ident(seq_sym, n)), body);
+        } else if std_name == intern_c(c"Vec") || std_name == intern_c(c"SliceIter") {
+            rest = for_copy(n, pattern, method_call(ident(seq_sym, n), intern_c(c"as_slice")),
+                body);
+        } else if std_name == intern_c(c"Range") || std_name == intern_c(c"RangeInclusive") {
+            let range = new_node(Range, start, end);
+            NODES[range].a = field(ident(seq_sym, n), intern_c(c"start"));
+            NODES[range].b = field(ident(seq_sym, n), intern_c(c"end"));
+            let inclusive = std_name == intern_c(c"RangeInclusive");
+            NODES[range].c = inclusive as i64;
+            rest = for_copy(n, pattern, range, body);
+            if inclusive {
+                // (exhausted by `next`: no more items)
+                let not_done = new_node(Unary, start, end);
+                NODES[not_done].op = Tok::Bang;
+                NODES[not_done].b = field(ident(seq_sym, n), intern_c(c"done"));
+                let then = block_of(rest, n);
+                rest = new_node(If, start, end);
+                NODES[rest].a = not_done;
+                NODES[rest].b = then;
+            }
+        } else if is_iterator {
+            rest = next_loop(n, ident(seq_sym, n));
+        } else {
+            rest = for_copy(n, pattern, method_call(ident(seq_sym, n), intern_c(c"iter")), body);
+            NODES[rest].p |= FOR_VIA_ITER;
+        }
+        let rest_stmt = new_node(ExprStmt, start, end);
+        NODES[rest_stmt].a = rest;
+        NODES[rest_stmt].b = 1;
+        // The block, in the loop's place, checked: the `let` by hand (e is
+        // checked), then the rest.
+        let outer = new_node(Block, start, end);
+        let mark = list_begin();
+        list_push(let_stmt);
+        list_push(rest_stmt);
+        list_end(outer, mark);
+        NODES[n] = NODES[outer];
+        push_scope();
+        check_pattern(bind, seq_ty);
+        if through && is_borrow(seq) {
+            // (`for x in &v`: a borrow, as `&v` passed directly is)
+            LOCALS[NODES[bind].x].borrow = true;
+        }
+        synth_expr(rest);
+        pop_scope();
+        NODES[n].ty = TY_UNIT;
+        TY_UNIT
     }
 }
 
-// Range n (`a..b`, `a..=b`) as a value (`expected`: 0 in synth mode): its
-// type.
+// Whether a pointer to a type of this kind is iterated through.
+fn is_iterable_kind(kind: TyKind) -> bool {
+    kind == TyKind::Struct || kind == TyKind::Enum || kind == TyKind::Slice
+        || kind == TyKind::Array
+}
+
+// The name of std's generic struct that t is an instance of (Vec,
+// Range, ...), or 0.
+fn std_struct_name(t: i64) -> i64 {
+    unsafe {
+        if STD_MODULE < 0 || TYPES[t].kind != TyKind::Struct {
+            return 0;
+        }
+        let s = TYPES[t].a;
+        if STRUCTS[s].tmpl == 0 {
+            return 0;
+        }
+        let tmpl = STRUCTS[s].tmpl - 1;
+        if STRUCTS[tmpl].module != STD_MODULE {
+            return 0;
+        }
+        STRUCTS[tmpl].name
+    }
+}
+
+// (t: the type iterated, seq's or the one it points to)
+fn not_iterable(n: i64, seq: i64, seq_ty: i64, t: i64) -> ! {
+    unsafe {
+        err_begin(NODES[seq].start);
+        err_str(c"'for' iterates over ranges, slices, arrays, iterators and types with an 'iter' method, got '");
+        err_type(seq_ty);
+        err_str(c"'");
+        if (NODES[n].p & FOR_VIA_ITER) != 0 {
+            err_help(c"its 'iter()' gives a value that is not an Iterator");
+        } else if TYPES[t].kind == TyKind::Struct || TYPES[t].kind == TyKind::Enum {
+            if method_of(t, intern_c(c"next")) >= 0 {
+                err_help(c"it has a 'next' method but does not implement Iterator: write 'impl Iterator for ");
+            } else {
+                err_help(c"implement Iterator for it: 'impl Iterator for ");
+            }
+            buf_type(ERR_HELP, t);
+            err_help(c" { type Item = ...; fn next(self: *Self) -> Option<Self::Item> { ... } }', or give it an 'iter' method that returns an iterator");
+        }
+        err_end()
+    }
+}
+
+// for __for_index in 0..len { let p = __for_seq[__for_index]; body }, for
+// `for` loop n over a slice or an array of type t, bound to __for_seq.
+fn index_loop(n: i64, t: i64) -> i64 {
+    unsafe {
+        let start = NODES[n].start;
+        let end = NODES[n].end;
+        let seq_sym = intern_c(c"__for_seq");
+        let index_sym = intern_c(c"__for_index");
+        let zero = new_node(Int, start, end);
+        NODES[zero].b = SUF_I64;
+        let len = if TYPES[t].kind == TyKind::Slice {
+            field(ident(seq_sym, n), intern_c(c"len"))
+        } else {
+            let count = new_node(Int, start, end);
+            NODES[count].a = TYPES[t].b;
+            NODES[count].b = SUF_I64;
+            count
+        };
+        let range = new_node(Range, start, end);
+        NODES[range].a = zero;
+        NODES[range].b = len;
+        // let p = __for_seq[__for_index];
+        let elem = new_node(Index, start, end);
+        NODES[elem].a = ident(seq_sym, n);
+        NODES[elem].b = ident(index_sym, n);
+        let elem_let = new_node(Let, start, end);
+        NODES[elem_let].a = NODES[n].b;
+        NODES[elem_let].c = elem;
+        let body = new_node(Block, start, end);
+        let mark = list_begin();
+        list_push(elem_let);
+        let old_body = new_node(ExprStmt, start, end);
+        NODES[old_body].a = NODES[n].d;
+        list_push(old_body);
+        list_end(body, mark);
+        let index_bind = new_node(PatBind, start, end);
+        NODES[index_bind].a = index_sym;
+        for_copy(n, index_bind, range, body)
+    }
+}
+
+// label: loop { match it.next() { std::Option::Some(p) => body, _ => break } }
+// for `for` loop n (its label, pattern and body).
+fn next_loop(n: i64, it: i64) -> i64 {
+    unsafe {
+        let start = NODES[n].start;
+        let end = NODES[n].end;
+        let m = new_node(Match, start, end);
+        NODES[m].a = method_call(it, intern_c(c"next"));
+        let some = new_node(PatVariant, start, end);
+        let std_seg = ident(intern_c(c"std"), n);
+        let prefix = new_node(Path, start, end);
+        let pmark = list_begin();
+        list_push(std_seg);
+        list_end(prefix, pmark);
+        NODES[some].h = prefix;
+        NODES[some].a = intern_c(c"Option");
+        NODES[some].b = intern_c(c"Some");
+        NODES[some].c = 1;
+        let smark = list_begin();
+        list_push(NODES[n].b);
+        list_end(some, smark);
+        let some_arm = new_node(Arm, start, end);
+        NODES[some_arm].a = some;
+        NODES[some_arm].c = NODES[n].d;
+        let brk = new_node(Break, end, end);
+        let wild = new_node(PatWild, end, end);
+        let none_arm = new_node(Arm, end, end);
+        NODES[none_arm].a = wild;
+        NODES[none_arm].c = brk;
+        NODES[none_arm].p = ARM_SYNTHETIC;
+        let amark = list_begin();
+        list_push(some_arm);
+        list_push(none_arm);
+        list_end(m, amark);
+        let lp = new_node(Loop, start, end);
+        NODES[lp].a = NODES[n].a;
+        NODES[lp].b = block_of_tail(m, n);
+        lp
+    }
+}
+
+// A copy of `for` loop n (its label) as `for pattern in seq body`.
+fn for_copy(n: i64, pattern: i64, seq: i64, body: i64) -> i64 {
+    unsafe {
+        let f = new_node(For, NODES[n].start, NODES[n].end);
+        NODES[f] = NODES[n];
+        NODES[f].b = pattern;
+        NODES[f].c = seq;
+        NODES[f].d = body;
+        NODES[f].p = NODES[n].p & ~FOR_VIA_ITER;
+        NODES[f].ty = 0;
+        f
+    }
+}
+
+fn ident(sym: i64, n: i64) -> i64 {
+    unsafe {
+        let id = new_node(Ident, NODES[n].start, NODES[n].end);
+        NODES[id].a = sym;
+        id
+    }
+}
+
+fn field(obj: i64, name: i64) -> i64 {
+    unsafe {
+        let f = new_node(FieldAccess, NODES[obj].start, NODES[obj].end);
+        NODES[f].a = obj;
+        NODES[f].b = name;
+        f
+    }
+}
+
+fn deref(e: i64) -> i64 {
+    unsafe {
+        let u = new_node(Unary, NODES[e].start, NODES[e].end);
+        NODES[u].op = Tok::Star;
+        NODES[u].b = e;
+        u
+    }
+}
+
+// `receiver.name()`.
+fn method_call(receiver: i64, name: i64) -> i64 {
+    unsafe {
+        let c = new_node(MethodCall, NODES[receiver].start, NODES[receiver].end);
+        NODES[c].a = receiver;
+        NODES[c].b = name;
+        let mark = list_begin();
+        list_end(c, mark);
+        c
+    }
+}
+
+// `{ e }` (e: a statement-like expression, for loop n's position).
+fn block_of(e: i64, n: i64) -> i64 {
+    unsafe {
+        let stmt = new_node(ExprStmt, NODES[n].start, NODES[n].end);
+        NODES[stmt].a = e;
+        NODES[stmt].b = 1;
+        let b = new_node(Block, NODES[n].start, NODES[n].end);
+        let mark = list_begin();
+        list_push(stmt);
+        list_end(b, mark);
+        b
+    }
+}
+
+// `{ e }` with e as the tail.
+fn block_of_tail(e: i64, n: i64) -> i64 {
+    unsafe {
+        let b = new_node(Block, NODES[n].start, NODES[n].end);
+        let mark = list_begin();
+        list_end(b, mark);
+        NODES[b].a = e;
+        b
+    }
+}
+
+// Range n (`a..b`, `a..=b`) as a value (`expected`: 0 in synth mode): the
+// struct literal `std::Range { start: a, end: b }` (`std::RangeInclusive
+// { start: a, end: b, done: false }`) in its place. Its type.
 pub fn range_value(n: i64, expected: i64) -> i64 {
-    unsafe { type_error(n, c"ranges can only be used as the bounds of a 'for' loop") }
+    unsafe {
+        let inclusive = NODES[n].c != 0;
+        if NODES[n].a == 0 || NODES[n].b == 0 {
+            type_error(n, c"a range used as a value needs both ends: 'a..b'");
+        }
+        if STD_MODULE < 0 {
+            type_error(n, c"a range used as a value is std's Range, and std is not loaded: write 'std::Range { start: a, end: b }'");
+        }
+        let start = NODES[n].start;
+        let end = NODES[n].end;
+        let lit = new_node(StructLit, start, end);
+        NODES[lit].a = intern_c(if inclusive { c"RangeInclusive" } else { c"Range" });
+        let prefix = new_node(Path, start, end);
+        let pmark = list_begin();
+        list_push(ident(intern_c(c"std"), n));
+        list_end(prefix, pmark);
+        NODES[lit].h = prefix;
+        let mark = list_begin();
+        list_push(field_init(intern_c(c"start"), NODES[n].a));
+        list_push(field_init(intern_c(c"end"), NODES[n].b));
+        if inclusive {
+            let no = new_node(Bool, end, end);
+            list_push(field_init(intern_c(c"done"), no));
+        }
+        list_end(lit, mark);
+        NODES[n] = NODES[lit];
+        if expected != 0 { check_expr(n, expected) } else { synth_expr(n) }
+    }
+}
+
+fn field_init(name: i64, value: i64) -> i64 {
+    unsafe {
+        let f = new_node(FieldInit, NODES[value].start, NODES[value].end);
+        NODES[f].a = name;
+        NODES[f].b = value;
+        f
+    }
 }
