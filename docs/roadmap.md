@@ -621,6 +621,14 @@ feature new in release N enters the compiler's own source in N+1
   `#[no_alloc]`, `#[no_io]`; effect bounds on trait methods; generics'
   effects inferred per instantiation
 - writing a `static mut` needs the `global` effect (denied in pure code)
+- allocation is explicit, as in Zig: an `Allocator` interface passed or
+  stored (std containers carry theirs), no allocator in scope means no
+  allocation; std provides a general-purpose allocator (with leak,
+  double-free and use-after-free detection in debug builds), an arena
+  (bump allocation, freed at once, a scoped form whose values cannot
+  escape) and a fixed-buffer allocator; `alloc` names which allocator a
+  function uses, so `#[no_alloc]` and "allocates only from its arena" are
+  checked and shown by `query effects`
 - the optimizer uses them: pure calls numbered, hoisted and memoized in
   the e-graph
 - the compiler's source moves to `?`, `derive`, interpolation and widening
@@ -637,6 +645,10 @@ feature new in release N enters the compiler's own source in N+1
   closes the dangling-borrow gap without lifetime annotations
 - raw pointers stay the escape hatch, in `unsafe`, checked by
   `--check-unsafe`
+- with the allocators of 0.16: an owned value carries its allocator,
+  moves and destructors free through it; values in an arena skip
+  per-value destruction, and second-class references keep arena data from
+  outliving its scope. One design covers ownership and allocation
 - `tachyonc fix --values` migrates the common patterns (manual `free` to
   destructors, stored slices to owned copies or indices) and gives exact
   diagnostics for the rest
@@ -654,7 +666,10 @@ feature new in release N enters the compiler's own source in N+1
   types; `#[fuzz]` entry points; snapshot tests; `tachyonc test` (with the
   `-O0` against `-O2` comparison built in) and `tachyonc reduce`
 - `type X = distinct T`; non-null pointer types
-- the compiler's source moves to mutable value semantics (0.17)
+- the compiler's source moves to mutable value semantics (0.17) and to
+  arenas: the syntax tree and types in one per compilation, the IR in one
+  per function, reset after it is emitted (compile time measured before
+  and after)
 - after 0.18 the type system has settled: the language specification is
   written (see "Toward 1.0")
 

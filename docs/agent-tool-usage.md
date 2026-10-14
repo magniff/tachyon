@@ -288,3 +288,22 @@ version); everything inside an item went through Python or `sed`.
 5. **Refactoring output in the codebase's style**: new imports merged
    into existing `use` lines with short paths, `unsafe` at function
    level, named split parts.
+
+## 0.11: why edits bypassed the tools
+
+Of the edits agents made to `.tach` files after the query-first hook went
+live, about 20% of the edits to existing compiler source went through
+`tachyonc` (the headline "8%" also counted new files, test fixtures and
+agents exercising the new tools on scratch programs). The rest were small
+changes inside one function (two to five lines: a condition, a
+statement, an expression), which the tools could only do by replacing a
+whole item. Agents read the function with `query show`, then patched it
+with a Python `s.replace(OLD, NEW)` behind an `assert`, cheap in tokens
+but unchecked, unjournaled and without undo, or with `sed -i 'Ns/.../'`
+on a line number from a compiler error, fragile once lines move.
+
+So for 0.12: `tachyonc edit patch NAME|FILE:LINE --old TEXT --new TEXT`
+(an anchor unique within one item, atomic, journaled, undoable, the file
+never read whole), `edit insert --in NAME --after ANCHOR`, the hook
+steering Python and `sed -i` rewrites of compiler source to them, and the
+metric counted on edits to existing compiler source only.
