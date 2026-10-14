@@ -16,26 +16,23 @@ often than to something else; each error names the fix.
 | `s.as_bytes()[0]`, `b'a'` | `s[0]`, `'a'` (a `u8`) |
 | `CString`, `.as_ptr()` | `c"text"` (a `*u8`); a slice is not NUL-terminated |
 | `match s { "a" => .. }` | `if s == "a" { .. } else if ...` |
-| `x.to_string()`, `s.parse()` | `Buf::push_int`; parse by hand, or C's `strtol` |
+| `x.to_string()`, `s.parse::<i64>()` | `Buf::push_int`; `std::parse_int(s)` (an `Option<i64>`) |
+| `s.trim()`, `s.split(',')`, `s.split_whitespace()` | `std::trim(s)`; `std::split(s, ',')`, `std::split_whitespace(s)`: a `Vec<[u8]>` of views of `s` (free it) |
 
 ```tach
-use std::Buf;
-
-fn parse_int(s: [u8]) -> Option<i64> {
-    if s.len == 0 { return None; }
-    let mut n = 0;
-    for ch in s {
-        if ch < '0' || ch > '9' { return None; }
-        n = n * 10 + (ch - '0') as i64;
-    }
-    Some(n)
-}
+use std::{Buf, parse_int, split};
 
 fn main() -> i32 {
     let mut b = Buf::new();
     defer b.free();
     b.push_str("sum=");
-    b.push_int(parse_int("40").unwrap() + parse_int("2").unwrap_or(0));
+    let mut parts = split("40,2", ',');
+    defer parts.free();
+    let mut sum = 0;
+    for p in parts.as_slice() {
+        sum += parse_int(p).unwrap_or(0);
+    }
+    b.push_int(sum);
     println(b.as_slice());
     if parse_int("4x").is_none() { println("not a number"); }
     0
@@ -57,6 +54,8 @@ not a number
 | `Drop`, RAII, scope guards | `defer stmt;` runs when the block exits; std types have `free()` |
 | `Box<T>`, `Rc<T>`, `Arc<T>` | none: a `Vec<T>`, or `malloc` in `unsafe` |
 | `Option<&T>` | `Option<*T>`, or an index |
+| `&mut v[i]`, `m.get_mut(&k)` | `v.as_slice()[i].f = x`; `m.get_mut(k)`: an `Option<[V]>`, a view of one element (`a[0].f += 1`) |
+| `*m.entry(k).or_insert(0) += 1` | `m.get_or_insert(k, 0)[0] += 1` |
 | `Mutex`, threads | none in tachyon (C's threads are C's business) |
 
 A `Vec`, `Buf` or `HashMap` value is a handle (a pointer, a length, a
@@ -222,7 +221,8 @@ fn main() -> i32 {
 | `extern crate`, Cargo dependencies | none: one program from its files; C through headers |
 | `pub use` | the same |
 | `std::collections::HashMap` | `std::HashMap` |
-| `std::io::stdin().read_line` | C's `getchar` or `read` (see `tachyonc guide c-interop`) |
+| `std::io::stdin().read_line(&mut s)` | `std::read_line(&buf)`: the line without its `'\n'`, false at the end of input |
+| `io::read_to_string(io::stdin())` | `std::read_stdin()`, a `Buf`; `std::Scanner` for its tokens, numbers and lines |
 | `std::env::args()` | `fn main(argc: i32, argv: **u8) -> i32` |
 
 ## unsafe and C
