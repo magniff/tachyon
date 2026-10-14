@@ -1203,6 +1203,25 @@ about the cheap and general ones:
   below b.len, so the range analysis drops the check of b[i] in std's
   slice equality, which bench/wordcount's map runs for every word (about
   8%); `tests/run/opt_equality.tach`.
+- *Division by a constant* (isel.tach, before tiling). `x / d` and
+  `x % d` for a constant d multiply by a magic number (Granlund and
+  Montgomery; Hacker's Delight, chapter 10) with a new machine operation,
+  `mulh` (the high half of the 128-bit product: `umulh`, `smulh` on
+  AArch64, one-operand `mulq`, `imulq` into rdx on x86-64, which the
+  allocator keeps free as for a division). Unsigned values up to 32 bits
+  take one `mulh` by 2^64 / d rounded up (exact below 2^32, as d < 2^32);
+  u64 a `mulh` and a shift, with the add fix-up when the magic number has
+  65 bits; signed values up to 32 bits a 64-bit product by the 33-bit magic
+  number and an arithmetic shift, i64 a `smulh` with its corrections; then
+  one more when negative (`sub q, t, t, asr #63`). The remainder is
+  `x - q * d` (`msub`), sharing q with a quotient of the same operands in
+  the block. Tachyon's results are kept: division by 0 is left to the
+  division instruction (x / 0 is 0, x % 0 is x), x / -1 is -x (MIN / -1
+  wraps to MIN). Tested by `tests/run/opt_divide_constant.tach` (every
+  kind of constant at every width, against divisions by the same numbers
+  unknown to the compiler) and a fuzz mode, `tests/fuzz/run.sh -D`
+  (`gendiv.awk`: random constants and dividends, the extremes and exact
+  multiples, every level against -O0).
 
 What remains, measured:
 
@@ -1210,12 +1229,6 @@ What remains, measured:
   `s[root]` (root is the previous iteration's child, checked then, but a
   phi has no range) and `s[child]` after the `&&` (checked on one way
   only). C has no checks; this is the safety tachyon keeps.
-- *Division by a constant* is `udiv`/`sdiv` (7 to 9 cycles on Apple
-  silicon) where clang multiplies by a magic number with `umulh`, which
-  neither back end nor encoder has yet (wordcount's `% 26` and `/ 26`,
-  json's and sort's random numbers, `Buf.push_int`). With only 64-bit
-  multiplication it could be done for dividends below 2^31, but the
-  hottest ones here are loop phis, which have no range.
 - *FMA*: clang contracts `a * b + c` by default (nbody: 27 ms against 29
   with `-ffp-contract=off`); tachyon never does, as that changes results.
 - *Floats compared for a branch* are `fcmp`, `cset`, `cbnz` on AArch64
