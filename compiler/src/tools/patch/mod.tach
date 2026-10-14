@@ -33,15 +33,18 @@ use crate::base::{
 };
 use crate::front::modules::file_of_pos;
 use crate::tools::edit::{TARGET, edit_replace};
-use crate::tools::edit::apply::apply_edit;
+use crate::tools::edit::apply::{ADD_IMPORTS, apply_edit};
 use crate::tools::edit::cli::{ambiguous, source_only, take_edit_option};
 use crate::tools::edit::items::{after_line, blank_line, indent_of, item_tail};
 use crate::tools::proc::{read_file_if, read_stdin};
-use crate::tools::query::{c_slice, ends_with_c, load_program, resolve_name, root_or_diag};
+use crate::tools::query::{
+    c_slice, def_at_line, ends_with_c, file_line, file_named, load_program, resolve_name,
+    root_or_diag,
+};
 use crate::tools::query::cache::cache_restore;
-use crate::tools::query::defs::{DEFS, K_MOD, bytes_eq, mod_fqn};
+use crate::tools::query::defs::{DEFS, DEF_COUNT, K_FIELD, K_MOD, K_VARIANT, bytes_eq, mod_fqn};
 use crate::tools::query::diagnostics::{ROOT_GIVEN, diag, program_errors, try_begin, try_end};
-use crate::tools::query::positions::{line_end, line_of, line_start};
+use crate::tools::query::positions::{LINES, line_end, line_index, line_of, line_start};
 use crate::tools::query::refs::file_text;
 use crate::tools::query::show::text_start;
 use crate::tools::query_text::region_target;
@@ -230,6 +233,8 @@ pub fn run_patch(argc: i64, argv: **u8) -> i64 {
             buf_str(summary, c"patched ");
         }
         buf_bytes(summary, buf_slice(SCOPE_NAME));
+        // (0.14: the imports the new text needs, when it has new errors)
+        ADD_IMPORTS = true;
         apply_edit(buf_slice(summary), root)
     }
 }
@@ -425,6 +430,10 @@ fn find_scope() -> bool {
             try_end(try_begin(c"items", name[0..0], false));
             return false;
         }
+        // (0.14) FILE:LINE on a line no item holds
+        if gap_scope(name) {
+            return true;
+        }
         let mut matches = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         if !resolve_name(WHAT, target(), &matches) {
             return false;
@@ -459,6 +468,51 @@ fn find_scope() -> bool {
         }
         SCOPE_START = line_start(text_start(d));
         SCOPE_END = after_line(item_tail(d) - 1);
+        true
+    }
+}
+
+// (0.14) Whether NAME is `FILE:LINE` (`FILE:LINE:COL`) on a line of a file
+// of the program that no item holds: a banner, a comment between items,
+// the header or the use lines. Then the scope is the lines between the
+// items around it: from the end of the item before (or the file's start)
+// to the text of the item after (its comments; or the file's end).
+fn gap_scope(name: [u8]) -> bool {
+    unsafe {
+        let mut line = 0;
+        let n = file_line(name, &line);
+        if n < 0 {
+            return false;
+        }
+        let f = file_named(name[0..n]);
+        if f < 0 || line < 1 {
+            return false;
+        }
+        let idx = line_index(FILES[f].start) + line - 1;
+        if idx >= LINES.count || LINES.data[idx] >= FILES[f].end || def_at_line(f, line) >= 0 {
+            return false;
+        }
+        let pos = LINES.data[idx];
+        let mut from = FILES[f].start;
+        let mut to = FILES[f].end;
+        for d in 0..DEF_COUNT {
+            if DEFS[d].kind == K_FIELD || DEFS[d].kind == K_VARIANT
+                || DEFS[d].start < FILES[f].start
+                || DEFS[d].start >= FILES[f].end {
+                continue;
+            }
+            let s = line_start(text_start(d));
+            let e = after_line(item_tail(d) - 1);
+            if e <= pos && e > from {
+                from = e;
+            }
+            if s > pos && s < to {
+                to = s;
+            }
+        }
+        SCOPE_START = from;
+        SCOPE_END = to;
+        buf_bytes(SCOPE_NAME, name);
         true
     }
 }

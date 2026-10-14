@@ -127,8 +127,10 @@ For other libraries or C files, make an object and link it yourself:
 tachyonc prog.tach -o prog.o && cc prog.o helper.c -o prog -lm
 ```
 
-Reading stdin: `getchar()` from `stdio.h`, or `read(0, buf, n)` from
-`unistd.h`, into a `Buf` or an array:
+Reading stdin: std has `read_line` and `read_stdin` (`tachyonc guide
+std`); from C, `getchar()` from `stdio.h`, or `read(0, buf, n)` from
+`unistd.h`, into a `Buf` or an array (not mixed with std's, which
+buffers):
 
 ```tach
 import "stdio.h" as c;

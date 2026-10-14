@@ -1,8 +1,9 @@
 // `tachyonc refactor --script FILE [--dry-run] [--no-check] [--root R]`
 // (0.11; docs/refactor.md): the commands of FILE (refactor, rewrite,
 // edit, fix: one per line, as typed after `tachyonc`, quoted as in sh;
-// `#` comments; `< PATH` gives a command its stdin), applied in turn and
-// checked once, at the end: all or nothing.
+// `#` comments; `< PATH` gives a command its stdin, 0.14: `<<WORD` the
+// lines after it up to a line WORD), applied in turn and checked once, at
+// the end: all or nothing.
 //
 // Each command runs in a copy of this process (fork), on the program as
 // the commands before it left it: their copies (`FILE.tachyon-edit~`)
@@ -28,8 +29,11 @@ use crate::tools::edit::apply::{
     STEP_REPORT, copy_made, copy_path, copy_rewritten, finish_edit, set_command,
 };
 use crate::tools::edit::cli::take_edit_option;
-use crate::tools::proc::{buf_cstr, fork_worker, read_file_if, remove_file, wait_any, worker_exit};
+use crate::tools::proc::{
+    buf_cstr, fork_worker, read_file_if, remove_file, wait_any, worker_exit, write_file_if,
+};
 use crate::tools::query::{c_slice, load_program, root_or_diag};
+use crate::tools::query::defs::bytes_eq;
 use crate::tools::query::diagnostics::{
     PROG, ROOT_GIVEN, TOOL, diag, program_errors, put_root, write_diags,
 };
@@ -274,6 +278,7 @@ fn script_inner(argc: i64, argv: **u8) -> i64 {
         // The steps: the words of each line, its stdin, its line number.
         let mut steps = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let mut inputs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut bodies = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let mut numbers = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let t = buf_slice(text);
         let mut p = 0;
@@ -295,10 +300,55 @@ fn script_inner(argc: i64, argv: **u8) -> i64 {
             if (*w).count == 0 {
                 continue;
             }
-            // (`< PATH`: stdin)
+            // (`< PATH`: stdin; 0.14: `<<WORD`, the lines after it up to
+            // a line WORD)
+            let cmd_line = line_no;
             let mut input = 0 as *u8;
+            let mut body = -1;
             let n = (*w).count;
-            if n >= 2 && streq((*w).data[n - 2] as *u8, c"<") {
+            let last = (*w).data[n - 1] as *u8;
+            let mut word = 0 as *u8;
+            if n >= 2 && streq((*w).data[n - 2] as *u8, c"<<") {
+                word = last;
+                (*w).count = n - 2;
+            } else if last[0] == '<' && last[1] == '<' && last[2] != 0 {
+                word = &last[2];
+                (*w).count = n - 1;
+            }
+            if word != 0 as *u8 {
+                body = buf_new();
+                let mut found = false;
+                while p < t.len && !found {
+                    let mut e2 = p;
+                    while e2 < t.len && t[e2] != '\n' {
+                        e2 += 1;
+                    }
+                    line_no += 1;
+                    let mut b = e2;
+                    while b > p && (t[b - 1] == ' ' || t[b - 1] == '\t' || t[b - 1] == '\r') {
+                        b -= 1;
+                    }
+                    if bytes_eq(t[p..b], c_slice(word)) {
+                        found = true;
+                    } else {
+                        buf_bytes(body, t[p..e2]);
+                        buf_byte(body, '\n');
+                    }
+                    p = e2 + 1;
+                }
+                if !found {
+                    let d = diag(c"error", c"refactor.script");
+                    buf_str(d, file);
+                    buf_byte(d, ':');
+                    buf_int(d, cmd_line);
+                    buf_str(d, c": no line '");
+                    buf_str(d, word);
+                    buf_str(d, c"' ends the text of <<");
+                    buf_str(d, word);
+                    buf_byte(d, '\n');
+                    return 2;
+                }
+            } else if n >= 2 && streq((*w).data[n - 2] as *u8, c"<") {
                 input = (*w).data[n - 1] as *u8;
                 (*w).count = n - 2;
             } else if (*w).data[n - 1] as *u8 != 0 as *u8 && ((*w).data[n - 1] as *u8)[0] == '<' {
@@ -309,19 +359,20 @@ fn script_inner(argc: i64, argv: **u8) -> i64 {
             if !is_tool(first)
                 || ((*w).count > 1 && streq(first, c"refactor")
                     && streq((*w).data[1] as *u8, c"--script")) {
-                return line_error(file, line_no,
+                return line_error(file, cmd_line,
                     c"not a command a script runs (refactor, rewrite, edit, fix)");
             }
             for k in 1..(*w).count {
                 if streq((*w).data[k] as *u8, c"--root")
                     || streq((*w).data[k] as *u8, c"--target") {
-                    return line_error(file, line_no,
+                    return line_error(file, cmd_line,
                         c"--root and --target are the script's, not a line's");
                 }
             }
             steps.push(w as i64);
             inputs.push(input as i64);
-            numbers.push(line_no);
+            bodies.push(body);
+            numbers.push(cmd_line);
         }
         if steps.count == 0 {
             let d = diag(c"note", c"refactor.script");
@@ -340,7 +391,24 @@ fn script_inner(argc: i64, argv: **u8) -> i64 {
         for k in 0..steps.count {
             remove_file(report);
             write_diags();
-            let status = run_step(steps.data[k] as *IntVec, inputs.data[k] as *u8, root, report);
+            // (a text after `<<WORD`: in a file next to the report, while
+            // the command runs)
+            let mut input = inputs.data[k] as *u8;
+            let stdin_buf = buf_new();
+            buf_str(stdin_buf, root);
+            buf_str(stdin_buf, c".tachyon-stdin~");
+            let stdin_path = buf_cstr(stdin_buf);
+            if bodies.data[k] >= 0 {
+                if !write_file_if(stdin_path, buf_slice(bodies.data[k])) {
+                    remove_all_copies();
+                    return line_error(file, numbers.data[k], c"cannot write the text after <<");
+                }
+                input = stdin_path;
+            }
+            let status = run_step(steps.data[k] as *IntVec, input, root, report);
+            if bodies.data[k] >= 0 {
+                remove_file(stdin_path);
+            }
             if status != 0 {
                 read_report(report);
                 remove_file(report);
