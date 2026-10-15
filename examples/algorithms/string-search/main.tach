@@ -1,0 +1,234 @@
+// String search: naive, Knuth-Morris-Pratt and Boyer-Moore-Horspool.
+//
+// Three ways to find every occurrence of a pattern in a text, overlapping
+// ones included. The text is 16 MiB of pseudo-words over the letters a to
+// h, from a seeded generator, so every run searches the same bytes; each
+// pattern is counted by all three searchers, which must agree.
+//
+//     tachyonc examples/algorithms/string-search/main.tach -o search && ./search
+//
+// A short demo prints KMP's failure table and the matches in a short
+// text; then the big text's counts go to stdout and each searcher's time
+// and throughput to stderr.
+
+import "time.h" as c;
+
+// ---------------------------------------------------------------- input
+
+// xorshift64*: a small, fast, seeded generator of 64-bit values.
+struct Rng { state: u64 }
+
+impl Rng {
+    fn new(seed: u64) -> Rng { Rng { state: seed | 1 } }
+
+    fn next(self: *Rng) -> u64 {
+        let mut x = self.state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.state = x;
+        x * 0x2545F4914F6CDD1D
+    }
+
+    // A value in lo..=hi.
+    fn range(self: *Rng, lo: i64, hi: i64) -> i64 {
+        lo + ((self.next() >> 33) % ((hi - lo + 1) as u64)) as i64
+    }
+}
+
+// `size` bytes of words of 1 to 8 letters from 'a' to 'h', separated by
+// single spaces.
+fn generate_text(size: i64, seed: u64) -> Vec<u8> {
+    let mut rng = Rng::new(seed);
+    let mut text: Vec<u8> = Vec::with_capacity(size);
+    while text.len() < size {
+        let len = rng.range(1, 8);
+        for _ in 0..len { text.push('a' + rng.range(0, 7) as u8); }
+        text.push(' ');
+    }
+    text.truncate(size);
+    text
+}
+
+// ------------------------------------------------------------ searchers
+
+// A searcher calls `found(i)` for every i where the pattern starts in
+// the text, in increasing order. Generic over the callback, so counting
+// and collecting positions are the same code, and the closure is inlined.
+trait Searcher {
+    fn each_match<F: FnMut(i64)>(self: *Self, text: [u8], found: F);
+
+    fn count(self: *Self, text: [u8]) -> i64 {
+        let mut n = 0;
+        self.each_match(text, |_| { n += 1; });
+        n
+    }
+}
+
+// Tries every position: O(n * m) at worst, but on most texts the first
+// byte already differs and it is O(n).
+struct Naive { pat: [u8] }
+
+impl Searcher for Naive {
+    fn each_match<F: FnMut(i64)>(self: *Naive, text: [u8], found: F) {
+        let mut found = found;
+        let pat = self.pat;
+        let m = pat.len;
+        let first = pat[0];
+        for i in 0..text.len - m + 1 {
+            if text[i] == first && text[i..i + m] == pat { found(i); }
+        }
+    }
+}
+
+// Knuth-Morris-Pratt: `fail[j]` is the length of the longest proper
+// prefix of pat[..j + 1] that is also its suffix. After matching j bytes
+// and failing, the search continues with fail[j - 1] bytes matched, so
+// it never moves backwards in the text: O(n + m), whatever the input.
+struct Kmp { pat: [u8], fail: Vec<i64> }
+
+impl Kmp {
+    fn new(pat: [u8]) -> Kmp {
+        let m = pat.len;
+        let mut fail = Vec::filled(m, 0);
+        let f = fail.as_slice();
+        let mut k = 0; // the border of pat[..j]
+        for j in 1..m {
+            while k > 0 && pat[j] != pat[k] { k = f[k - 1]; }
+            if pat[j] == pat[k] { k += 1; }
+            f[j] = k;
+        }
+        Kmp { pat: pat, fail: fail }
+    }
+
+    fn free(self: *Kmp) { self.fail.free(); }
+}
+
+impl Searcher for Kmp {
+    fn each_match<F: FnMut(i64)>(self: *Kmp, text: [u8], found: F) {
+        let mut found = found;
+        let pat = self.pat;
+        let f = self.fail.as_slice();
+        let m = pat.len;
+        let mut k = 0; // bytes of pat matched
+        for i in 0..text.len {
+            let b = text[i];
+            while k > 0 && b != pat[k] { k = f[k - 1]; }
+            if b == pat[k] { k += 1; }
+            if k == m {
+                found(i + 1 - m);
+                k = f[m - 1]; // overlapping matches too
+            }
+        }
+    }
+}
+
+// Boyer-Moore-Horspool: compare the window's last byte first; when the
+// window does not match, slide it so that this byte lines up with its
+// last occurrence in the pattern (all of m when it has none). On a large
+// alphabet it skips most of the text: O(n / m) at best, O(n * m) at
+// worst.
+struct Horspool { pat: [u8], shift: [i64; 256] }
+
+impl Horspool {
+    fn new(pat: [u8]) -> Horspool {
+        let m = pat.len;
+        let mut shift = [m; 256];
+        for j in 0..m - 1 { shift[pat[j]] = m - 1 - j; }
+        Horspool { pat: pat, shift: shift }
+    }
+}
+
+impl Searcher for Horspool {
+    fn each_match<F: FnMut(i64)>(self: *Horspool, text: [u8], found: F) {
+        let mut found = found;
+        let pat = self.pat;
+        let m = pat.len;
+        let last = pat[m - 1];
+        let head = pat[..m - 1];
+        let mut i = 0;
+        while i + m <= text.len {
+            let b = text[i + m - 1];
+            if b == last && text[i..i + m - 1] == head { found(i); }
+            i += self.shift[b];
+        }
+    }
+}
+
+// --------------------------------------------------------------- output
+
+fn now_ns() -> i64 {
+    let mut ts = c::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { c::timespec_get(&ts, c::TIME_UTC); }
+    ts.tv_sec * 1_000_000_000 + ts.tv_nsec
+}
+
+// The demo: the failure table, and the matches of `pat` in `text`.
+fn demo(pat: [u8], text: [u8]) {
+    let mut kmp = Kmp::new(pat);
+    defer kmp.free();
+    print("pattern  ");
+    for b in pat { print(f" {b:c}"); }
+    print("\nfailure  ");
+    for k in kmp.fail.iter() { print(f" {k}"); }
+    println("");
+    let mut at: Vec<i64> = Vec::new();
+    defer at.free();
+    kmp.each_match(text, |i| at.push(i)); // the closure collects
+    println(f"text      {text}");
+    print("matches   ");
+    let mut col = 0;
+    for i in at.iter() {
+        for _ in col..i { print(" "); }
+        print("^");
+        col = i + 1;
+    }
+    println(f"\n{at.len()} matches at {at:?}");
+}
+
+// Counts the matches of one searcher, adding the time it took to `*ns`.
+fn timed<S: Searcher>(s: *S, text: [u8], ns: *i64) -> i64 {
+    let t0 = now_ns();
+    let n = s.count(text);
+    *ns += now_ns() - t0;
+    n
+}
+
+fn main() -> i32 {
+    demo("abacab", "abacabacab abacab");
+    println("");
+
+    let size = 16 << 20;
+    let mut text = generate_text(size, 2026);
+    defer text.free();
+    let t = text.as_slice();
+    let words = t.iter().filter(|b| b == ' ').count();
+    println(f"text: {size} bytes, {words} words, letters a-h");
+    println(f"{"pattern":<12} {"matches":>8}");
+
+    let patterns = ["bad", "face", "hhhh", "a bad", "decade", "cabbage"];
+    let mut times = [0; 3];
+    for pat in patterns {
+        let naive = Naive { pat: pat };
+        let mut kmp = Kmp::new(pat);
+        defer kmp.free();
+        let horspool = Horspool::new(pat);
+        let counts = [
+            timed(&naive, t, &times[0]),
+            timed(&kmp, t, &times[1]),
+            timed(&horspool, t, &times[2]),
+        ];
+        let agree = counts[1] == counts[0] && counts[2] == counts[0];
+        println(f"{pat:<12} {counts[0]:>8}{if agree { "" } else { "  MISMATCH" }}");
+        if !agree { return 1; }
+    }
+    println("naive, kmp and horspool agree");
+
+    let names = ["naive", "kmp", "horspool"];
+    let mb = (size * patterns[..].len) as f64 / 1e6;
+    for k in 0..3 {
+        let ms = times[k] as f64 / 1e6;
+        eprintln(f"{names[k]:<9} {ms:>6.1} ms  {mb / ms * 1000.0:>6.0} MB/s");
+    }
+    0
+}
