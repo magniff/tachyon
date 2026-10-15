@@ -168,6 +168,11 @@ docs/design/errors-formatting.md; the language in docs/grammar.md,
   each type implementing it; a negated suffixed literal under an
   expected type (`let d: i64 = -9223372036854775808i64`) is no longer
   out of range.
+- **Tested on aarch64 only**: 0.15's release gate ran on aarch64-macos and
+  aarch64-linux; x86_64 (the x86_64-linux container) is off by default
+  from 0.15 (`bootstrap/gate.conf`, `gate.sh --with-x86`). Its one run on
+  0.15's tree failed only the new walkthrough sessions (a path in their
+  transcripts, fixed after).
 - **Breaking**: `read_line`, `read_stdin`, `parse_int` and
   `Scanner::next_int` return `Result` (`fix --only std015`); `==` on
   `Vec`, `Buf`, `HashMap` compares contents, no longer the pointer; the
@@ -877,9 +882,9 @@ need an idle machine.
 the `linux-x86_64` step (the emulated container: about half of the
 release gate's machine time) is not run; `--with-x86` (or
 `TACHYON_GATE_X86=1`) runs it, `--no-x86` leaves it out whatever the
-default. The x86_64 back end is still built and its unit tests run in
-the suite; programs are not run on x86_64 (nor on x86_64-macos, which
-the gate never ran: Rosetta).
+default. Since then programs are not run on x86_64 by the gate (the
+x86_64-macos suite never was: Rosetta); the x86_64 back end is still
+compiled and same-output still compares its assembly.
 
 It stays parallel without overloading the machine: the test runners
 (`tests/run.sh`, `tests/fuzz/run.sh`, `tests/abi/run.sh`,
