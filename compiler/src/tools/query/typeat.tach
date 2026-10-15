@@ -8,7 +8,7 @@ use crate::base::{
     FILES, FILE_COUNT, IntVec, SRC, STDOUT, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice,
     buf_str, buf_write_fd,
 };
-use crate::front::ast::{NODES, NODE_CAPTURE, NODE_COUNT, NODE_IMPLICIT, NodeKind};
+use crate::front::ast::{NODES, NODE_CAPTURE, NODE_COUNT, NODE_IMPLICIT, NodeKind, child};
 use crate::front::types::buf_type;
 use crate::middle::lower::ssa::HMap;
 use crate::tools::query::{parse_digits, trailing_number};
@@ -53,10 +53,12 @@ const EXPR_MAX: i64 = 100;
 
 // (0.15) Whether typed node n is one the compiler made, which the source
 // does not show: a hidden local (`__f0`, `__out`, `__t`) or what takes it
-// as its operand (`&__f0`, `__out.str(..)`), and inside an f-string or a
-// `?` (the pairs `fstrings`) anything outside its holes' expressions or
-// its operand (the pairs `holes`) but the f-string or `?` itself.
-fn made_by_compiler(n: i64, fstrings: *IntVec, holes: *IntVec) -> bool {
+// as its operand (`&__f0`, `__out.str(..)`, also once rewritten as a
+// call), a node with a hole's span and another type than its expression
+// (`&__f0` of a captured `__f0`), and inside an f-string or a `?` (the
+// pairs `fstrings`) anything outside its holes' expressions or its
+// operand (the pairs `holes`) but the f-string or `?` itself.
+fn made_by_compiler(n: i64, fstrings: *IntVec, holes: *IntVec, exprs: *IntVec) -> bool {
     unsafe {
         if hidden_name(n) {
             return true;
@@ -67,11 +69,23 @@ fn made_by_compiler(n: i64, fstrings: *IntVec, holes: *IntVec) -> bool {
                 && hidden_name(NODES[n].a)) {
             return true;
         }
+        if (k == NodeKind::Call || k == NodeKind::MethodCall) && NODES[n].count > 0 {
+            let r = child(n, 0);
+            if hidden_name(r) || (NODES[r].kind == NodeKind::Unary && hidden_name(NODES[r].b)) {
+                return true;
+            }
+        }
         if k == NodeKind::Interp || k == NodeKind::Try {
             return false;
         }
         let s = NODES[n].start;
         let e = NODES[n].end;
+        for i in 0..(*exprs).count {
+            let x = (*exprs).data[i];
+            if x != n && NODES[x].start == s && NODES[x].end == e && NODES[x].ty != NODES[n].ty {
+                return true;
+            }
+        }
         let mut i = 0;
         while i + 1 < (*fstrings).count {
             if s >= (*fstrings).data[i] && e <= (*fstrings).data[i + 1] {
@@ -197,6 +211,7 @@ pub fn query_type(arg: [u8]) -> i64 {
         // widened values, the copies an implicit cast holds, by type)
         let mut fstrings = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let mut holes = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut exprs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let mut widened = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
         for n in 1..NODE_COUNT {
             let k = NODES[n].kind;
@@ -208,6 +223,7 @@ pub fn query_type(arg: [u8]) -> i64 {
             } else if k == NodeKind::InterpHole && NODES[n].a > 0 {
                 holes.push(NODES[NODES[n].a].start);
                 holes.push(NODES[NODES[n].a].end);
+                exprs.push(NODES[n].a);
             } else if k == NodeKind::Try && NODES[n].a > 0 {
                 // (a `?`: what it is checked as, but its operand)
                 fstrings.push(NODES[n].start);
@@ -229,7 +245,7 @@ pub fn query_type(arg: [u8]) -> i64 {
             // (0.15: an implicit cast is shown as the value it widens; what
             // the compiler writes for an f-string or a `?` is not shown)
             if (NODES[n].kind == NodeKind::Cast && (NODES[n].p & NODE_IMPLICIT) != 0)
-                || made_by_compiler(n, &fstrings, &holes) {
+                || made_by_compiler(n, &fstrings, &holes, &exprs) {
                 continue;
             }
             if col >= 1 && (NODES[n].start > pos || NODES[n].end <= pos) {

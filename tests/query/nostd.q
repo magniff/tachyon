@@ -2,13 +2,13 @@
 ## the program does not define, its source by `std`, grep in it, a
 ## show with the `use` line a program needs.
 $ def std::read_line Vec::push
-std::read_line	<std>:1552:8	fn	pub fn read_line(line: *Buf) -> Result<bool, IoError>
+std::read_line	<std>:1637:8	fn	pub fn read_line(line: *Buf) -> Result<bool, IoError>
 std::Vec::push	<std>:185:12	method	pub fn push(self: *Vec<T>, x: T)
 $ def read_line twice
-std::read_line	<std>:1552:8	fn	pub fn read_line(line: *Buf) -> Result<bool, IoError>
+std::read_line	<std>:1637:8	fn	pub fn read_line(line: *Buf) -> Result<bool, IoError>
 crate::twice	nostd/main.tach:4:4	fn	fn twice(x: i64) -> i64
 $ show std::print_int
-// std::print_int	<std>:1898-1902
+// std::print_int	<std>:1983-1987
 // use std::print_int;
 pub fn print_int(v: i64) {
     let mut f = Fmt::to_fd(1);
@@ -21,7 +21,7 @@ $ text std:1-2
 2	// (compiler/std/embed.sh makes compiler/src/front/stdsrc.tach from this file
 $ grep 'pub fn read_line' --in std
 # <std>
-1552:1	code	std	pub fn read_line(line: *Buf) -> Result<bool, IoError> {
+1637:1	code	std	pub fn read_line(line: *Buf) -> Result<bool, IoError> {
 $ def no_such_name
 error query.no-match: no definition 'no_such_name'
 try: tachyonc query items

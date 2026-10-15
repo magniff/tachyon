@@ -14,7 +14,7 @@ $ type types015/main.tach:23:20 types015/main.tach:23:37 types015/main.tach:23:5
 P	p
 i64	p.x + q.y
 i32	n
-$ refs P
+$ refs P --in types015/main.tach
 # types015/main.tach
 3:8	def	struct P { x: i64, y: i64 }
 20:13	init	main	let p = P { x: 1, y: 2 };
