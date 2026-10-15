@@ -139,7 +139,7 @@ The last expression of a block, without `;`, is its value; `if`, `match`,
 ```tach
 struct Point { x: i64, y: i64 }
 
-enum Shape { Circle(Point, i64), Rect(Point, Point), Empty }
+enum Shape { Circle(Point, i64), Rect { min: Point, max: Point }, Empty }
 
 impl Point {
     fn new(x: i64, y: i64) -> Point { Point { x: x, y: y } }   // Point::new(1, 2)
@@ -150,7 +150,7 @@ impl Point {
 fn area(s: Shape) -> i64 {
     match s {
         Shape::Circle(_, r) => 3 * r * r,
-        Shape::Rect(a, b) => (b.x - a.x) * (b.y - a.y),
+        Shape::Rect { min, max } => (max.x - min.x) * (max.y - min.y),
         Shape::Empty => 0,
     }
 }
@@ -158,7 +158,8 @@ fn area(s: Shape) -> i64 {
 fn main() -> i32 {
     let mut p = Point::new(1, 2);
     p.shift(10);                          // passes &p
-    let shapes = [Shape::Rect(Point::new(0, 0), p), Shape::Circle(p, 2), Shape::Empty];
+    let shapes = [Shape::Rect { min: Point::new(0, 0), max: p }, Shape::Circle(p, 2),
+        Shape::Empty];
     for s in shapes {
         std::print_int(area(s));
         print(" ");
@@ -181,8 +182,11 @@ fn main() -> i32 {
 7 fives
 ```
 
-A match must cover every value; arms can have `|`, ranges `a..=b` and
-guards `if`. `use Shape::{Circle, Empty};` lets variants be written
+A variant's fields are by position (`Circle(Point, i64)`) or by name
+(`Rect { min: Point, max: Point }`, 0.17: made as `Shape::Rect { min: a,
+max }` in any order, matched as `Shape::Rect { min, .. }`; a variant's
+fields are read only through patterns, as in Rust). A match must cover
+every value; arms can have `|`, ranges `a..=b` and guards `if`. `use Shape::{Circle, Empty};` lets variants be written
 without `Shape::`. `==` compares structs, enums, tuples and arrays field
 by field; `[u8]` compares by bytes, a `Vec` or `HashMap` by contents.
 

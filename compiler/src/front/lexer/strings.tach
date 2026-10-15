@@ -3,7 +3,9 @@
 // literals (lex_fstring: FHead, the holes' tokens, FMid, FTail), character
 // literals and their escapes; STRS, the strings' table.
 
-use crate::base::{BUFS, SRC, alloc_zeroed, buf_byte, buf_clear, grow, memcpy};
+use crate::base::{
+    BUFS, SRC, alloc_zeroed, buf_byte, buf_bytes, buf_clear, buf_new, buf_slice, grow, memcpy,
+};
 use crate::base::diag::{err_begin, err_end, err_fmt, err_help, err_str, err_try_fmt, error_at};
 use crate::front::lexer::{
     LEX_END, LEX_POS, LEX_SCRATCH, STRS, STR_CAP, STR_COUNT, TOK_COUNT, Tok, at_end, lex_token,
@@ -325,8 +327,9 @@ pub fn lex_char() {
 }
 
 // (0.17) An unterminated character literal at `start`: a Rust label or
-// lifetime (`'outer:`, `'a`) has no quote in tachyon; several characters
-// are a string (the try: line).
+// lifetime (`'outer:`, `'a`) has no quote in tachyon (a label: the line
+// respelled, `outer: loop { break :outer; }`, is the try: line); several
+// characters are a string (the try: line).
 fn unterminated_char(start: i64) -> ! {
     unsafe {
         err_begin(start);
@@ -335,17 +338,69 @@ fn unterminated_char(start: i64) -> ! {
         while e < LEX_END && SRC[e] != '\'' && SRC[e] != '\n' {
             e += 1;
         }
-        let mut word = start + 1;
-        while word < LEX_END && (SRC[word] == '_' || SRC[word] >= 'a' && SRC[word] <= 'z'
-            || SRC[word] >= 'A' && SRC[word] <= 'Z' || SRC[word] >= '0' && SRC[word] <= '9') {
-            word += 1;
+        let word = ident_end(start + 1);
+        let mut before = start;
+        while before > 0 && SRC[before - 1] == ' ' {
+            before -= 1;
         }
-        if e < LEX_END && SRC[e] == '\'' && e > start + 2 {
+        let after_jump = (before >= 5 && SRC[before - 5..before] == "break")
+            || (before >= 8 && SRC[before - 8..before] == "continue");
+        let label = word > start + 1 && word < LEX_END && SRC[word] != '\''
+            && (SRC[word] == ':' || after_jump);
+        if label {
+            err_help(c"a label has no quote: `outer: loop { break :outer; }`");
+            err_try_fmt(label_line(start));
+        } else if e < LEX_END && SRC[e] == '\'' && e > start + 2 {
             err_help(c"a character literal is one byte; text is a string");
             err_try_fmt(f"\"{SRC[start + 1..e]}\"");
         } else if word > start + 1 {
             err_help(c"labels and lifetimes have no quote: `outer: loop { break :outer; }`; tachyon has no lifetimes (`&'a T` is `*T`)");
         }
         err_end()
+    }
+}
+
+// The end of the identifier from `i` (i itself when none starts there).
+fn ident_end(i: i64) -> i64 {
+    unsafe {
+        let mut j = i;
+        while j < LEX_END && (SRC[j] == '_' || SRC[j] >= 'a' && SRC[j] <= 'z'
+            || SRC[j] >= 'A' && SRC[j] <= 'Z' || SRC[j] >= '0' && SRC[j] <= '9') {
+            j += 1;
+        }
+        j
+    }
+}
+
+// The line of `start` with Rust's labels respelled: `'outer:` as
+// `outer:`, `break 'outer` as `break :outer` (character literals kept).
+fn label_line(start: i64) -> [u8] {
+    unsafe {
+        let mut eol = start;
+        while eol < LEX_END && SRC[eol] != '\n' {
+            eol += 1;
+        }
+        let b = buf_new();
+        let mut i = start;
+        while i > 0 && SRC[i - 1] != '\n' {
+            i -= 1;
+        }
+        while i < start && (SRC[i] == ' ' || SRC[i] == '\t') {
+            i += 1;
+        }
+        while i < eol {
+            let j = ident_end(i + 1);
+            if SRC[i] == '\'' && j > i + 1 && (j == eol || SRC[j] != '\'') {
+                if j == eol || SRC[j] != ':' {
+                    buf_byte(b, ':');
+                }
+                buf_bytes(b, SRC[i + 1..j]);
+                i = j;
+                continue;
+            }
+            buf_byte(b, SRC[i]);
+            i += 1;
+        }
+        buf_slice(b)
     }
 }

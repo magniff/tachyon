@@ -80,9 +80,10 @@ what replaces `vec!`, `format!`, `assert!` and the others.
 'outer: for i in 0..3 { break 'outer; }
 ```
 ```err
-error[tokenizer error] unterminated character literal
+error[tokenizer error] unterminated character literal | help: a label has no quote: `outer: loop { break :outer; }` | try: outer: for i in 0..3 { break :outer; }
 ```
-Labels have no quote: `outer: for i in 0..3 { break :outer; }`.
+Labels have no quote: `outer: for i in 0..3 { break :outer; }` (the
+try: line is yours, respelled).
 
 ```tach
 let o: Option<i64> = Some(1);
@@ -272,17 +273,35 @@ error[type error] unknown variant 'A'
 `E::A(x)`, or `use E::{A, B};` once.
 
 ```tach
-struct P { x: i64 }
+enum Ev { Key { code: i64, shift: bool }, Quit }
 fn main() -> i32 {
-    let p = P { x: 1 };
-    if p == P { x: 1 } { println("same"); }
-    0
+    let e = Ev::Key(1, false);
+    match e { Ev::Key(c, _) => c as i32, Ev::Quit => 0 }
 }
 ```
 ```err
-error[parser error] expected ';' or '}' after expression, got ':'
+error[type error] variant 'Ev::Key' has named fields; give them by name | try: Ev::Key { code: 1, shift: false }
 ```
-In a condition, parenthesize a struct literal: `if p == (P { x: 1 })`.
+A struct-like variant (0.17) is built and matched by name, as in Rust:
+`Ev::Key { code: 1, shift: false }`, `Ev::Key { code, .. } => code`.
+
+```tach
+enum Ev { Key { code: i64, shift: bool }, Quit }
+fn code(e: Ev) -> i64 {
+    match e { Ev::Key { code } => code, Ev::Quit => 0 }
+}
+```
+```err
+error[type error] the pattern of 'Ev::Key' does not mention field 'shift' | help: match it too, or end the pattern with '..' to leave the rest out | try: Ev::Key { code, .. }
+```
+
+```tach
+enum Ev { Key { code: i64, shift: bool }, Quit }
+fn code(e: Ev) -> i64 { e.code }
+```
+```err
+error[type error] cannot access field 'code' on type 'Ev' | help: a variant's fields are read through a pattern (no '.field' on an enum) | try: if let Ev::Key { code, .. } = e { ... }
+```
 
 ## Slices, Vec, std
 

@@ -96,7 +96,8 @@ struct_decl  = "struct" ident [ generics ] "{" [ field { "," field } [ "," ] ] "
 union_decl   = "union" ident "{" [ field { "," field } [ "," ] ] "}" ;   (* (0.3) #[repr(C)] only *)
 field        = [ "pub" ] ident ":" type ;              (* pub (0.5): fields are as visible as their struct *)
 enum_decl    = "enum" ident [ generics ] "{" [ variant { "," variant } [ "," ] ] "}" ;   (* (0.3) *)
-variant      = ident [ "(" type { "," type } [ "," ] ")" ] [ "=" expr ] ;  (* "=": fieldless enums only *)
+variant      = ident [ "(" type { "," type } [ "," ] ")"   (* "=": fieldless enums only *)
+                     | "{" [ ident ":" type { "," ident ":" type } [ "," ] ] "}" ] [ "=" expr ] ;   (* struct-like (0.17) *)
 impl_block   = "impl" [ generics ] [ path "for" ] type "{" { [ attributes ] [ "pub" ] fn_decl } "}" ;
                                                        (* (0.3); generics, a type with arguments: (0.5); a trait's: (0.9) *)
 trait_decl   = "trait" ident "{" { [ attributes ] [ "unsafe" ] "fn" ident [ generics ] "(" [ params ] ")" [ "->" type ] ( ";" | block ) } "}" ;
@@ -114,7 +115,15 @@ those. Constant arithmetic wraps like run-time arithmetic.
 **Enums** *(0.3)*. A fieldless enum's variants have discriminants (0, 1, ...
 unless given with `= expr`); such an enum is a scalar, compared with `==`
 and `!=` and cast to an integer with `as`. Variants with fields are tuple
-variants. Values are written `E::V` and `E::V(a, b)`.
+variants, `V(A, B)`, or struct-like ones (0.17), `V { a: A, b: B }`. Values
+are written `E::V`, `E::V(a, b)` and `E::V { a: x, b }` (a struct literal's
+form: every field once, in any order, `b` for `b: b`; the fields are
+evaluated in the order written). A struct-like variant is laid out as the
+tuple variant of its fields' types in declaration order; its fields are read
+only through patterns (`E::V { a, .. }`), not with `.a`, and it is neither
+built nor matched by position (`E::V(x, y)` is an error that names the
+form to write). `#[derive]` treats it as the tuple variant, and Debug writes
+`V { a: 1, b: 2 }`.
 
 **Impl blocks** *(0.3)* hold the methods and associated functions of a
 struct or enum. A function whose first parameter is named `self`, of type
@@ -155,15 +164,25 @@ single   = "_" | [ "mut" ] ident                      (* a binding, or a constan
          | ident "::" ident [ "(" [ pattern { "," pattern } [ "," ] ] ")" ]   (* (0.3) a variant *)
          | ident "::" ident "..=" ident "::" ident    (* (0.4) variants in declaration order *)
          | ident "(" [ pattern { "," pattern } [ "," ] ] ")"   (* (0.4) a variant brought in by `use` *)
+         | [ ident "::" ] ident "{" [ fpat { "," fpat } ] [ "," ".." ] [ "," ] "}"   (* (0.17) a variant's fields by name *)
          | "(" [ pattern { "," pattern } [ "," ] ] ")" ;
-literal  = [ "-" ] int_lit | char_lit | "true" | "false" | ident ;   (* ident: a constant *)
+literal  = [ "-" ] int_lit | char_lit | "true" | "false" | ident   (* ident: a constant *)
+         | ident "::" ident { "::" ident } ;          (* (0.17) a constant's path: i8::MIN, m::TOP *)
+fpat     = [ "mut" ] ident | ident ":" pattern ;       (* `a` is `a: a` *)
 ```
 
-`(p)` is `p`; `(p,)` is a one-element tuple pattern. An identifier that
-names a constant (and no local) is that constant's value; any other is a
-binding. Every alternative of an or-pattern binds the same variables, with
-the same types. The patterns of `let` and `for` must match every value
-(no literals, ranges, alternatives, or variants of enums with several).
+`(p)` is `p`; `(p,)` is a one-element tuple pattern. A path matched
+against an integer is a constant (0.17): `i8::MIN..=-1`, `0..=m::TOP`,
+`i64::MAX` alone; against an enum, `E::A..=E::C` is a variant range. A
+variant's pattern by name (0.17) names each field once, in any order; with
+`..` (last) the fields it leaves out match anything, without it every
+field is named (`E::V { .. }` matches the variant whatever its fields, a
+tuple variant's too). The enum's path may have module segments (`m::E::V {
+.. }`). An identifier that names a constant (and no local) is that
+constant's value; any other is a binding. Every alternative of an
+or-pattern binds the same variables, with the same types. The patterns of
+`let` and `for` must match every value (no literals, ranges, alternatives,
+or variants of enums with several).
 
 ## Statements and blocks
 
@@ -209,7 +228,7 @@ postfix     = "(" [ expr { "," expr } [ "," ] ] ")"     (* call *)
 primary     = int_lit | float_lit | char_lit | string_lit | cstring_lit | "true" | "false"
             | segment { "::" segment }               (* a name; (0.3) a variant or an associated function
                                                          (T::m); (0.5) an item of a module (m::f, a::b::T::m) *)
-            | segment { "::" segment } "{" [ field_init { "," field_init } [ "," ] ] "}"   (* struct (or union: one field) literal *)
+            | segment { "::" segment } "{" [ field_init { "," field_init } [ "," ] ] "}"   (* struct (or union: one field) literal; (0.17) a struct-like variant's *)
             | "(" ")" | "(" expr ")" | "(" expr "," [ expr { "," expr } [ "," ] ] ")"
             | "[" "]" | "[" expr ";" expr "]" | "[" expr { "," expr } [ "," ] "]"
             | [ label ] block_like ;
@@ -228,7 +247,9 @@ cond        = expr ;                                  (* without struct literals
 
 In conditions (`if`, `while`) and `for` ranges, `Name {` starts the body, not
 a struct literal; inside parentheses, brackets, braces and call arguments
-struct literals are allowed again (`if f(P { x: 1 }) { ... }`).
+struct literals are allowed again (`if f(P { x: 1 }) { ... }`). (0.17)
+`Name { a: ...` (a field name and its colon, not a labelled loop) is a
+literal there too: `match E::V { a: 1 } { ... }`.
 
 `return`, `break` and `continue` are expressions of type `!`, which coerces
 to every type (`let d = if ok { v } else { return -1 };`). A `loop` has the

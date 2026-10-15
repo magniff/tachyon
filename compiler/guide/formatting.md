@@ -9,8 +9,9 @@ family, and `#[derive]`.
 whose type has `Display` (`{expr:?}`: `Debug`). It is a value too (an
 `std::Interp`), passed to anything taking `T: Display`: `print`,
 `println`, `eprint`, `eprintln` (stderr), `format` (a new `Buf`, the
-caller frees it), `b.push_fmt(..)` (appends to a `Buf`), `f.write(..)`
-(inside a Display impl). A plain `"..."` never formats: `"{x}"` is
+caller frees it), `b.push_fmt(..)` (appends to a `Buf`; 0.17:
+`b.push_str(f"..")` is the same call), `f.write(..)` (inside a Display
+impl). A plain `"..."` never formats: `"{x}"` is
 those three bytes (a literal holding `{name}` of a local passed to
 `println` gets a warning, `try: f"..."`).
 
@@ -101,7 +102,7 @@ escaped: `"a\n"`), `Vec<T>`, `Option`, `Result` and `HashMap` (`[1, 2]`,
 struct Point { x: i64, y: i64 }
 
 #[derive(Debug)]
-enum Shape { Circle(i64), Rect(Point, Point), Empty }
+enum Shape { Circle(i64), Rect(Point, Point), Line { from: Point, len: i64 }, Empty }
 
 impl Display for Point {
     fn fmt(self: *Point, f: *Fmt) {
@@ -114,7 +115,7 @@ fn main(gpa: Gpa) -> i32 {
     let mut q = p.clone();
     q.x = 5;
     println(f"{p} {q:?}");
-    let shapes = [Shape::Circle(3), Shape::Rect(p, q), Shape::Empty];
+    let shapes = [Shape::Circle(3), Shape::Rect(p, q), Shape::Line { from: p, len: 4 }, Shape::Empty];
     for s in shapes { println(f"{s:?}"); }
     let mut v: Vec<i64> = Vec::new_in(gpa);
     defer v.free();
@@ -128,6 +129,7 @@ fn main(gpa: Gpa) -> i32 {
 (1, 2) Point { x: 5, y: 2 }
 Circle(3)
 Rect(Point { x: 1, y: 2 }, Point { x: 5, y: 2 })
+Line { from: Point { x: 1, y: 2 }, len: 4 }
 Empty
 [1, 2] Some(2) "hi"
 ```
