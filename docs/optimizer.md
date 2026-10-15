@@ -1462,3 +1462,76 @@ at the latch (a rotated `while i < n && i < m`) is not merged (the tests
 must be at the top); next-based `filter` keeps a bounds check the hand
 loop does not have (its position is a phi of two loops' phis); the
 sort kernel's comparator, threaded, still leaves an unused comparison.
+
+## 0.16: calls the effects make pure
+
+0.16's front end infers each function's effects
+([design/effects-allocation.md](design/effects-allocation.md)); the
+optimizer reads them as attributes and does three things with calls it
+did not do before.
+
+**Attributes from the front end** (`ipo::front_attrs`, ORed into
+`call_attrs` for every direct call): no raw `diverge` is `willreturn`
+(new information: the IR loses `willreturn` on any cycle, while the
+front end knows a counted `for` ends), no raw `panic` is `nopanic`, and
+a C function whose effects have no `alloc`, `io` or `global` and whose
+parameters are all numbers is `readnone`. A C function the program
+declares nothing about has the builtin table's effects
+(`front/effects/builtin.tach`, `known_c_effects`): libm none (so
+`readnone`, as 0.6's `PURE_LIBM` list had it, now the whole of libm),
+`mem*`/`str*` none, the allocation functions `alloc(extern)`, stdio and
+POSIX I/O `io`, `exit`/`abort` `io diverge` (and so not `nopanic`: a C
+function that may not return may stop the program). The lowering's own
+C calls (`callc`) take the table too, `readnone` when their arguments
+are floats.
+
+**Value numbering of calls** (`gvn.tach`): a direct call with a scalar
+result whose callee is `readnone` is hashed like a pure instruction, by
+its callee and its arguments, in the scoped table of the dominator-tree
+walk: a call dominated by an equal one is that one's value (the first
+returned, and a `readnone` callee's result depends on its arguments
+alone). A `readonly` callee's calls are merged within a block while
+nothing in between may write what they read: a store or copy outside
+the caller's private slots, or a call that writes. At -O2 a function's
+callees get their attributes only once they are optimized, after the
+function's first value numbering; a function with two such calls of one
+callee is simplified again after inlining (`repeated_pure_calls`).
+
+**Loop-invariant calls** (`licm.tach`): a direct call with a scalar
+result, `readnone`, its arguments defined outside the loop, moves to the
+preheader when it is also `willreturn` and `nopanic` (it may then run
+where the loop would not have run it: on no path, or once for a call
+that ran on some iterations), or when it is certain to run in the
+loop's first iteration before anything visible (`runs_first`): its
+block dominates every block that leaves the loop or goes back to its
+header, no inner loop comes before it, and the calls that may run
+before it in an iteration are `readonly`, `willreturn` and `nopanic`. A
+store before it does not matter: if the moved call stops the program
+or never returns, nothing reads that memory again. A call after a
+`printf` in the loop stays (the print must come first when the call
+runs forever).
+
+**Allocation through the Allocator trait** costs no call where it need
+not. Gpa's methods are `#[inline]`, so `gpa.alloc(64, 8)` is `malloc(64)`
+plus a null check, and `heap_to_stack` turns a block that does not
+escape into a frame slot as before; the null check of the slot's
+address now folds (instruction combining: the address of a slot, a
+static or constant data, plus a small offset, is not null), and with it
+goes the comparison that made the slot escape. An arena's bump path,
+written as std's will be (the fast path in `try_alloc`, the refill in a
+`#[cold]` function of its own), inlines into its caller: a load of the
+state, the aligned bump, a compare with the limit, a store, and the
+refill call on the cold edge.
+
+Tests: `tests/run/opt_effects_cse.tach` (readnone calls merged across
+blocks, libm's `sqrt`, readonly calls merged and not merged across a
+store), `opt_effects_licm.tach` (a `readnone` call that may loop forever
+hoisted because it runs first, a `readnone willreturn nopanic` call
+under a condition hoisted, one after a print and one reading a static
+the loop writes left in place), `opt_effects_arena.tach` (the bump path
+without a call, heap to stack through Gpa). Benchmarks:
+`bench/purecall.tach` against `bench/purecall_hoisted.tach` (the same
+with the calls hoisted and merged by hand), whose -O2 ratio bench/run.sh
+checks against 1.05 like the iterator and f-string pairs; and
+`bench/arena_trees.tach` (binarytrees with arenas through the Allocator
+trait, its C twin `arena_trees.c`).

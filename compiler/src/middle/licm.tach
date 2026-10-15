@@ -16,11 +16,14 @@ use crate::middle::gvn::{
     address_base, build_dom_tree, call_may_write, copy_dst, copy_size, find_escaping_slots, is_copy,
     may_alias, root_of,
 };
-use crate::middle::ipo::call_writes;
-use crate::middle::ir::{
-    BLOCKS, INSTS, IRF, IRFUNCS, Op, Term, ir_append, ir_new_block, ir_resolve_operands, ir_unlink,
+use crate::middle::ipo::{
+    ATTR_NOPANIC, ATTR_READNONE, ATTR_READONLY, ATTR_WILLRETURN, call_attrs, call_writes,
 };
-use crate::middle::ir::cfg::{pred_index, redirect_succ};
+use crate::middle::ir::{
+    BLOCKS, INSTS, IRF, IRFUNCS, Op, Term, ir_append, ir_arg, ir_new_block, ir_resolve_operands,
+    ir_unlink,
+};
+use crate::middle::ir::cfg::{pred_index, redirect_succ, succ, succ_count};
 use crate::middle::opt::{dominates, resolve_all};
 
 static mut LOOPS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -158,10 +161,86 @@ fn is_invariant(v: i64, stamp: i64, start: i64, count: i64) -> bool {
             }
             return !loop_may_write(start, count, base, offset, type_size(INSTS[v].ty));
         }
+        if op.is_call() {
+            return call_invariant(v, stamp, start, count);
+        }
         if !op.is_pure() && !op.is_vector() {
             return false;
         }
         defined_outside(INSTS[v].a, stamp) && defined_outside(INSTS[v].b, stamp)
+    }
+}
+
+// (0.16) Whether call v (in loop l's body, blocks marked `stamp`) may move
+// to the preheader: a direct call with a scalar result, READNONE, its
+// arguments defined outside; and either WILLRETURN and NOPANIC (it may
+// run where the loop would not have run it), or certain to run in the
+// loop's first iteration before anything a panic or a stop would make
+// visible (then it runs once, earlier, with the same arguments).
+fn call_invariant(v: i64, stamp: i64, start: i64, count: i64) -> bool {
+    unsafe {
+        let op = INSTS[v].op;
+        if op != Op::Call && op != Op::CallC || INSTS[v].ty == 0 || INSTS[v].c != 0 {
+            return false;
+        }
+        let attrs = call_attrs(v);
+        if (attrs & ATTR_READNONE) == 0 {
+            return false;
+        }
+        for i in 0..INSTS[v].nargs {
+            if !defined_outside(ir_arg(v, i), stamp) {
+                return false;
+            }
+        }
+        let speculable = ATTR_WILLRETURN | ATTR_NOPANIC;
+        if (attrs & speculable) == speculable {
+            return true;
+        }
+        runs_first(v, stamp, start, count)
+    }
+}
+
+// Whether v runs in every iteration that completes, and in the first one
+// before anything visible: its block dominates every block of the loop
+// that leaves it or goes back to its header, and the instructions that
+// may run before it in an iteration are not calls that may panic, stop,
+// loop forever or write (I/O included).
+fn runs_first(v: i64, stamp: i64, start: i64, count: i64) -> bool {
+    unsafe {
+        let b = INSTS[v].block;
+        let quiet = ATTR_WILLRETURN | ATTR_NOPANIC | ATTR_READONLY;
+        for i in start..start + count {
+            let x = LOOP_BODY.data[i];
+            let mut leaves = false;
+            for k in 0..succ_count(x) {
+                let s = succ(x, k);
+                if BLOCKS[s].mark != stamp || s == LOOP_BODY.data[start] {
+                    leaves = true;
+                }
+            }
+            if leaves && !dominates(b, x) {
+                return false;
+            }
+            if x != b && dominates(b, x) {
+                continue;
+            }
+            // (An inner loop before v may run forever.)
+            for k in 0..succ_count(x) {
+                let s = succ(x, k);
+                if s != LOOP_BODY.data[start] && dominates(s, x) {
+                    return false;
+                }
+            }
+            // Before v (all of x, or b up to v).
+            let mut w = BLOCKS[x].first;
+            while w != 0 && w != v {
+                if INSTS[w].op.is_call() && (call_attrs(w) & quiet) != quiet {
+                    return false;
+                }
+                w = INSTS[w].next;
+            }
+        }
+        true
     }
 }
 

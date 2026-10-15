@@ -1,0 +1,156 @@
+// arena_trees (0.16): bench/binarytrees.tach with its nodes in arenas: a
+// tree per iteration bumps through an arena that is reset after it, the
+// long-lived tree has an arena of its own. The allocations go through
+// the Allocator trait (`a.alloc(16, 8)`, generic code), and the bump path
+// must inline without a call, so that this runs faster than binarytrees
+// (malloc and free per node). (A small arena of its own until std's Arena
+// is made, 0.16 T2: the same fast path, a chunk list.)
+extern "C" {
+    fn printf(format: *u8, ...) -> i32;
+    fn malloc(size: u64) -> *u8;
+    fn free(p: *u8);
+}
+
+// Chunks of memory, bumped through; each chunk's first 8 bytes point to
+// the chunk before it.
+struct ArenaState { base: *u8, used: i64, limit: i64, total: i64 }
+
+struct Bump { s: *ArenaState }
+
+const CHUNK: i64 = 1 << 20;
+
+impl Allocator for Bump {
+    fn try_alloc(self: *Bump, size: i64, align: i64) -> *u8 {
+        unsafe {
+            let s = self.s;
+            let at = ((*s).used + align - 1) & (0 - align);
+            if at + size <= (*s).limit {
+                (*s).used = at + size;
+                return &(*s).base[at];
+            }
+            bump_refill(s, size, align)
+        }
+    }
+
+    unsafe fn try_resize(self: *Bump, p: *u8, old_size: i64, new_size: i64, align: i64) -> *u8 {
+        let q = self.try_alloc(new_size, align);
+        if q != 0 as *u8 {
+            let n = if old_size < new_size { old_size } else { new_size };
+            for i in 0..n {
+                q[i] = p[i];
+            }
+        }
+        q
+    }
+
+    unsafe fn free(self: *Bump, p: *u8, size: i64, align: i64) {
+    }
+}
+
+// A new chunk for an allocation that did not fit.
+#[cold]
+#[inline(never)]
+unsafe fn bump_refill(s: *ArenaState, size: i64, align: i64) -> *u8 {
+    let need = size + align + 8;
+    let bytes = if need > CHUNK { need } else { CHUNK };
+    let chunk = malloc(bytes as u64);
+    if chunk == 0 as *u8 {
+        return chunk;
+    }
+    *(chunk as **u8) = (*s).base;
+    (*s).base = chunk;
+    (*s).limit = bytes;
+    (*s).total += bytes;
+    let at = (((chunk as i64) + 8 + align - 1) & (0 - align)) - (chunk as i64);
+    (*s).used = at + size;
+    &chunk[at]
+}
+
+// Gives back every chunk but one, as large as all of them were.
+unsafe fn bump_reset(s: *ArenaState) {
+    if (*s).base == 0 as *u8 {
+        return;
+    }
+    if *((*s).base as **u8) != 0 as *u8 {
+        let total = (*s).total;
+        bump_free(s);
+        let chunk = malloc(total as u64);
+        *(chunk as **u8) = 0 as *u8;
+        (*s).base = chunk;
+        (*s).limit = total;
+        (*s).total = total;
+    }
+    (*s).used = 8;
+}
+
+unsafe fn bump_free(s: *ArenaState) {
+    let mut c = (*s).base;
+    while c != 0 as *u8 {
+        let next = *(c as **u8);
+        free(c);
+        c = next;
+    }
+    (*s).base = 0 as *u8;
+    (*s).used = 0;
+    (*s).limit = 0;
+    (*s).total = 0;
+}
+
+struct Node { left: *Node, right: *Node }
+
+fn make<A: Allocator>(a: *A, depth: i64) -> *Node {
+    let n = a.alloc(16, 8) as *Node;
+    unsafe {
+        if depth > 0 {
+            (*n).left = make(a, depth - 1);
+            (*n).right = make(a, depth - 1);
+        } else {
+            (*n).left = 0 as *Node;
+            (*n).right = 0 as *Node;
+        }
+    }
+    n
+}
+
+unsafe fn check(n: *Node) -> i64 {
+    if (*n).left == 0 as *Node {
+        return 1;
+    }
+    1 + check((*n).left) + check((*n).right)
+}
+
+fn main() -> i32 {
+    let min_depth = 4;
+    let max_depth = 16;
+    let stretch = max_depth + 1;
+    let mut state = ArenaState { base: 0 as *u8, used: 0, limit: 0, total: 0 };
+    let mut long_state = ArenaState { base: 0 as *u8, used: 0, limit: 0, total: 0 };
+    let a = Bump { s: &state };
+    let long_arena = Bump { s: &long_state };
+    unsafe {
+        let t = make(&a, stretch);
+        printf(c"stretch tree of depth %ld\t check: %ld\n", stretch, check(t));
+        bump_reset(&state);
+    }
+    let long_lived = make(&long_arena, max_depth);
+    let mut depth = min_depth;
+    while depth <= max_depth {
+        let iterations = 1 << (max_depth - depth + min_depth);
+        let mut sum = 0;
+        for _ in 0..iterations {
+            unsafe {
+                let t = make(&a, depth);
+                sum += check(t);
+                bump_reset(&state);
+            }
+        }
+        unsafe { printf(c"%ld\t trees of depth %ld\t check: %ld\n", iterations, depth, sum); }
+        depth += 2;
+    }
+    unsafe {
+        printf(c"long lived tree of depth %ld\t check: %ld\n", max_depth, check(long_lived));
+        bump_free(&state);
+        bump_free(&long_state);
+    }
+    0
+}

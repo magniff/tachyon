@@ -8,7 +8,9 @@
 # last (0.14), the time of bench/iterchain.tach (iterator chains) over
 # that of bench/iterloop.tach (the same loops by hand) at -O2, which fails
 # the run above 1.05, and (0.15) the same for bench/fmtloop.tach
-# (f-strings) over bench/fmtints.tach (Buf's push_int). Those ratios are
+# (f-strings) over bench/fmtints.tach (Buf's push_int), and (0.16) for
+# bench/purecall.tach (calls of pure functions left in loops) over
+# bench/purecall_hoisted.tach (hoisted and merged by hand). Those ratios are
 # measured on their own, robust to a busy machine: the two -O2 programs
 # run alternately, RUNS rounds of one run each, and each side's time is
 # its fastest round.
@@ -43,7 +45,7 @@ while [ $# -gt 0 ]; do
         -s) SEED=$2; shift 2 ;;
         -r) RUNS=$2; shift 2 ;;
         -t) TARGET=$2; shift 2 ;;
-        *) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+        *) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
     esac
 done
 if [ -z "$TARGET" ]; then
@@ -120,6 +122,8 @@ for source in "$ROOT"/bench/*.tach "$ROOT/examples/md5.tach"; do
                 iterloop) LOOP_MS=$ms ;;
                 fmtloop) FMT_MS=$ms ;;
                 fmtints) INTS_MS=$ms ;;
+                purecall) PURE_MS=$ms ;;
+                purecall_hoisted) HOISTED_MS=$ms ;;
             esac
         fi
         if [ -z "$reference" ]; then
@@ -182,4 +186,7 @@ if [ -n "${CHAIN_MS:-}" ] && [ -n "${LOOP_MS:-}" ]; then
 fi
 if [ -n "${FMT_MS:-}" ] && [ -n "${INTS_MS:-}" ]; then
     ratio fmtloop "$FMT_MS" fmtints "$INTS_MS" "f-strings"
+fi
+if [ -n "${PURE_MS:-}" ] && [ -n "${HOISTED_MS:-}" ]; then
+    ratio purecall "$PURE_MS" purecall_hoisted "$HOISTED_MS" "calls of pure functions"
 fi

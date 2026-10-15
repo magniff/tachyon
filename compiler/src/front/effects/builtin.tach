@@ -1,12 +1,68 @@
-// The effects of C functions declared without effect declarations (0.16;
-// T1 makes the table): libm, mem* and str* none; malloc, calloc, realloc,
-// free, strdup `alloc(extern)`; stdio and POSIX I/O `io`; exit and abort
-// `io diverge`; anything else unknown (docs/design/effects-allocation.md
-// §2.2). It replaces middle's PURE_LIBM.
+// The effects of C functions declared without effect declarations (0.16):
+// libm, mem* and str* none; malloc, calloc, realloc, free, strdup
+// `alloc(extern)`; stdio and POSIX I/O `io`; exit and abort `io diverge`;
+// anything else unknown (docs/design/effects-allocation.md §2.2). It
+// replaces middle's PURE_LIBM (0.16 T4): the optimizer reads it through
+// ipo::front_attrs.
 
-use crate::front::effects::{Effects, effects_top};
+use crate::base::{IntVec, intern};
+use crate::front::effects::{
+    EFF_ALLOC_EXTERN, EFF_DIVERGE, EFF_IO, EFF_RAW_DIVERGE, Effects, effects_top,
+};
+
+// (symbol, bits) pairs, made on first use.
+static mut KNOWN_C: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// Each name of `names` (separated by spaces) has effects `bits`.
+fn known(names: [u8], bits: i64) {
+    unsafe {
+        let mut start = 0;
+        for i in 0..names.len + 1 {
+            if i == names.len || names[i] == ' ' as u8 {
+                if i > start {
+                    KNOWN_C.push(intern(names[start..i]));
+                    KNOWN_C.push(bits);
+                }
+                start = i + 1;
+            }
+        }
+    }
+}
+
+fn make_table() {
+    // libm (C's errno is not something tachyon reads).
+    known("fabs fabsf floor floorf ceil ceilf trunc truncf round roundf fmod", 0);
+    known("fmodf sqrt sqrtf cbrt cbrtf hypot hypotf pow powf exp expf exp2 exp2f", 0);
+    known("expm1 expm1f log logf log2 log2f log10 log10f log1p log1pf sin sinf", 0);
+    known("cos cosf tan tanf asin asinf acos acosf atan atanf atan2 atan2f sinh", 0);
+    known("sinhf cosh coshf tanh tanhf fmin fminf fmax fmaxf copysign copysignf", 0);
+    known("rint rintf nearbyint nearbyintf ldexp ldexpf fma fmaf", 0);
+    // Memory and strings: none (they read and write through their pointers).
+    known("memcpy memmove memset memcmp memchr strlen strnlen strcmp strncmp", 0);
+    known("strchr strrchr strstr strcpy strncpy strcat strncat strspn strcspn abs", 0);
+    known("labs llabs", 0);
+    known("malloc calloc realloc free strdup strndup posix_memalign aligned_alloc",
+        EFF_ALLOC_EXTERN);
+    known("printf fprintf dprintf vprintf vfprintf puts putchar fputs fputc putc", EFF_IO);
+    known("fwrite fread fflush fopen fclose fgets fgetc getc getchar ungetc scanf", EFF_IO);
+    known("fscanf perror write read open close lseek pread pwrite fsync unlink", EFF_IO);
+    known("isatty", EFF_IO);
+    known("exit abort _exit _Exit", EFF_IO | EFF_DIVERGE | EFF_RAW_DIVERGE);
+}
 
 // The effects of the C function with symbol sym.
 pub fn known_c_effects(sym: i64) -> Effects {
-    effects_top()
+    unsafe {
+        if KNOWN_C.count == 0 {
+            make_table();
+        }
+        let mut i = 0;
+        while i < KNOWN_C.count {
+            if KNOWN_C.data[i] == sym {
+                return Effects { bits: KNOWN_C.data[i + 1], allocs: 0 };
+            }
+            i += 2;
+        }
+        effects_top()
+    }
 }

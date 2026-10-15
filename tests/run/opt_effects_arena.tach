@@ -1,0 +1,117 @@
+// (0.16) Allocation through the Allocator trait costs no call where it
+// need not: an arena's bump path (here a small arena of the test's own,
+// shaped like std's: the fast path inline, the refill a cold function)
+// inlines into its caller without a call, and a block from Gpa that does
+// not escape is a frame slot (heap to stack through Gpa's inlined
+// methods: no malloc, no free, the null check folded).
+// EXPECT: 2047 1 84 2047
+// CHECK: fn make:
+// CHECK-NOT: try_alloc
+// CHECK: call bump_refill
+// CHECK: fn scratch:
+// CHECK-NOT: call
+// CHECK: ret
+// CHECK: fn main:
+extern "C" {
+    fn printf(format: *u8, ...) -> i32;
+    fn malloc(n: u64) -> *u8;
+}
+
+struct BumpState { base: *u8, used: i64, limit: i64, chunks: i64 }
+
+struct Bump { s: *BumpState }
+
+impl Allocator for Bump {
+    fn try_alloc(self: *Bump, size: i64, align: i64) -> *u8 {
+        unsafe {
+            let s = self.s;
+            let at = ((*s).used + align - 1) & (0 - align);
+            if at + size <= (*s).limit {
+                (*s).used = at + size;
+                return &(*s).base[at];
+            }
+            bump_refill(s, size, align)
+        }
+    }
+
+    unsafe fn try_resize(self: *Bump, p: *u8, old_size: i64, new_size: i64, align: i64) -> *u8 {
+        let q = self.try_alloc(new_size, align);
+        if q != 0 as *u8 {
+            let n = if old_size < new_size { old_size } else { new_size };
+            for i in 0..n {
+                q[i] = p[i];
+            }
+        }
+        q
+    }
+
+    unsafe fn free(self: *Bump, p: *u8, size: i64, align: i64) {
+    }
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn bump_refill(s: *BumpState, size: i64, align: i64) -> *u8 {
+    let bytes = if size + align > 65536 { size + align } else { 65536 };
+    let chunk = malloc(bytes as u64);
+    if chunk == 0 as *u8 {
+        return chunk;
+    }
+    (*s).base = chunk;
+    (*s).limit = bytes;
+    (*s).chunks += 1;
+    let at = (((chunk as i64) + align - 1) & (0 - align)) - (chunk as i64);
+    (*s).used = at + size;
+    &chunk[at]
+}
+
+struct Node { left: *Node, right: *Node }
+
+fn make(a: *Bump, depth: i64) -> *Node {
+    let n = a.alloc(16, 8) as *Node;
+    unsafe {
+        if depth > 0 {
+            (*n).left = make(a, depth - 1);
+            (*n).right = make(a, depth - 1);
+        } else {
+            (*n).left = 0 as *Node;
+            (*n).right = 0 as *Node;
+        }
+    }
+    n
+}
+
+fn check(n: *Node) -> i64 {
+    unsafe {
+        if (*n).left == 0 as *Node {
+            return 1;
+        }
+        1 + check((*n).left) + check((*n).right)
+    }
+}
+
+fn scratch(gpa: Gpa, k: i64) -> i64 {
+    let mut g = gpa;
+    let p = g.alloc(64, 8) as *i64;
+    let mut s = 0;
+    unsafe {
+        for i in 0..8 {
+            p[i] = i * k;
+        }
+        for i in 0..8 {
+            s += p[i];
+        }
+        g.free(p as *u8, 64, 8);
+    }
+    s
+}
+
+fn main(gpa: Gpa) -> i32 {
+    // (Through a function value: not inlined into main.)
+    let f = scratch;
+    let mut state = BumpState { base: 0 as *u8, used: 0, limit: 0, chunks: 0 };
+    let a = Bump { s: &state };
+    let t = make(&a, 10);
+    unsafe { printf(c"%ld %ld %ld %ld\n", check(t), state.chunks, f(gpa, 3), check(t)); }
+    0
+}
