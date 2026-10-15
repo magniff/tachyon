@@ -33,6 +33,7 @@ starter's compiler in `target/tachyonc` (and `target/tools/tachyonc` for
 compiler-tools), AGENTS.md for the condition, CLAUDE.md and .claude/
 removed (the prompt carries AGENTS.md), `git init` with one commit."""
 
+import json
 import os
 import re
 import shutil
@@ -377,6 +378,11 @@ def grade(task, src, scratch, builder, starter_compiler):
                 entry["note"] = "no cases match"
             elif rc is None:
                 entry["note"] = "timeout"
+            elif rc != 0 and not totals:
+                # tests/run.sh stopped before running a case (a stale
+                # generated file, a missing tool): its first lines say why
+                entry["note"] = "stopped before the cases"
+                entry["head"] = "\n".join(text.strip().splitlines()[:8])[:800]
             g["suite"].append(entry)
             steps.append(entry["ok"])
         if task.same_output:
@@ -463,9 +469,78 @@ def summary(g):
     for s in g["suite"]:
         parts.append("%s %s%s" % (s["filter"], "ok" if s["ok"] else "FAIL",
                                   "" if s["ok"] else " " + ",".join(s["fails"][:3])
-                                  + (" (" + s["note"] + ")" if s.get("note") else "")))
+                                  + (" (" + s["note"] + ")" if s.get("note") else "")
+                                  + (": " + s["head"].splitlines()[0][:120]
+                                     if s.get("head") else "")))
     if g["same_output_ok"] is not None:
         parts.append("same-output " + ("ok" if g["same_output_ok"] else "DIFFERS"))
     if g["check_ok"] is not None:
         parts.append("grade.sh " + ("ok" if g["check_ok"] else "FAIL: " + g["check_msg"][-200:]))
     return "; ".join(parts)
+
+
+# ---------------------------------------------------------------- regrade
+
+def regrade_main(args):
+    """run.py regrade RUNDIR...: grades finished compiler-task runs again
+    from what they kept, without the agent: the starter tree (built, cached
+    under --ws-root) with the run's changes.patch applied, graded as `run`
+    grades it. grade.json is replaced and result.json's grading fields are
+    updated (the old ones kept as `regraded_from`). --only-stopped picks the
+    runs where a suite filter stopped before running any case."""
+    from lib.common import load_tasks, write_json
+    tasks = {t.id: t for t in load_tasks(None, None, "compiler")}
+    ws_root = os.path.abspath(args.ws_root or os.path.join(
+        os.environ.get("TMPDIR", "/tmp"), "tachyon-eval", "regrade"))
+    os.makedirs(ws_root, exist_ok=True)
+    runs = []
+    for top in args.rundirs:
+        for root, _, files in os.walk(top):
+            if "result.json" in files and "changes.patch" in files:
+                runs.append(root)
+    infos = {}
+    n = 0
+    for rdir in sorted(runs):
+        with open(os.path.join(rdir, "result.json")) as fh:
+            res = json.load(fh)
+        task = tasks.get(res["task"])
+        if not task or res.get("lang") != "compiler":
+            continue
+        gpath = os.path.join(rdir, "grade.json")
+        old = json.load(open(gpath)) if os.path.exists(gpath) else {}
+        if args.only_stopped and not any(
+                not s.get("ok") and s.get("failed") is None and s.get("note") != "timeout"
+                for s in old.get("suite", [])):
+            continue
+        if task.id not in infos:
+            sha = res.get("base_commit") or resolve_base(task)[1]
+            builder = builder_for(sha, args.builder)
+            infos[task.id] = (sha, builder, built_tree(task, sha, builder, ws_root))
+        sha, builder, st = infos[task.id]
+        tree = os.path.join(ws_root, "regrade-tree")
+        if os.path.exists(tree):
+            shutil.rmtree(tree)
+        copy_tree(st, tree, skip=("target",))
+        patch = os.path.join(rdir, "changes.patch")
+        if os.path.getsize(patch):
+            r = subprocess.run(["git", "apply", "--binary", "--whitespace=nowarn",
+                                os.path.abspath(patch)], cwd=tree, capture_output=True,
+                               text=True)
+            if r.returncode != 0:
+                print("skip %s: changes.patch does not apply: %s" % (rdir, r.stderr.strip()[:200]))
+                continue
+        g = grade(task, tree, os.path.join(ws_root, "regrade-grade"), builder,
+                  os.path.join(st, "target", "tachyonc"))
+        write_json(gpath, g)
+        prev = {k: res.get(k) for k in ("success", "tests_passed", "tests_total", "build_ok",
+                                         "check_ok", "same_output_ok", "grade_summary")}
+        res.update({"success": g["success"], "tests_passed": g["tests_passed"],
+                    "tests_total": g["tests_total"], "build_ok": g["build_ok"],
+                    "check_ok": g.get("check_ok"), "same_output_ok": g.get("same_output_ok"),
+                    "grade_summary": summary(g), "regraded_from": prev})
+        write_json(os.path.join(rdir, "result.json"), res)
+        n += 1
+        print("%s %s -> %s: %s" % (rdir, "OK" if prev["success"] else "FAIL",
+                                   "OK" if g["success"] else "FAIL", res["grade_summary"]))
+    print("regraded %d run(s)" % n)
+    return 0

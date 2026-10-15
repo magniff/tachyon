@@ -59,6 +59,29 @@ def lang_of(cond):
     return "rust" if cond == "rust" else "tach"
 
 
+# macOS mktemp without a template ignores $TMPDIR (and so does -t): it
+# makes the file in the per-user temp directory (/var/folders/...), which the
+# agent's sandbox does not let it write. The repository's scripts call it so
+# (compiler/std/embed.sh, compiler/guide/embed.sh, and tests/run.sh through
+# `embed.sh -c`), so every agent's bin directory has this shim: no template,
+# one in $TMPDIR (the sandbox's own temp directory inside Claude Code).
+MKTEMP_SHIM = """#!/bin/sh
+# (agent eval) mktemp with a template in $TMPDIR when none is given
+for a in "$@"; do
+    case "$a" in -*) ;; *) exec /usr/bin/mktemp "$@" ;; esac
+done
+exec /usr/bin/mktemp "$@" "${TMPDIR:-/tmp}/tmp.XXXXXXXXXX"
+"""
+
+
+def install_mktemp_shim(bin_dir):
+    p = os.path.join(bin_dir, "mktemp")
+    with open(p, "w") as fh:
+        fh.write(MKTEMP_SHIM)
+    os.chmod(p, 0o755)
+    return p
+
+
 def base_env(bin_dir):
     env = {
         "HOME": os.environ.get("HOME", ""),

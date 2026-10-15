@@ -6,6 +6,7 @@ the guide, with the tools, with both) against the same tasks in Rust.
     run.py list [--set ...]
     run.py run --model M --cond C[,C...] [--tasks T,...] [--reps N] [--jobs J] [--out DIR]
     run.py report RUNDIR... [--md docs/eval/FILE.md]
+    run.py regrade RUNDIR... [--only-stopped]   (compiler tasks)
 
 README.md next to this file has the details."""
 
@@ -81,6 +82,16 @@ def main(argv):
     p.add_argument("rundirs", nargs="+", metavar="RUNDIR")
     p.add_argument("--md", help="write the report here (and FILE.json next to it)")
 
+    p = sub.add_parser("regrade", help="compiler tasks: grade finished runs again from "
+                       "their changes.patch, without the agent")
+    p.add_argument("rundirs", nargs="+", metavar="RUNDIR")
+    p.add_argument("--only-stopped", action="store_true",
+                   help="only runs where a suite filter stopped before any case")
+    p.add_argument("--ws-root", help="where the starter trees are built and the grading "
+                   "runs (default $TMPDIR/tachyon-eval/regrade)")
+    p.add_argument("--builder", help="the compiler that builds the base (default: the "
+                   "release its releases.toml names)")
+
     args = ap.parse_args(argv)
     if args.cmd == "check-tasks":
         from lib import checktasks
@@ -96,6 +107,9 @@ def main(argv):
     if args.cmd == "run":
         from lib import runner
         return runner.main(args)
+    if args.cmd == "regrade":
+        from lib import ctasks
+        return ctasks.regrade_main(args)
     if args.cmd == "report":
         from lib import report
         return report.main(args)

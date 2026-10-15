@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from lib import claude_backend, ctasks, ollama_backend
 from lib.common import (ALL_CONDS, COMPILER_CONDS, DEFAULT_RESULTS_DIR, REPO_ROOT,
                         base_env, check_hook_summary, copy_tree, final_check,
-                        install_hooks, kill_leftovers, lang_of, load_tasks,
+                        install_hooks, install_mktemp_shim, kill_leftovers, lang_of, load_tasks,
                         private_paths, query_hook_summary, write_json)
 from lib.grade import grade_dir, prepare_bins, tool_version
 from lib.prompts import build_prompt, compiler_prompt, guide_text
@@ -85,6 +85,7 @@ def one_run(ctx, task, cond, rep):
     os.makedirs(bin_dir)
     tool = "tachyonc" if lang == "tach" else "rustc"
     os.symlink(os.path.join(ctx["bins"][lang], tool), os.path.join(bin_dir, tool))
+    install_mktemp_shim(bin_dir)
     copy_tree(os.path.join(task.path, lang), ws)
     git_init(ws, base_env(bin_dir))
 
@@ -171,6 +172,7 @@ def one_compiler_run(ctx, task, cond, rep):
         shutil.rmtree(base)
     ws, bin_dir = os.path.join(base, "ws"), os.path.join(base, "bin")
     os.makedirs(bin_dir)
+    install_mktemp_shim(bin_dir)
     env = base_env(bin_dir)
     try:
         ctasks.setup_workspace(task, cond, info["sha"], ws, info["builder"], info["starter"],
