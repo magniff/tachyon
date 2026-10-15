@@ -1,52 +1,37 @@
-// Calls: direct calls and calls through a function value, their arguments
-// against the parameters (generic functions instantiated), paths
-// (`m::f`, `T::f`, `Enum::Variant`) and the calls through them, and
-// method calls (`x.m()`, with `&x` or `*x` as its `self` needs).
+// Calls
 
-use crate::base::{
-    BUFS, SRC, SYMS, buf_byte, buf_bytes, buf_fmt, buf_new, buf_slice, buf_str, intern, sym_text,
-};
+use crate::base::{BUFS, SYMS, buf_bytes, buf_new, buf_slice, buf_str};
 use crate::base::diag::{
-    ERR_HELP, err_begin, err_end, err_failed_name, err_help, err_help_fmt, err_help_sym, err_int,
-    err_str, err_sym, err_try_fmt, err_try_tool, error_at,
+    ERR_HELP, err_begin, err_end, err_failed_name, err_help, err_help_sym, err_int, err_str,
+    err_sym, err_try_tool, error_at,
 };
 use crate::front::assoc::ensure_checked;
-use crate::front::ast::{
-    NODES, VK_LOAD, VK_NEW, VK_SPLAT, child, list_begin, list_end, list_push, new_node,
-};
-use crate::front::ast::NodeKind::{Call, Ident, Index, Path, Range, Unary, VariantLit};
-use crate::front::check::{
-    LOCALS, Res, SELF_SYM, SELF_TYPE, SELF_TYPE_SYM, is_std_named, lookup_local, name_error,
-};
-use crate::front::check::args::{arity_help, int_limit_help, normalize_args};
-use crate::front::check::assign::is_place;
+use crate::front::ast::{NODES, VK_LOAD, VK_NEW, VK_SPLAT, child};
+use crate::front::ast::NodeKind::{Ident, Path, VariantLit};
+use crate::front::check::{Res, SELF_SYM, SELF_TYPE, SELF_TYPE_SYM, lookup_local, name_error};
+use crate::front::check::args::{arity_help, normalize_args};
+use crate::front::check::calls::{method_of, offer_template_methods, path_member_error};
 use crate::front::check::check_mode::check_expr;
-use crate::front::check::collect::{
-    GMETHODS, GMETHOD_COUNT, find_generic_method, template_variant_named,
-};
+use crate::front::check::collect::{find_generic_method, template_variant_named};
 use crate::front::check::interp::{brace_warning, direct_call, direct_kind};
 use crate::front::check::names::{
-    CALLEE_POS, NEAR_ALL, NEAR_COLLECT, NODE_RESOLVED, Near, fn_value_type, help_closest_names,
-    help_near_item, help_nearest, near_to, std_has, unknown_name_error,
+    CALLEE_POS, NEAR_ALL, NEAR_COLLECT, NODE_RESOLVED, fn_value_type, help_near_item, help_nearest,
+    near_to, unknown_name_error,
 };
 use crate::front::check::resolve::{resolve_key, resolve_named};
 use crate::front::check::synth_mode::synth_expr;
-use crate::front::check::unsafety::{
-    U_C_CALL, U_METHOD, U_PTR_ARG, check_call_safety, is_borrow, unsafe_op,
-};
-use crate::front::check::vectors::{make_vecop, sym_is_c, vector_method};
+use crate::front::check::unsafety::{U_C_CALL, U_PTR_ARG, check_call_safety, is_borrow, unsafe_op};
+use crate::front::check::vectors::{make_vecop, sym_is_c};
 use crate::front::check::widen::int_limit;
 use crate::front::closures::{closure_call, closure_of_type};
 use crate::front::convert::{generic_trait_call, template_trait_call};
-use crate::front::derive::intrinsic::{has_intrinsic_method, intrinsic_method};
 use crate::front::generics::{
-    TPL_NONE, TPL_SLICE, check_arg, env_lookup, hint_for, instance_targs, targ_count_error,
-    template_instance, template_name, template_of_key,
+    TPL_NONE, check_arg, env_lookup, hint_for, instance_targs, targ_count_error, template_instance,
+    template_name, template_of_key,
 };
 use crate::front::generics::instantiate::{
     HINT_TY_PATH, fn_instance, infer_enum, instantiate_call, push_written_targs,
 };
-use crate::front::lexer::Tok;
 use crate::front::modules::{CUR_MOD, C_MODULE, MODULES, STD_MODULE};
 use crate::front::modules::lookup::{
     B_ITEM, B_MODULE, B_NONE, B_PRIVATE, B_TVARIANT, B_VARIANT, SYM_CRATE, SYM_STD, SYM_SUPER,
@@ -55,14 +40,11 @@ use crate::front::modules::lookup::{
 };
 use crate::front::traits::{bounded_param, require_in_bounds};
 use crate::front::types::{
-    ENUMS, FNS, METHODS, METHOD_COUNT, STRUCTS, SYM_FN, SYM_PRIMITIVE, TLISTS, TSCRATCH, TYPES,
-    TY_UNIT, TyKind, VARIANTS, buf_type, enum_type, enum_variant, err_type, find_field, find_method,
-    find_variant, fn_param, is_compound, is_ffi_safe, is_fn_type, is_integer, is_pointer, is_vector,
-    item_node_of, ptr_to, slice_of, type_elem, variant_field,
+    FNS, SYM_FN, SYM_PRIMITIVE, TLISTS, TSCRATCH, TYPES, TyKind, VARIANTS, buf_type, enum_type,
+    err_type, find_variant, fn_param, is_ffi_safe, is_fn_type, is_integer, is_pointer, is_vector,
+    item_node_of, type_elem, variant_field,
 };
 use crate::tools::query::command_line::{qnote, qnote_module};
-
-// ---- Calls ----
 
 fn is_variadic_arg_type(t: i64) -> bool {
     is_ffi_safe(t)
@@ -222,8 +204,6 @@ pub fn check_direct_call(n: i64, f: i64) -> i64 {
         FNS[f].ret
     }
 }
-
-// ---- Paths, variants and methods ----
 
 // What the type part of a path `T::m` names: a type (returned), or a
 // generic struct or enum without its type arguments (PATH_TPL set, -1
@@ -457,216 +437,6 @@ fn bind_impl_params(f: i64, t: i64) {
     }
 }
 
-// The method or associated function `name` of type t: of its impl
-// blocks, or a template of the generic impl blocks of its template.
-pub fn method_of(t: i64, name: i64) -> i64 {
-    unsafe {
-        let f = find_method(t, name);
-        if f >= 0 {
-            return f;
-        }
-        let kind = TYPES[t].kind;
-        if kind == TyKind::Struct && STRUCTS[TYPES[t].a].tmpl != 0 {
-            return find_generic_method(STRUCTS[TYPES[t].a].tmpl, name);
-        }
-        if kind == TyKind::Enum && ENUMS[TYPES[t].a].tmpl != 0 {
-            return find_generic_method(-ENUMS[TYPES[t].a].tmpl, name);
-        }
-        // (0.14: `impl<T> [T]`)
-        if kind == TyKind::Slice {
-            return find_generic_method(TPL_SLICE, name);
-        }
-        -1
-    }
-}
-
-// Offers near the names of type t's methods (with `self`; with
-// associated functions too unless methods_only), of its impl blocks and of
-// its template's (0.14: an unknown method's `did you mean`).
-pub fn offer_methods(near: *Near, t: i64, methods_only: bool) {
-    unsafe {
-        for i in 0..METHOD_COUNT {
-            if METHODS[i].ty == t && (!methods_only || is_method(METHODS[i].f)) {
-                near.offer(METHODS[i].name);
-            }
-        }
-        let kind = TYPES[t].kind;
-        let mut tpl = 0;
-        if kind == TyKind::Struct && STRUCTS[TYPES[t].a].tmpl != 0 {
-            tpl = STRUCTS[TYPES[t].a].tmpl;
-        } else if kind == TyKind::Enum && ENUMS[TYPES[t].a].tmpl != 0 {
-            tpl = -ENUMS[TYPES[t].a].tmpl;
-        }
-        if tpl != 0 {
-            offer_template_methods(near, tpl, methods_only);
-        }
-    }
-}
-
-// The same for the methods of template tpl (as find_generic_method).
-pub fn offer_template_methods(near: *Near, tpl: i64, methods_only: bool) {
-    unsafe {
-        for i in 0..GMETHOD_COUNT {
-            if GMETHODS[i].ty == tpl && (!methods_only || is_method(GMETHODS[i].f)) {
-                near.offer(GMETHODS[i].name);
-            }
-        }
-    }
-}
-
-// The help of an unknown method a Rust programmer calls on a slice, an
-// array or a Vec (0.14): what tachyon writes instead.
-fn rust_method_help(t: i64, name: i64) {
-    unsafe {
-        let text = SYMS[name].text;
-        let kind = TYPES[t].kind;
-        let seq = kind == TyKind::Slice || kind == TyKind::Array;
-        // (0.14 has `iter`: only the names it lacks)
-        let iter = text == "into_iter" || text == "chars" || text == "bytes";
-        if seq && text == "len" {
-            err_help(if kind == TyKind::Slice { c"`len` is a field of slices: `s.len`" }
-                else { c"an array's length is its slice's field: `a[..].len`" });
-        } else if (seq || is_std_vec(t)) && text == "iter_mut" {
-            err_help(c"no `iter_mut`: change elements by index, `s[i] = x` (a Vec: `v.set(i, x)`)");
-        } else if seq && iter {
-            err_help(c"`s.iter()`, or `for x in s`, goes over a slice's elements (a [u8]'s bytes)");
-        } else if seq && (text == "to_string" || text == "to_owned" || text == "to_vec"
-            || text == "clone" || text == "as_str" || text == "as_bytes") {
-            err_help(c"a string is a `[u8]` already; to copy it, push it into a `std::Buf` (`b.push_str(s)`)");
-        } else if text == "is_empty" && (seq || is_std_vec(t) || is_std_named(t, c"Buf")) {
-            err_help(if kind == TyKind::Slice { c"no `is_empty`: `s.len == 0`" }
-                else { c"no `is_empty`: `x.len() == 0`" });
-        } else if iter && is_std_vec(t) {
-            err_help(c"`v.iter()`, or `for x in v`, goes over a Vec's elements");
-        }
-    }
-}
-
-// (0.17) The help of an unknown method that is a function of std
-// (`s.trim()`: `std::trim(s)`; Rust's names for a few: `parse`,
-// `is_ascii_digit`, `sort_unstable`): the call to write, as the try: line
-// (with `gpa` for an allocating `_in` form).
-fn std_function_help(n: i64, t: i64, name: i64) {
-    unsafe {
-        let text = SYMS[name].text;
-        let mapped: [u8] = if text == "parse" { "parse_int" }
-            else if text == "is_ascii_digit" { "is_digit" }
-            else if text == "is_ascii_whitespace" || text == "is_whitespace" { "is_space" }
-            else if text == "sort_unstable" { "sort" }
-            else if text == "sort_unstable_by" { "sort_by" }
-            else if text == "split_ascii_whitespace" { "split_whitespace" }
-            else { text };
-        let mut f = intern(mapped);
-        let with_in = buf_new();
-        buf_bytes(with_in, mapped);
-        buf_str(with_in, c"_in");
-        let fin = intern(buf_slice(with_in));
-        let gpa = std_has(fin, true);
-        if gpa {
-            f = fin;
-        } else if !std_has(f, true) {
-            return;
-        }
-        if BUFS[ERR_HELP].len == 0 {
-            err_help_fmt(
-                f"'{text}' is no method: std's function `{sym_text(f)}` takes the value as its first argument");
-        }
-        let recv = NODES[n].a;
-        if recv == 0 || NODES[recv].end <= NODES[recv].start {
-            return;
-        }
-        let c = buf_new();
-        buf_fmt(c, f"std::{sym_text(f)}(");
-        buf_bytes(c, SRC[NODES[recv].start..NODES[recv].end]);
-        if is_std_vec(t) {
-            buf_str(c, c".as_slice()");
-        }
-        for i in 0..NODES[n].count {
-            let a = child(n, i);
-            buf_str(c, c", ");
-            buf_bytes(c, SRC[NODES[a].start..NODES[a].end]);
-        }
-        if gpa {
-            buf_str(c, c", gpa");
-        }
-        buf_byte(c, ')');
-        err_try_fmt(buf_slice(c));
-    }
-}
-
-// (0.17) The try: line that lists the methods of type t (a struct's or an
-// enum's, std's or the program's): `tachyonc query items TYPE ROOT`.
-fn type_items_try(t: i64) {
-    unsafe {
-        let kind = TYPES[t].kind;
-        if kind != TyKind::Struct && kind != TyKind::Enum {
-            return;
-        }
-        let b = buf_new();
-        buf_type(b, t);
-        let s = buf_slice(b);
-        let mut e = 0;
-        while e < s.len && s[e] != '<' {
-            e += 1;
-        }
-        let a = buf_new();
-        buf_str(a, c"query items ");
-        buf_bytes(a, s[0..e]);
-        err_try_tool(buf_slice(a), true);
-    }
-}
-
-// Whether t is a `Vec<T>` (std's), or a pointer to one.
-pub fn is_std_vec(t: i64) -> bool {
-    unsafe {
-        let mut s = t;
-        if TYPES[s].kind == TyKind::Ptr {
-            s = TYPES[s].a;
-        }
-        TYPES[s].kind == TyKind::Struct && STRUCTS[TYPES[s].a].tmpl != 0
-            && SYMS[template_name(STRUCTS[TYPES[s].a].tmpl)].text == "Vec"
-    }
-}
-
-// `T::m` where type t has no `m` (0.17: when nothing is near, the nearest
-// of its variants and functions, and the command that lists them).
-fn path_member_error(n: i64, t: i64, member: i64) -> ! {
-    unsafe {
-        err_begin(NODES[n].start);
-        if TYPES[t].kind == TyKind::Enum {
-            err_str(c"no variant or associated function '");
-        } else {
-            err_str(c"no associated function '");
-        }
-        err_sym(member);
-        err_failed_name(member);
-        err_str(c"' in '");
-        err_type(t);
-        err_str(c"'");
-        NEAR_ALL.count = 0;
-        NEAR_COLLECT = true;
-        let mut near = near_to(member);
-        if TYPES[t].kind == TyKind::Enum {
-            let e = TYPES[t].a;
-            for i in 0..ENUMS[e].variant_count {
-                near.offer(VARIANTS[enum_variant(e, i)].name);
-            }
-        }
-        offer_methods(&near, t, false);
-        NEAR_COLLECT = false;
-        // (0.15: `i64::MAX()`, a constant)
-        int_limit_help(t, member);
-        near.help();
-        if BUFS[ERR_HELP].len == 0 && NEAR_ALL.count > 0 {
-            help_nearest(if TYPES[t].kind
-                == TyKind::Enum { c"its nearest variants and functions: " }
-                else { c"its nearest functions: " }, member);
-        }
-        type_items_try(t);
-        err_end()
-    }
-}
-
 // `T::m(args)`: a variant with fields, or a call of an associated function
 // (or of a method, with the receiver passed explicitly).
 fn synth_path_call(n: i64, callee: i64) -> i64 {
@@ -800,218 +570,5 @@ fn synth_path_call(n: i64, callee: i64) -> i64 {
         }
         NODES[n].x = f + 1;
         check_direct_call(n, f)
-    }
-}
-
-// Whether function f is a method: its first parameter is named `self`.
-fn is_method(f: i64) -> bool {
-    unsafe {
-        let item = FNS[f].node;
-        NODES[item].count > 0 && NODES[child(item, 0)].a == SELF_SYM
-    }
-}
-
-// A new node for the checker: `op operand` (`&` or `*`) of type `ty`.
-pub fn synthetic_unary(op: Tok, operand: i64, ty: i64) -> i64 {
-    unsafe {
-        let u = new_node(Unary, NODES[operand].start, NODES[operand].end);
-        NODES[u].op = op;
-        NODES[u].b = operand;
-        NODES[u].ty = ty;
-        u
-    }
-}
-
-// (0.16) A new node for the checker: `place[..]`, the whole of an array
-// place as a slice of type `ty`, as `a[..]` is checked.
-pub fn whole_slice(place: i64, ty: i64) -> i64 {
-    unsafe {
-        let r = new_node(Range, NODES[place].start, NODES[place].end);
-        NODES[r].ty = TY_UNIT;
-        let s = new_node(Index, NODES[place].start, NODES[place].end);
-        NODES[s].a = place;
-        NODES[s].b = r;
-        NODES[s].ty = ty;
-        s
-    }
-}
-
-// `x.m(args)`: a call of method m of x's type (or of the type x points
-// to), with `&x` or `*x` as needed for its `self`; becomes an NodeKind::Call.
-pub fn synth_method(n: i64) -> i64 {
-    unsafe {
-        let mut receiver = NODES[n].a;
-        let name = NODES[n].b;
-        let mut receiver_ty = synth_expr(receiver);
-        // (0.16: an array place has its slice's methods: `a.iter()` is
-        // `a[..].iter()`)
-        if TYPES[receiver_ty].kind == TyKind::Array && method_of(receiver_ty, name) < 0
-            && is_place(receiver) {
-            let s = slice_of(TYPES[receiver_ty].a);
-            if method_of(s, name) >= 0 {
-                receiver = whole_slice(receiver, s);
-                NODES[n].a = receiver;
-                receiver_ty = s;
-            }
-        }
-        if is_vector(receiver_ty) {
-            return vector_method(n, name, receiver_ty);
-        }
-        let mut t = receiver_ty;
-        let mut through_pointer = false;
-        if is_pointer(t)
-            && (TYPES[TYPES[t].a].kind == TyKind::Struct || TYPES[TYPES[t].a].kind == TyKind::Enum
-                || (method_of(t, name) < 0 && (method_of(TYPES[t].a, name) >= 0
-                    || has_intrinsic_method(TYPES[t].a, name)))) {
-            t = TYPES[t].a;
-            through_pointer = true;
-        }
-        // (0.9: a value of a bounded parameter's type has its bounds' methods)
-        if NODES[receiver].kind == Ident && NODES[receiver].res == Res::Local
-            && NODES[receiver].y >= 0
-            && LOCALS[NODES[receiver].y].tparam != 0 {
-            require_in_bounds(LOCALS[NODES[receiver].y].tparam, name, NODES[n].start);
-        }
-        let f0 = method_of(t, name);
-        let mut f = -1;
-        if TYPES[t].kind == TyKind::Struct || TYPES[t].kind == TyKind::Enum || f0 >= 0 {
-            f = f0;
-        }
-        // (0.15: `x.clone()`, `x.cmp(&y)`, `x.hash()` of a type that has
-        // Clone, Ord or Hash without an impl: a copy, a float, a tuple...)
-        if f < 0 {
-            f = intrinsic_method(n, t, name);
-        }
-        if f < 0 {
-            // (0.15: `x.into()`, `x.from(..)`: a function of a generic trait's impl)
-            let r = generic_trait_call(n, t, name);
-            if r >= 0 {
-                return r;
-            }
-        }
-        if f < 0 {
-            err_begin(NODES[n].start);
-            err_str(c"no method '");
-            err_sym(name);
-            err_failed_name(name);
-            err_str(c"' on type '");
-            err_type(receiver_ty);
-            err_str(c"'");
-            if TYPES[t].kind == TyKind::Struct && find_field(TYPES[t].a, name) >= 0 {
-                err_help(c"to call a function stored in a field, write (s.f)(x)");
-            }
-            if TYPES[t].kind == TyKind::Array && method_of(slice_of(TYPES[t].a), name) >= 0 {
-                err_help(c"an array has its slice's methods where it is a place: bind it to a variable first");
-            }
-            rust_method_help(t, name);
-            std_function_help(n, t, name);
-            NEAR_ALL.count = 0;
-            NEAR_COLLECT = true;
-            let mut near = near_to(name);
-            offer_methods(&near, t, true);
-            NEAR_COLLECT = false;
-            near.help();
-            if BUFS[ERR_HELP].len == 0 && NEAR_ALL.count > 0 {
-                help_nearest(c"no method of that name; the nearest: ", name);
-            }
-            type_items_try(t);
-            err_end();
-        }
-        if !is_method(f) {
-            err_begin(NODES[n].start);
-            err_str(c"'");
-            err_type(t);
-            err_str(c"::");
-            err_sym(name);
-            err_str(c"' is an associated function, not a method (it has no 'self' parameter)");
-            err_help(c"call it as '");
-            buf_type(ERR_HELP, t);
-            err_help(c"::");
-            err_help_sym(name);
-            err_help(c"(...)'");
-            err_end();
-        }
-        // (0.15: named arguments, defaults)
-        normalize_args(n, f, 1);
-        // (0.17: `b.push_fmt(f"..")`: the f-string written in place, the
-        // receiver as push_fmt's `self: *Buf<A>` takes it)
-        let direct = direct_kind(n, f, true);
-        if direct != 0 && NODES[n].g == 0 {
-            if through_pointer && !is_borrow(receiver) {
-                unsafe_op(n, U_METHOD, c"calling a method through a raw pointer is unsafe");
-            }
-            let arg = if through_pointer { receiver }
-                else { synthetic_unary(Tok::Amp, receiver, ptr_to(t)) };
-            return direct_call(n, f, direct, arg);
-        }
-        if FNS[f].generic > 0 {
-            // A method template: its impl's parameters from the receiver's
-            // type, its own from the arguments.
-            f = instantiate_call(f, n, 1, t, NODES[n].g);
-        } else if NODES[n].g != 0 {
-            name_error(NODES[n].start, c"method '", name, c"' is not generic");
-        }
-        let self_ty = fn_param(f, 0);
-        let mut arg = receiver;
-        if through_pointer && !is_borrow(receiver) {
-            unsafe_op(n, U_METHOD, c"calling a method through a raw pointer is unsafe");
-        }
-        if self_ty == t {
-            if through_pointer {
-                arg = synthetic_unary(Tok::Star, receiver, t);
-            }
-        } else if self_ty == ptr_to(t) {
-            if !through_pointer {
-                if !is_place(receiver) && !is_compound(t) {
-                    err_begin(NODES[n].start);
-                    err_str(c"method '");
-                    err_sym(name);
-                    err_str(c"' takes 'self: *");
-                    err_type(t);
-                    err_str(c"', but the receiver is a temporary value");
-                    err_help(c"bind it to a variable first");
-                    err_end();
-                }
-                arg = synthetic_unary(Tok::Amp, receiver, self_ty);
-            }
-        } else {
-            err_begin(NODES[n].start);
-            err_str(c"method '");
-            err_sym(name);
-            err_str(c"' has 'self' of type '");
-            err_type(self_ty);
-            err_str(c"'; a method's 'self' must be '");
-            err_type(t);
-            err_str(c"' or '*");
-            err_type(t);
-            err_str(c"'");
-            err_end();
-        }
-        let count = NODES[n].count;
-        if count + 1 != FNS[f].param_count {
-            err_begin(NODES[n].start);
-            err_str(c"method '");
-            err_sym(name);
-            err_str(c"' expects ");
-            err_int(FNS[f].param_count - 1);
-            err_str(c" arguments, got ");
-            err_int(count);
-            arity_help(n, f, count, FNS[f].param_count - 1);
-            err_end();
-        }
-        let mark = list_begin();
-        list_push(arg);
-        for i in 0..count {
-            let a = child(n, i);
-            check_arg(a, fn_param(f, i + 1));
-            list_push(a);
-        }
-        list_end(n, mark);
-        NODES[n].kind = Call;
-        NODES[n].a = 0;
-        NODES[n].x = f + 1;
-        ensure_checked(f, n);
-        check_call_safety(n, f, 1);
-        FNS[f].ret
     }
 }
