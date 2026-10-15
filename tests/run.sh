@@ -1,8 +1,8 @@
 #!/bin/sh
 # The test suite of this release, run with a tachyon compiler (no cargo
 # needed): every tests/run/*.tach, tests/run/*/main.tach (a program of
-# several modules, 0.5) and tests/examples/*.test case is
-# compiled, assembled and linked with the C compiler, run, and checked;
+# several modules, 0.5) and tests/examples/*.test case (examples/NAME/,
+# 0.15) is compiled, assembled and linked with the C compiler, run, checked;
 # alongside them, tests/query/run.sh (`tachyonc query`, 0.11),
 # tests/refactor/run.sh (the refactoring tools, 0.11), tests/guide/run.sh
 # (`tachyonc guide`, 0.13) and tests/fmt/run.sh (`tachyonc fmt --check`
@@ -718,6 +718,41 @@ case fmt in
             count=$((count + 1))
         fi
         awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/fmt.out" >>"$FAILURES"
+        ;;
+esac
+
+# The examples (0.15: one folder each, examples/NAME/, or a group of them,
+# examples/GROUP/NAME/ under a README.md): each has a main.tach, a
+# README.md and a case in tests/examples (a .test whose SOURCE is its
+# main.tach); category "example". examples/tools/ (walkthroughs of the
+# tools, some failing to compile on purpose) has its own runner.
+case example_layout in
+    *"$FILTER"*)
+        for d in "$ROOT"/examples/*/ "$ROOT"/examples/*/*/; do
+            [ -d "$d" ] || continue
+            ex=${d%/}
+            ex=${ex#"$ROOT"/examples/}
+            case "$ex" in tools | tools/*) continue ;; esac
+            why=""
+            case "$ex" in
+                */*) ;;
+                # a group: its README; its folders are the examples
+                *) [ -f "$d/main.tach" ] || { [ -f "$d/README.md" ] && continue; } ;;
+            esac
+            # (a folder of a program's modules, not an example)
+            case "$ex" in */*) [ -f "${d%/}/../main.tach" ] && continue ;; esac
+            [ -f "$d/main.tach" ] || why="no main.tach"
+            [ -f "$d/README.md" ] || why="$why${why:+; }no README.md"
+            grep -qx "// SOURCE: examples/$ex/main.tach" "$ROOT"/tests/examples/*.test \
+                || why="$why${why:+; }no tests/examples/*.test with '// SOURCE: examples/$ex/main.tach'"
+            if [ -n "$why" ]; then
+                echo "example fail" >>"$TALLY"
+                printf 'FAIL example_layout %s:\n    %s\n\n' "$ex" "$why" >>"$FAILURES"
+            else
+                echo "example pass" >>"$TALLY"
+            fi
+            count=$((count + 1))
+        done
         ;;
 esac
 

@@ -202,20 +202,20 @@ printf '%s\n' "$out" | grep -q "^identical${TAB}[0-9]* compilations${TAB}[0-9]* 
 check same_output_identical "$ok" "$out"
 cat >"$WORK/differs.sh" <<EOS
 #!/bin/sh
-# tachyonc, but its assembly for md5.tach at -O1 has one more line
+# tachyonc, but its assembly for md5/main.tach at -O1 has one more line
 "$WORK/old-tachyonc" "\$@"
 st=\$?
 out=
 prev=
 for a in "\$@"; do [ "\$prev" = -o ] && out=\$a; prev=\$a; done
-case "\$*" in *-O1*md5.tach*) printf '\t// differs\n' >>"\$out" ;; esac
+case "\$*" in *-O1*md5/main.tach*) printf '\t// differs\n' >>"\$out" ;; esac
 exit \$st
 EOS
 chmod +x "$WORK/differs.sh"
 out=$("$COMPILER" same-output "$WORK/differs.sh" --corpus examples --work "$WORK/so2" 2>&1)
 rc=$?
 ok=0
-[ $rc = 1 ] && printf '%s\n' "$out" | head -1 | grep -q "^examples/md5.tach${TAB}[a-z0-9_-]*${TAB}-O1${TAB}asm line [0-9]*\$" \
+[ $rc = 1 ] && printf '%s\n' "$out" | head -1 | grep -q "^examples/md5/main.tach${TAB}[a-z0-9_-]*${TAB}-O1${TAB}asm line [0-9]*\$" \
     && printf '%s\n' "$out" | grep -q "^-${TAB}${TAB}// differs\$" \
     && printf '%s\n' "$out" | grep -q '^error same-output.differs: [0-9]* of [0-9]* compilations differ' \
     && printf '%s\n' "$out" | grep -q '^try: diff .*/old/out.s .*/new/out.s$' && ok=1

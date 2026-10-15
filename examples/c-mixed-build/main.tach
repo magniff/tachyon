@@ -1,0 +1,160 @@
+// c-mixed-build: a tachyon program linked with a C file of its own.
+// ring.c keeps a sliding window of readings; tachyon reads the input,
+// drives the ring, and is called back from C three ways: through a
+// function pointer it hands over (ring_each), by name (ring.c calls
+// on_evict, declared in the header tachyonc writes), and through a static
+// both sides share (EVICTIONS).
+//
+// Build: see README.md (tachyonc --emit-header, cc -c ring.c, link).
+// usage: c-mixed-build [WINDOW] < readings
+import "./ring.h" as c;
+import "string.h" as c;
+
+use std::{Scanner, read_stdin};
+
+// ---- what C calls --------------------------------------------------------
+
+// Counted by ring.c (`EVICTIONS++`): an `extern "C" static` has an
+// unmangled symbol C can link against, as an `extern "C" fn` does.
+extern "C" static mut EVICTIONS: i64 = 0;
+
+// ring.c calls this by name when the window is full and a reading falls
+// out of it.
+extern "C" fn on_evict(value: i64) {
+    println(f"    (dropped {value})");
+}
+
+// The state ring_each hands to `accumulate`: C sees only a `void *`, so
+// the struct needs no C layout; only tachyon looks inside.
+struct Stats { count: i64, sum: i64, min: i64, max: i64 }
+
+// A C callback: an `extern "C" fn` (a closure cannot be one; it would
+// need a place for what it captures, which is what `ctx` is for).
+extern "C" fn accumulate(value: i64, ctx: *u8) -> i32 {
+    let stats = ctx as *Stats;
+    unsafe {
+        stats.count += 1;
+        stats.sum += value;
+        if value < stats.min { stats.min = value; }
+        if value > stats.max { stats.max = value; }
+    }
+    0 // keep going
+}
+
+// Stops at the first reading above the limit in `ctx`.
+extern "C" fn above(value: i64, ctx: *u8) -> i32 {
+    let limit = unsafe { *(ctx as *i64) };
+    if value > limit { 1 } else { 0 }
+}
+
+// ---- a safe tachyon face for the C ring ------------------------------------
+
+// Owns a C Ring; every unsafe call is in here, behind methods whose
+// arguments cannot break it.
+struct Window { ring: *c::Ring }
+
+impl Window {
+    fn new(cap: i64) -> Option<Window> {
+        if cap <= 0 {
+            return None;
+        }
+        let ring = unsafe { c::ring_new(cap as u64) };
+        if ring == 0 as *c::Ring { None } else { Some(Window { ring: ring }) }
+    }
+
+    fn push(self: *Window, value: i64) {
+        unsafe { c::ring_push(self.ring, value); }
+    }
+
+    // The C struct's fields, read directly: the header gave them.
+    fn len(self: *Window) -> i64 {
+        unsafe { (*self.ring).len as i64 }
+    }
+
+    fn pushed(self: *Window) -> i64 {
+        unsafe { (*self.ring).pushed as i64 }
+    }
+
+    fn get(self: *Window, i: i64) -> i64 {
+        if i < 0 || i >= self.len() {
+            return 0;
+        }
+        unsafe { c::ring_get(self.ring, i as u64) }
+    }
+
+    fn stats(self: *Window) -> Stats {
+        let mut s = Stats { count: 0, sum: 0, min: i64::MAX, max: i64::MIN };
+        unsafe { c::ring_each(self.ring, accumulate, &s as *u8); }
+        s
+    }
+
+    // How many readings, oldest first, up to and including the first one
+    // above `limit`; None if none is.
+    fn first_above(self: *Window, limit: i64) -> Option<i64> {
+        let mut l = limit;
+        let visited = unsafe { c::ring_each(self.ring, above, &l as *u8) } as i64;
+        if visited == self.len() && self.get(visited - 1) <= limit { None } else { Some(visited) }
+    }
+
+    fn free(self: *Window) {
+        unsafe { c::ring_free(self.ring); }
+        self.ring = 0 as *c::Ring;
+    }
+}
+
+// FNV-1a in tachyon, to check C's: the same bits from both languages.
+fn fnv1a(data: [u8]) -> u32 {
+    let mut h: u32 = 2166136261;
+    for b in data {
+        h ^= b;
+        h *= 16777619;
+    }
+    h
+}
+
+fn parse_window(argc: i32, argv: **u8) -> i64 {
+    if argc < 2 {
+        return 4;
+    }
+    let arg = unsafe { argv[1] };
+    let text = unsafe { arg[0..c::strlen(arg) as i64] };
+    std::parse_int(text).unwrap_or(0)
+}
+
+fn main(argc: i32, argv: **u8) -> i32 {
+    let size = parse_window(argc, argv);
+    let mut window = match Window::new(size) {
+        Some(w) => w,
+        None => {
+            eprintln(f"bad window size {size}");
+            return 2;
+        }
+    };
+    defer window.free();
+
+    let mut input = read_stdin().unwrap();
+    defer input.free();
+    let mut sc = Scanner::new(input.as_slice());
+    println(f"a window of {size} readings");
+    while let Ok(reading) = sc.next_int() {
+        window.push(reading);
+        let s = window.stats();
+        let mean = s.sum as f64 / s.count as f64;
+        println(f"  +{reading:<4} n={s.count} mean={mean:.2} min={s.min} max={s.max}");
+    }
+
+    let held = window.len();
+    let evictions = unsafe { EVICTIONS };
+    println(f"pushed {window.pushed()}, holding {held}, dropped {evictions}");
+    match window.first_above(50) {
+        Some(n) => println(
+            f"first reading above 50: number {n} of the window ({window.get(n - 1)})"),
+        None => println("no reading above 50 in the window"),
+    }
+
+    // A tachyon slice to C: its pointer and its length (no NUL needed).
+    let word = "tachyon";
+    let from_c = unsafe { c::fnv1a(word.ptr, word.len as u64) };
+    println(f"fnv1a(\"{word}\"): C {from_c:08x}, tachyon {fnv1a(word):08x}");
+    0
+}

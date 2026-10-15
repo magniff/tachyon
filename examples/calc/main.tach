@@ -1,0 +1,176 @@
+// A calculator: reads lines of arithmetic from stdin and prints their
+// values. A tokenizer and a recursive-descent parser over a slice of
+// tokens, with enums, match, methods, slices, std's Vec, Results and `?`
+// for the errors, and Display impls that turn them into messages.
+use std::{Buf, Fmt, read_line};
+
+enum Token { Num(i64), Plus, Minus, Star, Slash, Percent, Open, Close, End }
+use Token::{Close, End, Minus, Num, Open, Percent, Plus, Slash, Star};
+
+enum Error { BadChar(u8), Unexpected(Token), DivideByZero }
+use Error::{BadChar, DivideByZero, Unexpected};
+
+// How a token is named in a message.
+impl Display for Token {
+    fn fmt(self: *Token, f: *Fmt) {
+        let name = match *self {
+            Num(_) => "a number",
+            Plus => "'+'",
+            Minus => "'-'",
+            Star => "'*'",
+            Slash => "'/'",
+            Percent => "'%'",
+            Open => "'('",
+            Close => "')'",
+            End => "the end",
+        };
+        f.str(name);
+    }
+}
+
+impl Display for Error {
+    fn fmt(self: *Error, f: *Fmt) {
+        match *self {
+            BadChar(c) => f.write(f"unexpected character '{c:c}'"),
+            Unexpected(t) => f.write(f"unexpected {t}"),
+            DivideByZero => f.str("division by zero"),
+        }
+    }
+}
+
+// The tokens of a line, ending with End; or the first character that is
+// not part of one.
+fn tokenize(text: [u8]) -> Result<Vec<Token>, Error> {
+    let mut tokens: Vec<Token> = Vec::new();
+    let mut at = 0;
+    while at < text.len {
+        let c = text[at];
+        at += 1;
+        let token = match c {
+            ' ' => continue,
+            '0'..='9' => {
+                let mut value = (c - '0') as i64;
+                while at < text.len && std::is_digit(text[at]) {
+                    value = value * 10 + (text[at] - '0') as i64;
+                    at += 1;
+                }
+                Num(value)
+            }
+            '+' => Plus,
+            '-' => Minus,
+            '*' => Star,
+            '/' => Slash,
+            '%' => Percent,
+            '(' => Open,
+            ')' => Close,
+            _ => {
+                tokens.free();
+                return Err(BadChar(c));
+            }
+        };
+        tokens.push(token);
+    }
+    tokens.push(End);
+    Ok(tokens)
+}
+
+// Each rule returns the value of what it parsed, or the first error: `?`
+// passes an Err up through every caller at once.
+struct Parser { tokens: [Token], at: i64 }
+
+impl Parser {
+    fn peek(self: *Parser) -> Token {
+        self.tokens[self.at]
+    }
+
+    // sum: term (('+' | '-') term)*
+    fn sum(self: *Parser) -> Result<i64, Error> {
+        let mut value = self.term()?;
+        loop {
+            match self.peek() {
+                Plus => {
+                    self.at += 1;
+                    value += self.term()?;
+                }
+                Minus => {
+                    self.at += 1;
+                    value -= self.term()?;
+                }
+                _ => return Ok(value),
+            }
+        }
+    }
+
+    // term: unary (('*' | '/' | '%') unary)*
+    fn term(self: *Parser) -> Result<i64, Error> {
+        let mut value = self.unary()?;
+        loop {
+            let op = self.peek();
+            match op {
+                Star | Slash | Percent => {
+                    self.at += 1;
+                    let rhs = self.unary()?;
+                    value = match op {
+                        Star => value * rhs,
+                        _ if rhs == 0 => return Err(DivideByZero),
+                        Slash => value / rhs,
+                        _ => value % rhs,
+                    };
+                }
+                _ => return Ok(value),
+            }
+        }
+    }
+
+    // unary: '-' unary | number | '(' sum ')'
+    fn unary(self: *Parser) -> Result<i64, Error> {
+        let t = self.peek();
+        match t {
+            Minus => {
+                self.at += 1;
+                Ok(-self.unary()?)
+            }
+            Num(n) => {
+                self.at += 1;
+                Ok(n)
+            }
+            Open => {
+                self.at += 1;
+                let value = self.sum()?;
+                if self.peek() != Close {
+                    return Err(Unexpected(self.peek()));
+                }
+                self.at += 1;
+                Ok(value)
+            }
+            other => Err(Unexpected(other)),
+        }
+    }
+}
+
+// A whole line: one sum, then nothing more.
+fn evaluate(line: [u8]) -> Result<i64, Error> {
+    let mut tokens = tokenize(line)?;
+    defer tokens.free();
+    let mut parser = Parser { tokens: tokens.as_slice(), at: 0 };
+    let value = parser.sum()?;
+    match parser.peek() {
+        End => Ok(value),
+        rest => Err(Unexpected(rest)),
+    }
+}
+
+fn main() -> i32 {
+    let mut line = Buf::new();
+    defer line.free();
+    while read_line(&line).unwrap_or(false) {
+        if line.len() == 0 {
+            continue;
+        }
+        match evaluate(line.as_slice()) {
+            Ok(value) => println(f"{value}"),
+            Err(e) => println(f"error: {e}"),
+        }
+    }
+    0
+}

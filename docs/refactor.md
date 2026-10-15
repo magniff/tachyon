@@ -534,7 +534,7 @@ N`), the first one's differing lines (`-→old`, `+→new`), and
 ```
 error same-output.differs: 3 of 81 compilations differ (kept in target/same-output)
 try: diff target/same-output/64/old/out.s target/same-output/64/new/out.s
-try: tachyonc --target aarch64-macos -O1 examples/md5.tach -o new.s
+try: tachyonc --target aarch64-macos -O1 examples/md5/main.tach -o new.s
 ```
 
 `tests/compare.sh` does the same and more (random programs, C interop,

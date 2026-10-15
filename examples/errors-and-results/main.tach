@@ -1,0 +1,170 @@
+// A config-file parser: errors as typed values, `?` to pass them up,
+// `From` to convert between layers, and `main` returning a Result.
+//
+// The config comes on stdin, one `key = value` per line:
+//   name = demo
+//   port = 8080
+// `#` starts a comment. `port` is required; the other keys have defaults.
+use std::{Fmt, HashMap, IoError, ParseIntError, Scanner, parse_int, read_stdin, trim};
+
+// ---- The value layer: one value, no idea where it came from. ----
+
+#[derive(Debug)]
+enum ValueError { NotANumber(ParseIntError), NotABool, OutOfRange(i64, i64, i64) }
+
+// Lets `?` turn parse_int's error into ours.
+impl From<ParseIntError> for ValueError {
+    fn from(e: ParseIntError) -> ValueError { ValueError::NotANumber(e) }
+}
+
+impl Display for ValueError {
+    fn fmt(self: *ValueError, f: *Fmt) {
+        match *self {
+            ValueError::NotANumber(e) => f.write(f"not a number ({e})"),
+            ValueError::NotABool => f.str("expected true or false"),
+            ValueError::OutOfRange(n, lo, hi) => f.write(f"{n} is not in {lo}..={hi}"),
+        }
+    }
+}
+
+fn parse_number(text: [u8], lo: i64, hi: i64) -> Result<i64, ValueError> {
+    let n = parse_int(text)?; // Err(ParseIntError) returns Err(ValueError::from(e))
+    if n < lo || n > hi { return Err(ValueError::OutOfRange(n, lo, hi)); }
+    Ok(n)
+}
+
+fn parse_word(text: [u8]) -> Option<bool> {
+    if text == "true" { return Some(true); }
+    if text == "false" { return Some(false); }
+    None
+}
+
+fn parse_bool(text: [u8]) -> Result<bool, ValueError> {
+    parse_word(text).ok_or(ValueError::NotABool) // Option -> Result
+}
+
+// ---- The file layer: knows lines and keys. ----
+
+#[derive(Debug)]
+enum ConfigError {
+    Read(IoError),
+    NoEquals(i64),
+    UnknownKey(i64, [u8]),
+    Duplicate(i64, [u8]),
+    BadValue(i64, [u8], ValueError),
+    Missing([u8]),
+}
+
+impl From<IoError> for ConfigError {
+    fn from(e: IoError) -> ConfigError { ConfigError::Read(e) }
+}
+
+impl Display for ConfigError {
+    fn fmt(self: *ConfigError, f: *Fmt) {
+        match *self {
+            ConfigError::Read(e) => f.write(f"{e}"),
+            ConfigError::NoEquals(line) => f.write(f"line {line}: expected `key = value`"),
+            ConfigError::UnknownKey(line, key) => f.write(f"line {line}: unknown key `{key}`"),
+            ConfigError::Duplicate(line, key) => f.write(f"line {line}: `{key}` is set twice"),
+            ConfigError::BadValue(line, key, e) => f.write(f"line {line}: {key}: {e}"),
+            ConfigError::Missing(key) => f.write(f"`{key}` is required"),
+        }
+    }
+}
+
+const KEYS: [[u8]; 5] = ["name", "port", "workers", "debug", "timeout_ms"];
+
+// A value as written, and the line it is on (for messages).
+struct Field { value: [u8], line: i64 }
+
+type Fields = HashMap<[u8], Field>;
+
+struct Config { name: [u8], port: i64, workers: i64, debug: bool, timeout_ms: i64 }
+
+// The text to `key -> Field`; the first bad line stops it.
+fn read_fields(text: [u8], fields: *Fields) -> Result<(), ConfigError> {
+    let mut lines = Scanner::new(text);
+    let mut number = 0;
+    while let Some(raw) = lines.next_line() {
+        number += 1;
+        let line = trim(raw);
+        if line.len == 0 || line[0] == '#' { continue; }
+        // Option -> Result: no '=' is an error, with the line number.
+        let eq = line.iter().position(|b| b == '=').ok_or(ConfigError::NoEquals(number))?;
+        let key = trim(line[..eq]);
+        let value = trim(line[eq + 1..]);
+        if !KEYS[..].iter().any(|k| k == key) { return Err(ConfigError::UnknownKey(number, key)); }
+        if fields.contains_key(key) { return Err(ConfigError::Duplicate(number, key)); }
+        fields.insert(key, Field { value, line: number });
+    }
+    Ok(())
+}
+
+// Absent is not an error: Ok(None). A bad value is: Err, with its line.
+fn number(fields: *Fields, key: [u8], lo: i64, hi: i64) -> Result<Option<i64>, ConfigError> {
+    match fields.get(key) {
+        None => Ok(None),
+        Some(field) => {
+            // map_err: a ValueError becomes a ConfigError that says where
+            let n = parse_number(field.value, lo, hi)
+                .map_err(|e| ConfigError::BadValue(field.line, key, e))?;
+            Ok(Some(n))
+        }
+    }
+}
+
+fn flag(fields: *Fields, key: [u8]) -> Result<Option<bool>, ConfigError> {
+    match fields.get(key) {
+        None => Ok(None),
+        Some(field) => {
+            let b = parse_bool(field.value)
+                .map_err(|e| ConfigError::BadValue(field.line, key, e))?;
+            Ok(Some(b))
+        }
+    }
+}
+
+fn parse_config(text: [u8]) -> Result<Config, ConfigError> {
+    let mut fields: Fields = HashMap::new();
+    defer fields.free(); // runs on every `?` exit too
+    read_fields(text, &fields)?;
+    Ok(Config {
+        name: fields.get("name").map(|f| f.value).unwrap_or("unnamed"),
+        port: number(&fields, "port", 1, 65535)?.ok_or(ConfigError::Missing("port"))?,
+        workers: number(&fields, "workers", 1, 64)?.unwrap_or(1),
+        debug: flag(&fields, "debug")?.unwrap_or(false),
+        timeout_ms: number(&fields, "timeout_ms", 0, 60000)?.unwrap_or(1000),
+    })
+}
+
+// Errors are values: here each one is matched and printed, not returned.
+fn show_rejections() {
+    let samples = [
+        "port = 80\nport = 81",
+        "port: 80",
+        "port = 80\ncolour = blue",
+        "port = 8o",
+        "port = 70000",
+        "port = 80\ndebug = yes",
+        "name = no port",
+    ];
+    println("rejected samples:");
+    for sample in samples {
+        match parse_config(sample) {
+            Ok(c) => println(f"  accepted?! port {c.port}"),
+            Err(e) => println(f"  {sample:<26?} {e}"), // Debug: quoted, \n escaped
+        }
+    }
+}
+
+// `?` in main: an Err ends the program with `Error: ` and the error's Debug
+// text on stderr, and exit status 1.
+fn main() -> Result<(), ConfigError> {
+    show_rejections();
+    let mut input = read_stdin()?; // IoError -> ConfigError through From
+    defer input.free();
+    let config = parse_config(input.as_slice())?;
+    println(f"config: {config.name} on port {config.port}");
+    println(f"  workers {config.workers}, debug {config.debug}, timeout {config.timeout_ms} ms");
+    Ok(())
+}

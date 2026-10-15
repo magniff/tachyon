@@ -152,7 +152,7 @@ tar -C "$SNAP" -c -f - src tachyonc.o | docker run --rm -i --name "$CONTAINER" -
     row fixpoint pass $(( $(date +%s) - start )) "cross-built = built here = built by that"
     start=$(date +%s)
     head -c 3000000 /dev/urandom >/tmp/random
-    ./target/tachyonc examples/md5.tach -o /tmp/md5
+    ./target/tachyonc examples/md5/main.tach -o /tmp/md5
     got=$(/tmp/md5 </tmp/random)
     want=$(md5sum </tmp/random | cut -d" " -f1)
     [ "$got" = "$want" ] || fail md5 "$start" "tachyon $got, md5sum $want"

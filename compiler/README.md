@@ -5,10 +5,10 @@
 
 ```
 $ tachyonc compiler/src/main.tach -o tachyonc.s && cc -o tachyonc tachyonc.s -lm
-$ tachyonc examples/md5.tach -o md5.s && cc -o md5 md5.s -lm
+$ tachyonc examples/md5/main.tach -o md5.s && cc -o md5 md5.s -lm
 $ tachyonc --target x86_64-linux compiler/src/main.tach -o linux.s   # cross-compile
-$ tachyonc -O0 examples/md5.tach -o md5.s     # -O0, -O1 or -O2 (the default)
-$ tachyonc --emit-ir examples/md5.tach -o md5.ir    # the optimized IR
+$ tachyonc -O0 examples/md5/main.tach -o md5.s     # -O0, -O1 or -O2 (the default)
+$ tachyonc --emit-ir examples/md5/main.tach -o md5.ir    # the optimized IR
 $ tachyonc --emit-imports prog.tach -o decls.tach   # what `import "x.h" as c;` declares
 $ tachyonc --fix-imports prog.tach   # rewrite 0.7's `*` imports and plain header imports (0.8; `fix --only imports`)
 $ tachyonc --emit-header prog.tach -o prog.h        # the program's C header

@@ -225,7 +225,7 @@ bootstrap/bootstrap.sh                   # the chain; leaves target/tachyonc
 Build and run a program, then test:
 
 ```sh
-target/tachyonc examples/md5.tach -o md5.s && cc -o md5 md5.s -lm
+target/tachyonc examples/md5/main.tach -o md5   # an executable (cc links it)
 ./md5 < README.md
 tests/run.sh                             # the test suite, for the host
 tests/run.sh -O 0 match                  # cases named *match*, at -O0
@@ -265,7 +265,8 @@ changes wait for 2.0. See [docs/roadmap.md](docs/roadmap.md) and
 |---|---|
 | `compiler/` | the compiler, in tachyon, in folders by phase: `front`, `middle`, `back`, `gen0`, `base`, `tools` ([compiler/README.md](compiler/README.md)) |
 | `docs/` | the grammar, the optimizer, the tools, releases and the roadmap |
-| `examples/`, `tests/`, `bench/` | examples, the test suite and fuzzers, the benchmarks with their C versions |
+| `examples/` | example programs, one folder each with a README: C interop, algorithms, the language tour ([examples/README.md](examples/README.md)) |
+| `tests/`, `bench/` | the test suite and fuzzers, the benchmarks with their C versions |
 | `bootstrap/` | the release chain (`releases.toml`), `bootstrap.sh`, `gate.sh`, the Linux checks |
 | `seed/` | the frozen Rust implementation at the root of the chain |
 | `AGENTS.md` | how to work on the compiler through its own tools |
