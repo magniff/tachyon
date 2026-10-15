@@ -194,6 +194,7 @@ usage: tachyonc query def|show NAME... [--root ROOT] [--exact] [--with-comments]
        tachyonc query deps MODULE [--max-lines N]
        tachyonc query unused [MODULE] [--all]
        tachyonc query impact NAME
+       tachyonc query effects NAME...   (0.16: the inferred effects)
        tachyonc query conflicts [FILE|DIR|FILE:LINE...] [--show]
 NAME: a path or its end (f, m::f, T::f, T.field), or FILE:LINE; std's too (std::f, Vec::push)
 --budget TOKENS: any answer cut to about TOKENS (default 8000; 0: no limit; context: 2000)

@@ -11,7 +11,8 @@ use crate::base::diag::{
     error_at, error_at_soft,
 };
 use crate::front::ast::{
-    FN_COLD, FN_INLINE, FN_NO_INLINE, FN_SIG_FAILED, FN_UNSAFE, NODES, REPR_C, REPR_INT, child,
+    FN_COLD, FN_EFFECT_DECL, FN_INLINE, FN_NO_INLINE, FN_SIG_FAILED, FN_UNSAFE, NODES, NodeKind,
+    REPR_C, REPR_INT, child,
 };
 use crate::front::ast::NodeKind::{
     CStr, Const, Enum, ExternFn, Fn, Impl, Mod, Static, Str, Struct, Trait, TyArray, TyName,
@@ -186,6 +187,7 @@ pub fn add_fn(item: i64, name: i64, display: i64) {
             targ_count: 0,
             origin: 0, parent: 0, depth: 0, module: module_of(item),
             attrs: NODES[item].p & (FN_INLINE | FN_NO_INLINE | FN_COLD | FN_UNSAFE),
+            effect_decl: if (NODES[item].p & FN_EFFECT_DECL) != 0 { NODES[item].z } else { 0 },
         };
         FN_COUNT += 1;
         NODES[item].x = FN_COUNT;
@@ -671,6 +673,11 @@ fn impl_template(item: i64) -> i64 {
             return TPL_NONE;
         }
         let g = NODES[self_node].g;
+        // (0.16: with a default type parameter, still every argument)
+        let full = if tpl > 0 { STRUCTS[tpl - 1].generic } else { ENUMS[-tpl - 1].generic };
+        if g != 0 && NODES[g].count < full && NODES[g].count == impl_count {
+            impl_args_error(self_node, tpl, params);
+        }
         if g == 0 || NODES[g].count != impl_count {
             error_at(NODES[self_node].start, c"a generic impl block is for its type with its parameters as arguments: 'impl<T> Vec<T>'");
         }
@@ -682,6 +689,49 @@ fn impl_template(item: i64) -> i64 {
             }
         }
         tpl
+    }
+}
+
+// An impl block whose type leaves out arguments that have defaults (0.16):
+// `impl<T> Vec<T>` is an error, its type parameters are written in full,
+// `impl<T, A: Allocator> Vec<T, A>`.
+fn impl_args_error(self_node: i64, tpl: i64, params: i64) -> ! {
+    unsafe {
+        let node = if tpl > 0 { STRUCTS[tpl - 1].node } else { ENUMS[-tpl - 1].node };
+        let tparams = NODES[node].g;
+        let out = buf_new();
+        buf_str(out, c"impl<");
+        for i in 0..NODES[tparams].count {
+            if i > 0 {
+                buf_str(out, c", ");
+            }
+            let p = if i < NODES[params].count { child(params, i) } else { child(tparams, i) };
+            buf_bytes(out, SYMS[NODES[p].a].text);
+            if i >= NODES[params].count && NODES[NODES[p].h].count > 0
+                && NODES[child(NODES[p].h, 0)].kind == NodeKind::TyName {
+                buf_str(out, c": ");
+                buf_bytes(out, SYMS[NODES[child(NODES[p].h, 0)].a].text);
+            }
+        }
+        buf_str(out, c"> ");
+        buf_bytes(out, SYMS[template_name(tpl)].text);
+        buf_byte(out, '<');
+        for i in 0..NODES[tparams].count {
+            if i > 0 {
+                buf_str(out, c", ");
+            }
+            let p = if i < NODES[params].count { child(params, i) } else { child(tparams, i) };
+            buf_bytes(out, SYMS[NODES[p].a].text);
+        }
+        buf_byte(out, '>');
+        err_begin(NODES[self_node].start);
+        err_str(c"an impl block writes every type argument of '");
+        err_sym(template_name(tpl));
+        err_str(c"', also those with defaults");
+        err_help(c"'");
+        err_help_sym(intern(buf_slice(out)));
+        err_help(c"'");
+        err_end()
     }
 }
 

@@ -35,7 +35,7 @@ use crate::front::check::check_mode::check_expr;
 use crate::front::check::collect::{
     collect_enum_variants, collect_struct_fields, new_enum, new_struct,
 };
-use crate::front::check::resolve::{enum_cycle_error, struct_cycle_error};
+use crate::front::check::resolve::{enum_cycle_error, resolve_type, struct_cycle_error};
 use crate::front::check::widen::try_widen;
 use crate::front::lexer::{SUF_NONE, Tok};
 use crate::front::modules::CUR_MOD;
@@ -151,6 +151,10 @@ fn generic_display(name: i64, targs: i64, count: i64) -> i64 {
     unsafe {
         let out = buf_new();
         buf_bytes(out, SYMS[name].text);
+        // (0.16: `Buf`, every argument its default)
+        if count == 0 {
+            return intern(buf_slice(out));
+        }
         buf_byte(out, '<');
         for i in 0..count {
             if i > 0 {
@@ -163,9 +167,13 @@ fn generic_display(name: i64, targs: i64, count: i64) -> i64 {
     }
 }
 
-// `base.G<code of each argument>`.
+// `base.G<code of each argument>` (0.16: base when there is none, every
+// argument of a type its default).
 fn generic_symbol(base: i64, targs: i64, count: i64) -> i64 {
     unsafe {
+        if count == 0 {
+            return base;
+        }
         let out = buf_new();
         buf_bytes(out, SYMS[base].text);
         buf_str(out, c".G");
@@ -321,12 +329,106 @@ pub fn targ_count_error(pos: i64, what: *u8, name: i64, expected: i64, got: i64)
     }
 }
 
+// ---- Default type parameters (0.16) ----
+
+// The default of type parameter k of generic struct or enum `node`
+// (declared in `module`), `A: Allocator = Gpa`: its type, resolved where
+// the item is declared with the parameters before it bound to the k types
+// on top of TSCRATCH (left there); 0 when it has none.
+pub fn param_default(node: i64, module: i64, k: i64) -> i64 {
+    unsafe {
+        let params = NODES[node].g;
+        let def = NODES[child(params, k)].b;
+        if def == 0 {
+            return 0;
+        }
+        let saved = TP_BASE;
+        TP_BASE = TP_NAMES.count;
+        for i in 0..k {
+            TP_NAMES.push(NODES[child(params, i)].a);
+            TP_TYPES.push(TSCRATCH.data[TSCRATCH.count - k + i]);
+        }
+        let saved_mod = CUR_MOD;
+        let saved_self = SELF_TYPE;
+        CUR_MOD = module;
+        SELF_TYPE = 0;
+        let t = resolve_type(def);
+        CUR_MOD = saved_mod;
+        SELF_TYPE = saved_self;
+        env_leave(saved);
+        t
+    }
+}
+
+// The type arguments TSCRATCH[mark..] of an instance of `node` completed
+// with the defaults of the parameters left out (`Vec<i64>` is `Vec<i64,
+// Gpa>`), as far as they have defaults.
+fn fill_defaults(node: i64, module: i64, mark: i64) {
+    unsafe {
+        let params = NODES[node].g;
+        let mut k = TSCRATCH.count - mark;
+        while k < NODES[params].count {
+            let t = param_default(node, module, k);
+            if t == 0 {
+                return;
+            }
+            TSCRATCH.push(t);
+            k += 1;
+        }
+    }
+}
+
+// How many of the type arguments TLISTS[targs..targs+count] of an instance
+// of `node` its name and symbol show: the trailing ones equal to their
+// parameters' defaults are left out, so `Vec<i64, Gpa>` is `Vec<i64>` in
+// messages and `Vec.Gl` in symbols, as before defaults existed.
+pub fn shown_targs(node: i64, module: i64, targs: i64, count: i64) -> i64 {
+    unsafe {
+        let params = NODES[node].g;
+        let mut shown = count;
+        while shown > 0 && NODES[child(params, shown - 1)].b != 0 {
+            let mark = TSCRATCH.count;
+            for i in 0..shown - 1 {
+                TSCRATCH.push(TLISTS.data[targs + i]);
+            }
+            let t = param_default(node, module, shown - 1);
+            TSCRATCH.count = mark;
+            if t != TLISTS.data[targs + shown - 1] {
+                break;
+            }
+            shown -= 1;
+        }
+        shown
+    }
+}
+
+// How many type arguments template `tpl` (encoded as template_of_key's)
+// needs at least: its parameters without defaults.
+pub fn required_targs(tpl: i64) -> i64 {
+    unsafe {
+        if tpl == TPL_SLICE {
+            return 1;
+        }
+        let node = if tpl > 0 { STRUCTS[tpl - 1].node } else { ENUMS[-tpl - 1].node };
+        let params = NODES[node].g;
+        let mut k = 0;
+        while k < NODES[params].count && NODES[child(params, k)].b == 0 {
+            k += 1;
+        }
+        k
+    }
+}
+
 // ---- Instances of structs and enums ----
 
 // The instance of struct template `tpl` with the type arguments
 // TSCRATCH[mark..] (popped).
 fn struct_instance(tpl: i64, mark: i64, pos: i64) -> i64 {
     unsafe {
+        // (0.16: the parameters left out take their defaults)
+        if TSCRATCH.count - mark < STRUCTS[tpl].generic {
+            fill_defaults(STRUCTS[tpl].node, STRUCTS[tpl].module, mark);
+        }
         let count = TSCRATCH.count - mark;
         if count != STRUCTS[tpl].generic {
             targ_count_error(pos, c"struct", STRUCTS[tpl].name, STRUCTS[tpl].generic, count);
@@ -342,8 +444,9 @@ fn struct_instance(tpl: i64, mark: i64, pos: i64) -> i64 {
         let targs = take_targs(mark);
         let node = STRUCTS[tpl].node;
         check_bounds(NODES[node].g, targs, count, STRUCTS[tpl].name, pos);
-        let s = new_struct(node, generic_display(STRUCTS[tpl].name, targs, count),
-            generic_symbol(STRUCTS[tpl].sym, targs, count), STRUCTS[tpl].module);
+        let shown = shown_targs(node, STRUCTS[tpl].module, targs, count);
+        let s = new_struct(node, generic_display(STRUCTS[tpl].name, targs, shown),
+            generic_symbol(STRUCTS[tpl].sym, targs, shown), STRUCTS[tpl].module);
         STRUCTS[s].tmpl = tpl + 1;
         STRUCTS[s].targs = targs;
         STRUCTS[s].targ_count = count;
@@ -363,6 +466,9 @@ fn struct_instance(tpl: i64, mark: i64, pos: i64) -> i64 {
 
 fn enum_instance(tpl: i64, mark: i64, pos: i64) -> i64 {
     unsafe {
+        if TSCRATCH.count - mark < ENUMS[tpl].generic {
+            fill_defaults(ENUMS[tpl].node, ENUMS[tpl].module, mark);
+        }
         let count = TSCRATCH.count - mark;
         if count != ENUMS[tpl].generic {
             targ_count_error(pos, c"enum", ENUMS[tpl].name, ENUMS[tpl].generic, count);
@@ -377,8 +483,9 @@ fn enum_instance(tpl: i64, mark: i64, pos: i64) -> i64 {
         let targs = take_targs(mark);
         let node = ENUMS[tpl].node;
         check_bounds(NODES[node].g, targs, count, ENUMS[tpl].name, pos);
-        let e = new_enum(node, generic_display(ENUMS[tpl].name, targs, count),
-            generic_symbol(ENUMS[tpl].sym, targs, count), ENUMS[tpl].module);
+        let shown = shown_targs(node, ENUMS[tpl].module, targs, count);
+        let e = new_enum(node, generic_display(ENUMS[tpl].name, targs, shown),
+            generic_symbol(ENUMS[tpl].sym, targs, shown), ENUMS[tpl].module);
         ENUMS[e].tmpl = tpl + 1;
         ENUMS[e].targs = targs;
         ENUMS[e].targ_count = count;

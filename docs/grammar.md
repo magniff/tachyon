@@ -1409,6 +1409,57 @@ On a generic type every parameter gets the trait as a bound
 (`impl<T: Ord> Ord for P<T>`). A derived trait and a written impl of
 the same trait for the type are a coherence error.
 
+## Additions of 0.16
+
+The design is [design/effects-allocation.md](design/effects-allocation.md).
+(Phase 0: the syntax and std's allocator interface; what is marked
+"to come" is checked or implemented by the 0.16 tasks.)
+
+```ebnf
+attr       += "#[" effect_attr "]"                       (* before fn, trait fn, impl fn, extern fn *)
+            | "#[" ( "sealed" | "scoped" ) "]"           (* before struct *)
+effect_attr = "effects" "(" [ effect { "," effect } [ "," ] ] ")"
+            | "pure" | "no_alloc" | "no_io" | "no_panic"
+effect      = "alloc" [ "(" alloc_src { "," alloc_src } ")" ]
+            | "io" | "global" | "panic" | "diverge" | "unsafe"
+alloc_src   = type | "extern"
+bound      += "effects" "(" [ effect { "," effect } ] ")"   (* F: Fn(i64) -> i64 + effects(panic) *)
+tparam      = ident [ ":" bound { "+" bound } ] [ "=" type ]   (* defaults: structs and enums, trailing *)
+```
+
+### Effects
+
+Every function has an inferred effect set: `alloc(A, ...)`, `io`,
+`global`, `panic`, `diverge`, `unsafe` (to come: the inference). A
+declaration is an upper bound of it, checked (to come); on a C function
+it is trusted. `#[pure]` is no `alloc`, `io` or `global`; `#[effects()]`
+is the empty set. Several declarations intersect. `tachyonc
+--print-effects` and `tachyonc query effects NAME` show the sets.
+
+### Default type parameters
+
+A struct's or an enum's type parameters may end with defaults: `struct
+Vec<T, A: Allocator = Gpa>`. A type leaves out trailing arguments that
+have defaults (`Vec<i64>` is `Vec<i64, Gpa>`; `Buf` is `Buf<Gpa>`); in
+an expression the omitted arguments are inferred, the default when
+nothing binds them (`Vec::new()`). Messages and symbols leave out the
+trailing arguments equal to their defaults. An impl block writes every
+argument: `impl<T, A: Allocator> Vec<T, A>`.
+
+### Allocators
+
+std's containers take their memory from an allocator, a type parameter:
+`Vec<T, A: Allocator = Gpa>`, `Buf<A>`, `HashMap<K, V, A>`. `Gpa` (C's
+malloc) is the default and the only global allocator: `Vec::new()` is
+on Gpa, `Vec::new_in(a)` on allocator `a`. `Allocator`, `Gpa`, `Arena`,
+`ScopedArena` and `arena_scope` are in the prelude (arenas: to come).
+
+### sealed, scoped
+
+`#[sealed]` (to come: checked) hides a struct's fields not marked `pub`,
+and its literals, outside its module; `#[scoped]` (to come) keeps values
+of the type from outliving the scope that made them.
+
 ## Importing C headers
 
 `import "stdio.h" as c;` *(0.4; `as`: 0.5, required since 0.8)* reads a C

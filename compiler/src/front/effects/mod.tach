@@ -1,0 +1,221 @@
+// Effects (0.16): what a checked function (an item, a generic instance, a
+// closure) may do, inferred from its body and its callees, and checked
+// against what it declares (`#[effects(...)]`, `#[pure]`, `#[no_alloc]`,
+// `#[no_io]`, `#[no_panic]`, a bound's `effects(...)`). The design is
+// docs/design/effects-allocation.md (§2.1 the effects, §3 the tables).
+//
+// An effect set is an Effects: `bits` holds EFF_IO ... EFF_ALLOC_EXTERN,
+// the raw `panic` and `diverge` the optimizer reads (EFF_RAW_*: before the
+// in-bounds and counted-loop masks), and EFF_UNKNOWN (⊤: a body that
+// failed to check, or not inferred); `allocs` holds a bit per allocator
+// type (ALLOCATORS, interned by allocator_bit), bit 63 (ALLOC_ANY) for
+// "any allocator". FN_EFFECTS has one per function (FNS index) once
+// infer_effects ran.
+//
+// Here: the tables, union, subset and the text (`alloc(Gpa, Arena) io
+// global panic diverge unsafe`, `none`); infer.tach the inference;
+// check.tach the declared bounds; why.tach the chains that explain an
+// effect; builtin.tach the effects of C functions.
+
+use crate::base::{IntVec, SYMS, buf_bytes, buf_str};
+use crate::front::modules::STD_MODULE;
+use crate::front::types::{FNS, FN_COUNT, STRUCTS, TYPES, TyKind, buf_type};
+
+pub mod builtin;
+pub mod check;
+pub mod infer;
+pub mod why;
+
+pub struct Effects { bits: i64, allocs: i64 }
+
+pub const EFF_IO: i64 = 1;
+pub const EFF_GLOBAL: i64 = 2;
+pub const EFF_PANIC: i64 = 4;
+pub const EFF_DIVERGE: i64 = 8;
+pub const EFF_UNSAFE: i64 = 16;
+pub const EFF_ALLOC_EXTERN: i64 = 32;
+// The bits an effect set shows and compares.
+pub const EFF_VISIBLE: i64 = 63;
+// `panic` and `diverge` before the masks (for the optimizer: ¬raw diverge
+// is WILLRETURN, ¬raw panic NOPANIC).
+pub const EFF_RAW_PANIC: i64 = 64;
+pub const EFF_RAW_DIVERGE: i64 = 128;
+// ⊤ for a body that failed to check (or before inference): it suppresses
+// the declared-effect errors of its callers.
+pub const EFF_UNKNOWN: i64 = 256;
+// In `allocs`: any allocator (also when ALLOCATORS has more than 63).
+pub const ALLOC_ANY: i64 = 1 << 63;
+
+// The allocator types effects name, by bit (TYPES indexes).
+pub static mut ALLOCATORS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// The effects of each function, by FNS index (FN_EFFECTS_COUNT of them).
+pub static mut FN_EFFECTS: *Effects = 0 as *Effects;
+pub static mut FN_EFFECTS_COUNT: i64 = 0;
+
+// --print-effects (0.16): the driver prints every function's effects
+// after checking (print_effects).
+pub static mut PRINT_EFFECTS: bool = false;
+
+pub fn effects_none() -> Effects {
+    Effects { bits: 0, allocs: 0 }
+}
+
+// Everything (⊤), unknown.
+pub fn effects_top() -> Effects {
+    Effects {
+        bits: EFF_VISIBLE | EFF_RAW_PANIC | EFF_RAW_DIVERGE | EFF_UNKNOWN, allocs: ALLOC_ANY,
+    }
+}
+
+// The effects of function f (⊤ when not inferred).
+pub fn fn_effects(f: i64) -> Effects {
+    unsafe {
+        if f < 0 || f >= FN_EFFECTS_COUNT {
+            return effects_top();
+        }
+        FN_EFFECTS[f]
+    }
+}
+
+pub fn effects_union(a: Effects, b: Effects) -> Effects {
+    Effects { bits: a.bits | b.bits, allocs: a.allocs | b.allocs }
+}
+
+// Whether a is within b (the visible bits and the allocators; any
+// allocator is within only any).
+pub fn effects_subset(a: Effects, b: Effects) -> bool {
+    if (a.bits & EFF_VISIBLE & (b.bits ^ -1)) != 0 {
+        return false;
+    }
+    if (b.allocs & ALLOC_ANY) != 0 {
+        return true;
+    }
+    (a.allocs & (b.allocs ^ -1)) == 0
+}
+
+// The bit of allocator type t in `allocs` (ALLOC_ANY past 63 of them).
+pub fn allocator_bit(t: i64) -> i64 {
+    unsafe {
+        for i in 0..ALLOCATORS.count {
+            if ALLOCATORS.data[i] == t {
+                return 1 << i;
+            }
+        }
+        if ALLOCATORS.count >= 63 {
+            return ALLOC_ANY;
+        }
+        ALLOCATORS.push(t);
+        1 << (ALLOCATORS.count - 1)
+    }
+}
+
+// The name of allocator type t, for sorting: a struct's symbol, else -1.
+fn allocator_name(t: i64) -> i64 {
+    unsafe {
+        if TYPES[t].kind == TyKind::Struct { STRUCTS[TYPES[t].a].name } else { -1 }
+    }
+}
+
+// Whether allocator type a is shown before b: Gpa first, then by name.
+fn allocator_before(a: i64, b: i64) -> bool {
+    unsafe {
+        let na = allocator_name(a);
+        let nb = allocator_name(b);
+        if na < 0 || nb < 0 {
+            return na >= 0 || na < 0 && nb < 0 && a < b;
+        }
+        let ta = SYMS[na].text;
+        let tb = SYMS[nb].text;
+        if ta == "Gpa" || tb == "Gpa" {
+            return ta == "Gpa" && tb != "Gpa";
+        }
+        let n = if ta.len < tb.len { ta.len } else { tb.len };
+        for i in 0..n {
+            if ta[i] != tb[i] {
+                return ta[i] < tb[i];
+            }
+        }
+        ta.len < tb.len
+    }
+}
+
+// Appends e as text: `alloc(Gpa, Arena) io global panic diverge unsafe`
+// (that order), `alloc` alone for any allocator, `none` for the empty set;
+// then ` (unknown)` for ⊤ not inferred.
+pub fn effects_text(out: i64, e: Effects) {
+    unsafe {
+        let mut first = true;
+        if e.allocs != 0 || (e.bits & EFF_ALLOC_EXTERN) != 0 {
+            buf_str(out, c"alloc");
+            if (e.allocs & ALLOC_ANY) == 0 {
+                buf_str(out, c"(");
+                let mut shown = 0;
+                let mut last = -1;
+                // (selection by allocator_before: few allocators)
+                loop {
+                    let mut next = -1;
+                    for i in 0..ALLOCATORS.count {
+                        let t = ALLOCATORS.data[i];
+                        if (e.allocs & (1 << i)) == 0 || last >= 0 && !allocator_before(last, t) {
+                            continue;
+                        }
+                        if next < 0 || allocator_before(t, next) {
+                            next = t;
+                        }
+                    }
+                    if next < 0 {
+                        break;
+                    }
+                    if shown > 0 {
+                        buf_str(out, c", ");
+                    }
+                    buf_type(out, next);
+                    shown += 1;
+                    last = next;
+                }
+                if (e.bits & EFF_ALLOC_EXTERN) != 0 {
+                    if shown > 0 {
+                        buf_str(out, c", ");
+                    }
+                    buf_str(out, c"extern");
+                }
+                buf_str(out, c")");
+            }
+            first = false;
+        }
+        let names: [*u8; 5] = [c"io", c"global", c"panic", c"diverge", c"unsafe"];
+        let bits: [i64; 5] = [EFF_IO, EFF_GLOBAL, EFF_PANIC, EFF_DIVERGE, EFF_UNSAFE];
+        for k in 0..5 {
+            if (e.bits & bits[k]) != 0 {
+                if !first {
+                    buf_str(out, c" ");
+                }
+                buf_str(out, names[k]);
+                first = false;
+            }
+        }
+        if first {
+            buf_str(out, c"none");
+        }
+        if (e.bits & EFF_UNKNOWN) != 0 {
+            buf_str(out, c" (unknown)");
+        }
+    }
+}
+
+// The effects of every function, for --print-effects: `name: effects`, a
+// line each, in FNS order: the program's functions, instances and
+// closures (not templates, not std's own).
+pub fn print_effects(out: i64) {
+    unsafe {
+        for f in 0..FN_COUNT {
+            if FNS[f].generic > 0 || FNS[f].node == 0 || FNS[f].module == STD_MODULE {
+                continue;
+            }
+            buf_bytes(out, SYMS[FNS[f].display].text);
+            buf_str(out, c": ");
+            effects_text(out, fn_effects(f));
+            buf_str(out, c"\n");
+        }
+    }
+}

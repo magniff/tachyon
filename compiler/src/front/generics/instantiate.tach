@@ -25,10 +25,10 @@ use crate::front::check::synth_mode::synth_expr;
 use crate::front::check::widen::{join_int, takes_context};
 use crate::front::closures::fn_bounds::{infer_closure_arg, infer_from_fn_bound, is_deferred_arg};
 use crate::front::generics::{
-    CUR_INST, HINT_NODE, HINT_TY, INST_QUEUE, MAX_INST_DEPTH, SYNTHED, TPL_NONE, check_targ_depth,
-    env_enter, env_leave, env_lookup, generic_symbol, hint_for, instance_of, instance_targs,
-    is_untyped_literal_expr, mark_synthed, same_targs, take_targs, targ_count_error,
-    template_instance,
+    CUR_INST, HINT_NODE, HINT_TY, INST_QUEUE, MAX_INST_DEPTH, SYNTHED, TPL_NONE, TPL_SLICE,
+    check_targ_depth, env_enter, env_leave, env_lookup, generic_symbol, hint_for, instance_of,
+    instance_targs, is_untyped_literal_expr, mangle_type, mark_synthed, param_default, same_targs,
+    shown_targs, take_targs, targ_count_error, template_instance,
 };
 use crate::front::modules::{CUR_MOD, module_of};
 use crate::front::traits::check_bounds;
@@ -410,6 +410,62 @@ fn require_bound(params: i64, bound: *i64, pos: i64, what: i64, how: *u8) {
     }
 }
 
+// (0.16) The parameters bound[first..first+count] that nothing bound and
+// that stand for parameters of generic struct or enum `node` (declared in
+// `module`) with a default, bound to the default: `Vec::new()` is
+// `Vec::<_, Gpa>::new()` when no argument or expected type says otherwise.
+fn bind_defaults(node: i64, module: i64, bound: *i64, first: i64, count: i64) {
+    unsafe {
+        let params = NODES[node].g;
+        for k in 0..count {
+            if k >= NODES[params].count {
+                return;
+            }
+            if bound[first + k] != 0 || NODES[child(params, k)].b == 0 {
+                continue;
+            }
+            let mark = TSCRATCH.count;
+            let mut known = true;
+            for i in 0..k {
+                if bound[first + i] == 0 {
+                    known = false;
+                }
+                TSCRATCH.push(bound[first + i]);
+            }
+            if known {
+                bound[first + k] = param_default(node, module, k);
+            }
+            TSCRATCH.count = mark;
+        }
+    }
+}
+
+// bind_defaults for the parameters of an impl block's generic type
+// (`impl<T, A: Allocator> Vec<T, A>`): those of function template
+// `template` that come from its impl.
+fn bind_impl_defaults(template: i64, bound: *i64) {
+    unsafe {
+        let self_node = NODES[template].h;
+        let params = NODES[template].g;
+        if self_node == 0 || NODES[params].a == 0 {
+            return;
+        }
+        let saved = CUR_MOD;
+        CUR_MOD = module_of(self_node);
+        let tpl = template_of_type_node(self_node);
+        CUR_MOD = saved;
+        if tpl == TPL_NONE || tpl == TPL_SLICE {
+            return;
+        }
+        if tpl > 0 {
+            bind_defaults(STRUCTS[tpl - 1].node, STRUCTS[tpl - 1].module, bound, 0,
+                NODES[params].a);
+        } else {
+            bind_defaults(ENUMS[-tpl - 1].node, ENUMS[-tpl - 1].module, bound, 0, NODES[params].a);
+        }
+    }
+}
+
 // The type arguments written in a Generics node (in the current scope),
 // pushed on TSCRATCH.
 pub fn push_written_targs(g: i64) {
@@ -447,7 +503,7 @@ pub fn fn_instance(tf: i64, mark: i64, origin: i64) -> i64 {
         let template = FNS[tf].node;
         let item = clone_node(template);
         NODES[item].g = 0;
-        add_fn(item, generic_symbol(FNS[tf].name, targs, count), 0);
+        add_fn(item, instance_symbol(tf, targs, count), 0);
         let f = FN_COUNT - 1;
         FNS[f].targs = targs;
         FNS[f].targ_count = count;
@@ -482,6 +538,47 @@ pub fn fn_instance(tf: i64, mark: i64, origin: i64) -> i64 {
         SELF_TYPE = saved_self;
         INST_QUEUE.push(f);
         f
+    }
+}
+
+// The symbol of the instance of function template tf with the type
+// arguments TLISTS[targs..targs+count] (generic_symbol); for a function of
+// a generic type's impl block, the impl's trailing arguments equal to the
+// type's defaults are left out, as in the type's own symbol (0.16:
+// `Vec.push.Gl` is push of `Vec<i64, Gpa>`, as before defaults existed).
+fn instance_symbol(tf: i64, targs: i64, count: i64) -> i64 {
+    unsafe {
+        let template = FNS[tf].node;
+        let self_node = NODES[template].h;
+        let params = NODES[template].g;
+        let impl_count = if self_node != 0 { NODES[params].a } else { 0 };
+        if impl_count == 0 {
+            return generic_symbol(FNS[tf].name, targs, count);
+        }
+        let saved = CUR_MOD;
+        CUR_MOD = module_of(self_node);
+        let tpl = template_of_type_node(self_node);
+        CUR_MOD = saved;
+        if tpl == TPL_NONE || tpl == TPL_SLICE {
+            return generic_symbol(FNS[tf].name, targs, count);
+        }
+        let shown = if tpl > 0 {
+            shown_targs(STRUCTS[tpl - 1].node, STRUCTS[tpl - 1].module, targs, impl_count)
+        } else {
+            shown_targs(ENUMS[-tpl - 1].node, ENUMS[-tpl - 1].module, targs, impl_count)
+        };
+        if shown == impl_count || shown == 0 && count == impl_count {
+            return generic_symbol(FNS[tf].name, targs, shown + count - impl_count);
+        }
+        let out = buf_new();
+        buf_bytes(out, SYMS[FNS[tf].name].text);
+        buf_str(out, c".G");
+        for i in 0..count {
+            if i < shown || i >= impl_count {
+                mangle_type(out, TLISTS.data[targs + i]);
+            }
+        }
+        intern(buf_slice(out))
     }
 }
 
@@ -547,6 +644,7 @@ pub fn instantiate_call(tf: i64, n: i64, first_param: i64, self_ty: i64, written
             hint_for(n));
         UNIFY_SELF = saved_self;
         UNIFY_SELF_TY = saved_self_ty;
+        bind_impl_defaults(template, bound);
         require_bound(params, bound, NODES[n].start, FNS[tf].display,
             c"write the type arguments: 'f::<T>(...)'");
         let mark = TSCRATCH.count;
@@ -586,6 +684,7 @@ pub fn infer_enum(tpl: i64, written: i64, member: i64, n: i64, pos: i64) -> i64 
         if n != 0 && variant != 0 {
             infer_from(params, bound, ENUMS[e].module, n, 0, variant, 0, false, 0, 0);
         }
+        bind_defaults(item, ENUMS[e].module, bound, 0, NODES[params].count);
         let how = c"write the type arguments: 'E::<T>::V'";
         require_bound(params, bound, pos, ENUMS[e].name, how);
         for i in 0..NODES[params].count {
@@ -659,6 +758,7 @@ pub fn infer_struct_literal(s: i64, n: i64, expected: i64) -> i64 {
                 }
             }
         }
+        bind_defaults(item, STRUCTS[s].module, bound, 0, NODES[params].count);
         require_bound(params, bound, NODES[n].start, STRUCTS[s].name,
             c"write the type arguments: 'S::<T> { ... }'");
         for i in 0..NODES[params].count {
@@ -684,7 +784,10 @@ pub fn clone_node(n: i64) -> i64 {
         NODES[c].ty = 0;
         NODES[c].x = 0;
         NODES[c].y = 0;
-        NODES[c].z = 0;
+        // (0.16: a function keeps its effect declarations)
+        if NODES[n].kind != Fn {
+            NODES[c].z = 0;
+        }
         NODES[c].res = Res::None;
         let kind = NODES[n].kind;
         match kind {

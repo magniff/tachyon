@@ -1,17 +1,21 @@
 // The standard library (0.5): the module `std`, built into the compiler
 // (compiler/std/embed.sh makes compiler/src/front/stdsrc.tach from this file
 // and the ones it appends: iter.tach, io.tach, fmt.tach, convert.tach,
-// clone.tach). A program that names `std` gets it: `std::Vec<i64>`,
-// `use std::{Buf, Vec};`.
+// clone.tach, alloc.tach, then Gpa's implementation: gpa.tach). A program
+// that names `std` gets it: `std::Vec<i64>`, `use std::{Buf, Vec};`.
 //
 // This file, the core: Option and Result, a growable vector, a byte
 // buffer, the operator traits, sorting and a hash map.
 // Failures (unwrapping None, an index out of bounds) print a message on
 // stderr and exit with 101, like the language's own checks.
 //
+// Allocation (0.16): Vec, Buf and HashMap take their memory from an
+// allocator, a type parameter (`Vec<T, A: Allocator = Gpa>`, alloc.tach),
+// every growth and free through it.
+//
 // Unsafe code (0.9): the safe functions here have no undefined behaviour
 // as long as a Vec's and a Buf's fields are changed by their methods only
-// (tachyon has no private fields yet), and a slice from `as_slice` (or a
+// (0.16: #[sealed], checked from 0.16's T2), and a slice from `as_slice` (or a
 // HashMap's `get_mut`, `get_or_insert`) is not used after the Vec grows
 // (the map gets a new key) or is freed. The functions taking C strings
 // are `unsafe fn`: the string must end with a NUL.
@@ -105,16 +109,27 @@ impl<T, E> Result<T, E> {
 
 // ---- Vec ----
 
-// A growable vector of T on the heap; `free` gives its memory back.
-pub struct Vec<T> { ptr: *T, len: i64, cap: i64 }
+// A growable vector of T, its memory from allocator A (0.16; Gpa, C's
+// malloc, by default); `free` gives its memory back.
+#[sealed]
+pub struct Vec<T, A: Allocator = Gpa> { ptr: *T, len: i64, cap: i64, alloc: A }
 
-impl<T> Vec<T> {
-    pub fn new() -> Vec<T> {
-        Vec { ptr: 0 as *T, len: 0, cap: 0 }
+// (0.16: only a Vec on a global allocator has `new`)
+impl<T, A: Allocator + GlobalAllocator> Vec<T, A> {
+    // An empty Vec on the global allocator (Gpa).
+    pub fn new() -> Vec<T, A> {
+        Vec { ptr: 0 as *T, len: 0, cap: 0, alloc: A::global() }
+    }
+}
+
+impl<T, A: Allocator> Vec<T, A> {
+    // An empty Vec on allocator a (0.16).
+    pub fn new_in(a: A) -> Vec<T, A> {
+        Vec { ptr: 0 as *T, len: 0, cap: 0, alloc: a }
     }
 
-    pub fn with_capacity(cap: i64) -> Vec<T> {
-        let mut v: Vec<T> = Vec::new();
+    pub fn with_capacity(cap: i64) -> Vec<T, A> {
+        let mut v: Vec<T, A> = Vec::new();
         v.reserve(cap);
         v
     }
@@ -122,24 +137,24 @@ impl<T> Vec<T> {
     // (0.15) n copies of x: Rust's `vec![x; n]`. x is copied as it is, not
     // cloned: n Vecs from one non-empty Vec would share its elements (push
     // `Vec::new()` n times instead).
-    pub fn filled(n: i64, x: T) -> Vec<T> {
-        let mut v: Vec<T> = Vec::with_capacity(n);
+    pub fn filled(n: i64, x: T) -> Vec<T, A> {
+        let mut v: Vec<T, A> = Vec::with_capacity(n);
         for _ in 0..n {
             v.push(x);
         }
         v
     }
 
-    pub fn len(self: *Vec<T>) -> i64 {
+    pub fn len(self: *Vec<T, A>) -> i64 {
         self.len
     }
 
-    pub fn is_empty(self: *Vec<T>) -> bool {
+    pub fn is_empty(self: *Vec<T, A>) -> bool {
         self.len == 0
     }
 
     // Room for `extra` more elements.
-    pub fn reserve(self: *Vec<T>, extra: i64) {
+    pub fn reserve(self: *Vec<T, A>, extra: i64) {
         if self.len + extra <= self.cap {
             return;
         }
@@ -147,24 +162,38 @@ impl<T> Vec<T> {
         while cap < self.len + extra {
             cap *= 2;
         }
-        self.ptr = unsafe { realloc(self.ptr as *u8, (cap * size_of(T)) as u64) as *T };
+        // (try_resize and the check here, not resize: one call less at -O0)
+        let p = unsafe {
+            self.alloc.try_resize(self.ptr as *u8, self.cap * size_of(T), cap * size_of(T),
+                align_of(T))
+        };
+        if p == 0 as *u8 {
+            out_of_memory();
+        }
+        self.ptr = p as *T;
         self.cap = cap;
     }
 
     // Appends the elements of s, which may be a view of this Vec: when it
     // grows, the elements are copied to the new memory before the old is
     // freed.
-    pub fn extend_from_slice(self: *Vec<T>, s: [T]) {
+    pub fn extend_from_slice(self: *Vec<T, A>, s: [T]) {
         let n = s.len;
         let mut old = 0 as *T;
+        let mut old_cap = 0;
         if self.len + n > self.cap {
             let mut cap = if self.cap == 0 { 4 } else { self.cap * 2 };
             while cap < self.len + n {
                 cap *= 2;
             }
             old = self.ptr;
+            old_cap = self.cap;
+            let p = self.alloc.try_alloc(cap * size_of(T), align_of(T));
+            if p == 0 as *u8 {
+                out_of_memory();
+            }
             unsafe {
-                self.ptr = malloc((cap * size_of(T)) as u64) as *T;
+                self.ptr = p as *T;
                 for i in 0..self.len {
                     self.ptr[i] = old[i];
                 }
@@ -178,11 +207,11 @@ impl<T> Vec<T> {
         }
         self.len += n;
         unsafe {
-            free(old as *u8);
+            self.alloc.free(old as *u8, old_cap * size_of(T), align_of(T));
         }
     }
 
-    pub fn push(self: *Vec<T>, x: T) {
+    pub fn push(self: *Vec<T, A>, x: T) {
         if self.len == self.cap {
             self.reserve(1);
         }
@@ -192,7 +221,7 @@ impl<T> Vec<T> {
         self.len += 1;
     }
 
-    pub fn pop(self: *Vec<T>) -> Option<T> {
+    pub fn pop(self: *Vec<T, A>) -> Option<T> {
         if self.len == 0 {
             return Option::None;
         }
@@ -201,21 +230,21 @@ impl<T> Vec<T> {
     }
 
     // Element i (checked: out of bounds exits with 101).
-    pub fn get(self: *Vec<T>, i: i64) -> T {
+    pub fn get(self: *Vec<T, A>, i: i64) -> T {
         self.as_slice()[i]
     }
 
-    pub fn set(self: *Vec<T>, i: i64, x: T) {
+    pub fn set(self: *Vec<T, A>, i: i64, x: T) {
         self.as_slice()[i] = x;
     }
 
     // The last element, if there is one (the Vec keeps it; `pop` takes it).
-    pub fn last(self: *Vec<T>) -> Option<T> {
+    pub fn last(self: *Vec<T, A>) -> Option<T> {
         if self.len == 0 { Option::None } else { Option::Some(self.get(self.len - 1)) }
     }
 
     // Exchanges elements i and j (checked).
-    pub fn swap(self: *Vec<T>, i: i64, j: i64) {
+    pub fn swap(self: *Vec<T, A>, i: i64, j: i64) {
         let s = self.as_slice();
         let t = s[i];
         s[i] = s[j];
@@ -224,7 +253,7 @@ impl<T> Vec<T> {
 
     // Puts x at index i, 0 to len (checked), moving the elements from i
     // on up by one.
-    pub fn insert(self: *Vec<T>, i: i64, x: T) {
+    pub fn insert(self: *Vec<T, A>, i: i64, x: T) {
         if i < 0 || i > self.len {
             unsafe { panic(c"Vec::insert: index out of bounds") }
         }
@@ -240,7 +269,7 @@ impl<T> Vec<T> {
 
     // Takes element i out (checked) and returns it, moving the elements
     // after it down by one.
-    pub fn remove(self: *Vec<T>, i: i64) -> T {
+    pub fn remove(self: *Vec<T, A>, i: i64) -> T {
         let s = self.as_slice();
         let x = s[i];
         for k in i..s.len - 1 {
@@ -251,23 +280,23 @@ impl<T> Vec<T> {
     }
 
     // Keeps the first n elements (all of them when there are fewer).
-    pub fn truncate(self: *Vec<T>, n: i64) {
+    pub fn truncate(self: *Vec<T, A>, n: i64) {
         if n >= 0 && n < self.len {
             self.len = n;
         }
     }
 
-    pub fn as_slice(self: *Vec<T>) -> [T] {
+    pub fn as_slice(self: *Vec<T, A>) -> [T] {
         unsafe { self.ptr[0..self.len] }
     }
 
-    pub fn clear(self: *Vec<T>) {
+    pub fn clear(self: *Vec<T, A>) {
         self.len = 0;
     }
 
-    pub fn free(self: *Vec<T>) {
+    pub fn free(self: *Vec<T, A>) {
         unsafe {
-            free(self.ptr as *u8);
+            self.alloc.free(self.ptr as *u8, self.cap * size_of(T), align_of(T));
         }
         self.ptr = 0 as *T;
         self.len = 0;
@@ -277,29 +306,37 @@ impl<T> Vec<T> {
 
 // ---- Buf ----
 
-// A growable buffer of bytes, for building text.
-pub struct Buf { bytes: Vec<u8> }
+// A growable buffer of bytes, for building text (0.16: on allocator A).
+#[sealed]
+pub struct Buf<A: Allocator = Gpa> { bytes: Vec<u8, A> }
 
-impl Buf {
-    pub fn new() -> Buf {
+impl<A: Allocator + GlobalAllocator> Buf<A> {
+    pub fn new() -> Buf<A> {
         Buf { bytes: Vec::new() }
     }
+}
 
-    pub fn len(self: *Buf) -> i64 {
+impl<A: Allocator> Buf<A> {
+    // An empty Buf on allocator a (0.16).
+    pub fn new_in(a: A) -> Buf<A> {
+        Buf { bytes: Vec::new_in(a) }
+    }
+
+    pub fn len(self: *Buf<A>) -> i64 {
         self.bytes.len
     }
 
-    pub fn push(self: *Buf, b: u8) {
+    pub fn push(self: *Buf<A>, b: u8) {
         self.bytes.push(b);
     }
 
     // Appends s, which may be a view of this Buf.
-    pub fn push_str(self: *Buf, s: [u8]) {
+    pub fn push_str(self: *Buf<A>, s: [u8]) {
         self.bytes.extend_from_slice(s);
     }
 
     // A C string (up to its NUL).
-    pub unsafe fn push_cstr(self: *Buf, s: *u8) {
+    pub unsafe fn push_cstr(self: *Buf<A>, s: *u8) {
         let mut n = 0;
         while s[n] != 0 {
             n += 1;
@@ -308,7 +345,7 @@ impl Buf {
     }
 
     // The decimal digits of v.
-    pub fn push_int(self: *Buf, v: i64) {
+    pub fn push_int(self: *Buf<A>, v: i64) {
         if v < 0 {
             self.push('-');
             if v == -9223372036854775807 - 1 {
@@ -324,15 +361,15 @@ impl Buf {
         self.push('0' + (v % 10) as u8);
     }
 
-    pub fn as_slice(self: *Buf) -> [u8] {
+    pub fn as_slice(self: *Buf<A>) -> [u8] {
         self.bytes.as_slice()
     }
 
-    pub fn clear(self: *Buf) {
+    pub fn clear(self: *Buf<A>) {
         self.bytes.clear();
     }
 
-    pub fn free(self: *Buf) {
+    pub fn free(self: *Buf<A>) {
         self.bytes.free();
     }
 }
@@ -749,8 +786,9 @@ pub fn sort_stable_by<T, F: FnMut(*T, *T) -> i64>(s: [T], f: F) {
 // A hash table (open addressing, linear probing) from K to V. Slots are
 // numbered 0..slots(); `key_at(i)` and `value_at(i)` give an occupied
 // slot's entry (None for a free one), which is how the map is iterated.
-pub struct HashMap<K: Hash + Eq, V> {
-    keys: *K, values: *V, states: *u8, cap: i64, len: i64, used: i64,
+#[sealed]
+pub struct HashMap<K: Hash + Eq, V, A: Allocator = Gpa> {
+    keys: *K, values: *V, states: *u8, cap: i64, len: i64, used: i64, alloc: A,
 }
 
 // Slot states.
@@ -758,21 +796,33 @@ const SLOT_FREE: u8 = 0;
 const SLOT_FULL: u8 = 1;
 const SLOT_GONE: u8 = 2;
 
-impl<K: Hash + Eq, V> HashMap<K, V> {
-    pub fn new() -> HashMap<K, V> {
-        HashMap { keys: 0 as *K, values: 0 as *V, states: 0 as *u8, cap: 0, len: 0, used: 0 }
+impl<K: Hash + Eq, V, A: Allocator + GlobalAllocator> HashMap<K, V, A> {
+    pub fn new() -> HashMap<K, V, A> {
+        HashMap {
+            keys: 0 as *K, values: 0 as *V, states: 0 as *u8, cap: 0, len: 0, used: 0,
+            alloc: A::global(),
+        }
+    }
+}
+
+impl<K: Hash + Eq, V, A: Allocator> HashMap<K, V, A> {
+    // An empty map on allocator a (0.16).
+    pub fn new_in(a: A) -> HashMap<K, V, A> {
+        HashMap {
+            keys: 0 as *K, values: 0 as *V, states: 0 as *u8, cap: 0, len: 0, used: 0, alloc: a
+        }
     }
 
-    pub fn len(self: *HashMap<K, V>) -> i64 {
+    pub fn len(self: *HashMap<K, V, A>) -> i64 {
         self.len
     }
 
-    pub fn is_empty(self: *HashMap<K, V>) -> bool {
+    pub fn is_empty(self: *HashMap<K, V, A>) -> bool {
         self.len == 0
     }
 
     // The slot holding `key`, or -1.
-    fn slot_of(self: *HashMap<K, V>, key: *K) -> i64 {
+    fn slot_of(self: *HashMap<K, V, A>, key: *K) -> i64 {
         if self.cap == 0 {
             return -1;
         }
@@ -790,17 +840,17 @@ impl<K: Hash + Eq, V> HashMap<K, V> {
         }
     }
 
-    pub fn contains(self: *HashMap<K, V>, key: K) -> bool {
+    pub fn contains(self: *HashMap<K, V, A>, key: K) -> bool {
         self.slot_of(&key) >= 0
     }
 
     // The same as `contains` (Rust's name).
-    pub fn contains_key(self: *HashMap<K, V>, key: K) -> bool {
+    pub fn contains_key(self: *HashMap<K, V, A>, key: K) -> bool {
         self.slot_of(&key) >= 0
     }
 
     // A copy of the value of `key`, if it has one (`get_mut` changes it).
-    pub fn get(self: *HashMap<K, V>, key: K) -> Option<V> {
+    pub fn get(self: *HashMap<K, V, A>, key: K) -> Option<V> {
         let i = self.slot_of(&key);
         if i < 0 { Option::None } else { Option::Some(unsafe { self.values[i] }) }
     }
@@ -809,7 +859,7 @@ impl<K: Hash + Eq, V> HashMap<K, V> {
     // one: `if let Some(a) = m.get_mut(k) { a[0].balance += 10; }`. The
     // view is valid until the map's next insert, remove or free (like a
     // Vec's `as_slice()`).
-    pub fn get_mut(self: *HashMap<K, V>, key: K) -> Option<[V]> {
+    pub fn get_mut(self: *HashMap<K, V, A>, key: K) -> Option<[V]> {
         let i = self.slot_of(&key);
         if i < 0 { Option::None } else { Option::Some(unsafe { self.values[i..i + 1] }) }
     }
@@ -817,7 +867,7 @@ impl<K: Hash + Eq, V> HashMap<K, V> {
     // The value of `key` in place (a view of one element, as `get_mut`),
     // inserted as `default` first if the key has none; Rust's
     // `entry(k).or_insert(d)`. Counting: `counts.get_or_insert(w, 0)[0] += 1;`.
-    pub fn get_or_insert(self: *HashMap<K, V>, key: K, default: V) -> [V] {
+    pub fn get_or_insert(self: *HashMap<K, V, A>, key: K, default: V) -> [V] {
         let mut i = self.slot_of(&key);
         if i < 0 {
             i = self.insert_new(key, default);
@@ -826,7 +876,7 @@ impl<K: Hash + Eq, V> HashMap<K, V> {
     }
 
     // Sets the value of `key`; returns its old value, if it had one.
-    pub fn insert(self: *HashMap<K, V>, key: K, value: V) -> Option<V> {
+    pub fn insert(self: *HashMap<K, V, A>, key: K, value: V) -> Option<V> {
         let i = self.slot_of(&key);
         if i >= 0 {
             let old = unsafe { self.values[i] };
@@ -840,7 +890,7 @@ impl<K: Hash + Eq, V> HashMap<K, V> {
     }
 
     // Adds `key`, which the map does not have; returns its slot.
-    fn insert_new(self: *HashMap<K, V>, key: K, value: V) -> i64 {
+    fn insert_new(self: *HashMap<K, V, A>, key: K, value: V) -> i64 {
         if (self.used + 1) * 4 > self.cap * 3 {
             self.rehash();
         }
@@ -862,7 +912,7 @@ impl<K: Hash + Eq, V> HashMap<K, V> {
     }
 
     // Removes `key`; returns its value, if it had one.
-    pub fn remove(self: *HashMap<K, V>, key: K) -> Option<V> {
+    pub fn remove(self: *HashMap<K, V, A>, key: K) -> Option<V> {
         let i = self.slot_of(&key);
         if i < 0 {
             return Option::None;
@@ -874,18 +924,18 @@ impl<K: Hash + Eq, V> HashMap<K, V> {
         }
     }
 
-    pub fn slots(self: *HashMap<K, V>) -> i64 {
+    pub fn slots(self: *HashMap<K, V, A>) -> i64 {
         self.cap
     }
 
-    pub fn key_at(self: *HashMap<K, V>, i: i64) -> Option<K> {
+    pub fn key_at(self: *HashMap<K, V, A>, i: i64) -> Option<K> {
         if i < 0 || i >= self.cap || unsafe { self.states[i] } != SLOT_FULL {
             return Option::None;
         }
         Option::Some(unsafe { self.keys[i] })
     }
 
-    pub fn value_at(self: *HashMap<K, V>, i: i64) -> Option<V> {
+    pub fn value_at(self: *HashMap<K, V, A>, i: i64) -> Option<V> {
         if i < 0 || i >= self.cap || unsafe { self.states[i] } != SLOT_FULL {
             return Option::None;
         }
@@ -894,7 +944,7 @@ impl<K: Hash + Eq, V> HashMap<K, V> {
 
     // Twice the room (at least 8 slots), the entries moved over and the
     // removed ones dropped.
-    fn rehash(self: *HashMap<K, V>) {
+    fn rehash(self: *HashMap<K, V, A>) {
         let old_cap = self.cap;
         let old_keys = self.keys;
         let old_values = self.values;
@@ -904,9 +954,12 @@ impl<K: Hash + Eq, V> HashMap<K, V> {
             cap *= 2;
         }
         unsafe {
-            self.keys = malloc((cap * size_of(K)) as u64) as *K;
-            self.values = malloc((cap * size_of(V)) as u64) as *V;
-            self.states = malloc(cap as u64);
+            self.keys = self.alloc.try_alloc(cap * size_of(K), align_of(K)) as *K;
+            self.values = self.alloc.try_alloc(cap * size_of(V), align_of(V)) as *V;
+            self.states = self.alloc.try_alloc(cap, 1);
+            if self.keys == 0 as *K || self.values == 0 as *V || self.states == 0 as *u8 {
+                out_of_memory();
+            }
             for i in 0..cap {
                 self.states[i] = SLOT_FREE;
             }
@@ -931,19 +984,19 @@ impl<K: Hash + Eq, V> HashMap<K, V> {
         }
         if old_cap > 0 {
             unsafe {
-                free(old_keys as *u8);
-                free(old_values as *u8);
-                free(old_states);
+                self.alloc.free(old_keys as *u8, old_cap * size_of(K), align_of(K));
+                self.alloc.free(old_values as *u8, old_cap * size_of(V), align_of(V));
+                self.alloc.free(old_states, old_cap, 1);
             }
         }
     }
 
-    pub fn free(self: *HashMap<K, V>) {
+    pub fn free(self: *HashMap<K, V, A>) {
         if self.cap > 0 {
             unsafe {
-                free(self.keys as *u8);
-                free(self.values as *u8);
-                free(self.states);
+                self.alloc.free(self.keys as *u8, self.cap * size_of(K), align_of(K));
+                self.alloc.free(self.values as *u8, self.cap * size_of(V), align_of(V));
+                self.alloc.free(self.states, self.cap, 1);
             }
         }
         self.cap = 0;
