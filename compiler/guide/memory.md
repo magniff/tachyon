@@ -105,6 +105,16 @@ runs. A view kept in a variable or a field and re-taken after each push
 is fine, even inside an index: in `s[grow(&v, &s)]` the slice `s` is
 read after `grow` returns (0.14).
 
+`tachyonc --check-alloc` (0.16) finds these at run time: Gpa gives each
+block pages of its own, never reused, and moves a block on every resize,
+so a view of freed or moved memory faults and the program stops with
+`use after free: block #3 (32 bytes), allocated at main.tach:4:5, freed
+at main.tach:9:5` (exit 101). Double, invalid and wrong-size frees stop
+it too, and the blocks not freed are listed at exit (`gpa.live_blocks()`,
+`gpa.check_leaks()` for tests). Each live block takes a page: for tests
+and debugging, at any `-O` level; `TACHYON_ALLOC_TRAP=N` raises SIGTRAP
+when block N is allocated, for a debugger.
+
 ## Raw memory
 
 `malloc` and `free` from C, in `unsafe` (see `tachyonc guide unsafe`).

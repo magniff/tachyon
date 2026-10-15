@@ -141,7 +141,8 @@ tar -C "$SNAP" -c -f - src | docker run --rm -i --name "$CONTAINER" --cpus "$CPU
     row chain pass $(( $(date +%s) - start )) "$(awk "/^  head / { sub(/^  head +/, \"\"); print; exit }" /tmp/chain.log)"
     start=$(date +%s)
     head -c 3000000 /dev/urandom >/tmp/random
-    ./target/tachyonc examples/md5.tach -o /tmp/md5.o
+    # (0.16: the 0.15 corpus allocates ambiently until fix --only alloc016)
+    TACHYON_AMBIENT_GPA=1 ./target/tachyonc examples/md5.tach -o /tmp/md5.o
     cc -o /tmp/md5 /tmp/md5.o -lm
     got=$(/tmp/md5 </tmp/random)
     want=$(md5sum </tmp/random | cut -d" " -f1)

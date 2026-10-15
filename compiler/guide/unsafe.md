@@ -92,4 +92,9 @@ views short-lived; re-take `as_slice()` after pushing.
   accesses against the heap blocks at run time (`malloc`/`free`):
   out-of-bounds and use-after-free stop the program with `unsafe access
   ...` and exit 101. Programs run tens of times slower.
+- `tachyonc --check-alloc` (0.16) puts every block of Gpa on pages of
+  its own: a use after free (a copied `Vec` handle, a view after a push)
+  faults and is reported with where the block was allocated and freed;
+  bad frees and leaks are reported too (`tachyonc guide memory`). With
+  `--check-unsafe`, raw accesses are checked against those blocks.
 - Statics, `static mut` included, are safe: tachyon has no threads.

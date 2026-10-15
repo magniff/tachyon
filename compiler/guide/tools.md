@@ -109,5 +109,5 @@ Exit status: 0 done, 1 refused or failed (nothing written), 2 usage.
 
 `-O0`, `-O1`, `-O2` (the default; all behave the same), `--target
 aarch64-macos|aarch64-linux|x86_64-linux|x86_64-macos`, `-g` (debug line
-tables), `--check-unsafe`, `--emit-header`, `--emit-imports`, `-I DIR`,
-`--version`. `tachyonc guide TOPIC` for the language.
+tables), `--check-unsafe`, `--check-alloc` (0.16), `--emit-header`,
+`--emit-imports`, `-I DIR`, `--version`. `tachyonc guide TOPIC` for the language.
