@@ -851,8 +851,21 @@ that carry their allocator; memoizing pure calls across the program
 lru-cache gap (the probe loop around an out-of-line `HashMap::insert`,
 which the capture analysis does not prove non-capturing) and a widening
 multiply-accumulate on x86_64 to a later perf task; the effects and
-allocators examples (examples/effects, examples/allocators) to 0.16.1 if
-they miss the gate.
+allocators examples made the gate (examples/effects,
+examples/allocators, nine tested sessions).
+
+0.16.0 release gate (2026-10-15): `bootstrap/gate.sh --release` on
+aarch64-macos, 5:52 wall (load average 15 to 30 from other agents'
+work): the chain (fixpoint, built by 0.15.0), the suite at -O0/1/2
+(938 tests); fuzz 60 in each of the ten modes (the seed in one), ABI 100
+in three modes, objcheck (1512 of 1512), header layouts, lldb at -O0 and
+-O2, stress-grow, and the new examples-checkalloc (every example's test
+built with `--check-alloc`, 87 cases); aarch64-linux (the cross-built
+fixpoint, the suite at every level, fuzz 300 in nine modes, ABI 150 in
+three, objcheck, layouts, gdb). Two earlier runs failed only on time
+(two algorithm examples at -O0 and one checked example past 20 s under
+load 30): the gate now gives each test program a minute. x86_64 not
+run (off from 0.15). Benchmarks and compile times in "Benchmarks", 0.16.
 
 ## 0.17: memory safety by mutable value semantics
 
@@ -1592,3 +1605,92 @@ on this machine at this load. The tiny std program compiles as fast as
 with 0.14.0 although std doubled (46 to 90 KB): std is loaded by
 sections, and print compiles less code (Integration notes in
 docs/design/errors-formatting.md).
+
+### 0.16
+
+aarch64-macos (Apple silicon, native; `bench/run.sh -p <0.15.0> -r 9`,
+the fastest of 9 runs in ms, right after the release gate, load average
+from 25 down to 2 while it ran, other agents' work on the machine; the
+"0.15.0" column is 0.15's own table, since 0.15.0 cannot build the
+programs migrated to explicit allocation; the geometric mean is over cc
+-O2's, programs with a C version only):
+
+| program | 0.15.0 | 0.16 -O2 | cc -O2 |
+|---|---|---|---|
+| arena_trees | - | 33 | 40 |
+| binarytrees | 160 | 159 | 161 |
+| collatz | 312 | 291 | 291 |
+| fannkuch | 122 | 117 | 140 |
+| fib | 14 | 14 | 14 |
+| interp | 43 | 42 | 40 |
+| iterchain | 196 | 193 | 183 |
+| iterloop | 194 | 191 | 185 |
+| json | 112 | 105 | 93 |
+| mandelbrot | 174 | 162 | 156 |
+| matmul | 19 | 18 | 43 |
+| nbody | 31 | 31 | 28 |
+| sieve | 69 | 59 | 70 |
+| sort | 60 | 55 | 52 |
+| stencil | 8 | 8 | 8 |
+| wordcount | 92 | 85 | 69 |
+| md5 | 37 | 20 | - |
+| fmtints | 30 | 22 | - |
+| fmtloop | 27 | 22 | - |
+| purecall | - | 74 | - |
+| purecall_hoisted | - | 74 | - |
+| geomean vs cc -O2 (16 programs) | 0.966 (15) | 0.953 | 1 |
+
+(-O0 and -O1 in the same run: geomean 7.750 and 1.598.) The pairs, run
+alternately, fastest of 18 rounds: iterchain over iterloop 193 against
+191 ms, **1.010**; fmtloop over fmtints 22 against 22, **1.000**;
+purecall (calls of pure functions left in loops) over purecall_hoisted
+(the same hoisted and merged by hand) 74 against 74, **1.000**, where
+0.15.0 took 291 ms (the limit for each pair is 1.05). arena_trees
+(binarytrees with its nodes in std's arenas through the Allocator trait)
+33 ms against C's arena 40 and binarytrees on malloc 159: the bump path
+inlines without a call. fmtloop and fmtints are faster than 0.15's
+(27 and 30 ms): an integer hole with a spec is formatted in one pass and
+`push_int` writes in place. md5 (u32 arithmetic throughout) went from
+34 to 19 ms against 0.15.0's build of its own md5, measured alone (min
+of 9): T4's u32 operations on the w registers, without the extension
+after each.
+
+The gaps examples/algorithms showed (docs/optimizer.md; measured by T4 on
+the examples, ms, C's in parentheses): dijkstra with struct entries 78 to
+65 (47), a derived `<` branch-free; nqueens on u32 masks 109 to 76 (69),
+u32 arithmetic without extensions; bigint's schoolbook multiply 8.3 to 5.7
+(4.7) and F(10^6) 45 to 36 (27), the widening multiply-accumulate
+vectorized (`umlal`); `count_ones`, `leading_zeros`, `trailing_zeros` in
+std, `cnt`/`clz` on AArch64. lru-cache stays at about 1.5 times C's
+(the probe loop around an out-of-line `HashMap::insert`): later.
+
+Compile time (aarch64-macos, wall time, best of 7, the two compilers
+alternating on the same input: 0.16's source, 125,600 lines in 277
+files; load average about 1.3):
+
+| | 0.15.0 | 0.16 |
+|---|---|---|
+| the compiler to an object, -O0 | 299 ms | 298 ms |
+| the compiler to an object, -O1 | 851 ms | 856 ms |
+| the compiler to an object, -O2 | 2596 ms | 2502 ms |
+| `tachyonc check compiler/src/main.tach`, no cache | 114 ms | 117 ms |
+| `tachyonc query refs run_gvn`, no cache | 149 ms | 158 ms |
+| a 7-line std program to an object, -O0 | 2.8 ms | 3.0 ms |
+| a 7-line std program to an object, -O2 | 5.7 ms | 6.8 ms |
+
+The compiler compiles itself as fast as 0.15.0 does at -O0 and -O1 and
+4% faster at -O2 (T6's register allocator fix: `is_returns_twice_call`
+compared names through strlen). The effects (inference and checks over
+about 400,000 nodes, 3 to 4 ms) are in `check`, 2% more; queries without
+the cache about 6% more. Accepted for 0.16, decided at integration: the
+compiler's own source moved to f-strings (T6), and a compiler built from
+it is 3 to 4% slower at -O0 and -O1 than one built from release-0.16
+before that move (check +0.6%, -O2 9% faster with the regalloc fix):
+each f-string is lowered to four functions that -O0 and -O1 do not
+inline, which user programs pay too; the fix belongs to the f-string
+lowering, in 0.17's compile-speed work, not to reverting the compiler's
+f-strings. The small std program compiles 0.2 ms slower at -O0 and 1.1
+ms at -O2: std's allocation layer (the Allocator trait, Gpa's methods
+inlined, alloc.tach's sections) and, at -O2, the effects the optimizer
+reads (at -O0 inference is skipped when nothing reads it).
+
