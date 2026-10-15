@@ -103,7 +103,7 @@ use crate::base::timer::{
 };
 use crate::tools::conflicts::run_conflicts;
 use derived::{collect_derive_spans, derived_note};
-use effects::query_effects;
+use effects::{OPT_HAS, OPT_WHY, check_effect_options, query_effects, query_effects_module};
 use locals::{QUERY_ARGV, full_requested, has_column, local_refs};
 use names::{canonical_name, is_name_char, is_symbol, item_below, module_def, path_matches};
 use stdq::{all_std, ask_with_std, names_std, std_requested, std_root, wants_std};
@@ -333,7 +333,7 @@ fn put_usage(out: i64) {
         buf_str(out, c"       tachyonc query deps MODULE [--max-lines N]\n");
         buf_str(out, c"       tachyonc query unused [MODULE] [--all]\n");
         buf_str(out, c"       tachyonc query impact NAME\n");
-        buf_str(out, c"       tachyonc query effects NAME...   (0.16: the inferred effects)\n");
+        buf_str(out, c"       tachyonc query effects NAME...|MODULE [--has EFFECT] [--why EFFECT]   (alloc(Gpa) io global panic diverge unsafe)\n");
         buf_str(out, c"       tachyonc query conflicts [FILE|DIR|FILE:LINE...] [--show]\n");
         buf_str(out, c"NAME: a path or its end (f, m::f, T::f, T.field), or FILE:LINE; std's too (std::f, Vec::push)\n");
         buf_str(out, c"--budget TOKENS: any answer cut to about TOKENS (default 8000; 0: no limit; context: 2000)\n");
@@ -439,7 +439,8 @@ fn run_query_inner(argc: i64, argv: **u8) -> i64 {
             let a = argv[i];
             let valued = streq(a, c"--in") || streq(a, c"--limit") || streq(a, c"--root")
                 || streq(a, c"--over") || streq(a, c"--max-lines") || streq(a, c"--kind")
-                || streq(a, c"--budget") || streq(a, c"--writes");
+                || streq(a, c"--budget") || streq(a, c"--writes") || streq(a, c"--has")
+                || streq(a, c"--why");
             if streq(a, c"--count") {
                 OPT_COUNT = true;
             } else if streq(a, c"--transitive") {
@@ -476,6 +477,12 @@ fn run_query_inner(argc: i64, argv: **u8) -> i64 {
                     i += 1;
                 } else if streq(a, c"--writes") {
                     OPT_WRITES = argv[i + 1];
+                    i += 1;
+                } else if streq(a, c"--has") {
+                    OPT_HAS = argv[i + 1];
+                    i += 1;
+                } else if streq(a, c"--why") {
+                    OPT_WHY = argv[i + 1];
                     i += 1;
                 } else {
                     let n = parse_count(argv[i + 1]);
@@ -602,6 +609,9 @@ fn run_query_inner(argc: i64, argv: **u8) -> i64 {
         if root == 0 as *u8 {
             return 2;
         }
+        if streq(cmd, c"effects") && check_effect_options() != 0 {
+            return 2;
+        }
         // (0.13: def, show, refs, callers and items from the tools' cache,
         // when it holds for the program; else read in full, then cached.
         // grep and type need the tokens and nodes, which are not cached:
@@ -625,9 +635,11 @@ fn run_query_inner(argc: i64, argv: **u8) -> i64 {
                 at_column = true;
             }
         }
+        // (0.16: effects without --has and --why: the cached lines)
+        let plain_effects = streq(cmd, c"effects") && OPT_HAS == 0 as *u8 && OPT_WHY == 0 as *u8;
         let cacheable = (streq(cmd, c"def") || streq(cmd, c"show") || streq(cmd, c"refs")
-            || streq(cmd, c"callers") || items || context) && !with_std && !at_column
-            && !full_requested();
+            || streq(cmd, c"callers") || items || context || plain_effects) && !with_std
+            && !at_column && !full_requested();
         let cached = cacheable && cache_restore(root, 0, is_refs || context);
         if !cached && !load_program(root, 0) {
             // (nothing to answer with: the errors say why)
@@ -938,6 +950,16 @@ fn answer(cmd: *u8, args: *IntVec, items: bool, is_refs: bool) -> i64 {
                     status = 1;
                 }
                 continue;
+            }
+            if streq(cmd, c"effects") {
+                // (0.16: a module's functions, effects.tach)
+                let m = context_module(text);
+                if m >= 0 {
+                    if query_effects_module(m) != 0 {
+                        status = 1;
+                    }
+                    continue;
+                }
             }
             if streq(cmd, c"show") && ends_with_c((*args).data[i] as *u8, c"::section") {
                 // (MODULE::section TITLE)

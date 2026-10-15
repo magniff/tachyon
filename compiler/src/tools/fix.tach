@@ -14,6 +14,10 @@
 //   std015   (0.15, only when asked for) the calls of 0.14 std functions
 //            whose result became a Result, given the method that gives
 //            the old value back (fixstd015.tach)
+//   alloc016 (0.16, only when asked for) allocation made explicit: std's
+//            0.15 forms (`Vec::new()`) become their `_in` forms, and the
+//            allocator is passed down from `fn main(gpa: Gpa)` to them
+//            (refactor_shape/alloc016.tach)
 //
 // `tachyonc --fix-imports ROOT` and `--fix-unsafe ROOT` (0.8, 0.9) are
 // `fix --only imports` and `fix --only unsafe`, silent when there is
@@ -23,6 +27,7 @@ use crate::base::{
     BUFS, FILES, IntVec, OVERLAY, SRC, STDOUT, SYMS, buf_byte, buf_bytes, buf_int, buf_new,
     buf_slice, buf_str, buf_write_fd, intern, streq,
 };
+use crate::front::ambient::AMBIENT_GPA;
 use crate::front::ast::{KEEP_PARSED, NODES, NODE_COUNT, NodeKind, child};
 use crate::front::generics::{TPL_NONE, template_of_key};
 use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
@@ -36,7 +41,7 @@ use crate::front::types::{
 };
 use crate::tools::edit::{TARGET, TARGET_NAME, edit_count, edit_replace};
 use crate::tools::edit::apply::{
-    copy_rewritten, finish_edit, overlay_args, prepare_edit, set_command, write_round,
+    STRICT_ALLOC, copy_rewritten, finish_edit, overlay_args, prepare_edit, set_command, write_round,
 };
 use crate::tools::edit::cli::{delete_lines, take_edit_option};
 use crate::tools::edit::items::{after_line, indent_of, node_head};
@@ -53,6 +58,7 @@ use crate::tools::query::positions::{line_end, line_start};
 use crate::tools::query::refs::{IN_FILE, IN_MODULE, OPT_IN, put_bad_in, ref_in, resolve_in};
 use crate::tools::query::show::text_start;
 use crate::tools::reexports::{reached_through, reexport_edits};
+use crate::tools::refactor_shape::alloc016::{ALLOC016_LEFT, alloc016_edits};
 use crate::tools::tidyimports::{TIDY_EDITED, relative_style, styled_path, tidy_import_edits};
 
 const F_IMPORTS: i64 = 1;
@@ -64,6 +70,8 @@ const F_TIDY: i64 = 16;
 const F_REEXPORTS: i64 = 32;
 // (0.15: only when asked for, as tidy-imports and reexports: fixstd015.tach)
 const F_STD015: i64 = 64;
+// (0.16: refactor_shape/alloc016.tach)
+const F_ALLOC016: i64 = 128;
 const F_ALL: i64 = 15;
 
 // What the checker found to fix: the imports an unknown name asks for
@@ -874,10 +882,11 @@ fn run_fix_inner(argc: i64, argv: **u8, alias: i64) -> i64 {
                         else if word_is(w, c"unsafe") { F_UNSAFE }
                         else if word_is(w, c"tidy-imports") { F_TIDY }
                         else if word_is(w, c"reexports") { F_REEXPORTS }
-                        else if word_is(w, c"std015") { F_STD015 } else { 0 };
+                        else if word_is(w, c"std015") { F_STD015 }
+                        else if word_is(w, c"alloc016") { F_ALLOC016 } else { 0 };
                     if bit == 0 {
                         let d = diag(c"error", c"fix.usage");
-                        buf_str(d, c"--only takes imports, unused, pub, unsafe, tidy-imports, reexports or std015, not '");
+                        buf_str(d, c"--only takes imports, unused, pub, unsafe, tidy-imports, reexports, std015 or alloc016, not '");
                         buf_bytes(d, w);
                         buf_str(d, c"'\n");
                         return 2;
@@ -922,6 +931,13 @@ fn run_fix_inner(argc: i64, argv: **u8, alias: i64) -> i64 {
         if (only & F_STD015) != 0 {
             KEEP_PARSED = true;
         }
+        // (alloc016 reads the 0.15 forms as calls of std's functions, and
+        // the edited program is checked with them errors)
+        if (only & F_ALLOC016) != 0 {
+            KEEP_PARSED = true;
+            AMBIENT_GPA = true;
+            STRICT_ALLOC = true;
+        }
         if !load_program(root, TARGET) {
             program_errors(c"error", root, true);
             return 1;
@@ -943,8 +959,9 @@ fn run_fix_inner(argc: i64, argv: **u8, alias: i64) -> i64 {
         let through = if (only & F_REEXPORTS) != 0 { reexport_edits(&dropped) } else { 0 };
         let tidied = if (only & F_TIDY) != 0 { tidy_import_edits() } else { 0 };
         let migrated = if (only & F_STD015) != 0 { std015_edits() } else { 0 };
+        let explicit = if (only & F_ALLOC016) != 0 { alloc016_edits() } else { 0 };
         let mut counts = [imports, wild, unused, public, wrapped, through, dropped, tidied,
-            migrated];
+            migrated, explicit];
         if round {
             // (a later round, on the edited program: what it fixed, the
             // copies it rewrote)
@@ -953,7 +970,7 @@ fn run_fix_inner(argc: i64, argv: **u8, alias: i64) -> i64 {
             }
             let out = buf_new();
             buf_str(out, c"count");
-            for k in 0..9 {
+            for k in 0..10 {
                 buf_byte(out, '\t');
                 buf_int(out, counts[k]);
             }
@@ -962,7 +979,7 @@ fn run_fix_inner(argc: i64, argv: **u8, alias: i64) -> i64 {
             return write_round();
         }
         if edit_count() == 0 {
-            if AMBIGUOUS {
+            if AMBIGUOUS || ALLOC016_LEFT > 0 {
                 return 1;
             }
             if alias == 0 {
@@ -993,15 +1010,16 @@ fn run_fix_inner(argc: i64, argv: **u8, alias: i64) -> i64 {
         put_count(what, counts[6], c"unused re-export", c"unused re-exports");
         put_count(what, counts[7], c"untidy use line", c"untidy use lines");
         put_count(what, counts[8], c"call of 0.14's std", c"calls of 0.14's std");
+        put_count(what, counts[9], c"allocation made explicit", c"allocations made explicit");
         let status = finish_edit(buf_slice(what), root);
-        if AMBIGUOUS { 1 } else { status }
+        if AMBIGUOUS || ALLOC016_LEFT > 0 { 1 } else { status }
     }
 }
 
 // A round of fix on the edited program (`PROG fix --round ... --overlay
 // FILE COPY... ROOT`): adds what it fixed to counts. Whether it fixed
 // anything.
-fn more_round(root: *u8, only_arg: *u8, counts: *[i64; 9]) -> bool {
+fn more_round(root: *u8, only_arg: *u8, counts: *[i64; 10]) -> bool {
     unsafe {
         let mut args = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         args.push(PROG as i64);
@@ -1045,7 +1063,7 @@ fn more_round(root: *u8, only_arg: *u8, counts: *[i64; 9]) -> bool {
             } else if line.len > 6 && line[0] == 'c' && line[5] == '\t' {
                 let mut k = 0;
                 let mut p = 6;
-                while p < line.len && k < 9 {
+                while p < line.len && k < 10 {
                     let mut n = 0;
                     while p < line.len && line[p] >= '0' && line[p] <= '9' {
                         n = n * 10 + (line[p] - '0') as i64;

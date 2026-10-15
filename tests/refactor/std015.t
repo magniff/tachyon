@@ -35,5 +35,5 @@
 % "$COMPILER" fix --only std015 --dry-run --in mine.tach
 note fix.none: nothing to fix
 $ fix --only nonsense
-error fix.usage: --only takes imports, unused, pub, unsafe, tidy-imports, reexports or std015, not 'nonsense'
+error fix.usage: --only takes imports, unused, pub, unsafe, tidy-imports, reexports, std015 or alloc016, not 'nonsense'
 [exit 2]
