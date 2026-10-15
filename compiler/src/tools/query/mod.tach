@@ -54,7 +54,7 @@ mod locals;
 pub mod command_line;
 
 use crate::base::{
-    FILES, FILE_COUNT, IntVec, SRC, STDOUT, SYMS, buf_byte, buf_bytes, buf_new, buf_str,
+    FILES, FILE_COUNT, IntVec, SRC, STDOUT, SYMS, buf_byte, buf_bytes, buf_new, buf_slice, buf_str,
     buf_write_fd, streq, strlen,
 };
 use crate::base::diag::edit_distance;
@@ -66,7 +66,10 @@ use crate::tools::plan::deps::query_deps;
 use crate::tools::query_text::{
     WITH_COMMENTS, all_files, infer_root, run_text, show_files, show_region,
 };
-use defs::{DEFS, DEF_COUNT, K_FIELD, K_VARIANT, find_defs, last_segment, mod_fqn_text};
+use defs::{
+    DEFS, DEF_COUNT, K_ENUM, K_FIELD, K_STRUCT, K_TRAIT, K_VARIANT, find_defs, last_segment,
+    mod_fqn_text,
+};
 use diagnostics::{
     CMD, OPT_EXACT, PROG, ROOT_GIVEN, alias_defs, diag, is_query_command, no_match, no_module,
     program_errors, push_once, try_begin, try_end, try_query, write_diags,
@@ -78,7 +81,9 @@ use refs::{
     resolve_in, try_refs,
 };
 use sections::{OPT_BANNERS, show_section};
-use show::{find_modules, query_def, query_items, query_modules, query_show, text_start};
+use show::{
+    find_modules, query_def, query_items, query_modules, query_show, query_type_items, text_start,
+};
 use typeat::query_type;
 
 use budget::{OPT_BUDGET, begin_output, end_output};
@@ -499,8 +504,19 @@ fn run_query_inner(argc: i64, argv: **u8) -> i64 {
             program_errors(c"error", root, true);
             return 1;
         }
-        if !with_std && STD_MODULE < 0 && !items && !streq(cmd, c"grep") && !streq(cmd, c"type")
-            && wants_std(&args) {
+        // (0.17: `items TYPE` of a std type, when no module is named so)
+        let mut items_of_types = items;
+        for k in 0..args.count {
+            let mut ms = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            if items {
+                find_modules(c_slice(args.data[k] as *u8), OPT_EXACT, &ms);
+            }
+            if ms.count > 0 {
+                items_of_types = false;
+            }
+        }
+        if !with_std && STD_MODULE < 0 && (!items || items_of_types) && !streq(cmd, c"grep")
+            && !streq(cmd, c"type") && wants_std(&args) {
             // (a NAME std defines and the program does not: asked again
             // with std)
             ask_with_std(argv);
@@ -721,17 +737,35 @@ fn answer(cmd: *u8, args: *IntVec, items: bool, is_refs: bool) -> i64 {
                 return 0;
             }
             let mut modules = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            let mut types = IntVec { data: 0 as *i64, count: 0, cap: 0 };
             let mut status = 0;
             for i in 0..n {
                 let text = c_slice((*args).data[i] as *u8);
                 let before = modules.count;
                 find_modules(text, OPT_EXACT, &modules);
                 if modules.count == before {
-                    no_module(text);
-                    status = 1;
+                    // (0.17: a type: its impl blocks' functions)
+                    let mut defs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+                    find_defs(text, OPT_EXACT, &defs);
+                    let t0 = types.count;
+                    for j in 0..defs.count {
+                        let k = DEFS[defs.data[j]].kind;
+                        if k == K_STRUCT || k == K_ENUM || k == K_TRAIT {
+                            types.push(defs.data[j]);
+                        }
+                    }
+                    if types.count == t0 {
+                        no_module(text);
+                        status = 1;
+                    }
                 }
             }
-            query_items(&modules);
+            if modules.count > 0 {
+                query_items(&modules);
+            }
+            if types.count > 0 {
+                query_type_items(&types);
+            }
             return status;
         }
         if streq(cmd, c"stats") {

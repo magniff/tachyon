@@ -3,10 +3,12 @@
 // (`m::f`, `T::f`, `Enum::Variant`) and the calls through them, and
 // method calls (`x.m()`, with `&x` or `*x` as its `self` needs).
 
-use crate::base::SYMS;
+use crate::base::{
+    BUFS, SRC, SYMS, buf_byte, buf_bytes, buf_fmt, buf_new, buf_slice, buf_str, intern, sym_text,
+};
 use crate::base::diag::{
-    ERR_HELP, err_begin, err_end, err_failed_name, err_help, err_help_sym, err_int, err_str,
-    err_sym, error_at,
+    ERR_HELP, err_begin, err_end, err_failed_name, err_help, err_help_fmt, err_help_sym, err_int,
+    err_str, err_sym, err_try_fmt, err_try_tool, error_at,
 };
 use crate::front::assoc::ensure_checked;
 use crate::front::ast::{
@@ -14,9 +16,9 @@ use crate::front::ast::{
 };
 use crate::front::ast::NodeKind::{Call, Ident, Index, Path, Range, Unary, VariantLit};
 use crate::front::check::{
-    LOCALS, Res, SELF_SYM, SELF_TYPE, SELF_TYPE_SYM, lookup_local, name_error,
+    LOCALS, Res, SELF_SYM, SELF_TYPE, SELF_TYPE_SYM, is_std_named, lookup_local, name_error,
 };
-use crate::front::check::args::{int_limit_help, normalize_args};
+use crate::front::check::args::{arity_help, int_limit_help, normalize_args};
 use crate::front::check::assign::is_place;
 use crate::front::check::check_mode::check_expr;
 use crate::front::check::collect::{
@@ -24,7 +26,8 @@ use crate::front::check::collect::{
 };
 use crate::front::check::interp::{brace_warning, direct_call, direct_kind};
 use crate::front::check::names::{
-    CALLEE_POS, NODE_RESOLVED, Near, fn_value_type, help_near_item, near_to, unknown_name_error,
+    CALLEE_POS, NEAR_ALL, NEAR_COLLECT, NODE_RESOLVED, Near, fn_value_type, help_closest_names,
+    help_near_item, help_nearest, near_to, std_has, unknown_name_error,
 };
 use crate::front::check::resolve::{resolve_key, resolve_named};
 use crate::front::check::synth_mode::synth_expr;
@@ -196,6 +199,9 @@ pub fn check_direct_call(n: i64, f: i64) -> i64 {
             err_int(params);
             err_str(c" arguments, got ");
             err_int(count);
+            if !variadic {
+                arity_help(n, f, count, params);
+            }
             err_end();
         }
         for i in 0..params {
@@ -527,9 +533,86 @@ fn rust_method_help(t: i64, name: i64) {
         } else if seq && (text == "to_string" || text == "to_owned" || text == "to_vec"
             || text == "clone" || text == "as_str" || text == "as_bytes") {
             err_help(c"a string is a `[u8]` already; to copy it, push it into a `std::Buf` (`b.push_str(s)`)");
+        } else if text == "is_empty" && (seq || is_std_vec(t) || is_std_named(t, c"Buf")) {
+            err_help(if kind == TyKind::Slice { c"no `is_empty`: `s.len == 0`" }
+                else { c"no `is_empty`: `x.len() == 0`" });
         } else if iter && is_std_vec(t) {
             err_help(c"`v.iter()`, or `for x in v`, goes over a Vec's elements");
         }
+    }
+}
+
+// (0.17) The help of an unknown method that is a function of std
+// (`s.trim()`: `std::trim(s)`; Rust's names for a few: `parse`,
+// `is_ascii_digit`, `sort_unstable`): the call to write, as the try: line
+// (with `gpa` for an allocating `_in` form).
+fn std_function_help(n: i64, t: i64, name: i64) {
+    unsafe {
+        let text = SYMS[name].text;
+        let mapped: [u8] = if text == "parse" { "parse_int" }
+            else if text == "is_ascii_digit" { "is_digit" }
+            else if text == "is_ascii_whitespace" || text == "is_whitespace" { "is_space" }
+            else if text == "sort_unstable" { "sort" }
+            else if text == "sort_unstable_by" { "sort_by" }
+            else if text == "split_ascii_whitespace" { "split_whitespace" }
+            else { text };
+        let mut f = intern(mapped);
+        let with_in = buf_new();
+        buf_bytes(with_in, mapped);
+        buf_str(with_in, c"_in");
+        let fin = intern(buf_slice(with_in));
+        let gpa = std_has(fin, true);
+        if gpa {
+            f = fin;
+        } else if !std_has(f, true) {
+            return;
+        }
+        if BUFS[ERR_HELP].len == 0 {
+            err_help_fmt(
+                f"'{text}' is no method: std's function `{sym_text(f)}` takes the value as its first argument");
+        }
+        let recv = NODES[n].a;
+        if recv == 0 || NODES[recv].end <= NODES[recv].start {
+            return;
+        }
+        let c = buf_new();
+        buf_fmt(c, f"std::{sym_text(f)}(");
+        buf_bytes(c, SRC[NODES[recv].start..NODES[recv].end]);
+        if is_std_vec(t) {
+            buf_str(c, c".as_slice()");
+        }
+        for i in 0..NODES[n].count {
+            let a = child(n, i);
+            buf_str(c, c", ");
+            buf_bytes(c, SRC[NODES[a].start..NODES[a].end]);
+        }
+        if gpa {
+            buf_str(c, c", gpa");
+        }
+        buf_byte(c, ')');
+        err_try_fmt(buf_slice(c));
+    }
+}
+
+// (0.17) The try: line that lists the methods of type t (a struct's or an
+// enum's, std's or the program's): `tachyonc query items TYPE ROOT`.
+fn type_items_try(t: i64) {
+    unsafe {
+        let kind = TYPES[t].kind;
+        if kind != TyKind::Struct && kind != TyKind::Enum {
+            return;
+        }
+        let b = buf_new();
+        buf_type(b, t);
+        let s = buf_slice(b);
+        let mut e = 0;
+        while e < s.len && s[e] != '<' {
+            e += 1;
+        }
+        let a = buf_new();
+        buf_str(a, c"query items ");
+        buf_bytes(a, s[0..e]);
+        err_try_tool(buf_slice(a), true);
     }
 }
 
@@ -545,6 +628,8 @@ pub fn is_std_vec(t: i64) -> bool {
     }
 }
 
+// `T::m` where type t has no `m` (0.17: when nothing is near, the nearest
+// of its variants and functions, and the command that lists them).
 fn path_member_error(n: i64, t: i64, member: i64) -> ! {
     unsafe {
         err_begin(NODES[n].start);
@@ -558,6 +643,8 @@ fn path_member_error(n: i64, t: i64, member: i64) -> ! {
         err_str(c"' in '");
         err_type(t);
         err_str(c"'");
+        NEAR_ALL.count = 0;
+        NEAR_COLLECT = true;
         let mut near = near_to(member);
         if TYPES[t].kind == TyKind::Enum {
             let e = TYPES[t].a;
@@ -566,9 +653,16 @@ fn path_member_error(n: i64, t: i64, member: i64) -> ! {
             }
         }
         offer_methods(&near, t, false);
+        NEAR_COLLECT = false;
         // (0.15: `i64::MAX()`, a constant)
         int_limit_help(t, member);
         near.help();
+        if BUFS[ERR_HELP].len == 0 && NEAR_ALL.count > 0 {
+            help_nearest(if TYPES[t].kind
+                == TyKind::Enum { c"its nearest variants and functions: " }
+                else { c"its nearest functions: " }, member);
+        }
+        type_items_try(t);
         err_end()
     }
 }
@@ -634,9 +728,19 @@ fn synth_path_call(n: i64, callee: i64) -> i64 {
                     err_str(c"' in '");
                     err_sym(template_name(tpl));
                     err_str(c"'");
+                    NEAR_ALL.count = 0;
+                    NEAR_COLLECT = true;
                     let mut near = near_to(member);
                     offer_template_methods(&near, tpl, false);
+                    NEAR_COLLECT = false;
                     near.help();
+                    if BUFS[ERR_HELP].len == 0 && NEAR_ALL.count > 0 {
+                        help_nearest(c"its nearest functions: ", member);
+                    }
+                    let a = buf_new();
+                    buf_str(a, c"query items ");
+                    buf_bytes(a, SYMS[template_name(tpl)].text);
+                    err_try_tool(buf_slice(a), true);
                     err_end();
                 }
                 // `Vec::new()`: the type's arguments are inferred too.
@@ -800,9 +904,17 @@ pub fn synth_method(n: i64) -> i64 {
                 err_help(c"an array has its slice's methods where it is a place: bind it to a variable first");
             }
             rust_method_help(t, name);
+            std_function_help(n, t, name);
+            NEAR_ALL.count = 0;
+            NEAR_COLLECT = true;
             let mut near = near_to(name);
             offer_methods(&near, t, true);
+            NEAR_COLLECT = false;
             near.help();
+            if BUFS[ERR_HELP].len == 0 && NEAR_ALL.count > 0 {
+                help_nearest(c"no method of that name; the nearest: ", name);
+            }
+            type_items_try(t);
             err_end();
         }
         if !is_method(f) {
@@ -884,6 +996,7 @@ pub fn synth_method(n: i64) -> i64 {
             err_int(FNS[f].param_count - 1);
             err_str(c" arguments, got ");
             err_int(count);
+            arity_help(n, f, count, FNS[f].param_count - 1);
             err_end();
         }
         let mark = list_begin();

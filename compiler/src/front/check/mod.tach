@@ -38,13 +38,14 @@ pub mod widen;
 pub mod args;
 mod sealed;
 
-use crate::base::{IntVec, _setjmp, grow, intern_c};
+use crate::base::{IntVec, SRC, _setjmp, buf_fmt, buf_new, buf_slice, cstr, grow, intern_c};
 use crate::base::diag::{
-    RECOVER_DEPTH, err_begin, err_end, err_str, err_sym, error_at, error_count, errors_forget,
-    errors_mark, exit_if_errors, recover_enter, recover_leave,
+    RECOVER_DEPTH, err_begin, err_end, err_help, err_str, err_sym, err_try_fmt, error_at,
+    error_count, errors_forget, errors_mark, exit_if_errors, recover_enter, recover_leave,
 };
 use crate::front::ast::{
-    FN_BODY_FAILED, FN_LAZY, FN_SIG_FAILED, NODES, SCRATCH, child, list_begin, list_end, list_push,
+    FN_BODY_FAILED, FN_LAZY, FN_SIG_FAILED, NODES, NodeKind, SCRATCH, child, list_begin, list_end,
+    list_push,
 };
 use crate::front::ast::NodeKind::{
     Array, Const, Enum, Fn, Impl, Let, PatBind, Static, Struct, Tuple, Use,
@@ -70,7 +71,8 @@ use crate::front::traits::{
     trait_named,
 };
 use crate::front::types::{
-    ENUMS, FNS, FN_COUNT, STRUCTS, TLISTS, TSCRATCH, TYPES, TY_ERROR, TyKind, err_type, type_elem,
+    ENUMS, FNS, FN_COUNT, STRUCTS, TLISTS, TSCRATCH, TYPES, TY_BOOL, TY_ERROR, TY_U8, TyKind,
+    buf_type, err_type, is_integer, is_numeric, type_elem,
 };
 use crate::tools::fiximports::report_legacy_imports;
 use crate::tools::query::command_line::QUERY;
@@ -131,6 +133,9 @@ pub fn type_error(n: i64, message: *u8) -> ! {
     unsafe { error_at(NODES[n].start, message) }
 }
 
+// A value of type `actual` where `expected` goes (0.17: the conversion to
+// write, as the try: line, when there is one: `x as i32`, `a[..]`,
+// `b.as_slice()`, `v.as_slice()`, `&x`).
 pub fn mismatch_error(n: i64, expected: i64, actual: i64) -> ! {
     unsafe {
         err_begin(NODES[n].start);
@@ -139,7 +144,63 @@ pub fn mismatch_error(n: i64, expected: i64, actual: i64) -> ! {
         err_str(c"', got '");
         err_type(actual);
         err_str(c"'");
+        mismatch_help(n, expected, actual);
         err_end()
+    }
+}
+
+fn mismatch_help(n: i64, expected: i64, actual: i64) {
+    unsafe {
+        if n == 0 || NODES[n].end <= NODES[n].start || expected == TY_ERROR || actual == TY_ERROR {
+            return;
+        }
+        let text = SRC[NODES[n].start..NODES[n].end];
+        // (an operator's operand: what binds looser than `as` and `!=`)
+        let k = NODES[n].kind;
+        let simple = !(k == NodeKind::Binary || k == NodeKind::Unary || k == NodeKind::Cast
+            || k == NodeKind::Range || k == NodeKind::If || k == NodeKind::Match
+            || k == NodeKind::Block || k == NodeKind::Closure);
+        let open: [u8] = if simple { "" } else { "(" };
+        let close: [u8] = if simple { "" } else { ")" };
+        let ek = TYPES[expected].kind;
+        let ak = TYPES[actual].kind;
+        if is_numeric(expected) && is_numeric(actual) {
+            err_help(c"only widening is implicit: convert explicitly");
+            let t = buf_new();
+            buf_fmt(t, f"{open}{text}{close} as ");
+            buf_type(t, expected);
+            err_try_fmt(buf_slice(t));
+        } else if expected == TY_BOOL && is_integer(actual) {
+            err_help(c"a condition is a bool: compare (`x != 0`); bitwise not is `~x`");
+            err_try_fmt(f"{open}{text}{close} != 0");
+        } else if ek == TyKind::Slice && ak == TyKind::Array {
+            err_help(c"an array is not a slice: take one of all of it");
+            err_try_fmt(f"{open}{text}{close}[..]");
+        }
+        else if ek == TyKind::Slice && TYPES[expected].a == TY_U8 && is_std_named(actual, c"Buf") {
+            err_help(c"a Buf's text is its slice");
+            err_try_fmt(f"{open}{text}{close}.as_slice()");
+        } else if ek == TyKind::Slice && is_std_named(actual, c"Vec") {
+            err_help(c"a Vec's elements are its slice");
+            err_try_fmt(f"{open}{text}{close}.as_slice()");
+        } else if ek == TyKind::Ptr && TYPES[expected].a == actual {
+            err_help(c"a pointer to it: its address");
+            err_try_fmt(f"&{text}");
+        }
+    }
+}
+
+// Whether type t is std's struct `name` (an instance of it).
+pub fn is_std_named(t: i64, name: *u8) -> bool {
+    unsafe {
+        if TYPES[t].kind != TyKind::Struct {
+            return false;
+        }
+        let b = buf_new();
+        buf_type(b, t);
+        let s = buf_slice(b);
+        let w = cstr(name);
+        s.len >= w.len && s[0..w.len] == w && (s.len == w.len || s[w.len] == '<')
     }
 }
 

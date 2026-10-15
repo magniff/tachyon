@@ -123,8 +123,8 @@ $ cat > old.tach <<'EOF'
 > }
 > EOF
 $ tachyonc check old.tach
-old.tach:4:17: error[type error] allocation is explicit: pass an allocator (try: Buf::new_in(gpa)) | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)' and is passed down as a parameter
-old.tach:16:28: error[type error] allocation is explicit: pass an allocator (try: split_whitespace_in(s, gpa)) | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)' and is passed down as a parameter
+old.tach:4:17: error[type error] allocation is explicit: pass an allocator (try: Buf::new_in(gpa)) | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)': add the parameter `gpa: Gpa` to 'shout' and pass it down | try: tachyonc fix --only alloc016 old.tach
+old.tach:16:28: error[type error] allocation is explicit: pass an allocator (try: split_whitespace_in(s, gpa)) | help: main takes the allocator: `fn main(gpa: Gpa)`, passed down as a parameter | try: tachyonc fix --only alloc016 old.tach
 [exit 1]
 ```
 

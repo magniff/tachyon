@@ -21,15 +21,23 @@ pub static mut ERRORS_AS_DUMP: bool = false;
 // The phase reporting errors, as in the reference compiler's diagnostics.
 pub static mut ERR_KIND: *u8 = 0 as *u8;
 pub static mut ERR_HELP: i64 = -1;
+// (0.17) The error's `try:` lines: commands or code to run or paste as
+// they are, one per line (`  = try: ...`; ` | try: ...` in the short form).
+pub static mut ERR_TRY: i64 = -1;
+// (0.17) The compiler as it was run (argv[0]), for the `tachyonc ...`
+// commands of `try:` lines; 0 is `tachyonc`.
+pub static mut DIAG_PROG: *u8 = 0 as *u8;
 
 // Starts an error message at `pos`; finish it with err_* and err_end.
 pub fn err_begin(pos: i64) {
     if ERR < 0 {
         ERR = buf_new();
         ERR_HELP = buf_new();
+        ERR_TRY = buf_new();
     }
     buf_clear(ERR);
     buf_clear(ERR_HELP);
+    buf_clear(ERR_TRY);
     ERR_POS = pos;
     ERR_POISONED = false;
 }
@@ -131,7 +139,10 @@ pub fn report_warning(pos: i64, key: i64, kind: *u8, message: *u8, help: *u8) {
 // checker meets it (a generic function is checked per instance).
 static mut KEYED_ERRORS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
-pub fn report_error_once(pos: i64, key: i64, kind: *u8, message: *u8, help: *u8) {
+// An error that does not stop the check (an unsafe operation), once per
+// position and key; `fix`, when not empty, is the `tachyonc` command
+// (arguments, the root after them) of its `try:` line.
+pub fn report_error_once(pos: i64, key: i64, kind: *u8, message: *u8, help: *u8, fix: [u8]) {
     unsafe {
         let mut i = 0;
         while i < KEYED_ERRORS.count {
@@ -151,6 +162,11 @@ pub fn report_error_once(pos: i64, key: i64, kind: *u8, message: *u8, help: *u8)
         buf_byte(out, '\n');
         if help != 0 as *u8 {
             buf_fmt(out, f"  = help: {cstr(help)}\n");
+        }
+        if fix.len > 0 {
+            buf_str(out, c"  = try: ");
+            buf_tool_command(out, fix, true);
+            buf_byte(out, '\n');
         }
         ERRORS.push(pos);
         ERRORS.push(out);
@@ -513,6 +529,64 @@ pub fn err_help_fmt<T: std::Display>(x: T) {
     fmt_end(ERR_HELP);
 }
 
+// (0.17) A `try:` line of the error: code or a command to use as it is.
+pub fn err_try(s: *u8) {
+    unsafe {
+        if BUFS[ERR_TRY].len > 0 {
+            buf_byte(ERR_TRY, '\n');
+        }
+        buf_str(ERR_TRY, s);
+    }
+}
+
+// The same, x's Display (an f-string).
+pub fn err_try_fmt<T: std::Display>(x: T) {
+    unsafe {
+        if BUFS[ERR_TRY].len > 0 {
+            buf_byte(ERR_TRY, '\n');
+        }
+        (*fmt_scratch()).push_fmt(x);
+    }
+    fmt_end(ERR_TRY);
+}
+
+// A `try:` line that runs the compiler: `tachyonc ARGS` (the compiler as
+// it was run), then ` ROOT` when `with_root` (the program's root file, as
+// positions print it).
+pub fn err_try_tool(args: [u8], with_root: bool) {
+    unsafe {
+        if BUFS[ERR_TRY].len > 0 {
+            buf_byte(ERR_TRY, '\n');
+        }
+        buf_tool_command(ERR_TRY, args, with_root);
+    }
+}
+
+// `tachyonc ARGS [ROOT]` into out (see err_try_tool).
+pub fn buf_tool_command(out: i64, args: [u8], with_root: bool) {
+    unsafe {
+        if DIAG_PROG == 0 as *u8 {
+            buf_str(out, c"tachyonc");
+        } else {
+            buf_str(out, DIAG_PROG);
+        }
+        buf_byte(out, ' ');
+        buf_bytes(out, args);
+        if with_root {
+            // (the first file read that is not std's or a C header's)
+            let mut f = 0;
+            while f < FILE_COUNT && FILES[f].path[0] == '<' {
+                f += 1;
+            }
+            if f < FILE_COUNT {
+                let path = FILES[f].path;
+                buf_byte(out, ' ');
+                buf_str(out, if path[0] == '.' && path[1] == '/' { &path[2] } else { path });
+            }
+        }
+    }
+}
+
 // Prints the error and exits:
 //   error[<kind>]: <message>
 //    --> <file>: line <line>, column <column>
@@ -567,6 +641,16 @@ fn error_text() -> i64 {
         buf_byte(out, '\n');
         if BUFS[ERR_HELP].len > 0 {
             buf_fmt(out, f"  = help: {buf_slice(ERR_HELP)}\n");
+        }
+        let tries = buf_slice(ERR_TRY);
+        let mut a = 0;
+        while a < tries.len {
+            let mut e = a;
+            while e < tries.len && tries[e] != '\n' {
+                e += 1;
+            }
+            buf_fmt(out, f"  = try: {tries[a..e]}\n");
+            a = e + 1;
         }
         instantiation_notes(out);
         out
@@ -668,6 +752,40 @@ pub fn buf_position(out: i64, pos: i64) {
         let path = FILES[file].path;
         buf_str(out, if path[0] == '.' && path[1] == '/' { &path[2] } else { path });
         buf_fmt(out, f": line {line}, column {col}");
+    }
+}
+
+// (0.17) The line of position pos in its file.
+pub fn pos_line(pos: i64) -> i64 {
+    unsafe {
+        let mut file = 0;
+        while file + 1 < FILE_COUNT && pos >= FILES[file + 1].start {
+            file += 1;
+        }
+        let mut line = 1;
+        let mut i = FILES[file].start;
+        while i < pos && i < SRC_LEN {
+            if SRC[i] == '\n' {
+                line += 1;
+            }
+            i += 1;
+        }
+        line
+    }
+}
+
+// (0.17) `FILE:LINE` of position pos, as the tools take an item's
+// position (`tachyonc edit delete main.tach:12`).
+pub fn buf_file_line(out: i64, pos: i64) {
+    unsafe {
+        let mut file = 0;
+        while file + 1 < FILE_COUNT && pos >= FILES[file + 1].start {
+            file += 1;
+        }
+        let path = FILES[file].path;
+        buf_str(out, if path[0] == '.' && path[1] == '/' { &path[2] } else { path });
+        buf_byte(out, ':');
+        buf_int(out, pos_line(pos));
     }
 }
 

@@ -110,7 +110,7 @@ try: tachyonc query show NAME
 ## edit.breaks: the errors tagged with their items; the refactoring that
 ## fits a changed shape; the items to change in the same edit.
 $ edit patch scale --old 'k: i64' --new 'k: i64, m: i64'
-main.tach:15:13: error[type error] function 'shapes::scale' expects 3 arguments, got 2  [in crate::main]
+main.tach:15:13: error[type error] function 'shapes::scale' expects 3 arguments, got 2 | help: its signature: `fn scale(r: Rect, k: i64, m: i64) -> Rect` (shapes.tach:22) | try: scale(Rect { w: 2, h: 3 }, k, VALUE)  [in crate::main]
 error edit.breaks: 1 new error (1 in crate::main, which the edit does not change); nothing written
 note edit.refactor: the uses of crate::shapes::scale no longer fit its new shape: a refactoring changes them with it (VALUE, EXPR: to fill in), then the rest of the edit
 try: tachyonc refactor signature crate::shapes::scale --add 'm: i64 = VALUE'
@@ -131,7 +131,7 @@ try: tachyonc query show crate::main crate::shapes::area crate::shapes::kind cra
 try: tachyonc edit patch Rect --old 'h: i64,' --new 'height: i64,' --no-check
 [exit 1]
 $ edit patch Kind < $T/inputs/multi_tall.pairs
-main.tach:7:5: error[type error] non-exhaustive match: 'Kind::Tall' is not covered | help: add an arm for it, or a wildcard arm '_ =>'  [in crate::describe]
+main.tach:7:5: error[type error] non-exhaustive match: 'Kind::Tall' is not covered | help: add an arm for it (try:), or a wildcard arm '_ =>' | try: Kind::Tall => VALUE,  [in crate::describe]
 error edit.breaks: 1 new error (1 in crate::describe, which the edit does not change); nothing written
 note edit.refactor: the uses of crate::shapes::Kind no longer fit its new shape: a refactoring changes them with it (VALUE, EXPR: to fill in), then the rest of the edit
 try: tachyonc refactor variant crate::shapes::Kind --add Tall --arm 'EXPR'
@@ -147,7 +147,7 @@ try: tachyonc refactor rename crate::shapes::area surface
 try: tachyonc edit replace area --no-check
 [exit 1]
 $ edit patch area < $T/inputs/multi_area_bool.pairs
-main.tach:16:18: error[type error] expected 'bool', got 'i64'  [in crate::main]
+main.tach:16:18: error[type error] expected 'bool', got 'i64' | help: a condition is a bool: compare (`x != 0`); bitwise not is `~x` | try: describe(kind(r)) != 0  [in crate::main]
 error edit.breaks: 1 new error (1 in crate::main, which the edit does not change); nothing written
 note edit.together: change crate::main in the same edit: one `edit apply FILE` with a block per item, or `edit patch --pairs FILE` with `@@ NAME` blocks
 try: tachyonc query show crate::main
@@ -170,7 +170,7 @@ try: tachyonc query show crate::main
 try: tachyonc edit patch scale --old 'scale(r: Rect, k: i64)' --new 'scale(k: i64, r: Rect)' --no-check
 [exit 1]
 $ edit patch scale --old 'k: i64' --new 'k: i32'
-main.tach:15:40: error[type error] expected 'i32', got 'i64'  [in crate::main]
+main.tach:15:40: error[type error] expected 'i32', got 'i64' | help: only widening is implicit: convert explicitly | try: k as i32  [in crate::main]
 error edit.breaks: 1 new error (1 in crate::main, which the edit does not change); nothing written
 note edit.refactor: the uses of crate::shapes::scale no longer fit its new shape: a refactoring changes them with it, then the rest of the edit
 try: tachyonc refactor signature crate::shapes::scale --type k i32 --default '$k as i32'
@@ -179,7 +179,7 @@ try: tachyonc query show crate::main
 try: tachyonc edit patch scale --old 'k: i64' --new 'k: i32' --no-check
 [exit 1]
 $ edit patch scale --old 'k: i64' --new 'k: i32' --old 'r.w * k, h: r.h * k' --new 'r.w * k as i64, h: r.h * k as i64'
-main.tach:15:40: error[type error] expected 'i32', got 'i64'  [in crate::main]
+main.tach:15:40: error[type error] expected 'i32', got 'i64' | help: only widening is implicit: convert explicitly | try: k as i32  [in crate::main]
 error edit.breaks: 1 new error (1 in crate::main, which the edit does not change); nothing written
 note edit.refactor: the uses of crate::shapes::scale no longer fit its new shape: a refactoring changes them with it, then the rest of the edit
 try: tachyonc refactor signature crate::shapes::scale --type k i32 --default '$k as i32'

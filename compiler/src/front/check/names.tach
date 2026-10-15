@@ -3,10 +3,12 @@
 // share, and the unknown-name error with its suggestions (a near name in
 // scope, or the `use` that would bring it).
 
-use crate::base::{BUFS, IntVec, SYMS, SYM_COUNT, buf_bytes, buf_new, buf_slice, buf_str, intern};
+use crate::base::{
+    BUFS, IntVec, SYMS, SYM_COUNT, buf_bytes, buf_new, buf_slice, buf_str, free, intern,
+};
 use crate::base::diag::{
     ERR_HELP, edit_distance, err_begin, err_end, err_failed_name, err_help, err_help_sym, err_str,
-    err_sym,
+    err_sym, err_try, err_try_tool,
 };
 use crate::front::assoc::ensure_checked;
 use crate::front::ast::{FN_UNSAFE, NODES};
@@ -23,7 +25,7 @@ use crate::front::modules::{
 };
 use crate::front::modules::lookup::{
     B_ITEM, B_MODULE, B_PRIVATE, B_TVARIANT, B_VARIANT, access_error, binding, binding_kind,
-    binding_value, lookup_item, lookup_quiet, note_c_use,
+    binding_value, help_std_path, lookup_item, lookup_quiet, note_c_use,
 };
 use crate::front::parser::items::ITEM_PUBLIC;
 use crate::front::stdsrc::std_source;
@@ -239,6 +241,7 @@ fn suggest_name(name: i64, value: bool, hint_std: bool) {
             err_help(c"::");
             err_help_sym(name);
             err_help(c";`");
+            err_try_tool("fix --only imports", true);
             return;
         }
         let near = nearest_name(name, value);
@@ -339,7 +342,7 @@ fn is_ident_byte(x: u8) -> bool {
 }
 
 // Whether std has a public value (or type) `name`.
-fn std_has(name: i64, value: bool) -> bool {
+pub fn std_has(name: i64, value: bool) -> bool {
     unsafe {
         std_names();
         for i in 0..STD_NAMES.count / 2 {
@@ -372,18 +375,41 @@ fn rust_input_help(name: i64) -> bool {
 }
 
 // The help of an unknown type a Rust programmer writes (0.14): what
-// tachyon has instead; whether there was one.
+// tachyon has instead, exactly (0.17: the type to write as the try: line
+// when there is one); whether there was one.
 fn rust_type_help(name: i64) -> bool {
     unsafe {
         let text = SYMS[name].text;
-        if text == "String" || text == "str" {
-            err_help(c"text is `[u8]`, a slice of bytes (string literals are one); build it in a `std::Buf`");
+        if text == "String" {
+            err_help(c"text is `[u8]`, a slice of bytes (string literals are one); text you build is a `std::Buf` (`Buf::new_in(gpa)`, `b.push_str(s)`, `b.as_slice()` is its `[u8]`)");
+            err_try(c"[u8]");
+        } else if text == "str" {
+            err_help(c"`&str` and `str` are `[u8]`: a slice of bytes, as string literals are");
+            err_try(c"[u8]");
         } else if text == "char" {
             err_help(c"`u8`: text is bytes, and 'a' is a u8");
+            err_try(c"u8");
+        } else if text == "usize" || text == "isize" {
+            err_help(c"`i64`: lengths and indices are i64 (`s.len`, `v.len()`)");
+            err_try(c"i64");
         } else if text == "HashSet" || text == "BTreeSet" {
-            err_help(c"a `std::HashMap<K, bool>`");
+            err_help(
+                c"a set is a `std::HashMap<K, bool>` (`m.insert(k, true)`, `m.contains_key(k)`)");
+            err_try(c"HashMap<K, bool>");
+        } else if text == "BTreeMap" {
+            err_help(c"`std::HashMap<K, V>`; for its keys in order, collect them in a Vec and `std::sort` it");
+            err_try(c"HashMap<K, V>");
+        } else if text == "VecDeque" || text == "LinkedList" {
+            err_help(c"a `Vec<T>` (with a start index for a queue)");
+            err_try(c"Vec<T>");
         } else if text == "Box" || text == "Rc" || text == "Arc" {
-            err_help(c"keep the value in a `Vec<T>` (one element), or point to it with a `*T`");
+            err_help(c"`*T` points to a value (`&x`; a parameter `p: *T` is a borrow); a value owned on the heap is a `Vec<T>` of one");
+            err_try(c"*T");
+        } else if text == "RefCell" || text == "Cell" || text == "Mutex" {
+            err_help(c"no interior mutability types: a `*T` writes through (`p.x = 1`), a `let mut` changes in place");
+            err_try(c"*T");
+        } else if STD_MODULE >= 0 && help_std_path(name, 0, CUR_MOD, false) {
+            // (`std::cmp::max`: a Rust module of std read as a type)
         } else {
             return false;
         }
@@ -465,6 +491,102 @@ pub fn near_to(want: i64) -> Near {
     Near { want: want, best: -1, d: NEAR_NONE }
 }
 
+// (0.17) While NEAR_COLLECT: every candidate offered, near or not (an
+// unknown method's: the closest methods of its type, by closest_names).
+pub static mut NEAR_ALL: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut NEAR_COLLECT: bool = false;
+
+// (0.17) The `max` names of NEAR_ALL closest to `want`, into the help as
+// `'a', 'b'`: all of them when there are at most `max`, else those
+// related to it (a common prefix of 3, a shared `_` word, one inside the
+// other, or an edit distance of at most half its length), closest first;
+// how many.
+pub fn help_closest_names(want: i64, max: i64) -> i64 {
+    unsafe {
+        let w = SYMS[want].text;
+        let all = NEAR_ALL.count <= max;
+        let mut score = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..NEAR_ALL.count {
+            let c = SYMS[NEAR_ALL.data[i]].text;
+            let d = edit_distance(w, c);
+            let mut p = 0;
+            while p < w.len && p < c.len && w[p] == c[p] {
+                p += 1;
+            }
+            let inside = c.len >= w.len && (0..c.len - w.len + 1).any(|k| c[k..k + w.len] == w)
+                || w.len >= c.len && c.len >= 3
+                && (0..w.len - c.len + 1).any(|k| w[k..k + c.len] == c);
+            let related = all || p >= 3 || inside || d * 2 <= w.len || shares_word(w, c);
+            score.push(if related { d * 4 - p * 3 - (if inside { 8 } else { 0 }) }
+                else { i64::MAX });
+        }
+        let mut shown = 0;
+        while shown < max {
+            let mut best = -1;
+            for i in 0..NEAR_ALL.count {
+                if score.data[i] != i64::MAX && (best < 0 || score.data[i] < score.data[best]
+                    || score.data[i] == score.data[best]
+                    && SYMS[NEAR_ALL.data[i]].text.len < SYMS[NEAR_ALL.data[best]].text.len) {
+                    best = i;
+                }
+            }
+            if best < 0 {
+                break;
+            }
+            if shown > 0 {
+                err_help(c", ");
+            }
+            err_help(c"'");
+            err_help_sym(NEAR_ALL.data[best]);
+            err_help(c"'");
+            score.data[best] = i64::MAX;
+            shown += 1;
+        }
+        free(score.data as *u8);
+        shown
+    }
+}
+
+// (0.17) `prefix` and the names of NEAR_ALL nearest to `want` as the help
+// (help_closest_names); no help when none is near.
+pub fn help_nearest(prefix: *u8, want: i64) {
+    unsafe {
+        let mark = BUFS[ERR_HELP].len;
+        err_help(prefix);
+        if help_closest_names(want, 4) == 0 {
+            BUFS[ERR_HELP].len = mark;
+        }
+    }
+}
+
+// Whether names a and b share a word of 3 letters or more (words split at
+// `_`: `push_string` and `push_str` share `push`).
+fn shares_word(a: [u8], b: [u8]) -> bool {
+    let mut i = 0;
+    while i < a.len {
+        let mut j = i;
+        while j < a.len && a[j] != '_' {
+            j += 1;
+        }
+        if j - i >= 3 {
+            let word = a[i..j];
+            let mut k = 0;
+            while k < b.len {
+                let mut e = k;
+                while e < b.len && b[e] != '_' {
+                    e += 1;
+                }
+                if b[k..e] == word {
+                    return true;
+                }
+                k = e + 1;
+            }
+        }
+        i = j + 1;
+    }
+    false
+}
+
 impl Near {
     // Whether candidate `cand` (a symbol) is closer than the best so far.
     pub fn close(self: *Near, cand: i64) -> bool {
@@ -486,6 +608,19 @@ impl Near {
 
     // Offers candidate `cand`.
     pub fn offer(self: *Near, cand: i64) {
+        if NEAR_COLLECT && cand >= 0 && cand != self.want {
+            unsafe {
+                let mut seen = false;
+                for i in 0..NEAR_ALL.count {
+                    if NEAR_ALL.data[i] == cand {
+                        seen = true;
+                    }
+                }
+                if !seen {
+                    NEAR_ALL.push(cand);
+                }
+            }
+        }
         if self.close(cand) {
             self.take(cand);
         }
@@ -571,7 +706,7 @@ fn lower(c: u8) -> u8 {
 
 // The path of the module (`crate::a::b`, `std`) whose public item `name`
 // is a value (or a type) the current module could import: a buffer, or 0.
-fn import_path_for(name: i64, value: bool) -> i64 {
+pub fn import_path_for(name: i64, value: bool) -> i64 {
     unsafe {
         for m in 0..module_count() {
             if m == CUR_MOD || m == C_MODULE {

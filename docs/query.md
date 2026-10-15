@@ -22,7 +22,7 @@ tachyonc query refs NAME... [--root ROOT] [--exact] [--count] [--in FILE|MODULE]
 tachyonc query callers NAME... [--root ROOT] [--exact] [--count] [--in FILE|MODULE] [--limit N] [--all]
 tachyonc query callees FN... [--transitive] [--writes TABLE] [--count] [--limit N] [--all]   (0.16)
 tachyonc query effects NAME...|MODULE [--has EFFECT] [--why EFFECT]   (0.16) the inferred effects
-tachyonc query items [MODULE...] [--root ROOT] [--comments]
+tachyonc query items [MODULE|TYPE...] [--root ROOT] [--comments]
 tachyonc query show MODULE::section TITLE                   (0.13)
 tachyonc query grep PATTERN... [--in FILE|MODULE|ITEM] [--code] [--comments] [--strings] [--word] [--count] [--limit N] [--all]
 tachyonc query type FILE:LINE[:COL]...                      (0.13)
@@ -530,6 +530,12 @@ An impl block is its header line (kind `impl`) followed by its
 functions. MODULE is a module path, matched like NAME (`gvn`,
 `crate::gvn`, `crate`, `std`). `items` alone lists the module tree:
 `PATH→FILE→ITEMS` per module.
+
+`items TYPE` (0.17), when no module has that name: a struct's, enum's
+or trait's line (`# PATH→FILE:LINE:COL`, then `LINE→KIND→SIGNATURE`),
+then the functions of its impl blocks, each block under its header; a
+std type (`items Buf`, `items std::Vec`) lists std's API for it. An
+unknown method's error names it as its `try:` line.
 
 ### Banners and comments (0.13)
 

@@ -131,6 +131,23 @@ try:
     case("report: edited file first", lines[1], "util.tach:3:5: error[type error] mine | help: did you mean 'g'?")
     case("report: capped", (len(lines), lines[-1]), (12, "(2 more: tachyonc check main.tach)"))
     case("report: clean is silent", hook.report([diag("a.tach", 1, "w", sev="warning")], "main.tach", None), "")
+    # (0.17) One `fix` command for the errors it answers, after the head.
+    u = [dict(diag("main.tach", i, "calling a C function is unsafe", code="unsafe"),
+              **{"try": ["tachyonc fix --only unsafe main.tach"]}) for i in (2, 5)]
+    a = dict(diag("main.tach", 7, "allocation is explicit: pass an allocator (try: Vec::new_in(gpa))"),
+             **{"try": ["tachyonc fix --only alloc016 main.tach"]})
+    lines = hook.report(u + [a, diag("main.tach", 9, "bad")], "main.tach", None).split("\n")
+    case("report: fix commands after the head", lines[:3],
+         ["tachyonc check main.tach: 4 errors",
+          "try: tachyonc fix --only unsafe main.tach   (2 of the errors)",
+          "try: tachyonc fix --only alloc016 main.tach   (1 of the errors)"])
+    case("report: one fix for all", hook.report(u, "main.tach", None).split("\n")[1],
+         "try: tachyonc fix --only unsafe main.tach   (all of them)")
+    case("report: other try lines stay on their error", hook.fix_commands(
+        [dict(diag("m.tach", 1, "x"), **{"try": ["use std::HashMap;", "target/tools/tachyonc fix --only imports m.tach"]})]),
+         [("target/tools/tachyonc fix --only imports m.tach", 1)])
+    case("typed name: under cwd", hook.typed_name(os.path.join(tmp, "bin", "tachyonc"), tmp),
+         os.path.join("bin", "tachyonc"))
     case("short line parsed", hook.parse_short("m.tach:2:7: error[type error] bad | help: try x"),
          {"severity": "error", "code": "type error", "file": "m.tach", "line": 2, "col": 7, "message": "bad",
           "help": ["try x"], "notes": [], "try": []})

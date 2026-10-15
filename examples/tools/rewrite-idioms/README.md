@@ -114,7 +114,7 @@ the hole has two types at the sites, and each gets a command:
 
 ```console
 $ tachyonc rewrite '$v.len() == 0' '$v.is_empty()'
-report.tach:68:8: error[type error] no method 'is_empty' on type '*Buf'  [edited: crate::report::finish]
+report.tach:68:8: error[type error] no method 'is_empty' on type '*Buf' | help: no `is_empty`: `x.len() == 0` | try: tachyonc query items Buf main.tach  [edited: crate::report::finish]
 error edit.breaks: 1 new error; nothing written
 note rewrite.where: $v has 2 types at the sites: Vec<[u8]> (1 site), *Buf (1 site); --where takes the ones the replacement fits
 try: tachyonc rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Vec<[u8]>'

@@ -29,7 +29,7 @@ sed, head, cat or awk ([docs/query.md](docs/query.md)):
 | the type of an expression | `target/tachyonc query type FILE:LINE:COL` |
 | what a function may do (allocate, io, panic, loop forever) | `target/tachyonc query effects NAME\|MODULE` (`--why EFFECT`: the chain; `--has alloc(Gpa)`: which still allocate) |
 | where it is defined, its signature | `target/tachyonc query def NAME` |
-| what a module contains | `target/tachyonc query items MODULE` |
+| what a module contains; a type's methods | `target/tachyonc query items MODULE`; `query items TYPE` |
 | the item at a compiler error's position | `target/tachyonc query show FILE:LINE` (`--with-comments`: its section comment too) |
 | a module's `use` lines, header comment, extern blocks | `target/tachyonc query show MODULE::use` (`::header`, `::extern`) |
 | change a module's `use` lines or header comment | `target/tachyonc edit patch\|replace MODULE::use` (`MODULE::header`, `MODULE::extern`; `edit insert --after MODULE::use`, `edit delete`) |

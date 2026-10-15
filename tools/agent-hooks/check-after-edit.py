@@ -15,7 +15,17 @@ errors, a PostToolUse `additionalContext`:
     main.tach:5:5: error[type error] undefined variable 'prinln' | help: did you mean 'println'?
 
 at most 10 errors (the edited file's first), then `(N more: tachyonc
-check ROOT)`. A clean program prints nothing.
+check ROOT)`. A clean program prints nothing. (0.17) The `try:` commands
+of the errors that one `tachyonc fix` run applies to all of them (`fix
+--only unsafe`, `alloc016`, `imports`, `pub`) come right after the head,
+once each, with how many errors they answer:
+
+    tachyonc check main.tach: 3 errors
+    try: tachyonc fix --only unsafe main.tach   (3 of the errors)
+
+and the compiler is run under the name the agent can type (`tachyonc` when
+it is the one on PATH, else its path from the event's directory), so the
+`try:` lines it prints run as they are.
 
 - When: a Write, Edit or MultiEdit of a `.tach` file; a Bash call whose
   `tachyonc edit|refactor|fix|rewrite|undo` wrote (its summary line; not
@@ -135,9 +145,12 @@ def run_check(compiler, root, cwd):
     dicts with the keys of --json; None when check could not run."""
     import subprocess  # (here: the hook's no-op path stays cheaper)
 
+    shown = typed_name(compiler, cwd)
+
     def run(args):
         try:
-            return subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=TIMEOUT)
+            return subprocess.run([shown] + args[1:], executable=args[0], cwd=cwd, capture_output=True,
+                                  text=True, timeout=TIMEOUT)
         except (OSError, subprocess.TimeoutExpired):
             return None
     tail = [os.path.relpath(root, cwd) if root and root.startswith(cwd + os.sep) else root] if root else []
@@ -174,6 +187,32 @@ def parse_short(line):
             "try": [p[5:] for p in parts[1:] if p.startswith("try: ")]}
 
 
+def typed_name(compiler, cwd):
+    """The compiler as the agent would type it: `tachyonc` when that is the
+    one on PATH, else its path from cwd when under it, else its path."""
+    on_path = which("tachyonc")
+    if on_path and os.path.realpath(on_path) == os.path.realpath(compiler):
+        return "tachyonc"
+    full = os.path.abspath(compiler)
+    if full.startswith(cwd + os.sep):
+        return os.path.relpath(full, cwd)
+    return compiler
+
+
+FIX = re.compile(r"^\S*tachyonc\S* fix\b")
+
+
+def fix_commands(errors):
+    """The `tachyonc fix ...` commands of the errors' try: lines, each with
+    how many errors name it, in order of first appearance."""
+    seen = {}
+    for d in errors:
+        for t in d.get("try") or []:
+            if FIX.match(t):
+                seen[t] = seen.get(t, 0) + 1
+    return list(seen.items())
+
+
 def line_of(d):
     """A diagnostic in check's one-line form."""
     pos = f"{d['file']}:{d['line']}:{d['col']}: " if d.get("file") else ""
@@ -198,6 +237,8 @@ def report(diags, root_shown, edited):
                                        or os.path.abspath(d.get("file") or "") == edited))
     n = len(errors)
     lines = [f"tachyonc check{' ' + root_shown if root_shown else ''}: {n} error{'s' if n != 1 else ''}"]
+    for cmd, k in fix_commands(errors):
+        lines.append(f"try: {cmd}   ({'the error' if n == 1 else 'all of them' if k == n else f'{k} of the errors'})")
     lines += [line_of(d) for d in errors[:MAX_SHOWN]]
     if n > MAX_SHOWN:
         lines.append(f"({n - MAX_SHOWN} more: tachyonc check{' ' + root_shown if root_shown else ''})")
