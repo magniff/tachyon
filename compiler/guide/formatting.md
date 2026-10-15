@@ -97,8 +97,6 @@ escaped: `"a\n"`), `Vec<T>`, `Option`, `Result` and `HashMap` (`[1, 2]`,
 `[u8]`'s): `std::debug_list(f, s)` writes one from a Debug impl.
 
 ```tach
-use std::Fmt;
-
 #[derive(Debug, Clone)]
 struct Point { x: i64, y: i64 }
 
@@ -155,8 +153,6 @@ tuples of them) is a copy. `Clone` is in std for `Vec` (deep), `Buf`,
 `HashMap`, `Option`, `Result` and the primitives.
 
 ```tach
-use std::{HashMap, sort};
-
 #[derive(Eq, Ord, Hash, Debug)]
 struct Key { group: i64, id: i64 }
 

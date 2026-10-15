@@ -26,7 +26,7 @@ main.tach:9:14: error[type error] unresolved import 'roster::add_score'
 main.tach:17:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: *Roster, name: [u8])` (roster.tach:17)
 main.tach:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: *Roster, name: [u8])` (roster.tach:17)
 main.tach:19:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: *Roster, name: [u8])` (roster.tach:17)
-main.tach:23:19: error[type error] unknown type 'HashMap' | help: add `use std::HashMap;` | try: tachyonc fix --only imports main.tach
+main.tach:33:23: error[type error] undefined variable 'I64_MIN' | help: add `use std::I64_MIN;` | try: tachyonc fix --only imports main.tach
 grades.tach:18:5: error[type error] undefined variable 'totl' | help: did you mean 'total'?
 grades.tach:39:17: error[unsafe] calling a C function is unsafe | help: put it in an `unsafe { ... }` block, or the function's body in an `unsafe fn` (the try: line wraps every such place) | try: tachyonc fix --only unsafe main.tach
 roster.tach:26:13: error[type error] cannot assign to immutable variable 'count' | help: make it mutable: `let mut count`
@@ -57,7 +57,7 @@ $ tachyonc fix --dry-run
 --- a/main.tach
 +++ b/main.tach
 @@ -9,0 +10 @@
-+use std::HashMap;
++use std::I64_MIN;
 --- a/grades.tach
 +++ b/grades.tach
 @@ -21 +21 @@
@@ -110,8 +110,8 @@ patched crate::roster::with_scores	roster.tach	+1 -1 lines
 ```
 
 An OLD that is not there is refused, with the nearest line of the item
-and a `try:` command built from it. Here it shows that `len` is a field,
-not a method:
+and a `try:` command built from it. Here it shows that the source
+writes the field, `scores.len` (a slice has both, `.len` and `.len()`):
 
 ```console
 $ tachyonc edit patch grades.tach:18 --old 'totl / scores.len()' --new 'total / scores.len()'
@@ -222,10 +222,10 @@ $ git diff --stat
   loop would have shown them a few at a time.
 - Three of them were fixed by `fix` with no file opened; the edit is the
   same one a careful human would make (`pub fn letter`, an
-  `unsafe { }` around the one call, the `use std::HashMap;` line).
+  `unsafe { }` around the one call, the `use std::I64_MIN;` line).
 - Each other fix named the item it changes, not a line number that
   moves after every edit, and was checked before it was written: a
-  patch that had introduced a new error (`scores.len()` on a slice)
+  patch that had introduced a new error (`scores.size()` on a slice)
   would have been refused, with the error.
 - `edit apply` made a change that is only correct as a whole (a new
   signature, a new function) in one step, so there was never a state of

@@ -10,13 +10,14 @@ $ edit insert --after std::trim --dry-run < $T/inputs/strip_prefix.tach
 +// s without prefix at its start, or None.
 +pub fn strip_prefix(s: [u8], prefix: [u8]) -> Option<[u8]> {
 +    if prefix.len > s.len || s[0..prefix.len] != prefix {
-+        return Option::None;
++        return None;
 +    }
 +    Option::Some(s[prefix.len..s.len])
 +}
-## std has no prelude: the check says so, nothing is written.
+## An error in std's new text (0.17: std sees the prelude, `None`; here
+## a wrong type): the check says so, nothing is written.
 $ edit insert --after std::trim < $T/inputs/strip_prefix_none.tach
-compiler/std/io.tach:24:16: error[type error] undefined variable 'None' | help: std has no prelude: write `Option::None`  [edited]
+compiler/std/io.tach:24:21: error[type error] expected '[u8]', got 'i64'  [edited]
 error edit.breaks: 1 new error; nothing written
 try: tachyonc edit insert --after std::trim --no-check
 [exit 1]
@@ -56,7 +57,7 @@ pub fn is_space(b: u8) -> bool {
     b == ' ' || b == '\n'
 }
 ## std's files are not this compiler's std: check reads them.
-% printf '\npub fn bad() -> Option<i64> {\n    None\n}\n' >> compiler/std/io.tach
+% printf '\npub fn bad() -> Option<i64> {\n    Nothing\n}\n' >> compiler/std/io.tach
 $ check
-compiler/std/io.tach:22:5: error[type error] undefined variable 'None' | help: std has no prelude: write `Option::None`
+compiler/std/io.tach:22:5: error[type error] undefined variable 'Nothing'
 [exit 1]

@@ -2,16 +2,20 @@
 
 The standard library is the module `std`, built into the compiler. The
 prelude names need no import: `Option`, `Some`, `None`, `Result`, `Ok`,
-`Err`, `Vec`, `print`, `println`, `eprint`, `eprintln`, `format`, and
-the traits `Add`, `Sub`, `Mul`, `Div`, `Neg`, `Eq`, `Ord`, `Hash`,
-`Display`, `Debug`, `Clone`, `From`, `Into` (the last eight: 0.15). Anything else is used by path
-(`std::print_int(n)`, `std::sort(s)`) or imported by name
-(`use std::{Buf, HashMap, sort};`).
+`Err`, `Vec`, `print`, `println`, `eprint`, `eprintln`, `format`,
+`format_in`, the allocators (`Gpa`, `Allocator`, `Arena`, `ScopedArena`,
+`arena_scope`), the traits `Add`, `Sub`, `Mul`, `Div`, `Neg`, `Eq`,
+`Ord`, `Hash`, `Iterator`, `Display`, `Debug`, `Clone`, `From`, `Into`,
+and (0.17) `Buf`, `HashMap`, `read_line`, `read_stdin_in`, `Scanner`,
+`parse_int`, `trim`, `split_in`, `split_whitespace_in`, `sort`,
+`sort_by`, `cmp_of`, `eq_of`, `Fmt`, `panic(msg)` and `unreachable()`.
+Anything else is used by path (`std::print_int(n)`) or imported by name
+(`use std::{IoError, is_digit};`).
 
 What a Rust programmer will miss: there is no `String` (use `[u8]` and
 `Buf`), no file reading (call C; iterators: `tachyonc guide
-iterators`), no `HashSet` (a `HashMap<K, bool>`), no `Vec` indexing
-(`get`, `set`, `as_slice()[i]`). Formatting is 0.15's f-strings,
+iterators`), no `HashSet` (a `HashMap<K, bool>`). A `Vec` (and a `Buf`) indexes as
+its slice: `v[i]`, `v[i] = x`, `v[a..b]` (0.17), checked. Formatting is 0.15's f-strings,
 `println(f"{x:>4}")` (`tachyonc guide formatting`); errors are enums in a
 `Result` (`tachyonc guide conversions`). Nothing frees itself: call `free()`, usually right
 after creating the value with `defer x.free();`.
@@ -35,8 +39,6 @@ after creating the value with `defer x.free();`.
   not stable).
 
 ```tach
-use std::HashMap;
-
 fn main(gpa: Gpa) -> i32 {
     let mut counts: HashMap<[u8], i64> = HashMap::new_in(gpa);
     defer counts.free();
@@ -84,8 +86,6 @@ next `read_line` overwrites the line, so to keep a part of it (a map's
 key), read all of stdin and take lines with `Scanner::next_line`.
 
 ```tach
-use std::{Buf, Scanner, parse_int, read_line, read_stdin_in, split_whitespace_in};
-
 fn main(gpa: Gpa) -> i32 {
     let mut line = Buf::new_in(gpa);
     defer line.free();

@@ -47,7 +47,7 @@ on the command line make one program; `mod name;` loads `name.tach`.
 | `Vec::new()`, a global allocator | `Vec::new_in(gpa)`: nothing allocates without an allocator; `gpa` comes from `fn main(gpa: Gpa)`, passed down as a parameter (0.16, `guide allocators`) |
 | `Box<T>`, arenas | a `Vec`; `arena_scope(gpa, \|a\| ..)` frees all it allocated at its end; `--check-alloc` traps a use after free |
 | `const fn`, purity | `#[pure]`, `#[no_alloc]`: checked declarations; `tachyonc query effects f` (0.16, `guide effects`) |
-| `v[i]` on a `Vec` | `v.get(i)`, `v.set(i, x)`, `v.as_slice()[i]` |
+| `v[i]` on a `Vec` | the same (0.17): `v[i]`, `v[i] = x`, `v[a..b]` index its slice, checked; `v.get(i)`, `v.set(i, x)` too |
 | closures, `.iter().map()` | the same (0.14): `v.iter().map(\|x\| x * k).sum()`; `F: Fn(i64) -> i64` bounds; no `dyn Fn`, `iter_mut` (`guide closures`, `guide iterators`) |
 | `x?` | the same on `Option` and `Result` (0.15); `impl From<E> for F` converts the error; `main` may return `Result<(), E>` (`guide conversions`) |
 | `impl Trait for T`, `T: Trait` | the same; `type Item;` associated types (0.14); `#[derive(Eq, Ord, Hash, Debug, Clone)]` (0.15); no `dyn`, `where`, supertraits |
@@ -79,7 +79,7 @@ let c = 3u32;             // suffixes; 1_000, 0xff, 0b1010
 let d = 2.5;              // f64; 2.5f32 is f32
 let e = 'A';              // u8: a byte, ASCII only
 let f = true;             // bool
-let s = "bytes";          // [u8]: s.len (an i64 field, not a method), s[0], s[1..3]
+let s = "bytes";          // [u8]: s.len() (or the field s.len, an i64), s[0], s[1..3]
 let p = c"for C";         // *u8, NUL-terminated
 let t = (1, "two");       // a tuple: t.0, t.1
 let arr = [0; 8];         // [i64; 8]; also [1, 2, 3]; arr[i] is checked
@@ -264,15 +264,13 @@ starts with hello
 index out of bounds: index 4, length 4
 ```
 
-An array `[T; N]` is a value (copied by `=`, no `.len`); a slice `[T]`
-is a pointer and a length (`.ptr`, `.len`) viewing an array, a `Vec` or
-memory. Writing through a slice needs no `mut`.
+An array `[T; N]` is a value (copied by `=`; `a.len()` is N); a slice
+`[T]` is a pointer and a length (`.ptr`, `.len`, `.len()`) viewing an
+array, a `Vec` or memory. Writing through a slice needs no `mut`.
 
 ## std: Vec, HashMap, Buf; allocation
 
 ```tach
-use std::{Buf, HashMap, sort};
-
 fn evens(n: i64, gpa: Gpa) -> Vec<i64> {  // it allocates: it takes an allocator
     (0..n).map(|i| i * 2).collect_in(gpa)
 }
@@ -349,7 +347,6 @@ Option means absent, Result failed). Files go through C (`fopen`):
 
 ```tach
 import "string.h" as c;
-use std::{Scanner, read_stdin_in};
 
 fn main(argc: i32, argv: **u8, gpa: Gpa) -> i32 {
     let mut input = read_stdin_in(gpa).unwrap(); // all of stdin
@@ -409,10 +406,9 @@ and linking: `guide c-interop`.
 | `'?' needs 'f' to return Option or Result` | `fn f(..) -> Option<T>` or `-> Result<T, E>` |
 | `'println!' is a macro call` | no macros: `println(f"{x}")` |
 | `cannot assign to immutable variable 'x'` | `let mut x` |
-| `cannot index type 'Vec<i64>'` | `v.get(i)`, `v.as_slice()[i]` |
+| `cannot index type 'HashMap<K, V>'` | `m.get(k)` (an Option), `m.insert(k, v)` |
 | `allocation is explicit: pass an allocator (try: Vec::new_in(gpa))` | `fn main(gpa: Gpa)`, `gpa` passed down; `tachyonc fix --only alloc016` |
 | `'for' iterates over ... got 'i64'` | a range: `for x in 0..n`; a Vec, a HashMap, `v.iter()` and ranges as values iterate too (0.14) |
-| `no method 'len' on type '[u8]'` | `s.len`, a field |
 | `expected '[i64]', got '[i64; 3]'` | pass `a[..]` |
 | `expected 'i32', got 'i64'` | `x as i32`: only widening is implicit |
 | `cannot take address of non-lvalue expression` | `&` needs a place: `let p = P { x: 1 }; f(&p)` |
