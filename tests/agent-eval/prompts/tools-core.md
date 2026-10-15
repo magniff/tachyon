@@ -18,6 +18,7 @@ query context parse_line --root main.tach`). Use these first:
 | rename, move, change a signature, field or variant everywhere | `tachyonc refactor rename\|move\|signature\|field\|variant ... --root main.tach` |
 | missing imports, `pub`, `unsafe` blocks | `tachyonc fix --root main.tach` |
 | every error, one line each | `tachyonc check --root main.tach` |
+| a bug: where it fails, the values at a line, a smaller failing input | `tachyonc guide debug` (`tachyonc test` prints a crash's line and callers; `tachyonc probe FILE:LINE EXPR... --input FILE`; `tachyonc reduce FILE --until 'CMD'`) |
 
 Everything else (`query grep|items|type`, `edit apply`, `rewrite`,
 `undo`, `batch`): `tachyonc --help`, `tachyonc CMD --help`, `tachyonc
