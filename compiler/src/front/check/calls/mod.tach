@@ -6,14 +6,15 @@
 pub mod paths;
 
 use crate::base::{
-    BUFS, SRC, SYMS, buf_byte, buf_bytes, buf_fmt, buf_new, buf_slice, buf_str, intern, sym_text,
+    BUFS, SRC, SYMS, buf_byte, buf_bytes, buf_fmt, buf_new, buf_slice, buf_str, intern, intern_c,
+    sym_text,
 };
 use crate::base::diag::{
     ERR_HELP, err_begin, err_end, err_failed_name, err_help, err_help_fmt, err_help_sym, err_int,
     err_str, err_sym, err_try_fmt, err_try_tool,
 };
 use crate::front::assoc::ensure_checked;
-use crate::front::ast::{NODES, child, list_begin, list_end, list_push, new_node};
+use crate::front::ast::{NODES, NodeKind, child, list_begin, list_end, list_push, new_node};
 use crate::front::ast::NodeKind::{Call, Ident, Index, Range, Unary};
 use crate::front::check::{LOCALS, Res, SELF_SYM, is_std_named, name_error};
 use crate::front::check::args::{arity_help, int_limit_help, normalize_args};
@@ -31,6 +32,7 @@ use crate::front::derive::intrinsic::{has_intrinsic_method, intrinsic_method};
 use crate::front::generics::{TPL_SLICE, check_arg, template_name};
 use crate::front::generics::instantiate::instantiate_call;
 use crate::front::lexer::Tok;
+use crate::front::modules::{CUR_MOD, STD_MODULE};
 use crate::front::traits::require_in_bounds;
 use crate::front::types::{
     ENUMS, FNS, METHODS, METHOD_COUNT, STRUCTS, TYPES, TY_UNIT, TyKind, VARIANTS, buf_type,
@@ -258,6 +260,26 @@ fn is_method(f: i64) -> bool {
     }
 }
 
+// (0.17) Method call n (of method f0 on type t) when it is std's
+// `Buf::push_str(f"...")` outside std: Buf::push_fmt, which n then calls
+// (an f-string is no `[u8]`; push_fmt writes it into the Buf without
+// making the text apart); else -1.
+fn push_str_interp(n: i64, f0: i64, t: i64) -> i64 {
+    unsafe {
+        if f0 < 0 || STD_MODULE < 0 || FNS[f0].module != STD_MODULE || CUR_MOD == STD_MODULE
+            || NODES[n].count != 1 || NODES[child(n, 0)].kind != NodeKind::Interp
+            || SYMS[NODES[FNS[f0].node].a].text != "push_str" {
+            return -1;
+        }
+        let push_fmt = intern_c(c"push_fmt");
+        let f = method_of(t, push_fmt);
+        if f >= 0 {
+            NODES[n].b = push_fmt;
+        }
+        f
+    }
+}
+
 // A new node for the checker: `op operand` (`&` or `*`) of type `ty`.
 pub fn synthetic_unary(op: Tok, operand: i64, ty: i64) -> i64 {
     unsafe {
@@ -319,7 +341,13 @@ pub fn synth_method(n: i64) -> i64 {
             && LOCALS[NODES[receiver].y].tparam != 0 {
             require_in_bounds(LOCALS[NODES[receiver].y].tparam, name, NODES[n].start);
         }
-        let f0 = method_of(t, name);
+        let mut f0 = method_of(t, name);
+        // (0.17) `b.push_str(f"..")`: Buf::push_fmt's, the f-string written
+        // straight into the Buf
+        let pf = push_str_interp(n, f0, t);
+        if pf >= 0 {
+            f0 = pf;
+        }
         let mut f = -1;
         if TYPES[t].kind == TyKind::Struct || TYPES[t].kind == TyKind::Enum || f0 >= 0 {
             f = f0;

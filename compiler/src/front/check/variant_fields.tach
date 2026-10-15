@@ -1,0 +1,501 @@
+// Struct-like enum variants (0.17). `enum E { V { a: A, b: B } }` is the
+// variant `V(A, B)` whose fields have names too (the Variant node's d: a
+// node listing a Field node per field, a = the name). A literal
+// `E::V { b: y, a: x }` is checked as the call `E::V(x, y)` (flagged
+// CALL_FIELDS; its z lists the fields in the order they were written, when
+// that is not theirs: the back ends evaluate them in that order), a
+// pattern `E::V { a, .. }` as `E::V(a, _)`. Fields are read only through
+// patterns, as in Rust.
+
+use crate::front::ast::{
+    CALL_FIELDS, FIELD_SHORTHAND, NODES, NodeKind, PAT_FIELDS, PAT_REST, child, list_begin,
+    list_end, list_push, new_node,
+};
+
+use crate::front::types::{
+    ENUMS, SYM_ALIAS, SYM_ENUM, TYPES, TyKind, VARIANTS, buf_type, enum_variant, err_type,
+};
+
+use crate::front::modules::lookup::{
+    B_ITEM, B_MODULE, B_TVARIANT, B_VARIANT, binding_kind, binding_value, lookup_quiet,
+    resolve_path,
+};
+
+use crate::front::check::{SELF_TYPE, SELF_TYPE_SYM, name_error};
+
+use crate::front::generics::env_lookup;
+
+use crate::front::check::resolve::resolve_alias;
+
+use crate::base::{
+    SRC, alloc_array, buf_bytes, buf_fmt, buf_new, buf_slice, buf_str, free, sym_text,
+};
+use crate::base::diag::{err_begin, err_end, err_fmt, err_help, err_help_fmt, err_str, err_try_fmt};
+use crate::front::check::args::check_shorthands;
+use crate::front::check::names::near_to;
+use crate::front::modules::CUR_MOD;
+
+// The enum (ENUMS index) of the variant literal_variant found last.
+static mut LIT_ENUM: i64 = -1;
+
+// The field of Variant node `vnode` named `name`, or -1.
+pub fn field_index(vnode: i64, name: i64) -> i64 {
+    unsafe {
+        let names = NODES[vnode].d;
+        if names == 0 {
+            return -1;
+        }
+        for i in 0..NODES[names].count {
+            if NODES[child(names, i)].a == name {
+                return i;
+            }
+        }
+        -1
+    }
+}
+
+// Whether variant v (a VARIANTS index) is written `V { a: A, ... }`.
+pub fn has_named_fields(v: i64) -> bool {
+    unsafe { NODES[VARIANTS[v].node].d != 0 }
+}
+
+// The variant of enum e named `name`: its node; -1 when e has none.
+fn enum_variant_node(e: i64, name: i64) -> i64 {
+    unsafe {
+        LIT_ENUM = e;
+        let item = ENUMS[e].node;
+        for i in 0..NODES[item].count {
+            if NODES[child(item, i)].a == name {
+                return child(item, i);
+            }
+        }
+        -1
+    }
+}
+
+// The variant node binding b names (a variant in scope by `use`), or 0.
+fn variant_of_binding(b: i64, name: i64) -> i64 {
+    unsafe {
+        if binding_kind(b) == B_VARIANT {
+            let v = binding_value(b);
+            return enum_variant_node(VARIANTS[v].enum_id, VARIANTS[v].name);
+        }
+        if binding_kind(b) == B_TVARIANT {
+            return enum_variant_node(binding_value(b), name);
+        }
+        0
+    }
+}
+
+// The variant struct literal n names (`E::V { .. }`, `m::E::V { .. }`,
+// `Self::V { .. }`, `V { .. }` after `use E::V;`): its Variant node, -1 for
+// an enum without that variant (LIT_ENUM: the enum), 0 for no enum.
+fn literal_variant(n: i64) -> i64 {
+    unsafe {
+        let name = NODES[n].a;
+        let h = NODES[n].h;
+        if h == 0 {
+            if name == SELF_TYPE_SYM || env_lookup(name) != 0 {
+                return 0;
+            }
+            return variant_of_binding(lookup_quiet(CUR_MOD, name, CUR_MOD), name);
+        }
+        let k = NODES[h].count;
+        let owner = NODES[child(h, k - 1)].a;
+        if k == 1 && owner == SELF_TYPE_SYM {
+            if SELF_TYPE != 0 && TYPES[SELF_TYPE].kind == TyKind::Enum {
+                return enum_variant_node(TYPES[SELF_TYPE].a, name);
+            }
+            return 0;
+        }
+        if k == 1 && env_lookup(owner) != 0 {
+            return 0;
+        }
+        let b = resolve_path(CUR_MOD, h, k, -1);
+        if binding_kind(b) == B_MODULE {
+            return variant_of_binding(lookup_quiet(binding_value(b), name, CUR_MOD), name);
+        }
+        if binding_kind(b) != B_ITEM {
+            return 0;
+        }
+        let key = binding_value(b);
+        if SYM_ENUM[key] != 0 {
+            return enum_variant_node(SYM_ENUM[key] - 1, name);
+        }
+        if SYM_ALIAS[key] != 0 {
+            let t = resolve_alias(key, NODES[n].start);
+            if TYPES[t].kind == TyKind::Enum {
+                return enum_variant_node(TYPES[t].a, name);
+            }
+        }
+        0
+    }
+}
+
+// The callee of the call literal n becomes: `E::V` as written (a Path),
+// or the variant's own name (an Ident).
+fn literal_callee(n: i64) -> i64 {
+    unsafe {
+        let h = NODES[n].h;
+        let name = NODES[n].a;
+        let name_start = if h == 0 { NODES[n].start } else { NODES[h].end };
+        let name_end = name_start + sym_text(name).len;
+        if h == 0 {
+            let id = new_node(NodeKind::Ident, name_start, name_end);
+            NODES[id].a = name;
+            NODES[id].g = NODES[n].g;
+            return id;
+        }
+        let k = NODES[h].count;
+        let before = child(h, k - 1);
+        let path = new_node(NodeKind::Path, NODES[n].start, name_end);
+        NODES[path].a = NODES[before].a;
+        NODES[path].g = NODES[before].g;
+        NODES[path].b = name;
+        NODES[path].h = NODES[n].g;
+        if k > 1 {
+            let mark = list_begin();
+            for i in 0..k {
+                list_push(child(h, i));
+            }
+            let last = new_node(NodeKind::Ident, name_start, name_end);
+            NODES[last].a = name;
+            NODES[last].g = NODES[n].g;
+            list_push(last);
+            list_end(path, mark);
+        }
+        path
+    }
+}
+
+// `E::V` for messages: the enum of the variant last found, and `name`.
+fn buf_variant(b: i64, name: i64) {
+    unsafe {
+        buf_bytes(b, sym_text(ENUMS[LIT_ENUM].name));
+        buf_str(b, c"::");
+        buf_bytes(b, sym_text(name));
+    }
+}
+
+// `a: A, b: B`: the fields of Variant node vnode, written as declared.
+fn buf_fields(b: i64, vnode: i64, with_types: bool) {
+    unsafe {
+        let names = NODES[vnode].d;
+        for i in 0..NODES[names].count {
+            if i > 0 {
+                buf_str(b, c", ");
+            }
+            let f = child(names, i);
+            buf_bytes(b, sym_text(NODES[f].a));
+            if with_types {
+                let ty = child(vnode, i);
+                buf_str(b, c": ");
+                buf_bytes(b, SRC[NODES[ty].start..NODES[ty].end]);
+            }
+        }
+    }
+}
+
+// The help of an unknown field `name` of variant node vnode: the nearest
+// field, else the fields.
+fn help_fields(vnode: i64, name: i64) {
+    unsafe {
+        let names = NODES[vnode].d;
+        let mut near = near_to(name);
+        for i in 0..NODES[names].count {
+            near.offer(NODES[child(names, i)].a);
+        }
+        if near.best >= 0 {
+            near.help();
+            return;
+        }
+        let f = buf_new();
+        buf_fields(f, vnode, true);
+        err_help_fmt(f"its fields: {buf_slice(f)}");
+    }
+}
+
+// An error at `pos` naming variant `name` of the enum last found:
+// `before` 'E::V' `after`.
+fn variant_error(pos: i64, before: *u8, name: i64, after: *u8) {
+    unsafe {
+        err_begin(pos);
+        err_str(before);
+        let b = buf_new();
+        buf_variant(b, name);
+        err_fmt(buf_slice(b));
+        err_str(after);
+    }
+}
+
+// (0.17) Struct literal n when it names a variant (`E::V { a: x, b: y }`):
+// made the call `E::V(x, y)`, to be checked again; false when n names no
+// variant (a struct's literal).
+pub fn variant_literal(n: i64) -> bool {
+    unsafe {
+        let vnode = literal_variant(n);
+        if vnode == 0 {
+            return false;
+        }
+        let name = NODES[n].a;
+        if vnode < 0 {
+            err_begin(NODES[n].start);
+            err_fmt(f"no variant '{sym_text(name)}' in enum '{sym_text(ENUMS[LIT_ENUM].name)}'");
+            err_end();
+        }
+        check_shorthands(n);
+        let callee = literal_callee(n);
+        let names = NODES[vnode].d;
+        let count = NODES[vnode].count;
+        if count == 0 && NODES[n].count == 0 {
+            // `E::V {}`: the variant without fields.
+            let start = NODES[n].start;
+            let end = NODES[n].end;
+            NODES[n] = NODES[callee];
+            NODES[n].start = start;
+            NODES[n].end = end;
+            return true;
+        }
+        if names == 0 {
+            variant_error(NODES[n].start, c"variant '", name, c"' has no named fields");
+            let b = buf_new();
+            buf_variant(b, name);
+            if count == 0 {
+                err_help(c"write it without braces");
+            } else {
+                buf_str(b, c"(");
+                for i in 0..count {
+                    if i > 0 {
+                        buf_str(b, c", ");
+                    }
+                    buf_str(b, c"_");
+                }
+                buf_str(b, c")");
+                err_help(c"its fields are by position");
+            }
+            err_try_fmt(buf_slice(b));
+            err_end();
+        }
+        let slots = alloc_array::<i64>(count + 1);
+        let mut ordered = true;
+        let mut last = -1;
+        for i in 0..NODES[n].count {
+            let init = child(n, i);
+            let k = field_index(vnode, NODES[init].a);
+            if k < 0 {
+                err_begin(NODES[init].start);
+                err_fmt(f"no field '{sym_text(NODES[init].a)}' in variant '");
+                let b = buf_new();
+                buf_variant(b, name);
+                err_fmt(buf_slice(b));
+                err_str(c"'");
+                help_fields(vnode, NODES[init].a);
+                err_end();
+            }
+            if slots[k] != 0 {
+                name_error(NODES[init].start, c"duplicate field '", NODES[init].a,
+                    c"' in constructor");
+            }
+            slots[k] = NODES[init].b;
+            if k < last {
+                ordered = false;
+            }
+            last = k;
+        }
+        for k in 0..count {
+            if slots[k] == 0 {
+                err_begin(NODES[n].start);
+                err_fmt(f"missing field '{sym_text(NODES[child(names, k)].a)}' in variant '");
+                let b = buf_new();
+                buf_variant(b, name);
+                err_fmt(buf_slice(b));
+                err_str(c"' constructor");
+                let f = buf_new();
+                buf_fields(f, vnode, true);
+                err_help_fmt(f"its fields: {buf_slice(f)}");
+                err_end();
+            }
+        }
+        let mut order = 0;
+        if !ordered {
+            order = new_node(NodeKind::None, NODES[n].start, NODES[n].end);
+            let mark = list_begin();
+            for i in 0..NODES[n].count {
+                list_push(field_index(vnode, NODES[child(n, i)].a));
+            }
+            list_end(order, mark);
+        }
+        let mark = list_begin();
+        for k in 0..count {
+            list_push(slots[k]);
+        }
+        list_end(n, mark);
+        free(slots as *u8);
+        NODES[n].kind = NodeKind::Call;
+        NODES[n].a = callee;
+        NODES[n].g = 0;
+        NODES[n].h = 0;
+        NODES[n].z = order;
+        NODES[n].p |= CALL_FIELDS;
+        true
+    }
+}
+
+// (0.17) `E::V(x, y)` (call n), or a pattern `E::V(p, q)`, for variant v
+// (of enum type t) whose fields have names: the error, with the form to
+// write.
+pub fn positional_error(n: i64, v: i64, t: i64, pattern: bool) -> ! {
+    unsafe {
+        let vnode = VARIANTS[v].node;
+        err_begin(NODES[n].start);
+        err_str(c"variant '");
+        err_type(t);
+        err_fmt(f"::{sym_text(VARIANTS[v].name)}' has named fields; ");
+        err_str(if pattern { c"match them by name" } else { c"give them by name" });
+        let b = buf_new();
+        buf_type(b, t);
+        buf_fmt(b, f"::{sym_text(VARIANTS[v].name)} {{ ");
+        let names = NODES[vnode].d;
+        // (the values or patterns written, when there is one per field)
+        let given = NODES[n].count == NODES[names].count;
+        for i in 0..NODES[names].count {
+            if i > 0 {
+                buf_str(b, c", ");
+            }
+            let name = sym_text(NODES[child(names, i)].a);
+            buf_bytes(b, name);
+            if given {
+                let text = SRC[NODES[child(n, i)].start..NODES[child(n, i)].end];
+                if text != name {
+                    buf_str(b, c": ");
+                    buf_bytes(b, text);
+                }
+            } else if !pattern {
+                buf_str(b, c": VALUE");
+            }
+        }
+        buf_str(b, c" }");
+        err_try_fmt(buf_slice(b));
+        err_end()
+    }
+}
+
+// (0.17) Pattern p `E::V { a, b: q, .. }` of variant v (enum type t): its
+// list made the patterns in field order, a wildcard for each field left
+// out (with `..`).
+pub fn pattern_fields(p: i64, v: i64, t: i64) {
+    unsafe {
+        let vnode = VARIANTS[v].node;
+        let names = NODES[vnode].d;
+        let count = VARIANTS[v].field_count;
+        if names == 0 && NODES[p].count > 0 {
+            err_begin(NODES[p].start);
+            err_str(c"variant '");
+            err_type(t);
+            err_fmt(f"::{sym_text(VARIANTS[v].name)}' has no named fields");
+            let b = buf_new();
+            buf_type(b, t);
+            buf_fmt(b, f"::{sym_text(VARIANTS[v].name)}");
+            if count > 0 {
+                buf_str(b, c"(");
+                for i in 0..count {
+                    if i > 0 {
+                        buf_str(b, c", ");
+                    }
+                    buf_str(b, c"_");
+                }
+                buf_str(b, c")");
+                err_help(c"match its fields by position");
+            }
+            err_try_fmt(buf_slice(b));
+            err_end();
+        }
+        let slots = alloc_array::<i64>(count + 1);
+        for i in 0..NODES[p].count {
+            let f = child(p, i);
+            let k = field_index(vnode, NODES[f].a);
+            if k < 0 {
+                err_begin(NODES[f].start);
+                err_fmt(f"no field '{sym_text(NODES[f].a)}' in variant '");
+                err_type(t);
+                err_fmt(f"::{sym_text(VARIANTS[v].name)}'");
+                help_fields(vnode, NODES[f].a);
+                err_end();
+            }
+            if slots[k] != 0 {
+                name_error(NODES[f].start, c"field '", NODES[f].a,
+                    c"' is matched twice in the pattern");
+            }
+            slots[k] = NODES[f].b;
+        }
+        if (NODES[p].p & PAT_REST) == 0 {
+            for k in 0..count {
+                if slots[k] == 0 {
+                    err_begin(NODES[p].start);
+                    err_str(c"the pattern of '");
+                    err_type(t);
+                    err_fmt(
+                        f"::{sym_text(VARIANTS[v].name)}' does not mention field '{sym_text(NODES[child(names, k)].a)}'");
+                    err_help(c"match it too, or end the pattern with '..' to leave the rest out");
+                    let b = buf_new();
+                    buf_type(b, t);
+                    buf_fmt(b, f"::{sym_text(VARIANTS[v].name)} {{ ");
+                    for i in 0..NODES[p].count {
+                        let f = child(p, i);
+                        if (NODES[f].p & FIELD_SHORTHAND) != 0 {
+                            buf_bytes(b, SRC[NODES[f].start..NODES[f].end]);
+                        } else {
+                            buf_fmt(b, f"{sym_text(NODES[f].a)}: ");
+                            buf_bytes(b, SRC[NODES[NODES[f].b].start..NODES[NODES[f].b].end]);
+                        }
+                        buf_str(b, c", ");
+                    }
+                    buf_str(b, c".. }");
+                    err_try_fmt(buf_slice(b));
+                    err_end();
+                }
+            }
+        }
+        let mark = list_begin();
+        for k in 0..count {
+            let mut q = slots[k];
+            if q == 0 {
+                q = new_node(NodeKind::PatWild, NODES[p].start, NODES[p].start);
+            }
+            list_push(q);
+        }
+        list_end(p, mark);
+        free(slots as *u8);
+        NODES[p].c = (count > 0) as i64;
+        NODES[p].p -= PAT_FIELDS;
+    }
+}
+
+// (0.17) The help of `e.a` on a value of enum type t (or a pointer to
+// one), when a variant has a field `a`: read it through a pattern. `base`:
+// the expression e.
+pub fn enum_field_help(t: i64, name: i64, base: i64) {
+    unsafe {
+        let mut e = t;
+        if TYPES[e].kind == TyKind::Ptr {
+            e = TYPES[e].a;
+        }
+        if TYPES[e].kind != TyKind::Enum {
+            return;
+        }
+        for i in 0..ENUMS[TYPES[e].a].variant_count {
+            let v = enum_variant(TYPES[e].a, i);
+            if field_index(VARIANTS[v].node, name) >= 0 {
+                err_help(c"a variant's fields are read through a pattern (no '.field' on an enum)");
+                let b = buf_new();
+                buf_str(b, c"if let ");
+                buf_type(b, e);
+                buf_fmt(b, f"::{sym_text(VARIANTS[v].name)} {{ {sym_text(name)}, .. }} = ");
+                buf_bytes(b, SRC[NODES[base].start..NODES[base].end]);
+                buf_str(b, c" { ... }");
+                err_try_fmt(buf_slice(b));
+                return;
+            }
+        }
+    }
+}

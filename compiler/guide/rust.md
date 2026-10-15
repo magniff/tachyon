@@ -9,7 +9,7 @@ often than to something else; each error names the fix.
 | Rust | tachyon |
 |---|---|
 | `&str`, `String`, `&[u8]` | `[u8]`: a pointer and a length; `"abc"` is one; no UTF-8 type |
-| `String::new()`, `push_str`, `format!` | `std::Buf` (`Buf::new_in(gpa)`): `push`, `push_str`, `push_int`, `push_fmt(f"..")`, `as_slice`; `format_in(f"..", gpa)` |
+| `String::new()`, `push_str`, `format!` | `std::Buf` (`Buf::new_in(gpa)`): `push`, `push_str`, `push_int`, `push_fmt(f"..")` (or `push_str(f"..")`), `as_slice`; `format_in(f"..", gpa)` |
 | `s.len()` | `s.len` (a field, `i64`) |
 | `s == "x"`, `s < t` | the same (std's `Eq` and `Ord` for `[u8]`, by bytes) |
 | `&s[1..3]` | `s[1..3]` (checked) |

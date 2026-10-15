@@ -15,7 +15,7 @@ anything query accepts.
 tachyonc refactor signature FN --add 'x: T [= VALUE]' [--at N] [--fill-calls] | --remove x
                                | --rename-param a b | --reorder b,a,c | --type x T [--default EXPR]
 tachyonc refactor field STRUCT --add 'g: T = VALUE' | --remove g | --rename g h | --type g T
-tachyonc refactor variant ENUM --add 'X(T, ...)' [--arm EXPR] [--arm-in SITE EXPR]... | --remove V | --rename V W
+tachyonc refactor variant ENUM --add 'X(T, ...)'|'X { a: T, ... }' [--arm EXPR] [--arm-in SITE EXPR]... | --remove V | --rename V W
 tachyonc rewrite 'PATTERN' 'REPLACEMENT' [--where '$x: T']... [--subst 'P' 'R']... [--in FILE|MODULE|ITEM]... [--list]
 tachyonc rewrite 'PATTERN' --list [--where ...] [--in FILE|MODULE|ITEM]   (0.16)
 tachyonc refactor extract-function FN --lines A-B --to NEW          (0.13)
@@ -125,7 +125,9 @@ A `#[repr(C)]` struct's layout changes with --add, --remove and --type:
   => EXPR` after its last arm (the enum written as that match's arms
   write it; else by its full path); without, the command is refused and
   lists them, `FILE:LINE:COL→FUNCTION` on stdout, then
-  `error refactor.non-exhaustive` and `try: query show FILE:LINE`.
+  `error refactor.non-exhaustive` and `try: query show FILE:LINE`. A
+  struct-like variant (0.17), `--add 'X { a: T }'`, gets the arm
+  `E::X { .. } => EXPR`.
 - `--arm-in SITE EXPR` (0.14, repeatable): the arm of the matches SITE
   names, for matches of different result types: SITE is the function
   (any item) the match is in, as `query` takes a NAME, or `FILE:LINE` of
@@ -496,4 +498,6 @@ as it changes the program through the edit engine (`edit_replace`,
 - A struct field added by `refactor field --add` is not `pub` unless the
   text says so.
 - `refactor variant --add --arm` (and `--arm-in`) binds no fields (`X(_,
-  _)`); an arm using them is written by hand (`edit`).
+  _)`, `X { .. }`); an arm using them is written by hand (`edit`).
+- `refactor field` takes a struct; a struct-like variant's fields (0.17)
+  are changed with `edit` (the variant, its literals and patterns).
