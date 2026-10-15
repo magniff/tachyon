@@ -2,7 +2,7 @@
 
 **The change.** At -O2, `(x << c1) << c2` and `(x >> c1) >> c2` (constant
 amounts, one direction, one type) stay two instructions: neither
-instruction combining (`middle/fold.tach`, `combine`) nor the e-graph
+instruction combining (`middle/fold/mod.tach`, `combine`) nor the e-graph
 rules (`middle/egraph.tach`) merge them. The agent adds the rule. It is a
 real peephole every optimizer has (LLVM's InstCombine does it), small (the
 reference is 18 lines in `combine`), and easy to get subtly wrong:
@@ -46,7 +46,7 @@ grade.sh ~5 s) on an M-series Mac.
 
 **If the patches do not apply at v0.16.0.** 0.16 moves the compiler
 source to `?`, derive and interpolation, so `combine` in
-`compiler/src/middle/fold.tach` may read differently. Re-make the
+`compiler/src/middle/fold/mod.tach` may read differently. Re-make the
 reference: in a tree of v0.16.0, add the same rule at the same place in
 `combine` (after `if (op == Shl || op == Shr) && shift_amount(c, ty) == 0`),
 copy `tests/run/opt_shift_chains.tach` from this patch, and
