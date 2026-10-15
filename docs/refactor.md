@@ -6,6 +6,8 @@ Python script (see [agent-tool-usage.md](agent-tool-usage.md)). They are
 built on `tachyonc query` ([query.md](query.md)): NAME is anything query
 accepts, positions and spans are the compiler's, and every problem is
 one line `SEVERITY CODE: MESSAGE` followed by `try:` lines, as there.
+Every query, edit and refactoring in one table, a row each: [query.md,
+"Every command at a glance"](query.md#every-command-at-a-glance-for-agents).
 
 Sessions with these tools on small programs, each step's command and
 its output, tested by `tests/walkthrough/run.sh`: [examples/tools](../examples/tools/README.md).

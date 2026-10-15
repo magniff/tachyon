@@ -56,6 +56,84 @@ deps, unused, impact) are in [refactor.md](refactor.md).
 Exit status: 0 answered, 1 no answer (nothing matches, an ambiguous
 `show`, a program that could not be read), 2 usage error (or no root).
 
+## Every command at a glance (for agents)
+
+The table AGENTS.md carried until 0.17, when its core was cut to the
+eight rows agents use (the rest cost tokens on every turn and was not
+used: docs/research/applying-to-tachyon.md, item 2). Each row is what you
+want and the command that does it, for the compiler's own source
+(`target/tachyonc`; any program with `--root ROOT`). `tachyonc --help`
+and `tachyonc CMD --help` print the same commands, `tachyonc guide
+tools` the ones a program needs.
+
+| you want | run |
+|---|---|
+| an item with what it calls, its types and callers, in one answer | `target/tachyonc query context NAME` (`--budget N`; a MODULE: its items and central bodies) |
+| the source of a function, type, method | `target/tachyonc query show NAME` |
+| where something is used | `target/tachyonc query refs NAME` (`--count`, `--in FILE\|MODULE`, `--kind write,call,...`; a local: `FN::x` or `FILE:LINE:COL`) |
+| what a function calls, all it reaches; can it change a table | `target/tachyonc query callees FN` (`--transitive`; `--writes TABLE`: the writes and borrows it reaches, with the call chain) |
+| text that is not a name (a message, a comment), with its item | `target/tachyonc query grep TEXT` (`--comments`, `--strings`, `--code`, `--word`, `--in`) |
+| a module's section banners; one section | `target/tachyonc query items MODULE --comments`, `query show MODULE::section TITLE` |
+| the type of an expression | `target/tachyonc query type FILE:LINE:COL` |
+| what a function may do (allocate, io, panic, loop forever) | `target/tachyonc query effects NAME\|MODULE` (`--why EFFECT`: the chain; `--has alloc(Gpa)`: which still allocate) |
+| where it is defined, its signature | `target/tachyonc query def NAME` |
+| what a module contains | `target/tachyonc query items MODULE` |
+| the item at a compiler error's position | `target/tachyonc query show FILE:LINE` (`--with-comments`: its section comment too) |
+| a module's `use` lines, header comment, extern blocks | `target/tachyonc query show MODULE::use` (`::header`, `::extern`) |
+| change a module's `use` lines or header comment | `target/tachyonc edit patch\|replace MODULE::use` (`MODULE::header`, `MODULE::extern`; `edit insert --after MODULE::use`, `edit delete`) |
+| lines of any file (a test, a fixture, conflict markers), a small file | `target/tachyonc query text FILE:A-B`, `query show FILE.tach` |
+| merge conflicts: the regions, their items, both sides; resolve one | `target/tachyonc query conflicts [FILE] [--show]`; `target/tachyonc edit resolve FILE:LINE\|NAME --ours\|--theirs\|--both` (`< text`, `--all`) |
+| change a few lines inside an item (a condition, a statement; FILE:LINE: a comment between items too) | `target/tachyonc edit patch NAME\|FILE:LINE --old 'TEXT' --new 'TEXT'` (pairs repeat; several lines: `< pairs` or `--pairs FILE`, blocks `<<<<<<< OLD` / `=======` / `>>>>>>> NEW`; `--loose` for other indentation; OLD there several times: `--nth N`, `--all`) |
+| add statements inside an item | `target/tachyonc edit insert --in NAME --after\|--before 'ANCHOR' < text` |
+| replace, add or remove an item by name | `target/tachyonc edit replace NAME < new.tach`, `edit insert --after\|--before NAME`, `edit delete NAME` (a module: its file too; `edit replace FILE.tach`: a whole file; `--dry-run` for the diff; the `use` lines new text needs are added) |
+| change several items (several files) in one checked edit | `target/tachyonc edit apply items.tach`: blocks `@@ NAME` (its new text), `@@ new after NAME`, `@@ new in MODULE`, `@@ delete NAME`, or `query show`'s output edited; `edit patch --in NAME` (or `@@ NAME` in `--pairs FILE`) starts another target's pairs |
+| an edit refused with `edit.breaks` | each error says `[edited: PATH]` or `[in PATH]`; run the `try:` refactoring it names (`note edit.refactor`), or change the broken items in the same edit (`note edit.together`); `--no-check` last |
+| see what an edit changed, without reading the file back | `--show` on any edit or refactoring; `target/tachyonc query diff` (the last one) |
+| wrap a body or lines in a block (`unsafe`, `loop`), re-indented; make a file with its `mod` line | `target/tachyonc edit wrap NAME --in unsafe [--lines A-B]`, `edit new-file PATH < text` |
+| take the last edit back | `target/tachyonc undo` (outside git: the journal is `.tachyonc/` next to the root) |
+| add, remove, rename, reorder or retype a parameter, with every call | `target/tachyonc refactor signature FN --add 'x: i64 = 0'` (`--remove x`, `--rename-param a b`, `--reorder b,a`, `--type x T --default '$x as T'`) |
+| add, remove, rename or retype a field, with every literal and access | `target/tachyonc refactor field STRUCT --add 'g: i64 = 0'` (`--remove g`, `--rename g h`, `--type g T`) |
+| add a variant (an arm in each match that needs one), remove, rename one | `target/tachyonc refactor variant ENUM --add 'X(i64)' --arm 'EXPR'` (`--arm-in FN 'EXPR'` per match; `--remove V`, `--rename V W`) |
+| move lines of a function into a new one, parameters and result computed | `target/tachyonc refactor extract-function FN --lines A-B --to NEW` |
+| put a small function's body where it is called (and delete it) | `target/tachyonc refactor inline FN` (`--at FILE:LINE`: one call) |
+| replace an idiom everywhere, typed | `target/tachyonc rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: *IntVec' --dry-run` (`--list`: the sites and their holes; `--subst 'P' 'R'`: inside the holes' code; `--where '$v: name ~ RE'`; `--in FN\|MODULE\|FILE`, repeated) |
+| rename anything (a module: its file too), with every reference | `target/tachyonc refactor rename PATH NEW` (a local or parameter: `FILE:LINE:COL` or `FN::x`, shadowing respected) |
+| move items to another module, imports and `pub` fixed | `target/tachyonc refactor move PATH... --to MODULE` (`--after\|--before ITEM`: where; a MODULE that does not exist is made) |
+| make a module; move one (file, folder, paths) | `target/tachyonc refactor new-module crate::a::b`, `refactor move-module crate::a crate::x::a` |
+| split a module into files | `target/tachyonc refactor split MODULE --plan` (then `--auto`, or `--into M --items a,b`; `--names a,b`; `--reexport` leaves code outside as it is; `--header TEXT`) |
+| several changes, checked once, all or nothing | `target/tachyonc refactor --script steps.txt` (one command per line; `<<END` ... `END` gives one its stdin) |
+| several queries and edits in one call, outputs under `## $ tachyonc ARGS` lines | `target/tachyonc batch < cmds.txt` (one command per line; `--stop` at the first failure) |
+| the errors, one per line (front end only) | `target/tachyonc check` |
+| missing/unused imports, `pub`, `unsafe` blocks | `target/tachyonc fix` (`--only imports,unused,pub,unsafe`, `--in FILE\|MODULE`, `--dry-run`; several modules have the name: `--use PATH::NAME`) |
+| imports through re-exports, then the re-exports; merged, sorted, wrapped `use` lines | `target/tachyonc fix --only reexports,tidy-imports` (`// api:` above a `pub use` keeps it) |
+| prove a refactoring changed no output | `target/tachyonc same-output OLD_TACHYONC` |
+| file and item sizes | `target/tachyonc query stats [MODULE\|FILE]` |
+| how a module's items use each other, how to split it | `target/tachyonc query deps MODULE --max-lines 1000` |
+| what nothing uses | `target/tachyonc query unused [MODULE\|FILE]` |
+| what a signature change touches | `target/tachyonc query impact NAME` |
+| files over a size | `target/tachyonc lint --max-lines 1000` |
+| lay code out (indentation, spaces, wrapping, `use` lines; edits do it too) | `target/tachyonc fmt FILE\|MODULE` (`--check`, `--dry-run`; `--all` the tree) |
+| what a diagnostic code means, how to fix it | `target/tachyonc explain CODE` (`explain TOOL` lists its codes; `explain WORDS`: the guide on them) |
+| std's API, a std item (from any program, or none) | `target/tachyonc query items std`, `query show std::read_line`, `query def Vec::push` |
+| what an expression or a few statements do, with std | `target/tachyonc try 'STATEMENTS'` (prints the output and `TYPE = VALUE`; `--file F`) |
+| the language on a word, an error message; one section | `target/tachyonc guide --find WORDS`, `guide TOPIC#SECTION` (`guide TOPIC#`: its sections) |
+| a command's options | `target/tachyonc CMD [SUB] --help` |
+
+NAME is `foo`, `module::foo`, `Type::method`, `Enum::Variant`,
+`Struct.field` or `FILE:LINE`; several in one call; every spelling a
+tool prints is taken back (`FILE:L:C:`, `FILE:A-B`, `Vec<i64>::push`,
+`main.0`, `./x.tach`). Any query takes `--budget N` (tokens; answers over
+8000 are cut, with the command that prints the rest). The root defaults to
+`compiler/src/main.tach` (`--root ROOT`, or a last argument ending in
+`.tach`, for other programs). A problem is one stderr line, `error CODE:
+message`, then `try:` lines: commands to run as they are. A build prints
+its errors as `check` does, one line each, when its output is not a
+terminal (`--diagnostics=human` for the long form), so a `check` before
+a build is redundant. Edits are atomic: an edit that adds an error
+writes nothing and prints the errors ([refactor.md](refactor.md)).
+`--json` on any command prints JSON lines, for scripts and hooks
+([JSON](#json-for-a-harness-015)).
+
 ## Output formats
 
 One line of grammar per kind of line (`\t` is a TAB; `[...]` optional):
