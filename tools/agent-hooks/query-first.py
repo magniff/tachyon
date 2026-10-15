@@ -43,6 +43,19 @@ event has them, and the checkout (a parallel agent's worktree).
 tools/agent-tool-usage.py --hook-log summarizes it. Enforcement
 starts only once the compiler answers `query` (marker
 .git/agent-query-ready); TACHYON_QUERY_ENFORCE=0 turns blocking off.
+
+(0.17) Each simple command of a line is judged on its own, in the
+directory its `cd`s lead to, with `$VAR`s assigned on the line expanded;
+the message names the command that reads. A whole file under 300 lines
+is read freely with cat, head, tail, sed -n (`read-small`); a .tach file
+outside any program's module tree (not a main.tach, not declared by a
+`mod` line, not under compiler/, examples/, bench/) is not source
+(`read-scratch`). A blocked record logs its `try:` commands. Python is
+judged by the script it runs, not by a here-document written to a file.
+After a Bash call (PostToolUse): a `# no-query:` reason that wants line
+numbers for the Edit tool is answered (`edit insert --after NAME`, `query
+def NAME`); the `repeat-query` hint of hints.txt after show, refs or def
+on one NAME three times in a row, once per NAME (state: hookstate.py).
 Development tooling only: not part of the build.
 """
 import json
@@ -61,6 +74,27 @@ tc = types.ModuleType("tachyonc_cmd")
 tc.__file__ = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tachyonc_cmd.py")
 with open(tc.__file__) as _fh:
     exec(compile(_fh.read(), tc.__file__, "exec"), tc.__dict__)
+
+class _LazyState:
+    """hookstate.py (0.17: the hints, the last queries), loaded at its
+    first use; a stand-in without hints when the copy of the hooks lacks
+    it."""
+
+    def __getattr__(self, name):
+        global hs
+        mod = types.ModuleType("hookstate")
+        mod.__file__ = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hookstate.py")
+        try:
+            with open(mod.__file__) as fh:
+                exec(compile(fh.read(), mod.__file__, "exec"), mod.__dict__)
+            hs = mod
+        except OSError:
+            hs = types.SimpleNamespace(load=lambda event: {}, save=lambda event, st: None,
+                                       hint=lambda key, **v: "")
+        return getattr(hs, name)
+
+
+hs = _LazyState()
 
 READERS = {"grep", "rg", "egrep", "fgrep", "sed", "head", "tail", "cat", "awk", "less", "more"}
 SOURCE = re.compile(r"(\.tach\b|compiler/src\b|compiler/std\b)")
@@ -206,28 +240,29 @@ def segments(command):
     return [seg.strip() for seg in out if seg.strip()]
 
 
-def source_reads(command, cwd=None, fixtures=None):
-    """(program, words) of each simple command reading .tach source; the
-    commands that read only test data (fixture) are added to `fixtures`."""
+SMALL_READERS = {"cat", "head", "tail", "sed", "nl", "less", "more"}
+SMALL_LINES = 300
+
+
+def source_reads(command, cwd=None, fixtures=None, small=None, scratch=None):
+    """(program, words, segment, [(operand, full path or None)]) of each
+    simple command reading .tach source. (0.17) Each command is judged on
+    its own, in the directory its `cd`s lead to, with `$VAR`s assigned on
+    the line expanded; a command that reads only test data is added to
+    `fixtures`, one that reads only files outside any program's module tree
+    (a probe, a scratch copy) to `scratch`, one that reads whole small
+    files (cat, head, sed -n ... of files under SMALL_LINES lines) to
+    `small`; none of those is blocked."""
     found = []
-    base = ""
-    for seg in segments(command):
-        seg = seg.strip()
-        if not seg or "#" == seg[:1]:
+    cwd = cwd or os.getcwd()
+    for seg, words, here, assigns in tc.located(command, cwd):
+        if not seg.strip() or seg.strip()[:1] == "#":
             continue
-        try:
-            words = shlex.split(seg, comments=True)
-        except ValueError:
-            words = seg.split()
         while words and "=" in words[0] and not words[0].startswith("-"):
             words = words[1:]
         if not words:
             continue
         prog = os.path.basename(words[0])
-        if prog == "cd" and len(words) > 1:
-            # (relative paths after `cd tests/x` are test data)
-            base = os.path.join(base, words[1])
-            continue
         if prog not in READERS:
             continue
         args = without_outputs(words[1:])
@@ -235,12 +270,122 @@ def source_reads(command, cwd=None, fixtures=None):
             continue  # an edit, not a read (logged as such)
         if prog == "cat" and (">" in seg):
             continue  # writing a file
-        files = [a for a in file_args(prog, args) if reads_source(a)]
-        if any(not fixture(a, base, cwd) for a in files):
-            found.append((prog, args))
-        elif files and fixtures is not None:
-            fixtures.append((prog, args))
+        files = []
+        for a in file_args(prog, args):
+            e = tc.expand(a, assigns)
+            if not reads_source(a):
+                continue
+            files.append((a, os.path.normpath(os.path.join(here, e)) if e is not None else None))
+        if not files:
+            continue
+        kinds = [file_kind(f, cwd, tc.expand(a, assigns)) for a, f in files]
+        if all(k == "fixture" for k in kinds):
+            if fixtures is not None:
+                fixtures.append((prog, args))
+            continue
+        if all(k in ("fixture", "scratch") for k in kinds):
+            if scratch is not None:
+                scratch.append((prog, args))
+            continue
+        if prog in SMALL_READERS and all(k != "source" or (f and lines_of(f) < SMALL_LINES)
+                                         for k, (_, f) in zip(kinds, files)):
+            if small is not None:
+                small.append((prog, args))
+            continue
+        found.append((prog, args, seg, [x for k, x in zip(kinds, files) if k == "source"]))
     return found
+
+
+def file_kind(full, cwd, typed=None):
+    """`fixture` (under a tests/ directory of the checkout), `scratch` (a
+    temporary or build directory: target/, /tmp, as the path reads inside
+    its checkout, or as typed outside any; or a .tach file outside any
+    program's module tree), else `source`. An operand whose path is not
+    known (a variable set in an earlier call) is source."""
+    if full is None:
+        return "source"
+    if fixture(full, "", cwd):
+        return "fixture"
+    top = checkout_of(os.path.dirname(full))[0]
+    shown = os.path.relpath(full, top) if top else (typed or full)
+    if SCRATCH.search(shown) or not is_program_source(full):
+        return "scratch"
+    return "source"
+
+
+def is_program_source(full):
+    """(0.17) Whether a .tach file belongs to a program: the compiler's
+    source and std, examples/ and bench/ of the checkout, a main.tach, a
+    file a `mod NAME;` line of its directory (or its parent module's file)
+    declares; a directory is. A probe the agent wrote next to the program,
+    or in a scratch directory, is not."""
+    if not full.endswith(".tach") or os.path.isdir(full) or not os.path.exists(full):
+        return True
+    if "/compiler/src/" in full or "/compiler/std/" in full:
+        return True
+    top = checkout_of(os.path.dirname(full))[0]
+    if top and re.match(r"^(examples|bench)/", os.path.relpath(full, top)):
+        return True
+    base = os.path.basename(full)
+    if base == "main.tach":
+        return True
+    d = os.path.dirname(full)
+    stem = base[:-5]
+    if base == "mod.tach":
+        stem, d = os.path.basename(d), os.path.dirname(d)
+    decl = re.compile(r"^\s*(?:pub\s+)?mod\s+%s\s*;" % re.escape(stem), re.M)
+    cands = []
+    try:
+        cands = [os.path.join(d, f) for f in sorted(os.listdir(d))[:200] if f.endswith(".tach")]
+    except OSError:
+        pass
+    cands += [os.path.join(d, "mod.tach"), d + ".tach"]
+    for c in cands:
+        if c == full:
+            continue
+        try:
+            with open(c, errors="replace") as fh:
+                if decl.search(fh.read(65536)):
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+def lines_of(path):
+    """The number of lines of a file (counted up to SMALL_LINES); a large
+    number when it cannot be read."""
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read(SMALL_LINES * 400)
+    except OSError:
+        return 1 << 30
+    n = data.count(b"\n")
+    return n if len(data) < SMALL_LINES * 400 else max(n, SMALL_LINES)
+
+
+def module_of(full):
+    """The module a .tach file holds, for `query items`: crate::a::b under
+    compiler/src or a program's root directory, std for compiler/std."""
+    m = re.search(r"/compiler/(src|std)/(.+)\.tach$", full)
+    if m:
+        if m.group(1) == "std":
+            return "std"
+        rel = m.group(2)
+    else:
+        d = os.path.dirname(full)
+        rel = None
+        for _ in range(6):
+            if os.path.exists(os.path.join(d, "main.tach")):
+                rel = os.path.relpath(full, d)[:-5]
+                break
+            d = os.path.dirname(d)
+        if rel is None:
+            return None
+    parts = [x for x in rel.split("/") if x]
+    if parts and parts[-1] in ("main", "mod"):
+        parts = parts[:-1]
+    return "::".join(["crate"] + parts)
 
 
 def fixture(path, base, cwd):
@@ -375,15 +520,37 @@ def source_rewrites(command):
             files = [a for a in operands if compiler_paths(a) and not (scratch_cwd and not a.startswith("/"))]
             if files:
                 found.append(("sed -i" if prog == "sed" else "perl -pi", files, script))
-    if re.search(r"\bpython[\d.]*\b", command) and re.search(r"\.write\(|write_text\(|write_bytes\(", command):
-        targets = python_targets(command)
+    script = python_text(command)
+    if script and re.search(r"\.write\(|write_text\(|write_bytes\(", script):
+        targets = python_targets(script)
         if targets is None:
-            files = compiler_paths(command)
+            files = compiler_paths(script)
         else:
             files = [f for t in targets for f in compiler_paths(t)]
         if files and not (scratch_cwd and not any(f.startswith("/") for f in files)):
             found.append(("python", files, ""))
     return found
+
+
+def python_text(command):
+    """(0.17) The Python a command runs, as far as it shows: the
+    here-documents given to a python command and its own words (`-c`); a
+    here-document written by `cat > x.py` is not run, so a script that
+    writes files is not taken for one that runs. "" when no python runs."""
+    texts = []
+    for m in HEREDOC.finditer(command):
+        start = command.rfind("\n", 0, m.start()) + 1
+        last = re.split(r"&&|\|\||[;&]", command[start:m.start()])[-1]
+        if re.search(r"(^|[\s/])python[\d.]*\b", last) and not re.search(r">\s*\S+\s*$", last.split("<<")[0]):
+            texts.append(m.group(0))
+    for seg in tc.segments(command):
+        words = seg.split()
+        while words and "=" in words[0]:
+            words = words[1:]
+        if words and re.match(r"^(\S*/)?python[\d.]*$", words[0]) or \
+                (words[:1] in (["env"], ["time"]) and any(re.match(r"^(\S*/)?python[\d.]*$", w) for w in words[1:3])):
+            texts.append(seg)
+    return "\n".join(texts)
 
 
 def python_targets(command):
@@ -520,6 +687,70 @@ def suggestion(prog, args):
     return "tachyonc query show NAME | tachyonc query items MODULE | tachyonc query text FILE:A-B"
 
 
+def blocked_message(command, prog, args, seg, files, cwd):
+    """(the message for a blocked read, its `try:` commands): which command
+    of the line reads source (when the line has several, the others are
+    not the problem), how long the file is when it is too long to read
+    whole, and complete commands to run instead."""
+    parts = [s for s in tc.segments(command) if s.strip() and not s.strip().startswith("#")]
+    what = "`%s`" % (seg if len(seg) <= 120 else seg[:117] + "...")
+    if len(parts) > 1:
+        what += " (command %d of %d on the line; the others are not blocked)" % (
+            next((i + 1 for i, p in enumerate(parts) if p.strip() == seg.strip()), 1), len(parts))
+    lines = ["blocked hook.query-first: %s reads .tach source" % what]
+    tries = [suggestion(prog, args)]
+    for arg, full in files[:1]:
+        n = lines_of(full) if full else None
+        if n is not None and n < (1 << 30):
+            mod = module_of(full) or arg
+            lines.append("%s is %s lines (a file under %d is read whole freely): `tachyonc query items %s` "
+                         "lists its items, `tachyonc query show NAME` one of them, `tachyonc query show %s:LINE` "
+                         "the item at a line" % (arg, format(n, ","), SMALL_LINES, mod, arg))
+            if mod != arg:
+                tries.append("tachyonc query items %s" % mod)
+    lines += ["try: %s" % t for t in tries]
+    lines.append("override: append '# no-query: <why query is not enough>'")
+    return "\n".join(lines) + "\n", tries
+
+
+LINE_FOR_EDIT = re.compile(r"line\s*(number|no\.?|numbers)?\b.*\b(edit|Edit)|\bfor\s+(the\s+)?Edit\b", re.I)
+
+
+def post_context(event, command, calls):
+    """(0.17) What the agent is told after a Bash call, or "": the reply to
+    a `# no-query:` reason that wants line numbers for the Edit tool; the
+    repeat-query hint (hints.txt) after show, refs or def on one NAME three
+    times in a row."""
+    out = []
+    esc = ESCAPE.search(command)
+    if esc and LINE_FOR_EDIT.search(esc.group(1)):
+        out.append("note hook.query-first: no line numbers are needed to change an item: "
+                   "`tachyonc edit insert --after NAME < text` adds an item after NAME, "
+                   "`tachyonc edit patch NAME --old 'TEXT' --new 'TEXT'` changes lines in it, "
+                   "and `tachyonc query def NAME` prints its FILE:LINE")
+    named = []
+    for sub, words, path, _ in calls:
+        if sub != "query":
+            continue
+        rest = [w for w in words if not w.startswith("-")]
+        if len(rest) >= 3 and rest[1] in ("show", "refs", "def", "callers"):
+            named += [(rest[1], n) for n in rest[2:] if not n.endswith(".tach") and not re.match(r"^\d+$", n)]
+    if named:
+        st = hs.load(event)
+        recent = (st.get("queries") or []) + [list(x) for x in named]
+        recent = recent[-6:]
+        st["queries"] = recent
+        hinted = st.setdefault("hinted_names", [])
+        last3 = recent[-3:]
+        name = last3[-1][1]
+        if len(last3) == 3 and all(q[1] == name for q in last3) and name not in hinted:
+            hinted.append(name)
+            prog = calls[0][2] or "tachyonc"
+            out.append(hs.hint("repeat-query", NAME=name, TACHYONC=prog))
+        hs.save(event, st)
+    return "\n".join(out)
+
+
 def via(calls):
     """{"via": PATH} when the tachyonc run was not plain `tachyonc` (a copy,
     a shell variable): the record says how the agent ran it."""
@@ -557,6 +788,11 @@ def main():
                 log(gd, {"kind": "tool-result", "tool": tool_call[0], **via(calls),
                          "command": command[:300], "written": written,
                          "compiler": tool_target(command), "stderr": err[:300]})
+            context = post_context(event, command, calls)
+            if context:
+                log(gd, {"kind": "hint", "text": context[:300], "command": command[:300]})
+                json.dump({"hookSpecificOutput": {"hookEventName": "PostToolUse",
+                                                  "additionalContext": context}}, sys.stdout)
             return 0
         if any(c[0] == "query" for c in calls):
             log(gd, {"kind": "query", **via(calls), "command": command[:300]})
@@ -578,11 +814,13 @@ def main():
                              "try: %s | override: append '# no-tool: <why the tools are not enough>'\n"
                              % (prog, files[0], edit_suggestion(prog, files, script)))
             return 2
-        fixtures = []
-        reads = source_reads(command, cwd, fixtures)
+        fixtures, small, scratch = [], [], []
+        reads = source_reads(command, cwd, fixtures, small, scratch)
         if not reads:
-            if fixtures:
-                log(gd, {"kind": "read-fixture", "program": fixtures[0][0], "command": command[:300]})
+            for kind, got in (("read-small", small), ("read-scratch", scratch), ("read-fixture", fixtures)):
+                if got:
+                    log(gd, {"kind": kind, "program": got[0][0], "command": command[:300]})
+                    break
             return 0
         esc = ESCAPE.search(command)
         if esc:
@@ -592,12 +830,11 @@ def main():
         if not query_ready(gd, cwd):
             log(gd, {"kind": "read-unenforced", "command": command[:300]})
             return 0
-        prog, args = reads[0]
-        log(gd, {"kind": "blocked",
-                 "program": prog, "command": command[:300]})
-        sys.stderr.write("blocked hook.query-first: %s on .tach source\n"
-                         "try: %s | override: append '# no-query: <why query is not enough>'\n"
-                         % (prog, suggestion(prog, args)))
+        prog, args, seg, files = reads[0]
+        message, tries = blocked_message(command, prog, args, seg, files, cwd)
+        log(gd, {"kind": "blocked", "program": prog, "command": command[:300],
+                 "segment": seg[:200], "try": tries})
+        sys.stderr.write(message)
         return 2
 
     if tool in ("Edit", "Write", "MultiEdit") and phase == "PreToolUse":

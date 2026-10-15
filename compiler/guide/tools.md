@@ -113,6 +113,33 @@ that adds an error writes nothing and prints the errors, each tagged
 it in the same `edit apply`, or run the refactoring the `try:` line
 names). `--dry-run` prints the diff instead; `--no-check` writes anyway.
 
+## Testing
+
+`tachyonc test` builds the program when a source changed and runs its
+cases: `tests/NAME.in` (stdin; none: empty) with `tests/NAME.out` (the
+expected stdout), next to `main.tach`; `tests/NAME.exit` holds an exit
+status other than 0. It prints the counts first, then each failing case
+with a few lines of difference, within about 1,000 tokens:
+
+```text
+$ tachyonc test
+test main.tach: 4 passed, 1 failed (tests/)
+FAIL big: stdout differs at line 3 (10 lines expected, 9 printed)
+  - 42 apples
+  - 43 pears
+  + 41 apples
+  + 43 pears
+(outputs: .tachyonc/test/NAME.got, NAME.err)
+```
+
+`tachyonc test big small` runs the cases whose names contain a word;
+`--full` every failure in full; `--input FILE` (`-`: stdin) one run,
+its output and exit status; `--timeout S` per case (10). Output is
+compared with `\r\n` as `\n` and trailing whitespace at the end left
+out. In the tachyon tree, `tachyonc test FILTER` rebuilds
+`target/tachyonc` when the source is newer and runs `tests/run.sh
+FILTER`, summarized the same way.
+
 ## Diagnostics
 
 Compiler errors, from `tachyonc check` or a build whose output is not a

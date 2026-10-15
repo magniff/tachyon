@@ -8,7 +8,12 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import sys
+import tempfile
+
+STATE = tempfile.mkdtemp()
+os.environ["TACHYON_HOOK_STATE"] = STATE
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 spec = importlib.util.spec_from_file_location("query_first", os.path.join(HERE, "query-first.py"))
@@ -21,16 +26,21 @@ hook.query_ready = lambda gd, cwd: True
 hook.git_dir = lambda cwd: "/nonexistent"
 
 
+OUT = [""]
+
+
 def run(event):
-    """The hook on event: (exit status, stderr, the records it logged)."""
+    """The hook on event: (exit status, stderr, the records it logged); its
+    stdout in OUT[0]."""
     LOGGED.clear()
-    stdin, stderr = sys.stdin, sys.stderr
-    sys.stdin, sys.stderr = io.StringIO(json.dumps(event)), io.StringIO()
+    stdin, stderr, stdout = sys.stdin, sys.stderr, sys.stdout
+    sys.stdin, sys.stderr, sys.stdout = io.StringIO(json.dumps(event)), io.StringIO(), io.StringIO()
     try:
         status = hook.main()
         err = sys.stderr.getvalue()
+        OUT[0] = sys.stdout.getvalue()
     finally:
-        sys.stdin, sys.stderr = stdin, stderr
+        sys.stdin, sys.stderr, sys.stdout = stdin, stderr, stdout
     return status, err, list(LOGGED)
 
 
@@ -62,9 +72,9 @@ st, err = blocked("sed -n '120,180p' compiler/src/gvn.tach")
 case("read sed -n", (st, "query show compiler/src/gvn.tach:120" in err), (True, True))
 case("read grep", blocked("grep -n 'fn run_gvn' compiler/src/gvn.tach")[0], True)
 st, err = blocked("sed -n '120,180p' examples/loops.tach")
-case("read sed -n example program", "try: tachyonc query text examples/loops.tach:120-180 |" in err, True)
+case("read sed -n example program", "try: tachyonc query text examples/loops.tach:120-180\n" in err, True)
 st, err = blocked("head -40 bench/calc.tach")
-case("read head program", "try: tachyonc query text bench/calc.tach:1-40 |" in err, True)
+case("read head program", "try: tachyonc query text bench/calc.tach:1-40\n" in err, True)
 st, err = blocked("cat examples/main.tach")
 case("read cat", "tachyonc query show examples/main.tach" in err, True)
 case("read a program outside tests", blocked("cat /home/u/proj/src/main.tach")[0], True)
@@ -91,8 +101,7 @@ case("read docs",blocked("grep -n edit docs/refactor.md")[0], False)
 # (0.14) Alternatives and regexes are never glued into one name.
 case("grep of alternatives: one query each",
      blocked("grep -n 'cmd_add\\|qty' compiler/src/a.tach")[1].split("\n")[1],
-     "try: tachyonc query refs cmd_add qty | tachyonc query grep cmd_add | tachyonc query grep qty"
-     " | override: append '# no-query: <why query is not enough>'")
+     "try: tachyonc query refs cmd_add qty | tachyonc query grep cmd_add | tachyonc query grep qty")
 case("grep -E of alternatives",
      "query refs Item calc | tachyonc query grep Item | tachyonc query grep calc"
      in blocked("grep -En 'Item|calc' compiler/src/a.tach")[1], True)
@@ -203,6 +212,10 @@ case("sed -i docs quoting a read", blocked(
      False)
 case("awk generating a program", blocked("awk -f tests/fuzz/gendiv.awk > target/fuzz/x.tach")[0], False)
 case("grep of a generated program", blocked("grep -c add target/fuzz/x.tach")[0], False)
+case("a script written by cat, then run: not a python rewrite (0.17)", blocked(
+    "cat > /tmp/x/t.py <<'EOF'\nopen('compiler/src/a.tach', 'w').write('x')\nEOF\npython3 -I /tmp/x/t.py")[0], False)
+case("python -c after an echo", blocked(
+    "echo hi; python3 -c \"open('compiler/src/a.tach', 'w').write('x')\"")[0], True)
 case("read with 2>&1", blocked("grep -n fn compiler/src/a.tach 2>&1")[0], True)
 
 # 0.12: the checkout and its shared git directory, without git; who logs.
@@ -237,6 +250,73 @@ with tempfile.TemporaryDirectory() as tmp:
         rec = json.loads(fh.readline())
     case("agent-feedback in a worktree", (out.stdout.strip(), rec["tool"], rec["message"], rec["worktree"]),
          ("recorded", "query", "a note", wt))
+
+
+# 0.17: each command of a line judged on its own, small files read whole,
+# probes and scratch copies are not source, variables and cds followed,
+# the try: lines logged; replies after the call (line numbers for Edit,
+# the repeat-query hint).
+with tempfile.TemporaryDirectory() as tmp:
+    tmp = os.path.realpath(tmp)
+    repo = os.path.join(tmp, "repo")
+    os.makedirs(os.path.join(repo, ".git"))
+    os.makedirs(os.path.join(repo, "compiler", "src", "front"))
+    big = "".join("fn f%d() {}\n" % i for i in range(400))
+    with open(os.path.join(repo, "compiler", "src", "front", "big.tach"), "w") as fh:
+        fh.write(big)
+    with open(os.path.join(repo, "compiler", "src", "small.tach"), "w") as fh:
+        fh.write("fn g() {}\n" * 20)
+    prog = os.path.join(tmp, "ws")
+    os.makedirs(os.path.join(prog, "scratch"))
+    for name, text in (("main.tach", "mod util;\nfn main() {}\n" + big), ("util.tach", big),
+                       ("probe.tach", big), ("scratch/diff.tach", big)):
+        with open(os.path.join(prog, name), "w") as fh:
+            fh.write(text)
+
+    def at(cwd, command, phase="PreToolUse", stdout=""):
+        return run({"hook_event_name": phase, "tool_name": "Bash", "cwd": cwd, "session_id": "qf-test",
+                    "tool_input": {"command": command}, "tool_response": {"stdout": stdout, "stderr": ""}})
+    st, err, recs = at(repo, "ls; cat compiler/src/front/big.tach; echo done")
+    case("per command: the reading one named", (st, err.splitlines()[0]),
+         (2, "blocked hook.query-first: `cat compiler/src/front/big.tach` (command 2 of 3 on the line; "
+             "the others are not blocked) reads .tach source"))
+    case("large file: its length and module", err.splitlines()[1].startswith(
+        "compiler/src/front/big.tach is 400 lines (a file under 300 is read whole freely): "
+        "`tachyonc query items crate::front::big` lists its items"), True)
+    case("blocked: the try lines logged", recs[-1].get("try"),
+         ["tachyonc query show compiler/src/front/big.tach (a whole small file) | tachyonc query text "
+          "compiler/src/front/big.tach:A-B", "tachyonc query items crate::front::big"])
+    st, err, recs = at(repo, "cat compiler/src/small.tach")
+    case("small file: read whole", (st, [r["kind"] for r in recs]), (0, ["read-small"]))
+    case("small file: sed -n", at(repo, "sed -n '1,5p' compiler/src/small.tach")[0], 0)
+    case("small file: grep is still a search", at(repo, "grep -n g compiler/src/small.tach")[0], 2)
+    case("a query on the line does not excuse a read",
+         at(repo, "tachyonc query show f; cat compiler/src/front/big.tach")[0], 2)
+    case("a query and ls: not blocked", at(repo, "tachyonc query items crate | head; ls compiler/src")[0], 0)
+    case("program: main.tach is source", at(prog, "cat main.tach")[0], 2)
+    case("program: a declared module is source", at(prog, "head -350 util.tach")[0], 2)
+    st, err, recs = at(prog, "head -6 scratch/diff.tach")
+    case("program: a scratch .tach is not", (st, [r["kind"] for r in recs]), (0, ["read-scratch"]))
+    case("program: a probe next to main.tach is not", at(prog, "cat probe.tach")[0], 0)
+    case("a variable on the line: scratch", at(repo, "S=/private/tmp/x/sp; cat $S/big.tach")[0], 0)
+    case("a variable on the line: source", at(tmp, "W=%s; cat $W/compiler/src/front/big.tach" % repo)[0], 2)
+    case("cd then a scratch file", at(repo, "cd %s && cat probe.tach" % prog)[0], 0)
+    case("cd then source", at(tmp, "cd repo && cat compiler/src/front/big.tach")[0], 2)
+    st, err, recs = at(repo, "sed -n '1,9p' compiler/src/front/big.tach  # no-query: need the line number for the Edit tool",
+                       "PostToolUse")
+    case("escape for Edit's line numbers: the reply", "edit insert --after NAME" in OUT[0]
+         and "query def NAME" in OUT[0], True)
+    for q in ("tachyonc query show run_gvn", "tachyonc query refs run_gvn"):
+        at(repo, q, "PostToolUse", "x\n")
+        case("repeat-query: not yet", OUT[0], "")
+    at(repo, "tachyonc query def run_gvn", "PostToolUse", "x\n")
+    hint = json.loads(OUT[0])["hookSpecificOutput"]["additionalContext"] if OUT[0] else ""
+    case("repeat-query: the hint, from hints.txt", hint,
+         hook.hs.hint("repeat-query", NAME="run_gvn", TACHYONC="tachyonc"))
+    case("repeat-query: the hint names context", "query context run_gvn" in hint, True)
+    at(repo, "tachyonc query show run_gvn", "PostToolUse", "x\n")
+    case("repeat-query: once per name", OUT[0], "")
+shutil.rmtree(STATE, ignore_errors=True)
 
 print("total", "ok" if FAILED == 0 else f"{FAILED} failed")
 sys.exit(1 if FAILED else 0)
