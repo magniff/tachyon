@@ -1,4 +1,3 @@
-## needs: 0.15 args
 ## The refactorings on calls with named and default arguments (0.15,
 ## tests/refactor/args015/): `--add 'x: T = V'` declares a default and
 ## leaves the calls; --fill-calls writes V, by label after a parameter

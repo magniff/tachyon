@@ -19,7 +19,7 @@ often than to something else; each error names the fix.
 | `x.to_string()`, `s.parse::<i64>()` | `Buf::push_int`; `std::parse_int(s)` (a `Result<i64, ParseIntError>`, 0.15) |
 | `s.trim()`, `s.split(',')`, `s.split_whitespace()` | `std::trim(s)`; `std::split(s, ',')`, `std::split_whitespace(s)`: a `Vec<[u8]>` of views of `s` (free it) |
 
-```tach 0.15 io
+```tach
 use std::{Buf, parse_int, split};
 
 fn main() -> i32 {
@@ -93,7 +93,7 @@ fn main() -> i32 {
 | `std::process::exit(n)` | `return n;` from `main`, or C's `exit` in `unsafe` |
 | `fn main() -> Result<(), E>` | the same (0.15): `Err(e)` prints `Error: ` and `e`'s Debug, exit 1 |
 
-```tach 0.15 try
+```tach
 enum Error { Empty, TooBig(i64) }
 
 fn check(n: i64) -> Result<i64, Error> {

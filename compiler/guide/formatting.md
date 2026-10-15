@@ -26,7 +26,7 @@ those three bytes (a literal holding `{name}` of a local passed to
 - Floats print the shortest text that reads back as the same value
   (`2.5`, `0.1`).
 
-```tach 0.15 fmt
+```tach
 fn main() -> i32 {
     let name = "tachyon";
     let n = 42;
@@ -47,7 +47,7 @@ tachyon has 42 and 2.5
 to stderr: 42-43
 ```
 
-```tach 0.15 fmt
+```tach
 fn next(c: *i64) -> i64 {
     *c += 1;
     *c
@@ -91,7 +91,7 @@ escaped: `"a\n"`), `Vec<T>`, `Option`, `Result` and `HashMap` (`[1, 2]`,
 `Some(5)`, `{1: 2}`). A slice `[T]` has no Debug (it would clash with
 `[u8]`'s): `std::debug_list(f, s)` writes one from a Debug impl.
 
-```tach 0.15 fmt derive
+```tach
 use std::Fmt;
 
 #[derive(Debug, Clone)]
@@ -149,7 +149,7 @@ derived trait and a hand-written impl of it clash: remove one.
 tuples of them) is a copy. `Clone` is in std for `Vec` (deep), `Buf`,
 `HashMap`, `Option`, `Result` and the primitives.
 
-```tach 0.15 derive fmt
+```tach
 use std::{HashMap, sort};
 
 #[derive(Eq, Ord, Hash, Debug)]

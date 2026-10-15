@@ -82,7 +82,7 @@ return are views of the text: keep the `Buf` until done with them. The
 next `read_line` overwrites the line, so to keep a part of it (a map's
 key), read all of stdin and take lines with `Scanner::next_line`.
 
-```tach 0.15 io
+```tach
 use std::{Buf, Scanner, parse_int, read_line, read_stdin, split_whitespace};
 
 fn main() -> i32 {

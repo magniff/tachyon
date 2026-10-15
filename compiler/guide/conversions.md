@@ -27,7 +27,7 @@ other: `a_i32 + b_i64` is an `i64`, `max(a_i32, b_i64)` is
 literals: `let t: i64 = a_i32 * b_i32` multiplies in `i64`, so the
 product cannot overflow `i32` first (C's bug, avoided).
 
-```tach 0.15 widen
+```tach
 fn total(xs: [i32]) -> i64 {
     let mut t: i64 = 0;
     for x in xs { t += x; }              // each i32 widens
@@ -58,7 +58,7 @@ Traits may have type parameters (0.15): `trait From<T> { fn from(x: T)
 impl per trait, arguments and type; `T::from(x)` picks the impl by the
 type of `x`.
 
-```tach 0.15 from
+```tach
 struct Celsius { deg: i64 }
 struct Fahrenheit { deg: i64 }
 
@@ -102,7 +102,7 @@ error as it is when `E` is the function's error type `F`, widened when
 Inside a closure it returns from the closure (give it `-> T`). `defer`s
 run, as for `return`.
 
-```tach 0.15 try from io
+```tach
 use std::{ParseIntError, parse_int};
 
 enum AppError { Parse(ParseIntError), Negative(i64) }
@@ -152,7 +152,7 @@ named: `x.ok_or(AppError::Missing)?`. std's `Option` has `ok_or`, `map`,
 `Err(e)` it prints `Error: ` and `e`'s Debug text on stderr and exits
 with 1, as Rust does.
 
-```tach 0.15 try derive fmt
+```tach
 #[derive(Debug)]
 enum ConfigError { Missing, Bad(i64) }
 
@@ -192,7 +192,7 @@ with an error enum means failure. std's input (0.15):
 InvalidDigit(i64), Overflow }`, `pub enum ScanError { End,
 Parse(ParseIntError) }`; each has Display and Debug.
 
-```tach 0.15 io
+```tach
 use std::{ScanError, Scanner, read_stdin};
 
 fn main() -> i32 {

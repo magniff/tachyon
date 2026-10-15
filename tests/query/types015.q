@@ -1,4 +1,3 @@
-## needs: 0.15 try widen fmt derive
 ## The checked syntax of 0.15 asked about (tests/query/types015/): the
 ## type of a `?` (its value's), of a widened value (as written, and what
 ## it is widened to), of a hole's expression; refs of a derived type

@@ -362,7 +362,7 @@ The closure borrows `j` (a `let mut`), which ends with the block: `move
 
 ## ?, conversions, arguments, formatting, derive (0.15)
 
-```tach 0.15 try
+```tach
 fn first(v: Option<i64>) -> i64 { let x = v?; x }
 ```
 ```err
@@ -372,18 +372,18 @@ Return `Option<i64>` (or `Result<i64, E>`), or `match` on the value.
 `?` on an Option inside a function returning a Result needs the error:
 `v.ok_or(MyError::Missing)?`.
 
-```tach 0.15 try io
+```tach
 use std::{ParseIntError, parse_int};
 enum AppError { Bad }
 fn read(s: [u8]) -> Result<i64, AppError> { let n = parse_int(s)?; Ok(n) }
 ```
 ```err
-'?' cannot convert 'ParseIntError' into 'AppError'
+'?' cannot convert the error 'ParseIntError' into 'AppError'
 ```
-The `try:` line is the impl to add: `impl From<ParseIntError> for
+The help is the impl to add: `impl From<ParseIntError> for
 AppError { fn from(e: ParseIntError) -> AppError { ... } }`.
 
-```tach 0.15 from
+```tach
 struct M { m: i64 }
 impl Into<M> for i64 { fn into(self: i64) -> M { M { m: self } } }
 ```
@@ -414,7 +414,7 @@ a default value is for a parameter of a function or an inherent method, not of a
 Defaults go on trailing parameters of `fn` items and inherent methods,
 not on trait or extern functions, closures or `fn` types.
 
-```tach 0.15 args
+```tach
 struct P { x: i64, y: i64 }
 fn main() -> i32 { let x = 1; let p = P { x, y }; p.x as i32 }
 ```
@@ -424,7 +424,7 @@ undefined variable 'y'
 The shorthand `P { x, y }` takes locals of the fields' names: write
 `y: VALUE`.
 
-```tach 0.15 derive
+```tach
 #[derive(Debg)]
 struct P { x: i64 }
 ```
@@ -436,7 +436,7 @@ hand). Deriving a trait and implementing it too is a coherence error
 whose help is `remove Ord from #[derive]`; deriving `Eq` needs `==` on
 every field.
 
-```tach 0.15 fmt
+```tach
 struct P { x: i64 }
 fn main() -> i32 { let p = P { x: 1 }; println(f"{p}"); 0 }
 ```

@@ -125,7 +125,7 @@ The last expression of a block, without `;`, is its value; `if`, `match`,
 Trailing parameters may have defaults; named arguments follow the
 positional ones, in parameter order (0.15):
 
-```tach 0.15 fmt args
+```tach
 fn greet(name: [u8], times: i64 = 1, sep: [u8] = " ") {
     for _ in 0..times { print(f"hi {name}{sep}"); }
     println("");
@@ -370,7 +370,7 @@ std prints and reads stdin: `read_stdin()` (all of it, a
 text), `parse_int` (a `Result`), `split`, `trim` (`guide conversions`:
 Option means absent, Result failed). Files go through C (`fopen`):
 
-```tach 0.15 io
+```tach
 import "string.h" as c;
 use std::{Scanner, read_stdin};
 

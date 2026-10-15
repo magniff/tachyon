@@ -48,10 +48,6 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-query.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 trap 'exit 130' INT TERM
 STATUS=0
-# (0.15: a transcript with a line `## needs: 0.15 FEATURE...` is skipped
-# while the compiler lacks one of the features, tests/needs015.sh)
-. "$ROOT/tests/needs015.sh"
-MISSING015=$(missing_015 "$COMPILER" "$WORK")
 
 # One run of `tachyonc query ARGS` (in $1, the line's ARGS), its output as
 # the transcript has it, into $WORK/run.
@@ -107,11 +103,6 @@ transcript() {
 for file in "$HERE"/*.q; do
     [ -f "$file" ] || continue
     name=$(basename "$file" .q)
-    needs=$(sed -n 's/^## needs: //p' "$file" | head -1)
-    if [ -n "$needs" ] && ! needs_ok_015 "$MISSING015" - $needs; then
-        echo "skip $name (needs $needs; the compiler lacks: $MISSING015)"
-        continue
-    fi
     for mode in off cache; do
         transcript "$file" $mode >"$WORK/$name.got"
         if [ $UPDATE -eq 1 ] && [ $mode = off ]; then

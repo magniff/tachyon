@@ -1,4 +1,3 @@
-## needs: 0.15 io
 ## tachyonc fix --only std015 on a program written against 0.14's std
 ## (tests/refactor/std015run/, whose output under 0.14 is below): with
 ## 0.15's std it does not compile, migrated it prints what it printed
