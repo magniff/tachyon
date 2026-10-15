@@ -22,6 +22,7 @@ use crate::tools::rewrite::parsed::{
     binding_level, pa, pb, pc, pchild, pcount, pd, pend, pflags, pg, ph, pk, pop, pstart,
     same_tokens,
 };
+use crate::tools::rewrite::regex::{re_search, re_valid};
 
 // ---- Holes ----
 
@@ -32,6 +33,16 @@ pub static mut H_SYM: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 pub static mut H_NAME: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 pub static mut H_REST: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 pub static mut H_TYPE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// (0.16) Per hole: 1 when it matches names only (`--where '$x: name'`,
+// `$x~/re/`), and the regular expression the name must match (a buffer;
+// -1: any); 1 when it is a new name of the replacement (`for $x in`, not
+// in the pattern), and its name at the site being replaced (a buffer).
+pub static mut H_NAMEONLY: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut H_RE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut H_FRESH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut FRESH_TEXT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// Whether holes_to_idents takes holes it does not know as new names.
+pub static mut FRESH_OK: bool = false;
 
 // What each hole matched at the site being tried: B_NODE the node (-1:
 // nothing yet, -2: arguments, from B_START to B_END; -3: no arguments).
@@ -114,6 +125,30 @@ pub fn holes_to_idents(text: *u8, out: i64, add: bool) -> bool {
             }
             let name = s[i..e];
             let rest = e + 3 <= s.len && s[e] == '.' && s[e + 1] == '.' && s[e + 2] == '.';
+            // (0.16: `$x~/re/`, a name matching re)
+            let mut re = -1;
+            let mut after_re = e;
+            if !rest && e + 1 < s.len && s[e] == '~' && s[e + 1] == '/' {
+                let mut j = e + 2;
+                let text = buf_new();
+                while j < s.len && s[j] != '/' {
+                    if s[j] == '\\' && j + 1 < s.len && s[j + 1] == '/' {
+                        j += 1;
+                    }
+                    buf_byte(text, s[j]);
+                    j += 1;
+                }
+                if j >= s.len || !add || !re_valid(buf_slice(text)) {
+                    let d = diag(c"error", c"rewrite.pattern");
+                    buf_bytes(d, name);
+                    buf_str(d,
+                        if !add { c"~/re/: a name hole's expression goes in the pattern\n" }
+                        else { c"~/re/: write a regular expression between the slashes (^ $ . * + ? [a-z] \\d \\w)\n" });
+                    return false;
+                }
+                re = text;
+                after_re = j + 1;
+            }
             let ident = buf_new();
             buf_str(ident, if rest { c"__tachyon_rest_" } else { c"__tachyon_hole_" });
             buf_bytes(ident, s[i + 1..e]);
@@ -125,7 +160,7 @@ pub fn holes_to_idents(text: *u8, out: i64, add: bool) -> bool {
                     buf_str(d, c" is written both with and without '...'\n");
                     return false;
                 }
-                if !add {
+                if !add && (!FRESH_OK || rest) {
                     let d = diag(c"error", c"rewrite.unbound");
                     buf_str(d, c"the replacement's ");
                     buf_bytes(d, name);
@@ -142,9 +177,20 @@ pub fn holes_to_idents(text: *u8, out: i64, add: bool) -> bool {
                 H_NAME.push(nb);
                 H_REST.push(rest as i64);
                 H_TYPE.push(-1);
+                H_NAMEONLY.push(0);
+                H_RE.push(-1);
+                H_FRESH.push(if add { 0 } else { 1 });
+                FRESH_TEXT.push(-1);
+            }
+            if re >= 0 {
+                H_NAMEONLY.data[h] = 1;
+                H_RE.data[h] = re;
             }
             buf_bytes(out, buf_slice(ident));
             i = if rest { e + 3 } else { e };
+            if re >= 0 {
+                i = after_re;
+            }
         }
         true
     }
@@ -299,6 +345,18 @@ fn bind(h: i64, n: i64) -> bool {
         if B_NODE.data[h] != -1 {
             return B_NODE.data[h] >= 0
                 && same_tokens(B_START.data[h], B_END.data[h], pstart(n), pend(n));
+        }
+        // (0.16: a name hole: an identifier or a path, its text matching
+        // the hole's expression)
+        if H_NAMEONLY.data[h] != 0 {
+            let k = pk(n);
+            if k != NodeKind::Ident && k != NodeKind::Path && k != NodeKind::TyName
+                && k != NodeKind::PatBind {
+                return false;
+            }
+            if H_RE.data[h] >= 0 && !re_search(buf_slice(H_RE.data[h]), SRC[pstart(n)..pend(n)]) {
+                return false;
+            }
         }
         B_NODE.data[h] = n;
         B_START.data[h] = pstart(n);
@@ -574,6 +632,105 @@ pub static mut DROPPED: i64 = 0;
 pub static mut DROP_USE: i64 = 0;
 pub static mut DROP_HOLE: i64 = 0;
 
+// (0.16) At the site being replaced: the substitutions --subst makes in
+// the text of its holes (start, end, text: a buffer; by position, none
+// inside another); where it starts, and whether its text has lines.
+pub static mut SUB_START: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut SUB_END: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut SUB_TEXT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut SITE_START: i64 = 0;
+pub static mut SITE_MULTI: bool = false;
+// (0.16) The replacement written on several lines: the indentation its
+// lines after the first share (they take the site's instead); -1 when it
+// is one line.
+pub static mut R_BASE_INDENT: i64 = -1;
+
+// Whether position pos is inside a substitution of the site.
+fn in_sub(pos: i64) -> bool {
+    unsafe {
+        for i in 0..SUB_START.count {
+            if SUB_START.data[i] <= pos && pos < SUB_END.data[i] {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// The text hole h stands for at the site, into out: a new name's, else
+// what it matched with the substitutions made in it.
+fn put_bound(out: i64, h: i64) {
+    unsafe {
+        if H_FRESH.data[h] != 0 {
+            buf_bytes(out, buf_slice(FRESH_TEXT.data[h]));
+            return;
+        }
+        let mut cur = B_START.data[h];
+        let end = B_END.data[h];
+        for i in 0..SUB_START.count {
+            let s = SUB_START.data[i];
+            if s < cur || SUB_END.data[i] > end {
+                continue;
+            }
+            buf_bytes(out, SRC[cur..s]);
+            buf_bytes(out, buf_slice(SUB_TEXT.data[i]));
+            cur = SUB_END.data[i];
+        }
+        buf_bytes(out, SRC[cur..end]);
+    }
+}
+
+// The replacement's lines: the indentation they share after the first
+// (R_BASE_INDENT; -1 when it has one line).
+pub fn note_base_indent() {
+    unsafe {
+        R_BASE_INDENT = -1;
+        let mut i = R_START;
+        while i < R_END {
+            if SRC[i] == '\n' {
+                let mut j = i + 1;
+                while j < R_END && SRC[j] == ' ' {
+                    j += 1;
+                }
+                if j < R_END && SRC[j] != '\n' && (R_BASE_INDENT < 0 || j - i - 1 < R_BASE_INDENT) {
+                    R_BASE_INDENT = j - i - 1;
+                }
+            }
+            i += 1;
+        }
+    }
+}
+
+// Copies the replacement's source from..to into out; on several lines,
+// each line after the first indented from the site's line instead of
+// R_BASE_INDENT.
+fn copy_source(out: i64, from: i64, to: i64) {
+    unsafe {
+        if R_BASE_INDENT < 0 {
+            buf_bytes(out, SRC[from..to]);
+            return;
+        }
+        let mut i = from;
+        while i < to {
+            buf_byte(out, SRC[i]);
+            if SRC[i] == '\n' {
+                let mut j = i + 1;
+                let mut skipped = 0;
+                while j < to && SRC[j] == ' ' && skipped < R_BASE_INDENT {
+                    j += 1;
+                    skipped += 1;
+                }
+                if j < to && SRC[j] != '\n' {
+                    put_indent(out, SITE_START);
+                }
+                i = j;
+                continue;
+            }
+            i += 1;
+        }
+    }
+}
+
 // The list node holding replacement node q as an element, and its index
 // (-1 when none).
 fn list_of(q: i64, index: *i64) -> i64 {
@@ -641,12 +798,14 @@ pub fn replacement_text() -> i64 {
             if wrap {
                 buf_byte(out, '(');
             }
-            let text = SRC[B_START.data[h]..B_END.data[h]];
-            buf_bytes(out, text);
+            let at_text = BUFS[out].len;
+            put_bound(out, h);
+            let empty = BUFS[out].len == at_text;
+            let last = if empty { ' ' } else { BUFS[out].data[BUFS[out].len - 1] };
             if wrap {
                 buf_byte(out, ')');
             }
-            if at != q && text.len > 0 && text[text.len - 1] != ';' && text[text.len - 1] != '}' {
+            if at != q && !empty && last != ';' && last != '}' {
                 // (`$s...;` for statements ending in a tail expression)
                 buf_byte(out, ';');
             }
@@ -679,8 +838,21 @@ pub fn note_breaks(first: i64, last: i64) {
                     h = e;
                 }
             }
-            if h < 0 {
+            // (0.16: a block written on lines keeps them; one on a line
+            // takes the site's lines: with a `$s...`, its block's, else
+            // the site's, by its depth in the replacement)
+            if has_newline(block_open(n), pend(n)) || (h < 0 && seq_len(n) == 0) {
                 continue;
+            }
+            if h < 0 {
+                let mut depth = 1;
+                for m in first..last {
+                    if m != n && pk(m) == NodeKind::Block && pstart(m) <= pstart(n)
+                        && pend(n) <= pend(m) {
+                        depth += 1;
+                    }
+                }
+                h = -1 - depth;
             }
             for i in 0..seq_len(n) + 1 {
                 let close = i == seq_len(n);
@@ -722,12 +894,30 @@ fn copy_laid(out: i64, from: i64, to: i64, at_end: bool) {
             }
             BREAK_NEXT += 4;
             let h = R_BREAKS.data[k + 1];
+            if h < 0 {
+                // (a block without `$s...`: the site's lines)
+                if at < from || !SITE_MULTI {
+                    continue;
+                }
+                copy_source(out, cur, at);
+                cur = at;
+                while BUFS[out].len > 0 && BUFS[out].data[BUFS[out].len - 1] == ' ' {
+                    BUFS[out].len -= 1;
+                }
+                buf_byte(out, '\n');
+                put_indent(out, SITE_START);
+                let levels = -1 - h - R_BREAKS.data[k + 2];
+                for _ in 0..levels {
+                    buf_str(out, c"    ");
+                }
+                continue;
+            }
             let block = B_LIST.data[h];
             if at < from || block <= 0 || !has_newline(block_open(block), pend(block))
                 || (B_NODE.data[h] == -3 && R_BREAKS.data[k + 3] == 1) {
                 continue;
             }
-            buf_bytes(out, SRC[cur..at]);
+            copy_source(out, cur, at);
             cur = at;
             while BUFS[out].len > 0 && BUFS[out].data[BUFS[out].len - 1] == ' ' {
                 BUFS[out].len -= 1;
@@ -742,12 +932,12 @@ fn copy_laid(out: i64, from: i64, to: i64, at_end: bool) {
                 buf_str(out, c"    ");
             }
         }
-        buf_bytes(out, SRC[cur..to]);
+        copy_source(out, cur, to);
     }
 }
 
 // Whether SRC[from..to) has a line break.
-fn has_newline(from: i64, to: i64) -> bool {
+pub fn has_newline(from: i64, to: i64) -> bool {
     for i in from..to {
         if unsafe { SRC[i] } == '\n' {
             return true;
@@ -784,7 +974,7 @@ pub fn dropped_use(program_end: i64, hole: *i64) -> i64 {
             }
             let sym = pa(b);
             for n in 1..program_end {
-                if pk(n) != NodeKind::Ident || pa(n) != sym {
+                if pk(n) != NodeKind::Ident || pa(n) != sym || in_sub(pstart(n)) {
                     continue;
                 }
                 for k in 0..H_SYM.count {

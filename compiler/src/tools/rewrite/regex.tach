@@ -1,0 +1,157 @@
+// The regular expressions of a rewrite's name holes (0.16: `$x~/re/`,
+// `--where '$x: name ~ re'`): `^` and `$` anchor, `.` any byte, `[a-z_]`
+// and `[^...]` classes, `\d` a digit, `\w` a name's byte, `\x` the byte
+// x; `*`, `+` and `?` after any of them. A match is anywhere in the text
+// unless anchored. Backtracking, for the short texts of names.
+
+// Whether re is well formed (classes closed, no repeat without an atom,
+// no `\` at the end).
+pub fn re_valid(re: [u8]) -> bool {
+    let mut r = if re.len > 0 && re[0] == '^' { 1 } else { 0 };
+    while r < re.len {
+        if re[r] == '$' && r + 1 == re.len {
+            return true;
+        }
+        if re[r] == '*' || re[r] == '+' || re[r] == '?' {
+            return false;
+        }
+        let e = atom_end(re, r);
+        if e < 0 {
+            return false;
+        }
+        r = e;
+        if r < re.len && (re[r] == '*' || re[r] == '+' || re[r] == '?') {
+            r += 1;
+        }
+    }
+    true
+}
+
+// Whether re matches somewhere in text.
+pub fn re_search(re: [u8], text: [u8]) -> bool {
+    if re.len > 0 && re[0] == '^' {
+        return match_here(re, 1, text, 0);
+    }
+    for i in 0..text.len + 1 {
+        if match_here(re, 0, text, i) {
+            return true;
+        }
+    }
+    false
+}
+
+// The end of the atom at re[r] (a byte, `.`, `\x`, a class), or -1.
+fn atom_end(re: [u8], r: i64) -> i64 {
+    if re[r] == '\\' {
+        return if r + 1 < re.len { r + 2 } else { -1 };
+    }
+    if re[r] != '[' {
+        return r + 1;
+    }
+    let mut i = r + 1;
+    if i < re.len && re[i] == '^' {
+        i += 1;
+    }
+    // (a `]` first is a byte of the class)
+    if i < re.len && re[i] == ']' {
+        i += 1;
+    }
+    while i < re.len && re[i] != ']' {
+        if re[i] == '\\' {
+            i += 1;
+        }
+        i += 1;
+    }
+    if i < re.len { i + 1 } else { -1 }
+}
+
+fn is_digit(c: u8) -> bool {
+    c >= '0' && c <= '9'
+}
+
+fn is_word(c: u8) -> bool {
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || is_digit(c) || c == '_'
+}
+
+// Whether `\x` matches byte c.
+fn escape_matches(x: u8, c: u8) -> bool {
+    if x == 'd' {
+        is_digit(c)
+    } else if x == 'w' {
+        is_word(c)
+    } else {
+        c == x
+    }
+}
+
+// Whether the atom re[r..e) matches byte c.
+fn atom_matches(re: [u8], r: i64, e: i64, c: u8) -> bool {
+    let a = re[r];
+    if a == '.' {
+        return true;
+    }
+    if a == '\\' {
+        return escape_matches(re[r + 1], c);
+    }
+    if a != '[' {
+        return a == c;
+    }
+    let mut i = r + 1;
+    let negated = re[i] == '^';
+    if negated {
+        i += 1;
+    }
+    let mut found = false;
+    let mut first = true;
+    while i < e - 1 && (first || re[i] != ']') {
+        first = false;
+        if re[i] == '\\' && i + 1 < e - 1 {
+            if escape_matches(re[i + 1], c) {
+                found = true;
+            }
+            i += 2;
+        } else if i + 2 < e - 1 && re[i + 1] == '-' {
+            if c >= re[i] && c <= re[i + 2] {
+                found = true;
+            }
+            i += 3;
+        } else {
+            if re[i] == c {
+                found = true;
+            }
+            i += 1;
+        }
+    }
+    found != negated
+}
+
+// Whether re[r..] matches text t from position i on.
+fn match_here(re: [u8], r: i64, t: [u8], i: i64) -> bool {
+    if r == re.len {
+        return true;
+    }
+    if re[r] == '$' && r + 1 == re.len {
+        return i == t.len;
+    }
+    let e = atom_end(re, r);
+    if e < 0 {
+        return false;
+    }
+    if e < re.len && (re[e] == '*' || re[e] == '+' || re[e] == '?') {
+        let op = re[e];
+        let least = if op == '+' { 1 } else { 0 };
+        let most = if op == '?' { 1 } else { t.len - i };
+        let mut n = 0;
+        while n < most && i + n < t.len && atom_matches(re, r, e, t[i + n]) {
+            n += 1;
+        }
+        while n >= least {
+            if match_here(re, e + 1, t, i + n) {
+                return true;
+            }
+            n -= 1;
+        }
+        return false;
+    }
+    i < t.len && atom_matches(re, r, e, t[i]) && match_here(re, e, t, i + 1)
+}

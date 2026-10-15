@@ -20,6 +20,7 @@ tachyonc query text FILE[:A[-B]]...                         (no program read)
 tachyonc query diff [ROOT]                                  the last journaled edit
 tachyonc query refs NAME... [--root ROOT] [--exact] [--count] [--in FILE|MODULE] [--kind K,...] [--limit N] [--all]
 tachyonc query callers NAME... [--root ROOT] [--exact] [--count] [--in FILE|MODULE] [--limit N] [--all]
+tachyonc query callees FN... [--transitive] [--writes TABLE] [--count] [--limit N] [--all]   (0.16)
 tachyonc query items [MODULE...] [--root ROOT] [--comments]
 tachyonc query show MODULE::section TITLE                   (0.13)
 tachyonc query grep PATTERN... [--in FILE|MODULE] [--code] [--comments] [--strings] [--word] [--count] [--limit N] [--all]
@@ -67,6 +68,8 @@ One line of grammar per kind of line (`\t` is a TAB; `[...]` optional):
 | refs, callers | reference | `LINE:COL \t (def \| REFKIND \t ENCLOSING) [\t ->TARGET] \t SOURCE` |
 | refs, callers, grep, > 60 | summary | `FILE \t COUNT`, then `note query.truncated` |
 | refs, callers `--count` | count | `COUNT`, or `COUNT \t PATH` per definition when several match |
+| callees (0.16) | callee | `DEPTH \t call\|ref \t PATH \t FILE:LINE [\t via CALLER]` |
+| callees `--writes` (0.16) | place | `# FILE`, then `LINE:COL \t write\|borrow \t FN > ... > F \t SOURCE` |
 | grep | file header, hit | `# FILE`; `LINE:COL \t (code \| comment \| string) \t ENCLOSING \t SOURCE` |
 | type | type | `TYPE \t EXPRESSION` |
 | context | item | the show header (`\t section: TITLE` when in one), source, then `// calls (N)`, `// types (N)`, `// uses (N)` with def lines, `// callers (N)` with `ENCLOSING \t FILE:LINE:COL \t SOURCE` |
@@ -336,6 +339,22 @@ references.
   line's module), or (0.13) a directory, by whole components
   (`compiler/src/front/`, `front/check`).
 - None left: `note query.empty: 0 refs` (exit 0).
+- (0.16) A local variable or a parameter: `FN::x` (every local named
+  `x` in FN: the one a `let` shadows and the one shadowing it too), or
+  `FILE:LINE:COL` at its declaration or at a use (as `refactor rename`
+  takes a local). Its declaration is `def`, an assignment to it (or into
+  it: `x.f = 1`, `x[i] += 1`) `write`, any other use `read`; `--kind`,
+  `--count` and `--in` apply. A FILE:LINE:COL that is on no local is
+  answered as before (the item holding the line). Locals are what the
+  checker resolved, so these read the program in full (no cache).
+
+```
+$ tachyonc query refs sum::total
+# calls016/main.tach
+12:13→def→let mut total = 0;
+15:9→write→sum→total += i;
+17:13→read→sum→total = total * 2;
+```
 
 ### The budget
 
@@ -355,6 +374,41 @@ try: target/tachyonc query refs IntVec::push --all
 (the `--in` suggestion is the file with the most). `--limit N` lists the
 first N, then `note query.truncated: showing N of M refs`; `--all` lists
 everything.
+
+## callees (0.16)
+
+`callees FN` lists the functions FN calls and the functions it names as
+values (a function passed as `fn(..)`: it may be called through the
+pointer), one per line: `DEPTH→call|ref→PATH→FILE:LINE` (where the
+callee is defined). `--transitive` follows them: every function reachable
+so, by depth, each from depth 2 on with `via CALLER`, the function it was
+first reached from. They come from the references the checker resolved
+(each counted for the innermost item holding it); a call through a
+function pointer is not followed, the function named where the pointer
+was made is. Past 100 lines, `note query.truncated` and `--all`;
+`--count` the number.
+
+```
+$ tachyonc query callees add_and_sum --transitive
+1→call→sum→calls016/main.tach:11
+1→call→table::grow→calls016/table.tach:6
+2→call→table::peek→calls016/table.tach:19→via sum
+2→call→table::put→calls016/table.tach:12→via table::grow
+```
+
+`--writes TABLE` (a static or a field) answers whether FN can change
+TABLE: the places in FN and every function it reaches that write it (an
+assignment to it, or into it: `TABLE.count = 0`, `TABLE.data[i] = x`) or
+borrow it (`&TABLE`, and a method taking `self: *T` called on it, as
+`TABLE.push(x)`: it may grow), each with the chain of calls from FN.
+None: `note query.empty: FN reaches no write or borrow of TABLE (N
+functions reached ...)`.
+
+```
+$ tachyonc query callees main --writes TABLE
+# calls016/table.tach
+8:14→borrow→main > add_and_sum > table::grow→put(&TABLE, x);
+```
 
 ## context (0.15)
 

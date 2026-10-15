@@ -48,6 +48,8 @@ mod stdq;
 mod budget;
 mod context;
 mod derived;
+mod callees;
+mod locals;
 
 use crate::host_target;
 use crate::base::{
@@ -93,12 +95,14 @@ use typeat::query_type;
 
 use budget::{OPT_BUDGET, begin_output, end_output};
 use cache::{cache_restore, cache_save};
+use callees::{OPT_TRANSITIVE, OPT_WRITES, query_callees};
 use context::{context_module, query_context, query_context_module};
 use crate::base::timer::{
     TIME_PASSES, T_ANSWER, T_CHECK, T_INDEX, T_LOAD, T_PARSE, timer_add, timer_now, timer_report,
 };
 use crate::tools::conflicts::run_conflicts;
 use derived::{collect_derive_spans, derived_note};
+use locals::{QUERY_ARGV, full_requested, has_column, local_refs};
 use names::{canonical_name, is_name_char, is_symbol, item_below, module_def, path_matches};
 use stdq::{all_std, ask_with_std, names_std, std_requested, std_root, wants_std};
 
@@ -318,6 +322,7 @@ fn put_usage(out: i64) {
         buf_str(out, c"       tachyonc query text FILE[:A[-B]]...\n");
         buf_str(out, c"       tachyonc query diff\n");
         buf_str(out, c"       tachyonc query refs|callers NAME... [--exact] [--count] [--in FILE|MODULE] [--limit N] [--all]\n");
+        buf_str(out, c"       tachyonc query callees FN... [--transitive] [--writes TABLE] [--count] [--limit N] [--all]\n");
         buf_str(out, c"       tachyonc query items [MODULE...] [--comments]\n");
         buf_str(out, c"       tachyonc query show MODULE::section TITLE\n");
         buf_str(out, c"       tachyonc query grep PATTERN... [--in FILE|MODULE] [--code] [--comments] [--strings] [--word] [--count] [--limit N] [--all]\n");
@@ -340,14 +345,15 @@ fn usage_error() -> i64 {
     unsafe { diag(c"error", c"query.usage") }
 }
 
-const N_COMMANDS: i64 = 15;
+const N_COMMANDS: i64 = 16;
 
 fn command_name(i: i64) -> *u8 {
     if i == 0 { c"def" } else if i == 1 { c"show" } else if i == 2 { c"refs" }
     else if i == 3 { c"callers" } else if i == 4 { c"items" } else if i == 5 { c"stats" }
     else if i == 6 { c"deps" } else if i == 7 { c"unused" } else if i == 8 { c"impact" }
     else if i == 9 { c"text" } else if i == 10 { c"diff" } else if i == 11 { c"grep" }
-    else if i == 12 { c"type" } else if i == 13 { c"context" } else { c"conflicts" }
+    else if i == 12 { c"type" } else if i == 13 { c"context" } else if i == 14 { c"callees" }
+    else { c"conflicts" }
 }
 
 // The command nearest to cmd (edit distance at most 2), or 0.
@@ -410,6 +416,7 @@ fn run_query_inner(argc: i64, argv: **u8) -> i64 {
         }
         let cmd = argv[2];
         CMD = cmd;
+        QUERY_ARGV = argv;
         // (0.15: merge conflicts, read as text: conflicts.tach)
         if streq(cmd, c"conflicts") {
             return run_conflicts(argc, argv);
@@ -429,9 +436,11 @@ fn run_query_inner(argc: i64, argv: **u8) -> i64 {
             let a = argv[i];
             let valued = streq(a, c"--in") || streq(a, c"--limit") || streq(a, c"--root")
                 || streq(a, c"--over") || streq(a, c"--max-lines") || streq(a, c"--kind")
-                || streq(a, c"--budget");
+                || streq(a, c"--budget") || streq(a, c"--writes");
             if streq(a, c"--count") {
                 OPT_COUNT = true;
+            } else if streq(a, c"--transitive") {
+                OPT_TRANSITIVE = true;
             } else if streq(a, c"--exact") {
                 OPT_EXACT = true;
             } else if streq(a, c"--all") {
@@ -462,6 +471,9 @@ fn run_query_inner(argc: i64, argv: **u8) -> i64 {
                 } else if streq(a, c"--kind") {
                     OPT_KIND = argv[i + 1];
                     i += 1;
+                } else if streq(a, c"--writes") {
+                    OPT_WRITES = argv[i + 1];
+                    i += 1;
                 } else {
                     let n = parse_count(argv[i + 1]);
                     if n < 0 {
@@ -486,7 +498,8 @@ fn run_query_inner(argc: i64, argv: **u8) -> i64 {
             i += 1;
         }
         let items = streq(cmd, c"items");
-        let is_refs = streq(cmd, c"refs") || streq(cmd, c"callers") || streq(cmd, c"grep");
+        let is_refs = streq(cmd, c"refs") || streq(cmd, c"callers") || streq(cmd, c"grep")
+            || streq(cmd, c"callees");
         if !is_query_command(cmd) {
             let out = usage_error();
             buf_str(out, c"unknown command '");
@@ -601,8 +614,17 @@ fn run_query_inner(argc: i64, argv: **u8) -> i64 {
         }
         STD_ALWAYS = with_std;
         let context = streq(cmd, c"context");
+        // (0.16: a local, by FILE:LINE:COL or asked again in full, needs
+        // the nodes: locals.tach)
+        let mut at_column = false;
+        for k in 0..args.count {
+            if streq(cmd, c"refs") && has_column(c_slice(args.data[k] as *u8)) {
+                at_column = true;
+            }
+        }
         let cacheable = (streq(cmd, c"def") || streq(cmd, c"show") || streq(cmd, c"refs")
-            || streq(cmd, c"callers") || items || context) && !with_std;
+            || streq(cmd, c"callers") || items || context) && !with_std && !at_column
+            && !full_requested();
         let cached = cacheable && cache_restore(root, 0, is_refs || context);
         if !cached && !load_program(root, 0) {
             // (nothing to answer with: the errors say why)
@@ -864,6 +886,24 @@ fn answer(cmd: *u8, args: *IntVec, items: bool, is_refs: bool) -> i64 {
         if streq(cmd, c"grep") {
             return query_grep(args);
         }
+        if streq(cmd, c"callees") {
+            // (0.16: callees.tach)
+            let mut fns = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            for i in 0..n {
+                let mut matches = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+                if !resolve_name(cmd, c_slice((*args).data[i] as *u8), &matches) {
+                    return 1;
+                }
+                for j in 0..matches.count {
+                    push_once(&fns, matches.data[j]);
+                }
+            }
+            let mut table = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            if OPT_WRITES != 0 as *u8 && !resolve_name(cmd, c_slice(OPT_WRITES), &table) {
+                return 1;
+            }
+            return query_callees(&fns, c_slice((*args).data[0] as *u8), &table);
+        }
         if streq(cmd, c"context") {
             // (0.15: context.tach)
             let mut status = 0;
@@ -916,6 +956,16 @@ fn answer(cmd: *u8, args: *IntVec, items: bool, is_refs: bool) -> i64 {
                 if r >= 0 {
                     if r != 0 {
                         status = 1;
+                    }
+                    continue;
+                }
+            }
+            if streq(cmd, c"refs") {
+                // (0.16: a local, `FN::x` or FILE:LINE:COL)
+                let r = local_refs(text);
+                if r >= 0 {
+                    if r != 0 {
+                        status = r;
                     }
                     continue;
                 }
