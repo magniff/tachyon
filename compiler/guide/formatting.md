@@ -25,6 +25,11 @@ those three bytes (a literal holding `{name}` of a local passed to
   binary, `c` a `u8` as its byte (a `u8` is a number otherwise).
 - Floats print the shortest text that reads back as the same value
   (`2.5`, `0.1`).
+- (0.17) Passed straight to `print`, `println`, `eprint`, `eprintln`,
+  `format_in` or `b.push_fmt`, an f-string is written in place: no
+  closure, no `Interp`, no copy of the function, at every `-O` level.
+  Through a function of your own taking `T: Display`, each f-string is
+  a new copy of that function (and of what it calls).
 
 ```tach
 fn main(gpa: Gpa) -> i32 {

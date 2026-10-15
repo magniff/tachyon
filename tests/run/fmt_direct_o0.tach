@@ -1,0 +1,122 @@
+// (0.17) An f-string passed straight to print, println, eprint, eprintln,
+// format_in or Buf::push_fmt is written in place (front/check/interp.tach,
+// direct_call): its holes are evaluated once, left to right, where the
+// call is (push_fmt's receiver first, format_in's allocator last), then
+// the Fmt calls run; push_fmt and format_in run the writes again when the
+// text did not fit, with the holes' values kept. fmt_direct at -O0 (no
+// inlining: the writes are calls).
+// FLAGS: -O0
+// EXPECT: [1] n=7 x=ff b=101 |  ab|ab  | -42|0042|3.14|[u8]="q\"t"|p=(3, 4)|q=(5, 6)|c=Z
+// EXPECT: raw (5, 6) Point { x: 5, y: 6 }
+// EXPECT: [2] plain
+// EXPECT: log 34 count 0 log 1234
+// EXPECT: push: 12345678901234567890123456789012345678901234567890-r7-8-9-(3, 4)-end
+// EXPECT: displays 2
+// EXPECT: log 6789 after push, len 74
+// EXPECT: big 300 xxxxx...yyyyy log 1011
+// EXPECT: small [13|14] len 7 log 1314
+// EXPECT: nested <a5b>
+// EXPECT: wide [         7]
+// EXPECT: printed no newline
+// STDERR: [e] 15 err
+// STDERR: [e2] Some(16)
+use std::{Buf, Display, Fmt, Gpa, eprint, eprintln, format_in, print, println};
+
+static mut LOG: i64 = 0;
+static mut COUNT: i64 = 0;
+
+// k, noted in LOG (its digits appended): the order the holes ran in.
+fn note(k: i64) -> i64 {
+    unsafe {
+        LOG = if k >= 10 { LOG * 100 + k } else { LOG * 10 + k };
+    }
+    k
+}
+
+fn take_log() -> i64 {
+    unsafe {
+        let l = LOG;
+        LOG = 0;
+        l
+    }
+}
+
+#[derive(Debug)]
+struct Point { x: i64, y: i64 }
+
+impl Display for Point {
+    fn fmt(self: *Point, f: *Fmt) {
+        unsafe {
+            COUNT += 1;
+        }
+        f.str("(");
+        f.display(&self.x);
+        f.str(", ");
+        f.display(&self.y);
+        f.str(")");
+    }
+}
+
+fn pick(b: *Buf<Gpa>) -> *Buf<Gpa> {
+    note(6);
+    b
+}
+
+fn main(gpa: Gpa) {
+    let n = 7;
+    let s: [u8] = "q\"t";
+    let p = Point { x: 3, y: 4 };
+    let q = Point { x: 5, y: 6 };
+    let pp: *Point = &q;
+    let c: u8 = 'Z';
+    let ab: [u8] = "ab";
+    let ten: [u8] = "1234567890";
+    println(
+        f"[{note(1)}] n={n} x={255:x} b={5:b} |{ab:>4}|{ab:<4}|{-42:>4}|{42:04}|{3.14159:.2}|[u8]={s:?}|p={p}|q={&q}|c={c:c}");
+    unsafe {
+        println(f"raw {pp} {pp:?}");
+    }
+    println(f"[{note(2)}] plain");
+    unsafe {
+        COUNT = 0;
+    }
+    print(f"log {note(3)}{note(4)}");
+    unsafe {
+        println(f" count {COUNT} log {take_log()}");
+    }
+    // push_fmt into a Buf with no room: the writes run twice, the holes once.
+    let mut b: Buf<Gpa> = Buf::new_in(gpa);
+    b.push_fmt(f"push: ");
+    unsafe {
+        COUNT = 0;
+        pick(&b).push_fmt(f"{ten:<10}{ten}{ten}{ten}{ten}-r{note(7)}-{note(8)}-{note(9)}-{p}-end");
+        println(b.as_slice());
+        println(f"displays {COUNT}");
+    }
+    println(f"log {take_log()} after push, len {b.len()}");
+    b.free();
+    // format_in over 256 bytes: from the stack buffer to the Buf's room.
+    let mut long: Buf<Gpa> = Buf::new_in(gpa);
+    for i in 0..150 {
+        long.push(if i < 75 { 'x' } else { 'y' });
+    }
+    let t = format_in(f"{long.as_slice()}{note(10)}{long.as_slice()}{note(11)}", gpa);
+    let ts = t.as_slice();
+    println(f"big {ts.len - 4} {ts[0..5]}...{ts[ts.len - 9..ts.len - 4]} log {take_log()}");
+    let u = format_in(f"[{note(13)}|{note(14)}]", gpa);
+    println(f"small {u.as_slice()} len {u.len()} log {take_log()}");
+    let inner = format_in(f"a{note(5)}b", gpa);
+    println(f"nested <{inner.as_slice()}>");
+    inner.free();
+    take_log();
+    println(f"wide [{n:>10}]");
+    eprint(f"[e] {note(15)}");
+    eprintln(f" err");
+    let o: Option<i64> = Some(16);
+    eprintln(f"[e2] {o:?}");
+    print(f"printed no newline");
+    println("");
+    t.free();
+    u.free();
+    long.free();
+}

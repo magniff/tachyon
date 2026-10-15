@@ -49,7 +49,7 @@ use crate::gen0::target::{
     new_label,
 };
 use crate::gen0::x86_64::{x64_epilogue, x64_frame_reserve, x64_imm};
-use crate::middle::inline::FN_LIVE;
+use crate::middle::inline::{FN_LIVE, leaf_dropped, leaf_kept};
 use crate::middle::ir::{
     ARGTY, BLOCKS, INSTS, INST_LOC, IRFUNCS, IRFUNC_COUNT, SLOTS, Term, VARIADIC_PIECE, ir_enter,
     ir_free_func, ir_operand, ir_operand_count,
@@ -332,33 +332,49 @@ pub fn gen_ir_function(fi: i64) {
     }
 }
 
-// (0.17) Every live IR function, in order: at -O1 (PER_FUNCTION) cleaned
-// up and simplified here, then instruction selection, register allocation
-// and emission, end to end; each function's IR is freed once it is
-// emitted (or dropped), so the IR in flight is one function's, at -O2 the
-// optimized program's at most.
+// (0.17) Every live IR function, in order: at -O1 (PER_FUNCTION) the small
+// leaves' calls inlined and the scalar pipeline run here, then
+// instruction selection, register allocation and emission, end to end;
+// each function's IR is freed once it is emitted (or dropped), so the IR
+// in flight is one function's, at -O2 the optimized program's at most.
+// -O1's small leaves come last: the functions after one inline its IR as
+// the middle end left it, not as instruction selection makes it.
 pub fn emit_ir_functions() {
     unsafe {
         for fi in 0..IRFUNC_COUNT {
-            if FN_LIVE[fi] != 0 {
-                if PER_FUNCTION {
-                    let t = timer_now();
-                    optimize_function(fi);
-                    timer_add(T_SCALAR, t);
-                }
-                let t = timer_now();
-                select_function(fi);
-                timer_add(T_ISEL, t);
-                let t2 = timer_now();
-                count_uses(fi);
-                gen_ir_function(fi);
-                timer_add(T_CODEGEN, t2);
-                let t3 = timer_now();
-                asm_flush();
-                timer_add(T_CODEGEN, t3);
+            if !leaf_kept(fi) {
+                emit_ir_function(fi);
             }
-            ir_free_func(fi);
         }
+        for fi in 0..IRFUNC_COUNT {
+            if leaf_kept(fi) {
+                emit_ir_function(fi);
+            }
+        }
+    }
+}
+
+// One function of emit_ir_functions, then its IR freed.
+fn emit_ir_function(fi: i64) {
+    unsafe {
+        if FN_LIVE[fi] != 0 && !leaf_dropped(fi) {
+            if PER_FUNCTION {
+                let t = timer_now();
+                optimize_function(fi);
+                timer_add(T_SCALAR, t);
+            }
+            let t = timer_now();
+            select_function(fi);
+            timer_add(T_ISEL, t);
+            let t2 = timer_now();
+            count_uses(fi);
+            gen_ir_function(fi);
+            timer_add(T_CODEGEN, t2);
+            let t3 = timer_now();
+            asm_flush();
+            timer_add(T_CODEGEN, t3);
+        }
+        ir_free_func(fi);
     }
 }
 
