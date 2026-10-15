@@ -17,8 +17,10 @@ use crate::middle::lower::ssa::HMap;
 use crate::tools::query::c_slice;
 use crate::tools::query::defs::bytes_eq;
 use crate::tools::query::diagnostics::diag;
+use crate::tools::query::positions::is_space;
 use crate::tools::rewrite::parsed::{
-    binding_level, pa, pb, pc, pchild, pcount, pend, pflags, pg, ph, pk, pop, pstart, same_tokens,
+    binding_level, pa, pb, pc, pchild, pcount, pd, pend, pflags, pg, ph, pk, pop, pstart,
+    same_tokens,
 };
 
 // ---- Holes ----
@@ -36,6 +38,9 @@ pub static mut H_TYPE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 pub static mut B_NODE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 pub static mut B_START: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 pub static mut B_END: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// (0.15) For a `$x...` hole: the node whose list it matched in.
+pub static mut B_LIST: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
 // The pattern's hole nodes.
 pub static mut PAT_HOLES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -169,6 +174,24 @@ pub fn hole_of(n: i64) -> i64 {
     }
 }
 
+// (0.15) The elements of node n's list as matched: a block's statements
+// and then its tail expression, when it has one; another node's list.
+pub fn seq_len(n: i64) -> i64 {
+    if pk(n) == NodeKind::Block && pa(n) != 0 { pcount(n) + 1 } else { pcount(n) }
+}
+
+pub fn seq_at(n: i64, i: i64) -> i64 {
+    if i < pcount(n) { pchild(n, i) } else { pa(n) }
+}
+
+// The `$x...` hole element e of a list is (in a block, written as a
+// statement `$s...;` or as the tail `$s...`), or -1.
+pub fn rest_hole_of(e: i64) -> i64 {
+    let x = if e > 0 && pk(e) == NodeKind::ExprStmt { pa(e) } else { e };
+    let h = hole_of(x);
+    if h >= 0 && unsafe { H_REST.data[h] } != 0 { h } else { -1 }
+}
+
 // Parses buffer `text` (the statements, `stmts`) after the program: its
 // node, or 0 after the diagnostic (`what`: the pattern or the
 // replacement).
@@ -266,6 +289,8 @@ fn checked_type(n: i64) -> i64 {
 }
 
 // Hole h matches node n (a repeated hole: the same tokens as before).
+// Its --where type is checked once the whole pattern matched
+// (`types_match`).
 fn bind(h: i64, n: i64) -> bool {
     unsafe {
         if H_REST.data[h] != 0 {
@@ -275,7 +300,23 @@ fn bind(h: i64, n: i64) -> bool {
             return B_NODE.data[h] >= 0
                 && same_tokens(B_START.data[h], B_END.data[h], pstart(n), pend(n));
         }
-        if H_TYPE.data[h] >= 0 && pk(n) != NodeKind::TyName && pk(n) != NodeKind::PatBind {
+        B_NODE.data[h] = n;
+        B_START.data[h] = pstart(n);
+        B_END.data[h] = pend(n);
+        true
+    }
+}
+
+// Whether the holes of the site just matched have their --where types
+// (counting the sites left out, for the notes).
+pub fn types_match() -> bool {
+    unsafe {
+        for h in 0..H_SYM.count {
+            let n = B_NODE.data[h];
+            if H_TYPE.data[h] < 0 || n <= 0 || pk(n) == NodeKind::TyName
+                || pk(n) == NodeKind::PatBind {
+                continue;
+            }
             let t = checked_type(n);
             if t <= 0 {
                 UNTYPED += 1;
@@ -292,18 +333,27 @@ fn bind(h: i64, n: i64) -> bool {
                 return false;
             }
         }
-        B_NODE.data[h] = n;
-        B_START.data[h] = pstart(n);
-        B_END.data[h] = pend(n);
         true
     }
 }
 
-// Hole h (`$x...`) matches the elements from..to of node n's list.
+// Hole h (`$x...`) matches the elements from..to of node n's list. In a
+// block (0.15) its text is all between the elements around them, the
+// comments too, spaces trimmed.
 fn bind_rest(h: i64, n: i64, from: i64, to: i64) -> bool {
     unsafe {
-        let s = if from < to { pstart(pchild(n, from)) } else { -1 };
-        let e = if from < to { pend(pchild(n, to - 1)) } else { -1 };
+        let mut s = if from < to { pstart(seq_at(n, from)) } else { -1 };
+        let mut e = if from < to { pend(seq_at(n, to - 1)) } else { -1 };
+        if from < to && pk(n) == NodeKind::Block {
+            s = if from > 0 { pend(seq_at(n, from - 1)) } else { block_open(n) + 1 };
+            e = if to < seq_len(n) { pstart(seq_at(n, to)) } else { pend(n) - 1 };
+            while s < e && is_space(SRC[s]) {
+                s += 1;
+            }
+            while e > s && is_space(SRC[e - 1]) {
+                e -= 1;
+            }
+        }
         if B_NODE.data[h] != -1 {
             if B_NODE.data[h] == -3 || from == to {
                 return B_NODE.data[h] == -3 && from == to;
@@ -313,18 +363,28 @@ fn bind_rest(h: i64, n: i64, from: i64, to: i64) -> bool {
         B_NODE.data[h] = if from < to { -2 } else { -3 };
         B_START.data[h] = s;
         B_END.data[h] = e;
+        B_LIST.data[h] = n;
         true
     }
 }
 
+// The position of block n's `{` (after `unsafe`).
+pub fn block_open(n: i64) -> i64 {
+    let mut i = pstart(n);
+    while i < pend(n) && unsafe { SRC[i] } != '{' {
+        i += 1;
+    }
+    i
+}
+
 fn match_list(p: i64, n: i64) -> bool {
-    let np = pcount(p);
-    let nn = pcount(n);
+    let np = seq_len(p);
+    let nn = seq_len(n);
     let mut v = -1;
     let mut vh = -1;
     for i in 0..np {
-        let h = hole_of(pchild(p, i));
-        if h >= 0 && unsafe { H_REST.data[h] } != 0 {
+        let h = rest_hole_of(seq_at(p, i));
+        if h >= 0 {
             v = i;
             vh = h;
             break;
@@ -335,7 +395,7 @@ fn match_list(p: i64, n: i64) -> bool {
             return false;
         }
         for i in 0..np {
-            if !match_node(pchild(p, i), pchild(n, i)) {
+            if !match_node(seq_at(p, i), seq_at(n, i)) {
                 return false;
             }
         }
@@ -346,12 +406,12 @@ fn match_list(p: i64, n: i64) -> bool {
         return false;
     }
     for i in 0..v {
-        if !match_node(pchild(p, i), pchild(n, i)) {
+        if !match_node(seq_at(p, i), seq_at(n, i)) {
             return false;
         }
     }
     for j in 0..after {
-        if !match_node(pchild(p, v + 1 + j), pchild(n, nn - after + j)) {
+        if !match_node(seq_at(p, v + 1 + j), seq_at(n, nn - after + j)) {
             return false;
         }
     }
@@ -429,7 +489,8 @@ pub fn match_node(p: i64, n: i64) -> bool {
         return pa(p) == pa(n) && match_node(pb(p), pb(n));
     }
     if k == NodeKind::Block {
-        return pflags(p) == pflags(n) && match_list(p, n) && match_node(pa(p), pa(n));
+        // (its tail is the last element of match_list's)
+        return pflags(p) == pflags(n) && match_list(p, n);
     }
     if k == NodeKind::ExprStmt {
         return pb(p) == pb(n) && match_node(pa(p), pa(n));
@@ -449,6 +510,34 @@ pub fn match_node(p: i64, n: i64) -> bool {
             }
         }
         return match_node(pa(p), pa(n));
+    }
+    // (0.15: loops over iterators, matches, `?`, named arguments,
+    // f-strings, patterns with holes)
+    if k == NodeKind::For {
+        return pa(p) == pa(n) && match_node(pb(p), pb(n)) && match_node(pc(p), pc(n))
+            && match_node(pd(p), pd(n));
+    }
+    if k == NodeKind::Match || k == NodeKind::Interp {
+        return match_node(pa(p), pa(n)) && match_list(p, n);
+    }
+    if k == NodeKind::Arm {
+        return match_node(pa(p), pa(n)) && match_node(pb(p), pb(n)) && match_node(pc(p), pc(n));
+    }
+    if k == NodeKind::Try {
+        return match_node(pa(p), pa(n));
+    }
+    if k == NodeKind::NamedArg {
+        return pa(p) == pa(n) && match_node(pb(p), pb(n));
+    }
+    if k == NodeKind::InterpHole {
+        return pb(p) == pb(n) && pc(p) == pc(n) && pd(p) == pd(n) && pflags(p) == pflags(n)
+            && match_node(pa(p), pa(n));
+    }
+    if k == NodeKind::PatTuple || k == NodeKind::PatOr {
+        return match_list(p, n);
+    }
+    if k == NodeKind::PatVariant {
+        return pa(p) == pa(n) && pb(p) == pb(n) && pc(p) == pc(n) && match_list(p, n);
     }
     false
 }
@@ -473,6 +562,17 @@ pub static mut R_HOLES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 pub static mut R_LEVELS: *i64 = 0 as *i64;
 pub static mut P_LEVELS: *i64 = 0 as *i64;
 pub static mut STMTS: bool = false;
+
+// (0.15) Per replacement hole (as R_HOLES): the node its text replaces,
+// the statement `$s...;` when it is written so, else the hole itself.
+pub static mut R_HOLE_SPAN: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// Per pattern hole: 1 when the replacement has it.
+pub static mut R_KEPT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// Sites left because they use a binding the replacement drops: how many,
+// and the first one's use and hole.
+pub static mut DROPPED: i64 = 0;
+pub static mut DROP_USE: i64 = 0;
+pub static mut DROP_HOLE: i64 = 0;
 
 // The list node holding replacement node q as an element, and its index
 // (-1 when none).
@@ -510,12 +610,14 @@ fn bound_level(h: i64) -> i64 {
 pub fn replacement_text() -> i64 {
     unsafe {
         let out = buf_new();
+        BREAK_NEXT = 0;
         let mut cur = R_START;
         for i in 0..R_HOLES.count {
             let q = R_HOLES.data[i];
             let h = hole_of(q);
-            let mut from = pstart(q);
-            let mut to = pend(q);
+            let at = R_HOLE_SPAN.data[i];
+            let mut from = pstart(at);
+            let mut to = pend(at);
             if H_REST.data[h] != 0 && B_NODE.data[h] == -3 {
                 // (no arguments: the hole goes, with a comma next to it)
                 let mut k = 0;
@@ -530,23 +632,171 @@ pub fn replacement_text() -> i64 {
                 if from < cur {
                     from = cur;
                 }
-                buf_bytes(out, SRC[cur..from]);
+                copy_laid(out, cur, from, false);
                 cur = to;
                 continue;
             }
-            buf_bytes(out, SRC[cur..from]);
+            copy_laid(out, cur, from, true);
             let wrap = H_REST.data[h] == 0 && bound_level(h) < R_LEVELS[q];
             if wrap {
                 buf_byte(out, '(');
             }
-            buf_bytes(out, SRC[B_START.data[h]..B_END.data[h]]);
+            let text = SRC[B_START.data[h]..B_END.data[h]];
+            buf_bytes(out, text);
             if wrap {
                 buf_byte(out, ')');
             }
+            if at != q && text.len > 0 && text[text.len - 1] != ';' && text[text.len - 1] != '}' {
+                // (`$s...;` for statements ending in a tail expression)
+                buf_byte(out, ';');
+            }
             cur = to;
         }
-        buf_bytes(out, SRC[cur..R_END]);
+        copy_laid(out, cur, R_END, true);
         out
+    }
+}
+
+// (0.15) Where the replacement's lines break when a block of it holding
+// a `$s...` stands for a block of the site written on several lines: at
+// each of its elements and at its `}`. Per break: its position, the hole,
+// 1 at the `}` (else 0), the block's number of elements; by position.
+pub static mut R_BREAKS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// The first break not yet passed while a site's text is made.
+static mut BREAK_NEXT: i64 = 0;
+
+// The breaks of the replacement's nodes first..last.
+pub fn note_breaks(first: i64, last: i64) {
+    unsafe {
+        for n in first..last {
+            if pk(n) != NodeKind::Block {
+                continue;
+            }
+            let mut h = -1;
+            for i in 0..seq_len(n) {
+                let e = rest_hole_of(seq_at(n, i));
+                if e >= 0 {
+                    h = e;
+                }
+            }
+            if h < 0 {
+                continue;
+            }
+            for i in 0..seq_len(n) + 1 {
+                let close = i == seq_len(n);
+                R_BREAKS.push(if close { pend(n) - 1 } else { pstart(seq_at(n, i)) });
+                R_BREAKS.push(h);
+                R_BREAKS.push(close as i64);
+                R_BREAKS.push(seq_len(n));
+            }
+        }
+        // (by position: blocks inside blocks)
+        let d = R_BREAKS.data;
+        let mut i = 4;
+        while i < R_BREAKS.count {
+            let mut j = i;
+            while j > 0 && d[j] < d[j - 4] {
+                for f in 0..4 {
+                    let t = d[j + f];
+                    d[j + f] = d[j - 4 + f];
+                    d[j - 4 + f] = t;
+                }
+                j -= 4;
+            }
+            i += 4;
+        }
+    }
+}
+
+// Copies the replacement's text from..to into out, its lines broken (see
+// R_BREAKS) where the site's block had lines; a break at `to` too when
+// `at_end`.
+fn copy_laid(out: i64, from: i64, to: i64, at_end: bool) {
+    unsafe {
+        let mut cur = from;
+        while BREAK_NEXT < R_BREAKS.count {
+            let k = BREAK_NEXT;
+            let at = R_BREAKS.data[k];
+            if at > to || (at == to && !at_end) {
+                break;
+            }
+            BREAK_NEXT += 4;
+            let h = R_BREAKS.data[k + 1];
+            let block = B_LIST.data[h];
+            if at < from || block <= 0 || !has_newline(block_open(block), pend(block))
+                || (B_NODE.data[h] == -3 && R_BREAKS.data[k + 3] == 1) {
+                continue;
+            }
+            buf_bytes(out, SRC[cur..at]);
+            cur = at;
+            while BUFS[out].len > 0 && BUFS[out].data[BUFS[out].len - 1] == ' ' {
+                BUFS[out].len -= 1;
+            }
+            buf_byte(out, '\n');
+            if R_BREAKS.data[k + 2] != 0 {
+                put_indent(out, pend(block) - 1);
+            } else if seq_len(block) > 0 {
+                put_indent(out, pstart(seq_at(block, 0)));
+            } else {
+                put_indent(out, pend(block) - 1);
+                buf_str(out, c"    ");
+            }
+        }
+        buf_bytes(out, SRC[cur..to]);
+    }
+}
+
+// Whether SRC[from..to) has a line break.
+fn has_newline(from: i64, to: i64) -> bool {
+    for i in from..to {
+        if unsafe { SRC[i] } == '\n' {
+            return true;
+        }
+    }
+    false
+}
+
+// Writes the indentation of the line of position pos into buffer out.
+fn put_indent(out: i64, pos: i64) {
+    unsafe {
+        let mut a = pos;
+        while a > 0 && SRC[a - 1] != '\n' {
+            a -= 1;
+        }
+        let mut b = a;
+        while b < pos && (SRC[b] == ' ' || SRC[b] == '\t') {
+            b += 1;
+        }
+        buf_bytes(out, SRC[a..b]);
+    }
+}
+
+// (0.15) At the site just matched: an identifier inside what a hole the
+// replacement keeps matched, naming the binding (`for $i`, `let $x`) a
+// hole it drops matched; 0 when there is none (else its hole in *hole).
+// Such a site would lose the binding its code uses.
+pub fn dropped_use(program_end: i64, hole: *i64) -> i64 {
+    unsafe {
+        for h in 0..H_SYM.count {
+            let b = B_NODE.data[h];
+            if R_KEPT.data[h] != 0 || b <= 0 || pk(b) != NodeKind::PatBind {
+                continue;
+            }
+            let sym = pa(b);
+            for n in 1..program_end {
+                if pk(n) != NodeKind::Ident || pa(n) != sym {
+                    continue;
+                }
+                for k in 0..H_SYM.count {
+                    if R_KEPT.data[k] != 0 && B_NODE.data[k] != -3 && B_START.data[k] <= pstart(n)
+                        && pend(n) <= B_END.data[k] {
+                        *hole = h;
+                        return n;
+                    }
+                }
+            }
+        }
+        0
     }
 }
 
