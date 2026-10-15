@@ -24,7 +24,8 @@
 pub mod instantiate;
 
 use crate::base::{
-    IntVec, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, intern, intern_c,
+    IntVec, SYMS, alloc_zeroed, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, free,
+    intern, intern_c,
 };
 use crate::base::diag::{err_begin, err_end, err_int, err_str, err_sym, error_at};
 use crate::front::ast::{NODES, NodeKind, child};
@@ -304,6 +305,96 @@ fn same_targs(targs: i64, count: i64, mark: i64) -> bool {
     true
 }
 
+// (0.16) Instances by template and type arguments, for fn_instance,
+// struct_instance and enum_instance, which scanned every function, struct
+// or enum at each use of a generic one: open addressing, `ids[slot]` = id +
+// 1 (0: empty), `hashes[slot]` its key's hash. A lookup returns the lowest
+// id that matches, as the scan did.
+pub struct InstIndex { ids: *i64, hashes: *i64, size: i64, used: i64 }
+
+pub static mut FN_INSTANCES: InstIndex =
+    InstIndex { ids: 0 as *i64, hashes: 0 as *i64, size: 0, used: 0 };
+static mut STRUCT_INSTANCES: InstIndex =
+    InstIndex { ids: 0 as *i64, hashes: 0 as *i64, size: 0, used: 0 };
+static mut ENUM_INSTANCES: InstIndex =
+    InstIndex { ids: 0 as *i64, hashes: 0 as *i64, size: 0, used: 0 };
+
+// The hash of template `tmpl` with the type arguments TSCRATCH[mark..].
+pub fn inst_hash(tmpl: i64, mark: i64) -> i64 {
+    unsafe {
+        let mut h: u64 = 14695981039346656037;
+        h = (h ^ tmpl as u64) * 1099511628211;
+        for i in mark..TSCRATCH.count {
+            h = (h ^ TSCRATCH.data[i] as u64) * 1099511628211;
+        }
+        ((h ^ (h >> 29)) & 0x7fffffffffffffff) as i64
+    }
+}
+
+// The first slot of hash h's chain, or -1 (nothing indexed).
+pub fn inst_first(ix: *InstIndex, h: i64) -> i64 {
+    unsafe {
+        if (*ix).size == 0 {
+            return -1;
+        }
+        let mut slot = h & ((*ix).size - 1);
+        while (*ix).ids[slot] != 0 && (*ix).hashes[slot] != h {
+            slot = (slot + 1) & ((*ix).size - 1);
+        }
+        if (*ix).ids[slot] == 0 { -1 } else { slot }
+    }
+}
+
+// The next slot of hash h's chain after `slot`, or -1.
+pub fn inst_next(ix: *InstIndex, h: i64, slot: i64) -> i64 {
+    unsafe {
+        let mut s = (slot + 1) & ((*ix).size - 1);
+        while (*ix).ids[s] != 0 && (*ix).hashes[s] != h {
+            s = (s + 1) & ((*ix).size - 1);
+        }
+        if (*ix).ids[s] == 0 { -1 } else { s }
+    }
+}
+
+pub fn inst_id(ix: *InstIndex, slot: i64) -> i64 {
+    unsafe { (*ix).ids[slot] - 1 }
+}
+
+pub fn inst_add(ix: *InstIndex, id: i64, h: i64) {
+    unsafe {
+        if ((*ix).used + 1) * 2 > (*ix).size {
+            let old_ids = (*ix).ids;
+            let old_hashes = (*ix).hashes;
+            let old_size = (*ix).size;
+            let size = if old_size == 0 { 256 } else { old_size * 2 };
+            (*ix).ids = alloc_zeroed(size * 8) as *i64;
+            (*ix).hashes = alloc_zeroed(size * 8) as *i64;
+            (*ix).size = size;
+            (*ix).used = 0;
+            for s in 0..old_size {
+                if old_ids[s] != 0 {
+                    inst_put(ix, old_ids[s] - 1, old_hashes[s]);
+                }
+            }
+            free(old_ids as *u8);
+            free(old_hashes as *u8);
+        }
+        inst_put(ix, id, h);
+    }
+}
+
+fn inst_put(ix: *InstIndex, id: i64, h: i64) {
+    unsafe {
+        let mut slot = h & ((*ix).size - 1);
+        while (*ix).ids[slot] != 0 {
+            slot = (slot + 1) & ((*ix).size - 1);
+        }
+        (*ix).ids[slot] = id + 1;
+        (*ix).hashes[slot] = h;
+        (*ix).used += 1;
+    }
+}
+
 fn check_targ_depth(mark: i64, pos: i64) {
     unsafe {
         for i in mark..TSCRATCH.count {
@@ -433,12 +524,21 @@ fn struct_instance(tpl: i64, mark: i64, pos: i64) -> i64 {
         if count != STRUCTS[tpl].generic {
             targ_count_error(pos, c"struct", STRUCTS[tpl].name, STRUCTS[tpl].generic, count);
         }
-        for s in 0..STRUCT_COUNT {
+        let h = inst_hash(tpl, mark);
+        let mut found = -1;
+        let mut slot = inst_first(&STRUCT_INSTANCES, h);
+        while slot >= 0 {
+            let s = inst_id(&STRUCT_INSTANCES, slot);
             if STRUCTS[s].tmpl == tpl + 1
-                && same_targs(STRUCTS[s].targs, STRUCTS[s].targ_count, mark) {
-                TSCRATCH.count = mark;
-                return struct_type(s);
+                && same_targs(STRUCTS[s].targs, STRUCTS[s].targ_count, mark)
+                && (found < 0 || s < found) {
+                found = s;
             }
+            slot = inst_next(&STRUCT_INSTANCES, h, slot);
+        }
+        if found >= 0 {
+            TSCRATCH.count = mark;
+            return struct_type(found);
         }
         check_targ_depth(mark, pos);
         let targs = take_targs(mark);
@@ -448,6 +548,7 @@ fn struct_instance(tpl: i64, mark: i64, pos: i64) -> i64 {
         let s = new_struct(node, generic_display(STRUCTS[tpl].name, targs, shown),
             generic_symbol(STRUCTS[tpl].sym, targs, shown), STRUCTS[tpl].module);
         STRUCTS[s].tmpl = tpl + 1;
+        inst_add(&STRUCT_INSTANCES, s, h);
         STRUCTS[s].targs = targs;
         STRUCTS[s].targ_count = count;
         let saved_mod = CUR_MOD;
@@ -473,11 +574,20 @@ fn enum_instance(tpl: i64, mark: i64, pos: i64) -> i64 {
         if count != ENUMS[tpl].generic {
             targ_count_error(pos, c"enum", ENUMS[tpl].name, ENUMS[tpl].generic, count);
         }
-        for e in 0..ENUM_COUNT {
-            if ENUMS[e].tmpl == tpl + 1 && same_targs(ENUMS[e].targs, ENUMS[e].targ_count, mark) {
-                TSCRATCH.count = mark;
-                return enum_type(e);
+        let h = inst_hash(tpl, mark);
+        let mut found = -1;
+        let mut slot = inst_first(&ENUM_INSTANCES, h);
+        while slot >= 0 {
+            let e = inst_id(&ENUM_INSTANCES, slot);
+            if ENUMS[e].tmpl == tpl + 1 && same_targs(ENUMS[e].targs, ENUMS[e].targ_count, mark)
+                && (found < 0 || e < found) {
+                found = e;
             }
+            slot = inst_next(&ENUM_INSTANCES, h, slot);
+        }
+        if found >= 0 {
+            TSCRATCH.count = mark;
+            return enum_type(found);
         }
         check_targ_depth(mark, pos);
         let targs = take_targs(mark);
@@ -487,6 +597,7 @@ fn enum_instance(tpl: i64, mark: i64, pos: i64) -> i64 {
         let e = new_enum(node, generic_display(ENUMS[tpl].name, targs, shown),
             generic_symbol(ENUMS[tpl].sym, targs, shown), ENUMS[tpl].module);
         ENUMS[e].tmpl = tpl + 1;
+        inst_add(&ENUM_INSTANCES, e, h);
         ENUMS[e].targs = targs;
         ENUMS[e].targ_count = count;
         let saved_mod = CUR_MOD;

@@ -23,11 +23,11 @@ pub mod intrinsic;
 
 use crate::base::{
     BUFS, IntVec, SRC, SYMS, _setjmp, add_source, buf_bytes, buf_clear, buf_int, buf_new, buf_str,
-    intern_c, sym_name,
+    cstr, intern_c, sym_name, sym_text,
 };
 use crate::base::diag::{
-    ERR_HELP, RECOVER_DEPTH, edit_distance, err_begin, err_end_soft, err_help, err_help_sym,
-    err_int, err_str, err_sym, recover_enter, recover_leave,
+    ERR_HELP, RECOVER_DEPTH, edit_distance, err_begin, err_end_soft, err_fmt, err_help,
+    err_help_fmt, err_str, recover_enter, recover_leave,
 };
 use crate::front::ast::{
     FN_BODY_FAILED, FN_DERIVED, NODES, NODE_COUNT, NodeKind, SCRATCH, child, list_begin, list_end,
@@ -92,17 +92,9 @@ fn expand_item(item: i64) {
             if code == 0 {
                 continue;
             }
-            let mut twice = false;
-            for j in 0..k {
-                if derive_code_quiet(child(holder, j)) == code {
-                    twice = true;
-                }
-            }
-            if twice {
+            if (0..k).any(|j| derive_code_quiet(child(holder, j)) == code) {
                 err_begin(NODES[d].start);
-                err_str(c"'");
-                err_sym(NODES[d].a);
-                err_str(c"' is derived twice");
+                err_fmt(f"'{sym_text(NODES[d].a)}' is derived twice");
                 err_help(c"remove one of them");
                 err_end_soft();
                 continue;
@@ -131,9 +123,7 @@ fn derive_code(d: i64, item: i64) -> i64 {
             err_end_soft();
             return 0;
         }
-        err_str(c"cannot derive '");
-        err_sym(name);
-        err_str(c"' (derivable: Eq, Ord, Hash, Debug, Clone)");
+        err_fmt(f"cannot derive '{sym_text(name)}' (derivable: Eq, Ord, Hash, Debug, Clone)");
         let text = SYMS[name].text;
         if text == "PartialEq" {
             err_help(c"tachyon's Eq is Rust's PartialEq: derive Eq");
@@ -142,10 +132,9 @@ fn derive_code(d: i64, item: i64) -> i64 {
         } else if text == "Copy" {
             err_help(c"every type copies on assignment: remove Copy");
         } else if text == "Display" {
-            err_help(c"Display has no derive: write 'impl Display for ");
-            err_help_sym(NODES[item].a);
-            err_help(c" { fn fmt(self: *");
-            err_help_sym(NODES[item].a);
+            err_help_fmt(
+                f"Display has no derive: write 'impl Display for {sym_text(NODES[item].a)}");
+            err_help_fmt(f" {{ fn fmt(self: *{sym_text(NODES[item].a)}");
             err_help(c", f: *std::Fmt) { f.str(\"...\"); } }'");
         } else if text == "Default" {
             err_help(c"there is no Default: write a 'fn new() -> T' in an impl");
@@ -162,9 +151,7 @@ fn derive_code(d: i64, item: i64) -> i64 {
                 }
             }
             if best >= 0 {
-                err_help(c"did you mean '");
-                err_help(names[best]);
-                err_help(c"'?");
+                err_help_fmt(f"did you mean '{cstr(names[best])}'?");
             }
         }
         err_end_soft();
@@ -491,12 +478,7 @@ fn w_variant_pattern(item: i64, v: i64, binder: *u8) {
 // discriminant (they are then 0, 1, ...), else a match.
 fn w_variant_index(item: i64, value: *u8) {
     unsafe {
-        let mut written = false;
-        for i in 0..NODES[item].count {
-            if NODES[child(item, i)].b != 0 {
-                written = true;
-            }
-        }
+        let written = (0..NODES[item].count).any(|i| NODES[child(item, i)].b != 0);
         if !written && !has_fields(item) {
             w(c"(");
             w(value);
@@ -715,7 +697,7 @@ fn parse_derived() {
         let mark = list_begin();
         let depth = RECOVER_DEPTH;
         if _setjmp(recover_enter()) == 0 {
-            lex_range(base, base + BUFS[GEN].len, true);
+            lex_range(base, base + BUFS[GEN].len, last: true);
             parse_items_fragment(first);
         } else {
             // (a syntax error in the made text: a compiler bug, reported)
@@ -865,23 +847,12 @@ fn field_has(ty: i64, code: i64) -> bool {
 fn field_error(item: i64, d: i64, code: i64, field: i64, ty: i64, variant: i64, index: i64) {
     unsafe {
         err_begin(NODES[field].start);
-        err_str(c"cannot derive ");
-        err_sym(NODES[d].a);
-        err_str(c" for '");
-        err_sym(NODES[item].a);
-        err_str(c"': ");
+        err_fmt(f"cannot derive {sym_text(NODES[d].a)} for '{sym_text(NODES[item].a)}': ");
         if variant >= 0 {
-            err_str(c"field ");
-            err_int(index);
-            err_str(c" of '");
-            err_sym(NODES[item].a);
-            err_str(c"::");
-            err_sym(NODES[child(item, variant)].a);
-            err_str(c"'");
+            err_fmt(f"field {index} of '{sym_text(NODES[item].a)}::");
+            err_fmt(f"{sym_text(NODES[child(item, variant)].a)}'");
         } else {
-            err_str(c"field '");
-            err_sym(NODES[field].a);
-            err_str(c"'");
+            err_fmt(f"field '{sym_text(NODES[field].a)}'");
         }
         err_str(c" of type '");
         err_type(ty);
@@ -892,9 +863,7 @@ fn field_error(item: i64, d: i64, code: i64, field: i64, ty: i64, variant: i64, 
         } else if code == D_EQ {
             err_help(c"remove Eq from #[derive], or give the field a type with ==");
         } else {
-            err_help(c"remove ");
-            err_help_sym(NODES[d].a);
-            err_help(c" from #[derive], or implement it for '");
+            err_help_fmt(f"remove {sym_text(NODES[d].a)} from #[derive], or implement it for '");
             buf_type(ERR_HELP, ty);
             err_help(c"'");
         }
@@ -927,8 +896,7 @@ pub fn derive_conflict_help(node: i64) {
         if (NODES[node].p & FN_DERIVED) == 0 {
             return;
         }
-        err_help(c"remove ");
-        err_help_sym(NODES[NODES[node].a].a);
+        err_help_fmt(f"remove {sym_text(NODES[NODES[node].a].a)}");
         err_help(c" from #[derive], or the impl written by hand");
     }
 }

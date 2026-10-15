@@ -311,6 +311,42 @@ pub fn buf_hex(b: i64, value: u64, digits: i64) {
     }
 }
 
+// (0.16) Appends x's Display, an f-string above all:
+// `buf_fmt(b, f"v{n}: {sym_text(s)}")`. The text is made in one std::Buf
+// kept for it (fmt_scratch), then copied (fmt_end): a Display that calls
+// buf_fmt itself would clobber it (none of the compiler's do). Through
+// push_fmt, which 0.15's std and 0.16's both have (0.16 has no
+// Fmt::to_buf).
+pub fn buf_fmt<T: std::Display>(b: i64, x: T) {
+    unsafe { (*fmt_scratch()).push_fmt(x); }
+    fmt_end(b);
+}
+
+// The scratch Buf, emptied.
+pub fn fmt_scratch() -> *std::Buf {
+    unsafe {
+        if FMT_SCRATCH == 0 as *std::Buf {
+            // Zeroed: an empty Buf (no bytes, no capacity), in 0.15 as in
+            // 0.16 (std::Buf::new allocates nothing, but it is not 0.16's).
+            FMT_SCRATCH = alloc_zeroed(size_of(std::Buf)) as *std::Buf;
+        }
+        (*FMT_SCRATCH).clear();
+        FMT_SCRATCH
+    }
+}
+
+// The scratch Buf's text, appended to buffer b.
+pub fn fmt_end(b: i64) {
+    unsafe { buf_bytes(b, (*FMT_SCRATCH).as_slice()); }
+}
+
+static mut FMT_SCRATCH: *std::Buf = 0 as *std::Buf;
+
+// A C string's bytes, up to its NUL: `{cstr(s)}` in an f-string.
+pub fn cstr(s: *u8) -> [u8] {
+    unsafe { s[0..strlen(s) as i64] }
+}
+
 // Writes the whole buffer to a file descriptor (0.15: what goes to
 // stdout while STDOUT_CAPTURE is a buffer goes to that buffer, for the
 // output budget of `tachyonc query`).
@@ -382,7 +418,7 @@ static mut SYM_TABLE_SIZE: i64 = 0;
 fn hash_bytes(bytes: [u8]) -> u64 {
     let mut h: u64 = 14695981039346656037;
     for i in 0..bytes.len as i64 {
-        h ^= bytes[i] as u64;
+        h ^= bytes[i];
         h *= 1099511628211;
     }
     h
@@ -456,7 +492,7 @@ pub fn intern(bytes: [u8]) -> i64 {
         // Symbols keep their own NUL-terminated copy, usable as a C string.
         let copy = alloc_zeroed(n + 1);
         memcpy(copy, bytes.ptr, n as u64);
-        SYMS[sym] = Sym { text: copy[0..n], hash: hash };
+        SYMS[sym] = Sym { text: copy[0..n], hash };
         SYM_COUNT += 1;
         SYM_TABLE[slot] = sym + 1;
         if SYM_COUNT > SYM_TABLES_CAP && SYM_TABLES.count > 0 {
@@ -476,7 +512,7 @@ pub fn restore_sym(text: [u8], hash: u64) -> i64 {
         }
         SYMS = grow(SYMS, SYM_COUNT, &SYM_CAP);
         let sym = SYM_COUNT;
-        SYMS[sym] = Sym { text: text, hash: hash };
+        SYMS[sym] = Sym { text, hash };
         SYM_COUNT += 1;
         sym_table_insert(sym);
         sym
@@ -539,6 +575,11 @@ pub fn sym_name(sym: i64) -> *u8 {
     unsafe { SYMS[sym].text.ptr }
 }
 
+// The symbol's name: `{sym_text(s)}` in an f-string.
+pub fn sym_text(sym: i64) -> [u8] {
+    unsafe { SYMS[sym].text }
+}
+
 // ---- Source files ----
 
 // All files are read into one buffer, SRC; a position is an offset in it.
@@ -598,9 +639,7 @@ pub fn load_sources(paths: **u8, count: i64) {
             let start = BUFS[all].len;
             read_file(paths[i], all);
             FILES = grow(FILES, FILE_COUNT, &FILE_CAP);
-            FILES[FILE_COUNT] = SourceFile {
-                path: paths[i], start: start, end: BUFS[all].len, module: 0
-            };
+            FILES[FILE_COUNT] = SourceFile { path: paths[i], start, end: BUFS[all].len, module: 0 };
             FILE_COUNT += 1;
             buf_byte(all, '\n');
         }
@@ -622,7 +661,7 @@ pub fn add_source(path: *u8, text: i64) -> i64 {
         let start = BUFS[all].len;
         buf_bytes(all, buf_slice(text));
         FILES = grow(FILES, FILE_COUNT, &FILE_CAP);
-        FILES[FILE_COUNT] = SourceFile { path: path, start: start, end: BUFS[all].len, module: 0 };
+        FILES[FILE_COUNT] = SourceFile { path, start, end: BUFS[all].len, module: 0 };
         FILE_COUNT += 1;
         buf_byte(all, '\n');
         buf_byte(all, 0);

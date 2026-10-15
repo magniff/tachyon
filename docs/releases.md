@@ -149,10 +149,14 @@ the optimizer's side in docs/optimizer.md, "0.16".
   linked in and C calling tachyon), language tours (closures and
   iterators, errors and results, traits and generics, formatting); the
   algorithm examples and the tool sessions on explicit allocation.
-- **The compiler's source** on 0.15's features (`?`, f-strings, derive,
-  widening) in the back end, base, gen0 and most of the front end; six
-  modules over 1000 lines split with `refactor split` (same-output
-  identical).
+- **The compiler's source** on 0.15's features (f-strings for its
+  messages and text, widening, `any`/`all`, field shorthand, named
+  arguments) in the back end, base, gen0 and part of the front end (the
+  lexer, C import, derive, conversions, associated types, patterns,
+  modules); the checker finds types and instances by hash (it scanned);
+  six modules over 1000 lines split with `refactor split`; same-output
+  identical throughout. The rest of the front end and the tools move in
+  0.17.
 - **The agent eval**: compiler tasks (an optimization, a cross-module
   rename, a checker fix, a std method) run with and without the tools
   (`--set`, `--reps`, `plans/0.16.md`).
