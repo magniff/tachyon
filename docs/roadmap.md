@@ -850,13 +850,55 @@ C's, and proven on a real program: a GPU-rendered terminal emulator,
 shipped as an example (not a release goal of its own). Each release may
 split into .x releases rather than be rushed.
 
-## 0.19: collections, text and I/O
+## 0.19: CPU intrinsics and target features (`std::arch`)
+
+Planned with the user on 2026-10-15: direct access to the CPU's
+instructions, as Rust's `std::arch`/`core::arch`, without giving up the
+no-UB rule. It comes before the standard library build-out, which uses it
+(SIMD-probed hash tables, fast text search, checksums).
+
+- `std::arch::aarch64` (NEON, then crc, aes, sha, dotprod; SVE later) and
+  `std::arch::x86_64` (SSE2 to SSE4.2, AVX, AVX2, FMA, BMI1/2, POPCNT,
+  LZCNT; AVX-512 later): typed intrinsics with the vendors' names
+  (`vaddq_u8`, `_mm256_add_epi32`), on 0.10's vector types plus the
+  vendor vector types, lowered to single instructions in both back ends
+  and understood by the optimizer (no opaque calls)
+- portable intrinsics in `std::arch` for every target: `count_ones`,
+  `leading_zeros`, `trailing_zeros`, `rotate_left`, `bswap`,
+  `prefetch`, `spin_loop`, `wide_mul` (128-bit product), with
+  constant folding
+- target features: `#[target_feature(enable = "avx2")]` on a function;
+  `tachyonc -C target-cpu=native|NAME` and `-C target-feature=+x,-y`; a
+  build's baseline features are known at compile time
+  (`std::arch::has::<"neon">()` constant-folds)
+- no UB: an instruction the CPU lacks must never run. A
+  `#[target_feature]` function may be called safely only where the
+  feature is known: inside another function with the feature, under the
+  build's baseline, or in the branch of a run-time check
+  (`if std::arch::detect("avx2") { fast(x) } else { slow(x) }`, checked
+  flow-sensitively like a narrowing); elsewhere the call is an error with
+  the exact `try:` (wrap in the detect branch). Run-time detection is
+  cached (cpuid, `getauxval`/`sysctl`), and multiversioning
+  (`#[target_feature]` variants selected once at start-up) is sugar on top
+- intrinsics with memory operands (loads, stores, gathers) take slices
+  or `&`/`&mut` places (0.17) and check bounds, so they are safe; raw
+  pointer forms stay `unsafe`; effects: intrinsics are pure unless they
+  touch memory
+- tests: every intrinsic checked against a scalar reference on random
+  inputs (the fuzzer gains intrinsics), run on aarch64-macos, x86_64
+  (Rosetta) and both Linux containers; `tests/objcheck.sh` checks the
+  encodings; examples/arch/ shows a SIMD byte search and a checksum
+  against their portable versions with timings
+- the tools: `query` shows an intrinsic's instruction and feature;
+  `guide arch`; `explain` for the feature errors
+
+## 0.20: collections, text and I/O
 
 - collections, each allocator-aware (0.16), with value semantics (0.17),
   iterators, `derive`d traits and contracts:
   - `Vec` (reworked);
   - `VecDeque`;
-  - `HashMap` and `HashSet`: an open-addressing, SIMD-probed table, with
+  - `HashMap` and `HashSet`: an open-addressing, SIMD-probed table (0.19's `std::arch`), with
     a seeded hash where inputs are untrusted;
   - `BTreeMap` and `BTreeSet`;
   - `BinaryHeap`;
@@ -874,7 +916,7 @@ split into .x releases rather than be rushed.
 - benchmarks against Rust's std and C on the same operations (a bench/
   pair each); a property test per collection against a model (0.18)
 
-## 0.20: concurrency, atomics and synchronization
+## 0.21: concurrency, atomics and synchronization
 
 - threads: `spawn`/`join`, scoped threads that may borrow the parent's
   values (second-class references, 0.17), thread-locals
@@ -892,7 +934,7 @@ split into .x releases rather than be rushed.
   tests (in the manner of loom) and a race-detecting build mode; the
   fuzzer gains threads
 
-## 0.21: GPU support
+## 0.22: GPU support
 
 - a native `gpu` library: wgpu's model (instance, adapter, device, queue,
   buffers, textures, samplers, bind groups, render and compute pipelines,
@@ -909,18 +951,18 @@ split into .x releases rather than be rushed.
 - tested headless: compute kernels against CPU results, render passes
   read back and compared with reference images
 
-## 0.22: windows and input in std, and a terminal emulator
+## 0.23: windows and input in std, and a terminal emulator
 
 - a `window` library in std, in the manner of winit: an event loop,
-  windows with a GPU surface (0.21), keyboard (with modifiers and text
+  windows with a GPU surface (0.22), keyboard (with modifiers and text
   input), mouse, resize, high-DPI scale, a frame clock, clipboard; Cocoa
   on macOS, Wayland then X11 on Linux
 - the terminal emulator, an example program (`examples/term`) that
   proves the standard library:
-  - a pty and a child shell, its I/O on its own thread (0.20);
+  - a pty and a child shell, its I/O on its own thread (0.21);
   - an xterm-compatible escape-sequence parser (a state machine in the
     manner of vte), a grid with scrollback, alternate screen, 256 and
-    true colours, attributes, wide and combining characters (0.19's
+    true colours, attributes, wide and combining characters (0.20's
     display width), resize and reflow;
   - rendering: fonts rasterized through the platform (Core Text,
     FreeType) into a glyph atlas, one instanced draw of the cells per
