@@ -115,7 +115,7 @@ checks the program, finds the site it would break, and writes nothing:
 
 ```console
 $ tachyonc rewrite '$v.len() == 0' '$v.is_empty()'
-./report.tach:68:8: error[type error] no method 'is_empty' on type '*Buf'  [edited: crate::report::finish]
+report.tach:68:8: error[type error] no method 'is_empty' on type '*Buf'  [edited: crate::report::finish]
 error edit.breaks: 1 new error; nothing written
 try: tachyonc rewrite '$v.len() == 0' '$v.is_empty()' --no-check
 [exit 1]

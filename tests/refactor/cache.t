@@ -29,14 +29,14 @@ pub fn f() -> i64 {
 ## An error: check and the queries count it.
 % printf '\npub fn f() -> i64 {\n    true\n}\n' > a.tach
 $ check
-./a.tach:3:5: error[type error] expected 'i64', got 'bool'
+a.tach:3:5: error[type error] expected 'i64', got 'bool'
 [exit 1]
 $ query def f
 crate::a::f	a.tach:2:8	fn	pub fn f() -> i64
 warning query.program-errors: 1 error in the program; results may be incomplete
 try: tachyonc --diagnostics=short main.tach -c -o /dev/null
 $ check
-./a.tach:3:5: error[type error] expected 'i64', got 'bool'
+a.tach:3:5: error[type error] expected 'i64', got 'bool'
 [exit 1]
 % rm a.tach
 $ check

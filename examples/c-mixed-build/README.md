@@ -22,23 +22,30 @@ statistics. The calls go both ways:
 
 ## Build and run
 
-From this folder. `tachyonc main.tach -o prog` alone cannot build this
-program: it links only the tachyon object. The steps, by hand (with
-`tachyonc` on your `PATH`; from a built tree it is `../../target/tachyonc`):
+From this folder (with `tachyonc` on your `PATH`; from a built tree it
+is `../../target/tachyonc`):
 
 ```sh
-tachyonc --emit-header main.tach -o main.h   # 1. tachyon's functions and statics, for C
-cc -O2 -c ring.c -o ring.o                   # 2. the C file (it includes main.h)
-tachyonc main.tach -o main.o                 # 3. the tachyon program, as an object
-cc main.o ring.o -o c-mixed-build            # 4. link both
+tachyonc --emit-header main.tach -o main.h       # 1. tachyon's functions and statics, for C
+tachyonc main.tach ring.c -o c-mixed-build       # 2. the program and the C file, linked
 echo 10 20 30 40 55 15 60 5 25 | ./c-mixed-build
 ```
 
-Steps 2 and 4 can be one, `cc main.o ring.c -o c-mixed-build` (once
-`main.h` exists): the linker does not care which language an object came
-from. `-o x.o` makes an object (`-o x.s`:
-assembly); any other name is an executable linked by `cc`
-(`$TACHYON_CC` if set).
+Step 2 compiles `ring.c` with `cc` (at the program's `-O` level, with
+its `-I` directories) and links it with the tachyon object. Objects
+(`.o`), archives (`.a`), shared libraries, `-l NAME` and `-L DIR` go on
+the same command line, in the order the linker wants them. The output's
+name says what is made: `-o x.o` an object, `-o x.s` assembly, any other
+name an executable linked by `cc` (`$TACHYON_CC` if set).
+
+A build that links itself (another linker, flags of its own) takes the
+tachyon program as an object, as the Makefile does:
+
+```sh
+cc -O2 -c ring.c -o ring.o                       # the C file (it includes main.h)
+tachyonc main.tach -o main.o                     # the tachyon program, as an object
+cc main.o ring.o -o c-mixed-build                # linked by cc
+```
 
 Or with make (`TACHYONC` defaults to the tree's compiler):
 
@@ -219,9 +226,9 @@ in C), printed in hex with `{x:08x}`.
   anything C only passes along (a context pointer) can be any type.
 - **Callbacks**: `extern "C" fn` plus a `void *` context, never a
   closure.
-- **Linking**: compile tachyon to an object (`-o main.o`) and link it
-  with the C objects and libraries using `cc` (add `-lm` and other `-l`
-  flags there).
+- **Linking**: C files, objects and `-l`/`-L` on `tachyonc`'s command
+  line; or compile tachyon to an object (`-o main.o`) and link it
+  yourself.
 - **Ownership**: C frees what C allocated (`ring_free`); wrap it in a
   tachyon type with a `free` method and `defer` it.
 

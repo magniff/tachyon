@@ -21,15 +21,15 @@ file, one per line, `FILE:LINE:COL: error[KIND] MESSAGE | help: ...`:
 
 ```console
 $ tachyonc check
-main.tach:8:38: error[type error] 'letter' is private | help: make it public: `pub fn letter` at ./grades.tach:21:1
+main.tach:8:38: error[type error] 'letter' is private | help: make it public: `pub fn letter` at grades.tach:21:1
 main.tach:9:14: error[type error] unresolved import 'roster::add_score'
 main.tach:17:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3
 main.tach:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3
 main.tach:19:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3
 main.tach:23:19: error[type error] unknown type 'HashMap' | help: add `use std::HashMap;`
-./grades.tach:18:5: error[type error] undefined variable 'totl' | help: did you mean 'total'?
-./grades.tach:39:17: error[unsafe] calling a C function is unsafe | help: put it in an `unsafe { ... }` block, or the function's body in an `unsafe fn` (`tachyonc --fix-unsafe` does the former)
-./roster.tach:26:13: error[type error] cannot assign to immutable variable 'count' | help: make it mutable: `let mut count`
+grades.tach:18:5: error[type error] undefined variable 'totl' | help: did you mean 'total'?
+grades.tach:39:17: error[unsafe] calling a C function is unsafe | help: put it in an `unsafe { ... }` block, or the function's body in an `unsafe fn` (`tachyonc fix --only unsafe` does the former)
+roster.tach:26:13: error[type error] cannot assign to immutable variable 'count' | help: make it mutable: `let mut count`
 [exit 1]
 ```
 
@@ -73,8 +73,8 @@ main.tach:9:14: error[type error] unresolved import 'roster::add_score'
 main.tach:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3
 main.tach:19:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3
 main.tach:20:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3
-./grades.tach:18:5: error[type error] undefined variable 'totl' | help: did you mean 'total'?
-./roster.tach:26:13: error[type error] cannot assign to immutable variable 'count' | help: make it mutable: `let mut count`
+grades.tach:18:5: error[type error] undefined variable 'totl' | help: did you mean 'total'?
+roster.tach:26:13: error[type error] cannot assign to immutable variable 'count' | help: make it mutable: `let mut count`
 [exit 1]
 ```
 

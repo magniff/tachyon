@@ -540,7 +540,9 @@ try: tachyonc fix --only imports --use crate::back::obj::is_blank
 ## tachyonc same-output
 
 A pure refactoring proven to change nothing: every program of the
-corpus is compiled by OLD and by this compiler, for every target both
+corpus is compiled by OLD (a path; 0.16: a name without a `/` and no
+such file here is looked up in `$PATH`, as the shell does) and by this
+compiler, for every target both
 have (a target OLD lacks is skipped, `note same-output.target`), at
 `-O0`, `-O1` and `-O2`, and the outputs are compared byte for byte (the
 assembly, what the compiler printed, its exit status). The corpus is

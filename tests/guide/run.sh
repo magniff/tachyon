@@ -338,6 +338,16 @@ if [ $rc -eq 0 ] && head -1 "$WORK/find.out" | grep -q '^# std#input$' \
 else
     result FAIL guide-find "exit $rc:" "$(head -3 "$WORK/find.out")" "$(cat "$WORK/find.err")"
 fi
+# (0.16) No paragraph within the budget: the best one's place, and the
+# command that prints its section.
+"$COMPILER" guide --find read a line --budget 5 >"$WORK/over.out" 2>"$WORK/over.err"
+rc=$?
+if [ $rc -eq 0 ] && [ "$(cat "$WORK/over.out")" = "# std#input" ] \
+    && grep -q '^try: .* guide std#input$' "$WORK/over.err"; then
+    result pass guide-find-over
+else
+    result FAIL guide-find-over "exit $rc:" "$(cat "$WORK/over.out")" "$(cat "$WORK/over.err")"
+fi
 "$COMPILER" guide --find xyzzy frobnicate >"$WORK/nofind.out" 2>&1
 rc=$?
 if [ $rc -eq 1 ] && grep -q '^error guide.no-match: ' "$WORK/nofind.out"; then
