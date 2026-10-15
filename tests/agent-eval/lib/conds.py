@@ -45,6 +45,13 @@ Modifiers, any order after the base:
 - `+recite`: one line after the task (prompts/recite.md): look a construct
   up with `guide --find` / `guide TOPIC#SECTION` before writing it (the
   research plan's item 9; the guide-core intro already says it).
+- (E3, E5, E6 of the delivery research) `+rewrite`: the query-first hook
+  runs a read of source whose query is not in doubt as that query instead
+  of blocking it (compiler-tools conditions only); `+nohints`: the hooks
+  give no hints (repeat-query, unfamiliar-construct); `+note`: a note when
+  a guide/query/explain/--help call prints again what it printed earlier
+  (tools/agent-hooks/lookup-note.py). Each is settings-eval.json's
+  `modifiers` entry of that name.
 
 `both+hook+test` is the rerun matrix's row D cell; `compiler-tools-core+test`
 the compiler one.
@@ -62,7 +69,10 @@ PROGRAM_BASES = ("bare", "guide", "tools", "both", "guide-core", "tools-core", "
                  "rust-pairs", "rust")
 COMPILER_BASES = ("compiler-tools", "compiler-plain", "compiler-tools-core")
 BASES = PROGRAM_BASES + COMPILER_BASES
-MODS = ("hook", "test", "turn-end", "recite")
+MODS = ("hook", "test", "turn-end", "recite", "rewrite", "nohints", "note")
+# (E3, E5, E6) the modifiers settings-eval.json's `modifiers` defines: an
+# environment for every hook of the run, more hooks
+HOOK_MODS = ("rewrite", "nohints", "note")
 
 # What each base puts in the prompt: guide (None, "full": `tachyonc guide`,
 # "core": prompts/guide-core.md), tools (None, "full": tools.md, "core":
@@ -110,12 +120,16 @@ class Cond:
         self.test = "test" in self.mods
         self.recite = "recite" in self.mods
         self.turn_end = "turn-end" in self.mods or self.test
+        self.hook_mods = tuple(m for m in self.mods if m in HOOK_MODS)
         if self.lang == "rust" and self.mods:
             raise ValueError("condition %r: rust takes no modifiers" % name)
         if self.compiler == "plain" and self.mods:
             raise ValueError("condition %r: compiler-plain takes no modifiers (no hooks)" % name)
         # the compiler-tools conditions: query-first and check hooks always
         self.query_hook = self.compiler in ("full", "core")
+        if "rewrite" in self.mods and not self.query_hook:
+            raise ValueError("condition %r: +rewrite needs the query-first hook "
+                             "(compiler-tools, compiler-tools-core)" % name)
         self.hook = "hook" in self.mods or self.query_hook or self.test
 
     def check_hook(self, flag=False):
@@ -183,5 +197,5 @@ def sort_key(name):
 
 
 def help_text():
-    return ("BASE[+MOD...]: bases %s; modifiers +hook, +test, +turn-end, +recite"
-            % ", ".join(BASES))
+    return ("BASE[+MOD...]: bases %s; modifiers %s"
+            % (", ".join(BASES), ", ".join("+" + m for m in MODS)))

@@ -86,7 +86,8 @@ def one_run(ctx, task, cond, rep):
     # in any: check after each change
     hook = ((ctx["hooks"]["check"], os.path.join(base, "check-hook.jsonl"))
             if lang == "tach" and (c.check_hook(ctx.get("check_hook")) or c.turn_end) else None)
-    extra = eval_hooks(ctx, c.settings_key(ctx.get("check_hook"))) if lang == "tach" else None
+    extra = eval_hooks(ctx, c.settings_key(ctx.get("check_hook")), c.hook_mods) \
+        if lang == "tach" else None
     env_note = ("claude-env.md" if ctx["backend"] == "claude"
                 and claude_backend.PERMS == "allowlist" else None)
     prompt = build_prompt(c, task.text(), ctx.get("guide"), env_note=env_note,
@@ -186,8 +187,10 @@ def one_compiler_run(ctx, task, cond, rep):
     c = conds.Cond(cond)
     tools = c.query_hook
     hook = (ctx["hooks"]["check"], os.path.join(base, "check-hook.jsonl")) if tools else None
-    qhook = ctx["hooks"]["query"] if tools else None
-    extra = eval_hooks(ctx, c.settings_key()) if tools else None
+    # (E3, E6) with +rewrite or +nohints the query-first hook comes from
+    # settings-eval.json too, with the modifiers' environment
+    qhook = ctx["hooks"]["query"] if tools and not c.hook_mods else None
+    extra = eval_hooks(ctx, c.settings_key(), c.hook_mods, query=bool(c.hook_mods)) if tools else None
     with open(os.path.join(ws, "AGENTS.md")) as fh:  # (the condition's)
         agents_text = fh.read()
     prompt = compiler_prompt(cond, task.text(), agents_text,
@@ -257,17 +260,21 @@ def one_compiler_run(ctx, task, cond, rep):
     return res
 
 
-def eval_hooks(ctx, key):
+def eval_hooks(ctx, key, mods=(), query=False):
     """(0.17) The hooks of settings-eval.json's condition `key` (None: no
     check or Stop hook), pointed at the copies; cached in ctx. None when
     the file does not exist (the conditions needing it refuse to run:
-    conds.Cond.needs), when the harness's own check hook is used instead."""
-    if key is None:
+    conds.Cond.needs), when the harness's own check hook is used instead.
+    (E3, E5, E6) mods: the condition's +rewrite, +nohints, +note (the
+    file's `modifiers`); query: the query-first hook from the file too."""
+    if key is None and not mods:
         return None
     cache = ctx.setdefault("eval_hooks", {})
-    if key not in cache:
-        cache[key] = eval_settings_hooks(conds.SETTINGS_EVAL, ctx["hooks"]["dir"], key)
-    return cache[key]
+    ck = (key, tuple(mods), query)
+    if ck not in cache:
+        cache[ck] = eval_settings_hooks(conds.SETTINGS_EVAL, ctx["hooks"]["dir"], key,
+                                        mods=mods, query=query)
+    return cache[ck]
 
 
 def dry_run(ctx, prompt, ws, rdir, check_hook, query_hook, extra_hooks=None):
@@ -392,7 +399,8 @@ def main(args):
                         "rust": tool_version(bins["rust"], "rust")}}
     # (0.17) every condition's hooks from settings-eval.json, checked now
     for c in cs:
-        eval_hooks(ctx, c.settings_key(args.check_hook))
+        eval_hooks(ctx, c.settings_key(args.check_hook) if not c.is_compiler else c.settings_key(),
+                   c.hook_mods, query=c.query_hook and bool(c.hook_mods))
     # (0.16) compiler tasks: the base, its builder and the starter's
     # compiler, built once per task (cached under the workspaces' root)
     ctx["ctasks"] = {}

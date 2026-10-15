@@ -79,8 +79,10 @@ def segments(command):
 
 
 def words_of(segment):
+    """The words of one simple command (from segments(), which leaves the
+    comments out: a `#` inside a word, `guide std#Vec`, is the word's)."""
     try:
-        return shlex.split(segment, comments=True)
+        return shlex.split(segment)
     except ValueError:
         return segment.split()
 

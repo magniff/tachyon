@@ -54,8 +54,17 @@ outside any program's module tree (not a main.tach, not declared by a
 judged by the script it runs, not by a here-document written to a file.
 After a Bash call (PostToolUse): a `# no-query:` reason that wants line
 numbers for the Edit tool is answered (`edit insert --after NAME`, `query
-def NAME`); the `repeat-query` hint of hints.txt after show, refs or def
-on one NAME three times in a row, once per NAME (state: hookstate.py).
+def NAME`); the `repeat-query` hint of hints.txt after the third show,
+refs, def or callers in a row on related items, once a session, not once
+`query context` ran, never with TACHYON_HINTS=0 (state: hookstate.py,
+its `query` part).
+
+(0.17, E6) TACHYON_QUERY_MODE=rewrite: a read whose query is not in doubt
+(rewrite_of: one reader of one file, after `cd`s only; `sed -n 'A,Bp'`,
+`head`, `tail -n N`, `cat`, `grep` of one name) runs as that query
+(PreToolUse `updatedInput` with permission `allow`, the `rewritten` note
+of hints.txt beside its result), logged as `rewritten`; any other read is
+blocked as in the default mode (`block`), and so is every write.
 Development tooling only: not part of the build.
 """
 import json
@@ -89,8 +98,9 @@ class _LazyState:
                 exec(compile(fh.read(), mod.__file__, "exec"), mod.__dict__)
             hs = mod
         except OSError:
-            hs = types.SimpleNamespace(load=lambda event: {}, save=lambda event, st: None,
-                                       hint=lambda key, **v: "")
+            hs = types.SimpleNamespace(load=lambda event, part=None: {},
+                                       save=lambda event, st, part=None: None,
+                                       hint=lambda key, **v: "", text=lambda key, **v: "")
         return getattr(hs, name)
 
 
@@ -713,14 +723,176 @@ def blocked_message(command, prog, args, seg, files, cwd):
     return "\n".join(lines) + "\n", tries
 
 
+# (0.17, E6) Rewrite instead of block: TACHYON_QUERY_MODE=rewrite runs a
+# read whose query is not in doubt as that query (PreToolUse `updatedInput`,
+# with a one-line note beside its result), so the agent loses no turn to a
+# refusal; anything else is blocked as before. Writes are always blocked.
+def query_mode():
+    return "rewrite" if os.environ.get("TACHYON_QUERY_MODE", "block") == "rewrite" else "block"
+
+
+GREP_FLAGS = set("nrRwHsI")
+
+
+def tachyonc_for(event, cwd, here):
+    """The tachyonc a rewritten command runs: the one the agent last ran
+    in this session, else target/tools/tachyonc, `tachyonc` on PATH,
+    target/tachyonc of cwd; as a path that works from `here` (the
+    directory the command runs in). None when there is none."""
+    import shutil
+    last = (hs.load(event, "query") or {}).get("tachyonc")
+    cands = [last] if last else []
+    cands += [os.path.join(cwd, "target", "tools", "tachyonc")]
+    if shutil.which("tachyonc"):
+        cands.append("tachyonc")
+    cands += [os.path.join(cwd, "target", "tachyonc")]
+    for c in cands:
+        if "/" not in c:
+            return c
+        full = c if os.path.isabs(c) else os.path.normpath(os.path.join(cwd, c))
+        if os.access(full, os.X_OK):
+            rel = os.path.relpath(full, here)
+            return rel if not rel.startswith("..") else full
+    return None
+
+
+def root_args(full, here):
+    """The `--root` a query about file `full` needs when run in `here`:
+    none when the program's root is here's (compiler/src/main.tach, or
+    main.tach), else `--root ROOT`."""
+    if "/compiler/src/" in full or "/compiler/std/" in full:
+        top = full.split("/compiler/")[0]
+        root = os.path.join(top, "compiler", "src", "main.tach")
+    else:
+        d, root = os.path.dirname(full), None
+        for _ in range(6):
+            if os.path.exists(os.path.join(d, "main.tach")):
+                root = os.path.join(d, "main.tach")
+                break
+            d = os.path.dirname(d)
+        if root is None:
+            return None
+    if root in (os.path.join(here, "compiler", "src", "main.tach"), os.path.join(here, "main.tach")):
+        return []
+    rel = os.path.relpath(root, here)
+    return ["--root", rel if not rel.startswith("..") else root]
+
+
+def rewrite_of(event, command, cwd, reads):
+    """(the command to run instead, the note's clause) for a read whose
+    query is not in doubt, else None: the line is one reader (after `cd`s)
+    of one source file, and the reader is
+    - `sed -n 'A,Bp' FILE` or `head [-n] N FILE` or `tail [-n] N FILE`:
+      `query text FILE:A-B`, the same lines;
+    - `cat FILE` (FILE over SMALL_LINES lines): `query items MODULE`, its
+      outline;
+    - `grep [-nrwH] NAME PATH` of one name: `query refs NAME` (`--in FILE`),
+      and where NAME is no item `query grep NAME`."""
+    if len(reads) != 1:
+        return None
+    prog, args, seg, files = reads[0]
+    if len(files) != 1 or files[0][1] is None:
+        return None
+    arg, full = files[0]
+    located = [x for x in tc.located(command, cwd) if x[0].strip() and not x[0].strip().startswith("#")]
+    if not located or located[-1][0].strip() != seg.strip():
+        return None
+    for _, words, _, _ in located[:-1]:
+        if not words or words[0] != "cd" or len(words) != 2 or "$" in words[1] or words[1] == "-":
+            return None
+    here = located[-1][2]
+    prefix = ""
+    if len(located) > 1:
+        rel = os.path.relpath(here, cwd)
+        prefix = "cd %s && " % shlex.quote(here if rel.startswith("..") else rel)
+    t = tachyonc_for(event, cwd, here)
+    if not t:
+        return None
+    ops = [a for a in args if a != arg]
+    n_lines = None
+    rng = None
+    if prog == "sed":
+        script = [a for a in ops if a != "-n"]
+        m = re.match(r"^(\d+)(?:,(\d+))?p$", script[0]) if len(script) == 1 and "-n" in ops else None
+        if not m:
+            return None
+        rng = (int(m.group(1)), int(m.group(2) or m.group(1)))
+    elif prog in ("head", "tail"):
+        n = None
+        if not ops:
+            n = 10
+        elif len(ops) == 2 and ops[0] == "-n" and ops[1].isdigit():
+            n = int(ops[1])
+        elif len(ops) == 1 and re.match(r"^-n?\d+$", ops[0]):
+            n = int(re.sub(r"\D", "", ops[0]))
+        if not n:
+            return None
+        if prog == "head":
+            rng = (1, n)
+        else:
+            try:
+                with open(full, "rb") as fh:
+                    total = sum(1 for _ in fh)
+            except OSError:
+                return None
+            rng = (max(1, total - n + 1), total)
+    if rng:
+        a, b = rng
+        if b < a:
+            return None
+        new = "%s query text %s:%d-%d" % (t, arg, a, b)
+        return prefix + new, "the same lines, each with its number"
+    if prog == "cat":
+        if any(o not in ("-n",) for o in ops):
+            return None
+        mod = module_of(full)
+        ra = root_args(full, here)
+        if not mod or ra is None:
+            return None
+        n_lines = lines_of_all(full)
+        new = " ".join([t, "query", "items", mod] + [shlex.quote(x) for x in ra])
+        why = ("%s is %s lines; this is its outline: `query show NAME` prints one item, "
+               "`query text %s:A-B` lines" % (arg, format(n_lines, ","), arg))
+        return prefix + new, why
+    if prog in ("grep", "rg"):
+        if prog == "rg":
+            return None
+        flags = [o for o in ops if o.startswith("-")]
+        pats = [o for o in ops if not o.startswith("-")]
+        if len(pats) != 1 or any(not set(f[1:]) <= GREP_FLAGS or f.startswith("--") for f in flags):
+            return None
+        name = re.sub(r"^(\\b|\\<|\^)|(\\b|\\>|\$)$", "", pats[0])
+        if not re.fullmatch(r"[A-Za-z_]\w*(?:::\w+)*", name):
+            return None
+        ra = root_args(full, here) if full.endswith(".tach") else []
+        if ra is None:
+            return None
+        inn = ["--in", arg] if full.endswith(".tach") else []
+        tail = " ".join(shlex.quote(x) for x in inn + ra)
+        tail = (" " + tail) if tail else ""
+        new = "%s query refs %s%s 2>/dev/null || %s query grep %s%s" % (t, name, tail, t, name, tail)
+        why = ("`query refs %s` lists its uses, each with its item; where %s is no item, "
+               "`query grep %s` the lines holding it" % (name, name, name))
+        return prefix + new, why
+    return None
+
+
+def lines_of_all(path):
+    try:
+        with open(path, "rb") as fh:
+            return sum(1 for _ in fh)
+    except OSError:
+        return 0
+
+
 LINE_FOR_EDIT = re.compile(r"line\s*(number|no\.?|numbers)?\b.*\b(edit|Edit)|\bfor\s+(the\s+)?Edit\b", re.I)
 
 
-def post_context(event, command, calls):
+def post_context(event, command, calls, out_text=""):
     """(0.17) What the agent is told after a Bash call, or "": the reply to
     a `# no-query:` reason that wants line numbers for the Edit tool; the
-    repeat-query hint (hints.txt) after show, refs or def on one NAME three
-    times in a row."""
+    repeat-query hint (hints.txt) after three show, refs or def calls in a
+    row on related items (repeat_query_hint)."""
     out = []
     esc = ESCAPE.search(command)
     if esc and LINE_FOR_EDIT.search(esc.group(1)):
@@ -728,27 +900,82 @@ def post_context(event, command, calls):
                    "`tachyonc edit insert --after NAME < text` adds an item after NAME, "
                    "`tachyonc edit patch NAME --old 'TEXT' --new 'TEXT'` changes lines in it, "
                    "and `tachyonc query def NAME` prints its FILE:LINE")
-    named = []
+    note = repeat_query_hint(event, calls, out_text)
+    if note:
+        out.append(note)
+    return "\n".join(out)
+
+
+QUERY_LOOKUPS = ("show", "refs", "def", "callers")
+TRIVIAL_HEADS = {"crate", "std", "self", "super", "Self"}
+WORD = re.compile(r"[A-Za-z_]\w{2,}")
+
+
+def name_parts(name):
+    return [p for p in re.split(r"::|\.", name) if p]
+
+
+def related(a, b):
+    """Whether query record b is about an item related to record a's: the
+    same name, a name and its type or module (`Foo` and `Foo::bar`), the
+    same last part (`ir::emit` and `emit`), or a name a's answer printed."""
+    for x in a["args"]:
+        px = name_parts(x)
+        for y in b["args"]:
+            py = name_parts(y)
+            if not px or not py:
+                continue
+            if x == y or px[-1] == py[-1]:
+                return True
+            short, long_ = (px, py) if len(px) <= len(py) else (py, px)
+            if long_[:len(short)] == short and not (len(short) == 1 and short[0] in TRIVIAL_HEADS):
+                return True
+            if py[-1] in a.get("out", ()):
+                return True
+    return False
+
+
+def repeat_query_hint(event, calls, out_text):
+    """(0.17, E3) The repeat-query hint, at the moment it applies: after the
+    third `query show|refs|def|callers` in a row on related items (related()),
+    once a session; never once the session has run `query context`."""
+    recs = []
+    used_context = False
     for sub, words, path, _ in calls:
         if sub != "query":
             continue
         rest = [w for w in words if not w.startswith("-")]
-        if len(rest) >= 3 and rest[1] in ("show", "refs", "def", "callers"):
-            named += [(rest[1], n) for n in rest[2:] if not n.endswith(".tach") and not re.match(r"^\d+$", n)]
-    if named:
-        st = hs.load(event)
-        recent = (st.get("queries") or []) + [list(x) for x in named]
-        recent = recent[-6:]
-        st["queries"] = recent
-        hinted = st.setdefault("hinted_names", [])
-        last3 = recent[-3:]
-        name = last3[-1][1]
-        if len(last3) == 3 and all(q[1] == name for q in last3) and name not in hinted:
-            hinted.append(name)
-            prog = calls[0][2] or "tachyonc"
-            out.append(hs.hint("repeat-query", NAME=name, TACHYONC=prog))
-        hs.save(event, st)
-    return "\n".join(out)
+        if len(rest) >= 2 and rest[1] == "context":
+            used_context = True
+        if len(rest) >= 3 and rest[1] in QUERY_LOOKUPS:
+            names = [n for n in rest[2:] if not n.endswith(".tach") and not re.match(r"^[\d:-]+$", n)
+                     and not re.search(r"\.tach:", n)]
+            if names:
+                recs.append({"args": names[:4], "prog": path or "tachyonc"})
+    if not recs and not used_context:
+        return ""
+    st = hs.load(event, "query")
+    if used_context:
+        st["used_context"] = True
+    if recs:
+        # (the names the answer printed: a callee, a caller, a field's type)
+        recs[-1]["out"] = sorted(set(WORD.findall(out_text or "")))[:400]
+        window = ((st.get("queries") or []) + recs)[-3:]
+        st["queries"] = window
+    else:
+        window = []
+    note = ""
+    hinted = st.setdefault("hinted", [])
+    if len(window) == 3 and "repeat-query" not in hinted and not st.get("used_context") \
+            and related(window[0], window[1]) and (related(window[1], window[2]) or related(window[0], window[2])):
+        # (the name asked about most; on a tie the first: where it began)
+        firsts = [r["args"][0] for r in window]
+        name = max(firsts, key=firsts.count)
+        note = hs.hint("repeat-query", NAME=name, TACHYONC=window[-1].get("prog") or "tachyonc")
+        if note:
+            hinted.append("repeat-query")
+    hs.save(event, st, "query")
+    return note
 
 
 def via(calls):
@@ -788,7 +1015,13 @@ def main():
                 log(gd, {"kind": "tool-result", "tool": tool_call[0], **via(calls),
                          "command": command[:300], "written": written,
                          "compiler": tool_target(command), "stderr": err[:300]})
-            context = post_context(event, command, calls)
+            ran = next((c[2] for c in calls if c[2] and not c[2].startswith("$")), None)
+            if ran and not err.startswith("error") and query_mode() == "rewrite":
+                st = hs.load(event, "query")
+                if st.get("tachyonc") != ran:
+                    st["tachyonc"] = ran
+                    hs.save(event, st, "query")
+            context = post_context(event, command, calls, out)
             if context:
                 log(gd, {"kind": "hint", "text": context[:300], "command": command[:300]})
                 json.dump({"hookSpecificOutput": {"hookEventName": "PostToolUse",
@@ -829,6 +1062,18 @@ def main():
             return 0
         if not query_ready(gd, cwd):
             log(gd, {"kind": "read-unenforced", "command": command[:300]})
+            return 0
+        rw = rewrite_of(event, command, cwd, reads) if query_mode() == "rewrite" else None
+        if rw:
+            new, why = rw
+            shown = command if len(command) <= 120 else command[:117] + "..."
+            note = hs.text("rewritten", FROM=shown, TO=new, WHY=why)
+            log(gd, {"kind": "rewritten", "program": reads[0][0], "command": command[:300],
+                     "to": new[:300]})
+            json.dump({"hookSpecificOutput": {
+                "hookEventName": "PreToolUse", "permissionDecision": "allow",
+                "permissionDecisionReason": "hook.query-first: a read of .tach source run as its query",
+                "updatedInput": dict(inp, command=new), "additionalContext": note}}, sys.stdout)
             return 0
         prog, args, seg, files = reads[0]
         message, tries = blocked_message(command, prog, args, seg, files, cwd)

@@ -83,7 +83,12 @@ tests/agent-eval/run.py run ... --skip-existing-in BASELINE_RUNDIR
   prompt, prompts/test.md or compiler-test.md, and the hooks of
   tools/agent-hooks/settings-eval.json, with the turn-end Stop hook),
   `+turn-end` (the Stop hook: with +hook settings-eval's `hook+turn-end`,
-  alone its `turn-end`), `+recite` (prompts/recite.md after the task).
+  alone its `turn-end`), `+recite` (prompts/recite.md after the task),
+  and settings-eval.json's `modifiers`: `+rewrite` (compiler-tools
+  conditions: the query-first hook runs an unambiguous read as its query
+  instead of blocking it), `+nohints` (the hooks give no hints),
+  `+note` (tools/agent-hooks/lookup-note.py: a note when a lookup prints
+  again what it printed earlier).
   Every check and Stop hook a condition registers is settings-eval.json's
   entry for it (`conds.Cond.settings_key`), its files copied out of the
   repository with the scripts.

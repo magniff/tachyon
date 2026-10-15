@@ -1020,9 +1020,27 @@ condition in tools/agent-hooks/settings-eval.json for the agent eval):
   source. The blocked record logs the `try:` commands it gave. After a
   call: a `# no-query:` reason asking for line numbers for the Edit tool
   is answered with `edit insert --after NAME` and `query def NAME`; the
-  hints of tools/agent-hooks/hints.txt (`repeat-query` after show, refs
-  and def on one name; `unfamiliar-construct` from the check hook) are
-  printed as written there.
+  hints of tools/agent-hooks/hints.txt (`repeat-query` after the third
+  show, refs, def or callers in a row on related items: one name, a name
+  and its type or module, a name the previous answer printed;
+  `unfamiliar-construct` from the check hook) are printed as written
+  there, each once a session; TACHYON_HINTS=0 turns them off. Every text
+  a hook adds is a factual statement with its command, the same words
+  every time (no times, no ids: appended text is written to the prompt
+  cache once). With TACHYON_QUERY_MODE=rewrite (the eval's `+rewrite`), a
+  read whose query is not in doubt runs as that query instead of being
+  blocked (PreToolUse `updatedInput`, permission `allow`, and a one-line
+  `note hook.query-first: ... ran as ...` beside the result): `sed -n
+  'A,Bp' F`, `head -N F`, `tail -n N F` → `query text F:A-B`; `cat F` →
+  `query items MODULE`; `grep -n NAME F` (flags among `-nrRwHsI`) →
+  `query refs NAME --in F`, else `query grep NAME`. A pipe, several
+  files, a regex or another flag is blocked as before; writes always are.
+- **lookup-note.py** (PostToolUse on Bash; the eval's `+note`): when a
+  `guide`, `query`, `explain` or `--help` call prints the same text as
+  the same call earlier in the session, one line: ``note: `tachyonc
+  guide std` printed the same text at shell call 4 of this session``, once
+  per call. The call runs: an old result may have been cleared from the
+  context. TACHYON_LOOKUP_NOTE=0 turns it off.
 
 The hooks keep a small per-session state ($TACHYON_HOOK_STATE, default
 $TMPDIR/tachyon-agent-hooks). Measured on an M-series Mac under load

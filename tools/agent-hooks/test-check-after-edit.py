@@ -255,6 +255,15 @@ try:
     run(ev, fake2, state)
     fake_says([b])
     case("hint: once a session", "guide --find" in ctx_of(run(ev, fake2, state)[1]), False)
+    # (E3) TACHYON_HINTS=0: the same mistake twice, no hint
+    off = dict(ev, session_id="delta-nohints")
+    os.environ["TACHYON_HINTS"] = "0"
+    for says in ([b], [], [b]):
+        fake_says(says)
+        got = ctx_of(run(off, fake2, state)[1])
+    del os.environ["TACHYON_HINTS"]
+    case("hint: off with TACHYON_HINTS=0", (got.startswith("tachyonc check main.tach: 1 error"),
+                                             "guide --find" in got), (True, False))
 
     # (0.17) A worktree's file edited from a session in the main checkout:
     # the worktree's root and compiler, check run in the worktree (check

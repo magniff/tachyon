@@ -315,7 +315,106 @@ with tempfile.TemporaryDirectory() as tmp:
          hook.hs.hint("repeat-query", NAME="run_gvn", TACHYONC="tachyonc"))
     case("repeat-query: the hint names context", "query context run_gvn" in hint, True)
     at(repo, "tachyonc query show run_gvn", "PostToolUse", "x\n")
-    case("repeat-query: once per name", OUT[0], "")
+    case("repeat-query: once a session", OUT[0], "")
+
+    # (E3) The hint at the moment of need: three lookups in a row on
+    # related items; once a session; not after `query context`; off with
+    # TACHYON_HINTS=0.
+    def post(session, command, stdout="x\n"):
+        run({"hook_event_name": "PostToolUse", "tool_name": "Bash", "cwd": repo, "session_id": session,
+             "tool_input": {"command": command}, "tool_response": {"stdout": stdout, "stderr": ""}})
+        return json.loads(OUT[0])["hookSpecificOutput"]["additionalContext"] if OUT[0] else ""
+    post("rel-1", "tachyonc query show Lexer")
+    post("rel-1", "tachyonc query refs Lexer::next")
+    case("related: a type and its method, then the method", post("rel-1", "tachyonc query def next"),
+         hook.hs.hint("repeat-query", NAME="Lexer", TACHYONC="tachyonc"))
+    case("related: once a session", post("rel-1", "tachyonc query show Lexer"), "")
+    post("rel-2", "tachyonc query show alpha")
+    post("rel-2", "tachyonc query show beta")
+    case("unrelated names: no hint", post("rel-2", "tachyonc query show gamma"), "")
+    post("rel-3", "target/tools/tachyonc query show alpha", "fn alpha() { beta(1) }\n")
+    post("rel-3", "target/tools/tachyonc query show beta", "fn beta(x: i64) { gamma(x) }\n")
+    got = post("rel-3", "target/tools/tachyonc query refs gamma")
+    case("related through the answers: a callee's callee", got,
+         hook.hs.hint("repeat-query", NAME="alpha", TACHYONC="target/tools/tachyonc"))
+    case("the hint is a statement with the command", got.startswith("note: `target/tools/tachyonc query "
+                                                                    "context alpha` prints"), True)
+    post("rel-4", "tachyonc query context Lexer")
+    post("rel-4", "tachyonc query show Lexer")
+    post("rel-4", "tachyonc query refs Lexer")
+    case("no hint once query context ran", post("rel-4", "tachyonc query def Lexer"), "")
+    os.environ["TACHYON_HINTS"] = "0"
+    post("rel-5", "tachyonc query show Lexer")
+    post("rel-5", "tachyonc query refs Lexer")
+    case("TACHYON_HINTS=0: no hint", post("rel-5", "tachyonc query def Lexer"), "")
+    del os.environ["TACHYON_HINTS"]
+
+    # (E6) Rewrite mode: an unambiguous read runs as its query (updatedInput,
+    # permission allow, a one-line note); anything else is blocked as before.
+    tools = os.path.join(repo, "target", "tools")
+    os.makedirs(tools)
+    pathbin = os.path.join(tmp, "bin")
+    os.makedirs(pathbin)
+    for d in (tools, pathbin):
+        with open(os.path.join(d, "tachyonc"), "w") as fh:
+            fh.write("#!/bin/sh\n")
+        os.chmod(os.path.join(d, "tachyonc"), 0o755)
+    old_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = pathbin + ":" + old_path
+
+    def rewritten(cwd, command, session="rw"):
+        st, err, recs = run({"hook_event_name": "PreToolUse", "tool_name": "Bash", "cwd": cwd,
+                             "session_id": session, "tool_input": {"command": command,
+                                                                   "description": "d"}})
+        if st != 0 or not OUT[0]:
+            return st, None, None, recs
+        o = json.loads(OUT[0])["hookSpecificOutput"]
+        return st, o, o["updatedInput"]["command"], recs
+    st, err = blocked("sed -n '120,180p' compiler/src/gvn.tach")
+    case("block mode is the default", st, True)
+    os.environ["TACHYON_QUERY_MODE"] = "rewrite"
+    st, o, cmd, recs = rewritten(repo, "sed -n '120,180p' compiler/src/front/big.tach")
+    case("rewrite sed -n: query text", cmd, "target/tools/tachyonc query text compiler/src/front/big.tach:120-180")
+    case("rewrite: the shape", (o["hookEventName"], o["permissionDecision"], o["updatedInput"]["description"]),
+         ("PreToolUse", "allow", "d"))
+    case("rewrite: the note", o["additionalContext"],
+         "note hook.query-first: `sed -n '120,180p' compiler/src/front/big.tach` ran as "
+         "`target/tools/tachyonc query text compiler/src/front/big.tach:120-180`: "
+         "the same lines, each with its number")
+    case("rewrite: logged", [(r["kind"], r["to"]) for r in recs if r["kind"] == "rewritten"],
+         [("rewritten", cmd)])
+    case("rewrite tail -n", rewritten(repo, "tail -n 50 compiler/src/front/big.tach")[2],
+         "target/tools/tachyonc query text compiler/src/front/big.tach:351-400")
+    case("rewrite head -N, a program on PATH's tachyonc", rewritten(prog, "head -350 util.tach")[2],
+         "tachyonc query text util.tach:1-350")
+    st, o, cmd, _ = rewritten(repo, "cat compiler/src/front/big.tach")
+    case("rewrite cat of a large file: its outline", cmd, "target/tools/tachyonc query items crate::front::big")
+    case("rewrite cat: the note says how to read more", "is 400 lines; this is its outline: `query show NAME`"
+         in o["additionalContext"], True)
+    case("rewrite cat in a program", rewritten(prog, "cat -n util.tach")[2], "tachyonc query items crate::util")
+    case("rewrite grep of a name", rewritten(repo, "grep -n f12 compiler/src/front/big.tach")[2],
+         "target/tools/tachyonc query refs f12 --in compiler/src/front/big.tach 2>/dev/null || "
+         "target/tools/tachyonc query grep f12 --in compiler/src/front/big.tach")
+    case("rewrite grep -rnw of a name in the tree", rewritten(repo, "grep -rnw '\\bf12\\b' compiler/src")[2],
+         "target/tools/tachyonc query refs f12 2>/dev/null || target/tools/tachyonc query grep f12")
+    case("rewrite after cd", rewritten(tmp, "cd repo && sed -n 5,9p compiler/src/front/big.tach")[2],
+         "cd repo && tachyonc query text compiler/src/front/big.tach:5-9")
+    os.makedirs(os.path.join(repo, "target"), exist_ok=True)
+    shutil.copy(os.path.join(tools, "tachyonc"), os.path.join(repo, "target", "tachyonc"))
+    post("rw-last", "target/tachyonc query items crate")
+    case("rewrite: the tachyonc the agent ran last",
+         rewritten(repo, "head -400 compiler/src/front/big.tach", "rw-last")[2],
+         "target/tachyonc query text compiler/src/front/big.tach:1-400")
+    for amb in ("grep -n 'f1.*' compiler/src/front/big.tach", "grep -c f12 compiler/src/front/big.tach",
+                "grep -in f12 compiler/src/front/big.tach", "sed -n '1,5p;9p' compiler/src/front/big.tach",
+                "sed -n '/fn/p' compiler/src/front/big.tach", "cat compiler/src/front/big.tach | head -400",
+                "cat compiler/src/front/big.tach main.tach", "ls; cat compiler/src/front/big.tach",
+                "cd $X && cat compiler/src/front/big.tach"):
+        case("ambiguous, still blocked: " + amb, rewritten(repo, amb)[0], 2)
+    case("writes still blocked in rewrite mode",
+         rewritten(repo, "sed -i '' 's/f1/g1/' compiler/src/front/big.tach")[0], 2)
+    del os.environ["TACHYON_QUERY_MODE"]
+    os.environ["PATH"] = old_path
 shutil.rmtree(STATE, ignore_errors=True)
 
 print("total", "ok" if FAILED == 0 else f"{FAILED} failed")

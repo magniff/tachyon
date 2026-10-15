@@ -60,7 +60,8 @@ it is the one on PATH, else its path from the event's directory), so the
   slower than SLOW_MS; turn-end.py runs what was left), its counts and
   the newly failing cases. TACHYON_CHECK_TESTS=0 leaves them out.
 - The hint `unfamiliar-construct` of hints.txt, once a session, when the
-  same error is made twice or an error's help names the guide.
+  same error is made twice or an error's help names the guide
+  (TACHYON_HINTS=0: never).
 
 TACHYON_CHECK_HOOK=0 turns it off. Development tooling only.
 """
@@ -558,8 +559,10 @@ def verify(event, st, compiler, root, cwd, edited, at_turn_end=False):
             seen[k] = seen.get(k, 0) + 1
             if (seen[k] >= 2 or any("guide " in h for h in d.get("help") or [])) and \
                     "unfamiliar-construct" not in hinted:
-                hinted.append("unfamiliar-construct")
-                texts.append(hs.hint("unfamiliar-construct", TACHYONC=tachyonc_shown(compiler, run_dir)))
+                note = hs.hint("unfamiliar-construct", TACHYONC=tachyonc_shown(compiler, run_dir))
+                if note:  # ("" when TACHYON_HINTS=0)
+                    hinted.append("unfamiliar-construct")
+                    texts.append(note)
             new_keys.discard(k)
     rec = {"kind": "check-hook", "tool": event.get("tool_name") or event.get("hook_event_name"),
            "root": shown[-120:], "errors": len(errors),
