@@ -16,7 +16,8 @@
 set -eu
 cd "$(dirname "$0")/../.."
 out=compiler/src/front/stdsrc.tach
-tmp=$(mktemp)
+# (next to the output: writable in a sandbox that only allows the tree, and mv is a rename)
+tmp=$(mktemp "$out.XXXXXX")
 files="std iter io fmt convert clone alloc"
 # (sed, not awk: awks differ on backslashes in replacements.)
 lines() {
