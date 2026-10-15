@@ -22,7 +22,8 @@ after creating the value with `defer x.free();`.
 - `get`, `set`, slice indexing and `unwrap` are checked: a failure prints
   a message and exits with 101.
 - `HashMap` keys need `Hash` and `Eq` (integers, `bool`, `[u8]` have
-  them; for a struct key, write `impl Hash`; `==` is structural). `get`
+  them; for a struct key, write `impl Hash`; `==` is structural). `==` on
+  Vecs, Bufs and maps compares their contents (0.15). `get`
   returns a copy of the value in an `Option`. Iterate with
   `for i in 0..m.slots()` and `key_at(i)`/`value_at(i)`, in slot order
   (not the order of insertion).

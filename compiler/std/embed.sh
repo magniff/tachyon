@@ -5,6 +5,7 @@
 # module, built into the compiler as a function that writes it to a buffer
 # (string literals cannot span lines, so one call per line).
 # Run it after changing any of them; tests/run.sh checks they agree.
+# (0.15) It also writes std_index, the sections' index (index.awk).
 #
 # usage: compiler/std/embed.sh [-c]   (-c: only check, exit 1 if stale)
 set -eu
@@ -25,6 +26,16 @@ files="std iter io fmt convert clone"
     # (sed, not awk: awks differ on backslashes in replacements.)
     for f in $files; do cat "compiler/std/$f.tach"; done |
         sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/^/        buf_str(out, c"/' -e 's/$/\\n");/'
+    echo "    }"
+    echo "}"
+    echo ""
+    echo "// (0.15) The index of std's sections (compiler/std/index.awk): what"
+    echo "// each defines and needs, so that a program's loader lexes only the"
+    echo "// sections it can reach (front/modules: load_std_sections)."
+    echo "pub fn std_index(out: i64) {"
+    echo "    unsafe {"
+    for f in $files; do cat "compiler/std/$f.tach"; done | LC_ALL=C awk -f compiler/std/index.awk |
+        grep -v '^#' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/^/        buf_str(out, c"/' -e 's/$/\\n");/'
     echo "    }"
     echo "}"
 } >"$tmp"

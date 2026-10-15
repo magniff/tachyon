@@ -192,7 +192,7 @@ fn main() -> i32 {
 A match must cover every value; arms can have `|`, ranges `a..=b` and
 guards `if`. `use Shape::{Circle, Empty};` lets variants be written
 without `Shape::`. `==` compares structs, enums, tuples and arrays field
-by field; `[u8]` compares by bytes.
+by field; `[u8]` compares by bytes, a `Vec` or `HashMap` by contents.
 
 ## Generics and traits
 

@@ -4,7 +4,7 @@
 ## A method #[derive] makes: the attribute answers (0.15).
 $ items
 crate	syntax015/main.tach	6
-std	<std>	350
+std	<std>	357
 $ show main
 // crate::main	syntax015/main.tach:25-31
 fn main() -> Option<i64> {

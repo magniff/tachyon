@@ -186,7 +186,7 @@ fn main() -> i32 {
 | `char`, a non-ASCII `char` literal | `u8`, ASCII literals only; `"\u{e9}"` in strings is UTF-8 bytes |
 | `()` | `()` |
 | `!` (never) | `!`: `fn fail() -> ! { ... }` |
-| `#[derive(PartialEq, Eq)]` | `==` is structural for structs, enums, tuples, arrays; `#[derive(Eq)]` checks it |
+| `#[derive(PartialEq, Eq)]` | `==` is structural for structs, enums, tuples, arrays; `Vec`, `Buf`, `HashMap` by contents (0.15); `#[derive(Eq)]` checks it |
 | `#[derive(Clone, Copy, Debug, Default, Hash)]` | `#[derive(Clone, Debug, Hash, Ord)]` (0.15); every value copies, no `Copy`, no `Default` |
 | `impl Display`, `{:?}` | `impl Display for T { fn fmt(self: *T, f: *Fmt) {..} }`, `{x:?}` (0.15, `guide formatting`) |
 | `impl From<A> for B`, `.into()` | the same (0.15, `guide conversions`) |
