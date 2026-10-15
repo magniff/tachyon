@@ -1812,20 +1812,22 @@ besides its own tables:
   registers constant data at that join.
 
 **Measured** (aarch64-macos, the compiler compiling itself, `-c`; wall
-time best of 5 alternating on a loaded machine (load 9 to 20),
-instructions retired, peak RSS; v0.15.0 and release-0.17 before this
-work on the same source):
+time best of 5 alternating (load about 5), instructions retired, peak
+RSS; v0.15.0 and release-0.17 before this work on the same source;
+after: with 0.17's cheaper f-strings, below, merged):
 
 | | v0.15.0 | before | after |
 |---|---|---|---|
-| -O0 wall / instructions / RSS | 358 ms / 6.94 G / 284 MB | 348 ms / 6.99 G / 294 MB | 286 ms / 5.45 G / 287 MB |
-| -O1 | 962 ms / 13.86 G / 534 MB | 988 ms / 14.01 G / 548 MB | 677 ms / 10.70 G / 347 MB |
-| -O2 | 2816 ms / 49.15 G / 755 MB | 2688 ms / 45.75 G / 766 MB | 1730 ms / 28.36 G / 485 MB |
-| a 7-line std program, -O0 | 3.0 ms / 37 M | 3.4 ms / 43 M | 3.3 ms / 39 M |
-| the same, -O2 | 5.2 ms / 64 M | 6.3 ms / 79 M | 5.8 ms / 71 M |
+| -O0 wall / instructions / RSS | 317 ms / 6.96 G / 284 MB | 313 ms / 7.02 G / 289 MB | 255 ms / 5.45 G / 254 MB |
+| -O1 | 910 ms / 13.93 G / 533 MB | 916 ms / 14.08 G / 543 MB | 676 ms / 10.90 G / 353 MB |
+| -O2 | 2745 ms / 49.50 G / 762 MB | 2656 ms / 46.02 G / 764 MB | 1677 ms / 28.05 G / 471 MB |
+| a 7-line std program, -O0 | 2.8 ms / 37 M | 3.1 ms / 43 M | 3.0 ms / 39 M |
+| the same, -O2 | 5.0 ms / 64 M | 5.9 ms / 79 M | 5.5 ms / 71 M |
+| the same with `println(f"sum {s}")`, -O2 | | 7.4 ms / 104 M | 6.4 ms / 87 M |
 
 The phases (`--time-passes` counting instructions, millions; before →
-after):
+after, before the f-string work was merged: its -O1 leaf inlining adds
+about 2% to -O1):
 
 | phase | -O0 | -O1 | -O2 |
 |---|---|---|---|
@@ -1917,7 +1919,9 @@ Neither is done.
 
 **Measured** (aarch64-macos, instructions retired, best of 9; the
 compiler built as bootstrap.sh builds it; "self" is the compile of
-0.17's compiler source as of this change, `-c`):
+0.17's compiler source as of this change, `-c`; this work alone, on
+0.16's pipeline: with the rest of 0.17's compile-time work see "0.17:
+compile time"):
 
 | | v0.15.0 | 0.16 (before) | 0.17 |
 |---|---|---|---|
