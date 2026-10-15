@@ -15,6 +15,9 @@ Program tasks (tasks/):
 - `tools-core`: bare + the tiered tools preamble (prompts/tools-core.md:
   eight rows, `query context` first, and where the rest is).
 - `both-core`: guide-core + tools-core (what a user gets once both land).
+- `guide-mini` (0.17 iterations): bare + prompts/guide-mini.md, a ~600-token
+  always-loaded core (the main Rust differences in one compiled example,
+  then the lookup lines); with `+readfirst` the iteration-1 cell.
 - `rust-pairs`: bare + paired Rust -> tachyon lines (prompts/rust-pairs.md),
   about the core guide's budget: the differences shown as pairs instead
   of tachyon-only examples.
@@ -45,6 +48,9 @@ Modifiers, any order after the base:
 - `+recite`: one line after the task (prompts/recite.md): look a construct
   up with `guide --find` / `guide TOPIC#SECTION` before writing it (the
   research plan's item 9; the guide-core intro already says it).
+- `+readfirst` (0.17 iterations): prompts/readfirst.md after the guide:
+  read the code in the directory first, follow its patterns, look up
+  (`guide --find`, `guide TOPIC#SECTION`) only what the code does not show.
 
 `both+hook+test` is the rerun matrix's row D cell; `compiler-tools-core+test`
 the compiler one.
@@ -59,10 +65,10 @@ import os
 from lib.common import HOOKS_DIR, PROMPTS_DIR
 
 PROGRAM_BASES = ("bare", "guide", "tools", "both", "guide-core", "tools-core", "both-core",
-                 "rust-pairs", "rust")
+                 "rust-pairs", "guide-mini", "rust")
 COMPILER_BASES = ("compiler-tools", "compiler-plain", "compiler-tools-core")
 BASES = PROGRAM_BASES + COMPILER_BASES
-MODS = ("hook", "test", "turn-end", "recite")
+MODS = ("hook", "test", "turn-end", "recite", "readfirst")
 
 # What each base puts in the prompt: guide (None, "full": `tachyonc guide`,
 # "core": prompts/guide-core.md), tools (None, "full": tools.md, "core":
@@ -77,6 +83,7 @@ _PARTS = {
     "tools-core": {"tools": "core"},
     "both-core": {"guide": "core", "tools": "core"},
     "rust-pairs": {"pairs": True},
+    "guide-mini": {"guide": "mini"},
     "rust": {},
     "compiler-tools": {"compiler": "full"},
     "compiler-plain": {"compiler": "plain"},
@@ -109,6 +116,7 @@ class Cond:
         self.lang = "compiler" if self.is_compiler else ("rust" if self.base == "rust" else "tach")
         self.test = "test" in self.mods
         self.recite = "recite" in self.mods
+        self.readfirst = "readfirst" in self.mods
         self.turn_end = "turn-end" in self.mods or self.test
         if self.lang == "rust" and self.mods:
             raise ValueError("condition %r: rust takes no modifiers" % name)
@@ -183,5 +191,5 @@ def sort_key(name):
 
 
 def help_text():
-    return ("BASE[+MOD...]: bases %s; modifiers +hook, +test, +turn-end, +recite"
+    return ("BASE[+MOD...]: bases %s; modifiers +hook, +test, +turn-end, +recite, +readfirst"
             % ", ".join(BASES))

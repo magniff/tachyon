@@ -55,12 +55,16 @@ def preamble(cond, guide=None, env_note=None, check_hook=False, guide_core=None)
             parts.append(_read("guide-intro.md") + "\n\n" + guide)
         elif c.guide == "core":
             parts.append(guide_core_text(guide_core))
+        elif c.guide == "mini":
+            parts.append(_read("guide-mini.md"))
         if c.pairs:
             parts.append(_read("rust-pairs.md"))
         if c.tools == "full":
             parts.append(_read("tools.md"))
         elif c.tools == "core":
             parts.append(_read("tools-core.md"))
+        if c.readfirst:
+            parts.append(_read("readfirst.md"))
         if c.test:
             parts.append(_read("test.md"))
         if check_hook:
