@@ -6,7 +6,8 @@
 
 use TyKind::{Array, Enum, Fn, Prim, Ptr, Slice, Struct, Tuple, Vector};
 use crate::base::{
-    IntVec, alloc_array, buf_byte, buf_int, buf_str, die, free, grow, intern_c, sym_name, sym_table,
+    IntVec, alloc_array, alloc_zeroed, buf_byte, buf_int, buf_str, die, free, grow, intern_c,
+    sym_name, sym_table,
 };
 use crate::base::diag::{ERR, ERR_POISONED};
 use crate::front::ast::{
@@ -62,11 +63,12 @@ pub static mut TY_V16I8: i64 = 0;
 fn add_type(kind: TyKind, a: i64, b: i64, list: i64, count: i64) -> i64 {
     unsafe {
         TYPES = grow(TYPES, TYPE_COUNT, &TYPE_CAP);
-        TYPES[TYPE_COUNT] = Type {
-            kind: kind, a: a, b: b, list: list, count: count, size: -1, align: 1
-        };
+        TYPES[TYPE_COUNT] = Type { kind, a, b, list, count, size: -1, align: 1 };
     }
     TYPE_COUNT += 1;
+    if TYPE_COUNT - 1 >= FIRST_CONSTRUCTED {
+        type_hash_insert(TYPE_COUNT - 1);
+    }
     TYPE_COUNT - 1
 }
 
@@ -79,13 +81,10 @@ pub fn type_elem(t: i64, i: i64) -> i64 {
 pub fn make_type(kind: TyKind, a: i64, b: i64, mark: i64) -> i64 {
     unsafe {
         let count = TSCRATCH.count - mark;
-        for t in FIRST_CONSTRUCTED..TYPE_COUNT {
-            if TYPES[t].kind == kind && TYPES[t].a == a && TYPES[t].b == b
-                && TYPES[t].count == count
-                && same_elems(t, mark) {
-                TSCRATCH.count = mark;
-                return t;
-            }
+        let found = type_hash_find(kind, a, b, mark, count);
+        if found >= 0 {
+            TSCRATCH.count = mark;
+            return found;
         }
         let list = TLISTS.count;
         for i in mark..TSCRATCH.count {
@@ -105,6 +104,79 @@ fn same_elems(t: i64, mark: i64) -> bool {
         }
     }
     true
+}
+
+// (0.16) The constructed types (ids from FIRST_CONSTRUCTED) by their fields,
+// for make_type: open addressing, TYPE_HASH[slot] = id + 1 (0: empty).
+// A lookup returns the lowest id of equal types, as the scan over every
+// type that this replaces did.
+static mut TYPE_HASH: *i64 = 0 as *i64;
+static mut TYPE_HASH_SIZE: i64 = 0;
+static mut TYPE_HASH_USED: i64 = 0;
+
+fn type_hash(kind: TyKind, a: i64, b: i64, elems: *i64, count: i64) -> i64 {
+    unsafe {
+        let mut h: u64 = 14695981039346656037;
+        h = (h ^ (kind as i64) as u64) * 1099511628211;
+        h = (h ^ a as u64) * 1099511628211;
+        h = (h ^ b as u64) * 1099511628211;
+        h = (h ^ count as u64) * 1099511628211;
+        for i in 0..count {
+            h = (h ^ elems[i] as u64) * 1099511628211;
+        }
+        ((h ^ (h >> 29)) & 0x7fffffffffffffff) as i64
+    }
+}
+
+// The lowest id of a constructed type with these fields and the elements
+// TSCRATCH[mark..mark + count], or -1.
+fn type_hash_find(kind: TyKind, a: i64, b: i64, mark: i64, count: i64) -> i64 {
+    unsafe {
+        if TYPE_HASH_SIZE == 0 {
+            return -1;
+        }
+        let mask = TYPE_HASH_SIZE - 1;
+        let mut slot = type_hash(kind, a, b, &TSCRATCH.data[mark], count) & mask;
+        let mut found = -1;
+        while TYPE_HASH[slot] != 0 {
+            let t = TYPE_HASH[slot] - 1;
+            if TYPES[t].kind == kind && TYPES[t].a == a && TYPES[t].b == b
+                && TYPES[t].count == count && same_elems(t, mark) && (found < 0 || t < found) {
+                found = t;
+            }
+            slot = (slot + 1) & mask;
+        }
+        found
+    }
+}
+
+fn type_hash_insert(t: i64) {
+    unsafe {
+        if (TYPE_HASH_USED + 1) * 2 > TYPE_HASH_SIZE {
+            let size = if TYPE_HASH_SIZE == 0 { 1024 } else { TYPE_HASH_SIZE * 2 };
+            free(TYPE_HASH as *u8);
+            TYPE_HASH = alloc_zeroed(size * 8) as *i64;
+            TYPE_HASH_SIZE = size;
+            TYPE_HASH_USED = 0;
+            for u in FIRST_CONSTRUCTED..t {
+                type_hash_put(u);
+            }
+        }
+        type_hash_put(t);
+    }
+}
+
+fn type_hash_put(t: i64) {
+    unsafe {
+        let mask = TYPE_HASH_SIZE - 1;
+        let mut slot = type_hash(TYPES[t].kind, TYPES[t].a, TYPES[t].b, &TLISTS.data[TYPES[t].list],
+            TYPES[t].count) & mask;
+        while TYPE_HASH[slot] != 0 {
+            slot = (slot + 1) & mask;
+        }
+        TYPE_HASH[slot] = t + 1;
+        TYPE_HASH_USED += 1;
+    }
 }
 
 pub fn ptr_to(t: i64) -> i64 {
