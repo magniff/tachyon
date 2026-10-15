@@ -7,7 +7,8 @@
 // on find (tools/explain).
 
 use crate::base::{IntVec, buf_byte, buf_bytes, buf_new, buf_slice};
-use crate::guide::render;
+use crate::guide::{render, render_doc};
+use crate::guide::stdapi::{API_DOC, impl_name, item_name, std_api};
 use crate::guide::text::{TOPIC_COUNT, topic_name};
 
 // The budget of `--find` without --budget, in tokens.
@@ -248,6 +249,127 @@ fn is_code(s: [u8]) -> bool {
     starts(s, "```")
 }
 
+// (0.17) Whether name is the query word w (lower case), case aside.
+fn same_name(name: [u8], w: [u8]) -> bool {
+    if name.len != w.len || name.len == 0 {
+        return false;
+    }
+    for i in 0..name.len {
+        if lower(name[i]) != w[i] {
+            return false;
+        }
+    }
+    true
+}
+
+// (0.17) Whether a query word names item `name` (in the impl of type
+// `owner`, "" outside one): `split_in`, `scanner`, `vec::push`.
+fn names_item(w: [u8], owner: [u8], name: [u8]) -> bool {
+    let mut k = w.len - 1;
+    while k > 0 && !(w[k] == ':' && w[k - 1] == ':') {
+        k -= 1;
+    }
+    if k > 0 {
+        return same_name(owner, w[0..k - 1]) && same_name(name, w[k + 1..]);
+    }
+    same_name(name, w)
+}
+
+// (0.17) For `guide --find`: the std items the query's words name (a
+// function or method: `split_in`, `push`, `vec::push`; a type or trait:
+// `scanner`), each with its comment (a method under its impl's header; a
+// type with its methods' signatures), into out within `budget` bytes;
+// the bytes written.
+fn std_items(words: *IntVec, budget: i64, out: i64) -> i64 {
+    unsafe {
+        let src = buf_new();
+        std_api(src, API_DOC);
+        let s = buf_slice(src);
+        let piece = buf_new();
+        let mut head: [u8] = "";
+        let mut owner: [u8] = "";
+        let mut head_put = false;
+        let mut doc_from = -1;
+        let mut i = 0;
+        while i < s.len {
+            let e = line_end(s, i);
+            let line = s[i..e];
+            let mut t = line;
+            while t.len > 0 && t[0] == ' ' {
+                t = t[1..];
+            }
+            if starts(t, "//") {
+                if doc_from < 0 {
+                    doc_from = i;
+                }
+                i = e + 1;
+                continue;
+            }
+            if starts(line, "impl") && line.len > 2 && line[line.len - 1] == '{' {
+                head = line;
+                owner = impl_name(line);
+                head_put = false;
+            } else if line == "}" {
+                if head_put {
+                    buf_bytes(piece, "}\n");
+                }
+                head = "";
+                owner = "";
+                head_put = false;
+            } else {
+                let it = item_name(t);
+                let name = it.0;
+                let mut hit = false;
+                let mut whole = false;
+                for k in 0..(*words).count {
+                    let w = buf_slice((*words).data[k]);
+                    // (a word among others: only a name no prose has,
+                    // `split_in`, `vec::push`; alone, any name: `sort`)
+                    let named = (*words).count == 1 || holds(w, "_") || holds(w, "::");
+                    if named && name.len > 0 && names_item(w, owner, name) {
+                        hit = true;
+                    }
+                    if named && head.len > 0 && it.1 == false && same_name(owner, w) {
+                        whole = true;
+                    }
+                }
+                if (hit || whole) && head.len > 0 && !head_put {
+                    buf_bytes(piece, head);
+                    buf_bytes(piece, "\n");
+                    head_put = true;
+                }
+                if hit && doc_from >= 0 {
+                    buf_bytes(piece, s[doc_from..i]);
+                }
+                if hit || whole {
+                    buf_bytes(piece, line);
+                    buf_bytes(piece, "\n");
+                }
+            }
+            doc_from = -1;
+            i = e + 1;
+        }
+        let got = buf_slice(piece);
+        if got.len == 0 {
+            return 0;
+        }
+        let mut n = got.len;
+        if n + 16 > budget {
+            n = budget - 40;
+            while n > 0 && got[n - 1] != '\n' {
+                n -= 1;
+            }
+        }
+        if n <= 0 {
+            return 0;
+        }
+        buf_bytes(out, "# std#every-item\n```text\n");
+        buf_bytes(out, got[0..n]);
+        buf_bytes(out, "```\n");
+        n + 30
+    }
+}
+
 // (0.16) The place (TOPIC#section) of the best paragraph when not one fit
 // the budget, a buffer; -1 else.
 pub static mut FIND_OVER: i64 = -1;
@@ -319,7 +441,10 @@ pub fn guide_find(query: [u8], budget: i64, out: i64, left: *i64) -> i64 {
                 b -= 1;
             }
         }
-        let mut room = budget;
+        // (0.17: the std items it names first, in half the budget at most;
+        // the paragraphs then in the other half)
+        let items = std_items(&words, budget / 2, out);
+        let mut room = if items > 0 { budget / 2 } else { budget };
         let mut shown = 0;
         let mut last_where = buf_new();
         for i in 0..picked.count {
@@ -352,14 +477,14 @@ pub fn guide_find(query: [u8], budget: i64, out: i64, left: *i64) -> i64 {
         }
         // (0.16: none within the budget: the first one's place, and
         // find_command's try shows it)
-        if shown == 0 && picked.count > 0 {
+        if shown == 0 && items == 0 && picked.count > 0 {
             FIND_OVER = buf_new();
             put_where(FIND_OVER, picked.data[0]);
             buf_bytes(out, "# ");
             buf_bytes(out, buf_slice(FIND_OVER));
             buf_bytes(out, "\n");
         }
-        picked.count
+        picked.count + (if items > 0 { 1 } else { 0 })
     }
 }
 
@@ -369,7 +494,7 @@ pub fn guide_find(query: [u8], budget: i64, out: i64, left: *i64) -> i64 {
 pub fn guide_section(t: i64, want0: [u8], out: i64) -> bool {
     unsafe {
         let b = buf_new();
-        render(t, b);
+        render_doc(t, b);
         let s = buf_slice(b);
         let want = buf_new();
         put_slug(want, want0);

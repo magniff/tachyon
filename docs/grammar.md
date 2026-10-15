@@ -693,7 +693,9 @@ The module `std` is built into the compiler, read when a program names it
 Failures (`unwrap` of `None`, an index out of bounds) write a message to
 stderr and exit with 101. Its source is `compiler/std/std.tach` (0.15:
 with the files `compiler/std/embed.sh` appends to it); the
-whole API, from that source: `tachyonc guide std`.
+whole API, from that source: `tachyonc guide std` (0.17: a line per
+item; with the comments, `guide std#every-item`; one name, `guide --find
+NAME`).
 
 0.14 adds reading stdin without `unsafe` (`read_line(&buf)`, a line
 without its `'\n'`, false at the end of input; `read_stdin()`, all of

@@ -47,6 +47,9 @@ iterators, traits, `#[derive(Debug)]` are as in Rust; no `dyn`, `Box`,
 `where`.
 
 Everything else is on demand: `tachyonc guide --find WORDS` (`--find read
-a line`), `tachyonc guide TOPIC` (`std`, `errors`, `rust`, ...),
-`tachyonc try 'CODE'` runs a snippet, `tachyonc check main.tach` lists
-every error.
+a line`, `--find split_in`), `tachyonc guide TOPIC` (`std`: the API, a
+line per item; `errors`, `rust`, ...), `tachyonc try 'CODE'` runs a
+snippet, `tachyonc check main.tach` lists every error. To test, put
+cases in `tests/NAME.in` and `tests/NAME.out`: `tachyonc test main.tach`
+builds and runs them all in one command (`N passed`, or each failure's
+first differing lines).

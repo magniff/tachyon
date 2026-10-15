@@ -337,9 +337,9 @@ diverge unsafe`): `tachyonc query effects f --why io` shows where;
 passing it by value) copies the pointer, not the contents. Pass `&v` to
 a `*Vec<T>` parameter to let a function push. A slice from `as_slice`
 is valid until the vector grows or is freed (using it later is the one
-hole in safe code). The whole of std, made from its source in this
-compiler (every item is `pub`): `tachyonc guide std#the-api`, or
-`tachyonc query items std`.
+hole in safe code). std's API, made from its source in this compiler, a
+line per item: `tachyonc guide std#the-api`; each item with its comment:
+`tachyonc guide std#every-item`; one name: `tachyonc guide --find NAME`.
 @STD-API-FULL@
 
 ## Input, output, arguments

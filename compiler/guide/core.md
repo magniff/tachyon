@@ -10,6 +10,7 @@ behaviour. This page is the core; the rest is on demand (the end).
 ```sh
 tachyonc main.tach -o prog && ./prog < in.txt   # `mod x;` loads x.tach
 tachyonc check main.tach                        # every error, one line each
+tachyonc test main.tach                         # builds; every tests/NAME.in vs NAME.out
 tachyonc try 'parse_int("42")'                  # a snippet: its TYPE = VALUE
 ```
 
@@ -143,8 +144,8 @@ fn main(gpa: Gpa) -> i32 {
 Lines one at a time: `let mut b = Buf::new_in(gpa); while
 read_line(&b).unwrap() { ... }` (without the `'\n'`). `Vec`, `Buf`,
 `HashMap` are handles: `let w = v;` copies the pointer, not the
-elements. The whole API: `tachyonc guide std` or `tachyonc query items
-std`; one item: `tachyonc query show std::Scanner`.
+elements. std's API, a line per item: `tachyonc guide std`; one name
+with its comment: `tachyonc guide --find split_in`.
 
 ## The first errors and their fixes
 
@@ -159,16 +160,22 @@ Every error has a `help:`; `tachyonc guide errors` has more.
 
 ## The loop
 
-Write the program, then `tachyonc check` (a check hook, where there is
-one, runs it after each edit); fix the first error first. Before writing a construct
-you are unsure of, `tachyonc guide --find WORDS` (`--find read a line`)
-or `tachyonc guide TOPIC#SECTION` prints the lines on it; `tachyonc
-try 'CODE'` runs a snippet. For an unfamiliar item, ask
-`tachyonc query context NAME` first: its source, what it calls and its
-callers in one call (`query context parse_args`). Edits, refactorings
-and the other queries: `tachyonc guide tools`. A bug: `tachyonc test`
-(a crash prints its line and callers), `tachyonc probe FILE:LINE EXPR`
-(values at a line, the source unchanged): `tachyonc guide debug`.
+This page is what most programs need: write the program from it, then
+`tachyonc check` (a check hook, where there is one, runs it after each
+edit); fix the first error first, as its `help:` says. A construct the
+page does not show: `tachyonc guide --find WORDS` (`--find read a
+line`, `--find split_in`) or `tachyonc guide TOPIC#SECTION` prints the
+lines on it, not a whole topic; `tachyonc try 'CODE'` runs a snippet.
+Test with cases: the input in `tests/NAME.in`, the expected output in
+`tests/NAME.out`; `tachyonc test` builds and runs them all in one
+command and prints `N passed`, or each failure's first differing lines.
+Run it again after each fix, instead of `./prog < x` and `diff` per
+case. For an unfamiliar item, ask `tachyonc query context NAME` first:
+its source, what it calls and its callers in one call (`query context
+parse_args`). Edits, refactorings and the other queries: `tachyonc
+guide tools`. A bug: `tachyonc test` (a crash prints its line and
+callers), `tachyonc probe FILE:LINE EXPR` (values at a line, the source
+unchanged): `tachyonc guide debug`.
 
 Topics (`tachyonc guide TOPIC`, `TOPIC#` lists its sections):
 @TOPIC-NAMES@

@@ -196,8 +196,6 @@ $ tachyonc guide --find 'spec width align' --budget 900 | head -11
   zeros, `.N` gives a float N decimals, `?` is Debug, `x`/`X` hex, `b`
   binary, `c` a `u8` as its byte (a `u8` is a number otherwise).
 - Floats print the shortest text that reads back as the same value
-note guide.budget: 1 more paragraphs over the budget of 900 tokens
-try: tachyonc guide --find 'spec width align' --budget 2700
 ```
 
 And the fix's condition, tried on a snippet before it goes in (`try`

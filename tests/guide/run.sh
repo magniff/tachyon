@@ -323,24 +323,41 @@ else
 fi
 
 # The std topic is std's API: every public item, as the compiler's item
-# index has it, is there (without `pub`).
+# index has it, is in its section std#every-item (without `pub`).
 mkdir -p "$WORK/std"
+"$COMPILER" guide 'std#every-item' >"$WORK/std/every.md" 2>&1
 printf 'fn main(gpa: Gpa) -> i32 {\n    let v: Vec<i64> = Vec::new_in(gpa);\n    0\n}\n' >"$WORK/std/main.tach"
 if (cd "$WORK/std" && "$COMPILER" query items std --root main.tach) >"$WORK/std/items" 2>&1; then
     awk -F '\t' '$3 ~ /^pub / { s = $3; sub(/^pub /, "", s); print s }' "$WORK/std/items" >"$WORK/std/want"
     : >"$WORK/std/missing"
     while IFS= read -r sig; do
-        grep -qF -- "$sig" "$WORK/topic-std.md" || echo "$sig" >>"$WORK/std/missing"
+        grep -qF -- "$sig" "$WORK/std/every.md" || echo "$sig" >>"$WORK/std/missing"
     done <"$WORK/std/want"
     if [ ! -s "$WORK/std/want" ]; then
         result FAIL guide-std "query items std listed no public item"
     elif [ -s "$WORK/std/missing" ]; then
-        result FAIL guide-std "std items missing from tachyonc guide std:" "$(head -5 "$WORK/std/missing")"
+        result FAIL guide-std "std items missing from tachyonc guide std#every-item:" "$(head -5 "$WORK/std/missing")"
     else
         result pass guide-std
     fi
 else
     result FAIL guide-std "query items std failed:" "$(cat "$WORK/std/items")"
+fi
+
+# (0.17) `guide std` itself is the index: a line per item, the receiver
+# as `Self`, no comments, nothing of std's own workings, within about
+# 3.5k tokens (under the 30000 characters an agent's shell shows whole);
+# std#every-item is not in it.
+size=$(wc -c <"$WORK/topic-std.md" | tr -d ' ')
+if [ "$size" -le 14500 ] && grep -qF 'fn push(self: *Self, x: T)' "$WORK/topic-std.md" \
+    && grep -qF 'fn split_in<A: Allocator>(s: [u8], sep: u8, a: A) -> Vec<[u8], A>' "$WORK/topic-std.md" \
+    && ! grep -q '^## Every item' "$WORK/topic-std.md" \
+    && ! grep -qF 'fn __' "$WORK/topic-std.md" \
+    && ! grep -qF 'live_blocks' "$WORK/topic-std.md" \
+    && grep -q '^## Every item with its comment$' "$WORK/std/every.md"; then
+    result pass guide-std-index
+else
+    result FAIL guide-std-index "tachyonc guide std is $size bytes (14500 at most), or not the index"
 fi
 
 # The guide by piece (0.15): --find prints the paragraphs about the
@@ -364,6 +381,25 @@ if [ $rc -eq 0 ] && [ "$(cat "$WORK/over.out")" = "# std#input" ] \
     result pass guide-find-over
 else
     result FAIL guide-find-over "exit $rc:" "$(cat "$WORK/over.out")" "$(cat "$WORK/over.err")"
+fi
+# (0.17) A word naming a std item: its signature and comment first.
+"$COMPILER" guide --find split_in >"$WORK/finditem.out" 2>"$WORK/finditem.err"
+rc=$?
+if [ $rc -eq 0 ] && head -1 "$WORK/finditem.out" | grep -q '^# std#every-item$' \
+    && grep -qF 'fn split_in<A: Allocator>(s: [u8], sep: u8, a: A) -> Vec<[u8], A>' "$WORK/finditem.out" \
+    && grep -q '^// The parts of s' "$WORK/finditem.out" \
+    && [ "$(wc -c <"$WORK/finditem.out" | tr -d ' ')" -le 4000 ]; then
+    result pass guide-find-item
+else
+    result FAIL guide-find-item "exit $rc:" "$(head -5 "$WORK/finditem.out")" "$(cat "$WORK/finditem.err")"
+fi
+"$COMPILER" guide --find vec::push >"$WORK/findm.out" 2>&1
+if grep -q '^impl<T, A: Allocator> Vec<T, A> {$' "$WORK/findm.out" \
+    && grep -qF '    fn push(self: *Vec<T, A>, x: T)' "$WORK/findm.out" \
+    && ! grep -qF 'fn pop' "$WORK/findm.out"; then
+    result pass guide-find-method
+else
+    result FAIL guide-find-method "$(head -8 "$WORK/findm.out")"
 fi
 "$COMPILER" guide --find xyzzy frobnicate >"$WORK/nofind.out" 2>&1
 rc=$?
