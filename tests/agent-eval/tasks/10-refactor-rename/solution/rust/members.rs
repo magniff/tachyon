@@ -36,7 +36,13 @@ impl Members {
         if self.find(id).is_some() {
             return false;
         }
-        self.list.push(Member { id: id, name: name.to_string(), on_loan: 0, owes: 0, paid: 0 });
+        self.list.push(Member {
+            id: id,
+            name: name.to_string(),
+            on_loan: 0,
+            owes: 0,
+            paid: 0,
+        });
         true
     }
 

@@ -21,7 +21,11 @@ fn crc_table() -> Vec<u32> {
     for n in 0..256u32 {
         let mut c = n;
         for _ in 0..8 {
-            c = if c & 1 != 0 { 0xEDB88320 ^ (c >> 1) } else { c >> 1 };
+            c = if c & 1 != 0 {
+                0xEDB88320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
         }
         t[n as usize] = c;
     }
@@ -87,7 +91,11 @@ impl Finder {
         if pos + MIN_MATCH > n {
             return (0, 0);
         }
-        let max = if n - pos < MAX_MATCH { n - pos } else { MAX_MATCH };
+        let max = if n - pos < MAX_MATCH {
+            n - pos
+        } else {
+            MAX_MATCH
+        };
         let mut best = 0;
         let mut dist = 0;
         let mut cand = self.head[hash3(&data[pos..])];
@@ -159,8 +167,17 @@ impl Writer {
 
 fn compress(table: &[u32], data: &[u8], res: &mut Vec<u8>) {
     let n = data.len();
-    let mut f = Finder { head: vec![-1; HASH_SIZE], prev: vec![0; WINDOW_SIZE] };
-    let mut w = Writer { out: Vec::new(), flag_at: 0, nbits: 0, literals: 0, matches: 0 };
+    let mut f = Finder {
+        head: vec![-1; HASH_SIZE],
+        prev: vec![0; WINDOW_SIZE],
+    };
+    let mut w = Writer {
+        out: Vec::new(),
+        flag_at: 0,
+        nbits: 0,
+        literals: 0,
+        matches: 0,
+    };
     let crc = crc32(table, data);
     w.out.push(b'L');
     w.out.push(b'Z');
@@ -352,7 +369,11 @@ fn main() {
     if mode_len > 0 && input[mode_len - 1] == b'\r' {
         mode_len -= 1;
     }
-    let rest = if nl < input.len() { nl + 1 } else { input.len() };
+    let rest = if nl < input.len() {
+        nl + 1
+    } else {
+        input.len()
+    };
     let body = &input[rest..];
     let mode = &input[..mode_len];
 

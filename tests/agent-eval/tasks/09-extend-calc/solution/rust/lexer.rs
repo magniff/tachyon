@@ -63,16 +63,38 @@ fn single(c: u8) -> Option<TokenKind> {
 fn operator(c: u8, next: u8) -> Option<(TokenKind, usize)> {
     let with_eq = next == b'=';
     match c {
-        b'<' => Some(if with_eq { (TokenKind::Le, 2) } else { (TokenKind::Lt, 1) }),
-        b'>' => Some(if with_eq { (TokenKind::Ge, 2) } else { (TokenKind::Gt, 1) }),
-        b'=' => Some(if with_eq { (TokenKind::EqEq, 2) } else { (TokenKind::Assign, 1) }),
-        b'!' => if with_eq { Some((TokenKind::Ne, 2)) } else { None },
+        b'<' => Some(if with_eq {
+            (TokenKind::Le, 2)
+        } else {
+            (TokenKind::Lt, 1)
+        }),
+        b'>' => Some(if with_eq {
+            (TokenKind::Ge, 2)
+        } else {
+            (TokenKind::Gt, 1)
+        }),
+        b'=' => Some(if with_eq {
+            (TokenKind::EqEq, 2)
+        } else {
+            (TokenKind::Assign, 1)
+        }),
+        b'!' => {
+            if with_eq {
+                Some((TokenKind::Ne, 2))
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
 
 fn token(kind: TokenKind) -> Token {
-    Token { kind: kind, value: 0, name: String::new() }
+    Token {
+        kind: kind,
+        value: 0,
+        name: String::new(),
+    }
 }
 
 // The tokens of `line`, ending with End; None when a character starts no
@@ -92,7 +114,11 @@ pub fn tokenize(line: &[u8]) -> Option<Vec<Token>> {
                 value = value * 10 + (line[i] - b'0') as i64;
                 i += 1;
             }
-            tokens.push(Token { kind: TokenKind::Num, value: value, name: String::new() });
+            tokens.push(Token {
+                kind: TokenKind::Num,
+                value: value,
+                name: String::new(),
+            });
         } else if is_name_start(c) {
             let start = i;
             while i < line.len() && (is_name_start(line[i]) || is_digit(line[i])) {
@@ -102,7 +128,11 @@ pub fn tokenize(line: &[u8]) -> Option<Vec<Token>> {
             if name == "let" {
                 tokens.push(token(TokenKind::Let));
             } else {
-                tokens.push(Token { kind: TokenKind::Name, value: 0, name: name });
+                tokens.push(Token {
+                    kind: TokenKind::Name,
+                    value: 0,
+                    name: name,
+                });
             }
         } else {
             let next = if i + 1 < line.len() { line[i + 1] } else { 0 };

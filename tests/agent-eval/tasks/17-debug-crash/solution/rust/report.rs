@@ -78,7 +78,11 @@ fn write_top(st: &State, out: &mut Vec<u8>) {
         return;
     }
     let order = ranking(&st.groups);
-    let k = if st.top < order.len() as i64 { st.top } else { order.len() as i64 };
+    let k = if st.top < order.len() as i64 {
+        st.top
+    } else {
+        order.len() as i64
+    };
     out.extend_from_slice(b"top ");
     push_int(out, k);
     out.extend_from_slice(b" by sum:\n");

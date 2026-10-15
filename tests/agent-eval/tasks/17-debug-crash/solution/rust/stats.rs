@@ -107,7 +107,10 @@ impl Group {
             }
             let count = (r - i) as i64;
             if count > best.count {
-                best = Busiest { count: count, start: t[i] };
+                best = Busiest {
+                    count: count,
+                    start: t[i],
+                };
             }
         }
         best
@@ -149,7 +152,11 @@ pub fn ranking(groups: &[Group]) -> Vec<i64> {
         let mut lo = 0;
         while lo < n {
             let mid = if lo + width < n { lo + width } else { n };
-            let hi = if lo + 2 * width < n { lo + 2 * width } else { n };
+            let hi = if lo + 2 * width < n {
+                lo + 2 * width
+            } else {
+                n
+            };
             let mut i = lo;
             let mut j = mid;
             let mut k = lo;

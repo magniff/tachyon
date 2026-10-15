@@ -21,7 +21,12 @@ pub fn hash_key(key: &[u8]) -> i32 {
 
 impl Table {
     pub fn new() -> Table {
-        let mut t = Table { hashes: Vec::new(), keys: Vec::new(), groups: Vec::new(), used: 0 };
+        let mut t = Table {
+            hashes: Vec::new(),
+            keys: Vec::new(),
+            groups: Vec::new(),
+            used: 0,
+        };
         t.alloc(16);
         t
     }

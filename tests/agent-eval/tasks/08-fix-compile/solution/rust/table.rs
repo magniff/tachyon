@@ -52,7 +52,11 @@ fn split_line(line: &[u8]) -> Vec<String> {
 
 // The first non-blank line is the header; the other non-blank lines are rows.
 pub fn parse_table(text: &[u8]) -> Table {
-    let mut t = Table { header: Vec::new(), rows: Vec::new(), ncols: 0 };
+    let mut t = Table {
+        header: Vec::new(),
+        rows: Vec::new(),
+        ncols: 0,
+    };
     let mut have_header = false;
     let mut start = 0;
     for i in 0..text.len() + 1 {

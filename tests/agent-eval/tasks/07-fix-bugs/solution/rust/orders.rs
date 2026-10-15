@@ -66,7 +66,11 @@ struct Tally {
 
 impl Tally {
     fn new() -> Tally {
-        Tally { subtotal: 0, filled: 0, rejected: 0 }
+        Tally {
+            subtotal: 0,
+            filled: 0,
+            rejected: 0,
+        }
     }
 
     // Starts the next order.

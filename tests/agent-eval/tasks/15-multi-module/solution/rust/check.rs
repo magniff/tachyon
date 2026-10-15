@@ -265,5 +265,15 @@ pub fn plan(q: &Query, t: &Table) -> Result<Plan, Vec<u8>> {
             Node::Cmp(a, op, b) => Cond::Cmp(resolve_arg(t, a), *op, resolve_arg(t, b)),
         });
     }
-    Ok(Plan { headers, select, conds, cond: q.cond, grouped, group, aggs, order, limit: q.limit })
+    Ok(Plan {
+        headers,
+        select,
+        conds,
+        cond: q.cond,
+        grouped,
+        group,
+        aggs,
+        order,
+        limit: q.limit,
+    })
 }

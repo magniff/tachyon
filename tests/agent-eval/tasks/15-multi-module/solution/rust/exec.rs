@@ -49,7 +49,10 @@ pub struct Groups {
 }
 
 fn make_groups(p: &Plan, t: &Table, rows: &[usize]) -> Groups {
-    let mut gs = Groups { first: Vec::new(), group_of: Vec::new() };
+    let mut gs = Groups {
+        first: Vec::new(),
+        group_of: Vec::new(),
+    };
     let g = match p.group {
         Some(g) => g,
         None => {

@@ -71,7 +71,10 @@ fn main() {
     let counts = count_words(text);
     let mut entries: Vec<Entry> = Vec::new();
     for (word, count) in &counts {
-        entries.push(Entry { word, count: *count });
+        entries.push(Entry {
+            word,
+            count: *count,
+        });
     }
     entries.sort_by(cmp_entries);
     let mut out = Vec::new();

@@ -159,7 +159,11 @@ impl Parser {
 // The tree of a whole line, or None when the tokens are not a line of
 // the grammar.
 pub fn parse(tokens: Vec<Token>) -> Option<Tree> {
-    let mut p = Parser { tokens: tokens, pos: 0, nodes: Vec::new() };
+    let mut p = Parser {
+        tokens: tokens,
+        pos: 0,
+        nodes: Vec::new(),
+    };
     let mut let_name = None;
     if p.peek() == TokenKind::Let {
         p.advance();
@@ -173,5 +177,9 @@ pub fn parse(tokens: Vec<Token>) -> Option<Tree> {
     if p.peek() != TokenKind::End {
         return None;
     }
-    Some(Tree { nodes: p.nodes, root: root, let_name: let_name })
+    Some(Tree {
+        nodes: p.nodes,
+        root: root,
+        let_name: let_name,
+    })
 }

@@ -144,7 +144,12 @@ fn split_fields(line: &[u8]) -> Vec<Vec<u8>> {
 // Reads the header and the rows from `lines`, up to the line `%%`; returns
 // the table and the index of the first line after `%%`.
 pub fn read_table(lines: &[&[u8]]) -> (Table, usize) {
-    let mut t = Table { names: Vec::new(), types: Vec::new(), cells: Vec::new(), nrows: 0 };
+    let mut t = Table {
+        names: Vec::new(),
+        types: Vec::new(),
+        cells: Vec::new(),
+        nrows: 0,
+    };
     let mut k = 0;
     if !lines.is_empty() {
         for item in split_fields(lines[0]) {
@@ -157,7 +162,11 @@ pub fn read_table(lines: &[&[u8]]) -> (Table, usize) {
             }
             t.names.push(item[..colon].to_vec());
             let ty = &item[colon + 1..];
-            t.types.push(if ty == b"int" { ColType::Int } else { ColType::Str });
+            t.types.push(if ty == b"int" {
+                ColType::Int
+            } else {
+                ColType::Str
+            });
         }
         k = 1;
     }

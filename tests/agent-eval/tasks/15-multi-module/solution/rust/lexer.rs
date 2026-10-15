@@ -174,8 +174,16 @@ pub fn tokenize(line: &[u8]) -> Result<Vec<Token>, Vec<u8>> {
                 _ => return Err(unexpected(&line[start..start + 1])),
             };
         }
-        toks.push(Token { tok, text: line[start..i].to_vec(), value });
+        toks.push(Token {
+            tok,
+            text: line[start..i].to_vec(),
+            value,
+        });
     }
-    toks.push(Token { tok: Tok::End, text: Vec::new(), value: Vec::new() });
+    toks.push(Token {
+        tok: Tok::End,
+        text: Vec::new(),
+        value: Vec::new(),
+    });
     Ok(toks)
 }
