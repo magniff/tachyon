@@ -120,9 +120,9 @@ try: tachyonc edit patch scale --old 'k: i64' --new 'k: i64, m: i64' --no-check
 [exit 1]
 $ edit patch Rect --old 'h: i64,' --new 'height: i64,'
 main.tach:15:32: error[type error] unknown field 'h' in struct 'Rect'  [in crate::main]
-./shapes.tach:15:11: error[type error] struct 'Rect' has no field 'h'  [in crate::shapes::area]
-./shapes.tach:19:15: error[type error] struct 'Rect' has no field 'h'  [in crate::shapes::kind]
-./shapes.tach:23:24: error[type error] unknown field 'h' in struct 'Rect'  [in crate::shapes::scale]
+shapes.tach:15:11: error[type error] struct 'Rect' has no field 'h'  [in crate::shapes::area]
+shapes.tach:19:15: error[type error] struct 'Rect' has no field 'h'  [in crate::shapes::kind]
+shapes.tach:23:24: error[type error] unknown field 'h' in struct 'Rect'  [in crate::shapes::scale]
 error edit.breaks: 4 new errors (4 in crate::main, crate::shapes::area, crate::shapes::kind and 1 more, which the edit does not change); nothing written
 note edit.refactor: the uses of crate::shapes::Rect no longer fit its new shape: a refactoring changes them with it, then the rest of the edit
 try: tachyonc refactor field crate::shapes::Rect --rename h height
@@ -154,7 +154,7 @@ try: tachyonc query show crate::main
 try: tachyonc edit patch area --no-check
 [exit 1]
 $ edit patch scale --old 'scale(r: Rect, k: i64)' --new 'scale(r: Rect, f: i64)'
-./shapes.tach:23:21: error[type error] undefined variable 'k'  [edited: crate::shapes::scale]
+shapes.tach:23:21: error[type error] undefined variable 'k'  [edited: crate::shapes::scale]
 error edit.breaks: 1 new error; nothing written
 note edit.refactor: the uses of crate::shapes::scale no longer fit its new shape: a refactoring changes them with it, then the rest of the edit
 try: tachyonc refactor signature crate::shapes::scale --rename-param k f

@@ -103,9 +103,9 @@ $ edit delete Corner::High --dry-run
 $ edit delete Point.y
 main.tach:13:27: error[type error] unknown field 'y' in struct 'Point'  [in crate::main]
 main.tach:14:33: error[type error] unknown field 'y' in struct 'Point'  [in crate::main]
-./geom.tach:9:11: error[type error] struct 'Point' has no field 'y'  [in crate::geom::area]
-./geom.tach:13:25: error[type error] unknown field 'y' in struct 'Point'  [in crate::geom::scale]
-./geom.tach:19:18: error[type error] struct 'Point' has no field 'y'  [in crate::geom::Point::sum]
+geom.tach:9:11: error[type error] struct 'Point' has no field 'y'  [in crate::geom::area]
+geom.tach:13:25: error[type error] unknown field 'y' in struct 'Point'  [in crate::geom::scale]
+geom.tach:19:18: error[type error] struct 'Point' has no field 'y'  [in crate::geom::Point::sum]
 error edit.breaks: 5 new errors (5 in crate::main, crate::geom::area, crate::geom::scale and 1 more, which the edit does not change); nothing written
 note edit.refactor: the uses of crate::geom::Point no longer fit its new shape: a refactoring changes them with it, then the rest of the edit
 try: tachyonc query refs crate::geom::Point.y

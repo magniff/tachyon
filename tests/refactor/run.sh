@@ -200,6 +200,11 @@ out=$("$COMPILER" same-output "$WORK/old-tachyonc" --corpus examples --corpus te
 ok=0
 printf '%s\n' "$out" | grep -q "^identical${TAB}[0-9]* compilations${TAB}[0-9]* programs${TAB}[0-9]* targets${TAB}-O0 -O1 -O2\$" && ok=1
 check same_output_identical "$ok" "$out"
+# (0.16) OLD named without a `/`: looked up in $PATH.
+out=$(PATH="$WORK:$PATH" "$COMPILER" same-output old-tachyonc --corpus tests/refactor/edits --work "$WORK/so-path" 2>&1)
+ok=0
+printf '%s\n' "$out" | grep -q "^identical${TAB}" && ok=1
+check same_output_in_path "$ok" "$out"
 cat >"$WORK/differs.sh" <<EOS
 #!/bin/sh
 # tachyonc, but its assembly for md5/main.tach at -O1 has one more line

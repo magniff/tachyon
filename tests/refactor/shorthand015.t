@@ -91,3 +91,18 @@ refactor.fill-calls: note, exit 0
 fix: Nothing to fix; leave out --fill-calls, or add x after the parameters without a default (--at), to declare a default instead.
 example:
     note refactor.fill-calls: the calls get the value (a trait's function has no defaults)
+## (0.16) A tool's name with its `-` lists its codes; a subcommand's own
+## help.
+$ explain same-output
+same-output.differs	error, exit 1
+same-output.no-compiler	error, exit 2
+same-output.no-corpus	error, exit 2
+same-output.not-run	warning
+same-output.target	note
+same-output.usage	error, exit 2
+same-output.work	error, exit 2
+$ edit apply --help
+tachyonc edit apply [FILE]   several items' new text in one checked edit (stdin without FILE)
+blocks: @@ NAME (its new text), @@ new after|before NAME, @@ new in MODULE, @@ delete NAME,
+@@ MODULE::use, @@ MODULE::header; or query show's output, changed
+--show: the diff after; --dry-run: the diff only; --no-check: write despite new errors

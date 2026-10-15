@@ -75,6 +75,10 @@
 #                        @ROOT@ stands for the root of the tree)
 #   // WARNING: text     (0.9) the case compiles with a warning containing
 #                        this text, one directive per message, in order
+#   // LINK: why         (0.16) tachyonc links the case itself: its CSOURCE
+#                        files (with -I for its CHEADER) and FLAGS on its
+#                        command line, `-o prog`; no -lm added (tachyonc
+#                        links libm when the program calls into it)
 #   // PROFILE: why      (0.10) at -O1 and -O2, the case is first compiled
 #                        with --profile-generate, run and checked; the
 #                        other directives then check it compiled with
@@ -259,6 +263,7 @@ read_directives() {
             else if (key == "FLAGS") flags = flags " " value
             else if (key == "WARNING") warnings = warnings value "\n"
             else if (key == "PROFILE") profile = 1
+            else if (key == "LINK") link = 1
         }
         END {
             printf "%s", args > (dir "/args")
@@ -281,6 +286,7 @@ read_directives() {
             printf "%s", flags > (dir "/flags")
             printf "%s", warnings > (dir "/warnings")
             printf "%d", profile > (dir "/profile")
+            printf "%d", link > (dir "/link")
         }
     ' "$1"
 }
@@ -369,18 +375,6 @@ check_case() {
     fi
     # shellcheck disable=SC2086
     [ "$OPT" = -O0 ] && PFLAGS=""
-    # shellcheck disable=SC2086
-    if ! "$COMPILER" --target "$TARGET" $OPT $FLAGS $PFLAGS "$source" -o "$dir/$OUT" >"$dir/compile.out" 2>&1; then
-        { echo "compile failed:"; cat "$dir/compile.out"; } >"$dir/why"
-        return 1
-    fi
-    if [ -s "$dir/warnings" ]; then
-        missing=$(missing_message "$dir/warnings" "$dir/compile.out")
-        if [ -n "$missing" ]; then
-            { echo "expected a warning containing '$missing' (after the ones before it), got:"; cat "$dir/compile.out"; } >"$dir/why"
-            return 1
-        fi
-    fi
     csources=""
     for c in $(cat "$dir/csources"); do
         csources="$csources $ROOT/$c"
@@ -394,10 +388,31 @@ check_case() {
         fi
         csources="-I $dir $csources"
     fi
-    # shellcheck disable=SC2086
-    if ! cc_run $LINK_FLAGS -o "$dir/prog" "$dir/$OUT" $csources -lm >"$dir/link.out" 2>&1; then
-        { echo "$CC failed:"; cat "$dir/link.out"; } >"$dir/why"
-        return 1
+    if [ "$(cat "$dir/link")" = 1 ]; then
+        # (0.16) tachyonc compiles the C files and links, as `cc` would
+        # shellcheck disable=SC2086
+        if ! TACHYON_CC="$CC" "$COMPILER" --target "$TARGET" $OPT $FLAGS $PFLAGS "$source" $csources -o "$dir/prog" >"$dir/compile.out" 2>&1; then
+            { echo "compile and link failed:"; cat "$dir/compile.out"; } >"$dir/why"
+            return 1
+        fi
+    else
+        # shellcheck disable=SC2086
+        if ! "$COMPILER" --target "$TARGET" $OPT $FLAGS $PFLAGS "$source" -o "$dir/$OUT" >"$dir/compile.out" 2>&1; then
+            { echo "compile failed:"; cat "$dir/compile.out"; } >"$dir/why"
+            return 1
+        fi
+        # shellcheck disable=SC2086
+        if ! cc_run $LINK_FLAGS -o "$dir/prog" "$dir/$OUT" $csources -lm >"$dir/link.out" 2>&1; then
+            { echo "$CC failed:"; cat "$dir/link.out"; } >"$dir/why"
+            return 1
+        fi
+    fi
+    if [ -s "$dir/warnings" ]; then
+        missing=$(missing_message "$dir/warnings" "$dir/compile.out")
+        if [ -n "$missing" ]; then
+            { echo "expected a warning containing '$missing' (after the ones before it), got:"; cat "$dir/compile.out"; } >"$dir/why"
+            return 1
+        fi
     fi
     [ "$(cat "$dir/build")" = 1 ] && return 0
     run_program "$dir"
