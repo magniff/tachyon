@@ -148,7 +148,16 @@ the optimizer's side in docs/optimizer.md, "0.16".
   interop (qsort with tachyon callbacks, a libc tour, libm, a C file
   linked in and C calling tachyon), language tours (closures and
   iterators, errors and results, traits and generics, formatting); the
-  algorithm examples and the tool sessions on explicit allocation.
+  algorithm examples and the tool sessions on explicit allocation;
+  examples/allocators (Gpa from main, an arena parser, scoped arenas, a
+  fixed buffer, five memory bugs `--check-alloc` stops) and
+  examples/effects (`#[pure]` and `#[no_alloc]`, effect bounds, trait
+  purity, `query effects` for agents), each README a tested session;
+  every example's test also runs under `--check-alloc` in the gate.
+- **Fixed**: at -O1 a nested pattern naming an enum's only variant
+  (inside `Ok(..)`) branched to a block that did not exist ("cannot
+  assemble"); examples/errors-and-results printed an error holding a
+  view of input it had freed.
 - **The compiler's source** on 0.15's features (f-strings for its
   messages and text, widening, `any`/`all`, field shorthand, named
   arguments) in the back end, base, gen0 and part of the front end (the
