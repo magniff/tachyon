@@ -1,12 +1,28 @@
 """`run.py check-tasks`: the validity checks of the format spec, one line
-per task."""
+per task.
 
+(0.17) Also, for the program tasks:
+
+- lints of both reference solutions: tachyon `tachyonc fmt --check`,
+  `lint --max-lines 1000`, `query unused` and `fix --dry-run` clean; Rust
+  `rustfmt --check` and `rustc -D warnings` clean (`--no-lint` skips);
+- variants: `variants/LANG-NAME.patch` (`diff -ruN a b` against
+  solution/LANG/) is a second correct, idiomatic solution written another
+  way (struct-like enum variants in Rust, one-line items, an iterator, a
+  scratch copy left in the workspace); it must build and pass every test
+  and the check, so that check.sh tests the task and not one way of
+  writing it (0.16: 18-api-refactor's check failed correct Rust);
+- the prompts: every ```tach block of prompts/*.md compiles (the
+  rust-pairs condition's examples)."""
+
+import glob
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 
-from lib.common import KINDS, load_tasks
+from lib.common import EVAL_DIR, KINDS, base_env, load_tasks, run_proc
 from lib.ctasks import check_ctask
 from lib.grade import grade_dir, prepare_bins
 
@@ -86,7 +102,89 @@ def check_task(task, bins, scratch):
             problems.append("starter %s/ already passes every test and check" % lang)
         elif gs["build_ok"]:
             notes.append("starter-%s %d/%d" % (lang, gs["tests_passed"], gs["tests_total"]))
+    for v in sorted(glob.glob(os.path.join(task.path, "variants", "*.patch"))):
+        name = os.path.basename(v)[:-6]
+        lang = name.split("-", 1)[0]
+        if lang not in ("tach", "rust"):
+            problems.append("variant %s: the name is LANG-NAME.patch, LANG tach or rust" % name)
+            continue
+        vdir = os.path.join(scratch, task.id, "variant-src-" + name)
+        if os.path.exists(vdir):
+            shutil.rmtree(vdir)
+        shutil.copytree(os.path.join(task.path, "solution", lang), vdir)
+        r = subprocess.run(["patch", "-p1", "-s", "-i", v], cwd=vdir, capture_output=True,
+                           text=True)
+        if r.returncode != 0:
+            problems.append("variant %s does not apply: %s" % (name, (r.stdout + r.stderr)[-200:]))
+            continue
+        g = grade_dir(task, lang, vdir, os.path.join(scratch, task.id, "variant-" + name),
+                      bins[lang])
+        if not g["success"]:
+            why = ("does not build" if not g["build_ok"] else
+                   "fails the check: " + g["check_msg"] if g["check_ok"] is False else
+                   "fails %d tests" % (g["tests_total"] - g["tests_passed"]))
+            problems.append("variant %s %s" % (name, why))
+        else:
+            notes.append("variant %s ok" % name)
     return problems, notes
+
+
+def lint_solution(task, lang, bins, scratch):
+    """(0.17) The reference solution's lints: [problem]."""
+    src = os.path.join(task.path, "solution", lang)
+    out = []
+    if lang == "tach":
+        env = base_env(bins["tach"])
+        cmds = [("fmt --check", ["tachyonc", "fmt", "--check", "main.tach"], None),
+                ("lint", ["tachyonc", "lint", "--max-lines", "1000", "main.tach"], None),
+                ("query unused", ["tachyonc", "query", "unused", "--root", "main.tach"],
+                 "nothing unused"),
+                ("fix --dry-run", ["tachyonc", "fix", "--dry-run", "--root", "main.tach"],
+                 "nothing to fix")]
+        for name, argv, want in cmds:
+            rc, o, e, _ = run_proc(argv, src, env, 120)
+            text = (o + e).decode("utf-8", "replace")
+            if rc != 0 or (want and want not in text):
+                out.append("solution/tach %s: %s" % (name, text.strip().splitlines()[:1]))
+        return out
+    rustfmt = shutil.which("rustfmt")
+    if rustfmt:
+        r = subprocess.run([rustfmt, "--check", "--edition", "2021", "main.rs"], cwd=src,
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            out.append("solution/rust is not rustfmt-clean (%d diffs; rustfmt --edition 2021 "
+                       "main.rs)" % r.stdout.count("Diff in"))
+    tmp = os.path.join(scratch, task.id, "rmeta")
+    os.makedirs(tmp, exist_ok=True)
+    env = base_env(bins["rust"])
+    env["TMPDIR"] = tmp
+    rc, o, e, _ = run_proc(["rustc", "--edition", "2021", "-D", "warnings", "--emit=metadata",
+                            "--out-dir", tmp, "main.rs"], src, env, 300)
+    if rc != 0:
+        first = [l for l in e.decode("utf-8", "replace").splitlines() if l.startswith("error")]
+        out.append("solution/rust has warnings: %s" % (first[:1] or ["rustc failed"])[0][:160])
+    return out
+
+
+def check_prompts(bins, scratch):
+    """(0.17) Every ```tach block of prompts/*.md compiles: [problem]."""
+    out = []
+    for md in sorted(glob.glob(os.path.join(EVAL_DIR, "prompts", "*.md"))):
+        with open(md) as fh:
+            text = fh.read()
+        blocks = re.findall(r"^```tach\n(.*?)^```", text, re.S | re.M)
+        for i, b in enumerate(blocks):
+            d = os.path.join(scratch, "prompts", "%s-%d" % (os.path.basename(md)[:-3], i))
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "main.tach"), "w") as fh:
+                fh.write(b)
+            rc, o, e, _ = run_proc(["tachyonc", "main.tach", "-o", "prog"], d,
+                                   base_env(bins["tach"]), 120)
+            if rc != 0:
+                out.append("%s block %d does not build: %s" % (
+                    os.path.basename(md), i + 1,
+                    (o + e).decode("utf-8", "replace").strip().splitlines()[:1]))
+    return out
 
 
 def main(args):
@@ -106,11 +204,21 @@ def main(args):
             problems, notes = check_ctask(t, args.base, args.builder, root)
         else:
             problems, notes = check_task(t, bins, os.path.join(root, "work"))
+            if not getattr(args, "no_lint", False):
+                for lang in ("tach", "rust"):
+                    problems += lint_solution(t, lang, bins, os.path.join(root, "work"))
         if problems:
             bad += 1
             print("FAIL %s: %s" % (t.id, "; ".join(problems)))
         else:
             print("ok   %s %s: %s" % (t.id, t.kind, ", ".join(notes)))
+    if bins and not args.tasks:
+        pp = check_prompts(bins, os.path.join(root, "work"))
+        if pp:
+            bad += 1
+            print("FAIL prompts: %s" % "; ".join(pp))
+        else:
+            print("ok   prompts: every tach block builds")
     print("%d task(s), %d with problems" % (len(tasks), bad))
     if args.keep:
         print("kept: %s" % root)

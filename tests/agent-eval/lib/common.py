@@ -20,7 +20,10 @@ PROGRAM_CONDS = TACH_CONDS + ("rust",)
 # (0.16) the compiler tasks' conditions: AGENTS.md with the tools table and
 # the hooks, or without them (lib/ctasks.py)
 COMPILER_CONDS = ("compiler-tools", "compiler-plain")
-ALL_CONDS = PROGRAM_CONDS + COMPILER_CONDS
+# (0.17) every base condition, in report order; a condition is
+# BASE[+hook][+test] (lib/conds.py)
+ALL_CONDS = ("bare", "guide", "tools", "both", "guide-core", "tools-core", "both-core",
+             "rust-pairs", "rust", "compiler-tools", "compiler-plain", "compiler-tools-core")
 KINDS = ("write", "fix", "extend", "refactor", "perf")
 
 TACH_BUILD = ["tachyonc", "main.tach", "-o", "prog"]
@@ -59,18 +62,39 @@ def lang_of(cond):
     return "rust" if cond == "rust" else "tach"
 
 
+def cond_key(cond):
+    """Report order of a condition name (base, then modifiers)."""
+    base, _, mods = cond.partition("+")
+    return (ALL_CONDS.index(base) if base in ALL_CONDS else 99, mods)
+
+
 # macOS mktemp without a template ignores $TMPDIR (and so does -t): it
 # makes the file in the per-user temp directory (/var/folders/...), which the
 # agent's sandbox does not let it write. The repository's scripts call it so
 # (compiler/std/embed.sh, compiler/guide/embed.sh, and tests/run.sh through
 # `embed.sh -c`), so every agent's bin directory has this shim: no template,
 # one in $TMPDIR (the sandbox's own temp directory inside Claude Code).
-MKTEMP_SHIM = """#!/bin/sh
-# (agent eval) mktemp with a template in $TMPDIR when none is given
-for a in "$@"; do
-    case "$a" in -*) ;; *) exec /usr/bin/mktemp "$@" ;; esac
+MKTEMP_SHIM = r"""#!/bin/sh
+# (agent eval) mktemp in $TMPDIR: a template there when none is given, and
+# (0.17) for -t PREFIX, which macOS puts in the per-user temp directory
+# whatever $TMPDIR says (the sandbox forbids it); a template given as an
+# argument is used as it is.
+flags=""; prefix=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --) shift; break ;;
+        -t) shift; prefix=$1 ;;
+        -*t) flags="$flags ${1%t}"; shift; prefix=$1 ;;
+        -t*) prefix=${1#-t} ;;
+        -*) flags="$flags $1" ;;
+        *) break ;;
+    esac
+    shift
 done
-exec /usr/bin/mktemp "$@" "${TMPDIR:-/tmp}/tmp.XXXXXXXXXX"
+if [ $# -gt 0 ]; then
+    exec /usr/bin/mktemp $flags "$@"
+fi
+exec /usr/bin/mktemp $flags "${TMPDIR:-/tmp}/${prefix:-tmp}.XXXXXXXXXX"
 """
 
 
@@ -320,15 +344,57 @@ def tail(b, n=2000):
 
 
 def install_hooks(ws_root):
-    """The agent hooks (tools/agent-hooks: check-after-edit.py, query-first.py
-    and the module they load) copied out of the repository, which the
-    agent's sandbox cannot read: {"check": path, "query": path}."""
+    """The agent hooks (tools/agent-hooks/: check-after-edit.py,
+    query-first.py, the modules and files they load) and (0.17) lib/hook-tee.py
+    copied out of the repository, which the agent's sandbox cannot read:
+    {"check": path, "query": path, "tee": path, "dir": the copies}."""
     d = os.path.join(ws_root, "hooks")
     os.makedirs(d, exist_ok=True)
-    for f in ("check-after-edit.py", "query-first.py", "tachyonc_cmd.py"):
-        shutil.copyfile(os.path.join(HOOKS_DIR, f), os.path.join(d, f))
+    for f in sorted(os.listdir(HOOKS_DIR)):
+        # the scripts and what they read (hints.txt, settings), not their tests
+        if os.path.isfile(os.path.join(HOOKS_DIR, f)) and not f.startswith("test-"):
+            shutil.copyfile(os.path.join(HOOKS_DIR, f), os.path.join(d, f))
+    shutil.copyfile(os.path.join(EVAL_DIR, "lib", "hook-tee.py"), os.path.join(d, "hook-tee.py"))
     return {"check": os.path.join(d, "check-after-edit.py"),
-            "query": os.path.join(d, "query-first.py")}
+            "query": os.path.join(d, "query-first.py"),
+            "tee": os.path.join(d, "hook-tee.py"), "dir": d}
+
+
+_HOOK_PATH = re.compile(r"""(?:["']?\$\{?CLAUDE_PROJECT_DIR\}?["']?/)?(?:\./)?"""
+                        r"""tools/agent-hooks/([\w.-]+\.py)""")
+
+
+def eval_settings_hooks(path, hooks_dir):
+    """(0.17, the +test modifier) The `hooks` of tools/agent-hooks/
+    settings-eval.json (the repository's hook settings for the eval: the
+    check hook that also runs the tests), each command pointed at the copy
+    of its script in hooks_dir. None when the file does not exist."""
+    if not os.path.isfile(path):
+        return None
+    with open(path) as fh:
+        data = json.load(fh)
+    hooks = data.get("hooks") or {}
+    out = {}
+    for ev, entries in hooks.items():
+        new = []
+        for e in entries:
+            e = dict(e)
+            hs = []
+            for h in e.get("hooks") or []:
+                h = dict(h)
+                if h.get("command"):
+                    h["command"] = _HOOK_PATH.sub(
+                        lambda m: shlex_quote(os.path.join(hooks_dir, m.group(1))), h["command"])
+                hs.append(h)
+            e["hooks"] = hs
+            new.append(e)
+        out[ev] = new
+    return out
+
+
+def shlex_quote(s):
+    import shlex
+    return shlex.quote(s)
 
 
 def install_check_hook(ws_root):

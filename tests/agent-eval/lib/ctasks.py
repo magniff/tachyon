@@ -251,14 +251,24 @@ line), compiling programs, `tests/run.sh`.
 def agents_md(tree, cond):
     """AGENTS.md for the condition: as it is for compiler-tools; for
     compiler-plain, without the tools table ("Read source through the
-    compiler", the hooks and the feedback line): file tools and the shell."""
+    compiler", the hooks and the feedback line): file tools and the shell;
+    (0.17) for compiler-tools-core, that section replaced by this
+    checkout's (the tiered eight-row core of 0.17's AGENTS.md)."""
+    from lib.conds import Cond
+    c = Cond(cond)
     with open(os.path.join(tree, "AGENTS.md")) as fh:
         text = fh.read()
-    if cond == "compiler-tools":
+    if c.compiler == "full":
         return text
     m = re.search(r"^## Read source through the compiler\n.*?(?=^## )", text, re.S | re.M)
     if not m:
         raise RuntimeError("AGENTS.md has no '## Read source through the compiler' section")
+    if c.compiler == "core":
+        core = tools_section(os.path.join(REPO_ROOT, "AGENTS.md"))
+        if core.strip() == text[m.start():m.end()].strip():
+            raise RuntimeError("compiler-tools-core: this checkout's AGENTS.md tools section "
+                               "is the base's: the condition would be compiler-tools")
+        return text[:m.start()] + core + text[m.end():]
     text = text[:m.start()] + PLAIN_READ + "\n" + text[m.end():]
     # the inner loop's mentions of the hook and the tools binary
     text = re.sub(r"the check hook's errors \(or (`target/tachyonc check`)\s+when the hook is "
@@ -272,6 +282,17 @@ def agents_md(tree, cond):
     return text
 
 
+def tools_section(path):
+    """(0.17) The "## Read source through the compiler" section of an
+    AGENTS.md (up to the next `## `)."""
+    with open(path) as fh:
+        text = fh.read()
+    m = re.search(r"^## Read source through the compiler\n.*?(?=^## )", text, re.S | re.M)
+    if not m:
+        raise RuntimeError("%s has no '## Read source through the compiler' section" % path)
+    return m.group(0)
+
+
 # What the compiler-plain AGENTS.md must not mention.
 PLAIN_FORBIDDEN = ("tachyonc query", "query show", "edit patch", "tachyonc refactor", "hook",
                    "target/tools/tachyonc", "agent-feedback", "no-query")
@@ -279,8 +300,9 @@ PLAIN_FORBIDDEN = ("tachyonc query", "query show", "edit patch", "tachyonc refac
 
 # ---------------------------------------------------------------- workspace
 
-def setup_workspace(task, cond, sha, ws, builder, starter_tree, env):
+def setup_workspace(task, cond, sha, ws, builder, starter_tree, env, tools_tachyonc=None):
     """The agent's copy of the repository (see the module's comment)."""
+    from lib.conds import Cond
     make_tree(task, sha, ws)
     for gone in ("CLAUDE.md", ".claude"):
         p = os.path.join(ws, gone)
@@ -295,9 +317,11 @@ def setup_workspace(task, cond, sha, ws, builder, starter_tree, env):
     os.makedirs(os.path.join(tgt, "builder"), exist_ok=True)
     shutil.copy2(builder, os.path.join(tgt, "builder", "tachyonc"))
     shutil.copy2(os.path.join(starter_tree, "target", "tachyonc"), os.path.join(tgt, "tachyonc"))
-    if cond == "compiler-tools":
+    if Cond(cond).query_hook:
+        # the tools binary: the starter's, or (0.17, --tools-tachyonc) a
+        # newer one, so that new tools can be measured on the same tasks
         os.makedirs(os.path.join(tgt, "tools"), exist_ok=True)
-        shutil.copy2(os.path.join(starter_tree, "target", "tachyonc"),
+        shutil.copy2(tools_tachyonc or os.path.join(starter_tree, "target", "tachyonc"),
                      os.path.join(tgt, "tools", "tachyonc"))
     e = dict(env, GIT_AUTHOR_NAME="eval", GIT_AUTHOR_EMAIL="eval@localhost",
              GIT_COMMITTER_NAME="eval", GIT_COMMITTER_EMAIL="eval@localhost")
@@ -311,7 +335,7 @@ def setup_workspace(task, cond, sha, ws, builder, starter_tree, env):
     subprocess.run(["git", "add", "-A"], cwd=ws, env=e, check=True, capture_output=True)
     subprocess.run(["git", "commit", "-q", "-m", "starter"], cwd=ws, env=e, check=True,
                    capture_output=True)
-    if cond == "compiler-tools":
+    if Cond(cond).query_hook:
         # the query-first hook enforces once the compiler answers queries
         open(os.path.join(ws, ".git", "agent-query-ready"), "w").close()
 
@@ -438,7 +462,7 @@ def check_ctask(task, base_override, builder_override, root):
         st = built_tree(task, sha, builder, root)
     except (RuntimeError, subprocess.CalledProcessError) as e:
         return ["starter: %s" % e], notes
-    for cond in COMPILER_CONDS:
+    for cond in COMPILER_CONDS + ("compiler-tools-core", "compiler-tools-core+test"):
         try:
             agents_md(st, cond)
         except RuntimeError as e:

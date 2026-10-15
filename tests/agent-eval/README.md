@@ -45,14 +45,44 @@ tests/agent-eval/run.py run --model claude:haiku --set compiler \
 ```
 
 A round is planned in `plans/` (0.16: [plans/0.16.md](plans/0.16.md),
-one command, `sh tests/agent-eval/plans/0.16.sh`).
+one command, `sh tests/agent-eval/plans/0.16.sh`; 0.17: the validation
+round against 0.16, [plans/0.17-validation.md](plans/0.17-validation.md)).
+
+```sh
+# (0.17) the self-check alone: can agents build, run, test and write in
+# their workspaces inside the sandbox (run.py run does it first)
+tests/agent-eval/run.py selfcheck --kinds tach,rust,compiler [--offline]
+
+# (0.17) each run's anatomy (also for runs from before 0.17), checked
+# against tool_calls_by_kind; --write stores it in result.json
+tests/agent-eval/run.py analyze tests/agent-eval/results/0.16-* --check
+
+# (0.17) new runs against a baseline round, per task, with a paired test
+tests/agent-eval/run.py compare --baseline DIR... --new DIR... \
+    --pairs guide-core=guide,guide-core=rust --md docs/eval/FILE.md
+
+# (0.17) reuse a baseline's cells: only the missing (task, cond, rep) run
+tests/agent-eval/run.py run ... --skip-existing-in BASELINE_RUNDIR
+```
 
 - `--model`: `claude:sonnet`, `claude:haiku` (any `claude --model`
   name), `ollama:MODEL`.
 - `--cond`: `bare` (tachyon, the preamble says only what tachyon is and
   how to build), `guide` (bare + `tachyonc guide` inlined, generated from
-  the binary under test), `tools` (bare + the tools table,
+  the binary under test; from 0.17 `tachyonc guide --full`, the long
+  core), `tools` (bare + the tools table,
   [prompts/tools.md](prompts/tools.md)), `both`, `rust`.
+- (0.17) a condition is `BASE[+MOD...]` ([lib/conds.py](lib/conds.py)):
+  new bases `guide-core` (the ~2k example-first core: prompts/guide-core.md
+  and `tachyonc guide` of a 0.17 compiler), `tools-core` (the tiered tools
+  preamble, prompts/tools-core.md), `both-core` (the two),
+  `rust-pairs` (paired Rust -> tachyon examples, prompts/rust-pairs.md,
+  compiled by check-tasks), `compiler-tools-core` (the task's AGENTS.md
+  with this checkout's tiered tools section); modifiers `+hook` (the
+  check hook in any tachyon condition), `+test` (`tachyonc test` in the
+  prompt, prompts/test.md or compiler-test.md, and the hooks of
+  tools/agent-hooks/settings-eval.json; a hosted run refuses it until that
+  file exists), `+recite` (prompts/recite.md after the task).
 - `--set programs|compiler|all|dev` (0.16): the task directories
   (`tasks/`, `ctasks/`, both, `devtasks/`: two tiny ones for working on
   the runner); or `--tasks-dir D[,D...]`; `--tasks a,b` picks some. A
@@ -84,6 +114,25 @@ one command, `sh tests/agent-eval/plans/0.16.sh`).
 - Resumable: a run whose `result.json` exists is skipped, so rerun the
   same command (same `--out`) after an interruption. A run directory
   without `result.json` is redone from scratch.
+- (0.17) `--selfcheck auto|hosted|offline|none`: before the first run,
+  lib/selfcheck.py sets up a workspace of each kind the round needs
+  (tach, rust, compiler) as a run does and runs probes in it: writing in
+  the workspace and $TMPDIR, `mktemp` (with and without `-d`/`-t`),
+  `python3`, `git`, the compiler, a build, a run, `check`; for compiler
+  tasks `compiler/std/embed.sh -c`, `bootstrap/eval-build.sh --quick`,
+  one `tests/run.sh` case; `tachyonc test` with `+test`. Offline: under
+  sandbox-exec with an approximation of Claude Code's box (it reproduces
+  0.16's mktemp failure when the shim is taken away). Hosted (the default
+  for Claude; one Haiku session per kind, under a cent): the same probes
+  in the real sandbox with the real permissions and hooks, plus the build
+  and run as single commands, the Write tool in the workspace and in the
+  sandbox's temp directory, and 14 command forms the 0.16 round saw
+  refused (`&&`, `$?`, `$VAR`, `$TMPDIR` redirects, a loop, a heredoc,
+  `$(...)`, a pipe, `cd`, `perl`, `sed -i`, ...), whose refusals are
+  recorded, not required. A failed required probe stops the round
+  (`OUT/selfcheck.json`, reused for 12 hours).
+- (0.17) `--tools-tachyonc PATH`: the compiler-tools conditions get PATH
+  as `target/tools/tachyonc` (newer tools on the same compiler tasks).
 - Hosted runs go `--jobs` at a time; Ollama runs one at a time.
 
 The prompt is `prompts/` assembled by `lib/prompts.py`: the language
@@ -113,6 +162,8 @@ task's `task.md`. Each run keeps its prompt in `prompt.md`.
    one. Success = all of them.
 
 Stored per run in `results/RUN/TASK/MODEL/COND/repN/`: `result.json`,
+(0.17) `hook-output.jsonl` (what each hook returned to the agent:
+lib/hook-tee.py wraps every hook, since the stream does not carry it),
 `grade.json` (per test), `prompt.md`, `transcript.jsonl` (Claude's
 stream-json, or the Ollama conversation with per-call counts),
 `agent.stderr`, `workspace.tar.gz` (the final workspace, without `.git`
@@ -129,6 +180,22 @@ plugins, permission mode), `compiler`, `model_id`; for tachyon,
 from `tachyonc check --json`; null for a compiler before 0.15) and with
 `--check-hook`, `check_hook`.
 
+- (0.17) `anatomy` ([lib/anatomy.py](lib/anatomy.py)): `tokens` (turns,
+  output, fresh, cache write, cache read, cost, first and median prompt
+  per model call), `roles` (calls as lookup / edit / verify / other;
+  `segment_roles` add up to `tool_calls_by_kind`), `first_edit_call`,
+  `errors` (the distinct compile errors seen in tool results and hook
+  output, each with its class: name, type, match, syntax, unsafe, alloc,
+  own, effects, other; Rust's by rustc code) with `classes` and `habits`
+  (Rust habits in tachyon errors: `String`, `std::io`, a C call without
+  `unsafe`, `Vec::new`, ...), `repair` (calls from an error to the next
+  clean build/check/checked edit, per error), `edit_recovery` (failed
+  edits and whether the next one worked), `denials` (by cause: heredoc,
+  `$(...)`, `$VAR`, loop, `cd`, unlisted command, chain, pipe, redirect,
+  a file outside the workspace), `ngrams` (the call sequence, top
+  bigrams and trigrams), `guide_topics`, `erosion` (starter items, test
+  files and assert-like lines gone at the end), `query_hook` (blocks and
+  whether the suggestion was followed). The report adds tables for each.
 - `input_tokens` is every prompt token the model read, summed over its
   calls: for Claude fresh + cache writes + cache reads
   (`cache_read_tokens` separately); for Ollama `prompt_eval_count`, the
@@ -182,17 +249,20 @@ writes outside the workspace and temp fail; the repo's
 `.git/agent-tools.jsonl` (written by its hook) has no entry from an eval
 session.
 
-Known denials: Claude Code asks before running a command line with shell
-variables (`for f in *; do ... $f; done`, `P=./prog; $P`) even in the
-sandbox, and with nobody to ask that is a denial. The preamble for the
-Claude backend says so and suggests a script file (`sh script.sh`, which
-is allowed). Writes outside the workspace are denied by design. On the
-dev runs about 1 call in 10 was denied (mostly `$?`, `$var`, subshells);
-the agents carried on. `--claude-permissions bypass` runs Claude with
-`bypassPermissions` inside the same sandbox instead (deny rules still
-hold, plus an Edit deny rule for the home directory), so nothing is
-denied; it is not verified yet and is for the repository owner to
-choose.
+Known denials: Claude Code splits a command line at `&&`, `;`, `|` and
+newlines and wants every part allowed; a command it cannot resolve asks,
+and with nobody to ask that is a denial. The preamble for the Claude
+backend says so and suggests a script file (`sh script.sh`). In the 0.16
+round 461 of 7,872 calls were denied (6%: heredocs, `$VAR`, chains, Write
+calls to the sandbox's temp directory /tmp/claude-UID). (0.17) The
+allowlist was widened from those denials (every command the agents
+chained, `Bash(./*)` for programs built in the workspace, `Edit` rules
+for the sandbox's temp directory, loops), all still inside the sandbox
+and the permission system; the self-check measures what is still refused
+(2026-10-15, Haiku: of 14 forms only a `for` loop), and every run's
+`anatomy.denials` says why each denial happened. `--claude-permissions
+bypass` (bypassPermissions in the sandbox) exists but is not used: the
+rounds keep the permission system.
 
 Ollama (`lib/ollama_backend.py`): a minimal loop against `/api/chat`
 (`tools`, `options: {num_ctx: 32768, temperature: 0.2}`,
@@ -242,7 +312,15 @@ workspace with `EVAL_LANG=tach|rust`, non-zero with a one-line reason).
 twin file names, both solutions build and pass every test and the check,
 no solution test takes more than half its time limit, and every starter
 fails (does not build, a test, or the check), building when
-`starter_builds` says it should.
+`starter_builds` says it should. (0.17) Also: the reference solutions'
+lints (tachyon `fmt --check`, `lint --max-lines 1000`, `query unused`,
+`fix --dry-run`; Rust `rustfmt --check`, `rustc -D warnings`;
+`--no-lint` skips), every `variants/LANG-NAME.patch` (`diff -ruN a b`
+against solution/LANG: a second correct solution written another way,
+such as struct-like enum variants in Rust, one-line items, an iterator
+with `type Item`, a scratch copy left in the workspace) builds and passes
+the tests and the check, so a check.sh tests the task and not one way of
+writing it; and every ```` ```tach ```` block of prompts/*.md builds.
 
 ## Compiler tasks (0.16)
 
@@ -300,6 +378,9 @@ reference), `hidden/` (tests copied over the graded tree), `grade.sh`.
 - `lib/ctasks.py` (0.16): the compiler tasks: bases, workspaces,
   AGENTS.md per condition, grading, their check; `lib/eval-build.sh`.
 - `plans/`: the commands of a round (`0.16.sh`, `0.16.md`).
+- (0.17) `lib/conds.py` (conditions and modifiers), `lib/selfcheck.py`,
+  `lib/anatomy.py` (`run.py analyze`), `lib/compare.py` (`run.py
+  compare`), `lib/hook-tee.py` (logs what a hook returned).
 - `lib/common.py` (tasks, meta.toml, processes), `lib/grade.py`,
   `lib/checktasks.py`, `lib/runner.py`, `lib/claude_backend.py`,
   `lib/ollama_backend.py`, `lib/toolkinds.py` (classifying tool calls),
