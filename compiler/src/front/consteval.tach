@@ -4,6 +4,7 @@
 // an f64 (rounded to f32 first for f32), bools as 0 or 1.
 
 use crate::base::{BUFS, IntVec, buf_reserve, memset};
+use crate::base::diag::{err_begin, err_end, err_help, err_str};
 use crate::front::ast::{NODES, NodeKind, VK_NEW, VK_SPLAT, child};
 use crate::front::check::{
     CONST_CONTEXT, RETURN_TYPE, Res, Try, attempt, name_error, type_error, type_error_got,
@@ -18,7 +19,7 @@ use crate::front::lexer::Tok::{
 };
 use crate::front::modules::{CUR_MOD, module_of};
 use crate::front::types::{
-    CONSTS, ENUMS, TYPES, TY_BOOL, TY_ERROR, TY_F32, TY_I64, TY_U64, TY_UNIT, VARIANTS,
+    CONSTS, ENUMS, FNS, TYPES, TY_BOOL, TY_ERROR, TY_F32, TY_I64, TY_U64, TY_UNIT, VARIANTS,
     field_offset, int_bits, int_max, is_compound, is_float, is_integer, is_pointer, is_signed,
     scalar_type, struct_field, tuple_offset, type_elem, type_size, variant_field,
     variant_field_offset,
@@ -139,6 +140,21 @@ pub fn eval_array_len(n: i64) -> i64 {
 pub fn const_eval(n: i64) -> i64 {
     unsafe {
         let ty = NODES[n].ty;
+        // (0.16: inside a constant constructor, a static's)
+        if NODES[n].kind == NodeKind::Call && CONST_FRAME >= 0 {
+            let body = const_frame_enter(n);
+            let value = const_eval(body);
+            const_frame_leave();
+            return value;
+        }
+        let arg = const_arg(n);
+        if arg >= 0 {
+            let saved = CONST_FRAME;
+            CONST_FRAME = CONST_FRAMES.data[2 * saved + 1];
+            let value = const_eval(arg);
+            CONST_FRAME = saved;
+            return value;
+        }
         match NODES[n].kind {
             NodeKind::Int | NodeKind::Char => wrap_int(NODES[n].a, ty),
             NodeKind::Float => float_const(f64_of_bits(NODES[n].a), ty),
@@ -341,6 +357,9 @@ pub static mut CONST_RELOCS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0
 pub fn const_emit(n: i64, ty: i64, out: i64) {
     unsafe {
         CONST_RELOCS.count = 0;
+        CONST_FRAMES.count = 0;
+        CONST_ARGS.count = 0;
+        CONST_FRAME = -1;
         let at = BUFS[out].len;
         let size = type_size(ty);
         buf_reserve(out, size);
@@ -365,6 +384,21 @@ pub fn const_emit(n: i64, ty: i64, out: i64) {
 
 fn const_write(n: i64, ty: i64, out: i64, at: i64) {
     unsafe {
+        // (0.16: a constant constructor; a use of its parameter)
+        if NODES[n].kind == NodeKind::Call {
+            let body = const_frame_enter(n);
+            const_write(body, ty, out, at);
+            const_frame_leave();
+            return;
+        }
+        let arg = const_arg(n);
+        if arg >= 0 {
+            let saved = CONST_FRAME;
+            CONST_FRAME = CONST_FRAMES.data[2 * saved + 1];
+            const_write(arg, ty, out, at);
+            CONST_FRAME = saved;
+            return;
+        }
         match NODES[n].kind {
             NodeKind::StructLit => {
                 let s = TYPES[ty].a;
@@ -438,5 +472,125 @@ pub fn write_scalar(out: i64, at: i64, value: i64, ty: i64) {
     }
     for i in 0..size {
         unsafe { BUFS[out].data[at + i] = (bits >> (i * 8) as u64) as u8; }
+    }
+}
+
+// ---- Constant constructors (0.16) ----
+
+// A call is a constant expression when its function's body is one
+// expression, constant once the parameters are the call's arguments: a
+// constructor, `Vec::new_in(a)` being `Vec { ptr: 0 as *T, len: 0, cap: 0,
+// alloc: a }`. So a static can hold a container on an arena:
+// `static mut V: Vec<i64, Arena> = Vec::new_in(Arena::none());`.
+// The calls being evaluated are frames: CONST_FRAMES holds (the frame's
+// first pair in CONST_ARGS, the frame its arguments are evaluated in) per
+// frame, CONST_ARGS (parameter local, argument node) pairs; CONST_FRAME
+// is the frame of the expression being evaluated (-1: none).
+static mut CONST_FRAMES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut CONST_ARGS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut CONST_FRAME: i64 = -1;
+
+// Constructors calling constructors, at most this deep.
+const CONST_CALL_DEPTH: i64 = 64;
+
+// The expression that is the body of function f, or -1.
+fn constructor_body(f: i64) -> i64 {
+    unsafe {
+        let item = FNS[f].node;
+        if NODES[item].kind != NodeKind::Fn {
+            return -1;
+        }
+        let body = NODES[item].c;
+        if body <= 0 || NODES[body].kind != NodeKind::Block || NODES[body].count != 0
+            || NODES[body].a <= 0 || NODES[NODES[body].a].ty <= 0 {
+            return -1;
+        }
+        NODES[body].a
+    }
+}
+
+// Call n, evaluated as a constant: its frame entered; the expression to
+// evaluate (then const_frame_leave).
+fn const_frame_enter(n: i64) -> i64 {
+    unsafe {
+        let f = NODES[n].x - 1;
+        let body = if f >= 0 { constructor_body(f) } else { -1 };
+        let item = if f >= 0 { FNS[f].node } else { 0 };
+        if body < 0 || CONST_FRAMES.count >= 2 * CONST_CALL_DEPTH
+            || NODES[n].count < NODES[item].count {
+            err_begin(NODES[n].start);
+            err_str(c"expression is not a compile-time constant");
+            err_help(c"a call is constant when its function's body is one expression of constants and its parameters (a constructor: 'Vec::new_in(Arena::none())')");
+            err_end();
+        }
+        let first = CONST_ARGS.count;
+        for i in 0..NODES[item].count {
+            CONST_ARGS.push(NODES[child(item, i)].x);
+            CONST_ARGS.push(child(n, i));
+        }
+        CONST_FRAMES.push(first);
+        CONST_FRAMES.push(CONST_FRAME);
+        CONST_FRAME = CONST_FRAMES.count / 2 - 1;
+        body
+    }
+}
+
+fn const_frame_leave() {
+    unsafe {
+        let k = CONST_FRAME;
+        CONST_ARGS.count = CONST_FRAMES.data[2 * k];
+        CONST_FRAME = CONST_FRAMES.data[2 * k + 1];
+        CONST_FRAMES.count = 2 * k;
+    }
+}
+
+// The argument node that n stands for, when it is a use of a parameter of
+// the constructor being evaluated; else -1.
+fn const_arg(n: i64) -> i64 {
+    unsafe {
+        if CONST_FRAME < 0 || NODES[n].kind != NodeKind::Ident || NODES[n].res != Res::Local {
+            return -1;
+        }
+        let first = CONST_FRAMES.data[2 * CONST_FRAME];
+        let end = if 2 * CONST_FRAME + 2 < CONST_FRAMES.count {
+            CONST_FRAMES.data[2 * CONST_FRAME + 2]
+        } else {
+            CONST_ARGS.count
+        };
+        let mut i = first;
+        while i < end {
+            if CONST_ARGS.data[i] == NODES[n].y {
+                return CONST_ARGS.data[i + 1];
+            }
+            i += 2;
+        }
+        -1
+    }
+}
+
+// Whether constant expression n calls a function (its check waits for
+// the functions' bodies: check_static_calls).
+pub fn has_const_call(n: i64) -> bool {
+    unsafe {
+        let kind = NODES[n].kind;
+        if kind == NodeKind::Call {
+            return true;
+        }
+        if kind == NodeKind::StructLit {
+            for i in 0..NODES[n].count {
+                if has_const_call(NODES[child(n, i)].b) {
+                    return true;
+                }
+            }
+        } else if kind == NodeKind::Tuple || kind == NodeKind::Array {
+            for i in 0..NODES[n].count {
+                if has_const_call(child(n, i)) {
+                    return true;
+                }
+            }
+        } else if kind == NodeKind::Repeat {
+            return has_const_call(NODES[n].a);
+        }
+        false
     }
 }

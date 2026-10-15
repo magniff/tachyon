@@ -1,10 +1,118 @@
-// `#[sealed]` structs (0.16; T2 makes the checks): the fields not marked
-// `pub` are invisible outside the module that declares the struct, and so
-// are its literals; std's Vec, Buf, HashMap, Arena, ScopedArena and
-// FixedBuf are sealed (docs/design/effects-allocation.md §2.4).
+// `#[sealed]` structs (0.16): the fields not marked `pub` are invisible
+// outside the module that declares the struct (and the modules inside
+// it), and so are its literals; std's Vec, Buf, HashMap, Gpa, Arena,
+// ScopedArena and FixedBuf are sealed (docs/design/effects-allocation.md
+// §2.4). The compiler's own nodes (NODE_IMPLICIT: main's `Gpa {}`, the
+// fields structural `==` compares) are let through.
+use crate::base::intern_c;
+use crate::base::diag::{err_begin, err_end_soft, err_help, err_help_sym, err_str, err_sym};
+use crate::front::ast::{NODES, NODE_IMPLICIT, STRUCT_SEALED, child};
+use crate::front::check::collect::find_generic_method;
+use crate::front::modules::{MODULES, STD_MODULE, is_within, module_of};
+use crate::front::parser::items::ITEM_PUBLIC;
+use crate::front::types::{STRUCTS, find_method, struct_type};
+
+// Whether node n, of struct s, is code outside the module sealing s.
+fn sealed_away(n: i64, s: i64) -> bool {
+    unsafe {
+        if (STRUCTS[s].repr & STRUCT_SEALED) == 0 || (NODES[n].p & NODE_IMPLICIT) != 0 {
+            return false;
+        }
+        !is_within(module_of(n), STRUCTS[s].module)
+    }
+}
+
+// The template of struct s (s when it is not an instance).
+fn template_of(s: i64) -> i64 {
+    unsafe {
+        if STRUCTS[s].tmpl != 0 { STRUCTS[s].tmpl - 1 } else { s }
+    }
+}
+
+// "'Vec' is sealed: " and the module's name, for an error.
+fn sealed_begin(n: i64, s: i64) {
+    unsafe {
+        err_begin(NODES[n].start);
+        err_str(c"'");
+        err_sym(STRUCTS[template_of(s)].name);
+        err_str(c"' is sealed: ");
+    }
+}
+
+fn err_module(s: i64) {
+    unsafe {
+        err_str(c" module '");
+        err_sym(MODULES[STRUCTS[s].module].key);
+        err_str(c"'");
+    }
+}
 
 // Field access n (a FieldAccess, x = the field) of struct s.
-pub fn check_field(n: i64, s: i64) {}
+pub fn check_field(n: i64, s: i64) {
+    unsafe {
+        if !sealed_away(n, s) {
+            return;
+        }
+        let t = template_of(s);
+        let field = NODES[n].x;
+        if field >= 0 && (NODES[child(STRUCTS[t].node, field)].p & ITEM_PUBLIC) != 0 {
+            return;
+        }
+        let name = NODES[n].b;
+        sealed_begin(n, s);
+        err_str(c"its field '");
+        err_sym(name);
+        err_str(c"' is private to");
+        err_module(s);
+        if find_method(struct_type(s), name) >= 0
+            || (STRUCTS[s].tmpl != 0 && find_generic_method(STRUCTS[s].tmpl, name) >= 0) {
+            err_help(c"call its method: '.");
+            err_help_sym(name);
+            err_help(c"()'");
+        } else {
+            err_help(c"use the methods of '");
+            err_help_sym(STRUCTS[t].name);
+            err_help(c"' (its fields change only through them: `.len()`, `.as_slice()`, ...)");
+        }
+        err_end_soft();
+    }
+}
 
-// Struct literal n of struct s.
-pub fn check_literal(n: i64, s: i64) {}
+// Struct literal n of struct s: whether it may be made here (its fields
+// are checked then).
+pub fn check_literal(n: i64, s: i64) -> bool {
+    unsafe {
+        if !sealed_away(n, s) {
+            return true;
+        }
+        let t = template_of(s);
+        let name = STRUCTS[t].name;
+        sealed_begin(n, s);
+        err_str(c"only");
+        err_module(s);
+        err_str(c" makes one");
+        if STRUCTS[t].module == STD_MODULE && name == intern_c(c"Gpa") {
+            err_help(
+                c"a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)' and is passed down as a parameter");
+        } else if STRUCTS[t].module == STD_MODULE && name == intern_c(c"ScopedArena") {
+            err_help(c"a scope's arena comes from 'arena_scope(gpa, |s: ScopedArena| ...)' or 'a.scope(|s: ScopedArena| ...)'");
+        } else if STRUCTS[t].module == STD_MODULE && name == intern_c(c"Arena") {
+            err_help(
+                c"make one with its constructor: 'Arena::new_in(gpa)' (a static: 'Arena::none()')");
+        } else if STRUCTS[t].module == STD_MODULE && name == intern_c(c"FixedBuf") {
+            err_help(c"make one with its constructor: 'FixedBuf::new(mem)'");
+        } else if STRUCTS[t].module == STD_MODULE {
+            err_help(c"make one with its constructor: '");
+            err_help_sym(name);
+            err_help(c"::new_in(gpa)' (a static: '");
+            err_help_sym(name);
+            err_help(c"::new_in(Arena::none())')");
+        } else {
+            err_help(c"make one with a function of the module that declares '");
+            err_help_sym(name);
+            err_help(c"'");
+        }
+        err_end_soft();
+        false
+    }
+}
