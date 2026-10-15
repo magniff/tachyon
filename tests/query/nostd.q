@@ -2,13 +2,13 @@
 ## the program does not define, its source by `std`, grep in it, a
 ## show with the `use` line a program needs.
 $ def std::read_line Vec::push
-std::read_line	<std>:2005:8	fn	pub fn read_line<A: Allocator>(line: *Buf<A>) -> Result<bool, IoError>
+std::read_line	<std>:2010:8	fn	pub fn read_line<A: Allocator>(line: *Buf<A>) -> Result<bool, IoError>
 std::Vec::push	<std>:234:12	method	pub fn push(self: *Vec<T, A>, x: T)
 $ def read_line twice
-std::read_line	<std>:2005:8	fn	pub fn read_line<A: Allocator>(line: *Buf<A>) -> Result<bool, IoError>
+std::read_line	<std>:2010:8	fn	pub fn read_line<A: Allocator>(line: *Buf<A>) -> Result<bool, IoError>
 crate::twice	nostd/main.tach:4:4	fn	fn twice(x: i64) -> i64
 $ show std::print_int
-// std::print_int	<std>:2394-2402
+// std::print_int	<std>:2399-2407
 // use std::print_int;
 #[inline(never)]
 pub fn print_int(v: i64) {
@@ -25,7 +25,7 @@ $ text std:1-2
 2	// (compiler/std/embed.sh makes compiler/src/front/stdsrc.tach from this file
 $ grep 'pub fn read_line' --in std
 # <std>
-2005:1	code	std	pub fn read_line<A: Allocator>(line: *Buf<A>) -> Result<bool, IoError> {
+2010:1	code	std	pub fn read_line<A: Allocator>(line: *Buf<A>) -> Result<bool, IoError> {
 $ def no_such_name
 error query.no-match: no definition 'no_such_name'
 try: tachyonc query items
