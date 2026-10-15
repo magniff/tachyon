@@ -85,8 +85,8 @@ def one_run(ctx, task, cond, rep):
     # (--check-hook) the tools and both conditions, (0.17) +hook and +test
     # in any: check after each change
     hook = ((ctx["hooks"]["check"], os.path.join(base, "check-hook.jsonl"))
-            if lang == "tach" and c.check_hook(ctx.get("check_hook")) else None)
-    extra = ctx.get("eval_hooks") if c.test else None
+            if lang == "tach" and (c.check_hook(ctx.get("check_hook")) or c.turn_end) else None)
+    extra = eval_hooks(ctx, c.settings_key(ctx.get("check_hook"))) if lang == "tach" else None
     env_note = ("claude-env.md" if ctx["backend"] == "claude"
                 and claude_backend.PERMS == "allowlist" else None)
     prompt = build_prompt(c, task.text(), ctx.get("guide"), env_note=env_note,
@@ -187,7 +187,7 @@ def one_compiler_run(ctx, task, cond, rep):
     tools = c.query_hook
     hook = (ctx["hooks"]["check"], os.path.join(base, "check-hook.jsonl")) if tools else None
     qhook = ctx["hooks"]["query"] if tools else None
-    extra = ctx.get("eval_hooks") if c.test else None
+    extra = eval_hooks(ctx, c.settings_key()) if tools else None
     with open(os.path.join(ws, "AGENTS.md")) as fh:  # (the condition's)
         agents_text = fh.read()
     prompt = compiler_prompt(cond, task.text(), agents_text,
@@ -257,6 +257,19 @@ def one_compiler_run(ctx, task, cond, rep):
     return res
 
 
+def eval_hooks(ctx, key):
+    """(0.17) The hooks of settings-eval.json's condition `key` (None: no
+    check or Stop hook), pointed at the copies; cached in ctx. None when
+    the file does not exist (the conditions needing it refuse to run:
+    conds.Cond.needs), when the harness's own check hook is used instead."""
+    if key is None:
+        return None
+    cache = ctx.setdefault("eval_hooks", {})
+    if key not in cache:
+        cache[key] = eval_settings_hooks(conds.SETTINGS_EVAL, ctx["hooks"]["dir"], key)
+    return cache[key]
+
+
 def dry_run(ctx, prompt, ws, rdir, check_hook, query_hook, extra_hooks=None):
     """--dry-run: no model. Writes the backend's settings and command line
     (settings.json, command.json) and feeds each registered hook a
@@ -272,7 +285,7 @@ def dry_run(ctx, prompt, ws, rdir, check_hook, query_hook, extra_hooks=None):
                                   check_hook and check_hook[0], query_hook, extra_hooks, tee)
     write_json(os.path.join(rdir, "command.json"), argv)
     hooks = settings.get("hooks", {})
-    out = {"hooks_registered": {ev: [h["matcher"] for h in hs] for ev, hs in hooks.items()}}
+    out = {"hooks_registered": {ev: [h.get("matcher", "*") for h in hs] for ev, hs in hooks.items()}}
     env = claude_backend.env(os.path.join(os.path.dirname(ws), "bin"))
     if check_hook:
         env["TACHYON_CHECK_HOOK_LOG"] = check_hook[1]
@@ -281,7 +294,7 @@ def dry_run(ctx, prompt, ws, rdir, check_hook, query_hook, extra_hooks=None):
     def fire(event, ev):
         got = []
         for h in hooks.get(ev, []):
-            if not re.fullmatch(h["matcher"], event["tool_name"]):
+            if h.get("matcher") and not re.fullmatch(h["matcher"], event.get("tool_name", "")):
                 continue
             for c in h["hooks"]:
                 p = subprocess.run(c["command"], shell=True, cwd=ws, env=env,
@@ -308,6 +321,9 @@ def dry_run(ctx, prompt, ws, rdir, check_hook, query_hook, extra_hooks=None):
             out["post_write"] = fire({"tool_name": "Write", "session_id": "dry-run",
                                       "tool_input": {"file_path": probe, "content": "..."},
                                       "tool_response": {}}, "PostToolUse")
+            # (0.17) the Stop hook with the error still there: it blocks
+            if hooks.get("Stop"):
+                out["stop"] = fire({"session_id": "dry-run", "stop_hook_active": False}, "Stop")
         finally:
             with open(probe, "w") as fh:
                 fh.write(saved)
@@ -374,8 +390,9 @@ def main(args):
            if getattr(args, "tools_tachyonc", None) else None,
            "versions": {"tach": tool_version(bins["tach"], "tach"),
                         "rust": tool_version(bins["rust"], "rust")}}
-    if any(c.test for c in cs):
-        ctx["eval_hooks"] = eval_settings_hooks(conds.SETTINGS_EVAL, hooks["dir"])
+    # (0.17) every condition's hooks from settings-eval.json, checked now
+    for c in cs:
+        eval_hooks(ctx, c.settings_key(args.check_hook))
     # (0.16) compiler tasks: the base, its builder and the starter's
     # compiler, built once per task (cached under the workspaces' root)
     ctx["ctasks"] = {}

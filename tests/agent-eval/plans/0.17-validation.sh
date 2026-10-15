@@ -14,7 +14,8 @@
 #   TACHYONC    the 0.17 candidate for the program tasks (default
 #               target/tachyonc; must have `tachyonc guide --full`)
 #   TOOLS_TACHYONC  compiler tasks: the binary given as target/tools/tachyonc
-#               (default: unset, the starter's)
+#               (default: unset, the starter's: the compiler tasks' base is
+#               the integrated 0.17 tree, so the starter has the new tools)
 #   TACHYONC_DIAG   step E: the compiler with item 5's diagnostics
 #   MODELS      default "claude:haiku claude:sonnet" (side by side)
 #   DREPS       reps of the deciding Sonnet program cells (default 10)
@@ -22,7 +23,7 @@
 #   JOBS, CJOBS parallel program / compiler runs per model (6, 2)
 #   OUT         results root (default tests/agent-eval/results)
 #   STEP        all (default: check dry A A-control drift tools C G report)
-#               | check | dry | A | A-control | drift | tools | C | G | D | E | report
+#               | check | dry | A | A-control | drift | tools | C | C-plain | G | D | E | report
 set -eu
 cd "$(dirname "$0")/../../.."
 RUN=tests/agent-eval/run.py
@@ -84,6 +85,7 @@ for root, _, files in os.walk(sys.argv[1]):
     d = r.get("dry_run") or {}
     post = [h for h in d.get("post_write", []) if h["hook"] == "check-after-edit.py"]
     pre = [h for h in d.get("pre_grep", []) if h["hook"] == "query-first.py"]
+    stop = [h for h in d.get("stop", []) if h["hook"] == "turn-end.py"]
     c = r["cond"]
     if c.startswith("compiler-tools"):
         ok = post and "undefined_name_xyz" in post[0]["stdout"] and pre and pre[0]["exit"] == 2
@@ -91,6 +93,11 @@ for root, _, files in os.walk(sys.argv[1]):
         ok = bool(post) and "undefined_name_xyz" in post[0]["stdout"]
     else:
         ok = not d.get("hooks_registered")
+    if "+test" in c or "+turn-end" in c:
+        # the Stop hook fires with the probe's error left: it blocks
+        ok = ok and bool(stop) and '"block"' in stop[0]["stdout"]
+    elif ok:
+        ok = not stop
     print("%-4s %s %s" % ("ok" if ok else "FAIL", r["task"], c))
     bad += not ok
 sys.exit(1 if bad else 0)
@@ -150,6 +157,17 @@ if want C; then
         say "C: $m compiler-tools-core x $REPS"
         $RUN run --model "$m" --set compiler --cond compiler-tools-core --reps "$REPS" \
             --jobs "$CJOBS" $tools_arg --out "$OUT/0.17v-C-$(slug "$m")" &
+        pids="$pids $!"
+    done
+    wait_all
+fi
+
+# C-plain (opt-in): compiler-plain on the same 0.17 base, the same-base control
+if want C-plain; then
+    for m in $MODELS; do
+        say "C-plain: $m compiler-plain (0.17 base) x $REPS"
+        $RUN run --model "$m" --set compiler --cond compiler-plain --reps "$REPS" \
+            --jobs "$CJOBS" --out "$OUT/0.17v-Cplain-$(slug "$m")" &
         pids="$pids $!"
     done
     wait_all
@@ -218,6 +236,10 @@ if want report; then
     [ -n "$n" ] && $RUN compare --baseline $bc --new $n \
         --pairs compiler-tools-core=compiler-tools,compiler-tools-core=compiler-plain \
         --md docs/eval/0.17-validation-C.md
+    n=$(dirs "$OUT"/0.17v-C-*)
+    cp=$(dirs "$OUT"/0.17v-Cplain-*)
+    [ -n "$n" ] && [ -n "$cp" ] && $RUN compare --baseline $cp --new $n \
+        --pairs compiler-tools-core=compiler-plain --md docs/eval/0.17-validation-C-samebase.md
     n=$(dirs "$OUT"/0.17v-G-*)
     a=$(dirs "$OUT"/0.17v-A-*)
     [ -n "$n" ] && [ -n "$a" ] && $RUN compare --baseline $a --new $n \
@@ -236,7 +258,7 @@ if want report; then
     [ -n "$n" ] && [ -n "$a" ] && $RUN compare --baseline $a --new $n \
         --pairs guide-core=guide-core --md docs/eval/0.17-validation-E.md
     all=$(dirs "$OUT"/0.17v-A-* "$OUT"/0.17v-Actl-* "$OUT"/0.17v-drift-* "$OUT"/0.17v-tools-* \
-        "$OUT"/0.17v-C-* "$OUT"/0.17v-G-* "$OUT"/0.17v-D-* "$OUT"/0.17v-Dctl-* "$OUT"/0.17v-E-*)
+        "$OUT"/0.17v-C-* "$OUT"/0.17v-Cplain-* "$OUT"/0.17v-G-* "$OUT"/0.17v-D-* "$OUT"/0.17v-Dctl-* "$OUT"/0.17v-E-*)
     [ -n "$all" ] && $RUN report $all --md docs/eval/0.17-validation.md
     } || true
 fi

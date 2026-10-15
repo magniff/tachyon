@@ -81,8 +81,12 @@ tests/agent-eval/run.py run ... --skip-existing-in BASELINE_RUNDIR
   with this checkout's tiered tools section); modifiers `+hook` (the
   check hook in any tachyon condition), `+test` (`tachyonc test` in the
   prompt, prompts/test.md or compiler-test.md, and the hooks of
-  tools/agent-hooks/settings-eval.json; a hosted run refuses it until that
-  file exists), `+recite` (prompts/recite.md after the task).
+  tools/agent-hooks/settings-eval.json, with the turn-end Stop hook),
+  `+turn-end` (the Stop hook: with +hook settings-eval's `hook+turn-end`,
+  alone its `turn-end`), `+recite` (prompts/recite.md after the task).
+  Every check and Stop hook a condition registers is settings-eval.json's
+  entry for it (`conds.Cond.settings_key`), its files copied out of the
+  repository with the scripts.
 - `--set programs|compiler|all|dev` (0.16): the task directories
   (`tasks/`, `ctasks/`, both, `devtasks/`: two tiny ones for working on
   the runner); or `--tasks-dir D[,D...]`; `--tasks a,b` picks some. A
@@ -327,8 +331,10 @@ writing it; and every ```` ```tach ```` block of prompts/*.md builds.
 `ctasks/NN-name/`: a change to tachyon's own compiler, made in a copy of
 the repository, graded by building the compiler and running part of its
 suite. The format is in `lib/ctasks.py`'s header: `meta.toml` (`kind`
-optimize|refactor|fix|feature, `base = "v0.16.0"` with `base_fallback`,
-a commit that exists now, `suite`: the tests/run.sh filters that must
+optimize|refactor|fix|feature, `base`: the commit the task is made
+from (0.16's round: `v0.16.0`; 0.17's rerun: the integrated release-0.17
+tree, so the new tools are in play; `base_fallback`, optional: a commit
+used while `base` does not exist), `suite`: the tests/run.sh filters that must
 pass, optional `same_output` corpus), `task.md`, `README.md` (for
 people), `starter.patch` (optional: a planted bug), `solution.patch` (the
 reference), `hidden/` (tests copied over the graded tree), `grade.sh`.
@@ -338,7 +344,10 @@ reference), `hidden/` (tests copied over the graded tree), `grade.sh`.
   ([lib/eval-build.sh](lib/eval-build.sh): what bootstrap.sh does for
   HEAD, from `target/builder/tachyonc`, the release that builds the base,
   since the copy has no tags); `target/tachyonc` built from the starter;
-  CLAUDE.md and `.claude/` removed: the prompt carries AGENTS.md.
+  CLAUDE.md and `.claude/` removed: the prompt carries AGENTS.md; (0.17)
+  tests/agent-eval removed (the reference solutions are in it). A base
+  after the last release is built by that release, as bootstrap.sh
+  builds HEAD.
 - **compiler-tools**: AGENTS.md as it is; `target/tools/tachyonc`; the
   query-first hook (PreToolUse on Bash, Read, Grep, Edit, Write; PostToolUse
   on Bash) and the check hook (PostToolUse), registered in `--settings`

@@ -31,7 +31,8 @@ build bootstrap.sh does for HEAD, from `target/builder/tachyonc`, the
 release that builds the base, since the copy has no tags or cache), the
 starter's compiler in `target/tachyonc` (and `target/tools/tachyonc` for
 compiler-tools), AGENTS.md for the condition, CLAUDE.md and .claude/
-removed (the prompt carries AGENTS.md), `git init` with one commit."""
+removed (the prompt carries AGENTS.md), (0.17) tests/agent-eval removed
+(the reference solutions), `git init` with one commit."""
 
 import json
 import os
@@ -128,7 +129,8 @@ def main_checkout():
 
 def builder_for(sha, override=None):
     """The compiler that builds the base: the `built_by` release of the last
-    [[release]] in the base's bootstrap/releases.toml, from a bootstrap
+    [[release]] in the base's bootstrap/releases.toml (the last release
+    itself when the base comes after it), from a bootstrap
     cache (this checkout's, the main checkout's, $TACHYON_BOOTSTRAP_CACHE)."""
     if override:
         if not os.access(override, os.X_OK):
@@ -150,6 +152,13 @@ def builder_for(sha, override=None):
         raise SystemExit("no [[release]] in releases.toml at %s" % sha[:12])
     by = releases[-1].get("built_by")
     tag = next((r.get("tag") for r in releases if r.get("version") == by), "v" + by)
+    # (0.17) a base after the last release (a development tree, as the 0.17
+    # rerun's is) is built by that release, as bootstrap.sh builds HEAD
+    last = releases[-1].get("tag") or "v" + releases[-1].get("version", "")
+    lsha = rev(last)
+    if lsha and lsha != sha and git(["merge-base", "--is-ancestor", lsha, sha],
+                                    check=False).returncode == 0:
+        tag = last
     tsha = rev(tag)
     if not tsha:
         raise SystemExit("the builder release %s (tag %s) is not tagged here; pass --builder"
@@ -266,8 +275,9 @@ def agents_md(tree, cond):
     if c.compiler == "core":
         core = tools_section(os.path.join(REPO_ROOT, "AGENTS.md"))
         if core.strip() == text[m.start():m.end()].strip():
-            raise RuntimeError("compiler-tools-core: this checkout's AGENTS.md tools section "
-                               "is the base's: the condition would be compiler-tools")
+            # (a base with 0.17's tiered AGENTS.md, the 0.17 rerun's: the
+            # base's text as it is, which compiler-tools would give too)
+            return text
         return text[:m.start()] + core + text[m.end():]
     text = text[:m.start()] + PLAIN_READ + "\n" + text[m.end():]
     # the inner loop's mentions of the hook and the tools binary
@@ -304,7 +314,10 @@ def setup_workspace(task, cond, sha, ws, builder, starter_tree, env, tools_tachy
     """The agent's copy of the repository (see the module's comment)."""
     from lib.conds import Cond
     make_tree(task, sha, ws)
-    for gone in ("CLAUDE.md", ".claude"):
+    # (0.17) tests/agent-eval too: the tasks' reference solutions are in it
+    # (0.16's workspaces had them; three compiler-plain runs grepped into
+    # 22's and 24's solution.patch)
+    for gone in ("CLAUDE.md", ".claude", os.path.join("tests", "agent-eval")):
         p = os.path.join(ws, gone)
         if os.path.isdir(p):
             shutil.rmtree(p)

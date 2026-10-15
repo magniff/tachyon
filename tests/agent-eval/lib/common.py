@@ -345,7 +345,9 @@ def tail(b, n=2000):
 
 def install_hooks(ws_root):
     """The agent hooks (tools/agent-hooks/: check-after-edit.py,
-    query-first.py, the modules and files they load) and (0.17) lib/hook-tee.py
+    query-first.py, turn-end.py, the modules and files they load:
+    tachyonc_cmd.py, hookstate.py, hints.txt, settings-eval.json; every file
+    but the tests) and (0.17) lib/hook-tee.py
     copied out of the repository, which the agent's sandbox cannot read:
     {"check": path, "query": path, "tee": path, "dir": the copies}."""
     d = os.path.join(ws_root, "hooks")
@@ -357,6 +359,7 @@ def install_hooks(ws_root):
     shutil.copyfile(os.path.join(EVAL_DIR, "lib", "hook-tee.py"), os.path.join(d, "hook-tee.py"))
     return {"check": os.path.join(d, "check-after-edit.py"),
             "query": os.path.join(d, "query-first.py"),
+            "turn_end": os.path.join(d, "turn-end.py"),
             "tee": os.path.join(d, "hook-tee.py"), "dir": d}
 
 
@@ -364,16 +367,32 @@ _HOOK_PATH = re.compile(r"""(?:["']?\$\{?CLAUDE_PROJECT_DIR\}?["']?/)?(?:\./)?""
                         r"""tools/agent-hooks/([\w.-]+\.py)""")
 
 
-def eval_settings_hooks(path, hooks_dir):
-    """(0.17, the +test modifier) The `hooks` of tools/agent-hooks/
-    settings-eval.json (the repository's hook settings for the eval: the
-    check hook that also runs the tests), each command pointed at the copy
-    of its script in hooks_dir. None when the file does not exist."""
+def eval_settings_hooks(path, hooks_dir, key, python="/usr/bin/python3 -I"):
+    """(0.17) The hooks of a condition in tools/agent-hooks/settings-eval.json
+    (the repository's hook settings for the eval: `conditions[key]`, e.g.
+    `hook+test`), each command's @HOOKS@ the copies' directory (hooks_dir,
+    lib/common.install_hooks) and @PYTHON@ `python`. None when the file
+    does not exist; an error when it lacks the condition or a file it lists
+    was not copied. (A file with a top-level `hooks`, the first draft's
+    form, is read with its tools/agent-hooks/ paths pointed at the copies.)"""
     if not os.path.isfile(path):
         return None
     with open(path) as fh:
         data = json.load(fh)
-    hooks = data.get("hooks") or {}
+    if "conditions" not in data:
+        hooks = data.get("hooks") or {}
+        sub = lambda c: _HOOK_PATH.sub(lambda m: shlex_quote(os.path.join(hooks_dir, m.group(1))), c)
+    else:
+        if key not in data["conditions"]:
+            raise SystemExit("%s has no condition %r (it has %s)"
+                             % (path, key, ", ".join(sorted(data["conditions"]))))
+        missing = [f for f in data.get("files") or []
+                   if not os.path.isfile(os.path.join(hooks_dir, f))]
+        if missing:
+            raise SystemExit("hooks directory %s lacks %s (install_hooks)" % (hooks_dir,
+                                                                             ", ".join(missing)))
+        hooks = data["conditions"][key]
+        sub = lambda c: c.replace("@HOOKS@", shlex_quote(hooks_dir)).replace("@PYTHON@", python)
     out = {}
     for ev, entries in hooks.items():
         new = []
@@ -383,8 +402,7 @@ def eval_settings_hooks(path, hooks_dir):
             for h in e.get("hooks") or []:
                 h = dict(h)
                 if h.get("command"):
-                    h["command"] = _HOOK_PATH.sub(
-                        lambda m: shlex_quote(os.path.join(hooks_dir, m.group(1))), h["command"])
+                    h["command"] = sub(h["command"])
                 hs.append(h)
             e["hooks"] = hs
             new.append(e)

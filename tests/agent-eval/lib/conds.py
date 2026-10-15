@@ -38,12 +38,21 @@ Modifiers, any order after the base:
   hooks of tools/agent-hooks/settings-eval.json (the check hook that also
   runs the tests); until that file exists the condition runs only as a
   dry run. Needs a compiler with `tachyonc test` (the self-check probes it).
+- `+turn-end`: the Stop hook (tools/agent-hooks/turn-end.py: a check of
+  what changed when the agent stops; errors block the stop once); with
+  +hook the check hook too (settings-eval.json's `hook+turn-end`), alone
+  only the Stop hook (`turn-end`). +test includes it.
 - `+recite`: one line after the task (prompts/recite.md): look a construct
   up with `guide --find` / `guide TOPIC#SECTION` before writing it (the
   research plan's item 9; the guide-core intro already says it).
 
 `both+hook+test` is the rerun matrix's row D cell; `compiler-tools-core+test`
-the compiler one."""
+the compiler one.
+
+(0.17) Every hook a condition registers but the query-first hook comes
+from tools/agent-hooks/settings-eval.json, the condition's entry of it
+named by `settings_key` (`hook`, `hook+test`, `hook+turn-end`,
+`turn-end`): the hooks' own definition of each condition."""
 
 import os
 
@@ -53,7 +62,7 @@ PROGRAM_BASES = ("bare", "guide", "tools", "both", "guide-core", "tools-core", "
                  "rust-pairs", "rust")
 COMPILER_BASES = ("compiler-tools", "compiler-plain", "compiler-tools-core")
 BASES = PROGRAM_BASES + COMPILER_BASES
-MODS = ("hook", "test", "recite")
+MODS = ("hook", "test", "turn-end", "recite")
 
 # What each base puts in the prompt: guide (None, "full": `tachyonc guide`,
 # "core": prompts/guide-core.md), tools (None, "full": tools.md, "core":
@@ -100,6 +109,7 @@ class Cond:
         self.lang = "compiler" if self.is_compiler else ("rust" if self.base == "rust" else "tach")
         self.test = "test" in self.mods
         self.recite = "recite" in self.mods
+        self.turn_end = "turn-end" in self.mods or self.test
         if self.lang == "rust" and self.mods:
             raise ValueError("condition %r: rust takes no modifiers" % name)
         if self.compiler == "plain" and self.mods:
@@ -113,6 +123,16 @@ class Cond:
         conditions, or (0.15's --check-hook) the tools and both conditions."""
         return self.hook or (flag and self.base in ("tools", "both", "tools-core", "both-core"))
 
+    def settings_key(self, flag=False):
+        """(0.17) The entry of settings-eval.json's `conditions` whose hooks
+        this run registers (the query-first hook apart), or None."""
+        if self.test:
+            return "hook+test"
+        check = self.check_hook(flag)
+        if self.turn_end:
+            return "hook+turn-end" if check else "turn-end"
+        return "hook" if check else None
+
     def sort_key(self):
         return (BASES.index(self.base), self.mods)
 
@@ -121,7 +141,7 @@ class Cond:
         out = []
         if self.guide == "core" and not os.path.isfile(GUIDE_CORE):
             out.append((GUIDE_CORE, "the core guide's intro (from the core-guide work)"))
-        if self.test and not os.path.isfile(SETTINGS_EVAL):
+        if (self.test or self.turn_end) and not os.path.isfile(SETTINGS_EVAL):
             out.append((SETTINGS_EVAL, "the eval's hook settings with tests (from the "
                         "feedback work)"))
         return out
@@ -163,4 +183,5 @@ def sort_key(name):
 
 
 def help_text():
-    return ("BASE[+MOD...]: bases %s; modifiers +hook, +test, +recite" % ", ".join(BASES))
+    return ("BASE[+MOD...]: bases %s; modifiers +hook, +test, +turn-end, +recite"
+            % ", ".join(BASES))
