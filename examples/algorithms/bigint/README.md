@@ -140,14 +140,14 @@ impl Ord for BigUint {
 **The operators** are the prelude's `Add`, `Sub` and `Mul`. An operator
 takes no allocator (its signature is the trait's), so the result is
 allocated where the left operand's limbs are: a `Vec` carries its
-allocator (`self.limbs.alloc`). A number from a `u64` has no operand to
+allocator (`self.limbs.allocator()`). A number from a `u64` has no operand to
 ask, so it is `BigUint::from_u64(x, gpa)` rather than `From<u64>`:
 
 ```tach
 impl Mul for BigUint {
     fn mul(self: BigUint, other: BigUint) -> BigUint {
         // (the result is allocated where self's limbs are)
-        let gpa = self.limbs.alloc;
+        let gpa = self.limbs.allocator();
         let mut r = Vec::filled_in(self.limbs.len() + other.limbs.len(), 0u32, gpa);
         mul_karatsuba(self.limbs.as_slice(), other.limbs.as_slice(), r.as_slice(), gpa);
         BigUint::from_limbs(r)
@@ -274,7 +274,7 @@ another 10%.
 | operator traits `Add`, `Sub`, `Mul`; `Ord` by hand gives `<` | `impl ... for BigUint` | `tachyonc guide traits` |
 | `#[derive(Eq, Clone, Debug)]`, `{x:?}` | `BigUint` | `tachyonc guide formatting` |
 | `impl Display`, `f.write(f"...")`, `{x:09}` | `Display for BigUint` | `tachyonc guide formatting` |
-| a `Vec` carries its allocator: `self.limbs.alloc` | `impl Mul for BigUint` | `tachyonc guide allocators` |
+| a `Vec` carries its allocator: `self.limbs.allocator()` | `impl Mul for BigUint` | `tachyonc guide allocators` |
 | widening: `u32` limbs into `u64` arithmetic | the kernels | `tachyonc guide conversions` |
 | slices as views, sub-slices `a[..m]`, written through | the kernels | `tachyonc guide types`, `guide memory` |
 | `defer` and `defer { ... }`; handles and who frees them | everywhere | `tachyonc guide memory` |

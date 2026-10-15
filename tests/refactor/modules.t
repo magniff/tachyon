@@ -106,7 +106,7 @@ try: tachyonc query def crate::geom::scale
 ## local p would be called).
 $ refactor rename geom::area p
 main.tach:11:19: error[type error] cannot call non-function type 'Point'  [edited: crate::main]
-./shapes.tach:7:29: error[type error] cannot call non-function type 'Point'  [edited: crate::shapes::perimeter]
+shapes.tach:7:29: error[type error] cannot call non-function type 'Point'  [edited: crate::shapes::perimeter]
 error edit.breaks: 2 new errors; nothing written
 try: tachyonc refactor rename geom::area p --no-check
 [exit 1]

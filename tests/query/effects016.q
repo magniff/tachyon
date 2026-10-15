@@ -41,12 +41,12 @@ crate::t0	none
 $ effects Bump::try_alloc Bump::try_resize fill in_scope apply double shout hof allocators
 <crate::Bump as Allocator>::try_alloc	unsafe
 <crate::Bump as Allocator>::try_resize	alloc(Bump) unsafe
-fill<Gpa>	alloc(Gpa) panic diverge
-fill<Bump>	alloc(Bump) panic diverge
-crate::in_scope	alloc(Arena) panic
+fill<Gpa>	alloc(Gpa) panic
+fill<Bump>	alloc(Bump) panic
+crate::in_scope	alloc(Gpa, Arena) panic
 crate::apply	io
 crate::double	none
 crate::shout	io
 hof<closure(i64) -> i64 at effects016/main.tach:133:9>	none
 hof<closure(i64) -> i64 at effects016/main.tach:133:29>	io
-crate::allocators	alloc(Gpa, Bump) io panic diverge
+crate::allocators	alloc(Gpa, Bump) io panic

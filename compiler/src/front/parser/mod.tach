@@ -14,7 +14,7 @@ mod types;
 mod foreign;
 pub mod items;
 
-use crate::base::{IntVec, SRC, SYMS, _setjmp, buf_bytes, free, intern_c};
+use crate::base::{FILES, IntVec, SRC, SYMS, _setjmp, buf_bytes, free, intern_c};
 use crate::base::diag::{
     ERR, ERR_HELP, RECOVER_DEPTH, err_begin, err_end, err_help, err_str, err_sym, error_at,
     fail_name, recover_enter, recover_leave,
@@ -26,6 +26,7 @@ use crate::front::lexer::Tok::{
     LBracket, LParen, Mod, Mut, Pub, RBrace, RBracket, RParen, Reserved, Semi, Static, Str, Struct,
     Trait, Type, Union, Unsafe, Use,
 };
+use crate::front::modules::file_of_pos;
 use crate::front::parser::exprs::parse_expr;
 use crate::front::parser::items::parse_top_item;
 use crate::front::parser::stmts::{is_item_start, parse_stmt};
@@ -85,8 +86,58 @@ fn err_token(i: i64) {
     }
 }
 
+// The first token of the top-level item parse_program is parsing; -1
+// outside it (an expression parsed alone: a rewrite's pattern).
+static mut ITEM_START: i64 = -1;
+
+// (0.16) A syntax error at a token of another file than the item's: the
+// item's file ended inside a bracket, and the parser went on into the
+// next file (std's text, another module's). Reported at that bracket, the
+// last one the item leaves open in its file, instead of in the next file.
+fn unclosed_bracket() {
+    unsafe {
+        if ITEM_START < 0 || P <= ITEM_START {
+            return;
+        }
+        let f = file_of_pos(TOKS[ITEM_START].start);
+        if file_of_pos(TOKS[P].start) == f {
+            return;
+        }
+        let end = FILES[f].end;
+        let mut k = P - 1;
+        while k > ITEM_START && TOKS[k].start >= end {
+            k -= 1;
+        }
+        let mut depth = 0;
+        let mut open = ITEM_START;
+        while k >= ITEM_START {
+            let kind = TOKS[k].kind;
+            if kind == RBrace || kind == RParen || kind == RBracket {
+                depth += 1;
+            } else if kind == LBrace || kind == LParen || kind == LBracket {
+                if depth == 0 {
+                    open = k;
+                    break;
+                }
+                depth -= 1;
+            }
+            k -= 1;
+        }
+        let kind = TOKS[open].kind;
+        let close = if kind == LParen { c")" } else if kind == LBracket { c"]" } else { c"}" };
+        err_begin(TOKS[open].start);
+        err_str(c"unclosed '");
+        err_str(kind.text());
+        err_str(c"': the file ends before its '");
+        err_str(close);
+        err_str(c"'");
+        err_end();
+    }
+}
+
 fn syntax_error(message: *u8) -> ! {
     unsafe {
+        unclosed_bracket();
         err_begin(cur_start());
         err_str(message);
         err_str(c", got '");
@@ -99,6 +150,7 @@ fn syntax_error(message: *u8) -> ! {
 fn expect(kind: Tok) {
     unsafe {
         if !at(kind) {
+            unclosed_bracket();
             err_begin(cur_start());
             err_str(c"expected '");
             err_str(kind.text());
@@ -417,6 +469,7 @@ pub fn parse_program() -> i64 {
             let depth = RECOVER_DEPTH;
             let items = SCRATCH.count;
             let start = P;
+            ITEM_START = P;
             BODY_FAILED = false;
             if _setjmp(recover_enter()) == 0 {
                 parse_top_item();
@@ -440,6 +493,7 @@ pub fn parse_program() -> i64 {
             recover_leave(depth);
         }
         list_end(program, mark);
+        ITEM_START = -1;
         program
     }
 }

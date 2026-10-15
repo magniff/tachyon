@@ -1,0 +1,154 @@
+// The query tools' front end: the notes of how names resolved (refs and
+// def read them), loading and indexing the program (split from query).
+
+use crate::host_target;
+use crate::base::{
+    FILES, FILE_COUNT, IntVec, _setjmp, alloc_array, alloc_zeroed, intern_c, load_sources,
+};
+use crate::base::diag::{ERR_BAIL, ERR_KIND, RECOVER_DEPTH};
+use crate::base::target::{T_X86_64_LINUX, set_target};
+use crate::base::timer::{T_CHECK, T_INDEX, T_LOAD, T_PARSE, timer_add, timer_now};
+use crate::front::ast::{KEEP_PARSED, init_ast, keep_parsed};
+use crate::front::check::check_program;
+use crate::front::cimport::{IMPORTED_START, drop_shadowed_imports, import_c_headers};
+use crate::front::lexer::{init_lexer, lex_range};
+use crate::front::modules::load_modules;
+use crate::front::parser::parse_program;
+use crate::front::types::{ENUMS, STRUCTS, TYPES, TyKind, init_declarations, init_types};
+use crate::gen0::gen::MAIN_SYM;
+use crate::tools::query::defs::{DEFS, MOD_DEF, collect_defs, finish_defs};
+use crate::tools::query::derived::collect_derive_spans;
+use crate::tools::query::positions::{init_containers, init_positions};
+
+// Set while a query runs: the hooks record what they resolve.
+pub static mut QUERY: bool = false;
+
+// What the checker resolved that its nodes do not keep: (position the name
+// is looked for from, the name written there, the definition's node,
+// flags), in fours.
+pub static mut NOTES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The name `name` written at (or just after) `from` stands for the item
+// whose node is `def`.
+pub fn qnote(from: i64, name: i64, def: i64, flags: i64) {
+    if !QUERY || def <= 0 {
+        return;
+    }
+    NOTES.push(from);
+    NOTES.push(name);
+    NOTES.push(def);
+    NOTES.push(flags);
+}
+
+// ... for module m.
+pub fn qnote_module(from: i64, name: i64, m: i64, flags: i64) {
+    unsafe {
+        if !QUERY || m < 0 || m >= MOD_DEF.count || MOD_DEF.data[m] < 0 {
+            return;
+        }
+        qnote(from, name, DEFS[MOD_DEF.data[m]].node, flags);
+    }
+}
+
+// `Self` written at pos stands for type t (0.13): a reference to its
+// struct or enum.
+pub fn qnote_self(pos: i64, name: i64, t: i64) {
+    unsafe {
+        if !QUERY || t <= 0 {
+            return;
+        }
+        let k = TYPES[t].kind;
+        if k == TyKind::Struct {
+            qnote(pos, name, STRUCTS[TYPES[t].a].node, 0);
+        } else if k == TyKind::Enum {
+            qnote(pos, name, ENUMS[TYPES[t].a].node, 0);
+        }
+    }
+}
+
+// The front end, up to the checked program, for `target` (0: the host);
+// an error that would end the compilation jumps back to the caller's
+// ERR_BAIL.
+pub fn front_end(root: *u8, target0: i64) {
+    unsafe {
+        let mut t = timer_now();
+        ERR_KIND = c"tokenizer error";
+        let paths = alloc_array::<*u8>(1);
+        paths[0] = root;
+        load_sources(paths, 1);
+        init_lexer();
+        lex_range(FILES[0].start, FILES[0].end, false);
+        ERR_KIND = c"module error";
+        load_modules();
+        ERR_KIND = c"tokenizer error";
+        let mut target = target0;
+        if target == 0 {
+            target = host_target();
+        }
+        if target == 0 {
+            target = T_X86_64_LINUX;
+        }
+        set_target(target);
+        let dirs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        import_c_headers(target, &dirs, false, c"");
+        lex_range(FILES[FILE_COUNT - 1].end, FILES[FILE_COUNT - 1].end, true);
+        timer_add(T_LOAD, t);
+        t = timer_now();
+        init_ast();
+        ERR_KIND = c"parser error";
+        let program = parse_program();
+        if KEEP_PARSED {
+            keep_parsed();
+        }
+        if IMPORTED_START >= 0 {
+            drop_shadowed_imports(program);
+        }
+        collect_defs(program);
+        collect_derive_spans(program);
+        PARSED = true;
+        timer_add(T_PARSE, t);
+        t = timer_now();
+        MAIN_SYM = intern_c(c"main");
+        init_types();
+        init_declarations();
+        ERR_KIND = c"type error";
+        check_program(program);
+        timer_add(T_CHECK, t);
+    }
+}
+
+// Whether the program was parsed (the definitions are known).
+pub static mut PARSED: bool = false;
+
+// Reads the program of `root` for a question or a change (0.11): its front
+// end, as far as it gets (its errors are recorded, never printed), then
+// the paths and positions of its definitions; the hooks note what they
+// resolve (refs). Whether the program was parsed: when not, there is
+// nothing to answer with.
+pub fn load_program(root: *u8, target: i64) -> bool {
+    unsafe {
+        QUERY = true;
+        ERR_BAIL = alloc_zeroed(512);
+        if _setjmp(ERR_BAIL) == 0 {
+            front_end(root, target);
+        }
+        RECOVER_DEPTH = 0;
+        ERR_BAIL = 0 as *u8;
+        QUERY = false;
+        if !PARSED {
+            return false;
+        }
+        index_program();
+        true
+    }
+}
+
+// The paths and positions of the definitions of the program just read
+// (after its front end).
+pub fn index_program() {
+    let t = timer_now();
+    init_positions();
+    finish_defs();
+    init_containers();
+    timer_add(T_INDEX, t);
+}

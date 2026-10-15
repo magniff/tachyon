@@ -13,23 +13,14 @@ returns a second value through a pointer.
 From this folder (with `tachyonc` on your `PATH`, or as
 `../../target/tachyonc` from a built tree).
 
-On macOS, libm is part of the system library every program links with:
-
 ```sh
 tachyonc main.tach -o c-math && ./c-math
 ```
 
-On Linux, libm is a library of its own, and `tachyonc -o prog` runs only
-`cc -o prog prog.o`, with no way to add `-lm`. Make an object and link it
-yourself:
-
-```sh
-tachyonc main.tach -o c-math.o && cc c-math.o -o c-math -lm && ./c-math
-```
-
-(Without `-lm` the link fails with `undefined reference to 'sin'`.) The
-object route works on macOS too, and is how any extra library or C file
-gets into a tachyon program: see [c-mixed-build](../c-mixed-build/).
+On Linux libm is a library of its own, apart from libc: `tachyonc` links
+it (`-lm`) because the program calls its functions. Other libraries and
+C files go on the same command line (`tachyonc main.tach helper.c -l png
+-o prog`): see [c-mixed-build](../c-mixed-build/).
 
 ## Expected output
 
@@ -179,12 +170,12 @@ printed with `{flat:?}`.
 - **Out-parameters**: pass `&local`; C writes through it.
 - **Callbacks into C APIs** must be `extern "C" fn` (see
   [c-qsort](../c-qsort/)); closures are for tachyon's own generic code.
-- **Linking**: libm needs `-lm` on Linux: compile to an object
-  (`-o x.o`) and link with `cc x.o -lm`.
+- **Linking**: libm is linked when the program calls into it (on Linux
+  it is apart from libc); other libraries with `-l NAME`, `-L DIR`.
 
 ## Language features
 
-- `import "math.h" as c`, out-parameters, linking with `-lm`:
+- `import "math.h" as c`, out-parameters, linking:
   `tachyonc guide c-interop`
 - closures, captures, `Fn` and `FnMut` bounds: `tachyonc guide closures`
 - generic functions with several type parameters: `tachyonc guide generics`

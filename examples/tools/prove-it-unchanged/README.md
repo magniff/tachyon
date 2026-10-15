@@ -76,7 +76,7 @@ $ tachyonc edit insert --before adler32 <<'EOF'
 > EOF
 inserted before crate::adler::adler32	adler.tach	+3 -0 lines
 $ tachyonc rewrite '65521' 'MOD_ADLER'
-./adler.tach:4:1: error[type error] constant 'MOD_ADLER' is defined in terms of itself  [edited: crate::adler::MOD_ADLER]
+adler.tach:4:1: error[type error] constant 'MOD_ADLER' is defined in terms of itself  [edited: crate::adler::MOD_ADLER]
 error edit.breaks: 1 new error; nothing written
 try: tachyonc rewrite 65521 MOD_ADLER --no-check
 [exit 1]

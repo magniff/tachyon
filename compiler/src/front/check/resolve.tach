@@ -4,8 +4,10 @@
 // a type as written (a name, a path, an alias, a generic instance) to a
 // type.
 
-use crate::base::buf_new;
-use crate::base::diag::{err_begin, err_end, err_end_soft, err_help, err_int, err_str, err_sym};
+use crate::base::{IntVec, buf_new};
+use crate::base::diag::{
+    err_begin, err_end, err_end_soft, err_help, err_int, err_str, err_sym, error_count,
+};
 use crate::front::assoc::{is_projection_node, resolve_projection_node};
 use crate::front::ast::{FN_SIG_FAILED, NODES, REPR_C, child};
 use crate::front::ast::NodeKind::{CStr, TyArray, TyName, TyNever, TyPtr, TySlice, TyTuple, TyUnit};
@@ -14,7 +16,10 @@ use crate::front::check::{
 };
 use crate::front::check::args::check_param_defaults;
 use crate::front::check::names::unknown_name_error;
-use crate::front::consteval::{check_const_expr, const_emit, const_value, eval_array_len};
+use crate::front::closures::scoped::check_static_type;
+use crate::front::consteval::{
+    check_const_expr, const_emit, const_value, eval_array_len, has_const_call,
+};
 use crate::front::generics::{
     TPL_NONE, TP_BASE, TP_NAMES, TP_TYPES, env_lookup, required_targs, template_instance,
     template_of_key,
@@ -34,7 +39,7 @@ use crate::front::types::{
     fn_param, is_ffi_field, is_ffi_safe, item_node_of, make_type, ptr_to, slice_of, struct_field,
     struct_type, type_elem, variant_field,
 };
-use crate::tools::query::{qnote, qnote_self};
+use crate::tools::query::command_line::{qnote, qnote_self};
 
 pub fn reset_layout_states() {
     unsafe {
@@ -311,6 +316,10 @@ pub fn collect_statics() {
             CUR_MOD = module_of(item);
             let ty = resolve_type_or_error(NODES[item].b);
             STATICS[s].ty = ty;
+            // (0.16: no scope's arena)
+            if !check_static_type(ty, NODES[item].a, NODES[NODES[item].b].start) {
+                continue;
+            }
             // A static shared with C is memory with C's layout: arrays of
             // FFI-safe types too (0.4).
             if STATICS[s].linkage != 0 && !is_ffi_field(ty) {
@@ -330,15 +339,48 @@ pub fn check_static(s: i64) {
     unsafe {
         let item = STATICS[s].node;
         let ty = STATICS[s].ty;
+        let errors = error_count();
         check_const_expr(NODES[item].c, ty);
+        // (0.16: not after an error in it, a #[sealed] literal's)
+        if error_count() != errors {
+            return;
+        }
         if NODES[NODES[item].c].kind == CStr {
             // A C string (0.4): the address of the literal.
+            return;
+        }
+        // (0.16: a call of a constructor once its body is checked)
+        if has_const_call(NODES[item].c) {
+            STATIC_CALLS.push(s);
             return;
         }
         // Evaluated now to report non-constant initializers; the code
         // generator evaluates it again into the data section.
         let scratch = buf_new();
         const_emit(NODES[item].c, ty, scratch);
+    }
+}
+
+// (0.16) The statics whose initializer calls a constant constructor: they
+// are evaluated once the functions' bodies are checked (check_program).
+static mut STATIC_CALLS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The initializers that call constructors, evaluated (to report what is
+// not constant) once every function body is checked.
+pub fn check_static_calls() {
+    unsafe {
+        for i in 0..STATIC_CALLS.count {
+            attempt(Try::StaticCall, STATIC_CALLS.data[i]);
+        }
+        STATIC_CALLS.count = 0;
+    }
+}
+
+// The value of static s's initializer, which calls a constructor.
+pub fn static_call_value(s: i64) {
+    unsafe {
+        let scratch = buf_new();
+        const_emit(NODES[STATICS[s].node].c, STATICS[s].ty, scratch);
     }
 }
 

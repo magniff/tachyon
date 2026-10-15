@@ -63,7 +63,7 @@ error patch.no-match: OLD 2 is not in crate::calc::sum_to; no line is near it
 try: tachyonc query show sum_to
 [exit 1]
 $ edit patch clamp --old 'return lo;' --new 'return true;'
-./calc.tach:6:16: error[type error] expected 'i64', got 'bool'  [edited: crate::calc::clamp]
+calc.tach:6:16: error[type error] expected 'i64', got 'bool'  [edited: crate::calc::clamp]
 error edit.breaks: 1 new error; nothing written
 try: tachyonc edit patch clamp --old 'return lo;' --new 'return true;' --no-check
 [exit 1]

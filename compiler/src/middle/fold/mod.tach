@@ -10,34 +10,46 @@
 // IEEE comparisons, and the saturating float-to-integer conversions of
 // emit_float_to_int.
 
-use crate::base::{IntVec, alloc_array, free};
+pub mod lattice;
+
+use crate::base::{IntVec, free};
 use crate::front::consteval::{bits_of, f64_of_bits, float_const, wrap_int};
 use crate::front::types::{
     TY_BOOL, TY_F32, TY_I64, TY_U64, int_bits, is_float, is_integer, is_signed,
 };
 use crate::gen0::target::log2;
 use crate::middle::ir::{
-    BLOCKS, Cond, INSTS, IRF, IRFUNCS, Op, Term, ir_arg, ir_insert_before, ir_make, ir_operand,
-    ir_operand_count, ir_prepend, ir_replace, ir_resolve_operands, ir_val,
+    BITS_LEADING, BITS_ONES, BLOCKS, Cond, INSTS, IRFUNCS, Op, Term, ir_append, ir_arg,
+    ir_insert_before, ir_make, ir_replace, ir_resolve_operands, ir_val,
 };
 use crate::middle::ir::Op::{
     Add, And, BNot, Cmp, Const, Conv, Div, Load, Mul, Neg, Not, Or, Phi, Rem, Shl, Shr, Store, Sub,
     Xor,
 };
-use crate::middle::ir::cfg::{succ, succ_count, switch_target};
-use crate::middle::opt::{
-    remove_pred, remove_trivial_phis, remove_unreachable, resolve_all, switch_to_jump,
-};
+use crate::middle::loops::new_phi_in;
+use crate::middle::opt::resolve_all;
 use std::Option;
 
 // ---- Folding ----
 
-fn is_foldable_op(op: Op) -> bool {
-    op.is_pure() || op == Const
-}
-
 pub fn shift_amount(b: i64, ty: i64) -> u64 {
     (b & (if int_bits(ty) == 64 { 63 } else { 31 })) as u64
+}
+
+// (0.16) BITS of the constant a: its 1 bits, its leading or its trailing
+// zeros (kind: BITS_ONES, BITS_LEADING, BITS_TRAILING; 64 for 0).
+pub fn fold_bits(kind: i64, a: i64) -> i64 {
+    let x = a as u64;
+    let mut n = 0;
+    for i in 0..64 {
+        let bit = (x >> (if kind == BITS_LEADING { 63 - i } else { i }) as u64) & 1;
+        if kind == BITS_ONES {
+            n += bit as i64;
+        } else if bit != 0 {
+            return i;
+        }
+    }
+    if kind == BITS_ONES { n } else { 64 }
 }
 
 // a <op> b (or <op> a) for constant operands, as the machine computes it.
@@ -49,6 +61,7 @@ pub fn fold_value(v: i64, a: i64, b: i64) -> i64 {
             Const => return INSTS[v].imm,
             Cmp => return fold_compare(INSTS[v].cond, INSTS[v].imm2, a, b) as i64,
             Conv => return fold_conversion(INSTS[v].imm2, ty, a),
+            Op::Bits => return fold_bits(INSTS[v].imm, a),
             _ => {}
         }
         if is_float(ty) {
@@ -187,382 +200,6 @@ fn fold_float_to_int(x: f64, to: i64) -> i64 {
     wrap_int(saturate_signed(x, 64), to)
 }
 
-// ---- Users ----
-
-// The users of each value of a function (CSR): USER_START[i] ..
-// USER_START[i + 1] in USER_LIST, by dense index (INSTS[v].aux - 1);
-// users are instructions, or -(block) for a block's terminator.
-static mut FN_VALUES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static mut USER_START: *i64 = 0 as *i64;
-static mut USER_LIST: *i64 = 0 as *i64;
-
-// Numbers the instructions of function `fi` (INSTS[v].aux = index + 1).
-fn number_values(fi: i64) {
-    FN_VALUES.count = 0;
-    unsafe {
-        for i in 0..IRFUNCS[fi].blocks.count {
-            let b = IRFUNCS[fi].blocks.data[i];
-            if BLOCKS[b].removed != 0 {
-                continue;
-            }
-            let mut v = BLOCKS[b].first;
-            while v != 0 {
-                FN_VALUES.push(v);
-                INSTS[v].aux = FN_VALUES.count;
-                v = INSTS[v].next;
-            }
-        }
-    }
-}
-
-fn build_users(fi: i64) {
-    unsafe {
-        number_values(fi);
-        let n = FN_VALUES.count;
-        free(USER_START as *u8);
-        USER_START = alloc_array::<i64>(n + 2);
-        // Count, then fill.
-        for pass in 0..2 {
-            let mut fill: *i64 = 0 as *i64;
-            if pass == 1 {
-                let mut total = 0;
-                for i in 0..n + 1 {
-                    let count = USER_START[i];
-                    USER_START[i] = total;
-                    total += count;
-                }
-                USER_START[n + 1] = total;
-                free(USER_LIST as *u8);
-                USER_LIST = alloc_array::<i64>(total + 1);
-                fill = alloc_array::<i64>(n + 1);
-            }
-            for i in 0..IRFUNCS[fi].blocks.count {
-                let b = IRFUNCS[fi].blocks.data[i];
-                if BLOCKS[b].removed != 0 {
-                    continue;
-                }
-                let mut v = BLOCKS[b].first;
-                while v != 0 {
-                    for k in 0..ir_operand_count(v) {
-                        add_user(ir_operand(v, k), v, pass, fill);
-                    }
-                    v = INSTS[v].next;
-                }
-                add_user(BLOCKS[b].cond, 0 - b, pass, fill);
-            }
-            if pass == 1 {
-                free(fill as *u8);
-            }
-        }
-    }
-}
-
-fn add_user(operand: i64, user: i64, pass: i64, fill: *i64) {
-    unsafe {
-        if operand == 0 || INSTS[operand].aux == 0 {
-            return;
-        }
-        let t = INSTS[operand].aux - 1;
-        if pass == 0 {
-            USER_START[t] += 1;
-        } else {
-            USER_LIST[USER_START[t] + fill[t]] = user;
-            fill[t] += 1;
-        }
-    }
-}
-
-// ---- SCCP ----
-
-// The lattice of a value: not known yet (Top), a constant, or not a
-// constant (Bottom).
-enum Lattice { Top, Const, Bottom }
-
-// Per dense index: lattice state and constant.
-static mut LAT: *Lattice = 0 as *Lattice;
-static mut LAT_VALUE: *i64 = 0 as *i64;
-static mut SSA_WORK: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static mut CFG_WORK: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-fn lat_of(v: i64) -> Lattice {
-    unsafe { LAT[INSTS[v].aux - 1] }
-}
-
-fn lat_value(v: i64) -> i64 {
-    unsafe { LAT_VALUE[INSTS[v].aux - 1] }
-}
-
-// Lowers the state of v; queues its users when it changed.
-fn lat_set(v: i64, state: Lattice, value: i64) {
-    unsafe {
-        let t = INSTS[v].aux - 1;
-        let old = LAT[t];
-        if old == Lattice::Bottom || state == Lattice::Top {
-            return;
-        }
-        if old == Lattice::Const {
-            if state == Lattice::Const && value == LAT_VALUE[t] {
-                return;
-            }
-            // Two different constants, or more than a constant.
-            LAT[t] = Lattice::Bottom;
-        } else {
-            LAT[t] = state;
-            LAT_VALUE[t] = value;
-        }
-        SSA_WORK.push(v);
-    }
-}
-
-// Whether the edge from `p` to `b` is executable (BLOCKS[p].aux bit k for
-// successor k).
-// (Edges past the 62nd successor of a switch share bit 62.)
-fn edge_bit(k: i64) -> u64 {
-    (if k < 62 { k } else { 62 }) as u64
-}
-
-fn edge_executable(p: i64, b: i64) -> bool {
-    for k in 0..succ_count(p) {
-        if unsafe { succ(p, k) == b && (BLOCKS[p].aux >> edge_bit(k)) & 1 != 0 } {
-            return true;
-        }
-    }
-    false
-}
-
-fn mark_edge(p: i64, k: i64) {
-    unsafe {
-        if k < 62 && (BLOCKS[p].aux >> edge_bit(k)) & 1 != 0 {
-            return;
-        }
-        BLOCKS[p].aux |= 1 << edge_bit(k);
-        CFG_WORK.push(succ(p, k));
-    }
-}
-
-fn sccp_eval(v: i64) {
-    unsafe {
-        let op = INSTS[v].op;
-        if INSTS[v].ty == 0 {
-            return;
-        }
-        if op == Phi {
-            let b = INSTS[v].block;
-            let mut state = Lattice::Top;
-            let mut value = 0;
-            for i in 0..INSTS[v].nargs {
-                let p = BLOCKS[b].preds.data[i];
-                if !edge_executable(p, b) {
-                    continue;
-                }
-                let operand = ir_arg(v, i);
-                let s = lat_of(operand);
-                if s == Lattice::Bottom {
-                    state = Lattice::Bottom;
-                    break;
-                }
-                if s == Lattice::Const {
-                    if state == Lattice::Const && value != lat_value(operand) {
-                        state = Lattice::Bottom;
-                        break;
-                    }
-                    state = Lattice::Const;
-                    value = lat_value(operand);
-                }
-            }
-            lat_set(v, state, value);
-            return;
-        }
-        if !is_foldable_op(op) {
-            lat_set(v, Lattice::Bottom, 0);
-            return;
-        }
-        if op == Const {
-            lat_set(v, Lattice::Const, INSTS[v].imm);
-            return;
-        }
-        let a = INSTS[v].a;
-        let b = INSTS[v].b;
-        let sa = lat_of(a);
-        let sb = if b != 0 { lat_of(b) } else { Lattice::Const };
-        if sa == Lattice::Bottom || sb == Lattice::Bottom {
-            lat_set(v, Lattice::Bottom, 0);
-        } else if sa == Lattice::Const && sb == Lattice::Const {
-            lat_set(v, Lattice::Const,
-                fold_value(v, lat_value(a), if b != 0 { lat_value(b) } else { 0 }));
-        }
-    }
-}
-
-fn sccp_terminator(b: i64) {
-    unsafe {
-        let term = BLOCKS[b].term;
-        if term == Term::Jump {
-            mark_edge(b, 0);
-        } else if term == Term::Switch {
-            let cond = BLOCKS[b].cond;
-            let s = lat_of(cond);
-            if s == Lattice::Bottom {
-                for k in 0..BLOCKS[b].nsucc {
-                    mark_edge(b, k);
-                }
-            } else if s == Lattice::Const {
-                let target = switch_target(b, lat_value(cond));
-                for k in 0..BLOCKS[b].nsucc {
-                    if succ(b, k) == target {
-                        mark_edge(b, k);
-                    }
-                }
-            }
-        } else if term == Term::Branch {
-            let cond = BLOCKS[b].cond;
-            let s = lat_of(cond);
-            if s == Lattice::Bottom {
-                mark_edge(b, 0);
-                mark_edge(b, 1);
-            } else if s == Lattice::Const {
-                mark_edge(b, if lat_value(cond) != 0 { 0 } else { 1 });
-            }
-        }
-    }
-}
-
-pub fn sccp(fi: i64) -> bool {
-    unsafe {
-        build_users(fi);
-        let n = FN_VALUES.count;
-        free(LAT as *u8);
-        free(LAT_VALUE as *u8);
-        LAT = alloc_array::<Lattice>(n + 1);
-        LAT_VALUE = alloc_array::<i64>(n + 1);
-        for i in 0..IRFUNCS[fi].blocks.count {
-            let b = IRFUNCS[fi].blocks.data[i];
-            BLOCKS[b].aux = 0;
-            BLOCKS[b].mark = 0;
-        }
-        SSA_WORK.count = 0;
-        CFG_WORK.count = 0;
-        CFG_WORK.push(IRFUNCS[fi].entry);
-        while CFG_WORK.count > 0 || SSA_WORK.count > 0 {
-            if CFG_WORK.count > 0 {
-                let b = CFG_WORK.pop();
-                if BLOCKS[b].mark == 0 {
-                    BLOCKS[b].mark = 1;
-                    let mut v = BLOCKS[b].first;
-                    while v != 0 {
-                        sccp_eval(v);
-                        v = INSTS[v].next;
-                    }
-                    sccp_terminator(b);
-                } else {
-                    // A new edge into a visited block: its phis may change.
-                    let mut v = BLOCKS[b].first;
-                    while v != 0 && INSTS[v].op == Phi {
-                        sccp_eval(v);
-                        v = INSTS[v].next;
-                    }
-                }
-                continue;
-            }
-            let v = SSA_WORK.pop();
-            let t = INSTS[v].aux - 1;
-            for i in USER_START[t]..USER_START[t + 1] {
-                let user = USER_LIST[i];
-                if user < 0 {
-                    if BLOCKS[0 - user].mark != 0 {
-                        sccp_terminator(0 - user);
-                    }
-                } else if BLOCKS[INSTS[user].block].mark != 0 {
-                    sccp_eval(user);
-                }
-            }
-        }
-        sccp_rewrite(fi)
-    }
-}
-
-// Replaces the values found constant, and the branches decided.
-fn sccp_rewrite(fi: i64) -> bool {
-    unsafe {
-        let mut changed = false;
-        IRF = fi;
-        for i in 0..FN_VALUES.count {
-            let v = FN_VALUES.data[i];
-            let op = INSTS[v].op;
-            if LAT[i] != Lattice::Const || op == Const || INSTS[v].block == 0 {
-                continue;
-            }
-            if BLOCKS[INSTS[v].block].mark == 0 {
-                continue;
-            }
-            let value = LAT_VALUE[i];
-            // A NaN made by float arithmetic stays computed at run time (see
-            // fold_makes_nan); what depends on it alone (its comparisons, its
-            // conversions to integers) is folded all the same.
-            if is_float(INSTS[v].ty) && f64_of_bits(value) != f64_of_bits(value) {
-                continue;
-            }
-            if op == Phi {
-                let c = ir_make(Const, INSTS[v].ty, 0, 0, value);
-                ir_prepend(IRFUNCS[fi].entry, c);
-                ir_replace(v, c);
-            } else {
-                INSTS[v].op = Const;
-                INSTS[v].cond = Cond::Eq;
-                INSTS[v].imm = value;
-                INSTS[v].a = 0;
-                INSTS[v].b = 0;
-                INSTS[v].imm2 = 0;
-            }
-            changed = true;
-        }
-        for i in 0..IRFUNCS[fi].blocks.count {
-            let b = IRFUNCS[fi].blocks.data[i];
-            if BLOCKS[b].removed != 0 || BLOCKS[b].mark == 0 {
-                continue;
-            }
-            if BLOCKS[b].term == Term::Switch && BLOCKS[b].nsucc < 62 {
-                // One successor reached only: a jump.
-                let mut taken = 0;
-                let mut reached = 0;
-                for k in 0..BLOCKS[b].nsucc {
-                    if (BLOCKS[b].aux >> k as u64) & 1 != 0 {
-                        taken = succ(b, k);
-                        reached += 1;
-                    }
-                }
-                if reached == 1 {
-                    switch_to_jump(b, taken);
-                    changed = true;
-                }
-                continue;
-            }
-            if BLOCKS[b].term != Term::Branch {
-                continue;
-            }
-            let bits = BLOCKS[b].aux;
-            if bits == 1 || bits == 2 {
-                // One edge is never taken.
-                let taken = if bits == 1 { BLOCKS[b].s0 } else { BLOCKS[b].s1 };
-                let dropped = if bits == 1 { BLOCKS[b].s1 } else { BLOCKS[b].s0 };
-                // One edge goes (even when both lead to the same block).
-                remove_pred(dropped, b);
-                BLOCKS[b].term = Term::Jump;
-                BLOCKS[b].cond = 0;
-                BLOCKS[b].s0 = taken;
-                BLOCKS[b].s1 = 0;
-                changed = true;
-            }
-        }
-        if changed {
-            resolve_all(fi);
-            remove_unreachable(fi);
-            remove_trivial_phis(fi);
-        }
-        changed
-    }
-}
-
 // ---- Instruction combining ----
 
 pub fn is_const(v: i64) -> bool {
@@ -616,6 +253,57 @@ pub fn all_ones(ty: i64) -> i64 {
     wrap_int(-1, ty)
 }
 
+// (0.16) !a when a is a comparison of integers: the opposite comparison;
+// !(x | y) and !(x & y) when x and y negate for free (comparisons of
+// integers, negations, and and or of such): !x & !y and !x | !y (what
+// merged branch chains leave, ifconv.tach).
+fn combine_not(v: i64, a: i64) -> bool {
+    unsafe {
+        if !negates_free(a, 0) || INSTS[a].op == Not {
+            return false;
+        }
+        let n = negated(a, v);
+        INSTS[v].op = INSTS[n].op;
+        INSTS[v].cond = INSTS[n].cond;
+        INSTS[v].a = INSTS[n].a;
+        INSTS[v].b = INSTS[n].b;
+        INSTS[v].imm2 = INSTS[n].imm2;
+        true
+    }
+}
+
+// The negation of x (negates_free), made before instruction `at`.
+fn negated(x: i64, at: i64) -> i64 {
+    unsafe {
+        let op = INSTS[x].op;
+        if op == Not {
+            return INSTS[x].a;
+        }
+        if op == Cmp {
+            let c = op_before(at, Cmp, TY_BOOL, INSTS[x].a, INSTS[x].b);
+            INSTS[c].cond = INSTS[x].cond.negate();
+            INSTS[c].imm2 = INSTS[x].imm2;
+            return c;
+        }
+        let a = negated(INSTS[x].a, at);
+        let b = negated(INSTS[x].b, at);
+        op_before(at, if op == Or { And } else { Or }, TY_BOOL, a, b)
+    }
+}
+
+// Whether bool x negates without an instruction more: a comparison of
+// integers, a negation, or an `and` or `or` of such (a few deep).
+fn negates_free(x: i64, depth: i64) -> bool {
+    unsafe {
+        let op = INSTS[x].op;
+        if op == Not || op == Cmp && !is_float(INSTS[x].imm2) {
+            return true;
+        }
+        (op == And || op == Or) && INSTS[x].ty == TY_BOOL && depth < 3
+            && negates_free(INSTS[x].a, depth + 1) && negates_free(INSTS[x].b, depth + 1)
+    }
+}
+
 // Rewrites instruction v into something cheaper; returns whether it
 // changed (v may have been replaced).
 fn combine(v: i64) -> bool {
@@ -629,6 +317,9 @@ fn combine(v: i64) -> bool {
             let a = INSTS[v].a;
             if INSTS[a].op == op && !(op == Neg && is_float(ty)) {
                 return replace_same_type(v, INSTS[a].a);
+            }
+            if op == Not {
+                return combine_not(v, a);
             }
             return false;
         }
@@ -741,6 +432,31 @@ pub fn combine_select(v: i64) -> bool {
             return replace_same_type(v, if INSTS[k].imm != 0 { x } else { y });
         }
         let ty = INSTS[v].ty;
+        if ty == TY_BOOL && INSTS[k].ty == TY_BOOL && (is_const(x) || is_const(y)) {
+            // (0.16) Bools: k ? true : y is k | y, k ? x : false is k & x
+            // (and with !k the other two), what if-converted `||` and `&&`
+            // (a comparator's `<`) leave.
+            if is_const(x) && is_const(y) {
+                if INSTS[x].imm != 0 {
+                    return replace_same_type(v, k);
+                }
+                INSTS[v].op = Not;
+                INSTS[v].b = 0;
+                INSTS[v].c = 0;
+                return true;
+            }
+            // k ? true : y = k | y, k ? false : y = !k & y; k ? x : false =
+            // k & x, k ? x : true = !k | x.
+            let then_const = is_const(x);
+            let truth = INSTS[if then_const { x } else { y }].imm != 0;
+            let other = if then_const { y } else { x };
+            let negate = then_const != truth;
+            INSTS[v].op = if truth { Or } else { And };
+            INSTS[v].a = if negate { op_before(v, Not, TY_BOOL, k, 0) } else { k };
+            INSTS[v].b = other;
+            INSTS[v].c = 0;
+            return true;
+        }
         if !is_integer(ty) {
             return false;
         }
@@ -819,6 +535,91 @@ fn combine_division(v: i64, a: i64, c: i64) -> bool {
     }
 }
 
+// Whether v is the address of a frame slot, a static or constant data,
+// plus a small constant offset: never null.
+fn is_object_address(v: i64) -> bool {
+    unsafe {
+        let mut x = v;
+        let mut offset = 0;
+        while INSTS[x].op == Add && INSTS[x].ty == TY_U64 && is_const(INSTS[x].b) {
+            offset += INSTS[INSTS[x].b].imm;
+            x = INSTS[x].a;
+        }
+        let op = INSTS[x].op;
+        (op == Op::Slot || op == Op::GAddr || op == Op::SAddr) && offset >= 0 && offset < 1 << 32
+    }
+}
+
+// (0.16) x <cond> c, compare v, when x is a phi whose operands give known
+// outcomes (constants, selects of constants, phis of such): a phi of
+// those outcomes. A comparator's ordering (-1, 0 or 1 from the
+// arms of an inlined `cmp`) compared with 0 becomes the comparison it
+// stands for.
+fn compare_phi(v: i64, x: i64, cond: Cond, ty: i64, c: i64) -> bool {
+    unsafe {
+        let n = INSTS[x].nargs;
+        if n < 2 || n > 8 {
+            return false;
+        }
+        // (Every operand known: an induction variable's comparison, its
+        // operand from the latch arithmetic, stays what the ranges and the
+        // loop passes know.)
+        for i in 0..n {
+            if !outcome_known(ir_arg(x, i), x, cond, ty, c, 0) {
+                return false;
+            }
+        }
+        let phi = outcome_phi(x, cond, ty, c);
+        ir_replace(v, phi);
+        true
+    }
+}
+
+// Whether w <cond> c is known at the end of each path to it: w a
+// constant, a select of constants, or a phi (not `top`, a few deep) of
+// such.
+fn outcome_known(w: i64, top: i64, cond: Cond, ty: i64, c: i64, depth: i64) -> bool {
+    unsafe {
+        if select_outcome(w, cond, ty, c, 0) >= 0 {
+            return true;
+        }
+        if INSTS[w].op != Phi || w == top || depth >= 3 || INSTS[w].nargs > 8 {
+            return false;
+        }
+        for i in 0..INSTS[w].nargs {
+            if !outcome_known(ir_arg(w, i), top, cond, ty, c, depth + 1) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// The phi of x's operands' outcomes (bools) in x's block (outcome_known
+// of each).
+fn outcome_phi(x: i64, cond: Cond, ty: i64, c: i64) -> i64 {
+    unsafe {
+        let n = INSTS[x].nargs;
+        let b = INSTS[x].block;
+        let mut values = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..n {
+            let p = BLOCKS[b].preds.data[i];
+            let w = ir_arg(x, i);
+            let known = select_outcome(w, cond, ty, c, 0);
+            if known >= 0 {
+                let k = ir_make(Const, TY_BOOL, 0, 0, known);
+                ir_append(p, k);
+                values.push(k);
+            } else {
+                values.push(outcome_phi(w, cond, ty, c));
+            }
+        }
+        let phi = new_phi_in(b, TY_BOOL, &values, 0, n);
+        free(values.data as *u8);
+        phi
+    }
+}
+
 fn combine_compare(v: i64) -> bool {
     unsafe {
         let mut a = INSTS[v].a;
@@ -836,6 +637,13 @@ fn combine_compare(v: i64) -> bool {
         }
         if a == b && !is_float(ty) {
             return make_const(v, (cond == Cond::Eq || cond == Cond::Le || cond == Cond::Ge) as i64);
+        }
+        if (cond == Cond::Eq || cond == Cond::Ne) && is_const(b) && INSTS[b].imm == 0
+            && is_object_address(a) {
+            // (0.16) The address of a slot, a static or constant data is not
+            // null (an allocation heap_to_stack made a slot, checked for
+            // null).
+            return make_const(v, (cond == Cond::Ne) as i64);
         }
         // (0.15) A select of constants compared with a constant: the
         // select's condition, its negation, or a constant (a comparator's
@@ -858,6 +666,10 @@ fn combine_compare(v: i64) -> bool {
                 INSTS[v].cond = Cond::Eq;
                 return true;
             }
+        }
+        if is_const(b) && INSTS[a].op == Phi && !is_float(ty)
+            && compare_phi(v, a, cond, ty, INSTS[b].imm) {
+            return true;
         }
         if ty == TY_BOOL && is_const(b) && !is_const(a) {
             // b != false, b == true: b itself.

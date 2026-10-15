@@ -7,18 +7,18 @@ crate::out_write	io
 crate::labs	none
 <crate::Square as Shape>::area	none
 apply<closure(i64) -> i64 at syntax016/main.tach:47:32>	none
-crate::grow	alloc(Gpa) panic diverge
-crate::main	alloc(Gpa) io global panic diverge unsafe
+crate::grow	alloc(Gpa) panic
+crate::main	alloc(Gpa) io global panic unsafe
 $ effects crate --has io syntax016/main.tach
 crate::out_write	io
-crate::main	alloc(Gpa) io global panic diverge unsafe
+crate::main	alloc(Gpa) io global panic unsafe
 $ effects grow --why alloc syntax016/main.tach
-crate::grow	alloc(Gpa) panic diverge
+crate::grow	alloc(Gpa) panic
   'v.push(1)' at syntax016/main.tach:39:5 grows a Vec<i64>
-  'self.reserve(1)' at <std>:216:13 grows a Vec<i64>
-  'self.alloc.try_resize(self.ptr as *u8, self...' at <std>:167:13 allocates from Gpa (an Allocator method)
+  'self.reserve_more(1)' at <std>:237:37 grows a Vec<i64>
+  'self.alloc.try_resize(self.ptr as *u8, self...' at <std>:185:13 allocates from Gpa (an Allocator method)
 $ effects grow --why 'alloc(Arena)' syntax016/main.tach
-crate::grow	alloc(Gpa) panic diverge
+crate::grow	alloc(Gpa) panic
   (not: alloc(Arena))
 $ effects grow --has allocates syntax016/main.tach
 error query.usage: unknown effect 'allocates' (effects: alloc, alloc(T), io, global, panic, diverge, unsafe, none)
@@ -27,4 +27,4 @@ $ effects Pair syntax016/main.tach
 note query.empty: no function among the names
 [exit 1]
 $ def grow syntax016/main.tach
-crate::grow	syntax016/main.tach:38:4	fn	fn grow(v: *Vec<i64>)	effects: alloc(Gpa) panic diverge
+crate::grow	syntax016/main.tach:38:4	fn	fn grow(v: *Vec<i64>)	effects: alloc(Gpa) panic

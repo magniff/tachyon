@@ -3,19 +3,27 @@
 // operations of instruction selection.
 
 use crate::back::emit::SHORT_BRANCHES;
-use crate::back::mc_arm64::{ma_f, ma_lea, ma_normalize, ma_r, ma_rr, ma_rrr, ma_w, o_back_imm};
+use crate::back::emit::machine::stays_canonical;
+use crate::back::mc_arm64::{
+    MA_W32, ma_f, ma_lea, ma_normalize, ma_r, ma_rr, ma_rrr, ma_w, o_back_imm,
+};
 use crate::base::BUFS;
-use crate::front::types::{TY_F64, TY_U64, int_bits, is_float, is_signed};
+use crate::front::types::{TY_F64, TY_U32, TY_U64, int_bits, is_float, is_signed};
 use crate::gen0::arm64::{a64_condition, a64_label, a64_load_imm};
 use crate::gen0::target::{CODE, emit_label, ins, log2, new_label, o, oi, on};
-use crate::middle::ir::{Cond, Op};
+use crate::middle::ir::{BITS_ONES, BITS_TRAILING, Cond, Op};
 use crate::middle::ir::Op::{Add, And, Div, Mul, Neg, Not, Or, Rem, Shl, Shr, Sub, Xor};
 
 // Division by zero gives 0 (and the remainder the dividend), as sdiv and
-// udiv do.
+// udiv do. (0.16) A u32 operation is done on the w registers (its result
+// zero-extended: canonical as it is, and a shift takes its amount modulo
+// 32 itself); and, or, xor, right shifts and unsigned divisions of
+// canonical operands are canonical: no normalization after them.
 pub fn ma_int_op(op: Op, ty: i64, d: i64, a: i64, b: i64) {
     unsafe {
         let signed = is_signed(ty);
+        let w32 = ty == TY_U32;
+        MA_W32 = w32;
         if op == Add { ma_rrr(c"add", d, a, b); }
         else if op == Sub { ma_rrr(c"sub", d, a, b); }
         else if op == Mul { ma_rrr(c"mul", d, a, b); }
@@ -24,7 +32,7 @@ pub fn ma_int_op(op: Op, ty: i64, d: i64, a: i64, b: i64) {
             ma_rrr(if signed { c"sdiv" } else { c"udiv" }, 17, a, b);
             o(c"    msub ");
             ma_r(d);
-            o(c", x17, ");
+            o(if w32 { c", w17, " } else { c", x17, " });
             ma_r(b);
             o(c", ");
             ma_r(a);
@@ -32,7 +40,9 @@ pub fn ma_int_op(op: Op, ty: i64, d: i64, a: i64, b: i64) {
         } else if op == And { ma_rrr(c"and", d, a, b); }
         else if op == Or { ma_rrr(c"orr", d, a, b); }
         else if op == Xor { ma_rrr(c"eor", d, a, b); }
-        else {
+        else if w32 {
+            ma_rrr(if op == Shl { c"lsl" } else { c"lsr" }, d, a, b);
+        } else {
             // The amount is taken modulo 32 for types up to 32 bits, modulo 64
             // for 64-bit ones.
             ma_rr(c"and", 17, b);
@@ -43,7 +53,10 @@ pub fn ma_int_op(op: Op, ty: i64, d: i64, a: i64, b: i64) {
                 ma_rrr(if signed { c"asr" } else { c"lsr" }, d, a, 17);
             }
         }
-        ma_normalize(d, ty);
+        MA_W32 = false;
+        if !w32 && !stays_canonical(op, signed) {
+            ma_normalize(d, ty);
+        }
     }
 }
 
@@ -69,6 +82,8 @@ pub fn ma_int_imm_ok(op: Op, imm: i64) -> bool {
 
 pub fn ma_int_op_imm(op: Op, ty: i64, d: i64, a: i64, imm: i64) -> bool {
     unsafe {
+        // (0.16) u32 on the w registers, as ma_int_op.
+        let w32 = ty == TY_U32;
         if op == Add || op == Sub {
             let mut value = imm;
             let mut subtract = op == Sub;
@@ -79,25 +94,33 @@ pub fn ma_int_op_imm(op: Op, ty: i64, d: i64, a: i64, imm: i64) -> bool {
             if value < 0 || value >= 4096 {
                 return false;
             }
+            MA_W32 = w32;
             ma_rr(if subtract { c"sub" } else { c"add" }, d, a);
+            MA_W32 = false;
             o_back_imm(value);
-            ma_normalize(d, ty);
+            if !w32 {
+                ma_normalize(d, ty);
+            }
             return true;
         }
         if op == Mul && (imm == 3 || imm == 5 || imm == 9) {
             // a * (2^k + 1) = a + (a << k)
+            MA_W32 = w32;
             ma_rrr(c"add", d, a, a);
+            MA_W32 = false;
             BUFS[CODE].len -= 1;
             o(c", lsl #");
             oi(log2(imm - 1));
             on();
-            ma_normalize(d, ty);
+            if !w32 {
+                ma_normalize(d, ty);
+            }
             return true;
         }
         if (op == And || op == Or || op == Xor) && is_logical_imm(imm as u64) {
+            // (of canonical operands, canonical)
             ma_rr(if op == And { c"and" } else if op == Or { c"orr" } else { c"eor" }, d, a);
             o_back_imm(imm);
-            ma_normalize(d, ty);
             return true;
         }
         if op == Shl || op == Shr {
@@ -107,13 +130,17 @@ pub fn ma_int_op_imm(op: Op, ty: i64, d: i64, a: i64, imm: i64) -> bool {
                     ma_rr(c"mov", d, a);
                 }
             } else if op == Shl {
+                MA_W32 = w32;
                 ma_rr(c"lsl", d, a);
+                MA_W32 = false;
                 o_back_imm(amount);
             } else {
                 ma_rr(if is_signed(ty) { c"asr" } else { c"lsr" }, d, a);
                 o_back_imm(amount);
             }
-            ma_normalize(d, ty);
+            if op == Shl && !w32 {
+                ma_normalize(d, ty);
+            }
             return true;
         }
         false
@@ -173,6 +200,13 @@ pub fn ma_unary(op: Op, ty: i64, d: i64, a: i64) {
             o(c", ");
             ma_f(a, ty);
             on();
+            return;
+        }
+        if ty == TY_U32 && op != Not {
+            // (0.16: on the w registers, as ma_int_op)
+            MA_W32 = true;
+            ma_rr(if op == Neg { c"neg" } else { c"mvn" }, d, a);
+            MA_W32 = false;
             return;
         }
         if op == Neg {
@@ -379,6 +413,8 @@ pub fn ma_jump_table(r: i64, low: i64, range: i64, default: i64, table: *i64) {
 // d = c + a * b, or c - a * b.
 pub fn ma_madd(sub: bool, ty: i64, d: i64, a: i64, b: i64, c: i64) {
     unsafe {
+        // (0.16: u32 on the w registers, as ma_int_op)
+        MA_W32 = ty == TY_U32;
         o(if sub { c"    msub " } else { c"    madd " });
         ma_r(d);
         o(c", ");
@@ -388,7 +424,10 @@ pub fn ma_madd(sub: bool, ty: i64, d: i64, a: i64, b: i64, c: i64) {
         o(c", ");
         ma_r(c);
         on();
-        ma_normalize(d, ty);
+        if !MA_W32 {
+            ma_normalize(d, ty);
+        }
+        MA_W32 = false;
     }
 }
 
@@ -398,14 +437,20 @@ pub fn ma_shop(code: i64, ty: i64, d: i64, a: i64, b: i64, k: i64) {
     let kind = code % 4;
     let mnemonic = if op == Add as i64 { c"add" } else if op == Sub as i64 { c"sub" }
         else if op == And as i64 { c"and" } else if op == Or as i64 { c"orr" } else { c"eor" };
+    // (0.16: u32 on the w registers, as ma_int_op)
+    let w32 = ty == TY_U32 && k < 32;
     unsafe {
+        MA_W32 = w32;
         ma_rrr(mnemonic, d, a, b);
+        MA_W32 = false;
         BUFS[CODE].len -= 1;
         o(if kind == 0 { c", lsl #" } else if kind == 1 { c", lsr #" } else { c", asr #" });
     }
     oi(k);
     on();
-    ma_normalize(d, ty);
+    if !w32 {
+        ma_normalize(d, ty);
+    }
 }
 
 // d = (a >> k) & (2^n - 1).
@@ -537,5 +582,30 @@ pub fn ma_fmath(kind: i64, ty: i64, d: i64, a: i64) {
         o(c", ");
         ma_f(a, ty);
         on();
+    }
+}
+
+// (0.16) d = the count `kind` of a's bits (BITS_ONES: cnt over the bytes
+// in v31, the vector temporary, and their sum; BITS_LEADING: clz;
+// BITS_TRAILING: rbit, then clz).
+pub fn ma_bits(kind: i64, d: i64, a: i64) {
+    unsafe {
+        if kind == BITS_ONES {
+            o(c"    fmov d31, ");
+            ma_r(a);
+            on();
+            o(c"    cnt v31.8b, v31.8b\n");
+            o(c"    addv b31, v31.8b\n");
+            o(c"    fmov ");
+            ma_w(d);
+            o(c", s31\n");
+            return;
+        }
+        if kind == BITS_TRAILING {
+            ma_rr(c"rbit", d, a);
+            ma_rr(c"clz", d, d);
+            return;
+        }
+        ma_rr(c"clz", d, a);
     }
 }

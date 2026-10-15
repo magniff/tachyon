@@ -43,7 +43,7 @@ on the command line make one program; `mod name;` loads `name.tach`.
 | `use m::*;` | not allowed: `use m::{a, b};`, or the path `m::a` |
 | `println!("{}", x)`, `format!` | no macros: `println(f"x = {x:>4} {v:?}")`, `format_in(f"..", gpa)` (a `Buf`) (`guide formatting`) |
 | `Vec::new()`, a global allocator | `Vec::new_in(gpa)`: nothing allocates without an allocator; `gpa` comes from `fn main(gpa: Gpa)`, passed down as a parameter (0.16, `guide allocators`) |
-| `Box<T>`, arenas | a `Vec`; `arena_scope(\|a\| ..)` frees all it allocated at its end; `--check-alloc` traps a use after free |
+| `Box<T>`, arenas | a `Vec`; `arena_scope(gpa, \|a\| ..)` frees all it allocated at its end; `--check-alloc` traps a use after free |
 | `const fn`, purity | `#[pure]`, `#[no_alloc]`: checked declarations; `tachyonc query effects f` (0.16, `guide effects`) |
 | `v[i]` on a `Vec` | `v.get(i)`, `v.set(i, x)`, `v.as_slice()[i]` |
 | closures, `.iter().map()` | the same (0.14): `v.iter().map(\|x\| x * k).sum()`; `F: Fn(i64) -> i64` bounds; no `dyn Fn`, `iter_mut` (`guide closures`, `guide iterators`) |
@@ -318,7 +318,7 @@ n=6!
 Allocation is explicit (0.16): nothing allocates without an allocator.
 A function that allocates takes one, `gpa: Gpa` or `a: A` with `A:
 Allocator`, or a container it was given (`push` uses the Vec's own);
-main's `gpa` is where they come from. `arena_scope(|a| ...)` hands out
+main's `gpa` is where they come from. `arena_scope(gpa, |a| ...)` hands out
 an arena whose memory is all freed when the closure returns.
 `--check-alloc` builds the program with a checking allocator: a use
 after free, a double free, a leak are reported where they happen.

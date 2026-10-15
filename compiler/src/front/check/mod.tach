@@ -55,7 +55,8 @@ use crate::front::check::collect::{
     collect_name, collect_names, collect_structs, eval_discriminant,
 };
 use crate::front::check::resolve::{
-    check_static, check_struct_cycles, collect_functions, collect_statics, evaluate_consts,
+    check_static, check_static_calls, check_struct_cycles, collect_functions, collect_statics,
+    evaluate_consts, resolve_type, static_call_value,
 };
 use crate::front::check::unsafety::{UNSAFE_DEPTH, WRAP_NODE, check_wrapped};
 use crate::front::consteval::const_value_of;
@@ -72,19 +73,19 @@ use crate::front::types::{
     ENUMS, FNS, FN_COUNT, STRUCTS, TLISTS, TSCRATCH, TYPES, TY_ERROR, TyKind, err_type, type_elem,
 };
 use crate::tools::fiximports::report_legacy_imports;
-use crate::tools::query::QUERY;
+use crate::tools::query::command_line::QUERY;
 use std::Option;
 
 // What other modules use of the parts.
-pub use body::check_block;
 use crate::front::ambient::main_gpa;
 use crate::front::assoc::{ensure_checked, lazy_std};
+pub use crate::front::check::body::check_block;
 use crate::front::closures::{CLOSURE_FNS, CLOSURE_STACK};
 use crate::front::convert::main_result_wrapper;
 use crate::front::derive::{check_derives, expand_derives};
-use crate::front::effects::check::check_effects;
+use crate::front::effects::EFFECTS_WANTED;
+use crate::front::effects::check::{check_effects, effects_declared};
 use crate::front::effects::infer::{infer_effects, note_body_failed};
-use resolve::resolve_type;
 
 // What an identifier names.
 pub enum Res { None, Local, Const, Static, Fn }
@@ -247,12 +248,17 @@ pub fn check_program(program: i64) {
         if QUERY {
             check_unchecked(program);
         }
+        // (0.16: the statics that call constant constructors)
+        check_static_calls();
         // (0.8: `*` imports and plain header imports, once the names used
         // through them are known)
         report_legacy_imports(true);
         // (0.16: the effects of every function, then the declared ones)
-        infer_effects();
-        check_effects();
+        // (none at -O0 when nothing reads them: EFFECTS_WANTED)
+        if EFFECTS_WANTED || effects_declared() {
+            infer_effects();
+            check_effects();
+        }
         exit_if_errors();
         finish_program(program);
     }
@@ -439,7 +445,7 @@ fn restore_check_state(s: CheckState) {
 // checked.
 
 // What `attempt` does.
-pub enum Try { Name, Type, Method, Static, Const, Use, Impl, Bound, Discr }
+pub enum Try { Name, Type, Method, Static, Const, Use, Impl, Bound, Discr, StaticCall }
 
 // The result of the attempt that went through.
 pub static mut TRY_RESULT: i64 = 0;
@@ -461,6 +467,7 @@ pub fn attempt(what: Try, arg: i64) -> bool {
             Try::Impl => collect_impl(arg),
             Try::Bound => TRY_RESULT = trait_named(arg),
             Try::Discr => TRY_RESULT = eval_discriminant(arg),
+            Try::StaticCall => static_call_value(arg),
         }
     } else {
         restore_check_state(state);

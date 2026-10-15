@@ -3,7 +3,9 @@
 // `import` lines, and the attributes before an item (`#[repr]`,
 // `#[inline]`, `#[cold]`).
 
-use crate::base::{SYMS, intern, intern_c};
+pub mod params;
+
+use crate::base::{intern, intern_c};
 use crate::base::diag::{err_begin, err_end, err_help, err_str, error_at};
 use crate::front::ambient::AMBIENT_TRY;
 use crate::front::ast::{
@@ -13,11 +15,11 @@ use crate::front::ast::{
     list_begin, list_end, list_push, new_node,
 };
 use crate::front::check::name_error;
-use crate::front::lexer::{STRS, TOKS, TOK_COUNT, Tok};
+use crate::front::lexer::{STRS, TOKS, Tok};
 use crate::front::lexer::Tok::{
-    Amp, Arrow, As, Colon, ColonColon, Comma, Const, Ellipsis, Enum, Eof, Eq, Extern, Fn, For, Gt,
-    Hash, Impl, Import, Int, LBrace, LBracket, LParen, Lt, Mod, Mut, Plus, Pub, RBrace, RBracket,
-    RParen, Reserved, Semi, Star, Static, Str, Struct, Trait, Type, Union, Unsafe, Use,
+    Arrow, As, Colon, ColonColon, Comma, Const, Enum, Eof, Eq, Extern, Fn, For, Gt, Hash, Impl,
+    Import, Int, LBrace, LBracket, LParen, Lt, Mod, Mut, Plus, Pub, RBrace, RBracket, RParen,
+    Reserved, Semi, Star, Static, Str, Struct, Trait, Type, Union, Unsafe, Use,
 };
 use crate::front::parser::{
     BODY_FAILED, P, UNDERSCORE, advance, at, cur, cur_start, eat, expect, expect_binding_name,
@@ -25,6 +27,7 @@ use crate::front::parser::{
 };
 use crate::front::parser::exprs::parse_expr;
 use crate::front::parser::foreign::parse_extern;
+use crate::front::parser::items::params::parse_params;
 use crate::front::parser::stmts::parse_block;
 use crate::front::parser::types::{is_int_type_name, parse_bound, parse_effect_list, parse_type};
 
@@ -856,53 +859,6 @@ fn parse_attributed_item(public: bool) -> i64 {
     }
 }
 
-// The parameters of `n` up to `)`; whether they end with `...`.
-pub fn parse_params(n: i64, allow_ellipsis: bool) -> bool {
-    let mark = list_begin();
-    let mut variadic = false;
-    while !at(RParen) && !at(Eof) {
-        if at(Ellipsis) {
-            if !allow_ellipsis {
-                unsafe { error_at(cur_start(), c"only extern functions can be variadic"); }
-            }
-            advance();
-            variadic = true;
-            eat(Comma);
-            break;
-        }
-        list_push(parse_param());
-        if !eat(Comma) {
-            break;
-        }
-    }
-    list_end(n, mark);
-    variadic
-}
-
-fn parse_param() -> i64 {
-    unsafe {
-        let start = cur_start();
-        if at(Amp) {
-            self_param_error(c"expected identifier, got '&'");
-        }
-        let mutable = eat(Mut);
-        let n = new_node(NodeKind::Param, start, 0);
-        NODES[n].a = if mutable { expect_binding_name() } else { expect_ident() };
-        if !at(Colon) && SYMS[NODES[n].a].text == "self" {
-            self_param_error(c"expected ':' after 'self'");
-        }
-        expect(Colon);
-        NODES[n].b = parse_type();
-        NODES[n].c = mutable as i64;
-        if eat(Eq) {
-            // A default (0.15): checked by check_param_defaults
-            NODES[n].h = parse_expr();
-        }
-        NODES[n].end = prev_end();
-        n
-    }
-}
-
 // Function `f` (a Fn or ExternFn) is one whose parameters cannot have
 // defaults (0.15: those of trait functions and extern functions): an
 // error at the first one that has one.
@@ -918,29 +874,6 @@ pub fn no_param_defaults(f: i64, what: *u8) {
                 err_end();
             }
         }
-    }
-}
-
-// `&self`, `&mut self`, `self` without a type (0.14): what tachyon writes.
-// (0.15) Rust's `fmt(&self, f: &mut Formatter)`: Display's and Debug's.
-fn self_param_error(message: *u8) -> ! {
-    unsafe {
-        err_begin(cur_start());
-        err_str(message);
-        let mut formatter = false;
-        let mut i = P;
-        while i < TOK_COUNT && i < P + 16 && TOKS[i].kind != Tok::RParen {
-            if TOKS[i].kind == Tok::Ident && SYMS[TOKS[i].value as i64].text == "Formatter" {
-                formatter = true;
-            }
-            i += 1;
-        }
-        if formatter {
-            err_help(c"Display and Debug in tachyon: `fn fmt(self: *Self, f: *std::Fmt)` and `fn fmt_debug(self: *Self, f: *std::Fmt)`, with no result; write with `f.write(f\"({self.x}, {self.y})\")`, `f.str(s)`, `f.debug(&x)`");
-        } else {
-            err_help(c"write the type of self: `self: *T` (a pointer: `&self`, `&mut self`) or `self: T` (a copy)");
-        }
-        err_end()
     }
 }
 
@@ -963,9 +896,12 @@ fn parse_struct() -> i64 {
         let mark = list_begin();
         while !at(RBrace) && !at(Eof) {
             let field_start = cur_start();
-            // `pub` (0.5) is allowed: a field is visible wherever its struct is.
-            eat(Pub);
+            // `pub` (0.5) is allowed: a field is visible wherever its struct is
+            // (0.16: of a #[sealed] struct, only the `pub` ones outside its module).
+            let public = eat(Pub);
             let field = new_node(NodeKind::Field, field_start, 0);
+            // (0.16: what a #[sealed] struct shows outside its module)
+            mark_public(field, public);
             NODES[field].a = expect_binding_name();
             expect(Colon);
             NODES[field].b = parse_type();

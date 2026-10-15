@@ -21,15 +21,15 @@ file, one per line, `FILE:LINE:COL: error[KIND] MESSAGE | help: ...`:
 
 ```console
 $ tachyonc check
-main.tach:8:38: error[type error] 'letter' is private | help: make it public: `pub fn letter` at ./grades.tach:21:1
+main.tach:8:38: error[type error] 'letter' is private | help: make it public: `pub fn letter` at grades.tach:21:1
 main.tach:9:14: error[type error] unresolved import 'roster::add_score'
 main.tach:17:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3
 main.tach:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3
 main.tach:19:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3
 main.tach:23:19: error[type error] unknown type 'HashMap' | help: add `use std::HashMap;`
-./grades.tach:18:5: error[type error] undefined variable 'totl' | help: did you mean 'total'?
-./grades.tach:39:17: error[unsafe] calling a C function is unsafe | help: put it in an `unsafe { ... }` block, or the function's body in an `unsafe fn` (`tachyonc --fix-unsafe` does the former)
-./roster.tach:26:13: error[type error] cannot assign to immutable variable 'count' | help: make it mutable: `let mut count`
+grades.tach:18:5: error[type error] undefined variable 'totl' | help: did you mean 'total'?
+grades.tach:39:17: error[unsafe] calling a C function is unsafe | help: put it in an `unsafe { ... }` block, or the function's body in an `unsafe fn` (`tachyonc fix --only unsafe` does the former)
+roster.tach:26:13: error[type error] cannot assign to immutable variable 'count' | help: make it mutable: `let mut count`
 [exit 1]
 ```
 
@@ -73,8 +73,8 @@ main.tach:9:14: error[type error] unresolved import 'roster::add_score'
 main.tach:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3
 main.tach:19:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3
 main.tach:20:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3
-./grades.tach:18:5: error[type error] undefined variable 'totl' | help: did you mean 'total'?
-./roster.tach:26:13: error[type error] cannot assign to immutable variable 'count' | help: make it mutable: `let mut count`
+grades.tach:18:5: error[type error] undefined variable 'totl' | help: did you mean 'total'?
+roster.tach:26:13: error[type error] cannot assign to immutable variable 'count' | help: make it mutable: `let mut count`
 [exit 1]
 ```
 
@@ -138,10 +138,10 @@ main.tach:19:5: error[type error] function 'roster::enrol' expects 2 arguments, 
 main.tach:20:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3
 [exit 1]
 $ tachyonc query show roster::enrol
-// crate::roster::enrol	roster.tach:16-19	effects: alloc(Gpa) panic diverge
+// crate::roster::enrol	roster.tach:16-19	effects: alloc(Gpa) panic
 // A student with no scores yet.
 pub fn enrol(r: *Roster, name: [u8]) {
-    r.students.push(Student { name: name, scores: Vec::new_in(r.students.alloc) });
+    r.students.push(Student { name: name, scores: Vec::new_in(r.students.allocator()) });
 }
 warning query.program-errors: 4 errors in the program; results may be incomplete
 try: tachyonc --diagnostics=short main.tach -c -o /dev/null
@@ -158,7 +158,7 @@ $ tachyonc edit apply --show <<'EOF'
 > @@ roster::enrol
 > // A student and their scores so far.
 > pub fn enrol(r: *Roster, name: [u8], scores: [i64]) {
->     let mut v: Vec<i64> = Vec::new_in(r.students.alloc);
+>     let mut v: Vec<i64> = Vec::new_in(r.students.allocator());
 >     v.extend_from_slice(scores);
 >     r.students.push(Student { name: name, scores: v });
 > }
@@ -180,7 +180,7 @@ applied 2 blocks: replaced crate::roster::enrol; inserted after crate::roster::e
 // roster.tach:16-33
 16	// A student and their scores so far.
 17	pub fn enrol(r: *Roster, name: [u8], scores: [i64]) {
-18	    let mut v: Vec<i64> = Vec::new_in(r.students.alloc);
+18	    let mut v: Vec<i64> = Vec::new_in(r.students.allocator());
 19	    v.extend_from_slice(scores);
 20	    r.students.push(Student { name: name, scores: v });
 21	}

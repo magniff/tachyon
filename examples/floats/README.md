@@ -11,13 +11,8 @@ From this folder (with `tachyonc` on your `PATH`, or `../../target/tachyonc`):
 tachyonc main.tach -o floats && ./floats
 ```
 
-On Linux, C's math functions are in a library of their own, `libm`, and
-`tachyonc -o floats` links only the C library: make an object and link
-it with `-lm` yourself (on macOS both commands work):
-
-```sh
-tachyonc main.tach -o floats.o && cc floats.o -o floats -lm && ./floats
-```
+On Linux, C's math functions are in a library of their own, `libm`:
+`tachyonc` links it because the program calls `sqrt`.
 
 ## Expected output
 

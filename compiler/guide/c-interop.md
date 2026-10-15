@@ -121,11 +121,18 @@ types they use.
 ## Building with C
 
 `tachyonc prog.tach -o prog` links with `cc` (`$TACHYON_CC` instead).
-For other libraries or C files, make an object and link it yourself:
+C files, objects (`.o`), archives (`.a`), shared libraries, `-l NAME`
+and `-L DIR` on its command line go to that link, in their order; a C
+file is compiled by `cc` at the program's `-O` level, with its `-I`
+directories. libm is linked when the program calls one of its functions
+(Linux has it apart from libc):
 
 ```sh
-tachyonc prog.tach -o prog.o && cc prog.o helper.c -o prog -lm
+tachyonc prog.tach helper.c -L vendor/lib -l png -o prog
 ```
+
+`-o prog.o` makes an object instead, for a build that links it itself
+(`cc prog.o helper.o -o prog -lm`).
 
 Reading stdin: std has `read_line` and `read_stdin` (`tachyonc guide
 std`); from C, `getchar()` from `stdio.h`, or `read(0, buf, n)` from

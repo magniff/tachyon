@@ -11,6 +11,7 @@ use crate::base::{IntVec, alloc_array, free, intern_c, memset};
 use crate::front::types::{TY_U64, is_integer, type_size};
 use crate::middle::egraph::{EGRAPH, egraph_rewrite, egraph_start};
 use crate::middle::fold::is_const;
+use crate::middle::gvn_calls::{call_numbering, inherit_into};
 use crate::middle::ipo::{call_reads, call_writes};
 use crate::middle::ir::{
     BLOCKS, Cond, INSTS, IRFUNCS, Op, SLOTS, SLOT_COUNT, Term, ir_arg, ir_insert_before, ir_make,
@@ -99,16 +100,35 @@ fn gvn_hash(v: i64) -> u64 {
         h = (h ^ INSTS[v].c as u64) * 1099511628211;
         h = (h ^ INSTS[v].imm as u64) * 1099511628211;
         h = (h ^ INSTS[v].imm2 as u64) * 1099511628211;
+        if INSTS[v].op.is_call() {
+            // (0.16) a call numbered by its callee and arguments
+            for i in 0..INSTS[v].nargs {
+                h = (h ^ ir_arg(v, i) as u64) * 1099511628211;
+            }
+        }
     }
     h ^ (h >> 29)
 }
 
 fn gvn_equal(v: i64, w: i64) -> bool {
     unsafe {
-        INSTS[v].op == INSTS[w].op && INSTS[v].cond == INSTS[w].cond && INSTS[v].ty == INSTS[w].ty
-            && INSTS[v].a == INSTS[w].a && INSTS[v].b == INSTS[w].b && INSTS[v].c == INSTS[w].c
-            && INSTS[v].imm == INSTS[w].imm
-            && INSTS[v].imm2 == INSTS[w].imm2
+        if !(INSTS[v].op == INSTS[w].op && INSTS[v].cond == INSTS[w].cond
+            && INSTS[v].ty == INSTS[w].ty && INSTS[v].a == INSTS[w].a && INSTS[v].b == INSTS[w].b
+            && INSTS[v].c == INSTS[w].c && INSTS[v].imm == INSTS[w].imm
+            && INSTS[v].imm2 == INSTS[w].imm2) {
+            return false;
+        }
+        if INSTS[v].op.is_call() {
+            if INSTS[v].nargs != INSTS[w].nargs || INSTS[v].c != INSTS[w].c {
+                return false;
+            }
+            for i in 0..INSTS[v].nargs {
+                if ir_arg(v, i) != ir_arg(w, i) {
+                    return false;
+                }
+            }
+        }
+        true
     }
 }
 
@@ -601,7 +621,7 @@ fn memory_step(v: i64) -> bool {
 
 // The writes of block b, applied to AVAIL (for a block between a block and
 // one it dominates).
-fn apply_block_kills(b: i64) {
+pub fn apply_block_kills(b: i64) {
     unsafe {
         let mut v = BLOCKS[b].first;
         while v != 0 {
@@ -619,51 +639,6 @@ fn apply_block_kills(b: i64) {
             }
             v = INSTS[v].next;
         }
-    }
-}
-
-// Whether what is known at the end of d (in AVAIL) holds at the start of
-// c, which d dominates, once the writes of the blocks on the paths from d
-// to c are applied; false when those are too many to look at.
-static mut REGION_STAMP: i64 = 1;
-static mut REGION: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-fn inherit_into(d: i64, c: i64) -> bool {
-    unsafe {
-        if BLOCKS[c].preds.count == 1 && BLOCKS[c].preds.data[0] == d {
-            return true;
-        }
-        REGION_STAMP += 1;
-        let stamp = REGION_STAMP;
-        REGION.count = 0;
-        let mut work = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for i in 0..BLOCKS[c].preds.count {
-            work.push(BLOCKS[c].preds.data[i]);
-        }
-        let mut ok = true;
-        while work.count > 0 {
-            let b = work.pop();
-            if b == d || BLOCKS[b].mark == stamp {
-                continue;
-            }
-            BLOCKS[b].mark = stamp;
-            REGION.push(b);
-            if REGION.count > 64 {
-                ok = false;
-                break;
-            }
-            for i in 0..BLOCKS[b].preds.count {
-                work.push(BLOCKS[b].preds.data[i]);
-            }
-        }
-        free(work.data as *u8);
-        if !ok {
-            return false;
-        }
-        for i in 0..REGION.count {
-            apply_block_kills(REGION.data[i]);
-        }
-        true
     }
 }
 
@@ -884,10 +859,33 @@ fn equal_value(w: i64) -> i64 {
     }
 }
 
+// (0.16) Calls numbered like pure instructions: the READONLY calls of the
+// current block since the last write (an equal one there is the same
+// value).
+static mut RO_CALLS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// Whether instruction v (a store, a copy or a call) may write memory a
+// READONLY call reads: anything but the caller's private slots.
+fn writes_for_calls(v: i64) -> bool {
+    unsafe {
+        let op = INSTS[v].op;
+        if op == Store {
+            let mut offset = 0;
+            return !is_private_slot(address_base(INSTS[v].a, &offset));
+        }
+        if is_copy(v) {
+            let mut offset = 0;
+            return !is_private_slot(address_base(copy_dst(v), &offset));
+        }
+        op.is_call() && call_writes(v)
+    }
+}
+
 fn gvn_block(b: i64, changed: *bool) {
     unsafe {
         COPIES.count = 0;
         PENDING.count = 0;
+        RO_CALLS.count = 0;
         let mut v = BLOCKS[b].first;
         while v != 0 {
             let next = INSTS[v].next;
@@ -923,8 +921,32 @@ fn gvn_block(b: i64, changed: *bool) {
                         *changed = true;
                     }
                 }
-            } else if memory_step(v) {
-                *changed = true;
+            } else {
+                let numbering = if op.is_call() { call_numbering(v) } else { 0 };
+                let mut w = 0;
+                if numbering == 1 {
+                    w = gvn_find_or_add(v);
+                } else if numbering == 2 {
+                    for i in 0..RO_CALLS.count {
+                        if gvn_equal(v, RO_CALLS.data[i]) {
+                            w = RO_CALLS.data[i];
+                        }
+                    }
+                }
+                if w != 0 {
+                    ir_replace(v, w);
+                    *changed = true;
+                } else {
+                    if RO_CALLS.count > 0 && writes_for_calls(v) {
+                        RO_CALLS.count = 0;
+                    }
+                    if numbering == 2 {
+                        RO_CALLS.push(v);
+                    }
+                    if memory_step(v) {
+                        *changed = true;
+                    }
+                }
             }
             v = next;
         }

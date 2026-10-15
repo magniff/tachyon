@@ -148,7 +148,7 @@ try: tachyonc query def Point
 ## A change that breaks the program: nothing written.
 $ refactor signature area --type p i32
 main.tach:16:18: error[type error] expected 'i32', got 'Point'  [in crate::main]
-./geom.tach:18:5: error[type error] cannot access field 'x' on type 'i32'  [edited: crate::geom::area]
+geom.tach:18:5: error[type error] cannot access field 'x' on type 'i32'  [edited: crate::geom::area]
 error edit.breaks: 2 new errors (1 in the edited text, 1 in crate::main, which the edit does not change); nothing written
 note edit.refactor: the uses of crate::geom::area no longer fit its new shape: a refactoring changes them with it (VALUE, EXPR: to fill in), then the rest of the edit
 try: tachyonc refactor signature crate::geom::area --type p i32 --default EXPR
@@ -205,7 +205,7 @@ $ refactor field Point --rename y height --dry-run
 -        (self.x + self.y) * unit
 +        (self.x + self.height) * unit
 $ refactor field Point --type x i32
-./geom.tach:47:27: error[type error] expected 'i32', got 'i64'  [in crate::geom::Point::scale]
+geom.tach:47:27: error[type error] expected 'i32', got 'i64'  [in crate::geom::Point::scale]
 error edit.breaks: 1 new error (1 in crate::geom::Point::scale, which the edit does not change); nothing written
 note edit.refactor: the uses of crate::geom::Point no longer fit its new shape: a refactoring changes them with it, then the rest of the edit
 try: tachyonc refactor field crate::geom::Point --type x i32
@@ -249,8 +249,8 @@ $ refactor field Label --add 'size: i64 = 4' --dry-run
 ## --- variant ---
 ## An arm that does not check: nothing written.
 $ refactor variant Kind --add 'Ring(i64, i64)' --arm 'oops'
-./kinds.tach:16:29: error[type error] undefined variable 'oops'  [edited: crate::kinds::weight]
-./kinds.tach:39:29: error[type error] undefined variable 'oops'  [edited: crate::kinds::sides]
+kinds.tach:16:29: error[type error] undefined variable 'oops'  [edited: crate::kinds::weight]
+kinds.tach:39:29: error[type error] undefined variable 'oops'  [edited: crate::kinds::sides]
 error edit.breaks: 2 new errors; nothing written
 try: tachyonc refactor variant Kind --add 'Ring(i64, i64)' --arm oops --no-check
 [exit 1]
@@ -407,7 +407,7 @@ $ refactor --script broken.txt
 renamed parameter x to n of crate::geom::twice	geom.tach	+2 -2 lines
 changed parameter p to i32 in crate::geom::area	geom.tach	+1 -1 lines
 main.tach:16:18: error[type error] expected 'i32', got 'Point'  [in crate::main]
-./geom.tach:18:5: error[type error] cannot access field 'x' on type 'i32'  [edited: crate::geom::area]
+geom.tach:18:5: error[type error] cannot access field 'x' on type 'i32'  [edited: crate::geom::area]
 error edit.breaks: 2 new errors (1 in the edited text, 1 in crate::main, which the edit does not change); nothing written
 note edit.refactor: the uses of crate::geom::area no longer fit its new shape: a refactoring changes them with it (VALUE, EXPR: to fill in), then the rest of the edit
 try: tachyonc refactor signature crate::geom::area --type p i32 --default EXPR
