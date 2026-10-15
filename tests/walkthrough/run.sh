@@ -1,24 +1,27 @@
 #!/bin/sh
-# The walkthroughs of examples/tools/ (0.15): each README.md is a
-# transcript, run as it is written, so that its commands and their
-# output never go stale. POSIX sh and awk only.
+# The walkthroughs of examples/tools/ (0.15), and of every other example
+# in a group whose README has a session (0.16: examples/allocators/,
+# examples/effects/): each README.md is a transcript, run as it is
+# written, so that its commands and their output never go stale. POSIX
+# sh and awk only.
 #
 # usage: tests/walkthrough/run.sh [-c COMPILER] [-u] [NAME...]
 #
 #   -c COMPILER   the tachyonc binary (default: target/tachyonc)
 #   -u            rewrite the READMEs' session blocks with the output
 #                 they get now (the prose around them is kept)
-#   NAME          only these examples (examples/tools/NAME/)
+#   NAME          only these examples (examples/GROUP/NAME/)
 #
-# Each examples/tools/NAME/README.md is run in a fresh copy of its
-# directory, made a git repository (one commit, branch main, so that
-# edits are journaled for undo and `git diff` shows what changed). The
+# Each examples/GROUP/NAME/README.md with a ```console block (every one
+# of examples/tools/) is run in a fresh copy of its directory, made a git
+# repository (one commit, branch main, so that edits are journaled for
+# undo and `git diff` shows what changed). The
 # README's ```console blocks are the session, in order:
 #
 #   $ COMMAND     a shell command line, run in the copy (`tachyonc` is
 #                 the compiler under test, first in PATH)
 #   > MORE        the command's next line (a heredoc's text), right
-#                 after its `$` line
+#                 after its `$` line (`>` alone: an empty line)
 #   other lines   the command's output: stdout, then stderr, then
 #                 `[exit N]` when N is not 0
 #
@@ -93,7 +96,7 @@ split_readme() {
             print n " " b > (out "/blocks")
             print > (out "/want"); next
         }
-        cont && /^> / { cmd = cmd substr($0, 3) "\n"; print > (out "/want"); next }
+        cont && /^>( |$)/ { cmd = cmd substr($0, 3) "\n"; print > (out "/want"); next }
         { cont = 0; print > (out "/want") }
         END { flush() }
     ' "$1"
@@ -123,7 +126,7 @@ run_one() {
             echo '```' >>"$meta/got"
             last=$((last + 1))
         done
-        awk 'NR == 1 { print "$ " $0; next } { print "> " $0 }' "$meta/cmd.$n" >>"$meta/got"
+        awk 'NR == 1 { print "$ " $0; next } $0 == "" { print ">"; next } { print "> " $0 }' "$meta/cmd.$n" >>"$meta/got"
         (
             cd "$dir" || exit 1
             sh "$meta/cmd.$n" >"$meta/out" 2>"$meta/err" </dev/null
@@ -164,8 +167,9 @@ run_one() {
 # The examples run at once (each is serial, and mostly waits on the
 # compiler and cc); the results are printed in order.
 names=
-for readme in "$ROOT"/examples/tools/*/README.md; do
+for readme in "$ROOT"/examples/*/*/README.md; do
     [ -f "$readme" ] || continue
+    grep -q '^```console' "$readme" || continue
     name=$(basename "$(dirname "$readme")")
     if [ -n "$ONLY" ]; then
         case " $ONLY " in *" $name "*) ;; *) continue ;; esac

@@ -1,0 +1,108 @@
+// A score, a histogram and the peak of a series of sensor samples, as a
+// small library whose functions promise what they do not do: `score` is
+// #[pure] (no allocation, no I/O, no statics), `histogram` is #[no_alloc]
+// (it fills memory its caller gives it), `peak` is #[no_panic]. The
+// compiler checks each promise against everything the function calls,
+// however deep: a helper three calls down that prints, allocates or
+// indexes out of range breaks the promise of the function at the top.
+
+// ---- score: #[pure], with three levels of helpers under it ----
+
+fn clamp(x: i64, lo: i64, hi: i64) -> i64 {
+    if x < lo {
+        lo
+    } else if x > hi {
+        hi
+    } else {
+        x
+    }
+}
+
+fn scaled(x: i64, gain: i64) -> i64 {
+    clamp(x * gain / 10, 0, 1000)
+}
+
+// The mean of two neighbours, scaled. `s[i + 1]` is a checked index: it
+// may panic, which #[pure] allows.
+fn smoothed(s: [i64], i: i64, gain: i64) -> i64 {
+    (scaled(s[i], gain) + scaled(s[i + 1], gain)) / 2
+}
+
+// The sum of the smoothed samples. Pure: what it returns depends only on
+// its arguments, and calling it does nothing else, so the optimizer may
+// compute it once for several calls, or move it out of a loop.
+#[pure]
+fn score(s: [i64], gain: i64) -> i64 {
+    let mut t = 0;
+    for i in 0..s.len - 1 {
+        t += smoothed(s, i, gain);
+    }
+    t
+}
+
+// ---- histogram: #[no_alloc], into memory the caller owns ----
+
+fn bucket(x: i64, width: i64, n: i64) -> i64 {
+    let b = x / width;
+    if b < 0 {
+        0
+    } else if b >= n {
+        n - 1
+    } else {
+        b
+    }
+}
+
+// How many samples fall in each bucket of `width`; the last bucket takes
+// everything above. Writing through `bins` is allowed: it allocates
+// nothing.
+#[no_alloc]
+fn histogram(s: [i64], bins: [i64], width: i64) {
+    for i in 0..bins.len {
+        bins[i] = 0;
+    }
+    for x in s {
+        bins[bucket(x, width, bins.len)] += 1;
+    }
+}
+
+// ---- peak: #[no_panic] ----
+
+// The largest sample; None for none. No index that could be out of range:
+// `get` is an Option, and `for x in s` visits each element exactly once.
+#[no_panic]
+fn peak(s: [i64]) -> Option<i64> {
+    let mut best = s.get(0)?;
+    for x in s {
+        if x > best {
+            best = x;
+        }
+    }
+    Some(best)
+}
+
+// ---- and one with no promise ----
+
+// The samples above `limit`, pushed onto `out`. It takes no allocator, yet
+// it allocates: `push` grows the Vec with the allocator the Vec holds.
+fn outliers(s: [i64], limit: i64, out: *Vec<i64>) {
+    for x in s {
+        if x > limit {
+            out.push(x);
+        }
+    }
+}
+
+fn main(gpa: Gpa) -> i32 {
+    let samples = [12, 48, 51, 300, 47, 52, 49, 950, 50, 46];
+    println(f"score: {score(samples[..], 15)}");
+    let mut bins = [0, 0, 0, 0, 0];
+    histogram(samples[..], bins[..], 100);
+    println(f"histogram: {bins[0]} {bins[1]} {bins[2]} {bins[3]} {bins[4]}");
+    println(f"peak: {peak(samples[..]):?}, of none: {peak(samples[..0]):?}");
+    let mut out: Vec<i64> = Vec::new_in(gpa);
+    defer out.free();
+    outliers(samples[..], 100, &out);
+    println(f"outliers: {out:?}");
+    0
+}

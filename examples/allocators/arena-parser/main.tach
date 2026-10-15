@@ -1,0 +1,339 @@
+// A tokenizer and a recursive-descent parser for arithmetic in
+// S-expressions, `(+ 1 (* 2 3) (max 4 5))`, building a tree whose every
+// list is a Vec of its children. The same generic code runs on two
+// allocators: the general-purpose one (`Gpa`: a malloc and a free per
+// list) and an arena (`arena_scope`: a pointer bump per list, everything
+// freed at once when the scope ends). The results are compared and the
+// two are timed (on stderr).
+use std::{Buf, Fmt};
+import "time.h" as c;
+
+// ---- Tokens ----
+
+enum Tok { Open, Close, Num(i64), Sym([u8]), End }
+
+// The tokenizer: one token at a time, at `pos` in src. A symbol is a view
+// of src (no copy): tokenizing allocates nothing.
+struct Lexer { src: [u8], pos: i64, start: i64 }
+
+impl Lexer {
+    fn next(self: *Lexer) -> Tok {
+        let src = self.src;
+        let mut i = self.pos;
+        while i < src.len && (src[i] == ' ' || src[i] == '\n') {
+            i += 1;
+        }
+        self.start = i;
+        if i == src.len {
+            self.pos = i;
+            return Tok::End;
+        }
+        let b = src[i];
+        let mut tok = Tok::Open;
+        if b == '(' {
+            i += 1;
+        } else if b == ')' {
+            tok = Tok::Close;
+            i += 1;
+        } else if b >= '0' && b <= '9' {
+            let mut n = 0;
+            while i < src.len && src[i] >= '0' && src[i] <= '9' {
+                n = n * 10 + (src[i] - '0') as i64;
+                i += 1;
+            }
+            tok = Tok::Num(n);
+        } else {
+            while i < src.len && src[i] != ' ' && src[i] != '(' && src[i] != ')' && src[i] != '\n' {
+                i += 1;
+            }
+            tok = Tok::Sym(src[self.start..i]);
+        }
+        self.pos = i;
+        tok
+    }
+}
+
+// ---- The tree ----
+
+const NUM: u8 = 0;
+const ADD: u8 = 1;
+const MUL: u8 = 2;
+const SUB: u8 = 3;
+const MAX: u8 = 4;
+
+// A number, or an operator applied to its children. The children are a
+// Vec on the tree's allocator: A is Gpa or an arena, chosen by the
+// caller, and the tree's type says which.
+struct Node<A: Allocator> { op: u8, num: i64, kids: Vec<Node<A>, A> }
+
+enum ParseError { Unexpected(i64), Unclosed, UnknownOp(i64), Empty }
+
+impl Display for ParseError {
+    fn fmt(self: *ParseError, f: *Fmt) {
+        match *self {
+            ParseError::Unexpected(at) => f.write(f"unexpected ')' at byte {at}"),
+            ParseError::Unclosed => f.str("a '(' is not closed"),
+            ParseError::UnknownOp(at) => f.write(f"no operator at byte {at}"),
+            ParseError::Empty => f.str("no expression"),
+        }
+    }
+}
+
+// The children of the lists being parsed wait on `stack`; a list's are
+// copied into a Vec of exactly their number when its ')' comes, so each
+// list is one allocation of the right size, on either allocator (an arena
+// cannot free a block that is not its last: a Vec grown by doubling
+// there would leave its old copies behind).
+struct Parser<A: Allocator> { lex: Lexer, a: A, stack: Vec<Node<A>, A>, lists: i64 }
+
+fn op_of(s: [u8]) -> u8 {
+    if s == "+" {
+        ADD
+    } else if s == "*" {
+        MUL
+    } else if s == "-" {
+        SUB
+    } else if s == "max" {
+        MAX
+    } else {
+        NUM
+    }
+}
+
+// expr = number | "(" op expr* ")", from the token t on.
+fn parse_expr<A: Allocator>(p: *Parser<A>, t: Tok) -> Result<Node<A>, ParseError> {
+    match t {
+        Tok::Num(n) => Ok(Node { op: NUM, num: n, kids: Vec::new_in(p.a) }),
+        Tok::Close => Err(ParseError::Unexpected(p.lex.start)),
+        Tok::Sym(_) => Err(ParseError::UnknownOp(p.lex.start)),
+        Tok::End => Err(ParseError::Unclosed),
+        Tok::Open => {
+            let op = match p.lex.next() {
+                Tok::Sym(s) => op_of(s),
+                _ => NUM,
+            };
+            if op == NUM {
+                return Err(ParseError::UnknownOp(p.lex.start));
+            }
+            let base = p.stack.len();
+            loop {
+                let next = p.lex.next();
+                match next {
+                    Tok::Close => {
+                        let waiting = p.stack.as_slice()[base..];
+                        let mut kids: Vec<Node<A>, A> = Vec::with_capacity_in(waiting.len, p.a);
+                        kids.extend_from_slice(waiting);
+                        p.stack.truncate(base);
+                        p.lists += 1;
+                        return Ok(Node { op: op, num: 0, kids: kids });
+                    }
+                    _ => {
+                        let kid = parse_expr(p, next)?;
+                        p.stack.push(kid);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The whole of src as one tree, every list on `a`; and the number of
+// lists (allocations).
+fn parse<A: Allocator>(src: [u8], a: A) -> Result<(Node<A>, i64), ParseError> {
+    let mut p = Parser {
+        lex: Lexer { src: src, pos: 0, start: 0 }, a: a, stack: Vec::new_in(a), lists: 0
+    };
+    defer p.stack.free();
+    let first = p.lex.next();
+    match first {
+        Tok::End => return Err(ParseError::Empty),
+        _ => {}
+    }
+    let mut tree = match parse_expr(&p, first) {
+        Ok(t) => t,
+        Err(e) => {
+            // The lists finished before the error wait on the stack: on
+            // an allocator that frees block by block, they must be freed
+            // here, or they leak (an arena frees them with the rest).
+            for k in p.stack.iter() {
+                free_tree(&k);
+            }
+            return Err(e);
+        }
+    };
+    match p.lex.next() {
+        Tok::End => Ok((tree, p.lists)),
+        _ => {
+            free_tree(&tree);
+            Err(ParseError::Unexpected(p.lex.start))
+        }
+    }
+}
+
+// The value of a tree (arithmetic wraps). Walking needs no allocator.
+#[no_alloc]
+fn eval<A: Allocator>(n: *Node<A>) -> i64 {
+    if n.op == NUM {
+        return n.num;
+    }
+    let mut acc = if n.op == MUL { 1 } else { 0 };
+    let mut first = true;
+    for k in n.kids.iter() {
+        let v = eval(&k);
+        if n.op == ADD {
+            acc += v;
+        } else if n.op == MUL {
+            acc *= v;
+        } else if n.op == SUB {
+            acc = if first { v } else { acc - v };
+        } else if first || v > acc {
+            acc = v;
+        }
+        first = false;
+    }
+    acc
+}
+
+// Frees a tree on an allocator that frees block by block: every list's
+// Vec, children first. (On an arena this is unnecessary: the scope's end
+// frees everything at once.)
+fn free_tree<A: Allocator>(n: *Node<A>) {
+    let kids = n.kids.as_slice();
+    for i in 0..kids.len {
+        free_tree(&kids[i]);
+    }
+    n.kids.free();
+}
+
+// ---- Input and timing ----
+
+struct Rng { x: u64 }
+
+impl Rng {
+    fn below(self: *Rng, n: i64) -> i64 {
+        self.x = self.x * 6364136223846793005u64 + 1442695040888963407u64;
+        ((self.x >> 33) % (n as u64)) as i64
+    }
+}
+
+// A random expression of about 4^depth nodes.
+fn generate(out: *Buf, rng: *Rng, depth: i64) {
+    if depth == 0 || rng.below(8) == 0 {
+        out.push_int(rng.below(100));
+        return;
+    }
+    let ops = ["+", "*", "-", "max"];
+    out.push_str("(");
+    out.push_str(ops[rng.below(4)]);
+    for _ in 0..2 + rng.below(5) {
+        out.push_str(" ");
+        generate(out, rng, depth - 1);
+    }
+    out.push_str(")");
+}
+
+// Processor time in microseconds (C's clock(): CLOCKS_PER_SEC is a
+// million on POSIX systems).
+fn now_us() -> i64 {
+    unsafe { c::clock() as i64 }
+}
+
+fn main(gpa: Gpa) -> i32 {
+    // A small one first: its value, and two errors.
+    let small = "(+ 1 (* 2 3) (max 4 5) (- 10 1 2))";
+    let (mut t, _) = parse(small, gpa).unwrap();
+    println(f"{small} = {eval(&t)}");
+    free_tree(&t);
+    for bad in ["(+ 1 (* 2 3)", "(+ 1 2))", "(1 2)"] {
+        match parse(bad, gpa) {
+            Ok(_) => println(f"{bad}: parsed?"),
+            Err(e) => println(f"{bad}: {e}"),
+        }
+    }
+
+    // A large one: about 2 MB of text.
+    let mut src = Buf::new_in(gpa);
+    defer src.free();
+    let mut rng = Rng { x: 2026u64 };
+    src.push_str("(+");
+    for _ in 0..6 {
+        src.push_str(" ");
+        generate(&src, &rng, 9);
+    }
+    src.push_str(")");
+    let text = src.as_slice();
+
+    // Each way five times; the best time of each phase. Stdout gets
+    // what does not depend on the machine, stderr the times.
+    let mut on_gpa = Times::new();
+    let mut fresh = Times::new();
+    let mut kept = Times::new();
+    let mut values = [0, 0, 0];
+    let mut lists = 0;
+    let mut used = 0;
+    let mut arena = Arena::new_in(gpa);
+    for _ in 0..5 {
+        // Gpa: a malloc per list, a free per list.
+        let t0 = now_us();
+        let (mut tree, n) = parse(text, gpa).unwrap();
+        let t1 = now_us();
+        values[0] = eval(&tree);
+        let t2 = now_us();
+        free_tree(&tree);
+        on_gpa.add(t0, t1, t2, now_us());
+        lists = n;
+
+        // A fresh arena each time: a bump per list; at the scope's end
+        // its chunks go back to Gpa, all at once.
+        let mut t = [now_us(), 0, 0];
+        values[1] = arena_scope(gpa, |a| {
+            let (tree, _) = parse(text, a).unwrap();
+            t[1] = now_us();
+            let v = eval(&tree);
+            t[2] = now_us();
+            v
+        });
+        fresh.add(t[0], t[1], t[2], now_us());
+
+        // One arena kept for every round: a scope of it rewinds it at its
+        // end, keeping its chunks for the next round.
+        t[0] = now_us();
+        values[2] = arena.scope(|a| {
+            let (tree, _) = parse(text, a).unwrap();
+            t[1] = now_us();
+            used = a.used();
+            let v = eval(&tree);
+            t[2] = now_us();
+            v
+        });
+        kept.add(t[0], t[1], t[2], now_us());
+    }
+    unsafe { arena.free_all(); }
+    let same = values[0] == values[1] && values[1] == values[2];
+    println(f"input: {text.len} bytes, {lists} lists (one allocation each)");
+    println(f"value: {values[0]}, the same three ways: {same}");
+    println(f"the tree in the arena: {used / 1024} KB");
+    eprintln("                   parse     eval     free (best of 5, microseconds)");
+    on_gpa.show("Gpa");
+    fresh.show("arena_scope");
+    kept.show("Arena::scope");
+    0
+}
+
+struct Times { parse: i64, eval: i64, free: i64 }
+
+impl Times {
+    fn new() -> Times {
+        Times { parse: 1 << 62, eval: 1 << 62, free: 1 << 62 }
+    }
+
+    fn add(self: *Times, start: i64, parsed: i64, evaluated: i64, freed: i64) {
+        if parsed - start < self.parse { self.parse = parsed - start; }
+        if evaluated - parsed < self.eval { self.eval = evaluated - parsed; }
+        if freed - evaluated < self.free { self.free = freed - evaluated; }
+    }
+
+    fn show(self: *Times, name: [u8]) {
+        eprintln(f"{name:<14} {self.parse:>10} {self.eval:>8} {self.free:>8}");
+    }
+}
