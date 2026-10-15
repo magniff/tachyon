@@ -20,14 +20,23 @@
 // (the map gets a new key) or is freed. The functions taking C strings
 // are `unsafe fn`: the string must end with a NUL.
 
+// (0.16) Their effects declared: allocation, I/O, none.
 extern "C" {
+    #[effects(alloc(extern))]
     fn malloc(size: u64) -> *u8;
+    #[effects(alloc(extern))]
     fn realloc(p: *u8, size: u64) -> *u8;
+    #[effects(alloc(extern))]
     fn free(p: *u8);
+    #[effects(io)]
     fn write(fd: i32, data: *u8, count: u64) -> i64;
+    #[effects(io)]
     fn read(fd: i32, data: *u8, count: u64) -> i64;
+    #[effects(io, diverge)]
     fn exit(code: i32) -> !;
+    #[effects()]
     fn memcpy(dst: *u8, src: *u8, n: u64) -> *u8;
+    #[effects()]
     fn strlen(s: *u8) -> u64;
     // (0.16) What std's panic calls: its effect is `panic`, not the io of
     // writing a message and exiting (docs/design/effects-allocation.md
@@ -155,23 +164,32 @@ impl<T, A: Allocator> Vec<T, A> {
 
     // Room for `extra` more elements.
     pub fn reserve(self: *Vec<T, A>, extra: i64) {
-        if self.len + extra <= self.cap {
-            return;
+        if extra > self.cap - self.len && !self.reserve_more(extra) {
+            out_of_memory();
         }
-        let mut cap = if self.cap == 0 { 4 } else { self.cap * 2 };
-        while cap < self.len + extra {
-            cap *= 2;
+    }
+
+    // Grows to room for `extra` (more than it has) more elements: twice the
+    // capacity, or more when needed; false when out of memory.
+    #[inline(never)]
+    fn reserve_more(self: *Vec<T, A>, extra: i64) -> bool {
+        if extra > ALLOC_LIMIT - self.len {
+            return false;
         }
-        // (try_resize and the check here, not resize: one call less at -O0)
+        let cap = grown_cap(self.cap, self.len + extra);
+        let bytes = alloc_bytes(cap, size_of(T));
+        if bytes < 0 {
+            return false;
+        }
         let p = unsafe {
-            self.alloc.try_resize(self.ptr as *u8, self.cap * size_of(T), cap * size_of(T),
-                align_of(T))
+            self.alloc.try_resize(self.ptr as *u8, self.cap * size_of(T), bytes, align_of(T))
         };
         if p == 0 as *u8 {
-            out_of_memory();
+            return false;
         }
         self.ptr = p as *T;
         self.cap = cap;
+        true
     }
 
     // Appends the elements of s, which may be a view of this Vec: when it
@@ -181,14 +199,18 @@ impl<T, A: Allocator> Vec<T, A> {
         let n = s.len;
         let mut old = 0 as *T;
         let mut old_cap = 0;
-        if self.len + n > self.cap {
-            let mut cap = if self.cap == 0 { 4 } else { self.cap * 2 };
-            while cap < self.len + n {
-                cap *= 2;
+        if n > self.cap - self.len {
+            let mut cap = -1;
+            if n <= ALLOC_LIMIT - self.len {
+                cap = grown_cap(self.cap, self.len + n);
+            }
+            let bytes = alloc_bytes(cap, size_of(T));
+            if bytes < 0 {
+                out_of_memory();
             }
             old = self.ptr;
             old_cap = self.cap;
-            let p = self.alloc.try_alloc(cap * size_of(T), align_of(T));
+            let p = self.alloc.try_alloc(bytes, align_of(T));
             if p == 0 as *u8 {
                 out_of_memory();
             }
@@ -212,8 +234,8 @@ impl<T, A: Allocator> Vec<T, A> {
     }
 
     pub fn push(self: *Vec<T, A>, x: T) {
-        if self.len == self.cap {
-            self.reserve(1);
+        if self.len == self.cap && !self.reserve_more(1) {
+            out_of_memory();
         }
         unsafe {
             self.ptr[self.len] = x;
@@ -259,10 +281,10 @@ impl<T, A: Allocator> Vec<T, A> {
         }
         self.push(x);
         let s = self.as_slice();
-        let mut k = s.len - 1;
-        while k > i {
+        let last = s.len - 1;
+        for d in 0..last - i {
+            let k = last - d;
             s[k] = s[k - 1];
-            k -= 1;
         }
         s[i] = x;
     }
@@ -323,6 +345,41 @@ impl<T, A: Allocator + Ambient> Vec<T, A> {
     }
 }
 
+// ---- Vec's room and allocator (0.16) ----
+
+impl<T, A: Allocator> Vec<T, A> {
+    // The elements it has room for (0.16).
+    pub fn capacity(self: *Vec<T, A>) -> i64 {
+        self.cap
+    }
+
+    // Its allocator (0.16): a copy of the handle.
+    pub fn allocator(self: *Vec<T, A>) -> A {
+        self.alloc
+    }
+
+    // Room for `extra` more elements, or Err when out of memory, the Vec
+    // as it was (0.16).
+    pub fn try_reserve(self: *Vec<T, A>, extra: i64) -> Result<(), AllocError> {
+        if extra > self.cap - self.len && !self.reserve_more(extra) {
+            return Result::Err(AllocError::OutOfMemory);
+        }
+        Result::Ok(())
+    }
+
+    // push, or Err when out of memory, the Vec as it was (0.16).
+    pub fn try_push(self: *Vec<T, A>, x: T) -> Result<(), AllocError> {
+        if self.len == self.cap && !self.reserve_more(1) {
+            return Result::Err(AllocError::OutOfMemory);
+        }
+        unsafe {
+            self.ptr[self.len] = x;
+        }
+        self.len += 1;
+        Result::Ok(())
+    }
+}
+
 // ---- Buf ----
 
 // A growable buffer of bytes, for building text (0.16: on allocator A).
@@ -350,28 +407,21 @@ impl<A: Allocator> Buf<A> {
 
     // A C string (up to its NUL).
     pub unsafe fn push_cstr(self: *Buf<A>, s: *u8) {
-        let mut n = 0;
-        while s[n] != 0 {
-            n += 1;
-        }
-        self.bytes.extend_from_slice(s[0..n]);
+        self.bytes.extend_from_slice(s[0..strlen(s) as i64]);
     }
 
     // The decimal digits of v.
     pub fn push_int(self: *Buf<A>, v: i64) {
-        if v < 0 {
-            self.push('-');
-            if v == -9223372036854775807 - 1 {
-                self.push_str("9223372036854775808");
-                return;
-            }
-            self.push_int(-v);
-            return;
+        let negative = v < 0;
+        let u = if negative { (-(v + 1)) as u64 + 1 } else { v as u64 };
+        let n = if negative { decimal_len(u) + 1 } else { decimal_len(u) };
+        if n > self.bytes.cap - self.bytes.len {
+            self.bytes.reserve(n);
         }
-        if v >= 10 {
-            self.push_int(v / 10);
+        unsafe {
+            put_decimal(&self.bytes.ptr[self.bytes.len], n, u, negative);
         }
-        self.push('0' + (v % 10) as u8);
+        self.bytes.len += n;
     }
 
     pub fn as_slice(self: *Buf<A>) -> [u8] {
@@ -391,6 +441,75 @@ impl<A: Allocator + Ambient> Buf<A> {
     #[ambient("Buf::new_in(gpa)")]
     pub fn new() -> Buf<A> {
         Buf { bytes: Vec::new_in(A::ambient()) }
+    }
+}
+
+// The number of decimal digits of u.
+#[inline]
+fn decimal_len(u: u64) -> i64 {
+    let mut n = 1;
+    let mut ten: u64 = 10;
+    for _ in 1..20 {
+        if u < ten {
+            break;
+        }
+        n += 1;
+        ten *= 10;
+    }
+    n
+}
+
+// u's decimal digits in p[0..n] (n: decimal_len(u), one more when
+// negative: after a '-'), two at a time. Unsafe: p has n bytes.
+#[inline]
+unsafe fn put_decimal(p: *u8, n: i64, u: u64, negative: bool) {
+    let pairs = "00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899";
+    let mut x = u;
+    let mut i = n;
+    for _ in 0..10 {
+        if x < 100 {
+            break;
+        }
+        let q = x / 100;
+        let r = (x - q * 100) as i64 * 2;
+        i -= 2;
+        p[i] = pairs.ptr[r];
+        p[i + 1] = pairs.ptr[r + 1];
+        x = q;
+    }
+    if x >= 10 {
+        let r = x as i64 * 2;
+        p[i - 2] = pairs.ptr[r];
+        p[i - 1] = pairs.ptr[r + 1];
+    } else {
+        p[i - 1] = '0' + x as u8;
+    }
+    if negative {
+        p[0] = '-';
+    }
+}
+
+// ---- Buf's room and allocator (0.16) ----
+
+impl<A: Allocator> Buf<A> {
+    // An empty Buf on allocator a with room for cap bytes (0.16).
+    pub fn with_capacity_in(cap: i64, a: A) -> Buf<A> {
+        Buf { bytes: Vec::with_capacity_in(cap, a) }
+    }
+
+    // The bytes it has room for (0.16).
+    pub fn capacity(self: *Buf<A>) -> i64 {
+        self.bytes.cap
+    }
+
+    // Room for `extra` more bytes (0.16).
+    pub fn reserve(self: *Buf<A>, extra: i64) {
+        self.bytes.reserve(extra);
+    }
+
+    // Its allocator (0.16): a copy of the handle.
+    pub fn allocator(self: *Buf<A>) -> A {
+        self.bytes.alloc
     }
 }
 
@@ -591,13 +710,16 @@ impl Hash for [u8] {
 // order). An introsort: quicksort around the median of three, insertion
 // sort for short runs, heapsort where the quicksort goes too deep, so
 // O(n log n) comparisons at worst. A `cmp` that is not a total order
-// leaves s in some order, never out of bounds.
+// leaves s in some order, never out of bounds. (0.16: its loops are
+// counted, and the ranges left to sort are on a stack, not recursion: it
+// does not have the effect diverge.)
 pub fn sort<T: Ord>(s: [T]) {
     let mut depth = 0;
-    let mut n = s.len;
-    while n > 1 {
+    for k in 0..64 {
+        if (s.len >> k) <= 1 {
+            break;
+        }
         depth += 2;
-        n /= 2;
     }
     quicksort::<T>(s, 0, s.len, depth);
 }
@@ -605,15 +727,36 @@ pub fn sort<T: Ord>(s: [T]) {
 // Short runs are sorted by insertion.
 const SORT_SMALL: i64 = 24;
 
-// Sorts s[lo..hi]; below `depth` more partitions, by heapsort.
+// Sorts s[lo..hi]; below `depth` more partitions, by heapsort. Each
+// partition puts its pivot in place, sorts the shorter side next and
+// keeps the longer for later (at most 64 kept: each is at least twice as
+// long as the one sorted next).
+// (not inlined into sort's caller: its loops keep their registers)
+#[inline(never)]
 fn quicksort<T: Ord>(s: [T], lo: i64, hi: i64, depth: i64) {
     let mut lo = lo;
     let mut hi = hi;
     let mut depth = depth;
-    while hi - lo > SORT_SMALL {
-        if depth == 0 {
-            heapsort::<T>(s[lo..hi]);
-            return;
+    let mut kept_lo: [i64; 64] = [0; 64];
+    let mut kept_hi: [i64; 64] = [0; 64];
+    let mut kept_depth: [i64; 64] = [0; 64];
+    let mut kept = 0;
+    // (each round places a pivot or finishes a range: 2n + 1 at most)
+    for _ in 0..2 * (hi - lo) + 1 {
+        if hi - lo <= SORT_SMALL || depth == 0 {
+            if hi - lo <= SORT_SMALL {
+                insertion_sort::<T>(s, lo, hi);
+            } else {
+                heapsort::<T>(s[lo..hi]);
+            }
+            if kept == 0 {
+                return;
+            }
+            kept -= 1;
+            lo = kept_lo[kept];
+            hi = kept_hi[kept];
+            depth = kept_depth[kept];
+            continue;
         }
         depth -= 1;
         // The median of the first, middle and last elements, at lo.
@@ -633,13 +776,21 @@ fn quicksort<T: Ord>(s: [T], lo: i64, hi: i64, depth: i64) {
         let pivot = s[lo];
         let mut i = lo;
         let mut j = hi;
-        loop {
+        // (the scans read s unchecked: i < hi and lo < j <= hi - 1 by their
+        // counts, and hi <= s.len)
+        for _ in lo..hi {
             i += 1;
-            while i < hi && s[i] < pivot {
+            for _ in i..hi {
+                if !(unsafe { s.ptr[i] } < pivot) {
+                    break;
+                }
                 i += 1;
             }
             j -= 1;
-            while j > lo && pivot < s[j] {
+            for _ in lo..j {
+                if !(pivot < unsafe { s.ptr[j] }) {
+                    break;
+                }
                 j -= 1;
             }
             if i >= j {
@@ -648,28 +799,40 @@ fn quicksort<T: Ord>(s: [T], lo: i64, hi: i64, depth: i64) {
             swap::<T>(s, i, j);
         }
         swap::<T>(s, lo, j);
-        // The shorter side by recursion, the longer by the loop: a stack
-        // of O(log n).
-        if j - lo < hi - j - 1 {
-            quicksort::<T>(s, lo, j, depth);
-            lo = j + 1;
-        } else {
-            quicksort::<T>(s, j + 1, hi, depth);
-            hi = j;
+        // The shorter side next, the longer kept.
+        if kept == 64 {
+            // (not reached: see above)
+            heapsort::<T>(s[lo..hi]);
+            hi = lo;
+            continue;
         }
+        kept_depth[kept] = depth;
+        if j - lo < hi - j - 1 {
+            kept_lo[kept] = j + 1;
+            kept_hi[kept] = hi;
+            hi = j;
+        } else {
+            kept_lo[kept] = lo;
+            kept_hi[kept] = j;
+            lo = j + 1;
+        }
+        kept += 1;
     }
-    insertion_sort::<T>(s, lo, hi);
 }
 
 fn insertion_sort<T: Ord>(s: [T], lo: i64, hi: i64) {
     for i in lo + 1..hi {
         let x = s[i];
-        let mut j = i;
-        while j > lo && x < s[j - 1] {
+        let mut at = lo;
+        for d in 0..i - lo {
+            let j = i - d;
+            if !(x < s[j - 1]) {
+                at = j;
+                break;
+            }
             s[j] = s[j - 1];
-            j -= 1;
         }
-        s[j] = x;
+        s[at] = x;
     }
 }
 
@@ -681,14 +844,11 @@ fn swap<T>(s: [T], i: i64, j: i64) {
 
 fn heapsort<T: Ord>(s: [T]) {
     let n = s.len;
-    let mut start = n / 2;
-    while start > 0 {
-        start -= 1;
-        sift_down::<T>(s, start, n);
+    for k in 0..n / 2 {
+        sift_down::<T>(s, n / 2 - 1 - k, n);
     }
-    let mut end = n;
-    while end > 1 {
-        end -= 1;
+    for k in 1..n {
+        let end = n - k;
         let top = s[0];
         s[0] = s[end];
         s[end] = top;
@@ -696,9 +856,10 @@ fn heapsort<T: Ord>(s: [T]) {
     }
 }
 
+// (the root's index at least doubles each round: 64 at most)
 fn sift_down<T: Ord>(s: [T], start: i64, end: i64) {
     let mut root = start;
-    loop {
+    for _ in 0..64 {
         let mut child = 2 * root + 1;
         if child >= end {
             return;
@@ -747,19 +908,21 @@ const STABLE_RUN: i64 = 16;
 pub fn sort_stable_by_in<T, F: FnMut(*T, *T) -> i64, A: Allocator>(s: [T], f: F, a: A) {
     let mut g = f;
     let n = s.len;
-    let mut lo = 0;
-    while lo < n {
+    for r in 0..(n + STABLE_RUN - 1) / STABLE_RUN {
+        let lo = r * STABLE_RUN;
         let hi = if lo + STABLE_RUN < n { lo + STABLE_RUN } else { n };
         for i in lo + 1..hi {
             let x = s[i];
             let mut j = i;
-            while j > lo && g(&x, &s[j - 1]) < 0 {
+            for _ in lo..i {
+                if !(g(&x, &s[j - 1]) < 0) {
+                    break;
+                }
                 s[j] = s[j - 1];
                 j -= 1;
             }
             s[j] = x;
         }
-        lo = hi;
     }
     if n <= STABLE_RUN {
         return;
@@ -769,15 +932,22 @@ pub fn sort_stable_by_in<T, F: FnMut(*T, *T) -> i64, A: Allocator>(s: [T], f: F,
     let mut from = s;
     let mut to = unsafe { buf.ptr[0..n] };
     let mut width = STABLE_RUN;
-    while width < n {
-        let mut lo = 0;
-        while lo < n {
+    // (the width doubles each round: 62 at most)
+    for _ in 0..62 {
+        if width >= n {
+            break;
+        }
+        for p in 0..(n + 2 * width - 1) / (2 * width) {
+            let lo = p * 2 * width;
             let mid = if lo + width < n { lo + width } else { n };
             let hi = if mid + width < n { mid + width } else { n };
             let mut i = lo;
             let mut j = mid;
             let mut k = lo;
-            while i < mid && j < hi {
+            for _ in lo..hi {
+                if i >= mid || j >= hi {
+                    break;
+                }
                 // (the left run's element first when they are equal)
                 if g(&from[j], &from[i]) < 0 {
                     to[k] = from[j];
@@ -788,17 +958,14 @@ pub fn sort_stable_by_in<T, F: FnMut(*T, *T) -> i64, A: Allocator>(s: [T], f: F,
                 }
                 k += 1;
             }
-            while i < mid {
-                to[k] = from[i];
-                i += 1;
+            for ii in i..mid {
+                to[k] = from[ii];
                 k += 1;
             }
-            while j < hi {
-                to[k] = from[j];
-                j += 1;
+            for jj in j..hi {
+                to[k] = from[jj];
                 k += 1;
             }
-            lo = hi;
         }
         let t = from;
         from = to;
@@ -851,7 +1018,8 @@ impl<K: Hash + Eq, V, A: Allocator> HashMap<K, V, A> {
         }
         let mask = self.cap - 1;
         let mut i = (key.hash() & mask as u64) as i64;
-        loop {
+        // (a quarter of the slots at least are free: one ends the search)
+        for _ in 0..self.cap {
             let state = unsafe { self.states[i] };
             if state == SLOT_FREE {
                 return -1;
@@ -861,6 +1029,7 @@ impl<K: Hash + Eq, V, A: Allocator> HashMap<K, V, A> {
             }
             i = (i + 1) & mask;
         }
+        -1
     }
 
     pub fn contains(self: *HashMap<K, V, A>, key: K) -> bool {
@@ -919,7 +1088,10 @@ impl<K: Hash + Eq, V, A: Allocator> HashMap<K, V, A> {
         }
         let mask = self.cap - 1;
         let mut j = (key.hash() & mask as u64) as i64;
-        while unsafe { self.states[j] } == SLOT_FULL {
+        for _ in 0..self.cap {
+            if unsafe { self.states[j] } != SLOT_FULL {
+                break;
+            }
             j = (j + 1) & mask;
         }
         unsafe {
@@ -968,17 +1140,24 @@ impl<K: Hash + Eq, V, A: Allocator> HashMap<K, V, A> {
     // Twice the room (at least 8 slots), the entries moved over and the
     // removed ones dropped.
     fn rehash(self: *HashMap<K, V, A>) {
+        self.rehash_to(if self.cap == 0 { 8 } else { self.cap * 2 });
+    }
+
+    // The entries moved to `cap` slots (a power of two, more than 4/3 of
+    // len), the removed ones dropped.
+    fn rehash_to(self: *HashMap<K, V, A>, cap: i64) {
         let old_cap = self.cap;
         let old_keys = self.keys;
         let old_values = self.values;
         let old_states = self.states;
-        let mut cap = if old_cap == 0 { 8 } else { old_cap * 2 };
-        while self.len * 2 > cap {
-            cap *= 2;
+        let key_bytes = alloc_bytes(cap, size_of(K));
+        let value_bytes = alloc_bytes(cap, size_of(V));
+        if key_bytes < 0 || value_bytes < 0 || cap > ALLOC_LIMIT {
+            out_of_memory();
         }
         unsafe {
-            self.keys = self.alloc.try_alloc(cap * size_of(K), align_of(K)) as *K;
-            self.values = self.alloc.try_alloc(cap * size_of(V), align_of(V)) as *V;
+            self.keys = self.alloc.try_alloc(key_bytes, align_of(K)) as *K;
+            self.values = self.alloc.try_alloc(value_bytes, align_of(V)) as *V;
             self.states = self.alloc.try_alloc(cap, 1);
             if self.keys == 0 as *K || self.values == 0 as *V || self.states == 0 as *u8 {
                 out_of_memory();
@@ -997,7 +1176,10 @@ impl<K: Hash + Eq, V, A: Allocator> HashMap<K, V, A> {
             let key = unsafe { old_keys[i] };
             let mut j = (key.hash() & mask as u64) as i64;
             unsafe {
-                while self.states[j] == SLOT_FULL {
+                for _ in 0..cap {
+                    if self.states[j] != SLOT_FULL {
+                        break;
+                    }
                     j = (j + 1) & mask;
                 }
                 self.states[j] = SLOT_FULL;
@@ -1032,5 +1214,34 @@ impl<K: Hash + Eq, V, A: Allocator + Ambient> HashMap<K, V, A> {
     #[ambient("HashMap::new_in(gpa)")]
     pub fn new() -> HashMap<K, V, A> {
         HashMap::new_in(A::ambient())
+    }
+}
+
+// ---- HashMap's room (0.16) ----
+
+impl<K: Hash + Eq, V, A: Allocator> HashMap<K, V, A> {
+    // Its allocator (0.16): a copy of the handle.
+    pub fn allocator(self: *HashMap<K, V, A>) -> A {
+        self.alloc
+    }
+
+    // An empty map on allocator a with room for n entries (0.16).
+    pub fn with_capacity_in(n: i64, a: A) -> HashMap<K, V, A> {
+        let mut m: HashMap<K, V, A> = HashMap::new_in(a);
+        if n > 0 {
+            if n > ALLOC_LIMIT / 8 {
+                out_of_memory();
+            }
+            // (slots: a power of two, 8 at least, n at most 3/4 of them)
+            let mut cap = 8;
+            for _ in 0..62 {
+                if n * 4 <= cap * 3 {
+                    break;
+                }
+                cap *= 2;
+            }
+            m.rehash_to(cap);
+        }
+        m
     }
 }

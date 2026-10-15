@@ -138,10 +138,10 @@ main.tach:19:5: error[type error] function 'roster::enrol' expects 2 arguments, 
 main.tach:20:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3
 [exit 1]
 $ tachyonc query show roster::enrol
-// crate::roster::enrol	roster.tach:16-19	effects: alloc(Gpa) panic diverge
+// crate::roster::enrol	roster.tach:16-19	effects: alloc(Gpa) panic
 // A student with no scores yet.
 pub fn enrol(r: *Roster, name: [u8]) {
-    r.students.push(Student { name: name, scores: Vec::new_in(r.students.alloc) });
+    r.students.push(Student { name: name, scores: Vec::new_in(r.students.allocator()) });
 }
 warning query.program-errors: 4 errors in the program; results may be incomplete
 try: tachyonc --diagnostics=short main.tach -c -o /dev/null
@@ -158,7 +158,7 @@ $ tachyonc edit apply --show <<'EOF'
 > @@ roster::enrol
 > // A student and their scores so far.
 > pub fn enrol(r: *Roster, name: [u8], scores: [i64]) {
->     let mut v: Vec<i64> = Vec::new_in(r.students.alloc);
+>     let mut v: Vec<i64> = Vec::new_in(r.students.allocator());
 >     v.extend_from_slice(scores);
 >     r.students.push(Student { name: name, scores: v });
 > }
@@ -180,7 +180,7 @@ applied 2 blocks: replaced crate::roster::enrol; inserted after crate::roster::e
 // roster.tach:16-33
 16	// A student and their scores so far.
 17	pub fn enrol(r: *Roster, name: [u8], scores: [i64]) {
-18	    let mut v: Vec<i64> = Vec::new_in(r.students.alloc);
+18	    let mut v: Vec<i64> = Vec::new_in(r.students.allocator());
 19	    v.extend_from_slice(scores);
 20	    r.students.push(Student { name: name, scores: v });
 21	}

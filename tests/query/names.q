@@ -25,7 +25,7 @@ $ show geom.tach:16:9 clash/main.tach:33 --root clash/main.tach
     pub fn len(self: *V2) -> i64 {
         self.x * self.x + self.y * self.y
     }
-// crate::main	clash/main.tach:30-52	effects: alloc(Gpa) io panic diverge unsafe
+// crate::main	clash/main.tach:30-52	effects: alloc(Gpa) io panic unsafe
 fn main(gpa: Gpa) -> i32 {
     let helper = 3;
     let n = a_helper() + b::helper() + helper;

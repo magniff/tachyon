@@ -11,7 +11,8 @@
 //
 // Sizes and alignments are in bytes; an alignment is a power of two from 1
 // to 4096. Running out of memory, or misusing an allocator, stops the
-// program (exit 101): part of the effect `alloc`, not `panic`.
+// program (exit 101): part of the effect `alloc`, not `panic`. A size
+// above ALLOC_LIMIT (2^62 bytes) is out of memory.
 
 pub trait Allocator {
     // size bytes aligned to align, null when out of memory; size 0: aligned,
@@ -47,10 +48,47 @@ pub trait Allocator {
     }
 }
 
+// What the try_ functions of containers return when out of memory
+// (`v.try_push(x)`, `v.try_reserve(n)`).
+pub enum AllocError { OutOfMemory }
+
+impl Display for AllocError {
+    fn fmt(self: *AllocError, f: *Fmt) {
+        f.str("out of memory");
+    }
+}
+
+impl Debug for AllocError {
+    fn fmt_debug(self: *AllocError, f: *Fmt) {
+        f.str("OutOfMemory");
+    }
+}
+
+// The largest allocation: 2^62 bytes (a size above it is out of memory).
+pub const ALLOC_LIMIT: i64 = 4611686018427387904;
+
 // Stops the program: an allocator is out of memory.
 #[cold]
 fn out_of_memory() -> ! {
     unsafe { panic(c"out of memory") }
+}
+
+// n elements of `size` bytes, in bytes; -1 when n is negative or that is
+// above ALLOC_LIMIT.
+#[inline]
+fn alloc_bytes(n: i64, size: i64) -> i64 {
+    if n < 0 || size > 0 && n > ALLOC_LIMIT / size {
+        return -1;
+    }
+    n * size
+}
+
+// The capacity a container grows to from cap for at least need elements:
+// twice cap (4 at least), or need when that is more.
+#[inline]
+fn grown_cap(cap: i64, need: i64) -> i64 {
+    let twice = if cap == 0 { 4 } else if cap < ALLOC_LIMIT / 2 { cap * 2 } else { ALLOC_LIMIT };
+    if twice < need { need } else { twice }
 }
 
 // ---- Gpa ----
@@ -64,147 +102,614 @@ fn out_of_memory() -> ! {
 #[sealed]
 pub struct Gpa {}
 
-// ---- Arenas (0.16; not implemented yet: T2) ----
-
-// The arenas' functions until they are made (0.16 T2): they stop the
-// program.
-#[cold]
-fn not_yet() -> ! {
-    unsafe { panic(c"arenas and FixedBuf are not implemented yet (0.16)") }
-}
-
-// What the try_ functions of containers return when out of memory (T2).
-pub enum AllocError { OutOfMemory }
+// ---- Arenas (0.16) ----
 
 // An arena: allocations bump a pointer through chunks taken from Gpa, and
-// are given back all at once. A handle: copies share the arena.
+// are given back all at once: when a scope ends (`a.scope(|s| ...)`,
+// `arena_scope(gpa, |s| ...)`), or by `reset` and `free_all` (unsafe: what
+// was allocated must not be used after). A request above 32 KB gets a
+// chunk of its own; the last block grows and shrinks in place; `free`
+// gives back the last block, and a chunk of its own. A handle: copies
+// share the arena. `Arena::none()`, a constant (for statics), has no
+// memory: allocating from it stops the program.
+//
+// (--check-alloc routes each block to its own pages at the points marked
+// "check-alloc", keeping the accounting: T3.)
 #[sealed]
 pub struct Arena { s: *ArenaState }
 
-// An arena's state, in its first chunk.
-struct ArenaState { base: *u8, used: i64, cap: i64, limit: i64, chunks: *u8 }
+// A chunk of an arena's memory, from Gpa: this header, then its bytes (the
+// first chunk's start with the arena's state).
+struct ArenaChunk { next: *ArenaChunk, size: i64 }
+
+// A block of its own (a request above ARENA_LARGE): this header, at
+// arena_large_head(align) bytes before the block, in a list both ways.
+struct ArenaLarge { next: *ArenaLarge, prev: *ArenaLarge, size: i64, align: i64 }
+
+// The state of an arena, in its first chunk, or of a scope, on the stack
+// of the scope's function. Addresses are i64s; ptr..limit is where the
+// next block goes (limit is 0 while the arena is lent to a scope).
+struct ArenaState {
+    ptr: i64,
+    limit: i64,
+    // the current chunk, its first byte and its end
+    chunk: *ArenaChunk,
+    start: i64,
+    end: i64,
+    // the last block (it grows in place), -1: none
+    last: i64,
+    // the bytes used in the chunks before the current one
+    before: i64,
+    lent: bool,
+    // the arena's own state (itself for an Arena; for a scope, its arena's)
+    root: *ArenaState,
+    // a scope's: the arena's blocks of their own when it started
+    large_mark: *ArenaLarge,
+    // the root's: its chunks, its blocks of their own, the bytes of these,
+    // the bytes taken from Gpa, the size of the next chunk
+    first: *ArenaChunk,
+    large: *ArenaLarge,
+    large_bytes: i64,
+    chunk_bytes: i64,
+    next_size: i64,
+}
+
+// Requests above this get a chunk of their own.
+const ARENA_LARGE: i64 = 32768;
+// The first chunk's bytes (Arena::new_in), the first next chunk's (a
+// request up to ARENA_LARGE, aligned, fits in any), the largest.
+const ARENA_FIRST: i64 = 8192;
+const ARENA_NEXT: i64 = 65536;
+const ARENA_MAX_CHUNK: i64 = 4194304;
+const ARENA_CHUNK_HEAD: i64 = 16;
+const ARENA_ALIGN_MAX: i64 = 4096;
+
+// A block's bytes from state s: the bump (an Arena's and a ScopedArena's
+// try_alloc), inlined where they are called; the rest (a new chunk, a
+// block of its own, Arena::none(), a lent arena) out of line and cold.
+#[inline]
+fn arena_alloc(s: *ArenaState, size: i64, align: i64) -> *u8 {
+    unsafe {
+        if s != 0 as *ArenaState {
+            let p = (s.ptr + align - 1) & -align;
+            let e = p + size;
+            if (size as u64) <= (ARENA_LARGE as u64) && p >= s.ptr && e <= s.limit {
+                s.ptr = e;
+                s.last = p;
+                // (check-alloc: the block's own pages here)
+                return p as *u8;
+            }
+        }
+        arena_alloc_slow(s, size, align)
+    }
+}
+
+// Whether align is an alignment: a power of two from 1 to 4096.
+fn arena_align_ok(align: i64) -> bool {
+    align >= 1 && align <= ARENA_ALIGN_MAX && (align & (align - 1)) == 0
+}
+
+// arena_alloc when the bump does not fit: a block of its own, or the next
+// chunk (a new one when there is none).
+#[cold]
+#[inline(never)]
+unsafe fn arena_alloc_slow(s: *ArenaState, size: i64, align: i64) -> *u8 {
+    arena_usable(s);
+    if size < 0 || size > ALLOC_LIMIT || !arena_align_ok(align) {
+        return 0 as *u8;
+    }
+    if size > ARENA_LARGE {
+        return arena_large_alloc(s.root, size, align);
+    }
+    let mut c = s.chunk.next;
+    if c == 0 as *ArenaChunk {
+        c = arena_new_chunk(s.root, s.chunk);
+        if c == 0 as *ArenaChunk {
+            return 0 as *u8;
+        }
+    }
+    s.before += s.ptr - s.start;
+    s.chunk = c;
+    s.start = c as i64 + ARENA_CHUNK_HEAD;
+    s.end = c as i64 + c.size;
+    s.limit = s.end;
+    s.ptr = s.start;
+    s.last = -1;
+    // (a request up to ARENA_LARGE, aligned, fits in any next chunk)
+    arena_alloc(s, size, align)
+}
+
+// Stops the program unless s is an arena that can allocate: not
+// Arena::none(), not lent to a scope.
+unsafe fn arena_usable(s: *ArenaState) {
+    if s == 0 as *ArenaState {
+        panic(c"the arena has no memory: it is Arena::none()");
+    }
+    if s.lent {
+        panic(c"the arena is lent to a scope: allocate from the scope's arena");
+    }
+}
+
+// A new chunk from Gpa, after chunk `after` in root's list; null when out
+// of memory.
+unsafe fn arena_new_chunk(root: *ArenaState, after: *ArenaChunk) -> *ArenaChunk {
+    let size = root.next_size;
+    let g = Gpa {};
+    let c = g.try_alloc(size, 16) as *ArenaChunk;
+    if c == 0 as *ArenaChunk {
+        return c;
+    }
+    c.size = size;
+    c.next = after.next;
+    after.next = c;
+    root.chunk_bytes += size;
+    if size < ARENA_MAX_CHUNK {
+        root.next_size = size * 2;
+    }
+    c
+}
+
+// The bytes of a block of its own before it: its header, or the
+// alignment when that is more.
+fn arena_large_head(align: i64) -> i64 {
+    if align > 32 { align } else { 32 }
+}
+
+// A block of its own of size bytes from Gpa, at the front of root's list.
+unsafe fn arena_large_alloc(root: *ArenaState, size: i64, align: i64) -> *u8 {
+    let head = arena_large_head(align);
+    let g = Gpa {};
+    let c = g.try_alloc(head + size, if align > 16 { align } else { 16 });
+    if c == 0 as *u8 {
+        return c;
+    }
+    let p = &c[head];
+    let h = (&p[-32]) as *ArenaLarge;
+    h.size = size;
+    h.align = align;
+    h.prev = 0 as *ArenaLarge;
+    h.next = root.large;
+    if root.large != 0 as *ArenaLarge {
+        root.large.prev = h;
+    }
+    root.large = h;
+    root.large_bytes += size;
+    root.chunk_bytes += head + size;
+    p
+}
+
+// Gives back block p, of its own, of root.
+unsafe fn arena_large_free(root: *ArenaState, p: *u8) {
+    let h = (&p[-32]) as *ArenaLarge;
+    let head = arena_large_head(h.align);
+    if h.prev == 0 as *ArenaLarge {
+        root.large = h.next;
+    } else {
+        h.prev.next = h.next;
+    }
+    if h.next != 0 as *ArenaLarge {
+        h.next.prev = h.prev;
+    }
+    root.large_bytes -= h.size;
+    root.chunk_bytes -= head + h.size;
+    let g = Gpa {};
+    g.free(&p[-head], head + h.size, if h.align > 16 { h.align } else { 16 });
+}
+
+// Gives back the blocks of their own of root down to `mark` (the list's
+// front when a scope started), or all of them.
+unsafe fn arena_large_free_to(root: *ArenaState, mark: *ArenaLarge) {
+    for _ in 0..ALLOC_LIMIT {
+        let h = root.large;
+        if h == mark {
+            return;
+        }
+        arena_large_free(root, &(h as *u8)[32]);
+    }
+}
+
+// An Arena's or a ScopedArena's try_resize: the last block in place, a
+// block of its own with Gpa's resize, else moved.
+#[inline]
+unsafe fn arena_resize(s: *ArenaState, p: *u8, old_size: i64, new_size: i64, align: i64)
+    -> *u8 {
+    if s != 0 as *ArenaState && p as i64 == s.last && (new_size as u64) <= (ARENA_LARGE as u64)
+        && old_size <= ARENA_LARGE && p as i64 + new_size <= s.limit {
+        s.ptr = p as i64 + new_size;
+        return p;
+    }
+    arena_resize_slow(s, p, old_size, new_size, align)
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn arena_resize_slow(s: *ArenaState, p: *u8, old_size: i64, new_size: i64, align: i64)
+    -> *u8 {
+    arena_usable(s);
+    if new_size < 0 || new_size > ALLOC_LIMIT || !arena_align_ok(align) {
+        return 0 as *u8;
+    }
+    if old_size > ARENA_LARGE && new_size > ARENA_LARGE {
+        // (a block of its own stays one: resized by Gpa, relinked)
+        let root = s.root;
+        let h = (&p[-32]) as *ArenaLarge;
+        let head = arena_large_head(align);
+        let g = Gpa {};
+        let c = g.try_resize(&p[-head], head + old_size, head + new_size,
+            if align > 16 { align } else { 16 });
+        if c == 0 as *u8 {
+            return c;
+        }
+        let q = &c[head];
+        let k = (&q[-32]) as *ArenaLarge;
+        if k.prev == 0 as *ArenaLarge {
+            root.large = k;
+        } else {
+            k.prev.next = k;
+        }
+        if k.next != 0 as *ArenaLarge {
+            k.next.prev = k;
+        }
+        k.size = new_size;
+        root.large_bytes += new_size - old_size;
+        root.chunk_bytes += new_size - old_size;
+        return q;
+    }
+    let q = arena_alloc(s, new_size, align);
+    if q == 0 as *u8 {
+        return q;
+    }
+    let n = if old_size < new_size { old_size } else { new_size };
+    if n > 0 {
+        memcpy(q, p, n as u64);
+    }
+    arena_free(s, p, old_size);
+    q
+}
+
+// An Arena's or a ScopedArena's free: the last block goes back to the
+// bump, a block of its own to Gpa; any other waits for the arena's end.
+// Nothing while the arena is lent to a scope.
+#[inline]
+unsafe fn arena_free(s: *ArenaState, p: *u8, size: i64) {
+    if s == 0 as *ArenaState || s.lent {
+        return;
+    }
+    if size > ARENA_LARGE {
+        arena_large_free(s.root, p);
+    } else if p as i64 == s.last {
+        s.ptr = s.last;
+        s.last = -1;
+    }
+}
+
+// The bytes allocated from state s (blocks of their own included).
+unsafe fn arena_used(s: *ArenaState) -> i64 {
+    s.before + s.ptr - s.start + s.root.large_bytes
+}
 
 impl Allocator for Arena {
+    #[inline]
     fn try_alloc(self: *Arena, size: i64, align: i64) -> *u8 {
-        not_yet()
+        unsafe { arena_alloc(self.s, size, align) }
     }
 
+    #[inline]
     unsafe fn try_resize(self: *Arena, p: *u8, old_size: i64, new_size: i64, align: i64) -> *u8 {
-        not_yet()
+        arena_resize(self.s, p, old_size, new_size, align)
     }
 
+    #[inline]
     unsafe fn free(self: *Arena, p: *u8, size: i64, align: i64) {
-        not_yet()
+        arena_free(self.s, p, size);
     }
 }
 
 impl Arena {
-    pub fn new() -> Arena {
-        not_yet()
+    // A new arena, its chunks from gpa: the first of 8 KB, the next
+    // ones twice as large each up to 4 MB.
+    pub fn new_in(gpa: Gpa) -> Arena {
+        Arena::with_capacity_in(ARENA_FIRST, gpa)
     }
 
-    pub fn with_capacity(bytes: i64) -> Arena {
-        not_yet()
+    // A new arena with room for `bytes` in its first chunk.
+    pub fn with_capacity_in(bytes: i64, gpa: Gpa) -> Arena {
+        let head = ARENA_CHUNK_HEAD + size_of(ArenaState);
+        let room = if bytes < 0 { 0 } else { bytes };
+        if room > ALLOC_LIMIT - head {
+            out_of_memory();
+        }
+        let size = head + room;
+        unsafe {
+            let c = gpa.alloc(size, 16) as *ArenaChunk;
+            c.next = 0 as *ArenaChunk;
+            c.size = size;
+            let s = (c as i64 + ARENA_CHUNK_HEAD) as *ArenaState;
+            s.start = c as i64 + head;
+            s.ptr = s.start;
+            s.end = c as i64 + size;
+            s.limit = s.end;
+            s.chunk = c;
+            s.last = -1;
+            s.before = 0;
+            s.lent = false;
+            s.root = s;
+            s.large_mark = 0 as *ArenaLarge;
+            s.first = c;
+            s.large = 0 as *ArenaLarge;
+            s.large_bytes = 0;
+            s.chunk_bytes = size;
+            s.next_size = ARENA_NEXT;
+            Arena { s: s }
+        }
     }
 
-    // An arena that has no memory yet, a constant (for statics).
+    // An arena that has no memory, a constant (for statics: `static mut
+    // V: Vec<i64, Arena> = Vec::new_in(Arena::none());`, set up in main
+    // with `Arena::new_in(gpa)`). Allocating from it stops the program.
     pub fn none() -> Arena {
         Arena { s: 0 as *ArenaState }
     }
 
+    // The bytes allocated from the arena since it was made or reset.
     pub fn used(self: *Arena) -> i64 {
-        not_yet()
+        if self.s == 0 as *ArenaState { 0 } else { unsafe { arena_used(self.s) } }
     }
 
+    // The bytes the arena holds from Gpa: its chunks and blocks.
     pub fn chunk_bytes(self: *Arena) -> i64 {
-        not_yet()
+        if self.s == 0 as *ArenaState { 0 } else { unsafe { self.s.chunk_bytes } }
     }
 
     // Everything allocated from the arena is given back; its chunks are
-    // kept. Unsafe: what was allocated must not be used after.
+    // kept (blocks of their own go back to Gpa). Unsafe: what was
+    // allocated must not be used after.
     pub unsafe fn reset(self: *Arena) {
-        not_yet()
+        let s = self.s;
+        if s == 0 as *ArenaState {
+            return;
+        }
+        arena_usable(s);
+        arena_large_free_to(s, 0 as *ArenaLarge);
+        let c = s.first;
+        s.chunk = c;
+        s.start = c as i64 + ARENA_CHUNK_HEAD + size_of(ArenaState);
+        s.ptr = s.start;
+        s.end = c as i64 + c.size;
+        s.limit = s.end;
+        s.last = -1;
+        s.before = 0;
     }
 
-    // The arena's memory, chunks included, given back.
+    // The arena's memory, chunks included, given back to Gpa; this handle
+    // becomes Arena::none(). Unsafe: nothing allocated from it, and no
+    // copy of the handle, may be used after.
     pub unsafe fn free_all(self: *Arena) {
-        not_yet()
+        let s = self.s;
+        if s == 0 as *ArenaState {
+            return;
+        }
+        arena_usable(s);
+        arena_large_free_to(s, 0 as *ArenaLarge);
+        let g = Gpa {};
+        let mut c = s.first.next;
+        for _ in 0..ALLOC_LIMIT {
+            if c == 0 as *ArenaChunk {
+                break;
+            }
+            let next = c.next;
+            g.free(c as *u8, c.size, 16);
+            c = next;
+        }
+        let first = s.first;
+        g.free(first as *u8, first.size, 16);
+        self.s = 0 as *ArenaState;
     }
 
-    // f with a scope of this arena: what f allocates from the ScopedArena is
-    // given back when f returns. The arena is lent meanwhile.
+    // f with a scope of this arena: what f allocates from the ScopedArena
+    // it is given is given back when f returns. The arena is lent
+    // meanwhile: allocating from it stops the program. Nothing on the
+    // ScopedArena can leave f (#[scoped]).
     pub fn scope<R, F: FnMut(ScopedArena) -> R>(self: *Arena, f: F) -> R {
-        not_yet()
+        unsafe { arena_scope_of(self.s, f) }
     }
 }
 
-// An arena lent to a scope (arena_scope, Arena::scope): nothing allocated
-// from it outlives the scope.
+// An arena lent to a scope (arena_scope, Arena::scope): what is allocated
+// from it is given back when the scope ends, so nothing holding it can
+// leave the scope (#[scoped]: not returned, not captured by another
+// scope, not in a static).
 #[sealed]
 #[scoped]
 pub struct ScopedArena { s: *ArenaState, mark: i64 }
 
 impl Allocator for ScopedArena {
+    #[inline]
     fn try_alloc(self: *ScopedArena, size: i64, align: i64) -> *u8 {
-        not_yet()
+        unsafe { arena_alloc(self.s, size, align) }
     }
 
+    #[inline]
     unsafe fn try_resize(self: *ScopedArena, p: *u8, old_size: i64, new_size: i64, align: i64)
         -> *u8 {
-        not_yet()
+        arena_resize(self.s, p, old_size, new_size, align)
     }
 
+    #[inline]
     unsafe fn free(self: *ScopedArena, p: *u8, size: i64, align: i64) {
-        not_yet()
+        arena_free(self.s, p, size);
     }
 }
 
 impl ScopedArena {
+    // The bytes allocated from this scope.
     pub fn used(self: *ScopedArena) -> i64 {
-        not_yet()
+        unsafe { arena_used(self.s) - self.mark }
     }
 
+    // f with a scope of this one (lent meanwhile), as Arena::scope.
     pub fn scope<R, F: FnMut(ScopedArena) -> R>(self: *ScopedArena, f: F) -> R {
-        not_yet()
+        unsafe { arena_scope_of(self.s, f) }
     }
 }
 
-// f with a new arena, given back when f returns.
-pub fn arena_scope<R, F: FnMut(ScopedArena) -> R>(f: F) -> R {
-    not_yet()
+// f with a new arena, its chunks from gpa, given back when f returns.
+pub fn arena_scope<R, F: FnMut(ScopedArena) -> R>(gpa: Gpa, f: F) -> R {
+    let mut a = Arena::new_in(gpa);
+    // (arena_scope_of, not a.scope: the scoped check of a function passed
+    // by name is at the call of arena_scope, once)
+    unsafe {
+        let r = arena_scope_of(a.s, f);
+        a.free_all();
+        r
+    }
 }
 
-// An allocator in a fixed buffer of bytes (its count of bytes used in the
-// buffer's first 8 bytes).
+// f with a scope of the arena of state p: the scope's state starts where
+// p's is, p is lent (its limit 0) until f returns, then p's blocks of
+// their own made meanwhile go back.
+fn arena_scope_of<R, F: FnMut(ScopedArena) -> R>(p: *ArenaState, f: F) -> R {
+    let mut st = ArenaState {
+        ptr: 0, limit: 0, chunk: 0 as *ArenaChunk, start: 0, end: 0, last: -1, before: 0,
+        lent: false, root: 0 as *ArenaState, large_mark: 0 as *ArenaLarge,
+        first: 0 as *ArenaChunk, large: 0 as *ArenaLarge, large_bytes: 0, chunk_bytes: 0,
+        next_size: 0,
+    };
+    let mark = unsafe { arena_lend(p, &st) };
+    let mut g = f;
+    let r = g(ScopedArena { s: &st, mark: mark });
+    unsafe {
+        arena_unlend(p, &st);
+    }
+    r
+}
+
+// Lends the arena of state p to a scope of state st: st starts at p's
+// position, p is locked. Returns the bytes used at the start.
+unsafe fn arena_lend(p: *ArenaState, st: *ArenaState) -> i64 {
+    arena_usable(p);
+    st.ptr = p.ptr;
+    st.limit = p.limit;
+    st.chunk = p.chunk;
+    st.start = p.start;
+    st.end = p.end;
+    st.before = p.before;
+    st.root = p.root;
+    st.large_mark = p.root.large;
+    p.lent = true;
+    p.limit = 0;
+    arena_used(st)
+}
+
+// The scope of state st is over: its blocks of their own go back, and p,
+// where it was, is no longer lent (st's chunks are p's next ones).
+unsafe fn arena_unlend(p: *ArenaState, st: *ArenaState) {
+    arena_large_free_to(p.root, st.large_mark);
+    st.lent = true;
+    st.limit = 0;
+    p.lent = false;
+    p.limit = p.end;
+}
+
+// ---- FixedBuf (0.16) ----
+
+// An allocator in a fixed buffer of bytes: `FixedBuf::new(mem[..])` over an
+// array or a Vec's view, which must outlive it (not checked). Blocks bump
+// through it; when it is full, try_alloc is null (out of memory). Its
+// first 16 bytes (from the first one aligned to 8) hold the bytes used and
+// the last block, so copies of the handle share them.
 #[sealed]
 pub struct FixedBuf { base: *u8, cap: i64 }
 
+const FIXED_HEAD: i64 = 16;
+
 impl Allocator for FixedBuf {
+    #[inline]
     fn try_alloc(self: *FixedBuf, size: i64, align: i64) -> *u8 {
-        not_yet()
+        if self.cap == 0 || !arena_align_ok(align) {
+            return 0 as *u8;
+        }
+        unsafe {
+            let h = (&self.base[-FIXED_HEAD]) as *i64;
+            let b = self.base as i64;
+            let p = (b + h[0] + align - 1) & -align;
+            if size < 0 || size > ALLOC_LIMIT || p + size > b + self.cap {
+                return 0 as *u8;
+            }
+            h[0] = p + size - b;
+            h[1] = p;
+            // (check-alloc: the block's own pages here)
+            p as *u8
+        }
     }
 
+    #[inline]
     unsafe fn try_resize(self: *FixedBuf, p: *u8, old_size: i64, new_size: i64, align: i64)
         -> *u8 {
-        not_yet()
+        if self.cap == 0 || new_size < 0 || new_size > ALLOC_LIMIT {
+            return 0 as *u8;
+        }
+        let h = (&self.base[-FIXED_HEAD]) as *i64;
+        let b = self.base as i64;
+        if p as i64 == h[1] && p as i64 + new_size <= b + self.cap {
+            h[0] = p as i64 + new_size - b;
+            return p;
+        }
+        let q = self.try_alloc(new_size, align);
+        if q == 0 as *u8 {
+            return q;
+        }
+        let n = if old_size < new_size { old_size } else { new_size };
+        if n > 0 {
+            memcpy(q, p, n as u64);
+        }
+        q
     }
 
+    #[inline]
     unsafe fn free(self: *FixedBuf, p: *u8, size: i64, align: i64) {
-        not_yet()
+        if self.cap == 0 {
+            return;
+        }
+        let h = (&self.base[-FIXED_HEAD]) as *i64;
+        if p as i64 == h[1] {
+            h[0] = p as i64 - self.base as i64;
+            h[1] = -1;
+        }
     }
 }
 
 impl FixedBuf {
+    // An allocator in mem (its first 16 bytes, from the first one aligned
+    // to 8, are its own; a smaller mem has no room).
     pub fn new(mem: [u8]) -> FixedBuf {
-        not_yet()
+        let at = mem.ptr as i64;
+        let skip = ((at + 7) & -8) - at + FIXED_HEAD;
+        if mem.len <= skip {
+            return FixedBuf { base: 0 as *u8, cap: 0 };
+        }
+        unsafe {
+            let base = &mem.ptr[skip];
+            let h = (&base[-FIXED_HEAD]) as *i64;
+            h[0] = 0;
+            h[1] = -1;
+            FixedBuf { base: base, cap: mem.len - skip }
+        }
     }
 
+    // The bytes allocated from it.
     pub fn used(self: *FixedBuf) -> i64 {
-        not_yet()
+        if self.cap == 0 { 0 } else { unsafe { ((&self.base[-FIXED_HEAD]) as *i64)[0] } }
     }
 
+    // Its bytes, for allocating from it again. Unsafe: what was allocated
+    // must not be used after.
     pub unsafe fn reset(self: *FixedBuf) {
-        not_yet()
+        if self.cap != 0 {
+            let h = (&self.base[-FIXED_HEAD]) as *i64;
+            h[0] = 0;
+            h[1] = -1;
+        }
     }
 }
 

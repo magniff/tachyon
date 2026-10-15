@@ -53,7 +53,7 @@ not a number
 | moves, `Clone`, `Copy` | every value is copied by `=` and by calls (bitwise); no moves |
 | `Drop`, RAII, scope guards | `defer stmt;` runs when the block exits; std types have `free()` |
 | `Box<T>`, `Rc<T>`, `Arc<T>` | none: a `Vec<T>`, or `malloc` in `unsafe` |
-| `Vec::new()`, the global allocator | `Vec::new_in(gpa)`: allocation is explicit (0.16); `gpa: Gpa` comes from `fn main(gpa: Gpa)` and is passed down; `arena_scope(\|a\| ..)` (`guide allocators`) |
+| `Vec::new()`, the global allocator | `Vec::new_in(gpa)`: allocation is explicit (0.16); `gpa: Gpa` comes from `fn main(gpa: Gpa)` and is passed down; `arena_scope(gpa, \|a\| ..)` (`guide allocators`) |
 | `Option<&T>` | `Option<*T>`, or an index |
 | `&mut v[i]`, `m.get_mut(&k)` | `v.as_slice()[i].f = x`; `m.get_mut(k)`: an `Option<[V]>`, a view of one element (`a[0].f += 1`) |
 | `*m.entry(k).or_insert(0) += 1` | `m.get_or_insert(k, 0)[0] += 1` |

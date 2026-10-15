@@ -14,14 +14,14 @@ $ callees main --transitive --limit 3
 1	call	add_and_sum	calls016/main.tach:6
 1	call	apply	calls016/main.tach:21
 1	call	sum	calls016/main.tach:11
-note query.truncated: showing 3 of 29 callees
+note query.truncated: showing 3 of 19 callees
 try: tachyonc query callees main --transitive --all
 $ callees main
 1	call	add_and_sum	calls016/main.tach:6
 1	call	apply	calls016/main.tach:21
 1	call	sum	calls016/main.tach:11
 1	ref	twice	calls016/main.tach:25
-1	call	std::print_int	<std>:2150
+1	call	std::print_int	<std>:2402
 ## main reaches a borrow of TABLE (put takes it by pointer) and a write of
 ## a field of it; sum reaches neither.
 $ callees main --writes TABLE

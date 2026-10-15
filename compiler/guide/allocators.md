@@ -97,15 +97,15 @@ keep containers in `main` and pass them (or views of them) down.
 ## Arenas
 
 An arena allocates by bumping a pointer and frees everything at once.
-`arena_scope(|a| ...)` makes one, runs the closure with it, and frees
-all of it when the closure returns; nothing allocated from it may leave
+`arena_scope(gpa, |a| ...)` makes one (its memory from `gpa`), runs the
+closure with it, and frees all of it when the closure returns; nothing allocated from it may leave
 the closure (the compiler rejects a result or a capture that holds the
-`ScopedArena`). `Arena` is a handle kept longer, `a.scope(|s| ...)` a
-scope of it; `FixedBuf::new(mem)` allocates from memory you give it.
+`ScopedArena`). `Arena::new_in(gpa)` is a handle kept longer,
+`a.scope(|s| ...)` a scope of it; `FixedBuf::new(mem)` allocates from memory you give it.
 
 ```tach
-fn longest(words: [[u8]]) -> i64 {
-    arena_scope(|a| {
+fn longest(words: [[u8]], gpa: Gpa) -> i64 {
+    arena_scope(gpa, |a| {
         let mut lens: Vec<i64, ScopedArena> = Vec::new_in(a);
         for w in words { lens.push(w.len); }
         lens.iter().max().unwrap_or(0)        // an i64 leaves, the Vec does not
