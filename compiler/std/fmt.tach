@@ -77,30 +77,69 @@ pub fn eprintln<T: Display>(x: T) {
 // it): `format_in(f"{x:>8}", gpa)`. (0.16: up to 256 bytes, x's Display
 // runs once, into a buffer on the stack.)
 pub fn format_in<T: Display, A: Allocator>(x: T, a: A) -> Buf<A> {
-    let mut tmp: [u8; 256] = [0; 256];
-    let mut f = Fmt::to_fd(-1);
-    f.out = &tmp[0];
-    f.cap = 256;
     let mut b: Buf<A> = Buf::new_in(a);
+    let mut tmp: [u8; 256] = [0; 256];
+    let mut f = __fmt_tmp(&tmp);
     // (one call of x's Display in the code: first to tmp, then, when the
     // text did not fit, to b's room)
-    let mut in_buf = false;
     loop {
         x.fmt(&f);
-        if in_buf {
-            if fmt_end_vec(&b.bytes, &f) {
-                return b;
-            }
-        } else if f.need == 0 {
-            b.bytes.reserve(f.len);
-            b.bytes.extend_from_slice(tmp[0..f.len]);
+        if __fmt_in_end(&b, &f, &tmp) {
             return b;
-        } else {
-            b.bytes.reserve(f.need);
-            f = fmt_to_vec(&b.bytes);
-            in_buf = true;
         }
     }
+}
+
+// (0.17) What the compiler writes for an f-string passed straight to
+// format_in, push_fmt, print, println, eprint or eprintln
+// (front/check/interp.tach): the holes' values, then the writes of
+// the text in place, with no closure. `format_in(f"..", a)` is
+//
+//   { let __f0 = e0; ...; let __a = a; let mut __b = std::Buf::new_in(__a);
+//     let mut __t = [0u8; 256]; let mut __out = std::__fmt_tmp(&__t);
+//     loop { WRITES; if std::__fmt_in_end(&__b, &__out, &__t) { break; } }
+//     __b }
+//
+// and `b.push_fmt(f"..")` is `{ let __r = &b; let __f0 = e0; ...; let mut
+// __out = std::__buf_fmt(__r); loop { WRITES; if std::__buf_fmt_end(__r,
+// &__out) { break; } } }`. Not for programs to call.
+
+// A Fmt writing into tmp (format_in's first pass).
+#[inline]
+pub fn __fmt_tmp(tmp: *[u8; 256]) -> Fmt {
+    let mut f = Fmt::to_fd(-1);
+    f.out = &(*tmp)[0];
+    f.cap = 256;
+    f
+}
+
+// The end of a pass of format_in: the text written to tmp, when it fits,
+// copied to b, of its length (true); else b reserves the length and f
+// writes into b's room (false); after that pass, as __buf_fmt_end.
+pub fn __fmt_in_end<A: Allocator>(b: *Buf<A>, f: *Fmt, tmp: *[u8; 256]) -> bool {
+    if f.out != &(*tmp)[0] {
+        return fmt_end_vec(&b.bytes, f);
+    }
+    if f.need == 0 {
+        b.bytes.reserve(f.len);
+        b.bytes.extend_from_slice((*tmp)[0..f.len]);
+        return true;
+    }
+    b.bytes.reserve(f.need);
+    *f = fmt_to_vec(&b.bytes);
+    false
+}
+
+// A Fmt writing into b's room (push_fmt).
+#[inline]
+pub fn __buf_fmt<A: Allocator>(b: *Buf<A>) -> Fmt {
+    fmt_to_vec(&b.bytes)
+}
+
+// The text f wrote is b's (true), or did not fit: b grows, f starts again.
+#[inline]
+pub fn __buf_fmt_end<A: Allocator>(b: *Buf<A>, f: *Fmt) -> bool {
+    fmt_end_vec(&b.bytes, f)
 }
 
 #[ambient("format_in(x, gpa)")]
@@ -113,10 +152,10 @@ impl<A: Allocator> Buf<A> {
     // the Buf has; when the text does not fit, the Buf grows and x's
     // Display runs again.)
     pub fn push_fmt<T: Display>(self: *Buf<A>, x: T) {
-        let mut f = fmt_to_vec(&self.bytes);
+        let mut f = __buf_fmt(self);
         loop {
             x.fmt(&f);
-            if fmt_end_vec(&self.bytes, &f) {
+            if __buf_fmt_end(self, &f) {
                 return;
             }
         }
