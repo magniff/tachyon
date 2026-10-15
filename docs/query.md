@@ -802,6 +802,114 @@ $ tachyonc batch < cmds.txt        (query show clamp; query refs clamp --count)
   WORD): nothing runs. `error batch.usage`: the options, a FILE that
   cannot be read, a line that is no tool command (`## exit 2`).
 
+## test: build, run the cases, a summary (0.17)
+
+`tachyonc test [FILTER...] [ROOT.tach]` is the one verification command
+(docs/research/applying-to-tachyon.md, item 3): it builds what changed,
+runs the tests and ends with a summary whose first line is always the
+counts, then only the failing cases, each with a few lines of
+difference, within `--budget N` tokens (1,000; `--full`: every failure,
+40 lines each, no budget unless given). It never needs `| tail`.
+
+**A program** (ROOT, default `./main.tach`). A case is `tests/NAME.in`
+(its stdin; none: empty) with `tests/NAME.out` (the expected stdout) in
+ROOT's directory (`--dir DIR`: another), and `tests/NAME.exit`, when
+there, the expected exit status (default 0): the agent eval's own
+convention, and the one agents write by hand. Output is compared as the
+eval grades it: `\r\n` as `\n`, trailing whitespace at the end left out.
+The program is built into `.tachyonc/test/prog` next to ROOT when a
+`.tach` file under ROOT's directory is newer than the build, or the
+compiler or `-O` level differs; each run's stdout and stderr stay there
+(`NAME.got`, `NAME.err`). A case may run `--timeout S` seconds (10).
+
+```text
+$ tachyonc test --timeout 1
+test main.tach: 2 passed, 3 failed (tests/)
+FAIL bad: stdout differs at line 2 (3 lines expected, 3 printed)
+  - line 2: B
+  - line 3: c
+  + line 2: b
+  + line 3: c
+FAIL crash: exit 3 (expected 0)
+FAIL hang: no exit after 1 s (--timeout S)
+(outputs: .tachyonc/test/NAME.got, NAME.err)
+```
+
+A FILTER selects the cases whose name contains it. Without cases, the
+build alone (`test main.tach: builds; no tests in tests/ ...`), or one
+run on `--input FILE` (`-`: stdin): its exit status, its output within
+the budget, its stderr. A build that fails prints `test ROOT: does not
+build (N errors)` and the errors, one line each.
+
+**The tachyon tree** (`./compiler/src/main.tach` and `./tests/run.sh`,
+no ROOT): `compiler/std/embed.sh` when compiler/std is newer than its
+embedding; `target/tachyonc` rebuilt (one build, by
+`target/tools/tachyonc` when there; `bootstrap/bootstrap.sh --dev`
+checks the fixpoint) when a `.tach` file of compiler/src or compiler/std
+is newer; then `tests/run.sh [-O N] FILTER` once per FILTER (none: the
+whole suite), its `FAIL` blocks (8 lines each) and totals summarized:
+
+```text
+$ target/tachyonc test gvn inline
+test gvn inline: 40 passed, 1 failed (tests/run.sh; target/tachyonc rebuilt in 1.9 s; 7.31 s)
+FAIL run_gvn_loads:
+  stdout mismatch
+  ...
+```
+
+A FILTER that matches no case is named in the headline (`no case
+matches 'x'`). Exit status: 0 every case passed, 1 a failure or a build
+error, 2 a usage error (`test.usage`) or nothing to run (`test.no-root`).
+tests/refactor/testcmd.t has a transcript.
+
+## The agent hooks (0.17)
+
+tools/agent-hooks, registered in .claude/settings.json (and per
+condition in tools/agent-hooks/settings-eval.json for the agent eval):
+
+- **check-after-edit.py** (PostToolUse): `check --json` after every
+  Write or Edit of a `.tach` file, every `tachyonc edit|refactor|fix|
+  rewrite|undo` that wrote, and every shell command that writes a `.tach`
+  file (`> f.tach`, `tee`, `cp`, `mv`). The root and the compiler are
+  the command's own: a Bash line's `cd`s are followed (`cd WORKTREE &&
+  tachyonc edit ...` checks WORKTREE). After the session's first check
+  of a root it reports the delta: `tachyonc check main.tach: 2 errors (1
+  new, 1 fixed, 1 as before)` and only the new errors; `0 errors (2
+  fixed)` when it became clean; nothing when it was and is clean. After
+  a clean check of a program with tests (`tests/*.out`), `tachyonc test
+  ROOT --full --timeout 2` runs (not again within 20 s,
+  `$TACHYON_TEST_DEBOUNCE`; never again for a program whose tests took
+  over 8 s) and its line follows: the counts, the newly failing cases
+  with their differences, the fixed ones by name. TACHYON_CHECK_TESTS=0
+  leaves the tests out.
+- **turn-end.py** (Stop): when a root this session touched (or the
+  current directory's) changed since its last clean check and test run,
+  `check` (and the tests) once; errors or failures block the stop once,
+  with `turn-end: unchecked changes in main.tach: 2 errors` and the
+  errors as the reason. Never twice for the same sources.
+- **query-first.py** (PreToolUse, PostToolUse on Bash): blocks a shell
+  read of `.tach` source, judging each command of a line on its own (in
+  the directory its `cd`s lead to, `$VAR`s assigned on the line
+  expanded); a whole file under 300 lines is read freely with `cat`,
+  `head`, `tail`, `sed -n`; a larger one gets its length and `query items
+  MODULE`; a `.tach` file outside any program's module tree (a probe, a
+  scratch copy: not a main.tach, not declared by a `mod` line) is not
+  source. The blocked record logs the `try:` commands it gave. After a
+  call: a `# no-query:` reason asking for line numbers for the Edit tool
+  is answered with `edit insert --after NAME` and `query def NAME`; the
+  hints of tools/agent-hooks/hints.txt (`repeat-query` after show, refs
+  and def on one name; `unfamiliar-construct` from the check hook) are
+  printed as written there.
+
+The hooks keep a small per-session state ($TACHYON_HOOK_STATE, default
+$TMPDIR/tachyon-agent-hooks). Measured on an M-series Mac under load
+(load average 6 on 12 cores; medians, Python's start included): a Bash
+call that changes nothing, 46 ms in the check hook (45 before 0.17) and
+60 ms in query-first (as before); the check hook after an edit, 76 ms
+(62 before: the state and the fingerprint); with a build and the 10
+cases of the eval's 01-wordfreq, 180 ms; the turn-end hook with nothing
+to check, 60 ms.
+
 ## Known limits
 
 - In a generic function that is never instantiated, the references that

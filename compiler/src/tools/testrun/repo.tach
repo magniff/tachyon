@@ -1,0 +1,251 @@
+// `tachyonc test [FILTER...]` in the tachyon tree (0.17; testrun/mod.tach):
+// std embedded and target/tachyonc rebuilt when a source is newer, then
+// tests/run.sh once per FILTER, its FAIL blocks and totals summarized.
+use crate::base::{
+    IntVec, STDOUT, alloc_array, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
+    buf_write_fd,
+};
+use crate::front::cpp::directives::file_exists;
+use crate::tools::proc::{buf_cstr, rename_file};
+use crate::tools::query::diagnostics::{PROG, put_cword};
+use crate::tools::testrun::{
+    BUDGET, FILTERS, OPT, contains, detail_lines, line_end, newer_tach, now_ms, put_cut,
+    put_failures, put_lines, put_secs, run_words, starts,
+};
+
+// ---- The tachyon repository ----
+
+pub fn run_repo() -> i64 {
+    unsafe {
+        let t0 = now_ms();
+        let out = buf_new();
+        let notes = buf_new();
+        // std's embedding, then the dev compiler, when older than a source.
+        if newer_tach(c"compiler/std", 0 as *u8, c"compiler/src/front/stdsrc.tach") {
+            let log = buf_new();
+            if run_words(c"sh", c"compiler/std/embed.sh", 0 as *u8, 0 as *u8, 0 as *u8, 0 as *u8,
+                0 as *u8, log) != 0 {
+                buf_bytes(out, "test: compiler/std/embed.sh failed\n");
+                put_lines(out, buf_slice(log), 0, 20, "");
+                buf_write_fd(out, STDOUT);
+                return 1;
+            }
+            buf_bytes(notes, "; std embedded");
+        }
+        if !file_exists(c"target/tachyonc")
+            || newer_tach(c"compiler/src", c"compiler/std", c"target/tachyonc") {
+            let t1 = now_ms();
+            let builder = if file_exists(c"target/tools/tachyonc") {
+                c"target/tools/tachyonc"
+            } else if file_exists(c"target/tachyonc") {
+                c"target/tachyonc"
+            } else {
+                PROG
+            };
+            let log = buf_new();
+            let rc = run_words(builder, c"compiler/src/main.tach", c"-o", c"target/tachyonc.test~",
+                c"--diagnostics=short", 0 as *u8, 0 as *u8, log);
+            if rc != 0 || !rename_file(c"target/tachyonc.test~", c"target/tachyonc") {
+                buf_bytes(out, "test: target/tachyonc does not build (with ");
+                buf_str(out, builder);
+                buf_bytes(out, ")\n");
+                let l = buf_slice(log);
+                let mut i = 0;
+                while i < l.len {
+                    let e = line_end(l, i);
+                    if e > i {
+                        if buf_slice(out).len + (e - i) > BUDGET {
+                            buf_bytes(out, "(more: ");
+                            buf_str(out, builder);
+                            buf_bytes(out, " check)\n");
+                            break;
+                        }
+                        put_cut(out, "", l[i..e]);
+                    }
+                    i = e + 1;
+                }
+                buf_write_fd(out, STDOUT);
+                return 1;
+            }
+            buf_bytes(notes, "; target/tachyonc rebuilt in ");
+            put_secs(notes, now_ms() - t1);
+        }
+        let mut blocks = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut names = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let totals = alloc_array::<i64>(3);
+        totals[0] = 0;
+        totals[1] = 0;
+        totals[2] = 0;
+        let mut ran = false;
+        let unmatched = buf_new();
+        let runs = if FILTERS.count == 0 { 1 } else { FILTERS.count };
+        for k in 0..runs {
+            let filter = if FILTERS.count == 0 { 0 as *u8 } else { FILTERS.data[k] as *u8 };
+            let log = buf_new();
+            let rc = if OPT != 0 as *u8 {
+                let level = buf_new();
+                buf_byte(level, OPT[2]);
+                run_words(c"sh", c"tests/run.sh", c"-O", buf_cstr(level), filter, 0 as *u8,
+                    0 as *u8, log)
+            } else {
+                run_words(c"sh", c"tests/run.sh", filter, 0 as *u8, 0 as *u8, 0 as *u8, 0 as *u8,
+                    log)
+            };
+            if parse_run(buf_slice(log), totals, &blocks, &names) {
+                ran = true;
+            } else if rc == 2 && contains(buf_slice(log), "no cases match") {
+                buf_bytes(unmatched,
+                    if buf_slice(unmatched).len == 0 { " (no case matches" } else { "," });
+                put_cword(unmatched, filter);
+            } else {
+                // (no table: no case matched, or run.sh could not run)
+                let b = buf_new();
+                buf_bytes(b, "tests/run.sh");
+                if filter != 0 as *u8 {
+                    put_cword(b, filter);
+                }
+                buf_bytes(b, ": exit ");
+                buf_int(b, rc);
+                buf_byte(b, '\n');
+                let l = buf_slice(log);
+                let mut lines = 0;
+                let mut i = 0;
+                while i < l.len {
+                    let e = line_end(l, i);
+                    lines += 1;
+                    i = e + 1;
+                }
+                put_lines(b, l, if lines > 3 { lines - 3 } else { 0 }, 3, "  ");
+                blocks.push(b);
+                let n = buf_new();
+                buf_bytes(n, "run.sh");
+                names.push(n);
+            }
+        }
+        buf_bytes(out, "test");
+        for k in 0..FILTERS.count {
+            put_cword(out, FILTERS.data[k] as *u8);
+        }
+        if FILTERS.count == 0 {
+            buf_bytes(out, " (the whole suite)");
+        }
+        if buf_slice(unmatched).len > 0 {
+            buf_bytes(out, buf_slice(unmatched));
+            buf_byte(out, ')');
+        }
+        buf_bytes(out, ": ");
+        if !ran && blocks.count == 0 {
+            buf_bytes(out, "nothing run\n");
+            buf_write_fd(out, STDOUT);
+            return 2;
+        }
+        buf_int(out, totals[0]);
+        buf_bytes(out, " passed, ");
+        buf_int(out, totals[2]);
+        buf_bytes(out, " failed");
+        if totals[1] > 0 {
+            buf_bytes(out, ", ");
+            buf_int(out, totals[1]);
+            buf_bytes(out, " xfail");
+        }
+        buf_bytes(out, " (tests/run.sh");
+        if OPT != 0 as *u8 {
+            buf_byte(out, ' ');
+            buf_str(out, OPT);
+        }
+        buf_bytes(out, buf_slice(notes));
+        buf_bytes(out, "; ");
+        put_secs(out, now_ms() - t0);
+        buf_bytes(out, ")\n");
+        put_failures(out, &blocks, &names);
+        buf_write_fd(out, STDOUT);
+        if !ran {
+            return 2;
+        }
+        if blocks.count > 0 || totals[2] > 0 { 1 } else { 0 }
+    }
+}
+
+// Reads run.sh's report: its FAIL and XPASS blocks into blocks (their
+// first lines and a few more) and names, its totals (pass, xfail, fail)
+// added; false when it has no table.
+fn parse_run(log: [u8], totals: *i64, blocks: *IntVec, names: *IntVec) -> bool {
+    unsafe {
+        let mut block = -1;
+        let mut lines = 0;
+        let mut extra = 0;
+        let mut table = false;
+        let mut i = 0;
+        while i <= log.len {
+            let e = line_end(log, i);
+            let l = if i < log.len { log[i..e] } else { log[0..0] };
+            i = e + 1;
+            let fail = starts(l, "FAIL ");
+            let xpass = starts(l, "XPASS ");
+            let end = l.len == 0 || fail || xpass || starts(l, "tests for ");
+            if end && block >= 0 {
+                if extra > 0 {
+                    buf_bytes(block, "  (");
+                    buf_int(block, extra);
+                    buf_bytes(block, " more lines)\n");
+                }
+                block = -1;
+            }
+            if fail || xpass {
+                let start = if fail { 5 } else { 6 };
+                let mut n = start;
+                while n < l.len && l[n] != ':' && l[n] != ' ' {
+                    n += 1;
+                }
+                let mut dup = false;
+                for k in 0..(*names).count {
+                    dup = dup || buf_slice((*names).data[k]) == l[start..n];
+                }
+                if dup {
+                    continue;
+                }
+                let name = buf_new();
+                buf_bytes(name, l[start..n]);
+                names.push(name);
+                let b = buf_new();
+                put_cut(b, "", l);
+                blocks.push(b);
+                block = if fail { b } else { -1 };
+                lines = 0;
+                extra = 0;
+                continue;
+            }
+            if block >= 0 {
+                let mut s = 0;
+                while s < 4 && s < l.len && l[s] == ' ' {
+                    s += 1;
+                }
+                if lines < 2 * detail_lines() {
+                    put_cut(block, "  ", l[s..l.len]);
+                } else {
+                    extra += 1;
+                }
+                lines += 1;
+                continue;
+            }
+            if starts(l, "  total ") {
+                let mut k = 0;
+                let mut p = 8;
+                while k < 3 && p < l.len {
+                    while p < l.len && l[p] == ' ' {
+                        p += 1;
+                    }
+                    let mut n = 0;
+                    while p < l.len && l[p] >= '0' && l[p] <= '9' {
+                        n = n * 10 + (l[p] - '0') as i64;
+                        p += 1;
+                    }
+                    totals[k] = totals[k] + n;
+                    k += 1;
+                }
+                table = true;
+            }
+        }
+        table
+    }
+}
