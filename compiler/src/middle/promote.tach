@@ -19,8 +19,8 @@ use crate::middle::gvn::{
 };
 use crate::middle::ipo::{call_reads, call_writes};
 use crate::middle::ir::{
-    ARGS, ARGTY, BLOCKS, INSTS, IRF, Op, SLOTS, ir_append, ir_arg, ir_insert_before, ir_make,
-    ir_prepend, ir_replace, ir_set_arg, ir_unlink, ir_val,
+    ARGS, ARGTY, BLOCKS, INSTS, IRF, Op, ir_append, ir_insert_before, ir_make, ir_prepend,
+    ir_replace, ir_set_arg, ir_unlink, ir_val,
 };
 use crate::middle::ir::Op::{Add, GAddr, Load, Phi, SAddr, Store};
 use crate::middle::ir::cfg::{succ, succ_count};
@@ -206,36 +206,13 @@ fn is_integer_like(ty: i64) -> bool {
     is_integer(ty) || is_float(ty) || ty == TY_BOOL
 }
 
-// (0.16) Whether object `root` is a frame slot whose address goes only to
-// calls that do not capture it (gvn.tach's escapes 2).
-fn call_only(root: i64) -> bool {
-    unsafe { INSTS[root].op == Op::Slot && SLOTS[INSTS[root].imm].escapes == 2 }
-}
-
-// Whether call v is given an address in object `root` (a slot of
-// call_only's: the call may read and write it).
-fn touches(v: i64, root: i64) -> bool {
-    unsafe {
-        for k in 0..INSTS[v].nargs {
-            let a = ir_val(ir_arg(v, k));
-            if a != 0 && root_of(a) == root {
-                return true;
-            }
-        }
-        false
-    }
-}
-
 // Whether the location [base + offset, + size of ty) of object `root` can
 // be promoted in loop l: every access of it is a load or store of type
 // ty at base + offset, and nothing else in the loop may reach it.
 fn can_promote(l: i64, root: i64, base: i64, offset: i64, ty: i64) -> bool {
     unsafe {
         let size = type_size(ty);
-        // (0.16) A slot whose address goes only to calls that do not keep it
-        // is private but at those calls: promote stores the location before
-        // each of them in the loop and loads it after.
-        let private = is_private_root(root) || call_only(root);
+        let private = is_private_root(root);
         let mut loc_lo = 0;
         let mut loc_hi = 0;
         if !relative_range(base, root, INSTS[ACCESSES.data[0]].block, &loc_lo, &loc_hi, 0)
@@ -375,10 +352,6 @@ fn address_outside(l: i64, base: i64, b: i64, at: i64) -> i64 {
     }
 }
 
-// The stamp (INSTS[].mark) of the reloads after calls of the location
-// being promoted.
-static mut RELOAD_STAMP: i64 = 2000000000;
-
 // Promotes [base + offset] (type ty) in loop l.
 fn promote(fi: i64, l: i64, base: i64, offset: i64, ty: i64) {
     unsafe {
@@ -388,14 +361,7 @@ fn promote(fi: i64, l: i64, base: i64, offset: i64, ty: i64) {
         ir_append(pre, initial);
         let var = new_synth_var(ty);
         ssa_write(var, pre, initial);
-        // (0.16) A call given the slot (call_only) may read and write the
-        // location: it is stored before the call and loaded after (the
-        // reloads made here, marked, are what the call leaves).
-        let root = root_of(base);
-        let around_calls = call_only(root);
-        RELOAD_STAMP += 1;
-        // The value each block leaves in the location: its last store, or
-        // the reload after its last call given the slot.
+        // The value each block leaves in the location: its last store.
         let mut stores = false;
         for i in 0..loop_size(l) {
             let b = loop_block(l, i);
@@ -403,30 +369,14 @@ fn promote(fi: i64, l: i64, base: i64, offset: i64, ty: i64) {
             let mut v = BLOCKS[b].first;
             while v != 0 {
                 if is_location(v, Store, base, offset) {
-                    last = ir_val(INSTS[v].b);
-                    stores = true;
-                } else if around_calls && INSTS[v].op.is_call() && !is_copy(v) && touches(v, root) {
-                    // (after the call's pieces)
-                    let mut at = v;
-                    while INSTS[at].next != 0 && INSTS[INSTS[at].next].op == Op::Piece {
-                        at = INSTS[at].next;
-                    }
-                    let reload = ir_make(Load, ty, 0, 0, offset);
-                    INSTS[reload].mark = RELOAD_STAMP;
-                    if INSTS[at].next == 0 {
-                        ir_append(b, reload);
-                    } else {
-                        ir_insert_before(INSTS[at].next, reload);
-                    }
-                    INSTS[reload].a = address_outside(l, base, b, reload);
-                    last = reload;
-                    v = reload;
+                    last = v;
                 }
                 v = INSTS[v].next;
             }
             if last != 0 {
-                ssa_write(var, b, last);
+                ssa_write(var, b, ir_val(INSTS[last].b));
                 BLOCKS[b].aux = 1;
+                stores = true;
             } else {
                 BLOCKS[b].aux = 0;
             }
@@ -438,20 +388,7 @@ fn promote(fi: i64, l: i64, base: i64, offset: i64, ty: i64) {
             let mut v = BLOCKS[b].first;
             while v != 0 {
                 let next = INSTS[v].next;
-                if INSTS[v].mark == RELOAD_STAMP && INSTS[v].op == Load {
-                    // (what the call before left)
-                    current = v;
-                } else if around_calls && INSTS[v].op.is_call() && !is_copy(v)
-                    && touches(v, root) && stores {
-                    // (with no store in the loop, the memory holds the value)
-                    if current == 0 {
-                        current = value_at_start(var, b, ty);
-                    }
-                    let st = ir_make(Store, 0, 0, current, offset);
-                    INSTS[st].imm2 = ty;
-                    ir_insert_before(v, st);
-                    INSTS[st].a = address_outside(l, base, b, st);
-                } else if is_location(v, Load, base, offset) {
+                if is_location(v, Load, base, offset) {
                     if current == 0 {
                         current = value_at_start(var, b, ty);
                     }

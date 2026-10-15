@@ -11,9 +11,7 @@ use crate::base::{IntVec, alloc_array, free, intern_c, memset};
 use crate::front::types::{TY_U64, is_integer, type_size};
 use crate::middle::egraph::{EGRAPH, egraph_rewrite, egraph_start};
 use crate::middle::fold::is_const;
-use crate::middle::ipo::{
-    ATTR_READNONE, ATTR_READONLY, arg_nocapture, call_attrs, call_reads, call_writes,
-};
+use crate::middle::ipo::{ATTR_READNONE, ATTR_READONLY, call_attrs, call_reads, call_writes};
 use crate::middle::ir::{
     BLOCKS, Cond, INSTS, IRFUNCS, Op, SLOTS, SLOT_COUNT, Term, ir_arg, ir_insert_before, ir_make,
     ir_operand, ir_operand_count, ir_replace, ir_resolve_operands, ir_set_operand, ir_unlink,
@@ -275,8 +273,7 @@ pub fn root_of(v: i64) -> i64 {
 }
 
 // Marks the frame slots of function `fi` whose address escapes: used other
-// than by loads, stores, copies and address arithmetic: escapes 1, or 2
-// when only passed to calls that do not capture it (arg_nocapture).
+// than by loads, stores, copies and address arithmetic.
 pub fn find_escaping_slots(fi: i64) {
     unsafe {
         for i in 0..IRFUNCS[fi].slots.count {
@@ -299,20 +296,7 @@ pub fn find_escaping_slots(fi: i64) {
                         || (op == Copy && k <= 1)
                         || (op == Add && k <= 1 && INSTS[v].ty == TY_U64)
                         || ((k == 3 || k == 4) && is_memcpy(v));
-                    if allowed {
-                        continue;
-                    }
-                    if arg_nocapture(v, k) {
-                        // (0.16) Into a call that does not keep it: the slot
-                        // is the callee's to read and write during the call
-                        // only (escapes 2: scalar promotion stores and reloads
-                        // around such calls, promote.tach).
-                        let root = root_of(operand);
-                        if root != 0 && INSTS[root].op == Slot
-                            && SLOTS[INSTS[root].imm].escapes == 0 {
-                            SLOTS[INSTS[root].imm].escapes = 2;
-                        }
-                    } else {
+                    if !allowed {
                         mark_escape(operand);
                     }
                 }
@@ -963,8 +947,24 @@ fn writes_for_calls(v: i64) -> bool {
     }
 }
 
+// Whether calls v and w call one function with the same arguments.
+fn same_call(v: i64, w: i64) -> bool {
+    unsafe {
+        if INSTS[v].op != INSTS[w].op || INSTS[v].imm != INSTS[w].imm
+            || INSTS[v].nargs != INSTS[w].nargs {
+            return false;
+        }
+        for i in 0..INSTS[v].nargs {
+            if ir_val(ir_arg(v, i)) != ir_val(ir_arg(w, i)) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 // (0.16) Whether function fi has two calls value numbering may merge (the
-// same callee, READNONE or READONLY): at -O2, its callees' attributes are
+// same callee and arguments, READNONE or READONLY): at -O2, its callees' attributes are
 // known only once they are optimized, after fi's first value numbering.
 pub fn repeated_pure_calls(fi: i64) -> bool {
     unsafe {
@@ -979,8 +979,9 @@ pub fn repeated_pure_calls(fi: i64) -> bool {
             while v != 0 && !found {
                 if INSTS[v].op.is_call() && call_numbering(v) != 0 {
                     for k in 0..seen.count {
-                        if INSTS[seen.data[k]].op == INSTS[v].op
-                            && INSTS[seen.data[k]].imm == INSTS[v].imm {
+                        // (a readonly call is merged within its block only)
+                        if same_call(seen.data[k], v) && (call_numbering(v) == 1
+                            || INSTS[seen.data[k]].block == INSTS[v].block) {
                             found = true;
                         }
                     }
