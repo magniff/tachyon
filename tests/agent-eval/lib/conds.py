@@ -15,6 +15,9 @@ Program tasks (tasks/):
 - `tools-core`: bare + the tiered tools preamble (prompts/tools-core.md:
   eight rows, `query context` first, and where the rest is).
 - `both-core`: guide-core + tools-core (what a user gets once both land).
+- `guide-mini` (0.17 iterations): bare + prompts/guide-mini.md, a ~600-token
+  always-loaded core (the main Rust differences in one compiled example,
+  then the lookup lines); with `+readfirst` the iteration-1 cell.
 - `rust-pairs`: bare + paired Rust -> tachyon lines (prompts/rust-pairs.md),
   about the core guide's budget: the differences shown as pairs instead
   of tachyon-only examples.
@@ -52,6 +55,9 @@ Modifiers, any order after the base:
   a guide/query/explain/--help call prints again what it printed earlier
   (tools/agent-hooks/lookup-note.py). Each is settings-eval.json's
   `modifiers` entry of that name.
+- `+readfirst` (0.17 iterations): prompts/readfirst.md after the guide:
+  read the code in the directory first, follow its patterns, look up
+  (`guide --find`, `guide TOPIC#SECTION`) only what the code does not show.
 
 `both+hook+test` is the rerun matrix's row D cell; `compiler-tools-core+test`
 the compiler one.
@@ -66,10 +72,10 @@ import os
 from lib.common import HOOKS_DIR, PROMPTS_DIR
 
 PROGRAM_BASES = ("bare", "guide", "tools", "both", "guide-core", "tools-core", "both-core",
-                 "rust-pairs", "rust")
+                 "rust-pairs", "guide-mini", "rust")
 COMPILER_BASES = ("compiler-tools", "compiler-plain", "compiler-tools-core")
 BASES = PROGRAM_BASES + COMPILER_BASES
-MODS = ("hook", "test", "turn-end", "recite", "rewrite", "nohints", "note")
+MODS = ("hook", "test", "turn-end", "recite", "rewrite", "nohints", "note", "readfirst")
 # (E3, E5, E6) the modifiers settings-eval.json's `modifiers` defines: an
 # environment for every hook of the run, more hooks
 HOOK_MODS = ("rewrite", "nohints", "note")
@@ -87,6 +93,7 @@ _PARTS = {
     "tools-core": {"tools": "core"},
     "both-core": {"guide": "core", "tools": "core"},
     "rust-pairs": {"pairs": True},
+    "guide-mini": {"guide": "mini"},
     "rust": {},
     "compiler-tools": {"compiler": "full"},
     "compiler-plain": {"compiler": "plain"},
@@ -119,6 +126,7 @@ class Cond:
         self.lang = "compiler" if self.is_compiler else ("rust" if self.base == "rust" else "tach")
         self.test = "test" in self.mods
         self.recite = "recite" in self.mods
+        self.readfirst = "readfirst" in self.mods
         self.turn_end = "turn-end" in self.mods or self.test
         self.hook_mods = tuple(m for m in self.mods if m in HOOK_MODS)
         if self.lang == "rust" and self.mods:

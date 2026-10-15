@@ -23,7 +23,7 @@ COMPILER_CONDS = ("compiler-tools", "compiler-plain")
 # (0.17) every base condition, in report order; a condition is
 # BASE[+hook][+test] (lib/conds.py)
 ALL_CONDS = ("bare", "guide", "tools", "both", "guide-core", "tools-core", "both-core",
-             "rust-pairs", "rust", "compiler-tools", "compiler-plain", "compiler-tools-core")
+             "rust-pairs", "guide-mini", "rust", "compiler-tools", "compiler-plain", "compiler-tools-core")
 KINDS = ("write", "fix", "extend", "refactor", "perf")
 
 TACH_BUILD = ["tachyonc", "main.tach", "-o", "prog"]
