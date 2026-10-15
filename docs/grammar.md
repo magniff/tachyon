@@ -730,7 +730,11 @@ fields whose parts all have `==`: they compare field by field
 holding a NaN is not equal to itself). Each operand is evaluated once.
 A part whose type has an `impl Eq` is compared by it, as `==` on it alone
 is (0.14). Unions have no `==`; comparing a type that holds one (a slice
-of them too) is an error naming it.
+of them too) is an error naming it. std's `Vec`, `Buf` and `HashMap` compare
+their contents (0.15, through their `impl Eq`): Vecs element by element, a
+Buf by bytes, maps by length and each key's value, in any order; `==` on a
+`Vec<T>` needs `==` on `T`. Whether two are the same Vec is a comparison
+of pointers, `a.as_slice().ptr == b.as_slice().ptr`.
 
 **The prelude.** Every module sees `Option`, `Some`, `None`, `Result`,
 `Ok`, `Err`, `Vec`, `print` and `println` (from `std`) without `use`. The

@@ -32,9 +32,13 @@ pub fn println<T: Display>(x: T) {
     f.flush();
 }
 
+#[inline(never)]
 pub fn print_int(v: i64) {
     let mut f = Fmt::to_fd(1);
-    f.int(v);
+    // (decimal only: not Fmt::int, whose hex and binary every program
+    // using print_int would compile)
+    let negative = v < 0;
+    fmt_decimal(&f, if negative { (-(v + 1)) as u64 + 1 } else { v as u64 }, negative);
     f.flush();
 }
 
@@ -150,51 +154,88 @@ fn fmt_room(f: *Fmt, n: i64) -> [u8] {
 }
 
 // fmt_room after making the room (n: at most FMT_CAP): the buffer written
-// out, or the Buf grown.
-#[inline(never)]
+// out, or the Buf grown. (A Fmt's file descriptor or Buf is chosen inline,
+// so that print compiles only the file descriptor's functions.)
+#[inline]
 fn fmt_make_room(f: *Fmt, n: i64) -> [u8] {
-    if f.fd >= 0 {
+    if f.fd >= 0 { fmt_fd_room(f.fd, n) } else { unsafe { fmt_buf_room(f.buf, n) } }
+}
+
+#[inline(never)]
+fn fmt_fd_room(fd: i32, n: i64) -> [u8] {
+    if fd != FMT_FD || FMT_LEN + n > FMT_CAP {
         fmt_flush();
-        FMT_FD = f.fd;
+        FMT_FD = fd;
+    }
+    let at = FMT_LEN;
+    FMT_LEN = at + n;
+    FMT_OUT[at..at + n]
+}
+
+#[inline(never)]
+fn fmt_buf_room(buf: *Buf, n: i64) -> [u8] {
+    unsafe {
+        let v = &(*buf).bytes;
+        v.reserve(n);
+        let at = v.len;
+        v.len = at + n;
+        v.ptr[at..at + n]
+    }
+}
+
+// Fmt::str (a call: an f-string's text is one).
+#[inline]
+fn fmt_str(f: *Fmt, s: [u8]) {
+    if f.fd >= 0 {
+        fmt_str_fd(f.fd, s);
     } else {
         unsafe {
-            (*f.buf).bytes.reserve(n);
+            fmt_str_buf(f.buf, s);
         }
     }
-    fmt_room(f, n)
 }
 
-// Fmt::str (not inlined: an f-string's text is a call).
 #[inline(never)]
-fn fmt_str(f: *Fmt, s: [u8]) {
+fn fmt_str_fd(fd: i32, s: [u8]) {
     let n = s.len;
-    let mut out = fmt_room(f, n);
-    if out.len != n {
-        if f.fd >= 0 && n > FMT_CAP {
-            // (written directly)
-            fmt_flush();
-            FMT_FD = f.fd;
-            let mut i = 0;
-            while i < n {
-                let rest = s[i..n];
-                let k = unsafe { write(f.fd, rest.ptr, rest.len as u64) };
-                if k <= 0 {
-                    break;
-                }
-                i += k;
+    let mut out = FMT_OUT[0..0];
+    if fd == FMT_FD && FMT_LEN + n <= FMT_CAP {
+        let at = FMT_LEN;
+        FMT_LEN = at + n;
+        out = FMT_OUT[at..at + n];
+    } else if n > FMT_CAP {
+        // (written directly)
+        fmt_flush();
+        FMT_FD = fd;
+        let mut i = 0;
+        while i < n {
+            let rest = s[i..n];
+            let k = unsafe { write(fd, rest.ptr, rest.len as u64) };
+            if k <= 0 {
+                break;
             }
-            FMT_DONE += n;
-            return;
+            i += k;
         }
-        out = fmt_make_room(f, n);
+        FMT_DONE += n;
+        return;
+    } else {
+        out = fmt_fd_room(fd, n);
     }
-    for i in 0..n {
-        out[i] = s[i];
+    unsafe {
+        memcpy(out.ptr, s.ptr, n as u64);
     }
 }
 
-// Fmt::byte when it does not fit (not inlined).
 #[inline(never)]
+fn fmt_str_buf(buf: *Buf, s: [u8]) {
+    let out = fmt_buf_room(buf, s.len);
+    unsafe {
+        memcpy(out.ptr, s.ptr, s.len as u64);
+    }
+}
+
+// Fmt::byte when it does not fit.
+#[inline]
 fn fmt_byte(f: *Fmt, b: u8) {
     let out = fmt_make_room(f, 1);
     out[0] = b;
@@ -847,6 +888,8 @@ impl<T: Debug, E: Debug> Debug for Result<T, E> {
 impl<T: Debug, A: Allocator> Debug for Vec<T, A> {
     fn fmt_debug(self: *Vec<T, A>, f: *Fmt) { debug_list(f, self.as_slice()); }
 }
+
+// ---- Debug of HashMap (0.15) ----
 
 // `{k: v, ...}`, in slot order.
 impl<K: Hash + Eq + Debug, V: Debug, A: Allocator> Debug for HashMap<K, V, A> {

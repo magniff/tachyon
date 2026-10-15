@@ -1,0 +1,249 @@
+// Runs the tree. Variables live on one stack of (name, value) entries; a
+// block's variables are dropped when it ends, and a name means its most
+// recent entry. Arithmetic wraps around at 64 bits.
+
+use crate::ast::{Ast, BinOp, Expr, Stmt, UnOp};
+use std::Buf;
+
+pub enum ErrorKind {
+    UndefinedVariable,
+    DivisionByZero,
+}
+
+pub struct RtError {
+    pub kind: ErrorKind,
+    pub line: i64,
+    // The variable's name index, for UndefinedVariable.
+    pub name: i64,
+}
+
+struct Machine {
+    // A copy of the tree's handles: the machine only reads it.
+    ast: Ast,
+    names: Vec<i64>,
+    values: Vec<i64>,
+    // The number of live entries in names/values (the rest are stale).
+    top: i64,
+    out: Buf,
+}
+
+fn truth(b: bool) -> i64 {
+    if b {
+        1
+    } else {
+        0
+    }
+}
+
+// The value of `op` on two numbers; None for division or remainder by 0.
+pub fn apply_binary(op: BinOp, a: i64, b: i64) -> Option<i64> {
+    let v = match op {
+        BinOp::Add => a + b,
+        BinOp::Sub => a - b,
+        BinOp::Mul => a * b,
+        BinOp::Div => {
+            if b == 0 {
+                return None;
+            }
+            a / b
+        }
+        BinOp::Rem => {
+            if b == 0 {
+                return None;
+            }
+            a % b
+        }
+        BinOp::Lt => truth(a < b),
+        BinOp::Le => truth(a <= b),
+        BinOp::Gt => truth(a > b),
+        BinOp::Ge => truth(a >= b),
+        BinOp::Eq => truth(a == b),
+        BinOp::Ne => truth(a != b),
+        BinOp::And => truth(a != 0 && b != 0),
+        BinOp::Or => truth(a != 0 || b != 0),
+    };
+    Some(v)
+}
+
+pub fn apply_unary(op: UnOp, a: i64) -> i64 {
+    match op {
+        UnOp::Neg => -a,
+        UnOp::Not => truth(a == 0),
+    }
+}
+
+impl Machine {
+    // The index of the live entry of `name`, or -1.
+    fn find(self: *Machine, name: i64) -> i64 {
+        let names = self.names.as_slice();
+        let mut i = self.top - 1;
+        while i >= 0 {
+            if names[i] == name {
+                return i;
+            }
+            i -= 1;
+        }
+        -1
+    }
+
+    fn declare(self: *Machine, name: i64, value: i64) {
+        if self.top == self.names.len() {
+            self.names.push(name);
+            self.values.push(value);
+        } else {
+            self.names.set(self.top, name);
+            self.values.set(self.top, value);
+        }
+        self.top += 1;
+    }
+
+    fn eval(self: *Machine, e: i64) -> Result<i64, RtError> {
+        match self.ast.expr(e) {
+            Expr::Num(v) => Ok(v),
+            Expr::Var(name, line) => {
+                let i = self.find(name);
+                if i < 0 {
+                    return Err(RtError {
+                        kind: ErrorKind::UndefinedVariable, line: line, name: name
+                    });
+                }
+                Ok(self.values.get(i))
+            }
+            Expr::Unary(op, a, _) => {
+                let v = match self.eval(a) {
+                    Ok(v) => v,
+                    Err(err) => return Err(err),
+                };
+                Ok(apply_unary(op, v))
+            }
+            Expr::Binary(op, a, b, line) => {
+                let left = match self.eval(a) {
+                    Ok(v) => v,
+                    Err(err) => return Err(err),
+                };
+                if op == BinOp::And && left == 0 {
+                    return Ok(0);
+                }
+                if op == BinOp::Or && left != 0 {
+                    return Ok(1);
+                }
+                let right = match self.eval(b) {
+                    Ok(v) => v,
+                    Err(err) => return Err(err),
+                };
+                match apply_binary(op, left, right) {
+                    Some(v) => Ok(v),
+                    None => Err(RtError { kind: ErrorKind::DivisionByZero, line: line, name: 0 }),
+                }
+            }
+        }
+    }
+
+    // Runs a list of statements in a new scope.
+    fn exec_block(self: *Machine, first: i64, count: i64) -> Result<(), RtError> {
+        let mark = self.top;
+        for k in 0..count {
+            let r = self.exec(self.ast.list(first + k));
+            if r.is_err() {
+                self.top = mark;
+                return r;
+            }
+        }
+        self.top = mark;
+        Ok(())
+    }
+
+    fn exec(self: *Machine, s: i64) -> Result<(), RtError> {
+        match self.ast.stmt(s) {
+            Stmt::Let(name, e) => {
+                let v = match self.eval(e) {
+                    Ok(v) => v,
+                    Err(err) => return Err(err),
+                };
+                self.declare(name, v);
+            }
+            Stmt::Set(name, e, line) => {
+                let v = match self.eval(e) {
+                    Ok(v) => v,
+                    Err(err) => return Err(err),
+                };
+                let i = self.find(name);
+                if i < 0 {
+                    return Err(RtError {
+                        kind: ErrorKind::UndefinedVariable, line: line, name: name
+                    });
+                }
+                self.values.set(i, v);
+            }
+            Stmt::Print(first, count) => {
+                let mut vals: Vec<i64> = Vec::new();
+                defer vals.free();
+                for k in 0..count {
+                    let v = match self.eval(self.ast.list(first + k)) {
+                        Ok(v) => v,
+                        Err(err) => return Err(err),
+                    };
+                    vals.push(v);
+                }
+                for k in 0..vals.len() {
+                    if k > 0 {
+                        self.out.push(' ');
+                    }
+                    self.out.push_int(vals.get(k));
+                }
+                self.out.push('\n');
+            }
+            Stmt::If(cond, first, count, els) => {
+                let c = match self.eval(cond) {
+                    Ok(v) => v,
+                    Err(err) => return Err(err),
+                };
+                if c != 0 {
+                    return self.exec_block(first, count);
+                } else if els >= 0 {
+                    return self.exec(els);
+                }
+            }
+            Stmt::While(cond, first, count) => loop {
+                let c = match self.eval(cond) {
+                    Ok(v) => v,
+                    Err(err) => return Err(err),
+                };
+                if c == 0 {
+                    break;
+                }
+                let r = self.exec_block(first, count);
+                if r.is_err() {
+                    return r;
+                }
+            },
+            Stmt::Block(first, count) => return self.exec_block(first, count),
+        }
+        Ok(())
+    }
+}
+
+// Runs the program; appends what it printed to `out`, ending with the
+// error line if it stopped on an error.
+pub fn run(ast: *Ast, out: *Buf) {
+    let mut m = Machine {
+        ast: *ast, names: Vec::new(), values: Vec::new(), top: 0, out: Buf::new()
+    };
+    defer m.names.free();
+    defer m.values.free();
+    defer m.out.free();
+    let r = m.exec_block(ast.top_first, ast.top_count);
+    out.push_str(m.out.as_slice());
+    if let Err(e) = r {
+        out.push_str("error at line ");
+        out.push_int(e.line);
+        match e.kind {
+            ErrorKind::UndefinedVariable => {
+                out.push_str(": undefined variable ");
+                out.push_str(ast.names.get(e.name));
+            }
+            ErrorKind::DivisionByZero => out.push_str(": division by zero"),
+        }
+        out.push('\n');
+    }
+}

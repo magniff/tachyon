@@ -2,17 +2,21 @@
 ## the program does not define, its source by `std`, grep in it, a
 ## show with the `use` line a program needs.
 $ def std::read_line Vec::push
-std::read_line	<std>:1690:8	fn	pub fn read_line(line: *Buf) -> Result<bool, IoError>
-std::Vec::push	<std>:214:12	method	pub fn push(self: *Vec<T, A>, x: T)
+std::read_line	<std>:1749:8	fn	pub fn read_line(line: *Buf) -> Result<bool, IoError>
+std::Vec::push	<std>:207:12	method	pub fn push(self: *Vec<T, A>, x: T)
 $ def read_line twice
-std::read_line	<std>:1690:8	fn	pub fn read_line(line: *Buf) -> Result<bool, IoError>
+std::read_line	<std>:1749:8	fn	pub fn read_line(line: *Buf) -> Result<bool, IoError>
 crate::twice	nostd/main.tach:4:4	fn	fn twice(x: i64) -> i64
 $ show std::print_int
-// std::print_int	<std>:2036-2040
+// std::print_int	<std>:2095-2103
 // use std::print_int;
+#[inline(never)]
 pub fn print_int(v: i64) {
     let mut f = Fmt::to_fd(1);
-    f.int(v);
+    // (decimal only: not Fmt::int, whose hex and binary every program
+    // using print_int would compile)
+    let negative = v < 0;
+    fmt_decimal(&f, if negative { (-(v + 1)) as u64 + 1 } else { v as u64 }, negative);
     f.flush();
 }
 $ text std:1-2
@@ -21,7 +25,7 @@ $ text std:1-2
 2	// (compiler/std/embed.sh makes compiler/src/front/stdsrc.tach from this file
 $ grep 'pub fn read_line' --in std
 # <std>
-1690:1	code	std	pub fn read_line(line: *Buf) -> Result<bool, IoError> {
+1749:1	code	std	pub fn read_line(line: *Buf) -> Result<bool, IoError> {
 $ def no_such_name
 error query.no-match: no definition 'no_such_name'
 try: tachyonc query items

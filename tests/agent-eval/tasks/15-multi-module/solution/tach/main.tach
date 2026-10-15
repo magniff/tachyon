@@ -1,0 +1,104 @@
+// A small query engine: a CSV table on stdin, then queries in a subset of
+// SQL, one per line; prints each query's result or one error line.
+
+mod check;
+mod exec;
+mod lexer;
+mod parser;
+mod sort;
+mod table;
+
+import "unistd.h" as c;
+
+use check::plan;
+use exec::run;
+use lexer::tokenize;
+use parser::parse;
+use std::Buf;
+use table::{Table, read_table};
+
+// All of stdin.
+fn read_all() -> Buf {
+    let mut b = Buf::new();
+    let mut chunk = [0u8; 65536];
+    loop {
+        let n = unsafe { c::read(0, &chunk[0] as *u8, 65536) } as i64;
+        if n <= 0 {
+            break;
+        }
+        b.push_str(chunk[0..n]);
+    }
+    b
+}
+
+// The input's lines, without their `\n` and one trailing `\r`.
+fn split_lines(text: [u8]) -> Vec<[u8]> {
+    let mut lines: Vec<[u8]> = Vec::new();
+    let mut start = 0;
+    for i in 0..text.len + 1 {
+        if i == text.len || text[i] == '\n' {
+            if i == text.len && start == i {
+                break;
+            }
+            let mut end = i;
+            if end > start && text[end - 1] == '\r' {
+                end -= 1;
+            }
+            lines.push(text[start..end]);
+            start = i + 1;
+        }
+    }
+    lines
+}
+
+fn is_blank(line: [u8]) -> bool {
+    for b in line {
+        if b != ' ' && b != '\t' {
+            return false;
+        }
+    }
+    true
+}
+
+fn run_query(line: [u8], t: *Table, out: *Buf) {
+    let mut toks = match tokenize(line) {
+        Ok(toks) => toks,
+        Err(e) => return report(e, out),
+    };
+    defer toks.free();
+    let mut q = match parse(toks.as_slice()) {
+        Ok(q) => q,
+        Err(e) => return report(e, out),
+    };
+    defer q.free();
+    let mut p = match plan(&q, t) {
+        Ok(p) => p,
+        Err(e) => return report(e, out),
+    };
+    defer p.free();
+    run(&p, t, out);
+}
+
+fn report(e: [u8], out: *Buf) {
+    out.push_str("error: ");
+    out.push_str(e);
+    out.push('\n');
+}
+
+fn main() -> i32 {
+    let input = read_all();
+    let mut lines = split_lines(input.as_slice());
+    defer lines.free();
+    let tl = read_table(lines.as_slice());
+    let t = tl.0;
+    let mut out = Buf::new();
+    for k in tl.1..lines.len() {
+        let line = lines.get(k);
+        if is_blank(line) || (line.len >= 2 && line[0..2] == "--") {
+            continue;
+        }
+        run_query(line, &t, &out);
+    }
+    print(out.as_slice());
+    0
+}

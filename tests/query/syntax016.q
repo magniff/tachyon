@@ -3,7 +3,7 @@
 ## minimal `query effects`.
 $ items
 crate	syntax016/main.tach	10
-std	<std>	399
+std	<std>	406
 $ show apply grow
 // crate::apply	syntax016/main.tach:31-35
 #[no_alloc]
@@ -29,4 +29,4 @@ apply<closure(i64) -> i64 at syntax016/main.tach:47:32>	alloc io global panic di
 crate::grow	alloc io global panic diverge unsafe (unknown)
 crate::main	alloc io global panic diverge unsafe (unknown)
 $ def Vec::new_in
-std::Vec::new_in	<std>:127:12	method	pub fn new_in(a: A) -> Vec<T, A>
+std::Vec::new_in	<std>:120:12	method	pub fn new_in(a: A) -> Vec<T, A>

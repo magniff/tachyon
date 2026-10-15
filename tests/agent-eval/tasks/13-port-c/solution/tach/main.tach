@@ -1,0 +1,433 @@
+// lzss: a small LZSS compressor and decompressor, ported from reference.c.
+//
+// The first line of stdin is the mode, `compress` or `decompress`; the
+// rest is the input. See the task for the stream format.
+
+import "unistd.h" as c;
+
+use std::Buf;
+
+const WINDOW_SIZE: i64 = 4096; // distances 1..4096
+const WINDOW_MASK: i64 = 4095;
+const MIN_MATCH: i64 = 3;
+const MAX_MATCH: i64 = 18;
+const HASH_BITS: u32 = 13;
+const HASH_SIZE: i64 = 8192;
+const MAX_CHAIN: i64 = 64; // candidates looked at per position
+const HEADER_SIZE: i64 = 11;
+
+static DIGITS: [u8] = "0123456789abcdef";
+
+// All of stdin.
+fn read_all() -> Buf {
+    let mut b = Buf::new();
+    let mut chunk = [0u8; 65536];
+    loop {
+        let n = unsafe { c::read(0, &chunk[0] as *u8, 65536) } as i64;
+        if n <= 0 {
+            break;
+        }
+        b.push_str(chunk[0..n]);
+    }
+    b
+}
+
+// ---- CRC-32 (the zlib one: reflected, polynomial 0xEDB88320) ----
+
+fn crc_table() -> Vec<u32> {
+    let mut t: Vec<u32> = Vec::with_capacity(256);
+    for n in 0..256 {
+        let mut c = n as u32;
+        for k in 0..8 {
+            if c & 1 != 0 {
+                c = 0xEDB88320u32 ^ (c >> 1);
+            } else {
+                c = c >> 1;
+            }
+        }
+        t.push(c);
+    }
+    t
+}
+
+fn crc32(table: [u32], p: [u8]) -> u32 {
+    let mut c: u32 = 0xFFFFFFFFu32;
+    for b in p {
+        c = table[((c ^ b as u32) & 0xFF) as i64] ^ (c >> 8);
+    }
+    c ^ 0xFFFFFFFFu32
+}
+
+fn push_hex32(out: *Buf, v: u32) {
+    let mut i = 7;
+    while i >= 0 {
+        out.push(DIGITS[((v >> (4 * i) as u32) & 15) as i64]);
+        i -= 1;
+    }
+}
+
+fn get_u32le(p: [u8]) -> u32 {
+    p[0] as u32 | (p[1] as u32) << 8 | (p[2] as u32) << 16 | (p[3] as u32) << 24
+}
+
+fn put_u32le(out: *Vec<u8>, v: u32) {
+    for i in 0..4 {
+        out.push((v >> (8 * i) as u32) as u8);
+    }
+}
+
+// ---- the match finder: hash chains over the last WINDOW_SIZE positions ----
+
+struct Finder {
+    head: Vec<i64>, // newest position with this hash, or -1
+    prev: Vec<i64>, // prev[p & WINDOW_MASK]: the position before p in p's chain
+}
+
+// The hash of the 3 bytes at p: a multiplicative hash, 32-bit wrapping.
+fn hash3(p: [u8]) -> i64 {
+    let v: u32 = (p[0] as u32) << 16 | (p[1] as u32) << 8 | p[2] as u32;
+    ((v * 2654435761u32) >> (32u32 - HASH_BITS)) as i64
+}
+
+impl Finder {
+    fn insert(self: *Finder, data: [u8], pos: i64) {
+        if pos + MIN_MATCH > data.len {
+            return;
+        }
+        let h = hash3(data[pos..]);
+        self.prev.set(pos & WINDOW_MASK, self.head.get(h));
+        self.head.set(h, pos);
+    }
+
+    // (length, distance) of the longest match at pos; (0, 0) if none.
+    fn find_match(self: *Finder, data: [u8], pos: i64) -> (i64, i64) {
+        let n = data.len;
+        if pos + MIN_MATCH > n {
+            return (0, 0);
+        }
+        let max = if n - pos < MAX_MATCH { n - pos } else { MAX_MATCH };
+        let mut best = 0;
+        let mut dist = 0;
+        let head = self.head.as_slice();
+        let prev = self.prev.as_slice();
+        let mut cand = head[hash3(data[pos..])];
+        let mut chain = 0;
+        while cand >= 0 && chain < MAX_CHAIN {
+            let d = pos - cand;
+            if d > WINDOW_SIZE {
+                break;
+            }
+            let mut len = 0;
+            while len < max && data[cand + len] == data[pos + len] {
+                len += 1;
+            }
+            if len > best {
+                best = len;
+                dist = d;
+                if len == max {
+                    break;
+                }
+            }
+            cand = prev[cand & WINDOW_MASK];
+            chain += 1;
+        }
+        if best < MIN_MATCH {
+            return (0, 0);
+        }
+        (best, dist)
+    }
+}
+
+// ---- compress ----
+
+struct Writer {
+    out: Vec<u8>,
+    flag_at: i64,
+    nbits: i64,
+    literals: i64,
+    matches: i64,
+}
+
+impl Writer {
+    fn start_token(self: *Writer, is_match: bool) {
+        if self.nbits == 8 || self.out.len() == HEADER_SIZE {
+            self.flag_at = self.out.len();
+            self.out.push(0);
+            self.nbits = 0;
+        }
+        if is_match {
+            let f = self.out.get(self.flag_at) | (1u8 << self.nbits as u8);
+            self.out.set(self.flag_at, f);
+        }
+        self.nbits += 1;
+    }
+
+    fn emit_literal(self: *Writer, c: u8) {
+        self.start_token(false);
+        self.out.push(c);
+        self.literals += 1;
+    }
+
+    fn emit_match(self: *Writer, dist: i64, len: i64) {
+        let d = dist - 1;
+        self.start_token(true);
+        self.out.push((d & 0xFF) as u8);
+        self.out.push((((d >> 8) << 4) | (len - MIN_MATCH)) as u8);
+        self.matches += 1;
+    }
+}
+
+fn compress(table: [u32], data: [u8], res: *Buf) {
+    let n = data.len;
+    let mut f = Finder {
+        head: Vec::with_capacity(HASH_SIZE), prev: Vec::with_capacity(WINDOW_SIZE)
+    };
+    defer f.head.free();
+    defer f.prev.free();
+    for i in 0..HASH_SIZE {
+        f.head.push(-1);
+    }
+    for i in 0..WINDOW_SIZE {
+        f.prev.push(0);
+    }
+    let mut w = Writer { out: Vec::new(), flag_at: 0, nbits: 0, literals: 0, matches: 0 };
+    defer w.out.free();
+    let crc = crc32(table, data);
+    w.out.push('L');
+    w.out.push('Z');
+    w.out.push(1);
+    put_u32le(&w.out, n as u32);
+    put_u32le(&w.out, crc);
+
+    let mut inserted = 0;
+    let mut pos = 0;
+    while pos < n {
+        while inserted < pos {
+            f.insert(data, inserted);
+            inserted += 1;
+        }
+        let m = f.find_match(data, pos);
+        let len = m.0;
+        let dist = m.1;
+        if len > 0 && pos + 1 < n {
+            while inserted < pos + 1 {
+                f.insert(data, inserted);
+                inserted += 1;
+            }
+            let m2 = f.find_match(data, pos + 1);
+            if m2.0 > len {
+                w.emit_literal(data[pos]);
+                pos += 1;
+                continue;
+            }
+        }
+        if len > 0 {
+            w.emit_match(dist, len);
+            pos += len;
+        } else {
+            w.emit_literal(data[pos]);
+            pos += 1;
+        }
+    }
+
+    res.push_str("compressed ");
+    res.push_int(n);
+    res.push_str(" -> ");
+    res.push_int(w.out.len());
+    res.push_str(" bytes (");
+    res.push_int(w.literals);
+    res.push_str(" literals, ");
+    res.push_int(w.matches);
+    res.push_str(" matches), crc32 ");
+    push_hex32(res, crc);
+    res.push('\n');
+    let out = w.out.as_slice();
+    for i in 0..out.len {
+        let c = out[i];
+        res.push(DIGITS[(c >> 4) as i64]);
+        res.push(DIGITS[(c & 15) as i64]);
+        if i % 32 == 31 || i + 1 == out.len {
+            res.push('\n');
+        }
+    }
+}
+
+// ---- decompress ----
+
+fn hex_value(c: u8) -> i64 {
+    match c {
+        '0'..='9' => (c - '0') as i64,
+        'a'..='f' => (c - 'a') as i64 + 10,
+        'A'..='F' => (c - 'A') as i64 + 10,
+        _ => -1,
+    }
+}
+
+// Hex text to bytes in `out`; whitespace is skipped. On an error, writes
+// the error line to `res` and returns false.
+fn unhex(text: [u8], out: *Vec<u8>, res: *Buf) -> bool {
+    let mut high = -1;
+    for i in 0..text.len {
+        let c = text[i];
+        if c == ' ' || c == '\t' || c == '\r' || c == '\n' {
+            continue;
+        }
+        let v = hex_value(c);
+        if v < 0 {
+            res.push_str("error: bad hex character at offset ");
+            res.push_int(i);
+            res.push('\n');
+            return false;
+        }
+        if high < 0 {
+            high = v;
+        } else {
+            out.push((high << 4 | v) as u8);
+            high = -1;
+        }
+    }
+    if high >= 0 {
+        res.push_str("error: odd number of hex digits\n");
+        return false;
+    }
+    true
+}
+
+fn truncated(res: *Buf, p: i64) {
+    res.push_str("error: truncated stream at byte ");
+    res.push_int(p);
+    res.push('\n');
+}
+
+// Decodes stream s; writes the stats line and the data, or the error line,
+// to `res`.
+fn decode(table: [u32], s: [u8], res: *Buf) {
+    let n = s.len;
+    if n < HEADER_SIZE {
+        res.push_str("error: truncated header\n");
+        return;
+    }
+    if s[0] != 'L' || s[1] != 'Z' || s[2] != 1 {
+        res.push_str("error: bad magic\n");
+        return;
+    }
+    let size = get_u32le(s[3..]) as i64;
+    let stored_crc = get_u32le(s[7..]);
+    let mut out: Vec<u8> = Vec::new();
+    defer out.free();
+    let mut p = HEADER_SIZE;
+    let mut flags: u32 = 0;
+    let mut nbits = 0;
+    while out.len() < size {
+        if nbits == 0 {
+            if p >= n {
+                truncated(res, p);
+                return;
+            }
+            flags = s[p] as u32;
+            p += 1;
+            nbits = 8;
+        }
+        let is_match = flags & 1 != 0;
+        flags = flags >> 1;
+        nbits -= 1;
+        if !is_match {
+            if p >= n {
+                truncated(res, p);
+                return;
+            }
+            out.push(s[p]);
+            p += 1;
+            continue;
+        }
+        if p + 2 > n {
+            truncated(res, p);
+            return;
+        }
+        let dist = (s[p] as i64 | ((s[p + 1] >> 4) as i64) << 8) + 1;
+        let len = (s[p + 1] & 15) as i64 + MIN_MATCH;
+        if dist > out.len() {
+            res.push_str("error: bad distance ");
+            res.push_int(dist);
+            res.push_str(" at byte ");
+            res.push_int(p);
+            res.push('\n');
+            return;
+        }
+        if out.len() + len > size {
+            res.push_str("error: match overruns the data at byte ");
+            res.push_int(p);
+            res.push('\n');
+            return;
+        }
+        p += 2;
+        for k in 0..len {
+            let b = out.get(out.len() - dist);
+            out.push(b);
+        }
+    }
+    if p < n {
+        res.push_str("error: ");
+        res.push_int(n - p);
+        res.push_str(" trailing bytes\n");
+        return;
+    }
+    let crc = crc32(table, out.as_slice());
+    if crc != stored_crc {
+        res.push_str("error: crc mismatch: stored ");
+        push_hex32(res, stored_crc);
+        res.push_str(", computed ");
+        push_hex32(res, crc);
+        res.push('\n');
+        return;
+    }
+    res.push_str("decompressed ");
+    res.push_int(n);
+    res.push_str(" -> ");
+    res.push_int(out.len());
+    res.push_str(" bytes, crc32 ");
+    push_hex32(res, crc);
+    res.push('\n');
+    res.push_str(out.as_slice());
+}
+
+fn decompress(table: [u32], text: [u8], res: *Buf) {
+    let mut s: Vec<u8> = Vec::new();
+    defer s.free();
+    if unhex(text, &s, res) {
+        decode(table, s.as_slice(), res);
+    }
+}
+
+// ---- main ----
+
+fn main() -> i32 {
+    let mut input_buf = read_all();
+    defer input_buf.free();
+    let input = input_buf.as_slice();
+    let mut nl = 0;
+    while nl < input.len && input[nl] != '\n' {
+        nl += 1;
+    }
+    let mut mode_len = nl;
+    if mode_len > 0 && input[mode_len - 1] == '\r' {
+        mode_len -= 1;
+    }
+    let rest = if nl < input.len { nl + 1 } else { input.len };
+    let body = input[rest..];
+    let mode = input[..mode_len];
+
+    let mut table = crc_table();
+    defer table.free();
+    let mut res = Buf::new();
+    defer res.free();
+    if mode == "compress" {
+        compress(table.as_slice(), body, &res);
+    } else if mode == "decompress" {
+        decompress(table.as_slice(), body, &res);
+    } else {
+        res.push_str("error: unknown mode\n");
+    }
+    print(res.as_slice());
+    0
+}

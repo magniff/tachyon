@@ -1,0 +1,336 @@
+// Checks a parsed query against the table and resolves it into a Plan:
+// column names become indices, aggregates are collected.
+
+use crate::parser::{AggKind, CmpOp, Item, Node, Operand, Query};
+use crate::table::{ColType, Table, Value};
+use std::Buf;
+
+pub struct Agg {
+    pub kind: AggKind,
+    // Unused for COUNT(*).
+    pub col: i64,
+}
+
+// A value of an output row: a column of the group's first row (or of the
+// row), or the aggregate with this index in Plan.aggs.
+pub enum Expr {
+    Col(i64),
+    Agg(i64),
+}
+
+pub enum Arg {
+    Col(i64),
+    Lit(Value),
+}
+
+pub enum Cond {
+    Or(i64, i64),
+    And(i64, i64),
+    Not(i64),
+    IsNull(Arg, bool),
+    Cmp(Arg, CmpOp, Arg),
+}
+
+pub struct OrderKey {
+    pub expr: Expr,
+    pub desc: bool,
+}
+
+pub struct Plan {
+    pub headers: Vec<[u8]>,
+    pub select: Vec<Expr>,
+    pub conds: Vec<Cond>,
+    pub cond: Option<i64>,
+    pub grouped: bool,
+    pub group: Option<i64>,
+    pub aggs: Vec<Agg>,
+    pub order: Vec<OrderKey>,
+    pub limit: Option<i64>,
+}
+
+impl Plan {
+    pub fn free(self: *Plan) {
+        self.headers.free();
+        self.select.free();
+        self.conds.free();
+        self.aggs.free();
+        self.order.free();
+    }
+}
+
+fn message(prefix: [u8], name: [u8], suffix: [u8]) -> [u8] {
+    let mut m = Buf::new();
+    m.push_str(prefix);
+    m.push_str(name);
+    m.push_str(suffix);
+    m.as_slice()
+}
+
+fn type_name(t: ColType) -> [u8] {
+    match t {
+        ColType::Int => "int",
+        ColType::Str => "str",
+    }
+}
+
+fn agg_name(kind: AggKind) -> [u8] {
+    match kind {
+        AggKind::CountStar | AggKind::Count => "COUNT",
+        AggKind::Sum => "SUM",
+        AggKind::Min => "MIN",
+        AggKind::Max => "MAX",
+    }
+}
+
+// The column name of an item, for the unknown-column check.
+fn item_name(item: Item) -> Option<[u8]> {
+    match item {
+        Item::Star => None,
+        Item::Col(n) => Some(n),
+        Item::Agg(AggKind::CountStar, _) => None,
+        Item::Agg(_, n) => Some(n),
+    }
+}
+
+// An error message if `name` is not a column.
+fn check_known(t: *Table, name: Option<[u8]>) -> Option<[u8]> {
+    match name {
+        Some(n) => {
+            if t.find(n).is_none() {
+                return Some(message("unknown column ", n, ""));
+            }
+            None
+        }
+        None => None,
+    }
+}
+
+fn operand_name(op: Operand) -> Option<[u8]> {
+    match op {
+        Operand::Name(n) => Some(n),
+        _ => None,
+    }
+}
+
+fn operand_type(t: *Table, op: Operand) -> ColType {
+    match op {
+        Operand::Name(n) => t.types.get(t.find(n).unwrap()),
+        Operand::Int(_) => ColType::Int,
+        Operand::Str(_) => ColType::Str,
+    }
+}
+
+fn check_sum(t: *Table, item: Item) -> Option<[u8]> {
+    if let Item::Agg(AggKind::Sum, n) = item {
+        if t.types.get(t.find(n).unwrap()) == ColType::Str {
+            return Some(message("cannot SUM str column ", n, ""));
+        }
+    }
+    None
+}
+
+fn resolve_arg(t: *Table, op: Operand) -> Arg {
+    match op {
+        Operand::Name(n) => Arg::Col(t.find(n).unwrap()),
+        Operand::Int(v) => Arg::Lit(Value::Int(v)),
+        Operand::Str(s) => Arg::Lit(Value::Str(s)),
+    }
+}
+
+// The index in `aggs` of this aggregate, adding it when it is new.
+fn agg_index(aggs: *Vec<Agg>, kind: AggKind, col: i64) -> i64 {
+    for i in 0..aggs.len() {
+        let a = aggs.get(i);
+        if a.kind == kind && (kind == AggKind::CountStar || a.col == col) {
+            return i;
+        }
+    }
+    aggs.push(Agg { kind: kind, col: col });
+    aggs.len() - 1
+}
+
+fn resolve_item(t: *Table, aggs: *Vec<Agg>, item: Item) -> Expr {
+    match item {
+        Item::Star => Expr::Col(0),
+        Item::Col(n) => Expr::Col(t.find(n).unwrap()),
+        Item::Agg(AggKind::CountStar, _) => Expr::Agg(agg_index(aggs, AggKind::CountStar, 0)),
+        Item::Agg(kind, n) => Expr::Agg(agg_index(aggs, kind, t.find(n).unwrap())),
+    }
+}
+
+fn header(item: Item) -> [u8] {
+    match item {
+        Item::Star => "*",
+        Item::Col(n) => n,
+        Item::Agg(AggKind::CountStar, _) => "COUNT(*)",
+        Item::Agg(kind, n) => {
+            let mut h = Buf::new();
+            h.push_str(agg_name(kind));
+            h.push('(');
+            h.push_str(n);
+            h.push(')');
+            h.as_slice()
+        }
+    }
+}
+
+fn is_group_col(t: *Table, group: Option<i64>, name: [u8]) -> bool {
+    match group {
+        Some(g) => t.find(name).unwrap() == g,
+        None => false,
+    }
+}
+
+// The first error of the query, in the order of the checks.
+fn first_error(q: *Query, t: *Table) -> Option<[u8]> {
+    // 1. the table
+    if q.table != "t" {
+        return Some(message("unknown table ", q.table, ""));
+    }
+    // 2. unknown columns, in the order they are written
+    for item in q.items.as_slice() {
+        let e = check_known(t, item_name(item));
+        if e.is_some() {
+            return e;
+        }
+    }
+    for node in q.nodes.as_slice() {
+        let mut e: Option<[u8]> = None;
+        match node {
+            Node::IsNull(a, _) => e = check_known(t, operand_name(a)),
+            Node::Cmp(a, _, b) => {
+                e = check_known(t, operand_name(a));
+                if e.is_none() {
+                    e = check_known(t, operand_name(b));
+                }
+            }
+            _ => {}
+        }
+        if e.is_some() {
+            return e;
+        }
+    }
+    if let Some(g) = q.group {
+        let e = check_known(t, Some(g));
+        if e.is_some() {
+            return e;
+        }
+    }
+    for o in q.order.as_slice() {
+        let e = check_known(t, item_name(o.item));
+        if e.is_some() {
+            return e;
+        }
+    }
+    // 3. types
+    for item in q.items.as_slice() {
+        let e = check_sum(t, item);
+        if e.is_some() {
+            return e;
+        }
+    }
+    for node in q.nodes.as_slice() {
+        if let Node::Cmp(a, _, b) = node {
+            let ta = operand_type(t, a);
+            let tb = operand_type(t, b);
+            if ta != tb {
+                let mut m = Buf::new();
+                m.push_str("cannot compare ");
+                m.push_str(type_name(ta));
+                m.push_str(" with ");
+                m.push_str(type_name(tb));
+                return Some(m.as_slice());
+            }
+        }
+    }
+    for o in q.order.as_slice() {
+        let e = check_sum(t, o.item);
+        if e.is_some() {
+            return e;
+        }
+    }
+    // 4. grouping
+    let grouped = is_grouped(q);
+    let group = match q.group {
+        Some(g) => t.find(g),
+        None => None,
+    };
+    if grouped {
+        for item in q.items.as_slice() {
+            match item {
+                Item::Star => return Some("column * must be grouped or aggregated"),
+                Item::Col(n) if !is_group_col(t, group, n) => {
+                    return Some(message("column ", n, " must be grouped or aggregated"));
+                }
+                _ => {}
+            }
+        }
+    }
+    for o in q.order.as_slice() {
+        match o.item {
+            Item::Col(n) if grouped && !is_group_col(t, group, n) => {
+                return Some(message("column ", n, " must be grouped or aggregated"));
+            }
+            Item::Agg(_, _) if !grouped => {
+                return Some("aggregate in ORDER BY of an ungrouped query");
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn is_grouped(q: *Query) -> bool {
+    let mut grouped = q.group.is_some();
+    for item in q.items.as_slice() {
+        if let Item::Agg(_, _) = item {
+            grouped = true;
+        }
+    }
+    grouped
+}
+
+// The plan of the query, or its first error. The caller frees the plan.
+pub fn plan(q: *Query, t: *Table) -> Result<Plan, [u8]> {
+    if let Some(e) = first_error(q, t) {
+        return Err(e);
+    }
+    let mut p = Plan {
+        headers: Vec::new(),
+        select: Vec::new(),
+        conds: Vec::new(),
+        cond: q.cond,
+        grouped: is_grouped(q),
+        group: None,
+        aggs: Vec::new(),
+        order: Vec::new(),
+        limit: q.limit,
+    };
+    if let Some(g) = q.group {
+        p.group = t.find(g);
+    }
+    for item in q.items.as_slice() {
+        if let Item::Star = item {
+            for c in 0..t.ncols() {
+                p.headers.push(t.names.get(c));
+                p.select.push(Expr::Col(c));
+            }
+        } else {
+            p.headers.push(header(item));
+            p.select.push(resolve_item(t, &p.aggs, item));
+        }
+    }
+    for o in q.order.as_slice() {
+        p.order.push(OrderKey { expr: resolve_item(t, &p.aggs, o.item), desc: o.desc });
+    }
+    for node in q.nodes.as_slice() {
+        p.conds.push(match node {
+            Node::Or(a, b) => Cond::Or(a, b),
+            Node::And(a, b) => Cond::And(a, b),
+            Node::Not(a) => Cond::Not(a),
+            Node::IsNull(a, neg) => Cond::IsNull(resolve_arg(t, a), neg),
+            Node::Cmp(a, op, b) => Cond::Cmp(resolve_arg(t, a), op, resolve_arg(t, b)),
+        });
+    }
+    Ok(p)
+}

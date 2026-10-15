@@ -7,6 +7,7 @@
 # line). Its end is front/stdalloc.tach's std_alloc_tail (0.16): Gpa's
 # implementation, gpa.tach (std_gpa_source here), and std::CHECK_ALLOC.
 # Run it after changing any of them; tests/run.sh checks they agree.
+# (0.15) It also writes std_index, the sections' index (index.awk).
 #
 # usage: compiler/std/embed.sh [-c]   (-c: only check, exit 1 if stale)
 set -eu
@@ -39,6 +40,19 @@ lines() {
     echo "pub fn std_gpa_source(out: i64) {"
     echo "    unsafe {"
     lines <compiler/std/gpa.tach
+    echo "    }"
+    echo "}"
+    echo ""
+    echo "// (0.15) The index of std's sections (compiler/std/index.awk): what"
+    echo "// each defines and needs, so that a program's loader lexes only the"
+    echo "// sections it can reach (front/modules: load_std_sections)."
+    echo "pub fn std_index(out: i64) {"
+    echo "    unsafe {"
+    # (0.16: over std_source's whole text, std_alloc_tail's included: Gpa's
+    # implementation and CHECK_ALLOC as without --check-alloc)
+    { for f in $files; do cat "compiler/std/$f.tach"; done; cat compiler/std/gpa.tach
+        echo "pub const CHECK_ALLOC: bool = false;"; } | LC_ALL=C awk -f compiler/std/index.awk |
+        grep -v '^#' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/^/        buf_str(out, c"/' -e 's/$/\\n");/'
     echo "    }"
     echo "}"
 } >"$tmp"

@@ -18,6 +18,7 @@
 // in lookup.tach: scopes, `use` items, lookups and paths.
 
 pub mod lookup;
+mod stdsections;
 
 use crate::base::{
     BUFS, FILES, FILE_COUNT, IntVec, SYMS, add_source, buf_byte, buf_bytes, buf_clear, buf_new,
@@ -30,10 +31,12 @@ use crate::front::ast::NODES;
 use crate::front::cpp::directives::{file_exists, path_dir};
 use crate::front::lexer::{TOKS, TOK_COUNT, Tok, lex_range};
 use crate::front::modules::lookup::{is_prelude015, is_prelude_name};
+use crate::front::modules::stdsections::load_std_sections;
 use crate::front::stdsrc::std_source;
 use crate::middle::lower::ssa::HMap;
 use crate::middle::profile::{PROFILE_GENERATE, PROFILE_MODULE, profile_runtime_source};
 use crate::middle::unsafecheck::{CHECK_MODULE, CHECK_UNSAFE, check_runtime_source};
+use crate::tools::query::QUERY;
 
 // What other modules use of the parts.
 
@@ -268,27 +271,39 @@ pub fn load_modules() {
 // `tachyonc query` about std from a program that does not use it.
 pub static mut STD_ALWAYS: bool = false;
 
+// (0.15) std's file, when it is loaded.
+static mut STD_FILE: i64 = -1;
+
 // The standard library, when the program names it (`std::...`) or (0.6) a
 // name of the prelude (0.14: or uses a range as a value; 0.15: or an
 // f-string, `?` or `#[derive]`, or the query asks about std, STD_ALWAYS),
-// once.
+// once. (0.15) Only the sections of std the program reaches are lexed
+// (stdsections); at the second call, once the modules' files are read,
+// what they reach more.
 fn load_std_if_named() {
     unsafe {
+        if STD_MODULE >= 0 {
+            let f = STD_FILE;
+            load_std_sections(FILES[f].start, FILES[f].end, STD_ALWAYS || QUERY);
+            return;
+        }
         for i in 0..TOK_COUNT - 1 {
-            if TOKS[i].kind == Tok::Ident && STD_MODULE < 0
+            if TOKS[i].kind == Tok::Ident
                 && ((TOKS[i + 1].kind == Tok::ColonColon
                     && TOKS[i].value as i64 == intern_c(c"std"))
                     || is_prelude_name(TOKS[i].value as i64)
                     && (!is_prelude015(TOKS[i].value as i64) || uses_prelude015(i)))
-                || STD_MODULE < 0 && (TOKS[i].kind == Tok::DotDot || TOKS[i].kind == Tok::DotDotEq)
+                || (TOKS[i].kind == Tok::DotDot || TOKS[i].kind == Tok::DotDotEq)
                 && range_as_value(i)
-                || STD_MODULE < 0 && needs_std015(i) || STD_ALWAYS && STD_MODULE < 0 {
+                || needs_std015(i) || STD_ALWAYS {
                 let text = buf_new();
                 std_source(text);
                 let start = add_source(c"<std>", text);
                 STD_MODULE = add_module(intern_c(c"std"), 0, true);
-                FILES[FILE_COUNT - 1].module = STD_MODULE;
-                lex_range(start, FILES[FILE_COUNT - 1].end, false);
+                STD_FILE = FILE_COUNT - 1;
+                FILES[STD_FILE].module = STD_MODULE;
+                load_std_sections(start, FILES[STD_FILE].end, STD_ALWAYS || QUERY);
+                return;
             }
         }
     }
@@ -343,7 +358,7 @@ fn is_declaring(k: Tok) -> bool {
 // within its statement, no `=>` or `=` (a match arm's or an `if let`'s
 // pattern); before it, no `for` loop's `in` and no `[` (a slicing), or
 // the `in` of `for x in (a..b).m() {`.
-fn range_as_value(i: i64) -> bool {
+pub fn range_as_value(i: i64) -> bool {
     unsafe {
         let mut depth = 0;
         let mut j = i + 1;

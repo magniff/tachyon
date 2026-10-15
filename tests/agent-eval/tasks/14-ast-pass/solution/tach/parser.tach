@@ -1,0 +1,358 @@
+// Parses tokens into the tree, by recursive descent:
+//
+//   program := stmt* END
+//   stmt    := 'let' NAME '=' expr ';'
+//            | NAME '=' expr ';'
+//            | 'print' expr (',' expr)* ';'
+//            | 'if' expr block ('else' (if-stmt | block))?
+//            | 'while' expr block
+//            | block
+//   block   := '{' stmt* '}'
+//   expr    := and ('||' and)*
+//   and     := eq ('&&' eq)*
+//   eq      := rel (('==' | '!=') rel)*
+//   rel     := add (('<' | '<=' | '>' | '>=') add)*
+//   add     := mul (('+' | '-') mul)*
+//   mul     := unary (('*' | '/' | '%') unary)*
+//   unary   := ('-' | '!') unary | primary
+//   primary := NUMBER | NAME | '(' expr ')'
+//
+// A syntax error is the line of the token where parsing failed.
+
+use crate::ast::{Ast, BinOp, Expr, Stmt, UnOp};
+use crate::lexer::{Lexed, Token, TokenKind};
+
+struct Parser {
+    tokens: Vec<Token>,
+    pos: i64,
+    ast: Ast,
+}
+
+impl Parser {
+    fn peek(self: *Parser) -> TokenKind {
+        self.tokens.get(self.pos).kind
+    }
+
+    fn advance(self: *Parser) -> Token {
+        let t = self.tokens.get(self.pos);
+        if t.kind != TokenKind::End {
+            self.pos += 1;
+        }
+        t
+    }
+
+    // The next token, which must be of `kind`; else the error's line.
+    fn expect(self: *Parser, kind: TokenKind) -> Result<Token, i64> {
+        let t = self.advance();
+        if t.kind != kind {
+            return Err(t.line);
+        }
+        Ok(t)
+    }
+
+    fn binary(self: *Parser, op: BinOp, left: i64, right: i64, line: i64) -> i64 {
+        self.ast.add_expr(Expr::Binary(op, left, right, line))
+    }
+
+    fn expr(self: *Parser) -> Result<i64, i64> {
+        let mut left = match self.and_expr() {
+            Ok(e) => e,
+            Err(l) => return Err(l),
+        };
+        while self.peek() == TokenKind::OrOr {
+            let line = self.advance().line;
+            let right = match self.and_expr() {
+                Ok(e) => e,
+                Err(l) => return Err(l),
+            };
+            left = self.binary(BinOp::Or, left, right, line);
+        }
+        Ok(left)
+    }
+
+    fn and_expr(self: *Parser) -> Result<i64, i64> {
+        let mut left = match self.eq_expr() {
+            Ok(e) => e,
+            Err(l) => return Err(l),
+        };
+        while self.peek() == TokenKind::AndAnd {
+            let line = self.advance().line;
+            let right = match self.eq_expr() {
+                Ok(e) => e,
+                Err(l) => return Err(l),
+            };
+            left = self.binary(BinOp::And, left, right, line);
+        }
+        Ok(left)
+    }
+
+    fn eq_expr(self: *Parser) -> Result<i64, i64> {
+        let mut left = match self.rel_expr() {
+            Ok(e) => e,
+            Err(l) => return Err(l),
+        };
+        loop {
+            let op = match self.peek() {
+                TokenKind::EqEq => BinOp::Eq,
+                TokenKind::Ne => BinOp::Ne,
+                _ => return Ok(left),
+            };
+            let line = self.advance().line;
+            let right = match self.rel_expr() {
+                Ok(e) => e,
+                Err(l) => return Err(l),
+            };
+            left = self.binary(op, left, right, line);
+        }
+    }
+
+    fn rel_expr(self: *Parser) -> Result<i64, i64> {
+        let mut left = match self.add_expr() {
+            Ok(e) => e,
+            Err(l) => return Err(l),
+        };
+        loop {
+            let op = match self.peek() {
+                TokenKind::Lt => BinOp::Lt,
+                TokenKind::Le => BinOp::Le,
+                TokenKind::Gt => BinOp::Gt,
+                TokenKind::Ge => BinOp::Ge,
+                _ => return Ok(left),
+            };
+            let line = self.advance().line;
+            let right = match self.add_expr() {
+                Ok(e) => e,
+                Err(l) => return Err(l),
+            };
+            left = self.binary(op, left, right, line);
+        }
+    }
+
+    fn add_expr(self: *Parser) -> Result<i64, i64> {
+        let mut left = match self.mul_expr() {
+            Ok(e) => e,
+            Err(l) => return Err(l),
+        };
+        loop {
+            let op = match self.peek() {
+                TokenKind::Plus => BinOp::Add,
+                TokenKind::Minus => BinOp::Sub,
+                _ => return Ok(left),
+            };
+            let line = self.advance().line;
+            let right = match self.mul_expr() {
+                Ok(e) => e,
+                Err(l) => return Err(l),
+            };
+            left = self.binary(op, left, right, line);
+        }
+    }
+
+    fn mul_expr(self: *Parser) -> Result<i64, i64> {
+        let mut left = match self.unary() {
+            Ok(e) => e,
+            Err(l) => return Err(l),
+        };
+        loop {
+            let op = match self.peek() {
+                TokenKind::Star => BinOp::Mul,
+                TokenKind::Slash => BinOp::Div,
+                TokenKind::Percent => BinOp::Rem,
+                _ => return Ok(left),
+            };
+            let line = self.advance().line;
+            let right = match self.unary() {
+                Ok(e) => e,
+                Err(l) => return Err(l),
+            };
+            left = self.binary(op, left, right, line);
+        }
+    }
+
+    fn unary(self: *Parser) -> Result<i64, i64> {
+        let op = match self.peek() {
+            TokenKind::Minus => UnOp::Neg,
+            TokenKind::Bang => UnOp::Not,
+            _ => return self.primary(),
+        };
+        let line = self.advance().line;
+        let operand = match self.unary() {
+            Ok(e) => e,
+            Err(l) => return Err(l),
+        };
+        Ok(self.ast.add_expr(Expr::Unary(op, operand, line)))
+    }
+
+    fn primary(self: *Parser) -> Result<i64, i64> {
+        let t = self.advance();
+        match t.kind {
+            TokenKind::Num => Ok(self.ast.add_expr(Expr::Num(t.value))),
+            TokenKind::Ident => Ok(self.ast.add_expr(Expr::Var(t.value, t.line))),
+            TokenKind::LParen => {
+                let inner = match self.expr() {
+                    Ok(e) => e,
+                    Err(l) => return Err(l),
+                };
+                if let Err(l) = self.expect(TokenKind::RParen) {
+                    return Err(l);
+                }
+                Ok(inner)
+            }
+            _ => Err(t.line),
+        }
+    }
+
+    // `{ stmt* }`: the list (first, count) of its statements.
+    fn block(self: *Parser) -> Result<(i64, i64), i64> {
+        if let Err(l) = self.expect(TokenKind::LBrace) {
+            return Err(l);
+        }
+        let mut items: Vec<i64> = Vec::new();
+        defer items.free();
+        while self.peek() != TokenKind::RBrace {
+            if self.peek() == TokenKind::End {
+                return Err(self.advance().line);
+            }
+            let s = match self.stmt() {
+                Ok(s) => s,
+                Err(l) => return Err(l),
+            };
+            items.push(s);
+        }
+        self.advance();
+        let first = self.ast.add_list(items.as_slice());
+        Ok((first, items.len()))
+    }
+
+    // `if` and what follows it, the `if` already read.
+    fn if_rest(self: *Parser) -> Result<i64, i64> {
+        let cond = match self.expr() {
+            Ok(e) => e,
+            Err(l) => return Err(l),
+        };
+        let (first, count) = match self.block() {
+            Ok(b) => b,
+            Err(l) => return Err(l),
+        };
+        let mut els = -1;
+        if self.peek() == TokenKind::Else {
+            self.advance();
+            if self.peek() == TokenKind::If {
+                self.advance();
+                els = match self.if_rest() {
+                    Ok(s) => s,
+                    Err(l) => return Err(l),
+                };
+            } else {
+                let (f, c) = match self.block() {
+                    Ok(b) => b,
+                    Err(l) => return Err(l),
+                };
+                els = self.ast.add_stmt(Stmt::Block(f, c));
+            }
+        }
+        Ok(self.ast.add_stmt(Stmt::If(cond, first, count, els)))
+    }
+
+    fn stmt(self: *Parser) -> Result<i64, i64> {
+        let t = self.advance();
+        match t.kind {
+            TokenKind::Let => {
+                let name = match self.expect(TokenKind::Ident) {
+                    Ok(n) => n.value,
+                    Err(l) => return Err(l),
+                };
+                if let Err(l) = self.expect(TokenKind::Assign) {
+                    return Err(l);
+                }
+                let e = match self.expr() {
+                    Ok(e) => e,
+                    Err(l) => return Err(l),
+                };
+                if let Err(l) = self.expect(TokenKind::Semi) {
+                    return Err(l);
+                }
+                Ok(self.ast.add_stmt(Stmt::Let(name, e)))
+            }
+            TokenKind::Ident => {
+                if let Err(l) = self.expect(TokenKind::Assign) {
+                    return Err(l);
+                }
+                let e = match self.expr() {
+                    Ok(e) => e,
+                    Err(l) => return Err(l),
+                };
+                if let Err(l) = self.expect(TokenKind::Semi) {
+                    return Err(l);
+                }
+                Ok(self.ast.add_stmt(Stmt::Set(t.value, e, t.line)))
+            }
+            TokenKind::Print => {
+                let mut items: Vec<i64> = Vec::new();
+                defer items.free();
+                loop {
+                    let e = match self.expr() {
+                        Ok(e) => e,
+                        Err(l) => return Err(l),
+                    };
+                    items.push(e);
+                    if self.peek() != TokenKind::Comma {
+                        break;
+                    }
+                    self.advance();
+                }
+                if let Err(l) = self.expect(TokenKind::Semi) {
+                    return Err(l);
+                }
+                let first = self.ast.add_list(items.as_slice());
+                Ok(self.ast.add_stmt(Stmt::Print(first, items.len())))
+            }
+            TokenKind::If => self.if_rest(),
+            TokenKind::While => {
+                let cond = match self.expr() {
+                    Ok(e) => e,
+                    Err(l) => return Err(l),
+                };
+                let (first, count) = match self.block() {
+                    Ok(b) => b,
+                    Err(l) => return Err(l),
+                };
+                Ok(self.ast.add_stmt(Stmt::While(cond, first, count)))
+            }
+            TokenKind::LBrace => {
+                self.pos -= 1;
+                let (first, count) = match self.block() {
+                    Ok(b) => b,
+                    Err(l) => return Err(l),
+                };
+                Ok(self.ast.add_stmt(Stmt::Block(first, count)))
+            }
+            _ => Err(t.line),
+        }
+    }
+}
+
+// The tree of the whole program, or the line of its first syntax error.
+pub fn parse(lexed: Lexed) -> Result<Ast, i64> {
+    let ast = Ast {
+        exprs: Vec::new(),
+        stmts: Vec::new(),
+        lists: Vec::new(),
+        names: lexed.names,
+        top_first: 0,
+        top_count: 0,
+    };
+    let mut p = Parser { tokens: lexed.tokens, pos: 0, ast: ast };
+    let mut items: Vec<i64> = Vec::new();
+    defer items.free();
+    while p.peek() != TokenKind::End {
+        let s = match p.stmt() {
+            Ok(s) => s,
+            Err(l) => return Err(l),
+        };
+        items.push(s);
+    }
+    p.ast.top_first = p.ast.add_list(items.as_slice());
+    p.ast.top_count = items.len();
+    Ok(p.ast)
+}
