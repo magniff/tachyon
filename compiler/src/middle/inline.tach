@@ -399,16 +399,44 @@ fn site_cold(b: i64) -> bool {
 // Whether optimized function g calls a function that returns twice (see
 // FN_RT).
 fn callee_returns_twice(g: i64) -> bool {
+    (callee_flags(g) & RT_RETURNS_TWICE) != 0
+}
+
+// Whether optimized function g calls nothing (0.17: see should_inline).
+fn callee_is_leaf(g: i64) -> bool {
+    (callee_flags(g) & RT_CALLS) == 0
+}
+
+// FN_RT[g], computed once g is optimized.
+fn callee_flags(g: i64) -> i64 {
     unsafe {
         if FN_RT[g] < 0 {
             let back = IR_CUR;
             ir_enter(g);
-            FN_RT[g] = if calls_returns_twice(g) { 1 } else { 0 };
+            let mut flags = if calls_returns_twice(g) { RT_RETURNS_TWICE } else { 0 };
+            for b in IRFUNCS[g].blocks.items() {
+                if BLOCKS[b].removed == 0 {
+                    let mut v = BLOCKS[b].first;
+                    while v != 0 {
+                        if INSTS[v].op.is_call() {
+                            flags = flags | RT_CALLS;
+                        }
+                        v = INSTS[v].next;
+                    }
+                }
+            }
+            FN_RT[g] = flags;
             ir_enter(back);
         }
-        FN_RT[g] == 1
+        FN_RT[g]
     }
 }
+
+const RT_RETURNS_TWICE: i64 = 1;
+const RT_CALLS: i64 = 2;
+// (0.17) A leaf this small is inlined whatever the program's budget (see
+// should_inline).
+const INLINE_LEAF: i64 = 6;
 
 fn should_inline(fi: i64, g: i64, call: i64) -> bool {
     unsafe {
@@ -443,7 +471,13 @@ fn should_inline(fi: i64, g: i64, call: i64) -> bool {
         if once && is_closure_fn(g) {
             return true;
         }
-        if FN_SIZE[fi] + FN_SIZE[g] > INLINE_BUDGET || PROGRAM_SIZE + FN_SIZE[g] > PROGRAM_BUDGET {
+        // (0.17) A small leaf is not charged to the program's budget: its
+        // code is about its call's (the arguments' moves, the call, the
+        // caller-saved registers it clobbers), and the program's callers,
+        // last in the order, found the budget spent.
+        let small_leaf = FN_SIZE[g] <= INLINE_LEAF && callee_is_leaf(g);
+        if FN_SIZE[fi] + FN_SIZE[g] > INLINE_BUDGET
+            || (PROGRAM_SIZE + FN_SIZE[g] > PROGRAM_BUDGET && !small_leaf) {
             return false;
         }
         // (0.10: with a profile, a call that never ran is cold, and a hot one
