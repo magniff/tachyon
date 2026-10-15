@@ -180,6 +180,7 @@ def run(prompt, ws, bin_dir, model, timeout_s, rdir, check_hook=None, query_hook
 
 def parse_stream(path):
     init, result = None, None
+    results = []
     usage_by_msg = {}
     calls = []
     denials = []
@@ -206,23 +207,34 @@ def parse_stream(path):
                     if c.get("type") == "tool_use":
                         calls.append((c.get("name"), c.get("input") or {}))
             elif t == "result":
+                # (0.16) a session can end more than once: a background task
+                # finishing after the answer starts another turn and another
+                # result. num_turns, usage and permission_denials are per
+                # result (summed below); total_cost_usd is cumulative.
                 result = d
+                results.append(d)
     kinds = Counter()
     for name, inp in calls:
         kinds.update(classify_call(name, inp))
-    if result and result.get("usage"):
-        u = result["usage"]
+    if results and all(r.get("usage") for r in results):
+        u = Counter()
+        for r in results:
+            for k in ("input_tokens", "output_tokens", "cache_read_input_tokens",
+                      "cache_creation_input_tokens"):
+                u[k] += r["usage"].get(k) or 0
     else:  # killed: add up the messages seen
         u = Counter()
         for mu in usage_by_msg.values():
             for k in ("input_tokens", "output_tokens", "cache_read_input_tokens",
                       "cache_creation_input_tokens"):
                 u[k] += mu.get(k) or 0
+    result_denials = [x for r in results for x in r.get("permission_denials") or []]
     fresh = u.get("input_tokens") or 0
     cread = u.get("cache_read_input_tokens") or 0
     cwrite = u.get("cache_creation_input_tokens") or 0
     res = {
-        "turns": (result or {}).get("num_turns", len(usage_by_msg)),
+        "turns": (sum(r.get("num_turns") or 0 for r in results) if results
+                  else len(usage_by_msg)),
         "tool_calls": len(calls),
         "tool_calls_by_kind": dict(sorted(kinds.items())),
         # every prompt token the model read: fresh + cache writes + cache reads
@@ -231,13 +243,14 @@ def parse_stream(path):
         "cache_read_tokens": cread,
         "cache_creation_tokens": cwrite,
         "cost_usd": (result or {}).get("total_cost_usd"),
-        "permission_denials": len((result or {}).get("permission_denials") or denials),
+        "permission_denials": len(result_denials or denials),
         "permission_denied": [
-            json.dumps(x.get("tool_input"))[:300]
-            for x in (result or {}).get("permission_denials") or []] or
+            json.dumps(x.get("tool_input"))[:300] for x in result_denials] or
             [x["tool"] for x in denials],
         "error": None,
     }
+    if len(results) > 1:
+        res["results"] = len(results)
     if hook_events:
         res["hook_events"] = dict(hook_events)
     if init:
