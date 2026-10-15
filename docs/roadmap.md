@@ -825,6 +825,35 @@ off from 0.15). Benchmarks and compile times in "Benchmarks", 0.15.
 - the compiler's source moves to `?`, `derive`, interpolation and widening
   (0.15)
 
+Done (0.16.0). The design (docs/design/effects-allocation.md, with the
+user's decisions: allocation strictly explicit, no ambient allocator),
+an interface commit with stubs, and six parallel tasks: effects
+(inference over the call graph per instance, through `fn` values and C,
+declarations and `effects(..)` bounds checked, why-chains,
+`--verify-effects`); allocators (`Allocator`, `Gpa`, arenas with scoped
+arenas, `FixedBuf`, `#[sealed]` and `#[scoped]`, a `Fmt` that never
+allocates, std's loops counted so growing a Vec does not diverge);
+`--check-alloc` (a checking Gpa: pages of their own, never reused; arenas
+routed through it); the optimizer (pure calls value-numbered and hoisted
+from the inferred effects, arena allocation without a call, the gaps the
+algorithm examples showed); the tools (`fix --only alloc016`, which moved
+the whole corpus, `query effects`, the guide's `effects` and `allocators`
+topics); the compiler's source on 0.15's features. Decided at
+integration: `a.scope(..)` is `alloc(Arena)`, the arena's own use of Gpa
+its business; std's `Eq`/`Ord`/`Hash` `#[pure]`; `fix --only alloc016`
+also rewrites the reads of sealed fields. Also in 0.16: link inputs on
+the command line (`x.c`, `x.o`, `-l`, `-L`); the examples in folders with
+READMEs, C interop and language tours; compiler tasks in the agent eval
+(tools against plain). Moved: naming an allocator by value in effects
+(`alloc(arena)` for a parameter: only types now) to 0.17, with values
+that carry their allocator; memoizing pure calls across the program
+(numbering and hoisting are done) to a later optimizer release; the
+lru-cache gap (the probe loop around an out-of-line `HashMap::insert`,
+which the capture analysis does not prove non-capturing) and a widening
+multiply-accumulate on x86_64 to a later perf task; the effects and
+allocators examples (examples/effects, examples/allocators) to 0.16.1 if
+they miss the gate.
+
 ## 0.17: memory safety by mutable value semantics
 
 - values are values: assigning a type owning memory (`Vec`, `Buf`,

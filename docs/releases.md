@@ -46,8 +46,138 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.13.0 | `v0.13.0` | 0.12.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | the tools, improved from 0.12's record: `edit patch` inside a line, `--pairs`, `edit wrap`, `edit new-file`, `signature --default`, `fix --in` over a subtree; section banners, `query grep`, `query type`, kinds of references; an on-disk cache (a query or `check` of an unchanged program in about 6 to 8 ms); `split` part names, layout kept by `move` and `split`, `refactor extract-function` and `inline`; `tachyonc fmt` (the tree formatted), `explain` and `guide` |
 | 0.14.0 | `v0.14.0` | 0.13.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | closures and iterators: closures (captures by value or by reference, `move`, `Fn`/`FnMut` bounds, a non-capturing closure is a `fn`, an escape check); associated types; an `Iterator` trait, `for` over anything iterable, ranges as values, std's sources, adapters and consumers, chains compiled to the hand-written loop; std reads stdin (`read_line`, `read_stdin`, `Scanner`), text helpers, values changed in place, an introsort; did-you-mean across the program and std, helps for Rust habits; the tools on a user's program; the agent eval (`tests/agent-eval/`) and its 0.13 baseline |
 | 0.15.0 | `v0.15.0` | 0.14.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | errors, conversions, less boilerplate: `?` on `Option` and `Result`, generic traits, `From`/`Into`, `main` returning `Result`, std's I/O on `Result` with typed errors (`fix --only std015` moves 0.14 code); lossless integer widening and joins, `i64::MAX`; f-strings over `Display` and `Debug`, generic `print`/`format`; `#[derive(Eq, Ord, Hash, Debug, Clone)]`; named and default arguments, field shorthand; `==` on `Vec`, `Buf`, `HashMap` by contents; std loaded by sections; if-conversion, vector masks and min/max reductions, split accumulators, `ldp`/`stp` (iterloop from 2.1 to about 1.05 times C); the tools for agents (`query context`, budgets, std from any program, `try`, `batch`, `edit apply`, merge conflicts, `--json`, the check hook); back end, gen0 and base on closures and iterators; algorithm and tool examples; six harder eval tasks |
+| 0.16.0 | `v0.16.0` | 0.15.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | effects and explicit allocation: inferred effect sets (`alloc(A)`, `io`, `global`, `panic`, `diverge`, `unsafe`) shown by `query effects` (`--why`, `--has`), `#[pure]`/`#[no_alloc]`/`#[no_io]`/`#[no_panic]`/`#[effects(..)]` and `effects(..)` bounds checked transitively (std's `Eq`/`Ord`/`Hash` pure), `--verify-effects`; allocation explicit (`fn main(gpa: Gpa)`, `Vec::new_in(gpa)`, `fix --only alloc016` moves 0.15 code), the `Allocator` trait, `Gpa`, arenas, `arena_scope`, `FixedBuf`, a `Fmt` that never allocates; `#[sealed]` std types, `#[scoped]` arenas; `--check-alloc` (use after free, double free, leaks, arena resets and scopes); pure calls numbered and hoisted, arena allocation without a call; link inputs on the command line (`x.c`, `-l`, `-L`); examples in folders with READMEs, C interop and language tours; the compiler's source on 0.15's features; compiler tasks in the agent eval |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.16
+
+The design, its work split and each part's notes are in
+docs/design/effects-allocation.md; the language in docs/grammar.md,
+"Additions of 0.16"; `tachyonc guide effects` and `guide allocators`;
+the optimizer's side in docs/optimizer.md, "0.16".
+
+- **Effects**: every function has an inferred set of effects: `alloc(A)`
+  (which allocators it allocates from: `alloc(Gpa)`, `alloc(Arena)`,
+  `alloc(extern)` for C's malloc), `io`, `global` (reads or writes a
+  static), `panic`, `diverge` (may not return: a `while` or `loop`, or
+  recursion; a counted `for` returns), `unsafe`. Generic functions per
+  instance; calls through `fn` values and closures by the functions of
+  that type whose address is taken; C functions by a table of libc
+  (libm and `mem*` none, malloc `alloc(extern)`, stdio `io`, exit `io
+  diverge`) or their declarations. An allocator's own methods are its
+  business: a call of `a.alloc(..)` is `alloc(Arena)`, not the Gpa the
+  arena refills from; `arena_scope(gpa, f)` and `a.scope(f)` are the
+  closure's effects minus its scoped arena, plus the parent's. `tachyonc
+  query effects NAME` (`--has EFFECT`, `--why EFFECT`: the chain of calls
+  down to the source, one line a step; a module), and `query def`, `show`
+  and `context` print `effects: ...`.
+- **Declarations, checked**: `#[pure]` (no `alloc`, `io`, `global`),
+  `#[no_alloc]`, `#[no_io]`, `#[no_panic]`, `#[effects(alloc(Gpa),
+  panic)]` (an upper bound), on functions, trait functions (binding every
+  impl, derived ones too) and C declarations (trusted); bounds `F: Fn(i64)
+  -> i64 + effects(panic)` checked where `F` is given. std's `Eq::eq`,
+  `Ord::cmp` and `Hash::hash` are `#[pure]`. A broken declaration is one
+  error naming where the effect comes from (`'f' is #[no_alloc], but it
+  allocates from Gpa: 'v.push(x)' at a.tach:7:9 grows a Vec<i64>`) and the
+  `query effects --why` command. `--verify-effects` checks the IR's
+  calls of C and stores to statics against the inferred sets.
+- **Allocation is explicit**, as in Zig: nothing allocates without an
+  allocator. `fn main(gpa: Gpa)` (the last parameter after `argc, argv`)
+  is where a program's general-purpose allocator comes from; it is passed
+  down as a parameter (`Vec::new_in(gpa)`, `with_capacity_in`,
+  `filled_in`, `Buf::new_in`, `HashMap::new_in`, `collect_in`,
+  `format_in`, `read_stdin_in`, `split_in`, `split_whitespace_in`,
+  `sort_stable_in`); a container carries its allocator (`push` grows
+  with it; `v.allocator()`). The `Allocator` trait (`try_alloc`,
+  `try_resize`, `free`; `alloc`/`resize` stop on out of memory); `Gpa`;
+  `Arena::new_in(gpa)` (bump allocation in chunks, the last block grows
+  in place, blocks over 32 KB of their own; `used`, unsafe `reset` and
+  `free_all`), `arena_scope(gpa, |a| ..)` and `a.scope(|s| ..)` (all of
+  the scope's memory given back at its end), `FixedBuf::new(mem[..])`;
+  `try_push`, `try_reserve`, `AllocError`. A `Fmt` never allocates
+  (print's path reaches no allocator), so `println` works in
+  `#[no_alloc]` code.
+- **`#[sealed]` and `#[scoped]`**: std's `Vec`, `Buf`, `HashMap`, `Gpa`,
+  `Arena`, `ScopedArena`, `FixedBuf` and `Fmt` are sealed: their fields
+  are private to std and only std makes them (`v.len()`, not `v.len`);
+  `ScopedArena` is scoped: no value holding it leaves its scope (returned,
+  captured by another scope, put in a static). A static holds a
+  container through a constant constructor (`static mut V: Vec<i64,
+  Arena> = Vec::new_in(Arena::none());`, set up in main).
+- **`--check-alloc`**: the program is built with a checking `Gpa` (any
+  `-O`): every block on pages of its own, never reused, so a use after
+  free, a double free, a free of a wrong pointer, size or allocator stop
+  the program with where the block was allocated and freed; leaks are
+  listed at exit (`gpa.live_blocks()`, `gpa.check_leaks()` in a test).
+  Arenas and `FixedBuf` are checked the same way (a view used after
+  `reset`, after its scope ended, after its Vec grew). With
+  `--check-unsafe` too, raw-pointer accesses into Gpa's blocks are
+  checked exactly.
+- **The optimizer uses the effects** (docs/optimizer.md, "0.16"): calls
+  of functions that read nothing are value-numbered by callee and
+  arguments and hoisted out of loops (`willreturn` from counted loops,
+  `nopanic`), read-only calls merged within a block; an arena's bump
+  allocation inlines without a call (bench/arena_trees, binarytrees on
+  std's arenas: 33 ms against C's arena 41, binarytrees on malloc 154);
+  the algorithm examples' gaps: derived `Ord` in registers, `u32`
+  without redundant extensions, `count_ones`/`leading_zeros`/
+  `trailing_zeros` (std, AArch64's `cnt`), a widening multiply-accumulate
+  vectorized (Benchmarks, 0.16).
+- **Formatting without allocation and faster**: an f-string's integer
+  hole with a spec is formatted in one pass, `Buf::push_int` writes in
+  place (bench/fmtloop about 0.8 of 0.15's).
+- **Link inputs on the command line**: `tachyonc main.tach helper.c
+  lib.o -l m -L dir -o prog` compiles C files with cc and links objects
+  and libraries; `-lm` is added on Linux when libm is used; `// LINK:` in
+  tests. `-S` writes the symbols of generics instantiated at C types.
+- **The tools**: `fix --only alloc016` moves a 0.15 program to explicit
+  allocation (the calls of 0.15's allocating forms become their `_in`
+  forms, `gpa: Gpa` threaded from main through every caller, before any
+  parameter with a default; the reads of sealed fields become their
+  methods; what cannot take a parameter, an impl of std's trait, a
+  function used as a value, a default, a write of a sealed field, is an
+  error naming the place); `query effects`; `rewrite` with `--subst`,
+  `--list` and name holes, `query callees` (`--transitive`, `--writes`),
+  refs of locals, `edit patch --nth/--all`; fmt and the refactorings know
+  0.16's syntax and keep effect attributes; `same-output` finds the old
+  compiler on PATH; arrays have their slice's methods (`a.iter()`).
+- **Examples** (examples/README.md): one folder each, with a README
+  (what it shows, how to build and run it, its output, a walk through the
+  code, the guide topics): the old examples on 0.15 and 0.16 idioms, C
+  interop (qsort with tachyon callbacks, a libc tour, libm, a C file
+  linked in and C calling tachyon), language tours (closures and
+  iterators, errors and results, traits and generics, formatting); the
+  algorithm examples and the tool sessions on explicit allocation.
+- **The compiler's source** on 0.15's features (`?`, f-strings, derive,
+  widening) in the back end, base, gen0 and most of the front end; six
+  modules over 1000 lines split with `refactor split` (same-output
+  identical).
+- **The agent eval**: compiler tasks (an optimization, a cross-module
+  rename, a checker fix, a std method) run with and without the tools
+  (`--set`, `--reps`, `plans/0.16.md`).
+- **Tested on aarch64 only**, as 0.15 (x86_64 off by default,
+  `gate.sh --with-x86`).
+- **Breaking** (`tachyonc fix --only alloc016` moves 0.15 code; what it
+  cannot is an error with the place and what to write):
+  - allocation is explicit: `Vec::new()`, `Buf::new()`,
+    `HashMap::new()`, `with_capacity`, `filled`, `collect()`,
+    `format(x)`, `read_stdin()`, `split`, `split_whitespace`,
+    `sort_stable` are errors naming their `_in` form; `main` takes
+    `gpa: Gpa` to allocate; a parameter's default cannot allocate;
+  - std's containers are sealed: `v.len`, `v.cap`, `v.ptr`, `b.bytes` and
+    `Vec { .. }` literals outside std are errors (the methods: `len()`,
+    `capacity()`, `as_slice()`); with_capacity reserves exactly what it is
+    asked (at least 4), no longer the next power of two;
+  - the I/O API: `read_line(&buf)` takes a `Buf` of any allocator;
+    `read_stdin_in(gpa)`, `split_in`, `split_whitespace_in`, `format_in`;
+    `Fmt::to_buf` is gone (`buf.push_fmt(x)` with a `Display`);
+    `Fmt::spec` returns a `FmtSpec`;
+  - `Eq`, `Ord` and `Hash` impls must be pure (no statics, I/O or
+    allocation: keep a comparator's state behind a pointer);
+  - the prelude gains `Allocator`, `Gpa`, `Arena`, `ScopedArena`,
+    `arena_scope`, `format_in`; `pure`, `effects`, `no_alloc`, `no_io`,
+    `no_panic`, `sealed`, `scoped` are attributes.
 
 ### What's new in 0.15
 
