@@ -144,12 +144,22 @@ exits with 1, as Rust does:
 fn main(gpa: Gpa) -> Result<(), ConfigError> {
     show_rejections(gpa);
     let mut input = read_stdin_in(gpa)?; // IoError -> ConfigError through From
-    defer input.free();
     let config = parse_config(input.as_slice(), gpa)?;
     ...
+    input.free(); // (config.name is a view of it: used above, not after)
     Ok(())
 }
 ```
+
+**An error that holds views.** `UnknownKey` and `Duplicate` carry the
+key as a `[u8]`, a view of `input`, and `main` prints its error *after*
+it returns. So `input` is freed on the success path only, not with
+`defer` (which runs before main returns): on the error path it outlives
+main, and the program ends right after. With `defer input.free()` the
+message would read freed memory; `tachyonc --check-alloc main.tach`
+stops such a program at the read (`use after free: ... freed at
+main.tach:165:11`), and lists the input as not freed on the error path
+instead. (0.17's values close this gap: a view cannot outlive its owner.)
 
 ## Language features
 
