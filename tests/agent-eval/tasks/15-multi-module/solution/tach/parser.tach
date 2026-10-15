@@ -73,11 +73,11 @@ struct Parser {
     nodes: Vec<Node>,
 }
 
-fn error_at(t: Token) -> [u8] {
+fn error_at(t: Token, gpa: Gpa) -> [u8] {
     if t.tok == Tok::End {
         return "syntax error: unexpected end of query";
     }
-    let mut m = Buf::new();
+    let mut m = Buf::new_in(gpa);
     m.push_str("syntax error: unexpected ");
     m.push_str(t.text);
     m.as_slice()
@@ -88,8 +88,8 @@ impl Parser {
         self.toks[self.pos].tok
     }
 
-    fn fail(self: *Parser) -> [u8] {
-        error_at(self.toks[self.pos])
+    fn fail(self: *Parser, gpa: Gpa) -> [u8] {
+        error_at(self.toks[self.pos], gpa)
     }
 
     fn is_kw(self: *Parser, k: Kw) -> bool {
@@ -106,21 +106,21 @@ impl Parser {
         }
     }
 
-    fn name(self: *Parser) -> Result<[u8], [u8]> {
+    fn name(self: *Parser, gpa: Gpa) -> Result<[u8], [u8]> {
         if self.peek() == Tok::Name {
             let text = self.toks[self.pos].text;
             self.pos += 1;
             Ok(text)
         } else {
-            Err(self.fail())
+            Err(self.fail(gpa))
         }
     }
 
     // NAME or an aggregate.
-    fn item(self: *Parser) -> Result<Item, [u8]> {
+    fn item(self: *Parser, gpa: Gpa) -> Result<Item, [u8]> {
         let kind = match self.peek() {
             Tok::Name => {
-                return match self.name() {
+                return match self.name(gpa) {
                     Ok(n) => Ok(Item::Col(n)),
                     Err(e) => Err(e),
                 };
@@ -129,35 +129,35 @@ impl Parser {
             Tok::Kw(Kw::Sum) => AggKind::Sum,
             Tok::Kw(Kw::Min) => AggKind::Min,
             Tok::Kw(Kw::Max) => AggKind::Max,
-            _ => return Err(self.fail()),
+            _ => return Err(self.fail(gpa)),
         };
         self.pos += 1;
         if !self.accept(Tok::LParen) {
-            return Err(self.fail());
+            return Err(self.fail(gpa));
         }
         if kind == AggKind::Count && self.peek() == Tok::Star {
             self.pos += 1;
             if !self.accept(Tok::RParen) {
-                return Err(self.fail());
+                return Err(self.fail(gpa));
             }
             return Ok(Item::Agg(AggKind::CountStar, ""));
         }
-        let col = match self.name() {
+        let col = match self.name(gpa) {
             Ok(n) => n,
             Err(e) => return Err(e),
         };
         if !self.accept(Tok::RParen) {
-            return Err(self.fail());
+            return Err(self.fail(gpa));
         }
         Ok(Item::Agg(kind, col))
     }
 
-    fn operand(self: *Parser) -> Result<Operand, [u8]> {
+    fn operand(self: *Parser, gpa: Gpa) -> Result<Operand, [u8]> {
         let op = match self.peek() {
             Tok::Name => Operand::Name(self.toks[self.pos].text),
             Tok::Int(v) => Operand::Int(v),
             Tok::Str => Operand::Str(self.toks[self.pos].value),
-            _ => return Err(self.fail()),
+            _ => return Err(self.fail(gpa)),
         };
         self.pos += 1;
         Ok(op)
@@ -168,14 +168,14 @@ impl Parser {
         self.nodes.len() - 1
     }
 
-    fn or(self: *Parser) -> Result<i64, [u8]> {
-        let mut left = match self.and() {
+    fn or(self: *Parser, gpa: Gpa) -> Result<i64, [u8]> {
+        let mut left = match self.and(gpa) {
             Ok(i) => i,
             Err(e) => return Err(e),
         };
         while self.is_kw(Kw::Or) {
             self.pos += 1;
-            let right = match self.and() {
+            let right = match self.and(gpa) {
                 Ok(i) => i,
                 Err(e) => return Err(e),
             };
@@ -184,14 +184,14 @@ impl Parser {
         Ok(left)
     }
 
-    fn and(self: *Parser) -> Result<i64, [u8]> {
-        let mut left = match self.not() {
+    fn and(self: *Parser, gpa: Gpa) -> Result<i64, [u8]> {
+        let mut left = match self.not(gpa) {
             Ok(i) => i,
             Err(e) => return Err(e),
         };
         while self.is_kw(Kw::And) {
             self.pos += 1;
-            let right = match self.not() {
+            let right = match self.not(gpa) {
                 Ok(i) => i,
                 Err(e) => return Err(e),
             };
@@ -200,31 +200,31 @@ impl Parser {
         Ok(left)
     }
 
-    fn not(self: *Parser) -> Result<i64, [u8]> {
+    fn not(self: *Parser, gpa: Gpa) -> Result<i64, [u8]> {
         if self.is_kw(Kw::Not) {
             self.pos += 1;
-            let inner = match self.not() {
+            let inner = match self.not(gpa) {
                 Ok(i) => i,
                 Err(e) => return Err(e),
             };
             return Ok(self.push(Node::Not(inner)));
         }
-        self.atom()
+        self.atom(gpa)
     }
 
-    fn atom(self: *Parser) -> Result<i64, [u8]> {
+    fn atom(self: *Parser, gpa: Gpa) -> Result<i64, [u8]> {
         if self.peek() == Tok::LParen {
             self.pos += 1;
-            let inner = match self.or() {
+            let inner = match self.or(gpa) {
                 Ok(i) => i,
                 Err(e) => return Err(e),
             };
             if !self.accept(Tok::RParen) {
-                return Err(self.fail());
+                return Err(self.fail(gpa));
             }
             return Ok(inner);
         }
-        let left = match self.operand() {
+        let left = match self.operand(gpa) {
             Ok(o) => o,
             Err(e) => return Err(e),
         };
@@ -236,7 +236,7 @@ impl Parser {
                 negated = true;
             }
             if !self.accept(Tok::Kw(Kw::Null)) {
-                return Err(self.fail());
+                return Err(self.fail(gpa));
             }
             return Ok(self.push(Node::IsNull(left, negated)));
         }
@@ -247,26 +247,26 @@ impl Parser {
             Tok::Le => CmpOp::Le,
             Tok::Gt => CmpOp::Gt,
             Tok::Ge => CmpOp::Ge,
-            _ => return Err(self.fail()),
+            _ => return Err(self.fail(gpa)),
         };
         self.pos += 1;
-        let right = match self.operand() {
+        let right = match self.operand(gpa) {
             Ok(o) => o,
             Err(e) => return Err(e),
         };
         Ok(self.push(Node::Cmp(left, op, right)))
     }
 
-    fn query(self: *Parser, q: *Query) -> Result<bool, [u8]> {
+    fn query(self: *Parser, q: *Query, gpa: Gpa) -> Result<bool, [u8]> {
         if !self.accept(Tok::Kw(Kw::Select)) {
-            return Err(self.fail());
+            return Err(self.fail(gpa));
         }
         if self.peek() == Tok::Star {
             self.pos += 1;
             q.items.push(Item::Star);
         } else {
             loop {
-                match self.item() {
+                match self.item(gpa) {
                     Ok(it) => q.items.push(it),
                     Err(e) => return Err(e),
                 }
@@ -276,15 +276,15 @@ impl Parser {
             }
         }
         if !self.accept(Tok::Kw(Kw::From)) {
-            return Err(self.fail());
+            return Err(self.fail(gpa));
         }
-        q.table = match self.name() {
+        q.table = match self.name(gpa) {
             Ok(n) => n,
             Err(e) => return Err(e),
         };
         if self.is_kw(Kw::Where) {
             self.pos += 1;
-            match self.or() {
+            match self.or(gpa) {
                 Ok(c) => q.cond = Some(c),
                 Err(e) => return Err(e),
             }
@@ -292,9 +292,9 @@ impl Parser {
         if self.is_kw(Kw::Group) {
             self.pos += 1;
             if !self.accept(Tok::Kw(Kw::By)) {
-                return Err(self.fail());
+                return Err(self.fail(gpa));
             }
-            match self.name() {
+            match self.name(gpa) {
                 Ok(n) => q.group = Some(n),
                 Err(e) => return Err(e),
             }
@@ -302,10 +302,10 @@ impl Parser {
         if self.is_kw(Kw::Order) {
             self.pos += 1;
             if !self.accept(Tok::Kw(Kw::By)) {
-                return Err(self.fail());
+                return Err(self.fail(gpa));
             }
             loop {
-                let item = match self.item() {
+                let item = match self.item(gpa) {
                     Ok(it) => it,
                     Err(e) => return Err(e),
                 };
@@ -329,29 +329,29 @@ impl Parser {
                     q.limit = Some(v);
                     self.pos += 1;
                 }
-                _ => return Err(self.fail()),
+                _ => return Err(self.fail(gpa)),
             }
         }
         if self.peek() != Tok::End {
-            return Err(self.fail());
+            return Err(self.fail(gpa));
         }
         Ok(true)
     }
 }
 
 // The query, or an error message. The caller frees the query.
-pub fn parse(toks: [Token]) -> Result<Query, [u8]> {
-    let mut p = Parser { toks: toks, pos: 0, nodes: Vec::new() };
+pub fn parse(toks: [Token], gpa: Gpa) -> Result<Query, [u8]> {
+    let mut p = Parser { toks: toks, pos: 0, nodes: Vec::new_in(gpa) };
     let mut q = Query {
-        items: Vec::new(),
+        items: Vec::new_in(gpa),
         table: "",
-        nodes: Vec::new(),
+        nodes: Vec::new_in(gpa),
         cond: None,
         group: None,
-        order: Vec::new(),
+        order: Vec::new_in(gpa),
         limit: None,
     };
-    match p.query(&q) {
+    match p.query(&q, gpa) {
         Ok(_) => {
             q.nodes = p.nodes;
             Ok(q)

@@ -26,14 +26,14 @@ $ show geom.tach:16:9 clash/main.tach:33 --root clash/main.tach
         self.x * self.x + self.y * self.y
     }
 // crate::main	clash/main.tach:30-52
-fn main() -> i32 {
+fn main(gpa: Gpa) -> i32 {
     let helper = 3;
     let n = a_helper() + b::helper() + helper;
     let p = a::Point { x: Point(n) };
     let s = sys::SockaddrIn { port: p.x };
     let v = V2 { x: 1, y: 2 } + V2 { x: 3, y: 4 };
     let sq = Square { side: 2 };
-    let mut std_vec: Vec<i64> = Vec::new();
+    let mut std_vec: Vec<i64> = Vec::new_in(gpa);
     std_vec.push(s.port);
     let mut mine = MyVec { n: 0 };
     mine.push(v.len());

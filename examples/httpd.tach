@@ -199,8 +199,8 @@ struct Path { buf: Buf }
 
 impl Path {
     // dir/name, without doubling the slash between them.
-    fn join(dir: [u8], name: [u8]) -> Path {
-        let mut buf = Buf::new();
+    fn join(dir: [u8], name: [u8], gpa: Gpa) -> Path {
+        let mut buf = Buf::new_in(gpa);
         buf.push_str(dir);
         let dir_slash = ends_with(dir, "/");
         let name_slash = name.len > 0 && name[0] == '/';
@@ -260,8 +260,8 @@ fn hex_val(ch: u8) -> Option<u8> {
     }
 }
 
-fn url_decode(s: [u8]) -> Buf {
-    let mut out = Buf::new();
+fn url_decode(s: [u8], gpa: Gpa) -> Buf {
+    let mut out = Buf::new_in(gpa);
     let mut r = 0;
     while r < s.len {
         let ch = s[r];
@@ -355,8 +355,8 @@ fn send_all(fd: i32, s: [u8]) {
 }
 
 // The headers, with a Content-Length when it is known.
-fn send_headers(fd: i32, status: [u8], content_type: [u8], length: Option<i64>) {
-    let mut h = Buf::new();
+fn send_headers(fd: i32, status: [u8], content_type: [u8], length: Option<i64>, gpa: Gpa) {
+    let mut h = Buf::new_in(gpa);
     defer h.free();
     h.push_str("HTTP/1.0 ");
     h.push_str(status);
@@ -370,25 +370,25 @@ fn send_headers(fd: i32, status: [u8], content_type: [u8], length: Option<i64>) 
     send_all(fd, h.as_slice());
 }
 
-fn send_html(fd: i32, status: [u8], body: *Buf) {
+fn send_html(fd: i32, status: [u8], body: *Buf, gpa: Gpa) {
     let bytes = body.as_slice();
-    send_headers(fd, status, "text/html; charset=utf-8", Some(bytes.len));
+    send_headers(fd, status, "text/html; charset=utf-8", Some(bytes.len), gpa);
     send_all(fd, bytes);
 }
 
-fn send_404(fd: i32, path: [u8]) {
-    let mut body = Buf::new();
+fn send_404(fd: i32, path: [u8], gpa: Gpa) {
+    let mut body = Buf::new_in(gpa);
     defer body.free();
     body.push_str("<!DOCTYPE html><html><head><title>404 Not Found</title>");
     body.push_str("<style>body{font-family:sans-serif;margin:40px}</style></head>");
     body.push_str("<body><h1>404 Not Found</h1><p>The path <code>");
     push_escaped(&body, path);
     body.push_str("</code> was not found on this server.</p></body></html>");
-    send_html(fd, "404 Not Found", &body);
+    send_html(fd, "404 Not Found", &body, gpa);
 }
 
-fn send_redirect(fd: i32, location: [u8]) {
-    let mut h = Buf::new();
+fn send_redirect(fd: i32, location: [u8], gpa: Gpa) {
+    let mut h = Buf::new_in(gpa);
     defer h.free();
     h.push_str("HTTP/1.0 301 Moved Permanently\r\nLocation: ");
     h.push_str(location);
@@ -418,15 +418,15 @@ fn push_style(out: *Buf) {
     out.push_str("</style>\n");
 }
 
-fn serve_directory(fd: i32, system: System, dir_path: *Path, url: [u8]) {
+fn serve_directory(fd: i32, system: System, dir_path: *Path, url: [u8], gpa: Gpa) {
     let dir = unsafe { opendir(dir_path.c()) };
     if dir as u64 == 0 {
-        send_404(fd, url);
+        send_404(fd, url, gpa);
         return;
     }
     defer unsafe { closedir(dir) };
 
-    let mut body = Buf::new();
+    let mut body = Buf::new_in(gpa);
     defer body.free();
     body.push_str("<!DOCTYPE html>\n<html>\n<head>\n");
     body.push_str("<meta charset=\"utf-8\">\n");
@@ -454,7 +454,7 @@ fn serve_directory(fd: i32, system: System, dir_path: *Path, url: [u8]) {
             continue;
         }
 
-        let mut path = Path::join(dir_path.bytes(), name);
+        let mut path = Path::join(dir_path.bytes(), name, gpa);
         defer path.free();
         let kind = unsafe { probe(system, path.c()) };
         // d_type is DT_UNKNOWN on file systems that do not keep it
@@ -489,25 +489,25 @@ fn serve_directory(fd: i32, system: System, dir_path: *Path, url: [u8]) {
     body.push_str("<hr><p style=\"color:#999;font-size:0.85em\">");
     body.push_str("Tachyon HTTP Server</p>\n");
     body.push_str("</body>\n</html>\n");
-    send_html(fd, "200 OK", &body);
+    send_html(fd, "200 OK", &body, gpa);
 }
 
 // ============================================================================
 // File serving
 // ============================================================================
 
-fn serve_file(fd: i32, system: System, path: *Path, size: i64) {
+fn serve_file(fd: i32, system: System, path: *Path, size: i64, gpa: Gpa) {
     // (not to wait for a writer if it is a FIFO)
     let file = unsafe { open(path.c(), O_RDONLY | sys::o_nonblock(system)) };
     if file < 0 {
-        send_404(fd, path.bytes());
+        send_404(fd, path.bytes(), gpa);
         return;
     }
     defer unsafe { close(file) };
 
     // (a FIFO or a device has no size)
     let length: Option<i64> = if size >= 0 { Some(size) } else { None };
-    send_headers(fd, "200 OK", guess_mime(path.bytes()), length);
+    send_headers(fd, "200 OK", guess_mime(path.bytes()), length, gpa);
     let mut chunk: [u8; 8192] = [0; 8192];
     loop {
         let n = unsafe { read(file, &chunk as *u8, 8192) };
@@ -543,7 +543,7 @@ fn parse_request(req: [u8]) -> Option<([u8], [u8])> {
     Some((method, req[start..i]))
 }
 
-fn handle_request(fd: i32, system: System, root: [u8]) {
+fn handle_request(fd: i32, system: System, root: [u8], gpa: Gpa) {
     defer unsafe { close(fd) };
     let mut request: [u8; 8192] = [0; 8192];
     let n = unsafe { read(fd, &request as *u8, 8191) };
@@ -553,11 +553,11 @@ fn handle_request(fd: i32, system: System, root: [u8]) {
     let (method, raw_path) = if let Some(parts) = parse_request(request[..n]) {
         parts
     } else {
-        send_404(fd, "/");
+        send_404(fd, "/", gpa);
         return;
     };
 
-    let mut decoded = url_decode(raw_path);
+    let mut decoded = url_decode(raw_path, gpa);
     defer decoded.free();
     let url = decoded.as_slice();
 
@@ -566,38 +566,38 @@ fn handle_request(fd: i32, system: System, root: [u8]) {
     eprint(" ");
     eprint(url);
 
-    let mut path = Path::join(root, url);
+    let mut path = Path::join(root, url, gpa);
     defer path.free();
     match unsafe { probe(system, path.c()) } {
         Kind::Missing => {
             eprint(" 404\n");
-            send_404(fd, url);
+            send_404(fd, url, gpa);
         }
         Kind::File(size) => {
             eprint(" 200 (");
             eprint(guess_mime(path.bytes()));
             eprint(")\n");
-            serve_file(fd, system, &path, size);
+            serve_file(fd, system, &path, size, gpa);
         }
         Kind::Dir => {
             if !ends_with(url, "/") {
-                let mut location = Buf::new();
+                let mut location = Buf::new_in(gpa);
                 defer location.free();
                 location.push_str(url);
                 location.push('/');
                 eprint(" 301\n");
-                send_redirect(fd, location.as_slice());
+                send_redirect(fd, location.as_slice(), gpa);
                 return;
             }
-            let mut index = Path::join(path.bytes(), "index.html");
+            let mut index = Path::join(path.bytes(), "index.html", gpa);
             defer index.free();
             if let Kind::File(size) = unsafe { probe(system, index.c()) } {
                 eprint(" 200 (index.html)\n");
-                serve_file(fd, system, &index, size);
+                serve_file(fd, system, &index, size, gpa);
                 return;
             }
             eprint(" 200 (dir)\n");
-            serve_directory(fd, system, &path, url);
+            serve_directory(fd, system, &path, url, gpa);
         }
     }
 }
@@ -606,7 +606,7 @@ fn handle_request(fd: i32, system: System, root: [u8]) {
 // Main: the root directory, then a socket and the accept loop
 // ============================================================================
 
-fn main(argc: i64, argv: **u8) -> i32 {
+fn main(argc: i64, argv: **u8, gpa: Gpa) -> i32 {
     let system = sys::detect();
 
     // argv[1] made absolute, else the current directory
@@ -634,7 +634,7 @@ fn main(argc: i64, argv: **u8) -> i32 {
             loop {
                 let fd = unsafe { accept(server, 0 as *u8, 0 as *u32) };
                 if fd >= 0 {
-                    handle_request(fd, system, root);
+                    handle_request(fd, system, root, gpa);
                 }
             }
         }

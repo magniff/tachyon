@@ -249,7 +249,7 @@ $ items crate
 9	mod	mod sys
 21	fn	fn printf(x: i64) -> i64
 26	fn	fn twice_generic<T: Area>(x: *T) -> i64
-30	fn	fn main() -> i32
+30	fn	fn main(gpa: Gpa) -> i32
 $ items sys
 # crate::sys	clash/main.tach
 10	struct	pub struct SockaddrIn
