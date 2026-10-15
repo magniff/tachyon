@@ -35,7 +35,7 @@ use crate::back::dwarf::{
     DEBUG_INFO, dbg_function_begin, dbg_function_end, dbg_loc, dbg_place_locs, dbg_sections,
     dbg_text_end,
 };
-use crate::back::emit::function::gen_ir_function;
+use crate::back::emit::function::{emit_ir_functions, gen_ir_function};
 use crate::back::emit::machine::{m_lea, m_load, m_mov, reg_fp};
 use crate::back::emit::stats::print_stats;
 use crate::back::isel::select_instructions;
@@ -70,10 +70,10 @@ use crate::gen0::target::{
     new_label, pop_d, pop_x, push_x0, static_prefix,
 };
 use crate::middle::inline::FN_LIVE;
-use crate::middle::ir::IRFUNC_COUNT;
+use crate::middle::ir::{IRFUNC_COUNT, ir_enter};
 use crate::middle::ir::print::print_ir_func;
 use crate::middle::lower::lower_program;
-use crate::middle::opt::{OPT_LEVEL, optimize_program};
+use crate::middle::opt::{OPT_LEVEL, PER_FUNCTION, optimize_program};
 use crate::middle::profile::profile_after_lowering;
 use expr::gen_expr;
 
@@ -199,38 +199,40 @@ pub fn compile_program(output: *u8) {
             profile_after_lowering();
             flush_warnings();
             timer_add(T_LOWER, t);
+            PER_FUNCTION = OPT_LEVEL == 1 && !EMIT_IR && !EMIT_MIR;
             optimize_program();
             if EMIT_IR {
                 for fi in 0..IRFUNC_COUNT {
                     if FN_LIVE[fi] != 0 {
+                        ir_enter(fi);
                         print_ir_func(ASM, fi);
                     }
                 }
                 buf_write_file(ASM, output);
                 return;
             }
-            t = timer_now();
-            select_instructions();
-            timer_add(T_ISEL, t);
             if EMIT_MIR {
+                t = timer_now();
+                select_instructions();
+                timer_add(T_ISEL, t);
                 for fi in 0..IRFUNC_COUNT {
                     if FN_LIVE[fi] != 0 {
+                        ir_enter(fi);
                         print_ir_func(ASM, fi);
                     }
                 }
                 buf_write_file(ASM, output);
                 return;
             }
-            count_uses();
         }
         t = timer_now();
         emit_file_header();
         if OPT_LEVEL > 0 {
-            for fi in 0..IRFUNC_COUNT {
-                if FN_LIVE[fi] != 0 {
-                    gen_ir_function(fi);
-                }
-            }
+            timer_add(T_CODEGEN, t);
+            // (0.17: each function selected, allocated and emitted, then
+            // freed; at -O1 optimized there too)
+            emit_ir_functions();
+            t = timer_now();
             print_stats();
         } else {
             for item in kids(program) {

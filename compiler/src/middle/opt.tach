@@ -32,7 +32,7 @@ use crate::middle::ipo::{
     propagate_constants,
 };
 use crate::middle::ir::{
-    ARGS, ARGTY, BLOCKS, FN_IR, INSTS, IRF, IRFUNCS, IRFUNC_COUNT, Op, Term, ir_append, ir_arg,
+    ARGS, ARGTY, BLOCKS, FN_IR, INSTS, IRFUNCS, IRFUNC_COUNT, Op, Term, ir_append, ir_arg, ir_enter,
     ir_operand, ir_operand_count, ir_replace, ir_resolve_operands, ir_unlink, ir_val,
 };
 use crate::middle::ir::cfg::{
@@ -198,7 +198,7 @@ pub fn remove_trivial_phis(fi: i64) -> bool {
                     }
                     if trivial {
                         if same == 0 {
-                            IRF = fi;
+                            ir_enter(fi);
                             same = ssa_undef(INSTS[phi].ty);
                         }
                         ir_replace(phi, same);
@@ -558,6 +558,21 @@ fn cleanup_function(fi: i64) {
     unsafe { verify_func(fi, c"lowering, inlining and cleanup"); }
 }
 
+// (0.17) The -O1 pipeline of one function (PER_FUNCTION): its cleanup and
+// the scalar pipeline, as optimize_program runs them on every function.
+pub fn optimize_function(fi: i64) {
+    unsafe {
+        ir_enter(fi);
+        cleanup_function(fi);
+        simplify_function(fi);
+    }
+}
+
+// (0.17) Whether the -O1 pipeline runs per function, from emission
+// (emit_ir_functions), not over the whole program first: -O1 without
+// --emit-ir or --emit-mir.
+pub static mut PER_FUNCTION: bool = false;
+
 // After inlining into fi: the cleanup and the scalar pipeline.
 pub fn optimize_after_inlining(fi: i64) {
     cleanup_function(fi);
@@ -605,9 +620,12 @@ pub fn optimize_program() {
             FN_LIVE[fi] = 1;
         }
         drop_unreachable_std();
+        if PER_FUNCTION {
+            return;
+        }
         for fi in 0..IRFUNC_COUNT {
             if FN_LIVE[fi] != 0 {
-                IRF = fi;
+                ir_enter(fi);
                 cleanup_function(fi);
             }
         }
@@ -617,7 +635,7 @@ pub fn optimize_program() {
         let mut t = timer_now();
         for fi in 0..IRFUNC_COUNT {
             if FN_LIVE[fi] != 0 {
-                IRF = fi;
+                ir_enter(fi);
                 simplify_function(fi);
             }
         }
@@ -651,6 +669,7 @@ pub fn optimize_program() {
         compute_sccs();
         propagate_constants();
         for fi in 0..IRFUNC_COUNT {
+            ir_enter(fi);
             FN_SIZE[fi] = func_size(fi);
         }
         start_inlining_budget();
@@ -666,7 +685,7 @@ pub fn optimize_program() {
                 }
                 continue;
             }
-            IRF = fi;
+            ir_enter(fi);
             t = timer_now();
             if eliminate_tail_recursion(fi) {
                 cleanup_function(fi);
@@ -707,7 +726,7 @@ pub fn optimize_program() {
         // are still called somewhere.
         for fi in 0..IRFUNC_COUNT {
             if DEFERRED[fi] != 0 && FN_LIVE[fi] != 0 {
-                IRF = fi;
+                ir_enter(fi);
                 loop_pipeline(fi);
             }
         }
@@ -717,7 +736,7 @@ pub fn optimize_program() {
         t = timer_now();
         for fi in 0..IRFUNC_COUNT {
             if FN_LIVE[fi] != 0 && slp_vectorize(fi) {
-                IRF = fi;
+                ir_enter(fi);
                 resolve_all(fi);
                 eliminate_dead_code(fi);
                 verify_func(fi, c"SLP vectorization");
@@ -764,7 +783,7 @@ fn loop_pipeline(fi: i64) {
 // Returns whether anything changed.
 fn optimize_loops(fi: i64) -> bool {
     unsafe {
-        IRF = fi;
+        ir_enter(fi);
         resolve_all(fi);
         seal_all(fi);
         simplify_cfg(fi);
@@ -898,6 +917,7 @@ fn drop_unreachable_std() {
         while work.count > 0 {
             work.count -= 1;
             let fi = work.data[work.count];
+            ir_enter(fi);
             for i in 0..IRFUNCS[fi].blocks.count {
                 let b = IRFUNCS[fi].blocks.data[i];
                 if BLOCKS[b].removed != 0 {

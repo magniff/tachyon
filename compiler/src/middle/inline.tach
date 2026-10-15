@@ -21,9 +21,9 @@ use crate::gen0::gen::fn_is_global;
 use crate::middle::fold::is_const;
 use crate::middle::ipo::devirtualize;
 use crate::middle::ir::{
-    ARGS, ARGTY, BLOCKS, BLOCK_COUNT, FN_IR, INSTS, IRF, IRFUNCS, IRFUNC_COUNT, Op, SLOTS, Term,
-    ir_append, ir_arg, ir_make, ir_new_block, ir_new_slot, ir_prepend, ir_replace, ir_set_arg,
-    ir_unlink, ir_val,
+    ARGS, ARGTY, BLOCKS, BLOCK_COUNT, FN_IR, INSTS, IRFUNCS, IRFUNC_COUNT, IRTables, IR_CUR, Op,
+    SLOTS, Term, ir_append, ir_arg, ir_enter, ir_make, ir_new_block, ir_new_slot, ir_prepend,
+    ir_replace, ir_set_arg, ir_unlink, ir_val, ir_view,
 };
 use crate::middle::ir::cfg::{
     case_target, case_value, copy_terminator, ir_switch_no_preds, pred_index, succ, succ_count,
@@ -77,6 +77,9 @@ pub static mut FN_RT: *i64 = 0 as *i64;
 // while it inlines: only callees that do not are inlined).
 static mut CALLER_RT: bool = false;
 
+// Per argument of the call inline_cost looks at: whether it is a constant.
+static mut CONST_ARGS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
 // The number of instructions that turn into code.
 pub fn func_size(fi: i64) -> i64 {
     let mut size = 0;
@@ -120,6 +123,7 @@ pub fn count_call_sites() {
             if FN_LIVE[fi] == 0 {
                 continue;
             }
+            ir_enter(fi);
             for i in 0..IRFUNCS[fi].blocks.count {
                 let b = IRFUNCS[fi].blocks.data[i];
                 if BLOCKS[b].removed != 0 {
@@ -150,6 +154,7 @@ pub static mut SCC_ORDER: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 fn callees(fi: i64, out: *IntVec) {
     (*out).count = 0;
     unsafe {
+        ir_enter(fi);
         for i in 0..IRFUNCS[fi].blocks.count {
             let b = IRFUNCS[fi].blocks.data[i];
             if BLOCKS[b].removed != 0 {
@@ -354,23 +359,32 @@ fn decides(g: i64, p: i64) -> bool {
 
 // The cost of inlining callee g at call `call`: its size, less the bonus
 // for constant arguments that decide something in it, less the call's own
-// cost (its argument moves, the call and the result).
+// cost (its argument moves, the call and the result). (0.17: the call is
+// the current function's; which arguments are constants is read first,
+// then g's parameters in g's tables.)
 fn inline_cost(g: i64, call: i64) -> i64 {
     unsafe {
+        let back = IR_CUR;
+        let nargs = INSTS[call].nargs;
+        CONST_ARGS.count = 0;
+        for k in 0..nargs {
+            CONST_ARGS.push(if is_const(ir_val(ir_arg(call, k))) { 1 } else { 0 });
+        }
+        ir_enter(g);
         let mut cost = FN_SIZE[g];
         let entry = IRFUNCS[g].entry;
         let mut v = BLOCKS[entry].first;
         while v != 0 {
             if INSTS[v].op == Op::Param {
                 let k = param_operand(g, v);
-                if k >= 0 && k < INSTS[call].nargs && is_const(ir_val(ir_arg(call, k)))
-                    && decides(g, v) {
+                if k >= 0 && k < nargs && CONST_ARGS.data[k] != 0 && decides(g, v) {
                     cost -= CONST_ARG_BONUS;
                 }
             }
             v = INSTS[v].next;
         }
-        cost - 2 - INSTS[call].nargs
+        ir_enter(back);
+        cost - 2 - nargs
     }
 }
 
@@ -387,7 +401,10 @@ fn site_cold(b: i64) -> bool {
 fn callee_returns_twice(g: i64) -> bool {
     unsafe {
         if FN_RT[g] < 0 {
+            let back = IR_CUR;
+            ir_enter(g);
             FN_RT[g] = if calls_returns_twice(g) { 1 } else { 0 };
+            ir_enter(back);
         }
         FN_RT[g] == 1
     }
@@ -590,17 +607,20 @@ pub fn start_inlining_budget() {
 
 // ---- Inlining one call ----
 
-// The copy of value `v` of the callee (INSTS[v].aux).
-fn mapped(v: i64) -> i64 {
-    if v == 0 { 0 } else { unsafe { INSTS[v].aux } }
+// The copy of value `v` of the callee (its aux, in the callee's tables).
+fn mapped(gt: *IRTables, v: i64) -> i64 {
+    if v == 0 { 0 } else { unsafe { gt.insts[v].aux } }
 }
 
 // Inlines callee g at call `call` of function fi. Returns the continuation
-// block (the instructions after the call).
+// block (the instructions after the call). (0.17: g's IR is read through
+// its own tables, gt, while fi's are current: ids are each function's.)
 fn inline_call(fi: i64, call: i64, g: i64) -> i64 {
     unsafe {
+        ir_enter(g);
         resolve_all(g);
-        IRF = fi;
+        ir_enter(fi);
+        let gt = ir_view(g);
         let b = INSTS[call].block;
         // The continuation: the instructions after the call, and b's end.
         let cont = ir_new_block();
@@ -633,52 +653,55 @@ fn inline_call(fi: i64, call: i64, g: i64) -> i64 {
             }
         }
         // Copy the blocks and instructions.
+        let gentry = IRFUNCS[g].entry;
         for i in 0..IRFUNCS[g].blocks.count {
             let gb = IRFUNCS[g].blocks.data[i];
-            if BLOCKS[gb].removed != 0 {
+            if gt.blocks[gb].removed != 0 {
                 continue;
             }
             let nb = ir_new_block();
             BLOCKS[nb].sealed = 1;
             BLOCKS[nb].loop_depth = 1;
-            BLOCKS[nb].novec = BLOCKS[gb].novec;
-            BLOCKS[nb].count = scaled_count(BLOCKS[gb].count, BLOCKS[b].count,
-                BLOCKS[IRFUNCS[g].entry].count);
-            BLOCKS[gb].aux = nb;
-            let mut gv = BLOCKS[gb].first;
+            BLOCKS[nb].novec = gt.blocks[gb].novec;
+            BLOCKS[nb].count = scaled_count(gt.blocks[gb].count, BLOCKS[b].count,
+                gt.blocks[gentry].count);
+            gt.blocks[gb].aux = nb;
+            let mut gv = gt.blocks[gb].first;
             while gv != 0 {
-                let op = INSTS[gv].op;
+                let op = gt.insts[gv].op;
                 if op == Op::Param {
-                    let index = INSTS[gv].imm;
-                    let piece = INSTS[gv].imm2;
+                    let index = gt.insts[gv].imm;
+                    let piece = gt.insts[gv].imm2;
                     if index < 0 {
-                        INSTS[gv].aux = INSTS[call].c;
+                        gt.insts[gv].aux = INSTS[call].c;
                     } else {
-                        INSTS[gv].aux = ir_arg(call,
+                        gt.insts[gv].aux = ir_arg(call,
                             param_first[index] + if piece > 0 { piece - 1 } else { 0 });
                     }
                 } else {
-                    let nv = ir_make(op, INSTS[gv].ty, INSTS[gv].a, INSTS[gv].b, INSTS[gv].imm);
-                    INSTS[nv].c = INSTS[gv].c;
-                    INSTS[nv].cond = INSTS[gv].cond;
-                    INSTS[nv].imm2 = INSTS[gv].imm2;
+                    let nv = ir_make(op, gt.insts[gv].ty, gt.insts[gv].a, gt.insts[gv].b,
+                        gt.insts[gv].imm);
+                    INSTS[nv].c = gt.insts[gv].c;
+                    INSTS[nv].cond = gt.insts[gv].cond;
+                    INSTS[nv].imm2 = gt.insts[gv].imm2;
                     if op == Op::Slot {
-                        let s = INSTS[gv].imm;
-                        INSTS[nv].imm = ir_new_slot(SLOTS[s].size, SLOTS[s].align);
-                        SLOTS[INSTS[nv].imm].ty = SLOTS[s].ty;
+                        let s = gt.insts[gv].imm;
+                        INSTS[nv].imm = ir_new_slot(gt.slots[s].size, gt.slots[s].align);
+                        SLOTS[INSTS[nv].imm].ty = gt.slots[s].ty;
                     }
-                    if INSTS[gv].nargs > 0 || op == Op::Phi || op.is_call() {
+                    if gt.insts[gv].nargs > 0 || op == Op::Phi || op.is_call() {
+                        let base = gt.insts[gv].args;
                         INSTS[nv].args = ARGS.count;
-                        INSTS[nv].nargs = INSTS[gv].nargs;
-                        for a in 0..INSTS[gv].nargs {
-                            ARGS.push(ir_arg(gv, a));
-                            ARGTY.push(ARGTY.data[INSTS[gv].args + a]);
+                        INSTS[nv].nargs = gt.insts[gv].nargs;
+                        for a in 0..gt.insts[gv].nargs {
+                            ARGS.push(gt.args.data[base + a]);
+                            ARGTY.push(gt.argty.data[base + a]);
                         }
                     }
                     ir_append(nb, nv);
-                    INSTS[gv].aux = nv;
+                    gt.insts[gv].aux = nv;
                 }
-                gv = INSTS[gv].next;
+                gv = gt.insts[gv].next;
             }
         }
         // Map the operands, the terminators and the predecessors. An aggregate
@@ -690,50 +713,54 @@ fn inline_call(fi: i64, call: i64, g: i64) -> i64 {
         let mut returns = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for i in 0..IRFUNCS[g].blocks.count {
             let gb = IRFUNCS[g].blocks.data[i];
-            if BLOCKS[gb].removed != 0 {
+            if gt.blocks[gb].removed != 0 {
                 continue;
             }
-            let nb = BLOCKS[gb].aux;
+            let nb = gt.blocks[gb].aux;
             let mut nv = BLOCKS[nb].first;
             while nv != 0 {
-                INSTS[nv].a = mapped(INSTS[nv].a);
-                INSTS[nv].b = mapped(INSTS[nv].b);
-                INSTS[nv].c = mapped(INSTS[nv].c);
+                INSTS[nv].a = mapped(&gt, INSTS[nv].a);
+                INSTS[nv].b = mapped(&gt, INSTS[nv].b);
+                INSTS[nv].c = mapped(&gt, INSTS[nv].c);
                 for a in 0..INSTS[nv].nargs {
-                    ir_set_arg(nv, a, mapped(ir_arg(nv, a)));
+                    ir_set_arg(nv, a, mapped(&gt, ir_arg(nv, a)));
                 }
                 nv = INSTS[nv].next;
             }
-            for p in 0..BLOCKS[gb].preds.count {
-                BLOCKS[nb].preds.push(BLOCKS[BLOCKS[gb].preds.data[p]].aux);
+            for p in 0..gt.blocks[gb].preds.count {
+                BLOCKS[nb].preds.push(gt.blocks[gt.blocks[gb].preds.data[p]].aux);
             }
-            let term = BLOCKS[gb].term;
+            let term = gt.blocks[gb].term;
+            let gcond = gt.blocks[gb].cond;
             if term == Term::Ret {
                 if copy_result {
-                    let copy = ir_make(Op::Copy, 0, INSTS[call].c, mapped(BLOCKS[gb].cond),
+                    let copy = ir_make(Op::Copy, 0, INSTS[call].c, mapped(&gt, gcond),
                         type_size(ret));
                     ir_append(nb, copy);
                 }
                 BLOCKS[nb].term = Term::Jump;
                 BLOCKS[nb].s0 = cont;
                 BLOCKS[cont].preds.push(nb);
-                returns.push(mapped(BLOCKS[gb].cond));
+                returns.push(mapped(&gt, gcond));
             } else if term == Term::Switch {
                 let mark = SSA_STACK.count;
-                for c in 0..BLOCKS[gb].ncases {
-                    SSA_STACK.push(case_value(gb, c));
-                    SSA_STACK.push(BLOCKS[case_target(gb, c)].aux);
+                let cases = gt.blocks[gb].cases;
+                for c in 0..gt.blocks[gb].ncases {
+                    SSA_STACK.push(gt.swcases.data[cases + 2 * c]);
+                    SSA_STACK.push(gt.blocks[gt.swcases.data[cases + 2 * c + 1]].aux);
                 }
-                ir_switch_no_preds(nb, mapped(BLOCKS[gb].cond), BLOCKS[BLOCKS[gb].s0].aux, mark);
+                ir_switch_no_preds(nb, mapped(&gt, gcond), gt.blocks[gt.blocks[gb].s0].aux, mark);
             } else {
+                let s0 = gt.blocks[gb].s0;
+                let s1 = gt.blocks[gb].s1;
                 BLOCKS[nb].term = term;
-                BLOCKS[nb].cond = mapped(BLOCKS[gb].cond);
-                BLOCKS[nb].s0 = if BLOCKS[gb].s0 != 0 { BLOCKS[BLOCKS[gb].s0].aux } else { 0 };
-                BLOCKS[nb].s1 = if BLOCKS[gb].s1 != 0 { BLOCKS[BLOCKS[gb].s1].aux } else { 0 };
+                BLOCKS[nb].cond = mapped(&gt, gcond);
+                BLOCKS[nb].s0 = if s0 != 0 { gt.blocks[s0].aux } else { 0 };
+                BLOCKS[nb].s1 = if s1 != 0 { gt.blocks[s1].aux } else { 0 };
             }
         }
         // Enter the copy.
-        let entry = BLOCKS[IRFUNCS[g].entry].aux;
+        let entry = gt.blocks[gentry].aux;
         BLOCKS[b].term = Term::Jump;
         BLOCKS[b].cond = 0;
         BLOCKS[b].s0 = entry;

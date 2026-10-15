@@ -69,7 +69,7 @@ use Op::{
     Shl, Shr, Store, StoreX, Sub, Test, Ubfx, VBin, VCmp, VExt, VIns, VNeg, VSel, VSplat, VSum, Xor,
 };
 use crate::back::dwarf::DEBUG_INFO;
-use crate::base::{IntVec, alloc_array, grow};
+use crate::base::{IntVec, alloc_array, free, grow};
 use crate::front::lexer::Tok;
 use crate::front::types::{
     FN_COUNT, TY_BOOL, TY_U64, is_fieldless_enum, is_float, is_integer, is_vector, is_void,
@@ -174,6 +174,24 @@ struct IRFunc {
     // The PARAM holding the result pointer (functions returning a compound
     // value), or 0.
     result_ptr: i64,
+    // (0.17) Its tables, while another function is the current one (see
+    // ir_enter).
+    t: IRTables,
+}
+
+// (0.17) The IR tables of one function: its instructions, blocks, frame
+// slots, operand lists, switch cases and (-g) source positions. Ids are
+// local to the function (0 is "none" in each table), so a function's IR
+// can be built, optimized, emitted and freed on its own, and, from 0.18,
+// on a thread of its own. The current function's tables are the statics
+// INSTS, BLOCKS, SLOTS, ARGS, ARGTY, SWCASES and INST_LOC (with their
+// counts), where every pass reads them; ir_enter switches to another
+// function's, and the inliner reads a callee's through ir_view.
+pub struct IRTables {
+    insts: *Inst, inst_count: i64, inst_cap: i64,
+    blocks: *Block, block_count: i64, block_cap: i64,
+    slots: *Slot, slot_count: i64, slot_cap: i64,
+    args: IntVec, argty: IntVec, swcases: IntVec, inst_loc: IntVec,
 }
 
 // A frame slot: memory in the function's frame; `ty` is the checker type
@@ -211,28 +229,109 @@ pub static mut IR_LOC: i64 = 0;
 pub static mut IRF: i64 = 0;
 pub static mut CUR: i64 = 0;
 
+// (0.17) The function whose tables are current (see ir_enter), or -1.
+pub static mut IR_CUR: i64 = -1;
+
 pub fn init_ir() {
     unsafe {
-        // Instruction 0 and block 0 stand for "none".
-        INSTS = grow(INSTS, INST_COUNT, &INST_CAP);
-        INSTS[0] = Inst {
-            op: Op::None, cond: Cond::Eq, ty: 0, a: 0, b: 0, c: 0, imm: 0, imm2: 0, args: 0,
-            nargs: 0,
-            block: 0, prev: 0, next: 0, repl: 0, mark: 0, aux: 0, scale: 0
-        };
-        INST_COUNT = 1;
-        if DEBUG_INFO {
-            INST_LOC.push(0);
-        }
-        BLOCKS = grow(BLOCKS, BLOCK_COUNT, &BLOCK_CAP);
-        BLOCKS[0] = empty_block(0);
-        BLOCK_COUNT = 1;
-        SLOTS = grow(SLOTS, SLOT_COUNT, &SLOT_CAP);
-        SLOTS[0] = Slot { size: 0, align: 1, offset: 0, escapes: 0, ty: 0 };
-        SLOT_COUNT = 1;
-        ARGS.push(0);
-        ARGTY.push(0);
+        IR_CUR = -1;
         FN_IR = alloc_array::<i64>(FN_COUNT + 1);
+    }
+}
+
+// (0.17) Makes function fi's tables the current ones (INSTS, BLOCKS, ...),
+// and fi the function being built (IRF).
+pub fn ir_enter(fi: i64) {
+    unsafe {
+        if IR_CUR != fi {
+            ir_save();
+            let t = IRFUNCS[fi].t;
+            INSTS = t.insts;
+            INST_COUNT = t.inst_count;
+            INST_CAP = t.inst_cap;
+            BLOCKS = t.blocks;
+            BLOCK_COUNT = t.block_count;
+            BLOCK_CAP = t.block_cap;
+            SLOTS = t.slots;
+            SLOT_COUNT = t.slot_count;
+            SLOT_CAP = t.slot_cap;
+            ARGS = t.args;
+            ARGTY = t.argty;
+            SWCASES = t.swcases;
+            INST_LOC = t.inst_loc;
+            IR_CUR = fi;
+        }
+        IRF = fi;
+    }
+}
+
+// (0.17) Function g's tables, to read (and mark, through aux) while
+// another function is current: the inliner copies a callee g into its
+// caller. g is not the current function.
+pub fn ir_view(g: i64) -> IRTables {
+    unsafe { IRFUNCS[g].t }
+}
+
+// The current function's tables, back into its IRFunc.
+fn ir_save() {
+    unsafe {
+        if IR_CUR >= 0 {
+            IRFUNCS[IR_CUR].t = IRTables {
+                insts: INSTS, inst_count: INST_COUNT, inst_cap: INST_CAP,
+                blocks: BLOCKS, block_count: BLOCK_COUNT, block_cap: BLOCK_CAP,
+                slots: SLOTS, slot_count: SLOT_COUNT, slot_cap: SLOT_CAP,
+                args: ARGS, argty: ARGTY, swcases: SWCASES, inst_loc: INST_LOC,
+            };
+        }
+    }
+}
+
+// (0.17) Frees function fi's IR (once it is emitted, or dropped); fi is
+// not current afterwards.
+pub fn ir_free_func(fi: i64) {
+    unsafe {
+        ir_enter(fi);
+        for b in 0..BLOCK_COUNT {
+            free(BLOCKS[b].preds.data as *u8);
+        }
+        free(INSTS as *u8);
+        free(BLOCKS as *u8);
+        free(SLOTS as *u8);
+        free(ARGS.data as *u8);
+        free(ARGTY.data as *u8);
+        free(SWCASES.data as *u8);
+        free(INST_LOC.data as *u8);
+        free(IRFUNCS[fi].blocks.data as *u8);
+        free(IRFUNCS[fi].slots.data as *u8);
+        IRFUNCS[fi].blocks = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        IRFUNCS[fi].slots = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        IRFUNCS[fi].t = empty_tables();
+        IR_CUR = -1;
+        INSTS = 0 as *Inst;
+        INST_COUNT = 0;
+        INST_CAP = 0;
+        BLOCKS = 0 as *Block;
+        BLOCK_COUNT = 0;
+        BLOCK_CAP = 0;
+        SLOTS = 0 as *Slot;
+        SLOT_COUNT = 0;
+        SLOT_CAP = 0;
+        ARGS = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        ARGTY = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        SWCASES = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        INST_LOC = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    }
+}
+
+fn empty_tables() -> IRTables {
+    IRTables {
+        insts: 0 as *Inst, inst_count: 0, inst_cap: 0,
+        blocks: 0 as *Block, block_count: 0, block_cap: 0,
+        slots: 0 as *Slot, slot_count: 0, slot_cap: 0,
+        args: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+        argty: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+        swcases: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+        inst_loc: IntVec { data: 0 as *i64, count: 0, cap: 0 },
     }
 }
 
@@ -261,6 +360,8 @@ pub fn ir_type(t: i64) -> i64 {
 
 // ---- Functions, blocks and slots ----
 
+// A new IR function for FNS entry f (its item: the Fn node), current from
+// now on, with its tables' "none" entries (instruction, block and slot 0).
 pub fn ir_new_func(f: i64, item: i64) -> i64 {
     unsafe {
         IRFUNCS = grow(IRFUNCS, IRFUNC_COUNT, &IRFUNC_CAP);
@@ -270,9 +371,29 @@ pub fn ir_new_func(f: i64, item: i64) -> i64 {
             blocks: IntVec { data: 0 as *i64, count: 0, cap: 0 },
             slots: IntVec { data: 0 as *i64, count: 0, cap: 0 },
             result_ptr: 0,
+            t: empty_tables(),
         };
         IRFUNC_COUNT += 1;
         FN_IR[f] = id + 1;
+        ir_enter(id);
+        INSTS = grow(INSTS, INST_COUNT, &INST_CAP);
+        INSTS[0] = Inst {
+            op: Op::None, cond: Cond::Eq, ty: 0, a: 0, b: 0, c: 0, imm: 0, imm2: 0, args: 0,
+            nargs: 0,
+            block: 0, prev: 0, next: 0, repl: 0, mark: 0, aux: 0, scale: 0
+        };
+        INST_COUNT = 1;
+        if DEBUG_INFO {
+            INST_LOC.push(0);
+        }
+        BLOCKS = grow(BLOCKS, BLOCK_COUNT, &BLOCK_CAP);
+        BLOCKS[0] = empty_block(0);
+        BLOCK_COUNT = 1;
+        SLOTS = grow(SLOTS, SLOT_COUNT, &SLOT_CAP);
+        SLOTS[0] = Slot { size: 0, align: 1, offset: 0, escapes: 0, ty: 0 };
+        SLOT_COUNT = 1;
+        ARGS.push(0);
+        ARGTY.push(0);
         id
     }
 }
@@ -319,6 +440,20 @@ pub fn ir_make(op: Op, ty: i64, a: i64, b: i64, imm: i64) -> i64 {
             INST_LOC.push(IR_LOC);
         }
         v
+    }
+}
+
+// (0.17) A scratch instruction, not part of the function: the entry after
+// its last one (the next ir_make takes it), for a pure computation over
+// an instruction's fields (folding) that must not take an id.
+pub fn ir_scratch(op: Op, ty: i64) -> i64 {
+    unsafe {
+        INSTS = grow(INSTS, INST_COUNT, &INST_CAP);
+        INSTS[INST_COUNT] = Inst {
+            op: op, cond: Cond::Eq, ty: ty, a: 0, b: 0, c: 0, imm: 0, imm2: 0, args: 0, nargs: 0,
+            block: 0, prev: 0, next: 0, repl: 0, mark: 0, aux: 0, scale: 0
+        };
+        INST_COUNT
     }
 }
 

@@ -26,7 +26,7 @@ use crate::middle::gvn::{
 };
 use crate::middle::inline::{FN_ADDRESS, FN_LIVE, FN_SCC, SCC_ORDER, ir_callee, param_operand};
 use crate::middle::ir::{
-    ARGTY, BLOCKS, FN_IR, INSTS, IRF, IRFUNCS, IRFUNC_COUNT, Op, Term, ir_append, ir_arg,
+    ARGTY, BLOCKS, FN_IR, INSTS, IRFUNCS, IRFUNC_COUNT, Op, Term, ir_append, ir_arg, ir_enter,
     ir_insert_before, ir_make, ir_new_slot, ir_operand, ir_operand_count, ir_replace,
     ir_set_operand, ir_unlink, ir_val,
 };
@@ -396,7 +396,7 @@ pub fn infer_component_attrs(start: i64, end: i64) {
             USED_COMPONENT = false;
             for i in start..end {
                 let fi = SCC_ORDER.data[i];
-                IRF = fi;
+                ir_enter(fi);
                 let nocapture = FN_NOCAPTURE[fi];
                 let attrs = compute_attrs(fi);
                 if attrs != FN_ATTRS[fi] || FN_NOCAPTURE[fi] != nocapture {
@@ -467,11 +467,21 @@ pub fn print_attrs() {
 static mut CALL_START: *i64 = 0 as *i64;
 static mut CALL_SITES: *i64 = 0 as *i64;
 
+static mut CALL_FNS: *i64 = 0 as *i64;
+
+// A constant (or function address) passed at a call site, by value: the
+// instruction is the caller's (0.17).
+struct ConstArg { op: Op, ty: i64, imm: i64 }
+
+// The direct call sites of every function g: CALL_SITES[CALL_START[g] ..
+// CALL_START[g + 1]], each an instruction of function CALL_FNS[..] (0.17:
+// instruction ids are the caller's own).
 fn collect_call_sites() {
     unsafe {
         let n = IRFUNC_COUNT;
         free(CALL_START as *u8);
         free(CALL_SITES as *u8);
+        free(CALL_FNS as *u8);
         CALL_START = alloc_array::<i64>(n + 2);
         let mut total = 0;
         for pass in 0..2 {
@@ -480,6 +490,7 @@ fn collect_call_sites() {
                 if FN_LIVE[fi] == 0 {
                     continue;
                 }
+                ir_enter(fi);
                 for i in 0..IRFUNCS[fi].blocks.count {
                     let b = IRFUNCS[fi].blocks.data[i];
                     if BLOCKS[b].removed != 0 {
@@ -493,6 +504,7 @@ fn collect_call_sites() {
                                 CALL_START[g] += 1;
                             } else {
                                 CALL_SITES[CALL_START[g] + fill[g]] = v;
+                                CALL_FNS[CALL_START[g] + fill[g]] = fi;
                                 fill[g] += 1;
                             }
                         }
@@ -508,6 +520,7 @@ fn collect_call_sites() {
                     total += count;
                 }
                 CALL_SITES = alloc_array::<i64>(total + 1);
+                CALL_FNS = alloc_array::<i64>(total + 1);
             }
         }
     }
@@ -521,32 +534,33 @@ fn is_internal(g: i64) -> bool {
     }
 }
 
-// The constant every call site passes as operand k, or 0.
-fn common_constant_arg(g: i64, k: i64) -> i64 {
+// The constant every call site passes as operand k (found: false when
+// they do not agree, or one passes no constant).
+fn common_constant_arg(g: i64, k: i64, found: *ConstArg) -> bool {
     unsafe {
         let start = CALL_START[g];
         let end = CALL_START[g + 1];
         if end == start {
-            return 0;
+            return false;
         }
-        let mut first = 0;
         for i in start..end {
             let call = CALL_SITES[i];
+            ir_enter(CALL_FNS[i]);
             if INSTS[call].block == 0 || k >= INSTS[call].nargs {
-                return 0;
+                return false;
             }
             let a = ir_val(ir_arg(call, k));
             if !is_const(a) && INSTS[a].op != FAddr {
-                return 0;
+                return false;
             }
-            if first == 0 {
-                first = a;
-            } else if INSTS[a].op != INSTS[first].op || INSTS[a].imm != INSTS[first].imm
-                || INSTS[a].ty != INSTS[first].ty {
-                return 0;
+            if i == start {
+                *found = ConstArg { op: INSTS[a].op, ty: INSTS[a].ty, imm: INSTS[a].imm };
+            } else if INSTS[a].op != found.op || INSTS[a].imm != found.imm
+                || INSTS[a].ty != found.ty {
+                return false;
             }
         }
-        first
+        true
     }
 }
 
@@ -650,7 +664,7 @@ pub fn propagate_constants() -> bool {
             if !is_internal(g) || CALL_START[g + 1] == CALL_START[g] {
                 continue;
             }
-            IRF = g;
+            ir_enter(g);
             resolve_all(g);
             let mut changed = false;
             let entry = IRFUNCS[g].entry;
@@ -659,9 +673,11 @@ pub fn propagate_constants() -> bool {
                 let next = INSTS[p].next;
                 let k = param_operand(g, p);
                 if k >= 0 {
-                    let c = common_constant_arg(g, k);
-                    if c != 0 && INSTS[c].ty == INSTS[p].ty {
-                        let k2 = ir_make(INSTS[c].op, INSTS[c].ty, 0, 0, INSTS[c].imm);
+                    let mut c = ConstArg { op: Const, ty: 0, imm: 0 };
+                    let agree = common_constant_arg(g, k, &c);
+                    ir_enter(g);
+                    if agree && c.ty == INSTS[p].ty {
+                        let k2 = ir_make(c.op, c.ty, 0, 0, c.imm);
                         ir_append_after_params(entry, k2);
                         replace_uses_keep(g, p, k2);
                         changed = true;
@@ -681,17 +697,21 @@ pub fn propagate_constants() -> bool {
             if !is_internal(g) {
                 continue;
             }
+            ir_enter(g);
             let r = common_constant_result(g);
             if r == 0 {
                 continue;
             }
+            let r_ty = INSTS[r].ty;
+            let r_imm = INSTS[r].imm;
             for s in CALL_START[g]..CALL_START[g + 1] {
                 let call = CALL_SITES[s];
-                let fi = BLOCKS[INSTS[call].block].func;
-                if INSTS[call].block == 0 || INSTS[call].ty == 0 || INSTS[call].ty != INSTS[r].ty {
+                let fi = CALL_FNS[s];
+                ir_enter(fi);
+                if INSTS[call].block == 0 || INSTS[call].ty == 0 || INSTS[call].ty != r_ty {
                     continue;
                 }
-                let c = ir_make(Const, INSTS[r].ty, 0, 0, INSTS[r].imm);
+                let c = ir_make(Const, r_ty, 0, 0, r_imm);
                 let next = INSTS[call].next;
                 if next != 0 {
                     ir_insert_before(next, c);
@@ -811,7 +831,7 @@ pub fn heap_to_stack(fi: i64) -> bool {
         if calls_returns_twice(fi) {
             return false;
         }
-        IRF = fi;
+        ir_enter(fi);
         resolve_all(fi);
         let mut changed = false;
         let mut frees = IntVec { data: 0 as *i64, count: 0, cap: 0 };
