@@ -86,21 +86,22 @@ mod branches;
 mod divisions;
 mod tiling;
 
-use crate::back::isel::branches::{form_selects, thread_phi_branches};
+use crate::back::isel::branches::{form_selects, lower_sels, thread_phi_branches};
 use crate::back::isel::divisions::lower_divisions;
 use crate::back::isel::tiling::isel_function;
 use crate::back::regalloc::LDEPTH;
 use crate::back::regalloc::prepare::layout_blocks;
 use crate::base::{alloc_array, free};
-use crate::front::types::is_float;
+use crate::base::target::X86;
+use crate::front::types::{TY_F64, is_float, is_vector, type_size};
 use crate::middle::inline::FN_LIVE;
 use crate::middle::ir::{
     BLOCKS, INSTS, INST_COUNT, IRF, IRFUNCS, IRFUNC_COUNT, Op, Term, ir_append, ir_insert_before,
     ir_operand, ir_operand_count, ir_unlink,
 };
-use crate::middle::ir::Op::{Cmp, Const, Param, Test};
+use crate::middle::ir::Op::{Cmp, Const, Copy, Load, LoadX, Param, Store, StoreX, Test};
 use crate::middle::ir::verify::verify_func;
-use crate::middle::opt::eliminate_dead_code;
+use crate::middle::opt::{eliminate_dead_code, resolve_all};
 
 // Uses of each instruction of the function being selected (by value id).
 static mut ISEL_USES: *i64 = 0 as *i64;
@@ -113,6 +114,10 @@ pub fn select_instructions() {
                 continue;
             }
             IRF = fi;
+            if lower_sels(fi) {
+                resolve_all(fi);
+                eliminate_dead_code(fi);
+            }
             let threaded = thread_phi_branches(fi);
             if form_selects(fi) || threaded {
                 eliminate_dead_code(fi);
@@ -253,6 +258,9 @@ fn schedule_function(fi: i64) {
                 ir_unlink(c);
                 ir_append(b, c);
             }
+            if !X86 {
+                pair_accesses(b);
+            }
             if b == entry || LDEPTH.data[BLOCKS[b].order] == 0 {
                 continue;
             }
@@ -270,6 +278,86 @@ fn schedule_function(fi: i64) {
                 }
                 v = next;
             }
+        }
+    }
+}
+
+// (0.15) The size of an access ldp or stp can pair (a 64-bit integer or
+// float, a vector), or 0.
+fn pair_size(v: i64) -> i64 {
+    unsafe {
+        let ty = if INSTS[v].op == Load { INSTS[v].ty } else { INSTS[v].imm2 };
+        if is_vector(ty) {
+            16
+        } else if type_size(ty) == 8 && (!is_float(ty) || ty == TY_F64) {
+            8
+        } else {
+            0
+        }
+    }
+}
+
+// (0.15, AArch64) Loads (stores) of one base at offsets one access apart
+// are put side by side, the lower offset first, for emission to make them
+// one ldp (stp): a load moves up to the other, past no store or call; a
+// store moves down to the other, past no memory access or call. Unrolled
+// copies of a loop body load a[k], b[k], then a[k + 1], b[k + 1].
+fn pair_accesses(b: i64) {
+    unsafe {
+        let mut w = BLOCKS[b].first;
+        while w != 0 {
+            let next = INSTS[w].next;
+            let op = INSTS[w].op;
+            let size = if op == Load || op == Store { pair_size(w) } else { 0 };
+            if size != 0 && (op == Store || ISEL_USES[w] > 0) {
+                let mut v = INSTS[w].prev;
+                let mut steps = 0;
+                while v != 0 && steps < 16 {
+                    let vop = INSTS[v].op;
+                    if vop == op && INSTS[v].a == INSTS[w].a && pair_size(v) == size
+                        && (INSTS[v].imm + size == INSTS[w].imm
+                            || INSTS[w].imm + size == INSTS[v].imm)
+                        && (op == Store || (ISEL_USES[v] > 0 && INSTS[v].ty == INSTS[w].ty))
+                        && (op == Load || INSTS[v].imm2 == INSTS[w].imm2) {
+                        if op == Load {
+                            ir_unlink(w);
+                            if INSTS[v].imm < INSTS[w].imm {
+                                insert_after(v, w);
+                            } else {
+                                ir_insert_before(v, w);
+                            }
+                        } else {
+                            ir_unlink(v);
+                            if INSTS[v].imm < INSTS[w].imm {
+                                ir_insert_before(w, v);
+                            } else {
+                                insert_after(w, v);
+                            }
+                        }
+                        break;
+                    }
+                    // What the move may not pass.
+                    if vop.is_call() || vop == Store || vop == StoreX || vop == Copy
+                        || vop == Op::Phi || (op == Store && (vop == Load || vop == LoadX))
+                        || INSTS[v].block != b {
+                        break;
+                    }
+                    v = INSTS[v].prev;
+                    steps += 1;
+                }
+            }
+            w = next;
+        }
+    }
+}
+
+// Puts unlinked instruction y right after x.
+fn insert_after(x: i64, y: i64) {
+    unsafe {
+        if INSTS[x].next != 0 {
+            ir_insert_before(INSTS[x].next, y);
+        } else {
+            ir_append(INSTS[x].block, y);
         }
     }
 }

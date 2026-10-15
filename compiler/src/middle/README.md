@@ -30,6 +30,7 @@ again. `back` takes the optimized IR.
 | `loops.tach` | the loop forest, canonical form, LCSSA, the SSA updater, cloning, rotation |
 | `scev.tach` | induction variables, trip counts, exit values, unrolling |
 | `range/` | value ranges: bounds checks, comparisons, jump threading (`thread`), phis (`phi`), chains to switches (`chains`) |
+| `ifconv.tach` | if-conversion in innermost loops: small branches become selects (0.15) |
 | `vectorize/` | the loop vectorizer: legality, checks, the vector loop (`build`), outer loops, run-time unrolling (`unroll`) |
 | `slp.tach` | the SLP vectorizer: stores to a vector's lanes |
 | `lsr.tach` | loop strength reduction, unswitching |
