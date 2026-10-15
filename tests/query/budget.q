@@ -186,6 +186,7 @@ usage: tachyonc query def|show NAME... [--root ROOT] [--exact] [--with-comments]
        tachyonc query text FILE[:A[-B]]...
        tachyonc query diff
        tachyonc query refs|callers NAME... [--exact] [--count] [--in FILE|MODULE] [--limit N] [--all]
+       tachyonc query callees FN... [--transitive] [--writes TABLE] [--count] [--limit N] [--all]
        tachyonc query items [MODULE...] [--comments]
        tachyonc query show MODULE::section TITLE
        tachyonc query grep PATTERN... [--in FILE|MODULE] [--code] [--comments] [--strings] [--word] [--count] [--limit N] [--all]

@@ -157,10 +157,17 @@ try: tachyonc query text calc.tach:18-20
   lines around it, a line up and down at a time, until it is unique:
 
 ```
-error patch.ambiguous: OLD 1 occurs 2 times in crate::calc::clamp, lines 6, 9; give more of the text around it
+error patch.ambiguous: OLD 1 occurs 2 times in crate::calc::clamp, lines 6, 9; give more of the text around it, or --nth N (--all: every one)
 try: tachyonc edit patch clamp --old 'return lo;' --new 'return 0 + lo;'
 try: tachyonc edit patch clamp --old 'return hi;' --new 'return 0 + hi;'
 ```
+
+  (0.16) Or say which: `--nth N` replaces the Nth match (1 is the first,
+  in TARGET's text order: the order of the lines the error lists),
+  `--all` every one; they hold for every pair of the command. Past the
+  last: `error patch.nth: OLD 1 occurs 3 times in crate::calc::clamp;
+  --nth 4 is past the last`. `edit insert --in` takes `--nth N` for its
+  ANCHOR (not `--all`).
 
   Pairs of several lines, and pairs given as blocks, are not put on the
   command line (agent harnesses refuse `$'...'` quoting): they are
@@ -186,7 +193,8 @@ try: tachyonc edit patch clamp --pairs .git/tachyon-edits/try-1.pairs
 - **Imports (0.14)**: when the check finds new errors, a round of `fix
   --only imports` on the edited file adds the `use` lines of the names
   the new text takes from other modules (as `edit replace` and `insert`
-  do, below), and the edit is checked with them: `note edit.imports`.
+  do, below), and the edit is checked with them: `note edit.imports`
+  (once per command: 0.16, a script's steps say it once).
 - Only the summary line is printed, never the file.
 
 ### Pairs on stdin, or in a file
@@ -507,6 +515,23 @@ before the check, and the summary counts every round. Nothing to fix:
 `tachyonc --fix-imports ROOT` (0.8) and `tachyonc --fix-unsafe ROOT`
 (0.9) are `fix --only imports` and `fix --only unsafe`, silent when
 there is nothing to do.
+
+**Which module (0.16).** The error of an unknown name helps with the
+first module that has a public item of that name. When several modules
+the file can name have one (of the same kind: a value, or a type),
+`imports` takes the nearest: the one whose innermost module holding both
+it and the importing module is deepest (a sibling before a cousin; std
+is farther than any of the program's), then the one with the fewest path
+segments. When more than one is that near, nothing is imported for that
+name, and `error fix.ambiguous` (exit 1, the other fixes made) lists
+them with a `try:` line each: `--use PATH::NAME` (repeatable) imports
+NAME from there.
+
+```
+error fix.ambiguous: crate::back uses 'is_blank', which 2 modules as near have: crate::back::asm, crate::back::obj; nothing is imported for it: name one with --use
+try: tachyonc fix --only imports --use crate::back::asm::is_blank
+try: tachyonc fix --only imports --use crate::back::obj::is_blank
+```
 
 ## tachyonc same-output
 

@@ -1,0 +1,315 @@
+// A rewrite's substitutions and new names (0.16; docs/refactor-shape.md):
+//
+//   --subst 'PATTERN' 'REPLACEMENT'   (repeated: in order)
+//
+// replaces each match of PATTERN inside the code a hole of the main
+// pattern matched (the statements of a `$s...` above all) by REPLACEMENT,
+// at each site the main replacement keeps that hole: PATTERN's holes
+// already bound at the site must match the same code (`$v.data[$i]`
+// matches only the site's $v and $i), its others bind afresh at each
+// match, and --where types and names hold for them too. A hole of the
+// main replacement that the pattern lacks is a new name, bound where the
+// replacement binds it (`for $x in`, `let $x =`): its own name (`$x` is
+// `x`), with a number when the site's item already has that name.
+// `--list` prints a line per site instead of rewriting.
+
+use crate::base::{
+    BUFS, FILES, IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
+    intern,
+};
+use crate::front::ast::NodeKind;
+use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
+use crate::front::modules::file_of_pos;
+use crate::tools::query::defs::DEFS;
+use crate::tools::query::positions::{enclosing, line_of, line_start};
+use crate::tools::query::refs::file_text;
+use crate::tools::rewrite::parsed::{binding_level, parenthesized, pend, pk, pstart};
+use crate::tools::rewrite::pattern::{
+    B_END, B_NODE, B_START, FRESH_TEXT, H_FRESH, H_NAME, H_REST, H_SYM, H_TYPE, P_LEVELS, R_KEPT,
+    R_LEVELS, SUB_END, SUB_START, SUB_TEXT, TYPE_MISSES, UNTYPED, hole_of, match_node, types_match,
+};
+
+// The substitutions: their patterns' and replacements' nodes, and the
+// replacements' holes (S_HOLES from S_HFIRST[k], S_HCOUNT[k] of them, in
+// order); the holes from S_LOCAL on are the patterns' own.
+pub static mut S_PAT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut S_REP: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut S_HFIRST: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut S_HCOUNT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut S_HOLES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut S_LOCAL: i64 = 0;
+
+// Substitution k's replacement node, its holes found in first..last.
+pub fn note_subst_holes(k: i64, first: i64, last: i64) {
+    unsafe {
+        let r = S_REP.data[k];
+        S_HFIRST.push(S_HOLES.count);
+        let mut n = 0;
+        for q in first..last {
+            if hole_of(q) >= 0 && pstart(q) >= pstart(r) && pend(q) <= pend(r) {
+                // (by position)
+                let mut j = S_HOLES.count;
+                S_HOLES.push(q);
+                while j > S_HFIRST.data[k] && pstart(S_HOLES.data[j - 1]) > pstart(q) {
+                    S_HOLES.data[j] = S_HOLES.data[j - 1];
+                    j -= 1;
+                }
+                S_HOLES.data[j] = q;
+                n += 1;
+            }
+        }
+        S_HCOUNT.push(n);
+    }
+}
+
+// Whether the name sym is written in SRC[from..to).
+fn name_in(sym: i64, from: i64, to: i64) -> bool {
+    unsafe {
+        let mut i = crate::tools::query::positions::token_at(from);
+        while i < TOK_COUNT && TOKS[i].start < to {
+            if TOKS[i].kind == Tok::Ident && TOKS[i].value as i64 == sym {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+}
+
+// The new names of the site from..to: each fresh hole's own name, or
+// with 2, 3... added, so as not to be a name of the item holding it.
+pub fn choose_fresh(from: i64, to: i64) {
+    unsafe {
+        let d = enclosing(from);
+        let a = if d >= 0 { DEFS[d].start } else { from };
+        let b = if d >= 0 { DEFS[d].end } else { to };
+        for h in 0..H_SYM.count {
+            if H_FRESH.data[h] == 0 {
+                continue;
+            }
+            let base = buf_slice(H_NAME.data[h]);
+            let mut k = 1;
+            loop {
+                let text = buf_new();
+                buf_bytes(text, base[1..base.len]);
+                if k > 1 {
+                    buf_int(text, k);
+                }
+                let mut taken = name_in(intern(buf_slice(text)), a, b);
+                for g in 0..h {
+                    if H_FRESH.data[g] != 0
+                        && crate::tools::query::defs::bytes_eq(buf_slice(FRESH_TEXT.data[g]),
+                            buf_slice(text)) {
+                        taken = true;
+                    }
+                }
+                if !taken {
+                    FRESH_TEXT.data[h] = text;
+                    break;
+                }
+                k += 1;
+            }
+        }
+    }
+}
+
+// Substitution k's replacement at the match just made, into a buffer:
+// its holes' texts, parenthesized where it needs.
+fn subst_text(k: i64) -> i64 {
+    unsafe {
+        let r = S_REP.data[k];
+        let out = buf_new();
+        let mut cur = pstart(r);
+        for i in 0..S_HCOUNT.data[k] {
+            let q = S_HOLES.data[S_HFIRST.data[k] + i];
+            let h = hole_of(q);
+            buf_bytes(out, SRC[cur..pstart(q)]);
+            cur = pend(q);
+            if H_FRESH.data[h] != 0 {
+                buf_bytes(out, buf_slice(FRESH_TEXT.data[h]));
+                continue;
+            }
+            if B_NODE.data[h] == -3 {
+                continue;
+            }
+            let wrap = H_REST.data[h] == 0 && B_NODE.data[h] >= 0
+                && binding_level(B_NODE.data[h]) < R_LEVELS[q];
+            if wrap {
+                buf_byte(out, '(');
+            }
+            buf_bytes(out, SRC[B_START.data[h]..B_END.data[h]]);
+            if wrap {
+                buf_byte(out, ')');
+            }
+        }
+        buf_bytes(out, SRC[cur..pend(r)]);
+        out
+    }
+}
+
+// The level substitution k's replacement has where it stands.
+fn subst_level(k: i64) -> i64 {
+    unsafe {
+        let r = S_REP.data[k];
+        let h = hole_of(r);
+        if h >= 0 {
+            if H_FRESH.data[h] != 0 || B_NODE.data[h] < 0 {
+                return 99;
+            }
+            return binding_level(B_NODE.data[h]);
+        }
+        binding_level(r)
+    }
+}
+
+// The substitutions at the site just matched (SUB_START, SUB_END,
+// SUB_TEXT): in the code of each hole the replacement keeps, every match
+// of each --subst pattern, outermost first.
+pub fn find_substs(program_end: i64) {
+    unsafe {
+        SUB_START.count = 0;
+        SUB_END.count = 0;
+        SUB_TEXT.count = 0;
+        if S_PAT.count == 0 {
+            return;
+        }
+        let misses = TYPE_MISSES;
+        let untyped = UNTYPED;
+        for h in 0..S_LOCAL {
+            if R_KEPT.data[h] == 0 || H_FRESH.data[h] != 0 || B_NODE.data[h] == -3
+                || B_START.data[h] < 0 {
+                continue;
+            }
+            let a = B_START.data[h];
+            let b = B_END.data[h];
+            for k in 0..S_PAT.count {
+                let p = S_PAT.data[k];
+                let kind = pk(p);
+                for m in 1..program_end {
+                    if pk(m) != kind || pstart(m) < a || pend(m) > b {
+                        continue;
+                    }
+                    for g in S_LOCAL..H_SYM.count {
+                        if H_FRESH.data[g] == 0 {
+                            B_NODE.data[g] = -1;
+                        }
+                    }
+                    if !match_node(p, m) || !types_match() {
+                        continue;
+                    }
+                    let mut from = pstart(m);
+                    let mut to = pend(m);
+                    let mut text = subst_text(k);
+                    if parenthesized(m) {
+                        from += 1;
+                        to -= 1;
+                    } else if subst_level(k) < P_LEVELS[m] {
+                        let w = buf_new();
+                        buf_byte(w, '(');
+                        buf_bytes(w, buf_slice(text));
+                        buf_byte(w, ')');
+                        text = w;
+                    }
+                    add_sub(from, to, text);
+                }
+            }
+        }
+        for g in S_LOCAL..H_SYM.count {
+            if H_FRESH.data[g] == 0 {
+                B_NODE.data[g] = -1;
+            }
+        }
+        TYPE_MISSES = misses;
+        UNTYPED = untyped;
+    }
+}
+
+// A substitution of from..to by text, unless one already holds it; one
+// it holds goes (outermost first).
+fn add_sub(from: i64, to: i64, text: i64) {
+    unsafe {
+        let mut i = 0;
+        while i < SUB_START.count {
+            let s = SUB_START.data[i];
+            let e = SUB_END.data[i];
+            if s <= from && to <= e {
+                return;
+            }
+            if from <= s && e <= to {
+                SUB_START.data[i] = SUB_START.data[SUB_START.count - 1];
+                SUB_END.data[i] = SUB_END.data[SUB_END.count - 1];
+                SUB_TEXT.data[i] = SUB_TEXT.data[SUB_TEXT.count - 1];
+                SUB_START.count -= 1;
+                SUB_END.count -= 1;
+                SUB_TEXT.count -= 1;
+                continue;
+            }
+            i += 1;
+        }
+        // (by position)
+        SUB_START.push(from);
+        SUB_END.push(to);
+        SUB_TEXT.push(text);
+        let mut j = SUB_START.count - 1;
+        while j > 0 && SUB_START.data[j - 1] > from {
+            SUB_START.data[j] = SUB_START.data[j - 1];
+            SUB_END.data[j] = SUB_END.data[j - 1];
+            SUB_TEXT.data[j] = SUB_TEXT.data[j - 1];
+            j -= 1;
+        }
+        SUB_START.data[j] = from;
+        SUB_END.data[j] = to;
+        SUB_TEXT.data[j] = text;
+    }
+}
+
+// `--list`: the line of the site at pos: `FILE:LINE:COL`, then each hole
+// of the pattern and what it matched (`$x=text`, spaces and lines made
+// one space, cut at 60 bytes), TAB-separated.
+pub fn put_site(out: i64, pos: i64) {
+    unsafe {
+        buf_bytes(out, file_text(file_of_pos(pos)));
+        buf_byte(out, ':');
+        buf_int(out, line_of(pos));
+        buf_byte(out, ':');
+        buf_int(out, pos - line_start(pos) + 1);
+        for h in 0..S_LOCAL {
+            if H_FRESH.data[h] != 0 || B_NODE.data[h] == -1 {
+                continue;
+            }
+            buf_byte(out, '\t');
+            buf_bytes(out, buf_slice(H_NAME.data[h]));
+            if H_REST.data[h] != 0 {
+                buf_str(out, c"...");
+            }
+            buf_byte(out, '=');
+            if B_NODE.data[h] == -3 {
+                continue;
+            }
+            let t = SRC[B_START.data[h]..B_END.data[h]];
+            let mut n = 0;
+            let mut space = false;
+            for i in 0..t.len {
+                let c = t[i];
+                if c == ' ' || c == '\n' || c == '\t' || c == '\r' {
+                    space = true;
+                    continue;
+                }
+                if n >= 60 {
+                    buf_byte(out, 226 as u8);
+                    buf_byte(out, 128 as u8);
+                    buf_byte(out, 166 as u8);
+                    break;
+                }
+                if space && n > 0 {
+                    buf_byte(out, ' ');
+                    n += 1;
+                }
+                space = false;
+                buf_byte(out, c);
+                n += 1;
+            }
+        }
+        buf_byte(out, '\n');
+    }
+}

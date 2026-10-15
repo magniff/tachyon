@@ -116,7 +116,7 @@ $ rewrite 'grow($v, $n' '$v'
 error rewrite.pattern: the pattern is no tachyon expression: expected ')', got 'EOF'
 [exit 2]
 $ rewrite 'grow($v, $n)' 'f($w)'
-error rewrite.unbound: the replacement's $w is not in the pattern
+error rewrite.unbound: the replacement's $w is not in the pattern, and the replacement binds no name with it (`for $x in`, `let $x =`)
 [exit 2]
 $ rewrite 'grow($v...) + 1' 'f()'
 note rewrite.none: nothing matches 'grow($v...) + 1'

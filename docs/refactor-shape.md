@@ -16,7 +16,8 @@ tachyonc refactor signature FN --add 'x: T [= VALUE]' [--at N] [--fill-calls] | 
                                | --rename-param a b | --reorder b,a,c | --type x T [--default EXPR]
 tachyonc refactor field STRUCT --add 'g: T = VALUE' | --remove g | --rename g h | --type g T
 tachyonc refactor variant ENUM --add 'X(T, ...)' [--arm EXPR] [--arm-in SITE EXPR]... | --remove V | --rename V W
-tachyonc rewrite 'PATTERN' 'REPLACEMENT' [--where '$x: T']... [--in FILE|MODULE]
+tachyonc rewrite 'PATTERN' 'REPLACEMENT' [--where '$x: T']... [--subst 'P' 'R']... [--in FILE|MODULE] [--list]
+tachyonc rewrite 'PATTERN' --list [--where ...] [--in FILE|MODULE]   (0.16)
 tachyonc refactor extract-function FN --lines A-B --to NEW          (0.13)
 tachyonc refactor inline FN [--at FILE:LINE] [--keep]                 (0.13)
 tachyonc refactor --script FILE
@@ -174,6 +175,7 @@ by the compiler's parser, with holes:
 | `$x...` | any number of elements of a call's arguments, a tuple, an array (one per list): `f($first, $rest...)`; (0.15) of a block's statements, its tail included: `{ let $x = $e; $s... }` |
 | `$x` written twice | the same code both times (the same tokens, spacing and comments aside) |
 | `--where '$x: T'` | only where the checker typed $x's expression `T` (as messages write types: `*IntVec`, `[u8]`, `Vec<i64>`; spaces aside); several: `--where '$x: T, $y: U'` or `--where` again |
+| `--where '$x: name'`, `--where '$x: name ~ RE'`, `$x~/RE/` | (0.16) only a name: an identifier or a path (`V`, `crate::m::V`, the name a `for` or `let` binds), not another expression (`IRFUNCS[f].blocks`); with RE, a name whose text RE matches (`^ $ . * + ? [a-z] [^...] \d \w`, anywhere unless anchored: `$v~/^v_/`) |
 
 The pattern is matched against every node as parsed (`--in FILE|MODULE`:
 the sites in that file or module), node by node: same kind, same
@@ -213,6 +215,46 @@ A site where the replacement drops a hole bound to a name (`for $i`,
 `let $x =`) that the code it keeps still uses is left as it is: `note
 rewrite.dropped` counts them and names the first, `try: query show` it.
 The imports the replacement's names need are added (`note edit.imports`).
+
+(0.16) **New names, substitutions.** A hole of the replacement that the
+pattern lacks is a new name, which the replacement must bind (`for $x
+in`, `let $x =`; else `error rewrite.unbound`): at each site it is its
+own name (`$x` is `x`), or `x2`, `x3`... when the item holding the site
+already has an `x`. `--subst 'P' 'R'` (repeatable, expressions) replaces
+each match of P inside the code a hole of the site matched and the
+replacement keeps (the statements of a `$s...` above all) by R: P's holes
+that the pattern has match only the code they matched at the site
+(`$v.data[$i]` is the site's `$v` and `$i`), its other holes match
+anything (`--where` holds for them too), and R may use either and the
+new names. A site where a dropped binding is still used after the
+substitutions is left (`note rewrite.dropped`):
+
+```
+tachyonc rewrite 'for $i in 0..$v.count { $s... }' 'for $x in $v.items() { $s... }' \
+    --subst '$v.data[$i]' '$x' --where '$v: name'
+```
+
+turns `for i in 0..BLOCKS.count { f(BLOCKS.data[i]); }` into `for x in
+BLOCKS.items() { f(x); }`, and leaves a loop that uses `i` otherwise.
+
+(0.16) **Layout.** A block of the replacement written on one line takes
+the site's lines when the site had them (a statement a line, the `}` on
+its own, indented from the site's line; with a `$s...`, as that block's
+statements were); a replacement written on several lines keeps its
+lines, each indented from the site's line as it was from the
+replacement's first.
+
+(0.16) **`--list`** prints a line per site instead of rewriting:
+`FILE:LINE:COL`, then each hole of the pattern and what it matched,
+TAB-separated (spaces and lines made one space, cut at 60 bytes). With a
+REPLACEMENT, the sites that would be rewritten (not those left by
+`rewrite.dropped`); without one, every site PATTERN matches:
+
+```
+$ tachyonc rewrite 'for $i in 0..$v.count { $s... }' --list
+loops.tach:8:5→$i=i→$v=w→$s...=t += w.data[i] * 2; if w.data[i] > 2 { t += w.data[i]; }
+loops.tach:18:5→$i=j→$v=w→$s...=t -= w.data[j];
+```
 
 Nothing matches: `note rewrite.none`, exit 0; when sites matched but for
 --where, `note rewrite.types` gives the first one's type and place, and
@@ -421,7 +463,7 @@ as it changes the program through the edit engine (`edit_replace`,
 | `refactor.no-call`, `refactor.ambiguous` | error | 1 | inline: no call (on the line of `--at`), several there | `query refs` |
 | `refactor.nested` | note | 0 | inline: calls left in the arguments of others | |
 | `refactor.script` | error | 1, 2 | a line is no command, a command failed: nothing written | |
-| `rewrite.pattern`, `rewrite.unbound` | error | 2 | the pattern or replacement does not parse, a hole alone, `$x...` outside a list, a hole of the replacement not in the pattern | |
+| `rewrite.pattern`, `rewrite.unbound` | error | 2 | the pattern or replacement does not parse, a hole alone, `$x...` outside a list, a hole of the replacement not in the pattern and bound by it nowhere, a bad `~/RE/` | |
 | `rewrite.bad-in` | error | 1 | `--in` names no file or module | |
 | `rewrite.none` | note | 0 | nothing matches | |
 | `rewrite.types` | note | 0 | sites match but for --where | the command with the type found |

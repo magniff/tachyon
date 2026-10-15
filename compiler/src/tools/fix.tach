@@ -24,11 +24,16 @@ use crate::base::{
     buf_slice, buf_str, buf_write_fd, intern, streq,
 };
 use crate::front::ast::{KEEP_PARSED, NODES, NODE_COUNT, NodeKind, child};
+use crate::front::generics::{TPL_NONE, template_of_key};
 use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
-use crate::front::modules::{C_MODULE, MODULES, STD_MODULE, file_of_pos, module_count, module_of};
+use crate::front::modules::{
+    C_MODULE, MODULES, STD_MODULE, file_of_pos, item_key_if_known, module_count, module_of,
+};
 use crate::front::modules::lookup::{B_PRIVATE, LEGACY_IMPORTS, binding_kind, binding_value};
 use crate::front::parser::items::ITEM_PUBLIC;
-use crate::front::types::item_node_of;
+use crate::front::types::{
+    SYM_ALIAS, SYM_CONST, SYM_ENUM, SYM_FN, SYM_STATIC, SYM_STRUCT, item_node_of,
+};
 use crate::tools::edit::{TARGET, TARGET_NAME, edit_count, edit_replace};
 use crate::tools::edit::apply::{
     copy_rewritten, finish_edit, overlay_args, prepare_edit, set_command, write_round,
@@ -39,9 +44,10 @@ use crate::tools::fiximports::{FIX_IMPORTS, fix_imports_edits};
 use crate::tools::fixstd015::std015_edits;
 use crate::tools::fixunsafe::{FIX_UNSAFE, WHOLE_BODIES, fix_unsafe_edits};
 use crate::tools::query::{c_slice, load_program, root_or_diag};
-use crate::tools::query::defs::{DEFS, DEF_COUNT, MOD_DEF};
+use crate::tools::query::defs::{DEFS, DEF_COUNT, MOD_DEF, mod_fqn, mod_fqn_text};
 use crate::tools::query::diagnostics::{
-    PROG, ROOT_GIVEN, TOOL, diag, program_errors, sym_less, try_begin, try_end, write_diags,
+    PROG, ROOT_GIVEN, TOOL, diag, program_errors, put_word, sym_less, try_begin, try_end,
+    write_diags,
 };
 use crate::tools::query::positions::{line_end, line_start};
 use crate::tools::query::refs::{IN_FILE, IN_MODULE, OPT_IN, put_bad_in, ref_in, resolve_in};
@@ -179,12 +185,21 @@ fn missing_use_edits() -> i64 {
     unsafe {
         let mut fixes = 0;
         let mut done = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        // (0.16: the module, among several with the name: choose_path)
         let mut i = 0;
+        while i < MISSING.count {
+            let m = MISSING.data[i];
+            if user_module(m) && module_in(m) {
+                MISSING.data[i + 1] = choose_path(m, MISSING.data[i + 2], MISSING.data[i + 1]);
+            }
+            i += 3;
+        }
+        i = 0;
         while i < MISSING.count {
             let m = MISSING.data[i];
             let p = MISSING.data[i + 1];
             i += 3;
-            if !user_module(m) || !module_in(m) {
+            if p < 0 || !user_module(m) || !module_in(m) {
                 continue;
             }
             // (once per module and path, with all its names)
@@ -215,6 +230,229 @@ fn missing_use_edits() -> i64 {
             }
         }
         fixes
+    }
+}
+
+// ---- Which module a missing import comes from (0.16) ----
+
+// `--use PATH::NAME`: the module to import NAME from when several have
+// it (fix.ambiguous's `try:` lines), as symbols: path, name, in pairs.
+static mut CHOSEN: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// Whether a name was left for fix.ambiguous (the exit status is 1).
+static mut AMBIGUOUS: bool = false;
+
+// `--use PATH::NAME` into CHOSEN. False when it has no `::`.
+fn take_use(v: [u8]) -> bool {
+    unsafe {
+        let mut cut = -1;
+        for i in 1..v.len {
+            if v[i] == ':' && v[i - 1] == ':' {
+                cut = i - 1;
+            }
+        }
+        if cut <= 0 || cut + 2 >= v.len {
+            return false;
+        }
+        CHOSEN.push(intern(v[0..cut]));
+        CHOSEN.push(intern(v[cut + 2..v.len]));
+        true
+    }
+}
+
+// The module whose path is symbol p (`crate::a::b`, `std`), or -1 (std's
+// path when std is not read).
+fn module_of_path(p: i64) -> i64 {
+    for m in 0..module_count() {
+        if m != C_MODULE && mod_fqn(m) == p {
+            return m;
+        }
+    }
+    -1
+}
+
+// 1 for a value (a function, constant or static), 2 for a type, else 0.
+fn key_kind(key: i64) -> i64 {
+    unsafe {
+        if SYM_FN[key] != 0 || SYM_CONST[key] != 0 || SYM_STATIC[key] != 0 {
+            1
+        } else if SYM_STRUCT[key] != 0 || SYM_ENUM[key] != 0 || SYM_ALIAS[key] != 0
+            || template_of_key(key) != TPL_NONE {
+            2
+        } else {
+            0
+        }
+    }
+}
+
+// Whether module a is module m or holds it.
+fn holds(a: i64, m: i64) -> bool {
+    unsafe {
+        let mut x = m;
+        loop {
+            if x == a {
+                return true;
+            }
+            if x <= 0 {
+                return false;
+            }
+            x = MODULES[x].parent;
+        }
+    }
+}
+
+// Whether module m can name module c's items: each module on c's path is
+// public, or its parent holds m.
+fn reachable(c: i64, m: i64) -> bool {
+    unsafe {
+        if c == STD_MODULE {
+            return true;
+        }
+        let mut x = c;
+        while x > 0 {
+            let p = MODULES[x].parent;
+            if !MODULES[x].public && !holds(p, m) {
+                return false;
+            }
+            x = p;
+        }
+        true
+    }
+}
+
+// How near module c is to module m: the depth of the innermost module
+// holding both (std: -1, farther than any of the program's), and the
+// number of segments of c's path.
+fn nearness(c: i64, m: i64, shared: *i64, segments: *i64) {
+    unsafe {
+        let mut n = 0;
+        let mut x = c;
+        while x > 0 {
+            n += 1;
+            x = MODULES[x].parent;
+        }
+        *segments = if c == STD_MODULE { 1 } else { n + 1 };
+        if c == STD_MODULE {
+            *shared = -1;
+            return;
+        }
+        let mut a = c;
+        while !holds(a, m) {
+            a = MODULES[a].parent;
+        }
+        let mut d = 0;
+        while a > 0 {
+            d += 1;
+            a = MODULES[a].parent;
+        }
+        *shared = d;
+    }
+}
+
+// Whether module a is nearer to m than module b.
+fn nearer(a: i64, b: i64, m: i64) -> bool {
+    let mut sa = 0;
+    let mut na = 0;
+    let mut sb = 0;
+    let mut nb = 0;
+    nearness(a, m, &sa, &na);
+    nearness(b, m, &sb, &nb);
+    sa > sb || (sa == sb && na < nb)
+}
+
+// The path (a symbol) to import `name` from into module m, which the
+// checker's help gave as p: when other modules m can name have a public
+// item `name` of the same kind, the one --use names, else the nearest
+// (the innermost module holding both, then the fewest segments) when no
+// other is as near; else -1, after fix.ambiguous.
+fn choose_path(m: i64, name: i64, p: i64) -> i64 {
+    unsafe {
+        let pm = module_of_path(p);
+        if pm < 0 {
+            return p;
+        }
+        let kind = key_kind(item_key_if_known(pm, name));
+        let mut cands = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut keys = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for c in 0..module_count() {
+            if c == m || c == C_MODULE {
+                continue;
+            }
+            let key = item_key_if_known(c, name);
+            if key < 0 {
+                continue;
+            }
+            let item = item_node_of(key);
+            if item == 0 || (NODES[item].p & ITEM_PUBLIC) == 0 || key_kind(key) != kind
+                || !reachable(c, m) {
+                continue;
+            }
+            cands.push(c);
+            keys.push(key);
+        }
+        if cands.count <= 1 {
+            return p;
+        }
+        for i in 0..CHOSEN.count / 2 {
+            if CHOSEN.data[2 * i + 1] != name {
+                continue;
+            }
+            for k in 0..cands.count {
+                if mod_fqn(cands.data[k]) == CHOSEN.data[2 * i] {
+                    return CHOSEN.data[2 * i];
+                }
+            }
+        }
+        // The nearest; those as near that are another item.
+        let mut best = 0;
+        for k in 1..cands.count {
+            if nearer(cands.data[k], cands.data[best], m) {
+                best = k;
+            }
+        }
+        let mut tied = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        tied.push(cands.data[best]);
+        for k in 0..cands.count {
+            if k != best && keys.data[k] != keys.data[best]
+                && !nearer(cands.data[best], cands.data[k], m) {
+                tied.push(cands.data[k]);
+            }
+        }
+        if tied.count == 1 {
+            return mod_fqn(cands.data[best]);
+        }
+        AMBIGUOUS = true;
+        let d = diag(c"error", c"fix.ambiguous");
+        buf_bytes(d, mod_fqn_text(m));
+        buf_str(d, c" uses '");
+        buf_bytes(d, SYMS[name].text);
+        buf_str(d, c"', which ");
+        buf_int(d, tied.count);
+        buf_str(d, c" modules as near have: ");
+        for k in 0..tied.count {
+            if k > 0 {
+                buf_str(d, c", ");
+            }
+            buf_bytes(d, mod_fqn_text(tied.data[k]));
+        }
+        buf_str(d, c"; nothing is imported for it: name one with --use\n");
+        for k in 0..tied.count {
+            if k == 5 {
+                break;
+            }
+            let out = try_begin(c"fix", c_slice(c""), false);
+            buf_str(out, c" --only imports --use");
+            let path = buf_new();
+            buf_bytes(path, mod_fqn_text(tied.data[k]));
+            buf_str(path, c"::");
+            buf_bytes(path, SYMS[name].text);
+            put_word(out, buf_slice(path));
+            if OPT_IN != 0 as *u8 {
+                buf_str(out, c" --in");
+                put_word(out, c_slice(OPT_IN));
+            }
+            try_end(out);
+        }
+        -1
     }
 }
 
@@ -603,6 +841,15 @@ fn run_fix_inner(argc: i64, argv: **u8, alias: i64) -> i64 {
                 i += 2;
                 continue;
             }
+            if streq(a, c"--use") && i + 1 < argc {
+                if !take_use(c_slice(argv[i + 1])) {
+                    let d = diag(c"error", c"fix.usage");
+                    buf_str(d, c"--use takes the path of an item, 'crate::a::b::name'\n");
+                    return 2;
+                }
+                i += 2;
+                continue;
+            }
             if streq(a, c"--overlay") && i + 2 < argc {
                 OVERLAY.push(argv[i + 1] as i64);
                 OVERLAY.push(argv[i + 2] as i64);
@@ -715,6 +962,9 @@ fn run_fix_inner(argc: i64, argv: **u8, alias: i64) -> i64 {
             return write_round();
         }
         if edit_count() == 0 {
+            if AMBIGUOUS {
+                return 1;
+            }
             if alias == 0 {
                 let d = diag(c"note", c"fix.none");
                 buf_str(d, c"nothing to fix\n");
@@ -743,7 +993,8 @@ fn run_fix_inner(argc: i64, argv: **u8, alias: i64) -> i64 {
         put_count(what, counts[6], c"unused re-export", c"unused re-exports");
         put_count(what, counts[7], c"untidy use line", c"untidy use lines");
         put_count(what, counts[8], c"call of 0.14's std", c"calls of 0.14's std");
-        finish_edit(buf_slice(what), root)
+        let status = finish_edit(buf_slice(what), root);
+        if AMBIGUOUS { 1 } else { status }
     }
 }
 

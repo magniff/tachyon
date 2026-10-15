@@ -27,7 +27,7 @@ try: tachyonc query text calc.tach:18-20
 [exit 1]
 ## Several matches in the block form: widened pairs, written to a file.
 $ edit patch clamp --pairs $T/inputs/twice.patch
-error patch.ambiguous: OLD 1 occurs 2 times in crate::calc::clamp, lines 6, 9; give more of the text around it
+error patch.ambiguous: OLD 1 occurs 2 times in crate::calc::clamp, lines 6, 9; give more of the text around it, or --nth N (--all: every one)
 try: tachyonc edit patch clamp --pairs .git/tachyon-edits/try-1.pairs
 try: tachyonc edit patch clamp --pairs .git/tachyon-edits/try-2.pairs
 [exit 1]
@@ -39,7 +39,7 @@ return 0 + lo;
 >>>>>>> NEW
 ## Widened OLDs of several lines on the command line: a file, not $'...'.
 $ edit patch clamp --old '}' --new '} '
-error patch.ambiguous: OLD 1 occurs 3 times in crate::calc::clamp, lines 7, 10, 12; give more of the text around it
+error patch.ambiguous: OLD 1 occurs 3 times in crate::calc::clamp, lines 7, 10, 12; give more of the text around it, or --nth N (--all: every one)
 try: tachyonc edit patch clamp --pairs .git/tachyon-edits/try-1.pairs
 try: tachyonc edit patch clamp --pairs .git/tachyon-edits/try-2.pairs
 try: tachyonc edit patch clamp --pairs .git/tachyon-edits/try-3.pairs
