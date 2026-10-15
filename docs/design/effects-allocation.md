@@ -443,3 +443,60 @@ What Phase 0 made, where it differs from or adds to §3–§4:
 - **Acceptance.** Suite 758/758 at -O0, -O1, -O2; `gate.sh --quick` passes (chain built by 0.14.0, fixpoint). `same-output` against release-0.15's compiler (built from ed8357c): 1416 of 6036 compilations differ, all accounted for by a per-function comparison on aarch64-macos (scratch script, 1506 compilations of tests/run, examples, bench; string labels normalized): **-O0 and -O1**: only std's `Vec.{new,new_in,with_capacity,reserve,extend_from_slice,free,clone}`, `HashMap.{new,new_in,rehash,free,clone}`, `Buf.{clone,new_in}` instances, the new `Gpa.{try_alloc,try_resize,free,alloc,resize,global}`, `gpa_aligned`, `gpa_resize_slow`, `out_of_memory`, and `std.panic` (now emitted where only out_of_memory calls it), plus the string data (`out of memory`, the stubs' one string); **-O2**: the same plus the functions Vec/Buf growth is inlined into (`fmt_make_room` 91, `main` 51, `print_int`, `fmt_pad`, `parse_int`, `read_stdin`, sort instances, ...): `Vec.reserve` is now out of line in most of them (a bigger body). Compile errors: only std line numbers in notes (err_assoc_lazy_default, err_derive_generic), err_unknown_attribute's list, and the changed or new tests. Program output: identical (the suite's expectations are 0.15's). **Bench** (-O2, alternating rounds, min of 15): sort 0.99, wordcount 1.02, json 0.99, binarytrees identical code; compile time of the compiler at -O2 unchanged (2.2 s), `check` unchanged. **fmtloop/fmtints is now ~1.06 (above bench/run.sh's 1.05)**: fmtints got 8% faster (push no longer inlines the growth path) while fmtloop is unchanged within 1% (its hot path has no Vec code); T2's non-allocating Fmt owns that ratio.
 - **Merge of release-0.15 (std in sections, content `==`).** The `==` impls are written in full, `impl<T: Eq, A: Allocator> Eq for Vec<T, A>` and `impl<K: Hash + Eq, V: Eq, A: Allocator> Eq for HashMap<K, V, A>`. embed.sh indexes std_source's whole text, std_alloc_tail's included (gpa.tach and the `CHECK_ALLOC = false` line), so **T3's --check-alloc tail needs an index of its own text** (or the same byte lengths). The arenas' and Gpa's leak-check sections are lazy (index.awk's LAZY). The `new` impl blocks (`A: Allocator + GlobalAllocator`) now follow the main impls. The core guide leaves out every std section whose banner says `(0.16` and continues an impl block of the same type that follows right after (`guide::stdapi`): 28507 of 28672 bytes.
 - **U1, strict (after the merge).** std: `GlobalAllocator`, `global_of` and `gpa()` are gone; `Gpa` is `#[sealed]`; Vec gains `with_capacity_in`, `filled_in`, `clone_in` (clone.tach; `Clone` clones into `self.alloc` through it); Iterator `collect_in`; `format_in(x, a: Gpa)` (T2 generalizes A with its Fmt); io `read_stdin_in`, `split_in`, `split_whitespace_in` (`read_line` stays `*Buf`, Gpa's: T2); `sort_stable_in`, `sort_stable_by_in`. The 0.15 forms stay as `#[ambient("…")]` functions taking their Gpa from std's private `trait Ambient` (its own `ambient()` is ambient too, so `Gpa::ambient()` is no way in); `Allocator::allocator()` is T2's (left out for the core guide's budget). Compiler: `#[ambient("text")]` sets `FN_AMBIENT = 1 << 36` and `front/ambient.tach::AMBIENT_TRY` (keyed by the function's start, so copies and instances find it); `check_ambient_call(n, f)` at the top of `check_call_safety` (every direct and method call), skipped inside std and under `AMBIENT_GPA` (`--ambient-gpa`, `--no-ambient-gpa`, taken out of argv for every command like `--json`; else `TACHYON_AMBIENT_GPA=1`); `main_gpa()` before `main_result_wrapper` in `check_program`. **T2: `sealed::check_literal` must accept the `NODE_IMPLICIT` `Gpa {}` main_gpa makes** (and reject every other Gpa literal outside std: tests/run/index_order's `alloc: Gpa {}` statics then move to an arena or to main). The guide: `guide std` marks the ambient functions ("an error: allocation is explicit; write …"), the core guide leaves them out (28667 of 28672 bytes: T5 rewrites core.md and the examples for the strict style). The compiler's own source keeps off std's containers (guide/stdapi.tach used `Vec<[u8]>`, now IntVec of symbols). Tests: explicit_alloc, err_016_explicit_alloc, alloc_gpa (strict, `FLAGS: --no-ambient-gpa`), syntax016 (`fn main(gpa: Gpa)`). **Scope for T5**: with `--no-ambient-gpa`, 67 of 494 programs of tests/run, examples and bench fail, 174 sites; plus the guide's examples, tests/query and tests/refactor fixtures and the eval tasks.
+
+## T4 notes (the optimizer)
+
+What T4 made (branch c16-opt; docs/optimizer.md, "0.16: calls the
+effects make pure"), and what the other tasks should know:
+
+- **front_attrs** (middle/ipo.tach) reads `fn_effects(f)`: no raw
+  `diverge` (and no visible one) is WILLRETURN, no raw `panic` NOPANIC, a
+  C function without `alloc`/`io`/`global` whose parameters are all
+  numbers READNONE. EFF_UNKNOWN gives nothing, so until T1 lands every
+  tachyon function contributes 0 and only C functions benefit. A C
+  function that the inference leaves EFF_UNKNOWN and that declares
+  nothing takes `known_c_effects(name)`; a C function that may not return
+  (`exit`) is never NOPANIC. **For T1:** set an extern's FN_EFFECTS to its
+  declaration, or to `known_c_effects` when it has none; set
+  EFF_RAW_DIVERGE/EFF_RAW_PANIC with the visible bits (front_attrs reads
+  both).
+- **known_c_effects** (front/effects/builtin.tach, T1's file, written
+  here because it replaces PURE_LIBM): a table of symbols, built once:
+  libm (none), mem*/str*/abs (none), malloc & co. (`alloc(extern)`),
+  stdio/POSIX I/O (`io`), exit/abort (`io diverge` + raw diverge);
+  anything else ⊤. T1 may extend it; keep the libm part (the optimizer's
+  readnone C functions).
+- **Value numbering of calls** (gvn.tach): readnone calls with a scalar
+  result by callee and arguments in the dominator-scoped table; readonly
+  ones within a block while nothing is written. **LICM** (licm.tach):
+  readnone calls with invariant arguments, speculatively when willreturn
+  and nopanic, else when they run in the first iteration before anything
+  visible (`runs_first`). Once T1 lands, counted `for` loops make pure
+  functions willreturn, and more calls are hoisted speculatively.
+- **Arenas (for T2).** The bump path inlines without a call when
+  `Arena::try_alloc` is the fast path (aligned bump, compare with the
+  limit, store) and the refill a `#[cold]` function of its own; then `a.
+  alloc(16, 8)` in a loop is five instructions and no call (tested with
+  a stand-in arena in tests/run/opt_effects_arena.tach). Do not put the
+  refill's loop or the chunk list in try_alloc. bench/arena_trees.tach
+  uses a stand-in `Bump` with that shape: switch it to std's Arena once
+  T2 has it (binarytrees 0.17-0.20 s on malloc, 0.03-0.04 s on the
+  arena, C's arena 0.04 s).
+- **heap_to_stack through Gpa** works as before (Gpa's methods are
+  `#[inline]`): the null check of the slot's address now folds, so the
+  slot no longer escapes through the comparison and its dead stores go.
+- **purecall** (bench/purecall.tach, bench/purecall_hoisted.tach, ratio
+  checked by bench/run.sh against 1.05): 0.05 s against 0.05 s hoisted by
+  hand (Phase 0's compiler: 0.21 s).
+- **The perf gaps of examples/algorithms** (merged release-0.15 first, for
+  c15-perf): see docs/optimizer.md for the table. std gains `count_ones`,
+  `leading_zeros`, `trailing_zeros` (io.tach, section "Bits (0.16)",
+  lazy, so the core guide does not list them; T5: `guide std` does).
+  The IR gains BITS (53) and VMACW (54).
+- **Not done:** lru-cache (the gap is the probe loop and the slot's
+  fields around the out-of-line HashMap::insert, which the capture
+  analysis does not prove nocapture; promotion through non-capturing
+  calls was tried and taken back: +30 ms of self-compile, no gain);
+  x86-64 has no widening multiply-accumulate (SSE2's pmuludq would do:
+  later); count_ones on x86-64 stays the bit-twiddling body (POPCNT is
+  not in the baseline).
