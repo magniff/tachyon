@@ -27,7 +27,10 @@ hit=$(grep -nE '\.c"|\.o"|#\[link|link_name|include!|include_str!|include_bytes!
 # Rebuild in a scratch copy without reference.c and run two small inputs.
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/check13.XXXXXX") || fail "mktemp failed"
 trap 'rm -rf "$tmp"' EXIT
-cp $files "$tmp/" || fail "copying the sources failed"
+# (0.16) The whole workspace, its directories kept: `cp $files` flattened
+# them, so a copy such as scratch/main.tach replaced main.tach.
+tar cf - --exclude ./.git --exclude ./prog . | (cd "$tmp" && tar xf -) ||
+    fail "copying the sources failed"
 cd "$tmp" || fail "cd failed"
 rm -f reference.c prog
 case "$EVAL_LANG" in

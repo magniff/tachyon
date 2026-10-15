@@ -21,10 +21,27 @@ files=$(find . -name "*.$ext" -not -path './.git/*' | sort)
 # All the sources as one line, for signatures that may be wrapped.
 flat=$(cat $files | tr '\n\t' '  ')
 
+# Prints the item that a line matching the regex $1 starts (in any file),
+# up to the brace that closes it: braces are counted, so struct-like enum
+# variants (`RaggedRow { row: i64, len: i64 },`) and nested blocks do not end
+# it early (0.16: the first `}` did, and cut off Rust's LoadError).
+item() {
+    cat $files | awk -v re="$1" '
+        !on && $0 ~ re { on = 1 }
+        on {
+            print
+            line = $0
+            opens = gsub(/\{/, "", line); closes = gsub(/\}/, "", line)
+            depth += opens - closes
+            if (opens > 0) seen = 1
+            if ((seen && depth <= 0) || (!seen && $0 ~ /;[ \t]*$/)) exit
+        }'
+}
+
 # 1. Positions are Pos, not (i64, i64).
 hit=$(for f in $files; do tr -d ' \t' < "$f" | grep -n -F '(i64,i64)' | sed "s|^|$f:|"; done | head -n 1 | cut -c1-100)
 [ -z "$hit" ] || fail "'(i64, i64)' still appears: $hit"
-pos=$(cat $files | awk '/(^|[^A-Za-z0-9_])struct[ \t]+Pos([ \t]|\{|$)/ { on = 1 } on { print } on && /\}/ { exit }')
+pos=$(item '(^|[^A-Za-z0-9_])struct[ \t]+Pos([ \t]|\{|$)')
 [ -n "$pos" ] || fail "no struct Pos"
 echo "$pos" | grep -Eq '(^|[^A-Za-z0-9_])row[[:space:]]*:[[:space:]]*i64' || fail "struct Pos has no field 'row: i64'"
 echo "$pos" | grep -Eq '(^|[^A-Za-z0-9_])col[[:space:]]*:[[:space:]]*i64' || fail "struct Pos has no field 'col: i64'"
@@ -38,7 +55,7 @@ done
 body() {
     for f in $files; do
         awk -v name="$1" '
-            !on && $0 ~ "^[ \t]*(pub[ \t]+)?fn[ \t]+" name "[ \t]*[<(]" {
+            !on && $0 ~ "^[ \t]*(pub(\\([a-z]+\\))?[ \t]+)?fn[ \t]+" name "[ \t]*[<(]" {
                 on = 1; match($0, /^[ \t]*/); ind = substr($0, 1, RLENGTH); print; next
             }
             on { print; if ($0 == ind "}") exit }
@@ -56,11 +73,11 @@ for f in parse_command apply_move apply_query; do
     body run_commands | sed '1d' | grep -Eq "(^|[^A-Za-z0-9_])$f[[:space:]]*(::<[^>]*>)?\\(" ||
         fail "run_commands does not call $f"
 done
-grep -Eq '^[[:space:]]*(pub[[:space:]]+)?fn[[:space:]]+run_commands[[:space:]]*[<(]' "main.$ext" ||
+grep -Eq '^[[:space:]]*(pub(\([a-z]+\))?[[:space:]]+)?fn[[:space:]]+run_commands[[:space:]]*[<(]' "main.$ext" ||
     fail "run_commands is no longer in main.$ext"
 
 # 3. load_level returns Result<Level, LoadError>; the error codes are gone.
-en=$(cat $files | awk '/(^|[^A-Za-z0-9_])enum[ \t]+LoadError([ \t]|\{|$)/ { on = 1 } on { print } on && /\}/ { exit }')
+en=$(item '(^|[^A-Za-z0-9_])enum[ \t]+LoadError([ \t]|\{|$)')
 [ -n "$en" ] || fail "no enum LoadError"
 for v in EmptyMap NoSeparator RaggedRow UnknownTile NoRobot SecondRobot OddTeleporters; do
     echo "$en" | grep -Eq "(^|[^A-Za-z0-9_])$v([^A-Za-z0-9_]|\$)" || fail "enum LoadError has no variant $v"

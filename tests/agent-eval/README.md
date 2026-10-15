@@ -34,6 +34,10 @@ tests/agent-eval/run.py check-tasks --set compiler
 tests/agent-eval/run.py run --model claude:sonnet --set compiler \
     --cond compiler-tools,compiler-plain --reps 3 --jobs 2 --out tests/agent-eval/results/0.16-compiler
 
+# (0.16) grade finished compiler runs again from their changes.patch,
+# without the agent (--only-stopped: a suite that stopped before any case)
+tests/agent-eval/run.py regrade tests/agent-eval/results/0.16-compiler --only-stopped
+
 # (0.16) no model: workspaces, prompts, settings, and the hooks fired on
 # synthetic events (result.json's dry_run)
 tests/agent-eval/run.py run --model claude:haiku --set compiler \
@@ -95,7 +99,10 @@ task's `task.md`. Each run keeps its prompt in `prompt.md`.
    move it): the starter (`tach/` or `rust/`) copied, `git init` with
    one commit (so `tachyonc undo` and `query diff` work, and the agent
    can diff; done for Rust too), and a `bin/` on PATH holding only
-   `tachyonc` (tachyon conditions) or only `rustc` (Rust).
+   `tachyonc` (tachyon conditions) or only `rustc` (Rust), and (0.16) a
+   `mktemp` shim: macOS mktemp without a template ignores `$TMPDIR` and
+   writes in the per-user temp directory, which the sandbox forbids; the
+   shim adds a template in `$TMPDIR`.
 2. The agent, with the task's `timeout_s`.
 3. Processes the agent left running in the workspace are killed, then
    the grading, in a copy without `.git` and the agent's `prog`: the
