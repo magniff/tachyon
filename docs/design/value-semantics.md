@@ -432,3 +432,235 @@ U1–U4 taken as recommended on 2026-10-15 (the user said to proceed):
   `fix --only alloc017`.
 - U4: errors in 0.17.0, with `--values=warn` as a one-release opt-out.
 
+
+## 8. Prototype results (§6, branch c17-proto, 2026-10-15)
+
+The four prototype steps were built on 0.16 (b3975e1) behind flags that are off by default; the suite is unchanged without them (859 passed). The branch is for measurement and will not be merged as is.
+
+| flag | what it does | code |
+|---|---|---|
+| `--values=report` (`report-std`: std's own functions) | kinds, moves, views, exclusivity; one line per report, then an `own-summary:` line | front/own/mod.tach (≈3,100 lines), a hook after the effects in `check_program` |
+| `--values=drops` | `Drop`, drop glue, drops as implicit defers | front/own/drops.tach, hooks in `check_block`, `check_function` and `check_defer`; std's `Drop` section is appended to std's source only under the flag |
+| `--noalias-params`, `--vec-stats` | the optimizer facts of `&mut`/`&`/`[T]` parameters | middle/gvn.tach, middle/vectorize/checks.tach (merged from c17-noalias) |
+
+tests/values-proto/ holds the drop-order program, two report examples, the corpus script (`corpus.sh`) and the bench script (`bench-drops.sh`). bench/drops/ is bench/ with its 13 frees removed.
+
+**The corpus.** It has 7,413 distinct functions that the checker reports on:
+
+| corpus | functions |
+|---|---|
+| tests/run (301 programs check cleanly; the rest are error tests) | 1,926 |
+| examples | 843 |
+| the 20 agent-eval reference solutions | 379 |
+| bench | 75 |
+| compiler/src | 4,190 |
+
+std was reported separately, over every program in tests/run.
+
+### 8.1 How the prototype works
+
+- **Kinds.** They are memoized per type, as in §2.1. Owned is std's Vec, Buf, HashMap and Arena, or any type with a `Drop` impl.
+- **The walk.** It is a forward abstract interpretation of each checked body, in evaluation order, as in §4. Its state:
+  - per owned place: maybe-moved and definitely-moved bits;
+  - per view-holding local (a "slot"): its origins, and whether a write, move or drop has since touched a place it views.
+- **Liveness is implicit.** An error is reported where an invalidated view is *used*, so a view that is never used again is not a conflict (NLL).
+- **Control flow.** Loops iterate to a fixpoint (4,336 rounds over 326,800 node visits on the compiler); if and match join.
+- **Pending arguments.** These give unnamed views (G2), conflicts between the arguments of one call, and two-phase receivers.
+- **Two pieces of measurement apparatus** stand in for things 0.17 does not have yet:
+  - **Parameter mutability.** It is inferred from the bodies (a fixpoint over calls), as `fix --values` would infer it. A `*T` or `[T]` parameter that the function writes through becomes `&mut`, and every other one `&`.
+  - **Two origins per view.** One follows the one-region rule as §2.4 specifies it. The other is *precise*: it comes from inferred callee summaries, which record which parameter, and which level of it, the result views. **A report under the first origin but not the second is exactly a case a narrowing annotation would fix**, which is the go/no-go measure.
+
+### 8.2 Step 1: kinds, moves and initialization — **go**
+
+**Reports.** These are unique positions under the design's rules, after the fixes in "Prototype false positives" below:
+
+| corpus | use after move | move out of index, `*p` or static | read-only by-value argument (`mig.borrow`) |
+|---|---|---|---|
+| tests | 4 | 3 | 12 |
+| examples | 2 | 5 | 11 |
+| evals | 1 | 8 | 4 |
+| bench | 0 | 0 | 0 |
+| compiler | 0 | 0 | 0 |
+
+**How the reports classify.** Every report of a first run (214 unique) was read and classified; the run was repeated after the fixes.
+
+- **Use after move: 7.**
+  - The 2 intended `--check-alloc` tests (G4: a double free, and a use after free through a copied handle).
+  - 3 handle copies that 0.17 forbids. Two are mechanical: a `defer tokens.free()` of a Vec passed to `parse`, which the migration deletes, and a `.clone()` that comes too late. One needs a hand change: bigint's `a = odd`, after which both share a buffer.
+  - 2 false positives: a `{v:?}` f-string hole lowered as a move.
+- **Move-outs: 16.** Most are handle copies out of `*self` (`let keys = self.keys`, in life and in eval 17), which become `std::take`/`swap` or `&`. Also:
+  - std's `OLD.push(V)`, a move out of a static in tests' index_order;
+  - 4 false positives: a `match` through a pointer, which needs binding modes.
+- **`mig.borrow`: 27.** An owned value passed by value to a callee that only reads it. This is fix rule 4 (`&T`). Once those 27 are borrows, the moves the corpus would otherwise report as uses after move disappear.
+  - One subgroup is not mechanical. bigint's operator traits take `self: BigUint`, and `fix` cannot change a trait's signature, so these are hand changes.
+- **Reuse after `free()`.** No program reuses a Vec after freeing it, so it is 0 outside the prototype's own tests.
+
+**Cost.** The reporting pass (pass 1) on the self-check of compiler/src takes 15–18 ms CPU. The type checker took 110–125 ms in the same runs: the machine had a load average of 10–17, against the 45 ms the design assumed. So the pass is about 14% of the checker.
+
+- Of that, an earlier single-level version took 9.4 ms; the precise second origin, which is apparatus, roughly doubles the bitset work.
+- The pass makes 326,800 node visits, about 50 ns each.
+- The prototype makes a separate pass to find the slots, and its bitset code makes a function call per operation.
+- **The 4 ms (5%) budget is not met by the prototype.** A one-origin implementation with inlined bitset operations should land around 6–8 ms (≈8% of an unloaded check). *Adjustment: budget 8%, or plan the optimization work in T1/T2.*
+
+The apparatus passes are not part of 0.17: inferring mutability takes 3–9 ms, and two rounds of summaries take 26–35 ms.
+
+### 8.3 Step 2: drops as implicit defers — **go**
+
+**How it is built.**
+
+- Before a block is checked, an implicit `defer` follows each plain `let`, and a function body starts with one per by-value parameter.
+- At `check_defer`, the implicit defer becomes the drop of the local's type:
+  - `x.drop()` for a type with a `Drop` impl;
+  - a block of its owned fields' drops for a struct or tuple without one (glue, in declaration order);
+  - nothing for a plain type.
+
+  This step is checked where the local is in scope.
+- After every body is checked, the move analysis (pass 2) empties the implicit defer of a local that is moved away at every exit.
+- **No back-end change was needed**: both back ends already lower `defer` on every exit.
+
+**Correctness (gen0 and -O2).** tests/values-proto/drop_order.tach gives identical output at -O0 and -O2, and it matches the expected order. It covers:
+
+- reverse order at scope end;
+- a nested block;
+- `break` and `continue` out of a loop body holding drops;
+- `?` (an early `Err` drops both locals);
+- a value moved into a callee, which the callee drops and the caller does not;
+- the drop of a by-value parameter;
+- struct glue, with fields in declaration order.
+
+**Bench.** This compares bench/X.tach with its frees against bench/drops/X.tach under `--values=drops`. Times are the best of 9; the machine was loaded, and the noise is about ±10% (fmtloop at -O2 read 1.10 with byte-identical code).
+
+| program | -O2 code | -O2 time | -O0 time |
+|---|---|---|---|
+| fmtints, fmtloop, iterchain, iterloop, wordcount | byte-identical assembly | 0.98–1.01 (one noisy 1.10) | 0.999–1.08 |
+| json | +8 instructions: `g.out` is now also freed on an early-error exit, a leak fixed | 1.00 | 0.98 |
+| sort | the two frees swap order (reverse declaration order) | 0.98 | 1.005 |
+
+- **-O2 parity holds by construction.** `Drop::drop` is `#[inline]` and calls `free`, which is exactly the hand-written code.
+- **-O0.** Each drop is one extra call (`Buf.drop` → `Buf.free`), and fmtloop now frees a Vec it used to leak. That is within the +3% gate on most programs and within noise on the rest.
+
+**Over the whole corpus** (with std's instances, which every program counts again):
+
+- only 8 implicit defers would need a drop flag (moved on some exits, not all);
+- 48 assignments to an owned place need the drop-the-old-value desugaring of §4 step 5, which the prototype does not do;
+- 58 `match`es move owned bindings;
+- 75 `let`s destructure tuples or enums;
+- 39 enum, array or closure types hold owned parts, which need generated glue;
+- 4 owned temporaries are dropped on the floor.
+
+**Adjustments:**
+
+- Drop glue has to be generated functions (match for enums, a loop for arrays guarded by `needs_drop`), not the prototype's inline AST.
+- The assignment desugaring is needed from day one: 48 sites.
+- `Drop` must be in the prelude; the prototype needed `use std::Drop`.
+
+### 8.4 Step 3: views and exclusivity — **go overall, no-go for agent-written parsers without one more rule**
+
+**Analysis rules the design needs that it does not state.** Each one was found by a class of false conflicts in the corpus, and none needs an annotation.
+
+- **R1. Two-level origins.** A view value's origin must say separately:
+  - what the value *points into* (its loans), and
+  - what the views it *holds* point into.
+
+  With one set, `let t = tokens.as_slice(); ... t[1]` "views `tokens`", and every element read out of a container of views (`Vec<[u8]>`, `[[u8]]`, `HashMap<[u8], V>`) looked like it escaped or was invalidated by pushes. An element read out of a view gets the outer value's inner level. This costs two bitsets per origin instead of one.
+- **R2. Parametricity.** A generic function whose result type is built from its type parameters carries the T values its arguments hold, not loans on the arguments: `T`, `Option<T>`, `(K, V)`, and level by level for `[T]`. This covers `Vec::get`, `HashMap::get`, `key_at`, `unwrap` and `Iterator::next`.
+
+  It is free (a generic body cannot make a T that points into its arguments) and removes the bulk of the false conflicts around `Vec<[u8]>`.
+- **R3. Reborrows.** A view taken from a view local (`let out = acc[..]`) does not invalidate its parent when written through.
+- **R4 (experiment, `OWN_TYPEFILTER=1`). Type-directed loans.** A view of `[E]` points only into storage of E (`Vec<E>`, `[E; N]`, `Buf` for u8). A loan on an argument whose referent stores no E, such as a sibling `&mut HashMap<[u8], i64>`, is not in its origin.
+
+**Bugs found.**
+
+- **G5: 1 real, unintended.** In examples/errors-and-results:166, `main -> Result` returns a `ConfigError` whose key views `input`. `defer input.free()` runs before the wrapper prints the error, so a bad config prints freed memory.
+- **G1, G4: 3 intended `--check-alloc` tests.**
+- **G7: tests' index_order.** It reports 35 times, as §5 expected: static views across calls that grow the tables.
+- **G2: std_self_append, 2.** `b.push_str(b.as_slice())`.
+- **G8 is not detected.** It is not a view or move rule, and needs §2.6's lint.
+
+**Rule conflicts that are not bugs:**
+
+- the 9 deliberate aliasing tests (opt_vectorize, opt_gvn, opt_slp, opt_promote), which split slices forbid;
+- ledger's two `get_mut` views of one map;
+- 15-multi-module returning views of deliberately leaked Bufs (14 reports; return a `Buf` instead);
+- std's stable sort, whose ping-pong `from`/`to` buffers need raw pointers or indices;
+- std's `sort_by` closures, which take `*T` (legacy `&mut`) and should take `&T`.
+
+**Two-phase receivers are essential.**
+
+- 422 call sites read the receiver in their arguments and are legal only because a `&mut self` receiver is two-phase (`v.push(v.len())`): tests 94, examples 155, evals 144, bench 13, compiler 16.
+- 2 genuine violations remain: bigint's `rng.big(1 + rng.next() % 600)`, which Rust also rejects; hoist `rng.next()`.
+- Explicit `&mut` arguments read later in the same call: 5, all of them std's `sort_by` and the aliasing tests above.
+
+**The go/no-go gate.** It counts the functions with a conflict that only the one-region rule makes (`own.region`; the threshold was about 2% of functions):
+
+| corpus | functions | one-region, as specified (with R1–R3) | with R4 too |
+|---|---|---|---|
+| tests | 1,926 | 0 | 0 |
+| examples | 843 | 4 (0.47%) | 1 |
+| evals | 379 | **13 (3.4%)** | **11 (2.9%)** |
+| bench | 75 | 0 | 0 |
+| compiler | 4,190 | 1 (0.02%) | 1 |
+| total | 7,413 | 18 (0.24%) | 13 (0.18%) |
+
+The two patterns behind the evals' 13 functions:
+
+- **A struct that holds views of a source text (a lexer, a parser, a table) returns a view of that text from a `&mut self` method, then mutates itself.** For example: `let col = self.name(); self.accept(..); use col`. The one-region result views `self`; the precise summary says it views only what `self`'s views view. Rust needs `Parser<'src>` for the same code.
+- **A call stores a view into one `&mut` argument while another `&mut` argument is passed.** For example `intern(&ids, &names, word)`: the store rule unions the loan on the sibling into the stored-to referent. R4 removes the cases where the sibling cannot hold the view's element type.
+
+The compiler's single case is the second pattern (`elements(old, what, &old_name, &on, &ot)`).
+
+**Verdict and adjustment.** The rule passes on the code humans wrote here: the compiler, std, tests and examples are all at or under 0.5%. It fails on the code agents write: eval solutions at 3.4%, which are parsers that keep views of their input. Two ways to handle this:
+
+- **(a) What the design reserved.** Add `#[views(p)]` to narrow a function's result or stores to named parameters, or to a parameter's held views (`views(*self)`).
+- **(b) Infer the precise, level-aware summaries, like 0.16's effects.** Run them per SCC, callees first; show them in `query` and `explain`; let `#[views(...)]` pin them on functions that must not change.
+
+  The prototype's precise origins are exactly this inference, and they remove all 18 functions by construction. The objection §2.8 raised against inferring mutability (a callee's body change silently breaks callers) applies equally to inferred effects, which 0.16 accepted with declarations as the pin.
+
+*Recommendation: (b), with `#[views]` as the declaration form. Ship R1–R3 in 0.17.0 regardless, and R4 too, because it is cheap and sound.*
+
+**Prototype false positives.** These were fixed, so they are not in the numbers above:
+
+- structural equality's `let ==l = a` read as a move (8);
+- a `for` over owned elements bound by move instead of `&T` (6);
+- a tuple `let` binding every element with the whole tuple's origin (3);
+- no reborrows (2);
+- pointer parameters getting no pseudo origin, which made G1 cases look like region conflicts (1).
+
+Two remain: a `match` through a pointer (binding modes, 4) and `{v:?}` holes (2).
+
+### 8.5 Step 4: noalias for `&mut` and read-only `&` parameters — **go, for safety more than speed**
+
+`--noalias-params` asserts the post-migration facts for the optimizer:
+
+- two different pointer or slice parameters never overlap each other, nor a static (in `may_alias`, so gvn, licm, slp and the vectorizer all get it);
+- a parameter the function never writes through is not written by its calls.
+
+| program | vectorizer overlap tests (pairs) | -O2 time |
+|---|---|---|
+| stencil | 4 → 0 (assembly 329 → 266 lines) | 8.00 → 7.95 ms (noise) |
+| matmul | 8 → 0 (assembly 301 → 183 lines) | 20.5 → 21.5 ms (noise) |
+| sort | no vector loops either way | 64.6 → 64.8 ms |
+| micro: 8 slices, 3 stores (18 pairs, over the limit of 16) | not vectorized → vectorized | 17.8 → 11.5 ms (**1.56×**) |
+| micro: 24-element axpy, 400k calls | 2 → 0 | 2.41 → 2.26 ms (6%) |
+
+- **bench/ does not move.** The overlap tests run once per outer iteration, and no bench loop vectorizes newly.
+- **Where it pays.** Kernels with many streams (past the vectorizer's pair limit) and short trip counts.
+- **Outputs** are identical with and without the flag.
+- **It is only sound under 0.17's rules.** With today's aliasable slices, `sweep(sa, sa)` would miscompile. So the flag can ship only with split slices (U2) and exclusivity, and "a parameter never overlaps a static" also needs the rule that `&S` cannot be passed to a function with `global`.
+- **Inlining loses the facts.** The optimizer must keep them as noalias scopes on the inlined body.
+
+*U2's payoff is mostly in correctness and in the occasional kernel, not in bench numbers.*
+
+### 8.6 Design changes the prototype implies
+
+1. **Origins have two levels (R1)**, what a value points into and what its views point into. Parametric results (R2) and reborrows (R3) are part of the rules.
+2. **Infer level-aware view summaries like effects**, with `#[views(...)]` to declare and pin them. The alternative is the narrowing attribute alone, which agent-written parsers would need in about 3% of functions. Add the type-directed loan filter (R4).
+3. **Two-phase receivers are not optional:** 422 call sites in this corpus depend on them.
+4. **Drops:**
+   - generated glue functions for enums and arrays;
+   - the owned-assignment desugaring;
+   - `Drop` in the prelude;
+   - drop flags are rare (8 sites).
+5. **`fix --values` rule 4** (read-only by-value parameters → `&T`) carries most of the move migration. Trait signatures with `self: Self` operators (bigint) need hand changes or `&Self` operator impls.
+6. **Check-time budget.** The pass costs about 14% of the checker in the prototype (two origin levels, unoptimized). Budget about 8% for 0.17, or plan the work to reach 5%.
+7. **`--noalias-params` ships only after exclusivity and split slices are enforced.** It must survive inlining to matter.
