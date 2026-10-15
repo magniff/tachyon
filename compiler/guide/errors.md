@@ -74,12 +74,13 @@ error[type error] expected 'bool', got 'i64'
 Bitwise not is `~n`.
 
 ```tach
-let big = i64::MAX;
+let big = i64::MAX();
 ```
 ```err
-error[type error] no associated function 'MAX' in 'i64' | help: std has the limits: 'std::I64_MAX'
+error[type error] no associated function 'MAX' in 'i64' | help: a constant, without (): 'i64::MAX'
 ```
-std has the limits: `std::I64_MAX`, `std::U8_MAX`, ...
+`i64::MAX`, `u8::MIN`, ... are constants (0.15); integer types have no
+other associated items, and floats no limits (yet).
 
 ```tach
 let s = "add";

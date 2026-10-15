@@ -1328,6 +1328,12 @@ not `bool`, not signed to unsigned, never narrower.
 - An expected type flows into arithmetic as for literals: in `let t: i64
   = a * b` with `a, b: i32`, the multiplication is done in `i64`.
 
+`INT::MAX` and `INT::MIN`, for `INT` a primitive integer type (`i64::MAX`,
+`u8::MIN`), are constants of that type: the literal of the value
+(`-9223372036854775808i64` for `i64::MIN`), so they fold and may stand in
+constant expressions. They are the only associated constants: there are
+none in general, nor for floats (std's `I64_MAX`, ... are the same values).
+
 Traits may have type parameters (`trait From<T>`), with these
 restrictions: no default bodies in a generic trait, the operator traits
 have none, an impl's trait arguments are concrete types or the impl's

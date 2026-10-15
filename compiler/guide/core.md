@@ -48,7 +48,7 @@ files on the command line make one program; `mod name;` loads
 | `Drop`, RAII | none: call `free()`, usually `defer v.free();` |
 | `'outer: loop`, `break 'outer` | `outer: loop`, `break :outer`, `continue :outer` |
 | `!x` on integers | `~x`; `!` is for `bool` only |
-| `i64::MAX`, `x.abs()`, `x.pow(2)` | none: write the literal, the expression, or call C |
+| `i64::MAX`, `x.abs()`, `x.pow(2)` | `i64::MAX`, `u8::MIN` the same (0.15); no methods on numbers: write the expression, or call C |
 | `x as usize` to index | lengths and indices are `i64` (`s.len`); any integer indexes |
 | overflow panics, `/ 0` panics | integers wrap; `x / 0 == 0`, `x % 0 == x`; no panic |
 | `match s { "add" => ... }` | strings are not patterns: `if s == "add" { ... }` |

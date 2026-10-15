@@ -178,7 +178,7 @@ fn main() -> i32 {
 |---|---|
 | `usize` for lengths and indices | `i64` (`s.len`, `v.len()`); indexing takes any integer type |
 | implicit widening `i32` -> `i64` | the same (0.15), lossless only; `i64::from(x)`; narrowing is `x as i32` |
-| `i32::MAX`, `u8::MIN` | none: write the value |
+| `i32::MAX`, `u8::MIN` | the same (0.15), for the integer types |
 | overflow: panic in debug, wrap in release | always wraps (two's complement) |
 | `x / 0` panics | `x / 0 == 0`, `x % 0 == x` |
 | `!x` (bitwise not) | `~x` |
