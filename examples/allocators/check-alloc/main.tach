@@ -1,0 +1,117 @@
+// Five memory bugs that compile in tachyon 0.16, one per command-line
+// argument: `copy`, `push`, `scope`, `twice` and `leak` (none: the correct
+// version of each). Built as usual they print a wrong number, or nothing
+// visible goes wrong at all; built with `tachyonc --check-alloc` each
+// stops at the bug, saying which block, where it was allocated and where
+// it was freed. 0.17's value semantics make the first four compile errors.
+import "string.h" as c;
+
+// A shelf of a shop: the stock of each of its items. `counts` is a Vec
+// handle, copied into the struct: the copy shares the original's memory.
+struct Shelf { name: [u8], counts: Vec<i64> }
+
+fn stock(s: *Shelf) -> i64 {
+    s.counts.iter().sum()
+}
+
+// The bug: a Vec freed through one handle, then used through a copy.
+fn copied_handle(gpa: Gpa, fixed: bool) {
+    let mut counts: Vec<i64> = Vec::new_in(gpa);
+    counts.push(3);
+    counts.push(4);
+    let shelf = Shelf { name: "fruit", counts: counts };
+    println(f"{shelf.name}: {stock(&shelf)}");
+    if fixed {
+        // one owner frees it, after the last use
+        println(f"{shelf.name}: {stock(&shelf)}");
+        counts.free();
+    } else {
+        counts.free();
+        println(f"{shelf.name}: {stock(&shelf)}");
+    }
+}
+
+// The bug: a view of a Vec kept across a push that moved its memory.
+fn slice_after_push(gpa: Gpa, fixed: bool) {
+    let mut v: Vec<i64> = Vec::new_in(gpa);
+    defer v.free();
+    for i in 0..4 {
+        v.push(i * 10);
+    }
+    let first = v.as_slice();
+    v.push(40);
+    if fixed {
+        // a view taken after the last push
+        println(f"first {v.as_slice()[0]}");
+    } else {
+        println(f"first {first[0]}");
+    }
+}
+
+// The bug: a view of an arena's Vec returned from the arena's scope.
+// The Vec itself could not leave (a compile error); a slice of it can.
+fn view_out_of_scope(gpa: Gpa, fixed: bool) {
+    if fixed {
+        // what leaves the scope is computed from the view
+        let first = arena_scope(gpa, |a| {
+            let mut v: Vec<i64, ScopedArena> = Vec::new_in(a);
+            v.push(7);
+            v.as_slice()[0]
+        });
+        println(f"{first}");
+    } else {
+        let s = arena_scope(gpa, |a| {
+            let mut v: Vec<i64, ScopedArena> = Vec::new_in(a);
+            v.push(7);
+            v.as_slice()
+        });
+        println(f"{s[0]}");
+    }
+}
+
+// The bug: two handles, two frees.
+fn freed_twice(gpa: Gpa, fixed: bool) {
+    let mut counts: Vec<i64> = Vec::new_in(gpa);
+    counts.push(1);
+    let mut shelf = Shelf { name: "tools", counts: counts };
+    println(f"{shelf.name}: {stock(&shelf)}");
+    counts.free();
+    if !fixed {
+        shelf.counts.free();
+    }
+}
+
+// The bug: a Buf never freed.
+fn leaked(gpa: Gpa, fixed: bool) {
+    let mut b = std::Buf::new_in(gpa);
+    b.push_str("a report nobody frees");
+    println(b.as_slice());
+    if fixed {
+        b.free();
+    }
+}
+
+fn main(argc: i64, argv: **u8, gpa: Gpa) -> i32 {
+    let bug = if argc > 1 { unsafe { argv[1][0..c::strlen(argv[1]) as i64] } } else { "" };
+    let fixed = bug == "";
+    if fixed || bug == "copy" {
+        copied_handle(gpa, fixed);
+    }
+    if fixed || bug == "push" {
+        slice_after_push(gpa, fixed);
+    }
+    if fixed || bug == "scope" {
+        view_out_of_scope(gpa, fixed);
+    }
+    if fixed || bug == "twice" {
+        freed_twice(gpa, fixed);
+    }
+    if fixed || bug == "leak" {
+        leaked(gpa, fixed);
+    }
+    if fixed && std::CHECK_ALLOC {
+        // (known only to the checking Gpa: -1 otherwise)
+        println(f"blocks still allocated: {gpa.live_blocks()}");
+    }
+    0
+}

@@ -34,8 +34,11 @@ program that way.
 Each example is a test case too: `tests/examples/NAME*.test` runs it
 with its input and checks its output (`tests/run.sh example` runs them
 all). `algorithms/` groups ten examples, one folder each; `tools/` holds
-walkthroughs of the compiler's tools (query, edit, refactor), tested by
-`tests/walkthrough/run.sh`.
+walkthroughs of the compiler's tools (query, edit, refactor);
+`allocators/` and `effects/` show 0.16's explicit allocation and
+effects. The READMEs of `tools/`, `allocators/` and `effects/` are
+sessions: `tests/walkthrough/run.sh` runs their commands and checks
+that they print what the README says, errors and traps included.
 
 ## The examples
 
@@ -59,4 +62,6 @@ walkthroughs of the compiler's tools (query, edit, refactor), tested by
 | [traits-generics](traits-generics/) | a geometry and units library in modules: shapes, vectors, matrices, metres and feet | traits with defaults, bounds, associated types, `#[derive]`, operator traits, `From`/`Into`, enums instead of `dyn` |
 | [formatting](formatting/) | a format-spec cheat sheet, an aligned table, Debug views, a hex dump | f-string specs, `Display`/`Debug` by hand and derived, `format`/`push_fmt`/`eprintln` |
 | [algorithms](algorithms/) | ten classic algorithms with READMEs, timings and C comparisons | `tachyonc examples/algorithms/NAME/main.tach -o NAME && ./NAME` |
+| [allocators](allocators/) | five examples of explicit allocation (0.16): `fn main(gpa: Gpa)`, a parser on an arena, per-request scratch with `arena_scope`, no heap with `FixedBuf`, memory bugs caught by `--check-alloc` | see each README |
+| [effects](effects/) | four examples of effects (0.16): `#[pure]`/`#[no_alloc]`/`#[no_panic]`, effect bounds on closures, `Hash`/`Eq`/`Ord` purity, an agent moving a module onto an arena with `query effects` | see each README |
 | [tools](tools/) | the agent toolset in action: eight tested walkthroughs (rename, split, rewrite, explore, fix errors, prove unchanged, conflicts) | see each README |

@@ -1,0 +1,121 @@
+// A small key-value store answering one request per line of stdin:
+// `SET key n`, `ADD key n`, `GET key`, `SUM key...`. Each request gets
+// scratch memory of its own, `arena_scope(gpa, |scratch| ...)`: its words,
+// its lowercased keys and its response are allocated there, by bumping a
+// pointer, and all of it is freed at once when the request is answered.
+// What outlives a request is allocated elsewhere: the map on Gpa, the
+// keys' bytes in an arena kept for the whole run.
+use std::{Buf, HashMap};
+
+// What lives for the whole run.
+struct Store { values: HashMap<[u8], i64>, names: Arena }
+
+// A copy of s in the store's names arena: the keys of the map must
+// outlive the request that brought them.
+fn intern(names: Arena, s: [u8]) -> [u8] {
+    let mut v: Vec<u8, Arena> = Vec::with_capacity_in(s.len, names);
+    v.extend_from_slice(s);
+    v.as_slice()
+}
+
+// s in lowercase, a new Vec on the allocator a (here: the request's
+// scratch arena).
+fn lower_in<A: Allocator>(s: [u8], a: A) -> Vec<u8, A> {
+    let mut v: Vec<u8, A> = Vec::with_capacity_in(s.len, a);
+    for b in s {
+        v.push(if b >= 'A' && b <= 'Z' { b + 32 } else { b });
+    }
+    v
+}
+
+// Answers one request into `out`; every allocation but the store's is on
+// `scratch`, whatever its type: the caller decides how long it lives.
+fn answer<A: Allocator>(store: *Store, line: [u8], scratch: A, out: *Buf<A>) {
+    let words = std::split_whitespace_in(line, scratch);
+    if words.len() == 0 {
+        out.push_str("empty request");
+        return;
+    }
+    let w = words.as_slice();
+    let cmd = lower_in(w[0], scratch);
+    let cmd = cmd.as_slice();
+    if (cmd == "set" || cmd == "add") && w.len == 3 {
+        let key = lower_in(w[1], scratch);
+        let n = match std::parse_int(w[2]) {
+            Ok(n) => n,
+            Err(_) => {
+                out.push_fmt(f"not a number: {w[2]}");
+                return;
+            }
+        };
+        let old = store.values.get(key.as_slice()).unwrap_or(0);
+        let new = if cmd == "set" { n } else { old + n };
+        if !store.values.contains_key(key.as_slice()) {
+            // A new key: its bytes go where the map's keys live.
+            store.values.insert(intern(store.names, key.as_slice()), new);
+        } else {
+            store.values.insert(key.as_slice(), new);
+        }
+        out.push_fmt(f"{key.as_slice()} = {new}");
+    } else if cmd == "get" && w.len == 2 {
+        let key = lower_in(w[1], scratch);
+        match store.values.get(key.as_slice()) {
+            Some(n) => out.push_fmt(f"{key.as_slice()} = {n}"),
+            None => out.push_fmt(f"{key.as_slice()} is not set"),
+        }
+    } else if cmd == "sum" && w.len >= 2 {
+        let mut total = 0;
+        let mut missing: Vec<[u8], A> = Vec::new_in(scratch);
+        for name in w[1..] {
+            let key = lower_in(name, scratch);
+            match store.values.get(key.as_slice()) {
+                Some(n) => total += n,
+                None => missing.push(key.as_slice()),
+            }
+        }
+        out.push_fmt(f"sum = {total}");
+        if missing.len() > 0 {
+            out.push_str(" (not set:");
+            for m in missing.iter() {
+                out.push_fmt(f" {m}");
+            }
+            out.push_str(")");
+        }
+    } else {
+        out.push_fmt(f"unknown request: {line}");
+    }
+}
+
+fn main(gpa: Gpa) -> i32 {
+    let mut input = std::read_stdin_in(gpa).unwrap();
+    defer input.free();
+    let mut store = Store { values: HashMap::new_in(gpa), names: Arena::new_in(gpa) };
+    defer store.values.free();
+    defer unsafe { store.names.free_all() };
+
+    let mut requests = 0;
+    let mut peak = 0;
+    let mut lines = std::split_in(input.as_slice(), '\n', gpa);
+    defer lines.free();
+    for line in lines.iter() {
+        if line.len == 0 {
+            continue;
+        }
+        // The request's scratch: an arena of its own, from gpa, freed
+        // (all of it) when the closure returns. Only an i64 leaves it.
+        let used = arena_scope(gpa, |scratch| {
+            let mut out = Buf::new_in(scratch);
+            answer(&store, line, scratch, &out);
+            println(f"{line:<24} -> {out.as_slice()}");
+            scratch.used()
+        });
+        requests += 1;
+        if used > peak {
+            peak = used;
+        }
+    }
+    println(
+        f"{requests} requests, {store.values.len()} keys; scratch per request at most {peak} bytes");
+    println(f"the keys' arena holds {store.names.used()} bytes");
+    0
+}

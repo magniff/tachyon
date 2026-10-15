@@ -8,7 +8,7 @@
 # (`tachyonc guide`, 0.13), tests/fmt/run.sh (`tachyonc fmt --check`
 # of the tree, and formatting changes no program, 0.13) and
 # tests/walkthrough/run.sh (the sessions of examples/tools/*/README.md,
-# 0.15). POSIX sh and awk only, so it runs the same on macOS and Linux.
+# 0.15, and of every examples/GROUP/NAME/README.md with one, 0.16). POSIX sh and awk only, so it runs the same on macOS and Linux.
 #
 # usage: tests/run.sh [-c COMPILER] [-t TARGET] [-O LEVEL] [-j JOBS] [-a] [-d FORMAT] [FILTER]
 #
@@ -775,9 +775,10 @@ case example_layout in
         ;;
 esac
 
-# The tool examples' sessions (0.15): tests/walkthrough/run.sh (run
-# above), each examples/tools/NAME/README.md run as a transcript;
-# category "walkthrough".
+# The examples' sessions (0.15): tests/walkthrough/run.sh (run above),
+# each examples/tools/NAME/README.md (0.16: and each other
+# examples/GROUP/NAME/README.md with a console block) run as a
+# transcript; category "walkthrough".
 case walkthrough in
     *"$FILTER"*)
         while read -r status _; do

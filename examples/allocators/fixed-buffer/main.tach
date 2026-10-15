@@ -1,0 +1,183 @@
+// A reverse-Polish calculator that never touches the heap: `main` takes
+// no allocator, so nothing in the program can call malloc, and all its
+// memory is 512 bytes on main's stack, handed out by a FixedBuf. A line or
+// a stack of numbers that would grow past them is an error the calculator
+// reports (`try_push` returns an AllocError), not a crash.
+use std::{AllocError, FixedBuf, Fmt};
+import "unistd.h" as c;
+
+enum CalcError { Underflow([u8]), Unknown([u8]), TooDeep(i64), Leftover(i64), Empty, TooLong(i64) }
+
+impl Display for CalcError {
+    fn fmt(self: *CalcError, f: *Fmt) {
+        match *self {
+            CalcError::Underflow(w) => f.write(f"'{w}' needs two numbers"),
+            CalcError::Unknown(w) => f.write(f"unknown word '{w}'"),
+            CalcError::TooDeep(n) => f.write(
+                f"out of memory at depth {n} (the stack has no more room)"),
+            CalcError::Leftover(n) => f.write(f"{n} numbers left: an operator is missing"),
+            CalcError::Empty => f.str("nothing to compute"),
+            CalcError::TooLong(n) => f.write(f"out of memory: the line is longer than {n} bytes"),
+        }
+    }
+}
+
+// Pushes x, or says how deep the stack was when the memory ran out.
+fn push(stack: *Vec<i64, FixedBuf>, x: i64) -> Result<(), CalcError> {
+    match stack.try_push(x) {
+        Ok(()) => Ok(()),
+        Err(AllocError::OutOfMemory) => Err(CalcError::TooDeep(stack.len())),
+    }
+}
+
+// The first index from i on whose byte is not (blank true) or is (blank
+// false) a space; line.len if none.
+fn skip(line: [u8], i: i64, blank: bool) -> i64 {
+    for j in i..line.len {
+        if (line[j] == ' ') != blank {
+            return j;
+        }
+    }
+    line.len
+}
+
+fn pop2(stack: *Vec<i64, FixedBuf>, w: [u8]) -> Result<(i64, i64), CalcError> {
+    if stack.len() < 2 {
+        return Err(CalcError::Underflow(w));
+    }
+    let b = stack.pop().unwrap();
+    let a = stack.pop().unwrap();
+    Ok((a, b))
+}
+
+// The value of one line, computed on `stack` (emptied first). Allocates
+// only from a FixedBuf: the declaration is checked, so a Gpa sneaking in
+// three calls down would be an error here.
+#[effects(alloc(FixedBuf), panic)]
+fn eval(line: [u8], stack: *Vec<i64, FixedBuf>) -> Result<i64, CalcError> {
+    stack.clear();
+    let mut i = 0;
+    // (a counted loop: each round takes at least one byte, so line.len
+    // rounds are enough; `while` would add the effect diverge)
+    for _ in 0..line.len {
+        // the next word: line[start..i]
+        let start = skip(line, i, true);
+        if start == line.len {
+            break;
+        }
+        i = skip(line, start, false);
+        let w = line[start..i];
+        if w == "+" || w == "-" || w == "*" || w == "/" {
+            let (a, b) = pop2(stack, w)?;
+            let r = if w == "+" {
+                a + b
+            } else if w == "-" {
+                a - b
+            } else if w == "*" {
+                a * b
+            } else {
+                a / b
+            };
+            push(stack, r)?;
+        } else if w == "dup" {
+            if stack.len() == 0 {
+                return Err(CalcError::Underflow(w));
+            }
+            let top = stack.as_slice()[stack.len() - 1];
+            push(stack, top)?;
+        } else {
+            match std::parse_int(w) {
+                Ok(n) => push(stack, n)?,
+                Err(_) => return Err(CalcError::Unknown(w)),
+            }
+        }
+    }
+    if stack.len() == 0 {
+        return Err(CalcError::Empty);
+    }
+    if stack.len() > 1 {
+        return Err(CalcError::Leftover(stack.len()));
+    }
+    Ok(stack.as_slice()[0])
+}
+
+// Standard input, read with C's read(2) into 64 bytes of this struct, a
+// byte at a time. (std's read_line would do, but it keeps its own buffer
+// from C's malloc: `query effects` shows it as alloc(extern).)
+struct Input { chunk: [u8; 64], len: i64, pos: i64 }
+
+impl Input {
+    // The next byte, or -1 at the end of the input.
+    fn byte(self: *Input) -> i64 {
+        if self.pos == self.len {
+            self.len = unsafe { c::read(0, &self.chunk[0], 64) as i64 };
+            self.pos = 0;
+            if self.len <= 0 {
+                self.len = 0;
+                return -1;
+            }
+        }
+        self.pos += 1;
+        self.chunk[self.pos - 1] as i64
+    }
+
+    // The next line into `line` (emptied first), without its newline:
+    // Ok(false) at the end of the input. A line that does not fit is
+    // skipped to its end, and is an error.
+    fn line(self: *Input, line: *Vec<u8, FixedBuf>) -> Result<bool, CalcError> {
+        line.clear();
+        let mut b = self.byte();
+        if b < 0 {
+            return Ok(false);
+        }
+        let mut full = false;
+        while b >= 0 && b != '\n' as i64 {
+            if !full && line.try_push(b as u8).is_err() {
+                full = true;
+            }
+            b = self.byte();
+        }
+        if full {
+            return Err(CalcError::TooLong(line.len()));
+        }
+        Ok(true)
+    }
+}
+
+// A line to show: at most 30 bytes of it, and "..." when there is more.
+fn short(s: [u8]) -> ([u8], [u8]) {
+    if s.len > 30 { (s[..30], "...") } else { (s, "") }
+}
+
+fn main() -> i32 {
+    // All the memory there is: 512 bytes on this function's stack.
+    let mut mem = [0u8; 512];
+    let fb = FixedBuf::new(mem[..]);
+    // The line first, with room for 160 bytes; the numbers' stack last,
+    // so that it grows in place (a FixedBuf, like an arena, only reuses
+    // the room of its last block).
+    let mut line: Vec<u8, FixedBuf> = Vec::with_capacity_in(160, fb);
+    let mut stack: Vec<i64, FixedBuf> = Vec::new_in(fb);
+    let mut input = Input { chunk: [0u8; 64], len: 0, pos: 0 };
+    let mut lines = 0;
+    let mut failed = 0;
+    loop {
+        let result = match input.line(&line) {
+            Ok(false) => break,
+            Ok(true) => eval(line.as_slice(), &stack),
+            Err(e) => Err(e),
+        };
+        let (text, more) = short(line.as_slice());
+        lines += 1;
+        match result {
+            Ok(v) => println(f"{text}{more} = {v}"),
+            Err(e) => {
+                println(f"{text}{more}: {e}");
+                failed += 1;
+            }
+        }
+    }
+    println(
+        f"{lines} lines, {failed} failed; {fb.used()} of 512 bytes in use, room for {stack.capacity()} numbers");
+    0
+}
