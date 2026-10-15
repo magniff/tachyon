@@ -9,6 +9,7 @@
 # with --check-alloc, the checking Gpa, alloc_check.tach
 # (std_check_gpa_source), and its index (std_check_index).
 # Run it after changing any of them; tests/run.sh checks they agree.
+# (0.17: `tachyonc edit` of a std item, or of one of these files, runs it.)
 # (0.15) It also writes std_index, the sections' index (index.awk).
 #
 # usage: compiler/std/embed.sh [-c]   (-c: only check, exit 1 if stale)

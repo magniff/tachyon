@@ -12,6 +12,7 @@ use crate::base::diag::{
 use crate::base::target::target_of_name;
 use crate::base::timer::{TIME_PASSES, timer_report};
 use crate::front::modules::file_of_pos;
+use crate::front::stdtree::{STD_TREE, find_std_tree, std_files_differ};
 use crate::tools::conflicts::resolve::run_resolve;
 use crate::tools::edit::{
     ARGC, ARGV, DRY_RUN, NO_CHECK, SHOW, TARGET, TARGET_NAME, edit_remove_file, edit_replace,
@@ -23,6 +24,7 @@ use crate::tools::edit::items::{
     whole_lines,
 };
 use crate::tools::edit::newfile::run_new_file;
+use crate::tools::edit::stdedit::{names_std_file, rerun_in_std_tree, std_rerun};
 use crate::tools::edit::undo::run_undo;
 use crate::tools::edit::wrap::run_wrap;
 use crate::tools::patch::run_patch;
@@ -62,7 +64,7 @@ fn usage(message: *u8) -> i64 {
 }
 
 // The options the editing commands share: --dry-run, --no-check, --show,
-// --exact, --root R, --target T. Whether a[i] is one (*i moves past its
+// --exact, --root R, --target T, --std-tree DIR. Whether a[i] is one (*i moves past its
 // value).
 pub fn take_edit_option(argc: i64, argv: **u8, i: *i64, root: **u8) -> bool {
     unsafe {
@@ -77,9 +79,13 @@ pub fn take_edit_option(argc: i64, argv: **u8, i: *i64, root: **u8) -> bool {
             NO_CHECK = true;
         } else if streq(a, c"--exact") {
             OPT_EXACT = true;
-        } else if (streq(a, c"--root") || streq(a, c"--target")) && *i + 1 < argc {
+        } else if (streq(a, c"--root") || streq(a, c"--target") || streq(a, c"--std-tree"))
+            && *i + 1 < argc {
             if streq(a, c"--root") {
                 *root = argv[*i + 1];
+            } else if streq(a, c"--std-tree") {
+                // (0.17: std from its files, stdtree.tach; stdedit.tach)
+                STD_TREE = argv[*i + 1];
             } else {
                 TARGET_NAME = argv[*i + 1];
                 TARGET = target_of_name(TARGET_NAME);
@@ -113,6 +119,11 @@ fn run_edit_inner(argc: i64, argv: **u8) -> i64 {
             return usage(c"no command (patch, apply, replace, insert, delete)");
         }
         let cmd = argv[2];
+        // (0.17: a std file named, `edit patch compiler/std/io.tach:102`:
+        // the edit runs on std's files; stdedit.tach)
+        if names_std_file(argc, argv) {
+            return rerun_in_std_tree(argc, argv);
+        }
         if streq(cmd, c"patch") || (streq(cmd, c"insert") && has_arg(argc, argv, c"--in")) {
             return run_patch(argc, argv);
         }
@@ -234,6 +245,10 @@ fn run_edit_inner(argc: i64, argv: **u8) -> i64 {
         let d = matches.data[0];
         let f = file_of_pos(DEFS[d].start);
         if FILES[f].path[0] == '<' {
+            // (0.17: std, in the repository: in its files; stdedit.tach)
+            if std_rerun(f) {
+                return rerun_in_std_tree(argc, argv);
+            }
             let e = diag(c"error", c"edit.not-source");
             buf_bytes(e, SYMS[DEFS[d].fqn].text);
             buf_str(e, c" is in ");
@@ -637,6 +652,19 @@ pub fn run_check(argc: i64, argv: **u8) -> i64 {
                 root = a;
             }
             i += 1;
+        }
+        // (0.17: std's files in the repository edited since this compiler
+        // was built: checked with them, as the next build will be;
+        // front/stdtree.tach. Not for an edit's check: --overlay.)
+        if STD_TREE == 0 as *u8 && OVERLAY.count == 0 {
+            let tree = find_std_tree();
+            if tree != 0 as *u8 && std_files_differ(tree) {
+                STD_TREE = tree;
+                let d = diag(c"note", c"check.std-files");
+                buf_str(d, c"std's files differ from this compiler's std: checked with ");
+                buf_str(d, tree);
+                buf_str(d, c" (bootstrap/bootstrap.sh --dev builds them in)\n");
+            }
         }
         ROOT_GIVEN = root;
         root = root_or_diag(root, c"check", c_slice(c""), false);

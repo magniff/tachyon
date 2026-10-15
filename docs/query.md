@@ -512,6 +512,42 @@ not, and where there is no program at all (a directory without
 - `text std:A-B` prints std's source (as `<std>` numbers it), `grep
   TEXT --in std` searches it.
 
+(0.17) In the tachyon repository, where std's files are
+(`compiler/std/*.tach`, found from the current directory or one of the
+three above it) and are the std built into the compiler, std's
+positions are those files' lines: `query def std::trim` prints
+`compiler/std/io.tach:102:8`, not `<std>:2075:8`; a FILE:LINE in one of
+them (`query show compiler/std/io.tach:102`, `--in
+compiler/std/io.tach`) reads std from its files. Elsewhere std is the
+compiler's text, `<std>`. The edits of std items: refactor.md, "Editing
+std by name".
+
+## similar and examples (0.17)
+
+`query similar NAME...` prints the items like NAME, nearest first (3,
+`--limit N`), in full as `show` prints them, after a line saying how
+many there are and the edit that adds one beside NAME: the templates
+for a new item of the kind. A method: the methods of its type (none:
+of the other types of its module); a trait's method: the same method
+of the trait's other impls; anything else: the items of its kind in
+its module, its file's first.
+
+```
+$ tachyonc query similar std::trim --limit 1
+// 1 of 135 fns like std::trim, nearest first; a new one beside it: tachyonc edit insert --after std::trim < new.tach
+// std::is_digit→compiler/std/io.tach:96-99→effects: none
+...
+```
+
+`query examples` lists the kinds of "add an X" change to the compiler
+and std (`std-fn`, `std-method`, `peephole`, `egraph-rule`, `pass`,
+`diagnostic`, `tool-diagnostic`, `subcommand`, `query-command`,
+`test`), each with where it goes and its recipe in `tachyonc guide how`;
+`query examples KIND` prints the kind's items to start from (their
+definitions, then the first one's source; `test`: files). The table of
+items is the compiler's own; tests/query/run.sh checks that every one
+is still found (`self_examples`).
+
 ## items
 
 `items MODULE` lists a module's items in order, without bodies:
@@ -627,6 +663,7 @@ when it was given, names quoted for the shell when they need it).
 
 | code | severity | exit | when | try |
 |---|---|---|---|---|
+| `query.no-kind` | error | 2 | (0.17) `query examples KIND` names no kind | `query examples` |
 | `query.no-match` | error | 1 | no definition (or module, for items) answers to NAME | the nearest definitions by edit distance (the same command with their paths); else the items of the module NAME names, or the module tree |
 | `query.alias` | note | (the answer's) | NAME is the other name an import gives (`use a::f as g;`), answered for what it imports (0.13) | |
 | `query.empty` | note | 0 | grep found nothing | |

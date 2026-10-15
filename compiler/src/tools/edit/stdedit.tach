@@ -1,0 +1,125 @@
+// Editing std by name (0.17). In the tachyon repository, an edit whose
+// target is a std item (`edit patch std::trim`, `edit insert --after
+// Vec::push`, `edit replace std::split`, a block of `edit apply`) runs
+// again with `--std-tree compiler/std`: std then comes from its files
+// (front/stdtree.tach), so the edit is made in compiler/std/FILE.tach and
+// checked with the edited std; after it, compiler/std/embed.sh makes
+// compiler/src/front/stdsrc.tach, the text built into the compiler, from
+// the files again (`note edit.std`). Outside the repository std is the
+// compiler's own text and such an edit is refused (`edit.not-source`).
+
+use crate::base::{BUFS, FILES, alloc_array, buf_new, buf_str, cstr, streq};
+use crate::front::stdtree::{STD_TREE, find_std_tree, tree_path};
+use crate::tools::edit::DRY_RUN;
+use crate::tools::proc::{STDIN_READ, run_capture, run_with_stdin};
+use crate::tools::query::diagnostics::diag;
+
+// The command asks for a run in std's files (std_rerun said so).
+static mut RERUN: bool = false;
+
+// Whether the item an edit targets, in file f, is std's built-in text that
+// std's files can stand in for: then the command runs again in them
+// (rerun_in_std_tree) instead of reporting edit.not-source.
+pub fn std_rerun(f: i64) -> bool {
+    unsafe {
+        let p = FILES[f].path;
+        if STD_TREE != 0 as *u8 || !(p[0] == '<' && p[1] == 's' && p[2] == 't' && p[3] == 'd'
+            && p[4] == '>' && p[5] == 0) || find_std_tree() == 0 as *u8 {
+            return false;
+        }
+        RERUN = true;
+        true
+    }
+}
+
+// Whether std_rerun asked for the command to run again.
+pub fn rerun_wanted() -> bool {
+    unsafe { RERUN }
+}
+
+// The command (argv) again with `--std-tree DIR`, given what this process
+// read of stdin; then, when it wrote std's files, embed.sh. Its status.
+pub fn rerun_in_std_tree(argc: i64, argv: **u8) -> i64 {
+    unsafe {
+        let dir = find_std_tree();
+        let args = alloc_array::<*u8>(argc + 3);
+        for i in 0..argc {
+            args[i] = argv[i];
+        }
+        args[argc] = c"--std-tree";
+        args[argc + 1] = dir;
+        args[argc + 2] = 0 as *u8;
+        let status = run_with_stdin(args, STDIN_READ);
+        if status == 0 && !DRY_RUN {
+            embed_std(dir);
+        }
+        status
+    }
+}
+
+// compiler/std/embed.sh, when stdsrc.tach is not std's files' text: the
+// note saying it ran (or the warning that it failed).
+pub fn embed_std(dir: *u8) {
+    unsafe {
+        let script = tree_path(dir, c"embed.sh");
+        let out = buf_new();
+        let check = [c"sh", script, c"-c", 0 as *u8];
+        if run_capture(&check[0], out) == 0 {
+            return;
+        }
+        let run = [c"sh", script, 0 as *u8];
+        if run_capture(&run[0], out) != 0 {
+            let d = diag(c"warning", c"edit.std");
+            buf_str(d, script);
+            buf_str(d, c" failed: compiler/src/front/stdsrc.tach is not std's new text\n");
+            return;
+        }
+        let d = diag(c"note", c"edit.std");
+        buf_str(d, c"ran ");
+        buf_str(d, script);
+        buf_str(d, c": compiler/src/front/stdsrc.tach has std's new text; rebuild to use it (bootstrap/bootstrap.sh --dev)\n");
+    }
+}
+
+// Whether path is one of std's files (compiler/std/NAME.tach): undoing an
+// edit of it runs embed.sh.
+pub fn is_std_file(path: [u8]) -> bool {
+    let dir = "compiler/std/";
+    if path.len <= dir.len + 5 || path[path.len - 5..path.len] != ".tach" {
+        return false;
+    }
+    for i in 0..path.len - dir.len {
+        if path[i..i + dir.len] == dir {
+            return true;
+        }
+    }
+    false
+}
+
+// Whether an argument of the command (from argv[3]) names one of std's
+// files, alone or with a line (`compiler/std/io.tach:102`), and the
+// repository has them: the command then runs on std's files (STD_TREE).
+pub fn names_std_file(argc: i64, argv: **u8) -> bool {
+    unsafe {
+        if STD_TREE != 0 as *u8 || find_std_tree() == 0 as *u8 {
+            return false;
+        }
+        for i in 3..argc {
+            // (run again with --std-tree: not again)
+            if streq(argv[i], c"--std-tree") {
+                return false;
+            }
+        }
+        for i in 3..argc {
+            let a = cstr(argv[i]);
+            let mut end = 0;
+            while end < a.len && a[end] != ':' {
+                end += 1;
+            }
+            if is_std_file(a[0..end]) {
+                return true;
+            }
+        }
+        false
+    }
+}
