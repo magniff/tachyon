@@ -357,10 +357,43 @@ try: tachyonc query def crate::shapes::scale
 $ refactor move Point::sum --to crate::util
 error refactor.not-movable: crate::geom::Point::sum is a method: it moves with its type's impl block
 [exit 1]
-$ refactor move geom::area --to crate::nowhere
-error refactor.no-module: no module 'crate::nowhere'
-try: tachyonc refactor new-module crate::nowhere
-[exit 1]
+## (0.17) A module that does not exist is made for the move, in the same
+## edit.
+$ refactor move geom::area --to crate::nowhere --dry-run
+made module crate::nowhere	2 files	+1 -0 lines
+moved crate::geom::area to crate::nowhere	4 files	+10 -7 lines
+--- a/main.tach
++++ b/main.tach
+@@ -4,0 +5 @@
++mod nowhere;
+@@ -6 +7,2 @@
+-use geom::{Point, area};
++use geom::Point;
++use nowhere::area;
+--- a/geom.tach
++++ b/geom.tach
+@@ -17,5 +16,0 @@
+-// The area of the rectangle from the origin to p.
+-pub fn area(p: Point) -> i64 {
+-    p.x * p.y
+-}
+-
+--- a/shapes.tach
++++ b/shapes.tach
+@@ -3 +3,2 @@
+-use crate::geom::{Point, area, double};
++use crate::geom::{Point, double};
++use crate::nowhere::area;
+--- a/nowhere.tach
++++ b/nowhere.tach
+@@ -0,0 +1,6 @@
++use crate::geom::Point;
++
++// The area of the rectangle from the origin to p.
++pub fn area(p: Point) -> i64 {
++    p.x * p.y
++}
+note refactor.made-module: there was no module crate::nowhere; it was made for the move (refactor new-module)
 $ refactor move geom::area
 error refactor.usage: move takes PATH... and the MODULE (`--to MODULE`)
 try: tachyonc refactor move crate::m::item --to crate::other

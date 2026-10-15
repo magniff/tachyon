@@ -87,7 +87,7 @@ try: tachyonc refactor extract-function first_big --lines 50-56 --to step
 [exit 1]
 $ refactor extract-function bytes --lines 85-89 --to fill
 error refactor.results: lines 85-89 set t, i, buf, used after them; NEW gives back one local it assigns, or the ones it declares
-try: tachyonc query show ./calc.tach:85
+try: tachyonc query show calc.tach:85
 [exit 1]
 $ refactor extract-function sum_to --lines 40-41 --to x
 error refactor.range: lines 40-41 are not inside the body of crate::calc::sum_to (lines 23-34)
@@ -184,7 +184,7 @@ $ refactor inline sum_to --at main.tach:7 --dry-run
 ## Refused: an early return, no call there.
 $ refactor inline first_big
 error refactor.escapes: crate::calc::first_big returns early, on line 53: inline takes a function that ends with its value
-try: tachyonc query show ./calc.tach:53
+try: tachyonc query show calc.tach:53
 [exit 1]
 $ refactor inline sum_to --at calc.tach:3
 error refactor.no-call: crate::calc::sum_to is not called on calc.tach:3

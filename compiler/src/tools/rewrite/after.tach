@@ -1,0 +1,211 @@
+// What a rewrite does after its sites (0.17): the imports it leaves
+// unused removed, and the --where per type a refused rewrite suggests.
+
+use crate::base::{
+    BUFS, FILES, IntVec, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
+};
+use crate::front::ast::{NODES, NODE_COUNT, NodeKind, child};
+use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
+use crate::front::modules::{file_of_pos, module_of};
+use crate::front::parser::items::ITEM_PUBLIC;
+use crate::tools::edit::apply::put_command;
+use crate::tools::edit::breaks::BREAK_HINTS;
+use crate::tools::fix::remove_use_names;
+use crate::tools::query::defs::bytes_eq;
+use crate::tools::query::diagnostics::put_word;
+use crate::tools::query::positions::token_at;
+use crate::tools::reexports::reached_through;
+use crate::tools::refactor_mod::use_local;
+use crate::tools::refactor_mod::cli::is_name_use;
+use crate::tools::rewrite::parsed::pk;
+use crate::tools::rewrite::pattern::{B_NODE, H_NAME, H_SYM, H_TYPE, checked_type, type_key};
+
+// (0.17) The imports the rewritten sites leave unused (starts, ends:
+// their spans; texts: their new text): a name of a `use` (not `pub use`)
+// of a file with a site, written in that file outside the `use` before
+// the rewrite but not after it (outside the sites, nor in their new
+// text), is removed. The number removed.
+pub fn drop_unused_imports(starts: *IntVec, ends: *IntVec, texts: *IntVec) -> i64 {
+    unsafe {
+        let mut removed = 0;
+        for u in 1..NODE_COUNT {
+            if !is_name_use(u) || (NODES[u].p & ITEM_PUBLIC) != 0 {
+                continue;
+            }
+            let f = file_of_pos(NODES[u].start);
+            let mut here = false;
+            for x in 0..(*starts).count {
+                if file_of_pos((*starts).data[x]) == f {
+                    here = true;
+                }
+            }
+            if !here {
+                continue;
+            }
+            let mut unused = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            for k in 0..NODES[u].count {
+                let name = use_local(child(u, k));
+                let mut before = 0;
+                let mut after = 0;
+                let mut i = token_at(FILES[f].start);
+                while i < TOK_COUNT && TOKS[i].start < FILES[f].end {
+                    let s = TOKS[i].start;
+                    if TOKS[i].kind == Tok::Ident && TOKS[i].value as i64 == name
+                        && (s < NODES[u].start || s >= NODES[u].end) {
+                        before += 1;
+                        if !in_spans(s, starts, ends) {
+                            after += 1;
+                        }
+                    }
+                    i += 1;
+                }
+                if before == 0 || after > 0 || reached_through(module_of(u), name) {
+                    continue;
+                }
+                let mut named = false;
+                for x in 0..(*starts).count {
+                    if file_of_pos((*starts).data[x]) == f
+                        && has_word(buf_slice((*texts).data[x]), SYMS[name].text) {
+                        named = true;
+                    }
+                }
+                if !named {
+                    unused.push(k);
+                }
+            }
+            if unused.count > 0 {
+                removed += remove_use_names(u, &unused);
+            }
+        }
+        removed
+    }
+}
+
+// (0.17) Per hole without --where, the types it has at the sites: hole,
+// type key (a buffer), number of sites, in triples.
+static mut SITE_TYPES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The types of the holes of the site just matched, into SITE_TYPES.
+pub fn note_site_types() {
+    unsafe {
+        for h in 0..H_SYM.count {
+            let n = B_NODE.data[h];
+            if H_TYPE.data[h] >= 0 || n <= 0 || pk(n) == NodeKind::TyName
+                || pk(n) == NodeKind::PatBind {
+                continue;
+            }
+            let t = checked_type(n);
+            if t <= 0 {
+                continue;
+            }
+            let key = type_key(t);
+            let mut k = 0;
+            let mut seen = false;
+            while k < SITE_TYPES.count {
+                if SITE_TYPES.data[k] == h
+                    && bytes_eq(buf_slice(SITE_TYPES.data[k + 1]), buf_slice(key)) {
+                    SITE_TYPES.data[k + 2] += 1;
+                    seen = true;
+                }
+                k += 3;
+            }
+            if !seen {
+                SITE_TYPES.push(h);
+                SITE_TYPES.push(key);
+                SITE_TYPES.push(1);
+            }
+        }
+    }
+}
+
+// For edit.breaks (BREAK_HINTS): a hole of several types at the sites
+// gets a note and a `try:` with `--where` per type (3 at most): the
+// replacement may fit the sites of one type only.
+pub fn where_hints() {
+    unsafe {
+        let out = buf_new();
+        for h in 0..H_SYM.count {
+            let mut types = 0;
+            let mut k = 0;
+            while k < SITE_TYPES.count {
+                if SITE_TYPES.data[k] == h {
+                    types += 1;
+                }
+                k += 3;
+            }
+            if types < 2 {
+                continue;
+            }
+            let name = buf_slice(H_NAME.data[h]);
+            buf_str(out, c"note ");
+            buf_str(out, c"rewrite.where");
+            buf_str(out, c": ");
+            buf_bytes(out, name);
+            buf_str(out, c" has ");
+            buf_int(out, types);
+            buf_str(out, c" types at the sites:");
+            k = 0;
+            let mut first = true;
+            while k < SITE_TYPES.count {
+                if SITE_TYPES.data[k] == h {
+                    buf_str(out, if first { c" " } else { c", " });
+                    first = false;
+                    buf_bytes(out, buf_slice(SITE_TYPES.data[k + 1]));
+                    buf_str(out, c" (");
+                    buf_int(out, SITE_TYPES.data[k + 2]);
+                    buf_str(out, if SITE_TYPES.data[k + 2] == 1 { c" site)" } else { c" sites)" });
+                }
+                k += 3;
+            }
+            buf_str(out, c"; --where takes the ones the replacement fits\n");
+            k = 0;
+            let mut shown = 0;
+            while k < SITE_TYPES.count {
+                if SITE_TYPES.data[k] == h && shown < 3 {
+                    put_command(out);
+                    buf_str(out, c" --where");
+                    let w = buf_new();
+                    buf_bytes(w, name);
+                    buf_str(w, c": ");
+                    buf_bytes(w, buf_slice(SITE_TYPES.data[k + 1]));
+                    put_word(out, buf_slice(w));
+                    buf_byte(out, '\n');
+                    shown += 1;
+                }
+                k += 3;
+            }
+        }
+        if BUFS[out].len > 0 {
+            BREAK_HINTS = out;
+        }
+    }
+}
+
+// Whether pos is in one of the spans [starts[i], ends[i]).
+fn in_spans(pos: i64, starts: *IntVec, ends: *IntVec) -> bool {
+    unsafe {
+        for i in 0..(*starts).count {
+            if (*starts).data[i] <= pos && pos < (*ends).data[i] {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// Whether text has word w (not part of a longer identifier).
+fn has_word(text: [u8], w: [u8]) -> bool {
+    let mut i = 0;
+    while i + w.len <= text.len {
+        if bytes_eq(text[i..i + w.len], w) && (i == 0 || !ident_byte(text[i - 1]))
+            && (i + w.len == text.len || !ident_byte(text[i + w.len])) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn ident_byte(c: u8) -> bool {
+    c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+}

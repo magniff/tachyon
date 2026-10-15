@@ -101,7 +101,7 @@ note query.truncated: showing 2 of 71 refs
 try: tachyonc query refs bump --in budget/main.tach
 try: tachyonc query refs bump --all
 $ refs bump --in nosuch
-error query.bad-in: no file or module 'nosuch' in the program
+error query.bad-in: no file, module or item 'nosuch' in the program
 try: tachyonc query refs bump
 [exit 1]
 $ callers m2::size
@@ -132,9 +132,14 @@ $ callers long_line
 # budget/main.tach
 63:15	call	main	(many() + long_line() + m1::size()) as i32
 $ refs bump --in long_line
-error query.bad-in: no file or module 'long_line' in the program
-try: tachyonc query refs bump
-[exit 1]
+# budget/main.tach
+59:11	call	long_line	util::bump(1) + util::bump(2) + util::bump(3) + util::bump(4) + util::bump(5) + util::bump(6) + uti…
+59:27	call	long_line	util::bump(1) + util::bump(2) + util::bump(3) + util::bump(4) + util::bump(5) + util::bump(6) + uti…
+59:43	call	long_line	util::bump(1) + util::bump(2) + util::bump(3) + util::bump(4) + util::bump(5) + util::bump(6) + uti…
+59:59	call	long_line	util::bump(1) + util::bump(2) + util::bump(3) + util::bump(4) + util::bump(5) + util::bump(6) + uti…
+59:75	call	long_line	util::bump(1) + util::bump(2) + util::bump(3) + util::bump(4) + util::bump(5) + util::bump(6) + uti…
+59:91	call	long_line	util::bump(1) + util::bump(2) + util::bump(3) + util::bump(4) + util::bump(5) + util::bump(6) + uti…
+59:107	call	long_line	util::bump(1) + util::bump(2) + util::bump(3) + util::bump(4) + util::bump(5) + util::bump(6) + uti…
 $ refs bump --bogus
 error query.usage: unknown option '--bogus'
 try: tachyonc query refs bump
@@ -185,11 +190,11 @@ usage: tachyonc query def|show NAME... [--root ROOT] [--exact] [--with-comments]
        tachyonc query context NAME...|MODULE [--budget TOKENS]   (source, calls, types, callers)
        tachyonc query text FILE[:A[-B]]...
        tachyonc query diff
-       tachyonc query refs|callers NAME... [--exact] [--count] [--in FILE|MODULE] [--limit N] [--all]
+       tachyonc query refs|callers NAME... [--exact] [--count] [--in FILE|MODULE|ITEM] [--limit N] [--all]
        tachyonc query callees FN... [--transitive] [--writes TABLE] [--count] [--limit N] [--all]
        tachyonc query items [MODULE...] [--comments]
        tachyonc query show MODULE::section TITLE
-       tachyonc query grep PATTERN... [--in FILE|MODULE] [--code] [--comments] [--strings] [--word] [--count] [--limit N] [--all]
+       tachyonc query grep PATTERN... [--in FILE|MODULE|ITEM] [--code] [--comments] [--strings] [--word] [--count] [--limit N] [--all]
        tachyonc query type FILE:LINE[:COL]...
        tachyonc query stats [MODULE|FILE] [--over N] [--all]
        tachyonc query deps MODULE [--max-lines N]

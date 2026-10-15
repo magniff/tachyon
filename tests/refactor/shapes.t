@@ -137,9 +137,9 @@ $ refactor signature twice --rename-param x n --dry-run
 ## Ambiguous, and not a function.
 $ refactor signature size --remove unit
 error query.ambiguous: 3 definitions match 'size'; name one
-try: tachyonc refactor signature crate::geom::Shape::size
-try: tachyonc refactor signature '<crate::geom::Point as Shape>::size'
-try: tachyonc refactor signature '<crate::geom::Pair as Shape>::size'
+try: tachyonc refactor signature crate::geom::Shape::size --remove unit
+try: tachyonc refactor signature '<crate::geom::Point as Shape>::size' --remove unit
+try: tachyonc refactor signature '<crate::geom::Pair as Shape>::size' --remove unit
 [exit 1]
 $ refactor signature Point --remove x
 error refactor.kind: crate::geom::Point is a struct, not a function
@@ -276,8 +276,7 @@ $ refactor variant Kind --add 'Ring(i64, i64)'
 kinds.tach:9:5	kinds::weight
 kinds.tach:33:5	kinds::sides
 error refactor.non-exhaustive: 2 matches on crate::kinds::Kind would not cover Ring; nothing written
-try: tachyonc query show kinds.tach:9
-try: tachyonc query show kinds.tach:33
+try: tachyonc query show kinds.tach:9 kinds.tach:33
 try: tachyonc refactor variant crate::kinds::Kind --add 'Ring(i64, i64)' --arm 'EXPR' --dry-run
 try: tachyonc refactor variant crate::kinds::Kind --add 'Ring(i64, i64)' --arm-in kinds::weight 'EXPR' --arm-in kinds::sides 'EXPR' --dry-run
 [exit 1]

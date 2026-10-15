@@ -4,6 +4,10 @@ $ check
 $ rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: *IntVec' --dry-run
 --- a/main.tach
 +++ b/main.tach
+@@ -4 +3,0 @@
+-use crate::vecs::{ByteVec, IntVec, grow, grow_bytes};
+@@ -5,0 +5 @@
++use crate::vecs::{ByteVec, IntVec, grow_bytes};
 @@ -10 +10 @@
 -    grow(&v, 10);
 +    (&v).reserve(10);
@@ -17,6 +21,7 @@ $ rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: *IntVec' --dry-run
 -    grow(v, 2);
 +    v.reserve(2);
 +    v.reserve(2);
+note rewrite.imports: removed 1 import the rewrite left unused
 ## No site has that type: what the sites have, and the command for it.
 $ rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: IntVec'
 note rewrite.none: nothing matches 'grow($v, $n)'
@@ -49,9 +54,14 @@ note rewrite.nested: 1 site inside a rewritten one is left; run the rewrite agai
 $ rewrite 'log($first, $rest...)' 'trace(0, $rest..., $first)' --dry-run
 --- a/main.tach
 +++ b/main.tach
+@@ -3,0 +4 @@
++use crate::util::{double, square, trace, twice};
+@@ -5 +5,0 @@
+-use crate::util::{double, log, square, trace, twice};
 @@ -19 +19 @@
 -    log(1, 2);
 +    trace(0, 2, 1);
+note rewrite.imports: removed 1 import the rewrite left unused
 $ rewrite 'double($x, $rest...)' 'twice($x, $rest...)' --in util.tach --dry-run
 note rewrite.none: nothing matches 'double($x, $rest...)'
 $ rewrite 'double($x, $rest...)' 'twice($x, $rest...)' --dry-run

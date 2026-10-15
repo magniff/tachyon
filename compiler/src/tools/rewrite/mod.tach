@@ -29,12 +29,13 @@ pub mod parsed;
 mod pattern;
 mod regex;
 mod subst;
+mod after;
 
 use crate::base::{
     BUFS, FILES, IntVec, STDOUT, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
     buf_write_fd, streq,
 };
-use crate::front::ast::{KEEP_PARSED, NodeKind, PARSED_COUNT};
+use crate::front::ast::{KEEP_PARSED, NODE_COUNT, NodeKind, PARSED_COUNT};
 use crate::front::modules::file_of_pos;
 use crate::front::types::buf_type;
 use crate::tools::edit::{TARGET, edit_replace};
@@ -57,6 +58,7 @@ use pattern::{
     replacement_level, replacement_text, rest_hole_of, seq_at, seq_len, types_match,
 };
 
+use after::{drop_unused_imports, note_site_types, where_hints};
 use crate::tools::query::command_line::load_program;
 use regex::re_valid;
 use subst::{S_LOCAL, S_PAT, S_REP, choose_fresh, find_substs, note_subst_holes, put_site};
@@ -226,6 +228,7 @@ fn run_rewrite_inner(argc: i64, argv: **u8) -> i64 {
         // (0.16: --subst PATTERN REPLACEMENT, in pairs; --list)
         let mut substs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let mut list = false;
+        let mut ins = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let mut i = 2;
         while i < argc {
             let a = argv[i];
@@ -249,7 +252,9 @@ fn run_rewrite_inner(argc: i64, argv: **u8) -> i64 {
                 continue;
             }
             if streq(a, c"--in") && i + 1 < argc {
+                // (0.17: repeated, the scopes add up)
                 OPT_IN = argv[i + 1];
+                ins.push(argv[i + 1] as i64);
                 i += 2;
                 continue;
             }
@@ -296,10 +301,12 @@ fn run_rewrite_inner(argc: i64, argv: **u8) -> i64 {
             program_errors(c"error", root, true);
             return 1;
         }
-        if OPT_IN != 0 as *u8 && !resolve_in(c_slice(OPT_IN)) {
-            let d = diag(c"error", c"rewrite.bad-in");
-            put_bad_in(d, OPT_IN);
-            return 1;
+        for k in 0..ins.count {
+            if !resolve_in(c_slice(ins.data[k] as *u8)) {
+                let d = diag(c"error", c"rewrite.bad-in");
+                put_bad_in(d, ins.data[k] as *u8);
+                return 1;
+            }
         }
         let program_end = PARSED_COUNT;
         note_clones(program_end, crate::front::ast::NODE_COUNT);
@@ -511,6 +518,7 @@ fn run_rewrite_inner(argc: i64, argv: **u8) -> i64 {
                 s_text.push(line);
                 continue;
             }
+            note_site_types();
             let mut text = replacement_text();
             let mut from = pstart(n);
             let mut to = pend(n);
@@ -555,6 +563,9 @@ fn run_rewrite_inner(argc: i64, argv: **u8) -> i64 {
         let mut files = 0;
         let mut last_end = -1;
         let mut last_file = -1;
+        let mut done_start = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut done_end = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut done_text = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for a in 0..order.count {
             let k = v[a];
             if s_start.data[k] < last_end {
@@ -562,6 +573,9 @@ fn run_rewrite_inner(argc: i64, argv: **u8) -> i64 {
                 continue;
             }
             edit_replace(s_start.data[k], s_end.data[k], s_text.data[k]);
+            done_start.push(s_start.data[k]);
+            done_end.push(s_end.data[k]);
+            done_text.push(s_text.data[k]);
             last_end = s_end.data[k];
             sites += 1;
             let f = file_of_pos(s_start.data[k]);
@@ -587,6 +601,16 @@ fn run_rewrite_inner(argc: i64, argv: **u8) -> i64 {
             buf_str(d, c" left; run the rewrite again\n");
         }
         notes(pattern, replacement);
+        // (0.17: the imports it leaves unused go)
+        let dropped = drop_unused_imports(&done_start, &done_end, &done_text);
+        if dropped > 0 {
+            let d = diag(c"note", c"rewrite.imports");
+            buf_str(d, c"removed ");
+            buf_int(d, dropped);
+            buf_str(d, if dropped == 1 { c" import" } else { c" imports" });
+            buf_str(d, c" the rewrite left unused\n");
+        }
+        where_hints();
         let what = buf_new();
         buf_str(what, c"rewrote ");
         buf_int(what, sites);
