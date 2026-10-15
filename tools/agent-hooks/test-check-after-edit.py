@@ -123,6 +123,21 @@ try:
          os.path.join(top, "target", "tools", "tachyonc"))
     case("compiler: the one the agent ran", hook.compiler_for(top, "target/tachyonc"),
          os.path.join(top, "target", "tachyonc"))
+    # (0.17) A program's check: target/tachyonc when newer (just rebuilt);
+    # the compiler's own source: still the tools binary.
+    t = time.time()
+    os.utime(os.path.join(top, "target", "tools", "tachyonc"), (t - 100, t - 100))
+    os.utime(os.path.join(top, "target", "tachyonc"), (t, t))
+    case("compiler: a newer build for a test program",
+         hook.compiler_for(os.path.join(top, "tests", "run"), None, os.path.join(top, "tests", "run", "loop.tach")),
+         os.path.join(top, "target", "tachyonc"))
+    case("compiler: the tools binary for the compiler's source",
+         hook.compiler_for(os.path.join(top, "compiler", "src"), None, os.path.join(top, "compiler", "src", "main.tach")),
+         os.path.join(top, "target", "tools", "tachyonc"))
+    os.utime(os.path.join(top, "target", "tachyonc"), (t - 200, t - 200))
+    case("compiler: an older build is not taken",
+         hook.compiler_for(os.path.join(top, "tests", "run"), None, os.path.join(top, "tests", "run", "loop.tach")),
+         os.path.join(top, "target", "tools", "tachyonc"))
 
     # The report: errors only, the edited file's first, at most 10.
     many = [diag("other.tach", i, f"e{i}") for i in range(1, 12)] + [diag("util.tach", 3, "mine", help=["did you mean 'g'?"])]

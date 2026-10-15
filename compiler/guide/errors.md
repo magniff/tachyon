@@ -698,11 +698,14 @@ safe).
 
 ## At run time
 
-A failed check prints one line on stderr and exits with code 101:
+A failed check prints its message on stderr and exits with code 101:
 `index out of bounds: index I, length N`, `slice range out of bounds:
 ...`, `called unwrap on None`, `called unwrap on Err`, `invalid value V
-for enum E`. Arithmetic never fails (it wraps; `/ 0` is 0). Runaway
-recursion is stopped by the operating system (a signal, no message).
+for enum E`. A note follows (0.17). A program built with `--trace`
+prints, instead, the failing line and the calls that led to it
+(`tachyonc test` builds so; `guide debug`). Arithmetic never fails (it
+wraps; `/ 0` is 0). Runaway recursion is stopped by the operating system
+(a signal, no message).
 
 ```tach
 enum Level { Low, High }
@@ -719,4 +722,5 @@ fn main() -> i32 {
 ```out (exit 101)
 5
 invalid value 3 for enum Level
+note: build with --trace for the line and its callers
 ```

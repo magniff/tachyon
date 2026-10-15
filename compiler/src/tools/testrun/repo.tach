@@ -3,13 +3,13 @@
 // tests/run.sh once per FILTER, its FAIL blocks and totals summarized.
 use crate::base::{
     IntVec, STDOUT, alloc_array, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
-    buf_write_fd,
+    buf_write_fd, streq,
 };
 use crate::front::cpp::directives::file_exists;
-use crate::tools::proc::{buf_cstr, rename_file};
+use crate::tools::proc::{buf_cstr, read_file_if, rename_file, same_bytes};
 use crate::tools::query::diagnostics::{PROG, put_cword};
 use crate::tools::testrun::{
-    BUDGET, FILTERS, OPT, contains, detail_lines, line_end, newer_tach, now_ms, put_cut,
+    AGAINST, BUDGET, FILTERS, OPT, contains, detail_lines, line_end, newer_tach, now_ms, put_cut,
     put_failures, put_lines, put_secs, run_words, starts,
 };
 
@@ -122,6 +122,14 @@ pub fn run_repo() -> i64 {
                 names.push(n);
             }
         }
+        // (0.17) The failures run again with the last passing build.
+        let counts = alloc_array::<i64>(2);
+        counts[0] = 0;
+        counts[1] = 0;
+        let base = if names.count > 0 { baseline_compiler() } else { 0 as *u8 };
+        if base != 0 as *u8 {
+            mark_baseline(base, &blocks, &names, counts);
+        }
         buf_bytes(out, "test");
         for k in 0..FILTERS.count {
             put_cword(out, FILTERS.data[k] as *u8);
@@ -154,6 +162,15 @@ pub fn run_repo() -> i64 {
             buf_str(out, OPT);
         }
         buf_bytes(out, buf_slice(notes));
+        if counts[0] + counts[1] > 0 {
+            buf_bytes(out, "; with ");
+            buf_str(out, base);
+            buf_bytes(out, ": ");
+            buf_int(out, counts[0]);
+            buf_bytes(out, " new, ");
+            buf_int(out, counts[1]);
+            buf_bytes(out, " failing too");
+        }
         buf_bytes(out, "; ");
         put_secs(out, now_ms() - t0);
         buf_bytes(out, ")\n");
@@ -163,6 +180,92 @@ pub fn run_repo() -> i64 {
             return 2;
         }
         if blocks.count > 0 || totals[2] > 0 { 1 } else { 0 }
+    }
+}
+
+// (0.17) The compiler the failures are run again with: --against's, else
+// target/tools/tachyonc (the last build whose suite passed) when its bytes
+// differ from target/tachyonc's; 0: none (`--against none`).
+fn baseline_compiler() -> *u8 {
+    unsafe {
+        if AGAINST != 0 as *u8 {
+            return if streq(AGAINST, c"none") { 0 as *u8 } else { AGAINST };
+        }
+        let tools = c"target/tools/tachyonc";
+        if !file_exists(tools) {
+            return 0 as *u8;
+        }
+        let a = buf_new();
+        let b = buf_new();
+        if read_file_if(tools, a) && read_file_if(c"target/tachyonc", b)
+            && same_bytes(buf_slice(a), buf_slice(b)) {
+            return 0 as *u8;
+        }
+        tools
+    }
+}
+
+// Whether case `name` fails with compiler `base` too: 1 it fails, 0 it
+// passes, -1 unknown (run.sh made no table).
+fn fails_with(base: *u8, name: [u8]) -> i64 {
+    unsafe {
+        let filter = buf_new();
+        buf_bytes(filter, name);
+        let log = buf_new();
+        if OPT != 0 as *u8 {
+            let level = buf_new();
+            buf_byte(level, OPT[2]);
+            run_words(c"sh", c"tests/run.sh", c"-c", base, c"-O", buf_cstr(level),
+                buf_cstr(filter), log);
+        } else {
+            run_words(c"sh", c"tests/run.sh", c"-c", base, buf_cstr(filter), 0 as *u8, 0 as *u8,
+                log);
+        }
+        let totals = alloc_array::<i64>(3);
+        totals[0] = 0;
+        totals[1] = 0;
+        totals[2] = 0;
+        let mut blocks = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut names = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        if !parse_run(buf_slice(log), totals, &blocks, &names) {
+            return -1;
+        }
+        for k in 0..names.count {
+            if buf_slice(names.data[k]) == name {
+                return 1;
+            }
+        }
+        0
+    }
+}
+
+// Each failure run again with the baseline compiler: its block says whether
+// it fails there too (the environment, or a cause older than the change)
+// or is new; `counts` gets (new, old).
+fn mark_baseline(base: *u8, blocks: *IntVec, names: *IntVec, counts: *i64) {
+    unsafe {
+        for k in 0..names.count {
+            let name = buf_slice(names.data[k]);
+            if name == "run.sh" {
+                continue;
+            }
+            let f = fails_with(base, name);
+            if f < 0 {
+                continue;
+            }
+            let b = blocks.data[k];
+            if f == 1 {
+                buf_bytes(b, "  (fails with ");
+                buf_str(b, base);
+                buf_bytes(b, " too: not from this change)\n");
+                counts[1] = counts[1] + 1;
+            } else {
+                buf_bytes(b, "  (new: passes with ");
+                buf_str(b, base);
+                buf_bytes(b, ")\n");
+                counts[0] = counts[0] + 1;
+            }
+        }
     }
 }
 

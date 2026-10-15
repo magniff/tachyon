@@ -407,7 +407,7 @@ else
 fi
 
 # --help on every command (0.15): the command's rows, no error.
-for c in "" edit "edit patch" refactor "refactor signature" fix fmt check undo explain try "query context" rewrite lint same-output; do
+for c in "" edit "edit patch" refactor "refactor signature" fix fmt check undo explain try "query context" rewrite lint same-output test probe reduce; do
     # shellcheck disable=SC2086
     if "$COMPILER" $c --help >"$WORK/help.out" 2>&1 && [ -s "$WORK/help.out" ] \
         && [ "$(wc -l <"$WORK/help.out")" -le 15 ] && ! grep -q '^error' "$WORK/help.out"; then
@@ -442,6 +442,7 @@ try_case unit '' 'let x = 3;'
 try_case error "snippet:2:5: error[type error] expected 'i64', got '[u8]'" 'let a = 1;
 a + "b"'
 try_case panic 'index out of bounds: index 3, length 0
+note: build with --trace for the line and its callers
 exit 101' 'let v: Vec<i64> = Vec::new_in(gpa); v.get(3)'
 printf 'struct P { x: i64 }\n\nlet p = P { x: 4 };\np.x * 10\n' >"$WORK/snip.tach"
 try_case file 'i64 = 40' --file "$WORK/snip.tach"

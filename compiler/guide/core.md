@@ -166,7 +166,9 @@ or `tachyonc guide TOPIC#SECTION` prints the lines on it; `tachyonc
 try 'CODE'` runs a snippet. For an unfamiliar item, ask
 `tachyonc query context NAME` first: its source, what it calls and its
 callers in one call (`query context parse_args`). Edits, refactorings
-and the other queries: `tachyonc guide tools`.
+and the other queries: `tachyonc guide tools`. A bug: `tachyonc test`
+(a crash prints its line and callers), `tachyonc probe FILE:LINE EXPR`
+(values at a line, the source unchanged): `tachyonc guide debug`.
 
 Topics (`tachyonc guide TOPIC`, `TOPIC#` lists its sections):
 @TOPIC-NAMES@

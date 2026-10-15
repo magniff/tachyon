@@ -168,9 +168,13 @@ def root_of(path):
     return None
 
 
-def compiler_for(where, ran=None):
+def compiler_for(where, ran=None, root=None):
     """The tachyonc to check with: the one the agent ran (a path), the
-    override, the checkout's tools binary or build, the one on PATH."""
+    override, the checkout's tools binary or build, the one on PATH.
+    (0.17) For a program outside the compiler's own source (a test case,
+    an example), target/tachyonc when it is newer than target/tools/tachyonc:
+    a compiler just rebuilt from changed source checks the programs written
+    for that change (the tools binary, older, reports what was fixed)."""
     if ran and os.sep in ran:
         p = ran if os.path.isabs(ran) else os.path.join(where, ran)
         if os.access(p, os.X_OK):
@@ -180,8 +184,15 @@ def compiler_for(where, ran=None):
         return env
     top = checkout_root(where)
     if top:
-        for rel in ("target/tools/tachyonc", "target/tachyonc"):
-            p = os.path.join(top, rel)
+        tools, build = (os.path.join(top, rel) for rel in ("target/tools/tachyonc", "target/tachyonc"))
+        own = root and os.path.abspath(root).startswith(os.path.join(top, "compiler") + os.sep)
+        if root and not own and os.access(build, os.X_OK) and os.access(tools, os.X_OK):
+            try:
+                if os.path.getmtime(build) > os.path.getmtime(tools):
+                    return build
+            except OSError:
+                pass
+        for p in (tools, build):
             if os.access(p, os.X_OK):
                 return p
     return which("tachyonc")
@@ -623,7 +634,7 @@ def main():
         root = os.path.normpath(os.path.join(cwd, root))
     if ran and os.sep in ran and not os.path.isabs(ran):
         ran = os.path.join(cwd, ran)
-    compiler = compiler_for(cwd if not edited else os.path.dirname(os.path.abspath(edited)), ran)
+    compiler = compiler_for(cwd if not edited else os.path.dirname(os.path.abspath(edited)), ran, root)
     if not compiler:
         return 0
     st = hs.load(event)

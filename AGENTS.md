@@ -33,6 +33,7 @@ these first:
 | replace, add, remove an item | `target/tachyonc edit replace\|insert\|delete NAME` (`< text`) |
 | rename, move, change a signature, field or variant everywhere | `target/tachyonc refactor rename\|move\|signature\|field\|variant ...` |
 | missing imports, `pub`, `unsafe` blocks | `target/tachyonc fix` |
+| a bug: where it fails, the values at a line, which change broke a test | `target/tachyonc guide debug` (`test` prints a crash's line and callers; `probe FILE:LINE EXPR... -- ARGS`; `reduce`) |
 | build and test what a change touches | `bootstrap/bootstrap.sh --dev`, `tests/run.sh FILTER` (the inner loop, below) |
 
 Everything else (`query grep|items|type|effects|impact`, `edit apply`,

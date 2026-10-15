@@ -105,6 +105,7 @@ tools` the ones a program needs.
 | several queries and edits in one call, outputs under `## $ tachyonc ARGS` lines | `target/tachyonc batch < cmds.txt` (one command per line; `--stop` at the first failure) |
 | the errors, one per line (front end only) | `target/tachyonc check` |
 | build what changed and run the tests; counts, then each failure | `target/tachyonc test [FILTER...]` (a program: `tests/NAME.in`/`.out`; `--full`, `--budget N`) |
+| a crash's line and callers; values at a line as the program runs; a failing input made small | `target/tachyonc test` (built with `--trace`), `target/tachyonc probe FILE:LINE EXPR... -- ARGS`, `target/tachyonc reduce FILE --until 'CMD'` (`guide debug`) |
 | missing/unused imports, `pub`, `unsafe` blocks | `target/tachyonc fix` (`--only imports,unused,pub,unsafe`, `--in FILE\|MODULE`, `--dry-run`; several modules have the name: `--use PATH::NAME`) |
 | imports through re-exports, then the re-exports; merged, sorted, wrapped `use` lines | `target/tachyonc fix --only reexports,tidy-imports` (`// api:` above a `pub use` keeps it) |
 | prove a refactoring changed no output | `target/tachyonc same-output OLD_TACHYONC` |
@@ -955,8 +956,16 @@ FAIL bad: stdout differs at line 2 (3 lines expected, 3 printed)
   + line 3: c
 FAIL crash: exit 3 (expected 0)
 FAIL hang: no exit after 1 s (--timeout S)
+  stderr: stopped by signal 14 (SIGALRM: a time limit)
+  stderr: trace, innermost call first:
+  stderr:   main.tach:12  main
 (outputs: .tachyonc/test/NAME.got, NAME.err)
 ```
+
+(0.17) The program is built with `--trace` (not with `-O 0`; `--no-trace`
+turns it off): a case that crashes or runs out of time shows the first
+12 lines of its stderr, the message and the frames, innermost first, each
+`FILE:LINE  function`.
 
 A FILTER selects the cases whose name contains it. Without cases, the
 build alone (`test main.tach: builds; no tests in tests/ ...`), or one
@@ -980,10 +989,60 @@ FAIL run_gvn_loads:
   ...
 ```
 
+(0.17) Each failing case is run again with `target/tools/tachyonc`, the
+last build whose suite passed (when its bytes differ from
+`target/tachyonc`'s; `--against TACHYONC` another, `--against none`
+not at all): its block ends with `(new: passes with ...)` or `(fails
+with ... too: not from this change)`, and the headline counts both
+(`with target/tools/tachyonc: 1 new, 6 failing too`). A failure that
+fails before the change too is the environment's or older: no need to
+stash the change and rebuild to find out.
+
 A FILTER that matches no case is named in the headline (`no case
 matches 'x'`). Exit status: 0 every case passed, 1 a failure or a build
 error, 2 a usage error (`test.usage`) or nothing to run (`test.no-root`).
 tests/refactor/testcmd.t has a transcript.
+
+## probe, reduce, --trace: what a program does (0.17)
+
+`tachyonc guide debug` is the agent-facing text, with the recipe.
+
+- `tachyonc FILE.tach --trace -o prog` (middle/trace.tach): each
+  function of the program's own files keeps a frame on a shadow stack
+  (4096 entries, a ring), set at its entry, before each call (the line
+  of the expression lowered last, so the line of `v[i]` in a statement
+  of several lines) and at each loop header; a failed check (rt.panic,
+  std's panic) prints the frames after its message, and SIGINT, SIGALRM,
+  SIGTERM and SIGSEGV print them too. Built on the IR after lowering,
+  before inlining, so the frames are the source's at every level (with
+  -O0: -O1). The cost: about 25% on the compiler's own run time, a
+  larger binary (the site strings); none without the flag. Without it,
+  a failure's message is followed by `note: build with --trace for the
+  line and its callers`.
+- `tachyonc probe FILE:LINE [EXPR...]... [--count FILE:LINE] [--max N]
+  [--input FILE] [--timeout S] [-O N] [--root ROOT] [-- ARGS]`
+  (tools/probe/): the line's statement found in the front end's tree
+  (before it; after a `let`; in a loop's body; at the start of a block
+  the line opens); copies of the files with the probes written in, on
+  the same lines, passed to the compiler with `--overlay PATH COPY`;
+  `check` of the copies with `let _: () = (EXPR);` names each
+  expression's type, which picks its printer (Display for numbers and
+  bool, quoted `[u8]`, elements of arrays, slices, Option and tuples,
+  addresses of pointers, Debug, else a struct's fields, else `<TYPE>`);
+  the build (with --trace) is run, and its stderr's `@@probe` lines
+  become the report. Counts come from an atexit report, else (stopped)
+  from the powers of two each probe announces (`at least N`).
+- `tachyonc reduce FILE --until 'CMD' [--out F] [--max-runs N]
+  [--timeout S]` (tools/reduce.tach): delta debugging on lines; CMD
+  (`sh -c`, `{}` the candidate, which keeps FILE's name in
+  `.tachyonc/reduce/`) exits 0 while the failure is there; each run in
+  a process group killed after S seconds (5).
+
+Codes: `probe.usage`, `probe.no-root`, `probe.no-file`,
+`probe.no-line`, `probe.no-statement`, `probe.expr`, `probe.build`,
+`reduce.usage`, `reduce.no-file`, `reduce.not-failing`
+(`tachyonc explain CODE`). tests/refactor/debugtools.t has a
+transcript; tests/run/trace_*.tach the traces.
 
 ## The agent hooks (0.17)
 
@@ -995,7 +1054,12 @@ condition in tools/agent-hooks/settings-eval.json for the agent eval):
   rewrite|undo` that wrote, and every shell command that writes a `.tach`
   file (`> f.tach`, `tee`, `cp`, `mv`). The root and the compiler are
   the command's own: a Bash line's `cd`s are followed (`cd WORKTREE &&
-  tachyonc edit ...` checks WORKTREE). After the session's first check
+  tachyonc edit ...` checks WORKTREE). The compiler is
+  target/tools/tachyonc, except for a program outside the compiler's
+  own source (a test case, an example) when target/tachyonc is newer: a
+  compiler just rebuilt from a fixed source checks the programs written
+  for the fix (0.17; the tools binary reported the errors the fix had
+  removed). After the session's first check
   of a root it reports the delta: `tachyonc check main.tach: 2 errors (1
   new, 1 fixed, 1 as before)` and only the new errors; `0 errors (2
   fixed)` when it became clean; nothing when it was and is clean. After

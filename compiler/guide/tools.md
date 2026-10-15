@@ -141,6 +141,15 @@ out. In the tachyon tree, `tachyonc test FILTER` rebuilds
 `target/tachyonc` when the source is newer and runs `tests/run.sh
 FILTER`, summarized the same way.
 
+## Debugging
+
+A bug: `tachyonc guide debug`. Tests are built with `--trace`, so a crash
+or a hang prints its line and callers. `tachyonc probe FILE:LINE EXPR...
+--input FILE` prints values at a line without editing the source.
+`tachyonc reduce FILE --until 'CMD'` shrinks a failing input. In the
+tachyon tree, `tachyonc test FILTER` also runs each failure with
+`target/tools/tachyonc`, to tell new failures from old ones.
+
 ## Diagnostics
 
 Compiler errors, from `tachyonc check` or a build whose output is not a
@@ -165,5 +174,6 @@ Exit status: 0 done, 1 refused or failed (nothing written), 2 usage.
 
 `-O0`, `-O1`, `-O2` (the default; all behave the same), `--target
 aarch64-macos|aarch64-linux|x86_64-linux|x86_64-macos`, `-g` (debug line
-tables), `--check-unsafe`, `--check-alloc` (0.16), `--emit-header`,
+tables), `--trace` (0.17: a failure prints its line and callers),
+`--check-unsafe`, `--check-alloc` (0.16), `--emit-header`,
 `--emit-imports`, `-I DIR`, `--version`. `tachyonc guide TOPIC` for the language.

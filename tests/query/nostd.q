@@ -3,7 +3,7 @@
 ## show with the `use` line a program needs.
 $ def std::read_line Vec::push
 std::read_line	../../compiler/std/io.tach:39:8	fn	pub fn read_line<A: Allocator>(line: *Buf<A>) -> Result<bool, IoError>
-std::Vec::push	../../compiler/std/std.tach:236:12	method	pub fn push(self: *Vec<T, A>, x: T)
+std::Vec::push	../../compiler/std/std.tach:247:12	method	pub fn push(self: *Vec<T, A>, x: T)
 $ def read_line twice
 std::read_line	../../compiler/std/io.tach:39:8	fn	pub fn read_line<A: Allocator>(line: *Buf<A>) -> Result<bool, IoError>
 crate::twice	nostd/main.tach:4:4	fn	fn twice(x: i64) -> i64	effects: none
@@ -25,7 +25,7 @@ $ text std:1-2
 2	// (compiler/std/embed.sh makes compiler/src/front/stdsrc.tach from this file
 $ grep 'pub fn read_line' --in std
 # <std>
-2012:1	code	std	pub fn read_line<A: Allocator>(line: *Buf<A>) -> Result<bool, IoError> {
+2023:1	code	std	pub fn read_line<A: Allocator>(line: *Buf<A>) -> Result<bool, IoError> {
 $ def no_such_name
 error query.no-match: no definition 'no_such_name'
 try: tachyonc query items

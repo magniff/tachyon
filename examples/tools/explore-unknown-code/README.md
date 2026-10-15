@@ -41,7 +41,7 @@ generated header:
 ```console
 $ tachyonc query items
 crate	main.tach	6
-std	<std>	485
+std	<std>	486
 crate::graph	graph.tach	11
 crate::heap	heap.tach	7
 crate::network	network.tach	2
@@ -109,12 +109,12 @@ crate::heap::free_heap	heap.tach:63:8	fn	pub fn free_heap(h: *MinHeap)
 crate::heap::is_empty	heap.tach:18:8	fn	pub fn is_empty(h: *MinHeap) -> bool
 crate::heap::pop	heap.tach:35:8	fn	pub fn pop(h: *MinHeap) -> Option<Entry>
 crate::graph::edges_from	graph.tach:57:8	fn	pub fn edges_from(g: *Graph, i: i64) -> [Edge]
-std::Vec::filled_in	<std>:149:12	method	pub fn filled_in(n: i64, x: T, a: A) -> Vec<T, A>
+std::Vec::filled_in	<std>:160:12	method	pub fn filled_in(n: i64, x: T, a: A) -> Vec<T, A>
 crate::heap::push	heap.tach:22:8	fn	pub fn push(h: *MinHeap, e: Entry)
-std::Vec::set	<std>:259:12	method	pub fn set(self: *Vec<T, A>, i: i64, x: T)
-std::Option::unwrap	<std>:75:12	method	pub fn unwrap(self: Option<T>) -> T
-std::Vec::free	<std>:319:12	method	pub fn free(self: *Vec<T, A>)
-std::Vec::get	<std>:255:12	method	pub fn get(self: *Vec<T, A>, i: i64) -> T
+std::Vec::set	<std>:270:12	method	pub fn set(self: *Vec<T, A>, i: i64, x: T)
+std::Option::unwrap	<std>:86:12	method	pub fn unwrap(self: Option<T>) -> T
+std::Vec::free	<std>:330:12	method	pub fn free(self: *Vec<T, A>)
+std::Vec::get	<std>:266:12	method	pub fn get(self: *Vec<T, A>, i: i64) -> T
 note query.budget: over the budget of 600 tokens, left out: types or uses 8, callers 1
 try: tachyonc query callers quickest
 try: tachyonc query context quickest --budget 1800

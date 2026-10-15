@@ -266,6 +266,7 @@ fn main() -> i32 {
 world
 starts with hello
 index out of bounds: index 4, length 4
+note: build with --trace for the line and its callers
 ```
 
 An array `[T; N]` is a value (copied by `=`; `a.len()` is N); a slice
