@@ -1,0 +1,361 @@
+// Huffman coding: an encoder and a decoder with canonical codes.
+//
+// Counts the bytes of a text, builds the Huffman tree with a min-heap,
+// turns its depths into canonical codes, packs the text into a bit
+// stream, and decodes it back with a lookup table, checking that the
+// round trip gives the text back. A short sentence shows the code table;
+// then 4 MiB of generated text (words drawn from a small vocabulary with
+// skewed frequencies, from a seeded generator) is compressed and timed.
+//
+//     tachyonc examples/algorithms/huffman/main.tach -o huffman && ./huffman
+//
+// Results go to stdout, timings to stderr. `main` returns a Result: an
+// error (a code too long for the table, a round trip that differs) is
+// printed as `Error: ...` with exit status 1.
+
+import "math.h" as m;
+import "time.h" as c;
+
+// ---------------------------------------------------------------- input
+
+// xorshift64*: a small, fast, seeded generator of 64-bit values.
+struct Rng { state: u64 }
+
+impl Rng {
+    fn new(seed: u64) -> Rng { Rng { state: seed | 1 } }
+
+    fn next(self: *Rng) -> u64 {
+        let mut x = self.state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.state = x;
+        x * 0x2545F4914F6CDD1D
+    }
+
+    // A value in lo..=hi.
+    fn range(self: *Rng, lo: i64, hi: i64) -> i64 {
+        lo + ((self.next() >> 33) % ((hi - lo + 1) as u64)) as i64
+    }
+}
+
+const WORDS: [[u8]; 24] = [
+    "the", "of", "and", "to", "a", "in", "is", "that", "it", "was", "for", "on",
+    "with", "as", "his", "they", "be", "at", "one", "have", "this", "from", "huffman",
+    "code",
+];
+
+// `size` bytes of sentences. The smaller of two uniform draws picks the
+// word, so early words are more frequent, as in real text.
+fn generate_text(size: i64, seed: u64) -> Vec<u8> {
+    let mut rng = Rng::new(seed);
+    let mut text: Vec<u8> = Vec::with_capacity(size + 16);
+    let last = WORDS[..].len - 1;
+    while text.len() < size {
+        let words = rng.range(3, 12);
+        for k in 0..words {
+            let i = rng.range(0, last);
+            let j = rng.range(0, last);
+            let w = WORDS[if i < j { i } else { j }];
+            if k == 0 {
+                text.push(w[0] - 32); // capitalized
+                text.extend_from_slice(w[1..]);
+            } else {
+                text.push(' ');
+                text.extend_from_slice(w);
+            }
+        }
+        text.extend_from_slice(if rng.range(0, 3) == 0 { ",\n" } else { ". " });
+    }
+    text.truncate(size);
+    text
+}
+
+// ------------------------------------------------------------- the tree
+
+// A binary min-heap of any ordered T (as in examples/algorithms/dijkstra).
+struct MinHeap<T: Ord> { items: Vec<T> }
+
+impl<T: Ord> MinHeap<T> {
+    fn new() -> MinHeap<T> { MinHeap { items: Vec::new() } }
+
+    fn len(self: *MinHeap<T>) -> i64 { self.items.len() }
+
+    fn push(self: *MinHeap<T>, x: T) {
+        self.items.push(x);
+        let s = self.items.as_slice();
+        let mut i = s.len - 1;
+        while i > 0 && x < s[(i - 1) / 2] {
+            s[i] = s[(i - 1) / 2];
+            i = (i - 1) / 2;
+        }
+        s[i] = x;
+    }
+
+    fn pop(self: *MinHeap<T>) -> Option<T> {
+        let last = self.items.pop()?;
+        let s = self.items.as_slice();
+        if s.len == 0 { return Some(last); }
+        let top = s[0];
+        let mut i = 0;
+        loop {
+            let mut child = 2 * i + 1;
+            if child >= s.len { break; }
+            if child + 1 < s.len && s[child + 1] < s[child] { child += 1; }
+            if last <= s[child] { break; }
+            s[i] = s[child];
+            i = child;
+        }
+        s[i] = last;
+        Some(top)
+    }
+
+    fn free(self: *MinHeap<T>) { self.items.free(); }
+}
+
+// A subtree in the heap. The derived Ord compares the weights, then the
+// node numbers, so equal weights merge in a fixed order and the codes
+// are the same on every machine.
+#[derive(Eq, Ord, Debug)]
+struct Subtree { weight: i64, node: i64 }
+
+// The code length of each byte value: its leaf's depth in the Huffman
+// tree (0 for a byte that does not occur). The tree's nodes are numbered:
+// 0..256 are the leaves, one per byte value, and each merge adds one;
+// `kids` holds each node's two children, (-1, -1) for a leaf.
+fn code_lengths(freq: [i64]) -> [i64; 256] {
+    let mut kids = Vec::filled(256, (-1, -1));
+    defer kids.free();
+    let mut heap: MinHeap<Subtree> = MinHeap::new();
+    defer heap.free();
+    for b in 0..256 {
+        if freq[b] > 0 { heap.push(Subtree { weight: freq[b], node: b }); }
+    }
+    let mut lengths = [0; 256];
+    if heap.len() == 1 { // one symbol: a 1-bit code
+        lengths[heap.pop().unwrap().node] = 1;
+        return lengths;
+    }
+    // Merge the two lightest subtrees until one is left: the root.
+    while heap.len() > 1 {
+        let a = heap.pop().unwrap();
+        let b = heap.pop().unwrap();
+        kids.push((a.node, b.node));
+        heap.push(Subtree { weight: a.weight + b.weight, node: kids.len() - 1 });
+    }
+    // The depths, walking down from the root with a stack.
+    let mut stack: Vec<(i64, i64)> = Vec::new();
+    defer stack.free();
+    stack.push((kids.len() - 1, 0));
+    while let Some((node, depth)) = stack.pop() {
+        let (left, right) = kids.get(node);
+        if left < 0 {
+            lengths[node] = depth;
+        } else {
+            stack.push((left, depth + 1));
+            stack.push((right, depth + 1));
+        }
+    }
+    lengths
+}
+
+// ---------------------------------------------------------------- codes
+
+#[derive(Debug)]
+enum HuffError { CodeTooLong(i64), Mismatch(i64) }
+
+// The longest code the decoder's table takes: 2^MAX_BITS entries.
+const MAX_BITS: i64 = 20;
+
+// Canonical codes: only the lengths matter. Symbols sorted by (length,
+// byte value) get consecutive codes, shifted left when the length grows,
+// so a decoder rebuilds the codes from the 256 lengths alone.
+struct Codebook { len: [i64; 256], code: [u64; 256], max_len: i64 }
+
+#[derive(Eq, Ord)]
+struct ByLength { len: i64, byte: i64 }
+
+impl Codebook {
+    fn new(lengths: [i64; 256]) -> Result<Codebook, HuffError> {
+        let mut order: Vec<ByLength> = Vec::new();
+        defer order.free();
+        for b in 0..256 {
+            if lengths[b] > 0 { order.push(ByLength { len: lengths[b], byte: b }); }
+        }
+        std::sort(order.as_slice()); // by the derived Ord
+        let max_len = order.last().map(|e| e.len).unwrap_or(0);
+        if max_len > MAX_BITS { return Err(HuffError::CodeTooLong(max_len)); }
+        let mut book = Codebook { len: lengths, code: [0u64; 256], max_len: max_len };
+        let mut code = 0u64;
+        let mut prev = 0;
+        for e in order.iter() {
+            code <<= e.len - prev;
+            book.code[e.byte] = code;
+            code += 1;
+            prev = e.len;
+        }
+        Ok(book)
+    }
+
+    // The decoder's table, indexed by the next max_len bits of the
+    // stream: each entry is (byte | length << 8). A code of length L
+    // fills the 2^(max_len - L) entries that start with it.
+    fn decode_table(self: *Codebook) -> Vec<u32> {
+        let mut table = Vec::filled(1 << self.max_len, 0u32);
+        let t = table.as_slice();
+        for b in 0..256 {
+            let len = self.len[b];
+            if len == 0 { continue; }
+            let first = (self.code[b] << (self.max_len - len)) as i64;
+            for k in first..first + (1 << (self.max_len - len)) {
+                t[k] = (b | len << 8) as u32;
+            }
+        }
+        table
+    }
+
+    fn code_text(self: *Codebook, b: u8) -> std::Buf {
+        let mut s = std::Buf::new();
+        for k in 0..self.len[b] {
+            s.push(if (self.code[b] >> (self.len[b] - 1 - k)) & 1 == 1 { '1' } else { '0' });
+        }
+        s
+    }
+}
+
+// ---------------------------------------------------- encode and decode
+
+// Packs each byte's code into a bit stream, most significant bit first:
+// `acc` holds the bits not yet written (fewer than 8 between bytes), the
+// last byte is padded with zero bits.
+fn encode(text: [u8], book: *Codebook) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::with_capacity(text.len / 2);
+    let mut acc = 0u64;
+    let mut bits = 0;
+    for b in text {
+        let len = book.len[b];
+        acc = (acc << len) | book.code[b];
+        bits += len;
+        while bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    if bits > 0 { out.push((acc << (8 - bits)) as u8); }
+    out
+}
+
+// Decodes `count` bytes: keeps up to 64 bits of the stream in `acc`,
+// looks the next max_len of them up in the table, consumes the length
+// found there.
+fn decode(bits: [u8], count: i64, book: *Codebook) -> Vec<u8> {
+    let mut table = book.decode_table();
+    defer table.free();
+    let t = table.as_slice();
+    let max = book.max_len;
+    let mask = (1u64 << max) - 1;
+    let mut out: Vec<u8> = Vec::with_capacity(count);
+    let mut acc = 0u64;
+    let mut have = 0;
+    let mut pos = 0;
+    for _ in 0..count {
+        while have <= 56 { // refill a byte at a time
+            let byte = if pos < bits.len { bits[pos] } else { 0 };
+            acc = (acc << 8) | byte;
+            pos += 1;
+            have += 8;
+        }
+        let e = t[(acc >> (have - max)) & mask];
+        out.push(e as u8);
+        have -= e >> 8;
+    }
+    out
+}
+
+// ---------------------------------------------------------------- stats
+
+fn frequencies(text: [u8]) -> [i64; 256] {
+    let mut freq = [0; 256];
+    for b in text { freq[b] += 1; }
+    freq
+}
+
+// The Shannon entropy of the byte distribution, in bits per byte: no
+// code that codes bytes one at a time does better.
+fn entropy(freq: [i64], total: i64) -> f64 {
+    freq.iter().filter(|n| n > 0).fold(0.0, |h, n| {
+        let p = n as f64 / total as f64;
+        h - p * unsafe { m::log2(p) }
+    })
+}
+
+// FNV-1a of the bytes.
+fn checksum(bytes: [u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325u64, |h, b| (h ^ b) * 0x100000001b3)
+}
+
+fn now_ns() -> i64 {
+    let mut ts = c::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { c::timespec_get(&ts, c::TIME_UTC); }
+    ts.tv_sec * 1_000_000_000 + ts.tv_nsec
+}
+
+fn rate(what: [u8], ns: i64, bytes: f64) {
+    eprintln(f"{what}: {ns as f64 / 1e6:>6.2} ms, {bytes * 1e3 / ns as f64:>5.0} MB/s");
+}
+
+// Compresses `text`, decodes it back and checks it; prints the sizes.
+// With `table`, also each byte's count and code.
+fn round_trip(text: [u8], table: bool = false) -> Result<(), HuffError> {
+    let t0 = now_ns();
+    let freq = frequencies(text);
+    let book = Codebook::new(code_lengths(freq[..]))?;
+    let t1 = now_ns();
+    let mut packed = encode(text, &book);
+    defer packed.free();
+    let t2 = now_ns();
+    let mut back = decode(packed.as_slice(), text.len, &book);
+    defer back.free();
+    let t3 = now_ns();
+
+    if table {
+        println("byte  count  bits  code");
+        for len in 1..book.max_len + 1 {
+            for b in 0..256 {
+                if book.len[b] != len { continue; }
+                let mut code = book.code_text(b as u8);
+                defer code.free();
+                let q = if b == ' ' { '\'' } else { ' ' }; // quote the space
+                println(f"{q:c}{b as u8:c}{q:c}  {freq[b]:>5}  {len:>4}  {code}");
+            }
+        }
+    }
+    if let Some(i) = (0..text.len).position(|i| back.get(i) != text[i]) {
+        return Err(HuffError::Mismatch(i));
+    }
+    let bits = book.len[..].iter().zip(freq[..].iter()).fold(0, |s, (l, n)| s + l * n);
+    let distinct = freq[..].iter().filter(|n| n > 0).count();
+    let n = text.len as f64;
+    let percent = packed.len() as f64 * 100.0 / n;
+    let h = entropy(freq[..], text.len);
+    println(f"{text.len} bytes, {distinct} distinct, longest code {book.max_len} bits");
+    println(f"encoded: {bits} bits = {packed.len()} bytes, {percent:.1}% of the input");
+    println(f"bits per byte: {bits as f64 / n:.4} (entropy {h:.4})");
+    println(f"checksum of the encoding: {checksum(packed.as_slice()):x}; decoded == input");
+    if !table {
+        eprintln(f"count + tree + codes: {(t1 - t0) as f64 / 1e6:>6.2} ms");
+        rate("encode", t2 - t1, n);
+        rate("decode", t3 - t2, n);
+    }
+    Ok(())
+}
+
+fn main() -> Result<(), HuffError> {
+    round_trip("this is an example of a huffman tree", table: true)?;
+    println("");
+    let mut text = generate_text(4 << 20, 2026);
+    defer text.free();
+    println(f"{text.as_slice()[..60]:?}...");
+    round_trip(text.as_slice())?;
+    Ok(())
+}

@@ -1,0 +1,486 @@
+// Arbitrary-precision natural numbers: schoolbook and Karatsuba
+// multiplication, 1000!, and Fibonacci numbers up to F(1000000).
+//
+// A number is a Vec of limbs in base 10^9, least significant first, with
+// no zero limb at the top (zero has no limbs). Base 10^9 makes printing in
+// decimal free (each limb is nine digits) and a limb product, below 10^18,
+// fits a u64 with room for the carry. A product of two numbers is the
+// product of two polynomials in B = 10^9 whose coefficients are the
+// limbs: the schoolbook method is O(n^2) limb products; Karatsuba's
+// splitting does three half-size products instead of four, O(n^1.585).
+//
+//     tachyonc examples/algorithms/bigint/main.tach -o bigint && ./bigint
+//
+// Results go to stdout; the times of the big products to stderr.
+
+import "time.h" as c;
+
+use std::Fmt;
+
+const BASE: u64 = 1_000_000_000;
+
+// Below this many limbs (in the shorter operand), schoolbook is faster.
+const KARATSUBA_MIN: i64 = 96;
+
+// ---------------------------------------------------------------- limbs
+//
+// The kernels work on slices of limbs. A product's slice `r` has room for
+// a.len + b.len limbs and starts zeroed.
+
+// r = a * b (r zeroed), O(a.len * b.len). A limb product is below 10^18
+// and a u64 holds 18 of them, so the rows are added up in u64 columns
+// without carrying, and the carries are propagated once every 16 rows:
+// the inner loop is a multiply and an add.
+fn mul_schoolbook(a: [u32], b: [u32], r: [u32]) {
+    let mut columns = Vec::filled(a.len + b.len, 0u64);
+    defer columns.free();
+    let acc = columns.as_slice();
+    let mut i = 0;
+    while i < a.len {
+        let end = if i + 16 < a.len { i + 16 } else { a.len };
+        for row in i..end {
+            let ai: u64 = a[row];
+            let out = acc[row..row + b.len];
+            for j in 0..b.len { out[j] += ai * b[j]; }
+        }
+        let mut carry: u64 = 0; // each column back below BASE
+        for k in i..acc.len {
+            let cur = acc[k] + carry;
+            acc[k] = cur % BASE;
+            carry = cur / BASE;
+            if carry == 0 && k >= end + b.len { break; }
+        }
+        i = end;
+    }
+    for k in 0..acc.len { r[k] = acc[k] as u32; }
+}
+
+// r[off..] += x; the sum fits in r.
+fn add_at(r: [u32], x: [u32], off: i64) {
+    let mut carry: u32 = 0;
+    let mut k = off;
+    for limb in x {
+        let mut s = r[k] + limb + carry;
+        carry = 0;
+        if s >= BASE as u32 { s -= BASE as u32; carry = 1; }
+        r[k] = s;
+        k += 1;
+    }
+    while carry != 0 {
+        let s = r[k] + 1;
+        if s == BASE as u32 { r[k] = 0; } else { r[k] = s; carry = 0; }
+        k += 1;
+    }
+}
+
+// r -= x, where r >= x.
+fn sub_from(r: [u32], x: [u32]) {
+    let mut borrow: u32 = 0;
+    let mut k = 0;
+    for limb in x {
+        let sub = limb + borrow;
+        if r[k] >= sub { r[k] -= sub; borrow = 0; }
+        else { r[k] = r[k] + BASE as u32 - sub; borrow = 1; }
+        k += 1;
+    }
+    while borrow != 0 {
+        if r[k] > 0 { r[k] -= 1; borrow = 0; } else { r[k] = BASE as u32 - 1; }
+        k += 1;
+    }
+}
+
+// The slice without its zero limbs at the top.
+fn trimmed(x: [u32]) -> [u32] {
+    let mut n = x.len;
+    while n > 0 && x[n - 1] == 0 { n -= 1; }
+    x[..n]
+}
+
+// a + b, as a new Vec of max(a.len, b.len) + 1 limbs.
+fn sum_of(a: [u32], b: [u32]) -> Vec<u32> {
+    let n = if a.len > b.len { a.len } else { b.len };
+    let mut s = Vec::filled(n + 1, 0u32);
+    let out = s.as_slice();
+    add_at(out, a, 0);
+    add_at(out, b, 0);
+    s
+}
+
+// r = a * b (r zeroed), by Karatsuba. With a = a1 B^m + a0 and
+// b = b1 B^m + b0:
+//     a b = z2 B^2m + (p - z2 - z0) B^m + z0
+// where z0 = a0 b0, z2 = a1 b1, p = (a0 + a1)(b0 + b1): three products of
+// half the size.
+fn mul_karatsuba(a: [u32], b: [u32], r: [u32]) {
+    if a.len < b.len { return mul_karatsuba(b, a, r); }
+    if b.len < KARATSUBA_MIN {
+        return mul_schoolbook(a, b, r);
+    }
+    if 2 * b.len <= a.len {
+        // Lopsided: b times each b.len-limb piece of a.
+        let mut part = Vec::filled(2 * b.len, 0u32);
+        defer part.free();
+        let p = part.as_slice();
+        let mut off = 0;
+        while off < a.len {
+            let end = if off + b.len < a.len { off + b.len } else { a.len };
+            for k in 0..p.len { p[k] = 0; }
+            mul_karatsuba(a[off..end], b, p);
+            add_at(r, trimmed(p), off);
+            off = end;
+        }
+        return;
+    }
+    let m = a.len / 2; // b.len > m: both halves are there
+    let (a0, a1) = (a[..m], a[m..]);
+    let (b0, b1) = (b[..m], b[m..]);
+    mul_karatsuba(a0, b0, r[..2 * m]); // z0, in place
+    mul_karatsuba(a1, b1, r[2 * m..]); // z2, in place
+    let mut sa = sum_of(a0, a1);
+    let mut sb = sum_of(b0, b1);
+    let mut prod = Vec::filled(sa.len() + sb.len(), 0u32);
+    defer {
+        sa.free();
+        sb.free();
+        prod.free();
+    }
+    let p = prod.as_slice();
+    mul_karatsuba(sa.as_slice(), sb.as_slice(), p);
+    sub_from(p, r[..2 * m]); // p - z0
+    sub_from(p, r[2 * m..]); // p - z0 - z2 = a0 b1 + a1 b0
+    add_at(r, trimmed(p), m);
+}
+
+// -------------------------------------------------------------- BigUint
+
+// The derived Eq compares the limb Vecs by contents; Clone copies them
+// (a deep copy); Debug shows the limbs.
+#[derive(Eq, Clone, Debug)]
+struct BigUint { limbs: Vec<u32> }
+
+impl BigUint {
+    fn zero() -> BigUint { BigUint { limbs: Vec::new() } }
+
+    // Takes the Vec, dropping zero limbs at the top.
+    fn from_limbs(v: Vec<u32>) -> BigUint {
+        let mut limbs = v;
+        while limbs.len() > 0 && limbs.get(limbs.len() - 1) == 0 { limbs.pop(); }
+        BigUint { limbs: limbs }
+    }
+
+    fn is_zero(self: *BigUint) -> bool { self.limbs.is_empty() }
+
+    // self *= k, in place, for a small k.
+    fn mul_small(self: *BigUint, k: u32) {
+        let s = self.limbs.as_slice();
+        let mut carry: u64 = 0;
+        for i in 0..s.len {
+            let cur = s[i] * k as u64 + carry;
+            s[i] = (cur % BASE) as u32;
+            carry = cur / BASE;
+        }
+        if carry != 0 { self.limbs.push(carry as u32); }
+    }
+
+    // The number of decimal digits (1 for zero).
+    fn digits(self: *BigUint) -> i64 {
+        if self.is_zero() { return 1; }
+        let mut top = self.limbs.get(self.limbs.len() - 1);
+        let mut d = 0;
+        while top > 0 {
+            d += 1;
+            top /= 10;
+        }
+        9 * (self.limbs.len() - 1) + d
+    }
+
+    fn digit_sum(self: *BigUint) -> i64 {
+        self.limbs.iter().map(|limb| {
+            let mut x = limb;
+            let mut s = 0;
+            while x > 0 {
+                s += (x % 10) as i64;
+                x /= 10;
+            }
+            s
+        }).sum()
+    }
+
+    // The schoolbook product, for checking Karatsuba.
+    fn mul_slow(self: *BigUint, other: *BigUint) -> BigUint {
+        let mut r = Vec::filled(self.limbs.len() + other.limbs.len(), 0u32);
+        mul_schoolbook(self.limbs.as_slice(), other.limbs.as_slice(), r.as_slice());
+        BigUint::from_limbs(r)
+    }
+
+    fn free(self: *BigUint) { self.limbs.free(); }
+}
+
+impl From<u64> for BigUint {
+    fn from(x: u64) -> BigUint {
+        let mut limbs: Vec<u32> = Vec::new();
+        let mut x = x;
+        while x > 0 {
+            limbs.push((x % BASE) as u32);
+            x /= BASE;
+        }
+        BigUint { limbs: limbs }
+    }
+}
+
+// Longer is larger; at equal lengths, the first limb that differs from
+// the top decides.
+impl Ord for BigUint {
+    fn cmp(self: *BigUint, other: *BigUint) -> i64 {
+        let (a, b) = (self.limbs.as_slice(), other.limbs.as_slice());
+        if a.len != b.len { return a.len - b.len; }
+        let mut i = a.len - 1;
+        while i >= 0 {
+            if a[i] != b[i] { return a[i] as i64 - b[i] as i64; }
+            i -= 1;
+        }
+        0
+    }
+}
+
+// The operators make a new number and leave their operands as they were:
+// the caller frees all three.
+impl Add for BigUint {
+    fn add(self: BigUint, other: BigUint) -> BigUint {
+        BigUint::from_limbs(sum_of(self.limbs.as_slice(), other.limbs.as_slice()))
+    }
+}
+
+impl Sub for BigUint {
+    // self - other, for self >= other (natural numbers).
+    fn sub(self: BigUint, other: BigUint) -> BigUint {
+        if self < other {
+            unsafe { std::panic(c"BigUint: subtraction below zero"); }
+        }
+        let mut r = self.limbs.clone();
+        sub_from(r.as_slice(), other.limbs.as_slice());
+        BigUint::from_limbs(r)
+    }
+}
+
+impl Mul for BigUint {
+    fn mul(self: BigUint, other: BigUint) -> BigUint {
+        let mut r = Vec::filled(self.limbs.len() + other.limbs.len(), 0u32);
+        mul_karatsuba(self.limbs.as_slice(), other.limbs.as_slice(), r.as_slice());
+        BigUint::from_limbs(r)
+    }
+}
+
+// Decimal: the top limb as it is, every other one as nine digits.
+impl Display for BigUint {
+    fn fmt(self: *BigUint, f: *Fmt) {
+        let s = self.limbs.as_slice();
+        if s.len == 0 {
+            f.str("0");
+            return;
+        }
+        f.write(f"{s[s.len - 1]}");
+        let mut i = s.len - 2;
+        while i >= 0 {
+            f.write(f"{s[i]:09}");
+            i -= 1;
+        }
+    }
+}
+
+// ----------------------------------------------------------- algorithms
+
+// n!, one small multiplication at a time.
+fn factorial(n: u32) -> BigUint {
+    let mut f: BigUint = 1u64.into();
+    for k in 2..=n { f.mul_small(k); }
+    f
+}
+
+// lo * (lo + 1) * ... * hi, splitting the range in halves: the factors
+// stay balanced, so the big products go through Karatsuba.
+fn product(lo: u64, hi: u64) -> BigUint {
+    if hi - lo < 8 {
+        let mut p = BigUint::from(lo);
+        for k in lo + 1..=hi { p.mul_small(k as u32); }
+        return p;
+    }
+    let mid = (lo + hi) / 2;
+    let mut left = product(lo, mid);
+    let mut right = product(mid + 1, hi);
+    defer {
+        left.free();
+        right.free();
+    }
+    left * right
+}
+
+// F(n) by adding: n additions.
+fn fib_iterative(n: i64) -> BigUint {
+    let mut a = BigUint::zero();
+    let mut b: BigUint = 1u64.into();
+    for _ in 0..n {
+        let next = a + b;
+        a.free();
+        a = b;
+        b = next;
+    }
+    b.free();
+    a
+}
+
+// F(n) by fast doubling, O(log n) multiplications:
+//     F(2k) = F(k) (2 F(k+1) - F(k)),  F(2k+1) = F(k)^2 + F(k+1)^2
+fn fib_doubling(n: i64) -> BigUint {
+    let mut a = BigUint::zero(); // F(k), k = 0
+    let mut b: BigUint = 1u64.into(); // F(k + 1)
+    let mut bit = 62;
+    while bit >= 0 && (n >> bit) & 1 == 0 { bit -= 1; }
+    while bit >= 0 {
+        let mut twice = b + b;
+        let mut diff = twice - a;
+        let mut sq_a = a * a;
+        let mut sq_b = b * b;
+        let even = a * diff; // F(2k)
+        let odd = sq_a + sq_b; // F(2k + 1)
+        twice.free();
+        diff.free();
+        sq_a.free();
+        sq_b.free();
+        a.free();
+        b.free();
+        if (n >> bit) & 1 == 1 {
+            a = odd; // k becomes 2k + 1
+            b = even + odd;
+            even.free();
+        } else {
+            a = even; // k becomes 2k
+            b = odd;
+        }
+        bit -= 1;
+    }
+    b.free();
+    a
+}
+
+// ---------------------------------------------------------------- input
+
+// xorshift64*: a small, fast, seeded generator of 64-bit values.
+struct Rng { state: u64 }
+
+impl Rng {
+    fn new(seed: u64) -> Rng { Rng { state: seed | 1 } }
+
+    fn next(self: *Rng) -> u64 {
+        let mut x = self.state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.state = x;
+        x * 0x2545F4914F6CDD1D
+    }
+
+    // A number of n random limbs.
+    fn big(self: *Rng, n: i64) -> BigUint {
+        let mut v: Vec<u32> = Vec::with_capacity(n);
+        for _ in 0..n { v.push(((self.next() >> 32) % BASE) as u32); }
+        BigUint::from_limbs(v)
+    }
+}
+
+// --------------------------------------------------------------- output
+
+fn now_ns() -> i64 {
+    let mut ts = c::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { c::timespec_get(&ts, c::TIME_UTC); }
+    ts.tv_sec * 1_000_000_000 + ts.tv_nsec
+}
+
+// Milliseconds between two now_ns() readings.
+fn ms(t0: i64, t1: i64) -> f64 { (t1 - t0) as f64 / 1e6 }
+
+// A one-line summary: the number of digits, the first and last ones, the
+// digit sum.
+fn describe(name: [u8], x: *BigUint) {
+    let mut text = format(f"{x}");
+    defer text.free();
+    let s = text.as_slice();
+    if s.len <= 60 {
+        println(f"{name} = {s}");
+    } else {
+        println(f"{name} = {s[..20]}...{s[s.len - 20..]}");
+    }
+    println(f"    {x.digits()} digits, digit sum {x.digit_sum()}");
+}
+
+fn main() -> i32 {
+    // Small ones, and what a number looks like inside.
+    let mut f30 = factorial(30);
+    defer f30.free();
+    describe("30!", &f30);
+    println(f"    as limbs: {f30:?}");
+
+    // 1000!, two ways.
+    let mut f1000 = factorial(1000);
+    defer f1000.free();
+    describe("1000!", &f1000);
+    let mut text = format(f"{f1000}");
+    defer text.free();
+    let zeros = text.as_slice().iter().fold(0, |n, d| if d == '0' { n + 1 } else { 0 });
+    println(f"    {zeros} trailing zeros");
+    let mut tree = product(1, 1000);
+    defer tree.free();
+    println(f"    product tree (Karatsuba) == one at a time: {tree == f1000}");
+
+    // Fibonacci numbers, two ways.
+    let mut fib_a = fib_iterative(10_000);
+    defer fib_a.free();
+    let mut fib_b = fib_doubling(10_000);
+    defer fib_b.free();
+    describe("F(10000)", &fib_a);
+    println(f"    fast doubling == additions: {fib_a == fib_b}");
+    let t0 = now_ns();
+    let mut big = fib_doubling(1_000_000);
+    let t1 = now_ns();
+    defer big.free();
+    describe("F(1000000)", &big);
+    eprintln(f"F(1000000) by fast doubling: {ms(t0, t1):.1} ms");
+
+    // Karatsuba against schoolbook on random operands.
+    let mut rng = Rng::new(2026);
+    let mut agree = 0;
+    let trials = 30;
+    for _ in 0..trials {
+        let mut x = rng.big(1 + (rng.next() % 600) as i64);
+        let mut y = rng.big(1 + (rng.next() % 600) as i64);
+        let mut fast = x * y;
+        let mut slow = x.mul_slow(&y);
+        if fast == slow { agree += 1; }
+        x.free();
+        y.free();
+        fast.free();
+        slow.free();
+    }
+    println(f"karatsuba == schoolbook on {agree} of {trials} random pairs");
+
+    let n = 5000;
+    let mut x = rng.big(n);
+    let mut y = rng.big(n);
+    defer {
+        x.free();
+        y.free();
+    }
+    let t2 = now_ns();
+    let mut slow = x.mul_slow(&y);
+    let t3 = now_ns();
+    let mut fast = x * y;
+    let t4 = now_ns();
+    defer {
+        slow.free();
+        fast.free();
+    }
+    println(
+        f"{n} x {n} limbs ({9 * n} digits each): equal {slow == fast}, digit sum {fast.digit_sum()}");
+    eprintln(f"{n} x {n} limbs: schoolbook {ms(t2, t3):.1} ms, karatsuba {ms(t3, t4):.1} ms");
+    0
+}
