@@ -128,8 +128,19 @@ fn parse_op(w: &[&str], labels: &[Label]) -> Result<Op, String> {
         return Ok(Op::Jz(jump_target(w[1], labels)?));
     }
     let plain = [
-        Op::Pop, Op::Dup, Op::Swap, Op::Over, Op::Add, Op::Sub, Op::Mul, Op::Div,
-        Op::Mod, Op::Lt, Op::Eq, Op::Print, Op::Halt,
+        Op::Pop,
+        Op::Dup,
+        Op::Swap,
+        Op::Over,
+        Op::Add,
+        Op::Sub,
+        Op::Mul,
+        Op::Div,
+        Op::Mod,
+        Op::Lt,
+        Op::Eq,
+        Op::Print,
+        Op::Halt,
     ];
     for op in plain {
         if crate::op::mnemonic(op) == name {
@@ -164,9 +175,15 @@ pub fn parse(text: &str) -> Result<Program, ParseError> {
                 None
             };
             if let Some(message) = error {
-                return Err(ParseError { line: i as i64 + 1, message: message });
+                return Err(ParseError {
+                    line: i as i64 + 1,
+                    message: message,
+                });
             }
-            labels.push(Label { name: name.to_string(), pc: count });
+            labels.push(Label {
+                name: name.to_string(),
+                pc: count,
+            });
         } else {
             count += 1;
         }
@@ -179,8 +196,16 @@ pub fn parse(text: &str) -> Result<Program, ParseError> {
         }
         match parse_op(&w, &labels) {
             Ok(op) => ops.push(op),
-            Err(message) => return Err(ParseError { line: i as i64 + 1, message: message }),
+            Err(message) => {
+                return Err(ParseError {
+                    line: i as i64 + 1,
+                    message: message,
+                })
+            }
         }
     }
-    Ok(Program { ops: ops, list: list })
+    Ok(Program {
+        ops: ops,
+        list: list,
+    })
 }

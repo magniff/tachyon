@@ -248,7 +248,11 @@ pub fn parse(lexed: Lexed) -> Result<Ast, i64> {
         top_first: 0,
         top_count: 0,
     };
-    let mut p = Parser { tokens: lexed.tokens, pos: 0, ast: ast };
+    let mut p = Parser {
+        tokens: lexed.tokens,
+        pos: 0,
+        ast: ast,
+    };
     let mut items: Vec<i64> = Vec::new();
     while p.peek() != TokenKind::End {
         let s = p.stmt()?;

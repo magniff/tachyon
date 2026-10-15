@@ -2,8 +2,11 @@
 
 The language, taught by the compiler that implements it (0.13), for a
 reader who has never seen tachyon: `tachyonc guide` prints the core
-guide (about 5k tokens), `tachyonc guide TOPIC` one topic, `--list` the
-topics with their sizes, `--all` everything; (0.15) `--find WORDS`
+guide (about 2k tokens, 0.17: Rust habits as paired lines, std's most
+used items, the first errors, the loop), `tachyonc guide TOPIC` one
+topic, `--list` the topics with their sizes, `--all` everything,
+`--full` the long form (topic `language`, the core of 0.13-0.16) with
+std's API in it; (0.15) `--find WORDS`
 the paragraphs about some words, `TOPIC#SECTION` one section, `--budget
 N` a cut to about N tokens.
 
@@ -12,7 +15,8 @@ The text is `compiler/guide/*.md` (ASCII, in the order of
 from it, as `compiler/std/embed.sh` makes `front/stdsrc.tach` from std,
 so a compiler's guide is its own version's. Run it after changing the
 text. A line `@STD-API@` in a topic becomes std's API and `@TOPICS@` the
-list of topics, when the topic is printed.
+list of topics, when the topic is printed; (0.17) `@TOPIC-NAMES@` their
+names on one line, and `@STD-API-FULL@` std's API in `--full` only.
 
 | module | |
 |---|---|
@@ -26,7 +30,8 @@ list of topics, when the topic is printed.
 `main`), runs it against the `out` block after it (with the `in` block
 as stdin), expects each `err` block's errors, checks the std section
 against the compiler's item index (`query items std`), the core guide's
-budget (28 KB, about 7k tokens) and that the embedded text is fresh.
+budget (10 KB, about 2.5k tokens; 0.17, it was 28 KB), `--full`, and
+that the embedded text is fresh.
 `tests/guide/run.sh -f compiler/guide/NAME.md` checks one topic's
 source while it is written. It also checks --find, sections, --budget,
 `explain WORDS`, `--help` on every command and `tachyonc try`.

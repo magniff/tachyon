@@ -30,7 +30,11 @@ fn encode(data: &[u8], out: &mut Vec<u8>) {
         let group = (b0 << 16) | (b1 << 8) | b2;
         out.push(ALPHABET[(group >> 18) & 63]);
         out.push(ALPHABET[(group >> 12) & 63]);
-        out.push(if rest > 1 { ALPHABET[(group >> 6) & 63] } else { b'=' });
+        out.push(if rest > 1 {
+            ALPHABET[(group >> 6) & 63]
+        } else {
+            b'='
+        });
         out.push(if rest > 2 { ALPHABET[group & 63] } else { b'=' });
         i += 3;
     }

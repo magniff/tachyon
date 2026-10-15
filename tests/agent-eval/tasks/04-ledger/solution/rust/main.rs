@@ -140,7 +140,14 @@ fn execute<'a>(
             if accounts.contains_key(name) {
                 return Err("error: account exists");
             }
-            accounts.insert(name, Account { name, balance: 0, txns: 0 });
+            accounts.insert(
+                name,
+                Account {
+                    name,
+                    balance: 0,
+                    txns: 0,
+                },
+            );
         }
         Command::Balance(name) => match accounts.get(name) {
             Some(a) => push_account(out, a),

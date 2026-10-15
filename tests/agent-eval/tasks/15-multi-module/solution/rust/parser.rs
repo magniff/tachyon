@@ -269,11 +269,23 @@ impl<'a> Parser<'a> {
             return Err(self.fail());
         }
         let nodes = std::mem::take(&mut self.nodes);
-        Ok(Query { items, table, nodes, cond, group, order, limit })
+        Ok(Query {
+            items,
+            table,
+            nodes,
+            cond,
+            group,
+            order,
+            limit,
+        })
     }
 }
 
 pub fn parse(toks: &[Token]) -> Result<Query, Vec<u8>> {
-    let mut p = Parser { toks, pos: 0, nodes: Vec::new() };
+    let mut p = Parser {
+        toks,
+        pos: 0,
+        nodes: Vec::new(),
+    };
     p.query()
 }

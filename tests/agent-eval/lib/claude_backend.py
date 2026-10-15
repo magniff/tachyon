@@ -40,7 +40,9 @@ TOOLS = "Read,Write,Edit,Glob,Grep,Bash"
 # Commands a programmer runs; Bash runs in the sandbox anyway, and a
 # command outside this list is still auto-allowed there unless Claude Code
 # itself asks for approval (shell variables, or commands it does not know,
-# such as `tachyonc edit`): the list covers those.
+# such as `tachyonc edit`): the list covers those. Claude Code splits a
+# compound line at && || ; | and newlines and wants every part allowed,
+# so every command an agent chains must be here.
 ALLOW = ["tachyonc", "rustc", "./prog", "prog", "cat", "ls", "echo", "printf",
          "head", "tail", "grep", "sed", "awk", "diff", "cmp", "wc", "sort",
          "uniq", "tr", "cut", "mkdir", "cp", "mv", "rm", "touch", "find",
@@ -51,51 +53,107 @@ ALLOW = ["tachyonc", "rustc", "./prog", "prog", "cat", "ls", "echo", "printf",
          "target/tachyonc", "target/tools/tachyonc", "./target/tachyonc",
          "bootstrap/eval-build.sh", "./bootstrap/eval-build.sh", "tests/run.sh",
          "./tests/run.sh", "tools/agent-feedback", "cc", "xargs", "cmp", "basename",
-         "dirname", "date", "sleep"]
+         "dirname", "date", "sleep",
+         # (0.17) widened from the 0.16 round's denials (461 of 7,872 calls): what agents chained
+         # with the commands above (every part of a chain must be allowed);
+         # all of it runs in the sandbox (writes only in the workspace and
+         # temp, no network)
+         "./target/tools/tachyonc", "compiler/std/embed.sh", "./compiler/std/embed.sh",
+         "compiler/guide/embed.sh", "./compiler/guide/embed.sh", "tools/agent-feedback",
+         "perl", "patch", "paste", "join", "comm", "column", "fold", "rev", "split",
+         "nl", "expr", "bc", "tar", "gzip", "gunzip", "shasum", "md5", "base64",
+         "hexdump", "strings", "nm", "otool", "realpath", "readlink", "type",
+         "command", "ulimit", "nproc", "sysctl", "clang", "gcc", "make", "zsh",
+         "export", "set", "[", "/usr/bin/time", "mktemp", "jot", "yes", "less",
+         "ln", "rmdir",
+         "printenv"]
+# Programs the agent built in its workspace (`./prog_dbg`, `./t0`,
+# `./new_prog`, a script `./gen.py`): any `./NAME`, in the sandbox.
+ALLOW_PATTERNS = ["Bash(./*)",
+                  # (0.17) the one form the self-check still saw refused
+                  # (2026-10-15, Haiku): a loop. Unverified whether a rule
+                  # can pass it; the next self-check measures it.
+                  "Bash(for *)", "Bash(while *)", "Bash(until *)"]
 
 
 # "allowlist" (the default): acceptEdits + the sandbox's auto-allow + ALLOW;
 # Claude Code still asks (so denies) before command lines it cannot check
 # statically: shell variables, `$?`, subshells. "bypass": no prompts at
 # all; the sandbox still confines Bash, deny rules still hold (and an Edit
-# deny rule for the home directory keeps the file tools out of it).
+# deny rule for the home directory keeps the file tools out of it). (0.17)
+# The rounds use the allowlist; bypass is not used (a machine safety check
+# refuses it), and the denials are measured instead (lib/anatomy.py, the
+# self-check's probes).
 PERMS = "allowlist"
 
 
-def hook_command(script):
+def sandbox_tmp_dirs():
+    """Claude Code's sandbox temp directory (/tmp/claude-UID, where Bash's
+    $TMPDIR points inside the sandbox) under both its spellings: the file
+    tools need an Edit rule to write there (the 0.16 round: 60-odd Write
+    calls to /tmp/claude-501/... denied), as Bash already may."""
+    d = "/tmp/claude-%d" % os.getuid()
+    return [d, "/private" + d]
+
+
+def edit_allow_rules():
+    """(0.17) Edit allow rules (they cover Write and MultiEdit too) for the
+    sandbox's temp directory."""
+    return ["Edit(/%s/**)" % d for d in sandbox_tmp_dirs()]
+
+
+def hook_command(script, tee=None):
+    """A hook's command line; with `tee` (lib/hook-tee.py's copy) the hook
+    runs under the wrapper that logs what it returned."""
+    if tee:
+        return {"type": "command", "command": "/usr/bin/python3 -I %s %s"
+                % (shlex.quote(tee), shlex.quote(script))}
     return {"type": "command", "command": "/usr/bin/python3 -I " + shlex.quote(script)}
 
 
-def hooks_for(check_hook=None, query_hook=None):
-    """The `hooks` of --settings: (--check-hook, compiler-tools) `tachyonc
-    check` after every change to a .tach file, its errors added to the
-    tool result; (compiler-tools) the query-first hook before and after
-    tool calls, as .claude/settings.json registers it in the repository.
-    Hooks run outside the sandbox; the scripts are copies outside the
-    repository (lib/common.install_hooks)."""
+def _tee_entry(h, tee):
+    if not tee or h.get("type", "command") != "command" or not h.get("command"):
+        return h
+    return dict(h, command="/usr/bin/python3 -I %s --sh %s"
+                % (shlex.quote(tee), shlex.quote(h["command"])))
+
+
+def hooks_for(check_hook=None, query_hook=None, extra=None, tee=None):
+    """The `hooks` of --settings: (--check-hook, +hook, compiler-tools)
+    `tachyonc check` after every change to a .tach file, its errors added
+    to the tool result; (compiler-tools) the query-first hook before and
+    after tool calls, as .claude/settings.json registers it in the
+    repository; (0.17, +test) `extra`: the hooks of settings-eval.json
+    instead of the check hook. Hooks run outside the sandbox; the scripts
+    are copies outside the repository (lib/common.install_hooks). With
+    `tee`, every hook runs under lib/hook-tee.py (its output logged)."""
     pre, post = [], []
     if query_hook:
         pre.append({"matcher": "Bash|Read|Grep|Edit|Write|MultiEdit",
-                    "hooks": [hook_command(query_hook)]})
-        post.append({"matcher": "Bash", "hooks": [hook_command(query_hook)]})
-    if check_hook:
+                    "hooks": [hook_command(query_hook, tee)]})
+        post.append({"matcher": "Bash", "hooks": [hook_command(query_hook, tee)]})
+    if check_hook and not extra:
         post.append({"matcher": "Write|Edit|MultiEdit|Bash",
-                     "hooks": [hook_command(check_hook)]})
+                     "hooks": [hook_command(check_hook, tee)]})
     hooks = {}
     if pre:
         hooks["PreToolUse"] = pre
     if post:
         hooks["PostToolUse"] = post
+    for ev, entries in (extra or {}).items():
+        for e in entries:
+            hooks.setdefault(ev, []).append(
+                dict(e, hooks=[_tee_entry(h, tee) for h in e.get("hooks") or []]))
     return hooks
 
 
-def settings(deny_read, check_hook=None, query_hook=None):
+def settings(deny_read, check_hook=None, query_hook=None, extra_hooks=None, tee=None):
     home = os.path.realpath(os.path.expanduser("~"))
     deny = ["Read(/%s/**)" % p for p in deny_read]
     if PERMS == "bypass":
         deny.append("Edit(/%s/**)" % home)
     extra = {}
-    hooks = hooks_for(check_hook, query_hook)
+    hooks = hooks_for(check_hook, query_hook, extra_hooks, tee)
     if hooks:
         extra["hooks"] = hooks
     return {
@@ -107,13 +165,14 @@ def settings(deny_read, check_hook=None, query_hook=None):
             "filesystem": {"denyRead": deny_read},
         },
         "permissions": {
-            "allow": ["Bash(%s:*)" % c for c in ALLOW],
+            "allow": (["Bash(%s:*)" % c for c in dict.fromkeys(ALLOW)] + ALLOW_PATTERNS
+                      + edit_allow_rules()),
             "deny": deny,
         },
     }
 
 
-def command(prompt, model, check_hook=None, query_hook=None):
+def command(prompt, model, check_hook=None, query_hook=None, extra_hooks=None, tee=None):
     claude = shutil.which("claude")
     if not claude:
         raise SystemExit("claude not found on PATH")
@@ -122,7 +181,8 @@ def command(prompt, model, check_hook=None, query_hook=None):
         "--model", model,
         "--output-format", "stream-json", "--verbose",
         "--setting-sources", "",
-        "--settings", json.dumps(settings(private_paths(), check_hook, query_hook)),
+        "--settings", json.dumps(settings(private_paths(), check_hook, query_hook,
+                                          extra_hooks, tee)),
         "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
         "--tools", TOOLS,
         "--permission-mode", "bypassPermissions" if PERMS == "bypass" else "acceptEdits",
@@ -140,11 +200,14 @@ def env(bin_dir):
     return e
 
 
-def run(prompt, ws, bin_dir, model, timeout_s, rdir, check_hook=None, query_hook=None):
+def run(prompt, ws, bin_dir, model, timeout_s, rdir, check_hook=None, query_hook=None,
+        extra_hooks=None, tee=None):
     """Runs the agent in `ws`; the stream goes to rdir/transcript.jsonl.
     Returns the agent's half of result.json. check_hook: (the hook
     script, its log) for --check-hook and compiler-tools, or None;
-    query_hook: the query-first hook script (compiler-tools), or None."""
+    query_hook: the query-first hook script (compiler-tools), or None;
+    (0.17) extra_hooks: settings-eval.json's hooks (+test); tee: the
+    hook-tee.py copy, whose log is rdir/hook-output.jsonl."""
     tpath = os.path.join(rdir, "transcript.jsonl")
     epath = os.path.join(rdir, "agent.stderr")
     t0 = time.time()
@@ -153,7 +216,9 @@ def run(prompt, ws, bin_dir, model, timeout_s, rdir, check_hook=None, query_hook
         e = env(bin_dir)
         if check_hook:
             e["TACHYON_CHECK_HOOK_LOG"] = check_hook[1]
-        argv = command(prompt, model, check_hook and check_hook[0], query_hook)
+        if tee:
+            e["EVAL_HOOK_OUTPUT_LOG"] = os.path.join(rdir, "hook-output.jsonl")
+        argv = command(prompt, model, check_hook and check_hook[0], query_hook, extra_hooks, tee)
         with open(os.path.join(rdir, "command.json"), "w") as fh:
             json.dump(argv[:2] + ["(prompt.md)"] + argv[3:], fh, indent=1)
         p = subprocess.Popen(argv, cwd=ws, env=e,
@@ -180,6 +245,7 @@ def run(prompt, ws, bin_dir, model, timeout_s, rdir, check_hook=None, query_hook
 
 def parse_stream(path):
     init, result = None, None
+    results = []
     usage_by_msg = {}
     calls = []
     denials = []
@@ -206,23 +272,34 @@ def parse_stream(path):
                     if c.get("type") == "tool_use":
                         calls.append((c.get("name"), c.get("input") or {}))
             elif t == "result":
+                # (0.16) a session can end more than once: a background task
+                # finishing after the answer starts another turn and another
+                # result. num_turns, usage and permission_denials are per
+                # result (summed below); total_cost_usd is cumulative.
                 result = d
+                results.append(d)
     kinds = Counter()
     for name, inp in calls:
         kinds.update(classify_call(name, inp))
-    if result and result.get("usage"):
-        u = result["usage"]
+    if results and all(r.get("usage") for r in results):
+        u = Counter()
+        for r in results:
+            for k in ("input_tokens", "output_tokens", "cache_read_input_tokens",
+                      "cache_creation_input_tokens"):
+                u[k] += r["usage"].get(k) or 0
     else:  # killed: add up the messages seen
         u = Counter()
         for mu in usage_by_msg.values():
             for k in ("input_tokens", "output_tokens", "cache_read_input_tokens",
                       "cache_creation_input_tokens"):
                 u[k] += mu.get(k) or 0
+    result_denials = [x for r in results for x in r.get("permission_denials") or []]
     fresh = u.get("input_tokens") or 0
     cread = u.get("cache_read_input_tokens") or 0
     cwrite = u.get("cache_creation_input_tokens") or 0
     res = {
-        "turns": (result or {}).get("num_turns", len(usage_by_msg)),
+        "turns": (sum(r.get("num_turns") or 0 for r in results) if results
+                  else len(usage_by_msg)),
         "tool_calls": len(calls),
         "tool_calls_by_kind": dict(sorted(kinds.items())),
         # every prompt token the model read: fresh + cache writes + cache reads
@@ -231,13 +308,14 @@ def parse_stream(path):
         "cache_read_tokens": cread,
         "cache_creation_tokens": cwrite,
         "cost_usd": (result or {}).get("total_cost_usd"),
-        "permission_denials": len((result or {}).get("permission_denials") or denials),
+        "permission_denials": len(result_denials or denials),
         "permission_denied": [
-            json.dumps(x.get("tool_input"))[:300]
-            for x in (result or {}).get("permission_denials") or []] or
+            json.dumps(x.get("tool_input"))[:300] for x in result_denials] or
             [x["tool"] for x in denials],
         "error": None,
     }
+    if len(results) > 1:
+        res["results"] = len(results)
     if hook_events:
         res["hook_events"] = dict(hook_events)
     if init:

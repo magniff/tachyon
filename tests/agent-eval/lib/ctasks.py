@@ -33,6 +33,7 @@ starter's compiler in `target/tachyonc` (and `target/tools/tachyonc` for
 compiler-tools), AGENTS.md for the condition, CLAUDE.md and .claude/
 removed (the prompt carries AGENTS.md), `git init` with one commit."""
 
+import json
 import os
 import re
 import shutil
@@ -250,14 +251,24 @@ line), compiling programs, `tests/run.sh`.
 def agents_md(tree, cond):
     """AGENTS.md for the condition: as it is for compiler-tools; for
     compiler-plain, without the tools table ("Read source through the
-    compiler", the hooks and the feedback line): file tools and the shell."""
+    compiler", the hooks and the feedback line): file tools and the shell;
+    (0.17) for compiler-tools-core, that section replaced by this
+    checkout's (the tiered eight-row core of 0.17's AGENTS.md)."""
+    from lib.conds import Cond
+    c = Cond(cond)
     with open(os.path.join(tree, "AGENTS.md")) as fh:
         text = fh.read()
-    if cond == "compiler-tools":
+    if c.compiler == "full":
         return text
     m = re.search(r"^## Read source through the compiler\n.*?(?=^## )", text, re.S | re.M)
     if not m:
         raise RuntimeError("AGENTS.md has no '## Read source through the compiler' section")
+    if c.compiler == "core":
+        core = tools_section(os.path.join(REPO_ROOT, "AGENTS.md"))
+        if core.strip() == text[m.start():m.end()].strip():
+            raise RuntimeError("compiler-tools-core: this checkout's AGENTS.md tools section "
+                               "is the base's: the condition would be compiler-tools")
+        return text[:m.start()] + core + text[m.end():]
     text = text[:m.start()] + PLAIN_READ + "\n" + text[m.end():]
     # the inner loop's mentions of the hook and the tools binary
     text = re.sub(r"the check hook's errors \(or (`target/tachyonc check`)\s+when the hook is "
@@ -271,6 +282,17 @@ def agents_md(tree, cond):
     return text
 
 
+def tools_section(path):
+    """(0.17) The "## Read source through the compiler" section of an
+    AGENTS.md (up to the next `## `)."""
+    with open(path) as fh:
+        text = fh.read()
+    m = re.search(r"^## Read source through the compiler\n.*?(?=^## )", text, re.S | re.M)
+    if not m:
+        raise RuntimeError("%s has no '## Read source through the compiler' section" % path)
+    return m.group(0)
+
+
 # What the compiler-plain AGENTS.md must not mention.
 PLAIN_FORBIDDEN = ("tachyonc query", "query show", "edit patch", "tachyonc refactor", "hook",
                    "target/tools/tachyonc", "agent-feedback", "no-query")
@@ -278,8 +300,9 @@ PLAIN_FORBIDDEN = ("tachyonc query", "query show", "edit patch", "tachyonc refac
 
 # ---------------------------------------------------------------- workspace
 
-def setup_workspace(task, cond, sha, ws, builder, starter_tree, env):
+def setup_workspace(task, cond, sha, ws, builder, starter_tree, env, tools_tachyonc=None):
     """The agent's copy of the repository (see the module's comment)."""
+    from lib.conds import Cond
     make_tree(task, sha, ws)
     for gone in ("CLAUDE.md", ".claude"):
         p = os.path.join(ws, gone)
@@ -294,9 +317,11 @@ def setup_workspace(task, cond, sha, ws, builder, starter_tree, env):
     os.makedirs(os.path.join(tgt, "builder"), exist_ok=True)
     shutil.copy2(builder, os.path.join(tgt, "builder", "tachyonc"))
     shutil.copy2(os.path.join(starter_tree, "target", "tachyonc"), os.path.join(tgt, "tachyonc"))
-    if cond == "compiler-tools":
+    if Cond(cond).query_hook:
+        # the tools binary: the starter's, or (0.17, --tools-tachyonc) a
+        # newer one, so that new tools can be measured on the same tasks
         os.makedirs(os.path.join(tgt, "tools"), exist_ok=True)
-        shutil.copy2(os.path.join(starter_tree, "target", "tachyonc"),
+        shutil.copy2(tools_tachyonc or os.path.join(starter_tree, "target", "tachyonc"),
                      os.path.join(tgt, "tools", "tachyonc"))
     e = dict(env, GIT_AUTHOR_NAME="eval", GIT_AUTHOR_EMAIL="eval@localhost",
              GIT_COMMITTER_NAME="eval", GIT_COMMITTER_EMAIL="eval@localhost")
@@ -310,7 +335,7 @@ def setup_workspace(task, cond, sha, ws, builder, starter_tree, env):
     subprocess.run(["git", "add", "-A"], cwd=ws, env=e, check=True, capture_output=True)
     subprocess.run(["git", "commit", "-q", "-m", "starter"], cwd=ws, env=e, check=True,
                    capture_output=True)
-    if cond == "compiler-tools":
+    if Cond(cond).query_hook:
         # the query-first hook enforces once the compiler answers queries
         open(os.path.join(ws, ".git", "agent-query-ready"), "w").close()
 
@@ -377,6 +402,11 @@ def grade(task, src, scratch, builder, starter_compiler):
                 entry["note"] = "no cases match"
             elif rc is None:
                 entry["note"] = "timeout"
+            elif rc != 0 and not totals:
+                # tests/run.sh stopped before running a case (a stale
+                # generated file, a missing tool): its first lines say why
+                entry["note"] = "stopped before the cases"
+                entry["head"] = "\n".join(text.strip().splitlines()[:8])[:800]
             g["suite"].append(entry)
             steps.append(entry["ok"])
         if task.same_output:
@@ -432,7 +462,7 @@ def check_ctask(task, base_override, builder_override, root):
         st = built_tree(task, sha, builder, root)
     except (RuntimeError, subprocess.CalledProcessError) as e:
         return ["starter: %s" % e], notes
-    for cond in COMPILER_CONDS:
+    for cond in COMPILER_CONDS + ("compiler-tools-core", "compiler-tools-core+test"):
         try:
             agents_md(st, cond)
         except RuntimeError as e:
@@ -463,9 +493,130 @@ def summary(g):
     for s in g["suite"]:
         parts.append("%s %s%s" % (s["filter"], "ok" if s["ok"] else "FAIL",
                                   "" if s["ok"] else " " + ",".join(s["fails"][:3])
-                                  + (" (" + s["note"] + ")" if s.get("note") else "")))
+                                  + (" (" + s["note"] + ")" if s.get("note") else "")
+                                  + (": " + s["head"].splitlines()[0][:120]
+                                     if s.get("head") else "")))
     if g["same_output_ok"] is not None:
         parts.append("same-output " + ("ok" if g["same_output_ok"] else "DIFFERS"))
     if g["check_ok"] is not None:
         parts.append("grade.sh " + ("ok" if g["check_ok"] else "FAIL: " + g["check_msg"][-200:]))
     return "; ".join(parts)
+
+
+# ---------------------------------------------------------------- regrade
+
+def regrade_main(args):
+    """run.py regrade RUNDIR...: grades finished compiler-task runs again
+    from what they kept, without the agent: the starter tree (built, cached
+    under --ws-root) with the run's changes.patch applied, graded as `run`
+    grades it. grade.json is replaced and result.json's grading fields are
+    updated (the old ones kept as `regraded_from`). --only-stopped picks the
+    runs where a suite filter stopped before running any case."""
+    from lib.common import load_tasks, write_json
+    tasks = {t.id: t for t in load_tasks(None, None, "compiler")}
+    ws_root = os.path.abspath(args.ws_root or os.path.join(
+        os.environ.get("TMPDIR", "/tmp"), "tachyon-eval", "regrade"))
+    os.makedirs(ws_root, exist_ok=True)
+    runs, pruns = [], []
+    for top in args.rundirs:
+        for root, _, files in os.walk(top):
+            if "result.json" in files and "changes.patch" in files:
+                runs.append(root)
+            elif "result.json" in files and "workspace.tar.gz" in files:
+                pruns.append(root)
+    if pruns:
+        regrade_programs(args, sorted(pruns), ws_root)
+    infos = {}
+    n = 0
+    for rdir in sorted(runs):
+        with open(os.path.join(rdir, "result.json")) as fh:
+            res = json.load(fh)
+        task = tasks.get(res["task"])
+        if not task or res.get("lang") != "compiler":
+            continue
+        gpath = os.path.join(rdir, "grade.json")
+        old = json.load(open(gpath)) if os.path.exists(gpath) else {}
+        if args.only_stopped and not any(
+                not s.get("ok") and s.get("failed") is None and s.get("note") != "timeout"
+                for s in old.get("suite", [])):
+            continue
+        if task.id not in infos:
+            sha = res.get("base_commit") or resolve_base(task)[1]
+            builder = builder_for(sha, args.builder)
+            infos[task.id] = (sha, builder, built_tree(task, sha, builder, ws_root))
+        sha, builder, st = infos[task.id]
+        tree = os.path.join(ws_root, "regrade-tree")
+        if os.path.exists(tree):
+            shutil.rmtree(tree)
+        copy_tree(st, tree, skip=("target",))
+        patch = os.path.join(rdir, "changes.patch")
+        if os.path.getsize(patch):
+            r = subprocess.run(["git", "apply", "--binary", "--whitespace=nowarn",
+                                os.path.abspath(patch)], cwd=tree, capture_output=True,
+                               text=True)
+            if r.returncode != 0:
+                print("skip %s: changes.patch does not apply: %s" % (rdir, r.stderr.strip()[:200]))
+                continue
+        g = grade(task, tree, os.path.join(ws_root, "regrade-grade"), builder,
+                  os.path.join(st, "target", "tachyonc"))
+        write_json(gpath, g)
+        prev = {k: res.get(k) for k in ("success", "tests_passed", "tests_total", "build_ok",
+                                         "check_ok", "same_output_ok", "grade_summary")}
+        res.update({"success": g["success"], "tests_passed": g["tests_passed"],
+                    "tests_total": g["tests_total"], "build_ok": g["build_ok"],
+                    "check_ok": g.get("check_ok"), "same_output_ok": g.get("same_output_ok"),
+                    "grade_summary": summary(g), "regraded_from": prev})
+        write_json(os.path.join(rdir, "result.json"), res)
+        n += 1
+        print("%s %s -> %s: %s" % (rdir, "OK" if prev["success"] else "FAIL",
+                                   "OK" if g["success"] else "FAIL", res["grade_summary"]))
+    print("regraded %d run(s)" % n)
+    return 0
+
+
+def regrade_programs(args, runs, ws_root):
+    """Program-task runs: the kept workspace.tar.gz graded again (build,
+    hidden tests, check.sh) with the compiler under test (--tachyonc), as
+    `run` grades it; --tasks, --only-failed and --only-check-failed pick."""
+    import tarfile
+    from lib.common import load_tasks, write_json
+    from lib.grade import grade_dir, prepare_bins
+    tasks = {t.id: t for t in load_tasks(None, None, "programs")}
+    want = set(filter(None, (args.tasks or "").split(",")))
+    bins = prepare_bins(ws_root, os.path.abspath(args.tachyonc))
+    n = 0
+    for rdir in runs:
+        with open(os.path.join(rdir, "result.json")) as fh:
+            res = json.load(fh)
+        task = tasks.get(res["task"])
+        if not task or (want and task.id not in want):
+            continue
+        if args.only_failed and res.get("success"):
+            continue
+        if getattr(args, "only_check_failed", False) and res.get("check_ok") is not False:
+            continue
+        ws = os.path.join(ws_root, "regrade-ws")
+        if os.path.exists(ws):
+            shutil.rmtree(ws)
+        os.makedirs(ws)
+        with tarfile.open(os.path.join(rdir, "workspace.tar.gz")) as tf:
+            tf.extractall(ws)
+        # the tarball holds the workspace's files, maybe under one top directory
+        top = os.listdir(ws)
+        src = os.path.join(ws, top[0]) if len(top) == 1 and os.path.isdir(
+            os.path.join(ws, top[0])) and not os.path.exists(os.path.join(ws, "main.tach")) \
+            and not os.path.exists(os.path.join(ws, "main.rs")) else ws
+        lang = res["lang"]
+        g = grade_dir(task, lang, src, os.path.join(ws_root, "regrade-grade"), bins[lang])
+        write_json(os.path.join(rdir, "grade.json"), g)
+        prev = {k: res.get(k) for k in ("success", "tests_passed", "tests_total", "build_ok",
+                                         "check_ok")}
+        res.update({"success": g["success"], "tests_passed": g["tests_passed"],
+                    "tests_total": g["tests_total"], "build_ok": g["build_ok"],
+                    "check_ok": g["check_ok"], "regraded_from": prev})
+        write_json(os.path.join(rdir, "result.json"), res)
+        n += 1
+        print("%s %s -> %s: %d/%d tests, check %s %s" % (
+            rdir, "OK" if prev["success"] else "FAIL", "OK" if g["success"] else "FAIL",
+            g["tests_passed"], g["tests_total"], g["check_ok"], (g.get("check_msg") or "")[:120]))
+    print("regraded %d program run(s)" % n)

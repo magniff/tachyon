@@ -167,7 +167,13 @@ fn parse_command<'a>(level: &Level, line: &'a [u8]) -> Command<'a> {
 
 // The commands that move the robot or the boxes: the moves, UNDO, RESET
 // and GOTO. Returns false if `cmd` is not one of them.
-fn apply_move(level: &Level, world: &mut World, cmd: &Command, number: i64, out: &mut String) -> bool {
+fn apply_move(
+    level: &Level,
+    world: &mut World,
+    cmd: &Command,
+    number: i64,
+    out: &mut String,
+) -> bool {
     match *cmd {
         Command::Move(dir, count) => {
             // Up to `count` steps; the first blocked step ends the command.
@@ -183,11 +189,19 @@ fn apply_move(level: &Level, world: &mut World, cmd: &Command, number: i64, out:
                     if tile_at(level, beyond) == b'#' || world.box_at(beyond) >= 0 {
                         break;
                     }
-                    world.history.push(Step { robot: world.robot, moved_box: b, box_from: next });
+                    world.history.push(Step {
+                        robot: world.robot,
+                        moved_box: b,
+                        box_from: next,
+                    });
                     world.boxes[b as usize] = beyond;
                     world.pushes += 1;
                 } else {
-                    world.history.push(Step { robot: world.robot, moved_box: -1, box_from: Pos::new(0, 0) });
+                    world.history.push(Step {
+                        robot: world.robot,
+                        moved_box: -1,
+                        box_from: Pos::new(0, 0),
+                    });
                 }
                 world.robot = next;
                 if tile_at(level, next) == b'T' {
@@ -200,7 +214,10 @@ fn apply_move(level: &Level, world: &mut World, cmd: &Command, number: i64, out:
                 done += 1;
             }
             if done < count {
-                out.push_str(&format!("line {}: blocked after {} of {} at ", number, done, count));
+                out.push_str(&format!(
+                    "line {}: blocked after {} of {} at ",
+                    number, done, count
+                ));
                 push_pos(out, world.robot);
                 out.push('\n');
             }
@@ -344,7 +361,13 @@ fn main() {
         Ok(level) => {
             push_summary(&mut out, &level);
             let mut world = World::new(&level);
-            run_commands(&level, &mut world, &lines, level.map_lines as usize + 1, &mut out);
+            run_commands(
+                &level,
+                &mut world,
+                &lines,
+                level.map_lines as usize + 1,
+                &mut out,
+            );
             out.push_str("final: ");
             push_status(&mut out, &level, &world);
         }

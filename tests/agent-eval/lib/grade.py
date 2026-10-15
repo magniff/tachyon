@@ -75,14 +75,23 @@ def run_tests(task, cwd, bin_dir):
             want = normalise(fh.read())
         rc, out, err, secs = run_proc([prog], cwd, env, task.test_timeout_s,
                                       stdin_path=inp)
+        retried = ""
         if rc is None:
-            res.append((name, False, secs, "timeout"))
+            # (0.16) once more: with 8 agents building and running programs,
+            # a test of a 0.5 s program stalled past 2.5 s (several 16-perf-tight
+            # runs whose programs take 0.2-0.6 s alone); a slow program times
+            # out twice
+            rc, out, err, secs = run_proc([prog], cwd, env, task.test_timeout_s,
+                                          stdin_path=inp)
+            retried = " (after a timeout, retried)"
+        if rc is None:
+            res.append((name, False, secs, "timeout" + (", twice" if retried else "")))
         elif rc != 0:
-            res.append((name, False, secs, "exit %d: %s" % (rc, tail(err, 200))))
+            res.append((name, False, secs, "exit %d: %s" % (rc, tail(err, 200)) + retried))
         elif normalise(out) != want:
-            res.append((name, False, secs, "wrong output"))
+            res.append((name, False, secs, "wrong output" + retried))
         else:
-            res.append((name, True, secs, ""))
+            res.append((name, True, secs, retried.strip()))
     return res
 
 

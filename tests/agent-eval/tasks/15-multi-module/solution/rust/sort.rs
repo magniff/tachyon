@@ -33,7 +33,11 @@ pub fn sorted_order(keys: &[Value], desc: &[bool], n: usize) -> Vec<usize> {
         let mut lo = 0;
         while lo < n {
             let mid = if lo + width < n { lo + width } else { n };
-            let hi = if lo + 2 * width < n { lo + 2 * width } else { n };
+            let hi = if lo + 2 * width < n {
+                lo + 2 * width
+            } else {
+                n
+            };
             let mut i = lo;
             let mut j = mid;
             let mut k = lo;

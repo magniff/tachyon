@@ -8,7 +8,9 @@ struct Scanner {
 
 impl Scanner {
     fn next_int(&mut self) -> i64 {
-        while self.pos < self.data.len() && !(self.data[self.pos] == b'-' || self.data[self.pos].is_ascii_digit()) {
+        while self.pos < self.data.len()
+            && !(self.data[self.pos] == b'-' || self.data[self.pos].is_ascii_digit())
+        {
             self.pos += 1;
         }
         let mut negative = false;
@@ -112,7 +114,11 @@ fn build_graph(n: usize, from: &[usize], to: &[usize], w: &[i64]) -> Graph {
         weights[k] = w[i];
         fill[from[i]] += 1;
     }
-    Graph { start, targets, weights }
+    Graph {
+        start,
+        targets,
+        weights,
+    }
 }
 
 fn shortest(g: &Graph, s: usize, t: usize, dist: &mut Vec<i64>, heap: &mut MinHeap) -> i64 {

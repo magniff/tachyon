@@ -14,7 +14,10 @@ struct Rng {
 
 impl Rng {
     fn next(&mut self) -> u64 {
-        self.x = self.x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.x = self
+            .x
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         self.x >> 33
     }
 }
