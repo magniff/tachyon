@@ -13,7 +13,7 @@ use crate::base::diag::{
     err_str, err_sym, err_try_fmt, err_try_tool,
 };
 use crate::front::assoc::ensure_checked;
-use crate::front::ast::{NODES, child, list_begin, list_end, list_push, new_node};
+use crate::front::ast::{NODES, NodeKind, child, list_begin, list_end, list_push, new_node};
 use crate::front::ast::NodeKind::{Call, Ident, Index, Range, Unary};
 use crate::front::check::{LOCALS, Res, SELF_SYM, is_std_named, name_error};
 use crate::front::check::args::{arity_help, int_limit_help, normalize_args};
@@ -25,15 +25,16 @@ use crate::front::check::names::{
 };
 use crate::front::check::synth_mode::synth_expr;
 use crate::front::check::unsafety::{U_METHOD, check_call_safety, is_borrow, unsafe_op};
-use crate::front::check::vectors::vector_method;
+use crate::front::check::vectors::{sym_is_c, vector_method};
 use crate::front::convert::generic_trait_call;
 use crate::front::derive::intrinsic::{has_intrinsic_method, intrinsic_method};
 use crate::front::generics::{TPL_SLICE, check_arg, template_name};
 use crate::front::generics::instantiate::instantiate_call;
-use crate::front::lexer::Tok;
+use crate::front::lexer::{SUF_I64, Tok};
+use crate::front::modules::lookup::is_prelude_name;
 use crate::front::traits::require_in_bounds;
 use crate::front::types::{
-    ENUMS, FNS, METHODS, METHOD_COUNT, STRUCTS, TYPES, TY_UNIT, TyKind, VARIANTS, buf_type,
+    ENUMS, FNS, METHODS, METHOD_COUNT, STRUCTS, TYPES, TY_I64, TY_UNIT, TyKind, VARIANTS, buf_type,
     enum_variant, err_type, find_field, find_method, fn_param, is_compound, is_pointer, is_vector,
     ptr_to, slice_of,
 };
@@ -159,7 +160,11 @@ fn std_function_help(n: i64, t: i64, name: i64) {
             return;
         }
         let c = buf_new();
-        buf_fmt(c, f"std::{sym_text(f)}(");
+        // (0.17: a name of the prelude needs no `std::`)
+        if !is_prelude_name(f) {
+            buf_str(c, c"std::");
+        }
+        buf_fmt(c, f"{sym_text(f)}(");
         buf_bytes(c, SRC[NODES[recv].start..NODES[recv].end]);
         if is_std_vec(t) {
             buf_str(c, c".as_slice()");
@@ -300,6 +305,12 @@ pub fn synth_method(n: i64) -> i64 {
                 NODES[n].a = receiver;
                 receiver_ty = s;
             }
+        }
+        if NODES[n].count == 0 && NODES[n].g == 0 && sym_is_c(name, c"len")
+            && (TYPES[receiver_ty].kind == TyKind::Slice
+                || TYPES[receiver_ty].kind == TyKind::Array && is_plain_place(receiver))
+            && method_of(receiver_ty, name) < 0 {
+            return len_method(n, receiver, receiver_ty);
         }
         if is_vector(receiver_ty) {
             return vector_method(n, name, receiver_ty);
@@ -460,5 +471,37 @@ pub fn synth_method(n: i64) -> i64 {
         ensure_checked(f, n);
         check_call_safety(n, f, 1);
         FNS[f].ret
+    }
+}
+
+// (0.17) `s.len()` on a slice is its field `s.len`; on an array, its
+// length (an i64), as Rust writes both.
+fn len_method(n: i64, receiver: i64, ty: i64) -> i64 {
+    unsafe {
+        if TYPES[ty].kind == TyKind::Array {
+            NODES[n].kind = NodeKind::Int;
+            NODES[n].a = TYPES[ty].b;
+            NODES[n].b = SUF_I64;
+            NODES[n].count = 0;
+            return TY_I64;
+        }
+        NODES[n].kind = NodeKind::FieldAccess;
+        NODES[n].a = receiver;
+        NODES[n].count = 0;
+        NODES[n].y = 2;
+        NODES[n].x = 1;
+        TY_I64
+    }
+}
+
+// Whether e is a variable, a constant, a static or a field of one: what
+// can be left unevaluated (an array's `.len()` is its type's).
+fn is_plain_place(e: i64) -> bool {
+    unsafe {
+        match NODES[e].kind {
+            NodeKind::Ident | NodeKind::Path => true,
+            NodeKind::FieldAccess | NodeKind::TupleField => is_plain_place(NODES[e].a),
+            _ => false,
+        }
     }
 }

@@ -141,7 +141,6 @@ buffers):
 
 ```tach
 import "stdio.h" as c;
-use std::Buf;
 
 fn main(gpa: Gpa) -> i32 {
     let mut line = Buf::new_in(gpa);

@@ -33,7 +33,7 @@ builds it into the compiler (`compiler/src/front/stdsrc.tach`).
    `--after Vec::swap`). The edit is made in std's file and checked with
    the edited std, every function of it (a generic one with `i64` for
    its type parameters); then embed.sh runs (`note edit.std`). Inside
-   std there is no prelude: `Option::None`, `Result::Ok(x)`. A function
+   std the prelude is as everywhere (0.17): `None`, `Ok(x)`. A function
    that allocates takes its allocator, `NAME_in(..., a: A)`, and has an
    `#[ambient]` wrapper without it, like `split_whitespace` and
    `split_whitespace_in`.

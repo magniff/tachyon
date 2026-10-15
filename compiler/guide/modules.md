@@ -28,6 +28,14 @@ A path starts with a name in scope, `crate`, `self`, `super` or `std`:
 `geometry::area(s)`, `crate::util::Vec2 { x: 1, y: 2 }`,
 `shapes::Shape::Rect(r)`, `util::Stack::<u8>::new()`.
 
+A `use` path may also start with a sibling module (0.17): in
+`parser.tach`, where `main.tach` has `mod lexer; mod parser;`,
+`use lexer::{Tok, next};` is `use crate::lexer::{Tok, next};`. The
+first segment, when the module has no name of its own for it, is a child
+of its parent module, else of the root; when both exist and differ, the
+error's `try:` lines are the two `crate::` paths. In an expression a
+sibling needs its `use crate::lexer;` (or `crate::lexer::next(..)`).
+
 ```tach
 mod util {
     pub fn double(x: i64) -> i64 { x * 2 }
@@ -61,9 +69,16 @@ fn main() -> i32 {
   is declared there, imported by name, or written as a path.
 - The order of items and `use` lines does not matter.
 - Name resolution: a local binding, then the module's own items, then
-  its imports, then the prelude (`Option Some None Result Ok Err Vec
-  print println`, the operator traits). A program's own `Vec` hides the
-  prelude's.
+  its imports, then the prelude. A program's own `Vec` (or `trim`) hides
+  the prelude's.
+- The prelude, std's names used without a `use`: `Option Some None
+  Result Ok Err Vec Buf HashMap print println eprint eprintln format
+  format_in Gpa Allocator Arena ScopedArena arena_scope read_line
+  read_stdin_in Scanner parse_int trim split_in split_whitespace_in sort
+  sort_by cmp_of eq_of Fmt Display Debug Clone From Into Iterator Hash
+  Eq Ord` and the operator traits, `panic(msg)` (prints `msg`, exits with
+  101) and `unreachable()`. The rest of std is `use std::{...}` (or
+  `std::name`); a program that names none of it is built without std.
 - A C header: `import "stdio.h" as c;` then `c::printf`; in a pattern,
   import a C constant by name: `use c::EOF;`.
 
@@ -75,7 +90,7 @@ their names, as do `extern "C"` items and `#[link_name]`s.
 ## Tools
 
 - `tachyonc fix --only imports` adds the `use` lines a program is
-  missing for its own items (std's are imported by hand: `use std::Buf;`),
+  missing (its own items', and std's outside the prelude),
   and `--only unused` removes unused ones.
 - `tachyonc query items` lists every module; `query items MODULE` its
   items with signatures.

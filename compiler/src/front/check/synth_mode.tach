@@ -9,7 +9,8 @@ use crate::base::diag::{
     ERR, err_begin, err_end, err_help, err_help_sym, err_int, err_str, err_sym, err_try_fmt,
 };
 use crate::front::ast::{
-    NODES, NODE_RAW, NodeKind, REPR_UNION, child, list_begin, list_end, list_push, new_node,
+    NODES, NODE_CHECKED, NODE_RAW, NodeKind, REPR_UNION, child, list_begin, list_end, list_push,
+    new_node,
 };
 use crate::front::ast::NodeKind::{
     Arm, Array, Assign, Binary, Block, Bool, Break, CStr, Call, Cast, Char, Closure, Continue,
@@ -23,7 +24,7 @@ use crate::front::check::assign::{check_assign, is_place};
 use crate::front::check::body::{
     check_block, check_break, check_for, check_loop, check_return, check_while, find_loop, synth_if,
 };
-use crate::front::check::calls::synth_method;
+use crate::front::check::calls::{synth_method, synthetic_unary};
 use crate::front::check::calls::paths::{synth_call, synth_path};
 use crate::front::check::check_mode::{check_expr, check_struct_fields, int_range_help};
 use crate::front::check::equality::{eq_unsupported, structural_eq};
@@ -45,6 +46,7 @@ use crate::front::lexer::{
     SUF_F32, SUF_I16, SUF_I32, SUF_I64, SUF_I8, SUF_ISIZE, SUF_NONE, SUF_U16, SUF_U32, SUF_U64,
     SUF_U8, SUF_USIZE, Tok,
 };
+use crate::front::modules::STD_MODULE;
 use crate::front::patterns::check_match;
 use crate::front::traits::{binary_op_trait, has_impl, negation_call, operator_call, std_trait};
 use crate::front::types::{
@@ -57,6 +59,10 @@ use crate::front::types::{
 use crate::gen0::target::enum_panic_kind;
 
 pub fn synth_expr(n: i64) -> i64 {
+    // (0.17) a node the checker moved under a new one, checked already
+    if unsafe { (NODES[n].p & NODE_CHECKED) != 0 } {
+        return unsafe { NODES[n].ty };
+    }
     fold_layout_query(n);
     let ty = synth_expr_inner(n);
     unsafe { NODES[n].ty = ty; }
@@ -295,9 +301,23 @@ fn cast_node(e: i64, t: i64) -> i64 {
 
 fn synth_index(n: i64) -> i64 {
     unsafe {
-        let base = NODES[n].a;
-        let base_ty = synth_expr(base);
-        let base_kind = TYPES[base_ty].kind;
+        let mut base = NODES[n].a;
+        let mut base_ty = synth_expr(base);
+        let mut base_kind = TYPES[base_ty].kind;
+        if base_kind == TyKind::Struct && indexes_as_slice(base_ty) {
+            // (0.17) `v[i]` (`v[a..b]`) on a Vec or a Buf is
+            // `v.as_slice()[i]`: checked, and a place to assign
+            NODES[base].p |= NODE_CHECKED;
+            let call = new_node(NodeKind::MethodCall, NODES[base].start, NODES[base].end);
+            NODES[call].a = base;
+            NODES[call].b = intern_c(c"as_slice");
+            let mark = list_begin();
+            list_end(call, mark);
+            NODES[n].a = call;
+            base = call;
+            base_ty = synth_expr(call);
+            base_kind = TYPES[base_ty].kind;
+        }
         if base_kind != TyKind::Array && base_kind != TyKind::Ptr && base_kind != TyKind::Slice {
             err_begin(NODES[base].start);
             err_str(c"cannot index type '");
@@ -344,6 +364,15 @@ fn synth_index(n: i64) -> i64 {
         }
         check_index_type(index);
         TYPES[base_ty].a
+    }
+}
+
+// (0.17) Whether a value of type t (a struct) is indexed through its
+// slice: std's Vec and Buf.
+fn indexes_as_slice(t: i64) -> bool {
+    unsafe {
+        STD_MODULE >= 0 && STRUCTS[TYPES[t].a].module == STD_MODULE
+            && (is_std_named(t, c"Vec") || is_std_named(t, c"Buf"))
     }
 }
 
@@ -441,20 +470,25 @@ pub fn help_near_field(s: i64, name: i64) {
 
 fn synth_tuple_field(n: i64) -> i64 {
     unsafe {
-        let base_ty = synth_expr(NODES[n].a);
+        let mut base_ty = synth_expr(NODES[n].a);
         let index = NODES[n].b;
+        if TYPES[base_ty].kind == TyKind::Ptr && TYPES[TYPES[base_ty].a].kind == TyKind::Tuple {
+            // (0.17) through a pointer to a tuple, as a field through a
+            // pointer to a struct: `p.0` is `(*p).0`
+            let base = NODES[n].a;
+            base_ty = TYPES[base_ty].a;
+            let deref = synthetic_unary(Tok::Star, base, base_ty);
+            if !is_borrow(base) {
+                NODES[deref].p |= NODE_RAW;
+                unsafe_op(n, U_FIELD, c"access to a field through a raw pointer is unsafe");
+            }
+            NODES[n].a = deref;
+        }
         if TYPES[base_ty].kind != TyKind::Tuple {
             err_begin(NODES[n].start);
             err_str(c"cannot use tuple index on type '");
             err_type(base_ty);
             err_str(c"'");
-            let base = NODES[n].a;
-            if TYPES[base_ty].kind == TyKind::Ptr && TYPES[TYPES[base_ty].a].kind == TyKind::Tuple
-                && NODES[base].end > NODES[base].start {
-                // (0.17) a pointer to a tuple: its element is reached through it
-                err_help(c"a pointer to a tuple: its elements are `(*p).0`, ...");
-                err_try_fmt(f"(*{SRC[NODES[base].start..NODES[base].end]}).{index}");
-            }
             err_end();
         }
         if index >= TYPES[base_ty].count {

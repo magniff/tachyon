@@ -412,8 +412,7 @@ is made in `compiler/std/FILE.tach` and checked with the edited std:
 every function of std, and each generic one nothing instantiates with
 `i64` for its type parameters (`Gpa` for an `Allocator`), so an error in
 a body is found at once (`compiler/std/io.tach:124:16: error[type
-error] undefined variable 'None' | help: std has no prelude: write
-`Option::None``). Once it is written, `compiler/std/embed.sh` makes
+error] expected '[u8]', got 'i64'`). Once it is written, `compiler/std/embed.sh` makes
 `compiler/src/front/stdsrc.tach` from the files (`note edit.std`);
 `undo` of a std edit does the same. The compiler that runs has the old
 std until it is rebuilt (`bootstrap/bootstrap.sh --dev`).

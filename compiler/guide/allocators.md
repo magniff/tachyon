@@ -10,8 +10,6 @@ so a function's signature says whether it allocates.
 ## Gpa, from main
 
 ```tach
-use std::Buf;
-
 fn squares(n: i64, gpa: Gpa) -> Vec<i64> {   // allocates: takes the allocator
     let mut v: Vec<i64> = Vec::with_capacity_in(n, gpa);
     for i in 0..n { v.push(i * i); }

@@ -1481,6 +1481,62 @@ from `main` to them ([refactor.md](refactor.md)).
 and its literals, outside its module; `#[scoped]` (to come) keeps values
 of the type from outliving the scope that made them.
 
+## Additions of 0.17: familiar forms
+
+Forms a Rust reader writes first, with tachyon's meaning unchanged
+(nothing here allocates, and every index stays checked). The measure
+behind them is `.claude/briefs/research/familiar-names.md`.
+
+```ebnf
+unary += "&" "mut" unary          (* the same as "&" unary *)
+```
+
+**`&mut e`** is `&e`: tachyon has one pointer type, `*T`, for `&T` and
+`&mut T`. (The exclusive meaning `&mut` will have with value semantics
+is [design/value-semantics.md](design/value-semantics.md)'s.)
+
+**The prelude** gains `Buf`, `HashMap`, `read_line`, `read_stdin_in`,
+`Scanner`, `parse_int`, `trim`, `split_in`, `split_whitespace_in`,
+`sort`, `sort_by`, `cmp_of`, `eq_of`, `Fmt`, `panic` and `unreachable`
+(and `read_stdin`, `split`, `split_whitespace`, whose use is the error
+naming their `_in` form). As before it comes last (a program's own
+`trim` hides it), and std is loaded only for a program that uses one of
+its names: a name the program declares itself (`fn trim`, `let split`),
+a field, a parameter or a member (`.trim`) does not load it. std's own
+source sees the prelude too (`None`, `Ok(x)` inside std).
+
+`panic(message: [u8]) -> !` prints the message on stderr and exits with
+101, as a failed check does; `unreachable()` the same with "entered
+unreachable code". Both are safe; their effect is
+`panic`. `std::panic` is still the `unsafe fn` taking a C string.
+
+**Indexing a Vec or a Buf.** `v[i]`, `v[i] = x`, `v[i] += x` and
+`v[a..b]` on std's `Vec` and `Buf` are `v.as_slice()[i]` (and so on):
+checked, a place to assign without `mut` (as a slice's element is); the
+slice is valid until the Vec grows or is freed. A `HashMap` is not
+indexed (`m.get(k)` is an Option: Rust's `m[k]` panics). A pointer to a
+Vec indexes the pointer, as before (`unsafe`).
+
+**Through a pointer.** `p.0` on a `*(A, B)` is `(*p).0`, as `p.x` on a
+`*S` is `(*p).x`: safe when `p` is a borrow (a parameter, `&x`),
+`unsafe` on a raw pointer.
+
+**`len()`.** `s.len()` on a slice is its field `s.len`; `a.len()` on
+an array (a variable, constant, static or a field of one) is its
+length, an `i64`. The field stays.
+
+**Paths.** A `use` path's first segment that is not `crate`, `self`,
+`super`, `std` nor a name of the module it is written in is looked up
+beside that module (a child of its parent), then at the root:
+`use lexer::{Tok, next};` in `parser.tach`, where `main.tach` has
+`mod lexer; mod parser;`, is `use crate::lexer::{Tok, next};`. When both
+are modules and differ (`crate::a::lexer` beside `crate::a::parser`, and
+`crate::lexer`), it is an error, `ambiguous module`, whose `try:` lines
+are the two `crate::` paths. Paths in expressions are unchanged: a
+sibling there is `crate::lexer::next(..)` or imported (`use
+crate::lexer;`; the error `unknown module 'lexer'` names that line).
+`use m::{self, X};` is not supported: its error's `try:` is `use m;`.
+
 ## Importing C headers
 
 `import "stdio.h" as c;` *(0.4; `as`: 0.5, required since 0.8)* reads a C

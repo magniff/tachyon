@@ -6,7 +6,7 @@ any type (`i64`, `[u8]`, `Vec<T>`, a struct). Its functions become the
 type's methods. Dispatch is static: a trait is not a type.
 
 ```tach
-use std::{HashMap, hash_u64};
+use std::hash_u64;
 
 trait Shape {
     fn area(self: *Self) -> i64;

@@ -33,14 +33,16 @@ use std::collections::HashMap;
 ```err
 error[type error] no 'collections' in module 'std' | help: tachyon's std is one module, without 'collections': its items are `std::NAME` | try: use std::HashMap;
 ```
-std has no submodules: `use std::{HashMap, read_line};`. `use std::io;`
-gets what reads stdin (`read_line`, `read_stdin_in`, `Scanner`).
+std has no submodules: `use std::{IoError, is_digit};` (`HashMap`,
+`read_line` and std's most used names are in the prelude: no `use`).
+`use std::io;` gets what reads stdin (`read_line`, `read_stdin_in`,
+`Scanner`).
 
 ```tach
 fn main() -> i32 { let s = "  a "; let t = s.trim(); 0 }
 ```
 ```err
-error[type error] no method 'trim' on type '[u8]' | help: 'trim' is no method: std's function `trim` takes the value as its first argument | try: std::trim(s)
+error[type error] no method 'trim' on type '[u8]' | help: 'trim' is no method: std's function `trim` takes the value as its first argument | try: trim(s)
 ```
 A method std has as a function (`trim`, `sort`, `parse` as `parse_int`,
 `split_whitespace` as `split_whitespace_in(s, gpa)`) gets the call to
@@ -285,14 +287,15 @@ In a condition, parenthesize a struct literal: `if p == (P { x: 1 })`.
 ## Slices, Vec, std
 
 ```tach
-let mut v: Vec<i64> = Vec::new_in(gpa);
-v.push(1);
-let a = v[0];
+let mut m: HashMap<i64, i64> = HashMap::new_in(gpa);
+let a = m[0];
 ```
 ```err
-error[type error] cannot index type 'Vec<i64>'
+error[type error] cannot index type 'HashMap<i64, i64>'
 ```
-`v.get(0)`, `v.set(0, x)`, `v.as_slice()[0]`.
+`m.get(0)` (an Option), `m.insert(0, x)`. A `Vec` and a `Buf` index as
+their slice (0.17): `v[0]`, `v[0] = x`, `v[1..3]` are
+`v.as_slice()[0]`, ..., checked.
 
 ```tach
 let n = 3;
@@ -304,18 +307,9 @@ error[type error] 'for' iterates over ranges, slices, arrays, iterators and type
 `for x in 0..n`. A type of yours iterates with `impl Iterator for T`, or
 an `iter` method returning one (`tachyonc guide iterators`).
 
-```tach
-let s = "abc";
-let n = s.len();
-```
-```err
-error[type error] no method 'len' on type '[u8]' | help: `len` is a field of slices: `s.len`
-```
-(`Vec` has the method `len()`.) A misspelt method, field or item gets
-the nearest name of its kind:
+A misspelt method, field or item gets the nearest name of its kind:
 
 ```tach
-use std::Buf;
 fn main(gpa: Gpa) -> i32 { let mut b = Buf::new_in(gpa); b.push_string("x"); 0 }
 ```
 ```err
@@ -329,18 +323,18 @@ fn main() -> i32 { let a = [1, 2, 3]; sum(a) as i32 }
 ```err
 error[type error] expected '[i64]', got '[i64; 3]'
 ```
-`sum(a[..])`. An array has no `.len` either: `a[..].len`.
+`sum(a[..])`. An array's length is `a.len()` (or `a[..].len`).
 
 ```tach
-let b = Buf::new_in(gpa);
+let e: IoError = IoError::Read;
 ```
 ```err
-error[type error] unknown type 'Buf'
+error[type error] unknown type 'IoError'
 ```
-`use std::Buf;` (only the prelude names need no import).
+`use std::IoError;` (the prelude's names need no import: `tachyonc guide
+modules`).
 
 ```tach
-use std::HashMap;
 struct K { a: i64 }
 fn main(gpa: Gpa) -> i32 { let m: HashMap<K, i64> = HashMap::new_in(gpa); 0 }
 ```
@@ -416,7 +410,7 @@ Return `Option<i64>` (or `Result<i64, E>`), or `match` on the value.
 `v.ok_or(MyError::Missing)?`.
 
 ```tach
-use std::{ParseIntError, parse_int};
+use std::ParseIntError;
 enum AppError { Bad }
 fn read(s: [u8]) -> Result<i64, AppError> { let n = parse_int(s)?; Ok(n) }
 ```
@@ -551,10 +545,13 @@ error[type error] undefined variable 'helper' | help: add `use crate::m::helper;
 Add the `use` line the help names, or run the `try:` line, `tachyonc fix
 --only imports main.tach`, which adds every missing one.
 
-In a module other than the root, a path starts in that module: `use
-table::Table;` in check.tach is `unknown module 'table'` when `mod
-table;` is in main.tach; the help says `crate::table::...` and the
-`try:` is the `use` line so written. `mod util;` with no util.tach is
+In a module other than the root, a path starts in that module; a `use`
+path may also start with a sibling module (0.17): `use table::Table;` in
+check.tach is `use crate::table::Table;` when `mod table;` is in
+main.tach. A module elsewhere (`crate::a::table`) is `unknown module
+'table'`, whose help says `crate::a::table::...` and whose `try:` is the
+`use` line so written; in an expression, `table::f(x)` needs `use
+crate::table;` (the `try:`). `mod util;` with no util.tach is
 `cannot find the file of module 'util'`, whose `try:` makes it:
 `tachyonc edit new-file util.tach main.tach < util.tach` (the text on
 stdin; the `mod` line that is there stays). A `mod` line for a file that
@@ -564,10 +561,10 @@ is next to a submodule's file belongs in the root.
 fn main() -> i32 { let text = read_to_string(); 0 }
 ```
 ```err
-error[type error] undefined variable 'read_to_string' | help: std reads stdin: `std::read_stdin_in(gpa)` (all of it, a Buf), `std::read_line(&buf)` (one line, Ok(false) at the end), `std::Scanner` (tokens)
+error[type error] undefined variable 'read_to_string' | help: std reads stdin: `read_stdin_in(gpa)` (all of it, a Buf), `read_line(&buf)` (one line, Ok(false) at the end), `Scanner` (tokens)
 ```
-std's items get their `use` line (`add `use std::read_line;``) or the
-nearest std name; an unknown function with neither points to `tachyonc
+std's items outside the prelude get their `use` line (`add `use
+std::is_digit;``) or the nearest std name; an unknown function with neither points to `tachyonc
 guide std`.
 
 ```tach
@@ -677,7 +674,8 @@ fn main() -> i32 { std::print_cstr(c"x"); 0 }
 error[unsafe] calling an `unsafe fn` is unsafe
 ```
 `std::panic`, `print_cstr` and `Buf::push_cstr` take C strings and are
-`unsafe fn`; for literals use `print("x")`.
+`unsafe fn`; for literals use `print("x")`, `panic("x")` (the prelude's,
+safe).
 
 ## At run time
 

@@ -7,7 +7,7 @@
 | `bool` | `true`, `false` |
 | `()` | the unit type |
 | `!` | never: `return`, `break`, `loop` without `break`, `fn f() -> !` |
-| `(A, B)` | tuples: `t.0`; `(x,)` has one element |
+| `(A, B)` | tuples: `t.0` (through a pointer too: `p.0`); `(x,)` has one element |
 | `[T; N]` | an array, a value; `N` a constant expression |
 | `[T]` | a slice: `.ptr` (a `*T`) and `.len` (an `i64`) |
 | `*T` | a pointer (`*u8` is also C's `void *` and `char *`) |
@@ -70,7 +70,7 @@ println("");
 Indexing (`a[i]`, any integer type) and slicing (`a[lo..hi]`, `a[..hi]`,
 `a[lo..]`, `a[..]`) are checked: out of bounds, the program prints
 `index out of bounds: index I, length N` and exits with 101. An array
-has no `.len`; slice it: `a[..].len`. A function taking `[T]` gets
+has no `.len` field: `a.len()` (0.17), or slice it: `a[..].len`. A function taking `[T]` gets
 `a[..]`, not `a`. A slice of a raw pointer, `p[0..n]`, is unchecked and
 unsafe.
 
