@@ -1,0 +1,183 @@
+// Splits a query line into tokens.
+
+use crate::table::parse_int;
+use std::Buf;
+
+pub enum Kw {
+    Select,
+    From,
+    Where,
+    Group,
+    By,
+    Order,
+    Asc,
+    Desc,
+    Limit,
+    And,
+    Or,
+    Not,
+    Is,
+    Null,
+    Count,
+    Sum,
+    Min,
+    Max,
+}
+
+pub enum Tok {
+    Name,
+    Kw(Kw),
+    Int(i64),
+    Str,
+    Comma,
+    LParen,
+    RParen,
+    Star,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    End,
+}
+
+pub struct Token {
+    pub tok: Tok,
+    // The token as written in the query.
+    pub text: [u8],
+    // A string's value, its quotes removed and '' undoubled.
+    pub value: [u8],
+}
+
+fn keyword(word: [u8]) -> Option<Kw> {
+    let mut lower = Buf::new();
+    defer lower.free();
+    for b in word {
+        lower.push(if b >= 'A' && b <= 'Z' { b + 32 } else { b });
+    }
+    let w = lower.as_slice();
+    if w == "select" { return Some(Kw::Select); }
+    if w == "from" { return Some(Kw::From); }
+    if w == "where" { return Some(Kw::Where); }
+    if w == "group" { return Some(Kw::Group); }
+    if w == "by" { return Some(Kw::By); }
+    if w == "order" { return Some(Kw::Order); }
+    if w == "asc" { return Some(Kw::Asc); }
+    if w == "desc" { return Some(Kw::Desc); }
+    if w == "limit" { return Some(Kw::Limit); }
+    if w == "and" { return Some(Kw::And); }
+    if w == "or" { return Some(Kw::Or); }
+    if w == "not" { return Some(Kw::Not); }
+    if w == "is" { return Some(Kw::Is); }
+    if w == "null" { return Some(Kw::Null); }
+    if w == "count" { return Some(Kw::Count); }
+    if w == "sum" { return Some(Kw::Sum); }
+    if w == "min" { return Some(Kw::Min); }
+    if w == "max" { return Some(Kw::Max); }
+    None
+}
+
+fn is_alpha(b: u8) -> bool {
+    (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || b == '_'
+}
+
+fn is_digit(b: u8) -> bool {
+    b >= '0' && b <= '9'
+}
+
+fn unexpected(text: [u8]) -> [u8] {
+    let mut m = Buf::new();
+    m.push_str("syntax error: unexpected ");
+    m.push_str(text);
+    m.as_slice()
+}
+
+// The tokens of `line`, ending with an End token, or an error message.
+pub fn tokenize(line: [u8]) -> Result<Vec<Token>, [u8]> {
+    let mut toks: Vec<Token> = Vec::new();
+    let mut i = 0;
+    while i < line.len {
+        let b = line[i];
+        let start = i;
+        if b == ' ' || b == '\t' {
+            i += 1;
+            continue;
+        }
+        let mut tok = Tok::End;
+        let mut value: [u8] = "";
+        if is_alpha(b) {
+            while i < line.len && (is_alpha(line[i]) || is_digit(line[i])) {
+                i += 1;
+            }
+            tok = match keyword(line[start..i]) {
+                Some(k) => Tok::Kw(k),
+                None => Tok::Name,
+            };
+        } else if is_digit(b) || (b == '-' && i + 1 < line.len && is_digit(line[i + 1])) {
+            i += 1;
+            while i < line.len && is_digit(line[i]) {
+                i += 1;
+            }
+            tok = Tok::Int(parse_int(line[start..i]));
+        } else if b == '\'' {
+            let mut s = Buf::new();
+            i += 1;
+            let mut closed = false;
+            while i < line.len {
+                if line[i] == '\'' {
+                    if i + 1 < line.len && line[i + 1] == '\'' {
+                        s.push('\'');
+                        i += 2;
+                    } else {
+                        i += 1;
+                        closed = true;
+                        break;
+                    }
+                } else {
+                    s.push(line[i]);
+                    i += 1;
+                }
+            }
+            if !closed {
+                toks.free();
+                return Err("syntax error: unterminated string");
+            }
+            tok = Tok::Str;
+            value = s.as_slice();
+        } else {
+            let next = if i + 1 < line.len { line[i + 1] } else { 0u8 };
+            i += 1;
+            if b == ',' {
+                tok = Tok::Comma;
+            } else if b == '(' {
+                tok = Tok::LParen;
+            } else if b == ')' {
+                tok = Tok::RParen;
+            } else if b == '*' {
+                tok = Tok::Star;
+            } else if b == '=' {
+                tok = Tok::Eq;
+            } else if b == '!' && next == '=' {
+                i += 1;
+                tok = Tok::Ne;
+            } else if b == '<' && next == '=' {
+                i += 1;
+                tok = Tok::Le;
+            } else if b == '<' {
+                tok = Tok::Lt;
+            } else if b == '>' && next == '=' {
+                i += 1;
+                tok = Tok::Ge;
+            } else if b == '>' {
+                tok = Tok::Gt;
+            } else {
+                toks.free();
+                return Err(unexpected(line[start..start + 1]));
+            }
+        }
+        toks.push(Token { tok: tok, text: line[start..i], value: value });
+    }
+    toks.push(Token { tok: Tok::End, text: "", value: "" });
+    Ok(toks)
+}
