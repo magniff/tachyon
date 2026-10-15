@@ -1210,7 +1210,8 @@ pub trait Iterator {
 ```
 
 std's sources implement it: `Range`, `RangeInclusive`, `SliceIter`
-(`v.iter()`, `s.iter()` on a slice, and `as_slice()`: the items left),
+(`v.iter()`, `s.iter()` on a slice, and `as_slice()`: the items left;
+0.16: an array place has its slice's methods, `a.iter()` is `a[..].iter()`),
 `HashMapIter` (`m.iter()`, items `(K, V)` in slot order), `Keys`
 (`m.keys()`) and `Values` (`m.values()`); each overrides `fold` with a
 counted loop, and all but the HashMap ones have an indexed `at`.

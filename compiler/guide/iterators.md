@@ -51,7 +51,7 @@ fn main() -> i32 {
 
 | source | items |
 |---|---|
-| `v.iter()` (a `Vec<T>`), `s.iter()` (a slice `[T]`) | each element, a copy |
+| `v.iter()` (a `Vec<T>`), `s.iter()` (a slice `[T]`; an array variable too, `a.iter()`) | each element, a copy |
 | `m.iter()`, `m.keys()`, `m.values()` (a `HashMap<K, V>`) | `(K, V)`, `K`, `V`, in slot order |
 | `a..b`, `a..=b` as a value: `(0..n).map(...)` | the integers; `0..=255u8` ends without overflow |
 | a type with `impl Iterator` | what its `next` returns |
