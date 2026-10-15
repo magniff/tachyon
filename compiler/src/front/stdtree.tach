@@ -1,0 +1,213 @@
+// std read from its files (0.17). In the tachyon repository, an edit of a
+// std item (`tachyonc edit patch std::trim`, `edit insert --after
+// Vec::push`) loads std from compiler/std/*.tach, the files embed.sh joins
+// into the text built into the compiler: each one a source file of the
+// module `std` under its own path, so that its items are edited, checked
+// and reported where they are written (tools/edit/stdedit.tach). The rest
+// of the time std is the built-in text (stdsrc.tach).
+
+use crate::base::{
+    BUFS, FILES, FILE_COUNT, IntVec, SRC, add_source, buf_byte, buf_new, buf_slice, buf_str,
+    read_file, streq,
+};
+use crate::front::cpp::directives::file_exists;
+use crate::front::stdalloc::{CHECK_ALLOC_LINUX, CHECK_ALLOC_MODE};
+use crate::front::stdsrc::std_source;
+use crate::tools::proc::read_file_if;
+
+// The directory of std's files (`--std-tree DIR`), or 0: the built-in text.
+pub static mut STD_TREE: *u8 = 0 as *u8;
+
+// Std's k-th file in embed.sh's order (then Gpa's implementation, the
+// checking one with --check-alloc), without its `.tach`; 0 past the last.
+pub fn std_tree_file(k: i64) -> *u8 {
+    unsafe {
+        if k == 0 { c"std" }
+        else if k == 1 { c"iter" }
+        else if k == 2 { c"io" }
+        else if k == 3 { c"fmt" }
+        else if k == 4 { c"convert" }
+        else if k == 5 { c"clone" }
+        else if k == 6 { c"alloc" }
+        else if k == 7 { if CHECK_ALLOC_MODE { c"alloc_check" } else { c"gpa" } }
+        else { 0 as *u8 }
+    }
+}
+
+// The path of std's k-th file in dir: DIR/NAME.tach.
+pub fn std_file_path(dir: *u8, k: i64) -> *u8 {
+    unsafe {
+        let b = buf_new();
+        buf_str(b, dir);
+        buf_byte(b, '/');
+        buf_str(b, std_tree_file(k));
+        buf_str(b, c".tach");
+        buf_byte(b, 0);
+        BUFS[b].data
+    }
+}
+
+// DIR/NAME as a C string.
+pub fn tree_path(dir: *u8, name: *u8) -> *u8 {
+    unsafe {
+        let b = buf_new();
+        buf_str(b, dir);
+        buf_byte(b, '/');
+        buf_str(b, name);
+        buf_byte(b, 0);
+        BUFS[b].data
+    }
+}
+
+// Whether dir holds std's files (its std.tach and embed.sh).
+pub fn is_std_tree(dir: *u8) -> bool {
+    unsafe { file_exists(tree_path(dir, c"std.tach")) && file_exists(tree_path(dir, c"embed.sh")) }
+}
+
+// The directory of std's files: compiler/std in the current directory or
+// one of the three above it; 0 when there is none (std is the compiler's).
+pub fn find_std_tree() -> *u8 {
+    unsafe {
+        let ups = [c"compiler/std", c"../compiler/std", c"../../compiler/std",
+            c"../../../compiler/std"];
+        for k in 0..4 {
+            if is_std_tree(ups[k]) {
+                return ups[k];
+            }
+        }
+        0 as *u8
+    }
+}
+
+// Std's files from STD_TREE (an edit's copies in their place: OVERLAY),
+// then std::CHECK_ALLOC as std_alloc_tail writes it, as sources of module
+// m: the first one's file; *start, *end: the text's bytes in SRC.
+pub fn add_std_tree(m: i64, start: *i64, end: *i64) -> i64 {
+    unsafe {
+        let first = FILE_COUNT;
+        let mut k = 0;
+        while std_tree_file(k) != 0 as *u8 {
+            let text = buf_new();
+            let path = std_file_path(STD_TREE, k);
+            read_file(path, text);
+            let s = add_source(path, text);
+            if k == 0 {
+                *start = s;
+            }
+            FILES[FILE_COUNT - 1].module = m;
+            k += 1;
+        }
+        let tail = buf_new();
+        if CHECK_ALLOC_MODE {
+            buf_str(tail, c"pub const CHECK_ALLOC: bool = true;\n");
+            buf_str(tail, if CHECK_ALLOC_LINUX { c"const CHECK_ALLOC_OS: i64 = 1;\n" }
+                else { c"const CHECK_ALLOC_OS: i64 = 0;\n" });
+        } else {
+            buf_str(tail, c"pub const CHECK_ALLOC: bool = false;\n");
+        }
+        add_source(c"<std>", tail);
+        FILES[FILE_COUNT - 1].module = m;
+        *end = FILES[FILE_COUNT - 1].end;
+        first
+    }
+}
+
+// ---- (0.17) Positions in std's built-in text, in std's files ----
+
+// Whether std's files are the built-in text: 0 not known yet, 1 they are
+// (MAP_*), 2 not (no files, or files changed since the compiler was built).
+static mut MAP_STATE: i64 = 0;
+// Where file k's text starts in the built-in text (then where the last
+// ends), and its path.
+static mut MAP_START: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut MAP_PATH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// Whether position pos, in file f, is in std's built-in text and std's
+// files (find_std_tree) hold that text: then *path is the file holding it,
+// *line its line there (the tools print `compiler/std/io.tach:102`, not
+// `<std>:2075`, in the tachyon repository).
+pub fn std_file_line(f: i64, pos: i64, path: **u8, line: *i64) -> bool {
+    unsafe {
+        if STD_TREE != 0 as *u8 || !streq(FILES[f].path, c"<std>") {
+            return false;
+        }
+        if MAP_STATE == 0 {
+            MAP_STATE = if map_std_files(f) { 1 } else { 2 };
+        }
+        let off = pos - FILES[f].start;
+        if MAP_STATE != 1 || off < 0 || off >= MAP_START.data[MAP_PATH.count] {
+            return false;
+        }
+        let mut k = 0;
+        while k + 1 < MAP_PATH.count && MAP_START.data[k + 1] <= off {
+            k += 1;
+        }
+        let mut n = 1;
+        for i in FILES[f].start + MAP_START.data[k]..pos {
+            if SRC[i] == '\n' {
+                n += 1;
+            }
+        }
+        *path = MAP_PATH.data[k] as *u8;
+        *line = n;
+        true
+    }
+}
+
+// MAP_START and MAP_PATH for std's text in file f; false when std's files
+// are not there or are not that text.
+fn map_std_files(f: i64) -> bool {
+    unsafe {
+        let dir = find_std_tree();
+        if dir == 0 as *u8 {
+            return false;
+        }
+        let mut off = 0;
+        let mut k = 0;
+        while std_tree_file(k) != 0 as *u8 {
+            let path = std_file_path(dir, k);
+            let text = buf_new();
+            if !read_file_if(path, text) {
+                return false;
+            }
+            let t = buf_slice(text);
+            let at = FILES[f].start + off;
+            if off + t.len > FILES[f].end - FILES[f].start || SRC[at..at + t.len] != t {
+                return false;
+            }
+            MAP_START.push(off);
+            MAP_PATH.push(path as i64);
+            off += t.len;
+            k += 1;
+        }
+        MAP_START.push(off);
+        true
+    }
+}
+
+// Whether std's files in dir are not the text built into this compiler
+// (std edited since it was built): `tachyonc check` then checks with them
+// (tools/edit/cli.tach: run_check).
+pub fn std_files_differ(dir: *u8) -> bool {
+    unsafe {
+        let built = buf_new();
+        std_source(built);
+        let b = buf_slice(built);
+        let mut off = 0;
+        let mut k = 0;
+        while std_tree_file(k) != 0 as *u8 {
+            let text = buf_new();
+            if !read_file_if(std_file_path(dir, k), text) {
+                return false;
+            }
+            let t = buf_slice(text);
+            if off + t.len > b.len || b[off..off + t.len] != t {
+                return true;
+            }
+            off += t.len;
+            k += 1;
+        }
+        // (then std::CHECK_ALLOC, std_alloc_tail's)
+        b.len - off != "pub const CHECK_ALLOC: bool = false;\n".len
+    }
+}

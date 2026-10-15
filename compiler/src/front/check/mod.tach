@@ -44,7 +44,8 @@ use crate::base::diag::{
     errors_mark, exit_if_errors, recover_enter, recover_leave,
 };
 use crate::front::ast::{
-    FN_BODY_FAILED, FN_LAZY, FN_SIG_FAILED, NODES, SCRATCH, child, list_begin, list_end, list_push,
+    FN_BODY_FAILED, FN_DEFAULT_COPY, FN_LAZY, FN_SIG_FAILED, NODES, SCRATCH, child, list_begin,
+    list_end, list_push,
 };
 use crate::front::ast::NodeKind::{
     Array, Const, Enum, Fn, Impl, Let, PatBind, Static, Struct, Tuple, Use,
@@ -62,15 +63,16 @@ use crate::front::check::unsafety::{UNSAFE_DEPTH, WRAP_NODE, check_wrapped};
 use crate::front::consteval::const_value_of;
 use crate::front::generics::{CUR_INST, INST_QUEUE, TP_BASE, TP_NAMES, TP_TYPES};
 use crate::front::generics::instantiate::{UNIFY_SELF, UNIFY_SELF_TY, fn_instance};
-use crate::front::modules::{CUR_MOD, init_modules};
+use crate::front::modules::{CUR_MOD, STD_MODULE, init_modules, module_of};
 use crate::front::modules::lookup::{collect_uses, resolve_all_uses, resolve_use_of};
 use crate::front::patterns::OR_MODE;
 use crate::front::traits::{
-    check_impl_signatures, check_later_bounds, collect_impl, collect_impls, init_traits,
-    trait_named,
+    bound_trait, check_impl_signatures, check_later_bounds, collect_impl, collect_impls, implements,
+    init_traits, trait_named,
 };
 use crate::front::types::{
-    ENUMS, FNS, FN_COUNT, STRUCTS, TLISTS, TSCRATCH, TYPES, TY_ERROR, TyKind, err_type, type_elem,
+    ENUMS, FNS, FN_COUNT, STRUCTS, TLISTS, TSCRATCH, TYPES, TY_ERROR, TY_I64, TyKind, err_type,
+    type_elem,
 };
 use crate::tools::fiximports::report_legacy_imports;
 use crate::tools::query::command_line::QUERY;
@@ -245,6 +247,14 @@ pub fn check_program(program: i64) {
             check_function_recovering(FNS[INST_QUEUE.data[q]].node);
             q += 1;
         }
+        // (0.17: std from its files, to be edited: its generic functions too)
+        if crate::front::stdtree::STD_TREE != 0 as *u8 {
+            check_std_generics(program);
+            while q < INST_QUEUE.count {
+                check_function_recovering(FNS[INST_QUEUE.data[q]].node);
+                q += 1;
+            }
+        }
         if QUERY {
             check_unchecked(program);
         }
@@ -388,6 +398,92 @@ fn check_unchecked(program: i64) {
         INST_QUEUE.count = queued;
         CLOSURE_FNS.count = closures;
         errors_forget(mark);
+    }
+}
+
+// (0.17) With std read from its files to be edited (front/stdtree.tach):
+// std's generic functions that nothing instantiated, each instantiated
+// once, i64 for its type parameters (Gpa where i64 does not satisfy the
+// bounds: an `Allocator`), so that an edit's errors in their bodies are
+// found. One whose bounds neither satisfies (an `Fn`, an `Iterator`) is
+// checked only where a program uses it, and so is a trait's default method
+// copied into an impl (lazy: `sum` of an iterator of pairs). Its errors are kept: the edit's
+// check reports those it added.
+fn check_std_generics(program: i64) {
+    unsafe {
+        let gpa = crate::front::effects::infer::std_struct_type(c"Gpa");
+        let fns = FN_COUNT;
+        for i in 0..NODES[program].count {
+            let item = child(program, i);
+            if NODES[item].kind != Fn || NODES[item].x == 0
+                || (NODES[item].p & (FN_SIG_FAILED | FN_LAZY | FN_DEFAULT_COPY)) != 0
+                || module_of(item) != STD_MODULE {
+                continue;
+            }
+            let f = NODES[item].x - 1;
+            if FNS[f].generic == 0 || FNS[f].tmpl != 0
+                || (0..fns).any(|g| FNS[g].tmpl == f + 1) {
+                continue;
+            }
+            let params = NODES[item].g;
+            let m = TSCRATCH.count;
+            for k in 0..FNS[f].generic {
+                let t = simple_targ(child(params, k), gpa);
+                if t == 0 {
+                    break;
+                }
+                TSCRATCH.push(t);
+            }
+            if TSCRATCH.count - m != FNS[f].generic {
+                TSCRATCH.count = m;
+                continue;
+            }
+            let depth = RECOVER_DEPTH;
+            let state = save_check_state();
+            if _setjmp(recover_enter()) == 0 {
+                fn_instance(f, m, item);
+            } else {
+                restore_check_state(state);
+            }
+            recover_leave(depth);
+        }
+    }
+}
+
+// A type for type parameter p (check_std_generics): i64, or gpa, the one
+// that satisfies its bounds; 0 when neither does or a bound is not a
+// plain trait.
+fn simple_targ(p: i64, gpa: i64) -> i64 {
+    unsafe {
+        let bounds = NODES[p].h;
+        if bounds == 0 {
+            return TY_I64;
+        }
+        for c in 0..2 {
+            let t = if c == 0 { TY_I64 } else { gpa };
+            if t == 0 {
+                continue;
+            }
+            let mut ok = true;
+            for i in 0..NODES[bounds].count {
+                let b = child(bounds, i);
+                if NODES[b].kind == crate::front::ast::NodeKind::EffectSet {
+                    continue;
+                }
+                if NODES[b].kind == crate::front::ast::NodeKind::TyFn || NODES[b].h != 0
+                    || NODES[b].g != 0 {
+                    return 0;
+                }
+                if !implements(bound_trait(b), t) {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                return t;
+            }
+        }
+        0
     }
 }
 

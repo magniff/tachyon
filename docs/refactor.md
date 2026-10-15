@@ -399,6 +399,39 @@ made crate::lib::extra→2 files→+6 -0 lines
 file of the program would have it as a child's file (`refactor
 new-module` makes the modules of a path).
 
+## Editing std by name (0.17)
+
+In the tachyon repository (`compiler/std/` with its `embed.sh`, from the
+current directory or one of the three above it), an edit whose target
+is a std item (`edit patch std::trim`, `edit insert --after Vec::swap`,
+`edit replace std::split`, `edit delete`, `edit wrap`, a block of `edit
+apply`) or one of std's files (`edit patch compiler/std/io.tach:102`)
+runs again with `--std-tree compiler/std`: std is then read from its
+files, each a file of the module `std` under its own path, so the edit
+is made in `compiler/std/FILE.tach` and checked with the edited std:
+every function of std, and each generic one nothing instantiates with
+`i64` for its type parameters (`Gpa` for an `Allocator`), so an error in
+a body is found at once (`compiler/std/io.tach:124:16: error[type
+error] undefined variable 'None' | help: std has no prelude: write
+`Option::None``). Once it is written, `compiler/std/embed.sh` makes
+`compiler/src/front/stdsrc.tach` from the files (`note edit.std`);
+`undo` of a std edit does the same. The compiler that runs has the old
+std until it is rebuilt (`bootstrap/bootstrap.sh --dev`).
+
+```
+$ tachyonc edit insert --after std::trim < strip_prefix.tach
+inserted after std::trim→compiler/std/io.tach→+9 -0 lines
+note edit.std: ran compiler/std/embed.sh: compiler/src/front/stdsrc.tach has std's new text; rebuild to use it (bootstrap/bootstrap.sh --dev)
+```
+
+`tachyonc check` in the repository reads std from its files when they
+differ from the compiler's std (edited with the Edit tool, or not yet
+built in), with every function checked as above (`note
+check.std-files`); otherwise std is the compiler's, as before. Outside
+the repository std is the compiler's text and an edit of it is refused
+(`edit.not-source`). The recipe, with the test and the guide entry:
+`tachyonc guide how add-std-fn`.
+
 ## Items as text
 
 `edit` works on an item's text: whole lines when the item has its lines
@@ -752,6 +785,9 @@ together, as both sides' `use` lines importing a name twice).
 
 | code | severity | exit | when | try |
 |---|---|---|---|---|
+| `edit.std` | note | 0 | (0.17) a std edit in the repository wrote std's files; embed.sh made stdsrc.tach | rebuild: `bootstrap/bootstrap.sh --dev` |
+| `edit.std` | warning | 0 | (0.17) the same, and embed.sh failed | `compiler/std/embed.sh` |
+| `check.std-files` | note | 0 | (0.17) std's files differ from the compiler's std: checked with them | |
 | `edit.breaks` | error | 1 | the edit adds errors (they are printed); nothing written | the command with `--no-check` |
 | `edit.breaks` | warning | 1, 0 | the same with `--dry-run`, or `--no-check` (written) | `tachyonc check` |
 | `edit.refactor` | note | | (0.15) with edit.breaks: an edited item's shape changed and its uses broke | the refactoring that changes them with it |

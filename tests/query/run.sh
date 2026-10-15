@@ -248,6 +248,37 @@ ok=0
 printf '%s\n' "$out" | head -2 | grep -q '^// use std::HashMap;$' && ok=1
 check std_show_no_program "$ok" "$(printf '%s\n' "$out" | head -5)"
 
+# (0.17) In the repository, std's items are where its files have them,
+# every function of std checks with them, and the "add an X" queries
+# answer: `query examples` for every kind (its items still exist),
+# `query similar`.
+out=$("$COMPILER" query def std::trim 2>&1)
+loc=$(printf '%s\n' "$out" | awk -F "$TAB" '$1 == "std::trim" { print $2 }')
+ok=0
+case "$loc" in compiler/std/*.tach:*) ok=1 ;; esac
+check std_def_in_repo "$ok" "$out"
+out=$("$COMPILER" query show "${loc%:*}" 2>&1)
+ok=0
+printf '%s\n' "$out" | head -1 | grep -q '^// std::trim' && ok=1
+check std_show_by_file "$ok" "$(printf '%s\n' "$out" | head -3)"
+out=$("$COMPILER" check --std-tree compiler/std 2>&1)
+ok=0
+[ $? -eq 0 ] && [ -z "$out" ] && ok=1
+check std_tree_checks "$ok" "$out"
+bad=""
+for kind in $("$COMPILER" query examples | cut -f1); do
+    "$COMPILER" query examples "$kind" >"$WORK/ex.out" 2>"$WORK/ex.err" || bad="$bad $kind"
+    [ -s "$WORK/ex.err" ] && bad="$bad $kind($(head -1 "$WORK/ex.err"))"
+done
+n=$("$COMPILER" query examples | wc -l)
+ok=0
+[ -z "$bad" ] && [ "$n" -ge 8 ] && ok=1
+check self_examples "$ok" "$n kinds; failing:$bad"
+out=$("$COMPILER" query similar std::trim crate::middle::fold::combine_not 2>&1)
+ok=0
+[ "$(printf '%s\n' "$out" | grep -c '^// 3 of [0-9]* fns like ')" = 2 ] && ok=1
+check self_similar "$ok" "$(printf '%s\n' "$out" | grep '^// ' | head -8)"
+
 # Every name a tool prints is accepted back (0.15): the paths, positions
 # (FILE:L:C, FILE:A-B, FILE:L:C: of a short diagnostic), enclosing items
 # and modules that def, show, refs, callers, items, type and check print,
