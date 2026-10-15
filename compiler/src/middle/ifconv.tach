@@ -1,0 +1,234 @@
+// If-conversion in innermost loops (0.15), before the vectorizer
+// (opt.tach's optimize_loops).
+//
+// A branch in an innermost loop whose ways meet again after doing little
+// (a triangle or a diamond: arms of at most IFCONV_COST cheap pure
+// instructions, no division, no memory) becomes straight-line code: the
+// arms' instructions move up before the branch, and each phi of the
+// meeting block that takes different values from the two ways becomes a
+// SEL on the branch's condition (k ? x : y). `if x > m { m = x }`, `if
+// x & 1 == 0 { t += x * x }` and `if x > r { c += 1 }` are then
+// reductions the vectorizer and the run-time unroller take (the select a
+// vector select on a mask; instcombine makes `k ? t + x : t` into `t + (k
+// ? x : 0)`), and the loop has no branch to mispredict. A condition the
+// same in every iteration is left to unswitching.
+use crate::base::{IntVec, free};
+use crate::front::types::{is_float, is_integer};
+use crate::middle::fold::combine_select;
+use crate::middle::ir::{
+    BLOCKS, INSTS, IRF, IRFUNCS, Op, Term, ir_append, ir_arg, ir_make, ir_set_arg, ir_unlink,
+    ir_val,
+};
+use crate::middle::ir::cfg::pred_index;
+use crate::middle::loops::{
+    analyze_loops, invariant_in, is_innermost, loop_block, loop_contains, loop_count, loop_header,
+    loop_size,
+};
+use crate::middle::opt::remove_pred_at;
+
+// The instructions both arms may hold together (constants free).
+const IFCONV_COST: i64 = 4;
+
+pub static mut IFCONV: bool = true;
+
+// The cost of arm block b (its instructions that are not constants), or -1
+// when it holds one that may not run unconditionally.
+fn arm_cost(b: i64) -> i64 {
+    unsafe {
+        let mut cost = 0;
+        let mut v = BLOCKS[b].first;
+        while v != 0 {
+            let op = INSTS[v].op;
+            if op == Op::Const {
+                v = INSTS[v].next;
+                continue;
+            }
+            if !(op.is_pure() || op == Op::Sel) || op == Op::Div || op == Op::Rem
+                || is_float(INSTS[v].ty) || (op == Op::Conv && is_float(INSTS[v].imm2))
+                || (op == Op::Cmp && is_float(INSTS[v].imm2)) {
+                return -1;
+            }
+            cost += 1;
+            v = INSTS[v].next;
+        }
+        cost
+    }
+}
+
+// Whether block b is an arm of h: reached from h alone, jumping on.
+fn is_arm(b: i64, h: i64) -> bool {
+    unsafe {
+        BLOCKS[b].preds.count == 1 && BLOCKS[b].preds.data[0] == h && BLOCKS[b].term == Term::Jump
+    }
+}
+
+fn move_up(from: i64, to: i64) {
+    unsafe {
+        let mut v = BLOCKS[from].first;
+        while v != 0 {
+            let next = INSTS[v].next;
+            ir_unlink(v);
+            ir_append(to, v);
+            v = next;
+        }
+    }
+}
+
+fn drop_arm(b: i64) {
+    unsafe {
+        BLOCKS[b].removed = 1;
+        BLOCKS[b].term = Term::None;
+        BLOCKS[b].preds.count = 0;
+        BLOCKS[b].first = 0;
+        BLOCKS[b].last = 0;
+    }
+}
+
+// Whether function fi has a branch to an arm (a block reached from it
+// alone, jumping on): no loop analysis without one.
+fn has_arm(fi: i64) -> bool {
+    unsafe {
+        for i in 0..IRFUNCS[fi].blocks.count {
+            let h = IRFUNCS[fi].blocks.data[i];
+            if BLOCKS[h].removed == 0 && BLOCKS[h].term == Term::Branch
+                && (is_arm(BLOCKS[h].s0, h) || is_arm(BLOCKS[h].s1, h)) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// If-converts the branch ending block h of loop l; returns whether it did.
+fn convert(l: i64, h: i64) -> bool {
+    unsafe {
+        let t = BLOCKS[h].s0;
+        let e = BLOCKS[h].s1;
+        if t == e || t == h || e == h {
+            return false;
+        }
+        let mut join = 0;
+        let mut arm_t = 0;
+        let mut arm_e = 0;
+        if is_arm(t, h) && is_arm(e, h) && BLOCKS[t].s0 == BLOCKS[e].s0 {
+            join = BLOCKS[t].s0;
+            arm_t = t;
+            arm_e = e;
+        } else if is_arm(t, h) && BLOCKS[t].s0 == e {
+            join = e;
+            arm_t = t;
+        } else if is_arm(e, h) && BLOCKS[e].s0 == t {
+            join = t;
+            arm_e = e;
+        } else {
+            return false;
+        }
+        if join == h || join == loop_header(l) || !loop_contains(l, join)
+            || (join == t && arm_t != 0) || (join == e && arm_e != 0) {
+            return false;
+        }
+        let cost_t = if arm_t != 0 { arm_cost(arm_t) } else { 0 };
+        let cost_e = if arm_e != 0 { arm_cost(arm_e) } else { 0 };
+        if cost_t < 0 || cost_e < 0 || cost_t + cost_e > IFCONV_COST {
+            return false;
+        }
+        let index_t = pred_index(join, if arm_t != 0 { arm_t } else { h });
+        let index_e = pred_index(join, if arm_e != 0 { arm_e } else { h });
+        if index_t < 0 || index_e < 0 {
+            return false;
+        }
+        let mut selects = 0;
+        let mut phi = BLOCKS[join].first;
+        while phi != 0 && INSTS[phi].op == Op::Phi {
+            if ir_val(ir_arg(phi, index_t)) != ir_val(ir_arg(phi, index_e)) {
+                if !is_integer(INSTS[phi].ty) {
+                    return false;
+                }
+                selects += 1;
+            }
+            phi = INSTS[phi].next;
+        }
+        if selects == 0 || selects > 3 {
+            return false;
+        }
+        let cond = BLOCKS[h].cond;
+        if arm_t != 0 {
+            move_up(arm_t, h);
+        }
+        if arm_e != 0 {
+            move_up(arm_e, h);
+        }
+        phi = BLOCKS[join].first;
+        while phi != 0 && INSTS[phi].op == Op::Phi {
+            let value_t = ir_val(ir_arg(phi, index_t));
+            let value_e = ir_val(ir_arg(phi, index_e));
+            let mut picked = value_t;
+            if value_t != value_e {
+                picked = ir_make(Op::Sel, INSTS[phi].ty, cond, value_t, 0);
+                INSTS[picked].c = value_e;
+                ir_append(h, picked);
+                // (k ? t + x : t is t + (k ? x : 0) at once: a reduction the
+                // vectorizer takes)
+                combine_select(picked);
+            }
+            ir_set_arg(phi, index_t, picked);
+            ir_set_arg(phi, index_e, picked);
+            phi = INSTS[phi].next;
+        }
+        // h jumps to the meeting block, once.
+        let removed_index = if arm_e != 0 { index_e } else { index_t };
+        let kept = if arm_e != 0 { arm_t } else { arm_e };
+        BLOCKS[h].term = Term::Jump;
+        BLOCKS[h].cond = 0;
+        BLOCKS[h].s0 = join;
+        BLOCKS[h].s1 = 0;
+        remove_pred_at(join, removed_index);
+        if kept != 0 {
+            BLOCKS[join].preds.data[pred_index(join, kept)] = h;
+        }
+        if arm_t != 0 {
+            drop_arm(arm_t);
+        }
+        if arm_e != 0 {
+            drop_arm(arm_e);
+        }
+        true
+    }
+}
+
+// If-converts the small branches of fi's innermost loops; returns whether
+// any was.
+pub fn if_convert_loops(fi: i64) -> bool {
+    unsafe {
+        if !IFCONV || !has_arm(fi) {
+            return false;
+        }
+        IRF = fi;
+        analyze_loops(fi);
+        let mut heads = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut owner = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for l in 0..loop_count() {
+            if !is_innermost(l) {
+                continue;
+            }
+            for i in 0..loop_size(l) {
+                let b = loop_block(l, i);
+                if BLOCKS[b].term == Term::Branch && !invariant_in(l, ir_val(BLOCKS[b].cond)) {
+                    heads.push(b);
+                    owner.push(l);
+                }
+            }
+        }
+        let mut changed = false;
+        for i in 0..heads.count {
+            let b = heads.data[i];
+            if BLOCKS[b].removed == 0 && BLOCKS[b].term == Term::Branch
+                && convert(owner.data[i], b) {
+                changed = true;
+            }
+        }
+        free(heads.data as *u8);
+        free(owner.data as *u8);
+        changed
+    }
+}
