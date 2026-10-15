@@ -16,7 +16,11 @@ PROMPTS_DIR = os.path.join(EVAL_DIR, "prompts")
 HOOKS_DIR = os.path.join(REPO_ROOT, "tools", "agent-hooks")
 
 TACH_CONDS = ("bare", "guide", "tools", "both")
-ALL_CONDS = TACH_CONDS + ("rust",)
+PROGRAM_CONDS = TACH_CONDS + ("rust",)
+# (0.16) the compiler tasks' conditions: AGENTS.md with the tools table and
+# the hooks, or without them (lib/ctasks.py)
+COMPILER_CONDS = ("compiler-tools", "compiler-plain")
+ALL_CONDS = PROGRAM_CONDS + COMPILER_CONDS
 KINDS = ("write", "fix", "extend", "refactor", "perf")
 
 TACH_BUILD = ["tachyonc", "main.tach", "-o", "prog"]
@@ -118,6 +122,8 @@ def parse_toml(text):
 # ---------------------------------------------------------------- tasks
 
 class Task:
+    is_compiler = False
+
     def __init__(self, path):
         self.path = path
         self.id = os.path.basename(path)
@@ -143,18 +149,47 @@ class Task:
         return os.path.join(self.path, self.check) if self.check else None
 
 
-def load_tasks(tasks_dir, names=None):
-    if not os.path.isdir(tasks_dir):
-        raise SystemExit("no tasks directory: %s" % tasks_dir)
-    ids = sorted(d for d in os.listdir(tasks_dir)
-                 if os.path.isfile(os.path.join(tasks_dir, d, "meta.toml")))
+# The task sets `--set` names (0.16): every directory holds NN-name/ tasks.
+TASK_SETS = {
+    "programs": ("tasks",),
+    "compiler": ("ctasks",),
+    "all": ("tasks", "ctasks"),
+    "dev": ("devtasks",),
+}
+
+
+def task_dirs(tasks_dir=None, task_set=None):
+    """The task directories: --tasks-dir (comma-separated) or --set."""
+    if task_set:
+        if task_set not in TASK_SETS:
+            raise SystemExit("--set is one of %s, got %r" % (", ".join(TASK_SETS), task_set))
+        return [os.path.join(EVAL_DIR, d) for d in TASK_SETS[task_set]]
+    return [d for d in (tasks_dir or DEFAULT_TASKS_DIR).split(",") if d]
+
+
+def load_tasks(tasks_dir, names=None, task_set=None):
+    """The tasks of the directories (a program task, or a compiler task
+    when it has solution.patch: lib/ctasks.py), by id; `names` picks."""
+    from lib.ctasks import CTask, is_ctask_dir
+    found = {}
+    for td in task_dirs(tasks_dir, task_set):
+        if not os.path.isdir(td):
+            raise SystemExit("no tasks directory: %s" % td)
+        for d in sorted(os.listdir(td)):
+            path = os.path.join(td, d)
+            if not os.path.isfile(os.path.join(path, "meta.toml")):
+                continue
+            if d in found:
+                raise SystemExit("task %s is in two directories" % d)
+            found[d] = path
+    ids = sorted(found)
     if names:
         missing = [n for n in names if n not in ids]
         if missing:
             raise SystemExit("unknown task(s): %s (have: %s)"
                              % (", ".join(missing), ", ".join(ids)))
         ids = [i for i in ids if i in names]
-    return [Task(os.path.join(tasks_dir, i)) for i in ids]
+    return [CTask(found[i]) if is_ctask_dir(found[i]) else Task(found[i]) for i in ids]
 
 
 # ---------------------------------------------------------------- processes
@@ -230,7 +265,8 @@ def normalise(b):
 
 
 def copy_tree(src, dst, skip=(".gitkeep",)):
-    """Copies src's contents into dst (created), leaving out `skip` names."""
+    """Copies src's contents into dst (created; merged into what is there),
+    leaving out `skip` names."""
     os.makedirs(dst, exist_ok=True)
     if not os.path.isdir(src):
         return
@@ -240,7 +276,7 @@ def copy_tree(src, dst, skip=(".gitkeep",)):
         s, d = os.path.join(src, name), os.path.join(dst, name)
         try:
             if os.path.isdir(s) and not os.path.islink(s):
-                shutil.copytree(s, d, symlinks=True)
+                shutil.copytree(s, d, symlinks=True, dirs_exist_ok=True)
             else:
                 shutil.copy2(s, d, follow_symlinks=False)
         except FileNotFoundError:  # a temporary file that went away
@@ -260,15 +296,44 @@ def tail(b, n=2000):
     return s if len(s) <= n else "..." + s[-n:]
 
 
-def install_check_hook(ws_root):
-    """The check hook (tools/agent-hooks/check-after-edit.py and the module
-    it loads) copied out of the repository, which the agent's sandbox
-    cannot read: its path."""
+def install_hooks(ws_root):
+    """The agent hooks (tools/agent-hooks: check-after-edit.py, query-first.py
+    and the module they load) copied out of the repository, which the
+    agent's sandbox cannot read: {"check": path, "query": path}."""
     d = os.path.join(ws_root, "hooks")
     os.makedirs(d, exist_ok=True)
-    for f in ("check-after-edit.py", "tachyonc_cmd.py"):
+    for f in ("check-after-edit.py", "query-first.py", "tachyonc_cmd.py"):
         shutil.copyfile(os.path.join(HOOKS_DIR, f), os.path.join(d, f))
-    return os.path.join(d, "check-after-edit.py")
+    return {"check": os.path.join(d, "check-after-edit.py"),
+            "query": os.path.join(d, "query-first.py")}
+
+
+def install_check_hook(ws_root):
+    return install_hooks(ws_root)["check"]
+
+
+def query_hook_summary(log_path):
+    """result.json's query_hook (compiler-tools): what the query-first hook
+    logged in the workspace's .git/agent-tools.jsonl, by record kind
+    (query, blocked, escape, edit, edit-blocked, edit-escape, ...), the
+    escapes' reasons, and the check hook's records counted apart."""
+    kinds, reasons = {}, []
+    try:
+        with open(log_path) as fh:
+            for line in fh:
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                k = r.get("kind") or "?"
+                kinds[k] = kinds.get(k, 0) + 1
+                if k in ("escape", "edit-escape") and r.get("reason"):
+                    reasons.append(str(r.get("reason"))[:160])
+    except OSError:
+        return None
+    return {"kinds": kinds, "blocked": kinds.get("blocked", 0) + kinds.get("edit-blocked", 0),
+            "escapes": kinds.get("escape", 0) + kinds.get("edit-escape", 0),
+            "escape_reasons": reasons[:20]}
 
 
 def check_hook_summary(log_path):

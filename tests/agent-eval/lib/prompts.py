@@ -39,3 +39,18 @@ def preamble(cond, guide=None, env_note=None, check_hook=False):
 def build_prompt(cond, task_text, guide=None, env_note=None, check_hook=False):
     return (preamble(cond, guide, env_note, check_hook) + "\n\n---\n\n"
             + task_text.strip() + "\n")
+
+
+def compiler_prompt(cond, task_text, agents_text, env_note=None):
+    """(0.16) A compiler task's prompt: the repository, its AGENTS.md for the
+    condition (lib/ctasks.agents_md), how to build and test in the copy,
+    the shell note (Claude), for compiler-tools the check hook, the
+    closing instructions, then task.md."""
+    parts = [_read("compiler-intro.md"), "<AGENTS.md>\n" + agents_text.strip() + "\n</AGENTS.md>",
+             _read("compiler-env.md")]
+    if cond == "compiler-tools":
+        parts.append(_read("check-hook.md"))
+    if env_note:
+        parts.append(_read(env_note))
+    parts.append(_read("compiler-ending.md"))
+    return "\n\n".join(parts) + "\n\n---\n\n" + task_text.strip() + "\n"

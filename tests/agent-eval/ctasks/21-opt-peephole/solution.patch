@@ -1,0 +1,88 @@
+diff --git a/compiler/src/middle/fold.tach b/compiler/src/middle/fold.tach
+index 733c38d..d9b5059 100644
+--- a/compiler/src/middle/fold.tach
++++ b/compiler/src/middle/fold.tach
+@@ -684,6 +684,24 @@ fn combine(v: i64) -> bool {
+         if (op == Shl || op == Shr) && shift_amount(c, ty) == 0 {
+             return replace_same_type(v, a);
+         }
++        // (x << c1) << c2 is x << (c1 + c2), and >> likewise, each amount
++        // taken as the machine takes it; past the width every bit is
++        // shifted out (0), or, arithmetic, only the sign is left.
++        if (op == Shl || op == Shr) && INSTS[a].op == op && INSTS[a].ty == ty
++            && is_const(INSTS[a].b) && is_integer(ty) {
++            let mut total = shift_amount(INSTS[INSTS[a].b].imm, ty) + shift_amount(c, ty);
++            let bits = int_bits(ty) as u64;
++            if total >= bits {
++                if op == Shl || !is_signed(ty) {
++                    return make_const(v, 0);
++                }
++                total = bits - 1;
++            }
++            INSTS[v].a = INSTS[a].a;
++            let operand = const_before(v, total as i64, INSTS[b].ty);
++            INSTS[v].b = operand;
++            return true;
++        }
+         if c == 0 && (op == Mul || op == And) {
+             return make_const(v, 0);
+         }
+diff --git a/docs/optimizer.md b/docs/optimizer.md
+index 9de97e8..e4fcad8 100644
+--- a/docs/optimizer.md
++++ b/docs/optimizer.md
+@@ -104,7 +104,7 @@ pointer) and every arithmetic rule.
+ | cleanup | unreachable-block removal; trivial-phi removal (a phi whose operands are one value is that value), to a fixpoint | `opt.tach` |
+ | SCCP | Wegman & Zadeck, *Constant Propagation with Conditional Branches* (TOPLAS 1991): a lattice per value, executable edges, two work lists; constant values and decided branches are rewritten | `fold.tach` |
+ | folding | what the machine computes: wrapping arithmetic at every width, `x / 0 == 0`, `x % 0 == x`, `MIN / -1 == MIN`, shift amounts modulo 32 (types up to 32 bits) or 64, IEEE comparisons, the saturating float-to-integer conversions of `-O0` (including its quirks: up to 32-bit signed targets saturate at 32 bits and wrap) | `fold.tach` |
+-| instruction combining | constants on the right; identities (`x + 0`, `x * 1`, `x & 0`, `x - x`, `x ^ x`, `x & x`, double negation, `b != false`); `x * 2^k` to a shift; unsigned division and remainder by `2^k` to a shift and a mask; signed division by `2^k` with the rounding fix-up (`(x + ((x >> 63) >>> (64 - k))) >> k`) and remainder from it; reassociation of constant address offsets and their folding into loads and stores; comparisons with the constant on the left mirrored; a branch on `!x` swapped | `fold.tach` |
++| instruction combining | constants on the right; identities (`x + 0`, `x * 1`, `x & 0`, `x - x`, `x ^ x`, `x & x`, double negation, `b != false`); `x * 2^k` to a shift; a shift of a shift by constants, one direction and type, to one shift (past the width: 0, or the sign for `>>` of a signed type); unsigned division and remainder by `2^k` to a shift and a mask; signed division by `2^k` with the rounding fix-up (`(x + ((x >> 63) >>> (64 - k))) >> k`) and remainder from it; reassociation of constant address offsets and their folding into loads and stores; comparisons with the constant on the left mirrored; a branch on `!x` swapped | `fold.tach` |
+ | CFG simplification | branches on constants and branches with one target become jumps; a block merges into its only predecessor when that predecessor jumps to it; jumps through empty blocks are threaded (when the target has no phis) | `opt.tach` |
+ | dominators | Cooper, Harvey & Kennedy, *A Simple, Fast Dominance Algorithm*, over a reverse post-order | `opt.tach` |
+ | GVN | a walk of the dominator tree with a scoped hash table (undo log, so scopes are popped in constant time per entry) over the pure instructions; commutative operands in a canonical order | `gvn.tach` |
+diff --git a/tests/run/opt_shift_chains.tach b/tests/run/opt_shift_chains.tach
+new file mode 100644
+index 0000000..d039e70
+--- /dev/null
++++ b/tests/run/opt_shift_chains.tach
+@@ -0,0 +1,40 @@
++// Shifts of shifts by constants combine (instruction combining): one
++// shift by the sum, or 0 past the width (left, logical), or a shift by
++// width - 1 (arithmetic): `logical` returns 0,
++// and its calls are gone. The program prints what -O0 prints.
++// EXPECT: 128 0 0
++// EXPECT: 4294967168 0 -1
++// EXPECT: 5120000 0 -1
++// CHECK: fn left:
++// CHECK: const 7
++// CHECK: shl
++// CHECK-NOT: shl
++// CHECK: ret
++// CHECK: fn arithmetic:
++// CHECK: const 15
++// CHECK: shr
++// CHECK-NOT: shr
++// CHECK: ret
++// CHECK: fn main:
++// CHECK-NOT: call logical
++extern "C" {
++    fn printf(format: *u8, ...) -> i32;
++}
++
++#[inline(never)]
++fn left(x: u32) -> u32 { (x << 3) << 4 }
++#[inline(never)]
++fn logical(x: u64) -> u64 { (x >> 30) >> 40 }
++#[inline(never)]
++fn arithmetic(x: i16) -> i16 { (x >> 9) >> 9 }
++
++fn main() -> i32 {
++    let xs: [i64; 3] = [1, -1, 40000];
++    for i in 0..3 {
++        let x = xs[i];
++        unsafe {
++            printf(c"%u %lu %d\n", left(x as u32), logical(x as u64), arithmetic(x as i16) as i32);
++        }
++    }
++    0
++}

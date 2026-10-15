@@ -7,6 +7,7 @@ import shutil
 import tempfile
 
 from lib.common import KINDS, load_tasks
+from lib.ctasks import check_ctask
 from lib.grade import grade_dir, prepare_bins
 
 ID_RE = re.compile(r"^\d\d-[a-z0-9]+(-[a-z0-9]+)*$")
@@ -89,20 +90,30 @@ def check_task(task, bins, scratch):
 
 
 def main(args):
-    tasks = load_tasks(args.tasks_dir, args.tasks or None)
+    tasks = load_tasks(args.tasks_dir, args.tasks or None, args.set)
     root = tempfile.mkdtemp(prefix="tachyon-eval-check-")
-    bins = prepare_bins(root, args.tachyonc)
-    if not os.path.exists(os.path.join(bins["rust"], "rustc")):
-        print("error: rustc not found")
-        return 1
+    bins = None
+    if any(not t.is_compiler for t in tasks):
+        bins = prepare_bins(root, args.tachyonc)
+        if not os.path.exists(os.path.join(bins["rust"], "rustc")):
+            print("error: rustc not found")
+            return 1
     bad = 0
     for t in tasks:
-        problems, notes = check_task(t, bins, os.path.join(root, "work"))
+        if t.is_compiler:
+            # (0.16) a compiler task: the starter fails the grading, the
+            # reference solution passes it (lib/ctasks.py)
+            problems, notes = check_ctask(t, args.base, args.builder, root)
+        else:
+            problems, notes = check_task(t, bins, os.path.join(root, "work"))
         if problems:
             bad += 1
             print("FAIL %s: %s" % (t.id, "; ".join(problems)))
         else:
             print("ok   %s %s: %s" % (t.id, t.kind, ", ".join(notes)))
     print("%d task(s), %d with problems" % (len(tasks), bad))
-    shutil.rmtree(root, ignore_errors=True)
+    if args.keep:
+        print("kept: %s" % root)
+    else:
+        shutil.rmtree(root, ignore_errors=True)
     return 1 if bad else 0

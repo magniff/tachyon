@@ -2,7 +2,8 @@
 """tachyon's agent eval: how well a coding agent writes tachyon (bare, with
 the guide, with the tools, with both) against the same tasks in Rust.
 
-    run.py check-tasks [--tasks-dir D] [TASK...]
+    run.py check-tasks [--set all|programs|compiler|dev | --tasks-dir D] [TASK...]
+    run.py list [--set ...]
     run.py run --model M --cond C[,C...] [--tasks T,...] [--reps N] [--jobs J] [--out DIR]
     run.py report RUNDIR... [--md docs/eval/FILE.md]
 
@@ -14,7 +15,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from lib.common import ALL_CONDS, DEFAULT_TASKS_DIR, REPO_ROOT  # noqa: E402
+from lib.common import (ALL_CONDS, DEFAULT_TASKS_DIR, REPO_ROOT,  # noqa: E402
+                        TASK_SETS, load_tasks)
 
 
 def main(argv):
@@ -24,13 +26,26 @@ def main(argv):
 
     def common(p):
         p.add_argument("--tasks-dir", default=DEFAULT_TASKS_DIR,
-                       help="the tasks (default tests/agent-eval/tasks)")
+                       help="the task directories, comma-separated (default "
+                       "tests/agent-eval/tasks)")
+        p.add_argument("--set", choices=sorted(TASK_SETS),
+                       help="instead of --tasks-dir: programs (tasks/), compiler "
+                       "(ctasks/), all (both), dev (devtasks/)")
+        p.add_argument("--base", help="compiler tasks: the base commit instead of "
+                       "meta.toml's base (then base_fallback)")
+        p.add_argument("--builder", help="compiler tasks: the compiler that builds the "
+                       "base (default: the release its releases.toml names, from a "
+                       "bootstrap cache)")
         p.add_argument("--tachyonc", default=os.path.join(REPO_ROOT, "target", "tachyonc"),
                        help="the tachyon compiler under test (default target/tachyonc)")
 
     p = sub.add_parser("check-tasks", help="validate tasks: solutions pass, starters fail")
     common(p)
+    p.add_argument("--keep", action="store_true", help="keep the scratch directory")
     p.add_argument("tasks", nargs="*", metavar="TASK")
+
+    p = sub.add_parser("list", help="the tasks, with kind, title and time limit")
+    common(p)
 
     p = sub.add_parser("run", help="run agents on tasks and grade them")
     common(p)
@@ -51,9 +66,14 @@ def main(argv):
                    help="claude backend: acceptEdits + sandbox + Bash allowlist "
                    "(default), or bypassPermissions inside the same sandbox")
     p.add_argument("--check-hook", action="store_true",
-                   help="tools and both conditions: tools/agent-hooks/check-after-edit.py "
+                   help="tools and both conditions (always on in compiler-tools): "
+                   "tools/agent-hooks/check-after-edit.py "
                    "after every change to a .tach file (its errors appended to the "
                    "tool result); result.json gets check_hook")
+    p.add_argument("--dry-run", action="store_true",
+                   help="no model: set up each workspace, write prompt.md, settings.json "
+                   "and command.json, and fire the hooks on synthetic events (result.json "
+                   "gets dry_run); workspaces are kept")
     p.add_argument("--keep-workspaces", action="store_true",
                    help="keep the live workspaces (a tarball is kept anyway)")
 
@@ -65,6 +85,14 @@ def main(argv):
     if args.cmd == "check-tasks":
         from lib import checktasks
         return checktasks.main(args)
+    if args.cmd == "list":
+        for t in load_tasks(args.tasks_dir, None, args.set):
+            extra = ""
+            if t.is_compiler:
+                extra = " base %s (fallback %s); suite %s" % (
+                    t.base, t.base_fallback, ",".join(t.suite))
+            print("%-20s %-9s %5ds  %s%s" % (t.id, t.kind, t.timeout_s, t.title, extra))
+        return 0
     if args.cmd == "run":
         from lib import runner
         return runner.main(args)
