@@ -6,7 +6,8 @@
 // PATTERN and REPLACEMENT are tachyon expressions (statements, when the
 // pattern ends with `;` or starts with `let`) with holes: `$x` matches
 // any expression (or type), `$x...` any number of arguments of a call, a
-// tuple or an array; a hole written twice matches equal code (the same
+// tuple or an array (0.15: or statements of a block, laid out as the
+// site's were); a hole written twice matches equal code (the same
 // tokens). `--where '$x: T'` keeps the sites where the checker gave $x
 // type T. Both are parsed by the compiler's parser (each hole an
 // identifier, `__tachyon_hole_x`), and the pattern is matched against
@@ -34,21 +35,22 @@ use crate::front::ast::{KEEP_PARSED, NodeKind, PARSED_COUNT};
 use crate::front::modules::file_of_pos;
 use crate::front::types::buf_type;
 use crate::tools::edit::{TARGET, edit_replace};
-use crate::tools::edit::apply::{apply_edit, set_command};
+use crate::tools::edit::apply::{ADD_IMPORTS, apply_edit, set_command};
 use crate::tools::edit::cli::take_edit_option;
 use crate::tools::query::{c_slice, load_program, root_or_diag};
 use crate::tools::query::diagnostics::{
     PROG, ROOT_GIVEN, TOOL, diag, diags, program_errors, put_cword, put_root, put_word, try_end,
     write_diags,
 };
-use crate::tools::query::positions::put_loc;
+use crate::tools::query::positions::{line_of, put_loc, put_path};
 use crate::tools::query::refs::{OPT_IN, put_bad_in, ref_in, resolve_in};
-use parsed::{parenthesized, slot_levels};
+use parsed::{pa, parenthesized, pb, slot_levels};
 use pattern::{
-    B_END, B_NODE, B_START, H_NAME, H_REST, H_SYM, H_TYPE, MISS_HOLE, MISS_NODE, MISS_TYPE,
-    PAT_HOLES, P_LEVELS, R_END, R_HOLES, R_LEVELS, R_ROOT, R_START, STMTS, TYPE_MISSES, UNTYPED,
-    hole_named, hole_of, holes_to_idents, is_name_byte, match_node, note_clones, parse_text,
-    replacement_level, replacement_text,
+    B_END, B_LIST, B_NODE, B_START, DROPPED, DROP_HOLE, DROP_USE, H_NAME, H_REST, H_SYM, H_TYPE,
+    MISS_HOLE, MISS_NODE, MISS_TYPE, PAT_HOLES, P_LEVELS, R_END, R_HOLES, R_HOLE_SPAN, R_KEPT,
+    R_LEVELS, R_ROOT, R_START, STMTS, TYPE_MISSES, UNTYPED, dropped_use, hole_named, hole_of,
+    holes_to_idents, is_name_byte, match_node, note_breaks, note_clones, parse_text,
+    replacement_level, replacement_text, rest_hole_of, seq_at, seq_len, types_match,
 };
 
 use parsed::{pchild, pcount, pend, pk, pstart};
@@ -222,6 +224,9 @@ fn run_rewrite_inner(argc: i64, argv: **u8) -> i64 {
             return 2;
         }
         KEEP_PARSED = true;
+        // (0.15: the imports names of the replacement need, as edit
+        // replace adds them)
+        ADD_IMPORTS = true;
         if !load_program(root, TARGET) {
             program_errors(c"error", root, true);
             return 1;
@@ -297,12 +302,29 @@ fn run_rewrite_inner(argc: i64, argv: **u8) -> i64 {
             }
         }
         sort_by_start(&R_HOLES);
+        for _ in 0..H_SYM.count {
+            R_KEPT.push(0);
+        }
+        for i in 0..R_HOLES.count {
+            let q = R_HOLES.data[i];
+            R_KEPT.data[hole_of(q)] = 1;
+            // (`$s...;`: the statement is what its text replaces)
+            let mut at = q;
+            for n in rfirst..rlast {
+                if pk(n) == NodeKind::ExprStmt && pa(n) == q && pb(n) == 1 && rest_hole_of(n) >= 0 {
+                    at = n;
+                }
+            }
+            R_HOLE_SPAN.push(at);
+        }
+        note_breaks(rfirst, rlast);
         R_LEVELS = slot_levels(rfirst, rlast);
         P_LEVELS = slot_levels(1, program_end);
         for _ in 0..H_SYM.count {
             B_NODE.push(-1);
             B_START.push(-1);
             B_END.push(-1);
+            B_LIST.push(0);
         }
         // The sites: start, end and replacement of each.
         let mut s_start = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -320,7 +342,17 @@ fn run_rewrite_inner(argc: i64, argv: **u8) -> i64 {
             for h in 0..H_SYM.count {
                 B_NODE.data[h] = -1;
             }
-            if !match_node(proot, n) {
+            if !match_node(proot, n) || !types_match() {
+                continue;
+            }
+            let mut dropped = 0;
+            let used = dropped_use(program_end, &dropped);
+            if used > 0 {
+                if DROPPED == 0 {
+                    DROP_USE = used;
+                    DROP_HOLE = dropped;
+                }
+                DROPPED += 1;
                 continue;
             }
             let mut text = replacement_text();
@@ -449,6 +481,26 @@ fn notes(pattern: *u8, replacement: *u8) {
             put_root(out);
             try_end(out);
         }
+        if DROPPED > 0 {
+            // (0.15)
+            let d = diag(c"note", c"rewrite.dropped");
+            buf_int(d, DROPPED);
+            buf_str(d, if DROPPED == 1 { c" site is" } else { c" sites are" });
+            buf_str(d, c" left: the replacement drops ");
+            buf_bytes(d, buf_slice(H_NAME.data[DROP_HOLE]));
+            buf_str(d, c", which the code it keeps uses; first: ");
+            put_loc(d, pstart(DROP_USE));
+            buf_byte(d, '\n');
+            let out = diags();
+            buf_str(out, c"try:");
+            put_cword(out, PROG);
+            buf_str(out, c" query show ");
+            put_path(out, file_of_pos(pstart(DROP_USE)));
+            buf_byte(out, ':');
+            buf_int(out, line_of(pstart(DROP_USE)));
+            put_root(out);
+            try_end(out);
+        }
         if UNTYPED > 0 {
             let d = diag(c"note", c"rewrite.untyped");
             buf_int(d, UNTYPED);
@@ -460,8 +512,8 @@ fn notes(pattern: *u8, replacement: *u8) {
 }
 
 // Each `$x...` of nodes first..last is an element of a list (the
-// arguments of a call, a tuple, an array), one per list. False after the
-// diagnostic.
+// arguments of a call, a tuple, an array; 0.15: the statements of a
+// block), one per list. False after the diagnostic.
 fn rest_holes_in_lists(first: i64, last: i64) -> bool {
     unsafe {
         let mut rests = 0;
@@ -473,26 +525,26 @@ fn rest_holes_in_lists(first: i64, last: i64) -> bool {
             }
             let k = pk(n);
             if k != NodeKind::Call && k != NodeKind::MethodCall && k != NodeKind::Tuple
-                && k != NodeKind::Array {
+                && k != NodeKind::Array && k != NodeKind::Block {
                 continue;
             }
             let mut here = 0;
-            for i in 0..pcount(n) {
-                let e = hole_of(pchild(n, i));
-                if e >= 0 && H_REST.data[e] != 0 {
+            for i in 0..seq_len(n) {
+                if rest_hole_of(seq_at(n, i)) >= 0 {
                     here += 1;
                 }
             }
             if here > 1 {
                 let d = diag(c"error", c"rewrite.pattern");
-                buf_str(d, c"one $x... per list of arguments\n");
+                buf_str(d, c"one $x... per list of arguments or block\n");
                 return false;
             }
             listed += here;
         }
         if rests != listed {
             let d = diag(c"error", c"rewrite.pattern");
-            buf_str(d, c"$x... stands for arguments: write it in the arguments of a call, a tuple or an array\n");
+            buf_str(d,
+                c"$x... stands for arguments or statements: write it in the arguments of a call, a tuple or an array, or among a block's statements\n");
             return false;
         }
         true
