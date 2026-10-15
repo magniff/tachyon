@@ -11,7 +11,9 @@ use crate::base::{IntVec, alloc_array, free, intern_c, memset};
 use crate::front::types::{TY_U64, is_integer, type_size};
 use crate::middle::egraph::{EGRAPH, egraph_rewrite, egraph_start};
 use crate::middle::fold::is_const;
-use crate::middle::ipo::{ATTR_READNONE, ATTR_READONLY, call_attrs, call_reads, call_writes};
+use crate::middle::ipo::{
+    ATTR_READNONE, ATTR_READONLY, arg_nocapture, call_attrs, call_reads, call_writes,
+};
 use crate::middle::ir::{
     BLOCKS, Cond, INSTS, IRFUNCS, Op, SLOTS, SLOT_COUNT, Term, ir_arg, ir_insert_before, ir_make,
     ir_operand, ir_operand_count, ir_replace, ir_resolve_operands, ir_set_operand, ir_unlink,
@@ -273,7 +275,8 @@ pub fn root_of(v: i64) -> i64 {
 }
 
 // Marks the frame slots of function `fi` whose address escapes: used other
-// than by loads, stores, copies and address arithmetic.
+// than by loads, stores, copies and address arithmetic: escapes 1, or 2
+// when only passed to calls that do not capture it (arg_nocapture).
 pub fn find_escaping_slots(fi: i64) {
     unsafe {
         for i in 0..IRFUNCS[fi].slots.count {
@@ -296,7 +299,20 @@ pub fn find_escaping_slots(fi: i64) {
                         || (op == Copy && k <= 1)
                         || (op == Add && k <= 1 && INSTS[v].ty == TY_U64)
                         || ((k == 3 || k == 4) && is_memcpy(v));
-                    if !allowed {
+                    if allowed {
+                        continue;
+                    }
+                    if arg_nocapture(v, k) {
+                        // (0.16) Into a call that does not keep it: the slot
+                        // is the callee's to read and write during the call
+                        // only (escapes 2: scalar promotion stores and reloads
+                        // around such calls, promote.tach).
+                        let root = root_of(operand);
+                        if root != 0 && INSTS[root].op == Slot
+                            && SLOTS[INSTS[root].imm].escapes == 0 {
+                            SLOTS[INSTS[root].imm].escapes = 2;
+                        }
+                    } else {
                         mark_escape(operand);
                     }
                 }

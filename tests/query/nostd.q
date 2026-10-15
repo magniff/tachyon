@@ -8,7 +8,7 @@ $ def read_line twice
 std::read_line	<std>:1779:8	fn	pub fn read_line(line: *Buf) -> Result<bool, IoError>
 crate::twice	nostd/main.tach:4:4	fn	fn twice(x: i64) -> i64
 $ show std::print_int
-// std::print_int	<std>:2143-2151
+// std::print_int	<std>:2174-2182
 // use std::print_int;
 #[inline(never)]
 pub fn print_int(v: i64) {

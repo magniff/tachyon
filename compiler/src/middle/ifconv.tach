@@ -13,7 +13,7 @@
 // ? x : 0)`), and the loop has no branch to mispredict. A condition the
 // same in every iteration is left to unswitching.
 use crate::base::{IntVec, free};
-use crate::front::types::{is_float, is_integer};
+use crate::front::types::{TY_BOOL, is_float, is_integer};
 use crate::middle::fold::combine_select;
 use crate::middle::ir::{
     BLOCKS, INSTS, IRF, IRFUNCS, Op, Term, ir_append, ir_arg, ir_make, ir_set_arg, ir_unlink,
@@ -25,6 +25,7 @@ use crate::middle::loops::{
     loop_size,
 };
 use crate::middle::opt::remove_pred_at;
+use crate::middle::tags::merge_phi_block;
 
 // The instructions both arms may hold together (constants free).
 const IFCONV_COST: i64 = 4;
@@ -84,14 +85,22 @@ fn drop_arm(b: i64) {
     }
 }
 
+// Whether block b branches and is reached from one block (a link of a
+// chain fold_branch_chain may merge).
+fn chained(b: i64) -> bool {
+    unsafe { BLOCKS[b].term == Term::Branch && BLOCKS[b].preds.count == 1 }
+}
+
 // Whether function fi has a branch to an arm (a block reached from it
-// alone, jumping on): no loop analysis without one.
-fn has_arm(fi: i64) -> bool {
+// alone, jumping on) or to a link of a chain: no loop analysis without
+// one.
+fn has_arm(fi: i64, chains: bool) -> bool {
     unsafe {
         for i in 0..IRFUNCS[fi].blocks.count {
             let h = IRFUNCS[fi].blocks.data[i];
             if BLOCKS[h].removed == 0 && BLOCKS[h].term == Term::Branch
-                && (is_arm(BLOCKS[h].s0, h) || is_arm(BLOCKS[h].s1, h)) {
+                && (is_arm(BLOCKS[h].s0, h) || is_arm(BLOCKS[h].s1, h)
+                    || chains && (chained(BLOCKS[h].s0) || chained(BLOCKS[h].s1))) {
                 return true;
             }
         }
@@ -141,7 +150,7 @@ fn convert(l: i64, h: i64) -> bool {
         let mut phi = BLOCKS[join].first;
         while phi != 0 && INSTS[phi].op == Op::Phi {
             if ir_val(ir_arg(phi, index_t)) != ir_val(ir_arg(phi, index_e)) {
-                if !is_integer(INSTS[phi].ty) {
+                if !is_integer(INSTS[phi].ty) && INSTS[phi].ty != TY_BOOL {
                     return false;
                 }
                 selects += 1;
@@ -196,34 +205,140 @@ fn convert(l: i64, h: i64) -> bool {
     }
 }
 
+// (0.16) Branches to a common destination, merged (LLVM's
+// FoldBranchToCommonDest): h branches to T or to B, and B, reached from h
+// alone, computes a little (at most 2 IFCONV_COST cheap pure instructions)
+// and branches to T or to F. h then computes B's condition too and
+// branches once, on (h's way to T) | (B's way to T), to T or F. A
+// comparator's `<` and `<=` (lexicographic over fields) and the chains of
+// `&&` and `||` are one branch then, which mispredicts at most once. T's
+// phis must take the same value from h and B. Returns whether it merged.
+fn fold_branch_chain(l: i64, h: i64) -> bool {
+    unsafe {
+        for side in 0..2 {
+            let b = if side == 0 { BLOCKS[h].s0 } else { BLOCKS[h].s1 };
+            let t = if side == 0 { BLOCKS[h].s1 } else { BLOCKS[h].s0 };
+            if b == h || b == t || BLOCKS[b].term != Term::Branch || BLOCKS[b].preds.count != 1
+                || !loop_contains(l, b) {
+                continue;
+            }
+            let b_to_t = BLOCKS[b].s0 == t;
+            if !b_to_t && BLOCKS[b].s1 != t {
+                continue;
+            }
+            let f = if b_to_t { BLOCKS[b].s1 } else { BLOCKS[b].s0 };
+            if f == t || f == h || f == b || pred_index(f, h) >= 0 {
+                continue;
+            }
+            let cost = arm_cost(b);
+            if cost < 0 || cost > 2 * IFCONV_COST {
+                continue;
+            }
+            let from_h = pred_index(t, h);
+            let from_b = pred_index(t, b);
+            let mut same = from_h >= 0 && from_b >= 0;
+            let mut phi = BLOCKS[t].first;
+            while same && phi != 0 && INSTS[phi].op == Op::Phi {
+                if ir_val(ir_arg(phi, from_h)) != ir_val(ir_arg(phi, from_b)) {
+                    same = false;
+                }
+                phi = INSTS[phi].next;
+            }
+            if !same {
+                continue;
+            }
+            // h's condition for T, B's for T, then their or.
+            let mut c1 = ir_val(BLOCKS[h].cond);
+            if side == 0 {
+                c1 = ir_make(Op::Not, TY_BOOL, c1, 0, 0);
+                ir_append(h, c1);
+            }
+            move_up(b, h);
+            let mut c2 = ir_val(BLOCKS[b].cond);
+            if !b_to_t {
+                c2 = ir_make(Op::Not, TY_BOOL, c2, 0, 0);
+                ir_append(h, c2);
+            }
+            let c = ir_make(Op::Or, TY_BOOL, c1, c2, 0);
+            ir_append(h, c);
+            BLOCKS[h].cond = c;
+            BLOCKS[h].s0 = t;
+            BLOCKS[h].s1 = f;
+            // T loses B, F has h for B.
+            remove_pred_at(t, from_b);
+            BLOCKS[f].preds.data[pred_index(f, b)] = h;
+            drop_arm(b);
+            return true;
+        }
+        false
+    }
+}
+
+// Whether block b holds phis only.
+fn only_phis(b: i64) -> bool {
+    unsafe {
+        let mut v = BLOCKS[b].first;
+        while v != 0 {
+            if INSTS[v].op != Op::Phi {
+                return false;
+            }
+            v = INSTS[v].next;
+        }
+        true
+    }
+}
+
 // If-converts the small branches of fi's innermost loops; returns whether
 // any was.
-pub fn if_convert_loops(fi: i64) -> bool {
+pub fn if_convert_loops(fi: i64, chains: bool) -> bool {
     unsafe {
-        if !IFCONV || !has_arm(fi) {
+        if !IFCONV || !has_arm(fi, chains) {
             return false;
         }
         IRF = fi;
         analyze_loops(fi);
         let mut heads = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let mut owner = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut merged = false;
         for l in 0..loop_count() {
             if !is_innermost(l) {
                 continue;
             }
             for i in 0..loop_size(l) {
                 let b = loop_block(l, i);
-                if BLOCKS[b].term == Term::Branch && !invariant_in(l, ir_val(BLOCKS[b].cond)) {
+                // (0.16) A block of phis only, jumping to a block whose phis
+                // take them (an inner `if` meeting before the outer one):
+                // merged into it, so that the outer branch is a diamond.
+                if BLOCKS[b].removed == 0 && BLOCKS[b].term == Term::Jump
+                    && BLOCKS[b].first != 0 && INSTS[BLOCKS[b].first].op == Op::Phi
+                    && loop_contains(l, BLOCKS[b].s0) && BLOCKS[b].s0 != loop_header(l)
+                    && only_phis(b) && merge_phi_block(fi, b, BLOCKS[b].s0) {
+                    merged = true;
+                }
+            }
+        }
+        if merged {
+            // (the blocks changed: the loops again)
+            analyze_loops(fi);
+        }
+        for l in 0..loop_count() {
+            if !is_innermost(l) {
+                continue;
+            }
+            for i in 0..loop_size(l) {
+                let b = loop_block(l, i);
+                if BLOCKS[b].removed == 0 && BLOCKS[b].term == Term::Branch
+                    && !invariant_in(l, ir_val(BLOCKS[b].cond)) {
                     heads.push(b);
                     owner.push(l);
                 }
             }
         }
-        let mut changed = false;
+        let mut changed = merged;
         for i in 0..heads.count {
             let b = heads.data[i];
             if BLOCKS[b].removed == 0 && BLOCKS[b].term == Term::Branch
-                && convert(owner.data[i], b) {
+                && (convert(owner.data[i], b) || chains && fold_branch_chain(owner.data[i], b)) {
                 changed = true;
             }
         }
