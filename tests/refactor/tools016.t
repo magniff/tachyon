@@ -142,7 +142,7 @@ rewrote 2 sites in 1 file	loops.tach	+5 -5 lines
 note rewrite.dropped: 1 site is left: the replacement drops $i, which the code it keeps uses; first: loops.tach:16:30
 try: tachyonc query show loops.tach:16
 $ query show total
-// crate::loops::total	loops.tach:5-22
+// crate::loops::total	loops.tach:5-22	effects: global panic
 pub fn total() -> i64 {
     let w = unsafe { V };
     let mut t = 0;

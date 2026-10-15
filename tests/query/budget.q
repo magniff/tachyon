@@ -126,7 +126,7 @@ error query.ambiguous: 6 definitions match 'size'; showing paths only
 try: tachyonc query show crate::m1::size
 [exit 1]
 $ show m2::size
-// crate::m2::size	budget/main.tach:7-7
+// crate::m2::size	budget/main.tach:7-7	effects: none
 mod m2 { pub fn size() -> i64 { 2 } }
 $ callers long_line
 # budget/main.tach

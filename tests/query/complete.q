@@ -158,7 +158,7 @@ $ refs area
 10:8	def	pub fn area_of(s: Shape) -> i64 {
 note query.alias: 'area' is an import alias in crate, for crate::shapes::area_of
 $ def area
-crate::shapes::area_of	complete/shapes.tach:10:8	fn	pub fn area_of(s: Shape) -> i64
+crate::shapes::area_of	complete/shapes.tach:10:8	fn	pub fn area_of(s: Shape) -> i64	effects: none
 note query.alias: 'area' is an import alias in crate, for crate::shapes::area_of
 $ def --exact area
 error query.no-match: no definition 'area'

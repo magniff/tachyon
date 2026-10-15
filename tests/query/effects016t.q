@@ -3,24 +3,22 @@
 ## end could not infer: front/effects/ infers them, 0.16 T1), and the
 ## errors. (On syntax016/'s program.)
 $ effects crate syntax016/main.tach
-crate::out_write	alloc io global panic diverge unsafe (unknown)
-crate::labs	alloc io global panic diverge unsafe (unknown)
-<crate::Square as Shape>::area	alloc io global panic diverge unsafe (unknown)
-apply<closure(i64) -> i64 at syntax016/main.tach:47:32>	alloc io global panic diverge unsafe (unknown)
-crate::grow	alloc io global panic diverge unsafe (unknown)
-crate::main	alloc io global panic diverge unsafe (unknown)
+crate::out_write	io
+crate::labs	none
+<crate::Square as Shape>::area	none
+apply<closure(i64) -> i64 at syntax016/main.tach:47:32>	none
+crate::grow	alloc(Gpa) panic diverge
+crate::main	alloc(Gpa) io global panic diverge unsafe
 $ effects crate --has io syntax016/main.tach
-crate::out_write	alloc io global panic diverge unsafe (unknown)
-crate::labs	alloc io global panic diverge unsafe (unknown)
-<crate::Square as Shape>::area	alloc io global panic diverge unsafe (unknown)
-apply<closure(i64) -> i64 at syntax016/main.tach:47:32>	alloc io global panic diverge unsafe (unknown)
-crate::grow	alloc io global panic diverge unsafe (unknown)
-crate::main	alloc io global panic diverge unsafe (unknown)
+crate::out_write	io
+crate::main	alloc(Gpa) io global panic diverge unsafe
 $ effects grow --why alloc syntax016/main.tach
-crate::grow	alloc io global panic diverge unsafe (unknown)
-  (effects are not inferred yet: 0.16 T1)
+crate::grow	alloc(Gpa) panic diverge
+  'v.push(1)' at syntax016/main.tach:39:5 grows a Vec<i64>
+  'self.reserve(1)' at <std>:216:13 grows a Vec<i64>
+  'self.alloc.try_resize(self.ptr as *u8, self...' at <std>:167:13 allocates from Gpa (an Allocator method)
 $ effects grow --why 'alloc(Arena)' syntax016/main.tach
-crate::grow	alloc io global panic diverge unsafe (unknown)
+crate::grow	alloc(Gpa) panic diverge
   (not: alloc(Arena))
 $ effects grow --has allocates syntax016/main.tach
 error query.usage: unknown effect 'allocates' (effects: alloc, alloc(T), io, global, panic, diverge, unsafe, none)
@@ -29,4 +27,4 @@ $ effects Pair syntax016/main.tach
 note query.empty: no function among the names
 [exit 1]
 $ def grow syntax016/main.tach
-crate::grow	syntax016/main.tach:38:4	fn	fn grow(v: *Vec<i64>)
+crate::grow	syntax016/main.tach:38:4	fn	fn grow(v: *Vec<i64>)	effects: alloc(Gpa) panic diverge

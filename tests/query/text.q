@@ -283,13 +283,13 @@ $ show util::header
 note query.empty: no header comment in util
 ## --with-comments: the section comment above the item too.
 $ show quad
-// crate::quad	text/main.tach:19-22
+// crate::quad	text/main.tach:19-22	effects: none
 // Four times x.
 fn quad(x: i64) -> i64 {
     twice(twice(x))
 }
 $ show quad --with-comments
-// crate::quad	text/main.tach:17-22
+// crate::quad	text/main.tach:17-22	effects: none
 // ---- Arithmetic ----
 
 // Four times x.

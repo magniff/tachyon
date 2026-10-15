@@ -69,7 +69,7 @@ $ query unused lang
 crate::util::cube	lang.tach:2:18	import
 crate::lang::summary	lang.tach:35:4	fn
 $ query impact square
-crate::util::square	util.tach:3:8	fn	pub fn square(x: i64) -> i64
+crate::util::square	util.tach:3:8	fn	pub fn square(x: i64) -> i64	effects: none
 util.tach	1	0	util::cube
 main.tach	1	1	crate main
 total	2	1	2 files

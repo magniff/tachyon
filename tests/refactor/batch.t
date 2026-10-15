@@ -8,7 +8,7 @@ $ batch $T/inputs/batch-queries.txt | sed 's/^## /#> /'
 4	fn	pub fn clamp(v: i64, lo: i64, hi: i64) -> i64
 15	fn	pub fn sum_to(n: i64) -> i64
 #> $ tachyonc query show clamp
-// crate::calc::clamp	calc.tach:3-12
+// crate::calc::clamp	calc.tach:3-12	effects: none
 // v, kept within [lo, hi].
 pub fn clamp(v: i64, lo: i64, hi: i64) -> i64 {
     if v < lo {
@@ -27,7 +27,7 @@ $ batch < $T/inputs/batch-queries.txt | sed 's/^## /#> /'
 4	fn	pub fn clamp(v: i64, lo: i64, hi: i64) -> i64
 15	fn	pub fn sum_to(n: i64) -> i64
 #> $ tachyonc query show clamp
-// crate::calc::clamp	calc.tach:3-12
+// crate::calc::clamp	calc.tach:3-12	effects: none
 // v, kept within [lo, hi].
 pub fn clamp(v: i64, lo: i64, hi: i64) -> i64 {
     if v < lo {
@@ -50,7 +50,7 @@ error query.no-match: no definition 'nosuchthing'
 try: tachyonc query items
 #> exit 1
 #> $ tachyonc query show clamp
-// crate::calc::clamp	calc.tach:3-12
+// crate::calc::clamp	calc.tach:3-12	effects: none
 // v, kept within [lo, hi].
 pub fn clamp(v: i64, lo: i64, hi: i64) -> i64 {
     if v < lo {
@@ -83,7 +83,7 @@ inserted in crate::calc::sum_to	calc.tach	+1 -0 lines
 error batch.usage: cannot read 'no-such.pairs'
 #> exit 2
 #> $ tachyonc query show sum_to
-// crate::calc::sum_to	calc.tach:14-24
+// crate::calc::sum_to	calc.tach:14-24	effects: diverge
 // 1 + 2 + ... + n.
 pub fn sum_to(n: i64) -> i64 {
     let mut total = 0;

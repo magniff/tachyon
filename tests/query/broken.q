@@ -3,7 +3,7 @@
 ## with a warning that counts the errors (and names the first when
 ## nothing answers).
 $ def good
-crate::good	broken/main.tach:7:4	fn	fn good(x: i64) -> i64
+crate::good	broken/main.tach:7:4	fn	fn good(x: i64) -> i64	effects: none
 warning query.program-errors: 5 errors in the program; results may be incomplete
 try: tachyonc --diagnostics=short broken/main.tach -c -o /dev/null
 $ refs good

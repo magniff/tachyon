@@ -1,31 +1,31 @@
 ## Several NAMEs in one call, ROOT by --root, FILE:LINE (0.11).
 $ def --root clash/main.tach a::helper b::helper
-crate::a::helper	clash/a.tach:2:8	fn	pub fn helper() -> i64
-crate::b::helper	clash/b.tach:1:8	fn	pub fn helper() -> i64
+crate::a::helper	clash/a.tach:2:8	fn	pub fn helper() -> i64	effects: none
+crate::b::helper	clash/b.tach:1:8	fn	pub fn helper() -> i64	effects: none
 $ show a::helper geom::V2::len --root clash/main.tach
-// crate::a::helper	clash/a.tach:1-4
+// crate::a::helper	clash/a.tach:1-4	effects: none
 // `helper` here and in b; a struct named like geom's function.
 pub fn helper() -> i64 {
     1
 }
-// crate::geom::V2::len	clash/geom.tach:14-17
+// crate::geom::V2::len	clash/geom.tach:14-17	effects: none
     /// Its squared length.
     pub fn len(self: *V2) -> i64 {
         self.x * self.x + self.y * self.y
     }
 $ show clash/geom.tach:16 --root clash/main.tach
-// crate::geom::V2::len	clash/geom.tach:14-17
+// crate::geom::V2::len	clash/geom.tach:14-17	effects: none
     /// Its squared length.
     pub fn len(self: *V2) -> i64 {
         self.x * self.x + self.y * self.y
     }
 $ show geom.tach:16:9 clash/main.tach:33 --root clash/main.tach
-// crate::geom::V2::len	clash/geom.tach:14-17
+// crate::geom::V2::len	clash/geom.tach:14-17	effects: none
     /// Its squared length.
     pub fn len(self: *V2) -> i64 {
         self.x * self.x + self.y * self.y
     }
-// crate::main	clash/main.tach:30-52
+// crate::main	clash/main.tach:30-52	effects: alloc(Gpa) io panic diverge unsafe
 fn main(gpa: Gpa) -> i32 {
     let helper = 3;
     let n = a_helper() + b::helper() + helper;
@@ -67,8 +67,8 @@ $ refs a::helper b::helper --root clash/main.tach
 32:13	call	main	->a::helper	let n = a_helper() + b::helper() + helper;
 32:29	call	main	->b::helper	let n = a_helper() + b::helper() + helper;
 $ def a::helper nothing_here b::helper --root clash/main.tach
-crate::a::helper	clash/a.tach:2:8	fn	pub fn helper() -> i64
-crate::b::helper	clash/b.tach:1:8	fn	pub fn helper() -> i64
+crate::a::helper	clash/a.tach:2:8	fn	pub fn helper() -> i64	effects: none
+crate::b::helper	clash/b.tach:1:8	fn	pub fn helper() -> i64	effects: none
 error query.no-match: no definition 'nothing_here'
 try: tachyonc query items clash/main.tach
 [exit 1]

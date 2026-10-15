@@ -4,8 +4,8 @@
 ## them, without --json.
 $ check --json
 $ query def add --json
-crate::add	main.tach:3:4	fn	fn add(a: i64, b: i64) -> i64
-std::Add::add	<std>:398:20	trait-method	fn add(self: Self, other: Self) -> Self
+crate::add	main.tach:3:4	fn	fn add(a: i64, b: i64) -> i64	effects: none
+std::Add::add	<std>:404:20	trait-method	fn add(self: Self, other: Self) -> Self
 ## (quotes and tabs escaped)
 $ query grep bad --json
 # main.tach

@@ -3,7 +3,7 @@
 ## module's items and its most used bodies; --budget cuts it, with a note
 ## and the commands that print the rest. --budget on any query.
 $ context report
-// crate::report	context/main.tach:9-15	section: Reports
+// crate::report	context/main.tach:9-15	section: Reports	effects: panic
 // The total, after restocking the empty items.
 fn report(items: *Vec<Item>) -> i64 {
     for i in 0..items.len() {
@@ -12,17 +12,17 @@ fn report(items: *Vec<Item>) -> i64 {
     total(items)
 }
 // calls (3)
-std::Vec::len	<std>:142:12	method	pub fn len(self: *Vec<T, A>) -> i64
+std::Vec::len	<std>:148:12	method	pub fn len(self: *Vec<T, A>) -> i64
 crate::stock::restock	context/stock.tach:10:8	fn	pub fn restock(items: *Vec<Item>, i: i64, n: i64)
 crate::stock::total	context/stock.tach:19:8	fn	pub fn total(items: *Vec<Item>) -> i64
 // types (2)
 crate::stock::Item	context/stock.tach:4:12	struct	pub struct Item { pub name: [u8], pub count: i64 }
-std::Vec	<std>:116:12	struct	pub struct Vec<T, A: Allocator = Gpa> { ptr: *T, len: i64, cap: i64, alloc: A }
+std::Vec	<std>:122:12	struct	pub struct Vec<T, A: Allocator = Gpa> { ptr: *T, len: i64, cap: i64, alloc: A }
 // callers (2)
 main	context/main.tach:21:13	let n = report(&items);
 main	context/main.tach:24:13	let m = report(&items);
 $ context restock total
-// crate::stock::restock	context/stock.tach:9-16
+// crate::stock::restock	context/stock.tach:9-16	effects: panic
 // Sets item i's count to n when it is empty.
 pub fn restock(items: *Vec<Item>, i: i64, n: i64) {
     let mut it = items.get(i);
@@ -32,16 +32,16 @@ pub fn restock(items: *Vec<Item>, i: i64, n: i64) {
     }
 }
 // calls (2)
-std::Vec::set	<std>:231:12	method	pub fn set(self: *Vec<T, A>, i: i64, x: T)
-std::Vec::get	<std>:227:12	method	pub fn get(self: *Vec<T, A>, i: i64) -> T
+std::Vec::set	<std>:237:12	method	pub fn set(self: *Vec<T, A>, i: i64, x: T)
+std::Vec::get	<std>:233:12	method	pub fn get(self: *Vec<T, A>, i: i64) -> T
 // types (2)
 crate::stock::Item	context/stock.tach:4:12	struct	pub struct Item { pub name: [u8], pub count: i64 }
-std::Vec	<std>:116:12	struct	pub struct Vec<T, A: Allocator = Gpa> { ptr: *T, len: i64, cap: i64, alloc: A }
+std::Vec	<std>:122:12	struct	pub struct Vec<T, A: Allocator = Gpa> { ptr: *T, len: i64, cap: i64, alloc: A }
 // uses (1)
 crate::stock::MAX	context/stock.tach:7:11	const	pub const MAX: i64 = 100
 // callers (1)
 report	context/main.tach:12:9	restock(items, i, 5);
-// crate::stock::total	context/stock.tach:18-25
+// crate::stock::total	context/stock.tach:18-25	effects: panic
 // The sum of the counts.
 pub fn total(items: *Vec<Item>) -> i64 {
     let mut t = 0;
@@ -51,11 +51,11 @@ pub fn total(items: *Vec<Item>) -> i64 {
     t
 }
 // calls (2)
-std::Vec::len	<std>:142:12	method	pub fn len(self: *Vec<T, A>) -> i64
-std::Vec::get	<std>:227:12	method	pub fn get(self: *Vec<T, A>, i: i64) -> T
+std::Vec::len	<std>:148:12	method	pub fn len(self: *Vec<T, A>) -> i64
+std::Vec::get	<std>:233:12	method	pub fn get(self: *Vec<T, A>, i: i64) -> T
 // types (2)
 crate::stock::Item	context/stock.tach:4:12	struct	pub struct Item { pub name: [u8], pub count: i64 }
-std::Vec	<std>:116:12	struct	pub struct Vec<T, A: Allocator = Gpa> { ptr: *T, len: i64, cap: i64, alloc: A }
+std::Vec	<std>:122:12	struct	pub struct Vec<T, A: Allocator = Gpa> { ptr: *T, len: i64, cap: i64, alloc: A }
 // callers (1)
 report	context/main.tach:14:5	total(items)
 $ context Item
@@ -94,7 +94,7 @@ pub fn total(items: *Vec<Item>) -> i64 {
     t
 }
 $ context report --budget 120
-// crate::report	context/main.tach:9-15	section: Reports
+// crate::report	context/main.tach:9-15	section: Reports	effects: panic
 // The total, after restocking the empty items.
 fn report(items: *Vec<Item>) -> i64 {
     for i in 0..items.len() {
@@ -103,11 +103,9 @@ fn report(items: *Vec<Item>) -> i64 {
     total(items)
 }
 // calls (3)
-std::Vec::len	<std>:142:12	method	pub fn len(self: *Vec<T, A>) -> i64
+std::Vec::len	<std>:148:12	method	pub fn len(self: *Vec<T, A>) -> i64
 crate::stock::restock	context/stock.tach:10:8	fn	pub fn restock(items: *Vec<Item>, i: i64, n: i64)
-// callers (2)
-main	context/main.tach:21:13	let n = report(&items);
-note query.budget: over the budget of 120 tokens, left out: calls 1, types or uses 2, callers 1
+note query.budget: over the budget of 120 tokens, left out: calls 1, types or uses 2, callers 2
 try: tachyonc query callers report
 try: tachyonc query context report --budget 360
 $ context nothing_here
@@ -115,11 +113,10 @@ error query.no-match: no definition 'nothing_here'
 try: tachyonc query items
 [exit 1]
 $ show report --budget 40
-// crate::report	context/main.tach:9-15
+// crate::report	context/main.tach:9-15	effects: panic
 // The total, after restocking the empty items.
 fn report(items: *Vec<Item>) -> i64 {
-    for i in 0..items.len() {
-note query.budget: cut at about 40 tokens: 4 of 8 lines (about 53 tokens in all)
+note query.budget: cut at about 40 tokens: 3 of 8 lines (about 57 tokens in all)
 try: tachyonc query show report --budget 100
 $ refs restock --budget 20
 # context/main.tach

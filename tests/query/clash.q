@@ -5,8 +5,8 @@
 ## (Nothing here prints a position in <C import>, whose line numbers
 ## depend on the host's headers.)
 $ def helper
-crate::a::helper	clash/a.tach:2:8	fn	pub fn helper() -> i64
-crate::b::helper	clash/b.tach:1:8	fn	pub fn helper() -> i64
+crate::a::helper	clash/a.tach:2:8	fn	pub fn helper() -> i64	effects: none
+crate::b::helper	clash/b.tach:1:8	fn	pub fn helper() -> i64	effects: none
 $ refs helper
 # clash/a.tach
 2:8	def	->a::helper	pub fn helper() -> i64 {
@@ -34,10 +34,10 @@ try: tachyonc query def crate::a::helper
 try: tachyonc query def crate::b::helper
 [exit 1]
 $ def --exact crate::a::helper
-crate::a::helper	clash/a.tach:2:8	fn	pub fn helper() -> i64
+crate::a::helper	clash/a.tach:2:8	fn	pub fn helper() -> i64	effects: none
 $ def Point
 crate::a::Point	clash/a.tach:6:12	struct	pub struct Point
-crate::geom::Point	clash/geom.tach:4:8	fn	pub fn Point(x: i64) -> i64
+crate::geom::Point	clash/geom.tach:4:8	fn	pub fn Point(x: i64) -> i64	effects: none
 $ refs Point
 # clash/a.tach
 6:12	def	->a::Point	pub struct Point {
@@ -53,11 +53,11 @@ pub struct Point {
     pub x: i64,
 }
 $ def len
-crate::geom::V2::len	clash/geom.tach:15:12	method	pub fn len(self: *V2) -> i64
-crate::myvec::Vec::len	clash/myvec.tach:11:12	method	pub fn len(self: *Vec) -> i64
-std::Vec::len	<std>:142:12	method	pub fn len(self: *Vec<T, A>) -> i64
-std::Buf::len	<std>:332:12	method	pub fn len(self: *Buf<A>) -> i64
-std::HashMap::len	<std>:833:12	method	pub fn len(self: *HashMap<K, V, A>) -> i64
+crate::geom::V2::len	clash/geom.tach:15:12	method	pub fn len(self: *V2) -> i64	effects: none
+crate::myvec::Vec::len	clash/myvec.tach:11:12	method	pub fn len(self: *Vec) -> i64	effects: none
+std::Vec::len	<std>:148:12	method	pub fn len(self: *Vec<T, A>) -> i64
+std::Buf::len	<std>:338:12	method	pub fn len(self: *Buf<A>) -> i64
+std::HashMap::len	<std>:839:12	method	pub fn len(self: *HashMap<K, V, A>) -> i64
 $ refs V2::len
 # clash/geom.tach
 15:12	def	pub fn len(self: *V2) -> i64 {
@@ -69,9 +69,9 @@ $ refs myvec::Vec::len
 # clash/myvec.tach
 11:12	def	pub fn len(self: *Vec) -> i64 {
 $ def V2::add
-<crate::geom::V2 as Add>::add	clash/geom.tach:21:8	method	fn add(self: V2, o: V2) -> V2
+<crate::geom::V2 as Add>::add	clash/geom.tach:21:8	method	fn add(self: V2, o: V2) -> V2	effects: none
 $ def Vec::add
-crate::myvec::Vec::add	clash/myvec.tach:15:12	method	pub fn add(self: *Vec, k: i64)
+crate::myvec::Vec::add	clash/myvec.tach:15:12	method	pub fn add(self: *Vec, k: i64)	effects: none
 $ refs '<V2 as Add>::add'
 # clash/geom.tach
 21:8	def	fn add(self: V2, o: V2) -> V2 {
@@ -111,7 +111,7 @@ $ refs Area::twice
 # clash/shapes.tach
 4:8	def	fn twice(self: *Self) -> i64 {
 $ show '<Square as Area>::area'
-// <crate::shapes::Square as Area>::area	clash/shapes.tach:14-16
+// <crate::shapes::Square as Area>::area	clash/shapes.tach:14-16	effects: none
     fn area(self: *Square) -> i64 {
         self.side * self.side
     }
@@ -126,9 +126,9 @@ $ refs crate::shapes::Area
 1:11	def	pub trait Area {
 13:6	type	shapes	impl Area for Square {
 $ def push
-crate::myvec::Vec::push	clash/myvec.tach:7:12	method	pub fn push(self: *Vec, x: i64)
-std::Vec::push	<std>:208:12	method	pub fn push(self: *Vec<T, A>, x: T)
-std::Buf::push	<std>:336:12	method	pub fn push(self: *Buf<A>, b: u8)
+crate::myvec::Vec::push	clash/myvec.tach:7:12	method	pub fn push(self: *Vec, x: i64)	effects: none
+std::Vec::push	<std>:214:12	method	pub fn push(self: *Vec<T, A>, x: T)
+std::Buf::push	<std>:342:12	method	pub fn push(self: *Buf<A>, b: u8)
 $ refs Vec::push --count
 2	crate::myvec::Vec::push
 10	std::Vec::push
@@ -165,7 +165,7 @@ $ refs crate::printf
 21:4	def	fn printf(x: i64) -> i64 {
 47:84	call	main	let total = twice_generic(&sq) + twice_generic(&v) + sq.twice() + mine.len() + printf(r);
 $ show crate::printf
-// crate::printf	clash/main.tach:20-23
+// crate::printf	clash/main.tach:20-23	effects: none
 /// The user's own printf (the C one is c::printf).
 fn printf(x: i64) -> i64 {
     x + 1

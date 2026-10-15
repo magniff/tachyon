@@ -1,0 +1,119 @@
+// --verify-effects (0.16; docs/design/effects-allocation.md §4 T1): the
+// front end's effects checked against the IR, right after lowering (before
+// inlining moves calls between functions). Each IR function's calls of C
+// functions that do io or allocate (their effects: a declaration or the
+// builtin table), and its stores and copies into statics, must be in its
+// function's inferred set (io, alloc(extern), global). Anything else is an
+// internal error of the inference, reported for every function, then exit
+// 1. A function whose effects are unknown is not checked.
+
+use crate::base::{STDERR, SYMS, buf_bytes, buf_new, buf_str, buf_write_fd, exit};
+use crate::front::effects::{
+    EFF_ALLOC_EXTERN, EFF_GLOBAL, EFF_IO, EFF_UNKNOWN, Effects, effects_text, fn_effects,
+};
+use crate::front::effects::builtin::{C_ALLOC, C_EXIT, C_IO, c_class};
+use crate::front::types::FNS;
+use crate::middle::ir::{BLOCKS, INSTS, IRFUNCS, IRFUNC_COUNT, Op};
+
+// --verify-effects.
+pub static mut VERIFY_EFFECTS: bool = false;
+
+// Checks every IR function (after lower_program); exits 1 when one does
+// what its effects do not say.
+pub fn verify_effects() {
+    unsafe {
+        let out = buf_new();
+        let mut bad = 0;
+        for fi in 0..IRFUNC_COUNT {
+            let f = IRFUNCS[fi].f;
+            let e = fn_effects(f);
+            if (e.bits & EFF_UNKNOWN) != 0 {
+                continue;
+            }
+            let blocks = IRFUNCS[fi].blocks;
+            for k in 0..blocks.count {
+                let mut v = BLOCKS[blocks.data[k]].first;
+                while v != 0 {
+                    let need = needs(v);
+                    if need != 0 && (e.bits & need) == 0 {
+                        report(out, f, e, v, need);
+                        bad += 1;
+                    }
+                    v = INSTS[v].next;
+                }
+            }
+        }
+        if bad > 0 {
+            buf_write_fd(out, STDERR);
+            exit(1);
+        }
+    }
+}
+
+// The effect bit instruction v needs (0: none it checks).
+fn needs(v: i64) -> i64 {
+    unsafe {
+        let op = INSTS[v].op;
+        if op == Op::Call {
+            let g = INSTS[v].imm;
+            if !FNS[g].is_extern {
+                return 0;
+            }
+            let ce = fn_effects(g);
+            if (ce.bits & EFF_IO) != 0 {
+                return EFF_IO;
+            }
+            if (ce.bits & EFF_ALLOC_EXTERN) != 0 {
+                return EFF_ALLOC_EXTERN;
+            }
+            return 0;
+        }
+        if op == Op::CallC {
+            let class = c_class(INSTS[v].imm);
+            if class == C_IO || class == C_EXIT {
+                return EFF_IO;
+            }
+            return if class == C_ALLOC { EFF_ALLOC_EXTERN } else { 0 };
+        }
+        if (op == Op::Store || op == Op::Copy) && into_static(INSTS[v].a) {
+            return EFF_GLOBAL;
+        }
+        0
+    }
+}
+
+// Whether address value a is a static's (its address, plus offsets).
+fn into_static(a: i64) -> bool {
+    unsafe {
+        let mut v = a;
+        while v != 0 {
+            let op = INSTS[v].op;
+            if op == Op::GAddr {
+                return true;
+            }
+            if op != Op::Add {
+                return false;
+            }
+            v = if INSTS[INSTS[v].b].op == Op::Const { INSTS[v].a } else { 0 };
+        }
+        false
+    }
+}
+
+fn report(out: i64, f: i64, e: Effects, v: i64, need: i64) {
+    unsafe {
+        buf_str(out, c"internal error: --verify-effects: '");
+        buf_bytes(out, SYMS[FNS[f].display].text);
+        buf_str(out, if need == EFF_IO { c"' calls C that does io" }
+            else if need == EFF_GLOBAL { c"' stores into a static" }
+            else { c"' calls C that allocates" });
+        if INSTS[v].op == Op::Call {
+            buf_str(out, c" ('");
+            buf_bytes(out, SYMS[FNS[INSTS[v].imm].name].text);
+            buf_str(out, c"')");
+        }
+        buf_str(out, c", but its effects are '");
+        effects_text(out, e);
+        buf_str(out, c"'\n");
+    }
+}

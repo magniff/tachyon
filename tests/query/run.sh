@@ -153,7 +153,7 @@ unset TACHYON_ROOT
 TAB=$(printf '\t')
 out=$("$COMPILER" query show gvn::run_gvn compiler/src/main.tach 2>&1)
 ok=0
-printf '%s\n' "$out" | head -1 | grep -q "^// crate::middle::gvn::run_gvn${TAB}compiler/src/middle/gvn.tach:[0-9]*-[0-9]*\$" \
+printf '%s\n' "$out" | head -1 | grep -q "^// crate::middle::gvn::run_gvn${TAB}compiler/src/middle/gvn.tach:[0-9]*-[0-9]*${TAB}effects: [a-z(), ]*\$" \
     && printf '%s\n' "$out" | grep -q '^pub fn run_gvn(' && ok=1
 check self_show "$ok" "$out"
 out=$("$COMPILER" query refs --count crate::middle::gvn::run_gvn compiler/src/main.tach 2>&1)
@@ -232,7 +232,7 @@ check self_grep_strings "$ok" "$n"
 # (./main.tach, found by default)
 out=$(cd "$HERE/clash" && "$COMPILER" query def a::helper 2>&1)
 ok=0
-[ "$out" = "crate::a::helper${TAB}a.tach:2:8${TAB}fn${TAB}pub fn helper() -> i64" ] && ok=1
+[ "$out" = "crate::a::helper${TAB}a.tach:2:8${TAB}fn${TAB}pub fn helper() -> i64${TAB}effects: none" ] && ok=1
 check default_root "$ok" "$out"
 # std where there is no program (0.15): its API by `items std` (no
 # private item), an item by a name std defines.

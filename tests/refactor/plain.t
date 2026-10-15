@@ -3,7 +3,7 @@
 ## diff is .tachyonc/edits next to the root.
 $ check
 $ query def area
-crate::geom::area	geom.tach:8:8	fn	pub fn area(p: Point) -> i64
+crate::geom::area	geom.tach:8:8	fn	pub fn area(p: Point) -> i64	effects: none
 ## ---- renaming a local ----
 ## By FN::local: every use, nothing else (the function's own name is
 ## also total).
