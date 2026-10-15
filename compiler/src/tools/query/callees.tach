@@ -1,0 +1,390 @@
+// `query callees FN [--transitive] [--writes TABLE]` (0.16; docs/query.md):
+// the functions FN calls, as the checker resolved its calls, and the
+// functions it names as values (they may be called through a pointer);
+// with --transitive, every function reachable that way, each with its
+// depth and the caller it was first reached from. With --writes TABLE (a
+// static or a field): the places in FN and the functions it reaches that
+// write TABLE (an assignment to it or into it) or borrow it (`&TABLE`, a
+// method taking `self: *T` called on it, as `TABLE.push(x)`), each with
+// the chain of calls from FN: whether FN can change TABLE.
+//
+// The edges are the references the checker recorded (refs.tach), each
+// counted for the innermost definition holding it. A call through a
+// function pointer is not an edge; the function named where the pointer
+// was made is.
+
+use crate::base::{IntVec, STDOUT, buf_byte, buf_bytes, buf_int, buf_new, buf_str, buf_write_fd};
+use crate::front::ast::{NODES, NODE_COUNT, NodeKind};
+use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
+use crate::front::modules::file_of_pos;
+use crate::middle::lower::ssa::HMap;
+use crate::tools::query::{QF_CALL, QF_DEF, QF_USE, QF_WRITE};
+use crate::tools::query::defs::{
+    DEFS, DEF_COUNT, K_FN, K_IMPL_METHOD, K_METHOD, K_TRAIT_FN, trait_of,
+};
+use crate::tools::query::diagnostics::{diag, sym_less};
+use crate::tools::query::positions::{enclosing, find_name, line_of, line_start, token_at};
+use crate::tools::query::refs::{
+    GROUP, OPT_ALL, OPT_COUNT, OPT_LIMIT, R_DEF, R_FLAGS, R_GROUP, R_POS, TARGETS, collect_refs,
+    file_text, put_line, put_short, ref_in, try_refs,
+};
+
+// --transitive, --writes TABLE (a C string, or null).
+pub static mut OPT_TRANSITIVE: bool = false;
+pub static mut OPT_WRITES: *u8 = 0 as *u8;
+
+// The lines printed before the rest is cut (--limit N, --all).
+const CALLEES_BUDGET: i64 = 100;
+
+// The call graph: per edge, its caller, callee, and whether it is a call
+// (else the callee is named as a value); per definition + 1, its first
+// edge + 1, and per edge its next + 1.
+static mut E_FROM: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut E_TO: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut E_CALL: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut E_NEXT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut E_HEAD: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+// Whether definition d is a function (with or without a body).
+fn is_fn_def(d: i64) -> bool {
+    unsafe {
+        let k = DEFS[d].kind;
+        k == K_FN || k == K_METHOD || k == K_IMPL_METHOD || k == K_TRAIT_FN
+    }
+}
+
+fn add_edge(from: i64, to: i64, call: bool, seen: *HMap) {
+    unsafe {
+        // (once per caller and callee: a generic function's instances
+        // repeat its calls; a call wins over a mention)
+        let key = (from * (DEF_COUNT + 1) + to) * 2 + 1;
+        let e0 = seen.get(key) - 1;
+        if e0 >= 0 {
+            if call {
+                E_CALL.data[e0] = 1;
+            }
+            return;
+        }
+        seen.put(key, E_FROM.count + 1);
+        E_FROM.push(from);
+        E_TO.push(to);
+        E_CALL.push(if call { 1 } else { 0 });
+        E_NEXT.push(E_HEAD.get(from + 1));
+        E_HEAD.put(from + 1, E_FROM.count);
+    }
+}
+
+// Every reference of the program, then the edges of the call graph.
+fn build_graph() {
+    unsafe {
+        TARGETS.count = 0;
+        R_POS.count = 0;
+        R_DEF.count = 0;
+        R_GROUP.count = 0;
+        R_FLAGS.count = 0;
+        GROUP = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        for d in 0..DEF_COUNT {
+            GROUP.put(d + 1, 1);
+        }
+        collect_refs();
+        let mut seen = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        for r in 0..R_POS.count {
+            let fl = R_FLAGS.data[r];
+            let to = R_DEF.data[r];
+            if (fl & (QF_DEF | QF_USE)) != 0 || !is_fn_def(to) {
+                continue;
+            }
+            let from = enclosing(R_POS.data[r]);
+            if from < 0 {
+                continue;
+            }
+            let call = (fl & QF_CALL) != 0;
+            add_edge(from, to, call, &seen);
+            // (a trait's function: the functions implementing it too)
+            if DEFS[to].kind == K_TRAIT_FN {
+                for d in 0..DEF_COUNT {
+                    if DEFS[d].kind == K_IMPL_METHOD && DEFS[d].name == DEFS[to].name
+                        && trait_of(d) == DEFS[to].parent {
+                        add_edge(from, d, call, &seen);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Where definition d is: `FILE:LINE`.
+fn put_def_loc(out: i64, d: i64) {
+    unsafe {
+        let p = DEFS[d].name_pos;
+        buf_bytes(out, file_text(file_of_pos(p)));
+        buf_byte(out, ':');
+        buf_int(out, line_of(p));
+    }
+}
+
+// The chain of calls from the start to d: `f > g > d`.
+fn put_chain(out: i64, d: i64, via: *HMap) {
+    unsafe {
+        let mut chain = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut x = d;
+        while x >= 0 && chain.count < 64 {
+            chain.push(x);
+            x = via.get(x + 1) - 1;
+        }
+        let mut i = chain.count - 1;
+        while i >= 0 {
+            put_short(out, DEFS[chain.data[i]].fqn);
+            if i > 0 {
+                buf_str(out, c" > ");
+            }
+            i -= 1;
+        }
+    }
+}
+
+// `query callees`: the functions the definitions `matches` call (all of
+// them reachable, with --transitive), or with --writes the places in them
+// that change TABLE (`table`: its definitions). The status.
+pub fn query_callees(matches: *IntVec, name: [u8], table: *IntVec) -> i64 {
+    unsafe {
+        build_graph();
+        // Breadth first from the functions asked about: per definition + 1,
+        // its depth + 1 and the caller it was reached from + 1.
+        let mut depth = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        let mut via = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        let mut how = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        let mut order = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..(*matches).count {
+            let d = (*matches).data[i];
+            if depth.get(d + 1) == 0 {
+                depth.put(d + 1, 1);
+                order.push(d);
+            }
+        }
+        let all = OPT_TRANSITIVE || OPT_WRITES != 0 as *u8;
+        let mut k = 0;
+        while k < order.count {
+            let d = order.data[k];
+            k += 1;
+            let dd = depth.get(d + 1);
+            if dd > 1 && !all {
+                continue;
+            }
+            let mut e = E_HEAD.get(d + 1) - 1;
+            while e >= 0 {
+                let to = E_TO.data[e];
+                if depth.get(to + 1) == 0 {
+                    depth.put(to + 1, dd + 1);
+                    via.put(to + 1, d + 1);
+                    how.put(to + 1, E_CALL.data[e] + 1);
+                    order.push(to);
+                }
+                e = E_NEXT.data[e] - 1;
+            }
+        }
+        if OPT_WRITES != 0 as *u8 {
+            return writes_of(&order, &via, table, name);
+        }
+        let first = (*matches).count;
+        let total = order.count - first;
+        // (by depth, then by path)
+        let v = order.data;
+        for a in first + 1..order.count {
+            let mut j = a;
+            while j > first && (depth.get(v[j] + 1) < depth.get(v[j - 1] + 1)
+                || (depth.get(v[j] + 1) == depth.get(v[j - 1] + 1)
+                    && sym_less(DEFS[v[j]].fqn, DEFS[v[j - 1]].fqn))) {
+                let t = v[j];
+                v[j] = v[j - 1];
+                v[j - 1] = t;
+                j -= 1;
+            }
+        }
+        let out = buf_new();
+        if OPT_COUNT {
+            buf_int(out, total);
+            buf_byte(out, '\n');
+            buf_write_fd(out, STDOUT);
+            return 0;
+        }
+        if total == 0 {
+            let d = diag(c"note", c"query.empty");
+            buf_str(d, c"0 callees\n");
+            return 0;
+        }
+        let shown = if OPT_ALL { total } else if OPT_LIMIT >= 0 && OPT_LIMIT < total { OPT_LIMIT }
+            else if OPT_LIMIT < 0 && total > CALLEES_BUDGET { CALLEES_BUDGET } else { total };
+        for i in 0..shown {
+            let d = order.data[first + i];
+            buf_int(out, depth.get(d + 1) - 1);
+            buf_byte(out, '\t');
+            buf_str(out, if how.get(d + 1) == 2 { c"call" } else { c"ref" });
+            buf_byte(out, '\t');
+            put_short(out, DEFS[d].fqn);
+            buf_byte(out, '\t');
+            put_def_loc(out, d);
+            if depth.get(d + 1) > 2 {
+                buf_str(out, c"\tvia ");
+                put_short(out, DEFS[via.get(d + 1) - 1].fqn);
+            }
+            buf_byte(out, '\n');
+        }
+        buf_write_fd(out, STDOUT);
+        if shown < total {
+            let d = diag(c"note", c"query.truncated");
+            buf_str(d, c"showing ");
+            buf_int(d, shown);
+            buf_str(d, c" of ");
+            buf_int(d, total);
+            buf_str(d, c" callees\n");
+            try_refs(c"callees", name,
+                if OPT_TRANSITIVE { c"--transitive --all" } else { c"--all" }, name[0..0]);
+        }
+        0
+    }
+}
+
+// The positions of the names of the places assignments write (1) and of
+// those borrowed (2: `&p`, and a method's `self: *T` receiver), with the
+// places they are made of up to a dereference (`A.b[i] = x` writes A and
+// b), into out (position + 1).
+pub fn changed_places(out: *HMap) {
+    unsafe {
+        for n in 1..NODE_COUNT {
+            let k = NODES[n].kind;
+            let mut t = 0;
+            let mut how = 0;
+            if k == NodeKind::Assign {
+                t = NODES[n].b;
+                how = 1;
+            } else if k == NodeKind::Unary && NODES[n].op == Tok::Amp {
+                t = NODES[n].b;
+                how = 2;
+            }
+            while t > 0 {
+                let tk = NODES[t].kind;
+                if tk == NodeKind::Ident {
+                    // (each name of a path: its last is where refs has it)
+                    let mut i = token_at(NODES[t].start);
+                    while i < TOK_COUNT && TOKS[i].start < NODES[t].end {
+                        if TOKS[i].kind == Tok::Ident && out.get(TOKS[i].start + 1) != 1 {
+                            out.put(TOKS[i].start + 1, how);
+                        }
+                        i += 1;
+                    }
+                    break;
+                }
+                if tk == NodeKind::FieldAccess {
+                    let a = NODES[t].a;
+                    let p = find_name(NODES[a].end, NODES[t].end, NODES[t].b, false);
+                    if p >= 0 && out.get(p + 1) != 1 {
+                        out.put(p + 1, how);
+                    }
+                    t = a;
+                } else if tk == NodeKind::Index || tk == NodeKind::TupleField {
+                    t = NODES[t].a;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+// --writes: the references to TABLE in the functions reached (`order`)
+// that change it. The status.
+fn writes_of(order: *IntVec, via: *HMap, table: *IntVec, name: [u8]) -> i64 {
+    unsafe {
+        let mut changed = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        changed_places(&changed);
+        let mut reached = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        for i in 0..(*order).count {
+            reached.put((*order).data[i] + 1, 1);
+        }
+        let mut wanted = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        for i in 0..(*table).count {
+            wanted.put((*table).data[i] + 1, 1);
+        }
+        let mut sites = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut kinds = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut seen = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        for r in 0..R_POS.count {
+            let pos = R_POS.data[r];
+            if wanted.get(R_DEF.data[r] + 1) == 0 || (R_FLAGS.data[r] & (QF_DEF | QF_USE)) != 0
+                || seen.get(pos + 1) != 0 || !ref_in(pos) {
+                continue;
+            }
+            let e = enclosing(pos);
+            if e < 0 || reached.get(e + 1) == 0 {
+                continue;
+            }
+            let mut how = changed.get(pos + 1);
+            if (R_FLAGS.data[r] & QF_WRITE) != 0 {
+                how = 1;
+            }
+            if how == 0 {
+                continue;
+            }
+            seen.put(pos + 1, 1);
+            sites.push(pos);
+            kinds.push(how);
+        }
+        // (by position)
+        let v = sites.data;
+        let w = kinds.data;
+        for a in 1..sites.count {
+            let mut j = a;
+            while j > 0 && v[j] < v[j - 1] {
+                let t = v[j];
+                v[j] = v[j - 1];
+                v[j - 1] = t;
+                let u = w[j];
+                w[j] = w[j - 1];
+                w[j - 1] = u;
+                j -= 1;
+            }
+        }
+        let out = buf_new();
+        if OPT_COUNT {
+            buf_int(out, sites.count);
+            buf_byte(out, '\n');
+            buf_write_fd(out, STDOUT);
+            return 0;
+        }
+        if sites.count == 0 {
+            let d = diag(c"note", c"query.empty");
+            buf_bytes(d, name);
+            buf_str(d, c" reaches no write or borrow of ");
+            put_short(d, DEFS[(*table).data[0]].fqn);
+            buf_str(d, c" (");
+            buf_int(d, (*order).count);
+            buf_str(d, if (*order).count == 1 { c" function" } else { c" functions" });
+            buf_str(d, c" reached by calls and functions named as values)\n");
+            return 0;
+        }
+        let mut cur = -1;
+        for i in 0..sites.count {
+            let pos = sites.data[i];
+            let f = file_of_pos(pos);
+            if f != cur {
+                buf_str(out, c"# ");
+                buf_bytes(out, file_text(f));
+                buf_byte(out, '\n');
+                cur = f;
+            }
+            buf_int(out, line_of(pos));
+            buf_byte(out, ':');
+            buf_int(out, pos - line_start(pos) + 1);
+            buf_byte(out, '\t');
+            buf_str(out, if kinds.data[i] == 1 { c"write" } else { c"borrow" });
+            buf_byte(out, '\t');
+            put_chain(out, enclosing(pos), via);
+            buf_byte(out, '\t');
+            put_line(out, pos);
+            buf_byte(out, '\n');
+        }
+        buf_write_fd(out, STDOUT);
+        0
+    }
+}

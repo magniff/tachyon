@@ -69,12 +69,14 @@ $ rewrite '{ let mut $t = 0; $s... }' '{ let mut $t = 1; $s... }' --dry-run
 $ rewrite 'match $o { Option::Some($y) => $a, Option::None => $b }' 'if let Option::Some($y) = $o { $a } else { $b }' --dry-run
 --- a/main.tach
 +++ b/main.tach
-@@ -38,4 +38 @@
+@@ -38,3 +38,4 @@
 -    match o {
 -        Option::Some(v) => v + 1,
 -        Option::None => 0,
--    }
-+    if let Option::Some(v) = o { v + 1 } else { 0 }
++    if let Option::Some(v) = o {
++        v + 1
++    } else {
++        0
 ## Written, then checked: the program still runs.
 $ rewrite 'for $i in 0..$v.len { let $x = $v[$i]; $s... }' 'for $x in $v.iter() { $s... }'
 rewrote 4 sites in 1 file	main.tach	+4 -8 lines

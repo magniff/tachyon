@@ -27,14 +27,14 @@ those three bytes (a literal holding `{name}` of a local passed to
   (`2.5`, `0.1`).
 
 ```tach
-fn main() -> i32 {
+fn main(gpa: Gpa) -> i32 {
     let name = "tachyon";
     let n = 42;
     let x = 2.5;
     println(f"{name} has {n} and {x}");
     println(f"[{n:>6}] [{n:<6}] [{n:06}] [{n:x}] [{n:X}] [{n:b}]");
     println(f"[{name:>9}] [{x:.3}] [{'A':c}] {{braces}} {n * 2 + 1}");
-    let mut s = format(f"{n}-{n + 1}");      // a Buf
+    let mut s = format_in(f"{n}-{n + 1}", gpa);   // a Buf
     defer s.free();
     eprintln(f"to stderr: {s.as_slice()}");
     0
@@ -72,7 +72,7 @@ fn main() -> i32 {
 
 Printing writes through a static 4 KB buffer, one `write` per call, no
 heap. Rust's `println!("{}", x)` is `println(f"{x}")`, `format!` is
-`format(f"...")`; there are no macros.
+`format_in(f"...", gpa)`; there are no macros.
 
 ## Display and Debug
 
@@ -106,14 +106,14 @@ impl Display for Point {
     }
 }
 
-fn main() -> i32 {
+fn main(gpa: Gpa) -> i32 {
     let p = Point { x: 1, y: 2 };
     let mut q = p.clone();
     q.x = 5;
     println(f"{p} {q:?}");
     let shapes = [Shape::Circle(3), Shape::Rect(p, q), Shape::Empty];
     for s in shapes { println(f"{s:?}"); }
-    let mut v: Vec<i64> = Vec::new();
+    let mut v: Vec<i64> = Vec::new_in(gpa);
     defer v.free();
     v.push(1);
     v.push(2);
@@ -155,10 +155,10 @@ use std::{HashMap, sort};
 #[derive(Eq, Ord, Hash, Debug)]
 struct Key { group: i64, id: i64 }
 
-fn main() -> i32 {
+fn main(gpa: Gpa) -> i32 {
     let keys = [Key { group: 2, id: 1 }, Key { group: 1, id: 9 }, Key { group: 1, id: 3 }];
     sort(keys[..]);                          // by group, then id
-    let mut m: HashMap<Key, i64> = HashMap::new();
+    let mut m: HashMap<Key, i64> = HashMap::new_in(gpa);
     defer m.free();
     for k in keys { m.insert(k, k.id * 10); }
     let wanted = Key { group: 2, id: 1 };

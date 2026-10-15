@@ -5,8 +5,9 @@ its model close to C's: structs, enums with exhaustive `match`, traits
 and generics (monomorphized), modules, checked slices, raw pointers,
 `unsafe`, exact C interop. There is no borrow checker, no lifetimes, no
 destructors, no macros. Closures and iterators are new in 0.14; `?`,
-f-strings, widening, `#[derive]`, named and default arguments in 0.15.
-Safe code has no undefined behaviour. This text matches this compiler;
+f-strings, widening, `#[derive]`, named and default arguments in 0.15;
+explicit allocation and effects in 0.16. Safe code has no undefined
+behaviour. This text matches this compiler;
 `tachyonc guide TOPIC` gives the detail (topics at the end).
 
 ## Build and run
@@ -27,10 +28,10 @@ fn main() -> i32 {
 hello
 ```
 
-`main` returns the exit status (`fn main()` with no result is 0);
-`fn main(argc: i32, argv: **u8) -> i32` takes the arguments. Several
-files on the command line make one program; `mod name;` loads
-`name.tach`.
+`main` returns the exit status (`fn main()` with no result is 0).
+`fn main(gpa: Gpa)` takes the program's allocator (below), `fn
+main(argc: i32, argv: **u8, gpa: Gpa)` the arguments too. Several files
+on the command line make one program; `mod name;` loads `name.tach`.
 
 ## Rust habits and what tachyon has instead
 
@@ -40,29 +41,29 @@ files on the command line make one program; `mod name;` loads
 | `&T`, `&mut T`, `Box<T>` | `*T`, one raw pointer type; `&x` takes an address; no lifetimes, no borrow checker |
 | `fn f(&self)`, `fn f(&mut self)` | `fn f(self: *T)` (may write through it); `fn f(self: T)` takes a copy |
 | `use m::*;` | not allowed: `use m::{a, b};`, or the path `m::a` |
-| `println!("{}", x)`, `format!` | no macros: `println(f"x = {x:>4} {v:?}")`, `format(f"..")` (a `Buf`) (0.15, `guide formatting`) |
+| `println!("{}", x)`, `format!` | no macros: `println(f"x = {x:>4} {v:?}")`, `format_in(f"..", gpa)` (a `Buf`) (`guide formatting`) |
+| `Vec::new()`, a global allocator | `Vec::new_in(gpa)`: nothing allocates without an allocator; `gpa` comes from `fn main(gpa: Gpa)`, passed down as a parameter (0.16, `guide allocators`) |
+| `Box<T>`, arenas | a `Vec`; `arena_scope(\|a\| ..)` frees all it allocated at its end; `--check-alloc` traps a use after free |
+| `const fn`, purity | `#[pure]`, `#[no_alloc]`: checked declarations; `tachyonc query effects f` (0.16, `guide effects`) |
 | `v[i]` on a `Vec` | `v.get(i)`, `v.set(i, x)`, `v.as_slice()[i]` |
-| closures, `.iter().map()` | the same (0.14): `\|x\| x + k`, `v.iter().map(\|x\| x * 2).sum()`; `F: Fn(i64) -> i64` bounds; no `dyn Fn`, `FnOnce`, `iter_mut` (`guide closures`, `guide iterators`) |
+| closures, `.iter().map()` | the same (0.14): `v.iter().map(\|x\| x * k).sum()`; `F: Fn(i64) -> i64` bounds; no `dyn Fn`, `iter_mut` (`guide closures`, `guide iterators`) |
 | `x?` | the same on `Option` and `Result` (0.15); `impl From<E> for F` converts the error; `main` may return `Result<(), E>` (`guide conversions`) |
 | `impl Trait for T`, `T: Trait` | the same; `type Item;` associated types (0.14); `#[derive(Eq, Ord, Hash, Debug, Clone)]` (0.15); no `dyn`, `where`, supertraits |
 | `Drop`, RAII | none: call `free()`, usually `defer v.free();` |
-| `'outer: loop`, `break 'outer` | `outer: loop`, `break :outer`, `continue :outer` |
 | `!x` on integers | `~x`; `!` is for `bool` only |
 | `i64::MAX`, `x.abs()`, `x.pow(2)` | `i64::MAX`, `u8::MIN` the same (0.15); no methods on numbers: write the expression, or call C |
-| `x as usize` to index | lengths and indices are `i64` (`s.len`); any integer indexes |
 | overflow panics, `/ 0` panics | integers wrap; `x / 0 == 0`, `x % 0 == x`; no panic |
 | `match s { "add" => ... }` | strings are not patterns: `if s == "add" { ... }` |
 | `char` | none: `'a'` is a `u8` (one ASCII byte) |
-| `P { x, ..base }` | `P { x, y }` (0.15); no `..base`: `P { x, y: base.y }` |
-| `let x;` | every `let` has a value |
 | no default or named arguments | `fn f(a: i64, b: i64 = 2)`, `f(1, b: 3)` (0.15): named ones last, in order |
-| implicit `i32` -> `i64` | the same: lossless widening (0.15); `a as i32` narrows; `From`/`Into` |
+| `usize`, implicit `i32` -> `i64` | lengths and indices are `i64`; lossless widening (0.15), `a as i32` narrows |
 
 The prelude, in every module without `use`: `Option`, `Some`, `None`,
 `Result`, `Ok`, `Err`, `Vec`, `print`, `println`, `eprint`, `eprintln`,
-`format`, and the traits `Add`, `Sub`, `Mul`, `Div`, `Neg`, `Eq`, `Ord`,
-`Hash`, `Display`, `Debug`, `Clone`, `From`, `Into`. The rest of std is used
-by path (`std::print_int(n)`) or imported (`use std::{Buf, HashMap};`).
+`format_in`, `Gpa`, `Arena`, `ScopedArena`, `arena_scope`, and the traits
+`Add`, `Sub`, `Mul`, `Div`, `Neg`, `Eq`, `Ord`, `Hash`, `Display`, `Debug`,
+`Clone`, `From`, `Into`, `Allocator`. The rest of std is used by path
+(`std::print_int(n)`) or imported (`use std::{Buf, HashMap};`).
 Calling C or an `unsafe fn`, and dereferencing or indexing a raw
 pointer, are allowed only in `unsafe { }` (`tachyonc guide rust`: the
 full list).
@@ -86,13 +87,19 @@ n += c as i32 + b as i32 + e as i32;
 
 Bindings are immutable unless `mut`. Shadowing (`let x = x + 1;`) is
 allowed. `const N: i64 = 10;` and `static mut COUNT: i64 = 0;` are items
-(statics are safe to use: there are no threads).
+(statics are safe to use: there are no threads). Integers wrap, `x / 0 ==
+0`, `x % 0 == x`; indexing, slicing, `unwrap` and casts to enums are
+checked (a message, exit 101): `guide types`.
 
 ## Functions and control flow
 
 ```tach
 fn classify(n: i64) -> [u8] {
     if n < 0 { "negative" } else if n == 0 { "zero" } else { "positive" }
+}
+
+fn greet(name: [u8], times: i64 = 1, sep: [u8] = " ") {   // defaults (0.15)
+    for _ in 0..times { print(f"hi {name}{sep}"); }
 }
 
 fn main() -> i32 {
@@ -112,35 +119,18 @@ fn main() -> i32 {
             if i * j == 6 { break :outer; }
         }
     }
+    greet("ann");
+    greet("bob", times: 2, sep: "! ");    // named arguments: last, in order
     println(classify(total - found));
     0
 }
 ```
 ```out
-positive
+hi ann hi bob! hi bob! positive
 ```
 
 The last expression of a block, without `;`, is its value; `if`, `match`,
 `loop` and blocks are expressions. There are no nested functions.
-Trailing parameters may have defaults; named arguments follow the
-positional ones, in parameter order (0.15):
-
-```tach
-fn greet(name: [u8], times: i64 = 1, sep: [u8] = " ") {
-    for _ in 0..times { print(f"hi {name}{sep}"); }
-    println("");
-}
-
-fn main() -> i32 {
-    greet("ann");
-    greet("bob", times: 2, sep: "! ");
-    0
-}
-```
-```out
-hi ann
-hi bob! hi bob!
-```
 
 ## Structs, enums, match, methods
 
@@ -199,11 +189,7 @@ by field; `[u8]` compares by bytes, a `Vec` or `HashMap` by contents.
 ```tach
 trait Area {
     fn area(self: *Self) -> i64;
-    fn describe(self: *Self) {            // a default method
-        print("area ");
-        std::print_int(self.area());
-        println("");
-    }
+    fn twice(self: *Self) -> i64 { 2 * self.area() }   // a default method
 }
 
 struct Square { side: i64 }
@@ -213,9 +199,7 @@ impl Area for Square {
 }
 
 fn total<T: Area>(items: [T]) -> i64 {    // bounds: T: A + B
-    let mut sum = 0;
-    for it in items { sum += it.area(); }
-    sum
+    items.iter().map(|it| it.area()).sum()
 }
 
 struct Pair<T> { a: T, b: T }
@@ -226,19 +210,13 @@ impl<T: Ord> Pair<T> {
 
 fn main() -> i32 {
     let squares = [Square { side: 2 }, Square { side: 3 }];
-    std::print_int(total(squares[..]));   // an array to a slice: a[..]
-    println("");
-    squares[0].describe();
-    let p = Pair { a: 3, b: 9 };
-    std::print_int(p.max() + Pair::<i64> { a: 1, b: 0 }.max());
-    println("");
+    let p = Pair::<i64> { a: 3, b: 9 };   // the turbofish: Pair::<i64>
+    println(f"{total(squares[..])} {squares[0].twice()} {p.max()}");   // a[..]: a slice
     0
 }
 ```
 ```out
-13
-area 4
-10
+13 8 9
 ```
 
 Generics are templates, checked per instantiation (`max::<i64>(a, b)`
@@ -248,31 +226,12 @@ objects: dispatch is static.
 
 ## Modules and imports
 
-```tach
-mod geometry {                            // or `mod geometry;` for geometry.tach
-    pub struct Rect { pub w: i64, pub h: i64 }
-    pub fn area(r: Rect) -> i64 { r.w * r.h }
-    fn helper() {}                        // private: only this module and its children
-}
-
-use geometry::{Rect, area};               // by name; never `*`
-use std::Buf;
-
-fn main() -> i32 {
-    let mut b = Buf::new();
-    defer b.free();
-    b.push_int(area(Rect { w: 2, h: 3 }));
-    println(b.as_slice());
-    0
-}
-```
-```out
-6
-```
-
-Paths start with a name in scope, `crate`, `self`, `super` or `std`.
-Items are private unless `pub`; `pub use` re-exports. A missing import's
-error says which `use` line to add, and `tachyonc fix` adds it.
+`mod geometry;` loads geometry.tach (or `mod geometry { ... }` inline);
+`use geometry::{Rect, area};` imports by name, never `*`. Paths start
+with a name in scope, `crate`, `self`, `super` or `std`. Items are
+private (to their module and its children) unless `pub`; `pub use`
+re-exports. A missing import's error says which `use` line to add, and
+`tachyonc fix` adds it.
 
 ## Slices, arrays, text
 
@@ -307,13 +266,17 @@ An array `[T; N]` is a value (copied by `=`, no `.len`); a slice `[T]`
 is a pointer and a length (`.ptr`, `.len`) viewing an array, a `Vec` or
 memory. Writing through a slice needs no `mut`.
 
-## std: Vec, HashMap, Buf
+## std: Vec, HashMap, Buf; allocation
 
 ```tach
 use std::{Buf, HashMap, sort};
 
-fn main() -> i32 {
-    let mut v: Vec<i64> = Vec::new();
+fn evens(n: i64, gpa: Gpa) -> Vec<i64> {  // it allocates: it takes an allocator
+    (0..n).map(|i| i * 2).collect_in(gpa)
+}
+
+fn main(gpa: Gpa) -> i32 {                 // the program's allocator
+    let mut v: Vec<i64> = Vec::new_in(gpa);
     defer v.free();                        // no destructors: free explicitly
     v.push(30);
     v.push(10);
@@ -326,7 +289,7 @@ fn main() -> i32 {
     std::print_int(last.unwrap_or(-1));
     println("");
 
-    let mut m: HashMap<[u8], i64> = HashMap::new();
+    let mut m: HashMap<[u8], i64> = HashMap::new_in(gpa);
     defer m.free();
     m.insert("a", 1);
     m.insert("b", 2);
@@ -335,10 +298,10 @@ fn main() -> i32 {
     for (k, _) in m.iter() { print(k); }   // (K, V) pairs, in slot order
     println("");
 
-    let mut b = Buf::new();                // text builder
+    let mut b = Buf::new_in(gpa);          // text builder
     defer b.free();
     b.push_str("n=");
-    b.push_int(m.len());
+    b.push_int(m.len() + evens(4, gpa).len()); // (a leak: not freed)
     b.push('!');
     println(b.as_slice());
     0
@@ -349,14 +312,28 @@ fn main() -> i32 {
 30
 1
 ab
-n=2!
+n=6!
 ```
+
+Allocation is explicit (0.16): nothing allocates without an allocator.
+A function that allocates takes one, `gpa: Gpa` or `a: A` with `A:
+Allocator`, or a container it was given (`push` uses the Vec's own);
+main's `gpa` is where they come from. `arena_scope(|a| ...)` hands out
+an arena whose memory is all freed when the closure returns.
+`--check-alloc` builds the program with a checking allocator: a use
+after free, a double free, a leak are reported where they happen.
+`tachyonc fix --only alloc016` moves 0.15 code (`Vec::new()`) over.
+Every function's effects are inferred (`alloc(Gpa) io global panic
+diverge unsafe`): `tachyonc query effects f --why io` shows where;
+`#[pure]` or `#[no_alloc]` on a function is checked (`guide effects`,
+`guide allocators`).
 
 `Vec`, `Buf` and `HashMap` are handles: copying one (`let w = v;`,
 passing it by value) copies the pointer, not the contents. Pass `&v` to
 a `*Vec<T>` parameter to let a function push. A slice from `as_slice`
-is valid until the vector grows or is freed. The whole of std, made
-from its source in this compiler (every item is `pub`):
+is valid until the vector grows or is freed (using it later is the one
+hole in safe code). The whole of std, made from its source in this
+compiler (every item is `pub`):
 
 ```text
 @STD-API@
@@ -364,30 +341,27 @@ from its source in this compiler (every item is `pub`):
 
 ## Input, output, arguments
 
-std prints and reads stdin: `read_stdin()` (all of it, a
+std prints and reads stdin: `read_stdin_in(gpa)` (all of it, a
 `Result<Buf, IoError>`), `read_line(&buf)` (the next line, without its
 `'\n'`; `Ok(false)` at the end), `Scanner` (tokens, numbers, lines of a
-text), `parse_int` (a `Result`), `split`, `trim` (`guide conversions`:
+text), `parse_int` (a `Result`), `split_in`, `trim` (`guide conversions`:
 Option means absent, Result failed). Files go through C (`fopen`):
 
 ```tach
 import "string.h" as c;
-use std::{Scanner, read_stdin};
+use std::{Scanner, read_stdin_in};
 
-fn main(argc: i32, argv: **u8) -> i32 {
-    let mut input = read_stdin().unwrap(); // all of stdin
+fn main(argc: i32, argv: **u8, gpa: Gpa) -> i32 {
+    let mut input = read_stdin_in(gpa).unwrap(); // all of stdin
     defer input.free();                   // the caller frees it
     let mut sc = Scanner::new(input.as_slice());
     let mut total = 0;
     while let Ok(n) = sc.next_int() {     // Err(ScanError::End) at the end
         total += n;
     }
-    std::print_int(total);
-    println("");
-    for k in 1..argc as i64 {             // argv[0] is the program
-        let arg = unsafe { argv[k] };     // a C string
-        let len = unsafe { c::strlen(arg) } as i64;
-        println(unsafe { arg[0..len] });  // as a [u8]
+    println(total);
+    for k in 1..argc as i64 {             // argv[0] is the program; C strings
+        println(unsafe { argv[k][0..c::strlen(argv[k]) as i64] });
     }
     0
 }
@@ -409,63 +383,34 @@ extern "C" {                              // or declare C functions yourself
     fn abs(x: i32) -> i32;
 }
 
-#[repr(C)]                                // C's layout, for passing to C
-struct Pair { a: i32, b: i32 }
-
-extern "C" fn add(p: Pair) -> i32 { p.a + p.b }   // callable from C
-
 fn main() -> i32 {
-    let x = 2.5;
-    unsafe {
-        c::printf(c"%.1f %d\n", x * 2.0, abs(-3) + add(Pair { a: 1, b: 2 }));
-    }
+    unsafe { c::printf(c"%.1f %d\n", 2.5 * 2.0, abs(-3)); }
     0
 }
 ```
 ```out
-5.0 6
+5.0 3
 ```
 
 Unsafe operations: calling C or an `unsafe fn`, dereferencing (`*p`,
 `p.f`) or indexing (`p[i]`) a raw pointer, reading a union field. A
 *borrow* is safe to dereference: `&place` passed directly, or a pointer
 parameter (`self: *T` included). A local holding a pointer is raw.
-`tachyonc fix --only unsafe` wraps what needs it.
-
-## Behaviour that is defined
-
-```tach
-let big: i32 = 2147483647;
-let zero = 0;
-std::print_int((big + 1) as i64);         // wraps: -2147483648
-print(" ");
-std::print_int(7 / zero + 7 % zero);      // x / 0 == 0, x % 0 == x
-print(" ");
-std::print_int(-7 / 2);                   // truncates toward zero; -7 % 2 == -1
-print(" ");
-std::print_int(300.7 as u8 as i64);       // float to int: truncates, then wraps
-println("");
-```
-```out
--2147483648 7 -3 44
-```
-
-Indexing and slicing are checked (exit 101 with a message), as are
-`unwrap` and casts to enums. A slice used after its memory is freed is
-the one hole in safe code (no lifetimes).
+`tachyonc fix --only unsafe` wraps what needs it; `#[repr(C)]`, callbacks
+and linking: `guide c-interop`.
 
 ## Errors you will meet first
 
 | error (short form) | fix |
 |---|---|
 | `unknown type 'String'` (or `char`, `Box`) | `[u8]`, `u8`, `*T` or `Vec<T>` |
-| `expected type, got '&'` | `*T` for `&T` and `&mut T` |
-| `expected identifier, got '&'` in `fn f(&self)` | `self: *T` |
+| `expected type, got '&'`; `expected identifier, got '&'` | `*T` for `&T`, `&mut T`; `self: *T` |
 | `cannot infer the type of closure parameter 'x'` | `\|x: i64\| ...`, or pass it where an `Fn` bound or `fn` type gives it |
 | `'?' needs 'f' to return Option or Result` | `fn f(..) -> Option<T>` or `-> Result<T, E>` |
 | `'println!' is a macro call` | no macros: `println(f"{x}")` |
 | `cannot assign to immutable variable 'x'` | `let mut x` |
 | `cannot index type 'Vec<i64>'` | `v.get(i)`, `v.as_slice()[i]` |
+| `allocation is explicit: pass an allocator (try: Vec::new_in(gpa))` | `fn main(gpa: Gpa)`, `gpa` passed down; `tachyonc fix --only alloc016` |
 | `'for' iterates over ... got 'i64'` | a range: `for x in 0..n`; a Vec, a HashMap, `v.iter()` and ranges as values iterate too (0.14) |
 | `no method 'len' on type '[u8]'` | `s.len`, a field |
 | `expected '[i64]', got '[i64; 3]'` | pass `a[..]` |
@@ -474,7 +419,6 @@ the one hole in safe code (no lifetimes).
 | `non-exhaustive match: 'E::C' is not covered` | an arm, or `_ =>` |
 | `error[unsafe] calling a C function is unsafe` | `unsafe { ... }` |
 | `undefined variable 'helper' \| help: add 'use ...'` | add the `use` line the help names |
-| `wildcard imports are not allowed` | `use m::{a, b};` |
 
 `tachyonc guide errors` has more, each with its fix.
 
@@ -488,6 +432,7 @@ tachyonc query def NAME                 # where it is defined, its signature
 tachyonc query refs NAME                # every resolved use (--count, --in FILE)
 tachyonc query items [MODULE]           # a module's items with signatures (std: its API)
 tachyonc query context NAME             # source, what it calls, its types and callers, at once
+tachyonc query effects NAME             # what it may do: alloc(Gpa) io global panic diverge unsafe
 tachyonc try '7 / 2'                    # run a snippet with std: its output, TYPE = VALUE
 tachyonc edit patch NAME --old 'a < b' --new 'a <= b'   # change text inside one item
 tachyonc edit replace NAME < new.tach   # replace an item; edit insert --after NAME; edit delete NAME
@@ -496,15 +441,12 @@ tachyonc undo                           # take the last edit back
 tachyonc refactor rename main::x total  # a local (or FILE:LINE:COL), an item, a field, with every use
 ```
 
-They pay off on renames, moves, signature, field and variant changes,
-errors across files and large code; a small file is cheaper read whole
-(`query show FILE.tach`, `query text FILE:1-200`) than queried piece by
-piece.
-ROOT is `--root FILE`, a last argument ending in `.tach`, or
-`./main.tach`. Every edit is checked first: one that adds an error
+They pay off on renames, moves, signature changes, errors across files
+and large code; a small file is cheaper read whole (`query show
+FILE.tach`). ROOT is `--root FILE`, a last argument ending in `.tach`,
+or `./main.tach`. Every edit is checked first: one that adds an error
 writes nothing. A problem is one line, `error CODE: message`, then
-`try:` lines: commands to run as they are. `tachyonc guide tools` has
-the rest.
+`try:` lines to run as they are (`guide tools`).
 
 ## Topics
 

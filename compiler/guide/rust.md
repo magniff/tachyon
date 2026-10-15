@@ -9,7 +9,7 @@ often than to something else; each error names the fix.
 | Rust | tachyon |
 |---|---|
 | `&str`, `String`, `&[u8]` | `[u8]`: a pointer and a length; `"abc"` is one; no UTF-8 type |
-| `String::new()`, `push_str`, `format!` | `std::Buf`: `push`, `push_str`, `push_int`, `push_fmt(f"..")`, `as_slice`; `format(f"..")` (0.15) |
+| `String::new()`, `push_str`, `format!` | `std::Buf` (`Buf::new_in(gpa)`): `push`, `push_str`, `push_int`, `push_fmt(f"..")`, `as_slice`; `format_in(f"..", gpa)` |
 | `s.len()` | `s.len` (a field, `i64`) |
 | `s == "x"`, `s < t` | the same (std's `Eq` and `Ord` for `[u8]`, by bytes) |
 | `&s[1..3]` | `s[1..3]` (checked) |
@@ -17,16 +17,16 @@ often than to something else; each error names the fix.
 | `CString`, `.as_ptr()` | `c"text"` (a `*u8`); a slice is not NUL-terminated |
 | `match s { "a" => .. }` | `if s == "a" { .. } else if ...` |
 | `x.to_string()`, `s.parse::<i64>()` | `Buf::push_int`; `std::parse_int(s)` (a `Result<i64, ParseIntError>`, 0.15) |
-| `s.trim()`, `s.split(',')`, `s.split_whitespace()` | `std::trim(s)`; `std::split(s, ',')`, `std::split_whitespace(s)`: a `Vec<[u8]>` of views of `s` (free it) |
+| `s.trim()`, `s.split(',')`, `s.split_whitespace()` | `std::trim(s)`; `std::split_in(s, ',', gpa)`, `std::split_whitespace_in(s, gpa)`: a `Vec<[u8]>` of views of `s` (free it) |
 
 ```tach
-use std::{Buf, parse_int, split};
+use std::{Buf, parse_int, split_in};
 
-fn main() -> i32 {
-    let mut b = Buf::new();
+fn main(gpa: Gpa) -> i32 {
+    let mut b = Buf::new_in(gpa);
     defer b.free();
     b.push_str("sum=");
-    let mut parts = split("40,2", ',');
+    let mut parts = split_in("40,2", ',', gpa);
     defer parts.free();
     let mut sum = 0;
     for p in parts.as_slice() {
@@ -53,6 +53,7 @@ not a number
 | moves, `Clone`, `Copy` | every value is copied by `=` and by calls (bitwise); no moves |
 | `Drop`, RAII, scope guards | `defer stmt;` runs when the block exits; std types have `free()` |
 | `Box<T>`, `Rc<T>`, `Arc<T>` | none: a `Vec<T>`, or `malloc` in `unsafe` |
+| `Vec::new()`, the global allocator | `Vec::new_in(gpa)`: allocation is explicit (0.16); `gpa: Gpa` comes from `fn main(gpa: Gpa)` and is passed down; `arena_scope(\|a\| ..)` (`guide allocators`) |
 | `Option<&T>` | `Option<*T>`, or an index |
 | `&mut v[i]`, `m.get_mut(&k)` | `v.as_slice()[i].f = x`; `m.get_mut(k)`: an `Option<[V]>`, a view of one element (`a[0].f += 1`) |
 | `*m.entry(k).or_insert(0) += 1` | `m.get_or_insert(k, 0)[0] += 1` |
@@ -67,8 +68,8 @@ fn fill(v: *Vec<i64>, n: i64) {          // v.push works through the pointer
     for i in 0..n { v.push(i * i); }
 }
 
-fn main() -> i32 {
-    let mut v: Vec<i64> = Vec::new();
+fn main(gpa: Gpa) -> i32 {
+    let mut v: Vec<i64> = Vec::new_in(gpa);
     defer v.free();
     fill(&v, 4);
     std::print_int(v.len() + v.get(3));
@@ -131,7 +132,7 @@ too big: 500
 | `for x in v.iter()`, `for x in &v` | the same (0.14), and `for x in v`: a copy of each element |
 | `for (i, x) in s.iter().enumerate()` | the same (0.14) |
 | `for x in v.iter_mut() { *x += 1 }` | `for i in 0..s.len { s[i] += 1; }` |
-| `.map()`, `.filter()`, `.sum()`, `.collect()` | the same (0.14); `collect()` makes a `Vec` only (`guide iterators`) |
+| `.map()`, `.filter()`, `.sum()`, `.collect()` | the same (0.14); `collect_in(gpa)` makes a `Vec` only (`guide iterators`) |
 | `\|x\| x + 1`, `move \|\|` | the same (0.14); a `let mut` is captured by reference, the rest by value (`guide closures`) |
 | `impl Fn(i64) -> i64`, `Box<dyn Fn>` | a generic parameter `F: Fn(i64) -> i64`; none as a result |
 | `(0..n).rev()` | `let mut i = n; while i > 0 { i -= 1; ... }` |
@@ -225,7 +226,7 @@ fn main() -> i32 {
 | `pub use` | the same |
 | `std::collections::HashMap` | `std::HashMap` |
 | `std::io::stdin().read_line(&mut s)` | `std::read_line(&buf)`: the line without its `'\n'`; `Ok(false)` at the end of input |
-| `io::read_to_string(io::stdin())` | `std::read_stdin()`, a `Result<Buf, IoError>`; `std::Scanner` for its tokens, numbers and lines |
+| `io::read_to_string(io::stdin())` | `std::read_stdin_in(gpa)`, a `Result<Buf, IoError>`; `std::Scanner` for its tokens, numbers and lines |
 | `std::env::args()` | `fn main(argc: i32, argv: **u8) -> i32` |
 
 ## unsafe and C

@@ -12,10 +12,6 @@ import argparse
 import os
 import sys
 
-# (0.16) std's ambient allocator (`Vec::new()`) for the 0.15 tasks, until
-# `tachyonc fix --only alloc016` migrates them (front/ambient.tach).
-os.environ.setdefault("TACHYON_AMBIENT_GPA", "1")
-
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lib.common import ALL_CONDS, DEFAULT_TASKS_DIR, REPO_ROOT  # noqa: E402

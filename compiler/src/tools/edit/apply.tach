@@ -90,23 +90,19 @@ fn error_lines(text: [u8], out: *IntVec) {
 fn check_edited(root: *u8, added: *IntVec) -> bool {
     unsafe {
         let before = buf_new();
-        errors_short(before);
+        if STRICT_ALLOC {
+            // (0.16: the program as it was, checked as the edited one is)
+            let status = check_run(root, false, before);
+            if status != 0 && status != 1 {
+                return false;
+            }
+        } else {
+            errors_short(before);
+        }
         let mut old = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         error_lines(buf_slice(before), &old);
-        // `PROG check --diagnostics=short [--target T] --overlay FILE COPY... ROOT`
-        let mut args = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        args.push(PROG as i64);
-        args.push(c"check" as i64);
-        args.push(c"--diagnostics=short" as i64);
-        if TARGET_NAME != 0 as *u8 {
-            args.push(c"--target" as i64);
-            args.push(TARGET_NAME as i64);
-        }
-        overlay_args(&args);
-        args.push(root as i64);
-        args.push(0);
         let out = buf_new();
-        let status = run_capture(args.data as **u8, out);
+        let status = check_run(root, true, out);
         if status != 0 && status != 1 {
             return false;
         }
@@ -135,6 +131,32 @@ fn check_edited(root: *u8, added: *IntVec) -> bool {
 }
 
 // The command line (for the `try:` line of a refused edit).
+// (0.16, `fix --only alloc016`) The edited program is checked with std's
+// 0.15 allocating forms errors, and the program before it too.
+pub static mut STRICT_ALLOC: bool = false;
+
+// `PROG check --diagnostics=short [--target T] [--overlay FILE COPY...]
+// ROOT` (the overlays: the edited program), its output into out; the
+// status.
+fn check_run(root: *u8, edited: bool, out: i64) -> i64 {
+    unsafe {
+        let mut args = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        args.push(PROG as i64);
+        args.push(c"check" as i64);
+        args.push(c"--diagnostics=short" as i64);
+        if TARGET_NAME != 0 as *u8 {
+            args.push(c"--target" as i64);
+            args.push(TARGET_NAME as i64);
+        }
+        if edited {
+            overlay_args(&args);
+        }
+        args.push(root as i64);
+        args.push(0);
+        run_capture(args.data as **u8, out)
+    }
+}
+
 pub fn set_command(argc: i64, argv: **u8) {
     ARGC = argc;
     ARGV = argv;
@@ -441,15 +463,22 @@ pub static mut ADD_IMPORTS: bool = false;
 // one unknown name of a function at a time).
 const MAX_IMPORT_ROUNDS: i64 = 4;
 
-// After `rounds` rounds of imports_round that added imports: the note.
+// After `rounds` rounds of imports_round that added imports: the note,
+// once per command (0.16: a script's steps, a rewrite's rounds, say it
+// once).
 fn imports_note(rounds: i64) {
     unsafe {
-        if rounds > 0 {
+        if rounds > 0 && !IMPORTS_NOTED {
+            IMPORTS_NOTED = true;
             let d = diag(c"note", c"edit.imports");
             buf_str(d, c"added the imports the new text needs (fix --only imports)\n");
         }
     }
 }
+
+// (a script's step tells the script in its report, `imports`, and the
+// steps after it are copies of the script: they say it no more)
+pub static mut IMPORTS_NOTED: bool = false;
 
 // The round of `fix --round --only imports --in FILE` on the edited
 // program, for each file the edit changed: the copies of the files it
@@ -642,6 +671,9 @@ fn step_done(what: [u8]) -> i64 {
             buf_str(report, c"new\t");
             buf_str(report, NEW_PATH.data[i] as *u8);
             buf_byte(report, '\n');
+        }
+        if IMPORTS_NOTED {
+            buf_str(report, c"imports\n");
         }
         // (the files it moved away: `gone PATH`)
         for i in 0..DEL_FILE.count {

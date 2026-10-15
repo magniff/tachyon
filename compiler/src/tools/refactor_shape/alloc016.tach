@@ -1,0 +1,581 @@
+// `tachyonc fix --only alloc016` (0.16; docs/design/effects-allocation.md
+// §2.3): a program written against 0.15's std, whose containers took
+// their memory from an ambient allocator, made explicit. Allocation is
+// explicit in 0.16: a program's allocator is the `gpa: Gpa` of `fn
+// main(gpa: Gpa)`, passed down as a parameter.
+//
+// 1. The calls of std's 0.15 forms (`#[ambient(..)]`: Vec::new(),
+//    with_capacity, filled, Buf::new(), HashMap::new(), collect(),
+//    format(x), read_stdin(), split, split_whitespace, sort_stable,
+//    sort_stable_by), as the checker resolved them, become their `_in`
+//    forms with the allocator appended: `Vec::new()` -> `Vec::new_in(gpa)`,
+//    `it.collect()` -> `it.collect_in(gpa)`, `format(x)` -> `format_in(x,
+//    gpa)`.
+// 2. N, the functions that need an allocator: those holding such a call
+//    (in a closure of theirs too), and every caller of one, transitively.
+// 3. Each function of N gets the parameter `gpa: Gpa` after its others
+//    (`fn main()` becomes `fn main(gpa: Gpa)`), and each of its calls the
+//    argument `gpa` (labelled when the call leaves a default before it).
+//    A function with a parameter of type Gpa already uses it (by its
+//    name), and its callers are left as they are. A trait's function
+//    (the program's trait) changes with the trait's declaration and every
+//    impl.
+// 4. A function that cannot take a parameter (an impl of std's trait,
+//    a function used as a value, `main` with other parameters, an
+//    `extern "C" fn`), and the functions of N it calls, are left with
+//    their calls as they were: `error fix.alloc016-manual` names each, with
+//    where it allocates. A call in a static's or a constant's value:
+//    `error fix.alloc016-static`.
+//
+// The edits are checked as every fix's are, with the ambient forms errors
+// (the edited program must compile as 0.16 asks).
+
+use crate::base::{FILES, IntVec, SYMS, buf_byte, buf_bytes, buf_new, buf_str, intern_c};
+use crate::front::ambient::AMBIENT_TRY;
+use crate::front::ast::{FN_AMBIENT, NODES, NODE_COUNT, NodeKind, PARSED_COUNT};
+use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
+use crate::front::modules::file_of_pos;
+use crate::front::types::FNS;
+use crate::middle::lower::ssa::HMap;
+use crate::tools::edit::edit_replace;
+use crate::tools::query::{QF_CALL, QF_DEF, QF_USE};
+use crate::tools::query::defs::{
+    DEFS, DEF_COUNT, K_FN, K_IMPL_METHOD, K_METHOD, K_TRAIT_FN, bytes_eq, def_of_node, trait_of,
+};
+use crate::tools::query::diagnostics::diag;
+use crate::tools::query::positions::{enclosing, put_loc, token_at};
+use crate::tools::query::refs::{GROUP, R_DEF, R_FLAGS, R_POS, TARGETS, collect_refs, ref_in};
+use crate::tools::refactor_shape::{
+    L_START, ORIG, PROGRAM_END, list_insert, list_of_node, list_of_params, orig_key, orig_of,
+    sym_text, text_buf, try_show_at,
+};
+use crate::tools::refactor_shape::signature::{has_self, insert_argument, signature_group};
+use crate::tools::rewrite::parsed::{pa, pb, pchild, pcount, pend, ph, pk, pstart};
+
+// What a definition of N is (per definition + 1).
+const S_ADD: i64 = 1;
+// (it has a parameter of type Gpa: its name is the allocator)
+const S_OWN: i64 = 2;
+// (it cannot take a parameter, or a function of S_BLOCKED calls it)
+const S_BLOCKED: i64 = 3;
+
+// The functions and sites the fix left (its errors): fix exits 1.
+pub static mut ALLOC016_LEFT: i64 = 0;
+
+// Starts an error of the fix (a function or site it left).
+fn left(code: *u8) -> i64 {
+    unsafe {
+        ALLOC016_LEFT += 1;
+        diag(c"error", code)
+    }
+}
+
+static mut STATE: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+// Per definition + 1: the symbol of its allocator's name + 1.
+static mut ANAME: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+// Per definition + 1: its first reference + 1; per reference its next + 1.
+static mut REF_HEAD: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+static mut REF_NEXT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// Per definition + 1: the first site of an ambient call in it + 1 (a
+// position, for the messages).
+static mut FIRST_SITE: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+fn in_std(pos: i64) -> bool {
+    unsafe { FILES[file_of_pos(pos)].path[0] == '<' }
+}
+
+fn is_fn_kind(d: i64) -> bool {
+    unsafe {
+        let k = DEFS[d].kind;
+        k == K_FN || k == K_METHOD || k == K_IMPL_METHOD || k == K_TRAIT_FN
+    }
+}
+
+// The nodes as written, by span and kind (orig_of).
+fn index_parsed() {
+    unsafe {
+        PROGRAM_END = PARSED_COUNT;
+        for n in 1..PROGRAM_END {
+            let key = orig_key(pstart(n), pend(n), pk(n));
+            if ORIG.get(key) == 0 {
+                ORIG.put(key, n + 1);
+            }
+        }
+    }
+}
+
+// Every reference of the program, each definition's in a list.
+fn index_refs() {
+    unsafe {
+        TARGETS.count = 0;
+        R_POS.count = 0;
+        R_DEF.count = 0;
+        R_FLAGS.count = 0;
+        GROUP = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        for d in 0..DEF_COUNT {
+            GROUP.put(d + 1, 1);
+        }
+        collect_refs();
+        for r in 0..R_POS.count {
+            let d = R_DEF.data[r];
+            REF_NEXT.push(REF_HEAD.get(d + 1));
+            REF_HEAD.put(d + 1, r + 1);
+        }
+    }
+}
+
+// The parameter of function node f whose type is written `Gpa` (or
+// `std::Gpa`): its name, or -1.
+fn gpa_param(f: i64) -> i64 {
+    unsafe {
+        for i in 0..pcount(f) {
+            let p = pchild(f, i);
+            let t = pb(p);
+            if t > 0 {
+                let text = crate::base::SRC[pstart(t)..pend(t)];
+                if bytes_eq(text, "Gpa") || bytes_eq(text, "std::Gpa") {
+                    return pa(p);
+                }
+            }
+        }
+        -1
+    }
+}
+
+// The parameter of function definition d whose default holds pos, or -1.
+fn in_default(d: i64, pos: i64) -> i64 {
+    let f = unsafe { DEFS[d].node };
+    for i in 0..pcount(f) {
+        let p = pchild(f, i);
+        let h = ph(p);
+        if h > 0 && pstart(h) <= pos && pos < pend(h) {
+            return p;
+        }
+    }
+    -1
+}
+
+// Why definition d cannot take the allocator as a parameter (a message),
+// or null. The calls of d are in its references.
+fn cannot_take(d: i64) -> *u8 {
+    unsafe {
+        if !is_fn_kind(d) {
+            return c"it is not a function";
+        }
+        let f = DEFS[d].node;
+        if pk(f) == NodeKind::ExternFn || NODES[f].y == 1 {
+            return c"it is a C function (C calls it)";
+        }
+        if DEFS[d].kind == K_IMPL_METHOD || DEFS[d].kind == K_TRAIT_FN {
+            let t = if DEFS[d].kind == K_TRAIT_FN { DEFS[d].parent } else { trait_of(d) };
+            if t < 0 || in_std(DEFS[t].start) {
+                return c"it implements a trait of std, whose signature is fixed";
+            }
+        }
+        let gpa = intern_c(c"gpa");
+        for i in 0..pcount(f) {
+            if pa(pchild(f, i)) == gpa {
+                return c"it has a parameter 'gpa' that is no Gpa";
+            }
+        }
+        let mut r = REF_HEAD.get(d + 1) - 1;
+        while r >= 0 {
+            let fl = R_FLAGS.data[r];
+            if (fl & (QF_CALL | QF_DEF | QF_USE)) == 0 && enclosing(R_POS.data[r]) >= 0 {
+                return c"it is used as a value (its type would change)";
+            }
+            if (fl & QF_CALL) != 0 && in_std(R_POS.data[r]) {
+                return c"std calls it";
+            }
+            r = REF_NEXT.data[r] - 1;
+        }
+        0 as *u8
+    }
+}
+
+// The definitions of N, from the sites' (queue): S_ADD, S_OWN, or
+// S_BLOCKED for those that cannot take the parameter (reported).
+fn close_over_callers(queue: *IntVec, roots: *IntVec) {
+    unsafe {
+        let gpa = intern_c(c"gpa");
+        let mut k = 0;
+        while k < (*queue).count {
+            let d = (*queue).data[k];
+            k += 1;
+            if STATE.get(d + 1) != 0 {
+                continue;
+            }
+            if !is_fn_kind(d) {
+                // (a static's or a constant's value: reported at the site)
+                STATE.put(d + 1, S_BLOCKED);
+                continue;
+            }
+            {
+                let own = gpa_param(DEFS[d].node);
+                if own >= 0 {
+                    STATE.put(d + 1, S_OWN);
+                    ANAME.put(d + 1, own + 1);
+                    continue;
+                }
+            }
+            // (a trait's function changes with the trait and its impls)
+            let mut group = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            signature_group(d, &group);
+            let mut why = 0 as *u8;
+            for g in 0..group.count {
+                if why == 0 as *u8 {
+                    why = cannot_take(group.data[g]);
+                }
+            }
+            for g in 0..group.count {
+                let x = group.data[g];
+                STATE.put(x + 1, if why != 0 as *u8 { S_BLOCKED } else { S_ADD });
+                ANAME.put(x + 1, gpa + 1);
+                if why != 0 as *u8 {
+                    // (std's own functions are std's business)
+                    if !in_std(DEFS[x].start) {
+                        roots.push(x);
+                        roots.push(why as i64);
+                    }
+                    continue;
+                }
+                // Its callers.
+                let mut r = REF_HEAD.get(x + 1) - 1;
+                while r >= 0 {
+                    if (R_FLAGS.data[r] & QF_CALL) != 0 {
+                        let from = enclosing(R_POS.data[r]);
+                        if from >= 0 && STATE.get(from + 1) == 0 {
+                            queue.push(from);
+                        }
+                    }
+                    r = REF_NEXT.data[r] - 1;
+                }
+            }
+        }
+    }
+}
+
+// The functions of N that a blocked one calls are blocked too (its call
+// cannot pass an allocator), and so on down.
+fn block_callees(calls_from: *HMap, callee: *IntVec, next: *IntVec) {
+    unsafe {
+        let mut queue = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for d in 0..DEF_COUNT {
+            if STATE.get(d + 1) == S_BLOCKED {
+                queue.push(d);
+            }
+        }
+        let mut k = 0;
+        while k < queue.count {
+            let d = queue.data[k];
+            k += 1;
+            let mut e = calls_from.get(d + 1) - 1;
+            while e >= 0 {
+                let to = (*callee).data[e];
+                if STATE.get(to + 1) == S_ADD {
+                    let mut group = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+                    signature_group(to, &group);
+                    for g in 0..group.count {
+                        STATE.put(group.data[g] + 1, S_BLOCKED);
+                        queue.push(group.data[g]);
+                    }
+                }
+                e = (*next).data[e] - 1;
+            }
+        }
+    }
+}
+
+// The node as written of checked call n (a Call or a MethodCall), or -1.
+fn written_call(n: i64) -> i64 {
+    let o = orig_of(n, NodeKind::Call);
+    if o >= 0 { o } else { orig_of(n, NodeKind::MethodCall) }
+}
+
+// The position just after the name `name` of call o as written (the
+// method's name, or the last segment of the called path), or -1.
+fn name_end(o: i64, name: i64) -> i64 {
+    unsafe {
+        let (from, to) = if pk(o) == NodeKind::MethodCall { (pend(pa(o)), pend(o)) }
+            else { (pstart(pa(o)), pend(pa(o))) };
+        let mut found = -1;
+        let mut i = token_at(from);
+        while i < TOK_COUNT && TOKS[i].start < to {
+            if TOKS[i].kind == Tok::Ident && TOKS[i].value as i64 == name {
+                found = TOKS[i].end;
+                if pk(o) == NodeKind::MethodCall {
+                    break;
+                }
+            }
+            i += 1;
+        }
+        found
+    }
+}
+
+// The text of the try of ambient function node f (`Vec::new_in(gpa)`), or
+// an empty slice.
+fn try_text(f: i64) -> [u8] {
+    unsafe {
+        let t = AMBIENT_TRY.get(NODES[f].start + 1) - 1;
+        if t >= 0 { SYMS[t].text } else { SYMS[0].text[0..0] }
+    }
+}
+
+// The edits of `fix --only alloc016`; their number.
+pub fn alloc016_edits() -> i64 {
+    unsafe {
+        index_parsed();
+        index_refs();
+        // 1. The sites: per site, its call as written, the ambient
+        // function's node, the definition holding it.
+        let mut s_call = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut s_fn = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut s_def = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut seen = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        let mut queue = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        // The calls between definitions, as written: per edge its callee,
+        // its call node as written, the next edge of its caller + 1.
+        let mut calls_from = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        let mut e_callee = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut e_call = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut e_next = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for n in 1..NODE_COUNT {
+            if NODES[n].kind != NodeKind::Call || NODES[n].x <= 0 {
+                continue;
+            }
+            let f = FNS[NODES[n].x - 1].node;
+            let o = written_call(n);
+            if o < 0 || seen.get(o + 1) != 0 || in_std(pstart(o)) {
+                continue;
+            }
+            seen.put(o + 1, 1);
+            let from = enclosing(pstart(o));
+            if (NODES[f].p & FN_AMBIENT) != 0 {
+                if !ref_in(pstart(o)) {
+                    continue;
+                }
+                let p = if from >= 0 && is_fn_kind(from) { in_default(from, pstart(o)) }
+                    else { -1 };
+                if p >= 0 {
+                    let e = left(c"fix.alloc016-manual");
+                    buf_str(e, c"the default of parameter '");
+                    buf_bytes(e, sym_text(pa(p)));
+                    buf_str(e, c"' of ");
+                    buf_bytes(e, sym_text(DEFS[from].fqn));
+                    buf_str(e, c" allocates at ");
+                    put_loc(e, pstart(o));
+                    buf_str(e, c", and a default has no allocator: take an Option and make the value in the body\n");
+                    try_show_at(pstart(o));
+                    continue;
+                }
+                s_call.push(o);
+                s_fn.push(f);
+                s_def.push(from);
+                if from >= 0 {
+                    if FIRST_SITE.get(from + 1) == 0 {
+                        FIRST_SITE.put(from + 1, pstart(o) + 1);
+                    }
+                    queue.push(from);
+                }
+                continue;
+            }
+            let to = def_of_node(f);
+            if from >= 0 && to >= 0 {
+                e_callee.push(to);
+                e_call.push(o);
+                e_next.push(calls_from.get(from + 1));
+                calls_from.put(from + 1, e_callee.count);
+            }
+        }
+        // 2. N.
+        let mut roots = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        close_over_callers(&queue, &roots);
+        block_callees(&calls_from, &e_callee, &e_next);
+        let mut fixes = 0;
+        // (per std function + 1: its calls rewritten; its imports done)
+        let mut done = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        let mut renamed = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        // 3. The sites, in the functions that have an allocator now.
+        for i in 0..s_call.count {
+            let o = s_call.data[i];
+            let d = s_def.data[i];
+            if d < 0 || !is_fn_kind(d) {
+                let e = left(c"fix.alloc016-static");
+                buf_str(e, c"the value of a static or a constant allocates at ");
+                put_loc(e, pstart(o));
+                buf_str(e,
+                    c": keep the container in main and pass it down, or put it on an arena\n");
+                try_show_at(pstart(o));
+                continue;
+            }
+            let st = STATE.get(d + 1);
+            if st != S_ADD && st != S_OWN {
+                continue;
+            }
+            let f = s_fn.data[i];
+            let name = NODES[f].a;
+            let at = name_end(o, name);
+            let want = try_text(f);
+            let new_name = buf_new();
+            buf_bytes(new_name, sym_text(name));
+            buf_str(new_name, c"_in");
+            if at < 0 || want.len == 0
+                || !starts_with(want, crate::base::buf_slice(new_name), name) {
+                let e = left(c"fix.alloc016-manual");
+                buf_str(e, c"the call at ");
+                put_loc(e, pstart(o));
+                buf_str(e, c" is not rewritten: write ");
+                buf_bytes(e, want);
+                buf_byte(e, '\n');
+                continue;
+            }
+            edit_replace(at, at, text_buf(c_bytes(c"_in")));
+            list_of_node(o);
+            list_insert(L_START.count, sym_text(ANAME.get(d + 1) - 1));
+            fixes += 1;
+            let sd = def_of_node(f);
+            if sd >= 0 {
+                done.put(sd + 1, done.get(sd + 1) + 1);
+            }
+        }
+        // The imports of the 0.15 forms (`use std::{read_stdin}`): renamed
+        // when every call is rewritten, else the new name added.
+        for i in 0..s_call.count {
+            let sd = def_of_node(s_fn.data[i]);
+            if sd < 0 || done.get(sd + 1) == 0 || renamed.get(sd + 1) != 0 {
+                continue;
+            }
+            renamed.put(sd + 1, 1);
+            fix_imports_of(sd, done.get(sd + 1));
+        }
+        // 4. The functions that take the allocator now, and their calls.
+        let gpa_decl = c_bytes(c"gpa: Gpa");
+        let gpa = intern_c(c"gpa");
+        for d in 0..DEF_COUNT {
+            if STATE.get(d + 1) != S_ADD || in_std(DEFS[d].start) {
+                continue;
+            }
+            let f = DEFS[d].node;
+            list_of_params(f, DEFS[d].name_pos);
+            list_insert(L_START.count, gpa_decl);
+        }
+        for e in 0..e_callee.count {
+            let to = e_callee.data[e];
+            if STATE.get(to + 1) != S_ADD {
+                continue;
+            }
+            let o = e_call.data[e];
+            let from = enclosing(pstart(o));
+            let st = STATE.get(from + 1);
+            if st != S_ADD && st != S_OWN {
+                continue;
+            }
+            let f = DEFS[to].node;
+            if pk(o) != NodeKind::Call && pk(o) != NodeKind::MethodCall {
+                continue;
+            }
+            list_of_node(o);
+            let off = if pk(o) == NodeKind::MethodCall && has_self(f) { 1 } else { 0 };
+            insert_argument(f, o, pcount(f), off, sym_text(ANAME.get(from + 1) - 1), gpa);
+        }
+        // 5. What is left: the functions that cannot take the allocator.
+        let mut i = 0;
+        while i < roots.count {
+            let d = roots.data[i];
+            let why = roots.data[i + 1] as *u8;
+            i += 2;
+            let e = left(c"fix.alloc016-manual");
+            buf_bytes(e, sym_text(DEFS[d].fqn));
+            buf_str(e, c" needs an allocator");
+            let site = FIRST_SITE.get(d + 1) - 1;
+            if site >= 0 {
+                buf_str(e, c" (it allocates at ");
+                put_loc(e, site);
+                buf_str(e, c")");
+            }
+            buf_str(e, c", but ");
+            buf_str(e, why);
+            buf_str(e,
+                c": keep a 'gpa: Gpa' in the value it works on, or pass what it allocates in\n");
+            try_show_at(DEFS[d].name_pos);
+        }
+        fixes
+    }
+}
+
+// The `use` lines naming std function sd (an ambient one), `rewritten` of
+// whose calls in the program were rewritten: the name becomes its `_in`
+// form, or (some calls are left) gets it beside it.
+fn fix_imports_of(sd: i64, rewritten: i64) {
+    unsafe {
+        let name = DEFS[sd].name;
+        let mut calls = 0;
+        let mut r = REF_HEAD.get(sd + 1) - 1;
+        while r >= 0 {
+            if (R_FLAGS.data[r] & QF_CALL) != 0 && !in_std(R_POS.data[r]) {
+                calls += 1;
+            }
+            r = REF_NEXT.data[r] - 1;
+        }
+        let all = calls <= rewritten;
+        r = REF_HEAD.get(sd + 1) - 1;
+        while r >= 0 {
+            let pos = R_POS.data[r];
+            let fl = R_FLAGS.data[r];
+            r = REF_NEXT.data[r] - 1;
+            if (fl & QF_USE) == 0 || in_std(pos) {
+                continue;
+            }
+            let t = token_at(pos);
+            if t >= TOK_COUNT || TOKS[t].start != pos || TOKS[t].kind != Tok::Ident
+                || TOKS[t].value as i64 != name {
+                continue;
+            }
+            let len = sym_text(name).len;
+            let b = buf_new();
+            if all {
+                edit_replace(pos + len, pos + len, text_buf(c_bytes(c"_in")));
+                continue;
+            }
+            // (in a brace list: beside it; else the list made)
+            let mut p = pos + len;
+            while crate::base::SRC[p] == ' ' {
+                p += 1;
+            }
+            let src = crate::base::SRC;
+            if src[p] == ',' || src[p] == '}' {
+                buf_str(b, c", ");
+                buf_bytes(b, sym_text(name));
+                buf_str(b, c"_in");
+                edit_replace(pos + len, pos + len, b);
+            } else {
+                buf_byte(b, '{');
+                buf_bytes(b, sym_text(name));
+                buf_str(b, c", ");
+                buf_bytes(b, sym_text(name));
+                buf_str(b, c"_in}");
+                edit_replace(pos, pos + len, b);
+            }
+        }
+    }
+}
+
+fn c_bytes(s: *u8) -> [u8] {
+    crate::tools::query::c_slice(s)
+}
+
+// Whether the try text `want` starts with `new_name(` or
+// `Type::new_name(` (the rewrite the fix makes is the one std asks for).
+fn starts_with(want: [u8], new_name: [u8], name: i64) -> bool {
+    let _ = name;
+    let mut i = 0;
+    while i + new_name.len < want.len {
+        if (i == 0 || want[i - 1] == ':' || want[i - 1] == '.')
+            && bytes_eq(want[i..i + new_name.len], new_name) && want[i + new_name.len] == '(' {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}

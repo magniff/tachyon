@@ -12,7 +12,7 @@ use crate::front::assoc::ensure_checked;
 use crate::front::ast::{
     NODES, VK_LOAD, VK_NEW, VK_SPLAT, child, list_begin, list_end, list_push, new_node,
 };
-use crate::front::ast::NodeKind::{Call, Ident, Path, Unary, VariantLit};
+use crate::front::ast::NodeKind::{Call, Ident, Index, Path, Range, Unary, VariantLit};
 use crate::front::check::{
     LOCALS, Res, SELF_SYM, SELF_TYPE, SELF_TYPE_SYM, lookup_local, name_error,
 };
@@ -53,9 +53,9 @@ use crate::front::modules::lookup::{
 use crate::front::traits::{bounded_param, require_in_bounds};
 use crate::front::types::{
     ENUMS, FNS, METHODS, METHOD_COUNT, STRUCTS, SYM_FN, SYM_PRIMITIVE, TLISTS, TSCRATCH, TYPES,
-    TyKind, VARIANTS, buf_type, enum_type, enum_variant, err_type, find_field, find_method,
+    TY_UNIT, TyKind, VARIANTS, buf_type, enum_type, enum_variant, err_type, find_field, find_method,
     find_variant, fn_param, is_compound, is_ffi_safe, is_fn_type, is_integer, is_pointer, is_vector,
-    item_node_of, ptr_to, type_elem, variant_field,
+    item_node_of, ptr_to, slice_of, type_elem, variant_field,
 };
 use crate::tools::query::{qnote, qnote_module};
 
@@ -710,13 +710,38 @@ pub fn synthetic_unary(op: Tok, operand: i64, ty: i64) -> i64 {
     }
 }
 
+// (0.16) A new node for the checker: `place[..]`, the whole of an array
+// place as a slice of type `ty`, as `a[..]` is checked.
+pub fn whole_slice(place: i64, ty: i64) -> i64 {
+    unsafe {
+        let r = new_node(Range, NODES[place].start, NODES[place].end);
+        NODES[r].ty = TY_UNIT;
+        let s = new_node(Index, NODES[place].start, NODES[place].end);
+        NODES[s].a = place;
+        NODES[s].b = r;
+        NODES[s].ty = ty;
+        s
+    }
+}
+
 // `x.m(args)`: a call of method m of x's type (or of the type x points
 // to), with `&x` or `*x` as needed for its `self`; becomes an NodeKind::Call.
 pub fn synth_method(n: i64) -> i64 {
     unsafe {
-        let receiver = NODES[n].a;
+        let mut receiver = NODES[n].a;
         let name = NODES[n].b;
-        let receiver_ty = synth_expr(receiver);
+        let mut receiver_ty = synth_expr(receiver);
+        // (0.16: an array place has its slice's methods: `a.iter()` is
+        // `a[..].iter()`)
+        if TYPES[receiver_ty].kind == TyKind::Array && method_of(receiver_ty, name) < 0
+            && is_place(receiver) {
+            let s = slice_of(TYPES[receiver_ty].a);
+            if method_of(s, name) >= 0 {
+                receiver = whole_slice(receiver, s);
+                NODES[n].a = receiver;
+                receiver_ty = s;
+            }
+        }
         if is_vector(receiver_ty) {
             return vector_method(n, name, receiver_ty);
         }
@@ -762,6 +787,9 @@ pub fn synth_method(n: i64) -> i64 {
             err_str(c"'");
             if TYPES[t].kind == TyKind::Struct && find_field(TYPES[t].a, name) >= 0 {
                 err_help(c"to call a function stored in a field, write (s.f)(x)");
+            }
+            if TYPES[t].kind == TyKind::Array && method_of(slice_of(TYPES[t].a), name) >= 0 {
+                err_help(c"an array has its slice's methods where it is a place: bind it to a variable first");
             }
             rust_method_help(t, name);
             let mut near = near_to(name);

@@ -36,9 +36,69 @@ fn trim(s: [u8]) -> [u8] {
     s[i..]
 }
 
+// s without its leading and trailing blanks.
+fn trim_both(s: [u8]) -> [u8] {
+    let t = trim(s);
+    let mut e = t.len;
+    while e > 0 && t[e - 1] == ' ' {
+        e -= 1;
+    }
+    t[0..e]
+}
+
 // s without a leading `pub `.
 fn unpub(s: [u8]) -> [u8] {
     if starts(s, "pub ") { s[4..] } else { s }
+}
+
+// (0.16) A struct's declaration s (`struct V<T> { a: T, pub n: i64 }`)
+// with its `pub` fields only, into out with a line break: the others are
+// std's (a #[sealed] type's are not visible); none left, its name alone.
+fn put_struct(out: i64, s: [u8]) {
+    let mut open = -1;
+    let mut angle = 0;
+    for i in 0..s.len {
+        if s[i] == '<' {
+            angle += 1;
+        } else if s[i] == '>' {
+            angle -= 1;
+        } else if s[i] == '{' && angle == 0 && open < 0 {
+            open = i;
+        }
+    }
+    if open < 0 || s[s.len - 1] != '}' {
+        put_line(out, "", s);
+        return;
+    }
+    let head = trim_both(s[0..open]);
+    let body = s[open + 1..s.len - 1];
+    let kept = buf_new();
+    let mut depth = 0;
+    let mut from = 0;
+    for i in 0..body.len + 1 {
+        let c = if i < body.len { body[i] } else { ',' as u8 };
+        if c == '<' || c == '(' || c == '[' {
+            depth += 1;
+        } else if c == '>' || c == ')' || c == ']' {
+            depth -= 1;
+        } else if c == ',' && depth == 0 {
+            let field = trim_both(body[from..i]);
+            if starts(field, "pub ") {
+                if buf_slice(kept).len > 0 {
+                    buf_bytes(kept, ", ");
+                }
+                buf_bytes(kept, field);
+            }
+            from = i + 1;
+        }
+    }
+    buf_bytes(out, head);
+    if buf_slice(kept).len > 0 {
+        buf_bytes(out, " { ");
+        buf_bytes(out, buf_slice(kept));
+        buf_bytes(out, " }");
+    }
+    buf_bytes(out, "\n");
 }
 
 // What line s changes the depth of braces by; braces in strings,
@@ -201,7 +261,9 @@ pub fn std_api(out: i64, core: bool) {
                 // (`a: i64, }`: the last field's comma goes)
                 let joined = buf_slice(decl);
                 let n = joined.len;
-                if n >= 3 && joined[n - 3..] == ", }" {
+                if core && starts(joined, "struct ") {
+                    put_struct(out, joined);
+                } else if n >= 3 && joined[n - 3..] == ", }" {
                     buf_bytes(out, joined[0..n - 3]);
                     put_line(out, "", " }");
                 } else {
@@ -218,6 +280,13 @@ pub fn std_api(out: i64, core: bool) {
                 }
                 continue;
             }
+            // (0.16: the core guide leaves out std's aliases of the builtin
+            // limits, `I32_MAX` for `i32::MAX`)
+            if core && starts(t, "pub const ")
+                && (find(t, "::MIN;") >= 0 || find(t, "::MAX;") >= 0) {
+                buf_clear(doc);
+                continue;
+            }
             if is_fn(t) {
                 put_doc(out, doc, "");
                 put_line(out, "", signature(t));
@@ -228,7 +297,9 @@ pub fn std_api(out: i64, core: bool) {
                 in_trait = true;
             } else if is_decl(t) {
                 put_doc(out, doc, "");
-                if depth == 0 {
+                if depth == 0 && core && starts(unpub(t), "struct ") {
+                    put_struct(out, unpub(t));
+                } else if depth == 0 {
                     put_line(out, "", unpub(t));
                 } else {
                     buf_clear(decl);

@@ -17,8 +17,8 @@ std's sources and adapters are small structs whose methods are
 same machine code at -O2, vectorized where the loop would be).
 
 ```tach
-fn main() -> i32 {
-    let mut v: Vec<i64> = Vec::new();
+fn main(gpa: Gpa) -> i32 {
+    let mut v: Vec<i64> = Vec::new_in(gpa);
     defer v.free();
     for i in 1..=6 { v.push(i); }
     std::print_int(v.iter().filter(|x| x % 2 == 0).map(|x| x * x).sum());
@@ -33,7 +33,7 @@ fn main() -> i32 {
     }
     std::print_int(v.iter().zip(v.iter()).fold(0, |acc, (a, b)| acc + a * b));
     println("");
-    let mut w = v.iter().map(|x| 7 - x).collect();      // a Vec<i64>
+    let mut w = v.iter().map(|x| 7 - x).collect_in(gpa);   // a Vec<i64>
     defer w.free();
     w.sort_by(|a, b| a.cmp(b));                         // a, b: *i64
     for x in w { std::print_int(x); }
@@ -51,7 +51,7 @@ fn main() -> i32 {
 
 | source | items |
 |---|---|
-| `v.iter()` (a `Vec<T>`), `s.iter()` (a slice `[T]`) | each element, a copy |
+| `v.iter()` (a `Vec<T>`), `s.iter()` (a slice `[T]`; an array variable too, `a.iter()`) | each element, a copy |
 | `m.iter()`, `m.keys()`, `m.values()` (a `HashMap<K, V>`) | `(K, V)`, `K`, `V`, in slot order |
 | `a..b`, `a..=b` as a value: `(0..n).map(...)` | the integers; `0..=255u8` ends without overflow |
 | a type with `impl Iterator` | what its `next` returns |

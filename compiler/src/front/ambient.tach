@@ -6,12 +6,12 @@
 // `split(..)`, `sort_stable(..)` are errors with the `_in` form to write
 // instead (`Vec::new_in(gpa)`).
 //
-// Those functions are still in std, marked `#[ambient("Vec::new_in(gpa)")]`
-// (the attribute is std's: their try text), for one reason: the test
-// corpus of 0.15 (tests, examples, bench, the guide, the eval tasks) is
-// migrated by `tachyonc fix --only alloc016` (0.16 T5); until it is,
-// `--ambient-gpa` or TACHYON_AMBIENT_GPA=1 (the test runners set it)
-// allows them. Both go before the release, with the functions.
+// Those functions stay in std, marked `#[ambient("Vec::new_in(gpa)")]`
+// (the attribute is std's: their try text), for two things: the error
+// names the `_in` form to write, and `tachyonc fix --only alloc016`
+// (tools/refactor_shape/alloc016.tach) reads a 0.15 program's calls of
+// them, as the checker resolved them, to migrate it. (0.16 T5: the corpus
+// is migrated; `--ambient-gpa` and TACHYON_AMBIENT_GPA are gone.)
 
 use crate::base::intern_c;
 use crate::base::diag::{err_begin, err_end_soft, err_help, err_str, err_sym};
@@ -23,7 +23,8 @@ use crate::front::modules::{CUR_MOD, STD_MODULE};
 use crate::front::types::{FNS, FN_COUNT, STRUCTS, TLISTS, TYPES, TyKind};
 use crate::middle::lower::ssa::HMap;
 
-// --ambient-gpa, TACHYON_AMBIENT_GPA=1 (--no-ambient-gpa: off).
+// Whether the calls are allowed: only `fix --only alloc016` sets it, to
+// read a 0.15 program (no option or variable does).
 pub static mut AMBIENT_GPA: bool = false;
 // The start position of an #[ambient("...")] function + 1 -> the symbol of
 // its text + 1 (copies of a function, instances and trait defaults, have
@@ -31,7 +32,7 @@ pub static mut AMBIENT_GPA: bool = false;
 pub static mut AMBIENT_TRY: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
 
 // Call n of function f: an error when f is one of std's ambient functions
-// and the caller is not std (and --ambient-gpa is off).
+// and the caller is not std (and the fix is not reading the program).
 pub fn check_ambient_call(n: i64, f: i64) {
     unsafe {
         let node = FNS[f].node;
@@ -51,7 +52,8 @@ pub fn check_ambient_call(n: i64, f: i64) {
     }
 }
 
-// `fn main(gpa: Gpa)` (called once the signatures are resolved, before
+// `fn main(gpa: Gpa)`, or a last parameter `gpa: Gpa` after main's others
+// (`fn main(argc: i32, argv: **u8, gpa: Gpa)`) (called once the signatures are resolved, before
 // main_result_wrapper): the program's general-purpose allocator, made by
 // the runtime's entry. Its body becomes `{ let gpa: Gpa = Gpa {}; body }`
 // (the literal flagged NODE_IMPLICIT: the one Gpa made outside std, which
@@ -64,15 +66,16 @@ pub fn main_gpa() {
             let node = FNS[f].node;
             if FNS[f].name != main || NODES[node].kind != NodeKind::Fn || NODES[node].d != 0
                 || NODES[node].h != 0 || (NODES[node].p & FN_SIG_FAILED) != 0
-                || FNS[f].generic != 0 || FNS[f].tmpl != 0 || FNS[f].param_count != 1 {
+                || FNS[f].generic != 0 || FNS[f].tmpl != 0 || FNS[f].param_count < 1 {
                 continue;
             }
-            let t = TLISTS.data[FNS[f].params];
+            let last = FNS[f].param_count - 1;
+            let t = TLISTS.data[FNS[f].params + last];
             if TYPES[t].kind != TyKind::Struct || STRUCTS[TYPES[t].a].name != gpa
                 || STRUCTS[TYPES[t].a].module != STD_MODULE {
                 continue;
             }
-            let param = child(node, 0);
+            let param = child(node, last);
             let (start, end) = (NODES[param].start, NODES[param].end);
             let lit = new_node(NodeKind::StructLit, start, end);
             NODES[lit].a = gpa;
@@ -93,9 +96,14 @@ pub fn main_gpa() {
             list_push(binding);
             list_end(block, mark);
             NODES[node].c = block;
-            let empty = list_begin();
-            list_end(node, empty);
-            FNS[f].param_count = 0;
+            // (0.16 T5: `fn main(argc: i32, argv: **u8, gpa: Gpa)` keeps
+            // the others)
+            let kept = list_begin();
+            for i in 0..last {
+                list_push(child(node, i));
+            }
+            list_end(node, kept);
+            FNS[f].param_count = last;
         }
     }
 }

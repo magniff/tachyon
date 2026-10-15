@@ -24,17 +24,17 @@ index 10b99a1..7bf2f11 100644
      v
 ## OLD several times: their lines, and the command with more context.
 $ edit patch clamp --old 'return' --new 'return 0 +'
-error patch.ambiguous: OLD 1 occurs 2 times in crate::calc::clamp, lines 6, 9; give more of the text around it
+error patch.ambiguous: OLD 1 occurs 2 times in crate::calc::clamp, lines 6, 9; give more of the text around it, or --nth N (--all: every one)
 try: tachyonc edit patch clamp --old 'return lo;' --new 'return 0 + lo;'
 try: tachyonc edit patch clamp --old 'return hi;' --new 'return 0 + hi;'
 [exit 1]
 $ edit patch sum_to --old ' += ' --new ' -= '
-error patch.ambiguous: OLD 1 occurs 2 times in crate::calc::sum_to, lines 19, 20; give more of the text around it
+error patch.ambiguous: OLD 1 occurs 2 times in crate::calc::sum_to, lines 19, 20; give more of the text around it, or --nth N (--all: every one)
 try: tachyonc edit patch sum_to --old 'total += i;' --new 'total -= i;'
 try: tachyonc edit patch sum_to --old 'i += 1;' --new 'i -= 1;'
 [exit 1]
 $ edit patch clamp --old '}' --new '} '
-error patch.ambiguous: OLD 1 occurs 3 times in crate::calc::clamp, lines 7, 10, 12; give more of the text around it
+error patch.ambiguous: OLD 1 occurs 3 times in crate::calc::clamp, lines 7, 10, 12; give more of the text around it, or --nth N (--all: every one)
 try: tachyonc edit patch clamp --pairs .git/tachyon-edits/try-1.pairs
 try: tachyonc edit patch clamp --pairs .git/tachyon-edits/try-2.pairs
 try: tachyonc edit patch clamp --pairs .git/tachyon-edits/try-3.pairs
@@ -68,7 +68,7 @@ error edit.breaks: 1 new error; nothing written
 try: tachyonc edit patch clamp --old 'return lo;' --new 'return true;' --no-check
 [exit 1]
 $ edit patch sum_to --old 'let mut' --new 'let' --old 'mut total' --new 'total'
-error patch.ambiguous: OLD 1 occurs 2 times in crate::calc::sum_to, lines 16, 17; give more of the text around it
+error patch.ambiguous: OLD 1 occurs 2 times in crate::calc::sum_to, lines 16, 17; give more of the text around it, or --nth N (--all: every one)
 try: tachyonc edit patch sum_to --old 'let mut total = n * 0;' --new 'let total = n * 0;' --old 'mut total' --new total
 try: tachyonc edit patch sum_to --old 'let mut i = 1;' --new 'let i = 1;' --old 'mut total' --new total
 [exit 1]
@@ -208,7 +208,7 @@ index 10b99a1..2c6ae04 100644
 $ undo
 undid inserted in crate::calc::sum_to	calc.tach	+3 -0 lines
 $ edit insert --in sum_to --before 'mut' < $T/inputs/stmt.tach
-error patch.ambiguous: ANCHOR occurs 2 times in crate::calc::sum_to, lines 16, 17; give more of the text around it
+error patch.ambiguous: ANCHOR occurs 2 times in crate::calc::sum_to, lines 16, 17; give more of the text around it, or --nth N
 try: tachyonc edit insert --in sum_to --before 'let mut total = 0;' < text.tach
 try: tachyonc edit insert --in sum_to --before 'let mut i = 1;' < text.tach
 [exit 1]

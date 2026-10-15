@@ -23,10 +23,6 @@
 # Prints `pass NAME` or `FAIL NAME` (and why) for each test; exits 1 if
 # one failed.
 
-# (0.16) std's ambient allocator (`Vec::new()`) for the 0.15 corpus, until
-# `tachyonc fix --only alloc016` migrates it: compiler/src/front/ambient.tach.
-TACHYON_AMBIENT_GPA=${TACHYON_AMBIENT_GPA:-1}
-export TACHYON_AMBIENT_GPA
 set -u
 LC_ALL=C
 export LC_ALL
@@ -109,11 +105,21 @@ for file in "$HERE"/*.q; do
     name=$(basename "$file" .q)
     for mode in off cache; do
         transcript "$file" $mode >"$WORK/$name.got"
-        if [ $UPDATE -eq 1 ] && [ $mode = off ]; then
-            { grep '^##' "$file"; cat "$WORK/$name.got"; } >"$WORK/$name.new"
-            cp "$WORK/$name.new" "$file"
-        fi
         grep -v '^##' "$file" >"$WORK/$name.want"
+        if [ $UPDATE -eq 1 ] && [ $mode = off ] && ! cmp -s "$WORK/$name.want" "$WORK/$name.got"; then
+            # (0.16: a failing transcript only, its `##` comments kept
+            # above the `$` line they were above)
+            awk 'NR == FNR {
+                    if ($0 ~ /^##/) { pend = pend $0 "\n" }
+                    else if ($0 ~ /^\$ /) { c[++n] = pend; pend = "" }
+                    next
+                }
+                /^\$ / { printf "%s", c[++k] }
+                { print }
+                END { printf "%s", pend }' "$file" "$WORK/$name.got" >"$WORK/$name.new"
+            cp "$WORK/$name.new" "$file"
+            grep -v '^##' "$file" >"$WORK/$name.want"
+        fi
         if cmp -s "$WORK/$name.want" "$WORK/$name.got"; then
             echo "pass $name ($mode)"
         else

@@ -30,10 +30,6 @@
 #   -j JOBS       programs tested at once (default: the number of CPUs,
 #                 or the slots of $TACHYON_JOBSERVER, see tests/run.sh)
 
-# (0.16) std's ambient allocator (`Vec::new()`) for the 0.15 corpus, until
-# `tachyonc fix --only alloc016` migrates it: compiler/src/front/ambient.tach.
-TACHYON_AMBIENT_GPA=${TACHYON_AMBIENT_GPA:-1}
-export TACHYON_AMBIENT_GPA
 set -u
 LC_ALL=C
 export LC_ALL

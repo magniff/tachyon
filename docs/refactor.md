@@ -21,7 +21,7 @@ tachyonc edit insert --after|--before NAME [ROOT] < TEXT
 tachyonc edit delete NAME [ROOT]
 tachyonc undo [--force]                        the last edit, undone
 tachyonc check [ROOT]                          the front end's errors, one per line
-tachyonc fix [ROOT] [--only imports,unused,pub,unsafe,tidy-imports,reexports,std015] [--in FILE|MODULE]
+tachyonc fix [ROOT] [--only imports,unused,pub,unsafe,tidy-imports,reexports,std015,alloc016] [--in FILE|MODULE]
 tachyonc same-output OLD [--corpus DIR|FILE]... [-j N] [--work DIR]
 tachyonc lint --max-lines N [ROOT]
 tachyonc query stats [MODULE|FILE] [--over N] [--all]
@@ -157,10 +157,17 @@ try: tachyonc query text calc.tach:18-20
   lines around it, a line up and down at a time, until it is unique:
 
 ```
-error patch.ambiguous: OLD 1 occurs 2 times in crate::calc::clamp, lines 6, 9; give more of the text around it
+error patch.ambiguous: OLD 1 occurs 2 times in crate::calc::clamp, lines 6, 9; give more of the text around it, or --nth N (--all: every one)
 try: tachyonc edit patch clamp --old 'return lo;' --new 'return 0 + lo;'
 try: tachyonc edit patch clamp --old 'return hi;' --new 'return 0 + hi;'
 ```
+
+  (0.16) Or say which: `--nth N` replaces the Nth match (1 is the first,
+  in TARGET's text order: the order of the lines the error lists),
+  `--all` every one; they hold for every pair of the command. Past the
+  last: `error patch.nth: OLD 1 occurs 3 times in crate::calc::clamp;
+  --nth 4 is past the last`. `edit insert --in` takes `--nth N` for its
+  ANCHOR (not `--all`).
 
   Pairs of several lines, and pairs given as blocks, are not put on the
   command line (agent harnesses refuse `$'...'` quoting): they are
@@ -186,7 +193,8 @@ try: tachyonc edit patch clamp --pairs .git/tachyon-edits/try-1.pairs
 - **Imports (0.14)**: when the check finds new errors, a round of `fix
   --only imports` on the edited file adds the `use` lines of the names
   the new text takes from other modules (as `edit replace` and `insert`
-  do, below), and the edit is checked with them: `note edit.imports`.
+  do, below), and the edit is checked with them: `note edit.imports`
+  (once per command: 0.16, a script's steps say it once).
 - Only the summary line is printed, never the file.
 
 ### Pairs on stdin, or in a file
@@ -479,9 +487,10 @@ fixed 2 missing imports, 3 unused imports, 1 pub, 1 unsafe block→3 files→+3 
 | `tidy-imports` | (0.12) the `use` lines in the codebase's style: the paths of a module's child modules written as most of its `use` lines that could be written either way write them (0.14: relative, `use a::x;`, or from `crate`, `use crate::m::a::x;`; a tie, as the first), the `use` items of a module with one path (and one `pub`) merged where the first is, their names sorted (byte order) and each once, `use p::a;` for one, `use p::{a, b};` when the line fits in 100 columns, else wrapped four spaces in, a line per name imported under another name (`use p::a as b;`); a `use` with a comment on its lines, or sharing a line, is left as it is, and one with a comment right above it is not merged into another |
 | `reexports` | (0.12) every import and path that reaches an item through a re-export (a `pub use` of another module, or an ancestor's import: `use crate::f` where the root imports f) is written from the module that defines the item (`mod` lines on the way made `pub` when needed); then the re-exports nothing goes through any more are removed, or made private imports when their file still names them |
 | `std015` | (0.15) a program written against 0.14's std moved to 0.15's I/O API, where failure is a Result with a typed error: each call the checker resolved to std's `parse_int` or `Scanner::next_int` gets `.ok()` (the old `Option<i64>`), `read_line` `.unwrap_or(false)` (the old `bool`), `read_stdin` `.unwrap()` (the old `Buf`), so the program means what it meant (exactly, but for `read_stdin` on a read error, which 0.14 read as empty input). Calls in generic functions are found through their instances; a function of the program with one of those names is not std's. A call whose value is already handled as a Result is left as it is, so a second run finds nothing: the operand of `?`; the receiver of `ok`, `err`, `map_err`, `is_ok`, `is_err`, `unwrap`, `unwrap_or`, `expect`, or `unwrap_or_else` with a one-parameter closure (for `read_line` and `read_stdin`, whose old types had none of Result's methods: of `unwrap_or_else`, `map`, `and_then` too); the scrutinee of a `match` or `if let` with an `Ok` or `Err` pattern; the value of a `let` whose type is written `Result<...>`. A Result kept in a local and handled further on (`let r = parse_int(s); match r { Ok(..) .. }`) is not recognised: run it once, on 0.14 code |
+| `alloc016` | (0.16) a program written against 0.15's std, whose containers took their memory from an ambient allocator, made explicit (docs/design/effects-allocation.md §2.3): each call the checker resolved to one of std's 0.15 allocating forms (`#[ambient]`: `Vec::new()`, `with_capacity`, `filled`, `Buf::new()`, `HashMap::new()`, `collect()`, `format(x)`, `read_stdin()`, `split`, `split_whitespace`, `sort_stable`, `sort_stable_by`) becomes its `_in` form with the allocator last (`Vec::new_in(gpa)`, `it.collect_in(gpa)`, `format_in(x, gpa)`), and the `use` lines naming them are renamed (or gain the new name while a call is left). N, the functions holding such a call (in a closure of theirs too) and every caller of one, transitively, take `gpa: Gpa` after their other parameters (`fn main()` becomes `fn main(gpa: Gpa)`, `main(argc, argv)` gets it last), and each call of them passes `gpa` (labelled when it leaves a default before it); a trait's function of the program changes with the trait's declaration and every impl; a function that has a parameter of type `Gpa` already uses it by its name, and its callers stay as they are. What cannot take a parameter is an error naming where it allocates, `fix.alloc016-manual`: an impl of std's trait (`Display::fmt`), a function used as a value, a C-called `extern "C" fn`, a call in a parameter's default (take an `Option` and make the value in the body); the functions of N only it calls are left too. A call in a static's or constant's value: `fix.alloc016-static`. The edit is checked with the 0.15 forms errors (the program before it is checked the same way, so the calls left by an error are no new errors); exit 1 when something was left. A second run finds nothing |
 
 By default the first four (`imports`, `unused`, `pub`, `unsafe`),
-everywhere; `tidy-imports`, `reexports` and `std015` only when asked
+everywhere; `tidy-imports`, `reexports`, `std015` and `alloc016` only when asked
 for (`--only reexports,tidy-imports` does both: the rounds tidy what the
 first rewrote).
 
@@ -507,6 +516,23 @@ before the check, and the summary counts every round. Nothing to fix:
 `tachyonc --fix-imports ROOT` (0.8) and `tachyonc --fix-unsafe ROOT`
 (0.9) are `fix --only imports` and `fix --only unsafe`, silent when
 there is nothing to do.
+
+**Which module (0.16).** The error of an unknown name helps with the
+first module that has a public item of that name. When several modules
+the file can name have one (of the same kind: a value, or a type),
+`imports` takes the nearest: the one whose innermost module holding both
+it and the importing module is deepest (a sibling before a cousin; std
+is farther than any of the program's), then the one with the fewest path
+segments. When more than one is that near, nothing is imported for that
+name, and `error fix.ambiguous` (exit 1, the other fixes made) lists
+them with a `try:` line each: `--use PATH::NAME` (repeatable) imports
+NAME from there.
+
+```
+error fix.ambiguous: crate::back uses 'is_blank', which 2 modules as near have: crate::back::asm, crate::back::obj; nothing is imported for it: name one with --use
+try: tachyonc fix --only imports --use crate::back::asm::is_blank
+try: tachyonc fix --only imports --use crate::back::obj::is_blank
+```
 
 ## tachyonc same-output
 

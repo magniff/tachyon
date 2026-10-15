@@ -115,7 +115,7 @@ a struct literal there in parentheses, `if p == (P { x: 1 }) { ... }`.
 ## Control flow
 
 ```tach
-fn main() -> i32 {
+fn main(gpa: Gpa) -> i32 {
     let n = 7;
     let parity = if n % 2 == 0 { "even" } else { "odd" };
     println(parity);
@@ -132,7 +132,7 @@ fn main() -> i32 {
     }
     let o: Option<i64> = Some(3);
     if let Some(x) = o { i += x; } else if n > 0 { i -= 1; }
-    let mut stack: Vec<i64> = Vec::new();
+    let mut stack: Vec<i64> = Vec::new_in(gpa);
     stack.push(1);
     while let Some(top) = stack.pop() { i += top; }
     std::print_int(v);

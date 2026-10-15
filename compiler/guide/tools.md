@@ -36,8 +36,9 @@ files are the modules it loads.
 | an item's source | `tachyonc query show NAME` (`--with-comments`) |
 | the item at an error | `tachyonc query show FILE:LINE` |
 | where it is defined, its signature | `tachyonc query def NAME` |
-| every use | `tachyonc query refs NAME` (`--count`, `--in FILE\|MODULE`) |
-| who calls a function | `tachyonc query callers NAME` |
+| every use | `tachyonc query refs NAME` (`--count`, `--in FILE\|MODULE`; a local: `FN::x`) |
+| who calls a function; what it calls | `tachyonc query callers NAME`; `query callees FN` (`--transitive`) |
+| what a function may do: allocate, io, panic... (0.16) | `tachyonc query effects NAME\|MODULE` (`--why io`, `--has alloc(Gpa)`) |
 | a module's items, with signatures | `tachyonc query items MODULE`; every module: `query items` |
 | a module's `use` lines, header comment | `tachyonc query show MODULE::use` (`::header`) |
 | lines of any file | `tachyonc query text FILE:A-B` |

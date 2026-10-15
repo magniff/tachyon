@@ -64,7 +64,7 @@ $ context Item
 pub struct Item { pub name: [u8], pub count: i64 }
 // used by (6)
 report	context/main.tach:10:23	fn report(items: *Vec<Item>) -> i64 {
-main	context/main.tach:18:24	let mut items: Vec<Item> = Vec::new();
+main	context/main.tach:18:24	let mut items: Vec<Item> = Vec::new_in(gpa);
 main	context/main.tach:19:16	items.push(Item { name: "bolt", count: 0 });
 main	context/main.tach:20:16	items.push(Item { name: "nut", count: 3 });
 stock::restock	context/stock.tach:10:28	pub fn restock(items: *Vec<Item>, i: i64, n: i64) {

@@ -243,7 +243,7 @@ In a condition, parenthesize a struct literal: `if p == (P { x: 1 })`.
 ## Slices, Vec, std
 
 ```tach
-let mut v: Vec<i64> = Vec::new();
+let mut v: Vec<i64> = Vec::new_in(gpa);
 v.push(1);
 let a = v[0];
 ```
@@ -274,7 +274,7 @@ the nearest name of its kind:
 
 ```tach
 use std::Buf;
-fn main() -> i32 { let mut b = Buf::new(); b.push_string("x"); 0 }
+fn main(gpa: Gpa) -> i32 { let mut b = Buf::new_in(gpa); b.push_string("x"); 0 }
 ```
 ```err
 error[type error] no method 'push_string' on type 'Buf' | help: did you mean 'push_str'?
@@ -290,7 +290,7 @@ error[type error] expected '[i64]', got '[i64; 3]'
 `sum(a[..])`. An array has no `.len` either: `a[..].len`.
 
 ```tach
-let b = Buf::new();
+let b = Buf::new_in(gpa);
 ```
 ```err
 error[type error] unknown type 'Buf'
@@ -300,7 +300,7 @@ error[type error] unknown type 'Buf'
 ```tach
 use std::HashMap;
 struct K { a: i64 }
-fn main() -> i32 { let m: HashMap<K, i64> = HashMap::new(); 0 }
+fn main(gpa: Gpa) -> i32 { let m: HashMap<K, i64> = HashMap::new_in(gpa); 0 }
 ```
 ```err
 error[type error] the trait 'Hash' is not implemented for 'K' | help: required by the bound 'K: Hash' of 'HashMap'
@@ -512,7 +512,7 @@ Add the `use` line the help names, or run `tachyonc fix`.
 fn main() -> i32 { let text = read_to_string(); 0 }
 ```
 ```err
-error[type error] undefined variable 'read_to_string' | help: std reads stdin: `std::read_stdin()` (all of it, a Buf), `std::read_line(&buf)` (one line, Ok(false) at the end), `std::Scanner` (tokens)
+error[type error] undefined variable 'read_to_string' | help: std reads stdin: `std::read_stdin_in(gpa)` (all of it, a Buf), `std::read_line(&buf)` (one line, Ok(false) at the end), `std::Scanner` (tokens)
 ```
 std's items get their `use` line (`add `use std::read_line;``) or the
 nearest std name; an unknown function with neither points to `tachyonc

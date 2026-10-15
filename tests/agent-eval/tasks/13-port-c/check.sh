@@ -4,10 +4,6 @@
 # the program is a port: it does not use reference.c, and it still builds
 # and works with reference.c gone.
 
-# (0.16) std's ambient allocator (`Vec::new()`) for the 0.15 corpus, until
-# `tachyonc fix --only alloc016` migrates it: compiler/src/front/ambient.tach.
-TACHYON_AMBIENT_GPA=${TACHYON_AMBIENT_GPA:-1}
-export TACHYON_AMBIENT_GPA
 case "$EVAL_LANG" in
     tach) ext=tach ;;
     rust) ext=rs ;;

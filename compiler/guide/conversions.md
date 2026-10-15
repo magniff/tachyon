@@ -183,7 +183,7 @@ with an error enum means failure. std's input (0.15):
 | function | returns | at the end, on failure |
 |---|---|---|
 | `read_line(&buf)` | `Result<bool, IoError>` | `Ok(false)` at the end; `Err(IoError::Read)` |
-| `read_stdin()` | `Result<Buf, IoError>` | `Err(IoError::Read)` |
+| `read_stdin_in(gpa)` | `Result<Buf, IoError>` | `Err(IoError::Read)` |
 | `parse_int(s)` | `Result<i64, ParseIntError>` | `Empty`, `InvalidDigit(at)` (the byte's index), `Overflow` |
 | `sc.next_int()` | `Result<i64, ScanError>` | `ScanError::End`, `ScanError::Parse(e)` |
 | `sc.next_token()`, `sc.next_line()` | `Option<[u8]>` | `None` at the end |
@@ -193,10 +193,10 @@ InvalidDigit(i64), Overflow }`, `pub enum ScanError { End,
 Parse(ParseIntError) }`; each has Display and Debug.
 
 ```tach
-use std::{ScanError, Scanner, read_stdin};
+use std::{ScanError, Scanner, read_stdin_in};
 
-fn main() -> i32 {
-    let mut input = read_stdin().unwrap();
+fn main(gpa: Gpa) -> i32 {
+    let mut input = read_stdin_in(gpa).unwrap();
     defer input.free();
     let mut sc = Scanner::new(input.as_slice());
     let mut sum = 0;
@@ -225,4 +225,6 @@ Code written for 0.14's API (Option and bool results) is moved by
 `parse_int(s).ok()`, `sc.next_int()` `sc.next_int().ok()`,
 `read_line(b)` `read_line(b).unwrap_or(false)`, `read_stdin()`
 `read_stdin().unwrap()`. All four mean what they meant, but a read
-error, which `read_stdin().unwrap()` now reports (exit 101).
+error, which `read_stdin().unwrap()` now reports (exit 101). (0.16:
+then `fix --only alloc016` makes allocation explicit: `guide
+allocators`.)
