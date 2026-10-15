@@ -171,7 +171,7 @@ by the compiler's parser, with holes:
 | hole | matches |
 |---|---|
 | `$x` | any expression; in a type's place, any type (`$a as $T`); in a `let`'s binding place, any pattern (`let $v = ...;`) |
-| `$x...` | any number of elements of a call's arguments, a tuple, an array (one per list): `f($first, $rest...)` |
+| `$x...` | any number of elements of a call's arguments, a tuple, an array (one per list): `f($first, $rest...)`; (0.15) of a block's statements, its tail included: `{ let $x = $e; $s... }` |
 | `$x` written twice | the same code both times (the same tokens, spacing and comments aside) |
 | `--where '$x: T'` | only where the checker typed $x's expression `T` (as messages write types: `*IntVec`, `[u8]`, `Vec<i64>`; spaces aside); several: `--where '$x: T, $y: U'` or `--where` again |
 
@@ -193,6 +193,26 @@ written, its body matched (`apply(|y| $b, $x)`); holes do not stand for
 a closure's parameters. A closure put where an operand or a callee is
 gets parentheses, since its body takes all that follows (`apply($f,
 $x)` to `$f($x)` makes `(|y| y + 1)(2)`).
+
+(0.15) `$s...` among a block's statements (as the tail, or as a
+statement `$s...;`) matches the statements there, with the comments
+between them; in the replacement they keep their lines and indentation
+when the site's block was written on several lines (each statement of
+the replacement's block, and its `}`, on a line of its own; a block nested
+deeper in the replacement than in the site keeps the site's indentation).
+A pattern also matches `for` loops, `match` arms (patterns with holes:
+`Option::Some($y)`), `e?`, named arguments and f-string holes; --where's
+types are checked once the whole pattern matched.
+
+```
+tachyonc rewrite 'for $i in 0..$v.count { let $x = $v.data[$i]; $s... }' \
+    'for $x in $v.items() { $s... }' --where '$v: IntVec'
+```
+
+A site where the replacement drops a hole bound to a name (`for $i`,
+`let $x =`) that the code it keeps still uses is left as it is: `note
+rewrite.dropped` counts them and names the first, `try: query show` it.
+The imports the replacement's names need are added (`note edit.imports`).
 
 Nothing matches: `note rewrite.none`, exit 0; when sites matched but for
 --where, `note rewrite.types` gives the first one's type and place, and

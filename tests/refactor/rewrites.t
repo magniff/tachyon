@@ -121,7 +121,7 @@ error rewrite.unbound: the replacement's $w is not in the pattern
 $ rewrite 'grow($v...) + 1' 'f()'
 note rewrite.none: nothing matches 'grow($v...) + 1'
 $ rewrite 'x + $rest...' 'x'
-error rewrite.pattern: $x... stands for arguments: write it in the arguments of a call, a tuple or an array
+error rewrite.pattern: $x... stands for arguments or statements: write it in the arguments of a call, a tuple or an array, or among a block's statements
 [exit 2]
 $ rewrite 'grow($v, $n)' '$v' --where '$w: i64'
 error rewrite.usage: --where names $w, which the pattern has not (or has as '$w...')
