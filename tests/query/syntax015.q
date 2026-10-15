@@ -4,7 +4,7 @@
 ## A method #[derive] makes: the attribute answers (0.15).
 $ items
 crate	syntax015/main.tach	6
-std	<std>	416
+std	<std>	420
 $ show main
 // crate::main	syntax015/main.tach:25-31	effects: alloc(Gpa) io global panic diverge
 fn main() -> Option<i64> {

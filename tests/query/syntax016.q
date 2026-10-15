@@ -3,7 +3,7 @@
 ## minimal `query effects` (0.16 T1: the effects are inferred).
 $ items
 crate	syntax016/main.tach	10
-std	<std>	416
+std	<std>	420
 $ show apply grow
 // crate::apply	syntax016/main.tach:31-35
 #[no_alloc]
