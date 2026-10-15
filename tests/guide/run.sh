@@ -346,10 +346,14 @@ fi
 
 # (0.17) `guide std` itself is the index: a line per item, the receiver
 # as `Self`, no comments, nothing of std's own workings, within about
-# 3.5k tokens (under the 30000 characters an agent's shell shows whole);
-# std#every-item is not in it.
+# 4k tokens (under the 30000 characters an agent's shell shows whole);
+# std#every-item is not in it. Its first screen (what `| head -60`
+# shows) is the most used names, then the overview.
 size=$(wc -c <"$WORK/topic-std.md" | tr -d ' ')
-if [ "$size" -le 14500 ] && grep -qF 'fn push(self: *Self, x: T)' "$WORK/topic-std.md" \
+if [ "$size" -le 16500 ] \
+    && head -60 "$WORK/topic-std.md" | grep -q '^## The most used$' \
+    && head -60 "$WORK/topic-std.md" | grep -qF 'Vec::new_in(gpa) -> Vec<T>' \
+    && head -60 "$WORK/topic-std.md" | grep -q '^## Overview$' && grep -qF 'fn push(self: *Self, x: T)' "$WORK/topic-std.md" \
     && grep -qF 'fn split_in<A: Allocator>(s: [u8], sep: u8, a: A) -> Vec<[u8], A>' "$WORK/topic-std.md" \
     && ! grep -q '^## Every item' "$WORK/topic-std.md" \
     && ! grep -qF 'fn __' "$WORK/topic-std.md" \
@@ -357,7 +361,7 @@ if [ "$size" -le 14500 ] && grep -qF 'fn push(self: *Self, x: T)' "$WORK/topic-s
     && grep -q '^## Every item with its comment$' "$WORK/std/every.md"; then
     result pass guide-std-index
 else
-    result FAIL guide-std-index "tachyonc guide std is $size bytes (14500 at most), or not the index"
+    result FAIL guide-std-index "tachyonc guide std is $size bytes (16500 at most), or not the index (most used first)"
 fi
 
 # The guide by piece (0.15): --find prints the paragraphs about the
