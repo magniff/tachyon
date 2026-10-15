@@ -73,12 +73,36 @@ pub static mut FN_LIVE: *i64 = 0 as *i64;
 // yet known. should_inline asked calls_returns_twice of the caller and the
 // callee for every candidate call, a scan of both: a few percent of -O2.
 pub static mut FN_RT: *i64 = 0 as *i64;
+
+// (0.17) See deciders: -1 not yet known.
+pub static mut FN_DECIDERS_START: *i64 = 0 as *i64;
+static mut FN_DECIDERS_LEN: *i64 = 0 as *i64;
+static mut DECIDERS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// (0.17) The inliner's caches of function information (FN_RT, deciders),
+// for IRFUNC_COUNT functions, none known.
+pub fn init_fn_caches() {
+    unsafe {
+        FN_RT = alloc_array::<i64>(IRFUNC_COUNT + 1);
+        FN_DECIDERS_START = alloc_array::<i64>(IRFUNC_COUNT + 1);
+        FN_DECIDERS_LEN = alloc_array::<i64>(IRFUNC_COUNT + 1);
+        for fi in 0..IRFUNC_COUNT {
+            FN_RT[fi] = -1;
+            FN_DECIDERS_START[fi] = -1;
+        }
+    }
+}
+
+// Forgets what the caches know of fi (it changed).
+pub fn forget_fn_caches(fi: i64) {
+    unsafe {
+        FN_RT[fi] = -1;
+        FN_DECIDERS_START[fi] = -1;
+    }
+}
 // Whether the function inline_calls works on calls one (it does not change
 // while it inlines: only callees that do not are inlined).
 static mut CALLER_RT: bool = false;
-
-// Per argument of the call inline_cost looks at: whether it is a constant.
-static mut CONST_ARGS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
 // The number of instructions that turn into code.
 pub fn func_size(fi: i64) -> i64 {
@@ -359,32 +383,47 @@ fn decides(g: i64, p: i64) -> bool {
 
 // The cost of inlining callee g at call `call`: its size, less the bonus
 // for constant arguments that decide something in it, less the call's own
-// cost (its argument moves, the call and the result). (0.17: the call is
-// the current function's; which arguments are constants is read first,
-// then g's parameters in g's tables.)
+// cost (its argument moves, the call and the result). (0.17: which of g's
+// parameters decide something is found once g is optimized, deciders.)
 fn inline_cost(g: i64, call: i64) -> i64 {
     unsafe {
-        let back = IR_CUR;
         let nargs = INSTS[call].nargs;
-        CONST_ARGS.count = 0;
-        for k in 0..nargs {
-            CONST_ARGS.push(if is_const(ir_val(ir_arg(call, k))) { 1 } else { 0 });
-        }
-        ir_enter(g);
         let mut cost = FN_SIZE[g];
-        let entry = IRFUNCS[g].entry;
-        let mut v = BLOCKS[entry].first;
-        while v != 0 {
-            if INSTS[v].op == Op::Param {
-                let k = param_operand(g, v);
-                if k >= 0 && k < nargs && CONST_ARGS.data[k] != 0 && decides(g, v) {
-                    cost -= CONST_ARG_BONUS;
-                }
+        let start = deciders(g);
+        for i in start..start + FN_DECIDERS_LEN[g] {
+            let k = DECIDERS.data[i];
+            if k < nargs && is_const(ir_val(ir_arg(call, k))) {
+                cost -= CONST_ARG_BONUS;
             }
-            v = INSTS[v].next;
         }
-        ir_enter(back);
         cost - 2 - nargs
+    }
+}
+
+// The call operands of g's parameters that decide something in it (one
+// per parameter instruction, in order): DECIDERS[deciders(g) ..
+// + FN_DECIDERS_LEN[g]], found once g is optimized (reset with FN_RT).
+fn deciders(g: i64) -> i64 {
+    unsafe {
+        if FN_DECIDERS_START[g] < 0 {
+            let back = IR_CUR;
+            ir_enter(g);
+            FN_DECIDERS_START[g] = DECIDERS.count;
+            let entry = IRFUNCS[g].entry;
+            let mut v = BLOCKS[entry].first;
+            while v != 0 {
+                if INSTS[v].op == Op::Param {
+                    let k = param_operand(g, v);
+                    if k >= 0 && decides(g, v) {
+                        DECIDERS.push(k);
+                    }
+                }
+                v = INSTS[v].next;
+            }
+            FN_DECIDERS_LEN[g] = DECIDERS.count - FN_DECIDERS_START[g];
+            ir_enter(back);
+        }
+        FN_DECIDERS_START[g]
     }
 }
 
@@ -459,7 +498,10 @@ fn should_inline(fi: i64, g: i64, call: i64) -> bool {
         // (0.14) A callee about as big as its call is inlined whatever the
         // caller's size: the chain of small closures an iterator chain calls,
         // `as_slice`.
-        if inline_cost(g, call) <= INLINE_TINY && PROGRAM_SIZE + FN_SIZE[g] <= PROGRAM_BUDGET {
+        // (0.17: computed once; it scans the callee for what each constant
+        // argument decides)
+        let cost = inline_cost(g, call);
+        if cost <= INLINE_TINY && PROGRAM_SIZE + FN_SIZE[g] <= PROGRAM_BUDGET {
             return true;
         }
         let b = INSTS[call].block;
@@ -484,12 +526,12 @@ fn should_inline(fi: i64, g: i64, call: i64) -> bool {
         // takes a callee up to INLINE_HOT)
         if site_cold(b) || is_cold_block(b) {
             // In a cold block, only when that makes the program no bigger.
-            return once || inline_cost(g, call) <= 0;
+            return once || cost <= 0;
         }
         if once && FN_SIZE[g] <= INLINE_ONCE {
             return true;
         }
-        if is_hot_count(BLOCKS[b].count) && inline_cost(g, call) <= INLINE_HOT {
+        if is_hot_count(BLOCKS[b].count) && cost <= INLINE_HOT {
             return true;
         }
         let depth = site_depth(b);
@@ -500,7 +542,7 @@ fn should_inline(fi: i64, g: i64, call: i64) -> bool {
         if depth >= 2 {
             threshold *= 2;
         }
-        inline_cost(g, call) <= threshold
+        cost <= threshold
     }
 }
 
