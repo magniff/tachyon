@@ -1,0 +1,235 @@
+// Selection: the k-th smallest of n values without sorting them.
+//
+// Two algorithms, both generic over any `T: Ord`: quickselect (Hoare's
+// partition around a median-of-three pivot; O(n) expected) and median of
+// medians (Blum, Floyd, Pratt, Rivest and Tarjan; O(n) guaranteed). They
+// find the minimum, percentiles, the median and the maximum of 2 million
+// seeded random values, checked against a sorted copy, and the median of
+// inputs that defeat naive pivot choices.
+//
+//     tachyonc examples/algorithms/quickselect/main.tach -o select && ./select
+//
+// Results go to stdout, the times of each method to stderr.
+
+import "time.h" as c;
+
+// ---------------------------------------------------------------- input
+
+// xorshift64*: a small, fast, seeded generator of 64-bit values.
+struct Rng { state: u64 }
+
+impl Rng {
+    fn new(seed: u64) -> Rng { Rng { state: seed | 1 } }
+
+    fn next(self: *Rng) -> u64 {
+        let mut x = self.state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.state = x;
+        x * 0x2545F4914F6CDD1D
+    }
+
+    // A value in lo..=hi.
+    fn range(self: *Rng, lo: i64, hi: i64) -> i64 {
+        lo + ((self.next() >> 33) % ((hi - lo + 1) as u64)) as i64
+    }
+}
+
+// ------------------------------------------------------------ selection
+
+fn swap<T>(s: [T], i: i64, j: i64) {
+    let t = s[i];
+    s[i] = s[j];
+    s[j] = t;
+}
+
+// The k-th smallest of s (k = 0 is the minimum), reordering s.
+//
+// Partition s around a pivot, then continue in the one side that holds
+// position k: n + n/2 + n/4 + ... = O(n) steps when the pivots split
+// well. The pivot is the median of the first, middle and last values,
+// which splits sorted, reversed and many other ordered inputs evenly;
+// Hoare's partition stops on values equal to the pivot from both sides,
+// so runs of equal values split evenly too.
+fn quickselect<T: Ord>(s: [T], k: i64) -> T {
+    let mut lo = 0;
+    let mut hi = s.len - 1;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if s[mid] < s[lo] { swap(s, mid, lo); }
+        if s[hi] < s[lo] { swap(s, hi, lo); }
+        if s[hi] < s[mid] { swap(s, hi, mid); }
+        let pivot = s[mid];
+        // Afterwards s[lo..=j] <= pivot <= s[j + 1..=hi], with lo <= j < hi.
+        let mut i = lo - 1;
+        let mut j = hi + 1;
+        loop {
+            i += 1;
+            while s[i] < pivot { i += 1; }
+            j -= 1;
+            while pivot < s[j] { j -= 1; }
+            if i >= j { break; }
+            swap(s, i, j);
+        }
+        if k <= j { hi = j; } else { lo = j + 1; }
+    }
+    s[k]
+}
+
+// Sorts a short slice in place.
+fn insertion_sort<T: Ord>(s: [T]) {
+    for i in 1..s.len {
+        let x = s[i];
+        let mut j = i;
+        while j > 0 && x < s[j - 1] {
+            s[j] = s[j - 1];
+            j -= 1;
+        }
+        s[j] = x;
+    }
+}
+
+// Splits s into three runs around p, in place: s[..lt] < p, s[lt..gt]
+// == p, s[gt..] > p (Dijkstra's "Dutch national flag").
+fn partition3<T: Ord>(s: [T], p: T) -> (i64, i64) {
+    let mut lt = 0;
+    let mut i = 0;
+    let mut gt = s.len;
+    while i < gt {
+        if s[i] < p {
+            swap(s, lt, i);
+            lt += 1;
+            i += 1;
+        } else if p < s[i] {
+            gt -= 1;
+            swap(s, i, gt);
+        } else {
+            i += 1;
+        }
+    }
+    (lt, gt)
+}
+
+// The k-th smallest of s, reordering s, in O(n) at worst.
+//
+// The pivot is the median of the medians of groups of five, found by
+// calling this function on them: at least 3/10 of the values are smaller
+// than it and 3/10 larger, so each round keeps at most 7/10 of them, and
+// T(n) <= T(n/5) + T(7n/10) + O(n) = O(n).
+fn median_of_medians<T: Ord>(s: [T], k: i64) -> T {
+    let mut w = s; // the window holding position k
+    let mut k = k;
+    loop {
+        if w.len <= 10 {
+            insertion_sort(w);
+            return w[k];
+        }
+        let groups = w.len / 5;
+        for g in 0..groups { // each group's median to the front
+            let a = 5 * g;
+            insertion_sort(w[a..a + 5]);
+            swap(w, g, a + 2);
+        }
+        let pivot = median_of_medians(w[..groups], groups / 2);
+        let (lt, gt) = partition3(w, pivot);
+        if k < lt {
+            w = w[..lt];
+        } else if k < gt {
+            return pivot;
+        } else {
+            w = w[gt..];
+            k -= gt;
+        }
+    }
+}
+
+// --------------------------------------------------------------- output
+
+fn now_ns() -> i64 {
+    let mut ts = c::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { c::timespec_get(&ts, c::TIME_UTC); }
+    ts.tv_sec * 1_000_000_000 + ts.tv_nsec
+}
+
+// The values at each rank found by `select` on a copy of `data`, which it
+// may reorder; the time it took goes to stderr.
+fn ranks<F: FnMut([i64], i64) -> i64>(name: [u8], data: [i64], ks: [i64], select: F, gpa: Gpa) -> Vec<i64> {
+    let mut work: Vec<i64> = Vec::new_in(gpa);
+    defer work.free();
+    work.extend_from_slice(data);
+    let t0 = now_ns();
+    let found = ks.iter().map(|k| select(work.as_slice(), k)).collect_in(gpa);
+    eprintln(f"{name:<18} {(now_ns() - t0) as f64 / 1e6:>7.2} ms");
+    found
+}
+
+// The median of `data` by both algorithms, which must agree with `want`.
+fn check_median(name: [u8], data: *Vec<i64>, want: i64) -> bool {
+    let k = data.len() / 2;
+    let mut a = data.clone();
+    defer a.free();
+    let mut b = data.clone();
+    defer b.free();
+    let q = quickselect(a.as_slice(), k);
+    let m = median_of_medians(b.as_slice(), k);
+    let ok = q == want && m == want;
+    println(f"{name:<14} median {q:>7} {if ok { "ok" } else { "WRONG" }}");
+    ok
+}
+
+fn main(gpa: Gpa) -> i32 {
+    let n = 2_000_000;
+    let mut rng = Rng::new(2026);
+    let mut data: Vec<i64> = Vec::with_capacity_in(n, gpa);
+    defer data.free();
+    for _ in 0..n { data.push(rng.range(0, 999_999_999)); }
+    println(f"{n} values in 0..=999999999 from a seeded generator");
+
+    let names = ["min", "p1", "p10", "median", "p90", "p99", "max"];
+    let ks = [0, n / 100, n / 10, n / 2, n * 9 / 10, n * 99 / 100, n - 1];
+    let mut by_quick = ranks("quickselect", data.as_slice(), ks[..], |s, k| quickselect(s, k), gpa);
+    defer by_quick.free();
+    let mut by_mom = ranks("median of medians", data.as_slice(), ks[..],
+        |s, k| median_of_medians(s, k), gpa);
+    defer by_mom.free();
+    let mut sorted = false;
+    let mut by_sort = ranks("sort", data.as_slice(), ks[..], |s, k| {
+        if !sorted { // sort once, then read
+            std::sort(s);
+            sorted = true;
+        }
+        s[k]
+    }, gpa);
+    defer by_sort.free();
+
+    println(f"{"rank":<7} {"k":>8} {"value":>10}");
+    for (r, k) in ks[..].iter().enumerate() {
+        println(f"{names[r]:<7} {k:>8} {by_quick.get(r):>10}");
+    }
+    if by_quick != by_sort || by_mom != by_sort {
+        println("the methods disagree");
+        return 1;
+    }
+    println("quickselect, median of medians and sort agree");
+    println("");
+
+    // Ordered inputs, where a first-element or last-element pivot makes
+    // quickselect quadratic: n^2 / 2 = 5 * 10^11 steps here.
+    let m = 1_000_000;
+    let mut patterns: Vec<([u8], Vec<i64>, i64)> = Vec::new_in(gpa);
+    patterns.push(("sorted", (0..m).collect_in(gpa), m / 2));
+    patterns.push(("reversed", (0..m).map(|i| m - 1 - i).collect_in(gpa), m / 2));
+    patterns.push(("all equal", (0..m).map(|_| 7).collect_in(gpa), 7));
+    patterns.push(("organ pipe",
+        (0..m).map(|i| if i < m / 2 { i } else { m - 1 - i }).collect_in(gpa), m / 4));
+    patterns.push(("sawtooth", (0..m).map(|i| i % 1000).collect_in(gpa), 500));
+    let mut all_ok = true;
+    for (name, values, want) in patterns.iter() {
+        let mut values = values;
+        defer values.free();
+        all_ok = check_median(name, &values, want) && all_ok;
+    }
+    patterns.free();
+    if all_ok { 0 } else { 1 }
+}

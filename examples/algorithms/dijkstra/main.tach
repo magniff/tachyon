@@ -1,0 +1,235 @@
+// Dijkstra's shortest paths with a binary heap, on a generated grid graph.
+//
+// A W x H grid: every cell is a node, joined to its four neighbours by
+// directed edges whose weights (1 to 9) come from a seeded generator, so
+// every run sees the same graph. The graph is stored in compressed sparse
+// row form (CSR); the search is the textbook one, with a binary min-heap
+// of (distance, node) entries and "lazy deletion": a node may sit in the
+// heap several times, and only its first pop counts. An entry is one i64,
+// the distance in the high 32 bits and the node in the low ones, so the
+// heap compares single integers.
+//
+//     tachyonc examples/algorithms/dijkstra/main.tach -o dijkstra && ./dijkstra
+//
+// The small grid is drawn with its shortest path; the big one (a million
+// nodes, four million edges) prints its results on stdout and the time
+// the search took on stderr.
+
+import "time.h" as c;
+
+// ---------------------------------------------------------------- input
+
+// xorshift64*: a small, fast, seeded generator of 64-bit values.
+struct Rng { state: u64 }
+
+impl Rng {
+    fn new(seed: u64) -> Rng { Rng { state: seed | 1 } }
+
+    fn next(self: *Rng) -> u64 {
+        let mut x = self.state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.state = x;
+        x * 0x2545F4914F6CDD1D
+    }
+
+    // A value in lo..=hi.
+    fn range(self: *Rng, lo: i64, hi: i64) -> i64 {
+        lo + ((self.next() >> 33) % ((hi - lo + 1) as u64)) as i64
+    }
+}
+
+// A directed graph in CSR form: the edges leaving node v are
+// targets[start[v]..start[v + 1]], with the same weights.
+struct Graph { n: i64, start: Vec<i64>, targets: Vec<i32>, weights: Vec<i32> }
+
+impl Graph {
+    // The w x h grid: node r * w + c, an edge to each of its neighbours.
+    fn grid(w: i64, h: i64, seed: u64, gpa: Gpa) -> Graph {
+        let mut rng = Rng::new(seed);
+        let n = w * h;
+        let mut start: Vec<i64> = Vec::with_capacity_in(n + 1, gpa);
+        let mut targets: Vec<i32> = Vec::with_capacity_in(4 * n, gpa);
+        let mut weights: Vec<i32> = Vec::with_capacity_in(4 * n, gpa);
+        let steps = [(0, 1), (1, 0), (0, -1), (-1, 0)];
+        for r in 0..h {
+            for c in 0..w {
+                start.push(targets.len());
+                for (dr, dc) in steps {
+                    let (nr, nc) = (r + dr, c + dc);
+                    if nr >= 0 && nr < h && nc >= 0 && nc < w {
+                        targets.push((nr * w + nc) as i32);
+                        weights.push(rng.range(1, 9) as i32);
+                    }
+                }
+            }
+        }
+        start.push(targets.len());
+        Graph { n: n, start: start, targets: targets, weights: weights }
+    }
+
+    fn edges(self: *Graph) -> i64 { self.targets.len() }
+
+    fn free(self: *Graph) {
+        self.start.free();
+        self.targets.free();
+        self.weights.free();
+    }
+}
+
+// ----------------------------------------------------------------- heap
+
+// A binary min-heap of any ordered T, in a Vec: the children of slot i
+// are 2i + 1 and 2i + 2, and no child is smaller than its parent.
+struct MinHeap<T: Ord> { items: Vec<T> }
+
+impl<T: Ord> MinHeap<T> {
+    fn with_capacity(cap: i64, gpa: Gpa) -> MinHeap<T> {
+        MinHeap { items: Vec::with_capacity_in(cap, gpa) }
+    }
+
+    fn is_empty(self: *MinHeap<T>) -> bool { self.items.is_empty() }
+
+    fn push(self: *MinHeap<T>, x: T) {
+        self.items.push(x);
+        let s = self.items.as_slice();
+        let mut i = s.len - 1;
+        while i > 0 { // sift up
+            let parent = (i - 1) / 2;
+            if s[parent] <= x { break; }
+            s[i] = s[parent];
+            i = parent;
+        }
+        s[i] = x;
+    }
+
+    fn pop(self: *MinHeap<T>) -> Option<T> {
+        let last = self.items.pop()?; // empty: None
+        let s = self.items.as_slice();
+        if s.len == 0 { return Some(last); }
+        let top = s[0];
+        let mut i = 0;
+        loop { // sift `last` down from the root
+            let mut child = 2 * i + 1;
+            if child >= s.len { break; }
+            if child + 1 < s.len && s[child + 1] < s[child] { child += 1; }
+            if last <= s[child] { break; }
+            s[i] = s[child];
+            i = child;
+        }
+        s[i] = last;
+        Some(top)
+    }
+
+    fn free(self: *MinHeap<T>) { self.items.free(); }
+}
+
+// ------------------------------------------------------------- dijkstra
+
+// A heap entry: (dist << 32) | node. Comparing two of them compares the
+// distances first and the nodes second, as a (dist, node) struct with a
+// derived Ord would, in one instruction.
+fn entry(dist: i64, node: i64) -> i64 { (dist << 32) | node }
+
+const UNREACHED: i64 = i64::MAX;
+
+// The result of a search: each node's distance from the source, and the
+// node before it on a shortest path (-1 for the source and unreached ones).
+struct Paths { dist: Vec<i64>, prev: Vec<i32>, settled: i64 }
+
+impl Paths {
+    fn free(self: *Paths) {
+        self.dist.free();
+        self.prev.free();
+    }
+}
+
+fn dijkstra(g: *Graph, source: i64, gpa: Gpa) -> Paths {
+    let mut dist = Vec::filled_in(g.n, UNREACHED, gpa);
+    let mut prev = Vec::filled_in(g.n, -1i32, gpa);
+    let d = dist.as_slice();
+    let p = prev.as_slice();
+    let start = g.start.as_slice();
+    let targets = g.targets.as_slice();
+    let weights = g.weights.as_slice();
+
+    let mut heap: MinHeap<i64> = MinHeap::with_capacity(g.n, gpa);
+    defer heap.free();
+    d[source] = 0;
+    heap.push(entry(0, source));
+    let mut settled = 0;
+    while let Some(e) = heap.pop() {
+        let (dv, v) = (e >> 32, e & 0xffff_ffff);
+        if dv > d[v] { continue; } // a stale entry: v was settled closer
+        settled += 1;
+        for k in start[v]..start[v + 1] {
+            let u = targets[k] as i64;
+            let nd = dv + weights[k];
+            if nd < d[u] {
+                d[u] = nd;
+                p[u] = v as i32;
+                heap.push(entry(nd, u));
+            }
+        }
+    }
+    Paths { dist: dist, prev: prev, settled: settled }
+}
+
+// --------------------------------------------------------------- output
+
+fn now_ns() -> i64 {
+    let mut ts = c::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { c::timespec_get(&ts, c::TIME_UTC); }
+    ts.tv_sec * 1_000_000_000 + ts.tv_nsec
+}
+
+// Draws each cell's distance, a star before the cells on the path from 0
+// to `target`.
+fn draw(w: i64, h: i64, paths: *Paths, target: i64, gpa: Gpa) {
+    let mut on_path = Vec::filled_in(w * h, false, gpa);
+    defer on_path.free();
+    let mut v = target;
+    let mut steps = 0;
+    while v != -1 {
+        on_path.set(v, true);
+        v = paths.prev.get(v) as i64;
+        steps += 1;
+    }
+    for r in 0..h {
+        for c in 0..w {
+            let v = r * w + c;
+            let d = paths.dist.get(v);
+            let mark = if on_path.get(v) { '*' } else { ' ' };
+            print(f" {mark:c}{d:>3}");
+        }
+        println("");
+    }
+    println(f"cost {paths.dist.get(target)}, {steps - 1} steps");
+}
+
+fn main(gpa: Gpa) -> i32 {
+    // A small grid, drawn: each cell shows its distance from the top left.
+    let (w, h) = (10, 6);
+    let mut small = Graph::grid(w, h, 2026, gpa);
+    defer small.free();
+    let mut paths = dijkstra(&small, 0, gpa);
+    defer paths.free();
+    draw(w, h, &paths, w * h - 1, gpa);
+
+    // A big one, timed.
+    let n = 1000;
+    let mut g = Graph::grid(n, n, 42, gpa);
+    defer g.free();
+    let t0 = now_ns();
+    let mut big = dijkstra(&g, 0, gpa);
+    let t1 = now_ns();
+    defer big.free();
+    let far = big.dist.iter().max().unwrap();
+    let checksum = big.dist.iter().fold(0u64, |h, x| (h ^ x as u64) * 0x100000001B3);
+    println(f"grid {n}x{n}: {g.n} nodes, {g.edges()} edges, {big.settled} settled");
+    println(f"corner to corner: {big.dist.get(g.n - 1)}, farthest node: {far}");
+    println(f"checksum of the distances: {checksum:x}");
+    eprintln(f"dijkstra on {g.n} nodes: {(t1 - t0) / 1_000_000} ms");
+    0
+}

@@ -5,7 +5,9 @@
 
 use crate::front::types::TY_BOOL;
 use crate::middle::ir::{BLOCKS, Cond, INSTS, Op, ir_append, ir_make, ir_val};
-use crate::middle::ir::Op::{And, Cmp, Const, Load, Mul, Neg, Phi, Store, VBin, VNeg, VSplat};
+use crate::middle::ir::Op::{
+    And, Cmp, Const, Load, Mul, Neg, Phi, Store, VBin, VCmp, VNeg, VSel, VSplat,
+};
 use crate::middle::loops::invariant_in;
 use crate::middle::vectorize::{
     VC_SKIP, VC_UNIFORM, VC_VECTOR, V_CHAIN, V_EVAL, V_IV, V_MAP, V_START, V_VT,
@@ -149,6 +151,21 @@ pub fn emit_body(l: i64, vh: i64, vp: i64) {
                     let value = vector_of(INSTS[v].b, vh, vp, l);
                     let nv = append(vh, Store, 0, map_get(INSTS[v].a), value, INSTS[v].imm);
                     INSTS[nv].imm2 = vt;
+                } else if op == Cmp {
+                    // (0.15) A mask.
+                    let a = vector_of(INSTS[v].a, vh, vp, l);
+                    let b = vector_of(INSTS[v].b, vh, vp, l);
+                    let nv = append(vh, VCmp, vt, a, b, 0);
+                    INSTS[nv].cond = INSTS[v].cond;
+                    INSTS[nv].imm2 = vt;
+                    map_put(v, nv);
+                } else if op == Op::Sel {
+                    let k = map_get(ir_val(INSTS[v].a));
+                    let b = vector_of(INSTS[v].b, vh, vp, l);
+                    let c = vector_of(INSTS[v].c, vh, vp, l);
+                    let nv = append(vh, VSel, vt, k, b, 0);
+                    INSTS[nv].c = c;
+                    map_put(v, nv);
                 } else if op == Neg {
                     let nv = append(vh, VNeg, vt, vector_of(INSTS[v].a, vh, vp, l), 0, 0);
                     map_put(v, nv);
@@ -169,4 +186,24 @@ pub fn identity(op: Op) -> i64 {
     if op == And { return -1; }
     if op == Mul { return 1; }
     0
+}
+
+// (0.15) The minimum or maximum of a and b in block blk, as reduction phi
+// r's next value nx (k ? z : r, or k ? r : z) picks it: a for r, b for z;
+// vectors of type ty, or scalars of type ty.
+pub fn minmax_of(blk: i64, r: i64, nx: i64, a: i64, b: i64, vector: bool, ty: i64) -> i64 {
+    unsafe {
+        let k = ir_val(INSTS[nx].a);
+        let x = if ir_val(INSTS[k].a) == r { a } else { b };
+        let y = if ir_val(INSTS[k].b) == r { a } else { b };
+        let p = if ir_val(INSTS[nx].b) == r { a } else { b };
+        let q = if ir_val(INSTS[nx].c) == r { a } else { b };
+        let m = if vector { append(blk, VCmp, ty, x, y, 0) }
+            else { cmp(blk, INSTS[k].cond, ty, x, y) };
+        INSTS[m].cond = INSTS[k].cond;
+        INSTS[m].imm2 = ty;
+        let s = append(blk, if vector { VSel } else { Op::Sel }, ty, m, p, 0);
+        INSTS[s].c = q;
+        s
+    }
 }

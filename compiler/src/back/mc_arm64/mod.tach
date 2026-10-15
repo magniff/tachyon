@@ -209,8 +209,88 @@ fn ma_mem_operand(base: i64, offset: i64) {
     }
 }
 
+// (0.15) The last load or store a pair may start (see pair_with_last): its
+// line's start and end in CODE (end -1: none), kind (1 an x register, 2 a
+// d register, 3 a q register; negated for a store), register, base and
+// offset.
+pub static mut PAIR_END: i64 = -1;
+static mut PAIR_START: i64 = 0;
+static mut PAIR_KIND: i64 = 0;
+static mut PAIR_REG: i64 = 0;
+static mut PAIR_BASE: i64 = 0;
+static mut PAIR_OFFSET: i64 = 0;
+
+// The kind of an access of type ty a pair can make (0: none).
+fn pair_kind(ty: i64) -> i64 {
+    if is_vector(ty) {
+        3
+    } else if ty == TY_F64 {
+        2
+    } else if !is_float(ty) && type_size(ty) == 8 {
+        1
+    } else {
+        0
+    }
+}
+
+// (0.15) A load (or store) of register r at [base, #offset] right after
+// one of the same kind, base and the offset before: the two become one
+// ldp (stp) in place of the line just written. A load whose result is the
+// base (the next one's address changes) or the other's register is no
+// pair. Returns whether it was made; else remembers this access when it
+// may start one (call it with the line about to be written).
+fn pair_with_last(load: bool, ty: i64, r: i64, base: i64, offset: i64) -> bool {
+    unsafe {
+        let kind = if load { pair_kind(ty) } else { 0 - pair_kind(ty) };
+        let size = if kind == 3 || kind == -3 { 16 } else { 8 };
+        if kind == 0 || MEM_INDEX >= 0 {
+            PAIR_END = -1;
+            return false;
+        }
+        if BUFS[CODE].len == PAIR_END && kind == PAIR_KIND && base == PAIR_BASE
+            && offset == PAIR_OFFSET + size && !(load && (PAIR_REG == base || PAIR_REG == r)) {
+            BUFS[CODE].len = PAIR_START;
+            o(if load { c"    ldp " } else { c"    stp " });
+            if kind == 1 || kind == -1 {
+                ma_r(PAIR_REG);
+                o(c", ");
+                ma_r(r);
+            } else {
+                ma_f(PAIR_REG, ty);
+                o(c", ");
+                ma_f(r, ty);
+            }
+            o(c", [");
+            ma_r(base);
+            if PAIR_OFFSET != 0 {
+                o(c", #");
+                oi(PAIR_OFFSET);
+            }
+            o(c"]");
+            on();
+            PAIR_END = -1;
+            return true;
+        }
+        // (ldp's offset: 7 signed bits, scaled)
+        if offset >= 0 && offset % size == 0 && offset / size < 63 {
+            PAIR_START = BUFS[CODE].len;
+            PAIR_KIND = kind;
+            PAIR_REG = r;
+            PAIR_BASE = base;
+            PAIR_OFFSET = offset;
+            PAIR_END = -2;
+        } else {
+            PAIR_END = -1;
+        }
+        false
+    }
+}
+
 pub fn ma_load(ty: i64, dst: i64, base: i64, offset: i64) {
     unsafe {
+        if pair_with_last(true, ty, dst, base, offset) {
+            return;
+        }
         let size = type_size(ty);
         let at = if MEM_INDEX >= 0 { 0 } else { ma_address(base, offset, size) };
         o(c"    ");
@@ -242,11 +322,17 @@ pub fn ma_load(ty: i64, dst: i64, base: i64, offset: i64) {
         o(c", ");
         ma_mem_operand(base, at);
         on();
+        if PAIR_END == -2 {
+            PAIR_END = BUFS[CODE].len;
+        }
     }
 }
 
 pub fn ma_store(ty: i64, src: i64, base: i64, offset: i64) {
     unsafe {
+        if pair_with_last(false, ty, src, base, offset) {
+            return;
+        }
         let size = type_size(ty);
         let at = if MEM_INDEX >= 0 { 0 } else { ma_address(base, offset, size) };
         o(c"    ");
@@ -269,6 +355,9 @@ pub fn ma_store(ty: i64, src: i64, base: i64, offset: i64) {
         o(c", ");
         ma_mem_operand(base, at);
         on();
+        if PAIR_END == -2 {
+            PAIR_END = BUFS[CODE].len;
+        }
     }
 }
 

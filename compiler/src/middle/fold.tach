@@ -635,6 +635,9 @@ fn combine(v: i64) -> bool {
         if op == Cmp {
             return combine_compare(v);
         }
+        if op == Op::Sel {
+            return combine_select(v);
+        }
         if !op.is_binary() || is_float(ty) {
             return false;
         }
@@ -723,6 +726,58 @@ fn combine(v: i64) -> bool {
     }
 }
 
+// (0.15) k ? x : x is x; a constant k picks; k ? t op x : t, with op one
+// of + - | ^ (0 the identity, t on the left for -), is t op (k ? x : 0):
+// the select leaves the chain through t, a reduction's (ifconv.tach).
+pub fn combine_select(v: i64) -> bool {
+    unsafe {
+        let k = INSTS[v].a;
+        let x = INSTS[v].b;
+        let y = INSTS[v].c;
+        if x == y {
+            return replace_same_type(v, x);
+        }
+        if is_const(k) {
+            return replace_same_type(v, if INSTS[k].imm != 0 { x } else { y });
+        }
+        let ty = INSTS[v].ty;
+        if !is_integer(ty) {
+            return false;
+        }
+        // (the arm holding the operation, and which one it is)
+        let mut t = y;
+        let mut w = x;
+        let mut then_side = true;
+        if INSTS[x].op != Add && INSTS[x].op != Sub && INSTS[x].op != Or && INSTS[x].op != Xor
+            || (INSTS[x].a != y && INSTS[x].b != y) {
+            t = x;
+            w = y;
+            then_side = false;
+        }
+        let op = INSTS[w].op;
+        if (op != Add && op != Sub && op != Or && op != Xor) || INSTS[w].ty != ty {
+            return false;
+        }
+        let other = if INSTS[w].a == t { INSTS[w].b } else if op != Sub && INSTS[w].b == t {
+            INSTS[w].a
+        } else {
+            return false;
+        };
+        if other == t {
+            return false;
+        }
+        let zero = const_before(v, 0, ty);
+        let pick = ir_make(Op::Sel, ty, k, if then_side { other } else { zero }, 0);
+        INSTS[pick].c = if then_side { zero } else { other };
+        ir_insert_before(v, pick);
+        INSTS[v].op = op;
+        INSTS[v].a = t;
+        INSTS[v].b = pick;
+        INSTS[v].c = 0;
+        true
+    }
+}
+
 // Division by a power of two: a shift (with a fix-up toward zero for signed
 // values), and the remainder a mask (or x - q * 2^k).
 fn combine_division(v: i64, a: i64, c: i64) -> bool {
@@ -782,6 +837,28 @@ fn combine_compare(v: i64) -> bool {
         if a == b && !is_float(ty) {
             return make_const(v, (cond == Cond::Eq || cond == Cond::Le || cond == Cond::Ge) as i64);
         }
+        // (0.15) A select of constants compared with a constant: the
+        // select's condition, its negation, or a constant (a comparator's
+        // ordering, -1, 0 or 1, compared with 0, once if-converted).
+        if is_const(b) && INSTS[a].op == Op::Sel && !is_float(ty) {
+            let c = INSTS[b].imm;
+            let x = select_outcome(INSTS[a].b, cond, ty, c, 0);
+            let y = select_outcome(INSTS[a].c, cond, ty, c, 0);
+            if x >= 0 && x == y {
+                return make_const(v, x);
+            }
+            if x == 1 && y == 0 {
+                return replace_same_type(v, INSTS[a].a);
+            }
+            if x == 0 && y == 1 {
+                INSTS[v].op = Not;
+                INSTS[v].a = INSTS[a].a;
+                INSTS[v].b = 0;
+                INSTS[v].imm2 = 0;
+                INSTS[v].cond = Cond::Eq;
+                return true;
+            }
+        }
         if ty == TY_BOOL && is_const(b) && !is_const(a) {
             // b != false, b == true: b itself.
             let c = INSTS[b].imm;
@@ -790,6 +867,22 @@ fn combine_compare(v: i64) -> bool {
             }
         }
         false
+    }
+}
+
+// (0.15) x <cond> c (operands of type ty) when x is a constant, or a
+// select whose operands all give one outcome: 1 or 0; else -1.
+fn select_outcome(x: i64, cond: Cond, ty: i64, c: i64, depth: i64) -> i64 {
+    unsafe {
+        if is_const(x) {
+            return fold_compare(cond, ty, INSTS[x].imm, c) as i64;
+        }
+        if INSTS[x].op != Op::Sel || depth > 3 {
+            return -1;
+        }
+        let p = select_outcome(INSTS[x].b, cond, ty, c, depth + 1);
+        let q = select_outcome(INSTS[x].c, cond, ty, c, depth + 1);
+        if p >= 0 && p == q { p } else { -1 }
     }
 }
 

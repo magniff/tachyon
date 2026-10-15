@@ -750,7 +750,7 @@ test machine).
   (renames, moves, signatures, errors across files) and when reading a
   small file is cheaper (tools-only cost more than the guide alone)
 
-Done (0.15.0, the release gate still to run). The design
+Done (0.15.0). The design
 (docs/design/errors-formatting.md), an interface commit with stubs and
 hooks, and six parallel tasks merged in the design's order: errors and
 conversions (`?`, generic traits, `From`/`Into`, `main` returning
@@ -779,6 +779,29 @@ per eval cell, and a baseline on the harder tasks, to a later release;
 associated constants in general, `Debug` for tuples and generic slices,
 `collect` into anything but a `Vec`, and returning closures, to later
 releases.
+Also in 0.15: the optimizer closed the gap to C on loops (if-conversion,
+vector masks and minimum/maximum reductions, one accumulator per copy in
+the run-time unroller, `ldp`/`stp`: bench/iterloop from about 2.1 to 1.04
+times cc -O2); ten algorithm examples and eight tool sessions (tested
+transcripts); 772 tests. From 0.15 the gate leaves x86_64 out
+(`bootstrap/gate.conf`; `--with-x86`): the work is on the language and the
+evals, and the emulated container was half the gate's machine time.
+
+0.15.0 release gate (2026-10-15): `bootstrap/gate.sh --release` on
+aarch64-macos, 85:47 wall, with the machine just rebooted and other
+agents' work on it (load average 15 to 4): the chain (fixpoint, built by
+0.14.0) and the suite at -O0/1/2 (772 tests); fuzz 60 in each of the ten
+modes (the seed in one), ABI 100 in three modes, objcheck (1216 of
+1216), header layouts, stress-grow; aarch64-linux (the cross-built
+fixpoint, the suite at every level, fuzz 300 in nine modes, ABI 150 in
+three, objcheck, layouts, gdb at -O0 and -O2). The lldb check failed in
+that run at -O0 and -O2 alike: lldb waited about 80 minutes without
+running the program; the line table it checks is the same as before the
+optimizer's changes, and the step passed alone afterwards (`gate.sh
+--only debug`); tests/debug.sh now bounds each lldb run. x86_64-linux
+ran once and failed only the walkthrough sessions (the compiler's path
+in their transcripts, fixed in f1cb343); it was not run again (x86_64
+off from 0.15). Benchmarks and compile times in "Benchmarks", 0.15.
 
 ## 0.16: effects
 
@@ -1471,3 +1494,72 @@ both). `query refs` without the cache is about 10% slower in both runs
 warm, every query is about 7 ms as in 0.13. The tiny std program
 compiles in about the time 0.13.0 takes (std's unreachable functions
 dropped before the optimizer).
+
+### 0.15
+
+aarch64-macos (Apple silicon, native; `bench/run.sh -p <0.14.0> -r 9`,
+the fastest of 9 runs in ms, after the gate, load average about 5 from
+other agents; "0.14.0" is the previous release at its default level; the
+geometric means are over cc -O2's, programs with a C version only):
+
+| program | 0.14.0 | 0.15 -O2 | cc -O2 |
+|---|---|---|---|
+| binarytrees | 174 | 160 | 156 |
+| collatz | 311 | 312 | 306 |
+| fannkuch | 119 | 122 | 143 |
+| fib | 14 | 14 | 15 |
+| interp | 42 | 43 | 41 |
+| iterchain | 418 | 196 | 189 |
+| iterloop | 419 | 194 | 187 |
+| json | 109 | 112 | 95 |
+| mandelbrot | 175 | 174 | 168 |
+| matmul | 19 | 19 | 46 |
+| nbody | 32 | 31 | 29 |
+| sieve | 65 | 69 | 77 |
+| sort | 60 | 60 | 56 |
+| stencil | 8 | 8 | 8 |
+| wordcount | 126 | 92 | 75 |
+| md5 | 39 | 37 | - |
+| fmtints | 28 | 30 | - |
+| fmtloop | - | 27 | - |
+| geomean vs cc -O2 (15 programs, iterchain included) | 1.091 | 0.966 | 1 |
+
+(-O0 and -O1 in the same run: geomean 8.052 and 1.658.) iterchain over
+iterloop, alternating, fastest of 18 rounds: 196 against 194 ms, a ratio
+of **1.010** (the limit is 1.05); both are now within 4% of cc -O2's
+(189 and 187 ms), from about 2.2 times in 0.14 (docs/optimizer.md,
+"0.15"). fmtloop (10^6 lines formatted by f-strings into a Buf) over
+fmtints (the same text with push_int and push_str by hand): 27 against
+29 ms, **0.931** (the limit is 1.05).
+
+The other differences are noise: an alternating rerun (fastest of 15,
+load average about 5) gives wordcount 87 against 87 ms, json 110 against
+111, binarytrees 159 against 165, sieve 66 against 74; sieve's
+assembly is the same as 0.14.0's (the binaries differ in their UUID), so
+its difference is the machine's. iterchain and iterloop are the
+optimizer's 0.15 work; everything else compiles as before.
+
+Compile time (aarch64-macos, wall time, best of 7, the two compilers
+alternating on the same input: the 0.15 source, 114,000 lines in 249
+files; load average about 4.5):
+
+| | 0.14.0 | 0.15 |
+|---|---|---|
+| the compiler to an object, -O0 | 303 ms | 300 ms |
+| the compiler to an object, -O2 | 2423 ms | 2399 ms |
+| `tachyonc check compiler/src/main.tach`, no cache | 97 ms | 100 ms |
+| `tachyonc query refs run_gvn`, no cache (`TACHYON_CACHE=off`) | 121 ms | 135 ms |
+| `tachyonc check compiler/src/main.tach`, cache warm | 8.7 ms | 8.9 ms |
+| `tachyonc query refs run_gvn`, cache warm | 10.1 ms | 9.5 ms |
+| a 7-line std program to an object, -O0 | 3.2 ms | 2.9 ms |
+| a 7-line std program to an object, -O2 | 5.0 ms | 5.0 ms |
+
+The compiler compiles itself as fast as 0.14.0 does (its source grew 16%
+since 0.14's measurement, 98,000 to 114,000 lines, so the absolute times
+are higher than 0.14's table). `query refs` without the cache is about
+12% slower (0.15's checker: widening, generic traits, named arguments),
+not investigated further; with the cache, queries are about 9 to 10 ms
+on this machine at this load. The tiny std program compiles as fast as
+with 0.14.0 although std doubled (46 to 90 KB): std is loaded by
+sections, and print compiles less code (Integration notes in
+docs/design/errors-formatting.md).

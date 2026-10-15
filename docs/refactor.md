@@ -7,6 +7,9 @@ built on `tachyonc query` ([query.md](query.md)): NAME is anything query
 accepts, positions and spans are the compiler's, and every problem is
 one line `SEVERITY CODE: MESSAGE` followed by `try:` lines, as there.
 
+Sessions with these tools on small programs, each step's command and
+its output, tested by `tests/walkthrough/run.sh`: [examples/tools](../examples/tools/README.md).
+
 ```
 tachyonc edit patch TARGET --old TEXT --new TEXT [--old TEXT --new TEXT]... [--loose]
 tachyonc edit patch TARGET [--loose] < PAIRS   (0.12; see "Edits inside an item")

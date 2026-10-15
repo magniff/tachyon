@@ -1,0 +1,260 @@
+// A sudoku solver: backtracking over bitmasks, always filling the cell
+// with the fewest candidates first.
+//
+// Each row, column and box keeps a 9-bit mask of the digits it holds; a
+// cell's candidates are the digits in none of its three masks, one OR
+// and one NOT. The search picks the empty cell with the fewest
+// candidates (a forced cell has one: no guess at all), tries each, and
+// undoes the move when the rest fails. It keeps going after the first
+// solution to prove there is no second one.
+//
+//     tachyonc examples/algorithms/sudoku/main.tach -o sudoku && ./sudoku
+//
+// It solves a few well-known hard puzzles, shows one parse error, then
+// solves 70 variants of them (digits relabelled, rows and columns
+// shuffled: the same puzzle to the solver, different to a cache) and
+// prints a checksum; the time goes to stderr.
+
+import "time.h" as c;
+
+// ----------------------------------------------------------------- grid
+
+// The 81 cells, row by row (0: empty), and the digits used by each row,
+// column and box, as bit d - 1 of a mask.
+#[derive(Clone)]
+struct Sudoku { cells: [u8; 81], rows: [u64; 9], cols: [u64; 9], boxes: [u64; 9] }
+
+// What is wrong with a puzzle's text: its length; the byte at an index;
+// the digit at an index, already in its row, column or box.
+#[derive(Debug)]
+enum ParseError { Length(i64), BadChar(i64, u8), Conflict(i64, u8) }
+
+const ALL: u64 = 0x1ff;
+
+fn box_of(i: i64) -> i64 { (i / 27) * 3 + (i % 9) / 3 }
+
+// The number of set bits of x, without a loop: the counts of bit pairs,
+// then of nibbles, then of bytes, then their sum in the top byte.
+fn popcount(x: u64) -> i64 {
+    let x = x - ((x >> 1) & 0x5555555555555555);
+    let x = (x & 0x3333333333333333) + ((x >> 2) & 0x3333333333333333);
+    let x = (x + (x >> 4)) & 0x0f0f0f0f0f0f0f0f;
+    ((x * 0x0101010101010101) >> 56) as i64
+}
+
+impl Sudoku {
+    fn empty() -> Sudoku { Sudoku { cells: [0; 81], rows: [0; 9], cols: [0; 9], boxes: [0; 9] } }
+
+    // 81 characters, row by row: '1' to '9', or '.' or '0' for an empty
+    // cell. Two equal digits in a row, column or box are an error too.
+    fn parse(text: [u8]) -> Result<Sudoku, ParseError> {
+        if text.len != 81 { return Err(ParseError::Length(text.len)); }
+        let mut s = Sudoku::empty();
+        for (i, b) in text.iter().enumerate() {
+            if b == '.' || b == '0' { continue; }
+            if b < '1' || b > '9' { return Err(ParseError::BadChar(i, b)); }
+            let d = b - '0';
+            if s.candidates(i) & (1u64 << (d - 1)) == 0 {
+                return Err(ParseError::Conflict(i, d));
+            }
+            s.place(i, d);
+        }
+        Ok(s)
+    }
+
+    fn candidates(self: *Sudoku, i: i64) -> u64 {
+        ALL & ~(self.rows[i / 9] | self.cols[i % 9] | self.boxes[box_of(i)])
+    }
+
+    fn place(self: *Sudoku, i: i64, d: u8) {
+        let bit = 1u64 << (d - 1);
+        self.cells[i] = d;
+        self.rows[i / 9] |= bit;
+        self.cols[i % 9] |= bit;
+        self.boxes[box_of(i)] |= bit;
+    }
+
+    fn clear(self: *Sudoku, i: i64) {
+        let bit = ~(1u64 << (self.cells[i] - 1));
+        self.cells[i] = 0;
+        self.rows[i / 9] &= bit;
+        self.cols[i % 9] &= bit;
+        self.boxes[box_of(i)] &= bit;
+    }
+
+    fn clues(self: *Sudoku) -> i64 { self.cells[..].iter().filter(|d| d != 0).count() }
+
+    fn row_text(self: *Sudoku, r: i64) -> [u8; 9] {
+        let mut t = [0u8; 9];
+        for k in 0..9 {
+            let d = self.cells[r * 9 + k];
+            t[k] = if d == 0 { '.' } else { '0' + d };
+        }
+        t
+    }
+}
+
+// ---------------------------------------------------------------- solve
+
+// The search's state: the grid it fills, the first solution it found,
+// how many it found (it stops at `limit`), and the nodes it visited.
+struct Search { grid: Sudoku, first: Sudoku, found: i64, limit: i64, nodes: i64 }
+
+impl Search {
+    fn run(puzzle: Sudoku, limit: i64 = 2) -> Search {
+        let mut s = Search { grid: puzzle, first: puzzle, found: 0, limit: limit, nodes: 0 };
+        s.fill();
+        s
+    }
+
+    fn fill(self: *Search) {
+        self.nodes += 1;
+        // The empty cell with the fewest candidates.
+        let mut best = -1;
+        let mut best_count = 10;
+        let mut best_mask = 0u64;
+        for i in 0..81 {
+            if self.grid.cells[i] != 0 { continue; }
+            let m = self.grid.candidates(i);
+            let n = popcount(m);
+            if n < best_count {
+                best = i;
+                best_count = n;
+                best_mask = m;
+                if n <= 1 { break; } // dead end, or forced
+            }
+        }
+        if best == -1 { // no empty cell: a solution
+            if self.found == 0 { self.first = self.grid; }
+            self.found += 1;
+            return;
+        }
+        let mut m = best_mask;
+        while m != 0 && self.found < self.limit {
+            let bit = m & (0 - m);
+            m ^= bit;
+            self.grid.place(best, (popcount(bit - 1) + 1) as u8);
+            self.fill();
+            self.grid.clear(best);
+        }
+    }
+}
+
+// ------------------------------------------------------------ variants
+
+// xorshift64*: a small, fast, seeded generator.
+struct Rng { state: u64 }
+
+impl Rng {
+    fn next(self: *Rng) -> u64 {
+        let mut x = self.state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.state = x;
+        x * 0x2545F4914F6CDD1D
+    }
+
+    fn below(self: *Rng, n: i64) -> i64 { ((self.next() >> 33) % (n as u64)) as i64 }
+
+    // A random order of 0..n into p (Fisher-Yates).
+    fn shuffle(self: *Rng, p: [i64]) {
+        for i in 0..p.len { p[i] = i; }
+        for i in 1..p.len {
+            let j = self.below(i + 1);
+            let t = p[i];
+            p[i] = p[j];
+            p[j] = t;
+        }
+    }
+}
+
+// The same puzzle in disguise: digits relabelled, the bands (groups of
+// three rows) and the rows inside each band shuffled, the same for the
+// columns. Every solution maps to a solution, so the difficulty is kept.
+fn disguise(p: *Sudoku, rng: *Rng) -> Sudoku {
+    let mut digits = [0; 9];
+    rng.shuffle(digits[..]);
+    let mut row_of = [0; 9];
+    let mut col_of = [0; 9];
+    shuffle_lines(rng, row_of[..]);
+    shuffle_lines(rng, col_of[..]);
+    let mut out = Sudoku::empty();
+    for r in 0..9 {
+        for c in 0..9 {
+            let d = p.cells[row_of[r] * 9 + col_of[c]];
+            if d != 0 { out.place(r * 9 + c, (digits[d - 1] + 1) as u8); }
+        }
+    }
+    out
+}
+
+// A random order of the nine rows (or columns) into `line_of` that keeps
+// each band together: the bands shuffled, and the three lines inside each.
+fn shuffle_lines(rng: *Rng, line_of: [i64]) {
+    let mut bands = [0; 3];
+    rng.shuffle(bands[..]);
+    for b in 0..3 {
+        let mut inner = [0; 3];
+        rng.shuffle(inner[..]);
+        for k in 0..3 { line_of[b * 3 + k] = bands[b] * 3 + inner[k]; }
+    }
+}
+
+// --------------------------------------------------------------- main
+
+fn now_ns() -> i64 {
+    let mut ts = c::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { c::timespec_get(&ts, c::TIME_UTC); }
+    ts.tv_sec * 1_000_000_000 + ts.tv_nsec
+}
+
+const PUZZLES: [[u8]; 7] = [
+    "8..........36......7..9.2...5...7.......457.....1...3...1....68..85...1..9....4..",
+    "4.....8.5.3..........7......2.....6.....8.4......1.......6.3.7.5..2.....1.4......",
+    "52...6.........7.13...........4..8..6......5...........418.........3..2...87.....",
+    "6.....8.3.4.7.................5.4.7.3..2.....1.6.......2.....5.....8.6......1....",
+    "48.3............71.2.......7.5....6....2..8.............1.76...3.....4......5....",
+    "....14....3....2...7..........9...3.6.1.............8.2.....1.4....5.6.....7.8...",
+    "53..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..79",
+];
+
+fn main(gpa: Gpa) -> i32 {
+    let first = Sudoku::parse(PUZZLES[0]).unwrap();
+    let s = Search::run(first);
+    println("puzzle        solution");
+    for r in 0..9 {
+        println(f"{first.row_text(r)[..]}     {s.first.row_text(r)[..]}");
+    }
+    println("");
+    println("#  clues   nodes  unique");
+    let mut puzzles: Vec<Sudoku> = Vec::new_in(gpa);
+    defer puzzles.free();
+    for (k, text) in PUZZLES[..].iter().enumerate() {
+        let p = Sudoku::parse(text).unwrap();
+        let s = Search::run(p);
+        println(f"{k}  {p.clues():>5} {s.nodes:>7}  {if s.found == 1 { "yes" } else { "no" }}");
+        puzzles.push(p);
+    }
+    let broken = "53..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..78";
+    match Sudoku::parse(broken) {
+        Ok(_) => println("parsed?"),
+        Err(e) => println(f"a broken puzzle: {e:?}"),
+    }
+
+    let count = 70;
+    let mut rng = Rng { state: 2026 };
+    let mut checksum = 0u64;
+    let mut nodes = 0;
+    let t0 = now_ns();
+    for k in 0..count {
+        let p = disguise(&puzzles.as_slice()[k % puzzles.len()], &rng);
+        let s = Search::run(p, limit: 1);
+        nodes += s.nodes;
+        for i in 0..81 { checksum = checksum * 31 + s.first.cells[i]; }
+    }
+    let t1 = now_ns();
+    println(f"{count} disguised puzzles: {nodes} nodes, checksum {checksum:x}");
+    eprintln(f"sudoku: {count} puzzles in {(t1 - t0) / 1_000_000} ms");
+    0
+}

@@ -71,7 +71,10 @@ for o in 0 2; do
                 printf 'breakpoint set --file %s --line %s\nrun\nbt 1\nkill\nquit\n' \
                     "${stop%:*}" "${stop#*:}" >"$WORK/cmds"
             fi
-            (cd "$ROOT" && lldb -b -s "$WORK/cmds" "$exe") >>"$WORK/log$o" 2>&1
+            # (at most 2 minutes: an lldb waiting for the system to let it
+            # attach, as after a reboot under load, would hang the gate)
+            (cd "$ROOT" && perl -e 'alarm 120; exec @ARGV' lldb -b -s "$WORK/cmds" "$exe") \
+                >>"$WORK/log$o" 2>&1 || echo "(lldb: exit $?)" >>"$WORK/log$o"
         elif [ "$stop" = crash ]; then
             (cd "$ROOT" && gdb -q -batch -ex 'set pagination off' -ex run -ex bt -ex kill "$exe") \
                 >>"$WORK/log$o" 2>&1
@@ -96,6 +99,9 @@ for o in 0 2; do
             if (k <= n) { print "missing: " want[k]; exit 1 }
         }' "$WORK/expect" >"$WORK/why"; then
         echo "FAIL -O$o: $(cat "$WORK/why") (with $DEBUGGER)"
+        if grep -q 'Not allowed to attach\|lldb: exit 142' "$WORK/log$o"; then
+            echo "    (lldb could not run the program: the system did not let it attach, or it waited; DevToolsSecurity -status, and rerun: gate.sh --only debug)"
+        fi
         sed 's/^/    /' "$WORK/log$o" | tail -30
         failed=$((failed + 1))
         continue

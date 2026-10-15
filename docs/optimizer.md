@@ -119,6 +119,7 @@ pointer) and every arithmetic rule.
 | inlining | strongly connected components of the call graph (Tarjan), callees first, so a callee is already optimized and recursion is never inlined; a callee is inlined when it has at most 30 instructions, or when this is its only call site and it has at most 400 (and is neither `main` nor address-taken); callers grow to at most 3,000 instructions. The callee's blocks are copied, parameters become the arguments, frame slots are copied, returns jump to a continuation block with a phi for the result | `inline.tach` |
 | copy elision (0.14) | a whole slot copied once (outside loops) into another slot or a field of one, the source used only before, the destination's part only after, neither escaping: the source is that part, the copy goes | `copies.tach` |
 | threading on tags (0.14) | a switch on a phi, or a branch comparing one with a constant, whose operands are constants or phis: the block (or a chain of single-predecessor blocks from the phi's) is copied for each predecessor giving a constant, going to its outcome; uses repaired by the SSA updater | `tags.tach` |
+| if-conversion (0.15) | in innermost loops, a branch whose ways meet again after at most 4 pure instructions: the instructions move up, the meeting block's phis become selects (`sel`) | `ifconv.tach` |
 | exit merging (0.14) | several exits at a loop's top testing induction variables against invariants: one counter tested against the smallest trip count; header phis with one start and step merged | `exits.tach` |
 
 The pipeline (`optimize_program` in `opt.tach`) runs the cleanup on
@@ -1462,3 +1463,104 @@ at the latch (a rotated `while i < n && i < m`) is not merged (the tests
 must be at the top); next-based `filter` keeps a bounds check the hand
 loop does not have (its position is a phi of two loops' phis); the
 sort kernel's comparator, threaded, still leaves an unused comparison.
+
+## 0.15: loops as cc compiles them
+
+0.14's benchmarks found bench/iterloop (six loop kernels written by
+hand) at about 2.2 times the time of its C twin under cc -O2, the
+iterator chains the same. Comparing the assembly kernel by kernel
+(`tachyonc -S`, `cc -O2 -S`), the causes were:
+
+| kernel | cause | ratio to cc -O2, before / after |
+|---|---|---|
+| filter-map-sum (`if x & 1 == 0 { t += x * x + r }`) | a branch per element (mispredicted), the loop too big for the run-time unroller, one accumulator | 1.78 / 1.05 |
+| dot product via zip | vectorized with the 64-bit multiplication done lane by lane (NEON has none): 13 instructions for two elements | 2.62 / 1.03 |
+| enumerate-map-sum | unrolled, but one accumulator: each copy waits for the one before | 1.32 / 0.92 |
+| map-max + count | the maximum and the count were serial chains of `csel` (2 and 1 cycles an element); cc vectorizes both | 3.74 / 1.07 |
+| take | vector loop of 2 copies of 2 lanes, against cc's 4 of 2 | 1.71 / 1.00 |
+| collect + sort | the heapsort's bounds checks (`2 * root + 1` may wrap: the checks stay, see below) | 1.23 / 1.15 |
+
+(aarch64-macos, the fastest of 9 alternating runs per kernel.)
+
+**A select in the middle end** (`SEL k, x, y`: k ? x : y, k a bool, x
+and y integers). Instruction selection made selects of small diamonds
+before (`form_selects`, `csel`); now the loop passes have one too, and
+isel makes each a machine SELECT (on the comparison when k is one, an
+integer one on x86-64; else on k != 0). It is pure: GVN numbers it
+(which made GVN hash and compare the third operand, VSEL's too), LICM
+hoists it (checking the third operand as well), the ranges take the
+union of x's and y's. Instruction combining: a constant k picks, k ? x
+: x is x, and **k ? t op x : t is t op (k ? x : 0)** for op one of `+ -
+| ^` (t on the left of `-`): the select leaves the chain through t; a
+select of constants (or of such selects) compared with a constant is
+its condition, the negation, or a constant: a comparator's ordering (-1,
+0, 1) compared with 0, once if-converted, is the comparison it came
+from (std's `sort_by` had kept a chain of three `csel`s for it, and its
+sift-down ran a third slower).
+
+**If-conversion** (`ifconv.tach`, in the loop passes after the ranges,
+before the vectorizer; `--no-ifconv`). In an innermost loop, a branch
+on a condition that is not invariant (unswitching takes those) whose
+ways meet again within the loop, a triangle or a diamond whose arms
+hold at most 4 instructions together, pure, no division, no float
+operation, and whose meeting block's phis that take two values are at
+most 3 integers: the arms' instructions move up before the branch, each
+such phi becomes a select. The combining rule above is applied at once,
+so `if x > r { c += 1 }` is `c + (x > r ? 1 : 0)`, a sum.
+
+**Masks and minimum/maximum reductions in the vectorizer.** A
+comparison with a vector operand used only as the condition of selects
+is a mask (`vcmp`; signed when ordered, as the vector comparisons are),
+a select on it a `vsel`. A header phi r whose next value is `k ? z : r`
+or `k ? r : z`, k an ordered signed comparison of r and z, is a minimum
+or a maximum: every lane starts at the start value (the operation is
+idempotent), the copies' accumulators are combined lane by lane with
+the same comparison and select, then the lanes (`vext`) with scalar
+ones. A select picks one of two integers: with ties both are equal, so
+the order of the combination does not matter.
+
+**Several accumulators in the run-time unroller**
+(`split_reduction`). A header phi whose value is only combined, through
+phis and selects, with values that do not depend on it, by one
+associative and commutative operation (`+` and `-`, `*`, `^`, `&`, `|`
+of integers: they wrap, so their order does not change the result), or
+a minimum or maximum as above (of any integers, unsigned too), and
+whose only value used after the loop is its next value, gets one
+accumulator per copy: copy k's is a new phi of the first copy's header,
+starting at the identity (a minimum's at the start), and the
+accumulators are combined after the unrolled loop, in order. A loop
+with such a reduction is unrolled up to 32 instructions (12 before,
+when it has no checks). Floats stay on one accumulator (reassociating
+their sums changes the rounding).
+
+**The vectorizer's cost model.** A 64-bit multiplication done lane by
+lane costs 4 per lane plus 1 (two lanes out, the product, one in), and
+a loop with one is weighed against the scalar loop the run-time
+unroller would make of it: its work only, without checks or the loop's
+own instructions. `v.iter().map(|x| x * 3).sum()` and the dot product
+run 2.5 times faster scalar, unrolled by 4 with 4 accumulators, than as
+the 0.10 vector loop. Tiny bodies (at most 16 instructions) over lanes
+of 4 bytes or more run 4 copies per vector iteration (2 before). On
+x86-64, a 64-bit vector comparison costs as one done lane by lane.
+
+**Pairs of loads and stores** (AArch64). Instruction selection's
+scheduler puts loads (stores) of one base at offsets one access apart
+side by side, the lower offset first: a load moves up past no store or
+call, a store down past no memory access or call (`pair_accesses`).
+Emission makes the two lines one `ldp` (`stp`) of x, d or q registers
+(`pair_with_last`), unless the first load's result is the base or both
+are one register; the encoder learned the q form.
+
+Tests: `opt_ifconv` (selects, masks, every comparison order of minimum
+and maximum, a division left as a branch, two selects, std's `sort_by`,
+every length from 0 to 20), `opt_unroll_reduction` (each kind of split reduction,
+wrapping i32 arithmetic, an unsigned maximum combined by selects),
+`opt_ldp`; the iterator tests expect the unrolled scalar loop for
+`x * 3`.
+
+Not done: the sort kernel's bounds checks. In a sift-down, `child = 2 *
+root + 1` may wrap for all the ranges know (root below a length, a
+length below 2^63), so `child < end` does not prove `child <u len`; C
+has no checks, and its signed overflow is undefined. The remaining
+filter-map-sum gap is cc's knowledge of the length (the kernels are
+`static`: clang propagates the constant 1048576 into them).
