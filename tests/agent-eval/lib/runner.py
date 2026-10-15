@@ -307,6 +307,10 @@ def dry_run(ctx, prompt, ws, rdir, check_hook, query_hook, extra_hooks=None):
                             "stderr": p.stderr[:600]})
         return got
 
+    # (0.17) a session id of its own: the hooks keep state per session
+    # ($TMPDIR/tachyon-agent-hooks), and a fixed id made a second dry run at
+    # the same paths see the first one's errors "as before"
+    sid = "dry-run-%d-%d" % (os.getpid(), int(time.time() * 1000))
     probe = None
     for cand in ("compiler/src/main.tach", "main.tach"):
         if os.path.isfile(os.path.join(ws, cand)):
@@ -318,16 +322,16 @@ def dry_run(ctx, prompt, ws, rdir, check_hook, query_hook, extra_hooks=None):
         with open(probe, "a") as fh:
             fh.write("\nfn eval_dry_run_probe() -> i64 { return undefined_name_xyz; }\n")
         try:
-            out["post_write"] = fire({"tool_name": "Write", "session_id": "dry-run",
+            out["post_write"] = fire({"tool_name": "Write", "session_id": sid,
                                       "tool_input": {"file_path": probe, "content": "..."},
                                       "tool_response": {}}, "PostToolUse")
             # (0.17) the Stop hook with the error still there: it blocks
             if hooks.get("Stop"):
-                out["stop"] = fire({"session_id": "dry-run", "stop_hook_active": False}, "Stop")
+                out["stop"] = fire({"session_id": sid, "stop_hook_active": False}, "Stop")
         finally:
             with open(probe, "w") as fh:
                 fh.write(saved)
-        out["pre_grep"] = fire({"tool_name": "Bash", "session_id": "dry-run",
+        out["pre_grep"] = fire({"tool_name": "Bash", "session_id": sid,
                                 "tool_input": {"command": "grep -n main "
                                                + os.path.relpath(probe, ws)}},
                                "PreToolUse")

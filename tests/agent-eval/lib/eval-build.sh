@@ -43,5 +43,8 @@ if [ $QUICK -eq 0 ]; then
     cmp -s "$OUT/build2.o" "$OUT/build3.o" \
         || { echo "eval-build: no fixpoint: build2.o and build3.o differ (the compiler's output depends on how it was built)" >&2; exit 1; }
 fi
+# a new file, not cp over the old one: macOS SIGKILLs a signed binary overwritten in
+# place (0.17 validation round: one agent's target/tachyonc died with 137 on every call)
+rm -f "$ROOT/target/tachyonc"
 cp "$OUT/build2" "$ROOT/target/tachyonc"
 echo "compiler: target/tachyonc ($("$ROOT/target/tachyonc" --version 2>&1 | head -1))" >&2

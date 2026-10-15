@@ -89,6 +89,12 @@ try:
     case("edit refused: nothing", bash("tachyonc edit patch f --old a --new q", ""), None)
     case("dry run: nothing", bash("tachyonc edit patch f --old a --new b --dry-run", "--- a/main.tach\n"), None)
     case("a query: nothing", bash("tachyonc query show f", "fn f() {}\n"), None)
+    case("stdin from a .tach file is not the root", bash("tachyonc edit replace f < /tmp/x/new.tach",
+                                                         "replaced crate::f\tmain.tach\t+1 -1 lines\n"), (None, None, "tachyonc"))
+    case("stdin without a space is not the root", bash("tachyonc edit insert --after f <new.tach",
+                                                        "inserted crate::g\tmain.tach\t+3 -0 lines\n"), (None, None, "tachyonc"))
+    case("a root before a redirect still counts", bash("tachyonc fix --only imports t/main.tach > log.txt",
+                                                       "fixed imports\tt/main.tach\t+1 -0 lines\n")[1], "t/main.tach")
     case("last .tach operand is the root", bash("tachyonc fix --only imports t/main.tach", "fixed imports\tt/main.tach\t+1 -0 lines\n")[1],
          "t/main.tach")
 

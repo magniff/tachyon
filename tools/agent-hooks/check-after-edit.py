@@ -325,6 +325,24 @@ def shell_writes(command, cwd):
     return out
 
 
+REDIR = re.compile(r"^\d*(?:<<?<?|>>?|&>>?)$")
+
+
+def operands(words):
+    """words without redirections: `edit replace f < new.tach` reads
+    new.tach as its stdin, it is not the root (0.17 validation round: the
+    snippet was checked alone and its names reported as errors)."""
+    out, skip = [], False
+    for w in words:
+        if skip:
+            skip = False
+        elif REDIR.match(w):
+            skip = True
+        elif not re.match(r"^\d*(?:<|>|&>)", w):
+            out.append(w)
+    return out
+
+
 def trigger(event):
     """(file edited or None, root or None, compiler the agent ran or None,
     the directory the change was made from) when the event changed tachyon
@@ -354,8 +372,9 @@ def trigger(event):
                     root = words[i + 1]
                 elif w.startswith("--root="):
                     root = w[7:]
-            if root is None and words and words[-1].endswith(".tach") and "new-file" not in words:
-                root = words[-1]
+            ops = operands(words)
+            if root is None and ops and ops[-1].endswith(".tach") and "new-file" not in ops:
+                root = ops[-1]
             return (None, root, path or None, here)
         for path, here in shell_writes(command, cwd):
             if os.path.exists(path):
