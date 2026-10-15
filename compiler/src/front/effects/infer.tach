@@ -108,6 +108,9 @@ static mut SCOPED_SYM: i64 = 0;
 static mut SCOPE_SYM: i64 = 0;
 static mut ARENA_SCOPE_SYM: i64 = 0;
 static mut LEN_SYM: i64 = 0;
+// std's arena_unlend: a scope's end, whose frees to Gpa (the blocks of
+// their own) are the arena's business, as its refills are.
+static mut ARENA_UNLEND_SYM: i64 = 0;
 
 // The walk: the node walked, what it found so far, the counted `for` loops
 // around (in_bounds: (loop variable, kind, what) triples).
@@ -159,6 +162,16 @@ pub fn is_allocator_method(f: i64) -> bool {
         }
         let i = impl_of_fn(template_of(f));
         i >= 0 && IMPLS[i].tr == ALLOCATOR_TRAIT
+    }
+}
+
+// Whether f is a part of std's arenas whose own allocation is the arena's
+// business (a scope's end giving the blocks of their own back to Gpa): a
+// call of it is masked as an Allocator method's is, and adds no allocator.
+fn is_arena_internal(f: i64) -> bool {
+    unsafe {
+        FNS[f].module == STD_MODULE && STD_MODULE >= 0 && FNS[f].self_ty == 0
+            && NODES[FNS[f].node].a == ARENA_UNLEND_SYM
     }
 }
 
@@ -284,6 +297,7 @@ fn init_walk() {
         SCOPED_SYM = intern_c(c"ScopedArena");
         SCOPE_SYM = intern_c(c"scope");
         ARENA_SCOPE_SYM = intern_c(c"arena_scope");
+        ARENA_UNLEND_SYM = intern_c(c"arena_unlend");
         LEN_SYM = intern_c(c"len");
         SEARCH = false;
     }
@@ -619,7 +633,7 @@ fn walk_call(n: i64) {
                 local(n, EFF_UNSAFE, 0);
             }
             let kind = (info & 7) - 1;
-            if kind == E_ALLOC {
+            if kind == E_ALLOC && FNS[f].self_ty != 0 {
                 local(n, 0, allocator_bit(FNS[f].self_ty));
             }
             call_edge(n, f, kind, if kind == E_SCOPE { allocator_bit(scope_parent(f)) } else { 0 });
@@ -693,7 +707,7 @@ fn callee_info(f: i64) -> i64 {
         if known != 0 {
             return known;
         }
-        let kind = if is_allocator_method(f) { E_ALLOC }
+        let kind = if is_allocator_method(f) || is_arena_internal(f) { E_ALLOC }
             else if scope_parent(f) != 0 { E_SCOPE } else { E_CALL };
         let mut info = kind + 1;
         if FNS[f].is_extern || (FNS[f].attrs & FN_UNSAFE) != 0 {
