@@ -128,7 +128,9 @@ run_one() {
             cd "$dir" || exit 1
             sh "$meta/cmd.$n" >"$meta/out" 2>"$meta/err" </dev/null
             rc=$?
-            cat "$meta/out" "$meta/err" | sed -e "s|$COMPILER|tachyonc|g" -e "s|$dir|WORK|g" -e "s|$WORK|WORK|g"
+            # (the compiler as the shell found it: some systems give
+            # it its path in PATH, the link to COMPILER)
+            cat "$meta/out" "$meta/err" | sed -e "s|$WORK/bin/tachyonc|tachyonc|g" -e "s|$COMPILER|tachyonc|g" -e "s|$dir|WORK|g" -e "s|$WORK|WORK|g"
             [ $rc -eq 0 ] || echo "[exit $rc]"
         ) >>"$meta/got"
     done <"$meta/blocks"
