@@ -21,7 +21,7 @@ import re
 import shlex
 
 SUBCOMMANDS = {"query", "edit", "refactor", "rewrite", "check", "fix", "undo", "fmt",
-               "explain", "guide", "lint", "same-output"}
+               "explain", "guide", "lint", "same-output", "test", "try", "batch"}
 # Commands that run another command named by their arguments.
 WRAPPERS = {"time", "env", "nice", "command", "exec", "timeout", "gtimeout", "then", "do",
             "else", "if", "while", "until", "!"}
@@ -114,6 +114,67 @@ def program(words, assigns):
             return value, rest, _looks_tachyonc(value, rest), value
         return head, rest, bool(rest) and rest[0] in SUBCOMMANDS, ""
     return head, rest, _looks_tachyonc(head, rest), head
+
+
+def expand(word, assigns):
+    """word with `$VAR`, `${VAR}` assigned earlier on the line (and a
+    leading `~`) replaced; None when it names a variable not assigned
+    there (its value is not known)."""
+    if word.startswith("~"):
+        word = os.path.expanduser(word)
+    unknown = []
+
+    def sub(m):
+        name = m.group(1) or m.group(2)
+        if name in assigns and "$" not in assigns[name]:
+            return assigns[name]
+        unknown.append(name)
+        return m.group(0)
+    out = re.sub(r"\$(?:\{(\w+)\}|(\w+))", sub, word)
+    return None if unknown else out
+
+
+def located(command, cwd):
+    """[(segment, words, the directory it runs in, assigns)] of each simple
+    command of command: a `cd DIR` (DIR relative to the directory before it,
+    `$VAR` assigned earlier on the line expanded) moves the commands after
+    it, so `cd WORKTREE && tachyonc edit ...` runs in WORKTREE (0.17). A cd
+    whose directory is not known (`cd $X` set in an earlier call, `cd -`)
+    leaves the directory as it was."""
+    assigns, out, here = {}, [], os.path.abspath(cwd or os.getcwd())
+    for seg in segments(command):
+        words = words_of(seg)
+        if words and words[0] in ("export", "local", "declare", "readonly"):
+            words = words[1:]
+        if words and all(ASSIGN.match(x) for x in words):
+            for x in words:
+                name, value = ASSIGN.match(x).groups()
+                assigns[name] = value
+            out.append((seg, words, here, dict(assigns)))
+            continue
+        out.append((seg, words, here, dict(assigns)))
+        if words and words[0] in ("cd", "pushd") and len(words) <= 2:
+            target = expand(words[1], assigns) if len(words) == 2 else os.path.expanduser("~")
+            if target and target != "-":
+                here = os.path.normpath(os.path.join(here, target))
+    return out
+
+
+def calls_at(command, cwd):
+    """calls(command), each with the directory it runs in: [(subcommand,
+    words, path, segment, directory)]."""
+    found = []
+    for seg, words, here, assigns in located(command, cwd):
+        if words and all(ASSIGN.match(x) for x in words):
+            continue
+        _, rest, is_tc, path = program(words, assigns)
+        if not is_tc:
+            continue
+        sub = next((a for a in rest if not a.startswith("-")), "")
+        if sub not in SUBCOMMANDS:
+            sub = "build" if any(a.endswith(".tach") for a in rest) else "other"
+        found.append((sub, rest, path, seg, here))
+    return found
 
 
 def calls(command):
