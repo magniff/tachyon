@@ -1,0 +1,415 @@
+// A shop's till: products and stock, carts, prices and discounts,
+// receipts, and the commands a clerk types. It began as a few functions
+// and grew into one file.
+
+use std::{Buf, parse_int, split_whitespace};
+
+// ---- Products and stock ----
+
+pub struct Product {
+    pub sku: i64,
+    pub name: [u8],
+    // the price of one, in cents
+    pub price: i64,
+    pub stock: i64,
+}
+
+pub struct Store {
+    pub products: Vec<Product>,
+    // sales so far, in cents
+    pub takings: i64,
+}
+
+pub fn new_store() -> Store {
+    Store { products: Vec::new(), takings: 0 }
+}
+
+pub fn add_product(st: *Store, sku: i64, name: [u8], price: i64, stock: i64) {
+    st.products.push(Product { sku: sku, name: name, price: price, stock: stock });
+}
+
+// The index of product `sku`, or None.
+pub fn find_sku(st: *Store, sku: i64) -> Option<i64> {
+    for i in 0..st.products.len() {
+        if st.products.get(i).sku == sku {
+            return Some(i);
+        }
+    }
+    None
+}
+
+pub fn product(st: *Store, sku: i64) -> Option<Product> {
+    match find_sku(st, sku) {
+        Some(i) => Some(st.products.get(i)),
+        None => None,
+    }
+}
+
+pub fn in_stock(st: *Store, sku: i64) -> i64 {
+    match product(st, sku) {
+        Some(p) => p.stock,
+        None => 0,
+    }
+}
+
+// n more of `sku` on the shelf; false for an unknown sku.
+pub fn restock(st: *Store, sku: i64, n: i64) -> bool {
+    match find_sku(st, sku) {
+        Some(i) => {
+            let mut p = st.products.get(i);
+            p.stock += n;
+            st.products.set(i, p);
+            true
+        }
+        None => false,
+    }
+}
+
+// n of `sku` off the shelf, as many as there are.
+fn take_stock(st: *Store, sku: i64, n: i64) -> i64 {
+    match find_sku(st, sku) {
+        Some(i) => {
+            let mut p = st.products.get(i);
+            let k = if p.stock < n { p.stock } else { n };
+            p.stock -= k;
+            st.products.set(i, p);
+            k
+        }
+        None => 0,
+    }
+}
+
+pub fn free_store(st: *Store) {
+    st.products.free();
+}
+
+// ---- Carts ----
+
+pub struct Line {
+    pub sku: i64,
+    pub qty: i64,
+}
+
+pub struct Cart {
+    pub lines: Vec<Line>,
+    pub coupon: Option<Coupon>,
+}
+
+pub fn new_cart() -> Cart {
+    Cart { lines: Vec::new(), coupon: None }
+}
+
+fn line_index(cart: *Cart, sku: i64) -> Option<i64> {
+    for i in 0..cart.lines.len() {
+        if cart.lines.get(i).sku == sku {
+            return Some(i);
+        }
+    }
+    None
+}
+
+// n of `sku` into the cart, when the shop has them: how many went in.
+pub fn add_to_cart(st: *Store, cart: *Cart, sku: i64, n: i64) -> i64 {
+    let have = in_stock(st, sku);
+    let already = qty_of(cart, sku);
+    let room = have - already;
+    let k = if room < n { room } else { n };
+    if k <= 0 {
+        return 0;
+    }
+    match line_index(cart, sku) {
+        Some(i) => {
+            let mut l = cart.lines.get(i);
+            l.qty += k;
+            cart.lines.set(i, l);
+        }
+        None => cart.lines.push(Line { sku: sku, qty: k }),
+    }
+    k
+}
+
+pub fn remove_from_cart(cart: *Cart, sku: i64) -> bool {
+    match line_index(cart, sku) {
+        Some(i) => {
+            cart.lines.remove(i);
+            true
+        }
+        None => false,
+    }
+}
+
+pub fn qty_of(cart: *Cart, sku: i64) -> i64 {
+    match line_index(cart, sku) {
+        Some(i) => cart.lines.get(i).qty,
+        None => 0,
+    }
+}
+
+pub fn items_in(cart: *Cart) -> i64 {
+    let mut n = 0;
+    for l in cart.lines.iter() {
+        n += l.qty;
+    }
+    n
+}
+
+pub fn clear_cart(cart: *Cart) {
+    cart.lines.clear();
+    cart.coupon = None;
+}
+
+pub fn free_cart(cart: *Cart) {
+    cart.lines.free();
+}
+
+// ---- Prices and discounts ----
+
+// The tax rate, in tenths of a percent.
+const TAX_PERMILLE: i64 = 80;
+
+pub enum Coupon {
+    // a percentage off the whole cart
+    Percent(i64),
+    // a fixed amount off, in cents, on carts of at least the second
+    Off(i64, i64),
+    // buy n of a sku, the next one is free
+    Free(i64, i64),
+}
+
+pub struct Total {
+    pub subtotal: i64,
+    pub discount: i64,
+    pub tax: i64,
+    pub total: i64,
+}
+
+pub fn parse_coupon(code: [u8]) -> Option<Coupon> {
+    if code == "TEN" {
+        return Some(Coupon::Percent(10));
+    }
+    if code == "FIVER" {
+        return Some(Coupon::Off(500, 2000));
+    }
+    if code == "TEA3" {
+        return Some(Coupon::Free(3, 1));
+    }
+    None
+}
+
+pub fn subtotal(st: *Store, cart: *Cart) -> i64 {
+    let mut sum = 0;
+    for l in cart.lines.iter() {
+        if let Some(p) = product(st, l.sku) {
+            sum += p.price * l.qty;
+        }
+    }
+    sum
+}
+
+fn discount(st: *Store, cart: *Cart, sub: i64) -> i64 {
+    match cart.coupon {
+        Some(Coupon::Percent(pct)) => round_div(sub * pct, 100),
+        Some(Coupon::Off(off, min)) => if sub >= min { off } else { 0 },
+        Some(Coupon::Free(n, sku)) => {
+            let q = qty_of(cart, sku);
+            let free = q / (n + 1);
+            match product(st, sku) {
+                Some(p) => free * p.price,
+                None => 0,
+            }
+        }
+        None => 0,
+    }
+}
+
+// a / b, rounded half up (a, b >= 0).
+fn round_div(a: i64, b: i64) -> i64 {
+    (a + b / 2) / b
+}
+
+fn tax_on(amount: i64) -> i64 {
+    round_div(amount * TAX_PERMILLE, 1000)
+}
+
+pub fn total(st: *Store, cart: *Cart) -> Total {
+    let sub = subtotal(st, cart);
+    let off = discount(st, cart, sub);
+    let taxed = sub - off;
+    let tax = tax_on(taxed);
+    Total { subtotal: sub, discount: off, tax: tax, total: taxed + tax }
+}
+
+// ---- Receipts ----
+
+// cents as dollars: 1234 is "12.34"
+pub fn money(b: *Buf, cents: i64) {
+    let mut c = cents;
+    if c < 0 {
+        b.push('-');
+        c = -c;
+    }
+    b.push_fmt(f"{c / 100}.{c % 100:02}");
+}
+
+fn pad_to(b: *Buf, width: i64) {
+    while b.len() < width {
+        b.push(' ');
+    }
+}
+
+// one receipt line: text on the left, an amount on the right
+fn receipt_line(left: [u8], cents: i64) {
+    let mut b = Buf::new();
+    defer b.free();
+    b.push_str(left);
+    pad_to(&b, 30);
+    let mut m = Buf::new();
+    defer m.free();
+    money(&m, cents);
+    let mut k = m.len();
+    while k < 9 {
+        b.push(' ');
+        k += 1;
+    }
+    b.push_str(m.as_slice());
+    println(b.as_slice());
+}
+
+pub fn print_receipt(st: *Store, cart: *Cart) {
+    println("------------- receipt -------------");
+    for l in cart.lines.iter() {
+        if let Some(p) = product(st, l.sku) {
+            let mut left = Buf::new();
+            defer left.free();
+            left.push_fmt(f"{l.qty} x {p.name}");
+            receipt_line(left.as_slice(), p.price * l.qty);
+        }
+    }
+    let t = total(st, cart);
+    receipt_line("subtotal", t.subtotal);
+    if t.discount > 0 {
+        receipt_line("discount", -t.discount);
+    }
+    receipt_line("tax", t.tax);
+    receipt_line("TOTAL", t.total);
+    println("-----------------------------------");
+}
+
+pub fn print_stock(st: *Store) {
+    println("sku  product          stock    price");
+    for p in st.products.iter() {
+        let mut m = Buf::new();
+        defer m.free();
+        money(&m, p.price);
+        println(f"{p.sku:<4} {p.name:<16} {p.stock:>5} {m.as_slice():>8}");
+    }
+}
+
+// ---- Commands ----
+
+pub enum Command {
+    Add(i64, i64),
+    Remove(i64),
+    Use([u8]),
+    Restock(i64, i64),
+    Checkout,
+    Stock,
+    Bad([u8]),
+}
+
+fn number(word: [u8]) -> Option<i64> {
+    match parse_int(word) {
+        Ok(n) => Some(n),
+        Err(_) => None,
+    }
+}
+
+pub fn parse_command(text: [u8]) -> Command {
+    let mut words = split_whitespace(text);
+    defer words.free();
+    let w = words.as_slice();
+    if w.len == 0 {
+        return Command::Bad("empty line");
+    }
+    let verb = w[0];
+    if verb == "add" && w.len == 3 {
+        if let Some(sku) = number(w[1]) {
+            if let Some(n) = number(w[2]) {
+                return Command::Add(sku, n);
+            }
+        }
+        return Command::Bad("add SKU COUNT");
+    }
+    if verb == "remove" && w.len == 2 {
+        if let Some(sku) = number(w[1]) {
+            return Command::Remove(sku);
+        }
+        return Command::Bad("remove SKU");
+    }
+    if verb == "coupon" && w.len == 2 {
+        return Command::Use(w[1]);
+    }
+    if verb == "restock" && w.len == 3 {
+        if let Some(sku) = number(w[1]) {
+            if let Some(n) = number(w[2]) {
+                return Command::Restock(sku, n);
+            }
+        }
+        return Command::Bad("restock SKU COUNT");
+    }
+    if verb == "checkout" {
+        return Command::Checkout;
+    }
+    if verb == "stock" {
+        return Command::Stock;
+    }
+    Command::Bad("unknown command")
+}
+
+// Runs one command; what the clerk sees.
+pub fn run(st: *Store, cart: *Cart, text: [u8]) {
+    println(f"> {text}");
+    match parse_command(text) {
+        Command::Add(sku, n) => {
+            let k = add_to_cart(st, cart, sku, n);
+            if k < n {
+                println(f"  only {k} added: not enough in stock");
+            } else {
+                println(f"  items in the cart: {items_in(cart)}");
+            }
+        }
+        Command::Remove(sku) => {
+            if !remove_from_cart(cart, sku) {
+                println("  not in the cart");
+            }
+        }
+        Command::Use(code) => match parse_coupon(code) {
+            Some(c) => {
+                cart.coupon = Some(c);
+                println("  coupon accepted");
+            }
+            None => println("  no such coupon"),
+        },
+        Command::Restock(sku, n) => {
+            if !restock(st, sku, n) {
+                println("  unknown sku");
+            }
+        }
+        Command::Checkout => checkout(st, cart),
+        Command::Stock => print_stock(st),
+        Command::Bad(why) => println(f"  ? {why}"),
+    }
+}
+
+fn checkout(st: *Store, cart: *Cart) {
+    if items_in(cart) == 0 {
+        println("  the cart is empty");
+        return;
+    }
+    print_receipt(st, cart);
+    for l in cart.lines.iter() {
+        take_stock(st, l.sku, l.qty);
+    }
+    st.takings += total(st, cart).total;
+    clear_cart(cart);
+}
