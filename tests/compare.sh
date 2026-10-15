@@ -25,10 +25,6 @@
 # compared), its IR is emitted at -O1 and -O2, and its tokens are dumped.
 # Differing outputs are kept in target/compare/diff.
 
-# (0.16) std's ambient allocator (`Vec::new()`) for the 0.15 corpus, until
-# `tachyonc fix --only alloc016` migrates it: compiler/src/front/ambient.tach.
-TACHYON_AMBIENT_GPA=${TACHYON_AMBIENT_GPA:-1}
-export TACHYON_AMBIENT_GPA
 set -u
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)

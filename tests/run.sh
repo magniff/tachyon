@@ -84,10 +84,6 @@
 # Stdout is compared after removing trailing whitespace. Each program may
 # run for 20 seconds.
 
-# (0.16) std's ambient allocator (`Vec::new()`) for the 0.15 corpus, until
-# `tachyonc fix --only alloc016` migrates it: compiler/src/front/ambient.tach.
-TACHYON_AMBIENT_GPA=${TACHYON_AMBIENT_GPA:-1}
-export TACHYON_AMBIENT_GPA
 set -u
 LC_ALL=C
 export LC_ALL
