@@ -38,7 +38,8 @@ these first:
 Everything else (`query grep|items|type|effects|impact`, `edit apply`,
 `rewrite`, `refactor extract-function|inline|split`, `batch`, `undo`):
 `target/tachyonc --help`, `target/tachyonc CMD --help`, `target/tachyonc
-guide tools`, or `explain CODE` on any error. Every command in one
+guide tools`, or `explain CODE` on any error; adding a std function, a
+pass, a diagnostic: `target/tachyonc guide how`. Every command in one
 table: [docs/query.md](docs/query.md#every-command-at-a-glance-for-agents);
 the edits in [docs/refactor.md](docs/refactor.md). NAME is `foo`,
 `module::foo`, `Type::method`, `Struct.field` or `FILE:LINE`; a problem
@@ -50,17 +51,19 @@ after the fixpoint and the suite pass, so it always works (your own
 builds replace `target/tachyonc`, and a broken one breaks `query`).
 
 **Hooks.** `tools/agent-hooks/query-first.py` blocks shell commands that
-read or rewrite `.tach` source (grep, sed, cat, `sed -i`, Python writing
+read or rewrite `.tach` source (grep, sed, `sed -i`, Python writing
 compiler/src) and suggests the query or `edit patch`; a `.tach` under
-`tests/` is read freely. When the tool is not enough, rerun with a
-trailing reason, which is recorded: `# no-query: need the comment above
-run_gvn, show omits it` (or `# no-tool: ...` for an edit).
-`tools/agent-hooks/check-after-edit.py` runs `tachyonc check` after
+`tests/`, or a whole file under 300 lines, is read freely. When the tool
+is not enough, rerun with a trailing reason, which is recorded: `#
+no-query: need the comment above run_gvn, show omits it` (or `# no-tool:
+...` for an edit). `check-after-edit.py` runs `tachyonc check` after
 every Write/Edit of a `.tach` file and every writing `tachyonc` command:
-its errors (at most 10) are added to that call's result; nothing added
-means it checks clean, so do not run `check` after an edit. When a tool
-falls short, record it in one line: `tools/agent-feedback "query refs"
-"misses uses inside never-instantiated generic fns"`.
+what changed since the last check (new errors, how many fixed) is added
+to that call's result; nothing added means no change, so do not run
+`check` after an edit. `turn-end.py` checks once more when you stop and
+blocks the stop once if errors are left. When a tool falls short, record
+it in one line: `tools/agent-feedback "query refs" "misses uses inside
+never-instantiated generic fns"`.
 
 ## The inner loop
 

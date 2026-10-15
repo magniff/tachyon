@@ -25,7 +25,10 @@ use crate::base::{
     buf_new, buf_slice, buf_str, cstr, find_sym, grow, intern, intern_c, read_file, streq, strlen,
     sym_text,
 };
-use crate::base::diag::{err_begin, err_end_soft, err_fmt, err_help, error_at_soft, fail_name};
+use crate::base::diag::{
+    err_begin, err_end_soft, err_fmt, err_help, err_help_fmt, err_try_tool, error_at_soft,
+    fail_name,
+};
 use crate::front::ast::NODES;
 use crate::front::cpp::directives::{file_exists, path_dir};
 use crate::front::lexer::{TOKS, TOK_COUNT, Tok, lex_range};
@@ -489,10 +492,7 @@ fn load_module(f: i64, i: i64) {
         if path == 0 as *u8 {
             err_begin(TOKS[i + 1].start);
             err_fmt(f"cannot find the file of module '{sym_text(name)}'");
-            err_help(c"looked for ");
-            err_help(module_candidate(f, name, nested: false));
-            err_help(c" and ");
-            err_help(module_candidate(f, name, nested: true));
+            missing_module_help(f, name);
             err_end_soft();
             // (what it would have declared is unknown: no errors for it)
             fail_name(name);
@@ -504,6 +504,42 @@ fn load_module(f: i64, i: i64) {
         let start = add_source(path, text);
         FILES[FILE_COUNT - 1].module = m;
         lex_range(start, FILES[FILE_COUNT - 1].end, last: false);
+    }
+}
+
+// (0.17) The help of `mod name;` in file f without its file: when f is
+// not the root and the file is next to f, it is the root's module (the
+// `mod` line goes there, f imports it through `crate::`); else where the
+// compiler looked, and the command that makes the file.
+fn missing_module_help(f: i64, name: i64) {
+    unsafe {
+        let flat = module_candidate(f, name, nested: false);
+        let shown = if flat[0] == '.' && flat[1] == '/' { &flat[2] } else { flat };
+        if FILES[f].module > 0 && !streq(path_base(FILES[f].path), c"mod.tach") {
+            let side = buf_new();
+            buf_fmt(side, f"{cstr(path_dir(FILES[f].path))}/{sym_text(name)}.tach");
+            buf_byte(side, 0);
+            let sp = BUFS[side].data;
+            if file_exists(sp) {
+                let mut r = 0;
+                while r < FILE_COUNT && FILES[r].path[0] == '<' {
+                    r += 1;
+                }
+                let root = if r < FILE_COUNT { FILES[r].path } else { c"main.tach" };
+                err_help_fmt(
+                    f"{cstr(if sp[0] == '.' && sp[1] == '/' { &sp[2] } else { sp })} is a module of the root: its `mod {sym_text(name)};` goes in {cstr(path_base(root))}, and this file imports it as `use crate::{sym_text(name)}::...;`");
+                return;
+            }
+        }
+        err_help(c"looked for ");
+        err_help(shown);
+        err_help(c" and ");
+        let nested = module_candidate(f, name, nested: true);
+        err_help(if nested[0] == '.' && nested[1] == '/' { &nested[2] } else { nested });
+        err_help(c": write the file (`edit new-file` takes its text on stdin)");
+        let args = buf_new();
+        buf_fmt(args, f"edit new-file {cstr(shown)}");
+        err_try_tool(buf_slice(args), true);
     }
 }
 

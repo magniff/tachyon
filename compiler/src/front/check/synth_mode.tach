@@ -4,8 +4,10 @@
 // arrays, the binary and unary operators, and the layout queries
 // (`size_of`, `align_of`) folded to constants.
 
-use crate::base::{buf_uint, intern_c};
-use crate::base::diag::{ERR, err_begin, err_end, err_help, err_help_sym, err_int, err_str, err_sym};
+use crate::base::{SRC, buf_uint, intern_c};
+use crate::base::diag::{
+    ERR, err_begin, err_end, err_help, err_help_sym, err_int, err_str, err_sym, err_try_fmt,
+};
 use crate::front::ast::{
     NODES, NODE_RAW, NodeKind, REPR_UNION, child, list_begin, list_end, list_push, new_node,
 };
@@ -15,14 +17,14 @@ use crate::front::ast::NodeKind::{
     PatLit, Path, Range, Repeat, Return, Str, StructLit, Tuple, TupleField, TyArray, TyFn, TyName,
     TyNever, TyPtr, TySlice, TyTuple, TyUnit, Unary, Unit, VariantLit, VecOp, While,
 };
-use crate::front::check::{lookup_local, type_error, type_error_got};
+use crate::front::check::{is_std_named, lookup_local, type_error, type_error_got};
 use crate::front::check::args::misplaced_named_arg;
 use crate::front::check::assign::{check_assign, is_place};
 use crate::front::check::body::{
     check_block, check_break, check_for, check_loop, check_return, check_while, find_loop, synth_if,
 };
 use crate::front::check::calls::{synth_call, synth_method, synth_path};
-use crate::front::check::check_mode::{check_expr, check_struct_fields};
+use crate::front::check::check_mode::{check_expr, check_struct_fields, int_range_help};
 use crate::front::check::equality::{eq_unsupported, structural_eq};
 use crate::front::check::interp::check_interp;
 use crate::front::check::iterate::range_value;
@@ -169,6 +171,7 @@ fn suffixed_literal(n: i64, negated: bool) -> i64 {
                 err_str(c" does not fit in type '");
                 err_type(ty);
                 err_str(c"'");
+                int_range_help(ty);
                 err_end();
             }
         }
@@ -299,6 +302,20 @@ fn synth_index(n: i64) -> i64 {
             err_str(c"cannot index type '");
             err_type(base_ty);
             err_str(c"'");
+            // (0.17) a Vec or a Buf through its slice, a HashMap by get
+            let index = NODES[n].b;
+            if NODES[base].end > NODES[base].start && index != 0
+                && NODES[index].end > NODES[index].start {
+                let b = SRC[NODES[base].start..NODES[base].end];
+                let i = SRC[NODES[index].start..NODES[index].end];
+                if is_std_named(base_ty, c"Vec") || is_std_named(base_ty, c"Buf") {
+                    err_help(c"its elements are its slice's: `v.as_slice()[i]` (also to assign), or `v.get(i)`, `v.set(i, x)`");
+                    err_try_fmt(f"{b}.as_slice()[{i}]");
+                } else if is_std_named(base_ty, c"HashMap") {
+                    err_help(c"a HashMap is read with `m.get(k)` (an Option) and written with `m.insert(k, v)`");
+                    err_try_fmt(f"{b}.get({i})");
+                }
+            }
             err_end();
         }
         let index = NODES[n].b;
@@ -430,6 +447,13 @@ fn synth_tuple_field(n: i64) -> i64 {
             err_str(c"cannot use tuple index on type '");
             err_type(base_ty);
             err_str(c"'");
+            let base = NODES[n].a;
+            if TYPES[base_ty].kind == TyKind::Ptr && TYPES[TYPES[base_ty].a].kind == TyKind::Tuple
+                && NODES[base].end > NODES[base].start {
+                // (0.17) a pointer to a tuple: its element is reached through it
+                err_help(c"a pointer to a tuple: its elements are `(*p).0`, ...");
+                err_try_fmt(f"(*{SRC[NODES[base].start..NODES[base].end]}).{index}");
+            }
             err_end();
         }
         if index >= TYPES[base_ty].count {

@@ -16,13 +16,23 @@ errors, a PostToolUse `additionalContext`:
     main.tach:5:5: error[type error] undefined variable 'prinln' | help: did you mean 'println'?
 
 at most 10 errors (the edited file's first), then `(N more: tachyonc
-check ROOT)`. A clean program prints nothing.
+check ROOT)`. A clean program prints nothing. (0.17) The `try:` commands
+of the errors that one `tachyonc fix` run applies to all of them (`fix
+--only unsafe`, `alloc016`, `imports`, `pub`) come right after the head,
+once each, with how many errors they answer:
+
+    tachyonc check main.tach: 3 errors
+    try: tachyonc fix --only unsafe main.tach   (3 of the errors)
+
+and the compiler is run under the name the agent can type (`tachyonc` when
+it is the one on PATH, else its path from the event's directory), so the
+`try:` lines it prints run as they are.
 
 - When: a Write, Edit or MultiEdit of a `.tach` file; a Bash call whose
   `tachyonc edit|refactor|fix|rewrite|undo` wrote (its summary line; not
   `--dry-run`), through any copy or variable (tachyonc_cmd.py).
-- The root: under a checkout's compiler/src, compiler/src/main.tach; under
-  compiler/std, compiler/std/std.tach; else the nearest main.tach in the
+- The root: under a checkout's compiler/src or compiler/std,
+  compiler/src/main.tach (0.17: check reads std's edited files); else the nearest main.tach in the
   file's directory or above it (not above the checkout), else the file
   itself when it has `fn main`; for a Bash call, its `--root R` or last
   `.tach` operand, else `check`'s default.
@@ -133,7 +143,11 @@ def root_of(path):
     p = os.path.abspath(path)
     top = checkout_root(os.path.dirname(p))
     if top:
-        for sub, root in (("compiler/src/", "compiler/src/main.tach"), ("compiler/std/", "compiler/std/std.tach")):
+        # (0.17: std's files are checked through the compiler's root, which
+        # `check` then reads std from when they differ from the built-in
+        # std; std.tach as a root defines std twice)
+        for sub, root in (("compiler/src/", "compiler/src/main.tach"), ("compiler/std/", "compiler/src/main.tach"),
+                          ("compiler/std/", "compiler/std/std.tach")):
             if p.startswith(os.path.join(top, sub)) and os.path.exists(os.path.join(top, root)):
                 return os.path.join(top, root)
     d = os.path.dirname(p)
@@ -177,9 +191,12 @@ def run_check(compiler, root, cwd):
     dicts with the keys of --json; None when check could not run."""
     import subprocess  # (here: the hook's no-op path stays cheaper)
 
+    shown = typed_name(compiler, cwd)
+
     def run(args):
         try:
-            return subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=TIMEOUT)
+            return subprocess.run([shown] + args[1:], executable=args[0], cwd=cwd, capture_output=True,
+                                  text=True, timeout=TIMEOUT)
         except (OSError, subprocess.TimeoutExpired):
             return None
     tail = [os.path.relpath(root, cwd) if root and root.startswith(cwd + os.sep) else root] if root else []
@@ -216,8 +233,35 @@ def parse_short(line):
             "try": [p[5:] for p in parts[1:] if p.startswith("try: ")]}
 
 
-def line_of(d):
-    """A diagnostic in check's one-line form."""
+def typed_name(compiler, cwd):
+    """The compiler as the agent would type it: `tachyonc` when that is the
+    one on PATH, else its path from cwd when under it, else its path."""
+    on_path = which("tachyonc")
+    if on_path and os.path.realpath(on_path) == os.path.realpath(compiler):
+        return "tachyonc"
+    full = os.path.abspath(compiler)
+    if full.startswith(cwd + os.sep):
+        return os.path.relpath(full, cwd)
+    return compiler
+
+
+FIX = re.compile(r"^\S*tachyonc\S* fix\b")
+
+
+def fix_commands(errors):
+    """The `tachyonc fix ...` commands of the errors' try: lines, each with
+    how many errors name it, in order of first appearance."""
+    seen = {}
+    for d in errors:
+        for t in d.get("try") or []:
+            if FIX.match(t):
+                seen[t] = seen.get(t, 0) + 1
+    return list(seen.items())
+
+
+def line_of(d, summarized=()):
+    """A diagnostic in check's one-line form (its `try:` lines but those in
+    `summarized`, the fix commands printed once after the head)."""
     pos = f"{d['file']}:{d['line']}:{d['col']}: " if d.get("file") else ""
     text = f"{pos}{d.get('severity', 'error')}[{d.get('code', '')}] {d.get('message', '')}"
     for h in d.get("help") or []:
@@ -225,8 +269,18 @@ def line_of(d):
     for n in d.get("notes") or []:
         text += " | note: " + n
     for t in d.get("try") or []:
-        text += " | try: " + t
+        if t not in summarized:
+            text += " | try: " + t
     return text
+
+
+def fix_lines(errors):
+    """The fix commands of the errors, once each, as `try:` lines after the
+    head (with how many of the errors they answer), and the set of them."""
+    n = len(errors)
+    fixes = fix_commands(errors)
+    return ([f"try: {cmd}   ({'the error' if n == 1 else 'all of them' if k == n else f'{k} of the errors'})"
+             for cmd, k in fixes], {cmd for cmd, _ in fixes})
 
 
 def report(diags, root_shown, edited):
@@ -240,7 +294,9 @@ def report(diags, root_shown, edited):
                                        or os.path.abspath(d.get("file") or "") == edited))
     n = len(errors)
     lines = [f"tachyonc check{' ' + root_shown if root_shown else ''}: {n} error{'s' if n != 1 else ''}"]
-    lines += [line_of(d) for d in errors[:MAX_SHOWN]]
+    fl, fixes = fix_lines(errors)
+    lines += fl
+    lines += [line_of(d, fixes) for d in errors[:MAX_SHOWN]]
     if n > MAX_SHOWN:
         lines.append(f"({n - MAX_SHOWN} more: tachyonc check{' ' + root_shown if root_shown else ''})")
     return "\n".join(lines)
@@ -357,8 +413,12 @@ def delta_report(errors, before, root_shown, edited):
     if same:
         parts.append(f"{same} as before")
     lines = [f"tachyonc check{where}: {n} error{'s' if n != 1 else ''} ({', '.join(parts)})"]
+    # the fix commands once, counted over all the errors (one fix run
+    # answers them all), then the new errors without them
+    fl, _ = fix_lines(errors)
+    lines += fl
     shown = report(new, root_shown, edited).split("\n")[1:] if new else []
-    lines += [x for x in shown if not x.startswith("(")]
+    lines += [x for x in shown if not x.startswith(("(", "try: "))]
     if len(new) > MAX_SHOWN:
         lines.append(f"({len(new) - MAX_SHOWN} more new: tachyonc check{where})")
     return "\n".join(lines)
@@ -440,18 +500,44 @@ def test_report(cur, before, root_shown):
     return "\n".join(out)
 
 
+def run_dir_for(root, cwd):
+    """(0.17) Where check runs: cwd, unless root is in another checkout than
+    cwd (a worktree's file edited from a session in the main checkout, or
+    the other way): then root's checkout, because `tachyonc check` reads
+    std's files (compiler/std) from the directory it runs in, and their
+    paths and try: lines are relative to it."""
+    if not root:
+        return cwd
+    top = checkout_root(os.path.dirname(os.path.abspath(root)))
+    if not top or checkout_root(cwd) == top:
+        return cwd
+    return top
+
+
+def root_shown(root, cwd, run_dir):
+    """root as the report names it: from cwd; from run_dir with `(in DIR)`
+    when check ran elsewhere (the errors' paths are from there too)."""
+    if not root:
+        return ""
+    if run_dir != cwd:
+        where = os.path.relpath(run_dir, cwd) if run_dir.startswith(cwd + os.sep) else run_dir
+        return f"{os.path.relpath(root, run_dir)} (in {where})"
+    return os.path.relpath(root, cwd) if root.startswith(cwd + os.sep) else root
+
+
 def verify(event, st, compiler, root, cwd, edited, at_turn_end=False):
     """Checks root (None: check's default in cwd), compares with this
     session's last check of it, runs its tests when they exist, are fast
     and are due; updates the session state st. (text for the agent, the
     record for the log) or None when check could not run."""
     t0 = time.time()
-    diags = run_check(compiler, root, cwd)
+    run_dir = run_dir_for(root, cwd)
+    diags = run_check(compiler, root, run_dir)
     ms = int((time.time() - t0) * 1000)
     if diags is None:
         return None
     key_root = root or default_root(cwd)
-    shown = (os.path.relpath(root, cwd) if root.startswith(cwd + os.sep) else root) if root else ""
+    shown = root_shown(root, cwd, run_dir)
     errors = [d for d in diags if d.get("severity") == "error"]
     roots = st.setdefault("roots", {})
     key = key_root or ("check@" + cwd)
@@ -473,7 +559,7 @@ def verify(event, st, compiler, root, cwd, edited, at_turn_end=False):
             if (seen[k] >= 2 or any("guide " in h for h in d.get("help") or [])) and \
                     "unfamiliar-construct" not in hinted:
                 hinted.append("unfamiliar-construct")
-                texts.append(hs.hint("unfamiliar-construct", TACHYONC=tachyonc_shown(compiler, cwd)))
+                texts.append(hs.hint("unfamiliar-construct", TACHYONC=tachyonc_shown(compiler, run_dir)))
             new_keys.discard(k)
     rec = {"kind": "check-hook", "tool": event.get("tool_name") or event.get("hook_event_name"),
            "root": shown[-120:], "errors": len(errors),
@@ -490,7 +576,7 @@ def verify(event, st, compiler, root, cwd, edited, at_turn_end=False):
         due = at_turn_end or not last or time.time() - last.get("time", 0) >= DEBOUNCE_S \
             or bool(prev.get("errors"))
         if due:
-            cur = run_tests(compiler, key_root, cwd)
+            cur = run_tests(compiler, key_root, run_dir)
             if cur is not None:
                 rec["test_ms"] = cur.get("ms", 0)
                 if cur.get("slow") or cur.get("ms", 0) > SLOW_MS:

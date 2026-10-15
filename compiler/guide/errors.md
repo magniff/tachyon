@@ -2,8 +2,13 @@
 
 `tachyonc check`, and a build whose output is not a terminal (an
 agent's shell, a pipe; `--diagnostics=short` anywhere): one line per
-error, `FILE:LINE:COL: error[KIND] MESSAGE | help: HELP | note: NOTE`,
-every error of every file at once (up to 50), sorted by position.
+error, `FILE:LINE:COL: error[KIND] MESSAGE | help: HELP | note: NOTE |
+try: TRY`, every error of every file at once (up to 50), sorted by
+position. A `try:` (0.17) is text to use as it is: code to paste where
+the error is (`a as i32`, `std::trim(s)`, the missing match arms), a
+`use` line, or a `tachyonc` command to run (`tachyonc fix --only unsafe
+main.tach`, `tachyonc edit new-file util.tach main.tach`); VALUE in it
+is yours to fill in.
 KIND is `tokenizer error`, `parser error`, `module error`, `type error`
 or `unsafe`. Fix the first errors first: a parser error can hide
 type errors in the same function. `tachyonc query show FILE:LINE` prints
@@ -16,9 +21,31 @@ error (short form, without the position), and the fix.
 let s: String = String::new();
 ```
 ```err
-error[type error] unknown type 'String' | help: text is `[u8]`, a slice of bytes (string literals are one); build it in a `std::Buf`
+error[type error] unknown type 'String' | help: text is `[u8]`, a slice of bytes (string literals are one); text you build is a `std::Buf` (`Buf::new_in(gpa)`, `b.push_str(s)`, `b.as_slice()` is its `[u8]`) | try: [u8]
 ```
-Also `str`, `char` (use `u8`), `Box`, `usize` indices (use `i64`).
+The `try:` is the type to write. Also `str` (`[u8]`), `char` (`u8`),
+`Box`, `Rc` (`*T`), `HashSet` (`HashMap<K, bool>`), `BTreeMap`,
+`VecDeque`, `RefCell`.
+
+```tach
+use std::collections::HashMap;
+```
+```err
+error[type error] no 'collections' in module 'std' | help: tachyon's std is one module, without 'collections': its items are `std::NAME` | try: use std::HashMap;
+```
+std has no submodules: `use std::{HashMap, read_line};`. `use std::io;`
+gets what reads stdin (`read_line`, `read_stdin_in`, `Scanner`).
+
+```tach
+fn main() -> i32 { let s = "  a "; let t = s.trim(); 0 }
+```
+```err
+error[type error] no method 'trim' on type '[u8]' | help: 'trim' is no method: std's function `trim` takes the value as its first argument | try: std::trim(s)
+```
+A method std has as a function (`trim`, `sort`, `parse` as `parse_int`,
+`split_whitespace` as `split_whitespace_in(s, gpa)`) gets the call to
+write; another unknown method, the type's nearest methods and `tachyonc
+query items TYPE`, which lists them all.
 
 ```tach
 fn get(x: &i64) -> i64 { *x }
@@ -215,8 +242,23 @@ enum E { A, B, C }
 fn f(e: E) -> i64 { match e { E::A => 1, E::B => 2 } }
 ```
 ```err
-error[type error] non-exhaustive match: 'E::C' is not covered | help: add an arm for it, or a wildcard arm '_ =>'
+error[type error] non-exhaustive match: 'E::C' is not covered | help: add an arm for it (try:), or a wildcard arm '_ =>' | try: E::C => VALUE,
 ```
+The `try:` lists every missing pattern as an arm to paste (integers as
+ranges: `201..=255 => VALUE,`). An unreachable arm's help gives the line
+of the arm above that already matches all it matches.
+
+```tach
+fn f() -> i64 { 1 }
+fn main() -> i32 { 0 }
+fn f() -> i64 { 2 }
+```
+```err
+duplicate function 'f'
+```
+The help says where the other one is, and the two `try:` lines delete
+either (`tachyonc edit delete main.tach:3 main.tach`); to change an item
+in place, `tachyonc edit replace f < new.tach` instead of adding a second.
 
 ```tach
 enum E { A(i64), B }
@@ -506,7 +548,17 @@ fn main() -> i32 { helper() as i32 }
 ```err
 error[type error] undefined variable 'helper' | help: add `use crate::m::helper;`
 ```
-Add the `use` line the help names, or run `tachyonc fix`.
+Add the `use` line the help names, or run the `try:` line, `tachyonc fix
+--only imports main.tach`, which adds every missing one.
+
+In a module other than the root, a path starts in that module: `use
+table::Table;` in check.tach is `unknown module 'table'` when `mod
+table;` is in main.tach; the help says `crate::table::...` and the
+`try:` is the `use` line so written. `mod util;` with no util.tach is
+`cannot find the file of module 'util'`, whose `try:` makes it:
+`tachyonc edit new-file util.tach main.tach < util.tach` (the text on
+stdin; the `mod` line that is there stays). A `mod` line for a file that
+is next to a submodule's file belongs in the root.
 
 ```tach
 fn main() -> i32 { let text = read_to_string(); 0 }
@@ -548,8 +600,21 @@ fn main() -> i32 { abs(-3) }
 ```err
 error[unsafe] calling a C function is unsafe
 ```
-`unsafe { abs(-3) }`. `tachyonc fix --only unsafe` wraps every such
-place.
+`unsafe { abs(-3) }`. The error's `try:`, `tachyonc fix --only unsafe
+main.tach`, wraps every such place; the check hook prints it once at the
+head of its report, with how many errors it answers.
+
+```tach
+fn helper() -> i64 { let v: Vec<i64> = Vec::new(); v.len() }
+fn main() -> i32 { helper() as i32 }
+```
+```err
+add the parameter `gpa: Gpa` to 'helper' and pass it down
+```
+Allocation is explicit (0.16): the help says where the allocator comes
+from here (this function's `gpa`, main's parameter, or one to add), and
+the `try:`, `tachyonc fix --only alloc016 main.tach`, threads main's
+`gpa` down to every such call.
 
 ```tach
 struct P { x: i64 }

@@ -21,14 +21,14 @@ file, one per line, `FILE:LINE:COL: error[KIND] MESSAGE | help: ...`:
 
 ```console
 $ tachyonc check
-main.tach:8:38: error[type error] 'letter' is private | help: make it public: `pub fn letter` at grades.tach:21:1
+main.tach:8:38: error[type error] 'letter' is private | help: make it public: `pub fn letter` at grades.tach:21:1 | try: tachyonc fix --only pub main.tach
 main.tach:9:14: error[type error] unresolved import 'roster::add_score'
-main.tach:17:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3
-main.tach:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3
-main.tach:19:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3
-main.tach:23:19: error[type error] unknown type 'HashMap' | help: add `use std::HashMap;`
+main.tach:17:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: *Roster, name: [u8])` (roster.tach:17)
+main.tach:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: *Roster, name: [u8])` (roster.tach:17)
+main.tach:19:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: *Roster, name: [u8])` (roster.tach:17)
+main.tach:23:19: error[type error] unknown type 'HashMap' | help: add `use std::HashMap;` | try: tachyonc fix --only imports main.tach
 grades.tach:18:5: error[type error] undefined variable 'totl' | help: did you mean 'total'?
-grades.tach:39:17: error[unsafe] calling a C function is unsafe | help: put it in an `unsafe { ... }` block, or the function's body in an `unsafe fn` (`tachyonc fix --only unsafe` does the former)
+grades.tach:39:17: error[unsafe] calling a C function is unsafe | help: put it in an `unsafe { ... }` block, or the function's body in an `unsafe fn` (the try: line wraps every such place) | try: tachyonc fix --only unsafe main.tach
 roster.tach:26:13: error[type error] cannot assign to immutable variable 'count' | help: make it mutable: `let mut count`
 [exit 1]
 ```
@@ -41,9 +41,9 @@ Most say what to do, in their `help:`. A `KIND` (`type error`,
 $ tachyonc explain unsafe
 unsafe: error (compiler)
 An unsafe operation (a raw pointer's dereference or indexing, a C call, a union field) outside unsafe code.
-fix: Put it in an `unsafe { }` block (`tachyonc fix --only unsafe` does), or the function in `unsafe fn`.
+fix: Put it in an `unsafe { }` block, or the function in `unsafe fn`; the try: line, `tachyonc fix --only unsafe ROOT`, wraps every such place (the check hook prints it once, with how many errors it answers).
 example:
-    main.tach:39:13: error[unsafe] dereference of a raw pointer is unsafe | help: put it in an `unsafe { ... }` block
+    main.tach:39:13: error[unsafe] dereference of a raw pointer is unsafe | help: put it in an `unsafe { ... }` block, or the function's body in an `unsafe fn` (the try: line wraps every such place) | try: tachyonc fix --only unsafe main.tach
 ```
 
 ## 2. The mechanical ones: `fix`
@@ -70,9 +70,9 @@ $ tachyonc fix
 fixed 1 missing import, 1 pub, 1 unsafe block	2 files	+3 -2 lines
 $ tachyonc check
 main.tach:9:14: error[type error] unresolved import 'roster::add_score'
-main.tach:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3
-main.tach:19:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3
-main.tach:20:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3
+main.tach:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: *Roster, name: [u8])` (roster.tach:17)
+main.tach:19:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: *Roster, name: [u8])` (roster.tach:17)
+main.tach:20:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: *Roster, name: [u8])` (roster.tach:17)
 grades.tach:18:5: error[type error] undefined variable 'totl' | help: did you mean 'total'?
 roster.tach:26:13: error[type error] cannot assign to immutable variable 'count' | help: make it mutable: `let mut count`
 [exit 1]
@@ -133,9 +133,9 @@ two-argument `enrol` and no `add_score`.
 ```console
 $ tachyonc check
 main.tach:9:14: error[type error] unresolved import 'roster::add_score'
-main.tach:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3
-main.tach:19:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3
-main.tach:20:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3
+main.tach:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: *Roster, name: [u8])` (roster.tach:17)
+main.tach:19:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: *Roster, name: [u8])` (roster.tach:17)
+main.tach:20:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: *Roster, name: [u8])` (roster.tach:17)
 [exit 1]
 $ tachyonc query show roster::enrol
 // crate::roster::enrol	roster.tach:16-19	effects: alloc(Gpa) panic

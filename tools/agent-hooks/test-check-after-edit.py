@@ -105,8 +105,8 @@ try:
     write(os.path.join(top, "tests", "run", "multi", "a", "b.tach"))
     case("root: compiler source", hook.root_of(os.path.join(top, "compiler", "src", "front", "x.tach")),
          os.path.join(top, "compiler", "src", "main.tach"))
-    case("root: std", hook.root_of(os.path.join(top, "compiler", "std", "iter.tach")),
-         os.path.join(top, "compiler", "std", "std.tach"))
+    case("root: std, through the compiler's root", hook.root_of(os.path.join(top, "compiler", "std", "iter.tach")),
+         os.path.join(top, "compiler", "src", "main.tach"))
     case("root: a one-file program", hook.root_of(os.path.join(top, "tests", "run", "loop.tach")),
          os.path.join(top, "tests", "run", "loop.tach"))
     case("root: a fragment, none", hook.root_of(os.path.join(top, "tests", "run", "frag.tach")), None)
@@ -132,6 +132,23 @@ try:
     case("report: edited file first", lines[1], "util.tach:3:5: error[type error] mine | help: did you mean 'g'?")
     case("report: capped", (len(lines), lines[-1]), (12, "(2 more: tachyonc check main.tach)"))
     case("report: clean is silent", hook.report([diag("a.tach", 1, "w", sev="warning")], "main.tach", None), "")
+    # (0.17) One `fix` command for the errors it answers, after the head.
+    u = [dict(diag("main.tach", i, "calling a C function is unsafe", code="unsafe"),
+              **{"try": ["tachyonc fix --only unsafe main.tach"]}) for i in (2, 5)]
+    a = dict(diag("main.tach", 7, "allocation is explicit: pass an allocator (try: Vec::new_in(gpa))"),
+             **{"try": ["tachyonc fix --only alloc016 main.tach"]})
+    lines = hook.report(u + [a, diag("main.tach", 9, "bad")], "main.tach", None).split("\n")
+    case("report: fix commands after the head", lines[:3],
+         ["tachyonc check main.tach: 4 errors",
+          "try: tachyonc fix --only unsafe main.tach   (2 of the errors)",
+          "try: tachyonc fix --only alloc016 main.tach   (1 of the errors)"])
+    case("report: one fix for all", hook.report(u, "main.tach", None).split("\n")[1],
+         "try: tachyonc fix --only unsafe main.tach   (all of them)")
+    case("report: other try lines stay on their error", hook.fix_commands(
+        [dict(diag("m.tach", 1, "x"), **{"try": ["use std::HashMap;", "target/tools/tachyonc fix --only imports m.tach"]})]),
+         [("target/tools/tachyonc fix --only imports m.tach", 1)])
+    case("typed name: under cwd", hook.typed_name(os.path.join(tmp, "bin", "tachyonc"), tmp),
+         os.path.join("bin", "tachyonc"))
     case("short line parsed", hook.parse_short("m.tach:2:7: error[type error] bad | help: try x"),
          {"severity": "error", "code": "type error", "file": "m.tach", "line": 2, "col": 7, "message": "bad",
           "help": ["try x"], "notes": [], "try": []})
@@ -238,6 +255,41 @@ try:
     run(ev, fake2, state)
     fake_says([b])
     case("hint: once a session", "guide --find" in ctx_of(run(ev, fake2, state)[1]), False)
+
+    # (0.17) A worktree's file edited from a session in the main checkout:
+    # the worktree's root and compiler, check run in the worktree (check
+    # reads compiler/std from the directory it runs in), its paths from
+    # there, said with `(in DIR)`.
+    main = os.path.join(tmp, "main")
+    os.makedirs(os.path.join(main, ".git"))
+    wt = os.path.join(main, ".claude", "worktrees", "w")
+    for t in (main, wt):
+        write(os.path.join(t, "compiler", "src", "main.tach"), "fn main() {}\n")
+        write(os.path.join(t, "compiler", "std", "io.tach"), "pub fn f() {}\n")
+    write(os.path.join(wt, ".git"), "gitdir: " + os.path.join(main, ".git", "worktrees", "w") + "\n")
+    for t, who in ((main, "main"), (wt, "worktree")):
+        c = os.path.join(t, "target", "tools", "tachyonc")
+        write(c, "#!/bin/sh\nprintf '{\"kind\":\"diagnostic\",\"severity\":\"error\",\"code\":\"type error\","
+                 "\"file\":\"compiler/std/io.tach\",\"line\":1,\"col\":5,\"message\":\"%s compiler in %%s\","
+                 "\"help\":[],\"notes\":[],\"try\":[]}\\n' \"$(pwd -P)\" >&2\nexit 1\n" % who)
+        os.chmod(c, 0o755)
+    saved_cc = os.environ.pop("TACHYON_CHECK_COMPILER", None)
+    for t, other, name in ((wt, main, "worktree edited from the main checkout"),
+                           (main, wt, "main checkout edited from a worktree")):
+        xev = {"hook_event_name": "PostToolUse", "tool_name": "Edit", "cwd": other, "session_id": "xtree",
+              "tool_input": {"file_path": os.path.join(t, "compiler", "std", "io.tach")}}
+        env = dict(os.environ, TACHYON_CHECK_HOOK_LOG=log, TACHYON_HOOK_STATE=tempfile.mkdtemp(dir=tmp))
+        r = subprocess.run([sys.executable, "-I", os.path.join(HERE, "check-after-edit.py")],
+                           input=json.dumps(xev), capture_output=True, text=True, env=env)
+        where = os.path.relpath(t, other) if t.startswith(other + os.sep) else t
+        who = "worktree" if t == wt else "main"
+        case(name, ctx_of(r.stdout),
+             f"tachyonc check compiler/src/main.tach (in {where}): 1 error\n"
+             f"compiler/std/io.tach:1:5: error[type error] {who} compiler in {os.path.realpath(t)}")
+    case("same checkout: runs in cwd", hook.run_dir_for(os.path.join(wt, "compiler", "src", "main.tach"),
+                                                        os.path.join(wt, "compiler")), os.path.join(wt, "compiler"))
+    if saved_cc is not None:
+        os.environ["TACHYON_CHECK_COMPILER"] = saved_cc
 
     # Tests: run after a clean check when tests/ has cases, the new
     # failures shown, not again within the debounce.

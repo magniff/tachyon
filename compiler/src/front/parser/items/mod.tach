@@ -5,8 +5,10 @@
 
 pub mod params;
 
-use crate::base::{intern, intern_c};
-use crate::base::diag::{err_begin, err_end, err_help, err_str, error_at};
+use crate::base::{
+    FILES, SRC, SYMS, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, intern, intern_c, sym_text,
+};
+use crate::base::diag::{err_begin, err_end, err_help, err_help_fmt, err_str, err_try_fmt, error_at};
 use crate::front::ambient::AMBIENT_TRY;
 use crate::front::ast::{
     EFFECTS_DECL, EFFECTS_NO_ALLOC, EFFECTS_NO_IO, EFFECTS_NO_PANIC, EFFECTS_PURE, FN_AMBIENT,
@@ -21,6 +23,7 @@ use crate::front::lexer::Tok::{
     Import, Int, LBrace, LBracket, LParen, Lt, Mod, Mut, Plus, Pub, RBrace, RBracket, RParen,
     Reserved, Semi, Star, Static, Str, Struct, Trait, Type, Union, Unsafe, Use,
 };
+use crate::front::modules::file_of_pos;
 use crate::front::parser::{
     BODY_FAILED, P, UNDERSCORE, advance, at, cur, cur_start, eat, expect, expect_binding_name,
     expect_ident, prev_end, reserved_error, syntax_error, tok_kind,
@@ -399,8 +402,7 @@ fn parse_enum() -> i64 {
             let variant = new_node(NodeKind::Variant, cur_start(), 0);
             NODES[variant].a = expect_binding_name();
             if at(LBrace) {
-                error_at(cur_start(),
-                    c"struct-like enum variants are not supported yet; use a tuple variant");
+                struct_variant_error(cur_start(), NODES[variant].a, NODES[n].a);
             }
             if eat(LParen) {
                 NODES[variant].c = 1;
@@ -427,6 +429,62 @@ fn parse_enum() -> i64 {
         expect(RBrace);
         NODES[n].end = prev_end();
         n
+    }
+}
+
+// (0.17) `V { a: A, b: B }` in an enum, at position `at` (its `{`): the
+// error, with the tuple variant to write, `V(A, B)`, as the try: line.
+fn struct_variant_error(at: i64, name: i64, owner: i64) -> ! {
+    unsafe {
+        err_begin(at);
+        err_str(c"struct-like enum variants are not supported yet; use a tuple variant");
+        let t = buf_new();
+        buf_bytes(t, SYMS[name].text);
+        buf_byte(t, '(');
+        let mut i = at + 1;
+        let mut depth = 0;
+        let mut field = 0;
+        let mut colon = -1;
+        let mut start = i;
+        let limit = FILES[file_of_pos(at)].end;
+        while i + 1 < limit {
+            let c = SRC[i];
+            if c == '(' || c == '[' || c == '<' || c == '{' {
+                depth += 1;
+            } else if (c == ')' || c == ']' || c == '>' || c == '}') && depth > 0 {
+                depth -= 1;
+            } else if depth == 0 && c == ':' && colon < 0 && SRC[i + 1] != ':' {
+                colon = i;
+            } else if depth == 0 && (c == ',' || c == '}') {
+                if colon > 0 {
+                    let mut a = colon + 1;
+                    while a < i && (SRC[a] == ' ' || SRC[a] == '\n') {
+                        a += 1;
+                    }
+                    let mut e = i;
+                    while e > a && (SRC[e - 1] == ' ' || SRC[e - 1] == '\n') {
+                        e -= 1;
+                    }
+                    if field > 0 {
+                        buf_str(t, c", ");
+                    }
+                    buf_bytes(t, SRC[a..e]);
+                    field += 1;
+                }
+                colon = -1;
+                start = i + 1;
+                if c == '}' {
+                    break;
+                }
+            }
+            i += 1;
+        }
+        let _ = start;
+        buf_byte(t, ')');
+        err_help_fmt(
+            f"the fields in order, without names: `{buf_slice(t)}`, matched as `{sym_text(owner)}::{sym_text(name)}(..)`");
+        err_try_fmt(buf_slice(t));
+        err_end()
     }
 }
 

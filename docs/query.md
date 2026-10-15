@@ -22,7 +22,7 @@ tachyonc query refs NAME... [--root ROOT] [--exact] [--count] [--in FILE|MODULE]
 tachyonc query callers NAME... [--root ROOT] [--exact] [--count] [--in FILE|MODULE] [--limit N] [--all]
 tachyonc query callees FN... [--transitive] [--writes TABLE] [--count] [--limit N] [--all]   (0.16)
 tachyonc query effects NAME...|MODULE [--has EFFECT] [--why EFFECT]   (0.16) the inferred effects
-tachyonc query items [MODULE...] [--root ROOT] [--comments]
+tachyonc query items [MODULE|TYPE...] [--root ROOT] [--comments]
 tachyonc query show MODULE::section TITLE                   (0.13)
 tachyonc query grep PATTERN... [--in FILE|MODULE|ITEM] [--code] [--comments] [--strings] [--word] [--count] [--limit N] [--all]
 tachyonc query type FILE:LINE[:COL]...                      (0.13)
@@ -77,7 +77,7 @@ tools` the ones a program needs.
 | the type of an expression | `target/tachyonc query type FILE:LINE:COL` |
 | what a function may do (allocate, io, panic, loop forever) | `target/tachyonc query effects NAME\|MODULE` (`--why EFFECT`: the chain; `--has alloc(Gpa)`: which still allocate) |
 | where it is defined, its signature | `target/tachyonc query def NAME` |
-| what a module contains | `target/tachyonc query items MODULE` |
+| what a module contains; a type's methods | `target/tachyonc query items MODULE`; `query items TYPE` |
 | the item at a compiler error's position | `target/tachyonc query show FILE:LINE` (`--with-comments`: its section comment too) |
 | a module's `use` lines, header comment, extern blocks | `target/tachyonc query show MODULE::use` (`::header`, `::extern`) |
 | change a module's `use` lines or header comment | `target/tachyonc edit patch\|replace MODULE::use` (`MODULE::header`, `MODULE::extern`; `edit insert --after MODULE::use`, `edit delete`) |
@@ -104,6 +104,7 @@ tools` the ones a program needs.
 | several changes, checked once, all or nothing | `target/tachyonc refactor --script steps.txt` (one command per line; `<<END` ... `END` gives one its stdin) |
 | several queries and edits in one call, outputs under `## $ tachyonc ARGS` lines | `target/tachyonc batch < cmds.txt` (one command per line; `--stop` at the first failure) |
 | the errors, one per line (front end only) | `target/tachyonc check` |
+| build what changed and run the tests; counts, then each failure | `target/tachyonc test [FILTER...]` (a program: `tests/NAME.in`/`.out`; `--full`, `--budget N`) |
 | missing/unused imports, `pub`, `unsafe` blocks | `target/tachyonc fix` (`--only imports,unused,pub,unsafe`, `--in FILE\|MODULE`, `--dry-run`; several modules have the name: `--use PATH::NAME`) |
 | imports through re-exports, then the re-exports; merged, sorted, wrapped `use` lines | `target/tachyonc fix --only reexports,tidy-imports` (`// api:` above a `pub use` keeps it) |
 | prove a refactoring changed no output | `target/tachyonc same-output OLD_TACHYONC` |
@@ -117,6 +118,7 @@ tools` the ones a program needs.
 | std's API, a std item (from any program, or none) | `target/tachyonc query items std`, `query show std::read_line`, `query def Vec::push` |
 | what an expression or a few statements do, with std | `target/tachyonc try 'STATEMENTS'` (prints the output and `TYPE = VALUE`; `--file F`) |
 | the language on a word, an error message; one section | `target/tachyonc guide --find WORDS`, `guide TOPIC#SECTION` (`guide TOPIC#`: its sections) |
+| add a std function, pass, diagnostic, test, subcommand: the steps; items to copy | `target/tachyonc guide how TASK`; `query examples KIND`; `query similar NAME` |
 | a command's options | `target/tachyonc CMD [SUB] --help` |
 
 NAME is `foo`, `module::foo`, `Type::method`, `Enum::Variant`,
@@ -644,6 +646,12 @@ An impl block is its header line (kind `impl`) followed by its
 functions. MODULE is a module path, matched like NAME (`gvn`,
 `crate::gvn`, `crate`, `std`). `items` alone lists the module tree:
 `PATH→FILE→ITEMS` per module.
+
+`items TYPE` (0.17), when no module has that name: a struct's, enum's
+or trait's line (`# PATH→FILE:LINE:COL`, then `LINE→KIND→SIGNATURE`),
+then the functions of its impl blocks, each block under its header; a
+std type (`items Buf`, `items std::Vec`) lists std's API for it. An
+unknown method's error names it as its `try:` line.
 
 ### Banners and comments (0.13)
 

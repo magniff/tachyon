@@ -114,7 +114,7 @@ has the rounding. Take ours:
 ```console
 $ tachyonc edit resolve mi_to_km --ours
 resolved convert.tach:22-31 (ours)	convert.tach	+0 -4 lines
-main.tach:26:29: error[type error] undefined variable 'lb_to_kg' | help: add `use crate::convert::lb_to_kg;`
+main.tach:26:29: error[type error] undefined variable 'lb_to_kg' | help: add `use crate::convert::lb_to_kg;` | try: tachyonc fix --only imports main.tach
 warning conflict.check: the resolved program has errors (written; the merge may need more than one side)
 try: tachyonc check
 ```

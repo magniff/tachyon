@@ -4,16 +4,18 @@
 // and paths (`a::b::c`) resolved to what they name.
 
 use crate::base::{
-    FILES, IntVec, SRC, SYMS, SYM_COUNT, alloc_array, buf_bytes, grow, intern_c, sym_text,
+    BUFS, FILES, IntVec, SRC, SYMS, SYM_COUNT, alloc_array, buf_bytes, buf_new, buf_slice, buf_str,
+    grow, intern_c, sym_text,
 };
 use crate::base::diag::{
     ERR_HELP, buf_position, err_begin, err_end, err_end_soft, err_failed_name, err_fmt, err_help,
-    err_help_fmt, err_help_sym, err_str, err_sym, error_at, fail_name,
+    err_help_fmt, err_help_sym, err_str, err_sym, err_try, err_try_fmt, err_try_tool, error_at,
+    fail_name,
 };
 use crate::front::ast::{NODES, NodeKind, child};
 use crate::front::check::{PROGRAM, SELF_SYM, Try, attempt, name_error};
 use crate::front::check::collect::template_variant_named;
-use crate::front::check::names::help_near_item;
+use crate::front::check::names::{help_near_item, import_path_for};
 use crate::front::modules::{
     CUR_MOD, C_MODULE, MODULES, MODULE_COUNT, STD_MODULE, child_module, file_of_pos, is_within,
     module_of, qualified_if_known, qualify,
@@ -191,7 +193,7 @@ pub fn resolve_use_of(u: i64) {
     unsafe {
         let m = USE_ENTRIES[u].module;
         let path = USE_ENTRIES[u].path;
-        let prefix = resolve_path(m, path, NODES[path].count, NODES[path].start);
+        let prefix = resolve_path(m, path, NODES[path].count, u);
         let mut result = 0;
         if USE_ENTRIES[u].glob {
             if binding_kind(prefix) == B_MODULE {
@@ -210,7 +212,7 @@ pub fn resolve_use_of(u: i64) {
                     access_error(result, NODES[id].start, name);
                 }
                 if result == B_NONE {
-                    unresolved_import(id, path);
+                    unresolved_import(id, path, prefix, m);
                 }
             } else if binding_kind(prefix) == B_ITEM && SYM_ENUM[binding_value(prefix)] != 0 {
                 let e = SYM_ENUM[binding_value(prefix)] - 1;
@@ -271,14 +273,32 @@ pub fn resolve_all_uses() {
     }
 }
 
-fn unresolved_import(id: i64, path: i64) -> ! {
+// `use path::name;` where the module of path has no `name` (0.17: what
+// std has instead, the nearest name there, or the module that has it).
+fn unresolved_import(id: i64, path: i64, prefix: i64, from: i64) -> ! {
     unsafe {
         err_begin(NODES[id].start);
         err_str(c"unresolved import '");
         for i in 0..NODES[path].count {
             err_fmt(f"{sym_text(NODES[child(path, i)].a)}::");
         }
-        err_fmt(f"{sym_text(NODES[id].a)}'");
+        let name = NODES[id].a;
+        err_fmt(f"{sym_text(name)}'");
+        let pm = binding_value(prefix);
+        if pm == STD_MODULE {
+            if !help_std_path(name, 0, from, true) && SYMS[name].text == "gpa" {
+                err_help(c"the allocator is main's parameter, `fn main(gpa: Gpa)`, passed down");
+            }
+        }
+        help_near_item(pm, name);
+        if BUFS[ERR_HELP].len == 0 {
+            let other = import_path_for(name, true);
+            let at = if other != 0 { other } else { import_path_for(name, false) };
+            if at != 0 {
+                err_help_fmt(f"'{sym_text(name)}' is in {buf_slice(at)}");
+                err_try_fmt(f"use {buf_slice(at)}::{sym_text(name)};");
+            }
+        }
         err_end()
     }
 }
@@ -333,6 +353,7 @@ fn help_make_public(key: i64, name: i64) {
         }
         err_help(c"` at ");
         buf_position(ERR_HELP, start);
+        err_try_tool("fix --only pub", true);
     }
 }
 
@@ -714,8 +735,9 @@ fn prelude_lookup(name: i64, m: i64, depth: i64) -> i64 {
 
 // The module (or the item, for the last segment) named by the first
 // `count` segments of `path` (a Path node whose list holds Ident nodes),
-// from module m: `crate`, `self` and `super` first; `std`.
-fn resolve_path(m: i64, path: i64, count: i64, pos: i64) -> i64 {
+// from module m: `crate`, `self` and `super` first; `std`. `entry`: the
+// use entry whose path it is, or -1 (for the helps of its errors, 0.17).
+fn resolve_path(m: i64, path: i64, count: i64, entry: i64) -> i64 {
     unsafe {
         let mut cur = binding(B_MODULE, m);
         for i in 0..count {
@@ -753,6 +775,7 @@ fn resolve_path(m: i64, path: i64, count: i64, pos: i64) -> i64 {
                 err_failed_name(name);
                 if i == 0 {
                     err_fmt(f"unknown module '{sym_text(name)}'");
+                    help_unknown_module(m, name, path, entry);
                 } else {
                     err_fmt(f"no '{sym_text(name)}' in module '");
                     if here == 0 {
@@ -761,6 +784,13 @@ fn resolve_path(m: i64, path: i64, count: i64, pos: i64) -> i64 {
                         err_sym(MODULES[here].key);
                     }
                     err_str(c"'");
+                    if here == STD_MODULE {
+                        let next = if i + 1 < NODES[path].count { NODES[child(path, i + 1)].a }
+                            else if entry >= 0 && !USE_ENTRIES[entry].glob {
+                                NODES[USE_ENTRIES[entry].item].a
+                            } else { 0 };
+                        help_std_path(name, next, m, entry >= 0);
+                    }
                     help_near_item(here, name);
                 }
                 err_end();
@@ -770,8 +800,106 @@ fn resolve_path(m: i64, path: i64, count: i64, pos: i64) -> i64 {
                 qnote_module(NODES[seg].start, name, binding_value(found), 0);
             }
         }
-        let _ = pos;
         cur
+    }
+}
+
+// (0.17) The help of `unknown module 'name'` at the start of path, from
+// module m: a module of that name elsewhere in the crate is reached from
+// the root (`crate::name::...`; for a `use`, its line so written is the
+// try:); a Rust std module is std's item; else the nearest module.
+fn help_unknown_module(m: i64, name: i64, path: i64, entry: i64) {
+    unsafe {
+        let mut found = -1;
+        if m != 0 {
+            found = child_module(0, name);
+        }
+        if found < 0 {
+            for k in 1..MODULE_COUNT {
+                if MODULES[k].name == name && k != STD_MODULE && k != C_MODULE && k != m
+                    && !is_within(k, STD_MODULE) {
+                    found = k;
+                    break;
+                }
+            }
+        }
+        if found >= 0 {
+            let full = buf_new();
+            buf_str(full, c"crate");
+            if MODULES[found].parent != 0 {
+                buf_str(full, c"::");
+                buf_bytes(full, SYMS[MODULES[MODULES[found].parent].key].text);
+            }
+            err_help_fmt(
+                f"'{sym_text(name)}' is the module {buf_slice(full)}::{sym_text(name)}; a path starts in the module it is written in: write `{buf_slice(full)}::{sym_text(name)}::...`");
+            if entry >= 0 {
+                let node = USE_ENTRIES[entry].node;
+                let at = NODES[path].start;
+                let t = buf_new();
+                buf_bytes(t, SRC[NODES[node].start..at]);
+                buf_bytes(t, buf_slice(full));
+                buf_str(t, c"::");
+                let mut e = NODES[node].end;
+                while e > at && SRC[e - 1] != ';' {
+                    e -= 1;
+                }
+                buf_bytes(t, SRC[at..if e > at { e } else { NODES[node].end }]);
+                err_try_fmt(buf_slice(t));
+            }
+            return;
+        }
+        if help_std_path(name, 0, m, entry >= 0) {
+            return;
+        }
+        help_near_item(m, name);
+    }
+}
+
+// (0.17) The help of a path through `std::name` that std does not have,
+// `next` the name after it (or 0), seen from module m: tachyon's std is
+// one module, so a Rust path (`std::collections::HashMap`, `std::io`) is
+// std's item itself (`std::HashMap`, the `use` line as try:), or what
+// replaces that module (`in_use`: the path is a `use` item's; else the
+// try: is the path to write). Whether there was a help.
+pub fn help_std_path(name: i64, next: i64, m: i64, in_use: bool) -> bool {
+    unsafe {
+        let t = SYMS[name].text;
+        if next != 0 && STD_MODULE >= 0
+            && binding_kind(lookup_quiet(STD_MODULE, next, m)) == B_ITEM {
+            err_help_fmt(f"tachyon's std is one module, without '{t}': its items are `std::NAME`");
+            if in_use {
+                err_try_fmt(f"use std::{sym_text(next)};");
+            } else {
+                err_try_fmt(f"std::{sym_text(next)}");
+            }
+            return true;
+        }
+        if t == "io" {
+            err_help(c"tachyon's std is one module: stdin is `read_line(&buf)` (a line), `read_stdin_in(gpa)` (all of it, a Buf), `Scanner` (tokens); output is `print`, `println`");
+            err_try(c"use std::{Scanner, read_line, read_stdin_in};");
+        } else if t == "collections" {
+            err_help(c"tachyon's std is one module: `HashMap<K, V>` (a set: `HashMap<K, bool>`), `Vec<T>` (in the prelude)");
+            err_try(c"use std::HashMap;");
+        } else if t == "fmt" {
+            err_help(
+                c"tachyon's std is one module: `Display` (`fn fmt(self: *T, f: *Fmt)`), `Fmt`");
+            err_try(c"use std::{Display, Fmt};");
+        } else if t == "string" || t == "str" || t == "char" {
+            err_help(c"text is `[u8]` (string literals are one), built in a `std::Buf`; std's text functions are `std::trim`, `std::split_in`, `std::parse_int`, ...");
+            err_try(c"use std::Buf;");
+        } else if t == "vec" || t == "option" || t == "result" || t == "prelude" {
+            err_help(
+                c"`Vec`, `Option`, `Result` and their variants are in the prelude: no `use` needed");
+        } else if t == "mem" || t == "cmp" || t == "iter" || t == "ops" || t == "convert"
+            || t == "hash" || t == "process" || t == "env" || t == "fs" || t == "num"
+            || t == "boxed" || t == "rc" || t == "cell" || t == "sync" || t == "thread"
+            || t == "time" || t == "path" || t == "slice" || t == "error" || t == "core"
+            || t == "alloc" {
+            err_help(c"tachyon's std is one module, without submodules: its items are `std::NAME` (`tachyonc query items std` lists them)");
+        } else {
+            return false;
+        }
+        true
     }
 }
 
@@ -780,7 +908,7 @@ fn resolve_path(m: i64, path: i64, count: i64, pos: i64) -> i64 {
 // segments, from the module being checked.
 pub fn path_module(path: i64, count: i64) -> i64 {
     unsafe {
-        let b = resolve_path(CUR_MOD, path, count, NODES[path].start);
+        let b = resolve_path(CUR_MOD, path, count, -1);
         if binding_kind(b) != B_MODULE {
             name_error(NODES[child(path, count - 1)].start, c"'", NODES[child(path, count - 1)].a,
                 c"' is not a module");
