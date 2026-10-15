@@ -15,6 +15,12 @@ and `NAME.json` (every run's result.json, compactly), made by
 Transcripts and final workspaces stay in `tests/agent-eval/results/`
 (not committed).
 
+From 0.16 the eval also has compiler tasks (`tests/agent-eval/ctasks/`):
+changes to tachyon's own compiler, with AGENTS.md and its tools and hooks
+(`compiler-tools`) against AGENTS.md without them (`compiler-plain`); the
+report's "Compiler tasks: tools against plain" section. The next round
+is planned in [tests/agent-eval/plans/0.16.md](../../tests/agent-eval/plans/0.16.md).
+
 | report | compiler | models | conditions | tasks x reps |
 |---|---|---|---|---|
 | (none yet: the first is 0.14's) | | | | |

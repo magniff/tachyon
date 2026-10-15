@@ -25,7 +25,23 @@ tests/agent-eval/run.py run --model ollama:qwen3-coder:30b --cond both,rust \
 
 # tables, plus docs/eval/0.14.json with every result
 tests/agent-eval/run.py report tests/agent-eval/results/0.14-* --md docs/eval/0.14.md
+
+# (0.16) every task: id, kind, time limit, title (compiler tasks: base, filters)
+tests/agent-eval/run.py list --set all
+
+# (0.16) the compiler tasks, tools against plain (ctasks/, below)
+tests/agent-eval/run.py check-tasks --set compiler
+tests/agent-eval/run.py run --model claude:sonnet --set compiler \
+    --cond compiler-tools,compiler-plain --reps 3 --jobs 2 --out tests/agent-eval/results/0.16-compiler
+
+# (0.16) no model: workspaces, prompts, settings, and the hooks fired on
+# synthetic events (result.json's dry_run)
+tests/agent-eval/run.py run --model claude:haiku --set compiler \
+    --cond compiler-tools,compiler-plain --dry-run --out /tmp/eval-dry
 ```
+
+A round is planned in `plans/` (0.16: [plans/0.16.md](plans/0.16.md),
+one command, `sh tests/agent-eval/plans/0.16.sh`).
 
 - `--model`: `claude:sonnet`, `claude:haiku` (any `claude --model`
   name), `ollama:MODEL`.
@@ -33,8 +49,15 @@ tests/agent-eval/run.py report tests/agent-eval/results/0.14-* --md docs/eval/0.
   how to build), `guide` (bare + `tachyonc guide` inlined, generated from
   the binary under test), `tools` (bare + the tools table,
   [prompts/tools.md](prompts/tools.md)), `both`, `rust`.
-- `--tasks-dir D` for another task set (`devtasks/` holds two tiny ones
-  for working on the runner); `--tasks a,b` picks some.
+- `--set programs|compiler|all|dev` (0.16): the task directories
+  (`tasks/`, `ctasks/`, both, `devtasks/`: two tiny ones for working on
+  the runner); or `--tasks-dir D[,D...]`; `--tasks a,b` picks some. A
+  compiler task runs only in the compiler conditions, a program task only
+  in the others.
+- `--cond compiler-tools,compiler-plain` (0.16): the compiler tasks'
+  conditions (below).
+- `--reps N`: every (task, condition) N times (`repN` directories); use
+  3 for a round, differences of a run or two are noise.
 - `--check-hook` (0.15): in the tools and both conditions,
   tools/agent-hooks/check-after-edit.py runs after every change to a
   `.tach` file (Write, Edit, a `tachyonc edit` that wrote) and adds
@@ -45,6 +68,15 @@ tests/agent-eval/run.py report tests/agent-eval/results/0.14-* --md docs/eval/0.
   Ollama: the loop runs the same script after write_file, edit_file and
   bash. result.json gets `check_hook` (checks, with_errors, errors,
   codes, ms_median; the log is kept as `check-hook.jsonl`).
+- `--dry-run` (0.16): no model; each workspace is set up, `prompt.md`,
+  `settings.json` and `command.json` (the `claude` command line) are
+  written, and every hook in the settings is run on synthetic events as
+  Claude Code would (a Write that adds an error to a `.tach` file: the
+  check hook must report it; a `grep` of a `.tach` file: the query hook
+  must block it); `dry_run` in result.json. A hosted run's
+  `check-hook.jsonl` is written by the hook itself, so it shows the hook
+  fired (checked on 00-hello-sum with Haiku, 2026-10-15: one check after
+  the agent's Write; the run cost $0.007).
 - Resumable: a run whose `result.json` exists is skipped, so rerun the
   same command (same `--out`) after an interruption. A run directory
   without `result.json` is redone from scratch.
@@ -205,9 +237,62 @@ no solution test takes more than half its time limit, and every starter
 fails (does not build, a test, or the check), building when
 `starter_builds` says it should.
 
+## Compiler tasks (0.16)
+
+`ctasks/NN-name/`: a change to tachyon's own compiler, made in a copy of
+the repository, graded by building the compiler and running part of its
+suite. The format is in `lib/ctasks.py`'s header: `meta.toml` (`kind`
+optimize|refactor|fix|feature, `base = "v0.16.0"` with `base_fallback`,
+a commit that exists now, `suite`: the tests/run.sh filters that must
+pass, optional `same_output` corpus), `task.md`, `README.md` (for
+people), `starter.patch` (optional: a planted bug), `solution.patch` (the
+reference), `hidden/` (tests copied over the graded tree), `grade.sh`.
+
+- **The workspace**: `git archive` of the base, the starter patch,
+  `git init` with one commit; `bootstrap/eval-build.sh`
+  ([lib/eval-build.sh](lib/eval-build.sh): what bootstrap.sh does for
+  HEAD, from `target/builder/tachyonc`, the release that builds the base,
+  since the copy has no tags); `target/tachyonc` built from the starter;
+  CLAUDE.md and `.claude/` removed: the prompt carries AGENTS.md.
+- **compiler-tools**: AGENTS.md as it is; `target/tools/tachyonc`; the
+  query-first hook (PreToolUse on Bash, Read, Grep, Edit, Write; PostToolUse
+  on Bash) and the check hook (PostToolUse), registered in `--settings`
+  as the repository's `.claude/settings.json` does, the scripts copied out
+  of the repository; the prompt adds `prompts/check-hook.md`.
+- **compiler-plain**: AGENTS.md without "Read source through the
+  compiler" (the tools table), replaced by a paragraph on the file tools
+  and the shell, and without the hook's lines (`ctasks.agents_md`; it
+  fails if the result still names the tools, so a changed AGENTS.md is
+  caught by `check-tasks`); no hooks, no `target/tools`.
+- The prompt: `prompts/compiler-intro.md`, AGENTS.md, `compiler-env.md`
+  (build with `bootstrap/eval-build.sh`, test with `tests/run.sh FILTER`,
+  no gate, no commit needed), the shell note, `compiler-ending.md`, then
+  `task.md`.
+- **The grading** (`ctasks.grade`), in a copy without `.git` and
+  `target/`: `hidden/` copied over it; the build with the fixpoint; every
+  `suite` filter; `tachyonc same-output STARTER` on the corpus; `grade.sh`
+  (with `TACHYONC`, `EVAL_STARTER_TACHYONC`, `EVAL_STARTER_TREE`).
+  `tests_passed`/`tests_total` count those steps.
+- **Kept per run**: `changes.patch` (the agent's diff, `target/` left
+  out), `agent-tools.jsonl` (the query hook's log), `check-hook.jsonl`;
+  result.json adds `changes` (files, lines added and removed),
+  `query_hook` (records by kind, blocks, escapes and their reasons),
+  `check_hook`, `grade_summary`, `base`, `base_commit`.
+- `check-tasks` builds the starter (cached per task and commit) and the
+  reference, and wants the reference to pass the grading and the starter
+  to fail it. `--base REF` and `--builder PATH` override the base and the
+  compiler that builds it (by default the `built_by` release of the
+  base's releases.toml, from a bootstrap cache).
+- The report's "Compiler tasks: tools against plain" section: success,
+  medians and their tools/plain ratio per model, per task, tool use and
+  the hooks, and the grading step failed runs stopped at.
+
 ## Files
 
 - `run.py`: the command line.
+- `lib/ctasks.py` (0.16): the compiler tasks: bases, workspaces,
+  AGENTS.md per condition, grading, their check; `lib/eval-build.sh`.
+- `plans/`: the commands of a round (`0.16.sh`, `0.16.md`).
 - `lib/common.py` (tasks, meta.toml, processes), `lib/grade.py`,
   `lib/checktasks.py`, `lib/runner.py`, `lib/claude_backend.py`,
   `lib/ollama_backend.py`, `lib/toolkinds.py` (classifying tool calls),

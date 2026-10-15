@@ -85,6 +85,11 @@ def classify_command(seg):
         return None
     head = w[0].strip("'\"")
     base = os.path.basename(head)
+    if base in ("sh", "bash") and len(w) > 1 and os.path.basename(w[1]) in (
+            "eval-build.sh", "bootstrap.sh", "gate.sh", "run.sh"):
+        w = w[1:]  # (sh bootstrap/eval-build.sh)
+        head = w[0]
+        base = os.path.basename(head)
     # (0.15) a copy (tachyonc-old, tc0) or a variable ($T) running a
     # tachyonc subcommand counts as tachyonc
     sub_next = len(w) > 1 and w[1] in TACH_SUBS
@@ -97,6 +102,13 @@ def classify_command(seg):
         return "tachyonc:other"  # --version, --help
     if base == "rustc":
         return "rustc"
+    # (0.16) the compiler tasks: building the compiler, the test suite
+    if base in ("eval-build.sh", "bootstrap.sh"):
+        return "compiler:build"
+    if base == "gate.sh":
+        return "compiler:gate"
+    if base == "run.sh" and "tests/" in head:
+        return "suite"
     if head.startswith("./") or head.startswith("/") and base == "prog":
         return "run"
     if base in ("for", "in", "done", "fi", "esac", "case", "until"):
