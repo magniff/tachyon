@@ -45,8 +45,119 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.12.0 | `v0.12.0` | 0.11.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | the compiler's source reorganized through its own tools: folders by phase, no file over 1,000 lines, no re-exports, tidy imports, output identical to 0.11's; `edit patch`, `edit insert --in`, `query text`, a module's `use` lines and header as targets, `fix --only reexports` and `tidy-imports`, `split --reexport`; the release gate in one command (`bootstrap/gate.sh`) |
 | 0.13.0 | `v0.13.0` | 0.12.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | the tools, improved from 0.12's record: `edit patch` inside a line, `--pairs`, `edit wrap`, `edit new-file`, `signature --default`, `fix --in` over a subtree; section banners, `query grep`, `query type`, kinds of references; an on-disk cache (a query or `check` of an unchanged program in about 6 to 8 ms); `split` part names, layout kept by `move` and `split`, `refactor extract-function` and `inline`; `tachyonc fmt` (the tree formatted), `explain` and `guide` |
 | 0.14.0 | `v0.14.0` | 0.13.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | closures and iterators: closures (captures by value or by reference, `move`, `Fn`/`FnMut` bounds, a non-capturing closure is a `fn`, an escape check); associated types; an `Iterator` trait, `for` over anything iterable, ranges as values, std's sources, adapters and consumers, chains compiled to the hand-written loop; std reads stdin (`read_line`, `read_stdin`, `Scanner`), text helpers, values changed in place, an introsort; did-you-mean across the program and std, helps for Rust habits; the tools on a user's program; the agent eval (`tests/agent-eval/`) and its 0.13 baseline |
+| 0.15.0 | `v0.15.0` | 0.14.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | errors, conversions, less boilerplate: `?` on `Option` and `Result`, generic traits, `From`/`Into`, `main` returning `Result`, std's I/O on `Result` with typed errors (`fix --only std015` moves 0.14 code); lossless integer widening and joins, `i64::MAX`; f-strings over `Display` and `Debug`, generic `print`/`format`; `#[derive(Eq, Ord, Hash, Debug, Clone)]`; named and default arguments, field shorthand; `==` on `Vec`, `Buf`, `HashMap` by contents; std loaded by sections; the tools for agents (`query context`, budgets, std from any program, `try`, `batch`, `edit apply`, merge conflicts, `--json`, the check hook); back end, gen0 and base on closures and iterators; six harder eval tasks |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.15
+
+The design, its work split and each part's notes are in
+docs/design/errors-formatting.md; the language in docs/grammar.md,
+"Additions of 0.15"; `tachyonc guide conversions` and `guide formatting`.
+
+- **Errors and `?`**: `e?` on an `Option` gives the value or returns
+  `None`; on a `Result` the value or `Err(e)`, the error widened or
+  converted by the function's error type's `impl From`. Inside a closure
+  it returns from the closure; defers run. `fn main() -> Result<(), E>`
+  prints `Error: {e:?}` on stderr and exits with 1. Errors name what to
+  write (`-> Result<i64, E>`, `e.ok_or(..)?`, the `impl From` to add).
+- **Generic traits, `From` and `Into`**: traits take type parameters
+  (`trait From<T>`), impls name concrete types or their own parameters,
+  bounds pass arguments (`T: From<U>`); a call picks the impl by its
+  argument types. `From` holds without an impl for the identity and for
+  widening (`i64::from(x_i32)`); `x.into()` is `U::from(x)` with `U` the
+  expected type. std's `Option`/`Result` helpers: `ok_or`, `map`,
+  `and_then`, `map_err`, `unwrap_or_else`, `err`.
+- **std's I/O on `Result`**: `read_line(&buf) -> Result<bool, IoError>`,
+  `read_stdin() -> Result<Buf, IoError>`, `parse_int -> Result<i64,
+  ParseIntError>`, `Scanner::next_int -> Result<i64, ScanError>`; the
+  error enums have `Display` and `Debug`. Option means absence, Result
+  failure. `tachyonc fix --only std015` moves 0.14 code (exact but for
+  `read_stdin` on a read error).
+- **Widening**: a narrower integer converts implicitly to a wider one of
+  the same signedness, and unsigned to a wider signed one, wherever a
+  value meets an expected type (lets, assignments, arguments, returns,
+  fields, elements) and where two types meet (operands, `if`/`match`
+  branches, two arguments of one type parameter: `max(a_i32, b_i64)` is
+  `max::<i64>`); never inside other types, never narrowing, never
+  between integers and floats. An expected type flows into arithmetic
+  (`let t: i64 = a_i32 * b_i32` multiplies in `i64`). `i64::MAX`,
+  `u8::MIN`, ... are constants of the integer types (std's `I64_MAX`
+  ... are the same).
+- **Formatting**: f-strings, `f"p = {p:?}, x = {x:>4}, {n:08x}"`
+  (width, alignment, zero padding, precision, hex, binary, a byte;
+  `{{`), evaluated where written, holes once and left to right; a value
+  of type `Interp` that any `T: Display` takes. `Display` and `Debug`
+  (`fn fmt(self: *T, f: *Fmt)`, `fn fmt_debug`), implemented for the
+  numbers, `bool`, `[u8]` (Debug quoted and escaped as Rust's), `Buf`,
+  and Debug for `Option`, `Result`, `Vec`, `HashMap`; floats print the
+  shortest decimal that reads back. `print`, `println`, `eprint`,
+  `eprintln`, `format` and `Buf::push_fmt` take any `Display`; output
+  goes through one static 4 KB buffer, one `write` per print, no heap:
+  `bench/fmtloop` (10^6 formatted lines) matches the same text built by
+  hand (`bench/fmtints`). `println!` and Rust's `fmt(&self, f: &mut
+  Formatter)` get the tachyon form in their help; a plain literal with
+  `{name}` of a local passed to print gets a warning.
+- **derive**: `#[derive(Eq, Ord, Hash, Debug, Clone)]` on structs and
+  enums (generic ones too, each parameter bound by the trait): Ord
+  lexicographic in declaration order, Debug as Rust's (`P { x: 1, y: 2
+  }`), Clone field by field (a Vec deep). `Clone` in std; tuples of
+  Eq/Ord/Hash/Clone types are those too (`sort` sorts tuples,
+  `HashMap<(i64, [u8]), V>`); `sort_stable` and `sort_stable_by`.
+- **Less boilerplate**: named arguments after the positional ones, in
+  the parameters' order (`area(w, h: 2)`); defaults on trailing
+  parameters of functions and inherent methods (`fn f(x: i64, step: i64
+  = 1)`), evaluated per call in the callee's module; field shorthand `S
+  { x, y }`.
+- **`==` on `Vec`, `Buf` and `HashMap` compares contents** (Vecs element
+  by element, maps by entries in any order); `==` on a `Vec<T>` needs
+  `==` on `T`.
+- **Compile time**: std is loaded by sections: an index made with std's
+  source (compiler/std/index.awk) lets the loader lex only the sections a
+  program reaches (Vec and printing always; HashMap, iterators, text,
+  conversions, Clone when named or needed). A small std program compiles
+  faster than with 0.14.0 although std grew from 46 to 90 KB (`Benchmarks`,
+  0.15).
+- **The tools for agents** (docs/tool-gaps-014.md, from the 0.14 eval
+  and development record; docs/query.md, docs/refactor.md): `query
+  context NAME` (the item, what it calls and uses, its callers, fitted to
+  a budget); `--budget N` on every query, long answers cut with the
+  command that gets the rest; std from any program (`query items std`,
+  `show std::read_line` with the `use` line, `text std:A-B`, `grep --in
+  std`, a name std defines asked again with std); every spelling a tool
+  prints accepted back as a name; `tachyonc try 'STATEMENTS'` (a snippet
+  compiled and run with std, its value and type printed); `guide --find
+  WORDS`, `explain WORDS`; `tachyonc batch` (several commands in one
+  call); `edit apply` (blocks per item, or `query show`'s output edited)
+  and `edit patch` over several targets; `edit.breaks` saying what broke
+  and the refactoring that would carry the change; `query conflicts` and
+  `edit resolve` for merge conflicts in `.tach` files; `--json` on every
+  command; builds off a terminal print the one-line errors; the check
+  hook (tools/agent-hooks/check-after-edit.py: errors after every edit
+  of a .tach file); tachyonc recognised through copies and variables,
+  `target/tools/tachyonc`. fmt, query and the refactorings know 0.15's
+  syntax (`signature --add 'x: T = V'` declares a default; `--fill-calls`
+  is 0.14's behaviour).
+- **The compiler's source**: the back end, gen0 and base iterate with
+  `IntVec::items()`, `kids(n)` and std's `any`/`all`/`position`/`find`
+  (through `rewrite`, which gained `$s...` holes over a block's
+  statements); same-output identical, self-compile time unchanged. The
+  front end and the tools move in 0.16.
+- **The agent eval, harder**: tasks 13-18 (porting a C compressor, a
+  pass over an interpreter's AST, a multi-module CSV query engine, a
+  tight perf limit, three run-time bugs, an API refactor); `run.py
+  --check-hook`, and the errors left at the end in each result.
+- **Also**: `query refs` no longer counts a trait's `Self` as a use of
+  each type implementing it; a negated suffixed literal under an
+  expected type (`let d: i64 = -9223372036854775808i64`) is no longer
+  out of range.
+- **Breaking**: `read_line`, `read_stdin`, `parse_int` and
+  `Scanner::next_int` return `Result` (`fix --only std015`); `==` on
+  `Vec`, `Buf`, `HashMap` compares contents, no longer the pointer; the
+  prelude gains `Display`, `Debug`, `Clone`, `From`, `Into`, `format`,
+  `eprint`, `eprintln` (a program's own names come first); `f(label:
+  loop { .. })` is a named argument; integer types that mismatched before
+  may now widen (a program valid in 0.14 keeps its types).
 
 ### What's new in 0.14
 

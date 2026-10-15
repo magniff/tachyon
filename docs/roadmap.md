@@ -750,6 +750,36 @@ test machine).
   (renames, moves, signatures, errors across files) and when reading a
   small file is cheaper (tools-only cost more than the guide alone)
 
+Done (0.15.0, the release gate still to run). The design
+(docs/design/errors-formatting.md), an interface commit with stubs and
+hooks, and six parallel tasks merged in the design's order: errors and
+conversions (`?`, generic traits, `From`/`Into`, `main` returning
+`Result`); widening and arguments (lossless widening and joins, named
+and default arguments, shorthand checked, std's I/O on `Result` with
+typed errors, `fix --only std015` for 0.14 code); formatting (f-strings,
+`Display`/`Debug`, generic `print`/`format` through one static buffer,
+`bench/fmtloop` at the cost of the hand-written text); derive (`Eq`,
+`Ord`, `Hash`, `Debug`, `Clone`, `Clone` in std, tuples ordered and
+hashed, `sort_stable`); the tools on all of it and the tools track from
+docs/tool-gaps-014.md (`query context` and budgets, std from any
+program, names in every printed spelling, `try`, `batch`, `edit apply`
+and several targets, `edit.breaks` hints, merge conflicts through `query
+conflicts` and `edit resolve` (0.14's moved gap 8), `--json`, the check
+hook, `target/tools/tachyonc`); the compiler's back end, gen0 and base on
+closures and iterators. Decided at integration: `i64::MAX` and the other
+integer limits as builtin constants (no associated constants in general
+yet); `==` on `Vec`, `Buf` and `HashMap` by contents. std doubled in size
+(46 to 90 KB), so it is loaded by sections: a small program compiles
+faster than with 0.14.0. The eval gained tasks 13-18 (harder: a C port,
+an AST pass, a multi-module program, a tight perf limit, run-time bugs,
+an API refactor) and the check hook; the guide says when the tools pay
+off. Moved: the front end's and the tools' source onto closures and
+iterators to 0.16 (with 0.15's own features, as planned); several runs
+per eval cell, and a baseline on the harder tasks, to a later release;
+associated constants in general, `Debug` for tuples and generic slices,
+`collect` into anything but a `Vec`, and returning closures, to later
+releases.
+
 ## 0.16: effects
 
 - inferred effect sets per function: `alloc`, `io`, `panic`, `global`
