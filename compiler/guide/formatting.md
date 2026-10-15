@@ -19,6 +19,11 @@ those three bytes (a literal holding `{name}` of a local passed to
   string literals work in it (`{m.get("k"):?}`); f-strings do not nest.
 - The holes are evaluated where the f-string is written, once, left to
   right; the value holds copies, so it can be stored and printed later.
+- (0.17) Passed straight to `print`, `println`, `eprint`, `eprintln`,
+  `format_in` or `b.push_fmt`, an f-string is written in place: no
+  closure, no `Interp`, no copy of the function, at every `-O` level.
+  Through a function of your own taking `T: Display`, each f-string is
+  a new copy of that function (and of what it calls).
 - The spec after `:` is `[<|>][0][width][.precision][?|x|X|b|c]`: `<`
   and `>` align (numbers go right by default, text left), `0` pads with
   zeros, `.N` gives a float N decimals, `?` is Debug, `x`/`X` hex, `b`

@@ -21,7 +21,7 @@ The code (0.12: in folders, see compiler/README.md): the middle end in
 | flag | pipeline |
 |---|---|
 | `-O0` | the 0.1 code generator (`gen.tach`), unchanged: stack-machine code straight from the AST |
-| `-O1` | lowering to SSA; per function, twice: SCCP, instruction combining, (the first time) scalar replacement of aggregates and constant tables, CFG simplification, GVN with memory forwarding and dead stores, dead code elimination, CFG simplification; linear-scan register allocation |
+| `-O1` | lowering to SSA; (0.17) the calls of small leaf functions inlined; per function, twice: SCCP, instruction combining, (the first time) scalar replacement of aggregates and constant tables, CFG simplification, GVN with memory forwarding and dead stores, dead code elimination, CFG simplification; linear-scan register allocation |
 | `-O2` (default) | `-O1`, then per function in call-graph order (callees first): tail recursion elimination, inlining, the loop optimizer (0.4: rotation, induction variables and unrolling, value ranges, strength reduction and unswitching, aggressive DCE) and loop-invariant code motion, each followed by the `-O1` pipeline again; functions left without callers are not emitted |
 
 `-O0` stays as an independent oracle: it shares only the front end with
@@ -1696,3 +1696,98 @@ one branch for the exit), `opt_u32_ops` (w registers, no `mov wN, wN`,
 against -O0), `opt_bits` (cnt, clz, rbit; constants folded; -O0's
 bodies), `opt_vectorize_widen` (umlal for `out[j] += k * b[j]` and a dot
 product).
+
+## 0.17: cheaper f-strings
+
+Until 0.17 every f-string was a closure in a `std::Interp` (0.15,
+[design/errors-formatting.md](design/errors-formatting.md)), handed to
+an instance of the generic function it was passed to: per f-string a
+closure function, its environment, an `Interp` type and its Display
+`fmt`, and an instance of `println` or `push_fmt` (and of every generic
+function in between), which -O0 and -O1 do not inline.
+
+**Written in place** (`front/check/interp.tach`, `direct_kind` and
+`direct_call`). An f-string passed straight to std's `print`,
+`println`, `eprint`, `eprintln`, `format_in` or `Buf::push_fmt` (outside
+std, without a turbofish) makes none of them: the checker makes the call
+a block that evaluates what the call evaluated, in its order (push_fmt's
+receiver, the holes left to right once, format_in's allocator), then
+runs the f-string's Fmt writes in place (`push_writes`, the closure's
+body as before):
+
+```
+println(f"n={n}")    =>  { let __f0 = n; { let mut __out = std::Fmt::to_fd(1);
+                            __out.byte('n'); __out.byte('='); __out.display(&__f0);
+                            __out.byte('\n'); __out.flush(); } }
+b.push_fmt(f"..")    =>  { let __r = &b; let __f0 = ..; { let mut __out = std::__buf_fmt(__r);
+                            loop { WRITES; if std::__buf_fmt_end(__r, &__out) { break; } } } }
+format_in(f"..", a)  =>  { let __f0 = ..; let __a = a; { let mut __b = std::Buf::new_in(__a);
+                            let mut __t = [0u8; 256]; let mut __out = std::__fmt_tmp(&__t);
+                            loop { WRITES; if std::__fmt_in_end(&__b, &__out, &__t) { break; } }
+                            __b } }
+```
+
+The retry loop is std's own (0.16): the writes run again when the text
+did not fit the Buf's room (or format_in's 256 bytes on the stack), the
+holes' values bound outside it. The call node becomes an `Interp` node
+whose `y` is the block (so the back ends, effects inference and every
+walk treat it as an f-string's); a copy of the call as written stays for
+`query refs`; `query type` shows the f-string's type as elsewhere; an
+effect's explanation names the call (`'println(f"..")' calls
+'std::println'`); `--check-alloc` sites are the call's. f-strings
+elsewhere (a variable, a function of the program taking `T: Display`,
+std's own) are as before.
+
+**-O1 inlines small leaf functions** (`middle/inline.tach`,
+`simplify_inlining_leaves`, -O1's scalar pipeline): the functions with
+no calls are simplified first; one of at most 6 instructions
+(`func_size`; 40 with `#[inline]`; never `#[inline(never)]` or
+`#[cold]`) is inlined into every caller, which is then simplified; one
+inlined everywhere (address not taken, not global) is not emitted. -O2
+is unchanged (its output is identical). The size, measured
+(instructions retired at -O1; the compiler's -O1 compile of itself):
+
+| leaf size | -O1 compile | matmul | iterchain | wordcount | json |
+|---|---|---|---|---|---|
+| none (0.16) | 14.03 G | 1882 M | 49.1 G | 2150 M | 2206 M |
+| 4 | +0.3% | 1882 M | 32.7 G | 2150 M | 2206 M |
+| 5 | +1.0% | 745 M | - | 2150 M | 2206 M |
+| 6 | +2.0% | 745 M | 31.0 G | 1939 M | 2073 M |
+| 8 | +3.0% | 745 M | 31.0 G | 2023 M | 2073 M |
+| 10 | +4.6% | 745 M | 31.0 G | 2025 M | 2073 M |
+
+The leaves are bigger than their calls: the -O1 code of the compiler
+grows (1.5% more instructions at 10) and with it the time of every pass
+after inlining. Inlining small functions that call (Fmt's `display`,
+`byte`), bottom-up, cost 31% at 6; inlining leaves of more than 3
+instructions only in loops, 1.2% at 6 for fewer gains (json, iterchain).
+Neither is done.
+
+**Measured** (aarch64-macos, instructions retired, best of 9; the
+compiler built as bootstrap.sh builds it; "self" is the compile of
+0.17's compiler source as of this change, `-c`):
+
+| | v0.15.0 | 0.16 (before) | 0.17 |
+|---|---|---|---|
+| self -O0 | 6.914 G | 6.968 G | 6.994 G |
+| self -O1 | 13.860 G | 14.005 G | 14.303 G |
+| self -O2 | 48.806 G | 45.375 G | 45.453 G |
+| small program -O0 / -O2 | 37.1 / 63.8 M | 43.0 / 78.9 M | 43.3 / 79.0 M |
+| the same, `println(f"sum {s}")` -O0 / -O2 | 39.1 / 80.0 M | 45.5 / 103.9 M | 45.3 / 101.7 M |
+| fmtloop run, -O1 / -O2 | | 934 / 657 M | 877 / 651 M |
+| fmtints run, -O1 / -O2 | | 825 / 657 M | 813 / 657 M |
+
+(v0.15.0's small programs are its own spelling, `Vec::new()`; the run
+time of instructions retired varies by about 0.5% from run to run.) The
+compiler's own f-strings (144) go through its own generic functions
+(`buf_fmt`, `err_fmt`, `err_help_fmt`), so they keep the Interp
+lowering: written as `(*fmt_scratch()).push_fmt(f"..")` at each call
+site, the self-compile takes 1.0% fewer instructions at -O0 and -O1
+(measured on a copy). The small program's gap to v0.15.0 is std's
+(0.16's allocators), not its f-strings.
+
+Tests: `fmt_direct` and `fmt_direct_o0` (every form, the order of the
+holes, specs, Debug, pointer holes, a push_fmt and a format_in over 256
+bytes that write twice), `fmt_direct_ir` (no closure, Interp or
+instance at -O0), `fmt_direct_err`, `checkalloc_fmt_direct`,
+`query/fstring017` (type, refs, effects), `opt_leaf_o1`.
