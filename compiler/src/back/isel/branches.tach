@@ -8,8 +8,8 @@ use crate::base::die;
 use crate::base::target::X86;
 use crate::front::types::{TY_U64, is_float, is_vector};
 use crate::middle::ir::{
-    ARGS, ARGTY, BLOCKS, Cond, INSTS, IRFUNCS, Term, ir_append, ir_arg, ir_make, ir_set_arg,
-    ir_unlink, ir_val,
+    ARGS, ARGTY, BLOCKS, Cond, INSTS, IRFUNCS, Op, Term, ir_append, ir_arg, ir_insert_before,
+    ir_make, ir_replace, ir_set_arg, ir_unlink, ir_val,
 };
 use crate::middle::ir::Op::{Cmp, Conv, Div, Phi, Rem, Select};
 use crate::middle::ir::cfg::pred_index;
@@ -68,6 +68,59 @@ fn is_arm(b: i64, h: i64) -> bool {
     unsafe {
         BLOCKS[b].preds.count == 1 && BLOCKS[b].preds.data[0] == h && BLOCKS[b].term == Term::Jump
     }
+}
+
+// (0.15) The middle end's selects (SEL k, x, y: made by if-conversion in
+// loops) become SELECTs: on the comparison k when it is one (an integer
+// one on x86-64), else on k != 0.
+pub fn lower_sels(fi: i64) -> bool {
+    let mut changed = false;
+    unsafe {
+        for i in 0..IRFUNCS[fi].blocks.count {
+            let b = IRFUNCS[fi].blocks.data[i];
+            if BLOCKS[b].removed != 0 {
+                continue;
+            }
+            let mut v = BLOCKS[b].first;
+            while v != 0 {
+                let next = INSTS[v].next;
+                if INSTS[v].op == Op::Sel {
+                    let cond = ir_val(INSTS[v].a);
+                    let mut lhs = cond;
+                    let mut rhs = 0;
+                    let mut imm = 0;
+                    let mut cmp_ty = TY_U64;
+                    let mut op = Cond::Ne;
+                    if INSTS[cond].op == Cmp && !(is_float(INSTS[cond].imm2) && X86) {
+                        cmp_ty = INSTS[cond].imm2;
+                        lhs = ir_val(INSTS[cond].a);
+                        rhs = ir_val(INSTS[cond].b);
+                        op = INSTS[cond].cond;
+                        let mut value = 0;
+                        if isel_const(rhs, &value) && fits_cmp_imm(value) {
+                            rhs = 0;
+                            imm = value;
+                        }
+                    }
+                    let sel = ir_make(Select, INSTS[v].ty, ir_val(INSTS[v].b), ir_val(INSTS[v].c),
+                        imm);
+                    INSTS[sel].cond = op;
+                    INSTS[sel].imm2 = cmp_ty;
+                    INSTS[sel].args = ARGS.count;
+                    ARGS.push(lhs);
+                    ARGTY.push(0);
+                    ARGS.push(rhs);
+                    ARGTY.push(0);
+                    INSTS[sel].nargs = 2;
+                    ir_insert_before(v, sel);
+                    ir_replace(v, sel);
+                    changed = true;
+                }
+                v = next;
+            }
+        }
+    }
+    changed
 }
 
 // Turns small diamonds and triangles into selects; returns whether any was.

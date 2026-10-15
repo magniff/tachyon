@@ -6,10 +6,12 @@
 
 use crate::front::types::{
     TY_BOOL, TY_F32, TY_F64, TY_I16, TY_I32, TY_I64, TY_I8, TY_U16, TY_U32, TY_U64, TY_U8, int_bits,
-    is_float, is_integer, type_size, vector_type,
+    is_float, is_integer, is_signed, type_size, vector_type,
 };
 use crate::middle::fold::is_const;
-use crate::middle::ir::{BLOCKS, INSTS, Op, Term, ir_arg, ir_val};
+use crate::middle::ir::{
+    BLOCKS, Cond, INSTS, Op, Term, ir_arg, ir_operand, ir_operand_count, ir_val,
+};
 use crate::middle::ir::Op::{
     Add, And, Const, Conv, Div, Load, Mul, Neg, Or, Phi, Shl, Store, Sub, Xor,
 };
@@ -231,6 +233,20 @@ pub fn analyze(l: i64, exit: *i64) -> bool {
                     return false;
                 }
                 let op = INSTS[next].op;
+                // (0.15) A minimum or maximum: k ? z : r (or k ? r : z), k an
+                // ordered comparison of r and z, signed (vector comparisons
+                // are).
+                if op == Op::Sel {
+                    if !is_minmax(phi, next) || !use_elem(INSTS[phi].ty) {
+                        return false;
+                    }
+                    set_class(phi, VC_VECTOR);
+                    V_REDS.push(phi);
+                    V_REDS.push(next);
+                    V_REDS.push(op as i64);
+                    phi = INSTS[phi].next;
+                    continue;
+                }
                 if op != Add && op != Sub && op != Mul && op != And && op != Or && op != Xor {
                     return false;
                 }
@@ -281,7 +297,10 @@ pub fn analyze(l: i64, exit: *i64) -> bool {
         // phis).
         for r in 0..V_REDS.count / 3 {
             let p = V_REDS.data[3 * r];
-            if !only_used_by(l, p, V_REDS.data[3 * r + 1]) {
+            let next = V_REDS.data[3 * r + 1];
+            // (a minimum's phi is compared too)
+            let also = if INSTS[next].op == Op::Sel { ir_val(INSTS[next].a) } else { next };
+            if !uses_only(l, p, next, also) {
                 return false;
             }
         }
@@ -330,34 +349,6 @@ pub fn loads_in(l: i64, v: i64) -> bool {
     }
 }
 
-// Whether every use of v inside loop l is instruction u (or the phi it
-// came from).
-fn only_used_by(l: i64, v: i64, u: i64) -> bool {
-    unsafe {
-        for k in 0..V_CHAIN.count {
-            let mut x = BLOCKS[V_CHAIN.data[k]].first;
-            while x != 0 {
-                if x != u {
-                    let n = if INSTS[x].op == Phi { 3 + INSTS[x].nargs } else { 3 };
-                    for i in 0..n {
-                        let w = if i == 0 { INSTS[x].a } else if i == 1 { INSTS[x].b }
-                            else if i == 2 { INSTS[x].c } else { ir_arg(x, i - 3) };
-                        if w != 0 && ir_val(w) == v {
-                            return false;
-                        }
-                    }
-                }
-                x = INSTS[x].next;
-            }
-            let b = V_CHAIN.data[k];
-            if BLOCKS[b].cond != 0 && ir_val(BLOCKS[b].cond) == v {
-                return false;
-            }
-        }
-        true
-    }
-}
-
 // The reduction (index) whose next value is w, or -1.
 pub fn reduction_of_next(w: i64) -> i64 {
     unsafe {
@@ -380,6 +371,82 @@ fn is_check(c: i64) -> bool {
             k += 3;
         }
         false
+    }
+}
+
+// (0.15) Whether next, the next value of header phi r, is k ? z : r or
+// k ? r : z with k a signed ordered comparison of r and z (either way):
+// a maximum or a minimum.
+pub fn is_minmax(r: i64, next: i64) -> bool {
+    unsafe {
+        if INSTS[next].op != Op::Sel {
+            return false;
+        }
+        let k = ir_val(INSTS[next].a);
+        if INSTS[k].op != Op::Cmp || INSTS[k].cond == Cond::Eq || INSTS[k].cond == Cond::Ne
+            || !is_integer(INSTS[k].imm2) || !is_signed(INSTS[k].imm2)
+            || INSTS[k].imm2 != INSTS[r].ty {
+            return false;
+        }
+        let x = ir_val(INSTS[k].a);
+        let y = ir_val(INSTS[k].b);
+        if (x == r) == (y == r) {
+            return false;
+        }
+        let z = if x == r { y } else { x };
+        let p = ir_val(INSTS[next].b);
+        let q = ir_val(INSTS[next].c);
+        (p == r && q == z) || (p == z && q == r)
+    }
+}
+
+// (0.15) Whether every use of v inside loop l is instruction u or w (no
+// terminator's).
+fn uses_only(l: i64, v: i64, u: i64, w: i64) -> bool {
+    unsafe {
+        for k in 0..V_CHAIN.count {
+            let b = V_CHAIN.data[k];
+            let mut x = BLOCKS[b].first;
+            while x != 0 {
+                if x != u && x != w {
+                    for i in 0..ir_operand_count(x) {
+                        let o = ir_operand(x, i);
+                        if o != 0 && ir_val(o) == v {
+                            return false;
+                        }
+                    }
+                }
+                x = INSTS[x].next;
+            }
+            if BLOCKS[b].cond != 0 && ir_val(BLOCKS[b].cond) == v {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// (0.15) Whether comparison v is used inside loop l only as the condition
+// of selects (a mask).
+fn only_select_conditions(l: i64, v: i64) -> bool {
+    unsafe {
+        for k in 0..V_CHAIN.count {
+            let b = V_CHAIN.data[k];
+            let mut x = BLOCKS[b].first;
+            while x != 0 {
+                for i in 0..ir_operand_count(x) {
+                    let o = ir_operand(x, i);
+                    if o != 0 && ir_val(o) == v && (INSTS[x].op != Op::Sel || i != 0) {
+                        return false;
+                    }
+                }
+                x = INSTS[x].next;
+            }
+            if BLOCKS[b].cond != 0 && ir_val(BLOCKS[b].cond) == v {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -432,6 +499,29 @@ fn classify(l: i64, v: i64, latch_cond: i64) -> bool {
         }
         let a = if INSTS[v].a != 0 { class_of(ir_val(INSTS[v].a)) } else { 0 };
         let b = if INSTS[v].b != 0 { class_of(ir_val(INSTS[v].b)) } else { 0 };
+        // (0.15) A comparison of vectors used only by selects: a mask
+        // (signed when ordered: the vector comparisons are).
+        if op == Op::Cmp && (a == VC_VECTOR || b == VC_VECTOR) {
+            let t = INSTS[v].imm2;
+            let cond = INSTS[v].cond;
+            if !is_integer(t) || (cond != Cond::Eq && cond != Cond::Ne && !is_signed(t))
+                || !use_elem(t) || !vector_operand_ok(l, INSTS[v].a)
+                || !vector_operand_ok(l, INSTS[v].b) || !only_select_conditions(l, v) {
+                return false;
+            }
+            set_class(v, VC_VECTOR);
+            return true;
+        }
+        // (0.15) A select on a mask.
+        if op == Op::Sel {
+            let k = ir_val(INSTS[v].a);
+            if a != VC_VECTOR || INSTS[k].op != Op::Cmp || !use_elem(INSTS[v].ty)
+                || !vector_operand_ok(l, INSTS[v].b) || !vector_operand_ok(l, INSTS[v].c) {
+                return false;
+            }
+            set_class(v, VC_VECTOR);
+            return true;
+        }
         if a == VC_VECTOR || b == VC_VECTOR {
             let ty = INSTS[v].ty;
             let ok_op = op == Add || op == Sub || op == Mul || op == And || op == Or || op == Xor
