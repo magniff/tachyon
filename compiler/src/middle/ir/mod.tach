@@ -69,7 +69,7 @@ use Op::{
     Shl, Shr, Store, StoreX, Sub, Test, Ubfx, VBin, VCmp, VExt, VIns, VNeg, VSel, VSplat, VSum, Xor,
 };
 use crate::back::dwarf::DEBUG_INFO;
-use crate::base::{IntVec, alloc_array, free, grow};
+use crate::base::{IntVec, alloc_array, cstr, free, grow, realloc};
 use crate::front::lexer::Tok;
 use crate::front::types::{
     FN_COUNT, TY_BOOL, TY_U64, is_fieldless_enum, is_float, is_integer, is_vector, is_void,
@@ -270,6 +270,72 @@ pub fn ir_enter(fi: i64) {
 // caller. g is not the current function.
 pub fn ir_view(g: i64) -> IRTables {
     unsafe { IRFUNCS[g].t }
+}
+
+// (0.17) Gives back the room the current function's tables have beyond
+// what it uses (each table starts at 64 entries and doubles; a block's
+// predecessor list too): after the function is lowered, and at -O2 once
+// its component is optimized, the IR kept for later is its size.
+pub fn ir_shrink() {
+    unsafe {
+        INSTS = shrink_array(INSTS, INST_COUNT, &INST_CAP);
+        BLOCKS = shrink_array(BLOCKS, BLOCK_COUNT, &BLOCK_CAP);
+        SLOTS = shrink_array(SLOTS, SLOT_COUNT, &SLOT_CAP);
+        shrink_vec(&ARGS);
+        shrink_vec(&ARGTY);
+        shrink_vec(&SWCASES);
+        shrink_vec(&INST_LOC);
+        for b in 0..BLOCK_COUNT {
+            shrink_vec(&BLOCKS[b].preds);
+        }
+        shrink_vec(&IRFUNCS[IR_CUR].blocks);
+        shrink_vec(&IRFUNCS[IR_CUR].slots);
+    }
+}
+
+// An array of `count` used elements of capacity *cap, reallocated to its
+// size when the room left is worth it.
+fn shrink_array<T>(data: *T, count: i64, cap: *i64) -> *T {
+    unsafe {
+        if *cap <= count + count / 4 + 4 {
+            return data;
+        }
+        let n = if count < 1 { 1 } else { count };
+        let p = realloc(data as *u8, (n * size_of(T)) as u64);
+        if p == 0 as *u8 {
+            return data;
+        }
+        *cap = n;
+        p as *T
+    }
+}
+
+fn shrink_vec(v: *IntVec) {
+    unsafe {
+        if (*v).cap > 0 {
+            (*v).data = shrink_array((*v).data, (*v).count, &(*v).cap);
+        }
+    }
+}
+
+// (0.17) The room the IR's tables take (every function's, in bytes): for
+// --time-passes.
+pub fn ir_tables_bytes() -> i64 {
+    unsafe {
+        ir_save();
+        let mut total = 0;
+        for fi in 0..IRFUNC_COUNT {
+            let t = IRFUNCS[fi].t;
+            total += t.inst_cap * size_of(Inst) + t.block_cap * size_of(Block)
+                + t.slot_cap * size_of(Slot)
+                + (t.args.cap + t.argty.cap + t.swcases.cap + t.inst_loc.cap) * 8;
+            for b in 0..t.block_count {
+                total += t.blocks[b].preds.cap * 8;
+            }
+            total += (IRFUNCS[fi].blocks.cap + IRFUNCS[fi].slots.cap) * 8;
+        }
+        total
+    }
 }
 
 // The current function's tables, back into its IRFunc.
