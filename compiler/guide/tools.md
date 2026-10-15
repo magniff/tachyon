@@ -15,7 +15,9 @@ small queries.
 ## The loop
 
 1. Write the program; `tachyonc check` (the front end only: fast, every
-   error, one line each).
+   error, one line each). Before writing a construct you are unsure of,
+   `tachyonc guide --find WORDS` or `tachyonc guide TOPIC#SECTION`
+   prints the lines on it.
 2. Fix each error: `tachyonc query show FILE:LINE` prints the item at
    the error's position; `tachyonc edit patch` changes a few lines of it.
 3. `tachyonc fix` for the mechanical ones (missing `use` lines, unsafe
@@ -29,6 +31,31 @@ argument ending in `.tach`, `$TACHYON_ROOT`, or `./main.tach`. The other
 files are the modules it loads.
 
 ## Reading
+
+For an item you have not seen, ask `tachyonc query context NAME` first:
+one call gives its source, the signatures of what it calls and uses,
+and its callers (instead of `show`, then `def`, then `refs`):
+
+```text
+$ tachyonc query context parse_item
+// crate::parse_item  main.tach:5-9  effects: panic
+fn parse_item(sc: *Scanner) -> Option<Item> {
+    let name = sc.next_token()?;
+    ...
+}
+// calls (3)
+std::Scanner::next_token  <std>:2184:12  method  pub fn next_token(self: *Scanner) -> Option<[u8]>
+...
+// types (3)
+crate::Item  main.tach:3:8  struct  struct Item { name: [u8], qty: i64 }
+...
+// callers (1)
+main  main.tach:19:26  while let Some(it) = parse_item(&sc) {
+```
+
+(The fields are separated by TABs.) It stays within about 2,000 tokens
+(`--budget N`); a module's name gives its items and its most used
+bodies.
 
 | to | run |
 |---|---|

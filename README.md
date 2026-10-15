@@ -62,9 +62,11 @@ full grammar is in [docs/grammar.md](docs/grammar.md).
 ## Built for agents
 
 **The compiler teaches the language.** A newcomer has never seen tachyon,
-so `tachyonc guide` prints a reference sized for a context window (about
-5k tokens; `--list` for the topics): where tachyon differs from Rust,
-std's API generated from its source, the first errors with their fixes.
+so `tachyonc guide` prints a core sized for a context window (about 2k
+tokens): where tachyon looks like Rust and means something else, as
+paired Rust and tachyon lines, std's most used items, the first errors
+with their fixes. The rest is on demand: `guide TOPIC`, `guide --find
+WORDS`, `guide TOPIC#SECTION` (std's API is generated from its source).
 It is built into the compiler, so it matches its version, and every
 example in it is compiled and run by the test suite.
 

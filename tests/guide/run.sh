@@ -254,7 +254,7 @@ if ! "$COMPILER" guide --list >"$WORK/list" 2>&1; then
     result FAIL guide-list "tachyonc guide --list failed:" "$(cat "$WORK/list")"
 fi
 missing=""
-for t in core rust syntax types std errors unsafe c-interop modules generics traits closures iterators conversions formatting memory tools; do
+for t in core language rust syntax types std errors unsafe c-interop modules generics traits closures iterators conversions formatting memory tools; do
     awk -F '\t' -v t="$t" '$1 == t { found = 1 } END { exit !found }' "$WORK/list" || missing="$missing $t"
 done
 if [ -n "$missing" ]; then
@@ -272,18 +272,35 @@ while IFS= read -r t; do
     fi
 done <"$WORK/topics"
 
-# The default output is the core guide; it stays in its budget (about 7k
-# tokens, at 4 bytes a token).
+# The default output is the core guide; it stays in its budget (0.17:
+# about 2k tokens, 2.5k at most, at 4 bytes a token), without std's
+# listing (`guide std`).
 "$COMPILER" guide >"$WORK/default.md" 2>&1
 if ! cmp -s "$WORK/default.md" "$WORK/topic-core.md"; then
     result FAIL guide-default "tachyonc guide is not tachyonc guide core"
 else
     size=$(wc -c <"$WORK/default.md" | tr -d ' ')
-    if [ "$size" -gt 28672 ]; then
-        result FAIL guide-budget "the core guide is $size bytes, over 28672 (7k tokens): move detail to a topic"
+    if [ "$size" -gt 10240 ]; then
+        result FAIL guide-budget "the core guide is $size bytes, over 10240 (2.5k tokens): move detail to a topic (language, rust, errors...)"
+    elif grep -q 'fn with_capacity_in' "$WORK/default.md"; then
+        result FAIL guide-budget "the core guide holds std's listing: it belongs in guide std"
     else
         result pass guide-budget
     fi
+fi
+
+# --full (0.17) is the long form, topic language, with std's API in it.
+"$COMPILER" guide --full >"$WORK/full.md" 2>&1
+if [ "$(head -1 "$WORK/full.md")" = "$(head -1 "$WORK/topic-language.md")" ]; then
+    if grep -qF 'fn new_in(a: A) -> Vec<T, A>' "$WORK/full.md" \
+        && ! grep -qF 'fn new_in(a: A) -> Vec<T, A>' "$WORK/topic-language.md" \
+        && ! grep -q '@STD-API' "$WORK/full.md" "$WORK/topic-language.md"; then
+        result pass guide-full
+    else
+        result FAIL guide-full "tachyonc guide --full lacks std's API (or guide language has it)"
+    fi
+else
+    result FAIL guide-full "tachyonc guide --full does not start as guide language:" "$(head -2 "$WORK/full.md")"
 fi
 
 # A topic that does not exist: one line, and what to run.
