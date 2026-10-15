@@ -27,6 +27,7 @@ sed, head, cat or awk ([docs/query.md](docs/query.md)):
 | text that is not a name (a message, a comment), with its item | `target/tachyonc query grep TEXT` (`--comments`, `--strings`, `--code`, `--word`, `--in`) |
 | a module's section banners; one section | `target/tachyonc query items MODULE --comments`, `query show MODULE::section TITLE` |
 | the type of an expression | `target/tachyonc query type FILE:LINE:COL` |
+| what a function may do (allocate, io, panic, loop forever) | `target/tachyonc query effects NAME\|MODULE` (`--why EFFECT`: the chain; `--has alloc(Gpa)`: which still allocate) |
 | where it is defined, its signature | `target/tachyonc query def NAME` |
 | what a module contains | `target/tachyonc query items MODULE` |
 | the item at a compiler error's position | `target/tachyonc query show FILE:LINE` (`--with-comments`: its section comment too) |

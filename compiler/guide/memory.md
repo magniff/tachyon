@@ -21,8 +21,8 @@ fn lost(v: Vec<i64>) {                    // a copy of the handle
     w.push(2);                            // the caller's len does not change
 }
 
-fn main() -> i32 {
-    let mut v: Vec<i64> = Vec::new();
+fn main(gpa: Gpa) -> i32 {
+    let mut v: Vec<i64> = Vec::new_in(gpa);
     defer v.free();
     add_one(&v);
     add_one(&v);
@@ -41,8 +41,9 @@ fn main() -> i32 {
 ```
 
 Write functions that change a container to take `*Vec<T>` and pass
-`&v`; return a new container by value (`fn make() -> Vec<i64>`), which
-the caller then owns and frees.
+`&v`; return a new container by value (`fn make(gpa: Gpa) -> Vec<i64>`:
+making one takes an allocator, `guide allocators`), which the caller
+then owns and frees.
 
 ## Freeing: defer
 
@@ -54,17 +55,17 @@ run. They do not run on `exit` or a failed check (exit 101).
 ```tach
 use std::Buf;
 
-fn describe(n: i64) -> i64 {
-    let mut b = Buf::new();
+fn describe(n: i64, gpa: Gpa) -> i64 {
+    let mut b = Buf::new_in(gpa);
     defer b.free();                       // on every path out
     if n < 0 { return -1; }
     b.push_int(n);
     b.len()                               // computed before the free
 }
 
-fn main() -> i32 {
+fn main(gpa: Gpa) -> i32 {
     defer println("done");
-    std::print_int(describe(12345) + describe(-5));
+    std::print_int(describe(12345, gpa) + describe(-5, gpa));
     println("");
     0
 }
@@ -84,7 +85,7 @@ case in safe code (tachyon has no lifetimes yet). Take the slice again
 after pushing:
 
 ```tach
-let mut v: Vec<i64> = Vec::new();
+let mut v: Vec<i64> = Vec::new_in(gpa);
 defer v.free();
 v.push(1);
 let s = v.as_slice();

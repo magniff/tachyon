@@ -1456,10 +1456,24 @@ argument: `impl<T, A: Allocator> Vec<T, A>`.
 std's containers take their memory from an allocator, a type parameter:
 `Vec<T, A: Allocator = Gpa>`, `Buf<A>`, `HashMap<K, V, A>`. Allocation
 is explicit: nothing allocates without being given an allocator
-(`Vec::new_in(a)`, `collect_in(a)`, `format_in(x, a)`); `Vec::new()` is
-an error. A program's `Gpa` (C's malloc) is its main's parameter, `fn
-main(gpa: Gpa)`, passed down. `Allocator`, `Gpa`, `Arena`, `ScopedArena`
-and `arena_scope` are in the prelude (arenas: to come).
+(`Vec::new_in(a)`, `with_capacity_in(n, a)`, `filled_in(n, x, a)`,
+`Buf::new_in(a)`, `HashMap::new_in(a)`, `collect_in(a)`, `format_in(x,
+a)`, `read_stdin_in(a)`, `split_in(s, sep, a)`, `split_whitespace_in(s,
+a)`, `sort_stable_in(s, a)`, `sort_stable_by_in(s, f, a)`,
+`v.clone_in(b)`); 0.15's forms (`Vec::new()`, `collect()`,
+`format(x)`...) are errors naming the `_in` form. A program's `Gpa` (C's
+malloc) is its main's parameter, passed down:
+
+```ebnf
+main = "fn" "main" "(" [ "gpa" ":" "Gpa" ] ")" [ "->" type ] block
+     | "fn" "main" "(" "argc" ":" "i32" "," "argv" ":" "**u8" [ "," "gpa" ":" "Gpa" ] ")" [ "->" type ] block
+```
+
+(any parameter names; the `Gpa` parameter is last). `Allocator`, `Gpa`,
+`Arena`, `ScopedArena`, `arena_scope` and `format_in` are in the prelude
+(arenas: to come). `tachyonc fix --only alloc016` moves a 0.15 program
+over: the calls become their `_in` forms and `gpa: Gpa` is threaded
+from `main` to them ([refactor.md](refactor.md)).
 
 ### sealed, scoped
 

@@ -21,6 +21,7 @@ tachyonc query diff [ROOT]                                  the last journaled e
 tachyonc query refs NAME... [--root ROOT] [--exact] [--count] [--in FILE|MODULE] [--kind K,...] [--limit N] [--all]
 tachyonc query callers NAME... [--root ROOT] [--exact] [--count] [--in FILE|MODULE] [--limit N] [--all]
 tachyonc query callees FN... [--transitive] [--writes TABLE] [--count] [--limit N] [--all]   (0.16)
+tachyonc query effects NAME...|MODULE [--has EFFECT] [--why EFFECT]   (0.16) the inferred effects
 tachyonc query items [MODULE...] [--root ROOT] [--comments]
 tachyonc query show MODULE::section TITLE                   (0.13)
 tachyonc query grep PATTERN... [--in FILE|MODULE] [--code] [--comments] [--strings] [--word] [--count] [--limit N] [--all]
@@ -61,8 +62,9 @@ One line of grammar per kind of line (`\t` is a TAB; `[...]` optional):
 
 | command | line | grammar |
 |---|---|---|
-| def | definition | `PATH \t FILE:LINE:COL \t KIND \t SIGNATURE` |
-| show | header | `// PATH \t FILE:FIRST-LAST`, then the source lines, verbatim |
+| def | definition | `PATH \t FILE:LINE:COL \t KIND \t SIGNATURE [\t effects: SET]` |
+| show | header | `// PATH \t FILE:FIRST-LAST [\t effects: SET]`, then the source lines, verbatim |
+| effects (0.16) | function | `PATH \t SET`, then with `--why` its chain, indented two spaces |
 | show, > 5 matches | path | `PATH` (stdout), then `error query.ambiguous` |
 | refs, callers | file header | `# FILE` |
 | refs, callers | reference | `LINE:COL \t (def \| REFKIND \t ENCLOSING) [\t ->TARGET] \t SOURCE` |
@@ -408,6 +410,41 @@ functions reached ...)`.
 $ tachyonc query callees main --writes TABLE
 # calls016/table.tach
 8:14→borrow→main > add_and_sum > table::grow→put(&TABLE, x);
+```
+
+## effects (0.16)
+
+`effects NAME...` prints the effect set the front end inferred for each
+function NAME names (docs/design/effects-allocation.md §2.1; `guide
+effects`): `PATH \t SET`, the set written `alloc(Gpa, Arena) io global
+panic diverge unsafe` (that order; `alloc` alone for any allocator,
+`alloc(extern)` for C's; `none` for the empty set; ` (unknown)` after a
+set the front end could not infer, a body that failed to check). A
+generic function's line is each of its instances' (`apply<closure(i64)
+-> i64 at main.tach:47:32> \t panic`). A MODULE gives the functions of
+it and of the modules under it (the root's: not std's).
+
+- `--has EFFECT` keeps the functions whose set has EFFECT: `alloc` (any
+  allocator), `alloc(T)` (that allocator type, or any), `alloc(extern)`,
+  `io`, `global`, `panic`, `diverge`, `unsafe`, or `none` (the empty
+  set). `query effects crate --has alloc(Gpa)` finds what still
+  allocates from a Gpa.
+- `--why EFFECT` adds, under each function's line, why it has EFFECT:
+  the chain of calls down to the operation it starts at
+  (front/effects/why.tach), each line indented two spaces; `(not:
+  EFFECT)` when it has not.
+- An unknown EFFECT is `error query.usage` (exit 2).
+
+`def`, `show` and `context` add `effects: SET` to a function's line (a
+TAB before it): not for a generic function (its instances differ) nor a
+set that could not be inferred. The cache keeps the text per definition,
+so the warm answers stay as fast; `effects` without `--has` and `--why`
+is answered from it too.
+
+```
+$ tachyonc query effects total --why alloc
+crate::total→alloc(Gpa) panic
+  ...the chain...
 ```
 
 ## context (0.15)

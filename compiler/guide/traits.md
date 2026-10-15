@@ -51,14 +51,14 @@ impl Hash for V2 {
 trait Double { fn double(self: Self) -> Self; }
 impl Double for i64 { fn double(self: i64) -> i64 { self * 2 } }
 
-fn main() -> i32 {
+fn main(gpa: Gpa) -> i32 {
     let sq = Square { side: 3 };
     let r = Rect { w: 2, h: 5 };
     report(&sq);                          // &place: a temporary has no address
     report(&r);
     let v = V2 { x: 1, y: 2 } + V2 { x: 3, y: 4 };
     if v > (V2 { x: 0, y: 0 }) { std::print_int(v.x * 10 + v.y); }
-    let mut seen: HashMap<V2, bool> = HashMap::new();   // a struct key: Hash + Eq
+    let mut seen: HashMap<V2, bool> = HashMap::new_in(gpa);   // a struct key: Hash + Eq
     defer seen.free();
     seen.insert(v, true);
     if seen.contains(V2 { x: 4, y: 6 }) { print(" found "); }

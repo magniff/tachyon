@@ -9,7 +9,7 @@ optimized as if written by hand. No boxing, no dynamic dispatch.
 struct Stack<T> { items: Vec<T> }
 
 impl<T> Stack<T> {
-    fn new() -> Stack<T> { Stack { items: Vec::new() } }
+    fn new(gpa: Gpa) -> Stack<T> { Stack { items: Vec::new_in(gpa) } }
     fn push(self: *Stack<T>, x: T) { self.items.push(x); }
     fn pop(self: *Stack<T>) -> Option<T> { self.items.pop() }
     fn free(self: *Stack<T>) { self.items.free(); }
@@ -35,8 +35,8 @@ type Pair<T> = (T, T);
 
 fn sum_pair(p: Pair<i64>) -> i64 { p.0 + p.1 }
 
-fn main() -> i32 {
-    let mut s: Stack<i64> = Stack::new();
+fn main(gpa: Gpa) -> i32 {
+    let mut s: Stack<i64> = Stack::new(gpa);
     defer s.free();
     s.push(4);
     s.push(9);
@@ -60,10 +60,10 @@ fn main() -> i32 {
 ```
 
 - Type arguments: after a type's name (`Vec<i64>`, `Option<*u8>`), and in
-  expressions after `::` (`Vec::<u8>::new()`, `max::<i64>(a, b)`,
+  expressions after `::` (`Vec::<u8>::new_in(gpa)`, `max::<i64>(a, b)`,
   `Pair::<i64> { a: 1, b: 2 }`, a method's own: `x.m::<u8>()`). They are inferred
   from arguments and from the expected type (`let v: Vec<i64> =
-  Vec::new();`); unsuffixed literals are looked at last.
+  Vec::new_in(gpa);`); unsuffixed literals are looked at last.
 - A generic function used as a value needs its arguments:
   `let f = largest::<i64>;`.
 - Without bounds, a body is checked per instance: `a > b` works for

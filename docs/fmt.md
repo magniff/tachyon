@@ -91,6 +91,12 @@ Within that:
   are `name: value`, a default `x: i64 = 1`; `#[derive(Eq, Ord)]` as a
   call's arguments; closers of nested type arguments stay together
   (`Conv<Vec<i64>>>`).
+  (0.16) Effect attributes as calls: `#[effects(alloc(Gpa, extern),
+  panic)]`, `#[pure] #[no_alloc]` (attributes on one line stay on one,
+  a space between them); a bound `F: Fn(i64) -> i64 + effects(panic)`;
+  a default type parameter `struct Pair<T, U = i64>`. Inside type
+  arguments every `<` after a type's name opens more (`U = Vec< T >` is
+  `U = Vec<T>`).
 - **Blank lines**: at most one in a row; none at the start of the file,
   after an opening bracket or before a closing one; one between two items
   of a file, impl, trait, module or extern block when either is a
@@ -115,7 +121,10 @@ Within that:
   same way (more arguments, more `&&`) are joined to it first and filled
   again. A line with a token too long for any line (a long string) is left
   as it is. (0.15) No line is broken inside an f-string: a long one goes
-  on a line of its own, whole (after its call's `(`).
+  on a line of its own, whole (after its call's `(`). (0.16) Type
+  arguments and parameters count as a bracket level: a long `fn f<F: ...,
+  G: ...>(a: A, b: B)` breaks its parameter list first; broken inside
+  the `<..>`, after a `,`, the next line is one level in.
 
 ### Edits are formatted
 

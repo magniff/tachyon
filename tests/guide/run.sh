@@ -18,7 +18,8 @@
 #             it has a line starting `fn main(`; else items, when every
 #             line at column 0 starts an item (fn, struct, impl, use...),
 #             compiled with an empty main; else statements, compiled as
-#             main's body (leading `use` and `import` lines above it)
+#             main's body (leading `use` and `import` lines above it;
+#             0.16: main is `fn main(gpa: Gpa)`, its allocator `gpa`)
 #   ```in     right after a tach block: the program's stdin (else empty)
 #   ```out    after a tach block (and its in block): it is run, and its stdout and
 #             stderr together are this text (trailing blanks aside);
@@ -112,7 +113,8 @@ split_blocks() {
                     } else {
                         i = 1
                         while (i <= nbody && (b[i] ~ /^(use |import )/ || b[i] ~ /^[ \t]*$/)) { print b[i] > f; i++ }
-                        print "fn main() -> i32 {" > f
+                        # (0.16: the allocator of main, gpa, for the statements)
+                        print "fn main(gpa: Gpa) -> i32 {" > f
                         for (; i <= nbody; i++) print b[i] > f
                         print "0" > f
                         print "}" > f
@@ -310,7 +312,7 @@ fi
 # The std topic is std's API: every public item, as the compiler's item
 # index has it, is there (without `pub`).
 mkdir -p "$WORK/std"
-printf 'fn main() -> i32 {\n    let v: Vec<i64> = Vec::new();\n    0\n}\n' >"$WORK/std/main.tach"
+printf 'fn main(gpa: Gpa) -> i32 {\n    let v: Vec<i64> = Vec::new_in(gpa);\n    0\n}\n' >"$WORK/std/main.tach"
 if (cd "$WORK/std" && "$COMPILER" query items std --root main.tach) >"$WORK/std/items" 2>&1; then
     awk -F '\t' '$3 ~ /^pub / { s = $3; sub(/^pub /, "", s); print s }' "$WORK/std/items" >"$WORK/std/want"
     : >"$WORK/std/missing"
@@ -408,7 +410,7 @@ try_case() { # <name> <expected output> <snippet...>
 }
 try_case int 'i64 = 3' '1 + 2'
 try_case std 'Option<i64> = Some(42)' 'parse_int("42").ok()'
-try_case vec 'Vec<i64> = [4, 5]' 'let mut v: Vec<i64> = Vec::new(); v.push(4); v.push(5); v'
+try_case vec 'Vec<i64> = [4, 5]' 'let mut v: Vec<i64> = Vec::new_in(gpa); v.push(4); v.push(5); v'
 try_case output "hi
 [u8] = \"abc\"" 'println("hi"); "abc"'
 try_case item 'i64 = 49' 'fn sq(x: i64) -> i64 { x * x } sq(7)'
@@ -417,10 +419,10 @@ try_case unit '' 'let x = 3;'
 try_case error "snippet:2:5: error[type error] expected 'i64', got '[u8]'" 'let a = 1;
 a + "b"'
 try_case panic 'index out of bounds: index 3, length 0
-exit 101' 'let v: Vec<i64> = Vec::new(); v.get(3)'
+exit 101' 'let v: Vec<i64> = Vec::new_in(gpa); v.get(3)'
 printf 'struct P { x: i64 }\n\nlet p = P { x: 4 };\np.x * 10\n' >"$WORK/snip.tach"
 try_case file 'i64 = 40' --file "$WORK/snip.tach"
-got=$(printf '7\n' | "$COMPILER" try 'let mut b = Buf::new(); read_line(&b).unwrap(); parse_int(b.as_slice()).ok()' 2>&1)
+got=$(printf '7\n' | "$COMPILER" try 'let mut b = Buf::new_in(gpa); read_line(&b).unwrap(); parse_int(b.as_slice()).ok()' 2>&1)
 if [ "$got" = 'Option<i64> = Some(7)' ]; then result pass try-stdin; else result FAIL try-stdin "$got"; fi
 "$COMPILER" try >"$WORK/try.out" 2>&1
 rc=$?

@@ -136,8 +136,8 @@ buffers):
 import "stdio.h" as c;
 use std::Buf;
 
-fn main() -> i32 {
-    let mut line = Buf::new();
+fn main(gpa: Gpa) -> i32 {
+    let mut line = Buf::new_in(gpa);
     defer line.free();
     loop {
         let ch = unsafe { c::getchar() };
