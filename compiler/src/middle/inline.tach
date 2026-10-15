@@ -30,7 +30,7 @@ use crate::middle::ir::cfg::{
 };
 use crate::middle::loops::{LP_DEPTH, analyze_loops, block_array, innermost_loop};
 use crate::middle::lower::ssa::{SSA_STACK, ssa_undef};
-use crate::middle::opt::{optimize_after_inlining, resolve_all};
+use crate::middle::opt::{optimize_after_inlining, resolve_all, simplify_function};
 use crate::middle::profile::{is_cold_block, is_hot_count};
 
 const INLINE_SMALL: i64 = 30;
@@ -796,5 +796,151 @@ pub fn inlined_everywhere(fi: i64) -> bool {
     unsafe {
         let f = IRFUNCS[fi].f;
         fn_attr_inline(f) == 1 && FN_ADDRESS[fi] == 0 && !fn_is_global(f)
+    }
+}
+
+// ---- (0.17) -O1: small leaf functions ----
+
+// The largest leaf -O1 inlines (func_size, once simplified), and one with
+// `#[inline]`. (Measured, 0.17: at 6, -O1 has all the gains 8 to 12 give
+// on the benchmarks (matmul 2.5 times fewer instructions, iterchain 37%,
+// wordcount 10%, json 6% fewer), 5 fewer and 4 nearly none; the -O1
+// compile of the compiler costs 2% more at 6, 3% at 8, 4.6% at 10;
+// docs/optimizer.md.)
+const LEAF_SIZE: i64 = 6;
+const LEAF_HINTED: i64 = 40;
+
+// -O1's scalar pipeline (optimize_program), with the calls of small leaf
+// functions inlined first: a function with no calls, of at most LEAF_SIZE
+// instructions once simplified (LEAF_HINTED with `#[inline]`; never with
+// `#[inline(never)]` or `#[cold]`), so that Fmt's tiny methods, `len`,
+// `as_slice` and the like do not stay calls. The leaves are simplified
+// first, then each other function has their calls inlined and is
+// simplified; a leaf every call of which was inlined (its address not
+// taken, not global) is not emitted. -O2 inlines by its own cost model.
+pub fn simplify_inlining_leaves() {
+    unsafe {
+        let small = alloc_array::<i64>(IRFUNC_COUNT + 1);
+        let done = alloc_array::<i64>(IRFUNC_COUNT + 1);
+        for fi in 0..IRFUNC_COUNT {
+            small[fi] = 0;
+            done[fi] = 0;
+            if FN_LIVE[fi] == 0 || has_calls(fi) {
+                continue;
+            }
+            IRF = fi;
+            simplify_function(fi);
+            done[fi] = 1;
+            let f = IRFUNCS[fi].f;
+            let hint = fn_attr_inline(f);
+            if hint == HINT_NEVER || fn_attr_cold(f) || FNS[f].variadic {
+                continue;
+            }
+            let limit = if hint == HINT_ALWAYS { LEAF_HINTED } else { LEAF_SIZE };
+            if func_size(fi) <= limit {
+                small[fi] = 1;
+            }
+        }
+        for fi in 0..IRFUNC_COUNT {
+            if FN_LIVE[fi] == 0 || done[fi] != 0 {
+                continue;
+            }
+            IRF = fi;
+            if inline_leaf_calls(fi, small) {
+                optimize_after_inlining(fi);
+            } else {
+                simplify_function(fi);
+            }
+        }
+        // (the leaves no longer called)
+        for fi in 0..IRFUNC_COUNT {
+            done[fi] = 0;
+        }
+        for fi in 0..IRFUNC_COUNT {
+            if FN_LIVE[fi] == 0 {
+                continue;
+            }
+            for i in 0..IRFUNCS[fi].blocks.count {
+                let b = IRFUNCS[fi].blocks.data[i];
+                if BLOCKS[b].removed != 0 {
+                    continue;
+                }
+                let mut v = BLOCKS[b].first;
+                while v != 0 {
+                    let g = ir_callee(v);
+                    if g >= 0 {
+                        done[g] = 1;
+                    }
+                    if INSTS[v].op == Op::FAddr && FN_IR[INSTS[v].imm] != 0 {
+                        done[FN_IR[INSTS[v].imm] - 1] = 1;
+                    }
+                    v = INSTS[v].next;
+                }
+            }
+        }
+        for fi in 0..IRFUNC_COUNT {
+            if small[fi] != 0 && done[fi] == 0 && !fn_is_global(IRFUNCS[fi].f) {
+                FN_LIVE[fi] = 0;
+            }
+        }
+        free(small as *u8);
+        free(done as *u8);
+    }
+}
+
+// Whether function fi makes a call (direct or not).
+fn has_calls(fi: i64) -> bool {
+    unsafe {
+        for i in 0..IRFUNCS[fi].blocks.count {
+            let b = IRFUNCS[fi].blocks.data[i];
+            if BLOCKS[b].removed != 0 {
+                continue;
+            }
+            let mut v = BLOCKS[b].first;
+            while v != 0 {
+                if INSTS[v].op.is_call() {
+                    return true;
+                }
+                v = INSTS[v].next;
+            }
+        }
+        false
+    }
+}
+
+// Inlines function fi's calls of the functions `small` marks (leaves:
+// their copies make no calls), in one pass over its blocks; whether any
+// was. (None in a function that calls setjmp or the like: it keeps its
+// frame, see regalloc.tach.)
+fn inline_leaf_calls(fi: i64, small: *i64) -> bool {
+    unsafe {
+        let mut changed = false;
+        let mut i = 0;
+        // (a call's continuation block is appended: visited too)
+        while i < IRFUNCS[fi].blocks.count {
+            let b = IRFUNCS[fi].blocks.data[i];
+            i += 1;
+            if BLOCKS[b].removed != 0 || BLOCKS[b].loop_depth == 1 {
+                continue;
+            }
+            let mut v = BLOCKS[b].first;
+            while v != 0 {
+                let next = INSTS[v].next;
+                let g = ir_callee(v);
+                if g >= 0 && g != fi && small[g] != 0 && FN_LIVE[g] != 0 {
+                    if !changed && calls_returns_twice(fi) {
+                        return false;
+                    }
+                    inline_call(fi, v, g);
+                    changed = true;
+                    break;
+                }
+                v = next;
+            }
+        }
+        for k in 0..IRFUNCS[fi].blocks.count {
+            BLOCKS[IRFUNCS[fi].blocks.data[k]].loop_depth = 0;
+        }
+        changed
     }
 }
