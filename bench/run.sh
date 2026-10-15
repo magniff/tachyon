@@ -1,5 +1,5 @@
 #!/bin/sh
-# Benchmarks: every bench/*.tach (and examples/md5.tach over 8 MB) compiled
+# Benchmarks: every bench/*.tach (and examples/md5/main.tach over 8 MB) compiled
 # by tachyon at -O0, -O1 and -O2, by the previous release and the seed when
 # given, and the C equivalents (bench/*.c) by cc -O2. Prints the fastest of
 # RUNS runs of each, in milliseconds, and checks that all outputs agree;
@@ -94,8 +94,10 @@ printf "%-10s" "program"
 for v in $VARIANTS; do printf " %9s" "$v"; done
 printf " %9s\n" "cc -O2"
 
-for source in "$ROOT"/bench/*.tach "$ROOT/examples/md5.tach"; do
+for source in "$ROOT"/bench/*.tach "$ROOT/examples/md5/main.tach"; do
     name=$(basename "$source" .tach)
+    # (an example is a directory: its name)
+    [ "$name" = main ] && name=$(basename "$(dirname "$source")")
     input="$WORK/empty"
     [ "$name" = md5 ] && input="$WORK/md5.in"
     printf "%-10s" "$name"

@@ -185,12 +185,18 @@ check() { # <file> <level> <dir> [-g]
 cd "$ROOT" || exit 1
 list="$WORK/list"
 : >"$list"
-for f in tests/run/*.tach tests/run/*/main.tach examples/*.tach bench/*.tach compiler/src/main.tach; do
+for f in tests/run/*.tach tests/run/*/main.tach examples/*/main.tach examples/*/*/main.tach bench/*.tach compiler/src/main.tach; do
     [ -f "$f" ] || continue
+    case "$f" in examples/tools/*) continue ;; esac   # (their own runner)
     case "$f" in *"$FILTER"*) ;; *) continue ;; esac
     # Programs that fail to compile (or compile once --fix-imports or, 0.10,
     # --fix-unsafe has rewritten them, 0.8), or need C sources or a header.
     grep -q '// ERROR\|// CSOURCE\|// CHEADER\|// FIXIMPORTS\|// FIXUNSAFE' "$f" && continue
+    # (an example linked with C files of its own: its test case says so)
+    case "$f" in
+        examples/*) grep -l -x "// SOURCE: $f" tests/examples/*.test 2>/dev/null \
+            | xargs grep -q '^// CSOURCE' 2>/dev/null && continue ;;
+    esac
     echo "$f" >>"$list"
 done
 # The slots: JOBS of them, or (0.11) the ones $TACHYON_JOBSERVER shares

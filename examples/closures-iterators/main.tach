@@ -1,0 +1,147 @@
+// A log-file analyzer: reads an access log on stdin and prints a report,
+// almost every step a chain of iterator adapters and closures.
+//
+// A line is `TIME LEVEL SERVICE STATUS MILLIS PATH`, e.g.
+//   09:00:02 WARN api 429 3 /users
+// Blank lines and `#` comments are skipped; malformed lines are counted.
+use std::{HashMap, parse_int, read_stdin_in, split_whitespace_in};
+
+#[derive(Eq, Debug)]
+enum Level { Info, Warn, Error }
+
+struct Entry { time: [u8], level: Level, service: [u8], status: i64, millis: i64, path: [u8] }
+
+// Our own iterator: the lines of a text, as views of it (no copies).
+struct Lines { text: [u8], pos: i64 }
+
+impl Lines {
+    fn new(text: [u8]) -> Lines { Lines { text, pos: 0 } }
+}
+
+impl Iterator for Lines {
+    type Item = [u8];
+
+    fn next(self: *Lines) -> Option<[u8]> {
+        if self.pos >= self.text.len { return None; }
+        let start = self.pos;
+        while self.pos < self.text.len && self.text[self.pos] != '\n' { self.pos += 1; }
+        let line = self.text[start..self.pos];
+        self.pos += 1; // past the '\n'
+        Some(line)
+    }
+}
+
+fn parse_level(word: [u8]) -> Option<Level> {
+    if word == "INFO" { Some(Level::Info) }
+    else if word == "WARN" { Some(Level::Warn) }
+    else if word == "ERROR" { Some(Level::Error) }
+    else { None }
+}
+
+// `?` on an Option: any missing or malformed field makes the line None.
+fn parse_entry(line: [u8], gpa: Gpa) -> Option<Entry> {
+    let mut words = split_whitespace_in(line, gpa);
+    defer words.free();
+    if words.len() != 6 { return None; }
+    Some(Entry {
+        time: words.get(0),
+        level: parse_level(words.get(1))?,
+        service: words.get(2),
+        status: parse_int(words.get(3)).ok()?,
+        millis: parse_int(words.get(4)).ok()?,
+        path: words.get(5),
+    })
+}
+
+// A generic function taking a closure: how many entries match `pred`.
+fn count_where<F: Fn(Entry) -> bool>(entries: [Entry], pred: F) -> i64 {
+    entries.iter().filter(pred).count()
+}
+
+fn bar(n: i64) -> [u8] {
+    let bars = "##############################";
+    bars[..if n < bars.len { n } else { bars.len }]
+}
+
+fn main(gpa: Gpa) -> i32 {
+    let mut input = read_stdin_in(gpa).unwrap();
+    defer input.free();
+
+    // Parse: skip blanks and comments, keep good entries, count bad ones.
+    // The closure pushes to `entries` and bumps `bad`: both are `let mut`,
+    // so it captures them by reference.
+    let mut entries: Vec<Entry> = Vec::new_in(gpa);
+    defer entries.free();
+    let mut bad = 0;
+    Lines::new(input.as_slice())
+        .filter(|l| l.len > 0 && l[0] != '#')
+        .for_each(|l| {
+            match parse_entry(l, gpa) {
+                Some(e) => entries.push(e),
+                None => bad += 1,
+            }
+        });
+    let all = entries.as_slice();
+    println(f"{all.len} requests, {bad} malformed line(s) skipped");
+    if all.len == 0 { return 0; }
+
+    // Totals with consumers: count, sum, min, max, fold.
+    let errors = count_where(all, |e| e.level == Level::Error);
+    let warnings = count_where(all, |e| e.level == Level::Warn);
+    let total_ms = all.iter().map(|e| e.millis).sum();
+    let slowest = all.iter().map(|e| e.millis).max().unwrap_or(0);
+    let fastest = all.iter().map(|e| e.millis).min().unwrap_or(0);
+    let (ok, failed) = all.iter().fold((0, 0), |(ok, failed), e| {
+        if e.status < 400 { (ok + 1, failed) } else { (ok, failed + 1) }
+    });
+    println(f"levels: {errors} errors, {warnings} warnings");
+    println(f"status: {ok} ok, {failed} failed");
+    println(f"latency: min {fastest} ms, max {slowest} ms, mean {total_ms / all.len} ms");
+
+    // Questions: any, all, position.
+    let has_5xx = all.iter().any(|e| e.status >= 500);
+    let all_fast = all.iter().all(|e| e.millis < 1000);
+    println(f"any 5xx: {has_5xx}, all under a second: {all_fast}");
+    if let Some(i) = all.iter().position(|e| e.level == Level::Error) {
+        let e = all[i];
+        println(f"first error: request #{i + 1} at {e.time}, {e.service} {e.path} ({e.status})");
+    }
+
+    // A closure kept in a `let`, capturing `limit` by value (a copy).
+    let limit = 100;
+    let is_slow = |e: Entry| e.millis > limit;
+    let mut slow = all.iter().filter(is_slow).collect_in(gpa);
+    defer slow.free();
+    slow.sort_by(|a, b| b.millis.cmp(&a.millis)); // slowest first
+    println(f"slow requests (over {limit} ms): {slow.len()}, the top 3:");
+    for (rank, e) in slow.iter().enumerate().take(3) {
+        println(f"  {rank + 1}. {e.millis:>4} ms  {e.service:<5} {e.path}");
+    }
+
+    // Counting with a HashMap, then sorting its pairs: by requests, most
+    // first, then by name.
+    let mut per_service: HashMap<[u8], i64> = HashMap::new_in(gpa);
+    defer per_service.free();
+    for e in all { per_service.get_or_insert(e.service, 0)[0] += 1; }
+    let mut ranked = per_service.iter().collect_in(gpa);
+    defer ranked.free();
+    ranked.sort_by(|a, b| {
+        let (name_a, n_a) = *a; // a and b point into the Vec: *([u8], i64)
+        let (name_b, n_b) = *b;
+        if n_a != n_b { n_b - n_a } else { name_a.cmp(&name_b) }
+    });
+    println("requests per service:");
+    for (service, n) in ranked {
+        let mean = all.iter().filter(|e| e.service == service).map(|e| e.millis).sum() / n;
+        println(f"  {service:<6} {n:>3}  {bar(n):<6}  mean {mean} ms");
+    }
+
+    // Two iterators side by side: zip pairs each request with the next
+    // one (the shorter one, all[1..], ends the pairs).
+    let mut same_second = 0;
+    for (a, b) in all.iter().zip(all[1..].iter()) {
+        if a.time == b.time { same_second += 1; }
+    }
+    println(f"back-to-back requests in the same second: {same_second}");
+    0
+}

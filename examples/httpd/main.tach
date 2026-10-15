@@ -51,15 +51,7 @@ mod sys {
     pub enum System { Linux, MacArm, MacIntel }
 
     fn starts_with(s: [u8], prefix: [u8]) -> bool {
-        if s.len < prefix.len {
-            return false;
-        }
-        for i in 0..prefix.len {
-            if s[i] != prefix[i] {
-                return false;
-            }
-        }
-        true
+        s.len >= prefix.len && s[..prefix.len] == prefix
     }
 
     pub fn detect() -> System {
@@ -182,16 +174,7 @@ use sys::System;
 // ============================================================================
 
 fn ends_with(s: [u8], suffix: [u8]) -> bool {
-    if s.len < suffix.len {
-        return false;
-    }
-    let start = s.len - suffix.len;
-    for i in 0..suffix.len {
-        if s[start + i] != suffix[i] {
-            return false;
-        }
-    }
-    true
+    s.len >= suffix.len && s[s.len - suffix.len..] == suffix
 }
 
 // A path for C: its bytes and a NUL.
@@ -339,10 +322,6 @@ fn push_escaped(out: *Buf, s: [u8]) {
 // HTTP responses
 // ============================================================================
 
-fn eprint(s: [u8]) {
-    unsafe { write(2, s.ptr, s.len as u64); }
-}
-
 fn send_all(fd: i32, s: [u8]) {
     let mut sent = 0;
     while sent < s.len {
@@ -358,13 +337,9 @@ fn send_all(fd: i32, s: [u8]) {
 fn send_headers(fd: i32, status: [u8], content_type: [u8], length: Option<i64>, gpa: Gpa) {
     let mut h = Buf::new_in(gpa);
     defer h.free();
-    h.push_str("HTTP/1.0 ");
-    h.push_str(status);
-    h.push_str("\r\nContent-Type: ");
-    h.push_str(content_type);
+    h.push_fmt(f"HTTP/1.0 {status}\r\nContent-Type: {content_type}");
     if let Some(n) = length {
-        h.push_str("\r\nContent-Length: ");
-        h.push_int(n);
+        h.push_fmt(f"\r\nContent-Length: {n}");
     }
     h.push_str("\r\nConnection: close\r\n\r\n");
     send_all(fd, h.as_slice());
@@ -390,9 +365,8 @@ fn send_404(fd: i32, path: [u8], gpa: Gpa) {
 fn send_redirect(fd: i32, location: [u8], gpa: Gpa) {
     let mut h = Buf::new_in(gpa);
     defer h.free();
-    h.push_str("HTTP/1.0 301 Moved Permanently\r\nLocation: ");
-    h.push_str(location);
-    h.push_str("\r\nConnection: close\r\n\r\n");
+    h.push_fmt(
+        f"HTTP/1.0 301 Moved Permanently\r\nLocation: {location}\r\nConnection: close\r\n\r\n");
     send_all(fd, h.as_slice());
 }
 
@@ -562,21 +536,17 @@ fn handle_request(fd: i32, system: System, root: [u8], gpa: Gpa) {
     let url = decoded.as_slice();
 
     // log the request on stderr
-    eprint(method);
-    eprint(" ");
-    eprint(url);
+    eprint(f"{method} {url}");
 
     let mut path = Path::join(root, url, gpa);
     defer path.free();
     match unsafe { probe(system, path.c()) } {
         Kind::Missing => {
-            eprint(" 404\n");
+            eprintln(" 404");
             send_404(fd, url, gpa);
         }
         Kind::File(size) => {
-            eprint(" 200 (");
-            eprint(guess_mime(path.bytes()));
-            eprint(")\n");
+            eprintln(f" 200 ({guess_mime(path.bytes())})");
             serve_file(fd, system, &path, size, gpa);
         }
         Kind::Dir => {
@@ -585,18 +555,18 @@ fn handle_request(fd: i32, system: System, root: [u8], gpa: Gpa) {
                 defer location.free();
                 location.push_str(url);
                 location.push('/');
-                eprint(" 301\n");
+                eprintln(" 301");
                 send_redirect(fd, location.as_slice(), gpa);
                 return;
             }
             let mut index = Path::join(path.bytes(), "index.html", gpa);
             defer index.free();
             if let Kind::File(size) = unsafe { probe(system, index.c()) } {
-                eprint(" 200 (index.html)\n");
+                eprintln(" 200 (index.html)");
                 serve_file(fd, system, &index, size, gpa);
                 return;
             }
-            eprint(" 200 (dir)\n");
+            eprintln(" 200 (dir)");
             serve_directory(fd, system, &path, url, gpa);
         }
     }
@@ -614,15 +584,13 @@ fn main(argc: i64, argv: **u8, gpa: Gpa) -> i32 {
     let root_c = &root_buf as *u8;
     if unsafe { argc < 2 || realpath(argv[1], root_c) as u64 == 0 } {
         if unsafe { getcwd(root_c, PATH_MAX as u64) as u64 == 0 } {
-            eprint("error: cannot get cwd\n");
+            eprintln("error: cannot get cwd");
             return 1;
         }
     }
     let root = unsafe { sys::cstr(root_c) };
 
-    eprint("Serving ");
-    eprint(root);
-    eprint("\n");
+    eprintln(f"Serving {root}");
 
     match sys::listen_tcp(system, LOCALHOST, PORT) {
         Err(message) => {
@@ -630,7 +598,7 @@ fn main(argc: i64, argv: **u8, gpa: Gpa) -> i32 {
             1
         }
         Ok(server) => {
-            eprint("Serving HTTP on http://127.0.0.1:8000/ ...\n");
+            eprintln("Serving HTTP on http://127.0.0.1:8000/ ...");
             loop {
                 let fd = unsafe { accept(server, 0 as *u8, 0 as *u32) };
                 if fd >= 0 {

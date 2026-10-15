@@ -95,7 +95,8 @@ check roundtrip "$([ "$n" = 0 ] && echo 1)" \
 $(cat "$WORK/fmt.out")"
 
 # compiles
-programs=$(ls tests/run/*.tach tests/run/*/main.tach examples/*.tach bench/*.tach 2>/dev/null)
+# (examples/tools/ has its own runner, and programs that do not compile)
+programs=$(ls tests/run/*.tach tests/run/*/main.tach examples/*/main.tach examples/*/*/main.tach bench/*.tach 2>/dev/null | grep -v '^examples/tools/')
 mkdir -p "$WORK/c"
 printf '%s\n' $programs compiler/src/main.tach | awk -v w="$WORK/c" '{ print NR " " $0 }' >"$WORK/list"
 compile_one() { # <n> <program>

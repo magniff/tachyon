@@ -15,9 +15,10 @@
 #   -q        print only the summary
 #
 # The corpus: tests/run/*.tach and the multi-module tests/run/*/main.tach,
-# examples/*.tach, bench/*.tach, the random programs (every mode of
-# tests/fuzz/gen.awk), the C interop programs (tests/abi/gen.awk; half of
-# them through import, the others also through --emit-header), and the
+# examples/*/main.tach and examples/*/*/main.tach (not examples/tools/),
+# bench/*.tach, the random programs (every mode of tests/fuzz/gen.awk),
+# the C interop programs (tests/abi/gen.awk; half of them through import,
+# the others also through --emit-header), and the
 # compiler's source in this tree and at the last release tag (its 0.2-style
 # C declarations, `extern fn`, turned into extern "C" blocks, which both
 # compilers accept). Each is compiled for every target at -O0,
@@ -171,9 +172,12 @@ program() { # name files...
         done
     done
 }
-for f in "$ROOT"/tests/run/*.tach "$ROOT"/examples/*.tach "$ROOT"/bench/*.tach \
-    "$DIR"/corpus/fuzz/*.tach "$DIR"/corpus/abi/*.tach; do
+for f in "$ROOT"/tests/run/*.tach "$ROOT"/examples/*/main.tach "$ROOT"/examples/*/*/main.tach \
+    "$ROOT"/bench/*.tach "$DIR"/corpus/fuzz/*.tach "$DIR"/corpus/abi/*.tach; do
     [ -f "$f" ] || continue
+    # (the tools' walkthroughs have their own runner, and programs that do
+    # not compile on purpose)
+    case $f in "$ROOT"/examples/tools/*) continue ;; esac
     base=$(basename "$(dirname "$f")")-$(basename "$f" .tach)
     program "$base" "$f"
     add "$base.tokens" --tokens "$f"
