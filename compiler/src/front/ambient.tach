@@ -1,0 +1,101 @@
+// Explicit allocation (0.16, the user's decision U1): nothing allocates
+// without being given an allocator. A program's general-purpose
+// allocator is the `gpa: Gpa` its `fn main(gpa: Gpa)` takes (main_gpa),
+// passed down as a parameter; std has no ambient allocator: `Vec::new()`,
+// `Buf::new()`, `HashMap::new()`, `collect()`, `format(x)`, `read_stdin()`,
+// `split(..)`, `sort_stable(..)` are errors with the `_in` form to write
+// instead (`Vec::new_in(gpa)`).
+//
+// Those functions are still in std, marked `#[ambient("Vec::new_in(gpa)")]`
+// (the attribute is std's: their try text), for one reason: the test
+// corpus of 0.15 (tests, examples, bench, the guide, the eval tasks) is
+// migrated by `tachyonc fix --only alloc016` (0.16 T5); until it is,
+// `--ambient-gpa` or TACHYON_AMBIENT_GPA=1 (the test runners set it)
+// allows them. Both go before the release, with the functions.
+
+use crate::base::intern_c;
+use crate::base::diag::{err_begin, err_end_soft, err_help, err_str, err_sym};
+use crate::front::ast::{
+    FN_AMBIENT, FN_SIG_FAILED, NODES, NODE_IMPLICIT, NodeKind, child, list_begin, list_end,
+    list_push, new_node,
+};
+use crate::front::modules::{CUR_MOD, STD_MODULE};
+use crate::front::types::{FNS, FN_COUNT, STRUCTS, TLISTS, TYPES, TyKind};
+use crate::middle::lower::ssa::HMap;
+
+// --ambient-gpa, TACHYON_AMBIENT_GPA=1 (--no-ambient-gpa: off).
+pub static mut AMBIENT_GPA: bool = false;
+// The start position of an #[ambient("...")] function + 1 -> the symbol of
+// its text + 1 (copies of a function, instances and trait defaults, have
+// its start).
+pub static mut AMBIENT_TRY: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+// Call n of function f: an error when f is one of std's ambient functions
+// and the caller is not std (and --ambient-gpa is off).
+pub fn check_ambient_call(n: i64, f: i64) {
+    unsafe {
+        let node = FNS[f].node;
+        if (NODES[node].p & FN_AMBIENT) == 0 || AMBIENT_GPA || CUR_MOD == STD_MODULE {
+            return;
+        }
+        let text = AMBIENT_TRY.get(NODES[node].start + 1) - 1;
+        err_begin(NODES[n].start);
+        err_str(c"allocation is explicit: pass an allocator");
+        if text >= 0 {
+            err_str(c" (try: ");
+            err_sym(text);
+            err_str(c")");
+        }
+        err_help(c"a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)' and is passed down as a parameter");
+        err_end_soft();
+    }
+}
+
+// `fn main(gpa: Gpa)` (called once the signatures are resolved, before
+// main_result_wrapper): the program's general-purpose allocator, made by
+// the runtime's entry. Its body becomes `{ let gpa: Gpa = Gpa {}; body }`
+// (the literal flagged NODE_IMPLICIT: the one Gpa made outside std, which
+// #[sealed] lets through) and main takes no parameter, as C's entry.
+pub fn main_gpa() {
+    unsafe {
+        let main = intern_c(c"main");
+        let gpa = intern_c(c"Gpa");
+        for f in 0..FN_COUNT {
+            let node = FNS[f].node;
+            if FNS[f].name != main || NODES[node].kind != NodeKind::Fn || NODES[node].d != 0
+                || NODES[node].h != 0 || (NODES[node].p & FN_SIG_FAILED) != 0
+                || FNS[f].generic != 0 || FNS[f].tmpl != 0 || FNS[f].param_count != 1 {
+                continue;
+            }
+            let t = TLISTS.data[FNS[f].params];
+            if TYPES[t].kind != TyKind::Struct || STRUCTS[TYPES[t].a].name != gpa
+                || STRUCTS[TYPES[t].a].module != STD_MODULE {
+                continue;
+            }
+            let param = child(node, 0);
+            let (start, end) = (NODES[param].start, NODES[param].end);
+            let lit = new_node(NodeKind::StructLit, start, end);
+            NODES[lit].a = gpa;
+            NODES[lit].p = NODE_IMPLICIT;
+            let none = list_begin();
+            list_end(lit, none);
+            let bind = new_node(NodeKind::PatBind, start, end);
+            NODES[bind].a = NODES[param].a;
+            NODES[bind].b = NODES[param].c;
+            let binding = new_node(NodeKind::Let, start, end);
+            NODES[binding].a = bind;
+            NODES[binding].b = NODES[param].b;
+            NODES[binding].c = lit;
+            let body = NODES[node].c;
+            let block = new_node(NodeKind::Block, NODES[body].start, NODES[body].end);
+            NODES[block].a = body;
+            let mark = list_begin();
+            list_push(binding);
+            list_end(block, mark);
+            NODES[node].c = block;
+            let empty = list_begin();
+            list_end(node, empty);
+            FNS[f].param_count = 0;
+        }
+    }
+}

@@ -5,7 +5,7 @@
 $ check --json
 $ query def add --json
 crate::add	main.tach:3:4	fn	fn add(a: i64, b: i64) -> i64
-std::Add::add	<std>:385:20	trait-method	fn add(self: Self, other: Self) -> Self
+std::Add::add	<std>:398:20	trait-method	fn add(self: Self, other: Self) -> Self
 ## (quotes and tabs escaped)
 $ query grep bad --json
 # main.tach

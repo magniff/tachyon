@@ -121,17 +121,18 @@ impl<T, A: Allocator> Vec<T, A> {
         Vec { ptr: 0 as *T, len: 0, cap: 0, alloc: a }
     }
 
-    pub fn with_capacity(cap: i64) -> Vec<T, A> {
-        let mut v: Vec<T, A> = Vec::new();
+    // An empty Vec on allocator a with room for cap elements (0.16).
+    pub fn with_capacity_in(cap: i64, a: A) -> Vec<T, A> {
+        let mut v: Vec<T, A> = Vec::new_in(a);
         v.reserve(cap);
         v
     }
 
-    // (0.15) n copies of x: Rust's `vec![x; n]`. x is copied as it is, not
-    // cloned: n Vecs from one non-empty Vec would share its elements (push
-    // `Vec::new()` n times instead).
-    pub fn filled(n: i64, x: T) -> Vec<T, A> {
-        let mut v: Vec<T, A> = Vec::with_capacity(n);
+    // (0.15) n copies of x on allocator a: Rust's `vec![x; n]`. x is copied
+    // as it is, not cloned: n Vecs from one non-empty Vec would share its
+    // elements (push `Vec::new_in(a)` n times instead).
+    pub fn filled_in(n: i64, x: T, a: A) -> Vec<T, A> {
+        let mut v: Vec<T, A> = Vec::with_capacity_in(n, a);
         for _ in 0..n {
             v.push(x);
         }
@@ -297,11 +298,22 @@ impl<T, A: Allocator> Vec<T, A> {
     }
 }
 
-// (0.16: only a Vec on a global allocator has `new`)
-impl<T, A: Allocator + GlobalAllocator> Vec<T, A> {
-    // An empty Vec on the global allocator (Gpa).
+// (0.16) The ambient constructors of 0.15, errors outside std: allocation
+// is explicit (front/ambient.tach; they go with --ambient-gpa).
+impl<T, A: Allocator + Ambient> Vec<T, A> {
+    #[ambient("Vec::new_in(gpa)")]
     pub fn new() -> Vec<T, A> {
-        Vec { ptr: 0 as *T, len: 0, cap: 0, alloc: A::global() }
+        Vec { ptr: 0 as *T, len: 0, cap: 0, alloc: A::ambient() }
+    }
+
+    #[ambient("Vec::with_capacity_in(cap, gpa)")]
+    pub fn with_capacity(cap: i64) -> Vec<T, A> {
+        Vec::with_capacity_in(cap, A::ambient())
+    }
+
+    #[ambient("Vec::filled_in(n, x, gpa)")]
+    pub fn filled(n: i64, x: T) -> Vec<T, A> {
+        Vec::filled_in(n, x, A::ambient())
     }
 }
 
@@ -369,9 +381,10 @@ impl<A: Allocator> Buf<A> {
     }
 }
 
-impl<A: Allocator + GlobalAllocator> Buf<A> {
+impl<A: Allocator + Ambient> Buf<A> {
+    #[ambient("Buf::new_in(gpa)")]
     pub fn new() -> Buf<A> {
-        Buf { bytes: Vec::new() }
+        Buf { bytes: Vec::new_in(A::ambient()) }
     }
 }
 
@@ -700,9 +713,20 @@ fn sift_down<T: Ord>(s: [T], start: i64, end: i64) {
 // ---- Stable sort (0.15) ----
 
 // Sorts s in place, smallest first, keeping equal elements in the order
-// they had (0.15): `sort_stable_by` with `|a, b| a.cmp(b)`.
+// they had (0.15), with a buffer from allocator a (0.16):
+// `sort_stable_by_in` with `|a, b| a.cmp(b)`.
+pub fn sort_stable_in<T: Ord, A: Allocator>(s: [T], a: A) {
+    sort_stable_by_in(s, |x: *T, y: *T| x.cmp(y), a);
+}
+
+#[ambient("sort_stable_in(s, gpa)")]
 pub fn sort_stable<T: Ord>(s: [T]) {
-    sort_stable_by(s, |a: *T, b: *T| a.cmp(b));
+    sort_stable_in(s, Gpa::ambient());
+}
+
+#[ambient("sort_stable_by_in(s, f, gpa)")]
+pub fn sort_stable_by<T, F: FnMut(*T, *T) -> i64>(s: [T], f: F) {
+    sort_stable_by_in(s, f, Gpa::ambient());
 }
 
 // The runs sort_stable_by sorts by insertion before merging them.
@@ -711,9 +735,10 @@ const STABLE_RUN: i64 = 16;
 // Sorts s in place by f (as sort_by: f(a, b) negative when *a goes before
 // *b), keeping equal elements in the order they had (0.15). A merge sort:
 // runs of 16 sorted by insertion, then merged in pairs through a buffer of
-// s.len elements, so O(n log n) comparisons. A `f` that is not a total
-// order leaves s in some order, never out of bounds.
-pub fn sort_stable_by<T, F: FnMut(*T, *T) -> i64>(s: [T], f: F) {
+// s.len elements from allocator a (0.16), so O(n log n) comparisons. A
+// `f` that is not a total order leaves s in some order, never out of
+// bounds.
+pub fn sort_stable_by_in<T, F: FnMut(*T, *T) -> i64, A: Allocator>(s: [T], f: F, a: A) {
     let mut g = f;
     let n = s.len;
     let mut lo = 0;
@@ -733,7 +758,7 @@ pub fn sort_stable_by<T, F: FnMut(*T, *T) -> i64>(s: [T], f: F) {
     if n <= STABLE_RUN {
         return;
     }
-    let mut buf: Vec<T> = Vec::with_capacity(n);
+    let mut buf: Vec<T, A> = Vec::with_capacity_in(n, a);
     // (every element of `to` is written before it is read)
     let mut from = s;
     let mut to = unsafe { buf.ptr[0..n] };
@@ -997,11 +1022,9 @@ impl<K: Hash + Eq, V, A: Allocator> HashMap<K, V, A> {
     }
 }
 
-impl<K: Hash + Eq, V, A: Allocator + GlobalAllocator> HashMap<K, V, A> {
+impl<K: Hash + Eq, V, A: Allocator + Ambient> HashMap<K, V, A> {
+    #[ambient("HashMap::new_in(gpa)")]
     pub fn new() -> HashMap<K, V, A> {
-        HashMap {
-            keys: 0 as *K, values: 0 as *V, states: 0 as *u8, cap: 0, len: 0, used: 0,
-            alloc: A::global(),
-        }
+        HashMap::new_in(A::ambient())
     }
 }

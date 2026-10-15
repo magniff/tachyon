@@ -7,7 +7,7 @@
 // braces of a body balance on its lines (tests/guide/run.sh compares the
 // result with the compiler's item index).
 
-use crate::base::{BUFS, buf_bytes, buf_clear, buf_new, buf_slice};
+use crate::base::{BUFS, IntVec, SYMS, buf_bytes, buf_clear, buf_new, buf_slice, intern};
 use crate::front::stdsrc::std_source;
 
 // Whether s starts with p.
@@ -131,10 +131,9 @@ pub fn std_api(out: i64, core: bool) {
     let text = buf_slice(src);
     let doc = buf_new();
     let decl = buf_new();
-    let mut impl_traits: Vec<[u8]> = Vec::new();
-    let mut impl_types: Vec<[u8]> = Vec::new();
-    defer impl_traits.free();
-    defer impl_types.free();
+    // (symbols: the compiler's source keeps off std's containers, 0.16)
+    let mut impl_traits = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    let mut impl_types = IntVec { data: 0 as *i64, count: 0, cap: 0 };
     let mut depth = 0;
     // In an impl of a type's own methods: its header, printed before its
     // first public method.
@@ -156,6 +155,7 @@ pub fn std_api(out: i64, core: bool) {
     // `(0.16`) are left out, as 0.15's were until its guide was made: the
     // allocators, arenas, Gpa (`tachyonc guide std` lists them).
     let mut skipping = false;
+    let mut hide_fn = false;
     let mut start = 0;
     if core {
         put_line(out, "", "// Signatures only; with their comments: tachyonc guide std.");
@@ -174,6 +174,24 @@ pub fn std_api(out: i64, core: bool) {
             skipping = find(t, "(0.16") >= 0;
         }
         if skipping {
+            continue;
+        }
+        // (0.16: std's ambient functions, errors outside std, are not
+        // in the core guide, and marked in `guide std`: front/ambient.tach)
+        if starts(t, "#[ambient(") {
+            if core {
+                hide_fn = true;
+            } else {
+                let what = t[11..t.len - 3];
+                buf_bytes(doc, "// (0.16) An error: allocation is explicit; write ");
+                buf_bytes(doc, what);
+                buf_bytes(doc, ".\n");
+            }
+            continue;
+        }
+        if hide_fn && (is_fn(t) || starts(t, "fn ")) {
+            hide_fn = false;
+            buf_clear(doc);
             continue;
         }
         if joining {
@@ -221,8 +239,8 @@ pub fn std_api(out: i64, core: bool) {
                 let head = signature(t);
                 if find(head, " for ") >= 0 {
                     let parts = trait_impl_parts(head);
-                    impl_traits.push(parts.0);
-                    impl_types.push(parts.1);
+                    impl_traits.push(intern(parts.0));
+                    impl_types.push(intern(parts.1));
                 } else {
                     in_impl = true;
                     impl_head = head;
@@ -286,8 +304,8 @@ pub fn std_api(out: i64, core: bool) {
         }
     }
     // The trait impls, by trait, in the order of their first impl.
-    let traits = impl_traits.as_slice();
-    let types = impl_types.as_slice();
+    let traits = unsafe { impl_traits.data[0..impl_traits.count] };
+    let types = unsafe { impl_types.data[0..impl_types.count] };
     if traits.len > 0 {
         put_line(out, "", "// Trait impls (their methods are the traits'):");
     }
@@ -302,13 +320,13 @@ pub fn std_api(out: i64, core: bool) {
             continue;
         }
         buf_bytes(out, "impl ");
-        buf_bytes(out, traits[i]);
+        buf_bytes(out, sym_text(traits[i]));
         buf_bytes(out, " for ");
         let mut sep = "";
         for j in i..traits.len {
             if traits[j] == traits[i] {
                 buf_bytes(out, sep);
-                buf_bytes(out, types[j]);
+                buf_bytes(out, sym_text(types[j]));
                 sep = ", ";
             }
         }
@@ -327,4 +345,8 @@ fn impl_type(h: [u8]) -> [u8] {
         i -= 1;
     }
     h
+}
+
+fn sym_text(s: i64) -> [u8] {
+    unsafe { SYMS[s].text }
 }

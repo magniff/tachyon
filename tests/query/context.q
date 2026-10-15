@@ -12,7 +12,7 @@ fn report(items: *Vec<Item>) -> i64 {
     total(items)
 }
 // calls (3)
-std::Vec::len	<std>:141:12	method	pub fn len(self: *Vec<T, A>) -> i64
+std::Vec::len	<std>:142:12	method	pub fn len(self: *Vec<T, A>) -> i64
 crate::stock::restock	context/stock.tach:10:8	fn	pub fn restock(items: *Vec<Item>, i: i64, n: i64)
 crate::stock::total	context/stock.tach:19:8	fn	pub fn total(items: *Vec<Item>) -> i64
 // types (2)
@@ -32,8 +32,8 @@ pub fn restock(items: *Vec<Item>, i: i64, n: i64) {
     }
 }
 // calls (2)
-std::Vec::set	<std>:230:12	method	pub fn set(self: *Vec<T, A>, i: i64, x: T)
-std::Vec::get	<std>:226:12	method	pub fn get(self: *Vec<T, A>, i: i64) -> T
+std::Vec::set	<std>:231:12	method	pub fn set(self: *Vec<T, A>, i: i64, x: T)
+std::Vec::get	<std>:227:12	method	pub fn get(self: *Vec<T, A>, i: i64) -> T
 // types (2)
 crate::stock::Item	context/stock.tach:4:12	struct	pub struct Item { pub name: [u8], pub count: i64 }
 std::Vec	<std>:116:12	struct	pub struct Vec<T, A: Allocator = Gpa> { ptr: *T, len: i64, cap: i64, alloc: A }
@@ -51,8 +51,8 @@ pub fn total(items: *Vec<Item>) -> i64 {
     t
 }
 // calls (2)
-std::Vec::len	<std>:141:12	method	pub fn len(self: *Vec<T, A>) -> i64
-std::Vec::get	<std>:226:12	method	pub fn get(self: *Vec<T, A>, i: i64) -> T
+std::Vec::len	<std>:142:12	method	pub fn len(self: *Vec<T, A>) -> i64
+std::Vec::get	<std>:227:12	method	pub fn get(self: *Vec<T, A>, i: i64) -> T
 // types (2)
 crate::stock::Item	context/stock.tach:4:12	struct	pub struct Item { pub name: [u8], pub count: i64 }
 std::Vec	<std>:116:12	struct	pub struct Vec<T, A: Allocator = Gpa> { ptr: *T, len: i64, cap: i64, alloc: A }
@@ -103,7 +103,7 @@ fn report(items: *Vec<Item>) -> i64 {
     total(items)
 }
 // calls (3)
-std::Vec::len	<std>:141:12	method	pub fn len(self: *Vec<T, A>) -> i64
+std::Vec::len	<std>:142:12	method	pub fn len(self: *Vec<T, A>) -> i64
 crate::stock::restock	context/stock.tach:10:8	fn	pub fn restock(items: *Vec<Item>, i: i64, n: i64)
 // callers (2)
 main	context/main.tach:21:13	let n = report(&items);

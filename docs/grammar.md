@@ -1453,10 +1453,12 @@ argument: `impl<T, A: Allocator> Vec<T, A>`.
 ### Allocators
 
 std's containers take their memory from an allocator, a type parameter:
-`Vec<T, A: Allocator = Gpa>`, `Buf<A>`, `HashMap<K, V, A>`. `Gpa` (C's
-malloc) is the default and the only global allocator: `Vec::new()` is
-on Gpa, `Vec::new_in(a)` on allocator `a`. `Allocator`, `Gpa`, `Arena`,
-`ScopedArena` and `arena_scope` are in the prelude (arenas: to come).
+`Vec<T, A: Allocator = Gpa>`, `Buf<A>`, `HashMap<K, V, A>`. Allocation
+is explicit: nothing allocates without being given an allocator
+(`Vec::new_in(a)`, `collect_in(a)`, `format_in(x, a)`); `Vec::new()` is
+an error. A program's `Gpa` (C's malloc) is its main's parameter, `fn
+main(gpa: Gpa)`, passed down. `Allocator`, `Gpa`, `Arena`, `ScopedArena`
+and `arena_scope` are in the prelude (arenas: to come).
 
 ### sealed, scoped
 
