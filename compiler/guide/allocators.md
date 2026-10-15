@@ -120,6 +120,8 @@ fn longest(words: [[u8]], gpa: Gpa) -> i64 {
 its own, never reused, so a use after free, a double free, a free of a
 wrong pointer or size stop the program with where the block was
 allocated and freed; leaks are listed at exit (`gpa.check_leaks()` in a
-test). Views (`as_slice()`, a `[T]`) into memory that was freed or
+test). Arenas and `FixedBuf` are checked the same way: a block
+used after their `reset`, after its scope ended, or after it moved is
+reported. Views (`as_slice()`, a `[T]`) into memory that was freed or
 moved are the one hole left in safe code (0.17 closes it); this mode is
 how to find one.

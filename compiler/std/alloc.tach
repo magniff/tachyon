@@ -113,8 +113,10 @@ pub struct Gpa {}
 // share the arena. `Arena::none()`, a constant (for statics), has no
 // memory: allocating from it stops the program.
 //
-// (--check-alloc routes each block to its own pages at the points marked
-// "check-alloc", keeping the accounting: T3.)
+// (--check-alloc, CHECK_ALLOC: each block is on pages of its own from the
+// checking Gpa, its owner the arena's state; the bump keeps the
+// accounting, so `used` and exhaustion are as without; a block given back
+// (free, a move, a reset, a scope's end, free_all) loses its pages.)
 #[sealed]
 pub struct Arena { s: *ArenaState }
 
@@ -152,6 +154,9 @@ struct ArenaState {
     large_bytes: i64,
     chunk_bytes: i64,
     next_size: i64,
+    // a scope's, with --check-alloc: the checking Gpa's blocks when it
+    // started (check_alloc_mark)
+    check_mark: i64,
 }
 
 // Requests above this get a chunk of their own.
@@ -176,7 +181,10 @@ fn arena_alloc(s: *ArenaState, size: i64, align: i64) -> *u8 {
             if (size as u64) <= (ARENA_LARGE as u64) && p >= s.ptr && e <= s.limit {
                 s.ptr = e;
                 s.last = p;
-                // (check-alloc: the block's own pages here)
+                if CHECK_ALLOC {
+                    // (the block's own pages; the bump keeps the count)
+                    return check_alloc_block(s.root as u64, size, align);
+                }
                 return p as *u8;
             }
         }
@@ -313,6 +321,9 @@ unsafe fn arena_large_free_to(root: *ArenaState, mark: *ArenaLarge) {
 #[inline]
 unsafe fn arena_resize(s: *ArenaState, p: *u8, old_size: i64, new_size: i64, align: i64)
     -> *u8 {
+    if CHECK_ALLOC {
+        return arena_resize_checked(s, p, old_size, new_size, align);
+    }
     if s != 0 as *ArenaState && p as i64 == s.last && (new_size as u64) <= (ARENA_LARGE as u64)
         && old_size <= ARENA_LARGE && p as i64 + new_size <= s.limit {
         s.ptr = p as i64 + new_size;
@@ -367,6 +378,25 @@ unsafe fn arena_resize_slow(s: *ArenaState, p: *u8, old_size: i64, new_size: i64
     q
 }
 
+// arena_resize with --check-alloc: the last block (the last live one of
+// the arena, as the bump's `last`) grows in place in the count and moves
+// to pages of its new size; any other as without.
+#[cold]
+#[inline(never)]
+unsafe fn arena_resize_checked(s: *ArenaState, p: *u8, old_size: i64, new_size: i64,
+    align: i64) -> *u8 {
+    if s != 0 as *ArenaState && s.last != -1 && (new_size as u64) <= (ARENA_LARGE as u64)
+        && old_size <= ARENA_LARGE && s.last + new_size <= s.limit
+        && check_alloc_is_last(s.root as u64, p) {
+        let q = check_alloc_moved(s.root as u64, p, old_size, new_size, align);
+        if q != 0 as *u8 {
+            s.ptr = s.last + new_size;
+        }
+        return q;
+    }
+    arena_resize_slow(s, p, old_size, new_size, align)
+}
+
 // An Arena's or a ScopedArena's free: the last block goes back to the
 // bump, a block of its own to Gpa; any other waits for the arena's end.
 // Nothing while the arena is lent to a scope.
@@ -377,6 +407,14 @@ unsafe fn arena_free(s: *ArenaState, p: *u8, size: i64) {
     }
     if size > ARENA_LARGE {
         arena_large_free(s.root, p);
+    } else if CHECK_ALLOC {
+        // (the last live block of the arena is the bump's last; the block's
+        // pages go)
+        if s.last != -1 && check_alloc_is_last(s.root as u64, p) {
+            s.ptr = s.last;
+            s.last = -1;
+        }
+        check_alloc_moved(s.root as u64, p, size, 0, 1);
     } else if p as i64 == s.last {
         s.ptr = s.last;
         s.last = -1;
@@ -440,6 +478,7 @@ impl Arena {
             s.large_bytes = 0;
             s.chunk_bytes = size;
             s.next_size = ARENA_NEXT;
+            s.check_mark = 0;
             Arena { s: s }
         }
     }
@@ -471,6 +510,9 @@ impl Arena {
         }
         arena_usable(s);
         arena_large_free_to(s, 0 as *ArenaLarge);
+        if CHECK_ALLOC {
+            check_alloc_release(s as u64, 0);
+        }
         let c = s.first;
         s.chunk = c;
         s.start = c as i64 + ARENA_CHUNK_HEAD + size_of(ArenaState);
@@ -491,6 +533,9 @@ impl Arena {
         }
         arena_usable(s);
         arena_large_free_to(s, 0 as *ArenaLarge);
+        if CHECK_ALLOC {
+            check_alloc_release(s as u64, 0);
+        }
         let g = Gpa {};
         let mut c = s.first.next;
         for _ in 0..ALLOC_LIMIT {
@@ -573,12 +618,16 @@ fn arena_scope_of<R, F: FnMut(ScopedArena) -> R>(p: *ArenaState, f: F) -> R {
         ptr: 0, limit: 0, chunk: 0 as *ArenaChunk, start: 0, end: 0, last: -1, before: 0,
         lent: false, root: 0 as *ArenaState, large_mark: 0 as *ArenaLarge,
         first: 0 as *ArenaChunk, large: 0 as *ArenaLarge, large_bytes: 0, chunk_bytes: 0,
-        next_size: 0,
+        next_size: 0, check_mark: 0,
     };
     let mark = unsafe { arena_lend(p, &st) };
+    let site = if CHECK_ALLOC { check_alloc_site() } else { 0 as *u8 };
     let mut g = f;
     let r = g(ScopedArena { s: &st, mark: mark });
     unsafe {
+        if CHECK_ALLOC {
+            check_alloc_set_site(site);
+        }
         arena_unlend(p, &st);
     }
     r
@@ -596,6 +645,9 @@ unsafe fn arena_lend(p: *ArenaState, st: *ArenaState) -> i64 {
     st.before = p.before;
     st.root = p.root;
     st.large_mark = p.root.large;
+    if CHECK_ALLOC {
+        st.check_mark = check_alloc_mark();
+    }
     p.lent = true;
     p.limit = 0;
     arena_used(st)
@@ -605,6 +657,10 @@ unsafe fn arena_lend(p: *ArenaState, st: *ArenaState) -> i64 {
 // where it was, is no longer lent (st's chunks are p's next ones).
 unsafe fn arena_unlend(p: *ArenaState, st: *ArenaState) {
     arena_large_free_to(p.root, st.large_mark);
+    if CHECK_ALLOC {
+        // (the scope's blocks, and its scopes': p was locked meanwhile)
+        check_alloc_release(p.root as u64, st.check_mark);
+    }
     st.lent = true;
     st.limit = 0;
     p.lent = false;
@@ -638,7 +694,10 @@ impl Allocator for FixedBuf {
             }
             h[0] = p + size - b;
             h[1] = p;
-            // (check-alloc: the block's own pages here)
+            if CHECK_ALLOC {
+                // (the block's own pages; the bump keeps the count)
+                return check_alloc_block(self.base as u64, size, align);
+            }
             p as *u8
         }
     }
@@ -651,6 +710,28 @@ impl Allocator for FixedBuf {
         }
         let h = (&self.base[-FIXED_HEAD]) as *i64;
         let b = self.base as i64;
+        if CHECK_ALLOC {
+            // (h[1] is the last block's place in the count; the block moves
+            // to pages of its new size)
+            let owner = self.base as u64;
+            if h[1] != -1 && h[1] + new_size <= b + self.cap && check_alloc_is_last(owner, p) {
+                let q = check_alloc_moved(owner, p, old_size, new_size, align);
+                if q != 0 as *u8 {
+                    h[0] = h[1] + new_size - b;
+                }
+                return q;
+            }
+            let q = self.try_alloc(new_size, align);
+            if q == 0 as *u8 {
+                return q;
+            }
+            let n = if old_size < new_size { old_size } else { new_size };
+            if n > 0 {
+                memcpy(q, p, n as u64);
+            }
+            check_alloc_moved(owner, p, old_size, 0, align);
+            return q;
+        }
         if p as i64 == h[1] && p as i64 + new_size <= b + self.cap {
             h[0] = p as i64 + new_size - b;
             return p;
@@ -672,6 +753,15 @@ impl Allocator for FixedBuf {
             return;
         }
         let h = (&self.base[-FIXED_HEAD]) as *i64;
+        if CHECK_ALLOC {
+            let owner = self.base as u64;
+            if h[1] != -1 && check_alloc_is_last(owner, p) {
+                h[0] = h[1] - self.base as i64;
+                h[1] = -1;
+            }
+            check_alloc_moved(owner, p, size, 0, align);
+            return;
+        }
         if p as i64 == h[1] {
             h[0] = p as i64 - self.base as i64;
             h[1] = -1;
@@ -709,6 +799,9 @@ impl FixedBuf {
             let h = (&self.base[-FIXED_HEAD]) as *i64;
             h[0] = 0;
             h[1] = -1;
+            if CHECK_ALLOC {
+                check_alloc_release(self.base as u64, 0);
+            }
         }
     }
 }
