@@ -79,6 +79,9 @@
 #                        files (with -I for its CHEADER) and FLAGS on its
 #                        command line, `-o prog`; no -lm added (tachyonc
 #                        links libm when the program calls into it)
+#   // NO-EXTRA-FLAGS: why (0.16) the case is built without
+#                        $TACHYON_TEST_FLAGS (its output differs by design
+#                        with them)
 #   // PROFILE: why      (0.10) at -O1 and -O2, the case is first compiled
 #                        with --profile-generate, run and checked; the
 #                        other directives then check it compiled with
@@ -87,7 +90,10 @@
 # directives (0.9's unsafe warnings are errors from 0.10; there are no
 # warnings at the moment).
 # Stdout is compared after removing trailing whitespace. Each program may
-# run for 20 seconds.
+# run for 20 seconds ($TACHYON_TEST_TIMEOUT: another limit, for a loaded
+# machine). $TACHYON_TEST_FLAGS (0.16): more compiler options for every
+# case but those with NO-EXTRA-FLAGS (the gate's examples-checkalloc
+# step: --check-alloc).
 
 set -u
 LC_ALL=C
@@ -98,7 +104,7 @@ COMPILER="$ROOT/target/tachyonc"
 CC=${CC:-cc}
 TARGET=""
 OPT=""
-TIMEOUT=20
+TIMEOUT=${TACHYON_TEST_TIMEOUT:-20}
 JOBS=""
 OUT=prog.o
 DIAG=human
@@ -264,6 +270,7 @@ read_directives() {
             else if (key == "WARNING") warnings = warnings value "\n"
             else if (key == "PROFILE") profile = 1
             else if (key == "LINK") link = 1
+            else if (key == "NO-EXTRA-FLAGS") noextra = 1
         }
         END {
             printf "%s", args > (dir "/args")
@@ -287,6 +294,7 @@ read_directives() {
             printf "%s", warnings > (dir "/warnings")
             printf "%d", profile > (dir "/profile")
             printf "%d", link > (dir "/link")
+            printf "%d", noextra > (dir "/noextra")
         }
     ' "$1"
 }
@@ -340,6 +348,10 @@ check_case() {
         : >"$dir/warnings"
     fi
     [ -s "$dir/warnings" ] && FLAGS="$DIAG_FLAG $(sed "s|@ROOT@|$ROOT|g" "$dir/flags")"
+    # (0.16: options for every case, from the environment)
+    if [ -n "${TACHYON_TEST_FLAGS:-}" ] && [ "$(cat "$dir/noextra")" != 1 ]; then
+        FLAGS="$FLAGS $TACHYON_TEST_FLAGS"
+    fi
     if [ -s "$dir/errors" ]; then
         # shellcheck disable=SC2086
         "$COMPILER" --target "$TARGET" $OPT $FLAGS "$source" -o "$dir/prog.s" >"$dir/compile.out" 2>&1

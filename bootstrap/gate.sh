@@ -59,6 +59,12 @@ export LC_ALL
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 MODE=default
+# (0.16) Each test program may run for a minute, not 20 s: the gate runs
+# its steps side by side with the containers, and the heavier examples
+# (algorithms at -O0) took longer than 20 s on a loaded machine. A hang
+# is still caught.
+TACHYON_TEST_TIMEOUT=${TACHYON_TEST_TIMEOUT:-60}
+export TACHYON_TEST_TIMEOUT
 LINUX=1
 # (0.15) x86_64: bootstrap/gate.conf's X86, then $TACHYON_GATE_X86, then
 # --no-x86/--with-x86
@@ -321,10 +327,10 @@ run_step() {
             # pages of their own, never reused): a use after free, a double
             # free or a wrong free in an example stops it, so one cannot
             # come back unnoticed (examples/errors-and-results had one).
-            w="$RUN/tachyonc-check-alloc"
-            printf '#!/bin/sh\nexec "%s" --check-alloc "$@"\n' "$C" >"$w"
-            chmod +x "$w"
-            sh "$ROOT/tests/run.sh" -c "$w" example >"$RUN/examples-checkalloc.out" 2>&1
+            # (a case whose output differs by design with the flag says
+            # NO-EXTRA-FLAGS; a checked program runs slower: 2 minutes)
+            TACHYON_TEST_FLAGS=--check-alloc TACHYON_TEST_TIMEOUT=120 \
+                sh "$ROOT/tests/run.sh" -c "$C" example >"$RUN/examples-checkalloc.out" 2>&1
             rc=$?
             cat "$RUN/examples-checkalloc.out"
             awk '$1 == "total" { printf "examples-checkalloc: %d passed, %d failed with --check-alloc\n", $2, $4 }' \

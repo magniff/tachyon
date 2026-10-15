@@ -1010,7 +1010,9 @@ built by `--check-alloc`, whose Gpa puts every block on pages of its own
 and never reuses them, so a use after free, a double free or a wrong free
 in an example stops it with where the block was allocated and freed;
 added after examples/errors-and-results printed an error holding a view
-of memory it had freed); and the two containers: `linux-x86_64`
+of memory it had freed; through `TACHYON_TEST_FLAGS=--check-alloc`, which
+a case whose output differs by design with the flag declines with `//
+NO-EXTRA-FLAGS: why`); and the two containers: `linux-x86_64`
 (`bootstrap/linux-check.sh`, which builds its own chain and so starts at
 once) and `linux-aarch64` (`bootstrap/aarch64-linux-check.sh --compiler`:
 the chain's compiler cross-compiles the tree). Inside each container the
@@ -1096,6 +1098,11 @@ file (`compiler/src/main.tach`) is the only file on the command line; a
 release without `root` (0.1.0 to 0.5.0) is compiled from all the `.tach`
 files of its `compiler` directory, as one module. The builder's `cli` says
 how to invoke the builder; the release's `root` says what to give it.
+
+From 0.16 the gate gives each test program a minute (`TACHYON_TEST_TIMEOUT`,
+60; tests/run.sh's own default stays 20 s): its steps run side by side
+with the Linux container, and the heavier examples at -O0 took longer
+than 20 s on a loaded machine (the examples-checkalloc step: 2 minutes).
 
 ## Adding a host
 
