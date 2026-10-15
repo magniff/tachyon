@@ -39,7 +39,8 @@ every function after every pass (on stderr).
 A function is a control flow graph of basic blocks. Instructions compute
 typed scalar values in SSA form; memory is explicit.
 
-- **Values** are instruction ids (`INSTS`). Types are the checker's scalar
+- **Values** are instruction ids (`INSTS`), local to their function (0.17:
+  each function has its own tables, see "0.17: compile time"). Types are the checker's scalar
   types (`i8` ... `u64`, `f32`, `f64`, `bool`); pointers, function values
   and the addresses of compound values (structs, tuples, arrays) are `u64`.
 - **Integers are canonical**: kept sign- or zero-extended to 64 bits, as in
@@ -126,7 +127,10 @@ The pipeline (`optimize_program` in `opt.tach`) runs the cleanup on
 every function, then the `-O1` pipeline twice per function, then at `-O2`
 inlining and LICM in call-graph order, each followed by the `-O1`
 pipeline, and finally drops functions nobody calls (other than `main` and
-those whose address is taken).
+those whose address is taken). From 0.17 each function is then selected,
+allocated, emitted and freed on its own (`emit_ir_functions`), and at
+`-O1` its cleanup and scalar pipeline run there too: one function is
+optimized and emitted end to end (see "0.17: compile time").
 
 ## The back end
 
@@ -1696,3 +1700,149 @@ one branch for the exit), `opt_u32_ops` (w registers, no `mov wN, wN`,
 against -O0), `opt_bits` (cnt, clz, rbit; constants folded; -O0's
 bodies), `opt_vectorize_widen` (umlal for `out[j] += k * b[j]` and a dot
 product).
+
+## 0.17: compile time
+
+The roadmap's compile-speed track, part 1: a profile of the compiler
+compiling itself, the hot spots that were repeated work fixed, and the
+middle and back end restructured so that each function is optimized and
+emitted on its own, with instruction, block and slot ids local to it:
+the prerequisite for per-function arenas and for code generation on
+several threads (0.18).
+
+**Method.** `sample` (macOS) on the self-compile (`-c
+compiler/src/main.tach`) at each level, three runs, shares of
+`compile_program`'s samples (inclusive); instructions retired and peak
+RSS from `/usr/bin/time -l`; `--time-passes` with `clock()` replaced by
+instructions retired (a C file defining `clock` from
+`proc_pid_rusage`, linked into a build of the compiler: `tachyonc
+compiler/src/main.tach iclock.c -o icount`) for each phase's
+instructions, which a loaded machine does not blur. `same-output`
+against the compiler before each change proved every change but two
+(see below) left the output of 6984 compilations as it was.
+
+**The hot spots** (share of the self-compile before, at the level where
+it was largest, and after):
+
+| # | where | before | why | fix | after |
+|---|---|---|---|---|---|
+| 1 | `calls_returns_twice` from `should_inline` | 32% (-O2) | every candidate call scanned the caller and the callee, comparing each call's name with seven strings | the caller's answer once per `inline_calls` (it cannot change while it inlines), the callee's cached once its component is done (`FN_RT`) | 1.7% |
+| 2 | `layout_blocks` | 6.5% (-O2) | each loop header cleared every block's mark (quadratic), and the loop depths, which only the back end reads, were computed for every dominator computation | marks of the last walk cleared; `layout_order` for the middle end | 0.2% |
+| 3 | `dominates` in `analyze_loops` | 3.8% (-O2) | a walk up the dominator tree for every predecessor of every block | a predecessor earlier in reverse post-order is not dominated by the header | 0.1% |
+| 4 | `add_piece_defs`, `emit_call_pieces` | 11.8% (-O1) | the rest of the block scanned for every call's result pieces | only a call returning an aggregate has pieces | 0.2% |
+| 5 | `next_intersection` with fixed intervals | 10.8% (-O1) | every caller-saved register asked where the calls meet the interval, the same lists | registers grouped by identical fixed ranges, one answer per group and step (`fixed_intersection`) | 4.0% |
+| 6 | `ir_operand`, `ir_operand_count`, `Op::is_call` | 8.4% (-O1) | calls: the compiler spends its inlining budget before its passes' turn | `#[inline]`, and small leaves no longer charged to the program's budget | 0 |
+| 7 | `resolve_all` | 8.8% (-O2) | every operand of every instruction rewritten, replaced or not | only replaced operands written | 6.8% |
+| 8 | `__bzero` from `gvn_reset` | 3.6% (-O1) | the value numbering table cleared at the size of the largest function, for every function | sized per function | 0.3% |
+| 9 | program-wide tables | 5.2% (-O1, `number_values`) | one instruction table for the program (130 MB at -O2): a function's instructions scattered, scratch arrays sized by the program's slots | ids local to each function (below) | 0.2% |
+| 10 | `text_is` in the assembler | 10% (-O0 instructions) | `strlen` and `memcmp` against each word, for every operand and directive | byte by byte, first byte first | 0.1% |
+| 11 | the assembler's byte helpers | 7% (-O0 instructions) | `is_space`, `tchar` calls; `out32` as four `buf_byte`; lines found byte by byte | inline; one check for four bytes; `memchr` | |
+| 12 | `add_clobbers` | 1.6% (-O1) | 64 registers tested at every call | the clobbered list made once per function | 1.2% |
+| 13 | `IntVec::push` | 5.4% (-O2) | a call of `grow` for every element | stores directly when there is room | 3.8% |
+| 14 | `analyze_loops`, `compute_dominators` | 10.8% (-O2) | every loop pass, and canonicalization after each loop it changes, finds the loops and the dominators again | open (0.18: the analyses kept while the CFG has not changed, which needs the CFG's changes counted) | 8.3% |
+| 15 | assembling -O0's text | 3.8 of 6.4 G (-O0, phases) | -O0 writes 30 MB of assembly and reads it back | cheaper parsing (10, 11); open: direct encoding | 2.3 of 4.9 G |
+
+Also open: the value-range facts (`decide`, `narrow_by_facts`: a linear
+scan of the facts per query, 2.5% at -O2) and the front end's check
+(1.4 G instructions at every level), outside this track.
+
+Two changes change output, on purpose: small leaves (at most 6
+instructions, no calls) are no longer charged to the program's inlining
+budget (`INLINE_LEAF`; the cold-block and per-caller rules still apply):
+in the compiler the budget was spent (384k of 374k) before its own
+passes came, so `Op::is_call` stayed a call in its hottest loops; 94 of
+6984 compilations differ (larger std users in the suite, four examples,
+the compiler), bench/ does not; the compiler built with it is 3.6%
+faster at -O0 and 3.1% at -O1, and does 0.8% more work at -O2 (it
+inlines more of itself). And `--emit-ir`, `--emit-mir` and
+`--print-regalloc` print the ids, now each function's.
+
+**Function-local ids** (`middle/ir`). Each IR function has its own
+tables (`IRTables`: instructions, blocks, slots, the operand lists ARGS
+and ARGTY, the switch cases SWCASES and -g's INST_LOC), ids local to it
+(0 is "none" in each). The current function's tables are the statics
+every pass reads (`INSTS`, `BLOCKS`, ...), so the passes did not change:
+`ir_enter(fi)` switches (it replaced the `IRF = fi` every pass began
+with), `ir_view(g)` gives the inliner a callee's tables while the
+caller's are current (`inline_call` copies through them), `ir_shrink`
+gives back a function's unused room once it is lowered and once its
+component is optimized (tables start at 64 entries and double; that
+room was more than half of the IR), and `ir_free_func` frees a function
+after it is emitted. What read several functions at once is explicit:
+the inliner's cost model reads which arguments are constants in the
+caller, then the callee's parameters in its tables; interprocedural
+constant propagation records each call site with its caller and passes
+constants by value; the call graph, call counts, std's reachability,
+effects verification and profiles enter each function they read.
+egraph's scratch instruction, made once for the program, would have
+been another function's instruction: other functions use the free entry
+past their last (`ir_scratch`). `--verify-ir` checks that a verified
+function's tables are the current ones.
+
+**The pipeline** (`emit_ir_functions`). After the whole-program phases
+(at -O2: interprocedural constants, the call graph's components bottom
+up, dead functions), each function in order is selected, its uses
+counted, allocated, emitted and freed; at -O1 its cleanup and scalar
+pipeline run there too (`optimize_function`, `PER_FUNCTION`), so a
+function goes from lowered IR to machine code before the next one
+starts. `--time-passes` reports the IR's tables (lowered and optimized).
+
+**Ready for threads?** What a function's optimization and emission touch,
+besides its own tables:
+- *pass state*: about 440 statics in middle/, back/ and gen0/ (scratch
+  arrays and work lists of the passes, the loop forest, the value-range
+  facts, the register allocator's intervals, the emitter's frame and
+  peephole memory, the CODE buffer): per-function by use, shared by
+  storage; 0.18 moves them into a per-thread context with the current
+  tables;
+- *read from other functions*: callees' attributes (`FN_ATTRS`,
+  `FN_NOCAPTURE`, final once their component is done), sizes and flags
+  (`FN_SIZE`, `FN_RT`, `FN_LIVE`), and a callee's IR when it is inlined;
+  the inliner marks the callee's instructions (`aux`) as it copies them,
+  which two callers on two threads must not: the mapping belongs in the
+  caller's scratch;
+- *written for the program*: the inlining budget (`PROGRAM_SIZE`: the
+  decisions depend on the order functions are processed in), the
+  constant tables SROA makes (string ids, in order), the emitter's label
+  numbers (`LABEL_COUNT`), the assembly text (in order), the runtime
+  pieces it needs (`PANIC_USED`, `ENUM_PANICS`), debug information
+  (`DBG_FNS`) and statistics. For output identical whatever the thread
+  count, 0.18 emits each function into a buffer of its own with local
+  label numbers, rebased when the buffers are joined in order, and
+  registers constant data at that join.
+
+**Measured** (aarch64-macos, the compiler compiling itself, `-c`; wall
+time best of 5 alternating on a loaded machine (load 9 to 20),
+instructions retired, peak RSS; v0.15.0 and release-0.17 before this
+work on the same source):
+
+| | v0.15.0 | before | after |
+|---|---|---|---|
+| -O0 wall / instructions / RSS | 358 ms / 6.94 G / 284 MB | 348 ms / 6.99 G / 294 MB | 286 ms / 5.45 G / 287 MB |
+| -O1 | 962 ms / 13.86 G / 534 MB | 988 ms / 14.01 G / 548 MB | 677 ms / 10.70 G / 347 MB |
+| -O2 | 2816 ms / 49.15 G / 755 MB | 2688 ms / 45.75 G / 766 MB | 1730 ms / 28.36 G / 485 MB |
+| a 7-line std program, -O0 | 3.0 ms / 37 M | 3.4 ms / 43 M | 3.3 ms / 39 M |
+| the same, -O2 | 5.2 ms / 64 M | 6.3 ms / 79 M | 5.8 ms / 71 M |
+
+The phases (`--time-passes` counting instructions, millions; before →
+after):
+
+| phase | -O0 | -O1 | -O2 |
+|---|---|---|---|
+| parse, check, effects | 1645 → 1646 | 1685 → 1681 | 1781 → 1683 |
+| lower to SSA | | 460 → 538 | 459 → 538 |
+| scalar pipeline | | 4158 → 3133 | 4164 → 3016 |
+| inlining (and its simplification) | | | 12745 → 4028 |
+| loop passes, LICM, promotion | | | 15341 → 10904 |
+| other -O2 phases | | | 991 → 892 |
+| instruction selection | | 687 → 486 | 922 → 674 |
+| register allocation and emission | 983 → 984 | 4362 → 3358 | 6603 → 5250 |
+| data and output (the assembler) | 3772 → 2258 | 1768 → 1131 | 2199 → 1384 |
+| total | 6400 → 4887 | 13121 → 10326 | 45204 → 28369 |
+
+Lowering costs 17% more: each function's tables are allocated, and
+shrunk once lowered.
+
+(The small program: `Vec::new_in(gpa)`, ten pushes, a sum, `print_int`,
+`println("")`; v0.15.0's is the same with `Vec::new()`. Of its
+instructions, 13.5 M are the process's start.)
