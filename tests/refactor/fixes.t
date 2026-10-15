@@ -68,7 +68,7 @@ $ fix --only unused --in shapes.tach --dry-run
 -};
 +use crate::util::square;
 $ fix --in nowhere
-error fix.bad-in: no file or module 'nowhere' in the program
+error fix.bad-in: no file, module or item 'nowhere' in the program
 [exit 1]
 $ fix
 fixed 2 missing imports, 3 unused imports, 1 pub, 1 unsafe block	3 files	+4 -8 lines

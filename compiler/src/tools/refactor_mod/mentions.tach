@@ -20,6 +20,7 @@ use crate::front::lexer::{TOKS, TOK_COUNT};
 use crate::tools::query::c_slice;
 use crate::tools::query::defs::{
     DEFS, DEF_COUNT, K_FIELD, K_IMPL_METHOD, K_METHOD, K_TRAIT_FN, K_VARIANT, bytes_eq,
+    mod_fqn_text,
 };
 use crate::tools::query::positions::{enclosing, token_at};
 use crate::tools::query::show::text_start;
@@ -36,6 +37,15 @@ pub const MENTION_LOCAL: i64 = 2;
 // included.
 static mut KEEP_BARE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
+// (0.17) The module of the item renamed: a path mention `a::b::old` is
+// one when a::b ends that module's path (`crate::a::b`), not when it
+// names another module (`MODULE::header`, `main::header`).
+static mut ITEM_MODULE: i64 = -1;
+
+// (0.17) Whether no other definition has the renamed item's name: else
+// only a mention by a path naming its module is one.
+static mut ITEM_UNIQUE: bool = true;
+
 // The mentions of the old name of the definitions of group (renamed to
 // new) in the comments of the program's files.
 pub fn doc_mentions(group: *IntVec, old: i64, new: [u8]) {
@@ -46,6 +56,8 @@ pub fn doc_mentions(group: *IntVec, old: i64, new: [u8]) {
         let member = k == K_FIELD || k == K_VARIANT || k == K_METHOD || k == K_IMPL_METHOD
             || k == K_TRAIT_FN;
         let mut owner = o[0..0];
+        ITEM_MODULE = if member { -1 } else { DEFS[d].module };
+        ITEM_UNIQUE = true;
         if member {
             owner = owner_name(d);
             if owner.len == 0 {
@@ -63,7 +75,9 @@ pub fn doc_mentions(group: *IntVec, old: i64, new: [u8]) {
                     }
                 }
                 if !mine {
-                    return;
+                    // (0.17: another item has the name: only the path
+                    // mentions that name its module)
+                    ITEM_UNIQUE = false;
                 }
             }
             // (the functions with a local of that name)
@@ -204,12 +218,12 @@ fn mention(s: [u8], old: [u8]) -> i64 {
     }
     let at = t.len - old.len;
     if at == 0 {
-        return 0;
+        return if unsafe { ITEM_UNIQUE } { 0 } else { -1 };
     }
     if at < 3 || t[at - 1] != ':' || t[at - 2] != ':' {
         return -1;
     }
-    if path_prefix(t[0..at - 2]) { at } else { -1 }
+    if path_prefix(t[0..at - 2]) && names_item_module(t[0..at - 2]) { at } else { -1 }
 }
 
 // Where old is in s when s is `Owner.old`, `Owner::old`, `Owner::old()`
@@ -262,4 +276,30 @@ fn path_prefix(s: [u8]) -> bool {
         i = e + 2;
     }
     true
+}
+
+// (0.17) Whether path prefix s can name module ITEM_MODULE: its path ends
+// with s by whole segments (`crate` is the root); with `self` or `super`
+// in it, yes.
+fn names_item_module(s: [u8]) -> bool {
+    unsafe {
+        if ITEM_MODULE < 0 {
+            return true;
+        }
+        let mut i = 0;
+        while i < s.len {
+            let mut e = i;
+            while e < s.len && s[e] != ':' {
+                e += 1;
+            }
+            if bytes_eq(s[i..e], c_slice(c"self")) || bytes_eq(s[i..e], c_slice(c"super")) {
+                return ITEM_UNIQUE;
+            }
+            i = e + 2;
+        }
+        let m = mod_fqn_text(ITEM_MODULE);
+        bytes_eq(m, s)
+            || (m.len > s.len + 2 && bytes_eq(m[m.len - s.len..m.len], s)
+                && m[m.len - s.len - 1] == ':')
+    }
 }

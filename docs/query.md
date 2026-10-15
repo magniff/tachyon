@@ -24,7 +24,7 @@ tachyonc query callees FN... [--transitive] [--writes TABLE] [--count] [--limit 
 tachyonc query effects NAME...|MODULE [--has EFFECT] [--why EFFECT]   (0.16) the inferred effects
 tachyonc query items [MODULE...] [--root ROOT] [--comments]
 tachyonc query show MODULE::section TITLE                   (0.13)
-tachyonc query grep PATTERN... [--in FILE|MODULE] [--code] [--comments] [--strings] [--word] [--count] [--limit N] [--all]
+tachyonc query grep PATTERN... [--in FILE|MODULE|ITEM] [--code] [--comments] [--strings] [--word] [--count] [--limit N] [--all]
 tachyonc query type FILE:LINE[:COL]...                      (0.13)
 tachyonc query stats [MODULE|FILE] [--over N] [--all]      (refactor.md)
 tachyonc query deps MODULE [--max-lines N]                 (refactor.md)
@@ -339,7 +339,12 @@ references.
   modules included: `gvn`, `crate::ir`), or the item holding a line,
   `FILE:LINE` (0.12; `rewrite --in` too; `fix --in FILE:LINE` fixes that
   line's module), or (0.13) a directory, by whole components
-  (`compiler/src/front/`, `front/check`).
+  (`compiler/src/front/`, `front/check`), or (0.17) an item, by NAME
+  (`--in run_patch`: the references in its text; a function, a type, a
+  const...).
+- (0.17) A string or C-string constant (`const S: [u8] = "..."`, `const
+  C: *u8 = c"..."`) has its uses as references: the checker puts the
+  literal in their place, refs finds them by their name.
 - None left: `note query.empty: 0 refs` (exit 0).
 - (0.16) A local variable or a parameter: `FN::x` (every local named
   `x` in FN: the one a `let` shadows and the one shadowing it too), or
@@ -574,7 +579,9 @@ lexer's tokens. `--code`, `--comments`, `--strings` keep the hits there
 (any of them); `--word` the hits that are whole identifiers. `--in`,
 `--count`, `--limit N`, `--all` and the budget are refs'. The files the
 compiler makes (`<std>`, `<C import>`) are searched only when `--in`
-names them. No hit: `note query.empty`.
+names them. No hit: `note query.empty`. (0.17) A hit in a comment right
+above an item (its doc comment, no blank line between) is that item's
+(`route::ride_cost`, a field's `Entry.line`), not the module's.
 
 ## type (0.13)
 

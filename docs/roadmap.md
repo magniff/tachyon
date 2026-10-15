@@ -889,6 +889,18 @@ run (off from 0.15). Benchmarks and compile times in "Benchmarks", 0.16.
   prototype first, then the implementation; it may become 0.17 and 0.17.1
   rather than be rushed
 - the compiler's source moves to effect annotations (0.16)
+- compile speed, part 1 (a parallel track, back end only, independent of
+  the value-semantics work): a profiling pass over `--time-passes` and
+  hot front-end routines (interning, lookups by linear scan); the
+  middle and back end restructured into a per-function pipeline with
+  function-local IR ids (the prerequisite for both per-function arenas
+  and parallel code generation, measured in the 0.16 arena prototype:
+  the IR in flight drops from 185 MB to about 1.5 MB); cheaper f-strings: today each one becomes four functions (a closure,
+  its environment, an `Interp` instance and a Display instance) that -O0
+  and -O1 do not inline, which made the compiler's own -O0/-O1
+  self-compile 3–4% slower when it adopted f-strings in 0.16; lower an
+  f-string passed straight to print/format/push_fmt into direct `Fmt`
+  calls, and let -O1 inline small leaf functions
 
 ## 0.18: contracts and verification in the language
 
@@ -903,6 +915,14 @@ run (off from 0.15). Benchmarks and compile times in "Benchmarks", 0.16.
   arenas: the syntax tree and types in one per compilation, the IR in one
   per function, reset after it is emitted (compile time measured before
   and after)
+- compile speed, part 2: functions optimized and emitted in parallel on a
+  small thread pool inside the compiler (an `unsafe` island over the
+  platform's threads until 0.21 brings std concurrency); output
+  byte-identical whatever the thread count, checked by the gate; goal:
+  the self-compile at -O2 several times faster on a 10-core machine and
+  peak memory down by most of today's ~700 MB; incremental rebuilds:
+  unchanged functions reuse their optimized code from the cache that
+  already serves the query tools
 - after 0.18 the type system has settled: the language specification is
   written (see "Toward 1.0")
 

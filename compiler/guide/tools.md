@@ -76,7 +76,7 @@ an edit then `check`.
 | a parameter, with every call | `tachyonc refactor signature FN --add 'x: i64 = 0'` (a default; `--fill-calls`: each call gets 0; `--remove`, `--rename-param`, `--reorder`, `--type`) |
 | a field, with every literal | `tachyonc refactor field STRUCT --add 'g: i64 = 0'` |
 | a variant, with every match | `tachyonc refactor variant ENUM --add 'X(i64)' --arm 'EXPR'` (`--arm-in FN 'EXPR'` per match) |
-| move items to a module | `tachyonc refactor move PATH --to MODULE` |
+| move items to a module | `tachyonc refactor move PATH --to MODULE` (made when missing) |
 | an idiom everywhere, typed | `tachyonc rewrite 'old($a)' 'new($a)' --dry-run` |
 | imports, unused, pub, unsafe | `tachyonc fix` (`--only imports,unused,pub,unsafe`, `--dry-run`) |
 

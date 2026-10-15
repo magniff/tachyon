@@ -124,9 +124,12 @@ patched crate::middle::range::decide→compiler/src/middle/range.tach→+1 -1 li
   comments of the item after), or a module
   or a file of the program (all of its text: its `use` lines, its header
   comment), or (0.12) `MODULE::use` (its `use` lines: from the first to
-  the last) or `MODULE::header` (the comment at the top of its file), as
+  the last) or `MODULE::header` (the comment at the top of its file), or
+  (0.17) `MODULE::extern` (its `extern "C" { ... }` blocks), as
   `query show` prints them; the root module is `crate` or the root file's
-  name (`main::header`). An item's text is its lines with the comment and attribute
+  name (`main::header`, `crate::extern`). `FILE:LINE` on a `mod x;` line
+  (0.17) is that line (`mod x;` -> `pub mod x;`), not x's file, which the
+  module's name gives. An item's text is its lines with the comment and attribute
   lines above it, as `query show` prints them.
 - **Each OLD must occur exactly once** in TARGET's text, matched byte for
   byte; it may start and end inside a line, in every form (0.13). When
@@ -294,6 +297,10 @@ them one edit: checked once, all or nothing, one `undo`, `--dry-run`,
 | `@@ delete NAME` | NAME deleted (no text) |
 | `@@ MODULE::use`, `@@ MODULE::header` | the module's `use` lines or header comment |
 
+(0.17) `@@ new after X` or `@@ new before X`, where X is an item an
+earlier block of the file adds, goes next to that block's text: new
+items chain in one file.
+
 So the output of `query show A B` (or the items of `query context`),
 changed and given back, is a round trip: change the items in place, add
 blocks for new ones, apply. Each block is made as `edit replace`,
@@ -440,7 +447,16 @@ with TEXT and removes the others (none: TEXT goes after the header);
 line or before the first; `edit delete` removes them. The header is the
 comment lines at the top of the file, except those right above the first
 item (its own comment; not above a `mod` or `use` line). A header is
-replaced, not inserted next to (`edit.layout`).
+replaced, not inserted next to (`edit.layout`). (0.17) `MODULE::extern`
+is one too: its `extern "C"` blocks (replace: the first becomes TEXT;
+with none, TEXT goes after the `use` lines; insert after the last or
+before the first).
+
+**Files and modules (0.17).** `edit replace FILE.tach < TEXT` replaces
+the whole file. `edit delete MODULE` (or `@@ delete MODULE`) removes its
+`mod` line and its file, and its children's files: one edit, one `undo`.
+A one-line `const` or `static` inserted next to one (`edit insert
+--after B`) joins its run: no blank line between them.
 
 An item that shares a line with other code (a field of
 `struct P { x: i64, y: i64 }`) is its exact bytes: replace replaces
@@ -629,7 +645,8 @@ references between them).
 
 ### query unused
 
-`query unused [MODULE|FILE]`: the definitions nothing refers to (its
+`query unused [MODULE|FILE]` (0.17: MODULE with its child modules): the
+definitions nothing refers to (its
 own `use` lines and itself aside: a function that only calls itself is
 unused) and the imports nothing in their file names, in order:
 `PATH→FILE:LINE:COL→KIND` (`KIND` `import` for an import, whose PATH is

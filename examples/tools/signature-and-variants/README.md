@@ -167,8 +167,7 @@ ledger.tach:66:5	ledger::apply
 report.tach:8:5	report::describe
 report.tach:18:5	report::is_credit
 error refactor.non-exhaustive: 3 matches on crate::event::Event would not cover Fee; nothing written
-try: tachyonc query show ledger.tach:66
-try: tachyonc query show report.tach:8
+try: tachyonc query show ledger.tach:66 report.tach:8 report.tach:18
 try: tachyonc refactor variant crate::event::Event --add 'Fee(i64)' --arm 'EXPR' --dry-run
 try: tachyonc refactor variant crate::event::Event --add 'Fee(i64)' --arm-in ledger::apply 'EXPR' --arm-in report::describe 'EXPR' --arm-in report::is_credit 'EXPR' --dry-run
 [exit 1]

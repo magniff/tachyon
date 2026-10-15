@@ -3,8 +3,8 @@
 // or deleted with its lines.
 
 use crate::base::{
-    BUFS, FILES, IntVec, OVERLAY, SRC, SYMS, _setjmp, alloc_zeroed, buf_byte, buf_bytes, buf_int,
-    buf_new, buf_slice, buf_str, streq,
+    BUFS, FILES, FILE_COUNT, IntVec, OVERLAY, SRC, SYMS, _setjmp, alloc_zeroed, buf_byte, buf_bytes,
+    buf_int, buf_new, buf_slice, buf_str, streq,
 };
 use crate::base::diag::{
     DIAG_SHORT, ERR_BAIL, RECOVER_DEPTH, error_count, flush_warnings, write_errors,
@@ -13,8 +13,10 @@ use crate::base::target::target_of_name;
 use crate::base::timer::{TIME_PASSES, timer_report};
 use crate::front::modules::file_of_pos;
 use crate::tools::conflicts::resolve::run_resolve;
-use crate::tools::edit::{ARGC, ARGV, DRY_RUN, NO_CHECK, SHOW, TARGET, TARGET_NAME, edit_replace};
-use crate::tools::edit::apply::{ADD_IMPORTS, apply_edit};
+use crate::tools::edit::{
+    ARGC, ARGV, DRY_RUN, NO_CHECK, SHOW, TARGET, TARGET_NAME, edit_remove_file, edit_replace,
+};
+use crate::tools::edit::apply::{ADD_IMPORTS, apply_edit, try_replaced};
 use crate::tools::edit::applyfile::run_apply;
 use crate::tools::edit::items::{
     after_line, blank_line, indent_of, item_head, item_tail, item_text, keyword_head, leading,
@@ -25,16 +27,19 @@ use crate::tools::edit::undo::run_undo;
 use crate::tools::edit::wrap::run_wrap;
 use crate::tools::patch::run_patch;
 use crate::tools::proc::read_stdin;
-use crate::tools::query::{c_slice, ends_with_c, resolve_name, root_or_diag};
+use crate::tools::query::{c_slice, ends_with_c, file_named, resolve_name, root_or_diag};
 use crate::tools::query::cache::{cache_on, cache_restore, cache_save};
 use crate::tools::query::command_line::{PARSED, QUERY, front_end, index_program, load_program};
-use crate::tools::query::defs::{DEFS, K_FIELD, K_VARIANT, mod_fqn_text};
+use crate::tools::query::defs::{
+    DEFS, K_CONST, K_FIELD, K_MOD, K_STATIC, K_VARIANT, bytes_eq, mod_fqn_text,
+};
 use crate::tools::query::diagnostics::{
     OPT_EXACT, PROG, ROOT_GIVEN, TOOL, diag, program_errors, try_begin, try_end, write_diags,
 };
-use crate::tools::query::positions::{line_end, line_start};
+use crate::tools::query::positions::{line_end, line_of, line_start};
+use crate::tools::query::refs::file_text;
 use crate::tools::query::show::text_start;
-use crate::tools::query_text::region_target;
+use crate::tools::query_text::{region_spans, region_target};
 
 // ---- The commands ----
 
@@ -201,6 +206,22 @@ fn run_edit_inner(argc: i64, argv: **u8) -> i64 {
         if r == 0 {
             return edit_region(rf, rk, &spans, how, input, root);
         }
+        // (0.17) `edit replace FILE.tach < text`: the whole file.
+        if replace && ends_with_c(names.data[0] as *u8, c".tach") {
+            let f = file_named(name);
+            if f >= 0 && FILES[f].path[0] != '<' {
+                let text = buf_new();
+                buf_bytes(text, buf_slice(input));
+                if BUFS[text].len > 0 && BUFS[text].data[BUFS[text].len - 1] != '\n' {
+                    buf_byte(text, '\n');
+                }
+                edit_replace(FILES[f].start, FILES[f].end, text);
+                let summary = buf_new();
+                buf_str(summary, c"replaced ");
+                buf_bytes(summary, file_text(f));
+                return apply_edit(buf_slice(summary), root);
+            }
+        }
         let mut matches = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         if !resolve_name(what, name, &matches) {
             return 1;
@@ -262,7 +283,18 @@ pub fn item_edit(how: u8, d: i64, input: i64, summary: i64) -> bool {
                 return false;
             }
             let text = item_text(buf_slice(input), indent_of(head));
-            let sep = if member { c"\n" } else { c"\n\n" };
+            // (0.17: a one-line const or static next to one joins its run)
+            let t = buf_slice(text);
+            let mut lines = 0;
+            for i in 0..t.len {
+                if t[i] == '\n' && i + 1 < t.len {
+                    lines += 1;
+                }
+            }
+            let run = (DEFS[d].kind == K_CONST || DEFS[d].kind == K_STATIC) && lines == 0
+                && line_of(text_start(d)) == line_of(tail - 1)
+                && const_or_static(t);
+            let sep = if member || run { c"\n" } else { c"\n\n" };
             let out = buf_new();
             if how == 'a' {
                 buf_str(out, sep);
@@ -288,6 +320,22 @@ pub fn item_edit(how: u8, d: i64, input: i64, summary: i64) -> bool {
             return false;
         }
         true
+    }
+}
+
+// (0.17) Whether text t (an item's) is a const or a static.
+fn const_or_static(t: [u8]) -> bool {
+    unsafe {
+        let mut i = 0;
+        while i < t.len && (t[i] == ' ' || t[i] == '\t') {
+            i += 1;
+        }
+        let mut s = t[i..t.len];
+        if s.len > 4 && bytes_eq(s[0..4], c_slice(c"pub ")) {
+            s = s[4..s.len];
+        }
+        (s.len > 6 && bytes_eq(s[0..6], c_slice(c"const ")))
+            || (s.len > 7 && bytes_eq(s[0..7], c_slice(c"static ")))
     }
 }
 
@@ -321,7 +369,24 @@ fn delete_item(d: i64, whole: bool, head: i64, tail: i64) -> bool {
             }
             return edit_replace(a, b, buf_new());
         }
-        delete_lines(line_start(text_start(d)), tail)
+        if !delete_lines(line_start(text_start(d)), tail) {
+            return false;
+        }
+        // (0.17) A module's files go with its `mod` line: its own file
+        // and its children's.
+        if DEFS[d].kind == K_MOD {
+            let m = SYMS[DEFS[d].fqn].text;
+            for g in 0..FILE_COUNT {
+                let t = mod_fqn_text(FILES[g].module);
+                if FILES[g].path[0] != '<'
+                    && (FILES[g].start < DEFS[d].start || FILES[g].start >= DEFS[d].end)
+                    && (bytes_eq(t, m) || (t.len > m.len + 2 && bytes_eq(t[0..m.len], m)
+                        && t[m.len] == ':' && t[m.len + 1] == ':')) {
+                    edit_remove_file(c_slice(FILES[g].path));
+                }
+            }
+        }
+        true
     }
 }
 
@@ -345,7 +410,7 @@ pub fn region_edit(f: i64, kind: i64, spans: *IntVec, how: u8, input: i64, summa
     unsafe {
         let n = (*spans).count;
         let text = if how == 'd' { buf_new() } else { item_text(buf_slice(input), SRC[0..0]) };
-        if (how == 'a' || how == 'b') && kind != 1 {
+        if (how == 'a' || how == 'b') && kind == 2 {
             let e = diag(c"error", c"edit.layout");
             buf_str(e, c"a header comment is replaced, not inserted next to\n");
             let out = try_begin(c"replace", mod_fqn_text(FILES[f].module), true);
@@ -368,9 +433,23 @@ pub fn region_edit(f: i64, kind: i64, spans: *IntVec, how: u8, input: i64, summa
         } else if n == 0 {
             // (none yet: at the top, after the header for use lines)
             let mut at = FILES[f].start;
-            if kind == 1 {
+            if kind != 2 {
                 while at < FILES[f].end && (blank_line(at) || comment_at(at)) {
                     at = after_line(at);
+                }
+            }
+            if kind == 3 {
+                // (extern blocks: after the use lines)
+                let mut uses = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+                region_spans(f, 1, &uses);
+                if uses.count > 0 {
+                    at = FILES[f].start;
+                    for _ in 0..uses.data[uses.count - 1] + 1 {
+                        at = after_line(at);
+                    }
+                    while at < FILES[f].end && blank_line(at) {
+                        at = after_line(at);
+                    }
                 }
             }
             let out = buf_new();
@@ -402,7 +481,8 @@ pub fn region_edit(f: i64, kind: i64, spans: *IntVec, how: u8, input: i64, summa
             }
         }
         buf_bytes(summary, mod_fqn_text(FILES[f].module));
-        buf_str(summary, if kind == 1 { c"::use" } else { c"::header" });
+        buf_str(summary, if kind == 1 { c"::use" } else if kind == 2 { c"::header" }
+            else { c"::extern" });
         -1
     }
 }
@@ -493,8 +573,11 @@ pub fn ambiguous(what: *u8, name: [u8], matches: *IntVec) {
             if i == 3 || (i == 2 && n > 3) {
                 break;
             }
-            let out = try_begin(what, SYMS[DEFS[(*matches).data[i]].fqn].text, true);
-            try_end(out);
+            // (0.17: the command as run, the name replaced)
+            let fqn = SYMS[DEFS[(*matches).data[i]].fqn].text;
+            if !try_replaced(name, fqn) {
+                try_end(try_begin(what, fqn, true));
+            }
         }
         if n > 3 {
             let out = try_begin(c"def", name, true);

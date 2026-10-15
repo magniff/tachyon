@@ -32,12 +32,12 @@ sed, head, cat or awk ([docs/query.md](docs/query.md)):
 | what a module contains | `target/tachyonc query items MODULE` |
 | the item at a compiler error's position | `target/tachyonc query show FILE:LINE` (`--with-comments`: its section comment too) |
 | a module's `use` lines, header comment, extern blocks | `target/tachyonc query show MODULE::use` (`::header`, `::extern`) |
-| change a module's `use` lines or header comment | `target/tachyonc edit patch\|replace MODULE::use` (`MODULE::header`; `edit insert --after MODULE::use`, `edit delete`) |
+| change a module's `use` lines or header comment | `target/tachyonc edit patch\|replace MODULE::use` (`MODULE::header`, `MODULE::extern`; `edit insert --after MODULE::use`, `edit delete`) |
 | lines of any file (a test, a fixture, conflict markers), a small file | `target/tachyonc query text FILE:A-B`, `query show FILE.tach` |
 | merge conflicts: the regions, their items, both sides; resolve one | `target/tachyonc query conflicts [FILE] [--show]`; `target/tachyonc edit resolve FILE:LINE\|NAME --ours\|--theirs\|--both` (`< text`, `--all`) |
 | change a few lines inside an item (a condition, a statement; FILE:LINE: a comment between items too) | `target/tachyonc edit patch NAME\|FILE:LINE --old 'TEXT' --new 'TEXT'` (pairs repeat; several lines: `< pairs` or `--pairs FILE`, blocks `<<<<<<< OLD` / `=======` / `>>>>>>> NEW`; `--loose` for other indentation; OLD there several times: `--nth N`, `--all`) |
 | add statements inside an item | `target/tachyonc edit insert --in NAME --after\|--before 'ANCHOR' < text` |
-| replace, add or remove an item by name | `target/tachyonc edit replace NAME < new.tach`, `edit insert --after\|--before NAME`, `edit delete NAME` (`--dry-run` for the diff; the `use` lines new text needs are added) |
+| replace, add or remove an item by name | `target/tachyonc edit replace NAME < new.tach`, `edit insert --after\|--before NAME`, `edit delete NAME` (a module: its file too; `edit replace FILE.tach`: a whole file; `--dry-run` for the diff; the `use` lines new text needs are added) |
 | change several items (several files) in one checked edit | `target/tachyonc edit apply items.tach`: blocks `@@ NAME` (its new text), `@@ new after NAME`, `@@ new in MODULE`, `@@ delete NAME`, or `query show`'s output edited; `edit patch --in NAME` (or `@@ NAME` in `--pairs FILE`) starts another target's pairs |
 | an edit refused with `edit.breaks` | each error says `[edited: PATH]` or `[in PATH]`; run the `try:` refactoring it names (`note edit.refactor`), or change the broken items in the same edit (`note edit.together`); `--no-check` last |
 | see what an edit changed, without reading the file back | `--show` on any edit or refactoring; `target/tachyonc query diff` (the last one) |
@@ -48,9 +48,9 @@ sed, head, cat or awk ([docs/query.md](docs/query.md)):
 | add a variant (an arm in each match that needs one), remove, rename one | `target/tachyonc refactor variant ENUM --add 'X(i64)' --arm 'EXPR'` (`--arm-in FN 'EXPR'` per match; `--remove V`, `--rename V W`) |
 | move lines of a function into a new one, parameters and result computed | `target/tachyonc refactor extract-function FN --lines A-B --to NEW` |
 | put a small function's body where it is called (and delete it) | `target/tachyonc refactor inline FN` (`--at FILE:LINE`: one call) |
-| replace an idiom everywhere, typed | `target/tachyonc rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: *IntVec' --dry-run` (`--list`: the sites and their holes; `--subst 'P' 'R'`: inside the holes' code; `--where '$v: name ~ RE'`) |
+| replace an idiom everywhere, typed | `target/tachyonc rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: *IntVec' --dry-run` (`--list`: the sites and their holes; `--subst 'P' 'R'`: inside the holes' code; `--where '$v: name ~ RE'`; `--in FN\|MODULE\|FILE`, repeated) |
 | rename anything (a module: its file too), with every reference | `target/tachyonc refactor rename PATH NEW` (a local or parameter: `FILE:LINE:COL` or `FN::x`, shadowing respected) |
-| move items to another module, imports and `pub` fixed | `target/tachyonc refactor move PATH... --to MODULE` (`--after\|--before ITEM`: where) |
+| move items to another module, imports and `pub` fixed | `target/tachyonc refactor move PATH... --to MODULE` (`--after\|--before ITEM`: where; a MODULE that does not exist is made) |
 | make a module; move one (file, folder, paths) | `target/tachyonc refactor new-module crate::a::b`, `refactor move-module crate::a crate::x::a` |
 | split a module into files | `target/tachyonc refactor split MODULE --plan` (then `--auto`, or `--into M --items a,b`; `--names a,b`; `--reexport` leaves code outside as it is; `--header TEXT`) |
 | several changes, checked once, all or nothing | `target/tachyonc refactor --script steps.txt` (one command per line; `<<END` ... `END` gives one its stdin) |

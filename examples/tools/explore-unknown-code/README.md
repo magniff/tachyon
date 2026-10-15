@@ -154,14 +154,15 @@ $ tachyonc query refs Entry.line --kind init
 ```
 
 The first state is `Entry { ..., line: 0 }`. A search of the comments
-says what 0 means:
+says what 0 means (each hit names the item its comment documents, here
+the field `Entry.line` and the function `ride_cost`):
 
 ```console
 $ tachyonc query grep start --comments
 # heap.tach
-6:48	comment	heap::Entry	// the line the state arrived on; 0 at the start
+6:48	comment	heap::Entry.line	// the line the state arrived on; 0 at the start
 # route.tach
-29:46	comment	route	// What a ride on `e` costs, arriving at its start on `here_line`.
+29:46	comment	route::ride_cost	// What a ride on `e` costs, arriving at its start on `here_line`.
 ```
 
 And `query type` gives the type of the expression at a position (here
