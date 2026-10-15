@@ -303,16 +303,7 @@ fn fmt_byte(f: *Fmt, b: u8) {
 // u's decimal digits, after a '-' when negative.
 #[inline]
 fn fmt_decimal(f: *Fmt, u: u64, negative: bool) {
-    let mut n = 1;
-    let mut ten: u64 = 10;
-    for _ in 1..20 {
-        if u < ten {
-            break;
-        }
-        n += 1;
-        ten *= 10;
-    }
-    let len = if negative { n + 1 } else { n };
+    let len = if negative { decimal_len(u) + 1 } else { decimal_len(u) };
     let mut out = fmt_room(f, len);
     if out.len != len {
         out = fmt_make_room(f, len);
@@ -320,33 +311,8 @@ fn fmt_decimal(f: *Fmt, u: u64, negative: bool) {
             return;
         }
     }
-    // (two digits at a time)
-    let pairs = "00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899";
-    let mut x = u;
-    let mut i = len;
     unsafe {
-        let p = out.ptr;
-        for _ in 0..10 {
-            if x < 100 {
-                break;
-            }
-            let q = x / 100;
-            let r = (x - q * 100) as i64 * 2;
-            i -= 2;
-            p[i] = pairs.ptr[r];
-            p[i + 1] = pairs.ptr[r + 1];
-            x = q;
-        }
-        if x >= 10 {
-            let r = x as i64 * 2;
-            p[i - 2] = pairs.ptr[r];
-            p[i - 1] = pairs.ptr[r + 1];
-        } else {
-            p[i - 1] = '0' + x as u8;
-        }
-        if negative {
-            p[0] = '-';
-        }
+        put_decimal(out.ptr, len, u, negative);
     }
 }
 
@@ -430,8 +396,10 @@ impl Fmt {
     // to w. The buffer is first written out unless w bytes fit in it, so
     // the hole's text is either all in it or at least w long.
     #[inline]
-    pub fn spec(self: *Fmt, w: i64, p: i64, flags: i64) -> Fmt {
-        let old = *self;
+    pub fn spec(self: *Fmt, w: i64, p: i64, flags: i64) -> FmtSpec {
+        let old = FmtSpec {
+            width: self.width, prec: self.prec, flags: self.flags, mark: self.mark
+        };
         self.flags = flags;
         if w > 0 || p >= 0 {
             if self.fd >= 0 && (self.fd != FMT_FD || FMT_CAP - FMT_LEN < w) {
@@ -448,7 +416,7 @@ impl Fmt {
 
     // Ends the hole `spec` started (`old`: what it returned).
     #[inline]
-    pub fn end_spec(self: *Fmt, old: Fmt) {
+    pub fn end_spec(self: *Fmt, old: FmtSpec) {
         if (self.flags & FMT_PAD) != 0 {
             fmt_pad(self);
         }
@@ -459,28 +427,33 @@ impl Fmt {
     }
 
     // v in decimal (x, X, b: in hex or binary, as a u64; c: its low byte).
-    #[inline(never)]
+    // (0.16: without a spec, inline: an f-string's `{n}` is as fast as
+    // Buf's push_int)
+    #[inline]
     pub fn int(self: *Fmt, v: i64) {
         if self.flags != 0 {
             if (self.flags & (FMT_HEX | FMT_BIN | FMT_CHAR)) != 0 {
                 fmt_radix(self, v as u64);
-                return;
+            } else {
+                fmt_int_spec(self, v);
             }
-            fmt_number_start(self);
+            return;
         }
         let negative = v < 0;
         fmt_decimal(self, if negative { (-(v + 1)) as u64 + 1 } else { v as u64 }, negative);
     }
 
-    // v in decimal, hex (x, X), binary (b), or as a byte (c).
-    #[inline(never)]
+    // v in decimal, hex (x, X), binary (b), or as a byte (c). (0.16:
+    // inline, as int)
+    #[inline]
     pub fn uint(self: *Fmt, v: u64) {
         if self.flags != 0 {
             if (self.flags & (FMT_HEX | FMT_BIN | FMT_CHAR)) != 0 {
                 fmt_radix(self, v);
-                return;
+            } else {
+                fmt_uint_spec(self, v);
             }
-            fmt_number_start(self);
+            return;
         }
         fmt_decimal(self, v, false);
     }
@@ -490,6 +463,20 @@ impl Fmt {
     pub fn float(self: *Fmt, v: f64) {
         fmt_float(self, v, false, false);
     }
+}
+
+// Fmt::int and Fmt::uint with a spec of a decimal.
+#[inline(never)]
+fn fmt_int_spec(f: *Fmt, v: i64) {
+    fmt_number_start(f);
+    let negative = v < 0;
+    fmt_decimal(f, if negative { (-(v + 1)) as u64 + 1 } else { v as u64 }, negative);
+}
+
+#[inline(never)]
+fn fmt_uint_spec(f: *Fmt, v: u64) {
+    fmt_number_start(f);
+    fmt_decimal(f, v, false);
 }
 
 // A number starts here: when nothing of the hole is written yet, the hole
@@ -807,6 +794,75 @@ impl<F: Fn(*Fmt)> Display for Interp<F> {
     }
 }
 
+// ---- Fmt's holes (0.16) ----
+
+// The spec of the hole a Fmt was writing, which Fmt::spec saves and
+// end_spec puts back (0.16).
+pub struct FmtSpec { width: i64, prec: i64, flags: i64, mark: i64 }
+
+impl Fmt {
+    // An f-string's hole of a decimal integer with a spec of width w and
+    // flags (`{n:>5}`, `{n:05}`): what spec, int and end_spec write, in one
+    // pass (0.16).
+    #[inline]
+    pub fn int_hole(self: *Fmt, v: i64, w: i64, flags: i64) {
+        let negative = v < 0;
+        fmt_hole(self, if negative { (-(v + 1)) as u64 + 1 } else { v as u64 }, negative, w,
+            flags);
+    }
+
+    #[inline]
+    pub fn uint_hole(self: *Fmt, v: u64, w: i64, flags: i64) {
+        fmt_hole(self, v, false, w, flags);
+    }
+}
+
+// Fmt::int_hole: u (after a '-' when negative) padded to w: with spaces
+// before it (after it: FMT_LEFT), or zeros after its sign (FMT_ZERO).
+#[inline(never)]
+fn fmt_hole(f: *Fmt, u: u64, negative: bool, w: i64, flags: i64) {
+    let n = if negative { decimal_len(u) + 1 } else { decimal_len(u) };
+    let pad = w - n;
+    if pad <= 0 {
+        fmt_decimal(f, u, negative);
+        return;
+    }
+    if w > FMT_CAP {
+        // (as spec and end_spec do)
+        let old = f.spec(w, -1, flags);
+        fmt_number_start(f);
+        fmt_decimal(f, u, negative);
+        f.end_spec(old);
+        return;
+    }
+    let mut out = fmt_room(f, w);
+    if out.len != w {
+        out = fmt_make_room(f, w);
+        if out.len != w {
+            return;
+        }
+    }
+    unsafe {
+        let p = out.ptr;
+        if (flags & FMT_LEFT) != 0 {
+            put_decimal(p, n, u, negative);
+            for k in n..w {
+                p[k] = ' ';
+            }
+        } else {
+            put_decimal(&p[pad], n, u, negative);
+            let fill: u8 = if (flags & FMT_ZERO) != 0 { '0' } else { ' ' };
+            for k in 0..pad {
+                p[k] = fill;
+            }
+            if negative && fill == '0' {
+                p[0] = '-';
+                p[pad] = '0';
+            }
+        }
+    }
+}
+
 // ---- Display and Debug of std's types (0.15) ----
 
 impl Display for i8 {
@@ -972,6 +1028,13 @@ impl<T: Debug, E: Debug> Debug for Result<T, E> {
 
 impl<T: Debug, A: Allocator> Debug for Vec<T, A> {
     fn fmt_debug(self: *Vec<T, A>, f: *Fmt) { debug_list(f, self.as_slice()); }
+}
+
+// (0.16: `Ok(())`)
+impl Debug for () {
+    fn fmt_debug(self: *(), f: *Fmt) {
+        f.str("()");
+    }
 }
 
 // ---- Debug of HashMap (0.15) ----

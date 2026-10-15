@@ -1,0 +1,77 @@
+// 0.16: arena scopes. `arena_scope(gpa, f)` gives f a new arena and frees
+// it when f returns; `a.scope(f)` gives f a scope of arena a, rewound when
+// f returns, a lent meanwhile; scopes nest. What f computes from its
+// arena leaves the scope; what holds the arena cannot (#[scoped]).
+// FLAGS: --no-ambient-gpa
+// EXPECT: 4950 used inside: true
+// EXPECT: before 800, inside 800 + 8000, after 800
+// EXPECT: nested: 4 + 30, outer back to 0, a back to 800
+// EXPECT: large in a scope: given back true
+// EXPECT: copied out: [0, 1, 4, 9]
+use std::HashMap;
+
+fn squares(s: ScopedArena, n: i64) -> Vec<i64, ScopedArena> {
+    let mut v: Vec<i64, ScopedArena> = Vec::new_in(s);
+    for i in 0..n {
+        v.push(i * i);
+    }
+    v
+}
+
+fn main(gpa: Gpa) {
+    let r = arena_scope(gpa, |s: ScopedArena| {
+        let mut v: Vec<i64, ScopedArena> = Vec::new_in(s);
+        for i in 0..100 {
+            v.push(i);
+        }
+        let mut t = 0;
+        for x in v.iter() {
+            t += x;
+        }
+        (t, s.used() > 0)
+    });
+    println(f"{r.0} used inside: {r.1}");
+    let mut a = Arena::new_in(gpa);
+    let mut keep: Vec<i64, Arena> = Vec::with_capacity_in(100, a);
+    let before = a.used();
+    let inside = a.scope(|s: ScopedArena| {
+        let mut m: HashMap<i64, i64, ScopedArena> = HashMap::new_in(s);
+        let mut v: Vec<i64, ScopedArena> = Vec::with_capacity_in(1000, s);
+        for i in 0..1000 {
+            v.push(i);
+        }
+        m.insert(1, 2);
+        s.used()
+    });
+    println(f"before {before}, inside {before} + {inside - m_bytes()}, after {a.used()}");
+    let n = a.scope(|s: ScopedArena| {
+        let mut v: Vec<i64, ScopedArena> = Vec::with_capacity_in(3, s);
+        v.push(1);
+        let inner = s.scope(|t: ScopedArena| {
+            let w = squares(t, 3);
+            w.len() * 10
+        });
+        let back = s.used() == 32;
+        (v.capacity(), inner, back)
+    });
+    println(
+        f"nested: {n.0} + {n.1}, outer back to {if n.2 { 0 } else { 1 }}, a back to {a.used()}");
+    let held = a.chunk_bytes();
+    let given = a.scope(|s: ScopedArena| {
+        let mut big: Vec<i64, ScopedArena> = Vec::with_capacity_in(10000, s);
+        big.push(1);
+        big.len()
+    });
+    println(f"large in a scope: given back {a.chunk_bytes() == held && given == 1}");
+    let copied = a.scope(|s: ScopedArena| squares(s, 4).clone_in(gpa));
+    println(f"copied out: {copied:?}");
+    keep.push(1);
+    unsafe {
+        a.free_all();
+    }
+}
+
+// The bytes of the map's three arrays (8 slots of keys, values, states).
+fn m_bytes() -> i64 {
+    8 * 8 + 8 * 8 + 8
+}

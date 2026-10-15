@@ -234,7 +234,7 @@ mkdir -p "$WORK/empty"
 out=$(cd "$WORK/empty" && "$COMPILER" query items std 2>&1)
 ok=0
 [ "$(printf '%s\n' "$out" | wc -l)" -ge 100 ] && printf '%s\n' "$out" | head -1 | grep -q "^# std${TAB}<std>\$" \
-    && printf '%s\n' "$out" | grep -q "${TAB}pub fn read_line(line: \*Buf) -> Result<bool, IoError>\$" \
+    && printf '%s\n' "$out" | grep -q "${TAB}pub fn read_line<A: Allocator>(line: \*Buf<A>) -> Result<bool, IoError>\$" \
     && ! printf '%s\n' "$out" | grep -q 'fn malloc' && ok=1
 check std_items_no_program "$ok" "$(printf '%s\n' "$out" | head -5)"
 out=$(cd "$WORK/empty" && "$COMPILER" query show HashMap::get_or_insert 2>&1)

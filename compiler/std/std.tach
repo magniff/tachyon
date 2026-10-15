@@ -162,7 +162,7 @@ impl<T, A: Allocator> Vec<T, A> {
 
     // Room for `extra` more elements.
     pub fn reserve(self: *Vec<T, A>, extra: i64) {
-        if extra > self.cap - self.len && !self.grow(extra) {
+        if extra > self.cap - self.len && !self.reserve_more(extra) {
             out_of_memory();
         }
     }
@@ -170,7 +170,7 @@ impl<T, A: Allocator> Vec<T, A> {
     // Grows to room for `extra` (more than it has) more elements: twice the
     // capacity, or more when needed; false when out of memory.
     #[inline(never)]
-    fn grow(self: *Vec<T, A>, extra: i64) -> bool {
+    fn reserve_more(self: *Vec<T, A>, extra: i64) -> bool {
         if extra > ALLOC_LIMIT - self.len {
             return false;
         }
@@ -232,7 +232,7 @@ impl<T, A: Allocator> Vec<T, A> {
     }
 
     pub fn push(self: *Vec<T, A>, x: T) {
-        if self.len == self.cap && !self.grow(1) {
+        if self.len == self.cap && !self.reserve_more(1) {
             out_of_memory();
         }
         unsafe {
@@ -359,7 +359,7 @@ impl<T, A: Allocator> Vec<T, A> {
     // Room for `extra` more elements, or Err when out of memory, the Vec
     // as it was (0.16).
     pub fn try_reserve(self: *Vec<T, A>, extra: i64) -> Result<(), AllocError> {
-        if extra > self.cap - self.len && !self.grow(extra) {
+        if extra > self.cap - self.len && !self.reserve_more(extra) {
             return Result::Err(AllocError::OutOfMemory);
         }
         Result::Ok(())
@@ -367,7 +367,7 @@ impl<T, A: Allocator> Vec<T, A> {
 
     // push, or Err when out of memory, the Vec as it was (0.16).
     pub fn try_push(self: *Vec<T, A>, x: T) -> Result<(), AllocError> {
-        if self.len == self.cap && !self.grow(1) {
+        if self.len == self.cap && !self.reserve_more(1) {
             return Result::Err(AllocError::OutOfMemory);
         }
         unsafe {
@@ -410,22 +410,16 @@ impl<A: Allocator> Buf<A> {
 
     // The decimal digits of v.
     pub fn push_int(self: *Buf<A>, v: i64) {
-        let mut d: [u8; 20] = [0; 20];
-        let mut n = 20;
-        // (as a u64: -v of the smallest i64 is itself)
-        let mut u = if v < 0 { (-(v + 1)) as u64 + 1 } else { v as u64 };
-        for _ in 0..20 {
-            n -= 1;
-            d[n] = '0' + (u % 10) as u8;
-            u = u / 10;
-            if u == 0 {
-                break;
-            }
+        let negative = v < 0;
+        let u = if negative { (-(v + 1)) as u64 + 1 } else { v as u64 };
+        let n = if negative { decimal_len(u) + 1 } else { decimal_len(u) };
+        if n > self.bytes.cap - self.bytes.len {
+            self.bytes.reserve(n);
         }
-        if v < 0 {
-            self.push('-');
+        unsafe {
+            put_decimal(&self.bytes.ptr[self.bytes.len], n, u, negative);
         }
-        self.push_str(d[n..20]);
+        self.bytes.len += n;
     }
 
     pub fn as_slice(self: *Buf<A>) -> [u8] {
@@ -445,6 +439,51 @@ impl<A: Allocator + Ambient> Buf<A> {
     #[ambient("Buf::new_in(gpa)")]
     pub fn new() -> Buf<A> {
         Buf { bytes: Vec::new_in(A::ambient()) }
+    }
+}
+
+// The number of decimal digits of u.
+#[inline]
+fn decimal_len(u: u64) -> i64 {
+    let mut n = 1;
+    let mut ten: u64 = 10;
+    for _ in 1..20 {
+        if u < ten {
+            break;
+        }
+        n += 1;
+        ten *= 10;
+    }
+    n
+}
+
+// u's decimal digits in p[0..n] (n: decimal_len(u), one more when
+// negative: after a '-'), two at a time. Unsafe: p has n bytes.
+#[inline]
+unsafe fn put_decimal(p: *u8, n: i64, u: u64, negative: bool) {
+    let pairs = "00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899";
+    let mut x = u;
+    let mut i = n;
+    for _ in 0..10 {
+        if x < 100 {
+            break;
+        }
+        let q = x / 100;
+        let r = (x - q * 100) as i64 * 2;
+        i -= 2;
+        p[i] = pairs.ptr[r];
+        p[i + 1] = pairs.ptr[r + 1];
+        x = q;
+    }
+    if x >= 10 {
+        let r = x as i64 * 2;
+        p[i - 2] = pairs.ptr[r];
+        p[i - 1] = pairs.ptr[r + 1];
+    } else {
+        p[i - 1] = '0' + x as u8;
+    }
+    if negative {
+        p[0] = '-';
     }
 }
 
@@ -1174,6 +1213,11 @@ impl<K: Hash + Eq, V, A: Allocator + Ambient> HashMap<K, V, A> {
 // ---- HashMap's room (0.16) ----
 
 impl<K: Hash + Eq, V, A: Allocator> HashMap<K, V, A> {
+    // Its allocator (0.16): a copy of the handle.
+    pub fn allocator(self: *HashMap<K, V, A>) -> A {
+        self.alloc
+    }
+
     // An empty map on allocator a with room for n entries (0.16).
     pub fn with_capacity_in(n: i64, a: A) -> HashMap<K, V, A> {
         let mut m: HashMap<K, V, A> = HashMap::new_in(a);
