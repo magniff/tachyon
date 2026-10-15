@@ -6,7 +6,7 @@ the guide, with the tools, with both) against the same tasks in Rust.
     run.py list [--set ...]
     run.py run --model M --cond C[,C...] [--tasks T,...] [--reps N] [--jobs J] [--out DIR]
     run.py report RUNDIR... [--md docs/eval/FILE.md]
-    run.py regrade RUNDIR... [--only-stopped]   (compiler tasks)
+    run.py regrade RUNDIR... [--only-stopped | --only-failed | --only-check-failed]
 
 README.md next to this file has the details."""
 
@@ -82,11 +82,17 @@ def main(argv):
     p.add_argument("rundirs", nargs="+", metavar="RUNDIR")
     p.add_argument("--md", help="write the report here (and FILE.json next to it)")
 
-    p = sub.add_parser("regrade", help="compiler tasks: grade finished runs again from "
-                       "their changes.patch, without the agent")
+    p = sub.add_parser("regrade", help="grade finished runs again without the agent "
+                       "(compiler tasks: changes.patch; programs: workspace.tar.gz)")
     p.add_argument("rundirs", nargs="+", metavar="RUNDIR")
     p.add_argument("--only-stopped", action="store_true",
-                   help="only runs where a suite filter stopped before any case")
+                   help="compiler runs: only those where a suite filter stopped before any case")
+    p.add_argument("--only-failed", action="store_true", help="program runs: only failed ones")
+    p.add_argument("--only-check-failed", action="store_true",
+                   help="program runs: only those whose check.sh failed")
+    p.add_argument("--tasks", default="", help="program runs: these task ids only")
+    p.add_argument("--tachyonc", default=os.path.join(REPO_ROOT, "target", "tachyonc"),
+                   help="program runs: the compiler under test (default target/tachyonc)")
     p.add_argument("--ws-root", help="where the starter trees are built and the grading "
                    "runs (default $TMPDIR/tachyon-eval/regrade)")
     p.add_argument("--builder", help="the compiler that builds the base (default: the "

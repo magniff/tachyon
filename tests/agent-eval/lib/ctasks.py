@@ -493,11 +493,15 @@ def regrade_main(args):
     ws_root = os.path.abspath(args.ws_root or os.path.join(
         os.environ.get("TMPDIR", "/tmp"), "tachyon-eval", "regrade"))
     os.makedirs(ws_root, exist_ok=True)
-    runs = []
+    runs, pruns = [], []
     for top in args.rundirs:
         for root, _, files in os.walk(top):
             if "result.json" in files and "changes.patch" in files:
                 runs.append(root)
+            elif "result.json" in files and "workspace.tar.gz" in files:
+                pruns.append(root)
+    if pruns:
+        regrade_programs(args, sorted(pruns), ws_root)
     infos = {}
     n = 0
     for rdir in sorted(runs):
@@ -544,3 +548,51 @@ def regrade_main(args):
                                    "OK" if g["success"] else "FAIL", res["grade_summary"]))
     print("regraded %d run(s)" % n)
     return 0
+
+
+def regrade_programs(args, runs, ws_root):
+    """Program-task runs: the kept workspace.tar.gz graded again (build,
+    hidden tests, check.sh) with the compiler under test (--tachyonc), as
+    `run` grades it; --tasks, --only-failed and --only-check-failed pick."""
+    import tarfile
+    from lib.common import load_tasks, write_json
+    from lib.grade import grade_dir, prepare_bins
+    tasks = {t.id: t for t in load_tasks(None, None, "programs")}
+    want = set(filter(None, (args.tasks or "").split(",")))
+    bins = prepare_bins(ws_root, os.path.abspath(args.tachyonc))
+    n = 0
+    for rdir in runs:
+        with open(os.path.join(rdir, "result.json")) as fh:
+            res = json.load(fh)
+        task = tasks.get(res["task"])
+        if not task or (want and task.id not in want):
+            continue
+        if args.only_failed and res.get("success"):
+            continue
+        if getattr(args, "only_check_failed", False) and res.get("check_ok") is not False:
+            continue
+        ws = os.path.join(ws_root, "regrade-ws")
+        if os.path.exists(ws):
+            shutil.rmtree(ws)
+        os.makedirs(ws)
+        with tarfile.open(os.path.join(rdir, "workspace.tar.gz")) as tf:
+            tf.extractall(ws)
+        # the tarball holds the workspace's files, maybe under one top directory
+        top = os.listdir(ws)
+        src = os.path.join(ws, top[0]) if len(top) == 1 and os.path.isdir(
+            os.path.join(ws, top[0])) and not os.path.exists(os.path.join(ws, "main.tach")) \
+            and not os.path.exists(os.path.join(ws, "main.rs")) else ws
+        lang = res["lang"]
+        g = grade_dir(task, lang, src, os.path.join(ws_root, "regrade-grade"), bins[lang])
+        write_json(os.path.join(rdir, "grade.json"), g)
+        prev = {k: res.get(k) for k in ("success", "tests_passed", "tests_total", "build_ok",
+                                         "check_ok")}
+        res.update({"success": g["success"], "tests_passed": g["tests_passed"],
+                    "tests_total": g["tests_total"], "build_ok": g["build_ok"],
+                    "check_ok": g["check_ok"], "regraded_from": prev})
+        write_json(os.path.join(rdir, "result.json"), res)
+        n += 1
+        print("%s %s -> %s: %d/%d tests, check %s %s" % (
+            rdir, "OK" if prev["success"] else "FAIL", "OK" if g["success"] else "FAIL",
+            g["tests_passed"], g["tests_total"], g["check_ok"], (g.get("check_msg") or "")[:120]))
+    print("regraded %d program run(s)" % n)
