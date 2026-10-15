@@ -42,6 +42,7 @@
 # fuzz-div, fuzz-range, fuzz-seed (against the Rust seed); abi-plain,
 # abi-import, abi-header; objcheck; layout (tests/cimport/layout.sh); debug (tests/debug.sh);
 # stress-grow (the compiler with every table growth moving, 0.14);
+# examples-checkalloc (every example's test built with --check-alloc, 0.16);
 # linux-x86_64 (bootstrap/linux-check.sh); linux-aarch64
 # (bootstrap/aarch64-linux-check.sh); bench.
 #
@@ -154,7 +155,7 @@ esac
 
 FUZZ_STEPS="fuzz-plain fuzz-loops fuzz-generics fuzz-pressure fuzz-calls fuzz-lang06 fuzz-vector fuzz-div fuzz-range fuzz-seed"
 ABI_STEPS="abi-plain abi-import abi-header"
-HOST_STEPS="suite-O0 suite-O1 suite-O2 $FUZZ_STEPS $ABI_STEPS objcheck layout debug stress-grow"
+HOST_STEPS="suite-O0 suite-O1 suite-O2 $FUZZ_STEPS $ABI_STEPS objcheck layout debug stress-grow examples-checkalloc"
 LINUX_STEPS="linux-x86_64 linux-aarch64"
 [ "$X86" = 1 ] || LINUX_STEPS="linux-aarch64"
 case "$MODE" in
@@ -314,6 +315,21 @@ run_step() {
                 TACHYON_STRESS_GROW=1 sh "$ROOT/tests/run.sh" -c "$C" -O $level || return 1
             done
             echo "stress-grow: the self-compile is the same; the suite passes at -O0 and -O2" ;;
+        examples-checkalloc)
+            # (0.16) Every example's test (tests/examples/*.test) with the
+            # program built by --check-alloc (the checking Gpa: blocks on
+            # pages of their own, never reused): a use after free, a double
+            # free or a wrong free in an example stops it, so one cannot
+            # come back unnoticed (examples/errors-and-results had one).
+            w="$RUN/tachyonc-check-alloc"
+            printf '#!/bin/sh\nexec "%s" --check-alloc "$@"\n' "$C" >"$w"
+            chmod +x "$w"
+            sh "$ROOT/tests/run.sh" -c "$w" example >"$RUN/examples-checkalloc.out" 2>&1
+            rc=$?
+            cat "$RUN/examples-checkalloc.out"
+            awk '$1 == "total" { printf "examples-checkalloc: %d passed, %d failed with --check-alloc\n", $2, $4 }' \
+                "$RUN/examples-checkalloc.out"
+            return $rc ;;
         linux-x86_64)
             command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 \
                 || { echo "docker is not running (start it, e.g. colima start; or --no-linux)"; return 1; }
@@ -466,8 +482,8 @@ note_of() {
     case "$1" in
         chain) awk '/^  head / { sub(/^  head +/, ""); print; exit }' "$l" ;;
         suite-*) awk '$1 == "total" { printf "%d passed, %d xfail, %d failed\n", $2, $3, $4 }' "$l" ;;
-        fuzz-*|abi-*|objcheck|layout|debug|stress-grow)
-            grep -E '^(fuzz|abi|objcheck|layout|debug|stress-grow):' "$l" | tail -1 ;;
+        fuzz-*|abi-*|objcheck|layout|debug|stress-grow|examples-checkalloc)
+            grep -E '^(fuzz|abi|objcheck|layout|debug|stress-grow|examples-checkalloc):' "$l" | tail -1 ;;
         linux-*) grep '^gate-row' "$l" | awk -F'\t' '$3 != "pass" && $3 != "skip" { bad = bad " " $2 } END { n = NR; print n " steps in the container" (bad == "" ? "" : "; failed:" bad) }' ;;
         bench) grep '^geomean' "$l" | tail -1 ;;
     esac
@@ -506,7 +522,7 @@ for s in $([ $CHAIN -eq 1 ] && echo chain) $STEPS $([ $BENCH -eq 1 ] && echo ben
     l="$RUN/$s.log"
     [ -f "$l" ] || { echo "    not run (the chain failed)"; continue; }
     case "$s" in
-        suite-*) awk '/^tests for / { exit } { print }' "$l" | head -60 ;;
+        suite-*|examples-checkalloc) awk '/^tests for / { exit } { print }' "$l" | head -60 ;;
         fuzz-*|abi-*|objcheck) grep -E '^FAIL' "$l" | head -20; [ -d "$RUN/failures/$s" ] && echo "    kept in $RUN/failures/$s" ;;
         linux-*) awk '/^--- / { p = 1 } p' "$l" | head -80; grep -q '^--- ' "$l" || tail -30 "$l" ;;
         *) tail -30 "$l" ;;

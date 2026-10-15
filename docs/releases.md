@@ -1000,7 +1000,13 @@ finds garbage instead of, by luck, the old data. Its self-compile must
 give the same object as without, and the suite pass at -O0 and -O2. The
 mode is for finding such reads, as `TYPES[template_instance(..)].a` was
 before 0.14 read TYPES before the call that grew it; it costs little
-time and about twice the memory); and the two containers: `linux-x86_64`
+time and about twice the memory); `examples-checkalloc` (0.16, not in
+`--quick`: every example's test, tests/examples/*.test, with the program
+built by `--check-alloc`, whose Gpa puts every block on pages of its own
+and never reuses them, so a use after free, a double free or a wrong free
+in an example stops it with where the block was allocated and freed;
+added after examples/errors-and-results printed an error holding a view
+of memory it had freed); and the two containers: `linux-x86_64`
 (`bootstrap/linux-check.sh`, which builds its own chain and so starts at
 once) and `linux-aarch64` (`bootstrap/aarch64-linux-check.sh --compiler`:
 the chain's compiler cross-compiles the tree). Inside each container the
