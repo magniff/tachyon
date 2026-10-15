@@ -882,7 +882,12 @@ they miss the gate.
   middle and back end restructured into a per-function pipeline with
   function-local IR ids (the prerequisite for both per-function arenas
   and parallel code generation, measured in the 0.16 arena prototype:
-  the IR in flight drops from 185 MB to about 1.5 MB)
+  the IR in flight drops from 185 MB to about 1.5 MB); cheaper f-strings: today each one becomes four functions (a closure,
+  its environment, an `Interp` instance and a Display instance) that -O0
+  and -O1 do not inline, which made the compiler's own -O0/-O1
+  self-compile 3–4% slower when it adopted f-strings in 0.16; lower an
+  f-string passed straight to print/format/push_fmt into direct `Fmt`
+  calls, and let -O1 inline small leaf functions
 
 ## 0.18: contracts and verification in the language
 
