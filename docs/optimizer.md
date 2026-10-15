@@ -1491,7 +1491,12 @@ integer one on x86-64; else on k != 0). It is pure: GVN numbers it
 hoists it (checking the third operand as well), the ranges take the
 union of x's and y's. Instruction combining: a constant k picks, k ? x
 : x is x, and **k ? t op x : t is t op (k ? x : 0)** for op one of `+ -
-| ^` (t on the left of `-`): the select leaves the chain through t.
+| ^` (t on the left of `-`): the select leaves the chain through t; a
+select of constants (or of such selects) compared with a constant is
+its condition, the negation, or a constant: a comparator's ordering (-1,
+0, 1) compared with 0, once if-converted, is the comparison it came
+from (std's `sort_by` had kept a chain of three `csel`s for it, and its
+sift-down ran a third slower).
 
 **If-conversion** (`ifconv.tach`, in the loop passes after the ranges,
 before the vectorizer; `--no-ifconv`). In an innermost loop, a branch
@@ -1547,8 +1552,8 @@ Emission makes the two lines one `ldp` (`stp`) of x, d or q registers
 are one register; the encoder learned the q form.
 
 Tests: `opt_ifconv` (selects, masks, every comparison order of minimum
-and maximum, a division left as a branch, two selects, every length
-from 0 to 20), `opt_unroll_reduction` (each kind of split reduction,
+and maximum, a division left as a branch, two selects, std's `sort_by`,
+every length from 0 to 20), `opt_unroll_reduction` (each kind of split reduction,
 wrapping i32 arithmetic, an unsigned maximum combined by selects),
 `opt_ldp`; the iterator tests expect the unrolled scalar loop for
 `x * 3`.
