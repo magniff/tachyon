@@ -9,22 +9,21 @@
 // bounded by their loop counts; a comparator that is not an order (random,
 // always less, never less, NaN-like values, alternating answers) must never
 // make them leave the slice, nor lose or duplicate an element. The slices
-// end where their Gpa block ends (8 bytes x 2048: whole pages) and start
+// end where their Gpa block ends (16 bytes x 2048: whole pages) and start
 // after a freed block, so under --check-alloc a read one past either end
 // stops the program (std_sort_adversarial_u is the same under
-// --check-unsafe).
+// --check-unsafe). Ord::cmp is #[pure] (0.16): the comparator's mode and
+// random state are not statics but a Rand each key points at (a write
+// through a raw pointer is unsafe, not global).
 use std::{Ord, Vec, sort};
 
-struct Key { v: i64 }
+struct Rand { mode: i64, seed: u64 }
 
-static mut MODE: i64 = 0;
-static mut SEED: u64 = 1;
+struct Key { v: i64, st: *Rand }
 
-fn next_random() -> u64 {
-    unsafe {
-        SEED = SEED * 6364136223846793005 + 1442695040888963407;
-        SEED >> 33
-    }
+fn next_random(st: *Rand) -> u64 {
+    st.seed = st.seed * 6364136223846793005 + 1442695040888963407;
+    st.seed >> 33
 }
 
 // (a NaN-like key: every comparison with it is "not less", both ways)
@@ -32,9 +31,10 @@ const NAN: i64 = -1;
 
 impl Ord for Key {
     fn cmp(self: *Key, other: *Key) -> i64 {
-        let mode = unsafe { MODE };
+        let st = self.st;
+        let mode = unsafe { (*st).mode };
         if mode == 0 {
-            (next_random() % 3) as i64 - 1
+            (unsafe { next_random(st) } % 3) as i64 - 1
         } else if mode == 1 {
             -1
         } else if mode == 2 {
@@ -53,20 +53,20 @@ impl Ord for Key {
             }
         } else {
             // flip-flop: the answer alternates
-            if next_random() % 2 == 0 { -1 } else { 1 }
+            if unsafe { next_random(st) } % 2 == 0 { -1 } else { 1 }
         }
     }
 }
 
 // Sorts s with the comparator `mode`; true when no element was lost.
-fn check(s: [Key], mode: i64) -> bool {
+fn check(s: [Key], mode: i64, st: *Rand) -> bool {
     let mut sum = 0;
     let mut xor = 0;
     for k in s {
         sum += k.v;
         xor = xor ^ (k.v * 2654435761);
     }
-    unsafe { MODE = mode; }
+    st.mode = mode;
     sort(s);
     let mut sum2 = 0;
     let mut xor2 = 0;
@@ -77,33 +77,34 @@ fn check(s: [Key], mode: i64) -> bool {
     sum == sum2 && xor == xor2
 }
 
-fn fill(v: *Vec<Key>, n: i64, mode: i64) {
+fn fill(v: *Vec<Key>, n: i64, mode: i64, st: *Rand) {
     v.clear();
     for i in 0..n {
-        let x = (next_random() % 1000) as i64;
+        let x = (next_random(st) % 1000) as i64;
         let k = if mode == 4 && i % 7 == 3 { NAN } else { x };
-        v.push(Key { v: k });
+        v.push(Key { v: k, st: st as *Rand });
     }
 }
 
 fn main(gpa: Gpa) -> i32 {
     let names = ["random", "always-less", "never-less", "all-equal", "nan-like", "flip-flop"];
+    let mut st = Rand { mode: 0, seed: 1 };
     for mode in 0..6 {
         let mut ok = true;
         // A freed block right before the data: a read before the slice
         // faults too.
         let mut before: Vec<Key> = Vec::with_capacity_in(2048, gpa);
-        before.push(Key { v: 0 });
+        before.push(Key { v: 0, st: &st as *Rand });
         before.free();
         let mut data: Vec<Key> = Vec::with_capacity_in(2048, gpa);
         defer data.free();
         for n in [0, 1, 2, 3, 24, 25, 26, 48, 100, 333, 1000, 2047, 2048] {
-            fill(&data, n, mode);
+            fill(&data, n, mode, &st);
             // the whole, its end and its start
-            ok = ok && check(data.as_slice(), mode);
+            ok = ok && check(data.as_slice(), mode, &st);
             if n > 2 {
-                ok = ok && check(data.as_slice()[n / 3..], mode);
-                ok = ok && check(data.as_slice()[..n - n / 3], mode);
+                ok = ok && check(data.as_slice()[n / 3..], mode, &st);
+                ok = ok && check(data.as_slice()[..n - n / 3], mode, &st);
             }
         }
         println(f"{names[mode]} {if ok { "ok" } else { "LOST" }}");
