@@ -1,11 +1,291 @@
-// Why a function has an effect (0.16; T1 makes it): the chain from the
-// function down to a local source (`'v.push(x)' at sum.tach:7:9 grows a
-// Vec<i64>`), rebuilt on demand by walking its body again.
+// Why a function has an effect (0.16): the chain from the function down
+// to a local source, rebuilt on demand by walking each body again
+// (infer.tach's find_step), one line a step:
+//   'v.push(x)' at sum.tach:7:9 grows a Vec<i64>
+//   'self.reserve(1)' at <std>:131:9 calls 'Vec::reserve'
+//   'self.alloc.try_resize(..)' at <std>:167:13 allocates from Gpa (an Allocator method)
+// Nothing is stored for it. The declared-effect errors (check.tach) show
+// the first step.
 
-use crate::base::buf_str;
+use crate::base::{IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_new, buf_slice, buf_str};
+use crate::base::diag::{buf_position, put_short_positions};
+use crate::front::ast::{NODES, NODE_RAW, NodeKind};
+use crate::front::check::Res;
+use crate::front::effects::{
+    ALLOCATORS, ALLOC_ANY, EFF_ALLOC_EXTERN, EFF_DIVERGE, EFF_GLOBAL, EFF_IO, EFF_PANIC,
+    EFF_UNKNOWN, EFF_UNSAFE, fn_effects,
+};
+use crate::front::effects::builtin::c_symbol;
+use crate::front::effects::check::buf_fn_name;
+use crate::front::effects::infer::{
+    ADDRESS_TAKEN, COMPONENT, E_ALLOC, FOUND_CALLEE, FOUND_KIND, FOUND_NODE, GRAPH_FNS, NODE_FX,
+    VIRTUAL_TYPE, find_step, has_effect, is_allocator_method, template_of,
+};
+use crate::front::modules::STD_MODULE;
+use crate::front::types::{FNS, STRUCTS, TYPES, TyKind, buf_type};
+
+// Appends effect (bit, alloc) as a declaration names it: `alloc(Gpa)`,
+// `alloc(extern)`, `alloc`, `io`, ...
+pub fn effect_name(out: i64, bit: i64, alloc: i64) {
+    unsafe {
+        if bit == 0 {
+            buf_str(out, c"alloc");
+            if alloc != ALLOC_ANY {
+                buf_str(out, c"(");
+                buf_allocator(out, alloc);
+                buf_str(out, c")");
+            }
+            return;
+        }
+        buf_str(out, if bit == EFF_ALLOC_EXTERN { c"alloc(extern)" } else if bit == EFF_IO { c"io" }
+            else if bit == EFF_GLOBAL { c"global" } else if bit == EFF_PANIC { c"panic" }
+            else if bit == EFF_DIVERGE { c"diverge" } else { c"unsafe" });
+    }
+}
+
+// Appends the allocator type of allocator bit `alloc`.
+fn buf_allocator(out: i64, alloc: i64) {
+    unsafe {
+        for i in 0..ALLOCATORS.count {
+            if alloc == (1 << i) {
+                buf_type(out, ALLOCATORS.data[i]);
+                return;
+            }
+        }
+        buf_str(out, c"any");
+    }
+}
+
+// Appends what having effect (bit, alloc) does, after "it": `allocates
+// from Gpa`, `does io`, ...
+pub fn effect_phrase(out: i64, bit: i64, alloc: i64) {
+    unsafe { phrase(out, bit, alloc); }
+}
+
+unsafe fn phrase(out: i64, bit: i64, alloc: i64) {
+    if bit == 0 {
+        if alloc == ALLOC_ANY {
+            buf_str(out, c"allocates");
+            return;
+        }
+        buf_str(out, c"allocates from ");
+        buf_allocator(out, alloc);
+        return;
+    }
+    buf_str(out, if bit == EFF_ALLOC_EXTERN { c"allocates from C (malloc)" }
+        else if bit == EFF_IO { c"does io" } else if bit == EFF_GLOBAL { c"uses a static (global)" }
+        else if bit == EFF_PANIC { c"may panic" }
+        else if bit == EFF_DIVERGE { c"may not terminate (diverge)" }
+        else { c"has unsafe operations (unsafe)" });
+}
+
+// Appends the source text of node n, its first line, shortened.
+fn buf_source(out: i64, n: i64) {
+    unsafe {
+        let start = NODES[n].start;
+        let mut end = start;
+        while end < NODES[n].end && SRC[end] != '\n' {
+            end += 1;
+        }
+        if end - start > 48 {
+            buf_bytes(out, SRC[start..start + 44]);
+            buf_str(out, c"..");
+            return;
+        }
+        buf_bytes(out, SRC[start..end]);
+        if end < NODES[n].end {
+            buf_str(out, c" ..");
+        }
+    }
+}
+
+// Appends position pos: `file:line:col` (short) or `file: line L, column
+// C` (what diagnostics write, made short by --diagnostics=short).
+fn buf_pos(out: i64, pos: i64, short: bool) {
+    if !short {
+        buf_position(out, pos);
+        return;
+    }
+    let tmp = buf_new();
+    buf_position(tmp, pos);
+    put_short_positions(out, buf_slice(tmp));
+}
+
+// Whether function f is a std container's method that grows it.
+fn grows_container(f: i64) -> bool {
+    unsafe {
+        let base = template_of(f);
+        let t = FNS[f].self_ty;
+        if FNS[base].module != STD_MODULE || t <= 0 || TYPES[t].kind != TyKind::Struct {
+            return false;
+        }
+        let s = TYPES[t].a;
+        let tpl = if STRUCTS[s].tmpl != 0 { STRUCTS[s].tmpl - 1 } else { s };
+        let ty = SYMS[STRUCTS[tpl].name].text;
+        let name = SYMS[NODES[FNS[base].node].a].text;
+        (ty == "Vec" || ty == "Buf" || ty == "HashMap")
+            && (starts(name, "push") || starts(name, "reserve") || starts(name, "insert")
+                || starts(name, "extend") || starts(name, "try_push")
+                || starts(name, "try_reserve"))
+    }
+}
+
+fn starts(s: [u8], prefix: [u8]) -> bool {
+    s.len >= prefix.len && s[0..prefix.len] == prefix
+}
+
+// What local source n (found by find_step for effect bit) is.
+fn local_text(out: i64, n: i64, bit: i64, alloc: i64) {
+    unsafe {
+        let kind = NODES[n].kind;
+        if kind == NodeKind::Ident && NODES[n].res == Res::Static {
+            buf_str(out, c" is a static's (global)");
+        } else if kind == NodeKind::Ident {
+            buf_str(out, c" takes an unsafe function as a value");
+        } else if kind == NodeKind::Index && (NODES[n].p & NODE_RAW) != 0 {
+            buf_str(out, c" indexes a raw pointer");
+        } else if kind == NodeKind::Index {
+            let range = NODES[NODES[n].b].kind == NodeKind::Range;
+            buf_str(out, if range { c" is a checked slicing" } else { c" is a checked index" });
+        } else if kind == NodeKind::EnumPanic {
+            buf_str(out, c" is a checked conversion to an enum");
+        } else if kind == NodeKind::VecOp {
+            buf_str(out, c" is a checked vector access");
+        } else if kind == NodeKind::While {
+            buf_str(out, c" is a 'while' loop");
+        } else if kind == NodeKind::Loop {
+            buf_str(out, c" is a 'loop'");
+        } else if kind == NodeKind::Unary {
+            buf_str(out, c" dereferences a raw pointer");
+        } else if kind == NodeKind::FieldAccess {
+            buf_str(out, if (NODES[n].p & NODE_RAW) != 0 { c" reads through a raw pointer" }
+                else { c" reads a field of a union" });
+        } else if kind == NodeKind::Cast {
+            buf_str(out, c" makes a pointer from an integer");
+        } else if kind == NodeKind::Call && bit == 0 {
+            let f = NODES[n].x - 1;
+            if f >= 0 && is_allocator_method(f) {
+                buf_str(out, c" allocates from ");
+                buf_type(out, FNS[f].self_ty);
+                buf_str(out, c" (an Allocator method)");
+            } else {
+                buf_str(out, c" ");
+                effect_phrase(out, bit, alloc);
+            }
+        } else if kind == NodeKind::Call {
+            let f = NODES[n].x - 1;
+            buf_str(out, if f >= 0 && FNS[f].is_extern { c" calls C" }
+                else if f >= 0 { c" calls an unsafe function" }
+                else { c" calls through a pointer" });
+        } else if bit == EFF_UNSAFE {
+            buf_str(out, c" is an unsafe operation");
+        }
+    }
+}
+
+// Appends the first step of why function f has effect (bit, alloc):
+// `'SOURCE' at POS what`; returns its node (0: none found). FOUND_CALLEE
+// is the graph node it calls (-1: a local source).
+pub fn step_text(out: i64, f: i64, bit: i64, alloc: i64, short: bool) -> i64 {
+    unsafe {
+        find_step(f, bit, alloc);
+        let n = FOUND_NODE;
+        let callee = FOUND_CALLEE;
+        if n == 0 {
+            if (fn_effects(f).bits & EFF_UNKNOWN) != 0 {
+                buf_str(out, c"its body did not check (its effects are unknown)");
+            } else {
+                buf_str(out, c"(no source found)");
+            }
+            return 0;
+        }
+        if n == FNS[f].node {
+            buf_str(out, c"it is an 'unsafe fn'");
+            return n;
+        }
+        buf_str(out, c"'");
+        buf_source(out, n);
+        buf_str(out, c"' at ");
+        buf_pos(out, NODES[n].start, short);
+        if callee < 0 {
+            local_text(out, n, bit, alloc);
+        } else if callee >= GRAPH_FNS {
+            let t = VIRTUAL_TYPE.data[callee - GRAPH_FNS];
+            if t < 0 {
+                buf_str(out, c" calls C through a pointer (unknown effects)");
+            } else {
+                buf_str(out, c" calls a '");
+                buf_type(out, t);
+                buf_str(out, c"' value (a function of that type whose address is taken)");
+            }
+        } else if FNS[callee].is_extern {
+            buf_str(out, c" calls C's '");
+            buf_bytes(out, SYMS[c_symbol(callee)].text);
+            buf_str(out, c"'");
+        } else if bit == EFF_DIVERGE && COMPONENT[callee] == COMPONENT[f] {
+            buf_str(out, c" calls '");
+            buf_fn_name(out, callee);
+            buf_str(out, c"', which calls back (recursion)");
+        } else if (bit == 0 || bit == EFF_ALLOC_EXTERN) && grows_container(callee) {
+            buf_str(out, c" grows a ");
+            buf_type(out, FNS[callee].self_ty);
+        } else {
+            buf_str(out, c" calls '");
+            buf_fn_name(out, callee);
+            buf_str(out, c"'");
+        }
+        FOUND_CALLEE = callee;
+        n
+    }
+}
 
 // Appends to out why function f has effect bit `bit` (an EFF_* bit, or 0
-// with `alloc` an allocator bit of `allocs`).
+// with `alloc` an allocator bit of `allocs`, ALLOC_ANY for any): the
+// chain of steps, a line each, down to a local source (or C, or a body
+// that did not check).
 pub fn explain_effect(f: i64, bit: i64, alloc: i64, out: i64) {
-    unsafe { buf_str(out, c"(effects are not inferred yet: 0.16 T1)"); }
+    unsafe {
+        let mut visited = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut cur = f;
+        while visited.count < 32 {
+            visited.push(cur);
+            let n = step_text(out, cur, bit, alloc, true);
+            buf_byte(out, '\n');
+            let mut next = FOUND_CALLEE;
+            if n == 0 || next < 0 || FOUND_KIND == E_ALLOC {
+                break;
+            }
+            if next >= GRAPH_FNS {
+                // (through a fn value: the first function of that type
+                // that has the effect)
+                let t = VIRTUAL_TYPE.data[next - GRAPH_FNS];
+                next = -1;
+                let mut i = 0;
+                while t >= 0 && i < ADDRESS_TAKEN.count {
+                    let g = ADDRESS_TAKEN.data[i + 1];
+                    if ADDRESS_TAKEN.data[i] == t && has_effect(NODE_FX[g], bit, alloc) {
+                        next = g;
+                        break;
+                    }
+                    i += 2;
+                }
+                if next < 0 {
+                    break;
+                }
+            }
+            if FNS[next].is_extern {
+                break;
+            }
+            for k in 0..visited.count {
+                if visited.data[k] == next {
+                    next = -1;
+                    break;
+                }
+            }
+            if next < 0 {
+                break;
+            }
+            cur = next;
+        }
+    }
 }
