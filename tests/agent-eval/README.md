@@ -86,7 +86,8 @@ tests/agent-eval/run.py run ... --skip-existing-in BASELINE_RUNDIR
   alone its `turn-end`), `+recite` (prompts/recite.md after the task),
   and settings-eval.json's `modifiers`: `+rewrite` (compiler-tools
   conditions: the query-first hook runs an unambiguous read as its query
-  instead of blocking it), `+nohints` (the hooks give no hints),
+  instead of blocking it; the workspace's AGENTS.md hook paragraph and
+  prompts/query-rewrite.md say so, the block-mode wording left out), `+nohints` (the hooks give no hints),
   `+note` (tools/agent-hooks/lookup-note.py: a note when a lookup prints
   again what it printed earlier).
   Every check and Stop hook a condition registers is settings-eval.json's

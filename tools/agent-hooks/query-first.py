@@ -1067,7 +1067,13 @@ def main():
         if rw:
             new, why = rw
             shown = command if len(command) <= 120 else command[:117] + "..."
-            note = hs.text("rewritten", FROM=shown, TO=new, WHY=why)
+            # (the first rewrite of a session says what the mode does)
+            st = hs.load(event, "query")
+            first = not st.get("rewrote")
+            if first:
+                st["rewrote"] = True
+                hs.save(event, st, "query")
+            note = hs.text("rewritten-first" if first else "rewritten", FROM=shown, TO=new, WHY=why)
             log(gd, {"kind": "rewritten", "program": reads[0][0], "command": command[:300],
                      "to": new[:300]})
             json.dump({"hookSpecificOutput": {

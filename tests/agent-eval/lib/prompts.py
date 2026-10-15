@@ -89,6 +89,9 @@ def compiler_prompt(cond, task_text, agents_text, env_note=None):
              _read("compiler-env.md")]
     if c.query_hook:
         parts.append(_read("check-hook.md"))
+    if "rewrite" in c.mods:
+        # (+rewrite) what the query-first hook does with a read in this mode
+        parts.append(_read("query-rewrite.md"))
     if c.test:
         parts.append(_read("compiler-test.md"))
     if env_note:

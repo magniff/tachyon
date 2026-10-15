@@ -377,7 +377,11 @@ with tempfile.TemporaryDirectory() as tmp:
     case("rewrite sed -n: query text", cmd, "target/tools/tachyonc query text compiler/src/front/big.tach:120-180")
     case("rewrite: the shape", (o["hookEventName"], o["permissionDecision"], o["updatedInput"]["description"]),
          ("PreToolUse", "allow", "d"))
-    case("rewrite: the note", o["additionalContext"],
+    case("rewrite: the first note says what the mode does", o["additionalContext"].startswith(
+        "note hook.query-first: shell reads of large .tach files are answered with the matching query "
+        "(sed -n, head, tail: `query text`; cat: `query items`; grep NAME: `query refs`); `sed -n"), True)
+    st, o, cmd, recs = rewritten(repo, "sed -n '120,180p' compiler/src/front/big.tach")
+    case("rewrite: the note after the first", o["additionalContext"],
          "note hook.query-first: `sed -n '120,180p' compiler/src/front/big.tach` ran as "
          "`target/tools/tachyonc query text compiler/src/front/big.tach:120-180`: "
          "the same lines, each with its number")
