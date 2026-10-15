@@ -45,7 +45,7 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.12.0 | `v0.12.0` | 0.11.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | the compiler's source reorganized through its own tools: folders by phase, no file over 1,000 lines, no re-exports, tidy imports, output identical to 0.11's; `edit patch`, `edit insert --in`, `query text`, a module's `use` lines and header as targets, `fix --only reexports` and `tidy-imports`, `split --reexport`; the release gate in one command (`bootstrap/gate.sh`) |
 | 0.13.0 | `v0.13.0` | 0.12.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | the tools, improved from 0.12's record: `edit patch` inside a line, `--pairs`, `edit wrap`, `edit new-file`, `signature --default`, `fix --in` over a subtree; section banners, `query grep`, `query type`, kinds of references; an on-disk cache (a query or `check` of an unchanged program in about 6 to 8 ms); `split` part names, layout kept by `move` and `split`, `refactor extract-function` and `inline`; `tachyonc fmt` (the tree formatted), `explain` and `guide` |
 | 0.14.0 | `v0.14.0` | 0.13.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | closures and iterators: closures (captures by value or by reference, `move`, `Fn`/`FnMut` bounds, a non-capturing closure is a `fn`, an escape check); associated types; an `Iterator` trait, `for` over anything iterable, ranges as values, std's sources, adapters and consumers, chains compiled to the hand-written loop; std reads stdin (`read_line`, `read_stdin`, `Scanner`), text helpers, values changed in place, an introsort; did-you-mean across the program and std, helps for Rust habits; the tools on a user's program; the agent eval (`tests/agent-eval/`) and its 0.13 baseline |
-| 0.15.0 | `v0.15.0` | 0.14.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | errors, conversions, less boilerplate: `?` on `Option` and `Result`, generic traits, `From`/`Into`, `main` returning `Result`, std's I/O on `Result` with typed errors (`fix --only std015` moves 0.14 code); lossless integer widening and joins, `i64::MAX`; f-strings over `Display` and `Debug`, generic `print`/`format`; `#[derive(Eq, Ord, Hash, Debug, Clone)]`; named and default arguments, field shorthand; `==` on `Vec`, `Buf`, `HashMap` by contents; std loaded by sections; the tools for agents (`query context`, budgets, std from any program, `try`, `batch`, `edit apply`, merge conflicts, `--json`, the check hook); back end, gen0 and base on closures and iterators; six harder eval tasks |
+| 0.15.0 | `v0.15.0` | 0.14.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | errors, conversions, less boilerplate: `?` on `Option` and `Result`, generic traits, `From`/`Into`, `main` returning `Result`, std's I/O on `Result` with typed errors (`fix --only std015` moves 0.14 code); lossless integer widening and joins, `i64::MAX`; f-strings over `Display` and `Debug`, generic `print`/`format`; `#[derive(Eq, Ord, Hash, Debug, Clone)]`; named and default arguments, field shorthand; `==` on `Vec`, `Buf`, `HashMap` by contents; std loaded by sections; if-conversion, vector masks and min/max reductions, split accumulators, `ldp`/`stp` (iterloop from 2.1 to about 1.05 times C); the tools for agents (`query context`, budgets, std from any program, `try`, `batch`, `edit apply`, merge conflicts, `--json`, the check hook); back end, gen0 and base on closures and iterators; algorithm and tool examples; six harder eval tasks |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
@@ -138,6 +138,23 @@ docs/design/errors-formatting.md; the language in docs/grammar.md,
   `target/tools/tachyonc`. fmt, query and the refactorings know 0.15's
   syntax (`signature --add 'x: T = V'` declares a default; `--fill-calls`
   is 0.14's behaviour).
+- **Loops as cc compiles them** (docs/optimizer.md, "0.15"): a select in
+  the middle end and if-conversion of small branches in innermost loops
+  (`if x > r { c += 1 }` is a sum); masks and minimum/maximum reductions
+  in the vectorizer; one accumulator per copy in the run-time unroller
+  for associative integer reductions; the vectorizer's cost model weighs
+  a 64-bit multiplication lane by lane against the unrolled scalar loop;
+  `ldp`/`stp` pairs on AArch64. bench/iterloop (six kernels by hand) went
+  from about 2.1 times cc -O2's time to about 1.0 to 1.1 (Benchmarks,
+  0.15).
+- **Examples**: examples/algorithms, ten algorithms (Dijkstra, Kruskal,
+  topological sort, string search, Huffman, an LRU cache, big integers,
+  quickselect, sudoku, n-queens) in idiomatic 0.15, each with a README,
+  a C reference and a test; examples/tools, eight sessions with the
+  tools (exploring unknown code, fixing errors, merge conflicts, proving
+  a change unchanged, renames and moves, rewrites, signatures and
+  variants, splitting a module), each README a transcript that
+  tests/walkthrough/run.sh replays.
 - **The compiler's source**: the back end, gen0 and base iterate with
   `IntVec::items()`, `kids(n)` and std's `any`/`all`/`position`/`find`
   (through `rewrite`, which gained `$s...` holes over a block's
@@ -826,6 +843,7 @@ $ bootstrap/gate.sh --quick            # before committing a big change: chain, 
 $ bootstrap/gate.sh                    # every step, modest fuzz counts
 $ bootstrap/gate.sh --release          # every step, the release's fuzz counts
 $ bootstrap/gate.sh --no-linux         # without the containers
+$ bootstrap/gate.sh --with-x86         # with x86_64 (off by default since 0.15)
 $ bootstrap/gate.sh --only 'fuzz-*,objcheck'   # some steps (--list shows them)
 $ bootstrap/gate.sh --release --bench  # the gate, then the benchmarks alone
 $ bootstrap/gate.sh --only bench       # only the benchmarks
@@ -854,6 +872,14 @@ the chain's compiler cross-compiles the tree). Inside each container the
 same steps run at once (`gate.sh --inside`), and their rows appear in the
 table under the container's. `bench` runs alone, at the end: benchmarks
 need an idle machine.
+
+(0.15) x86_64 is off by default: `bootstrap/gate.conf` sets `X86=0`, so
+the `linux-x86_64` step (the emulated container: about half of the
+release gate's machine time) is not run; `--with-x86` (or
+`TACHYON_GATE_X86=1`) runs it, `--no-x86` leaves it out whatever the
+default. The x86_64 back end is still built and its unit tests run in
+the suite; programs are not run on x86_64 (nor on x86_64-macos, which
+the gate never ran: Rosetta).
 
 It stays parallel without overloading the machine: the test runners
 (`tests/run.sh`, `tests/fuzz/run.sh`, `tests/abi/run.sh`,

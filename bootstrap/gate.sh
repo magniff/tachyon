@@ -15,6 +15,10 @@
 #   (default)        every step, with modest fuzz counts
 #   --release        every step, with the release's fuzz counts
 #   --no-linux       without the containers
+#   --no-x86         without x86_64 (the x86_64-linux container); the
+#                    default since 0.15, set in bootstrap/gate.conf (X86=0)
+#                    or by $TACHYON_GATE_X86 (0 or 1)
+#   --with-x86       with x86_64, whatever the default
 #   --only STEPS     only these steps (comma-separated; `fuzz-*` patterns;
 #                    the chain is added when they need the compiler)
 #   --bench          then the benchmarks (bench/run.sh), alone, at the end
@@ -55,6 +59,12 @@ export LC_ALL
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 MODE=default
 LINUX=1
+# (0.15) x86_64: bootstrap/gate.conf's X86, then $TACHYON_GATE_X86, then
+# --no-x86/--with-x86
+X86=1
+[ ! -f "$ROOT/bootstrap/gate.conf" ] || X86=$(sed -n 's/^X86=\([01]\)$/\1/p' "$ROOT/bootstrap/gate.conf" | tail -1)
+[ -n "$X86" ] || X86=1
+[ -z "${TACHYON_GATE_X86:-}" ] || X86=$TACHYON_GATE_X86
 ONLY=""
 BENCH=0
 JOBS=""
@@ -78,6 +88,8 @@ while [ $# -gt 0 ]; do
         --quick) MODE=quick ;;
         --release) MODE=release ;;
         --no-linux) LINUX=0 ;;
+        --no-x86) X86=0 ;;
+        --with-x86) X86=1 ;;
         --only) [ $# -ge 2 ] || die "--only needs steps"; ONLY=$2; shift ;;
         --only=*) ONLY=${1#--only=} ;;
         --bench) BENCH=1 ;;
@@ -102,6 +114,7 @@ while [ $# -gt 0 ]; do
     shift
 done
 case "$HISTORY" in fast|full) ;; *) die "--history is fast or full" ;; esac
+case "$X86" in 0|1) ;; *) die "X86 (bootstrap/gate.conf, \$TACHYON_GATE_X86) is 0 or 1, not '$X86'" ;; esac
 for n in "$CPUS" ${JOBS:+"$JOBS"} ${FUZZ_N:+"$FUZZ_N"} ${ABI_N:+"$ABI_N"}; do
     case "$n" in ''|*[!0-9]*) die "'$n' is not a number" ;; esac
 done
@@ -143,6 +156,7 @@ FUZZ_STEPS="fuzz-plain fuzz-loops fuzz-generics fuzz-pressure fuzz-calls fuzz-la
 ABI_STEPS="abi-plain abi-import abi-header"
 HOST_STEPS="suite-O0 suite-O1 suite-O2 $FUZZ_STEPS $ABI_STEPS objcheck layout debug stress-grow"
 LINUX_STEPS="linux-x86_64 linux-aarch64"
+[ "$X86" = 1 ] || LINUX_STEPS="linux-aarch64"
 case "$MODE" in
     quick) STEPS="suite-O2 $FUZZ_STEPS abi-plain" ;;
     *) STEPS="$HOST_STEPS"; [ $LINUX -eq 1 ] && STEPS="$STEPS $LINUX_STEPS" ;;
@@ -165,7 +179,7 @@ if [ -n "$ONLY" ]; then
             # shellcheck disable=SC2254
             case "$s" in $p) found=1 ;; esac
         done
-        [ $found -eq 1 ] || die "no step matches '$p' (see --list)"
+        [ $found -eq 1 ] || die "no step matches '$p' (see --list$([ "$X86" = 1 ] || echo '; x86_64 is off: --with-x86'))"
     done
     set +f
     STEPS=""
