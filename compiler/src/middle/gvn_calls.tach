@@ -1,0 +1,128 @@
+// Value numbering's regions and calls (split from gvn.tach): whether what
+// gvn knows at the end of a dominating block still holds where it is
+// inherited (the writes of the blocks between applied), and the numbering
+// of calls the effects make pure: readnone calls by callee and arguments,
+// readonly ones while nothing is written (0.16).
+
+use crate::base::{IntVec, free};
+use crate::middle::gvn::apply_block_kills;
+use crate::middle::ipo::{ATTR_READNONE, ATTR_READONLY, call_attrs};
+use crate::middle::ir::{BLOCKS, INSTS, IRFUNCS, Op, ir_arg, ir_val};
+use crate::middle::ir::Op::CallC;
+
+// Whether what is known at the end of d (in AVAIL) holds at the start of
+// c, which d dominates, once the writes of the blocks on the paths from d
+// to c are applied; false when those are too many to look at.
+static mut REGION_STAMP: i64 = 1;
+static mut REGION: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+pub fn inherit_into(d: i64, c: i64) -> bool {
+    unsafe {
+        if BLOCKS[c].preds.count == 1 && BLOCKS[c].preds.data[0] == d {
+            return true;
+        }
+        REGION_STAMP += 1;
+        let stamp = REGION_STAMP;
+        REGION.count = 0;
+        let mut work = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..BLOCKS[c].preds.count {
+            work.push(BLOCKS[c].preds.data[i]);
+        }
+        let mut ok = true;
+        while work.count > 0 {
+            let b = work.pop();
+            if b == d || BLOCKS[b].mark == stamp {
+                continue;
+            }
+            BLOCKS[b].mark = stamp;
+            REGION.push(b);
+            if REGION.count > 64 {
+                ok = false;
+                break;
+            }
+            for i in 0..BLOCKS[b].preds.count {
+                work.push(BLOCKS[b].preds.data[i]);
+            }
+        }
+        free(work.data as *u8);
+        if !ok {
+            return false;
+        }
+        for i in 0..REGION.count {
+            apply_block_kills(REGION.data[i]);
+        }
+        true
+    }
+}
+
+// How call v may be numbered: 1 when it reads and writes no memory
+// (ATTR_READNONE: an equal call dominating it is the same value), 2 when
+// it only reads (ATTR_READONLY: the same within a block while nothing is
+// written), 0 not at all (an indirect call, a compound result, no
+// result).
+pub fn call_numbering(v: i64) -> i64 {
+    unsafe {
+        let op = INSTS[v].op;
+        if op != Op::Call && op != CallC || INSTS[v].ty == 0 || INSTS[v].c != 0 {
+            return 0;
+        }
+        let attrs = call_attrs(v);
+        if (attrs & ATTR_READNONE) != 0 {
+            return 1;
+        }
+        if (attrs & ATTR_READONLY) != 0 {
+            return 2;
+        }
+        0
+    }
+}
+
+// Whether calls v and w call one function with the same arguments.
+fn same_call(v: i64, w: i64) -> bool {
+    unsafe {
+        if INSTS[v].op != INSTS[w].op || INSTS[v].imm != INSTS[w].imm
+            || INSTS[v].nargs != INSTS[w].nargs {
+            return false;
+        }
+        for i in 0..INSTS[v].nargs {
+            if ir_val(ir_arg(v, i)) != ir_val(ir_arg(w, i)) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// (0.16) Whether function fi has two calls value numbering may merge (the
+// same callee and arguments, READNONE or READONLY): at -O2, its callees' attributes are
+// known only once they are optimized, after fi's first value numbering.
+pub fn repeated_pure_calls(fi: i64) -> bool {
+    unsafe {
+        let mut seen = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut found = false;
+        for i in 0..IRFUNCS[fi].blocks.count {
+            let b = IRFUNCS[fi].blocks.data[i];
+            if BLOCKS[b].removed != 0 {
+                continue;
+            }
+            let mut v = BLOCKS[b].first;
+            while v != 0 && !found {
+                if INSTS[v].op.is_call() && call_numbering(v) != 0 {
+                    for k in 0..seen.count {
+                        // (a readonly call is merged within its block only)
+                        if same_call(seen.data[k], v) && (call_numbering(v) == 1
+                            || INSTS[seen.data[k]].block == INSTS[v].block) {
+                            found = true;
+                        }
+                    }
+                    if seen.count < 64 {
+                        seen.push(v);
+                    }
+                }
+                v = INSTS[v].next;
+            }
+        }
+        free(seen.data as *u8);
+        found
+    }
+}

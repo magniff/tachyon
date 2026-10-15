@@ -51,41 +51,28 @@ mod derived;
 mod effects;
 mod callees;
 mod locals;
+pub mod command_line;
 
-use crate::host_target;
 use crate::base::{
-    FILES, FILE_COUNT, IntVec, SRC, STDOUT, SYMS, _setjmp, alloc_array, alloc_zeroed, buf_byte,
-    buf_bytes, buf_new, buf_str, buf_write_fd, intern_c, load_sources, streq, strlen,
+    FILES, FILE_COUNT, IntVec, SRC, STDOUT, SYMS, buf_byte, buf_bytes, buf_new, buf_str,
+    buf_write_fd, streq, strlen,
 };
-use crate::base::diag::{ERR_BAIL, ERR_KIND, RECOVER_DEPTH, edit_distance};
-use crate::base::target::{T_X86_64_LINUX, set_target};
-use crate::front::ast::{KEEP_PARSED, init_ast, keep_parsed};
-use crate::front::check::check_program;
-use crate::front::cimport::{IMPORTED_START, drop_shadowed_imports, import_c_headers};
+use crate::base::diag::edit_distance;
 use crate::front::cpp::directives::file_exists;
-use crate::front::lexer::{init_lexer, lex_range};
-use crate::front::modules::{STD_ALWAYS, STD_MODULE, load_modules, module_at};
-use crate::front::parser::parse_program;
-use crate::front::types::{ENUMS, STRUCTS, TYPES, TyKind, init_declarations, init_types};
-use crate::gen0::gen::MAIN_SYM;
+use crate::front::modules::{STD_ALWAYS, STD_MODULE, module_at};
 use crate::tools::edit::undo::run_query_diff;
 use crate::tools::plan::{query_impact, query_stats, query_unused};
 use crate::tools::plan::deps::query_deps;
 use crate::tools::query_text::{
     WITH_COMMENTS, all_files, infer_root, run_text, show_files, show_region,
 };
-use defs::{
-    DEFS, DEF_COUNT, K_FIELD, K_VARIANT, MOD_DEF, collect_defs, find_defs, finish_defs,
-    last_segment, mod_fqn_text,
-};
+use defs::{DEFS, DEF_COUNT, K_FIELD, K_VARIANT, find_defs, last_segment, mod_fqn_text};
 use diagnostics::{
     CMD, OPT_EXACT, PROG, ROOT_GIVEN, alias_defs, diag, is_query_command, no_match, no_module,
     program_errors, push_once, try_begin, try_end, try_query, write_diags,
 };
 use grep::{G_CODE, G_COMMENT, G_STRING, OPT_WHERE, OPT_WORD, query_grep};
-use positions::{
-    LINES, init_containers, init_positions, line_end, line_index, line_start, sort_by_position,
-};
+use positions::{LINES, line_end, line_index, line_start, sort_by_position};
 use refs::{
     OPT_ALL, OPT_COUNT, OPT_IN, OPT_KIND, OPT_LIMIT, def_used_at, file_text, put_bad_in, query_refs,
     resolve_in, try_refs,
@@ -97,12 +84,11 @@ use typeat::query_type;
 use budget::{OPT_BUDGET, begin_output, end_output};
 use cache::{cache_restore, cache_save};
 use callees::{OPT_TRANSITIVE, OPT_WRITES, query_callees};
+use command_line::load_program;
 use context::{context_module, query_context, query_context_module};
-use crate::base::timer::{
-    TIME_PASSES, T_ANSWER, T_CHECK, T_INDEX, T_LOAD, T_PARSE, timer_add, timer_now, timer_report,
-};
+use crate::base::timer::{TIME_PASSES, T_ANSWER, timer_add, timer_now, timer_report};
 use crate::tools::conflicts::run_conflicts;
-use derived::{collect_derive_spans, derived_note};
+use derived::derived_note;
 use effects::{OPT_HAS, OPT_WHY, check_effect_options, query_effects, query_effects_module};
 use locals::{QUERY_ARGV, full_requested, has_column, local_refs};
 use names::{canonical_name, is_name_char, is_symbol, item_below, module_def, path_matches};
@@ -111,9 +97,6 @@ use stdq::{all_std, ask_with_std, names_std, std_requested, std_root, wants_std}
 extern "C" {
     fn getenv(name: *u8) -> *u8;
 }
-
-// Set while a query runs: the hooks record what they resolve.
-pub static mut QUERY: bool = false;
 
 // Flags of a reference: a call, the definition itself, an import.
 pub const QF_CALL: i64 = 1;
@@ -124,49 +107,6 @@ pub const QF_USE: i64 = 4;
 pub const QF_WRITE: i64 = 8;
 pub const QF_INIT: i64 = 16;
 pub const QF_PAT: i64 = 32;
-
-// What the checker resolved that its nodes do not keep: (position the name
-// is looked for from, the name written there, the definition's node,
-// flags), in fours.
-static mut NOTES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-// The name `name` written at (or just after) `from` stands for the item
-// whose node is `def`.
-pub fn qnote(from: i64, name: i64, def: i64, flags: i64) {
-    if !QUERY || def <= 0 {
-        return;
-    }
-    NOTES.push(from);
-    NOTES.push(name);
-    NOTES.push(def);
-    NOTES.push(flags);
-}
-
-// ... for module m.
-pub fn qnote_module(from: i64, name: i64, m: i64, flags: i64) {
-    unsafe {
-        if !QUERY || m < 0 || m >= MOD_DEF.count || MOD_DEF.data[m] < 0 {
-            return;
-        }
-        qnote(from, name, DEFS[MOD_DEF.data[m]].node, flags);
-    }
-}
-
-// `Self` written at pos stands for type t (0.13): a reference to its
-// struct or enum.
-pub fn qnote_self(pos: i64, name: i64, t: i64) {
-    unsafe {
-        if !QUERY || t <= 0 {
-            return;
-        }
-        let k = TYPES[t].kind;
-        if k == TyKind::Struct {
-            qnote(pos, name, STRUCTS[TYPES[t].a].node, 0);
-        } else if k == TyKind::Enum {
-            qnote(pos, name, ENUMS[TYPES[t].a].node, 0);
-        }
-    }
-}
 
 // ---- The command line ----
 
@@ -225,93 +165,6 @@ pub fn root_or_diag(given: *u8, cmd: *u8, name: [u8], with_name: bool) -> *u8 {
         }
         root
     }
-}
-
-// The front end, up to the checked program, for `target` (0: the host);
-// an error that would end the compilation jumps back to the caller's
-// ERR_BAIL.
-pub fn front_end(root: *u8, target0: i64) {
-    unsafe {
-        let mut t = timer_now();
-        ERR_KIND = c"tokenizer error";
-        let paths = alloc_array::<*u8>(1);
-        paths[0] = root;
-        load_sources(paths, 1);
-        init_lexer();
-        lex_range(FILES[0].start, FILES[0].end, false);
-        ERR_KIND = c"module error";
-        load_modules();
-        ERR_KIND = c"tokenizer error";
-        let mut target = target0;
-        if target == 0 {
-            target = host_target();
-        }
-        if target == 0 {
-            target = T_X86_64_LINUX;
-        }
-        set_target(target);
-        let dirs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        import_c_headers(target, &dirs, false, c"");
-        lex_range(FILES[FILE_COUNT - 1].end, FILES[FILE_COUNT - 1].end, true);
-        timer_add(T_LOAD, t);
-        t = timer_now();
-        init_ast();
-        ERR_KIND = c"parser error";
-        let program = parse_program();
-        if KEEP_PARSED {
-            keep_parsed();
-        }
-        if IMPORTED_START >= 0 {
-            drop_shadowed_imports(program);
-        }
-        collect_defs(program);
-        collect_derive_spans(program);
-        PARSED = true;
-        timer_add(T_PARSE, t);
-        t = timer_now();
-        MAIN_SYM = intern_c(c"main");
-        init_types();
-        init_declarations();
-        ERR_KIND = c"type error";
-        check_program(program);
-        timer_add(T_CHECK, t);
-    }
-}
-
-// Whether the program was parsed (the definitions are known).
-pub static mut PARSED: bool = false;
-
-// Reads the program of `root` for a question or a change (0.11): its front
-// end, as far as it gets (its errors are recorded, never printed), then
-// the paths and positions of its definitions; the hooks note what they
-// resolve (refs). Whether the program was parsed: when not, there is
-// nothing to answer with.
-pub fn load_program(root: *u8, target: i64) -> bool {
-    unsafe {
-        QUERY = true;
-        ERR_BAIL = alloc_zeroed(512);
-        if _setjmp(ERR_BAIL) == 0 {
-            front_end(root, target);
-        }
-        RECOVER_DEPTH = 0;
-        ERR_BAIL = 0 as *u8;
-        QUERY = false;
-        if !PARSED {
-            return false;
-        }
-        index_program();
-        true
-    }
-}
-
-// The paths and positions of the definitions of the program just read
-// (after its front end).
-pub fn index_program() {
-    let t = timer_now();
-    init_positions();
-    finish_defs();
-    init_containers();
-    timer_add(T_INDEX, t);
 }
 
 // The commands, for `--help` and the nearest command to a misspelt one.

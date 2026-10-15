@@ -1,65 +1,39 @@
-// `tachyonc fix [ROOT] [--only imports|unused|pub|unsafe] [--in FILE|MODULE]
-// [--dry-run]`
-// (0.11; docs/refactor.md): every fix the compiler can make by itself, in
-// one atomic edit (edit.tach), one summary line:
-//
-//   imports  the `use` lines the errors for unknown names ask for (`add
-//            `use crate::m::name;``), merged into a `use` of that module
-//            when there is one; and 0.8's wildcard migration (`use
-//            a::*;` becomes the names it brings: fiximports.tach)
-//   unused   imports nothing in their file names, removed
-//   pub      `pub` on the items other modules use while they are private
-//   unsafe   unsafe operations outside unsafe code, wrapped in unsafe
-//            blocks (fixunsafe.tach)
-//   std015   (0.15, only when asked for) the calls of 0.14 std functions
-//            whose result became a Result, given the method that gives
-//            the old value back (fixstd015.tach)
-//   alloc016 (0.16, only when asked for) allocation made explicit: std's
-//            0.15 forms (`Vec::new()`) become their `_in` forms, and the
-//            allocator is passed down from `fn main(gpa: Gpa)` to them
-//            (refactor_shape/alloc016.tach)
-//
-// `tachyonc --fix-imports ROOT` and `--fix-unsafe ROOT` (0.8, 0.9) are
-// `fix --only imports` and `fix --only unsafe`, silent when there is
-// nothing to do.
+// `tachyonc fix`'s command line: the kinds of fix (--only), the
+// import paths chosen for a missing name, and the rounds of fixes until
+// nothing is left (split from fix).
 
 use crate::base::{
-    BUFS, FILES, IntVec, OVERLAY, SRC, STDOUT, SYMS, buf_byte, buf_bytes, buf_int, buf_new,
-    buf_slice, buf_str, buf_write_fd, intern, streq,
+    BUFS, IntVec, OVERLAY, STDOUT, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
+    buf_write_fd, intern, streq,
 };
 use crate::front::ambient::AMBIENT_GPA;
-use crate::front::ast::{KEEP_PARSED, NODES, NODE_COUNT, NodeKind, child};
+use crate::front::ast::{KEEP_PARSED, NODES};
 use crate::front::generics::{TPL_NONE, template_of_key};
-use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
-use crate::front::modules::{
-    C_MODULE, MODULES, STD_MODULE, file_of_pos, item_key_if_known, module_count, module_of,
-};
-use crate::front::modules::lookup::{B_PRIVATE, LEGACY_IMPORTS, binding_kind, binding_value};
+use crate::front::modules::{C_MODULE, MODULES, STD_MODULE, item_key_if_known, module_count};
+use crate::front::modules::lookup::LEGACY_IMPORTS;
 use crate::front::parser::items::ITEM_PUBLIC;
 use crate::front::types::{
     SYM_ALIAS, SYM_CONST, SYM_ENUM, SYM_FN, SYM_STATIC, SYM_STRUCT, item_node_of,
 };
-use crate::tools::edit::{TARGET, TARGET_NAME, edit_count, edit_replace};
+use crate::tools::edit::{TARGET, TARGET_NAME, edit_count};
 use crate::tools::edit::apply::{
     STRICT_ALLOC, copy_rewritten, finish_edit, overlay_args, prepare_edit, set_command, write_round,
 };
-use crate::tools::edit::cli::{delete_lines, take_edit_option};
-use crate::tools::edit::items::{after_line, indent_of, node_head};
+use crate::tools::edit::cli::take_edit_option;
+use crate::tools::fix::{missing_use_edits, pub_edits, unused_import_edits};
 use crate::tools::fiximports::{FIX_IMPORTS, fix_imports_edits};
 use crate::tools::fixstd015::std015_edits;
 use crate::tools::fixunsafe::{FIX_UNSAFE, WHOLE_BODIES, fix_unsafe_edits};
-use crate::tools::query::{c_slice, load_program, root_or_diag};
-use crate::tools::query::defs::{DEFS, DEF_COUNT, MOD_DEF, mod_fqn, mod_fqn_text};
+use crate::tools::query::{c_slice, root_or_diag};
+use crate::tools::query::command_line::load_program;
+use crate::tools::query::defs::{mod_fqn, mod_fqn_text};
 use crate::tools::query::diagnostics::{
-    PROG, ROOT_GIVEN, TOOL, diag, program_errors, put_word, sym_less, try_begin, try_end,
-    write_diags,
+    PROG, ROOT_GIVEN, TOOL, diag, program_errors, put_word, try_begin, try_end, write_diags,
 };
-use crate::tools::query::positions::{line_end, line_start};
-use crate::tools::query::refs::{IN_FILE, IN_MODULE, OPT_IN, put_bad_in, ref_in, resolve_in};
-use crate::tools::query::show::text_start;
-use crate::tools::reexports::{reached_through, reexport_edits};
+use crate::tools::query::refs::{OPT_IN, put_bad_in, resolve_in};
+use crate::tools::reexports::reexport_edits;
 use crate::tools::refactor_shape::alloc016::{ALLOC016_LEFT, alloc016_edits};
-use crate::tools::tidyimports::{TIDY_EDITED, relative_style, styled_path, tidy_import_edits};
+use crate::tools::tidyimports::{TIDY_EDITED, tidy_import_edits};
 
 const F_IMPORTS: i64 = 1;
 const F_UNUSED: i64 = 2;
@@ -73,173 +47,6 @@ const F_STD015: i64 = 64;
 // (0.16: refactor_shape/alloc016.tach)
 const F_ALLOC016: i64 = 128;
 const F_ALL: i64 = 15;
-
-// What the checker found to fix: the imports an unknown name asks for
-// (module, path, name: symbols), and the private items used elsewhere
-// (their bindings).
-static mut MISSING: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static mut PRIVATE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-// The unknown `name` in module m is item `name` of the module with path
-// `path` (its help says `add `use PATH::name;``).
-pub fn note_missing_use(m: i64, path: i64, name: i64) {
-    let mut i = 0;
-    while i < MISSING.count {
-        if unsafe {
-            MISSING.data[i] == m && MISSING.data[i + 1] == path && MISSING.data[i + 2] == name
-        } {
-            return;
-        }
-        i += 3;
-    }
-    MISSING.push(m);
-    MISSING.push(path);
-    MISSING.push(name);
-}
-
-// Binding b (B_PRIVATE) was used where it is private.
-pub fn note_private(b: i64) {
-    if binding_kind(b) != B_PRIVATE {
-        return;
-    }
-    for i in 0..PRIVATE.count {
-        if unsafe { PRIVATE.data[i] == b } {
-            return;
-        }
-    }
-    PRIVATE.push(b);
-}
-
-// Whether module m passes --in: its file, or it or a module it is in (a
-// child of the module given passes, as for ref_in; 0.13).
-fn module_in(m: i64) -> bool {
-    unsafe {
-        if OPT_IN == 0 as *u8 {
-            return true;
-        }
-        let mut a = m;
-        while a >= 0 {
-            if IN_MODULE.data[a] != 0 {
-                return true;
-            }
-            a = if a > 0 { MODULES[a].parent } else { -1 };
-        }
-        for f in 0..crate::base::FILE_COUNT {
-            if FILES[f].module == m && IN_FILE.data[f] != 0 {
-                return true;
-            }
-        }
-        false
-    }
-}
-
-// Whether module m's code is in a file of the program (not std's, the C
-// headers').
-fn user_module(m: i64) -> bool {
-    m >= 0 && m != STD_MODULE && m != C_MODULE
-}
-
-fn user_pos(pos: i64) -> bool {
-    unsafe { FILES[file_of_pos(pos)].path[0] != '<' }
-}
-
-// ---- Missing imports ----
-
-// The path of Use node u (its segments before the imported names), as a
-// symbol: `crate::a::b`.
-fn use_path(u: i64) -> i64 {
-    unsafe {
-        let path = NODES[u].c;
-        let out = buf_new();
-        for i in 0..NODES[path].count {
-            if i > 0 {
-                buf_str(out, c"::");
-            }
-            buf_bytes(out, SYMS[NODES[child(path, i)].a].text);
-        }
-        intern(buf_slice(out))
-    }
-}
-
-// Whether Use node u, in module m, imports from the module of path p
-// (`crate::a`; written `a` in the root module).
-fn same_path(u: i64, m: i64, p: i64) -> bool {
-    unsafe {
-        let up = use_path(u);
-        if up == p || crate::tools::tidyimports::use_abs_path(u, m) == p {
-            return true;
-        }
-        let t = SYMS[p].text;
-        let w = SYMS[up].text;
-        m == 0 && t.len == w.len + 7 && crate::tools::proc::same_bytes(t[7..t.len], w)
-            && t[0] == 'c' && t[5] == ':'
-    }
-}
-
-// The Use items (not header imports, not `*`) of module m, by position.
-fn module_uses(m: i64, out: *IntVec) {
-    unsafe {
-        for n in 1..NODE_COUNT {
-            if NODES[n].kind == NodeKind::Use && NODES[n].d != 2 && module_of(n) == m
-                && user_pos(NODES[n].start) {
-                out.push(n);
-            }
-        }
-    }
-}
-
-// The edits adding the missing imports; their number.
-fn missing_use_edits() -> i64 {
-    unsafe {
-        let mut fixes = 0;
-        let mut done = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        // (0.16: the module, among several with the name: choose_path)
-        let mut i = 0;
-        while i < MISSING.count {
-            let m = MISSING.data[i];
-            if user_module(m) && module_in(m) {
-                MISSING.data[i + 1] = choose_path(m, MISSING.data[i + 2], MISSING.data[i + 1]);
-            }
-            i += 3;
-        }
-        i = 0;
-        while i < MISSING.count {
-            let m = MISSING.data[i];
-            let p = MISSING.data[i + 1];
-            i += 3;
-            if p < 0 || !user_module(m) || !module_in(m) {
-                continue;
-            }
-            // (once per module and path, with all its names)
-            let mut seen = false;
-            let mut k = 0;
-            while k < done.count {
-                if done.data[k] == m && done.data[k + 1] == p {
-                    seen = true;
-                }
-                k += 2;
-            }
-            if seen {
-                continue;
-            }
-            done.push(m);
-            done.push(p);
-            let mut names = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-            let mut j = 0;
-            while j < MISSING.count {
-                if MISSING.data[j] == m && MISSING.data[j + 1] == p {
-                    names.push(MISSING.data[j + 2]);
-                }
-                j += 3;
-            }
-            sort_syms(&names);
-            if add_import(m, p, &names) {
-                fixes += names.count;
-            }
-        }
-        fixes
-    }
-}
 
 // ---- Which module a missing import comes from (0.16) ----
 
@@ -372,7 +179,7 @@ fn nearer(a: i64, b: i64, m: i64) -> bool {
 // item `name` of the same kind, the one --use names, else the nearest
 // (the innermost module holding both, then the fewest segments) when no
 // other is as near; else -1, after fix.ambiguous.
-fn choose_path(m: i64, name: i64, p: i64) -> i64 {
+pub fn choose_path(m: i64, name: i64, p: i64) -> i64 {
     unsafe {
         let pm = module_of_path(p);
         if pm < 0 {
@@ -461,326 +268,6 @@ fn choose_path(m: i64, name: i64, p: i64) -> i64 {
             try_end(out);
         }
         -1
-    }
-}
-
-fn sort_syms(v: *IntVec) {
-    unsafe {
-        for k in 1..(*v).count {
-            let mut j = k;
-            while j > 0 && sym_less((*v).data[j], (*v).data[j - 1]) {
-                let t = (*v).data[j];
-                (*v).data[j] = (*v).data[j - 1];
-                (*v).data[j - 1] = t;
-                j -= 1;
-            }
-        }
-    }
-}
-
-// The edit importing `names` from the module of path p into module m:
-// into a `use` of that module, else a `use` line after m's last one (or
-// before its first item).
-fn add_import(m: i64, p: i64, names: *IntVec) -> bool {
-    unsafe {
-        let mut uses = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        module_uses(m, &uses);
-        for k in 0..uses.count {
-            let u = uses.data[k];
-            if NODES[u].b == 1 || !same_path(u, m, p) || NODES[u].count == 0 {
-                continue;
-            }
-            let last = child(u, NODES[u].count - 1);
-            let braces = brace_after(NODES[NODES[u].c].end, NODES[u].end);
-            let text = buf_new();
-            if braces {
-                // `use p::{a, b};` -> `use p::{a, b, NAME};`
-                for x in 0..(*names).count {
-                    buf_str(text, c", ");
-                    buf_bytes(text, SYMS[(*names).data[x]].text);
-                }
-                return edit_replace(NODES[last].end, NODES[last].end, text);
-            }
-            // `use p::a;` (or `use p::a as b;`) -> `use p::{a, NAME};`
-            let mut semi = NODES[u].end;
-            while semi > NODES[last].start && SRC[semi - 1] != ';' {
-                semi -= 1;
-            }
-            buf_byte(text, '{');
-            buf_bytes(text, SRC[NODES[last].start..semi - 1]);
-            for x in 0..(*names).count {
-                buf_str(text, c", ");
-                buf_bytes(text, SYMS[(*names).data[x]].text);
-            }
-            buf_byte(text, '}');
-            return edit_replace(NODES[last].start, semi - 1, text);
-        }
-        // A new line.
-        let line = buf_new();
-        buf_str(line, c"use ");
-        // (0.14: a child module's path as the module writes them)
-        let styled = styled_path(p, m, relative_style(m));
-        buf_bytes(line, SYMS[styled].text);
-        buf_str(line, c"::");
-        if (*names).count > 1 {
-            buf_byte(line, '{');
-        }
-        for x in 0..(*names).count {
-            if x > 0 {
-                buf_str(line, c", ");
-            }
-            buf_bytes(line, SYMS[(*names).data[x]].text);
-        }
-        if (*names).count > 1 {
-            buf_byte(line, '}');
-        }
-        buf_byte(line, ';');
-        if uses.count > 0 {
-            let u = uses.data[uses.count - 1];
-            let at = line_end(NODES[u].end - 1);
-            let text = buf_new();
-            buf_byte(text, '\n');
-            buf_bytes(text, indent_of(NODES[u].start));
-            buf_bytes(text, buf_slice(line));
-            return edit_replace(at, at, text);
-        }
-        // Before the module's first item (and its comments).
-        let mut first = -1;
-        for d in 0..DEF_COUNT {
-            if DEFS[d].module == m && DEFS[d].parent < 0 && user_pos(DEFS[d].start)
-                && (first < 0 || DEFS[d].start < DEFS[first].start) {
-                first = d;
-            }
-        }
-        if first < 0 {
-            return false;
-        }
-        let at = line_start(text_start(first));
-        let text = buf_new();
-        buf_bytes(text, indent_of(DEFS[first].start));
-        buf_bytes(text, buf_slice(line));
-        buf_str(text, c"\n\n");
-        edit_replace(at, at, text)
-    }
-}
-
-// Whether a `{` is in SRC[from..to).
-fn brace_after(from: i64, to: i64) -> bool {
-    unsafe {
-        for p in from..to {
-            if SRC[p] == '{' {
-                return true;
-            }
-        }
-        false
-    }
-}
-
-// ---- Unused imports ----
-
-// Whether identifier `name` is written in file f outside SRC[a..b).
-fn named_in_file(name: i64, f: i64, a: i64, b: i64) -> bool {
-    unsafe {
-        let lo = crate::tools::query::positions::token_at(FILES[f].start);
-        let mut i = lo;
-        while i < TOK_COUNT && TOKS[i].start < FILES[f].end {
-            if TOKS[i].kind == Tok::Ident && TOKS[i].value as i64 == name
-                && (TOKS[i].start < a || TOKS[i].start >= b) {
-                return true;
-            }
-            i += 1;
-        }
-        false
-    }
-}
-
-// The edits removing the imports nothing in their file names (a name
-// written anywhere in the file keeps its import: a local of that name
-// too); their number. `pub use` items are kept (other modules may use
-// what they bring).
-fn unused_import_edits(only_report: *IntVec) -> i64 {
-    unsafe {
-        let mut fixes = 0;
-        for u in 1..NODE_COUNT {
-            if NODES[u].kind != NodeKind::Use || NODES[u].d == 2 || NODES[u].b == 1
-                || (NODES[u].p & ITEM_PUBLIC) != 0 {
-                continue;
-            }
-            if !user_pos(NODES[u].start) || !user_module(module_of(u)) || !ref_in(NODES[u].start) {
-                continue;
-            }
-            let f = file_of_pos(NODES[u].start);
-            let n = NODES[u].count;
-            let mut unused = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-            for k in 0..n {
-                let id = child(u, k);
-                let local = if NODES[id].b != 0 { NODES[id].b } else { NODES[id].a };
-                // (an import other modules import or name through is used:
-                // `use crate::name` reaching the root's import, 0.12)
-                if !named_in_file(local, f, NODES[u].start, NODES[u].end)
-                    && !reached_through(module_of(u), local) {
-                    unused.push(k);
-                }
-            }
-            if unused.count == 0 {
-                continue;
-            }
-            if only_report != 0 as *IntVec {
-                for k in 0..unused.count {
-                    only_report.push(child(u, unused.data[k]));
-                }
-                continue;
-            }
-            if unused.count == n {
-                let head = node_head(NODES[u].start);
-                if blank_before(head) && blank_after(NODES[u].end) {
-                    delete_lines(line_start(head), NODES[u].end);
-                } else {
-                    edit_replace(head, NODES[u].end, buf_new());
-                }
-                fixes += n;
-                continue;
-            }
-            if n - unused.count == 1 && one_line_braces(u) {
-                // (one name left: `use p::{a};` is `use p::a;`)
-                let mut kept = 0;
-                for k in 0..n {
-                    let mut gone = false;
-                    for x in 0..unused.count {
-                        if unused.data[x] == k {
-                            gone = true;
-                        }
-                    }
-                    if !gone {
-                        kept = child(u, k);
-                    }
-                }
-                let mut open = NODES[NODES[u].c].end;
-                while SRC[open] != '{' {
-                    open += 1;
-                }
-                let mut close = NODES[u].end;
-                while SRC[close] != '}' {
-                    close -= 1;
-                }
-                let text = buf_new();
-                buf_bytes(text, SRC[NODES[kept].start..NODES[kept].end]);
-                if edit_replace(open, close + 1, text) {
-                    fixes += unused.count;
-                }
-                continue;
-            }
-            for k in 0..unused.count {
-                if remove_use_name(u, unused.data[k]) {
-                    fixes += 1;
-                }
-            }
-        }
-        fixes
-    }
-}
-
-// Whether Use node u lists its names between braces, on one line.
-fn one_line_braces(u: i64) -> bool {
-    unsafe {
-        brace_after(NODES[NODES[u].c].end, NODES[u].end) && same_line(NODES[u].start, NODES[u].end)
-    }
-}
-
-// Whether only blanks are before pos on its line.
-fn blank_before(pos: i64) -> bool {
-    unsafe {
-        let mut p = line_start(pos);
-        while p < pos && (SRC[p] == ' ' || SRC[p] == '\t') {
-            p += 1;
-        }
-        p == pos
-    }
-}
-
-// Whether only blanks (or a comment) are after pos on its line.
-fn blank_after(pos: i64) -> bool {
-    unsafe {
-        let e = line_end(pos);
-        let mut p = pos;
-        while p < e && (SRC[p] == ' ' || SRC[p] == '\t' || SRC[p] == '\r') {
-            p += 1;
-        }
-        p == e || (p + 1 < e && SRC[p] == '/' && SRC[p + 1] == '/')
-    }
-}
-
-// The edit removing name k of Use node u (one of several between braces),
-// with its separator: `a, b, c` loses `b, ` (its line, when it is alone
-// on it), the last loses `, c`.
-pub fn remove_use_name(u: i64, k: i64) -> bool {
-    unsafe {
-        let id = child(u, k);
-        let a = NODES[id].start;
-        let b = NODES[id].end;
-        let n = NODES[u].count;
-        if k + 1 < n {
-            let next = NODES[child(u, k + 1)].start;
-            if blank_before(a) && !same_line(b, next) {
-                // alone on its line: the line
-                return edit_replace(line_start(a), after_line(b), buf_new());
-            }
-            if same_line(b, next) {
-                return edit_replace(a, next, buf_new());
-            }
-            // last on its line: `, NAME` (from the end of the one before)
-            if k > 0 && same_line(NODES[child(u, k - 1)].end, a) {
-                return edit_replace(NODES[child(u, k - 1)].end, b, buf_new());
-            }
-            return edit_replace(a, next, buf_new());
-        }
-        // The last name: from the end of the one before.
-        let prev = NODES[child(u, k - 1)].end;
-        if blank_before(a) && !same_line(prev, a) {
-            let mut e = b;
-            if SRC[e] == ',' {
-                e += 1;
-            }
-            if blank_after(e) {
-                return edit_replace(line_start(a), after_line(b), buf_new());
-            }
-        }
-        edit_replace(prev, b, buf_new())
-    }
-}
-
-fn same_line(a: i64, b: i64) -> bool {
-    line_start(a) == line_start(b)
-}
-
-// ---- pub ----
-
-// The edits making the private items used elsewhere public; their number.
-fn pub_edits() -> i64 {
-    unsafe {
-        let mut fixes = 0;
-        for i in 0..PRIVATE.count {
-            let key = binding_value(PRIVATE.data[i]);
-            let mut node = item_node_of(key);
-            if node == 0 {
-                // a module: its `mod` item
-                for m in 1..module_count() {
-                    if MODULES[m].key == key && MOD_DEF.data[m] >= 0 {
-                        node = DEFS[MOD_DEF.data[m]].node;
-                    }
-                }
-            }
-            if node == 0 || (NODES[node].p & ITEM_PUBLIC) != 0 || !user_pos(NODES[node].start)
-                || !ref_in(NODES[node].start) {
-                continue;
-            }
-            let text = buf_new();
-            buf_str(text, c"pub ");
-            if edit_replace(NODES[node].start, NODES[node].start, text) {
-                fixes += 1;
-            }
-        }
-        fixes
     }
 }
 
@@ -1082,9 +569,4 @@ fn more_round(root: *u8, only_arg: *u8, counts: *[i64; 10]) -> bool {
 
 fn word_is(w: [u8], s: *u8) -> bool {
     unsafe { crate::tools::proc::same_bytes(w, c_slice(s)) }
-}
-
-// The imports nothing names (query unused): their Ident nodes, into out.
-pub fn unused_imports(out: *IntVec) {
-    unused_import_edits(out);
 }
