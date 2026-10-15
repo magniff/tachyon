@@ -3,14 +3,14 @@
 // materialized at a given iteration (eval_at), the vector form of a value
 // and the body on VF lanes (emit_body), and the identities of reductions.
 
-use crate::front::types::TY_BOOL;
+use crate::front::types::{TY_BOOL, TY_F64};
 use crate::middle::ir::{BLOCKS, Cond, INSTS, Op, ir_append, ir_make, ir_val};
 use crate::middle::ir::Op::{
     And, Cmp, Const, Load, Mul, Neg, Phi, Store, VBin, VCmp, VNeg, VSel, VSplat,
 };
 use crate::middle::loops::invariant_in;
 use crate::middle::vectorize::{
-    VC_SKIP, VC_UNIFORM, VC_VECTOR, V_CHAIN, V_EVAL, V_IV, V_MAP, V_START, V_VT,
+    VC_SKIP, VC_UNIFORM, VC_VECTOR, VC_WIDE, VC_WMUL, V_CHAIN, V_EVAL, V_IV, V_MAP, V_START, V_VT,
 };
 use crate::middle::vectorize::legality::{class_of, loads_in};
 
@@ -133,7 +133,15 @@ pub fn emit_body(l: i64, vh: i64, vp: i64) {
             while v != 0 {
                 let cls = class_of(v);
                 let op = INSTS[v].op;
-                if op == Phi || cls == VC_SKIP {
+                if op == Phi || cls == VC_SKIP || cls == VC_WIDE || cls == VC_WMUL {
+                    // ((0.16) the widened loads and their products: in the
+                    // VMACW of the add they go to)
+                    v = INSTS[v].next;
+                    continue;
+                }
+                if op == Op::Add && cls == VC_VECTOR && (class_of(ir_val(INSTS[v].a)) == VC_WMUL
+                    || class_of(ir_val(INSTS[v].b)) == VC_WMUL) {
+                    map_put(v, multiply_add(l, v, vh, vp));
                     v = INSTS[v].next;
                     continue;
                 }
@@ -178,6 +186,27 @@ pub fn emit_body(l: i64, vh: i64, vp: i64) {
                 v = INSTS[v].next;
             }
         }
+    }
+}
+
+// (0.16) The vector loop's value of v = x + k * (load as u64) (VC_WMUL's
+// product, either order): a VMACW of x's vector, the load's 8 bytes (two
+// u32, an f64 load) and k's splat.
+fn multiply_add(l: i64, v: i64, vh: i64, vp: i64) -> i64 {
+    unsafe {
+        let a = ir_val(INSTS[v].a);
+        let m = if class_of(a) == VC_WMUL { a } else { ir_val(INSTS[v].b) };
+        let x = if m == a { INSTS[v].b } else { INSTS[v].a };
+        let w = if class_of(ir_val(INSTS[m].a)) == VC_WIDE { ir_val(INSTS[m].a) }
+            else { ir_val(INSTS[m].b) };
+        let k = if w == ir_val(INSTS[m].a) { INSTS[m].b } else { INSTS[m].a };
+        let ld = if INSTS[w].op == Op::Conv { ir_val(INSTS[w].a) } else { w };
+        let acc = vector_of(x, vh, vp, l);
+        let pair = append(vh, Load, TY_F64, map_get(INSTS[ld].a), 0, INSTS[ld].imm);
+        let kv = vector_of(k, vh, vp, l);
+        let nv = append(vh, Op::VMacW, V_VT, acc, pair, 0);
+        INSTS[nv].c = kv;
+        nv
     }
 }
 

@@ -11,7 +11,7 @@ use crate::base::{IntVec, alloc_array, free, intern_c, memset};
 use crate::front::types::{TY_U64, is_integer, type_size};
 use crate::middle::egraph::{EGRAPH, egraph_rewrite, egraph_start};
 use crate::middle::fold::is_const;
-use crate::middle::ipo::{call_reads, call_writes};
+use crate::middle::ipo::{ATTR_READNONE, ATTR_READONLY, call_attrs, call_reads, call_writes};
 use crate::middle::ir::{
     BLOCKS, Cond, INSTS, IRFUNCS, Op, SLOTS, SLOT_COUNT, Term, ir_arg, ir_insert_before, ir_make,
     ir_operand, ir_operand_count, ir_replace, ir_resolve_operands, ir_set_operand, ir_unlink,
@@ -99,16 +99,35 @@ fn gvn_hash(v: i64) -> u64 {
         h = (h ^ INSTS[v].c as u64) * 1099511628211;
         h = (h ^ INSTS[v].imm as u64) * 1099511628211;
         h = (h ^ INSTS[v].imm2 as u64) * 1099511628211;
+        if INSTS[v].op.is_call() {
+            // (0.16) a call numbered by its callee and arguments
+            for i in 0..INSTS[v].nargs {
+                h = (h ^ ir_arg(v, i) as u64) * 1099511628211;
+            }
+        }
     }
     h ^ (h >> 29)
 }
 
 fn gvn_equal(v: i64, w: i64) -> bool {
     unsafe {
-        INSTS[v].op == INSTS[w].op && INSTS[v].cond == INSTS[w].cond && INSTS[v].ty == INSTS[w].ty
-            && INSTS[v].a == INSTS[w].a && INSTS[v].b == INSTS[w].b && INSTS[v].c == INSTS[w].c
-            && INSTS[v].imm == INSTS[w].imm
-            && INSTS[v].imm2 == INSTS[w].imm2
+        if !(INSTS[v].op == INSTS[w].op && INSTS[v].cond == INSTS[w].cond
+            && INSTS[v].ty == INSTS[w].ty && INSTS[v].a == INSTS[w].a && INSTS[v].b == INSTS[w].b
+            && INSTS[v].c == INSTS[w].c && INSTS[v].imm == INSTS[w].imm
+            && INSTS[v].imm2 == INSTS[w].imm2) {
+            return false;
+        }
+        if INSTS[v].op.is_call() {
+            if INSTS[v].nargs != INSTS[w].nargs || INSTS[v].c != INSTS[w].c {
+                return false;
+            }
+            for i in 0..INSTS[v].nargs {
+                if ir_arg(v, i) != ir_arg(w, i) {
+                    return false;
+                }
+            }
+        }
+        true
     }
 }
 
@@ -884,10 +903,105 @@ fn equal_value(w: i64) -> i64 {
     }
 }
 
+// (0.16) Calls numbered like pure instructions: the READONLY calls of the
+// current block since the last write (an equal one there is the same
+// value).
+static mut RO_CALLS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// How call v may be numbered: 1 when it reads and writes no memory
+// (ATTR_READNONE: an equal call dominating it is the same value), 2 when
+// it only reads (ATTR_READONLY: the same within a block while nothing is
+// written), 0 not at all (an indirect call, a compound result, no
+// result).
+fn call_numbering(v: i64) -> i64 {
+    unsafe {
+        let op = INSTS[v].op;
+        if op != Op::Call && op != CallC || INSTS[v].ty == 0 || INSTS[v].c != 0 {
+            return 0;
+        }
+        let attrs = call_attrs(v);
+        if (attrs & ATTR_READNONE) != 0 {
+            return 1;
+        }
+        if (attrs & ATTR_READONLY) != 0 {
+            return 2;
+        }
+        0
+    }
+}
+
+// Whether instruction v (a store, a copy or a call) may write memory a
+// READONLY call reads: anything but the caller's private slots.
+fn writes_for_calls(v: i64) -> bool {
+    unsafe {
+        let op = INSTS[v].op;
+        if op == Store {
+            let mut offset = 0;
+            return !is_private_slot(address_base(INSTS[v].a, &offset));
+        }
+        if is_copy(v) {
+            let mut offset = 0;
+            return !is_private_slot(address_base(copy_dst(v), &offset));
+        }
+        op.is_call() && call_writes(v)
+    }
+}
+
+// Whether calls v and w call one function with the same arguments.
+fn same_call(v: i64, w: i64) -> bool {
+    unsafe {
+        if INSTS[v].op != INSTS[w].op || INSTS[v].imm != INSTS[w].imm
+            || INSTS[v].nargs != INSTS[w].nargs {
+            return false;
+        }
+        for i in 0..INSTS[v].nargs {
+            if ir_val(ir_arg(v, i)) != ir_val(ir_arg(w, i)) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// (0.16) Whether function fi has two calls value numbering may merge (the
+// same callee and arguments, READNONE or READONLY): at -O2, its callees' attributes are
+// known only once they are optimized, after fi's first value numbering.
+pub fn repeated_pure_calls(fi: i64) -> bool {
+    unsafe {
+        let mut seen = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut found = false;
+        for i in 0..IRFUNCS[fi].blocks.count {
+            let b = IRFUNCS[fi].blocks.data[i];
+            if BLOCKS[b].removed != 0 {
+                continue;
+            }
+            let mut v = BLOCKS[b].first;
+            while v != 0 && !found {
+                if INSTS[v].op.is_call() && call_numbering(v) != 0 {
+                    for k in 0..seen.count {
+                        // (a readonly call is merged within its block only)
+                        if same_call(seen.data[k], v) && (call_numbering(v) == 1
+                            || INSTS[seen.data[k]].block == INSTS[v].block) {
+                            found = true;
+                        }
+                    }
+                    if seen.count < 64 {
+                        seen.push(v);
+                    }
+                }
+                v = INSTS[v].next;
+            }
+        }
+        free(seen.data as *u8);
+        found
+    }
+}
+
 fn gvn_block(b: i64, changed: *bool) {
     unsafe {
         COPIES.count = 0;
         PENDING.count = 0;
+        RO_CALLS.count = 0;
         let mut v = BLOCKS[b].first;
         while v != 0 {
             let next = INSTS[v].next;
@@ -923,8 +1037,32 @@ fn gvn_block(b: i64, changed: *bool) {
                         *changed = true;
                     }
                 }
-            } else if memory_step(v) {
-                *changed = true;
+            } else {
+                let numbering = if op.is_call() { call_numbering(v) } else { 0 };
+                let mut w = 0;
+                if numbering == 1 {
+                    w = gvn_find_or_add(v);
+                } else if numbering == 2 {
+                    for i in 0..RO_CALLS.count {
+                        if gvn_equal(v, RO_CALLS.data[i]) {
+                            w = RO_CALLS.data[i];
+                        }
+                    }
+                }
+                if w != 0 {
+                    ir_replace(v, w);
+                    *changed = true;
+                } else {
+                    if RO_CALLS.count > 0 && writes_for_calls(v) {
+                        RO_CALLS.count = 0;
+                    }
+                    if numbering == 2 {
+                        RO_CALLS.push(v);
+                    }
+                    if memory_step(v) {
+                        *changed = true;
+                    }
+                }
             }
             v = next;
         }

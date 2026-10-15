@@ -1564,3 +1564,135 @@ length below 2^63), so `child < end` does not prove `child <u len`; C
 has no checks, and its signed overflow is undefined. The remaining
 filter-map-sum gap is cc's knowledge of the length (the kernels are
 `static`: clang propagates the constant 1048576 into them).
+
+## 0.16: calls the effects make pure
+
+0.16's front end infers each function's effects
+([design/effects-allocation.md](design/effects-allocation.md)); the
+optimizer reads them as attributes and does three things with calls it
+did not do before.
+
+**Attributes from the front end** (`ipo::front_attrs`, ORed into
+`call_attrs` for every direct call): no raw `diverge` is `willreturn`
+(new information: the IR loses `willreturn` on any cycle, while the
+front end knows a counted `for` ends), no raw `panic` is `nopanic`, and
+a C function whose effects have no `alloc`, `io` or `global` and whose
+parameters are all numbers is `readnone`. A C function the program
+declares nothing about has the builtin table's effects
+(`front/effects/builtin.tach`, `known_c_effects`): libm none (so
+`readnone`, as 0.6's `PURE_LIBM` list had it, now the whole of libm),
+`mem*`/`str*` none, the allocation functions `alloc(extern)`, stdio and
+POSIX I/O `io`, `exit`/`abort` `io diverge` (and so not `nopanic`: a C
+function that may not return may stop the program). The lowering's own
+C calls (`callc`) take the table too, `readnone` when their arguments
+are floats.
+
+**Value numbering of calls** (`gvn.tach`): a direct call with a scalar
+result whose callee is `readnone` is hashed like a pure instruction, by
+its callee and its arguments, in the scoped table of the dominator-tree
+walk: a call dominated by an equal one is that one's value (the first
+returned, and a `readnone` callee's result depends on its arguments
+alone). A `readonly` callee's calls are merged within a block while
+nothing in between may write what they read: a store or copy outside
+the caller's private slots, or a call that writes. At -O2 a function's
+callees get their attributes only once they are optimized, after the
+function's first value numbering; a function with two such calls of one
+callee is simplified again after inlining (`repeated_pure_calls`).
+
+**Loop-invariant calls** (`licm.tach`): a direct call with a scalar
+result, `readnone`, its arguments defined outside the loop, moves to the
+preheader when it is also `willreturn` and `nopanic` (it may then run
+where the loop would not have run it: on no path, or once for a call
+that ran on some iterations), or when it is certain to run in the
+loop's first iteration before anything visible (`runs_first`): its
+block dominates every block that leaves the loop or goes back to its
+header, no inner loop comes before it, and the calls that may run
+before it in an iteration are `readonly`, `willreturn` and `nopanic`. A
+store before it does not matter: if the moved call stops the program
+or never returns, nothing reads that memory again. A call after a
+`printf` in the loop stays (the print must come first when the call
+runs forever).
+
+**Allocation through the Allocator trait** costs no call where it need
+not. Gpa's methods are `#[inline]`, so `gpa.alloc(64, 8)` is `malloc(64)`
+plus a null check, and `heap_to_stack` turns a block that does not
+escape into a frame slot as before; the null check of the slot's
+address now folds (instruction combining: the address of a slot, a
+static or constant data, plus a small offset, is not null), and with it
+goes the comparison that made the slot escape. An arena's bump path,
+written as std's will be (the fast path in `try_alloc`, the refill in a
+`#[cold]` function of its own), inlines into its caller: a load of the
+state, the aligned bump, a compare with the limit, a store, and the
+refill call on the cold edge.
+
+Tests: `tests/run/opt_effects_cse.tach` (readnone calls merged across
+blocks, libm's `sqrt`, readonly calls merged and not merged across a
+store), `opt_effects_licm.tach` (a `readnone` call that may loop forever
+hoisted because it runs first, a `readnone willreturn nopanic` call
+under a condition hoisted, one after a print and one reading a static
+the loop writes left in place), `opt_effects_arena.tach` (the bump path
+without a call, heap to stack through Gpa). Benchmarks:
+`bench/purecall.tach` against `bench/purecall_hoisted.tach` (the same
+with the calls hoisted and merged by hand), whose -O2 ratio bench/run.sh
+checks against 1.05 like the iterator and f-string pairs; and
+`bench/arena_trees.tach` (binarytrees with arenas through the Allocator
+trait, its C twin `arena_trees.c`).
+
+**The gaps examples/algorithms found** (against clang -O2; the times are
+the examples' own, best of 10 on a busy Apple M-series machine, before =
+this branch after merging release-0.15, so with 0.15's if-conversion):
+
+| gap | what was done | before | after | C |
+|---|---|---|---|---|
+| dijkstra, heap of `#[derive(Ord)]` structs | branch-free comparator | 88 ms | 71 ms | 50 ms |
+| nqueens on `u32` masks | w registers | 109 ms | 76-86 ms | 69-75 ms |
+| bigint F(10^6) / 5000-limb schoolbook | umlal (VMACW) | 46 / 8.0 ms | 35 / 5.6 ms | 25 / 4.4 ms |
+| sudoku with `std::count_ones` | BITS (cnt) | 99 ms (hand SWAR) | 99-102 ms | 91 ms |
+| lru-cache | not done | 236 ms | 232 ms | 154 ms |
+
+- *Comparators.* A derived `<` is `cmp(a, b) < 0` over an inlined `cmp`
+  whose arms return -1, 0 or 1: a phi of constants (and phis of them, and
+  selects of constants) compared with a constant is now a phi of the
+  comparisons' bools (`compare_phi`, fold.tach: every operand's outcome
+  known, so an induction variable's comparison is left alone);
+  tags.tach threads branches on bool phis too; if-conversion
+  (ifconv.tach) first merges a block of phis only into the block whose
+  phis take them (so the outer branch of an `if` nested in another's arm
+  is a diamond), converts bool phis, and runs again while it converts;
+  `k ? true : y` is `k | y` and its three siblings (combine_select); a
+  chain of branches to a common destination becomes one branch on the
+  `or` of its conditions (`fold_branch_chain`, LLVM's
+  FoldBranchToCommonDest, arms of at most 8 cheap instructions); and a
+  negated `or` of comparisons is an `and` of the opposite comparisons (De
+  Morgan, `combine_not`). A heap's `s[c + 1] < s[c]` on two-field structs
+  is then `lt(d) | (eq(d) & lt(n))` and a select: no branch to mispredict.
+- *u32 on AArch64.* Integers are kept canonical, and a u32 operation was
+  a 64-bit one plus `mov wN, wN`. The machine layer now writes u32 add,
+  sub, mul, shifts, divisions, madd and the shifted-operand forms on the
+  w registers (`MA_W32`), whose results are zero-extended; and on both
+  targets an and, or, xor, right shift or unsigned division of canonical
+  operands is not normalized again (`stays_canonical`).
+- *Bit counts.* std gains `count_ones`, `leading_zeros` and
+  `trailing_zeros` (u64 in, i64 out: 64 for zero); the lowering makes
+  them the IR's BITS on AArch64 (`fmov`, `cnt`, `addv`, `fmov`; `clz`;
+  `rbit` and `clz`), folded on constants, value-numbered and hoisted like
+  any pure instruction; on x86-64, whose baseline has no POPCNT, they
+  stay calls of their bodies (a few shifts and masks each).
+- *Widening multiply-accumulate.* The vectorizer takes a u32 load that
+  only feeds u64 products (VC_WIDE), its product with an invariant below
+  2^32 (VC_WMUL), and the add of that product to a vector or a reduction:
+  one VMACW per two lanes, an 8-byte load of the two u32 (as an f64:
+  memory stays an ordinary load for the alias analysis) and AArch64's
+  `umlal vd.2d, vn.2s, vk.s[0]`. bigint's schoolbook kernel and dot
+  products of u32 by a u32 are clang's code then.
+- *Not done:* lru-cache's probe loop (its out-of-line `HashMap::insert`
+  is not found nocapture, so the cache's fields stay in memory around
+  it; promoting them through non-capturing calls was tried and cost 30 ms
+  of self-compile for nothing here); the widening multiply on x86-64
+  (pmuludq).
+
+Tests: `opt_ord_select` (a heap's sift on structs: and/or and a select,
+one branch for the exit), `opt_u32_ops` (w registers, no `mov wN, wN`,
+against -O0), `opt_bits` (cnt, clz, rbit; constants folded; -O0's
+bodies), `opt_vectorize_widen` (umlal for `out[j] += k * b[j]` and a dot
+product).

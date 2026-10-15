@@ -17,14 +17,16 @@ use crate::front::types::{
 };
 use crate::gen0::target::log2;
 use crate::middle::ir::{
-    BLOCKS, Cond, INSTS, IRF, IRFUNCS, Op, Term, ir_arg, ir_insert_before, ir_make, ir_operand,
-    ir_operand_count, ir_prepend, ir_replace, ir_resolve_operands, ir_val,
+    BITS_LEADING, BITS_ONES, BLOCKS, Cond, INSTS, IRF, IRFUNCS, Op, Term, ir_append, ir_arg,
+    ir_insert_before, ir_make, ir_operand, ir_operand_count, ir_prepend, ir_replace,
+    ir_resolve_operands, ir_val,
 };
 use crate::middle::ir::Op::{
     Add, And, BNot, Cmp, Const, Conv, Div, Load, Mul, Neg, Not, Or, Phi, Rem, Shl, Shr, Store, Sub,
     Xor,
 };
 use crate::middle::ir::cfg::{succ, succ_count, switch_target};
+use crate::middle::loops::new_phi_in;
 use crate::middle::opt::{
     remove_pred, remove_trivial_phis, remove_unreachable, resolve_all, switch_to_jump,
 };
@@ -40,6 +42,22 @@ pub fn shift_amount(b: i64, ty: i64) -> u64 {
     (b & (if int_bits(ty) == 64 { 63 } else { 31 })) as u64
 }
 
+// (0.16) BITS of the constant a: its 1 bits, its leading or its trailing
+// zeros (kind: BITS_ONES, BITS_LEADING, BITS_TRAILING; 64 for 0).
+pub fn fold_bits(kind: i64, a: i64) -> i64 {
+    let x = a as u64;
+    let mut n = 0;
+    for i in 0..64 {
+        let bit = (x >> (if kind == BITS_LEADING { 63 - i } else { i }) as u64) & 1;
+        if kind == BITS_ONES {
+            n += bit as i64;
+        } else if bit != 0 {
+            return i;
+        }
+    }
+    if kind == BITS_ONES { n } else { 64 }
+}
+
 // a <op> b (or <op> a) for constant operands, as the machine computes it.
 pub fn fold_value(v: i64, a: i64, b: i64) -> i64 {
     unsafe {
@@ -49,6 +67,7 @@ pub fn fold_value(v: i64, a: i64, b: i64) -> i64 {
             Const => return INSTS[v].imm,
             Cmp => return fold_compare(INSTS[v].cond, INSTS[v].imm2, a, b) as i64,
             Conv => return fold_conversion(INSTS[v].imm2, ty, a),
+            Op::Bits => return fold_bits(INSTS[v].imm, a),
             _ => {}
         }
         if is_float(ty) {
@@ -616,6 +635,57 @@ pub fn all_ones(ty: i64) -> i64 {
     wrap_int(-1, ty)
 }
 
+// (0.16) !a when a is a comparison of integers: the opposite comparison;
+// !(x | y) and !(x & y) when x and y negate for free (comparisons of
+// integers, negations, and and or of such): !x & !y and !x | !y (what
+// merged branch chains leave, ifconv.tach).
+fn combine_not(v: i64, a: i64) -> bool {
+    unsafe {
+        if !negates_free(a, 0) || INSTS[a].op == Not {
+            return false;
+        }
+        let n = negated(a, v);
+        INSTS[v].op = INSTS[n].op;
+        INSTS[v].cond = INSTS[n].cond;
+        INSTS[v].a = INSTS[n].a;
+        INSTS[v].b = INSTS[n].b;
+        INSTS[v].imm2 = INSTS[n].imm2;
+        true
+    }
+}
+
+// The negation of x (negates_free), made before instruction `at`.
+fn negated(x: i64, at: i64) -> i64 {
+    unsafe {
+        let op = INSTS[x].op;
+        if op == Not {
+            return INSTS[x].a;
+        }
+        if op == Cmp {
+            let c = op_before(at, Cmp, TY_BOOL, INSTS[x].a, INSTS[x].b);
+            INSTS[c].cond = INSTS[x].cond.negate();
+            INSTS[c].imm2 = INSTS[x].imm2;
+            return c;
+        }
+        let a = negated(INSTS[x].a, at);
+        let b = negated(INSTS[x].b, at);
+        op_before(at, if op == Or { And } else { Or }, TY_BOOL, a, b)
+    }
+}
+
+// Whether bool x negates without an instruction more: a comparison of
+// integers, a negation, or an `and` or `or` of such (a few deep).
+fn negates_free(x: i64, depth: i64) -> bool {
+    unsafe {
+        let op = INSTS[x].op;
+        if op == Not || op == Cmp && !is_float(INSTS[x].imm2) {
+            return true;
+        }
+        (op == And || op == Or) && INSTS[x].ty == TY_BOOL && depth < 3
+            && negates_free(INSTS[x].a, depth + 1) && negates_free(INSTS[x].b, depth + 1)
+    }
+}
+
 // Rewrites instruction v into something cheaper; returns whether it
 // changed (v may have been replaced).
 fn combine(v: i64) -> bool {
@@ -629,6 +699,9 @@ fn combine(v: i64) -> bool {
             let a = INSTS[v].a;
             if INSTS[a].op == op && !(op == Neg && is_float(ty)) {
                 return replace_same_type(v, INSTS[a].a);
+            }
+            if op == Not {
+                return combine_not(v, a);
             }
             return false;
         }
@@ -741,6 +814,31 @@ pub fn combine_select(v: i64) -> bool {
             return replace_same_type(v, if INSTS[k].imm != 0 { x } else { y });
         }
         let ty = INSTS[v].ty;
+        if ty == TY_BOOL && INSTS[k].ty == TY_BOOL && (is_const(x) || is_const(y)) {
+            // (0.16) Bools: k ? true : y is k | y, k ? x : false is k & x
+            // (and with !k the other two), what if-converted `||` and `&&`
+            // (a comparator's `<`) leave.
+            if is_const(x) && is_const(y) {
+                if INSTS[x].imm != 0 {
+                    return replace_same_type(v, k);
+                }
+                INSTS[v].op = Not;
+                INSTS[v].b = 0;
+                INSTS[v].c = 0;
+                return true;
+            }
+            // k ? true : y = k | y, k ? false : y = !k & y; k ? x : false =
+            // k & x, k ? x : true = !k | x.
+            let then_const = is_const(x);
+            let truth = INSTS[if then_const { x } else { y }].imm != 0;
+            let other = if then_const { y } else { x };
+            let negate = then_const != truth;
+            INSTS[v].op = if truth { Or } else { And };
+            INSTS[v].a = if negate { op_before(v, Not, TY_BOOL, k, 0) } else { k };
+            INSTS[v].b = other;
+            INSTS[v].c = 0;
+            return true;
+        }
         if !is_integer(ty) {
             return false;
         }
@@ -819,6 +917,91 @@ fn combine_division(v: i64, a: i64, c: i64) -> bool {
     }
 }
 
+// Whether v is the address of a frame slot, a static or constant data,
+// plus a small constant offset: never null.
+fn is_object_address(v: i64) -> bool {
+    unsafe {
+        let mut x = v;
+        let mut offset = 0;
+        while INSTS[x].op == Add && INSTS[x].ty == TY_U64 && is_const(INSTS[x].b) {
+            offset += INSTS[INSTS[x].b].imm;
+            x = INSTS[x].a;
+        }
+        let op = INSTS[x].op;
+        (op == Op::Slot || op == Op::GAddr || op == Op::SAddr) && offset >= 0 && offset < 1 << 32
+    }
+}
+
+// (0.16) x <cond> c, compare v, when x is a phi whose operands give known
+// outcomes (constants, selects of constants, phis of such): a phi of
+// those outcomes. A comparator's ordering (-1, 0 or 1 from the
+// arms of an inlined `cmp`) compared with 0 becomes the comparison it
+// stands for.
+fn compare_phi(v: i64, x: i64, cond: Cond, ty: i64, c: i64) -> bool {
+    unsafe {
+        let n = INSTS[x].nargs;
+        if n < 2 || n > 8 {
+            return false;
+        }
+        // (Every operand known: an induction variable's comparison, its
+        // operand from the latch arithmetic, stays what the ranges and the
+        // loop passes know.)
+        for i in 0..n {
+            if !outcome_known(ir_arg(x, i), x, cond, ty, c, 0) {
+                return false;
+            }
+        }
+        let phi = outcome_phi(x, cond, ty, c);
+        ir_replace(v, phi);
+        true
+    }
+}
+
+// Whether w <cond> c is known at the end of each path to it: w a
+// constant, a select of constants, or a phi (not `top`, a few deep) of
+// such.
+fn outcome_known(w: i64, top: i64, cond: Cond, ty: i64, c: i64, depth: i64) -> bool {
+    unsafe {
+        if select_outcome(w, cond, ty, c, 0) >= 0 {
+            return true;
+        }
+        if INSTS[w].op != Phi || w == top || depth >= 3 || INSTS[w].nargs > 8 {
+            return false;
+        }
+        for i in 0..INSTS[w].nargs {
+            if !outcome_known(ir_arg(w, i), top, cond, ty, c, depth + 1) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// The phi of x's operands' outcomes (bools) in x's block (outcome_known
+// of each).
+fn outcome_phi(x: i64, cond: Cond, ty: i64, c: i64) -> i64 {
+    unsafe {
+        let n = INSTS[x].nargs;
+        let b = INSTS[x].block;
+        let mut values = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..n {
+            let p = BLOCKS[b].preds.data[i];
+            let w = ir_arg(x, i);
+            let known = select_outcome(w, cond, ty, c, 0);
+            if known >= 0 {
+                let k = ir_make(Const, TY_BOOL, 0, 0, known);
+                ir_append(p, k);
+                values.push(k);
+            } else {
+                values.push(outcome_phi(w, cond, ty, c));
+            }
+        }
+        let phi = new_phi_in(b, TY_BOOL, &values, 0, n);
+        free(values.data as *u8);
+        phi
+    }
+}
+
 fn combine_compare(v: i64) -> bool {
     unsafe {
         let mut a = INSTS[v].a;
@@ -836,6 +1019,13 @@ fn combine_compare(v: i64) -> bool {
         }
         if a == b && !is_float(ty) {
             return make_const(v, (cond == Cond::Eq || cond == Cond::Le || cond == Cond::Ge) as i64);
+        }
+        if (cond == Cond::Eq || cond == Cond::Ne) && is_const(b) && INSTS[b].imm == 0
+            && is_object_address(a) {
+            // (0.16) The address of a slot, a static or constant data is not
+            // null (an allocation heap_to_stack made a slot, checked for
+            // null).
+            return make_const(v, (cond == Cond::Ne) as i64);
         }
         // (0.15) A select of constants compared with a constant: the
         // select's condition, its negation, or a constant (a comparator's
@@ -858,6 +1048,10 @@ fn combine_compare(v: i64) -> bool {
                 INSTS[v].cond = Cond::Eq;
                 return true;
             }
+        }
+        if is_const(b) && INSTS[a].op == Phi && !is_float(ty)
+            && compare_phi(v, a, cond, ty, INSTS[b].imm) {
+            return true;
         }
         if ty == TY_BOOL && is_const(b) && !is_const(a) {
             // b != false, b == true: b itself.

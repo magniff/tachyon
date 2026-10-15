@@ -4,6 +4,7 @@
 // class of each of its instructions (uniform, vector or skipped), with the
 // affine coefficients of values in the induction variables (coef).
 
+use crate::base::target::X86;
 use crate::front::types::{
     TY_BOOL, TY_F32, TY_F64, TY_I16, TY_I32, TY_I64, TY_I8, TY_U16, TY_U32, TY_U64, TY_U8, int_bits,
     is_float, is_integer, is_signed, type_size, vector_type,
@@ -22,8 +23,9 @@ use crate::middle::loops::{
 use crate::middle::profile::is_cold_block;
 use crate::middle::scev::counted_loop;
 use crate::middle::vectorize::{
-    VC_SKIP, VC_UNIFORM, VC_VECTOR, VEC_MAX_INSTS, VEC_MAX_OVERLAPS, VSTAMP, V_ACCESS, V_CHAIN,
-    V_CHECKS, V_ELEM, V_HAS_STORE, V_HAS_ULOAD, V_IV, V_IV2, V_N, V_NE, V_REDS, V_SIZE, V_VF, V_VT,
+    VC_SKIP, VC_UNIFORM, VC_VECTOR, VC_WIDE, VC_WMUL, VEC_MAX_INSTS, VEC_MAX_OVERLAPS, VSTAMP,
+    V_ACCESS, V_CHAIN, V_CHECKS, V_ELEM, V_HAS_STORE, V_HAS_ULOAD, V_IV, V_IV2, V_N, V_NE, V_REDS,
+    V_SIZE, V_VF, V_VT,
 };
 use crate::middle::vectorize::checks::{overlap_pairs, record_check};
 
@@ -142,6 +144,9 @@ pub fn vector_operand_ok(l: i64, v: i64) -> bool {
     let c = class_of(x);
     if c == VC_VECTOR {
         return true;
+    }
+    if c == VC_WIDE || c == VC_WMUL {
+        return false;
     }
     coef(l, x) == 0
 }
@@ -464,6 +469,14 @@ fn classify(l: i64, v: i64, latch_cond: i64) -> bool {
             let ty = INSTS[v].ty;
             let addr = ir_val(INSTS[v].a);
             let c = coef(l, addr);
+            // (0.16) Two u32 a lane of u64 each: VC_WIDE (AArch64)
+            if ty == TY_U32 && c == 4 && !X86 && only_widened(l, v) {
+                V_ACCESS.push(v);
+                V_ACCESS.push(addr);
+                V_ACCESS.push(4);
+                set_class(v, VC_WIDE);
+                return true;
+            }
             if c == 0 && (class_of(addr) == VC_UNIFORM || invariant_in(l, addr)) {
                 // An invariant address: the same value in every iteration (a
                 // store reaching it is ruled out by the overlap test).
@@ -499,6 +512,9 @@ fn classify(l: i64, v: i64, latch_cond: i64) -> bool {
         }
         let a = if INSTS[v].a != 0 { class_of(ir_val(INSTS[v].a)) } else { 0 };
         let b = if INSTS[v].b != 0 { class_of(ir_val(INSTS[v].b)) } else { 0 };
+        if a == VC_WIDE || b == VC_WIDE || a == VC_WMUL || b == VC_WMUL {
+            return classify_wide(l, v, a, b);
+        }
         // (0.15) A comparison of vectors used only by selects: a mask
         // (signed when ordered: the vector comparisons are).
         if op == Op::Cmp && (a == VC_VECTOR || b == VC_VECTOR) {
@@ -548,5 +564,87 @@ fn classify(l: i64, v: i64, latch_cond: i64) -> bool {
             return true;
         }
         false
+    }
+}
+
+// (0.16) Classifies v, an instruction of loop l with a VC_WIDE or VC_WMUL
+// operand (a and b: its operands' classes): the widening of a u32 load,
+// the product of one with an invariant below 2^32, or an add of such a
+// product to a vector (a VMACW). Anything else of theirs: false.
+fn classify_wide(l: i64, v: i64, a: i64, b: i64) -> bool {
+    unsafe {
+        let op = INSTS[v].op;
+        let ty = INSTS[v].ty;
+        if ty != TY_U64 && ty != TY_I64 {
+            return false;
+        }
+        if op == Conv && a == VC_WIDE && INSTS[v].imm2 == TY_U32 {
+            set_class(v, VC_WIDE);
+            return true;
+        }
+        if op == Mul && (a == VC_WIDE) != (b == VC_WIDE) {
+            let k = ir_val(if a == VC_WIDE { INSTS[v].b } else { INSTS[v].a });
+            let w = ir_val(if a == VC_WIDE { INSTS[v].a } else { INSTS[v].b });
+            if class_of(k) == VC_VECTOR || !vector_operand_ok(l, k)
+                || !below_2_32(k) || !use_elem(ty) {
+                return false;
+            }
+            set_class(v, VC_WMUL);
+            return true;
+        }
+        if op == Add && (a == VC_WMUL) != (b == VC_WMUL) {
+            let other = if a == VC_WMUL { INSTS[v].b } else { INSTS[v].a };
+            if !vector_operand_ok(l, other) || !use_elem(ty) {
+                return false;
+            }
+            set_class(v, VC_VECTOR);
+            return true;
+        }
+        false
+    }
+}
+
+// Whether value k is below 2^32: a value of an unsigned type of at most
+// 32 bits (canonical: its u64 is the same; a load, a parameter, what
+// widening left), or such a constant.
+fn below_2_32(k: i64) -> bool {
+    unsafe {
+        if is_const(k) {
+            return INSTS[k].imm >= 0 && INSTS[k].imm < 1 << 32;
+        }
+        let t = INSTS[k].ty;
+        if INSTS[k].op == Conv {
+            let from = INSTS[k].imm2;
+            return from == TY_U32 || from == TY_U16 || from == TY_U8;
+        }
+        t == TY_U32 || t == TY_U16 || t == TY_U8
+    }
+}
+
+// Whether every use of u32 load v in loop l is its widening to 64 bits,
+// or a 64-bit product (a canonical u32 is its u64 already).
+fn only_widened(l: i64, v: i64) -> bool {
+    unsafe {
+        for k in 0..V_CHAIN.count {
+            let b = V_CHAIN.data[k];
+            let mut x = BLOCKS[b].first;
+            while x != 0 {
+                for i in 0..ir_operand_count(x) {
+                    let o = ir_operand(x, i);
+                    if o != 0 && ir_val(o) == v && !(i == 0 && INSTS[x].op == Conv
+                        && INSTS[x].imm2 == TY_U32
+                        && (INSTS[x].ty == TY_U64 || INSTS[x].ty == TY_I64)
+                        || i <= 1 && INSTS[x].op == Mul
+                        && (INSTS[x].ty == TY_U64 || INSTS[x].ty == TY_I64)) {
+                        return false;
+                    }
+                }
+                x = INSTS[x].next;
+            }
+            if BLOCKS[b].cond != 0 && ir_val(BLOCKS[b].cond) == v {
+                return false;
+            }
+        }
+        true
     }
 }

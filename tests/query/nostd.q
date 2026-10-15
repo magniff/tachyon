@@ -8,7 +8,7 @@ $ def read_line twice
 std::read_line	<std>:2012:8	fn	pub fn read_line<A: Allocator>(line: *Buf<A>) -> Result<bool, IoError>
 crate::twice	nostd/main.tach:4:4	fn	fn twice(x: i64) -> i64	effects: none
 $ show std::print_int
-// std::print_int	<std>:2401-2409	effects: io global panic
+// std::print_int	<std>:2432-2440	effects: io global panic
 // use std::print_int;
 #[inline(never)]
 pub fn print_int(v: i64) {

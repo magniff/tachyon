@@ -12,7 +12,12 @@ use crate::base::{
     IntVec, STDERR, alloc_array, buf_byte, buf_int, buf_new, buf_str, buf_write_fd, free, intern_c,
     sym_name,
 };
-use crate::front::types::{FNS, TYPES, TY_U64, TY_U8};
+use crate::front::effects::{
+    EFF_ALLOC_EXTERN, EFF_DIVERGE, EFF_GLOBAL, EFF_IO, EFF_PANIC, EFF_RAW_DIVERGE, EFF_RAW_PANIC,
+    EFF_UNKNOWN, Effects, fn_effects,
+};
+use crate::front::effects::builtin::known_c_effects;
+use crate::front::types::{FNS, TLISTS, TYPES, TY_BOOL, TY_U64, TY_U8, is_float, is_integer};
 use crate::gen0::gen::fn_is_global;
 use crate::gen0::target::rt_panic_sym;
 use crate::middle::fold::is_const;
@@ -21,9 +26,9 @@ use crate::middle::gvn::{
 };
 use crate::middle::inline::{FN_ADDRESS, FN_LIVE, FN_SCC, SCC_ORDER, ir_callee, param_operand};
 use crate::middle::ir::{
-    BLOCKS, FN_IR, INSTS, IRF, IRFUNCS, IRFUNC_COUNT, Op, Term, ir_append, ir_arg, ir_insert_before,
-    ir_make, ir_new_slot, ir_operand, ir_operand_count, ir_replace, ir_set_operand, ir_unlink,
-    ir_val,
+    ARGTY, BLOCKS, FN_IR, INSTS, IRF, IRFUNCS, IRFUNC_COUNT, Op, Term, ir_append, ir_arg,
+    ir_insert_before, ir_make, ir_new_slot, ir_operand, ir_operand_count, ir_replace,
+    ir_set_operand, ir_unlink, ir_val,
 };
 use crate::middle::ir::Op::{
     Add, Call, CallC, CallI, Cmp, Const, Copy, FAddr, Load, Param, SAddr, Store,
@@ -64,35 +69,6 @@ pub fn init_attrs() {
     ATTRS_READY = true;
 }
 
-// The symbols of the C library functions known to compute only from their
-// arguments (no errno either).
-static mut PURE_LIBM: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-fn is_pure_libm(name: i64) -> bool {
-    unsafe {
-        if PURE_LIBM.count == 0 {
-            PURE_LIBM.push(intern_c(c"fabs"));
-            PURE_LIBM.push(intern_c(c"fabsf"));
-            PURE_LIBM.push(intern_c(c"floor"));
-            PURE_LIBM.push(intern_c(c"floorf"));
-            PURE_LIBM.push(intern_c(c"ceil"));
-            PURE_LIBM.push(intern_c(c"ceilf"));
-            PURE_LIBM.push(intern_c(c"trunc"));
-            PURE_LIBM.push(intern_c(c"truncf"));
-            PURE_LIBM.push(intern_c(c"round"));
-            PURE_LIBM.push(intern_c(c"roundf"));
-            PURE_LIBM.push(intern_c(c"fmod"));
-            PURE_LIBM.push(intern_c(c"fmodf"));
-        }
-        for i in 0..PURE_LIBM.count {
-            if PURE_LIBM.data[i] == name {
-                return true;
-            }
-        }
-        false
-    }
-}
-
 // What call v is known to do, as attribute bits (0: nothing known).
 pub fn call_attrs(v: i64) -> i64 {
     unsafe {
@@ -100,10 +76,7 @@ pub fn call_attrs(v: i64) -> i64 {
         if op == Call {
             let g = FN_IR[INSTS[v].imm] - 1;
             if g < 0 {
-                // A C function.
-                if is_pure_libm(FNS[INSTS[v].imm].name) {
-                    return ATTR_READNONE | ATTR_READONLY | ATTR_WILLRETURN | ATTR_NOPANIC;
-                }
+                // A C function (builtin.tach's table, or its declaration).
                 return front_attrs(INSTS[v].imm);
             }
             if ATTRS_READY && FN_ATTRS_DONE[g] != 0 {
@@ -118,9 +91,7 @@ pub fn call_attrs(v: i64) -> i64 {
                 // instruction could see, and nothing comes after it.
                 return ATTR_READNONE | ATTR_READONLY | ATTR_NORETURN;
             }
-            if is_pure_libm(name) {
-                return ATTR_READNONE | ATTR_READONLY | ATTR_WILLRETURN | ATTR_NOPANIC;
-            }
+            return c_lib_attrs(v, name);
         }
         0
     }
@@ -128,10 +99,74 @@ pub fn call_attrs(v: i64) -> i64 {
 
 // What the front end's effects (0.16, front/effects) say of function f (an
 // FNS index), as attribute bits: ¬raw diverge WILLRETURN, ¬raw panic
-// NOPANIC, an extern declared without alloc, io or global and with only
-// non-pointer parameters READNONE (0.16 T4). 0: nothing yet.
+// NOPANIC, and a C function without alloc, io or global whose parameters
+// are all numbers READNONE (and so READONLY). A C function the inference
+// left unknown and that declares nothing has builtin.tach's table
+// (libm: READNONE). 0: nothing known.
 pub fn front_attrs(f: i64) -> i64 {
-    0
+    unsafe {
+        let mut e = fn_effects(f);
+        if (e.bits & EFF_UNKNOWN) != 0 && FNS[f].is_extern && FNS[f].effect_decl == 0 {
+            e = known_c_effects(FNS[f].name);
+        }
+        let mut attrs = effects_attrs(e, FNS[f].is_extern && numeric_params(f));
+        if FNS[f].is_extern && (attrs & ATTR_WILLRETURN) == 0 {
+            // (A C function that may not return may exit: `exit`, `abort`.)
+            attrs = attrs & ~ATTR_NOPANIC;
+        }
+        attrs
+    }
+}
+
+// The attribute bits effects e give (READNONE too when `readnone_ok`: a C
+// function whose parameters are all numbers).
+fn effects_attrs(e: Effects, readnone_ok: bool) -> i64 {
+    if (e.bits & EFF_UNKNOWN) != 0 {
+        return 0;
+    }
+    let mut attrs = 0;
+    if (e.bits & (EFF_DIVERGE | EFF_RAW_DIVERGE)) == 0 {
+        attrs = attrs | ATTR_WILLRETURN;
+    }
+    if (e.bits & (EFF_PANIC | EFF_RAW_PANIC)) == 0 {
+        attrs = attrs | ATTR_NOPANIC;
+    }
+    if readnone_ok && e.allocs == 0 && (e.bits & (EFF_IO | EFF_GLOBAL | EFF_ALLOC_EXTERN)) == 0 {
+        attrs = attrs | ATTR_READNONE | ATTR_READONLY;
+    }
+    attrs
+}
+
+// Whether every parameter of function f is a number (an integer, a float,
+// a bool: no pointer, slice or function).
+fn numeric_params(f: i64) -> bool {
+    unsafe {
+        if FNS[f].variadic {
+            return false;
+        }
+        for i in 0..FNS[f].param_count {
+            let t = TLISTS.data[FNS[f].params + i];
+            if !is_integer(t) && !is_float(t) && t != TY_BOOL {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// What C library function `sym` called by the lowering (CALLC v) does:
+// builtin.tach's table, READNONE when every argument is a float.
+fn c_lib_attrs(v: i64, sym: i64) -> i64 {
+    unsafe {
+        let mut floats = true;
+        for i in 0..INSTS[v].nargs {
+            if !is_float(ARGTY.data[INSTS[v].args + i]) {
+                floats = false;
+            }
+        }
+        let attrs = effects_attrs(known_c_effects(sym), floats);
+        if (attrs & ATTR_WILLRETURN) == 0 { 0 } else { attrs }
+    }
 }
 
 // Whether call v may write memory other than the caller's private slots.

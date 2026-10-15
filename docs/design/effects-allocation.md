@@ -500,6 +500,63 @@ What T2 made, where it differs from or adds to §2.4–§2.7 (for T1, T3, T4, T5
 - **Tests.** alloc_arena, alloc_scope, alloc_fixedbuf, alloc_arena_none, alloc_arena_lent, alloc_out_of_memory, alloc_fmt_room, alloc_sealed, alloc_static_arena, err_alloc_sealed_field, err_alloc_sealed_literal, err_alloc_scoped_value, err_alloc_scoped_capture, err_alloc_scoped_static, err_alloc_static_call, fmt_int_hole; index_order (arena statics), std_self_append, fmt_values (no to_buf), fmt_zero_cost (the number inline in no call: CHECK removed). Suite 781/781 at -O0/1/2.
 - **Cost.** Bench against Phase 0 (min of 15 alternating runs, busy machine): sort ~1.01, wordcount ~1.0–1.03 (noise), json 0.97, binarytrees 0.98, interp/iter* 1.00. Programs using f-strings with integer specs carry `fmt_hole` and `fmt_spec_decimal` (~700 lines of assembly once): tests/run/fmt_values compiles to 12% more assembly and ~5% longer (the assembler); the compiler's own build is unaffected (it does not use std's Fmt).
 
+## T4 notes (the optimizer)
+
+What T4 made (branch c16-opt; docs/optimizer.md, "0.16: calls the
+effects make pure"), and what the other tasks should know:
+
+- **front_attrs** (middle/ipo.tach) reads `fn_effects(f)`: no raw
+  `diverge` (and no visible one) is WILLRETURN, no raw `panic` NOPANIC, a
+  C function without `alloc`/`io`/`global` whose parameters are all
+  numbers READNONE. EFF_UNKNOWN gives nothing, so until T1 lands every
+  tachyon function contributes 0 and only C functions benefit. A C
+  function that the inference leaves EFF_UNKNOWN and that declares
+  nothing takes `known_c_effects(name)`; a C function that may not return
+  (`exit`) is never NOPANIC. **For T1:** set an extern's FN_EFFECTS to its
+  declaration, or to `known_c_effects` when it has none; set
+  EFF_RAW_DIVERGE/EFF_RAW_PANIC with the visible bits (front_attrs reads
+  both).
+- **known_c_effects** (front/effects/builtin.tach, T1's file, written
+  here because it replaces PURE_LIBM): a table of symbols, built once:
+  libm (none), mem*/str*/abs (none), malloc & co. (`alloc(extern)`),
+  stdio/POSIX I/O (`io`), exit/abort (`io diverge` + raw diverge);
+  anything else ⊤. T1 may extend it; keep the libm part (the optimizer's
+  readnone C functions).
+- **Value numbering of calls** (gvn.tach): readnone calls with a scalar
+  result by callee and arguments in the dominator-scoped table; readonly
+  ones within a block while nothing is written. **LICM** (licm.tach):
+  readnone calls with invariant arguments, speculatively when willreturn
+  and nopanic, else when they run in the first iteration before anything
+  visible (`runs_first`). Once T1 lands, counted `for` loops make pure
+  functions willreturn, and more calls are hoisted speculatively.
+- **Arenas (for T2).** The bump path inlines without a call when
+  `Arena::try_alloc` is the fast path (aligned bump, compare with the
+  limit, store) and the refill a `#[cold]` function of its own; then `a.
+  alloc(16, 8)` in a loop is five instructions and no call (tested with
+  a stand-in arena in tests/run/opt_effects_arena.tach). Do not put the
+  refill's loop or the chunk list in try_alloc. bench/arena_trees.tach
+  uses a stand-in `Bump` with that shape: switch it to std's Arena once
+  T2 has it (binarytrees 0.17-0.20 s on malloc, 0.03-0.04 s on the
+  arena, C's arena 0.04 s).
+- **heap_to_stack through Gpa** works as before (Gpa's methods are
+  `#[inline]`): the null check of the slot's address now folds, so the
+  slot no longer escapes through the comparison and its dead stores go.
+- **purecall** (bench/purecall.tach, bench/purecall_hoisted.tach, ratio
+  checked by bench/run.sh against 1.05): 0.05 s against 0.05 s hoisted by
+  hand (Phase 0's compiler: 0.21 s).
+- **The perf gaps of examples/algorithms** (merged release-0.15 first, for
+  c15-perf): see docs/optimizer.md for the table. std gains `count_ones`,
+  `leading_zeros`, `trailing_zeros` (io.tach, section "Bits (0.16)",
+  lazy, so the core guide does not list them; T5: `guide std` does).
+  The IR gains BITS (53) and VMACW (54).
+- **Not done:** lru-cache (the gap is the probe loop and the slot's
+  fields around the out-of-line HashMap::insert, which the capture
+  analysis does not prove nocapture; promotion through non-capturing
+  calls was tried and taken back: +30 ms of self-compile, no gain);
+  x86-64 has no widening multiply-accumulate (SSE2's pmuludq would do:
+  later); count_ones on x86-64 stays the bit-twiddling body (POPCNT is
+  not in the baseline).
+
 ## Integration notes (release-0.16)
 
 - **Arenas under --check-alloc** (T3's hooks, after T2): `arena_alloc`'s bump and `FixedBuf::try_alloc` take each block from `check_alloc_block(owner, ..)` (owner: the arena's root state, or the FixedBuf's base) after doing their own accounting, so `used()` and exhaustion are as without the flag. `arena_free`/`FixedBuf::free` give the block's pages back (`check_alloc_moved(.., 0, ..)`); the last block is recognised by `check_alloc_is_last(owner, p)` (the owner's last live block: new in both Gpa sources), which keeps the in-place growth and rewind of the count; every resize moves the block (`check_alloc_moved`), as Gpa's do. `reset`, `free_all` and `FixedBuf::reset` call `check_alloc_release(owner, 0)`; a scope records `check_alloc_mark()` in its state (`ArenaState.check_mark`) and releases the root's blocks after it at its end, its call's site restored first (`check_alloc_site`/`check_alloc_set_site`), so the release is reported at the scope's call. Blocks of their own (above 32 KB) stay Gpa's blocks. tests/run/checkalloc_arena_{reset,scope,grow,cross} and checkalloc_fixedbuf_reset; alloc_arena's "grew in place" is false under the flag (every resize moves).
@@ -507,4 +564,3 @@ What T2 made, where it differs from or adds to §2.4–§2.7 (for T1, T3, T4, T5
 - **sort's unchecked scans** (T2): each scan's reads are at indexes its own loop count keeps in `lo < j <= hi - 1` and `i < hi <= s.len`, whatever the comparator answers. tests/run/std_sort_adversarial (--check-alloc) and _u (--check-unsafe): random, always-less, never-less, all-equal, NaN-like and alternating comparators over slices that end at a page boundary after a freed block; an off-by-one injected in either scan was caught by both.
 - **fix --only alloc016**: the allocator parameter goes before the first parameter with a default (it went last, which a default forbids).
 - **Open**: `a.scope(..)` on an `Arena` shows `alloc(Gpa, Arena)` (its end gives the blocks of their own back to Gpa: `arena_large_free`), where §2.3's discharge says `alloc(Arena)`; std's `Eq`/`Ord`/`Hash` are not `#[pure]` yet (§2.2, line 51), though `guide effects` says they are.
-

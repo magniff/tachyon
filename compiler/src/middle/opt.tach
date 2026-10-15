@@ -18,7 +18,7 @@ use crate::middle::adce::aggressive_dce;
 use crate::middle::copies::elide_copies;
 use crate::middle::exits::count_loop_exits;
 use crate::middle::fold::{instcombine, sccp};
-use crate::middle::gvn::run_gvn;
+use crate::middle::gvn::{repeated_pure_calls, run_gvn};
 use crate::middle::ifconv::if_convert_loops;
 use crate::middle::inline::{
     FN_ADDRESS, FN_CALLS, FN_LIVE, FN_SCC, FN_SIZE, SCC_ORDER, compute_sccs, count_call_sites,
@@ -672,6 +672,10 @@ pub fn optimize_program() {
             t = timer_now();
             if heap_to_stack(fi) {
                 simplify_function(fi);
+            } else if repeated_pure_calls(fi) {
+                // (0.16: merged now that the callees' attributes are known)
+                run_gvn(fi);
+                eliminate_dead_code(fi);
             }
             timer_add(T_HEAP, t);
             if inlined_everywhere(fi) {
@@ -776,9 +780,14 @@ fn optimize_loops(fi: i64) -> bool {
         }
         // (0.15: small branches in innermost loops, selects for the
         // vectorizer and the unroller)
-        if if_convert_loops(fi) {
+        // (0.16: again while it converts, a few times: a branch whose arms
+        // were converted may be a diamond itself then, the tree of an
+        // inlined comparator's `<`)
+        let mut rounds = 0;
+        while rounds < 4 && if_convert_loops(fi) {
             changed = true;
             light_cleanup(fi);
+            rounds += 1;
         }
         // (0.10: after the checks the ranges remove, before strength
         // reduction rewrites the addresses)
