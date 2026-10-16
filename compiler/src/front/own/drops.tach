@@ -27,7 +27,8 @@
 // the others stay. Both back ends lower a `defer` on every exit, so the
 // back end needs nothing more.
 //
-// --values=off places no drops (0.16's semantics: nothing drops).
+// Only --values=error places drops (drops_on); the other modes keep 0.16's
+// semantics: nothing drops.
 
 use crate::base::{IntVec, SYMS, intern_c};
 use crate::front::ast::{
@@ -40,7 +41,7 @@ use crate::front::closures::{CLOSURES, CLOSURE_STACK};
 use crate::front::lexer::Tok;
 use crate::front::modules::STD_MODULE;
 use crate::front::own::diag::{
-    MODE_OFF, OWN_DROP_VIEW, OWN_MODE, own_end, own_help, own_str, own_type,
+    MODE_ERROR, MODE_OFF, OWN_DROP_VIEW, OWN_MODE, own_end, own_help, own_str, own_type,
 };
 use crate::front::own::glue::{
     GLUE_MATCH, G_PATHS, G_PATH_AT, G_STMTS, glue_block, glue_mark, glue_reset, has_glue,
@@ -50,7 +51,7 @@ use crate::front::own::state::{
     CUR, PL_COUNT, PL_FIELD, PL_PARENT, PL_RID, PL_RKIND, RK_LOCAL, dmoved_bits, get_bit,
     moved_bits, root_of,
 };
-use crate::front::types::{FNS, TLISTS, TY_BOOL, TY_UNIT};
+use crate::front::types::{FNS, STRUCTS, TLISTS, TYPES, TY_BOOL, TY_UNIT, TyKind, struct_field};
 use crate::middle::lower::ssa::HMap;
 
 // Node flags (0.17, T1): on the read of the old value of an owned
@@ -139,8 +140,13 @@ fn syms() {
     }
 }
 
+// Whether drops are placed: only where moves are enforced, --values=error
+// (0.17, integration of T1 and T4). Under report and warn a use after a
+// move, or a handle copied and freed twice (0.16's idioms, migrated by
+// `fix --values`), still compiles, and dropping the copies would free
+// memory twice; there nothing drops, as in 0.16 (`free` frees).
 pub fn drops_on() -> bool {
-    unsafe { OWN_MODE != MODE_OFF }
+    unsafe { OWN_MODE == MODE_ERROR }
 }
 
 // Whether any drop was placed (check_own walks then).
@@ -272,6 +278,36 @@ fn is_std_fn(f: i64, name: i64) -> bool {
     }
 }
 
+// (0.17) Whether type t, which has `impl Drop`, holds views of its own:
+// own.drop_view. A view reached only through a type argument does not
+// count when the impl is generic over it: std's `impl<T> Drop for
+// Vec<T>` drops a `Vec<[u8]>`'s elements without reading them (a view
+// has no drop), as Rust's `may_dangle`. Fields of the template are
+// looked at, so `struct P<T> { s: [u8], x: T }` with `impl<T> Drop` is
+// still reported.
+fn drop_reads_views(t: i64) -> bool {
+    unsafe {
+        if !is_view_type(t) {
+            return false;
+        }
+        if TYPES[t].kind != TyKind::Struct {
+            return true;
+        }
+        let s = TYPES[t].a;
+        if STRUCTS[s].tmpl == 0 {
+            return true;
+        }
+        let tm = STRUCTS[s].tmpl - 1;
+        for i in 0..STRUCTS[tm].field_count {
+            let ft = (*struct_field(tm, i)).ty;
+            if ft > 0 && is_view_type(ft) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 // check_function, its parameters defined: an implicit defer per by-value
 // parameter, first in the body (not std::forget's, whose point is not to
 // drop); `needs_drop::<T>()` folded; `impl Drop` of a view type noted.
@@ -284,7 +320,7 @@ pub fn param_drops(item: i64, f: i64) {
             NODES[NODES[body].a].a = if has_glue(t) { 1 } else { 0 };
         }
         if FNS[f].self_ty > 0 && NODES[item].a == SYM_DROP && has_drop_impl(FNS[f].self_ty)
-            && is_view_type(FNS[f].self_ty) {
+            && drop_reads_views(FNS[f].self_ty) {
             DROP_VIEWS.push(item);
             DROP_VIEWS.push(FNS[f].self_ty);
         }

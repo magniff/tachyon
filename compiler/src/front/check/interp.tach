@@ -21,8 +21,8 @@ use crate::base::diag::{
     ERR_HELP, err_begin, err_end, err_help, err_help_sym, err_str, report_warning,
 };
 use crate::front::ast::{
-    CLOSURE_MOVE, FMT_BIN, FMT_CHAR, FMT_HEX, NODES, NodeKind, child, list_begin, list_end,
-    list_push, new_node,
+    CLOSURE_HOLES, CLOSURE_MOVE, FMT_BIN, FMT_CHAR, FMT_HEX, NODES, NodeKind, child, list_begin,
+    list_end, list_push, new_node,
 };
 use crate::front::check::{
     CONST_CONTEXT, LOCALS, lookup_local, mismatch_error, pop_scope, push_scope, type_error,
@@ -31,6 +31,7 @@ use crate::front::check::synth_mode::synth_expr;
 use crate::front::check::unsafety::is_borrow;
 use crate::front::lexer::{SUF_I64, SUF_U8, Tok, str_at};
 use crate::front::modules::{CUR_MOD, STD_MODULE};
+use crate::front::own::drops::NO_DROP;
 use crate::front::patterns::check_pattern;
 use crate::front::traits::{implements, std_trait};
 use crate::front::types::{
@@ -185,7 +186,7 @@ fn expand(n: i64) -> i64 {
         NODES[param].a = out;
         NODES[param].b = fmt_ptr;
         let closure = new_node(NodeKind::Closure, start, end);
-        NODES[closure].c = CLOSURE_MOVE;
+        NODES[closure].c = CLOSURE_MOVE | CLOSURE_HOLES;
         NODES[closure].a = body;
         let pmark = list_begin();
         list_push(param);
@@ -244,7 +245,7 @@ fn push_hole_lets(n: i64) {
         for i in 0..NODES[n].count {
             let item = child(n, i);
             if NODES[item].kind == NodeKind::InterpHole {
-                list_push(let_node(hidden(c"__f", holes), NODES[item].a, item, false));
+                list_push(let_node(hidden(c"=f", holes), NODES[item].a, item, false));
                 holes += 1;
             }
         }
@@ -304,7 +305,7 @@ fn push_writes(n: i64, out: i64, direct: bool) {
                 }
                 continue;
             }
-            let name = hidden(c"__f", holes);
+            let name = hidden(c"=f", holes);
             let debug = NODES[item].b == 1;
             // (`__out.display(&__f0)`; through a pointer, `__f0.fmt(__out)`:
             // a pointer value is passed as a receiver)
@@ -528,7 +529,11 @@ fn direct_body(fs: i64, k: i64, n: i64) -> i64 {
             let b = intern_c(c"__b");
             let t = intern_c(c"__t");
             let new_in = std_call(c"Buf", c"new_in", ident(intern_c(c"__a"), n), 0, 0, n);
-            list_push(let_node(b, new_in, n, true));
+            // (0.17: no drop: the block's value, moved out by its tail; the
+            // own walk sees the holes as borrows, not this move)
+            let lb = let_node(b, new_in, n, true);
+            NODES[lb].p |= NO_DROP;
+            list_push(lb);
             let zero = new_node(NodeKind::Int, NODES[n].start, NODES[n].end);
             NODES[zero].b = SUF_U8;
             let tmp = new_node(NodeKind::Repeat, NODES[n].start, NODES[n].end);
@@ -703,7 +708,7 @@ fn spec_error(h: i64, t: i64, message: *u8) -> ! {
     }
 }
 
-// `__f3`, `__s3`: a hidden local's name.
+// `=f3` (0.17: a hole, which the own walk reads, not moves: front/own/walk.tach's eval_let), `__s3`: a hidden local's name.
 fn hidden(prefix: *u8, i: i64) -> i64 {
     let out = buf_new();
     buf_str(out, prefix);
