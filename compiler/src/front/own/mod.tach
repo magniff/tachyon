@@ -29,14 +29,17 @@ pub mod calls;
 pub mod summary;
 pub mod diag;
 pub mod observe;
+pub mod drops;
+pub mod glue;
 
 use crate::base::streq;
 use crate::base::timer::{T_CHECK, T_OWN, timer_now, timer_sub};
 use crate::front::effects::infer::body_walked;
 use crate::front::own::diag::{
-    MODE_ERROR, MODE_OFF, MODE_REPORT, MODE_WARN, OWN_MODE, OWN_REPORT_PRINT, own_flush,
-    print_reports,
+    MODE_ERROR, MODE_OFF, MODE_REPORT, MODE_WARN, OWN_MODE, OWN_REPORT_PRINT, own_discard,
+    own_flush, print_reports,
 };
+use crate::front::own::drops::{any_drops, finish_drops, fn_has_drops};
 use crate::front::own::state::init_state;
 use crate::front::own::summary::validate_views_decls;
 use crate::front::own::walk::walk_fn;
@@ -88,22 +91,38 @@ fn walkable(f: i64) -> bool {
 // function walked. Phase 0's driver walks the
 // functions in their order, once each; T3's walks the effects' SCCs callees
 // first, iterating recursive ones (summary.tach).
+//
+// (T1) Drops are placed in every mode but off, and their moves decide them:
+// when the findings are not wanted (report without --values=report), the
+// functions with drops are still walked, their findings dropped; then
+// finish_drops empties, flags or keeps each drop.
 pub fn check_own() {
     unsafe {
         validate_views_decls();
         // (report, the default, walks only when its findings are printed:
         // --values=report; tests/refactor/run.sh keeps compiler/src clean
         // under it)
-        if OWN_MODE == MODE_OFF || OWN_MODE == MODE_REPORT && !OWN_REPORT_PRINT {
+        let all = !(OWN_MODE == MODE_OFF || OWN_MODE == MODE_REPORT && !OWN_REPORT_PRINT);
+        if !all && !any_drops() {
             return;
         }
         let t = timer_now();
         init_state();
         for f in 0..FN_COUNT {
-            if walkable(f) {
+            if walkable(f) && (all || fn_has_drops(f)) {
                 walk_fn(f, 0);
-                own_flush();
+                if all {
+                    own_flush();
+                } else {
+                    own_discard();
+                }
             }
+        }
+        finish_drops();
+        if all {
+            own_flush();
+        } else {
+            own_discard();
         }
         if OWN_REPORT_PRINT {
             print_reports();
