@@ -12,29 +12,31 @@ of an `unsafe fn`:
 - indexing or slicing a raw pointer: `p[i]`, `p[lo..hi]` (unchecked);
 - casting an integer to a pointer (except the literal `0`, null);
 - reading a union's field;
-- passing a pointer that is not a borrow to a pointer parameter, calling
-  a plain `fn` pointer with one, using an `unsafe fn` or a function with
-  pointer parameters as a value.
+- passing a raw pointer to a pointer parameter, calling a plain `fn`
+  pointer with one, using an `unsafe fn` or a function with pointer
+  parameters as a value.
 
-## Borrows
+## References and raw pointers
 
-Tachyon has one pointer type, `*T`. A pointer known to be valid is a
-*borrow*, and dereferencing a borrow is safe:
+`&T` and `&mut T` (0.17) are references: checked by the compiler
+(`guide memory`, `guide views`), so dereferencing one is safe. `*T` is
+the raw pointer, the escape hatch: nothing checks what it points to.
 
-- `&place` written directly where the pointer is used (`f(&x)`, the
-  receiver of `x.m()`): the address of a local, a static, a field or a
-  checked element;
-- a parameter declared with a pointer type and not `mut` (`self: *T`
-  included).
-
-Everything else is raw: a local holding a pointer, a pointer field,
-`malloc`'s result, `c"..."` (read-only memory). Indexing a borrow is
-unsafe (a borrow is one value, not an array), except that `p[i]` on a
-pointer to a Vec, a Buf or a slice (`dist: *Vec<i64>`) is `(*p)[i]`, the
-element of the one it points to, checked: safe through a borrow, unsafe
-through a raw pointer, the same in both. `p[0]` on any other pointer is
-pointer arithmetic: the value it points to is `*p` (`*out = acc`), safe
-through a borrow.
+- `&place` and `&mut place` are references, kept in a local too (`let r
+  = &mut x; r.f = 1;`); a reference converts to a raw `*T` wherever one
+  is expected (`malloc`'s callers, C's parameters).
+- A raw pointer: a `*T` local or field, `malloc`'s result, `c"..."`
+  (read-only memory), and `&(*p).f` of a place reached through a raw
+  `p`. In `unsafe` code `&*p` makes a reference of it: the code vouches.
+- A `*T` parameter written without `mut`, in a safe function, is
+  accepted as `&mut T` through 0.17 (the legacy rule; `tachyonc fix
+  --values` rewrites it to `&mut T` or `&T`, and from 0.18 `*T`
+  parameters are raw). A `mut p: *T` parameter and any `*T` of an
+  `unsafe fn` or of C are raw.
+- `p[i]` on a reference to a Vec, a Buf or a slice is the element of the
+  one it points to, checked; `p[i]` on a raw pointer is pointer
+  arithmetic, unchecked and unsafe. On `out: &mut i64` the value is
+  `*out` (`*out = acc`).
 
 ```tach
 extern "C" {
@@ -44,7 +46,7 @@ extern "C" {
 
 struct Stats { count: i64, sum: i64 }
 
-fn add(s: *Stats, x: i64) {          // s is a borrow: safe to use
+fn add(s: &mut Stats, x: i64) {      // a reference: safe to use
     s.count += 1;
     s.sum += x;
 }
@@ -58,8 +60,8 @@ unsafe fn total(p: *i64, n: i64) -> i64 {
 
 fn main() -> i32 {
     let mut st = Stats { count: 0, sum: 0 };
-    add(&st, 5);
-    add(&st, 7);
+    add(&mut st, 5);
+    add(&mut st, 7);
     let p = unsafe { malloc(3 * 8) as *i64 };
     defer { unsafe { free(p as *u8); } }
     unsafe {
@@ -79,15 +81,16 @@ fn main() -> i32 {
 
 Write the contract of an `unsafe fn` in its comment: its callers take it
 on. What unsafe code must keep so that the safe code around it stays
-defined: every pointer it hands to safe code points to live memory of
-its type, and every slice it makes is valid for its length while used.
+defined:
 
-## The one gap
-
-Tachyon has no lifetimes yet: a slice used after its memory is gone (a
-`Vec`'s `as_slice()` after a push that reallocated or a `free`, a slice
-of a returned local array) is undefined behaviour in safe code. Keep
-views short-lived; re-take `as_slice()` after pushing.
+- every pointer it hands to safe code as a reference points to live
+  memory of its type, and every slice it makes is valid for its length
+  while it is used;
+- it makes no second live alias of a place under a `&mut` (the optimizer
+  relies on a `&mut` parameter being the only way to its memory);
+- a type whose safe methods manage memory through raw pointers (a
+  growable buffer of its own) implements `Drop`: that makes it owned and
+  move-only, so a copy cannot outlive a reallocation.
 
 ## Tools
 
@@ -98,8 +101,8 @@ views short-lived; re-take `as_slice()` after pushing.
   out-of-bounds and use-after-free stop the program with `unsafe access
   ...` and exit 101. Programs run tens of times slower.
 - `tachyonc --check-alloc` (0.16) puts every block of Gpa on pages of
-  its own: a use after free (a copied `Vec` handle, a view after a push)
-  faults and is reported with where the block was allocated and freed;
+  its own: a use after free through raw pointers faults and is reported
+  with where the block was allocated and freed;
   bad frees and leaks are reported too (`tachyonc guide memory`). With
   `--check-unsafe`, raw accesses are checked against those blocks.
 - Statics, `static mut` included, are safe: tachyon has no threads.

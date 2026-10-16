@@ -1,9 +1,9 @@
 # tachyon, the core (tachyon 0.17)
 
-Tachyon is a compiled systems language with Rust's syntax and C's model:
-no borrow checker, lifetimes, destructors or macros; nothing allocates
-without an allocator; indexing is checked; safe code has no undefined
-behaviour. This page is the core; the rest is on demand (the end).
+Tachyon is a compiled systems language with Rust's syntax and value
+semantics (0.17: moves, drops, `&T`/`&mut T`, checked views) but no
+lifetimes to write, no macros; nothing allocates without an allocator;
+indexing is checked; safe code has no undefined behaviour. This page is the core; the rest is on demand (the end).
 
 ## Build and run
 
@@ -25,9 +25,9 @@ struct P { x: i64 }
 
 impl P {
     // Rust: fn bump(&mut self)
-    fn bump(self: *P) { self.x += 1; }     // *T: the one pointer type
+    fn bump(self: &mut P) { self.x += 1; } // self written out
     // Rust: fn get(&self) -> i64
-    fn get(self: P) -> i64 { self.x }      // T: a copy
+    fn get(self: &P) -> i64 { self.x }     // (self: P: a copy, a move if owned)
 }
 
 // Rust: fn first(s: &str) -> char
@@ -41,8 +41,7 @@ fn odds(n: i64, gpa: Gpa) -> Vec<i64> {     // allocating takes an allocator
 // Rust: fn main()
 fn main(gpa: Gpa) -> i32 {             // gpa: the program's allocator; 0 = exit status
     // Rust: let mut v = Vec::new();
-    let mut v: Vec<i64> = Vec::new_in(gpa);
-    defer v.free();                    // Rust: drop at scope end (no destructors)
+    let mut v: Vec<i64> = Vec::new_in(gpa);  // dropped at scope end, as in Rust
     v.push(5);
     v.push(2);
     v[0] += 10;                        // as Rust: checked (v[1..2] a slice)
@@ -50,16 +49,14 @@ fn main(gpa: Gpa) -> i32 {             // gpa: the program's allocator; 0 = exit
     sort(v.as_slice());
     // Rust: let mut p = P { x: 1 }; p.bump();
     let mut p = P { x: 1 };
-    p.bump();                          // passes &p
+    p.bump();                          // passes &mut p
     // Rust: println!("{} {:?}", p.get(), v);
     println(f"{p.get()} {v:?}");       // no macros: f-strings
     let s = "hi";
     println(s.len());                  // an i64; or the field, s.len
     // Rust: let mut b = String::new(); b.push_str("n="); ...
     let mut b = Buf::new_in(gpa);
-    defer b.free();
     let o = odds(7, gpa);
-    defer o.free();
     b.push_str("n=");
     b.push_int(o.len());
     println(b.as_slice());
@@ -67,7 +64,6 @@ fn main(gpa: Gpa) -> i32 {             // gpa: the program's allocator; 0 = exit
     if s == "hi" && !is_digit(first(s)) { println(first(s)); }   // compared, not matched
     // Rust: *m.entry(k).or_insert(0) += 1;
     let mut m: HashMap<[u8], i64> = HashMap::new_in(gpa);
-    defer m.free();
     m.get_or_insert("k", 0)[0] += 1;
     // Rust: !x on an integer; x.abs(); 7 / 0 panics
     let z = 0;
@@ -104,7 +100,7 @@ in a module reaches its sibling `lexer`.
 ```tach
 struct Item { name: [u8], qty: i64 }
 
-fn add(v: *Vec<Item>, it: Item) { v.push(it); }   // Rust: v: &mut Vec<Item>; add(&mut v, ..)
+fn add(v: &mut Vec<Item>, it: Item) { v.push(it); }   // called as add(&mut items, ..)
 
 fn main(gpa: Gpa) -> i32 {
     let input = read_stdin_in(gpa).unwrap();   // all of stdin: Result<Buf, IoError>
@@ -141,9 +137,12 @@ fn main(gpa: Gpa) -> i32 {
 ```
 
 Lines one at a time: `let mut b = Buf::new_in(gpa); while
-read_line(&b).unwrap() { ... }` (without the `'\n'`). `Vec`, `Buf`,
-`HashMap` are handles: `let w = v;` copies the pointer, not the
-elements. std's API, a line per item: `tachyonc guide std`; one name
+read_line(&mut b).unwrap() { ... }` (without the `'\n'`). An owned
+value (`Vec`, `Buf`, `HashMap`, a struct holding one) moves: after `let
+w = v;` or `f(v)`, `v` is dead (`own.moved`); take `v: &Vec<T>` (`&mut`
+to change it) and pass `&v` (`&mut v`), or `.clone()`. A reference kept
+in a local (`let p = &mut st;`) is passed on as `p`, any number of
+times. A slice of `v` is a view: take it again after `v` grows. std's API, a line per item: `tachyonc guide std`; one name
 with its comment: `tachyonc guide --find split_in`.
 
 ## The first errors and their fixes
@@ -154,6 +153,9 @@ with its comment: `tachyonc guide --find split_in`.
 | `calling a C function is unsafe`; `dereference of a raw pointer is unsafe` | `unsafe { ... }`; `tachyonc fix --only unsafe` adds them |
 | `no 'collections' in module 'std'`; `unknown type 'String'` | std is one module: `use std::name;` (its most used names need none); text is `[u8]`, built in a `Buf` |
 | `allocation is explicit: pass an allocator` | `Vec::new_in(gpa)`, `gpa` from `fn main(gpa: Gpa)` passed down |
+| `expected '&mut P', got '&P'` | `&mut x` at the call |
+| `own.moved: 'v' is used here after it moved into 'f(v)'` | `f(&v)` with `v: &Vec<T>`, or `f(v.clone())` (the `try:`) |
+| `own.conflict: ... while 'first' views them` | use the view before the change, or take it again after (`guide views`) |
 
 Every error has a `help:`; `tachyonc guide errors` has more.
 

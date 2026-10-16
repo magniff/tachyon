@@ -26,6 +26,7 @@ tachyonc query items [MODULE|TYPE...] [--root ROOT] [--comments]
 tachyonc query show MODULE::section TITLE                   (0.13)
 tachyonc query grep PATTERN... [--in FILE|MODULE|ITEM] [--code] [--comments] [--strings] [--word] [--count] [--limit N] [--all]
 tachyonc query type FILE:LINE[:COL]...                      (0.13)
+tachyonc query own FILE:LINE:COL...                         (0.17)
 tachyonc query stats [MODULE|FILE] [--over N] [--all]      (refactor.md)
 tachyonc query deps MODULE [--max-lines N]                 (refactor.md)
 tachyonc query unused [MODULE|FILE] [--all]                (refactor.md)
@@ -75,6 +76,7 @@ tools` the ones a program needs.
 | text that is not a name (a message, a comment), with its item | `target/tachyonc query grep TEXT` (`--comments`, `--strings`, `--code`, `--word`, `--in`) |
 | a module's section banners; one section | `target/tachyonc query items MODULE --comments`, `query show MODULE::section TITLE` |
 | the type of an expression | `target/tachyonc query type FILE:LINE:COL` |
+| each local's kind, moves and views at a position (0.17) | `target/tachyonc query own FILE:LINE:COL` |
 | what a function may do (allocate, io, panic, loop forever) | `target/tachyonc query effects NAME\|MODULE` (`--why EFFECT`: the chain; `--has alloc(Gpa)`: which still allocate) |
 | where it is defined, its signature | `target/tachyonc query def NAME` |
 | what a module contains; a type's methods | `target/tachyonc query items MODULE`; `query items TYPE` |
@@ -732,6 +734,28 @@ other (`{p.x + q.y:>4}`: `i64→p.x + q.y`), and a position on its text
 gives the f-string's type. What the compiler writes for an f-string or a
 `?` (the hidden locals `__f0`, `__out`, the match a `?` is) is never
 shown.
+
+## own (0.17)
+
+`own FILE:LINE:COL` shows the own pass's state at a position
+(docs/design/value-semantics.md §2.9): the position and its function,
+then a line per local in scope there (parameters first, then in the
+order they are declared), its name, type and kind (`plain`, `owned`,
+`view`, `owned view`), and, from the own pass's walk of the function
+(front/own/observe.tach), whether it is moved (where, into what) and the
+views it holds (what they view, where they were taken, what invalidated
+them). Without the walk (a template never instantiated, or before the
+checker has it), the kinds alone:
+
+```
+main.tach:16:17 in crate::main
+gpa    Gpa       plain
+v      Vec<i64>  owned
+first  [i64]     view
+```
+
+A `let`'s names are in scope after the `let`. A position in no function
+the checker saw: `error query.no-match`, `try:` the item at that line.
 
 ## Diagnostics
 
