@@ -18,6 +18,13 @@ Program tasks (tasks/):
 - `guide-mini` (0.17 iterations): bare + prompts/guide-mini.md, a ~600-token
   always-loaded core (the main Rust differences in one compiled example,
   then the lookup lines); with `+readfirst` the iteration-1 cell.
+- `guide-example` (0.17 iterations): bare + prompts/guide-example.md, whose
+  `@EXAMPLE@` is `tachyonc guide example` from the compiler under test: a
+  whole program in three files and a test case (modules, enums and match,
+  Result and `?`, Vec, HashMap, Buf, a sort closure, allocators passed
+  down) in place of guide-mini's one-file example, then the lookup lines.
+  The worked program answers up front what Haiku probed and looked up
+  before its first write (.claude/briefs/research/prewrite-deliberation.md).
 - `rust-pairs`: bare + paired Rust -> tachyon lines (prompts/rust-pairs.md),
   about the core guide's budget: the differences shown as pairs instead
   of tachyon-only examples.
@@ -72,7 +79,7 @@ import os
 from lib.common import HOOKS_DIR, PROMPTS_DIR
 
 PROGRAM_BASES = ("bare", "guide", "tools", "both", "guide-core", "tools-core", "both-core",
-                 "rust-pairs", "guide-mini", "rust")
+                 "rust-pairs", "guide-mini", "guide-example", "rust")
 COMPILER_BASES = ("compiler-tools", "compiler-plain", "compiler-tools-core")
 BASES = PROGRAM_BASES + COMPILER_BASES
 MODS = ("hook", "test", "turn-end", "recite", "rewrite", "nohints", "note", "readfirst")
@@ -81,9 +88,10 @@ MODS = ("hook", "test", "turn-end", "recite", "rewrite", "nohints", "note", "rea
 HOOK_MODS = ("rewrite", "nohints", "note")
 
 # What each base puts in the prompt: guide (None, "full": `tachyonc guide`,
-# "core": prompts/guide-core.md), tools (None, "full": tools.md, "core":
-# tools-core.md), pairs (rust-pairs.md), compiler (None, "full", "plain",
-# "core": the AGENTS.md variant).
+# "core": prompts/guide-core.md, "mini": prompts/guide-mini.md, "example":
+# prompts/guide-example.md with `tachyonc guide example`), tools (None,
+# "full": tools.md, "core": tools-core.md), pairs (rust-pairs.md),
+# compiler (None, "full", "plain", "core": the AGENTS.md variant).
 _PARTS = {
     "bare": {},
     "guide": {"guide": "full"},
@@ -94,6 +102,7 @@ _PARTS = {
     "both-core": {"guide": "core", "tools": "core"},
     "rust-pairs": {"pairs": True},
     "guide-mini": {"guide": "mini"},
+    "guide-example": {"guide": "example"},
     "rust": {},
     "compiler-tools": {"compiler": "full"},
     "compiler-plain": {"compiler": "plain"},

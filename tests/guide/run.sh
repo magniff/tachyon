@@ -20,6 +20,11 @@
 #             compiled with an empty main; else statements, compiled as
 #             main's body (leading `use` and `import` lines above it;
 #             0.16: main is `fn main(gpa: Gpa)`, its allocator `gpa`)
+#   ```tach NAME.tach
+#             (0.17) a file of a program of several modules: the blocks
+#             named so, in a row (prose between them, no other block),
+#             are written next to each other and main.tach is compiled;
+#             an in and out block after the last one are the program's
 #   ```in     right after a tach block: the program's stdin (else empty)
 #   ```out    after a tach block (and its in block): it is run, and its stdout and
 #             stderr together are this text (trailing blanks aside);
@@ -86,6 +91,29 @@ split_blocks() {
             }
             if (line == "```") {
                 infence = 0
+                if (lang ~ /^tach [a-z_][a-z0-9_]*\.tach$/) {
+                    # (0.17) a file of a program of several: the blocks
+                    # `tach NAME.tach` in a row are one program, built from
+                    # main.tach; an in or out block after them is its
+                    if (proj == "") {
+                        n++
+                        proj = dir "/" topic "-" sprintf("%05d", start)
+                        system("mkdir -p \"" proj "\"")
+                        printf "%s\n", topic ":" start > (proj "/name")
+                        close(proj "/name")
+                    }
+                    fname = substr(lang, 6)
+                    f = proj "/" (fname == "main.tach" ? "prog.tach" : fname)
+                    for (i = 1; i <= nbody; i++) print b[i] > f
+                    close(f)
+                    pending = proj
+                    next
+                }
+                if (lang == "in" || lang ~ /^out/ || lang == "err") {
+                    if (proj != "") pending = proj
+                } else {
+                    proj = ""
+                }
                 if (lang == "tach") {
                     n++
                     name = topic ":" start
@@ -131,6 +159,7 @@ split_blocks() {
                         close(pending "/exit")
                     }
                     pending = ""
+                    proj = ""
                 } else {
                     pending = ""
                 }

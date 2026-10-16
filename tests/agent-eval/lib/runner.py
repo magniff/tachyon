@@ -17,7 +17,7 @@ from lib.common import (DEFAULT_RESULTS_DIR, REPO_ROOT, base_env, check_hook_sum
                         install_mktemp_shim, kill_leftovers, load_tasks, private_paths,
                         query_hook_summary, write_json)
 from lib.grade import grade_dir, prepare_bins, tool_version
-from lib.prompts import build_prompt, compiler_prompt, guide_text
+from lib.prompts import build_prompt, compiler_prompt, guide_text, guide_topic
 
 _print_lock = threading.Lock()
 
@@ -91,7 +91,8 @@ def one_run(ctx, task, cond, rep):
     env_note = ("claude-env.md" if ctx["backend"] == "claude"
                 and claude_backend.PERMS == "allowlist" else None)
     prompt = build_prompt(c, task.text(), ctx.get("guide"), env_note=env_note,
-                          check_hook=bool(hook), guide_core=ctx.get("guide_core"))
+                          check_hook=bool(hook), guide_core=ctx.get("guide_core"),
+                          guide_example=ctx.get("guide_example"))
     with open(os.path.join(rdir, "prompt.md"), "w") as fh:
         fh.write(prompt)
     backend, name = ctx["backend"], ctx["model_name"]
@@ -416,6 +417,13 @@ def main(args):
     if any(c.guide == "core" for c in cs):
         try:
             ctx["guide_core"] = guide_text(bins["tach"], "core")
+        except SystemExit as e:
+            if not args.dry_run:
+                raise
+            say("dry run: %s; a stub stands in" % e)
+    if any(c.guide == "example" for c in cs):
+        try:
+            ctx["guide_example"] = guide_topic(bins["tach"], "example")
         except SystemExit as e:
             if not args.dry_run:
                 raise

@@ -45,7 +45,26 @@ def guide_core_text(core=None):
     return intro + "\n\n" + (core or STUB % "a compiler with the short core")
 
 
-def preamble(cond, guide=None, env_note=None, check_hook=False, guide_core=None):
+def guide_topic(tach_bin, topic):
+    """(0.17) `tachyonc guide TOPIC` from the binary under test; SystemExit
+    when it has no such topic."""
+    env = base_env(tach_bin)
+    rc, out, err, _ = run_proc(["tachyonc", "guide", topic], tach_bin, env, 60)
+    if rc != 0 or not out.strip():
+        raise SystemExit("tachyonc guide %s failed: %s" % (topic, err.decode()[:400]))
+    return out.decode("utf-8").strip()
+
+
+def guide_example_text(example=None):
+    """(0.17 iterations) The guide-example condition's text:
+    prompts/guide-example.md with `tachyonc guide example` at @EXAMPLE@ (a
+    stub when the compiler has no such topic: dry runs only)."""
+    return _read("guide-example.md").replace(
+        "@EXAMPLE@", example or STUB % "a compiler with `tachyonc guide example`")
+
+
+def preamble(cond, guide=None, env_note=None, check_hook=False, guide_core=None,
+             guide_example=None):
     c = Cond(cond) if isinstance(cond, str) else cond
     if c.lang == "rust":
         parts = [_read("rust.md")]
@@ -57,6 +76,8 @@ def preamble(cond, guide=None, env_note=None, check_hook=False, guide_core=None)
             parts.append(guide_core_text(guide_core))
         elif c.guide == "mini":
             parts.append(_read("guide-mini.md"))
+        elif c.guide == "example":
+            parts.append(guide_example_text(guide_example))
         if c.pairs:
             parts.append(_read("rust-pairs.md"))
         if c.tools == "full":
@@ -75,10 +96,11 @@ def preamble(cond, guide=None, env_note=None, check_hook=False, guide_core=None)
     return "\n\n".join(parts)
 
 
-def build_prompt(cond, task_text, guide=None, env_note=None, check_hook=False, guide_core=None):
+def build_prompt(cond, task_text, guide=None, env_note=None, check_hook=False, guide_core=None,
+                 guide_example=None):
     c = Cond(cond) if isinstance(cond, str) else cond
     tail = ("\n\n" + _read("recite.md")) if c.recite else ""
-    return (preamble(c, guide, env_note, check_hook, guide_core) + "\n\n---\n\n"
+    return (preamble(c, guide, env_note, check_hook, guide_core, guide_example) + "\n\n---\n\n"
             + task_text.strip() + tail + "\n")
 
 

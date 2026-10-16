@@ -78,7 +78,12 @@ tests/agent-eval/run.py run ... --skip-existing-in BASELINE_RUNDIR
   preamble, prompts/tools-core.md), `both-core` (the two),
   `rust-pairs` (paired Rust -> tachyon examples, prompts/rust-pairs.md,
   compiled by check-tasks), `compiler-tools-core` (the task's AGENTS.md
-  with this checkout's tiered tools section); modifiers `+hook` (the
+  with this checkout's tiered tools section), the iterations' `guide-mini`
+  (prompts/guide-mini.md: one compiled example and the lookup lines) and
+  `guide-example` (prompts/guide-example.md around `tachyonc guide
+  example`, a whole program in three files and a test case;
+  `tests/agent-eval/check-prompts.sh` dry-runs both and checks their
+  prompts); modifiers `+hook` (the
   check hook in any tachyon condition), `+test` (`tachyonc test` in the
   prompt, prompts/test.md or compiler-test.md, and the hooks of
   tools/agent-hooks/settings-eval.json, with the turn-end Stop hook),

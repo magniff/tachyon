@@ -160,9 +160,10 @@ Every error has a `help:`; `tachyonc guide errors` has more.
 
 ## The loop
 
-This page is what most programs need: write the program from it, then
-`tachyonc check` (a check hook, where there is one, runs it after each
-edit); fix the first error first, as its `help:` says. A construct the
+This page is what most programs need: write the program from it (a
+whole one, in three files with a test case: `tachyonc guide example`),
+then `tachyonc check` (a check hook, where there is one, runs it after
+each edit); fix the first error first, as its `help:` says. A construct the
 page does not show: `tachyonc guide --find WORDS` (`--find read a
 line`, `--find split_in`) or `tachyonc guide TOPIC#SECTION` prints the
 lines on it, not a whole topic; `tachyonc try 'CODE'` runs a snippet.
