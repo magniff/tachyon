@@ -1,0 +1,65 @@
+// The intrinsics' AArch64 instructions (0.19, docs/design/arch.md §5.3):
+// a mnemonic the encoder's own chain does not know is looked up in
+// compiler/arch/insn_a64.def (arch/table.tach), whose line gives its
+// encoding class and fixed bits; the class adds the registers, the
+// arrangement and the immediates. compiler/arch/README.md lists the
+// classes:
+//
+//   same3   Vd.T, Vn.T, Vm.T             Q, size, Rm, Rn, Rd
+//   across  <V>d, Vn.T                   Q, size, Rn, Rd
+//   umov    Wd|Xd, Vn.Ts[i]              Q (for .d), imm5, Rn, Rd
+//   tbl     Vd.T, {Vn.16b..}, Vm.T       Q, Rm, len - 1, Rn, Rd
+//   ext     Vd.T, Vn.T, Vm.T, #index     Q, Rm, imm4, Rn, Rd
+//   shrn    Vd.Tb, Vn.Ta, #shift         Q, immh:immb = 2 * esize - shift, Rn, Rd
+//   crc     Wd, Wn, Wm|Xm                Rm, Rn, Rd
+//
+// (T4 moves the vector instructions of the chain here and adds the other
+// classes: two-register misc, modified immediate, shift by immediate,
+// copy, vector by element, the crypto ones.)
+
+use crate::arch::table::{insn_hex, insn_named, insn_text};
+use crate::back::enc_arm64::{C_X, OPS, imm5, need, r, word};
+use crate::back::objfile::assemble::asm_error;
+use crate::middle::ctx::FnCtx;
+
+// The instruction of mnemonic `name` with the operands parsed;
+// false when the table has no such mnemonic.
+pub fn a64_table_instruction(mut cx: *FnCtx, name: [u8]) -> bool {
+    unsafe {
+        let k = insn_named(name);
+        if k < 0 {
+            return false;
+        }
+        let class = insn_text(k, 1);
+        let bits = insn_hex(k, 2);
+        let o0 = OPS[0];
+        let o1 = OPS[1];
+        if class == "same3" {
+            need(cx, 3);
+            word(bits | o0.shift << 30 | o0.imm << 22 | r(2) << 16 | r(1) << 5 | r(0));
+        } else if class == "across" {
+            need(cx, 2);
+            word(bits | o1.shift << 30 | o1.imm << 22 | r(1) << 5 | r(0));
+        } else if class == "umov" {
+            need(cx, 2);
+            let q = if o0.cls == C_X { 1 << 30 } else { 0 };
+            word(bits | q | imm5(o1.imm, o1.amount) << 16 | r(1) << 5 | r(0));
+        } else if class == "tbl" {
+            need(cx, 3);
+            word(bits | o0.shift << 30 | r(2) << 16 | (o1.amount - 1) << 13 | r(1) << 5 | r(0));
+        } else if class == "ext" {
+            need(cx, 4);
+            word(bits | o0.shift << 30 | r(2) << 16 | (OPS[3].imm & 15) << 11 | r(1) << 5 | r(0));
+        } else if class == "shrn" {
+            need(cx, 3);
+            let esize = 8 << o0.imm as u64;
+            word(bits | o0.shift << 30 | (2 * esize - OPS[2].imm) << 16 | r(1) << 5 | r(0));
+        } else if class == "crc" {
+            need(cx, 3);
+            word(bits | r(2) << 16 | r(1) << 5 | r(0));
+        } else {
+            asm_error(cx, c"internal error: an instruction class the encoder does not know");
+        }
+        true
+    }
+}

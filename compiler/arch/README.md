@@ -1,0 +1,100 @@
+# The intrinsic tables (0.19)
+
+Every intrinsic of `std::arch` is one line of a table here; the
+instructions they use are lines of the instruction tables. The design is
+docs/design/arch.md (§2.1, and §7.2 for who adds what).
+
+| file | holds |
+|---|---|
+| `portable.def` | `std::arch`: `count_ones`, `has`, `detect`, ... (every target) |
+| `aarch64.def` | `std::arch::aarch64`: ACLE's names |
+| `x86_64.def` | `std::arch::x86_64`: Intel's names |
+| `insn_a64.def` | the AArch64 instructions the compiler's assembler reads from here |
+| `insn_x86.def` | the x86-64 instructions the same |
+| `embed.sh` | writes them into `compiler/src/arch/tables.tach` |
+
+Run `compiler/arch/embed.sh` after changing a `.def` file;
+`tests/run.sh` fails while the generated file is stale. Lines starting
+with `#` and blank lines are comments. Columns are separated by ` | `
+(space, bar, space), which no column may contain. A malformed line is an
+internal error of the compiler on the first program that names
+`std::arch` (`tests/run.sh arch` finds it).
+
+## Intrinsic lines
+
+    name | features | signature | form | instruction | flags | memory | fold | semantics | equivalent | doc
+
+| column | what | examples |
+|---|---|---|
+| name | the vendor's name, unique over the three tables | `vqsubq_u8`, `_mm_movemask_epi8` |
+| features | the target features it needs, comma-separated (the table's architecture's names); `-` none | `neon`, `crc`, `sse4.2` |
+| signature | `(PARAM: TYPE, ...) -> TYPE`, without `->` for none. Types are tachyon's, the vendor aliases of the same module (`uint8x16_t`, `__m128i`), or a slice `[u8]` with an `i64` index for a memory form. An immediate is `NAME: const LO..=HI`: an argument that must be a constant in that range (`arch.const_arg`), passed as an `i64` | `(a: uint8x16_t, n: const 0..=15) -> uint8x16_t` |
+| form | how lowering makes it (`middle/lower/arch.tach`): `intr` (`Op::Intr`, the instruction), `intr.mem` (`Op::IntrMem`), `load`, `store` (a checked `Load`/`Store` of the vector), `cast` (no instruction), `vbin.OP` (add sub mul and or xor), `vcmp.C` (eq gt ge lt le), `vsplat`, `vext`: 0.10's vector operations; `bits.K` (ones leading trailing), `feat.has`, `feat.detect`, `hint`. `:TYPE` after a generic form: the type it computes in when the signature's are others | `intr`, `vcmp.eq:v16i8` |
+| instruction | its assembly template (below); `-` none | `uqsub <d>.16b, <a>.16b, <b>.16b` |
+| flags | `pure`, `commutative`, `tied=PARAM` (the instruction overwrites that parameter's register: the result starts as a copy of it); `-` none | `pure tied=a` |
+| memory | `none`, `load(SLICE, BYTES)`, `store(SLICE, BYTES)` (SLICE's parameter is followed by the index; checked `0 <= i`, `i + BYTES / elem <= len`), `raw` (a pointer form: unsafe) | `load(s, 16)` |
+| fold | the constant folder's family (T6, `middle/fold/arch.tach`); `-` none | `lanes.qsub_u`, `perm.tbl` |
+| semantics | one line of what it computes, lane `k` of result `r`: the reference T7's generator tests against | `r[k] = max(a[k] - b[k], 0)` |
+| equivalent | the other architecture's equivalent or recipe (`query arch --equiv`) | `x86_64: _mm_subs_epu8` |
+| doc | one line for `query show` and the guide | `lanewise a - b, saturating at 0` |
+
+The effects come from the memory column: none for a register intrinsic,
+`panic` for a checked memory form, `unsafe` for a raw one.
+
+### Instruction templates
+
+The assembly the machine layers write (`back/mc_arm64/arch.tach`,
+`back/mc_x86_64/arch.tach`, and -O0's `gen0/gen/arch.tach` with fixed
+registers), AT&T syntax on x86-64. Placeholders in angle brackets:
+
+| placeholder | is |
+|---|---|
+| `<d>` | the result's register |
+| `<t>` | the instruction temporary: v31 / xmm15 (x17 / r11 for a general register) |
+| `<NAME>` | parameter NAME's register, or an immediate's value |
+| `<NAME:M>` | a view of the register: `w` (32-bit), `x` (64-bit) general register; on AArch64 `b h s d q`, a vector register's scalar view |
+| `<_d>`, `<_t>` | the result and the temporary, when a parameter is named d or t |
+
+Instructions are separated by `; ` (a result moved between register
+files, as `umaxv` then `umov`). Under `tied=P` the template writes the
+tied register as `<d>`.
+
+## Instruction lines
+
+AArch64 (`insn_a64.def`), for the mnemonics the scalar encoder
+(`back/enc_arm64/mod.tach`) does not know:
+
+    mnemonic | class | bits | syntax
+
+`bits` is the encoding with the class's fields zero; `syntax` is
+documentation. The classes (`back/enc_arm64/simd.tach`):
+
+| class | operands | fields added |
+|---|---|---|
+| `same3` | `Vd.T, Vn.T, Vm.T` | Q, size, Rm, Rn, Rd |
+| `across` | `<V>d, Vn.T` | Q, size, Rn, Rd |
+| `umov` | `Wd\|Xd, Vn.Ts[i]` | Q (for .d), imm5, Rn, Rd |
+| `tbl` | `Vd.T, {Vn.16b, ...}, Vm.T` | Q, Rm, len - 1, Rn, Rd |
+| `ext` | `Vd.T, Vn.T, Vm.T, #index` | Q, Rm, imm4, Rn, Rd |
+| `shrn` | `Vd.Tb, Vn.Ta, #shift` | Q, immh:immb = 2 * esize - shift, Rn, Rd |
+| `crc` | `Wd, Wn, Wm\|Xm` | Rm, Rn, Rd |
+
+x86-64 (`insn_x86.def`), for the mnemonics `back/enc_x86.tach`'s own
+table lacks:
+
+    mnemonic | class | prefix | map | opcode | flags
+
+`prefix` is the mandatory prefix (`66`, `f2`, `f3`, `-`), `map` the
+opcode map (`0f`, `0f38`, `0f3a`), `opcode` the byte, in hexadecimal;
+`flags` `w` for REX.W, else `-`. Classes: `sse` (`op src, dst`: ModRM reg
+is dst) and `ssei` (`op $imm8, src, dst`). VEX (AVX) is T5's.
+
+## Adding an intrinsic
+
+1. Its line in the architecture's table, its instruction's line when the
+   encoder lacks it; `compiler/arch/embed.sh`.
+2. `tests/arch/gen.sh --check` builds every intrinsic at -O0 and -O2 and
+   compares them (the AArch64 program is run); `tests/objcheck.sh arch_`
+   (and `-t x86_64-macos arch_`) checks the encoder against `cc -c`.
+3. A new form, class or placeholder is a change to the compiler: its
+   owner is in docs/design/arch.md, "Phase 0 contract".

@@ -1,14 +1,18 @@
+use crate::arch::virtual::in_arch_source;
 use crate::base::{intern, intern_c};
 use crate::base::diag::error_at;
 use crate::front::ambient::AMBIENT_TRY;
 use crate::front::ast::{
     EFFECTS_DECL, EFFECTS_NO_ALLOC, EFFECTS_NO_IO, EFFECTS_NO_PANIC, EFFECTS_PURE, FN_AMBIENT,
-    FN_COLD, FN_EFFECT_DECL, FN_INLINE, FN_NO_INLINE, FN_VIEWS_DECL, NODES, NodeKind, list_begin,
-    list_end, list_push, new_node,
+    FN_COLD, FN_EFFECT_DECL, FN_FEATURES, FN_INLINE, FN_INTRINSIC, FN_NO_INLINE, FN_VIEWS_DECL,
+    NODES, NodeKind, list_begin, list_end, list_push, new_node,
 };
 use crate::front::check::name_error;
+use crate::front::features::{FA_MULTIVERSION, FA_TARGET_FEATURE, note_feature_attr};
 use crate::front::lexer::{TOKS, str_at};
-use crate::front::lexer::Tok::{Comma, Eof, Hash, LBracket, LParen, RBracket, RParen, Star, Str};
+use crate::front::lexer::Tok::{
+    Comma, Eof, Eq, Hash, Int, LBracket, LParen, RBracket, RParen, Star, Str,
+};
 use crate::front::parser::{
     P, advance, at, cur_start, eat, expect, expect_ident, prev_end, syntax_error,
 };
@@ -19,6 +23,10 @@ use crate::middle::lower::ssa::HMap;
 // the first EffectSet and the last (chained by b).
 static mut EFFECT_DECLS: i64 = 0;
 static mut EFFECT_DECLS_LAST: i64 = 0;
+
+// (0.19) The id of an #[intrinsic(ID)] before the function being parsed
+// (-1: none).
+pub static mut INTRINSIC_PENDING: i64 = -1;
 
 // The text of an #[ambient("...")] before the function being parsed (-1:
 // none).
@@ -164,6 +172,52 @@ pub fn parse_fn_attribute(name: i64, pos: i64) -> i64 {
         }
         if name == intern_c(c"cold") {
             return FN_COLD;
+        }
+        // (0.19) std::arch: `#[intrinsic(ID)]` (its virtual declarations
+        // only), `#[target_feature(enable = "a,b")]`,
+        // `#[multiversion("a", "b,c")]` (front/features)
+        if name == intern_c(c"intrinsic") {
+            if !in_arch_source(pos) {
+                name_error(pos, c"unknown attribute '", name,
+                    c"' (#[intrinsic] is std::arch's own)");
+            }
+            expect(LParen);
+            if !at(Int) {
+                syntax_error(c"expected the intrinsic's id");
+            }
+            INTRINSIC_PENDING = TOKS[P].value as i64;
+            advance();
+            expect(RParen);
+            return FN_INTRINSIC;
+        }
+        if name == intern_c(c"target_feature") {
+            expect(LParen);
+            let word = expect_ident();
+            if word != intern_c(c"enable") {
+                name_error(pos, c"unknown target_feature option '", word,
+                    c"' (expected #[target_feature(enable = \"avx2,fma\")])");
+            }
+            expect(Eq);
+            if !at(Str) {
+                syntax_error(
+                    c"expected the features as a string: #[target_feature(enable = \"avx2,fma\")]");
+            }
+            note_feature_attr(FA_TARGET_FEATURE, TOKS[P].value as i64, pos);
+            advance();
+            expect(RParen);
+            return FN_FEATURES;
+        }
+        if name == intern_c(c"multiversion") {
+            expect(LParen);
+            while at(Str) {
+                note_feature_attr(FA_MULTIVERSION, TOKS[P].value as i64, pos);
+                advance();
+                if !eat(Comma) {
+                    break;
+                }
+            }
+            expect(RParen);
+            return FN_FEATURES;
         }
         if name != intern_c(c"inline") {
             return 0;

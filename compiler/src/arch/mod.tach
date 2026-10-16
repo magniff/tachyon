@@ -1,0 +1,283 @@
+// std::arch (0.19): CPU intrinsics and target features. The design is
+// docs/design/arch.md; its "Phase 0 contract" says which task owns what.
+//
+// Every intrinsic is one line of a table (compiler/arch/*.def, generated
+// into tables.tach by compiler/arch/embed.sh), parsed on a program's first
+// use of std::arch (table.tach) into an IntrInfo. The modules std::arch,
+// std::arch::aarch64 and std::arch::x86_64 are virtual (virtual.tach):
+// when a program names std::arch, a declaration is synthesized for each
+// intrinsic it names, marked #[intrinsic(ID)]; nothing else is read, and a
+// program that names no std::arch item pays nothing. A call of such a
+// declaration is checked as any call (then front/check/arch.tach), and
+// lowered by its table's IR form (middle/lower/arch.tach, gen0/gen/arch.tach).
+//
+// Here: the IntrInfo of an intrinsic and the constants of its columns,
+// the lookups, and which function is which intrinsic.
+
+pub mod features;
+pub mod table;
+pub mod tables;
+pub mod template;
+pub mod virtual;
+
+use crate::arch::table::param_entry;
+use crate::base::{BUFS, sym_table};
+use crate::base::target::X86;
+use crate::front::effects::{EFF_PANIC, EFF_RAW_PANIC, EFF_UNSAFE};
+use crate::front::types::FNS;
+use crate::middle::lower::ssa::HMap;
+
+// The architectures of the tables (IntrInfo.arch).
+pub const ARCH_PORTABLE: i64 = 0;
+pub const ARCH_AARCH64: i64 = 1;
+pub const ARCH_X86_64: i64 = 2;
+
+// The IR forms (the `form` column, IntrInfo.form): how lowering makes the
+// intrinsic. form_arg is the operation (VBIN: an Op; VCMP: a Cond; BITS:
+// BITS_*; FEAT: FEAT_HAS or FEAT_DETECT).
+pub const FORM_INTR: i64 = 1;
+pub const FORM_INTR_MEM: i64 = 2;
+pub const FORM_VBIN: i64 = 3;
+pub const FORM_VCMP: i64 = 4;
+pub const FORM_VSPLAT: i64 = 5;
+pub const FORM_VEXT: i64 = 6;
+pub const FORM_CAST: i64 = 7;
+pub const FORM_LOAD: i64 = 8;
+pub const FORM_STORE: i64 = 9;
+pub const FORM_BITS: i64 = 10;
+pub const FORM_FEAT: i64 = 11;
+pub const FORM_HINT: i64 = 12;
+
+pub const FEAT_HAS: i64 = 0;
+pub const FEAT_DETECT: i64 = 1;
+
+// The flags (the `flags` column): computed from its operands alone
+// (`pure`), operands that commute (`commutative`); `tied=P`: the result's
+// register is parameter P's (the instruction overwrites it), P + 1 in
+// bits IF_TIED_SHIFT and up (0: none).
+pub const IF_PURE: i64 = 1;
+pub const IF_COMMUTATIVE: i64 = 2;
+pub const IF_TIED_SHIFT: i64 = 8;
+
+// The memory an intrinsic touches (the `memory` column): none, a load or a
+// store of mem_bytes bytes of slice parameter mem_param at index
+// mem_param + 1 (checked), or raw (a pointer form, unsafe).
+pub const MEM_NONE: i64 = 0;
+pub const MEM_LOAD: i64 = 1;
+pub const MEM_STORE: i64 = 2;
+pub const MEM_RAW: i64 = 3;
+
+// The text columns of a line (intr_text).
+pub const F_NAME: i64 = 0;
+pub const F_FEATURES: i64 = 1;
+pub const F_SIGNATURE: i64 = 2;
+pub const F_FORM: i64 = 3;
+pub const F_INSN: i64 = 4;
+pub const F_FLAGS: i64 = 5;
+pub const F_MEMORY: i64 = 6;
+pub const F_FOLD: i64 = 7;
+pub const F_SEMANTICS: i64 = 8;
+pub const F_EQUIV: i64 = 9;
+pub const F_DOC: i64 = 10;
+pub const FIELD_COUNT: i64 = 11;
+
+// An intrinsic: its table line, parsed.
+//   name     its name (a symbol); arch: ARCH_*
+//   features the target features it needs (features.tach's bits)
+//   form, form_arg, work: its IR form; work, the type its generic
+//            operation is on when the signature's types are others (x86's
+//            `vcmp.eq:v16i8` on __m128i: a symbol, 0 for none)
+//   params, nparams: its parameters (table.tach: param_entry); ret: the
+//            return type's text, as a field (ret_start..ret_end; equal: none)
+//   consts   a bit per parameter that is an immediate (`n: const LO..=HI`)
+//   flags    IF_*; mem, mem_param, mem_bytes: MEM_*
+//   fields   the index of its first field in table.tach's FIELDS
+pub struct IntrInfo {
+    name: i64, arch: i64, features: i64,
+    form: i64, form_arg: i64, work: i64,
+    params: i64, nparams: i64, ret_start: i64, ret_end: i64, consts: i64,
+    flags: i64, mem: i64, mem_param: i64, mem_bytes: i64,
+    fields: i64,
+}
+
+pub static mut INTRS: *IntrInfo = 0 as *IntrInfo;
+pub static mut INTR_COUNT: i64 = 0;
+// The table's text (a BUFS index; -1 before the first use).
+pub static mut TABLE_BUF: i64 = -1;
+// The intrinsic of each name (a table by symbol: id + 1).
+pub static mut INTR_BY_NAME: *i64 = 0 as *i64;
+
+// Whether the program names std::arch (or uses a target-feature
+// attribute): every lookup below is skipped otherwise.
+pub static mut ARCH_USED: bool = false;
+// The features of the intrinsics the program names (virtual.tach): the
+// AArch64 assembly's `.arch_extension` lines (mc_arm64/arch.tach).
+pub static mut ARCH_EXT_FEATURES: i64 = 0;
+// The intrinsic of each declaration virtual.tach made (its Fn node + 1 to
+// id + 1).
+static mut INTR_OF_NODE: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+// The number of intrinsics in the tables. (These accessors only read: the
+// front end loads the tables, load_arch_modules, before any code
+// generation task runs; 0 intrinsics when no program named std::arch.)
+pub fn intrinsic_count() -> i64 {
+    INTR_COUNT
+}
+
+// Intrinsic id's information.
+pub fn intrinsic(id: i64) -> *IntrInfo {
+    unsafe { &INTRS[id] as *IntrInfo }
+}
+
+// The name (a symbol) of intrinsic id.
+pub fn intrinsic_name(id: i64) -> i64 {
+    unsafe { INTRS[id].name }
+}
+
+// The intrinsic named `name` (a symbol), or -1.
+pub fn intrinsic_named(name: i64) -> i64 {
+    unsafe {
+        if name <= 0 || TABLE_BUF < 0 {
+            return -1;
+        }
+        INTR_BY_NAME[name] - 1
+    }
+}
+
+// Column `field` (F_*) of intrinsic id's line.
+pub fn intr_text(id: i64, field: i64) -> [u8] {
+    unsafe {
+        let base = INTRS[id].fields;
+        let start = crate::arch::table::FIELDS.data[base + 2 * field];
+        let end = crate::arch::table::FIELDS.data[base + 2 * field + 1];
+        BUFS[TABLE_BUF].data[start..end]
+    }
+}
+
+// The return type's text of intrinsic id ("" for none).
+pub fn intr_ret_text(id: i64) -> [u8] {
+    unsafe { BUFS[TABLE_BUF].data[INTRS[id].ret_start..INTRS[id].ret_end] }
+}
+
+// Parameter k of intrinsic id: its name (a symbol), and, for an immediate,
+// its range lo..=hi (lo > hi for an ordinary parameter).
+pub fn intr_param_name(id: i64, k: i64) -> i64 {
+    unsafe { param_entry(INTRS[id].params + k, 0) }
+}
+
+pub fn intr_param_is_const(id: i64, k: i64) -> bool {
+    unsafe { (INTRS[id].consts >> k as u64 & 1) != 0 }
+}
+
+pub fn intr_param_lo(id: i64, k: i64) -> i64 {
+    unsafe { param_entry(INTRS[id].params + k, 3) }
+}
+
+pub fn intr_param_hi(id: i64, k: i64) -> i64 {
+    unsafe { param_entry(INTRS[id].params + k, 4) }
+}
+
+// The parameter tied to the result (IF_TIED_SHIFT), or -1.
+pub fn intr_tied(id: i64) -> i64 {
+    unsafe { (INTRS[id].flags >> IF_TIED_SHIFT as u64) - 1 }
+}
+
+// The INTR operand (0 a, 1 b, 2 c) of the parameter tied to the result
+// (the register parameters in order, immediates left out), or -1.
+pub fn intr_tied_operand(id: i64) -> i64 {
+    let tied = intr_tied(id);
+    if tied < 0 {
+        return -1;
+    }
+    let mut k = 0;
+    for p in 0..tied {
+        if !intr_param_is_const(id, p) {
+            k += 1;
+        }
+    }
+    k
+}
+
+// The number of immediates of intrinsic id.
+pub fn intrinsic_const_count(id: i64) -> i64 {
+    unsafe {
+        let mut n = 0;
+        for k in 0..INTRS[id].nparams {
+            if intr_param_is_const(id, k) {
+                n += 1;
+            }
+        }
+        n
+    }
+}
+
+// Immediate k of an INTR's imm2 (16 bits each, in parameter order;
+// sign-extended).
+pub fn intr_imm(imm2: i64, k: i64) -> i64 {
+    let v = (imm2 >> (16 * k) as u64) & 0xffff;
+    if v >= 0x8000 { v - 0x10000 } else { v }
+}
+
+// imm2 with immediate k set to `value`.
+pub fn intr_with_imm(imm2: i64, k: i64, value: i64) -> i64 {
+    let shift = (16 * k) as u64;
+    (imm2 & ~(0xffff << shift)) | ((value & 0xffff) << shift)
+}
+
+// The architecture being compiled for (ARCH_AARCH64 or ARCH_X86_64).
+pub fn target_arch() -> i64 {
+    unsafe { if X86 { ARCH_X86_64 } else { ARCH_AARCH64 } }
+}
+
+// Whether intrinsic id is of another architecture than the target's: it is
+// checked, never generated (a call of it is dead, or an error).
+pub fn intrinsic_is_foreign(id: i64) -> bool {
+    unsafe {
+        let a = INTRS[id].arch;
+        a != ARCH_PORTABLE && a != target_arch()
+    }
+}
+
+// The effects of intrinsic id (front/effects: as a C function's declared
+// ones): a checked memory form may panic, a raw one is unsafe, the others
+// have none.
+pub fn intrinsic_effect_bits(id: i64) -> i64 {
+    unsafe {
+        let m = INTRS[id].mem;
+        if m == MEM_LOAD || m == MEM_STORE { EFF_PANIC | EFF_RAW_PANIC }
+        else if m == MEM_RAW { EFF_UNSAFE }
+        else { 0 }
+    }
+}
+
+// The declaration virtual.tach made for intrinsic id is Fn node `node`
+// (the parser, at its #[intrinsic(ID)]).
+pub fn note_intrinsic_node(node: i64, id: i64) {
+    unsafe { INTR_OF_NODE.put(node + 1, id + 1); }
+}
+
+// The intrinsic function f (FNS) declares, or -1 (always -1 for a program
+// that names no std::arch item).
+pub fn intrinsic_of_fn(f: i64) -> i64 {
+    unsafe {
+        if !ARCH_USED || f < 0 {
+            return -1;
+        }
+        INTR_OF_NODE.get(FNS[f].node + 1) - 1
+    }
+}
+
+// The intrinsic Fn node n declares, or -1.
+pub fn intrinsic_of_node(n: i64) -> i64 {
+    unsafe {
+        if !ARCH_USED {
+            return -1;
+        }
+        INTR_OF_NODE.get(n + 1) - 1
+    }
+}
+
+// The table by name, allocated when the table is first parsed.
+pub fn init_name_table() {
+    unsafe { sym_table(&INTR_BY_NAME); }
+}

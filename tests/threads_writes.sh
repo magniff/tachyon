@@ -162,7 +162,13 @@ base::STRESS_GROW	read by asm_thread_start before the thread starts (stress_grow
 # covers it (key: in the entry's key; read: recorded, cc_note; IR: in
 # hash::ir_hash; off: a mode the cache is off in, cc_wanted; own: the
 # cache's, or the task's context's).
-READ='back::codecache::CC_ON	own
+READ='arch::ARCH_USED	key: a program naming std::arch has its intrinsics in its IR and the build features in the options hash (made by the front end, before the tasks)
+arch::INTRS	key: the intrinsic tables are part of the compiler (its identity), parsed by the front end before the tasks, read-only after
+arch::INTR_COUNT	key: the same
+arch::TABLE_BUF	key: the same
+arch::table::FIELDS	key: the same
+arch::table::PARAMS	key: the same
+back::codecache::CC_ON	own
 back::codecache::CHECK	own (testing)
 back::codecache::ENV	own: the key'"'"'s program hash
 back::codecache::FN_IRH	own: read R_IR

@@ -1,0 +1,81 @@
+// x86-64 intrinsics (0.19, docs/design/arch.md §5.4): an INTR is its
+// table's instruction template (arch/template.tach, AT&T syntax) with its
+// registers; -O0 writes the same with fixed ones (gen0/gen/arch.tach).
+// (Compile-tested: objcheck and the CROSS cases; not run in 0.19.)
+
+use crate::arch::{F_INSN, INTRS, intr_text, intr_tied};
+use crate::arch::template::{
+    SLOT_D, SLOT_T, TP_END, TP_NEXT, TP_SLOT, TP_TEXT, TPiece, template_piece, template_slot,
+};
+use crate::back::mc_x86_64::{mx_mov, mx_rs};
+use crate::base::buf_bytes;
+use crate::front::types::{TY_I64, TY_V16I8};
+use crate::gen0::target::{o, oi, on};
+use crate::middle::ctx::FnCtx;
+
+// The instruction temporaries: xmm15, and r11 for a general register.
+const XTEMP: i64 = 47;
+const RTEMP: i64 = 11;
+
+// Register r with modifier m: %xmm<n> (32 + n), a general register's
+// 64-bit name (`w`: 32-bit, `h`: 16-bit, `b`: 8-bit).
+fn mx_reg(mut cx: *FnCtx, r: i64, m: u8) {
+    unsafe {
+        let size = if m == 'w' { 4 } else if m == 'h' { 2 } else if m == 'b' { 1 } else { 8 };
+        mx_rs(cx, r, size);
+    }
+}
+
+fn mx_move(mut cx: *FnCtx, d: i64, s: i64) {
+    unsafe { mx_mov(cx, d, s, if d >= 32 { TY_V16I8 } else { TY_I64 }); }
+}
+
+// Intrinsic id into register d (-1: no result) from the registers ops[k]
+// of its parameters (-1 for an immediate, whose value is imms[k]). SSE's
+// two-operand forms are tied: the result starts as a copy of the tied
+// parameter, in xmm15 (r11) when d is another operand's.
+pub fn mx_intr(mut cx: *FnCtx, id: i64, d: i64, ops: [i64], imms: [i64]) {
+    unsafe {
+        let tied = intr_tied(id);
+        let mut dd = d;
+        if tied >= 0 && ops[tied] != d {
+            for k in 0..INTRS[id].nparams {
+                if k != tied && ops[k] == d {
+                    dd = if d >= 32 { XTEMP } else { RTEMP };
+                }
+            }
+            mx_move(cx, dd, ops[tied]);
+        }
+        let text = intr_text(id, F_INSN);
+        let mut p = TPiece { kind: 0, start: 0, end: 0, name: 0, modifier: 0 };
+        let mut at = 0;
+        o(cx, c"    ");
+        loop {
+            at = template_piece(text, at, &p);
+            if p.kind == TP_END {
+                break;
+            }
+            if p.kind == TP_TEXT {
+                buf_bytes(cx.code, text[p.start..p.end]);
+            } else if p.kind == TP_NEXT {
+                on(cx);
+                o(cx, c"    ");
+            } else if p.kind == TP_SLOT {
+                let s = template_slot(id, p.name);
+                if s == SLOT_D {
+                    mx_reg(cx, dd, p.modifier);
+                } else if s == SLOT_T {
+                    mx_reg(cx, XTEMP, p.modifier);
+                } else if ops[s] < 0 {
+                    oi(cx, imms[s]);
+                } else {
+                    mx_reg(cx, ops[s], p.modifier);
+                }
+            }
+        }
+        on(cx);
+        if dd != d {
+            mx_move(cx, d, dd);
+        }
+    }
+}
