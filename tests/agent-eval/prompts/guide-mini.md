@@ -37,13 +37,13 @@ The prelude (`Vec`, `Buf`, `HashMap`, `MinHeap`, `Scanner`,
 allocator: pass `gpa` down from main as a parameter.
 
 As in Rust: `[u8]` and tuples compare and sort (`==`, `<`, `v.sort()`);
-`let (a, b) = f();`; `for b in s` yields bytes; `v[i] = x` through
-`&mut Vec`; `&&` short-circuits; `if` is an expression; match guards;
-`match e` on a `&E` binds references (`E::A(x) => *x`); `let ...
-else`; `&f()`; `{v[i]}` in f-strings; `for (k, x) in m.iter()`; `x?`,
-closures, traits, `#[derive(Debug, Eq, Ord)]`. Unlike Rust:
-`sort_by(|a, b| *a - *b)` returns an `i64`; `usize` is `i64`; integers
-wrap; `as` narrows; no `dyn`, `Box`, `where`.
+`v[i] = x` through `&mut Vec`; match guards;
+`match e` on a `&E` binds references (`E::A(x) => x + 1`); `let ...
+else`; `&f()`; `x?`, closures, traits, `#[derive(Debug, Eq, Ord)]`.
+Unlike Rust: `for x in v`, `v.iter()`, `v.get(i)`, `m.get(k)` give
+copies, not `&T` (passed where `&T` is wanted, borrowed; change one
+in place: `v[i].push(x)`); `sort_by(|a, b| a - b)` returns an
+`i64`; `usize` is `i64`; integers wrap; `as` narrows; no `dyn`, `Box`.
 
 On demand: `tachyonc guide --find WORDS` (`--find read a line`),
 `tachyonc guide std` (the most used; `std#the-api`: all),

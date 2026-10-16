@@ -52,7 +52,7 @@ fn main(gpa: Gpa) -> i32 {             // gpa: the program's allocator; 0 = exit
     // Rust: println!("{} {:?}", p.get(), v);
     println(f"{p.get()} {v:?}");       // no macros: f-strings
     let s = "hi";
-    println(s.len());                  // an i64; or the field, s.len
+    println(s.len());                  // an i64 (slices, Vec, Buf, HashMap)
     // Rust: let mut b = String::new(); b.push_str("n="); ...
     let mut b = Buf::new_in(gpa);
     let o = odds(7, gpa);

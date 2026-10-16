@@ -57,7 +57,7 @@ write; another unknown method, the type's nearest methods and `tachyonc
 query items TYPE`, which lists them all.
 
 ```tach
-fn count(s: &str) -> i64 { s.len }
+fn count(s: &str) -> i64 { s.len() }
 ```
 ```err
 error[parser error] expected type, got '&' | help: `&str` is `[u8]` in tachyon: a slice of bytes, as string literals are
@@ -351,7 +351,7 @@ fn main() -> i32 { let a = [1, 2, 3]; sum(a) as i32 }
 ```err
 error[type error] expected '[i64]', got '[i64; 3]'
 ```
-`sum(a[..])`. An array's length is `a.len()` (or `a[..].len`).
+`sum(a[..])`. An array's length is `a.len()`.
 
 ```tach
 let e: IoError = IoError::Read;
@@ -818,13 +818,15 @@ error[own.readonly] cannot write 'p.x': 'p' is '&P', a shared reference
 `v.as_mut_slice()` or `&mut a[..]`. Old code: `tachyonc fix --values`.
 
 ```text
-error[type error] expected 'i64', got '&i64' | help: it is a reference: read through it with '*' | try: *n
-error[type error] expected '&i64', got 'i64' | help: the other operand is a reference: read through it with '*' | try: 3 < *n
+error[type error] expected '&Item', got 'Item'
+error[type error] expected 'Item', got '&Item' | help: it is a reference: read through it with '*' | try: *it
 ```
-(0.18.1) A pattern on a reference (`match e` with `e: &E`) binds
-references, `n: &i64`, as a `sort_by` closure's parameters are: read
-them with `*n`; `fix --suggested` writes it. An index reads through one
-(`keys[n]`).
+(0.18.1) A place passed where `&T` is expected is borrowed, as a
+receiver is (`f(it)` for `f(x: &Item)`); a reference to a number or a
+bool is read through where the value is wanted (`n + 1`, `3 < n`,
+`keys[n]`, `f(n)`). What is left: a value that is no place where `&T`
+is expected (`&f(x)` names it), and a reference to a struct where the
+struct is wanted (`*it`, or `.clone()` for an owned one).
 
 ```text
 error[own.readonly] changes 'v' (Vec<i64>), a copy the match on '*e' (3:11) binds: the change would not reach it, and could free memory it points to

@@ -11,7 +11,7 @@ prelude: no `use` line.
 v.push(x: T)                     Vec; Buf: b.push(byte: u8)
 v.as_slice() -> [T]              Vec; Buf: -> [u8]
 Vec::new_in(gpa) -> Vec<T>       let mut v: Vec<i64> = Vec::new_in(gpa);
-v.len() -> i64                   Vec, Buf, HashMap, slices (`.len` too)
+v.len() -> i64                   Vec, Buf, HashMap, slices
 v.get(i: i64) -> T               checked, as v[i]; m.get(k) -> Option<V>
 b.push_str(s: [u8])
 Buf::new_in(gpa) -> Buf          text you build (there is no String)

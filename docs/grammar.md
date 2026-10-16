@@ -1682,14 +1682,27 @@ let_stmt += "let" pattern "=" expr "else" block ";" ;     (* let-else *)
   operator's) takes a temporary: a local named by e's text, declared
   before the statement and dropped at the end of the block (Rust's
   lifetime extension for `let r = &f(x);`). It is made where nothing
-  evaluated before it in the statement (a call, an assignment, an index,
-  the other side of `&&`/`||`, a closure, a loop's condition) could tell
-  the difference; a literal of literals anywhere. Elsewhere `&e` is
+  evaluated before it in the statement (a call, an assignment, an index)
+  could tell the difference; a literal of literals anywhere. Where it is
+  evaluated or not (the other side of `&&`/`||`, a match arm's value, a
+  closure's body), its temporaries go in a block made for that
+  expression. A loop's condition makes none. Elsewhere `&e` is
   `cannot take address of non-lvalue expression`, whose `try:` names the
   value first. `&e` of a slice value is still the slice; where `&[T]` is
   expected, the temporary's reference (`cmp_of(&a.text(), &b.text())`).
 - **An index** may be a reference to an integer (`keys[a]` with `a:
   &i64`, a `sort_by` closure's parameter): it is read through.
+- **References where values are expected, and back.** A place (a
+  local, a field) where `&T` is expected is borrowed, as a `self: &T`
+  receiver is: `f(it)` for `f(x: &Item)`. A reference to a plain value
+  (a number, a bool, a struct of them) where the value is expected is
+  read through, a copy: an operator's operand (`n + 1`, `3 < n`), an
+  argument, a typed `let`. A `&&T` where `&T` is expected is read
+  through once, and a method's receiver through every reference (`tr.f()`
+  for `tr: &&T`, `s.len()` for `s: &[u8]`). A view taken through a
+  reference local or a pattern's reference binding views what it points
+  to, not the reference: it may be returned or kept after the binding's
+  scope when that is alive.
 
 ## Importing C headers
 

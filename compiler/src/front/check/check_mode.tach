@@ -15,6 +15,7 @@ use crate::front::check::{
     Res, SELF_TYPE, SELF_TYPE_SYM, mismatch_error, name_error, type_error_got,
 };
 use crate::front::check::args::check_shorthands;
+use crate::front::check::assign::is_place;
 use crate::front::check::body::{check_branch, check_if, check_loop};
 use crate::front::check::distinct::{BINARY_NODE, distinct_literal};
 use crate::front::check::interp::check_interp;
@@ -43,9 +44,9 @@ use crate::front::modules::lookup::{
 };
 use crate::front::patterns::check_match;
 use crate::front::types::{
-    FNS, REF_MUT, REF_SHARED, STRUCTS, SYM_ALIAS, SYM_STRUCT, TYPES, TY_ERROR, TY_NEVER, TyKind,
-    buf_type, err_type, find_field, int_max, is_float, is_integer, is_numeric, is_signed,
-    struct_field, struct_type, type_elem,
+    FNS, REF_MUT, REF_SHARED, STRUCTS, SYM_ALIAS, SYM_STRUCT, TYPES, TY_BOOL, TY_ERROR, TY_NEVER,
+    TyKind, buf_type, err_type, find_field, int_max, is_float, is_integer, is_numeric, is_ref,
+    is_signed, struct_field, struct_type, type_elem,
 };
 
 fn passes_expected_to_operands(op: Tok, ex: i64) -> bool {
@@ -227,28 +228,36 @@ pub fn coerce_ref(n: i64, actual: i64, expected: i64) -> bool {
             }
             return false;
         }
-        if ak == TyKind::Slice && TYPES[actual].b == 0 && ek == TyKind::Ptr
-            && TYPES[expected].b == REF_SHARED && TYPES[expected].a == actual
-            && NODES[n].kind == NodeKind::Ident && (NODES[n].p & NODE_TEMP) != 0 {
-            // (0.18.1) a temporary slice, `&x.text()`, where `&[T]` is
-            // expected (`cmp_of(&a.text(), &b.text())`): its reference
-            let inner = new_node(NodeKind::Ident, NODES[n].start, NODES[n].end);
-            NODES[inner] = NODES[n];
-            NODES[n].kind = Unary;
-            NODES[n].op = Tok::Amp;
-            NODES[n].b = inner;
-            NODES[n].a = 0;
-            NODES[n].p = 0;
-            NODES[n].res = Res::None;
-            NODES[n].x = 0;
-            NODES[n].y = 0;
-            NODES[n].ty = expected;
+        if ek == TyKind::Ptr && TYPES[expected].b == REF_SHARED && TYPES[expected].a == actual
+            && (is_place(n) || NODES[n].kind == NodeKind::Ident && (NODES[n].p & NODE_TEMP) != 0) {
+            // (0.18.1) a place where `&T` is expected is borrowed, as a
+            // `self: &T` receiver is: `f(it)` for `f(x: &Item)` with `it`
+            // from `for it in v.iter()`; a temporary slice, `&x.text()`,
+            // where `&[T]` is (`cmp_of(&a.text(), &b.text())`)
+            wrap_unary(n, Tok::Amp, expected);
             return true;
         }
         if ak != TyKind::Ptr || TYPES[actual].b == 0 {
             return false;
         }
         let pointee = TYPES[actual].a;
+        if pointee == expected && (is_numeric(expected) || expected == TY_BOOL
+            || crate::front::own::kinds::is_plain_type(expected)) {
+            // (0.18.1) a reference to a plain value (a number, a struct of
+            // numbers: a pattern's binding on a reference, a closure's
+            // parameter) where the value is expected: read through it, as
+            // `*n`, a copy
+            wrap_unary(n, Tok::Star, expected);
+            return true;
+        }
+        if ek == TyKind::Ptr && TYPES[expected].b != 0 && is_ref(pointee)
+            && pointee_fits(TYPES[pointee].a, TYPES[expected].a)
+            && (TYPES[expected].b == REF_SHARED || TYPES[pointee].b == REF_MUT) {
+            // (0.18.1) `&&T` where `&T` is expected (`let tr = &t;` of a
+            // `t: &T`): the reference it holds
+            wrap_unary(n, Tok::Star, pointee);
+            return true;
+        }
         if ek == TyKind::Ptr && pointee_fits(pointee, TYPES[expected].a) {
             return TYPES[expected].b == 0 || TYPES[expected].b == REF_SHARED;
         }
@@ -275,6 +284,27 @@ pub fn coerce_ref(n: i64, actual: i64, expected: i64) -> bool {
             return true;
         }
         false
+    }
+}
+
+// (0.18.1) Node n becomes `op n` (`&` or `*`) of type ty: what it was
+// moves to a new node under it.
+fn wrap_unary(n: i64, op: Tok, ty: i64) {
+    unsafe {
+        let inner = new_node(NodeKind::Ident, NODES[n].start, NODES[n].end);
+        NODES[inner] = NODES[n];
+        NODES[n].kind = Unary;
+        NODES[n].op = op;
+        NODES[n].b = inner;
+        NODES[n].a = 0;
+        NODES[n].c = 0;
+        NODES[n].count = 0;
+        NODES[n].p = 0;
+        NODES[n].res = Res::None;
+        NODES[n].x = 0;
+        NODES[n].y = 0;
+        NODES[n].ty = ty;
+        crate::front::own::fast::note_synthetic(n);
     }
 }
 

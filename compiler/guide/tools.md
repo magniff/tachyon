@@ -75,7 +75,7 @@ bodies.
 | what nothing uses | `tachyonc query unused` |
 | sizes, dependencies | `tachyonc query stats`, `query deps MODULE` |
 | std's API, a std item | `tachyonc query items std`, `query show std::read_line` (any program) |
-| what a snippet does | `tachyonc try 'let v = [3, 1]; v[..].len'` prints `i64 = 2` |
+| what a snippet does | `tachyonc try 'let v = [3, 1]; v[..].len()'` prints `i64 = 2` |
 | the guide on some words | `tachyonc guide --find WORDS`, `guide TOPIC#SECTION`, `explain WORDS` |
 | items like one, to copy for a new one; recipes for adding an X (0.17) | `tachyonc query similar NAME`; `query examples KIND`; `tachyonc guide how` |
 
