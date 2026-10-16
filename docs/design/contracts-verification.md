@@ -1738,7 +1738,7 @@ later by a `fix` migration or a flag.
   `--tachyon-test NAME` (or `--tachyon-list`). Each module on the way to a
   test gets a `pub fn __tachyon_tests(name, gpa) -> bool` dispatcher.
 - **Generators are made, not derived by traits:** a parameter's type is
-  turned into an expression (`std::gen_vec(g, |g: *std::Gen| ..)` for
+  turned into an expression (`std::gen_vec(g, |g: &mut std::Gen| ..)` for
   `Vec<T>`, tuples element by element, `[T]` an owned Vec lent); any other
   type goes through `std::arbitrary_of::<T>`, and a struct or enum of the
   program without its own `impl Arbitrary` gets a structural one in its
@@ -1795,3 +1795,44 @@ later by a `fix` migration or a flag.
   12 lines in about 300 runs (11 s). Replacing expressions with literals
   and inlining calls (the design's other steps), several files, and
   candidates checked in-process are left for 0.18.1.
+
+### Integration with 0.17 (as built on release-0.18)
+
+The four branches were built before 0.17's value semantics; merging them
+onto v0.17.0 settled these (each with a test):
+
+- **Requires checks read in place.** A call's `{ let ?aI = arg; f?pre(..);
+  f(..) }` passes the arguments to `f?pre` without a move (the own pass
+  reads them), `f?pre`'s owned parameters get no drops and borrow what
+  they bind (moving one is own.move_out), and the own pass sees through
+  the block to the call (a borrowed copy, `v.get(i)` or its `.unwrap()`,
+  keeps 0.17's meaning). tests/run/contract_values (--check-alloc).
+- **`old(..)` and owned parameters (§2.1).** An ensures runs after the
+  body: reading a by-value owned parameter there, or keeping a view in
+  `old(..)`, is contract.old with its fix (`old(v.len())`,
+  `old(v.clone())`, or a `&` parameter). The own pass would reject both
+  too, with messages about generated names. tests/run/err_contract_old.
+- **Distinct types are plain by 0.17's kinds.** Besides Vec, Buf,
+  HashMap and slices, a reference (`distinct &T`: a copied loan the own
+  pass would not see) and a type that owns by its Drop impl (known once
+  the impls are, check_distinct_kinds) are distinct.kind. The own pass
+  runs before the types are erased and takes every distinct type as
+  plain. std's distinct Eq/Ord/Hash helpers take `&T`.
+  tests/run/err_distinct_values.
+- **NonNull** is `distinct *T`: a parameter of it is a value, not a
+  legacy `*T` borrow, and dereferencing needs `as *T` in unsafe code. Its
+  null check's message is a fixed message of the contracts' table (the
+  enum checks and the contracts share the negative keys).
+- **Generators take `&mut Gen`** (Arbitrary, Gen's methods, gen_vec and
+  the rest, the generated code).
+- **Property and fuzz cases are leak-checked**: the case's values are
+  dropped after it, so a block allocated in the case and left is a
+  failure listing that block (check_alloc_leaks_since).
+- **The test runtime and the fuzzer are lazy sections** of std: lexed
+  only by the test builds that name them.
+- **One failure line**: the `note: build with --trace` line is gone
+  (decision 5): `FILE:LINE:COL: message`, exit 101.
+
+Left for 0.18.1: a leak's site names the generated `<test>` source, not
+the property; facts from `ensures` at call sites (the contracts report's
+list); `fmt` keeps the bang spellings of the assertions.
