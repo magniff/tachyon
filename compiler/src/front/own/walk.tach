@@ -32,7 +32,8 @@
 
 use crate::base::{SYMS, intern_c};
 use crate::front::ast::{
-    CLOSURE_MOVE, DEFER_IMPLICIT, NODES, NODE_IN_BOUNDS, NODE_RAW, NODE_REF_MUT, NodeKind, child,
+    CLOSURE_MOVE, DEFER_IMPLICIT, FN_CLOSURE, NODES, NODE_IN_BOUNDS, NODE_RAW, NODE_REF_MUT,
+    NodeKind, child,
 };
 use crate::front::check::{LOCALS, Res};
 use crate::front::lexer::Tok;
@@ -1018,7 +1019,16 @@ fn eval_call(n: i64, dst: i64) {
                     || i == 0 && crate::front::own::drops::borrowed_call(n) {
                     BORROW_OK = arg;
                 }
-                eval(arg, CX_MOVE, o);
+                // (std's iterators hand a closure the elements they read,
+                // `g(acc, s[k])` in fold: borrowed copies, as a `for` loop's
+                // element; a closure's by-value parameters drop nothing
+                // in 0.17.0. Only an element read out of a slice: a value
+                // std owns, `f(e)` in map_err, moves)
+                let actx = if FNS[CUR_F].module == STD_MODULE && NODES[arg].kind == NodeKind::Index
+                    && (f < 0 || FNS[f].node > 0 && (NODES[FNS[f].node].p & FN_CLOSURE) != 0)
+                    { CX_READ }
+                    else { CX_MOVE };
+                eval(arg, actx, o);
                 let mut kind = PK_NONE;
                 if c_callee || mode == P_RAW {
                     kind = PK_RAW;
@@ -1030,6 +1040,18 @@ fn eval_call(n: i64, dst: i64) {
                     kind = PK_RAW;
                 }
                 pend_push(kind, -1, o, arg, mode);
+            }
+        }
+        if f >= 0 && FNS[f].module == STD_MODULE && NODES[n].count == 2
+            && FNS[CUR_F].module != STD_MODULE {
+            // (std's bitwise extend_from_slice on owned elements)
+            let s = child(n, 1);
+            let st = NODES[s].ty;
+            if st > 0 && TYPES[st].kind == TyKind::Slice
+                && crate::front::own::glue::has_glue(TYPES[st].a)
+                && crate::front::own::drops::method_word(SYMS[FNS[f].display].text)
+                == "extend_from_slice" {
+                crate::front::own::moves::bitwise_extend(s);
             }
         }
         if reachable(CUR) {
