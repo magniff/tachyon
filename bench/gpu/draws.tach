@@ -1,0 +1,109 @@
+// bench/gpu: CPU cost of encoding DRAWS draws with a bind group change
+// every 10 into one render pass, through std::gpu (lib/gpu) on Metal, with
+// its validation (docs/design/gpu.md §5: within 10% of draws.m, faster
+// than wgpu/). bench/gpu/run.sh builds and runs the three.
+
+use gpu::{BindingType, BufferUsage, Format, PassDesc, Reflection, ShaderSource, TextureUsage, VertexFormat, VertexLayout};
+use std::Buf;
+
+extern "C" {
+    fn clock_gettime_nsec_np(clock: i32) -> u64;
+}
+
+const DRAWS: i64 = 10000;
+const GROUPS: i64 = 16;
+const ITERS: i64 = 60;
+
+const MSL: [[u8]; 10] = [
+    "#include <metal_stdlib>",
+    "using namespace metal;",
+    "struct Globals { float2 size; };",
+    "struct VIn { float2 pos [[attribute(0)]]; float4 color [[attribute(1)]]; };",
+    "struct VOut { float4 pos [[position]]; float4 color; };",
+    "vertex VOut vs_main(VIn in [[stage_in]], constant Globals& g [[buffer(0)]]) {",
+    "    VOut o; float2 n = in.pos / g.size * 2.0 - 1.0;",
+    "    o.pos = float4(n.x, -n.y, 0.5, 1.0); o.color = in.color; return o;",
+    "}",
+    "fragment float4 fs_main(VOut in [[stage_in]]) { return in.color; }",
+];
+
+fn now_us() -> f64 {
+    // CLOCK_MONOTONIC_RAW
+    let ns = unsafe { clock_gettime_nsec_np(4) };
+    ns as f64 / 1000.0
+}
+
+fn main(gpa: Gpa) -> i32 {
+    let inst = gpu::Instance::new_in(gpa);
+    let mut adapter = inst.adapter().unwrap();
+    defer adapter.free();
+    let (mut dev, mut queue) = adapter.device().unwrap();
+    defer dev.free();
+    defer queue.free();
+    let mut text = Buf::new_in(gpa);
+    defer text.free();
+    for l in MSL {
+        text.push_str(l);
+        text.push('\n');
+    }
+    let mut refl = Reflection::new_in(gpa);
+    defer refl.free();
+    refl.vertex("vs", "vs_main");
+    refl.fragment("fs", "fs_main");
+    refl.bind(0, 0, BindingType::Uniform, vertex: 0);
+    refl.input(0, VertexFormat::Float32x2);
+    refl.input(1, VertexFormat::Unorm8x4);
+    let src = ShaderSource { msl: text.as_slice(), reflection: refl };
+    let mut shader = dev.shader(&src).unwrap();
+    defer shader.free();
+    let mut desc = gpu::RenderDesc::new(&shader, "vs", "fs", Format::Rgba8Unorm);
+    let mut layout = VertexLayout::new(12);
+    layout.attribute(0, VertexFormat::Float32x2, 0);
+    layout.attribute(1, VertexFormat::Unorm8x4, 8);
+    desc.vertex_buffer(layout);
+    let mut pipe = dev.render_pipeline(&desc).unwrap();
+    defer pipe.free();
+    let mut tex = dev.texture(64, 64, Format::Rgba8Unorm, usage: TextureUsage::RENDER_ATTACHMENT);
+    defer tex.free();
+    let mut view = tex.view();
+    defer view.free();
+    let mut verts = dev.buffer(6 * 12, BufferUsage::VERTEX);
+    defer verts.free();
+    let mut uni = dev.buffer(GROUPS * 256, BufferUsage::UNIFORM);
+    defer uni.free();
+    let mut groups: Vec<gpu::BindGroup> = Vec::new_in(gpa);
+    for k in 0..GROUPS {
+        groups.push(dev.bind_group(pipe.bind_layout(0), [gpu::bind_range(0, &uni, k * 256, 16)][..]));
+    }
+    let gs = groups.as_slice();
+    let mut times: Vec<f64> = Vec::new_in(gpa);
+    defer times.free();
+    for _ in 0..ITERS {
+        let t0 = now_us();
+        let mut enc = dev.encoder();
+        enc.render_pass(PassDesc::color(&view), |pass| {
+            pass.set_pipeline(&pipe);
+            pass.set_vertex_buffer(0, &verts);
+            for i in 0..DRAWS {
+                if i % 10 == 0 {
+                    pass.set_bind_group(0, &gs[(i / 10) % GROUPS]);
+                }
+                pass.draw(0..6, 0..1);
+            }
+        });
+        let cmds = enc.finish();
+        let t1 = now_us();
+        queue.submit(cmds);
+        queue.wait_idle().unwrap();
+        times.push(t1 - t0);
+    }
+    for k in 0..GROUPS {
+        let mut g = groups.get(k);
+        g.free();
+    }
+    groups.free();
+    let t = times.as_slice();
+    t.sort_by(|a, b| if *a < *b { -1 } else if *a > *b { 1 } else { 0 });
+    println(f"tachyon {DRAWS} draws: median {t[ITERS / 2]:.0} us, min {t[0]:.0} us");
+    0
+}
