@@ -1,0 +1,235 @@
+// EXPECT: sha256 ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+// EXPECT: sha1 a9993e364706816aba3e25717850c26c9cd0d89d
+// EXPECT: aes 69c4e0d86a7b0430d8cdb78070b4c55a
+// EXPECT: pmull 1 6 5555555555555555 5555555555555555
+// (0.19 T4) The AArch64 crypto intrinsics by known answers: SHA-256 and
+// SHA-1 of "abc" (FIPS 180-4's examples, one block, vsha256hq/h2q/su0q/su1q
+// and vsha1cq/pq/mq/h/su0q/su1q), AES-128 of FIPS-197 appendix C.1
+// (vaeseq_u8, vaesmcq_u8; the key schedule in scalar code), and pmull
+// against known products. Each is one instruction (the ASM lines); a CPU
+// without the feature prints the expected line (the detect fallback).
+// ASM(aarch64-macos): sha256su0 v
+// ASM(aarch64-macos): sha256su1 v
+// ASM(aarch64-macos): sha256h q
+// ASM(aarch64-macos): sha256h2 q
+// ASM(aarch64-macos): sha1su0 v
+// ASM(aarch64-macos): sha1su1 v
+// ASM(aarch64-macos): sha1h s
+// ASM(aarch64-macos): sha1c q
+// ASM(aarch64-macos): aese v
+// ASM(aarch64-macos): aesmc v
+// ASM(aarch64-macos): pmull v
+use std::arch::detect;
+use std::arch::aarch64::{
+    uint32x4_t, uint8x16_t, vaddq_u32, vaeseq_u8, vaesmcq_u8, veorq_u8, vgetq_lane_u32,
+    vgetq_lane_u64, vld1q_u32, vld1q_u8, vmull_p64, vreinterpretq_u32_u8, vrev32q_u8, vsha1cq_u32,
+    vsha1h_u32, vsha1mq_u32, vsha1pq_u32, vsha1su0q_u32, vsha1su1q_u32, vsha256h2q_u32,
+    vsha256hq_u32, vsha256su0q_u32, vsha256su1q_u32, vst1q_u8,
+};
+
+fn print_hex(x: u64, digits: i64) {
+    let hex = "0123456789abcdef";
+    for k in 0..digits {
+        let d = ((x >> (4 * (digits - 1 - k)) as u64) & 15) as i64;
+        print(hex[d..d + 1]);
+    }
+}
+
+// "abc", padded: one 64-byte block.
+fn abc_block() -> [u8; 64] {
+    let mut b: [u8; 64] = [0; 64];
+    b[0] = 'a';
+    b[1] = 'b';
+    b[2] = 'c';
+    b[3] = 0x80;
+    b[63] = 24;
+    b
+}
+
+// The block's 16 big-endian words, four to a vector.
+fn words(b: [u8], i: i64) -> uint32x4_t {
+    vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(b, 16 * i)))
+}
+
+fn sha256_abc() {
+    let k: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    let block = abc_block();
+    let mut msg: [uint32x4_t; 4] = [words(block[..], 0), words(block[..], 1),
+        words(block[..], 2), words(block[..], 3)];
+    let mut abcd = vld1q_u32(h[..], 0);
+    let mut efgh = vld1q_u32(h[..], 4);
+    let abcd0 = abcd;
+    let efgh0 = efgh;
+    for i in 0..16 {
+        let wk = vaddq_u32(msg[i % 4], vld1q_u32(k[..], 4 * i));
+        let old = abcd;
+        abcd = vsha256hq_u32(abcd, efgh, wk);
+        efgh = vsha256h2q_u32(efgh, old, wk);
+        if i < 12 {
+            msg[i % 4] = vsha256su1q_u32(vsha256su0q_u32(msg[i % 4], msg[(i + 1) % 4]),
+                msg[(i + 2) % 4], msg[(i + 3) % 4]);
+        }
+    }
+    abcd = vaddq_u32(abcd, abcd0);
+    efgh = vaddq_u32(efgh, efgh0);
+    print("sha256 ");
+    for j in 0..4 {
+        print_hex(lane(abcd, j), 8);
+    }
+    for j in 0..4 {
+        print_hex(lane(efgh, j), 8);
+    }
+    println("");
+}
+
+fn lane(v: uint32x4_t, j: i64) -> u64 {
+    let mut out: [u8; 16] = [0; 16];
+    vst1q_u8(out[..], 0, v16u8::from_bits(v));
+    let mut x: u64 = 0;
+    for b in 0..4 {
+        x = x | (out[4 * j + b] as u64) << (8 * b) as u64;
+    }
+    x
+}
+
+fn sha1_abc() {
+    let block = abc_block();
+    let mut msg: [uint32x4_t; 4] = [words(block[..], 0), words(block[..], 1),
+        words(block[..], 2), words(block[..], 3)];
+    let h: [u32; 4] = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476];
+    let mut abcd = vld1q_u32(h[..], 0);
+    let abcd0 = abcd;
+    let e0: u32 = 0xc3d2e1f0;
+    let mut e = e0;
+    let ks: [u32; 4] = [0x5a827999, 0x6ed9eba1, 0x8f1bbcdc, 0xca62c1d6];
+    for i in 0..20 {
+        let kv: [u32; 4] = [ks[i / 5]; 4];
+        let wk = vaddq_u32(msg[i % 4], vld1q_u32(kv[..], 0));
+        let next = vsha1h_u32(vgetq_lane_u32(abcd, 0));
+        if i < 5 {
+            abcd = vsha1cq_u32(abcd, e, wk);
+        } else if i < 10 || i >= 15 {
+            abcd = vsha1pq_u32(abcd, e, wk);
+        } else {
+            abcd = vsha1mq_u32(abcd, e, wk);
+        }
+        e = next;
+        if i < 16 {
+            msg[i % 4] = vsha1su1q_u32(vsha1su0q_u32(msg[i % 4], msg[(i + 1) % 4],
+                msg[(i + 2) % 4]), msg[(i + 3) % 4]);
+        }
+    }
+    abcd = vaddq_u32(abcd, abcd0);
+    print("sha1 ");
+    for j in 0..4 {
+        print_hex(lane(abcd, j), 8);
+    }
+    print_hex((e + e0) as u64, 8);
+    println("");
+}
+
+// AES's S-box, from the inverse in GF(2^8) and the affine map.
+fn gmul(a: u32, b: u32) -> u32 {
+    let mut x = a;
+    let mut y = b;
+    let mut p: u32 = 0;
+    for _ in 0..8 {
+        if (y & 1) != 0 { p = p ^ x; }
+        x = x << 1;
+        if (x & 256) != 0 { x = x ^ 0x11b; }
+        y = y >> 1;
+    }
+    p
+}
+
+fn sbox(x: u8) -> u8 {
+    let mut inv: u32 = 1;
+    let mut b = x as u32;
+    let mut e = 254;
+    while e > 0 {
+        if (e & 1) != 0 { inv = gmul(inv, b); }
+        b = gmul(b, b);
+        e = e >> 1;
+    }
+    let mut s = inv;
+    for r in 1..5 {
+        s = s ^ (((inv << r as u32) | (inv >> (8 - r) as u32)) & 255);
+    }
+    (s ^ 0x63) as u8
+}
+
+fn aes_fips197() {
+    let mut w: [u8; 176] = [0; 176];
+    let mut pt: [u8; 16] = [0; 16];
+    for i in 0..16 {
+        w[i] = i as u8;
+        pt[i] = (i * 17) as u8;
+    }
+    let mut rcon: u8 = 1;
+    for i in 4..44 {
+        let mut t: [u8; 4] = [w[4 * i - 4], w[4 * i - 3], w[4 * i - 2], w[4 * i - 1]];
+        if i % 4 == 0 {
+            t = [sbox(t[1]) ^ rcon, sbox(t[2]), sbox(t[3]), sbox(t[0])];
+            rcon = gmul(rcon as u32, 2) as u8;
+        }
+        for j in 0..4 {
+            w[4 * i + j] = w[4 * i - 16 + j] ^ t[j];
+        }
+    }
+    let mut s: uint8x16_t = vld1q_u8(pt[..], 0);
+    for r in 0..9 {
+        s = vaesmcq_u8(vaeseq_u8(s, vld1q_u8(w[..], 16 * r)));
+    }
+    s = veorq_u8(vaeseq_u8(s, vld1q_u8(w[..], 144)), vld1q_u8(w[..], 160));
+    let mut out: [u8; 16] = [0; 16];
+    vst1q_u8(out[..], 0, s);
+    print("aes ");
+    for i in 0..16 {
+        print_hex(out[i] as u64, 2);
+    }
+    println("");
+}
+
+fn pmull_line() {
+    let a = vmull_p64(1, 1);
+    let b = vmull_p64(3, 2);
+    let c = vmull_p64(0xffffffffffffffff, 0xffffffffffffffff);
+    print(f"pmull {vgetq_lane_u64(a, 0)} {vgetq_lane_u64(b, 0)} ");
+    // (all ones squared without carries: every other bit, both halves)
+    print_hex(vgetq_lane_u64(c, 1), 16);
+    print(" ");
+    print_hex(vgetq_lane_u64(c, 0), 16);
+    println("");
+}
+
+fn main() {
+    if detect("sha2") {
+        sha256_abc();
+        sha1_abc();
+    } else {
+        println("sha256 ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        println("sha1 a9993e364706816aba3e25717850c26c9cd0d89d");
+    }
+    if detect("aes") {
+        aes_fips197();
+        pmull_line();
+    } else {
+        println("aes 69c4e0d86a7b0430d8cdb78070b4c55a");
+        println("pmull 1 6 5555555555555555 5555555555555555");
+    }
+}
