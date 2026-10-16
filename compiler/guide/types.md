@@ -155,8 +155,11 @@ checked (a null p exits 101: `null pointer made NonNull`), `p.as_ptr()`
 `Option<NonNull<T>>` is one pointer, `None` the null one, so it is the
 field type of a nullable link and C's nullable pointer in an `extern
 "C"` signature; a C header's `_Nonnull` pointers import as NonNull (a
-result is C's promise, which the unsafe call vouches for). Any
-`*T` has `p.is_null()`.
+result is C's promise, which the unsafe call vouches for). `_Nonnull`
+is clang's nullability qualifier: imports read headers as the system's
+C compiler does, so they see it where that compiler is clang (macOS);
+with gcc (most Linux systems) a header has no such qualifier and its
+pointers import as `*T`. Any `*T` has `p.is_null()`.
 
 ```tach
 use std::NonNull;

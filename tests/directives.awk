@@ -39,6 +39,7 @@
     else if (key == "PROFILE") profile = 1
     else if (key == "LINK") link = 1
     else if (key == "NO-EXTRA-FLAGS") noextra = 1
+    else if (key == "REQUIRES") requires = requires " " value
 }
 END {
     printf "%s", args > (dir "/args")
@@ -63,4 +64,5 @@ END {
     printf "%d", profile > (dir "/profile")
     printf "%d", link > (dir "/link")
     printf "%d", noextra > (dir "/noextra")
+    printf "%s", requires > (dir "/requires")
 }
