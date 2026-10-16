@@ -2180,49 +2180,66 @@ and the tests below keep it so:
    joined flags, read and written with the mutex held.
 
 The join runs beside the tasks: it writes the program's ASM buffer, the
-assembler's state (its own symbols since 0.18.1: `ASym.text` and a table
-by name; mnemonics and registers are looked up with `find_sym`, which
-writes nothing) and the joined function's text and constant ids, none of
-which a running task touches.
+assembler's state and the joined function's text and constant ids, none
+of which a running task touches. The assembler keeps to its own state
+since 0.18.1: its names (`ASym.text` and a table by name, not interned
+symbols), its mnemonics and registers (`NameMap`s, not tables indexed by
+symbol), the text it reads (`ATEXT`, not a buffer of BUFS) and the bytes
+it writes (`OBJ`, not OBJ_BYTES in BUFS).
+
+**-O0** compiles from the syntax tree, with the checker, whose statics
+are not per thread: its functions are generated on the main thread, as
+before, and the streaming assembler takes their texts (copies, through a
+queue under a mutex of its own) on a thread of its own
+(`threads::asm_thread_start`), which its own state above makes safe
+beside the main thread. The main thread does not assemble while it runs
+(`asm_thread_finish` joins it before the runtime's and the data's text).
+At -O1 and -O2 the join assembles beside the tasks already; handing its
+texts on to that thread measured no gain.
 
 `tests/threads_writes.sh` checks the groups: it lists every static that
 code reachable from `run_task` writes (by `query callees --transitive`
 and `query refs`; a mutating method call and an address taken count),
 71 of them, and every one must be in its table with the reason; then
 the statics the join writes that task code reads or writes, 14, against
-a second table. A new write fails the test with the `query callees
+a second table; then those -O0's assembler thread and its main thread
+share, 12, each on an internal error's path, under -g (which does not
+stream, so has no assembler thread) or read before the thread starts,
+against a third. A new write fails the test with the `query callees
 --writes` command that shows its chain. The effects cannot say this
 (they do not tell a read of a static from a write). ThreadSanitizer
 is not available, but valgrind is (aarch64-linux, the compiler
 cross-built): memcheck on the -O2 self-compile at `-j1` and `-j4`, and
-DRD, a happens-before race detector, on it at `-j4`, found no error
-(nor DRD and helgrind on examples/md5 at `-j4`); the -j1 and -j4 objects
-are the same there too.
+DRD, a happens-before race detector, on it at -O1 and -O2 `-j4` and on
+the -O0 one (with the assembler thread), found no error (nor DRD and
+helgrind on examples/md5 at `-j4`; helgrind's only reports without its
+default suppressions are glibc's own mutex and condition variable
+words); the -j1 and -j4 objects are the same there too.
 
 **Tests.** `tests/threads.sh` (the gate's `threads` step, also in
 `--quick`, with `tests/threads_writes.sh`): every program of the corpus
-at -O1 and -O2, and the self-compile at -O0, -O1 and -O2, compiled at
--j1 and -j8 (the self-compile also at -j3, and with
-`TACHYON_FRESH_CONTEXTS=1`) must give the same object, the same output
-and the same exit: 1399 compilations. `TACHYON_PHASE_TIMES=1` prints each
+at -O0, -O1 and -O2 compiled at -j1 and -j8 (the self-compile also at
+-j3, and with `TACHYON_FRESH_CONTEXTS=1`, and to assembly) must give the
+same object, the same output and the same exit: 2095 compilations. `TACHYON_PHASE_TIMES=1` prints each
 phase's wall time.
 
 **Measured** (aarch64-macos, the compiler compiling itself, `-c`; best
-wall of 5 alternating runs, median user time, peak RSS; other agents'
-work kept the load at 2 to 6):
+wall of 5 alternating runs (-O0's of 3, after its assembler thread),
+median user time, peak RSS; other agents' work kept the load at 2 to 6,
+and a run at load 20 to 40 gave times within 5% of these):
 
 | | v0.17.0 | -j1 | -j2 | -j4 | -j8 | -j10 |
 |---|---|---|---|---|---|---|
-| -O0 wall / user / RSS | 0.32 s / 0.30 / 312 MB | 0.32 / 0.30 / 281 | 0.32 | 0.32 | 0.32 | 0.32 |
+| -O0 wall / user / RSS | 0.33 s / 0.31 / 316 MB | 0.32 / 0.30 / 280 | 0.27 / 0.30 / 300 | 0.27 / 0.30 / 299 | **0.27** / 0.30 / 300 | 0.27 / 0.30 / 299 |
 | -O1 | 0.81 s / 0.78 / 432 MB | 0.78 / 0.75 / 417 | 0.53 / 0.79 / 421 | 0.41 / 0.85 / 423 | **0.35** / 1.00 / 427 | 0.35 / 1.02 / 433 |
 | -O2 | 1.98 s / 1.94 / 581 MB | 2.03 / 1.99 / 600 | 1.22 / 2.04 / 599 | 0.85 / 2.26 / 616 | **0.69** / 2.76 / 632 | 0.68 / 2.80 / 637 |
 
 -O2 is 2.9 times faster at -j8 (the design's goal was 3, and at most
-0.65 s at -j10), -O1 2.3 times. The user time grows with the threads
-(the efficiency cores run slower; the allocator and the caches are
-shared). -O0 does not change (it is serial, below); its RSS falls
-because the assembler no longer interns every label into the program's
-symbols. -O2's RSS grows with the IR the budget's new view inlines, and
+0.65 s at -j10), -O1 2.3 times, -O0 1.2 times (its assembler beside
+its code generation; the goal was 0.20 s). The user time grows with the
+threads (the efficiency cores run slower; the allocator and the caches
+are shared). -O0's RSS at -j1 falls because the assembler no longer
+interns every label into the program's symbols. -O2's RSS grows with the IR the budget's new view inlines, and
 by each thread's scratch.
 
 Phases at -O2 -j8 (`TACHYON_PHASE_TIMES=1`, ms; -j1's in parentheses):
@@ -2232,10 +2249,9 @@ interprocedural constants and the components' levels 42, bottom up 242
 (538), data and output 24: 660 ms, of which 300 serial.
 
 **What is left.**
-- *-O0* is serial: gen0 compiles from the syntax tree and reaches the
-  checker (lazily checked items, instantiation), whose statics are not
-  per thread. Overlapping the assembler with gen0 needs the assembler
-  off `BUFS` and the symbol tables gen0 grows.
+- *-O0's code generation* is serial: gen0 compiles from the syntax tree
+  and reaches the checker (lazily checked items, instantiation), whose
+  statics are not per thread; only the assembler runs beside it.
 - *The serial part:* the front end, lowering, interprocedural constants
   and dead functions (about 280 ms at -O2); the bottom-up phase's level
   barriers (a level waits for its slowest component; the largest
