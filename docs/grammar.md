@@ -1044,7 +1044,8 @@ one; a local of that name shadows the constructor). A vector is a value:
 it is copied by `=`, passed and returned like a struct; lane `i` lives
 at byte `i × size_of(lane)` (`[T; N]`'s layout), and a vector in memory
 may be read lane by lane through a pointer. Integer lanes are signed;
-there are no unsigned vector types.
+there are no unsigned vector types (0.19 adds them, and 64- and 256-bit
+vectors: [below](#additions-of-019-vector-types-and-stdarchs-types)).
 
 **Making vectors.**
 
@@ -1703,6 +1704,81 @@ let_stmt += "let" pattern "=" expr "else" block ";" ;     (* let-else *)
   reference local or a pattern's reference binding views what it points
   to, not the reference: it may be returned or kept after the binding's
   scope when that is alive.
+
+## Additions of 0.19: vector types and std::arch's types
+
+### More vector types
+
+0.10's six vector types become thirty: unsigned lanes, and 64-bit and
+256-bit vectors. Each is aligned to its size, and its names are reserved
+as 0.10's are.
+
+| size | signed | unsigned | float |
+|---|---|---|---|
+| 8 bytes | `v8i8 v4i16 v2i32 v1i64` | `v8u8 v4u16 v2u32 v1u64` | `v2f32 v1f64` |
+| 16 bytes | `v16i8 v8i16 v4i32 v2i64` | `v16u8 v8u16 v4u32 v2u64` | `v4f32 v2f64` |
+| 32 bytes | `v32i8 v16i16 v8i32 v4i64` | `v32u8 v16u16 v8u32 v4u64` | `v8f32 v4f64` |
+
+Every 0.10 operation applies to every one of them, with these rules:
+
+- **Unsigned lanes** wrap at their width and compare unsigned. A mask of
+  an unsigned vector is the vector itself, each lane all ones (`MAX`) or
+  `0`. `-a` on unsigned lanes is `0 - a`, wrapping.
+- **The mask of a float vector** is the signed vector of its lanes'
+  width (`v8i32` for `v8f32`, `v1i64` for `v1f64`).
+- **Float sums** stay pairwise: the sum of the first half's lanes plus
+  the sum of the second half's, so `((l0 + l1) + (l2 + l3)) + ((l4 + l5)
+  + (l6 + l7))` for eight lanes.
+- **Placement.** A 64-bit vector lives in the low half of a vector
+  register. A 256-bit vector is computed as its two 128-bit halves on
+  every target in 0.19 (no function uses 256-bit registers yet), so the
+  same program runs everywhere.
+
+**`T::from_bits(v)`** reinterprets the bytes of a vector `v` of the same
+size as vector type `T` (lane `i` of `T` is the bytes at `i × size_of`
+its lane). It costs no instruction. A size mismatch is a type error, and
+a type error between two vectors of the same size suggests it.
+
+### std::arch's types
+
+`std::arch::aarch64` and `std::arch::x86_64` name the vendors' vector
+types (docs/design/arch.md).
+
+- **ACLE's types are aliases** of the vector types: `int8x16_t = v16i8`,
+  `uint8x16_t = v16u8`, `uint16x4_t = v4u16`, `float32x4_t = v4f32`,
+  `float64x1_t = v1f64`, and so on for every lane type and both sizes.
+  The polynomial types are unsigned (`poly8x16_t = v16u8`, `poly64x2_t =
+  v2u64`, `p8 = u8`, `p64 = u64`, `p128 = v2u64`). Each has its tuples:
+  `uint8x16x2_t = (v16u8, v16u8)`, `...x3_t`, `...x4_t`. Through an
+  alias, a vector type's associated functions apply as they are:
+  `uint8x16_t::from_bits(v)`, `uint8x16_t::splat(0)`.
+- **Intel's types are distinct and opaque:** `__m128i`, `__m128`,
+  `__m128d` (16 bytes), `__m256i`, `__m256`, `__m256d` (32 bytes). They
+  have no operators, no lanes, no `splat` or `load`: their intrinsics
+  make, read and combine them, and `T::from_bits(v)` converts them both
+  ways (`v16u8::from_bits(m)`, `__m128i::from_bits(v)`).
+
+### Intrinsics
+
+An intrinsic is a function of `std::arch`, `std::arch::aarch64` or
+`std::arch::x86_64`, under its vendor's name, called as any function.
+
+- **Immediates are arguments.** A shift count, lane number or shuffle
+  mask is an `i64` argument in the vendor's position, which must be a
+  constant expression (literals, constants, operators and casts of them)
+  in the range the intrinsic gives (`arch.const_arg`):
+  `vextq_u8(a, b, 3)`. Rust's `vextq_u8::<3>(a, b)` is an error
+  (`arch.rust_form`) whose `try:` line writes this form.
+- **Memory intrinsics take a slice and an index**, checked as
+  `v.load(s, i)` is: `vld1q_u8(s, i)`, `vst1q_u8(s, i, v)`,
+  `_mm_loadu_si128(s, i)`. Given a pointer instead (C's and Rust's
+  signature) the call is an error (`arch.raw_form`) naming both forms.
+- **The pointer forms** are in the `raw` submodule of each architecture's
+  module, with the vendor's signature, `unsafe`:
+  `std::arch::aarch64::raw::vld1q_u8(p: *u8)`,
+  `std::arch::x86_64::raw::_mm_loadu_si128(p: *__m128i)`.
+- `is_x86_feature_detected!("f")` and its AArch64 twin are
+  `std::arch::detect("f")` (`arch.rust_form`).
 
 ## Importing C headers
 
