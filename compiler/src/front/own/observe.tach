@@ -3,10 +3,236 @@
 // moved (where, by what), the views it holds with their origins. T2 owns
 // this file; T6 the command.
 //
-// Phase 0: a stub.
+// own_state_at walks the function holding the position (the fast path
+// off), and the view events call at(n) first: the state before the event
+// closest after the position (entered from before it), in the walk's last
+// pass there (a loop's last round), is written out.
 
-// The state at the position (a byte offset into the program's text),
-// written to out; false when the position is in no walked function.
+use crate::base::{IntVec, SYMS, buf_bytes, buf_new, buf_slice, buf_str};
+use crate::front::ast::NODES;
+use crate::front::check::LOCALS;
+use crate::front::effects::infer::body_walked;
+use crate::front::own::diag::own_discard;
+use crate::front::own::kinds::kind_word;
+use crate::front::own::state::{
+    CUR, LOC_CAP, LOC_PL, NSLOT, OV, PL_COUNT, PL_FIELD, PL_MOVED_BY, PL_PARENT, PL_RID, PL_RKIND,
+    POOL, RK_LOCAL, RK_MARK, RK_STATIC, TUPLE_FIELD, get_bit, l1, l2, moved_bits, reachable,
+    root_of, slot_of_local, slot_off,
+};
+use crate::front::own::views::{F_MUTLOAN, put_loc};
+use crate::front::own::walk::{BOUND, PARAM_LOCALS, walk_fn};
+use crate::front::types::{FNS, FN_COUNT, STATICS, buf_type};
+
+static mut OBS_POS: i64 = -1;
+static mut OBS_OUT: i64 = -1;
+static mut OBS_BEFORE: bool = true;
+static mut OBS_TAKEN: bool = false;
+
+// The locals taken (a LOCALS index each) and their notes (buffers).
+static mut OBS_LOCALS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut OBS_NOTES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// (the closest event after the position taken so far)
+static mut OBS_BEST: i64 = 0;
+
+// The state at the position (a byte offset into the program's text): a
+// line per local in scope (its name, type and kind, aligned; then whether
+// it is moved and the views it holds), written to out; false when the
+// position is in no walked function or the walk does not reach it.
 pub fn own_state_at(out: i64, pos: i64) -> bool {
-    false
+    unsafe {
+        let mut f = -1;
+        let mut span = 0;
+        for g in 0..FN_COUNT {
+            if FNS[g].is_extern || !body_walked(g) {
+                continue;
+            }
+            let item = FNS[g].node;
+            let s = NODES[item].start;
+            let e = NODES[item].end;
+            if s <= pos && pos <= e && (f < 0 || e - s < span) {
+                f = g;
+                span = e - s;
+            }
+        }
+        if f < 0 {
+            return false;
+        }
+        crate::front::own::state::init_state();
+        OBS_POS = pos;
+        OBS_BEFORE = true;
+        OBS_TAKEN = false;
+        crate::front::own::fast::FORCE_WALK = true;
+        walk_fn(f, 0);
+        crate::front::own::fast::FORCE_WALK = false;
+        own_discard();
+        OBS_POS = -1;
+        if !OBS_TAKEN {
+            return false;
+        }
+        let mut wn = 1;
+        let mut wt = 1;
+        for i in 0..OBS_LOCALS.count {
+            let l = OBS_LOCALS.data[i];
+            let nl = SYMS[LOCALS[l].name].text.len;
+            if nl > wn {
+                wn = nl;
+            }
+            let t = buf_new();
+            buf_type(t, LOCALS[l].ty);
+            if buf_slice(t).len > wt {
+                wt = buf_slice(t).len;
+            }
+        }
+        for i in 0..OBS_LOCALS.count {
+            let l = OBS_LOCALS.data[i];
+            let name = SYMS[LOCALS[l].name].text;
+            buf_bytes(out, name);
+            pad(out, wn - name.len + 2);
+            let t = buf_new();
+            buf_type(t, LOCALS[l].ty);
+            buf_bytes(out, buf_slice(t));
+            pad(out, wt - buf_slice(t).len + 2);
+            buf_str(out, kind_word(LOCALS[l].ty));
+            buf_bytes(out, buf_slice(OBS_NOTES.data[i]));
+            buf_str(out, c"\n");
+        }
+        true
+    }
+}
+
+fn pad(out: i64, n: i64) {
+    unsafe {
+        for i in 0..n {
+            buf_str(out, c" ");
+        }
+    }
+}
+
+// An event at node n: the state is taken before the first event at or
+// after the position (each pass: a loop's last round wins).
+pub fn at(n: i64) {
+    unsafe {
+        if OBS_POS < 0 || n <= 0 || !reachable(CUR) {
+            return;
+        }
+        if NODES[n].start < OBS_POS {
+            OBS_BEFORE = true;
+            return;
+        }
+        if !OBS_BEFORE || OBS_TAKEN && NODES[n].start > OBS_BEST {
+            return;
+        }
+        OBS_BEFORE = false;
+        OBS_BEST = NODES[n].start;
+        OBS_TAKEN = true;
+        OBS_LOCALS.count = 0;
+        OBS_NOTES.count = 0;
+        for i in 0..PARAM_LOCALS.count {
+            local_line(PARAM_LOCALS.data[i]);
+        }
+        for i in 0..BOUND.count {
+            local_line(BOUND.data[i]);
+        }
+    }
+}
+
+fn local_line(l: i64) {
+    unsafe {
+        if l < 0 {
+            return;
+        }
+        let name = SYMS[LOCALS[l].name].text;
+        if name.len > 1 && name[0] == '_' && name[1] == '_' {
+            return;
+        }
+        for i in 0..OBS_LOCALS.count {
+            if OBS_LOCALS.data[i] == l {
+                return;
+            }
+        }
+        let out = buf_new();
+        OBS_LOCALS.push(l);
+        OBS_NOTES.push(out);
+        if l < LOC_CAP && LOC_PL[l] != 0 {
+            let p = LOC_PL[l] - 1;
+            if get_bit(moved_bits(), p) {
+                buf_str(out, c"  moved");
+                let by = PL_MOVED_BY[p];
+                if by > 0 {
+                    buf_str(out, c" at ");
+                    put_loc(out, NODES[by].start, true);
+                }
+            }
+        }
+        let s = slot_of_local(l);
+        if s >= 0 && s < NSLOT {
+            let off = slot_off(CUR, s);
+            let flags = POOL[off + OV];
+            buf_str(out, c"  views ");
+            put_set(out, l1(off));
+            if crate::front::own::state::is_empty(l2(off)) == false {
+                buf_str(out, c", which hold views of ");
+                put_set(out, l2(off));
+            }
+            if (flags & F_MUTLOAN) != 0 {
+                buf_str(out, c" (exclusive)");
+            }
+            if (flags & crate::front::own::state::F_INVALID) != 0 {
+                buf_str(out, c"; invalid since ");
+                let why = POOL[off + OV + 1];
+                if why > 0 {
+                    put_loc(out, NODES[why].start, true);
+                } else {
+                    buf_str(out, c"its owner's scope ended");
+                }
+            }
+        }
+    }
+}
+
+// The places of bitset b, by name: `nothing` when empty.
+fn put_set(out: i64, b: *i64) {
+    unsafe {
+        let mut first = true;
+        for q in 0..PL_COUNT {
+            if !get_bit(b, q) || PL_RKIND[root_of(q)] == RK_MARK {
+                continue;
+            }
+            if !first {
+                buf_str(out, c", ");
+            }
+            first = false;
+            put_place(out, q);
+        }
+        if first {
+            buf_str(out, c"nothing (static data)");
+        }
+    }
+}
+
+fn put_place(out: i64, p: i64) {
+    unsafe {
+        if PL_PARENT[p] >= 0 {
+            put_place(out, PL_PARENT[p]);
+            buf_str(out, c".");
+            let f = PL_FIELD[p];
+            if f >= TUPLE_FIELD {
+                crate::base::buf_int(out, f - TUPLE_FIELD);
+            } else {
+                buf_bytes(out, SYMS[f].text);
+            }
+            return;
+        }
+        let k = PL_RKIND[p];
+        if k == RK_LOCAL {
+            buf_bytes(out, SYMS[LOCALS[PL_RID[p]].name].text);
+        } else if k == RK_STATIC {
+            buf_bytes(out, SYMS[NODES[STATICS[PL_RID[p]].node].a].text);
+        } else {
+            buf_str(out, if PL_FIELD[p] == 1 { c"what *" } else { c"what " });
+            buf_bytes(out, SYMS[LOCALS[PL_RID[p]].name].text);
+            buf_str(out, if PL_FIELD[p] == 1 { c" holds" } else { c" points to" });
+        }
+    }
 }

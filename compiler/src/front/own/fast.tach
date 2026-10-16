@@ -1,16 +1,417 @@
 // The own pass's fast path (0.17, docs/design/value-semantics.md §4,
 // "Cost"; T2 owns it): a function with nothing to track is not walked.
 //
-// Phase 0's contract hook: walk_fn asks needs_walk(f) first; a function
-// that does not need it gets the summary views() (collect_begin, then
-// collect_end with nothing collected) and no findings.
+// walk_fn asks needs_walk(f) first; a function that does not need it gets
+// the summary views() (collect_begin, then collect_end with nothing
+// collected) and no findings. A function needs the walk when:
+// - a parameter, its result or any expression in it has an owned or a
+//   view type (moves, drops, slots, results, `&T` loans, f-strings over
+//   owned values: everything the events track hangs on one of them);
+// - or a call in it takes a loan (`&place`, a borrowed pointer parameter
+//   passed on) of a root that an earlier argument of the same call, or of
+//   an enclosing one, also borrows, or that is assigned meanwhile: the only
+//   findings left without views or owned values are argument conflicts
+//   (`f(&a, &a)`, `a.f(g(&a))` with legacy `*T` parameters).
+// The scan below visits what walk.tach's eval visits; a node kind the walk
+// learns must be added here too.
+
+use crate::base::{IntVec, alloc_array};
+use crate::front::ast::{NODES, NODE_RAW, NodeKind, child};
+use crate::front::check::{LOCALS, Res};
+use crate::front::own::kinds::{K_OWNED, K_VIEW, type_kind};
+use crate::front::types::{FNS, TYPES, TyKind};
 
 // Functions skipped (for --values=report's count and the budget).
 pub static mut SKIPPED: i64 = 0;
 // Set by `query own` (observe.tach): walk whatever the fast path says.
 pub static mut FORCE_WALK: bool = false;
 
-// Whether function f has anything the walk tracks.
+static mut NEED: bool = false;
+// The roots borrowed by the pending arguments of the calls being scanned.
+static mut ROOTS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// Pending views of statics (in ROOTS).
+static mut STATIC_VIEWS: i64 = 0;
+
+static mut MEMO: *u8 = 0 as *u8;
+static mut MEMO_CAP: i64 = 0;
+
+static mut KNOWN: *u8 = 0 as *u8;
+static mut KNOWN_CAP: i64 = 0;
+
+// Whether type t is owned or a view (kinds.tach), memoized here per type
+// id in one byte (the scan asks it of every node): 0 unknown, 1 no, 2
+// owned, 3 a view only.
+fn tracked(t: i64) -> bool {
+    unsafe {
+        if t <= 0 {
+            return false;
+        }
+        if t < MEMO_CAP {
+            let m = MEMO[t];
+            if m != 0 {
+                return m >= 2;
+            }
+        } else {
+            let n = t * 2 + 1024;
+            let a = alloc_array::<u8>(n);
+            for i in 0..MEMO_CAP {
+                a[i] = MEMO[i];
+            }
+            MEMO = a;
+            MEMO_CAP = n;
+        }
+        let k = type_kind(t);
+        MEMO[t] = if (k & K_OWNED) != 0 { 2 } else if (k & K_VIEW) != 0 { 3 } else { 1 };
+        MEMO[t] >= 2
+    }
+}
+
+// Whether expression e (of a view type) holds only views of static data
+// or of what a raw pointer reaches (origin ∅: the walk gives it none): a
+// string literal, a place reached through a raw pointer (`SYMS[s].text`).
+fn raw_view(e: i64) -> bool {
+    unsafe {
+        let k = NODES[e].kind;
+        if k == NodeKind::Str {
+            return true;
+        }
+        if k == NodeKind::FieldAccess {
+            if NODES[e].y == 1 {
+                return !reference(NODES[e].a);
+            }
+            return raw_view(NODES[e].a);
+        }
+        if k == NodeKind::Call {
+            // (a call given no loans and no views: its result has none)
+            if NODES[e].x - 1 < 0 {
+                return false;
+            }
+            for i in 0..NODES[e].count {
+                let arg = child(e, i);
+                let ak = NODES[arg].kind;
+                if ak == NodeKind::Unary && NODES[arg].op == crate::front::lexer::Tok::Amp
+                    || ak == NodeKind::Ident && NODES[arg].res == Res::Local && NODES[arg].y >= 0
+                    && LOCALS[NODES[arg].y].borrow {
+                    return false;
+                }
+                let at = NODES[arg].ty;
+                if tracked(at) && !(MEMO[at] == 3 && raw_view(arg)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        if k == NodeKind::TupleField {
+            return raw_view(NODES[e].a);
+        }
+        if k == NodeKind::Unary && NODES[e].op == crate::front::lexer::Tok::Star {
+            return !reference(NODES[e].b);
+        }
+        if k == NodeKind::Index && NODES[NODES[e].b].kind != NodeKind::Range {
+            let bt = NODES[NODES[e].a].ty;
+            if bt > 0 && TYPES[bt].kind == TyKind::Ptr {
+                return (NODES[e].p & NODE_RAW) != 0 || !reference(NODES[e].a);
+            }
+            return raw_view(NODES[e].a);
+        }
+        false
+    }
+}
+
+// Whether pointer expression e is a reference or a borrow (walk.tach's
+// is_reference).
+fn reference(e: i64) -> bool {
+    unsafe {
+        let t = NODES[e].ty;
+        if t > 0 && TYPES[t].kind == TyKind::Ptr && TYPES[t].b != 0 {
+            return true;
+        }
+        NODES[e].kind == NodeKind::Ident && NODES[e].res == Res::Local && NODES[e].y >= 0
+            && LOCALS[NODES[e].y].borrow
+    }
+}
+
+// Whether function f has anything the walk tracks (memoized: the driver
+// walks a recursive component's functions several times).
 pub fn needs_walk(f: i64) -> bool {
-    true
+    unsafe {
+        if f < KNOWN_CAP && KNOWN[f] != 0 {
+            return KNOWN[f] == 2;
+        }
+        if f >= KNOWN_CAP {
+            let n = f * 2 + 1024;
+            let a = alloc_array::<u8>(n);
+            for i in 0..KNOWN_CAP {
+                a[i] = KNOWN[i];
+            }
+            KNOWN = a;
+            KNOWN_CAP = n;
+        }
+        let need = scan_fn(f);
+        KNOWN[f] = if need { 2 } else { 1 };
+        need
+    }
+}
+
+fn scan_fn(f: i64) -> bool {
+    unsafe {
+        let item = FNS[f].node;
+        // (T1's drops: owned locals)
+        if tracked(FNS[f].ret) || crate::front::own::drops::fn_has_drops(f) {
+            return true;
+        }
+        for i in 0..NODES[item].count {
+            let l = NODES[child(item, i)].x;
+            if l < 0 {
+                continue;
+            }
+            let t = LOCALS[l].ty;
+            // (a pointer parameter to what holds views: the stores)
+            if tracked(t) || t > 0 && TYPES[t].kind == TyKind::Ptr && tracked(TYPES[t].a) {
+                return true;
+            }
+        }
+        NEED = false;
+        ROOTS.count = 0;
+        STATIC_VIEWS = 0;
+        scan(NODES[item].c);
+        NEED
+    }
+}
+
+// The root of place expression e: 2 * local, 2 * static + 1; -1: not a
+// place.
+fn place_root(e: i64) -> i64 {
+    unsafe {
+        let k = NODES[e].kind;
+        if k == NodeKind::Ident {
+            if NODES[e].res == Res::Local && NODES[e].y >= 0 {
+                return 2 * NODES[e].y;
+            }
+            if NODES[e].res == Res::Static && NODES[e].y >= 0 {
+                return 2 * NODES[e].y + 1;
+            }
+            return -1;
+        }
+        if k == NodeKind::FieldAccess || k == NodeKind::TupleField {
+            return place_root(NODES[e].a);
+        }
+        if k == NodeKind::Unary && NODES[e].op == crate::front::lexer::Tok::Star {
+            return place_root(NODES[e].b);
+        }
+        if k == NodeKind::Index && NODES[NODES[e].b].kind != NodeKind::Range {
+            return place_root(NODES[e].a);
+        }
+        -1
+    }
+}
+
+// A loan of root r is taken while the pending ones are ROOTS.
+fn loan(r: i64) {
+    unsafe {
+        if r < 0 {
+            return;
+        }
+        for i in 0..ROOTS.count {
+            if ROOTS.data[i] == r {
+                NEED = true;
+                return;
+            }
+        }
+    }
+}
+
+fn scan_list(n: i64) {
+    unsafe {
+        for i in 0..NODES[n].count {
+            scan(child(n, i));
+        }
+    }
+}
+
+fn scan_pattern(p: i64) {
+    unsafe {
+        if p == 0 {
+            return;
+        }
+        let k = NODES[p].kind;
+        if k == NodeKind::PatBind {
+            if NODES[p].x >= 0 && tracked(LOCALS[NODES[p].x].ty) {
+                NEED = true;
+            }
+            return;
+        }
+        if k == NodeKind::PatTuple || k == NodeKind::PatVariant || k == NodeKind::PatOr {
+            for i in 0..NODES[p].count {
+                scan_pattern(child(p, i));
+            }
+        }
+    }
+}
+
+// Node n: its type, then (not for a leaf: a local, a literal) its parts.
+// Inlined: a leaf costs no call (the scan's hottest path).
+#[inline]
+fn scan(n: i64) {
+    unsafe {
+        if n == 0 || NEED {
+            return;
+        }
+        let t = NODES[n].ty;
+        if t > 0 {
+            let m = if t < MEMO_CAP { MEMO[t] } else { 0 };
+            if m != 1 && (m >= 2 || tracked(t)) && !(MEMO[t] == 3 && raw_view(n)) {
+                NEED = true;
+                return;
+            }
+        }
+        let k = NODES[n].kind;
+        if k == NodeKind::Ident || k == NodeKind::Int || k == NodeKind::Bool
+            || k == NodeKind::Char || k == NodeKind::CStr || k == NodeKind::Str {
+            return;
+        }
+        scan_node(n);
+    }
+}
+
+fn scan_node(n: i64) {
+    unsafe {
+        match NODES[n].kind {
+            NodeKind::FieldAccess | NodeKind::TupleField | NodeKind::Cast
+                | NodeKind::Repeat | NodeKind::EnumPanic => scan(NODES[n].a),
+            NodeKind::Unary => scan(NODES[n].b),
+            NodeKind::Index | NodeKind::Range => {
+                scan(NODES[n].b);
+                scan(NODES[n].a);
+            }
+            NodeKind::Binary => {
+                scan(NODES[n].b);
+                scan(NODES[n].c);
+            }
+            NodeKind::Assign => {
+                scan(NODES[n].c);
+                scan(NODES[n].b);
+                loan(place_root(NODES[n].b));
+            }
+            NodeKind::Call => scan_call(n),
+            NodeKind::Block => {
+                for i in 0..NODES[n].count {
+                    let s = child(n, i);
+                    let k = NODES[s].kind;
+                    if k == NodeKind::Let {
+                        scan_pattern(NODES[s].a);
+                        scan(NODES[s].c);
+                    } else if k == NodeKind::Defer || k == NodeKind::ExprStmt {
+                        scan(NODES[s].a);
+                    } else {
+                        scan(s);
+                    }
+                }
+                scan(NODES[n].a);
+            }
+            NodeKind::If => {
+                scan(NODES[n].a);
+                scan(NODES[n].b);
+                scan(NODES[n].c);
+            }
+            NodeKind::Match => {
+                scan(NODES[n].a);
+                for i in 0..NODES[n].count {
+                    let arm = child(n, i);
+                    scan_pattern(NODES[arm].a);
+                    scan(NODES[arm].b);
+                    scan(NODES[arm].c);
+                }
+            }
+            NodeKind::Loop | NodeKind::While | NodeKind::For => {
+                scan_pattern(NODES[n].b);
+                scan(NODES[n].b);
+                scan(NODES[n].c);
+                scan(NODES[n].d);
+            }
+            NodeKind::Break => scan(NODES[n].b),
+            NodeKind::Return => scan(NODES[n].a),
+            NodeKind::Tuple | NodeKind::Array | NodeKind::StructLit
+                | NodeKind::VariantLit => scan_list(n),
+            NodeKind::FieldInit | NodeKind::NamedArg => scan(NODES[n].b),
+            NodeKind::Closure | NodeKind::Try | NodeKind::Interp => scan(NODES[n].y),
+            NodeKind::VecOp => {
+                scan(NODES[n].a);
+                scan_list(n);
+            }
+            _ => {}
+        }
+    }
+}
+
+// A call: its arguments in order; a loan (`&place`, a borrowed pointer
+// passed on, a view read out of a place: `p.text`) is checked against the
+// pending ones, then pending itself. A view of a static pending while a
+// nested call runs (it may write statics) needs the walk.
+fn scan_call(n: i64) {
+    unsafe {
+        if STATIC_VIEWS > 0 {
+            NEED = true;
+            return;
+        }
+        if NODES[n].x - 1 < 0 {
+            scan(NODES[n].a);
+        }
+        let mark = ROOTS.count;
+        let statics = STATIC_VIEWS;
+        for i in 0..NODES[n].count {
+            let arg = child(n, i);
+            let k = NODES[arg].kind;
+            let mut r = -1;
+            if k == NodeKind::Unary && NODES[arg].op == crate::front::lexer::Tok::Amp {
+                scan(NODES[arg].b);
+                r = place_root(NODES[arg].b);
+            } else if k == NodeKind::Ident && NODES[arg].res == Res::Local && NODES[arg].y >= 0
+                && LOCALS[NODES[arg].y].borrow && NODES[arg].ty > 0
+                && TYPES[NODES[arg].ty].kind == TyKind::Ptr {
+                r = 2 * NODES[arg].y;
+            } else {
+                r = view_arg(arg);
+                if r == -2 {
+                    scan(arg);
+                    r = -1;
+                } else if r >= 0 && (r & 1) == 1 {
+                    STATIC_VIEWS += 1;
+                }
+            }
+            if NEED {
+                break;
+            }
+            if r >= 0 {
+                loan(r);
+                ROOTS.push(r);
+            }
+        }
+        ROOTS.count = mark;
+        STATIC_VIEWS = statics;
+    }
+}
+
+// An argument that is a view (not owned) read out of a place, or one that
+// holds no views of anything (raw_view): its parts scanned, then its root
+// (a loan for the call: the walk's pending view), -1 for none; -2: another
+// kind of argument.
+fn view_arg(arg: i64) -> i64 {
+    unsafe {
+        let t = NODES[arg].ty;
+        if t <= 0 || !tracked(t) || MEMO[t] != 3 {
+            return -2;
+        }
+        if raw_view(arg) {
+            scan_node(arg);
+            return -1;
+        }
+        let r = place_root(arg);
+        if r < 0 {
+            return -2;
+        }
+        scan_node(arg);
+        r
+    }
 }
