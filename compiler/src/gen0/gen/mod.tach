@@ -39,7 +39,7 @@ use crate::back::emit::function::emit_ir_functions;
 use crate::back::emit::machine::{m_lea, m_load, m_mov, reg_fp};
 use crate::back::emit::stats::print_stats;
 use crate::back::isel::select_instructions;
-use crate::back::objfile::{asm_flush, asm_stream_begin, write_output};
+use crate::back::objfile::{asm_flush, asm_hand_over, asm_stream_begin, write_output};
 use crate::base::{
     BUFS, FILES, IntVec, STDOUT, SYMS, buf_bytes, buf_clear, buf_fmt, buf_new, buf_slice, buf_str,
     buf_write_fd, buf_write_file, cstr, intern_c,
@@ -83,7 +83,8 @@ use crate::base::target::X86;
 use crate::front::effects::{PRINT_EFFECTS, print_effects};
 use crate::middle::ctx::FnCtx;
 use crate::middle::effects_verify::{VERIFY_EFFECTS, verify_effects};
-use crate::middle::parallel::{parallel_end, phase_time};
+use crate::middle::parallel::{assembler_thread_wanted, parallel_end, phase_time};
+use crate::middle::threads::{asm_thread_finish, asm_thread_start};
 use crate::middle::trace::trace_after_lowering;
 
 static mut FRAME_SIZE: i64 = 0;
@@ -250,11 +251,24 @@ pub fn compile_program(mut cx: *FnCtx, output: *u8) {
             t = timer_now();
             print_stats();
         } else {
+            // (0.18.1: the assembler on a thread of its own, beside the
+            // code generation)
+            let threaded = assembler_thread_wanted();
+            if threaded {
+                asm_thread_start();
+            }
             for item in kids(program) {
                 if NODES[item].kind == Fn {
                     gen_function(cx, item);
-                    asm_flush(cx);
+                    if threaded {
+                        asm_hand_over(cx);
+                    } else {
+                        asm_flush(cx);
+                    }
                 }
+            }
+            if threaded {
+                asm_thread_finish();
             }
         }
         timer_add(T_CODEGEN, t);

@@ -9,7 +9,10 @@
 # into middle::ctx::FnCtx, make it before the tasks run
 # (parallel::prepare_tasks), or join it between phases. The same for the
 # join (parallel::join_task: the assembler, beside the tasks): a static
-# it writes that a task reads or writes must be one of JOINED below.
+# it writes that a task reads or writes must be one of JOINED below; and
+# for -O0's assembler thread (objfile::assemble_bytes, beside gen0's code
+# generation, gen_function and asm_hand_over on the main thread): a static
+# one side writes that the other touches must be one of ASSEMBLER below.
 #
 # usage: tests/threads_writes.sh [-c COMPILER]
 
@@ -116,6 +119,20 @@ base::SYM_TABLES_CAP	the same
 base::STRESS_GROW	read by prepare_tasks (stress_grow)
 base::timer::T_TOTALS	--time-passes, which runs on one thread'
 
+# The assembler thread's and -O0's main thread's: static <TAB> why
+ASSEMBLER='base::BUFS	asm_error (an internal error, which exits) and dwarf_file (-g, which does not stream: no thread)
+base::BUF_CAP	the same
+base::BUF_COUNT	the same
+base::FMT_SCRATCH	the same
+base::SYMS	dwarf_file (-g: no thread)
+base::SYM_CAP	the same
+base::SYM_COUNT	the same
+base::SYM_TABLE	the same
+base::SYM_TABLES	the same
+base::SYM_TABLES_CAP	the same
+base::SYM_TABLE_SIZE	the same
+base::STRESS_GROW	read by asm_thread_start before the thread starts (stress_grow)'
+
 cd "$ROOT" || exit 1
 WORK="$ROOT/target/threads"
 mkdir -p "$WORK"
@@ -174,5 +191,35 @@ newj=$(comm -23 "$WORK/join-written" "$WORK/join-allowed")
 for s in $newj; do
     echo "FAIL $s: the join writes it and a task uses it; try: $COMPILER query callees crate::middle::parallel::join_task --writes crate::$s"
 done
-echo "threads-writes: $(wc -l <"$WORK/written" | tr -d ' ') statics written by tasks, $(wc -l <"$WORK/join-written" | tr -d ' ') by the join and used by tasks; $(echo "$new$newj" | grep -c .) not known to be race-free"
-[ -z "$new" ] && [ -z "$newj" ]
+# -O0's assembler thread against the main thread.
+{
+    echo "back::objfile::assemble_bytes"
+    "$COMPILER" query callees crate::back::objfile::assemble_bytes --transitive --all | awk -F'\t' 'NF >= 3 { print $3 }'
+} | sort -u >"$WORK/assembler"
+{
+    echo "gen0::gen::gen_function"
+    echo "back::objfile::asm_hand_over"
+    "$COMPILER" query callees crate::gen0::gen::gen_function crate::back::objfile::asm_hand_over --transitive --all | awk -F'\t' 'NF >= 3 { print $3 }'
+} | sort -u >"$WORK/gen0"
+awk -F'\t' -v A="$WORK/assembler" -v M="$WORK/gen0" '
+    BEGIN {
+        while ((getline f < A) > 0) in_asm[f] = 1
+        while ((getline f < M) > 0) in_main[f] = 1
+    }
+    /^## \$ tachyonc query refs / { s = $0; sub(/^## \$ tachyonc query refs crate::/, "", s); sub(/ --all$/, "", s); n = s; sub(/.*::/, "", n); next }
+    NF >= 4 && $1 ~ /^[0-9]+:[0-9]+$/ {
+        w = ($2 == "write" || $2 == "borrow")
+        if ($2 == "read" && match($4, n "(\\[[^]]*\\])?[ \t]*\\.[ \t]*(push|pop|clear|set|insert|put|reserve|truncate|remove|append|extend)[ \t]*\\(")) w = 1
+        if ($2 == "read" && match($4, "&(mut )?" n "([^A-Za-z_0-9]|$)")) w = 1
+        t = ($2 != "use" && $2 != "def")
+        if ($3 in in_asm) { if (w) aw[s] = 1; if (t) at[s] = 1 }
+        if ($3 in in_main) { if (w) mw[s] = 1; if (t) mt[s] = 1 }
+    }
+    END { for (s in aw) if (s in mt) print s; for (s in mw) if (s in at) print s }' "$WORK/refs" | sort -u >"$WORK/asm-shared"
+printf '%s\n' "$ASSEMBLER" | cut -f1 | sort -u >"$WORK/asm-allowed"
+newa=$(comm -23 "$WORK/asm-shared" "$WORK/asm-allowed")
+for s in $newa; do
+    echo "FAIL $s: -O0's assembler thread and its main thread share it; try: $COMPILER query callees crate::back::objfile::assemble_bytes --writes crate::$s"
+done
+echo "threads-writes: $(wc -l <"$WORK/written" | tr -d ' ') statics written by tasks, $(wc -l <"$WORK/join-written" | tr -d ' ') by the join and used by tasks, $(wc -l <"$WORK/asm-shared" | tr -d ' ') shared by -O0's assembler thread; $(echo "$new$newj$newa" | grep -c .) not known to be race-free"
+[ -z "$new" ] && [ -z "$newj" ] && [ -z "$newa" ]

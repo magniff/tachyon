@@ -7,13 +7,13 @@
 // shifts by one; branches to labels are relaxed by objfile.tach.
 
 use crate::back::objfile::{
-    FX_X86_BRANCH, FX_X86_GOT, FX_X86_RIP, TAIL_JCC, TAIL_JMP, asym, emit_relaxable, fixup, here,
-    out16, out32, out64, out8,
+    ATEXT, FX_X86_BRANCH, FX_X86_GOT, FX_X86_RIP, NameMap, TAIL_JCC, TAIL_JMP, asym, c_bytes,
+    emit_relaxable, fixup, here, name_get, name_put, out16, out32, out64, out8,
 };
 use crate::back::objfile::assemble::{
     OP_COUNT, OP_END, OP_START, asm_error, is_digit_start, parse_number, text_is,
 };
-use crate::base::{BUFS, alloc_array, buf_byte, buf_new, buf_str, find_sym, intern_c, sym_table};
+use crate::base::{BUFS, alloc_array, buf_byte, buf_new, buf_str};
 use crate::middle::ctx::FnCtx;
 
 const K_REG: i64 = 1;
@@ -39,9 +39,13 @@ static mut XOPS: *XOp = 0 as *XOp;
 
 // Registers by interned name: 1 + (number | size << 5 | rex8 << 10 |
 // xmm << 11).
-static mut REGS: *i64 = 0 as *i64;
+static mut REGS: NameMap = NameMap {
+    ptrs: 0 as *i64, lens: 0 as *i64, vals: 0 as *i64, size: 0, count: 0
+};
 // Mnemonics by interned name: 1 + (class | size << 8 | arg << 16).
-static mut XMN: *i64 = 0 as *i64;
+static mut XMN: NameMap = NameMap {
+    ptrs: 0 as *i64, lens: 0 as *i64, vals: 0 as *i64, size: 0, count: 0
+};
 
 const X_ALU: i64 = 1;
 const X_TEST: i64 = 2;
@@ -74,16 +78,14 @@ const X_SSEI: i64 = 26;
 const X_SSESHIFT: i64 = 27;
 
 fn reg_def(name: *u8, num: i64, size: i64, rex8: bool, xmm: bool) {
-    let id = intern_c(name);
     unsafe {
-        REGS[id] = 1 + (num | size << 5 | (if rex8 { 1 << 10 } else { 0 })
-            | (if xmm { 1 << 11 } else { 0 }));
+        name_put(&REGS, c_bytes(name), 1 + (num | size << 5 | (if rex8 { 1 << 10 } else { 0 })
+            | (if xmm { 1 << 11 } else { 0 })));
     }
 }
 
 fn mn(name: *u8, class: i64, size: i64, arg: i64) {
-    let id = intern_c(name);
-    unsafe { XMN[id] = 1 + (class | size << 8 | arg << 16); }
+    unsafe { name_put(&XMN, c_bytes(name), 1 + (class | size << 8 | arg << 16)); }
 }
 
 // SSE: arg = mandatory prefix << 8 | opcode (after 0F).
@@ -101,8 +103,6 @@ fn join(a: *u8, b: *u8) -> *u8 {
 
 pub fn init_x86() {
     unsafe {
-        sym_table(&REGS);
-        sym_table(&XMN);
         XOPS = alloc_array::<XOp>(8);
         let r64: [*u8; 16] = [c"rax", c"rcx", c"rdx", c"rbx", c"rsp", c"rbp", c"rsi", c"rdi", c"r8",
             c"r9", c"r10", c"r11", c"r12", c"r13", c"r14", c"r15"];
@@ -121,8 +121,7 @@ pub fn init_x86() {
             reg_def(r8[i], i, 1, i >= 4 && i < 8, xmm: false);
             reg_def(xmm[i], i, 16, rex8: false, xmm: true);
         }
-        let rip = intern_c(c"rip");
-        REGS[rip] = 1 + (16 | 8 << 5);
+        name_put(&REGS, "rip", 1 + (16 | 8 << 5));
         let alu: [*u8; 6] = [c"add", c"or", c"and", c"sub", c"xor", c"cmp"];
         let digit: [i64; 6] = [0, 1, 4, 5, 6, 7];
         let sfx: [*u8; 4] = [c"b", c"w", c"l", c"q"];
@@ -235,7 +234,7 @@ pub fn init_x86() {
 // ---- Operands ----
 
 fn ch(mut cx: *FnCtx, i: i64) -> u8 {
-    unsafe { BUFS[cx.asm].data[i] }
+    unsafe { ATEXT[i] }
 }
 
 // The register `%name` at [a, b) into op; false if unknown.
@@ -244,10 +243,7 @@ fn parse_xreg(mut cx: *FnCtx, a: i64, b: i64, op: *XOp) -> bool {
         if ch(cx, a) != '%' {
             return false;
         }
-        // (0.18.1: find_sym, not intern: the assembler runs beside code
-        // generation's threads, which read the symbols)
-        let id = find_sym(BUFS[cx.asm].data[a + 1..b]);
-        let v = if id < 0 { 0 } else { REGS[id] };
+        let v = name_get(&REGS, ATEXT[a + 1..b]);
         if v == 0 {
             return false;
         }
@@ -266,7 +262,7 @@ fn parse_xsym(mut cx: *FnCtx, a: i64, b: i64, op: *XOp) {
         while at < b && ch(cx, at) != '@' {
             at += 1;
         }
-        (*op).sym = asym(BUFS[cx.asm].data[a..at]);
+        (*op).sym = asym(ATEXT[a..at]);
         (*op).modifier = MOD_NONE;
         if at < b {
             if text_is(cx, at + 1, b, c"PLT") {
@@ -601,8 +597,7 @@ pub fn x86_instruction(mut cx: *FnCtx, a: i64, b: i64) {
         for k in 0..OP_COUNT {
             parse_xop(cx, k);
         }
-        let id = find_sym(BUFS[cx.asm].data[a..b]);
-        let v = if id < 0 { 0 } else { XMN[id] };
+        let v = name_get(&XMN, ATEXT[a..b]);
         if v == 0 {
             asm_error(cx, c"unknown instruction");
         }

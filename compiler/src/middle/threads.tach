@@ -21,6 +21,7 @@
 // program with few functions, makes no thread: the main thread runs every
 // task, in order.
 
+use crate::back::objfile::assemble_bytes;
 use crate::base::{IntVec, alloc_zeroed, die, free};
 use crate::middle::ctx::{FnCtx, fnctx_new};
 use crate::middle::parallel::{join_task, run_task};
@@ -248,6 +249,90 @@ extern "C" fn worker_main(arg: *u8) -> *u8 {
         pthread_mutex_lock(MUTEX);
         take_tasks(arg as i64);
         pthread_mutex_unlock(MUTEX);
+    }
+    0 as *u8
+}
+
+// ---- The assembler's thread ----
+
+// (0.18.1) -O0 generates each function's text on the main thread (from
+// the syntax tree, with the checker); the streaming assembler takes the
+// texts, in order, on a thread of its own (asm_thread_start), with a
+// context of its own (A_CTX). It reads only its texts (copies, handed
+// over through A_QUEUE with A_MUTEX held) and the tables it made before
+// the thread started (its mnemonics), and writes only its own state
+// (back::objfile, back::enc_*); the main thread does not assemble while
+// it runs (asm_thread_finish joins it first).
+static mut A_THREAD: u64 = 0;
+static mut A_MUTEX: *u8 = 0 as *u8;
+static mut A_WAKE: *u8 = 0 as *u8;
+static mut A_QUEUE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut A_HEAD: i64 = 0;
+static mut A_STOP: bool = false;
+static mut A_CTX: *FnCtx = 0 as *FnCtx;
+
+pub fn asm_thread_start() {
+    unsafe {
+        A_CTX = fnctx_new();
+        // (the growth mode, read once, before the thread reads it)
+        crate::base::stress_grow();
+        A_MUTEX = alloc_zeroed(PTHREAD_ROOM);
+        A_WAKE = alloc_zeroed(PTHREAD_ROOM);
+        pthread_mutex_init(A_MUTEX, 0 as *u8);
+        pthread_cond_init(A_WAKE, 0 as *u8);
+        A_QUEUE.count = 0;
+        A_HEAD = 0;
+        A_STOP = false;
+        let attr = alloc_zeroed(PTHREAD_ROOM);
+        pthread_attr_init(attr);
+        pthread_attr_setstacksize(attr, STACK_SIZE as u64);
+        if pthread_create(&A_THREAD, attr, asm_thread_main, 0 as *u8) != 0 {
+            die(c"cannot start the assembler's thread (try -j1)");
+        }
+    }
+}
+
+// Hands text[0..n] (malloc'd; the thread frees it) to the assembler.
+pub fn asm_thread_push(text: *u8, n: i64) {
+    unsafe {
+        pthread_mutex_lock(A_MUTEX);
+        A_QUEUE.push(text as i64);
+        A_QUEUE.push(n);
+        pthread_cond_broadcast(A_WAKE);
+        pthread_mutex_unlock(A_MUTEX);
+    }
+}
+
+// Waits until the assembler has taken every text, and stops it.
+pub fn asm_thread_finish() {
+    unsafe {
+        pthread_mutex_lock(A_MUTEX);
+        A_STOP = true;
+        pthread_cond_broadcast(A_WAKE);
+        pthread_mutex_unlock(A_MUTEX);
+        pthread_join(A_THREAD, 0 as *u8);
+    }
+}
+
+extern "C" fn asm_thread_main(arg: *u8) -> *u8 {
+    unsafe {
+        pthread_mutex_lock(A_MUTEX);
+        loop {
+            while A_HEAD == A_QUEUE.count && !A_STOP {
+                pthread_cond_wait(A_WAKE, A_MUTEX);
+            }
+            if A_HEAD == A_QUEUE.count {
+                break;
+            }
+            let text = A_QUEUE.data[A_HEAD] as *u8;
+            let n = A_QUEUE.data[A_HEAD + 1];
+            A_HEAD += 2;
+            pthread_mutex_unlock(A_MUTEX);
+            assemble_bytes(A_CTX, text, n);
+            free(text);
+            pthread_mutex_lock(A_MUTEX);
+        }
+        pthread_mutex_unlock(A_MUTEX);
     }
     0 as *u8
 }

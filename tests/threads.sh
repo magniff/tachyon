@@ -2,14 +2,14 @@
 # (0.18.1) Code generation on threads gives the same output whatever
 # their number (docs/optimizer.md, "0.18.1: threads"): every program of
 # the corpus (tests/run, examples, bench, the compiler itself) is
-# compiled at -O1 and -O2 with -j1 and with -jN, to an object, and the
+# compiled at -O0, -O1 and -O2 with -j1 and with -jN, to an object, and the
 # two must be the same bytes (and print the same; the compiler's own to
 # assembly too). The compiler's own
 # self-compile is also checked at -O0, at -j3, and with
 # TACHYON_FRESH_CONTEXTS=1 (each task in a context of its own: a task
 # that used what an earlier task left in its thread's context would make
 # the output depend on the schedule). -O0 compiles from the syntax tree on
-# one thread; it is here so that the flag stays harmless there.
+# the main thread and assembles on another.
 #
 # usage: tests/threads.sh [-c COMPILER] [-t TARGET] [-n THREADS] [-j JOBS] [FILTER]
 #
@@ -136,12 +136,11 @@ run() { # <file> <level> <env> <threads>
     ( check "$1" "$2" "$3" "$4" "$n" >"$WORK/$n.result"; echo >&3 ) &
 }
 while read -r f; do
-    for o in 1 2; do
+    for o in 0 1 2; do
         run "$f" "$o" "" "$THREADS"
     done
 done <"$list"
 if [ -z "$FILTER" ] || echo compiler/src/main.tach | grep -q "$FILTER"; then
-    run compiler/src/main.tach 0 "" "$THREADS"
     for o in 1 2; do
         run compiler/src/main.tach "$o" "" 3
         run compiler/src/main.tach "$o" TACHYON_FRESH_CONTEXTS=1 "$THREADS"
