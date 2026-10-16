@@ -24,7 +24,8 @@ use crate::base::{
 };
 use crate::base::target::{ELF, X86};
 use crate::front::types::FNS;
-use crate::gen0::target::{ASM, CODE, emit_symbol_ref, local_prefix};
+use crate::gen0::target::{emit_symbol_ref, local_prefix};
+use crate::middle::ctx::FnCtx;
 
 pub static mut DEBUG_INFO: bool = false;
 
@@ -174,12 +175,12 @@ static mut DBG_POS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
 // Before function f's label (in ASM): the line of its declaration, at
 // `pos`, for its first instruction.
-pub fn dbg_function_begin(f: i64, prefix: *u8, pos: i64) {
+pub fn dbg_function_begin(mut cx: *FnCtx, f: i64, prefix: *u8, pos: i64) {
     unsafe {
         if !DEBUG_INFO {
             return;
         }
-        dbg_loc(ASM, pos);
+        dbg_loc(cx.asm, pos);
         DBG_FNS.push(f);
         DBG_PREFIX.push(prefix as i64);
         DBG_POS.push(pos);
@@ -187,13 +188,13 @@ pub fn dbg_function_begin(f: i64, prefix: *u8, pos: i64) {
 }
 
 // After the function's last instruction (in ASM): its end label.
-pub fn dbg_function_end() {
+pub fn dbg_function_end(mut cx: *FnCtx) {
     unsafe {
         if !DEBUG_INFO {
             return;
         }
-        end_label(ASM, DBG_FNS.count - 1);
-        buf_str(ASM, c":\n");
+        end_label(cx.asm, DBG_FNS.count - 1);
+        buf_str(cx.asm, c":\n");
     }
 }
 
@@ -205,53 +206,53 @@ fn end_label(out: i64, i: i64) {
 
 // The end of the code (in ASM, after the last instruction of the text
 // section).
-pub fn dbg_text_end() {
+pub fn dbg_text_end(mut cx: *FnCtx) {
     unsafe {
         if !DEBUG_INFO || DBG_FNS.count == 0 {
             return;
         }
-        buf_fmt(ASM, f"{cstr(local_prefix())}dbg.text_end:\n");
+        buf_fmt(cx.asm, f"{cstr(local_prefix())}dbg.text_end:\n");
     }
 }
 
 // ---- The sections ----
 
-fn section(name: *u8) {
+fn section(mut cx: *FnCtx, name: *u8) {
     unsafe {
         if ELF {
-            buf_str(ASM, c"\n.section .");
-            buf_str(ASM, name);
-            buf_str(ASM, c",\"\",@progbits\n");
+            buf_str(cx.asm, c"\n.section .");
+            buf_str(cx.asm, name);
+            buf_str(cx.asm, c",\"\",@progbits\n");
         } else {
-            buf_str(ASM, c"\n.section __DWARF,__");
-            buf_str(ASM, name);
-            buf_str(ASM, c",regular,debug\n");
+            buf_str(cx.asm, c"\n.section __DWARF,__");
+            buf_str(cx.asm, name);
+            buf_str(cx.asm, c",regular,debug\n");
         }
     }
 }
 
-fn label(name: *u8) {
+fn label(mut cx: *FnCtx, name: *u8) {
     unsafe {
-        buf_fmt(ASM, f"{cstr(local_prefix())}{cstr(name)}:\n");
+        buf_fmt(cx.asm, f"{cstr(local_prefix())}{cstr(name)}:\n");
     }
 }
 
 // `.byte` lines for a list of bytes.
-fn bytes(b: [u8]) {
+fn bytes(mut cx: *FnCtx, b: [u8]) {
     unsafe {
         let mut i = 0;
         while i < b.len as i64 {
-            buf_str(ASM, c"    .byte ");
+            buf_str(cx.asm, c"    .byte ");
             let mut k = 0;
             while k < 16 && i < b.len as i64 {
                 if k > 0 {
-                    buf_byte(ASM, ',');
+                    buf_byte(cx.asm, ',');
                 }
-                buf_uint(ASM, b[i]);
+                buf_uint(cx.asm, b[i]);
                 i += 1;
                 k += 1;
             }
-            buf_byte(ASM, '\n');
+            buf_byte(cx.asm, '\n');
         }
     }
 }
@@ -282,42 +283,42 @@ fn uleb(b: i64, value: i64) {
 // A reference to the start of another debug section: its offset, 0 on
 // Mach-O (one unit per object, not relocated), a relocated label on ELF
 // (the linker concatenates the sections of every object).
-fn section_offset(name: *u8) {
+fn section_offset(mut cx: *FnCtx, name: *u8) {
     unsafe {
         if ELF {
-            buf_str(ASM, c"    .long ");
-            buf_str(ASM, local_prefix());
-            buf_str(ASM, name);
-            buf_byte(ASM, '\n');
+            buf_str(cx.asm, c"    .long ");
+            buf_str(cx.asm, local_prefix());
+            buf_str(cx.asm, name);
+            buf_byte(cx.asm, '\n');
         } else {
-            buf_str(ASM, c"    .long 0\n");
+            buf_str(cx.asm, c"    .long 0\n");
         }
     }
 }
 
 // A function's label as an operand.
-fn function_symbol(i: i64) {
+fn function_symbol(mut cx: *FnCtx, i: i64) {
     unsafe {
         let f = DBG_FNS.data[i];
         // (emit_symbol_ref writes to CODE)
-        let out = CODE;
-        CODE = ASM;
-        emit_symbol_ref(DBG_PREFIX.data[i] as *u8, FNS[f].name);
-        CODE = out;
+        let out = cx.code;
+        cx.code = cx.asm;
+        emit_symbol_ref(cx, DBG_PREFIX.data[i] as *u8, FNS[f].name);
+        cx.code = out;
     }
 }
 
 // .debug_abbrev, .debug_info and the (empty) .debug_line of the program
 // `main_path` (appended to ASM).
-pub fn dbg_sections(main_path: *u8, producer: *u8) {
+pub fn dbg_sections(mut cx: *FnCtx, main_path: *u8, producer: *u8) {
     unsafe {
         if !DEBUG_INFO || DBG_FNS.count == 0 {
             return;
         }
         // The abbreviations: 1 the compile unit, 2 a subprogram, 3 one
         // without a declaration (from a synthesized source).
-        section(c"debug_abbrev");
-        label(c"dbg.abbrev");
+        section(cx, c"debug_abbrev");
+        label(cx, c"dbg.abbrev");
         let ab = buf_new();
         let abbrev: [u8; 46] = [
             1, 0x11, 1, // DW_TAG_compile_unit, children
@@ -344,18 +345,18 @@ pub fn dbg_sections(main_path: *u8, producer: *u8) {
             0,
         ];
         buf_bytes(ab, abbrev[0..46]);
-        bytes(buf_slice(ab));
+        bytes(cx, buf_slice(ab));
         // The compile unit.
-        section(c"debug_info");
-        label(c"dbg.info");
-        buf_fmt(ASM, f"    .long {cstr(local_prefix())}dbg.info_end - {cstr(local_prefix())}");
-        buf_str(ASM, c"dbg.info_start\n");
-        label(c"dbg.info_start");
+        section(cx, c"debug_info");
+        label(cx, c"dbg.info");
+        buf_fmt(cx.asm, f"    .long {cstr(local_prefix())}dbg.info_end - {cstr(local_prefix())}");
+        buf_str(cx.asm, c"dbg.info_start\n");
+        label(cx, c"dbg.info_start");
         let version = buf_new();
         buf_byte(version, 4);
         buf_byte(version, 0);
-        bytes(buf_slice(version));
-        section_offset(c"dbg.abbrev");
+        bytes(cx, buf_slice(version));
+        section_offset(cx, c"dbg.abbrev");
         let b = buf_new();
         buf_byte(b, 8);
         buf_byte(b, 1);
@@ -364,8 +365,8 @@ pub fn dbg_sections(main_path: *u8, producer: *u8) {
         buf_byte(b, 0x0c);
         buf_byte(b, 0);
         string(b, main_path[0..strlen(main_path) as i64]);
-        bytes(buf_slice(b));
-        section_offset(c"dbg.line");
+        bytes(cx, buf_slice(b));
+        section_offset(cx, c"dbg.line");
         // (0.18) DW_AT_comp_dir: the root file's directory, which the
         // file names are relative to (out_path), not the current one.
         let dir = buf_new();
@@ -375,12 +376,12 @@ pub fn dbg_sections(main_path: *u8, producer: *u8) {
         } else {
             string(dir, c"."[0..1]);
         }
-        bytes(buf_slice(dir));
-        buf_str(ASM, c"    .quad ");
-        function_symbol(0);
-        buf_fmt(ASM, f"\n    .long {cstr(local_prefix())}dbg.text_end - ");
-        function_symbol(0);
-        buf_byte(ASM, '\n');
+        bytes(cx, buf_slice(dir));
+        buf_str(cx.asm, c"    .quad ");
+        function_symbol(cx, 0);
+        buf_fmt(cx.asm, f"\n    .long {cstr(local_prefix())}dbg.text_end - ");
+        function_symbol(cx, 0);
+        buf_byte(cx.asm, '\n');
         // The functions.
         for i in 0..DBG_FNS.count {
             let f = DBG_FNS.data[i];
@@ -391,28 +392,28 @@ pub fn dbg_sections(main_path: *u8, producer: *u8) {
             buf_byte(s, if declared { 2 } else { 3 });
             let display = FNS[f].display;
             string(s, if display > 0 { SYMS[display].text } else { SYMS[FNS[f].name].text });
-            bytes(buf_slice(s));
-            buf_str(ASM, c"    .quad ");
-            function_symbol(i);
-            buf_str(ASM, c"\n    .long ");
-            end_label(ASM, i);
-            buf_str(ASM, c" - ");
-            function_symbol(i);
-            buf_byte(ASM, '\n');
+            bytes(cx, buf_slice(s));
+            buf_str(cx.asm, c"    .quad ");
+            function_symbol(cx, i);
+            buf_str(cx.asm, c"\n    .long ");
+            end_label(cx.asm, i);
+            buf_str(cx.asm, c" - ");
+            function_symbol(cx, i);
+            buf_byte(cx.asm, '\n');
             if declared {
                 let d = buf_new();
                 uleb(d, FILE_NUMBERS.data[file]);
                 uleb(d, line_index(pos) - line_index(FILES[file].start) + 1);
-                bytes(buf_slice(d));
+                bytes(cx, buf_slice(d));
             }
         }
         let end = buf_new();
         buf_byte(end, 0);
-        bytes(buf_slice(end));
-        label(c"dbg.info_end");
+        bytes(cx, buf_slice(end));
+        label(cx, c"dbg.info_end");
         // The line program goes here (written by the assembler).
-        section(c"debug_line");
-        label(c"dbg.line");
+        section(cx, c"debug_line");
+        label(cx, c"dbg.line");
     }
 }
 
@@ -496,13 +497,13 @@ fn prologue_second() -> *u8 {
 // compact unwind information of: lldb unwinds through -O0's code (whose
 // pushes and pops of temporaries its instruction-based unwinder takes for a
 // prologue and an epilogue) with it.
-pub fn dbg_place_locs() {
+pub fn dbg_place_locs(mut cx: *FnCtx) {
     unsafe {
         if !DEBUG_INFO {
             return;
         }
-        let t = BUFS[ASM].data;
-        let n = BUFS[ASM].len;
+        let t = BUFS[cx.asm].data;
+        let n = BUFS[cx.asm].len;
         let out = buf_new();
         buf_reserve(out, n + n / 8);
         let cfi = !ELF;
@@ -593,7 +594,7 @@ pub fn dbg_place_locs() {
         if cfi_open {
             buf_str(out, c"    .cfi_endproc\n");
         }
-        ASM = out;
+        cx.asm = out;
     }
 }
 

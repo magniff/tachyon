@@ -9,9 +9,9 @@
 
 // Loops: header, then the index of their first body block in LOOP_BODY,
 // and its count (3 per loop).
-use crate::back::regalloc::ORDER;
 use crate::base::{IntVec, alloc_array, free};
 use crate::front::types::type_size;
+use crate::middle::ctx::FnCtx;
 use crate::middle::gvn::{
     address_base, build_dom_tree, call_may_write, copy_dst, copy_size, find_escaping_slots, is_copy,
     may_alias, root_of,
@@ -20,57 +20,53 @@ use crate::middle::ipo::{
     ATTR_NOPANIC, ATTR_READNONE, ATTR_READONLY, ATTR_WILLRETURN, call_attrs, call_writes,
 };
 use crate::middle::ir::{
-    BLOCKS, INSTS, IRFUNCS, Op, Term, ir_append, ir_arg, ir_enter, ir_new_block,
-    ir_resolve_operands, ir_unlink,
+    IRFUNCS, Op, Term, ir_append, ir_arg, ir_enter, ir_new_block, ir_resolve_operands, ir_unlink,
 };
 use crate::middle::ir::cfg::{pred_index, redirect_succ, succ, succ_count};
 use crate::middle::opt::{dominates, resolve_all};
 
-static mut LOOPS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static mut LOOP_BODY: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-fn find_loops(fi: i64) {
+fn find_loops(mut cx: *FnCtx, fi: i64) {
     unsafe {
-        LOOPS.count = 0;
-        LOOP_BODY.count = 0;
+        cx.loops.count = 0;
+        cx.loop_body.count = 0;
         let mut work = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for i in 0..ORDER.count {
-            let h = ORDER.data[i];
-            let start = LOOP_BODY.count;
+        for i in 0..cx.order.count {
+            let h = cx.order.data[i];
+            let start = cx.loop_body.count;
             // Every back edge into h.
-            for k in 0..BLOCKS[h].preds.count {
-                let t = BLOCKS[h].preds.data[k];
-                if BLOCKS[t].order < 0 || !dominates(h, t) {
+            for k in 0..cx.blocks[h].preds.count {
+                let t = cx.blocks[h].preds.data[k];
+                if cx.blocks[t].order < 0 || !dominates(cx, h, t) {
                     continue;
                 }
-                if LOOP_BODY.count == start {
-                    for j in 0..ORDER.count {
-                        BLOCKS[ORDER.data[j]].mark = 0;
+                if cx.loop_body.count == start {
+                    for j in 0..cx.order.count {
+                        cx.blocks[cx.order.data[j]].mark = 0;
                     }
-                    BLOCKS[h].mark = 1;
-                    LOOP_BODY.push(h);
+                    cx.blocks[h].mark = 1;
+                    cx.loop_body.push(h);
                 }
-                if BLOCKS[t].mark == 0 {
-                    BLOCKS[t].mark = 1;
-                    LOOP_BODY.push(t);
+                if cx.blocks[t].mark == 0 {
+                    cx.blocks[t].mark = 1;
+                    cx.loop_body.push(t);
                     work.push(t);
                 }
                 while work.count > 0 {
                     let x = work.pop();
-                    for m in 0..BLOCKS[x].preds.count {
-                        let p = BLOCKS[x].preds.data[m];
-                        if BLOCKS[p].order >= 0 && BLOCKS[p].mark == 0 {
-                            BLOCKS[p].mark = 1;
-                            LOOP_BODY.push(p);
+                    for m in 0..cx.blocks[x].preds.count {
+                        let p = cx.blocks[x].preds.data[m];
+                        if cx.blocks[p].order >= 0 && cx.blocks[p].mark == 0 {
+                            cx.blocks[p].mark = 1;
+                            cx.loop_body.push(p);
                             work.push(p);
                         }
                     }
                 }
             }
-            if LOOP_BODY.count > start {
-                LOOPS.push(h);
-                LOOPS.push(start);
-                LOOPS.push(LOOP_BODY.count - start);
+            if cx.loop_body.count > start {
+                cx.loops.push(h);
+                cx.loops.push(start);
+                cx.loops.push(cx.loop_body.count - start);
             }
         }
         free(work.data as *u8);
@@ -80,21 +76,21 @@ fn find_loops(fi: i64) {
 // The preheader of the loop with header h (body blocks marked with
 // `stamp`), or 0 when the loop has several entering edges (or when its
 // entering edge would have to be split and `split` is false).
-fn preheader(fi: i64, h: i64, stamp: i64, split: bool) -> i64 {
+fn preheader(mut cx: *FnCtx, fi: i64, h: i64, stamp: i64, split: bool) -> i64 {
     unsafe {
         let mut outside = 0;
         let mut count = 0;
-        for k in 0..BLOCKS[h].preds.count {
-            let p = BLOCKS[h].preds.data[k];
-            if BLOCKS[p].mark != stamp {
+        for k in 0..cx.blocks[h].preds.count {
+            let p = cx.blocks[h].preds.data[k];
+            if cx.blocks[p].mark != stamp {
                 outside = p;
                 count += 1;
             }
         }
-        if count != 1 || BLOCKS[outside].order < 0 {
+        if count != 1 || cx.blocks[outside].order < 0 {
             return 0;
         }
-        if BLOCKS[outside].term == Term::Jump {
+        if cx.blocks[outside].term == Term::Jump {
             return outside;
         }
         if !split {
@@ -102,15 +98,15 @@ fn preheader(fi: i64, h: i64, stamp: i64, split: bool) -> i64 {
         }
         // Split the edge: a new block between the predecessor and the header,
         // at the same index in the header's predecessors.
-        ir_enter(fi);
-        let e = ir_new_block();
-        BLOCKS[e].sealed = 1;
-        BLOCKS[e].term = Term::Jump;
-        BLOCKS[e].s0 = h;
-        BLOCKS[e].preds.push(outside);
-        redirect_succ(outside, h, e);
-        let index = pred_index(h, outside);
-        BLOCKS[h].preds.data[index] = e;
+        ir_enter(cx, fi);
+        let e = ir_new_block(cx);
+        cx.blocks[e].sealed = 1;
+        cx.blocks[e].term = Term::Jump;
+        cx.blocks[e].s0 = h;
+        cx.blocks[e].preds.push(outside);
+        redirect_succ(cx, outside, h, e);
+        let index = pred_index(cx, h, outside);
+        cx.blocks[h].preds.data[index] = e;
         e
     }
 }
@@ -118,57 +114,58 @@ fn preheader(fi: i64, h: i64, stamp: i64, split: bool) -> i64 {
 // Whether something in the loop (blocks marked `stamp`) may write
 // [base + offset, + size): a store, a copy, or a call (unless the base is
 // a private slot).
-fn loop_may_write(start: i64, count: i64, base: i64, offset: i64, size: i64) -> bool {
+fn loop_may_write(mut cx: *FnCtx, start: i64, count: i64, base: i64, offset: i64, size: i64) -> bool {
     unsafe {
         for i in start..start + count {
-            let mut v = BLOCKS[LOOP_BODY.data[i]].first;
+            let mut v = cx.blocks[cx.loop_body.data[i]].first;
             while v != 0 {
-                let op = INSTS[v].op;
-                if op == Op::Store || is_copy(v) {
-                    let mut other_offset = if op == Op::Store { INSTS[v].imm } else { 0 };
-                    let other = address_base(if op == Op::Store { INSTS[v].a } else { copy_dst(v) },
+                let op = cx.insts[v].op;
+                if op == Op::Store || is_copy(cx, v) {
+                    let mut other_offset = if op == Op::Store { cx.insts[v].imm } else { 0 };
+                    let other = address_base(cx,
+                        if op == Op::Store { cx.insts[v].a } else { copy_dst(cx, v) },
                         &other_offset);
-                    let other_size = if op == Op::Store { type_size(INSTS[v].imm2) }
-                        else { copy_size(v) };
-                    if may_alias(base, offset, size, other, other_offset, other_size) {
+                    let other_size = if op == Op::Store { type_size(cx.insts[v].imm2) }
+                        else { copy_size(cx, v) };
+                    if may_alias(cx, base, offset, size, other, other_offset, other_size) {
                         return true;
                     }
-                } else if op.is_call() && call_writes(v) && call_may_write(base) {
+                } else if op.is_call() && call_writes(cx, v) && call_may_write(cx, base) {
                     return true;
                 }
-                v = INSTS[v].next;
+                v = cx.insts[v].next;
             }
         }
         false
     }
 }
 
-fn defined_outside(v: i64, stamp: i64) -> bool {
-    unsafe { v == 0 || BLOCKS[INSTS[v].block].mark != stamp }
+fn defined_outside(mut cx: *FnCtx, v: i64, stamp: i64) -> bool {
+    unsafe { v == 0 || cx.blocks[cx.insts[v].block].mark != stamp }
 }
 
-fn is_invariant(v: i64, stamp: i64, start: i64, count: i64) -> bool {
+fn is_invariant(mut cx: *FnCtx, v: i64, stamp: i64, start: i64, count: i64) -> bool {
     unsafe {
-        let op = INSTS[v].op;
+        let op = cx.insts[v].op;
         if op == Op::Load {
-            if !defined_outside(INSTS[v].a, stamp) {
+            if !defined_outside(cx, cx.insts[v].a, stamp) {
                 return false;
             }
-            let mut offset = INSTS[v].imm;
-            let base = address_base(INSTS[v].a, &offset);
-            if root_of(base) == 0 {
+            let mut offset = cx.insts[v].imm;
+            let base = address_base(cx, cx.insts[v].a, &offset);
+            if root_of(cx, base) == 0 {
                 return false;
             }
-            return !loop_may_write(start, count, base, offset, type_size(INSTS[v].ty));
+            return !loop_may_write(cx, start, count, base, offset, type_size(cx.insts[v].ty));
         }
         if op.is_call() {
-            return call_invariant(v, stamp, start, count);
+            return call_invariant(cx, v, stamp, start, count);
         }
         if !op.is_pure() && !op.is_vector() && op != Op::Sel {
             return false;
         }
-        defined_outside(INSTS[v].a, stamp) && defined_outside(INSTS[v].b, stamp)
-            && defined_outside(INSTS[v].c, stamp)
+        defined_outside(cx, cx.insts[v].a, stamp) && defined_outside(cx, cx.insts[v].b, stamp)
+            && defined_outside(cx, cx.insts[v].c, stamp)
     }
 }
 
@@ -178,18 +175,18 @@ fn is_invariant(v: i64, stamp: i64, start: i64, count: i64) -> bool {
 // run where the loop would not have run it), or certain to run in the
 // loop's first iteration before anything a panic or a stop would make
 // visible (then it runs once, earlier, with the same arguments).
-fn call_invariant(v: i64, stamp: i64, start: i64, count: i64) -> bool {
+fn call_invariant(mut cx: *FnCtx, v: i64, stamp: i64, start: i64, count: i64) -> bool {
     unsafe {
-        let op = INSTS[v].op;
-        if op != Op::Call && op != Op::CallC || INSTS[v].ty == 0 || INSTS[v].c != 0 {
+        let op = cx.insts[v].op;
+        if op != Op::Call && op != Op::CallC || cx.insts[v].ty == 0 || cx.insts[v].c != 0 {
             return false;
         }
-        let attrs = call_attrs(v);
+        let attrs = call_attrs(cx, v);
         if (attrs & ATTR_READNONE) == 0 {
             return false;
         }
-        for i in 0..INSTS[v].nargs {
-            if !defined_outside(ir_arg(v, i), stamp) {
+        for i in 0..cx.insts[v].nargs {
+            if !defined_outside(cx, ir_arg(cx, v, i), stamp) {
                 return false;
             }
         }
@@ -197,7 +194,7 @@ fn call_invariant(v: i64, stamp: i64, start: i64, count: i64) -> bool {
         if (attrs & speculable) == speculable {
             return true;
         }
-        runs_first(v, stamp, start, count)
+        runs_first(cx, v, stamp, start, count)
     }
 }
 
@@ -206,58 +203,59 @@ fn call_invariant(v: i64, stamp: i64, start: i64, count: i64) -> bool {
 // that leaves it or goes back to its header, and the instructions that
 // may run before it in an iteration are not calls that may panic, stop,
 // loop forever or write (I/O included).
-fn runs_first(v: i64, stamp: i64, start: i64, count: i64) -> bool {
+fn runs_first(mut cx: *FnCtx, v: i64, stamp: i64, start: i64, count: i64) -> bool {
     unsafe {
-        let b = INSTS[v].block;
+        let b = cx.insts[v].block;
         let quiet = ATTR_WILLRETURN | ATTR_NOPANIC | ATTR_READONLY;
         for i in start..start + count {
-            let x = LOOP_BODY.data[i];
+            let x = cx.loop_body.data[i];
             let mut leaves = false;
-            for k in 0..succ_count(x) {
-                let s = succ(x, k);
-                if BLOCKS[s].mark != stamp || s == LOOP_BODY.data[start] {
+            for k in 0..succ_count(cx, x) {
+                let s = succ(cx, x, k);
+                if cx.blocks[s].mark != stamp || s == cx.loop_body.data[start] {
                     leaves = true;
                 }
             }
-            if leaves && !dominates(b, x) {
+            if leaves && !dominates(cx, b, x) {
                 return false;
             }
-            if x != b && dominates(b, x) {
+            if x != b && dominates(cx, b, x) {
                 continue;
             }
             // (An inner loop before v may run forever.)
-            for k in 0..succ_count(x) {
-                let s = succ(x, k);
-                if s != LOOP_BODY.data[start] && dominates(s, x) {
+            for k in 0..succ_count(cx, x) {
+                let s = succ(cx, x, k);
+                if s != cx.loop_body.data[start] && dominates(cx, s, x) {
                     return false;
                 }
             }
             // Before v (all of x, or b up to v).
-            let mut w = BLOCKS[x].first;
+            let mut w = cx.blocks[x].first;
             while w != 0 && w != v {
-                if INSTS[w].op.is_call() && (call_attrs(w) & quiet) != quiet {
+                if cx.insts[w].op.is_call() && (call_attrs(cx, w) & quiet) != quiet {
                     return false;
                 }
-                w = INSTS[w].next;
+                w = cx.insts[w].next;
             }
         }
         true
     }
 }
 
-pub fn run_licm(fi: i64) -> bool {
+pub fn run_licm(mut cx: *FnCtx, fi: i64) -> bool {
     unsafe {
         // First give every loop a preheader (splitting edges changes the
         // blocks, so the loops are found again until no split is needed).
         let mut rounds = 0;
         loop {
-            build_dom_tree(fi);
-            find_loops(fi);
+            build_dom_tree(cx, fi);
+            find_loops(cx, fi);
             let mut split = false;
-            for l in 0..LOOPS.count / 3 {
-                let stamp = mark_loop(fi, l);
-                let h = LOOPS.data[3 * l];
-                if preheader(fi, h, stamp, false) == 0 && preheader(fi, h, stamp, true) != 0 {
+            for l in 0..cx.loops.count / 3 {
+                let stamp = mark_loop(cx, fi, l);
+                let h = cx.loops.data[3 * l];
+                if preheader(cx, fi, h, stamp, false) == 0
+                    && preheader(cx, fi, h, stamp, true) != 0 {
                     split = true;
                 }
             }
@@ -268,31 +266,32 @@ pub fn run_licm(fi: i64) -> bool {
             if rounds > 4 {
                 // Give up on the remaining splits; the loop info must be
                 // fresh for hoisting.
-                build_dom_tree(fi);
-                find_loops(fi);
+                build_dom_tree(cx, fi);
+                find_loops(cx, fi);
                 break;
             }
         }
-        find_escaping_slots(fi);
+        find_escaping_slots(cx, fi);
         let mut changed = false;
-        let loop_count = LOOPS.count / 3;
+        let loop_count = cx.loops.count / 3;
         // Innermost (smallest) loops first.
         let mut done = alloc_array::<i64>(loop_count + 1);
         for _ in 0..loop_count {
             let mut best = -1;
             for l in 0..loop_count {
-                if done[l] == 0 && (best < 0 || LOOPS.data[3 * l + 2] < LOOPS.data[3 * best + 2]) {
+                if done[l] == 0
+                    && (best < 0 || cx.loops.data[3 * l + 2] < cx.loops.data[3 * best + 2]) {
                     best = l;
                 }
             }
             done[best] = 1;
-            if hoist_loop(fi, best) {
+            if hoist_loop(cx, fi, best) {
                 changed = true;
             }
         }
         free(done as *u8);
         if changed {
-            resolve_all(fi);
+            resolve_all(cx, fi);
         }
         changed
     }
@@ -300,31 +299,31 @@ pub fn run_licm(fi: i64) -> bool {
 
 // Marks the body of loop l with a stamp of its own (and only it); returns
 // the stamp.
-fn mark_loop(fi: i64, l: i64) -> i64 {
+fn mark_loop(mut cx: *FnCtx, fi: i64, l: i64) -> i64 {
     unsafe {
-        let start = LOOPS.data[3 * l + 1];
-        let count = LOOPS.data[3 * l + 2];
+        let start = cx.loops.data[3 * l + 1];
+        let count = cx.loops.data[3 * l + 2];
         let stamp = 100 + l;
         for i in 0..IRFUNCS[fi].blocks.count {
             let b = IRFUNCS[fi].blocks.data[i];
-            if BLOCKS[b].mark == stamp {
-                BLOCKS[b].mark = 0;
+            if cx.blocks[b].mark == stamp {
+                cx.blocks[b].mark = 0;
             }
         }
         for i in start..start + count {
-            BLOCKS[LOOP_BODY.data[i]].mark = stamp;
+            cx.blocks[cx.loop_body.data[i]].mark = stamp;
         }
         stamp
     }
 }
 
-fn hoist_loop(fi: i64, l: i64) -> bool {
+fn hoist_loop(mut cx: *FnCtx, fi: i64, l: i64) -> bool {
     unsafe {
-        let h = LOOPS.data[3 * l];
-        let start = LOOPS.data[3 * l + 1];
-        let count = LOOPS.data[3 * l + 2];
-        let stamp = mark_loop(fi, l);
-        let pre = preheader(fi, h, stamp, false);
+        let h = cx.loops.data[3 * l];
+        let start = cx.loops.data[3 * l + 1];
+        let count = cx.loops.data[3 * l + 2];
+        let stamp = mark_loop(cx, fi, l);
+        let pre = preheader(cx, fi, h, stamp, false);
         if pre == 0 {
             return false;
         }
@@ -333,18 +332,18 @@ fn hoist_loop(fi: i64, l: i64) -> bool {
         while moved {
             moved = false;
             // In layout order, so operands are seen before their users.
-            for k in 0..ORDER.count {
-                let b = ORDER.data[k];
-                if BLOCKS[b].mark != stamp {
+            for k in 0..cx.order.count {
+                let b = cx.order.data[k];
+                if cx.blocks[b].mark != stamp {
                     continue;
                 }
-                let mut v = BLOCKS[b].first;
+                let mut v = cx.blocks[b].first;
                 while v != 0 {
-                    let next = INSTS[v].next;
-                    ir_resolve_operands(v);
-                    if is_invariant(v, stamp, start, count) {
-                        ir_unlink(v);
-                        ir_append(pre, v);
+                    let next = cx.insts[v].next;
+                    ir_resolve_operands(cx, v);
+                    if is_invariant(cx, v, stamp, start, count) {
+                        ir_unlink(cx, v);
+                        ir_append(cx, pre, v);
                         moved = true;
                         moved_any = true;
                     }

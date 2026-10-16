@@ -11,42 +11,28 @@
 
 // Per block id: the immediate post-dominator (-1: the virtual exit, 0:
 // none: the block cannot reach a return) and the post-order number.
-use crate::back::regalloc::ORDER;
 use crate::base::{IntVec, free};
+use crate::middle::ctx::FnCtx;
 use crate::middle::ipo::has_effect;
-use crate::middle::ir::{BLOCKS, INSTS, Op, Term, ir_enter, ir_operand, ir_operand_count, ir_unlink};
+use crate::middle::ir::{Op, Term, ir_enter, ir_operand, ir_operand_count, ir_unlink};
 use crate::middle::ir::cfg::{succ, succ_count};
 use crate::middle::loops::{analyze_loops, block_array, innermost_loop};
 use crate::middle::opt::{remove_pred, remove_trivial_phis, remove_unreachable, resolve_all};
 
-static mut PDOM: *i64 = 0 as *i64;
-static mut PORDER: *i64 = 0 as *i64;
-static mut PDOM_CAP: i64 = 0;
-static mut PORDER_CAP: i64 = 0;
-static mut AD_SEEN: *i64 = 0 as *i64;
-static mut AD_SEEN_CAP: i64 = 0;
-static mut AD_FIRST: *i64 = 0 as *i64;
-static mut AD_FIRST_CAP: i64 = 0;
-static mut AD_TERM: *i64 = 0 as *i64;
-static mut AD_TERM_CAP: i64 = 0;
-static mut AD_BLOCK: *i64 = 0 as *i64;
-static mut AD_BLOCK_CAP: i64 = 0;
-static mut PORDER_LIST: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-fn is_exit_block(b: i64) -> bool {
-    unsafe { BLOCKS[b].term == Term::Ret || BLOCKS[b].term == Term::Unreach }
+fn is_exit_block(mut cx: *FnCtx, b: i64) -> bool {
+    unsafe { cx.blocks[b].term == Term::Ret || cx.blocks[b].term == Term::Unreach }
 }
 
-fn pdom_intersect(b1: i64, b2: i64) -> i64 {
+fn pdom_intersect(mut cx: *FnCtx, b1: i64, b2: i64) -> i64 {
     unsafe {
         let mut x = b1;
         let mut y = b2;
         while x != y {
-            while x != -1 && (y == -1 || PORDER[x] < PORDER[y]) {
-                x = PDOM[x];
+            while x != -1 && (y == -1 || cx.porder[x] < cx.porder[y]) {
+                x = cx.pdom[x];
             }
-            while y != -1 && (x == -1 || PORDER[y] < PORDER[x]) {
-                y = PDOM[y];
+            while y != -1 && (x == -1 || cx.porder[y] < cx.porder[x]) {
+                y = cx.pdom[y];
             }
         }
         x
@@ -54,19 +40,19 @@ fn pdom_intersect(b1: i64, b2: i64) -> i64 {
 }
 
 // Post-dominators of fi's reachable blocks (layout_blocks done).
-fn compute_post_dominators(fi: i64) {
+fn compute_post_dominators(mut cx: *FnCtx, fi: i64) {
     unsafe {
-        PDOM = block_array(PDOM, &PDOM_CAP, fi);
-        PORDER = block_array(PORDER, &PORDER_CAP, fi);
+        cx.pdom = block_array(cx, cx.pdom, &cx.pdom_cap, fi);
+        cx.porder = block_array(cx, cx.porder, &cx.porder_cap, fi);
         // Post-order of the reverse CFG from the virtual exit (whose number
         // is the largest).
-        PORDER_LIST.count = 0;
-        AD_SEEN = block_array(AD_SEEN, &AD_SEEN_CAP, fi);
-        let seen = AD_SEEN;
+        cx.porder_list.count = 0;
+        cx.ad_seen = block_array(cx, cx.ad_seen, &cx.ad_seen_cap, fi);
+        let seen = cx.ad_seen;
         let mut stack = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for i in 0..ORDER.count {
-            let r = ORDER.data[i];
-            if !is_exit_block(r) || seen[r] != 0 {
+        for i in 0..cx.order.count {
+            let r = cx.order.data[i];
+            if !is_exit_block(cx, r) || seen[r] != 0 {
                 continue;
             }
             seen[r] = 1;
@@ -75,47 +61,47 @@ fn compute_post_dominators(fi: i64) {
             while stack.count > 0 {
                 let b = stack.data[stack.count - 2];
                 let k = stack.data[stack.count - 1];
-                if k < BLOCKS[b].preds.count {
+                if k < cx.blocks[b].preds.count {
                     stack.data[stack.count - 1] = k + 1;
-                    let p = BLOCKS[b].preds.data[k];
-                    if BLOCKS[p].order >= 0 && seen[p] == 0 {
+                    let p = cx.blocks[b].preds.data[k];
+                    if cx.blocks[p].order >= 0 && seen[p] == 0 {
                         seen[p] = 1;
                         stack.push(p);
                         stack.push(0);
                     }
                 } else {
                     stack.count -= 2;
-                    PORDER[b] = PORDER_LIST.count + 1;
-                    PORDER_LIST.push(b);
+                    cx.porder[b] = cx.porder_list.count + 1;
+                    cx.porder_list.push(b);
                 }
             }
         }
         free(stack.data as *u8);
-        for i in 0..PORDER_LIST.count {
-            let b = PORDER_LIST.data[i];
-            PDOM[b] = if is_exit_block(b) { -1 } else { 0 };
+        for i in 0..cx.porder_list.count {
+            let b = cx.porder_list.data[i];
+            cx.pdom[b] = if is_exit_block(cx, b) { -1 } else { 0 };
         }
         // The virtual exit's number is above every block's.
         let mut changed = true;
         while changed {
             changed = false;
-            let mut i = PORDER_LIST.count;
+            let mut i = cx.porder_list.count;
             while i > 0 {
                 i -= 1;
-                let b = PORDER_LIST.data[i];
-                if is_exit_block(b) {
+                let b = cx.porder_list.data[i];
+                if is_exit_block(cx, b) {
                     continue;
                 }
                 let mut new_pdom = 0;
-                for k in 0..succ_count(b) {
-                    let s = succ(b, k);
-                    if PORDER[s] == 0 || PDOM[s] == 0 {
+                for k in 0..succ_count(cx, b) {
+                    let s = succ(cx, b, k);
+                    if cx.porder[s] == 0 || cx.pdom[s] == 0 {
                         continue;
                     }
-                    new_pdom = if new_pdom == 0 { s } else { pdom_intersect(s, new_pdom) };
+                    new_pdom = if new_pdom == 0 { s } else { pdom_intersect(cx, s, new_pdom) };
                 }
-                if new_pdom != PDOM[b] {
-                    PDOM[b] = new_pdom;
+                if new_pdom != cx.pdom[b] {
+                    cx.pdom[b] = new_pdom;
                     changed = true;
                 }
             }
@@ -123,106 +109,107 @@ fn compute_post_dominators(fi: i64) {
     }
 }
 
-fn adce_mark(v: i64, work: *IntVec) {
+fn adce_mark(mut cx: *FnCtx, v: i64, work: *IntVec) {
     unsafe {
-        if v != 0 && INSTS[v].mark == 0 {
-            INSTS[v].mark = 1;
+        if v != 0 && cx.insts[v].mark == 0 {
+            cx.insts[v].mark = 1;
             work.push(v);
         }
     }
 }
 
 // Marks block b's terminator live (and b itself).
-fn adce_mark_branch(b: i64, live_term: *i64, blocks: *IntVec, work: *IntVec) {
+fn adce_mark_branch(mut cx: *FnCtx, b: i64, live_term: *i64, blocks: *IntVec, work: *IntVec) {
     unsafe {
         if live_term[b] == 0 {
             live_term[b] = 1;
             blocks.push(b);
-            adce_mark(BLOCKS[b].cond, work);
+            adce_mark(cx, cx.blocks[b].cond, work);
         }
     }
 }
 
-pub fn aggressive_dce(fi: i64) -> bool {
+pub fn aggressive_dce(mut cx: *FnCtx, fi: i64) -> bool {
     unsafe {
-        ir_enter(fi);
-        resolve_all(fi);
-        analyze_loops(fi);
-        compute_post_dominators(fi);
+        ir_enter(cx, fi);
+        resolve_all(cx, fi);
+        analyze_loops(cx, fi);
+        compute_post_dominators(cx, fi);
         // Control dependence: the branches each block depends on, as lists
         // (CD_FIRST[b] .. linked through CD_NEXT).
         let mut deps = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        AD_FIRST = block_array(AD_FIRST, &AD_FIRST_CAP, fi);
-        let first = AD_FIRST;
-        for i in 0..ORDER.count {
-            let x = ORDER.data[i];
-            if succ_count(x) < 2 || PORDER[x] == 0 || PDOM[x] == 0 {
+        cx.ad_first = block_array(cx, cx.ad_first, &cx.ad_first_cap, fi);
+        let first = cx.ad_first;
+        for i in 0..cx.order.count {
+            let x = cx.order.data[i];
+            if succ_count(cx, x) < 2 || cx.porder[x] == 0 || cx.pdom[x] == 0 {
                 continue;
             }
-            for k in 0..succ_count(x) {
-                let mut runner = succ(x, k);
-                while runner != PDOM[x] && runner > 0 && PORDER[runner] != 0 {
+            for k in 0..succ_count(cx, x) {
+                let mut runner = succ(cx, x, k);
+                while runner != cx.pdom[x] && runner > 0 && cx.porder[runner] != 0 {
                     deps.push(x);
                     deps.push(first[runner]);
                     first[runner] = deps.count / 2;
-                    runner = PDOM[runner];
+                    runner = cx.pdom[runner];
                     if runner == 0 {
                         break;
                     }
                 }
             }
         }
-        AD_TERM = block_array(AD_TERM, &AD_TERM_CAP, fi);
-        AD_BLOCK = block_array(AD_BLOCK, &AD_BLOCK_CAP, fi);
-        let live_term = AD_TERM;
-        let live_block = AD_BLOCK;
+        cx.ad_term = block_array(cx, cx.ad_term, &cx.ad_term_cap, fi);
+        cx.ad_block = block_array(cx, cx.ad_block, &cx.ad_block_cap, fi);
+        let live_term = cx.ad_term;
+        let live_block = cx.ad_block;
         let mut work = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let mut blocks = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for i in 0..ORDER.count {
-            let b = ORDER.data[i];
-            let mut v = BLOCKS[b].first;
+        for i in 0..cx.order.count {
+            let b = cx.order.data[i];
+            let mut v = cx.blocks[b].first;
             while v != 0 {
-                INSTS[v].mark = 0;
-                v = INSTS[v].next;
+                cx.insts[v].mark = 0;
+                v = cx.insts[v].next;
             }
         }
-        for i in 0..ORDER.count {
-            let b = ORDER.data[i];
-            let mut v = BLOCKS[b].first;
+        for i in 0..cx.order.count {
+            let b = cx.order.data[i];
+            let mut v = cx.blocks[b].first;
             while v != 0 {
-                if has_effect(v) {
-                    adce_mark(v, &work);
+                if has_effect(cx, v) {
+                    adce_mark(cx, v, &work);
                 }
-                v = INSTS[v].next;
+                v = cx.insts[v].next;
             }
             // Branches that stay: in loops, unable to reach a return, or
             // without a post-dominator a jump could go to (one with phis).
-            let j = PDOM[b];
-            let mut keep = is_exit_block(b) || innermost_loop(b) >= 0 || PORDER[b] == 0 || j <= 0;
-            if !keep && BLOCKS[b].term != Term::Jump {
-                let f = BLOCKS[j].first;
-                keep = f != 0 && INSTS[f].op == Op::Phi;
+            let j = cx.pdom[b];
+            let mut keep = is_exit_block(cx, b) || innermost_loop(cx, b) >= 0 || cx.porder[b] == 0
+                || j <= 0;
+            if !keep && cx.blocks[b].term != Term::Jump {
+                let f = cx.blocks[j].first;
+                keep = f != 0 && cx.insts[f].op == Op::Phi;
             }
-            if keep && BLOCKS[b].term != Term::Jump {
-                adce_mark_branch(b, live_term, &blocks, &work);
-            } else if is_exit_block(b) {
-                adce_mark_branch(b, live_term, &blocks, &work);
+            if keep && cx.blocks[b].term != Term::Jump {
+                adce_mark_branch(cx, b, live_term, &blocks, &work);
+            } else if is_exit_block(cx, b) {
+                adce_mark_branch(cx, b, live_term, &blocks, &work);
             }
         }
         while work.count > 0 || blocks.count > 0 {
             if work.count > 0 {
                 let v = work.pop();
-                let b = INSTS[v].block;
+                let b = cx.insts[v].block;
                 if b != 0 && live_block[b] == 0 {
                     live_block[b] = 1;
                     blocks.push(b);
                 }
-                for k in 0..ir_operand_count(v) {
-                    adce_mark(ir_operand(v, k), &work);
+                for k in 0..ir_operand_count(cx, v) {
+                    adce_mark(cx, ir_operand(cx, v, k), &work);
                 }
-                if INSTS[v].op == Op::Phi && b != 0 {
-                    for k in 0..BLOCKS[b].preds.count {
-                        adce_mark_branch(BLOCKS[b].preds.data[k], live_term, &blocks, &work);
+                if cx.insts[v].op == Op::Phi && b != 0 {
+                    for k in 0..cx.blocks[b].preds.count {
+                        adce_mark_branch(cx, cx.blocks[b].preds.data[k], live_term, &blocks, &work);
                     }
                 }
                 continue;
@@ -231,55 +218,55 @@ pub fn aggressive_dce(fi: i64) -> bool {
             live_block[b] = 1;
             let mut d = first[b];
             while d != 0 {
-                adce_mark_branch(deps.data[2 * (d - 1)], live_term, &blocks, &work);
+                adce_mark_branch(cx, deps.data[2 * (d - 1)], live_term, &blocks, &work);
                 d = deps.data[2 * (d - 1) + 1];
             }
         }
         // Sweep.
         let mut changed = false;
-        for i in 0..ORDER.count {
-            let b = ORDER.data[i];
-            let mut v = BLOCKS[b].first;
+        for i in 0..cx.order.count {
+            let b = cx.order.data[i];
+            let mut v = cx.blocks[b].first;
             while v != 0 {
-                let next = INSTS[v].next;
-                if INSTS[v].mark == 0 {
-                    ir_unlink(v);
+                let next = cx.insts[v].next;
+                if cx.insts[v].mark == 0 {
+                    ir_unlink(cx, v);
                     changed = true;
                 }
                 v = next;
             }
         }
-        for i in 0..ORDER.count {
-            let b = ORDER.data[i];
+        for i in 0..cx.order.count {
+            let b = cx.order.data[i];
             if live_term[b] != 0
-                || (BLOCKS[b].term != Term::Branch && BLOCKS[b].term != Term::Switch) {
+                || (cx.blocks[b].term != Term::Branch && cx.blocks[b].term != Term::Switch) {
                 continue;
             }
-            let j = PDOM[b];
+            let j = cx.pdom[b];
             if j <= 0 {
                 continue;
             }
-            let first_inst = BLOCKS[j].first;
-            if first_inst != 0 && INSTS[first_inst].op == Op::Phi {
+            let first_inst = cx.blocks[j].first;
+            if first_inst != 0 && cx.insts[first_inst].op == Op::Phi {
                 continue;
             }
-            for k in 0..succ_count(b) {
-                remove_pred(succ(b, k), b);
+            for k in 0..succ_count(cx, b) {
+                remove_pred(cx, succ(cx, b, k), b);
             }
-            BLOCKS[b].term = Term::Jump;
-            BLOCKS[b].cond = 0;
-            BLOCKS[b].s0 = j;
-            BLOCKS[b].s1 = 0;
-            BLOCKS[j].preds.push(b);
+            cx.blocks[b].term = Term::Jump;
+            cx.blocks[b].cond = 0;
+            cx.blocks[b].s0 = j;
+            cx.blocks[b].s1 = 0;
+            cx.blocks[j].preds.push(b);
             changed = true;
         }
         free(deps.data as *u8);
         free(work.data as *u8);
         free(blocks.data as *u8);
         if changed {
-            remove_unreachable(fi);
-            resolve_all(fi);
-            remove_trivial_phis(fi);
+            remove_unreachable(cx, fi);
+            resolve_all(cx, fi);
+            remove_trivial_phis(cx, fi);
         }
         changed
     }

@@ -34,6 +34,10 @@ Debugging flags: `--emit-ir` writes the optimized IR instead of assembly,
 `--verify-ir` checks the IR after every pass, `--print-after-all` prints
 every function after every pass (on stderr).
 
+`-j N` (0.18.1): the threads -O1 and -O2 optimize and emit the functions
+on (default: the processors, at most 8); the output is the same bytes
+whatever N (see "0.18.1: threads").
+
 ## The IR
 
 A function is a control flow graph of basic blocks. Instructions compute
@@ -1809,7 +1813,8 @@ besides its own tables:
   (`DBG_FNS`) and statistics. For output identical whatever the thread
   count, 0.18 emits each function into a buffer of its own with local
   label numbers, rebased when the buffers are joined in order, and
-  registers constant data at that join.
+  registers constant data at that join. (Done in 0.18.1: "0.18.1:
+  threads", below.)
 
 **Measured** (aarch64-macos, the compiler compiling itself, `-c`; wall
 time best of 5 alternating (load about 5), instructions retired, peak
@@ -2036,3 +2041,240 @@ and a `&T` written through a raw pointer, without `--values=error`: the
 test stays and the results are right), `opt_copy_move` (a move elided in
 a loop), `opt_nrvo` (the returned local built in the result; not with two
 locals; a defer after the return value).
+
+## 0.18.1: threads
+
+Task T7 of [design/contracts-verification.md](design/contracts-verification.md)
+(§4.3): the middle and back end run each function's work on several
+threads. `-j N` (or `-jN`) sets the threads; the output is the same
+bytes whatever N.
+
+**The default** is the processors online, at most 8, and for a small
+program one thread per 16 functions (a thread costs about as much to
+start as a few small functions to compile). On this machine (4
+performance and 6 efficiency cores) -j8 and -j10 are within noise of
+each other and well ahead of -j4 (measured below): the efficiency cores
+are worth having, and past 8 the serial part (the front end, lowering,
+interprocedural constants, the join) dominates. `-j1` makes no thread:
+the main thread runs every task, in order.
+
+**The state of a thread** (`middle/ctx.tach`). The 289 statics of
+middle, back and gen0 that a function's optimization and emission write
+(the passes' scratch, the current function's IR tables, the loop forest,
+the value ranges, the register allocator's intervals, the emitter's frame
+and peephole memory, the CODE and ASM buffers) are fields of
+`middle::ctx::FnCtx`, and the 1284 functions that reach one take `mut
+cx: *FnCtx`. Serial code passes `main_cx()`; each thread of the pool has
+its own (`threads::POOL_CTX`). The move was done by a script over `query
+refs` and `query def` positions (there is no `refactor context` yet),
+then `fix --only imports,unsafe` and `fmt`; `same-output` against
+v0.17.0 found the 8316 compilations identical. The parameter is a raw
+pointer (`mut`): as a 0.17 legacy reference, nested calls (`f(cx,
+g(cx))`) would be exclusivity conflicts.
+
+**The tasks** (`middle/parallel.tach`, on `middle/threads.tach`'s pool):
+
+| phase | -O1 | -O2 | a task |
+|---|---|---|---|
+| cleanup | yes | yes | one function's `cleanup_function` |
+| scalar pipeline | (the small leaves, serial) | yes | one function's `simplify_function` |
+| interprocedural constants, SCCs, budget | | serial | |
+| bottom up | | a level at a time | one component: tail recursion, inlining, heap to stack, the loop passes, its attributes |
+| dead functions | | serial | |
+| emission | yes | yes | one function: -O1's pipeline, or -O2's waiting loop passes and SLP; selection, allocation, emission into its own text |
+| join | beside the emission | beside the emission | the main thread, in program order |
+
+A component's **level** is 0 when it calls no other component, else one
+more than the highest level of the components it calls, or whose address
+it takes when they come before it in SCC_ORDER (a call through the
+address may be made direct and inlined). The components of a level run
+at once; the next level starts when they are done.
+
+**The same output whatever the threads.** A task reads only what is
+final when it starts, and what tasks make for the program is joined in
+program order between phases:
+
+- *Labels.* A task numbers its function's labels from 1 and writes them
+  `L\x01<n>`; the join renumbers them from the labels before
+  (`join_text`), as one thread numbered them.
+- *Constant data* (SROA's constant tables, `const_data`): a task gets a
+  placeholder id, `-(1 + function << 20 + k)`, which the IR carries (and
+  inlining copies); it is numbered at the end of the phase in the order
+  of (phase, rank, k), the order one thread makes them in, and the text
+  writes `Lstr.\x02<n>` until then. -O1's (made in the emission tasks)
+  are numbered at the join, which goes in that order. The program's
+  strings grow only between phases (`register_consts`), since the tasks
+  read them.
+- *The inlining budget and call counts* were shared counters, which each
+  component inlined against and changed: the decisions depended on the
+  order the components were done in. Now a component sees the program's
+  size and call counts as the lower levels left them, plus its own
+  changes (`program_size`, `calls_left`); the barrier between levels adds
+  the level's.
+- *Facts of other functions* (attributes, no-capture bits, sizes,
+  `FN_RT`, deciders, optimized IR): in the bottom-up phase a task reads
+  those of lower levels only (`fn_facts_ready`), done before its level
+  began; 0.17 read whichever were done, which threads would make a race.
+  A callee is resolved, and its call flags and deciders made, by its own
+  task when its component is done (`finish_component_function`); the
+  inliner's maps from a callee's ids to their copies are in the caller's
+  context (0.17 wrote them into the callee's `aux`).
+- *Nothing a task finds in its context was left by another task* (which
+  task a thread runs next is the schedule's): gvn's `param_written` cache
+  is dropped at each task (`begin_task`); `set_site`'s tables grow to
+  cover a block instead of recording it only when the largest function
+  before had made them large enough; e-graph folding uses the free entry
+  after the function's last instruction (0.17 made the program's first
+  scratch an instruction of whichever function needed it first).
+  `TACHYON_FRESH_CONTEXTS=1` gives each task a new context: the output
+  must not change (tests/threads.sh).
+- Modes that keep the program's state in statics or print as they go run
+  on one thread: `-g`, `--time-passes` (its clock is the process's),
+  `--stats`, `--verify-ir`, `--verify-regalloc`, `--print-after-all`,
+  `--print-regalloc`.
+
+**What changed in the output** (`same-output` against v0.17.0, 8316
+compilations): -O0 and -O1 are v0.17.0's, byte for byte, assembly and
+objects, on every target. At -O2, 88 compilations differ: 23 of the 672
+programs, on each target. Each is the budget's or the call counts' view
+(a component no longer sees the growth or the inlined calls of the
+components done before it in its level), or a fact a call made direct
+read of a function of the same level, or `set_site`. bench/ has one of
+them (iterchain); the compiler grows by 7% (its budget was spent before
+its own passes came, in 0.17's order too), and its -O2 self-compile
+executes 5% more instructions at -j1.
+
+**Why there is no data race.** Every static is in one of these groups,
+and the tests below keep it so:
+
+1. *Per thread:* the 289 in `FnCtx`; a thread uses only its own context.
+2. *Written only between phases,* by the main thread while no task runs:
+   the program's tables (types, symbols, strings, FN_LIVE, SCC_ORDER,
+   the components and their levels, PROGRAM_SIZE, FN_CALLS), and what
+   `prepare_tasks` makes before the first phase and `prepare_layouts`
+   before each: the symbols the passes compare with (memcpy, malloc,
+   calloc, free, rt.panic), the e-graph's rules, the C library's effects
+   table, every type's layout (so `compute_layout` only reads), the
+   growth mode. A task never adds a type, a string, a symbol or a buffer:
+   abi's offsets read the precomputed layouts (`variant_offset`,
+   `struct_offset`), constant data waits for its id, tasks format into
+   their own text (`cx_fmt`).
+3. *One entry per function or component, written by its own task:*
+   IRFUNCS[fi] (its tables, saved when the task ends, `ir_release`),
+   FN_SIZE, FN_RT, FN_DECIDERS, DEFERRED, FN_ATTRS and FN_NOCAPTURE (the
+   component's), FN_CONSTS and FN_TEXT, COMP_GROWTH and COMP_INLINED,
+   and a context's buffers' entries in BUFS (no buffer is made while
+   tasks run, so BUFS does not move). Another task reads such an entry
+   only when its writer is done: a lower level's in the bottom-up phase,
+   an earlier phase's otherwise; the join reads a text once its task is
+   marked done. The order comes from the pool's mutex: a task's writes
+   come before its thread takes the mutex to count it done, and the next
+   phase (or level) is handed over, and a joined task is seen done,
+   under the same mutex. A function's constants live in chunks that never
+   move, since a task may read one made in an earlier phase while its
+   owner adds more.
+4. *Only in modes that run on one thread,* or on the way to an internal
+   error, which exits: the -g records, `--stats`' and `--time-passes`'
+   totals, the IR printers' buffers, `buf_new` and `buf_fmt` there.
+5. *The pool's own state,* READY, REMAINING, PHASE_KIND, STOP and the
+   joined flags, read and written with the mutex held.
+
+The join runs beside the tasks: it writes the program's ASM buffer, the
+assembler's state and the joined function's text and constant ids, none
+of which a running task touches. The assembler keeps to its own state
+since 0.18.1: its names (`ASym.text` and a table by name, not interned
+symbols), its mnemonics and registers (`NameMap`s, not tables indexed by
+symbol), the text it reads (`ATEXT`, not a buffer of BUFS) and the bytes
+it writes (`OBJ`, not OBJ_BYTES in BUFS).
+
+**-O0** compiles from the syntax tree, with the checker, whose statics
+are not per thread: its functions are generated on the main thread, as
+before, and the streaming assembler takes their texts (copies, through a
+queue under a mutex of its own) on a thread of its own
+(`threads::asm_thread_start`), which its own state above makes safe
+beside the main thread. The main thread does not assemble while it runs
+(`asm_thread_finish` joins it before the runtime's and the data's text).
+At -O1 and -O2 the join assembles beside the tasks already; handing its
+texts on to that thread measured no gain.
+
+`tests/threads_writes.sh` checks the groups: it lists every static that
+code reachable from `run_task` writes (by `query callees --transitive`
+and `query refs`; a mutating method call and an address taken count),
+78 of them, and every one must be in its table with the reason; then
+the statics the join writes that task code reads or writes, 14, against
+a second table; then those -O0's assembler thread and its main thread
+share, 12, each on an internal error's path, under -g (which does not
+stream, so has no assembler thread) or read before the thread starts,
+against a third. A new write fails the test with the `query callees
+--writes` command that shows its chain. The effects cannot say this
+(they do not tell a read of a static from a write). ThreadSanitizer
+is not available, but valgrind is (aarch64-linux, the compiler
+cross-built): memcheck on the -O2 self-compile at `-j1` and `-j4`, and
+DRD, a happens-before race detector, on it at -O1 and -O2 `-j4` and on
+the -O0 one (with the assembler thread), found no error (nor DRD and
+helgrind on examples/md5 at `-j4`; helgrind's only reports without its
+default suppressions are glibc's own mutex and condition variable
+words); the -j1 and -j4 objects are the same there too.
+
+**Tests.** `tests/threads.sh` (the gate's `threads` step, also in
+`--quick`, with `tests/threads_writes.sh`): every program of the corpus
+at -O0, -O1 and -O2 compiled at -j1 and -j8 (the self-compile also at
+-j3, and with `TACHYON_FRESH_CONTEXTS=1`, and to assembly) must give the
+same object, the same output and the same exit: 2179 compilations. `TACHYON_PHASE_TIMES=1` prints each
+phase's wall time.
+
+**Measured** (aarch64-macos, the compiler compiling itself, `-c`, after
+the merge of 0.18.0, against v0.18.0; best wall of 5 alternating runs,
+median user time, peak RSS, median instructions retired; an agent eval
+and other agents kept the load at 7 to 9, so the wall times are a few
+percent high):
+
+| | v0.18.0 | -j1 | -j2 | -j4 | -j8 | -j10 |
+|---|---|---|---|---|---|---|
+| -O0 wall / user / RSS | 0.35 s / 0.33 / 370 MB | 0.35 / 0.32 / 338 | 0.30 / 0.33 / 356 | 0.29 / 0.35 / 357 | **0.30** / 0.44 / 360 | 0.29 / 0.33 / 355 |
+| -O0 instructions | 7.63 G | 7.49 | 7.52 | 7.52 | 7.53 | 7.52 |
+| -O1 wall / user / RSS | 0.87 s / 0.84 / 480 MB | 0.83 / 0.81 / 456 | 0.57 / 0.84 / 473 | 0.42 / 0.84 / 477 | **0.37** / 1.06 / 504 | 0.36 / 1.09 / 484 |
+| -O1 instructions | 14.47 G | 13.21 | 13.24 | 13.24 | 13.28 | 13.28 |
+| -O2 wall / user / RSS | 2.13 s / 2.09 / 630 MB | 2.16 / 2.18 / 642 | 1.33 / 2.30 / 643 | 0.87 / 2.35 / 652 | **0.72** / 2.92 / 671 | 0.70 / 3.06 / 678 |
+| -O2 instructions | 35.88 G | 33.64 | 33.84 | 33.75 | 33.79 | 33.79 |
+
+-O2 is 3.0 times faster at -j8 and -j10 (the design's goal was 3, and
+at most 0.65 s at -j10), -O1 2.4 times, -O0 1.2 times (its assembler
+beside its code generation; the goal was 0.20 s). The instructions
+retired fall at -j1 (the context's fields cost less than the statics
+did, and -O0's assembler no longer interns every label), though -O2
+inlines more (the budget's view, above). The user time grows with the
+threads (the efficiency cores run slower; the allocator and the caches
+are shared). Measured before the merge, against v0.17.0 at load 2 to 6:
+-O2 1.98 s to 0.69 s at -j8, -O1 0.81 to 0.35, -O0 0.33 to 0.27.
+
+Phases at -O2 -j8 (`TACHYON_PHASE_TIMES=1`, ms; -j1's in parentheses):
+front end 115, lowering 45, cleanup 13 (20), scalar pipeline 40 (206),
+interprocedural constants and the components' levels 42, bottom up 242
+(994), dead functions 32, emission with the join and the assembler 106
+(538), data and output 24: 660 ms, of which 300 serial.
+
+**What is left.**
+- *-O0's code generation* is serial: gen0 compiles from the syntax tree
+  and reaches the checker (lazily checked items, instantiation), whose
+  statics are not per thread; only the assembler runs beside it.
+- *The serial part:* the front end, lowering, interprocedural constants
+  and dead functions (about 280 ms at -O2); the bottom-up phase's level
+  barriers (a level waits for its slowest component; the largest
+  component, the checker's, is one task).
+- *Per-function assembly:* the join still assembles the text on one
+  thread; the design's workers assemble their function into bytes and
+  relocations.
+- *-g, --time-passes, --stats* on one thread.
+- The budget's view overshoots within a level; a deterministic share of
+  the level's remaining budget would bring the compiler's code back.
+
+**For incremental builds (T8).** A function's output is now a unit: its
+text and label count (`FN_TEXT`), its constants (`FN_CONSTS`, by
+placeholder), produced by one `run_task` from its IR after the
+whole-program phases and the facts of lower levels. A cache key is the
+IR as `K_EMIT` (or the bottom-up task) receives it plus what
+`fn_facts_ready` lets it read, and the program's budget and call counts
+as its level sees them (`program_size`, `calls_left`); `join_task` is the
+place to splice cached texts in, and `resolve_consts` numbers their
+constants as one thread would.

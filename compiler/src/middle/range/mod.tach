@@ -25,44 +25,24 @@ mod interval;
 mod phi;
 mod thread;
 
-use crate::base::{IntVec, alloc_array, free};
+use crate::base::{alloc_array, free};
 use crate::front::types::{TY_BOOL, int_bits, is_integer, is_signed};
+use crate::middle::ctx::FnCtx;
 use crate::middle::fold::is_const;
-use crate::middle::ir::{
-    BLOCKS, Cond, INSTS, INST_COUNT, IRFUNCS, Op, Term, ir_append, ir_arg, ir_enter, ir_make,
-    ir_val,
-};
+use crate::middle::ir::{Cond, IRFUNCS, Op, Term, ir_append, ir_arg, ir_enter, ir_make, ir_val};
 use crate::middle::ir::Cond::{Eq, Ge, Gt, Le, Lt, Ne};
 use crate::middle::ir::cfg::{case_target, case_value};
 use crate::middle::ir::verify::verify_func;
-use crate::middle::loops::{
-    LP_PARENT, analyze_loops, innermost_loop, loop_count, loop_latch, loop_preheader,
-};
+use crate::middle::loops::{analyze_loops, innermost_loop, loop_count, loop_latch, loop_preheader};
 use crate::middle::opt::{remove_trivial_phis, remove_unreachable, resolve_all, simplify_cfg};
 use crate::middle::range::chains::chains_to_switches;
 use crate::middle::range::interval::{
     MAX_I64, MIN_I64, greater, lesser, range_at, range_with_facts, type_max, type_min,
 };
-use crate::middle::range::phi::{FACT_NEST, FACT_RANGE_DEPTH, PHI_RANGES, forget_phi_ranges};
+use crate::middle::range::phi::{FACT_RANGE_DEPTH, forget_phi_ranges};
 use crate::middle::range::thread::{thread_implied, thread_phi_conditions};
 use crate::middle::scev::{counted_loop, iv_start};
 use crate::tools::query::checks::{PRINT_CHECKS, note_removed};
-
-// The facts at a block: pairs (comparison or bool value, holds).
-static mut FACTS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-// (0.11) Changes of FACTS are counted (FACTS_VER); FACT_MARK[v] is
-// MARK_STAMP when a comparison of FACTS has v as an operand, for the
-// FACTS of version MARK_VER: narrow_by_facts looks at the facts only for
-// such a v.
-static mut FACTS_VER: i64 = 1;
-static mut MARK_VER: i64 = 0;
-static mut MARK_STAMP: i64 = 0;
-static mut FACT_MARK: *i64 = 0 as *i64;
-static mut MARK_CAP: i64 = 0;
-// Per loop: the comparisons its counted test implies (0: none), made for
-// the facts (not in any block).
-static mut LOOP_FACT_LT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static mut LOOP_FACT_GE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
 // Outcomes of a comparison as a set: 1 less, 2 equal, 4 greater.
 fn cond_set(c: Cond) -> i64 {
@@ -86,102 +66,105 @@ fn is_order(c: Cond) -> bool {
 }
 
 // A comparison instruction outside any block, for a fact.
-fn fact_cmp(cond: Cond, ty: i64, a: i64, b: i64) -> i64 {
-    let v = ir_make(Op::Cmp, TY_BOOL, a, b, 0);
+fn fact_cmp(mut cx: *FnCtx, cond: Cond, ty: i64, a: i64, b: i64) -> i64 {
+    let v = ir_make(cx, Op::Cmp, TY_BOOL, a, b, 0);
     unsafe {
-        INSTS[v].cond = cond;
-        INSTS[v].imm2 = ty;
+        cx.insts[v].cond = cond;
+        cx.insts[v].imm2 = ty;
     }
     v
 }
 
-fn fact_const(value: i64, ty: i64) -> i64 {
-    ir_make(Op::Const, ty, 0, 0, value)
+fn fact_const(mut cx: *FnCtx, value: i64, ty: i64) -> i64 {
+    ir_make(cx, Op::Const, ty, 0, 0, value)
 }
 
 // The facts of the counted loops of the function (after analyze_loops).
-fn make_loop_facts() {
-    LOOP_FACT_LT.count = 0;
-    LOOP_FACT_GE.count = 0;
-    for l in 0..loop_count() {
-        let mut lt = 0;
-        let mut ge = 0;
-        let mut iv = 0;
-        let mut step = 0;
-        let mut n = 0;
-        let mut ne = false;
-        if loop_preheader(l) != 0 && loop_latch(l) != 0
-            && counted_loop(l, &iv, &step, &n, &ne) && !ne {
-            let latch = loop_latch(l);
-            let ty = unsafe { INSTS[BLOCKS[latch].cond].imm2 };
-            let start = iv_start(l, iv);
-            if step == 1 {
-                lt = fact_cmp(Lt, ty, iv, n);
-                ge = fact_cmp(Ge, ty, iv, start);
-            } else {
-                lt = fact_cmp(Gt, ty, iv, n);
-                ge = fact_cmp(Le, ty, iv, start);
+fn make_loop_facts(mut cx: *FnCtx) {
+    unsafe {
+        cx.loop_fact_lt.count = 0;
+        cx.loop_fact_ge.count = 0;
+        for l in 0..loop_count(cx) {
+            let mut lt = 0;
+            let mut ge = 0;
+            let mut iv = 0;
+            let mut step = 0;
+            let mut n = 0;
+            let mut ne = false;
+            if loop_preheader(cx, l) != 0 && loop_latch(cx, l) != 0
+                && counted_loop(cx, l, &iv, &step, &n, &ne) && !ne {
+                let latch = loop_latch(cx, l);
+                let ty = unsafe { cx.insts[cx.blocks[latch].cond].imm2 };
+                let start = iv_start(cx, l, iv);
+                if step == 1 {
+                    lt = fact_cmp(cx, Lt, ty, iv, n);
+                    ge = fact_cmp(cx, Ge, ty, iv, start);
+                } else {
+                    lt = fact_cmp(cx, Gt, ty, iv, n);
+                    ge = fact_cmp(cx, Le, ty, iv, start);
+                }
             }
+            cx.loop_fact_lt.push(lt);
+            cx.loop_fact_ge.push(ge);
         }
-        LOOP_FACT_LT.push(lt);
-        LOOP_FACT_GE.push(ge);
     }
 }
 
 // The facts at the start of block b into FACTS.
-fn collect_facts(b: i64) {
+fn collect_facts(mut cx: *FnCtx, b: i64) {
     unsafe {
-        FACTS_VER += 1;
-        FACTS.count = 0;
+        cx.facts_ver += 1;
+        cx.facts.count = 0;
         let mut x = b;
         let mut steps = 0;
         while steps < 64 {
             steps += 1;
-            if BLOCKS[x].preds.count == 1 {
-                let p = BLOCKS[x].preds.data[0];
-                edge_fact(p, x);
+            if cx.blocks[x].preds.count == 1 {
+                let p = cx.blocks[x].preds.data[0];
+                edge_fact(cx, p, x);
             }
-            let up = BLOCKS[x].idom;
+            let up = cx.blocks[x].idom;
             if up == x || up == 0 {
                 break;
             }
             x = up;
         }
-        let mut l = innermost_loop(b);
+        let mut l = innermost_loop(cx, b);
         while l >= 0 {
-            if l < LOOP_FACT_LT.count && LOOP_FACT_LT.data[l] != 0 {
-                FACTS.push(LOOP_FACT_LT.data[l]);
-                FACTS.push(1);
-                FACTS.push(LOOP_FACT_GE.data[l]);
-                FACTS.push(1);
+            if l < cx.loop_fact_lt.count && cx.loop_fact_lt.data[l] != 0 {
+                cx.facts.push(cx.loop_fact_lt.data[l]);
+                cx.facts.push(1);
+                cx.facts.push(cx.loop_fact_ge.data[l]);
+                cx.facts.push(1);
             }
-            l = LP_PARENT.data[l];
+            l = cx.lp_parent.data[l];
         }
     }
 }
 
 // The fact the edge p -> x gives (x reached by it), if any.
-fn edge_fact(p: i64, x: i64) {
+fn edge_fact(mut cx: *FnCtx, p: i64, x: i64) {
     unsafe {
-        FACTS_VER += 1;
-        if BLOCKS[p].term == Term::Branch && BLOCKS[p].s0 != BLOCKS[p].s1 {
-            FACTS.push(ir_val(BLOCKS[p].cond));
-            FACTS.push(if BLOCKS[p].s0 == x { 1 } else { 0 });
-        } else if BLOCKS[p].term == Term::Switch && BLOCKS[p].s0 != x {
+        cx.facts_ver += 1;
+        if cx.blocks[p].term == Term::Branch && cx.blocks[p].s0 != cx.blocks[p].s1 {
+            cx.facts.push(ir_val(cx, cx.blocks[p].cond));
+            cx.facts.push(if cx.blocks[p].s0 == x { 1 } else { 0 });
+        } else if cx.blocks[p].term == Term::Switch && cx.blocks[p].s0 != x {
             // x is the target of exactly one case: the value is that case's.
             let mut found = -1;
             let mut count = 0;
-            for i in 0..BLOCKS[p].ncases {
-                if case_target(p, i) == x {
+            for i in 0..cx.blocks[p].ncases {
+                if case_target(cx, p, i) == x {
                     found = i;
                     count += 1;
                 }
             }
             if count == 1 {
-                let v = ir_val(BLOCKS[p].cond);
-                let ty = INSTS[v].ty;
-                FACTS.push(fact_cmp(Eq, ty, v, fact_const(case_value(p, found), ty)));
-                FACTS.push(1);
+                let v = ir_val(cx, cx.blocks[p].cond);
+                let ty = cx.insts[v].ty;
+                cx.facts.push(fact_cmp(cx, Eq, ty, v,
+                    fact_const(cx, case_value(cx, p, found), ty)));
+                cx.facts.push(1);
             }
         }
     }
@@ -189,12 +172,13 @@ fn edge_fact(p: i64, x: i64) {
 
 // v with conversions between 64-bit integer types (which change no bits)
 // looked through: values equal as bits compare equal.
-pub fn bits_of_value(v: i64) -> i64 {
+pub fn bits_of_value(mut cx: *FnCtx, v: i64) -> i64 {
     unsafe {
-        let mut x = ir_val(v);
-        while INSTS[x].op == Op::Conv && is_integer(INSTS[x].ty) && is_integer(INSTS[x].imm2)
-            && int_bits(INSTS[x].ty) == 64 && int_bits(INSTS[x].imm2) == 64 {
-            x = ir_val(INSTS[x].a);
+        let mut x = ir_val(cx, v);
+        while cx.insts[x].op == Op::Conv && is_integer(cx.insts[x].ty)
+            && is_integer(cx.insts[x].imm2)
+            && int_bits(cx.insts[x].ty) == 64 && int_bits(cx.insts[x].imm2) == 64 {
+            x = ir_val(cx, cx.insts[x].a);
         }
         x
     }
@@ -204,17 +188,17 @@ pub fn bits_of_value(v: i64) -> i64 {
 
 // Prepares the range queries of value_range_at for function fi: its
 // loops and their facts (again after its control flow changes).
-pub fn prepare_ranges(fi: i64) {
-    analyze_loops(fi);
-    make_loop_facts();
-    forget_phi_ranges();
+pub fn prepare_ranges(mut cx: *FnCtx, fi: i64) {
+    analyze_loops(cx, fi);
+    make_loop_facts(cx);
+    forget_phi_ranges(cx);
 }
 
 // The range of integer value v at block b (the signed 64-bit view of its
 // canonical value): from its operations and the facts that hold at b.
-pub fn value_range_at(v: i64, b: i64, lo: *i64, hi: *i64) {
-    collect_facts(b);
-    range_at(v, lo, hi);
+pub fn value_range_at(mut cx: *FnCtx, v: i64, b: i64, lo: *i64, hi: *i64) {
+    collect_facts(cx, b);
+    range_at(cx, v, lo, hi);
 }
 
 // Narrows [*lo, *hi], the range of v, by the facts in FACTS comparing v
@@ -222,30 +206,30 @@ pub fn value_range_at(v: i64, b: i64, lo: *i64, hi: *i64) {
 // phis, and not too deep) with a value whose range bounds it: v < w gives
 // v < w's upper bound, v > w v > w's lower one, v == w w's range (an
 // unsigned comparison only with a non-negative w).
-fn narrow_by_facts(v: i64, lo: *i64, hi: *i64, depth: i64) {
+fn narrow_by_facts(mut cx: *FnCtx, v: i64, lo: *i64, hi: *i64, depth: i64) {
     unsafe {
-        if MARK_VER != FACTS_VER {
-            mark_facts();
+        if cx.mark_ver != cx.facts_ver {
+            mark_facts(cx);
         }
-        let x0 = bits_of_value(v);
-        if x0 < MARK_CAP && FACT_MARK[x0] != MARK_STAMP {
+        let x0 = bits_of_value(cx, v);
+        if x0 < cx.mark_cap && cx.fact_mark[x0] != cx.mark_stamp {
             return;
         }
         let mut i = 0;
-        while i < FACTS.count {
-            let f = FACTS.data[i];
-            let holds = FACTS.data[i + 1] != 0;
+        while i < cx.facts.count {
+            let f = cx.facts.data[i];
+            let holds = cx.facts.data[i + 1] != 0;
             i += 2;
-            if INSTS[f].op != Op::Cmp || !is_integer(INSTS[f].imm2) {
+            if cx.insts[f].op != Op::Cmp || !is_integer(cx.insts[f].imm2) {
                 continue;
             }
-            let mut cond = INSTS[f].cond;
+            let mut cond = cx.insts[f].cond;
             if !holds {
                 cond = cond.negate();
             }
-            let fa = bits_of_value(INSTS[f].a);
-            let fb = bits_of_value(INSTS[f].b);
-            let x = bits_of_value(v);
+            let fa = bits_of_value(cx, cx.insts[f].a);
+            let fb = bits_of_value(cx, cx.insts[f].b);
+            let x = bits_of_value(cx, v);
             let mut k = 0;
             let mut w = 0;
             if fa == x && fa != fb {
@@ -256,23 +240,23 @@ fn narrow_by_facts(v: i64, lo: *i64, hi: *i64, depth: i64) {
             } else {
                 continue;
             }
-            let signed = is_signed(INSTS[f].imm2);
+            let signed = is_signed(cx.insts[f].imm2);
             let min = 0 - 9223372036854775807 - 1;
             let max = 9223372036854775807;
             // The bound w gives: k for a constant; else its range's upper end
             // for < and <=, its lower end for > and >=, both for ==.
             let mut klo = 0;
-            if is_const(w) {
-                k = INSTS[w].imm;
+            if is_const(cx, w) {
+                k = cx.insts[w].imm;
                 klo = k;
             } else {
-                if !PHI_RANGES || FACT_NEST >= FACT_RANGE_DEPTH || cond == Ne {
+                if !cx.phi_ranges || cx.fact_nest >= FACT_RANGE_DEPTH || cond == Ne {
                     continue;
                 }
                 let mut whi = 0;
-                FACT_NEST += 1;
-                range_with_facts(w, &klo, &whi, depth + 1);
-                FACT_NEST -= 1;
+                cx.fact_nest += 1;
+                range_with_facts(cx, w, &klo, &whi, depth + 1);
+                cx.fact_nest -= 1;
                 if !signed && klo < 0 {
                     continue;
                 }
@@ -280,7 +264,7 @@ fn narrow_by_facts(v: i64, lo: *i64, hi: *i64, depth: i64) {
             }
             match cond {
                 Eq => {
-                    if is_const(w) {
+                    if is_const(cx, w) {
                         *lo = k;
                         *hi = k;
                     } else if klo <= *hi && k >= *lo {
@@ -326,9 +310,9 @@ fn narrow_by_facts(v: i64, lo: *i64, hi: *i64, depth: i64) {
 
 // Whether range [lo, hi] of comparison operand v can help decide it: not
 // its type's whole range, and for an unsigned order not of unknown sign.
-fn bounds_something(v: i64, lo: i64, hi: i64, signed: bool, order: bool) -> bool {
+fn bounds_something(mut cx: *FnCtx, v: i64, lo: i64, hi: i64, signed: bool, order: bool) -> bool {
     unsafe {
-        let ty = INSTS[v].ty;
+        let ty = cx.insts[v].ty;
         if lo <= type_min(ty) && hi >= type_max(ty) {
             return false;
         }
@@ -337,31 +321,31 @@ fn bounds_something(v: i64, lo: i64, hi: i64, signed: bool, order: bool) -> bool
 }
 
 // Marks the operands of the comparisons in FACTS (see FACT_MARK).
-fn mark_facts() {
+fn mark_facts(mut cx: *FnCtx) {
     unsafe {
-        if MARK_CAP <= INST_COUNT {
-            free(FACT_MARK as *u8);
-            MARK_CAP = 2 * INST_COUNT + 1024;
-            FACT_MARK = alloc_array::<i64>(MARK_CAP);
+        if cx.mark_cap <= cx.inst_count {
+            free(cx.fact_mark as *u8);
+            cx.mark_cap = 2 * cx.inst_count + 1024;
+            cx.fact_mark = alloc_array::<i64>(cx.mark_cap);
         }
-        MARK_STAMP += 1;
+        cx.mark_stamp += 1;
         let mut i = 0;
-        while i < FACTS.count {
-            let f = FACTS.data[i];
+        while i < cx.facts.count {
+            let f = cx.facts.data[i];
             i += 2;
-            if INSTS[f].op != Op::Cmp {
+            if cx.insts[f].op != Op::Cmp {
                 continue;
             }
-            let fa = bits_of_value(INSTS[f].a);
-            let fb = bits_of_value(INSTS[f].b);
-            if fa < MARK_CAP {
-                FACT_MARK[fa] = MARK_STAMP;
+            let fa = bits_of_value(cx, cx.insts[f].a);
+            let fb = bits_of_value(cx, cx.insts[f].b);
+            if fa < cx.mark_cap {
+                cx.fact_mark[fa] = cx.mark_stamp;
             }
-            if fb < MARK_CAP {
-                FACT_MARK[fb] = MARK_STAMP;
+            if fb < cx.mark_cap {
+                cx.fact_mark[fb] = cx.mark_stamp;
             }
         }
-        MARK_VER = FACTS_VER;
+        cx.mark_ver = cx.facts_ver;
     }
 }
 
@@ -382,38 +366,38 @@ fn interval_outcomes(alo: i64, ahi: i64, blo: i64, bhi: i64) -> i64 {
 
 // Whether comparison or bool c holds at a block with facts FACTS: 1 true,
 // 0 false, -1 unknown.
-fn decide(c: i64) -> i64 {
+fn decide(mut cx: *FnCtx, c: i64) -> i64 {
     unsafe {
         let mut i = 0;
-        while i < FACTS.count {
-            if FACTS.data[i] == c {
-                return FACTS.data[i + 1];
+        while i < cx.facts.count {
+            if cx.facts.data[i] == c {
+                return cx.facts.data[i + 1];
             }
             i += 2;
         }
-        if INSTS[c].op != Op::Cmp || !is_integer(INSTS[c].imm2) {
+        if cx.insts[c].op != Op::Cmp || !is_integer(cx.insts[c].imm2) {
             return -1;
         }
-        let a = bits_of_value(INSTS[c].a);
-        let b = bits_of_value(INSTS[c].b);
-        let q = cond_set(INSTS[c].cond);
-        let signed = is_signed(INSTS[c].imm2);
+        let a = bits_of_value(cx, cx.insts[c].a);
+        let b = bits_of_value(cx, cx.insts[c].b);
+        let q = cond_set(cx.insts[c].cond);
+        let signed = is_signed(cx.insts[c].imm2);
         // (0.11) The cheaper side first (a phi's range costs most): when its
         // range bounds nothing, the other's cannot decide anything.
         let mut alo = MIN_I64;
         let mut ahi = MAX_I64;
         let mut blo = MIN_I64;
         let mut bhi = MAX_I64;
-        let order = is_order(INSTS[c].cond);
-        if INSTS[a].op == Op::Phi && INSTS[b].op != Op::Phi {
-            range_at(b, &blo, &bhi);
-            if bounds_something(b, blo, bhi, signed, order) {
-                range_at(a, &alo, &ahi);
+        let order = is_order(cx.insts[c].cond);
+        if cx.insts[a].op == Op::Phi && cx.insts[b].op != Op::Phi {
+            range_at(cx, b, &blo, &bhi);
+            if bounds_something(cx, b, blo, bhi, signed, order) {
+                range_at(cx, a, &alo, &ahi);
             }
         } else {
-            range_at(a, &alo, &ahi);
-            if bounds_something(a, alo, ahi, signed, order) {
-                range_at(b, &blo, &bhi);
+            range_at(cx, a, &alo, &ahi);
+            if bounds_something(cx, a, alo, ahi, signed, order) {
+                range_at(cx, b, &blo, &bhi);
             }
         }
         let nonneg = alo >= 0 && blo >= 0;
@@ -421,20 +405,20 @@ fn decide(c: i64) -> i64 {
         if a == b {
             outcomes = 2;
         }
-        if signed || nonneg || !is_order(INSTS[c].cond) {
+        if signed || nonneg || !is_order(cx.insts[c].cond) {
             outcomes &= interval_outcomes(alo, ahi, blo, bhi);
         }
         i = 0;
-        while i < FACTS.count {
-            let f = FACTS.data[i];
-            let holds = FACTS.data[i + 1] != 0;
+        while i < cx.facts.count {
+            let f = cx.facts.data[i];
+            let holds = cx.facts.data[i + 1] != 0;
             i += 2;
-            if INSTS[f].op != Op::Cmp || !is_integer(INSTS[f].imm2) {
+            if cx.insts[f].op != Op::Cmp || !is_integer(cx.insts[f].imm2) {
                 continue;
             }
-            let fa = bits_of_value(INSTS[f].a);
-            let fb = bits_of_value(INSTS[f].b);
-            let mut fs = cond_set(INSTS[f].cond);
+            let fa = bits_of_value(cx, cx.insts[f].a);
+            let fb = bits_of_value(cx, cx.insts[f].b);
+            let mut fs = cond_set(cx.insts[f].cond);
             if !holds {
                 fs = 7 & ~fs;
             }
@@ -443,7 +427,7 @@ fn decide(c: i64) -> i64 {
             } else if fa != a || fb != b {
                 continue;
             }
-            let fsigned = is_signed(INSTS[f].imm2);
+            let fsigned = is_signed(cx.insts[f].imm2);
             if fs == 2 || fs == 5 || fsigned == signed || nonneg {
                 outcomes &= fs;
             } else if fsigned && !signed && alo >= 0 && (fs & 4) == 0 {
@@ -470,95 +454,96 @@ fn decide(c: i64) -> i64 {
 // Decides the branches of fi whose condition the facts and ranges decide,
 // threads edges past blocks whose test the edge decides, and turns chains
 // of equality tests into switches. Returns whether anything changed.
-pub fn fold_by_ranges(fi: i64) -> bool {
+pub fn fold_by_ranges(mut cx: *FnCtx, fi: i64) -> bool {
     unsafe {
-        ir_enter(fi);
-        resolve_all(fi);
-        let mut changed = thread_phi_conditions(fi);
+        ir_enter(cx, fi);
+        resolve_all(cx, fi);
+        let mut changed = thread_phi_conditions(cx, fi);
         if changed {
-            resolve_all(fi);
-            remove_unreachable(fi);
-            remove_trivial_phis(fi);
-            resolve_all(fi);
+            resolve_all(cx, fi);
+            remove_unreachable(cx, fi);
+            remove_trivial_phis(cx, fi);
+            resolve_all(cx, fi);
         }
-        analyze_loops(fi);
-        make_loop_facts();
+        analyze_loops(cx, fi);
+        make_loop_facts(cx);
         for round in 0..3 {
             if round > 0 {
-                resolve_all(fi);
-                analyze_loops(fi);
+                resolve_all(cx, fi);
+                analyze_loops(cx, fi);
             }
-            forget_phi_ranges();
+            forget_phi_ranges(cx);
             let mut folded = false;
             for i in 0..IRFUNCS[fi].blocks.count {
                 let b = IRFUNCS[fi].blocks.data[i];
-                if BLOCKS[b].removed != 0 || BLOCKS[b].order < 0 || BLOCKS[b].term != Term::Branch {
+                if cx.blocks[b].removed != 0 || cx.blocks[b].order < 0
+                    || cx.blocks[b].term != Term::Branch {
                     continue;
                 }
-                let c = ir_val(BLOCKS[b].cond);
-                if is_const(c) {
+                let c = ir_val(cx, cx.blocks[b].cond);
+                if is_const(cx, c) {
                     continue;
                 }
-                PHI_RANGES = is_check(BLOCKS[b].s0) || is_check(BLOCKS[b].s1);
-                let d = decide_branch(b, c);
-                PHI_RANGES = false;
+                cx.phi_ranges = is_check(cx, cx.blocks[b].s0) || is_check(cx, cx.blocks[b].s1);
+                let d = decide_branch(cx, b, c);
+                cx.phi_ranges = false;
                 if d >= 0 {
                     // (0.18: --print-checks names the checks removed here)
                     if PRINT_CHECKS != 0 as *u8 {
-                        note_removed(if d == 1 { BLOCKS[b].s1 } else { BLOCKS[b].s0 });
+                        note_removed(cx, if d == 1 { cx.blocks[b].s1 } else { cx.blocks[b].s0 });
                     }
-                    let k = ir_make(Op::Const, TY_BOOL, 0, 0, d);
-                    ir_append(b, k);
-                    BLOCKS[b].cond = k;
+                    let k = ir_make(cx, Op::Const, TY_BOOL, 0, 0, d);
+                    ir_append(cx, b, k);
+                    cx.blocks[b].cond = k;
                     folded = true;
                 }
             }
             if folded {
-                simplify_cfg(fi);
+                simplify_cfg(cx, fi);
             }
-            let threaded = thread_implied(fi);
+            let threaded = thread_implied(cx, fi);
             if !folded && !threaded {
                 break;
             }
             changed = true;
         }
-        if chains_to_switches(fi) {
+        if chains_to_switches(cx, fi) {
             changed = true;
         }
         if changed {
-            resolve_all(fi);
-            remove_unreachable(fi);
-            remove_trivial_phis(fi);
-            verify_func(fi, c"value ranges");
+            resolve_all(cx, fi);
+            remove_unreachable(cx, fi);
+            remove_trivial_phis(cx, fi);
+            verify_func(cx, fi, c"value ranges");
         }
         changed
     }
 }
 
 // Whether block b is where a check fails: it ends the program.
-fn is_check(b: i64) -> bool {
-    unsafe { BLOCKS[b].term == Term::Unreach }
+fn is_check(mut cx: *FnCtx, b: i64) -> bool {
+    unsafe { cx.blocks[b].term == Term::Unreach }
 }
 
 // Whether the condition c of block b's branch is decided: by the facts at
 // b, or, for a phi of b, by the facts on each incoming edge alike.
-fn decide_branch(b: i64, c: i64) -> i64 {
+fn decide_branch(mut cx: *FnCtx, b: i64, c: i64) -> i64 {
     unsafe {
-        collect_facts(b);
-        let d = decide(c);
-        if d >= 0 || INSTS[c].op != Op::Phi || INSTS[c].block != b {
+        collect_facts(cx, b);
+        let d = decide(cx, c);
+        if d >= 0 || cx.insts[c].op != Op::Phi || cx.insts[c].block != b {
             return d;
         }
         let mut all = -1;
-        for k in 0..INSTS[c].nargs {
-            let p = BLOCKS[b].preds.data[k];
-            if BLOCKS[p].term == Term::Switch
-                || (BLOCKS[p].term == Term::Branch && BLOCKS[p].s0 == BLOCKS[p].s1) {
+        for k in 0..cx.insts[c].nargs {
+            let p = cx.blocks[b].preds.data[k];
+            if cx.blocks[p].term == Term::Switch
+                || (cx.blocks[p].term == Term::Branch && cx.blocks[p].s0 == cx.blocks[p].s1) {
                 return -1;
             }
-            collect_facts(p);
-            edge_fact(p, b);
-            let dk = decide(ir_val(ir_arg(c, k)));
+            collect_facts(cx, p);
+            edge_fact(cx, p, b);
+            let dk = decide(cx, ir_val(cx, ir_arg(cx, c, k)));
             if dk < 0 || (all >= 0 && dk != all) {
                 return -1;
             }

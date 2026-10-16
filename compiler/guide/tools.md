@@ -177,8 +177,9 @@ Exit status: 0 done, 1 refused or failed (nothing written), 2 usage.
 
 ## Other compiler options
 
-`-O0`, `-O1`, `-O2` (the default; all behave the same), `--target
-aarch64-macos|aarch64-linux|x86_64-linux|x86_64-macos`, `-g` (debug line
+`-O0`, `-O1`, `-O2` (the default; all behave the same), `-j N` (0.18.1:
+the threads -O1 and -O2 compile on; the output is the same whatever N),
+`--target aarch64-macos|aarch64-linux|x86_64-linux|x86_64-macos`, `-g` (debug line
 tables), `--trace` (0.17: a failure prints its line and callers),
 `--check-unsafe`, `--check-alloc` (0.16), `--emit-header`,
 `--emit-imports`, `-I DIR`, `--version`; `--emit-ir` and `--emit-mir`

@@ -41,6 +41,7 @@
 # fuzz-generics, fuzz-pressure, fuzz-calls, fuzz-lang06, fuzz-vector,
 # fuzz-div, fuzz-range, fuzz-seed (against the Rust seed); abi-plain,
 # abi-import, abi-header; objcheck; layout (tests/cimport/layout.sh); debug (tests/debug.sh);
+# threads (tests/threads.sh: the same output at -j1 and -j8, 0.18.1);
 # stress-grow (the compiler with every table growth moving, 0.14);
 # examples-checkalloc (every example's test built with --check-alloc, 0.16);
 # linux-x86_64 (bootstrap/linux-check.sh); linux-aarch64
@@ -161,11 +162,11 @@ esac
 
 FUZZ_STEPS="fuzz-plain fuzz-loops fuzz-generics fuzz-pressure fuzz-calls fuzz-lang06 fuzz-vector fuzz-div fuzz-range fuzz-seed"
 ABI_STEPS="abi-plain abi-import abi-header"
-HOST_STEPS="suite-O0 suite-O1 suite-O2 $FUZZ_STEPS $ABI_STEPS objcheck layout debug stress-grow examples-checkalloc"
+HOST_STEPS="suite-O0 suite-O1 suite-O2 $FUZZ_STEPS $ABI_STEPS objcheck layout debug threads stress-grow examples-checkalloc"
 LINUX_STEPS="linux-x86_64 linux-aarch64"
 [ "$X86" = 1 ] || LINUX_STEPS="linux-aarch64"
 case "$MODE" in
-    quick) STEPS="suite-O2 $FUZZ_STEPS abi-plain" ;;
+    quick) STEPS="suite-O2 $FUZZ_STEPS abi-plain threads" ;;
     *) STEPS="$HOST_STEPS"; [ $LINUX -eq 1 ] && STEPS="$STEPS $LINUX_STEPS" ;;
 esac
 if [ -n "$ONLY" ]; then
@@ -305,6 +306,7 @@ run_step() {
                 time.h fcntl.h unistd.h signal.h sys/stat.h sys/time.h sys/socket.h \
                 netinet/in.h dirent.h pthread.h) ;;
         debug) sh "$ROOT/tests/debug.sh" -c "$C" ;;
+        threads) sh "$ROOT/tests/threads_writes.sh" -c "$C" && sh "$ROOT/tests/threads.sh" -c "$C" ;;
         stress-grow)
             # (0.14) The compiler with TACHYON_STRESS_GROW=1 (base::grow):
             # every growth of its tables moves them and poisons the old
@@ -488,8 +490,8 @@ note_of() {
     case "$1" in
         chain) awk '/^  head / { sub(/^  head +/, ""); print; exit }' "$l" ;;
         suite-*) awk '$1 == "total" { printf "%d passed, %d xfail, %d failed\n", $2, $3, $4 }' "$l" ;;
-        fuzz-*|abi-*|objcheck|layout|debug|stress-grow|examples-checkalloc)
-            grep -E '^(fuzz|abi|objcheck|layout|debug|stress-grow|examples-checkalloc):' "$l" | tail -1 ;;
+        fuzz-*|abi-*|objcheck|layout|debug|threads|stress-grow|examples-checkalloc)
+            grep -E '^(fuzz|abi|objcheck|layout|debug|threads|stress-grow|examples-checkalloc):' "$l" | tail -1 ;;
         linux-*) grep '^gate-row' "$l" | awk -F'\t' '$3 != "pass" && $3 != "skip" { bad = bad " " $2 } END { n = NR; print n " steps in the container" (bad == "" ? "" : "; failed:" bad) }' ;;
         bench) grep '^geomean' "$l" | tail -1 ;;
     esac
@@ -529,7 +531,7 @@ for s in $([ $CHAIN -eq 1 ] && echo chain) $STEPS $([ $BENCH -eq 1 ] && echo ben
     [ -f "$l" ] || { echo "    not run (the chain failed)"; continue; }
     case "$s" in
         suite-*|examples-checkalloc) awk '/^tests for / { exit } { print }' "$l" | head -60 ;;
-        fuzz-*|abi-*|objcheck) grep -E '^FAIL' "$l" | head -20; [ -d "$RUN/failures/$s" ] && echo "    kept in $RUN/failures/$s" ;;
+        fuzz-*|abi-*|objcheck|threads) grep -E '^FAIL' "$l" | head -20; [ -d "$RUN/failures/$s" ] && echo "    kept in $RUN/failures/$s" ;;
         linux-*) awk '/^--- / { p = 1 } p' "$l" | head -80; grep -q '^--- ' "$l" || tail -30 "$l" ;;
         *) tail -30 "$l" ;;
     esac

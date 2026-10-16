@@ -2,13 +2,14 @@
 // of each value, a lattice value per SSA value, the executable edges, and
 // the rewrite of what became constant.
 
-use crate::base::{IntVec, alloc_array, free};
+use crate::base::{alloc_array, free};
 use crate::front::consteval::f64_of_bits;
 use crate::front::types::is_float;
+use crate::middle::ctx::FnCtx;
 use crate::middle::fold::fold_value;
 use crate::middle::ir::{
-    BLOCKS, Cond, INSTS, IRFUNCS, Op, Term, ir_arg, ir_enter, ir_make, ir_operand, ir_operand_count,
-    ir_prepend, ir_replace,
+    Cond, IRFUNCS, Op, Term, ir_arg, ir_enter, ir_make, ir_operand, ir_operand_count, ir_prepend,
+    ir_replace,
 };
 use crate::middle::ir::Op::{Const, Phi};
 use crate::middle::ir::cfg::{succ, succ_count, switch_target};
@@ -22,66 +23,59 @@ fn is_foldable_op(op: Op) -> bool {
 
 // ---- Users ----
 
-// The users of each value of a function (CSR): USER_START[i] ..
-// USER_START[i + 1] in USER_LIST, by dense index (INSTS[v].aux - 1);
-// users are instructions, or -(block) for a block's terminator.
-static mut FN_VALUES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static mut USER_START: *i64 = 0 as *i64;
-static mut USER_LIST: *i64 = 0 as *i64;
-
 // Numbers the instructions of function `fi` (INSTS[v].aux = index + 1).
-fn number_values(fi: i64) {
-    FN_VALUES.count = 0;
+fn number_values(mut cx: *FnCtx, fi: i64) {
+    unsafe { cx.fn_values.count = 0; }
     unsafe {
         for i in 0..IRFUNCS[fi].blocks.count {
             let b = IRFUNCS[fi].blocks.data[i];
-            if BLOCKS[b].removed != 0 {
+            if cx.blocks[b].removed != 0 {
                 continue;
             }
-            let mut v = BLOCKS[b].first;
+            let mut v = cx.blocks[b].first;
             while v != 0 {
-                FN_VALUES.push(v);
-                INSTS[v].aux = FN_VALUES.count;
-                v = INSTS[v].next;
+                cx.fn_values.push(v);
+                cx.insts[v].aux = cx.fn_values.count;
+                v = cx.insts[v].next;
             }
         }
     }
 }
 
-fn build_users(fi: i64) {
+fn build_users(mut cx: *FnCtx, fi: i64) {
     unsafe {
-        number_values(fi);
-        let n = FN_VALUES.count;
-        free(USER_START as *u8);
-        USER_START = alloc_array::<i64>(n + 2);
+        number_values(cx, fi);
+        let n = cx.fn_values.count;
+        free(cx.user_start as *u8);
+        cx.user_start = alloc_array::<i64>(n + 2);
         // Count, then fill.
         for pass in 0..2 {
             let mut fill: *i64 = 0 as *i64;
             if pass == 1 {
                 let mut total = 0;
                 for i in 0..n + 1 {
-                    let count = USER_START[i];
-                    USER_START[i] = total;
+                    let count = cx.user_start[i];
+                    cx.user_start[i] = total;
                     total += count;
                 }
-                USER_START[n + 1] = total;
-                free(USER_LIST as *u8);
-                USER_LIST = alloc_array::<i64>(total + 1);
+                cx.user_start[n + 1] = total;
+                free(cx.user_list as *u8);
+                cx.user_list = alloc_array::<i64>(total + 1);
                 fill = alloc_array::<i64>(n + 1);
             }
             for i in 0..IRFUNCS[fi].blocks.count {
                 let b = IRFUNCS[fi].blocks.data[i];
-                if BLOCKS[b].removed != 0 {
+                if cx.blocks[b].removed != 0 {
                     continue;
                 }
-                let mut v = BLOCKS[b].first;
+                let mut v = cx.blocks[b].first;
                 while v != 0 {
-                    for k in 0..ir_operand_count(v) {
-                        add_user(ir_operand(v, k), v, pass, fill);
+                    for k in 0..ir_operand_count(cx, v) {
+                        add_user(cx, ir_operand(cx, v, k), v, pass, fill);
                     }
-                    v = INSTS[v].next;
+                    v = cx.insts[v].next;
                 }
-                add_user(BLOCKS[b].cond, 0 - b, pass, fill);
+                add_user(cx, cx.blocks[b].cond, 0 - b, pass, fill);
             }
             if pass == 1 {
                 free(fill as *u8);
@@ -90,16 +84,16 @@ fn build_users(fi: i64) {
     }
 }
 
-fn add_user(operand: i64, user: i64, pass: i64, fill: *i64) {
+fn add_user(mut cx: *FnCtx, operand: i64, user: i64, pass: i64, fill: *i64) {
     unsafe {
-        if operand == 0 || INSTS[operand].aux == 0 {
+        if operand == 0 || cx.insts[operand].aux == 0 {
             return;
         }
-        let t = INSTS[operand].aux - 1;
+        let t = cx.insts[operand].aux - 1;
         if pass == 0 {
-            USER_START[t] += 1;
+            cx.user_start[t] += 1;
         } else {
-            USER_LIST[USER_START[t] + fill[t]] = user;
+            cx.user_list[cx.user_start[t] + fill[t]] = user;
             fill[t] += 1;
         }
     }
@@ -109,41 +103,35 @@ fn add_user(operand: i64, user: i64, pass: i64, fill: *i64) {
 
 // The lattice of a value: not known yet (Top), a constant, or not a
 // constant (Bottom).
-enum Lattice { Top, Const, Bottom }
+pub enum Lattice { Top, Const, Bottom }
 
-// Per dense index: lattice state and constant.
-static mut LAT: *Lattice = 0 as *Lattice;
-static mut LAT_VALUE: *i64 = 0 as *i64;
-static mut SSA_WORK: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static mut CFG_WORK: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-fn lat_of(v: i64) -> Lattice {
-    unsafe { LAT[INSTS[v].aux - 1] }
+fn lat_of(mut cx: *FnCtx, v: i64) -> Lattice {
+    unsafe { cx.lat[cx.insts[v].aux - 1] }
 }
 
-fn lat_value(v: i64) -> i64 {
-    unsafe { LAT_VALUE[INSTS[v].aux - 1] }
+fn lat_value(mut cx: *FnCtx, v: i64) -> i64 {
+    unsafe { cx.lat_value[cx.insts[v].aux - 1] }
 }
 
 // Lowers the state of v; queues its users when it changed.
-fn lat_set(v: i64, state: Lattice, value: i64) {
+fn lat_set(mut cx: *FnCtx, v: i64, state: Lattice, value: i64) {
     unsafe {
-        let t = INSTS[v].aux - 1;
-        let old = LAT[t];
+        let t = cx.insts[v].aux - 1;
+        let old = cx.lat[t];
         if old == Lattice::Bottom || state == Lattice::Top {
             return;
         }
         if old == Lattice::Const {
-            if state == Lattice::Const && value == LAT_VALUE[t] {
+            if state == Lattice::Const && value == cx.lat_value[t] {
                 return;
             }
             // Two different constants, or more than a constant.
-            LAT[t] = Lattice::Bottom;
+            cx.lat[t] = Lattice::Bottom;
         } else {
-            LAT[t] = state;
-            LAT_VALUE[t] = value;
+            cx.lat[t] = state;
+            cx.lat_value[t] = value;
         }
-        SSA_WORK.push(v);
+        cx.ssa_work.push(v);
     }
 }
 
@@ -154,243 +142,243 @@ fn edge_bit(k: i64) -> u64 {
     (if k < 62 { k } else { 62 }) as u64
 }
 
-fn edge_executable(p: i64, b: i64) -> bool {
-    for k in 0..succ_count(p) {
-        if unsafe { succ(p, k) == b && (BLOCKS[p].aux >> edge_bit(k)) & 1 != 0 } {
+fn edge_executable(mut cx: *FnCtx, p: i64, b: i64) -> bool {
+    for k in 0..succ_count(cx, p) {
+        if unsafe { succ(cx, p, k) == b && (cx.blocks[p].aux >> edge_bit(k)) & 1 != 0 } {
             return true;
         }
     }
     false
 }
 
-fn mark_edge(p: i64, k: i64) {
+fn mark_edge(mut cx: *FnCtx, p: i64, k: i64) {
     unsafe {
-        if k < 62 && (BLOCKS[p].aux >> edge_bit(k)) & 1 != 0 {
+        if k < 62 && (cx.blocks[p].aux >> edge_bit(k)) & 1 != 0 {
             return;
         }
-        BLOCKS[p].aux |= 1 << edge_bit(k);
-        CFG_WORK.push(succ(p, k));
+        cx.blocks[p].aux |= 1 << edge_bit(k);
+        cx.cfg_work.push(succ(cx, p, k));
     }
 }
 
-fn sccp_eval(v: i64) {
+fn sccp_eval(mut cx: *FnCtx, v: i64) {
     unsafe {
-        let op = INSTS[v].op;
-        if INSTS[v].ty == 0 {
+        let op = cx.insts[v].op;
+        if cx.insts[v].ty == 0 {
             return;
         }
         if op == Phi {
-            let b = INSTS[v].block;
+            let b = cx.insts[v].block;
             let mut state = Lattice::Top;
             let mut value = 0;
-            for i in 0..INSTS[v].nargs {
-                let p = BLOCKS[b].preds.data[i];
-                if !edge_executable(p, b) {
+            for i in 0..cx.insts[v].nargs {
+                let p = cx.blocks[b].preds.data[i];
+                if !edge_executable(cx, p, b) {
                     continue;
                 }
-                let operand = ir_arg(v, i);
-                let s = lat_of(operand);
+                let operand = ir_arg(cx, v, i);
+                let s = lat_of(cx, operand);
                 if s == Lattice::Bottom {
                     state = Lattice::Bottom;
                     break;
                 }
                 if s == Lattice::Const {
-                    if state == Lattice::Const && value != lat_value(operand) {
+                    if state == Lattice::Const && value != lat_value(cx, operand) {
                         state = Lattice::Bottom;
                         break;
                     }
                     state = Lattice::Const;
-                    value = lat_value(operand);
+                    value = lat_value(cx, operand);
                 }
             }
-            lat_set(v, state, value);
+            lat_set(cx, v, state, value);
             return;
         }
         if !is_foldable_op(op) {
-            lat_set(v, Lattice::Bottom, 0);
+            lat_set(cx, v, Lattice::Bottom, 0);
             return;
         }
         if op == Const {
-            lat_set(v, Lattice::Const, INSTS[v].imm);
+            lat_set(cx, v, Lattice::Const, cx.insts[v].imm);
             return;
         }
-        let a = INSTS[v].a;
-        let b = INSTS[v].b;
-        let sa = lat_of(a);
-        let sb = if b != 0 { lat_of(b) } else { Lattice::Const };
+        let a = cx.insts[v].a;
+        let b = cx.insts[v].b;
+        let sa = lat_of(cx, a);
+        let sb = if b != 0 { lat_of(cx, b) } else { Lattice::Const };
         if sa == Lattice::Bottom || sb == Lattice::Bottom {
-            lat_set(v, Lattice::Bottom, 0);
+            lat_set(cx, v, Lattice::Bottom, 0);
         } else if sa == Lattice::Const && sb == Lattice::Const {
-            lat_set(v, Lattice::Const,
-                fold_value(v, lat_value(a), if b != 0 { lat_value(b) } else { 0 }));
+            lat_set(cx, v, Lattice::Const,
+                fold_value(cx, v, lat_value(cx, a), if b != 0 { lat_value(cx, b) } else { 0 }));
         }
     }
 }
 
-fn sccp_terminator(b: i64) {
+fn sccp_terminator(mut cx: *FnCtx, b: i64) {
     unsafe {
-        let term = BLOCKS[b].term;
+        let term = cx.blocks[b].term;
         if term == Term::Jump {
-            mark_edge(b, 0);
+            mark_edge(cx, b, 0);
         } else if term == Term::Switch {
-            let cond = BLOCKS[b].cond;
-            let s = lat_of(cond);
+            let cond = cx.blocks[b].cond;
+            let s = lat_of(cx, cond);
             if s == Lattice::Bottom {
-                for k in 0..BLOCKS[b].nsucc {
-                    mark_edge(b, k);
+                for k in 0..cx.blocks[b].nsucc {
+                    mark_edge(cx, b, k);
                 }
             } else if s == Lattice::Const {
-                let target = switch_target(b, lat_value(cond));
-                for k in 0..BLOCKS[b].nsucc {
-                    if succ(b, k) == target {
-                        mark_edge(b, k);
+                let target = switch_target(cx, b, lat_value(cx, cond));
+                for k in 0..cx.blocks[b].nsucc {
+                    if succ(cx, b, k) == target {
+                        mark_edge(cx, b, k);
                     }
                 }
             }
         } else if term == Term::Branch {
-            let cond = BLOCKS[b].cond;
-            let s = lat_of(cond);
+            let cond = cx.blocks[b].cond;
+            let s = lat_of(cx, cond);
             if s == Lattice::Bottom {
-                mark_edge(b, 0);
-                mark_edge(b, 1);
+                mark_edge(cx, b, 0);
+                mark_edge(cx, b, 1);
             } else if s == Lattice::Const {
-                mark_edge(b, if lat_value(cond) != 0 { 0 } else { 1 });
+                mark_edge(cx, b, if lat_value(cx, cond) != 0 { 0 } else { 1 });
             }
         }
     }
 }
 
-pub fn sccp(fi: i64) -> bool {
+pub fn sccp(mut cx: *FnCtx, fi: i64) -> bool {
     unsafe {
-        build_users(fi);
-        let n = FN_VALUES.count;
-        free(LAT as *u8);
-        free(LAT_VALUE as *u8);
-        LAT = alloc_array::<Lattice>(n + 1);
-        LAT_VALUE = alloc_array::<i64>(n + 1);
+        build_users(cx, fi);
+        let n = cx.fn_values.count;
+        free(cx.lat as *u8);
+        free(cx.lat_value as *u8);
+        cx.lat = alloc_array::<Lattice>(n + 1);
+        cx.lat_value = alloc_array::<i64>(n + 1);
         for i in 0..IRFUNCS[fi].blocks.count {
             let b = IRFUNCS[fi].blocks.data[i];
-            BLOCKS[b].aux = 0;
-            BLOCKS[b].mark = 0;
+            cx.blocks[b].aux = 0;
+            cx.blocks[b].mark = 0;
         }
-        SSA_WORK.count = 0;
-        CFG_WORK.count = 0;
-        CFG_WORK.push(IRFUNCS[fi].entry);
-        while CFG_WORK.count > 0 || SSA_WORK.count > 0 {
-            if CFG_WORK.count > 0 {
-                let b = CFG_WORK.pop();
-                if BLOCKS[b].mark == 0 {
-                    BLOCKS[b].mark = 1;
-                    let mut v = BLOCKS[b].first;
+        cx.ssa_work.count = 0;
+        cx.cfg_work.count = 0;
+        cx.cfg_work.push(IRFUNCS[fi].entry);
+        while cx.cfg_work.count > 0 || cx.ssa_work.count > 0 {
+            if cx.cfg_work.count > 0 {
+                let b = cx.cfg_work.pop();
+                if cx.blocks[b].mark == 0 {
+                    cx.blocks[b].mark = 1;
+                    let mut v = cx.blocks[b].first;
                     while v != 0 {
-                        sccp_eval(v);
-                        v = INSTS[v].next;
+                        sccp_eval(cx, v);
+                        v = cx.insts[v].next;
                     }
-                    sccp_terminator(b);
+                    sccp_terminator(cx, b);
                 } else {
                     // A new edge into a visited block: its phis may change.
-                    let mut v = BLOCKS[b].first;
-                    while v != 0 && INSTS[v].op == Phi {
-                        sccp_eval(v);
-                        v = INSTS[v].next;
+                    let mut v = cx.blocks[b].first;
+                    while v != 0 && cx.insts[v].op == Phi {
+                        sccp_eval(cx, v);
+                        v = cx.insts[v].next;
                     }
                 }
                 continue;
             }
-            let v = SSA_WORK.pop();
-            let t = INSTS[v].aux - 1;
-            for i in USER_START[t]..USER_START[t + 1] {
-                let user = USER_LIST[i];
+            let v = cx.ssa_work.pop();
+            let t = cx.insts[v].aux - 1;
+            for i in cx.user_start[t]..cx.user_start[t + 1] {
+                let user = cx.user_list[i];
                 if user < 0 {
-                    if BLOCKS[0 - user].mark != 0 {
-                        sccp_terminator(0 - user);
+                    if cx.blocks[0 - user].mark != 0 {
+                        sccp_terminator(cx, 0 - user);
                     }
-                } else if BLOCKS[INSTS[user].block].mark != 0 {
-                    sccp_eval(user);
+                } else if cx.blocks[cx.insts[user].block].mark != 0 {
+                    sccp_eval(cx, user);
                 }
             }
         }
-        sccp_rewrite(fi)
+        sccp_rewrite(cx, fi)
     }
 }
 
 // Replaces the values found constant, and the branches decided.
-fn sccp_rewrite(fi: i64) -> bool {
+fn sccp_rewrite(mut cx: *FnCtx, fi: i64) -> bool {
     unsafe {
         let mut changed = false;
-        ir_enter(fi);
-        for i in 0..FN_VALUES.count {
-            let v = FN_VALUES.data[i];
-            let op = INSTS[v].op;
-            if LAT[i] != Lattice::Const || op == Const || INSTS[v].block == 0 {
+        ir_enter(cx, fi);
+        for i in 0..cx.fn_values.count {
+            let v = cx.fn_values.data[i];
+            let op = cx.insts[v].op;
+            if cx.lat[i] != Lattice::Const || op == Const || cx.insts[v].block == 0 {
                 continue;
             }
-            if BLOCKS[INSTS[v].block].mark == 0 {
+            if cx.blocks[cx.insts[v].block].mark == 0 {
                 continue;
             }
-            let value = LAT_VALUE[i];
+            let value = cx.lat_value[i];
             // A NaN made by float arithmetic stays computed at run time (see
             // fold_makes_nan); what depends on it alone (its comparisons, its
             // conversions to integers) is folded all the same.
-            if is_float(INSTS[v].ty) && f64_of_bits(value) != f64_of_bits(value) {
+            if is_float(cx.insts[v].ty) && f64_of_bits(value) != f64_of_bits(value) {
                 continue;
             }
             if op == Phi {
-                let c = ir_make(Const, INSTS[v].ty, 0, 0, value);
-                ir_prepend(IRFUNCS[fi].entry, c);
-                ir_replace(v, c);
+                let c = ir_make(cx, Const, cx.insts[v].ty, 0, 0, value);
+                ir_prepend(cx, IRFUNCS[fi].entry, c);
+                ir_replace(cx, v, c);
             } else {
-                INSTS[v].op = Const;
-                INSTS[v].cond = Cond::Eq;
-                INSTS[v].imm = value;
-                INSTS[v].a = 0;
-                INSTS[v].b = 0;
-                INSTS[v].imm2 = 0;
+                cx.insts[v].op = Const;
+                cx.insts[v].cond = Cond::Eq;
+                cx.insts[v].imm = value;
+                cx.insts[v].a = 0;
+                cx.insts[v].b = 0;
+                cx.insts[v].imm2 = 0;
             }
             changed = true;
         }
         for i in 0..IRFUNCS[fi].blocks.count {
             let b = IRFUNCS[fi].blocks.data[i];
-            if BLOCKS[b].removed != 0 || BLOCKS[b].mark == 0 {
+            if cx.blocks[b].removed != 0 || cx.blocks[b].mark == 0 {
                 continue;
             }
-            if BLOCKS[b].term == Term::Switch && BLOCKS[b].nsucc < 62 {
+            if cx.blocks[b].term == Term::Switch && cx.blocks[b].nsucc < 62 {
                 // One successor reached only: a jump.
                 let mut taken = 0;
                 let mut reached = 0;
-                for k in 0..BLOCKS[b].nsucc {
-                    if (BLOCKS[b].aux >> k as u64) & 1 != 0 {
-                        taken = succ(b, k);
+                for k in 0..cx.blocks[b].nsucc {
+                    if (cx.blocks[b].aux >> k as u64) & 1 != 0 {
+                        taken = succ(cx, b, k);
                         reached += 1;
                     }
                 }
                 if reached == 1 {
-                    switch_to_jump(b, taken);
+                    switch_to_jump(cx, b, taken);
                     changed = true;
                 }
                 continue;
             }
-            if BLOCKS[b].term != Term::Branch {
+            if cx.blocks[b].term != Term::Branch {
                 continue;
             }
-            let bits = BLOCKS[b].aux;
+            let bits = cx.blocks[b].aux;
             if bits == 1 || bits == 2 {
                 // One edge is never taken.
-                let taken = if bits == 1 { BLOCKS[b].s0 } else { BLOCKS[b].s1 };
-                let dropped = if bits == 1 { BLOCKS[b].s1 } else { BLOCKS[b].s0 };
+                let taken = if bits == 1 { cx.blocks[b].s0 } else { cx.blocks[b].s1 };
+                let dropped = if bits == 1 { cx.blocks[b].s1 } else { cx.blocks[b].s0 };
                 // One edge goes (even when both lead to the same block).
-                remove_pred(dropped, b);
-                BLOCKS[b].term = Term::Jump;
-                BLOCKS[b].cond = 0;
-                BLOCKS[b].s0 = taken;
-                BLOCKS[b].s1 = 0;
+                remove_pred(cx, dropped, b);
+                cx.blocks[b].term = Term::Jump;
+                cx.blocks[b].cond = 0;
+                cx.blocks[b].s0 = taken;
+                cx.blocks[b].s1 = 0;
                 changed = true;
             }
         }
         if changed {
-            resolve_all(fi);
-            remove_unreachable(fi);
-            remove_trivial_phis(fi);
+            resolve_all(cx, fi);
+            remove_unreachable(cx, fi);
+            remove_trivial_phis(cx, fi);
         }
         changed
     }

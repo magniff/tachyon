@@ -21,6 +21,7 @@ use crate::gen0::target::{
     emit_int_binary, emit_label, emit_load, emit_load_imm, emit_load_reg, emit_move_to_second,
     emit_negate, emit_panic, emit_store, new_label, push_value,
 };
+use crate::middle::ctx::FnCtx;
 use crate::middle::ir::{Cond, cond_of_token};
 
 // ---- Vectors (0.10) ----
@@ -35,287 +36,287 @@ fn lane_size(vt: i64) -> i64 {
 }
 
 // Evaluates vector expression e into a new slot; returns its offset.
-fn gen_vector_to_slot(e: i64) -> i64 {
+fn gen_vector_to_slot(mut cx: *FnCtx, e: i64) -> i64 {
     let slot = alloc_slot(16, 16);
-    gen_expr(e);
-    emit_frame_addr(R_SECOND, slot);
-    emit_copy(16);
+    gen_expr(cx, e);
+    emit_frame_addr(cx, R_SECOND, slot);
+    emit_copy(cx, 16);
     slot
 }
 
 // Evaluates scalar expression e (of type ty) into a new slot.
-fn gen_scalar_to_slot(e: i64, ty: i64) -> i64 {
+fn gen_scalar_to_slot(mut cx: *FnCtx, e: i64, ty: i64) -> i64 {
     let slot = alloc_slot(8, 8);
-    gen_expr(e);
-    store_to_frame(ty, slot);
+    gen_expr(cx, e);
+    store_to_frame(cx, ty, slot);
     slot
 }
 
 // Accumulator = the scalar of type ty at frame offset `offset`.
-fn load_frame_scalar(ty: i64, offset: i64) {
-    emit_frame_addr(R_ACC, offset);
-    emit_load(ty, R_ACC);
+fn load_frame_scalar(mut cx: *FnCtx, ty: i64, offset: i64) {
+    emit_frame_addr(cx, R_ACC, offset);
+    emit_load(cx, ty, R_ACC);
 }
 
 // Accumulator = lane i (of type ty) of the vector in slot `slot`.
-fn load_lane(slot: i64, ty: i64, i: i64) {
-    load_frame_scalar(ty, slot - i * type_size(ty));
+fn load_lane(mut cx: *FnCtx, slot: i64, ty: i64, i: i64) {
+    load_frame_scalar(cx, ty, slot - i * type_size(ty));
 }
 
 // Lane i of the vector in slot `slot` = the accumulator (of type ty).
-fn store_lane(slot: i64, ty: i64, i: i64) {
-    store_to_frame(ty, slot - i * type_size(ty));
+fn store_lane(mut cx: *FnCtx, slot: i64, ty: i64, i: i64) {
+    store_to_frame(cx, ty, slot - i * type_size(ty));
 }
 
 // Accumulator = lane i of slot a <op> lane i of slot b (the operands of
 // type ty); a comparison gives -1 or 0 (of type result_ty).
-fn gen_lane_operator(op: Tok, a: i64, b: i64, ty: i64, result_ty: i64, i: i64) {
-    load_lane(a, ty, i);
-    push_value(ty);
-    load_lane(b, ty, i);
-    pop_second_operand(ty);
+fn gen_lane_operator(mut cx: *FnCtx, op: Tok, a: i64, b: i64, ty: i64, result_ty: i64, i: i64) {
+    load_lane(cx, a, ty, i);
+    push_value(cx, ty);
+    load_lane(cx, b, ty, i);
+    pop_second_operand(cx, ty);
     if is_comparison(op) {
-        emit_compare(cond_of_token(op), ty);
-        emit_negate(result_ty);
+        emit_compare(cx, cond_of_token(op), ty);
+        emit_negate(cx, result_ty);
     } else if is_float(ty) {
-        emit_float_binary(op, ty);
+        emit_float_binary(cx, op, ty);
     } else {
-        emit_int_binary(op, ty);
+        emit_int_binary(cx, op, ty);
     }
 }
 
-pub fn gen_vector_binary(op: Tok, lhs: i64, rhs: i64, result_vt: i64) {
+pub fn gen_vector_binary(mut cx: *FnCtx, op: Tok, lhs: i64, rhs: i64, result_vt: i64) {
     let vt = unsafe { NODES[lhs].ty };
-    let a = gen_vector_to_slot(lhs);
-    let b = gen_vector_to_slot(rhs);
+    let a = gen_vector_to_slot(cx, lhs);
+    let b = gen_vector_to_slot(cx, rhs);
     let r = alloc_slot(16, 16);
     let elem = vec_elem(vt);
     let result_elem = vec_elem(result_vt);
     for i in 0..vec_lanes(vt) {
-        gen_lane_operator(op, a, b, elem, result_elem, i);
-        store_lane(r, result_elem, i);
+        gen_lane_operator(cx, op, a, b, elem, result_elem, i);
+        store_lane(cx, r, result_elem, i);
     }
-    emit_frame_addr(R_ACC, r);
+    emit_frame_addr(cx, R_ACC, r);
 }
 
-pub fn gen_vector_negate(operand: i64, vt: i64) {
-    let a = gen_vector_to_slot(operand);
+pub fn gen_vector_negate(mut cx: *FnCtx, operand: i64, vt: i64) {
+    let a = gen_vector_to_slot(cx, operand);
     let elem = vec_elem(vt);
     for i in 0..vec_lanes(vt) {
-        load_lane(a, elem, i);
-        emit_negate(elem);
-        store_lane(a, elem, i);
+        load_lane(cx, a, elem, i);
+        emit_negate(cx, elem);
+        store_lane(cx, a, elem, i);
     }
-    emit_frame_addr(R_ACC, a);
+    emit_frame_addr(cx, R_ACC, a);
 }
 
 // `target <op>= value` on a vector: the value is in the accumulator (its
 // address).
-pub fn gen_vector_assign(op: Tok, target: i64, vt: i64) {
+pub fn gen_vector_assign(mut cx: *FnCtx, op: Tok, target: i64, vt: i64) {
     let b = alloc_slot(16, 16);
-    emit_frame_addr(R_SECOND, b);
-    emit_copy(16);
+    emit_frame_addr(cx, R_SECOND, b);
+    emit_copy(cx, 16);
     let addr = alloc_slot(8, 8);
-    gen_addr(target);
-    store_reg_to_frame(R_ACC, addr);
+    gen_addr(cx, target);
+    store_reg_to_frame(cx, R_ACC, addr);
     let elem = vec_elem(vt);
     let size = type_size(elem);
     for i in 0..vec_lanes(vt) {
-        load_reg_from_frame(R_ACC, addr);
-        emit_add_imm(R_ACC, i * size);
-        emit_load(elem, R_ACC);
-        push_value(elem);
-        load_lane(b, elem, i);
-        pop_second_operand(elem);
+        load_reg_from_frame(cx, R_ACC, addr);
+        emit_add_imm(cx, R_ACC, i * size);
+        emit_load(cx, elem, R_ACC);
+        push_value(cx, elem);
+        load_lane(cx, b, elem, i);
+        pop_second_operand(cx, elem);
         if is_float(elem) {
-            emit_float_binary(op, elem);
+            emit_float_binary(cx, op, elem);
         } else {
-            emit_int_binary(op, elem);
+            emit_int_binary(cx, op, elem);
         }
-        load_reg_from_frame(R_ADDR, addr);
-        emit_add_imm(R_ADDR, i * size);
-        emit_store(elem, R_ACC, R_ADDR);
+        load_reg_from_frame(cx, R_ADDR, addr);
+        emit_add_imm(cx, R_ADDR, i * size);
+        emit_store(cx, elem, R_ACC, R_ADDR);
     }
 }
 
 // The memory of a vector load or store, `s` (a slice or an array), and its
 // index: slots holding the address of the first lane, after checking
 // that the lanes are in bounds (a range i..i + lanes of s).
-fn gen_vector_address(s: i64, index: i64, lanes: i64, elem: i64) -> i64 {
+fn gen_vector_address(mut cx: *FnCtx, s: i64, index: i64, lanes: i64, elem: i64) -> i64 {
     unsafe {
         let s_ty = NODES[s].ty;
         let ptr = alloc_slot(8, 8);
         let len = alloc_slot(8, 8);
         // s's address first, the index, then a slice's pointer and length
         // (as `s[i]` reads them).
-        gen_expr(s);
-        store_reg_to_frame(R_ACC, ptr);
-        let idx = gen_scalar_to_slot(index, TY_I64);
-        load_reg_from_frame(R_ACC, ptr);
+        gen_expr(cx, s);
+        store_reg_to_frame(cx, R_ACC, ptr);
+        let idx = gen_scalar_to_slot(cx, index, TY_I64);
+        load_reg_from_frame(cx, R_ACC, ptr);
         if is_slice(s_ty) {
-            emit_move_to_second(TY_U64);
-            emit_load_reg(R_ACC, R_SECOND);
-            store_reg_to_frame(R_ACC, ptr);
-            emit_add_imm(R_SECOND, 8);
-            emit_load_reg(R_ACC, R_SECOND);
-            store_reg_to_frame(R_ACC, len);
+            emit_move_to_second(cx, TY_U64);
+            emit_load_reg(cx, R_ACC, R_SECOND);
+            store_reg_to_frame(cx, R_ACC, ptr);
+            emit_add_imm(cx, R_SECOND, 8);
+            emit_load_reg(cx, R_ACC, R_SECOND);
+            store_reg_to_frame(cx, R_ACC, len);
         } else {
-            store_reg_to_frame(R_ACC, ptr);
-            emit_load_imm(R_ACC, TYPES[s_ty].b as u64);
-            store_reg_to_frame(R_ACC, len);
+            store_reg_to_frame(cx, R_ACC, ptr);
+            emit_load_imm(cx, R_ACC, TYPES[s_ty].b as u64);
+            store_reg_to_frame(cx, R_ACC, len);
         }
         // index <= len - lanes (signed: len - lanes may be negative), and
         // 0 <= index.
-        let ok = new_label();
-        let fail = new_label();
-        load_reg_from_frame(R_SECOND, len);
-        emit_add_imm(R_SECOND, 0 - lanes);
-        load_reg_from_frame(R_ACC, idx);
-        emit_compare_jump(Cond::Gt, true, fail);
-        emit_load_imm(R_SECOND, 0);
-        emit_compare_jump(Cond::Ge, true, ok);
-        emit_label(fail);
-        load_reg_from_frame(R_SECOND, idx);
-        emit_add_imm(R_SECOND, lanes);
-        load_reg_from_frame(R_ACC, idx);
-        emit_frame_addr(R_ADDR, len);
-        emit_load_reg(R_ADDR, R_ADDR);
-        emit_panic(PANIC_RANGE_SIGNED, site_of(index, 0));
-        emit_label(ok);
-        load_reg_from_frame(R_SECOND, ptr);
-        load_reg_from_frame(R_ACC, idx);
-        emit_index_addr(type_size(elem));
-        store_reg_to_frame(R_ACC, ptr);
+        let ok = new_label(cx);
+        let fail = new_label(cx);
+        load_reg_from_frame(cx, R_SECOND, len);
+        emit_add_imm(cx, R_SECOND, 0 - lanes);
+        load_reg_from_frame(cx, R_ACC, idx);
+        emit_compare_jump(cx, Cond::Gt, true, fail);
+        emit_load_imm(cx, R_SECOND, 0);
+        emit_compare_jump(cx, Cond::Ge, true, ok);
+        emit_label(cx, fail);
+        load_reg_from_frame(cx, R_SECOND, idx);
+        emit_add_imm(cx, R_SECOND, lanes);
+        load_reg_from_frame(cx, R_ACC, idx);
+        emit_frame_addr(cx, R_ADDR, len);
+        emit_load_reg(cx, R_ADDR, R_ADDR);
+        emit_panic(cx, PANIC_RANGE_SIGNED, site_of(index, 0));
+        emit_label(cx, ok);
+        load_reg_from_frame(cx, R_SECOND, ptr);
+        load_reg_from_frame(cx, R_ACC, idx);
+        emit_index_addr(cx, type_size(elem));
+        store_reg_to_frame(cx, R_ACC, ptr);
         ptr
     }
 }
 
 // The address of lane `index` (an expression) of the vector in slot
 // `slot`, checked, in the accumulator.
-fn gen_lane_address(slot: i64, index: i64, vt: i64) {
-    let idx = gen_scalar_to_slot(index, TY_I64);
-    let ok = new_label();
-    load_reg_from_frame(R_ACC, idx);
-    emit_load_imm(R_SECOND, vec_lanes(vt) as u64);
-    emit_compare_jump(Cond::Lt, false, ok);
-    emit_panic(PANIC_INDEX_SIGNED, site_of(index, 0));
-    emit_label(ok);
-    emit_frame_addr(R_SECOND, slot);
-    load_reg_from_frame(R_ACC, idx);
-    emit_index_addr(lane_size(vt));
+fn gen_lane_address(mut cx: *FnCtx, slot: i64, index: i64, vt: i64) {
+    let idx = gen_scalar_to_slot(cx, index, TY_I64);
+    let ok = new_label(cx);
+    load_reg_from_frame(cx, R_ACC, idx);
+    emit_load_imm(cx, R_SECOND, vec_lanes(vt) as u64);
+    emit_compare_jump(cx, Cond::Lt, false, ok);
+    emit_panic(cx, PANIC_INDEX_SIGNED, site_of(index, 0));
+    emit_label(cx, ok);
+    emit_frame_addr(cx, R_SECOND, slot);
+    load_reg_from_frame(cx, R_ACC, idx);
+    emit_index_addr(cx, lane_size(vt));
 }
 
 // The float sum of lanes lo..hi of slot a (pairwise: the sum of the first
 // half plus the sum of the second), in the accumulator.
-fn gen_float_sum(a: i64, elem: i64, lo: i64, hi: i64) {
+fn gen_float_sum(mut cx: *FnCtx, a: i64, elem: i64, lo: i64, hi: i64) {
     if hi - lo == 1 {
-        load_lane(a, elem, lo);
+        load_lane(cx, a, elem, lo);
         return;
     }
     let mid = lo + (hi - lo) / 2;
-    gen_float_sum(a, elem, lo, mid);
-    push_value(elem);
-    gen_float_sum(a, elem, mid, hi);
-    pop_second_operand(elem);
-    emit_float_binary(Tok::Plus, elem);
+    gen_float_sum(cx, a, elem, lo, mid);
+    push_value(cx, elem);
+    gen_float_sum(cx, a, elem, mid, hi);
+    pop_second_operand(cx, elem);
+    emit_float_binary(cx, Tok::Plus, elem);
 }
 
-pub fn gen_vecop(n: i64) {
+pub fn gen_vecop(mut cx: *FnCtx, n: i64) {
     unsafe {
         let kind = NODES[n].x;
         let vt = NODES[n].y;
         let elem = vec_elem(vt);
         let lanes = vec_lanes(vt);
         if kind == VK_NEW {
-            gen_aggregate(n);
+            gen_aggregate(cx, n);
             return;
         }
         if kind == VK_SPLAT {
             let r = alloc_slot(16, 16);
-            gen_expr(child(n, 0));
+            gen_expr(cx, child(n, 0));
             for i in 0..lanes {
-                store_lane(r, elem, i);
+                store_lane(cx, r, elem, i);
             }
-            emit_frame_addr(R_ACC, r);
+            emit_frame_addr(cx, R_ACC, r);
             return;
         }
         if kind == VK_LOAD {
-            let ptr = gen_vector_address(child(n, 0), child(n, 1), lanes, elem);
+            let ptr = gen_vector_address(cx, child(n, 0), child(n, 1), lanes, elem);
             let r = alloc_slot(16, 16);
             for i in 0..lanes {
-                load_reg_from_frame(R_ACC, ptr);
-                emit_add_imm(R_ACC, i * type_size(elem));
-                emit_load(elem, R_ACC);
-                store_lane(r, elem, i);
+                load_reg_from_frame(cx, R_ACC, ptr);
+                emit_add_imm(cx, R_ACC, i * type_size(elem));
+                emit_load(cx, elem, R_ACC);
+                store_lane(cx, r, elem, i);
             }
-            emit_frame_addr(R_ACC, r);
+            emit_frame_addr(cx, R_ACC, r);
             return;
         }
-        let a = gen_vector_to_slot(NODES[n].a);
+        let a = gen_vector_to_slot(cx, NODES[n].a);
         if kind == VK_STORE {
-            let ptr = gen_vector_address(child(n, 0), child(n, 1), lanes, elem);
+            let ptr = gen_vector_address(cx, child(n, 0), child(n, 1), lanes, elem);
             for i in 0..lanes {
-                load_lane(a, elem, i);
-                load_reg_from_frame(R_ADDR, ptr);
-                emit_add_imm(R_ADDR, i * type_size(elem));
-                emit_store(elem, R_ACC, R_ADDR);
+                load_lane(cx, a, elem, i);
+                load_reg_from_frame(cx, R_ADDR, ptr);
+                emit_add_imm(cx, R_ADDR, i * type_size(elem));
+                emit_store(cx, elem, R_ACC, R_ADDR);
             }
             return;
         }
         if kind == VK_LANE {
-            gen_lane_address(a, child(n, 0), vt);
-            emit_load(elem, R_ACC);
+            gen_lane_address(cx, a, child(n, 0), vt);
+            emit_load(cx, elem, R_ACC);
             return;
         }
         if kind == VK_WITH {
             let addr = alloc_slot(8, 8);
-            gen_lane_address(a, child(n, 0), vt);
-            store_reg_to_frame(R_ACC, addr);
-            let x = gen_scalar_to_slot(child(n, 1), elem);
-            load_frame_scalar(elem, x);
-            load_reg_from_frame(R_SECOND, addr);
-            emit_store(elem, R_ACC, R_SECOND);
-            emit_frame_addr(R_ACC, a);
+            gen_lane_address(cx, a, child(n, 0), vt);
+            store_reg_to_frame(cx, R_ACC, addr);
+            let x = gen_scalar_to_slot(cx, child(n, 1), elem);
+            load_frame_scalar(cx, elem, x);
+            load_reg_from_frame(cx, R_SECOND, addr);
+            emit_store(cx, elem, R_ACC, R_SECOND);
+            emit_frame_addr(cx, R_ACC, a);
             return;
         }
         if kind == VK_SUM {
             if is_float(elem) {
-                gen_float_sum(a, elem, 0, lanes);
+                gen_float_sum(cx, a, elem, 0, lanes);
                 return;
             }
-            load_lane(a, elem, 0);
+            load_lane(cx, a, elem, 0);
             for i in 1..lanes {
-                push_value(elem);
-                load_lane(a, elem, i);
-                pop_second_operand(elem);
-                emit_int_binary(Tok::Plus, elem);
+                push_value(cx, elem);
+                load_lane(cx, a, elem, i);
+                pop_second_operand(cx, elem);
+                emit_int_binary(cx, Tok::Plus, elem);
             }
             return;
         }
         // VK_SELECT: mask a; (x & a) | (y & ~a), on the lanes' bits.
-        let x = gen_vector_to_slot(child(n, 0));
-        let y = gen_vector_to_slot(child(n, 1));
+        let x = gen_vector_to_slot(cx, child(n, 0));
+        let y = gen_vector_to_slot(cx, child(n, 1));
         let it = vec_elem(vt);
         let t = alloc_slot(8, 8);
         for i in 0..lanes {
-            load_lane(a, it, i);
-            emit_bitnot(it);
-            push_value(it);
-            load_lane(y, it, i);
-            pop_second_operand(it);
-            emit_int_binary(Tok::Amp, it);
-            store_to_frame(it, t);
-            load_lane(x, it, i);
-            push_value(it);
-            load_lane(a, it, i);
-            pop_second_operand(it);
-            emit_int_binary(Tok::Amp, it);
-            push_value(it);
-            load_frame_scalar(it, t);
-            pop_second_operand(it);
-            emit_int_binary(Tok::Pipe, it);
-            store_lane(x, it, i);
+            load_lane(cx, a, it, i);
+            emit_bitnot(cx, it);
+            push_value(cx, it);
+            load_lane(cx, y, it, i);
+            pop_second_operand(cx, it);
+            emit_int_binary(cx, Tok::Amp, it);
+            store_to_frame(cx, it, t);
+            load_lane(cx, x, it, i);
+            push_value(cx, it);
+            load_lane(cx, a, it, i);
+            pop_second_operand(cx, it);
+            emit_int_binary(cx, Tok::Amp, it);
+            push_value(cx, it);
+            load_frame_scalar(cx, it, t);
+            pop_second_operand(cx, it);
+            emit_int_binary(cx, Tok::Pipe, it);
+            store_lane(cx, x, it, i);
         }
-        emit_frame_addr(R_ACC, x);
+        emit_frame_addr(cx, R_ACC, x);
     }
 }

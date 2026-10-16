@@ -38,11 +38,10 @@ use crate::front::types::{
     TY_BOOL, TY_I16, TY_I32, TY_I64, TY_I8, TY_U16, TY_U32, TY_U64, TY_U8, is_integer,
 };
 use crate::gen0::target::log2;
+use crate::middle::ctx::FnCtx;
 use crate::middle::fold::{fold_compare, fold_value};
 use crate::middle::gvn::{gvn_find_or_add, is_commutative_op, operands_out_of_order};
-use crate::middle::ir::{
-    Cond, INSTS, INST_COUNT, IR_CUR, Op, ir_insert_before, ir_make, ir_replace, ir_scratch,
-};
+use crate::middle::ir::{Cond, Op, ir_insert_before, ir_make, ir_replace, ir_scratch};
 use crate::middle::ir::Op::{Add, And, BNot, Cmp, Const, Mul, Neg, Or, Shl, Sub, Xor};
 
 // ---- The rules ----
@@ -270,7 +269,7 @@ static mut R_VARS_NOW: i64 = 0;
 static mut R_BY_OP: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 static mut R_BY_OP_START: [i64; 65] = [0; 65];
 
-fn init_rules() {
+pub fn init_rules() {
     unsafe {
         if RULES_READY {
             return;
@@ -334,57 +333,52 @@ fn init_rules() {
 // its members (a run in ALTS; none recorded: the value alone) and the
 // best cost found for it.
 
-static mut EC_STAMP: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static mut EC_START: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static mut EC_LEN: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static mut EC_COST: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static mut ALTS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static mut RUN: i64 = 0;
-
 // Whether the e-graph runs (-O1 and up; `--no-egraph` turns it off, to
 // compare).
 pub static mut EGRAPH: bool = true;
 
-pub fn egraph_start() {
-    init_rules();
-    RUN += 1;
-    ALTS.count = 0;
+pub fn egraph_start(mut cx: *FnCtx) {
+    unsafe {
+        init_rules();
+        cx.run += 1;
+        cx.alts.count = 0;
+    }
 }
 
-fn ec_touch(v: i64) {
+fn ec_touch(mut cx: *FnCtx, v: i64) {
     unsafe {
-        while EC_STAMP.count <= v {
-            EC_STAMP.push(0);
-            EC_START.push(0);
-            EC_LEN.push(0);
-            EC_COST.push(0);
+        while cx.ec_stamp.count <= v {
+            cx.ec_stamp.push(0);
+            cx.ec_start.push(0);
+            cx.ec_len.push(0);
+            cx.ec_cost.push(0);
         }
-        if EC_STAMP.data[v] != RUN {
-            EC_STAMP.data[v] = RUN;
-            EC_START.data[v] = 0;
-            EC_LEN.data[v] = 0;
-            EC_COST.data[v] = 0;
+        if cx.ec_stamp.data[v] != cx.run {
+            cx.ec_stamp.data[v] = cx.run;
+            cx.ec_start.data[v] = 0;
+            cx.ec_len.data[v] = 0;
+            cx.ec_cost.data[v] = 0;
         }
     }
 }
 
-fn member_count(v: i64) -> i64 {
+fn member_count(mut cx: *FnCtx, v: i64) -> i64 {
     unsafe {
-        ec_touch(v);
-        if EC_LEN.data[v] == 0 { 1 } else { EC_LEN.data[v] }
+        ec_touch(cx, v);
+        if cx.ec_len.data[v] == 0 { 1 } else { cx.ec_len.data[v] }
     }
 }
 
-fn member(v: i64, i: i64) -> i64 {
+fn member(mut cx: *FnCtx, v: i64, i: i64) -> i64 {
     unsafe {
-        if EC_LEN.data[v] == 0 { v } else { ALTS.data[EC_START.data[v] + i] }
+        if cx.ec_len.data[v] == 0 { v } else { cx.alts.data[cx.ec_start.data[v] + i] }
     }
 }
 
-fn is_member(v: i64, w: i64) -> bool {
-    let n = member_count(v);
+fn is_member(mut cx: *FnCtx, v: i64, w: i64) -> bool {
+    let n = member_count(cx, v);
     for i in 0..n {
-        if member(v, i) == w {
+        if member(cx, v, i) == w {
             return true;
         }
     }
@@ -392,8 +386,8 @@ fn is_member(v: i64, w: i64) -> bool {
 }
 
 // Whether v and w are known equal.
-fn same_value(v: i64, w: i64) -> bool {
-    v == w || is_member(v, w) || is_member(w, v)
+fn same_value(mut cx: *FnCtx, v: i64, w: i64) -> bool {
+    v == w || is_member(cx, v, w) || is_member(cx, w, v)
 }
 
 fn op_cost(op: Op) -> i64 {
@@ -406,18 +400,18 @@ fn op_cost(op: Op) -> i64 {
 }
 
 // The cost of node m: its operation's, with its operands' best.
-fn node_cost(m: i64) -> i64 {
+fn node_cost(mut cx: *FnCtx, m: i64) -> i64 {
     unsafe {
-        let mut cost = op_cost(INSTS[m].op);
-        let a = INSTS[m].a;
-        let b = INSTS[m].b;
+        let mut cost = op_cost(cx.insts[m].op);
+        let a = cx.insts[m].a;
+        let b = cx.insts[m].b;
         if a != 0 {
-            ec_touch(a);
-            cost += EC_COST.data[a];
+            ec_touch(cx, a);
+            cost += cx.ec_cost.data[a];
         }
         if b != 0 {
-            ec_touch(b);
-            cost += EC_COST.data[b];
+            ec_touch(cx, b);
+            cost += cx.ec_cost.data[b];
         }
         cost
     }
@@ -425,24 +419,23 @@ fn node_cost(m: i64) -> i64 {
 
 // ---- Matching ----
 
-// Variable bindings of the rule being matched, and the trail of bound
-// variables (to undo a failed branch).
-static mut BIND: [i64; 8] = [0; 8];
-static mut TRAIL: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-fn undo_to(mark: i64) {
-    while TRAIL.count > mark {
-        BIND[TRAIL.pop()] = 0;
+fn undo_to(mut cx: *FnCtx, mark: i64) {
+    unsafe {
+        while cx.trail.count > mark {
+            cx.bind[cx.trail.pop()] = 0;
+        }
     }
 }
 
-fn bind(var: i64, v: i64) -> bool {
-    if BIND[var] == 0 {
-        BIND[var] = v;
-        TRAIL.push(var);
-        return true;
+fn bind(mut cx: *FnCtx, var: i64, v: i64) -> bool {
+    unsafe {
+        if cx.bind[var] == 0 {
+            cx.bind[var] = v;
+            cx.trail.push(var);
+            return true;
+        }
+        same_value(cx, cx.bind[var], v)
     }
-    same_value(BIND[var], v)
 }
 
 fn is_commutative_pattern(p: i64) -> bool {
@@ -453,47 +446,47 @@ fn is_commutative_pattern(p: i64) -> bool {
 
 // Whether pattern p matches value v (of integer type ty): a member of
 // v's class, for an operation.
-fn pmatch(p: i64, v: i64, ty: i64) -> bool {
+fn pmatch(mut cx: *FnCtx, p: i64, v: i64, ty: i64) -> bool {
     unsafe {
         let kind = P_KIND.data[p];
         if kind == K_VAR {
-            return bind(P_VAL.data[p], v);
+            return bind(cx, P_VAL.data[p], v);
         }
         if kind == K_CVAR || kind == K_LIT {
-            let c = const_member(v);
+            let c = const_member(cx, v);
             if c == 0 {
                 return false;
             }
             if kind == K_LIT {
-                return INSTS[c].imm == wrap_int(P_VAL.data[p], ty);
+                return cx.insts[c].imm == wrap_int(P_VAL.data[p], ty);
             }
-            return bind(P_VAL.data[p], c);
+            return bind(cx, P_VAL.data[p], c);
         }
         let op = P_OP.data[p];
         let is_cmp = op == Cmp as i64;
-        let n = member_count(v);
+        let n = member_count(cx, v);
         for k in 0..n {
-            let m = member(v, k);
-            let mop = INSTS[m].op;
+            let m = member(cx, v, k);
+            let mop = cx.insts[m].op;
             if mop as i64 == op && (if is_cmp {
-                INSTS[m].cond as i64 == P_COND.data[p] && INSTS[m].ty == TY_BOOL
+                cx.insts[m].cond as i64 == P_COND.data[p] && cx.insts[m].ty == TY_BOOL
             } else {
-                INSTS[m].ty == ty
+                cx.insts[m].ty == ty
             }) {
-                let child_ty = if is_cmp { INSTS[m].imm2 } else { ty };
+                let child_ty = if is_cmp { cx.insts[m].imm2 } else { ty };
                 if is_integer(child_ty) {
-                    let mark = TRAIL.count;
-                    if pmatch(P_A.data[p], INSTS[m].a, child_ty)
-                        && (P_B.data[p] < 0 || pmatch(P_B.data[p], INSTS[m].b, child_ty)) {
+                    let mark = cx.trail.count;
+                    if pmatch(cx, P_A.data[p], cx.insts[m].a, child_ty)
+                        && (P_B.data[p] < 0 || pmatch(cx, P_B.data[p], cx.insts[m].b, child_ty)) {
                         return true;
                     }
-                    undo_to(mark);
+                    undo_to(cx, mark);
                     if P_B.data[p] >= 0 && is_commutative_pattern(p) {
-                        if pmatch(P_A.data[p], INSTS[m].b, child_ty)
-                            && pmatch(P_B.data[p], INSTS[m].a, child_ty) {
+                        if pmatch(cx, P_A.data[p], cx.insts[m].b, child_ty)
+                            && pmatch(cx, P_B.data[p], cx.insts[m].a, child_ty) {
                             return true;
                         }
-                        undo_to(mark);
+                        undo_to(cx, mark);
                     }
                 }
             }
@@ -503,11 +496,11 @@ fn pmatch(p: i64, v: i64, ty: i64) -> bool {
 }
 
 // A constant member of v's class, or 0.
-fn const_member(v: i64) -> i64 {
-    let n = member_count(v);
+fn const_member(mut cx: *FnCtx, v: i64) -> i64 {
+    let n = member_count(cx, v);
     for k in 0..n {
-        let m = member(v, k);
-        if unsafe { INSTS[m].op == Const } {
+        let m = member(cx, v, k);
+        if unsafe { cx.insts[m].op == Const } {
             return m;
         }
     }
@@ -516,34 +509,22 @@ fn const_member(v: i64) -> i64 {
 
 // ---- Building right-hand sides ----
 
-// The scratch instruction folding evaluates constants with.
-static mut SCRATCH_INST: i64 = 0;
-
-static mut SCRATCH_FN: i64 = -1;
-
 // (0.17) The constant `x <op> y`, folded through a scratch instruction:
-// the first one the program needs is made (as it was when instruction
-// ids were the program's: one, kept), the other functions' is the free
-// entry after their last instruction, which ids local to a function make
-// necessary (the program's one would be another function's instruction).
-fn fold2(op: Op, ty: i64, x: i64, y: i64) -> i64 {
-    if SCRATCH_INST == 0 {
-        SCRATCH_INST = ir_make(op, ty, 0, 0, 0);
-        unsafe { SCRATCH_FN = IR_CUR; }
-    }
-    let mut scratch = SCRATCH_INST;
+// the free entry after the function's last instruction (ir_scratch).
+// (0.18.1: always; 0.17 made the program's first one an instruction of
+// the function that needed it first, which made that function's ids
+// depend on the order the functions were optimized in.)
+fn fold2(mut cx: *FnCtx, op: Op, ty: i64, x: i64, y: i64) -> i64 {
     unsafe {
-        if SCRATCH_FN != IR_CUR || SCRATCH_INST >= INST_COUNT {
-            scratch = ir_scratch(op, ty);
-        }
-        INSTS[scratch].op = op;
-        INSTS[scratch].ty = ty;
+        let scratch = ir_scratch(cx, op, ty);
+        cx.insts[scratch].op = op;
+        cx.insts[scratch].ty = ty;
+        fold_value(cx, scratch, x, y)
     }
-    fold_value(scratch, x, y)
 }
 
 // The value of constant expression p (of type ty), with BIND's constants.
-fn const_value_of(p: i64, ty: i64, consts: *i64) -> i64 {
+fn const_value_of(mut cx: *FnCtx, p: i64, ty: i64, consts: *i64) -> i64 {
     unsafe {
         let kind = P_KIND.data[p];
         if kind == K_LIT {
@@ -552,68 +533,66 @@ fn const_value_of(p: i64, ty: i64, consts: *i64) -> i64 {
         if kind == K_CVAR {
             return consts[P_VAL.data[p]];
         }
-        let x = const_value_of(P_A.data[p], ty, consts);
+        let x = const_value_of(cx, P_A.data[p], ty, consts);
         let op = P_OP.data[p];
         if op == C_NEG {
-            return fold2(Neg, ty, x, 0);
+            return fold2(cx, Neg, ty, x, 0);
         }
         if op == C_LOG2 {
             return log2(x);
         }
-        let y = const_value_of(P_B.data[p], ty, consts);
+        let y = const_value_of(cx, P_B.data[p], ty, consts);
         let fop = if op == C_ADD { Add } else if op == C_SUB { Sub } else if op == C_MUL { Mul }
             else if op == C_AND { And } else if op == C_OR { Or } else { Xor };
-        fold2(fop, ty, x, y)
+        fold2(cx, fop, ty, x, y)
     }
 }
 
-static mut CONSTS: [i64; 8] = [0; 8];
-
 // A node (op, ty, a, b) before instruction `at`: an equal one the table
 // knows, or a new one.
-fn make_node(at: i64, op: Op, cond: i64, ty: i64, operand_ty: i64, a: i64, b: i64, imm: i64) -> i64 {
+fn make_node(mut cx: *FnCtx, at: i64, op: Op, cond: i64, ty: i64, operand_ty: i64, a: i64, b: i64,
+    imm: i64) -> i64 {
     unsafe {
-        let n = ir_make(op, ty, a, b, imm);
+        let n = ir_make(cx, op, ty, a, b, imm);
         if op == Cmp {
-            INSTS[n].cond = if cond == Cond::Ne as i64 { Cond::Ne } else { Cond::Eq };
-            INSTS[n].imm2 = operand_ty;
+            cx.insts[n].cond = if cond == Cond::Ne as i64 { Cond::Ne } else { Cond::Eq };
+            cx.insts[n].imm2 = operand_ty;
         }
-        if b != 0 && is_commutative_op(n) && operands_out_of_order(a, b) {
-            INSTS[n].a = b;
-            INSTS[n].b = a;
+        if b != 0 && is_commutative_op(cx, n) && operands_out_of_order(cx, a, b) {
+            cx.insts[n].a = b;
+            cx.insts[n].b = a;
         }
-        ir_insert_before(at, n);
-        let w = gvn_find_or_add(n);
+        ir_insert_before(cx, at, n);
+        let w = gvn_find_or_add(cx, n);
         if w != 0 {
-            ir_replace(n, w);
+            ir_replace(cx, n, w);
             return w;
         }
-        ec_touch(n);
-        EC_COST.data[n] = node_cost(n);
+        ec_touch(cx, n);
+        cx.ec_cost.data[n] = node_cost(cx, n);
         n
     }
 }
 
-fn build(at: i64, p: i64, ty: i64) -> i64 {
+fn build(mut cx: *FnCtx, at: i64, p: i64, ty: i64) -> i64 {
     unsafe {
         let kind = P_KIND.data[p];
         if kind == K_VAR || kind == K_CVAR {
-            return BIND[P_VAL.data[p]];
+            return cx.bind[P_VAL.data[p]];
         }
         if kind == K_LIT || kind == K_CEXPR {
-            return make_node(at, Const, 0, ty, 0, 0, 0, const_value_of(p, ty, &CONSTS as *i64));
+            return make_node(cx, at, Const, 0, ty, 0, 0, 0,
+                const_value_of(cx, p, ty, &cx.consts as *i64));
         }
         let op = P_OP.data[p];
         let is_cmp = op == Cmp as i64;
-        let child_ty = if is_cmp { BUILD_CMP_TY } else { ty };
-        let a = build(at, P_A.data[p], child_ty);
-        let b = if P_B.data[p] >= 0 { build(at, P_B.data[p], child_ty) } else { 0 };
+        let child_ty = if is_cmp { cx.build_cmp_ty } else { ty };
+        let a = build(cx, at, P_A.data[p], child_ty);
+        let b = if P_B.data[p] >= 0 { build(cx, at, P_B.data[p], child_ty) } else { 0 };
         let iop = op_of(op);
-        make_node(at, iop, P_COND.data[p], if is_cmp { TY_BOOL } else { ty }, child_ty, a, b, 0)
+        make_node(cx, at, iop, P_COND.data[p], if is_cmp { TY_BOOL } else { ty }, child_ty, a, b, 0)
     }
 }
-
-static mut BUILD_CMP_TY: i64 = 0;
 
 fn op_of(op: i64) -> Op {
     if op == Add as i64 { return Add; }
@@ -634,20 +613,20 @@ fn is_pow2(x: i64) -> bool {
 
 // The rules on instruction v (new to GVN's table, its operands resolved):
 // returns the value standing for it (v itself, or a cheaper equal one).
-pub fn egraph_rewrite(v: i64) -> i64 {
+pub fn egraph_rewrite(mut cx: *FnCtx, v: i64) -> i64 {
     unsafe {
-        let op = INSTS[v].op;
+        let op = cx.insts[v].op;
         let is_cmp = op == Cmp;
-        let ty = INSTS[v].ty;
-        let operand_ty = if is_cmp { INSTS[v].imm2 } else { ty };
-        ec_touch(v);
-        EC_COST.data[v] = node_cost(v);
+        let ty = cx.insts[v].ty;
+        let operand_ty = if is_cmp { cx.insts[v].imm2 } else { ty };
+        ec_touch(cx, v);
+        cx.ec_cost.data[v] = node_cost(cx, v);
         if !is_integer(operand_ty)
-            || (is_cmp && INSTS[v].cond != Cond::Eq && INSTS[v].cond != Cond::Ne) {
+            || (is_cmp && cx.insts[v].cond != Cond::Eq && cx.insts[v].cond != Cond::Ne) {
             return v;
         }
-        FOUND.count = 0;
-        FOUND.push(v);
+        cx.found.count = 0;
+        cx.found.push(v);
         let o = op as i64;
         if o >= 64 {
             return v;
@@ -656,66 +635,65 @@ pub fn egraph_rewrite(v: i64) -> i64 {
             let r = R_BY_OP.data[ri];
             let lhs = R_LHS.data[r];
             for i in 0..8 {
-                BIND[i] = 0;
+                cx.bind[i] = 0;
             }
-            TRAIL.count = 0;
-            if !pmatch(lhs, v, ty) {
+            cx.trail.count = 0;
+            if !pmatch(cx, lhs, v, ty) {
                 continue;
             }
             // The constants bound, as values of their type.
             for i in 0..R_VARS.data[r] {
-                CONSTS[i] = if BIND[i] != 0 && INSTS[BIND[i]].op == Const { INSTS[BIND[i]].imm }
+                cx.consts[i] = if cx.bind[i] != 0
+                    && cx.insts[cx.bind[i]].op == Const { cx.insts[cx.bind[i]].imm }
                     else { 0 };
             }
             let guard = R_GUARD.data[r];
-            if guard >= 0 && !is_pow2(CONSTS[guard]) {
+            if guard >= 0 && !is_pow2(cx.consts[guard]) {
                 continue;
             }
-            BUILD_CMP_TY = operand_ty;
-            let w = build(v, R_RHS.data[r], ty);
-            if INSTS[w].ty != ty {
+            cx.build_cmp_ty = operand_ty;
+            let w = build(cx, v, R_RHS.data[r], ty);
+            if cx.insts[w].ty != ty {
                 continue;
             }
             // w and its members join v's class.
-            let n = member_count(w);
+            let n = member_count(cx, w);
             for k in 0..n {
-                let m = member(w, k);
+                let m = member(cx, w, k);
                 let mut known = false;
-                for j in 0..FOUND.count {
-                    if FOUND.data[j] == m {
+                for j in 0..cx.found.count {
+                    if cx.found.data[j] == m {
                         known = true;
                     }
                 }
                 if !known {
-                    FOUND.push(m);
+                    cx.found.push(m);
                 }
             }
         }
-        if FOUND.count == 1 {
+        if cx.found.count == 1 {
             return v;
         }
-        EC_START.data[v] = ALTS.count;
-        EC_LEN.data[v] = FOUND.count;
-        for j in 0..FOUND.count {
-            ALTS.push(FOUND.data[j]);
+        cx.ec_start.data[v] = cx.alts.count;
+        cx.ec_len.data[v] = cx.found.count;
+        for j in 0..cx.found.count {
+            cx.alts.push(cx.found.data[j]);
         }
         // Extraction: the cheapest member (v on a tie).
         let mut best = v;
-        let mut best_cost = EC_COST.data[v];
-        for j in 1..FOUND.count {
-            let m = FOUND.data[j];
-            ec_touch(m);
-            if EC_COST.data[m] < best_cost {
+        let mut best_cost = cx.ec_cost.data[v];
+        for j in 1..cx.found.count {
+            let m = cx.found.data[j];
+            ec_touch(cx, m);
+            if cx.ec_cost.data[m] < best_cost {
                 best = m;
-                best_cost = EC_COST.data[m];
+                best_cost = cx.ec_cost.data[m];
             }
         }
-        EC_COST.data[v] = best_cost;
+        cx.ec_cost.data[v] = best_cost;
         best
     }
 }
-
-static mut FOUND: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
 // ---- Checking the rules (tachyonc --check-rules) ----
 
@@ -753,31 +731,31 @@ static mut EVAL_VARS: [i64; 8] = [0; 8];
 
 // Pattern p evaluated with EVAL_VARS (integers of type ty; comparisons as
 // 0 or 1).
-fn eval_pattern(p: i64, ty: i64, cmp_ty: i64) -> i64 {
+fn eval_pattern(mut cx: *FnCtx, p: i64, ty: i64, cmp_ty: i64) -> i64 {
     unsafe {
         let kind = P_KIND.data[p];
         if kind == K_VAR || kind == K_CVAR {
             return EVAL_VARS[P_VAL.data[p]];
         }
         if kind == K_LIT || kind == K_CEXPR {
-            return const_value_of(p, ty, &EVAL_VARS as *i64);
+            return const_value_of(cx, p, ty, &EVAL_VARS as *i64);
         }
         let op = P_OP.data[p];
         if op == Cmp as i64 {
-            let x = eval_pattern(P_A.data[p], cmp_ty, cmp_ty);
-            let y = eval_pattern(P_B.data[p], cmp_ty, cmp_ty);
+            let x = eval_pattern(cx, P_A.data[p], cmp_ty, cmp_ty);
+            let y = eval_pattern(cx, P_B.data[p], cmp_ty, cmp_ty);
             let cond = if P_COND.data[p] == Cond::Ne as i64 { Cond::Ne } else { Cond::Eq };
             return fold_compare(cond, cmp_ty, x, y) as i64;
         }
-        let x = eval_pattern(P_A.data[p], ty, cmp_ty);
-        let y = if P_B.data[p] >= 0 { eval_pattern(P_B.data[p], ty, cmp_ty) } else { 0 };
-        fold2(op_of(op), ty, x, y)
+        let x = eval_pattern(cx, P_A.data[p], ty, cmp_ty);
+        let y = if P_B.data[p] >= 0 { eval_pattern(cx, P_B.data[p], ty, cmp_ty) } else { 0 };
+        fold2(cx, op_of(op), ty, x, y)
     }
 }
 
 // Checks every rule on random values at every integer width; prints a
 // line per failure and a summary; returns the number of failures.
-pub fn check_rules(trials: i64) -> i64 {
+pub fn check_rules(mut cx: *FnCtx, trials: i64) -> i64 {
     unsafe {
         init_rules();
         let types: [i64; 8] = [TY_I8, TY_I16, TY_I32, TY_I64, TY_U8, TY_U16, TY_U32, TY_U64];
@@ -803,8 +781,8 @@ pub fn check_rules(trials: i64) -> i64 {
                         }
                     }
                     checked += 1;
-                    let left = eval_pattern(lhs, value_ty, ty);
-                    let right = eval_pattern(R_RHS.data[r], value_ty, ty);
+                    let left = eval_pattern(cx, lhs, value_ty, ty);
+                    let right = eval_pattern(cx, R_RHS.data[r], value_ty, ty);
                     if left != right && !failed {
                         failed = true;
                         failures += 1;

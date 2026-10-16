@@ -9,77 +9,66 @@
 // leaves; the leaves of the variants of an enum may coincide but not
 // overlap otherwise. Bytes outside the leaves (padding) are not kept.
 
-use crate::back::abi::{ABI_LEAVES, LEAVES_WHOLE_VECTORS, abi_leaves};
-use crate::back::regalloc::ORDER;
-use crate::back::regalloc::prepare::{layout_blocks, layout_order};
-use crate::base::{BUFS, IntVec, alloc_array, buf_clear, buf_new, buf_reserve, free, memset};
+use crate::back::abi::abi_leaves;
+use crate::back::regalloc::prepare::layout_order;
+use crate::base::{BUFS, IntVec, alloc_array, buf_clear, buf_reserve, free, memset};
 use crate::front::consteval::{bits_of, wrap_int, write_scalar};
-use crate::front::lexer::str_at;
 use crate::front::types::{
     TY_BOOL, TY_F32, TY_F64, TY_U64, int_bits, is_integer, is_void, type_size,
 };
-use crate::gen0::target::add_const_data;
+use crate::middle::ctx::FnCtx;
 use crate::middle::fold::{is_const, op_before};
 use crate::middle::gvn::{
     address_base, copy_dst, copy_src, find_escaping_slots, is_copy, is_private_root, root_of,
 };
 use crate::middle::ir::{
-    BLOCKS, INSTS, IRFUNCS, SLOTS, SLOT_COUNT, ir_enter, ir_insert_before, ir_make, ir_operand,
-    ir_operand_count, ir_prepend, ir_replace, ir_type, ir_unlink, ir_val,
+    IRFUNCS, ir_enter, ir_insert_before, ir_make, ir_operand, ir_operand_count, ir_prepend,
+    ir_replace, ir_type, ir_unlink, ir_val,
 };
 use crate::middle::ir::Op::{Add, Const, Conv, Copy, Load, SAddr, Slot, Store};
 use crate::middle::ir::cfg::{succ, succ_count};
-use crate::middle::lower::ssa::{DEFS, ir_seal, new_synth_var, ssa_read, ssa_write};
+use crate::middle::lower::ssa::{ir_seal, new_synth_var, ssa_read, ssa_write};
 use crate::middle::opt::{compute_dominators, dominates, remove_trivial_phis, resolve_all};
+use crate::middle::parallel::{const_data, const_data_bytes};
 
 const SROA_MAX_LEAVES: i64 = 32;
 
 const SROA_ROUNDS: i64 = 4;
 
-// Per slot: 1 while a candidate; its leaves are (offset, IR type) pairs at
-// SR_LEAVES[SR_FIRST[s]..] (SR_COUNT[s] of them, by offset), and their
-// variables start at SR_VAR[s].
-static mut SR_STATE: *i64 = 0 as *i64;
-static mut SR_FIRST: *i64 = 0 as *i64;
-static mut SR_COUNT: *i64 = 0 as *i64;
-static mut SR_VAR: *i64 = 0 as *i64;
-static mut SR_LEAVES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static mut SR_VALUES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-fn leaf_offset(s: i64, i: i64) -> i64 {
-    unsafe { SR_LEAVES.data[2 * (SR_FIRST[s] + i)] }
+fn leaf_offset(mut cx: *FnCtx, s: i64, i: i64) -> i64 {
+    unsafe { cx.sr_leaves.data[2 * (cx.sr_first[s] + i)] }
 }
 
-fn leaf_type(s: i64, i: i64) -> i64 {
-    unsafe { SR_LEAVES.data[2 * (SR_FIRST[s] + i) + 1] }
+fn leaf_type(mut cx: *FnCtx, s: i64, i: i64) -> i64 {
+    unsafe { cx.sr_leaves.data[2 * (cx.sr_first[s] + i) + 1] }
 }
 
 // The leaves of slot s from its type; false when they cannot be variables.
-fn slot_leaves(s: i64) -> bool {
+fn slot_leaves(mut cx: *FnCtx, s: i64) -> bool {
     unsafe {
-        let ty = SLOTS[s].ty;
+        let ty = cx.slots[s].ty;
         if ty == 0 || is_void(ty) {
             return false;
         }
-        ABI_LEAVES.count = 0;
-        LEAVES_WHOLE_VECTORS = true;
-        abi_leaves(ty, 0);
-        LEAVES_WHOLE_VECTORS = false;
-        let n = ABI_LEAVES.count / 2;
+        cx.abi_leaves.count = 0;
+        cx.leaves_whole_vectors = true;
+        abi_leaves(cx, ty, 0);
+        cx.leaves_whole_vectors = false;
+        let n = cx.abi_leaves.count / 2;
         if n == 0 || n > SROA_MAX_LEAVES * 4 {
             return false;
         }
-        SR_FIRST[s] = SR_LEAVES.count / 2;
+        cx.sr_first[s] = cx.sr_leaves.count / 2;
         let mut count = 0;
         for i in 0..n {
-            let offset = ABI_LEAVES.data[2 * i];
-            let leaf = ir_type(ABI_LEAVES.data[2 * i + 1]);
+            let offset = cx.abi_leaves.data[2 * i];
+            let leaf = ir_type(cx.abi_leaves.data[2 * i + 1]);
             // Inserted by offset; a repeated (offset, type) once.
             let mut at = count;
             let mut repeat = false;
             for k in 0..count {
-                let o = SR_LEAVES.data[2 * (SR_FIRST[s] + k)];
-                let t = SR_LEAVES.data[2 * (SR_FIRST[s] + k) + 1];
+                let o = cx.sr_leaves.data[2 * (cx.sr_first[s] + k)];
+                let t = cx.sr_leaves.data[2 * (cx.sr_first[s] + k) + 1];
                 if o == offset && t == leaf {
                     repeat = true;
                 }
@@ -90,26 +79,28 @@ fn slot_leaves(s: i64) -> bool {
             if repeat {
                 continue;
             }
-            SR_LEAVES.push(0);
-            SR_LEAVES.push(0);
+            cx.sr_leaves.push(0);
+            cx.sr_leaves.push(0);
             let mut k = count;
             while k > at {
-                SR_LEAVES.data[2 * (SR_FIRST[s] + k)] = SR_LEAVES.data[2 * (SR_FIRST[s] + k - 1)];
-                SR_LEAVES.data[2 * (SR_FIRST[s] + k) + 1] = SR_LEAVES.data[
-                    2 * (SR_FIRST[s] + k - 1) + 1];
+                cx.sr_leaves.data[2 * (cx.sr_first[s] + k)] = cx.sr_leaves.data[
+                    2 * (cx.sr_first[s] + k - 1)];
+                cx.sr_leaves.data[2 * (cx.sr_first[s] + k) + 1] = cx.sr_leaves.data[
+                    2 * (cx.sr_first[s] + k - 1) + 1];
                 k -= 1;
             }
-            SR_LEAVES.data[2 * (SR_FIRST[s] + at)] = offset;
-            SR_LEAVES.data[2 * (SR_FIRST[s] + at) + 1] = leaf;
+            cx.sr_leaves.data[2 * (cx.sr_first[s] + at)] = offset;
+            cx.sr_leaves.data[2 * (cx.sr_first[s] + at) + 1] = leaf;
             count += 1;
         }
-        SR_COUNT[s] = count;
+        cx.sr_count[s] = count;
         if count > SROA_MAX_LEAVES {
             return false;
         }
         // No two leaves overlap.
         for i in 1..count {
-            if leaf_offset(s, i - 1) + type_size(leaf_type(s, i - 1)) > leaf_offset(s, i) {
+            if leaf_offset(cx, s, i - 1) + type_size(leaf_type(cx, s, i - 1))
+                > leaf_offset(cx, s, i) {
                 return false;
             }
         }
@@ -118,10 +109,10 @@ fn slot_leaves(s: i64) -> bool {
 }
 
 // The leaf of slot s at `offset` of IR type `ty`, or -1.
-fn find_leaf(s: i64, offset: i64, ty: i64) -> i64 {
+fn find_leaf(mut cx: *FnCtx, s: i64, offset: i64, ty: i64) -> i64 {
     unsafe {
-        for i in 0..SR_COUNT[s] {
-            if leaf_offset(s, i) == offset && leaf_type(s, i) == ty {
+        for i in 0..cx.sr_count[s] {
+            if leaf_offset(cx, s, i) == offset && leaf_type(cx, s, i) == ty {
                 return i;
             }
         }
@@ -132,11 +123,11 @@ fn find_leaf(s: i64, offset: i64, ty: i64) -> i64 {
 // The same for a load or a store: a 64-bit integer leaf also takes the
 // other 64-bit integer type (i64 and u64 have the same canonical bits; a
 // slice's length is an i64 leaf that a parameter's piece fills as u64).
-fn find_access_leaf(s: i64, offset: i64, ty: i64) -> i64 {
+fn find_access_leaf(mut cx: *FnCtx, s: i64, offset: i64, ty: i64) -> i64 {
     unsafe {
-        for i in 0..SR_COUNT[s] {
-            let lt = leaf_type(s, i);
-            if leaf_offset(s, i) == offset
+        for i in 0..cx.sr_count[s] {
+            let lt = leaf_type(cx, s, i);
+            if leaf_offset(cx, s, i) == offset
                 && (lt == ty
                     || (is_integer(lt) && is_integer(ty) && int_bits(lt) == 64
                         && int_bits(ty) == 64)) {
@@ -149,23 +140,23 @@ fn find_access_leaf(s: i64, offset: i64, ty: i64) -> i64 {
 
 // v as type ty: v, or a conversion before instruction `at` between 64-bit
 // integer types (which changes no bits).
-fn as_leaf_type(v: i64, ty: i64, at: i64) -> i64 {
+fn as_leaf_type(mut cx: *FnCtx, v: i64, ty: i64, at: i64) -> i64 {
     unsafe {
-        if INSTS[v].ty == ty {
+        if cx.insts[v].ty == ty {
             return v;
         }
-        let c = op_before(at, Conv, ty, v, 0);
-        INSTS[c].imm2 = INSTS[v].ty;
+        let c = op_before(cx, at, Conv, ty, v, 0);
+        cx.insts[c].imm2 = cx.insts[v].ty;
         c
     }
 }
 
 // Whether [offset, + size) holds whole leaves of slot s only.
-fn whole_leaves(s: i64, offset: i64, size: i64) -> bool {
+fn whole_leaves(mut cx: *FnCtx, s: i64, offset: i64, size: i64) -> bool {
     unsafe {
-        for i in 0..SR_COUNT[s] {
-            let start = leaf_offset(s, i);
-            let end = start + type_size(leaf_type(s, i));
+        for i in 0..cx.sr_count[s] {
+            let start = leaf_offset(cx, s, i);
+            let end = start + type_size(leaf_type(cx, s, i));
             if start < offset + size && end > offset && (start < offset || end > offset + size) {
                 return false;
             }
@@ -175,33 +166,33 @@ fn whole_leaves(s: i64, offset: i64, size: i64) -> bool {
 }
 
 // The candidate slot of address `v` (and its offset), or 0.
-fn sroa_slot(v: i64, offset: *i64) -> i64 {
+fn sroa_slot(mut cx: *FnCtx, v: i64, offset: *i64) -> i64 {
     unsafe {
         *offset = 0;
-        let base = address_base(v, offset);
-        if INSTS[base].op != Slot || SR_STATE[INSTS[base].imm] == 0 {
+        let base = address_base(cx, v, offset);
+        if cx.insts[base].op != Slot || cx.sr_state[cx.insts[base].imm] == 0 {
             return 0;
         }
-        INSTS[base].imm
+        cx.insts[base].imm
     }
 }
 
 // Whether a copy of `size` bytes between slots d (at d_off) and s (at
 // s_off) moves leaves to leaves of the same types.
-fn leaves_match(d: i64, d_off: i64, s: i64, s_off: i64, size: i64) -> bool {
+fn leaves_match(mut cx: *FnCtx, d: i64, d_off: i64, s: i64, s_off: i64, size: i64) -> bool {
     unsafe {
         let mut count = 0;
-        for i in 0..SR_COUNT[s] {
-            let o = leaf_offset(s, i);
+        for i in 0..cx.sr_count[s] {
+            let o = leaf_offset(cx, s, i);
             if o >= s_off && o < s_off + size {
-                if find_leaf(d, d_off + o - s_off, leaf_type(s, i)) < 0 {
+                if find_leaf(cx, d, d_off + o - s_off, leaf_type(cx, s, i)) < 0 {
                     return false;
                 }
                 count += 1;
             }
         }
-        for i in 0..SR_COUNT[d] {
-            let o = leaf_offset(d, i);
+        for i in 0..cx.sr_count[d] {
+            let o = leaf_offset(cx, d, i);
             if o >= d_off && o < d_off + size {
                 count -= 1;
             }
@@ -211,55 +202,58 @@ fn leaves_match(d: i64, d_off: i64, s: i64, s_off: i64, size: i64) -> bool {
 }
 
 // Rules out the slots used other than as plain memory.
-fn sroa_scan(fi: i64) {
+fn sroa_scan(mut cx: *FnCtx, fi: i64) {
     unsafe {
         for i in 0..IRFUNCS[fi].blocks.count {
             let b = IRFUNCS[fi].blocks.data[i];
-            if BLOCKS[b].removed != 0 {
+            if cx.blocks[b].removed != 0 {
                 continue;
             }
-            let mut v = BLOCKS[b].first;
+            let mut v = cx.blocks[b].first;
             while v != 0 {
-                let op = INSTS[v].op;
-                for k in 0..ir_operand_count(v) {
-                    let operand = ir_operand(v, k);
+                let op = cx.insts[v].op;
+                for k in 0..ir_operand_count(cx, v) {
+                    let operand = ir_operand(cx, v, k);
                     if operand == 0 {
                         continue;
                     }
                     let mut offset = 0;
-                    let s = sroa_slot(operand, &offset);
+                    let s = sroa_slot(cx, operand, &offset);
                     if s == 0 {
                         continue;
                     }
                     let mut ok = false;
                     if op == Load && k == 0 {
-                        ok = find_access_leaf(s, offset + INSTS[v].imm, INSTS[v].ty) >= 0;
+                        ok = find_access_leaf(cx, s, offset + cx.insts[v].imm, cx.insts[v].ty) >= 0;
                     } else if op == Store && k == 0 {
-                        ok = find_access_leaf(s, offset + INSTS[v].imm, INSTS[v].imm2) >= 0;
+                        ok = find_access_leaf(cx, s, offset + cx.insts[v].imm, cx.insts[v].imm2)
+                            >= 0;
                     } else if op == Copy && k <= 1 {
-                        ok = whole_leaves(s, offset, INSTS[v].imm);
-                    } else if op == Add && k == 0 && INSTS[v].ty == TY_U64 && is_const(INSTS[v].b) {
+                        ok = whole_leaves(cx, s, offset, cx.insts[v].imm);
+                    }
+                    else if op == Add && k == 0 && cx.insts[v].ty == TY_U64
+                        && is_const(cx, cx.insts[v].b) {
                         ok = true;
                     }
                     if !ok {
-                        SR_STATE[s] = 0;
+                        cx.sr_state[s] = 0;
                         // (an address stored into a candidate: see run_sroa)
                         if op == Store && k == 1 {
                             let mut d_off = 0;
-                            let d = sroa_slot(INSTS[v].a, &d_off);
+                            let d = sroa_slot(cx, cx.insts[v].a, &d_off);
                             if d != 0 {
-                                SR_HELD.push(d);
+                                cx.sr_held.push(d);
                             }
                         }
                     }
                 }
-                v = INSTS[v].next;
+                v = cx.insts[v].next;
             }
-            if BLOCKS[b].cond != 0 {
+            if cx.blocks[b].cond != 0 {
                 let mut offset = 0;
-                let s = sroa_slot(BLOCKS[b].cond, &offset);
+                let s = sroa_slot(cx, cx.blocks[b].cond, &offset);
                 if s != 0 {
-                    SR_STATE[s] = 0;
+                    cx.sr_state[s] = 0;
                 }
             }
         }
@@ -269,23 +263,24 @@ fn sroa_scan(fi: i64) {
             changed = false;
             for i in 0..IRFUNCS[fi].blocks.count {
                 let b = IRFUNCS[fi].blocks.data[i];
-                if BLOCKS[b].removed != 0 {
+                if cx.blocks[b].removed != 0 {
                     continue;
                 }
-                let mut v = BLOCKS[b].first;
+                let mut v = cx.blocks[b].first;
                 while v != 0 {
-                    if INSTS[v].op == Copy {
+                    if cx.insts[v].op == Copy {
                         let mut d_off = 0;
                         let mut s_off = 0;
-                        let d = sroa_slot(INSTS[v].a, &d_off);
-                        let s = sroa_slot(INSTS[v].b, &s_off);
-                        if d != 0 && s != 0 && !leaves_match(d, d_off, s, s_off, INSTS[v].imm) {
-                            SR_STATE[d] = 0;
-                            SR_STATE[s] = 0;
+                        let d = sroa_slot(cx, cx.insts[v].a, &d_off);
+                        let s = sroa_slot(cx, cx.insts[v].b, &s_off);
+                        if d != 0 && s != 0
+                            && !leaves_match(cx, d, d_off, s, s_off, cx.insts[v].imm) {
+                            cx.sr_state[d] = 0;
+                            cx.sr_state[s] = 0;
                             changed = true;
                         }
                     }
-                    v = INSTS[v].next;
+                    v = cx.insts[v].next;
                 }
             }
         }
@@ -293,108 +288,102 @@ fn sroa_scan(fi: i64) {
 }
 
 // The replacement of the slots: loads, stores and copies in block b.
-fn sroa_block(b: i64) {
+fn sroa_block(mut cx: *FnCtx, b: i64) {
     unsafe {
-        let mut v = BLOCKS[b].first;
+        let mut v = cx.blocks[b].first;
         while v != 0 {
-            let next = INSTS[v].next;
-            let op = INSTS[v].op;
+            let next = cx.insts[v].next;
+            let op = cx.insts[v].op;
             let mut offset = 0;
             if op == Load {
-                let s = sroa_slot(INSTS[v].a, &offset);
+                let s = sroa_slot(cx, cx.insts[v].a, &offset);
                 if s != 0 {
-                    let leaf = find_access_leaf(s, offset + INSTS[v].imm, INSTS[v].ty);
-                    let value = ssa_read(SR_VAR[s] + leaf, b);
-                    ir_replace(v, as_leaf_type(value, INSTS[v].ty, v));
+                    let leaf = find_access_leaf(cx, s, offset + cx.insts[v].imm, cx.insts[v].ty);
+                    let value = ssa_read(cx, cx.sr_var[s] + leaf, b);
+                    ir_replace(cx, v, as_leaf_type(cx, value, cx.insts[v].ty, v));
                 }
             } else if op == Store {
-                let s = sroa_slot(INSTS[v].a, &offset);
+                let s = sroa_slot(cx, cx.insts[v].a, &offset);
                 if s != 0 {
-                    let leaf = find_access_leaf(s, offset + INSTS[v].imm, INSTS[v].imm2);
-                    ssa_write(SR_VAR[s] + leaf, b,
-                        as_leaf_type(ir_val(INSTS[v].b), leaf_type(s, leaf), v));
-                    ir_unlink(v);
+                    let leaf = find_access_leaf(cx, s, offset + cx.insts[v].imm, cx.insts[v].imm2);
+                    ssa_write(cx, cx.sr_var[s] + leaf, b,
+                        as_leaf_type(cx, ir_val(cx, cx.insts[v].b), leaf_type(cx, s, leaf), v));
+                    ir_unlink(cx, v);
                 }
             } else if op == Copy {
-                sroa_copy(b, v);
+                sroa_copy(cx, b, v);
             }
             v = next;
         }
     }
 }
 
-fn sroa_copy(b: i64, v: i64) {
+fn sroa_copy(mut cx: *FnCtx, b: i64, v: i64) {
     unsafe {
-        let size = INSTS[v].imm;
+        let size = cx.insts[v].imm;
         let mut d_off = 0;
         let mut s_off = 0;
-        let d = sroa_slot(INSTS[v].a, &d_off);
-        let s = sroa_slot(INSTS[v].b, &s_off);
+        let d = sroa_slot(cx, cx.insts[v].a, &d_off);
+        let s = sroa_slot(cx, cx.insts[v].b, &s_off);
         if d == 0 && s == 0 {
             return;
         }
         // The leaves of the source: (offset in the copy, type, value).
-        SR_VALUES.count = 0;
+        cx.sr_values.count = 0;
         if s != 0 {
-            for i in 0..SR_COUNT[s] {
-                let o = leaf_offset(s, i);
+            for i in 0..cx.sr_count[s] {
+                let o = leaf_offset(cx, s, i);
                 if o >= s_off && o < s_off + size {
-                    SR_VALUES.push(o - s_off);
-                    SR_VALUES.push(leaf_type(s, i));
-                    SR_VALUES.push(ssa_read(SR_VAR[s] + i, b));
+                    cx.sr_values.push(o - s_off);
+                    cx.sr_values.push(leaf_type(cx, s, i));
+                    cx.sr_values.push(ssa_read(cx, cx.sr_var[s] + i, b));
                 }
             }
         } else {
-            for i in 0..SR_COUNT[d] {
-                let o = leaf_offset(d, i);
+            for i in 0..cx.sr_count[d] {
+                let o = leaf_offset(cx, d, i);
                 if o >= d_off && o < d_off + size {
-                    let load = ir_make(Load, leaf_type(d, i), INSTS[v].b, 0, o - d_off);
-                    ir_insert_before(v, load);
-                    SR_VALUES.push(o - d_off);
-                    SR_VALUES.push(leaf_type(d, i));
-                    SR_VALUES.push(load);
+                    let load = ir_make(cx, Load, leaf_type(cx, d, i), cx.insts[v].b, 0, o - d_off);
+                    ir_insert_before(cx, v, load);
+                    cx.sr_values.push(o - d_off);
+                    cx.sr_values.push(leaf_type(cx, d, i));
+                    cx.sr_values.push(load);
                 }
             }
         }
         let mut i = 0;
-        while i < SR_VALUES.count {
-            let at = SR_VALUES.data[i];
-            let ty = SR_VALUES.data[i + 1];
-            let value = SR_VALUES.data[i + 2];
+        while i < cx.sr_values.count {
+            let at = cx.sr_values.data[i];
+            let ty = cx.sr_values.data[i + 1];
+            let value = cx.sr_values.data[i + 2];
             if d != 0 {
-                ssa_write(SR_VAR[d] + find_leaf(d, d_off + at, ty), b, value);
+                ssa_write(cx, cx.sr_var[d] + find_leaf(cx, d, d_off + at, ty), b, value);
             } else {
-                let store = ir_make(Store, 0, INSTS[v].a, value, at);
-                INSTS[store].imm2 = ty;
-                ir_insert_before(v, store);
+                let store = ir_make(cx, Store, 0, cx.insts[v].a, value, at);
+                cx.insts[store].imm2 = ty;
+                ir_insert_before(cx, v, store);
             }
             i += 3;
         }
-        ir_unlink(v);
+        ir_unlink(cx, v);
     }
 }
-
-// Slots holding the address of another slot (a closure's environment
-// holding a variable captured by reference): when they are replaced, the
-// other slot's address reaches its uses directly, and it may be replaced
-// in turn (0.14).
-static mut SR_HELD: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
 // Scalar replacement, to a fixpoint: again while a slot replaced held the
 // address of another (at most SROA_ROUNDS times). Returns whether any slot
 // was replaced.
-pub fn run_sroa(fi: i64) -> bool {
+pub fn run_sroa(mut cx: *FnCtx, fi: i64) -> bool {
     unsafe {
         let mut any = false;
         for _ in 0..SROA_ROUNDS {
-            SR_HELD.count = 0;
-            if !sroa_once(fi) {
+            cx.sr_held.count = 0;
+            if !sroa_once(cx, fi) {
                 break;
             }
             any = true;
             let mut again = false;
-            for i in 0..SR_HELD.count {
-                if SR_STATE[SR_HELD.data[i]] != 0 {
+            for i in 0..cx.sr_held.count {
+                if cx.sr_state[cx.sr_held.data[i]] != 0 {
                     again = true;
                 }
             }
@@ -406,40 +395,40 @@ pub fn run_sroa(fi: i64) -> bool {
     }
 }
 
-fn sroa_once(fi: i64) -> bool {
+fn sroa_once(mut cx: *FnCtx, fi: i64) -> bool {
     unsafe {
-        ir_enter(fi);
-        resolve_all(fi);
-        let n = SLOT_COUNT + 1;
-        free(SR_STATE as *u8);
-        free(SR_FIRST as *u8);
-        free(SR_COUNT as *u8);
-        free(SR_VAR as *u8);
-        SR_STATE = alloc_array::<i64>(n);
-        SR_FIRST = alloc_array::<i64>(n);
-        SR_COUNT = alloc_array::<i64>(n);
-        SR_VAR = alloc_array::<i64>(n);
-        SR_LEAVES.count = 0;
+        ir_enter(cx, fi);
+        resolve_all(cx, fi);
+        let n = cx.slot_count + 1;
+        free(cx.sr_state as *u8);
+        free(cx.sr_first as *u8);
+        free(cx.sr_count as *u8);
+        free(cx.sr_var as *u8);
+        cx.sr_state = alloc_array::<i64>(n);
+        cx.sr_first = alloc_array::<i64>(n);
+        cx.sr_count = alloc_array::<i64>(n);
+        cx.sr_var = alloc_array::<i64>(n);
+        cx.sr_leaves.count = 0;
         let mut any = false;
         for i in 0..IRFUNCS[fi].slots.count {
             let s = IRFUNCS[fi].slots.data[i];
-            if slot_leaves(s) {
-                SR_STATE[s] = 1;
+            if slot_leaves(cx, s) {
+                cx.sr_state[s] = 1;
                 any = true;
             }
         }
         if !any {
             return false;
         }
-        sroa_scan(fi);
+        sroa_scan(cx, fi);
         any = false;
         for i in 0..IRFUNCS[fi].slots.count {
             let s = IRFUNCS[fi].slots.data[i];
-            if SR_STATE[s] != 0 {
+            if cx.sr_state[s] != 0 {
                 any = true;
-                SR_VAR[s] = new_synth_var(leaf_type(s, 0));
-                for k in 1..SR_COUNT[s] {
-                    new_synth_var(leaf_type(s, k));
+                cx.sr_var[s] = new_synth_var(cx, leaf_type(cx, s, 0));
+                for k in 1..cx.sr_count[s] {
+                    new_synth_var(cx, leaf_type(cx, s, k));
                 }
             }
         }
@@ -448,41 +437,41 @@ fn sroa_once(fi: i64) -> bool {
         }
         // SSA construction: blocks in reverse post-order; BLOCKS[b].mark counts
         // the filled predecessors.
-        DEFS.clear();
-        layout_order(fi);
+        cx.defs.clear();
+        layout_order(cx, fi);
         for i in 0..IRFUNCS[fi].blocks.count {
             let b = IRFUNCS[fi].blocks.data[i];
-            BLOCKS[b].sealed = 0;
-            BLOCKS[b].incomplete = 0;
-            BLOCKS[b].mark = 0;
+            cx.blocks[b].sealed = 0;
+            cx.blocks[b].incomplete = 0;
+            cx.blocks[b].mark = 0;
         }
         let mut order = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for k in 0..ORDER.count {
-            order.push(ORDER.data[k]);
+        for k in 0..cx.order.count {
+            order.push(cx.order.data[k]);
         }
         for k in 0..order.count {
             let b = order.data[k];
-            if BLOCKS[b].mark == BLOCKS[b].preds.count {
-                ir_seal(b);
+            if cx.blocks[b].mark == cx.blocks[b].preds.count {
+                ir_seal(cx, b);
             }
-            sroa_block(b);
-            for i in 0..succ_count(b) {
-                let s = succ(b, i);
-                BLOCKS[s].mark += 1;
-                if BLOCKS[s].sealed == 0 && BLOCKS[s].order <= k
-                    && BLOCKS[s].mark == BLOCKS[s].preds.count {
-                    ir_seal(s);
+            sroa_block(cx, b);
+            for i in 0..succ_count(cx, b) {
+                let s = succ(cx, b, i);
+                cx.blocks[s].mark += 1;
+                if cx.blocks[s].sealed == 0 && cx.blocks[s].order <= k
+                    && cx.blocks[s].mark == cx.blocks[s].preds.count {
+                    ir_seal(cx, s);
                 }
             }
         }
         for k in 0..order.count {
-            if BLOCKS[order.data[k]].sealed == 0 {
-                ir_seal(order.data[k]);
+            if cx.blocks[order.data[k]].sealed == 0 {
+                ir_seal(cx, order.data[k]);
             }
         }
         free(order.data as *u8);
-        resolve_all(fi);
-        remove_trivial_phis(fi);
+        resolve_all(cx, fi);
+        remove_trivial_phis(cx, fi);
         true
     }
 }
@@ -493,30 +482,31 @@ fn sroa_once(fi: i64) -> bool {
 // in one block that comes before every read of it (in that block, or in
 // blocks it dominates), always holds the same bytes: it becomes read-only
 // data (a local table, like md5's shift amounts).
-pub fn promote_constant_slots(fi: i64) -> bool {
+pub fn promote_constant_slots(mut cx: *FnCtx, fi: i64) -> bool {
     unsafe {
-        ir_enter(fi);
-        resolve_all(fi);
-        find_escaping_slots(fi);
-        compute_dominators(fi);
-        let n = SLOT_COUNT + 1;
+        ir_enter(cx, fi);
+        resolve_all(cx, fi);
+        find_escaping_slots(cx, fi);
+        compute_dominators(cx, fi);
+        let n = cx.slot_count + 1;
         // Per slot: the block of its stores (0: none, -1: not constant), the
         // stores not yet passed (during the second walk).
         let block_of = alloc_array::<i64>(n);
         let stores = alloc_array::<i64>(n);
         let reads = alloc_array::<i64>(n);
-        for i in 0..ORDER.count {
-            let b = ORDER.data[i];
-            let mut v = BLOCKS[b].first;
+        for i in 0..cx.order.count {
+            let b = cx.order.data[i];
+            let mut v = cx.blocks[b].first;
             while v != 0 {
-                let op = INSTS[v].op;
-                if op == Store || is_copy(v) {
-                    let root = root_of(if op == Store { INSTS[v].a } else { copy_dst(v) });
-                    if is_private_root(root) {
-                        let s = INSTS[root].imm;
+                let op = cx.insts[v].op;
+                if op == Store || is_copy(cx, v) {
+                    let root = root_of(cx,
+                        if op == Store { cx.insts[v].a } else { copy_dst(cx, v) });
+                    if is_private_root(cx, root) {
+                        let s = cx.insts[root].imm;
                         let mut offset = 0;
-                        let base = address_base(INSTS[v].a, &offset);
-                        if op != Store || base != root || INSTS[INSTS[v].b].op != Const {
+                        let base = address_base(cx, cx.insts[v].a, &offset);
+                        if op != Store || base != root || cx.insts[cx.insts[v].b].op != Const {
                             block_of[s] = -1;
                         } else if block_of[s] == 0 {
                             block_of[s] = b;
@@ -528,93 +518,94 @@ pub fn promote_constant_slots(fi: i64) -> bool {
                         }
                     }
                 }
-                v = INSTS[v].next;
+                v = cx.insts[v].next;
             }
         }
         // Every read after the stores.
-        for i in 0..ORDER.count {
-            let b = ORDER.data[i];
-            let mut v = BLOCKS[b].first;
+        for i in 0..cx.order.count {
+            let b = cx.order.data[i];
+            let mut v = cx.blocks[b].first;
             while v != 0 {
-                let op = INSTS[v].op;
+                let op = cx.insts[v].op;
                 let mut from = 0;
                 if op == Load {
-                    from = root_of(INSTS[v].a);
-                } else if is_copy(v) {
-                    from = root_of(copy_src(v));
+                    from = root_of(cx, cx.insts[v].a);
+                } else if is_copy(cx, v) {
+                    from = root_of(cx, copy_src(cx, v));
                 }
-                if from != 0 && INSTS[from].op == Slot {
-                    let s = INSTS[from].imm;
+                if from != 0 && cx.insts[from].op == Slot {
+                    let s = cx.insts[from].imm;
                     reads[s] = 1;
                     if block_of[s] > 0 {
                         if block_of[s] == b {
                             if stores[s] > 0 {
                                 block_of[s] = -1;
                             }
-                        } else if !dominates(block_of[s], b) {
+                        } else if !dominates(cx, block_of[s], b) {
                             block_of[s] = -1;
                         }
                     }
                 }
                 if op == Store {
-                    let root = root_of(INSTS[v].a);
-                    if is_private_root(root) && block_of[INSTS[root].imm] > 0 {
-                        stores[INSTS[root].imm] -= 1;
+                    let root = root_of(cx, cx.insts[v].a);
+                    if is_private_root(cx, root) && block_of[cx.insts[root].imm] > 0 {
+                        stores[cx.insts[root].imm] -= 1;
                     }
                 }
-                v = INSTS[v].next;
+                v = cx.insts[v].next;
             }
         }
         let mut changed = false;
-        let scratch = buf_new();
+        // (0.18.1: the context's buffer: a task makes none)
+        let scratch = cx.scratch_buf;
         for k in 0..IRFUNCS[fi].slots.count {
             let s = IRFUNCS[fi].slots.data[k];
             if block_of[s] <= 0 || reads[s] == 0 {
                 continue;
             }
             // The bytes, from the stores (which are removed).
-            let size = SLOTS[s].size;
+            let size = cx.slots[s].size;
             buf_clear(scratch);
             buf_reserve(scratch, size);
             memset(BUFS[scratch].data, 0, size as u64);
             BUFS[scratch].len = size;
             let b = block_of[s];
-            let mut v = BLOCKS[b].first;
+            let mut v = cx.blocks[b].first;
             while v != 0 {
-                let next = INSTS[v].next;
-                if INSTS[v].op == Store {
-                    let root = root_of(INSTS[v].a);
-                    if root != 0 && INSTS[root].op == Slot && INSTS[root].imm == s {
+                let next = cx.insts[v].next;
+                if cx.insts[v].op == Store {
+                    let root = root_of(cx, cx.insts[v].a);
+                    if root != 0 && cx.insts[root].op == Slot && cx.insts[root].imm == s {
                         let mut offset = 0;
-                        address_base(INSTS[v].a, &offset);
-                        write_scalar(scratch, offset + INSTS[v].imm, INSTS[INSTS[v].b].imm,
-                            INSTS[v].imm2);
-                        ir_unlink(v);
+                        address_base(cx, cx.insts[v].a, &offset);
+                        write_scalar(scratch, offset + cx.insts[v].imm, cx.insts[cx.insts[v].b].imm,
+                            cx.insts[v].imm2);
+                        ir_unlink(cx, v);
                     }
                 }
                 v = next;
             }
-            let id = add_const_data(BUFS[scratch].data[0..size], SLOTS[s].align);
-            let data = ir_make(SAddr, TY_U64, 0, 0, id);
-            ir_prepend(IRFUNCS[fi].entry, data);
-            for i in 0..ORDER.count {
-                let mut w = BLOCKS[ORDER.data[i]].first;
+            let id = const_data(cx, fi, BUFS[scratch].data[0..size], cx.slots[s].align);
+            let data = ir_make(cx, SAddr, TY_U64, 0, 0, id);
+            ir_prepend(cx, IRFUNCS[fi].entry, data);
+            for i in 0..cx.order.count {
+                let mut w = cx.blocks[cx.order.data[i]].first;
                 while w != 0 {
-                    let next = INSTS[w].next;
-                    if INSTS[w].op == Slot && INSTS[w].imm == s {
-                        ir_replace(w, data);
+                    let next = cx.insts[w].next;
+                    if cx.insts[w].op == Slot && cx.insts[w].imm == s {
+                        ir_replace(cx, w, data);
                     }
                     w = next;
                 }
             }
-            SLOTS[s].size = 0;
+            cx.slots[s].size = 0;
             changed = true;
         }
         free(block_of as *u8);
         free(stores as *u8);
         free(reads as *u8);
         if changed {
-            resolve_all(fi);
+            resolve_all(cx, fi);
         }
         changed
     }
@@ -627,12 +618,13 @@ pub fn constant_load(id: i64, offset: i64, ty: i64, ok: *bool) -> i64 {
         let size = type_size(ty);
         *ok = false;
         // (A vector, 0.10, is no constant.)
-        if size > 8 || offset < 0 || offset + size > str_at(id).len as i64 {
+        let bytes = const_data_bytes(id);
+        if size > 8 || offset < 0 || offset + size > bytes.len as i64 {
             return 0;
         }
         let mut bits: u64 = 0;
         for i in 0..size {
-            bits |= (str_at(id).ptr[offset + i] as u64) << (8 * i) as u64;
+            bits |= (bytes.ptr[offset + i] as u64) << (8 * i) as u64;
         }
         *ok = true;
         if ty == TY_F32 {

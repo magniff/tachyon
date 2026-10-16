@@ -20,25 +20,24 @@
 
 use crate::base::{IntVec, free};
 use crate::front::types::{TY_I64, TY_U64, int_bits, is_integer};
+use crate::middle::ctx::FnCtx;
 use crate::middle::fold::all_ones;
 use crate::middle::ir::{
-    BLOCKS, Cond, INSTS, IRFUNCS, Op, Term, ir_arg, ir_enter, ir_new_block, ir_operand,
-    ir_operand_count, ir_replace, ir_set_arg, ir_val,
+    Cond, IRFUNCS, Op, Term, ir_arg, ir_enter, ir_new_block, ir_operand, ir_operand_count,
+    ir_replace, ir_set_arg, ir_val,
 };
 use crate::middle::ir::Op::{Add, And, Cmp, Const, Phi, Sub};
 use crate::middle::ir::cfg::{ir_terminate, pred_index};
 use crate::middle::ir::verify::verify_func;
 use crate::middle::loops::{
-    LP_LIST2, add_pred_values, canonicalize_loops, clone_map, clone_region, form_lcssa,
-    innermost_loop, is_canonical, is_innermost, loop_block, loop_contains, loop_count, loop_header,
-    loop_latch, loop_preheader, loop_size, mark_loop_blocks, new_phi_in,
+    add_pred_values, canonicalize_loops, clone_map, clone_region, form_lcssa, innermost_loop,
+    is_canonical, is_innermost, loop_block, loop_contains, loop_count, loop_header, loop_latch,
+    loop_preheader, loop_size, mark_loop_blocks, new_phi_in,
 };
 use crate::middle::opt::resolve_all;
 use crate::middle::profile::{is_cold_block, is_hot_count};
 use crate::middle::scev::counted_loop;
-use crate::middle::vectorize::{
-    VC_UNIFORM, VSTAMP, V_CHECKS, V_EVAL, V_IV, V_IV2, V_N, V_NE, expected_trips,
-};
+use crate::middle::vectorize::{VC_UNIFORM, expected_trips};
 use crate::middle::vectorize::build::{append, cmp, konst};
 use crate::middle::vectorize::checks::{check_tests, record_check};
 use crate::middle::vectorize::legality::{coef, is_unreachable_exit, loads_in, set_class};
@@ -55,22 +54,22 @@ const UNROLL_RT_REDUCTION: i64 = 32;
 // condition of its blocks). A constant only the loop's exits read (a
 // check's site and kind, passed to the failure on its cold path) costs
 // the loop nothing, so the unroller does not count it.
-fn read_in_loop(l: i64, v: i64) -> bool {
+fn read_in_loop(mut cx: *FnCtx, l: i64, v: i64) -> bool {
     unsafe {
-        for i in 0..loop_size(l) {
-            let b = loop_block(l, i);
-            if BLOCKS[b].cond != 0 && ir_val(BLOCKS[b].cond) == v {
+        for i in 0..loop_size(cx, l) {
+            let b = loop_block(cx, l, i);
+            if cx.blocks[b].cond != 0 && ir_val(cx, cx.blocks[b].cond) == v {
                 return true;
             }
-            let mut w = BLOCKS[b].first;
+            let mut w = cx.blocks[b].first;
             while w != 0 {
-                for k in 0..ir_operand_count(w) {
-                    let o = ir_operand(w, k);
-                    if o != 0 && ir_val(o) == v {
+                for k in 0..ir_operand_count(cx, w) {
+                    let o = ir_operand(cx, w, k);
+                    if o != 0 && ir_val(cx, o) == v {
                         return true;
                     }
                 }
-                w = INSTS[w].next;
+                w = cx.insts[w].next;
             }
         }
         false
@@ -79,89 +78,91 @@ fn read_in_loop(l: i64, v: i64) -> bool {
 
 // The unrolling factor for loop l (canonical, innermost), or 0; sets V_IV,
 // V_N, V_CHECKS and the classes coef needs.
-fn runtime_factor(l: i64) -> i64 {
+fn runtime_factor(mut cx: *FnCtx, l: i64) -> i64 {
     unsafe {
-        let h = loop_header(l);
-        let latch = loop_latch(l);
-        if BLOCKS[h].novec != 0 || is_cold_block(h) || latch == 0 || loop_preheader(l) == 0
-            || BLOCKS[latch].term != Term::Branch {
+        let h = loop_header(cx, l);
+        let latch = loop_latch(cx, l);
+        if cx.blocks[h].novec != 0 || is_cold_block(cx, h) || latch == 0
+            || loop_preheader(cx, l) == 0
+            || cx.blocks[latch].term != Term::Branch {
             return 0;
         }
         let mut iv = 0;
         let mut step = 0;
         let mut n = 0;
         let mut ne = false;
-        if !counted_loop(l, &iv, &step, &n, &ne) || step != 1 || int_bits(INSTS[iv].ty) != 64 {
+        if !counted_loop(cx, l, &iv, &step, &n, &ne) || step != 1
+            || int_bits(cx.insts[iv].ty) != 64 {
             return 0;
         }
-        VSTAMP += 1;
-        V_IV = iv;
-        V_N = n;
-        V_NE = ne;
-        V_IV2 = 0;
-        V_CHECKS.count = 0;
-        V_EVAL.count = 0;
-        let s0 = BLOCKS[latch].s0;
-        let s1 = BLOCKS[latch].s1;
+        cx.vstamp += 1;
+        cx.v_iv = iv;
+        cx.v_n = n;
+        cx.v_ne = ne;
+        cx.v_iv2 = 0;
+        cx.v_checks.count = 0;
+        cx.v_eval.count = 0;
+        let s0 = cx.blocks[latch].s0;
+        let s1 = cx.blocks[latch].s1;
         let e = if s0 == h { s1 } else { s0 };
-        if loop_contains(l, e) || BLOCKS[e].preds.count != 1 {
+        if loop_contains(cx, l, e) || cx.blocks[e].preds.count != 1 {
             return 0;
         }
         let mut size = 0;
-        for i in 0..loop_size(l) {
-            let b = loop_block(l, i);
-            let mut v = BLOCKS[b].first;
+        for i in 0..loop_size(cx, l) {
+            let b = loop_block(cx, l, i);
+            let mut v = cx.blocks[b].first;
             while v != 0 {
-                let op = INSTS[v].op;
+                let op = cx.insts[v].op;
                 if op.is_call() || op == Op::Copy {
                     return 0;
                 }
                 if (op.is_pure() && op != Cmp) || op == Const {
-                    set_class(v, VC_UNIFORM);
+                    set_class(cx, v, VC_UNIFORM);
                 }
-                if op != Const || read_in_loop(l, v) {
+                if op != Const || read_in_loop(cx, l, v) {
                     size += 1;
                 }
-                v = INSTS[v].next;
+                v = cx.insts[v].next;
             }
             if b == latch {
                 continue;
             }
-            let t = BLOCKS[b].term;
+            let t = cx.blocks[b].term;
             if t == Term::Branch {
-                let a = BLOCKS[b].s0;
-                let c = BLOCKS[b].s1;
-                if !loop_contains(l, a) || !loop_contains(l, c) {
-                    let next = if loop_contains(l, a) { a } else { c };
+                let a = cx.blocks[b].s0;
+                let c = cx.blocks[b].s1;
+                if !loop_contains(cx, l, a) || !loop_contains(cx, l, c) {
+                    let next = if loop_contains(cx, l, a) { a } else { c };
                     let out = if next == a { c } else { a };
-                    if !loop_contains(l, next) || !is_unreachable_exit(l, out)
-                        || !record_check(l, b, next) {
+                    if !loop_contains(cx, l, next) || !is_unreachable_exit(cx, l, out)
+                        || !record_check(cx, l, b, next) {
                         return 0;
                     }
                 }
-            } else if t != Term::Jump || !loop_contains(l, BLOCKS[b].s0) {
+            } else if t != Term::Jump || !loop_contains(cx, l, cx.blocks[b].s0) {
                 return 0;
             }
         }
-        set_class(iv, VC_UNIFORM);
-        for k in 0..V_CHECKS.count / 3 {
-            let c = coef(l, V_CHECKS.data[3 * k + 1]);
-            if (c != 1 && c != -1) || loads_in(l, V_CHECKS.data[3 * k + 1]) {
+        set_class(cx, iv, VC_UNIFORM);
+        for k in 0..cx.v_checks.count / 3 {
+            let c = coef(cx, l, cx.v_checks.data[3 * k + 1]);
+            if (c != 1 && c != -1) || loads_in(cx, l, cx.v_checks.data[3 * k + 1]) {
                 return 0;
             }
         }
         // It pays where checks go, or where the loop's own instructions (the
         // induction variable, its test and branch) are a good part of it.
         // (0.15) Or where reductions run on several accumulators.
-        if V_CHECKS.count == 0 && size > UNROLL_RT_TINY
-            && (size > UNROLL_RT_REDUCTION || !has_split_reduction(l)) {
+        if cx.v_checks.count == 0 && size > UNROLL_RT_TINY
+            && (size > UNROLL_RT_REDUCTION || !has_split_reduction(cx, l)) {
             return 0;
         }
-        let budget = if is_hot_count(BLOCKS[h].count) { 2 * UNROLL_RT_SIZE }
+        let budget = if is_hot_count(cx.blocks[h].count) { 2 * UNROLL_RT_SIZE }
             else { UNROLL_RT_SIZE };
         let mut u = if 4 * size <= budget { 4 } else if 2 * size <= budget { 2 } else { 0 };
         // (With a profile: enough iterations an entry for a few rounds.)
-        let t = expected_trips(l);
+        let t = expected_trips(cx, l);
         while u > 1 && t >= 0 && t < 2 * u {
             u = u / 2;
         }
@@ -188,24 +189,25 @@ fn in_set(set: *IntVec, v: i64) -> bool {
 // nx may be used outside the loop (outs: the exit block's values). Returns
 // the operation (as i64; ADD for + and -), -1 for a minimum or maximum (its
 // select nx), or 0.
-fn split_reduction(l: i64, r: i64, nx: i64, outs: *IntVec) -> i64 {
+fn split_reduction(mut cx: *FnCtx, l: i64, r: i64, nx: i64, outs: *IntVec) -> i64 {
     unsafe {
-        let ty = INSTS[r].ty;
-        if !is_integer(ty) || r == V_IV || nx == r || INSTS[nx].block == 0
-            || !loop_contains(l, INSTS[nx].block) {
+        let ty = cx.insts[r].ty;
+        if !is_integer(ty) || r == cx.v_iv || nx == r || cx.insts[nx].block == 0
+            || !loop_contains(cx, l, cx.insts[nx].block) {
             return 0;
         }
-        let h = loop_header(l);
+        let h = loop_header(cx, l);
         let mut set = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         set.push(r);
         let mut family = 0;
         let mut minmax = false;
-        let k = INSTS[nx].a;
-        if INSTS[nx].op == Op::Sel && INSTS[k].op == Cmp && is_integer(INSTS[k].imm2)
-            && INSTS[k].cond != Cond::Eq && INSTS[k].cond != Cond::Ne
-            && (INSTS[k].a == r) != (INSTS[k].b == r) {
-            let z = if INSTS[k].a == r { INSTS[k].b } else { INSTS[k].a };
-            if (INSTS[nx].b == r && INSTS[nx].c == z) || (INSTS[nx].b == z && INSTS[nx].c == r) {
+        let k = cx.insts[nx].a;
+        if cx.insts[nx].op == Op::Sel && cx.insts[k].op == Cmp && is_integer(cx.insts[k].imm2)
+            && cx.insts[k].cond != Cond::Eq && cx.insts[k].cond != Cond::Ne
+            && (cx.insts[k].a == r) != (cx.insts[k].b == r) {
+            let z = if cx.insts[k].a == r { cx.insts[k].b } else { cx.insts[k].a };
+            if (cx.insts[nx].b == r && cx.insts[nx].c == z)
+                || (cx.insts[nx].b == z && cx.insts[nx].c == r) {
                 minmax = true;
                 set.push(k);
                 set.push(nx);
@@ -215,24 +217,24 @@ fn split_reduction(l: i64, r: i64, nx: i64, outs: *IntVec) -> i64 {
         let mut grew = true;
         while ok && grew && !minmax {
             grew = false;
-            for i in 0..loop_size(l) {
-                let mut w = BLOCKS[loop_block(l, i)].first;
+            for i in 0..loop_size(cx, l) {
+                let mut w = cx.blocks[loop_block(cx, l, i)].first;
                 while w != 0 && ok {
-                    if w != r && !in_set(&set, w) && uses_set(w, &set) {
-                        let op = INSTS[w].op;
+                    if w != r && !in_set(&set, w) && uses_set(cx, w, &set) {
+                        let op = cx.insts[w].op;
                         if op == Phi {
-                            ok = INSTS[w].block != h;
-                            for a in 0..INSTS[w].nargs {
-                                ok = ok && in_set(&set, ir_val(ir_arg(w, a)));
+                            ok = cx.insts[w].block != h;
+                            for a in 0..cx.insts[w].nargs {
+                                ok = ok && in_set(&set, ir_val(cx, ir_arg(cx, w, a)));
                             }
                         } else if op == Op::Sel {
-                            ok = !in_set(&set, INSTS[w].a) && in_set(&set, INSTS[w].b)
-                                && in_set(&set, INSTS[w].c);
+                            ok = !in_set(&set, cx.insts[w].a) && in_set(&set, cx.insts[w].b)
+                                && in_set(&set, cx.insts[w].c);
                         } else if (op == Add || op == Sub || op == Op::Xor || op == Op::Or
-                            || op == And || op == Op::Mul) && INSTS[w].ty == ty {
+                            || op == And || op == Op::Mul) && cx.insts[w].ty == ty {
                             let f = if op == Sub { Add as i64 } else { op as i64 };
-                            ok = in_set(&set, INSTS[w].a) != in_set(&set, INSTS[w].b)
-                                && (op != Sub || in_set(&set, INSTS[w].a))
+                            ok = in_set(&set, cx.insts[w].a) != in_set(&set, cx.insts[w].b)
+                                && (op != Sub || in_set(&set, cx.insts[w].a))
                                 && (family == 0 || family == f);
                             family = f;
                         } else {
@@ -243,25 +245,25 @@ fn split_reduction(l: i64, r: i64, nx: i64, outs: *IntVec) -> i64 {
                             grew = true;
                         }
                     }
-                    w = INSTS[w].next;
+                    w = cx.insts[w].next;
                 }
             }
         }
         // Nothing else uses the set inside the loop (a minimum's compare
         // and select only each other and r), nor outside but nx, nor a
         // terminator.
-        for i in 0..loop_size(l) {
-            let b = loop_block(l, i);
-            if BLOCKS[b].term != Term::Jump && in_set(&set, ir_val(BLOCKS[b].cond)) {
+        for i in 0..loop_size(cx, l) {
+            let b = loop_block(cx, l, i);
+            if cx.blocks[b].term != Term::Jump && in_set(&set, ir_val(cx, cx.blocks[b].cond)) {
                 ok = false;
             }
             if minmax {
-                let mut w = BLOCKS[b].first;
+                let mut w = cx.blocks[b].first;
                 while w != 0 && ok {
-                    if w != r && w != k && w != nx && uses_set(w, &set) {
+                    if w != r && w != k && w != nx && uses_set(cx, w, &set) {
                         ok = false;
                     }
-                    w = INSTS[w].next;
+                    w = cx.insts[w].next;
                 }
             }
         }
@@ -277,10 +279,10 @@ fn split_reduction(l: i64, r: i64, nx: i64, outs: *IntVec) -> i64 {
     }
 }
 
-fn uses_set(w: i64, set: *IntVec) -> bool {
-    for i in 0..ir_operand_count(w) {
-        let x = ir_operand(w, i);
-        if x != 0 && in_set(set, ir_val(x)) {
+fn uses_set(mut cx: *FnCtx, w: i64, set: *IntVec) -> bool {
+    for i in 0..ir_operand_count(cx, w) {
+        let x = ir_operand(cx, w, i);
+        if x != 0 && in_set(set, ir_val(cx, x)) {
             return true;
         }
     }
@@ -302,26 +304,26 @@ fn reduction_identity(kind: i64, ty: i64) -> i64 {
 // loop as it is) after the unrolled loop, in block b: the copies'
 // accumulators (their next values, next[k * np + i]) combined in order;
 // a phi that is no split reduction has the last copy's.
-fn combine_accumulators(b: i64, kind: i64, r: i64, nx: i64, next: *IntVec, np: i64, i: i64,
-    u: i64) -> i64 {
+fn combine_accumulators(mut cx: *FnCtx, b: i64, kind: i64, r: i64, nx: i64, next: *IntVec, np: i64,
+    i: i64, u: i64) -> i64 {
     unsafe {
         if kind == 0 {
             return (*next).data[(u - 1) * np + i];
         }
-        let ty = INSTS[r].ty;
+        let ty = cx.insts[r].ty;
         let mut acc = (*next).data[i];
         for k in 1..u {
             let m = (*next).data[k * np + i];
             if kind > 0 {
-                acc = append(b, kind as Op, ty, acc, m, 0);
+                acc = append(cx, b, kind as Op, ty, acc, m, 0);
             } else {
                 // The select of the loop on (acc, m) for (r, the other).
-                let kc = INSTS[nx].a;
-                let x = if INSTS[kc].a == r { acc } else { m };
-                let y = if INSTS[kc].b == r { acc } else { m };
-                let c = cmp(b, INSTS[kc].cond, INSTS[kc].imm2, x, y);
-                let s = append(b, Op::Sel, ty, c, if INSTS[nx].b == r { acc } else { m }, 0);
-                INSTS[s].c = if INSTS[nx].c == r { acc } else { m };
+                let kc = cx.insts[nx].a;
+                let x = if cx.insts[kc].a == r { acc } else { m };
+                let y = if cx.insts[kc].b == r { acc } else { m };
+                let c = cmp(cx, b, cx.insts[kc].cond, cx.insts[kc].imm2, x, y);
+                let s = append(cx, b, Op::Sel, ty, c, if cx.insts[nx].b == r { acc } else { m }, 0);
+                cx.insts[s].c = if cx.insts[nx].c == r { acc } else { m };
                 acc = s;
             }
         }
@@ -331,51 +333,51 @@ fn combine_accumulators(b: i64, kind: i64, r: i64, nx: i64, next: *IntVec, np: i
 
 // (0.15) Whether a header phi of loop l is a reduction split_reduction
 // takes (the exit's values not known yet: as by LCSSA).
-fn has_split_reduction(l: i64) -> bool {
+fn has_split_reduction(mut cx: *FnCtx, l: i64) -> bool {
     unsafe {
-        let h = loop_header(l);
-        let li = pred_index(h, loop_latch(l));
+        let h = loop_header(cx, l);
+        let li = pred_index(cx, h, loop_latch(cx, l));
         let outs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        let mut x = BLOCKS[h].first;
-        while x != 0 && INSTS[x].op == Phi {
-            if split_reduction(l, x, ir_val(ir_arg(x, li)), &outs) != 0 {
+        let mut x = cx.blocks[h].first;
+        while x != 0 && cx.insts[x].op == Phi {
+            if split_reduction(cx, l, x, ir_val(cx, ir_arg(cx, x, li)), &outs) != 0 {
                 return true;
             }
-            x = INSTS[x].next;
+            x = cx.insts[x].next;
         }
         false
     }
 }
 
 // Unrolls loop l by `u` (see above).
-fn unroll_runtime(fi: i64, l: i64, u: i64) {
+fn unroll_runtime(mut cx: *FnCtx, fi: i64, l: i64, u: i64) {
     unsafe {
-        ir_enter(fi);
-        let h = loop_header(l);
-        let p = loop_preheader(l);
-        let latch = loop_latch(l);
-        let hp = pred_index(h, p);
-        let li = pred_index(h, latch);
-        let e = if BLOCKS[latch].s0 == h { BLOCKS[latch].s1 } else { BLOCKS[latch].s0 };
-        let start = ir_val(ir_arg(V_IV, hp));
-        let n = V_N;
-        let stamp = mark_loop_blocks(l);
+        ir_enter(cx, fi);
+        let h = loop_header(cx, l);
+        let p = loop_preheader(cx, l);
+        let latch = loop_latch(cx, l);
+        let hp = pred_index(cx, h, p);
+        let li = pred_index(cx, h, latch);
+        let e = if cx.blocks[latch].s0 == h { cx.blocks[latch].s1 } else { cx.blocks[latch].s0 };
+        let start = ir_val(cx, ir_arg(cx, cx.v_iv, hp));
+        let n = cx.v_n;
+        let stamp = mark_loop_blocks(cx, l);
         let mut region = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for i in 0..LP_LIST2.count {
-            region.push(LP_LIST2.data[i]);
+        for i in 0..cx.lp_list2.count {
+            region.push(cx.lp_list2.data[i]);
         }
         let nb = region.count;
         let mut phis = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        let mut x = BLOCKS[h].first;
-        while x != 0 && INSTS[x].op == Phi {
+        let mut x = cx.blocks[h].first;
+        while x != 0 && cx.insts[x].op == Phi {
             phis.push(x);
-            x = INSTS[x].next;
+            x = cx.insts[x].next;
         }
         let mut outs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        x = BLOCKS[e].first;
-        while x != 0 && INSTS[x].op == Phi {
-            outs.push(ir_val(ir_arg(x, 0)));
-            x = INSTS[x].next;
+        x = cx.blocks[e].first;
+        while x != 0 && cx.insts[x].op == Phi {
+            outs.push(ir_val(cx, ir_arg(cx, x, 0)));
+            x = cx.insts[x].next;
         }
         let np = phis.count;
         let ne = outs.count;
@@ -385,10 +387,10 @@ fn unroll_runtime(fi: i64, l: i64, u: i64) {
         let mut onext = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let mut ostart = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for i in 0..np {
-            let nx = ir_val(ir_arg(phis.data[i], li));
+            let nx = ir_val(cx, ir_arg(cx, phis.data[i], li));
             onext.push(nx);
-            ostart.push(ir_val(ir_arg(phis.data[i], hp)));
-            kinds.push(split_reduction(l, phis.data[i], nx, &outs));
+            ostart.push(ir_val(cx, ir_arg(cx, phis.data[i], hp)));
+            kinds.push(split_reduction(cx, l, phis.data[i], nx, &outs));
         }
         // Per copy: its blocks (nb), header phis (np), next values (np), exit
         // values (ne), and the induction variable's next value.
@@ -398,32 +400,32 @@ fn unroll_runtime(fi: i64, l: i64, u: i64) {
         let mut outv = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let mut ivn = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for _ in 0..u {
-            clone_region(fi, &region, stamp);
+            clone_region(cx, fi, &region, stamp);
             for i in 0..nb {
-                blocks.push(BLOCKS[region.data[i]].aux);
+                blocks.push(cx.blocks[region.data[i]].aux);
             }
             for i in 0..np {
-                cphi.push(INSTS[phis.data[i]].aux);
-                next.push(clone_map(ir_val(ir_arg(phis.data[i], li)), stamp));
+                cphi.push(cx.insts[phis.data[i]].aux);
+                next.push(clone_map(cx, ir_val(cx, ir_arg(cx, phis.data[i], li)), stamp));
             }
             for i in 0..ne {
-                outv.push(clone_map(outs.data[i], stamp));
+                outv.push(clone_map(cx, outs.data[i], stamp));
             }
-            ivn.push(clone_map(ir_val(ir_arg(V_IV, li)), stamp));
+            ivn.push(clone_map(cx, ir_val(cx, ir_arg(cx, cx.v_iv, li)), stamp));
         }
         // The copies' checks go: each branch to an unreachable exit jumps on.
         for k in 0..u * nb {
             let b = blocks.data[k];
-            if BLOCKS[b].term == Term::Branch {
-                let a = BLOCKS[b].s0;
-                let c = BLOCKS[b].s1;
-                let out_a = is_unreachable_exit(l, a) && !is_copy_block(&blocks, a);
-                let out_c = is_unreachable_exit(l, c) && !is_copy_block(&blocks, c);
+            if cx.blocks[b].term == Term::Branch {
+                let a = cx.blocks[b].s0;
+                let c = cx.blocks[b].s1;
+                let out_a = is_unreachable_exit(cx, l, a) && !is_copy_block(&blocks, a);
+                let out_c = is_unreachable_exit(cx, l, c) && !is_copy_block(&blocks, c);
                 if out_a != out_c {
-                    BLOCKS[b].term = Term::Jump;
-                    BLOCKS[b].cond = 0;
-                    BLOCKS[b].s0 = if out_a { c } else { a };
-                    BLOCKS[b].s1 = 0;
+                    cx.blocks[b].term = Term::Jump;
+                    cx.blocks[b].cond = 0;
+                    cx.blocks[b].s0 = if out_a { c } else { a };
+                    cx.blocks[b].s1 = 0;
                 }
             }
         }
@@ -434,45 +436,46 @@ fn unroll_runtime(fi: i64, l: i64, u: i64) {
         for k in 1..u {
             for i in 0..np {
                 if kinds.data[i] == 0 {
-                    ir_replace(cphi.data[k * np + i], next.data[(k - 1) * np + i]);
+                    ir_replace(cx, cphi.data[k * np + i], next.data[(k - 1) * np + i]);
                 }
             }
             let ch = blocks.data[k * nb + hi];
-            BLOCKS[ch].preds.count = 0;
-            BLOCKS[ch].preds.push(blocks.data[(k - 1) * nb + lati]);
+            cx.blocks[ch].preds.count = 0;
+            cx.blocks[ch].preds.push(blocks.data[(k - 1) * nb + lati]);
             let pl = blocks.data[(k - 1) * nb + lati];
-            BLOCKS[pl].term = Term::Jump;
-            BLOCKS[pl].cond = 0;
-            BLOCKS[pl].s0 = ch;
-            BLOCKS[pl].s1 = 0;
+            cx.blocks[pl].term = Term::Jump;
+            cx.blocks[pl].cond = 0;
+            cx.blocks[pl].s0 = ch;
+            cx.blocks[pl].s1 = 0;
         }
         let last = blocks.data[(u - 1) * nb + lati];
         // C: the decision.
-        let c = ir_new_block();
-        let up = ir_new_block();
-        let ux = ir_new_block();
-        let sp = ir_new_block();
-        BLOCKS[c].sealed = 1;
-        BLOCKS[up].sealed = 1;
-        BLOCKS[ux].sealed = 1;
-        BLOCKS[sp].sealed = 1;
-        BLOCKS[p].s0 = c;
-        BLOCKS[c].preds.push(p);
-        let trips = append(c, Sub, TY_I64, n, start, 0);
-        let mut ok = cmp(c, Cond::Ge, TY_U64, trips, konst(c, u, TY_I64));
-        let lastv = append(c, Sub, TY_I64, n, konst(c, 1, TY_I64), 0);
-        ok = check_tests(l, c, ok, start, lastv);
-        ir_terminate(c, Term::Branch, ok, up, sp);
+        let c = ir_new_block(cx);
+        let up = ir_new_block(cx);
+        let ux = ir_new_block(cx);
+        let sp = ir_new_block(cx);
+        cx.blocks[c].sealed = 1;
+        cx.blocks[up].sealed = 1;
+        cx.blocks[ux].sealed = 1;
+        cx.blocks[sp].sealed = 1;
+        cx.blocks[p].s0 = c;
+        cx.blocks[c].preds.push(p);
+        let trips = append(cx, c, Sub, TY_I64, n, start, 0);
+        let mut ok = cmp(cx, c, Cond::Ge, TY_U64, trips, konst(cx, c, u, TY_I64));
+        let lastv = append(cx, c, Sub, TY_I64, n, konst(cx, c, 1, TY_I64), 0);
+        ok = check_tests(cx, l, c, ok, start, lastv);
+        ir_terminate(cx, c, Term::Branch, ok, up, sp);
         // UP: the end of the unrolled iterations.
-        let mask = konst(up, 0 - u, TY_I64);
-        let uend = append(up, Add, TY_I64, start, append(up, And, TY_I64, trips, mask, 0), 0);
-        BLOCKS[up].term = Term::Jump;
-        BLOCKS[up].s0 = h0;
-        BLOCKS[h0].preds.data[hp] = up;
-        BLOCKS[h0].preds.data[li] = last;
+        let mask = konst(cx, up, 0 - u, TY_I64);
+        let uend = append(cx, up, Add, TY_I64, start, append(cx, up, And, TY_I64, trips, mask, 0),
+            0);
+        cx.blocks[up].term = Term::Jump;
+        cx.blocks[up].s0 = h0;
+        cx.blocks[h0].preds.data[hp] = up;
+        cx.blocks[h0].preds.data[li] = last;
         for i in 0..np {
             let back = if kinds.data[i] != 0 { next.data[i] } else { next.data[(u - 1) * np + i] };
-            ir_set_arg(cphi.data[i], li, back);
+            ir_set_arg(cx, cphi.data[i], li, back);
         }
         // (0.15) Copy k's accumulators: phis of the first copy's header,
         // from the identity (a minimum's: the start).
@@ -483,36 +486,36 @@ fn unroll_runtime(fi: i64, l: i64, u: i64) {
                 if kind == 0 {
                     continue;
                 }
-                let ty = INSTS[phis.data[i]].ty;
+                let ty = cx.insts[phis.data[i]].ty;
                 let init = if kind < 0 { ostart.data[i] } else {
-                    konst(up, reduction_identity(kind, ty), ty)
+                    konst(cx, up, reduction_identity(kind, ty), ty)
                 };
                 vals.count = 0;
                 vals.push(0);
                 vals.push(0);
                 vals.data[hp] = init;
                 vals.data[li] = next.data[k * np + i];
-                let acc = new_phi_in(h0, ty, &vals, 0, 2);
-                ir_replace(cphi.data[k * np + i], acc);
+                let acc = new_phi_in(cx, h0, ty, &vals, 0, 2);
+                ir_replace(cx, cphi.data[k * np + i], acc);
             }
         }
-        BLOCKS[h0].novec = 1;
+        cx.blocks[h0].novec = 1;
         // The last copy's latch.
-        let more = cmp(last, Cond::Ne, TY_I64, ivn.data[u - 1], uend);
-        BLOCKS[last].term = Term::Branch;
-        BLOCKS[last].cond = more;
-        BLOCKS[last].s0 = h0;
-        BLOCKS[last].s1 = ux;
-        BLOCKS[ux].preds.push(last);
+        let more = cmp(cx, last, Cond::Ne, TY_I64, ivn.data[u - 1], uend);
+        cx.blocks[last].term = Term::Branch;
+        cx.blocks[last].cond = more;
+        cx.blocks[last].s0 = h0;
+        cx.blocks[last].s1 = ux;
+        cx.blocks[ux].preds.push(last);
         // UX: done, or the rest in the scalar loop.
-        let done = cmp(ux, Cond::Eq, TY_I64, uend, n);
-        ir_terminate(ux, Term::Branch, done, e, sp);
-        BLOCKS[e].preds.count -= 1;
+        let done = cmp(cx, ux, Cond::Eq, TY_I64, uend, n);
+        ir_terminate(cx, ux, Term::Branch, done, e, sp);
+        cx.blocks[e].preds.count -= 1;
         // (0.15) The reductions' accumulators combined.
         let mut comb = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for i in 0..np {
-            comb.push(combine_accumulators(ux, kinds.data[i], phis.data[i], onext.data[i], &next,
-                np, i, u));
+            comb.push(combine_accumulators(cx, ux, kinds.data[i], phis.data[i], onext.data[i],
+                &next, np, i, u));
         }
         vals.count = 0;
         for i in 0..ne {
@@ -524,19 +527,19 @@ fn unroll_runtime(fi: i64, l: i64, u: i64) {
             }
             vals.push(x);
         }
-        add_pred_values(e, ux, &vals, 0);
+        add_pred_values(cx, e, ux, &vals, 0);
         // SP: the scalar loop's preheader, from C or UX.
         for i in 0..np {
             vals.count = 0;
-            vals.push(ir_val(ir_arg(phis.data[i], hp)));
+            vals.push(ir_val(cx, ir_arg(cx, phis.data[i], hp)));
             vals.push(comb.data[i]);
-            let r = new_phi_in(sp, INSTS[phis.data[i]].ty, &vals, 0, 2);
-            ir_set_arg(phis.data[i], hp, r);
+            let r = new_phi_in(cx, sp, cx.insts[phis.data[i]].ty, &vals, 0, 2);
+            ir_set_arg(cx, phis.data[i], hp, r);
         }
-        ir_terminate(sp, Term::Jump, 0, h, 0);
-        BLOCKS[h].preds.count -= 1;
-        BLOCKS[h].preds.data[hp] = sp;
-        BLOCKS[h].novec = 1;
+        ir_terminate(cx, sp, Term::Jump, 0, h, 0);
+        cx.blocks[h].preds.count -= 1;
+        cx.blocks[h].preds.data[hp] = sp;
+        cx.blocks[h].novec = 1;
         free(vals.data as *u8);
         free(region.data as *u8);
         free(phis.data as *u8);
@@ -576,45 +579,45 @@ pub static mut UNROLL_RUNTIME: bool = true;
 
 // Unrolls the innermost counted loops of fi whose trip count is known at
 // run time only; returns whether any was (fresh: the loop forest is current).
-pub fn unroll_runtime_loops(fi: i64, fresh: bool) -> bool {
+pub fn unroll_runtime_loops(mut cx: *FnCtx, fi: i64, fresh: bool) -> bool {
     unsafe {
         if !UNROLL_RUNTIME {
             return false;
         }
         if !fresh {
-            canonicalize_loops(fi);
+            canonicalize_loops(cx, fi);
         }
         let mut headers = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for l in 0..loop_count() {
-            if loop_header(l) != IRFUNCS[fi].entry && is_innermost(l)
-                && BLOCKS[loop_header(l)].novec == 0 {
-                headers.push(loop_header(l));
+        for l in 0..loop_count(cx) {
+            if loop_header(cx, l) != IRFUNCS[fi].entry && is_innermost(cx, l)
+                && cx.blocks[loop_header(cx, l)].novec == 0 {
+                headers.push(loop_header(cx, l));
             }
         }
         let mut changed = false;
         let mut stale = false;
         for i in 0..headers.count {
             if stale {
-                canonicalize_loops(fi);
+                canonicalize_loops(cx, fi);
                 stale = false;
             }
-            let l = innermost_loop(headers.data[i]);
-            if l < 0 || loop_header(l) != headers.data[i] || !is_canonical(l) {
+            let l = innermost_loop(cx, headers.data[i]);
+            if l < 0 || loop_header(cx, l) != headers.data[i] || !is_canonical(cx, l) {
                 continue;
             }
-            if runtime_factor(l) == 0 {
+            if runtime_factor(cx, l) == 0 {
                 continue;
             }
-            if form_lcssa(fi, l) {
-                resolve_all(fi);
+            if form_lcssa(cx, fi, l) {
+                resolve_all(cx, fi);
             }
-            let u = runtime_factor(l);
+            let u = runtime_factor(cx, l);
             if u > 0 {
-                unroll_runtime(fi, l, u);
+                unroll_runtime(cx, fi, l, u);
                 changed = true;
                 stale = true;
-                resolve_all(fi);
-                verify_func(fi, c"unrolling (run-time trip count)");
+                resolve_all(cx, fi);
+                verify_func(cx, fi, c"unrolling (run-time trip count)");
             }
         }
         free(headers.data as *u8);

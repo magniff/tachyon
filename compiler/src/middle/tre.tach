@@ -16,69 +16,71 @@
 // `ret` of the phi's operand in each predecessor.
 use crate::base::{IntVec, free};
 use crate::front::types::{FNS, is_integer};
+use crate::middle::ctx::FnCtx;
 use crate::middle::fold::all_ones;
 use crate::middle::inline::ir_callee;
 use crate::middle::ir::{
-    ARGS, ARGTY, BLOCKS, INSTS, IRFUNCS, Op, Term, ir_append, ir_arg, ir_enter, ir_make,
-    ir_new_block, ir_operand, ir_operand_count, ir_prepend, ir_set_arg, ir_type, ir_unlink, ir_val,
+    IRFUNCS, Op, Term, ir_append, ir_arg, ir_enter, ir_make, ir_new_block, ir_operand,
+    ir_operand_count, ir_prepend, ir_set_arg, ir_type, ir_unlink, ir_val,
 };
 use crate::middle::ir::Op::{Add, And, Const, Mul, Or, Param, Phi, Slot, Xor};
 use crate::middle::loops::clone_inst;
 use crate::middle::opt::{remove_unreachable, resolve_all};
 use crate::middle::scev::{append_const, append_inst};
 
-fn split_returns(fi: i64) {
+fn split_returns(mut cx: *FnCtx, fi: i64) {
     unsafe {
         for i in 0..IRFUNCS[fi].blocks.count {
             let r = IRFUNCS[fi].blocks.data[i];
-            if BLOCKS[r].removed != 0 || BLOCKS[r].term != Term::Ret || BLOCKS[r].preds.count < 2 {
+            if cx.blocks[r].removed != 0 || cx.blocks[r].term != Term::Ret
+                || cx.blocks[r].preds.count < 2 {
                 continue;
             }
-            let phi = ir_val(BLOCKS[r].cond);
-            if phi == 0 || INSTS[phi].op != Phi || INSTS[phi].block != r
-                || BLOCKS[r].first != phi || BLOCKS[r].last != phi {
+            let phi = ir_val(cx, cx.blocks[r].cond);
+            if phi == 0 || cx.insts[phi].op != Phi || cx.insts[phi].block != r
+                || cx.blocks[r].first != phi || cx.blocks[r].last != phi {
                 continue;
             }
             let mut jumps = true;
-            for k in 0..BLOCKS[r].preds.count {
-                if BLOCKS[BLOCKS[r].preds.data[k]].term != Term::Jump {
+            for k in 0..cx.blocks[r].preds.count {
+                if cx.blocks[cx.blocks[r].preds.data[k]].term != Term::Jump {
                     jumps = false;
                 }
             }
             if !jumps {
                 continue;
             }
-            for k in 0..BLOCKS[r].preds.count {
-                let p = BLOCKS[r].preds.data[k];
-                BLOCKS[p].term = Term::Ret;
-                BLOCKS[p].cond = ir_val(ir_arg(phi, k));
-                BLOCKS[p].s0 = 0;
+            for k in 0..cx.blocks[r].preds.count {
+                let p = cx.blocks[r].preds.data[k];
+                cx.blocks[p].term = Term::Ret;
+                cx.blocks[p].cond = ir_val(cx, ir_arg(cx, phi, k));
+                cx.blocks[p].s0 = 0;
             }
-            BLOCKS[r].preds.count = 0;
+            cx.blocks[r].preds.count = 0;
         }
     }
-    remove_unreachable(fi);
+    remove_unreachable(cx, fi);
 }
 
 // The number of uses of v in function fi (operands and conditions).
-fn use_count(fi: i64, v: i64) -> i64 {
+fn use_count(mut cx: *FnCtx, fi: i64, v: i64) -> i64 {
     let mut n = 0;
     unsafe {
         for i in 0..IRFUNCS[fi].blocks.count {
             let b = IRFUNCS[fi].blocks.data[i];
-            if BLOCKS[b].removed != 0 {
+            if cx.blocks[b].removed != 0 {
                 continue;
             }
-            let mut u = BLOCKS[b].first;
+            let mut u = cx.blocks[b].first;
             while u != 0 {
-                for k in 0..ir_operand_count(u) {
-                    if ir_val(ir_operand(u, k)) == v {
+                for k in 0..ir_operand_count(cx, u) {
+                    if ir_val(cx, ir_operand(cx, u, k)) == v {
                         n += 1;
                     }
                 }
-                u = INSTS[u].next;
+                u = cx.insts[u].next;
             }
-            if BLOCKS[b].cond != 0 && ir_val(BLOCKS[b].cond) == v {
+            if cx.blocks[b].cond != 0 && ir_val(cx, cx.blocks[b].cond) == v {
                 n += 1;
             }
         }
@@ -89,43 +91,44 @@ fn use_count(fi: i64, v: i64) -> i64 {
 // The recursive call of a tail site: block b returns `call` or `call op y`;
 // *y is the other operand (0 for a plain tail call), *op its operation.
 // Returns the call, or 0.
-fn tail_site(fi: i64, b: i64, op: *Op, y: *i64) -> i64 {
+fn tail_site(mut cx: *FnCtx, fi: i64, b: i64, op: *Op, y: *i64) -> i64 {
     unsafe {
-        if BLOCKS[b].term != Term::Ret {
+        if cx.blocks[b].term != Term::Ret {
             return 0;
         }
-        let r = ir_val(BLOCKS[b].cond);
-        if r == 0 || INSTS[r].block != b {
+        let r = ir_val(cx, cx.blocks[b].cond);
+        if r == 0 || cx.insts[r].block != b {
             return 0;
         }
         let mut call = 0;
-        if ir_callee(r) == fi {
+        if ir_callee(cx, r) == fi {
             call = r;
             *y = 0;
         } else {
-            let o = INSTS[r].op;
+            let o = cx.insts[r].op;
             if !(o == Add || o == Mul || o == And || o == Or || o == Xor)
-                || !is_integer(INSTS[r].ty) {
+                || !is_integer(cx.insts[r].ty) {
                 return 0;
             }
-            let a = ir_val(INSTS[r].a);
-            let c = ir_val(INSTS[r].b);
+            let a = ir_val(cx, cx.insts[r].a);
+            let c = ir_val(cx, cx.insts[r].b);
             // (When both are calls to itself, the later one.)
-            if ir_callee(c) == fi && INSTS[c].block == b && a != c && only_pure_after(c, r) {
+            if ir_callee(cx, c) == fi && cx.insts[c].block == b && a != c
+                && only_pure_after(cx, c, r) {
                 call = c;
                 *y = a;
-            } else if ir_callee(a) == fi && INSTS[a].block == b && a != c {
+            } else if ir_callee(cx, a) == fi && cx.insts[a].block == b && a != c {
                 call = a;
                 *y = c;
             } else {
                 return 0;
             }
             *op = o;
-            if use_count(fi, call) != 1 || use_count(fi, r) != 1 {
+            if use_count(cx, fi, call) != 1 || use_count(cx, fi, r) != 1 {
                 return 0;
             }
         }
-        if !only_pure_after(call, r) {
+        if !only_pure_after(cx, call, r) {
             return 0;
         }
         call
@@ -134,22 +137,22 @@ fn tail_site(fi: i64, b: i64, op: *Op, y: *i64) -> i64 {
 
 // Whether nothing with an effect follows instruction `call` in its block
 // (the operation r and pure instructions only).
-fn only_pure_after(call: i64, r: i64) -> bool {
+fn only_pure_after(mut cx: *FnCtx, call: i64, r: i64) -> bool {
     unsafe {
-        let mut v = INSTS[call].next;
+        let mut v = cx.insts[call].next;
         while v != 0 {
-            if v != r && !INSTS[v].op.is_pure() && INSTS[v].op != Const {
+            if v != r && !cx.insts[v].op.is_pure() && cx.insts[v].op != Const {
                 return false;
             }
-            v = INSTS[v].next;
+            v = cx.insts[v].next;
         }
         true
     }
 }
 
-pub fn eliminate_tail_recursion(fi: i64) -> bool {
+pub fn eliminate_tail_recursion(mut cx: *FnCtx, fi: i64) -> bool {
     unsafe {
-        ir_enter(fi);
+        ir_enter(cx, fi);
         let f = IRFUNCS[fi].f;
         if IRFUNCS[fi].result_ptr != 0 || !is_integer(ir_type(FNS[f].ret)) {
             return false;
@@ -159,41 +162,41 @@ pub fn eliminate_tail_recursion(fi: i64) -> bool {
         let mut any_call = false;
         for i in 0..IRFUNCS[fi].blocks.count {
             let b = IRFUNCS[fi].blocks.data[i];
-            if BLOCKS[b].removed != 0 {
+            if cx.blocks[b].removed != 0 {
                 continue;
             }
-            let mut v = BLOCKS[b].first;
+            let mut v = cx.blocks[b].first;
             while v != 0 {
-                let op = INSTS[v].op;
-                if op == Slot || (op == Param && (INSTS[v].imm < 0 || INSTS[v].imm2 != 0)) {
+                let op = cx.insts[v].op;
+                if op == Slot || (op == Param && (cx.insts[v].imm < 0 || cx.insts[v].imm2 != 0)) {
                     return false;
                 }
                 if op == Param && b != entry {
                     return false;
                 }
-                if ir_callee(v) == fi {
+                if ir_callee(cx, v) == fi {
                     any_call = true;
                 }
-                v = INSTS[v].next;
+                v = cx.insts[v].next;
             }
         }
         if !any_call {
             return false;
         }
-        resolve_all(fi);
-        split_returns(fi);
+        resolve_all(cx, fi);
+        split_returns(cx, fi);
         // The tail sites, all with one operation.
         let mut sites = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let mut acc_op = Op::None;
         let mut ok = true;
         for i in 0..IRFUNCS[fi].blocks.count {
             let b = IRFUNCS[fi].blocks.data[i];
-            if BLOCKS[b].removed != 0 {
+            if cx.blocks[b].removed != 0 {
                 continue;
             }
             let mut op = Op::None;
             let mut y = 0;
-            let call = tail_site(fi, b, &op, &y);
+            let call = tail_site(cx, fi, b, &op, &y);
             if call == 0 {
                 continue;
             }
@@ -214,14 +217,14 @@ pub fn eliminate_tail_recursion(fi: i64) -> bool {
         let ty = ir_type(FNS[f].ret);
         // A new entry holds the parameters and jumps to the old one, the loop's
         // header. Each parameter becomes a phi there (its uses follow).
-        let e2 = ir_new_block();
-        BLOCKS[e2].sealed = 1;
-        let old_preds = BLOCKS[entry].preds.count;
+        let e2 = ir_new_block(cx);
+        cx.blocks[e2].sealed = 1;
+        let old_preds = cx.blocks[entry].preds.count;
         let mut params = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        let mut v = BLOCKS[entry].first;
+        let mut v = cx.blocks[entry].first;
         while v != 0 {
-            let next = INSTS[v].next;
-            if INSTS[v].op == Param {
+            let next = cx.insts[v].next;
+            if cx.insts[v].op == Param {
                 params.push(v);
             }
             v = next;
@@ -230,87 +233,89 @@ pub fn eliminate_tail_recursion(fi: i64) -> bool {
         let npreds = old_preds + 1 + nsites;
         for i in 0..params.count {
             let p = params.data[i];
-            let fresh = clone_inst(p);
-            ir_append(e2, fresh);
-            ir_unlink(p);
-            INSTS[p].op = Phi;
-            INSTS[p].a = 0;
-            INSTS[p].b = 0;
-            INSTS[p].imm = 0;
-            INSTS[p].imm2 = 0;
-            INSTS[p].args = ARGS.count;
-            INSTS[p].nargs = npreds;
-            let index = INSTS[fresh].imm;
+            let fresh = clone_inst(cx, p);
+            ir_append(cx, e2, fresh);
+            ir_unlink(cx, p);
+            cx.insts[p].op = Phi;
+            cx.insts[p].a = 0;
+            cx.insts[p].b = 0;
+            cx.insts[p].imm = 0;
+            cx.insts[p].imm2 = 0;
+            cx.insts[p].args = cx.args.count;
+            cx.insts[p].nargs = npreds;
+            let index = cx.insts[fresh].imm;
             for k in 0..old_preds {
-                ARGS.push(p);
-                ARGTY.push(0);
+                cx.args.push(p);
+                cx.argty.push(0);
             }
-            ARGS.push(fresh);
-            ARGTY.push(0);
+            cx.args.push(fresh);
+            cx.argty.push(0);
             for s in 0..nsites {
-                ARGS.push(ir_arg(sites.data[3 * s + 1], index));
-                ARGTY.push(0);
+                cx.args.push(ir_arg(cx, sites.data[3 * s + 1], index));
+                cx.argty.push(0);
             }
-            ir_prepend(entry, p);
+            ir_prepend(cx, entry, p);
         }
         let mut acc = 0;
         if acc_op != Op::None {
             let identity = if acc_op == Mul { 1 } else if acc_op == And { all_ones(ty) } else { 0 };
-            let start = append_const(e2, identity, ty);
-            acc = ir_make(Phi, ty, 0, 0, 0);
-            INSTS[acc].args = ARGS.count;
-            INSTS[acc].nargs = npreds;
+            let start = append_const(cx, e2, identity, ty);
+            acc = ir_make(cx, Phi, ty, 0, 0, 0);
+            cx.insts[acc].args = cx.args.count;
+            cx.insts[acc].nargs = npreds;
             for k in 0..old_preds {
-                ARGS.push(acc);
-                ARGTY.push(0);
+                cx.args.push(acc);
+                cx.argty.push(0);
             }
-            ARGS.push(start);
-            ARGTY.push(0);
+            cx.args.push(start);
+            cx.argty.push(0);
             for s in 0..nsites {
-                ARGS.push(0);
-                ARGTY.push(0);
+                cx.args.push(0);
+                cx.argty.push(0);
             }
-            ir_prepend(entry, acc);
+            ir_prepend(cx, entry, acc);
         }
-        BLOCKS[e2].term = Term::Jump;
-        BLOCKS[e2].s0 = entry;
-        BLOCKS[entry].preds.push(e2);
+        cx.blocks[e2].term = Term::Jump;
+        cx.blocks[e2].s0 = entry;
+        cx.blocks[entry].preds.push(e2);
         IRFUNCS[fi].entry = e2;
         // The tail sites jump back.
         for s in 0..nsites {
             let b = sites.data[3 * s];
             let call = sites.data[3 * s + 1];
             let y = sites.data[3 * s + 2];
-            let r = ir_val(BLOCKS[b].cond);
+            let r = ir_val(cx, cx.blocks[b].cond);
             let mut next_acc = acc;
             if r != call {
-                ir_unlink(r);
+                ir_unlink(cx, r);
             }
-            ir_unlink(call);
+            ir_unlink(cx, call);
             if acc != 0 {
                 if y != 0 {
-                    next_acc = append_inst(b, acc_op, ty, acc, y);
+                    next_acc = append_inst(cx, b, acc_op, ty, acc, y);
                 }
-                ir_set_arg(acc, old_preds + 1 + s, next_acc);
+                ir_set_arg(cx, acc, old_preds + 1 + s, next_acc);
             }
-            BLOCKS[b].term = Term::Jump;
-            BLOCKS[b].cond = 0;
-            BLOCKS[b].s0 = entry;
-            BLOCKS[entry].preds.push(b);
+            cx.blocks[b].term = Term::Jump;
+            cx.blocks[b].cond = 0;
+            cx.blocks[b].s0 = entry;
+            cx.blocks[entry].preds.push(b);
         }
         // The other returns combine their value with the accumulator.
         if acc != 0 {
             for i in 0..IRFUNCS[fi].blocks.count {
                 let b = IRFUNCS[fi].blocks.data[i];
-                if BLOCKS[b].removed != 0 || BLOCKS[b].term != Term::Ret || BLOCKS[b].cond == 0 {
+                if cx.blocks[b].removed != 0 || cx.blocks[b].term != Term::Ret
+                    || cx.blocks[b].cond == 0 {
                     continue;
                 }
-                BLOCKS[b].cond = append_inst(b, acc_op, ty, acc, ir_val(BLOCKS[b].cond));
+                cx.blocks[b].cond = append_inst(cx, b, acc_op, ty, acc,
+                    ir_val(cx, cx.blocks[b].cond));
             }
         }
         free(params.data as *u8);
         free(sites.data as *u8);
-        resolve_all(fi);
+        resolve_all(cx, fi);
         true
     }
 }

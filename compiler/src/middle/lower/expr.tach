@@ -23,9 +23,10 @@ use crate::front::types::{
     variant_field_offset,
 };
 use crate::gen0::gen::expr::{field_offset_of, panic_kind, pointer_place};
+use crate::middle::ctx::FnCtx;
 use crate::middle::ir::{
-    CUR, Cond, INSTS, IR_CALL_LOCS, IR_EXPR_LOC, Op, Term, cond_of_token, emit_ir, ir_binary,
-    ir_cmp, ir_const, ir_load, ir_new_block, ir_offset, ir_slot_addr, ir_store, ir_type,
+    CUR, Cond, IR_CALL_LOCS, IR_EXPR_LOC, Op, Term, cond_of_token, emit_ir, ir_binary, ir_cmp,
+    ir_const, ir_load, ir_new_block, ir_offset, ir_slot_addr, ir_store, ir_type,
 };
 use crate::middle::ir::cfg::ir_terminate;
 use crate::middle::lower::{
@@ -38,7 +39,7 @@ use crate::middle::lower::calls::{
 use crate::middle::lower::control::{LOOP_INFO, lower_break, lower_for, lower_if, lower_loop};
 use crate::middle::lower::matching::lower_match;
 use crate::middle::lower::ssa::{
-    LOCAL_ADDR, PROMOTE, SSA_STACK, ir_seal, new_synth_var, ssa_read, ssa_undef, ssa_write,
+    LOCAL_ADDR, PROMOTE, ir_seal, new_synth_var, ssa_read, ssa_undef, ssa_write,
 };
 use crate::middle::lower::vector::{lower_vecop, vec_operand, vec_result, vector_operator};
 
@@ -46,109 +47,109 @@ use crate::middle::lower::vector::{lower_vecop, vec_operand, vec_result, vector_
 
 // `value`, or an undefined value of type `ty` when there is none (in code
 // after a diverging expression).
-pub fn need_value(value: i64, ty: i64) -> i64 {
+pub fn need_value(mut cx: *FnCtx, value: i64, ty: i64) -> i64 {
     if value != 0 || is_void(ty) {
         return value;
     }
-    ssa_undef(ir_type(ty))
+    ssa_undef(cx, ir_type(ty))
 }
 
-pub fn lower_operand(n: i64) -> i64 {
-    unsafe { need_value(lower_expr(n), NODES[n].ty) }
+pub fn lower_operand(mut cx: *FnCtx, n: i64) -> i64 {
+    unsafe { need_value(cx, lower_expr(cx, n), NODES[n].ty) }
 }
 
-fn load_scalar(addr: i64, ty: i64) -> i64 {
+fn load_scalar(mut cx: *FnCtx, addr: i64, ty: i64) -> i64 {
     if is_compound(ty) {
         return addr;
     }
     if is_void(ty) {
         return 0;
     }
-    ir_load(ir_type(ty), addr, 0)
+    ir_load(cx, ir_type(ty), addr, 0)
 }
 
-pub fn lower_expr(n: i64) -> i64 {
+pub fn lower_expr(mut cx: *FnCtx, n: i64) -> i64 {
     if IR_CALL_LOCS {
         unsafe {
             IR_EXPR_LOC = NODES[n].start + 1;
         }
     }
-    let value = lower_expr_inner(n);
+    let value = lower_expr_inner(cx, n);
     if unsafe { NODES[n].ty == TY_NEVER } {
-        if !is_dead_block(CUR) {
-            ir_terminate(CUR, Term::Unreach, 0, 0, 0);
-            start_dead_block();
+        if !is_dead_block(cx, CUR) {
+            ir_terminate(cx, CUR, Term::Unreach, 0, 0, 0);
+            start_dead_block(cx);
         }
         return 0;
     }
     value
 }
 
-fn lower_expr_inner(n: i64) -> i64 {
+fn lower_expr_inner(mut cx: *FnCtx, n: i64) -> i64 {
     unsafe {
         let ty = NODES[n].ty;
         match NODES[n].kind {
-            Int | Char => ir_const(wrap_int(NODES[n].a, ty), ir_type(ty)),
-            Float => ir_const(float_const(f64_of_bits(NODES[n].a), ty), ty),
-            Bool => ir_const(NODES[n].a, TY_BOOL),
+            Int | Char => ir_const(cx, wrap_int(NODES[n].a, ty), ir_type(ty)),
+            Float => ir_const(cx, float_const(f64_of_bits(NODES[n].a), ty), ty),
+            Bool => ir_const(cx, NODES[n].a, TY_BOOL),
             Unit => 0,
-            Str => lower_string(n),
-            CStr => emit_ir(Op::SAddr, TY_U64, 0, 0, NODES[n].a),
-            Ident => lower_ident(n),
-            Binary => lower_binary(n),
-            Unary => lower_unary(n),
+            Str => lower_string(cx, n),
+            CStr => emit_ir(cx, Op::SAddr, TY_U64, 0, 0, NODES[n].a),
+            Ident => lower_ident(cx, n),
+            Binary => lower_binary(cx, n),
+            Unary => lower_unary(cx, n),
             Cast => {
                 let operand = NODES[n].a;
-                let value = lower_expr(operand);
-                lower_cast(value, NODES[operand].ty, ty)
+                let value = lower_expr(cx, operand);
+                lower_cast(cx, value, NODES[operand].ty, ty)
             }
-            Call => lower_call(n),
-            Index if NODES[NODES[n].b].kind == Range => lower_slicing(n),
-            Index | FieldAccess | TupleField => load_scalar(lower_addr(n), ty),
-            VariantLit => lower_variant(n),
-            NodeKind::VecOp => lower_vecop(n),
+            Call => lower_call(cx, n),
+            Index if NODES[NODES[n].b].kind == Range => lower_slicing(cx, n),
+            Index | FieldAccess | TupleField => load_scalar(cx, lower_addr(cx, n), ty),
+            VariantLit => lower_variant(cx, n),
+            NodeKind::VecOp => lower_vecop(cx, n),
             // (0.14: its env, or its function as a value)
-            NodeKind::Closure => lower_expr(NODES[n].y),
+            NodeKind::Closure => lower_expr(cx, NODES[n].y),
             // (0.15: the Match of `?`, the Block of an f-string)
-            NodeKind::Try | NodeKind::Interp => lower_expr(NODES[n].y),
-            Match => lower_match(n),
-            Tuple | Array | StructLit => lower_aggregate(n),
-            Repeat => lower_repeat(n),
-            NodeKind::Block => lower_block(n),
-            If => lower_if(n),
-            Loop | While => lower_loop(n),
+            NodeKind::Try | NodeKind::Interp => lower_expr(cx, NODES[n].y),
+            Match => lower_match(cx, n),
+            Tuple | Array | StructLit => lower_aggregate(cx, n),
+            Repeat => lower_repeat(cx, n),
+            NodeKind::Block => lower_block(cx, n),
+            If => lower_if(cx, n),
+            Loop | While => lower_loop(cx, n),
             For => {
-                lower_for(n);
+                lower_for(cx, n);
                 0
             }
             Assign => {
-                lower_assign(n);
+                lower_assign(cx, n);
                 0
             }
             EnumPanic => {
                 let operand = NODES[n].a;
-                let value = lower_cast(lower_operand(operand), NODES[operand].ty, TY_I64);
-                lower_panic(NODES[n].x, value, site_of(n, 0));
+                let value = lower_cast(cx, lower_operand(cx, operand), NODES[operand].ty, TY_I64);
+                lower_panic(cx, NODES[n].x, value, site_of(n, 0));
                 0
             }
             Return => {
                 let mut value = 0;
                 if NODES[n].a != 0 {
-                    value = keep_value(lower_expr(NODES[n].a), NODES[NODES[n].a].ty, 0);
+                    value = keep_value(cx, lower_expr(cx, NODES[n].a), NODES[NODES[n].a].ty, 0);
                 }
-                lower_defers(0);
-                lower_return(value);
+                lower_defers(cx, 0);
+                lower_return(cx, value);
                 0
             }
             Break => {
-                lower_break(n);
+                lower_break(cx, n);
                 0
             }
             Continue => {
                 let info = NODES[NODES[n].x].z;
-                lower_defers(defer_loop_depth(NODES[n].x));
-                lower_jump(LOOP_INFO.data[info]);
-                start_dead_block();
+                lower_defers(cx, defer_loop_depth(NODES[n].x));
+                lower_jump(cx, LOOP_INFO.data[info]);
+                start_dead_block(cx);
                 0
             }
             _ => type_error(n, c"internal error: unexpected node in IR lowering"),
@@ -156,16 +157,16 @@ fn lower_expr_inner(n: i64) -> i64 {
     }
 }
 
-fn lower_string(n: i64) -> i64 {
-    let base = ir_slot_addr(new_slot_for(TY_STRING));
+fn lower_string(mut cx: *FnCtx, n: i64) -> i64 {
+    let base = ir_slot_addr(cx, new_slot_for(cx, TY_STRING));
     unsafe {
-        ir_store(TY_U64, base, emit_ir(Op::SAddr, TY_U64, 0, 0, NODES[n].a), 0);
-        ir_store(TY_U64, base, ir_const(str_at(NODES[n].a).len as i64, TY_U64), 8);
+        ir_store(cx, TY_U64, base, emit_ir(cx, Op::SAddr, TY_U64, 0, 0, NODES[n].a), 0);
+        ir_store(cx, TY_U64, base, ir_const(cx, str_at(NODES[n].a).len as i64, TY_U64), 8);
     }
     base
 }
 
-fn lower_ident(n: i64) -> i64 {
+fn lower_ident(mut cx: *FnCtx, n: i64) -> i64 {
     unsafe {
         let ty = NODES[n].ty;
         let resolution = NODES[n].res;
@@ -175,51 +176,51 @@ fn lower_ident(n: i64) -> i64 {
                 return 0;
             }
             if PROMOTE[index] != 0 {
-                return ssa_read(index, CUR);
+                return ssa_read(cx, index, CUR);
             }
-            return load_scalar(LOCAL_ADDR[index], ty);
+            return load_scalar(cx, LOCAL_ADDR[index], ty);
         }
         if resolution == Res::Const {
-            return ir_const(const_value(index), ir_type(ty));
+            return ir_const(cx, const_value(index), ir_type(ty));
         }
         if resolution == Res::Static {
-            return load_scalar(emit_ir(Op::GAddr, TY_U64, 0, 0, NODES[n].a), ty);
+            return load_scalar(cx, emit_ir(cx, Op::GAddr, TY_U64, 0, 0, NODES[n].a), ty);
         }
-        emit_ir(Op::FAddr, TY_U64, 0, 0, index)
+        emit_ir(cx, Op::FAddr, TY_U64, 0, 0, index)
     }
 }
 
 // The pointer base of `p[i]` or `p[lo..hi]`, before its index or bounds:
 // a place's address (`pointer_place`), 0 for a promoted local, else its
 // value. `late_pointer` gives the pointer after them.
-fn early_pointer(base: i64) -> i64 {
+fn early_pointer(mut cx: *FnCtx, base: i64) -> i64 {
     unsafe {
         if NODES[base].kind == Ident && NODES[base].res == Res::Local
             && PROMOTE[NODES[base].y] != 0 {
             return 0;
         }
         if pointer_place(base) {
-            return lower_addr(base);
+            return lower_addr(cx, base);
         }
-        lower_operand(base)
+        lower_operand(cx, base)
     }
 }
 
-fn late_pointer(base: i64, early: i64) -> i64 {
+fn late_pointer(mut cx: *FnCtx, base: i64, early: i64) -> i64 {
     unsafe {
         if NODES[base].kind == Ident && NODES[base].res == Res::Local
             && PROMOTE[NODES[base].y] != 0 {
-            return lower_operand(base);
+            return lower_operand(cx, base);
         }
         if pointer_place(base) {
-            return ir_load(TY_U64, early, 0);
+            return ir_load(cx, TY_U64, early, 0);
         }
         early
     }
 }
 
 // The address of a place (or of a compound value).
-pub fn lower_addr(n: i64) -> i64 {
+pub fn lower_addr(mut cx: *FnCtx, n: i64) -> i64 {
     unsafe {
         match NODES[n].kind {
             Ident if NODES[n].res == Res::Local => {
@@ -229,22 +230,23 @@ pub fn lower_addr(n: i64) -> i64 {
                 }
                 LOCAL_ADDR[local]
             }
-            Ident if NODES[n].res == Res::Static => emit_ir(Op::GAddr, TY_U64, 0, 0, NODES[n].a),
+            Ident if NODES[n].res
+                == Res::Static => emit_ir(cx, Op::GAddr, TY_U64, 0, 0, NODES[n].a),
             Unary if NODES[n].op == Tok::Star => {
-                let addr = lower_operand(NODES[n].b);
-                raw_check(n, addr, ir_const(type_size(NODES[n].ty), TY_U64));
+                let addr = lower_operand(cx, NODES[n].b);
+                raw_check(cx, n, addr, ir_const(cx, type_size(NODES[n].ty), TY_U64));
                 addr
             }
             FieldAccess => {
-                let addr = lower_operand(NODES[n].a);
-                let field = ir_offset(addr, field_offset_of(n));
-                raw_check(n, field, ir_const(type_size(NODES[n].ty), TY_U64));
+                let addr = lower_operand(cx, NODES[n].a);
+                let field = ir_offset(cx, addr, field_offset_of(n));
+                raw_check(cx, n, field, ir_const(cx, type_size(NODES[n].ty), TY_U64));
                 field
             }
             TupleField => {
                 let base = NODES[n].a;
-                let addr = lower_operand(base);
-                ir_offset(addr, tuple_offset(NODES[base].ty, NODES[n].b))
+                let addr = lower_operand(cx, base);
+                ir_offset(cx, addr, tuple_offset(NODES[base].ty, NODES[n].b))
             }
             Index => {
                 let base = NODES[n].a;
@@ -253,31 +255,32 @@ pub fn lower_addr(n: i64) -> i64 {
                 // A slice's address (its pointer and length are read after
                 // the index), an array's, or a pointer read after it.
                 let is_pointer = TYPES[base_ty].kind == TyKind::Ptr;
-                let mut addr = if is_pointer { early_pointer(base) } else { lower_operand(base) };
-                let index = lower_operand(NODES[n].b);
+                let mut addr = if is_pointer { early_pointer(cx, base) }
+                    else { lower_operand(cx, base) };
+                let index = lower_operand(cx, NODES[n].b);
                 if is_pointer {
-                    addr = late_pointer(base, addr);
+                    addr = late_pointer(cx, base, addr);
                 } else if is_slice(base_ty) {
-                    let length = ir_load(TY_U64, addr, 8);
-                    lower_check(ir_cmp(Cond::Lt, TY_U64, index, length),
+                    let length = ir_load(cx, TY_U64, addr, 8);
+                    lower_check(cx, ir_cmp(cx, Cond::Lt, TY_U64, index, length),
                         panic_kind(NODES[NODES[n].b].ty, false), index, length, 0, site_of(n, 0));
-                    addr = ir_load(TY_U64, addr, 0);
+                    addr = ir_load(cx, TY_U64, addr, 0);
                 } else if TYPES[base_ty].kind == TyKind::Array {
                     // Checked (0.7), against the constant length: SCCP and
                     // the value ranges remove what they prove.
-                    let length = ir_const(TYPES[base_ty].b, TY_U64);
-                    lower_check(ir_cmp(Cond::Lt, TY_U64, index, length),
+                    let length = ir_const(cx, TYPES[base_ty].b, TY_U64);
+                    lower_check(cx, ir_cmp(cx, Cond::Lt, TY_U64, index, length),
                         panic_kind(NODES[NODES[n].b].ty, false), index, length, 0, site_of(n, 0));
                 }
                 let mut scaled = index;
                 if elem_size != 1 {
-                    scaled = ir_binary(Op::Mul, TY_U64, index, ir_const(elem_size, TY_U64));
+                    scaled = ir_binary(cx, Op::Mul, TY_U64, index, ir_const(cx, elem_size, TY_U64));
                 }
-                let at = ir_binary(Op::Add, TY_U64, addr, scaled);
-                raw_check(n, at, ir_const(elem_size, TY_U64));
+                let at = ir_binary(cx, Op::Add, TY_U64, addr, scaled);
+                raw_check(cx, n, at, ir_const(cx, elem_size, TY_U64));
                 at
             }
-            _ => lower_operand(n),
+            _ => lower_operand(cx, n),
         }
     }
 }
@@ -300,145 +303,147 @@ pub fn arith_op(token: Tok) -> Op {
 }
 
 // a <token> b, for operands of type `operand_ty` and a result of type `ty`.
-pub fn lower_operator(token: Tok, operand_ty: i64, ty: i64, a: i64, b: i64) -> i64 {
+pub fn lower_operator(mut cx: *FnCtx, token: Tok, operand_ty: i64, ty: i64, a: i64, b: i64) -> i64 {
     if is_comparison(token) {
-        return ir_cmp(cond_of_token(token), ir_type(operand_ty), a, b);
+        return ir_cmp(cx, cond_of_token(token), ir_type(operand_ty), a, b);
     }
     if is_float(ty) && token == Tok::Percent {
-        let mark = SSA_STACK.count;
-        push_arg(a, ty);
-        push_arg(b, ty);
+        let mark = unsafe { cx.ssa_stack.count };
+        push_arg(cx, a, ty);
+        push_arg(cx, b, ty);
         let call = unsafe {
-            emit_ir(Op::CallC, ty, 0, 0, intern_c(if ty == TY_F32 { c"fmodf" } else { c"fmod" }))
+            emit_ir(cx, Op::CallC, ty, 0, 0,
+                intern_c(if ty == TY_F32 { c"fmodf" } else { c"fmod" }))
         };
-        take_args(call, mark);
+        take_args(cx, call, mark);
         return call;
     }
-    ir_binary(arith_op(token), ir_type(ty), a, b)
+    ir_binary(cx, arith_op(token), ir_type(ty), a, b)
 }
 
-fn lower_binary(n: i64) -> i64 {
+fn lower_binary(mut cx: *FnCtx, n: i64) -> i64 {
     unsafe {
         let op = NODES[n].op;
         let lhs = NODES[n].b;
         let rhs = NODES[n].c;
         if op == Tok::AmpAmp || op == Tok::PipePipe {
-            return lower_short_circuit(op, lhs, rhs);
+            return lower_short_circuit(cx, op, lhs, rhs);
         }
         if is_vector(NODES[lhs].ty) {
-            let a = vec_operand(lhs);
-            let b = vec_operand(rhs);
-            return vec_result(vector_operator(op, NODES[lhs].ty, NODES[n].ty, a, b), NODES[n].ty);
+            let a = vec_operand(cx, lhs);
+            let b = vec_operand(cx, rhs);
+            return vec_result(cx, vector_operator(cx, op, NODES[lhs].ty, NODES[n].ty, a, b),
+                NODES[n].ty);
         }
-        let a = lower_operand(lhs);
-        let b = lower_operand(rhs);
-        lower_operator(op, NODES[lhs].ty, NODES[n].ty, a, b)
+        let a = lower_operand(cx, lhs);
+        let b = lower_operand(cx, rhs);
+        lower_operator(cx, op, NODES[lhs].ty, NODES[n].ty, a, b)
     }
 }
 
-fn lower_short_circuit(op: Tok, lhs: i64, rhs: i64) -> i64 {
-    let result = new_synth_var(TY_BOOL);
-    let a = lower_operand(lhs);
-    ssa_write(result, CUR, a);
-    let rhs_block = ir_new_block();
-    let join = ir_new_block();
+fn lower_short_circuit(mut cx: *FnCtx, op: Tok, lhs: i64, rhs: i64) -> i64 {
+    let result = new_synth_var(cx, TY_BOOL);
+    let a = lower_operand(cx, lhs);
+    ssa_write(cx, result, CUR, a);
+    let rhs_block = ir_new_block(cx);
+    let join = ir_new_block(cx);
     if op == Tok::AmpAmp {
-        lower_branch(a, rhs_block, join);
+        lower_branch(cx, a, rhs_block, join);
     } else {
-        lower_branch(a, join, rhs_block);
+        lower_branch(cx, a, join, rhs_block);
     }
-    ir_seal(rhs_block);
+    ir_seal(cx, rhs_block);
     CUR = rhs_block;
-    let b = lower_operand(rhs);
-    ssa_write(result, CUR, b);
-    lower_jump(join);
-    ir_seal(join);
+    let b = lower_operand(cx, rhs);
+    ssa_write(cx, result, CUR, b);
+    lower_jump(cx, join);
+    ir_seal(cx, join);
     CUR = join;
-    ssa_read(result, join)
+    ssa_read(cx, result, join)
 }
 
-fn lower_unary(n: i64) -> i64 {
+fn lower_unary(mut cx: *FnCtx, n: i64) -> i64 {
     unsafe {
         let op = NODES[n].op;
         let operand = NODES[n].b;
         let ty = NODES[n].ty;
         if op == Tok::Amp {
-            return lower_addr(operand);
+            return lower_addr(cx, operand);
         }
         if op == Tok::Minus && is_vector(ty) {
-            let a = vec_operand(operand);
-            return vec_result(emit_ir(Op::VNeg, ty, a, 0, 0), ty);
+            let a = vec_operand(cx, operand);
+            return vec_result(cx, emit_ir(cx, Op::VNeg, ty, a, 0, 0), ty);
         }
-        let value = lower_operand(operand);
+        let value = lower_operand(cx, operand);
         if op == Tok::Minus {
-            return emit_ir(Op::Neg, ir_type(ty), value, 0, 0);
+            return emit_ir(cx, Op::Neg, ir_type(ty), value, 0, 0);
         }
         if op == Tok::Bang {
-            return emit_ir(Op::Not, TY_BOOL, value, 0, 0);
+            return emit_ir(cx, Op::Not, TY_BOOL, value, 0, 0);
         }
         if op == Tok::Tilde {
-            return emit_ir(Op::BNot, ir_type(ty), value, 0, 0);
+            return emit_ir(cx, Op::BNot, ir_type(ty), value, 0, 0);
         }
-        raw_check(n, value, ir_const(type_size(ty), TY_U64));
-        load_scalar(value, ty)
+        raw_check(cx, n, value, ir_const(cx, type_size(ty), TY_U64));
+        load_scalar(cx, value, ty)
     }
 }
 
-pub fn ir_conv(value: i64, from: i64, to: i64) -> i64 {
-    let v = emit_ir(Op::Conv, to, value, 0, 0);
-    unsafe { INSTS[v].imm2 = from; }
+pub fn ir_conv(mut cx: *FnCtx, value: i64, from: i64, to: i64) -> i64 {
+    let v = emit_ir(cx, Op::Conv, to, value, 0, 0);
+    unsafe { cx.insts[v].imm2 = from; }
     v
 }
 
-fn lower_cast(value: i64, checker_from: i64, to: i64) -> i64 {
+fn lower_cast(mut cx: *FnCtx, value: i64, checker_from: i64, to: i64) -> i64 {
     let from = scalar_type(checker_from);
     if from == TY_NEVER || from == to || from == TY_BOOL {
         return value;
     }
-    let operand = need_value(value, from);
+    let operand = need_value(cx, value, from);
     if is_float(from) || is_float(to) {
-        return ir_conv(operand, ir_type(from), ir_type(to));
+        return ir_conv(cx, operand, ir_type(from), ir_type(to));
     }
     // Integers and pointers: truncate or extend to `to`.
     if !is_integer(to) || int_bits(to) == 64 {
         return operand;
     }
-    ir_conv(operand, ir_type(from), to)
+    ir_conv(cx, operand, ir_type(from), to)
 }
 
 // ---- Enums and slices ----
 
-fn lower_variant(n: i64) -> i64 {
+fn lower_variant(mut cx: *FnCtx, n: i64) -> i64 {
     unsafe {
         let ty = NODES[n].ty;
         let v = NODES[n].a;
         let tag = ENUMS[TYPES[ty].a].tag;
         let discr = wrap_int(VARIANTS[v].discr, tag);
         if !is_compound(ty) {
-            return ir_const(discr, tag);
+            return ir_const(cx, discr, tag);
         }
-        let base = ir_slot_addr(new_slot_for(ty));
+        let base = ir_slot_addr(cx, new_slot_for(cx, ty));
         // (0.18: the null niche: the pointer, or null)
         if enum_niche(TYPES[ty].a) {
             if NODES[n].count == 1 {
-                store_value(base, 0, lower_expr(child(n, 0)), variant_field(v, 0));
+                store_value(cx, base, 0, lower_expr(cx, child(n, 0)), variant_field(v, 0));
             } else {
-                ir_store(TY_U64, base, ir_const(0, TY_U64), 0);
+                ir_store(cx, TY_U64, base, ir_const(cx, 0, TY_U64), 0);
             }
             return base;
         }
         for j in 0..NODES[n].count {
             let i = field_order(n, j);
-            let value = lower_expr(child(n, i));
-            store_value(base, variant_field_offset(v, i), value, variant_field(v, i));
+            let value = lower_expr(cx, child(n, i));
+            store_value(cx, base, variant_field_offset(v, i), value, variant_field(v, i));
         }
-        ir_store(tag, base, ir_const(discr, tag), 0);
+        ir_store(cx, tag, base, ir_const(cx, discr, tag), 0);
         base
     }
 }
 
 // `a[lo..hi]`: as gen_slicing (gen.tach).
-fn lower_slicing(n: i64) -> i64 {
+fn lower_slicing(mut cx: *FnCtx, n: i64) -> i64 {
     unsafe {
         let base = NODES[n].a;
         let base_ty = NODES[base].ty;
@@ -451,66 +456,69 @@ fn lower_slicing(n: i64) -> i64 {
         // value, an array's address), then the bounds, then what the base
         // holds, so that bounds that change it are seen.
         let is_pointer = TYPES[base_ty].kind == TyKind::Ptr;
-        let value = if is_pointer { early_pointer(base) } else { lower_operand(base) };
+        let value = if is_pointer { early_pointer(cx, base) } else { lower_operand(cx, base) };
         let mut bound_ty = TY_U64;
         let mut lo = 0;
         if low != 0 {
-            lo = lower_operand(low);
+            lo = lower_operand(cx, low);
             bound_ty = NODES[low].ty;
         } else {
-            lo = ir_const(0, TY_U64);
+            lo = ir_const(cx, 0, TY_U64);
         }
         let mut hi = 0;
         if high != 0 {
-            hi = lower_operand(high);
+            hi = lower_operand(cx, high);
             bound_ty = NODES[high].ty;
         }
         let mut pointer = value;
         let mut length = 0;
         if is_pointer {
-            pointer = late_pointer(base, value);
+            pointer = late_pointer(cx, base, value);
         } else if is_slice(base_ty) {
-            pointer = ir_load(TY_U64, value, 0);
-            length = ir_load(TY_U64, value, 8);
+            pointer = ir_load(cx, TY_U64, value, 0);
+            length = ir_load(cx, TY_U64, value, 8);
         } else if TYPES[base_ty].kind == TyKind::Array {
-            length = ir_const(TYPES[base_ty].b, TY_U64);
+            length = ir_const(cx, TYPES[base_ty].b, TY_U64);
         }
         if high == 0 {
             hi = length;
         }
         let mut end = hi;
         if inclusive {
-            end = ir_binary(Op::Add, TY_U64, hi, ir_const(1, TY_U64));
+            end = ir_binary(cx, Op::Add, TY_U64, hi, ir_const(cx, 1, TY_U64));
         }
         if TYPES[base_ty].kind != TyKind::Ptr {
             let kind = panic_kind(bound_ty, true);
-            lower_check(ir_cmp(if inclusive { Cond::Lt } else { Cond::Le }, TY_U64, hi, length),
-                kind, lo, end, length, site_of(n, 0));
-            lower_check(ir_cmp(Cond::Le, TY_U64, lo, end), kind, lo, end, length, site_of(n, 0));
+            lower_check(cx,
+                ir_cmp(cx, if inclusive { Cond::Lt } else { Cond::Le }, TY_U64, hi, length), kind,
+                lo, end, length, site_of(n, 0));
+            lower_check(cx, ir_cmp(cx, Cond::Le, TY_U64, lo, end), kind, lo, end, length,
+                site_of(n, 0));
         }
         let mut scaled = lo;
         if elem_size != 1 {
-            scaled = ir_binary(Op::Mul, TY_U64, lo, ir_const(elem_size, TY_U64));
+            scaled = ir_binary(cx, Op::Mul, TY_U64, lo, ir_const(cx, elem_size, TY_U64));
         }
-        let start = ir_binary(Op::Add, TY_U64, pointer, scaled);
+        let start = ir_binary(cx, Op::Add, TY_U64, pointer, scaled);
         if TYPES[base_ty].kind == TyKind::Ptr {
-            let count = ir_binary(Op::Sub, TY_U64, end, lo);
-            raw_check(n, start, ir_binary(Op::Mul, TY_U64, count, ir_const(elem_size, TY_U64)));
+            let count = ir_binary(cx, Op::Sub, TY_U64, end, lo);
+            raw_check(cx, n, start,
+                ir_binary(cx, Op::Mul, TY_U64, count, ir_const(cx, elem_size, TY_U64)));
         }
-        let result = ir_slot_addr(new_slot_for(NODES[n].ty));
-        ir_store(TY_U64, result, start, 0);
-        ir_store(TY_U64, result, ir_binary(Op::Sub, TY_U64, end, lo), 8);
+        let result = ir_slot_addr(cx, new_slot_for(cx, NODES[n].ty));
+        ir_store(cx, TY_U64, result, start, 0);
+        ir_store(cx, TY_U64, result, ir_binary(cx, Op::Sub, TY_U64, end, lo), 8);
         result
     }
 }
 
 // ---- Aggregates ----
 
-fn lower_aggregate(n: i64) -> i64 {
+fn lower_aggregate(mut cx: *FnCtx, n: i64) -> i64 {
     unsafe {
         let ty = NODES[n].ty;
         let kind = NODES[n].kind;
-        let base = ir_slot_addr(new_slot_for(ty));
+        let base = ir_slot_addr(cx, new_slot_for(cx, ty));
         for i in 0..NODES[n].count {
             let elem = child(n, i);
             let mut value_node = elem;
@@ -528,58 +536,58 @@ fn lower_aggregate(n: i64) -> i64 {
                 elem_ty = TYPES[ty].a;
                 offset = i * type_size(elem_ty);
             }
-            let value = lower_expr(value_node);
-            store_value(base, offset, value, elem_ty);
+            let value = lower_expr(cx, value_node);
+            store_value(cx, base, offset, value, elem_ty);
         }
         base
     }
 }
 
 // Stores `value` (of checker type `ty`) at addr + offset.
-pub fn store_value(addr: i64, offset: i64, value: i64, ty: i64) {
+pub fn store_value(mut cx: *FnCtx, addr: i64, offset: i64, value: i64, ty: i64) {
     if is_void(ty) {
         return;
     }
-    let v = need_value(value, ty);
+    let v = need_value(cx, value, ty);
     if is_compound(ty) {
-        lower_copy(ir_offset(addr, offset), v, type_size(ty));
+        lower_copy(cx, ir_offset(cx, addr, offset), v, type_size(ty));
     } else {
-        ir_store(ir_type(ty), addr, v, offset);
+        ir_store(cx, ir_type(ty), addr, v, offset);
     }
 }
 
 // `[value; count]`: the value is evaluated once.
-fn lower_repeat(n: i64) -> i64 {
+fn lower_repeat(mut cx: *FnCtx, n: i64) -> i64 {
     unsafe {
         let ty = NODES[n].ty;
         let elem_ty = TYPES[ty].a;
         let count = TYPES[ty].b;
         let elem_size = type_size(elem_ty);
-        let base = ir_slot_addr(new_slot_for(ty));
-        let value = lower_expr(NODES[n].a);
+        let base = ir_slot_addr(cx, new_slot_for(cx, ty));
+        let value = lower_expr(cx, NODES[n].a);
         if count == 0 || is_void(elem_ty) || elem_size == 0 {
             return base;
         }
         if count <= 4 {
             for i in 0..count {
-                store_value(base, i * elem_size, value, elem_ty);
+                store_value(cx, base, i * elem_size, value, elem_ty);
             }
             return base;
         }
-        let cursor = new_synth_var(TY_U64);
-        ssa_write(cursor, CUR, base);
-        let end = ir_offset(base, count * elem_size);
-        let body = ir_new_block();
-        let exit = ir_new_block();
-        lower_jump(body);
+        let cursor = new_synth_var(cx, TY_U64);
+        ssa_write(cx, cursor, CUR, base);
+        let end = ir_offset(cx, base, count * elem_size);
+        let body = ir_new_block(cx);
+        let exit = ir_new_block(cx);
+        lower_jump(cx, body);
         CUR = body;
-        let at = ssa_read(cursor, body);
-        store_value(at, 0, value, elem_ty);
-        let next = ir_offset(at, elem_size);
-        ssa_write(cursor, CUR, next);
-        lower_branch(ir_cmp(Cond::Ne, TY_U64, next, end), body, exit);
-        ir_seal(body);
-        ir_seal(exit);
+        let at = ssa_read(cx, cursor, body);
+        store_value(cx, at, 0, value, elem_ty);
+        let next = ir_offset(cx, at, elem_size);
+        ssa_write(cx, cursor, CUR, next);
+        lower_branch(cx, ir_cmp(cx, Cond::Ne, TY_U64, next, end), body, exit);
+        ir_seal(cx, body);
+        ir_seal(cx, exit);
         CUR = exit;
         base
     }

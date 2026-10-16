@@ -14,21 +14,22 @@ use crate::front::types::{
     ENUMS, TYPES, TY_NEVER, TY_U64, VARIANTS, is_compound, is_enum, is_integer, is_ref, is_void,
     scalar_type, tuple_offset, type_elem, type_size, variant_field, variant_field_offset,
 };
+use crate::middle::ctx::FnCtx;
 use crate::middle::ir::{
-    BLOCK_COUNT, CUR, Cond, Term, ir_cmp, ir_const, ir_load, ir_new_block, ir_offset, ir_slot_addr,
-    ir_store, ir_type,
+    CUR, Cond, Term, ir_cmp, ir_const, ir_load, ir_new_block, ir_offset, ir_slot_addr, ir_store,
+    ir_type,
 };
 use crate::middle::ir::cfg::{ir_switch, ir_terminate};
 use crate::middle::lower::{is_dead_block, lower_branch, lower_copy, lower_jump, new_slot_for};
 use crate::middle::lower::control::{join_new, join_read, join_write};
 use crate::middle::lower::expr::{lower_expr, lower_operand, need_value};
-use crate::middle::lower::ssa::{LOCAL_ADDR, PROMOTE, SSA_STACK, ir_seal, ssa_write};
+use crate::middle::lower::ssa::{LOCAL_ADDR, PROMOTE, ir_seal, ssa_write};
 
 // ---- match ----
 
 // As gen_match (gen.tach): the arms in order, each pattern tested by
 // branches to the next arm.
-pub fn lower_match(n: i64) -> i64 {
+pub fn lower_match(mut cx: *FnCtx, n: i64) -> i64 {
     unsafe {
         let ty = NODES[n].ty;
         let scrutinee = NODES[n].a;
@@ -36,9 +37,9 @@ pub fn lower_match(n: i64) -> i64 {
         let has_value = !is_void(ty);
         let mut result = 0;
         if has_value {
-            result = join_new(ty);
+            result = join_new(cx, ty);
         }
-        let mut value = lower_operand(scrutinee);
+        let mut value = lower_operand(cx, scrutinee);
         if st == TY_NEVER {
             return 0;
         }
@@ -49,47 +50,47 @@ pub fn lower_match(n: i64) -> i64 {
             // (0.18.1: every arm matches what the reference points to,
             // dereferenced once here: a switch on its tag)
             let inner = TYPES[st].a;
-            value = referent_value(value, inner);
+            value = referent_value(cx, value, inner);
             st = inner;
         }
-        let join = ir_new_block();
+        let join = ir_new_block(cx);
         if switch_cases(n, st) {
-            lower_match_switch(n, st, value, result, join);
-            ir_seal(join);
+            lower_match_switch(cx, n, st, value, result, join);
+            ir_seal(cx, join);
             CUR = join;
             if has_value {
-                return join_read(result, join);
+                return join_read(cx, result, join);
             }
             return 0;
         }
         for i in 0..NODES[n].count {
             let arm = child(n, i);
-            let fail = ir_new_block();
-            alloc_pattern_locals(NODES[arm].a);
-            lower_pattern_test(NODES[arm].a, st, value, fail);
+            let fail = ir_new_block(cx);
+            alloc_pattern_locals(cx, NODES[arm].a);
+            lower_pattern_test(cx, NODES[arm].a, st, value, fail);
             if NODES[arm].b != 0 {
-                let guard = lower_operand(NODES[arm].b);
-                let body = ir_new_block();
-                lower_branch(guard, body, fail);
-                ir_seal(body);
+                let guard = lower_operand(cx, NODES[arm].b);
+                let body = ir_new_block(cx);
+                lower_branch(cx, guard, body, fail);
+                ir_seal(cx, body);
                 CUR = body;
             }
             let body = NODES[arm].c;
-            let v = lower_expr(body);
+            let v = lower_expr(cx, body);
             if has_value && NODES[body].ty != TY_NEVER {
-                join_write(result, v, ty);
+                join_write(cx, result, v, ty);
             }
-            lower_jump(join);
-            ir_seal(fail);
+            lower_jump(cx, join);
+            ir_seal(cx, fail);
             CUR = fail;
         }
-        if !is_dead_block(CUR) {
-            ir_terminate(CUR, Term::Unreach, 0, 0, 0);
+        if !is_dead_block(cx, CUR) {
+            ir_terminate(cx, CUR, Term::Unreach, 0, 0, 0);
         }
-        ir_seal(join);
+        ir_seal(cx, join);
         CUR = join;
         if has_value {
-            return join_read(result, join);
+            return join_read(cx, result, join);
         }
         0
     }
@@ -97,20 +98,20 @@ pub fn lower_match(n: i64) -> i64 {
 
 // The storage of the locals a pattern binds that live in memory (once: the
 // alternatives of an or-pattern bind the same locals).
-fn alloc_pattern_locals(p: i64) {
+fn alloc_pattern_locals(mut cx: *FnCtx, p: i64) {
     unsafe {
         let kind = NODES[p].kind;
         if kind == PatBind {
             let local = NODES[p].x;
             let ty = LOCALS[local].ty;
             if PROMOTE[local] == 0 && !is_void(ty) {
-                LOCAL_ADDR[local] = ir_slot_addr(new_slot_for(ty));
+                LOCAL_ADDR[local] = ir_slot_addr(cx, new_slot_for(cx, ty));
             }
             return;
         }
         if kind == PatTuple || kind == PatVariant || kind == PatOr {
             for i in 0..NODES[p].count {
-                alloc_pattern_locals(child(p, i));
+                alloc_pattern_locals(cx, child(p, i));
             }
         }
     }
@@ -118,19 +119,19 @@ fn alloc_pattern_locals(p: i64) {
 
 // (0.18.1) The value a pattern on a reference matches, from the reference
 // ptr: the referent's address (compound) or its value.
-pub fn referent_value(ptr: i64, inner: i64) -> i64 {
+pub fn referent_value(mut cx: *FnCtx, ptr: i64, inner: i64) -> i64 {
     if is_compound(inner) {
         return ptr;
     }
     if is_void(inner) {
         return 0;
     }
-    ir_load(ir_type(inner), ptr, 0)
+    ir_load(cx, ir_type(inner), ptr, 0)
 }
 
 // Branches to `fail` unless `value` (of checker type ty; the address of a
 // compound value) matches pattern p; binds its variables.
-fn lower_pattern_test(p: i64, ty: i64, value: i64, fail: i64) {
+fn lower_pattern_test(mut cx: *FnCtx, p: i64, ty: i64, value: i64, fail: i64) {
     unsafe {
         let kind = NODES[p].kind;
         if ty == TY_NEVER {
@@ -138,7 +139,7 @@ fn lower_pattern_test(p: i64, ty: i64, value: i64, fail: i64) {
         }
         let inner = pattern_referent(p, ty);
         if inner != 0 {
-            lower_pattern_test(p, inner, referent_value(value, inner), fail);
+            lower_pattern_test(cx, p, inner, referent_value(cx, value, inner), fail);
             return;
         }
         match kind {
@@ -148,9 +149,9 @@ fn lower_pattern_test(p: i64, ty: i64, value: i64, fail: i64) {
                 if binds_ref(p) {
                     // (value: the address of what it binds)
                     if PROMOTE[local] != 0 {
-                        ssa_write(local, CUR, value);
+                        ssa_write(cx, local, CUR, value);
                     } else {
-                        ir_store(ir_type(LOCALS[local].ty), LOCAL_ADDR[local], value, 0);
+                        ir_store(cx, ir_type(LOCALS[local].ty), LOCAL_ADDR[local], value, 0);
                     }
                     return;
                 }
@@ -158,38 +159,38 @@ fn lower_pattern_test(p: i64, ty: i64, value: i64, fail: i64) {
                     return;
                 }
                 if PROMOTE[local] != 0 {
-                    ssa_write(local, CUR, need_value(value, ty));
+                    ssa_write(cx, local, CUR, need_value(cx, value, ty));
                 } else if is_compound(ty) {
-                    lower_copy(LOCAL_ADDR[local], value, type_size(ty));
+                    lower_copy(cx, LOCAL_ADDR[local], value, type_size(ty));
                 } else {
-                    ir_store(ir_type(ty), LOCAL_ADDR[local], need_value(value, ty), 0);
+                    ir_store(cx, ir_type(ty), LOCAL_ADDR[local], need_value(cx, value, ty), 0);
                 }
                 return;
             }
             PatLit => {
                 let t = ir_type(ty);
-                test_or_fail(ir_cmp(Cond::Eq, t, value, ir_const(NODES[p].x, t)), fail);
+                test_or_fail(cx, ir_cmp(cx, Cond::Eq, t, value, ir_const(cx, NODES[p].x, t)), fail);
                 return;
             }
             PatRange => {
                 let t = ir_type(ty);
-                test_or_fail(ir_cmp(Cond::Ge, t, value, ir_const(NODES[p].x, t)), fail);
-                test_or_fail(ir_cmp(Cond::Le, t, value, ir_const(NODES[p].y, t)), fail);
+                test_or_fail(cx, ir_cmp(cx, Cond::Ge, t, value, ir_const(cx, NODES[p].x, t)), fail);
+                test_or_fail(cx, ir_cmp(cx, Cond::Le, t, value, ir_const(cx, NODES[p].y, t)), fail);
                 return;
             }
             PatOr => {
-                let ok = ir_new_block();
+                let ok = ir_new_block(cx);
                 let last = NODES[p].count - 1;
                 for i in 0..last {
-                    let next = ir_new_block();
-                    lower_pattern_test(child(p, i), ty, value, next);
-                    lower_jump(ok);
-                    ir_seal(next);
+                    let next = ir_new_block(cx);
+                    lower_pattern_test(cx, child(p, i), ty, value, next);
+                    lower_jump(cx, ok);
+                    ir_seal(cx, next);
                     CUR = next;
                 }
-                lower_pattern_test(child(p, last), ty, value, fail);
-                lower_jump(ok);
-                ir_seal(ok);
+                lower_pattern_test(cx, child(p, last), ty, value, fail);
+                lower_jump(cx, ok);
+                ir_seal(cx, ok);
                 CUR = ok;
                 return;
             }
@@ -200,13 +201,14 @@ fn lower_pattern_test(p: i64, ty: i64, value: i64, fail: i64) {
                 // no `fail` block, which is 0 for a pattern known to match)
                 if enum_niche(VARIANTS[v].enum_id) {
                     // (0.18: the null niche: null or not)
-                    let word = ir_load(TY_U64, value, 0);
+                    let word = ir_load(cx, TY_U64, value, 0);
                     let cond = if VARIANTS[v].field_count == 1 { Cond::Ne } else { Cond::Eq };
-                    test_or_fail(ir_cmp(cond, TY_U64, word, ir_const(0, TY_U64)), fail);
+                    test_or_fail(cx, ir_cmp(cx, cond, TY_U64, word, ir_const(cx, 0, TY_U64)), fail);
                 } else if ENUMS[VARIANTS[v].enum_id].variant_count != 1 {
-                    let tag_value = if is_compound(ty) { ir_load(tag, value, 0) } else { value };
-                    test_or_fail(ir_cmp(Cond::Eq, tag, tag_value,
-                        ir_const(wrap_int(VARIANTS[v].discr, tag), tag)), fail);
+                    let tag_value = if is_compound(ty) { ir_load(cx, tag, value, 0) }
+                        else { value };
+                    test_or_fail(cx, ir_cmp(cx, Cond::Eq, tag, tag_value,
+                        ir_const(cx, wrap_int(VARIANTS[v].discr, tag), tag)), fail);
                 }
             }
             _ => {}
@@ -227,11 +229,11 @@ fn lower_pattern_test(p: i64, ty: i64, value: i64, fail: i64) {
             }
             let mut elem = 0;
             if is_compound(elem_ty) || binds_ref(sub) {
-                elem = ir_offset(value, offset);
+                elem = ir_offset(cx, value, offset);
             } else if !is_void(elem_ty) {
-                elem = ir_load(ir_type(elem_ty), value, offset);
+                elem = ir_load(cx, ir_type(elem_ty), value, offset);
             }
-            lower_pattern_test(sub, elem_ty, elem, fail);
+            lower_pattern_test(cx, sub, elem_ty, elem, fail);
         }
     }
 }
@@ -339,68 +341,68 @@ fn add_switch_value(value: i64, arm: i64) {
 
 // Match n as a switch on the scrutinee (or its tag): every arm in a block
 // of its own, which binds the pattern's variables and evaluates the body.
-fn lower_match_switch(n: i64, st: i64, value: i64, result: i64, join: i64) {
+fn lower_match_switch(mut cx: *FnCtx, n: i64, st: i64, value: i64, result: i64, join: i64) {
     unsafe {
         let mut key = value;
         if is_compound(st) {
             let tag = ENUMS[TYPES[st].a].tag;
-            key = ir_load(tag, value, 0);
+            key = ir_load(cx, tag, value, 0);
         }
         // (Matches in the arms reuse SW_CASES and SW_DEFAULT.)
         let catch_all = SW_DEFAULT;
-        let first = BLOCK_COUNT;
+        let first = cx.block_count;
         for _ in 0..NODES[n].count {
-            ir_new_block();
+            ir_new_block(cx);
         }
         let mut default = 0;
         if catch_all >= 0 {
             default = first + catch_all;
         } else {
-            default = ir_new_block();
+            default = ir_new_block(cx);
         }
         let unreachable = default;
-        if is_dead_block(CUR) {
-            ir_terminate(CUR, Term::Unreach, 0, 0, 0);
+        if is_dead_block(cx, CUR) {
+            ir_terminate(cx, CUR, Term::Unreach, 0, 0, 0);
         } else {
-            let mark = SSA_STACK.count;
+            let mark = cx.ssa_stack.count;
             let mut i = 0;
             while i < SW_CASES.count {
-                SSA_STACK.push(SW_CASES.data[i]);
-                SSA_STACK.push(first + SW_CASES.data[i + 1]);
+                cx.ssa_stack.push(SW_CASES.data[i]);
+                cx.ssa_stack.push(first + SW_CASES.data[i + 1]);
                 i += 2;
             }
-            ir_switch(CUR, key, default, mark);
+            ir_switch(cx, CUR, key, default, mark);
         }
         let has_value = !is_void(NODES[n].ty);
         for i in 0..NODES[n].count {
             let arm = child(n, i);
             let p = NODES[arm].a;
             CUR = first + i;
-            ir_seal(CUR);
-            alloc_pattern_locals(p);
-            lower_pattern_binds(p, st, value);
+            ir_seal(cx, CUR);
+            alloc_pattern_locals(cx, p);
+            lower_pattern_binds(cx, p, st, value);
             let body = NODES[arm].c;
-            let v = lower_expr(body);
+            let v = lower_expr(cx, body);
             if has_value && NODES[body].ty != TY_NEVER {
-                join_write(result, v, NODES[n].ty);
+                join_write(cx, result, v, NODES[n].ty);
             }
-            lower_jump(join);
+            lower_jump(cx, join);
         }
         if catch_all < 0 {
             CUR = unreachable;
-            ir_seal(CUR);
-            ir_terminate(CUR, Term::Unreach, 0, 0, 0);
+            ir_seal(cx, CUR);
+            ir_terminate(cx, CUR, Term::Unreach, 0, 0, 0);
         }
     }
 }
 
 // Binds the variables of pattern p, known to match `value`: its fields
 // for a variant, the value for a binding.
-fn lower_pattern_binds(p: i64, ty: i64, value: i64) {
+fn lower_pattern_binds(mut cx: *FnCtx, p: i64, ty: i64, value: i64) {
     unsafe {
         let kind = NODES[p].kind;
         if kind == PatBind || kind == PatWild {
-            lower_pattern_test(p, ty, value, 0);
+            lower_pattern_test(cx, p, ty, value, 0);
             return;
         }
         if kind != PatVariant {
@@ -413,19 +415,19 @@ fn lower_pattern_binds(p: i64, ty: i64, value: i64) {
             let offset = variant_field_offset(v, i);
             let mut elem = 0;
             if is_compound(elem_ty) || binds_ref(sub) {
-                elem = ir_offset(value, offset);
+                elem = ir_offset(cx, value, offset);
             } else if !is_void(elem_ty) {
-                elem = ir_load(ir_type(elem_ty), value, offset);
+                elem = ir_load(cx, ir_type(elem_ty), value, offset);
             }
-            lower_pattern_test(sub, elem_ty, elem, 0);
+            lower_pattern_test(cx, sub, elem_ty, elem, 0);
         }
     }
 }
 
 // Continues in a new block when `cond` holds, else goes to `fail`.
-fn test_or_fail(cond: i64, fail: i64) {
-    let next = ir_new_block();
-    lower_branch(cond, next, fail);
-    ir_seal(next);
+fn test_or_fail(mut cx: *FnCtx, cond: i64, fail: i64) {
+    let next = ir_new_block(cx);
+    lower_branch(cx, cond, next, fail);
+    ir_seal(cx, next);
     CUR = next;
 }

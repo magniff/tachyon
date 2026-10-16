@@ -21,12 +21,9 @@ mod matching;
 pub mod ssa;
 mod vector;
 
-use ssa::{DEFS, SSA_STACK, ssa_read, ssa_write};
+use ssa::{ssa_read, ssa_write};
 
-use crate::back::abi::{
-    ABI_PIECE_COUNT, ABI_PIECE_OFFSET, ABI_PIECE_TY, AbiClass, conv_classify,
-    conv_returns_through_pointer, fn_uses_c,
-};
+use crate::back::abi::{AbiClass, conv_classify, conv_returns_through_pointer, fn_uses_c};
 use crate::base::{alloc_array, intern_c};
 use crate::base::target::X86;
 use crate::front::ast::{DEFERS, DEFER_LOOPS, NODES, NODE_COUNT, NodeKind, PAT_DEREF, child};
@@ -44,10 +41,11 @@ use crate::front::types::{
 use crate::gen0::gen::MAIN_SYM;
 use crate::gen0::gen::expr::arith_op_of_assign;
 use crate::middle::copies::{moves_local, note_move_copies};
+use crate::middle::ctx::FnCtx;
 use crate::middle::ir::{
-    BLOCKS, CUR, INLINE_COPY_MAX, INSTS, INST_COUNT, IRF, IRFUNCS, IR_EXPR_LOC, IR_LOC, IR_LOCS, Op,
-    SLOTS, Term, emit_ir, init_ir, ir_const, ir_enter, ir_load, ir_new_block, ir_new_func,
-    ir_new_slot, ir_offset, ir_shrink, ir_slot_addr, ir_store, ir_type,
+    CUR, INLINE_COPY_MAX, IRFUNCS, IR_EXPR_LOC, IR_LOC, IR_LOCS, Op, Term, emit_ir, init_ir,
+    ir_const, ir_enter, ir_load, ir_new_block, ir_new_func, ir_new_slot, ir_offset, ir_shrink,
+    ir_slot_addr, ir_store, ir_type,
 };
 use crate::middle::ir::cfg::ir_terminate;
 use crate::middle::lower::calls::{push_arg, take_args};
@@ -61,39 +59,41 @@ use crate::middle::lower::vector::{arith_token_of, vec_operand, vector_operator}
 // ---- Blocks during lowering ----
 
 // A block that no edge reaches (code after `return`, `break`, ...).
-fn is_dead_block(b: i64) -> bool {
-    unsafe { BLOCKS[b].sealed != 0 && BLOCKS[b].preds.count == 0 && b != IRFUNCS[IRF].entry }
+fn is_dead_block(mut cx: *FnCtx, b: i64) -> bool {
+    unsafe {
+        cx.blocks[b].sealed != 0 && cx.blocks[b].preds.count == 0 && b != IRFUNCS[cx.irf].entry
+    }
 }
 
-fn start_dead_block() {
-    let b = ir_new_block();
-    unsafe { BLOCKS[b].sealed = 1; }
+fn start_dead_block(mut cx: *FnCtx) {
+    let b = ir_new_block(cx);
+    unsafe { cx.blocks[b].sealed = 1; }
     CUR = b;
 }
 
 // Ends the current block with a jump (no edge from a dead block).
-fn lower_jump(target: i64) {
-    if is_dead_block(CUR) {
-        ir_terminate(CUR, Term::Unreach, 0, 0, 0);
+fn lower_jump(mut cx: *FnCtx, target: i64) {
+    if is_dead_block(cx, CUR) {
+        ir_terminate(cx, CUR, Term::Unreach, 0, 0, 0);
     } else {
-        ir_terminate(CUR, Term::Jump, 0, target, 0);
+        ir_terminate(cx, CUR, Term::Jump, 0, target, 0);
     }
 }
 
-fn lower_branch(cond: i64, if_true: i64, if_false: i64) {
-    if is_dead_block(CUR) {
-        ir_terminate(CUR, Term::Unreach, 0, 0, 0);
+fn lower_branch(mut cx: *FnCtx, cond: i64, if_true: i64, if_false: i64) {
+    if is_dead_block(cx, CUR) {
+        ir_terminate(cx, CUR, Term::Unreach, 0, 0, 0);
     } else {
-        ir_terminate(CUR, Term::Branch, cond, if_true, if_false);
+        ir_terminate(cx, CUR, Term::Branch, cond, if_true, if_false);
     }
 }
 
 // ---- The program ----
 
 // Lowers every function to IR.
-pub fn lower_program(program: i64) {
+pub fn lower_program(mut cx: *FnCtx, program: i64) {
     unsafe {
-        init_ir();
+        init_ir(cx);
         PROMOTE = alloc_array::<i64>(LOCAL_COUNT + 1);
         LOCAL_ADDR = alloc_array::<i64>(LOCAL_COUNT + 1);
         for local in 0..LOCAL_COUNT {
@@ -112,30 +112,30 @@ pub fn lower_program(program: i64) {
         for i in 0..NODES[program].count {
             let item = child(program, i);
             if NODES[item].kind == Fn {
-                lower_function(item);
+                lower_function(cx, item);
             }
         }
     }
 }
 
-fn lower_function(item: i64) {
+fn lower_function(mut cx: *FnCtx, item: i64) {
     unsafe {
         let f = NODES[item].x - 1;
         // (-g) The parameters and the frame come from the declaration.
         IR_LOC = if IR_LOCS { NODES[item].start + 1 } else { 0 };
         IR_EXPR_LOC = 0;
-        ir_enter(ir_new_func(f, item));
-        DEFS.clear();
+        ir_enter(cx, ir_new_func(cx, f, item));
+        cx.defs.clear();
         DEFERS.count = 0;
         DEFER_LOOPS.count = 0;
-        let entry = ir_new_block();
-        IRFUNCS[IRF].entry = entry;
-        BLOCKS[entry].sealed = 1;
+        let entry = ir_new_block(cx);
+        IRFUNCS[cx.irf].entry = entry;
+        cx.blocks[entry].sealed = 1;
         CUR = entry;
         let ret = FNS[f].ret;
         let c = fn_uses_c(f);
-        if conv_returns_through_pointer(c, ret) {
-            IRFUNCS[IRF].result_ptr = emit_ir(Op::Param, TY_U64, 0, 0, -1);
+        if conv_returns_through_pointer(cx, c, ret) {
+            IRFUNCS[cx.irf].result_ptr = emit_ir(cx, Op::Param, TY_U64, 0, 0, -1);
         }
         for i in 0..FNS[f].param_count {
             let ty = fn_param(f, i);
@@ -143,95 +143,95 @@ fn lower_function(item: i64) {
             if is_void(ty) || local < 0 {
                 continue;
             }
-            let kind = conv_classify(c, ty);
+            let kind = conv_classify(cx, c, ty);
             if kind == AbiClass::Pieces {
                 // Stored from the registers (or stack slots) of its pieces:
                 // NodeKind::Param imm2 = the piece + 1.
-                let slot = ir_slot_addr(new_slot_for(ty));
-                for k in 0..ABI_PIECE_COUNT {
-                    let piece = emit_ir(Op::Param, ABI_PIECE_TY[k], 0, 0, i);
-                    INSTS[piece].imm2 = k + 1;
-                    ir_store(ABI_PIECE_TY[k], slot, piece, ABI_PIECE_OFFSET[k]);
+                let slot = ir_slot_addr(cx, new_slot_for(cx, ty));
+                for k in 0..cx.abi_piece_count {
+                    let piece = emit_ir(cx, Op::Param, cx.abi_piece_ty[k], 0, 0, i);
+                    cx.insts[piece].imm2 = k + 1;
+                    ir_store(cx, cx.abi_piece_ty[k], slot, piece, cx.abi_piece_offset[k]);
                 }
-                bind_local(local, slot, ty, true);
+                bind_local(cx, local, slot, ty, true);
                 continue;
             }
-            let param = emit_ir(Op::Param, ir_type(ty), 0, 0, i);
+            let param = emit_ir(cx, Op::Param, ir_type(ty), 0, 0, i);
             if kind == AbiClass::Stack {
                 // The address of the caller's copy on the stack.
-                INSTS[param].imm2 = -1;
+                cx.insts[param].imm2 = -1;
             }
             // A compound parameter points to the caller's private copy.
-            bind_local(local, param, ty, true);
+            bind_local(cx, local, param, ty, true);
         }
         let body = NODES[item].c;
-        let value = lower_block(body);
+        let value = lower_block(cx, body);
         if NODES[body].ty != TY_NEVER {
-            lower_return(value);
+            lower_return(cx, value);
         }
-        if BLOCKS[CUR].term == Term::None {
-            ir_terminate(CUR, Term::Unreach, 0, 0, 0);
+        if cx.blocks[CUR].term == Term::None {
+            ir_terminate(cx, CUR, Term::Unreach, 0, 0, 0);
         }
         IR_LOC = 0;
-        ir_shrink();
+        ir_shrink(cx);
     }
 }
 
-fn lower_return(value: i64) {
+fn lower_return(mut cx: *FnCtx, value: i64) {
     unsafe {
-        let f = IRFUNCS[IRF].f;
+        let f = IRFUNCS[cx.irf].f;
         let ret = FNS[f].ret;
         let mut result = 0;
         let c = fn_uses_c(f);
-        if conv_returns_through_pointer(c, ret) {
-            lower_copy(IRFUNCS[IRF].result_ptr, value, type_size(ret));
+        if conv_returns_through_pointer(cx, c, ret) {
+            lower_copy(cx, IRFUNCS[cx.irf].result_ptr, value, type_size(ret));
             if X86 && c {
                 // Returned in rax, as C does.
-                result = IRFUNCS[IRF].result_ptr;
+                result = IRFUNCS[cx.irf].result_ptr;
             }
         } else if is_compound(ret) {
             // Returned in registers: its pieces, read from a multiple of 8
             // bytes, packed for the RET.
-            let mut addr = need_value(value, ret);
-            if type_size(ret) % 8 != 0 && INSTS[addr].op != Op::Slot {
-                let copy = ir_slot_addr(new_slot_for(ret));
-                lower_copy(copy, addr, type_size(ret));
+            let mut addr = need_value(cx, value, ret);
+            if type_size(ret) % 8 != 0 && cx.insts[addr].op != Op::Slot {
+                let copy = ir_slot_addr(cx, new_slot_for(cx, ret));
+                lower_copy(cx, copy, addr, type_size(ret));
                 addr = copy;
             }
-            conv_classify(c, ret);
-            let count = ABI_PIECE_COUNT;
+            conv_classify(cx, c, ret);
+            let count = cx.abi_piece_count;
             let mut tys: [i64; 4] = [0; 4];
             let mut offsets: [i64; 4] = [0; 4];
             for k in 0..count {
-                tys[k] = ABI_PIECE_TY[k];
-                offsets[k] = ABI_PIECE_OFFSET[k];
+                tys[k] = cx.abi_piece_ty[k];
+                offsets[k] = cx.abi_piece_offset[k];
             }
-            let mark = SSA_STACK.count;
+            let mark = cx.ssa_stack.count;
             for k in 0..count {
-                push_arg(ir_load(tys[k], addr, offsets[k]), tys[k]);
+                push_arg(cx, ir_load(cx, tys[k], addr, offsets[k]), tys[k]);
             }
-            result = emit_ir(Op::Pack, 0, 0, 0, 0);
-            take_args(result, mark);
+            result = emit_ir(cx, Op::Pack, 0, 0, 0, 0);
+            take_args(cx, result, mark);
         } else if is_void(ret) {
             // `main` without a result exits with 0.
             if FNS[f].name == MAIN_SYM {
-                result = ir_const(0, TY_I64);
+                result = ir_const(cx, 0, TY_I64);
             }
         } else {
-            result = need_value(value, ret);
+            result = need_value(cx, value, ret);
         }
-        if !is_dead_block(CUR) {
-            ir_terminate(CUR, Term::Ret, result, 0, 0);
+        if !is_dead_block(cx, CUR) {
+            ir_terminate(cx, CUR, Term::Ret, result, 0, 0);
         } else {
-            ir_terminate(CUR, Term::Unreach, 0, 0, 0);
+            ir_terminate(cx, CUR, Term::Unreach, 0, 0, 0);
         }
-        start_dead_block();
+        start_dead_block(cx);
     }
 }
 
 // ---- Statements and bindings ----
 
-fn lower_block(block: i64) -> i64 {
+fn lower_block(mut cx: *FnCtx, block: i64) -> i64 {
     unsafe {
         let mark = DEFERS.count;
         // (-g) Instructions come from the statement being lowered, and after
@@ -244,11 +244,11 @@ fn lower_block(block: i64) -> i64 {
                 IR_EXPR_LOC = 0;
             }
             if NODES[stmt].kind == Let {
-                lower_let(stmt);
+                lower_let(cx, stmt);
             } else if NODES[stmt].kind == Defer {
                 DEFERS.push(stmt);
             } else {
-                lower_expr(NODES[stmt].a);
+                lower_expr(cx, NODES[stmt].a);
             }
         }
         let tail = NODES[block].a;
@@ -258,13 +258,13 @@ fn lower_block(block: i64) -> i64 {
                 IR_LOC = NODES[tail].start + 1;
                 IR_EXPR_LOC = 0;
             }
-            value = lower_expr(tail);
+            value = lower_expr(cx, tail);
         }
         if DEFERS.count > mark {
             if tail != 0 {
-                value = keep_value(value, NODES[tail].ty, mark);
+                value = keep_value(cx, value, NODES[tail].ty, mark);
             }
-            lower_defers(mark);
+            lower_defers(cx, mark);
             DEFERS.count = mark;
         }
         IR_LOC = outer;
@@ -275,20 +275,20 @@ fn lower_block(block: i64) -> i64 {
 
 // The deferred statements registered above DEFERS depth `depth`, last
 // first (0.6): at the end of their block, or at a jump out of it.
-fn lower_defers(depth: i64) {
+fn lower_defers(mut cx: *FnCtx, depth: i64) {
     let mut i = DEFERS.count - 1;
-    while i >= depth && !is_dead_block(CUR) {
-        unsafe { lower_expr(NODES[DEFERS.data[i]].a); }
+    while i >= depth && !is_dead_block(cx, CUR) {
+        unsafe { lower_expr(cx, NODES[DEFERS.data[i]].a); }
         i -= 1;
     }
 }
 
 // A value computed before deferred statements run: a compound value is
 // copied, so a deferred statement changing its source does not change it.
-fn keep_value(value: i64, ty: i64, depth: i64) -> i64 {
-    if DEFERS.count > depth && value != 0 && is_compound(ty) && !is_dead_block(CUR) {
-        let copy = ir_slot_addr(new_slot_for(ty));
-        lower_copy(copy, value, type_size(ty));
+fn keep_value(mut cx: *FnCtx, value: i64, ty: i64, depth: i64) -> i64 {
+    if DEFERS.count > depth && value != 0 && is_compound(ty) && !is_dead_block(cx, CUR) {
+        let copy = ir_slot_addr(cx, new_slot_for(cx, ty));
+        lower_copy(cx, copy, value, type_size(ty));
         return copy;
     }
     value
@@ -307,23 +307,23 @@ pub fn is_fresh(n: i64) -> bool {
     }
 }
 
-fn lower_let(stmt: i64) {
+fn lower_let(mut cx: *FnCtx, stmt: i64) {
     unsafe {
         let init = NODES[stmt].c;
-        let value = lower_expr(init);
+        let value = lower_expr(cx, init);
         if NODES[init].ty == TY_NEVER {
             return;
         }
-        let first = INST_COUNT;
-        bind_pattern_ir(NODES[stmt].a, value, is_fresh(init));
+        let first = cx.inst_count;
+        bind_pattern_ir(cx, NODES[stmt].a, value, is_fresh(init));
         // (0.17: a move, COPY_MOVE; copies.tach)
         if moves_local(init) {
-            note_move_copies(first);
+            note_move_copies(cx, first);
         }
     }
 }
 
-fn bind_pattern_ir(pattern: i64, value: i64, fresh: bool) {
+fn bind_pattern_ir(mut cx: *FnCtx, pattern: i64, value: i64, fresh: bool) {
     unsafe {
         let kind = NODES[pattern].kind;
         let ty = NODES[pattern].ty;
@@ -331,13 +331,13 @@ fn bind_pattern_ir(pattern: i64, value: i64, fresh: bool) {
             return;
         }
         if kind == PatBind {
-            bind_local(NODES[pattern].x, value, ty, fresh);
+            bind_local(cx, NODES[pattern].x, value, ty, fresh);
             return;
         }
         let mut value = value;
         if (NODES[pattern].p & PAT_DEREF) != 0 {
             // (0.18.1) value is a reference; ty, what it points to
-            value = referent_value(value, ty);
+            value = referent_value(cx, value, ty);
         }
         for i in 0..NODES[pattern].count {
             let mut elem_ty = 0;
@@ -351,35 +351,35 @@ fn bind_pattern_ir(pattern: i64, value: i64, fresh: bool) {
             }
             let mut elem = 0;
             if is_compound(elem_ty) || binds_ref(child(pattern, i)) {
-                elem = ir_offset(value, offset);
+                elem = ir_offset(cx, value, offset);
             } else if !is_void(elem_ty) {
-                elem = ir_load(ir_type(elem_ty), value, offset);
+                elem = ir_load(cx, ir_type(elem_ty), value, offset);
             }
-            bind_pattern_ir(child(pattern, i), elem, false);
+            bind_pattern_ir(cx, child(pattern, i), elem, false);
         }
     }
 }
 
 // Binds local `local` (of type `ty`) to `value` (the address of a compound
 // value, taken over when `fresh`).
-fn bind_local(local: i64, value: i64, ty: i64, fresh: bool) {
+fn bind_local(mut cx: *FnCtx, local: i64, value: i64, ty: i64, fresh: bool) {
     unsafe {
         if is_void(ty) {
             return;
         }
         if PROMOTE[local] != 0 {
-            ssa_write(local, CUR, need_value(value, ty));
+            ssa_write(cx, local, CUR, need_value(cx, value, ty));
             return;
         }
         if is_compound(ty) && fresh {
             LOCAL_ADDR[local] = value;
             return;
         }
-        let addr = ir_slot_addr(new_slot_for(ty));
+        let addr = ir_slot_addr(cx, new_slot_for(cx, ty));
         if is_compound(ty) {
-            lower_copy(addr, value, type_size(ty));
+            lower_copy(cx, addr, value, type_size(ty));
         } else {
-            ir_store(ir_type(ty), addr, need_value(value, ty), 0);
+            ir_store(cx, ir_type(ty), addr, need_value(cx, value, ty), 0);
         }
         LOCAL_ADDR[local] = addr;
     }
@@ -387,30 +387,30 @@ fn bind_local(local: i64, value: i64, ty: i64, fresh: bool) {
 
 // A frame slot for a value of type `ty`; compound values get a multiple of
 // 8 bytes, so that they can be read and written in 8-byte pieces.
-fn new_slot_for(ty: i64) -> i64 {
+fn new_slot_for(mut cx: *FnCtx, ty: i64) -> i64 {
     let size = if is_compound(ty) { align_to(type_size(ty), 8) } else { type_size(ty) };
-    let slot = ir_new_slot(size, type_align(ty));
-    unsafe { SLOTS[slot].ty = ty; }
+    let slot = ir_new_slot(cx, size, type_align(ty));
+    unsafe { cx.slots[slot].ty = ty; }
     slot
 }
 
 // Copies `size` bytes from `src` to `dst`.
-fn lower_copy(dst: i64, src: i64, size: i64) {
+fn lower_copy(mut cx: *FnCtx, dst: i64, src: i64, size: i64) {
     unsafe {
         if size == 0 {
             return;
         }
         if size <= INLINE_COPY_MAX {
-            let v = emit_ir(Op::Copy, 0, dst, src, size);
-            INSTS[v].imm2 = 0;
+            let v = emit_ir(cx, Op::Copy, 0, dst, src, size);
+            cx.insts[v].imm2 = 0;
             return;
         }
-        let mark = SSA_STACK.count;
-        push_arg(dst, TY_U64);
-        push_arg(src, TY_U64);
-        push_arg(ir_const(size, TY_U64), TY_U64);
-        let call = emit_ir(Op::CallC, 0, 0, 0, intern_c(c"memcpy"));
-        take_args(call, mark);
+        let mark = cx.ssa_stack.count;
+        push_arg(cx, dst, TY_U64);
+        push_arg(cx, src, TY_U64);
+        push_arg(cx, ir_const(cx, size, TY_U64), TY_U64);
+        let call = emit_ir(cx, Op::CallC, 0, 0, 0, intern_c(c"memcpy"));
+        take_args(cx, call, mark);
     }
 }
 
@@ -418,7 +418,7 @@ fn lower_copy(dst: i64, src: i64, size: i64) {
 
 // The right-hand side is evaluated first, then the target's address; a
 // compound assignment then reads the old value.
-fn lower_assign(n: i64) {
+fn lower_assign(mut cx: *FnCtx, n: i64) {
     unsafe {
         let op = NODES[n].op;
         let target = NODES[n].b;
@@ -428,35 +428,36 @@ fn lower_assign(n: i64) {
             && (PROMOTE[NODES[target].y] != 0 || is_void(ty)) {
             let local = NODES[target].y;
             if is_void(ty) {
-                lower_expr(value);
+                lower_expr(cx, value);
                 return;
             }
-            let v = lower_operand(value);
+            let v = lower_operand(cx, value);
             if op == Tok::Eq {
-                ssa_write(local, CUR, v);
+                ssa_write(cx, local, CUR, v);
                 return;
             }
-            let old = ssa_read(local, CUR);
-            ssa_write(local, CUR, lower_operator(arith_op_of_assign(op), ty, ty, old, v));
+            let old = ssa_read(cx, local, CUR);
+            ssa_write(cx, local, CUR, lower_operator(cx, arith_op_of_assign(op), ty, ty, old, v));
             return;
         }
         if op == Tok::Eq {
-            let v = lower_expr(value);
-            let addr = lower_addr(target);
-            store_value(addr, 0, v, ty);
+            let v = lower_expr(cx, value);
+            let addr = lower_addr(cx, target);
+            store_value(cx, addr, 0, v, ty);
             return;
         }
         if is_vector(ty) {
-            let v = vec_operand(value);
-            let addr = lower_addr(target);
-            let old = ir_load(ty, addr, 0);
-            ir_store(ty, addr,
-                vector_operator(arith_token_of(arith_op_of_assign(op)), ty, ty, old, v), 0);
+            let v = vec_operand(cx, value);
+            let addr = lower_addr(cx, target);
+            let old = ir_load(cx, ty, addr, 0);
+            ir_store(cx, ty, addr,
+                vector_operator(cx, arith_token_of(arith_op_of_assign(op)), ty, ty, old, v), 0);
             return;
         }
-        let v = lower_operand(value);
-        let addr = lower_addr(target);
-        let old = ir_load(ir_type(ty), addr, 0);
-        ir_store(ir_type(ty), addr, lower_operator(arith_op_of_assign(op), ty, ty, old, v), 0);
+        let v = lower_operand(cx, value);
+        let addr = lower_addr(cx, target);
+        let old = ir_load(cx, ir_type(ty), addr, 0);
+        ir_store(cx, ir_type(ty), addr, lower_operator(cx, arith_op_of_assign(op), ty, ty, old, v),
+            0);
     }
 }

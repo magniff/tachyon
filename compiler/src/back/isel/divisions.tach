@@ -1,10 +1,10 @@
 // Divisions by constants (isel/mod.tach, step 1b): x / d and x % d as a
 // multiplication by a magic number.
 
-use crate::base::IntVec;
 use crate::front::types::{TY_I64, TY_U64, int_bits, is_integer, is_signed};
+use crate::middle::ctx::FnCtx;
 use crate::middle::fold::{const_before, op_before};
-use crate::middle::ir::{BLOCKS, INSTS, IRFUNCS, ir_replace};
+use crate::middle::ir::{IRFUNCS, ir_replace};
 use crate::middle::ir::Op::{Add, Const, Div, Mul, MulH, Neg, Rem, Shr, Sub};
 use crate::middle::opt::resolve_all;
 
@@ -32,25 +32,21 @@ use crate::middle::opt::resolve_all;
 // division instructions give them), and so do signed divisions by the
 // negative powers of two and MIN, which instcombine does not take.
 
-// The quotients made in the block being lowered: (dividend, divisor, type,
-// quotient) for each.
-static mut DIV_SEEN: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-pub fn lower_divisions(fi: i64) {
-    resolve_all(fi);
+pub fn lower_divisions(mut cx: *FnCtx, fi: i64) {
+    resolve_all(cx, fi);
     unsafe {
         for b in IRFUNCS[fi].blocks.items() {
-            if BLOCKS[b].removed != 0 {
+            if cx.blocks[b].removed != 0 {
                 continue;
             }
-            DIV_SEEN.count = 0;
-            let mut v = BLOCKS[b].first;
+            cx.div_seen.count = 0;
+            let mut v = cx.blocks[b].first;
             while v != 0 {
-                let next = INSTS[v].next;
-                let op = INSTS[v].op;
-                if (op == Div || op == Rem) && is_integer(INSTS[v].ty)
-                    && INSTS[INSTS[v].b].op == Const {
-                    lower_division(v);
+                let next = cx.insts[v].next;
+                let op = cx.insts[v].op;
+                if (op == Div || op == Rem) && is_integer(cx.insts[v].ty)
+                    && cx.insts[cx.insts[v].b].op == Const {
+                    lower_division(cx, v);
                 }
                 v = next;
             }
@@ -61,47 +57,49 @@ pub fn lower_divisions(fi: i64) {
 // Division or remainder v by a constant: the quotient by multiplication
 // (shared by a quotient and a remainder of the same operands in a block),
 // the remainder x - q * d.
-fn lower_division(v: i64) {
+fn lower_division(mut cx: *FnCtx, v: i64) {
     unsafe {
-        let ty = INSTS[v].ty;
-        let x = INSTS[v].a;
-        let d = INSTS[INSTS[v].b].imm;
+        let ty = cx.insts[v].ty;
+        let x = cx.insts[v].a;
+        let d = cx.insts[cx.insts[v].b].imm;
         let mut q = 0;
         let mut k = 0;
-        while k < DIV_SEEN.count {
-            if DIV_SEEN.data[k] == x && DIV_SEEN.data[k + 1] == d && DIV_SEEN.data[k + 2] == ty {
-                q = DIV_SEEN.data[k + 3];
+        while k < cx.div_seen.count {
+            if cx.div_seen.data[k] == x && cx.div_seen.data[k + 1] == d
+                && cx.div_seen.data[k + 2] == ty {
+                q = cx.div_seen.data[k + 3];
                 break;
             }
             k += 4;
         }
         if q == 0 {
-            q = make_quotient(v, x, d, ty);
+            q = make_quotient(cx, v, x, d, ty);
             if q == 0 {
                 return;
             }
-            DIV_SEEN.push(x);
-            DIV_SEEN.push(d);
-            DIV_SEEN.push(ty);
-            DIV_SEEN.push(q);
+            cx.div_seen.push(x);
+            cx.div_seen.push(d);
+            cx.div_seen.push(ty);
+            cx.div_seen.push(q);
         }
-        if INSTS[v].op == Div {
-            ir_replace(v, q);
+        if cx.insts[v].op == Div {
+            ir_replace(cx, v, q);
             return;
         }
         if is_signed(ty) && d == -1 {
-            ir_replace(v, const_before(v, 0, ty));
+            ir_replace(cx, v, const_before(cx, v, 0, ty));
             return;
         }
-        let product = op_before(v, Mul, ty, q, const_before(v, d, ty));
-        ir_replace(v, op_before(v, Sub, ty, x, product));
+        let product = op_before(cx, v, Mul, ty, q, const_before(cx, v, d, ty));
+        ir_replace(cx, v, op_before(cx, v, Sub, ty, x, product));
     }
 }
 
 // The high half of x * m (inserted before v).
-fn mulh_before(v: i64, ty: i64, x: i64, m: i64, signed: bool) -> i64 {
-    let h = op_before(v, MulH, ty, x, const_before(v, m, if signed { TY_I64 } else { TY_U64 }));
-    unsafe { INSTS[h].imm = if signed { 1 } else { 0 }; }
+fn mulh_before(mut cx: *FnCtx, v: i64, ty: i64, x: i64, m: i64, signed: bool) -> i64 {
+    let h = op_before(cx, v, MulH, ty, x,
+        const_before(cx, v, m, if signed { TY_I64 } else { TY_U64 }));
+    unsafe { cx.insts[h].imm = if signed { 1 } else { 0 }; }
     h
 }
 
@@ -120,7 +118,7 @@ fn exact_log2(d: u64) -> i64 {
 // x / d for the constant d (canonical for ty), computed before v from the
 // canonical 64-bit x; 0 when the division stays (by 0, which has its
 // defined result, and by negative powers of two).
-fn make_quotient(v: i64, x: i64, d: i64, ty: i64) -> i64 {
+fn make_quotient(mut cx: *FnCtx, v: i64, x: i64, d: i64, ty: i64) -> i64 {
     let bits = int_bits(ty);
     if d == 0 {
         return 0;
@@ -132,35 +130,35 @@ fn make_quotient(v: i64, x: i64, d: i64, ty: i64) -> i64 {
             return x;
         }
         if k > 0 {
-            return op_before(v, Shr, ty, x, const_before(v, k, ty));
+            return op_before(cx, v, Shr, ty, x, const_before(cx, v, k, ty));
         }
         if bits <= 32 {
             // m = 2^64 / d rounded up: for x < 2^bits, x * m / 2^64 differs
             // from x / d by less than x / 2^64 <= 1 / d, too little to
             // reach the next integer.
             let m = 0xffffffffffffffff as u64 / ud + 1;
-            return mulh_before(v, ty, x, m as i64, signed: false);
+            return mulh_before(cx, v, ty, x, m as i64, signed: false);
         }
         let mut m: u64 = 0;
         let mut add = false;
         let mut s = 0;
         magic_unsigned(ud, &m, &add, &s);
-        let t = mulh_before(v, TY_U64, x, m as i64, signed: false);
+        let t = mulh_before(cx, v, TY_U64, x, m as i64, signed: false);
         if !add {
-            return op_before(v, Shr, TY_U64, t, const_before(v, s, TY_U64));
+            return op_before(cx, v, Shr, TY_U64, t, const_before(cx, v, s, TY_U64));
         }
         // m is 2^64 + the constant: q = (((x - t) >> 1) + t) >> (s - 1).
-        let half = op_before(v, Shr, TY_U64, op_before(v, Sub, TY_U64, x, t),
-            const_before(v, 1, TY_U64));
-        let sum = op_before(v, Add, TY_U64, half, t);
-        return op_before(v, Shr, TY_U64, sum, const_before(v, s - 1, TY_U64));
+        let half = op_before(cx, v, Shr, TY_U64, op_before(cx, v, Sub, TY_U64, x, t),
+            const_before(cx, v, 1, TY_U64));
+        let sum = op_before(cx, v, Add, TY_U64, half, t);
+        return op_before(cx, v, Shr, TY_U64, sum, const_before(cx, v, s - 1, TY_U64));
     }
     if d == 1 {
         return x;
     }
     if d == -1 {
         // Wrapping: MIN / -1 is MIN.
-        return op_before(v, Neg, ty, x, 0);
+        return op_before(cx, v, Neg, ty, x, 0);
     }
     let ad = if d < 0 { (0 - d) as u64 } else { d as u64 };
     if exact_log2(ad) >= 0 {
@@ -179,21 +177,22 @@ fn make_quotient(v: i64, x: i64, d: i64, ty: i64) -> i64 {
         } else if d < 0 && m > 0 {
             m -= wide;
         }
-        let product = op_before(v, Mul, TY_I64, x, const_before(v, m, TY_I64));
-        t = op_before(v, Shr, TY_I64, product, const_before(v, bits + s, TY_I64));
+        let product = op_before(cx, v, Mul, TY_I64, x, const_before(cx, v, m, TY_I64));
+        t = op_before(cx, v, Shr, TY_I64, product, const_before(cx, v, bits + s, TY_I64));
     } else {
-        t = mulh_before(v, TY_I64, x, m, signed: true);
+        t = mulh_before(cx, v, TY_I64, x, m, signed: true);
         if d > 0 && m < 0 {
-            t = op_before(v, Add, TY_I64, t, x);
+            t = op_before(cx, v, Add, TY_I64, t, x);
         } else if d < 0 && m > 0 {
-            t = op_before(v, Sub, TY_I64, t, x);
+            t = op_before(cx, v, Sub, TY_I64, t, x);
         }
         if s > 0 {
-            t = op_before(v, Shr, TY_I64, t, const_before(v, s, TY_I64));
+            t = op_before(cx, v, Shr, TY_I64, t, const_before(cx, v, s, TY_I64));
         }
     }
     // Rounded toward zero: one more when negative.
-    op_before(v, Sub, TY_I64, t, op_before(v, Shr, TY_I64, t, const_before(v, 63, TY_I64)))
+    op_before(cx, v, Sub, TY_I64, t,
+        op_before(cx, v, Shr, TY_I64, t, const_before(cx, v, 63, TY_I64)))
 }
 
 // The magic number of signed division by d (2 <= |d| < 2^(w-1), w bits;
