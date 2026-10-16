@@ -1449,6 +1449,27 @@ appends "Tn notes" here.
 - `TACHYON_ARENA_SHUFFLE`, which randomizes the arenas' chunk addresses, so
   that any address-dependent output shows up as a byte difference.
 
+**T4 notes** (b18-distinct).
+- A distinct type is `TyKind::Distinct` (front/distinct.tach) while the
+  program is checked; `erase_program_types` (front/check/distinct.tach)
+  then writes its underlying type wherever the code generators read
+  types (node types, fields, signatures, variants, statics, locals), so
+  middle, back and gen0 never see one. Tools (QUERY) keep it.
+- The inherited traits are std's `distinct_eq/cmp/hash/fmt/fmt_debug/clone`
+  (clone.tach), called through `intrinsic_method` with `<X, T>`; an
+  explicit impl wins. Generic distinct types have generic impls through
+  `TPL_DISTINCT + alias` (`impl<T> NonNull<T>`, `NonNull::new`).
+- The niche knows std's `NonNull` by its alias (std's module, that name),
+  not by a `#[niche_null]` attribute: the parser takes no attributes on
+  aliases yet. An enum has it with two variants, one without fields and
+  one holding only a NonNull (`enum_niche`).
+- Left to T1 (the invariant): `q as NonNull<T>` and a NonNull from C are
+  not checked for null yet; `NonNull::new` checks.
+- Field access through a distinct struct type is not offered (convert
+  with `as`); `!` on a distinct bool is not either.
+- Found on the way: an `extern "C" fn`'s result type `X<Y<Z>>` was a
+  parser error (fixed in its own commit).
+
 ## 8. Measuring what it does for agents
 
 The user asked that the benefit be measurable. No eval is run with this design.
