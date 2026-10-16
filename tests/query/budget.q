@@ -202,6 +202,7 @@ usage: tachyonc query def|show NAME... [--root ROOT] [--exact] [--with-comments]
        tachyonc query unused [MODULE] [--all]
        tachyonc query impact NAME
        tachyonc query effects NAME...|MODULE [--has EFFECT] [--why EFFECT]   (alloc(Gpa) io global panic diverge unsafe)
+       tachyonc query features NAME... [--why FEATURE] [-C target-cpu=CPU] [-C target-feature=+x,-y]   (std::arch: what a function needs beyond the build's features)
        tachyonc query views NAME...|MODULE [--why]   (what results and `&mut` parameters view: views(self), views(*self), stores(word))
        tachyonc query conflicts [FILE|DIR|FILE:LINE...] [--show]
        tachyonc query similar NAME... [--limit N]   (items like NAME to copy, nearest first)
