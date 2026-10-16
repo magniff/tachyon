@@ -24,3 +24,4 @@ is planned in [tests/agent-eval/plans/0.16.md](../../tests/agent-eval/plans/0.16
 | report | compiler | models | conditions | tasks x reps |
 |---|---|---|---|---|
 | (none yet: the first is 0.14's) | | | | |
+| [0.17-validation-results](0.17-validation-results.md) (verdicts; per-cell reports 0.17-validation-*.md) | 0.17 candidate (release-0.17 03dbfff); compiler tasks on 2bb20ed | Sonnet, Haiku | guide-core, guide, both-core, rust-pairs, both+hook+test, compiler-tools-core(+test), compiler-plain; baseline 0.16 reused | programs 01-18 x3-10, compiler 21-24 x3: 588 new runs |
