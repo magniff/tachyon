@@ -683,8 +683,9 @@ fn at_mark() -> *i64 {
 // The events
 
 // Slot s is used at node n: an invalidated slot is the finding; a `&mut`
-// child of s ends.
-pub fn use_slot(s: i64, n: i64) {
+// child of s ends, if it borrows what mask m covers (null: all; the place
+// read through s: a field read leaves a view of another field alive).
+pub fn use_slot(s: i64, n: i64, m: *i64) {
     unsafe {
         let fl = slot_off(CUR, s) + OV;
         if (POOL[fl] & F_INVALID) != 0 {
@@ -693,7 +694,8 @@ pub fn use_slot(s: i64, n: i64) {
         }
         if ANY_CHILD && ANY_MUT {
             for q in 0..NSLOT {
-                if q != s && is_slot_ancestor(s, q) {
+                if q != s && is_slot_ancestor(s, q)
+                    && (m == 0 as *i64 || any_and(l1(slot_off(CUR, q)), m)) {
                     let qf = slot_off(CUR, q) + OV;
                     if (POOL[qf] & F_MUTLOAN) != 0 && (POOL[qf] & F_INVALID) == 0 {
                         POOL[qf + 1] = n;
@@ -772,7 +774,7 @@ pub fn on_read(p: i64, n: i64) {
         }
         let s = slot_of_place(p);
         if s >= 0 {
-            use_slot(s, n);
+            use_slot(s, n, &PL_MASK[p * NW]);
         }
         if ANY_MUT {
             let m = &PL_MASK[p * NW];
@@ -899,6 +901,9 @@ pub fn on_value(p: i64, n: i64, ty: i64, dst: i64) {
     }
 }
 
+// The expression a pattern binds out of (walk::eval_match), or 0.
+pub static mut BIND_FROM: i64 = 0;
+
 // Local l bound at node n (a pattern) to a value of origin v (-1: none).
 pub fn on_bind(l: i64, n: i64, v: i64) {
     unsafe {
@@ -916,6 +921,13 @@ pub fn on_bind(l: i64, n: i64, v: i64) {
         }
         POOL[off + OV] = start_flags(l);
         SLOT_PARENT.data[s] = -1;
+        if BIND_FROM != 0 {
+            let ps = root_slot(BIND_FROM);
+            if ps >= 0 && ps != s {
+                SLOT_PARENT.data[s] = ps;
+                ANY_CHILD = true;
+            }
+        }
         slot_note(s, n, 0);
     }
 }
@@ -983,7 +995,7 @@ pub fn on_assign(p: i64, n: i64, v: i64) {
             if t > 0 && TYPES[t].kind == TyKind::Slice && TYPES[t].b != REF_MUT {
                 readonly(n, SLOT_LOCAL.data[vs], t);
             }
-            use_slot(vs, n);
+            use_slot(vs, n, 0 as *i64);
             let so = slot_off(CUR, vs);
             let m = new_ov();
             or_expanded(at(m), l1(so));
@@ -1004,7 +1016,7 @@ pub fn on_assign(p: i64, n: i64, v: i64) {
             if t > 0 && TYPES[t].kind == TyKind::Ptr && TYPES[t].b == REF_SHARED {
                 readonly(n, l, t);
             }
-            use_slot(s, n);
+            use_slot(s, n, 0 as *i64);
             write_place(p, n, H_WRITE, s);
             if v >= 0 {
                 or_into(l2(slot_off(CUR, s)), l1(v));
