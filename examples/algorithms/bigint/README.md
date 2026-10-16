@@ -130,7 +130,7 @@ say; with it, `self < other` works:
 struct BigUint { limbs: Vec<u32> }
 
 impl Ord for BigUint {
-    fn cmp(self: *BigUint, other: *BigUint) -> i64 {
+    fn cmp(self: &BigUint, other: &BigUint) -> i64 {
         let (a, b) = (self.limbs.as_slice(), other.limbs.as_slice());
         if a.len != b.len { return a.len - b.len; }
         ...

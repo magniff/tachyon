@@ -86,10 +86,10 @@ default, which is why the triangle prints as `shape`:
 
 ```tach
 pub trait Shape {
-    fn area(self: *Self) -> f64;
-    fn perimeter(self: *Self) -> f64;
-    fn name(self: *Self) -> [u8] { "shape" }
-    fn describe(self: *Self) {
+    fn area(self: &Self) -> f64;
+    fn perimeter(self: &Self) -> f64;
+    fn name(self: &Self) -> [u8] { "shape" }
+    fn describe(self: &Self) {
         println(f"{self.name():<8} area {self.area():>7.2}  perimeter {self.perimeter():>6.2}");
     }
 }
@@ -118,7 +118,7 @@ on the mixed list as on the list of rectangles:
 pub enum AnyShape { C(Circle), R(Rect), P(Polygon) }
 
 impl Shape for AnyShape {
-    fn area(self: *AnyShape) -> f64 {
+    fn area(self: &AnyShape) -> f64 {
         match *self {
             AnyShape::C(c) => c.area(),
             AnyShape::R(r) => r.area(),
@@ -139,7 +139,7 @@ impl Iterator for Edges {
     fn next(self: *Edges) -> Option<(Vec2, Vec2)> { ... }
 }
 
-fn perimeter(self: *Polygon) -> f64 {
+fn perimeter(self: &Polygon) -> f64 {
     self.edges().fold(0.0, |acc, (a, b)| acc + (b - a).length())
 }
 ```
@@ -153,15 +153,15 @@ used:
 ```tach
 pub trait Measured {
     type Output;
-    fn measure(self: *Self) -> Self::Output;
+    fn measure(self: &Self) -> Self::Output;
 }
 
 impl Measured for Segment {
     type Output = Meters;
-    fn measure(self: *Segment) -> Meters { Meters { m: (self.b - self.a).length() } }
+    fn measure(self: &Segment) -> Meters { Meters { m: (self.b - self.a).length() } }
 }
 
-fn show<T: Measured>(label: [u8], x: *T) {
+fn show<T: Measured>(label: [u8], x: &T) {
     let m: T::Output = x.measure();
     println(f"{label:<10} {m}");
 }

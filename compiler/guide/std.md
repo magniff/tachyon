@@ -187,7 +187,7 @@ last|
 Generated from std's source in this compiler: every public item a
 program uses, one line each. Methods take `self: &Self` (reads),
 `self: &mut Self` (changes; called as `v.push(x)` on a place), `self:
-*Self` or `self: Self` (by value). Each item with its
+*Self` (a reference, the older spelling) or `self: Self` (by value). Each item with its
 comment: `tachyonc guide std#every-item`; one item's source: `tachyonc
 query show std::Scanner::next_line`.
 

@@ -33,8 +33,8 @@ fn report<T: Shape>(s: &T) {
 }
 
 // Operators: + - * / and unary - through Add Sub Mul Div Neg,
-// == through Eq, < <= > >= through Ord's cmp. std's traits take
-// `self: *Self` (a reference, as a `*T` parameter is), so their impls do.
+// == through Eq, < <= > >= through Ord's cmp. Eq and Ord take
+// `self: &Self`, so their impls do (Display, Debug, Iterator: `*Self`).
 struct V2 { x: i64, y: i64 }
 
 impl Add for V2 {
