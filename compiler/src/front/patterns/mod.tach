@@ -16,8 +16,8 @@ use crate::base::diag::{
     ERR_HELP, err_begin, err_end, err_fmt, err_help, err_help_fmt, err_str, err_try_fmt,
 };
 use crate::front::ast::{
-    ARM_NO_ELSE, NODES, NodeKind, PAT_FIELDS, PAT_PARENS, child, list_begin, list_end, list_push,
-    new_node,
+    ARM_NO_ELSE, NODES, NodeKind, PAT_DEREF, PAT_FIELDS, PAT_PARENS, PAT_REF, child, list_begin,
+    list_end, list_push, new_node,
 };
 use crate::front::ast::NodeKind::{
     Ident, PatBind, PatLit, PatOr, PatRange, PatTuple, PatVariant, PatWild,
@@ -40,15 +40,15 @@ use crate::front::distinct::{is_distinct_type, strip_distinct};
 use crate::front::generics::{TPL_NONE, env_lookup, instance_of, template_of_key};
 use crate::front::modules::CUR_MOD;
 use crate::front::modules::lookup::{
-    B_ITEM, B_PRIVATE, access_error, binding_kind, binding_value, lookup_commit, lookup_name,
-    note_c_use, note_pattern_pos, path_module,
+    B_ITEM, B_PRIVATE, B_TVARIANT, B_VARIANT, access_error, binding_kind, binding_value,
+    lookup_commit, lookup_name, lookup_quiet, note_c_use, note_pattern_pos, path_module,
 };
 use crate::front::own::drops::arm_drops;
 use crate::front::patterns::usefulness::check_arms;
 use crate::front::types::{
-    CONSTS, ENUMS, SYM_PRIMITIVE, TYPES, TY_BOOL, TY_ERROR, TY_NEVER, TY_UNIT, TyKind, VARIANTS,
-    buf_type, enum_type, enum_variant, err_type, find_variant, is_fieldless_enum, is_float,
-    is_integer, item_node_of, type_elem, variant_field,
+    CONSTS, ENUMS, REF_MUT, REF_SHARED, SYM_PRIMITIVE, TYPES, TY_BOOL, TY_ERROR, TY_NEVER, TY_UNIT,
+    TyKind, VARIANTS, buf_type, enum_type, enum_variant, err_type, find_variant, is_fieldless_enum,
+    is_float, is_integer, is_ref, item_node_of, ref_to, type_elem, variant_field,
 };
 use crate::tools::query::command_line::qnote;
 
@@ -62,13 +62,81 @@ static mut OR_END: i64 = 0;
 // Where the locals of the pattern being checked start in ENV.
 static mut PATTERN_START: i64 = 0;
 
+// (0.18.1) The binding mode under the references matched so far
+// (PAT_DEREF): 0 by value, REF_SHARED or REF_MUT: bindings are references.
+static mut BIND_REF: i64 = 0;
+
+// Whether PatBind p names a value rather than binding one: a constant, or
+// a variant in scope (`None`), as check_pat reads it.
+fn names_value(p: i64) -> bool {
+    unsafe {
+        let name = NODES[p].a;
+        if NODES[p].b != 0 || lookup_local(name).is_some() {
+            return false;
+        }
+        if scope_const(name) != 0 {
+            return true;
+        }
+        let k = binding_kind(lookup_quiet(CUR_MOD, name, CUR_MOD));
+        k == B_VARIANT || k == B_TVARIANT
+    }
+}
+
+// Whether pattern p, matched against a value of reference type ty, matches
+// what it points to (Rust's default binding modes): any pattern but a
+// binding or `_`, against `&T` or `&mut T` of a T that is no reference.
+fn derefs(p: i64, ty: i64) -> bool {
+    unsafe {
+        if !is_ref(ty) || is_ref(TYPES[ty].a) {
+            return false;
+        }
+        let k = NODES[p].kind;
+        k != PatWild && (k != PatBind || names_value(p))
+    }
+}
+
+// (0.18.1, for the code generators) What pattern p, given a value of type
+// ty, matches: the referent of a reference it matches through
+// (PAT_DEREF), else 0.
+pub fn pattern_referent(p: i64, ty: i64) -> i64 {
+    unsafe {
+        if (NODES[p].p & PAT_DEREF) != 0 && is_ref(ty) {
+            return TYPES[ty].a;
+        }
+    }
+    0
+}
+
+// Whether pattern p is a binding that takes a reference into the matched
+// value (PAT_REF): the generators give it the value's address.
+pub fn binds_ref(p: i64) -> bool {
+    unsafe { NODES[p].kind == PatBind && (NODES[p].p & PAT_REF) != 0 }
+}
+
 pub fn check_pattern(p: i64, ty: i64) {
     PATTERN_START = ENV.count;
+    let saved = BIND_REF;
+    BIND_REF = 0;
     check_pat(p, ty);
+    BIND_REF = saved;
 }
 
 fn check_pat(p: i64, ty: i64) {
     unsafe {
+        if derefs(p, ty) {
+            // (0.18.1) a pattern on a reference matches what it points to;
+            // its bindings are references into it, `&mut` only under
+            // `&mut` all the way down (lowering: PAT_DEREF, PAT_REF)
+            let saved = BIND_REF;
+            BIND_REF = if saved == REF_SHARED || TYPES[ty].b == REF_SHARED { REF_SHARED }
+                else { REF_MUT };
+            check_pat(p, TYPES[ty].a);
+            BIND_REF = saved;
+            NODES[p].p |= PAT_DEREF;
+            return;
+        }
+        // (a pattern checked again, a generic's instance: flags of its own)
+        NODES[p].p &= ~(PAT_DEREF | PAT_REF);
         let kind = NODES[p].kind;
         // (0.18: a literal pattern of a distinct type matches its
         // underlying type's values)
@@ -157,8 +225,22 @@ fn check_pat(p: i64, ty: i64) {
                 check_pat(p, ty);
                 return;
             }
+            let mut bty = ty;
+            // (a slice is a view already: a copy, as `&[T]` is `[T]`)
+            if BIND_REF != 0 && !(TYPES[ty].kind == TyKind::Slice && TYPES[ty].b == 0) {
+                if NODES[p].b != 0 {
+                    err_begin(NODES[p].start);
+                    err_fmt(
+                        f"'mut {sym_text(name)}' in a pattern on a reference: its bindings are references into the value");
+                    err_help(c"drop the 'mut' (under a '&mut', '*x = v' changes the field), or match a copy: 'match *e'");
+                    err_end();
+                }
+                bty = ref_to(ty, BIND_REF);
+                NODES[p].p |= PAT_REF;
+                NODES[p].ty = bty;
+            }
             if OR_MODE {
-                NODES[p].x = or_rebind(p, name, ty);
+                NODES[p].x = or_rebind(p, name, bty);
                 return;
             }
             for i in PATTERN_START..ENV.count {
@@ -167,7 +249,7 @@ fn check_pat(p: i64, ty: i64) {
                         c"' is bound more than once in the same pattern");
                 }
             }
-            NODES[p].x = define_local(name, ty, NODES[p].b != 0, false);
+            NODES[p].x = define_local(name, bty, NODES[p].b != 0 && bty == ty, false);
             return;
         }
         if kind == PatOr {
@@ -445,6 +527,15 @@ fn check_or_pattern(p: i64, ty: i64) {
             check_pat(alt, ty);
             if binding_count(alt) != bound {
                 type_error(alt, c"every alternative of an or-pattern must bind the same variables");
+            }
+        }
+    }
+    unsafe {
+        for i in 0..NODES[p].count {
+            if binds_ref(child(p, i)) {
+                // (0.18.1: the generators give an alternative a value, not
+                // the address a reference binding takes)
+                type_error(child(p, i), c"a binding as an alternative of an or-pattern on a reference: bind the value once, outside the or-pattern");
             }
         }
     }

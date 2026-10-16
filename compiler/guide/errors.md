@@ -789,6 +789,15 @@ error[own.readonly] cannot write 'p.x': 'p' is '&P', a shared reference
 --type p '&mut P'` changes both); a slice: `s: &mut [T]`, passed as
 `v.as_mut_slice()` or `&mut a[..]`. Old code: `tachyonc fix --values`.
 
+```text
+error[own.readonly] changes 'v' (Vec<i64>), a copy the match on '*e' (3:11) binds: the change would not reach it, and could free memory it points to
+error[own.readonly] changes 'w' (Vec<i64>), a copy of an element 'vv.get(0)' reads: ...
+```
+(0.18.1) `match *e`, `v.get(i)` and a `for` loop's element give a copy
+of an owned value that stays where it is: read it, do not change it.
+Match the reference instead (`match e` with `e: &mut E` binds `v: &mut
+Vec<i64>`), or change the element in place (`vv[0].push(1)`).
+
 ## At run time
 
 A failed check prints its message on stderr and exits with code 101:

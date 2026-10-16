@@ -230,8 +230,9 @@ total 129
   here `input`, until `main` returns. Text is compared with `==` and `<`;
   `match` has no string patterns.
 - Enum variants are tuple-like or struct-like; patterns as in Rust, with
-  guards (`Ok(n) if n >= 0`), `if let`, `while let`. Matching through a
-  reference is `match *self`.
+  guards (`Ok(n) if n >= 0`), `if let`, `while let`. Matching a
+  reference matches what it points to: `match self` binds references
+  into it (0.18.1, `n: &i64`, read as `*n`), `match *self` copies.
 - `#[derive(Eq, Ord, Hash, Debug, Clone)]` (no `PartialEq`, no `Copy`
   derive: a struct of numbers and views, as `Item`, copies; one holding a
   `Vec`, `Buf` or `HashMap`, as `Store`, moves). `Display` is written by

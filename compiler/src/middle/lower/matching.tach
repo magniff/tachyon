@@ -8,10 +8,10 @@ use crate::front::ast::NodeKind::{PatBind, PatLit, PatOr, PatRange, PatTuple, Pa
 use crate::front::check::LOCALS;
 use crate::front::consteval::wrap_int;
 use crate::front::distinct::enum_niche;
-use crate::front::patterns::{binding_count, is_irrefutable};
+use crate::front::patterns::{binding_count, binds_ref, is_irrefutable, pattern_referent};
 use crate::front::patterns::usefulness::int_key;
 use crate::front::types::{
-    ENUMS, TYPES, TY_NEVER, TY_U64, VARIANTS, is_compound, is_enum, is_integer, is_void,
+    ENUMS, TYPES, TY_NEVER, TY_U64, VARIANTS, is_compound, is_enum, is_integer, is_ref, is_void,
     scalar_type, tuple_offset, type_elem, type_size, variant_field, variant_field_offset,
 };
 use crate::middle::ir::{
@@ -32,15 +32,25 @@ pub fn lower_match(n: i64) -> i64 {
     unsafe {
         let ty = NODES[n].ty;
         let scrutinee = NODES[n].a;
-        let st = NODES[scrutinee].ty;
+        let mut st = NODES[scrutinee].ty;
         let has_value = !is_void(ty);
         let mut result = 0;
         if has_value {
             result = join_new(ty);
         }
-        let value = lower_operand(scrutinee);
+        let mut value = lower_operand(scrutinee);
         if st == TY_NEVER {
             return 0;
+        }
+        if is_ref(st) && (0..NODES[n].count).all(|i| {
+            let p = NODES[child(n, i)].a;
+            NODES[p].kind == PatWild || pattern_referent(p, st) != 0
+        }) {
+            // (0.18.1: every arm matches what the reference points to,
+            // dereferenced once here: a switch on its tag)
+            let inner = TYPES[st].a;
+            value = referent_value(value, inner);
+            st = inner;
         }
         let join = ir_new_block();
         if switch_cases(n, st) {
@@ -106,6 +116,18 @@ fn alloc_pattern_locals(p: i64) {
     }
 }
 
+// (0.18.1) The value a pattern on a reference matches, from the reference
+// ptr: the referent's address (compound) or its value.
+pub fn referent_value(ptr: i64, inner: i64) -> i64 {
+    if is_compound(inner) {
+        return ptr;
+    }
+    if is_void(inner) {
+        return 0;
+    }
+    ir_load(ir_type(inner), ptr, 0)
+}
+
 // Branches to `fail` unless `value` (of checker type ty; the address of a
 // compound value) matches pattern p; binds its variables.
 fn lower_pattern_test(p: i64, ty: i64, value: i64, fail: i64) {
@@ -114,10 +136,24 @@ fn lower_pattern_test(p: i64, ty: i64, value: i64, fail: i64) {
         if ty == TY_NEVER {
             return;
         }
+        let inner = pattern_referent(p, ty);
+        if inner != 0 {
+            lower_pattern_test(p, inner, referent_value(value, inner), fail);
+            return;
+        }
         match kind {
             PatWild => return,
             PatBind => {
                 let local = NODES[p].x;
+                if binds_ref(p) {
+                    // (value: the address of what it binds)
+                    if PROMOTE[local] != 0 {
+                        ssa_write(local, CUR, value);
+                    } else {
+                        ir_store(ir_type(LOCALS[local].ty), LOCAL_ADDR[local], value, 0);
+                    }
+                    return;
+                }
                 if is_void(ty) {
                     return;
                 }
@@ -190,7 +226,7 @@ fn lower_pattern_test(p: i64, ty: i64, value: i64, fail: i64) {
                 offset = tuple_offset(ty, i);
             }
             let mut elem = 0;
-            if is_compound(elem_ty) {
+            if is_compound(elem_ty) || binds_ref(sub) {
                 elem = ir_offset(value, offset);
             } else if !is_void(elem_ty) {
                 elem = ir_load(ir_type(elem_ty), value, offset);
@@ -376,7 +412,7 @@ fn lower_pattern_binds(p: i64, ty: i64, value: i64) {
             let elem_ty = variant_field(v, i);
             let offset = variant_field_offset(v, i);
             let mut elem = 0;
-            if is_compound(elem_ty) {
+            if is_compound(elem_ty) || binds_ref(sub) {
                 elem = ir_offset(value, offset);
             } else if !is_void(elem_ty) {
                 elem = ir_load(ir_type(elem_ty), value, offset);

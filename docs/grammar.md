@@ -184,6 +184,17 @@ or-pattern binds the same variables, with the same types. The patterns of
 `let` and `for` must match every value (no literals, ranges, alternatives,
 or variants of enums with several).
 
+Patterns on references (0.18.1, Rust's default binding modes): a pattern
+other than a binding or `_`, matched against a value of type `&T` or
+`&mut T` (T not itself a reference), matches the T the reference points
+to, and the bindings inside it are references into that T: `&U` for a
+field of type U, `&mut U` when every reference matched through is `&mut`.
+A field of slice type `[U]` binds a copy (a slice is a view already). A
+binding under a reference cannot be `mut`, nor an alternative of an
+or-pattern. `match e { E::A(n) => *n, E::B(v) => v.len(), E::C => 0 }`
+with `e: &E`; `match *e` matches a copy of the value (its owned fields
+bound so may be read, not changed or moved). There is no `&pat` pattern.
+
 ## Statements and blocks
 
 ```ebnf

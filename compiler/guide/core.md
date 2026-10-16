@@ -86,7 +86,8 @@ Also: `usize` is `i64` (lengths, indices); integers wrap; `a as i32`
 narrows, widening is implicit; `x?`, closures, `impl Trait for T`, `T:
 Trait`, `#[derive(Eq, Debug)]` are Rust's; no `dyn`, `where`, `Box` (a
 `Vec` or `*T`); `&x` and `&mut x` are references (`&T`, `&mut T`,
-0.17), and `p.0`, `p.x` reach through a reference or a pointer. Arguments may have defaults and names: `fn f(a: i64, b: i64 =
+0.17), and `p.0`, `p.x` reach through a reference or a pointer; `match e` on
+`e: &E` binds references into it (`E::A(n) => *n`), as Rust does. Arguments may have defaults and names: `fn f(a: i64, b: i64 =
 2)`, `f(1, b: 3)`. The prelude (no `use`) has `Option`, `Result`, `Vec`,
 `Buf`, `HashMap`, `print`, `println`, `format_in`, `Gpa`, `read_line`,
 `read_stdin_in`, `Scanner`, `parse_int`, `trim`, `split_in`,

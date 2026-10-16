@@ -10,6 +10,7 @@ use crate::front::ast::NodeKind::{
 use crate::front::check::LOCALS;
 use crate::front::consteval::wrap_int;
 use crate::front::distinct::enum_niche;
+use crate::front::patterns::{binds_ref, pattern_referent};
 use crate::front::types::{
     ENUMS, TYPES, TY_NEVER, TY_U64, VARIANTS, is_compound, is_signed, is_void, scalar_type,
     tuple_offset, type_elem, variant_field, variant_field_offset,
@@ -92,9 +93,30 @@ fn gen_pattern_test(p: i64, ty: i64, held: i64, fail: i64) {
         if ty == TY_NEVER {
             return;
         }
+        let inner = pattern_referent(p, ty);
+        if inner != 0 {
+            // (0.18.1) `held` holds a reference: the pattern matches what it
+            // points to (a compound one stays where it is)
+            let inner_held = alloc_slot(8, 8);
+            load_reg_from_frame(R_ACC, held);
+            if is_compound(inner) {
+                store_reg_to_frame(R_ACC, inner_held);
+            } else if !is_void(inner) {
+                emit_load(inner, R_ACC);
+                store_to_frame(inner, inner_held);
+            }
+            gen_pattern_test(p, inner, inner_held, fail);
+            return;
+        }
         match kind {
             PatWild => return,
             PatBind => {
+                if binds_ref(p) {
+                    // (held: the address of what it binds)
+                    load_reg_from_frame(R_ACC, held);
+                    store_reg_to_frame(R_ACC, LOCALS[NODES[p].x].offset);
+                    return;
+                }
                 if !is_void(ty) {
                     load_held(ty, held);
                     store_to_frame(ty, LOCALS[NODES[p].x].offset);
@@ -171,7 +193,7 @@ fn gen_pattern_test(p: i64, ty: i64, held: i64, fail: i64) {
             let elem_held = alloc_slot(8, 8);
             load_reg_from_frame(R_ACC, held);
             emit_add_imm(R_ACC, offset);
-            if is_compound(elem_ty) {
+            if is_compound(elem_ty) || binds_ref(sub) {
                 store_reg_to_frame(R_ACC, elem_held);
             } else if !is_void(elem_ty) {
                 emit_load(elem_ty, R_ACC);

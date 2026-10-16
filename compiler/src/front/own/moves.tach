@@ -22,17 +22,17 @@ use crate::front::check::LOCALS;
 use crate::front::closures::{CLOSURES, CLOSURE_COUNT};
 use crate::front::modules::STD_MODULE;
 use crate::front::own::diag::{
-    OWN_MOVED, OWN_MOVE_OUT, OWN_PARTIAL, own_begin, own_end, own_help, own_help_bytes, own_str,
-    own_sym, own_try, own_type,
+    OWN_MOVED, OWN_MOVE_OUT, OWN_PARTIAL, OWN_READONLY, own_begin, own_end, own_help,
+    own_help_bytes, own_str, own_sym, own_try, own_type,
 };
 use crate::front::own::drops::{
     ASSIGN_OLD, BYREF, MATCH_BYREF, assign_read, drop_state, note_move, walk_begin,
 };
-use crate::front::own::kinds::{has_drop_impl, owned_base_type};
+use crate::front::own::kinds::{has_drop_impl, is_owned_type, owned_base_type};
 use crate::front::own::state::{
     CUR, NW, PL_COUNT, PL_FIELD, PL_MASK, PL_MOVED_BY, PL_PARENT, PL_RID, PL_RKIND, POOL, RK_LOCAL,
-    RK_STATIC, S_DMOVED, S_MOVED, TUPLE_FIELD, any_and, dmoved_bits, get_bit, is_below, moved_bits,
-    root_of, set_bit,
+    RK_STATIC, S_DMOVED, S_MOVED, TUPLE_FIELD, any_and, dmoved_bits, field_number, get_bit,
+    is_below, moved_bits, root_of, set_bit,
 };
 use crate::front::own::walk::{CUR_F, MO_DEREF, MO_INDEX, MO_STATIC, PO_DEREF, PO_INDEX, PO_RAW};
 use crate::front::types::FNS;
@@ -260,6 +260,53 @@ pub fn move_out_value(n: i64, how: i64) {
     // (std's accessors make the copies callers borrow:
     // drops::borrowed_call)
     move_out(-1, n, how);
+}
+
+// (0.18.1) own.readonly: a `&mut` loan at node n of owned place p (of type
+// t), or an assignment to one, that is part of a binding that borrows (BYREF: a match through a
+// reference, a `for` loop's element, a copy `v.get(i)` reads): the binding
+// is a bitwise copy, and a change to it (a push that moves the elements,
+// a free) would leave the original pointing at memory that is gone.
+pub fn byref_change(p: i64, n: i64, t: i64) {
+    unsafe {
+        if p < 0 || FNS[CUR_F].module == STD_MODULE || PO_RAW || !is_owned_type(t) {
+            return;
+        }
+        let root = root_of(p);
+        if PL_RKIND[root] != RK_LOCAL {
+            return;
+        }
+        let l = PL_RID[root];
+        let at = BYREF.get(l + 1) - 1;
+        if at <= 0 {
+            return;
+        }
+        own_begin(n, OWN_READONLY);
+        own_str(c"changes ");
+        own_sym(LOCALS[l].name);
+        own_str(c" (");
+        own_type(LOCALS[l].ty);
+        own_str(c"), ");
+        let k = NODES[at].kind;
+        if k == NodeKind::Index {
+            own_str(c"a copy of a loop's element, which the loop borrows: ");
+            own_str(c"the change would not reach the element, and could free memory it points to");
+            own_help(c"loop over the indices and change the element in place ('for i in 0..v.len() { v[i]... }')");
+        } else if crate::front::own::drops::borrowed_call(at) {
+            own_str(c"a copy of an element ");
+            src_quoted(at);
+            own_str(c" reads: the change would not reach the element, and could free memory it points to");
+            own_help(c"change the element in place ('v[i]...'), or work on a copy ('.clone()')");
+        } else {
+            own_str(c"a copy the match on ");
+            src_quoted(at);
+            own_str(c" (");
+            line_col(NODES[at].start);
+            own_str(c") binds: the change would not reach it, and could free memory it points to");
+            own_help(c"match the reference itself ('match e' for 'e: &mut E', or 'match &mut x'): its bindings are '&mut' references into the value (0.18.1)");
+        }
+        own_end();
+    }
 }
 
 // own.move_out: the value of call n, a copy of an element a collection
@@ -536,7 +583,7 @@ fn place_text(b: i64, p: i64) {
             buf_byte(b, '.');
             let f = PL_FIELD[p];
             if f >= TUPLE_FIELD {
-                buf_int(b, f - TUPLE_FIELD);
+                buf_int(b, field_number(f));
             } else {
                 buf_bytes(b, SYMS[f].text);
             }
