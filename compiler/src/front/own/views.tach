@@ -38,9 +38,9 @@ use crate::front::own::kinds::{P_MUT, is_owned_type, is_view_type, param_mode};
 use crate::front::own::state::{
     CUR, F_INVALID, F_SCOPE, F_STATIC, LOC_CAP, LOC_PL, NSLOT, NW, OV, PE, PEND, PE_BY, PE_INVALID,
     PE_KIND, PE_OV, PK_NONE, PK_RAW, PL_COUNT, PL_FIELD, PL_MASK, PL_PARENT, PL_RID, PL_RKIND, POOL,
-    POOL_TOP, RK_LOCAL, RK_MARK, RK_STATIC, SLOT_LOCAL, SLOT_PARENT, TUPLE_FIELD, any_and, at,
-    get_bit, l1, l2, mark_place, new_ov, or_expanded, or_into, ov_hits, ov_inner, ov_or, root_of,
-    root_place, set_bit, slot_for, slot_of_local, slot_of_place, slot_off,
+    POOL_TOP, RK_LOCAL, RK_MARK, RK_ROOT, RK_STATIC, SLOT_LOCAL, SLOT_PARENT, TUPLE_FIELD, any_and,
+    at, get_bit, l1, l2, mark_place, new_ov, or_expanded, or_into, ov_hits, ov_inner, ov_or,
+    root_of, root_place, set_bit, slot_for, slot_of_local, slot_of_place, slot_off,
 };
 use crate::front::own::walk::{
     BOUND, CUR_F, PARAM_LOCALS, PO_DEREF, PO_INNER, PO_RAW, PO_VIEWSLOT, W_DROP, W_MOVE,
@@ -359,7 +359,7 @@ fn put_place(p: i64) {
 
 // The first place of origin o (level 1, else 2) that is a local's, a
 // static's or a parameter's; -1.
-fn first_place(o: i64, m: *i64) -> i64 {
+pub fn first_place(o: i64, m: *i64) -> i64 {
     unsafe {
         for q in 0..PL_COUNT {
             if PL_RKIND[root_of(q)] == RK_MARK {
@@ -466,6 +466,36 @@ fn reporting(n: i64) -> bool {
     unsafe { !QUIET && !seen(n) }
 }
 
+// Whether local l is the checker's own: a desugaring's (`__t`, `__out`,
+// `__b` of format_in; `__f`, `__a0` of a derived impl) or an f-string
+// hole's (`=f0`, `==l`). Its views and loans are the desugaring's, which
+// std's raw code keeps right: a finding on them would name nothing the
+// program wrote, so none is reported. A `for` loop's `__for_seq` is the
+// user's sequence and stays.
+pub fn hidden_local(l: i64) -> bool {
+    unsafe {
+        if l < 0 {
+            return false;
+        }
+        let name = SYMS[LOCALS[l].name].text;
+        if name.len >= 1 && name[0] == '=' {
+            return true;
+        }
+        name.len >= 2 && name[0] == '_' && name[1] == '_' && LOCALS[l].name != SYM_FOR_SEQ
+    }
+}
+
+// Whether place p's root is a hidden local (or one of its roots).
+pub fn hidden_place(p: i64) -> bool {
+    unsafe {
+        if p < 0 {
+            return false;
+        }
+        let r = root_of(p);
+        (PL_RKIND[r] == RK_LOCAL || PL_RKIND[r] == RK_ROOT) && hidden_local(PL_RID[r])
+    }
+}
+
 // Slot s, invalidated, is used at node n: the finding.
 fn report_invalid(s: i64, n: i64) {
     unsafe {
@@ -475,12 +505,12 @@ fn report_invalid(s: i64, n: i64) {
         let how = (flags >> HOW_SHIFT) & 15;
         let l = SLOT_LOCAL.data[s];
         let at_node = if reason > 0 { reason } else { n };
-        if !reporting(at_node) {
+        let hit = (flags >> HIT_SHIFT) & 1023;
+        let what = if hit > 0 { hit - 1 } else { first_place(off, 0 as *i64) };
+        if hidden_local(l) || hidden_place(what) || !reporting(at_node) {
             return;
         }
         let assumed = (any_and(l1(off), at_mark()) || any_and(l2(off), at_mark()));
-        let hit = (flags >> HIT_SHIFT) & 1023;
-        let what = if hit > 0 { hit - 1 } else { first_place(off, 0 as *i64) };
         if LOCALS[l].name == SYM_FOR_SEQ && reason > 0 && how != H_GLOBAL {
             // (a `for` loop's sequence: §2.9 situation 4)
             own_begin(at_node, OWN_CONFLICT);
@@ -1004,7 +1034,7 @@ pub fn on_assign(p: i64, n: i64, v: i64) {
 // own.readonly: assignment n writes through local l of type t (`&T`, `[T]`).
 fn readonly(n: i64, l: i64, t: i64) {
     unsafe {
-        if !reporting(n) {
+        if hidden_local(l) || !reporting(n) {
             return;
         }
         own_begin(n, OWN_READONLY);
@@ -1047,7 +1077,7 @@ fn readonly(n: i64, l: i64, t: i64) {
 fn static_store(p: i64, n: i64, v: i64) {
     unsafe {
         let q = first_place(v, 0 as *i64);
-        if q < 0 || !reporting(n) {
+        if q < 0 || hidden_place(q) || !reporting(n) {
             return;
         }
         own_begin(n, OWN_ESCAPE);
@@ -1089,7 +1119,7 @@ pub fn on_scope_end(mark: i64, v: i64, tail: i64) {
         invalidate(at(mask), 0 - first - 1, H_SCOPE, -1, PEND.count);
         let body = NODES[FNS[CUR_F].node].c;
         if v >= 0 && tail != 0 && tail != NODES[body].a && ov_hits(v, at(mask))
-            && reporting(tail) {
+            && !hidden_place(first_place(v, at(mask))) && reporting(tail) {
             let q = first_place(v, at(mask));
             own_begin(tail, OWN_ESCAPE);
             own_str(c"the block's value views ");
@@ -1124,7 +1154,7 @@ pub fn on_result(e: i64, v: i64) {
         }
         if v >= 0 {
             let q = escaping(v, 0 as *i64);
-            if q >= 0 && reporting(e) {
+            if q >= 0 && !hidden_place(q) && reporting(e) {
                 let l = PL_RID[root_of(q)];
                 own_begin(e, OWN_ESCAPE);
                 own_sym(FNS[f].display);
@@ -1181,7 +1211,7 @@ pub fn on_result(e: i64, v: i64) {
             let m = new_ov();
             or_into(at(m), l2(off));
             let q = escaping(m, 0 as *i64);
-            if q >= 0 && reporting(e) {
+            if q >= 0 && !hidden_place(q) && !hidden_local(l) && reporting(e) {
                 own_begin(e, OWN_ESCAPE);
                 own_sym(FNS[f].display);
                 own_str(c" stores a view of ");

@@ -9,4 +9,4 @@ $ items prelude017/uses.tach
 crate	prelude017/uses.tach	1
 std	<std>	528
 $ def trim prelude017/uses.tach
-std::trim	../../compiler/std/io.tach:102:8	fn	pub fn trim(s: [u8]) -> [u8]	effects: panic	views: views(s) inferred
+std::trim	../../compiler/std/io.tach:103:8	fn	pub fn trim(s: [u8]) -> [u8]	effects: panic	views: views(s) declared
