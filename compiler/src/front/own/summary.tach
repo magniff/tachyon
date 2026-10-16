@@ -26,9 +26,11 @@
 use crate::base::{SYMS, buf_byte, buf_bytes, buf_fmt, buf_new, buf_slice, buf_str, intern_c};
 use crate::base::diag::report_error_once;
 use crate::front::ast::{NODES, NodeKind, child};
+use crate::front::effects::infer::template_of;
 use crate::front::own::infer::{filter_summary, param_carries};
 use crate::front::own::kinds::{P_MUT, P_MUT_VIEW, is_view_type, param_mode};
-use crate::front::parser::items::attrs::STORES_FORM;
+use crate::front::parser::items::attrs::{STORES_FORM, views_of};
+use crate::front::traits::{IMPLS, impl_of_fn, trait_fn};
 use crate::front::types::{FNS, FN_COUNT, REF_MUT, REF_SHARED, TYPES, TyKind, fn_param};
 
 pub const S_L1_P: i64 = 0;
@@ -151,7 +153,7 @@ pub fn summary_of(f: i64) -> ViewSummary {
         if !view_fn(f) {
             return empty_summary();
         }
-        if FNS[f].views_decl != 0 {
+        if decl_of(f) != 0 {
             return filter_summary(f, declared_summary(f));
         }
         if f < STORED_N && STORED[f * 9 + 8] != 0 {
@@ -400,6 +402,49 @@ pub fn param_named(f: i64, sym: i64) -> i64 {
     }
 }
 
+// The declaration that binds f (its first views/stores EffectSet node, 0:
+// none): f's own, else its trait method's (§2.4: a declaration on a
+// trait's method binds every impl). DECL_NAMES gets the Fn node whose
+// parameter names it uses (memoized per function).
+pub fn decl_of(f: i64) -> i64 {
+    unsafe {
+        if f < 0 {
+            return 0;
+        }
+        if f >= DECL_N {
+            let n = FN_COUNT + 64;
+            let a = crate::base::alloc_array::<i64>(n * 2);
+            for i in 0..DECL_N * 2 {
+                a[i] = DECL_MEMO[i];
+            }
+            DECL_MEMO = a;
+            DECL_N = n;
+        }
+        if DECL_MEMO[f * 2] == 0 {
+            let mut d = FNS[f].views_decl;
+            let mut names = FNS[f].node;
+            if d == 0 && FNS[f].node != 0 {
+                let i = impl_of_fn(template_of(f));
+                if i >= 0 && IMPLS[i].tr >= 0 {
+                    let tf = trait_fn(IMPLS[i].tr, NODES[FNS[f].node].a);
+                    if tf != 0 && views_of(tf) != 0 {
+                        d = views_of(tf);
+                        names = tf;
+                    }
+                }
+            }
+            DECL_MEMO[f * 2] = d + 1;
+            DECL_MEMO[f * 2 + 1] = names;
+        }
+        DECL_NAMES = DECL_MEMO[f * 2 + 1];
+        DECL_MEMO[f * 2] - 1
+    }
+}
+
+static mut DECL_MEMO: *i64 = 0 as *i64;
+static mut DECL_N: i64 = 0;
+pub static mut DECL_NAMES: i64 = 0;
+
 // f's declared summary: `#[views(a, *b)]` puts a at every level (S_L1_P,
 // S_L1_STAR, S_L2_P, S_L2_STAR), b at S_L1_STAR and S_L2_STAR; `#[stores(..)]`
 // the same for the stores. Names that are no parameter count for nothing
@@ -409,12 +454,13 @@ pub fn declared_summary(f: i64) -> ViewSummary {
     unsafe {
         let mut s = empty_summary();
         s.declared = true;
-        let mut d = FNS[f].views_decl;
+        let mut d = decl_of(f);
+        let names = DECL_NAMES;
         while d != 0 {
             let stores = NODES[d].c == STORES_FORM;
             for k in 0..NODES[d].count {
                 let item = child(d, k);
-                let i = param_named(f, NODES[item].a);
+                let i = node_param_named(names, NODES[item].a);
                 if i < 0 {
                     continue;
                 }
@@ -437,11 +483,23 @@ pub fn declared_summary(f: i64) -> ViewSummary {
     }
 }
 
+// The parameter of Fn node item named sym, -1.
+fn node_param_named(item: i64, sym: i64) -> i64 {
+    unsafe {
+        for i in 0..NODES[item].count {
+            if NODES[child(item, i)].a == sym {
+                return i;
+            }
+        }
+        -1
+    }
+}
+
 // Whether f's declaration has a `#[views]` part (else: views()), a
 // `#[stores]` part (else: stores()).
 pub fn declares(f: i64, stores: bool) -> bool {
     unsafe {
-        let mut d = FNS[f].views_decl;
+        let mut d = decl_of(f);
         while d != 0 {
             if (NODES[d].c == STORES_FORM) == stores {
                 return true;
