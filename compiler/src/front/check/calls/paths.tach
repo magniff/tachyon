@@ -6,7 +6,7 @@ use crate::base::diag::{
     err_sym, err_try_tool, error_at,
 };
 use crate::front::assoc::ensure_checked;
-use crate::front::ast::{NODES, VK_LOAD, VK_NEW, VK_SPLAT, child};
+use crate::front::ast::{CALL_FIELDS, NODES, VK_LOAD, VK_NEW, VK_SPLAT, child};
 use crate::front::ast::NodeKind::{Ident, Path, VariantLit};
 use crate::front::check::{Res, SELF_SYM, SELF_TYPE, SELF_TYPE_SYM, lookup_local, name_error};
 use crate::front::check::args::{arity_help, normalize_args};
@@ -21,6 +21,7 @@ use crate::front::check::names::{
 use crate::front::check::resolve::{resolve_key, resolve_named};
 use crate::front::check::synth_mode::synth_expr;
 use crate::front::check::unsafety::{U_C_CALL, U_PTR_ARG, check_call_safety, is_borrow, unsafe_op};
+use crate::front::check::variant_fields::{has_named_fields, positional_error};
 use crate::front::check::vectors::{make_vecop, sym_is_c};
 use crate::front::check::widen::int_limit;
 use crate::front::closures::{closure_call, closure_of_type};
@@ -35,8 +36,8 @@ use crate::front::generics::instantiate::{
 use crate::front::modules::{CUR_MOD, C_MODULE, MODULES, STD_MODULE};
 use crate::front::modules::lookup::{
     B_ITEM, B_MODULE, B_NONE, B_PRIVATE, B_TVARIANT, B_VARIANT, SYM_CRATE, SYM_STD, SYM_SUPER,
-    access_error, binding, binding_kind, binding_value, lookup_item, lookup_name, note_c_use,
-    path_module,
+    access_error, binding, binding_kind, binding_value, lookup_item, lookup_name,
+    module_as_path_error, note_c_use, path_module, sibling_module,
 };
 use crate::front::traits::{bounded_param, require_in_bounds};
 use crate::front::types::{
@@ -256,6 +257,14 @@ fn path_target(n: i64) -> i64 {
                 if b == B_NONE && name == SYM_STD && STD_MODULE >= 0 {
                     b = binding(B_MODULE, STD_MODULE);
                 }
+                if b == B_NONE {
+                    // (0.17) a module beside this one, else the root's, as
+                    // a `use` path's first segment
+                    let other = sibling_module(CUR_MOD, name, n, n, -1);
+                    if other >= 0 {
+                        b = binding(B_MODULE, other);
+                    }
+                }
                 if binding_kind(b) == B_MODULE {
                     qnote_module(NODES[n].start, name, binding_value(b), 0);
                 }
@@ -307,6 +316,9 @@ fn path_target(n: i64) -> i64 {
             return -2;
         }
         if binding_kind(b) != B_ITEM {
+            if segments == 0 && b == B_NONE {
+                module_as_path_error(CUR_MOD, name, NODES[n].start, n);
+            }
             unknown_name_error(NODES[n].start, c"unknown type '", name);
         }
         let key = binding_value(b);
@@ -365,6 +377,10 @@ pub fn synth_path(n: i64) -> i64 {
                     err_str(c"' has ");
                     err_int(VARIANTS[v].field_count);
                     err_str(if VARIANTS[v].field_count == 1 { c" field" } else { c" fields" });
+                    if has_named_fields(v) {
+                        // (0.17)
+                        positional_error(n, v, t, false);
+                    }
                     err_help(c"construct it with '");
                     buf_type(ERR_HELP, t);
                     err_help(c"::");
@@ -524,6 +540,9 @@ fn synth_path_call(n: i64, callee: i64) -> i64 {
             let v = find_variant(TYPES[t].a, member);
             if v >= 0 {
                 let count = VARIANTS[v].field_count;
+                if (NODES[n].p & CALL_FIELDS) == 0 && has_named_fields(v) {
+                    positional_error(n, v, t, false);
+                }
                 if count == 0 {
                     err_begin(NODES[n].start);
                     err_str(c"variant '");

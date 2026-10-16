@@ -267,6 +267,8 @@ def agents_md(tree, cond):
     c = Cond(cond)
     with open(os.path.join(tree, "AGENTS.md")) as fh:
         text = fh.read()
+    if "rewrite" in c.mods:
+        text = rewrite_mode_hooks(text)
     if c.compiler == "full":
         return text
     m = re.search(r"^## Read source through the compiler\n.*?(?=^## )", text, re.S | re.M)
@@ -278,7 +280,8 @@ def agents_md(tree, cond):
             # (a base with 0.17's tiered AGENTS.md, the 0.17 rerun's: the
             # base's text as it is, which compiler-tools would give too)
             return text
-        return text[:m.start()] + core + text[m.end():]
+        return text[:m.start()] + (rewrite_mode_hooks(core) if "rewrite" in c.mods else core) \
+            + text[m.end():]
     text = text[:m.start()] + PLAIN_READ + "\n" + text[m.end():]
     # the inner loop's mentions of the hook and the tools binary
     text = re.sub(r"the check hook's errors \(or (`target/tachyonc check`)\s+when the hook is "
@@ -290,6 +293,40 @@ def agents_md(tree, cond):
         raise RuntimeError("AGENTS.md for compiler-plain still names the tools: %s (update "
                            "ctasks.agents_md for this AGENTS.md)" % ", ".join(left))
     return text
+
+
+# (+rewrite) The query-first hook's paragraph of AGENTS.md as the hook acts
+# in rewrite mode: reads of large .tach files are answered with the query,
+# so the block-mode wording (blocked, rerun with `# no-query:`) is left out;
+# shell rewrites are still blocked. Both forms: 0.16's "This is being
+# tested" paragraphs and 0.17's tiered "**Hooks.**" sentence.
+REWRITE_HOOK_TEXT = ("shell reads of large `.tach` files are answered with the matching query "
+                     "(`sed -n`, `head`, `tail`: `query text`; `cat`: `query items`; `grep`: "
+                     "`query refs` or `query grep`), each command of a line on its own; the result "
+                     "says what ran. Shell rewrites of compiler source "
+                     "(`sed -i`, `perl -pi`, Python writing compiler/src) are blocked with the "
+                     "`edit patch` that does the same (`# no-tool: <why>` to override).")
+_REWRITE_FORMS = (
+    (r"\*\*This is being tested\.\*\* A hook \(`tools/agent-hooks/query-first\.py`\)\s+blocks.*?"
+     r"Edit and Write tools, test fixtures and docs are not affected\.",
+     "**This is being tested.** A hook (`tools/agent-hooks/query-first.py`): " + REWRITE_HOOK_TEXT),
+    (r"`tools/agent-hooks/query-first\.py` blocks shell commands that\s+read or rewrite.*?"
+     r"for an edit\)\.",
+     "`tools/agent-hooks/query-first.py`: " + REWRITE_HOOK_TEXT),
+)
+
+
+def rewrite_mode_hooks(text):
+    """AGENTS.md text with the query-first hook's paragraph for rewrite
+    mode (REWRITE_HOOK_TEXT); an error when it has neither known form."""
+    for pat, repl in _REWRITE_FORMS:
+        new, n = re.subn(pat, lambda m: repl, text, count=1, flags=re.S)
+        if n:
+            return new
+    if "query-first" not in text:
+        return text  # (a section without the hook paragraph)
+    raise RuntimeError("AGENTS.md's query-first paragraph has no known form (update "
+                       "ctasks._REWRITE_FORMS for +rewrite)")
 
 
 def tools_section(path):

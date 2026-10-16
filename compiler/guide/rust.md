@@ -9,8 +9,8 @@ often than to something else; each error names the fix.
 | Rust | tachyon |
 |---|---|
 | `&str`, `String`, `&[u8]` | `[u8]`: a pointer and a length; `"abc"` is one; no UTF-8 type |
-| `String::new()`, `push_str`, `format!` | `std::Buf` (`Buf::new_in(gpa)`): `push`, `push_str`, `push_int`, `push_fmt(f"..")`, `as_slice`; `format_in(f"..", gpa)` |
-| `s.len()` | `s.len` (a field, `i64`) |
+| `String::new()`, `push_str`, `format!` | `std::Buf` (`Buf::new_in(gpa)`): `push`, `push_str`, `push_int`, `push_fmt(f"..")` (or `push_str(f"..")`), `as_slice`; `format_in(f"..", gpa)` |
+| `s.len()` | the same (0.17), an `i64`; or the field `s.len` |
 | `s == "x"`, `s < t` | the same (std's `Eq` and `Ord` for `[u8]`, by bytes) |
 | `&s[1..3]` | `s[1..3]` (checked) |
 | `s.as_bytes()[0]`, `b'a'` | `s[0]`, `'a'` (a `u8`) |
@@ -20,8 +20,6 @@ often than to something else; each error names the fix.
 | `s.trim()`, `s.split(',')`, `s.split_whitespace()` | `std::trim(s)`; `std::split_in(s, ',', gpa)`, `std::split_whitespace_in(s, gpa)`: a `Vec<[u8]>` of views of `s` (free it) |
 
 ```tach
-use std::{Buf, parse_int, split_in};
-
 fn main(gpa: Gpa) -> i32 {
     let mut b = Buf::new_in(gpa);
     defer b.free();
@@ -55,7 +53,7 @@ not a number
 | `Box<T>`, `Rc<T>`, `Arc<T>` | none: a `Vec<T>`, or `malloc` in `unsafe` |
 | `Vec::new()`, the global allocator | `Vec::new_in(gpa)`: allocation is explicit (0.16); `gpa: Gpa` comes from `fn main(gpa: Gpa)` and is passed down; `arena_scope(gpa, \|a\| ..)` (`guide allocators`) |
 | `Option<&T>` | `Option<*T>`, or an index |
-| `&mut v[i]`, `m.get_mut(&k)` | `v.as_slice()[i].f = x`; `m.get_mut(k)`: an `Option<[V]>`, a view of one element (`a[0].f += 1`) |
+| `&mut v[i]`, `m.get_mut(&k)` | `v[i].f = x` (0.17); `m.get_mut(k)`: an `Option<[V]>`, a view of one element (`a[0].f += 1`) |
 | `*m.entry(k).or_insert(0) += 1` | `m.get_or_insert(k, 0)[0] += 1` |
 | `Mutex`, threads | none in tachyon (C's threads are C's business) |
 
@@ -86,11 +84,11 @@ fn main(gpa: Gpa) -> i32 {
 | Rust | tachyon |
 |---|---|
 | `x?` | the same (0.15), on `Option` and `Result`; the error goes through `From` |
-| `panic!("msg")` | `unsafe { std::panic(c"msg") }` (exit 101), or `return` an error |
+| `panic!("msg")`, `unreachable!()` | `panic("msg")`, `unreachable()` (0.17; exit 101), or `return` an error |
 | `.map()`, `.and_then()`, `.ok_or()`, `.map_err()` | the same (0.15), and `unwrap_or_else` |
 | `.unwrap()`, `.unwrap_or(d)`, `.is_some()`, `.is_none()` | the same |
 | `.is_ok()`, `.is_err()`, `.ok()` | the same |
-| `assert!(c)`, `debug_assert!` | `if !c { unsafe { std::panic(c"...") } }` |
+| `assert!(c)`, `debug_assert!` | `if !c { panic("..."); }` |
 | `std::process::exit(n)` | `return n;` from `main`, or C's `exit` in `unsafe` |
 | `fn main() -> Result<(), E>` | the same (0.15): `Err(e)` prints `Error: ` and `e`'s Debug, exit 1 |
 

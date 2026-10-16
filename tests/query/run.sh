@@ -243,9 +243,10 @@ ok=0
     && printf '%s\n' "$out" | grep -q "${TAB}pub fn read_line<A: Allocator>(line: \*Buf<A>) -> Result<bool, IoError>\$" \
     && ! printf '%s\n' "$out" | grep -q 'fn malloc' && ok=1
 check std_items_no_program "$ok" "$(printf '%s\n' "$out" | head -5)"
-out=$(cd "$WORK/empty" && "$COMPILER" query show HashMap::get_or_insert 2>&1)
+# (0.17: a name outside the prelude, which needs no `use`)
+out=$(cd "$WORK/empty" && "$COMPILER" query show FixedBuf::used 2>&1)
 ok=0
-printf '%s\n' "$out" | head -2 | grep -q '^// use std::HashMap;$' && ok=1
+printf '%s\n' "$out" | head -2 | grep -q '^// use std::FixedBuf;$' && ok=1
 check std_show_no_program "$ok" "$(printf '%s\n' "$out" | head -5)"
 
 # (0.17) In the repository, std's items are where its files have them,

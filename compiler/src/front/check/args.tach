@@ -8,15 +8,17 @@
 // Also the shorthand of a struct literal's field (`P { x, y }`), whose
 // unknown name gets the long form as its help.
 
-use crate::base::{BUFS, FILES, IntVec, SRC, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, free};
+use crate::base::{
+    BUFS, FILES, IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, free,
+};
 use crate::base::diag::{
-    ERR_HELP, buf_file_line, err_begin, err_end, err_end_soft, err_help, err_help_fmt, err_help_sym,
-    err_int, err_str, err_sym, err_try_fmt,
+    ERR_HELP, buf_file_line, err_begin, err_end, err_end_soft, err_fix, err_help, err_help_fmt,
+    err_help_sym, err_int, err_str, err_sym, err_try_fmt,
 };
 use crate::front::ast::{
     CALL_ARGS_DONE, FIELD_SHORTHAND, NODES, NodeKind, child, list_begin, list_end, list_push,
 };
-use crate::front::check::{ENV, FNS, SELF_TYPE, lookup_local};
+use crate::front::check::{ENV, FNS, LOCALS, SELF_TYPE, lookup_local};
 use crate::front::check::check_mode::check_expr;
 use crate::front::check::names::near_to;
 use crate::front::check::unsafety::UNSAFE_DEPTH;
@@ -235,14 +237,42 @@ pub fn arity_help(n: i64, f: i64, count: i64, params: i64) {
         if count < params && NODES[n].end > NODES[n].start && SRC[NODES[n].end - 1] == ')' {
             let t = buf_new();
             buf_bytes(t, SRC[NODES[n].start..NODES[n].end - 1]);
+            // (0.18) a missing argument a local of its parameter's name and
+            // type gives (`gpa`); when every one is, the call is the fix
+            let off = FNS[f].param_count - params;
+            let is_fn = NODES[node].kind == NodeKind::Fn || NODES[node].kind == NodeKind::ExternFn;
+            let mut all = true;
             for k in count..params {
                 if k > 0 {
                     buf_str(t, c", ");
                 }
-                buf_str(t, c"VALUE");
+                let name = if is_fn && k + off < NODES[node].count {
+                    NODES[child(node, k + off)].a
+                } else {
+                    -1
+                };
+                let mut given = false;
+                if name > 0 {
+                    match lookup_local(name) {
+                        Option::Some(id) => {
+                            if LOCALS[id].ty == fn_param(f, k + off) {
+                                buf_bytes(t, SYMS[name].text);
+                                given = true;
+                            }
+                        }
+                        Option::None => {}
+                    }
+                }
+                if !given {
+                    buf_str(t, c"VALUE");
+                    all = false;
+                }
             }
             buf_byte(t, ')');
             err_try_fmt(buf_slice(t));
+            if all {
+                err_fix(NODES[n].start, NODES[n].end, buf_slice(t));
+            }
         }
     }
 }

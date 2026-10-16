@@ -129,6 +129,21 @@ try:
          os.path.join(top, "target", "tools", "tachyonc"))
     case("compiler: the one the agent ran", hook.compiler_for(top, "target/tachyonc"),
          os.path.join(top, "target", "tachyonc"))
+    # (0.17) A program's check: target/tachyonc when newer (just rebuilt);
+    # the compiler's own source: still the tools binary.
+    t = time.time()
+    os.utime(os.path.join(top, "target", "tools", "tachyonc"), (t - 100, t - 100))
+    os.utime(os.path.join(top, "target", "tachyonc"), (t, t))
+    case("compiler: a newer build for a test program",
+         hook.compiler_for(os.path.join(top, "tests", "run"), None, os.path.join(top, "tests", "run", "loop.tach")),
+         os.path.join(top, "target", "tachyonc"))
+    case("compiler: the tools binary for the compiler's source",
+         hook.compiler_for(os.path.join(top, "compiler", "src"), None, os.path.join(top, "compiler", "src", "main.tach")),
+         os.path.join(top, "target", "tools", "tachyonc"))
+    os.utime(os.path.join(top, "target", "tachyonc"), (t - 200, t - 200))
+    case("compiler: an older build is not taken",
+         hook.compiler_for(os.path.join(top, "tests", "run"), None, os.path.join(top, "tests", "run", "loop.tach")),
+         os.path.join(top, "target", "tools", "tachyonc"))
 
     # The report: errors only, the edited file's first, at most 10.
     many = [diag("other.tach", i, f"e{i}") for i in range(1, 12)] + [diag("util.tach", 3, "mine", help=["did you mean 'g'?"])]
@@ -150,6 +165,16 @@ try:
           "try: tachyonc fix --only alloc016 main.tach   (1 of the errors)"])
     case("report: one fix for all", hook.report(u, "main.tach", None).split("\n")[1],
          "try: tachyonc fix --only unsafe main.tach   (all of them)")
+    # (0.18) `fix --suggested` first, named once, never run by the hook
+    sg = [dict(diag("main.tach", i, "undefined variable 'totl'"),
+               **{"try": ["tachyonc fix --suggested main.tach"]}) for i in (3, 8)]
+    lines = hook.report(u + sg + [diag("main.tach", 9, "bad")], "main.tach", None).split("\n")
+    case("report: fix --suggested first", lines[:3],
+         ["tachyonc check main.tach: 5 errors",
+          "try: tachyonc fix --suggested main.tach   (2 of the errors: their exact fixes, one checked edit)",
+          "try: tachyonc fix --only unsafe main.tach   (2 of the errors)"])
+    case("report: fix --suggested not on its errors", lines[5],
+         "main.tach:3:5: error[type error] undefined variable 'totl'")
     case("report: other try lines stay on their error", hook.fix_commands(
         [dict(diag("m.tach", 1, "x"), **{"try": ["use std::HashMap;", "target/tools/tachyonc fix --only imports m.tach"]})]),
          [("target/tools/tachyonc fix --only imports m.tach", 1)])
@@ -261,6 +286,15 @@ try:
     run(ev, fake2, state)
     fake_says([b])
     case("hint: once a session", "guide --find" in ctx_of(run(ev, fake2, state)[1]), False)
+    # (E3) TACHYON_HINTS=0: the same mistake twice, no hint
+    off = dict(ev, session_id="delta-nohints")
+    os.environ["TACHYON_HINTS"] = "0"
+    for says in ([b], [], [b]):
+        fake_says(says)
+        got = ctx_of(run(off, fake2, state)[1])
+    del os.environ["TACHYON_HINTS"]
+    case("hint: off with TACHYON_HINTS=0", (got.startswith("tachyonc check main.tach: 1 error"),
+                                             "guide --find" in got), (True, False))
 
     # (0.17) A worktree's file edited from a session in the main checkout:
     # the worktree's root and compiler, check run in the worktree (check

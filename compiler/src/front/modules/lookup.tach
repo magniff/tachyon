@@ -4,18 +4,19 @@
 // and paths (`a::b::c`) resolved to what they name.
 
 use crate::base::{
-    BUFS, FILES, IntVec, SRC, SYMS, SYM_COUNT, alloc_array, buf_bytes, buf_new, buf_slice, buf_str,
-    grow, intern_c, sym_text,
+    BUFS, FILES, IntVec, SRC, SYMS, SYM_COUNT, alloc_array, buf_bytes, buf_fmt, buf_new, buf_slice,
+    buf_str, grow, intern_c, sym_table, sym_text,
 };
 use crate::base::diag::{
-    ERR_HELP, buf_position, err_begin, err_end, err_end_soft, err_failed_name, err_fmt, err_help,
-    err_help_fmt, err_help_sym, err_str, err_sym, err_try, err_try_fmt, err_try_tool, error_at,
-    fail_name,
+    ERR_HELP, buf_position, err_begin, err_end, err_end_soft, err_failed_name, err_fix, err_fixable,
+    err_fmt, err_help, err_help_fmt, err_help_sym, err_str, err_sym, err_try, err_try_fmt,
+    err_try_tool, error_at, fail_name, fix_at_ok,
 };
 use crate::front::ast::{NODES, NodeKind, child};
 use crate::front::check::{PROGRAM, SELF_SYM, Try, attempt, name_error};
 use crate::front::check::collect::template_variant_named;
 use crate::front::check::names::{help_near_item, import_path_for};
+use crate::front::lexer::is_ident_byte;
 use crate::front::modules::{
     CUR_MOD, C_MODULE, MODULES, MODULE_COUNT, STD_MODULE, child_module, file_of_pos, is_within,
     module_of, qualified_if_known, qualify,
@@ -285,6 +286,20 @@ fn unresolved_import(id: i64, path: i64, prefix: i64, from: i64) -> ! {
         let name = NODES[id].a;
         err_fmt(f"{sym_text(name)}'");
         let pm = binding_value(prefix);
+        if name == SELF_SYM && NODES[path].count > 0 {
+            // (0.17) Rust's `use m::{self, X};`
+            let p = buf_new();
+            for i in 0..NODES[path].count {
+                if i > 0 {
+                    buf_str(p, c"::");
+                }
+                buf_bytes(p, SYMS[NODES[child(path, i)].a].text);
+            }
+            err_help_fmt(
+                f"`self` in a `use` list is not supported: import the module on a line of its own, `use {buf_slice(p)};`, and the rest from it");
+            err_try_fmt(f"use {buf_slice(p)};");
+            err_end();
+        }
         if pm == STD_MODULE {
             if !help_std_path(name, 0, from, true) && SYMS[name].text == "gpa" {
                 err_help(c"the allocator is main's parameter, `fn main(gpa: Gpa)`, passed down");
@@ -353,7 +368,8 @@ fn help_make_public(key: i64, name: i64) {
         }
         err_help(c"` at ");
         buf_position(ERR_HELP, start);
-        err_try_tool("fix --only pub", true);
+        // (0.18: `fix --suggested` adds it, as `fix --only pub`)
+        err_fixable();
     }
 }
 
@@ -376,7 +392,10 @@ fn child_module_key(key: i64) -> bool {
 // The error for a binding that cannot be used: private, or (0.6) brought
 // by two `*` imports.
 pub fn access_error(b: i64, pos: i64, name: i64) -> ! {
-    note_private(b);
+    // (0.18: `fix --suggested --at FILE:LINE`, the error at that line)
+    if fix_at_ok(pos) {
+        note_private(b);
+    }
     if b == B_AMBIGUOUS {
         unsafe {
             name_error(pos, c"'", name, c"' is ambiguous: more than one '*' import brings it (import it by name, or write its path)");
@@ -506,7 +525,8 @@ fn lookup_uncached(m: i64, name: i64, from: i64, depth: i64) -> i64 {
         }
         // The prelude is part of the scope of the code being checked, not an
         // item of the modules its `*` imports and paths go through.
-        if STD_MODULE >= 0 && m != STD_MODULE && depth == 0 && m == from {
+        // (0.17: std's own code too: `None`, `Some(x)`)
+        if STD_MODULE >= 0 && depth == 0 && m == from {
             return prelude_lookup(name, m, depth);
         }
         B_NONE
@@ -663,64 +683,90 @@ pub fn enum_variant_binding(e: i64, name: i64) -> i64 {
 // Names every module sees without `use`, after everything else (its own
 // items, its imports): std's Option, Some, None, Result, Ok, Err, Vec,
 // print and println (0.9: the operator traits and Hash; 0.14: Iterator;
-// 0.15: Display, Debug, Clone, From, Into, format, eprint, eprintln):
-// a fixed list, not a `*` import (it stays in 0.8). The standard library
-// is loaded when a program names one of them (or `std`; 0.14: or uses a
-// range as a value, see load_std_if_named).
+// 0.15: Display, Debug, Clone, From, Into, format, eprint, eprintln;
+// 0.17: Buf, HashMap, read_line, trim, ..., panic, unreachable, see
+// prelude_name): a fixed list, not a `*` import (it stays in 0.8). The
+// standard library is loaded when a program names one of them (or `std`;
+// 0.14: or uses a range as a value, see load_std_if_named). (0.17) std's
+// own code sees the prelude too.
 
-// The prelude's names, interned once: Option, Some, None, Result, Ok,
-// Err, Vec, print, println (it is asked about every identifier while the
-// modules load).
-static mut PRELUDE_NAMES: [i64; 32] = [0; 32];
+// The prelude's names, interned once (it is asked about every identifier
+// while the modules load): Option, Some, None, Result, Ok, Err, Vec,
+// print, println, ... (prelude_name). SYM_PRELUDE[sym] is a name's index
+// in it plus one, 0 for a name not in it.
+static mut PRELUDE_NAMES: [i64; 55] = [0; 55];
+
+static mut SYM_PRELUDE: *i64 = 0 as *i64;
+
+// The number of the prelude's names; those from PRELUDE_LATE on (0.15's,
+// 0.16's and 0.17's) load std only where the program uses them
+// (front::modules::uses_prelude015).
+pub const PRELUDE_COUNT: i64 = 55;
+
+pub const PRELUDE_LATE: i64 = 18;
+
+// The index of `panic` (0.17), which is std's safe `panic_str`, not the
+// `unsafe fn panic` of a C string that `std::panic` names.
+const PRELUDE_PANIC: i64 = 49;
 
 static mut PRELUDE_INTERNED: bool = false;
 
 fn prelude_name(i: i64) -> i64 {
     if !PRELUDE_INTERNED {
         // (0.9: and the traits of the operators, and Hash; 0.14: Iterator;
-        // 0.15: formatting, conversions, Clone; 0.16: allocators, format_in)
-        let names: [*u8; 32] = [c"Option", c"Some", c"None", c"Result", c"Ok", c"Err", c"Vec",
+        // 0.15: formatting, conversions, Clone; 0.16: allocators, format_in;
+        // 0.17: what Rust has without a `use` or programs reach for first:
+        // text and input, Buf, HashMap, sorting, cmp_of/eq_of, Fmt, a safe
+        // panic and unreachable; the stable sorts)
+        let names: [*u8; 55] = [c"Option", c"Some", c"None", c"Result", c"Ok", c"Err", c"Vec",
             c"print", c"println", c"Add", c"Sub", c"Mul", c"Div", c"Neg", c"Eq", c"Ord", c"Hash",
             c"Iterator", c"Display", c"Debug", c"Clone", c"From", c"Into", c"format", c"eprint",
             c"eprintln", c"Allocator", c"Gpa", c"Arena", c"ScopedArena", c"arena_scope",
-            c"format_in"];
-        for k in 0..32 {
-            unsafe { PRELUDE_NAMES[k] = intern_c(names[k]); }
+            c"format_in", c"Buf", c"HashMap", c"read_line", c"read_stdin_in", c"read_stdin",
+            c"Scanner", c"parse_int", c"trim", c"split", c"split_in", c"split_whitespace",
+            c"split_whitespace_in", c"cmp_of", c"eq_of", c"Fmt", c"sort", c"sort_by", c"panic",
+            c"unreachable", c"sort_stable", c"sort_stable_by", c"sort_stable_in",
+            c"sort_stable_by_in"];
+        unsafe {
+            sym_table(&SYM_PRELUDE);
+            for k in 0..PRELUDE_COUNT {
+                let sym = intern_c(names[k]);
+                PRELUDE_NAMES[k] = sym;
+                SYM_PRELUDE[sym] = k + 1;
+            }
         }
         PRELUDE_INTERNED = true;
     }
     PRELUDE_NAMES[i]
 }
 
-pub fn is_prelude_name(name: i64) -> bool {
-    for i in 0..32 {
-        if name == prelude_name(i) {
-            return true;
-        }
-    }
-    false
+// The index of `name` in the prelude, -1 when it is not one of its names.
+pub fn prelude_index(name: i64) -> i64 {
+    prelude_name(0);
+    unsafe { SYM_PRELUDE[name] - 1 }
 }
 
-// Whether name is one the prelude gained in 0.15 (Display, Debug, Clone,
-// From, Into, format, eprint, eprintln; and 0.16's Allocator, Gpa, Arena,
-// ScopedArena, arena_scope, format_in): load_std_if_named looks at how a program
-// uses these before it loads std for them.
+pub fn is_prelude_name(name: i64) -> bool {
+    prelude_index(name) >= 0
+}
+
+// Whether name is one the prelude gained in 0.15 or later (Display, Debug,
+// Clone, From, Into, format, eprint, eprintln; 0.16's Allocator, Gpa,
+// Arena, ScopedArena, arena_scope, format_in; 0.17's Buf, HashMap, trim,
+// ...): load_std_if_named looks at how a program uses these before it
+// loads std for them.
 pub fn is_prelude015(name: i64) -> bool {
-    for i in 18..32 {
-        if name == prelude_name(i) {
-            return true;
-        }
-    }
-    false
+    prelude_index(name) >= PRELUDE_LATE
 }
 
 fn prelude_lookup(name: i64, m: i64, depth: i64) -> i64 {
     unsafe {
-        if !is_prelude_name(name) {
+        let k = prelude_index(name);
+        if k < 0 {
             return B_NONE;
         }
-        let some = name == prelude_name(1) || name == prelude_name(2);
-        let ok = name == prelude_name(4) || name == prelude_name(5);
+        let some = k == 1 || k == 2;
+        let ok = k == 4 || k == 5;
         if some || ok {
             let e = lookup_uncached(STD_MODULE,
                 if some { prelude_name(0) } else { prelude_name(3) }, m, depth + 1);
@@ -728,6 +774,9 @@ fn prelude_lookup(name: i64, m: i64, depth: i64) -> i64 {
                 return B_NONE;
             }
             return enum_variant_binding(SYM_ENUM[binding_value(e)] - 1, name);
+        }
+        if k == PRELUDE_PANIC {
+            return lookup_uncached(STD_MODULE, intern_c(c"panic_str"), m, depth + 1);
         }
         lookup_uncached(STD_MODULE, name, m, depth + 1)
     }
@@ -737,7 +786,7 @@ fn prelude_lookup(name: i64, m: i64, depth: i64) -> i64 {
 // `count` segments of `path` (a Path node whose list holds Ident nodes),
 // from module m: `crate`, `self` and `super` first; `std`. `entry`: the
 // use entry whose path it is, or -1 (for the helps of its errors, 0.17).
-fn resolve_path(m: i64, path: i64, count: i64, entry: i64) -> i64 {
+pub fn resolve_path(m: i64, path: i64, count: i64, entry: i64) -> i64 {
     unsafe {
         let mut cur = binding(B_MODULE, m);
         for i in 0..count {
@@ -770,6 +819,14 @@ fn resolve_path(m: i64, path: i64, count: i64, entry: i64) -> i64 {
                 if i == 0 && name == SYM_STD && STD_MODULE >= 0 {
                     cur = binding(B_MODULE, STD_MODULE);
                     continue;
+                }
+                if i == 0 {
+                    let other = sibling_module(m, name, seg, path, entry);
+                    if other >= 0 {
+                        cur = binding(B_MODULE, other);
+                        qnote_module(NODES[seg].start, name, other, 0);
+                        continue;
+                    }
                 }
                 err_begin(NODES[seg].start);
                 err_failed_name(name);
@@ -804,6 +861,104 @@ fn resolve_path(m: i64, path: i64, count: i64, entry: i64) -> i64 {
     }
 }
 
+// (0.17) The module the first segment `name` (node seg) of a path names
+// when module m, where it is written, has nothing of that name: a child
+// of m's parent (a sibling: `use lexer::Tok;` or `lexer::next(..)` in
+// parser.tach, where main.tach has `mod lexer;`), else a child of the
+// root; -1: neither. A `use` path (its entry) and a path in code (entry
+// -1: a type's, a literal's, an expression's, ending where node path
+// ends) alike. Both, and different modules: an error, the two paths from
+// the root its try: lines.
+pub fn sibling_module(m: i64, name: i64, seg: i64, path: i64, entry: i64) -> i64 {
+    unsafe {
+        if m == 0 {
+            return -1;
+        }
+        let parent = MODULES[m].parent;
+        let mut sibling = -1;
+        if parent >= 0 {
+            sibling = child_module(parent, name);
+        }
+        let mut top = -1;
+        if parent != 0 {
+            top = child_module(0, name);
+        }
+        if sibling == STD_MODULE || sibling == C_MODULE {
+            sibling = -1;
+        }
+        if top == STD_MODULE || top == C_MODULE {
+            top = -1;
+        }
+        if sibling >= 0 && top >= 0 && sibling != top {
+            err_begin(NODES[seg].start);
+            err_failed_name(name);
+            err_fmt(
+                f"ambiguous module '{sym_text(name)}': crate::{sym_text(MODULES[sibling].key)} (beside this module) or crate::{sym_text(name)} (at the root)");
+            err_help(c"a path that starts with neither `crate`, `self`, `super` nor a name of this module starts beside it, or at the root: name the one you mean");
+            let a = buf_new();
+            buf_str(a, c"crate::");
+            buf_bytes(a, SYMS[MODULES[parent].key].text);
+            path_try(entry, seg, path, buf_slice(a));
+            path_try(entry, seg, path, "crate");
+            err_end();
+        }
+        if sibling >= 0 { sibling } else { top }
+    }
+}
+
+// (0.17) A try: line for use entry `entry`: its line with `prefix::`
+// written before its path (`use crate::lexer::{Tok, mk};`).
+fn use_line_try(entry: i64, path: i64, prefix: [u8]) {
+    unsafe {
+        let node = USE_ENTRIES[entry].node;
+        let at = NODES[path].start;
+        let t = buf_new();
+        buf_bytes(t, SRC[NODES[node].start..at]);
+        buf_bytes(t, prefix);
+        buf_str(t, c"::");
+        let mut e = NODES[node].end;
+        while e > at && SRC[e - 1] != ';' {
+            e -= 1;
+        }
+        let stop = if e > at { e } else { NODES[node].end };
+        buf_bytes(t, SRC[at..stop]);
+        err_try_fmt(buf_slice(t));
+        // (0.18) the fix: the line so written
+        err_fix(NODES[node].start, stop, buf_slice(t));
+    }
+}
+
+// (0.17) A try: line for a path (its first segment, node seg) with
+// `prefix::` written before it: a `use` entry's line (use_line_try), or the
+// path in code, its names and `::`s (`crate::front::util::twice`).
+fn path_try(entry: i64, seg: i64, path: i64, prefix: [u8]) {
+    if entry >= 0 {
+        use_line_try(entry, path, prefix);
+        return;
+    }
+    unsafe {
+        let start = NODES[seg].start;
+        let mut end = start;
+        while is_ident_byte(SRC[end]) || SRC[end] == ':' {
+            end += 1;
+        }
+        while end > start && SRC[end - 1] == ':' {
+            end -= 1;
+        }
+        let t = buf_new();
+        buf_bytes(t, prefix);
+        buf_str(t, c"::");
+        buf_bytes(t, SRC[start..end]);
+        err_try_fmt(buf_slice(t));
+        // (0.18) the fix: the first segment so written
+        let full = buf_new();
+        buf_bytes(full, prefix);
+        buf_str(full, c"::");
+        buf_bytes(full, SYMS[NODES[seg].a].text);
+        path_fix(start, NODES[seg].a, buf_slice(full));
+    }
+}
+
 // (0.17) The help of `unknown module 'name'` at the start of path, from
 // module m: a module of that name elsewhere in the crate is reached from
 // the root (`crate::name::...`; for a `use`, its line so written is the
@@ -811,8 +966,14 @@ fn resolve_path(m: i64, path: i64, count: i64, entry: i64) -> i64 {
 fn help_unknown_module(m: i64, name: i64, path: i64, entry: i64) {
     unsafe {
         let mut found = -1;
-        if m != 0 {
+        if m != 0 && MODULES[m].parent >= 0 {
+            found = child_module(MODULES[m].parent, name);
+        }
+        if m != 0 && found < 0 {
             found = child_module(0, name);
+        }
+        if found == m || found == STD_MODULE || found == C_MODULE {
+            found = -1;
         }
         if found < 0 {
             for k in 1..MODULE_COUNT {
@@ -831,20 +992,17 @@ fn help_unknown_module(m: i64, name: i64, path: i64, entry: i64) {
                 buf_bytes(full, SYMS[MODULES[MODULES[found].parent].key].text);
             }
             err_help_fmt(
-                f"'{sym_text(name)}' is the module {buf_slice(full)}::{sym_text(name)}; a path starts in the module it is written in: write `{buf_slice(full)}::{sym_text(name)}::...`");
+                f"'{sym_text(name)}' is the module {buf_slice(full)}::{sym_text(name)}; a path starts in this module, beside it or at the root: write `{buf_slice(full)}::{sym_text(name)}::...`");
             if entry >= 0 {
-                let node = USE_ENTRIES[entry].node;
-                let at = NODES[path].start;
-                let t = buf_new();
-                buf_bytes(t, SRC[NODES[node].start..at]);
-                buf_bytes(t, buf_slice(full));
-                buf_str(t, c"::");
-                let mut e = NODES[node].end;
-                while e > at && SRC[e - 1] != ';' {
-                    e -= 1;
-                }
-                buf_bytes(t, SRC[at..if e > at { e } else { NODES[node].end }]);
-                err_try_fmt(buf_slice(t));
+                use_line_try(entry, path, buf_slice(full));
+            } else {
+                // (a type or a literal's path: the module imported, as
+                // module_as_path_error's for an expression)
+                err_try_fmt(f"use {buf_slice(full)}::{sym_text(name)};");
+                // (0.18) the fix: the path from the crate's root
+                buf_str(full, c"::");
+                buf_bytes(full, SYMS[name].text);
+                path_fix(if path > 0 { NODES[path].start } else { -1 }, name, buf_slice(full));
             }
             return;
         }
@@ -852,6 +1010,44 @@ fn help_unknown_module(m: i64, name: i64, path: i64, entry: i64) {
             return;
         }
         help_near_item(m, name);
+    }
+}
+
+// (0.17) `table::f(x)` in an expression (Path node path at `at`), where
+// `table` is no name of module m nor a module beside it or at the root
+// (those are found as a `use` path's are), but a module elsewhere in the
+// crate: the error names it and its `use` line; returns when no module
+// has that name.
+pub fn module_as_path_error(m: i64, name: i64, at: i64, path: i64) {
+    unsafe {
+        let mut found = -1;
+        for k in 1..MODULE_COUNT {
+            if MODULES[k].name == name && k != STD_MODULE && k != C_MODULE && k != m
+                && !is_within(k, STD_MODULE) {
+                found = k;
+                break;
+            }
+        }
+        if found < 0 {
+            return;
+        }
+        err_begin(at);
+        err_failed_name(name);
+        err_fmt(f"unknown module '{sym_text(name)}'");
+        help_unknown_module(m, name, path, -1);
+        err_end()
+    }
+}
+
+// (0.18) The fix of a path whose first segment, module `name` at `at`
+// (-1: unknown), is written from the crate's root: `full` in its place.
+fn path_fix(at: i64, name: i64, full: [u8]) {
+    unsafe {
+        let text = SYMS[name].text;
+        if at < 0 || SRC[at..at + text.len] != text || SRC[at + text.len] != ':' {
+            return;
+        }
+        err_fix(at, at + text.len, full);
     }
 }
 

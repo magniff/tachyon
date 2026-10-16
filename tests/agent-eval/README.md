@@ -78,12 +78,23 @@ tests/agent-eval/run.py run ... --skip-existing-in BASELINE_RUNDIR
   preamble, prompts/tools-core.md), `both-core` (the two),
   `rust-pairs` (paired Rust -> tachyon examples, prompts/rust-pairs.md,
   compiled by check-tasks), `compiler-tools-core` (the task's AGENTS.md
-  with this checkout's tiered tools section); modifiers `+hook` (the
+  with this checkout's tiered tools section), the iterations' `guide-mini`
+  (prompts/guide-mini.md: one compiled example and the lookup lines) and
+  `guide-example` (prompts/guide-example.md around `tachyonc guide
+  example`, a whole program in three files and a test case;
+  `tests/agent-eval/check-prompts.sh` dry-runs both and checks their
+  prompts); modifiers `+hook` (the
   check hook in any tachyon condition), `+test` (`tachyonc test` in the
   prompt, prompts/test.md or compiler-test.md, and the hooks of
   tools/agent-hooks/settings-eval.json, with the turn-end Stop hook),
   `+turn-end` (the Stop hook: with +hook settings-eval's `hook+turn-end`,
-  alone its `turn-end`), `+recite` (prompts/recite.md after the task).
+  alone its `turn-end`), `+recite` (prompts/recite.md after the task),
+  and settings-eval.json's `modifiers`: `+rewrite` (compiler-tools
+  conditions: the query-first hook runs an unambiguous read as its query
+  instead of blocking it; the workspace's AGENTS.md hook paragraph and
+  prompts/query-rewrite.md say so, the block-mode wording left out), `+nohints` (the hooks give no hints),
+  `+note` (tools/agent-hooks/lookup-note.py: a note when a lookup prints
+  again what it printed earlier).
   Every check and Stop hook a condition registers is settings-eval.json's
   entry for it (`conds.Cond.settings_key`), its files copied out of the
   repository with the scripts.

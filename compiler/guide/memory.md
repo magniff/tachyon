@@ -53,8 +53,6 @@ The value a block returns is computed before the deferred statements
 run. They do not run on `exit` or a failed check (exit 101).
 
 ```tach
-use std::Buf;
-
 fn describe(n: i64, gpa: Gpa) -> i64 {
     let mut b = Buf::new_in(gpa);
     defer b.free();                       // on every path out

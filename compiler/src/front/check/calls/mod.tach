@@ -6,14 +6,16 @@
 pub mod paths;
 
 use crate::base::{
-    BUFS, SRC, SYMS, buf_byte, buf_bytes, buf_fmt, buf_new, buf_slice, buf_str, intern, sym_text,
+    BUFS, SRC, SYMS, buf_byte, buf_bytes, buf_fmt, buf_new, buf_slice, buf_str, intern, intern_c,
+    sym_text,
 };
 use crate::base::diag::{
-    ERR_HELP, err_begin, err_end, err_failed_name, err_help, err_help_fmt, err_help_sym, err_int,
-    err_str, err_sym, err_try_fmt, err_try_tool,
+    ERR_HELP, err_begin, err_end, err_failed_name, err_fix, err_help, err_help_fmt, err_help_sym,
+    err_int, err_str, err_sym, err_try_fmt, err_try_tool,
 };
+use crate::front::ambient::has_local_gpa;
 use crate::front::assoc::ensure_checked;
-use crate::front::ast::{NODES, child, list_begin, list_end, list_push, new_node};
+use crate::front::ast::{NODES, NodeKind, child, list_begin, list_end, list_push, new_node};
 use crate::front::ast::NodeKind::{Call, Ident, Index, Range, Unary};
 use crate::front::check::{LOCALS, Res, SELF_SYM, is_std_named, name_error};
 use crate::front::check::args::{arity_help, int_limit_help, normalize_args};
@@ -25,15 +27,17 @@ use crate::front::check::names::{
 };
 use crate::front::check::synth_mode::synth_expr;
 use crate::front::check::unsafety::{U_METHOD, check_call_safety, is_borrow, unsafe_op};
-use crate::front::check::vectors::vector_method;
+use crate::front::check::vectors::{sym_is_c, vector_method};
 use crate::front::convert::generic_trait_call;
 use crate::front::derive::intrinsic::{has_intrinsic_method, intrinsic_method};
 use crate::front::generics::{TPL_SLICE, check_arg, template_name};
 use crate::front::generics::instantiate::instantiate_call;
-use crate::front::lexer::Tok;
+use crate::front::lexer::{SUF_I64, Tok};
+use crate::front::modules::{CUR_MOD, STD_MODULE};
+use crate::front::modules::lookup::is_prelude_name;
 use crate::front::traits::require_in_bounds;
 use crate::front::types::{
-    ENUMS, FNS, METHODS, METHOD_COUNT, STRUCTS, TYPES, TY_UNIT, TyKind, VARIANTS, buf_type,
+    ENUMS, FNS, METHODS, METHOD_COUNT, STRUCTS, TYPES, TY_I64, TY_UNIT, TyKind, VARIANTS, buf_type,
     enum_variant, err_type, find_field, find_method, fn_param, is_compound, is_pointer, is_vector,
     ptr_to, slice_of,
 };
@@ -159,7 +163,11 @@ fn std_function_help(n: i64, t: i64, name: i64) {
             return;
         }
         let c = buf_new();
-        buf_fmt(c, f"std::{sym_text(f)}(");
+        // (0.17: a name of the prelude needs no `std::`)
+        if !is_prelude_name(f) {
+            buf_str(c, c"std::");
+        }
+        buf_fmt(c, f"{sym_text(f)}(");
         buf_bytes(c, SRC[NODES[recv].start..NODES[recv].end]);
         if is_std_vec(t) {
             buf_str(c, c".as_slice()");
@@ -174,6 +182,10 @@ fn std_function_help(n: i64, t: i64, name: i64) {
         }
         buf_byte(c, ')');
         err_try_fmt(buf_slice(c));
+        // (0.18) the fix, when the allocator it passes is this function's
+        if !gpa || has_local_gpa() {
+            err_fix(NODES[n].start, NODES[n].end, buf_slice(c));
+        }
     }
 }
 
@@ -258,6 +270,26 @@ fn is_method(f: i64) -> bool {
     }
 }
 
+// (0.17) Method call n (of method f0 on type t) when it is std's
+// `Buf::push_str(f"...")` outside std: Buf::push_fmt, which n then calls
+// (an f-string is no `[u8]`; push_fmt writes it into the Buf without
+// making the text apart); else -1.
+fn push_str_interp(n: i64, f0: i64, t: i64) -> i64 {
+    unsafe {
+        if f0 < 0 || STD_MODULE < 0 || FNS[f0].module != STD_MODULE || CUR_MOD == STD_MODULE
+            || NODES[n].count != 1 || NODES[child(n, 0)].kind != NodeKind::Interp
+            || SYMS[NODES[FNS[f0].node].a].text != "push_str" {
+            return -1;
+        }
+        let push_fmt = intern_c(c"push_fmt");
+        let f = method_of(t, push_fmt);
+        if f >= 0 {
+            NODES[n].b = push_fmt;
+        }
+        f
+    }
+}
+
 // A new node for the checker: `op operand` (`&` or `*`) of type `ty`.
 pub fn synthetic_unary(op: Tok, operand: i64, ty: i64) -> i64 {
     unsafe {
@@ -301,6 +333,12 @@ pub fn synth_method(n: i64) -> i64 {
                 receiver_ty = s;
             }
         }
+        if NODES[n].count == 0 && NODES[n].g == 0 && sym_is_c(name, c"len")
+            && (TYPES[receiver_ty].kind == TyKind::Slice
+                || TYPES[receiver_ty].kind == TyKind::Array && is_plain_place(receiver))
+            && method_of(receiver_ty, name) < 0 {
+            return len_method(n, receiver, receiver_ty);
+        }
         if is_vector(receiver_ty) {
             return vector_method(n, name, receiver_ty);
         }
@@ -319,7 +357,13 @@ pub fn synth_method(n: i64) -> i64 {
             && LOCALS[NODES[receiver].y].tparam != 0 {
             require_in_bounds(LOCALS[NODES[receiver].y].tparam, name, NODES[n].start);
         }
-        let f0 = method_of(t, name);
+        let mut f0 = method_of(t, name);
+        // (0.17) `b.push_str(f"..")`: Buf::push_fmt's, the f-string written
+        // straight into the Buf
+        let pf = push_str_interp(n, f0, t);
+        if pf >= 0 {
+            f0 = pf;
+        }
         let mut f = -1;
         if TYPES[t].kind == TyKind::Struct || TYPES[t].kind == TyKind::Enum || f0 >= 0 {
             f = f0;
@@ -460,5 +504,37 @@ pub fn synth_method(n: i64) -> i64 {
         ensure_checked(f, n);
         check_call_safety(n, f, 1);
         FNS[f].ret
+    }
+}
+
+// (0.17) `s.len()` on a slice is its field `s.len`; on an array, its
+// length (an i64), as Rust writes both.
+fn len_method(n: i64, receiver: i64, ty: i64) -> i64 {
+    unsafe {
+        if TYPES[ty].kind == TyKind::Array {
+            NODES[n].kind = NodeKind::Int;
+            NODES[n].a = TYPES[ty].b;
+            NODES[n].b = SUF_I64;
+            NODES[n].count = 0;
+            return TY_I64;
+        }
+        NODES[n].kind = NodeKind::FieldAccess;
+        NODES[n].a = receiver;
+        NODES[n].count = 0;
+        NODES[n].y = 2;
+        NODES[n].x = 1;
+        TY_I64
+    }
+}
+
+// Whether e is a variable, a constant, a static or a field of one: what
+// can be left unevaluated (an array's `.len()` is its type's).
+pub fn is_plain_place(e: i64) -> bool {
+    unsafe {
+        match NODES[e].kind {
+            NodeKind::Ident | NodeKind::Path => true,
+            NodeKind::FieldAccess | NodeKind::TupleField => is_plain_place(NODES[e].a),
+            _ => false,
+        }
     }
 }

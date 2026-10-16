@@ -10,6 +10,9 @@ FAIL bad: stdout differs at line 2 (3 lines expected, 3 printed)
   + line 3: c
 FAIL crash: exit 3 (expected 0)
 FAIL hang: no exit after 1 s (--timeout S)
+  stderr: stopped by signal 14 (SIGALRM: a time limit)
+  stderr: trace, innermost call first:
+  stderr:   main.tach:12  main
 (outputs: .tachyonc/test/NAME.got, NAME.err)
 [exit 1]
 ## filters: cases whose name contains one of them
@@ -65,10 +68,10 @@ error test.no-root: no case in tests/ matches the filters
 try: tachyonc test main.tach
 [exit 2]
 $ test --bogus
-error test.usage: unknown option '--bogus'; usage: tachyonc test [FILTER...] [ROOT.tach] [--dir DIR] [--input FILE] [--budget N] [--full] [--timeout S] [-O N]
+error test.usage: unknown option '--bogus'; usage: tachyonc test [FILTER...] [ROOT.tach] [--dir DIR] [--input FILE] [--budget N] [--full] [--timeout S] [-O N] [--no-trace] [--against TACHYONC]
 [exit 2]
 $ test --budget lots
-error test.usage: --budget takes a number of tokens, not 'lots'; usage: tachyonc test [FILTER...] [ROOT.tach] [--dir DIR] [--input FILE] [--budget N] [--full] [--timeout S] [-O N]
+error test.usage: --budget takes a number of tokens, not 'lots'; usage: tachyonc test [FILTER...] [ROOT.tach] [--dir DIR] [--input FILE] [--budget N] [--full] [--timeout S] [-O N] [--no-trace] [--against TACHYONC]
 [exit 2]
 $ test missing.tach
 error test.no-root: no file 'missing.tach'

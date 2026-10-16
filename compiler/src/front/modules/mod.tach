@@ -32,12 +32,13 @@ use crate::base::diag::{
 use crate::front::ast::NODES;
 use crate::front::cpp::directives::{file_exists, path_dir};
 use crate::front::lexer::{TOKS, TOK_COUNT, Tok, lex_range};
-use crate::front::modules::lookup::{is_prelude015, is_prelude_name};
+use crate::front::modules::lookup::{is_prelude015, is_prelude_name, prelude_index};
 use crate::front::modules::stdsections::load_std_sections;
 use crate::front::stdsrc::std_source;
 use crate::front::stdtree::{STD_TREE, add_std_tree};
 use crate::middle::lower::ssa::HMap;
 use crate::middle::profile::{PROFILE_GENERATE, PROFILE_MODULE, profile_runtime_source};
+use crate::middle::trace::{TRACE, TRACE_MODULE, trace_runtime_source};
 use crate::middle::unsafecheck::{CHECK_MODULE, CHECK_UNSAFE, check_runtime_source};
 use crate::tools::query::command_line::QUERY;
 
@@ -265,6 +266,15 @@ pub fn load_modules() {
             FILES[FILE_COUNT - 1].module = PROFILE_MODULE;
             lex_range(start, FILES[FILE_COUNT - 1].end, last: false);
         }
+        // (0.17: --trace's runtime)
+        if TRACE && TRACE_MODULE < 0 {
+            let text = buf_new();
+            trace_runtime_source(text);
+            let start = add_source(c"<trace>", text);
+            TRACE_MODULE = add_module(intern_c(c"__trace"), 0, public: false);
+            FILES[FILE_COUNT - 1].module = TRACE_MODULE;
+            lex_range(start, FILES[FILE_COUNT - 1].end, last: false);
+        }
     }
 }
 
@@ -334,8 +344,8 @@ fn needs_std015(i: i64) -> bool {
     }
 }
 
-// Whether identifier token i, a name the prelude gained in 0.15, names
-// std's item: not when it is declared (`let format`, `fn eprint`), a
+// Whether identifier token i, a name the prelude gained in 0.15 or later,
+// names std's item: not when it is declared (`let format`, `fn eprint`), a
 // parameter, field or named argument (`format: *u8`), a member
 // (`.format`), or a name the program declares itself (`fn eprint` at
 // another token), so that programs of 0.14 using these names get no std.
@@ -347,14 +357,31 @@ fn uses_prelude015(i: i64) -> bool {
         if TOKS[i + 1].kind == Tok::Colon {
             return false;
         }
-        let name = TOKS[i].value;
-        for j in 1..TOK_COUNT {
-            if TOKS[j].kind == Tok::Ident && TOKS[j].value == name
-                && is_declaring(TOKS[j - 1].kind) {
-                return false;
+        !declares_prelude_name(TOKS[i].value as i64)
+    }
+}
+
+// Which of the prelude's names the program declares itself (`fn trim`,
+// `let split`), over the tokens read so far (0.17: one pass, not one per
+// use; more tokens come as the modules' files are read).
+static mut PRELUDE_DECLARED: [bool; 64] = [false; 64];
+
+static mut DECLARED_UPTO: i64 = 1;
+
+fn declares_prelude_name(name: i64) -> bool {
+    unsafe {
+        while DECLARED_UPTO < TOK_COUNT {
+            let j = DECLARED_UPTO;
+            if TOKS[j].kind == Tok::Ident && is_declaring(TOKS[j - 1].kind) {
+                let k = prelude_index(TOKS[j].value as i64);
+                if k >= 0 {
+                    PRELUDE_DECLARED[k] = true;
+                }
             }
+            DECLARED_UPTO += 1;
         }
-        true
+        let k = prelude_index(name);
+        k >= 0 && PRELUDE_DECLARED[k]
     }
 }
 

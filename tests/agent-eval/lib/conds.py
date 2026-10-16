@@ -15,6 +15,16 @@ Program tasks (tasks/):
 - `tools-core`: bare + the tiered tools preamble (prompts/tools-core.md:
   eight rows, `query context` first, and where the rest is).
 - `both-core`: guide-core + tools-core (what a user gets once both land).
+- `guide-mini` (0.17 iterations): bare + prompts/guide-mini.md, a ~600-token
+  always-loaded core (the main Rust differences in one compiled example,
+  then the lookup lines); with `+readfirst` the iteration-1 cell.
+- `guide-example` (0.17 iterations): bare + prompts/guide-example.md, whose
+  `@EXAMPLE@` is `tachyonc guide example` from the compiler under test: a
+  whole program in three files and a test case (modules, enums and match,
+  Result and `?`, Vec, HashMap, Buf, a sort closure, allocators passed
+  down) in place of guide-mini's one-file example, then the lookup lines.
+  The worked program answers up front what Haiku probed and looked up
+  before its first write (.claude/briefs/research/prewrite-deliberation.md).
 - `rust-pairs`: bare + paired Rust -> tachyon lines (prompts/rust-pairs.md),
   about the core guide's budget: the differences shown as pairs instead
   of tachyon-only examples.
@@ -45,6 +55,16 @@ Modifiers, any order after the base:
 - `+recite`: one line after the task (prompts/recite.md): look a construct
   up with `guide --find` / `guide TOPIC#SECTION` before writing it (the
   research plan's item 9; the guide-core intro already says it).
+- (E3, E5, E6 of the delivery research) `+rewrite`: the query-first hook
+  runs a read of source whose query is not in doubt as that query instead
+  of blocking it (compiler-tools conditions only); `+nohints`: the hooks
+  give no hints (repeat-query, unfamiliar-construct); `+note`: a note when
+  a guide/query/explain/--help call prints again what it printed earlier
+  (tools/agent-hooks/lookup-note.py). Each is settings-eval.json's
+  `modifiers` entry of that name.
+- `+readfirst` (0.17 iterations): prompts/readfirst.md after the guide:
+  read the code in the directory first, follow its patterns, look up
+  (`guide --find`, `guide TOPIC#SECTION`) only what the code does not show.
 
 `both+hook+test` is the rerun matrix's row D cell; `compiler-tools-core+test`
 the compiler one.
@@ -59,15 +79,19 @@ import os
 from lib.common import HOOKS_DIR, PROMPTS_DIR
 
 PROGRAM_BASES = ("bare", "guide", "tools", "both", "guide-core", "tools-core", "both-core",
-                 "rust-pairs", "rust")
+                 "rust-pairs", "guide-mini", "guide-example", "rust")
 COMPILER_BASES = ("compiler-tools", "compiler-plain", "compiler-tools-core")
 BASES = PROGRAM_BASES + COMPILER_BASES
-MODS = ("hook", "test", "turn-end", "recite")
+MODS = ("hook", "test", "turn-end", "recite", "rewrite", "nohints", "note", "readfirst")
+# (E3, E5, E6) the modifiers settings-eval.json's `modifiers` defines: an
+# environment for every hook of the run, more hooks
+HOOK_MODS = ("rewrite", "nohints", "note")
 
 # What each base puts in the prompt: guide (None, "full": `tachyonc guide`,
-# "core": prompts/guide-core.md), tools (None, "full": tools.md, "core":
-# tools-core.md), pairs (rust-pairs.md), compiler (None, "full", "plain",
-# "core": the AGENTS.md variant).
+# "core": prompts/guide-core.md, "mini": prompts/guide-mini.md, "example":
+# prompts/guide-example.md with `tachyonc guide example`), tools (None,
+# "full": tools.md, "core": tools-core.md), pairs (rust-pairs.md),
+# compiler (None, "full", "plain", "core": the AGENTS.md variant).
 _PARTS = {
     "bare": {},
     "guide": {"guide": "full"},
@@ -77,6 +101,8 @@ _PARTS = {
     "tools-core": {"tools": "core"},
     "both-core": {"guide": "core", "tools": "core"},
     "rust-pairs": {"pairs": True},
+    "guide-mini": {"guide": "mini"},
+    "guide-example": {"guide": "example"},
     "rust": {},
     "compiler-tools": {"compiler": "full"},
     "compiler-plain": {"compiler": "plain"},
@@ -109,13 +135,18 @@ class Cond:
         self.lang = "compiler" if self.is_compiler else ("rust" if self.base == "rust" else "tach")
         self.test = "test" in self.mods
         self.recite = "recite" in self.mods
+        self.readfirst = "readfirst" in self.mods
         self.turn_end = "turn-end" in self.mods or self.test
+        self.hook_mods = tuple(m for m in self.mods if m in HOOK_MODS)
         if self.lang == "rust" and self.mods:
             raise ValueError("condition %r: rust takes no modifiers" % name)
         if self.compiler == "plain" and self.mods:
             raise ValueError("condition %r: compiler-plain takes no modifiers (no hooks)" % name)
         # the compiler-tools conditions: query-first and check hooks always
         self.query_hook = self.compiler in ("full", "core")
+        if "rewrite" in self.mods and not self.query_hook:
+            raise ValueError("condition %r: +rewrite needs the query-first hook "
+                             "(compiler-tools, compiler-tools-core)" % name)
         self.hook = "hook" in self.mods or self.query_hook or self.test
 
     def check_hook(self, flag=False):
@@ -183,5 +214,5 @@ def sort_key(name):
 
 
 def help_text():
-    return ("BASE[+MOD...]: bases %s; modifiers +hook, +test, +turn-end, +recite"
-            % ", ".join(BASES))
+    return ("BASE[+MOD...]: bases %s; modifiers %s"
+            % (", ".join(BASES), ", ".join("+" + m for m in MODS)))

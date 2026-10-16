@@ -390,7 +390,7 @@ fn parse_generic_params(defaults: bool) -> i64 {
     }
 }
 
-// `enum E { A, B(T, ...), C = expr, ... }`
+// `enum E { A, B(T, ...), C { x: T, ... }, D = expr, ... }`
 fn parse_enum() -> i64 {
     unsafe {
         let start = cur_start();
@@ -404,9 +404,9 @@ fn parse_enum() -> i64 {
             let variant = new_node(NodeKind::Variant, cur_start(), 0);
             NODES[variant].a = expect_binding_name();
             if at(LBrace) {
-                struct_variant_error(cur_start(), NODES[variant].a, NODES[n].a);
-            }
-            if eat(LParen) {
+                // (0.17) `V { a: A, b: B }`
+                parse_variant_fields(variant);
+            } else if eat(LParen) {
                 NODES[variant].c = 1;
                 let types = list_begin();
                 while !at(RParen) && !at(Eof) {
@@ -434,59 +434,38 @@ fn parse_enum() -> i64 {
     }
 }
 
-// (0.17) `V { a: A, b: B }` in an enum, at position `at` (its `{`): the
-// error, with the tuple variant to write, `V(A, B)`, as the try: line.
-fn struct_variant_error(at: i64, name: i64, owner: i64) -> ! {
+// (0.17) The fields of `V { a: A, b: B }`, after the variant's name: the
+// variant's list holds the types (as for `V(A, B)`, c = 1), its d a node
+// whose list holds a Field node per field (a: the name, b: 0).
+fn parse_variant_fields(variant: i64) {
     unsafe {
-        err_begin(at);
-        err_str(c"struct-like enum variants are not supported yet; use a tuple variant");
-        let t = buf_new();
-        buf_bytes(t, SYMS[name].text);
-        buf_byte(t, '(');
-        let mut i = at + 1;
-        let mut depth = 0;
-        let mut field = 0;
-        let mut colon = -1;
-        let mut start = i;
-        let limit = FILES[file_of_pos(at)].end;
-        while i + 1 < limit {
-            let c = SRC[i];
-            if c == '(' || c == '[' || c == '<' || c == '{' {
-                depth += 1;
-            } else if (c == ')' || c == ']' || c == '>' || c == '}') && depth > 0 {
-                depth -= 1;
-            } else if depth == 0 && c == ':' && colon < 0 && SRC[i + 1] != ':' {
-                colon = i;
-            } else if depth == 0 && (c == ',' || c == '}') {
-                if colon > 0 {
-                    let mut a = colon + 1;
-                    while a < i && (SRC[a] == ' ' || SRC[a] == '\n') {
-                        a += 1;
-                    }
-                    let mut e = i;
-                    while e > a && (SRC[e - 1] == ' ' || SRC[e - 1] == '\n') {
-                        e -= 1;
-                    }
-                    if field > 0 {
-                        buf_str(t, c", ");
-                    }
-                    buf_bytes(t, SRC[a..e]);
-                    field += 1;
-                }
-                colon = -1;
-                start = i + 1;
-                if c == '}' {
-                    break;
-                }
+        let names = new_node(NodeKind::None, cur_start(), 0);
+        expect(LBrace);
+        let mark = list_begin();
+        while !at(RBrace) && !at(Eof) {
+            let field = new_node(NodeKind::Field, cur_start(), 0);
+            NODES[field].a = expect_binding_name();
+            NODES[field].end = prev_end();
+            expect(Colon);
+            // (the type, kept on the stack after its field until the end)
+            NODES[field].c = parse_type();
+            list_push(field);
+            if !eat(Comma) {
+                break;
             }
-            i += 1;
         }
-        let _ = start;
-        buf_byte(t, ')');
-        err_help_fmt(
-            f"the fields in order, without names: `{buf_slice(t)}`, matched as `{sym_text(owner)}::{sym_text(name)}(..)`");
-        err_try_fmt(buf_slice(t));
-        err_end()
+        list_end(names, mark);
+        expect(RBrace);
+        NODES[names].end = prev_end();
+        let types = list_begin();
+        for i in 0..NODES[names].count {
+            let field = child(names, i);
+            list_push(NODES[field].c);
+            NODES[field].c = 0;
+        }
+        list_end(variant, types);
+        NODES[variant].c = (NODES[names].count > 0) as i64;
+        NODES[variant].d = names;
     }
 }
 

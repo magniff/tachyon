@@ -96,7 +96,8 @@ struct_decl  = "struct" ident [ generics ] "{" [ field { "," field } [ "," ] ] "
 union_decl   = "union" ident "{" [ field { "," field } [ "," ] ] "}" ;   (* (0.3) #[repr(C)] only *)
 field        = [ "pub" ] ident ":" type ;              (* pub (0.5): fields are as visible as their struct *)
 enum_decl    = "enum" ident [ generics ] "{" [ variant { "," variant } [ "," ] ] "}" ;   (* (0.3) *)
-variant      = ident [ "(" type { "," type } [ "," ] ")" ] [ "=" expr ] ;  (* "=": fieldless enums only *)
+variant      = ident [ "(" type { "," type } [ "," ] ")"   (* "=": fieldless enums only *)
+                     | "{" [ ident ":" type { "," ident ":" type } [ "," ] ] "}" ] [ "=" expr ] ;   (* struct-like (0.17) *)
 impl_block   = "impl" [ generics ] [ path "for" ] type "{" { [ attributes ] [ "pub" ] fn_decl } "}" ;
                                                        (* (0.3); generics, a type with arguments: (0.5); a trait's: (0.9) *)
 trait_decl   = "trait" ident "{" { [ attributes ] [ "unsafe" ] "fn" ident [ generics ] "(" [ params ] ")" [ "->" type ] ( ";" | block ) } "}" ;
@@ -114,7 +115,15 @@ those. Constant arithmetic wraps like run-time arithmetic.
 **Enums** *(0.3)*. A fieldless enum's variants have discriminants (0, 1, ...
 unless given with `= expr`); such an enum is a scalar, compared with `==`
 and `!=` and cast to an integer with `as`. Variants with fields are tuple
-variants. Values are written `E::V` and `E::V(a, b)`.
+variants, `V(A, B)`, or struct-like ones (0.17), `V { a: A, b: B }`. Values
+are written `E::V`, `E::V(a, b)` and `E::V { a: x, b }` (a struct literal's
+form: every field once, in any order, `b` for `b: b`; the fields are
+evaluated in the order written). A struct-like variant is laid out as the
+tuple variant of its fields' types in declaration order; its fields are read
+only through patterns (`E::V { a, .. }`), not with `.a`, and it is neither
+built nor matched by position (`E::V(x, y)` is an error that names the
+form to write). `#[derive]` treats it as the tuple variant, and Debug writes
+`V { a: 1, b: 2 }`.
 
 **Impl blocks** *(0.3)* hold the methods and associated functions of a
 struct or enum. A function whose first parameter is named `self`, of type
@@ -155,15 +164,25 @@ single   = "_" | [ "mut" ] ident                      (* a binding, or a constan
          | ident "::" ident [ "(" [ pattern { "," pattern } [ "," ] ] ")" ]   (* (0.3) a variant *)
          | ident "::" ident "..=" ident "::" ident    (* (0.4) variants in declaration order *)
          | ident "(" [ pattern { "," pattern } [ "," ] ] ")"   (* (0.4) a variant brought in by `use` *)
+         | [ ident "::" ] ident "{" [ fpat { "," fpat } ] [ "," ".." ] [ "," ] "}"   (* (0.17) a variant's fields by name *)
          | "(" [ pattern { "," pattern } [ "," ] ] ")" ;
-literal  = [ "-" ] int_lit | char_lit | "true" | "false" | ident ;   (* ident: a constant *)
+literal  = [ "-" ] int_lit | char_lit | "true" | "false" | ident   (* ident: a constant *)
+         | ident "::" ident { "::" ident } ;          (* (0.17) a constant's path: i8::MIN, m::TOP *)
+fpat     = [ "mut" ] ident | ident ":" pattern ;       (* `a` is `a: a` *)
 ```
 
-`(p)` is `p`; `(p,)` is a one-element tuple pattern. An identifier that
-names a constant (and no local) is that constant's value; any other is a
-binding. Every alternative of an or-pattern binds the same variables, with
-the same types. The patterns of `let` and `for` must match every value
-(no literals, ranges, alternatives, or variants of enums with several).
+`(p)` is `p`; `(p,)` is a one-element tuple pattern. A path matched
+against an integer is a constant (0.17): `i8::MIN..=-1`, `0..=m::TOP`,
+`i64::MAX` alone; against an enum, `E::A..=E::C` is a variant range. A
+variant's pattern by name (0.17) names each field once, in any order; with
+`..` (last) the fields it leaves out match anything, without it every
+field is named (`E::V { .. }` matches the variant whatever its fields, a
+tuple variant's too). The enum's path may have module segments (`m::E::V {
+.. }`). An identifier that names a constant (and no local) is that
+constant's value; any other is a binding. Every alternative of an
+or-pattern binds the same variables, with the same types. The patterns of
+`let` and `for` must match every value (no literals, ranges, alternatives,
+or variants of enums with several).
 
 ## Statements and blocks
 
@@ -209,7 +228,7 @@ postfix     = "(" [ expr { "," expr } [ "," ] ] ")"     (* call *)
 primary     = int_lit | float_lit | char_lit | string_lit | cstring_lit | "true" | "false"
             | segment { "::" segment }               (* a name; (0.3) a variant or an associated function
                                                          (T::m); (0.5) an item of a module (m::f, a::b::T::m) *)
-            | segment { "::" segment } "{" [ field_init { "," field_init } [ "," ] ] "}"   (* struct (or union: one field) literal *)
+            | segment { "::" segment } "{" [ field_init { "," field_init } [ "," ] ] "}"   (* struct (or union: one field) literal; (0.17) a struct-like variant's *)
             | "(" ")" | "(" expr ")" | "(" expr "," [ expr { "," expr } [ "," ] ] ")"
             | "[" "]" | "[" expr ";" expr "]" | "[" expr { "," expr } [ "," ] "]"
             | [ label ] block_like ;
@@ -228,7 +247,9 @@ cond        = expr ;                                  (* without struct literals
 
 In conditions (`if`, `while`) and `for` ranges, `Name {` starts the body, not
 a struct literal; inside parentheses, brackets, braces and call arguments
-struct literals are allowed again (`if f(P { x: 1 }) { ... }`).
+struct literals are allowed again (`if f(P { x: 1 }) { ... }`). (0.17)
+`Name { a: ...` (a field name and its colon, not a labelled loop) is a
+literal there too: `match E::V { a: 1 } { ... }`.
 
 `return`, `break` and `continue` are expressions of type `!`, which coerces
 to every type (`let d = if ok { v } else { return -1 };`). A `loop` has the
@@ -338,7 +359,8 @@ parameters). The unsafe operations, and what they promise:
   pointer: dereferencing it is safe.
 - Indexing a raw pointer, `p[i]` (unchecked by design: a pointer has no
   length), and slicing one, `p[lo..hi]` (the slice is only as valid as
-  the memory behind it).
+  the memory behind it). On a raw pointer to a Vec, a Buf or a slice they
+  index the pointee, checked (0.17), and are unsafe as `*p` is.
 - Casting an integer to a pointer (other than the literal `0`, a null
   pointer, which safe code cannot dereference). Pointer-to-pointer and
   pointer-to-integer casts are safe; tachyon has no pointer arithmetic
@@ -672,7 +694,9 @@ The module `std` is built into the compiler, read when a program names it
 Failures (`unwrap` of `None`, an index out of bounds) write a message to
 stderr and exit with 101. Its source is `compiler/std/std.tach` (0.15:
 with the files `compiler/std/embed.sh` appends to it); the
-whole API, from that source: `tachyonc guide std`.
+whole API, from that source: `tachyonc guide std` (0.17: a line per
+item; with the comments, `guide std#every-item`; one name, `guide --find
+NAME`).
 
 0.14 adds reading stdin without `unsafe` (`read_line(&buf)`, a line
 without its `'\n'`, false at the end of input; `read_stdin()`, all of
@@ -853,7 +877,8 @@ fn main() -> i32 {
   included.
 
 Dereferencing a borrow (`*p`, `p.f`, `p.m()`) is safe; indexing it
-(`p[i]`) is not (a borrow is one value, not an array). In exchange, a
+(`p[i]`) is not (a borrow is one value, not an array), except that a
+pointer to a Vec, a Buf or a slice indexes its pointee (0.17). In exchange, a
 call passing something other than a borrow to a pointer parameter (a
 pointer field, a local holding a pointer, `malloc`'s result, `c"..."`,
 which is read-only memory) is unsafe: the caller vouches for it. A
@@ -1480,6 +1505,81 @@ from `main` to them ([refactor.md](refactor.md)).
 `#[sealed]` (to come: checked) hides a struct's fields not marked `pub`,
 and its literals, outside its module; `#[scoped]` (to come) keeps values
 of the type from outliving the scope that made them.
+
+## Additions of 0.17: familiar forms
+
+Forms a Rust reader writes first, with tachyon's meaning unchanged
+(nothing here allocates, and every index stays checked). The measure
+behind them is `.claude/briefs/research/familiar-names.md`.
+
+```ebnf
+unary += "&" "mut" unary          (* the same as "&" unary *)
+```
+
+**`&mut e`** is `&e`: tachyon has one pointer type, `*T`, for `&T` and
+`&mut T`. (The exclusive meaning `&mut` will have with value semantics
+is [design/value-semantics.md](design/value-semantics.md)'s.)
+
+**The prelude** gains `Buf`, `HashMap`, `read_line`, `read_stdin_in`,
+`Scanner`, `parse_int`, `trim`, `split_in`, `split_whitespace_in`,
+`sort`, `sort_by`, the stable sorts (`sort_stable`, `sort_stable_by`,
+`sort_stable_in`, `sort_stable_by_in`), `cmp_of`, `eq_of`, `Fmt`, `panic` and `unreachable`
+(and `read_stdin`, `split`, `split_whitespace`, whose use is the error
+naming their `_in` form). As before it comes last (a program's own
+`trim` hides it), and std is loaded only for a program that uses one of
+its names: a name the program declares itself (`fn trim`, `let split`),
+a field, a parameter or a member (`.trim`) does not load it. std's own
+source sees the prelude too (`None`, `Ok(x)` inside std).
+
+`panic(message: [u8]) -> !` prints the message on stderr and exits with
+101, as a failed check does; `unreachable()` the same with "entered
+unreachable code". Both are safe; their effect is
+`panic`. `std::panic` is still the `unsafe fn` taking a C string.
+
+**Indexing a Vec or a Buf.** `v[i]`, `v[i] = x`, `v[i] += x` and
+`v[a..b]` on std's `Vec` and `Buf` are `v.as_slice()[i]` (and so on):
+checked, a place to assign without `mut` (as a slice's element is); the
+slice is valid until the Vec grows or is freed. A `HashMap` is not
+indexed (`m.get(k)` is an Option: Rust's `m[k]` panics). On any pointer
+to a Vec, a Buf or a slice, `p[i]`, `p[i] = x`, `&p[i]` and `p[a..b]`
+index the pointee (`p.as_slice()[i]`, `(*p)[i]`), checked, as `p.get(i)`
+is: the type decides what they mean. Whether the pointer is a borrow
+decides only safety: through a borrow (a pointer parameter, `&v`) they
+are safe; through a raw pointer (a `mut` parameter, a local, a field, a
+static) they read through it, so they are `unsafe` (the error's try: is
+`fix --only unsafe`, or `v[i]` for a local `let p = &v;`). Generic code
+over an array of `T` behind a `*T` (std's Vec) therefore does not write
+`p[i]`, which would index the pointee when `T` is a Vec: it takes the
+element's address (cast through `*u8`). `p[0]` on a pointer to anything
+else is pointer arithmetic; through a borrow its error names `*p`, the
+value it points to (`try: *out = acc` for `out[0] = acc`).
+
+**Through a pointer.** `p.0` on a `*(A, B)` is `(*p).0`, as `p.x` on a
+`*S` is `(*p).x`: safe when `p` is a borrow (a parameter, `&x`),
+`unsafe` on a raw pointer.
+
+**`len()`.** `s.len()` on a slice is its field `s.len`; `a.len()` on
+an array (a variable, constant, static or a field of one) is its
+length, an `i64`. The field stays. The other way round, `a.len` on such
+an array is its length, and `v.len` on std's `Vec`, `Buf` and `HashMap`
+(whose `len` field is sealed, or which have none) is `v.len()`: a read
+only; `v.len = n` and `&v.len` are still errors.
+
+**Paths.** A path's first segment that is not `crate`, `self`, `super`,
+`std` nor a name of the module it is written in is looked up beside that
+module (a child of its parent), then at the root: `use lexer::{Tok,
+next};` in `parser.tach`, where `main.tach` has `mod lexer; mod parser;`,
+is `use crate::lexer::{Tok, next};`. A path in code starts the same way
+(0.17): `lexer::next(..)`, `fn f(t: lexer::Tok)`, `lexer::Tok { .. }` and
+`lexer::Kind::Ident` in a pattern are `crate::lexer::...` there, as the
+`use` line would be; a name in scope in the module (an item, an import)
+still comes first. When both are modules and differ (`crate::a::lexer`
+beside `crate::a::parser`, and `crate::lexer`), it is an error,
+`ambiguous module`, whose `try:` lines are the two `crate::` paths (the
+`use` line, or the path in code, so written). A module elsewhere
+(`crate::b::lexer`) is `unknown module 'lexer'`, whose `try:` is the
+`use` line with its path from the root.
+`use m::{self, X};` is not supported: its error's `try:` is `use m;`.
 
 ## Importing C headers
 

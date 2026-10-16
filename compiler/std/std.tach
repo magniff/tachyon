@@ -53,7 +53,18 @@ extern "C" {
 pub unsafe fn panic(message: *u8) -> ! {
     panic_write(2, message, strlen(message));
     panic_write(2, c"\n", 1);
+    panic_note();
     panic_exit(101)
+}
+
+// (0.17) The line after a failure's message; a program built with
+// --trace prints the calls that led to the failure instead (the compiler
+// makes this call one of its trace runtime's, compiler/src/middle/trace.tach).
+fn panic_note() {
+    unsafe {
+        let note = c"note: build with --trace for the line and its callers\n";
+        panic_write(2, note, strlen(note));
+    }
 }
 
 // ---- Option and Result ----
@@ -124,6 +135,24 @@ impl<T, E> Result<T, E> {
 }
 
 // ---- Vec ----
+
+// Element i of the array of T at p, by its address, and the n elements at
+// p as a slice: what `p[i]` and `p[0..n]` are for most T. (0.17) On a
+// pointer to a Vec, a Buf or a slice those index the one it points to, so
+// code over arrays of any T (Vec's, HashMap's) goes through these.
+#[inline]
+unsafe fn elem_at<T>(p: *T, i: i64) -> *T {
+    (&(p as *u8)[i * size_of(T)]) as *T
+}
+
+#[inline]
+unsafe fn raw_slice<T>(p: *T, n: i64) -> [T] {
+    let none: [T; 0] = [];
+    let mut s = none[..];
+    s.ptr = p;
+    s.len = n;
+    s
+}
 
 // A growable vector of T, its memory from allocator A (0.16; Gpa, C's
 // malloc, by default); `free` gives its memory back.
@@ -217,14 +246,14 @@ impl<T, A: Allocator> Vec<T, A> {
             unsafe {
                 self.ptr = p as *T;
                 for i in 0..self.len {
-                    self.ptr[i] = old[i];
+                    *elem_at(self.ptr, i) = *elem_at(old, i);
                 }
             }
             self.cap = cap;
         }
         for i in 0..n {
             unsafe {
-                self.ptr[self.len + i] = s[i];
+                *elem_at(self.ptr, self.len + i) = s[i];
             }
         }
         self.len += n;
@@ -238,7 +267,7 @@ impl<T, A: Allocator> Vec<T, A> {
             out_of_memory();
         }
         unsafe {
-            self.ptr[self.len] = x;
+            *elem_at(self.ptr, self.len) = x;
         }
         self.len += 1;
     }
@@ -248,7 +277,7 @@ impl<T, A: Allocator> Vec<T, A> {
             return Option::None;
         }
         self.len -= 1;
-        Option::Some(unsafe { self.ptr[self.len] })
+        Option::Some(unsafe { *elem_at(self.ptr, self.len) })
     }
 
     // Element i (checked: out of bounds exits with 101).
@@ -309,7 +338,7 @@ impl<T, A: Allocator> Vec<T, A> {
     }
 
     pub fn as_slice(self: *Vec<T, A>) -> [T] {
-        unsafe { self.ptr[0..self.len] }
+        unsafe { raw_slice(self.ptr, self.len) }
     }
 
     pub fn clear(self: *Vec<T, A>) {
@@ -373,7 +402,7 @@ impl<T, A: Allocator> Vec<T, A> {
             return Result::Err(AllocError::OutOfMemory);
         }
         unsafe {
-            self.ptr[self.len] = x;
+            *elem_at(self.ptr, self.len) = x;
         }
         self.len += 1;
         Result::Ok(())
@@ -781,14 +810,14 @@ fn quicksort<T: Ord>(s: [T], lo: i64, hi: i64, depth: i64) {
         for _ in lo..hi {
             i += 1;
             for _ in i..hi {
-                if !(unsafe { s.ptr[i] } < pivot) {
+                if !(unsafe { *elem_at(s.ptr, i) } < pivot) {
                     break;
                 }
                 i += 1;
             }
             j -= 1;
             for _ in lo..j {
-                if !(pivot < unsafe { s.ptr[j] }) {
+                if !(pivot < unsafe { *elem_at(s.ptr, j) }) {
                     break;
                 }
                 j -= 1;
@@ -930,7 +959,7 @@ pub fn sort_stable_by_in<T, F: FnMut(*T, *T) -> i64, A: Allocator>(s: [T], f: F,
     let mut buf: Vec<T, A> = Vec::with_capacity_in(n, a);
     // (every element of `to` is written before it is read)
     let mut from = s;
-    let mut to = unsafe { buf.ptr[0..n] };
+    let mut to = unsafe { raw_slice(buf.ptr, n) };
     let mut width = STABLE_RUN;
     // (the width doubles each round: 62 at most)
     for _ in 0..62 {
@@ -1024,7 +1053,7 @@ impl<K: Hash + Eq, V, A: Allocator> HashMap<K, V, A> {
             if state == SLOT_FREE {
                 return -1;
             }
-            if state == SLOT_FULL && unsafe { self.keys[i] } == *key {
+            if state == SLOT_FULL && unsafe { *elem_at(self.keys, i) } == *key {
                 return i;
             }
             i = (i + 1) & mask;
@@ -1044,7 +1073,7 @@ impl<K: Hash + Eq, V, A: Allocator> HashMap<K, V, A> {
     // A copy of the value of `key`, if it has one (`get_mut` changes it).
     pub fn get(self: *HashMap<K, V, A>, key: K) -> Option<V> {
         let i = self.slot_of(&key);
-        if i < 0 { Option::None } else { Option::Some(unsafe { self.values[i] }) }
+        if i < 0 { Option::None } else { Option::Some(unsafe { *elem_at(self.values, i) }) }
     }
 
     // The value of `key` in place, as a view of one element, if it has
@@ -1053,7 +1082,8 @@ impl<K: Hash + Eq, V, A: Allocator> HashMap<K, V, A> {
     // Vec's `as_slice()`).
     pub fn get_mut(self: *HashMap<K, V, A>, key: K) -> Option<[V]> {
         let i = self.slot_of(&key);
-        if i < 0 { Option::None } else { Option::Some(unsafe { self.values[i..i + 1] }) }
+        if i < 0 { Option::None }
+        else { Option::Some(unsafe { raw_slice(elem_at(self.values, i), 1) }) }
     }
 
     // The value of `key` in place (a view of one element, as `get_mut`),
@@ -1064,16 +1094,16 @@ impl<K: Hash + Eq, V, A: Allocator> HashMap<K, V, A> {
         if i < 0 {
             i = self.insert_new(key, default);
         }
-        unsafe { self.values[i..i + 1] }
+        unsafe { raw_slice(elem_at(self.values, i), 1) }
     }
 
     // Sets the value of `key`; returns its old value, if it had one.
     pub fn insert(self: *HashMap<K, V, A>, key: K, value: V) -> Option<V> {
         let i = self.slot_of(&key);
         if i >= 0 {
-            let old = unsafe { self.values[i] };
+            let old = unsafe { *elem_at(self.values, i) };
             unsafe {
-                self.values[i] = value;
+                *elem_at(self.values, i) = value;
             }
             return Option::Some(old);
         }
@@ -1099,8 +1129,8 @@ impl<K: Hash + Eq, V, A: Allocator> HashMap<K, V, A> {
                 self.used += 1;
             }
             self.states[j] = SLOT_FULL;
-            self.keys[j] = key;
-            self.values[j] = value;
+            *elem_at(self.keys, j) = key;
+            *elem_at(self.values, j) = value;
         }
         self.len += 1;
         j
@@ -1115,7 +1145,7 @@ impl<K: Hash + Eq, V, A: Allocator> HashMap<K, V, A> {
         self.len -= 1;
         unsafe {
             self.states[i] = SLOT_GONE;
-            Option::Some(self.values[i])
+            Option::Some(*elem_at(self.values, i))
         }
     }
 
@@ -1127,14 +1157,14 @@ impl<K: Hash + Eq, V, A: Allocator> HashMap<K, V, A> {
         if i < 0 || i >= self.cap || unsafe { self.states[i] } != SLOT_FULL {
             return Option::None;
         }
-        Option::Some(unsafe { self.keys[i] })
+        Option::Some(unsafe { *elem_at(self.keys, i) })
     }
 
     pub fn value_at(self: *HashMap<K, V, A>, i: i64) -> Option<V> {
         if i < 0 || i >= self.cap || unsafe { self.states[i] } != SLOT_FULL {
             return Option::None;
         }
-        Option::Some(unsafe { self.values[i] })
+        Option::Some(unsafe { *elem_at(self.values, i) })
     }
 
     // Twice the room (at least 8 slots), the entries moved over and the
@@ -1173,7 +1203,7 @@ impl<K: Hash + Eq, V, A: Allocator> HashMap<K, V, A> {
             if unsafe { old_states[i] } != SLOT_FULL {
                 continue;
             }
-            let key = unsafe { old_keys[i] };
+            let key = unsafe { *elem_at(old_keys, i) };
             let mut j = (key.hash() & mask as u64) as i64;
             unsafe {
                 for _ in 0..cap {
@@ -1183,8 +1213,8 @@ impl<K: Hash + Eq, V, A: Allocator> HashMap<K, V, A> {
                     j = (j + 1) & mask;
                 }
                 self.states[j] = SLOT_FULL;
-                self.keys[j] = key;
-                self.values[j] = old_values[i];
+                *elem_at(self.keys, j) = key;
+                *elem_at(self.values, j) = *elem_at(old_values, i);
             }
         }
         if old_cap > 0 {

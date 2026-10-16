@@ -20,6 +20,11 @@
 #             compiled with an empty main; else statements, compiled as
 #             main's body (leading `use` and `import` lines above it;
 #             0.16: main is `fn main(gpa: Gpa)`, its allocator `gpa`)
+#   ```tach NAME.tach
+#             (0.17) a file of a program of several modules: the blocks
+#             named so, in a row (prose between them, no other block),
+#             are written next to each other and main.tach is compiled;
+#             an in and out block after the last one are the program's
 #   ```in     right after a tach block: the program's stdin (else empty)
 #   ```out    after a tach block (and its in block): it is run, and its stdout and
 #             stderr together are this text (trailing blanks aside);
@@ -86,6 +91,29 @@ split_blocks() {
             }
             if (line == "```") {
                 infence = 0
+                if (lang ~ /^tach [a-z_][a-z0-9_]*\.tach$/) {
+                    # (0.17) a file of a program of several: the blocks
+                    # `tach NAME.tach` in a row are one program, built from
+                    # main.tach; an in or out block after them is its
+                    if (proj == "") {
+                        n++
+                        proj = dir "/" topic "-" sprintf("%05d", start)
+                        system("mkdir -p \"" proj "\"")
+                        printf "%s\n", topic ":" start > (proj "/name")
+                        close(proj "/name")
+                    }
+                    fname = substr(lang, 6)
+                    f = proj "/" (fname == "main.tach" ? "prog.tach" : fname)
+                    for (i = 1; i <= nbody; i++) print b[i] > f
+                    close(f)
+                    pending = proj
+                    next
+                }
+                if (lang == "in" || lang ~ /^out/ || lang == "err") {
+                    if (proj != "") pending = proj
+                } else {
+                    proj = ""
+                }
                 if (lang == "tach") {
                     n++
                     name = topic ":" start
@@ -131,6 +159,7 @@ split_blocks() {
                         close(pending "/exit")
                     }
                     pending = ""
+                    proj = ""
                 } else {
                     pending = ""
                 }
@@ -323,24 +352,45 @@ else
 fi
 
 # The std topic is std's API: every public item, as the compiler's item
-# index has it, is there (without `pub`).
+# index has it, is in its section std#every-item (without `pub`).
 mkdir -p "$WORK/std"
+"$COMPILER" guide 'std#every-item' >"$WORK/std/every.md" 2>&1
 printf 'fn main(gpa: Gpa) -> i32 {\n    let v: Vec<i64> = Vec::new_in(gpa);\n    0\n}\n' >"$WORK/std/main.tach"
 if (cd "$WORK/std" && "$COMPILER" query items std --root main.tach) >"$WORK/std/items" 2>&1; then
     awk -F '\t' '$3 ~ /^pub / { s = $3; sub(/^pub /, "", s); print s }' "$WORK/std/items" >"$WORK/std/want"
     : >"$WORK/std/missing"
     while IFS= read -r sig; do
-        grep -qF -- "$sig" "$WORK/topic-std.md" || echo "$sig" >>"$WORK/std/missing"
+        grep -qF -- "$sig" "$WORK/std/every.md" || echo "$sig" >>"$WORK/std/missing"
     done <"$WORK/std/want"
     if [ ! -s "$WORK/std/want" ]; then
         result FAIL guide-std "query items std listed no public item"
     elif [ -s "$WORK/std/missing" ]; then
-        result FAIL guide-std "std items missing from tachyonc guide std:" "$(head -5 "$WORK/std/missing")"
+        result FAIL guide-std "std items missing from tachyonc guide std#every-item:" "$(head -5 "$WORK/std/missing")"
     else
         result pass guide-std
     fi
 else
     result FAIL guide-std "query items std failed:" "$(cat "$WORK/std/items")"
+fi
+
+# (0.17) `guide std` itself is the index: a line per item, the receiver
+# as `Self`, no comments, nothing of std's own workings, within about
+# 4k tokens (under the 30000 characters an agent's shell shows whole);
+# std#every-item is not in it. Its first screen (what `| head -60`
+# shows) is the most used names, then the overview.
+size=$(wc -c <"$WORK/topic-std.md" | tr -d ' ')
+if [ "$size" -le 16500 ] \
+    && head -60 "$WORK/topic-std.md" | grep -q '^## The most used$' \
+    && head -60 "$WORK/topic-std.md" | grep -qF 'Vec::new_in(gpa) -> Vec<T>' \
+    && head -60 "$WORK/topic-std.md" | grep -q '^## Overview$' && grep -qF 'fn push(self: *Self, x: T)' "$WORK/topic-std.md" \
+    && grep -qF 'fn split_in<A: Allocator>(s: [u8], sep: u8, a: A) -> Vec<[u8], A>' "$WORK/topic-std.md" \
+    && ! grep -q '^## Every item' "$WORK/topic-std.md" \
+    && ! grep -qF 'fn __' "$WORK/topic-std.md" \
+    && ! grep -qF 'live_blocks' "$WORK/topic-std.md" \
+    && grep -q '^## Every item with its comment$' "$WORK/std/every.md"; then
+    result pass guide-std-index
+else
+    result FAIL guide-std-index "tachyonc guide std is $size bytes (16500 at most), or not the index (most used first)"
 fi
 
 # The guide by piece (0.15): --find prints the paragraphs about the
@@ -364,6 +414,25 @@ if [ $rc -eq 0 ] && [ "$(cat "$WORK/over.out")" = "# std#input" ] \
     result pass guide-find-over
 else
     result FAIL guide-find-over "exit $rc:" "$(cat "$WORK/over.out")" "$(cat "$WORK/over.err")"
+fi
+# (0.17) A word naming a std item: its signature and comment first.
+"$COMPILER" guide --find split_in >"$WORK/finditem.out" 2>"$WORK/finditem.err"
+rc=$?
+if [ $rc -eq 0 ] && head -1 "$WORK/finditem.out" | grep -q '^# std#every-item$' \
+    && grep -qF 'fn split_in<A: Allocator>(s: [u8], sep: u8, a: A) -> Vec<[u8], A>' "$WORK/finditem.out" \
+    && grep -q '^// The parts of s' "$WORK/finditem.out" \
+    && [ "$(wc -c <"$WORK/finditem.out" | tr -d ' ')" -le 4000 ]; then
+    result pass guide-find-item
+else
+    result FAIL guide-find-item "exit $rc:" "$(head -5 "$WORK/finditem.out")" "$(cat "$WORK/finditem.err")"
+fi
+"$COMPILER" guide --find vec::push >"$WORK/findm.out" 2>&1
+if grep -q '^impl<T, A: Allocator> Vec<T, A> {$' "$WORK/findm.out" \
+    && grep -qF '    fn push(self: *Vec<T, A>, x: T)' "$WORK/findm.out" \
+    && ! grep -qF 'fn pop' "$WORK/findm.out"; then
+    result pass guide-find-method
+else
+    result FAIL guide-find-method "$(head -8 "$WORK/findm.out")"
 fi
 "$COMPILER" guide --find xyzzy frobnicate >"$WORK/nofind.out" 2>&1
 rc=$?
@@ -407,7 +476,7 @@ else
 fi
 
 # --help on every command (0.15): the command's rows, no error.
-for c in "" edit "edit patch" refactor "refactor signature" fix fmt check undo explain try "query context" rewrite lint same-output; do
+for c in "" edit "edit patch" refactor "refactor signature" fix fmt check undo explain try "query context" rewrite lint same-output test probe reduce; do
     # shellcheck disable=SC2086
     if "$COMPILER" $c --help >"$WORK/help.out" 2>&1 && [ -s "$WORK/help.out" ] \
         && [ "$(wc -l <"$WORK/help.out")" -le 15 ] && ! grep -q '^error' "$WORK/help.out"; then
@@ -442,6 +511,7 @@ try_case unit '' 'let x = 3;'
 try_case error "snippet:2:5: error[type error] expected 'i64', got '[u8]'" 'let a = 1;
 a + "b"'
 try_case panic 'index out of bounds: index 3, length 0
+note: build with --trace for the line and its callers
 exit 101' 'let v: Vec<i64> = Vec::new_in(gpa); v.get(3)'
 printf 'struct P { x: i64 }\n\nlet p = P { x: 4 };\np.x * 10\n' >"$WORK/snip.tach"
 try_case file 'i64 = 40' --file "$WORK/snip.tach"

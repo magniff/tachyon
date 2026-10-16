@@ -1,17 +1,74 @@
 # std
 
+## The most used
+
+The names agents' programs used most (0.17's evals, by how many of 362
+sessions used each), most used first. `v` is a `Vec`, `b` a `Buf`, `m` a
+`HashMap`, `sc` a `Scanner`, `o` an `Option` or `Result`. Every item:
+the index below (`guide std#the-api`); one item: `guide --find NAME`.
+
+```text
+v.push(x: T)                     Vec; Buf: b.push(byte: u8)
+v.as_slice() -> [T]              Vec; Buf: -> [u8]
+Vec::new_in(gpa) -> Vec<T>       let mut v: Vec<i64> = Vec::new_in(gpa);
+v.len() -> i64                   Vec, Buf, HashMap; a slice: s.len or s.len()
+v.get(i: i64) -> T               checked; also v[i]; m.get(k) -> Option<V>
+b.push_str(s: [u8])
+v.free()                         Vec, Buf, HashMap: defer v.free();
+Buf::new_in(gpa) -> Buf          text you build (there is no String)
+o.unwrap() -> T                  Option, Result
+read_stdin_in(gpa) -> Result<Buf, IoError>    all of stdin
+print(x), println(x)             any Display; f"{x} {v:?}"
+b.push_int(v: i64)
+v.set(i: i64, x: T)              checked; also v[i] = x
+Scanner::new(text: [u8]) -> Scanner
+sc.next_int() -> Result<i64, ScanError>
+o.unwrap_or(x: T) -> T           Option, Result
+v.clear()                        Vec, Buf
+v.sort_by(|a, b| a.x - b.x)      Vec or slice; a, b: *T; < 0: a first
+HashMap::new_in(gpa) -> HashMap<K, V>
+v.pop() -> Option<T>
+Vec::filled_in(n: i64, x: T, gpa) -> Vec<T>
+sort(s: [T])                     in place, by Ord
+m.slots(), m.key_at(i) -> Option<K>, m.value_at(i) -> Option<V>   iterate
+Vec::with_capacity_in(cap: i64, gpa) -> Vec<T>
+m.get_or_insert(k: K, d: V) -> [V]    m.get_or_insert(w, 0)[0] += 1;
+sc.next_token() -> Option<[u8]>
+parse_int(s: [u8]) -> Result<i64, ParseIntError>
+sc.next_line() -> Option<[u8]>
+m.insert(k: K, x: V) -> Option<V>     Vec: v.insert(i: i64, x: T)
+std::print_int(v: i64)
+trim(s: [u8]) -> [u8]
+is_digit(b: u8) -> bool          use std::{is_digit};
+read_line(&b) -> Result<bool, IoError>    Ok(false) at the end of input
+split_whitespace_in(s: [u8], gpa) -> Vec<[u8]>
+v.swap(i: i64, j: i64)
+sort_stable_by_in(s: [T], f, gpa)     use std::{sort_stable_by_in};
+o.is_some() -> bool              Option
+v.remove(i: i64) -> T            m.remove(k) -> Option<V>
+split_in(s: [u8], sep: u8, gpa) -> Vec<[u8]>
+m.contains_key(k: K) -> bool
+```
+
+## Overview
+
 The standard library is the module `std`, built into the compiler. The
 prelude names need no import: `Option`, `Some`, `None`, `Result`, `Ok`,
-`Err`, `Vec`, `print`, `println`, `eprint`, `eprintln`, `format`, and
-the traits `Add`, `Sub`, `Mul`, `Div`, `Neg`, `Eq`, `Ord`, `Hash`,
-`Display`, `Debug`, `Clone`, `From`, `Into` (the last eight: 0.15). Anything else is used by path
-(`std::print_int(n)`, `std::sort(s)`) or imported by name
-(`use std::{Buf, HashMap, sort};`).
+`Err`, `Vec`, `print`, `println`, `eprint`, `eprintln`, `format`,
+`format_in`, the allocators (`Gpa`, `Allocator`, `Arena`, `ScopedArena`,
+`arena_scope`), the traits `Add`, `Sub`, `Mul`, `Div`, `Neg`, `Eq`,
+`Ord`, `Hash`, `Iterator`, `Display`, `Debug`, `Clone`, `From`, `Into`,
+and (0.17) `Buf`, `HashMap`, `read_line`, `read_stdin_in`, `Scanner`,
+`parse_int`, `trim`, `split_in`, `split_whitespace_in`, `sort`,
+`sort_by`, `sort_stable`, `sort_stable_by` (and their `_in` forms),
+`cmp_of`, `eq_of`, `Fmt`, `panic(msg)` and `unreachable()`.
+Anything else is used by path (`std::print_int(n)`) or imported by name
+(`use std::{IoError, is_digit};`).
 
 What a Rust programmer will miss: there is no `String` (use `[u8]` and
 `Buf`), no file reading (call C; iterators: `tachyonc guide
-iterators`), no `HashSet` (a `HashMap<K, bool>`), no `Vec` indexing
-(`get`, `set`, `as_slice()[i]`). Formatting is 0.15's f-strings,
+iterators`), no `HashSet` (a `HashMap<K, bool>`). A `Vec` (and a `Buf`) indexes as
+its slice: `v[i]`, `v[i] = x`, `v[a..b]` (0.17), checked. Formatting is 0.15's f-strings,
 `println(f"{x:>4}")` (`tachyonc guide formatting`); errors are enums in a
 `Result` (`tachyonc guide conversions`). Nothing frees itself: call `free()`, usually right
 after creating the value with `defer x.free();`.
@@ -35,8 +92,6 @@ after creating the value with `defer x.free();`.
   not stable).
 
 ```tach
-use std::HashMap;
-
 fn main(gpa: Gpa) -> i32 {
     let mut counts: HashMap<[u8], i64> = HashMap::new_in(gpa);
     defer counts.free();
@@ -84,8 +139,6 @@ next `read_line` overwrites the line, so to keep a part of it (a map's
 key), read all of stdin and take lines with `Scanner::next_line`.
 
 ```tach
-use std::{Buf, Scanner, parse_int, read_line, read_stdin_in, split_whitespace_in};
-
 fn main(gpa: Gpa) -> i32 {
     let mut line = Buf::new_in(gpa);
     defer line.free();
@@ -128,10 +181,13 @@ last|
 
 ## The API
 
-Generated from std's source in this compiler: every public item, with
-its comment. Methods take `self: *T` (called as `v.push(x)` on a place)
-or `self: T` (a copy).
+Generated from std's source in this compiler: every public item a
+program uses, one line each. Methods take `self: *Self` (called as
+`v.push(x)` on a place) or `self: Self` (a copy). Each item with its
+comment: `tachyonc guide std#every-item`; one item's source: `tachyonc
+query show std::Scanner::next_line`.
 
 ```text
 @STD-API@
 ```
+@STD-API-DOC@

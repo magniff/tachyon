@@ -9,6 +9,13 @@ the error is (`a as i32`, `std::trim(s)`, the missing match arms), a
 `use` line, or a `tachyonc` command to run (`tachyonc fix --only unsafe
 main.tach`, `tachyonc edit new-file util.tach main.tach`); VALUE in it
 is yours to fill in.
+An error whose fix the compiler knows exactly (0.18: a did-you-mean with
+one name that near, a conversion, a path from `crate::`, a Rust type or
+label respelled, a missing `use` or `pub`, a missing `gpa` argument)
+also has `try: tachyonc fix --suggested main.tach`: one command makes
+all of them, as one checked edit (`--dry-run` shows the diff, `tachyonc
+undo` takes it back, `--at FILE:LINE` fixes one line's), then prints the
+errors left. Run it instead of editing those lines by hand or with sed.
 KIND is `tokenizer error`, `parser error`, `module error`, `type error`
 or `unsafe`. Fix the first errors first: a parser error can hide
 type errors in the same function. `tachyonc query show FILE:LINE` prints
@@ -33,14 +40,16 @@ use std::collections::HashMap;
 ```err
 error[type error] no 'collections' in module 'std' | help: tachyon's std is one module, without 'collections': its items are `std::NAME` | try: use std::HashMap;
 ```
-std has no submodules: `use std::{HashMap, read_line};`. `use std::io;`
-gets what reads stdin (`read_line`, `read_stdin_in`, `Scanner`).
+std has no submodules: `use std::{IoError, is_digit};` (`HashMap`,
+`read_line` and std's most used names are in the prelude: no `use`).
+`use std::io;` gets what reads stdin (`read_line`, `read_stdin_in`,
+`Scanner`).
 
 ```tach
 fn main() -> i32 { let s = "  a "; let t = s.trim(); 0 }
 ```
 ```err
-error[type error] no method 'trim' on type '[u8]' | help: 'trim' is no method: std's function `trim` takes the value as its first argument | try: std::trim(s)
+error[type error] no method 'trim' on type '[u8]' | help: 'trim' is no method: std's function `trim` takes the value as its first argument | try: trim(s)
 ```
 A method std has as a function (`trim`, `sort`, `parse` as `parse_int`,
 `split_whitespace` as `split_whitespace_in(s, gpa)`) gets the call to
@@ -78,9 +87,10 @@ what replaces `vec!`, `format!`, `assert!` and the others.
 'outer: for i in 0..3 { break 'outer; }
 ```
 ```err
-error[tokenizer error] unterminated character literal
+error[tokenizer error] unterminated character literal | help: a label has no quote: `outer: loop { break :outer; }` | try: outer: for i in 0..3 { break :outer; }
 ```
-Labels have no quote: `outer: for i in 0..3 { break :outer; }`.
+Labels have no quote: `outer: for i in 0..3 { break :outer; }` (the
+try: line is yours, respelled).
 
 ```tach
 let o: Option<i64> = Some(1);
@@ -270,29 +280,48 @@ error[type error] unknown variant 'A'
 `E::A(x)`, or `use E::{A, B};` once.
 
 ```tach
-struct P { x: i64 }
+enum Ev { Key { code: i64, shift: bool }, Quit }
 fn main() -> i32 {
-    let p = P { x: 1 };
-    if p == P { x: 1 } { println("same"); }
-    0
+    let e = Ev::Key(1, false);
+    match e { Ev::Key(c, _) => c as i32, Ev::Quit => 0 }
 }
 ```
 ```err
-error[parser error] expected ';' or '}' after expression, got ':'
+error[type error] variant 'Ev::Key' has named fields; give them by name | try: Ev::Key { code: 1, shift: false }
 ```
-In a condition, parenthesize a struct literal: `if p == (P { x: 1 })`.
+A struct-like variant (0.17) is built and matched by name, as in Rust:
+`Ev::Key { code: 1, shift: false }`, `Ev::Key { code, .. } => code`.
+
+```tach
+enum Ev { Key { code: i64, shift: bool }, Quit }
+fn code(e: Ev) -> i64 {
+    match e { Ev::Key { code } => code, Ev::Quit => 0 }
+}
+```
+```err
+error[type error] the pattern of 'Ev::Key' does not mention field 'shift' | help: match it too, or end the pattern with '..' to leave the rest out | try: Ev::Key { code, .. }
+```
+
+```tach
+enum Ev { Key { code: i64, shift: bool }, Quit }
+fn code(e: Ev) -> i64 { e.code }
+```
+```err
+error[type error] cannot access field 'code' on type 'Ev' | help: a variant's fields are read through a pattern (no '.field' on an enum) | try: if let Ev::Key { code, .. } = e { ... }
+```
 
 ## Slices, Vec, std
 
 ```tach
-let mut v: Vec<i64> = Vec::new_in(gpa);
-v.push(1);
-let a = v[0];
+let mut m: HashMap<i64, i64> = HashMap::new_in(gpa);
+let a = m[0];
 ```
 ```err
-error[type error] cannot index type 'Vec<i64>'
+error[type error] cannot index type 'HashMap<i64, i64>'
 ```
-`v.get(0)`, `v.set(0, x)`, `v.as_slice()[0]`.
+`m.get(0)` (an Option), `m.insert(0, x)`. A `Vec` and a `Buf` index as
+their slice (0.17): `v[0]`, `v[0] = x`, `v[1..3]` are
+`v.as_slice()[0]`, ..., checked.
 
 ```tach
 let n = 3;
@@ -304,18 +333,9 @@ error[type error] 'for' iterates over ranges, slices, arrays, iterators and type
 `for x in 0..n`. A type of yours iterates with `impl Iterator for T`, or
 an `iter` method returning one (`tachyonc guide iterators`).
 
-```tach
-let s = "abc";
-let n = s.len();
-```
-```err
-error[type error] no method 'len' on type '[u8]' | help: `len` is a field of slices: `s.len`
-```
-(`Vec` has the method `len()`.) A misspelt method, field or item gets
-the nearest name of its kind:
+A misspelt method, field or item gets the nearest name of its kind:
 
 ```tach
-use std::Buf;
 fn main(gpa: Gpa) -> i32 { let mut b = Buf::new_in(gpa); b.push_string("x"); 0 }
 ```
 ```err
@@ -329,18 +349,18 @@ fn main() -> i32 { let a = [1, 2, 3]; sum(a) as i32 }
 ```err
 error[type error] expected '[i64]', got '[i64; 3]'
 ```
-`sum(a[..])`. An array has no `.len` either: `a[..].len`.
+`sum(a[..])`. An array's length is `a.len()` (or `a[..].len`).
 
 ```tach
-let b = Buf::new_in(gpa);
+let e: IoError = IoError::Read;
 ```
 ```err
-error[type error] unknown type 'Buf'
+error[type error] unknown type 'IoError'
 ```
-`use std::Buf;` (only the prelude names need no import).
+`use std::IoError;` (the prelude's names need no import: `tachyonc guide
+modules`).
 
 ```tach
-use std::HashMap;
 struct K { a: i64 }
 fn main(gpa: Gpa) -> i32 { let m: HashMap<K, i64> = HashMap::new_in(gpa); 0 }
 ```
@@ -416,7 +436,7 @@ Return `Option<i64>` (or `Result<i64, E>`), or `match` on the value.
 `v.ok_or(MyError::Missing)?`.
 
 ```tach
-use std::{ParseIntError, parse_int};
+use std::ParseIntError;
 enum AppError { Bad }
 fn read(s: [u8]) -> Result<i64, AppError> { let n = parse_int(s)?; Ok(n) }
 ```
@@ -549,12 +569,15 @@ fn main() -> i32 { helper() as i32 }
 error[type error] undefined variable 'helper' | help: add `use crate::m::helper;`
 ```
 Add the `use` line the help names, or run the `try:` line, `tachyonc fix
---only imports main.tach`, which adds every missing one.
+--suggested main.tach`, which adds every missing one (and makes the
+other errors' exact fixes; `fix --only imports`: the imports alone).
 
-In a module other than the root, a path starts in that module: `use
-table::Table;` in check.tach is `unknown module 'table'` when `mod
-table;` is in main.tach; the help says `crate::table::...` and the
-`try:` is the `use` line so written. `mod util;` with no util.tach is
+In a module other than the root, a path starts in that module, or with
+a sibling module, or one of the root (0.17): `use table::Table;` and
+`table::f(x)` in check.tach are `crate::table::...` when `mod table;` is
+in main.tach. A module elsewhere (`crate::a::table`) is `unknown module
+'table'`, whose help says `crate::a::table::...` and whose `try:` is the
+`use` line so written (in code: `use crate::a::table;`). `mod util;` with no util.tach is
 `cannot find the file of module 'util'`, whose `try:` makes it:
 `tachyonc edit new-file util.tach main.tach < util.tach` (the text on
 stdin; the `mod` line that is there stays). A `mod` line for a file that
@@ -564,10 +587,10 @@ is next to a submodule's file belongs in the root.
 fn main() -> i32 { let text = read_to_string(); 0 }
 ```
 ```err
-error[type error] undefined variable 'read_to_string' | help: std reads stdin: `std::read_stdin_in(gpa)` (all of it, a Buf), `std::read_line(&buf)` (one line, Ok(false) at the end), `std::Scanner` (tokens)
+error[type error] undefined variable 'read_to_string' | help: std reads stdin: `read_stdin_in(gpa)` (all of it, a Buf), `read_line(&buf)` (one line, Ok(false) at the end), `Scanner` (tokens)
 ```
-std's items get their `use` line (`add `use std::read_line;``) or the
-nearest std name; an unknown function with neither points to `tachyonc
+std's items outside the prelude get their `use` line (`add `use
+std::is_digit;``) or the nearest std name; an unknown function with neither points to `tachyonc
 guide std`.
 
 ```tach
@@ -648,7 +671,12 @@ fn first(p: *i64) -> i64 { p[1] }
 ```err
 error[unsafe] indexing a raw pointer is unsafe
 ```
-A pointer is one value; for many, take a slice `[i64]`.
+A pointer is one value; for many, take a slice `[i64]`. A pointer to a
+Vec, a Buf or a slice (`v: *Vec<i64>`) indexes what it points to, checked:
+safely through a parameter, in `unsafe` through a raw one (`let p = &v;`:
+index `v`).
+`out[0] = acc` meant to write through the pointer: the error's try: is
+`*out = acc`, safe through a borrow.
 
 ```tach
 fn read(x: *i64) -> i64 { *x }
@@ -677,15 +705,19 @@ fn main() -> i32 { std::print_cstr(c"x"); 0 }
 error[unsafe] calling an `unsafe fn` is unsafe
 ```
 `std::panic`, `print_cstr` and `Buf::push_cstr` take C strings and are
-`unsafe fn`; for literals use `print("x")`.
+`unsafe fn`; for literals use `print("x")`, `panic("x")` (the prelude's,
+safe).
 
 ## At run time
 
-A failed check prints one line on stderr and exits with code 101:
+A failed check prints its message on stderr and exits with code 101:
 `index out of bounds: index I, length N`, `slice range out of bounds:
 ...`, `called unwrap on None`, `called unwrap on Err`, `invalid value V
-for enum E`. Arithmetic never fails (it wraps; `/ 0` is 0). Runaway
-recursion is stopped by the operating system (a signal, no message).
+for enum E`. A note follows (0.17). A program built with `--trace`
+prints, instead, the failing line and the calls that led to it
+(`tachyonc test` builds so; `guide debug`). Arithmetic never fails (it
+wraps; `/ 0` is 0). Runaway recursion is stopped by the operating system
+(a signal, no message).
 
 ```tach
 enum Level { Low, High }
@@ -702,4 +734,5 @@ fn main() -> i32 {
 ```out (exit 101)
 5
 invalid value 3 for enum Level
+note: build with --trace for the line and its callers
 ```

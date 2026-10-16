@@ -19,7 +19,7 @@ Each `// Rust:` line is followed by the tachyon for it.
 
 ```tach
 import "stdio.h" as c;                 // a C header; its names under c::
-use std::{Buf, HashMap, sort};         // Rust: use std::collections::*;  (never *)
+use std::is_digit;                     // Rust: use std::collections::*;  (never *)
 
 struct P { x: i64 }
 
@@ -45,8 +45,7 @@ fn main(gpa: Gpa) -> i32 {             // gpa: the program's allocator; 0 = exit
     defer v.free();                    // Rust: drop at scope end (no destructors)
     v.push(5);
     v.push(2);
-    // Rust: v[0] += 10;
-    v.set(0, v.get(0) + 10);           // or v.as_slice()[0]; both checked
+    v[0] += 10;                        // as Rust: checked (v[1..2] a slice)
     // Rust: v.sort();
     sort(v.as_slice());
     // Rust: let mut p = P { x: 1 }; p.bump();
@@ -54,19 +53,18 @@ fn main(gpa: Gpa) -> i32 {             // gpa: the program's allocator; 0 = exit
     p.bump();                          // passes &p
     // Rust: println!("{} {:?}", p.get(), v);
     println(f"{p.get()} {v:?}");       // no macros: f-strings
-    // Rust: s.len()  on a &str
     let s = "hi";
-    println(s.len);                    // .len is a field of a slice (an i64)
+    println(s.len());                  // an i64; or the field, s.len
     // Rust: let mut b = String::new(); b.push_str("n="); ...
     let mut b = Buf::new_in(gpa);
     defer b.free();
     let o = odds(7, gpa);
     defer o.free();
     b.push_str("n=");
-    b.push_int(o.len());               // .len() is a method of Vec, Buf, HashMap
+    b.push_int(o.len());
     println(b.as_slice());
     // Rust: match s { "hi" => ..., _ => ... }
-    if s == "hi" { println(first(s)); }    // strings are compared, not matched
+    if s == "hi" && !is_digit(first(s)) { println(first(s)); }   // compared, not matched
     // Rust: *m.entry(k).or_insert(0) += 1;
     let mut m: HashMap<[u8], i64> = HashMap::new_in(gpa);
     defer m.free();
@@ -76,6 +74,7 @@ fn main(gpa: Gpa) -> i32 {             // gpa: the program's allocator; 0 = exit
     println(f"{~0u8} {7 / z} {m.get("k").unwrap()}");   // ~x; no methods on numbers; x / 0 == 0
     // Rust: libc::puts(...) in unsafe -- the same: C calls need unsafe
     unsafe { c::puts(c"from C"); }     // c"..": a NUL-terminated *u8
+    if z != 0 { panic("z"); }          // Rust: panic!("z"): exit 101; unreachable()
     0
 }
 ```
@@ -91,19 +90,21 @@ from C
 Also: `usize` is `i64` (lengths, indices); integers wrap; `a as i32`
 narrows, widening is implicit; `x?`, closures, `impl Trait for T`, `T:
 Trait`, `#[derive(Eq, Debug)]` are Rust's; no `dyn`, `where`, `Box` (a
-`Vec` or `*T`). Arguments may have defaults and names: `fn f(a: i64, b:
-i64 = 2)`, `f(1, b: 3)`. The prelude has `Option`, `Result`, `Vec`,
-`print`, `println`, `format_in`, `Gpa`; the rest of std is
-`use std::{...}`.
+`Vec` or `*T`); `&mut x` is `&x`, and `p.0`, `p.x` reach through a
+pointer. Arguments may have defaults and names: `fn f(a: i64, b: i64 =
+2)`, `f(1, b: 3)`. The prelude (no `use`) has `Option`, `Result`, `Vec`,
+`Buf`, `HashMap`, `print`, `println`, `format_in`, `Gpa`, `read_line`,
+`read_stdin_in`, `Scanner`, `parse_int`, `trim`, `split_in`,
+`split_whitespace_in`, `sort`, `sort_by`, `sort_stable_by`, `cmp_of`, `Fmt`, `panic`,
+`unreachable`; the rest of std is `use std::{...}`; `use lexer::Tok;`
+in a module reaches its sibling `lexer`.
 
 ## std: what programs use most
 
 ```tach
-use std::{HashMap, Scanner, read_stdin_in, parse_int, trim, split_in};
-
 struct Item { name: [u8], qty: i64 }
 
-fn add(v: *Vec<Item>, it: Item) { v.push(it); }   // Rust: v: &mut Vec<Item>; call add(&v, ..)
+fn add(v: *Vec<Item>, it: Item) { v.push(it); }   // Rust: v: &mut Vec<Item>; add(&mut v, ..)
 
 fn main(gpa: Gpa) -> i32 {
     let input = read_stdin_in(gpa).unwrap();   // all of stdin: Result<Buf, IoError>
@@ -114,7 +115,7 @@ fn main(gpa: Gpa) -> i32 {
     for _ in 0..n {
         let name = sc.next_token().unwrap();   // Option<[u8]>: a slice of input
         let qty = sc.next_int().unwrap_or(0);
-        add(&items, Item { name: name, qty: qty });
+        add(&mut items, Item { name: name, qty: qty });
         seen.insert(name, qty);                // also contains(k), remove(k)
     }
     items.sort_by(|a, b| b.qty - a.qty);       // a, b: *Item; < 0: a first
@@ -142,8 +143,8 @@ fn main(gpa: Gpa) -> i32 {
 Lines one at a time: `let mut b = Buf::new_in(gpa); while
 read_line(&b).unwrap() { ... }` (without the `'\n'`). `Vec`, `Buf`,
 `HashMap` are handles: `let w = v;` copies the pointer, not the
-elements. The whole API: `tachyonc guide std` or `tachyonc query items
-std`; one item: `tachyonc query show std::Scanner`.
+elements. std's API, a line per item: `tachyonc guide std`; one name
+with its comment: `tachyonc guide --find split_in`.
 
 ## The first errors and their fixes
 
@@ -151,8 +152,7 @@ std`; one item: `tachyonc query show std::Scanner`.
 |---|---|
 | `non-exhaustive match: 'E::B' is not covered` | an arm for it, or `_ =>` |
 | `calling a C function is unsafe`; `dereference of a raw pointer is unsafe` | `unsafe { ... }`; `tachyonc fix --only unsafe` adds them |
-| `no 'collections' in module 'std'`; `unknown type 'String'` | std is one module: `use std::{HashMap, Buf};`; text is `[u8]` |
-| `no method 'len' on type '[u8]'` | `s.len`, a field |
+| `no 'collections' in module 'std'`; `unknown type 'String'` | std is one module: `use std::name;` (its most used names need none); text is `[u8]`, built in a `Buf` |
 | `allocation is explicit: pass an allocator` | `Vec::new_in(gpa)`, `gpa` from `fn main(gpa: Gpa)` passed down |
 
 Every error has a `help:`; `tachyonc guide errors` has more.

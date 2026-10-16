@@ -1,9 +1,9 @@
 ## tachyonc fix (tests/refactor/fixes/): missing imports (the second
 ## of a statement found by a second round), unused imports, pub, unsafe.
 $ check
-main.tach:15:25: error[type error] undefined variable 'twice' | help: add `use crate::util::twice;` | try: tachyonc fix --only imports main.tach
+main.tach:15:25: error[type error] undefined variable 'twice' | help: add `use crate::util::twice;` | try: tachyonc fix --suggested main.tach
 main.tach:17:13: error[unsafe] calling a C function is unsafe | help: put it in an `unsafe { ... }` block, or the function's body in an `unsafe fn` (the try: line wraps every such place) | try: tachyonc fix --only unsafe main.tach
-main.tach:18:13: error[type error] 'hidden' is private | help: make it public: `pub fn hidden` at util.tach:19:1 | try: tachyonc fix --only pub main.tach
+main.tach:18:13: error[type error] 'hidden' is private | help: make it public: `pub fn hidden` at util.tach:19:1 | try: tachyonc fix --suggested main.tach
 [exit 1]
 $ fix --dry-run
 --- a/main.tach
@@ -85,5 +85,5 @@ $ undo
 undid fixed 2 missing imports, 3 unused imports, 1 pub, 1 unsafe block	3 files	+4 -8 lines
 % git status --short
 $ fix --only nonsense
-error fix.usage: --only takes imports, unused, pub, unsafe, tidy-imports, reexports, std015 or alloc016, not 'nonsense'
+error fix.usage: --only takes imports, unused, pub, unsafe, suggested, tidy-imports, reexports, std015 or alloc016, not 'nonsense'
 [exit 2]

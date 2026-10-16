@@ -20,8 +20,9 @@ small queries.
    prints the lines on it.
 2. Fix each error: `tachyonc query show FILE:LINE` prints the item at
    the error's position; `tachyonc edit patch` changes a few lines of it.
-3. `tachyonc fix` for the mechanical ones (missing `use` lines, unsafe
-   blocks, `pub`).
+3. `tachyonc fix --suggested` when errors have `try: tachyonc fix
+   --suggested main.tach` (0.18): their exact fixes, one checked edit,
+   then the errors left; `tachyonc fix` for unsafe blocks.
 4. Build and run: `tachyonc main.tach -o prog && ./prog`.
 
 ## The program
@@ -107,6 +108,7 @@ an edit then `check`.
 | move items to a module | `tachyonc refactor move PATH --to MODULE` (made when missing) |
 | an idiom everywhere, typed | `tachyonc rewrite 'old($a)' 'new($a)' --dry-run` |
 | imports, unused, pub, unsafe | `tachyonc fix` (`--only imports,unused,pub,unsafe`, `--dry-run`) |
+| the errors' exact fixes (their `try: tachyonc fix --suggested`) | `tachyonc fix --suggested` (`--dry-run`, `--at FILE:LINE`) |
 
 Every edit is atomic: the edited program is checked first, and an edit
 that adds an error writes nothing and prints the errors, each tagged
@@ -141,6 +143,15 @@ out. In the tachyon tree, `tachyonc test FILTER` rebuilds
 `target/tachyonc` when the source is newer and runs `tests/run.sh
 FILTER`, summarized the same way.
 
+## Debugging
+
+A bug: `tachyonc guide debug`. Tests are built with `--trace`, so a crash
+or a hang prints its line and callers. `tachyonc probe FILE:LINE EXPR...
+--input FILE` prints values at a line without editing the source.
+`tachyonc reduce FILE --until 'CMD'` shrinks a failing input. In the
+tachyon tree, `tachyonc test FILTER` also runs each failure with
+`target/tools/tachyonc`, to tell new failures from old ones.
+
 ## Diagnostics
 
 Compiler errors, from `tachyonc check` or a build whose output is not a
@@ -165,5 +176,6 @@ Exit status: 0 done, 1 refused or failed (nothing written), 2 usage.
 
 `-O0`, `-O1`, `-O2` (the default; all behave the same), `--target
 aarch64-macos|aarch64-linux|x86_64-linux|x86_64-macos`, `-g` (debug line
-tables), `--check-unsafe`, `--check-alloc` (0.16), `--emit-header`,
+tables), `--trace` (0.17: a failure prints its line and callers),
+`--check-unsafe`, `--check-alloc` (0.16), `--emit-header`,
 `--emit-imports`, `-I DIR`, `--version`. `tachyonc guide TOPIC` for the language.

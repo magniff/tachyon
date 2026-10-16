@@ -4,7 +4,10 @@
 
 use crate::base::_setjmp;
 use crate::base::diag::{RECOVER_DEPTH, error_at, recover_enter, recover_leave};
-use crate::front::ast::{NODES, NodeKind, SCRATCH, list_begin, list_end, list_push, new_node};
+use crate::front::ast::{
+    FIELD_SHORTHAND, NODES, NodeKind, PAT_FIELDS, PAT_PARENS, PAT_REST, SCRATCH, list_begin,
+    list_end, list_push, new_node,
+};
 use crate::front::lexer::{TOKS, Tok};
 use crate::front::lexer::Tok::{
     Char, Colon, ColonColon, Comma, Const, Defer, DotDot, DotDotEq, Enum, Eof, Eq, Extern, False,
@@ -202,7 +205,7 @@ fn parse_pattern_literal() -> i64 {
         let operand = parse_primary();
         return make_unary(Minus, operand, start);
     }
-    if at(Ident) {
+    if at(Ident) && tok_kind(1) != ColonColon {
         let n = new_node(NodeKind::Ident, start, 0);
         unsafe {
             NODES[n].a = expect_ident();
@@ -269,6 +272,7 @@ pub fn parse_single_pattern() -> i64 {
             NODES[n].b = expect_ident();
             NODES[n].d = 1;
             NODES[n].c = 1;
+            NODES[n].p |= PAT_PARENS;
             expect(LParen);
             let mark = list_begin();
             while !at(RParen) && !at(Eof) {
@@ -282,13 +286,18 @@ pub fn parse_single_pattern() -> i64 {
             NODES[n].end = prev_end();
             return n;
         }
+        if at(Ident) && tok_kind(1) == LBrace {
+            // `V { a, .. }` (0.17): a variant brought into scope by `use`.
+            let n = new_node(NodeKind::PatVariant, start, 0);
+            NODES[n].b = expect_ident();
+            NODES[n].d = 1;
+            parse_pattern_fields(n);
+            return n;
+        }
         if at(Ident) {
             let n = new_node(NodeKind::PatBind, start, 0);
             NODES[n].a = expect_ident();
             NODES[n].end = prev_end();
-            if at(LBrace) {
-                error_at(cur_start(), c"struct patterns are not supported; enum variants are written 'Enum::Variant(...)'");
-            }
             return n;
         }
         if at(LParen) {
@@ -325,8 +334,11 @@ fn parse_variant_pattern(start: i64) -> i64 {
         }
         NODES[n].a = name;
         NODES[n].b = member;
-        if eat(LParen) {
+        if at(LBrace) {
+            parse_pattern_fields(n);
+        } else if eat(LParen) {
             NODES[n].c = 1;
+            NODES[n].p |= PAT_PARENS;
             let mark = list_begin();
             while !at(RParen) && !at(Eof) {
                 list_push(parse_pattern());
@@ -344,16 +356,66 @@ fn parse_variant_pattern(start: i64) -> i64 {
                 error_at(cur_start(), c"exclusive range patterns are not supported; use 'a..=b'");
             }
             advance();
-            if !(at(Ident) && tok_kind(1) == ColonColon) {
-                syntax_error(c"expected the last variant of the range ('E::V')");
-            }
             let r = new_node(NodeKind::PatRange, start, 0);
             NODES[r].a = n;
-            NODES[r].b = parse_variant_pattern(cur_start());
+            if at(Ident) && tok_kind(1) == ColonColon {
+                NODES[r].b = parse_variant_pattern(cur_start());
+            } else {
+                // (0.17) `i8::MIN..=-1`: a constant's path (made a Path
+                // by the checker when the value is an integer)
+                if !(at_literal_pattern() || at(Ident)) {
+                    syntax_error(c"expected the end of the range pattern");
+                }
+                NODES[r].b = parse_pattern_literal();
+            }
             NODES[r].end = prev_end();
             return r;
         }
         n
+    }
+}
+
+// (0.17) The fields of a variant's pattern `{ a, b: p, mut c, .. }`, after
+// its name: FieldInit nodes in n's list (a: the name, b: the pattern; `a`
+// alone binds a), n flagged PAT_FIELDS (and PAT_REST with `..`).
+fn parse_pattern_fields(n: i64) {
+    unsafe {
+        expect(LBrace);
+        NODES[n].c = 1;
+        NODES[n].p |= PAT_FIELDS;
+        let mark = list_begin();
+        while !at(RBrace) && !at(Eof) {
+            if at(DotDot) {
+                advance();
+                NODES[n].p |= PAT_REST;
+                if !at(RBrace) {
+                    syntax_error(c"expected '}' after '..' (it comes last in a variant's pattern)");
+                }
+                break;
+            }
+            let start = cur_start();
+            let field = new_node(NodeKind::FieldInit, start, 0);
+            let mutable = eat(Mut);
+            NODES[field].a = expect_binding_name();
+            if !mutable && eat(Colon) {
+                NODES[field].b = parse_pattern();
+            } else {
+                // `a` (or `mut a`): `a: a`
+                let bind = new_node(NodeKind::PatBind, start, prev_end());
+                NODES[bind].a = NODES[field].a;
+                NODES[bind].b = mutable as i64;
+                NODES[field].b = bind;
+                NODES[field].p |= FIELD_SHORTHAND;
+            }
+            NODES[field].end = prev_end();
+            list_push(field);
+            if !eat(Comma) {
+                break;
+            }
+        }
+        list_end(n, mark);
+        expect(RBrace);
+        NODES[n].end = prev_end();
     }
 }
 

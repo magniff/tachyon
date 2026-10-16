@@ -30,5 +30,7 @@ the edited program checked before anything is written, a journal for
 | `commands.tach` | the table of the commands that change a program; `run_command`, every tool command (main, batch) |
 | `fmt/` | `tachyonc fmt` (0.13, docs/fmt.md): the pieces of a text (`pieces`), lines and levels (`layout`), wrapping (`wrap`), `use` runs (`uses`); the edit engine formats its edits with it |
 | `help.tach` | `--help` on every command (0.15): the tools table's rows for it |
+| `probe/` | `tachyonc probe` (0.17): a program run with values printed at lines, from copies of its files (`--overlay`): where each probe goes and the command line (`mod`), the code written in (`code`), the run and its report (`run`) |
+| `reduce.tach` | `tachyonc reduce` (0.17): a failing input made small, line by line |
 | `snippet.tach` | `tachyonc try` (0.15): a snippet compiled and run with std, its value printed |
 | `explain/` | `tachyonc explain CODE` (0.13): the table of every diagnostic code (`tools_table`, `refactor_table`) |
