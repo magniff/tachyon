@@ -32,6 +32,8 @@ Everything else is raw: a local holding a pointer, a pointer field,
 unsafe (a borrow is one value, not an array), except that `p[i]` on a
 borrow of a Vec, a Buf or a slice (`dist: *Vec<i64>`) is `(*p)[i]`: safe,
 checked. On a raw pointer to one it is pointer arithmetic: write `(*p)[i]`.
+`p[0]` on any other pointer is pointer arithmetic too: the value it
+points to is `*p` (`*out = acc`), safe through a borrow.
 
 ```tach
 extern "C" {

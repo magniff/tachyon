@@ -1544,7 +1544,9 @@ borrow of a Vec, a Buf or a slice (a pointer parameter, `&v`), `p[i]` and
 `p[a..b]` index the pointee (`p.as_slice()[i]`, `(*p)[i]`), checked and
 safe, as `p.get(i)` is. On a raw pointer they stay pointer arithmetic
 (`unsafe`; the error names `(*p)[i]`, the element, instead of an `unsafe`
-block).
+block). `p[0]` on a pointer to anything else is pointer arithmetic as
+well; through a borrow its error names `*p`, the value it points to
+(`try: *out = acc` for `out[0] = acc`).
 
 **Through a pointer.** `p.0` on a `*(A, B)` is `(*p).0`, as `p.x` on a
 `*S` is `(*p).x`: safe when `p` is a borrow (a parameter, `&x`),
