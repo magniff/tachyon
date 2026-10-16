@@ -52,7 +52,7 @@ registers), AT&T syntax on x86-64. Placeholders in angle brackets:
 | `<d>` | the result's register |
 | `<t>` | the instruction temporary: v31 / xmm15 (x17 / r11 for a general register) |
 | `<NAME>` | parameter NAME's register, or an immediate's value |
-| `<NAME:M>` | a view of the register: `w` (32-bit), `x` (64-bit) general register; on AArch64 `b h s d q`, a vector register's scalar view |
+| `<NAME:M>` | a view of the register: `w` (32-bit), `x` (64-bit) general register; on AArch64 `b h s d q`, a vector register's scalar view; for an immediate, a digit scales it (`#<n:2>`: ext's lane count in bytes) |
 | `<_d>`, `<_t>` | the result and the temporary, when a parameter is named d or t |
 
 Instructions are separated by `; ` (a result moved between register
@@ -97,17 +97,37 @@ AArch64 (`insn_a64.def`), for the mnemonics the scalar encoder
     mnemonic | class | bits | syntax
 
 `bits` is the encoding with the class's fields zero; `syntax` is
-documentation. The classes (`back/enc_arm64/simd.tach`):
+documentation. With vector operands (and SIMD scalar ones, `d0`), the
+encoder reads this table before its own chain: a mnemonic may have
+several lines, consecutive, and the first whose class fits the operands
+encodes them (`cmeq` against `#0` is a line here, against a register the
+chain's). The classes (`back/enc_arm64/simd.tach`):
 
 | class | operands | fields added |
 |---|---|---|
-| `same3` | `Vd.T, Vn.T, Vm.T` | Q, size, Rm, Rn, Rd |
+| `same3` | `Vd.T, Vn.T, Vm.T` | Q, size (from Vd), Rm, Rn, Rd |
+| `same3f` | the same, float | Q, sz (bit 22), Rm, Rn, Rd |
+| `diff3` | `Vd.Ta, Vn.Tb, Vm.Tb` (long, wide, narrow) | Q and size of the narrowest arrangement, Rm, Rn, Rd |
+| `misc2` | `Vd.T, Vn.T[, #0]` | Q and size of the narrowest arrangement, Rn, Rd |
+| `misc2f` | the same, float (`#0.0`) | Q of the narrowest, sz of the widest, Rn, Rd |
 | `across` | `<V>d, Vn.T` | Q, size, Rn, Rd |
+| `acrossf` | the same, float | Q, Rn, Rd |
 | `umov` | `Wd\|Xd, Vn.Ts[i]` | Q (for .d), imm5, Rn, Rd |
 | `tbl` | `Vd.T, {Vn.16b, ...}, Vm.T` | Q, Rm, len - 1, Rn, Rd |
 | `ext` | `Vd.T, Vn.T, Vm.T, #index` | Q, Rm, imm4, Rn, Rd |
-| `shrn` | `Vd.Tb, Vn.Ta, #shift` | Q, immh:immb = 2 * esize - shift, Rn, Rd |
-| `crc` | `Wd, Wn, Wm\|Xm` | Rm, Rn, Rd |
+| `shrn` | `Vd.T, Vn.T, #shift`: right shifts, narrowing ones too | Q, immh:immb = 2 * esize - shift (esize of the narrowest) |
+| `shl` | `Vd.T, Vn.T, #shift`: left shifts, widening ones too | Q, immh:immb = esize + shift (esize of the narrowest) |
+| `elem` | `Vd.T, Vn.T, Vm.Ts[i]` (also `Vm.4b[i]`) | Q, size, H:L:M, Rm, Rn, Rd |
+| `same3s`, `misc2s`, `misc2fs`, `shrns`, `shls` | the scalar forms, `<V>d, <V>n, ...` (`sqadd d0, d1, d2`: a 64-bit vector of one 64-bit lane) | as the vector class, size from the register's letter; bits are the vector bits \| 0x50000000 |
+| `rr` | `Rd, Rn` (any registers: crypto) | Rn, Rd |
+| `rrr`, `crc` | `Rd, Rn, Rm` | Rm, Rn, Rd |
+| `rrrr` | `Vd, Vn, Vm, Va` (`eor3`, `bcax`) | Rm, Ra, Rn, Rd |
+| `xar` | `Vd, Vn, Vm, #imm6` | Rm, imm6, Rn, Rd |
+
+The regular AArch64 families (every type and arrangement of an
+operation) are written by `tools/arch/a64_families.py --write`, between
+the `# ==== generated` markers of `aarch64.def` and `insn_a64.def`: change
+a family there, not its lines; lines outside the markers are kept.
 
 x86-64 (`insn_x86.def`), for the mnemonics `back/enc_x86.tach`'s own
 table lacks:
