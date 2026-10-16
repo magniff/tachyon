@@ -32,6 +32,7 @@ pub extern "C" {
     fn exit(code: i32) -> !;
     fn getenv(name: *u8) -> *u8;
     fn realpath(path: *u8, resolved: *u8) -> *u8;
+    fn getcwd(buf: *u8, size: u64) -> *u8;
 }
 
 pub const STDOUT: i32 = 1;
@@ -722,9 +723,81 @@ pub fn root_dir() -> *u8 {
     }
 }
 
+// (0.18) The root's directory as out_path compares with (normal_path's,
+// once), and the current directory, read once.
+static mut ROOT_LEX: *u8 = 0 as *u8;
+
+static mut ROOT_LEX_ABS: bool = false;
+static mut CWD: *u8 = 0 as *u8;
+
+// path normal by its text: empty and "." components dropped, ".."
+// taking the component before it away (kept at the start of a relative
+// path). With `absolute`, a relative path is first put after the current
+// directory (read once). Symbolic links are not followed, so two
+// spellings of a file through the same links agree.
+fn normal_path(path: *u8, absolute: bool) -> *u8 {
+    unsafe {
+        let full = buf_new();
+        if absolute && path[0] != '/' {
+            if CWD == 0 as *u8 {
+                let b = alloc_zeroed(4096);
+                CWD = if getcwd(b, 4096) != 0 as *u8 { b } else { c"/" };
+            }
+            buf_str(full, CWD);
+            buf_byte(full, '/');
+        }
+        buf_str(full, path);
+        let s = BUFS[full].data;
+        let n = BUFS[full].len;
+        let rooted = s[0] == '/';
+        let out = buf_new();
+        // where each kept component starts in out, and whether it is ".."
+        let mut starts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut ups = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut i = 0;
+        while i < n {
+            while i < n && s[i] == '/' {
+                i += 1;
+            }
+            let a = i;
+            while i < n && s[i] != '/' {
+                i += 1;
+            }
+            let len = i - a;
+            if len == 0 || (len == 1 && s[a] == '.') {
+                continue;
+            }
+            let up = len == 2 && s[a] == '.' && s[a + 1] == '.';
+            if up && starts.count > 0 && ups.data[ups.count - 1] == 0 {
+                BUFS[out].len = starts.data[starts.count - 1];
+                starts.count -= 1;
+                ups.count -= 1;
+                continue;
+            }
+            if up && rooted {
+                continue;
+            }
+            starts.push(BUFS[out].len);
+            ups.push(if up { 1 } else { 0 });
+            if rooted || BUFS[out].len > 0 {
+                buf_byte(out, '/');
+            }
+            buf_bytes(out, s[a..i]);
+        }
+        if rooted && BUFS[out].len == 0 {
+            buf_byte(out, '/');
+        }
+        buf_byte(out, 0);
+        free(starts.data as *u8);
+        free(ups.data as *u8);
+        BUFS[out].data
+    }
+}
+
 // The path of file `file` relative to the root's directory (see
-// OUT_PATHS); a file that cannot be resolved keeps its path, without a
-// leading "./".
+// OUT_PATHS). Both are made normal by their text (normal_path): no
+// call of realpath or getcwd per file, which walk the directories above
+// the current one on some systems.
 pub fn out_path(file: i64) -> *u8 {
     unsafe {
         let path = FILES[file].path;
@@ -737,40 +810,56 @@ pub fn out_path(file: i64) -> *u8 {
         if OUT_PATHS.data[file] != 0 {
             return OUT_PATHS.data[file] as *u8;
         }
-        let dir = root_dir();
-        let abs = realpath(path, 0 as *u8);
-        let mut made = if path[0] == '.' && path[1] == '/' { &path[2] } else { path };
-        if abs != 0 as *u8 && dir[0] == '/' {
-            // the longest common prefix of whole components
-            let mut i = 0;
-            let mut last = 0;
-            while abs[i] != 0 && abs[i] == dir[i] {
-                if abs[i] == '/' {
-                    last = i + 1;
-                }
-                i += 1;
+        // Both relative (the usual case: the modules' paths are made from
+        // the root's) need no current directory; else both absolute.
+        let absolute = FILES[0].path[0] == '/' || path[0] == '/';
+        if ROOT_LEX == 0 as *u8 || ROOT_LEX_ABS != absolute {
+            // the root's directory: its normal path up to the last '/'
+            // ("/" for a root at the top, "" for one in the current
+            // directory)
+            let r = normal_path(FILES[0].path, absolute);
+            let mut cut = strlen(r) as i64;
+            while cut > 0 && r[cut] != '/' {
+                cut -= 1;
             }
-            let out = buf_new();
-            if dir[i] == 0 && abs[i] == '/' {
-                // under the root's directory
-                last = i + 1;
-            } else if dir[last] != 0 {
-                // one "../" for each component of dir after the common
-                // prefix (last <= i: within dir)
-                buf_str(out, c"../");
-                let mut k = last;
-                while dir[k] != 0 {
-                    if dir[k] == '/' {
-                        buf_str(out, c"../");
-                    }
-                    k += 1;
-                }
+            if r[cut] != '/' {
+                r[0] = 0;
+            } else {
+                r[if cut > 0 { cut } else { 1 }] = 0;
             }
-            buf_str(out, &abs[last]);
-            buf_byte(out, 0);
-            made = BUFS[out].data;
-            free(abs);
+            ROOT_LEX = r;
+            ROOT_LEX_ABS = absolute;
         }
+        let dir = ROOT_LEX;
+        let abs = normal_path(path, absolute);
+        // the longest common prefix of whole components
+        let mut i = 0;
+        let mut last = 0;
+        while abs[i] != 0 && abs[i] == dir[i] {
+            if abs[i] == '/' {
+                last = i + 1;
+            }
+            i += 1;
+        }
+        let out = buf_new();
+        if dir[i] == 0 && abs[i] == '/' {
+            // under the root's directory
+            last = i + 1;
+        } else if dir[last] != 0 {
+            // one "../" for each component of dir after the common prefix
+            // (last <= i: within dir)
+            buf_str(out, c"../");
+            let mut k = last;
+            while dir[k] != 0 {
+                if dir[k] == '/' {
+                    buf_str(out, c"../");
+                }
+                k += 1;
+            }
+        }
+        buf_str(out, &abs[last]);
+        buf_byte(out, 0);
+        let made = BUFS[out].data;
         OUT_PATHS.data[file] = made as i64;
         made
     }
