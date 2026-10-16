@@ -733,6 +733,6 @@ fn main() -> i32 {
 ```
 ```out (exit 101)
 5
-invalid value 3 for enum Level
+main.tach:7:13: invalid value 3 for enum Level
 note: build with --trace for the line and its callers
 ```
