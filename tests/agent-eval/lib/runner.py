@@ -1,6 +1,7 @@
 """`run.py run`: every (task, condition, rep) in a fresh workspace, the
 agent, then the grading; one result.json per run, resumable."""
 
+import hashlib
 import json
 import os
 import re
@@ -373,8 +374,12 @@ def main(args):
     out = os.path.abspath(args.out or os.path.join(
         DEFAULT_RESULTS_DIR, time.strftime("%Y%m%d-%H%M%S")))
     os.makedirs(out, exist_ok=True)
+    # (0.17 iterations) the default root is named by the run's whole --out
+    # path, not its last part: two runs with --out .../a/claude-haiku and
+    # .../b/claude-haiku shared a root, its compiler copy and hooks
     ws_root = os.path.realpath(args.ws_root or os.path.join(
-        os.environ.get("TMPDIR", "/tmp"), "tachyon-eval", os.path.basename(out)))
+        os.environ.get("TMPDIR", "/tmp"), "tachyon-eval", "%s-%s" % (
+            os.path.basename(out), hashlib.sha1(os.path.abspath(out).encode()).hexdigest()[:8])))
     repo = os.path.realpath(REPO_ROOT)
     if ws_root == repo or ws_root.startswith(repo + os.sep):
         raise SystemExit("workspaces must be outside the repository: %s" % ws_root)
@@ -404,7 +409,7 @@ def main(args):
         ref, sha = ctasks.resolve_base(t, args.base)
         builder = ctasks.builder_for(sha, args.builder)
         say("%s: base %s (%s), building the starter" % (t.id, ref, sha[:12]))
-        st = ctasks.built_tree(t, sha, builder, ws_root)
+        st = ctasks.built_tree(t, sha, builder, os.path.dirname(ws_root))  # cached by commit, shared
         ctx["ctasks"][t.id] = {"ref": ref, "sha": sha, "builder": builder, "starter": st,
                                "version": tool_version(os.path.join(st, "target"), "tach")}
     if any(c.guide == "full" for c in cs):

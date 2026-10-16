@@ -1,6 +1,7 @@
 """Builds a workspace with the fixed command, runs the hidden tests and
 check.sh: the grading of the format spec."""
 
+import filecmp
 import os
 import shutil
 import subprocess
@@ -19,7 +20,8 @@ def prepare_bins(root, tachyonc):
     os.makedirs(bins["tach"], exist_ok=True)
     os.makedirs(bins["rust"], exist_ok=True)
     tc = os.path.join(bins["tach"], "tachyonc")
-    if not os.path.exists(tc):
+    # (0.17 iterations) a copy that differs from --tachyonc is replaced
+    if not os.path.exists(tc) or not filecmp.cmp(tc, tachyonc, shallow=False):
         if not os.path.isfile(tachyonc):
             raise SystemExit("no tachyon compiler at %s (--tachyonc PATH)"
                              % tachyonc)
