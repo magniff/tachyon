@@ -1,0 +1,179 @@
+// (0.21) x86-64 atomics (docs/design/concurrency.md §4.4; compiled and
+// object-checked, not run: the user's no-x86-testing rule). Loads are
+// plain moves (TSO), stores too but SeqCst ones (xchg); swap is xchg, CAS
+// and fetch_add/sub lock cmpxchg and lock xadd; the other read-modify-
+// writes a lock cmpxchg loop. One ATOMIC is one sequence written here:
+// r10 and r11 are the temporaries inside one instruction, and rax, which
+// cmpxchg needs, is kept free by the register allocator across an ATOMIC
+// that uses it (atomic_needs_rax). Fences: mfence for SeqCst, nothing for
+// the others (a compiler barrier).
+
+use crate::middle::ctx::FnCtx;
+use crate::back::mc_x86_64::{mx_normalize, mx_rs};
+use crate::front::types::{TY_I16, TY_I32, TY_I8, type_size};
+use crate::gen0::target::{emit_label, local_prefix, new_label, o, oi, on};
+use crate::middle::ir::atomic::{
+    ATOMIC_ADD, ATOMIC_AND, ATOMIC_CAS, ATOMIC_LOAD, ATOMIC_NAND, ATOMIC_OR, ATOMIC_SMAX,
+    ATOMIC_SMIN, ATOMIC_STORE, ATOMIC_SUB, ATOMIC_SWAP, ATOMIC_UMAX, ATOMIC_XOR, FENCE_COMPILER,
+    ORD_SEQCST,
+};
+
+// Whether an ATOMIC of `kind` needs rax (cmpxchg).
+pub fn atomic_needs_rax(kind: i64) -> bool {
+    kind != ATOMIC_LOAD && kind != ATOMIC_STORE && kind != ATOMIC_SWAP && kind != ATOMIC_ADD
+        && kind != ATOMIC_SUB
+}
+
+// The operand-size suffix: b w l q.
+fn suffix(mut cx: *FnCtx, size: i64) {
+    unsafe {
+        o(cx, if size == 1 { c"b" } else if size == 2 { c"w" } else if size == 4 { c"l" }
+            else { c"q" });
+    }
+}
+
+// "    <m><suffix> %r, (%a)\n"
+fn to_mem(mut cx: *FnCtx, m: *u8, size: i64, r: i64, a: i64) {
+    unsafe {
+        o(cx, c"    ");
+        o(cx, m);
+        suffix(cx, size);
+        o(cx, c" ");
+        mx_rs(cx, r, size);
+        o(cx, c", (");
+        mx_rs(cx, a, 8);
+        o(cx, c")");
+        on(cx);
+    }
+}
+
+// "    <m> %a, %b\n" on 64-bit registers.
+fn rr(mut cx: *FnCtx, m: *u8, a: i64, b: i64) {
+    unsafe {
+        o(cx, c"    ");
+        o(cx, m);
+        o(cx, c" ");
+        mx_rs(cx, a, 8);
+        o(cx, c", ");
+        mx_rs(cx, b, 8);
+        on(cx);
+    }
+}
+
+// r = the zero-extended value of `size` bytes at (a).
+fn load_zx(mut cx: *FnCtx, size: i64, r: i64, a: i64) {
+    unsafe {
+        o(cx, if size == 1 { c"    movzbl (" } else if size == 2 { c"    movzwl (" }
+            else if size == 4 { c"    movl (" } else { c"    movq (" });
+        mx_rs(cx, a, 8);
+        o(cx, c"), ");
+        mx_rs(cx, r, if size == 8 { 8 } else { 4 });
+        on(cx);
+    }
+}
+
+// r = its low `size` bytes, zero-extended.
+fn zero_extend(mut cx: *FnCtx, size: i64, r: i64) {
+    unsafe {
+        if size == 8 {
+            return;
+        }
+        o(cx, if size == 1 { c"    movzbl " } else if size == 2 { c"    movzwl " }
+            else { c"    movl " });
+        mx_rs(cx, r, size);
+        o(cx, c", ");
+        mx_rs(cx, r, 4);
+        on(cx);
+    }
+}
+
+// r10 = the canonical form of the value of type ty in rax's low bytes.
+fn canonical_r10(mut cx: *FnCtx, ty: i64, size: i64) {
+    unsafe {
+        if ty == TY_I8 || ty == TY_I16 || ty == TY_I32 {
+            o(cx, if ty == TY_I8 { c"    movsbq %al, %r10\n" }
+                else if ty == TY_I16 { c"    movswq %ax, %r10\n" }
+                else { c"    movslq %eax, %r10\n" });
+        } else {
+            rr(cx, c"movq", 0, 10);
+            zero_extend(cx, size, 10);
+        }
+    }
+}
+
+// The ATOMIC of `kind` and `order` on a value of IR type ty: address in
+// a, value (CAS: the new one) in b, CAS's expected value in c, the old
+// value into d (d < 0: none).
+pub fn mx_atomic(mut cx: *FnCtx, kind: i64, order: i64, ty: i64, d: i64, a: i64, b: i64, c: i64) {
+    unsafe {
+        let size = type_size(ty);
+        let mut result = 11;
+        if kind == ATOMIC_LOAD {
+            load_zx(cx, size, 11, a);
+        } else if kind == ATOMIC_STORE {
+            if order == ORD_SEQCST {
+                rr(cx, c"movq", b, 11);
+                to_mem(cx, c"xchg", size, 11, a);
+            } else {
+                to_mem(cx, c"mov", size, b, a);
+            }
+            return;
+        } else if kind == ATOMIC_SWAP {
+            rr(cx, c"movq", b, 11);
+            to_mem(cx, c"xchg", size, 11, a);
+        } else if kind == ATOMIC_ADD || kind == ATOMIC_SUB {
+            rr(cx, c"movq", b, 11);
+            if kind == ATOMIC_SUB {
+                o(cx, c"    negq %r11\n");
+            }
+            to_mem(cx, c"lock xadd", size, 11, a);
+        } else if kind == ATOMIC_CAS {
+            rr(cx, c"movq", c, 0);
+            rr(cx, c"movq", b, 11);
+            to_mem(cx, c"lock cmpxchg", size, 11, a);
+            result = 0;
+        } else {
+            let again = new_label(cx);
+            load_zx(cx, size, 0, a);
+            emit_label(cx, again);
+            if kind == ATOMIC_AND || kind == ATOMIC_NAND || kind == ATOMIC_OR
+                || kind == ATOMIC_XOR {
+                rr(cx, c"movq", 0, 11);
+                rr(cx, if kind == ATOMIC_OR { c"orq" } else if kind == ATOMIC_XOR { c"xorq" }
+                    else { c"andq" },
+                    b, 11);
+                if kind == ATOMIC_NAND {
+                    o(cx, c"    notq %r11\n");
+                }
+            } else {
+                canonical_r10(cx, ty, size);
+                rr(cx, c"movq", 10, 11);
+                rr(cx, c"cmpq", b, 10);
+                rr(cx, if kind == ATOMIC_SMAX { c"cmovlq" } else if kind == ATOMIC_SMIN { c"cmovgq" }
+                    else if kind == ATOMIC_UMAX { c"cmovbq" } else { c"cmovaq" }, b, 11);
+            }
+            to_mem(cx, c"lock cmpxchg", size, 11, a);
+            o(cx, c"    jne ");
+            o(cx, local_prefix());
+            oi(cx, again);
+            on(cx);
+            result = 0;
+        }
+        if d >= 0 {
+            zero_extend(cx, size, result);
+            if d != result {
+                rr(cx, c"movq", result, d);
+            }
+            mx_normalize(cx, d, ty);
+        }
+    }
+}
+
+// A FENCE: mfence for SeqCst, else nothing.
+pub fn mx_fence(mut cx: *FnCtx, imm: i64) {
+    unsafe {
+        if (imm & FENCE_COMPILER) == 0 && (imm & 15) == ORD_SEQCST {
+            o(cx, c"    mfence\n");
+        }
+    }
+}

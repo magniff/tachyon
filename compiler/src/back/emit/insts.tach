@@ -9,20 +9,23 @@ use crate::back::emit::machine::{
     m_unary, reg_move_temp, reg_sp,
 };
 use crate::back::emit::operands::{
-    const_of, float_operand, int_operand, materialize, operand_reg, result_done, result_reg,
-    use_any,
+    const_of, float_operand, int_operand, materialize, operand_reg, result_done,
+    result_reg, use_any,
 };
+use crate::back::mc_arm64::atomic::{ma_atomic, ma_fence};
 use crate::back::mc_arm64::ops::{
     ma_bits, ma_cmp_imm, ma_fmath, ma_madd, ma_mulh, ma_select, ma_shop, ma_ubfx,
 };
 use crate::back::mc_arm64::vector::{
     ma_vbin, ma_vcmp, ma_vext, ma_vins, ma_vmacw, ma_vneg, ma_vsel, ma_vsplat, ma_vsum,
 };
+use crate::back::mc_x86_64::atomic::{mx_atomic, mx_fence};
 use crate::back::mc_x86_64::ops::{mx_cmp_imm, mx_mulh, mx_select, mx_sqrt};
 use crate::back::mc_x86_64::vector::{
     mx_vbin, mx_vcmp, mx_vext, mx_vins, mx_vneg, mx_vsel, mx_vsplat, mx_vsum,
 };
 use crate::back::regalloc::USE_NONE;
+use crate::back::regalloc::locations::vloc;
 use crate::back::regalloc::prepare::{is_zero_operand, use_kind};
 use crate::base::{BUFS, die};
 use crate::base::target::X86;
@@ -76,6 +79,14 @@ pub fn emit_inst(mut cx: *FnCtx, v: i64) {
             let r = result_reg(cx, v);
             ma_bits(cx, cx.insts[v].imm, r, a);
             result_done(cx, v, r);
+        } else if op == Op::Atomic {
+            emit_atomic(cx, v);
+        } else if op == Op::Fence {
+            if !X86 {
+                ma_fence(cx, cx.insts[v].imm);
+            } else {
+                mx_fence(cx, cx.insts[v].imm);
+            }
         } else if op == Load {
             emit_load_inst(cx, v);
         } else if op == Store {
@@ -126,6 +137,33 @@ pub fn emit_inst(mut cx: *FnCtx, v: i64) {
             result_done(cx, v, r);
         } else {
             die(c"internal error: unexpected instruction in emission");
+        }
+    }
+}
+
+// (0.21) An ATOMIC (mc_arm64/atomic.tach, mc_x86_64/atomic.tach): its
+// operands only read, its result (when used) written last.
+fn emit_atomic(mut cx: *FnCtx, v: i64) {
+    unsafe {
+        let a = operand_reg(cx, cx.insts[v].a);
+        let b = if cx.insts[v].b != 0 { operand_reg(cx, cx.insts[v].b) } else { -1 };
+        let c = if cx.insts[v].c != 0 { operand_reg(cx, cx.insts[v].c) } else { -1 };
+        let mut d = -1;
+        if cx.insts[v].ty != 0 {
+            let loc = unsafe { vloc(cx, v, cx.cur_pos + 2) };
+            if loc >= 0 && loc < 64 {
+                d = loc;
+            }
+        }
+        let kind = cx.insts[v].imm & 255;
+        let order = (cx.insts[v].imm >> 8) & 15;
+        if X86 {
+            mx_atomic(cx, kind, order, cx.insts[v].imm2, d, a, b, c);
+        } else {
+            ma_atomic(cx, kind, order, cx.insts[v].imm2, d, a, b, c);
+        }
+        if d >= 0 {
+            result_done(cx, v, d);
         }
     }
 }

@@ -1,0 +1,144 @@
+// (0.21) The encodings of the atomic instructions (back/mc_arm64/atomic.tach
+// writes them): load-acquire and store-release (ldar, stlr), the exclusive
+// pairs (ldxr, ldaxr, stxr, stlxr), LSE's cas, swp and ld<op> with their
+// ordering (a, l, al) and width (b, h) suffixes, dmb, clrex, and mrs of
+// tpidr_el0 (thread-locals).
+
+use crate::middle::ctx::FnCtx;
+use crate::back::enc_arm64::{C_X, OPS, word};
+use crate::back::objfile::assemble::{OP_COUNT, OP_END, OP_START, asm_error, text_is};
+use crate::base::BUFS;
+
+// The size field (bits 31-30) of an access of register operand k with
+// width suffix `w` ('b', 'h' or 0).
+fn size_field(mut cx: *FnCtx, k: i64, w: u8) -> i64 {
+    unsafe {
+        if w == 'b' {
+            return 0;
+        }
+        if w == 'h' {
+            return 1 << 30;
+        }
+        if OPS[k].cls == C_X { 3 << 30 } else { 2 << 30 }
+    }
+}
+
+fn reg(mut cx: *FnCtx, k: i64) -> i64 {
+    unsafe { OPS[k].reg }
+}
+
+// Whether `name` is `base` followed by an optional width suffix (b, h),
+// which goes to *w.
+fn base_width(name: [u8], base: [u8], w: &mut u8) -> bool {
+    if name.len < base.len || name[0..base.len] != base {
+        return false;
+    }
+    let rest = name[base.len..];
+    if rest.len == 0 {
+        *w = 0;
+        return true;
+    }
+    if rest.len == 1 && (rest[0] == 'b' || rest[0] == 'h') {
+        *w = rest[0];
+        return true;
+    }
+    false
+}
+
+// The LSE family `name` starts with: its encoding without size, ordering
+// and registers, the length of the base, or (-1, 0).
+fn lse_base(name: [u8]) -> (i64, i64) {
+    let bases: [[u8]; 10] = ["cas", "swp", "ldadd", "ldclr", "ldeor", "ldset", "ldsmax", "ldsmin",
+        "ldumax", "ldumin"];
+    let codes: [i64; 10] = [0x08a07c00, 0x38208000, 0x38200000, 0x38201000, 0x38202000, 0x38203000,
+        0x38204000, 0x38205000, 0x38206000, 0x38207000];
+    for i in 0..10 {
+        let b = bases[i];
+        if name.len >= b.len && name[0..b.len] == b {
+            return (codes[i], b.len);
+        }
+    }
+    (-1, 0)
+}
+
+// Encodes instruction `name` (its operands parsed) when it is one of these;
+// whether it was.
+pub fn a64_atomic(mut cx: *FnCtx, name: [u8]) -> bool {
+    unsafe {
+        let mut w: u8 = 0;
+        let exclusive_loads: [[u8]; 3] = ["ldar", "ldxr", "ldaxr"];
+        let load_codes: [i64; 3] = [0x08dffc00, 0x085f7c00, 0x085ffc00];
+        for i in 0..3 {
+            if base_width(name, exclusive_loads[i], &mut w) {
+                word(load_codes[i] | size_field(cx, 0, w) | reg(cx, 1) << 5 | reg(cx, 0));
+                return true;
+            }
+        }
+        if base_width(name, "stlr", &mut w) {
+            word(0x089ffc00 | size_field(cx, 0, w) | reg(cx, 1) << 5 | reg(cx, 0));
+            return true;
+        }
+        if base_width(name, "stxr", &mut w) || base_width(name, "stlxr", &mut w) {
+            let rel = name[2] == 'l';
+            let base = if rel { 0x0800fc00 } else { 0x08007c00 };
+            word(base | size_field(cx, 1, w) | reg(cx, 0) << 16 | reg(cx, 2) << 5 | reg(cx, 1));
+            return true;
+        }
+        if name == "dmb" {
+            if OP_COUNT != 1 {
+                asm_error(cx, c"wrong number of operands");
+            }
+            let crm = if text_is(cx, OP_START[0], OP_END[0], c"ish") { 11 }
+                else if text_is(cx, OP_START[0], OP_END[0], c"ishld") { 9 }
+                else if text_is(cx, OP_START[0], OP_END[0], c"ishst") { 10 }
+                else if text_is(cx, OP_START[0], OP_END[0], c"sy") { 15 }
+                else { asm_error(cx, c"bad barrier option") };
+            word(0xd50330bf | crm << 8);
+            return true;
+        }
+        if name == "clrex" {
+            word(0xd5033f5f);
+            return true;
+        }
+        if name == "mrs" {
+            if OP_COUNT != 2 || !text_is(cx, OP_START[1], OP_END[1], c"tpidr_el0") {
+                asm_error(cx, c"mrs: only tpidr_el0");
+            }
+            word(0xd53bd040 | reg(cx, 0));
+            return true;
+        }
+        let (code, n) = lse_base(name);
+        if code < 0 {
+            return false;
+        }
+        let mut rest = name[n..];
+        let mut acq = 0;
+        let mut rel = 0;
+        if rest.len >= 2 && rest[0] == 'a' && rest[1] == 'l' {
+            acq = 1;
+            rel = 1;
+            rest = rest[2..];
+        } else if rest.len >= 1 && rest[0] == 'a' {
+            acq = 1;
+            rest = rest[1..];
+        } else if rest.len >= 1 && rest[0] == 'l' {
+            rel = 1;
+            rest = rest[1..];
+        }
+        if rest.len > 1 || rest.len == 1 && rest[0] != 'b' && rest[0] != 'h' {
+            return false;
+        }
+        w = if rest.len == 1 { rest[0] } else { 0 };
+        if OP_COUNT != 3 {
+            asm_error(cx, c"wrong number of operands");
+        }
+        let size = size_field(cx, 1, w);
+        if code == 0x08a07c00 {
+            // cas: L is bit 22, o0 bit 15.
+            word(code | size | acq << 22 | rel << 15 | reg(cx, 0) << 16 | reg(cx, 2) << 5 | reg(cx, 1));
+        } else {
+            word(code | size | acq << 23 | rel << 22 | reg(cx, 0) << 16 | reg(cx, 2) << 5 | reg(cx, 1));
+        }
+        true
+    }
+}
