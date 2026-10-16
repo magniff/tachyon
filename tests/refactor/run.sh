@@ -262,4 +262,8 @@ while IFS= read -r code; do
 done <"$WORK/codes"
 check self_explain "$([ "$(wc -l <"$WORK/codes")" -ge 90 ] && [ -z "$missing$extra$bad" ] && echo 1)" \
     "$(wc -l <"$WORK/codes") codes; no entry:$(echo $missing); not a code:$(echo $extra); bad:$bad"
+# The own pass (0.17, front/own): compiler/src walks clean under
+# --values=report (the default only walks when its findings are printed).
+out=$(TACHYON_CACHE="$WORK/owncache" "$COMPILER" check --values=report compiler/src/main.tach 2>&1)
+check own_report_compiler "$(printf '%s\n' "$out" | grep -q '^own: 0 findings' && echo 1)" "$out"
 exit $STATUS
