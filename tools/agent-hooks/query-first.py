@@ -616,14 +616,21 @@ def python_targets(command):
 
 def edit_suggestion(prog, files, script):
     """The tachyonc command for a rewrite: `sed -i 'Ns/a/b/' FILE` of plain
-    text is `edit patch FILE:N --old a --new b`."""
-    f = re.sub(r"^.*?(compiler/(?:src|std)/)", r"\1", files[0])
+    text is `edit patch FILE:N --old a --new b`; (0.18.1) without a line,
+    every line's: `edit patch FILE --old a --new b --all`, one per file
+    (at most 3). A regex (`\\b`, `.*`, `[..]`), `&` or several commands:
+    the general form."""
+    fs = [re.sub(r"^.*?(compiler/(?:src|std)/)", r"\1", f) for f in files]
+    f = fs[0]
     m = re.match(r"^(\d+)?s([/|#,])((?:\\.|(?!\2).)*)\2((?:\\.|(?!\2).)*)\2g?$", script or "")
-    if prog == "sed -i" and m and not re.search(r"(?<!\\)[\^$*.\[\]+?(){}]", m.group(3)) and "&" not in m.group(4):
+    if prog == "sed -i" and m and not re.search(r"(?<!\\)[\^$*.\[\]+?(){}]|\\[bBwWsSdD<>]", m.group(3)) \
+            and "&" not in m.group(4) and not re.search(r"\\[0-9n]", m.group(4)):
         old = re.sub(r"\\(.)", r"\1", m.group(3))
         new = re.sub(r"\\(.)", r"\1", m.group(4))
-        target = f"{f}:{m.group(1)}" if m.group(1) else f
-        return f"tachyonc edit patch {target} --old {shlex.quote(old)} --new {shlex.quote(new)}"
+        pair = f"--old {shlex.quote(old)} --new {shlex.quote(new)}"
+        if m.group(1):
+            return f"tachyonc edit patch {f}:{m.group(1)} {pair}"
+        return " ; ".join(f"tachyonc edit patch {x} {pair} --all" for x in fs[:3])
     return (f"tachyonc edit patch {f}:LINE --old 'TEXT' --new 'TEXT' "
             "(pairs repeat, or come on stdin; docs/refactor.md)")
 

@@ -9,3 +9,7 @@ up and do not stop: write a script file with the Write tool and run it
 with `sh script.sh`, or run one simple command at a time. A command
 that runs longer than two minutes (the whole test suite) can be given a
 longer timeout.
+
+Change files with the Edit tool (or the tools AGENTS.md names). This is
+macOS: BSD `sed -i` needs an empty suffix (`sed -i '' 's/a/b/' f`) and
+has no `\b`.

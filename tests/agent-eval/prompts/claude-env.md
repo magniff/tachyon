@@ -9,6 +9,9 @@ files with the Write tool (a script, a test input), then run one simple
 command at a time, e.g. `tachyonc main.tach -o prog`, `sh check.sh`,
 `./prog < input.txt`.
 
+Change files with the Edit tool. This is macOS: BSD `sed -i` needs an
+empty suffix (`sed -i '' 's/a/b/' f`) and has no `\b`.
+
 The program reads standard input: run it as `./prog < input.txt`; a
 bare `./prog` waits for input that never comes until the command times
 out.
