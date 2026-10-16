@@ -103,6 +103,11 @@
 set -u
 LC_ALL=C
 export LC_ALL
+# (0.18.1) Without the code cache (back::codecache), unless the caller
+# says (gate.sh's suite-O2 row): its programs are small, and a cache per
+# program and compiler would fill target/tachyonc-cache.
+TACHYON_CODE_CACHE=${TACHYON_CODE_CACHE:-off}
+export TACHYON_CODE_CACHE
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 COMPILER="$ROOT/target/tachyonc"

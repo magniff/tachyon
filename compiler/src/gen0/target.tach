@@ -55,6 +55,7 @@ use crate::gen0::x86_64::{
 use crate::middle::ir::Cond;
 use crate::middle::lower::ssa::HMap;
 
+use crate::back::codecache::cc_text_string;
 use crate::base::target::{APPLE_A64, ELF, X86};
 use crate::front::contracts::checks::message_text;
 use crate::front::contracts::sites::{SITE_COL, SITE_FILE, SITE_LINE, site_count};
@@ -189,6 +190,14 @@ pub fn o_str_label(mut cx: *FnCtx, id: i64) {
         o(cx, local_prefix());
         o(cx, c"str.");
     }
+    // (0.18.1) With the code cache: the text's string i, str.\x03<i>, its
+    // id put by the join (back::codecache).
+    let i = cc_text_string(cx, id);
+    if i >= 0 {
+        unsafe { buf_byte(cx.code, 3); }
+        oi(cx, i);
+        return;
+    }
     let real = const_data_id(id);
     if real < 0 {
         unsafe { buf_byte(cx.code, 2); }
@@ -301,6 +310,14 @@ pub fn add_const_data(bytes: [u8], align: i64) -> i64 {
     }
     unsafe { STR_ALIGN.data[id] = align; }
     id
+}
+
+// (0.18.1, back::codecache) The alignment of string or constant data id
+// (0: a string literal's).
+pub fn str_align(id: i64) -> i64 {
+    unsafe {
+        if id < STR_ALIGN.count { STR_ALIGN.data[id] } else { 0 }
+    }
 }
 
 pub fn data_string(id: i64) {
@@ -753,7 +770,10 @@ pub fn emit_runtime(mut cx: *FnCtx) {
         let note = if trace_dump_fn() >= 0 { "" } else { panic_note_text() };
         let lp = cstr(local_prefix());
         data_section(writable: false);
-        let count = 4 + ENUM_PANICS.count;
+        // (0.18.1) -O1 and -O2: the kinds and sites as the join numbered them
+        // (rt_output), those of the code emitted; -O0: the front end's.
+        let kinds = if RT_RENUMBERED { OUT_KINDS.count } else { ENUM_PANICS.count };
+        let count = 4 + kinds;
         buf_fmt(DATA, f".p2align 2\n{lp}rt.messages:\n");
         for i in 0..count {
             buf_fmt(DATA, f"    .long {lp}rt.m{i} - {lp}rt.messages\n");
@@ -771,10 +791,10 @@ pub fn emit_runtime(mut cx: *FnCtx) {
             data_bytes(note);
             data_bytes("\0");
         }
-        for i in 0..ENUM_PANICS.count {
+        for i in 0..kinds {
             buf_fmt(DATA, f"{lp}rt.m{4 + i}:\n");
             let m = buf_new();
-            let e = ENUM_PANICS.data[i];
+            let e = ENUM_PANICS.data[if RT_RENUMBERED { OUT_KINDS.data[i] - 4 } else { i }];
             if e >= 0 {
                 buf_str(m, c"invalid value %lld for enum ");
                 buf_bytes(m, SYMS[ENUMS[e].name].text);
@@ -792,12 +812,13 @@ pub fn emit_runtime(mut cx: *FnCtx) {
         // (0.18) The sites: (line, file << 16 | column) each, from 1; the
         // files their checks are in, by name.
         buf_fmt(DATA, f".p2align 2\n{lp}rt.sites:\n    .long 0, 0\n");
-        let sites = site_count();
+        let sites = if RT_RENUMBERED { OUT_SITES.count + 1 } else { site_count() };
         let mut used = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for f in 0..FILE_COUNT {
             used.push(0);
         }
-        for s in 1..sites {
+        for o in 1..sites {
+            let s = if RT_RENUMBERED { OUT_SITES.data[o - 1] } else { o };
             let col = if SITE_COL.data[s] > 65535 { 65535 } else { SITE_COL.data[s] };
             buf_fmt(DATA, f"    .long {SITE_LINE.data[s]}, {SITE_FILE.data[s] * 65536 + col}\n");
             used.data[SITE_FILE.data[s]] = 1;
@@ -840,4 +861,39 @@ pub fn message_kind(text: i64) -> i64 {
 // contract's or an assertion's).
 pub fn kind_is_enum(kind: i64) -> bool {
     kind >= 4 && kind - 4 < ENUM_PANICS.count && unsafe { ENUM_PANICS.data[kind - 4] >= 0 }
+}
+
+// (0.18.1) -O1 and -O2 number the checks' sites and kinds (past the fixed
+// ones) the code loads as the join meets them (rt_output), in the order of
+// the code: a function's code names its own (middle::ir::RtId), so that
+// an edit elsewhere changes none of it (back::codecache). OUT_SITES: the
+// front end's site of each number from 1; OUT_KINDS: the front end's kind
+// of each from 4.
+pub static mut RT_RENUMBERED: bool = false;
+static mut OUT_SITES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut OUT_KINDS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut OUT_SITE_OF: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+static mut OUT_KIND_OF: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+// The program's number for the front end's site or kind `value` (class
+// middle::ir::RT_SITE or RT_KIND), given the first time the join asks.
+pub fn rt_output(class: i64, value: i64) -> i64 {
+    unsafe {
+        if class == crate::middle::ir::RT_SITE {
+            let found = OUT_SITE_OF.get(value + 1);
+            if found != 0 {
+                return found;
+            }
+            OUT_SITES.push(value);
+            OUT_SITE_OF.put(value + 1, OUT_SITES.count);
+            return OUT_SITES.count;
+        }
+        let found = OUT_KIND_OF.get(value + 1);
+        if found != 0 {
+            return found;
+        }
+        OUT_KINDS.push(value);
+        OUT_KIND_OF.put(value + 1, 3 + OUT_KINDS.count);
+        3 + OUT_KINDS.count
+    }
 }

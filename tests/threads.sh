@@ -23,6 +23,9 @@
 set -u
 LC_ALL=C
 export LC_ALL
+# (0.18.1) Without the code cache: -jN's tasks would take -j1's outputs.
+TACHYON_CACHE=off
+export TACHYON_CACHE
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 COMPILER="$ROOT/target/tachyonc"

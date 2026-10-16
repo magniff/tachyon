@@ -5,6 +5,7 @@
 // docs/optimizer.md, "0.6: interprocedural optimization".
 
 use crate::back::abi::{fn_type_uses_c, fn_uses_c};
+use crate::back::codecache::{R_ATTRS, R_STATIC, cc_note};
 use crate::back::regalloc::intervals::calls_returns_twice;
 use crate::back::regalloc::prepare::layout_order;
 use crate::base::{
@@ -56,8 +57,8 @@ const ATTR_ALL: i64 = 31;
 // compared or passed to nocapture parameters). Valid when FN_ATTRS_DONE.
 pub static mut FN_ATTRS: *i64 = 0 as *i64;
 pub static mut FN_NOCAPTURE: *i64 = 0 as *i64;
-static mut FN_ATTRS_DONE: *i64 = 0 as *i64;
-static mut ATTRS_READY: bool = false;
+pub static mut FN_ATTRS_DONE: *i64 = 0 as *i64;
+pub static mut ATTRS_READY: bool = false;
 
 // --print-attrs: print every function's attributes (stderr).
 pub static mut PRINT_ATTRS: bool = false;
@@ -82,6 +83,8 @@ pub fn call_attrs(mut cx: *FnCtx, v: i64) -> i64 {
             // (0.18.1: in the bottom-up phase, a callee whose component is
             // below this one's: one being done on another thread is not)
             if ATTRS_READY && fn_facts_ready(cx, g, FN_ATTRS_DONE[g] != 0) {
+                // (0.18.1: for the code cache, back::codecache)
+                cc_note(cx, R_ATTRS, g);
                 return FN_ATTRS[g] | front_attrs(cx.insts[v].imm);
             }
             return front_attrs(cx.insts[v].imm);
@@ -245,6 +248,7 @@ fn compute_attrs(mut cx: *FnCtx, fi: i64) -> i64 {
                     let mut known = call_attrs(cx, v);
                     if op == Call {
                         let g = FN_IR[cx.insts[v].imm] - 1;
+                        cc_note(cx, R_STATIC, g);
                         if g >= 0 && FN_SCC[g] == FN_SCC[fi] {
                             // Within the component: what is assumed so far;
                             // recursion may not return.
@@ -347,6 +351,10 @@ fn captured(mut cx: *FnCtx, fi: i64, p: i64) -> bool {
                         } else if op == Call && k >= 3 {
                             let g = FN_IR[cx.insts[v].imm] - 1;
                             let bit = k - 3;
+                            cc_note(cx, R_STATIC, g);
+                            if g >= 0 && g != fi && FN_SCC[g] != FN_SCC[fi] {
+                                cc_note(cx, R_ATTRS, g);
+                            }
                             if g >= 0 && g != fi && FN_SCC[g] == FN_SCC[fi] {
                                 cx.used_component = true;
                             }
@@ -542,7 +550,7 @@ fn common_constant_arg(mut cx: *FnCtx, g: i64, k: i64, found: *ConstArg) -> bool
                 return false;
             }
             let a = ir_val(cx, ir_arg(cx, call, k));
-            if !is_const(cx, a) && cx.insts[a].op != FAddr {
+            if !is_const(cx, a) && cx.insts[a].op != FAddr && cx.insts[a].op != Op::RtId {
                 return false;
             }
             if i == start {

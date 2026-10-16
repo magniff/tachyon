@@ -11,6 +11,9 @@
 // simplified (see inline_rounds).
 
 use crate::back::abi::{AbiClass, conv_classify, conv_returns_through_pointer, fn_uses_c};
+use crate::back::codecache::{
+    R_DEC, R_IR, R_RT, R_SIZE, R_STATIC, cc_note, cc_note_budget, cc_note_calls,
+};
 use crate::back::regalloc::intervals::calls_returns_twice;
 use crate::base::{IntVec, alloc_array, alloc_zeroed, free, memset};
 use crate::front::ast::{FN_CLOSURE, NODES};
@@ -47,8 +50,8 @@ const CONST_ARG_BONUS: i64 = 10;
 
 // The program's growth budget: the sum of the functions' sizes may reach
 // PROGRAM_BUDGET.
-static mut PROGRAM_SIZE: i64 = 0;
-static mut PROGRAM_BUDGET: i64 = 0;
+pub static mut PROGRAM_SIZE: i64 = 0;
+pub static mut PROGRAM_BUDGET: i64 = 0;
 
 // ---- Inlining hints ----
 //
@@ -76,7 +79,7 @@ pub static mut FN_RT: *i64 = 0 as *i64;
 pub static mut FN_DECIDERS_START: *i64 = 0 as *i64;
 // (0.18.1) Per function, the deciders (its own list: the function's task
 // makes it, its callers read it).
-static mut FN_DECIDERS: *IntVec = 0 as *IntVec;
+pub static mut FN_DECIDERS: *IntVec = 0 as *IntVec;
 
 // (0.17) The inliner's caches of function information (FN_RT, deciders),
 // for IRFUNC_COUNT functions, none known.
@@ -128,7 +131,10 @@ pub fn ir_callee(mut cx: *FnCtx, v: i64) -> i64 {
         if cx.insts[v].op != Op::Call {
             return -1;
         }
-        FN_IR[cx.insts[v].imm] - 1
+        let g = FN_IR[cx.insts[v].imm] - 1;
+        // (0.18.1: what the task saw of g, for the code cache)
+        cc_note(cx, R_STATIC, g);
+        g
     }
 }
 
@@ -376,6 +382,7 @@ fn decides(mut cx: *FnCtx, g: i64, p: i64) -> bool {
 fn inline_cost(mut cx: *FnCtx, g: i64, call: i64) -> i64 {
     unsafe {
         let nargs = cx.insts[call].nargs;
+        cc_note(cx, R_SIZE, g);
         let mut cost = FN_SIZE[g];
         let list = deciders(cx, g);
         for i in 0..(*list).count {
@@ -411,6 +418,7 @@ fn deciders(mut cx: *FnCtx, g: i64) -> *IntVec {
             }
             ir_enter(cx, back);
         }
+        cc_note(cx, R_DEC, g);
         &FN_DECIDERS[g]
     }
 }
@@ -455,6 +463,7 @@ fn callee_flags(mut cx: *FnCtx, g: i64) -> i64 {
             FN_RT[g] = flags;
             ir_enter(cx, back);
         }
+        cc_note(cx, R_RT, g);
         FN_RT[g]
     }
 }
@@ -475,6 +484,7 @@ fn should_inline(mut cx: *FnCtx, fi: i64, g: i64, call: i64) -> bool {
         if !fn_facts_ready(cx, g, true) {
             return false;
         }
+        cc_note(cx, R_SIZE, g);
         // A function calling setjmp (or the like) keeps its own frame, and
         // its callers theirs (see regalloc.tach).
         if cx.caller_rt || callee_returns_twice(cx, g) {
@@ -494,7 +504,7 @@ fn should_inline(mut cx: *FnCtx, fi: i64, g: i64, call: i64) -> bool {
         // (0.17: computed once; it scans the callee for what each constant
         // argument decides)
         let cost = inline_cost(cx, g, call);
-        if cost <= INLINE_TINY && program_size(cx) + FN_SIZE[g] <= PROGRAM_BUDGET {
+        if cost <= INLINE_TINY && budget_allows(cx, FN_SIZE[g]) {
             return true;
         }
         let b = cx.insts[call].block;
@@ -512,7 +522,7 @@ fn should_inline(mut cx: *FnCtx, fi: i64, g: i64, call: i64) -> bool {
         // last in the order, found the budget spent.
         let small_leaf = FN_SIZE[g] <= INLINE_LEAF && callee_is_leaf(cx, g);
         if FN_SIZE[fi] + FN_SIZE[g] > INLINE_BUDGET
-            || (program_size(cx) + FN_SIZE[g] > PROGRAM_BUDGET && !small_leaf) {
+            || (!budget_allows(cx, FN_SIZE[g]) && !small_leaf) {
             return false;
         }
         // (0.10: with a profile, a call that never ran is cold, and a hot one
@@ -705,6 +715,7 @@ fn inline_call(mut cx: *FnCtx, fi: i64, call: i64, g: i64) -> i64 {
         // simplify_inlining_leaves; its tables are only read: another thread
         // may be copying it too)
         ir_enter(cx, fi);
+        cc_note(cx, R_IR, g);
         let gt = ir_view(g);
         inline_maps(cx, gt.block_count + 1, gt.inst_count + 1);
         let b = cx.insts[call].block;
@@ -962,6 +973,17 @@ fn program_size(mut cx: *FnCtx) -> i64 {
     unsafe { PROGRAM_SIZE + cx.comp_growth }
 }
 
+// (0.18.1) Whether the program, grown by n more, is within the inlining
+// budget as the component being optimized sees it (the code cache keeps
+// the answer, not the size: back::codecache).
+fn budget_allows(mut cx: *FnCtx, n: i64) -> bool {
+    unsafe {
+        let within = program_size(cx) + n <= PROGRAM_BUDGET;
+        cc_note_budget(cx, cx.comp_growth + n, within);
+        within
+    }
+}
+
 fn program_grows(mut cx: *FnCtx, n: i64) {
     unsafe { cx.comp_growth += n; }
 }
@@ -977,11 +999,15 @@ pub fn add_program_size(n: i64) {
 fn calls_left(mut cx: *FnCtx, g: i64) -> i64 {
     unsafe {
         let mut n = FN_CALLS[g];
+        let mut own = 0;
         for i in 0..cx.comp_dec.count {
             if cx.comp_dec.data[i] == g {
-                n -= 1;
+                own += 1;
             }
         }
+        n -= own;
+        // (0.18.1: the code cache keeps whether it is one, not the count)
+        cc_note_calls(cx, g, own, n == 1);
         n
     }
 }
@@ -1123,9 +1149,9 @@ pub fn leaf_kept(fi: i64) -> bool {
 
 // (0.17, -O1) Per function: a small leaf, a leaf (simplified already), one
 // something keeps (see simplify_inlining_leaves).
-static mut LEAF_SMALL: *i64 = 0 as *i64;
-static mut LEAF_DONE: *i64 = 0 as *i64;
-static mut LEAF_KEEP: *i64 = 0 as *i64;
+pub static mut LEAF_SMALL: *i64 = 0 as *i64;
+pub static mut LEAF_DONE: *i64 = 0 as *i64;
+pub static mut LEAF_KEEP: *i64 = 0 as *i64;
 
 // Whether function fi makes a call (direct or not).
 fn has_calls(mut cx: *FnCtx, fi: i64) -> bool {
