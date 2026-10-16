@@ -45,6 +45,15 @@ pub fn make_vecop(n: i64, receiver: i64, kind: i64, vt: i64) -> i64 {
 pub fn vector_method(n: i64, name: i64, vt: i64) -> i64 {
     unsafe {
         let receiver = NODES[n].a;
+        if is_opaque_vector(vt) {
+            // (0.19)
+            opaque_lanes_error(NODES[n].start, vt, name);
+            synth_expr(receiver);
+            for i in 0..NODES[n].count {
+                synth_expr(child(n, i));
+            }
+            return TY_ERROR;
+        }
         if NODES[n].g != 0 {
             name_error(NODES[n].start, c"method '", name, c"' is not generic");
         }
@@ -65,6 +74,59 @@ pub fn vector_method(n: i64, name: i64, vt: i64) -> i64 {
         err_help(c"vectors have `lane(i)`, `with_lane(i, x)`, `sum()`, `store(slice, i)`, and masks `select(a, b)`");
         err_end();
         vt
+    }
+}
+
+// `T::m(args)` for vector type vt: `splat(x)`, `load(s, i)`, `from_bits(v)`
+// (0.10; 0.19: through an alias too, `uint8x16_t::from_bits(v)`; Intel's
+// opaque types have only `from_bits`).
+pub fn vector_assoc_call(n: i64, callee: i64, vt: i64) -> i64 {
+    unsafe {
+        let member = NODES[callee].b;
+        if NODES[callee].g != 0 {
+            name_error(NODES[callee].start, c"'", NODES[callee].a, c"' takes no type arguments");
+        }
+        if sym_is_c(member, c"from_bits") {
+            return make_vecop(n, 0, VK_FROM_BITS, vt);
+        }
+        let known = sym_is_c(member, c"splat") || sym_is_c(member, c"load");
+        if known && is_opaque_vector(vt) {
+            opaque_lanes_error(NODES[callee].start, vt, member);
+            for i in 0..NODES[n].count {
+                synth_expr(child(n, i));
+            }
+            return vt;
+        }
+        if sym_is_c(member, c"splat") {
+            return make_vecop(n, 0, VK_SPLAT, vt);
+        }
+        if sym_is_c(member, c"load") {
+            return make_vecop(n, 0, VK_LOAD, vt);
+        }
+        err_begin(NODES[callee].start);
+        err_str(c"no associated function '");
+        err_sym(member);
+        err_failed_name(member);
+        err_str(c"' for vector type '");
+        err_type(vt);
+        err_str(c"'");
+        err_help(c"vector types have `splat(x)`, `load(slice, index)` and `from_bits(v)`");
+        err_end();
+        vt
+    }
+}
+
+// (0.19) `member` used on Intel's opaque vector type vt, which has no lanes.
+fn opaque_lanes_error(pos: i64, vt: i64, member: i64) {
+    unsafe {
+        err_begin(pos);
+        err_str(c"'");
+        err_type(vt);
+        err_str(c"' has no lanes, so no '");
+        err_sym(member);
+        err_str(c"': Intel's vector types are made, read and combined by their intrinsics");
+        err_help(c"use the intrinsic (`_mm_set1_epi8(x)`, `_mm_loadu_si128(s, i)`, `_mm_storeu_si128(s, i, v)`), or convert to a vector with lanes: `v16u8::from_bits(v)`");
+        err_end();
     }
 }
 
@@ -211,6 +273,11 @@ pub fn vector_operator_ok(n: i64, op: Tok, ty: i64) {
 }
 
 unsafe fn vector_operator_check(n: i64, op: Tok, ty: i64) {
+    if is_opaque_vector(ty) {
+        // (0.19: `m += m` on an __m128i)
+        type_error_got(n, c"Intel's vector types have no operators: use their intrinsics, or convert with T::from_bits(v) (`v16u8::from_bits(x)`)", ty);
+        return;
+    }
     if op == Tok::Plus || op == Tok::Minus || op == Tok::Star {
         return;
     }
