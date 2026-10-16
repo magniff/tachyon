@@ -35,23 +35,55 @@ def segments(command):
     `&&`, newlines and parentheses outside quotes; comments and
     here-document bodies left out."""
     body = HEREDOC.sub("<<HEREDOC\n", command)
-    out, cur, quote, i = [], [], None, 0
+    return [body[s:e] for s, e in _spans(body)]
+
+
+def segment_spans(command):
+    """(0.17, chained rewrites) [(start, end)] of each simple command of
+    segments(command) in command itself, so that one command of a line can
+    be replaced and the rest kept as typed; None for a line with a
+    here-document (its body is not split)."""
+    if "<<" in command and HEREDOC.search(command):
+        return None
+    return _spans(command)
+
+
+def _spans(body):
+    out, start, end, quote, i = [], None, 0, None, 0
+
+    def take(a, b):
+        nonlocal start, end
+        if start is None:
+            start = a
+        end = b
+
+    def cut():
+        nonlocal start
+        if start is not None:
+            s, e = start, end
+            while s < e and body[s].isspace():
+                s += 1
+            while e > s and body[e - 1].isspace():
+                e -= 1
+            if e > s:
+                out.append((s, e))
+        start = None
     while i < len(body):
         c = body[i]
         if quote:
-            cur.append(c)
+            take(i, i + 1)
             if c == "\\" and quote == '"' and i + 1 < len(body):
-                cur.append(body[i + 1])
+                take(i, i + 2)
                 i += 1
             elif c == quote:
                 quote = None
         elif c == "\\" and i + 1 < len(body):
-            cur.append(c + body[i + 1])
+            take(i, i + 2)
             i += 1
         elif c in "'\"":
             quote = c
-            cur.append(c)
-        elif c == "#" and (not cur or cur[-1] in " \t"):
+            take(i, i + 1)
+        elif c == "#" and (start is None or body[end - 1] in " \t"):
             while i < len(body) and body[i] != "\n":
                 i += 1
             continue
@@ -60,22 +92,20 @@ def segments(command):
             if body[i + 1] == "{":
                 j = body.find("}", i)
                 j = len(body) - 1 if j < 0 else j
-                cur.append(body[i:j + 1])
+                take(i, j + 1)
                 i = j
             else:
-                out.append("".join(cur))
-                cur = []
+                cut()
                 i += 1
-        elif c == "&" and ((cur and cur[-1] in "<>") or body[i + 1:i + 2] == ">"):
-            cur.append(c)  # (2>&1, &>)
+        elif c == "&" and ((start is not None and body[end - 1] in "<>") or body[i + 1:i + 2] == ">"):
+            take(i, i + 1)  # (2>&1, &>)
         elif c in ";|&\n()`":
-            out.append("".join(cur))
-            cur = []
+            cut()
         else:
-            cur.append(c)
+            take(i, i + 1)
         i += 1
-    out.append("".join(cur))
-    return [seg.strip() for seg in out if seg.strip()]
+    cut()
+    return out
 
 
 def words_of(segment):
@@ -152,13 +182,22 @@ def located(command, cwd):
             for x in words:
                 name, value = ASSIGN.match(x).groups()
                 assigns[name] = value
-            out.append((seg, words, here, dict(assigns)))
+            out.append((seg, words, here, with_pwd(assigns, here)))
             continue
-        out.append((seg, words, here, dict(assigns)))
+        out.append((seg, words, here, with_pwd(assigns, here)))
         if words and words[0] in ("cd", "pushd") and len(words) <= 2:
-            target = expand(words[1], assigns) if len(words) == 2 else os.path.expanduser("~")
+            target = expand(words[1], with_pwd(assigns, here)) if len(words) == 2 else os.path.expanduser("~")
             if target and target != "-":
                 here = os.path.normpath(os.path.join(here, target))
+    return out
+
+
+def with_pwd(assigns, here):
+    """assigns with `PWD` (the directory a command runs in, unless the line
+    assigns it): `cd "$PWD" && ...` stays where it is, `$PWD/x.tach` is
+    known."""
+    out = dict(assigns)
+    out.setdefault("PWD", here)
     return out
 
 

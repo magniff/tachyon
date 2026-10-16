@@ -301,8 +301,9 @@ def agents_md(tree, cond):
 # shell rewrites are still blocked. Both forms: 0.16's "This is being
 # tested" paragraphs and 0.17's tiered "**Hooks.**" sentence.
 REWRITE_HOOK_TEXT = ("shell reads of large `.tach` files are answered with the matching query "
-                     "(`sed -n`, `head`, `tail`: `query text`; `cat`: `query items`; `grep NAME`: "
-                     "`query refs`); the result says what ran. Shell rewrites of compiler source "
+                     "(`sed -n`, `head`, `tail`: `query text`; `cat`: `query items`; `grep`: "
+                     "`query refs` or `query grep`), each command of a line on its own; the result "
+                     "says what ran. Shell rewrites of compiler source "
                      "(`sed -i`, `perl -pi`, Python writing compiler/src) are blocked with the "
                      "`edit patch` that does the same (`# no-tool: <why>` to override).")
 _REWRITE_FORMS = (

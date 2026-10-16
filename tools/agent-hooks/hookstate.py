@@ -145,7 +145,9 @@ DEFAULT_HINTS = {
     "rewritten": "note hook.query-first: `{FROM}` ran as `{TO}`: {WHY}",
     "rewritten-first": "note hook.query-first: shell reads of large .tach files are answered with "
                        "the matching query (sed -n, head, tail: `query text`; cat: `query items`; "
-                       "grep NAME: `query refs`); `{FROM}` ran as `{TO}`: {WHY}",
+                       "grep: `query refs` or `query grep`), each command of a line on its own, "
+                       "the others as typed; `{FROM}` ran as `{TO}`: {WHY}",
+    "rewritten-also": "note hook.query-first: also `{FROM}` ran as `{TO}`: {WHY}",
     "repeat-lookup": "note: `{WHAT}` printed the same text at shell call {N} of this session",
 }
 # The hints proper (E3): TACHYON_HINTS=0 turns these off; the other texts
