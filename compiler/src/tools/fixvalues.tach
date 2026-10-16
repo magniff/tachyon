@@ -15,8 +15,11 @@
 // first, to a fixed point: passing `p` (or `&p.f`) on to a parameter that
 // is written writes `p`; passing `v` by value to a parameter that keeps it
 // moves `v`. std's functions are read (their `*T` receivers count by their
-// bodies) and never rewritten. A function used as a value, one of a trait
-// or an impl of one, an `unsafe fn`, C's and `main` keep their signatures.
+// bodies) and never rewritten. A method of a trait of the program changes
+// with its trait: the declaration and every impl together, `&mut T` when
+// one of them writes (an impl of a trait that declares `&T`, std's Eq,
+// Ord, Hash, is spelled so). A function used as a value, an `unsafe fn`,
+// C's and `main` keep their signatures.
 // A call whose argument cannot be rewritten (a temporary to a `&T`, a
 // slice local to a `&mut [T]`) keeps its parameter as it is, and the fixed
 // point runs again. Left to hand (§5 rule 7): conflicts, views of statics,
@@ -32,6 +35,7 @@ use crate::front::check::Res;
 use crate::front::lexer::Tok;
 use crate::front::modules::{STD_MODULE, file_of_pos};
 use crate::front::own::kinds::{K_NEEDS_DROP, is_owned_type, type_kind};
+use crate::front::traits::{IMPLS, impl_of_fn, trait_fn};
 use crate::front::types::{FNS, FN_COUNT, REF_MUT, STRUCTS, TYPES, TyKind, fn_param};
 use crate::middle::lower::ssa::HMap;
 use crate::tools::edit::edit_replace;
@@ -79,6 +83,14 @@ static mut AS_VALUE: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, co
 static mut EDITED: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
 static mut HAS_AS_MUT_SLICE: bool = false;
 
+// (0.17, trait methods) The functions of the program's traits: each impl's
+// method and each default body, as pairs (the declaration's Fn node, the
+// function). A trait method's parameters change for the declaration and
+// every impl together, or not at all.
+static mut MEMBERS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// A member's node (+ 1 → its declaration's node + 1).
+static mut GROUP: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
 // The counts, for the report: parameters to `&mut T`, to `&T`, to `&mut
 // [T]`, owned to `&T`; arguments rewritten; `defer x.free()` deleted.
 pub static mut VALUES_COUNTS: [i64; 6] = [0; 6];
@@ -88,6 +100,107 @@ pub static mut VALUES_COUNTS: [i64; 6] = [0; 6];
 fn base_node(f: i64) -> i64 {
     unsafe {
         if FNS[f].tmpl > 0 { FNS[FNS[f].tmpl - 1].node } else { FNS[f].node }
+    }
+}
+
+// The declaration of the program trait method f implements or is (a
+// default body), or 0.
+fn group_of(f: i64) -> i64 {
+    unsafe { GROUP.get(base_node(f) + 1) }
+}
+
+// Whether parameter i of the trait declaration decl is a non-`mut` `*T`
+// of a T that is neither a pointer nor a slice (by its text: a
+// declaration without a body has no function of its own).
+fn decl_ptr(decl: i64, i: i64) -> bool {
+    unsafe {
+        if i >= NODES[decl].count || (NODES[decl].p & 64) != 0 {
+            return false;
+        }
+        let pn = child(decl, i);
+        let tn = NODES[pn].b;
+        if NODES[pn].c != 0 || tn <= 0 || SRC[NODES[tn].start] != '*' {
+            return false;
+        }
+        let mut s = NODES[tn].start + 1;
+        while SRC[s] == ' ' {
+            s += 1;
+        }
+        SRC[s] != '*' && SRC[s] != '['
+    }
+}
+
+// The flags of parameter i over every member of decl's group.
+fn group_flags(decl: i64, i: i64) -> i64 {
+    unsafe {
+        let mut fl = 0;
+        let mut k = 0;
+        while k < MEMBERS.count {
+            if MEMBERS.data[k] == decl {
+                fl = fl | flags(MEMBERS.data[k + 1], i);
+            }
+            k += 2;
+        }
+        fl
+    }
+}
+
+// The conversion parameter i of trait method decl gets, the same for the
+// declaration and every member: `&mut T` when one of them writes through
+// it, else `&T`; none when one of them cannot change (a raw parameter, a
+// function used as a value, an `unsafe fn`, a call that keeps it).
+fn group_conv(decl: i64, i: i64) -> i64 {
+    unsafe {
+        if !decl_ptr(decl, i) || AS_VALUE.get(decl + 1) != 0 {
+            return CV_NONE;
+        }
+        let mut k = 0;
+        while k < MEMBERS.count {
+            if MEMBERS.data[k] == decl {
+                let f = MEMBERS.data[k + 1];
+                if FNS[f].export || (FNS[f].attrs & FN_UNSAFE) != 0
+                    || AS_VALUE.get(base_node(f) + 1) != 0 || pclass(f, i) != PC_PTR {
+                    return CV_NONE;
+                }
+            }
+            k += 2;
+        }
+        let fl = group_flags(decl, i);
+        if (fl & F_FORCED) != 0 {
+            return CV_NONE;
+        }
+        if (fl & F_WRITE) != 0 { CV_MUT } else { CV_SHARED }
+    }
+}
+
+// The members of the program's traits (MEMBERS, GROUP).
+fn find_groups() {
+    unsafe {
+        for f in 0..FN_COUNT {
+            if !has_body(f) || FNS[f].tmpl > 0 {
+                continue;
+            }
+            let node = FNS[f].node;
+            if in_std(NODES[node].start) || GROUP.get(node + 1) != 0 {
+                continue;
+            }
+            let mut decl = 0;
+            let im = impl_of_fn(f);
+            if im >= 0 && IMPLS[im].tr >= 0 {
+                decl = trait_fn(IMPLS[im].tr, NODES[node].a);
+            } else {
+                let d = def_of_node(node);
+                if d >= 0 && DEFS[d].kind == K_TRAIT_FN {
+                    decl = node;
+                }
+            }
+            if decl <= 0 || in_std(NODES[decl].start) {
+                continue;
+            }
+            GROUP.put(node + 1, decl);
+            MEMBERS.push(decl);
+            MEMBERS.push(f);
+        }
     }
 }
 
@@ -181,7 +294,15 @@ fn pclass(f: i64, i: i64) -> i64 {
 
 // The conversion parameter i of f gets.
 fn conv(f: i64, i: i64) -> i64 {
-    if f < 0 || !eligible(f) {
+    if f < 0 {
+        return CV_NONE;
+    }
+    // (a trait method: its group's)
+    let g = group_of(f);
+    if g > 0 {
+        return group_conv(g, i);
+    }
+    if !eligible(f) {
         return CV_NONE;
     }
     let c = pclass(f, i);
@@ -232,7 +353,8 @@ fn callee_writes(f: i64, i: i64) -> bool {
         if !has_body(f) {
             return true;
         }
-        let fl = flags(f, i);
+        let g = group_of(f);
+        let fl = if g > 0 { group_flags(g, i) } else { flags(f, i) };
         (fl & F_WRITE) != 0 || (fl & F_FORCED) != 0 && k == TyKind::Ptr
     }
 }
@@ -858,10 +980,82 @@ fn walk_all(ph: i64) {
                 CUR_LOCALS.push(NODES[child(item, i)].x);
             }
             IN_HOLE = 0;
-            if ph == PH_EDIT && eligible(f) {
+            if ph == PH_EDIT && (eligible(f) || group_of(f) > 0) {
                 edit_params(f);
             }
             scan(NODES[item].c, CX_MOVE);
+        }
+    }
+}
+
+// The trait declarations of the groups, rewritten as their members are
+// (PH_EDIT: a declaration without a body is no function walk_all sees).
+fn edit_decls() {
+    unsafe {
+        let mut k = 0;
+        while k < MEMBERS.count {
+            let decl = MEMBERS.data[k];
+            k += 2;
+            for i in 0..NODES[decl].count {
+                let cv = group_conv(decl, i);
+                let s = NODES[NODES[child(decl, i)].b].start;
+                if cv == CV_NONE || EDITED.get(s + 1) != 0 {
+                    continue;
+                }
+                if cv == CV_MUT {
+                    replace_text(s, s + 1, c"&mut ");
+                    VALUES_COUNTS[0] += 1;
+                } else {
+                    replace_text(s, s + 1, c"&");
+                    VALUES_COUNTS[1] += 1;
+                }
+            }
+        }
+    }
+}
+
+// (0.17) An impl's `*T` parameter where its trait declares `&T` or `&mut
+// T` (std's Eq, Ord, Hash, Drop; a trait already rewritten) is the
+// trait's type already (front::traits::check_impl_signatures): it is
+// spelled so, and no call changes.
+fn respell_impls() {
+    unsafe {
+        for f in 0..FN_COUNT {
+            if !has_body(f) || FNS[f].tmpl > 0 {
+                continue;
+            }
+            let node = FNS[f].node;
+            let im = impl_of_fn(f);
+            if in_std(NODES[node].start) || im < 0 || IMPLS[im].tr < 0 {
+                continue;
+            }
+            let decl = trait_fn(IMPLS[im].tr, NODES[node].a);
+            if decl <= 0 || decl == node {
+                continue;
+            }
+            let mut i = 0;
+            while i < NODES[node].count && i < NODES[decl].count {
+                let pn = child(node, i);
+                let tn = NODES[pn].b;
+                let dn = NODES[child(decl, i)].b;
+                i += 1;
+                if NODES[pn].c != 0 || tn <= 0 || dn <= 0 || SRC[NODES[tn].start] != '*'
+                    || SRC[NODES[dn].start] != '&' || EDITED.get(NODES[tn].start + 1) != 0 {
+                    continue;
+                }
+                let s = NODES[tn].start;
+                let mut d = NODES[dn].start + 1;
+                while SRC[d] == ' ' {
+                    d += 1;
+                }
+                if SRC[d] == 'm' && SRC[d + 1] == 'u' && SRC[d + 2] == 't' && SRC[d + 3] == ' ' {
+                    replace_text(s, s + 1, c"&mut ");
+                    VALUES_COUNTS[0] += 1;
+                } else {
+                    replace_text(s, s + 1, c"&");
+                    VALUES_COUNTS[1] += 1;
+                }
+            }
         }
     }
 }
@@ -1018,6 +1212,7 @@ fn free_defer_edits() {
 pub fn values_edits() -> i64 {
     unsafe {
         find_values();
+        find_groups();
         // (the flags to a fixed point; then the calls checked, and again
         // while one forces a parameter to stay)
         let mut rounds = 0;
@@ -1035,6 +1230,8 @@ pub fn values_edits() -> i64 {
             rounds += 1;
         }
         walk_all(PH_EDIT);
+        edit_decls();
+        respell_impls();
         free_defer_edits();
         VALUES_COUNTS[0] + VALUES_COUNTS[1] + VALUES_COUNTS[2] + VALUES_COUNTS[3] + VALUES_COUNTS[5]
     }
