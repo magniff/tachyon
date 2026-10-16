@@ -28,13 +28,13 @@ A path starts with a name in scope, `crate`, `self`, `super` or `std`:
 `geometry::area(s)`, `crate::util::Vec2 { x: 1, y: 2 }`,
 `shapes::Shape::Rect(r)`, `util::Stack::<u8>::new()`.
 
-A `use` path may also start with a sibling module (0.17): in
-`parser.tach`, where `main.tach` has `mod lexer; mod parser;`,
-`use lexer::{Tok, next};` is `use crate::lexer::{Tok, next};`. The
-first segment, when the module has no name of its own for it, is a child
-of its parent module, else of the root; when both exist and differ, the
-error's `try:` lines are the two `crate::` paths. In an expression a
-sibling needs its `use crate::lexer;` (or `crate::lexer::next(..)`).
+A path may also start with a sibling module (0.17): in `parser.tach`,
+where `main.tach` has `mod lexer; mod parser;`, `use lexer::{Tok, next};`
+is `use crate::lexer::{Tok, next};`, and `lexer::next(..)` or `t:
+lexer::Tok` in code is `crate::lexer::...` the same way. The first
+segment, when the module has no name of its own for it, is a child of its
+parent module, else of the root; when both exist and differ, the error's
+`try:` lines are the two `crate::` paths.
 
 ```tach
 mod util {

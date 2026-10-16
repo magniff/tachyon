@@ -359,7 +359,8 @@ parameters). The unsafe operations, and what they promise:
   pointer: dereferencing it is safe.
 - Indexing a raw pointer, `p[i]` (unchecked by design: a pointer has no
   length), and slicing one, `p[lo..hi]` (the slice is only as valid as
-  the memory behind it).
+  the memory behind it). On a raw pointer to a Vec, a Buf or a slice they
+  index the pointee, checked (0.17), and are unsafe as `*p` is.
 - Casting an integer to a pointer (other than the literal `0`, a null
   pointer, which safe code cannot dereference). Pointer-to-pointer and
   pointer-to-integer casts are safe; tachyon has no pointer arithmetic
@@ -877,7 +878,7 @@ fn main() -> i32 {
 
 Dereferencing a borrow (`*p`, `p.f`, `p.m()`) is safe; indexing it
 (`p[i]`) is not (a borrow is one value, not an array), except that a
-borrow of a Vec, a Buf or a slice indexes its pointee (0.17). In exchange, a
+pointer to a Vec, a Buf or a slice indexes its pointee (0.17). In exchange, a
 call passing something other than a borrow to a pointer parameter (a
 pointer field, a local holding a pointer, `malloc`'s result, `c"..."`,
 which is read-only memory) is unsafe: the caller vouches for it. A
@@ -1550,14 +1551,25 @@ unreachable code". Both are safe; their effect is
 `v[a..b]` on std's `Vec` and `Buf` are `v.as_slice()[i]` (and so on):
 checked, a place to assign without `mut` (as a slice's element is); the
 slice is valid until the Vec grows or is freed. A `HashMap` is not
-indexed (`m.get(k)` is an Option: Rust's `m[k]` panics). Through a
-borrow of a Vec, a Buf or a slice (a pointer parameter, `&v`), `p[i]` and
-`p[a..b]` index the pointee (`p.as_slice()[i]`, `(*p)[i]`), checked and
-safe, as `p.get(i)` is. On a raw pointer they stay pointer arithmetic
-(`unsafe`; the error names `(*p)[i]`, the element, instead of an `unsafe`
-block). `p[0]` on a pointer to anything else is pointer arithmetic as
-well; through a borrow its error names `*p`, the value it points to
-(`try: *out = acc` for `out[0] = acc`).
+indexed (`m.get(k)` is an Option: Rust's `m[k]` panics). On any pointer
+to a Vec, a Buf or a slice, `p[i]`, `p[i] = x`, `&p[i]` and `p[a..b]`
+index the pointee (`p.as_slice()[i]`, `(*p)[i]`), checked, as `p.get(i)`
+is: the type decides what they mean. Whether the pointer is a borrow
+decides only safety: through a borrow (a pointer parameter, `&v`) they
+are safe; through a raw pointer (a `mut` parameter, a local, a field, a
+static) they read through it, so they are `unsafe` (the error's try: is
+`fix --only unsafe`, or `v[i]` for a local `let p = &v;`). The type is
+the one written in the source, not an instance's: where p points, as
+written, to a type parameter (`p: *T`, a field `*T` of a generic struct,
+`x as *T`, the `ptr` of an `s: [T]`, a call to a function declared
+`-> *T` with T its own or its impl's parameter, a local from one of
+these), `p[i]`
+is pointer arithmetic for every `T`, a Vec too, so a generic body means
+one thing in every instance (std's Vec indexes its `ptr: *T` so); only a
+pointee written as a Vec, a Buf or a slice (`*Vec<T>`) is indexed
+(decided 2026-10-16, for the user's review). `p[0]` on a pointer to anything
+else is pointer arithmetic; through a borrow its error names `*p`, the
+value it points to (`try: *out = acc` for `out[0] = acc`).
 
 **Through a pointer.** `p.0` on a `*(A, B)` is `(*p).0`, as `p.x` on a
 `*S` is `(*p).x`: safe when `p` is a borrow (a parameter, `&x`),
@@ -1570,17 +1582,20 @@ an array is its length, and `v.len` on std's `Vec`, `Buf` and `HashMap`
 (whose `len` field is sealed, or which have none) is `v.len()`: a read
 only; `v.len = n` and `&v.len` are still errors.
 
-**Paths.** A `use` path's first segment that is not `crate`, `self`,
-`super`, `std` nor a name of the module it is written in is looked up
-beside that module (a child of its parent), then at the root:
-`use lexer::{Tok, next};` in `parser.tach`, where `main.tach` has
-`mod lexer; mod parser;`, is `use crate::lexer::{Tok, next};`. When both
-are modules and differ (`crate::a::lexer` beside `crate::a::parser`, and
-`crate::lexer`), it is an error, `ambiguous module`, whose `try:` lines
-are the two `crate::` paths. Paths in expressions are unchanged: a
-sibling there is `crate::lexer::next(..)` or imported (`use
-crate::lexer;`; the error `unknown module 'lexer'` names that line, in
-an expression, a type or a struct literal's path).
+**Paths.** A path's first segment that is not `crate`, `self`, `super`,
+`std` nor a name of the module it is written in is looked up beside that
+module (a child of its parent), then at the root: `use lexer::{Tok,
+next};` in `parser.tach`, where `main.tach` has `mod lexer; mod parser;`,
+is `use crate::lexer::{Tok, next};`. A path in code starts the same way
+(0.17): `lexer::next(..)`, `fn f(t: lexer::Tok)`, `lexer::Tok { .. }` and
+`lexer::Kind::Ident` in a pattern are `crate::lexer::...` there, as the
+`use` line would be; a name in scope in the module (an item, an import)
+still comes first. When both are modules and differ (`crate::a::lexer`
+beside `crate::a::parser`, and `crate::lexer`), it is an error,
+`ambiguous module`, whose `try:` lines are the two `crate::` paths (the
+`use` line, or the path in code, so written). A module elsewhere
+(`crate::b::lexer`) is `unknown module 'lexer'`, whose `try:` is the
+`use` line with its path from the root.
 `use m::{self, X};` is not supported: its error's `try:` is `use m;`.
 
 ## Importing C headers

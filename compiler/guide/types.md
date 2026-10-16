@@ -81,7 +81,9 @@ field (and `p.m()` calls a method) through it. A pointer parameter and
 `&place` passed directly are *borrows*, safe to dereference; any other
 pointer (a local holding `&x`, a field, a C result) is raw, used only in
 `unsafe`. `0 as *T` is null. There is no pointer arithmetic: index a raw
-pointer (`p[i]`, `&p[i]`) in unsafe code, or cast through `i64`.
+pointer (`p[i]`, `&p[i]`) in unsafe code, or cast through `i64`. On a
+pointer to a Vec, a Buf or a slice, `p[i]` indexes the one it points to,
+checked (0.17): safe through a borrow, `unsafe` through a raw pointer.
 
 ```tach
 struct Counter { n: i64 }

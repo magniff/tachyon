@@ -20,20 +20,23 @@
 // a warning in 0.9). `--fix-unsafe` wraps them in unsafe blocks
 // (fixunsafe.tach).
 
-use crate::base::{SRC, buf_fmt, buf_new, buf_slice};
+use crate::base::{SRC, buf_fmt, buf_new, buf_slice, intern_c};
 use crate::base::diag::{
     ERR_KIND, err_begin, err_end_soft, err_fix, err_fmt, err_help, err_help_fmt, err_str,
-    err_try_fmt, error_keyed, report_error_once,
+    err_try_fmt, err_try_tool, error_keyed, report_error_once,
 };
 use crate::front::ambient::check_ambient_call;
-use crate::front::ast::{FN_UNSAFE, NODES, NODE_REF, child};
-use crate::front::ast::NodeKind::{FieldAccess, Ident, TupleField, TyPtr, Unary};
+use crate::front::ast::{FN_UNSAFE, NODES, NODE_REF, NodeKind, child};
+use crate::front::ast::NodeKind::{
+    Call, Cast, FieldAccess, Ident, MethodCall, TupleField, TyName, TyPtr, TySlice, Unary,
+};
 use crate::front::check::{CONST_CONTEXT, LOCALS, Res};
 use crate::front::check::assign::ASSIGNING;
 use crate::front::check::check_mode::check_expr;
 use crate::front::check::synth_mode::synth_expr;
+use crate::front::generics::env_lookup;
 use crate::front::lexer::Tok;
-use crate::front::types::{FNS, TY_BOOL, err_type, is_numeric, is_ref};
+use crate::front::types::{FNS, STRUCTS, TYPES, TY_BOOL, TyKind, err_type, is_numeric, is_ref};
 use crate::tools::fixunsafe::{FIX_UNSAFE, note_unsafe_site};
 
 pub static mut UNSAFE_DEPTH: i64 = 0;
@@ -86,13 +89,17 @@ pub fn unsafe_op(n: i64, key: i64, message: *u8) {
     }
 }
 
-// (0.17) `p[i]` (`p[a..b]`) on a raw pointer to a Vec, a Buf or a slice
-// (pointee), outside unsafe code. It stays pointer arithmetic, the value
-// at that offset from p (statics such as BUFS are arrays), but is seldom
-// what was meant; so the error is not unsafe_op's, whose try: would wrap
-// the arithmetic in `unsafe`: it names the element, `(*p)[i]`.
+// (0.17) `p[i]` (`p[a..b]`) on a raw pointer p to a Vec, a Buf or a slice
+// (pointee), outside unsafe code. It indexes the one p points to, checked,
+// as through a borrow; reading through a raw pointer is what is unsafe, so
+// `fix --only unsafe` wraps it (its meaning is the same in `unsafe`). For a
+// local `let p = &v;` the try: indexes v itself.
 pub fn unsafe_view_index(n: i64, base: i64, index: i64, pointee: i64, slicing: bool) {
     if UNSAFE_DEPTH > 0 || CONST_CONTEXT {
+        return;
+    }
+    if FIX_UNSAFE && WRAP_NODE != 0 {
+        note_unsafe_site(WRAP_NODE);
         return;
     }
     unsafe {
@@ -103,17 +110,46 @@ pub fn unsafe_view_index(n: i64, base: i64, index: i64, pointee: i64, slicing: b
         let saved = ERR_KIND;
         ERR_KIND = c"unsafe";
         err_begin(NODES[n].start);
-        err_str(if slicing { c"slicing a raw pointer to '" }
-            else { c"indexing a raw pointer to '" });
+        err_str(if slicing { c"slicing a '" } else { c"indexing a '" });
         err_type(pointee);
-        err_str(c"' is unsafe pointer arithmetic over '");
-        err_type(pointee);
-        err_str(c"' values, not indexing the one it points to");
-        err_help(c"`(*p)[i]` indexes what p points to: safe through a borrow (a pointer parameter, `&v`), unsafe through a raw pointer, as `p.get(i)` is");
-        if NODES[base].end > NODES[base].start && NODES[index].end > NODES[index].start {
-            let b = SRC[NODES[base].start..NODES[base].end];
-            let i = SRC[NODES[index].start..NODES[index].end];
-            err_try_fmt(f"(*{b})[{i}]");
+        err_str(c"' through a raw pointer is unsafe");
+        let p = if NODES[base].end > NODES[base].start { SRC[NODES[base].start..NODES[base].end] }
+            else { "p" };
+        let mut what = "a raw pointer";
+        let mut place = 0;
+        if NODES[base].kind == Ident && NODES[base].res == Res::Local && NODES[base].y >= 0 {
+            let local = NODES[base].y;
+            place = LOCALS[local].init;
+            what = if LOCALS[local].is_param { "a `mut` parameter" } else { "a local" };
+        } else if NODES[base].kind == Ident && NODES[base].res == Res::Static {
+            what = "a static";
+        } else if NODES[base].kind == FieldAccess {
+            what = "a field";
+        }
+        if place != 0 && (NODES[place].kind == Ident || NODES[place].kind == FieldAccess)
+            && NODES[place].end > NODES[place].start {
+            // `let p = &v;`: v itself, the rest of the statement after it
+            // when it is assigned on one line
+            let v = SRC[NODES[place].start..NODES[place].end];
+            err_help_fmt(
+                f"`{p}` is {what} holding `&{v}`, a raw pointer, not a borrow; `{v}` itself is indexed safely");
+            let mut end = NODES[n].end;
+            let assign = ASSIGNING;
+            if assign != 0 && NODES[assign].b == n {
+                end = NODES[assign].end;
+                for c in SRC[NODES[n].end..end] {
+                    if c == '\n' {
+                        end = NODES[n].end;
+                    }
+                }
+            }
+            err_try_fmt(f"{v}{SRC[NODES[base].end..end]}");
+            let t = buf_new();
+            buf_fmt(t, f"{v}");
+            err_fix(NODES[base].start, NODES[base].end, buf_slice(t));
+        } else {
+            err_help_fmt(f"`{p}` is {what}, a raw pointer, not a borrow: `{p}[i]` indexes what it points to, checked, in an `unsafe {{ ... }}` block (the try: line wraps every such place)");
+            err_try_tool("fix --only unsafe", true);
         }
         err_end_soft();
         ERR_KIND = saved;
@@ -235,6 +271,96 @@ pub fn is_borrow(e: i64) -> bool {
         }
         if kind == Ident && NODES[e].res == Res::Local && NODES[e].y >= 0 {
             return LOCALS[NODES[e].y].borrow;
+        }
+        false
+    }
+}
+
+// (0.17, decided 2026-10-16) What type node t, as written, makes of a
+// type parameter: 1 for `*P`, 2 for `[P]`, 0 otherwise. P is one of the
+// parameters of Generics node `params`, or, for `params` -1, one in scope.
+pub fn written_param(t: i64, params: i64) -> i64 {
+    unsafe {
+        if t == 0 || (NODES[t].kind != TyPtr && NODES[t].kind != TySlice) {
+            return 0;
+        }
+        let inner = NODES[t].a;
+        if inner == 0 || NODES[inner].kind != TyName || NODES[inner].g != 0
+            || NODES[inner].count != 0 {
+            return 0;
+        }
+        let name = NODES[inner].a;
+        let mut found = false;
+        if params < 0 {
+            found = env_lookup(name) != 0;
+        } else if params > 0 {
+            for i in 0..NODES[params].count {
+                if NODES[child(params, i)].a == name {
+                    found = true;
+                }
+            }
+        }
+        if !found {
+            0
+        } else if NODES[t].kind == TyPtr {
+            1
+        } else {
+            2
+        }
+    }
+}
+
+// (0.17, decided 2026-10-16) Whether pointer expression e (checked) points,
+// as written, to a type parameter: a local or parameter `p: *T` (or one
+// initialized from such an expression), a field declared `*T` in a generic
+// struct, `x as *T`, the `ptr` of a local `s: [T]`. Then `p[i]` is pointer
+// arithmetic for every T, a Vec's too: a generic body means one thing in
+// every instance.
+pub fn pointee_is_param(e: i64) -> bool {
+    unsafe {
+        let kind = NODES[e].kind;
+        if kind == Ident && NODES[e].res == Res::Local && NODES[e].y >= 0 {
+            return LOCALS[NODES[e].y].twritten == 1;
+        }
+        if kind == Cast {
+            return written_param(NODES[e].b, -1) == 1;
+        }
+        if (kind == Call || kind == MethodCall) && NODES[e].x > 0 {
+            // a call: its function's result as declared, `-> *T` with T a
+            // parameter of the function or of its impl
+            let f = NODES[e].x - 1;
+            let tf = if FNS[f].tmpl > 0 { FNS[f].tmpl - 1 } else { f };
+            let item = FNS[tf].node;
+            return item > 0 && written_param(NODES[item].b, NODES[item].g) == 1;
+        }
+        if kind != FieldAccess {
+            return false;
+        }
+        let base = NODES[e].a;
+        let mut bt = NODES[base].ty;
+        if bt <= 0 {
+            return false;
+        }
+        if TYPES[bt].kind == TyKind::Slice {
+            return NODES[e].b == intern_c(c"ptr") && NODES[base].kind == Ident
+                && NODES[base].res == Res::Local && NODES[base].y >= 0
+                && LOCALS[NODES[base].y].twritten == 2;
+        }
+        if TYPES[bt].kind == TyKind::Ptr {
+            bt = TYPES[bt].a;
+        }
+        if TYPES[bt].kind != TyKind::Struct {
+            return false;
+        }
+        let item = STRUCTS[TYPES[bt].a].node;
+        if item <= 0 || NODES[item].kind != NodeKind::Struct {
+            return false;
+        }
+        for i in 0..NODES[item].count {
+            let field = child(item, i);
+            if NODES[field].a == NODES[e].b {
+                return written_param(NODES[field].b, NODES[item].g) == 1;
+            }
         }
         false
     }

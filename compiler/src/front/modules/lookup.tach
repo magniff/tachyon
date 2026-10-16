@@ -16,6 +16,7 @@ use crate::front::ast::{NODES, NodeKind, child};
 use crate::front::check::{PROGRAM, SELF_SYM, Try, attempt, name_error};
 use crate::front::check::collect::template_variant_named;
 use crate::front::check::names::{help_near_item, import_path_for};
+use crate::front::lexer::is_ident_byte;
 use crate::front::modules::{
     CUR_MOD, C_MODULE, MODULES, MODULE_COUNT, STD_MODULE, child_module, file_of_pos, is_within,
     module_of, qualified_if_known, qualify,
@@ -820,7 +821,7 @@ pub fn resolve_path(m: i64, path: i64, count: i64, entry: i64) -> i64 {
                     cur = binding(B_MODULE, STD_MODULE);
                     continue;
                 }
-                if i == 0 && entry >= 0 {
+                if i == 0 {
                     let other = sibling_module(m, name, seg, path, entry);
                     if other >= 0 {
                         cur = binding(B_MODULE, other);
@@ -861,12 +862,15 @@ pub fn resolve_path(m: i64, path: i64, count: i64, entry: i64) -> i64 {
     }
 }
 
-// (0.17) The module the first segment `name` (node seg) of a `use` path
-// names when module m, where it is written, has nothing of that name: a
-// child of m's parent (a sibling: `use lexer::Tok;` in parser.tach, where
-// main.tach has `mod lexer;`), else a child of the root; -1: neither.
-// Both, and different modules: an error, the two `use` lines its try:.
-fn sibling_module(m: i64, name: i64, seg: i64, path: i64, entry: i64) -> i64 {
+// (0.17) The module the first segment `name` (node seg) of a path names
+// when module m, where it is written, has nothing of that name: a child
+// of m's parent (a sibling: `use lexer::Tok;` or `lexer::next(..)` in
+// parser.tach, where main.tach has `mod lexer;`), else a child of the
+// root; -1: neither. A `use` path (its entry) and a path in code (entry
+// -1: a type's, a literal's, an expression's, ending where node path
+// ends) alike. Both, and different modules: an error, the two paths from
+// the root its try: lines.
+pub fn sibling_module(m: i64, name: i64, seg: i64, path: i64, entry: i64) -> i64 {
     unsafe {
         if m == 0 {
             return -1;
@@ -891,12 +895,12 @@ fn sibling_module(m: i64, name: i64, seg: i64, path: i64, entry: i64) -> i64 {
             err_failed_name(name);
             err_fmt(
                 f"ambiguous module '{sym_text(name)}': crate::{sym_text(MODULES[sibling].key)} (beside this module) or crate::{sym_text(name)} (at the root)");
-            err_help(c"a `use` path that starts with neither `crate`, `self`, `super` nor a name of this module starts beside it, or at the root: name the one you mean");
+            err_help(c"a path that starts with neither `crate`, `self`, `super` nor a name of this module starts beside it, or at the root: name the one you mean");
             let a = buf_new();
             buf_str(a, c"crate::");
             buf_bytes(a, SYMS[MODULES[parent].key].text);
-            use_line_try(entry, path, buf_slice(a));
-            use_line_try(entry, path, "crate");
+            path_try(entry, seg, path, buf_slice(a));
+            path_try(entry, seg, path, "crate");
             err_end();
         }
         if sibling >= 0 { sibling } else { top }
@@ -922,6 +926,37 @@ fn use_line_try(entry: i64, path: i64, prefix: [u8]) {
         err_try_fmt(buf_slice(t));
         // (0.18) the fix: the line so written
         err_fix(NODES[node].start, stop, buf_slice(t));
+    }
+}
+
+// (0.17) A try: line for a path (its first segment, node seg) with
+// `prefix::` written before it: a `use` entry's line (use_line_try), or the
+// path in code, its names and `::`s (`crate::front::util::twice`).
+fn path_try(entry: i64, seg: i64, path: i64, prefix: [u8]) {
+    if entry >= 0 {
+        use_line_try(entry, path, prefix);
+        return;
+    }
+    unsafe {
+        let start = NODES[seg].start;
+        let mut end = start;
+        while is_ident_byte(SRC[end]) || SRC[end] == ':' {
+            end += 1;
+        }
+        while end > start && SRC[end - 1] == ':' {
+            end -= 1;
+        }
+        let t = buf_new();
+        buf_bytes(t, prefix);
+        buf_str(t, c"::");
+        buf_bytes(t, SRC[start..end]);
+        err_try_fmt(buf_slice(t));
+        // (0.18) the fix: the first segment so written
+        let full = buf_new();
+        buf_bytes(full, prefix);
+        buf_str(full, c"::");
+        buf_bytes(full, SYMS[NODES[seg].a].text);
+        path_fix(start, NODES[seg].a, buf_slice(full));
     }
 }
 
@@ -958,7 +993,7 @@ fn help_unknown_module(m: i64, name: i64, path: i64, entry: i64) {
                 buf_bytes(full, SYMS[MODULES[MODULES[found].parent].key].text);
             }
             err_help_fmt(
-                f"'{sym_text(name)}' is the module {buf_slice(full)}::{sym_text(name)}; a path starts in the module it is written in: write `{buf_slice(full)}::{sym_text(name)}::...`");
+                f"'{sym_text(name)}' is the module {buf_slice(full)}::{sym_text(name)}; a path starts in this module, beside it or at the root: write `{buf_slice(full)}::{sym_text(name)}::...`");
             if entry >= 0 {
                 use_line_try(entry, path, buf_slice(full));
             } else {
@@ -979,32 +1014,28 @@ fn help_unknown_module(m: i64, name: i64, path: i64, entry: i64) {
     }
 }
 
-// (0.17) `table::f(x)` in an expression, where `table` is no name of
-// module m but a module of the crate (a sibling, not imported): the error
-// names it and its `use` line; returns when no module has that name.
-pub fn module_as_path_error(m: i64, name: i64, at: i64) {
+// (0.17) `table::f(x)` in an expression (Path node path at `at`), where
+// `table` is no name of module m nor a module beside it or at the root
+// (those are found as a `use` path's are), but a module elsewhere in the
+// crate: the error names it and its `use` line; returns when no module
+// has that name.
+pub fn module_as_path_error(m: i64, name: i64, at: i64, path: i64) {
     unsafe {
         let mut found = -1;
-        if m != 0 && MODULES[m].parent >= 0 {
-            found = child_module(MODULES[m].parent, name);
+        for k in 1..MODULE_COUNT {
+            if MODULES[k].name == name && k != STD_MODULE && k != C_MODULE && k != m
+                && !is_within(k, STD_MODULE) {
+                found = k;
+                break;
+            }
         }
         if found < 0 {
-            found = child_module(0, name);
-        }
-        if found < 0 || found == STD_MODULE || found == C_MODULE || found == m {
             return;
         }
-        let key = sym_text(MODULES[found].key);
         err_begin(at);
         err_failed_name(name);
         err_fmt(f"unknown module '{sym_text(name)}'");
-        err_help_fmt(
-            f"'{sym_text(name)}' is the module crate::{key}; a path starts in the module it is written in: import it, or write `crate::{key}::...`");
-        err_try_fmt(f"use crate::{key};");
-        // (0.18) the fix: the path from the crate's root
-        let full = buf_new();
-        buf_fmt(full, f"crate::{key}");
-        path_fix(at, name, buf_slice(full));
+        help_unknown_module(m, name, path, -1);
         err_end()
     }
 }
