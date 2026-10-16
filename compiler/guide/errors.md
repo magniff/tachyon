@@ -368,7 +368,7 @@ fn main(gpa: Gpa) -> i32 { let m: HashMap<K, i64> = HashMap::new_in(gpa); 0 }
 ```err
 error[type error] the trait 'Hash' is not implemented for 'K' | help: required by the bound 'K: Hash' of 'HashMap'
 ```
-`impl Hash for K { fn hash(self: *K) -> u64 { std::hash_u64(self.a as u64) } }`.
+`impl Hash for K { fn hash(self: &K) -> u64 { std::hash_u64(self.a as u64) } }`.
 
 ## Closures and iterators (0.14)
 

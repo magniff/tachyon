@@ -42,11 +42,11 @@ impl Add for V2 {
 }
 
 impl Ord for V2 {
-    fn cmp(self: *V2, o: *V2) -> i64 { (self.x + self.y) - (o.x + o.y) }
+    fn cmp(self: &V2, o: &V2) -> i64 { (self.x + self.y) - (o.x + o.y) }
 }
 
 impl Hash for V2 {
-    fn hash(self: *V2) -> u64 { hash_u64((self.x * 31 + self.y) as u64) }
+    fn hash(self: &V2) -> u64 { hash_u64((self.x * 31 + self.y) as u64) }
 }
 
 trait Double { fn double(self: Self) -> Self; }

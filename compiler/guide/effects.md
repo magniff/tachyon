@@ -62,7 +62,7 @@ fn main() -> i32 {
   through its pointer parameters); `#[no_alloc]`, `#[no_io]`,
   `#[no_panic]` forbid one; `#[effects(...)]` lists what is allowed,
   `#[effects()]` nothing. Several attributes intersect.
-- On a trait's function (`#[pure] fn hash(self: *Self) -> u64;`) the
+- On a trait's function (`#[pure] fn hash(self: &Self) -> u64;`) the
   declaration binds every impl; std's `Eq`, `Ord` and `Hash` are pure.
 - On a C function in an `extern` block it is trusted, as its signature
   is. Undeclared, std's table applies (libm and `mem*`: none, `malloc`:

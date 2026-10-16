@@ -970,8 +970,8 @@ there supertraits, associated types or generic traits yet.
 `a * b`, `a / b` call `add`, `sub`, `mul`, `div` (`Add`, `Sub`, `Mul`,
 `Div`: `fn add(self: Self, other: Self) -> Self`), `-a` calls `neg`
 (`Neg`), `a == b` and `a != b` call `eq(&a, &b)` (`Eq`: `fn eq(self:
-*Self, other: *Self) -> bool`), and `<`, `<=`, `>`, `>=` compare `cmp`'s
-result with 0 (`Ord`: `fn cmp(self: *Self, other: *Self) -> i64`,
+&Self, other: &Self) -> bool`), and `<`, `<=`, `>`, `>=` compare `cmp`'s
+result with 0 (`Ord`: `fn cmp(self: &Self, other: &Self) -> i64`,
 negative, zero or positive). Each operand is evaluated once, left to
 right. A type's own impl takes precedence over 0.6's structural `==`
 (for structs, enums, tuples, arrays and slices); the builtin scalars
@@ -981,7 +981,8 @@ numbers all of them, every type with `==` `Eq`, numbers, pointers and
 fieldless enums `Ord`. Compound assignment (`+=`) stays numeric.
 
 **std** (0.9): the traits `Add`, `Sub`, `Mul`, `Div`, `Neg`, `Eq`, `Ord`,
-`Hash` (`fn hash(self: *Self) -> u64`), in the prelude; impls of `Eq`,
+`Hash` (`fn hash(self: &Self) -> u64`; 0.17: `&Self`, and an impl's
+legacy `*Self` is taken as `&Self`), in the prelude; impls of `Eq`,
 `Ord` and `Hash` for the integer types, `bool` and `[u8]` (byte strings:
 by bytes, lexicographically, FNV-1a); `sort<T: Ord>(s: [T])` (in place,
 not stable; a heapsort, an introsort from 0.14); and `HashMap<K: Hash + Eq, V>` (open addressing
