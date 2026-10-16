@@ -7,15 +7,16 @@ use crate::back::abi::{
     ABI_PIECE_COUNT, ABI_PIECE_OFFSET, ABI_PIECE_TY, AbiClass, conv_classify,
     conv_returns_through_pointer, fn_type_uses_c, fn_uses_c, variadic_kind,
 };
-use crate::base::intern_c;
+use crate::base::{IntVec, free, intern_c};
 use crate::base::target::X86;
 use crate::front::ast::{NODES, NODE_RAW, child};
+use crate::front::contracts::checks::{CHECK_FN, check_message, check_values, conjuncts, operands};
 use crate::front::modules::STD_MODULE;
 use crate::front::types::{
-    FNS, TYPES, TY_F32, TY_F64, TY_I64, TY_U64, TY_U8_PTR, fn_param, is_compound, is_void,
-    scalar_type, type_elem, type_size,
+    FNS, TYPES, TY_F32, TY_F64, TY_I64, TY_U64, TY_U8_PTR, fn_param, int_bits, is_compound,
+    is_signed, is_void, scalar_type, type_elem, type_size,
 };
-use crate::gen0::target::{PANIC_USED, rt_panic_sym};
+use crate::gen0::target::{PANIC_USED, message_kind, rt_panic_sym};
 use crate::middle::checkalloc::site_before_call;
 use crate::middle::ir::{
     ARGS, ARGTY, BITS_LEADING, BITS_ONES, BITS_TRAILING, CUR, INSTS, IRF, IRFUNCS, Op, Term,
@@ -29,6 +30,7 @@ use crate::middle::profile::PROFILE_MODULE;
 use crate::middle::unsafecheck::{
     CHECK_MODULE, CHECK_UNSAFE, check_function, redirect_alloc, site_string,
 };
+use crate::tools::query::checks::note_check;
 
 // ---- Calls ----
 
@@ -78,6 +80,10 @@ pub fn lower_call(n: i64) -> i64 {
         let callee = NODES[n].a;
         // (--check-unsafe: malloc and the like go through the runtime)
         let direct = redirect_alloc(NODES[n].x - 1, FNS[IRFUNCS[IRF].f].module);
+        // (0.18: a contract check, front/contracts)
+        if direct >= 0 && direct == CHECK_FN {
+            return lower_contract_check(n);
+        }
         let kind = bits_kind(direct);
         if kind >= 0 {
             let x = need_value(lower_expr(child(n, 0)), TY_U64);
@@ -190,38 +196,84 @@ pub fn lower_call(n: i64) -> i64 {
 
 // Continues when `ok` holds; otherwise calls the run-time helper (see
 // emit_panic) with kind, a, b and c, which does not return. (0.18) site:
-// the check's record in front/contracts/sites.tach, 0 for none (phase 0:
-// always 0, and unused until T5 prints `FILE:LINE:COL: ...` from it).
-pub fn lower_check(ok: i64, kind: i64, a: i64, b: i64, c: i64, site: i64 = 0) {
+// the check's site (front/contracts/sites.tach; 0: none), whose position
+// the helper prints first; `site_value`: the site as a value instead (a
+// requires' call site, a parameter of its check), or 0.
+pub fn lower_check(ok: i64, kind: i64, a: i64, b: i64, c: i64, site: i64 = 0, site_value: i64 = 0) {
     PANIC_USED = true;
     let pass = ir_new_block();
     let fail = ir_new_block();
     lower_branch(ok, pass, fail);
     ir_seal(fail);
     CUR = fail;
-    let mark = SSA_STACK.count;
-    push_arg(ir_const(kind, TY_U64), TY_U64);
-    push_arg(a, TY_U64);
-    push_arg(b, TY_U64);
-    push_arg(if c != 0 { c } else { ir_const(0, TY_U64) }, TY_U64);
-    let call = emit_ir(Op::CallC, 0, 0, 0, rt_panic_sym());
-    take_args(call, mark);
-    ir_terminate(CUR, Term::Unreach, 0, 0, 0);
+    rt_panic_call(kind, a, b, c, site, site_value);
     ir_seal(pass);
     CUR = pass;
 }
 
-// A failed `n as E`: the run-time helper with the value; does not return.
-pub fn lower_panic(kind: i64, a: i64) {
+// (0.18) The call of the run-time helper in the current (failing) block,
+// which ends it.
+pub fn rt_panic_call(kind: i64, a: i64, b: i64, c: i64, site: i64, site_value: i64) {
     PANIC_USED = true;
+    note_check(site, kind);
     let mark = SSA_STACK.count;
     push_arg(ir_const(kind, TY_U64), TY_U64);
-    push_arg(a, TY_U64);
-    push_arg(ir_const(0, TY_U64), TY_U64);
-    push_arg(ir_const(0, TY_U64), TY_U64);
+    push_arg(if a != 0 { a } else { ir_const(0, TY_U64) }, TY_U64);
+    push_arg(if b != 0 { b } else { ir_const(0, TY_U64) }, TY_U64);
+    push_arg(if c != 0 { c } else { ir_const(0, TY_U64) }, TY_U64);
+    push_arg(if site_value != 0 { site_value } else { ir_const(site, TY_U64) }, TY_U64);
     let call = emit_ir(Op::CallC, 0, 0, 0, rt_panic_sym());
     take_args(call, mark);
     ir_terminate(CUR, Term::Unreach, 0, 0, 0);
+}
+
+// (0.18) `std::contract_check(cond, site, check)` (front/contracts): each
+// conjunct of cond checked in turn; a false one calls the helper with its
+// message (front/contracts/checks.tach), its shown operands, evaluated
+// again on the failing path (a condition is pure), and the site.
+fn lower_contract_check(n: i64) -> i64 {
+    unsafe {
+        let cond = child(n, 0);
+        let site = need_value(lower_expr(child(n, 1)), TY_I64);
+        let check = NODES[child(n, 2)].a;
+        let mut conjs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        conjuncts(cond, &conjs);
+        let mut ops = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for k in 0..conjs.count {
+            let conj = conjs.data[k];
+            let ok = lower_operand(conj);
+            let pass = ir_new_block();
+            let fail = ir_new_block();
+            lower_branch(ok, pass, fail);
+            ir_seal(fail);
+            CUR = fail;
+            ops.count = 0;
+            check_values(n, conj, &ops);
+            let mut values: [i64; 3] = [0; 3];
+            for i in 0..ops.count {
+                let op = ops.data[i];
+                let ty = NODES[op].ty;
+                let mut v = need_value(lower_expr(op), ty);
+                if int_bits(ty) < 64 {
+                    v = ir_conv(v, ty, if is_signed(ty) { TY_I64 } else { TY_U64 });
+                }
+                values[i] = v;
+            }
+            let kind = message_kind(check_message(check, conj, &ops, IRFUNCS[IRF].f));
+            rt_panic_call(kind, values[0], values[1], values[2], 0, site);
+            ir_seal(pass);
+            CUR = pass;
+        }
+        free(conjs.data as *u8);
+        free(ops.data as *u8);
+        0
+    }
+}
+
+// A failed `n as E`: the run-time helper with the value; does not return.
+// (0.18) site: as lower_check's.
+pub fn lower_panic(kind: i64, a: i64, site: i64 = 0) {
+    rt_panic_call(kind, a, 0, 0, site, 0);
     start_dead_block();
 }
 

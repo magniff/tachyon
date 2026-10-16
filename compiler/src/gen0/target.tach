@@ -23,8 +23,8 @@
 
 use crate::back::abi::returns_through_pointer;
 use crate::base::{
-    BUFS, IntVec, SYMS, buf_byte, buf_bytes, buf_clear, buf_fmt, buf_int, buf_new, buf_slice,
-    buf_str, buf_uint, cstr, intern_c, strlen,
+    BUFS, FILES, FILE_COUNT, IntVec, SYMS, buf_byte, buf_bytes, buf_clear, buf_fmt, buf_int,
+    buf_new, buf_slice, buf_str, buf_uint, cstr, free, intern_c, strlen,
 };
 use crate::front::lexer::{Tok, add_string, str_at};
 use crate::front::types::{ENUMS, align_to, is_float, scalar_type};
@@ -56,6 +56,8 @@ use crate::middle::ir::Cond;
 use crate::middle::lower::ssa::HMap;
 
 use crate::base::target::{APPLE_A64, ELF, X86};
+use crate::front::contracts::checks::message_text;
+use crate::front::contracts::sites::{SITE_COL, SITE_FILE, SITE_LINE, site_count};
 use crate::middle::trace::trace_dump_fn;
 
 pub const R_ACC: i64 = 0;
@@ -646,11 +648,29 @@ pub fn rt_panic_sym() -> i64 {
     RT_PANIC_SYM
 }
 
-// Calls the helper with a = R_ACC, b = R_SECOND, c = R_ADDR. (0.18) site: as
-// lower_check's (0 in phase 0; T5).
+// Calls the helper with a = R_ACC, b = R_SECOND, c = R_ADDR. (0.18) site:
+// the check's site (front/contracts/sites.tach; 0: none), whose position
+// the helper prints first.
 pub fn emit_panic(kind: i64, site: i64 = 0) {
     PANIC_USED = true;
-    if X86 { x64_panic(kind); } else { a64_panic(kind); }
+    if X86 { x64_panic(kind, site); } else { a64_panic(kind, site); }
+}
+
+// (0.18) Calls the helper as emit_panic does, with the site popped from
+// the temporaries (a value: a requires' call site).
+pub fn emit_panic_site_popped(kind: i64) {
+    PANIC_USED = true;
+    unsafe {
+        if X86 {
+            ins(c"movq (%rsp), %r8");
+            ins(c"addq $16, %rsp");
+            x64_panic(kind, -1);
+        } else {
+            a64_pop_int(4);
+            a64_panic(kind, -1);
+        }
+    }
+    DEPTH -= 1;
 }
 
 // (0.17) The line after a failure's message, without --trace; std's panic
@@ -659,7 +679,10 @@ pub fn panic_note_text() -> [u8] {
     "note: build with --trace for the line and its callers\n"
 }
 
-// The helper and its messages, when a check was generated.
+// The helper and its messages, when a check was generated: (0.18) a table
+// of 32-bit offsets from rt.messages to each message (kinds 0 to 3, then
+// one per ENUM_PANICS entry: an enum's, or a message text's), the
+// sites' table (front/contracts/sites.tach) and the files' names.
 pub fn emit_runtime() {
     unsafe {
         if !PANIC_USED {
@@ -670,11 +693,16 @@ pub fn emit_runtime() {
         if X86 { x64_runtime(); } else { a64_runtime(); }
         buf_bytes(ASM, buf_slice(CODE));
         CODE = out;
-        // The four messages, 128 bytes apart; (0.17) each with a note on
-        // --trace, without --trace (with it, the trace follows them).
+        // (0.17) each message with a note on --trace, without --trace (with
+        // it, the trace follows them).
         let note = if trace_dump_fn() >= 0 { "" } else { panic_note_text() };
+        let lp = cstr(local_prefix());
         data_section(writable: false);
-        buf_fmt(DATA, f".p2align 7\n{cstr(local_prefix())}rt.messages:\n");
+        let count = 4 + ENUM_PANICS.count;
+        buf_fmt(DATA, f".p2align 2\n{lp}rt.messages:\n");
+        for i in 0..count {
+            buf_fmt(DATA, f"    .long {lp}rt.m{i} - {lp}rt.messages\n");
+        }
         let messages: [*u8; 4] = [
             c"index out of bounds: index %lld, length %llu\n",
             c"index out of bounds: index %llu, length %llu\n",
@@ -683,21 +711,79 @@ pub fn emit_runtime() {
         ];
         for i in 0..4 {
             let text = messages[i];
-            let n = strlen(text) as i64;
-            data_bytes(text[0..n]);
+            buf_fmt(DATA, f"{lp}rt.m{i}:\n");
+            data_bytes(text[0..strlen(text) as i64]);
             data_bytes(note);
-            buf_fmt(DATA, f"    .space {128 - n - note.len as i64}\n");
+            data_bytes("\0");
         }
         for i in 0..ENUM_PANICS.count {
+            buf_fmt(DATA, f"{lp}rt.m{4 + i}:\n");
             let m = buf_new();
-            buf_str(m, c"invalid value %lld for enum ");
-            let name = SYMS[ENUMS[ENUM_PANICS.data[i]].name].text;
-            let room = 126 - note.len as i64 - BUFS[m].len;
-            buf_bytes(m, if name.len as i64 > room { name[0..room] } else { name });
-            buf_byte(m, '\n');
+            let e = ENUM_PANICS.data[i];
+            if e >= 0 {
+                buf_str(m, c"invalid value %lld for enum ");
+                buf_bytes(m, SYMS[ENUMS[e].name].text);
+                buf_byte(m, '\n');
+            } else {
+                // (0.18) a check's message, made by front/contracts.
+                buf_bytes(m, message_text(-1 - e));
+            }
             buf_bytes(m, note);
+            buf_byte(m, 0);
             data_bytes(buf_slice(m));
-            buf_fmt(DATA, f"    .space {128 - BUFS[m].len}\n");
+        }
+        buf_fmt(DATA, f"{lp}rt.at:\n");
+        data_bytes("%s:%u:%u: \0");
+        // (0.18) The sites: (line, file << 16 | column) each, from 1; the
+        // files their checks are in, by name.
+        buf_fmt(DATA, f".p2align 2\n{lp}rt.sites:\n    .long 0, 0\n");
+        let sites = site_count();
+        let mut used = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for f in 0..FILE_COUNT {
+            used.push(0);
+        }
+        for s in 1..sites {
+            let col = if SITE_COL.data[s] > 65535 { 65535 } else { SITE_COL.data[s] };
+            buf_fmt(DATA, f"    .long {SITE_LINE.data[s]}, {SITE_FILE.data[s] * 65536 + col}\n");
+            used.data[SITE_FILE.data[s]] = 1;
+        }
+        buf_fmt(DATA, f"{lp}rt.files:\n");
+        for f in 0..FILE_COUNT {
+            if used.data[f] != 0 {
+                buf_fmt(DATA, f"    .long {lp}rt.f{f} - {lp}rt.files\n");
+            } else {
+                buf_fmt(DATA, f"    .long {lp}rt.at - {lp}rt.files\n");
+            }
+        }
+        for f in 0..FILE_COUNT {
+            if used.data[f] != 0 {
+                buf_fmt(DATA, f"{lp}rt.f{f}:\n");
+                let path = FILES[f].path;
+                let start = if path[0] == '.' && path[1] == '/' { 2 } else { 0 };
+                data_bytes(path[start..strlen(path) as i64]);
+                data_bytes("\0");
+            }
+        }
+        unsafe { free(used.data as *u8); }
+    }
+}
+
+// (0.18) The kind of a check whose message is `text` (a message of
+// front/contracts/checks.tach: a format for the helper's dprintf, with
+// the check's values).
+pub fn message_kind(text: i64) -> i64 {
+    let key = -1 - text;
+    for i in 0..ENUM_PANICS.count {
+        if unsafe { ENUM_PANICS.data[i] == key } {
+            return 4 + i;
         }
     }
+    ENUM_PANICS.push(key);
+    3 + ENUM_PANICS.count
+}
+
+// (0.18) Whether check kind `kind` (4 on) is an enum's `as E` check (else a
+// contract's or an assertion's).
+pub fn kind_is_enum(kind: i64) -> bool {
+    kind >= 4 && kind - 4 < ENUM_PANICS.count && unsafe { ENUM_PANICS.data[kind - 4] >= 0 }
 }
