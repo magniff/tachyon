@@ -20,12 +20,13 @@
 // again); a range found under an assumption made outside its own
 // finding is not kept. At most PHI_NEST levels.
 
-use crate::base::{IntVec, alloc_array, free};
+use crate::base::{alloc_array, free};
 use crate::front::types::is_integer;
-use crate::middle::ir::{BLOCKS, INSTS, INST_COUNT, Op, ir_arg, ir_val};
+use crate::middle::ctx::FnCtx;
+use crate::middle::ir::{Op, ir_arg, ir_val};
 use crate::middle::loops::{innermost_loop, loop_count, loop_header};
 use crate::middle::opt::dominates;
-use crate::middle::range::{FACTS, FACTS_VER, collect_facts, edge_fact, narrow_by_facts};
+use crate::middle::range::{collect_facts, edge_fact, narrow_by_facts};
 use crate::middle::range::interval::{
     MAX_I64, MIN_I64, greater, lesser, range_with_facts, type_max, type_min,
 };
@@ -34,51 +35,16 @@ const PHI_NEST: i64 = 12;
 // Phi ranges being found within one another (each may take facts with
 // other values afresh: see FACT_NEST), at most PHI_FINDS.
 const PHI_FINDS: i64 = 3;
-static mut PR_ACTIVE: i64 = 0;
 // The phis of a header found together (the others have their type's
 // range).
 const HEADER_PHIS: i64 = 8;
 // How deep facts comparing with a value whose range bounds it are taken
 // (within the ranging of such a value), and how deep they are now.
 pub const FACT_RANGE_DEPTH: i64 = 3;
-pub static mut FACT_NEST: i64 = 0;
 const NO_TAINT: i64 = 1000000;
 
-static mut RANGE_GEN: i64 = 1;
-// Whether phis get ranges now (and facts comparing two values are taken):
-// while a check's branch is decided (one way unreachable: a bounds check,
-// an unwrap), where they pay for their cost.
-pub static mut PHI_RANGES: bool = false;
-// Phis whose range was found in this generation, and how many may be (the
-// others have their type's range: a bound on the work in large functions).
-static mut PR_WORK: i64 = 0;
 const PR_BUDGET: i64 = 5000;
-static mut PR_GEN: *i64 = 0 as *i64;
-static mut PR_LO: *i64 = 0 as *i64;
-static mut PR_HI: *i64 = 0 as *i64;
-static mut PR_CAP: i64 = 0;
-// The phis whose ranges are being found: (phi, assumed lo, assumed hi,
-// frame), a frame numbering each push (so one names the whole stack below
-// it, which cannot change while it is there).
-static mut PR_STACK: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 const PR_STRIDE: i64 = 4;
-static mut PR_FRAMES: i64 = 0;
-// A range found under assumptions: kept for the stack it was found under
-// (its top frame), within the generation.
-static mut PT_GEN: *i64 = 0 as *i64;
-static mut PT_FRAME: *i64 = 0 as *i64;
-static mut PT_LO: *i64 = 0 as *i64;
-static mut PT_HI: *i64 = 0 as *i64;
-static mut PT_TAINT_OF: *i64 = 0 as *i64;
-// The outermost level of PR_STACK whose assumption the range being found
-// used (NO_TAINT: none).
-static mut PR_TAINT: i64 = 1000000;
-// FACTS put aside while a phi's operands are ranged at its predecessors.
-static mut FACTS_SAVED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-// The header phis being found (HR_FIELDS each): the phi, its type's range,
-// the entry operands' range, the assumption, the operands coming back,
-// how far the assumption was widened.
-static mut HR: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 const HR_FIELDS: i64 = 10;
 const HR_PHI: i64 = 0;
 const HR_TLO: i64 = 1;
@@ -91,51 +57,51 @@ const HR_BLO: i64 = 7;
 const HR_BHI: i64 = 8;
 const HR_STAGE: i64 = 9;
 
-pub fn forget_phi_ranges() {
+pub fn forget_phi_ranges(mut cx: *FnCtx) {
     unsafe {
-        RANGE_GEN += 1;
-        PR_WORK = 0;
+        cx.range_gen += 1;
+        cx.pr_work = 0;
     }
 }
 
-fn facts_save() -> i64 {
+fn facts_save(mut cx: *FnCtx) -> i64 {
     unsafe {
-        let mark = FACTS_SAVED.count;
-        for i in 0..FACTS.count {
-            FACTS_SAVED.push(FACTS.data[i]);
+        let mark = cx.facts_saved.count;
+        for i in 0..cx.facts.count {
+            cx.facts_saved.push(cx.facts.data[i]);
         }
-        FACTS_SAVED.push(FACTS.count);
+        cx.facts_saved.push(cx.facts.count);
         mark
     }
 }
 
-fn facts_restore(mark: i64) {
+fn facts_restore(mut cx: *FnCtx, mark: i64) {
     unsafe {
-        let n = FACTS_SAVED.data[FACTS_SAVED.count - 1];
-        FACTS_VER += 1;
-        FACTS.count = 0;
+        let n = cx.facts_saved.data[cx.facts_saved.count - 1];
+        cx.facts_ver += 1;
+        cx.facts.count = 0;
         for i in 0..n {
-            FACTS.push(FACTS_SAVED.data[mark + i]);
+            cx.facts.push(cx.facts_saved.data[mark + i]);
         }
-        FACTS_SAVED.count = mark;
+        cx.facts_saved.count = mark;
     }
 }
 
 // The facts at the end of predecessor p of h, and on the edge, in FACTS.
-fn edge_facts(p: i64, h: i64) {
-    collect_facts(p);
-    edge_fact(p, h);
+fn edge_facts(mut cx: *FnCtx, p: i64, h: i64) {
+    collect_facts(cx, p);
+    edge_fact(cx, p, h);
 }
 
-fn is_back_edge(p: i64, h: i64) -> bool {
-    dominates(h, p)
+fn is_back_edge(mut cx: *FnCtx, p: i64, h: i64) -> bool {
+    dominates(cx, h, p)
 }
 
-fn has_back_edge(h: i64) -> bool {
+fn has_back_edge(mut cx: *FnCtx, h: i64) -> bool {
     unsafe {
-        for i in 0..BLOCKS[h].preds.count {
-            let p = BLOCKS[h].preds.data[i];
-            if BLOCKS[p].order >= 0 && is_back_edge(p, h) {
+        for i in 0..cx.blocks[h].preds.count {
+            let p = cx.blocks[h].preds.data[i];
+            if cx.blocks[p].order >= 0 && is_back_edge(cx, p, h) {
                 return true;
             }
         }
@@ -144,14 +110,14 @@ fn has_back_edge(h: i64) -> bool {
 }
 
 // Whether phi v's range is kept, or being found.
-fn phi_known(v: i64) -> bool {
+fn phi_known(mut cx: *FnCtx, v: i64) -> bool {
     unsafe {
-        if v < PR_CAP && PR_GEN[v] == RANGE_GEN {
+        if v < cx.pr_cap && cx.pr_gen[v] == cx.range_gen {
             return true;
         }
         let mut k = 0;
-        while k < PR_STACK.count {
-            if PR_STACK.data[k] == v {
+        while k < cx.pr_stack.count {
+            if cx.pr_stack.data[k] == v {
                 return true;
             }
             k += PR_STRIDE;
@@ -160,169 +126,169 @@ fn phi_known(v: i64) -> bool {
     }
 }
 
-fn pr_push(v: i64, lo: i64, hi: i64) {
+fn pr_push(mut cx: *FnCtx, v: i64, lo: i64, hi: i64) {
     unsafe {
-        PR_STACK.push(v);
-        PR_STACK.push(lo);
-        PR_STACK.push(hi);
-        PR_FRAMES += 1;
-        PR_STACK.push(PR_FRAMES);
+        cx.pr_stack.push(v);
+        cx.pr_stack.push(lo);
+        cx.pr_stack.push(hi);
+        cx.pr_frames += 1;
+        cx.pr_stack.push(cx.pr_frames);
     }
 }
 
 // Starts finding ranges at stack level `level`: the taint so far, set
 // aside.
-fn taint_enter() -> i64 {
+fn taint_enter(mut cx: *FnCtx) -> i64 {
     unsafe {
-        let outer = PR_TAINT;
-        PR_TAINT = NO_TAINT;
+        let outer = cx.pr_taint;
+        cx.pr_taint = NO_TAINT;
         outer
     }
 }
 
 // Ends it: the outermost level whose assumption what was found used (at
 // least `level`: none from outside, it may be kept).
-fn taint_leave(level: i64, outer: i64) -> i64 {
+fn taint_leave(mut cx: *FnCtx, level: i64, outer: i64) -> i64 {
     unsafe {
-        let taint = PR_TAINT;
-        PR_TAINT = if taint < level { lesser(outer, taint) } else { outer };
+        let taint = cx.pr_taint;
+        cx.pr_taint = if taint < level { lesser(outer, taint) } else { outer };
         taint
     }
 }
 
-fn top_frame() -> i64 {
-    unsafe { if PR_STACK.count == 0 { 0 } else { PR_STACK.data[PR_STACK.count - 1] } }
+fn top_frame(mut cx: *FnCtx) -> i64 {
+    unsafe { if cx.pr_stack.count == 0 { 0 } else { cx.pr_stack.data[cx.pr_stack.count - 1] } }
 }
 
 // Keeps phi v's range [lo, hi], found at stack level `level` using the
 // assumptions down to level `taint`.
-fn pr_keep(v: i64, lo: i64, hi: i64, level: i64, taint: i64) {
+fn pr_keep(mut cx: *FnCtx, v: i64, lo: i64, hi: i64, level: i64, taint: i64) {
     unsafe {
         if taint >= level {
-            PR_GEN[v] = RANGE_GEN;
-            PR_LO[v] = lo;
-            PR_HI[v] = hi;
+            cx.pr_gen[v] = cx.range_gen;
+            cx.pr_lo[v] = lo;
+            cx.pr_hi[v] = hi;
         } else {
-            PT_GEN[v] = RANGE_GEN;
-            PT_FRAME[v] = top_frame();
-            PT_LO[v] = lo;
-            PT_HI[v] = hi;
-            PT_TAINT_OF[v] = taint;
+            cx.pt_gen[v] = cx.range_gen;
+            cx.pt_frame[v] = top_frame(cx);
+            cx.pt_lo[v] = lo;
+            cx.pt_hi[v] = hi;
+            cx.pt_taint_of[v] = taint;
         }
     }
 }
 
 // The range of phi v (*lo and *hi hold its type's on entry).
-pub fn phi_range(v: i64, lo: *i64, hi: *i64, depth: i64) {
+pub fn phi_range(mut cx: *FnCtx, v: i64, lo: &mut i64, hi: &mut i64, depth: i64) {
     unsafe {
-        if PR_CAP <= INST_COUNT {
-            free(PR_GEN as *u8);
-            free(PR_LO as *u8);
-            free(PR_HI as *u8);
-            free(PT_GEN as *u8);
-            free(PT_FRAME as *u8);
-            free(PT_LO as *u8);
-            free(PT_HI as *u8);
-            free(PT_TAINT_OF as *u8);
-            PR_CAP = 2 * INST_COUNT + 1024;
-            PR_GEN = alloc_array::<i64>(PR_CAP);
-            PR_LO = alloc_array::<i64>(PR_CAP);
-            PR_HI = alloc_array::<i64>(PR_CAP);
-            PT_GEN = alloc_array::<i64>(PR_CAP);
-            PT_FRAME = alloc_array::<i64>(PR_CAP);
-            PT_LO = alloc_array::<i64>(PR_CAP);
-            PT_HI = alloc_array::<i64>(PR_CAP);
-            PT_TAINT_OF = alloc_array::<i64>(PR_CAP);
+        if cx.pr_cap <= cx.inst_count {
+            free(cx.pr_gen as *u8);
+            free(cx.pr_lo as *u8);
+            free(cx.pr_hi as *u8);
+            free(cx.pt_gen as *u8);
+            free(cx.pt_frame as *u8);
+            free(cx.pt_lo as *u8);
+            free(cx.pt_hi as *u8);
+            free(cx.pt_taint_of as *u8);
+            cx.pr_cap = 2 * cx.inst_count + 1024;
+            cx.pr_gen = alloc_array::<i64>(cx.pr_cap);
+            cx.pr_lo = alloc_array::<i64>(cx.pr_cap);
+            cx.pr_hi = alloc_array::<i64>(cx.pr_cap);
+            cx.pt_gen = alloc_array::<i64>(cx.pr_cap);
+            cx.pt_frame = alloc_array::<i64>(cx.pr_cap);
+            cx.pt_lo = alloc_array::<i64>(cx.pr_cap);
+            cx.pt_hi = alloc_array::<i64>(cx.pr_cap);
+            cx.pt_taint_of = alloc_array::<i64>(cx.pr_cap);
         }
-        if PR_GEN[v] == RANGE_GEN {
-            *lo = PR_LO[v];
-            *hi = PR_HI[v];
+        if cx.pr_gen[v] == cx.range_gen {
+            *lo = cx.pr_lo[v];
+            *hi = cx.pr_hi[v];
             return;
         }
-        if PT_GEN[v] == RANGE_GEN && PT_FRAME[v] == top_frame() {
+        if cx.pt_gen[v] == cx.range_gen && cx.pt_frame[v] == top_frame(cx) {
             // (Found under this very stack: under the same assumptions.)
-            *lo = PT_LO[v];
-            *hi = PT_HI[v];
-            if PT_TAINT_OF[v] < PR_TAINT {
-                PR_TAINT = PT_TAINT_OF[v];
+            *lo = cx.pt_lo[v];
+            *hi = cx.pt_hi[v];
+            if cx.pt_taint_of[v] < cx.pr_taint {
+                cx.pr_taint = cx.pt_taint_of[v];
             }
             return;
         }
         let mut k = 0;
-        while k < PR_STACK.count {
-            if PR_STACK.data[k] == v {
-                *lo = PR_STACK.data[k + 1];
-                *hi = PR_STACK.data[k + 2];
-                if k / PR_STRIDE < PR_TAINT {
-                    PR_TAINT = k / PR_STRIDE;
+        while k < cx.pr_stack.count {
+            if cx.pr_stack.data[k] == v {
+                *lo = cx.pr_stack.data[k + 1];
+                *hi = cx.pr_stack.data[k + 2];
+                if k / PR_STRIDE < cx.pr_taint {
+                    cx.pr_taint = k / PR_STRIDE;
                 }
                 return;
             }
             k += PR_STRIDE;
         }
-        let h = INSTS[v].block;
-        if !PHI_RANGES || PR_STACK.count >= PR_STRIDE * PHI_NEST || PR_ACTIVE >= PHI_FINDS
-            || PR_WORK >= PR_BUDGET || h == 0 || BLOCKS[h].order < 0
-            || INSTS[v].nargs != BLOCKS[h].preds.count {
+        let h = cx.insts[v].block;
+        if !cx.phi_ranges || cx.pr_stack.count >= PR_STRIDE * PHI_NEST || cx.pr_active >= PHI_FINDS
+            || cx.pr_work >= PR_BUDGET || h == 0 || cx.blocks[h].order < 0
+            || cx.insts[v].nargs != cx.blocks[h].preds.count {
             return;
         }
-        PR_WORK += 1;
-        if has_back_edge(h) {
-            header_ranges(h, v, lo, hi, depth);
+        cx.pr_work += 1;
+        if has_back_edge(cx, h) {
+            header_ranges(cx, h, v, lo, hi, depth);
             return;
         }
         // In a loop, its header's phis first (they may be what v's operands
         // come from).
-        let l = innermost_loop(h);
-        if l >= 0 && l < loop_count() {
-            let hh = loop_header(l);
-            let first = BLOCKS[hh].first;
-            if hh != h && BLOCKS[hh].order >= 0 && first != 0 && INSTS[first].op == Op::Phi
-                && !phi_known(first) && is_integer(INSTS[first].ty)
-                && INSTS[first].nargs == BLOCKS[hh].preds.count
-                && has_back_edge(hh) {
-                let mut ilo = type_min(INSTS[first].ty);
-                let mut ihi = type_max(INSTS[first].ty);
-                header_ranges(hh, first, &ilo, &ihi, depth);
+        let l = innermost_loop(cx, h);
+        if l >= 0 && l < loop_count(cx) {
+            let hh = loop_header(cx, l);
+            let first = cx.blocks[hh].first;
+            if hh != h && cx.blocks[hh].order >= 0 && first != 0 && cx.insts[first].op == Op::Phi
+                && !phi_known(cx, first) && is_integer(cx.insts[first].ty)
+                && cx.insts[first].nargs == cx.blocks[hh].preds.count
+                && has_back_edge(cx, hh) {
+                let mut ilo = type_min(cx.insts[first].ty);
+                let mut ihi = type_max(cx.insts[first].ty);
+                header_ranges(cx, hh, first, &mut ilo, &mut ihi, depth);
             }
         }
         let tlo = *lo;
         let thi = *hi;
-        let level = PR_STACK.count / PR_STRIDE;
-        let outer = taint_enter();
-        let mark = facts_save();
+        let level = cx.pr_stack.count / PR_STRIDE;
+        let outer = taint_enter(cx);
+        let mark = facts_save(cx);
         // (A phi's range does not depend on where it is asked for: kept,
         // it must not depend on how deep that was.)
-        let fact_nest = FACT_NEST;
-        FACT_NEST = 0;
-        PR_ACTIVE += 1;
-        pr_push(v, tlo, thi);
+        let fact_nest = cx.fact_nest;
+        cx.fact_nest = 0;
+        cx.pr_active += 1;
+        pr_push(cx, v, tlo, thi);
         let mut rlo = thi;
         let mut rhi = tlo;
-        for i in 0..INSTS[v].nargs {
-            let p = BLOCKS[h].preds.data[i];
-            if BLOCKS[p].order < 0 {
+        for i in 0..cx.insts[v].nargs {
+            let p = cx.blocks[h].preds.data[i];
+            if cx.blocks[p].order < 0 {
                 continue;
             }
-            edge_facts(p, h);
+            edge_facts(cx, p, h);
             let mut alo = 0;
             let mut ahi = 0;
-            range_with_facts(ir_val(ir_arg(v, i)), &alo, &ahi, 1);
+            range_with_facts(cx, ir_val(cx, ir_arg(cx, v, i)), &mut alo, &mut ahi, 1);
             rlo = lesser(rlo, alo);
             rhi = greater(rhi, ahi);
         }
-        PR_STACK.count -= PR_STRIDE;
-        facts_restore(mark);
-        FACT_NEST = fact_nest;
-        PR_ACTIVE -= 1;
+        cx.pr_stack.count -= PR_STRIDE;
+        facts_restore(cx, mark);
+        cx.fact_nest = fact_nest;
+        cx.pr_active -= 1;
         if rlo > rhi {
             rlo = tlo;
             rhi = thi;
         }
         rlo = greater(rlo, tlo);
         rhi = lesser(rhi, thi);
-        let taint = taint_leave(level, outer);
-        pr_keep(v, rlo, rhi, level, taint);
+        let taint = taint_leave(cx, level, outer);
+        pr_keep(cx, v, rlo, rhi, level, taint);
         *lo = rlo;
         *hi = rhi;
     }
@@ -331,60 +297,62 @@ pub fn phi_range(v: i64, lo: *i64, hi: *i64, depth: i64) {
 // The ranges of the integer phis of loop header h (the first HEADER_PHIS),
 // found together; *lo and *hi for v among them (its type's range on
 // entry).
-fn header_ranges(h: i64, v: i64, lo: *i64, hi: *i64, depth: i64) {
+fn header_ranges(mut cx: *FnCtx, h: i64, v: i64, lo: &mut i64, hi: &mut i64, depth: i64) {
     unsafe {
-        let base = HR.count;
+        let base = cx.hr.count;
         let mut n = 0;
-        let mut phi = BLOCKS[h].first;
-        while phi != 0 && INSTS[phi].op == Op::Phi && n < HEADER_PHIS {
-            let ty = INSTS[phi].ty;
-            if is_integer(ty) && INSTS[phi].nargs == BLOCKS[h].preds.count && !phi_known(phi) {
-                HR.push(phi);
-                HR.push(type_min(ty));
-                HR.push(type_max(ty));
-                HR.push(type_max(ty));
-                HR.push(type_min(ty));
+        let mut phi = cx.blocks[h].first;
+        while phi != 0 && cx.insts[phi].op == Op::Phi && n < HEADER_PHIS {
+            let ty = cx.insts[phi].ty;
+            if is_integer(ty) && cx.insts[phi].nargs == cx.blocks[h].preds.count
+                && !phi_known(cx, phi) {
+                cx.hr.push(phi);
+                cx.hr.push(type_min(ty));
+                cx.hr.push(type_max(ty));
+                cx.hr.push(type_max(ty));
+                cx.hr.push(type_min(ty));
                 for _ in 5..HR_FIELDS {
-                    HR.push(0);
+                    cx.hr.push(0);
                 }
                 n += 1;
             }
-            phi = INSTS[phi].next;
+            phi = cx.insts[phi].next;
         }
-        let level = PR_STACK.count / PR_STRIDE;
-        if n == 0 || PR_STACK.count + PR_STRIDE * n > PR_STRIDE * PHI_NEST {
-            HR.count = base;
+        let level = cx.pr_stack.count / PR_STRIDE;
+        if n == 0 || cx.pr_stack.count + PR_STRIDE * n > PR_STRIDE * PHI_NEST {
+            cx.hr.count = base;
             return;
         }
-        let outer = taint_enter();
-        let mark = facts_save();
-        let fact_nest = FACT_NEST;
-        FACT_NEST = 0;
-        PR_ACTIVE += 1;
+        let outer = taint_enter(cx);
+        let mark = facts_save(cx);
+        let fact_nest = cx.fact_nest;
+        cx.fact_nest = 0;
+        cx.pr_active += 1;
         // The entry operands.
         let mut entries = 0;
-        for i in 0..BLOCKS[h].preds.count {
-            let p = BLOCKS[h].preds.data[i];
-            if BLOCKS[p].order < 0 || is_back_edge(p, h) {
+        for i in 0..cx.blocks[h].preds.count {
+            let p = cx.blocks[h].preds.data[i];
+            if cx.blocks[p].order < 0 || is_back_edge(cx, p, h) {
                 continue;
             }
             entries += 1;
-            edge_facts(p, h);
+            edge_facts(cx, p, h);
             for m in 0..n {
                 let e = base + m * HR_FIELDS;
                 let mut alo = 0;
                 let mut ahi = 0;
-                range_with_facts(ir_val(ir_arg(HR.data[e + HR_PHI], i)), &alo, &ahi, 1);
-                HR.data[e + HR_RLO] = lesser(HR.data[e + HR_RLO], alo);
-                HR.data[e + HR_RHI] = greater(HR.data[e + HR_RHI], ahi);
+                range_with_facts(cx, ir_val(cx, ir_arg(cx, cx.hr.data[e + HR_PHI], i)), &mut alo,
+                    &mut ahi, 1);
+                cx.hr.data[e + HR_RLO] = lesser(cx.hr.data[e + HR_RLO], alo);
+                cx.hr.data[e + HR_RHI] = greater(cx.hr.data[e + HR_RHI], ahi);
             }
         }
         let mut settled = entries > 0;
         if settled {
             for m in 0..n {
                 let e = base + m * HR_FIELDS;
-                HR.data[e + HR_HLO] = HR.data[e + HR_RLO];
-                HR.data[e + HR_HHI] = HR.data[e + HR_RHI];
+                cx.hr.data[e + HR_HLO] = cx.hr.data[e + HR_RLO];
+                cx.hr.data[e + HR_HHI] = cx.hr.data[e + HR_RHI];
             }
             // Each round ranges the operands coming back under the
             // assumptions, then widens those they leave (each at most three
@@ -393,55 +361,57 @@ fn header_ranges(h: i64, v: i64, lo: *i64, hi: *i64, depth: i64) {
             for _ in 0..3 * n + 1 {
                 for m in 0..n {
                     let e = base + m * HR_FIELDS;
-                    pr_push(HR.data[e + HR_PHI], HR.data[e + HR_HLO], HR.data[e + HR_HHI]);
-                    HR.data[e + HR_BLO] = MAX_I64;
-                    HR.data[e + HR_BHI] = MIN_I64;
+                    pr_push(cx, cx.hr.data[e + HR_PHI], cx.hr.data[e + HR_HLO],
+                        cx.hr.data[e + HR_HHI]);
+                    cx.hr.data[e + HR_BLO] = MAX_I64;
+                    cx.hr.data[e + HR_BHI] = MIN_I64;
                 }
-                for i in 0..BLOCKS[h].preds.count {
-                    let p = BLOCKS[h].preds.data[i];
-                    if BLOCKS[p].order < 0 || !is_back_edge(p, h) {
+                for i in 0..cx.blocks[h].preds.count {
+                    let p = cx.blocks[h].preds.data[i];
+                    if cx.blocks[p].order < 0 || !is_back_edge(cx, p, h) {
                         continue;
                     }
-                    edge_facts(p, h);
+                    edge_facts(cx, p, h);
                     for m in 0..n {
                         let e = base + m * HR_FIELDS;
                         let mut blo = 0;
                         let mut bhi = 0;
-                        range_with_facts(ir_val(ir_arg(HR.data[e + HR_PHI], i)), &blo, &bhi, 1);
-                        HR.data[e + HR_BLO] = lesser(HR.data[e + HR_BLO], blo);
-                        HR.data[e + HR_BHI] = greater(HR.data[e + HR_BHI], bhi);
+                        range_with_facts(cx, ir_val(cx, ir_arg(cx, cx.hr.data[e + HR_PHI], i)),
+                            &mut blo, &mut bhi, 1);
+                        cx.hr.data[e + HR_BLO] = lesser(cx.hr.data[e + HR_BLO], blo);
+                        cx.hr.data[e + HR_BHI] = greater(cx.hr.data[e + HR_BHI], bhi);
                     }
                 }
-                PR_STACK.count -= PR_STRIDE * n;
+                cx.pr_stack.count -= PR_STRIDE * n;
                 let mut widened = false;
                 for m in 0..n {
                     let e = base + m * HR_FIELDS;
-                    let blo = HR.data[e + HR_BLO];
-                    let bhi = HR.data[e + HR_BHI];
-                    let hlo = HR.data[e + HR_HLO];
-                    let hhi = HR.data[e + HR_HHI];
+                    let blo = cx.hr.data[e + HR_BLO];
+                    let bhi = cx.hr.data[e + HR_BHI];
+                    let hlo = cx.hr.data[e + HR_HLO];
+                    let hhi = cx.hr.data[e + HR_HHI];
                     if blo >= hlo && bhi <= hhi {
                         continue;
                     }
                     widened = true;
-                    HR.data[e + HR_STAGE] += 1;
-                    if HR.data[e + HR_STAGE] == 1 {
-                        HR.data[e + HR_HLO] = lesser(hlo, blo);
-                        HR.data[e + HR_HHI] = greater(hhi, bhi);
-                    } else if HR.data[e + HR_STAGE] == 2 {
+                    cx.hr.data[e + HR_STAGE] += 1;
+                    if cx.hr.data[e + HR_STAGE] == 1 {
+                        cx.hr.data[e + HR_HLO] = lesser(hlo, blo);
+                        cx.hr.data[e + HR_HHI] = greater(hhi, bhi);
+                    } else if cx.hr.data[e + HR_STAGE] == 2 {
                         let mut flo = 0;
                         let mut fhi = 0;
-                        back_fact_hull(h, HR.data[e + HR_PHI], HR.data[e + HR_TLO],
-                            HR.data[e + HR_THI], &flo, &fhi);
+                        back_fact_hull(cx, h, cx.hr.data[e + HR_PHI], cx.hr.data[e + HR_TLO],
+                            cx.hr.data[e + HR_THI], &mut flo, &mut fhi);
                         if blo < hlo {
-                            HR.data[e + HR_HLO] = lesser(hlo, flo);
+                            cx.hr.data[e + HR_HLO] = lesser(hlo, flo);
                         }
                         if bhi > hhi {
-                            HR.data[e + HR_HHI] = greater(hhi, fhi);
+                            cx.hr.data[e + HR_HHI] = greater(hhi, fhi);
                         }
                     } else {
-                        HR.data[e + HR_HLO] = HR.data[e + HR_TLO];
-                        HR.data[e + HR_HHI] = HR.data[e + HR_THI];
+                        cx.hr.data[e + HR_HLO] = cx.hr.data[e + HR_TLO];
+                        cx.hr.data[e + HR_HHI] = cx.hr.data[e + HR_THI];
                     }
                 }
                 if !widened {
@@ -450,47 +420,47 @@ fn header_ranges(h: i64, v: i64, lo: *i64, hi: *i64, depth: i64) {
                 }
             }
         }
-        facts_restore(mark);
-        FACT_NEST = fact_nest;
-        PR_ACTIVE -= 1;
-        let taint = taint_leave(level, outer);
+        facts_restore(cx, mark);
+        cx.fact_nest = fact_nest;
+        cx.pr_active -= 1;
+        let taint = taint_leave(cx, level, outer);
         let keep = taint >= level;
         for m in 0..n {
             let e = base + m * HR_FIELDS;
-            let tlo = HR.data[e + HR_TLO];
-            let thi = HR.data[e + HR_THI];
+            let tlo = cx.hr.data[e + HR_TLO];
+            let thi = cx.hr.data[e + HR_THI];
             let mut rlo = tlo;
             let mut rhi = thi;
             if settled {
-                rlo = greater(tlo, lesser(HR.data[e + HR_RLO], HR.data[e + HR_BLO]));
-                rhi = lesser(thi, greater(HR.data[e + HR_RHI], HR.data[e + HR_BHI]));
+                rlo = greater(tlo, lesser(cx.hr.data[e + HR_RLO], cx.hr.data[e + HR_BLO]));
+                rhi = lesser(thi, greater(cx.hr.data[e + HR_RHI], cx.hr.data[e + HR_BHI]));
             }
-            let p = HR.data[e + HR_PHI];
-            pr_keep(p, rlo, rhi, level, taint);
+            let p = cx.hr.data[e + HR_PHI];
+            pr_keep(cx, p, rlo, rhi, level, taint);
             if p == v {
                 *lo = rlo;
                 *hi = rhi;
             }
         }
-        HR.count = base;
+        cx.hr.count = base;
     }
 }
 
 // What the facts on the edges into h coming back say of phi v's operands
 // there (of type range [tlo, thi]), alone.
-fn back_fact_hull(h: i64, v: i64, tlo: i64, thi: i64, lo: *i64, hi: *i64) {
+fn back_fact_hull(mut cx: *FnCtx, h: i64, v: i64, tlo: i64, thi: i64, lo: &mut i64, hi: &mut i64) {
     unsafe {
         let mut rlo = thi;
         let mut rhi = tlo;
-        for i in 0..INSTS[v].nargs {
-            let p = BLOCKS[h].preds.data[i];
-            if BLOCKS[p].order < 0 || !is_back_edge(p, h) {
+        for i in 0..cx.insts[v].nargs {
+            let p = cx.blocks[h].preds.data[i];
+            if cx.blocks[p].order < 0 || !is_back_edge(cx, p, h) {
                 continue;
             }
-            edge_facts(p, h);
+            edge_facts(cx, p, h);
             let mut olo = tlo;
             let mut ohi = thi;
-            narrow_by_facts(ir_val(ir_arg(v, i)), &olo, &ohi, 1);
+            narrow_by_facts(cx, ir_val(cx, ir_arg(cx, v, i)), &mut olo, &mut ohi, 1);
             rlo = lesser(rlo, olo);
             rhi = greater(rhi, ohi);
         }

@@ -2,6 +2,7 @@
 ## left when the replacement drops a binding they use, loops and matches
 ## (tests/refactor/rewrites015/).
 $ check
+ok: 0 errors in main.tach
 ## A loop's body: its first statement, then the others in $s...; their
 ## comments go with them, their lines as they were. weighted's loop uses
 ## i, which the replacement drops: left.
@@ -83,6 +84,7 @@ rewrote 4 sites in 1 file	main.tach	+4 -8 lines
 note rewrite.dropped: 1 site is left: the replacement drops $i, which the code it keeps uses; first: main.tach:19:18
 try: tachyonc query show main.tach:19
 $ check
+ok: 0 errors in main.tach
 ## Errors.
 $ rewrite 'for $i in 0..$v.len { $a...; $b... }' '0'
 error rewrite.pattern: one $x... per list of arguments or block

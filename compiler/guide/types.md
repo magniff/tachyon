@@ -9,7 +9,7 @@
 | `!` | never: `return`, `break`, `loop` without `break`, `fn f() -> !` |
 | `(A, B)` | tuples: `t.0` (through a pointer too: `p.0`); `(x,)` has one element |
 | `[T; N]` | an array, a value; `N` a constant expression |
-| `[T]` | a slice: `.ptr` (a `*T`) and `.len` (an `i64`) |
+| `[T]` | a slice: `.len()` (an `i64`); `.ptr` (a `*T`) for C |
 | `*T` | a pointer (`*u8` is also C's `void *` and `char *`) |
 | `fn(A, B) -> R` | a plain function value |
 | `extern "C" fn(A) -> R` | a C function pointer, another type |
@@ -62,7 +62,7 @@ let copy = grid;                  // arrays are values: copied whole
 grid[0][0] = 1;
 let row = grid[1][..];            // [i64]: a view of the array
 let part = row[1..];              // checked: lo <= hi <= len
-std::print_int(copy[0][0] + part.len + part[1]);
+std::print_int(copy[0][0] + part.len() + part[1]);
 println("");
 ```
 ```out
@@ -72,7 +72,7 @@ println("");
 Indexing (`a[i]`, any integer type) and slicing (`a[lo..hi]`, `a[..hi]`,
 `a[lo..]`, `a[..]`) are checked: out of bounds, the program prints
 `index out of bounds: index I, length N` and exits with 101. An array
-has no `.len` field: `a.len()` (0.17), or slice it: `a[..].len`. A function taking `[T]` gets
+has its length too: `a.len()` (0.17), or slice it: `a[..].len()`. A function taking `[T]` gets
 `a[..]`, not `a`. A slice of a raw pointer, `p[0..n]`, is unchecked and
 unsafe.
 
@@ -87,8 +87,8 @@ null) is dereferenced only in `unsafe`. There is no pointer arithmetic:
 index a raw pointer (`p[i]`, `&p[i]`) in unsafe code, or cast through
 `i64`. On a reference to a Vec, a Buf or a slice, `p[i]` indexes the one
 it points to, checked: safe through a reference, `unsafe` through a raw
-pointer. A `*T` parameter (without `mut`) is still taken as `&mut T` in
-0.17; `tachyonc fix --values` rewrites it.
+pointer. A `*T` parameter is raw like any `*T` (0.18.1); `tachyonc fix --values`
+makes it a reference.
 
 ```tach
 struct Counter { n: i64 }

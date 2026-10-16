@@ -7,6 +7,7 @@
 ## writes a call with labels in the new order; inline puts in labelled
 ## arguments and defaults by parameter.
 $ check
+ok: 0 errors in main.tach
 $ refactor signature area --add 'scale: i64 = 2' --dry-run
 --- a/main.tach
 +++ b/main.tach
@@ -77,9 +78,9 @@ $ refactor signature Box::grow --rename-param times n --dry-run
 --- a/main.tach
 +++ b/main.tach
 @@ -17,2 +17,2 @@
--    fn grow(self: *Box, by: i64, times: i64 = 1) {
+-    fn grow(self: &mut Box, by: i64, times: i64 = 1) {
 -        self.w += by * times;
-+    fn grow(self: *Box, by: i64, n: i64 = 1) {
++    fn grow(self: &mut Box, by: i64, n: i64 = 1) {
 +        self.w += by * n;
 @@ -30 +30 @@
 -    x.grow(2, times: 3);
@@ -100,3 +101,4 @@ $ refactor signature area --reorder w,depth,h
 reordered the parameters of crate::area, 4 calls	main.tach	+2 -2 lines
 % "$COMPILER" main.tach -o prog && ./prog && echo ran
 ran
+ok: built prog

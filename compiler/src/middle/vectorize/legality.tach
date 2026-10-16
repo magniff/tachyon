@@ -9,10 +9,9 @@ use crate::front::types::{
     TY_BOOL, TY_F32, TY_F64, TY_I16, TY_I32, TY_I64, TY_I8, TY_U16, TY_U32, TY_U64, TY_U8, int_bits,
     is_float, is_integer, is_signed, type_size, vector_type,
 };
+use crate::middle::ctx::FnCtx;
 use crate::middle::fold::is_const;
-use crate::middle::ir::{
-    BLOCKS, Cond, INSTS, Op, Term, ir_arg, ir_operand, ir_operand_count, ir_val,
-};
+use crate::middle::ir::{Cond, Op, Term, ir_arg, ir_operand, ir_operand_count, ir_val};
 use crate::middle::ir::Op::{
     Add, And, Const, Conv, Div, Load, Mul, Neg, Or, Phi, Shl, Store, Sub, Xor,
 };
@@ -23,22 +22,20 @@ use crate::middle::loops::{
 use crate::middle::profile::is_cold_block;
 use crate::middle::scev::counted_loop;
 use crate::middle::vectorize::{
-    VC_SKIP, VC_UNIFORM, VC_VECTOR, VC_WIDE, VC_WMUL, VEC_MAX_INSTS, VEC_MAX_OVERLAPS, VSTAMP,
-    V_ACCESS, V_CHAIN, V_CHECKS, V_ELEM, V_HAS_STORE, V_HAS_ULOAD, V_IV, V_IV2, V_N, V_NE, V_REDS,
-    V_SIZE, V_VF, V_VT,
+    VC_SKIP, VC_UNIFORM, VC_VECTOR, VC_WIDE, VC_WMUL, VEC_MAX_INSTS, VEC_MAX_OVERLAPS,
 };
 use crate::middle::vectorize::checks::{overlap_pairs, record_check};
 
-pub fn class_of(v: i64) -> i64 {
+pub fn class_of(mut cx: *FnCtx, v: i64) -> i64 {
     unsafe {
-        if v != 0 && INSTS[v].mark == VSTAMP { INSTS[v].aux } else { 0 }
+        if v != 0 && cx.insts[v].mark == cx.vstamp { cx.insts[v].aux } else { 0 }
     }
 }
 
-pub fn set_class(v: i64, c: i64) {
+pub fn set_class(mut cx: *FnCtx, v: i64, c: i64) {
     unsafe {
-        INSTS[v].mark = VSTAMP;
-        INSTS[v].aux = c;
+        cx.insts[v].mark = cx.vstamp;
+        cx.insts[v].aux = c;
     }
 }
 
@@ -47,30 +44,30 @@ pub fn set_class(v: i64, c: i64) {
 // is not such a value.
 pub const NONAFFINE: i64 = 9223372036854775807;
 
-pub fn coef(l: i64, v: i64) -> i64 {
-    coef_wrt(l, v, V_IV, V_IV2)
+pub fn coef(mut cx: *FnCtx, l: i64, v: i64) -> i64 {
+    unsafe { coef_wrt(cx, l, v, cx.v_iv, cx.v_iv2) }
 }
 
 // The coefficient of induction variable `iv` in v, where `other` (another
 // induction variable, of an inner loop, or 0) counts as invariant.
-pub fn coef_wrt(l: i64, v: i64, iv: i64, other: i64) -> i64 {
+pub fn coef_wrt(mut cx: *FnCtx, l: i64, v: i64, iv: i64, other: i64) -> i64 {
     unsafe {
-        let x = ir_val(v);
+        let x = ir_val(cx, v);
         if x == iv {
             return 1;
         }
         if x == other && other != 0 {
             return 0;
         }
-        if invariant_in(l, x) {
+        if invariant_in(cx, l, x) {
             return 0;
         }
-        if class_of(x) != VC_UNIFORM {
+        if class_of(cx, x) != VC_UNIFORM {
             return NONAFFINE;
         }
-        let op = INSTS[x].op;
-        let a = if INSTS[x].a != 0 { coef_wrt(l, INSTS[x].a, iv, other) } else { 0 };
-        let b = if INSTS[x].b != 0 { coef_wrt(l, INSTS[x].b, iv, other) } else { 0 };
+        let op = cx.insts[x].op;
+        let a = if cx.insts[x].a != 0 { coef_wrt(cx, l, cx.insts[x].a, iv, other) } else { 0 };
+        let b = if cx.insts[x].b != 0 { coef_wrt(cx, l, cx.insts[x].b, iv, other) } else { 0 };
         if a == NONAFFINE || b == NONAFFINE {
             return NONAFFINE;
         }
@@ -78,7 +75,7 @@ pub fn coef_wrt(l: i64, v: i64, iv: i64, other: i64) -> i64 {
             // Computed from invariants alone (it would be hoisted).
             return 0;
         }
-        let wide = is_integer(INSTS[x].ty) && int_bits(INSTS[x].ty) == 64;
+        let wide = is_integer(cx.insts[x].ty) && int_bits(cx.insts[x].ty) == 64;
         if !wide {
             return NONAFFINE;
         }
@@ -88,19 +85,19 @@ pub fn coef_wrt(l: i64, v: i64, iv: i64, other: i64) -> i64 {
         if op == Sub {
             return a - b;
         }
-        if op == Mul && is_const(ir_val(INSTS[x].b)) && b == 0 {
-            return a * INSTS[ir_val(INSTS[x].b)].imm;
+        if op == Mul && is_const(cx, ir_val(cx, cx.insts[x].b)) && b == 0 {
+            return a * cx.insts[ir_val(cx, cx.insts[x].b)].imm;
         }
-        if op == Mul && is_const(ir_val(INSTS[x].a)) && a == 0 {
-            return b * INSTS[ir_val(INSTS[x].a)].imm;
+        if op == Mul && is_const(cx, ir_val(cx, cx.insts[x].a)) && a == 0 {
+            return b * cx.insts[ir_val(cx, cx.insts[x].a)].imm;
         }
-        if op == Shl && is_const(ir_val(INSTS[x].b)) && b == 0 {
-            let k = INSTS[ir_val(INSTS[x].b)].imm;
+        if op == Shl && is_const(cx, ir_val(cx, cx.insts[x].b)) && b == 0 {
+            let k = cx.insts[ir_val(cx, cx.insts[x].b)].imm;
             if k >= 0 && k < 16 {
                 return a << k as u64;
             }
         }
-        if op == Conv && is_integer(INSTS[x].imm2) && int_bits(INSTS[x].imm2) == 64 {
+        if op == Conv && is_integer(cx.insts[x].imm2) && int_bits(cx.insts[x].imm2) == 64 {
             return a;
         }
         NONAFFINE
@@ -122,89 +119,91 @@ pub fn lane_type(t: i64) -> i64 {
 
 // Records T, the type of the loop's vectorized values; false when another
 // one was seen.
-pub fn use_elem(t: i64) -> bool {
+pub fn use_elem(mut cx: *FnCtx, t: i64) -> bool {
     unsafe {
         let lt = lane_type(t);
         if lt == 0 {
             return false;
         }
-        if V_ELEM == 0 {
-            V_ELEM = t;
+        if cx.v_elem == 0 {
+            cx.v_elem = t;
             return true;
         }
-        V_ELEM == t
+        cx.v_elem == t
     }
 }
 
 // Whether v (an operand of a vector operation) has a value: a vector, or
 // one value for all lanes (invariant, or uniform without the induction
 // variable).
-pub fn vector_operand_ok(l: i64, v: i64) -> bool {
-    let x = ir_val(v);
-    let c = class_of(x);
+pub fn vector_operand_ok(mut cx: *FnCtx, l: i64, v: i64) -> bool {
+    let x = ir_val(cx, v);
+    let c = class_of(cx, x);
     if c == VC_VECTOR {
         return true;
     }
     if c == VC_WIDE || c == VC_WMUL {
         return false;
     }
-    coef(l, x) == 0
+    coef(cx, l, x) == 0
 }
 
-pub fn is_unreachable_exit(l: i64, b: i64) -> bool {
-    unsafe { !loop_contains(l, b) && BLOCKS[b].term == Term::Unreach }
+pub fn is_unreachable_exit(mut cx: *FnCtx, l: i64, b: i64) -> bool {
+    unsafe { !loop_contains(cx, l, b) && cx.blocks[b].term == Term::Unreach }
 }
 
 // Classifies the instructions of loop l; false when it cannot be
 // vectorized.
-pub fn analyze(l: i64, exit: *i64) -> bool {
+pub fn analyze(mut cx: *FnCtx, l: i64, exit: &mut i64) -> bool {
     unsafe {
-        VSTAMP += 1;
-        V_ELEM = 0;
-        V_HAS_STORE = false;
-        V_HAS_ULOAD = false;
-        V_IV2 = 0;
-        V_CHAIN.count = 0;
-        V_CHECKS.count = 0;
-        V_ACCESS.count = 0;
-        V_REDS.count = 0;
-        let h = loop_header(l);
-        let latch = loop_latch(l);
-        if BLOCKS[h].novec != 0 || is_cold_block(h) || latch == 0 || loop_preheader(l) == 0
-            || BLOCKS[latch].term != Term::Branch {
+        cx.vstamp += 1;
+        cx.v_elem = 0;
+        cx.v_has_store = false;
+        cx.v_has_uload = false;
+        cx.v_iv2 = 0;
+        cx.v_chain.count = 0;
+        cx.v_checks.count = 0;
+        cx.v_access.count = 0;
+        cx.v_reds.count = 0;
+        let h = loop_header(cx, l);
+        let latch = loop_latch(cx, l);
+        if cx.blocks[h].novec != 0 || is_cold_block(cx, h) || latch == 0
+            || loop_preheader(cx, l) == 0
+            || cx.blocks[latch].term != Term::Branch {
             return false;
         }
         let mut iv = 0;
         let mut step = 0;
         let mut n = 0;
         let mut ne = false;
-        if !counted_loop(l, &iv, &step, &n, &ne) || step != 1 || int_bits(INSTS[iv].ty) != 64 {
+        if !counted_loop(cx, l, &mut iv, &mut step, &mut n, &mut ne) || step != 1
+            || int_bits(cx.insts[iv].ty) != 64 {
             return false;
         }
-        V_IV = iv;
-        V_N = n;
-        V_NE = ne;
+        cx.v_iv = iv;
+        cx.v_n = n;
+        cx.v_ne = ne;
         // The chain of blocks.
         let mut b = h;
         let mut count = 0;
         loop {
-            V_CHAIN.push(b);
+            cx.v_chain.push(b);
             if b == latch {
                 break;
             }
-            if BLOCKS[b].term == Term::Jump && loop_contains(l, BLOCKS[b].s0)
-                && BLOCKS[BLOCKS[b].s0].preds.count == 1 {
-                b = BLOCKS[b].s0;
-            } else if BLOCKS[b].term == Term::Branch {
-                let s0 = BLOCKS[b].s0;
-                let s1 = BLOCKS[b].s1;
+            if cx.blocks[b].term == Term::Jump && loop_contains(cx, l, cx.blocks[b].s0)
+                && cx.blocks[cx.blocks[b].s0].preds.count == 1 {
+                b = cx.blocks[b].s0;
+            } else if cx.blocks[b].term == Term::Branch {
+                let s0 = cx.blocks[b].s0;
+                let s1 = cx.blocks[b].s1;
                 let mut next = 0;
-                if loop_contains(l, s0) && is_unreachable_exit(l, s1) {
+                if loop_contains(cx, l, s0) && is_unreachable_exit(cx, l, s1) {
                     next = s0;
-                } else if loop_contains(l, s1) && is_unreachable_exit(l, s0) {
+                } else if loop_contains(cx, l, s1) && is_unreachable_exit(cx, l, s0) {
                     next = s1;
                 }
-                if next == 0 || BLOCKS[next].preds.count != 1 || !record_check(l, b, next) {
+                if next == 0 || cx.blocks[next].preds.count != 1 || !record_check(cx, l, b, next) {
                     return false;
                 }
                 b = next;
@@ -216,124 +215,128 @@ pub fn analyze(l: i64, exit: *i64) -> bool {
                 return false;
             }
         }
-        if V_CHAIN.count != loop_size(l) {
+        if cx.v_chain.count != loop_size(cx, l) {
             return false;
         }
         // The exit at the latch.
-        let s0 = BLOCKS[latch].s0;
-        let s1 = BLOCKS[latch].s1;
+        let s0 = cx.blocks[latch].s0;
+        let s1 = cx.blocks[latch].s1;
         let e = if s0 == h { s1 } else { s0 };
-        if loop_contains(l, e) || BLOCKS[e].preds.count != 1 {
+        if loop_contains(cx, l, e) || cx.blocks[e].preds.count != 1 {
             return false;
         }
         *exit = e;
-        let latch_cond = ir_val(BLOCKS[latch].cond);
+        let latch_cond = ir_val(cx, cx.blocks[latch].cond);
         // The header's phis: the induction variable and reductions.
-        let mut phi = BLOCKS[h].first;
-        while phi != 0 && INSTS[phi].op == Phi {
+        let mut phi = cx.blocks[h].first;
+        while phi != 0 && cx.insts[phi].op == Phi {
             if phi != iv {
-                let next = ir_val(ir_arg(phi, pred_index(h, latch)));
-                if !is_integer(INSTS[phi].ty) || class_of(next) != 0 || INSTS[next].block == 0
-                    || !loop_contains(l, INSTS[next].block) {
+                let next = ir_val(cx, ir_arg(cx, phi, pred_index(cx, h, latch)));
+                if !is_integer(cx.insts[phi].ty) || class_of(cx, next) != 0
+                    || cx.insts[next].block == 0
+                    || !loop_contains(cx, l, cx.insts[next].block) {
                     return false;
                 }
-                let op = INSTS[next].op;
+                let op = cx.insts[next].op;
                 // (0.15) A minimum or maximum: k ? z : r (or k ? r : z), k an
                 // ordered comparison of r and z, signed (vector comparisons
                 // are).
                 if op == Op::Sel {
-                    if !is_minmax(phi, next) || !use_elem(INSTS[phi].ty) {
+                    if !is_minmax(cx, phi, next) || !use_elem(cx, cx.insts[phi].ty) {
                         return false;
                     }
-                    set_class(phi, VC_VECTOR);
-                    V_REDS.push(phi);
-                    V_REDS.push(next);
-                    V_REDS.push(op as i64);
-                    phi = INSTS[phi].next;
+                    set_class(cx, phi, VC_VECTOR);
+                    cx.v_reds.push(phi);
+                    cx.v_reds.push(next);
+                    cx.v_reds.push(op as i64);
+                    phi = cx.insts[phi].next;
                     continue;
                 }
                 if op != Add && op != Sub && op != Mul && op != And && op != Or && op != Xor {
                     return false;
                 }
-                let a = ir_val(INSTS[next].a);
-                let bb = ir_val(INSTS[next].b);
+                let a = ir_val(cx, cx.insts[next].a);
+                let bb = ir_val(cx, cx.insts[next].b);
                 if !(a == phi || (bb == phi && op != Sub)) || a == bb
-                    || INSTS[next].ty != INSTS[phi].ty {
+                    || cx.insts[next].ty != cx.insts[phi].ty {
                     return false;
                 }
-                if !use_elem(INSTS[phi].ty) {
+                if !use_elem(cx, cx.insts[phi].ty) {
                     return false;
                 }
-                set_class(phi, VC_VECTOR);
-                V_REDS.push(phi);
-                V_REDS.push(next);
-                V_REDS.push(op as i64);
+                set_class(cx, phi, VC_VECTOR);
+                cx.v_reds.push(phi);
+                cx.v_reds.push(next);
+                cx.v_reds.push(op as i64);
             } else {
-                set_class(phi, VC_UNIFORM);
+                set_class(cx, phi, VC_UNIFORM);
             }
-            phi = INSTS[phi].next;
+            phi = cx.insts[phi].next;
         }
         // Every instruction, in order.
         let mut total = 0;
-        for k in 0..V_CHAIN.count {
-            let mut v = BLOCKS[V_CHAIN.data[k]].first;
+        for k in 0..cx.v_chain.count {
+            let mut v = cx.blocks[cx.v_chain.data[k]].first;
             while v != 0 {
                 total += 1;
                 if total > VEC_MAX_INSTS {
                     return false;
                 }
-                if !classify(l, v, latch_cond) {
+                if !classify(cx, l, v, latch_cond) {
                     return false;
                 }
-                v = INSTS[v].next;
+                v = cx.insts[v].next;
             }
         }
-        V_SIZE = total;
-        if V_ELEM == 0 {
+        cx.v_size = total;
+        if cx.v_elem == 0 {
             return false;
         }
-        V_VF = 16 / type_size(V_ELEM);
-        V_VT = vector_type(lane_type(V_ELEM), V_VF);
-        if V_VT == 0 {
+        cx.v_vf = 16 / type_size(cx.v_elem);
+        cx.v_vt = vector_type(lane_type(cx.v_elem), cx.v_vf);
+        if cx.v_vt == 0 {
             return false;
         }
         // The reductions' phis are used by their next values alone, and the
         // loop's values used after it are reductions' (LCSSA: the exit's
         // phis).
-        for r in 0..V_REDS.count / 3 {
-            let p = V_REDS.data[3 * r];
-            let next = V_REDS.data[3 * r + 1];
+        for r in 0..cx.v_reds.count / 3 {
+            let p = cx.v_reds.data[3 * r];
+            let next = cx.v_reds.data[3 * r + 1];
             // (a minimum's phi is compared too)
-            let also = if INSTS[next].op == Op::Sel { ir_val(INSTS[next].a) } else { next };
-            if !uses_only(l, p, next, also) {
+            let also = if cx.insts[next].op == Op::Sel { ir_val(cx, cx.insts[next].a) }
+                else { next };
+            if !uses_only(cx, l, p, next, also) {
                 return false;
             }
         }
-        let mut x = BLOCKS[e].first;
-        while x != 0 && INSTS[x].op == Phi {
-            let w = ir_val(ir_arg(x, 0));
+        let mut x = cx.blocks[e].first;
+        while x != 0 && cx.insts[x].op == Phi {
+            let w = ir_val(cx, ir_arg(cx, x, 0));
             // (A uniform value: its value at the last iteration, computed
             // after the vector loop.)
-            if !invariant_in(l, w) && reduction_of_next(w) < 0
-                && (class_of(w) != VC_UNIFORM || coef(l, w) == NONAFFINE || loads_in(l, w)) {
+            if !invariant_in(cx, l, w) && reduction_of_next(cx, w) < 0
+                && (class_of(cx, w) != VC_UNIFORM || coef(cx, l, w) == NONAFFINE
+                    || loads_in(cx, l, w)) {
                 return false;
             }
-            x = INSTS[x].next;
+            x = cx.insts[x].next;
         }
         // Checks: on an index with coefficient 1. What is computed before the
         // loop (indices and addresses at its first and last iterations)
         // loads nothing.
-        for k in 0..V_CHECKS.count / 3 {
-            if coef(l, V_CHECKS.data[3 * k + 1]) != 1 || loads_in(l, V_CHECKS.data[3 * k + 1]) {
+        for k in 0..cx.v_checks.count / 3 {
+            if coef(cx, l, cx.v_checks.data[3 * k + 1]) != 1
+                || loads_in(cx, l, cx.v_checks.data[3 * k + 1]) {
                 return false;
             }
         }
-        for k in 0..V_ACCESS.count / 3 {
-            if loads_in(l, V_ACCESS.data[3 * k + 1]) {
+        for k in 0..cx.v_access.count / 3 {
+            if loads_in(cx, l, cx.v_access.data[3 * k + 1]) {
                 return false;
             }
         }
-        if overlap_pairs() > VEC_MAX_OVERLAPS {
+        if overlap_pairs(cx) > VEC_MAX_OVERLAPS {
             return false;
         }
         true
@@ -341,24 +344,24 @@ pub fn analyze(l: i64, exit: *i64) -> bool {
 }
 
 // Whether uniform value v depends on a load in loop l.
-pub fn loads_in(l: i64, v: i64) -> bool {
+pub fn loads_in(mut cx: *FnCtx, l: i64, v: i64) -> bool {
     unsafe {
-        let x = ir_val(v);
-        if x == 0 || x == V_IV || invariant_in(l, x) {
+        let x = ir_val(cx, v);
+        if x == 0 || x == cx.v_iv || invariant_in(cx, l, x) {
             return false;
         }
-        if INSTS[x].op == Load {
+        if cx.insts[x].op == Load {
             return true;
         }
-        loads_in(l, INSTS[x].a) || loads_in(l, INSTS[x].b)
+        loads_in(cx, l, cx.insts[x].a) || loads_in(cx, l, cx.insts[x].b)
     }
 }
 
 // The reduction (index) whose next value is w, or -1.
-pub fn reduction_of_next(w: i64) -> i64 {
+pub fn reduction_of_next(mut cx: *FnCtx, w: i64) -> i64 {
     unsafe {
-        for r in 0..V_REDS.count / 3 {
-            if V_REDS.data[3 * r + 1] == w {
+        for r in 0..cx.v_reds.count / 3 {
+            if cx.v_reds.data[3 * r + 1] == w {
                 return r;
             }
         }
@@ -366,11 +369,11 @@ pub fn reduction_of_next(w: i64) -> i64 {
     }
 }
 
-fn is_check(c: i64) -> bool {
+fn is_check(mut cx: *FnCtx, c: i64) -> bool {
     unsafe {
         let mut k = 0;
-        while k < V_CHECKS.count {
-            if V_CHECKS.data[k] == c {
+        while k < cx.v_checks.count {
+            if cx.v_checks.data[k] == c {
                 return true;
             }
             k += 3;
@@ -382,48 +385,48 @@ fn is_check(c: i64) -> bool {
 // (0.15) Whether next, the next value of header phi r, is k ? z : r or
 // k ? r : z with k a signed ordered comparison of r and z (either way):
 // a maximum or a minimum.
-pub fn is_minmax(r: i64, next: i64) -> bool {
+pub fn is_minmax(mut cx: *FnCtx, r: i64, next: i64) -> bool {
     unsafe {
-        if INSTS[next].op != Op::Sel {
+        if cx.insts[next].op != Op::Sel {
             return false;
         }
-        let k = ir_val(INSTS[next].a);
-        if INSTS[k].op != Op::Cmp || INSTS[k].cond == Cond::Eq || INSTS[k].cond == Cond::Ne
-            || !is_integer(INSTS[k].imm2) || !is_signed(INSTS[k].imm2)
-            || INSTS[k].imm2 != INSTS[r].ty {
+        let k = ir_val(cx, cx.insts[next].a);
+        if cx.insts[k].op != Op::Cmp || cx.insts[k].cond == Cond::Eq || cx.insts[k].cond == Cond::Ne
+            || !is_integer(cx.insts[k].imm2) || !is_signed(cx.insts[k].imm2)
+            || cx.insts[k].imm2 != cx.insts[r].ty {
             return false;
         }
-        let x = ir_val(INSTS[k].a);
-        let y = ir_val(INSTS[k].b);
+        let x = ir_val(cx, cx.insts[k].a);
+        let y = ir_val(cx, cx.insts[k].b);
         if (x == r) == (y == r) {
             return false;
         }
         let z = if x == r { y } else { x };
-        let p = ir_val(INSTS[next].b);
-        let q = ir_val(INSTS[next].c);
+        let p = ir_val(cx, cx.insts[next].b);
+        let q = ir_val(cx, cx.insts[next].c);
         (p == r && q == z) || (p == z && q == r)
     }
 }
 
 // (0.15) Whether every use of v inside loop l is instruction u or w (no
 // terminator's).
-fn uses_only(l: i64, v: i64, u: i64, w: i64) -> bool {
+fn uses_only(mut cx: *FnCtx, l: i64, v: i64, u: i64, w: i64) -> bool {
     unsafe {
-        for k in 0..V_CHAIN.count {
-            let b = V_CHAIN.data[k];
-            let mut x = BLOCKS[b].first;
+        for k in 0..cx.v_chain.count {
+            let b = cx.v_chain.data[k];
+            let mut x = cx.blocks[b].first;
             while x != 0 {
                 if x != u && x != w {
-                    for i in 0..ir_operand_count(x) {
-                        let o = ir_operand(x, i);
-                        if o != 0 && ir_val(o) == v {
+                    for i in 0..ir_operand_count(cx, x) {
+                        let o = ir_operand(cx, x, i);
+                        if o != 0 && ir_val(cx, o) == v {
                             return false;
                         }
                     }
                 }
-                x = INSTS[x].next;
+                x = cx.insts[x].next;
             }
-            if BLOCKS[b].cond != 0 && ir_val(BLOCKS[b].cond) == v {
+            if cx.blocks[b].cond != 0 && ir_val(cx, cx.blocks[b].cond) == v {
                 return false;
             }
         }
@@ -433,21 +436,21 @@ fn uses_only(l: i64, v: i64, u: i64, w: i64) -> bool {
 
 // (0.15) Whether comparison v is used inside loop l only as the condition
 // of selects (a mask).
-fn only_select_conditions(l: i64, v: i64) -> bool {
+fn only_select_conditions(mut cx: *FnCtx, l: i64, v: i64) -> bool {
     unsafe {
-        for k in 0..V_CHAIN.count {
-            let b = V_CHAIN.data[k];
-            let mut x = BLOCKS[b].first;
+        for k in 0..cx.v_chain.count {
+            let b = cx.v_chain.data[k];
+            let mut x = cx.blocks[b].first;
             while x != 0 {
-                for i in 0..ir_operand_count(x) {
-                    let o = ir_operand(x, i);
-                    if o != 0 && ir_val(o) == v && (INSTS[x].op != Op::Sel || i != 0) {
+                for i in 0..ir_operand_count(cx, x) {
+                    let o = ir_operand(cx, x, i);
+                    if o != 0 && ir_val(cx, o) == v && (cx.insts[x].op != Op::Sel || i != 0) {
                         return false;
                     }
                 }
-                x = INSTS[x].next;
+                x = cx.insts[x].next;
             }
-            if BLOCKS[b].cond != 0 && ir_val(BLOCKS[b].cond) == v {
+            if cx.blocks[b].cond != 0 && ir_val(cx, cx.blocks[b].cond) == v {
                 return false;
             }
         }
@@ -455,112 +458,114 @@ fn only_select_conditions(l: i64, v: i64) -> bool {
     }
 }
 
-fn classify(l: i64, v: i64, latch_cond: i64) -> bool {
+fn classify(mut cx: *FnCtx, l: i64, v: i64, latch_cond: i64) -> bool {
     unsafe {
-        let op = INSTS[v].op;
+        let op = cx.insts[v].op;
         if op == Phi {
-            return class_of(v) != 0;
+            return class_of(cx, v) != 0;
         }
-        if v == latch_cond || is_check(v) {
-            set_class(v, VC_SKIP);
+        if v == latch_cond || is_check(cx, v) {
+            set_class(cx, v, VC_SKIP);
             return true;
         }
         if op == Load {
-            let ty = INSTS[v].ty;
-            let addr = ir_val(INSTS[v].a);
-            let c = coef(l, addr);
+            let ty = cx.insts[v].ty;
+            let addr = ir_val(cx, cx.insts[v].a);
+            let c = coef(cx, l, addr);
             // (0.16) Two u32 a lane of u64 each: VC_WIDE (AArch64)
-            if ty == TY_U32 && c == 4 && !X86 && only_widened(l, v) {
-                V_ACCESS.push(v);
-                V_ACCESS.push(addr);
-                V_ACCESS.push(4);
-                set_class(v, VC_WIDE);
+            if ty == TY_U32 && c == 4 && !X86 && only_widened(cx, l, v) {
+                cx.v_access.push(v);
+                cx.v_access.push(addr);
+                cx.v_access.push(4);
+                set_class(cx, v, VC_WIDE);
                 return true;
             }
-            if c == 0 && (class_of(addr) == VC_UNIFORM || invariant_in(l, addr)) {
+            if c == 0 && (class_of(cx, addr) == VC_UNIFORM || invariant_in(cx, l, addr)) {
                 // An invariant address: the same value in every iteration (a
                 // store reaching it is ruled out by the overlap test).
-                V_HAS_ULOAD = true;
-                V_ACCESS.push(v);
-                V_ACCESS.push(addr);
-                V_ACCESS.push(type_size(ty));
-                set_class(v, VC_UNIFORM);
+                cx.v_has_uload = true;
+                cx.v_access.push(v);
+                cx.v_access.push(addr);
+                cx.v_access.push(type_size(ty));
+                set_class(cx, v, VC_UNIFORM);
                 return true;
             }
-            if c != type_size(ty) || !use_elem(ty) {
+            if c != type_size(ty) || !use_elem(cx, ty) {
                 return false;
             }
-            V_ACCESS.push(v);
-            V_ACCESS.push(addr);
-            V_ACCESS.push(type_size(ty));
-            set_class(v, VC_VECTOR);
+            cx.v_access.push(v);
+            cx.v_access.push(addr);
+            cx.v_access.push(type_size(ty));
+            set_class(cx, v, VC_VECTOR);
             return true;
         }
         if op == Store {
-            let ty = INSTS[v].imm2;
-            let addr = ir_val(INSTS[v].a);
-            if coef(l, addr) != type_size(ty) || !use_elem(ty)
-                || !vector_operand_ok(l, INSTS[v].b) {
+            let ty = cx.insts[v].imm2;
+            let addr = ir_val(cx, cx.insts[v].a);
+            if coef(cx, l, addr) != type_size(ty) || !use_elem(cx, ty)
+                || !vector_operand_ok(cx, l, cx.insts[v].b) {
                 return false;
             }
-            V_HAS_STORE = true;
-            V_ACCESS.push(v);
-            V_ACCESS.push(addr);
-            V_ACCESS.push(type_size(ty));
-            set_class(v, VC_VECTOR);
+            cx.v_has_store = true;
+            cx.v_access.push(v);
+            cx.v_access.push(addr);
+            cx.v_access.push(type_size(ty));
+            set_class(cx, v, VC_VECTOR);
             return true;
         }
-        let a = if INSTS[v].a != 0 { class_of(ir_val(INSTS[v].a)) } else { 0 };
-        let b = if INSTS[v].b != 0 { class_of(ir_val(INSTS[v].b)) } else { 0 };
+        let a = if cx.insts[v].a != 0 { class_of(cx, ir_val(cx, cx.insts[v].a)) } else { 0 };
+        let b = if cx.insts[v].b != 0 { class_of(cx, ir_val(cx, cx.insts[v].b)) } else { 0 };
         if a == VC_WIDE || b == VC_WIDE || a == VC_WMUL || b == VC_WMUL {
-            return classify_wide(l, v, a, b);
+            return classify_wide(cx, l, v, a, b);
         }
         // (0.15) A comparison of vectors used only by selects: a mask
         // (signed when ordered: the vector comparisons are).
         if op == Op::Cmp && (a == VC_VECTOR || b == VC_VECTOR) {
-            let t = INSTS[v].imm2;
-            let cond = INSTS[v].cond;
+            let t = cx.insts[v].imm2;
+            let cond = cx.insts[v].cond;
             if !is_integer(t) || (cond != Cond::Eq && cond != Cond::Ne && !is_signed(t))
-                || !use_elem(t) || !vector_operand_ok(l, INSTS[v].a)
-                || !vector_operand_ok(l, INSTS[v].b) || !only_select_conditions(l, v) {
+                || !use_elem(cx, t) || !vector_operand_ok(cx, l, cx.insts[v].a)
+                || !vector_operand_ok(cx, l, cx.insts[v].b) || !only_select_conditions(cx, l, v) {
                 return false;
             }
-            set_class(v, VC_VECTOR);
+            set_class(cx, v, VC_VECTOR);
             return true;
         }
         // (0.15) A select on a mask.
         if op == Op::Sel {
-            let k = ir_val(INSTS[v].a);
-            if a != VC_VECTOR || INSTS[k].op != Op::Cmp || !use_elem(INSTS[v].ty)
-                || !vector_operand_ok(l, INSTS[v].b) || !vector_operand_ok(l, INSTS[v].c) {
+            let k = ir_val(cx, cx.insts[v].a);
+            if a != VC_VECTOR || cx.insts[k].op != Op::Cmp || !use_elem(cx, cx.insts[v].ty)
+                || !vector_operand_ok(cx, l, cx.insts[v].b)
+                || !vector_operand_ok(cx, l, cx.insts[v].c) {
                 return false;
             }
-            set_class(v, VC_VECTOR);
+            set_class(cx, v, VC_VECTOR);
             return true;
         }
         if a == VC_VECTOR || b == VC_VECTOR {
-            let ty = INSTS[v].ty;
+            let ty = cx.insts[v].ty;
             let ok_op = op == Add || op == Sub || op == Mul || op == And || op == Or || op == Xor
                 || op == Neg || (op == Div && is_float(ty));
-            if !ok_op || (is_float(ty) && (op == And || op == Or || op == Xor)) || !use_elem(ty) {
+            if !ok_op || (is_float(ty) && (op == And || op == Or || op == Xor))
+                || !use_elem(cx, ty) {
                 return false;
             }
-            if !vector_operand_ok(l, INSTS[v].a)
-                || (INSTS[v].b != 0 && !vector_operand_ok(l, INSTS[v].b)) {
+            if !vector_operand_ok(cx, l, cx.insts[v].a)
+                || (cx.insts[v].b != 0 && !vector_operand_ok(cx, l, cx.insts[v].b)) {
                 return false;
             }
-            set_class(v, VC_VECTOR);
+            set_class(cx, v, VC_VECTOR);
             return true;
         }
         if a == VC_SKIP || b == VC_SKIP {
             return false;
         }
         if op.is_pure() || op == Const {
-            if op == Op::Cmp || INSTS[v].ty == TY_BOOL {
+            if op == Op::Cmp || cx.insts[v].ty == TY_BOOL {
                 // (A comparison that is no check: control flow, or a value.)
                 return false;
             }
-            set_class(v, VC_UNIFORM);
+            set_class(cx, v, VC_UNIFORM);
             return true;
         }
         false
@@ -571,33 +576,33 @@ fn classify(l: i64, v: i64, latch_cond: i64) -> bool {
 // operand (a and b: its operands' classes): the widening of a u32 load,
 // the product of one with an invariant below 2^32, or an add of such a
 // product to a vector (a VMACW). Anything else of theirs: false.
-fn classify_wide(l: i64, v: i64, a: i64, b: i64) -> bool {
+fn classify_wide(mut cx: *FnCtx, l: i64, v: i64, a: i64, b: i64) -> bool {
     unsafe {
-        let op = INSTS[v].op;
-        let ty = INSTS[v].ty;
+        let op = cx.insts[v].op;
+        let ty = cx.insts[v].ty;
         if ty != TY_U64 && ty != TY_I64 {
             return false;
         }
-        if op == Conv && a == VC_WIDE && INSTS[v].imm2 == TY_U32 {
-            set_class(v, VC_WIDE);
+        if op == Conv && a == VC_WIDE && cx.insts[v].imm2 == TY_U32 {
+            set_class(cx, v, VC_WIDE);
             return true;
         }
         if op == Mul && (a == VC_WIDE) != (b == VC_WIDE) {
-            let k = ir_val(if a == VC_WIDE { INSTS[v].b } else { INSTS[v].a });
-            let w = ir_val(if a == VC_WIDE { INSTS[v].a } else { INSTS[v].b });
-            if class_of(k) == VC_VECTOR || !vector_operand_ok(l, k)
-                || !below_2_32(k) || !use_elem(ty) {
+            let k = ir_val(cx, if a == VC_WIDE { cx.insts[v].b } else { cx.insts[v].a });
+            let w = ir_val(cx, if a == VC_WIDE { cx.insts[v].a } else { cx.insts[v].b });
+            if class_of(cx, k) == VC_VECTOR || !vector_operand_ok(cx, l, k)
+                || !below_2_32(cx, k) || !use_elem(cx, ty) {
                 return false;
             }
-            set_class(v, VC_WMUL);
+            set_class(cx, v, VC_WMUL);
             return true;
         }
         if op == Add && (a == VC_WMUL) != (b == VC_WMUL) {
-            let other = if a == VC_WMUL { INSTS[v].b } else { INSTS[v].a };
-            if !vector_operand_ok(l, other) || !use_elem(ty) {
+            let other = if a == VC_WMUL { cx.insts[v].b } else { cx.insts[v].a };
+            if !vector_operand_ok(cx, l, other) || !use_elem(cx, ty) {
                 return false;
             }
-            set_class(v, VC_VECTOR);
+            set_class(cx, v, VC_VECTOR);
             return true;
         }
         false
@@ -607,14 +612,14 @@ fn classify_wide(l: i64, v: i64, a: i64, b: i64) -> bool {
 // Whether value k is below 2^32: a value of an unsigned type of at most
 // 32 bits (canonical: its u64 is the same; a load, a parameter, what
 // widening left), or such a constant.
-fn below_2_32(k: i64) -> bool {
+fn below_2_32(mut cx: *FnCtx, k: i64) -> bool {
     unsafe {
-        if is_const(k) {
-            return INSTS[k].imm >= 0 && INSTS[k].imm < 1 << 32;
+        if is_const(cx, k) {
+            return cx.insts[k].imm >= 0 && cx.insts[k].imm < 1 << 32;
         }
-        let t = INSTS[k].ty;
-        if INSTS[k].op == Conv {
-            let from = INSTS[k].imm2;
+        let t = cx.insts[k].ty;
+        if cx.insts[k].op == Conv {
+            let from = cx.insts[k].imm2;
             return from == TY_U32 || from == TY_U16 || from == TY_U8;
         }
         t == TY_U32 || t == TY_U16 || t == TY_U8
@@ -623,25 +628,25 @@ fn below_2_32(k: i64) -> bool {
 
 // Whether every use of u32 load v in loop l is its widening to 64 bits,
 // or a 64-bit product (a canonical u32 is its u64 already).
-fn only_widened(l: i64, v: i64) -> bool {
+fn only_widened(mut cx: *FnCtx, l: i64, v: i64) -> bool {
     unsafe {
-        for k in 0..V_CHAIN.count {
-            let b = V_CHAIN.data[k];
-            let mut x = BLOCKS[b].first;
+        for k in 0..cx.v_chain.count {
+            let b = cx.v_chain.data[k];
+            let mut x = cx.blocks[b].first;
             while x != 0 {
-                for i in 0..ir_operand_count(x) {
-                    let o = ir_operand(x, i);
-                    if o != 0 && ir_val(o) == v && !(i == 0 && INSTS[x].op == Conv
-                        && INSTS[x].imm2 == TY_U32
-                        && (INSTS[x].ty == TY_U64 || INSTS[x].ty == TY_I64)
-                        || i <= 1 && INSTS[x].op == Mul
-                        && (INSTS[x].ty == TY_U64 || INSTS[x].ty == TY_I64)) {
+                for i in 0..ir_operand_count(cx, x) {
+                    let o = ir_operand(cx, x, i);
+                    if o != 0 && ir_val(cx, o) == v && !(i == 0 && cx.insts[x].op == Conv
+                        && cx.insts[x].imm2 == TY_U32
+                        && (cx.insts[x].ty == TY_U64 || cx.insts[x].ty == TY_I64)
+                        || i <= 1 && cx.insts[x].op == Mul
+                        && (cx.insts[x].ty == TY_U64 || cx.insts[x].ty == TY_I64)) {
                         return false;
                     }
                 }
-                x = INSTS[x].next;
+                x = cx.insts[x].next;
             }
-            if BLOCKS[b].cond != 0 && ir_val(BLOCKS[b].cond) == v {
+            if cx.blocks[b].cond != 0 && ir_val(cx, cx.blocks[b].cond) == v {
                 return false;
             }
         }

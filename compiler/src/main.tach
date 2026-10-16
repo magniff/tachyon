@@ -91,16 +91,19 @@ mod guide;
 // The standard library, named here in the root: 0.5.0, which builds this
 // compiler, reads std only when the files of the command line name it.
 
+use crate::back::codecache::{cc_args, cc_option};
 use crate::back::dwarf::DEBUG_INFO;
 use crate::back::emit::stats::STATS;
 use crate::back::objfile::{OUTPUT_MODE, OUT_ASM, OUT_EXECUTABLE, OUT_OBJECT, output_mode_of};
 use crate::back::objfile::output::{add_link_arg, add_link_include, is_link_input, link_args_given};
 use crate::back::regalloc::{PRINT_REGALLOC, VERIFY_REGALLOC};
 use crate::base::{
-    FILES, FILE_COUNT, IntVec, OVERLAY, STDERR, STDOUT, alloc_zeroed, buf_int, buf_new, buf_str,
-    buf_write_fd, die, die2, load_sources, streq,
+    FILES, FILE_COUNT, IntVec, OVERLAY, STDERR, STDOUT, alloc_zeroed, buf_int, buf_new, buf_slice,
+    buf_str, buf_write_fd, die, die2, load_sources, streq,
 };
-use crate::base::diag::{DENY_WARNINGS, DIAG_PROG, DIAG_SHORT, ERRORS_AS_DUMP, ERR_KIND};
+use crate::base::diag::{
+    DENY_WARNINGS, DIAG_PROG, DIAG_SHORT, ERRORS_AS_DUMP, ERR_KIND, ok_line_setup, print_ok,
+};
 use crate::base::json::DIAG_JSON;
 use crate::base::target::{
     T_AARCH64_LINUX, T_AARCH64_MACOS, T_X86_64_LINUX, T_X86_64_MACOS, set_target, target_is_linux,
@@ -116,6 +119,7 @@ use crate::front::modules::load_modules;
 use crate::front::own::{is_values_option, values_option};
 use crate::front::stdalloc::{CHECK_ALLOC_LINUX, CHECK_ALLOC_MODE};
 use crate::gen0::gen::{EMIT_IR, EMIT_MIR, compile_program};
+use crate::middle::ctx::main_cx;
 use crate::middle::effects_verify::VERIFY_EFFECTS;
 use crate::middle::egraph::{EGRAPH, check_rules};
 use crate::middle::gvn::NOALIAS_OFF;
@@ -124,12 +128,12 @@ use crate::middle::ipo::PRINT_ATTRS;
 use crate::middle::ir::{IR_CALL_LOCS, IR_LOCS};
 use crate::middle::ir::verify::{PRINT_AFTER_ALL, VERIFY_IR};
 use crate::middle::opt::OPT_LEVEL;
+use crate::middle::parallel::{JOBS, parse_jobs, vec_stat};
 use crate::middle::profile::{PROFILE_GENERATE, PROFILE_USE};
 use crate::middle::slp::SLP;
 use crate::middle::trace::TRACE;
 use crate::middle::unsafecheck::CHECK_UNSAFE;
 use crate::middle::vectorize::VECTORIZE;
-use crate::middle::vectorize::checks::{VEC_STAT_LOOPS, VEC_STAT_SKIPPED, VEC_STAT_TESTS};
 use crate::middle::vectorize::unroll::UNROLL_RUNTIME;
 use crate::tools::batch::run_batch;
 use crate::tools::commands::run_command;
@@ -147,7 +151,7 @@ fn usage() -> ! {
 
 // The release this source is; see docs/releases.md.
 pub fn version() -> *u8 {
-    c"0.18.0"
+    c"0.18.1"
 }
 
 // struct utsname: sysname is the first field on every system; machine is
@@ -202,6 +206,7 @@ fn main(argc: i32, argv: **u8) -> i32 {
         // (0.15) `--json`, anywhere: diagnostics and output as JSON lines
         // (base::diag::DIAG_JSON), for every command; taken out of argv.
         DIAG_PROG = argv[0];
+        ok_line_setup();
         let mut argc = argc;
         let mut k = 1;
         while k < argc as i64 {
@@ -260,19 +265,27 @@ fn main(argc: i32, argv: **u8) -> i32 {
         DIAG_SHORT = isatty(STDERR) == 0;
         let mut inputs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let mut output = c"a.o";
+        let mut output_given = false;
         let mut tokens_only = false;
         let mut target = 0;
         let mut include_dirs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let mut emit_imports = false;
         let mut vec_stats = false;
+        // (0.18.1: the options, for the code cache's key, back::codecache)
+        cc_args(argc as i64, argv);
         let mut i = 1;
         while i < argc as i64 {
             let arg = argv[i];
+            if cc_option(arg) {
+                i += 1;
+                continue;
+            }
             if streq(arg, c"-o") {
                 if i + 1 >= argc as i64 {
                     usage();
                 }
                 output = argv[i + 1];
+                output_given = true;
                 i += 2;
                 continue;
             }
@@ -290,6 +303,18 @@ fn main(argc: i32, argv: **u8) -> i32 {
             if streq(arg, c"-O0") || streq(arg, c"-O1") || streq(arg, c"-O2") {
                 OPT_LEVEL = (arg[2] - '0') as i64;
                 i += 1;
+                continue;
+            }
+            // (0.18.1) -j N or -jN: the threads code generation may use (the
+            // output is the same whatever their number; middle::parallel).
+            if arg[0] == '-' && arg[1] == 'j' {
+                let value = if arg[2] != 0 { &arg[2] } else if i + 1 < argc as i64 { argv[i + 1] }
+                    else { c"" };
+                JOBS = parse_jobs(value);
+                if JOBS < 1 {
+                    die(c"-j wants a number of threads: -j4, or -j 1 for one");
+                }
+                i += if arg[2] != 0 { 1 } else { 2 };
                 continue;
             }
             if streq(arg, c"--emit-asm") || streq(arg, c"-S") {
@@ -495,7 +520,7 @@ fn main(argc: i32, argv: **u8) -> i32 {
                 continue;
             }
             if streq(arg, c"--check-rules") {
-                return if check_rules(2000) == 0 { 0 } else { 1 };
+                return if check_rules(main_cx(), 2000) == 0 { 0 } else { 1 };
             }
             if streq(arg, c"--deny-warnings") {
                 DENY_WARNINGS = true;
@@ -525,6 +550,12 @@ fn main(argc: i32, argv: **u8) -> i32 {
         }
         if inputs.count == 0 {
             usage();
+        }
+        // (0.18.1) --emit-ir and --emit-mir without -o print to stdout ("-";
+        // gen0::gen::write_dump): agents in the 0.18 eval looked for the IR
+        // on stdout and found a.o next to the source.
+        if (EMIT_IR || EMIT_MIR) && !output_given {
+            output = c"-";
         }
         if PROFILE_GENERATE != 0 as *u8 && OPT_LEVEL == 0 {
             die(c"--profile-generate needs -O1 or -O2");
@@ -583,15 +614,24 @@ fn main(argc: i32, argv: **u8) -> i32 {
         }
         import_c_headers(target, &include_dirs, emit_imports, output);
         lex_range(FILES[FILE_COUNT - 1].end, FILES[FILE_COUNT - 1].end, true);
-        compile_program(output);
+        compile_program(main_cx(), output);
+        // (0.18.1) the success line: `ok: built prog` (base::diag::print_ok)
+        let done = buf_new();
+        buf_str(done,
+            if OUTPUT_MODE == OUT_EXECUTABLE && !EMIT_HEADER && !EMIT_IR && !EMIT_MIR { c"built " }
+            else { c"wrote " });
+        buf_str(done, output);
+        if !streq(output, c"-") {
+            print_ok(buf_slice(done));
+        }
         if vec_stats {
             let b = buf_new();
             buf_str(b, c"vector loops ");
-            buf_int(b, VEC_STAT_LOOPS);
+            buf_int(b, vec_stat(0));
             buf_str(b, c", overlap tests ");
-            buf_int(b, VEC_STAT_TESTS);
+            buf_int(b, vec_stat(1));
             buf_str(b, c", tests dropped by noalias ");
-            buf_int(b, VEC_STAT_SKIPPED);
+            buf_int(b, vec_stat(2));
             buf_str(b, c"\n");
             buf_write_fd(b, STDERR);
         }

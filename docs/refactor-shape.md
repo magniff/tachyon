@@ -162,7 +162,7 @@ $ tachyonc refactor variant Shape --add 'Ring(i64)' --arm-in area 0 --arm-in rou
 ## rewrite
 
 ```
-tachyonc rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: *IntVec'
+tachyonc rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: &mut IntVec'
 rewrote 37 sites in 9 files→9 files→+37 -37 lines
 ```
 
@@ -176,7 +176,7 @@ by the compiler's parser, with holes:
 | `$x` | any expression; in a type's place, any type (`$a as $T`); in a `let`'s binding place, any pattern (`let $v = ...;`) |
 | `$x...` | any number of elements of a call's arguments, a tuple, an array (one per list): `f($first, $rest...)`; (0.15) of a block's statements, its tail included: `{ let $x = $e; $s... }` |
 | `$x` written twice | the same code both times (the same tokens, spacing and comments aside) |
-| `--where '$x: T'` | only where the checker typed $x's expression `T` (as messages write types: `*IntVec`, `[u8]`, `Vec<i64>`; spaces aside); several: `--where '$x: T, $y: U'` or `--where` again |
+| `--where '$x: T'` | only where the checker typed $x's expression `T` (as messages write types: `&mut IntVec`, `[u8]`, `Vec<i64>`; spaces aside); several: `--where '$x: T, $y: U'` or `--where` again |
 | `--where '$x: name'`, `--where '$x: name ~ RE'`, `$x~/RE/` | (0.16) only a name: an identifier or a path (`V`, `crate::m::V`, the name a `for` or `let` binds), not another expression (`IRFUNCS[f].blocks`); with RE, a name whose text RE matches (`^ $ . * + ? [a-z] [^...] \d \w`, anywhere unless anchored: `$v~/^v_/`) |
 
 The pattern is matched against every node as parsed (`--in FILE|MODULE`:
@@ -287,17 +287,17 @@ called where they were:
 $ tachyonc refactor extract-function mean_to --lines 40-43 --to add_all --show
 extracted lines 40-43 of crate::calc::mean_to into add_all(i, n, acc) -> i64→calc.tach→+6 -1 lines
 // calc.tach:40-44
-40→    i = add_all(i, n, &acc);
+40→    i = add_all(i, n, &mut acc);
 ...
-44→fn add_all(mut i: i64, n: i64, acc: *Acc) -> i64 {
+44→fn add_all(mut i: i64, n: i64, acc: &mut Acc) -> i64 {
 ```
 
 - **Parameters**: the locals of FN the lines use and do not declare, in
   the order of their first use, typed as declared (`x: T` as written,
   else as the checker has it): by value; `mut` and given back when the
   lines assign them (or use their value and take their address); by
-  pointer (`acc: *Acc`, called with `&acc`, the lines' `&acc` then
-  `acc`) when they only take their address or write their fields
+  reference (`acc: &mut Acc`, called with `&mut acc`, 0.18.1; it was
+  `acc: *Acc`; the lines' `&acc` then `acc`) when they only take their address or write their fields
   (`acc.add(i)`, `p.x = 0`; an array indexed is passed by value).
 - **Result**: the locals the lines declare and FN uses after them (`let
   x = NEW(...);`, several: `let (a, b) = NEW(...);`, `mut` where they

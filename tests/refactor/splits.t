@@ -3,6 +3,7 @@
 ## group, keeps the interface with --reexport, and tidies the imports
 ## of the files it edits (tests/refactor/splits/).
 $ main.tach -o prog
+ok: built prog
 % ./prog; echo "exit $?"
 exit 0
 ## --reexport: code outside the module (main.tach) is left as it is.
@@ -42,6 +43,7 @@ pub fn weight(k: i64) -> i64 {
     if k == 0 { W_LOW } else if k == 1 { W_MID } else { W_HIGH }
 }
 $ main.tach -o prog
+ok: built prog
 % ./prog; echo "exit $?"
 exit 0
 $ undo

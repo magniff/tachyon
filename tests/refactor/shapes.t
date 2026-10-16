@@ -1,5 +1,6 @@
 ## tachyonc refactor signature|field|variant (tests/refactor/shapes/).
 $ check
+ok: 0 errors in main.tach
 ## --- signature ---
 ## A parameter added: the definition, and each call with the value.
 $ refactor signature area --add 'scale: i64 = 1' --fill-calls --dry-run
@@ -19,14 +20,14 @@ $ refactor signature Point::scale --add 'extra: i64 = 0' --at 1 --dry-run
 +++ b/main.tach
 @@ -14,2 +14,2 @@
 -    p.scale(2);
--    Point::scale(&p, 3);
+-    Point::scale(&mut p, 3);
 +    p.scale(0, 2);
-+    Point::scale(&p, 0, 3);
++    Point::scale(&mut p, 0, 3);
 --- a/geom.tach
 +++ b/geom.tach
 @@ -46 +46 @@
--    pub fn scale(self: *Point, k: i64) {
-+    pub fn scale(self: *Point, extra: i64, k: i64) {
+-    pub fn scale(self: &mut Point, k: i64) {
++    pub fn scale(self: &mut Point, extra: i64, k: i64) {
 note refactor.fill-calls: the calls get the value (a default is on trailing parameters only, and a later one has none)
 ## A trait's function: the trait, every impl, the calls (in a generic
 ## function's instances too).
@@ -39,14 +40,14 @@ $ refactor signature Shape::size --add 'bias: i64 = 0' --dry-run
 --- a/geom.tach
 +++ b/geom.tach
 @@ -53 +53 @@
--    fn size(self: *Self, unit: i64) -> i64;
-+    fn size(self: *Self, unit: i64, bias: i64) -> i64;
+-    fn size(self: &Self, unit: i64) -> i64;
++    fn size(self: &Self, unit: i64, bias: i64) -> i64;
 @@ -57 +57 @@
--    fn size(self: *Point, unit: i64) -> i64 {
-+    fn size(self: *Point, unit: i64, bias: i64) -> i64 {
+-    fn size(self: &Point, unit: i64) -> i64 {
++    fn size(self: &Point, unit: i64, bias: i64) -> i64 {
 @@ -63 +63 @@
--    fn size(self: *Pair, unit: i64) -> i64 {
-+    fn size(self: *Pair, unit: i64, bias: i64) -> i64 {
+-    fn size(self: &Pair, unit: i64) -> i64 {
++    fn size(self: &Pair, unit: i64, bias: i64) -> i64 {
 @@ -69 +69 @@
 -    s.size(1) + s.size(2)
 +    s.size(1, 0) + s.size(2, 0)
@@ -73,17 +74,17 @@ $ refactor signature Point::size --rename-param unit u --dry-run
 --- a/geom.tach
 +++ b/geom.tach
 @@ -53 +53 @@
--    fn size(self: *Self, unit: i64) -> i64;
-+    fn size(self: *Self, u: i64) -> i64;
+-    fn size(self: &Self, unit: i64) -> i64;
++    fn size(self: &Self, u: i64) -> i64;
 @@ -57,2 +57,2 @@
--    fn size(self: *Point, unit: i64) -> i64 {
+-    fn size(self: &Point, unit: i64) -> i64 {
 -        (self.x + self.y) * unit
-+    fn size(self: *Point, u: i64) -> i64 {
++    fn size(self: &Point, u: i64) -> i64 {
 +        (self.x + self.y) * u
 @@ -63,2 +63,2 @@
--    fn size(self: *Pair, unit: i64) -> i64 {
+-    fn size(self: &Pair, unit: i64) -> i64 {
 -        (self.a + self.b) as i64 * unit
-+    fn size(self: *Pair, u: i64) -> i64 {
++    fn size(self: &Pair, u: i64) -> i64 {
 +        (self.a + self.b) as i64 * u
 $ refactor signature apply --reorder x,f --dry-run
 --- a/main.tach
@@ -101,7 +102,9 @@ $ refactor signature area --type p '*Point' --dry-run
 -pub fn area(p: Point) -> i64 {
 +pub fn area(p: *Point) -> i64 {
 main.tach:16:18: error[type error] expected '*Point', got 'Point' | help: a pointer to it: its address | try: &p | try: tachyonc fix --suggested main.tach  [in crate::main]
-warning edit.breaks: 1 new error (1 in crate::main, which the edit does not change) (dry run)
+geom.tach:18:5: error[unsafe] access to a field through a raw pointer is unsafe: `p` is a `*T` parameter | help: a `*T` parameter is a raw pointer (0.18.1); a borrow is `&T`, or `&mut T` when written through: make `p` one (the first try: changes such parameters, with their calls), or put this in an `unsafe { ... }` block (the second: what the first keeps raw, a pointer indexed, compared, cast, stored or given to C) | try: tachyonc fix --values main.tach | try: tachyonc fix --only unsafe main.tach  [edited: crate::geom::area]
+geom.tach:18:11: error[unsafe] access to a field through a raw pointer is unsafe: `p` is a `*T` parameter | help: a `*T` parameter is a raw pointer (0.18.1); a borrow is `&T`, or `&mut T` when written through: make `p` one (the first try: changes such parameters, with their calls), or put this in an `unsafe { ... }` block (the second: what the first keeps raw, a pointer indexed, compared, cast, stored or given to C) | try: tachyonc fix --values main.tach | try: tachyonc fix --only unsafe main.tach  [edited: crate::geom::area]
+warning edit.breaks: 3 new errors (2 in the edited text, 1 in crate::main, which the edit does not change) (dry run)
 [exit 1]
 ## Refused: a function used as a value, a missing default, an unknown
 ## parameter, a parameter still used, a name taken.

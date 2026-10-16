@@ -4,8 +4,9 @@
 // that hold at a block (mod.tach).
 
 use crate::front::types::{TY_BOOL, int_bits, is_integer, is_signed};
+use crate::middle::ctx::FnCtx;
 use crate::middle::fold::{is_const, shift_amount};
-use crate::middle::ir::{INSTS, Op};
+use crate::middle::ir::Op;
 use crate::middle::range::narrow_by_facts;
 use crate::middle::range::phi::phi_range;
 
@@ -45,42 +46,42 @@ pub fn type_max(ty: i64) -> i64 {
 const RANGE_DEPTH: i64 = 24;
 
 // The range of v (context-free): *lo and *hi.
-fn range_of(v: i64, lo: *i64, hi: *i64, depth: i64) {
+fn range_of(mut cx: *FnCtx, v: i64, lo: &mut i64, hi: &mut i64, depth: i64) {
     unsafe {
-        let ty = INSTS[v].ty;
+        let ty = cx.insts[v].ty;
         *lo = type_min(ty);
         *hi = type_max(ty);
-        let op = INSTS[v].op;
+        let op = cx.insts[v].op;
         if op == Op::Const {
-            *lo = INSTS[v].imm;
-            *hi = INSTS[v].imm;
+            *lo = cx.insts[v].imm;
+            *hi = cx.insts[v].imm;
             return;
         }
         if depth > RANGE_DEPTH || !is_integer(ty) {
             return;
         }
-        let a = INSTS[v].a;
-        let b = INSTS[v].b;
+        let a = cx.insts[v].a;
+        let b = cx.insts[v].b;
         // (0.11) An operation with one operand to range costs less depth
         // than one with two: chains of constants added, shifted and
         // converted are followed further than trees.
-        let next = if op == Op::Conv || op == Op::Rem || op == Op::Shr || is_const(a)
-            || is_const(b) {
+        let next = if op == Op::Conv || op == Op::Rem || op == Op::Shr || is_const(cx, a)
+            || is_const(cx, b) {
             depth + 1
         } else {
             depth + 4
         };
         if op == Op::And {
-            let m = if is_const(b) { INSTS[b].imm } else if is_const(a) { INSTS[a].imm }
-                else { -1 };
+            let m = if is_const(cx, b) { cx.insts[b].imm }
+                else if is_const(cx, a) { cx.insts[a].imm } else { -1 };
             if m >= 0 {
                 *lo = 0;
                 if m < *hi {
                     *hi = m;
                 }
             }
-        } else if op == Op::Rem && is_const(b) && INSTS[b].imm != 0 {
-            let c = INSTS[b].imm;
+        } else if op == Op::Rem && is_const(cx, b) && cx.insts[b].imm != 0 {
+            let c = cx.insts[b].imm;
             if !is_signed(ty) && c > 0 {
                 *lo = 0;
                 *hi = c - 1;
@@ -88,27 +89,46 @@ fn range_of(v: i64, lo: *i64, hi: *i64, depth: i64) {
                 let m = if c < 0 { 0 - c } else { c };
                 let mut alo = 0;
                 let mut ahi = 0;
-                range_with_facts(a, &alo, &ahi, next);
+                range_with_facts(cx, a, &mut alo, &mut ahi, next);
                 *lo = if alo >= 0 { 0 } else { 1 - m };
                 *hi = if ahi <= 0 { 0 } else { m - 1 };
             }
+        } else if op == Op::Rem && int_bits(ty) == 64 {
+            // (0.18.1) x % n by a positive n (a fact, say a requires' `n > 0`):
+            // in [0, n) unsigned, and for a signed one |x % n| < n (x % 0 is
+            // x, so the divisor must be known positive).
+            let mut blo = 0;
+            let mut bhi = 0;
+            range_with_facts(cx, b, &mut blo, &mut bhi, next);
+            if blo >= 1 {
+                if !is_signed(ty) {
+                    *lo = 0;
+                    *hi = bhi - 1;
+                } else {
+                    let mut alo = 0;
+                    let mut ahi = 0;
+                    range_with_facts(cx, a, &mut alo, &mut ahi, next);
+                    *lo = if alo >= 0 { 0 } else { 1 - bhi };
+                    *hi = if ahi <= 0 { 0 } else { bhi - 1 };
+                }
+            }
         } else if op == Op::Phi {
-            phi_range(v, lo, hi, depth);
+            phi_range(cx, v, lo, hi, depth);
         } else if op == Op::Sel {
             // (0.15) Either operand.
             let mut blo = 0;
             let mut bhi = 0;
             let mut clo = 0;
             let mut chi = 0;
-            range_with_facts(b, &blo, &bhi, depth + 4);
-            range_with_facts(INSTS[v].c, &clo, &chi, depth + 4);
+            range_with_facts(cx, b, &mut blo, &mut bhi, depth + 4);
+            range_with_facts(cx, cx.insts[v].c, &mut clo, &mut chi, depth + 4);
             *lo = lesser(blo, clo);
             *hi = greater(bhi, chi);
-        } else if op == Op::Shr && is_const(b) {
-            let k = shift_amount(INSTS[b].imm, ty);
+        } else if op == Op::Shr && is_const(cx, b) {
+            let k = shift_amount(cx.insts[b].imm, ty);
             let mut alo = 0;
             let mut ahi = 0;
-            range_with_facts(a, &alo, &ahi, next);
+            range_with_facts(cx, a, &mut alo, &mut ahi, next);
             if is_signed(ty) {
                 // (0.11) An arithmetic shift is monotone.
                 *lo = alo >> k as u64;
@@ -123,17 +143,17 @@ fn range_of(v: i64, lo: *i64, hi: *i64, depth: i64) {
                     *hi = lesser(*hi, ahi >> k as u64);
                 }
             }
-        } else if op == Op::Conv && is_integer(INSTS[v].imm2) {
-            let from = INSTS[v].imm2;
+        } else if op == Op::Conv && is_integer(cx.insts[v].imm2) {
+            let from = cx.insts[v].imm2;
             if int_bits(from) == 64 && int_bits(ty) == 64 {
                 // (0.11) The same bits: the same range in the signed view.
-                range_with_facts(a, lo, hi, next);
+                range_with_facts(cx, a, lo, hi, next);
             }
             else if int_bits(from) < int_bits(ty)
                 || (int_bits(from) == int_bits(ty) && is_signed(from) == is_signed(ty)) {
                 let mut alo = 0;
                 let mut ahi = 0;
-                range_with_facts(a, &alo, &ahi, next);
+                range_with_facts(cx, a, &mut alo, &mut ahi, next);
                 // Widening keeps the value when it fits the new type.
                 if alo >= type_min(ty) && ahi <= type_max(ty) && (is_signed(ty) || alo >= 0) {
                     *lo = alo;
@@ -152,15 +172,15 @@ fn range_of(v: i64, lo: *i64, hi: *i64, depth: i64) {
             let mut ahi = MAX_I64;
             let mut blo = MIN_I64;
             let mut bhi = MAX_I64;
-            if op == Op::Shl || (INSTS[a].op == Op::Phi && INSTS[b].op != Op::Phi) {
-                range_with_facts(b, &blo, &bhi, next);
+            if op == Op::Shl || (cx.insts[a].op == Op::Phi && cx.insts[b].op != Op::Phi) {
+                range_with_facts(cx, b, &mut blo, &mut bhi, next);
                 if usable_operand(op, blo, bhi, true) {
-                    range_with_facts(a, &alo, &ahi, next);
+                    range_with_facts(cx, a, &mut alo, &mut ahi, next);
                 }
             } else {
-                range_with_facts(a, &alo, &ahi, next);
+                range_with_facts(cx, a, &mut alo, &mut ahi, next);
                 if usable_operand(op, alo, ahi, false) {
-                    range_with_facts(b, &blo, &bhi, next);
+                    range_with_facts(cx, b, &mut blo, &mut bhi, next);
                 }
             }
             let mut rlo = 0;
@@ -221,14 +241,14 @@ pub fn greater(a: i64, b: i64) -> i64 {
 
 // The range of v, with the facts in FACTS that compare v itself with a
 // constant applied.
-pub fn range_with_facts(v: i64, lo: *i64, hi: *i64, depth: i64) {
-    range_of(v, lo, hi, depth);
-    narrow_by_facts(v, lo, hi, depth);
+pub fn range_with_facts(mut cx: *FnCtx, v: i64, lo: &mut i64, hi: &mut i64, depth: i64) {
+    range_of(cx, v, lo, hi, depth);
+    narrow_by_facts(cx, v, lo, hi, depth);
 }
 
 // The range of v at a block whose facts are in FACTS.
-pub fn range_at(v: i64, lo: *i64, hi: *i64) {
-    range_with_facts(v, lo, hi, 0);
+pub fn range_at(mut cx: *FnCtx, v: i64, lo: &mut i64, hi: &mut i64) {
+    range_with_facts(cx, v, lo, hi, 0);
 }
 
 pub const MIN_I64: i64 = 0 - 9223372036854775807 - 1;

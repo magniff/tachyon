@@ -41,7 +41,7 @@ Most say what to do, in their `help:`. A `KIND` (`type error`,
 $ tachyonc explain unsafe
 unsafe: error (compiler)
 An unsafe operation (a raw pointer's dereference or indexing, a C call, a union field) outside unsafe code.
-fix: Put it in an `unsafe { }` block, or the function in `unsafe fn`; the try: line, `tachyonc fix --only unsafe ROOT`, wraps every such place (the check hook prints it once, with how many errors it answers).
+fix: Put it in an `unsafe { }` block, or the function in `unsafe fn`; the try: line, `tachyonc fix --only unsafe ROOT`, wraps every such place (the check hook prints it once, with how many errors it answers). Through a `*T` parameter (raw since 0.18.1, V4; until then a non-`mut` one was a borrow, `&mut T`): make it `&T`, or `&mut T` when written through, with `tachyonc fix --values ROOT` (every such parameter and its calls), then `fix --only unsafe` for what it keeps raw (indexed, compared, cast, stored, given to C).
 example:
     main.tach:39:13: error[unsafe] dereference of a raw pointer is unsafe | help: put it in an `unsafe { ... }` block, or the function's body in an `unsafe fn` (the try: line wraps every such place) | try: tachyonc fix --only unsafe main.tach
 ```
@@ -202,11 +202,13 @@ applied 2 blocks: replaced crate::roster::enrol; inserted after crate::roster::e
 ```console
 $ tachyonc check && echo no errors
 no errors
+ok: 0 errors in main.tach
 $ tachyonc main.tach -o gradebook && ./gradebook
 Ada     95 A  swing  6, with honours
 Brook   75 C  swing 21
 Cyd     64 D  swing 17
 best: Ada (95); 3 students have 3 scores or more
+ok: built gradebook
 $ git diff --stat
  grades.tach |  6 +++---
  main.tach   |  1 +

@@ -40,7 +40,7 @@ on the command line make one program; `mod name;` loads `name.tach`.
 | Rust | tachyon |
 |---|---|
 | `String`, `&str` | `[u8]`, a byte slice: `"text"` is a `[u8]`; build text with `std::Buf`; `c"text"` is a NUL-terminated `*u8` for C |
-| `&T`, `&mut T`, `Box<T>` | `&T`, `&mut T` (0.17): `&x`, `&mut x`, checked and safe; no lifetimes; `*T` is the raw pointer (a `*T` parameter is still taken as `&mut T`); no `Box` |
+| `&T`, `&mut T`, `Box<T>` | `&T`, `&mut T` (0.17): `&x`, `&mut x`, checked and safe; no lifetimes; `*T` is the raw pointer: dereferencing it needs `unsafe`, parameter or not (0.18.1); no `Box` |
 | `fn f(&self)`, `fn f(&mut self)` | `fn f(self: &T)`, `fn f(self: &mut T)` (0.17); `fn f(self: T)` takes the value (an owned one moves) |
 | `use m::*;` | not allowed: `use m::{a, b};`, or the path `m::a` |
 | `println!("{}", x)`, `format!` | no macros: `println(f"x = {x:>4} {v:?}")`, `format_in(f"..", gpa)` (a `Buf`) (`guide formatting`) |
@@ -79,7 +79,7 @@ let c = 3u32;             // suffixes; 1_000, 0xff, 0b1010
 let d = 2.5;              // f64; 2.5f32 is f32
 let e = 'A';              // u8: a byte, ASCII only
 let f = true;             // bool
-let s = "bytes";          // [u8]: s.len() (or the field s.len, an i64), s[0], s[1..3]
+let s = "bytes";          // [u8]: s.len() (an i64), s[0], s[1..3]
 let p = c"for C";         // *u8, NUL-terminated
 let t = (1, "two");       // a tuple: t.0, t.1
 let arr = [0; 8];         // [i64; 8]; also [1, 2, 3]; arr[i] is checked
@@ -244,7 +244,7 @@ re-exports. A missing import's error says which `use` line to add, and
 ```tach
 fn sum(xs: [i64]) -> i64 {
     let mut t = 0;
-    for i in 0..xs.len { t += xs[i]; }    // indices are i64; checked
+    for i in 0..xs.len() { t += xs[i]; }    // indices are i64; checked
     t
 }
 
@@ -269,7 +269,7 @@ main.tach:16:20: index out of bounds: index 4, length 4
 ```
 
 An array `[T; N]` is a value (copied by `=`; `a.len()` is N); a slice
-`[T]` is a pointer and a length (`.ptr`, `.len`, `.len()`) viewing an
+`[T]` is a pointer and a length (`.len()`; `.ptr` for C) viewing an
 array, a `Vec` or memory. A `[T]` is read-only; `&mut [T]`
 (`&mut a[..]`, `v.as_mut_slice()`) writes its elements (0.17).
 
@@ -341,10 +341,49 @@ line per item: `tachyonc guide std#the-api`; each item with its comment:
 `tachyonc guide std#every-item`; one name: `tachyonc guide --find NAME`.
 @STD-API-FULL@
 
+A priority queue is a `BinaryHeap` (the largest first) or a `MinHeap`
+(the smallest first; Rust's `BinaryHeap<Reverse<T>>`), both in the
+prelude (`guide std#heaps-priority-queues`). Dijkstra's shortest paths
+with a MinHeap of (distance, node) pairs:
+
+```tach
+// Dijkstra: the shortest distances from node 0.
+fn main(gpa: Gpa) -> i32 {
+    let n = 5;
+    let mut adj: Vec<Vec<(i64, i64)>> = Vec::new_in(gpa);   // adj[u]: (to, weight)
+    for _ in 0..n {
+        adj.push(Vec::new_in(gpa));
+    }
+    for (u, v, w) in [(0, 1, 4), (0, 2, 1), (2, 1, 2), (1, 3, 1), (2, 3, 5)] {
+        adj[u].push((v, w));
+    }
+    let mut dist: Vec<i64> = Vec::filled_in(n, i64::MAX, gpa);
+    let mut heap: MinHeap<(i64, i64)> = MinHeap::new_in(gpa);  // (distance, node)
+    dist[0] = 0;
+    heap.push((0, 0));
+    while let Some((d, u)) = heap.pop() {      // the nearest first
+        if d > dist[u] {
+            continue;                          // stale: u was reached sooner
+        }
+        for (v, w) in adj[u].iter() {
+            if d + w < dist[v] {
+                dist[v] = d + w;
+                heap.push((d + w, v));
+            }
+        }
+    }
+    println(f"{dist[1]} {dist[2]} {dist[3]} {dist[4] == i64::MAX}");
+    0
+}
+```
+```out
+3 1 4 true
+```
+
 ## Input, output, arguments
 
 std prints and reads stdin: `read_stdin_in(gpa)` (all of it, a
-`Result<Buf, IoError>`), `read_line(&buf)` (the next line, without its
+`Result<Buf, IoError>`), `read_line(&mut buf)` (the next line, without its
 `'\n'`; `Ok(false)` at the end), `Scanner` (tokens, numbers, lines of a
 text), `parse_int` (a `Result`), `split_in`, `trim` (`guide conversions`:
 Option means absent, Result failed). Files go through C (`fopen`):
@@ -395,8 +434,8 @@ fn main() -> i32 {
 Unsafe operations: calling C or an `unsafe fn`, dereferencing (`*p`,
 `p.f`) or indexing (`p[i]`) a raw pointer, reading a union field. A
 reference (`&T`, `&mut T`) is safe to read and write through wherever
-it is kept, and so is a `*T` parameter (taken as `&mut T` in 0.17); any
-other `*T` (a local or field of that type, a C result) is raw.
+it is kept; every `*T` is raw, a parameter too (0.18.1: `mut` or not;
+`fix --values` makes a parameter a reference).
 `tachyonc fix --only unsafe` wraps what needs it; `#[repr(C)]`, callbacks
 and linking: `guide c-interop`.
 
@@ -415,7 +454,7 @@ and linking: `guide c-interop`.
 | `'for' iterates over ... got 'i64'` | a range: `for x in 0..n`; a Vec, a HashMap, `v.iter()` and ranges as values iterate too (0.14) |
 | `expected '[i64]', got '[i64; 3]'` | pass `a[..]` |
 | `expected 'i32', got 'i64'` | `x as i32`: only widening is implicit |
-| `cannot take address of non-lvalue expression` | `&` needs a place: `let p = P { x: 1 }; f(&p)` |
+| `cannot take address of non-lvalue expression` | `&f(x)` is a temporary (0.18.1) unless a call before it in the statement could see the order: name it, `let t = f(x);` then `&t` |
 | `non-exhaustive match: 'E::C' is not covered` | an arm, or `_ =>` |
 | `error[unsafe] calling a C function is unsafe` | `unsafe { ... }` |
 | `undefined variable 'helper' \| help: add 'use ...'` | add the `use` line the help names |

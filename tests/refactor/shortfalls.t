@@ -1,5 +1,6 @@
 ## 0.14: the tools' shortfalls recorded in 0.13 (tests/refactor/shortfalls/).
 $ check
+ok: 0 errors in main.tach
 ## --- refactor variant --add --arm-in: an arm per match ---
 ## Without arms: the matches, and the commands that give them one (one
 ## --arm for all, or an --arm-in per match).
@@ -196,5 +197,6 @@ pub fn fourth() -> i64 {
     first() + third()
 }
 $ main.tach -o prog
+ok: built prog
 % ./prog; echo "exit $?"
 exit 0

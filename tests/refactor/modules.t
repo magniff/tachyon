@@ -2,7 +2,9 @@
 ## new-module, move-module, split; each atomic, journaled for undo, with
 ## --dry-run.
 $ check
+ok: 0 errors in main.tach
 $ main.tach -o prog
+ok: built prog
 % ./prog; echo "exit $?"
 exit 0
 ## ---- rename ----
@@ -77,8 +79,8 @@ $ refactor rename Point::sum total --dry-run
 --- a/geom.tach
 +++ b/geom.tach
 @@ -12 +12 @@
--    pub fn sum(self: *Point) -> i64 {
-+    pub fn total(self: *Point) -> i64 {
+-    pub fn sum(self: &Point) -> i64 {
++    pub fn total(self: &Point) -> i64 {
 ## A module: its file is renamed too.
 $ refactor rename crate::util tools
 renamed crate::util to tools	3 files	+4 -4 lines
@@ -167,6 +169,7 @@ pub fn double(p: Point) -> Point {
     scale(p, half(twice(2)))
 }
 $ main.tach -o prog
+ok: built prog
 % ./prog; echo "exit $?"
 exit 0
 $ undo
@@ -185,7 +188,7 @@ pub struct Point {
 
 impl Point {
     // x + y.
-    pub fn sum(self: *Point) -> i64 {
+    pub fn sum(self: &Point) -> i64 {
         self.x + self.y
     }
 }
@@ -230,7 +233,7 @@ $ refactor move geom::Point --to crate::shapes
 moved crate::geom::Point to crate::shapes	3 files	+16 -14 lines
 % git diff
 diff --git a/geom.tach b/geom.tach
-index bf000c1..872f916 100644
+index 97f33f8..872f916 100644
 --- a/geom.tach
 +++ b/geom.tach
 @@ -1,19 +1,8 @@
@@ -246,7 +249,7 @@ index bf000c1..872f916 100644
 -
 -impl Point {
 -    // x + y.
--    pub fn sum(self: *Point) -> i64 {
+-    pub fn sum(self: &Point) -> i64 {
 -        self.x + self.y
 -    }
 -}
@@ -269,7 +272,7 @@ index 620be80..2ddb6f5 100644
  
  fn main() -> i32 {
 diff --git a/shapes.tach b/shapes.tach
-index 0c40caf..2869d54 100644
+index 0c40caf..bd6cf2f 100644
 --- a/shapes.tach
 +++ b/shapes.tach
 @@ -1,6 +1,6 @@
@@ -292,11 +295,12 @@ index 0c40caf..2869d54 100644
 +
 +impl Point {
 +    // x + y.
-+    pub fn sum(self: *Point) -> i64 {
++    pub fn sum(self: &Point) -> i64 {
 +        self.x + self.y
 +    }
 +}
 $ main.tach -o prog
+ok: built prog
 % ./prog; echo "exit $?"
 exit 0
 $ undo
@@ -465,6 +469,7 @@ index 620be80..b915abc 100644
      if n == 127 { 0 } else { 1 }
  }
 $ main.tach -o prog
+ok: built prog
 % ./prog; echo "exit $?"
 exit 0
 $ refactor move-module crate::figures::shapes crate::shapes
@@ -503,7 +508,7 @@ pub struct Point {
 
 impl Point {
     // x + y.
-    pub fn sum(self: *Point) -> i64 {
+    pub fn sum(self: &Point) -> i64 {
         self.x + self.y
     }
 }
@@ -546,6 +551,7 @@ index 0c40caf..df89998 100644
  pub fn perimeter(p: Point) -> i64 {
      let q = double(p);
 $ main.tach -o prog
+ok: built prog
 % ./prog; echo "exit $?"
 exit 0
 $ undo
@@ -573,6 +579,7 @@ split crate::geom into 2 modules	5 files	+32 -24 lines
 ./shapes.tach
 ./util.tach
 $ main.tach -o prog
+ok: built prog
 % ./prog; echo "exit $?"
 exit 0
 $ undo
@@ -657,7 +664,7 @@ split crate::geom: 3 items into crate::geom::scaling	3 files	+21 -18 lines
 +
 +impl Point {
 +    // x + y.
-+    pub fn sum(self: *Point) -> i64 {
++    pub fn sum(self: &Point) -> i64 {
 +        self.x + self.y
 +    }
 +}
@@ -696,7 +703,7 @@ split crate::geom: 3 items into crate::geom::scaling	3 files	+21 -18 lines
 -
 -impl Point {
 -    // x + y.
--    pub fn sum(self: *Point) -> i64 {
+-    pub fn sum(self: &Point) -> i64 {
 -        self.x + self.y
 -    }
 -}
@@ -770,6 +777,7 @@ fn scale() -> i64 {
     2
 }
 $ main.tach -o prog
+ok: built prog
 % ./prog; echo "exit $?"
 exit 0
 $ undo

@@ -2,6 +2,7 @@
 ## (0.14): every tool works with no flags; the journal for undo and query
 ## diff is .tachyonc/edits next to the root.
 $ check
+ok: 0 errors in main.tach
 $ query def area
 crate::geom::area	geom.tach:8:8	fn	pub fn area(p: Point) -> i64	effects: none
 ## ---- renaming a local ----
@@ -106,9 +107,9 @@ $ refactor rename Catalog::add::qty copies --dry-run
 +++ b/catalog.tach
 @@ -12,2 +12,2 @@
 -    // Adds `qty` copies of the book `id`; see `Catalog::total`.
--    pub fn add(self: *Catalog, id: i64, qty: i64) -> i64 {
+-    pub fn add(self: &mut Catalog, id: i64, qty: i64) -> i64 {
 +    // Adds `copies` copies of the book `id`; see `Catalog::total`.
-+    pub fn add(self: *Catalog, id: i64, copies: i64) -> i64 {
++    pub fn add(self: &mut Catalog, id: i64, copies: i64) -> i64 {
 @@ -18,2 +18,2 @@
 -                // `qty` more; `Item::qty` is the count.
 -                it.qty += qty;
@@ -223,8 +224,8 @@ $ refactor rename crate::total sum --dry-run
 --- a/main.tach
 +++ b/main.tach
 @@ -8 +8 @@
--fn total(points: *Vec<Point>) -> i64 {
-+fn sum(points: *Vec<Point>) -> i64 {
+-fn total(points: &Vec<Point>) -> i64 {
++fn sum(points: &Vec<Point>) -> i64 {
 @@ -28 +28 @@
 -    let x = total(&v);
 +    let x = sum(&v);

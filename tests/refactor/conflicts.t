@@ -92,7 +92,7 @@ pub struct Shape {
 }
 
 impl Shape {
-    pub fn grow(self: *Shape, by: i64) {
+    pub fn grow(self: &mut Shape, by: i64) {
         (*self).w = (*self).w + 1;
     }
 }
@@ -110,6 +110,7 @@ pub fn scale(s: Shape, k: i64) -> Shape {
     Shape { w: s.w * k, h: s.h * k }
 }
 $ check
+ok: 0 errors in main.tach
 ## Undo, resolve by resolve.
 $ undo
 undid resolved main.tach:4-8 (text)	main.tach	+1 -5 lines

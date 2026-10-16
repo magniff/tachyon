@@ -28,6 +28,8 @@ $ fix --suggested --dry-run
 $ fix --suggested
 fixed 5 suggested fixes	main.tach	+5 -5 lines
 $ check
+ok: 0 errors in main.tach
 $ main.tach -o prog
+ok: built prog
 % ./prog
 4 3.75 2.5 5 3

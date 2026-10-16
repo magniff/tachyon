@@ -1112,6 +1112,51 @@ Moved to 0.18.1:
   "Benchmarks", 0.18);
 - 0.17.1's list (above) stands.
 
+Done (0.18.1). Code generation on threads (T7: `-j N`, the per-function
+state in `FnCtx`, byte-identical output for every N, tests/threads.sh)
+and incremental rebuilds (T8: the code cache, tests/incremental.sh); V4
+(every `*T` raw; compiler/src and std on references); two use-after-free
+holes in safe code closed (a changed copy of a borrowed owned value, a
+reference into a Vec across a push); the contracts' evidence in
+generated code with two range fixes, `x % n` ranges and entry facts;
+the 0.18 eval's polish (BinaryHeap/MinHeap, binding modes on references,
+`&f()` temporaries, let-else, `ok:` lines, the check hook applying
+fixes, one `len()`); a valgrind row in the gate and a lock on the
+bootstrap cache. The release gate's record is in "Benchmarks", 0.18.1.
+
+The release gate (`gate.sh --release --no-x86` on aarch64-macos, 10:57
+wall, every step passing; x86_64 not run, by instruction): the chain
+(fixpoint, built by 0.18.0), the suite at -O0/1/2 (1532 tests, 3
+XFAIL; 325 of them the agent hooks' tests, which need python3), fuzz 60
+in each of the ten modes, ABI 100 in three modes, objcheck 1900 of 1900,
+header layouts, lldb, threads (2278 compilations the same at -j1 and
+-j8), incremental (160 edit series rebuilt as clean builds, 92% hits),
+stress-grow, examples-checkalloc (87); aarch64-linux (the cross-built
+fixpoint, the suite at every level, 1206, the hooks' tests left out:
+no python3 in the container, nonnull_cimport skipped), fuzz 300 in nine
+modes, ABI 150 in three, objcheck 1900, layouts, gdb, and the new
+valgrind row: 227 compilations clean under memcheck).
+
+Moved to 0.18.2 or 0.19:
+- the compiler's source on arenas (design §4.1, §4.2: the front end's
+  tables as `Vec<T, Comp>`, the syntax tree's arena released after
+  lowering, per-function IR arenas);
+- incrementality in the front end, and per-function assembly (the -O2
+  -j8 rebuild's serial parts: front end 127 ms, lowering 51,
+  interprocedural constants 49, dead functions 36);
+- contracts: the checking entry for indirect calls (they skip a
+  requires; their callees assume nothing), a `len >= 0` invariant and
+  offsets (`i + 4 <= len` against `i + k < len`, window's +24%), a min
+  as a loop bound, rotated loops, non-negative while-loop indices, `query
+  checks crate`;
+- the Allocator trait's `self: *Self` on references (0.18.0 builds
+  compiler/src, so 0.19);
+- `HashMap::get_or_insert -> &mut V` and the other reference results
+  (0.17.1's projections);
+- `check` 7% more instructions than 0.18.0's on the same source (its
+  phases are 0.18.0's; the difference is in the command around them);
+- the items of 0.18.1's list above not named here, and 0.17.1's.
+
 ## After 0.18: a standard library, and a real program on it
 
 Planned with the user on 2026-10-14, to start once 0.18 has shipped. The
@@ -2078,3 +2123,60 @@ for every compilation though the new sections are only lexed by the
 builds that name them; the phase 0 syntax hooks, the contracts and the
 tests each added a third of it (bisected on release-0.18's merges).
 Building std's text by section, as it is loaded, is a 0.18.1 item.
+
+### 0.18.1
+
+aarch64-macos (`gate.sh --only bench`, the fastest of 5 runs in ms, at
+load about 2; "0.18.0" is v0.18.0's build in the same run; the geometric
+mean is over cc -O2's, programs with a C version only; 0.18.0 cannot
+build heap, so its geomean leaves heap out):
+
+| program | 0.18.0 | 0.18.1 -O2 | cc -O2 | instructions 0.18.0 / 0.18.1 |
+|---|---|---|---|---|
+| arena_trees | 32 | 32 | 39 | 693.1 / 693.1 M |
+| binarytrees | 168 | 169 | 162 | 5102 / 5104 M |
+| collatz | 290 | 291 | 291 | 3040 / 3040 M |
+| contracts | 205 | 148 | - | 6717 / 4384 M (-34.7%) |
+| contracts_plain | 199 | 194 | - | 6199 / 5871 M (-5.3%) |
+| fannkuch | 117 | 118 | 140 | 1284.5 / 1284.5 M |
+| heap | - | 203 | 198 | - / 1761 M |
+| interp | 42 | 43 | 40 | 1500 / 1500 M |
+| iterchain | 189 | 189 | 182 | 4478 / 4478 M |
+| iterloop | 193 | 190 | 183 | 4509 / 4509 M |
+| json | 104 | 105 | 93 | 1516 / 1516 M |
+| mandelbrot | 163 | 162 | 156 | 2172 / 2172 M |
+| matmul | 18 | 18 | 43 | 247.5 / 247.5 M |
+| nbody | 31 | 31 | 28 | 622.2 / 622.3 M |
+| sieve | 58 | 59 | 67 | 467.3 / 467.0 M |
+| sort | 55 | 56 | 52 | 414.1 / 414.2 M |
+| stencil | 8 | 8 | 8 | 236.1 / 235.9 M |
+| wordcount | 83 | 84 | 68 | 1591 / 1591 M |
+| geomean vs cc -O2 | 0.957 | 0.965 (heap included) | 1 | |
+
+The pairs: iterchain over iterloop 0.995, fmtloop over fmtints 1.000,
+purecall over purecall_hoisted 1.000. Every program's code is 0.18.0's
+in instructions (within 0.1%) but the contracts pair, faster by the
+range fixes and the entry facts (docs/optimizer.md, "Contracts and
+generated code: the evidence"); heap (std's BinaryHeap) is 1.03 of C's.
+
+Compile time (aarch64-macos, best of 5 alternating, wall, load 2 to 6;
+0.18.1's source in a copy outside the tree; no cache; the default `-j`):
+
+| | 0.18.0 | 0.18.1 |
+|---|---|---|
+| the compiler to an object, -O0 | 359 ms / 7.97 G | 308 ms / 7.92 G |
+| the compiler to an object, -O1 | 873 ms | 392 ms |
+| the compiler to an object, -O2 | 2150 ms / 37.17 G / 613 MB | 765 ms / 36.46 G / 684 MB |
+| the same at -j1 | 37.16 G | 36.34 G / 651 MB |
+| `tachyonc check compiler/src/main.tach` | 177 ms / 3.48 G | 189 ms / 3.73 G |
+| `tachyonc query refs run_gvn` | 238 ms | 253 ms |
+| a small std program to an object, -O0 | 3.9 ms / 57 M | 4.1 ms / 63 M |
+| a small std program to an object, -O2 | 6.5 ms | 6.1 ms |
+
+The compiler compiles itself 2.8 times faster at -O2 and 2.2 times at
+-O1 (threads, docs/optimizer.md, "0.18.1: threads"), in fewer
+instructions; the threads cost memory at -O2 (613 to 684 MB). `check`
+and the queries do 7% more: their phases (parse, check, effects, own)
+are within 2 ms of 0.18.0's, and the difference is in the command
+around them, a 0.18.2 item. The small program at -O0 pays 6 M
+instructions more (std's new sections).

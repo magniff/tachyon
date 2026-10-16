@@ -30,10 +30,8 @@ use crate::front::ast::NODES;
 use crate::front::lexer::add_string;
 use crate::front::types::{FNS, SYM_FN, SYM_STATIC, TY_I64, TY_U64, TY_U8, ptr_to};
 use crate::gen0::gen::MAIN_SYM;
-use crate::middle::ir::{
-    ARGS, ARGTY, BLOCKS, INSTS, IRFUNCS, IRFUNC_COUNT, Op, ir_append, ir_enter, ir_insert_before,
-    ir_make,
-};
+use crate::middle::ctx::FnCtx;
+use crate::middle::ir::{IRFUNCS, IRFUNC_COUNT, Op, ir_append, ir_enter, ir_insert_before, ir_make};
 use crate::middle::ir::cfg::{succ, succ_count};
 
 extern "C" {
@@ -114,24 +112,24 @@ fn profiled(fi: i64) -> bool {
 
 // The checksum of IR function fi's shape: per block (in order), its
 // instructions' operations, its terminator and its successors' positions.
-fn checksum(fi: i64) -> u64 {
+fn checksum(mut cx: *FnCtx, fi: i64) -> u64 {
     unsafe {
         let n = IRFUNCS[fi].blocks.count;
         for i in 0..n {
-            BLOCKS[IRFUNCS[fi].blocks.data[i]].aux = i;
+            cx.blocks[IRFUNCS[fi].blocks.data[i]].aux = i;
         }
         let mut h: u64 = 1469598103934665603;
         h = (h ^ n as u64) * 1099511628211;
         for i in 0..n {
             let b = IRFUNCS[fi].blocks.data[i];
-            let mut v = BLOCKS[b].first;
+            let mut v = cx.blocks[b].first;
             while v != 0 {
-                h = (h ^ INSTS[v].op as u64) * 1099511628211;
-                v = INSTS[v].next;
+                h = (h ^ cx.insts[v].op as u64) * 1099511628211;
+                v = cx.insts[v].next;
             }
-            h = (h ^ (100 + BLOCKS[b].term as i64) as u64) * 1099511628211;
-            for k in 0..succ_count(b) {
-                h = (h ^ (1000 + BLOCKS[succ(b, k)].aux) as u64) * 1099511628211;
+            h = (h ^ (100 + cx.blocks[b].term as i64) as u64) * 1099511628211;
+            for k in 0..succ_count(cx, b) {
+                h = (h ^ (1000 + cx.blocks[succ(cx, b, k)].aux) as u64) * 1099511628211;
             }
         }
         h
@@ -139,39 +137,39 @@ fn checksum(fi: i64) -> u64 {
 }
 
 // The first instruction of block b after its phis and parameters (0: none).
-fn body_start(b: i64) -> i64 {
+fn body_start(mut cx: *FnCtx, b: i64) -> i64 {
     unsafe {
-        let mut v = BLOCKS[b].first;
-        while v != 0 && (INSTS[v].op == Op::Phi || INSTS[v].op == Op::Param) {
-            v = INSTS[v].next;
+        let mut v = cx.blocks[b].first;
+        while v != 0 && (cx.insts[v].op == Op::Phi || cx.insts[v].op == Op::Param) {
+            v = cx.insts[v].next;
         }
         v
     }
 }
 
-fn make(op: Op, ty: i64, a: i64, x: i64, imm: i64) -> i64 {
-    ir_make(op, ty, a, x, imm)
+fn make(mut cx: *FnCtx, op: Op, ty: i64, a: i64, x: i64, imm: i64) -> i64 {
+    ir_make(cx, op, ty, a, x, imm)
 }
 
 // Counter `k`'s increment, at the start of block b.
-fn count_block(b: i64, k: i64, counters: i64) {
+fn count_block(mut cx: *FnCtx, b: i64, k: i64, counters: i64) {
     unsafe {
-        let g = make(Op::GAddr, TY_U64, 0, 0, counters);
-        let p = make(Op::Load, TY_U64, g, 0, 0);
-        let off = make(Op::Const, TY_U64, 0, 0, 8 * k);
-        let a = make(Op::Add, TY_U64, p, off, 0);
-        let c = make(Op::Load, TY_U64, a, 0, 0);
-        let one = make(Op::Const, TY_U64, 0, 0, 1);
-        let c1 = make(Op::Add, TY_U64, c, one, 0);
-        let s = make(Op::Store, 0, a, c1, 0);
-        INSTS[s].imm2 = TY_U64;
+        let g = make(cx, Op::GAddr, TY_U64, 0, 0, counters);
+        let p = make(cx, Op::Load, TY_U64, g, 0, 0);
+        let off = make(cx, Op::Const, TY_U64, 0, 0, 8 * k);
+        let a = make(cx, Op::Add, TY_U64, p, off, 0);
+        let c = make(cx, Op::Load, TY_U64, a, 0, 0);
+        let one = make(cx, Op::Const, TY_U64, 0, 0, 1);
+        let c1 = make(cx, Op::Add, TY_U64, c, one, 0);
+        let s = make(cx, Op::Store, 0, a, c1, 0);
+        cx.insts[s].imm2 = TY_U64;
         let list: [i64; 8] = [g, p, off, a, c, one, c1, s];
-        let at = body_start(b);
+        let at = body_start(cx, b);
         for i in 0..8 {
             if at == 0 {
-                ir_append(b, list[i]);
+                ir_append(cx, b, list[i]);
             } else {
-                ir_insert_before(at, list[i]);
+                ir_insert_before(cx, at, list[i]);
             }
         }
     }
@@ -198,7 +196,7 @@ fn buf_name(out: i64, name: *u8) {
 }
 
 // --profile-generate: the counters, and the runtime's start in main.
-fn instrument() {
+fn instrument(mut cx: *FnCtx) {
     unsafe {
         let counters = intern_c(c"__profile.COUNTERS");
         let start = SYM_FN[intern_c(c"__profile::start")] - 1;
@@ -221,17 +219,17 @@ fn instrument() {
             if !profiled(fi) {
                 continue;
             }
-            ir_enter(fi);
+            ir_enter(cx, fi);
             let n = IRFUNCS[fi].blocks.count;
             buf_str(meta, c"fn ");
             buf_name(meta, function_name(fi));
             buf_byte(meta, ' ');
-            buf_uint(meta, checksum(fi));
+            buf_uint(meta, checksum(cx, fi));
             buf_byte(meta, ' ');
             buf_int(meta, n);
             buf_byte(meta, '\n');
             for i in 0..n {
-                count_block(IRFUNCS[fi].blocks.data[i], total + i, counters);
+                count_block(cx, IRFUNCS[fi].blocks.data[i], total + i, counters);
             }
             total += n;
         }
@@ -240,28 +238,28 @@ fn instrument() {
         buf_str(path, PROFILE_GENERATE);
         let path_id = add_string(BUFS[path].data[0..BUFS[path].len]);
         // start(total, path, meta), before the entry's counter.
-        ir_enter(main);
+        ir_enter(cx, main);
         let entry = IRFUNCS[main].entry;
-        let n = make(Op::Const, TY_I64, 0, 0, total);
-        let p = make(Op::SAddr, TY_U64, 0, 0, path_id);
-        let m = make(Op::SAddr, TY_U64, 0, 0, meta_id);
-        let call = make(Op::Call, 0, 0, 0, start);
-        INSTS[call].args = ARGS.count;
-        INSTS[call].nargs = 3;
+        let n = make(cx, Op::Const, TY_I64, 0, 0, total);
+        let p = make(cx, Op::SAddr, TY_U64, 0, 0, path_id);
+        let m = make(cx, Op::SAddr, TY_U64, 0, 0, meta_id);
+        let call = make(cx, Op::Call, 0, 0, 0, start);
+        cx.insts[call].args = cx.args.count;
+        cx.insts[call].nargs = 3;
         let str_ty = ptr_to(TY_U8);
-        ARGS.push(n);
-        ARGTY.push(TY_I64);
-        ARGS.push(p);
-        ARGTY.push(str_ty);
-        ARGS.push(m);
-        ARGTY.push(str_ty);
+        cx.args.push(n);
+        cx.argty.push(TY_I64);
+        cx.args.push(p);
+        cx.argty.push(str_ty);
+        cx.args.push(m);
+        cx.argty.push(str_ty);
         let list: [i64; 4] = [n, p, m, call];
-        let at = body_start(entry);
+        let at = body_start(cx, entry);
         for i in 0..4 {
             if at == 0 {
-                ir_append(entry, list[i]);
+                ir_append(cx, entry, list[i]);
             } else {
-                ir_insert_before(at, list[i]);
+                ir_insert_before(cx, at, list[i]);
             }
         }
     }
@@ -278,7 +276,7 @@ fn pf_char() -> u8 {
 }
 
 // The next word of the line (up to a space or the end of the line).
-fn pf_word(start: *i64) -> i64 {
+fn pf_word(start: &mut i64) -> i64 {
     unsafe {
         while pf_char() == ' ' {
             PF_AT += 1;
@@ -293,7 +291,7 @@ fn pf_word(start: *i64) -> i64 {
 
 fn pf_number() -> u64 {
     let mut s = 0;
-    let n = pf_word(&s);
+    let n = pf_word(&mut s);
     let mut x: u64 = 0;
     for i in 0..n {
         let c = unsafe { PF_TEXT[s + i] };
@@ -327,7 +325,7 @@ fn word_is(s: i64, n: i64, name: *u8) -> bool {
 }
 
 // --profile-use: the counts of the functions whose profile matches.
-fn annotate() {
+fn annotate(mut cx: *FnCtx) {
     unsafe {
         let file = fopen(PROFILE_USE, c"rb");
         if file == 0 as *u8 {
@@ -349,7 +347,7 @@ fn annotate() {
         PF_LEN = BUFS[text].len;
         PF_AT = 0;
         let mut s = 0;
-        let n = pf_word(&s);
+        let n = pf_word(&mut s);
         if !word_is(s, n, c"tachyon-profile") || pf_number() != 1 {
             report_warning(0, 2, c"profile", c"not a tachyon profile (version 1): no counts used",
                 0 as *u8);
@@ -361,13 +359,13 @@ fn annotate() {
         let mut fns = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         while PF_AT < PF_LEN {
             let mut ws = 0;
-            let wn = pf_word(&ws);
+            let wn = pf_word(&mut ws);
             if !word_is(ws, wn, c"fn") {
                 pf_next_line();
                 continue;
             }
             let mut ns = 0;
-            let nn = pf_word(&ns);
+            let nn = pf_word(&mut ns);
             let sum = pf_number();
             let blocks = pf_number() as i64;
             pf_next_line();
@@ -381,7 +379,7 @@ fn annotate() {
             }
         }
         for fi in 0..IRFUNC_COUNT {
-            ir_enter(fi);
+            ir_enter(cx, fi);
             let name = function_name(fi);
             let mut k = 0;
             while k < fns.count {
@@ -394,7 +392,7 @@ fn annotate() {
                 continue;
             }
             let n = IRFUNCS[fi].blocks.count;
-            if fns.data[k + 2] as u64 != checksum(fi) || fns.data[k + 3] != n {
+            if fns.data[k + 2] as u64 != checksum(cx, fi) || fns.data[k + 3] != n {
                 let message = buf_new();
                 buf_str(message, c"the profile of '");
                 buf_str(message, name);
@@ -409,7 +407,7 @@ fn annotate() {
                 let count = pf_number();
                 pf_next_line();
                 let c = if count > 1099511627776 { 1099511627776 } else { count as i64 };
-                BLOCKS[IRFUNCS[fi].blocks.data[i]].count = c;
+                cx.blocks[IRFUNCS[fi].blocks.data[i]].count = c;
                 if c > PROFILE_MAX {
                     PROFILE_MAX = c;
                 }
@@ -419,12 +417,12 @@ fn annotate() {
 }
 
 // After lowering: instruments the functions, or reads their counts.
-pub fn profile_after_lowering() {
+pub fn profile_after_lowering(mut cx: *FnCtx) {
     if PROFILE_GENERATE != 0 as *u8 {
-        instrument();
+        instrument(cx);
     }
     if PROFILE_USE != 0 as *u8 {
-        annotate();
+        annotate(cx);
     }
 }
 
@@ -438,6 +436,6 @@ pub fn is_hot_count(count: i64) -> bool {
 }
 
 // Whether block b never ran (in a function with a profile).
-pub fn is_cold_block(b: i64) -> bool {
-    unsafe { PROFILE_MAX > 0 && BLOCKS[b].count == 0 }
+pub fn is_cold_block(mut cx: *FnCtx, b: i64) -> bool {
+    unsafe { PROFILE_MAX > 0 && cx.blocks[b].count == 0 }
 }

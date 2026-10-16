@@ -57,7 +57,7 @@ write; another unknown method, the type's nearest methods and `tachyonc
 query items TYPE`, which lists them all.
 
 ```tach
-fn count(s: &str) -> i64 { s.len }
+fn count(s: &str) -> i64 { s.len() }
 ```
 ```err
 error[parser error] expected type, got '&' | help: `&str` is `[u8]` in tachyon: a slice of bytes, as string literals are
@@ -100,7 +100,8 @@ let Some(x) = o;
 ```err
 error[type error] refutable pattern in 'let'
 ```
-`let x = match o { Some(x) => x, None => return 1 };` (no `let else`).
+`let Some(x) = o else { return 1; };` (0.18.1, the else block must
+leave), or `let x = match o { Some(x) => x, None => 0 };`.
 
 ```tach
 let n = 5;
@@ -350,7 +351,7 @@ fn main() -> i32 { let a = [1, 2, 3]; sum(a) as i32 }
 ```err
 error[type error] expected '[i64]', got '[i64; 3]'
 ```
-`sum(a[..])`. An array's length is `a.len()` (or `a[..].len`).
+`sum(a[..])`. An array's length is `a.len()`.
 
 ```tach
 let e: IoError = IoError::Read;
@@ -393,6 +394,16 @@ make the parameter generic
 ```
 A closure that captures is no plain `fn`: `fn run<F: Fn(i64) -> i64>(f:
 F) -> i64`. One that captures nothing converts.
+
+```tach
+fn apply<F: Fn(&i64) -> i64>(f: F) -> i64 { let x = 1; f(&x) }
+fn main() -> i32 { apply(|a: *i64| 1); 0 }
+```
+```err
+error[type error] closure parameter of type '*i64' where '&i64' is wanted
+```
+A `*T` is a raw pointer (0.18.1), not a reference: annotate `&i64` as the
+bound does, or leave the parameter untyped (`fix --suggested` writes it).
 
 ```tach
 fn apply<F: Fn(i64)>(f: F) { f(1); }
@@ -552,6 +563,17 @@ error[parser error] 'dyn' is a reserved keyword
 ```
 No trait objects: `fn f<T: A>(x: &T)`, or an enum of the cases.
 
+```tach
+struct K { n: i64 }
+impl Ord for K { fn cmp(self: *K, o: *K) -> i64 { 0 } }
+fn main() -> i32 { 0 }
+```
+```err
+error[type error] 'cmp' takes 'self' as a raw pointer where trait 'Ord' declares '&K'
+```
+An impl spells the trait's references (`self: &K, o: &K`); `tachyonc fix
+--values` respells every such impl.
+
 ## Modules and imports
 
 ```tach
@@ -588,7 +610,7 @@ is next to a submodule's file belongs in the root.
 fn main() -> i32 { let text = read_to_string(); 0 }
 ```
 ```err
-error[type error] undefined variable 'read_to_string' | help: std reads stdin: `read_stdin_in(gpa)` (all of it, a Buf), `read_line(&buf)` (one line, Ok(false) at the end), `Scanner` (tokens)
+error[type error] undefined variable 'read_to_string' | help: std reads stdin: `read_stdin_in(gpa)` (all of it, a Buf), `read_line(&mut buf)` (one line, Ok(false) at the end), `Scanner` (tokens)
 ```
 std's items outside the prelude get their `use` line (`add `use
 std::is_digit;``) or the nearest std name; an unknown function with neither points to `tachyonc
@@ -658,14 +680,19 @@ to a function taking `&mut P`.
 
 ```tach
 struct P { x: i64 }
-fn get(p: *P) -> i64 { p.x }
-fn main() -> i32 { get(&P { x: 1 }) as i32 }
+fn one() -> i64 { 1 }
+fn get(n: i64, p: &P) -> i64 { n + p.x }
+fn main() -> i32 { get(one(), &P { x: one() }) as i32 }
 ```
 ```err
 error[type error] cannot take address of non-lvalue expression
 ```
-`&` takes the address of a place (a variable, a field, an element):
-`let p = P { x: 1 }; get(&p)`.
+`&` takes the address of a place (a variable, a field, an element). Of
+a value, `&f(x)` or `&P { x: 1 }`, it takes a temporary (0.18.1), which
+lives to the end of the block, unless something evaluated before it in
+the statement (`one()` here, a call) could see the difference: then
+name it first, as the `try:` does: `let t = P { x: one() }; get(one(),
+&t)`.
 
 ```tach
 fn factorial(n: i64) -> i64 { if n < 2 { 1 } else { n * factorial(n - 1) } }
@@ -684,32 +711,33 @@ fn first(p: *i64) -> i64 { p[1] }
 ```err
 error[unsafe] indexing a raw pointer is unsafe
 ```
-A pointer is one value; for many, take a slice `[i64]`. A pointer to a
-Vec, a Buf or a slice (`v: *Vec<i64>`) indexes what it points to, checked:
-safely through a parameter, in `unsafe` through a raw one (`let p = &v;`:
-index `v`).
+A pointer is one value; for many, take a slice `[i64]`. A reference to
+a Vec, a Buf or a slice (`v: &Vec<i64>`) indexes what it points to,
+checked and safe; through a `*T` it needs `unsafe` (`let p = &v;`: index
+`v`).
 `out[0] = acc` meant to write through the pointer: the error's try: is
 `*out = acc`, safe through a borrow.
 
 ```tach
 fn read(x: *i64) -> i64 { *x }
-struct H { p: *i64 }
-fn get(h: H) -> i64 { read(h.p) }
 ```
 ```err
-error[unsafe] passing a raw pointer to a pointer parameter is unsafe
+error[unsafe] dereference of a raw pointer is unsafe: `x` is a `*T` parameter
 ```
-A `*T` field is a raw pointer: vouch for it in `unsafe { read(h.p) }`,
-or hold a reference (`struct H { p: &mut i64 }`, 0.17).
+A `*T` parameter is a raw pointer (0.18.1), as in Rust. Make it a
+borrow, `x: &i64` (`&mut i64` when written through; `tachyonc fix
+--values` changes such parameters with their calls), or vouch for it in
+`unsafe { *x }` (`fix --only unsafe`). The same for a field access, a
+method call and an index through it.
 
 ```tach
-fn add(p: *i64, x: i64) { *p += x; }
-fn main() -> i32 { let f = add; 0 }
+unsafe fn danger() -> i64 { 1 }
+fn main() -> i32 { let f = danger; 0 }
 ```
 ```err
-error[unsafe] using an `unsafe fn`, or a function with pointer parameters, as a value is unsafe
+error[unsafe] using an `unsafe fn` as a value is unsafe
 ```
-`let f = unsafe { add };` and call it in `unsafe` too.
+Call it in `unsafe`, or wrap it in a safe `fn`.
 
 ```tach
 fn main() -> i32 { std::print_cstr(c"x"); 0 }
@@ -788,6 +816,26 @@ error[own.readonly] cannot write 'p.x': 'p' is '&P', a shared reference
 `p: &mut P`, and `&mut x` at the calls (`tachyonc refactor signature F
 --type p '&mut P'` changes both); a slice: `s: &mut [T]`, passed as
 `v.as_mut_slice()` or `&mut a[..]`. Old code: `tachyonc fix --values`.
+
+```text
+error[type error] expected '&Item', got 'Item'
+error[type error] expected 'Item', got '&Item' | help: it is a reference: read through it with '*' | try: *it
+```
+(0.18.1) A place passed where `&T` is expected is borrowed, as a
+receiver is (`f(it)` for `f(x: &Item)`); a reference to a number or a
+bool is read through where the value is wanted (`n + 1`, `3 < n`,
+`keys[n]`, `f(n)`). What is left: a value that is no place where `&T`
+is expected (`&f(x)` names it), and a reference to a struct where the
+struct is wanted (`*it`, or `.clone()` for an owned one).
+
+```text
+error[own.readonly] changes 'v' (Vec<i64>), a copy the match on '*e' (3:11) binds: the change would not reach it, and could free memory it points to
+error[own.readonly] changes 'w' (Vec<i64>), a copy of an element 'vv.get(0)' reads: ...
+```
+(0.18.1) `match *e`, `v.get(i)` and a `for` loop's element give a copy
+of an owned value that stays where it is: read it, do not change it.
+Match the reference instead (`match e` with `e: &mut E` binds `v: &mut
+Vec<i64>`), or change the element in place (`vv[0].push(1)`).
 
 ## At run time
 

@@ -3,7 +3,7 @@
 ## minimal `query effects`.
 $ items
 crate	syntax016/main.tach	10
-std	<std>	647
+std	<std>	706
 $ show apply grow
 // crate::apply	syntax016/main.tach:31-35
 #[no_alloc]
@@ -13,7 +13,7 @@ fn apply<F: Fn(i64) -> i64 + effects(panic)>(f: F, x: i64) -> i64 {
 }
 // crate::grow	syntax016/main.tach:37-40	effects: alloc(Gpa) panic
 #[effects(alloc(Gpa), panic)]
-fn grow(v: *Vec<i64>) {
+fn grow(v: &mut Vec<i64>) {
     v.push(1);
 }
 $ show crate::Pair

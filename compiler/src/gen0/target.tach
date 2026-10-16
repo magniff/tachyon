@@ -55,9 +55,12 @@ use crate::gen0::x86_64::{
 use crate::middle::ir::Cond;
 use crate::middle::lower::ssa::HMap;
 
+use crate::back::codecache::cc_text_string;
 use crate::base::target::{APPLE_A64, ELF, X86};
 use crate::front::contracts::checks::message_text;
 use crate::front::contracts::sites::{SITE_COL, SITE_FILE, SITE_LINE, site_count};
+use crate::middle::ctx::FnCtx;
+use crate::middle::parallel::const_data_id;
 use crate::middle::trace::trace_dump_fn;
 
 pub const R_ACC: i64 = 0;
@@ -67,62 +70,77 @@ pub const R_ADDR: i64 = 9;
 pub const R_LOOP_PTR: i64 = 10;
 pub const R_LOOP_COUNT: i64 = 11;
 
-// The assembly being generated for the current function, and for the
-// whole file.
-pub static mut CODE: i64 = -1;
-pub static mut ASM: i64 = -1;
 pub static mut DATA: i64 = -1;
 // Temporaries currently pushed (16 bytes each).
 pub static mut DEPTH: i64 = 0;
-pub static mut LABEL_COUNT: i64 = 0;
 
 // ---- Output helpers ----
 
-pub fn o(s: *u8) {
-    buf_str(CODE, s);
+pub fn o(mut cx: *FnCtx, s: *u8) {
+    unsafe { buf_str(cx.code, s); }
 }
 
-pub fn oi(value: i64) {
-    buf_int(CODE, value);
+pub fn oi(mut cx: *FnCtx, value: i64) {
+    unsafe { buf_int(cx.code, value); }
 }
 
-pub fn on() {
-    buf_byte(CODE, '\n');
+// (0.18.1) buf_fmt with cx's scratch text: base::buf_fmt's is the
+// program's, which two tasks would share.
+pub fn cx_fmt<T: std::Display>(mut cx: *FnCtx, b: i64, x: T) {
+    unsafe {
+        (*cx.fmt).clear();
+        (*cx.fmt).push_fmt(x);
+        buf_bytes(b, (*cx.fmt).as_slice());
+    }
+}
+
+pub fn on(mut cx: *FnCtx) {
+    unsafe { buf_byte(cx.code, '\n'); }
 }
 
 // "    <s>\n"
-pub fn ins(s: *u8) {
-    unsafe { buf_str(CODE, c"    "); }
-    buf_str(CODE, s);
-    buf_byte(CODE, '\n');
+pub fn ins(mut cx: *FnCtx, s: *u8) {
+    unsafe {
+        unsafe { buf_str(cx.code, c"    "); }
+        buf_str(cx.code, s);
+        buf_byte(cx.code, '\n');
+    }
 }
 
 // "    <a><value><b>\n"
-pub fn ins_i(a: *u8, value: i64, b: *u8) {
-    unsafe { buf_str(CODE, c"    "); }
-    buf_str(CODE, a);
-    buf_int(CODE, value);
-    buf_str(CODE, b);
-    buf_byte(CODE, '\n');
+pub fn ins_i(mut cx: *FnCtx, a: *u8, value: i64, b: *u8) {
+    unsafe {
+        unsafe { buf_str(cx.code, c"    "); }
+        buf_str(cx.code, a);
+        buf_int(cx.code, value);
+        buf_str(cx.code, b);
+        buf_byte(cx.code, '\n');
+    }
 }
 
 // Ends a line started with o(): "<a><value><b>\n".
-pub fn end_i(a: *u8, value: i64, b: *u8) {
-    buf_str(CODE, a);
-    buf_int(CODE, value);
-    buf_str(CODE, b);
-    buf_byte(CODE, '\n');
+pub fn end_i(mut cx: *FnCtx, a: *u8, value: i64, b: *u8) {
+    unsafe {
+        buf_str(cx.code, a);
+        buf_int(cx.code, value);
+        buf_str(cx.code, b);
+        buf_byte(cx.code, '\n');
+    }
 }
 
 // Ends a line started with o(): "<s>\n".
-pub fn end(s: *u8) {
-    buf_str(CODE, s);
-    buf_byte(CODE, '\n');
+pub fn end(mut cx: *FnCtx, s: *u8) {
+    unsafe {
+        buf_str(cx.code, s);
+        buf_byte(cx.code, '\n');
+    }
 }
 
-pub fn new_label() -> i64 {
-    LABEL_COUNT += 1;
-    LABEL_COUNT
+pub fn new_label(mut cx: *FnCtx) -> i64 {
+    unsafe {
+        cx.label_count += 1;
+        cx.label_count
+    }
 }
 
 // Assembler-local labels: "L" on Mach-O, ".L" on ELF.
@@ -144,11 +162,48 @@ pub fn static_prefix() -> *u8 {
     if ELF { c"tachyon.static." } else { c"_tachyon.static." }
 }
 
-pub fn emit_label(label: i64) {
+pub fn emit_label(mut cx: *FnCtx, label: i64) {
     unsafe {
-        o(local_prefix());
-        oi(label);
-        o(c":\n");
+        o_label(cx, label);
+        o(cx, c":\n");
+    }
+}
+
+// A local label as an operand: L<n> (.L<n> on ELF). In a task's context
+// (local_labels) the number is the function's own, written L\x01<n>,
+// which the join renumbers (middle::parallel, join_text).
+pub fn o_label(mut cx: *FnCtx, label: i64) {
+    unsafe {
+        o(cx, local_prefix());
+        if cx.local_labels {
+            buf_byte(cx.code, 1);
+        }
+    }
+    oi(cx, label);
+}
+
+// The label of string literal or constant data `id`: Lstr.<id>. Constant
+// data a task made, not numbered yet (a negative id, middle::parallel):
+// Lstr.\x02<n>, which the join numbers.
+pub fn o_str_label(mut cx: *FnCtx, id: i64) {
+    unsafe {
+        o(cx, local_prefix());
+        o(cx, c"str.");
+    }
+    // (0.18.1) With the code cache: the text's string i, str.\x03<i>, its
+    // id put by the join (back::codecache).
+    let i = cc_text_string(cx, id);
+    if i >= 0 {
+        unsafe { buf_byte(cx.code, 3); }
+        oi(cx, i);
+        return;
+    }
+    let real = const_data_id(id);
+    if real < 0 {
+        unsafe { buf_byte(cx.code, 2); }
+        oi(cx, -id - 1);
+    } else {
+        oi(cx, real);
     }
 }
 
@@ -157,17 +212,17 @@ pub static mut LINK_NAMES: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size:
 
 // "<prefix><name>"; a C symbol (prefix "_" or none) may be renamed by
 // #[link_name].
-pub fn emit_symbol_ref(sym_prefix: *u8, name: i64) {
+pub fn emit_symbol_ref(mut cx: *FnCtx, sym_prefix: *u8, name: i64) {
     unsafe {
-        o(sym_prefix);
+        o(cx, sym_prefix);
         if strlen(sym_prefix) <= 1 {
             let link = LINK_NAMES.get(name + 1);
             if link != 0 {
-                buf_bytes(CODE, SYMS[link - 1].text);
+                buf_bytes(cx.code, SYMS[link - 1].text);
                 return;
             }
         }
-        buf_bytes(CODE, SYMS[name].text);
+        buf_bytes(cx.code, SYMS[name].text);
     }
 }
 
@@ -181,11 +236,11 @@ pub fn log2(value: i64) -> i64 {
 }
 
 // Pushes the accumulator for a value of type `ty`.
-pub fn push_value(ty: i64) {
+pub fn push_value(mut cx: *FnCtx, ty: i64) {
     if is_float(ty) {
-        push_d0();
+        push_d0(cx);
     } else {
-        push_x0();
+        push_x0(cx);
     }
 }
 
@@ -257,6 +312,14 @@ pub fn add_const_data(bytes: [u8], align: i64) -> i64 {
     id
 }
 
+// (0.18.1, back::codecache) The alignment of string or constant data id
+// (0: a string literal's).
+pub fn str_align(id: i64) -> i64 {
+    unsafe {
+        if id < STR_ALIGN.count { STR_ALIGN.data[id] } else { 0 }
+    }
+}
+
 pub fn data_string(id: i64) {
     unsafe {
         if id < STR_ALIGN.count && STR_ALIGN.data[id] > 1 {
@@ -269,14 +332,14 @@ pub fn data_string(id: i64) {
 }
 
 // The start and the end of the assembly file.
-pub fn emit_file_header() {
-    unsafe { buf_str(ASM, if ELF { c".text\n" } else { c".section __TEXT,__text\n" }); }
+pub fn emit_file_header(mut cx: *FnCtx) {
+    unsafe { buf_str(cx.asm, if ELF { c".text\n" } else { c".section __TEXT,__text\n" }); }
 }
 
-pub fn emit_file_trailer() {
+pub fn emit_file_trailer(mut cx: *FnCtx) {
     if ELF {
         // No executable stack.
-        unsafe { buf_str(ASM, c"\n.section .note.GNU-stack,\"\",@progbits\n"); }
+        unsafe { buf_str(cx.asm, c"\n.section .note.GNU-stack,\"\",@progbits\n"); }
     }
 }
 
@@ -286,44 +349,46 @@ pub fn emit_file_trailer() {
 // describe the contract in terms of the virtual registers above.
 
 // Control flow.
-pub fn emit_jump(label: i64) {
-    if X86 { x64_jump(label); } else { a64_jump(label); }
+pub fn emit_jump(mut cx: *FnCtx, label: i64) {
+    if X86 { x64_jump(cx, label); } else { a64_jump(cx, label); }
 }
 
 // Jumps when the accumulator is zero (false).
-pub fn emit_jump_if_zero(label: i64) {
-    if X86 { x64_jump_if_zero(label); } else { a64_jump_if_zero(label); }
+pub fn emit_jump_if_zero(mut cx: *FnCtx, label: i64) {
+    if X86 { x64_jump_if_zero(cx, label); } else { a64_jump_if_zero(cx, label); }
 }
 
-pub fn emit_jump_if_nonzero(label: i64) {
-    if X86 { x64_jump_if_nonzero(label); } else { a64_jump_if_nonzero(label); }
+pub fn emit_jump_if_nonzero(mut cx: *FnCtx, label: i64) {
+    if X86 { x64_jump_if_nonzero(cx, label); } else { a64_jump_if_nonzero(cx, label); }
 }
 
 // <reg> -= 1, setting the flags for emit_jump_unless_zero_result.
-pub fn emit_decrement(reg: i64) {
-    if X86 { x64_decrement(reg); } else { a64_decrement(reg); }
+pub fn emit_decrement(mut cx: *FnCtx, reg: i64) {
+    if X86 { x64_decrement(cx, reg); } else { a64_decrement(cx, reg); }
 }
 
 // Jumps unless the last emit_decrement reached zero (stores in between do
 // not change the flags).
-pub fn emit_jump_unless_zero_result(label: i64) {
-    if X86 { x64_jump_unless_zero_result(label); } else { a64_jump_unless_zero_result(label); }
+pub fn emit_jump_unless_zero_result(mut cx: *FnCtx, label: i64) {
+    if X86 { x64_jump_unless_zero_result(cx, label); }
+    else { a64_jump_unless_zero_result(cx, label); }
 }
 
 // Jumps when R_ACC <op> R_SECOND, integers (op a comparison token).
-pub fn emit_compare_jump(op: Cond, signed: bool, label: i64) {
-    if X86 { x64_compare_jump(op, signed, label); } else { a64_compare_jump(op, signed, label); }
+pub fn emit_compare_jump(mut cx: *FnCtx, op: Cond, signed: bool, label: i64) {
+    if X86 { x64_compare_jump(cx, op, signed, label); }
+    else { a64_compare_jump(cx, op, signed, label); }
 }
 
 // Constants and addresses.
 
 // <reg> = value
-pub fn emit_load_imm(reg: i64, value: u64) {
-    if X86 { x64_load_imm(reg, value); } else { a64_load_imm(reg, value); }
+pub fn emit_load_imm(mut cx: *FnCtx, reg: i64, value: u64) {
+    if X86 { x64_load_imm(cx, reg, value); } else { a64_load_imm(cx, reg, value); }
 }
 
 // <reg> = frame pointer - offset
-pub fn emit_frame_addr(reg: i64, offset: i64) {
+pub fn emit_frame_addr(mut cx: *FnCtx, reg: i64, offset: i64) {
     unsafe {
         let i = overaligned_slot(offset);
         if i >= 0 {
@@ -331,212 +396,216 @@ pub fn emit_frame_addr(reg: i64, offset: i64) {
             // left below it; then the field's offset.
             let slot = OVERALIGNED.data[i];
             let align = OVERALIGNED.data[i + 1];
-            emit_frame_addr_plain(reg, slot - (align - 16));
-            if X86 { x64_align_down(reg, align); } else { a64_align_down(reg, align); }
+            emit_frame_addr_plain(cx, reg, slot - (align - 16));
+            if X86 { x64_align_down(cx, reg, align); } else { a64_align_down(cx, reg, align); }
             if slot != offset {
-                if X86 { x64_add_imm(reg, slot - offset); }
-                else { a64_add_imm(reg, slot - offset); }
+                if X86 { x64_add_imm(cx, reg, slot - offset); }
+                else { a64_add_imm(cx, reg, slot - offset); }
             }
             return;
         }
-        emit_frame_addr_plain(reg, offset);
+        emit_frame_addr_plain(cx, reg, offset);
     }
 }
 
-fn emit_frame_addr_plain(reg: i64, offset: i64) {
-    if X86 { x64_frame_addr(reg, offset); } else { a64_frame_addr(reg, offset); }
+fn emit_frame_addr_plain(mut cx: *FnCtx, reg: i64, offset: i64) {
+    if X86 { x64_frame_addr(cx, reg, offset); } else { a64_frame_addr(cx, reg, offset); }
 }
 
 // <reg> += value
-pub fn emit_add_imm(reg: i64, value: i64) {
-    if X86 { x64_add_imm(reg, value); } else { a64_add_imm(reg, value); }
+pub fn emit_add_imm(mut cx: *FnCtx, reg: i64, value: i64) {
+    if X86 { x64_add_imm(cx, reg, value); } else { a64_add_imm(cx, reg, value); }
 }
 
 // R_ACC = address of a symbol defined in this file.
-pub fn emit_local_symbol_addr(prefix: *u8, name: i64) {
-    if X86 { x64_local_symbol_addr(prefix, name); } else { a64_local_symbol_addr(prefix, name); }
+pub fn emit_local_symbol_addr(mut cx: *FnCtx, prefix: *u8, name: i64) {
+    if X86 { x64_local_symbol_addr(cx, prefix, name); }
+    else { a64_local_symbol_addr(cx, prefix, name); }
 }
 
 // R_ACC = address of an external (C) symbol.
-pub fn emit_extern_symbol_addr(name: i64) {
-    if X86 { x64_extern_symbol_addr(name); } else { a64_extern_symbol_addr(name); }
+pub fn emit_extern_symbol_addr(mut cx: *FnCtx, name: i64) {
+    if X86 { x64_extern_symbol_addr(cx, name); } else { a64_extern_symbol_addr(cx, name); }
 }
 
 // R_ACC = address of string literal `id`.
-pub fn emit_string_addr(id: i64) {
-    if X86 { x64_string_addr(id); } else { a64_string_addr(id); }
+pub fn emit_string_addr(mut cx: *FnCtx, id: i64) {
+    if X86 { x64_string_addr(cx, id); } else { a64_string_addr(cx, id); }
 }
 
 // Float accumulator = the float whose f64 bits are `bits`.
-pub fn emit_load_float(bits: i64, ty: i64) {
-    if X86 { x64_load_float(bits, ty); } else { a64_load_float(bits, ty); }
+pub fn emit_load_float(mut cx: *FnCtx, bits: i64, ty: i64) {
+    if X86 { x64_load_float(cx, bits, ty); } else { a64_load_float(cx, bits, ty); }
 }
 
 // Temporaries.
 
-pub fn push_x0() {
-    if X86 { x64_push_int(); } else { a64_push_int(); }
+pub fn push_x0(mut cx: *FnCtx) {
+    if X86 { x64_push_int(cx); } else { a64_push_int(cx); }
     DEPTH += 1;
 }
 
-fn push_d0() {
-    if X86 { x64_push_float(); } else { a64_push_float(); }
+fn push_d0(mut cx: *FnCtx) {
+    if X86 { x64_push_float(cx); } else { a64_push_float(cx); }
     DEPTH += 1;
 }
 
 // Pops the top temporary into int register <reg>.
-pub fn pop_x(reg: i64) {
-    if X86 { x64_pop_int(reg); } else { a64_pop_int(reg); }
+pub fn pop_x(mut cx: *FnCtx, reg: i64) {
+    if X86 { x64_pop_int(cx, reg); } else { a64_pop_int(cx, reg); }
     DEPTH -= 1;
 }
 
 // Pops the top temporary into float register <reg> (0: the accumulator).
-pub fn pop_d(reg: i64) {
-    if X86 { x64_pop_float(reg); } else { a64_pop_float(reg); }
+pub fn pop_d(mut cx: *FnCtx, reg: i64) {
+    if X86 { x64_pop_float(cx, reg); } else { a64_pop_float(cx, reg); }
     DEPTH -= 1;
 }
 
 // <reg> = the top temporary, left in place.
-pub fn emit_peek(reg: i64) {
-    if X86 { x64_peek(reg); } else { a64_peek(reg); }
+pub fn emit_peek(mut cx: *FnCtx, reg: i64) {
+    if X86 { x64_peek(cx, reg); } else { a64_peek(cx, reg); }
 }
 
 // <reg> (an int register, or float register <reg> when `float`) = the
 // temporary `depth` below the top (0: the top), left in place.
-pub fn emit_peek_at(reg: i64, depth: i64, float: bool) {
-    if X86 { x64_peek_at(reg, depth, float); } else { a64_peek_at(reg, depth, float); }
+pub fn emit_peek_at(mut cx: *FnCtx, reg: i64, depth: i64, float: bool) {
+    if X86 { x64_peek_at(cx, reg, depth, float); } else { a64_peek_at(cx, reg, depth, float); }
 }
 
 // Drops `count` temporaries without changing DEPTH (for jumps out of the
 // current expression).
-pub fn emit_drop_temps(count: i64) {
+pub fn emit_drop_temps(mut cx: *FnCtx, count: i64) {
     if count > 0 {
-        if X86 { x64_drop_temps(count); } else { a64_drop_temps(count); }
+        if X86 { x64_drop_temps(cx, count); } else { a64_drop_temps(cx, count); }
     }
 }
 
 // Loads and stores.
 
 // Accumulator = the value of type `ty` at [<addr>].
-pub fn emit_load(ty: i64, addr: i64) {
+pub fn emit_load(mut cx: *FnCtx, ty: i64, addr: i64) {
     let t = scalar_type(ty);
-    if X86 { x64_load(t, addr); } else { a64_load(t, addr); }
+    if X86 { x64_load(cx, t, addr); } else { a64_load(cx, t, addr); }
 }
 
 // <reg> = the 8 bytes at [<addr>].
-pub fn emit_load_reg(reg: i64, addr: i64) {
-    if X86 { x64_load_reg(reg, addr); } else { a64_load_reg(reg, addr); }
+pub fn emit_load_reg(mut cx: *FnCtx, reg: i64, addr: i64) {
+    if X86 { x64_load_reg(cx, reg, addr); } else { a64_load_reg(cx, reg, addr); }
 }
 
 // [<addr>] = <reg>, a value of type `ty` (register <reg> of the float
 // accumulator's kind for floats).
-pub fn emit_store(ty: i64, reg: i64, addr: i64) {
+pub fn emit_store(mut cx: *FnCtx, ty: i64, reg: i64, addr: i64) {
     let t = scalar_type(ty);
-    if X86 { x64_store(t, reg, addr); } else { a64_store(t, reg, addr); }
+    if X86 { x64_store(cx, t, reg, addr); } else { a64_store(cx, t, reg, addr); }
 }
 
 // [<addr> + offset] = the 8 bytes of <reg>.
-pub fn emit_store_offset(reg: i64, addr: i64, offset: i64) {
-    if X86 { x64_store_offset(reg, addr, offset); } else { a64_store_offset(reg, addr, offset); }
+pub fn emit_store_offset(mut cx: *FnCtx, reg: i64, addr: i64, offset: i64) {
+    if X86 { x64_store_offset(cx, reg, addr, offset); }
+    else { a64_store_offset(cx, reg, addr, offset); }
 }
 
 // Copies `size` bytes from [R_ACC] to [R_SECOND]; clobbers the target's
 // scratch registers (and every caller-saved register for large copies).
-pub fn emit_copy(size: i64) {
-    if X86 { x64_copy(size); } else { a64_copy(size); }
+pub fn emit_copy(mut cx: *FnCtx, size: i64) {
+    if X86 { x64_copy(cx, size); } else { a64_copy(cx, size); }
 }
 
 // R_SECOND = accumulator (the float registers for floats).
-pub fn emit_move_to_second(ty: i64) {
-    if X86 { x64_move_to_second(ty); } else { a64_move_to_second(ty); }
+pub fn emit_move_to_second(mut cx: *FnCtx, ty: i64) {
+    if X86 { x64_move_to_second(cx, ty); } else { a64_move_to_second(cx, ty); }
 }
 
 // Integer operations: integers are kept sign- or zero-extended to 64 bits.
 
 // Brings R_ACC into the canonical form of `ty`.
-pub fn emit_normalize(ty: i64) {
+pub fn emit_normalize(mut cx: *FnCtx, ty: i64) {
     let t = scalar_type(ty);
-    if X86 { x64_normalize(t); } else { a64_normalize(t); }
+    if X86 { x64_normalize(cx, t); } else { a64_normalize(cx, t); }
 }
 
 // R_ACC = R_ACC <op> R_SECOND for integers of type `ty`.
-pub fn emit_int_binary(op: Tok, ty: i64) {
-    if X86 { x64_int_binary(op, ty); } else { a64_int_binary(op, ty); }
+pub fn emit_int_binary(mut cx: *FnCtx, op: Tok, ty: i64) {
+    if X86 { x64_int_binary(cx, op, ty); } else { a64_int_binary(cx, op, ty); }
 }
 
 // R_ACC = (accumulator <op> second operand) as a bool; operands of `ty`.
-pub fn emit_compare(op: Cond, ty: i64) {
+pub fn emit_compare(mut cx: *FnCtx, op: Cond, ty: i64) {
     let t = scalar_type(ty);
-    if X86 { x64_compare(op, t); } else { a64_compare(op, t); }
+    if X86 { x64_compare(cx, op, t); } else { a64_compare(cx, op, t); }
 }
 
 // Accumulator = -accumulator.
-pub fn emit_negate(ty: i64) {
-    if X86 { x64_negate(ty); } else { a64_negate(ty); }
+pub fn emit_negate(mut cx: *FnCtx, ty: i64) {
+    if X86 { x64_negate(cx, ty); } else { a64_negate(cx, ty); }
 }
 
 // R_ACC = !R_ACC (a bool).
-pub fn emit_not_bool() {
-    if X86 { x64_not_bool(); } else { a64_not_bool(); }
+pub fn emit_not_bool(mut cx: *FnCtx) {
+    if X86 { x64_not_bool(cx); } else { a64_not_bool(cx); }
 }
 
 // R_ACC = ~R_ACC.
-pub fn emit_bitnot(ty: i64) {
-    if X86 { x64_bitnot(ty); } else { a64_bitnot(ty); }
+pub fn emit_bitnot(mut cx: *FnCtx, ty: i64) {
+    if X86 { x64_bitnot(cx, ty); } else { a64_bitnot(cx, ty); }
 }
 
 // R_ACC = R_SECOND + R_ACC * elem_size (an element's address).
-pub fn emit_index_addr(elem_size: i64) {
-    if X86 { x64_index_addr(elem_size); } else { a64_index_addr(elem_size); }
+pub fn emit_index_addr(mut cx: *FnCtx, elem_size: i64) {
+    if X86 { x64_index_addr(cx, elem_size); } else { a64_index_addr(cx, elem_size); }
 }
 
 // Floats.
 
 // Float accumulator = accumulator <op> second operand.
-pub fn emit_float_binary(op: Tok, ty: i64) {
-    if X86 { x64_float_binary(op, ty); } else { a64_float_binary(op, ty); }
+pub fn emit_float_binary(mut cx: *FnCtx, op: Tok, ty: i64) {
+    if X86 { x64_float_binary(cx, op, ty); } else { a64_float_binary(cx, op, ty); }
 }
 
-pub fn emit_int_to_float(from: i64, to: i64) {
-    if X86 { x64_int_to_float(from, to); } else { a64_int_to_float(from, to); }
+pub fn emit_int_to_float(mut cx: *FnCtx, from: i64, to: i64) {
+    if X86 { x64_int_to_float(cx, from, to); } else { a64_int_to_float(cx, from, to); }
 }
 
-pub fn emit_float_to_float(from: i64, to: i64) {
+pub fn emit_float_to_float(mut cx: *FnCtx, from: i64, to: i64) {
     if from == to {
         return;
     }
-    if X86 { x64_float_to_float(to); } else { a64_float_to_float(to); }
+    if X86 { x64_float_to_float(cx, to); } else { a64_float_to_float(cx, to); }
 }
 
 // Saturating conversions (NaN is 0): signed results up to 32 bits convert
 // at 32 bits and wrap, unsigned ones up to 32 bits convert signed at 64
 // bits and wrap; u64 converts unsigned at 2^63 and above.
-pub fn emit_float_to_int(from: i64, to: i64) {
-    if X86 { x64_float_to_int(from, to); } else { a64_float_to_int(from, to); }
+pub fn emit_float_to_int(mut cx: *FnCtx, from: i64, to: i64) {
+    if X86 { x64_float_to_int(cx, from, to); } else { a64_float_to_int(cx, from, to); }
 }
 
 // Functions.
 
-pub fn emit_function_start(symbol_prefix: *u8, name: i64, global: bool) {
-    if X86 { x64_function_start(symbol_prefix, name, global); }
-    else { a64_function_start(symbol_prefix, name, global); }
+pub fn emit_function_start(mut cx: *FnCtx, symbol_prefix: *u8, name: i64, global: bool) {
+    if X86 { x64_function_start(cx, symbol_prefix, name, global); }
+    else { a64_function_start(cx, symbol_prefix, name, global); }
 }
 
 // Reserves the frame once its size is known (written to ASM, after the
 // function start).
-pub fn emit_frame_reserve(frame_size: i64) {
-    let size = align_to(frame_size, 16);
-    if size == 0 {
-        return;
+pub fn emit_frame_reserve(mut cx: *FnCtx, frame_size: i64) {
+    unsafe {
+        let size = align_to(frame_size, 16);
+        if size == 0 {
+            return;
+        }
+        let out = cx.code;
+        cx.code = cx.asm;
+        if X86 { x64_frame_reserve(cx, size); } else { a64_frame_reserve(cx, size); }
+        cx.code = out;
     }
-    let out = CODE;
-    CODE = ASM;
-    if X86 { x64_frame_reserve(size); } else { a64_frame_reserve(size); }
-    CODE = out;
 }
 
-pub fn emit_epilogue() {
-    if X86 { x64_epilogue(); } else { a64_epilogue(); }
+pub fn emit_epilogue(mut cx: *FnCtx) {
+    if X86 { x64_epilogue(cx); } else { a64_epilogue(cx); }
 }
 
 // Calls. An argument's location is 0-7 for an int register (by index in
@@ -557,56 +626,57 @@ pub fn variadic_arg_location(ty: i64, state: *i64) -> i64 {
 
 // The first int argument register used by ordinary arguments of a function
 // returning `ret` (1 where the result pointer takes the first one).
-pub fn first_int_arg(ret: i64) -> i64 {
-    if X86 && returns_through_pointer(ret) { 1 } else { 0 }
+pub fn first_int_arg(mut cx: *FnCtx, ret: i64) -> i64 {
+    if X86 && returns_through_pointer(cx, ret) { 1 } else { 0 }
 }
 
 // Accumulator = the incoming parameter at `location`, of type `ty` (a
 // pointer for compound values).
-pub fn emit_load_param(location: i64, ty: i64) {
+pub fn emit_load_param(mut cx: *FnCtx, location: i64, ty: i64) {
     let t = scalar_type(ty);
-    if X86 { x64_load_param(location, t); } else { a64_load_param(location, t); }
+    if X86 { x64_load_param(cx, location, t); } else { a64_load_param(cx, location, t); }
 }
 
 // Moves the stack pointer down (reserve) or up (release) by `size` bytes.
-pub fn emit_sp_sub(size: i64) {
-    if X86 { x64_sp_sub(size); } else { a64_sp_sub(size); }
+pub fn emit_sp_sub(mut cx: *FnCtx, size: i64) {
+    if X86 { x64_sp_sub(cx, size); } else { a64_sp_sub(cx, size); }
 }
 
-pub fn emit_sp_add(size: i64) {
-    if X86 { x64_sp_add(size); } else { a64_sp_add(size); }
+pub fn emit_sp_add(mut cx: *FnCtx, size: i64) {
+    if X86 { x64_sp_add(cx, size); } else { a64_sp_add(cx, size); }
 }
 
 // Loads argument register `location` from the temporary at sp + from;
 // `promote` widens an f32 to f64 (C's default promotion).
-pub fn emit_load_arg_reg(location: i64, ty: i64, from: i64, promote: bool) {
+pub fn emit_load_arg_reg(mut cx: *FnCtx, location: i64, ty: i64, from: i64, promote: bool) {
     let t = scalar_type(ty);
-    if X86 { x64_load_arg_reg(location, t, from, promote); }
-    else { a64_load_arg_reg(location, t, from, promote); }
+    if X86 { x64_load_arg_reg(cx, location, t, from, promote); }
+    else { a64_load_arg_reg(cx, location, t, from, promote); }
 }
 
 // Copies the temporary at sp + from to the outgoing stack area at
 // sp + offset.
-pub fn emit_stack_arg(ty: i64, from: i64, offset: i64, promote: bool) {
+pub fn emit_stack_arg(mut cx: *FnCtx, ty: i64, from: i64, offset: i64, promote: bool) {
     let t = scalar_type(ty);
-    if X86 { x64_stack_arg(t, from, offset, promote); }
-    else { a64_stack_arg(t, from, offset, promote); }
+    if X86 { x64_stack_arg(cx, t, from, offset, promote); }
+    else { a64_stack_arg(cx, t, from, offset, promote); }
 }
 
 // Loads the callee of an indirect call from the temporary at sp + from.
-pub fn emit_load_callee(from: i64) {
-    if X86 { x64_load_callee(from); } else { a64_load_callee(from); }
+pub fn emit_load_callee(mut cx: *FnCtx, from: i64) {
+    if X86 { x64_load_callee(cx, from); } else { a64_load_callee(cx, from); }
 }
 
 // Calls a function by symbol; `vector_regs` float registers carry
 // arguments (needed by variadic C functions on x86-64).
-pub fn emit_call(prefix: *u8, name: i64, is_extern: bool, variadic: bool, vector_regs: i64) {
-    if X86 { x64_call(prefix, name, is_extern, variadic, vector_regs); }
-    else { a64_call(prefix, name); }
+pub fn emit_call(mut cx: *FnCtx, prefix: *u8, name: i64, is_extern: bool, variadic: bool,
+    vector_regs: i64) {
+    if X86 { x64_call(cx, prefix, name, is_extern, variadic, vector_regs); }
+    else { a64_call(cx, prefix, name); }
 }
 
-pub fn emit_call_indirect() {
-    if X86 { x64_call_indirect(); } else { a64_call_indirect(); }
+pub fn emit_call_indirect(mut cx: *FnCtx) {
+    if X86 { x64_call_indirect(cx); } else { a64_call_indirect(cx); }
 }
 
 // ---- Run-time checks ----
@@ -651,23 +721,23 @@ pub fn rt_panic_sym() -> i64 {
 // Calls the helper with a = R_ACC, b = R_SECOND, c = R_ADDR. (0.18) site:
 // the check's site (front/contracts/sites.tach; 0: none), whose position
 // the helper prints first.
-pub fn emit_panic(kind: i64, site: i64 = 0) {
+pub fn emit_panic(mut cx: *FnCtx, kind: i64, site: i64 = 0) {
     PANIC_USED = true;
-    if X86 { x64_panic(kind, site); } else { a64_panic(kind, site); }
+    if X86 { x64_panic(cx, kind, site); } else { a64_panic(cx, kind, site); }
 }
 
 // (0.18) Calls the helper as emit_panic does, with the site popped from
 // the temporaries (a value: a requires' call site).
-pub fn emit_panic_site_popped(kind: i64) {
+pub fn emit_panic_site_popped(mut cx: *FnCtx, kind: i64) {
     PANIC_USED = true;
     unsafe {
         if X86 {
-            ins(c"movq (%rsp), %r8");
-            ins(c"addq $16, %rsp");
-            x64_panic(kind, -1);
+            ins(cx, c"movq (%rsp), %r8");
+            ins(cx, c"addq $16, %rsp");
+            x64_panic(cx, kind, -1);
         } else {
-            a64_pop_int(4);
-            a64_panic(kind, -1);
+            a64_pop_int(cx, 4);
+            a64_panic(cx, kind, -1);
         }
     }
     DEPTH -= 1;
@@ -685,22 +755,25 @@ pub fn panic_note_text() -> [u8] {
 // of 32-bit offsets from rt.messages to each message (kinds 0 to 3, then
 // one per ENUM_PANICS entry: an enum's, or a message text's), the
 // sites' table (front/contracts/sites.tach) and the files' names.
-pub fn emit_runtime() {
+pub fn emit_runtime(mut cx: *FnCtx) {
     unsafe {
         if !PANIC_USED {
             return;
         }
-        let out = CODE;
-        buf_clear(CODE);
-        if X86 { x64_runtime(); } else { a64_runtime(); }
-        buf_bytes(ASM, buf_slice(CODE));
-        CODE = out;
+        let out = cx.code;
+        buf_clear(cx.code);
+        if X86 { x64_runtime(cx); } else { a64_runtime(cx); }
+        buf_bytes(cx.asm, buf_slice(cx.code));
+        cx.code = out;
         // (0.17) each message with a note on --trace, without --trace (with
         // it, the trace follows them).
         let note = if trace_dump_fn() >= 0 { "" } else { panic_note_text() };
         let lp = cstr(local_prefix());
         data_section(writable: false);
-        let count = 4 + ENUM_PANICS.count;
+        // (0.18.1) -O1 and -O2: the kinds and sites as the join numbered them
+        // (rt_output), those of the code emitted; -O0: the front end's.
+        let kinds = if RT_RENUMBERED { OUT_KINDS.count } else { ENUM_PANICS.count };
+        let count = 4 + kinds;
         buf_fmt(DATA, f".p2align 2\n{lp}rt.messages:\n");
         for i in 0..count {
             buf_fmt(DATA, f"    .long {lp}rt.m{i} - {lp}rt.messages\n");
@@ -718,10 +791,10 @@ pub fn emit_runtime() {
             data_bytes(note);
             data_bytes("\0");
         }
-        for i in 0..ENUM_PANICS.count {
+        for i in 0..kinds {
             buf_fmt(DATA, f"{lp}rt.m{4 + i}:\n");
             let m = buf_new();
-            let e = ENUM_PANICS.data[i];
+            let e = ENUM_PANICS.data[if RT_RENUMBERED { OUT_KINDS.data[i] - 4 } else { i }];
             if e >= 0 {
                 buf_str(m, c"invalid value %lld for enum ");
                 buf_bytes(m, SYMS[ENUMS[e].name].text);
@@ -739,12 +812,13 @@ pub fn emit_runtime() {
         // (0.18) The sites: (line, file << 16 | column) each, from 1; the
         // files their checks are in, by name.
         buf_fmt(DATA, f".p2align 2\n{lp}rt.sites:\n    .long 0, 0\n");
-        let sites = site_count();
+        let sites = if RT_RENUMBERED { OUT_SITES.count + 1 } else { site_count() };
         let mut used = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for f in 0..FILE_COUNT {
             used.push(0);
         }
-        for s in 1..sites {
+        for o in 1..sites {
+            let s = if RT_RENUMBERED { OUT_SITES.data[o - 1] } else { o };
             let col = if SITE_COL.data[s] > 65535 { 65535 } else { SITE_COL.data[s] };
             buf_fmt(DATA, f"    .long {SITE_LINE.data[s]}, {SITE_FILE.data[s] * 65536 + col}\n");
             used.data[SITE_FILE.data[s]] = 1;
@@ -787,4 +861,39 @@ pub fn message_kind(text: i64) -> i64 {
 // contract's or an assertion's).
 pub fn kind_is_enum(kind: i64) -> bool {
     kind >= 4 && kind - 4 < ENUM_PANICS.count && unsafe { ENUM_PANICS.data[kind - 4] >= 0 }
+}
+
+// (0.18.1) -O1 and -O2 number the checks' sites and kinds (past the fixed
+// ones) the code loads as the join meets them (rt_output), in the order of
+// the code: a function's code names its own (middle::ir::RtId), so that
+// an edit elsewhere changes none of it (back::codecache). OUT_SITES: the
+// front end's site of each number from 1; OUT_KINDS: the front end's kind
+// of each from 4.
+pub static mut RT_RENUMBERED: bool = false;
+static mut OUT_SITES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut OUT_KINDS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut OUT_SITE_OF: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+static mut OUT_KIND_OF: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+// The program's number for the front end's site or kind `value` (class
+// middle::ir::RT_SITE or RT_KIND), given the first time the join asks.
+pub fn rt_output(class: i64, value: i64) -> i64 {
+    unsafe {
+        if class == crate::middle::ir::RT_SITE {
+            let found = OUT_SITE_OF.get(value + 1);
+            if found != 0 {
+                return found;
+            }
+            OUT_SITES.push(value);
+            OUT_SITE_OF.put(value + 1, OUT_SITES.count);
+            return OUT_SITES.count;
+        }
+        let found = OUT_KIND_OF.get(value + 1);
+        if found != 0 {
+            return found;
+        }
+        OUT_KINDS.push(value);
+        OUT_KIND_OF.put(value + 1, 3 + OUT_KINDS.count);
+        3 + OUT_KINDS.count
+    }
 }

@@ -2,53 +2,60 @@
 
 ## The most used
 
-The names agents' programs used most (0.17's evals, by how many of 362
-sessions used each), most used first. `v` is a `Vec`, `b` a `Buf`, `m` a
-`HashMap`, `sc` a `Scanner`, `o` an `Option` or `Result`. Every item:
-the index below (`guide std#the-api`); one item: `guide --find NAME`.
+std's most used items (0.17's evals: by how many of 362 sessions used
+each), most used first. `v` is a `Vec`, `b` a `Buf`, `m` a `HashMap`,
+`sc` a `Scanner`, `o` an `Option` or `Result`. All of these are in the
+prelude: no `use` line.
 
 ```text
 v.push(x: T)                     Vec; Buf: b.push(byte: u8)
 v.as_slice() -> [T]              Vec; Buf: -> [u8]
 Vec::new_in(gpa) -> Vec<T>       let mut v: Vec<i64> = Vec::new_in(gpa);
-v.len() -> i64                   Vec, Buf, HashMap; a slice: s.len or s.len()
-v.get(i: i64) -> T               checked; also v[i]; m.get(k) -> Option<V>
+v.len() -> i64                   Vec, Buf, HashMap, slices
+v.get(i: i64) -> T               checked, as v[i]; m.get(k) -> Option<V>
 b.push_str(s: [u8])
-v.free()                         Vec, Buf, HashMap: frees now, leaves it empty; values drop by themselves
 Buf::new_in(gpa) -> Buf          text you build (there is no String)
-o.unwrap() -> T                  Option, Result
+o.unwrap() -> T                  Option, Result; o.is_some(), o.is_none()
 read_stdin_in(gpa) -> Result<Buf, IoError>    all of stdin
-print(x), println(x)             any Display; f"{x} {v:?}"
+print(x), println(x)             any Display; f"{x} {v:?} {v[i]} {s.len()}"
 b.push_int(v: i64)
-v.set(i: i64, x: T)              checked; also v[i] = x
+v.set(i: i64, x: T)              checked, as v[i] = x
 Scanner::new(text: [u8]) -> Scanner
 sc.next_int() -> Result<i64, ScanError>
 o.unwrap_or(x: T) -> T           Option, Result
 v.clear()                        Vec, Buf
-v.sort_by(|a, b| a.x - b.x)      Vec or slice; a, b: &T; < 0: a first
+v.sort()                         by Ord: numbers, [u8], tuples, #[derive(Eq, Ord)]
+v.sort_by(|a, b| a.x - b.x)      a, b: &T (*a - *b); < 0: a first; cmp_of(a, b)
 HashMap::new_in(gpa) -> HashMap<K, V>
-v.pop() -> Option<T>
+v.pop() -> Option<T>             v.remove(i: i64) -> T; m.remove(k) -> Option<V>
 Vec::filled_in(n: i64, x: T, gpa) -> Vec<T>
-sort(s: &mut [T])                in place, by Ord; also v.sort()
-m.slots(), m.key_at(i) -> Option<K>, m.value_at(i) -> Option<V>   iterate
-Vec::with_capacity_in(cap: i64, gpa) -> Vec<T>
+sort(s: &mut [T])                a slice in place: sort(&mut v[a..b])
+for (k, x) in m.iter()           in slot order (not insertion order)
 m.get_or_insert(k: K, d: V) -> &mut [V]    m.get_or_insert(w, 0)[0] += 1;
-sc.next_token() -> Option<[u8]>
+sc.next_token() -> Option<[u8]>  sc.next_line() -> Option<[u8]>
 parse_int(s: [u8]) -> Result<i64, ParseIntError>
-sc.next_line() -> Option<[u8]>
 m.insert(k: K, x: V) -> Option<V>     Vec: v.insert(i: i64, x: T)
-std::print_int(v: i64)
+std::print_int(v: i64)           std::is_digit(b: u8) -> bool
 trim(s: [u8]) -> [u8]
-is_digit(b: u8) -> bool          use std::{is_digit};
 read_line(&mut b) -> Result<bool, IoError>    Ok(false) at the end of input
 split_whitespace_in(s: [u8], gpa) -> Vec<[u8]>
-v.swap(i: i64, j: i64)
-sort_stable_by_in(s: &mut [T], f, gpa)
-o.is_some() -> bool              Option
-v.remove(i: i64) -> T            m.remove(k) -> Option<V>
 split_in(s: [u8], sep: u8, gpa) -> Vec<[u8]>
-m.contains_key(k: K) -> bool
+v.swap(i: i64, j: i64)           m.contains_key(k: K) -> bool
+MinHeap::new_in(gpa), h.push(x), h.pop() -> Option<T>   a priority queue, smallest first; BinaryHeap: largest
 ```
+
+`[u8]` compares with `==`, `<` and `cmp_of` (`'a'` is a `u8`); `for b
+in s` yields its bytes. A slice from `as_slice()`, `trim`, `split_in` or
+a `Scanner` views its text: keep the `Buf`, and push to it only when
+done with them (`guide std#overview`).
+
+An allocator (`gpa`, from `fn main(gpa: Gpa)`, passed down as a
+parameter) goes only to constructors and `_in` functions; methods
+(`push`, `insert`, `clone`, `sort`) use the container's own. Not in
+std: `String` (text is `[u8]` and `Buf`), `HashSet` (`HashMap<K,
+bool>`), `Box`.
+
+@PAGE-END@ More, a section at a time: `tachyonc guide std#the-api` (every item, a line each), `std#overview` (ownership, views, HashMap), `std#input` (reading stdin), `std#heaps` (priority queues); one item: `tachyonc guide --find NAME`; all of it: `tachyonc guide std --whole`.
 
 ## Overview
 
@@ -61,7 +68,8 @@ prelude names need no import: `Option`, `Some`, `None`, `Result`, `Ok`,
 and (0.17) `Buf`, `HashMap`, `read_line`, `read_stdin_in`, `Scanner`,
 `parse_int`, `trim`, `split_in`, `split_whitespace_in`, `sort`,
 `sort_by`, `sort_stable`, `sort_stable_by` (and their `_in` forms),
-`cmp_of`, `eq_of`, `Fmt`, `panic(msg)` and `unreachable()`.
+`cmp_of`, `eq_of`, `Fmt`, `panic(msg)` and `unreachable()`; (0.18.1)
+the heaps `BinaryHeap` and `MinHeap`.
 Anything else is used by path (`std::print_int(n)`) or imported by name
 (`use std::{IoError, is_digit};`).
 
@@ -89,8 +97,8 @@ dropped (freed) at the end of its scope (0.17): no `free` calls.
 - To change a value in place, `get_mut(k)` and `get_or_insert(k, d)`
   give a writable view of one element (`&mut [V]`; `a[0]` is the value),
   safe to use until the map's next insert, remove or free, like
-  `as_mut_slice()`:
-  `counts.get_or_insert(word, 0)[0] += 1;` counts.
+  `as_mut_slice()`: Rust's `*m.entry(k).or_insert(0) += 1` is
+  `counts.get_or_insert(word, 0)[0] += 1;`.
 - `sort(s)` sorts a slice in place by `Ord` (an introsort: O(n log n),
   not stable); `v.sort()`, `s.sort()` too.
 - (0.17) `sort(&mut a[..])`, `sort(v.as_mut_slice())`; `v.free()`
@@ -127,9 +135,18 @@ c=10 a=3 b=1
 3 has b
 ```
 
+## Heaps: priority queues
+
+`BinaryHeap<T>` and `MinHeap<T>` (`T: Ord`; tuples compare field by
+field) are priority queues: `push(x)`, `pop() -> Option<T>`, `peek()`,
+`len()`, `from_vec(v)`, `into_sorted_vec()`; a BinaryHeap pops the
+largest first, a MinHeap the smallest (Rust's `BinaryHeap<Reverse<T>>`:
+tachyon has no tuple structs, so no `Reverse(x)`). Dijkstra with a
+MinHeap: `tachyonc guide --find dijkstra`.
+
 ## Input
 
-`read_line(&buf)` reads stdin a line at a time: the line goes into the
+`read_line(&mut buf)` reads stdin a line at a time: the line goes into the
 `Buf` without its `'\n'`, and the result is `Ok(false)` at the end of
 input (an empty line is `Ok(true)` with an empty `buf`; a read error is
 `Err(IoError::Read)`). `read_stdin_in(gpa)` returns all of stdin that is left

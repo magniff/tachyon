@@ -11,7 +11,7 @@ extern "C" {
 }
 
 #[effects(alloc(Gpa, extern), panic,)]
-fn grow(v: *Vec<i64>) {
+fn grow(v: &mut Vec<i64>) {
     v.push(1);
 }
 
@@ -34,7 +34,7 @@ trait Shape {
 
 fn main(gpa: Gpa) {
     let mut v: Vec<i64, Gpa> = Vec::new_in(gpa);
-    grow(&v);
+    grow(&mut v);
     let p: Pair<i64> = Pair { a: 1, b: 2 };
     println(apply(|x| x + 1, |x| x, p.a) + v.len());
 }

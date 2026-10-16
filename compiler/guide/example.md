@@ -27,7 +27,7 @@ fn main(gpa: Gpa) -> i32 {
     while let Some(raw) = sc.next_line() {      // a line, without its '\n'
         line_no += 1;
         let line = trim(cut_comment(raw));      // views into input: no copies
-        if line.len == 0 {
+        if line.len() == 0 {
             continue;
         }
         if let Err(e) = run(&mut store, line, gpa) { // run may change store
@@ -45,7 +45,7 @@ fn run(store: &mut Store, line: [u8], gpa: Gpa) -> Result<(), Error> {
 
 // s up to its first '#'.
 fn cut_comment(s: [u8]) -> [u8] {
-    for i in 0..s.len {
+    for i in 0..s.len() {
         if s[i] == '#' {                        // '#' is a u8
             return s[..i];                      // a slice of s: s[a..b], s[a..]
         }
@@ -110,7 +110,7 @@ pub fn parse(line: [u8], gpa: Gpa) -> Result<Command, Error> {
 }
 
 fn arity(w: [[u8]], n: i64) -> Result<(), Error> {
-    if w.len != n {
+    if w.len() != n {
         return Err(Error::Arity(w[0], n));
     }
     Ok(())
@@ -230,8 +230,9 @@ total 129
   here `input`, until `main` returns. Text is compared with `==` and `<`;
   `match` has no string patterns.
 - Enum variants are tuple-like or struct-like; patterns as in Rust, with
-  guards (`Ok(n) if n >= 0`), `if let`, `while let`. Matching through a
-  reference is `match *self`.
+  guards (`Ok(n) if n >= 0`), `if let`, `while let`. Matching a
+  reference matches what it points to: `match self` binds references
+  into it (0.18.1, `n: &i64`, read as `*n`), `match *self` copies.
 - `#[derive(Eq, Ord, Hash, Debug, Clone)]` (no `PartialEq`, no `Copy`
   derive: a struct of numbers and views, as `Item`, copies; one holding a
   `Vec`, `Buf` or `HashMap`, as `Store`, moves). `Display` is written by

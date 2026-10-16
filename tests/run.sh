@@ -103,6 +103,11 @@
 set -u
 LC_ALL=C
 export LC_ALL
+# (0.18.1) Without the code cache (back::codecache), unless the caller
+# says (gate.sh's suite-O2 row): its programs are small, and a cache per
+# program and compiler would fill target/tachyonc-cache.
+TACHYON_CODE_CACHE=${TACHYON_CODE_CACHE:-off}
+export TACHYON_CODE_CACHE
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 COMPILER="$ROOT/target/tachyonc"
@@ -585,6 +590,16 @@ esac
 case own-try in
     *"$FILTER"*) "$ROOT/tests/own-try/run.sh" -c "$COMPILER" >"$WORK/own-try.out" 2>&1 & ;;
 esac
+# (0.18.1) The agent hooks' cases (tools/agent-hooks/test-*.py, Python;
+# skipped without python3): category "hooks".
+case hooks in
+    *"$FILTER"*)
+        if command -v python3 >/dev/null 2>&1; then
+            for t in "$ROOT"/tools/agent-hooks/test-*.py; do python3 -I "$t"; done >"$WORK/hooks.out" 2>&1 &
+        else
+            : >"$WORK/hooks.out"
+        fi ;;
+esac
 
 # The slots: JOBS of them in a FIFO of our own, or the shared ones of
 # $TACHYON_JOBSERVER (see above).
@@ -701,6 +716,19 @@ case fmt in
             count=$((count + 1))
         fi
         awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/fmt.out" >>"$FAILURES"
+        ;;
+esac
+
+# category "hooks": the agent hooks' cases, a pass or FAIL line each
+case hooks in
+    *"$FILTER"*)
+        while read -r status _; do
+            case "$status" in
+                pass) echo "hooks pass" >>"$TALLY"; count=$((count + 1)) ;;
+                FAIL) echo "hooks fail" >>"$TALLY"; count=$((count + 1)) ;;
+            esac
+        done <"$WORK/hooks.out"
+        awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/hooks.out" >>"$FAILURES"
         ;;
 esac
 

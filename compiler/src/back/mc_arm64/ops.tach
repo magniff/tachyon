@@ -2,15 +2,13 @@
 // comparisons and branches, conversions, jump tables, and the machine
 // operations of instruction selection.
 
-use crate::back::emit::SHORT_BRANCHES;
 use crate::back::emit::machine::stays_canonical;
-use crate::back::mc_arm64::{
-    MA_W32, ma_f, ma_lea, ma_normalize, ma_r, ma_rr, ma_rrr, ma_w, o_back_imm,
-};
+use crate::back::mc_arm64::{ma_f, ma_lea, ma_normalize, ma_r, ma_rr, ma_rrr, ma_w, o_back_imm};
 use crate::base::BUFS;
 use crate::front::types::{TY_F64, TY_U32, TY_U64, int_bits, is_float, is_signed};
 use crate::gen0::arm64::{a64_condition, a64_label, a64_load_imm};
-use crate::gen0::target::{CODE, emit_label, ins, log2, new_label, o, oi, on};
+use crate::gen0::target::{emit_label, ins, log2, new_label, o, oi, on};
+use crate::middle::ctx::FnCtx;
 use crate::middle::ir::{BITS_ONES, BITS_TRAILING, Cond, Op};
 use crate::middle::ir::Op::{Add, And, Div, Mul, Neg, Not, Or, Rem, Shl, Shr, Sub, Xor};
 
@@ -19,51 +17,51 @@ use crate::middle::ir::Op::{Add, And, Div, Mul, Neg, Not, Or, Rem, Shl, Shr, Sub
 // zero-extended: canonical as it is, and a shift takes its amount modulo
 // 32 itself); and, or, xor, right shifts and unsigned divisions of
 // canonical operands are canonical: no normalization after them.
-pub fn ma_int_op(op: Op, ty: i64, d: i64, a: i64, b: i64) {
+pub fn ma_int_op(mut cx: *FnCtx, op: Op, ty: i64, d: i64, a: i64, b: i64) {
     unsafe {
         let signed = is_signed(ty);
         let w32 = ty == TY_U32;
-        MA_W32 = w32;
-        if op == Add { ma_rrr(c"add", d, a, b); }
-        else if op == Sub { ma_rrr(c"sub", d, a, b); }
-        else if op == Mul { ma_rrr(c"mul", d, a, b); }
-        else if op == Div { ma_rrr(if signed { c"sdiv" } else { c"udiv" }, d, a, b); }
+        cx.ma_w32 = w32;
+        if op == Add { ma_rrr(cx, c"add", d, a, b); }
+        else if op == Sub { ma_rrr(cx, c"sub", d, a, b); }
+        else if op == Mul { ma_rrr(cx, c"mul", d, a, b); }
+        else if op == Div { ma_rrr(cx, if signed { c"sdiv" } else { c"udiv" }, d, a, b); }
         else if op == Rem {
-            ma_rrr(if signed { c"sdiv" } else { c"udiv" }, 17, a, b);
-            o(c"    msub ");
-            ma_r(d);
-            o(if w32 { c", w17, " } else { c", x17, " });
-            ma_r(b);
-            o(c", ");
-            ma_r(a);
-            on();
-        } else if op == And { ma_rrr(c"and", d, a, b); }
-        else if op == Or { ma_rrr(c"orr", d, a, b); }
-        else if op == Xor { ma_rrr(c"eor", d, a, b); }
+            ma_rrr(cx, if signed { c"sdiv" } else { c"udiv" }, 17, a, b);
+            o(cx, c"    msub ");
+            ma_r(cx, d);
+            o(cx, if w32 { c", w17, " } else { c", x17, " });
+            ma_r(cx, b);
+            o(cx, c", ");
+            ma_r(cx, a);
+            on(cx);
+        } else if op == And { ma_rrr(cx, c"and", d, a, b); }
+        else if op == Or { ma_rrr(cx, c"orr", d, a, b); }
+        else if op == Xor { ma_rrr(cx, c"eor", d, a, b); }
         else if w32 {
-            ma_rrr(if op == Shl { c"lsl" } else { c"lsr" }, d, a, b);
+            ma_rrr(cx, if op == Shl { c"lsl" } else { c"lsr" }, d, a, b);
         } else {
             // The amount is taken modulo 32 for types up to 32 bits, modulo 64
             // for 64-bit ones.
-            ma_rr(c"and", 17, b);
-            o_back_imm(if int_bits(ty) == 64 { 63 } else { 31 });
+            ma_rr(cx, c"and", 17, b);
+            o_back_imm(cx, if int_bits(ty) == 64 { 63 } else { 31 });
             if op == Shl {
-                ma_rrr(c"lsl", d, a, 17);
+                ma_rrr(cx, c"lsl", d, a, 17);
             } else {
-                ma_rrr(if signed { c"asr" } else { c"lsr" }, d, a, 17);
+                ma_rrr(cx, if signed { c"asr" } else { c"lsr" }, d, a, 17);
             }
         }
-        MA_W32 = false;
+        cx.ma_w32 = false;
         if !w32 && !stays_canonical(op, signed) {
-            ma_normalize(d, ty);
+            ma_normalize(cx, d, ty);
         }
     }
 }
 
 // d = the high 64 bits of a * b (MULH, 0.11): smulh or umulh. The result
 // is already canonical for its type (see isel.tach).
-pub fn ma_mulh(signed: bool, d: i64, a: i64, b: i64) {
-    unsafe { ma_rrr(if signed { c"smulh" } else { c"umulh" }, d, a, b); }
+pub fn ma_mulh(mut cx: *FnCtx, signed: bool, d: i64, a: i64, b: i64) {
+    unsafe { ma_rrr(cx, if signed { c"smulh" } else { c"umulh" }, d, a, b); }
 }
 
 // Whether ma_int_op_imm emits `a <op> imm` (one instruction).
@@ -80,7 +78,7 @@ pub fn ma_int_imm_ok(op: Op, imm: i64) -> bool {
     op == Shl || op == Shr
 }
 
-pub fn ma_int_op_imm(op: Op, ty: i64, d: i64, a: i64, imm: i64) -> bool {
+pub fn ma_int_op_imm(mut cx: *FnCtx, op: Op, ty: i64, d: i64, a: i64, imm: i64) -> bool {
     unsafe {
         // (0.16) u32 on the w registers, as ma_int_op.
         let w32 = ty == TY_U32;
@@ -94,52 +92,52 @@ pub fn ma_int_op_imm(op: Op, ty: i64, d: i64, a: i64, imm: i64) -> bool {
             if value < 0 || value >= 4096 {
                 return false;
             }
-            MA_W32 = w32;
-            ma_rr(if subtract { c"sub" } else { c"add" }, d, a);
-            MA_W32 = false;
-            o_back_imm(value);
+            cx.ma_w32 = w32;
+            ma_rr(cx, if subtract { c"sub" } else { c"add" }, d, a);
+            cx.ma_w32 = false;
+            o_back_imm(cx, value);
             if !w32 {
-                ma_normalize(d, ty);
+                ma_normalize(cx, d, ty);
             }
             return true;
         }
         if op == Mul && (imm == 3 || imm == 5 || imm == 9) {
             // a * (2^k + 1) = a + (a << k)
-            MA_W32 = w32;
-            ma_rrr(c"add", d, a, a);
-            MA_W32 = false;
-            BUFS[CODE].len -= 1;
-            o(c", lsl #");
-            oi(log2(imm - 1));
-            on();
+            cx.ma_w32 = w32;
+            ma_rrr(cx, c"add", d, a, a);
+            cx.ma_w32 = false;
+            BUFS[cx.code].len -= 1;
+            o(cx, c", lsl #");
+            oi(cx, log2(imm - 1));
+            on(cx);
             if !w32 {
-                ma_normalize(d, ty);
+                ma_normalize(cx, d, ty);
             }
             return true;
         }
         if (op == And || op == Or || op == Xor) && is_logical_imm(imm as u64) {
             // (of canonical operands, canonical)
-            ma_rr(if op == And { c"and" } else if op == Or { c"orr" } else { c"eor" }, d, a);
-            o_back_imm(imm);
+            ma_rr(cx, if op == And { c"and" } else if op == Or { c"orr" } else { c"eor" }, d, a);
+            o_back_imm(cx, imm);
             return true;
         }
         if op == Shl || op == Shr {
             let amount = imm & (if int_bits(ty) == 64 { 63 } else { 31 });
             if amount == 0 {
                 if d != a {
-                    ma_rr(c"mov", d, a);
+                    ma_rr(cx, c"mov", d, a);
                 }
             } else if op == Shl {
-                MA_W32 = w32;
-                ma_rr(c"lsl", d, a);
-                MA_W32 = false;
-                o_back_imm(amount);
+                cx.ma_w32 = w32;
+                ma_rr(cx, c"lsl", d, a);
+                cx.ma_w32 = false;
+                o_back_imm(cx, amount);
             } else {
-                ma_rr(if is_signed(ty) { c"asr" } else { c"lsr" }, d, a);
-                o_back_imm(amount);
+                ma_rr(cx, if is_signed(ty) { c"asr" } else { c"lsr" }, d, a);
+                o_back_imm(cx, amount);
             }
             if op == Shl && !w32 {
-                ma_normalize(d, ty);
+                ma_normalize(cx, d, ty);
             }
             return true;
         }
@@ -176,234 +174,235 @@ pub fn is_logical_imm(value: u64) -> bool {
     count == 2
 }
 
-pub fn ma_float_op(op: Op, ty: i64, d: i64, a: i64, b: i64) {
+pub fn ma_float_op(mut cx: *FnCtx, op: Op, ty: i64, d: i64, a: i64, b: i64) {
     unsafe {
-        o(c"    ");
-        if op == Add { o(c"fadd "); }
-        else if op == Sub { o(c"fsub "); }
-        else if op == Mul { o(c"fmul "); }
-        else { o(c"fdiv "); }
-        ma_f(d, ty);
-        o(c", ");
-        ma_f(a, ty);
-        o(c", ");
-        ma_f(b, ty);
-        on();
+        o(cx, c"    ");
+        if op == Add { o(cx, c"fadd "); }
+        else if op == Sub { o(cx, c"fsub "); }
+        else if op == Mul { o(cx, c"fmul "); }
+        else { o(cx, c"fdiv "); }
+        ma_f(cx, d, ty);
+        o(cx, c", ");
+        ma_f(cx, a, ty);
+        o(cx, c", ");
+        ma_f(cx, b, ty);
+        on(cx);
     }
 }
 
-pub fn ma_unary(op: Op, ty: i64, d: i64, a: i64) {
+pub fn ma_unary(mut cx: *FnCtx, op: Op, ty: i64, d: i64, a: i64) {
     unsafe {
         if op == Neg && is_float(ty) {
-            o(c"    fneg ");
-            ma_f(d, ty);
-            o(c", ");
-            ma_f(a, ty);
-            on();
+            o(cx, c"    fneg ");
+            ma_f(cx, d, ty);
+            o(cx, c", ");
+            ma_f(cx, a, ty);
+            on(cx);
             return;
         }
         if ty == TY_U32 && op != Not {
             // (0.16: on the w registers, as ma_int_op)
-            MA_W32 = true;
-            ma_rr(if op == Neg { c"neg" } else { c"mvn" }, d, a);
-            MA_W32 = false;
+            cx.ma_w32 = true;
+            ma_rr(cx, if op == Neg { c"neg" } else { c"mvn" }, d, a);
+            cx.ma_w32 = false;
             return;
         }
         if op == Neg {
-            ma_rr(c"neg", d, a);
+            ma_rr(cx, c"neg", d, a);
         } else if op == Not {
-            ma_rr(c"eor", d, a);
-            o_back_imm(1);
+            ma_rr(cx, c"eor", d, a);
+            o_back_imm(cx, 1);
             return;
         } else {
-            ma_rr(c"mvn", d, a);
+            ma_rr(cx, c"mvn", d, a);
         }
-        ma_normalize(d, ty);
+        ma_normalize(cx, d, ty);
     }
 }
 
-fn ma_compare(ty: i64, a: i64, b: i64) {
+fn ma_compare(mut cx: *FnCtx, ty: i64, a: i64, b: i64) {
     unsafe {
         if is_float(ty) {
-            o(c"    fcmp ");
-            ma_f(a, ty);
-            o(c", ");
-            ma_f(b, ty);
-            on();
+            o(cx, c"    fcmp ");
+            ma_f(cx, a, ty);
+            o(cx, c", ");
+            ma_f(cx, b, ty);
+            on(cx);
         } else {
-            ma_rr(c"cmp", a, b);
+            ma_rr(cx, c"cmp", a, b);
         }
     }
 }
 
-pub fn ma_cmp(op: Cond, ty: i64, d: i64, a: i64, b: i64) {
+pub fn ma_cmp(mut cx: *FnCtx, op: Cond, ty: i64, d: i64, a: i64, b: i64) {
     unsafe {
-        ma_compare(ty, a, b);
-        o(c"    cset ");
-        ma_r(d);
-        o(c", ");
-        o(a64_condition(op, is_signed(ty), is_float(ty)));
-        on();
+        ma_compare(cx, ty, a, b);
+        o(cx, c"    cset ");
+        ma_r(cx, d);
+        o(cx, c", ");
+        o(cx, a64_condition(op, is_signed(ty), is_float(ty)));
+        on(cx);
     }
 }
 
 // Sets the flags from a - imm, |imm| < 4096 (cmn for a negative one).
-fn ma_compare_imm(a: i64, imm: i64) {
+fn ma_compare_imm(mut cx: *FnCtx, a: i64, imm: i64) {
     unsafe {
-        o(if imm < 0 { c"    cmn " } else { c"    cmp " });
-        ma_r(a);
-        o(c", #");
-        oi(if imm < 0 { 0 - imm } else { imm });
-        on();
+        o(cx, if imm < 0 { c"    cmn " } else { c"    cmp " });
+        ma_r(cx, a);
+        o(cx, c", #");
+        oi(cx, if imm < 0 { 0 - imm } else { imm });
+        on(cx);
     }
 }
 
 // d = (a op imm), integers, |imm| < 4096.
-pub fn ma_cmp_imm(op: Cond, ty: i64, d: i64, a: i64, imm: i64) {
+pub fn ma_cmp_imm(mut cx: *FnCtx, op: Cond, ty: i64, d: i64, a: i64, imm: i64) {
     unsafe {
-        ma_compare_imm(a, imm);
-        o(c"    cset ");
-        ma_r(d);
-        o(c", ");
-        o(a64_condition(op, is_signed(ty), float: false));
-        on();
+        ma_compare_imm(cx, a, imm);
+        o(cx, c"    cset ");
+        ma_r(cx, d);
+        o(cx, c", ");
+        o(cx, a64_condition(op, is_signed(ty), float: false));
+        on(cx);
     }
 }
 
-pub fn ma_cmp_branch(op: Cond, ty: i64, a: i64, b: i64, b_is_imm: bool, imm: i64, label: i64) {
+pub fn ma_cmp_branch(mut cx: *FnCtx, op: Cond, ty: i64, a: i64, b: i64, b_is_imm: bool, imm: i64,
+    label: i64) {
     unsafe {
         if b_is_imm && imm == 0 && (op == Cond::Eq || op == Cond::Ne) {
-            ma_branch_bool(a, op == Cond::Ne, label);
+            ma_branch_bool(cx, a, op == Cond::Ne, label);
             return;
         }
         if b_is_imm {
-            ma_compare_imm(a, imm);
+            ma_compare_imm(cx, a, imm);
         } else {
-            ma_rr(c"cmp", a, b);
+            ma_rr(cx, c"cmp", a, b);
         }
-        o(c"    b.");
-        o(a64_condition(op, is_signed(ty), float: false));
-        o(c" ");
-        a64_label(label);
-        on();
+        o(cx, c"    b.");
+        o(cx, a64_condition(op, is_signed(ty), float: false));
+        o(cx, c" ");
+        a64_label(cx, label);
+        on(cx);
     }
 }
 
-pub fn ma_branch_bool(r: i64, if_nonzero: bool, label: i64) {
+pub fn ma_branch_bool(mut cx: *FnCtx, r: i64, if_nonzero: bool, label: i64) {
     unsafe {
-        o(if if_nonzero { c"    cbnz " } else { c"    cbz " });
-        ma_r(r);
-        o(c", ");
-        a64_label(label);
-        on();
+        o(cx, if if_nonzero { c"    cbnz " } else { c"    cbz " });
+        ma_r(cx, r);
+        o(cx, c", ");
+        a64_label(cx, label);
+        on(cx);
     }
 }
 
-pub fn ma_conv(from: i64, to: i64, d: i64, src: i64) {
+pub fn ma_conv(mut cx: *FnCtx, from: i64, to: i64, d: i64, src: i64) {
     unsafe {
         if is_float(from) && is_float(to) {
-            o(c"    fcvt ");
-            ma_f(d, to);
-            o(c", ");
-            ma_f(src, from);
-            on();
+            o(cx, c"    fcvt ");
+            ma_f(cx, d, to);
+            o(cx, c", ");
+            ma_f(cx, src, from);
+            on(cx);
             return;
         }
         if is_float(to) {
-            o(if is_signed(from) { c"    scvtf " } else { c"    ucvtf " });
-            ma_f(d, to);
-            o(c", ");
-            ma_r(src);
-            on();
+            o(cx, if is_signed(from) { c"    scvtf " } else { c"    ucvtf " });
+            ma_f(cx, d, to);
+            o(cx, c", ");
+            ma_r(cx, src);
+            on(cx);
             return;
         }
         if !is_float(from) {
             if d != src {
-                ma_rr(c"mov", d, src);
+                ma_rr(cx, c"mov", d, src);
             }
-            ma_normalize(d, to);
+            ma_normalize(cx, d, to);
             return;
         }
         // Saturating float to integer (see emit_float_to_int).
         if is_signed(to) && int_bits(to) <= 32 {
-            o(c"    fcvtzs ");
-            ma_w(d);
-            o(c", ");
-            ma_f(src, from);
-            on();
-            o(c"    sxtw ");
-            ma_r(d);
-            o(c", ");
-            ma_w(d);
-            on();
+            o(cx, c"    fcvtzs ");
+            ma_w(cx, d);
+            o(cx, c", ");
+            ma_f(cx, src, from);
+            on(cx);
+            o(cx, c"    sxtw ");
+            ma_r(cx, d);
+            o(cx, c", ");
+            ma_w(cx, d);
+            on(cx);
         } else if to != TY_U64 {
-            o(c"    fcvtzs ");
-            ma_r(d);
-            o(c", ");
-            ma_f(src, from);
-            on();
+            o(cx, c"    fcvtzs ");
+            ma_r(cx, d);
+            o(cx, c", ");
+            ma_f(cx, src, from);
+            on(cx);
         } else {
             // d = value >= 2^63 ? fcvtzu(value) : fcvtzs(value); fcvtzs gives
             // INT64_MAX exactly for those values (no smaller float rounds to
             // it), the one value whose increment overflows.
-            o(c"    fcvtzs x16, ");
-            ma_f(src, from);
-            on();
-            o(c"    fcvtzu x17, ");
-            ma_f(src, from);
-            on();
-            ins(c"cmn x16, #1");
-            o(c"    csel ");
-            ma_r(d);
-            o(c", x17, x16, vs\n");
+            o(cx, c"    fcvtzs x16, ");
+            ma_f(cx, src, from);
+            on(cx);
+            o(cx, c"    fcvtzu x17, ");
+            ma_f(cx, src, from);
+            on(cx);
+            ins(cx, c"cmn x16, #1");
+            o(cx, c"    csel ");
+            ma_r(cx, d);
+            o(cx, c", x17, x16, vs\n");
         }
-        ma_normalize(d, to);
+        ma_normalize(cx, d, to);
     }
 }
 
 // A jump through a table of 32-bit offsets (from the table) to labels:
 // entry `value - low` for register r, the default above the range.
-pub fn ma_jump_table(r: i64, low: i64, range: i64, default: i64, table: *i64) {
+pub fn ma_jump_table(mut cx: *FnCtx, r: i64, low: i64, range: i64, default: i64, table: *i64) {
     unsafe {
         // The index: the value itself when the cases start at 0.
         let index = if low == 0 { r } else { 16 };
         if low != 0 {
-            ma_lea(16, r, 0 - low);
+            ma_lea(cx, 16, r, 0 - low);
         }
         if range - 1 < 4096 {
-            o(c"    cmp ");
-            ma_r(index);
-            o(c", #");
-            oi(range - 1);
-            on();
+            o(cx, c"    cmp ");
+            ma_r(cx, index);
+            o(cx, c", #");
+            oi(cx, range - 1);
+            on(cx);
         } else {
-            a64_load_imm(17, (range - 1) as u64);
-            o(c"    cmp ");
-            ma_r(index);
-            o(c", x17");
-            on();
+            a64_load_imm(cx, 17, (range - 1) as u64);
+            o(cx, c"    cmp ");
+            ma_r(cx, index);
+            o(cx, c", x17");
+            on(cx);
         }
-        o(c"    b.hi ");
-        a64_label(default);
-        on();
-        let at = new_label();
-        o(c"    adr x17, ");
-        a64_label(at);
-        on();
-        o(c"    ldrsw x16, [x17, ");
-        ma_r(index);
-        o(c", lsl #2]");
-        on();
-        ins(c"add x17, x17, x16");
-        ins(c"br x17");
-        ins(c".p2align 2");
-        emit_label(at);
+        o(cx, c"    b.hi ");
+        a64_label(cx, default);
+        on(cx);
+        let at = new_label(cx);
+        o(cx, c"    adr x17, ");
+        a64_label(cx, at);
+        on(cx);
+        o(cx, c"    ldrsw x16, [x17, ");
+        ma_r(cx, index);
+        o(cx, c", lsl #2]");
+        on(cx);
+        ins(cx, c"add x17, x17, x16");
+        ins(cx, c"br x17");
+        ins(cx, c".p2align 2");
+        emit_label(cx, at);
         for i in 0..range {
-            o(c"    .long ");
-            a64_label(table[i]);
-            o(c" - ");
-            a64_label(at);
-            on();
+            o(cx, c"    .long ");
+            a64_label(cx, table[i]);
+            o(cx, c" - ");
+            a64_label(cx, at);
+            on(cx);
         }
     }
 }
@@ -411,28 +410,28 @@ pub fn ma_jump_table(r: i64, low: i64, range: i64, default: i64, table: *i64) {
 // ---- Machine operations of instruction selection (isel/) ----
 
 // d = c + a * b, or c - a * b.
-pub fn ma_madd(sub: bool, ty: i64, d: i64, a: i64, b: i64, c: i64) {
+pub fn ma_madd(mut cx: *FnCtx, sub: bool, ty: i64, d: i64, a: i64, b: i64, c: i64) {
     unsafe {
         // (0.16: u32 on the w registers, as ma_int_op)
-        MA_W32 = ty == TY_U32;
-        o(if sub { c"    msub " } else { c"    madd " });
-        ma_r(d);
-        o(c", ");
-        ma_r(a);
-        o(c", ");
-        ma_r(b);
-        o(c", ");
-        ma_r(c);
-        on();
-        if !MA_W32 {
-            ma_normalize(d, ty);
+        cx.ma_w32 = ty == TY_U32;
+        o(cx, if sub { c"    msub " } else { c"    madd " });
+        ma_r(cx, d);
+        o(cx, c", ");
+        ma_r(cx, a);
+        o(cx, c", ");
+        ma_r(cx, b);
+        o(cx, c", ");
+        ma_r(cx, c);
+        on(cx);
+        if !cx.ma_w32 {
+            ma_normalize(cx, d, ty);
         }
-        MA_W32 = false;
+        cx.ma_w32 = false;
     }
 }
 
 // d = a op (b sh k); `code` is 4 * op + sh (0 lsl, 1 lsr, 2 asr).
-pub fn ma_shop(code: i64, ty: i64, d: i64, a: i64, b: i64, k: i64) {
+pub fn ma_shop(mut cx: *FnCtx, code: i64, ty: i64, d: i64, a: i64, b: i64, k: i64) {
     let op = code / 4;
     let kind = code % 4;
     let mnemonic = if op == Add as i64 { c"add" } else if op == Sub as i64 { c"sub" }
@@ -440,64 +439,64 @@ pub fn ma_shop(code: i64, ty: i64, d: i64, a: i64, b: i64, k: i64) {
     // (0.16: u32 on the w registers, as ma_int_op)
     let w32 = ty == TY_U32 && k < 32;
     unsafe {
-        MA_W32 = w32;
-        ma_rrr(mnemonic, d, a, b);
-        MA_W32 = false;
-        BUFS[CODE].len -= 1;
-        o(if kind == 0 { c", lsl #" } else if kind == 1 { c", lsr #" } else { c", asr #" });
+        cx.ma_w32 = w32;
+        ma_rrr(cx, mnemonic, d, a, b);
+        cx.ma_w32 = false;
+        BUFS[cx.code].len -= 1;
+        o(cx, if kind == 0 { c", lsl #" } else if kind == 1 { c", lsr #" } else { c", asr #" });
     }
-    oi(k);
-    on();
+    oi(cx, k);
+    on(cx);
     if !w32 {
-        ma_normalize(d, ty);
+        ma_normalize(cx, d, ty);
     }
 }
 
 // d = (a >> k) & (2^n - 1).
-pub fn ma_ubfx(d: i64, a: i64, k: i64, n: i64) {
+pub fn ma_ubfx(mut cx: *FnCtx, d: i64, a: i64, k: i64, n: i64) {
     unsafe {
-        ma_rr(c"ubfx", d, a);
-        BUFS[CODE].len -= 1;
-        o(c", #");
-        oi(k);
-        o(c", #");
-        oi(n);
-        on();
+        ma_rr(cx, c"ubfx", d, a);
+        BUFS[cx.code].len -= 1;
+        o(cx, c", #");
+        oi(cx, k);
+        o(cx, c", #");
+        oi(cx, n);
+        on(cx);
     }
 }
 
 // Sets the flags from a & b (b < 0: a & mask).
-fn ma_tst(a: i64, b: i64, mask: i64) {
+fn ma_tst(mut cx: *FnCtx, a: i64, b: i64, mask: i64) {
     unsafe {
         if b >= 0 {
-            ma_rr(c"tst", a, b);
+            ma_rr(cx, c"tst", a, b);
         } else {
-            o(c"    tst ");
-            ma_r(a);
-            o(c", #");
-            oi(mask);
-            on();
+            o(cx, c"    tst ");
+            ma_r(cx, a);
+            o(cx, c", #");
+            oi(cx, mask);
+            on(cx);
         }
     }
 }
 
 // Jumps to `label` when a & b (b < 0: a & mask) is nonzero, or zero.
-pub fn ma_test_branch(a: i64, b: i64, mask: i64, if_nonzero: bool, label: i64) {
+pub fn ma_test_branch(mut cx: *FnCtx, a: i64, b: i64, mask: i64, if_nonzero: bool, label: i64) {
     unsafe {
-        if b < 0 && mask > 0 && (mask & (mask - 1)) == 0 && SHORT_BRANCHES {
-            o(if if_nonzero { c"    tbnz " } else { c"    tbz " });
-            ma_r(a);
-            o(c", #");
-            oi(log2(mask));
-            o(c", ");
-            a64_label(label);
-            on();
+        if b < 0 && mask > 0 && (mask & (mask - 1)) == 0 && cx.short_branches {
+            o(cx, if if_nonzero { c"    tbnz " } else { c"    tbz " });
+            ma_r(cx, a);
+            o(cx, c", #");
+            oi(cx, log2(mask));
+            o(cx, c", ");
+            a64_label(cx, label);
+            on(cx);
             return;
         }
-        ma_tst(a, b, mask);
-        o(if if_nonzero { c"    b.ne " } else { c"    b.eq " });
-        a64_label(label);
-        on();
+        ma_tst(cx, a, b, mask);
+        o(cx, if if_nonzero { c"    b.ne " } else { c"    b.eq " });
+        a64_label(cx, label);
+        on(cx);
     }
 }
 
@@ -505,107 +504,107 @@ pub fn ma_test_branch(a: i64, b: i64, mask: i64, if_nonzero: bool, label: i64) {
 // (lhs & rhs) op 0 when `test` (rhs < 0: the immediate imm); cmp_ty is the
 // type compared, ty the selected; the flags are already set unless
 // `compare`.
-pub fn ma_select(op: Cond, test: bool, compare: bool, cmp_ty: i64, lhs: i64, rhs: i64, imm: i64,
-    ty: i64, d: i64, then: i64, other: i64, increment: bool) {
+pub fn ma_select(mut cx: *FnCtx, op: Cond, test: bool, compare: bool, cmp_ty: i64, lhs: i64,
+    rhs: i64, imm: i64, ty: i64, d: i64, then: i64, other: i64, increment: bool) {
     unsafe {
         if !compare {
         } else if test {
-            ma_tst(lhs, rhs, imm);
+            ma_tst(cx, lhs, rhs, imm);
         } else if is_float(cmp_ty) {
-            ma_compare(cmp_ty, lhs, rhs);
+            ma_compare(cx, cmp_ty, lhs, rhs);
         } else if rhs < 0 {
-            ma_compare_imm(lhs, imm);
+            ma_compare_imm(cx, lhs, imm);
         } else {
-            ma_rr(c"cmp", lhs, rhs);
+            ma_rr(cx, c"cmp", lhs, rhs);
         }
         let condition = a64_condition(op, is_signed(cmp_ty), is_float(cmp_ty) && !test);
         if is_float(ty) {
-            o(c"    fcsel ");
-            ma_f(d, ty);
-            o(c", ");
-            ma_f(then, ty);
-            o(c", ");
-            ma_f(other, ty);
+            o(cx, c"    fcsel ");
+            ma_f(cx, d, ty);
+            o(cx, c", ");
+            ma_f(cx, then, ty);
+            o(cx, c", ");
+            ma_f(cx, other, ty);
         } else {
-            o(if increment { c"    csinc " } else { c"    csel " });
-            ma_r(d);
-            o(c", ");
-            ma_r_or_zero(then);
-            o(c", ");
-            ma_r_or_zero(other);
+            o(cx, if increment { c"    csinc " } else { c"    csel " });
+            ma_r(cx, d);
+            o(cx, c", ");
+            ma_r_or_zero(cx, then);
+            o(cx, c", ");
+            ma_r_or_zero(cx, other);
         }
-        o(c", ");
-        o(condition);
-        on();
+        o(cx, c", ");
+        o(cx, condition);
+        on(cx);
     }
 }
 
 // x<r>, or xzr for -1.
-fn ma_r_or_zero(r: i64) {
+fn ma_r_or_zero(mut cx: *FnCtx, r: i64) {
     if r < 0 {
-        unsafe { o(c"xzr"); }
+        unsafe { o(cx, c"xzr"); }
     } else {
-        ma_r(r);
+        ma_r(cx, r);
     }
 }
 
 // Stores (or loads) registers r and s at [sp, #offset] and [sp, #offset +
 // 8]: x or d registers alike.
-pub fn ma_pair(load: bool, r: i64, s: i64, offset: i64) {
+pub fn ma_pair(mut cx: *FnCtx, load: bool, r: i64, s: i64, offset: i64) {
     unsafe {
-        o(if load { c"    ldp " } else { c"    stp " });
+        o(cx, if load { c"    ldp " } else { c"    stp " });
         if r >= 32 {
-            ma_f(r, TY_F64);
-            o(c", ");
-            ma_f(s, TY_F64);
+            ma_f(cx, r, TY_F64);
+            o(cx, c", ");
+            ma_f(cx, s, TY_F64);
         } else {
-            ma_r(r);
-            o(c", ");
-            ma_r(s);
+            ma_r(cx, r);
+            o(cx, c", ");
+            ma_r(cx, s);
         }
-        o(c", [sp");
+        o(cx, c", [sp");
         if offset != 0 {
-            o(c", #");
-            oi(offset);
+            o(cx, c", #");
+            oi(cx, offset);
         }
-        o(c"]\n");
+        o(cx, c"]\n");
     }
 }
 
 // d = sqrt, fabs, floor, ceil, trunc or round (kind 0 to 5) of a.
-pub fn ma_fmath(kind: i64, ty: i64, d: i64, a: i64) {
+pub fn ma_fmath(mut cx: *FnCtx, kind: i64, ty: i64, d: i64, a: i64) {
     unsafe {
-        o(if kind == 0 { c"    fsqrt " } else if kind == 1 { c"    fabs " }
+        o(cx, if kind == 0 { c"    fsqrt " } else if kind == 1 { c"    fabs " }
             else if kind == 2 { c"    frintm " } else if kind == 3 { c"    frintp " }
             else if kind == 4 { c"    frintz " } else { c"    frinta " });
-        ma_f(d, ty);
-        o(c", ");
-        ma_f(a, ty);
-        on();
+        ma_f(cx, d, ty);
+        o(cx, c", ");
+        ma_f(cx, a, ty);
+        on(cx);
     }
 }
 
 // (0.16) d = the count `kind` of a's bits (BITS_ONES: cnt over the bytes
 // in v31, the vector temporary, and their sum; BITS_LEADING: clz;
 // BITS_TRAILING: rbit, then clz).
-pub fn ma_bits(kind: i64, d: i64, a: i64) {
+pub fn ma_bits(mut cx: *FnCtx, kind: i64, d: i64, a: i64) {
     unsafe {
         if kind == BITS_ONES {
-            o(c"    fmov d31, ");
-            ma_r(a);
-            on();
-            o(c"    cnt v31.8b, v31.8b\n");
-            o(c"    addv b31, v31.8b\n");
-            o(c"    fmov ");
-            ma_w(d);
-            o(c", s31\n");
+            o(cx, c"    fmov d31, ");
+            ma_r(cx, a);
+            on(cx);
+            o(cx, c"    cnt v31.8b, v31.8b\n");
+            o(cx, c"    addv b31, v31.8b\n");
+            o(cx, c"    fmov ");
+            ma_w(cx, d);
+            o(cx, c", s31\n");
             return;
         }
         if kind == BITS_TRAILING {
-            ma_rr(c"rbit", d, a);
-            ma_rr(c"clz", d, d);
+            ma_rr(cx, c"rbit", d, a);
+            ma_rr(cx, c"clz", d, d);
             return;
         }
-        ma_rr(c"clz", d, a);
+        ma_rr(cx, c"clz", d, a);
     }
 }

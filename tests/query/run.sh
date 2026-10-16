@@ -196,7 +196,7 @@ check self_def_variant "$ok" "$out"
 out=$("$COMPILER" query items gvn 2>&1)
 ok=0
 printf '%s\n' "$out" | head -1 | grep -q "^# crate::middle::gvn${TAB}compiler/src/middle/gvn.tach\$" \
-    && printf '%s\n' "$out" | grep -q "^[0-9]*${TAB}fn${TAB}pub fn run_gvn(fi: i64) -> bool\$" && ok=1
+    && printf '%s\n' "$out" | grep -q "^[0-9]*${TAB}fn${TAB}pub fn run_gvn(mut cx: \*FnCtx, fi: i64) -> bool\$" && ok=1
 check self_items "$ok" "$(printf '%s\n' "$out" | head -5)"
 # More than 5 definitions for show: their paths, and an error.
 out=$("$COMPILER" query show .name 2>&1)
@@ -240,7 +240,7 @@ mkdir -p "$WORK/empty"
 out=$(cd "$WORK/empty" && "$COMPILER" query items std 2>&1)
 ok=0
 [ "$(printf '%s\n' "$out" | wc -l)" -ge 100 ] && printf '%s\n' "$out" | head -1 | grep -q "^# std${TAB}<std>\$" \
-    && printf '%s\n' "$out" | grep -q "${TAB}pub fn read_line<A: Allocator>(line: \*Buf<A>) -> Result<bool, IoError>\$" \
+    && printf '%s\n' "$out" | grep -q "${TAB}pub fn read_line<A: Allocator>(line: \&mut Buf<A>) -> Result<bool, IoError>\$" \
     && ! printf '%s\n' "$out" | grep -q 'fn malloc' && ok=1
 check std_items_no_program "$ok" "$(printf '%s\n' "$out" | head -5)"
 # (0.17: a name outside the prelude, which needs no `use`)
@@ -263,8 +263,10 @@ ok=0
 printf '%s\n' "$out" | head -1 | grep -q '^// std::trim' && ok=1
 check std_show_by_file "$ok" "$(printf '%s\n' "$out" | head -3)"
 out=$("$COMPILER" check --std-tree compiler/std 2>&1)
+rc=$?
 ok=0
-[ $? -eq 0 ] && [ -z "$out" ] && ok=1
+# (0.18.1: a clean check says so in one line)
+[ $rc -eq 0 ] && [ "$out" = "ok: 0 errors in compiler/src/main.tach" ] && ok=1
 check std_tree_checks "$ok" "$out"
 bad=""
 for kind in $("$COMPILER" query examples | cut -f1); do

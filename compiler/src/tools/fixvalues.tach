@@ -5,6 +5,10 @@
 //   `&mut T` when the function writes through it, else `&T`; the calls'
 //   `&x` become `&mut x` for a `&mut` parameter (a receiver `x.m()` is
 //   referenced by itself), a raw pointer passed on becomes `&mut *p`.
+//   (0.18.1) A raw pointer stays `*T`: a parameter passed on to C's, an
+//   unsafe fn's or a `mut` one, given `c"..."` or null, compared, indexed
+//   (`p[i]`, `&p[i]`), cast or stored (`let`, an aggregate), and one passed
+//   on to such a parameter (F_RAW).
 // - Rule 3: a slice parameter that is written becomes `&mut [T]`; the
 //   calls' `a[..]` become `&mut a[..]`, `v.as_slice()` `v.as_mut_slice()`.
 // - Rule 4, the move migration: a by-value parameter of an owned type
@@ -52,6 +56,11 @@ const F_WRITE: i64 = 1;
 const F_MOVE: i64 = 2;
 const F_FORCED: i64 = 4;
 
+// (a raw pointer: indexed, `p[1]`, or passed on to a raw parameter, C's,
+// an unsafe fn's, a `mut` one or another raw one: it stays `*T`, and so
+// does a parameter passed on to it)
+const F_RAW: i64 = 8;
+
 // The conversions (conv).
 const CV_NONE: i64 = 0;
 const CV_MUT: i64 = 1;
@@ -90,6 +99,9 @@ static mut HAS_AS_MUT_SLICE: bool = false;
 static mut MEMBERS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 // A member's node (+ 1 → its declaration's node + 1).
 static mut GROUP: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+// The closures f-strings make (node + 1: 1), find_values.
+static mut FSTRING_CLOSURES: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
 
 // The counts, for the report: parameters to `&mut T`, to `&T`, to `&mut
 // [T]`, owned to `&T`; arguments rewritten; `defer x.free()` deleted.
@@ -359,6 +371,28 @@ fn callee_writes(f: i64, i: i64) -> bool {
     }
 }
 
+// Whether parameter i of f is a raw pointer that stays one: C's, an
+// `unsafe fn`'s, a `mut p: *T`, or one the walk found raw (F_RAW).
+fn callee_raw(f: i64, i: i64) -> bool {
+    unsafe {
+        if f < 0 || i >= FNS[f].param_count {
+            return false;
+        }
+        let t = fn_param(f, i);
+        if t <= 0 || TYPES[t].kind != TyKind::Ptr || TYPES[t].b != 0 {
+            return false;
+        }
+        if FNS[f].is_extern || (FNS[f].attrs & FN_UNSAFE) != 0 {
+            return true;
+        }
+        let item = FNS[f].node;
+        if item > 0 && i < NODES[item].count && NODES[child(item, i)].c != 0 {
+            return true;
+        }
+        group_of(f) <= 0 && has_body(f) && (flags(f, i) & F_RAW) != 0
+    }
+}
+
 // Whether a call of f keeps (moves) the value its by-value parameter i
 // gets: unless the parameter becomes `&T`.
 fn callee_consumes(f: i64, i: i64) -> bool {
@@ -405,6 +439,34 @@ fn place_root(n: i64) -> i64 {
             }
         }
         e
+    }
+}
+
+// Whether place n is reached through a raw pointer: a field, an index or
+// a deref of a `*T` that stays raw (`&t.blocks[i].preds`, blocks a `*T`).
+fn through_raw(n: i64) -> bool {
+    unsafe {
+        let mut e = n;
+        while e > 0 {
+            let k = NODES[e].kind;
+            let mut base = 0;
+            if k == NodeKind::FieldAccess || k == NodeKind::TupleField || k == NodeKind::Index {
+                base = NODES[e].a;
+            } else if k == NodeKind::Unary && NODES[e].op == Tok::Star {
+                base = NODES[e].b;
+            } else {
+                return false;
+            }
+            let t = NODES[base].ty;
+            if t > 0 && TYPES[t].kind == TyKind::Ptr && TYPES[t].b == 0 {
+                let p = param_ident(base);
+                if p < 0 || conv(CUR_F, p) == CV_NONE {
+                    return true;
+                }
+            }
+            e = base;
+        }
+        false
     }
 }
 
@@ -472,8 +534,8 @@ fn bare_use(p: i64, ctx: i64) {
         mark_cur(p, F_MOVE);
     } else if c == PC_PTR && ctx == CX_BIND && IN_HOLE == 0 {
         // (a local made from it would be a reference, and a raw walk
-        // `q = (*q).next` would no longer check)
-        mark_cur(p, F_WRITE | F_FORCED);
+        // `q = (*q).next` would no longer check: kept raw, `argv[0] = w0`)
+        mark_cur(p, F_WRITE | F_FORCED | F_RAW);
     } else if c == PC_PTR && ctx == CX_MOVE && IN_HOLE == 0 {
         mark_cur(p, F_WRITE);
     }
@@ -525,6 +587,12 @@ fn mark_all(n: i64) {
             }
         }
     }
+}
+
+// Whether closure n is the one an f-string's Interp makes: the field `f`
+// of the `std::Interp { f: ... }` its block ends with.
+fn fstring_closure(n: i64) -> bool {
+    unsafe { FSTRING_CLOSURES.get(n + 1) != 0 }
 }
 
 fn scan_list(n: i64, ctx: i64) {
@@ -587,13 +655,28 @@ fn scan(n: i64, ctx: i64) {
                     // unsafe code: it stays a raw pointer)
                     let p = param_ident(NODES[n].a);
                     if p >= 0 && (NODES[n].p & NODE_RAW) != 0 {
-                        force(CUR_F, p);
+                        mark(CUR_F, p, F_FORCED | F_RAW);
                     }
                     place_read(n, ctx);
                 }
             }
-            NodeKind::Cast => scan(NODES[n].a, CX_READ),
+            NodeKind::Cast => {
+                // (`p as i64`, `p as *u8`: an address, a raw pointer)
+                let p = param_ident(NODES[n].a);
+                if p >= 0 && pclass(CUR_F, p) == PC_PTR {
+                    mark_cur(p, F_WRITE | F_FORCED | F_RAW);
+                }
+                scan(NODES[n].a, CX_READ);
+            }
             NodeKind::Binary => {
+                // (`p == 0 as *T`, `p != q`: an address compared, a raw
+                // pointer; a reference's `==` would compare the values)
+                for side in [NODES[n].b, NODES[n].c] {
+                    let p = param_ident(side);
+                    if p >= 0 && pclass(CUR_F, p) == PC_PTR {
+                        mark_cur(p, F_WRITE | F_FORCED | F_RAW);
+                    }
+                }
                 scan(NODES[n].b, CX_READ);
                 scan(NODES[n].c, CX_READ);
             }
@@ -654,8 +737,9 @@ fn scan(n: i64, ctx: i64) {
             }
             NodeKind::Break => scan(NODES[n].b, CX_MOVE),
             NodeKind::Return => scan(NODES[n].a, CX_MOVE),
+            // (a pointer parameter kept in an aggregate: as by `let`)
             NodeKind::Tuple | NodeKind::Array | NodeKind::StructLit | NodeKind::VariantLit => {
-                scan_list(n, CX_MOVE);
+                scan_list(n, CX_BIND);
             }
             NodeKind::FieldInit | NodeKind::NamedArg => scan(NODES[n].b, ctx),
             NodeKind::Repeat => scan(NODES[n].a, CX_MOVE),
@@ -663,7 +747,15 @@ fn scan(n: i64, ctx: i64) {
                 scan(NODES[n].a, CX_READ);
                 scan(NODES[n].b, CX_READ);
             }
-            NodeKind::Closure => mark_all(NODES[n].y),
+            NodeKind::Closure => {
+                // (an f-string's closure, `std::Interp { f: |out| ... }`,
+                // displays the locals its holes were bound to, `let __f0 =
+                // e0`, which the walk reads: it spans the holes' source,
+                // and is no capture of them)
+                if !fstring_closure(n) {
+                    mark_all(NODES[n].y);
+                }
+            }
             NodeKind::Try => scan(NODES[n].y, ctx),
             NodeKind::Interp => {
                 IN_HOLE += 1;
@@ -685,6 +777,13 @@ fn scan(n: i64, ctx: i64) {
 fn borrow(n: i64, f: i64, i: i64) {
     unsafe {
         let operand = NODES[n].b;
+        // (`&p[i]` of a `*T` parameter: pointer arithmetic, a raw pointer)
+        if NODES[operand].kind == NodeKind::Index && (NODES[operand].p & NODE_RAW) != 0 {
+            let q = param_ident(NODES[operand].a);
+            if q >= 0 && pclass(CUR_F, q) == PC_PTR {
+                mark_cur(q, F_WRITE | F_FORCED | F_RAW);
+            }
+        }
         place_parts(operand);
         let p = param_ident(place_root(operand));
         if p < 0 || IN_HOLE > 0 {
@@ -739,6 +838,10 @@ fn argument(f: i64, i: i64, arg: i64, call: i64) {
         let p = param_ident(arg);
         let slicing = k == NodeKind::Index && NODES[NODES[arg].b].kind == NodeKind::Range;
         let q = if slicing { param_ident(place_root(NODES[arg].a)) } else { p };
+        if q >= 0 && !slicing && pclass(CUR_F, q) == PC_PTR && callee_raw(f, i) {
+            mark_cur(q, F_WRITE | F_FORCED | F_RAW);
+            return;
+        }
         if q >= 0 && IN_HOLE == 0 {
             let c = pclass(CUR_F, q);
             if slicing {
@@ -759,8 +862,13 @@ fn argument(f: i64, i: i64, arg: i64, call: i64) {
         }
         // (a view of a parameter passed on, `v.as_slice()`, to a parameter
         // that is written: sort_by)
+        // (a slice's `s.ptr` passed on, to C's memcpy: the pointer of a view,
+        // read only as the view is; a write through it wants `&mut [T]`)
         let w = param_ident(write_root(arg));
-        if w >= 0 && IN_HOLE == 0 && pclass(CUR_F, w) != PC_NONE && callee_writes(f, i) {
+        let view_ptr = k == NodeKind::FieldAccess && param_ident(NODES[arg].a) == w
+            && w >= 0 && pclass(CUR_F, w) == PC_SLICE;
+        if w >= 0 && IN_HOLE == 0 && pclass(CUR_F, w) != PC_NONE && !view_ptr
+            && callee_writes(f, i) {
             mark_cur(w, F_WRITE);
         }
         let by_value = f < 0 || i >= FNS[f].param_count || fn_param(f, i) <= 0
@@ -813,10 +921,7 @@ fn rewrite_argument(f: i64, i: i64, arg: i64) {
                     return;
                 }
                 // (`&` of a place reached through a raw pointer stays raw)
-                let root = place_root(operand);
-                let rt = NODES[root].ty;
-                if rt > 0 && TYPES[rt].kind == TyKind::Ptr && TYPES[rt].b == 0
-                    && param_ident(root) < 0 && root != operand {
+                if through_raw(operand) {
                     force(f, i);
                     return;
                 }
@@ -839,6 +944,12 @@ fn rewrite_argument(f: i64, i: i64, arg: i64) {
                 return;
             }
             if t > 0 && TYPES[t].kind == TyKind::Ptr {
+                // (a C string, `c"..."`, or null, `0 as *T`, passed: a
+                // raw pointer, which no reference can be)
+                if k == NodeKind::CStr || k == NodeKind::Cast {
+                    mark(f, i, F_FORCED | F_RAW);
+                    return;
+                }
                 if edit {
                     wrap(arg, if cv == CV_MUT { c"&mut *" } else { c"&*" });
                     VALUES_COUNTS[4] += 1;
@@ -1075,6 +1186,19 @@ fn find_values() {
             if (k == NodeKind::Ident || k == NodeKind::Path) && NODES[n].res == Res::Fn
                 && NODES[n].y >= 0 && callees.get(n + 1) == 0 {
                 AS_VALUE.put(base_node(NODES[n].y) + 1, 1);
+            }
+        }
+        // (an Interp's y: `{ let __f0 = e0; ...; std::Interp { f: closure } }`)
+        for n in 1..NODE_COUNT {
+            let y = NODES[n].y;
+            if NODES[n].kind == NodeKind::Interp && y > 0 && NODES[y].kind == NodeKind::Block {
+                let lit = NODES[y].a;
+                if lit > 0 && NODES[lit].kind == NodeKind::StructLit && NODES[lit].count > 0 {
+                    let f = NODES[child(lit, 0)].b;
+                    if f > 0 && NODES[f].kind == NodeKind::Closure {
+                        FSTRING_CLOSURES.put(f + 1, 1);
+                    }
+                }
             }
         }
         let sym = intern("as_mut_slice");

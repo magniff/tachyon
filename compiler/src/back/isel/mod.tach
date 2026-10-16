@@ -89,89 +89,85 @@ mod tiling;
 use crate::back::isel::branches::{form_selects, lower_sels, thread_phi_branches};
 use crate::back::isel::divisions::lower_divisions;
 use crate::back::isel::tiling::isel_function;
-use crate::back::regalloc::LDEPTH;
 use crate::back::regalloc::prepare::layout_blocks;
 use crate::base::{alloc_array, free};
 use crate::base::target::X86;
 use crate::front::types::{TY_F64, is_float, is_vector, type_size};
+use crate::middle::ctx::FnCtx;
 use crate::middle::inline::FN_LIVE;
 use crate::middle::ir::{
-    BLOCKS, INSTS, INST_COUNT, IRFUNCS, IRFUNC_COUNT, Op, Term, ir_append, ir_enter,
-    ir_insert_before, ir_operand, ir_operand_count, ir_unlink,
+    IRFUNCS, IRFUNC_COUNT, Op, Term, ir_append, ir_enter, ir_insert_before, ir_operand,
+    ir_operand_count, ir_unlink,
 };
 use crate::middle::ir::Op::{Cmp, Const, Copy, Load, LoadX, Param, Store, StoreX, Test};
 use crate::middle::ir::verify::verify_func;
 use crate::middle::opt::{eliminate_dead_code, resolve_all};
 
-// Uses of each instruction of the function being selected (by value id).
-static mut ISEL_USES: *i64 = 0 as *i64;
-static mut ISEL_CAP: i64 = 0;
-
-pub fn select_instructions() {
+pub fn select_instructions(mut cx: *FnCtx) {
     unsafe {
         for fi in 0..IRFUNC_COUNT {
             if FN_LIVE[fi] != 0 {
-                select_function(fi);
+                select_function(cx, fi);
             }
         }
     }
 }
 
 // Instruction selection for function fi.
-pub fn select_function(fi: i64) {
+pub fn select_function(mut cx: *FnCtx, fi: i64) {
     unsafe {
-        ir_enter(fi);
-        if lower_sels(fi) {
-            resolve_all(fi);
-            eliminate_dead_code(fi);
+        ir_enter(cx, fi);
+        if lower_sels(cx, fi) {
+            resolve_all(cx, fi);
+            eliminate_dead_code(cx, fi);
         }
-        let threaded = thread_phi_branches(fi);
-        if form_selects(fi) || threaded {
-            eliminate_dead_code(fi);
+        let threaded = thread_phi_branches(cx, fi);
+        if form_selects(cx, fi) || threaded {
+            eliminate_dead_code(cx, fi);
         }
-        lower_divisions(fi);
-        isel_function(fi);
-        eliminate_dead_code(fi);
-        schedule_function(fi);
-        verify_func(fi, c"instruction selection");
+        lower_divisions(cx, fi);
+        isel_function(cx, fi);
+        eliminate_dead_code(cx, fi);
+        schedule_function(cx, fi);
+        verify_func(cx, fi, c"instruction selection");
     }
 }
 
 // ---- Use counts ----
 
-fn isel_count_uses(fi: i64) {
+fn isel_count_uses(mut cx: *FnCtx, fi: i64) {
     unsafe {
-        if ISEL_CAP < INST_COUNT + 1 {
-            free(ISEL_USES as *u8);
-            ISEL_CAP = 2 * INST_COUNT + 1024;
-            ISEL_USES = alloc_array::<i64>(ISEL_CAP);
+        if cx.isel_cap < cx.inst_count + 1 {
+            free(cx.isel_uses as *u8);
+            cx.isel_cap = 2 * cx.inst_count + 1024;
+            cx.isel_uses = alloc_array::<i64>(cx.isel_cap);
         }
         for b in IRFUNCS[fi].blocks.items() {
-            if BLOCKS[b].removed != 0 {
+            if cx.blocks[b].removed != 0 {
                 continue;
             }
-            let mut v = BLOCKS[b].first;
+            let mut v = cx.blocks[b].first;
             while v != 0 {
-                ISEL_USES[v] = 0;
-                v = INSTS[v].next;
+                cx.isel_uses[v] = 0;
+                v = cx.insts[v].next;
             }
         }
         for b in IRFUNCS[fi].blocks.items() {
-            if BLOCKS[b].removed != 0 {
+            if cx.blocks[b].removed != 0 {
                 continue;
             }
-            let mut v = BLOCKS[b].first;
+            let mut v = cx.blocks[b].first;
             while v != 0 {
-                for k in 0..ir_operand_count(v) {
-                    let operand = ir_operand(v, k);
+                for k in 0..ir_operand_count(cx, v) {
+                    let operand = ir_operand(cx, v, k);
                     if operand != 0 {
-                        ISEL_USES[operand] += 1;
+                        cx.isel_uses[operand] += 1;
                     }
                 }
-                v = INSTS[v].next;
+                v = cx.insts[v].next;
             }
-            if BLOCKS[b].cond != 0 {
-                ISEL_USES[BLOCKS[b].cond] += 1;
+            if cx.blocks[b].cond != 0 {
+                cx.isel_uses[cx.blocks[b].cond] += 1;
             }
         }
     }
@@ -179,40 +175,40 @@ fn isel_count_uses(fi: i64) {
 
 // One use of `v` less; when it was the last, `v` is dead and so are its
 // own uses.
-fn isel_release(v: i64) {
+fn isel_release(mut cx: *FnCtx, v: i64) {
     unsafe {
         if v == 0 {
             return;
         }
-        ISEL_USES[v] -= 1;
-        if ISEL_USES[v] == 0 && !INSTS[v].op.has_side_effect() {
-            for k in 0..ir_operand_count(v) {
-                isel_release(ir_operand(v, k));
+        cx.isel_uses[v] -= 1;
+        if cx.isel_uses[v] == 0 && !cx.insts[v].op.has_side_effect() {
+            for k in 0..ir_operand_count(cx, v) {
+                isel_release(cx, ir_operand(cx, v, k));
             }
         }
     }
 }
 
-fn isel_retain(v: i64) {
+fn isel_retain(mut cx: *FnCtx, v: i64) {
     if v != 0 {
-        unsafe { ISEL_USES[v] += 1; }
+        unsafe { cx.isel_uses[v] += 1; }
     }
 }
 
 // Whether `v` (an operand of `user`) can be covered by a rule rooted at
 // `user`: an integer instruction `op` of the same block used by `user`
 // alone.
-fn coverable(v: i64, op: Op, user: i64) -> bool {
+fn coverable(mut cx: *FnCtx, v: i64, op: Op, user: i64) -> bool {
     unsafe {
-        v != 0 && INSTS[v].op == op && INSTS[v].block == INSTS[user].block && ISEL_USES[v] == 1
-            && !is_float(INSTS[v].ty)
+        v != 0 && cx.insts[v].op == op && cx.insts[v].block == cx.insts[user].block
+            && cx.isel_uses[v] == 1 && !is_float(cx.insts[v].ty)
     }
 }
 
-fn isel_const(v: i64, out: *i64) -> bool {
+fn isel_const(mut cx: *FnCtx, v: i64, out: &mut i64) -> bool {
     unsafe {
-        if v != 0 && INSTS[v].op == Const && !is_float(INSTS[v].ty) {
-            *out = INSTS[v].imm;
+        if v != 0 && cx.insts[v].op == Const && !is_float(cx.insts[v].ty) {
+            *out = cx.insts[v].imm;
             return true;
         }
         false
@@ -221,64 +217,65 @@ fn isel_const(v: i64, out: *i64) -> bool {
 
 // Rewrites root `v`'s operands to a, b, c (counting the new uses before
 // releasing the old ones, so that shared leaves stay alive).
-fn isel_set_operands(v: i64, a: i64, b: i64, c: i64) {
+fn isel_set_operands(mut cx: *FnCtx, v: i64, a: i64, b: i64, c: i64) {
     unsafe {
-        let old_a = INSTS[v].a;
-        let old_b = INSTS[v].b;
-        let old_c = INSTS[v].c;
-        INSTS[v].a = a;
-        INSTS[v].b = b;
-        INSTS[v].c = c;
-        isel_retain(a);
-        isel_retain(b);
-        isel_retain(c);
-        isel_release(old_a);
-        isel_release(old_b);
-        isel_release(old_c);
+        let old_a = cx.insts[v].a;
+        let old_b = cx.insts[v].b;
+        let old_c = cx.insts[v].c;
+        cx.insts[v].a = a;
+        cx.insts[v].b = b;
+        cx.insts[v].c = c;
+        isel_retain(cx, a);
+        isel_retain(cx, b);
+        isel_retain(cx, c);
+        isel_release(cx, old_a);
+        isel_release(cx, old_b);
+        isel_release(cx, old_c);
     }
 }
 
 // ---- Scheduling ----
 
-fn schedule_function(fi: i64) {
+fn schedule_function(mut cx: *FnCtx, fi: i64) {
     unsafe {
-        isel_count_uses(fi);
+        isel_count_uses(cx, fi);
         let entry = IRFUNCS[fi].entry;
         // Loop depths (by layout index), from the allocator's layout.
-        layout_blocks(fi);
+        layout_blocks(cx, fi);
         // Constants go after the entry's parameters (and before its branch's
         // comparison, which stays last).
-        let mut at = BLOCKS[entry].first;
-        while at != 0 && INSTS[at].op == Param {
-            at = INSTS[at].next;
+        let mut at = cx.blocks[entry].first;
+        while at != 0 && cx.insts[at].op == Param {
+            at = cx.insts[at].next;
         }
         let mut hoisted = 0;
         for b in IRFUNCS[fi].blocks.items() {
-            if BLOCKS[b].removed != 0 || BLOCKS[b].order < 0 {
+            if cx.blocks[b].removed != 0 || cx.blocks[b].order < 0 {
                 continue;
             }
             // The branch's comparison (or test), used by it alone, last.
-            let c = BLOCKS[b].cond;
-            if BLOCKS[b].term == Term::Branch && c != 0 && INSTS[c].block == b && INSTS[c].next != 0
-                && (INSTS[c].op == Cmp || INSTS[c].op == Test) && ISEL_USES[c] == 1 {
-                ir_unlink(c);
-                ir_append(b, c);
+            let c = cx.blocks[b].cond;
+            if cx.blocks[b].term == Term::Branch && c != 0 && cx.insts[c].block == b
+                && cx.insts[c].next != 0
+                && (cx.insts[c].op == Cmp || cx.insts[c].op == Test) && cx.isel_uses[c] == 1 {
+                ir_unlink(cx, c);
+                ir_append(cx, b, c);
             }
             if !X86 {
-                pair_accesses(b);
+                pair_accesses(cx, b);
             }
-            if b == entry || LDEPTH.data[BLOCKS[b].order] == 0 {
+            if b == entry || cx.ldepth.data[cx.blocks[b].order] == 0 {
                 continue;
             }
-            let mut v = BLOCKS[b].first;
+            let mut v = cx.blocks[b].first;
             while v != 0 {
-                let next = INSTS[v].next;
-                if INSTS[v].op == Const && ISEL_USES[v] > 0 && hoisted < 16 {
-                    ir_unlink(v);
+                let next = cx.insts[v].next;
+                if cx.insts[v].op == Const && cx.isel_uses[v] > 0 && hoisted < 16 {
+                    ir_unlink(cx, v);
                     if at == 0 {
-                        ir_append(entry, v);
+                        ir_append(cx, entry, v);
                     } else {
-                        ir_insert_before(at, v);
+                        ir_insert_before(cx, at, v);
                     }
                     hoisted += 1;
                 }
@@ -290,9 +287,9 @@ fn schedule_function(fi: i64) {
 
 // (0.15) The size of an access ldp or stp can pair (a 64-bit integer or
 // float, a vector), or 0.
-fn pair_size(v: i64) -> i64 {
+fn pair_size(mut cx: *FnCtx, v: i64) -> i64 {
     unsafe {
-        let ty = if INSTS[v].op == Load { INSTS[v].ty } else { INSTS[v].imm2 };
+        let ty = if cx.insts[v].op == Load { cx.insts[v].ty } else { cx.insts[v].imm2 };
         if is_vector(ty) {
             16
         } else if type_size(ty) == 8 && (!is_float(ty) || ty == TY_F64) {
@@ -308,36 +305,37 @@ fn pair_size(v: i64) -> i64 {
 // one ldp (stp): a load moves up to the other, past no store or call; a
 // store moves down to the other, past no memory access or call. Unrolled
 // copies of a loop body load a[k], b[k], then a[k + 1], b[k + 1].
-fn pair_accesses(b: i64) {
+fn pair_accesses(mut cx: *FnCtx, b: i64) {
     unsafe {
-        let mut w = BLOCKS[b].first;
+        let mut w = cx.blocks[b].first;
         while w != 0 {
-            let next = INSTS[w].next;
-            let op = INSTS[w].op;
-            let size = if op == Load || op == Store { pair_size(w) } else { 0 };
-            if size != 0 && (op == Store || ISEL_USES[w] > 0) {
-                let mut v = INSTS[w].prev;
+            let next = cx.insts[w].next;
+            let op = cx.insts[w].op;
+            let size = if op == Load || op == Store { pair_size(cx, w) } else { 0 };
+            if size != 0 && (op == Store || cx.isel_uses[w] > 0) {
+                let mut v = cx.insts[w].prev;
                 let mut steps = 0;
                 while v != 0 && steps < 16 {
-                    let vop = INSTS[v].op;
-                    if vop == op && INSTS[v].a == INSTS[w].a && pair_size(v) == size
-                        && (INSTS[v].imm + size == INSTS[w].imm
-                            || INSTS[w].imm + size == INSTS[v].imm)
-                        && (op == Store || (ISEL_USES[v] > 0 && INSTS[v].ty == INSTS[w].ty))
-                        && (op == Load || INSTS[v].imm2 == INSTS[w].imm2) {
+                    let vop = cx.insts[v].op;
+                    if vop == op && cx.insts[v].a == cx.insts[w].a && pair_size(cx, v) == size
+                        && (cx.insts[v].imm + size == cx.insts[w].imm
+                            || cx.insts[w].imm + size == cx.insts[v].imm)
+                        && (op == Store
+                            || (cx.isel_uses[v] > 0 && cx.insts[v].ty == cx.insts[w].ty))
+                        && (op == Load || cx.insts[v].imm2 == cx.insts[w].imm2) {
                         if op == Load {
-                            ir_unlink(w);
-                            if INSTS[v].imm < INSTS[w].imm {
-                                insert_after(v, w);
+                            ir_unlink(cx, w);
+                            if cx.insts[v].imm < cx.insts[w].imm {
+                                insert_after(cx, v, w);
                             } else {
-                                ir_insert_before(v, w);
+                                ir_insert_before(cx, v, w);
                             }
                         } else {
-                            ir_unlink(v);
-                            if INSTS[v].imm < INSTS[w].imm {
-                                ir_insert_before(w, v);
+                            ir_unlink(cx, v);
+                            if cx.insts[v].imm < cx.insts[w].imm {
+                                ir_insert_before(cx, w, v);
                             } else {
-                                insert_after(w, v);
+                                insert_after(cx, w, v);
                             }
                         }
                         break;
@@ -345,10 +343,10 @@ fn pair_accesses(b: i64) {
                     // What the move may not pass.
                     if vop.is_call() || vop == Store || vop == StoreX || vop == Copy
                         || vop == Op::Phi || (op == Store && (vop == Load || vop == LoadX))
-                        || INSTS[v].block != b {
+                        || cx.insts[v].block != b {
                         break;
                     }
-                    v = INSTS[v].prev;
+                    v = cx.insts[v].prev;
                     steps += 1;
                 }
             }
@@ -358,12 +356,12 @@ fn pair_accesses(b: i64) {
 }
 
 // Puts unlinked instruction y right after x.
-fn insert_after(x: i64, y: i64) {
+fn insert_after(mut cx: *FnCtx, x: i64, y: i64) {
     unsafe {
-        if INSTS[x].next != 0 {
-            ir_insert_before(INSTS[x].next, y);
+        if cx.insts[x].next != 0 {
+            ir_insert_before(cx, cx.insts[x].next, y);
         } else {
-            ir_append(INSTS[x].block, y);
+            ir_append(cx, cx.insts[x].block, y);
         }
     }
 }

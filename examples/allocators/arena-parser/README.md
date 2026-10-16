@@ -27,6 +27,7 @@ $ tachyonc main.tach -o parser && ./parser 2>/dev/null
 input: 1771952 bytes, 134180 lists (one allocation each)
 value: -9194208206490895369, the same three ways: true
 the tree in the arena: 33773 KB
+ok: built parser
 ```
 
 The times go to stderr (they differ from run to run). On an Apple

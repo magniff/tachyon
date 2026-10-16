@@ -25,6 +25,24 @@ hook.log = lambda gd, record: LOGGED.append({**hook.IDENT, **record})
 hook.query_ready = lambda gd, cwd: True
 hook.git_dir = lambda cwd: "/nonexistent"
 
+# (0.18.1) The tree these cases run in is their checkout even when it has
+# no .git of its own: a release's tree as bootstrap.sh extracts it (`git
+# archive`, under the target/ of another checkout or of none), where the
+# hook would otherwise take every file for a scratch copy.
+TREE = os.path.dirname(os.path.dirname(HERE))
+_checkout_of = hook.checkout_of
+
+
+def checkout_of(cwd):
+    top, gd = _checkout_of(cwd)
+    d = os.path.abspath(cwd or os.getcwd())
+    if (d + "/").startswith(TREE + "/"):
+        return TREE, gd
+    return top, gd
+
+
+hook.checkout_of = checkout_of
+
 
 OUT = [""]
 
@@ -138,6 +156,18 @@ case("python worktree path", blocked(
     "s=open(p).read(); open(p,'w').write(s)\"")[0], True)
 
 # Not compiler source, or not a rewrite: let through.
+# (0.18.1) A whole-file sed: every line's, --all, one per file; a regex
+# (\\b, -E) or a & in the replacement: the general form; BSD's -i ''.
+st, err = blocked("sed -i '' 's/old_name/new_name/g' compiler/src/a.tach compiler/src/b.tach")
+case("sed -i whole files", err.splitlines()[1].split(" | ")[0] if err else "",
+     "try: tachyonc edit patch compiler/src/a.tach --old old_name --new new_name --all ; "
+     "tachyonc edit patch compiler/src/b.tach --old old_name --new new_name --all")
+st, err = blocked("sed -i -E 's/\\bold\\b/new/g' compiler/src/a.tach")
+case("sed -i word boundary", "edit patch compiler/src/a.tach:LINE --old 'TEXT' --new 'TEXT'" in err, True)
+st, err = blocked("sed -i '' -e '12s/a(b)/a(c)/' compiler/src/a.tach")
+case("sed -i -e with a line", "try: tachyonc edit patch compiler/src/a.tach:12 --old 'a(b)' --new 'a(c)'" in err, False)
+st, err = blocked("sed -i '' -e '12s/x - 1/x + 1/' compiler/src/a.tach")
+case("sed -i -e plain", "try: tachyonc edit patch compiler/src/a.tach:12 --old 'x - 1' --new 'x + 1'" in err, True)
 case("sed -i test fixture", blocked("sed -i 's/a/b/' tests/run/loops.tach")[0], False)
 case("sed -i docs", blocked("sed -i '' 's/a/b/' docs/refactor.md AGENTS.md")[0], False)
 case("sed -i scratch copy", blocked("sed -i 's/a/b/' target/scratch/compiler/src/x.tach")[0], False)

@@ -1,5 +1,6 @@
 ## 0.13: refactor extract-function and refactor inline (tests/refactor/code/).
 $ main.tach -o prog
+ok: built prog
 % ./prog; echo "exit $?"
 exit 0
 ## ---- extract-function ----
@@ -48,11 +49,11 @@ fn sums(n: i64) -> (i64, i64) {
 $ refactor extract-function mean_to --lines 45-48 --to add_all --show
 extracted lines 45-48 of crate::calc::mean_to into add_all(i, n, acc) -> i64	calc.tach	+6 -1 lines
 // calc.tach:45-49
-45	    i = add_all(i, n, &acc);
+45	    i = add_all(i, n, &mut acc);
 46	    acc.mean()
 47	}
 48	
-49	fn add_all(mut i: i64, n: i64, acc: *Acc) -> i64 {
+49	fn add_all(mut i: i64, n: i64, acc: &mut Acc) -> i64 {
 // calc.tach:54
 54	    i
 ## In a method, using self: a method of the same impl.
@@ -63,8 +64,9 @@ extracted lines 16-17 of crate::calc::Acc::mean into raw_mean() -> i64	calc.tach
 17	        m
 18	    }
 19	
-20	    fn raw_mean(self: *Acc) -> i64 {
+20	    fn raw_mean(self: &Acc) -> i64 {
 $ main.tach -o prog
+ok: built prog
 % ./prog; echo "exit $?"
 exit 0
 $ undo
@@ -124,6 +126,7 @@ inlined crate::calc::square_plus at 1 call, deleted it	calc.tach	+5 -6 lines
 67	        s + 2
 68	    } + clamp(x, 0, 9)
 $ main.tach -o prog
+ok: built prog
 % ./prog; echo "exit $?"
 exit 0
 ## Into another module: what the body names there made pub and imported;
@@ -151,6 +154,7 @@ inlined crate::calc::quad at 1 call, deleted it	2 files	+10 -12 lines
      if s == 78 { 0 } else { 1 }
  }
 $ main.tach -o prog
+ok: built prog
 % ./prog; echo "exit $?"
 exit 0
 $ undo

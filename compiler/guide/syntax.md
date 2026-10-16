@@ -105,7 +105,7 @@ From loosest to tightest (all left-associative except where noted):
 | `f()` `a[i]` `a[i..j]` `x.f` `x.0` `x.m()` | `*p.x` is `*(p.x)` |
 
 No `**` (power), no ternary (`if c { a } else { b }` is an
-expression). `e?` (0.15) is postfix, as tight as a call: `parse(s)?.len`
+expression). `e?` (0.15) is postfix, as tight as a call: `parse(s)?.len()`
 (`tachyonc guide conversions`). `return`,
 `break`, `continue` have type `!` and fit anywhere:
 `let v = if ok { x } else { return 1 };`.
@@ -152,4 +152,9 @@ odd
 `'a'..='z'`, alternatives `A | B`, a variant `E::V(x, _)` or `E::K {
 code, shift: true }` (`E::K { code, .. }` leaves the other fields out), a
 tuple `(a, 0)`, a binding (`n`), `_`, with a guard `n if n > 0`. The arms must
-cover every value; a match is an expression.
+cover every value; a match is an expression. Matched against a reference
+(`e: &E`, 0.18.1), a pattern matches what it points to and binds
+references into it, as Rust's default binding modes do: `match e {
+E::A(n) => *n, ... }` has `n: &i64` (under `&mut E`, `*n += 1` changes
+the field; a slice field binds a copy). `match *e` binds copies: a
+number's to use freely, a Vec's only to read.

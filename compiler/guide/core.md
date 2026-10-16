@@ -52,7 +52,7 @@ fn main(gpa: Gpa) -> i32 {             // gpa: the program's allocator; 0 = exit
     // Rust: println!("{} {:?}", p.get(), v);
     println(f"{p.get()} {v:?}");       // no macros: f-strings
     let s = "hi";
-    println(s.len());                  // an i64; or the field, s.len
+    println(s.len());                  // an i64 (slices, Vec, Buf, HashMap)
     // Rust: let mut b = String::new(); b.push_str("n="); ...
     let mut b = Buf::new_in(gpa);
     let o = odds(7, gpa);
@@ -63,7 +63,7 @@ fn main(gpa: Gpa) -> i32 {             // gpa: the program's allocator; 0 = exit
     if s == "hi" && !is_digit(first(s)) { println(first(s)); }   // compared, not matched
     // Rust: *m.entry(k).or_insert(0) += 1;
     let mut m: HashMap<[u8], i64> = HashMap::new_in(gpa);
-    m.get_or_insert("k", 0)[0] += 1;
+    m.get_or_insert("k", 0)[0] += 1;   // a one-element view: [0] is the value
     // Rust: !x on an integer; x.abs(); 7 / 0 panics
     let z = 0;
     println(f"{~0u8} {7 / z} {m.get("k").unwrap()}");   // ~x; no methods on numbers; x / 0 == 0
@@ -85,10 +85,13 @@ from C
 Also: `usize` is `i64` (lengths, indices); integers wrap; `a as i32`
 narrows, widening is implicit; `x?`, closures, `impl Trait for T`, `T:
 Trait`, `#[derive(Eq, Debug)]` are Rust's; no `dyn`, `where`, `Box` (a
-`Vec` or `*T`); `&x` and `&mut x` are references (`&T`, `&mut T`,
-0.17), and `p.0`, `p.x` reach through a reference or a pointer. Arguments may have defaults and names: `fn f(a: i64, b: i64 =
+`Vec` or `&T`); `&x` and `&mut x` are references (`&T`, `&mut T`,
+0.17): the way to borrow, in parameters too; `*T` is a raw pointer
+(Rust's `*mut T`), dereferencing it needs `unsafe` (0.18.1; old code:
+`tachyonc fix --values`); `p.0`, `p.x` reach through a reference; `match e` on
+`e: &E` binds references into it (`E::A(n) => *n`), as Rust does. Arguments may have defaults and names: `fn f(a: i64, b: i64 =
 2)`, `f(1, b: 3)`. The prelude (no `use`) has `Option`, `Result`, `Vec`,
-`Buf`, `HashMap`, `print`, `println`, `format_in`, `Gpa`, `read_line`,
+`Buf`, `HashMap`, `BinaryHeap` and `MinHeap` (priority queues: `pop` the largest, the smallest), `print`, `println`, `format_in`, `Gpa`, `read_line`,
 `read_stdin_in`, `Scanner`, `parse_int`, `trim`, `split_in`,
 `split_whitespace_in`, `sort`, `sort_by`, `sort_stable_by`, `cmp_of`, `Fmt`, `panic`,
 `unreachable`; the rest of std is `use std::{...}`; `use lexer::Tok;`
@@ -141,7 +144,9 @@ value (`Vec`, `Buf`, `HashMap`, a struct holding one) moves: after `let
 w = v;` or `f(v)`, `v` is dead (`own.moved`); take `v: &Vec<T>` (`&mut`
 to change it) and pass `&v` (`&mut v`), or `.clone()`. A reference kept
 in a local (`let p = &mut st;`) is passed on as `p`, any number of
-times. A slice of `v` is a view: take it again after `v` grows. std's API, a line per item: `tachyonc guide std`; one name
+times. `&f(x)` makes a temporary that lives to the end of the block
+(0.18.1). A slice of `v` is a view: take it again after `v` grows. std's most used items: `tachyonc guide std`; all, a line each:
+`tachyonc guide std#the-api`; one name
 with its comment: `tachyonc guide --find split_in`.
 
 ## The first errors and their fixes
@@ -149,7 +154,8 @@ with its comment: `tachyonc guide --find split_in`.
 | error (short form) | fix |
 |---|---|
 | `non-exhaustive match: 'E::B' is not covered` | an arm for it, or `_ =>` |
-| `calling a C function is unsafe`; `dereference of a raw pointer is unsafe` | `unsafe { ... }`; `tachyonc fix --only unsafe` adds them |
+| `calling a C function is unsafe` | `unsafe { ... }`; `tachyonc fix --only unsafe` adds them |
+| `dereference of a raw pointer is unsafe: 'p' is a '*T' parameter` | a borrow is `p: &T` (`&mut T`): `tachyonc fix --values`; or `unsafe { ... }` |
 | `no 'collections' in module 'std'`; `unknown type 'String'` | std is one module: `use std::name;` (its most used names need none); text is `[u8]`, built in a `Buf` |
 | `allocation is explicit: pass an allocator` | `Vec::new_in(gpa)`, `gpa` from `fn main(gpa: Gpa)` passed down |
 | `expected '&mut P', got '&P'` | `&mut x` at the call |
@@ -167,7 +173,8 @@ testing`, `guide contracts`).
 ## The loop
 
 Write the program, then `tachyonc check` (a check hook, where there is
-one, runs it after each edit); fix the first error first. Before writing a construct
+one, runs it after each edit); fix the first error first. A clean check
+ends with `ok: 0 errors in main.tach`, a build with `ok: built prog`. Before writing a construct
 you are unsure of, `tachyonc guide --find WORDS` (`--find read a line`)
 or `tachyonc guide TOPIC#SECTION` prints the lines on it; `tachyonc
 try 'CODE'` runs a snippet. For an unfamiliar item, ask

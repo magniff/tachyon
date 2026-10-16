@@ -4,23 +4,22 @@
 // and the body on VF lanes (emit_body), and the identities of reductions.
 
 use crate::front::types::{TY_BOOL, TY_F64};
-use crate::middle::ir::{BLOCKS, Cond, INSTS, Op, ir_append, ir_make, ir_val};
+use crate::middle::ctx::FnCtx;
+use crate::middle::ir::{Cond, Op, ir_append, ir_make, ir_val};
 use crate::middle::ir::Op::{
     And, Cmp, Const, Load, Mul, Neg, Phi, Store, VBin, VCmp, VNeg, VSel, VSplat,
 };
 use crate::middle::loops::invariant_in;
-use crate::middle::vectorize::{
-    VC_SKIP, VC_UNIFORM, VC_VECTOR, VC_WIDE, VC_WMUL, V_CHAIN, V_EVAL, V_IV, V_MAP, V_START, V_VT,
-};
+use crate::middle::vectorize::{VC_SKIP, VC_UNIFORM, VC_VECTOR, VC_WIDE, VC_WMUL};
 use crate::middle::vectorize::legality::{class_of, loads_in};
 
-pub fn map_get(v: i64) -> i64 {
+pub fn map_get(mut cx: *FnCtx, v: i64) -> i64 {
     unsafe {
-        let x = ir_val(v);
+        let x = ir_val(cx, v);
         let mut k = 0;
-        while k < V_MAP.count {
-            if V_MAP.data[k] == x {
-                return V_MAP.data[k + 1];
+        while k < cx.v_map.count {
+            if cx.v_map.data[k] == x {
+                return cx.v_map.data[k + 1];
             }
             k += 2;
         }
@@ -28,162 +27,166 @@ pub fn map_get(v: i64) -> i64 {
     }
 }
 
-pub fn map_put(v: i64, w: i64) {
+pub fn map_put(mut cx: *FnCtx, v: i64, w: i64) {
     unsafe {
-        V_MAP.push(v);
-        V_MAP.push(w);
+        cx.v_map.push(v);
+        cx.v_map.push(w);
     }
 }
 
-pub fn append(b: i64, op: Op, ty: i64, a: i64, x: i64, imm: i64) -> i64 {
-    let v = ir_make(op, ty, a, x, imm);
-    ir_append(b, v);
+pub fn append(mut cx: *FnCtx, b: i64, op: Op, ty: i64, a: i64, x: i64, imm: i64) -> i64 {
+    let v = ir_make(cx, op, ty, a, x, imm);
+    ir_append(cx, b, v);
     v
 }
 
-pub fn konst(b: i64, value: i64, ty: i64) -> i64 {
-    append(b, Const, ty, 0, 0, value)
+pub fn konst(mut cx: *FnCtx, b: i64, value: i64, ty: i64) -> i64 {
+    append(cx, b, Const, ty, 0, 0, value)
 }
 
-pub fn cmp(b: i64, cond: Cond, ty: i64, a: i64, x: i64) -> i64 {
-    let v = append(b, Cmp, TY_BOOL, a, x, 0);
+pub fn cmp(mut cx: *FnCtx, b: i64, cond: Cond, ty: i64, a: i64, x: i64) -> i64 {
+    let v = append(cx, b, Cmp, TY_BOOL, a, x, 0);
     unsafe {
-        INSTS[v].cond = cond;
-        INSTS[v].imm2 = ty;
+        cx.insts[v].cond = cond;
+        cx.insts[v].imm2 = ty;
     }
     v
 }
 
 // The value of uniform (or invariant) v when the induction variable is
 // `at`, computed in block b.
-pub fn eval_at(l: i64, v: i64, at: i64, b: i64) -> i64 {
+pub fn eval_at(mut cx: *FnCtx, l: i64, v: i64, at: i64, b: i64) -> i64 {
     unsafe {
-        let x = ir_val(v);
-        if x == V_IV {
+        let x = ir_val(cx, v);
+        if x == cx.v_iv {
             return at;
         }
-        if invariant_in(l, x) {
+        if invariant_in(cx, l, x) {
             return x;
         }
         let mut k = 0;
-        while k < V_EVAL.count {
-            if V_EVAL.data[k] == x && V_EVAL.data[k + 1] == at {
-                return V_EVAL.data[k + 2];
+        while k < cx.v_eval.count {
+            if cx.v_eval.data[k] == x && cx.v_eval.data[k + 1] == at {
+                return cx.v_eval.data[k + 2];
             }
             k += 3;
         }
-        let a = if INSTS[x].a != 0 { eval_at(l, INSTS[x].a, at, b) } else { 0 };
-        let y = if INSTS[x].b != 0 { eval_at(l, INSTS[x].b, at, b) } else { 0 };
-        let nv = ir_make(INSTS[x].op, INSTS[x].ty, a, y, INSTS[x].imm);
-        INSTS[nv].imm2 = INSTS[x].imm2;
-        INSTS[nv].cond = INSTS[x].cond;
-        ir_append(b, nv);
-        V_EVAL.push(x);
-        V_EVAL.push(at);
-        V_EVAL.push(nv);
+        let a = if cx.insts[x].a != 0 { eval_at(cx, l, cx.insts[x].a, at, b) } else { 0 };
+        let y = if cx.insts[x].b != 0 { eval_at(cx, l, cx.insts[x].b, at, b) } else { 0 };
+        let nv = ir_make(cx, cx.insts[x].op, cx.insts[x].ty, a, y, cx.insts[x].imm);
+        cx.insts[nv].imm2 = cx.insts[x].imm2;
+        cx.insts[nv].cond = cx.insts[x].cond;
+        ir_append(cx, b, nv);
+        cx.v_eval.push(x);
+        cx.v_eval.push(at);
+        cx.v_eval.push(nv);
         nv
     }
 }
 
 // ok = ok && c (as branches would cost blocks: and of bools, 0 or 1).
-pub fn and_into(b: i64, ok: i64, c: i64) -> i64 {
+pub fn and_into(mut cx: *FnCtx, b: i64, ok: i64, c: i64) -> i64 {
     if ok == 0 {
         return c;
     }
-    append(b, And, TY_BOOL, ok, c, 0)
+    append(cx, b, And, TY_BOOL, ok, c, 0)
 }
 
 // The value of v for the vector loop: a vector (splat when v is the same
 // for all lanes; invariant ones in the vector preheader `vp`).
-fn vector_of(v: i64, vh: i64, vp: i64, l: i64) -> i64 {
+fn vector_of(mut cx: *FnCtx, v: i64, vh: i64, vp: i64, l: i64) -> i64 {
     unsafe {
-        let x = ir_val(v);
-        if class_of(x) == VC_VECTOR {
-            return map_get(x);
+        let x = ir_val(cx, v);
+        if class_of(cx, x) == VC_VECTOR {
+            return map_get(cx, x);
         }
         let key = -x - 1;
         let mut k = 0;
-        while k < V_MAP.count {
-            if V_MAP.data[k] == key {
-                return V_MAP.data[k + 1];
+        while k < cx.v_map.count {
+            if cx.v_map.data[k] == key {
+                return cx.v_map.data[k + 1];
             }
             k += 2;
         }
-        if invariant_in(l, x) || !loads_in(l, x) {
+        if invariant_in(cx, l, x) || !loads_in(cx, l, x) {
             // The same in every iteration (coefficient 0, no load): computed
             // once, before the loop.
-            let s = ir_make(VSplat, V_VT, eval_at(l, x, V_START, vp), 0, 0);
-            ir_append(vp, s);
-            map_put(key, s);
+            let s = ir_make(cx, VSplat, cx.v_vt, eval_at(cx, l, x, cx.v_start, vp), 0, 0);
+            ir_append(cx, vp, s);
+            map_put(cx, key, s);
             return s;
         }
-        let s = ir_make(VSplat, V_VT, map_get(x), 0, 0);
-        ir_append(vh, s);
+        let s = ir_make(cx, VSplat, cx.v_vt, map_get(cx, x), 0, 0);
+        ir_append(cx, vh, s);
         s
     }
 }
 
 // One copy of the loop's body in block vh (V_MAP maps the induction
 // variable and the reductions' phis).
-pub fn emit_body(l: i64, vh: i64, vp: i64) {
+pub fn emit_body(mut cx: *FnCtx, l: i64, vh: i64, vp: i64) {
     unsafe {
-        let vt = V_VT;
-        for k in 0..V_CHAIN.count {
-            let mut v = BLOCKS[V_CHAIN.data[k]].first;
+        let vt = cx.v_vt;
+        for k in 0..cx.v_chain.count {
+            let mut v = cx.blocks[cx.v_chain.data[k]].first;
             while v != 0 {
-                let cls = class_of(v);
-                let op = INSTS[v].op;
+                let cls = class_of(cx, v);
+                let op = cx.insts[v].op;
                 if op == Phi || cls == VC_SKIP || cls == VC_WIDE || cls == VC_WMUL {
                     // ((0.16) the widened loads and their products: in the
                     // VMACW of the add they go to)
-                    v = INSTS[v].next;
+                    v = cx.insts[v].next;
                     continue;
                 }
-                if op == Op::Add && cls == VC_VECTOR && (class_of(ir_val(INSTS[v].a)) == VC_WMUL
-                    || class_of(ir_val(INSTS[v].b)) == VC_WMUL) {
-                    map_put(v, multiply_add(l, v, vh, vp));
-                    v = INSTS[v].next;
+                if op == Op::Add && cls == VC_VECTOR
+                    && (class_of(cx, ir_val(cx, cx.insts[v].a)) == VC_WMUL
+                        || class_of(cx, ir_val(cx, cx.insts[v].b)) == VC_WMUL) {
+                    map_put(cx, v, multiply_add(cx, l, v, vh, vp));
+                    v = cx.insts[v].next;
                     continue;
                 }
                 if cls == VC_UNIFORM {
-                    let nv = ir_make(op, INSTS[v].ty, map_get(INSTS[v].a), map_get(INSTS[v].b),
-                        INSTS[v].imm);
-                    INSTS[nv].imm2 = INSTS[v].imm2;
-                    INSTS[nv].cond = INSTS[v].cond;
-                    ir_append(vh, nv);
-                    map_put(v, nv);
+                    let nv = ir_make(cx, op, cx.insts[v].ty, map_get(cx, cx.insts[v].a),
+                        map_get(cx, cx.insts[v].b), cx.insts[v].imm);
+                    cx.insts[nv].imm2 = cx.insts[v].imm2;
+                    cx.insts[nv].cond = cx.insts[v].cond;
+                    ir_append(cx, vh, nv);
+                    map_put(cx, v, nv);
                 } else if op == Load {
-                    let nv = append(vh, Load, vt, map_get(INSTS[v].a), 0, INSTS[v].imm);
-                    map_put(v, nv);
+                    let nv = append(cx, vh, Load, vt, map_get(cx, cx.insts[v].a), 0,
+                        cx.insts[v].imm);
+                    map_put(cx, v, nv);
                 } else if op == Store {
-                    let value = vector_of(INSTS[v].b, vh, vp, l);
-                    let nv = append(vh, Store, 0, map_get(INSTS[v].a), value, INSTS[v].imm);
-                    INSTS[nv].imm2 = vt;
+                    let value = vector_of(cx, cx.insts[v].b, vh, vp, l);
+                    let nv = append(cx, vh, Store, 0, map_get(cx, cx.insts[v].a), value,
+                        cx.insts[v].imm);
+                    cx.insts[nv].imm2 = vt;
                 } else if op == Cmp {
                     // (0.15) A mask.
-                    let a = vector_of(INSTS[v].a, vh, vp, l);
-                    let b = vector_of(INSTS[v].b, vh, vp, l);
-                    let nv = append(vh, VCmp, vt, a, b, 0);
-                    INSTS[nv].cond = INSTS[v].cond;
-                    INSTS[nv].imm2 = vt;
-                    map_put(v, nv);
+                    let a = vector_of(cx, cx.insts[v].a, vh, vp, l);
+                    let b = vector_of(cx, cx.insts[v].b, vh, vp, l);
+                    let nv = append(cx, vh, VCmp, vt, a, b, 0);
+                    cx.insts[nv].cond = cx.insts[v].cond;
+                    cx.insts[nv].imm2 = vt;
+                    map_put(cx, v, nv);
                 } else if op == Op::Sel {
-                    let k = map_get(ir_val(INSTS[v].a));
-                    let b = vector_of(INSTS[v].b, vh, vp, l);
-                    let c = vector_of(INSTS[v].c, vh, vp, l);
-                    let nv = append(vh, VSel, vt, k, b, 0);
-                    INSTS[nv].c = c;
-                    map_put(v, nv);
+                    let k = map_get(cx, ir_val(cx, cx.insts[v].a));
+                    let b = vector_of(cx, cx.insts[v].b, vh, vp, l);
+                    let c = vector_of(cx, cx.insts[v].c, vh, vp, l);
+                    let nv = append(cx, vh, VSel, vt, k, b, 0);
+                    cx.insts[nv].c = c;
+                    map_put(cx, v, nv);
                 } else if op == Neg {
-                    let nv = append(vh, VNeg, vt, vector_of(INSTS[v].a, vh, vp, l), 0, 0);
-                    map_put(v, nv);
+                    let nv = append(cx, vh, VNeg, vt, vector_of(cx, cx.insts[v].a, vh, vp, l), 0,
+                        0);
+                    map_put(cx, v, nv);
                 } else {
-                    let a = vector_of(INSTS[v].a, vh, vp, l);
-                    let b = vector_of(INSTS[v].b, vh, vp, l);
-                    let nv = append(vh, VBin, vt, a, b, op as i64);
-                    map_put(v, nv);
+                    let a = vector_of(cx, cx.insts[v].a, vh, vp, l);
+                    let b = vector_of(cx, cx.insts[v].b, vh, vp, l);
+                    let nv = append(cx, vh, VBin, vt, a, b, op as i64);
+                    map_put(cx, v, nv);
                 }
-                v = INSTS[v].next;
+                v = cx.insts[v].next;
             }
         }
     }
@@ -192,20 +195,20 @@ pub fn emit_body(l: i64, vh: i64, vp: i64) {
 // (0.16) The vector loop's value of v = x + k * (load as u64) (VC_WMUL's
 // product, either order): a VMACW of x's vector, the load's 8 bytes (two
 // u32, an f64 load) and k's splat.
-fn multiply_add(l: i64, v: i64, vh: i64, vp: i64) -> i64 {
+fn multiply_add(mut cx: *FnCtx, l: i64, v: i64, vh: i64, vp: i64) -> i64 {
     unsafe {
-        let a = ir_val(INSTS[v].a);
-        let m = if class_of(a) == VC_WMUL { a } else { ir_val(INSTS[v].b) };
-        let x = if m == a { INSTS[v].b } else { INSTS[v].a };
-        let w = if class_of(ir_val(INSTS[m].a)) == VC_WIDE { ir_val(INSTS[m].a) }
-            else { ir_val(INSTS[m].b) };
-        let k = if w == ir_val(INSTS[m].a) { INSTS[m].b } else { INSTS[m].a };
-        let ld = if INSTS[w].op == Op::Conv { ir_val(INSTS[w].a) } else { w };
-        let acc = vector_of(x, vh, vp, l);
-        let pair = append(vh, Load, TY_F64, map_get(INSTS[ld].a), 0, INSTS[ld].imm);
-        let kv = vector_of(k, vh, vp, l);
-        let nv = append(vh, Op::VMacW, V_VT, acc, pair, 0);
-        INSTS[nv].c = kv;
+        let a = ir_val(cx, cx.insts[v].a);
+        let m = if class_of(cx, a) == VC_WMUL { a } else { ir_val(cx, cx.insts[v].b) };
+        let x = if m == a { cx.insts[v].b } else { cx.insts[v].a };
+        let w = if class_of(cx, ir_val(cx, cx.insts[m].a)) == VC_WIDE { ir_val(cx, cx.insts[m].a) }
+            else { ir_val(cx, cx.insts[m].b) };
+        let k = if w == ir_val(cx, cx.insts[m].a) { cx.insts[m].b } else { cx.insts[m].a };
+        let ld = if cx.insts[w].op == Op::Conv { ir_val(cx, cx.insts[w].a) } else { w };
+        let acc = vector_of(cx, x, vh, vp, l);
+        let pair = append(cx, vh, Load, TY_F64, map_get(cx, cx.insts[ld].a), 0, cx.insts[ld].imm);
+        let kv = vector_of(cx, k, vh, vp, l);
+        let nv = append(cx, vh, Op::VMacW, cx.v_vt, acc, pair, 0);
+        cx.insts[nv].c = kv;
         nv
     }
 }
@@ -220,19 +223,19 @@ pub fn identity(op: Op) -> i64 {
 // (0.15) The minimum or maximum of a and b in block blk, as reduction phi
 // r's next value nx (k ? z : r, or k ? r : z) picks it: a for r, b for z;
 // vectors of type ty, or scalars of type ty.
-pub fn minmax_of(blk: i64, r: i64, nx: i64, a: i64, b: i64, vector: bool, ty: i64) -> i64 {
+pub fn minmax_of(mut cx: *FnCtx, blk: i64, r: i64, nx: i64, a: i64, b: i64, vector: bool, ty: i64) -> i64 {
     unsafe {
-        let k = ir_val(INSTS[nx].a);
-        let x = if ir_val(INSTS[k].a) == r { a } else { b };
-        let y = if ir_val(INSTS[k].b) == r { a } else { b };
-        let p = if ir_val(INSTS[nx].b) == r { a } else { b };
-        let q = if ir_val(INSTS[nx].c) == r { a } else { b };
-        let m = if vector { append(blk, VCmp, ty, x, y, 0) }
-            else { cmp(blk, INSTS[k].cond, ty, x, y) };
-        INSTS[m].cond = INSTS[k].cond;
-        INSTS[m].imm2 = ty;
-        let s = append(blk, if vector { VSel } else { Op::Sel }, ty, m, p, 0);
-        INSTS[s].c = q;
+        let k = ir_val(cx, cx.insts[nx].a);
+        let x = if ir_val(cx, cx.insts[k].a) == r { a } else { b };
+        let y = if ir_val(cx, cx.insts[k].b) == r { a } else { b };
+        let p = if ir_val(cx, cx.insts[nx].b) == r { a } else { b };
+        let q = if ir_val(cx, cx.insts[nx].c) == r { a } else { b };
+        let m = if vector { append(cx, blk, VCmp, ty, x, y, 0) }
+            else { cmp(cx, blk, cx.insts[k].cond, ty, x, y) };
+        cx.insts[m].cond = cx.insts[k].cond;
+        cx.insts[m].imm2 = ty;
+        let s = append(cx, blk, if vector { VSel } else { Op::Sel }, ty, m, p, 0);
+        cx.insts[s].c = q;
         s
     }
 }

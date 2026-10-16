@@ -4,7 +4,7 @@
 // arrays, the binary and unary operators, and the layout queries
 // (`size_of`, `align_of`) folded to constants.
 
-use crate::base::{SRC, buf_fmt, buf_new, buf_slice, buf_uint, intern_c};
+use crate::base::{SRC, buf_bytes, buf_fmt, buf_new, buf_slice, buf_uint, intern_c};
 use crate::base::diag::{
     ERR, err_begin, err_end, err_end_soft, err_fix, err_fmt, err_help, err_help_fmt, err_help_sym,
     err_int, err_str, err_sym, err_try_fmt,
@@ -19,7 +19,7 @@ use crate::front::ast::NodeKind::{
     PatLit, Path, Range, Repeat, Return, Str, StructLit, Tuple, TupleField, TyArray, TyFn, TyName,
     TyNever, TyPtr, TySlice, TyTuple, TyUnit, Unary, Unit, VariantLit, VecOp, While,
 };
-use crate::front::check::{is_std_named, lookup_local, type_error, type_error_got};
+use crate::front::check::{Res, is_std_named, lookup_local, type_error, type_error_got};
 use crate::front::check::args::misplaced_named_arg;
 use crate::front::check::assign::{check_assign, is_place};
 use crate::front::check::body::{
@@ -35,10 +35,12 @@ use crate::front::check::iterate::range_value;
 use crate::front::check::names::{NODE_RESOLVED, near_to, synth_name};
 use crate::front::check::resolve::resolve_type;
 use crate::front::check::sealed::{check_field, len_reads_as_method};
+use crate::front::check::temps::NODE_TEMP;
 use crate::front::check::try_op::check_try;
 use crate::front::check::unsafety::{
-    NODE_NO_READ, UNSAFE_DEPTH, U_DEREF, U_FIELD, U_INDEX, U_INT_PTR, U_SLICE, U_UNION, is_borrow,
-    mark_no_read, pointee_is_param, unsafe_index_zero, unsafe_op, unsafe_view_index,
+    NODE_NO_READ, UNSAFE_DEPTH, U_DEREF, U_FIELD, U_INDEX, U_INT_PTR, U_SLICE, U_UNION, WRAP_NODE,
+    is_borrow, mark_no_read, pointee_is_param, unsafe_index_zero, unsafe_op, unsafe_through,
+    unsafe_view_index,
 };
 use crate::front::check::variant_fields::{enum_field_help, variant_literal};
 use crate::front::check::vectors::{synth_vecop, vector_binary};
@@ -487,9 +489,27 @@ fn indexes_through(t: i64) -> bool {
     }
 }
 
+// The index of `a[i]` (or an end of `a[i..j]`): an integer, or (0.18.1) a
+// reference to one, read through (`keys[a]` in a `sort_by` closure, whose
+// `a` is `&i64`; `*a` written for it).
 fn check_index_type(index: i64) {
     unsafe {
         let index_ty = synth_expr(index);
+        if is_ref(index_ty) && is_integer(TYPES[index_ty].a) {
+            let inner = new_node(NodeKind::Ident, NODES[index].start, NODES[index].end);
+            NODES[inner] = NODES[index];
+            NODES[index].kind = Unary;
+            NODES[index].op = Tok::Star;
+            NODES[index].b = inner;
+            NODES[index].a = 0;
+            NODES[index].count = 0;
+            NODES[index].p = 0;
+            NODES[index].res = Res::None;
+            NODES[index].x = 0;
+            NODES[index].y = 0;
+            NODES[index].ty = TYPES[index_ty].a;
+            return;
+        }
         if !is_integer(index_ty) {
             err_begin(NODES[index].start);
             err_str(c"index must be integer, got '");
@@ -542,7 +562,8 @@ fn synth_field(n: i64) -> i64 {
             base_ty = TYPES[base_ty].a;
             if !is_borrow(NODES[n].a) {
                 NODES[n].p |= NODE_RAW;
-                unsafe_op(n, U_FIELD, c"access to a field through a raw pointer is unsafe");
+                unsafe_through(n, NODES[n].a, U_FIELD,
+                    c"access to a field through a raw pointer is unsafe");
             }
         }
         if TYPES[base_ty].kind != TyKind::Struct {
@@ -620,7 +641,8 @@ fn synth_tuple_field(n: i64) -> i64 {
             let deref = synthetic_unary(Tok::Star, base, base_ty);
             if !is_borrow(base) {
                 NODES[deref].p |= NODE_RAW;
-                unsafe_op(n, U_FIELD, c"access to a field through a raw pointer is unsafe");
+                unsafe_through(n, base, U_FIELD,
+                    c"access to a field through a raw pointer is unsafe");
             }
             NODES[n].a = deref;
         }
@@ -702,19 +724,42 @@ pub fn is_context_literal(e: i64) -> bool {
 // types join to the wider one: an operand of a definite type is
 // synthesized first (widen::takes_context), and the narrower is widened;
 // an operand whose type comes from context (a literal, `None`) takes the
-// other's.
+// other's. (0.18.1) An operand that is a reference to a number or a bool
+// (a pattern's binding on a reference, `n + 1`; a closure's `&i64`) is
+// read through, as Rust's operators on `&i64` do.
 fn synth_operands(lhs: i64, rhs: i64) -> i64 {
     if literal_takes_rhs_type(lhs, rhs) || takes_context(lhs) && !takes_context(rhs) {
-        let rhs_ty = synth_expr(rhs);
+        let rhs_ty = read_through(rhs, synth_expr(rhs));
         check_expr(lhs, rhs_ty);
         return rhs_ty;
     }
-    let lhs_ty = synth_expr(lhs);
+    let lhs_ty = read_through(lhs, synth_expr(lhs));
     if is_integer(lhs_ty) && !takes_context(rhs) {
         return join_operands(lhs, lhs_ty, rhs);
     }
     check_expr(rhs, lhs_ty);
     lhs_ty
+}
+
+// (0.18.1) Operand e (of BINARY_NODE) of type ty: when it is `&T` of a
+// number or a bool, `*e` in its place; T, or ty.
+pub fn read_through(e: i64, ty: i64) -> i64 {
+    unsafe {
+        let b = BINARY_NODE;
+        if !is_ref(ty) || b <= 0 || !(is_numeric(TYPES[ty].a) || TYPES[ty].a == TY_BOOL) {
+            return ty;
+        }
+        let t = TYPES[ty].a;
+        let u = synthetic_unary(Tok::Star, e, t);
+        if NODES[b].b == e {
+            NODES[b].b = u;
+        } else if NODES[b].c == e {
+            NODES[b].c = u;
+        } else {
+            return ty;
+        }
+        t
+    }
 }
 
 fn synth_binary(n: i64) -> i64 {
@@ -888,7 +933,7 @@ fn synth_unary(n: i64) -> i64 {
             }
             if !is_borrow(operand) {
                 NODES[n].p |= NODE_RAW;
-                unsafe_op(n, U_DEREF, c"dereference of a raw pointer is unsafe");
+                unsafe_through(n, operand, U_DEREF, c"dereference of a raw pointer is unsafe");
             }
             return TYPES[ty].a;
         }
@@ -901,7 +946,12 @@ fn synth_unary(n: i64) -> i64 {
         }
         let ty = synth_expr(operand);
         MUT_PLACE = outer_place;
-        if !is_place(operand) {
+        // (0.18.1) a temporary's local (check/temps.tach) is the value as
+        // `&` of it was before: a slice is its own view, a function's
+        // name its pointer
+        let temp = (NODES[operand].p & NODE_TEMP) != 0
+            && (TYPES[ty].kind == TyKind::Slice || TYPES[ty].kind == TyKind::Fn);
+        if !is_place(operand) || temp {
             if TYPES[ty].kind == TyKind::Slice {
                 // (0.17) `&s[a..b]`, `&mut a[..]`: a slice value is its own
                 // view; `&mut` makes it the exclusive `&mut [T]`
@@ -916,7 +966,7 @@ fn synth_unary(n: i64) -> i64 {
                 fn_value_error(n, operand, c"address");
                 return ty;
             }
-            type_error(n, c"cannot take address of non-lvalue expression");
+            non_lvalue_error(n, operand);
         }
         // (0.17) `&place` is a reference, `&mut place` an exclusive one
         // (docs/design/value-semantics.md §2.3); a place reached through a
@@ -928,6 +978,69 @@ fn synth_unary(n: i64) -> i64 {
         }
         ref_to(ty, if mutable { REF_MUT } else { REF_SHARED })
     }
+}
+
+// (0.18.1) `&e` of a value where no temporary is made for it
+// (check/temps.tach: something evaluated before it in its statement):
+// bind it first, `let t = e;`, then `&t`; the try: is the statement so,
+// when it is on one line, with a name the statement does not use (`t`
+// may be the receiver).
+fn non_lvalue_error(n: i64, operand: i64) {
+    unsafe {
+        err_begin(NODES[n].start);
+        err_str(c"cannot take address of non-lvalue expression");
+        err_help(c"'&' takes a place; a value made here needs a name first: 'let t = VALUE;' before the statement, then '&t'");
+        let s = WRAP_NODE;
+        let a = NODES[n].start;
+        let b = NODES[n].end;
+        if s > 0 && NODES[s].start <= a && b <= NODES[s].end {
+            let text = SRC[NODES[s].start..NODES[s].end];
+            let mut one_line = true;
+            for i in 0..text.len() {
+                if text[i] == '\n' {
+                    one_line = false;
+                }
+            }
+            if one_line {
+                let mut name: [u8] = "t";
+                if uses_word(text, "t") {
+                    name = "tmp";
+                    if uses_word(text, "tmp") {
+                        name = "tmp_ref";
+                    }
+                }
+                let t = buf_new();
+                buf_bytes(t, "let ");
+                buf_bytes(t, name);
+                buf_bytes(t, " = ");
+                buf_bytes(t, SRC[NODES[operand].start..NODES[operand].end]);
+                buf_bytes(t, "; ");
+                buf_bytes(t, SRC[NODES[s].start..a]);
+                buf_bytes(t, if (NODES[n].p & NODE_REF_MUT) != 0 { "&mut " } else { "&" });
+                buf_bytes(t, name);
+                buf_bytes(t, SRC[b..NODES[s].end]);
+                err_try_fmt(buf_slice(t));
+            }
+        }
+        err_end();
+    }
+}
+
+// Whether text has the identifier w (not inside a longer name).
+fn uses_word(text: [u8], w: [u8]) -> bool {
+    let mut i = 0;
+    while i + w.len() <= text.len() {
+        if text[i..i + w.len()] == w && (i == 0 || !is_word_byte(text[i - 1]))
+            && (i + w.len() == text.len() || !is_word_byte(text[i + w.len()])) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn is_word_byte(c: u8) -> bool {
+    c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_'
 }
 
 // `&f` or `*f` (node n) of a function value f (operand): a function's name

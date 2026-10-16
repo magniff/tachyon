@@ -15,14 +15,15 @@ use crate::front::effects::builtin::{C_ALLOC, C_EXIT, C_IO, c_class};
 use crate::front::stdalloc::CHECK_ALLOC_MODE;
 use crate::front::types::FNS;
 use crate::middle::checkalloc::site_static;
-use crate::middle::ir::{BLOCKS, INSTS, IRFUNCS, IRFUNC_COUNT, Op, ir_enter};
+use crate::middle::ctx::FnCtx;
+use crate::middle::ir::{IRFUNCS, IRFUNC_COUNT, Op, ir_enter};
 
 // --verify-effects.
 pub static mut VERIFY_EFFECTS: bool = false;
 
 // Checks every IR function (after lower_program); exits 1 when one does
 // what its effects do not say.
-pub fn verify_effects() {
+pub fn verify_effects(mut cx: *FnCtx) {
     unsafe {
         let out = buf_new();
         let mut bad = 0;
@@ -32,17 +33,17 @@ pub fn verify_effects() {
             if (e.bits & EFF_UNKNOWN) != 0 {
                 continue;
             }
-            ir_enter(fi);
+            ir_enter(cx, fi);
             let blocks = IRFUNCS[fi].blocks;
             for k in 0..blocks.count {
-                let mut v = BLOCKS[blocks.data[k]].first;
+                let mut v = cx.blocks[blocks.data[k]].first;
                 while v != 0 {
-                    let need = needs(v);
+                    let need = needs(cx, v);
                     if need != 0 && (e.bits & need) == 0 {
-                        report(out, f, e, v, need);
+                        report(cx, out, f, e, v, need);
                         bad += 1;
                     }
-                    v = INSTS[v].next;
+                    v = cx.insts[v].next;
                 }
             }
         }
@@ -54,11 +55,11 @@ pub fn verify_effects() {
 }
 
 // The effect bit instruction v needs (0: none it checks).
-fn needs(v: i64) -> i64 {
+fn needs(mut cx: *FnCtx, v: i64) -> i64 {
     unsafe {
-        let op = INSTS[v].op;
+        let op = cx.insts[v].op;
         if op == Op::Call {
-            let g = INSTS[v].imm;
+            let g = cx.insts[v].imm;
             if !FNS[g].is_extern {
                 return 0;
             }
@@ -72,13 +73,13 @@ fn needs(v: i64) -> i64 {
             return 0;
         }
         if op == Op::CallC {
-            let class = c_class(INSTS[v].imm);
+            let class = c_class(cx.insts[v].imm);
             if class == C_IO || class == C_EXIT {
                 return EFF_IO;
             }
             return if class == C_ALLOC { EFF_ALLOC_EXTERN } else { 0 };
         }
-        if (op == Op::Store || op == Op::Copy) && into_static(INSTS[v].a) {
+        if (op == Op::Store || op == Op::Copy) && into_static(cx, cx.insts[v].a) {
             return EFF_GLOBAL;
         }
         0
@@ -86,34 +87,34 @@ fn needs(v: i64) -> i64 {
 }
 
 // Whether address value a is a static's (its address, plus offsets).
-fn into_static(a: i64) -> bool {
+fn into_static(mut cx: *FnCtx, a: i64) -> bool {
     unsafe {
         let mut v = a;
         while v != 0 {
-            let op = INSTS[v].op;
+            let op = cx.insts[v].op;
             if op == Op::GAddr {
                 // (not --check-alloc's site, which the program does not see)
-                return !CHECK_ALLOC_MODE || INSTS[v].imm != site_static();
+                return !CHECK_ALLOC_MODE || cx.insts[v].imm != site_static();
             }
             if op != Op::Add {
                 return false;
             }
-            v = if INSTS[INSTS[v].b].op == Op::Const { INSTS[v].a } else { 0 };
+            v = if cx.insts[cx.insts[v].b].op == Op::Const { cx.insts[v].a } else { 0 };
         }
         false
     }
 }
 
-fn report(out: i64, f: i64, e: Effects, v: i64, need: i64) {
+fn report(mut cx: *FnCtx, out: i64, f: i64, e: Effects, v: i64, need: i64) {
     unsafe {
         buf_str(out, c"internal error: --verify-effects: '");
         buf_bytes(out, SYMS[FNS[f].display].text);
         buf_str(out, if need == EFF_IO { c"' calls C that does io" }
             else if need == EFF_GLOBAL { c"' stores into a static" }
             else { c"' calls C that allocates" });
-        if INSTS[v].op == Op::Call {
+        if cx.insts[v].op == Op::Call {
             buf_str(out, c" ('");
-            buf_bytes(out, SYMS[FNS[INSTS[v].imm].name].text);
+            buf_bytes(out, SYMS[FNS[cx.insts[v].imm].name].text);
             buf_str(out, c"')");
         }
         buf_str(out, c", but its effects are '");

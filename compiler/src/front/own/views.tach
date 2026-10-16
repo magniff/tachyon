@@ -36,11 +36,12 @@ use crate::front::own::diag::{
 };
 use crate::front::own::kinds::{P_MUT, is_owned_type, is_view_type, param_mode};
 use crate::front::own::state::{
-    CUR, F_INVALID, F_SCOPE, F_STATIC, LOC_CAP, LOC_PL, NSLOT, NW, OV, PE, PEND, PE_BY, PE_INVALID,
-    PE_KIND, PE_OV, PK_NONE, PK_RAW, PL_COUNT, PL_FIELD, PL_MASK, PL_PARENT, PL_RID, PL_RKIND, POOL,
-    POOL_TOP, RK_LOCAL, RK_MARK, RK_ROOT, RK_STATIC, SLOT_LOCAL, SLOT_PARENT, TUPLE_FIELD, any_and,
-    at, get_bit, l1, l2, mark_place, new_ov, or_expanded, or_into, ov_hits, ov_inner, ov_or,
-    root_of, root_place, set_bit, slot_for, slot_of_local, slot_of_place, slot_off,
+    CUR, DEREF_FIELD, F_INVALID, F_SCOPE, F_STATIC, LOC_CAP, LOC_PL, NSLOT, NW, OV, PE, PEND, PE_BY,
+    PE_INVALID, PE_KIND, PE_OV, PK_NONE, PK_RAW, PL_COUNT, PL_FIELD, PL_MASK, PL_PARENT, PL_RID,
+    PL_RKIND, POOL, POOL_TOP, RK_LOCAL, RK_MARK, RK_ROOT, RK_STATIC, SLOT_LOCAL, SLOT_PARENT,
+    TUPLE_FIELD, any_and, at, child_place, clear_bit, field_number, get_bit, is_deref_place, l1, l2,
+    mark_place, new_ov, or_expanded, or_into, ov_hits, ov_inner, ov_or, root_of, root_place,
+    set_bit, slot_for, slot_of_local, slot_of_place, slot_off,
 };
 use crate::front::own::walk::{
     BOUND, CUR_F, PARAM_LOCALS, PO_DEREF, PO_INNER, PO_RAW, PO_VIEWSLOT, W_DROP, W_MOVE,
@@ -283,7 +284,11 @@ fn write_place(p: i64, n: i64, how: i64, except: i64) {
         let m = new_ov();
         or_into(at(m), &PL_MASK[p * NW]);
         close_mask(at(m));
-        invalidate(at(m), n, how, except, PEND.count);
+        // (a drop is never one of a call's own arguments changing what an
+        // earlier one borrows: the locals a scope drops inside an argument
+        // were declared there, after the pending ones; a jump out of the
+        // argument, `?` or `return`, drops the older ones but skips the call)
+        invalidate(at(m), n, how, except, if how == H_DROP { 0 } else { PEND.count });
         POOL_TOP = m;
     }
 }
@@ -335,10 +340,13 @@ fn put_place(p: i64) {
         if PL_PARENT[p] >= 0 {
             put_place(PL_PARENT[p]);
             let f = PL_FIELD[p];
+            if f == DEREF_FIELD {
+                return;
+            }
             own_str(c".");
             if f >= TUPLE_FIELD {
                 let b = buf_new();
-                crate::base::buf_int(b, f - TUPLE_FIELD);
+                crate::base::buf_int(b, field_number(f));
                 own_bytes(buf_slice(b));
             } else {
                 own_bytes(SYMS[f].text);
@@ -873,7 +881,9 @@ pub fn on_borrow(p: i64, n: i64, kind: i64, raw: bool, dst: i64) {
             if s >= 0 {
                 ov_or(dst, slot_off(CUR, s));
             }
-            set_bit(l1(dst), p);
+            // (0.18.1: what it points to, DEREF_FIELD, not its own storage)
+            let d = child_place(p, DEREF_FIELD);
+            set_bit(l1(dst), if d >= 0 { d } else { p });
             return;
         }
         set_bit(l1(dst), p);
@@ -1106,6 +1116,10 @@ pub fn on_mut_loan(p: i64, n: i64) {
         if PO_RAW {
             return;
         }
+        let nt = NODES[n].ty;
+        if nt > 0 && TYPES[nt].kind == TyKind::Ptr {
+            crate::front::own::moves::byref_change(p, n, TYPES[nt].a);
+        }
         let vs = PO_VIEWSLOT;
         if vs >= 0 {
             let t = LOCALS[SLOT_LOCAL.data[vs]].ty;
@@ -1210,7 +1224,15 @@ pub fn on_scope_end(mark: i64, v: i64, tail: i64) {
         let mask = new_ov();
         or_expanded(at(mask), at(m));
         close_mask(at(mask));
-        invalidate(at(mask), 0 - first - 1, H_SCOPE, -1, PEND.count);
+        // (0.18.1) what a dying reference points to lives on: the views
+        // through it, DEREF_FIELD, also hold what it views
+        for q in 0..PL_COUNT {
+            if is_deref_place(q) && get_bit(at(m), PL_PARENT[q]) {
+                clear_bit(at(mask), q);
+            }
+        }
+        // (the pending arguments outlive the scope, write_place)
+        invalidate(at(mask), 0 - first - 1, H_SCOPE, -1, 0);
         let body = NODES[FNS[CUR_F].node].c;
         if v >= 0 && tail != 0 && tail != NODES[body].a && ov_hits(v, at(mask))
             && !hidden_place(first_place(v, at(mask))) && reporting(tail) {
@@ -1258,7 +1280,10 @@ pub fn on_result(e: i64, v: i64) {
                 own_sym(FNS[f].display);
                 own_str(c" returns");
                 let lt = LOCALS[l].ty;
-                if is_owned_type(lt) {
+                if crate::front::own::drops::BYREF.get(l + 1) != 0 {
+                    // (0.18.1) `match *e { E::S(s) => s.as_slice() }`
+                    own_help(c"it is a copy that 'match *e' (a loop, a 'get') binds; match the reference itself, 'match e', whose bindings are references to what it points to");
+                } else if is_owned_type(lt) {
                     own_help(c"return the owner itself; a caller that wants a view takes '.as_slice()' of it");
                     let text = src_of(e);
                     if ends_with(text, c".as_slice()") {
@@ -1334,7 +1359,7 @@ pub fn on_result(e: i64, v: i64) {
 fn escaping(o: i64, m: *i64) -> i64 {
     unsafe {
         for q in 0..PL_COUNT {
-            if !get_bit(l1(o), q) && !get_bit(l2(o), q) {
+            if !get_bit(l1(o), q) && !get_bit(l2(o), q) || is_deref_place(q) {
                 continue;
             }
             let r = root_of(q);

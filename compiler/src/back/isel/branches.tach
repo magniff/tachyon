@@ -3,13 +3,14 @@
 // and branches on phis are threaded into their predecessors (step 0).
 
 use crate::back::emit::blocks::fits_cmp_imm;
-use crate::back::isel::{ISEL_USES, isel_const, isel_count_uses};
+use crate::back::isel::{isel_const, isel_count_uses};
 use crate::base::die;
 use crate::base::target::X86;
 use crate::front::types::{TY_U64, is_float, is_vector};
+use crate::middle::ctx::FnCtx;
 use crate::middle::ir::{
-    ARGS, ARGTY, BLOCKS, Cond, INSTS, IRFUNCS, Op, Term, ir_append, ir_arg, ir_insert_before,
-    ir_make, ir_replace, ir_set_arg, ir_unlink, ir_val,
+    Cond, IRFUNCS, Op, Term, ir_append, ir_arg, ir_insert_before, ir_make, ir_replace, ir_set_arg,
+    ir_unlink, ir_val,
 };
 use crate::middle::ir::Op::{Cmp, Conv, Div, Phi, Rem, Select};
 use crate::middle::ir::cfg::pred_index;
@@ -23,31 +24,31 @@ use crate::middle::opt::{
 // The instructions an arm of a select may hold: pure, cheap ones (no
 // division: its checks and, on x86-64, its fixed registers cost more than
 // a branch).
-fn is_speculable(v: i64) -> bool {
+fn is_speculable(mut cx: *FnCtx, v: i64) -> bool {
     unsafe {
-        let op = INSTS[v].op;
+        let op = cx.insts[v].op;
         if op.is_remat() {
             return true;
         }
         op.is_pure() && op != Div && op != Rem
-            && !(op == Conv && (is_float(INSTS[v].ty) || is_float(INSTS[v].imm2)))
+            && !(op == Conv && (is_float(cx.insts[v].ty) || is_float(cx.insts[v].imm2)))
     }
 }
 
 // The number of instructions of arm block `b` that cost something, or -1
 // when it holds one it may not.
-fn arm_cost(b: i64) -> i64 {
+fn arm_cost(mut cx: *FnCtx, b: i64) -> i64 {
     unsafe {
         let mut cost = 0;
-        let mut v = BLOCKS[b].first;
+        let mut v = cx.blocks[b].first;
         while v != 0 {
-            if !is_speculable(v) {
+            if !is_speculable(cx, v) {
                 return -1;
             }
-            if !INSTS[v].op.is_remat() {
+            if !cx.insts[v].op.is_remat() {
                 cost += 1;
             }
-            v = INSTS[v].next;
+            v = cx.insts[v].next;
         }
         cost
     }
@@ -64,56 +65,57 @@ fn selectable_type(ty: i64) -> bool {
 }
 
 // Whether block b is an arm: only reached from h, only jumping on.
-fn is_arm(b: i64, h: i64) -> bool {
+fn is_arm(mut cx: *FnCtx, b: i64, h: i64) -> bool {
     unsafe {
-        BLOCKS[b].preds.count == 1 && BLOCKS[b].preds.data[0] == h && BLOCKS[b].term == Term::Jump
+        cx.blocks[b].preds.count == 1 && cx.blocks[b].preds.data[0] == h
+            && cx.blocks[b].term == Term::Jump
     }
 }
 
 // (0.15) The middle end's selects (SEL k, x, y: made by if-conversion in
 // loops) become SELECTs: on the comparison k when it is one (an integer
 // one on x86-64), else on k != 0.
-pub fn lower_sels(fi: i64) -> bool {
+pub fn lower_sels(mut cx: *FnCtx, fi: i64) -> bool {
     let mut changed = false;
     unsafe {
         for i in 0..IRFUNCS[fi].blocks.count {
             let b = IRFUNCS[fi].blocks.data[i];
-            if BLOCKS[b].removed != 0 {
+            if cx.blocks[b].removed != 0 {
                 continue;
             }
-            let mut v = BLOCKS[b].first;
+            let mut v = cx.blocks[b].first;
             while v != 0 {
-                let next = INSTS[v].next;
-                if INSTS[v].op == Op::Sel {
-                    let cond = ir_val(INSTS[v].a);
+                let next = cx.insts[v].next;
+                if cx.insts[v].op == Op::Sel {
+                    let cond = ir_val(cx, cx.insts[v].a);
                     let mut lhs = cond;
                     let mut rhs = 0;
                     let mut imm = 0;
                     let mut cmp_ty = TY_U64;
                     let mut op = Cond::Ne;
-                    if INSTS[cond].op == Cmp && !(is_float(INSTS[cond].imm2) && X86) {
-                        cmp_ty = INSTS[cond].imm2;
-                        lhs = ir_val(INSTS[cond].a);
-                        rhs = ir_val(INSTS[cond].b);
-                        op = INSTS[cond].cond;
+                    if cx.insts[cond].op == Cmp && !(is_float(cx.insts[cond].imm2) && X86) {
+                        cmp_ty = cx.insts[cond].imm2;
+                        lhs = ir_val(cx, cx.insts[cond].a);
+                        rhs = ir_val(cx, cx.insts[cond].b);
+                        op = cx.insts[cond].cond;
                         let mut value = 0;
-                        if isel_const(rhs, &value) && fits_cmp_imm(value) {
+                        if isel_const(cx, rhs, &mut value) && fits_cmp_imm(value) {
                             rhs = 0;
                             imm = value;
                         }
                     }
-                    let sel = ir_make(Select, INSTS[v].ty, ir_val(INSTS[v].b), ir_val(INSTS[v].c),
-                        imm);
-                    INSTS[sel].cond = op;
-                    INSTS[sel].imm2 = cmp_ty;
-                    INSTS[sel].args = ARGS.count;
-                    ARGS.push(lhs);
-                    ARGTY.push(0);
-                    ARGS.push(rhs);
-                    ARGTY.push(0);
-                    INSTS[sel].nargs = 2;
-                    ir_insert_before(v, sel);
-                    ir_replace(v, sel);
+                    let sel = ir_make(cx, Select, cx.insts[v].ty, ir_val(cx, cx.insts[v].b),
+                        ir_val(cx, cx.insts[v].c), imm);
+                    cx.insts[sel].cond = op;
+                    cx.insts[sel].imm2 = cmp_ty;
+                    cx.insts[sel].args = cx.args.count;
+                    cx.args.push(lhs);
+                    cx.argty.push(0);
+                    cx.args.push(rhs);
+                    cx.argty.push(0);
+                    cx.insts[sel].nargs = 2;
+                    ir_insert_before(cx, v, sel);
+                    ir_replace(cx, v, sel);
                     changed = true;
                 }
                 v = next;
@@ -124,7 +126,7 @@ pub fn lower_sels(fi: i64) -> bool {
 }
 
 // Turns small diamonds and triangles into selects; returns whether any was.
-pub fn form_selects(fi: i64) -> bool {
+pub fn form_selects(mut cx: *FnCtx, fi: i64) -> bool {
     unsafe {
         let mut changed = false;
         for _ in 0..2 {
@@ -132,7 +134,8 @@ pub fn form_selects(fi: i64) -> bool {
             let count = IRFUNCS[fi].blocks.count;
             for i in 0..count {
                 let h = IRFUNCS[fi].blocks.data[i];
-                if BLOCKS[h].removed == 0 && BLOCKS[h].term == Term::Branch && try_select(h) {
+                if cx.blocks[h].removed == 0 && cx.blocks[h].term == Term::Branch
+                    && try_select(cx, h) {
                     round = true;
                 }
             }
@@ -140,20 +143,20 @@ pub fn form_selects(fi: i64) -> bool {
                 break;
             }
             changed = true;
-            resolve_all(fi);
-            remove_trivial_phis(fi);
-            resolve_all(fi);
-            simplify_cfg(fi);
-            resolve_all(fi);
+            resolve_all(cx, fi);
+            remove_trivial_phis(cx, fi);
+            resolve_all(cx, fi);
+            simplify_cfg(cx, fi);
+            resolve_all(cx, fi);
         }
         changed
     }
 }
 
-fn try_select(h: i64) -> bool {
+fn try_select(mut cx: *FnCtx, h: i64) -> bool {
     unsafe {
-        let t = BLOCKS[h].s0;
-        let e = BLOCKS[h].s1;
+        let t = cx.blocks[h].s0;
+        let e = cx.blocks[h].s1;
         if t == e || t == h || e == h {
             return false;
         }
@@ -161,14 +164,14 @@ fn try_select(h: i64) -> bool {
         let mut join = 0;
         let mut arm_t = 0;
         let mut arm_e = 0;
-        if is_arm(t, h) && is_arm(e, h) && BLOCKS[t].s0 == BLOCKS[e].s0 {
-            join = BLOCKS[t].s0;
+        if is_arm(cx, t, h) && is_arm(cx, e, h) && cx.blocks[t].s0 == cx.blocks[e].s0 {
+            join = cx.blocks[t].s0;
             arm_t = t;
             arm_e = e;
-        } else if is_arm(t, h) && BLOCKS[t].s0 == e {
+        } else if is_arm(cx, t, h) && cx.blocks[t].s0 == e {
             join = e;
             arm_t = t;
-        } else if is_arm(e, h) && BLOCKS[e].s0 == t {
+        } else if is_arm(cx, e, h) && cx.blocks[e].s0 == t {
             join = t;
             arm_e = e;
         } else {
@@ -177,203 +180,203 @@ fn try_select(h: i64) -> bool {
         if join == h || join == t && arm_t != 0 || join == e && arm_e != 0 {
             return false;
         }
-        let cost_t = if arm_t != 0 { arm_cost(arm_t) } else { 0 };
-        let cost_e = if arm_e != 0 { arm_cost(arm_e) } else { 0 };
+        let cost_t = if arm_t != 0 { arm_cost(cx, arm_t) } else { 0 };
+        let cost_e = if arm_e != 0 { arm_cost(cx, arm_e) } else { 0 };
         if cost_t < 0 || cost_e < 0 || cost_t > 2 || cost_e > 2 {
             return false;
         }
         // The comparison.
-        let cond = BLOCKS[h].cond;
+        let cond = cx.blocks[h].cond;
         let mut lhs = cond;
         let mut rhs = 0;
         let mut imm = 0;
         let mut cmp_ty = TY_U64;
         let mut op = Cond::Ne;
-        if INSTS[cond].op == Cmp {
-            cmp_ty = INSTS[cond].imm2;
+        if cx.insts[cond].op == Cmp {
+            cmp_ty = cx.insts[cond].imm2;
             if is_float(cmp_ty) && X86 {
                 return false;
             }
-            lhs = INSTS[cond].a;
-            rhs = INSTS[cond].b;
-            op = INSTS[cond].cond;
+            lhs = cx.insts[cond].a;
+            rhs = cx.insts[cond].b;
+            op = cx.insts[cond].cond;
             let mut value = 0;
-            if isel_const(rhs, &value) && fits_cmp_imm(value) {
+            if isel_const(cx, rhs, &mut value) && fits_cmp_imm(value) {
                 rhs = 0;
                 imm = value;
             }
         }
         // The phis of the meeting block, and their values from each way.
-        let index_t = pred_index(join, if arm_t != 0 { arm_t } else { h });
-        let index_e = pred_index(join, if arm_e != 0 { arm_e } else { h });
+        let index_t = pred_index(cx, join, if arm_t != 0 { arm_t } else { h });
+        let index_e = pred_index(cx, join, if arm_e != 0 { arm_e } else { h });
         if index_t < 0 || index_e < 0 {
             return false;
         }
         let mut selects = 0;
-        let mut phi = BLOCKS[join].first;
-        while phi != 0 && INSTS[phi].op == Phi {
-            if ir_val(ir_arg(phi, index_t)) != ir_val(ir_arg(phi, index_e)) {
-                if !selectable_type(INSTS[phi].ty) {
+        let mut phi = cx.blocks[join].first;
+        while phi != 0 && cx.insts[phi].op == Phi {
+            if ir_val(cx, ir_arg(cx, phi, index_t)) != ir_val(cx, ir_arg(cx, phi, index_e)) {
+                if !selectable_type(cx.insts[phi].ty) {
                     return false;
                 }
                 selects += 1;
             }
-            phi = INSTS[phi].next;
+            phi = cx.insts[phi].next;
         }
         if selects == 0 || selects > 2 || cost_t + cost_e + selects > 4 {
             return false;
         }
         // The arms' instructions move up into h.
         if arm_t != 0 {
-            move_instructions(arm_t, h);
+            move_instructions(cx, arm_t, h);
         }
         if arm_e != 0 {
-            move_instructions(arm_e, h);
+            move_instructions(cx, arm_e, h);
         }
         // One select per phi that picks; the phi then gets it from h.
-        phi = BLOCKS[join].first;
-        while phi != 0 && INSTS[phi].op == Phi {
-            let value_t = ir_val(ir_arg(phi, index_t));
-            let value_e = ir_val(ir_arg(phi, index_e));
+        phi = cx.blocks[join].first;
+        while phi != 0 && cx.insts[phi].op == Phi {
+            let value_t = ir_val(cx, ir_arg(cx, phi, index_t));
+            let value_e = ir_val(cx, ir_arg(cx, phi, index_e));
             let mut picked = value_t;
             if value_t != value_e {
-                let sel = ir_make(Select, INSTS[phi].ty, value_t, value_e, imm);
-                INSTS[sel].cond = op;
-                INSTS[sel].imm2 = cmp_ty;
-                INSTS[sel].args = ARGS.count;
-                ARGS.push(lhs);
-                ARGTY.push(0);
-                ARGS.push(rhs);
-                ARGTY.push(0);
-                INSTS[sel].nargs = 2;
-                ir_append(h, sel);
+                let sel = ir_make(cx, Select, cx.insts[phi].ty, value_t, value_e, imm);
+                cx.insts[sel].cond = op;
+                cx.insts[sel].imm2 = cmp_ty;
+                cx.insts[sel].args = cx.args.count;
+                cx.args.push(lhs);
+                cx.argty.push(0);
+                cx.args.push(rhs);
+                cx.argty.push(0);
+                cx.insts[sel].nargs = 2;
+                ir_append(cx, h, sel);
                 picked = sel;
             }
-            ir_set_arg(phi, index_t, picked);
-            ir_set_arg(phi, index_e, picked);
-            phi = INSTS[phi].next;
+            ir_set_arg(cx, phi, index_t, picked);
+            ir_set_arg(cx, phi, index_e, picked);
+            phi = cx.insts[phi].next;
         }
         // h now jumps to the meeting block, once.
         let removed_index = if arm_e != 0 { index_e } else { index_t };
         let kept = if arm_e != 0 { arm_t } else { arm_e };
-        BLOCKS[h].term = Term::Jump;
-        BLOCKS[h].cond = 0;
-        BLOCKS[h].s0 = join;
-        BLOCKS[h].s1 = 0;
-        remove_pred_at(join, removed_index);
+        cx.blocks[h].term = Term::Jump;
+        cx.blocks[h].cond = 0;
+        cx.blocks[h].s0 = join;
+        cx.blocks[h].s1 = 0;
+        remove_pred_at(cx, join, removed_index);
         if kept != 0 {
             // The other way's predecessor entry becomes h.
-            BLOCKS[join].preds.data[pred_index(join, kept)] = h;
+            cx.blocks[join].preds.data[pred_index(cx, join, kept)] = h;
         } else if arm_e == 0 && arm_t == 0 {
             die(c"internal error: select without arms");
         }
         if arm_t != 0 {
-            drop_arm(arm_t);
+            drop_arm(cx, arm_t);
         }
         if arm_e != 0 {
-            drop_arm(arm_e);
+            drop_arm(cx, arm_e);
         }
         true
     }
 }
 
 // Moves the instructions of block `from` to the end of block `to`.
-fn move_instructions(from: i64, to: i64) {
+fn move_instructions(mut cx: *FnCtx, from: i64, to: i64) {
     unsafe {
-        let mut v = BLOCKS[from].first;
+        let mut v = cx.blocks[from].first;
         while v != 0 {
-            let next = INSTS[v].next;
-            ir_unlink(v);
-            ir_append(to, v);
+            let next = cx.insts[v].next;
+            ir_unlink(cx, v);
+            ir_append(cx, to, v);
             v = next;
         }
     }
 }
 
 // Removes an emptied arm (its edges are already redirected).
-fn drop_arm(b: i64) {
+fn drop_arm(mut cx: *FnCtx, b: i64) {
     unsafe {
-        BLOCKS[b].removed = 1;
-        BLOCKS[b].term = Term::None;
-        BLOCKS[b].preds.count = 0;
-        BLOCKS[b].first = 0;
-        BLOCKS[b].last = 0;
+        cx.blocks[b].removed = 1;
+        cx.blocks[b].term = Term::None;
+        cx.blocks[b].preds.count = 0;
+        cx.blocks[b].first = 0;
+        cx.blocks[b].last = 0;
     }
 }
 
 // ---- Branches on phis ----
 
-pub fn thread_phi_branches(fi: i64) -> bool {
+pub fn thread_phi_branches(mut cx: *FnCtx, fi: i64) -> bool {
     unsafe {
-        let mut changed = decide_repeated_branches(fi);
-        isel_count_uses(fi);
+        let mut changed = decide_repeated_branches(cx, fi);
+        isel_count_uses(cx, fi);
         let count = IRFUNCS[fi].blocks.count;
         for i in 0..count {
             let b = IRFUNCS[fi].blocks.data[i];
-            if BLOCKS[b].removed != 0 || BLOCKS[b].term != Term::Branch {
+            if cx.blocks[b].removed != 0 || cx.blocks[b].term != Term::Branch {
                 continue;
             }
-            let p = BLOCKS[b].first;
-            let s0 = BLOCKS[b].s0;
-            let s1 = BLOCKS[b].s1;
+            let p = cx.blocks[b].first;
+            let s0 = cx.blocks[b].s0;
+            let s1 = cx.blocks[b].s1;
             // Only the phi, used by the branch alone.
-            if p == 0 || p != BLOCKS[b].cond || INSTS[p].op != Phi || INSTS[p].next != 0
-                || ISEL_USES[p] != 1
+            if p == 0 || p != cx.blocks[b].cond || cx.insts[p].op != Phi || cx.insts[p].next != 0
+                || cx.isel_uses[p] != 1
                 || s0 == s1 || s0 == b || s1 == b {
                 continue;
             }
             let mut k = 0;
-            while k < BLOCKS[b].preds.count {
-                let pred = BLOCKS[b].preds.data[k];
-                let value = ir_val(ir_arg(p, k));
+            while k < cx.blocks[b].preds.count {
+                let pred = cx.blocks[b].preds.data[k];
+                let value = ir_val(cx, ir_arg(cx, p, k));
                 // (0.11) A predecessor branching on the phi's value for it
                 // (`a && b` when a is false): the edge decides it.
-                if BLOCKS[pred].term == Term::Branch && ir_val(BLOCKS[pred].cond) == value
-                    && pred != b && (BLOCKS[pred].s0 == b) != (BLOCKS[pred].s1 == b) {
-                    let target = if BLOCKS[pred].s0 == b { s0 } else { s1 };
-                    let other = if BLOCKS[pred].s0 == b { BLOCKS[pred].s1 }
-                        else { BLOCKS[pred].s0 };
+                if cx.blocks[pred].term == Term::Branch && ir_val(cx, cx.blocks[pred].cond) == value
+                    && pred != b && (cx.blocks[pred].s0 == b) != (cx.blocks[pred].s1 == b) {
+                    let target = if cx.blocks[pred].s0 == b { s0 } else { s1 };
+                    let other = if cx.blocks[pred].s0 == b { cx.blocks[pred].s1 }
+                        else { cx.blocks[pred].s0 };
                     if target != other && target != pred {
-                        if BLOCKS[pred].s0 == b {
-                            BLOCKS[pred].s0 = target;
+                        if cx.blocks[pred].s0 == b {
+                            cx.blocks[pred].s0 = target;
                         } else {
-                            BLOCKS[pred].s1 = target;
+                            cx.blocks[pred].s1 = target;
                         }
-                        add_pred_like(target, pred, b);
-                        remove_pred_at(b, k);
+                        add_pred_like(cx, target, pred, b);
+                        remove_pred_at(cx, b, k);
                         changed = true;
                         continue;
                     }
                 }
-                if BLOCKS[pred].term != Term::Jump || pred == b || pred == s0 || pred == s1 {
+                if cx.blocks[pred].term != Term::Jump || pred == b || pred == s0 || pred == s1 {
                     k += 1;
                     continue;
                 }
                 let mut known = 0;
-                if isel_const(value, &known) {
+                if isel_const(cx, value, &mut known) {
                     let target = if known != 0 { s0 } else { s1 };
-                    BLOCKS[pred].s0 = target;
-                    add_pred_like(target, pred, b);
+                    cx.blocks[pred].s0 = target;
+                    add_pred_like(cx, target, pred, b);
                 } else {
-                    BLOCKS[pred].term = Term::Branch;
-                    BLOCKS[pred].cond = value;
-                    BLOCKS[pred].s0 = s0;
-                    BLOCKS[pred].s1 = s1;
-                    add_pred_like(s0, pred, b);
-                    add_pred_like(s1, pred, b);
+                    cx.blocks[pred].term = Term::Branch;
+                    cx.blocks[pred].cond = value;
+                    cx.blocks[pred].s0 = s0;
+                    cx.blocks[pred].s1 = s1;
+                    add_pred_like(cx, s0, pred, b);
+                    add_pred_like(cx, s1, pred, b);
                 }
-                remove_pred_at(b, k);
+                remove_pred_at(cx, b, k);
                 changed = true;
             }
-            if BLOCKS[b].preds.count == 0 {
-                remove_block(b);
+            if cx.blocks[b].preds.count == 0 {
+                remove_block(cx, b);
             }
         }
         if changed {
-            resolve_all(fi);
-            remove_unreachable(fi);
-            remove_trivial_phis(fi);
-            resolve_all(fi);
+            resolve_all(cx, fi);
+            remove_unreachable(cx, fi);
+            remove_trivial_phis(cx, fi);
+            resolve_all(cx, fi);
         }
         changed
     }
@@ -382,33 +385,33 @@ pub fn thread_phi_branches(fi: i64) -> bool {
 // A branch on the condition its block's only predecessor branched on is
 // decided by the edge that leads there: it becomes a jump. Returns whether
 // any did.
-fn decide_repeated_branches(fi: i64) -> bool {
+fn decide_repeated_branches(mut cx: *FnCtx, fi: i64) -> bool {
     let mut changed = false;
     unsafe {
         for b in IRFUNCS[fi].blocks.items() {
             // (A branch both ways to one block is two predecessor entries there:
             // left alone.)
-            if BLOCKS[b].removed != 0 || BLOCKS[b].term != Term::Branch
-                || BLOCKS[b].preds.count != 1
-                || BLOCKS[b].s0 == BLOCKS[b].s1 {
+            if cx.blocks[b].removed != 0 || cx.blocks[b].term != Term::Branch
+                || cx.blocks[b].preds.count != 1
+                || cx.blocks[b].s0 == cx.blocks[b].s1 {
                 continue;
             }
-            let p = BLOCKS[b].preds.data[0];
-            let cond = ir_val(BLOCKS[b].cond);
-            if p == b || BLOCKS[p].term != Term::Branch || ir_val(BLOCKS[p].cond) != cond
-                || BLOCKS[p].s0 == BLOCKS[p].s1 {
+            let p = cx.blocks[b].preds.data[0];
+            let cond = ir_val(cx, cx.blocks[b].cond);
+            if p == b || cx.blocks[p].term != Term::Branch || ir_val(cx, cx.blocks[p].cond) != cond
+                || cx.blocks[p].s0 == cx.blocks[p].s1 {
                 continue;
             }
-            let taken = BLOCKS[p].s0 == b;
-            let keep = if taken { BLOCKS[b].s0 } else { BLOCKS[b].s1 };
-            let drop = if taken { BLOCKS[b].s1 } else { BLOCKS[b].s0 };
+            let taken = cx.blocks[p].s0 == b;
+            let keep = if taken { cx.blocks[b].s0 } else { cx.blocks[b].s1 };
+            let drop = if taken { cx.blocks[b].s1 } else { cx.blocks[b].s0 };
             if keep != drop {
-                remove_pred(drop, b);
+                remove_pred(cx, drop, b);
             }
-            BLOCKS[b].term = Term::Jump;
-            BLOCKS[b].cond = 0;
-            BLOCKS[b].s0 = keep;
-            BLOCKS[b].s1 = 0;
+            cx.blocks[b].term = Term::Jump;
+            cx.blocks[b].cond = 0;
+            cx.blocks[b].s0 = keep;
+            cx.blocks[b].s1 = 0;
             changed = true;
         }
     }

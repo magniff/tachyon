@@ -74,7 +74,10 @@ build() {
     case "$2" in
         # (from 0.7 the compiler writes objects; the previous release may
         # only write assembly)
-        O0|O1|O2) "$COMPILER" --target "$TARGET" "-$2" "$1" -o "$3.o"
+        # (0.18.1: a build's `ok:` line is not the table's; its errors are
+        # shown when it fails)
+        O0|O1|O2) "$COMPILER" --target "$TARGET" "-$2" "$1" -o "$3.o" >"$3.out" 2>&1 \
+                || { cat "$3.out" >&2; return 1; }
             # shellcheck disable=SC2086
             "$CC" $ARCH -o "$3" "$3.o" -lm
             return ;;

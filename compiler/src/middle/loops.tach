@@ -14,12 +14,11 @@
 
 // Per loop: its header, parent loop (-1: outermost), depth (1: outermost)
 // and blocks: LP_BLOCKS[LP_START[l]..][..LP_COUNT[l]], the header first.
-use crate::back::regalloc::ORDER;
 use crate::base::{IntVec, alloc_array, free};
+use crate::middle::ctx::FnCtx;
 use crate::middle::ir::{
-    ARGS, ARGTY, BLOCKS, BLOCK_COUNT, INSTS, INST_LOC, IRFUNCS, IR_LOCS, Op, SWCASES, Term,
-    ir_append, ir_arg, ir_enter, ir_insert_before, ir_make, ir_new_block, ir_operand,
-    ir_operand_count, ir_prepend, ir_set_operand,
+    IRFUNCS, IR_LOCS, Op, Term, ir_append, ir_arg, ir_enter, ir_insert_before, ir_make,
+    ir_new_block, ir_operand, ir_operand_count, ir_prepend, ir_set_operand,
 };
 use crate::middle::ir::cfg::{
     case_target, case_value, copy_terminator, pred_index, redirect_succ, succ, succ_count,
@@ -31,67 +30,48 @@ use crate::middle::opt::{
     compute_dominators, dominates, remove_pred, remove_trivial_phis, resolve_all, simplify_cfg,
 };
 
-static mut LP_HEADER: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static mut LP_PARENT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static mut LP_DEPTH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static mut LP_START: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static mut LP_COUNT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static mut LP_BLOCKS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-// Per block id (below LP_NBLOCKS): the innermost loop containing it, + 1.
-static mut LP_OF: *i64 = 0 as *i64;
-static mut LP_OF_CAP: i64 = 0;
-static mut LP_NBLOCKS: i64 = 0;
-// A visit stamp per block id, for walks over the CFG.
-pub static mut LP_SEEN: *i64 = 0 as *i64;
-static mut LP_SEEN_CAP: i64 = 0;
-static mut LP_STAMP: i64 = 0;
-// Scratch lists.
-pub static mut LP_LIST: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static mut LP_LIST2: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static mut LP_VALUES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-pub fn loop_count() -> i64 {
-    LP_HEADER.count
+pub fn loop_count(mut cx: *FnCtx) -> i64 {
+    unsafe { cx.lp_header.count }
 }
 
-pub fn loop_header(l: i64) -> i64 {
-    unsafe { LP_HEADER.data[l] }
+pub fn loop_header(mut cx: *FnCtx, l: i64) -> i64 {
+    unsafe { cx.lp_header.data[l] }
 }
 
-pub fn loop_block(l: i64, i: i64) -> i64 {
-    unsafe { LP_BLOCKS.data[LP_START.data[l] + i] }
+pub fn loop_block(mut cx: *FnCtx, l: i64, i: i64) -> i64 {
+    unsafe { cx.lp_blocks.data[cx.lp_start.data[l] + i] }
 }
 
-pub fn loop_size(l: i64) -> i64 {
-    unsafe { LP_COUNT.data[l] }
+pub fn loop_size(mut cx: *FnCtx, l: i64) -> i64 {
+    unsafe { cx.lp_count.data[l] }
 }
 
 // Whether block b belongs to loop l (or to a loop nested in it).
-pub fn loop_contains(l: i64, b: i64) -> bool {
+pub fn loop_contains(mut cx: *FnCtx, l: i64, b: i64) -> bool {
     unsafe {
-        if b >= LP_NBLOCKS {
+        if b >= cx.lp_nblocks {
             return false;
         }
-        let mut x = LP_OF[b] - 1;
+        let mut x = cx.lp_of[b] - 1;
         while x >= 0 {
             if x == l {
                 return true;
             }
-            x = LP_PARENT.data[x];
+            x = cx.lp_parent.data[x];
         }
         false
     }
 }
 
 // The innermost loop containing block b, or -1.
-pub fn innermost_loop(b: i64) -> i64 {
-    if b >= LP_NBLOCKS { -1 } else { unsafe { LP_OF[b] - 1 } }
+pub fn innermost_loop(mut cx: *FnCtx, b: i64) -> i64 {
+    if unsafe { b >= cx.lp_nblocks } { -1 } else { unsafe { cx.lp_of[b] - 1 } }
 }
 
 // Whether loop l contains no other loop.
-pub fn is_innermost(l: i64) -> bool {
-    for k in 0..loop_count() {
-        if unsafe { LP_PARENT.data[k] == l } {
+pub fn is_innermost(mut cx: *FnCtx, l: i64) -> bool {
+    for k in 0..loop_count(cx) {
+        if unsafe { cx.lp_parent.data[k] == l } {
             return false;
         }
     }
@@ -102,12 +82,12 @@ pub fn is_innermost(l: i64) -> bool {
 // to cover every block (the contents are not kept then), with the entries
 // of function fi's blocks set to 0. (Allocating one per call would cost
 // the size of the whole program each time.)
-pub fn block_array(arr: *i64, cap: *i64, fi: i64) -> *i64 {
+pub fn block_array(mut cx: *FnCtx, arr: *i64, cap: *i64, fi: i64) -> *i64 {
     unsafe {
         let mut a = arr;
-        if *cap < BLOCK_COUNT + 1 {
+        if *cap < cx.block_count + 1 {
             free(a as *u8);
-            *cap = (BLOCK_COUNT + 1) * 2;
+            *cap = (cx.block_count + 1) * 2;
             a = alloc_array::<i64>(*cap);
         }
         for i in 0..IRFUNCS[fi].blocks.count {
@@ -117,74 +97,76 @@ pub fn block_array(arr: *i64, cap: *i64, fi: i64) -> *i64 {
     }
 }
 
-fn new_stamp() -> i64 {
-    LP_STAMP += 1;
-    LP_STAMP
+fn new_stamp(mut cx: *FnCtx) -> i64 {
+    unsafe {
+        cx.lp_stamp += 1;
+        cx.lp_stamp
+    }
 }
 
 // Finds the loops of function fi (and its dominators and block layout).
-pub fn analyze_loops(fi: i64) {
+pub fn analyze_loops(mut cx: *FnCtx, fi: i64) {
     unsafe {
-        compute_dominators(fi);
-        LP_HEADER.count = 0;
-        LP_PARENT.count = 0;
-        LP_DEPTH.count = 0;
-        LP_START.count = 0;
-        LP_COUNT.count = 0;
-        LP_BLOCKS.count = 0;
-        LP_NBLOCKS = BLOCK_COUNT;
-        LP_OF = block_array(LP_OF, &LP_OF_CAP, fi);
+        compute_dominators(cx, fi);
+        cx.lp_header.count = 0;
+        cx.lp_parent.count = 0;
+        cx.lp_depth.count = 0;
+        cx.lp_start.count = 0;
+        cx.lp_count.count = 0;
+        cx.lp_blocks.count = 0;
+        cx.lp_nblocks = cx.block_count;
+        cx.lp_of = block_array(cx, cx.lp_of, &cx.lp_of_cap, fi);
         // (Stamps only grow, so LP_SEEN needs no clearing.)
-        LP_SEEN = block_array(LP_SEEN, &LP_SEEN_CAP, fi);
+        cx.lp_seen = block_array(cx, cx.lp_seen, &cx.lp_seen_cap, fi);
         let mut work = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for i in 0..ORDER.count {
-            let h = ORDER.data[i];
-            let start = LP_BLOCKS.count;
-            let stamp = new_stamp();
-            for k in 0..BLOCKS[h].preds.count {
-                let t = BLOCKS[h].preds.data[k];
+        for i in 0..cx.order.count {
+            let h = cx.order.data[i];
+            let start = cx.lp_blocks.count;
+            let stamp = new_stamp(cx);
+            for k in 0..cx.blocks[h].preds.count {
+                let t = cx.blocks[h].preds.data[k];
                 // (h dominates t only when t is not earlier in the
                 // order: the walk up t's dominators is for back edges)
-                if BLOCKS[t].order < BLOCKS[h].order || !dominates(h, t) {
+                if cx.blocks[t].order < cx.blocks[h].order || !dominates(cx, h, t) {
                     continue;
                 }
-                if LP_BLOCKS.count == start {
-                    LP_SEEN[h] = stamp;
-                    LP_BLOCKS.push(h);
+                if cx.lp_blocks.count == start {
+                    cx.lp_seen[h] = stamp;
+                    cx.lp_blocks.push(h);
                 }
-                if LP_SEEN[t] != stamp {
-                    LP_SEEN[t] = stamp;
-                    LP_BLOCKS.push(t);
+                if cx.lp_seen[t] != stamp {
+                    cx.lp_seen[t] = stamp;
+                    cx.lp_blocks.push(t);
                     work.push(t);
                 }
                 while work.count > 0 {
                     let x = work.pop();
-                    for m in 0..BLOCKS[x].preds.count {
-                        let p = BLOCKS[x].preds.data[m];
-                        if BLOCKS[p].order >= 0 && LP_SEEN[p] != stamp {
-                            LP_SEEN[p] = stamp;
-                            LP_BLOCKS.push(p);
+                    for m in 0..cx.blocks[x].preds.count {
+                        let p = cx.blocks[x].preds.data[m];
+                        if cx.blocks[p].order >= 0 && cx.lp_seen[p] != stamp {
+                            cx.lp_seen[p] = stamp;
+                            cx.lp_blocks.push(p);
                             work.push(p);
                         }
                     }
                 }
             }
-            if LP_BLOCKS.count > start {
-                LP_HEADER.push(h);
-                LP_PARENT.push(-1);
-                LP_DEPTH.push(1);
-                LP_START.push(start);
-                LP_COUNT.push(LP_BLOCKS.count - start);
+            if cx.lp_blocks.count > start {
+                cx.lp_header.push(h);
+                cx.lp_parent.push(-1);
+                cx.lp_depth.push(1);
+                cx.lp_start.push(start);
+                cx.lp_count.push(cx.lp_blocks.count - start);
             }
         }
         free(work.data as *u8);
         // Nesting: the loops from the largest to the smallest; the innermost
         // loop seen so far that contains a header is its parent.
-        let n = loop_count();
+        let n = loop_count(cx);
         let by_size = alloc_array::<i64>(n + 1);
         for l in 0..n {
             let mut k = l;
-            while k > 0 && LP_COUNT.data[by_size[k - 1]] < LP_COUNT.data[l] {
+            while k > 0 && cx.lp_count.data[by_size[k - 1]] < cx.lp_count.data[l] {
                 by_size[k] = by_size[k - 1];
                 k -= 1;
             }
@@ -192,11 +174,11 @@ pub fn analyze_loops(fi: i64) {
         }
         for i in 0..n {
             let l = by_size[i];
-            let parent = LP_OF[loop_header(l)] - 1;
-            LP_PARENT.data[l] = parent;
-            LP_DEPTH.data[l] = if parent < 0 { 1 } else { LP_DEPTH.data[parent] + 1 };
-            for k in 0..loop_size(l) {
-                LP_OF[loop_block(l, k)] = l + 1;
+            let parent = cx.lp_of[loop_header(cx, l)] - 1;
+            cx.lp_parent.data[l] = parent;
+            cx.lp_depth.data[l] = if parent < 0 { 1 } else { cx.lp_depth.data[parent] + 1 };
+            for k in 0..loop_size(cx, l) {
+                cx.lp_of[loop_block(cx, l, k)] = l + 1;
             }
         }
         free(by_size as *u8);
@@ -207,20 +189,20 @@ pub fn analyze_loops(fi: i64) {
 
 // The preheader of loop l (its header's only outside predecessor, which
 // jumps to it), or 0.
-pub fn loop_preheader(l: i64) -> i64 {
+pub fn loop_preheader(mut cx: *FnCtx, l: i64) -> i64 {
     unsafe {
-        let h = loop_header(l);
+        let h = loop_header(cx, l);
         let mut found = 0;
-        for k in 0..BLOCKS[h].preds.count {
-            let p = BLOCKS[h].preds.data[k];
-            if !loop_contains(l, p) {
+        for k in 0..cx.blocks[h].preds.count {
+            let p = cx.blocks[h].preds.data[k];
+            if !loop_contains(cx, l, p) {
                 if found != 0 {
                     return 0;
                 }
                 found = p;
             }
         }
-        if found == 0 || BLOCKS[found].term != Term::Jump {
+        if found == 0 || cx.blocks[found].term != Term::Jump {
             return 0;
         }
         found
@@ -228,13 +210,13 @@ pub fn loop_preheader(l: i64) -> i64 {
 }
 
 // The single latch of loop l, or 0.
-pub fn loop_latch(l: i64) -> i64 {
-    let h = loop_header(l);
+pub fn loop_latch(mut cx: *FnCtx, l: i64) -> i64 {
+    let h = loop_header(cx, l);
     let mut found = 0;
     unsafe {
-        for k in 0..BLOCKS[h].preds.count {
-            let p = BLOCKS[h].preds.data[k];
-            if loop_contains(l, p) {
+        for k in 0..cx.blocks[h].preds.count {
+            let p = cx.blocks[h].preds.data[k];
+            if loop_contains(cx, l, p) {
                 if found != 0 {
                     return 0;
                 }
@@ -246,17 +228,17 @@ pub fn loop_latch(l: i64) -> i64 {
 }
 
 // The exit blocks of loop l (outside it, entered from it) into LP_LIST.
-pub fn loop_exits(l: i64) {
+pub fn loop_exits(mut cx: *FnCtx, l: i64) {
     unsafe {
-        LP_LIST.count = 0;
-        let stamp = new_stamp();
-        for i in 0..loop_size(l) {
-            let b = loop_block(l, i);
-            for k in 0..succ_count(b) {
-                let s = succ(b, k);
-                if !loop_contains(l, s) && LP_SEEN[s] != stamp {
-                    LP_SEEN[s] = stamp;
-                    LP_LIST.push(s);
+        cx.lp_list.count = 0;
+        let stamp = new_stamp(cx);
+        for i in 0..loop_size(cx, l) {
+            let b = loop_block(cx, l, i);
+            for k in 0..succ_count(cx, b) {
+                let s = succ(cx, b, k);
+                if !loop_contains(cx, l, s) && cx.lp_seen[s] != stamp {
+                    cx.lp_seen[s] = stamp;
+                    cx.lp_list.push(s);
                 }
             }
         }
@@ -264,51 +246,51 @@ pub fn loop_exits(l: i64) {
 }
 
 // Appends predecessor `pred` to block b; its k-th phi gets values[first + k].
-pub fn add_pred_values(b: i64, pred: i64, values: *IntVec, first: i64) {
+pub fn add_pred_values(mut cx: *FnCtx, b: i64, pred: i64, values: *IntVec, first: i64) {
     unsafe {
-        BLOCKS[b].preds.push(pred);
+        cx.blocks[b].preds.push(pred);
         let mut k = 0;
-        let mut phi = BLOCKS[b].first;
-        while phi != 0 && INSTS[phi].op == Op::Phi {
-            let n = INSTS[phi].nargs;
-            let start = ARGS.count;
+        let mut phi = cx.blocks[b].first;
+        while phi != 0 && cx.insts[phi].op == Op::Phi {
+            let n = cx.insts[phi].nargs;
+            let start = cx.args.count;
             for i in 0..n {
-                ARGS.push(ARGS.data[INSTS[phi].args + i]);
-                ARGTY.push(0);
+                cx.args.push(cx.args.data[cx.insts[phi].args + i]);
+                cx.argty.push(0);
             }
-            ARGS.push((*values).data[first + k]);
-            ARGTY.push(0);
-            INSTS[phi].args = start;
-            INSTS[phi].nargs = n + 1;
+            cx.args.push((*values).data[first + k]);
+            cx.argty.push(0);
+            cx.insts[phi].args = start;
+            cx.insts[phi].nargs = n + 1;
             k += 1;
-            phi = INSTS[phi].next;
+            phi = cx.insts[phi].next;
         }
     }
 }
 
 // A new phi of type ty in block b (after its other phis) over `count`
 // operands values[first..].
-pub fn new_phi_in(b: i64, ty: i64, values: *IntVec, first: i64, count: i64) -> i64 {
+pub fn new_phi_in(mut cx: *FnCtx, b: i64, ty: i64, values: *IntVec, first: i64, count: i64) -> i64 {
     unsafe {
-        let phi = ir_make(Op::Phi, ty, 0, 0, 0);
-        INSTS[phi].args = ARGS.count;
-        INSTS[phi].nargs = count;
+        let phi = ir_make(cx, Op::Phi, ty, 0, 0, 0);
+        cx.insts[phi].args = cx.args.count;
+        cx.insts[phi].nargs = count;
         for i in 0..count {
-            ARGS.push((*values).data[first + i]);
-            ARGTY.push(0);
+            cx.args.push((*values).data[first + i]);
+            cx.argty.push(0);
         }
         let mut last_phi = 0;
-        let mut v = BLOCKS[b].first;
-        while v != 0 && INSTS[v].op == Op::Phi {
+        let mut v = cx.blocks[b].first;
+        while v != 0 && cx.insts[v].op == Op::Phi {
             last_phi = v;
-            v = INSTS[v].next;
+            v = cx.insts[v].next;
         }
         if last_phi == 0 {
-            ir_prepend(b, phi);
-        } else if INSTS[last_phi].next == 0 {
-            ir_append(b, phi);
+            ir_prepend(cx, b, phi);
+        } else if cx.insts[last_phi].next == 0 {
+            ir_append(cx, b, phi);
         } else {
-            ir_insert_before(INSTS[last_phi].next, phi);
+            ir_insert_before(cx, cx.insts[last_phi].next, phi);
         }
         phi
     }
@@ -318,64 +300,65 @@ pub fn new_phi_in(b: i64, ty: i64, values: *IntVec, first: i64, count: i64) -> i
 // predecessors) to a new block that jumps to b: their edges go to the new
 // block, and b's phis get, for it, the operand of the one predecessor or a
 // new phi in the new block over theirs. Returns the new block.
-fn split_preds(fi: i64, b: i64, list: *IntVec) -> i64 {
+fn split_preds(mut cx: *FnCtx, fi: i64, b: i64, list: &IntVec) -> i64 {
     unsafe {
-        ir_enter(fi);
-        let nb = ir_new_block();
-        BLOCKS[nb].sealed = 1;
+        ir_enter(cx, fi);
+        let nb = ir_new_block(cx);
+        cx.blocks[nb].sealed = 1;
         let n = (*list).count;
-        let mark = LP_VALUES.count;
-        let mut phi = BLOCKS[b].first;
-        while phi != 0 && INSTS[phi].op == Op::Phi {
+        let mark = cx.lp_values.count;
+        let mut phi = cx.blocks[b].first;
+        while phi != 0 && cx.insts[phi].op == Op::Phi {
             if n == 1 {
-                LP_VALUES.push(ir_arg(phi, pred_index(b, (*list).data[0])));
+                cx.lp_values.push(ir_arg(cx, phi, pred_index(cx, b, (*list).data[0])));
             } else {
-                let first = LP_VALUES.count;
+                let first = cx.lp_values.count;
                 for i in 0..n {
-                    LP_VALUES.push(ir_arg(phi, pred_index(b, (*list).data[i])));
+                    cx.lp_values.push(ir_arg(cx, phi, pred_index(cx, b, (*list).data[i])));
                 }
-                let np = new_phi_in(nb, INSTS[phi].ty, &LP_VALUES, first, n);
-                LP_VALUES.count = first;
-                LP_VALUES.push(np);
+                let np = new_phi_in(cx, nb, cx.insts[phi].ty, &cx.lp_values, first, n);
+                cx.lp_values.count = first;
+                cx.lp_values.push(np);
             }
-            phi = INSTS[phi].next;
+            phi = cx.insts[phi].next;
         }
         for i in 0..n {
             let p = (*list).data[i];
-            remove_pred(b, p);
-            redirect_succ(p, b, nb);
-            BLOCKS[nb].preds.push(p);
+            remove_pred(cx, b, p);
+            redirect_succ(cx, p, b, nb);
+            cx.blocks[nb].preds.push(p);
         }
-        add_pred_values(b, nb, &LP_VALUES, mark);
-        LP_VALUES.count = mark;
-        BLOCKS[nb].term = Term::Jump;
-        BLOCKS[nb].s0 = b;
+        add_pred_values(cx, b, nb, &cx.lp_values, mark);
+        cx.lp_values.count = mark;
+        cx.blocks[nb].term = Term::Jump;
+        cx.blocks[nb].s0 = b;
         nb
     }
 }
 
 // Puts loop l in canonical form; returns whether anything changed (the
 // loop forest must then be found again).
-fn canonicalize_loop(fi: i64, l: i64) -> bool {
+fn canonicalize_loop(mut cx: *FnCtx, fi: i64, l: i64) -> bool {
     unsafe {
-        let h = loop_header(l);
+        let h = loop_header(cx, l);
         let mut outside = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let mut inside = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for k in 0..BLOCKS[h].preds.count {
-            let p = BLOCKS[h].preds.data[k];
-            if loop_contains(l, p) {
+        for k in 0..cx.blocks[h].preds.count {
+            let p = cx.blocks[h].preds.data[k];
+            if loop_contains(cx, l, p) {
                 inside.push(p);
             } else {
                 outside.push(p);
             }
         }
         let mut changed = false;
-        if outside.count > 0 && (outside.count > 1 || BLOCKS[outside.data[0]].term != Term::Jump) {
-            split_preds(fi, h, &outside);
+        if outside.count > 0
+            && (outside.count > 1 || cx.blocks[outside.data[0]].term != Term::Jump) {
+            split_preds(cx, fi, h, &outside);
             changed = true;
         }
         if inside.count > 1 {
-            split_preds(fi, h, &inside);
+            split_preds(cx, fi, h, &inside);
             changed = true;
         }
         free(outside.data as *u8);
@@ -384,26 +367,26 @@ fn canonicalize_loop(fi: i64, l: i64) -> bool {
             return true;
         }
         // Dedicated exits.
-        loop_exits(l);
+        loop_exits(cx, l);
         let mut exits = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for i in 0..LP_LIST.count {
-            exits.push(LP_LIST.data[i]);
+        for i in 0..cx.lp_list.count {
+            exits.push(cx.lp_list.data[i]);
         }
         let mut from = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for i in 0..exits.count {
             let e = exits.data[i];
             let mut shared = false;
             from.count = 0;
-            for k in 0..BLOCKS[e].preds.count {
-                let p = BLOCKS[e].preds.data[k];
-                if loop_contains(l, p) {
+            for k in 0..cx.blocks[e].preds.count {
+                let p = cx.blocks[e].preds.data[k];
+                if loop_contains(cx, l, p) {
                     from.push(p);
                 } else {
                     shared = true;
                 }
             }
             if shared {
-                split_preds(fi, e, &from);
+                split_preds(cx, fi, e, &from);
                 changed = true;
             }
         }
@@ -415,13 +398,13 @@ fn canonicalize_loop(fi: i64, l: i64) -> bool {
 
 // Puts every loop of fi in canonical form (finding the loops again after
 // each change). Loops whose header is the entry are left alone.
-pub fn canonicalize_loops(fi: i64) -> bool {
+pub fn canonicalize_loops(mut cx: *FnCtx, fi: i64) -> bool {
     let mut changed = false;
     for _ in 0..1000 {
-        analyze_loops(fi);
+        analyze_loops(cx, fi);
         let mut did = false;
-        for l in 0..loop_count() {
-            if unsafe { loop_header(l) != IRFUNCS[fi].entry && canonicalize_loop(fi, l) } {
+        for l in 0..loop_count(cx) {
+            if unsafe { loop_header(cx, l) != IRFUNCS[fi].entry && canonicalize_loop(cx, fi, l) } {
                 did = true;
                 break;
             }
@@ -435,16 +418,16 @@ pub fn canonicalize_loops(fi: i64) -> bool {
 }
 
 // Whether loop l is in canonical form.
-pub fn is_canonical(l: i64) -> bool {
+pub fn is_canonical(mut cx: *FnCtx, l: i64) -> bool {
     unsafe {
-        if loop_preheader(l) == 0 || loop_latch(l) == 0 {
+        if loop_preheader(cx, l) == 0 || loop_latch(cx, l) == 0 {
             return false;
         }
-        loop_exits(l);
-        for i in 0..LP_LIST.count {
-            let e = LP_LIST.data[i];
-            for k in 0..BLOCKS[e].preds.count {
-                if !loop_contains(l, BLOCKS[e].preds.data[k]) {
+        loop_exits(cx, l);
+        for i in 0..cx.lp_list.count {
+            let e = cx.lp_list.data[i];
+            for k in 0..cx.blocks[e].preds.count {
+                if !loop_contains(cx, l, cx.blocks[e].preds.data[k]) {
                     return false;
                 }
             }
@@ -459,28 +442,28 @@ pub fn is_canonical(l: i64) -> bool {
 // definition, then ssa_read(var, block) gives the value reaching the end of
 // a block (phis are placed where definitions meet; lower.tach). Every
 // block must be sealed.
-fn updater_var(ty: i64) -> i64 {
-    new_synth_var(ty)
+fn updater_var(mut cx: *FnCtx, ty: i64) -> i64 {
+    new_synth_var(cx, ty)
 }
 
-pub fn seal_all(fi: i64) {
+pub fn seal_all(mut cx: *FnCtx, fi: i64) {
     unsafe {
         for i in 0..IRFUNCS[fi].blocks.count {
             let b = IRFUNCS[fi].blocks.data[i];
-            BLOCKS[b].sealed = 1;
-            BLOCKS[b].incomplete = 0;
+            cx.blocks[b].sealed = 1;
+            cx.blocks[b].incomplete = 0;
         }
     }
 }
 
 // The block where a use of an operand happens: the block of instruction u,
 // or for a phi's k-th operand, the k-th predecessor of the phi's block.
-fn use_block(u: i64, k: i64) -> i64 {
+fn use_block(mut cx: *FnCtx, u: i64, k: i64) -> i64 {
     unsafe {
-        if INSTS[u].op == Op::Phi && k >= 3 {
-            return BLOCKS[INSTS[u].block].preds.data[k - 3];
+        if cx.insts[u].op == Op::Phi && k >= 3 {
+            return cx.blocks[cx.insts[u].block].preds.data[k - 3];
         }
-        INSTS[u].block
+        cx.insts[u].block
     }
 }
 
@@ -489,32 +472,32 @@ fn use_block(u: i64, k: i64) -> i64 {
 // Makes every value defined in loop l and used outside it go through phis
 // in the exit blocks. Returns whether anything changed. The dominators
 // must be current.
-pub fn form_lcssa(fi: i64, l: i64) -> bool {
+pub fn form_lcssa(mut cx: *FnCtx, fi: i64, l: i64) -> bool {
     unsafe {
-        ir_enter(fi);
+        ir_enter(cx, fi);
         // Uses outside the loop of values defined inside: (user, operand index)
         // pairs; a terminator's condition is user -block (index 0).
         let mut uses = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for i in 0..IRFUNCS[fi].blocks.count {
             let b = IRFUNCS[fi].blocks.data[i];
-            if BLOCKS[b].removed != 0 || BLOCKS[b].order < 0 {
+            if cx.blocks[b].removed != 0 || cx.blocks[b].order < 0 {
                 continue;
             }
-            let mut v = BLOCKS[b].first;
+            let mut v = cx.blocks[b].first;
             while v != 0 {
-                for k in 0..ir_operand_count(v) {
-                    let w = ir_operand(v, k);
-                    if w != 0 && INSTS[w].block != 0 && loop_contains(l, INSTS[w].block)
-                        && !loop_contains(l, use_block(v, k)) {
+                for k in 0..ir_operand_count(cx, v) {
+                    let w = ir_operand(cx, v, k);
+                    if w != 0 && cx.insts[w].block != 0 && loop_contains(cx, l, cx.insts[w].block)
+                        && !loop_contains(cx, l, use_block(cx, v, k)) {
                         uses.push(v);
                         uses.push(k);
                     }
                 }
-                v = INSTS[v].next;
+                v = cx.insts[v].next;
             }
-            let c = BLOCKS[b].cond;
-            if c != 0 && INSTS[c].block != 0 && loop_contains(l, INSTS[c].block)
-                && !loop_contains(l, b) {
+            let c = cx.blocks[b].cond;
+            if c != 0 && cx.insts[c].block != 0 && loop_contains(cx, l, cx.insts[c].block)
+                && !loop_contains(cx, l, b) {
                 uses.push(0 - b);
                 uses.push(0);
             }
@@ -523,42 +506,42 @@ pub fn form_lcssa(fi: i64, l: i64) -> bool {
             free(uses.data as *u8);
             return false;
         }
-        loop_exits(l);
+        loop_exits(cx, l);
         let mut exits = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for i in 0..LP_LIST.count {
-            exits.push(LP_LIST.data[i]);
+        for i in 0..cx.lp_list.count {
+            exits.push(cx.lp_list.data[i]);
         }
         // One updater variable per value (INSTS[w].mark = var + 1).
         for i in 0..uses.count / 2 {
-            let w = lcssa_used(uses.data[2 * i], uses.data[2 * i + 1]);
-            INSTS[w].mark = 0;
+            let w = lcssa_used(cx, uses.data[2 * i], uses.data[2 * i + 1]);
+            cx.insts[w].mark = 0;
         }
         for i in 0..uses.count / 2 {
             let u = uses.data[2 * i];
             let k = uses.data[2 * i + 1];
-            let w = lcssa_used(u, k);
-            if INSTS[w].mark == 0 {
-                let var = updater_var(INSTS[w].ty);
-                INSTS[w].mark = var + 1;
+            let w = lcssa_used(cx, u, k);
+            if cx.insts[w].mark == 0 {
+                let var = updater_var(cx, cx.insts[w].ty);
+                cx.insts[w].mark = var + 1;
                 for j in 0..exits.count {
                     let e = exits.data[j];
-                    if dominates(INSTS[w].block, e) {
-                        let first = LP_VALUES.count;
-                        for m in 0..BLOCKS[e].preds.count {
-                            LP_VALUES.push(w);
+                    if dominates(cx, cx.insts[w].block, e) {
+                        let first = cx.lp_values.count;
+                        for m in 0..cx.blocks[e].preds.count {
+                            cx.lp_values.push(w);
                         }
-                        let phi = new_phi_in(e, INSTS[w].ty, &LP_VALUES, first,
-                            BLOCKS[e].preds.count);
-                        LP_VALUES.count = first;
-                        ssa_write(var, e, phi);
+                        let phi = new_phi_in(cx, e, cx.insts[w].ty, &cx.lp_values, first,
+                            cx.blocks[e].preds.count);
+                        cx.lp_values.count = first;
+                        ssa_write(cx, var, e, phi);
                     }
                 }
             }
-            let var = INSTS[w].mark - 1;
+            let var = cx.insts[w].mark - 1;
             if u < 0 {
-                BLOCKS[0 - u].cond = ssa_read(var, 0 - u);
+                cx.blocks[0 - u].cond = ssa_read(cx, var, 0 - u);
             } else {
-                ir_set_operand(u, k, ssa_read(var, use_block(u, k)));
+                ir_set_operand(cx, u, k, ssa_read(cx, var, use_block(cx, u, k)));
             }
         }
         free(exits.data as *u8);
@@ -567,47 +550,47 @@ pub fn form_lcssa(fi: i64, l: i64) -> bool {
     }
 }
 
-fn lcssa_used(u: i64, k: i64) -> i64 {
-    if u < 0 { unsafe { BLOCKS[0 - u].cond } } else { ir_operand(u, k) }
+fn lcssa_used(mut cx: *FnCtx, u: i64, k: i64) -> i64 {
+    if u < 0 { unsafe { cx.blocks[0 - u].cond } } else { ir_operand(cx, u, k) }
 }
 
 // ---- Cloning ----
 
 // The copy of value v when v is defined in the region being cloned (blocks
 // marked `stamp` in LP_SEEN), else v.
-pub fn clone_map(v: i64, stamp: i64) -> i64 {
+pub fn clone_map(mut cx: *FnCtx, v: i64, stamp: i64) -> i64 {
     unsafe {
-        if v == 0 || INSTS[v].block == 0 {
+        if v == 0 || cx.insts[v].block == 0 {
             return v;
         }
-        let b = INSTS[v].block;
-        if b < LP_NBLOCKS && LP_SEEN[b] == stamp { INSTS[v].aux } else { v }
+        let b = cx.insts[v].block;
+        if b < cx.lp_nblocks && cx.lp_seen[b] == stamp { cx.insts[v].aux } else { v }
     }
 }
 
-fn clone_block_map(b: i64, stamp: i64) -> i64 {
+fn clone_block_map(mut cx: *FnCtx, b: i64, stamp: i64) -> i64 {
     unsafe {
-        if b != 0 && b < LP_NBLOCKS && LP_SEEN[b] == stamp { BLOCKS[b].aux } else { b }
+        if b != 0 && b < cx.lp_nblocks && cx.lp_seen[b] == stamp { cx.blocks[b].aux } else { b }
     }
 }
 
 // A copy of instruction v (not in a block; operands as they are).
-pub fn clone_inst(v: i64) -> i64 {
+pub fn clone_inst(mut cx: *FnCtx, v: i64) -> i64 {
     unsafe {
-        let op = INSTS[v].op;
-        let nv = ir_make(op, INSTS[v].ty, INSTS[v].a, INSTS[v].b, INSTS[v].imm);
-        INSTS[nv].c = INSTS[v].c;
-        INSTS[nv].cond = INSTS[v].cond;
-        INSTS[nv].imm2 = INSTS[v].imm2;
+        let op = cx.insts[v].op;
+        let nv = ir_make(cx, op, cx.insts[v].ty, cx.insts[v].a, cx.insts[v].b, cx.insts[v].imm);
+        cx.insts[nv].c = cx.insts[v].c;
+        cx.insts[nv].cond = cx.insts[v].cond;
+        cx.insts[nv].imm2 = cx.insts[v].imm2;
         if IR_LOCS {
-            INST_LOC.data[nv] = INST_LOC.data[v];
+            cx.inst_loc.data[nv] = cx.inst_loc.data[v];
         }
-        if INSTS[v].nargs > 0 || op == Op::Phi || op.is_call() {
-            INSTS[nv].args = ARGS.count;
-            INSTS[nv].nargs = INSTS[v].nargs;
-            for a in 0..INSTS[v].nargs {
-                ARGS.push(ir_arg(v, a));
-                ARGTY.push(ARGTY.data[INSTS[v].args + a]);
+        if cx.insts[v].nargs > 0 || op == Op::Phi || op.is_call() {
+            cx.insts[nv].args = cx.args.count;
+            cx.insts[nv].nargs = cx.insts[v].nargs;
+            for a in 0..cx.insts[v].nargs {
+                cx.args.push(ir_arg(cx, v, a));
+                cx.argty.push(cx.argty.data[cx.insts[v].args + a]);
             }
         }
         nv
@@ -619,89 +602,91 @@ pub fn clone_inst(v: i64) -> i64 {
 // and successors inside the region are mapped to their copies; a copy's
 // predecessors are its original's, mapped, in the same order (those from
 // outside the region kept: their terminators still go to the original).
-pub fn clone_region(fi: i64, list: *IntVec, stamp: i64) {
+pub fn clone_region(mut cx: *FnCtx, fi: i64, list: *IntVec, stamp: i64) {
     unsafe {
-        ir_enter(fi);
+        ir_enter(cx, fi);
         let n = (*list).count;
         for i in 0..n {
             let b = (*list).data[i];
-            let nb = ir_new_block();
-            BLOCKS[nb].sealed = 1;
-            BLOCKS[nb].novec = BLOCKS[b].novec;
-            BLOCKS[nb].count = BLOCKS[b].count;
-            BLOCKS[b].aux = nb;
-            let mut v = BLOCKS[b].first;
+            let nb = ir_new_block(cx);
+            cx.blocks[nb].sealed = 1;
+            cx.blocks[nb].novec = cx.blocks[b].novec;
+            cx.blocks[nb].count = cx.blocks[b].count;
+            cx.blocks[b].aux = nb;
+            let mut v = cx.blocks[b].first;
             while v != 0 {
-                let nv = clone_inst(v);
-                ir_append(nb, nv);
-                INSTS[v].aux = nv;
-                v = INSTS[v].next;
+                let nv = clone_inst(cx, v);
+                ir_append(cx, nb, nv);
+                cx.insts[v].aux = nv;
+                v = cx.insts[v].next;
             }
         }
         for i in 0..n {
             let b = (*list).data[i];
-            let nb = BLOCKS[b].aux;
-            let mut v = BLOCKS[nb].first;
+            let nb = cx.blocks[b].aux;
+            let mut v = cx.blocks[nb].first;
             while v != 0 {
-                for k in 0..ir_operand_count(v) {
-                    let w = ir_operand(v, k);
+                for k in 0..ir_operand_count(cx, v) {
+                    let w = ir_operand(cx, v, k);
                     if w != 0 {
-                        ir_set_operand(v, k, clone_map(w, stamp));
+                        ir_set_operand(cx, v, k, clone_map(cx, w, stamp));
                     }
                 }
-                v = INSTS[v].next;
+                v = cx.insts[v].next;
             }
-            copy_terminator(nb, b);
-            BLOCKS[nb].cond = clone_map(BLOCKS[b].cond, stamp);
-            map_successors(nb, stamp);
-            for k in 0..BLOCKS[b].preds.count {
-                BLOCKS[nb].preds.push(clone_block_map(BLOCKS[b].preds.data[k], stamp));
+            copy_terminator(cx, nb, b);
+            cx.blocks[nb].cond = clone_map(cx, cx.blocks[b].cond, stamp);
+            map_successors(cx, nb, stamp);
+            for k in 0..cx.blocks[b].preds.count {
+                cx.blocks[nb].preds.push(clone_block_map(cx, cx.blocks[b].preds.data[k], stamp));
             }
         }
     }
 }
 
 // Maps the successors of block b (a copy) through clone_block_map.
-fn map_successors(b: i64, stamp: i64) {
+fn map_successors(mut cx: *FnCtx, b: i64, stamp: i64) {
     unsafe {
-        if BLOCKS[b].term == Term::Switch {
-            let start = SWCASES.count;
-            for i in 0..BLOCKS[b].ncases {
-                SWCASES.push(case_value(b, i));
-                SWCASES.push(clone_block_map(case_target(b, i), stamp));
+        if cx.blocks[b].term == Term::Switch {
+            let start = cx.swcases.count;
+            for i in 0..cx.blocks[b].ncases {
+                cx.swcases.push(case_value(cx, b, i));
+                cx.swcases.push(clone_block_map(cx, case_target(cx, b, i), stamp));
             }
-            BLOCKS[b].cases = start;
-            BLOCKS[b].s0 = clone_block_map(BLOCKS[b].s0, stamp);
-            switch_rebuild_succs(b);
+            cx.blocks[b].cases = start;
+            cx.blocks[b].s0 = clone_block_map(cx, cx.blocks[b].s0, stamp);
+            switch_rebuild_succs(cx, b);
             return;
         }
-        BLOCKS[b].s0 = clone_block_map(BLOCKS[b].s0, stamp);
-        BLOCKS[b].s1 = clone_block_map(BLOCKS[b].s1, stamp);
+        cx.blocks[b].s0 = clone_block_map(cx, cx.blocks[b].s0, stamp);
+        cx.blocks[b].s1 = clone_block_map(cx, cx.blocks[b].s1, stamp);
     }
 }
 
 // Marks the blocks of loop l with a fresh stamp in LP_SEEN and lists them
 // in LP_LIST2; returns the stamp.
-pub fn mark_loop_blocks(l: i64) -> i64 {
-    let stamp = new_stamp();
-    LP_LIST2.count = 0;
-    for i in 0..loop_size(l) {
-        let b = loop_block(l, i);
-        unsafe { LP_SEEN[b] = stamp; }
-        LP_LIST2.push(b);
+pub fn mark_loop_blocks(mut cx: *FnCtx, l: i64) -> i64 {
+    unsafe {
+        let stamp = new_stamp(cx);
+        cx.lp_list2.count = 0;
+        for i in 0..loop_size(cx, l) {
+            let b = loop_block(cx, l, i);
+            unsafe { cx.lp_seen[b] = stamp; }
+            cx.lp_list2.push(b);
+        }
+        stamp
     }
-    stamp
 }
 
 // The number of instructions in loop l.
-pub fn loop_inst_count(l: i64) -> i64 {
+pub fn loop_inst_count(mut cx: *FnCtx, l: i64) -> i64 {
     unsafe {
         let mut n = 0;
-        for i in 0..loop_size(l) {
-            let mut v = BLOCKS[loop_block(l, i)].first;
+        for i in 0..loop_size(cx, l) {
+            let mut v = cx.blocks[loop_block(cx, l, i)].first;
             while v != 0 {
                 n += 1;
-                v = INSTS[v].next;
+                v = cx.insts[v].next;
             }
         }
         n
@@ -709,8 +694,8 @@ pub fn loop_inst_count(l: i64) -> i64 {
 }
 
 // Whether v is defined outside loop l (constants and the like included).
-pub fn invariant_in(l: i64, v: i64) -> bool {
-    unsafe { v == 0 || INSTS[v].block == 0 || !loop_contains(l, INSTS[v].block) }
+pub fn invariant_in(mut cx: *FnCtx, l: i64, v: i64) -> bool {
+    unsafe { v == 0 || cx.insts[v].block == 0 || !loop_contains(cx, l, cx.insts[v].block) }
 }
 
 // ---- Rotation ----
@@ -718,14 +703,12 @@ pub fn invariant_in(l: i64, v: i64) -> bool {
 // Instructions (other than phis) a header may have to be duplicated.
 const ROTATE_MAX: i64 = 16;
 
-// The headers of the loops rotated in the current function (each loop is
-// rotated once).
-static mut ROTATED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-fn was_rotated(h: i64) -> bool {
-    for i in 0..ROTATED.count {
-        if unsafe { ROTATED.data[i] == h } {
-            return true;
+fn was_rotated(mut cx: *FnCtx, h: i64) -> bool {
+    unsafe {
+        for i in 0..cx.rotated.count {
+            if unsafe { cx.rotated.data[i] == h } {
+                return true;
+            }
         }
     }
     false
@@ -735,109 +718,110 @@ fn was_rotated(h: i64) -> bool {
 // guarded do-while: the header's instructions are copied into the
 // preheader, which branches to the body or the exit; the header, reached
 // from the latch only, becomes part of the latch. Returns whether it did.
-fn rotate_loop(fi: i64, l: i64) -> bool {
+fn rotate_loop(mut cx: *FnCtx, fi: i64, l: i64) -> bool {
     unsafe {
-        let h = loop_header(l);
-        let pre = loop_preheader(l);
-        let latch = loop_latch(l);
-        if pre == 0 || latch == 0 || latch == h || BLOCKS[h].term != Term::Branch {
+        let h = loop_header(cx, l);
+        let pre = loop_preheader(cx, l);
+        let latch = loop_latch(cx, l);
+        if pre == 0 || latch == 0 || latch == h || cx.blocks[h].term != Term::Branch {
             return false;
         }
-        let s0 = BLOCKS[h].s0;
-        let s1 = BLOCKS[h].s1;
-        let in0 = loop_contains(l, s0);
-        let in1 = loop_contains(l, s1);
+        let s0 = cx.blocks[h].s0;
+        let s1 = cx.blocks[h].s1;
+        let in0 = loop_contains(cx, l, s0);
+        let in1 = loop_contains(cx, l, s1);
         if in0 == in1 || s0 == s1 {
             return false;
         }
         let body = if in0 { s0 } else { s1 };
         let exit = if in0 { s1 } else { s0 };
-        if body == h || was_rotated(h) {
+        if body == h || was_rotated(cx, h) {
             return false;
         }
         let mut size = 0;
-        let mut v = BLOCKS[h].first;
+        let mut v = cx.blocks[h].first;
         while v != 0 {
-            if INSTS[v].op != Op::Phi {
+            if cx.insts[v].op != Op::Phi {
                 size += 1;
             }
-            v = INSTS[v].next;
+            v = cx.insts[v].next;
         }
         if size > ROTATE_MAX {
             return false;
         }
-        ir_enter(fi);
-        ROTATED.push(body);
+        ir_enter(cx, fi);
+        cx.rotated.push(body);
         // The header's values as the preheader sees them: a phi's operand for
         // the preheader, copies of the other instructions (INSTS[v].aux).
-        let pre_index = pred_index(h, pre);
-        v = BLOCKS[h].first;
+        let pre_index = pred_index(cx, h, pre);
+        v = cx.blocks[h].first;
         while v != 0 {
-            if INSTS[v].op == Op::Phi {
-                INSTS[v].aux = ir_arg(v, pre_index);
+            if cx.insts[v].op == Op::Phi {
+                cx.insts[v].aux = ir_arg(cx, v, pre_index);
             } else {
-                let nv = clone_inst(v);
-                for k in 0..ir_operand_count(nv) {
-                    let w = ir_operand(nv, k);
-                    if w != 0 && INSTS[w].block == h {
-                        ir_set_operand(nv, k, INSTS[w].aux);
+                let nv = clone_inst(cx, v);
+                for k in 0..ir_operand_count(cx, nv) {
+                    let w = ir_operand(cx, nv, k);
+                    if w != 0 && cx.insts[w].block == h {
+                        ir_set_operand(cx, nv, k, cx.insts[w].aux);
                     }
                 }
-                ir_append(pre, nv);
-                INSTS[v].aux = nv;
+                ir_append(cx, pre, nv);
+                cx.insts[v].aux = nv;
             }
-            v = INSTS[v].next;
+            v = cx.insts[v].next;
         }
-        let cond = BLOCKS[h].cond;
-        let pre_cond = if INSTS[cond].block == h { INSTS[cond].aux } else { cond };
+        let cond = cx.blocks[h].cond;
+        let pre_cond = if cx.insts[cond].block == h { cx.insts[cond].aux } else { cond };
         // The preheader branches like the header; the header loses it.
-        BLOCKS[pre].term = Term::Branch;
-        BLOCKS[pre].cond = pre_cond;
-        BLOCKS[pre].s0 = s0;
-        BLOCKS[pre].s1 = s1;
-        remove_pred(h, pre);
+        cx.blocks[pre].term = Term::Branch;
+        cx.blocks[pre].cond = pre_cond;
+        cx.blocks[pre].s0 = s0;
+        cx.blocks[pre].s1 = s1;
+        remove_pred(cx, h, pre);
         for t in 0..2 {
             let s = if t == 0 { body } else { exit };
-            let index = pred_index(s, h);
-            let first = LP_VALUES.count;
-            let mut phi = BLOCKS[s].first;
-            while phi != 0 && INSTS[phi].op == Op::Phi {
-                let w = ir_arg(phi, index);
-                LP_VALUES.push(if w != 0 && INSTS[w].block == h { INSTS[w].aux } else { w });
-                phi = INSTS[phi].next;
+            let index = pred_index(cx, s, h);
+            let first = cx.lp_values.count;
+            let mut phi = cx.blocks[s].first;
+            while phi != 0 && cx.insts[phi].op == Op::Phi {
+                let w = ir_arg(cx, phi, index);
+                cx.lp_values.push(if w != 0 && cx.insts[w].block == h { cx.insts[w].aux }
+                    else { w });
+                phi = cx.insts[phi].next;
             }
-            add_pred_values(s, pre, &LP_VALUES, first);
-            LP_VALUES.count = first;
+            add_pred_values(cx, s, pre, &cx.lp_values, first);
+            cx.lp_values.count = first;
         }
         // Uses of the header's values elsewhere read whichever definition
         // reaches them: the header's or the preheader's.
-        v = BLOCKS[h].first;
+        v = cx.blocks[h].first;
         while v != 0 {
-            INSTS[v].mark = 0;
-            v = INSTS[v].next;
+            cx.insts[v].mark = 0;
+            v = cx.insts[v].next;
         }
         for i in 0..IRFUNCS[fi].blocks.count {
             let b = IRFUNCS[fi].blocks.data[i];
             // (The header's own phis use values at the latch.)
-            if BLOCKS[b].removed != 0 {
+            if cx.blocks[b].removed != 0 {
                 continue;
             }
-            let mut u = BLOCKS[b].first;
+            let mut u = cx.blocks[b].first;
             while u != 0 {
-                for k in 0..ir_operand_count(u) {
-                    let w = ir_operand(u, k);
-                    if w != 0 && INSTS[w].block == h {
-                        let ub = use_block(u, k);
+                for k in 0..ir_operand_count(cx, u) {
+                    let w = ir_operand(cx, u, k);
+                    if w != 0 && cx.insts[w].block == h {
+                        let ub = use_block(cx, u, k);
                         if ub != h {
-                            ir_set_operand(u, k, ssa_read(rotate_var(w, h, pre), ub));
+                            ir_set_operand(cx, u, k, ssa_read(cx, rotate_var(cx, w, h, pre), ub));
                         }
                     }
                 }
-                u = INSTS[u].next;
+                u = cx.insts[u].next;
             }
-            let c = BLOCKS[b].cond;
-            if c != 0 && INSTS[c].block == h && b != pre && b != h {
-                BLOCKS[b].cond = ssa_read(rotate_var(c, h, pre), b);
+            let c = cx.blocks[b].cond;
+            if c != 0 && cx.insts[c].block == h && b != pre && b != h {
+                cx.blocks[b].cond = ssa_read(cx, rotate_var(cx, c, h, pre), b);
             }
         }
         true
@@ -846,15 +830,15 @@ fn rotate_loop(fi: i64, l: i64) -> bool {
 
 // The updater variable of header value w (defined in h, and as
 // INSTS[w].aux in the preheader).
-fn rotate_var(w: i64, h: i64, pre: i64) -> i64 {
+fn rotate_var(mut cx: *FnCtx, w: i64, h: i64, pre: i64) -> i64 {
     unsafe {
-        if INSTS[w].mark == 0 {
-            let var = updater_var(INSTS[w].ty);
-            INSTS[w].mark = var + 1;
-            ssa_write(var, h, w);
-            ssa_write(var, pre, INSTS[w].aux);
+        if cx.insts[w].mark == 0 {
+            let var = updater_var(cx, cx.insts[w].ty);
+            cx.insts[w].mark = var + 1;
+            ssa_write(cx, var, h, w);
+            ssa_write(cx, var, pre, cx.insts[w].aux);
         }
-        INSTS[w].mark - 1
+        cx.insts[w].mark - 1
     }
 }
 
@@ -862,36 +846,36 @@ fn rotate_var(w: i64, h: i64, pre: i64) -> i64 {
 // analysis serves them all: rotation makes no blocks and moves none
 // between loops (a rotated loop's preheader now branches, which no other
 // loop's rotation depends on).
-pub fn rotate_loops(fi: i64) -> bool {
+pub fn rotate_loops(mut cx: *FnCtx, fi: i64) -> bool {
     unsafe {
-        ROTATED.count = 0;
-        canonicalize_loops(fi);
+        cx.rotated.count = 0;
+        canonicalize_loops(cx, fi);
         let mut changed = false;
         // Innermost loops first: an outer loop's rotation then only adds phis
         // to inner loops already rotated. The phis an updater leaves trivial
         // go before the next rotation reads its header's phis.
         let mut depth = 0;
-        for l in 0..loop_count() {
-            if LP_DEPTH.data[l] > depth {
-                depth = LP_DEPTH.data[l];
+        for l in 0..loop_count(cx) {
+            if cx.lp_depth.data[l] > depth {
+                depth = cx.lp_depth.data[l];
             }
         }
         while depth >= 1 {
-            for l in 0..loop_count() {
-                if LP_DEPTH.data[l] == depth && loop_header(l) != IRFUNCS[fi].entry
-                    && rotate_loop(fi, l) {
+            for l in 0..loop_count(cx) {
+                if cx.lp_depth.data[l] == depth && loop_header(cx, l) != IRFUNCS[fi].entry
+                    && rotate_loop(cx, fi, l) {
                     changed = true;
-                    resolve_all(fi);
-                    remove_trivial_phis(fi);
+                    resolve_all(cx, fi);
+                    remove_trivial_phis(cx, fi);
                 }
             }
             depth -= 1;
         }
         if changed {
-            resolve_all(fi);
-            verify_func(fi, c"loop rotation");
+            resolve_all(cx, fi);
+            verify_func(cx, fi, c"loop rotation");
             // The old headers now have their latch as only predecessor.
-            simplify_cfg(fi);
+            simplify_cfg(cx, fi);
         }
         changed
     }

@@ -31,6 +31,7 @@ $ tachyonc main.tach -o rpn && ./rpn < input.txt
 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 ...: out of memory: the line is longer than 160 bytes
 7 x *: unknown word 'x'
 9 lines, 5 failed; 416 of 512 bytes in use, room for 32 numbers
+ok: built rpn
 ```
 
 Five lines fail, two of them for want of memory: 32 numbers fit on the

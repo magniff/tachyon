@@ -4,7 +4,7 @@
 // library calls.
 
 use crate::back::isel::{
-    ISEL_USES, coverable, isel_const, isel_count_uses, isel_release, isel_retain, isel_set_operands,
+    coverable, isel_const, isel_count_uses, isel_release, isel_retain, isel_set_operands,
 };
 use crate::back::mc_arm64::ops::{is_logical_imm, ma_int_imm_ok};
 use crate::base::{streq, sym_name};
@@ -14,7 +14,8 @@ use crate::front::types::{
 };
 use crate::gen0::target::{LINK_NAMES, log2};
 use crate::gen0::x86_64::fits_i32;
-use crate::middle::ir::{BLOCKS, Cond, INSTS, IRFUNCS, Term, ir_arg, ir_set_arg};
+use crate::middle::ctx::FnCtx;
+use crate::middle::ir::{Cond, IRFUNCS, Term, ir_arg, ir_set_arg};
 use crate::middle::ir::Op::{
     Add, And, Call, Cmp, Const, FMath, Lea, Load, LoadX, MAdd, MSub, Mul, Or, Select, ShOp, Shl,
     Shr, Slot, Store, StoreX, Sub, Test, Ubfx, Xor,
@@ -23,20 +24,20 @@ use crate::middle::opt::resolve_all;
 
 // ---- Tiling ----
 
-pub fn isel_function(fi: i64) {
-    resolve_all(fi);
-    isel_count_uses(fi);
+pub fn isel_function(mut cx: *FnCtx, fi: i64) {
+    resolve_all(cx, fi);
+    isel_count_uses(cx, fi);
     unsafe {
         for b in IRFUNCS[fi].blocks.items() {
-            if BLOCKS[b].removed != 0 {
+            if cx.blocks[b].removed != 0 {
                 continue;
             }
-            isel_branch(b);
-            let mut v = BLOCKS[b].last;
+            isel_branch(cx, b);
+            let mut v = cx.blocks[b].last;
             while v != 0 {
-                let prev = INSTS[v].prev;
-                if ISEL_USES[v] > 0 || INSTS[v].op.has_side_effect() {
-                    isel_inst(v);
+                let prev = cx.insts[v].prev;
+                if cx.isel_uses[v] > 0 || cx.insts[v].op.has_side_effect() {
+                    isel_inst(cx, v);
                 }
                 v = prev;
             }
@@ -44,32 +45,32 @@ pub fn isel_function(fi: i64) {
     }
 }
 
-fn isel_inst(v: i64) {
+fn isel_inst(mut cx: *FnCtx, v: i64) {
     unsafe {
-        let op = INSTS[v].op;
+        let op = cx.insts[v].op;
         if op == Call {
-            isel_libcall(v);
+            isel_libcall(cx, v);
         } else if op == Load || op == Store {
-            isel_address(v);
+            isel_address(cx, v);
         } else if op == Select {
-            isel_select_test(v);
-            isel_select_increment(v);
-        } else if is_float(INSTS[v].ty) {
+            isel_select_test(cx, v);
+            isel_select_increment(cx, v);
+        } else if is_float(cx.insts[v].ty) {
             return;
         } else if X86 {
             if op == Add || op == Sub {
-                isel_lea(v);
+                isel_lea(cx, v);
             }
         } else if op == Add || op == Sub {
-            if !isel_madd(v) {
-                isel_shop(v);
+            if !isel_madd(cx, v) {
+                isel_shop(cx, v);
             }
         } else if op == And {
-            if !isel_ubfx(v) {
-                isel_shop(v);
+            if !isel_ubfx(cx, v) {
+                isel_shop(cx, v);
             }
         } else if op == Or || op == Xor {
-            isel_shop(v);
+            isel_shop(cx, v);
         }
     }
 }
@@ -80,13 +81,13 @@ fn is_wide_int(ty: i64) -> bool {
 }
 
 // load/store of base + (index << s) (or base + index).
-fn isel_address(v: i64) {
+fn isel_address(mut cx: *FnCtx, v: i64) {
     unsafe {
-        let addr = INSTS[v].a;
-        let store = INSTS[v].op == Store;
-        let ty = if store { INSTS[v].imm2 } else { INSTS[v].ty };
-        let offset = INSTS[v].imm;
-        if !coverable(addr, Add, v) || !is_wide_int(INSTS[addr].ty) {
+        let addr = cx.insts[v].a;
+        let store = cx.insts[v].op == Store;
+        let ty = if store { cx.insts[v].imm2 } else { cx.insts[v].ty };
+        let offset = cx.insts[v].imm;
+        if !coverable(cx, addr, Add, v) || !is_wide_int(cx.insts[addr].ty) {
             return;
         }
         if !X86 && offset != 0 {
@@ -101,136 +102,140 @@ fn isel_address(v: i64) {
         let mut chosen_scale = -1;
         // A shifted index first, then a plain one.
         for side in 0..2 {
-            let base = if side == 0 { INSTS[addr].a } else { INSTS[addr].b };
-            let index = if side == 0 { INSTS[addr].b } else { INSTS[addr].a };
+            let base = if side == 0 { cx.insts[addr].a } else { cx.insts[addr].b };
+            let index = if side == 0 { cx.insts[addr].b } else { cx.insts[addr].a };
             let mut k = 0;
-            if chosen_scale < 0 && coverable(index, Shl, addr) && is_wide_int(INSTS[index].ty)
-                && isel_const(INSTS[index].b, &k) && base_ok(base) {
+            if chosen_scale < 0 && coverable(cx, index, Shl, addr)
+                && is_wide_int(cx.insts[index].ty)
+                && isel_const(cx, cx.insts[index].b, &mut k) && base_ok(cx, base) {
                 let s = k & 63;
                 if (X86 && s <= 3) || (!X86 && (s == 0 || (1 << s as u64) == size)) {
                     chosen_base = base;
-                    chosen_index = INSTS[index].a;
+                    chosen_index = cx.insts[index].a;
                     chosen_scale = s;
                 }
             }
         }
         if chosen_scale < 0 {
-            let base = INSTS[addr].a;
-            let index = INSTS[addr].b;
-            if INSTS[index].op.is_remat() && !INSTS[base].op.is_remat() {
+            let base = cx.insts[addr].a;
+            let index = cx.insts[addr].b;
+            if cx.insts[index].op.is_remat() && !cx.insts[base].op.is_remat() {
                 // A constant or an address is the base (a slot from %rsp).
-                if !base_ok(index) {
+                if !base_ok(cx, index) {
                     return;
                 }
                 chosen_base = index;
                 chosen_index = base;
             } else {
-                if !base_ok(base) {
+                if !base_ok(cx, base) {
                     return;
                 }
                 chosen_base = base;
                 chosen_index = index;
             }
-            if INSTS[chosen_index].op == Const {
+            if cx.insts[chosen_index].op == Const {
                 // base + constant: instcombine folds those into the offset.
                 return;
             }
             chosen_scale = 0;
         }
         if store {
-            let value = INSTS[v].b;
-            INSTS[v].op = StoreX;
-            isel_set_operands(v, chosen_base, chosen_index, value);
+            let value = cx.insts[v].b;
+            cx.insts[v].op = StoreX;
+            isel_set_operands(cx, v, chosen_base, chosen_index, value);
         } else {
-            INSTS[v].op = LoadX;
-            isel_set_operands(v, chosen_base, chosen_index, 0);
+            cx.insts[v].op = LoadX;
+            isel_set_operands(cx, v, chosen_base, chosen_index, 0);
         }
-        INSTS[v].scale = chosen_scale;
+        cx.insts[v].scale = chosen_scale;
     }
 }
 
 // Whether `base` may be the base of an indexed access: a frame slot only
 // on x86-64 (from %rsp, the slot's offset in the displacement).
-fn base_ok(base: i64) -> bool {
-    unsafe { base != 0 && (X86 || INSTS[base].op != Slot) }
+fn base_ok(mut cx: *FnCtx, base: i64) -> bool {
+    unsafe { base != 0 && (X86 || cx.insts[base].op != Slot) }
 }
 
 // x86-64: a + (b << s), a + b, a + k, a - k into any register.
-fn isel_lea(v: i64) {
+fn isel_lea(mut cx: *FnCtx, v: i64) {
     unsafe {
-        let ty = INSTS[v].ty;
+        let ty = cx.insts[v].ty;
         if !is_wide_int(ty) {
             return;
         }
-        let a = INSTS[v].a;
-        let b = INSTS[v].b;
+        let a = cx.insts[v].a;
+        let b = cx.insts[v].b;
         let mut k = 0;
-        if isel_const(b, &k) {
-            let disp = if INSTS[v].op == Sub { 0 - k } else { k };
-            if !fits_i32(k) || !fits_i32(disp) || INSTS[a].op.is_remat() {
+        if isel_const(cx, b, &mut k) {
+            let disp = if cx.insts[v].op == Sub { 0 - k } else { k };
+            if !fits_i32(k) || !fits_i32(disp) || cx.insts[a].op.is_remat() {
                 return;
             }
-            INSTS[v].op = Lea;
-            INSTS[v].imm = disp;
-            INSTS[v].scale = 0;
+            cx.insts[v].op = Lea;
+            cx.insts[v].imm = disp;
+            cx.insts[v].scale = 0;
             // (x * 3) + k = k(x, x, 2), and (x + y) + k = k(x, y).
             let mut m = 0;
-            if coverable(a, Mul, v) && INSTS[a].ty == ty && isel_const(INSTS[a].b, &m)
+            if coverable(cx, a, Mul, v) && cx.insts[a].ty == ty
+                && isel_const(cx, cx.insts[a].b, &mut m)
                 && (m == 3 || m == 5 || m == 9) {
-                INSTS[v].scale = log2(m - 1);
-                isel_set_operands(v, INSTS[a].a, INSTS[a].a, 0);
+                cx.insts[v].scale = log2(m - 1);
+                isel_set_operands(cx, v, cx.insts[a].a, cx.insts[a].a, 0);
                 return;
             }
-            if coverable(a, Add, v) && INSTS[a].ty == ty && !INSTS[INSTS[a].a].op.is_remat()
-                && !INSTS[INSTS[a].b].op.is_remat() {
-                isel_set_operands(v, INSTS[a].a, INSTS[a].b, 0);
+            if coverable(cx, a, Add, v) && cx.insts[a].ty == ty
+                && !cx.insts[cx.insts[a].a].op.is_remat()
+                && !cx.insts[cx.insts[a].b].op.is_remat() {
+                isel_set_operands(cx, v, cx.insts[a].a, cx.insts[a].b, 0);
                 return;
             }
-            isel_set_operands(v, a, 0, 0);
+            isel_set_operands(cx, v, a, 0, 0);
             return;
         }
-        if INSTS[v].op != Add || INSTS[a].op == Const || INSTS[b].op == Const {
+        if cx.insts[v].op != Add || cx.insts[a].op == Const || cx.insts[b].op == Const {
             return;
         }
         for side in 0..2 {
             let base = if side == 0 { a } else { b };
             let index = if side == 0 { b } else { a };
             let mut s = 0;
-            if coverable(index, Shl, v) && INSTS[index].ty == ty && isel_const(INSTS[index].b, &s)
-                && (s & 63) <= 3 && INSTS[base].op != Slot {
-                INSTS[v].op = Lea;
-                INSTS[v].imm = 0;
-                INSTS[v].scale = s & 63;
-                isel_set_operands(v, base, INSTS[index].a, 0);
+            if coverable(cx, index, Shl, v) && cx.insts[index].ty == ty
+                && isel_const(cx, cx.insts[index].b, &mut s)
+                && (s & 63) <= 3 && cx.insts[base].op != Slot {
+                cx.insts[v].op = Lea;
+                cx.insts[v].imm = 0;
+                cx.insts[v].scale = s & 63;
+                isel_set_operands(cx, v, base, cx.insts[index].a, 0);
                 return;
             }
         }
-        if INSTS[a].op == Slot || INSTS[b].op == Slot {
+        if cx.insts[a].op == Slot || cx.insts[b].op == Slot {
             return;
         }
-        INSTS[v].op = Lea;
-        INSTS[v].imm = 0;
-        INSTS[v].scale = 0;
-        isel_set_operands(v, a, b, 0);
+        cx.insts[v].op = Lea;
+        cx.insts[v].imm = 0;
+        cx.insts[v].scale = 0;
+        isel_set_operands(cx, v, a, b, 0);
     }
 }
 
 // AArch64: c + a * b, c - a * b.
-fn isel_madd(v: i64) -> bool {
+fn isel_madd(mut cx: *FnCtx, v: i64) -> bool {
     unsafe {
-        let ty = INSTS[v].ty;
-        let sub = INSTS[v].op == Sub;
+        let ty = cx.insts[v].ty;
+        let sub = cx.insts[v].op == Sub;
         for side in 0..2 {
             if sub && side == 1 {
                 break;
             }
-            let m = if side == 0 { INSTS[v].b } else { INSTS[v].a };
-            let other = if side == 0 { INSTS[v].a } else { INSTS[v].b };
+            let m = if side == 0 { cx.insts[v].b } else { cx.insts[v].a };
+            let other = if side == 0 { cx.insts[v].a } else { cx.insts[v].b };
             let mut k = 0;
-            if coverable(m, Mul, v) && INSTS[m].ty == ty && INSTS[other].op != Const
-                && !(isel_const(INSTS[m].b, &k) && ma_int_imm_ok(Mul, k)) {
-                INSTS[v].op = if sub { MSub } else { MAdd };
-                isel_set_operands(v, INSTS[m].a, INSTS[m].b, other);
+            if coverable(cx, m, Mul, v) && cx.insts[m].ty == ty && cx.insts[other].op != Const
+                && !(isel_const(cx, cx.insts[m].b, &mut k) && ma_int_imm_ok(Mul, k)) {
+                cx.insts[v].op = if sub { MSub } else { MAdd };
+                isel_set_operands(cx, v, cx.insts[m].a, cx.insts[m].b, other);
                 return true;
             }
         }
@@ -239,30 +244,30 @@ fn isel_madd(v: i64) -> bool {
 }
 
 // AArch64: x op (y sh k).
-fn isel_shop(v: i64) -> bool {
+fn isel_shop(mut cx: *FnCtx, v: i64) -> bool {
     unsafe {
-        let ty = INSTS[v].ty;
-        let op = INSTS[v].op;
+        let ty = cx.insts[v].ty;
+        let op = cx.insts[v].op;
         let commutative = op != Sub;
         for side in 0..2 {
             if !commutative && side == 1 {
                 break;
             }
-            let s = if side == 0 { INSTS[v].b } else { INSTS[v].a };
-            let other = if side == 0 { INSTS[v].a } else { INSTS[v].b };
-            if other == 0 || INSTS[other].op == Const || s == 0 {
+            let s = if side == 0 { cx.insts[v].b } else { cx.insts[v].a };
+            let other = if side == 0 { cx.insts[v].a } else { cx.insts[v].b };
+            if other == 0 || cx.insts[other].op == Const || s == 0 {
                 continue;
             }
             let mut k = 0;
-            let sop = INSTS[s].op;
-            if (sop == Shl || sop == Shr) && coverable(s, sop, v) && INSTS[s].ty == ty
-                && isel_const(INSTS[s].b, &k) {
+            let sop = cx.insts[s].op;
+            if (sop == Shl || sop == Shr) && coverable(cx, s, sop, v) && cx.insts[s].ty == ty
+                && isel_const(cx, cx.insts[s].b, &mut k) {
                 let amount = k & (if int_bits(ty) == 64 { 63 } else { 31 });
                 let kind = if sop == Shl { 0 } else if is_signed(ty) { 2 } else { 1 };
-                INSTS[v].op = ShOp;
-                INSTS[v].imm = amount;
-                INSTS[v].imm2 = 4 * (op as i64) + kind;
-                isel_set_operands(v, other, INSTS[s].a, 0);
+                cx.insts[v].op = ShOp;
+                cx.insts[v].imm = amount;
+                cx.insts[v].imm2 = 4 * (op as i64) + kind;
+                isel_set_operands(cx, v, other, cx.insts[s].a, 0);
                 return true;
             }
         }
@@ -271,14 +276,15 @@ fn isel_shop(v: i64) -> bool {
 }
 
 // AArch64: (x >> k) & (2^n - 1), the field within the type.
-fn isel_ubfx(v: i64) -> bool {
+fn isel_ubfx(mut cx: *FnCtx, v: i64) -> bool {
     unsafe {
-        let ty = INSTS[v].ty;
-        let s = INSTS[v].a;
+        let ty = cx.insts[v].ty;
+        let s = cx.insts[v].a;
         let mut mask = 0;
         let mut k = 0;
-        if !isel_const(INSTS[v].b, &mask) || mask <= 0 || !coverable(s, Shr, v) || INSTS[s].ty != ty
-            || !isel_const(INSTS[s].b, &k) {
+        if !isel_const(cx, cx.insts[v].b, &mut mask) || mask <= 0 || !coverable(cx, s, Shr, v)
+            || cx.insts[s].ty != ty
+            || !isel_const(cx, cx.insts[s].b, &mut k) {
             return false;
         }
         if (mask & (mask + 1)) != 0 {
@@ -289,10 +295,10 @@ fn isel_ubfx(v: i64) -> bool {
         if n < 1 || amount + n > int_bits(ty) {
             return false;
         }
-        INSTS[v].op = Ubfx;
-        INSTS[v].imm = amount;
-        INSTS[v].imm2 = n;
-        isel_set_operands(v, INSTS[s].a, 0, 0);
+        cx.insts[v].op = Ubfx;
+        cx.insts[v].imm = amount;
+        cx.insts[v].imm2 = n;
+        isel_set_operands(cx, v, cx.insts[s].a, 0, 0);
         true
     }
 }
@@ -303,94 +309,95 @@ fn test_imm_ok(mask: i64) -> bool {
 }
 
 // The branch ending block b on (x & y) == 0 or != 0: a test.
-fn isel_branch(b: i64) {
+fn isel_branch(mut cx: *FnCtx, b: i64) {
     unsafe {
-        let c = BLOCKS[b].cond;
-        if BLOCKS[b].term != Term::Branch || BLOCKS[b].s0 == BLOCKS[b].s1 || c == 0
-            || INSTS[c].op != Cmp || ISEL_USES[c] != 1
-            || INSTS[c].block != b || INSTS[c].next != 0 || is_float(INSTS[c].imm2) {
+        let c = cx.blocks[b].cond;
+        if cx.blocks[b].term != Term::Branch || cx.blocks[b].s0 == cx.blocks[b].s1 || c == 0
+            || cx.insts[c].op != Cmp || cx.isel_uses[c] != 1
+            || cx.insts[c].block != b || cx.insts[c].next != 0 || is_float(cx.insts[c].imm2) {
             return;
         }
-        let op = INSTS[c].cond;
+        let op = cx.insts[c].cond;
         let mut zero = 1;
-        if (op != Cond::Eq && op != Cond::Ne) || !isel_const(INSTS[c].b, &zero) || zero != 0 {
+        if (op != Cond::Eq && op != Cond::Ne) || !isel_const(cx, cx.insts[c].b, &mut zero)
+            || zero != 0 {
             return;
         }
-        let and = INSTS[c].a;
-        if !coverable(and, And, c) {
+        let and = cx.insts[c].a;
+        if !coverable(cx, and, And, c) {
             return;
         }
         let mut mask = 0;
-        INSTS[c].op = Test;
-        if isel_const(INSTS[and].b, &mask) && test_imm_ok(mask) {
-            INSTS[c].imm = mask;
-            isel_set_operands(c, INSTS[and].a, 0, 0);
+        cx.insts[c].op = Test;
+        if isel_const(cx, cx.insts[and].b, &mut mask) && test_imm_ok(mask) {
+            cx.insts[c].imm = mask;
+            isel_set_operands(cx, c, cx.insts[and].a, 0, 0);
         } else {
-            isel_set_operands(c, INSTS[and].a, INSTS[and].b, 0);
+            isel_set_operands(cx, c, cx.insts[and].a, cx.insts[and].b, 0);
         }
     }
 }
 
 // A select on (x & y) == 0 or != 0 tests instead of comparing.
-fn isel_select_test(v: i64) {
+fn isel_select_test(mut cx: *FnCtx, v: i64) {
     unsafe {
-        let lhs = ir_arg(v, 0);
-        let op = INSTS[v].cond;
-        if INSTS[v].scale != 0 || ir_arg(v, 1) != 0 || INSTS[v].imm != 0
+        let lhs = ir_arg(cx, v, 0);
+        let op = cx.insts[v].cond;
+        if cx.insts[v].scale != 0 || ir_arg(cx, v, 1) != 0 || cx.insts[v].imm != 0
             || (op != Cond::Eq && op != Cond::Ne)
-            || !coverable(lhs, And, v) {
+            || !coverable(cx, lhs, And, v) {
             return;
         }
         let mut mask = 0;
-        INSTS[v].scale = 1;
-        isel_retain(INSTS[lhs].a);
-        ir_set_arg(v, 0, INSTS[lhs].a);
-        if isel_const(INSTS[lhs].b, &mask) && test_imm_ok(mask) {
-            INSTS[v].imm = mask;
+        cx.insts[v].scale = 1;
+        isel_retain(cx, cx.insts[lhs].a);
+        ir_set_arg(cx, v, 0, cx.insts[lhs].a);
+        if isel_const(cx, cx.insts[lhs].b, &mut mask) && test_imm_ok(mask) {
+            cx.insts[v].imm = mask;
         } else {
-            isel_retain(INSTS[lhs].b);
-            ir_set_arg(v, 1, INSTS[lhs].b);
+            isel_retain(cx, cx.insts[lhs].b);
+            ir_set_arg(cx, v, 1, cx.insts[lhs].b);
         }
-        isel_release(lhs);
+        isel_release(cx, lhs);
     }
 }
 
 // AArch64: a select of an increment adds it itself (csinc): c ? a : b + 1;
 // for c ? a + 1 : b, the condition is inverted (integer comparisons and
 // tests only: a negated float comparison is not the opposite one).
-fn isel_select_increment(v: i64) {
+fn isel_select_increment(mut cx: *FnCtx, v: i64) {
     unsafe {
         // 64-bit integers only: csinc adds without wrapping at a narrower width.
-        if X86 || !is_wide_int(INSTS[v].ty) || (INSTS[v].scale & 2) != 0 {
+        if X86 || !is_wide_int(cx.insts[v].ty) || (cx.insts[v].scale & 2) != 0 {
             return;
         }
         let mut one = 0;
-        let other = INSTS[v].b;
-        if coverable(other, Add, v) && INSTS[other].ty == INSTS[v].ty
-            && isel_const(INSTS[other].b, &one)
+        let other = cx.insts[v].b;
+        if coverable(cx, other, Add, v) && cx.insts[other].ty == cx.insts[v].ty
+            && isel_const(cx, cx.insts[other].b, &mut one)
             && one == 1 {
-            INSTS[v].scale = INSTS[v].scale | 2;
-            isel_set_operands(v, INSTS[v].a, INSTS[other].a, 0);
+            cx.insts[v].scale = cx.insts[v].scale | 2;
+            isel_set_operands(cx, v, cx.insts[v].a, cx.insts[other].a, 0);
             return;
         }
-        let then = INSTS[v].a;
-        let invertible = (INSTS[v].scale & 1) == 1 || !is_float(INSTS[v].imm2);
-        if invertible && coverable(then, Add, v) && INSTS[then].ty == INSTS[v].ty
-            && isel_const(INSTS[then].b, &one) && one == 1 {
-            INSTS[v].scale = INSTS[v].scale | 2;
-            INSTS[v].cond = INSTS[v].cond.negate();
-            isel_set_operands(v, INSTS[v].b, INSTS[then].a, 0);
+        let then = cx.insts[v].a;
+        let invertible = (cx.insts[v].scale & 1) == 1 || !is_float(cx.insts[v].imm2);
+        if invertible && coverable(cx, then, Add, v) && cx.insts[then].ty == cx.insts[v].ty
+            && isel_const(cx, cx.insts[then].b, &mut one) && one == 1 {
+            cx.insts[v].scale = cx.insts[v].scale | 2;
+            cx.insts[v].cond = cx.insts[v].cond.negate();
+            isel_set_operands(cx, v, cx.insts[v].b, cx.insts[then].a, 0);
         }
     }
 }
 
 // A call of one of the C library's math functions that is one instruction
 // (of a function declared with its C signature, under its own name).
-fn isel_libcall(v: i64) {
+fn isel_libcall(mut cx: *FnCtx, v: i64) {
     unsafe {
-        let f = INSTS[v].imm;
-        if !FNS[f].is_extern || FNS[f].variadic || FNS[f].param_count != 1 || INSTS[v].nargs != 1
-            || INSTS[v].c != 0 {
+        let f = cx.insts[v].imm;
+        if !FNS[f].is_extern || FNS[f].variadic || FNS[f].param_count != 1 || cx.insts[v].nargs != 1
+            || cx.insts[v].c != 0 {
             return;
         }
         let ty = FNS[f].ret;
@@ -419,13 +426,13 @@ fn isel_libcall(v: i64) {
         if kind < 0 || (kind == 0 && ELF) || (kind > 0 && X86) {
             return;
         }
-        let arg = ir_arg(v, 0);
-        INSTS[v].op = FMath;
-        INSTS[v].a = arg;
-        INSTS[v].b = 0;
-        INSTS[v].c = 0;
-        INSTS[v].imm = kind;
-        INSTS[v].args = 0;
-        INSTS[v].nargs = 0;
+        let arg = ir_arg(cx, v, 0);
+        cx.insts[v].op = FMath;
+        cx.insts[v].a = arg;
+        cx.insts[v].b = 0;
+        cx.insts[v].c = 0;
+        cx.insts[v].imm = kind;
+        cx.insts[v].args = 0;
+        cx.insts[v].nargs = 0;
     }
 }

@@ -19,7 +19,7 @@ fn total(v: Vec<i64>) -> i64 {
 }
 
 fn add(v: &mut Vec<i64>, x: i64) {
-    v.push(x);
+    unsafe { v.push(x); }
 }
 
 fn fill(s: [i64]) {

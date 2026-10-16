@@ -19,8 +19,9 @@ use crate::base::{
 use crate::front::contracts::sites::{SITE_COL, SITE_FILE, SITE_LINE, site_count};
 use crate::front::types::FNS;
 use crate::gen0::target::{PANIC_RANGE_UNSIGNED, kind_is_enum, rt_panic_sym};
+use crate::middle::ctx::{FnCtx, main_cx};
 use crate::middle::inline::FN_LIVE;
-use crate::middle::ir::{ARGS, BLOCKS, INSTS, IRF, IRFUNCS, IRFUNC_COUNT, Op, ir_enter};
+use crate::middle::ir::{IRFUNCS, IRFUNC_COUNT, Op, ir_enter};
 
 // `--print-checks` (0: off; "": every function; else the name a function's
 // display must have, or start with followed by `::`).
@@ -34,12 +35,12 @@ extern "C" {
 }
 
 // A check made in the IR function being lowered (rt_panic_call).
-pub fn note_check(site: i64, kind: i64) {
+pub fn note_check(fi: i64, site: i64, kind: i64) {
     unsafe {
         if PRINT_CHECKS == 0 as *u8 {
             return;
         }
-        NOTED.push(IRF);
+        NOTED.push(fi);
         NOTED.push(site);
         NOTED.push(kind);
     }
@@ -50,20 +51,35 @@ static mut REMOVED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
 // Block b, a branch's successor that the range analysis found never taken:
 // the check failing there, if it is one, noted as removed.
-pub fn note_removed(b: i64) {
+pub fn note_removed(mut cx: *FnCtx, b: i64) {
     unsafe {
-        let mut v = BLOCKS[b].first;
+        let mut v = cx.blocks[b].first;
         while v != 0 {
-            if INSTS[v].op == Op::CallC && INSTS[v].imm == rt_panic_sym() && INSTS[v].nargs >= 5 {
-                let k = ARGS.data[INSTS[v].args];
-                let s = ARGS.data[INSTS[v].args + 4];
-                REMOVED.push(IRF);
-                REMOVED.push(if INSTS[s].op == Op::Const { INSTS[s].imm } else { 0 });
-                REMOVED.push(if INSTS[k].op == Op::Const { INSTS[k].imm } else { -1 });
+            if cx.insts[v].op == Op::CallC && cx.insts[v].imm == rt_panic_sym()
+                && cx.insts[v].nargs >= 5 {
+                let k = cx.args.data[cx.insts[v].args];
+                let s = cx.args.data[cx.insts[v].args + 4];
+                REMOVED.push(cx.irf);
+                REMOVED.push(front_number(cx, s, 0));
+                REMOVED.push(front_number(cx, k, -1));
                 return;
             }
-            v = INSTS[v].next;
+            v = cx.insts[v].next;
         }
+    }
+}
+
+// The front end's kind or site that value v of a panic call is (a
+// constant, or an RTID value since 0.18.1), or `none`.
+fn front_number(mut cx: *FnCtx, v: i64, none: i64) -> i64 {
+    unsafe {
+        if cx.insts[v].op == Op::Const {
+            return cx.insts[v].imm;
+        }
+        if cx.insts[v].op == Op::RtId {
+            return crate::middle::ir::rtid_value(cx.insts[v].imm);
+        }
+        none
     }
 }
 
@@ -121,6 +137,7 @@ fn put_site(out: i64, site: i64) {
 // optimize_program, before the code is emitted).
 pub fn print_checks() {
     unsafe {
+        let cx = main_cx();
         let out = buf_new();
         let mut left = 0;
         let mut removed = 0;
@@ -130,27 +147,27 @@ pub fn print_checks() {
             if FN_LIVE[fi] == 0 || !wanted(f) {
                 continue;
             }
-            ir_enter(fi);
+            ir_enter(cx, fi);
             seen.count = 0;
             for i in 0..IRFUNCS[fi].blocks.count {
                 let b = IRFUNCS[fi].blocks.data[i];
-                if BLOCKS[b].removed != 0 {
+                if cx.blocks[b].removed != 0 {
                     continue;
                 }
-                let mut v = BLOCKS[b].first;
+                let mut v = cx.blocks[b].first;
                 while v != 0 {
-                    if INSTS[v].op == Op::CallC && INSTS[v].imm == rt_panic_sym()
-                        && INSTS[v].nargs >= 5 {
-                        let k = ARGS.data[INSTS[v].args];
-                        let s = ARGS.data[INSTS[v].args + 4];
-                        let kind = if INSTS[k].op == Op::Const { INSTS[k].imm } else { -1 };
-                        let site = if INSTS[s].op == Op::Const { INSTS[s].imm } else { 0 };
+                    if cx.insts[v].op == Op::CallC && cx.insts[v].imm == rt_panic_sym()
+                        && cx.insts[v].nargs >= 5 {
+                        let k = cx.args.data[cx.insts[v].args];
+                        let s = cx.args.data[cx.insts[v].args + 4];
+                        let kind = front_number(cx, k, -1);
+                        let site = front_number(cx, s, 0);
                         put_site(out, site);
                         buf_fmt_fn(out, f, kind_name(kind), c"left");
                         seen.push(site);
                         left += 1;
                     }
-                    v = INSTS[v].next;
+                    v = cx.insts[v].next;
                 }
             }
             // Removed by the range analysis (here, or in a function inlined

@@ -49,8 +49,84 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.16.0 | `v0.16.0` | 0.15.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | effects and explicit allocation: inferred effect sets (`alloc(A)`, `io`, `global`, `panic`, `diverge`, `unsafe`) shown by `query effects` (`--why`, `--has`), `#[pure]`/`#[no_alloc]`/`#[no_io]`/`#[no_panic]`/`#[effects(..)]` and `effects(..)` bounds checked transitively (std's `Eq`/`Ord`/`Hash` pure), `--verify-effects`; allocation explicit (`fn main(gpa: Gpa)`, `Vec::new_in(gpa)`, `fix --only alloc016` moves 0.15 code), the `Allocator` trait, `Gpa`, arenas, `arena_scope`, `FixedBuf`, a `Fmt` that never allocates; `#[sealed]` std types, `#[scoped]` arenas; `--check-alloc` (use after free, double free, leaks, arena resets and scopes); pure calls numbered and hoisted, arena allocation without a call; link inputs on the command line (`x.c`, `-l`, `-L`); examples in folders with READMEs, C interop and language tours; the compiler's source on 0.15's features; compiler tasks in the agent eval |
 | 0.17.0 | `v0.17.0` | 0.16.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | memory safety by mutable value semantics: owned values (`Vec`, `Buf`, `HashMap`, `Drop` types, what holds one) move and are dropped at the end of their scope (`Drop`, generated drop glue, drop flags, `.clone()` explicit); references `&T`/`&mut T` and slices split into read-only `[T]` and exclusive `&mut [T]`, second-class: views checked so none outlives or is invalidated under what it views, with inferred view summaries (`views(..)`, `stores(..)`, `#[views]` pins), two-phase receivers and reborrows, no lifetime annotations; `--values=error` the default (`warn`, `report`, `off` for 0.17 only); noalias and read-only facts from reference parameters, NRVO, moves elided in loops; std on values (`Drop` for the containers, `&Self`/`&mut Self` receivers, sorts on `&mut [T]`, `Eq`/`Ord`/`Hash` on `&Self`); `fix --values` and the corpus migrated; `query own`, `query views`, `explain own.*`, tests/own-try; familiar forms (`&mut x`, `v[i]` on Vec and Buf, indexing through a pointer by its type, `p.0`, `len()`, `panic`/`unreachable`, a larger prelude, module paths in code resolved as `use` lines, struct-like enum variants); `fix --suggested`, the `&f` diagnostic; `--trace`, `probe`, `reduce`, `tachyonc test`, `guide debug`; compile speed (per-function IR and pipeline, -O1 leaf inlining, f-strings written in place: the compiler compiles itself 14% faster at -O0, 37% at -O2, in a third less memory) |
 | 0.18.0 | `v0.18.0` | 0.17.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | contracts and verification in the language: `requires`/`ensures` (`result`, `old(..)`, `else` messages, `debug` clauses), checked at run time, a requires at the call so the caller is blamed, pure conditions (`contract.effect`); std's own clauses (`unwrap`, `Vec::get`, ...); `assert`, `assert_eq`, `assert_ne`, `debug_assert`; every run-time check one line `FILE:LINE:COL: message` with the condition and its values; `query checks` (the checks the optimizer proved away and those left), `--no-positions`; `#[test]`, `#[cfg(test)]` modules, `assert_snapshot`, `#[property]` with inputs generated from the types and shrunk, contracts tested as properties, `#[fuzz]` with block coverage (`--coverage`, `tachyonc fuzz`), leaks failing a test; `tachyonc test` builds at -O0 and -O2 and compares them; `reduce` over programs (`--differs`, `--fails`, `--test`); `type X = distinct T`, `std::NonNull<T>` with the null niche (`Option<NonNull<T>>` is a pointer, FFI-safe, `_Nonnull` imported) and a checked `as NonNull<T>`; std's `Display`, `Debug`, `Iterator`, `Clone` on references, `fix --values` over traits; the agent eval's `+debrief` |
+| 0.18.1 | `v0.18.1` | 0.18.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | two use-after-free holes in safe code closed (a changed copy of a borrowed owned value; a reference into a Vec across a push); functions compiled in parallel (`-j N`, the same bytes at any N; the -O2 self-compile 2.13 s to 0.72 s at -j8) and incremental rebuilds from a code cache (a one-function edit 0.53 s, byte-identical to clean); V4: every `*T` raw, borrowing only `&`/`&mut`, the compiler and std on references; contracts in generated code (range fixes, `x % n` ranges, entry facts: the contracts bench 25% fewer instructions than without clauses); BinaryHeap/MinHeap, binding modes on references, `&f()` temporaries, let-else and the 0.18 eval's polish; a valgrind row and threads/incremental steps in the gate, a lock on the bootstrap cache |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.18.1
+
+The compiler on threads, incremental rebuilds, V4 and the 0.18 eval's
+polish; docs/optimizer.md, "0.18.1: threads", "0.18.1: incremental
+rebuilds", "Contracts and generated code: the evidence";
+docs/design/contracts-verification.md §4.3, §4.4 and T7/T8's notes.
+
+- **Two use-after-free holes in safe code, closed** (both accepted by
+  0.18.0):
+  - changing a bitwise copy of an owned value the original still points
+    to: `match *e { E::B(v) => v.push(..) }`, `let w = v.get(i);
+    w.push(..)`, `for w in vv { w.push(..) }`, or assigning such a
+    binding, freed or grew the buffer behind the original's back. It is
+    own.readonly now, with the fix (match the reference, or change the
+    element in place);
+  - `let r = &v[i]; v.push(..); *r` was not seen (the loan of
+    `&v.as_slice()[i]` held no view): the loan views v, so the push is
+    own.conflict.
+- **Functions compiled in parallel**: `-j N` (default: the processors
+  online, at most 8, fewer for a small program); the middle and back
+  end's per-function state is a `FnCtx` per thread, the tasks (scalar
+  pipeline, components bottom-up, emission) on a pool, the join in
+  order, so the output is the same bytes for every N (tests/threads.sh,
+  a gate step: every program at -j1/-j3/-j8). The -O2 self-compile from
+  2.13 s (v0.18.0) to 0.72 s at -j8, -O1 0.87 to 0.37 s, -O0 0.35 to
+  0.30 s (its assembler on a thread of its own).
+- **Incremental rebuilds**: a task whose inputs (its functions' IR by a
+  128-bit hash, what the program knows of them, the types, the compiler
+  and the options) are those of an earlier build takes that build's
+  output from the code cache (`target/`, `--cache=on|off`); rebuilding
+  the compiler after a one-function edit takes 0.53 s at -O2 -j8 (0.47
+  s with nothing changed), byte-identical to a clean build
+  (tests/incremental.sh, a gate step: 148 series of edits). Off below
+  8000 IR instructions and in the suite.
+- **V4: every `*T` is raw.** The legacy rule (a non-`mut` `*T`
+  parameter of a safe function borrowed as `&mut T`) is gone: borrowing
+  is `&` and `&mut` only, and dereferencing a `*T` needs `unsafe`.
+  compiler/src (358 `&mut` and 222 `&` parameters, 882 call sites, by
+  `fix --values`; same-output on 8940 compilations) and std (about 90
+  receivers; `read_line(&mut buf)`) moved; 0.18.0 code gets an error
+  whose `try:` is `fix --values`, which keeps a pointer that is really
+  raw (moved, compared, stored) raw. Not yet: the Allocator trait's
+  `self: *Self` (0.19).
+- **Contracts in generated code, measured** (bench/contracts against
+  bench/contracts_plain, instructions): as 0.18.0 shipped them, clauses
+  cost 8% more than none; with two range fixes (a length read as `len
+  - 0`; one step of transitivity: `i < n` and `n <= v.len()` give `i <
+  v.len()`), `x % n` ranges, and entry facts (a callee no caller inlines
+  assumes its checked requires; indirect calls, C-callable and
+  address-taken functions assume nothing) they save 25%: prefix -83%
+  (vectorizes), dot -59%, bucket +15%, window +24% (its clause's form,
+  `i + 4 <= len`, is not chained to `i + 1 < len` yet: one more check
+  per call). The survey: 1670 checks left over bench and the examples,
+  1564 now.
+- **The 0.18 eval's polish** (docs/eval/0.18-polish-results.md: Haiku
+  1.85 to 1.74 times Rust's cost, Sonnet 1.51 to 1.43, within noise
+  overall; the heap task Haiku 2.52 to 1.53, Sonnet 2.11 to 1.26; Opus
+  1.18, Fable 1.06): std's `BinaryHeap` and `MinHeap` in the prelude,
+  `Vec::sort_by_key`, `retain`, `contains`, `first`, `(a..b).rev()`;
+  Rust's default binding modes on references (`match e { E::A(n) => *n
+  }` on `e: &E`); `&f(x)` and `&recv.method()` take temporaries;
+  `let-else`; indexing through a reference; `ok: ...` when a check or
+  build has no error; `guide std` a first page of the most used items;
+  the check hook applies errors' exact fixes; `--emit-ir` to stdout;
+  guide-mini answers what agents guessed; one `len()` in the corpus and
+  the guide.
+- **The gate**: a valgrind memcheck row in the aarch64-linux container
+  (the compiler on the suite's programs); `threads` and `incremental`;
+  bootstrap.sh's shared release cache under a lock.
+- **Tested on aarch64 only**, as 0.15 to 0.18 (`gate.sh --with-x86`).
+- **Breaking**: `*T` parameters are raw (V4): code that passed `&x` to
+  a non-`mut` `*T` parameter and read through it without `unsafe` gets
+  an error naming `fix --values`; std's receivers and `read_line` take
+  references.
 
 ### What's new in 0.18
 
@@ -1371,7 +1447,17 @@ in an example stops it with where the block was allocated and freed;
 added after examples/errors-and-results printed an error holding a view
 of memory it had freed; through `TACHYON_TEST_FLAGS=--check-alloc`, which
 a case whose output differs by design with the flag declines with `//
-NO-EXTRA-FLAGS: why`); and the two containers: `linux-x86_64`
+NO-EXTRA-FLAGS: why`); `valgrind` (0.18.1, `--release` only, in the
+`linux-aarch64` container, where valgrind is: `tests/valgrind.sh`, the
+compiler under memcheck, its -O2 self-compile at `-j4` and the
+compilations of the `opt_*`, `own_*` and `contract_*` cases and a few
+examples at -O0 and -O2; any invalid read or write or use of an
+uninitialised value fails it, leaks do not, as the compiler leaves its
+memory to the exit; added after two memory bugs of 0.17, an SLP table
+overflow and a read of the own pass's place -1, passed every macOS check
+and only valgrind showed them; about 2 minutes, beside the container's other steps; on its own:
+`bootstrap/aarch64-linux-check.sh --worktree --dev --compiler
+target/tachyonc --only valgrind`); and the two containers: `linux-x86_64`
 (`bootstrap/linux-check.sh`, which builds its own chain and so starts at
 once) and `linux-aarch64` (`bootstrap/aarch64-linux-check.sh --compiler`:
 the chain's compiler cross-compiles the tree). Inside each container the
@@ -1575,7 +1661,15 @@ md5 example against `md5sum`, then runs the checks asked for at once
 (`bootstrap/gate.sh --inside`).
 
 Built steps are cached in `target/bootstrap/<host>/`; a rerun only rebuilds
-HEAD. Options of `bootstrap.sh`:
+HEAD. (0.18.1) Runs from several worktrees share the main checkout's
+cache safely: a release's entry is written under a lock (`<entry>.lock`,
+a directory made by `mkdir`, with its holder's pid), built in
+`<entry>.building` and renamed into place once its fixpoint (and suite)
+passed, so no run sees a half-built entry or deletes another's tree (two
+gates built 0.17.0 into it at once, and one removed the other's tree
+mid-suite). A second run waits for the lock, then finds the entry built;
+a lock whose holder is gone, or older than
+`TACHYON_BOOTSTRAP_LOCK_STALE` minutes (120), is taken over. Options of `bootstrap.sh`:
 
 ```
 --until 0.1.0      stop after a release: a from-scratch build of any release

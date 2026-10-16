@@ -22,7 +22,13 @@
 # which their own builds of target/tachyonc do not replace. (0.14) In a linked git worktree the
 # releases come from the main checkout's cache (or $TACHYON_BOOTSTRAP_CACHE),
 # so a fresh worktree builds only HEAD; HEAD itself is always built in the
-# worktree's own target/bootstrap.
+# worktree's own target/bootstrap. (0.18.1) Runs from several worktrees
+# share that cache safely: an entry is written under a lock (<entry>.lock,
+# a directory: mkdir is atomic), built in <entry>.building and renamed into
+# place once its fixpoint (and suite) passed, so no run sees a half-built
+# entry or deletes another's; a run waits for the lock, and takes it over
+# when its holder is gone (or after TACHYON_BOOTSTRAP_LOCK_STALE minutes,
+# default 120).
 #
 # usage: bootstrap/bootstrap.sh [options]
 #
@@ -203,7 +209,8 @@ fi
 # ---- The manifest ----
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-bootstrap.XXXXXX")
-trap 'rm -rf "$WORK"' EXIT
+HELD_LOCK=""
+trap 'rm -rf "$WORK" $HELD_LOCK' EXIT
 trap 'exit 130' INT TERM
 
 # One line per entry, fields separated by '|' (hosts comma-separated):
@@ -290,6 +297,53 @@ mkdir -p "$CACHE"
 
 tag_commit() { # <tag>: its commit, or nothing when the tag does not exist
     git rev-parse -q --verify "refs/tags/$1^{commit}" 2>/dev/null || true
+}
+
+# (0.18.1) The lock on a shared-cache entry <dir>: the directory
+# <dir>.lock, made by mkdir (atomic), with the holder's pid in it; one at a
+# time (HELD_LOCK, removed on exit). A lock whose holder is gone (this
+# host's processes) or older than the stale limit is taken over: renamed
+# away first, so two waiters cannot both break it.
+LOCK_STALE=${TACHYON_BOOTSTRAP_LOCK_STALE:-120}
+lock() { # <dir>
+    lk_waited=0
+    while ! mkdir "$1.lock" 2>/dev/null; do
+        lk_pid=$(cat "$1.lock/pid" 2>/dev/null || true)
+        lk_stale=0
+        if [ -n "$lk_pid" ] && ! kill -0 "$lk_pid" 2>/dev/null; then
+            lk_stale=1
+        elif [ -n "$(find "$1.lock" -prune -mmin +"$LOCK_STALE" 2>/dev/null)" ]; then
+            lk_stale=1
+        fi
+        if [ $lk_stale -eq 1 ]; then
+            if mv "$1.lock" "$1.lock.stale.$$" 2>/dev/null; then
+                step "taking over the stale lock $1.lock (holder ${lk_pid:-unknown})"
+                rm -rf "$1.lock.stale.$$"
+            fi
+            continue
+        fi
+        if [ $lk_waited -eq 0 ]; then
+            step "waiting for another bootstrap.sh (pid ${lk_pid:-?}) building $(basename "$1")"
+            lk_waited=1
+        fi
+        sleep 2
+    done
+    echo $$ >"$1.lock/pid"
+    HELD_LOCK=$1.lock
+}
+unlock() { # <dir>
+    rm -rf "$1.lock"
+    HELD_LOCK=""
+}
+# Puts the finished <dir>.building in place of <dir> (under the lock): the
+# rename is atomic, and an unfinished old entry is moved aside first.
+publish() { # <dir>
+    if [ -e "$1" ]; then
+        rm -rf "$1.old"
+        mv "$1" "$1.old"
+    fi
+    mv "$1.building" "$1"
+    rm -rf "$1.old"
 }
 
 # Extracts the tree of <commit> into <dir> (fresh).
@@ -421,7 +475,16 @@ build_seed() { # <tree> <dir> <description>
 seed_commit=$(tag_commit "$SEED_TAG")
 if [ -n "$seed_commit" ]; then
     seed_cache="$CACHE/$SEED_TAG-$(echo "$seed_commit" | cut -c1-12)"
-    [ -d "$seed_cache/tree" ] || extract "$seed_commit" "$seed_cache/tree"
+    if [ ! -d "$seed_cache/tree" ]; then
+        # (under the lock, extracted aside and renamed into place)
+        mkdir -p "$seed_cache"
+        lock "$seed_cache/tree"
+        if [ ! -d "$seed_cache/tree" ]; then
+            extract "$seed_commit" "$seed_cache/tree.building"
+            mv "$seed_cache/tree.building" "$seed_cache/tree"
+        fi
+        unlock "$seed_cache/tree"
+    fi
     build_seed "$seed_cache/tree" "$seed_cache" "tag '$SEED_TAG'"
 elif [ $DEV -eq 1 ]; then
     build_seed "$ROOT" "$LOCAL_CACHE/seed-worktree" "the working tree (--dev)"
@@ -463,26 +526,42 @@ while IFS='|' read -r _ version tag compiler built_by cli tests _ root; do
     if [ "$HISTORY" = full ] || [ "$version" = "$LAST_RELEASE" ]; then
         run_tests=1
     fi
+    # (what the cache holds is read without the lock: `fixpoint` and `ok`
+    # appear only once the entry is complete; anything else is decided
+    # again under the lock, as another run may have built it meanwhile)
     if [ -f "$dir/ok" ]; then
         step "$version: $tag ($short), built and tested before (cached)"
         TEST_TOTAL=$(cat "$dir/ok")
     elif [ -f "$dir/fixpoint" ] && [ $run_tests -eq 0 ]; then
         step "$version: $tag ($short), built and its fixpoint checked before (cached)"
         TEST_TOTAL="not run (--history fast)"
-    elif [ -f "$dir/fixpoint" ] && [ -x "$dir/tachyonc" ] && [ -d "$dir/tree" ]; then
-        run_suite "$version" "$dir/tree" "$tests" "$dir" </dev/null
-        echo "$TEST_TOTAL" >"$dir/ok"
     else
-        rm -f "$dir/fixpoint"
-        extract "$commit" "$dir/tree"
-        build_and_check "$version" "$dir/tree" "$compiler" "$root" "$cli" "$tests" \
-            "$PREV_CLI" "$PREV_BIN" "$PREV_NAME" "$dir" "$run_tests" </dev/null
-        : >"$dir/fixpoint"
-        if [ $run_tests -eq 1 ]; then
-            echo "$TEST_TOTAL" >"$dir/ok"
-        else
+        lock "$dir"
+        if [ -f "$dir/ok" ]; then
+            step "$version: $tag ($short), built and tested by another run (cached)"
+            TEST_TOTAL=$(cat "$dir/ok")
+        elif [ -f "$dir/fixpoint" ] && [ $run_tests -eq 0 ]; then
+            step "$version: $tag ($short), built by another run (cached)"
             TEST_TOTAL="not run (--history fast)"
+        elif [ -f "$dir/fixpoint" ] && [ -x "$dir/tachyonc" ] && [ -d "$dir/tree" ]; then
+            run_suite "$version" "$dir/tree" "$tests" "$dir" </dev/null
+            echo "$TEST_TOTAL" >"$dir/ok.new"
+            mv "$dir/ok.new" "$dir/ok"
+        else
+            # (built aside, in <dir>.building, then renamed into place)
+            rm -rf "$dir.building"
+            extract "$commit" "$dir.building/tree"
+            build_and_check "$version" "$dir.building/tree" "$compiler" "$root" "$cli" "$tests" \
+                "$PREV_CLI" "$PREV_BIN" "$PREV_NAME" "$dir.building" "$run_tests" </dev/null
+            : >"$dir.building/fixpoint"
+            if [ $run_tests -eq 1 ]; then
+                echo "$TEST_TOTAL" >"$dir.building/ok"
+            else
+                TEST_TOTAL="not run (--history fast)"
+            fi
+            publish "$dir"
         fi
+        unlock "$dir"
     fi
     note "$version    $tag $short, built by $PREV_NAME, fixpoint ok, tests: $TEST_TOTAL"
     PREV_BIN="$dir/tachyonc"

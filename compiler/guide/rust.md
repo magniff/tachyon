@@ -10,7 +10,7 @@ often than to something else; each error names the fix.
 |---|---|
 | `&str`, `String`, `&[u8]` | `[u8]`: a pointer and a length; `"abc"` is one; no UTF-8 type |
 | `String::new()`, `push_str`, `format!` | `std::Buf` (`Buf::new_in(gpa)`): `push`, `push_str`, `push_int`, `push_fmt(f"..")` (or `push_str(f"..")`), `as_slice`; `format_in(f"..", gpa)` |
-| `s.len()` | the same (0.17), an `i64`; or the field `s.len` |
+| `s.len()` | the same, an `i64` |
 | `s == "x"`, `s < t` | the same (std's `Eq` and `Ord` for `[u8]`, by bytes) |
 | `&s[1..3]` | `s[1..3]` (checked) |
 | `s.as_bytes()[0]`, `b'a'` | `s[0]`, `'a'` (a `u8`) |
@@ -88,9 +88,10 @@ fn main(gpa: Gpa) -> i32 {
 20
 ```
 
-Before 0.17, `*T` was the one pointer type and `&x` its address: a
-non-`mut` `p: *T` parameter is still accepted (as `&mut T`), and
-`tachyonc fix --values` rewrites such code to references.
+`*T` is Rust's `*mut T` / `*const T`: dereferencing it needs `unsafe`,
+a parameter too (0.18.1). Before 0.17, `*T` was the one pointer type and
+`&x` its address; `tachyonc fix --values` rewrites such code to
+references.
 
 ## Errors and Option
 
@@ -142,18 +143,20 @@ too big: 500
 |---|---|
 | `for x in v.iter()`, `for x in &v` | the same (0.14), and `for x in v`: a copy of each element |
 | `for (i, x) in s.iter().enumerate()` | the same (0.14) |
-| `for x in v.iter_mut() { *x += 1 }` | `for i in 0..s.len { s[i] += 1; }` |
+| `for x in v.iter_mut() { *x += 1 }` | `for i in 0..s.len() { s[i] += 1; }` |
 | `.map()`, `.filter()`, `.sum()`, `.collect()` | the same (0.14); `collect_in(gpa)` makes a `Vec` only (`guide iterators`) |
 | `\|x\| x + 1`, `move \|\|` | the same (0.14); a `let mut` is captured by reference, the rest by value (`guide closures`) |
 | `impl Fn(i64) -> i64`, `Box<dyn Fn>` | a generic parameter `F: Fn(i64) -> i64`; none as a result |
-| `(0..n).rev()` | `let mut i = n; while i > 0 { i -= 1; ... }` |
+| `(0..n).rev()` | the same (0.18.1) |
 | `.step_by(2)` | `while` with `i += 2` |
 | `sort()`, `sort_by(\|a, b\| ...)` | `std::sort(s)` (`T: Ord`; not stable); `v.sort_by(\|a, b\| b.cmp(a))` (0.14; `a`, `b`: `&T`) |
+| `v.sort_by_key(\|x\| x.k)`, `v.retain(..)`, `v.contains(&x)`, `v.first()` | the same on a `Vec` (0.18.1; `sort_by_key` is stable); `contains(x)` takes x by value |
+| `BinaryHeap<T>`; a min-heap `BinaryHeap<Reverse<T>>` | `BinaryHeap<T>`; `MinHeap<T>`, no `Reverse` (0.18.1, `guide std#heaps-priority-queues`) |
 
 A function value is `fn(A) -> R`, a plain function, no environment.
 Its parameters may be references (`fn(&mut Sum, i64)`, 0.17); a
-function with raw `*T` parameters used as a value is called in
-`unsafe` (its callee is not checked):
+function with `*T` parameters is a value like any other (an `unsafe fn`
+as a value is unsafe):
 
 ```tach
 struct Sum { total: i64 }
@@ -189,7 +192,7 @@ fn main() -> i32 {
 
 | Rust | tachyon |
 |---|---|
-| `usize` for lengths and indices | `i64` (`s.len`, `v.len()`); indexing takes any integer type |
+| `usize` for lengths and indices | `i64` (`s.len()`, `v.len()`); indexing takes any integer type |
 | implicit widening `i32` -> `i64` | the same (0.15), lossless only; `i64::from(x)`; narrowing is `x as i32` |
 | `i32::MAX`, `u8::MIN` | the same (0.15), for the integer types |
 | overflow: panic in debug, wrap in release | always wraps (two's complement) |
@@ -210,10 +213,10 @@ fn main() -> i32 {
 
 | Rust | tachyon |
 |---|---|
-| `fn f(&self)`, `&mut self`, `self` | `fn f(self: &T)`, `fn f(self: &mut T)`, `fn f(self: T)`; `Self` works (`self: *T`, before 0.17: as `&mut T`) |
+| `fn f(&self)`, `&mut self`, `self` | `fn f(self: &T)`, `fn f(self: &mut T)`, `fn f(self: T)`; `Self` works (`self: *T` is the raw pointer, 0.18.1) |
 | `'a: loop { break 'a; }` | `a: loop { break :a; }` |
 | `let x;` then assign | `let x = ...;` always |
-| `let Some(x) = o else { .. };` | `let x = match o { Some(x) => x, None => return 1 };` |
+| `let Some(x) = o else { .. };` | the same (0.18.1); the block must leave (`return`, `break`, `continue`, `panic`) |
 | `P { x, y }` shorthand, `..base` | the shorthand (0.15); no `..base` |
 | `where T: Ord` | `<T: Ord>` |
 | `pub(crate)`, `pub(super)` | `pub`, or nothing (private to the module and its children) |
@@ -238,7 +241,7 @@ fn main() -> i32 {
 | `extern crate`, Cargo dependencies | none: one program from its files; C through headers |
 | `pub use` | the same |
 | `std::collections::HashMap` | `std::HashMap` |
-| `std::io::stdin().read_line(&mut s)` | `std::read_line(&buf)`: the line without its `'\n'`; `Ok(false)` at the end of input |
+| `std::io::stdin().read_line(&mut s)` | `std::read_line(&mut buf)`: the line without its `'\n'`; `Ok(false)` at the end of input |
 | `io::read_to_string(io::stdin())` | `std::read_stdin_in(gpa)`, a `Result<Buf, IoError>`; `std::Scanner` for its tokens, numbers and lines |
 | `std::env::args()` | `fn main(argc: i32, argv: **u8) -> i32` |
 

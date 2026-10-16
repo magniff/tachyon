@@ -12,6 +12,7 @@ FAIL hang: no exit after 1 s (--timeout S): stopped by signal 14 (SIGALRM: a tim
 ## A program built with --trace (at -O1 at least); without it, a failure's
 ## message has a note.
 $ main.tach --trace -o prog
+ok: built prog
 % ./prog < tests/crash.in; echo "exit $?"
 a best 7
 exit 101
@@ -20,6 +21,7 @@ trace, innermost call first:
   stats.tach:44  stats::best
   main.tach:25  main
 $ main.tach -o plain
+ok: built plain
 % ./plain < tests/crash.in; echo "exit $?"
 a best 7
 exit 101

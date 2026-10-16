@@ -2,12 +2,8 @@
 // simulated over the control flow graph.
 
 use crate::back::emit::machine::call_returns_through_pointer;
-use crate::back::emit::operands::{
-    PM, PM_FIELDS, PM_LOC, pm_dst, pm_kind, pm_result, pm_src, pm_value,
-};
-use crate::back::regalloc::{
-    BEND, BSTART, LOC_NONE, LOC_REMAT, ORDER, RV_SLOT, SPILL_COUNT, USE_REG,
-};
+use crate::back::emit::operands::{PM_FIELDS, PM_LOC, pm_dst, pm_kind, pm_result, pm_src, pm_value};
+use crate::back::regalloc::{LOC_NONE, LOC_REMAT, USE_REG};
 use crate::back::regalloc::intervals::is_returns_twice_call;
 use crate::back::regalloc::locations::{
     plan_end_moves, plan_gap_moves, plan_start_moves, stored_at_def, tloc, vloc,
@@ -19,7 +15,8 @@ use crate::back::regalloc::scan::{X86_ALLOC_ACD, is_callee_saved_reg};
 use crate::base::{SYMS, alloc_array, buf_fmt, buf_new, buf_write_fd, cstr, die, exit, free};
 use crate::base::target::X86;
 use crate::front::types::{FNS, in_fregs};
-use crate::middle::ir::{BLOCKS, INSTS, IRF, IRFUNCS, ir_operand, ir_operand_count};
+use crate::middle::ctx::FnCtx;
+use crate::middle::ir::{IRFUNCS, ir_operand, ir_operand_count};
 use crate::middle::ir::Op::{Const, Div, MulH, Pack, Param, Phi, Piece, Rem, Shl, Shr};
 
 // ---- Checking (--verify-regalloc) ----
@@ -29,12 +26,10 @@ use crate::middle::ir::Op::{Const, Div, MulH, Pack, Param, Phi, Piece, Rem, Shl,
 // (a value, or -1 when unknown), and checks that every use finds its value
 // where the allocation says it is.
 
-static mut CHECK_WIDTH: i64 = 0;
-
-fn check_fail(v: i64, message: *u8) -> ! {
+fn check_fail(mut cx: *FnCtx, v: i64, message: *u8) -> ! {
     unsafe {
         let out = buf_new();
-        let name = SYMS[FNS[IRFUNCS[IRF].f].name].text;
+        let name = SYMS[FNS[IRFUNCS[cx.irf].f].name].text;
         buf_fmt(out, f"internal error: register allocation of {name}: {cstr(message)} (v{v})\n");
         buf_write_fd(out, 2);
         exit(1);
@@ -57,7 +52,7 @@ fn check_get(state: *i64, loc: i64) -> i64 {
     if k < 0 { -1 } else { unsafe { state[k] } }
 }
 
-fn check_set(state: *i64, loc: i64, v: i64) {
+fn check_set(state: &mut i64, loc: i64, v: i64) {
     let k = check_index(loc);
     if k >= 0 {
         unsafe { state[k] = v; }
@@ -65,47 +60,49 @@ fn check_set(state: *i64, loc: i64, v: i64) {
 }
 
 // Value v is used at pos, needing `kind`.
-fn check_use(state: *i64, v: i64, pos: i64, kind: i64) {
+fn check_use(mut cx: *FnCtx, state: *i64, v: i64, pos: i64, kind: i64) {
     unsafe {
-        if !is_live_use(v, kind) {
+        if !is_live_use(cx, v, kind) {
             return;
         }
-        let loc = vloc(v, pos);
+        let loc = vloc(cx, v, pos);
         if loc == LOC_NONE {
-            check_fail(v, c"an operand without a location");
+            check_fail(cx, v, c"an operand without a location");
         }
         if kind == USE_REG && (loc < 0 || loc >= 64) {
-            check_fail(v, c"an operand not in a register");
+            check_fail(cx, v, c"an operand not in a register");
         }
         if loc == LOC_REMAT {
             return;
         }
         if check_get(state, loc) != v {
-            check_fail(v, c"an operand not where it should be");
+            check_fail(cx, v, c"an operand not where it should be");
         }
     }
 }
 
 // Applies the moves in PM (all sources read first), then clears them.
-fn check_moves(state: *i64) {
-    let n = PM.count / PM_FIELDS;
-    for i in 0..n {
-        let value = pm_value(i);
-        if pm_kind(i) == PM_LOC && value != 0 && check_get(state, pm_src(i)) != value {
-            unsafe { check_fail(value, c"a move of the wrong value"); }
+fn check_moves(mut cx: *FnCtx, state: *i64) {
+    unsafe {
+        let n = cx.pm.count / PM_FIELDS;
+        for i in 0..n {
+            let value = pm_value(cx, i);
+            if pm_kind(cx, i) == PM_LOC && value != 0 && check_get(state, pm_src(cx, i)) != value {
+                unsafe { check_fail(cx, value, c"a move of the wrong value"); }
+            }
         }
+        for i in 0..n {
+            check_set(&mut *state, pm_dst(cx, i), pm_result(cx, i));
+        }
+        cx.pm.count = 0;
     }
-    for i in 0..n {
-        check_set(state, pm_dst(i), pm_result(i));
-    }
-    PM.count = 0;
 }
 
-fn check_clobber(state: *i64, v: i64) {
+fn check_clobber(mut cx: *FnCtx, state: &mut i64, v: i64) {
     unsafe {
-        let op = INSTS[v].op;
+        let op = cx.insts[v].op;
         if op.is_call() {
-            let all = is_returns_twice_call(v);
+            let all = is_returns_twice_call(cx, v);
             for r in 0..64 {
                 if all || !is_callee_saved_reg(r) {
                     state[r] = -1;
@@ -113,12 +110,12 @@ fn check_clobber(state: *i64, v: i64) {
             }
             return;
         }
-        if X86 && !in_fregs(INSTS[v].ty) && X86_ALLOC_ACD {
+        if X86 && !in_fregs(cx.insts[v].ty) && X86_ALLOC_ACD {
             if op == Div || op == Rem || op == MulH {
                 state[0] = -1;
                 state[2] = -1;
             }
-            if (op == Shl || op == Shr) && INSTS[INSTS[v].b].op != Const {
+            if (op == Shl || op == Shr) && cx.insts[cx.insts[v].b].op != Const {
                 state[1] = -1;
             }
         }
@@ -127,109 +124,110 @@ fn check_clobber(state: *i64, v: i64) {
 
 // Value v defined at pos: in its location, and in its slot when it is
 // stored there.
-fn check_def(state: *i64, v: i64, pos: i64) {
+fn check_def(mut cx: *FnCtx, state: &mut i64, v: i64, pos: i64) {
     unsafe {
-        let t = tracked(v);
+        let t = tracked(cx, v);
         if t < 0 {
             return;
         }
-        let loc = tloc(t, pos);
+        let loc = tloc(cx, t, pos);
         if loc >= 0 && loc < 64 {
             state[loc] = v;
         }
-        if stored_at_def(t) {
-            check_set(state, 0 - (1 + RV_SLOT[t]), v);
+        if stored_at_def(cx, t) {
+            check_set(state, 0 - (1 + cx.rv_slot[t]), v);
         }
     }
 }
 
-fn ra_check_block(state: *i64, b: i64) {
+fn ra_check_block(mut cx: *FnCtx, state: *i64, b: i64) {
     unsafe {
-        let k = BLOCKS[b].order;
-        let start = BSTART.data[k];
-        plan_start_moves(b);
-        check_moves(state);
+        let k = cx.blocks[b].order;
+        let start = cx.bstart.data[k];
+        plan_start_moves(cx, b);
+        check_moves(cx, state);
         // Phis and parameters.
-        let mut v = BLOCKS[b].first;
+        let mut v = cx.blocks[b].first;
         while v != 0 {
-            let t = tracked(v);
-            let op = INSTS[v].op;
+            let t = tracked(cx, v);
+            let op = cx.insts[v].op;
             if t >= 0 && (op == Phi || op == Param) {
-                let loc = tloc(t, start);
+                let loc = tloc(cx, t, start);
                 if op == Param {
-                    check_set(state, loc, v);
+                    check_set(&mut *state, loc, v);
                 } else if check_get(state, loc) != v {
-                    check_fail(v, c"a phi not where it should be");
+                    check_fail(cx, v, c"a phi not where it should be");
                 }
-                if stored_at_def(t) {
-                    check_set(state, 0 - (1 + RV_SLOT[t]), v);
+                if stored_at_def(cx, t) {
+                    check_set(&mut *state, 0 - (1 + cx.rv_slot[t]), v);
                 }
             }
-            v = INSTS[v].next;
+            v = cx.insts[v].next;
         }
-        v = BLOCKS[b].first;
+        v = cx.blocks[b].first;
         while v != 0 {
-            let op = INSTS[v].op;
-            if op == Phi || op == Param || is_fused_compare(v) {
-                v = INSTS[v].next;
+            let op = cx.insts[v].op;
+            if op == Phi || op == Param || is_fused_compare(cx, v) {
+                v = cx.insts[v].next;
                 continue;
             }
-            let p = INSTS[v].mark;
-            plan_gap_moves(p - 1);
-            check_moves(state);
+            let p = cx.insts[v].mark;
+            plan_gap_moves(cx, p - 1);
+            check_moves(cx, state);
             if op == Piece || op == Pack {
                 // Defined by their call; read by the RET.
-                v = INSTS[v].next;
+                v = cx.insts[v].next;
                 continue;
             }
-            for i in 0..ir_operand_count(v) {
-                let operand = ir_operand(v, i);
-                if operand != 0 && !(op.is_call() && i == 2 && !call_returns_through_pointer(v)) {
-                    check_use(state, operand, p, use_kind(v, i));
+            for i in 0..ir_operand_count(cx, v) {
+                let operand = ir_operand(cx, v, i);
+                if operand != 0
+                    && !(op.is_call() && i == 2 && !call_returns_through_pointer(cx, v)) {
+                    check_use(cx, state, operand, p, use_kind(cx, v, i));
                 }
             }
-            check_clobber(state, v);
-            if op.is_call() && INSTS[v].c != 0 && !call_returns_through_pointer(v) {
-                check_use(state, INSTS[v].c, p + 2, use_kind(v, 2));
+            check_clobber(cx, &mut *state, v);
+            if op.is_call() && cx.insts[v].c != 0 && !call_returns_through_pointer(cx, v) {
+                check_use(cx, state, cx.insts[v].c, p + 2, use_kind(cx, v, 2));
             }
-            if is_emitted(v) {
-                check_def(state, v, p + 2);
+            if is_emitted(cx, v) {
+                check_def(cx, &mut *state, v, p + 2);
             }
             if op.is_call() {
-                let mut w = INSTS[v].next;
+                let mut w = cx.insts[v].next;
                 while w != 0 {
-                    if INSTS[w].op == Piece && INSTS[w].a == v && tracked(w) >= 0 {
-                        check_def(state, w, p + 2);
+                    if cx.insts[w].op == Piece && cx.insts[w].a == v && tracked(cx, w) >= 0 {
+                        check_def(cx, &mut *state, w, p + 2);
                     }
-                    w = INSTS[w].next;
+                    w = cx.insts[w].next;
                 }
             }
-            v = INSTS[v].next;
+            v = cx.insts[v].next;
         }
-        let end = BEND.data[k];
-        plan_gap_moves(end - 1);
-        check_moves(state);
+        let end = cx.bend.data[k];
+        plan_gap_moves(cx, end - 1);
+        check_moves(cx, state);
         let mut out: [i64; 8] = [0; 8];
-        let count = term_uses(b, &out as *i64);
+        let count = term_uses(cx, b, &out as *i64);
         for i in 0..count {
-            check_use(state, out[2 * i], end, out[2 * i + 1]);
+            check_use(cx, state, out[2 * i], end, out[2 * i + 1]);
         }
-        plan_end_moves(b);
-        check_moves(state);
+        plan_end_moves(cx, b);
+        check_moves(cx, state);
     }
 }
 
-pub fn check_allocation(fi: i64) {
+pub fn check_allocation(mut cx: *FnCtx, fi: i64) {
     unsafe {
-        let n = ORDER.count;
-        CHECK_WIDTH = 64 + SPILL_COUNT;
+        let n = cx.order.count;
+        cx.check_width = 64 + cx.spill_count;
         // Per layout index: the state at the end of the block (-2: not reached
         // yet).
-        let exits = alloc_array::<i64>(n * CHECK_WIDTH + 1);
-        for i in 0..n * CHECK_WIDTH {
+        let exits = alloc_array::<i64>(n * cx.check_width + 1);
+        for i in 0..n * cx.check_width {
             exits[i] = -2;
         }
-        let state = alloc_array::<i64>(CHECK_WIDTH + 1);
+        let state = alloc_array::<i64>(cx.check_width + 1);
         let mut changed = true;
         let mut rounds = 0;
         while changed {
@@ -239,20 +237,20 @@ pub fn check_allocation(fi: i64) {
                 die(c"internal error: the register allocation check does not settle");
             }
             for k in 0..n {
-                let b = ORDER.data[k];
+                let b = cx.order.data[k];
                 // The meet of the predecessors' exits (unknown where they
                 // disagree).
                 let mut first = true;
-                for i in 0..CHECK_WIDTH {
+                for i in 0..cx.check_width {
                     state[i] = -1;
                 }
-                for p in BLOCKS[b].preds.items() {
-                    let pk = BLOCKS[p].order;
-                    if pk < 0 || exits[pk * CHECK_WIDTH] == -2 {
+                for p in cx.blocks[b].preds.items() {
+                    let pk = cx.blocks[p].order;
+                    if pk < 0 || exits[pk * cx.check_width] == -2 {
                         continue;
                     }
-                    for j in 0..CHECK_WIDTH {
-                        let x = exits[pk * CHECK_WIDTH + j];
+                    for j in 0..cx.check_width {
+                        let x = exits[pk * cx.check_width + j];
                         if first {
                             state[j] = x;
                         } else if state[j] != x {
@@ -264,12 +262,12 @@ pub fn check_allocation(fi: i64) {
                 if first && k != 0 {
                     continue;
                 }
-                ra_check_block(state, b);
+                ra_check_block(cx, state, b);
                 // -2 marks "not reached": a reached state never holds it.
-                for j in 0..CHECK_WIDTH {
+                for j in 0..cx.check_width {
                     let x = if state[j] == -2 { -1 } else { state[j] };
-                    if exits[k * CHECK_WIDTH + j] != x {
-                        exits[k * CHECK_WIDTH + j] = x;
+                    if exits[k * cx.check_width + j] != x {
+                        exits[k * cx.check_width + j] = x;
                         changed = true;
                     }
                 }

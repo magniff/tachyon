@@ -99,7 +99,7 @@ tools` the ones a program needs.
 | add a variant (an arm in each match that needs one), remove, rename one | `target/tachyonc refactor variant ENUM --add 'X(i64)' --arm 'EXPR'` (`--arm-in FN 'EXPR'` per match; `--remove V`, `--rename V W`) |
 | move lines of a function into a new one, parameters and result computed | `target/tachyonc refactor extract-function FN --lines A-B --to NEW` |
 | put a small function's body where it is called (and delete it) | `target/tachyonc refactor inline FN` (`--at FILE:LINE`: one call) |
-| replace an idiom everywhere, typed | `target/tachyonc rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: *IntVec' --dry-run` (`--list`: the sites and their holes; `--subst 'P' 'R'`: inside the holes' code; `--where '$v: name ~ RE'`; `--in FN\|MODULE\|FILE`, repeated) |
+| replace an idiom everywhere, typed | `target/tachyonc rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: &mut IntVec' --dry-run` (`--list`: the sites and their holes; `--subst 'P' 'R'`: inside the holes' code; `--where '$v: name ~ RE'`; `--in FN\|MODULE\|FILE`, repeated) |
 | rename anything (a module: its file too), with every reference | `target/tachyonc refactor rename PATH NEW` (a local or parameter: `FILE:LINE:COL` or `FN::x`, shadowing respected) |
 | move items to another module, imports and `pub` fixed | `target/tachyonc refactor move PATH... --to MODULE` (`--after\|--before ITEM`: where; a MODULE that does not exist is made) |
 | make a module; move one (file, folder, paths) | `target/tachyonc refactor new-module crate::a::b`, `refactor move-module crate::a crate::x::a` |
@@ -939,6 +939,10 @@ must come from the cache when the first made it).
   file of the program), one that could not be parsed. A damaged or
   partly written file is not read (a hash of its contents; written
   through a new file renamed over the old).
+- (0.18.1) Beside it, a build's code cache, `g-KEY.pack`: each
+  function's optimized code at -O1 and -O2, reused by a rebuild where an
+  edit did not change it ([optimizer.md](optimizer.md), "0.18.1:
+  incremental rebuilds"); `--no-cache` goes without.
 
 ## Several commands in one call: batch (0.15)
 
@@ -1122,7 +1126,17 @@ condition in tools/agent-hooks/settings-eval.json for the agent eval):
   `$TACHYON_TEST_DEBOUNCE`; never again for a program whose tests took
   over 8 s) and its line follows: the counts, the newly failing cases
   with their differences, the fixed ones by name. TACHYON_CHECK_TESTS=0
-  leaves the tests out.
+  leaves the tests out. (0.18.1) Errors whose `try:` is `tachyonc fix
+  --suggested` (the compiler gives it only for an exact fix: a
+  did-you-mean name with one candidate, a missing `use` or `pub`, a
+  conversion) are fixed by the hook: it runs `fix --suggested --json
+  ROOT` (one checked, journaled edit), checks again, and prints a head
+  line (`tachyonc fix --suggested main.tach, run by the hook (tachyonc
+  undo takes it back; ...)`), a `fixed FILE:L:C: MESSAGE | FIX` line per
+  error it fixed, then the errors left. A refused fix leaves the report
+  as before, with its `try:`; TACHYON_HOOK_FIX=0 turns it off; the
+  record says `hook_fixed`. (The 0.18 eval: the `try:` was offered 43
+  times and run once.)
 - **turn-end.py** (Stop): when a root this session touched (or the
   current directory's) changed since its last clean check and test run,
   `check` (and the tests) once; errors or failures block the stop once,

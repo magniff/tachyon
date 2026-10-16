@@ -7,20 +7,19 @@
 // The dominator tree: children of the block at layout index k are
 // DOM_CHILD[DOM_START[k] .. DOM_START[k + 1]] (blocks).
 use crate::back::abi::fn_uses_c;
-use crate::back::regalloc::ORDER;
 use crate::base::{IntVec, alloc_array, free, intern_c, memset};
 use crate::front::own::diag::{MODE_ERROR, OWN_MODE};
 use crate::front::types::{
     FNS, REF_MUT, REF_SHARED, TYPES, TY_U64, TyKind, fn_param, is_integer, type_size,
 };
+use crate::middle::ctx::FnCtx;
 use crate::middle::egraph::{EGRAPH, egraph_rewrite, egraph_start};
 use crate::middle::fold::is_const;
 use crate::middle::gvn_calls::{call_numbering, inherit_into};
 use crate::middle::ipo::{call_reads, call_writes};
 use crate::middle::ir::{
-    BLOCKS, Cond, INSTS, INST_COUNT, IRF, IRFUNCS, Op, SLOTS, SLOT_COUNT, Term, ir_arg,
-    ir_insert_before, ir_make, ir_operand, ir_operand_count, ir_replace, ir_resolve_operands,
-    ir_set_operand, ir_unlink, ir_val,
+    Cond, IRFUNCS, Op, Term, ir_arg, ir_insert_before, ir_make, ir_operand, ir_operand_count,
+    ir_replace, ir_resolve_operands, ir_set_operand, ir_unlink, ir_val,
 };
 use crate::middle::ir::Op::{
     Add, And, CallC, Cmp, Const, Conv, Copy, GAddr, Load, Mul, Or, Phi, SAddr, Slot, Store, Xor,
@@ -28,32 +27,29 @@ use crate::middle::ir::Op::{
 use crate::middle::opt::{compute_dominators, resolve_all};
 use crate::middle::sroa::constant_load;
 
-static mut DOM_START: *i64 = 0 as *i64;
-static mut DOM_CHILD: *i64 = 0 as *i64;
-
-pub fn build_dom_tree(fi: i64) {
+pub fn build_dom_tree(mut cx: *FnCtx, fi: i64) {
     unsafe {
-        compute_dominators(fi);
-        let n = ORDER.count;
-        free(DOM_START as *u8);
-        free(DOM_CHILD as *u8);
-        DOM_START = alloc_array::<i64>(n + 2);
-        DOM_CHILD = alloc_array::<i64>(n + 1);
+        compute_dominators(cx, fi);
+        let n = cx.order.count;
+        free(cx.dom_start as *u8);
+        free(cx.dom_child as *u8);
+        cx.dom_start = alloc_array::<i64>(n + 2);
+        cx.dom_child = alloc_array::<i64>(n + 1);
         for i in 1..n {
-            let b = ORDER.data[i];
-            DOM_START[BLOCKS[BLOCKS[b].idom].order] += 1;
+            let b = cx.order.data[i];
+            cx.dom_start[cx.blocks[cx.blocks[b].idom].order] += 1;
         }
         let mut total = 0;
         for k in 0..n + 1 {
-            let count = DOM_START[k];
-            DOM_START[k] = total;
+            let count = cx.dom_start[k];
+            cx.dom_start[k] = total;
             total += count;
         }
         let fill = alloc_array::<i64>(n + 1);
         for i in 1..n {
-            let b = ORDER.data[i];
-            let parent = BLOCKS[BLOCKS[b].idom].order;
-            DOM_CHILD[DOM_START[parent] + fill[parent]] = b;
+            let b = cx.order.data[i];
+            let parent = cx.blocks[cx.blocks[b].idom].order;
+            cx.dom_child[cx.dom_start[parent] + fill[parent]] = b;
             fill[parent] += 1;
         }
         free(fill as *u8);
@@ -62,22 +58,15 @@ pub fn build_dom_tree(fi: i64) {
 
 // ---- The value table ----
 
-static mut GVN_TABLE: *i64 = 0 as *i64;
-static mut GVN_SIZE: i64 = 0;
-static mut GVN_CAP: i64 = 0;
-static mut GVN_COUNT: i64 = 0;
-// Slots filled, in order, to undo a scope.
-static mut GVN_LOG: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
 fn is_gvn_op(op: Op) -> bool {
     op.is_remat() || op.is_pure() || op.is_vector() || op == Op::Sel
 }
 
-pub fn is_commutative_op(v: i64) -> bool {
+pub fn is_commutative_op(mut cx: *FnCtx, v: i64) -> bool {
     unsafe {
-        let op = INSTS[v].op;
+        let op = cx.insts[v].op;
         if op == Cmp {
-            return INSTS[v].cond == Cond::Eq || INSTS[v].cond == Cond::Ne;
+            return cx.insts[v].cond == Cond::Eq || cx.insts[v].cond == Cond::Ne;
         }
         op == Add || op == Mul || op == And || op == Or || op == Xor
     }
@@ -85,50 +74,50 @@ pub fn is_commutative_op(v: i64) -> bool {
 
 // The canonical order of commutative operands: constants on the right
 // (where the targets have immediate forms), others by value id.
-pub fn operands_out_of_order(a: i64, b: i64) -> bool {
-    let a_const = is_const(a);
-    let b_const = is_const(b);
+pub fn operands_out_of_order(mut cx: *FnCtx, a: i64, b: i64) -> bool {
+    let a_const = is_const(cx, a);
+    let b_const = is_const(cx, b);
     if a_const != b_const {
         return a_const;
     }
     a > b
 }
 
-fn gvn_hash(v: i64) -> u64 {
+fn gvn_hash(mut cx: *FnCtx, v: i64) -> u64 {
     let mut h: u64 = 1469598103934665603;
     unsafe {
-        h = (h ^ INSTS[v].op as u64) * 1099511628211;
-        h = (h ^ INSTS[v].cond as u64) * 1099511628211;
-        h = (h ^ INSTS[v].ty as u64) * 1099511628211;
-        h = (h ^ INSTS[v].a as u64) * 1099511628211;
-        h = (h ^ INSTS[v].b as u64) * 1099511628211;
-        h = (h ^ INSTS[v].c as u64) * 1099511628211;
-        h = (h ^ INSTS[v].imm as u64) * 1099511628211;
-        h = (h ^ INSTS[v].imm2 as u64) * 1099511628211;
-        if INSTS[v].op.is_call() {
+        h = (h ^ cx.insts[v].op as u64) * 1099511628211;
+        h = (h ^ cx.insts[v].cond as u64) * 1099511628211;
+        h = (h ^ cx.insts[v].ty as u64) * 1099511628211;
+        h = (h ^ cx.insts[v].a as u64) * 1099511628211;
+        h = (h ^ cx.insts[v].b as u64) * 1099511628211;
+        h = (h ^ cx.insts[v].c as u64) * 1099511628211;
+        h = (h ^ cx.insts[v].imm as u64) * 1099511628211;
+        h = (h ^ cx.insts[v].imm2 as u64) * 1099511628211;
+        if cx.insts[v].op.is_call() {
             // (0.16) a call numbered by its callee and arguments
-            for i in 0..INSTS[v].nargs {
-                h = (h ^ ir_arg(v, i) as u64) * 1099511628211;
+            for i in 0..cx.insts[v].nargs {
+                h = (h ^ ir_arg(cx, v, i) as u64) * 1099511628211;
             }
         }
     }
     h ^ (h >> 29)
 }
 
-fn gvn_equal(v: i64, w: i64) -> bool {
+fn gvn_equal(mut cx: *FnCtx, v: i64, w: i64) -> bool {
     unsafe {
-        if !(INSTS[v].op == INSTS[w].op && INSTS[v].cond == INSTS[w].cond
-            && INSTS[v].ty == INSTS[w].ty && INSTS[v].a == INSTS[w].a && INSTS[v].b == INSTS[w].b
-            && INSTS[v].c == INSTS[w].c && INSTS[v].imm == INSTS[w].imm
-            && INSTS[v].imm2 == INSTS[w].imm2) {
+        if !(cx.insts[v].op == cx.insts[w].op && cx.insts[v].cond == cx.insts[w].cond
+            && cx.insts[v].ty == cx.insts[w].ty && cx.insts[v].a == cx.insts[w].a
+            && cx.insts[v].b == cx.insts[w].b && cx.insts[v].c == cx.insts[w].c
+            && cx.insts[v].imm == cx.insts[w].imm && cx.insts[v].imm2 == cx.insts[w].imm2) {
             return false;
         }
-        if INSTS[v].op.is_call() {
-            if INSTS[v].nargs != INSTS[w].nargs || INSTS[v].c != INSTS[w].c {
+        if cx.insts[v].op.is_call() {
+            if cx.insts[v].nargs != cx.insts[w].nargs || cx.insts[v].c != cx.insts[w].c {
                 return false;
             }
-            for i in 0..INSTS[v].nargs {
-                if ir_arg(v, i) != ir_arg(w, i) {
+            for i in 0..cx.insts[v].nargs {
+                if ir_arg(cx, v, i) != ir_arg(cx, w, i) {
                     return false;
                 }
             }
@@ -142,49 +131,51 @@ fn gvn_equal(v: i64, w: i64) -> bool {
 // function's table for every function was a few percent of -O2. The
 // value found for an expression does not depend on the size: the table
 // holds no two equal entries.)
-fn gvn_reset(capacity: i64) {
+fn gvn_reset(mut cx: *FnCtx, capacity: i64) {
     unsafe {
         let mut size = 1024;
         while size < capacity * 2 {
             size *= 2;
         }
-        if size > GVN_CAP {
-            free(GVN_TABLE as *u8);
-            GVN_TABLE = alloc_array::<i64>(size);
-            GVN_CAP = size;
+        if size > cx.gvn_cap {
+            free(cx.gvn_table as *u8);
+            cx.gvn_table = alloc_array::<i64>(size);
+            cx.gvn_cap = size;
         } else {
-            memset(GVN_TABLE as *u8, 0, (size * 8) as u64);
+            memset(cx.gvn_table as *u8, 0, (size * 8) as u64);
         }
-        GVN_SIZE = size;
-        GVN_COUNT = 0;
-        GVN_LOG.count = 0;
+        cx.gvn_size = size;
+        cx.gvn_count = 0;
+        cx.gvn_log.count = 0;
     }
 }
 
 // The equal value already in the table, or 0 after adding v.
-pub fn gvn_find_or_add(v: i64) -> i64 {
+pub fn gvn_find_or_add(mut cx: *FnCtx, v: i64) -> i64 {
     unsafe {
-        let mask = (GVN_SIZE - 1) as u64;
-        let mut slot = gvn_hash(v) & mask;
-        while GVN_TABLE[slot] != 0 {
-            let w = GVN_TABLE[slot];
-            if gvn_equal(v, w) {
+        let mask = (cx.gvn_size - 1) as u64;
+        let mut slot = gvn_hash(cx, v) & mask;
+        while cx.gvn_table[slot] != 0 {
+            let w = cx.gvn_table[slot];
+            if gvn_equal(cx, v, w) {
                 return w;
             }
             slot = (slot + 1) & mask;
         }
-        GVN_TABLE[slot] = v;
-        GVN_LOG.push(slot as i64);
+        cx.gvn_table[slot] = v;
+        cx.gvn_log.push(slot as i64);
         0
     }
 }
 
 // Removes the entries added after `mark` (most recent first, which keeps
 // the linear probing chains intact).
-fn gvn_undo(mark: i64) {
-    while GVN_LOG.count > mark {
-        let slot = GVN_LOG.pop();
-        unsafe { GVN_TABLE[slot] = 0; }
+fn gvn_undo(mut cx: *FnCtx, mark: i64) {
+    unsafe {
+        while cx.gvn_log.count > mark {
+            let slot = cx.gvn_log.pop();
+            unsafe { cx.gvn_table[slot] = 0; }
+        }
     }
 }
 
@@ -202,12 +193,13 @@ fn gvn_undo(mark: i64) {
 
 // The base of address `v` and its constant offset: (x + c1) + c2 is x at
 // c1 + c2.
-pub fn address_base(v: i64, offset: *i64) -> i64 {
+pub fn address_base(mut cx: *FnCtx, v: i64, offset: &mut i64) -> i64 {
     unsafe {
         let mut base = v;
-        while INSTS[base].op == Add && INSTS[base].ty == TY_U64 && is_const(INSTS[base].b) {
-            *offset += INSTS[INSTS[base].b].imm;
-            base = INSTS[base].a;
+        while cx.insts[base].op == Add && cx.insts[base].ty == TY_U64
+            && is_const(cx, cx.insts[base].b) {
+            *offset += cx.insts[cx.insts[base].b].imm;
+            base = cx.insts[base].a;
         }
         base
     }
@@ -217,37 +209,48 @@ static mut MEMCPY_SYM: i64 = 0;
 
 // Whether v is a copy too: a call of memcpy of a constant size (the
 // lowering of copies over INLINE_COPY_MAX bytes).
-fn is_memcpy(v: i64) -> bool {
+fn is_memcpy(mut cx: *FnCtx, v: i64) -> bool {
     unsafe {
         if MEMCPY_SYM == 0 {
             MEMCPY_SYM = intern_c(c"memcpy");
         }
-        INSTS[v].op == CallC && INSTS[v].imm == MEMCPY_SYM && INSTS[v].nargs == 3
-            && is_const(ir_val(ir_arg(v, 2)))
+        cx.insts[v].op == CallC && cx.insts[v].imm == MEMCPY_SYM && cx.insts[v].nargs == 3
+            && is_const(cx, ir_val(cx, ir_arg(cx, v, 2)))
+    }
+}
+
+// (0.18.1) The symbols is_memcpy compares with, made before the tasks run
+// (middle::parallel: interning grows the program's table).
+pub fn init_syms() {
+    unsafe {
+        if MEMCPY_SYM == 0 {
+            MEMCPY_SYM = intern_c(c"memcpy");
+        }
     }
 }
 
 // The destination, source and size of copy v (Op::Copy or memcpy).
-pub fn copy_dst(v: i64) -> i64 {
+pub fn copy_dst(mut cx: *FnCtx, v: i64) -> i64 {
     unsafe {
-        if INSTS[v].op == Copy { INSTS[v].a } else { ir_val(ir_arg(v, 0)) }
+        if cx.insts[v].op == Copy { cx.insts[v].a } else { ir_val(cx, ir_arg(cx, v, 0)) }
     }
 }
 
-pub fn copy_src(v: i64) -> i64 {
+pub fn copy_src(mut cx: *FnCtx, v: i64) -> i64 {
     unsafe {
-        if INSTS[v].op == Copy { INSTS[v].b } else { ir_val(ir_arg(v, 1)) }
+        if cx.insts[v].op == Copy { cx.insts[v].b } else { ir_val(cx, ir_arg(cx, v, 1)) }
     }
 }
 
-pub fn copy_size(v: i64) -> i64 {
+pub fn copy_size(mut cx: *FnCtx, v: i64) -> i64 {
     unsafe {
-        if INSTS[v].op == Copy { INSTS[v].imm } else { INSTS[ir_val(ir_arg(v, 2))].imm }
+        if cx.insts[v].op == Copy { cx.insts[v].imm }
+        else { cx.insts[ir_val(cx, ir_arg(cx, v, 2))].imm }
     }
 }
 
-pub fn is_copy(v: i64) -> bool {
-    unsafe { INSTS[v].op == Copy || is_memcpy(v) }
+pub fn is_copy(mut cx: *FnCtx, v: i64) -> bool {
+    unsafe { cx.insts[v].op == Copy || is_memcpy(cx, v) }
 }
 
 fn is_object_op(op: Op) -> bool {
@@ -255,23 +258,23 @@ fn is_object_op(op: Op) -> bool {
 }
 
 // The memory object address `v` points into (see above), or 0.
-pub fn root_of(v: i64) -> i64 {
+pub fn root_of(mut cx: *FnCtx, v: i64) -> i64 {
     unsafe {
         let mut x = v;
         for _ in 0..64 {
-            let op = INSTS[x].op;
+            let op = cx.insts[x].op;
             if is_object_op(op) {
                 return x;
             }
-            if op != Add || INSTS[x].ty != TY_U64 {
+            if op != Add || cx.insts[x].ty != TY_U64 {
                 return 0;
             }
-            if is_const(INSTS[x].b) {
-                x = INSTS[x].a;
+            if is_const(cx, cx.insts[x].b) {
+                x = cx.insts[x].a;
                 continue;
             }
-            let ra = root_of(INSTS[x].a);
-            let rb = root_of(INSTS[x].b);
+            let ra = root_of(cx, cx.insts[x].a);
+            let rb = root_of(cx, cx.insts[x].b);
             if ra != 0 && rb == 0 {
                 return ra;
             }
@@ -286,86 +289,86 @@ pub fn root_of(v: i64) -> i64 {
 
 // Marks the frame slots of function `fi` whose address escapes: used other
 // than by loads, stores, copies and address arithmetic.
-pub fn find_escaping_slots(fi: i64) {
+pub fn find_escaping_slots(mut cx: *FnCtx, fi: i64) {
     unsafe {
         for i in 0..IRFUNCS[fi].slots.count {
-            SLOTS[IRFUNCS[fi].slots.data[i]].escapes = 0;
+            cx.slots[IRFUNCS[fi].slots.data[i]].escapes = 0;
         }
         for i in 0..IRFUNCS[fi].blocks.count {
             let b = IRFUNCS[fi].blocks.data[i];
-            if BLOCKS[b].removed != 0 {
+            if cx.blocks[b].removed != 0 {
                 continue;
             }
-            let mut v = BLOCKS[b].first;
+            let mut v = cx.blocks[b].first;
             while v != 0 {
-                let op = INSTS[v].op;
-                for k in 0..ir_operand_count(v) {
-                    let operand = ir_operand(v, k);
+                let op = cx.insts[v].op;
+                for k in 0..ir_operand_count(cx, v) {
+                    let operand = ir_operand(cx, v, k);
                     if operand == 0 {
                         continue;
                     }
                     let allowed = ((op == Load || op == Store) && k == 0)
                         || (op == Copy && k <= 1)
-                        || (op == Add && k <= 1 && INSTS[v].ty == TY_U64)
-                        || ((k == 3 || k == 4) && is_memcpy(v));
+                        || (op == Add && k <= 1 && cx.insts[v].ty == TY_U64)
+                        || ((k == 3 || k == 4) && is_memcpy(cx, v));
                     if !allowed {
-                        mark_escape(operand);
+                        mark_escape(cx, operand);
                     }
                 }
-                v = INSTS[v].next;
+                v = cx.insts[v].next;
             }
-            if BLOCKS[b].cond != 0 {
-                mark_escape(BLOCKS[b].cond);
+            if cx.blocks[b].cond != 0 {
+                mark_escape(cx, cx.blocks[b].cond);
             }
         }
     }
 }
 
-fn mark_escape(operand: i64) {
+fn mark_escape(mut cx: *FnCtx, operand: i64) {
     unsafe {
-        let root = root_of(operand);
-        if root != 0 && INSTS[root].op == Slot {
-            SLOTS[INSTS[root].imm].escapes = 1;
+        let root = root_of(cx, operand);
+        if root != 0 && cx.insts[root].op == Slot {
+            cx.slots[cx.insts[root].imm].escapes = 1;
         }
     }
 }
 
 // The memory object of a root: a frame slot, a static, constant data
 // (negative, apart), or 0.
-fn object_of(root: i64) -> i64 {
+fn object_of(mut cx: *FnCtx, root: i64) -> i64 {
     unsafe {
         if root == 0 {
             return 0;
         }
-        let op = INSTS[root].op;
+        let op = cx.insts[root].op;
         if op == Slot {
-            return INSTS[root].imm;
+            return cx.insts[root].imm;
         }
         if op == GAddr {
-            return -1 - INSTS[root].imm;
+            return -1 - cx.insts[root].imm;
         }
         // Constant data, by string id.
-        -(1 << 40) - INSTS[root].imm
+        -(1 << 40) - cx.insts[root].imm
     }
 }
 
-fn is_constant_memory(root: i64) -> bool {
-    unsafe { root != 0 && INSTS[root].op == SAddr }
+fn is_constant_memory(mut cx: *FnCtx, root: i64) -> bool {
+    unsafe { root != 0 && cx.insts[root].op == SAddr }
 }
 
-pub fn is_private_root(root: i64) -> bool {
-    unsafe { root != 0 && INSTS[root].op == Slot && SLOTS[INSTS[root].imm].escapes == 0 }
+pub fn is_private_root(mut cx: *FnCtx, root: i64) -> bool {
+    unsafe { root != 0 && cx.insts[root].op == Slot && cx.slots[cx.insts[root].imm].escapes == 0 }
 }
 
-fn is_private_slot(base: i64) -> bool {
-    is_private_root(root_of(base))
+fn is_private_slot(mut cx: *FnCtx, base: i64) -> bool {
+    is_private_root(cx, root_of(cx, base))
 }
 
 // Whether a call may write the memory at base: not when it is private or
 // constant.
-pub fn call_may_write(base: i64) -> bool {
-    let root = root_of(base);
-    !is_private_root(root) && !is_constant_memory(root) && !param_frozen(base)
+pub fn call_may_write(mut cx: *FnCtx, base: i64) -> bool {
+    let root = root_of(cx, base);
+    !is_private_root(cx, root) && !is_constant_memory(cx, root) && !param_frozen(cx, base)
 }
 
 // ---- (0.17) Reference parameters: noalias and read-only ----
@@ -386,9 +389,6 @@ pub fn call_may_write(base: i64) -> bool {
 // `sweep(sa, sa)` would be miscompiled. `--no-noalias` turns the facts off
 // (to measure them).
 pub static mut NOALIAS_OFF: bool = false;
-static mut RO_FN: i64 = -1;
-static mut RO_STAMP: i64 = -1;
-static mut RO_WRITTEN: i64 = 0;
 
 // Parameter classes (param_class).
 const PC_NONE: i64 = 0;
@@ -402,8 +402,8 @@ pub fn noalias_active() -> bool {
 }
 
 // The class of parameter k of the function being optimized.
-fn param_class(k: i64) -> i64 {
-    unsafe { param_class_of(IRFUNCS[IRF].f, k) }
+fn param_class(mut cx: *FnCtx, k: i64) -> i64 {
+    unsafe { param_class_of(IRFUNCS[cx.irf].f, k) }
 }
 
 // The class of parameter k of function f, by its type: PC_EXCLUSIVE
@@ -461,36 +461,36 @@ pub fn has_ref_facts(f: i64) -> bool {
 // The reference parameter (its index + 1) address v points into, through
 // additions, or 0: a `&T`/`&mut T` parameter, or the pointer (the first
 // piece) of a slice parameter.
-pub fn param_root(v: i64) -> i64 {
+pub fn param_root(mut cx: *FnCtx, v: i64) -> i64 {
     unsafe {
         let mut x = v;
         for _ in 0..64 {
-            let op = INSTS[x].op;
+            let op = cx.insts[x].op;
             if op == Op::Param {
-                let k = INSTS[x].imm;
-                if k < 0 || INSTS[x].ty != TY_U64 {
+                let k = cx.insts[x].imm;
+                if k < 0 || cx.insts[x].ty != TY_U64 {
                     return 0;
                 }
-                let class = param_class(k);
+                let class = param_class(cx, k);
                 if class == PC_NONE {
                     return 0;
                 }
-                let f = IRFUNCS[IRF].f;
+                let f = IRFUNCS[cx.irf].f;
                 let slice = TYPES[fn_param(f, k)].kind == TyKind::Slice;
-                if slice && INSTS[x].imm2 != 1 || !slice && INSTS[x].imm2 != 0 {
+                if slice && cx.insts[x].imm2 != 1 || !slice && cx.insts[x].imm2 != 0 {
                     return 0;
                 }
                 return k + 1;
             }
-            if op != Add || INSTS[x].ty != TY_U64 {
+            if op != Add || cx.insts[x].ty != TY_U64 {
                 return 0;
             }
-            if is_const(INSTS[x].b) {
-                x = INSTS[x].a;
+            if is_const(cx, cx.insts[x].b) {
+                x = cx.insts[x].a;
                 continue;
             }
-            let pa = param_root(INSTS[x].a);
-            let pb = param_root(INSTS[x].b);
+            let pa = param_root(cx, cx.insts[x].a);
+            let pb = param_root(cx, cx.insts[x].b);
             if pa != 0 && pb == 0 {
                 return pa;
             }
@@ -506,67 +506,67 @@ pub fn param_root(v: i64) -> i64 {
 // Whether parameter p (index + 1) has a fact here: exclusive, or shared and
 // never written through by the function (a write through `[T]` is
 // own.readonly's; until it is checked, such a parameter is left raw).
-fn param_kept_apart(p: i64) -> bool {
-    let class = param_class(p - 1);
-    class == PC_EXCLUSIVE || class == PC_SHARED && !param_written(p)
+fn param_kept_apart(mut cx: *FnCtx, p: i64) -> bool {
+    let class = param_class(cx, p - 1);
+    class == PC_EXCLUSIVE || class == PC_SHARED && !param_written(cx, p)
 }
 
 // Whether bases b1 and b2 point into memory that 0.17's parameter rules
 // keep apart: two different reference parameters, or one and a static.
-pub fn params_disjoint(b1: i64, b2: i64) -> bool {
+pub fn params_disjoint(mut cx: *FnCtx, b1: i64, b2: i64) -> bool {
     if !noalias_active() {
         return false;
     }
-    let p1 = param_root(b1);
-    let p2 = param_root(b2);
+    let p1 = param_root(cx, b1);
+    let p2 = param_root(cx, b2);
     if p1 == 0 && p2 == 0 || p1 == p2 {
         return false;
     }
     if p1 != 0 && p2 != 0 {
-        return param_kept_apart(p1) && param_kept_apart(p2);
+        return param_kept_apart(cx, p1) && param_kept_apart(cx, p2);
     }
     let p = if p1 == 0 { p2 } else { p1 };
-    let other = if p1 == 0 { root_of(b1) } else { root_of(b2) };
-    unsafe { other != 0 && INSTS[other].op == GAddr && param_kept_apart(p) }
+    let other = if p1 == 0 { root_of(cx, b1) } else { root_of(cx, b2) };
+    unsafe { other != 0 && cx.insts[other].op == GAddr && param_kept_apart(cx, p) }
 }
 
 // Whether the function being optimized may write through parameter p
 // (index + 1): a store or copy into it, or the parameter passed to a call
 // (or stored, compared... used other than as an address). A bit per
 // parameter, recomputed when the function or its instructions change.
-fn param_written(p: i64) -> bool {
+fn param_written(mut cx: *FnCtx, p: i64) -> bool {
     unsafe {
-        if RO_FN != IRF || RO_STAMP != INST_COUNT {
-            RO_FN = IRF;
-            RO_STAMP = INST_COUNT;
-            RO_WRITTEN = 0;
-            for i in 0..IRFUNCS[IRF].blocks.count {
-                let b = IRFUNCS[IRF].blocks.data[i];
-                if BLOCKS[b].removed != 0 {
+        if cx.ro_fn != cx.irf || cx.ro_stamp != cx.inst_count {
+            cx.ro_fn = cx.irf;
+            cx.ro_stamp = cx.inst_count;
+            cx.ro_written = 0;
+            for i in 0..IRFUNCS[cx.irf].blocks.count {
+                let b = IRFUNCS[cx.irf].blocks.data[i];
+                if cx.blocks[b].removed != 0 {
                     continue;
                 }
-                let mut v = BLOCKS[b].first;
+                let mut v = cx.blocks[b].first;
                 while v != 0 {
-                    let op = INSTS[v].op;
-                    for k in 0..ir_operand_count(v) {
-                        let operand = ir_operand(v, k);
+                    let op = cx.insts[v].op;
+                    for k in 0..ir_operand_count(cx, v) {
+                        let operand = ir_operand(cx, v, k);
                         if operand == 0 {
                             continue;
                         }
                         let read = (op == Load && k == 0) || (op == Copy && k == 1)
-                            || (op == Add && INSTS[v].ty == TY_U64) || op == Cmp;
+                            || (op == Add && cx.insts[v].ty == TY_U64) || op == Cmp;
                         if !read {
-                            let q = param_root(operand);
+                            let q = param_root(cx, operand);
                             if q > 0 && q < 63 {
-                                RO_WRITTEN = RO_WRITTEN | (1 << (q - 1));
+                                cx.ro_written = cx.ro_written | (1 << (q - 1));
                             }
                         }
                     }
-                    v = INSTS[v].next;
+                    v = cx.insts[v].next;
                 }
             }
         }
-        p >= 63 || (RO_WRITTEN & (1 << (p - 1))) != 0
+        p >= 63 || (cx.ro_written & (1 << (p - 1))) != 0
     }
 }
 
@@ -574,31 +574,32 @@ fn param_written(p: i64) -> bool {
 // reference parameter the function passes to no call and writes nowhere
 // (an exclusive one is reached through nothing else; a shared one is
 // frozen for the call).
-fn param_frozen(base: i64) -> bool {
+fn param_frozen(mut cx: *FnCtx, base: i64) -> bool {
     if !noalias_active() {
         return false;
     }
-    let p = param_root(base);
-    p != 0 && !param_written(p)
+    let p = param_root(cx, base);
+    p != 0 && !param_written(cx, p)
 }
 
 // Whether [base1 + off1, + size1) and [base2 + off2, + size2) may overlap,
 // for an access that writes one of them (constant memory is never
 // written).
-pub fn may_alias(base1: i64, off1: i64, size1: i64, base2: i64, off2: i64, size2: i64) -> bool {
+pub fn may_alias(mut cx: *FnCtx, base1: i64, off1: i64, size1: i64, base2: i64, off2: i64,
+    size2: i64) -> bool {
     if base1 == base2 {
         return off1 < off2 + size2 && off2 < off1 + size1;
     }
-    if params_disjoint(base1, base2) {
+    if params_disjoint(cx, base1, base2) {
         return false;
     }
-    let r1 = root_of(base1);
-    let r2 = root_of(base2);
-    if is_constant_memory(r1) || is_constant_memory(r2) {
+    let r1 = root_of(cx, base1);
+    let r2 = root_of(cx, base2);
+    if is_constant_memory(cx, r1) || is_constant_memory(cx, r2) {
         return false;
     }
     if r1 != 0 && r2 != 0 {
-        if object_of(r1) != object_of(r2) {
+        if object_of(cx, r1) != object_of(cx, r2) {
             return false;
         }
         if base1 == r1 && base2 == r2 {
@@ -607,7 +608,7 @@ pub fn may_alias(base1: i64, off1: i64, size1: i64, base2: i64, off2: i64, size2
         return true;
     }
     // A private slot is only reached through itself.
-    !is_private_root(r1) && !is_private_root(r2)
+    !is_private_root(cx, r1) && !is_private_root(cx, r2)
 }
 
 // ---- Memory values ----
@@ -621,39 +622,38 @@ pub fn may_alias(base1: i64, off1: i64, size1: i64, base2: i64, off2: i64, size2
 // before it is read is dead. Writes kill what they may overlap; calls kill
 // what is neither private nor constant.
 
-static mut AVAIL: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static mut COPIES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static mut PENDING: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 const AVAIL_MAX: i64 = 256;
 
 // Removes entry i (of `width` values) from list l.
 fn list_remove(l: *IntVec, i: i64, width: i64) {
-    for k in 0..width {
-        unsafe { (*l).data[i + k] = (*l).data[(*l).count - width + k]; }
+    unsafe {
+        for k in 0..width {
+            (*l).data[i + k] = (*l).data[(*l).count - width + k];
+        }
+        (*l).count -= width;
     }
-    (*l).count -= width;
 }
 
 // A write of [base + offset, + size).
-fn avail_kill(base: i64, offset: i64, size: i64) {
+fn avail_kill(mut cx: *FnCtx, base: i64, offset: i64, size: i64) {
     unsafe {
         let mut i = 0;
-        while i < AVAIL.count {
-            let d = AVAIL.data;
-            if may_alias(base, offset, size, d[i], d[i + 1], d[i + 2]) {
-                list_remove(&AVAIL, i, 5);
+        while i < cx.avail.count {
+            let d = cx.avail.data;
+            if may_alias(cx, base, offset, size, d[i], d[i + 1], d[i + 2]) {
+                list_remove(&cx.avail, i, 5);
             } else {
                 i += 5;
             }
         }
         i = 0;
-        while i < COPIES.count {
-            let d = COPIES.data;
+        while i < cx.gvn_copies.count {
+            let d = cx.gvn_copies.data;
             let mut src_offset = 0;
-            let src = address_base(d[i + 3], &src_offset);
-            if may_alias(base, offset, size, d[i], d[i + 1], d[i + 2])
-                || may_alias(base, offset, size, src, src_offset, d[i + 2]) {
-                list_remove(&COPIES, i, 5);
+            let src = address_base(cx, d[i + 3], &mut src_offset);
+            if may_alias(cx, base, offset, size, d[i], d[i + 1], d[i + 2])
+                || may_alias(cx, base, offset, size, src, src_offset, d[i + 2]) {
+                list_remove(&cx.gvn_copies, i, 5);
             } else {
                 i += 5;
             }
@@ -662,22 +662,22 @@ fn avail_kill(base: i64, offset: i64, size: i64) {
 }
 
 // A call may write any memory but private slots and constants.
-fn avail_kill_call() {
+fn avail_kill_call(mut cx: *FnCtx) {
     unsafe {
         let mut i = 0;
-        while i < AVAIL.count {
-            if call_may_write(AVAIL.data[i]) {
-                list_remove(&AVAIL, i, 5);
+        while i < cx.avail.count {
+            if call_may_write(cx, cx.avail.data[i]) {
+                list_remove(&cx.avail, i, 5);
             } else {
                 i += 5;
             }
         }
         i = 0;
-        while i < COPIES.count {
+        while i < cx.gvn_copies.count {
             let mut src_offset = 0;
-            let src = address_base(COPIES.data[i + 3], &src_offset);
-            if call_may_write(COPIES.data[i]) || call_may_write(src) {
-                list_remove(&COPIES, i, 5);
+            let src = address_base(cx, cx.gvn_copies.data[i + 3], &mut src_offset);
+            if call_may_write(cx, cx.gvn_copies.data[i]) || call_may_write(cx, src) {
+                list_remove(&cx.gvn_copies, i, 5);
             } else {
                 i += 5;
             }
@@ -685,22 +685,24 @@ fn avail_kill_call() {
     }
 }
 
-fn avail_add(base: i64, offset: i64, size: i64, ty: i64, value: i64) {
-    if AVAIL.count >= AVAIL_MAX * 5 {
-        list_remove(&AVAIL, 0, 5);
+fn avail_add(mut cx: *FnCtx, base: i64, offset: i64, size: i64, ty: i64, value: i64) {
+    unsafe {
+        if cx.avail.count >= AVAIL_MAX * 5 {
+            list_remove(&cx.avail, 0, 5);
+        }
+        cx.avail.push(base);
+        cx.avail.push(offset);
+        cx.avail.push(size);
+        cx.avail.push(ty);
+        cx.avail.push(value);
     }
-    AVAIL.push(base);
-    AVAIL.push(offset);
-    AVAIL.push(size);
-    AVAIL.push(ty);
-    AVAIL.push(value);
 }
 
-fn avail_find(base: i64, offset: i64, ty: i64) -> i64 {
+fn avail_find(mut cx: *FnCtx, base: i64, offset: i64, ty: i64) -> i64 {
     unsafe {
         let mut i = 0;
-        while i < AVAIL.count {
-            let d = AVAIL.data;
+        while i < cx.avail.count {
+            let d = cx.avail.data;
             if d[i] == base && d[i + 1] == offset && d[i + 3] == ty {
                 return d[i + 4];
             }
@@ -712,29 +714,31 @@ fn avail_find(base: i64, offset: i64, ty: i64) -> i64 {
 
 // A read of [base + offset, + size): the stores it may read are no longer
 // dead when overwritten.
-fn pending_read(base: i64, offset: i64, size: i64) {
-    let mut i = 0;
-    while i < PENDING.count {
-        let d = PENDING.data;
-        if unsafe { may_alias(base, offset, size, d[i], d[i + 1], d[i + 2]) } {
-            list_remove(&PENDING, i, 4);
-        } else {
-            i += 4;
+fn pending_read(mut cx: *FnCtx, base: i64, offset: i64, size: i64) {
+    unsafe {
+        let mut i = 0;
+        while i < cx.pending.count {
+            let d = cx.pending.data;
+            if unsafe { may_alias(cx, base, offset, size, d[i], d[i + 1], d[i + 2]) } {
+                list_remove(&cx.pending, i, 4);
+            } else {
+                i += 4;
+            }
         }
     }
 }
 
 // A write of [base + offset, + size): the pending stores it covers are
 // dead.
-fn pending_overwrite(base: i64, offset: i64, size: i64) -> bool {
+fn pending_overwrite(mut cx: *FnCtx, base: i64, offset: i64, size: i64) -> bool {
     unsafe {
         let mut changed = false;
         let mut i = 0;
-        while i < PENDING.count {
-            let d = PENDING.data;
+        while i < cx.pending.count {
+            let d = cx.pending.data;
             if d[i] == base && d[i + 1] >= offset && d[i + 1] + d[i + 2] <= offset + size {
-                ir_unlink(d[i + 3]);
-                list_remove(&PENDING, i, 4);
+                ir_unlink(cx, d[i + 3]);
+                list_remove(&cx.pending, i, 4);
                 changed = true;
             } else {
                 i += 4;
@@ -745,83 +749,83 @@ fn pending_overwrite(base: i64, offset: i64, size: i64) -> bool {
 }
 
 // Memory effects of instruction v; returns whether anything changed.
-fn memory_step(v: i64) -> bool {
+fn memory_step(mut cx: *FnCtx, v: i64) -> bool {
     unsafe {
-        let op = INSTS[v].op;
+        let op = cx.insts[v].op;
         if op == Load {
-            let ty = INSTS[v].ty;
+            let ty = cx.insts[v].ty;
             let size = type_size(ty);
-            let mut offset = INSTS[v].imm;
-            let mut base = address_base(INSTS[v].a, &offset);
+            let mut offset = cx.insts[v].imm;
+            let mut base = address_base(cx, cx.insts[v].a, &mut offset);
             let mut changed = false;
             // From the source of a copy that still holds.
             let mut i = 0;
-            while i < COPIES.count {
-                let d = COPIES.data;
+            while i < cx.gvn_copies.count {
+                let d = cx.gvn_copies.data;
                 if d[i] == base && offset >= d[i + 1] && offset + size <= d[i + 1] + d[i + 2] {
-                    INSTS[v].a = d[i + 3];
-                    INSTS[v].imm = offset - d[i + 1];
-                    offset = INSTS[v].imm;
-                    base = address_base(INSTS[v].a, &offset);
+                    cx.insts[v].a = d[i + 3];
+                    cx.insts[v].imm = offset - d[i + 1];
+                    offset = cx.insts[v].imm;
+                    base = address_base(cx, cx.insts[v].a, &mut offset);
                     changed = true;
                     break;
                 }
                 i += 5;
             }
-            let known = avail_find(base, offset, ty);
+            let known = avail_find(cx, base, offset, ty);
             if known != 0 {
-                ir_replace(v, known);
+                ir_replace(cx, v, known);
                 return true;
             }
             // From constant data at a known offset: a constant.
-            if INSTS[base].op == SAddr {
+            if cx.insts[base].op == SAddr {
                 let mut ok = false;
-                let value = constant_load(INSTS[base].imm, offset, ty, &ok);
+                let value = constant_load(cx.insts[base].imm, offset, ty, &mut ok);
                 if ok {
-                    let c = ir_make(Const, ty, 0, 0, value);
-                    ir_insert_before(v, c);
-                    ir_replace(v, c);
+                    let c = ir_make(cx, Const, ty, 0, 0, value);
+                    ir_insert_before(cx, v, c);
+                    ir_replace(cx, v, c);
                     return true;
                 }
             }
-            pending_read(base, offset, size);
-            avail_add(base, offset, size, ty, v);
+            pending_read(cx, base, offset, size);
+            avail_add(cx, base, offset, size, ty, v);
             return changed;
         }
         if op == Store {
-            let ty = INSTS[v].imm2;
+            let ty = cx.insts[v].imm2;
             let size = type_size(ty);
-            let mut offset = INSTS[v].imm;
-            let base = address_base(INSTS[v].a, &offset);
+            let mut offset = cx.insts[v].imm;
+            let base = address_base(cx, cx.insts[v].a, &mut offset);
             // Storing what the location holds already: nothing to do.
-            if avail_find(base, offset, ty) == INSTS[v].b && INSTS[v].b != 0 {
-                ir_unlink(v);
+            if avail_find(cx, base, offset, ty) == cx.insts[v].b && cx.insts[v].b != 0 {
+                ir_unlink(cx, v);
                 return true;
             }
-            let changed = pending_overwrite(base, offset, size);
-            avail_kill(base, offset, size);
-            avail_add(base, offset, size, ty, INSTS[v].b);
-            PENDING.push(base);
-            PENDING.push(offset);
-            PENDING.push(size);
-            PENDING.push(v);
+            let changed = pending_overwrite(cx, base, offset, size);
+            avail_kill(cx, base, offset, size);
+            avail_add(cx, base, offset, size, ty, cx.insts[v].b);
+            cx.pending.push(base);
+            cx.pending.push(offset);
+            cx.pending.push(size);
+            cx.pending.push(v);
             return changed;
         }
-        if is_copy(v) {
-            let size = copy_size(v);
+        if is_copy(cx, v) {
+            let size = copy_size(cx, v);
             let mut src_offset = 0;
-            let src = address_base(copy_src(v), &src_offset);
+            let src = address_base(cx, copy_src(cx, v), &mut src_offset);
             let mut offset = 0;
-            let base = address_base(copy_dst(v), &offset);
-            pending_read(src, src_offset, size);
-            let changed = pending_overwrite(base, offset, size);
-            avail_kill(base, offset, size);
-            if !may_alias(base, offset, size, src, src_offset, size) {
-                COPIES.push(base);
-                COPIES.push(offset);
-                COPIES.push(size);
-                COPIES.push(copy_src(v));
-                COPIES.push(v);
+            let base = address_base(cx, copy_dst(cx, v), &mut offset);
+            pending_read(cx, src, src_offset, size);
+            let changed = pending_overwrite(cx, base, offset, size);
+            avail_kill(cx, base, offset, size);
+            if !may_alias(cx, base, offset, size, src, src_offset, size) {
+                cx.gvn_copies.push(base);
+                cx.gvn_copies.push(offset);
+                cx.gvn_copies.push(size);
+                cx.gvn_copies.push(copy_src(cx, v));
+                cx.gvn_copies.push(v);
             }
             return changed;
         }
@@ -829,18 +833,18 @@ fn memory_step(v: i64) -> bool {
             // It may read anything but private slots (unless its attributes
             // say it reads nothing), and write it (unless they say it writes
             // nothing; see ipo.tach).
-            if call_reads(v) {
+            if call_reads(cx, v) {
                 let mut i = 0;
-                while i < PENDING.count {
-                    if !is_private_slot(PENDING.data[i]) {
-                        list_remove(&PENDING, i, 4);
+                while i < cx.pending.count {
+                    if !is_private_slot(cx, cx.pending.data[i]) {
+                        list_remove(&cx.pending, i, 4);
                     } else {
                         i += 4;
                     }
                 }
             }
-            if call_writes(v) {
-                avail_kill_call();
+            if call_writes(cx, v) {
+                avail_kill_call(cx);
             }
         }
         false
@@ -849,23 +853,23 @@ fn memory_step(v: i64) -> bool {
 
 // The writes of block b, applied to AVAIL (for a block between a block and
 // one it dominates).
-pub fn apply_block_kills(b: i64) {
+pub fn apply_block_kills(mut cx: *FnCtx, b: i64) {
     unsafe {
-        let mut v = BLOCKS[b].first;
+        let mut v = cx.blocks[b].first;
         while v != 0 {
-            let op = INSTS[v].op;
+            let op = cx.insts[v].op;
             if op == Store {
-                let mut offset = INSTS[v].imm;
-                let base = address_base(ir_val(INSTS[v].a), &offset);
-                avail_kill(base, offset, type_size(INSTS[v].imm2));
-            } else if is_copy(v) {
+                let mut offset = cx.insts[v].imm;
+                let base = address_base(cx, ir_val(cx, cx.insts[v].a), &mut offset);
+                avail_kill(cx, base, offset, type_size(cx.insts[v].imm2));
+            } else if is_copy(cx, v) {
                 let mut offset = 0;
-                let base = address_base(ir_val(copy_dst(v)), &offset);
-                avail_kill(base, offset, copy_size(v));
-            } else if op.is_call() && call_writes(v) {
-                avail_kill_call();
+                let base = address_base(cx, ir_val(cx, copy_dst(cx, v)), &mut offset);
+                avail_kill(cx, base, offset, copy_size(cx, v));
+            } else if op.is_call() && call_writes(cx, v) {
+                avail_kill_call(cx);
             }
-            v = INSTS[v].next;
+            v = cx.insts[v].next;
         }
     }
 }
@@ -873,44 +877,44 @@ pub fn apply_block_kills(b: i64) {
 // ---- Dead stores to private slots ----
 
 // Removes the stores and copies into private slots that nothing reads.
-fn remove_unread_slot_writes(fi: i64) -> bool {
+fn remove_unread_slot_writes(mut cx: *FnCtx, fi: i64) -> bool {
     unsafe {
-        let n = SLOT_COUNT + 1;
+        let n = cx.slot_count + 1;
         let read = alloc_array::<i64>(n);
         for i in 0..IRFUNCS[fi].blocks.count {
             let b = IRFUNCS[fi].blocks.data[i];
-            if BLOCKS[b].removed != 0 {
+            if cx.blocks[b].removed != 0 {
                 continue;
             }
-            let mut v = BLOCKS[b].first;
+            let mut v = cx.blocks[b].first;
             while v != 0 {
-                let op = INSTS[v].op;
+                let op = cx.insts[v].op;
                 let mut from = 0;
                 if op == Load {
-                    from = root_of(INSTS[v].a);
-                } else if is_copy(v) {
-                    from = root_of(copy_src(v));
+                    from = root_of(cx, cx.insts[v].a);
+                } else if is_copy(cx, v) {
+                    from = root_of(cx, copy_src(cx, v));
                 }
-                if from != 0 && INSTS[from].op == Slot {
-                    read[INSTS[from].imm] = 1;
+                if from != 0 && cx.insts[from].op == Slot {
+                    read[cx.insts[from].imm] = 1;
                 }
-                v = INSTS[v].next;
+                v = cx.insts[v].next;
             }
         }
         let mut changed = false;
         for i in 0..IRFUNCS[fi].blocks.count {
             let b = IRFUNCS[fi].blocks.data[i];
-            if BLOCKS[b].removed != 0 {
+            if cx.blocks[b].removed != 0 {
                 continue;
             }
-            let mut v = BLOCKS[b].first;
+            let mut v = cx.blocks[b].first;
             while v != 0 {
-                let next = INSTS[v].next;
-                let op = INSTS[v].op;
-                if op == Store || is_copy(v) {
-                    let to = root_of(if op == Store { INSTS[v].a } else { copy_dst(v) });
-                    if is_private_root(to) && read[INSTS[to].imm] == 0 {
-                        ir_unlink(v);
+                let next = cx.insts[v].next;
+                let op = cx.insts[v].op;
+                if op == Store || is_copy(cx, v) {
+                    let to = root_of(cx, if op == Store { cx.insts[v].a } else { copy_dst(cx, v) });
+                    if is_private_root(cx, to) && read[cx.insts[to].imm] == 0 {
+                        ir_unlink(cx, v);
                         changed = true;
                     }
                 }
@@ -924,22 +928,22 @@ fn remove_unread_slot_writes(fi: i64) -> bool {
 
 // ---- The walk ----
 
-pub fn run_gvn(fi: i64) -> bool {
+pub fn run_gvn(mut cx: *FnCtx, fi: i64) -> bool {
     unsafe {
-        resolve_all(fi);
-        egraph_start();
-        build_dom_tree(fi);
-        find_escaping_slots(fi);
+        resolve_all(cx, fi);
+        egraph_start(cx);
+        build_dom_tree(cx, fi);
+        find_escaping_slots(cx, fi);
         let mut count = 0;
-        for i in 0..ORDER.count {
-            BLOCKS[ORDER.data[i]].mark = 0;
-            let mut v = BLOCKS[ORDER.data[i]].first;
+        for i in 0..cx.order.count {
+            cx.blocks[cx.order.data[i]].mark = 0;
+            let mut v = cx.blocks[cx.order.data[i]].first;
             while v != 0 {
                 count += 1;
-                v = INSTS[v].next;
+                v = cx.insts[v].next;
             }
         }
-        gvn_reset(count);
+        gvn_reset(cx, count);
         let mut changed = false;
         // What each block on the stack knows at its end: (start, count) in
         // `saved`.
@@ -947,66 +951,66 @@ pub fn run_gvn(fi: i64) -> bool {
         // Explicit stack of (layout index, child position, log mark, saved
         // start, saved count).
         let mut stack = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        AVAIL.count = 0;
-        EQ_MAP.count = 0;
+        cx.avail.count = 0;
+        cx.eq_map.count = 0;
         // (EQ_MAP's length when each block of the stack but the entry was
         // entered.)
         let mut eq_marks = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        gvn_block(ORDER.data[0], &changed);
+        gvn_block(cx, cx.order.data[0], &mut changed);
         stack.push(0);
         stack.push(0);
         stack.push(0);
         stack.push(saved.count);
-        for i in 0..AVAIL.count {
-            saved.push(AVAIL.data[i]);
+        for i in 0..cx.avail.count {
+            saved.push(cx.avail.data[i]);
         }
-        stack.push(AVAIL.count);
+        stack.push(cx.avail.count);
         while stack.count > 0 {
             let top = stack.count - 5;
             let k = stack.data[top];
             let next = stack.data[top + 1];
-            if DOM_START[k] + next < DOM_START[k + 1] {
+            if cx.dom_start[k] + next < cx.dom_start[k + 1] {
                 stack.data[top + 1] = next + 1;
-                let child = DOM_CHILD[DOM_START[k] + next];
-                let mark = GVN_LOG.count;
-                AVAIL.count = 0;
+                let child = cx.dom_child[cx.dom_start[k] + next];
+                let mark = cx.gvn_log.count;
+                cx.avail.count = 0;
                 let start = stack.data[top + 3];
                 let n = stack.data[top + 4];
                 for i in 0..n {
-                    AVAIL.push(saved.data[start + i]);
+                    cx.avail.push(saved.data[start + i]);
                 }
-                if !inherit_into(ORDER.data[k], child) {
-                    AVAIL.count = 0;
+                if !inherit_into(cx, cx.order.data[k], child) {
+                    cx.avail.count = 0;
                 }
-                eq_marks.push(EQ_MAP.count);
-                learn_equality(child);
-                gvn_block(child, &changed);
-                stack.push(BLOCKS[child].order);
+                eq_marks.push(cx.eq_map.count);
+                learn_equality(cx, child);
+                gvn_block(cx, child, &mut changed);
+                stack.push(cx.blocks[child].order);
                 stack.push(0);
                 stack.push(mark);
                 stack.push(saved.count);
-                for i in 0..AVAIL.count {
-                    saved.push(AVAIL.data[i]);
+                for i in 0..cx.avail.count {
+                    saved.push(cx.avail.data[i]);
                 }
-                stack.push(AVAIL.count);
+                stack.push(cx.avail.count);
             } else {
-                gvn_undo(stack.data[top + 2]);
+                gvn_undo(cx, stack.data[top + 2]);
                 saved.count = stack.data[top + 3];
                 stack.count -= 5;
                 if eq_marks.count > 0 {
                     eq_marks.count -= 1;
-                    EQ_MAP.count = eq_marks.data[eq_marks.count];
+                    cx.eq_map.count = eq_marks.data[eq_marks.count];
                 }
             }
         }
         free(eq_marks.data as *u8);
         free(stack.data as *u8);
         free(saved.data as *u8);
-        if remove_unread_slot_writes(fi) {
+        if remove_unread_slot_writes(cx, fi) {
             changed = true;
         }
         if changed {
-            resolve_all(fi);
+            resolve_all(cx, fi);
         }
         changed
     }
@@ -1023,163 +1027,158 @@ pub fn run_gvn(fi: i64) -> bool {
 // `if a.len != b.len { return false; }` lets the range analysis see that
 // an index below a.len is below b.len.
 
-// (y, x) pairs: y is x in the blocks being visited.
-static mut EQ_MAP: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 const EQ_MAX: i64 = 32;
 
-fn learn_equality(c: i64) {
+fn learn_equality(mut cx: *FnCtx, c: i64) {
     unsafe {
-        if BLOCKS[c].preds.count != 1 || EQ_MAP.count >= 2 * EQ_MAX {
+        if cx.blocks[c].preds.count != 1 || cx.eq_map.count >= 2 * EQ_MAX {
             return;
         }
-        let p = BLOCKS[c].preds.data[0];
-        if BLOCKS[p].term != Term::Branch || BLOCKS[p].s0 == BLOCKS[p].s1 || BLOCKS[p].cond == 0 {
+        let p = cx.blocks[c].preds.data[0];
+        if cx.blocks[p].term != Term::Branch || cx.blocks[p].s0 == cx.blocks[p].s1
+            || cx.blocks[p].cond == 0 {
             return;
         }
-        let cmp = ir_val(BLOCKS[p].cond);
-        if INSTS[cmp].op != Cmp || !is_integer(INSTS[cmp].imm2) {
+        let cmp = ir_val(cx, cx.blocks[p].cond);
+        if cx.insts[cmp].op != Cmp || !is_integer(cx.insts[cmp].imm2) {
             return;
         }
-        let eq = INSTS[cmp].cond == Cond::Eq && BLOCKS[p].s0 == c;
-        let ne = INSTS[cmp].cond == Cond::Ne && BLOCKS[p].s1 == c;
+        let eq = cx.insts[cmp].cond == Cond::Eq && cx.blocks[p].s0 == c;
+        let ne = cx.insts[cmp].cond == Cond::Ne && cx.blocks[p].s1 == c;
         if !eq && !ne {
             return;
         }
-        let a = ir_val(INSTS[cmp].a);
-        let b = ir_val(INSTS[cmp].b);
-        add_equality(a, b);
-        if INSTS[a].op == Conv && INSTS[b].op == Conv && is_integer(INSTS[a].ty)
-            && INSTS[a].ty == INSTS[b].ty && INSTS[a].imm2 == INSTS[b].imm2
-            && is_integer(INSTS[a].imm2)
-            && type_size(INSTS[a].imm2) == type_size(INSTS[a].ty) {
-            add_equality(ir_val(INSTS[a].a), ir_val(INSTS[b].a));
+        let a = ir_val(cx, cx.insts[cmp].a);
+        let b = ir_val(cx, cx.insts[cmp].b);
+        add_equality(cx, a, b);
+        if cx.insts[a].op == Conv && cx.insts[b].op == Conv && is_integer(cx.insts[a].ty)
+            && cx.insts[a].ty == cx.insts[b].ty && cx.insts[a].imm2 == cx.insts[b].imm2
+            && is_integer(cx.insts[a].imm2)
+            && type_size(cx.insts[a].imm2) == type_size(cx.insts[a].ty) {
+            add_equality(cx, ir_val(cx, cx.insts[a].a), ir_val(cx, cx.insts[b].a));
         }
     }
 }
 
-fn add_equality(a: i64, b: i64) {
+fn add_equality(mut cx: *FnCtx, a: i64, b: i64) {
     unsafe {
-        if a == b || INSTS[a].ty != INSTS[b].ty || (is_const(a) && is_const(b)) {
+        if a == b || cx.insts[a].ty != cx.insts[b].ty || (is_const(cx, a) && is_const(cx, b)) {
             return;
         }
         // y goes, x stays: a constant, or the older value.
         let mut x = a;
         let mut y = b;
-        if is_const(y) || (!is_const(x) && x > y) {
+        if is_const(cx, y) || (!is_const(cx, x) && x > y) {
             x = b;
             y = a;
         }
-        EQ_MAP.push(y);
-        EQ_MAP.push(x);
+        cx.eq_map.push(y);
+        cx.eq_map.push(x);
     }
 }
 
-fn equal_value(w: i64) -> i64 {
+fn equal_value(mut cx: *FnCtx, w: i64) -> i64 {
     unsafe {
-        let mut k = EQ_MAP.count;
+        let mut k = cx.eq_map.count;
         while k > 0 {
             k -= 2;
-            if EQ_MAP.data[k] == w {
-                return EQ_MAP.data[k + 1];
+            if cx.eq_map.data[k] == w {
+                return cx.eq_map.data[k + 1];
             }
         }
         w
     }
 }
 
-// (0.16) Calls numbered like pure instructions: the READONLY calls of the
-// current block since the last write (an equal one there is the same
-// value).
-static mut RO_CALLS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
 // Whether instruction v (a store, a copy or a call) may write memory a
 // READONLY call reads: anything but the caller's private slots.
-fn writes_for_calls(v: i64) -> bool {
+fn writes_for_calls(mut cx: *FnCtx, v: i64) -> bool {
     unsafe {
-        let op = INSTS[v].op;
+        let op = cx.insts[v].op;
         if op == Store {
             let mut offset = 0;
-            return !is_private_slot(address_base(INSTS[v].a, &offset));
+            return !is_private_slot(cx, address_base(cx, cx.insts[v].a, &mut offset));
         }
-        if is_copy(v) {
+        if is_copy(cx, v) {
             let mut offset = 0;
-            return !is_private_slot(address_base(copy_dst(v), &offset));
+            return !is_private_slot(cx, address_base(cx, copy_dst(cx, v), &mut offset));
         }
-        op.is_call() && call_writes(v)
+        op.is_call() && call_writes(cx, v)
     }
 }
 
-fn gvn_block(b: i64, changed: *bool) {
+fn gvn_block(mut cx: *FnCtx, b: i64, changed: &mut bool) {
     unsafe {
-        COPIES.count = 0;
-        PENDING.count = 0;
-        RO_CALLS.count = 0;
-        let mut v = BLOCKS[b].first;
+        cx.gvn_copies.count = 0;
+        cx.pending.count = 0;
+        cx.ro_calls.count = 0;
+        let mut v = cx.blocks[b].first;
         while v != 0 {
-            let next = INSTS[v].next;
-            ir_resolve_operands(v);
-            if EQ_MAP.count > 0 && INSTS[v].op != Phi {
-                for k in 0..ir_operand_count(v) {
-                    let w = ir_operand(v, k);
+            let next = cx.insts[v].next;
+            ir_resolve_operands(cx, v);
+            if cx.eq_map.count > 0 && cx.insts[v].op != Phi {
+                for k in 0..ir_operand_count(cx, v) {
+                    let w = ir_operand(cx, v, k);
                     if w != 0 {
-                        let x = equal_value(w);
+                        let x = equal_value(cx, w);
                         if x != w {
-                            ir_set_operand(v, k, x);
+                            ir_set_operand(cx, v, k, x);
                             *changed = true;
                         }
                     }
                 }
             }
-            let op = INSTS[v].op;
+            let op = cx.insts[v].op;
             if is_gvn_op(op) {
-                if is_commutative_op(v) && operands_out_of_order(INSTS[v].a, INSTS[v].b) {
-                    let a = INSTS[v].a;
-                    INSTS[v].a = INSTS[v].b;
-                    INSTS[v].b = a;
+                if is_commutative_op(cx, v)
+                    && operands_out_of_order(cx, cx.insts[v].a, cx.insts[v].b) {
+                    let a = cx.insts[v].a;
+                    cx.insts[v].a = cx.insts[v].b;
+                    cx.insts[v].b = a;
                 }
-                let w = gvn_find_or_add(v);
+                let w = gvn_find_or_add(cx, v);
                 if w != 0 {
-                    ir_replace(v, w);
+                    ir_replace(cx, v, w);
                     *changed = true;
                 } else if EGRAPH {
                     // (0.9: the rewrite rules, see egraph.tach)
-                    let best = egraph_rewrite(v);
+                    let best = egraph_rewrite(cx, v);
                     if best != v {
-                        ir_replace(v, best);
+                        ir_replace(cx, v, best);
                         *changed = true;
                     }
                 }
             } else {
-                let numbering = if op.is_call() { call_numbering(v) } else { 0 };
+                let numbering = if op.is_call() { call_numbering(cx, v) } else { 0 };
                 let mut w = 0;
                 if numbering == 1 {
-                    w = gvn_find_or_add(v);
+                    w = gvn_find_or_add(cx, v);
                 } else if numbering == 2 {
-                    for i in 0..RO_CALLS.count {
-                        if gvn_equal(v, RO_CALLS.data[i]) {
-                            w = RO_CALLS.data[i];
+                    for i in 0..cx.ro_calls.count {
+                        if gvn_equal(cx, v, cx.ro_calls.data[i]) {
+                            w = cx.ro_calls.data[i];
                         }
                     }
                 }
                 if w != 0 {
-                    ir_replace(v, w);
+                    ir_replace(cx, v, w);
                     *changed = true;
                 } else {
-                    if RO_CALLS.count > 0 && writes_for_calls(v) {
-                        RO_CALLS.count = 0;
+                    if cx.ro_calls.count > 0 && writes_for_calls(cx, v) {
+                        cx.ro_calls.count = 0;
                     }
                     if numbering == 2 {
-                        RO_CALLS.push(v);
+                        cx.ro_calls.push(v);
                     }
-                    if memory_step(v) {
+                    if memory_step(cx, v) {
                         *changed = true;
                     }
                 }
             }
             v = next;
         }
-        if BLOCKS[b].cond != 0 {
-            BLOCKS[b].cond = equal_value(ir_val(BLOCKS[b].cond));
+        if cx.blocks[b].cond != 0 {
+            cx.blocks[b].cond = equal_value(cx, ir_val(cx, cx.blocks[b].cond));
         }
     }
 }

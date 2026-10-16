@@ -47,6 +47,7 @@ test main.tach: 1 passed (1 #[test]; -O2 only)
 ## the program built without its tests (a #[cfg(test)] module is left out)
 % "$COMPILER" main.tach -o prog && ./prog < tests/gaps.in
 5 12345
+ok: built prog
 ## the levels must agree: a difference is the compiler's bug (here a
 ## test-only switch makes -O2 read the literal 12345 as 12346)
 % TACHYON_PLANT_MISCOMPILE=1 "$COMPILER" test gaps
@@ -67,6 +68,7 @@ checks.tach:1:1: error[import.wildcard] wildcard imports are not allowed: 'use s
 $ edit patch checks.tach:1 --old 'use super::*;' --new ''
 patched checks.tach:1	checks.tach	+0 -1 lines
 $ check
+ok: 0 errors in main.tach
 ## a #[test] takes nothing or `gpa: Gpa`
 % printf '#[test]\nfn takes(n: i64) {\n}\n' > checks.tach
 $ test

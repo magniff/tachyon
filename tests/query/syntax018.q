@@ -3,11 +3,11 @@
 ## an item shown with its clauses, a distinct type, test functions.
 $ items
 crate	syntax018/main.tach	14
-std	<std>	647
+std	<std>	706
 crate::tests	syntax018/main.tach	1
 $ show crate::push Stack Percent
 // crate::push	syntax018/main.tach:19-27	effects: panic
-fn push(s: *Stack, x: i64)
+fn push(s: &mut Stack, x: i64)
     requires s.len < s.max else "push on a full stack"
     ensures s.len == old(s.len) + 1
 {

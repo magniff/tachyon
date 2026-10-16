@@ -8,14 +8,14 @@ use crate::base::{
 };
 use crate::base::diag::{
     ERR_HELP, edit_distance, err_begin, err_end, err_failed_name, err_fix, err_fix_word,
-    err_fixable, err_help, err_help_sym, err_pos, err_str, err_sym, err_try, err_try_tool,
+    err_fixable, err_help, err_help_sym, err_pos, err_str, err_sym, err_try,
 };
 use crate::front::assoc::ensure_checked;
 use crate::front::ast::{FN_UNSAFE, NODES};
 use crate::front::ast::NodeKind::{CStr, Path, Str};
 use crate::front::check::{CHECK_UNCHECKED, LOCALS, Res, lookup_local, name_error};
 use crate::front::check::synth_mode::synth_expr;
-use crate::front::check::unsafety::{U_FN_VALUE, has_borrow_param, unsafe_op};
+use crate::front::check::unsafety::{U_FN_VALUE, unsafe_op};
 use crate::front::cimport::c_import_skip_reason;
 use crate::front::closures::note_local_use;
 use crate::front::generics::{TPL_NONE, env_lookup, instance_of, targ_count_error, template_of_key};
@@ -144,8 +144,9 @@ pub fn synth_name(n: i64) -> i64 {
             NODES[n].res = Res::Fn;
             NODES[n].y = f;
             ensure_checked(f, n);
-            if (FNS[f].attrs & FN_UNSAFE) != 0 || has_borrow_param(f) {
-                unsafe_op(n, U_FN_VALUE, c"using an `unsafe fn`, or a function with pointer parameters, as a value is unsafe (its callers are not checked)");
+            if (FNS[f].attrs & FN_UNSAFE) != 0 {
+                unsafe_op(n, U_FN_VALUE,
+                    c"using an `unsafe fn` as a value is unsafe (its callers are not checked)");
             }
             return fn_value_type(f);
         }
@@ -227,7 +228,8 @@ pub fn unknown_name_error(pos: i64, before: *u8, name: i64) -> ! {
 // API is listed.
 fn suggest_name(name: i64, value: bool, hint_std: bool) {
     unsafe {
-        if !value && rust_type_help(name) {
+        // (0.18.1: and `Reverse(x)`, a value, as a type)
+        if (!value || SYMS[name].text == "Reverse") && rust_type_help(name) {
             return;
         }
         let mut path = import_path_for(name, value);
@@ -247,7 +249,7 @@ fn suggest_name(name: i64, value: bool, hint_std: bool) {
             return;
         }
         let mut tie = false;
-        let near = nearest_name(name, value, &tie);
+        let near = nearest_name(name, value, &mut tie);
         if near >= 0 {
             err_help(c"did you mean '");
             err_help_sym(near);
@@ -384,7 +386,7 @@ fn rust_input_help(name: i64) -> bool {
         if t == "read_to_string" || t == "read_all" || t == "stdin" || t == "input"
             || t == "read_input" || t == "read" || t == "lines" || t == "read_lines"
             || t == "getline" || t == "gets" || t == "scanf" {
-            err_help(c"std reads stdin: `read_stdin_in(gpa)` (all of it, a Buf), `read_line(&buf)` (one line, Ok(false) at the end), `Scanner` (tokens)");
+            err_help(c"std reads stdin: `read_stdin_in(gpa)` (all of it, a Buf), `read_line(&mut buf)` (one line, Ok(false) at the end), `Scanner` (tokens)");
         } else if t == "parse" || t == "atoi" || t == "parse_i64" || t == "to_int"
             || t == "int" || t == "from_str" {
             err_help(
@@ -398,7 +400,8 @@ fn rust_input_help(name: i64) -> bool {
 
 // The help of an unknown type a Rust programmer writes (0.14): what
 // tachyon has instead, exactly (0.17: the type to write as the try: line
-// when there is one); whether there was one.
+// when there is one); whether there was one. (0.18.1) `Reverse`, a value
+// too (`Reverse(x)`).
 fn rust_type_help(name: i64) -> bool {
     unsafe {
         let text = SYMS[name].text;
@@ -425,6 +428,11 @@ fn rust_type_help(name: i64) -> bool {
         } else if text == "BTreeMap" {
             err_help(c"`std::HashMap<K, V>`; for its keys in order, collect them in a Vec and `std::sort` it");
             err_try(c"HashMap<K, V>");
+        } else if text == "Reverse" {
+            // (0.18.1) Rust's min-heap, `BinaryHeap<Reverse<T>>`, and its
+            // `Reverse(x)`: no tuple structs here
+            err_help(c"a min-heap is `MinHeap<T>` (prelude): `h.push(x)`, `h.pop()` gives the smallest first, no wrapper; `BinaryHeap<T>` pops the largest");
+            err_try(c"MinHeap<T>");
         } else if text == "VecDeque" || text == "LinkedList" {
             err_help(c"a `Vec<T>` (with a start index for a queue)");
             err_try(c"Vec<T>");
@@ -486,7 +494,7 @@ fn name_in_scope(name: i64, value: bool) -> bool {
 }
 
 // The name in scope nearest to `name` (see name_distance), or -1.
-fn nearest_name(name: i64, value: bool, tie: *bool) -> i64 {
+fn nearest_name(name: i64, value: bool, tie: &mut bool) -> i64 {
     unsafe {
         let mut near = near_to(name);
         for s in 0..SYM_COUNT {
@@ -629,7 +637,7 @@ fn shares_word(a: [u8], b: [u8]) -> bool {
 
 impl Near {
     // Whether candidate `cand` (a symbol) is closer than the best so far.
-    pub fn close(self: *Near, cand: i64) -> bool {
+    pub fn close(self: &Near, cand: i64) -> bool {
         unsafe {
             if cand < 0 || cand == self.want {
                 return false;
@@ -640,7 +648,7 @@ impl Near {
         }
     }
 
-    pub fn take(self: *Near, cand: i64) {
+    pub fn take(self: &mut Near, cand: i64) {
         unsafe {
             let d = name_distance(SYMS[self.want].text, SYMS[cand].text);
             if d == self.d {
@@ -656,7 +664,7 @@ impl Near {
     }
 
     // Offers candidate `cand`.
-    pub fn offer(self: *Near, cand: i64) {
+    pub fn offer(self: &mut Near, cand: i64) {
         if NEAR_COLLECT && cand >= 0 && cand != self.want {
             unsafe {
                 let mut seen = false;
@@ -677,7 +685,7 @@ impl Near {
 
     // The error's help, `did you mean 'x'?`, when there is a candidate and
     // no other help.
-    pub fn help(self: *Near) {
+    pub fn help(self: &Near) {
         unsafe {
             if self.best >= 0 && BUFS[ERR_HELP].len == 0 {
                 err_help(c"did you mean '");

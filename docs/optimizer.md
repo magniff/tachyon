@@ -34,6 +34,10 @@ Debugging flags: `--emit-ir` writes the optimized IR instead of assembly,
 `--verify-ir` checks the IR after every pass, `--print-after-all` prints
 every function after every pass (on stderr).
 
+`-j N` (0.18.1): the threads -O1 and -O2 optimize and emit the functions
+on (default: the processors, at most 8); the output is the same bytes
+whatever N (see "0.18.1: threads").
+
 ## The IR
 
 A function is a control flow graph of basic blocks. Instructions compute
@@ -1809,7 +1813,8 @@ besides its own tables:
   (`DBG_FNS`) and statistics. For output identical whatever the thread
   count, 0.18 emits each function into a buffer of its own with local
   label numbers, rebased when the buffers are joined in order, and
-  registers constant data at that join.
+  registers constant data at that join. (Done in 0.18.1: "0.18.1:
+  threads", below.)
 
 **Measured** (aarch64-macos, the compiler compiling itself, `-c`; wall
 time best of 5 alternating (load about 5), instructions retired, peak
@@ -2036,3 +2041,590 @@ and a `&T` written through a raw pointer, without `--values=error`: the
 test stays and the results are right), `opt_copy_move` (a move elided in
 a loop), `opt_nrvo` (the returned local built in the result; not with two
 locals; a defer after the return value).
+
+## 0.18.1: threads
+
+Task T7 of [design/contracts-verification.md](design/contracts-verification.md)
+(§4.3): the middle and back end run each function's work on several
+threads. `-j N` (or `-jN`) sets the threads; the output is the same
+bytes whatever N.
+
+**The default** is the processors online, at most 8, and for a small
+program one thread per 16 functions (a thread costs about as much to
+start as a few small functions to compile). On this machine (4
+performance and 6 efficiency cores) -j8 and -j10 are within noise of
+each other and well ahead of -j4 (measured below): the efficiency cores
+are worth having, and past 8 the serial part (the front end, lowering,
+interprocedural constants, the join) dominates. `-j1` makes no thread:
+the main thread runs every task, in order.
+
+**The state of a thread** (`middle/ctx.tach`). The 289 statics of
+middle, back and gen0 that a function's optimization and emission write
+(the passes' scratch, the current function's IR tables, the loop forest,
+the value ranges, the register allocator's intervals, the emitter's frame
+and peephole memory, the CODE and ASM buffers) are fields of
+`middle::ctx::FnCtx`, and the 1284 functions that reach one take `mut
+cx: *FnCtx`. Serial code passes `main_cx()`; each thread of the pool has
+its own (`threads::POOL_CTX`). The move was done by a script over `query
+refs` and `query def` positions (there is no `refactor context` yet),
+then `fix --only imports,unsafe` and `fmt`; `same-output` against
+v0.17.0 found the 8316 compilations identical. The parameter is a raw
+pointer (`mut`): as a 0.17 legacy reference, nested calls (`f(cx,
+g(cx))`) would be exclusivity conflicts.
+
+**The tasks** (`middle/parallel.tach`, on `middle/threads.tach`'s pool):
+
+| phase | -O1 | -O2 | a task |
+|---|---|---|---|
+| cleanup | yes | yes | one function's `cleanup_function` |
+| scalar pipeline | (the small leaves, serial) | yes | one function's `simplify_function` |
+| interprocedural constants, SCCs, budget | | serial | |
+| bottom up | | a level at a time | one component: tail recursion, inlining, heap to stack, the loop passes, its attributes |
+| dead functions | | serial | |
+| emission | yes | yes | one function: -O1's pipeline, or -O2's waiting loop passes and SLP; selection, allocation, emission into its own text |
+| join | beside the emission | beside the emission | the main thread, in program order |
+
+A component's **level** is 0 when it calls no other component, else one
+more than the highest level of the components it calls, or whose address
+it takes when they come before it in SCC_ORDER (a call through the
+address may be made direct and inlined). The components of a level run
+at once; the next level starts when they are done.
+
+**The same output whatever the threads.** A task reads only what is
+final when it starts, and what tasks make for the program is joined in
+program order between phases:
+
+- *Labels.* A task numbers its function's labels from 1 and writes them
+  `L\x01<n>`; the join renumbers them from the labels before
+  (`join_text`), as one thread numbered them.
+- *Constant data* (SROA's constant tables, `const_data`): a task gets a
+  placeholder id, `-(1 + function << 20 + k)`, which the IR carries (and
+  inlining copies); it is numbered at the end of the phase in the order
+  of (phase, rank, k), the order one thread makes them in, and the text
+  writes `Lstr.\x02<n>` until then. -O1's (made in the emission tasks)
+  are numbered at the join, which goes in that order. The program's
+  strings grow only between phases (`register_consts`), since the tasks
+  read them.
+- *The inlining budget and call counts* were shared counters, which each
+  component inlined against and changed: the decisions depended on the
+  order the components were done in. Now a component sees the program's
+  size and call counts as the lower levels left them, plus its own
+  changes (`program_size`, `calls_left`); the barrier between levels adds
+  the level's.
+- *Facts of other functions* (attributes, no-capture bits, sizes,
+  `FN_RT`, deciders, optimized IR): in the bottom-up phase a task reads
+  those of lower levels only (`fn_facts_ready`), done before its level
+  began; 0.17 read whichever were done, which threads would make a race.
+  A callee is resolved, and its call flags and deciders made, by its own
+  task when its component is done (`finish_component_function`); the
+  inliner's maps from a callee's ids to their copies are in the caller's
+  context (0.17 wrote them into the callee's `aux`).
+- *Nothing a task finds in its context was left by another task* (which
+  task a thread runs next is the schedule's): gvn's `param_written` cache
+  is dropped at each task (`begin_task`); `set_site`'s tables grow to
+  cover a block instead of recording it only when the largest function
+  before had made them large enough; e-graph folding uses the free entry
+  after the function's last instruction (0.17 made the program's first
+  scratch an instruction of whichever function needed it first).
+  `TACHYON_FRESH_CONTEXTS=1` gives each task a new context: the output
+  must not change (tests/threads.sh).
+- Modes that keep the program's state in statics or print as they go run
+  on one thread: `-g`, `--time-passes` (its clock is the process's),
+  `--stats`, `--verify-ir`, `--verify-regalloc`, `--print-after-all`,
+  `--print-regalloc`.
+
+**What changed in the output** (`same-output` against v0.17.0, 8316
+compilations): -O0 and -O1 are v0.17.0's, byte for byte, assembly and
+objects, on every target. At -O2, 88 compilations differ: 23 of the 672
+programs, on each target. Each is the budget's or the call counts' view
+(a component no longer sees the growth or the inlined calls of the
+components done before it in its level), or a fact a call made direct
+read of a function of the same level, or `set_site`. bench/ has one of
+them (iterchain); the compiler grows by 7% (its budget was spent before
+its own passes came, in 0.17's order too), and its -O2 self-compile
+executes 5% more instructions at -j1.
+
+**Why there is no data race.** Every static is in one of these groups,
+and the tests below keep it so:
+
+1. *Per thread:* the 289 in `FnCtx`; a thread uses only its own context.
+2. *Written only between phases,* by the main thread while no task runs:
+   the program's tables (types, symbols, strings, FN_LIVE, SCC_ORDER,
+   the components and their levels, PROGRAM_SIZE, FN_CALLS), and what
+   `prepare_tasks` makes before the first phase and `prepare_layouts`
+   before each: the symbols the passes compare with (memcpy, malloc,
+   calloc, free, rt.panic), the e-graph's rules, the C library's effects
+   table, every type's layout (so `compute_layout` only reads), the
+   growth mode. A task never adds a type, a string, a symbol or a buffer:
+   abi's offsets read the precomputed layouts (`variant_offset`,
+   `struct_offset`), constant data waits for its id, tasks format into
+   their own text (`cx_fmt`).
+3. *One entry per function or component, written by its own task:*
+   IRFUNCS[fi] (its tables, saved when the task ends, `ir_release`),
+   FN_SIZE, FN_RT, FN_DECIDERS, DEFERRED, FN_ATTRS and FN_NOCAPTURE (the
+   component's), FN_CONSTS and FN_TEXT, COMP_GROWTH and COMP_INLINED,
+   and a context's buffers' entries in BUFS (no buffer is made while
+   tasks run, so BUFS does not move). Another task reads such an entry
+   only when its writer is done: a lower level's in the bottom-up phase,
+   an earlier phase's otherwise; the join reads a text once its task is
+   marked done. The order comes from the pool's mutex: a task's writes
+   come before its thread takes the mutex to count it done, and the next
+   phase (or level) is handed over, and a joined task is seen done,
+   under the same mutex. A function's constants live in chunks that never
+   move, since a task may read one made in an earlier phase while its
+   owner adds more.
+4. *Only in modes that run on one thread,* or on the way to an internal
+   error, which exits: the -g records, `--stats`' and `--time-passes`'
+   totals, the IR printers' buffers, `buf_new` and `buf_fmt` there.
+5. *The pool's own state,* READY, REMAINING, PHASE_KIND, STOP and the
+   joined flags, read and written with the mutex held.
+
+The join runs beside the tasks: it writes the program's ASM buffer, the
+assembler's state and the joined function's text and constant ids, none
+of which a running task touches. The assembler keeps to its own state
+since 0.18.1: its names (`ASym.text` and a table by name, not interned
+symbols), its mnemonics and registers (`NameMap`s, not tables indexed by
+symbol), the text it reads (`ATEXT`, not a buffer of BUFS) and the bytes
+it writes (`OBJ`, not OBJ_BYTES in BUFS).
+
+**-O0** compiles from the syntax tree, with the checker, whose statics
+are not per thread: its functions are generated on the main thread, as
+before, and the streaming assembler takes their texts (copies, through a
+queue under a mutex of its own) on a thread of its own
+(`threads::asm_thread_start`), which its own state above makes safe
+beside the main thread. The main thread does not assemble while it runs
+(`asm_thread_finish` joins it before the runtime's and the data's text).
+At -O1 and -O2 the join assembles beside the tasks already; handing its
+texts on to that thread measured no gain.
+
+`tests/threads_writes.sh` checks the groups: it lists every static that
+code reachable from `run_task` writes (by `query callees --transitive`
+and `query refs`; a mutating method call and an address taken count),
+78 of them, and every one must be in its table with the reason; then
+the statics the join writes that task code reads or writes, 14, against
+a second table; then those -O0's assembler thread and its main thread
+share, 12, each on an internal error's path, under -g (which does not
+stream, so has no assembler thread) or read before the thread starts,
+against a third. A new write fails the test with the `query callees
+--writes` command that shows its chain. The effects cannot say this
+(they do not tell a read of a static from a write). ThreadSanitizer
+is not available, but valgrind is (aarch64-linux, the compiler
+cross-built): memcheck on the -O2 self-compile at `-j1` and `-j4`, and
+DRD, a happens-before race detector, on it at -O1 and -O2 `-j4` and on
+the -O0 one (with the assembler thread), found no error (nor DRD and
+helgrind on examples/md5 at `-j4`; helgrind's only reports without its
+default suppressions are glibc's own mutex and condition variable
+words); the -j1 and -j4 objects are the same there too.
+
+**Tests.** `tests/threads.sh` (the gate's `threads` step, also in
+`--quick`, with `tests/threads_writes.sh`): every program of the corpus
+at -O0, -O1 and -O2 compiled at -j1 and -j8 (the self-compile also at
+-j3, and with `TACHYON_FRESH_CONTEXTS=1`, and to assembly) must give the
+same object, the same output and the same exit: 2179 compilations. `TACHYON_PHASE_TIMES=1` prints each
+phase's wall time.
+
+**Measured** (aarch64-macos, the compiler compiling itself, `-c`, after
+the merge of 0.18.0, against v0.18.0; best wall of 5 alternating runs,
+median user time, peak RSS, median instructions retired; an agent eval
+and other agents kept the load at 7 to 9, so the wall times are a few
+percent high):
+
+| | v0.18.0 | -j1 | -j2 | -j4 | -j8 | -j10 |
+|---|---|---|---|---|---|---|
+| -O0 wall / user / RSS | 0.35 s / 0.33 / 370 MB | 0.35 / 0.32 / 338 | 0.30 / 0.33 / 356 | 0.29 / 0.35 / 357 | **0.30** / 0.44 / 360 | 0.29 / 0.33 / 355 |
+| -O0 instructions | 7.63 G | 7.49 | 7.52 | 7.52 | 7.53 | 7.52 |
+| -O1 wall / user / RSS | 0.87 s / 0.84 / 480 MB | 0.83 / 0.81 / 456 | 0.57 / 0.84 / 473 | 0.42 / 0.84 / 477 | **0.37** / 1.06 / 504 | 0.36 / 1.09 / 484 |
+| -O1 instructions | 14.47 G | 13.21 | 13.24 | 13.24 | 13.28 | 13.28 |
+| -O2 wall / user / RSS | 2.13 s / 2.09 / 630 MB | 2.16 / 2.18 / 642 | 1.33 / 2.30 / 643 | 0.87 / 2.35 / 652 | **0.72** / 2.92 / 671 | 0.70 / 3.06 / 678 |
+| -O2 instructions | 35.88 G | 33.64 | 33.84 | 33.75 | 33.79 | 33.79 |
+
+-O2 is 3.0 times faster at -j8 and -j10 (the design's goal was 3, and
+at most 0.65 s at -j10), -O1 2.4 times, -O0 1.2 times (its assembler
+beside its code generation; the goal was 0.20 s). The instructions
+retired fall at -j1 (the context's fields cost less than the statics
+did, and -O0's assembler no longer interns every label), though -O2
+inlines more (the budget's view, above). The user time grows with the
+threads (the efficiency cores run slower; the allocator and the caches
+are shared). Measured before the merge, against v0.17.0 at load 2 to 6:
+-O2 1.98 s to 0.69 s at -j8, -O1 0.81 to 0.35, -O0 0.33 to 0.27.
+
+Phases at -O2 -j8 (`TACHYON_PHASE_TIMES=1`, ms; -j1's in parentheses):
+front end 115, lowering 45, cleanup 13 (20), scalar pipeline 40 (206),
+interprocedural constants and the components' levels 42, bottom up 242
+(994), dead functions 32, emission with the join and the assembler 106
+(538), data and output 24: 660 ms, of which 300 serial.
+
+**What is left.**
+- *-O0's code generation* is serial: gen0 compiles from the syntax tree
+  and reaches the checker (lazily checked items, instantiation), whose
+  statics are not per thread; only the assembler runs beside it.
+- *The serial part:* the front end, lowering, interprocedural constants
+  and dead functions (about 280 ms at -O2); the bottom-up phase's level
+  barriers (a level waits for its slowest component; the largest
+  component, the checker's, is one task).
+- *Per-function assembly:* the join still assembles the text on one
+  thread; the design's workers assemble their function into bytes and
+  relocations.
+- *-g, --time-passes, --stats* on one thread.
+- The budget's view overshoots within a level; a deterministic share of
+  the level's remaining budget would bring the compiler's code back.
+
+**For incremental builds (T8).** A function's output is now a unit: its
+text and label count (`FN_TEXT`), its constants (`FN_CONSTS`, by
+placeholder), produced by one `run_task` from its IR after the
+whole-program phases and the facts of lower levels. A cache key is the
+IR as `K_EMIT` (or the bottom-up task) receives it plus what
+`fn_facts_ready` lets it read, and the program's budget and call counts
+as its level sees them (`program_size`, `calls_left`); `join_task` is the
+place to splice cached texts in, and `resolve_consts` numbers their
+constants as one thread would.
+
+## 0.18.1: incremental rebuilds
+
+Task T8 of [design/contracts-verification.md](design/contracts-verification.md)
+(§4.4), on T7's tasks: a task of `middle::parallel` whose inputs are the
+same as in an earlier build takes that build's outputs instead of
+running (`back/codecache`). Three kinds of tasks are cached:
+
+| entry | in | out |
+|---|---|---|
+| scalar (-O2) | a function's IR as lowered | its cleanup's and scalar pipeline's IR, and their constant data (the two tasks' phases are one entry; -O1's cleanup alone costs less than its entry) |
+| component (-O2) | a component's functions' IR after interprocedural constants | their optimized IR, size, call flags, deciders, attributes, whether their loop passes wait; the component's growth and calls inlined |
+| emission (-O1, -O2) | a function's IR as emission receives it | its text and constant data |
+
+**The key** of an entry: the kind; the compiler (a hash of its
+executable) and the command line (every option but `-o`, `-j`, the
+cache's own and the diagnostics', and the `TACHYON_*` variables the code
+generator reads); the target and the optimizer's switches; every type
+of the program (`types_hash`: each type's description and layout, a
+struct or enum by its fields and variants, not its name); and per
+function of the task its symbol (with its module's path: a C function
+declared in several modules has one declaration in each), what the
+program knows of it as the task begins (live, address taken, -O1's leaf
+marks, at -O2 its size, call flags, deciders, attributes, whether its
+loop passes wait) and its IR's hash. The IR's hash (`hash::ir_hash`,
+128 bits) takes every field of every instruction, block and slot, the
+operand lists, the switch cases and the function's move notes, but the
+scratch fields `mark` and `aux` (stamps a pass left, which every pass
+writes before it reads), and the ids an edit elsewhere renumbers by
+what they name: a string by its bytes and its place among the
+function's strings, a symbol (GADDR, CALLC) by its text (a static's
+type and linkage too), a function (CALL, FADDR) by `fn_canon` (its
+symbol, linkage, signature, attributes, effects, whether it is a
+closure's, a C name the program links, whether it has IR), constant
+data a task made by its owner's symbol, its place and its bytes.
+
+**What a task read** of other functions is recorded as it runs, at the
+accessors (`cc_note`): the callee of a call (`ir_callee`, whose fixed
+facts: live, address taken, leaf marks, in the task's SCC, ready),
+`fn_facts_ready`, a callee's size, attributes and no-capture bits, call
+flags, deciders and IR (`ir_enter`, `ir_view` in `inline_call`). Two reads
+of the program record their answer, not the value: whether the
+program, grown by what the component inlined so far and the callee, is
+within the inlining budget (`budget_allows`), and whether a callee has
+one call left (`calls_left`); the program's size changes with every
+edit, the answers rarely. An entry is used only when every recorded read
+reads the same now (a verifying trace, as in Salsa or Bazel), and when
+the functions whose IR it read have their strings the same ids as in
+its build (an alias hash). A read of a function that is not ready (its
+task may be writing it) is not recorded; a read of IR whose hash is not
+known poisons the task (it runs, nothing is stored).
+`tests/threads_writes.sh` lists every static task code touches (175)
+and each must be in its table with how the cache covers it: the key,
+a recorded read, the IR's hash, a mode the cache is off in, or the
+cache's own.
+
+**The outputs** name strings, symbols, functions and constant data by
+what they are (`snapshot::Rel`): a string by the function whose list
+holds it (the task's own, or one whose IR it read) and its place there,
+constant data by its owner and place (the task's own: past what it had
+when the task began), a symbol by its text, a function by its symbol
+(by its index when another function has the symbol: the IR's hashes
+hold the index then). An emission's text writes its strings
+`str.\x03<i>`, the i-th of the text's, and the join puts their ids (as
+it numbers labels, `\x01`, and constant data, `\x02`). A hit installs
+the IR, the facts and the text, and makes the constant data again in
+its order, in its phase and rank (the same placeholders, numbered as
+one thread numbers them).
+
+**The pack**: `target/tachyonc-cache/g-KEY.pack`, where the tools'
+cache is (`$TACHYON_CACHE` names another directory, or `off`; without
+it there is a cache only when the current directory has a `target`
+directory), KEY a hash of the root as given, the current directory, the
+command line, the options and the compiler. It is 8-byte words: a
+header (magic, version, compiler, options, length, entries, last use),
+then each entry's length, key, age and body hash, and its body (bytes of
+variable-length numbers). It is mapped whole and indexed by key; a body
+is checked against its hash when its entry is used (a damaged one is a
+miss). A build that made entries writes a new pack, renamed over the old
+one (concurrent builds each write a whole one; the last stays), by a
+copy of the process after the output is written (here with
+`$TACHYON_CACHE_SYNC` or `$TACHYON_CACHE_TRACE`): the entries it used and
+made, and the others for 3 builds while the pack stays under twice the
+used ones (32 MB at least). When the directory's packs pass
+`$TACHYON_CACHE_LIMIT` MB (1024), the least recently used go. A build
+that used every entry and made none only marks the pack used.
+
+**Run-time numbers.** A check's site (front/contracts/sites.tach) and
+its kind past the four fixed ones (an enum's, a contract's message) are
+numbers the run-time helper reads, made in the front end's order: an
+edit that added a check anywhere moved every later one, and the code of
+every later function with a check changed. They are RTID values in the
+IR (`middle::ir::ir_rtid`, a contract's site literal too: `INT_SITE`),
+named by their function and place (`FN_RTIDS`), which no edit elsewhere
+changes; emission writes a load of one as the line `\x04REG,INDEX`, and
+the join writes the load (`m_load_imm`) of the program's number for it,
+given in the order the join meets them (`gen0::target::rt_output`);
+`emit_runtime` writes the tables in that order. -O0 keeps the front end's
+numbers.
+
+**Off:** `--no-cache` or `--cache=off`, or `$TACHYON_CODE_CACHE=off` (the
+tools' cache as it is); a program whose live functions have fewer than
+8000 instructions as lowered, unless `--cache=on` (a 7-line program with
+std has 1405: its build at -O1 takes 6 ms, the cache's start, the
+compiler's hash and the pack, 4 ms more; examples/calc, 3321, 7.3 ms
+and 8.0; examples/closures-iterators, 8230, 10.6 and 10.5 at -O1, 36 and
+13 at -O2); at -O0; with -g, `--trace`,
+`--time-passes`, `--stats`, the IR and register printers and checkers,
+profiles, `--check-alloc`, `--check-unsafe`, `--coverage`,
+`--verify-effects`, `--print-checks`, `--emit-ir`, `--emit-mir`,
+`--vec-stats`, and any option the cache does not know. tests/run.sh
+runs without it (`TACHYON_CODE_CACHE=off` unless set), and so do the
+gate's steps but `incremental` and `suite-O2` (a smoke row, its cache in
+the run's directory, removed after).
+`$TACHYON_CACHE_STATS` prints each kind's hits and misses (new, a read
+changed, unreadable, not cacheable); `$TACHYON_CACHE_WHY` (with `-j1`)
+each miss and the read that changed; `$TACHYON_CACHE_CHECK` reads every
+component entry back as it is made and compares the IR.
+
+**The same bytes.** `tests/incremental.sh` (the gate's `incremental`
+step, also in `--quick`): the compiler's own source (10 seeded edits and
+the 6 most recent commits to compiler/src of at most 60 lines that still
+undo, each undone and redone), the examples and bench (4 edits each, with
+`--cache=on`), at
+-O1 and -O2, with -j1 and -j8: a cold build with the cache must be the
+object a build without it makes, then after each edit the rebuild with
+the cache must be the clean build's object, then the tree put back
+(the first entries, aged): 148 series, 90 to 93% of the tasks hits. The edits:
+a `let x = N;` made N + 1 (a function's code), a new `let` of a new
+string (every later string and symbol id moves), a comment line (every
+later check's position in the file), a new function (every later
+function id), a new `let` indexing an array (a new check: every later
+check's site). `tests/threads.sh` runs without the cache (-jN would take
+-j1's outputs).
+
+**Measured** (aarch64-macos, the compiler's self-compile `-c`, best of
+5, load 2 to 6; an edit: `let x = N;` to N + 1 in a function of
+compiler/src, five of them, the mean):
+
+| | cold, no cache | cold, cache (overhead) | warm, nothing changed | warm, one function edited | pack |
+|---|---|---|---|---|---|
+| -O2 -j8 | 0.77 s | 0.80 s (+4%; +13% writing in the process) | 0.47 s | 0.53 s | 76 MB |
+| -O2 -j1 | 2.26 s | 2.48 s (+10%) | 0.62 s | 0.67 s | 76 MB |
+| -O1 -j8 | 0.41 s | 0.39 s | 0.34 s | 0.36 s | 15 MB |
+| -O1 -j1 | 0.87 s | 0.89 s | 0.37 s | 0.38 s | 15 MB |
+
+Phases of the -O2 -j8 rebuild with nothing changed (ms): front end 127,
+lowering 51, cleanup and scalar pipeline (hashing the lowered IR, the
+entries read) 32, interprocedural constants 49, components 40, dead
+functions 36, emission with the join and the assembler 80, data and
+output 25. The serial parts this task does not touch (the front end,
+lowering, interprocedural constants, dead functions, the join's
+assembly, the data) are about 360 ms: the design's goal (at most 0.4 s
+after one edit) needs the front end's (out of T8's scope) and the
+assembler's per function. The suite runs 6% slower with the cache on
+(its programs are small; the compiler's own builds write 76 MB packs),
+and its packs took about 450 MB; it now runs without the cache.
+
+The 12 most recent commits to compiler/src that undo cleanly, undone one
+at a time (-O2 -j8, 6553 scalar, 6115 component and 5256 emission
+tasks): 11 rebuild with 0 to 34 tasks of a kind missing; 1 changes a
+struct's fields, and every entry misses (a cold build). Before the
+run-time numbers were RTID values, the 4 of them that add or remove a
+check missed about 415 components each (every later function with a
+check, std's always).
+
+The serial parts of the -O2 -j8 rebuild with nothing changed (ms, load
+6 to 8): the front end 140 (parsing 27, checking 104, effects 6, own 10;
+std's is checked lazily: a 7-line program's front end takes 1.5), lowering
+55, interprocedural constants and the components 60, dead functions 40,
+the join 16 and the assembler 87 (the main thread, beside the emission's
+tasks), the data and the output 27: about 425 of the 580. The next steps
+for rebuild latency: per-function assembly (T7's, whose bytes the cache
+would keep instead of the text: the 87), the front end's own
+incrementality (the 195 of parsing, checking and lowering), and the call
+graph's counts kept between phases (dead functions recounts every
+call).
+
+**What is left.**
+- *Types.* An edit that adds, removes or changes a type (a new tuple, a
+  closure, a struct's fields) misses everything: the key holds every
+  type's id and description. A type's id is its place in creation
+  order; naming types by their structure (and their ids in the outputs
+  by it, as strings) would keep the rest.
+- *The serial parts* above, and per-function assembly (T7's), whose bytes
+  the cache could keep instead of the text.
+
+## Contracts and generated code: the evidence
+
+0.18 turns a checked `requires` into a branch at the call and a checked
+`ensures` into a branch after the call (front/contracts/expand.tach), so
+the range analysis (middle/range) sees their conditions as facts once
+the callee is inlined. Nothing is ever assumed: a fact comes only from a
+check that ran. This section measures whether that makes code faster
+(0.18.1, aarch64-macos, -O2, the M-series host).
+
+**The bench pair.** bench/contracts.tach has four kernels over
+`Vec<i64>`; bench/contracts_plain.tach is the same program without the
+clauses (an argument 1-4 runs one kernel). Instructions retired (robust
+under load); wall time the best of 5 runs at a load of about 5.5 on 12
+cores, so only large differences in it mean anything. "HEAD" is
+release-0.18.1 as it was (29de9e34); "fixed" adds the two range fixes
+below; "facts" adds the entry facts and remainders (c181-facts, below:
+"After entry facts"). Checks are `query checks` (`--print-checks=`), per
+iteration of the kernel's hot loop; the plain columns are the fixed
+compiler's (HEAD's where it differs; the facts compiler's plain program
+is the fixed one's, byte for byte).
+
+| kernel | clause | checks in the loop: plain / HEAD / fixed / facts | instructions: plain / HEAD / fixed / facts (M) | wall ms: plain / fixed | vectorized |
+|---|---|---|---|---|---|
+| 1 prefix: `for i in 0..n { s += v[i] }` | `requires 0 <= n && n <= v.len()` | 1 / 1 / **0** / 0 | 1315 / 1313 / **218** (-83%) / 218 | 47 / 19 | fixed, facts |
+| 2 window: `weigh(v, i)` reads v[i..i + 4], called for each i | `requires 0 <= i && i + 4 <= v.len()` | 4 / 5 / 5 / 5 | 1731 / 2142 / 2140 (+24%) / 2142 (+24%) | 47 / 57 | no |
+| 3 bucket: `counts[bucket(x, counts.len())] += 1` | `requires n > 0`, `ensures 0 <= result && result < n` | 1 / 4 / 3 / **1** | 1212 / 1812 / 1632 (+35%) / **1393** (+15%) | 67 / 70 | no |
+| 4 dot: `for i in 0..a.len() { s += a[i] * b[i] }` | `requires a.len() == b.len()` | 1 (HEAD: 2) / 0 / **0** / 0 | 1651 (HEAD: 1979) / 1487 / **669** (-59%) / 670 | 56 / 29 | no |
+| all four | | | 5882 (HEAD: 6201) / 6717 / 4624 / **4383** | | |
+
+The whole program: with HEAD the clauses cost 8% more instructions than
+none (6717M against 6201M, HEAD's plain); with the fixes they save 21%,
+with the entry facts and remainders 25% (4383M against 5871M).
+
+**The survey.** `--print-checks=` over bench/ (23 programs) and the 39
+examples, at -O2, as they are (no clauses of their own; std's apply).
+
+| | left | removed by ranges | removed otherwise |
+|---|---|---|---|
+| HEAD, all 62 programs | 1670 (user code 577, std 1093) | 1138 | 304 |
+| fixed, all 62 programs | 1564 (user code 578, std 986) | 1166 | 304 |
+| fixed, bench/ user code only | 72 (63 index, 7 contract, 2 slice) | 30 | 12 |
+
+std's clauses: 31 of the 211 contract checks at call sites are proven
+by ranges (a `v.get(i)` in a loop to `v.len()`), and after that its
+body's own check is a double. The bench's 39 distinct sites left in user
+code: about 3 would go with a natural clause (iterloop's `dot` and
+`take_loop`, bounded by a min of two lengths, with a `requires` instead
+of the min; sort's `s[i]` with the length stated); the rest are
+data-dependent (interp's `code[pc]`, `regs[r]`, `stack[sp]`, json's
+`s[pos]`, fannkuch's `perm[k - i]`), would need a type invariant (not a
+fact in 0.18), or are analysis gaps listed below.
+
+**The fixes (this branch).** Both small, in middle/range/mod.tach, with
+tests/run/opt_range_chain.tach:
+- *`sub len, 0`.* Indexing a Vec reads its length as a slice's, `len - 0`
+  in u64, which instcombine keeps because the type changes; the analysis
+  took it for another value, so even `for i in 0..v.len() { v[i] }` kept
+  its check in 0.18. `bits_of_value` now looks through `x + 0` and `x -
+  0` of 64-bit integers. This alone removes 106 checks in the survey and
+  5% of the plain bench's instructions.
+- *One step of transitivity.* `decide` chains two facts through a third
+  value when the direct facts leave a comparison open: `i < n` (the
+  loop's) and `n <= v.len()` (a requires', an assert's, a guard's) give
+  `i < v.len()`; `a.len() == b.len()` with `i < a.len()` gives `i <
+  b.len()`. Same signedness only; a signed chain decides an unsigned
+  check when i is known non-negative, as for a direct fact.
+
+Cost: the -O2 self-compile +0.6% instructions (the chaining itself is
+below the noise; the rest is the compiler's own code optimized more); the
+compiler's binary +0.3%; every bench program within ±0.1% except the
+pair (contracts -31%, contracts_plain -5%).
+
+**Verdict.** Contracts speed code up where a clause states a relation
+the analysis can chain to a loop bound: a length bounding a loop
+(prefix, 6x fewer instructions once the loop vectorizes) and two lengths
+equal (dot, 2.5x). Without the fixes above they did not: the prefix
+clause removed nothing and the program with clauses ran 8% more
+instructions than without. Where the clause's condition does not match
+the check's form (window: `i + 4 <= len` against `i + 1 < len`) or
+where the callee's own result is not bounded (bucket: `h % n`), the
+clause is one more check per call, and the code is slower (+24%, +35%
+instructions; the branches predict well, so wall time moves less). A
+clause is not free: a contract that removes nothing costs its check.
+
+**What the analysis could use but does not (0.18.1 follow-ups).**
+1. *Offsets.* `i + 4 <= len` implies `i + k < len` for 0 <= k < 4, and a
+   loop to `len - 3` implies `i + 4 <= len`; with them window's requires
+   is proven at the call and its four checks go.
+2. *Remainders* (done in c181-facts, below).
+3. *Entry facts in a callee that is not inlined* (done in c181-facts,
+   below, for a callee no caller inlines).
+4. *A min as a bound.* `let m = if n < len { n } else { len }` is a phi
+   both of whose inputs are at most len; iterloop's `dot` and
+   `take_loop` keep their checks for it.
+5. *Rotated loops.* When a loop is rotated before it is inlined, the
+   check compares `i + 1` (unsigned) after the exit test, whose lower
+   bound the phi ranges lose (`i + 1` may wrap as far as they know), so
+   a chained signed fact does not decide it; seen with `sum_prefix(v, n -
+   1)` called once.
+6. *Non-negative while-loop indices.* wordcount's `while i < n && ..
+   s[i]` keeps its check: `i < n` is signed, the check unsigned, and i's
+   lower bound (it starts at 0 and only grows) is not derived.
+7. *Tools.* `query checks crate` prints nothing (the names it matches
+   have no `crate::`; `--print-checks=` lists every function), and a
+   removed check says `removed (ranges)`, not the fact that removed it.
+
+**After entry facts (c181-facts).** Three changes, in middle/:
+- *Entry facts* (middle/entryfacts.tach). A requires is checked at every
+  direct call, before it, so at the callee's entry its clauses hold:
+  every direct call passed the checks with these arguments, or the
+  program exited 101. At -O2 a function's entry calls its `$pre`
+  companion with a site no check has; once inlined there, the failing
+  side of each of its checks is emptied (a branch into an empty
+  unreachable block: the condition is a fact for the range analysis and
+  value numbering), and before code generation each such branch becomes
+  a jump and the condition, unused, goes; the code emitted has nothing
+  of it. *Soundness:* an indirect call skips the requires (its checking
+  entry is still to come), so a function whose address the program takes
+  (any `faddr` of it in the IR, scanned before the first pass and before
+  the code cache's keys) assumes nothing; neither does a function C may
+  call (`extern "C"`, exported, `main`), one with a compound parameter
+  (passed again as it is), or a clause that is not cheap to evaluate
+  again (locals, constants, operators, fields and std's `len()` only).
+  The optimizer never assumes a clause that is not checked.
+  tests/run/opt_entry_facts.tach (a bounds check gone; the address-taken
+  and the exported function keep theirs) and
+  contract_entry_indirect.tach (through a fn value, an index out of
+  bounds still stops at the body's check, exit 101).
+- *Only where no caller inlines.* A function a caller may inline
+  (inline::never_inlined: not `#[inline(never)]`, cold, nor larger than
+  INLINE_ONCE as lowered) takes no entry facts: its inlined copy has the
+  call's checks before it anyway, and with the facts its own loop passes
+  ran on a loop without checks, which came to the caller unrolled where
+  the caller would have vectorized it (prefix 218M to 582M, dot 669M to
+  914M, measured with facts everywhere). So none of the bench pair's
+  kernels (all inlined) changes by entry facts; they serve non-inlined
+  callees: `at(v, i)` with `requires i < v.len()` loses its bounds check.
+- *Remainders* (middle/range): `x % n` with n known positive (its range
+  with the facts: a requires' `n > 0`) is in [0, n) (unsigned; |x % n| <
+  n signed), and is below n itself (`decide`, rem_below). Bucket's
+  ensures fold and its loop keeps one check, its requires, as the plain
+  program keeps one, the index's; its body is one instruction shorter
+  per iteration than plain's. The 15% left is register pressure in
+  `main` (all kernels inlined into it): the LCG's constant is
+  materialized each iteration.
+
+*The window is not fixed, and cannot be soundly without a length bound.*
+Integers wrap: `i + 4 <= v.len()` holds for i near i64::MAX, where
+i + 4 wraps negative, so neither the clause nor the loop's `i < len - 3`
+(len - 3 wraps for a negative len) proves `i + k < len`; offset facts
+need i + 4 not to wrap, i.e. len >= 0, which is the Vec's invariant, not
+a checked fact (type invariants give no facts in 0.18). The clause stays
+one more check per call (+24%).
+
+*Elsewhere:* every other bench program's binary is byte for byte the
+same; the -O2 self-compile within the noise (36.19G and 36.21G
+instructions, base 36.15G-36.19G), the compiler's binary the same size.
+
+*Left:* the checking entry for indirect calls (then a function whose
+address is taken could assume too); entry facts for a function its
+callers inline (the phase order above: the facts after its loop passes);
+a non-negative length (the window); facts at the instance level of a
+callee whose clause calls more than `len()`.

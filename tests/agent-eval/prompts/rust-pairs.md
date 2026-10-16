@@ -163,8 +163,8 @@ More pairs, one line each:
 
 - `use std::collections::HashMap;` -> `use std::HashMap;` (std is one
   module: `use std::{Buf, HashMap, Scanner};`); `use a::*;` -> name each item.
-- `String::from("x")`, `&str` -> `"x"` (a `[u8]`); `s.len()` -> `s.len`
-  (a field) on a `[u8]`, `v.len()` on a `Vec` or `Buf`.
+- `String::from("x")`, `&str` -> `"x"` (a `[u8]`); `s.len()` -> `s.len()`
+  on a `[u8]`, a `Vec` or a `Buf`.
 - `v[i]` on a `Vec` -> `v.get(i)`, `v.set(i, x)`, `v.as_slice()[i]`.
 - `Box<T>`, `Rc<T>` -> a `Vec<T>` and indices; `&x`, `&mut x`, `&T`,
   `&mut T` as in Rust (a reference is not returned: return an index or the

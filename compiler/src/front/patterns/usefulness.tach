@@ -21,7 +21,7 @@ use crate::front::check::variant_fields::has_named_fields;
 use crate::front::distinct::strip_distinct;
 use crate::front::types::{
     ENUMS, TYPES, TY_BOOL, TY_UNIT, TyKind, VARIANTS, buf_type, enum_variant, int_max, is_integer,
-    is_signed, type_elem, variant_field,
+    is_ref, is_signed, type_elem, variant_field,
 };
 
 static mut MAT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -99,6 +99,19 @@ fn ctor_kind(ty: i64) -> i64 {
     0
 }
 
+// The type a column of values of type t is matched as: a reference's
+// referent (0.18.1: its patterns match what it points to, PAT_DEREF; a
+// reference has one constructor), a distinct type's underlying type
+// (0.18: its values are those).
+fn column_type(t: i64) -> i64 {
+    unsafe {
+        if is_ref(t) && !is_ref(TYPES[t].a) {
+            return strip_distinct(TYPES[t].a);
+        }
+    }
+    strip_distinct(t)
+}
+
 fn mat_row(m: i64, cols: i64, r: i64) -> i64 {
     m + r * cols
 }
@@ -106,7 +119,7 @@ fn mat_row(m: i64, cols: i64, r: i64) -> i64 {
 // Copies the rows of matrix (m, rows, cols) with or-patterns in the first
 // column expanded into one row per alternative; returns the new start and
 // sets *out_rows.
-fn expand_rows(m: i64, rows: i64, cols: i64, out_rows: *i64) -> i64 {
+fn expand_rows(m: i64, rows: i64, cols: i64, out_rows: &mut i64) -> i64 {
     let start = MAT.count;
     let mut count = 0;
     for r in 0..rows {
@@ -145,13 +158,13 @@ fn push_ctor_types(ty: i64, c: i64) -> i64 {
         if kind == 1 {
             let v = enum_variant(TYPES[ty].a, c);
             for i in 0..VARIANTS[v].field_count {
-                MTY.push(strip_distinct(variant_field(v, i)));
+                MTY.push(column_type(variant_field(v, i)));
             }
             return VARIANTS[v].field_count;
         }
         if kind == 3 && ty != TY_UNIT {
             for i in 0..TYPES[ty].count {
-                MTY.push(strip_distinct(type_elem(ty, i)));
+                MTY.push(column_type(type_elem(ty, i)));
             }
             return TYPES[ty].count;
         }
@@ -246,7 +259,7 @@ fn segment_end(i: i64, ty: i64) -> i64 {
 
 // The number of constructors of the column's type to try, and whether the
 // constructors in column 0 cover the type (`complete`).
-fn ctor_count(m: i64, rows: i64, cols: i64, ty: i64, complete: *bool) -> i64 {
+fn ctor_count(m: i64, rows: i64, cols: i64, ty: i64, complete: &mut bool) -> i64 {
     unsafe {
         let kind = ctor_kind(ty);
         let mut total = 0;
@@ -308,7 +321,7 @@ fn useful(m: i64, rows: i64, cols: i64, types: i64, q: i64) -> bool {
             return result;
         }
         let mut erows = 0;
-        let em = expand_rows(m, rows, cols, &erows);
+        let em = expand_rows(m, rows, cols, &mut erows);
         let ty = MTY.data[types];
         let kind = ctor_kind(ty);
         if kind == 4 {
@@ -316,7 +329,7 @@ fn useful(m: i64, rows: i64, cols: i64, types: i64, q: i64) -> bool {
         }
         if !is_wild(head) || kind != 0 {
             let mut complete = false;
-            let total = ctor_count(em, erows, cols, ty, &complete);
+            let total = ctor_count(em, erows, cols, ty, &mut complete);
             if !is_wild(head) || complete {
                 // Saved: the recursion reuses CUTS.
                 let cuts = MAT.count;
@@ -396,14 +409,14 @@ fn find_missing(m: i64, rows: i64, cols: i64, types: i64) -> bool {
         let mark = MAT.count;
         let tmark = MTY.count;
         let mut erows = 0;
-        let em = expand_rows(m, rows, cols, &erows);
+        let em = expand_rows(m, rows, cols, &mut erows);
         let ty = MTY.data[types];
         let kind = ctor_kind(ty);
         if kind == 4 {
             int_segments(em, erows, cols, ty, 0);
         }
         let mut complete = false;
-        let total = ctor_count(em, erows, cols, ty, &complete);
+        let total = ctor_count(em, erows, cols, ty, &mut complete);
         let cuts = MAT.count;
         if kind == 4 {
             for i in 0..CUTS.count {
@@ -613,7 +626,7 @@ fn witness_any(node: i64) -> bool {
 // integer's missing ranges, adjacent ones joined), as witness nodes into
 // `list`, at most `max`; whether there were more. Other types: nothing
 // (the caller has the first witness).
-fn missing_witnesses(rows: i64, list: *IntVec, max: i64) -> bool {
+fn missing_witnesses(rows: i64, list: &mut IntVec, max: i64) -> bool {
     unsafe {
         let ty = MTY.data[0];
         let kind = ctor_kind(ty);
@@ -623,12 +636,12 @@ fn missing_witnesses(rows: i64, list: *IntVec, max: i64) -> bool {
         let mark = MAT.count;
         let tmark = MTY.count;
         let mut erows = 0;
-        let em = expand_rows(0, rows, 1, &erows);
+        let em = expand_rows(0, rows, 1, &mut erows);
         if kind == 4 {
             int_segments(em, erows, 1, ty, 0);
         }
         let mut complete = false;
-        let total = ctor_count(em, erows, 1, ty, &complete);
+        let total = ctor_count(em, erows, 1, ty, &mut complete);
         let cuts = MAT.count;
         if kind == 4 {
             for i in 0..CUTS.count {
@@ -692,7 +705,7 @@ pub fn check_arms(n: i64, st: i64) {
         MAT.count = 0;
         MTY.count = 0;
         // (0.18: a distinct type's values are its underlying type's)
-        MTY.push(strip_distinct(st));
+        MTY.push(column_type(st));
         // The patterns of the arms without guards so far: one-column rows.
         let rows_start = 0;
         let mut rows = 0;
@@ -733,7 +746,7 @@ pub fn check_arms(n: i64, st: i64) {
             for r in 0..kept.count {
                 MAT.push(kept.data[r]);
             }
-            let more = missing_witnesses(kept.count, &list, 8);
+            let more = missing_witnesses(kept.count, &mut list, 8);
             if list.count == 0 {
                 list.push(first);
             }
@@ -769,7 +782,7 @@ pub fn check_arms(n: i64, st: i64) {
 // The error of an unreachable arm (pattern p) after the arms `kept` (their
 // patterns; `arms`, the arm nodes): the first arm above that matches all
 // it matches alone, by its line, else the arms above together.
-fn unreachable_arm(p: i64, kept: *IntVec, arms: *IntVec) -> ! {
+fn unreachable_arm(p: i64, kept: &IntVec, arms: &IntVec) -> ! {
     unsafe {
         let mut cover = -1;
         for j in 0..kept.count {

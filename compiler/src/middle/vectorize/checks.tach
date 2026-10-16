@@ -3,13 +3,13 @@
 // and no store overlapping another access at another address (accesses
 // grouped by base, their ranges over the whole loop compared).
 
-use crate::base::IntVec;
 use crate::front::types::{TY_BOOL, TY_I64, TY_U64, int_bits, is_signed};
+use crate::middle::ctx::FnCtx;
 use crate::middle::gvn::{address_base, params_disjoint};
-use crate::middle::ir::{BLOCKS, Cond, INSTS, ir_val};
+use crate::middle::ir::{Cond, ir_val};
 use crate::middle::ir::Op::{Add, Cmp, Or, Store};
 use crate::middle::loops::invariant_in;
-use crate::middle::vectorize::{VEC_MAX_CHECKS, V_ACCESS, V_CHECKS, V_IV, V_IV2};
+use crate::middle::vectorize::VEC_MAX_CHECKS;
 use crate::middle::vectorize::build::{and_into, append, cmp, eval_at, konst};
 use crate::middle::vectorize::legality::{NONAFFINE, coef, coef_wrt};
 use crate::middle::vectorize::outer::eval_at2;
@@ -17,33 +17,33 @@ use crate::middle::vectorize::outer::eval_at2;
 // Records the check ending block b of loop l (into V_CHECKS), whose way on
 // is `next`, the other way an unreachable exit: false unless the way on
 // is `idx <u len` (64 bits, len invariant).
-pub fn record_check(l: i64, b: i64, next: i64) -> bool {
+pub fn record_check(mut cx: *FnCtx, l: i64, b: i64, next: i64) -> bool {
     unsafe {
-        let c = ir_val(BLOCKS[b].cond);
-        if INSTS[c].op != Cmp || INSTS[c].block != b {
+        let c = ir_val(cx, cx.blocks[b].cond);
+        if cx.insts[c].op != Cmp || cx.insts[c].block != b {
             return false;
         }
-        let mut cond = INSTS[c].cond;
-        if next != BLOCKS[b].s0 {
+        let mut cond = cx.insts[c].cond;
+        if next != cx.blocks[b].s0 {
             cond = cond.negate();
         }
-        let mut idx = ir_val(INSTS[c].a);
-        let mut len = ir_val(INSTS[c].b);
+        let mut idx = ir_val(cx, cx.insts[c].a);
+        let mut len = ir_val(cx, cx.insts[c].b);
         if cond == Cond::Gt {
-            idx = ir_val(INSTS[c].b);
-            len = ir_val(INSTS[c].a);
+            idx = ir_val(cx, cx.insts[c].b);
+            len = ir_val(cx, cx.insts[c].a);
             cond = Cond::Lt;
         }
-        if cond != Cond::Lt || is_signed(INSTS[c].imm2) || int_bits(INSTS[c].imm2) != 64
-            || !invariant_in(l, len) {
+        if cond != Cond::Lt || is_signed(cx.insts[c].imm2) || int_bits(cx.insts[c].imm2) != 64
+            || !invariant_in(cx, l, len) {
             return false;
         }
-        if V_CHECKS.count >= 3 * VEC_MAX_CHECKS {
+        if cx.v_checks.count >= 3 * VEC_MAX_CHECKS {
             return false;
         }
-        V_CHECKS.push(c);
-        V_CHECKS.push(idx);
-        V_CHECKS.push(len);
+        cx.v_checks.push(c);
+        cx.v_checks.push(idx);
+        cx.v_checks.push(len);
         true
     }
 }
@@ -52,92 +52,78 @@ pub fn record_check(l: i64, b: i64, next: i64) -> bool {
 // V_CHECKS fails from iteration `start` to `last`: each index (of
 // coefficient 1 or -1) at both ends, the lower at least 0 and the higher
 // below the length; `hi >= lo` rules out an index that wraps.
-pub fn check_tests(l: i64, c: i64, ok0: i64, start: i64, last: i64) -> i64 {
+pub fn check_tests(mut cx: *FnCtx, l: i64, c: i64, ok0: i64, start: i64, last: i64) -> i64 {
     unsafe {
         let mut ok = ok0;
-        for k in 0..V_CHECKS.count / 3 {
-            let idx = V_CHECKS.data[3 * k + 1];
-            let len = V_CHECKS.data[3 * k + 2];
-            let first = eval_at(l, idx, start, c);
-            let final = eval_at(l, idx, last, c);
-            let down = coef(l, idx) < 0;
+        for k in 0..cx.v_checks.count / 3 {
+            let idx = cx.v_checks.data[3 * k + 1];
+            let len = cx.v_checks.data[3 * k + 2];
+            let first = eval_at(cx, l, idx, start, c);
+            let final = eval_at(cx, l, idx, last, c);
+            let down = coef(cx, l, idx) < 0;
             let lo = if down { final } else { first };
             let hi = if down { first } else { final };
-            ok = and_into(c, ok, cmp(c, Cond::Ge, TY_I64, lo, konst(c, 0, TY_I64)));
-            ok = and_into(c, ok, cmp(c, Cond::Ge, TY_I64, hi, lo));
-            ok = and_into(c, ok, cmp(c, Cond::Lt, TY_I64, hi, len));
+            ok = and_into(cx, c, ok, cmp(cx, c, Cond::Ge, TY_I64, lo, konst(cx, c, 0, TY_I64)));
+            ok = and_into(cx, c, ok, cmp(cx, c, Cond::Ge, TY_I64, hi, lo));
+            ok = and_into(cx, c, ok, cmp(cx, c, Cond::Lt, TY_I64, hi, len));
         }
         ok
     }
 }
 
-// The accesses grouped by the base of their address (the address less a
-// constant): (base, lowest offset, highest offset + size, whether one
-// stores) quadruples. An access's offset adds its constant to its
-// instruction's.
-static mut V_GROUPS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
 // Groups the accesses; false when a group stores and holds accesses at
 // different offsets (a dependence the overlap test would always find).
-pub fn build_groups() -> bool {
+pub fn build_groups(mut cx: *FnCtx) -> bool {
     unsafe {
-        V_GROUPS.count = 0;
-        for i in 0..V_ACCESS.count / 3 {
-            let a = V_ACCESS.data[3 * i];
-            let mut off = INSTS[a].imm;
-            let base = ir_val(address_base(V_ACCESS.data[3 * i + 1], &off));
-            let end = off + V_ACCESS.data[3 * i + 2];
-            let store = INSTS[a].op == Store;
+        cx.v_groups.count = 0;
+        for i in 0..cx.v_access.count / 3 {
+            let a = cx.v_access.data[3 * i];
+            let mut off = cx.insts[a].imm;
+            let base = ir_val(cx, address_base(cx, cx.v_access.data[3 * i + 1], &mut off));
+            let end = off + cx.v_access.data[3 * i + 2];
+            let store = cx.insts[a].op == Store;
             let mut g = 0;
-            while g < V_GROUPS.count && V_GROUPS.data[g] != base {
+            while g < cx.v_groups.count && cx.v_groups.data[g] != base {
                 g += 4;
             }
-            if g == V_GROUPS.count {
-                V_GROUPS.push(base);
-                V_GROUPS.push(off);
-                V_GROUPS.push(end);
-                V_GROUPS.push(if store { 1 } else { 0 });
+            if g == cx.v_groups.count {
+                cx.v_groups.push(base);
+                cx.v_groups.push(off);
+                cx.v_groups.push(end);
+                cx.v_groups.push(if store { 1 } else { 0 });
                 continue;
             }
-            let same = V_GROUPS.data[g + 1] == off && V_GROUPS.data[g + 2] == end;
-            if !same && (store || V_GROUPS.data[g + 3] != 0) {
+            let same = cx.v_groups.data[g + 1] == off && cx.v_groups.data[g + 2] == end;
+            if !same && (store || cx.v_groups.data[g + 3] != 0) {
                 return false;
             }
-            if off < V_GROUPS.data[g + 1] { V_GROUPS.data[g + 1] = off; }
-            if end > V_GROUPS.data[g + 2] { V_GROUPS.data[g + 2] = end; }
-            if store { V_GROUPS.data[g + 3] = 1; }
+            if off < cx.v_groups.data[g + 1] { cx.v_groups.data[g + 1] = off; }
+            if end > cx.v_groups.data[g + 2] { cx.v_groups.data[g + 2] = end; }
+            if store { cx.v_groups.data[g + 3] = 1; }
         }
         true
     }
 }
 
-// (0.17 prototype, `--noalias-params`) Whether groups i and j need an
-// overlap test: not when their bases are different parameters (or a
-// parameter and a static). VEC_STAT_*: the vector loops made and the
-// overlap tests they emitted (`--vec-stats`).
-pub static mut VEC_STAT_LOOPS: i64 = 0;
-pub static mut VEC_STAT_TESTS: i64 = 0;
-pub static mut VEC_STAT_SKIPPED: i64 = 0;
-
-fn needs_test(i: i64, j: i64) -> bool {
-    unsafe { !params_disjoint(V_GROUPS.data[4 * i], V_GROUPS.data[4 * j]) }
+fn needs_test(mut cx: *FnCtx, i: i64, j: i64) -> bool {
+    unsafe { !params_disjoint(cx, cx.v_groups.data[4 * i], cx.v_groups.data[4 * j]) }
 }
 
 // The number of runtime overlap tests the groups need (each storing group
 // against every other); a large number when they cannot be.
-pub fn overlap_pairs() -> i64 {
+pub fn overlap_pairs(mut cx: *FnCtx) -> i64 {
     unsafe {
-        if !build_groups() {
+        if !build_groups(cx) {
             return 1000000;
         }
-        let n = V_GROUPS.count / 4;
+        let n = cx.v_groups.count / 4;
         let mut count = 0;
         for i in 0..n {
-            if V_GROUPS.data[4 * i + 3] == 0 {
+            if cx.v_groups.data[4 * i + 3] == 0 {
                 continue;
             }
             for j in 0..n {
-                if j != i && (V_GROUPS.data[4 * j + 3] == 0 || j > i) && needs_test(i, j) {
+                if j != i && (cx.v_groups.data[4 * j + 3] == 0 || j > i) && needs_test(cx, i, j) {
                     count += 1;
                 }
             }
@@ -148,30 +134,32 @@ pub fn overlap_pairs() -> i64 {
 
 // Appends to block c the test that groups i and j do not overlap (over
 // all iterations: one wholly below the other) to *ok.
-fn group_test(l: i64, c: i64, i: i64, j: i64, ok: i64, start: i64, last: i64, start2: i64,
-    last2: i64) -> i64 {
+fn group_test(mut cx: *FnCtx, l: i64, c: i64, i: i64, j: i64, ok: i64, start: i64, last: i64,
+    start2: i64, last2: i64) -> i64 {
     unsafe {
-        let below = group_below(l, c, i, j, start, last, start2, last2);
-        let above = group_below(l, c, j, i, start, last, start2, last2);
-        and_into(c, ok, append(c, Or, TY_BOOL, below, above, 0))
+        let below = group_below(cx, l, c, i, j, start, last, start2, last2);
+        let above = group_below(cx, l, c, j, i, start, last, start2, last2);
+        and_into(cx, c, ok, append(cx, c, Or, TY_BOOL, below, above, 0))
     }
 }
 
 // Whether group g's bytes all come before group h's: every highest
 // corner of g (its end) at most every lowest corner of h.
-fn group_below(l: i64, c: i64, g: i64, h: i64, start: i64, last: i64, start2: i64, last2: i64) -> i64 {
+fn group_below(mut cx: *FnCtx, l: i64, c: i64, g: i64, h: i64, start: i64, last: i64, start2: i64,
+    last2: i64) -> i64 {
     unsafe {
         let mut his: [i64; 2] = [0; 2];
         let mut los: [i64; 2] = [0; 2];
-        let nh = group_corners(l, c, g, true, start, last, start2, last2, &his as *i64);
-        let nl = group_corners(l, c, h, false, start, last, start2, last2, &los as *i64);
+        let nh = group_corners(cx, l, c, g, true, start, last, start2, last2, &his as *i64);
+        let nl = group_corners(cx, l, c, h, false, start, last, start2, last2, &los as *i64);
         let mut ok = 0;
         for a in 0..nh {
-            let end = append(c, Add, TY_U64, his[a], konst(c, V_GROUPS.data[4 * g + 2], TY_U64), 0);
+            let end = append(cx, c, Add, TY_U64, his[a],
+                konst(cx, c, cx.v_groups.data[4 * g + 2], TY_U64), 0);
             for b in 0..nl {
-                let begin = append(c, Add, TY_U64, los[b],
-                    konst(c, V_GROUPS.data[4 * h + 1], TY_U64), 0);
-                ok = and_into(c, ok, cmp(c, Cond::Le, TY_U64, end, begin));
+                let begin = append(cx, c, Add, TY_U64, los[b],
+                    konst(cx, c, cx.v_groups.data[4 * h + 1], TY_U64), 0);
+                ok = and_into(cx, c, ok, cmp(cx, c, Cond::Le, TY_U64, end, begin));
             }
         }
         ok
@@ -181,45 +169,46 @@ fn group_below(l: i64, c: i64, g: i64, h: i64, start: i64, last: i64, start2: i6
 // The base of group g at its highest (or lowest) iterations, into out:
 // one value, or two when its coefficient of k has an unknown sign (k's
 // first and last value; j's coefficient is a constant).
-fn group_corners(l: i64, c: i64, g: i64, high: bool, start: i64, last: i64, start2: i64, last2: i64,
-    out: *i64) -> i64 {
+fn group_corners(mut cx: *FnCtx, l: i64, c: i64, g: i64, high: bool, start: i64, last: i64,
+    start2: i64, last2: i64, out: *i64) -> i64 {
     unsafe {
-        let base = V_GROUPS.data[4 * g];
-        let cj = coef_wrt(l, base, V_IV, V_IV2);
+        let base = cx.v_groups.data[4 * g];
+        let cj = coef_wrt(cx, l, base, cx.v_iv, cx.v_iv2);
         let jv = if (cj >= 0) == high { last } else { start };
-        if V_IV2 == 0 {
-            out[0] = eval_at(l, base, jv, c);
+        if cx.v_iv2 == 0 {
+            out[0] = eval_at(cx, l, base, jv, c);
             return 1;
         }
-        let ck = coef_wrt(l, base, V_IV2, V_IV);
+        let ck = coef_wrt(cx, l, base, cx.v_iv2, cx.v_iv);
         if ck != NONAFFINE {
             let kv = if (ck >= 0) == high { last2 } else { start2 };
-            out[0] = eval_at2(l, base, jv, kv, c);
+            out[0] = eval_at2(cx, l, base, jv, kv, c);
             return 1;
         }
-        out[0] = eval_at2(l, base, jv, start2, c);
-        out[1] = eval_at2(l, base, jv, last2, c);
+        out[0] = eval_at2(cx, l, base, jv, start2, c);
+        out[1] = eval_at2(cx, l, base, jv, last2, c);
         2
     }
 }
 
 // The overlap tests of all the groups, and'ed into ok.
-pub fn overlap_tests(l: i64, c: i64, ok0: i64, start: i64, last: i64, start2: i64, last2: i64) -> i64 {
+pub fn overlap_tests(mut cx: *FnCtx, l: i64, c: i64, ok0: i64, start: i64, last: i64, start2: i64,
+    last2: i64) -> i64 {
     unsafe {
         let mut ok = ok0;
-        VEC_STAT_LOOPS += 1;
-        let n = V_GROUPS.count / 4;
+        cx.vec_loops += 1;
+        let n = cx.v_groups.count / 4;
         for i in 0..n {
-            if V_GROUPS.data[4 * i + 3] == 0 {
+            if cx.v_groups.data[4 * i + 3] == 0 {
                 continue;
             }
             for j in 0..n {
-                if j != i && (V_GROUPS.data[4 * j + 3] == 0 || j > i) {
-                    if needs_test(i, j) {
-                        ok = group_test(l, c, i, j, ok, start, last, start2, last2);
-                        VEC_STAT_TESTS += 1;
+                if j != i && (cx.v_groups.data[4 * j + 3] == 0 || j > i) {
+                    if needs_test(cx, i, j) {
+                        ok = group_test(cx, l, c, i, j, ok, start, last, start2, last2);
+                        cx.vec_tests += 1;
                     } else {
-                        VEC_STAT_SKIPPED += 1;
+                        cx.vec_skipped += 1;
                     }
                 }
             }

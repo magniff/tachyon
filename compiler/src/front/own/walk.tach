@@ -47,9 +47,10 @@ use crate::front::own::state::{
     PK_RESERVE, PK_SHARED, PK_VIEW, PL_OVERFLOW, PL_PARENT, PL_RKIND, POOL, POOL_TOP, RK_STATIC,
     SLOT_CAP, SLOT_OVERFLOW, TUPLE_FIELD, alias_local, child_place, copy_state, join_state,
     local_place, new_ov, new_state, pend_push, reachable, reset_places, root_of, same_state,
-    set_unreachable, set_words, slot_for, static_has_place, static_place,
+    set_unreachable, set_words, slot_for, static_has_place, static_place, variant_field_key,
 };
 use crate::front::own::summary::{ViewSummary, collect_begin, collect_end, collect_result};
+use crate::front::patterns::binds_ref;
 use crate::front::types::{FNS, REF_MUT, REF_SHARED, TYPES, TyKind};
 
 // The value of an expression is read (a copy, or a borrow) or moved.
@@ -102,6 +103,10 @@ pub static mut PO_INDEX: bool = false;
 pub static mut PO_RAW: bool = false;
 pub static mut PO_INNER: bool = false;
 pub static mut PO_VIEWSLOT: i64 = -1;
+
+// (0.18.1) While `&place` is taken: the origin that gets the views of a
+// value the place is reached through (`&v.as_slice()[i]`), place_rec.
+static mut PO_VALUE_DST: i64 = -1;
 // (whether place_rec makes the places of plain locals and statics: where
 // something borrows them)
 static mut PO_MAKE: bool = false;
@@ -215,6 +220,11 @@ pub fn ev_assign(p: i64, n: i64, v: i64) {
         let compound = NODES[n].op != Tok::Eq;
         if PO_VIEWSLOT < 0 && !PO_RAW && compound {
             ev_read(p, n);
+        }
+        if !compound {
+            // (0.18.1: an owned copy that borrows, replaced: its old value
+            // dropped)
+            moves::byref_change(p, n, NODES[NODES[n].b].ty);
         }
         views::on_assign(p, n, v);
         if !compound && !PO_INDEX && !PO_DEREF {
@@ -359,7 +369,10 @@ fn place_rec(e: i64) -> i64 {
             let inner = PO_INNER;
             let vs = PO_VIEWSLOT;
             let make = PO_MAKE;
+            let vd = PO_VALUE_DST;
+            PO_VALUE_DST = -1;
             eval(NODES[e].b, CX_READ, -1);
+            PO_VALUE_DST = vd;
             PO_MAKE = make;
             PO_DEREF = deref;
             PO_INDEX = index;
@@ -384,8 +397,11 @@ fn place_rec(e: i64) -> i64 {
             }
             return p;
         }
-        // (a value: a call's result, a literal)
-        eval(e, CX_READ, -1);
+        // (a value: a call's result, a literal; under `&`, what the
+        // loan views: `&v[i]` of a Vec is `&v.as_slice()[i]`)
+        let d = PO_VALUE_DST;
+        PO_VALUE_DST = -1;
+        eval(e, CX_READ, d);
         -1
     }
 }
@@ -443,7 +459,9 @@ pub fn eval(n: i64, ctx: i64, dst: i64) {
                 } else if op == Tok::Amp {
                     let operand = NODES[n].b;
                     if is_place_expr(operand) {
+                        PO_VALUE_DST = dst;
                         let p = place_of_make(operand);
+                        PO_VALUE_DST = -1;
                         let kind = if (NODES[n].p & NODE_REF_MUT) != 0 { REF_MUT }
                             else { REF_SHARED };
                         ev_borrow(p, n, kind, PO_RAW, dst);
@@ -651,6 +669,14 @@ fn eval_assign(n: i64) {
 
 // Binds pattern pat (at node n) to a value with origin v (-1: none).
 fn bind(pat: i64, v: i64) {
+    bind_at(pat, v, -1);
+}
+
+// bind, the matched value at place `place` (-1: none, or not followed):
+// a binding that is a reference into it (0.18.1, PAT_REF) borrows its
+// field's place, as `&(*e).f` does, so that references to two fields
+// are apart; without a place it views what the value views.
+fn bind_at(pat: i64, v: i64, place: i64) {
     unsafe {
         if pat == 0 {
             return;
@@ -658,17 +684,90 @@ fn bind(pat: i64, v: i64) {
         let k = NODES[pat].kind;
         if k == NodeKind::PatBind {
             let l = NODES[pat].x;
-            if l >= 0 {
-                slot_for(l, is_view_type(LOCALS[l].ty));
-                ev_bind(l, pat, v);
+            if l < 0 {
+                return;
             }
+            if place >= 0 && binds_ref(pat) {
+                let o = new_ov();
+                clear_po(false);
+                PO_DEREF = true;
+                let kind = if TYPES[LOCALS[l].ty].b == REF_MUT { REF_MUT } else { REF_SHARED };
+                ev_borrow(place, pat, kind, false, o);
+                slot_for(l, true);
+                ev_bind(l, pat, o);
+                POOL_TOP = o;
+                return;
+            }
+            slot_for(l, is_view_type(LOCALS[l].ty));
+            ev_bind(l, pat, v);
             return;
         }
         if k == NodeKind::PatTuple || k == NodeKind::PatVariant || k == NodeKind::PatOr {
             for i in 0..NODES[pat].count {
-                bind(child(pat, i), v);
+                let mut sub = -1;
+                if place >= 0 && k == NodeKind::PatTuple {
+                    sub = child_place(place, TUPLE_FIELD + i);
+                } else if place >= 0 && k == NodeKind::PatVariant {
+                    sub = child_place(place, variant_field_key(NODES[pat].x, i));
+                }
+                bind_at(child(pat, i), v, sub);
             }
         }
+    }
+}
+
+// Whether pattern p binds a reference into the matched value (PAT_REF).
+fn has_ref_binding(p: i64) -> bool {
+    unsafe {
+        if p == 0 {
+            return false;
+        }
+        let k = NODES[p].kind;
+        if k == NodeKind::PatBind {
+            return binds_ref(p);
+        }
+        if k == NodeKind::PatTuple || k == NodeKind::PatVariant || k == NodeKind::PatOr {
+            for i in 0..NODES[p].count {
+                if has_ref_binding(child(p, i)) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+// The place pattern pat's references borrow from, matched against e:
+// e's, when pat has one and e is a path of locals, fields and `*` through
+// references (an index is evaluated, a raw pointer is not followed); else
+// -1.
+fn ref_bind_place(e: i64, pat: i64) -> i64 {
+    unsafe {
+        if e == 0 || !has_ref_binding(pat) {
+            return -1;
+        }
+        let mut x = e;
+        loop {
+            let k = NODES[x].kind;
+            if k == NodeKind::Ident {
+                break;
+            }
+            if k == NodeKind::FieldAccess || k == NodeKind::TupleField {
+                x = NODES[x].a;
+            } else if k == NodeKind::Unary && NODES[x].op == Tok::Star {
+                x = NODES[x].b;
+            } else {
+                return -1;
+            }
+        }
+        if !is_place_expr(e) {
+            return -1;
+        }
+        let p = place_of_make(e);
+        if PO_RAW || PO_INDEX {
+            return -1;
+        }
+        p
     }
 }
 
@@ -713,7 +812,7 @@ fn eval_match(n: i64, ctx: i64, dst: i64) {
             // (a view bound out of the scrutinee reborrows what it
             // comes from: `if let Some(a) = m.get_mut(k)`, views::on_bind)
             views::BIND_FROM = NODES[n].a;
-            bind(NODES[arm].a, v);
+            bind_at(NODES[arm].a, v, ref_bind_place(NODES[n].a, NODES[arm].a));
             views::BIND_FROM = 0;
             eval(NODES[arm].b, CX_READ, -1);
             eval(NODES[arm].c, ctx, dst);
@@ -915,7 +1014,7 @@ fn eval_let(s: i64) {
             BORROW_OK = init;
         }
         eval(init, ctx, v);
-        bind(pat, v);
+        bind_at(pat, v, ref_bind_place(init, pat));
         POOL_TOP = v;
         if pat != 0 && init != 0 && NODES[pat].kind == NodeKind::PatBind && NODES[pat].x >= 0 {
             views::on_let(NODES[pat].x, init);

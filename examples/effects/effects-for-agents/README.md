@@ -25,7 +25,9 @@ $ tachyonc main.tach -o render && ./render > before.txt && head -4 before.txt
 <li><a href="#arenas">Arenas</a></li>
 <li><a href="#why-arenas">Why arenas?</a></li>
 </ul>
+ok: built render
 $ tachyonc --check-alloc main.tach -o render-checked && ./render-checked > /dev/null
+ok: built render-checked
 ```
 
 Nothing is left allocated: every value is dropped at the end of its
@@ -179,7 +181,9 @@ The same output, and nothing left allocated:
 ```console
 $ tachyonc main.tach -o render && ./render | diff before.txt - && echo same output
 same output
+ok: built render
 $ tachyonc --check-alloc main.tach -o render-checked && ./render-checked > /dev/null
+ok: built render-checked
 $ tachyonc query effects crate::markup
 crate::markup::lines	alloc(Arena) panic
 crate::markup::slug	alloc(Arena) panic

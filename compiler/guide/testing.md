@@ -9,7 +9,7 @@ leave test items out; `check` and the queries see them.
 ```tach
 fn gap(v: [i64]) -> i64 {
     let mut best = 0;
-    for i in 1..v.len {
+    for i in 1..v.len() {
         if v[i] - v[i - 1] > best {
             best = v[i] - v[i - 1];
         }
@@ -128,7 +128,7 @@ FAIL bubble_sorts (property, case 11 of 100, shrunk in 8 steps): not sorted
 
 ```tach
 fn parse(data: [u8]) -> i64 {
-    if data.len >= 2 && data[0] == 'O' && data[1] == 'K' {
+    if data.len() >= 2 && data[0] == 'O' && data[1] == 'K' {
         return 1;
     }
     0
