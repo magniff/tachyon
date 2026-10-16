@@ -9,7 +9,7 @@
 // Debug, Display and Clone when T has them (front/traits.tach, std's
 // distinct_* helpers).
 
-use crate::base::{SRC, SYMS, buf_fmt, buf_new, buf_slice, intern, intern_c};
+use crate::base::{IntVec, SRC, SYMS, buf_fmt, buf_new, buf_slice, free, intern, intern_c};
 use crate::base::diag::{
     ERR_KIND, err_begin, err_end_soft, err_fix, err_fmt, err_help, err_help_fmt, err_jump,
     err_try_fmt,
@@ -26,6 +26,7 @@ use crate::front::distinct::{
 };
 use crate::front::lexer::{SUF_NONE, Tok};
 use crate::front::modules::{STD_MODULE, module_of};
+use crate::front::own::kinds::{is_owned_type, is_plain_type};
 use crate::front::traits::{implements, std_trait};
 use crate::front::types::{
     CONSTS, CONST_COUNT, ENUMS, ENUM_COUNT, FIELDS, FIELD_COUNT, FNS, FN_COUNT, STATICS,
@@ -53,7 +54,8 @@ pub fn distinct_of(alias: i64, base: i64, mark: i64) -> i64 {
             err_begin(NODES[NODES[alias].b].start);
             let b = buf_new();
             buf_type(b, bad);
-            let what = if TYPES[bad].kind == TyKind::Slice { "views memory" }
+            let what = if TYPES[bad].kind == TyKind::Slice || TYPES[bad].kind == TyKind::Ptr
+                { "views memory" }
                 else { "owns memory" };
             err_fmt(f"a distinct type is over a plain type: '{buf_slice(b)}' {what}");
             let name = SYMS[NODES[alias].a].text;
@@ -70,15 +72,18 @@ pub fn distinct_of(alias: i64, base: i64, mark: i64) -> i64 {
     }
 }
 
-// A type in t that is not plain (an owned or a view type: a slice, Vec,
-// Buf, HashMap, or a struct, enum, tuple or array holding one); 0.
+// A type in t that is not plain (an owned or a view type: a slice, a
+// reference, Vec, Buf, HashMap, or a struct, enum, tuple or array holding
+// one); 0. A type that owns by its Drop impl is found later, when the
+// impls are known (check_distinct_kinds).
 fn not_plain(t: i64, depth: i64) -> i64 {
     unsafe {
         if t <= 0 || depth > 16 {
             return 0;
         }
         let kind = TYPES[t].kind;
-        if kind == TyKind::Slice {
+        // (0.17: a reference is a view)
+        if kind == TyKind::Slice || kind == TyKind::Ptr && TYPES[t].b != 0 {
             return t;
         }
         if kind == TyKind::Struct {
@@ -120,6 +125,45 @@ fn not_plain(t: i64, depth: i64) -> i64 {
             return not_plain(TYPES[t].a, depth + 1);
         }
         0
+    }
+}
+
+// (0.18, with 0.17's values) distinct.kind for the distinct types whose
+// underlying type is owned or a view by 0.17's kinds but passed
+// not_plain: a struct or enum with a Drop impl (known once the impls
+// are), or an instance's type argument. Once per alias; called by
+// check_program before the own pass, which takes every distinct type as
+// plain.
+pub fn check_distinct_kinds() {
+    unsafe {
+        if !ANY_DISTINCT {
+            return;
+        }
+        let mut seen = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for t in 1..type_count() {
+            if TYPES[t].kind != TyKind::Distinct {
+                continue;
+            }
+            let alias = TYPES[t].b;
+            let base = TYPES[t].a;
+            if alias <= 0 || base <= 0 || base == TY_ERROR || not_plain(base, 0) != 0
+                || is_plain_type(base) || (0..seen.count).any(|j| seen.data[j] == alias) {
+                continue;
+            }
+            seen.push(alias);
+            let saved = ERR_KIND;
+            ERR_KIND = DISTINCT_KIND;
+            err_begin(NODES[NODES[alias].b].start);
+            let b = buf_new();
+            buf_type(b, base);
+            let what = if is_owned_type(base) { "owns memory" } else { "views memory" };
+            err_fmt(f"a distinct type is over a plain type: '{buf_slice(b)}' {what}");
+            let name = SYMS[NODES[alias].a].text;
+            err_help_fmt(f"a distinct value is copied freely; for an owned or view type declare a struct of one field instead: 'struct {name} {{ v: {buf_slice(b)} }}'");
+            err_end_soft();
+            ERR_KIND = saved;
+        }
+        free(seen.data as *u8);
     }
 }
 
