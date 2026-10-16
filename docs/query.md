@@ -23,6 +23,7 @@ tachyonc query callers NAME... [--root ROOT] [--exact] [--count] [--in FILE|MODU
 tachyonc query callees FN... [--transitive] [--writes TABLE] [--count] [--limit N] [--all]   (0.16)
 tachyonc query effects NAME...|MODULE [--has EFFECT] [--why EFFECT]   (0.16) the inferred effects
 tachyonc query views NAME...|MODULE [--why]   (0.17) what results and `&mut` parameters view
+tachyonc query features NAME... [--why FEATURE] [-C OPTION]   (0.19) what a function needs of the CPU
 tachyonc query items [MODULE|TYPE...] [--root ROOT] [--comments]
 tachyonc query show MODULE::section TITLE                   (0.13)
 tachyonc query grep PATTERN... [--in FILE|MODULE|ITEM] [--code] [--comments] [--strings] [--word] [--count] [--limit N] [--all]
@@ -535,6 +536,32 @@ is answered from it too.
 $ tachyonc query effects total --why alloc
 crate::total→alloc(Gpa) panic
   ...the chain...
+```
+
+## features (0.19)
+
+`features NAME...` prints what each function NAME names needs of the CPU
+beyond the build's features (docs/design/arch.md §2.4): `PATH \t
+FEATURES (inferred)`, `FEATURES (declared)` for a #[target_feature]
+function (its declaration is its requirement), or `none` (callable
+anywhere; `none (declared: crc)` when the build has what it declares). The
+requirement is inferred over the calls, as effects are: an intrinsic's
+features, less what each call's point knows (the build's, the function's
+declaration, the has()/detect() guards around it). A generic function's
+line is each of its instances'. `-C target-cpu=CPU` and `-C
+target-feature=+x,-y` set the build's features, as for a build (`check`
+and the editing commands take them too).
+
+- `--why FEATURE` adds, under each line, the calls that bring FEATURE in,
+  one indented line each, `FILE:L:C: calls 'NAME'`, down to the intrinsic
+  (`, which needs crc`); `(not: FEATURE)` when it does not need it.
+- An unknown FEATURE is `error query.usage` (exit 2).
+
+```
+$ tachyonc query features twice --why crc -C target-cpu=generic
+crate::twice	crc (inferred)
+  features019/main.tach:11:5: calls 'hw'
+  features019/main.tach:7:5: calls 'std::arch::aarch64::__crc32cd', which needs crc
 ```
 
 ## views (0.17)

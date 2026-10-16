@@ -1389,6 +1389,39 @@ the `AE_*` codes.
 - `CpuFeat` is false until T3; a foreign intrinsic's call is
   unreachable until T2 makes it an error.
 
+**T2 as built (branch a19-t2).**
+- `front/features/regions.tach` walks every checked body once (after the
+  effects): the known set at each point (the build's features, the
+  declaration, the guards of §2.4: `then` of `if G`, `&&` atoms, `else` of
+  `if !G`, the rest of a block after `if !G { DIVERGES }` or
+  `assert(G)`, which 0.18 checks as `std::contract_check`), recorded per
+  direct call (`CALLS`: caller, callee, known, the ambiguous readings,
+  node) and per has()/detect() call (`known_at`).
+- `infer.tach`: `NEEDS[f]` (beyond the build's features; a declaration
+  pins it to what it declares) by a worklist over the calls, from the
+  intrinsics and declarations up. No SCCs are needed: a set only grows.
+- `check.tach`: `arch.feature` in entry points (main, `extern "C" fn`s,
+  tests), `arch.declared`, `arch.feature_ambiguous` (where the
+  unqualified name is, not carried up), `arch.fn_pointer` for a plain
+  `fn` value or a closure coerced to a `fn` type. **Change:** a closure
+  passed as itself is not checked where it is made: it is called directly
+  (in its own function, or in the generic instance it is passed to), so
+  the calls carry its set. Unguarded calls of another architecture's
+  intrinsics are `arch.feature` errors.
+- **Static deadness** is a function, not a node flag:
+  `front::features::static_condition(cond)` (1, 0, or -1 when not a
+  constant has/detect condition: `!`, `&&`, `||` of them), read by
+  `lower_if` and `gen_if`, which generate only the live branch.
+- `-C`: `-x` also removes what needs x; `native` reads /proc/cpuinfo or
+  `sysctl` (`front::cpp::cc::run_command`, now `pub`); `check`, `query`
+  and the editing commands take `-C` (their cache is skipped then), and
+  the edits' checks forward it (`push_arch_args`).
+- `query features NAME [--why F] [-C ...]` (tools/query/features.tach).
+- Not done: `#[multiversion]` (clones, dispatcher, `arch.multiversion`);
+  `features:` on `def`/`show`/`context` lines (T8's); `--target` on
+  `query`. `arch.feature_ambiguous` has no run test until an AArch64 aes
+  intrinsic exists (T4).
+
 ## 8. Open questions
 
 - **O1. Latency and throughput in `query show`.** Useful for choosing
