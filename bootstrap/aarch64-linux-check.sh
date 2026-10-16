@@ -172,7 +172,7 @@ tar -C "$SNAP" -c -f - src tachyonc.o | docker run --rm -i --name "$CONTAINER" -
     steps=suite-O2
     [ "$ALL_LEVELS" = 1 ] && steps="suite-O*"
     # (no seed here: it has no aarch64-linux backend)
-    [ "$FUZZ" != 0 ] && steps="$steps,fuzz-plain,fuzz-loops,fuzz-generics,fuzz-pressure,fuzz-calls,fuzz-lang06,fuzz-vector,fuzz-div,fuzz-range"
+    [ "$FUZZ" != 0 ] && steps="$steps,fuzz-plain,fuzz-loops,fuzz-generics,fuzz-pressure,fuzz-calls,fuzz-lang06,fuzz-vector,fuzz-div,fuzz-range,fuzz-arch"
     [ "$ABI" != 0 ] && steps="$steps,abi-*,layout"
     [ "$OBJCHECK" = 1 ] && steps="$steps,objcheck"
     [ "$DEBUGGER" = 1 ] && steps="$steps,debug"

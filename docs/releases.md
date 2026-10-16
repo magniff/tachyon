@@ -1427,7 +1427,8 @@ The steps: `chain` (`bootstrap.sh --dev --no-head-tests`: the releases,
 then the working tree, built and checked for its fixpoint); then, at
 once, `suite-O0`, `suite-O1`, `suite-O2`; `fuzz-plain`, `fuzz-loops`,
 `fuzz-generics`, `fuzz-pressure`, `fuzz-calls`, `fuzz-lang06`,
-`fuzz-vector`, `fuzz-div`, `fuzz-range` and `fuzz-seed` (the seed as a
+`fuzz-vector`, `fuzz-div`, `fuzz-range`, `fuzz-arch` (0.19: the
+intrinsics, `tests/fuzz/run.sh -A`) and `fuzz-seed` (the seed as a
 third oracle); `abi-plain`, `abi-import`, `abi-header`; `objcheck`;
 `layout` (`tests/cimport/layout.sh` on the system headers); `debug`
 (`tests/debug.sh`); `stress-grow` (0.14, not in `--quick`: the compiler
