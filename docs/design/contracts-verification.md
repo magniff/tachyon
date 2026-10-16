@@ -417,10 +417,12 @@ mod tests {
   the one `cfg` tachyon accepts (D3).
 - **A test module sees its parent's items,** private ones included, without a
   `use`, as a nested scope sees its parent's names.
-  - `use super::*;` inside a test module is accepted as a no-op, and `fmt`
-    deletes it. It is the one place where Rust habit writes a wildcard, and it
-    names nothing the module does not already see.
-  - Wildcard imports stay errors everywhere else.
+  - `use super::*;` is **not** accepted, in a test module or anywhere: no
+    wildcard imports is a standing rule. It is `error[import] wildcard imports
+    are not allowed`, whose help says that a test module sees its parent's
+    items without an import, and whose `try:` deletes the line. `fix
+    --suggested` and `fix --only imports` apply that deletion (decided
+    2026-10-16).
 - **The harness.**
   - `tachyonc test` compiles the program with a test entry in place of `main`:
     one binary for every test, where `prog --tachyon-test NAME` runs one.
@@ -772,6 +774,7 @@ them with ` | `.
 | `distinct.kind` | `distinct` over an owned or view type | | `help:` a struct |
 | `test.signature` | a `#[test]` with parameters other than `gpa: Gpa` | | `edit patch` `#[test]` → `#[property]` |
 | `test.generate` | a property parameter with no generator | `no generator for '*u8' (raw pointer)` | `tachyonc edit insert --after T < impl Arbitrary for T {..}` |
+| `import.wildcard` | `use super::*;` (in a test module or elsewhere) | `wildcard imports are not allowed \| help: a test module sees its parent's items without an import` | `tachyonc edit delete FILE:LINE` (applied by `fix --suggested`, `fix --only imports`) |
 | `macro.args` | `panic!("{}", x)` | | an f-string, by `edit patch` |
 
 Run-time failures are §2.4's lines, and the test summary is §2.9's.
@@ -1186,6 +1189,10 @@ clauses become checked AST before either back end sees them:
    `tachyonc test FILTER` still runs tests/run.sh.
 5. Nothing has `#[test]` today, so making those items test-only breaks nothing.
 
+**Before 0.17 ships.** Every task is marked "can start now" or "needs 0.17"
+in §7 ("When each task can start"): T1–T5, T8 and T9 start now; T6 and T7
+start their 0.16-only steps now and do their `fix --values` passes after 0.17.
+
 **std.**
 - Clauses go on its public API: indexing-like methods, `insert`/`remove`,
   `unwrap`/`expect`, `split_at`, `parse_*` preconditions.
@@ -1263,7 +1270,23 @@ compiled programs' output is unchanged.
 | **T6 Compiler: front, tools, base on values and arenas** | scripts in docs/design/018-migration/front-*.txt; base/comp.tach; tools/refactor_table/ | 0.17.0; P0's names | §4.1: `Comp`/`Ast`, IntVec → Vec, `refactor table`, `fix --values` on front, tools and base, the release of `Ast` after lowering |
 | **T7 Compiler: middle, back, gen0; threads** | scripts in docs/design/018-migration/middle-*.txt; tools/refactor_ctx/; middle/ctx.tach; base/threads.tach; back/emit/join.tach | 0.17.0 (0.17.1 optional); T5 merged before its replay | §4.2 and §4.3: `refactor context`, FnCtx and Program, `fix --values` there, per-function arenas and the inline store, the pool, the deterministic join, per-component inline budgets, `-j` |
 | **T8 Incremental** | back/codecache.tach, Program's read recording (after T7's context step), tests/incremental/* | T7 step 1 | §4.4: keys, read sets, the pack, the gate's clean-against-incremental check |
-| **T9 Tools, guide, eval preparation** | tools/query (def/show/context clauses), tools/fmt, refactor's clause handling, fix (`--suggested` forms, `use super::*` in test modules), explain entries, compiler/guide/{contracts,testing,debug,errors,core,types}.md, docs/{grammar,query,refactor}.md, tools/agent-hooks/check-after-edit.py, tests/agent-eval tasks (§8) | P0 shapes; T1/T2 outputs | §2.14 |
+| **T9 Tools, guide, eval preparation** | tools/query (def/show/context clauses), tools/fmt, refactor's clause handling, fix (`--suggested` forms, the deletion of `use super::*`), explain entries, compiler/guide/{contracts,testing,debug,errors,core,types}.md, docs/{grammar,query,refactor}.md, tools/agent-hooks/check-after-edit.py, tests/agent-eval tasks (§8) | P0 shapes; T1/T2 outputs | §2.14 |
+
+**When each task can start.** Releases are pipelined: 0.18's tasks begin
+while 0.17 is being built. The compiler/src that a task changes is built by
+the previous release, and nothing below uses 0.17's syntax until 0.17 ships.
+
+| task | start | why |
+|---|---|---|
+| T1 Contracts | **can start now** (before 0.17 ships) | clauses, desugaring, purity, messages and std's clauses need only 0.16; the `old(..)` kind rule and invariant checks at `&mut T` boundaries are finished after 0.17 merges |
+| T2 Tests and properties | **can start now** | `Gen` is passed as `*Gen` until `&mut` exists; nothing else touches value semantics |
+| T3 Fuzzing and reduce | **can start now** | independent of 0.17 |
+| T4 Distinct and NonNull | **can start now** | "plain" is approximated by "no Vec, Buf, HashMap or Drop" until 0.17's kinds land |
+| T5 Checks, optimizer | **can start now** | independent of 0.17 |
+| T6 Compiler front, tools, base | **partly now**: `Comp`/`Ast`, IntVec → `Vec<i64, Comp>`, `refactor table` (0.16 features); **needs 0.17** for `fix --values` and the release of `Ast` | |
+| T7 Compiler middle, back, gen0; threads | **can start now** with `cx: *FnCtx` / `p: *Program` parameters and the effects declaration (0.16); **needs 0.17** for the `&`/`&mut` signatures (one `fix --values` pass) | |
+| T8 Incremental | **can start now**, after T7's context step | independent of 0.17 |
+| T9 Tools, guide, eval preparation | **can start now** | |
 
 **Task items and acceptance.**
 
@@ -1413,9 +1436,9 @@ rebuilds: wall time per run, and the build share of it.
   enough for agents' minute-long runs, not for days.
 - **Distinct types multiply instances** (`Vec<NodeId>` against `Vec<i64>`), so
   identical-body folding is needed before the compiler adopts them in 0.19.
-- **`use super::*` in test modules** bends the no-wildcard rule (decision 8).
-  If the user rejects it, the error with its exact edit costs agents one turn
-  per test module.
+- **`use super::*` in test modules** is an error (decision 8): agents who
+  write Rust tests write it by habit, so it costs a turn per test module unless
+  the check hook's `fix --suggested` removes it. E2 counts it.
 
 ## 10. Open questions, with recommendations
 
@@ -1528,9 +1551,12 @@ later by a `fix` migration or a flag.
    `panic!`/`unreachable!` are accepted and normalized by `fmt` (Q6).
 7. **Tests:** `#[test] fn` (Rust's form, not Zig's blocks), with `#[cfg(test)]`
    as the one accepted `cfg` (Q2).
-8. **Test modules see their parent's items;** `use super::*;` in one is a
-   no-op that `fmt` deletes. Wildcards stay errors everywhere else. This is the
-   one exception to the no-wildcard rule, and the user may want to reverse it.
+8. **Test modules see their parent's items without any import.** `use
+   super::*;` is not accepted, not even as a no-op (no wildcard imports is a
+   standing user rule): it is `error[import] wildcard imports are not
+   allowed`, whose help says test modules see the parent's items and whose
+   `try:` deletes the line, applied by `fix --suggested` and `fix --only
+   imports`. *Decided 2026-10-16* (coordinator, on the user's standing rule).
 9. **Test builds use `--trace` and `--check-alloc`,** and leaks fail (Q8).
    `tachyonc test` compares -O0 and -O2 by default (Q9).
 10. **Properties:** integrated shrinking; contracts with `ensures` are tested
