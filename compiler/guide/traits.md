@@ -107,7 +107,7 @@ struct Countdown { n: i64 }
 
 impl Iterator for Countdown {           // std's trait, in the prelude
     type Item = i64;
-    fn next(self: *Countdown) -> Option<i64> {
+    fn next(self: &mut Countdown) -> Option<i64> {
         if self.n == 0 { return None; }
         self.n -= 1;
         Some(self.n + 1)

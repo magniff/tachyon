@@ -82,8 +82,8 @@ heap. Rust's `println!("{}", x)` is `println(f"{x}")`, `format!` is
 ## Display and Debug
 
 ```text
-trait Display { fn fmt(self: *Self, f: *Fmt); }
-trait Debug { fn fmt_debug(self: *Self, f: *Fmt); }
+trait Display { fn fmt(self: &Self, f: &mut Fmt); }
+trait Debug { fn fmt_debug(self: &Self, f: &mut Fmt); }
 ```
 
 Write `impl Display for T` (no derive: the text is yours) with the
@@ -104,7 +104,7 @@ struct Point { x: i64, y: i64 }
 enum Shape { Circle(i64), Rect(Point, Point), Line { from: Point, len: i64 }, Empty }
 
 impl Display for Point {
-    fn fmt(self: *Point, f: *Fmt) {
+    fn fmt(self: &Point, f: &mut Fmt) {
         f.write(f"({self.x}, {self.y})");
     }
 }

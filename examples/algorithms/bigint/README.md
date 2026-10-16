@@ -189,7 +189,7 @@ nine digits, with an f-string spec (`{x:09}`: zero-padded to 9):
 
 ```tach
 impl Display for BigUint {
-    fn fmt(self: *BigUint, f: *Fmt) {
+    fn fmt(self: &BigUint, f: &mut Fmt) {
         ...
         f.write(f"{s[s.len - 1]}");
         let mut i = s.len - 2;

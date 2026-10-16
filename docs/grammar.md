@@ -919,8 +919,8 @@ in std is safe and uses unsafe blocks inside.
 
 ```
 trait Shape {
-    fn area(self: *Self) -> i64;
-    fn describe(self: *Self) {            // a default
+    fn area(self: &Self) -> i64;
+    fn describe(self: &Self) {            // a default
         print("area ");
         std::print_int(self.area());
     }
@@ -929,7 +929,7 @@ trait Shape {
 struct Square { side: i64 }
 
 impl Shape for Square {
-    fn area(self: *Square) -> i64 { self.side * self.side }
+    fn area(self: &Square) -> i64 { self.side * self.side }
 }
 
 fn total<T: Shape>(items: [T]) -> i64 { ... }   // bounds
@@ -1168,11 +1168,11 @@ let g: fn(i64) -> i64 = |x| x * 2;   // captures nothing: a plain fn
 ```tach
 trait Source {
     type Item;                                  // declared: no default, no bounds
-    fn get(self: *Self) -> Self::Item;
+    fn get(self: &Self) -> Self::Item;
 }
 impl Source for Counter {
     type Item = i64;                            // every declared name is defined
-    fn get(self: *Counter) -> i64 { self.n }
+    fn get(self: &Counter) -> i64 { self.n }
 }
 fn first<I: Source>(it: I) -> I::Item { ... }
 fn total<I: Iterator<Item = T>, T: Add>(it: I) -> T { ... }
@@ -1232,9 +1232,9 @@ The `Iterator` trait (in the prelude):
 ```
 pub trait Iterator {
     type Item;
-    fn next(self: *Self) -> Option<Self::Item>;
-    fn exact_len(self: *Self) -> i64                 // items left, or -1 (default)
-    fn at(self: *Self, k: i64) -> Self::Item         // k-th left: k = 0, 1, 2, ... while exact_len > k
+    fn next(self: &mut Self) -> Option<Self::Item>;
+    fn exact_len(self: &Self) -> i64                 // items left, or -1 (default)
+    fn at(self: &Self, k: i64) -> Self::Item         // k-th left: k = 0, 1, 2, ... while exact_len > k
     fn map, filter, enumerate, zip, take             // adapters: Map, Filter, Enumerate, Zip, Take
     fn fold, for_each, count, sum, min, max, collect // consumers (collect: a Vec)
 }

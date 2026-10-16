@@ -136,7 +136,7 @@ the perimeter are then one chain each:
 ```tach
 impl Iterator for Edges {
     type Item = (Vec2, Vec2);
-    fn next(self: *Edges) -> Option<(Vec2, Vec2)> { ... }
+    fn next(self: &mut Edges) -> Option<(Vec2, Vec2)> { ... }
 }
 
 fn perimeter(self: &Polygon) -> f64 {

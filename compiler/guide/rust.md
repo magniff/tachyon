@@ -201,7 +201,7 @@ fn main() -> i32 {
 | `!` (never) | `!`: `fn fail() -> ! { ... }` |
 | `#[derive(PartialEq, Eq)]` | `==` is structural for structs, enums, tuples, arrays; `Vec`, `Buf`, `HashMap` by contents (0.15); `#[derive(Eq)]` checks it |
 | `#[derive(Clone, Copy, Debug, Default, Hash)]` | `#[derive(Clone, Debug, Hash, Ord)]` (0.15); every value copies, no `Copy`, no `Default` |
-| `impl Display`, `{:?}` | `impl Display for T { fn fmt(self: *T, f: *Fmt) {..} }`, `{x:?}` (0.15, `guide formatting`) |
+| `impl Display`, `{:?}` | `impl Display for T { fn fmt(self: &T, f: &mut Fmt) {..} }`, `{x:?}` (0.15, `guide formatting`) |
 | `impl From<A> for B`, `.into()` | the same (0.15, `guide conversions`) |
 | `type A = B;` | the same (`type Pair<T> = (T, T);` too) |
 | `const fn` | none; `const` items take constant expressions |
