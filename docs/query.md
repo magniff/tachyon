@@ -939,6 +939,10 @@ must come from the cache when the first made it).
   file of the program), one that could not be parsed. A damaged or
   partly written file is not read (a hash of its contents; written
   through a new file renamed over the old).
+- (0.18.1) Beside it, a build's code cache, `g-KEY.pack`: each
+  function's optimized code at -O1 and -O2, reused by a rebuild where an
+  edit did not change it ([optimizer.md](optimizer.md), "0.18.1:
+  incremental rebuilds"); `--no-cache` goes without.
 
 ## Several commands in one call: batch (0.15)
 

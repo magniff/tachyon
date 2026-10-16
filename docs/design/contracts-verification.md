@@ -1836,3 +1836,36 @@ onto v0.17.0 settled these (each with a test):
 Left for 0.18.1: a leak's site names the generated `<test>` source, not
 the property; facts from `ensures` at call sites (the contracts report's
 list); `fmt` keeps the bang spellings of the assertions.
+
+### T8 notes (incremental rebuilds, as built on p181-incr)
+
+Built as §4.4 says, on T7's tasks, with these differences
+([optimizer.md](../optimizer.md), "0.18.1: incremental rebuilds"):
+
+- **What is cached** is three kinds of tasks: -O2's cleanup and scalar
+  pipeline (one entry over two phases), -O2's components (their
+  optimized IR and facts, which the callers' tasks and the later phases
+  read: an entry holds IR, encoded, not only bytes), and every
+  function's emission (its text, not its bytes: the join still
+  assembles, T7's per-function assembly being left).
+- **The key** holds the program's types whole (`types_hash`), not per
+  read: an edit that adds or changes a type misses every entry. The
+  other renumbered ids (strings, symbols, functions, constant data) are
+  hashed and stored by what they name, and mapped to the build's ids
+  when an entry is used.
+- **Reads** are recorded at the accessors of `middle::inline`,
+  `middle::ipo` and `ir_enter` (`cc_note`), not in a `Program` type (T7
+  kept the statics; `fn_facts_ready` is the readiness T7 made). The
+  inlining budget and a callee's calls left are recorded as their
+  answers. `tests/threads_writes.sh` checks that every static task code
+  touches is covered.
+- **Found:** 0.18's run-time check sites are numbered globally, in
+  lowering order, and the number is a constant in the code: an edit that
+  adds a check makes every later function with one miss (std's
+  functions always). Measured on the 12 most recent commits to
+  compiler/src: 7 rebuild with a few misses, 4 with about 415 of 6111
+  components missing, 1 (a struct changed) from nothing.
+- **Goals:** the -O2 self-compile with nothing changed in 0.47 s at -j8
+  (the goal 0.3 s), after one function's edit 0.53 s (0.4 s): the
+  serial parts left (front end, lowering, interprocedural constants,
+  dead functions, the join's assembly, the data) are about 360 ms.

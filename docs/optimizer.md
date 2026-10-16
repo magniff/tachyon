@@ -2278,3 +2278,159 @@ IR as `K_EMIT` (or the bottom-up task) receives it plus what
 as its level sees them (`program_size`, `calls_left`); `join_task` is the
 place to splice cached texts in, and `resolve_consts` numbers their
 constants as one thread would.
+
+## 0.18.1: incremental rebuilds
+
+Task T8 of [design/contracts-verification.md](design/contracts-verification.md)
+(§4.4), on T7's tasks: a task of `middle::parallel` whose inputs are the
+same as in an earlier build takes that build's outputs instead of
+running (`back/codecache`). Three kinds of tasks are cached:
+
+| entry | in | out |
+|---|---|---|
+| scalar (-O2) | a function's IR as lowered | its cleanup's and scalar pipeline's IR, and their constant data (the two tasks' phases are one entry; -O1's cleanup alone costs less than its entry) |
+| component (-O2) | a component's functions' IR after interprocedural constants | their optimized IR, size, call flags, deciders, attributes, whether their loop passes wait; the component's growth and calls inlined |
+| emission (-O1, -O2) | a function's IR as emission receives it | its text and constant data |
+
+**The key** of an entry: the kind; the compiler (a hash of its
+executable) and the command line (every option but `-o`, `-j`, the
+cache's own and the diagnostics', and the `TACHYON_*` variables the code
+generator reads); the target and the optimizer's switches; every type
+of the program (`types_hash`: each type's description and layout, a
+struct or enum by its fields and variants, not its name); and per
+function of the task its symbol (with its module's path: a C function
+declared in several modules has one declaration in each), what the
+program knows of it as the task begins (live, address taken, -O1's leaf
+marks, at -O2 its size, call flags, deciders, attributes, whether its
+loop passes wait) and its IR's hash. The IR's hash (`hash::ir_hash`,
+128 bits) takes every field of every instruction, block and slot, the
+operand lists, the switch cases and the function's move notes, but the
+scratch fields `mark` and `aux` (stamps a pass left, which every pass
+writes before it reads), and the ids an edit elsewhere renumbers by
+what they name: a string by its bytes and its place among the
+function's strings, a symbol (GADDR, CALLC) by its text (a static's
+type and linkage too), a function (CALL, FADDR) by `fn_canon` (its
+symbol, linkage, signature, attributes, effects, whether it is a
+closure's, a C name the program links, whether it has IR), constant
+data a task made by its owner's symbol, its place and its bytes.
+
+**What a task read** of other functions is recorded as it runs, at the
+accessors (`cc_note`): the callee of a call (`ir_callee`, whose fixed
+facts: live, address taken, leaf marks, in the task's SCC, ready),
+`fn_facts_ready`, a callee's size, attributes and no-capture bits, call
+flags, deciders and IR (`ir_enter`, `ir_view` in `inline_call`). Two reads
+of the program record their answer, not the value: whether the
+program, grown by what the component inlined so far and the callee, is
+within the inlining budget (`budget_allows`), and whether a callee has
+one call left (`calls_left`); the program's size changes with every
+edit, the answers rarely. An entry is used only when every recorded read
+reads the same now (a verifying trace, as in Salsa or Bazel), and when
+the functions whose IR it read have their strings the same ids as in
+its build (an alias hash). A read of a function that is not ready (its
+task may be writing it) is not recorded; a read of IR whose hash is not
+known poisons the task (it runs, nothing is stored).
+`tests/threads_writes.sh` lists every static task code touches (175)
+and each must be in its table with how the cache covers it: the key,
+a recorded read, the IR's hash, a mode the cache is off in, or the
+cache's own.
+
+**The outputs** name strings, symbols, functions and constant data by
+what they are (`snapshot::Rel`): a string by the function whose list
+holds it (the task's own, or one whose IR it read) and its place there,
+constant data by its owner and place (the task's own: past what it had
+when the task began), a symbol by its text, a function by its symbol
+(by its index when another function has the symbol: the IR's hashes
+hold the index then). An emission's text writes its strings
+`str.\x03<i>`, the i-th of the text's, and the join puts their ids (as
+it numbers labels, `\x01`, and constant data, `\x02`). A hit installs
+the IR, the facts and the text, and makes the constant data again in
+its order, in its phase and rank (the same placeholders, numbered as
+one thread numbers them).
+
+**The pack**: `target/tachyonc-cache/g-KEY.pack`, where the tools'
+cache is (`$TACHYON_CACHE` names another directory, or `off`; without
+it there is a cache only when the current directory has a `target`
+directory), KEY a hash of the root as given, the current directory, the
+command line, the options and the compiler. It is 8-byte words: a
+header (magic, version, compiler, options, length, entries, last use),
+then each entry's length, key, age and body hash, and its body (bytes of
+variable-length numbers). It is mapped whole and indexed by key; a body
+is checked against its hash when its entry is used (a damaged one is a
+miss). A build that made entries writes a new pack, renamed over the old
+one (concurrent builds each write a whole one; the last stays), by a
+copy of the process after the output is written (here with
+`$TACHYON_CACHE_SYNC` or `$TACHYON_CACHE_TRACE`): the entries it used and
+made, and the others for 3 builds while the pack stays under twice the
+used ones (32 MB at least). When the directory's packs pass
+`$TACHYON_CACHE_LIMIT` MB (1024), the least recently used go. A build
+that used every entry and made none only marks the pack used.
+
+**Off:** `--no-cache` or `--cache=off`; at -O0; with -g, `--trace`,
+`--time-passes`, `--stats`, the IR and register printers and checkers,
+profiles, `--check-alloc`, `--check-unsafe`, `--coverage`,
+`--verify-effects`, `--print-checks`, `--emit-ir`, `--emit-mir`,
+`--vec-stats`, and any option the cache does not know.
+`$TACHYON_CACHE_STATS` prints each kind's hits and misses (new, a read
+changed, unreadable, not cacheable); `$TACHYON_CACHE_WHY` (with `-j1`)
+each miss and the read that changed; `$TACHYON_CACHE_CHECK` reads every
+component entry back as it is made and compares the IR.
+
+**The same bytes.** `tests/incremental.sh` (the gate's `incremental`
+step, also in `--quick`): the compiler's own source (10 seeded edits and
+the 6 most recent commits to compiler/src of at most 60 lines that still
+undo, each undone and redone), the examples and bench (4 edits each), at
+-O1 and -O2, with -j1 and -j8: a cold build with the cache must be the
+object a build without it makes, then after each edit the rebuild with
+the cache must be the clean build's object, then the tree put back
+(the first entries, aged): 148 series, 90 to 93% of the tasks hits. The edits:
+a `let x = N;` made N + 1 (a function's code), a new `let` of a new
+string (every later string and symbol id moves), a comment line (every
+later check's position in the file), a new function (every later
+function id). `tests/threads.sh` runs without the cache (-jN would take
+-j1's outputs).
+
+**Measured** (aarch64-macos, the compiler's self-compile `-c`, best of
+5, load 2 to 6; an edit: `let x = N;` to N + 1 in a function of
+compiler/src, five of them, the mean):
+
+| | cold, no cache | cold, cache (overhead) | warm, nothing changed | warm, one function edited | pack |
+|---|---|---|---|---|---|
+| -O2 -j8 | 0.77 s | 0.80 s (+4%; +13% writing in the process) | 0.47 s | 0.53 s | 76 MB |
+| -O2 -j1 | 2.26 s | 2.48 s (+10%) | 0.62 s | 0.67 s | 76 MB |
+| -O1 -j8 | 0.41 s | 0.39 s | 0.34 s | 0.36 s | 15 MB |
+| -O1 -j1 | 0.87 s | 0.89 s | 0.37 s | 0.38 s | 15 MB |
+
+Phases of the -O2 -j8 rebuild with nothing changed (ms): front end 127,
+lowering 51, cleanup and scalar pipeline (hashing the lowered IR, the
+entries read) 32, interprocedural constants 49, components 40, dead
+functions 36, emission with the join and the assembler 80, data and
+output 25. The serial parts this task does not touch (the front end,
+lowering, interprocedural constants, dead functions, the join's
+assembly, the data) are about 360 ms: the design's goal (at most 0.4 s
+after one edit) needs the front end's (out of T8's scope) and the
+assembler's per function. The suite runs 6% slower with the cache on
+(its programs are small; the compiler's own builds write 76 MB packs),
+and its packs take about 450 MB.
+
+The 12 most recent commits to compiler/src that undo cleanly, undone one
+at a time (-O2 -j8, 6549 scalar, 6111 component and 5247 emission
+tasks): 7 rebuild in 0.51 to 0.56 s with 1 to 32 tasks of each kind
+missing; 4 add or remove a run-time check, which renumbers the checks
+after it (0.18's site ids, in lowering order, a constant in the code:
+std's functions, lowered last, always), and about 415 components miss
+(0.56 to 0.67 s); 1 changes a struct's fields, and every entry misses
+(0.90 s, a cold build).
+
+**What is left.**
+- *Site ids.* A check's site id is a global number in the code; an edit
+  that adds one moves every later one, and the functions holding them
+  (std's, and every function that inlined one) miss. Numbering a
+  function's sites from 1 in its own text and putting the ids at the
+  join (as constant data) would keep them.
+- *Types.* An edit that adds, removes or changes a type (a new tuple, a
+  closure, a struct's fields) misses everything: the key holds every
+  type's id and description. A type's id is its place in creation
+  order; naming types by their structure (and their ids in the outputs
+  by it, as strings) would keep the rest.
+- *The serial parts* above, and per-function assembly (T7's), whose bytes
+  the cache could keep instead of the text.
