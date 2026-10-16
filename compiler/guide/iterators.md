@@ -19,7 +19,6 @@ same machine code at -O2, vectorized where the loop would be).
 ```tach
 fn main(gpa: Gpa) -> i32 {
     let mut v: Vec<i64> = Vec::new_in(gpa);
-    defer v.free();
     for i in 1..=6 { v.push(i); }
     std::print_int(v.iter().filter(|x| x % 2 == 0).map(|x| x * x).sum());
     print(" ");
@@ -34,8 +33,7 @@ fn main(gpa: Gpa) -> i32 {
     std::print_int(v.iter().zip(v.iter()).fold(0, |acc, (a, b)| acc + a * b));
     println("");
     let mut w = v.iter().map(|x| 7 - x).collect_in(gpa);   // a Vec<i64>
-    defer w.free();
-    w.sort_by(|a, b| a.cmp(b));                         // a, b: *i64
+    w.sort_by(|a, b| a.cmp(b));                         // a, b: &i64
     for x in w { std::print_int(x); }
     println("");
     0
@@ -68,9 +66,9 @@ over the indices: `for i in 0..v.len() { v.set(i, v.get(i) * 2); }`.
   `(A, B)`, as long as both have one), `take(n)`.
 - `fold(init, |acc, x| ...)`, `for_each(f)`, `count()`, `sum()` (from
   `0 as Item`), `min()` and `max()` (an `Option`), `collect()` (a `Vec`
-  of the items; free it; there is no other target, and no
+  of the items, dropped with its scope; there is no other target, and no
   `collect::<Vec<_>>()`).
-- `sort_by(s, |a, b| ...)` sorts in place by a comparison of `*T`s
+- `sort_by(s, |a, b| ...)` sorts in place by a comparison of `&T`s
   returning negative, zero or positive (`a.cmp(b)`; `b.cmp(a)`
   descending); also `v.sort_by(...)` and `s.sort_by(...)`.
 - An adapter takes its iterator by value, so a chain is one value; to

@@ -51,7 +51,10 @@ use crate::front::own::state::{
     CUR, PL_COUNT, PL_FIELD, PL_PARENT, PL_RID, PL_RKIND, RK_LOCAL, dmoved_bits, get_bit,
     moved_bits, root_of,
 };
-use crate::front::types::{FNS, STRUCTS, TLISTS, TYPES, TY_BOOL, TY_UNIT, TyKind, struct_field};
+use crate::front::types::{
+    FNS, REF_MUT, REF_SHARED, STRUCTS, TLISTS, TYPES, TY_BOOL, TY_UNIT, TyKind, fn_param,
+    struct_field,
+};
 use crate::middle::lower::ssa::HMap;
 
 // Node flags (0.17, T1): on the read of the old value of an owned
@@ -473,6 +476,48 @@ fn push_bindings(p: i64) {
     }
 }
 
+// The last word of a function's display name: `get` of `Vec<T>::get`.
+pub fn method_word(d: [u8]) -> [u8] {
+    let mut i = d.len;
+    while i > 0 && d[i - 1] != ':' && d[i - 1] != '.' {
+        i -= 1;
+    }
+    d[i..d.len]
+}
+
+// Whether call e gives a copy of an element its shared receiver keeps:
+// std's accessors (`v.get(i)`, `v.last()`, `m.get(k)`, `key_at`,
+// `value_at`) return a `T`, not a `&T`, until references are type
+// arguments (0.17.1), and through `unwrap`, `expect`, `unwrap_or`. The copy
+// is borrowed: a binding of it is not dropped, and moving it is
+// own.move_out (it would be dropped twice).
+pub fn borrowed_call(e: i64) -> bool {
+    unsafe {
+        if e <= 0 || NODES[e].kind != NodeKind::Call || NODES[e].count == 0 {
+            return false;
+        }
+        let f = NODES[e].x - 1;
+        if f < 0 || FNS[f].module != STD_MODULE || !has_glue(NODES[e].ty) {
+            return false;
+        }
+        let name = method_word(SYMS[FNS[f].display].text);
+        let p0 = fn_param(f, 0);
+        if p0 <= 0 {
+            return false;
+        }
+        if name == "get" || name == "last" || name == "first" || name == "key_at"
+            || name == "value_at" {
+            // (a shared receiver: `&self`, or a slice)
+            return TYPES[p0].kind == TyKind::Slice && TYPES[p0].b != REF_MUT
+                || TYPES[p0].kind == TyKind::Ptr && TYPES[p0].b == REF_SHARED;
+        }
+        if name == "unwrap" || name == "expect" || name == "unwrap_or" {
+            return borrowed_call(child(e, 0));
+        }
+        false
+    }
+}
+
 // Pattern p's owned bindings borrow what they bind (node at).
 fn mark_byref(p: i64, at: i64) {
     unsafe {
@@ -496,6 +541,11 @@ fn let_drops(block: i64, i: i64, stmt: i64) {
         let pat = NODES[stmt].a;
         let init = NODES[stmt].c;
         if pat == 0 || (NODES[stmt].p & NO_DROP) != 0 {
+            return;
+        }
+        if borrowed_call(init) {
+            // (a copy of an element a collection keeps: `v.get(i)`)
+            mark_byref(pat, init);
             return;
         }
         if init != 0 && NODES[init].kind == NodeKind::Index
@@ -701,7 +751,7 @@ pub fn arm_drops(m: i64, arm: i64) {
             if (NODES[arm].p & ARM_FOR_NEXT) != 0 {
                 return;
             }
-            if scrutinee != 0 && reached_by_ref(scrutinee) {
+            if scrutinee != 0 && (reached_by_ref(scrutinee) || borrowed_call(scrutinee)) {
                 NODES[scrutinee].p |= MATCH_BYREF;
                 mark_byref(pat, scrutinee);
                 return;

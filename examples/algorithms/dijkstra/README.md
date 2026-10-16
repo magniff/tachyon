@@ -74,7 +74,7 @@ returns, so an empty heap returns `None` in one token:
 ```tach
 struct MinHeap<T: Ord> { items: Vec<T> }
 
-fn pop(self: *MinHeap<T>) -> Option<T> {
+fn pop(self: &mut MinHeap<T>) -> Option<T> {
     let last = self.items.pop()?;         // empty: None
     let s = self.items.as_slice();
     ...

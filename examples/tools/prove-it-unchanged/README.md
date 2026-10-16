@@ -55,9 +55,9 @@ renamed local a to low in crate::adler::adler32, 4 uses	adler.tach	+4 -4 lines
 $ tachyonc refactor rename adler32::b high
 renamed local b to high in crate::adler::adler32, 3 uses	adler.tach	+3 -3 lines
 $ tachyonc refactor rename main::c1 sum_in
-renamed local c1 to sum_in in crate::main, 2 uses	main.tach	+3 -3 lines
+renamed local c1 to sum_in in crate::main, 1 use	main.tach	+2 -2 lines
 $ tachyonc refactor rename main::c2 sum_out
-renamed local c2 to sum_out in crate::main, 2 uses	main.tach	+3 -3 lines
+renamed local c2 to sum_out in crate::main, 1 use	main.tach	+2 -2 lines
 $ tachyonc refactor rename main::p out
 renamed local p to out in crate::main, 4 uses	main.tach	+4 -4 lines
 $ tachyonc main.tach -o after.s && cmp before.s after.s && echo same assembly
@@ -135,24 +135,19 @@ parameters (in the order of their first use), the one they define and
 `main` uses after them its result:
 
 ```console
-$ tachyonc refactor extract-function main --lines 23-31 --to round_trips --show
-extracted lines 23-31 of crate::main into round_trips(out, gpa, s) -> bool	main.tach	+14 -9 lines
-// main.tach:23
-23	    let ok = round_trips(out, gpa, s);
-// main.tach:38-50
-38	}
-39	
-40	fn round_trips(out: [u8], gpa: Gpa, s: [u8]) -> bool {
-41	    let ok = match rle::decode(out, gpa) {
-42	        Some(v) => {
-43	            let mut back = v;
-44	            let same = back.as_slice() == s;
-45	            back.free();
-46	            same
-47	        }
-48	        None => false,
-49	    };
-50	    ok
+$ tachyonc refactor extract-function main --lines 21-24 --to round_trips --show
+extracted lines 21-24 of crate::main into round_trips(out, gpa, s) -> bool	main.tach	+9 -4 lines
+// main.tach:21
+21	    let ok = round_trips(out, gpa, s);
+// main.tach:34-41
+34	}
+35	
+36	fn round_trips(out: [u8], gpa: Gpa, s: [u8]) -> bool {
+37	    let ok = match rle::decode(out, gpa) {
+38	        Some(back) => back.as_slice() == s,
+39	        None => false,
+40	    };
+41	    ok
 ```
 
 The compiled code changes now (there is a new function), so the
@@ -185,9 +180,9 @@ identical	12 compilations	1 programs	4 targets	-O0 -O1 -O2
 ```console
 $ git diff --stat
  adler.tach | 13 ++++++++-----
- main.tach  | 37 +++++++++++++++++++++----------------
+ main.tach  | 23 ++++++++++++++---------
  rle.tach   |  5 ++---
- 3 files changed, 31 insertions(+), 24 deletions(-)
+ 3 files changed, 24 insertions(+), 17 deletions(-)
 ```
 
 ## Why not by hand

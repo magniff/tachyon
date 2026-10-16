@@ -114,11 +114,11 @@ the hole has two types at the sites, and each gets a command:
 
 ```console
 $ tachyonc rewrite '$v.len() == 0' '$v.is_empty()'
-report.tach:68:8: error[type error] no method 'is_empty' on type '*Buf' | help: no `is_empty`: `x.len() == 0` | try: tachyonc query items Buf main.tach  [edited: crate::report::finish]
+report.tach:68:8: error[type error] no method 'is_empty' on type '&mut Buf' | help: no `is_empty`: `x.len() == 0` | try: tachyonc query items Buf main.tach  [edited: crate::report::finish]
 error edit.breaks: 1 new error; nothing written
-note rewrite.where: $v has 2 types at the sites: Vec<[u8]> (1 site), *Buf (1 site); --where takes the ones the replacement fits
+note rewrite.where: $v has 2 types at the sites: Vec<[u8]> (1 site), &mutBuf (1 site); --where takes the ones the replacement fits
 try: tachyonc rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Vec<[u8]>'
-try: tachyonc rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: *Buf'
+try: tachyonc rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: &mutBuf'
 try: tachyonc rewrite '$v.len() == 0' '$v.is_empty()' --no-check
 [exit 1]
 ```
@@ -129,10 +129,10 @@ it skipped is reported with its type, and a command for it:
 ```console
 $ tachyonc rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Vec<[u8]>' --show
 rewrote 1 site in 1 file	main.tach	+1 -1 lines
-// main.tach:19
-19	    if ws.is_empty() {
-note rewrite.types: 1 site matches but for --where; first: $v is *Buf at report.tach:68:8
-try: tachyonc rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: *Buf' --dry-run
+// main.tach:17
+17	    if ws.is_empty() {
+note rewrite.types: 1 site matches but for --where; first: $v is &mut Buf at report.tach:68:8
+try: tachyonc rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: &mut Buf' --dry-run
 ```
 
 ## 4. Index loops become `for x in v`

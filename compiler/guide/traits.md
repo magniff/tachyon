@@ -9,23 +9,23 @@ type's methods. Dispatch is static: a trait is not a type.
 use std::hash_u64;
 
 trait Shape {
-    fn area(self: *Self) -> i64;
-    fn name(self: *Self) -> [u8] { "shape" }   // a default
+    fn area(self: &Self) -> i64;
+    fn name(self: &Self) -> [u8] { "shape" }   // a default
 }
 
 struct Square { side: i64 }
 struct Rect { w: i64, h: i64 }
 
 impl Shape for Square {
-    fn area(self: *Square) -> i64 { self.side * self.side }
-    fn name(self: *Square) -> [u8] { "square" }
+    fn area(self: &Square) -> i64 { self.side * self.side }
+    fn name(self: &Square) -> [u8] { "square" }
 }
 
 impl Shape for Rect {
-    fn area(self: *Rect) -> i64 { self.w * self.h }
+    fn area(self: &Rect) -> i64 { self.w * self.h }
 }
 
-fn report<T: Shape>(s: *T) {
+fn report<T: Shape>(s: &T) {
     print(s.name());
     print(" ");
     std::print_int(s.area());
@@ -33,7 +33,8 @@ fn report<T: Shape>(s: *T) {
 }
 
 // Operators: + - * / and unary - through Add Sub Mul Div Neg,
-// == through Eq, < <= > >= through Ord's cmp.
+// == through Eq, < <= > >= through Ord's cmp. std's traits take
+// `self: *Self` (a reference, as a `*T` parameter is), so their impls do.
 struct V2 { x: i64, y: i64 }
 
 impl Add for V2 {
@@ -41,11 +42,11 @@ impl Add for V2 {
 }
 
 impl Ord for V2 {
-    fn cmp(self: *V2, o: *V2) -> i64 { (self.x + self.y) - (o.x + o.y) }
+    fn cmp(self: &V2, o: &V2) -> i64 { (self.x + self.y) - (o.x + o.y) }
 }
 
 impl Hash for V2 {
-    fn hash(self: *V2) -> u64 { hash_u64((self.x * 31 + self.y) as u64) }
+    fn hash(self: &V2) -> u64 { hash_u64((self.x * 31 + self.y) as u64) }
 }
 
 trait Double { fn double(self: Self) -> Self; }
@@ -59,7 +60,6 @@ fn main(gpa: Gpa) -> i32 {
     let v = V2 { x: 1, y: 2 } + V2 { x: 3, y: 4 };
     if v > (V2 { x: 0, y: 0 }) { std::print_int(v.x * 10 + v.y); }
     let mut seen: HashMap<V2, bool> = HashMap::new_in(gpa);   // a struct key: Hash + Eq
-    defer seen.free();
     seen.insert(v, true);
     if seen.contains(V2 { x: 4, y: 6 }) { print(" found "); }
     std::print_int(21.double());

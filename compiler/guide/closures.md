@@ -58,8 +58,13 @@ Decided per variable, so the meaning never depends on an analysis:
 | the variable | captured | the closure sees |
 |---|---|---|
 | `let x`, a parameter, a `for` variable | by value (a copy) | the value it had; nothing can change it |
-| `let mut x` | by reference | later changes, and its own assignments change `x` |
+| `let mut x` | by reference | `x` itself: its assignments change `x` |
 | anything, with `move \|..\|` | by value | a snapshot; assignments change the closure's copy |
+
+A closure capturing `x` by reference is a view of `x` (0.17): while the
+closure is still to be called, `x` is not changed another way
+(`own.conflict`, as in Rust). Change it after the closure's last call,
+or capture a snapshot with `move`.
 
 ```tach
 fn call<F: FnMut() -> i64>(mut f: F) -> i64 {
@@ -68,16 +73,16 @@ fn call<F: FnMut() -> i64>(mut f: F) -> i64 {
 
 fn main() -> i32 {
     let mut n = 1;
-    let read = || n;            // by reference
-    let snap = move || n;       // a copy of n, now
-    n = 5;
-    std::print_int(call(read) * 10 + call(snap));
-    println("");
+    let snap = move || n;              // a copy of n, now
+    let bump = || { n += 10; n };      // by reference: changes n
+    let b = call(bump);                // 11
+    n += 100;                          // bump is done with n
+    println(f"{b} {call(snap)} {n}");
     0
 }
 ```
 ```out
-51
+11 1 111
 ```
 
 A closure that borrows a variable cannot leave that variable's block: a

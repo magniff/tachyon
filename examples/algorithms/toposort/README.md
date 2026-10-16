@@ -131,7 +131,6 @@ captures the plan, then `?` returns it:
 
 ```tach
 let mut order = sort(&g, gpa).map_err(|c| self.named(c, gpa))?;
-defer order.free();
 Ok(order.iter().map(|v| self.names.get(v)).collect_in(gpa))
 ```
 

@@ -1952,8 +1952,9 @@ instance at -O0), `fmt_direct_err`, `checkalloc_fmt_direct`,
 
 docs/design/value-semantics.md §4, "Optimizer work for zero cost" (task
 T5). What the own pass guarantees under `--values=error` becomes facts
-for the optimizer. Under `report` (the default until the migration) and
-`warn` the facts are unsound (`sweep(sa, sa)`), so nothing changes there.
+for the optimizer. `error` is the default since the migration (T7);
+under the opt-outs `report`, `warn` and `off` the facts are unsound
+(`sweep(sa, sa)`), so nothing changes there.
 
 **Reference parameters** (middle/gvn.tach, "Reference parameters"). The
 facts come from the parameter types, and only when the own pass ran in

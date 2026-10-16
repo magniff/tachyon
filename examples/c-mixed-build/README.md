@@ -98,7 +98,7 @@ A path starting with `./` is relative to the importing file. The header's
 `c::Ring` with the same fields, so tachyon can read them directly:
 
 ```tach
-fn len(self: *Window) -> i64 {
+fn len(self: &Window) -> i64 {
     unsafe { (*self.ring).len as i64 }
 }
 ```
@@ -171,7 +171,7 @@ extern "C" fn accumulate(value: i64, ctx: *u8) -> i32 {
     0 // keep going
 }
 
-fn stats(self: *Window) -> Stats {
+fn stats(self: &mut Window) -> Stats {
     let mut s = Stats { count: 0, sum: 0, min: i64::MAX, max: i64::MIN };
     unsafe { c::ring_each(self.ring, accumulate, &s as *u8); }
     s
@@ -189,9 +189,9 @@ struct Window { ring: *c::Ring }
 
 impl Window {
     fn new(cap: i64) -> Option<Window> { ... }
-    fn push(self: *Window, value: i64) { unsafe { c::ring_push(self.ring, value); } }
-    fn get(self: *Window, i: i64) -> i64 { ... }   // checks i first
-    fn free(self: *Window) { ... }
+    fn push(self: &mut Window, value: i64) { unsafe { c::ring_push(self.ring, value); } }
+    fn get(self: &mut Window, i: i64) -> i64 { ... }   // checks i first
+    fn free(self: &mut Window) { ... }
 }
 ```
 

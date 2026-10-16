@@ -114,7 +114,7 @@ fn main(gpa: Gpa) -> i32 {
         add(&mut items, Item { name: name, qty: qty });
         seen.insert(name, qty);                // also contains(k), remove(k)
     }
-    items.sort_by(|a, b| b.qty - a.qty);       // a, b: *Item; < 0: a first
+    items.sort_by(|a, b| b.qty - a.qty);       // a, b: &Item; < 0: a first
     for (i, it) in items.iter().enumerate() { print(f"{i}:{it.name} "); }
     let line = trim(sc.next_line().unwrap());  // the rest of the line
     let total = split_in(line, ',', gpa).iter()
@@ -124,7 +124,7 @@ fn main(gpa: Gpa) -> i32 {
         None => println("no pen"),
     }
     let text = format_in(f"{items.len()} {seen.len()}", gpa);   // a Buf
-    println(text.as_slice());                  // (not freed: the program ends)
+    println(text.as_slice());                  // text, seen, items, input: dropped at the end
     0
 }
 ```

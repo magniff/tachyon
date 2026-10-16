@@ -52,14 +52,15 @@ fn on_macos() -> bool {
 `==` on two `[u8]` compares their bytes.
 
 **The world** is two `Vec<Cell>`s, the current generation and the next;
-`step` computes one from the other and swaps them. `Vec` is a handle (a
-pointer, a length, a capacity), so the swap copies three words, not the
-cells:
+`step` computes one from the other and swaps them. A `Vec` owns its
+cells, so `step` cannot copy one out of `self` (it would have two owners):
+it takes the current one, leaving an empty `Vec` in its place, and trades
+it for the next. A `Vec` moves as three words (a pointer, a length, a
+capacity), not the cells:
 
 ```tach
-let old = self.cells;
-self.cells = self.next;
-self.next = old;
+let old = self.cells.take();
+self.cells = std::replace(&mut self.next, old);
 ```
 
 The edges wrap around (a torus): `(x + width) % width`.

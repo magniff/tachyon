@@ -368,7 +368,7 @@ fn main(gpa: Gpa) -> i32 { let m: HashMap<K, i64> = HashMap::new_in(gpa); 0 }
 ```err
 error[type error] the trait 'Hash' is not implemented for 'K' | help: required by the bound 'K: Hash' of 'HashMap'
 ```
-`impl Hash for K { fn hash(self: *K) -> u64 { std::hash_u64(self.a as u64) } }`.
+`impl Hash for K { fn hash(self: &K) -> u64 { std::hash_u64(self.a as u64) } }`.
 
 ## Closures and iterators (0.14)
 
@@ -535,22 +535,22 @@ A generic body is checked per use; the note names the instance.
 Implement `Ord` for `P`, or bound `T: Ord` to say what it needs.
 
 ```tach
-trait A { fn a(self: *Self) -> i64; fn b(self: *Self) -> i64; }
+trait A { fn a(self: &Self) -> i64; fn b(self: &Self) -> i64; }
 struct S { }
-impl A for S { fn a(self: *S) -> i64 { 1 } }
+impl A for S { fn a(self: &S) -> i64 { 1 } }
 ```
 ```err
 error[type error] the impl of trait 'A' is missing 'b' | help: it has no default: write it in the impl
 ```
 
 ```tach
-trait A { fn a(self: *Self) -> i64; }
-fn f(x: *dyn A) -> i64 { 0 }
+trait A { fn a(self: &Self) -> i64; }
+fn f(x: &dyn A) -> i64 { 0 }
 ```
 ```err
 error[parser error] 'dyn' is a reserved keyword
 ```
-No trait objects: `fn f<T: A>(x: *T)`, or an enum of the cases.
+No trait objects: `fn f<T: A>(x: &T)`, or an enum of the cases.
 
 ## Modules and imports
 
@@ -761,7 +761,8 @@ signature total --type v '&Vec<i64>' --default '&$v'` changes both.
 ```text
 error[own.move_out] cannot move 'self.keys' (Vec<Entry>) out of '*self': 'rehash' borrows 'self'
 ```
-`let old = std::take(&mut self.keys);` (leaves an empty Vec), or loop
+`let old = self.keys.take();` (leaves an empty Vec on the same
+allocator; `std::take(&mut x)` for a `Default` value), or loop
 over `self.keys` by reference.
 
 ```text

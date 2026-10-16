@@ -40,18 +40,18 @@ on the command line make one program; `mod name;` loads `name.tach`.
 | Rust | tachyon |
 |---|---|
 | `String`, `&str` | `[u8]`, a byte slice: `"text"` is a `[u8]`; build text with `std::Buf`; `c"text"` is a NUL-terminated `*u8` for C |
-| `&T`, `&mut T`, `Box<T>` | `&T`, `&mut T` (0.17): `&x`, `&mut x`, reading through one is safe; no lifetimes; `*T` is the raw pointer (a `*T` parameter is a borrow); no `Box` |
-| `fn f(&self)`, `fn f(&mut self)` | `fn f(self: *T)` (may write through it); `fn f(self: T)` takes a copy |
+| `&T`, `&mut T`, `Box<T>` | `&T`, `&mut T` (0.17): `&x`, `&mut x`, checked and safe; no lifetimes; `*T` is the raw pointer (a `*T` parameter is still taken as `&mut T`); no `Box` |
+| `fn f(&self)`, `fn f(&mut self)` | `fn f(self: &T)`, `fn f(self: &mut T)` (0.17); `fn f(self: T)` takes the value (an owned one moves) |
 | `use m::*;` | not allowed: `use m::{a, b};`, or the path `m::a` |
 | `println!("{}", x)`, `format!` | no macros: `println(f"x = {x:>4} {v:?}")`, `format_in(f"..", gpa)` (a `Buf`) (`guide formatting`) |
 | `Vec::new()`, a global allocator | `Vec::new_in(gpa)`: nothing allocates without an allocator; `gpa` comes from `fn main(gpa: Gpa)`, passed down as a parameter (0.16, `guide allocators`) |
 | `Box<T>`, arenas | a `Vec`; `arena_scope(gpa, \|a\| ..)` frees all it allocated at its end; `--check-alloc` traps a use after free |
 | `const fn`, purity | `#[pure]`, `#[no_alloc]`: checked declarations; `tachyonc query effects f` (0.16, `guide effects`) |
-| `v[i]` on a `Vec` | the same (0.17): `v[i]`, `v[i] = x`, `v[a..b]` index its slice, checked, also through a pointer parameter (`v: *Vec<i64>`); `v.get(i)`, `v.set(i, x)` too |
+| `v[i]` on a `Vec` | the same (0.17): `v[i]`, `v[i] = x`, `v[a..b]` index its slice, checked, also through a reference (`v: &mut Vec<i64>`); `v.get(i)`, `v.set(i, x)` too |
 | closures, `.iter().map()` | the same (0.14): `v.iter().map(\|x\| x * k).sum()`; `F: Fn(i64) -> i64` bounds; no `dyn Fn`, `iter_mut` (`guide closures`, `guide iterators`) |
 | `x?` | the same on `Option` and `Result` (0.15); `impl From<E> for F` converts the error; `main` may return `Result<(), E>` (`guide conversions`) |
 | `impl Trait for T`, `T: Trait` | the same; `type Item;` associated types (0.14); `#[derive(Eq, Ord, Hash, Debug, Clone)]` (0.15); no `dyn`, `where`, supertraits |
-| `Drop`, RAII | none: call `free()`, usually `defer v.free();` |
+| `Drop`, RAII | the same (0.17): values are dropped at the end of their scope; `impl Drop for T`, `drop(x)`, `std::forget(x)`; no `free` calls (`guide memory`) |
 | `!x` on integers | `~x`; `!` is for `bool` only |
 | `i64::MAX`, `x.abs()`, `x.pow(2)` | `i64::MAX`, `u8::MIN` the same (0.15); no methods on numbers: write the expression, or call C |
 | overflow panics, `/ 0` panics | integers wrap; `x / 0 == 0`, `x % 0 == x`; no panic |
@@ -143,7 +143,7 @@ enum Shape { Circle(Point, i64), Rect { min: Point, max: Point }, Empty }
 
 impl Point {
     fn new(x: i64, y: i64) -> Point { Point { x: x, y: y } }   // Point::new(1, 2)
-    fn shift(self: *Point, dx: i64) { self.x += dx; }           // writes through self
+    fn shift(self: &mut Point, dx: i64) { self.x += dx; }       // writes through self
     fn sum(self: Point) -> i64 { self.x + self.y }              // a copy
 }
 
@@ -157,7 +157,7 @@ fn area(s: Shape) -> i64 {
 
 fn main() -> i32 {
     let mut p = Point::new(1, 2);
-    p.shift(10);                          // passes &p
+    p.shift(10);                          // passes &mut p
     let shapes = [Shape::Rect { min: Point::new(0, 0), max: p }, Shape::Circle(p, 2),
         Shape::Empty];
     for s in shapes {
@@ -194,14 +194,14 @@ by field; `[u8]` compares by bytes, a `Vec` or `HashMap` by contents.
 
 ```tach
 trait Area {
-    fn area(self: *Self) -> i64;
-    fn twice(self: *Self) -> i64 { 2 * self.area() }   // a default method
+    fn area(self: &Self) -> i64;
+    fn twice(self: &Self) -> i64 { 2 * self.area() }   // a default method
 }
 
 struct Square { side: i64 }
 
 impl Area for Square {
-    fn area(self: *Square) -> i64 { self.side * self.side }
+    fn area(self: &Square) -> i64 { self.side * self.side }
 }
 
 fn total<T: Area>(items: [T]) -> i64 {    // bounds: T: A + B
@@ -211,7 +211,7 @@ fn total<T: Area>(items: [T]) -> i64 {    // bounds: T: A + B
 struct Pair<T> { a: T, b: T }
 
 impl<T: Ord> Pair<T> {
-    fn max(self: *Pair<T>) -> T { if self.a > self.b { self.a } else { self.b } }
+    fn max(self: &Pair<T>) -> T { if self.a > self.b { self.a } else { self.b } }
 }
 
 fn main() -> i32 {
@@ -271,7 +271,8 @@ note: build with --trace for the line and its callers
 
 An array `[T; N]` is a value (copied by `=`; `a.len()` is N); a slice
 `[T]` is a pointer and a length (`.ptr`, `.len`, `.len()`) viewing an
-array, a `Vec` or memory. Writing through a slice needs no `mut`.
+array, a `Vec` or memory. A `[T]` is read-only; `&mut [T]`
+(`&mut a[..]`, `v.as_mut_slice()`) writes its elements (0.17).
 
 ## std: Vec, HashMap, Buf; allocation
 
@@ -281,12 +282,11 @@ fn evens(n: i64, gpa: Gpa) -> Vec<i64> {  // it allocates: it takes an allocator
 }
 
 fn main(gpa: Gpa) -> i32 {                 // the program's allocator
-    let mut v: Vec<i64> = Vec::new_in(gpa);
-    defer v.free();                        // no destructors: free explicitly
+    let mut v: Vec<i64> = Vec::new_in(gpa);  // dropped (freed) when main returns
     v.push(30);
     v.push(10);
     v.push(20);
-    sort(v.as_slice());                    // in place
+    sort(v.as_mut_slice());                // in place
     v.set(0, v.get(0) + 1);                // get/set are checked
     for x in v { std::print_int(x); print(" "); }   // also &v, v.iter()
     println("");
@@ -295,7 +295,6 @@ fn main(gpa: Gpa) -> i32 {                 // the program's allocator
     println("");
 
     let mut m: HashMap<[u8], i64> = HashMap::new_in(gpa);
-    defer m.free();
     m.insert("a", 1);
     m.insert("b", 2);
     match m.get("a") { Some(x) => std::print_int(x), None => print("none") }
@@ -304,9 +303,9 @@ fn main(gpa: Gpa) -> i32 {                 // the program's allocator
     println("");
 
     let mut b = Buf::new_in(gpa);          // text builder
-    defer b.free();
+    let e = evens(4, gpa);
     b.push_str("n=");
-    b.push_int(m.len() + evens(4, gpa).len()); // (a leak: not freed)
+    b.push_int(m.len() + e.len());
     b.push('!');
     println(b.as_slice());
     0
@@ -333,11 +332,12 @@ diverge unsafe`): `tachyonc query effects f --why io` shows where;
 `#[pure]` or `#[no_alloc]` on a function is checked (`guide effects`,
 `guide allocators`).
 
-`Vec`, `Buf` and `HashMap` are handles: copying one (`let w = v;`,
-passing it by value) copies the pointer, not the contents. Pass `&v` to
-a `*Vec<T>` parameter to let a function push. A slice from `as_slice`
-is valid until the vector grows or is freed (using it later is the one
-hole in safe code). std's API, made from its source in this compiler, a
+`Vec`, `Buf` and `HashMap` own their contents: `let w = v;` or passing
+one by value moves it (`.clone()` copies). Pass `&v` to a `&Vec<T>`
+parameter to read it, `&mut v` to a `&mut Vec<T>` one to let a function
+push. A slice from `as_slice` views the vector: using it after the
+vector grew or was dropped is an error (`guide views`). std's API,
+made from its source in this compiler, a
 line per item: `tachyonc guide std#the-api`; each item with its comment:
 `tachyonc guide std#every-item`; one name: `tachyonc guide --find NAME`.
 @STD-API-FULL@
@@ -354,8 +354,7 @@ Option means absent, Result failed). Files go through C (`fopen`):
 import "string.h" as c;
 
 fn main(argc: i32, argv: **u8, gpa: Gpa) -> i32 {
-    let mut input = read_stdin_in(gpa).unwrap(); // all of stdin
-    defer input.free();                   // the caller frees it
+    let input = read_stdin_in(gpa).unwrap(); // all of stdin, a Buf
     let mut sc = Scanner::new(input.as_slice());
     let mut total = 0;
     while let Ok(n) = sc.next_int() {     // Err(ScanError::End) at the end
@@ -396,8 +395,9 @@ fn main() -> i32 {
 
 Unsafe operations: calling C or an `unsafe fn`, dereferencing (`*p`,
 `p.f`) or indexing (`p[i]`) a raw pointer, reading a union field. A
-*borrow* is safe to dereference: `&place` passed directly, or a pointer
-parameter (`self: *T` included). A local holding a pointer is raw.
+reference (`&T`, `&mut T`) is safe to read and write through wherever
+it is kept, and so is a `*T` parameter (taken as `&mut T` in 0.17); any
+other `*T` (a local or field of that type, a C result) is raw.
 `tachyonc fix --only unsafe` wraps what needs it; `#[repr(C)]`, callbacks
 and linking: `guide c-interop`.
 

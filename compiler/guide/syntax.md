@@ -45,11 +45,11 @@ fn bump(mut n: i64) -> i64 { n += 1; n }   // a mutable parameter
 unsafe fn raw(p: *i64) -> i64 { p[0] }     // callers need unsafe
 
 impl Point {
-    fn len2(self: *Point) -> i64 { self.x * self.x + self.y * self.y }
+    fn len2(self: &Point) -> i64 { self.x * self.x + self.y * self.y }
 }
 
-trait Named { fn name(self: *Self) -> [u8]; }
-impl Named for Point { fn name(self: *Point) -> [u8] { "point" } }
+trait Named { fn name(self: &Self) -> [u8]; }
+impl Named for Point { fn name(self: &Point) -> [u8] { "point" } }
 
 mod util { pub fn twice(x: i64) -> i64 { x * 2 } }
 

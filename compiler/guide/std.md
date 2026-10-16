@@ -14,7 +14,7 @@ Vec::new_in(gpa) -> Vec<T>       let mut v: Vec<i64> = Vec::new_in(gpa);
 v.len() -> i64                   Vec, Buf, HashMap; a slice: s.len or s.len()
 v.get(i: i64) -> T               checked; also v[i]; m.get(k) -> Option<V>
 b.push_str(s: [u8])
-v.free()                         Vec, Buf, HashMap: defer v.free(); consumes v
+v.free()                         Vec, Buf, HashMap: frees now, leaves it empty; values drop by themselves
 Buf::new_in(gpa) -> Buf          text you build (there is no String)
 o.unwrap() -> T                  Option, Result
 read_stdin_in(gpa) -> Result<Buf, IoError>    all of stdin
@@ -32,7 +32,7 @@ Vec::filled_in(n: i64, x: T, gpa) -> Vec<T>
 sort(s: &mut [T])                in place, by Ord; also v.sort()
 m.slots(), m.key_at(i) -> Option<K>, m.value_at(i) -> Option<V>   iterate
 Vec::with_capacity_in(cap: i64, gpa) -> Vec<T>
-m.get_or_insert(k: K, d: V) -> [V]    m.get_or_insert(w, 0)[0] += 1;
+m.get_or_insert(k: K, d: V) -> &mut [V]    m.get_or_insert(w, 0)[0] += 1;
 sc.next_token() -> Option<[u8]>
 parse_int(s: [u8]) -> Result<i64, ParseIntError>
 sc.next_line() -> Option<[u8]>
@@ -40,7 +40,7 @@ m.insert(k: K, x: V) -> Option<V>     Vec: v.insert(i: i64, x: T)
 std::print_int(v: i64)
 trim(s: [u8]) -> [u8]
 is_digit(b: u8) -> bool          use std::{is_digit};
-read_line(&b) -> Result<bool, IoError>    Ok(false) at the end of input
+read_line(&mut b) -> Result<bool, IoError>    Ok(false) at the end of input
 split_whitespace_in(s: [u8], gpa) -> Vec<[u8]>
 v.swap(i: i64, j: i64)
 sort_stable_by_in(s: &mut [T], f, gpa)
@@ -70,12 +70,14 @@ What a Rust programmer will miss: there is no `String` (use `[u8]` and
 iterators`), no `HashSet` (a `HashMap<K, bool>`). A `Vec` (and a `Buf`) indexes as
 its slice: `v[i]`, `v[i] = x`, `v[a..b]` (0.17), checked. Formatting is 0.15's f-strings,
 `println(f"{x:>4}")` (`tachyonc guide formatting`); errors are enums in a
-`Result` (`tachyonc guide conversions`). Nothing frees itself: call `free()`, usually right
-after creating the value with `defer x.free();`.
+`Result` (`tachyonc guide conversions`). A `Vec`, `Buf` or `HashMap` is
+dropped (freed) at the end of its scope (0.17): no `free` calls.
 
-- `Vec<T>`, `Buf` and `HashMap<K, V>` are handles: copying one shares its
-  memory. Pass `&v` (a `*Vec<T>`) to functions that change it.
-- A slice from `as_slice()` is valid until the next push or `free`.
+- `Vec<T>`, `Buf` and `HashMap<K, V>` own their memory: `let w = v;`
+  moves it, `.clone()` copies. Pass `&v` (a `&Vec<T>`) to functions that
+  read it, `&mut v` (a `&mut Vec<T>`) to those that change it.
+- A slice from `as_slice()` views the container: the checker rejects its
+  use after the next push, `free` or drop (`tachyonc guide views`).
 - `get`, `set`, slice indexing and `unwrap` are checked: a failure prints
   a message and exits with 101.
 - `HashMap` keys need `Hash` and `Eq` (integers, `bool`, `[u8]` have
@@ -85,19 +87,20 @@ after creating the value with `defer x.free();`.
   `for i in 0..m.slots()` and `key_at(i)`/`value_at(i)`, in slot order
   (not the order of insertion).
 - To change a value in place, `get_mut(k)` and `get_or_insert(k, d)`
-  give a view of one element (`[V]`; `a[0]` is the value), safe to use
-  until the map's next insert, remove or free, like `as_slice()`:
+  give a writable view of one element (`&mut [V]`; `a[0]` is the value),
+  safe to use until the map's next insert, remove or free, like
+  `as_mut_slice()`:
   `counts.get_or_insert(word, 0)[0] += 1;` counts.
 - `sort(s)` sorts a slice in place by `Ord` (an introsort: O(n log n),
   not stable); `v.sort()`, `s.sort()` too.
 - (0.17) `sort(&mut a[..])`, `sort(v.as_mut_slice())`; `v.free()`
-  consumes `v`; `v.take()` empties a container, keeping its allocator;
+  frees now and leaves `v` empty; `v.take()` moves the contents out,
+  leaving an empty container with the same allocator;
   `std::take`, `std::replace`, `std::swap`; `v.iter_ref()` yields `&T`.
 
 ```tach
 fn main(gpa: Gpa) -> i32 {
     let mut counts: HashMap<[u8], i64> = HashMap::new_in(gpa);
-    defer counts.free();
     let words = ["a", "b", "a", "c", "a"];
     for w in words {
         counts.get_or_insert(w, 0)[0] += 1;
@@ -144,14 +147,11 @@ key), read all of stdin and take lines with `Scanner::next_line`.
 ```tach
 fn main(gpa: Gpa) -> i32 {
     let mut line = Buf::new_in(gpa);
-    defer line.free();
-    read_line(&line).unwrap();            // the header: "n m"
-    let mut header = split_whitespace_in(line.as_slice(), gpa);
-    defer header.free();
+    read_line(&mut line).unwrap();        // the header: "n m"
+    let header = split_whitespace_in(line.as_slice(), gpa);
     let n = parse_int(header.get(0)).unwrap();
     let m = parse_int(header.get(1)).unwrap_or(0);
-    let mut rest = read_stdin_in(gpa).unwrap(); // everything after it
-    defer rest.free();
+    let rest = read_stdin_in(gpa).unwrap(); // everything after it
     let mut sc = Scanner::new(rest.as_slice());
     let mut sum = 0;
     for _ in 0..n {

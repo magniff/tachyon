@@ -59,11 +59,12 @@ fn main(gpa: Gpa) {
   drop; a type without one drops its fields. `drop(x)` drops early,
   `std::forget(x)` never (a leak, safe).
 - Moving out of a borrowed place (`let k = self.keys;` in a `&mut self`
-  method) is `own.move_out`: take it with `std::take(&mut self.keys)`,
-  which leaves an empty one, or `std::replace`.
-- `v.free()` still works: it consumes `v`. `defer v.free()`, the idiom
-  before 0.17, is legal and no longer needed; `tachyonc fix --values`
-  rewrites old code.
+  method) is `own.move_out`: take it with `self.keys.take()`, which
+  leaves an empty one (`std::take(&mut x)` for a `Default` value), or
+  `std::replace`.
+- `v.free()` still works: it frees now and leaves `v` empty (its drop
+  then frees nothing). `defer v.free()`, the idiom before 0.17, is
+  legal and no longer needed; `tachyonc fix --values` rewrites old code.
 
 ## References
 

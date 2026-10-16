@@ -11,11 +11,16 @@ use std::{Buf, HashMap};
 struct Store { values: HashMap<[u8], i64>, names: Arena }
 
 // A copy of s in the store's names arena: the keys of the map must
-// outlive the request that brought them.
+// outlive the request that brought them. The arena owns the bytes, not
+// the Vec: the Vec is forgotten, and the view is made from its pointer,
+// valid as long as the arena (which safe code cannot say in 0.17: a view
+// of a Vec ends with the Vec).
 fn intern(names: Arena, s: [u8]) -> [u8] {
     let mut v: Vec<u8, Arena> = Vec::with_capacity_in(s.len, names);
     v.extend_from_slice(s);
-    v.as_slice()
+    let p = v.as_slice().ptr;
+    std::forget(v);
+    unsafe { p[0..s.len] }
 }
 
 // s in lowercase, a new Vec on the allocator a (here: the request's
@@ -30,7 +35,7 @@ fn lower_in<A: Allocator>(s: [u8], a: A) -> Vec<u8, A> {
 
 // Answers one request into `out`; every allocation but the store's is on
 // `scratch`, whatever its type: the caller decides how long it lives.
-fn answer<A: Allocator>(store: *Store, line: [u8], scratch: A, out: *Buf<A>) {
+fn answer<A: Allocator>(store: &mut Store, line: [u8], scratch: A, out: &mut Buf<A>) {
     let words = std::split_whitespace_in(line, scratch);
     if words.len() == 0 {
         out.push_str("empty request");
@@ -50,11 +55,13 @@ fn answer<A: Allocator>(store: *Store, line: [u8], scratch: A, out: *Buf<A>) {
         };
         let old = store.values.get(key.as_slice()).unwrap_or(0);
         let new = if cmd == "set" { n } else { old + n };
-        if !store.values.contains_key(key.as_slice()) {
+        match store.values.get_mut(key.as_slice()) {
+            // A known key: its value changes in place.
+            Some(v) => v[0] = new,
             // A new key: its bytes go where the map's keys live.
-            store.values.insert(intern(store.names, key.as_slice()), new);
-        } else {
-            store.values.insert(key.as_slice(), new);
+            None => {
+                store.values.insert(intern(store.names, key.as_slice()), new);
+            }
         }
         out.push_fmt(f"{key.as_slice()} = {new}");
     } else if cmd == "get" && w.len == 2 {
@@ -65,21 +72,17 @@ fn answer<A: Allocator>(store: *Store, line: [u8], scratch: A, out: *Buf<A>) {
         }
     } else if cmd == "sum" && w.len >= 2 {
         let mut total = 0;
-        let mut missing: Vec<[u8], A> = Vec::new_in(scratch);
+        let mut missing = Buf::new_in(scratch);
         for name in w[1..] {
             let key = lower_in(name, scratch);
             match store.values.get(key.as_slice()) {
                 Some(n) => total += n,
-                None => missing.push(key.as_slice()),
+                None => missing.push_fmt(f" {key.as_slice()}"),
             }
         }
         out.push_fmt(f"sum = {total}");
         if missing.len() > 0 {
-            out.push_str(" (not set:");
-            for m in missing.iter() {
-                out.push_fmt(f" {m}");
-            }
-            out.push_str(")");
+            out.push_fmt(f" (not set:{missing.as_slice()})");
         }
     } else {
         out.push_fmt(f"unknown request: {line}");
@@ -88,7 +91,6 @@ fn answer<A: Allocator>(store: *Store, line: [u8], scratch: A, out: *Buf<A>) {
 
 fn main(gpa: Gpa) -> i32 {
     let mut input = std::read_stdin_in(gpa).unwrap();
-    defer input.free();
     let mut store = Store { values: HashMap::new_in(gpa), names: Arena::new_in(gpa) };
     defer store.values.free();
     defer unsafe { store.names.free_all() };
@@ -96,7 +98,6 @@ fn main(gpa: Gpa) -> i32 {
     let mut requests = 0;
     let mut peak = 0;
     let mut lines = std::split_in(input.as_slice(), '\n', gpa);
-    defer lines.free();
     for line in lines.iter() {
         if line.len == 0 {
             continue;
@@ -105,7 +106,7 @@ fn main(gpa: Gpa) -> i32 {
         // (all of it) when the closure returns. Only an i64 leaves it.
         let used = arena_scope(gpa, |scratch| {
             let mut out = Buf::new_in(scratch);
-            answer(&store, line, scratch, &out);
+            answer(&mut store, line, scratch, &mut out);
             println(f"{line:<24} -> {out.as_slice()}");
             scratch.used()
         });

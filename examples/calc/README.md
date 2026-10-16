@@ -60,7 +60,7 @@ once, so the grammar reads as it would without errors:
 
 ```tach
 // term: unary (('*' | '/' | '%') unary)*
-fn term(self: *Parser) -> Result<i64, Error> {
+fn term(self: &mut Parser) -> Result<i64, Error> {
     let mut value = self.unary()?;
     loop {
         let op = self.peek();

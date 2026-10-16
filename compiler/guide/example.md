@@ -21,9 +21,7 @@ use store::Store;
 
 fn main(gpa: Gpa) -> i32 {
     let input = read_stdin_in(gpa).unwrap();    // all of stdin, a Buf
-    defer input.free();                         // freed when main returns
     let mut store = Store::new(gpa);            // it allocates: give it gpa
-    defer store.free();
     let mut sc = Scanner::new(input.as_slice());
     let mut line_no = 0;
     while let Some(raw) = sc.next_line() {      // a line, without its '\n'
@@ -32,15 +30,15 @@ fn main(gpa: Gpa) -> i32 {
         if line.len == 0 {
             continue;
         }
-        if let Err(e) = run(&store, line, gpa) { // &store: a *Store
+        if let Err(e) = run(&mut store, line, gpa) { // run may change store
             println(f"line {line_no}: {e}");    // Error has Display
         }
     }
     0
-}
+}                                               // store, then input, dropped (freed)
 
 // One line: parsed, then applied; `?` passes the first Err up.
-fn run(store: *Store, line: [u8], gpa: Gpa) -> Result<(), Error> {
+fn run(store: &mut Store, line: [u8], gpa: Gpa) -> Result<(), Error> {
     let cmd = parse(line, gpa)?;
     store.apply(cmd)
 }
@@ -94,8 +92,7 @@ impl Display for Error {
 
 // `add NAME COUNT PRICE`, `sell NAME COUNT` or `report`.
 pub fn parse(line: [u8], gpa: Gpa) -> Result<Command, Error> {
-    let mut words = split_whitespace_in(line, gpa);  // Vec<[u8]>: views into line
-    defer words.free();
+    let words = split_whitespace_in(line, gpa); // Vec<[u8]>: views into line
     let w = words.as_slice();                   // [[u8]]
     let verb = w[0];
     if verb == "add" {                          // text is compared with ==, not matched
@@ -143,13 +140,9 @@ impl Store {
         Store { items: Vec::new_in(gpa), index: HashMap::new_in(gpa) }
     }
 
-    pub fn free(self: *Store) {                 // no destructors: freed by hand
-        self.items.free();
-        self.index.free();
-    }
+    // No free: a Store drops its fields (items, then index) when it is dropped.
 
-    // self: *Store is Rust's &mut self (and &self).
-    pub fn apply(self: *Store, cmd: Command) -> Result<(), Error> {
+    pub fn apply(self: &mut Store, cmd: Command) -> Result<(), Error> {
         match cmd {
             Command::Add(item) => match self.index.get(item.name) {
                 Some(i) => {
@@ -175,16 +168,14 @@ impl Store {
     }
 
     // The items by value, highest first, ties by name; then the total.
-    fn report(self: *Store) {
+    fn report(self: &Store) {
         let gpa = self.items.allocator();       // a Vec's allocator, to allocate with
         let mut order = self.items.clone();     // a copy (in that allocator)
-        defer order.free();
-        order.sort_by(|a, b| {                  // a, b: *Item; < 0: a goes first
+        order.sort_by(|a, b| {                  // a, b: &Item; < 0: a goes first
             let d = value(*b) - value(*a);
-            if d != 0 { d } else { cmp_of(&a.name, &b.name) }   // cmp_of takes pointers
+            if d != 0 { d } else { cmp_of(&a.name, &b.name) }   // cmp_of takes references
         });
         let mut out = Buf::new_in(gpa);         // Rust's String
-        defer out.free();
         let mut total = 0;
         for it in order {
             out.push_fmt(f"{it.name:<5}{it.count:>3} x {it.price:>2} = {value(it)}\n");
@@ -240,16 +231,18 @@ total 129
   `match` has no string patterns.
 - Enum variants are tuple-like or struct-like; patterns as in Rust, with
   guards (`Ok(n) if n >= 0`), `if let`, `while let`. Matching through a
-  pointer is `match *self`.
-- `#[derive(Eq, Ord, Hash, Debug, Clone)]` (no `PartialEq`, no `Copy`:
-  every struct and enum copies). `Display` is written by hand, with
-  `f.write(f"..")`.
+  reference is `match *self`.
+- `#[derive(Eq, Ord, Hash, Debug, Clone)]` (no `PartialEq`, no `Copy`
+  derive: a struct of numbers and views, as `Item`, copies; one holding a
+  `Vec`, `Buf` or `HashMap`, as `Store`, moves). `Display` is written by
+  hand, with `f.write(f"..")`; its `self: *Self` is a reference.
 - Nothing allocates without an allocator. `main` gets `gpa` and passes
   it down. A function that allocates takes `gpa: Gpa`; one holding a
-  `Vec` can use `v.allocator()`. Free with `defer x.free()`.
-- `self: *T` is `&self` and `&mut self`; `&x` gives a `*T`; fields are
-  reached through it with `.`.
+  `Vec` can use `v.allocator()`. Nothing is freed by hand: a value is
+  dropped at the end of its scope (`tachyonc guide memory`).
+- `self: &T` and `self: &mut T` are `&self` and `&mut self`; `&x` and
+  `&mut x` give `&T` and `&mut T`; fields are reached through them with `.`.
 - Comparators return an `i64` (negative: `a` first) and take
-  pointers: `sort_by(|a, b| ..)`, `cmp_of(&x, &y)`.
+  references: `sort_by(|a, b| ..)`, `cmp_of(&x, &y)`.
 - `Buf` is Rust's `String`: `push_str`, `push_int`, `push_fmt(f"..")`,
   `as_slice()`.

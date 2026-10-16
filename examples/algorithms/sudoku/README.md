@@ -68,7 +68,7 @@ allocation.
 #[derive(Clone)]
 struct Sudoku { cells: [u8; 81], rows: [u64; 9], cols: [u64; 9], boxes: [u64; 9] }
 
-fn candidates(self: *Sudoku, i: i64) -> u64 {
+fn candidates(self: &Sudoku, i: i64) -> u64 {
     ALL & ~(self.rows[i / 9] | self.cols[i % 9] | self.boxes[box_of(i)])
 }
 ```
@@ -188,7 +188,7 @@ version above closes the gap.
 | `Result` and an error enum with `#[derive(Debug)]`, `{e:?}` | `parse`, `main` | `tachyonc guide conversions`, `guide formatting` |
 | `match` on `Ok` / `Err` | `main` | `tachyonc guide syntax` |
 | default and named arguments: `limit: i64 = 2`, `run(p, limit: 1)` | `Search::run` | `tachyonc guide core` |
-| methods taking `self: *T` and writing through it | `place`, `clear`, `fill` | `tachyonc guide core` |
+| methods taking `self: &mut T` and writing through it | `place`, `clear`, `fill` | `tachyonc guide core` |
 | bit operations on `u64`, `~`, wrapping `0 - m` | `candidates`, `fill`, `popcount` | `tachyonc guide types` |
 | iterators and closures: `enumerate`, `filter(\|d\| d != 0).count()` | `parse`, `clues` | `tachyonc guide iterators`, `guide closures` |
 | `const` arrays of strings | `PUZZLES` | `tachyonc guide syntax` |

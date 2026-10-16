@@ -148,19 +148,20 @@ too big: 500
 | `impl Fn(i64) -> i64`, `Box<dyn Fn>` | a generic parameter `F: Fn(i64) -> i64`; none as a result |
 | `(0..n).rev()` | `let mut i = n; while i > 0 { i -= 1; ... }` |
 | `.step_by(2)` | `while` with `i += 2` |
-| `sort()`, `sort_by(\|a, b\| ...)` | `std::sort(s)` (`T: Ord`; not stable); `v.sort_by(\|a, b\| b.cmp(a))` (0.14; `a`, `b`: `*T`) |
+| `sort()`, `sort_by(\|a, b\| ...)` | `std::sort(s)` (`T: Ord`; not stable); `v.sort_by(\|a, b\| b.cmp(a))` (0.14; `a`, `b`: `&T`) |
 
 A function value is `fn(A) -> R`, a plain function, no environment.
-Using a function with pointer parameters as a value, and calling it
-with a pointer, is `unsafe` (its callee is not checked):
+Its parameters may be references (`fn(&mut Sum, i64)`, 0.17); a
+function with raw `*T` parameters used as a value is called in
+`unsafe` (its callee is not checked):
 
 ```tach
 struct Sum { total: i64 }
 
-fn add(s: *Sum, x: i64) { s.total += x; }
+fn add(s: &mut Sum, x: i64) { s.total += x; }
 
-fn each(xs: [i64], f: fn(*Sum, i64), s: *Sum) {
-    for x in xs { unsafe { f(s, x); } }
+fn each(xs: [i64], f: fn(&mut Sum, i64), s: &mut Sum) {
+    for x in xs { f(s, x); }
 }
 
 fn square(x: i64) -> i64 { x * x }
@@ -174,7 +175,7 @@ fn map_sum(xs: [i64], f: fn(i64) -> i64) -> i64 {
 fn main() -> i32 {
     let mut s = Sum { total: 0 };
     let xs = [1, 2, 3];
-    unsafe { each(xs[..], add, &s); }
+    each(xs[..], add, &mut s);
     std::print_int(s.total + map_sum(xs[..], square));
     println("");
     0

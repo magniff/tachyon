@@ -121,5 +121,7 @@ main.tach:7:30: error[own.conflict] 'v.push' may move v's elements while the 'fo
   try: tachyonc edit patch main.tach:7 --old 'for x in v {' --new 'for i in 0..v.len() { let x = v[i];'
 ```
 
-`--values=warn` (0.17 only) makes them warnings; `--values=report`
-lists them without failing the build.
+They are errors by default (`--values=error`). `--values=warn` (0.17
+only) makes them warnings; `--values=report` lists them without failing
+the build; `--values=off` turns the checks and the drops off (0.16's
+semantics, for code not yet migrated by `tachyonc fix --values`).

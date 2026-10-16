@@ -6,11 +6,10 @@ declaration that keeps the result true. The program renders a small
 subset of Markdown to HTML (`markup.tach`; `main.tach` renders two
 documents). The task:
 
-> `markup` leaks: everything it makes for a document stays allocated.
-> Freeing it piece by piece is tedious and easy to get wrong. Move the
-> module's allocations into an arena that `main` empties after each
-> document, and make sure nothing in `markup` allocates from the
-> general-purpose allocator again.
+> `markup` makes many small blocks for each document, each freed on its
+> own when it is dropped. Move the module's allocations into an arena
+> that `main` empties after each document, and make sure nothing in
+> `markup` allocates from the general-purpose allocator again.
 
 Every command below is run by `tests/walkthrough/run.sh` in a fresh
 copy of this directory (a git repository, so that the edits are
@@ -18,7 +17,7 @@ journaled and `git diff` shows them), and its output is checked against
 this file. `tests/examples/effects-effects-for-agents.test` runs the
 program as it is before the session.
 
-## 1. The leak
+## 1. Before
 
 ```console
 $ tachyonc main.tach -o render && ./render > before.txt && head -4 before.txt
@@ -27,23 +26,14 @@ $ tachyonc main.tach -o render && ./render > before.txt && head -4 before.txt
 <li><a href="#why-arenas">Why arenas?</a></li>
 </ul>
 $ tachyonc --check-alloc main.tach -o render-checked && ./render-checked > /dev/null
-check-alloc: 9 blocks of Gpa not freed (1152 bytes):
-  block #2 (128 bytes), allocated at ./markup.tach:11:5
-  block #4 (8 bytes), allocated at ./markup.tach:25:13
-  block #5 (160 bytes), allocated at ./markup.tach:59:13
-  block #8 (16 bytes), allocated at ./markup.tach:25:13
-  block #14 (304 bytes), allocated at ./markup.tach:49:13
-  block #15 (64 bytes), allocated at ./markup.tach:11:5
-  block #17 (8 bytes), allocated at ./markup.tach:25:13
-  block #18 (160 bytes), allocated at ./markup.tach:59:13
-  block #24 (304 bytes), allocated at ./markup.tach:105:9
 ```
 
-Nine blocks, allocated at five lines of `markup.tach`: the lines'
-`Vec` (line 11), each heading's id (25), the headings' `Vec` (59), and
-the HTML's `Buf`, last grown at line 49 or 105, which `render` returns
-and `main` never frees. Each could get a `free`, in the right place; or
-all of them can come from one arena, freed at once.
+Nothing is left allocated: every value is dropped at the end of its
+scope (0.16's version of this program leaked nine blocks here). They are
+made at five lines of `markup.tach`: the lines' `Vec` (line 11), each
+heading's id (25), the headings' `Vec` (59), and the HTML's `Buf`, grown
+at lines 49 and 105, which `render` returns and `main` drops after
+printing it. One arena can hold all of them, emptied at once.
 
 ## 2. What allocates, and from what
 
@@ -98,9 +88,9 @@ main.tach:10:40: error[type error] expected 'Arena', got 'Gpa'  [in crate::main]
 markup.tach:11:25: error[type error] expected 'Gpa', got 'Arena'  [edited: crate::markup::lines]
 markup.tach:31:5: error[type error] expected 'Buf', got 'Buf<Arena>'  [edited: crate::markup::slug]
 markup.tach:56:44: error[type error] expected 'Gpa', got 'Arena'  [edited: crate::markup::headings]
-markup.tach:75:25: error[type error] expected '*Buf', got '&Buf<Arena>'  [edited: crate::markup::render]
-markup.tach:90:28: error[type error] expected '*Buf', got '&Buf<Arena>'  [edited: crate::markup::render]
-markup.tach:100:23: error[type error] expected '*Buf', got '&Buf<Arena>'  [edited: crate::markup::render]
+markup.tach:75:25: error[type error] expected '&mut Buf', got '&mut Buf<Arena>'  [edited: crate::markup::render]
+markup.tach:90:28: error[type error] expected '&mut Buf', got '&mut Buf<Arena>'  [edited: crate::markup::render]
+markup.tach:100:23: error[type error] expected '&mut Buf', got '&mut Buf<Arena>'  [edited: crate::markup::render]
 markup.tach:107:5: error[type error] expected 'Buf', got 'Buf<Arena>'  [edited: crate::markup::render]
 warning edit.breaks: 8 new errors (7 in the edited text, 1 in crate::main, which the edit does not change) (dry run)
 ```
@@ -117,7 +107,7 @@ $ cat > steps.txt <<'EOF'
 > refactor signature markup::slug --type gpa Arena
 > refactor signature markup::headings --type gpa Arena
 > refactor signature markup::render --type gpa Arena
-> refactor signature markup::inline --type out '*Buf<Arena>'
+> refactor signature markup::inline --type out '&mut Buf<Arena>'
 > refactor field markup::Heading --type id 'Buf<Arena>'
 > edit patch markup::lines --old '-> Vec<[u8]>' --new '-> Vec<[u8], Arena>'
 > edit patch markup::slug --old '-> Buf' --new '-> Buf<Arena>'
@@ -140,7 +130,8 @@ $ cat > steps.txt <<'EOF'
 >     for doc in docs {
 >         let html = markup::render(doc, arena);
 >         print(html.as_slice());
->         // (unsafe: html, and every view into the arena, is dead from here)
+>         drop(html); // before the reset, which takes its memory
+>         // (unsafe: every view into the arena is dead from here)
 >         unsafe { arena.reset() };
 >     }
 >     0
@@ -152,7 +143,7 @@ changed parameter gpa to Arena in crate::markup::lines	markup.tach	+1 -1 lines
 changed parameter gpa to Arena in crate::markup::slug	markup.tach	+1 -1 lines
 changed parameter gpa to Arena in crate::markup::headings	markup.tach	+1 -1 lines
 changed parameter gpa to Arena in crate::markup::render	markup.tach	+1 -1 lines
-changed parameter out to *Buf<Arena> in crate::markup::inline	markup.tach	+1 -1 lines
+changed parameter out to &mut Buf<Arena> in crate::markup::inline	markup.tach	+1 -1 lines
 changed field id to Buf<Arena> in crate::markup::Heading	markup.tach	+1 -1 lines
 patched crate::markup::lines	markup.tach	+1 -1 lines
 patched crate::markup::slug	markup.tach	+1 -1 lines
@@ -162,21 +153,24 @@ renamed parameter gpa to arena of crate::markup::lines	markup.tach	+2 -2 lines
 renamed parameter gpa to arena of crate::markup::slug	markup.tach	+2 -2 lines
 renamed parameter gpa to arena of crate::markup::headings	markup.tach	+3 -3 lines
 renamed parameter gpa to arena of crate::markup::render	markup.tach	+4 -4 lines
-replaced crate::main	main.tach	+7 -1 lines
-script steps.txt: 15 commands	2 files	+20 -14 lines
+replaced crate::main	main.tach	+8 -1 lines
+script steps.txt: 15 commands	2 files	+21 -14 lines
 $ git diff --stat
- main.tach   |  8 +++++++-
+ main.tach   |  9 ++++++++-
  markup.tach | 26 +++++++++++++-------------
- 2 files changed, 20 insertions(+), 14 deletions(-)
+ 2 files changed, 21 insertions(+), 14 deletions(-)
 ```
 
 `Arena::new_in(gpa)` makes an arena whose chunks come from `gpa`.
 `reset` frees everything allocated from it but keeps its memory for the
 next document, and `free_all` gives the memory back at the end. Both are
-`unsafe` in 0.16: nothing stops a view into the arena (`html.as_slice()`
-here) from being used after them. 0.17's second-class references close
-that; an `arena.scope(|a| ...)` per document has no such hole today,
-but its arena is a `ScopedArena`, and the task asked for `Arena`.
+`unsafe`: nothing stops a view into the arena (`html.as_slice()` here),
+or a value still holding its memory, from being used after them; so
+`html` is dropped before the reset (dropped after it, its `Buf` would
+give back memory the reset already took: `--check-alloc` stops at
+that). 0.17.1's arena references close the hole; an
+`arena.scope(|a| ...)` per document has none today, but its arena is a
+`ScopedArena`, and the task asked for `Arena`.
 
 ## 4. Checked
 

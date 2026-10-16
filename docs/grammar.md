@@ -382,11 +382,12 @@ defined, is the same list: every pointer it hands to safe code as a
 borrow points to live memory of its type, and every slice it makes is
 valid for its length while it is used. The same holds for memory a
 slice views: a slice of an array is valid while the array lives, and one
-from `Vec::as_slice` until the vector grows or is freed (tachyon has no
-lifetimes; using a view after its storage is gone is the one way safe
-code can still reach undefined behaviour, and std's types assume their
-fields are changed by their methods only, as tachyon has no private
-fields yet). A view need not have a name: a slice argument (or a
+from `Vec::as_slice` until the vector grows or is freed. Until 0.17,
+using a view after its storage was gone was the one way safe code could
+still reach undefined behaviour; from 0.17 the own pass rejects it under
+`--values=error`, the default (its opt-outs `warn`, `report` and `off`
+do not; std's types also assume their fields are changed by their
+methods only, as tachyon has no private fields yet). A view need not have a name: a slice argument (or a
 receiver taken by value) is a copy made before the later arguments run
 (`take(v.as_slice(), grow(&v))`); the base of an index that is not a
 place, before its index (`v.as_slice()[grow(&v)]`); and `for x in v`,
@@ -969,8 +970,8 @@ there supertraits, associated types or generic traits yet.
 `a * b`, `a / b` call `add`, `sub`, `mul`, `div` (`Add`, `Sub`, `Mul`,
 `Div`: `fn add(self: Self, other: Self) -> Self`), `-a` calls `neg`
 (`Neg`), `a == b` and `a != b` call `eq(&a, &b)` (`Eq`: `fn eq(self:
-*Self, other: *Self) -> bool`), and `<`, `<=`, `>`, `>=` compare `cmp`'s
-result with 0 (`Ord`: `fn cmp(self: *Self, other: *Self) -> i64`,
+&Self, other: &Self) -> bool`), and `<`, `<=`, `>`, `>=` compare `cmp`'s
+result with 0 (`Ord`: `fn cmp(self: &Self, other: &Self) -> i64`,
 negative, zero or positive). Each operand is evaluated once, left to
 right. A type's own impl takes precedence over 0.6's structural `==`
 (for structs, enums, tuples, arrays and slices); the builtin scalars
@@ -980,7 +981,8 @@ numbers all of them, every type with `==` `Eq`, numbers, pointers and
 fieldless enums `Ord`. Compound assignment (`+=`) stays numeric.
 
 **std** (0.9): the traits `Add`, `Sub`, `Mul`, `Div`, `Neg`, `Eq`, `Ord`,
-`Hash` (`fn hash(self: *Self) -> u64`), in the prelude; impls of `Eq`,
+`Hash` (`fn hash(self: &Self) -> u64`; 0.17: `&Self`, and an impl's
+legacy `*Self` is taken as `&Self`), in the prelude; impls of `Eq`,
 `Ord` and `Hash` for the integer types, `bool` and `[u8]` (byte strings:
 by bytes, lexicographically, FNV-1a); `sort<T: Ord>(s: [T])` (in place,
 not stable; a heapsort, an introsort from 0.14); and `HashMap<K: Hash + Eq, V>` (open addressing
@@ -1530,6 +1532,19 @@ is wanted is an error naming `&mut x`. A place reached through a raw
 pointer still gives a raw pointer (`&*p` gives a reference). Function
 attributes `#[views(a, *b)]` and `#[stores(c)]` declare a view summary.
 (Phase 0: what the own pass checks of them comes with its tasks.)
+
+**Moves, drops and the checks** (value semantics, T1–T3, T7;
+[design/value-semantics.md](design/value-semantics.md) §2). A value of
+an owned type (a `Vec`, `Buf`, `HashMap`, a type with `Drop`, a struct
+holding one) moves on `=`, a by-value argument and `return`, and is
+dropped at the end of its scope; views (slices, references) cannot
+outlive or alias against what they view. These checks and the drops are
+on by default: `--values=error` (the default since T7, which moved the
+tests, examples and evals over with `tachyonc fix --values`).
+`--values=warn` and `--values=report` keep 0.16's semantics (no drops)
+and only warn or list; `--values=off` turns the pass off. They are
+opt-outs for 0.17 only. `defer v.free()` stays legal (`free` frees now
+and leaves the container empty) and is no longer needed.
 
 **The prelude** gains `Buf`, `HashMap`, `read_line`, `read_stdin_in`,
 `Scanner`, `parse_int`, `trim`, `split_in`, `split_whitespace_in`,

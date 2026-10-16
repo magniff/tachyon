@@ -63,6 +63,9 @@ $ refactor field Lexer --type src '[u8]' --default '$src.as_slice()' --dry-run
 @@ -4 +4 @@
 -    Lexer { src: text, pos: 0 }
 +    Lexer { src: text.as_slice(), pos: 0 }
+main.tach:4:5: error[own.escape] 'lexer' returns a view of 'text', which is dropped when 'lexer' returns | help: return the owner itself; a caller that wants a view takes '.as_slice()' of it  [edited: crate::lexer]
+warning edit.breaks: 1 new error (dry run)
+[exit 1]
 $ undo
 undid changed parameter s to &mut [i64] in crate::fill, 1 argument in 1 call	main.tach	+2 -2 lines
 $ undo
@@ -79,3 +82,5 @@ $ refactor signature add --type v '&mut Vec<i64>' --default '&mut $v' --dry-run
 -    add(&v, 1);
 +    add(&mut v, 1);
 $ check
+main.tach:18:5: error[own.readonly] writes through 's', a '[i64]', which is read-only | help: take the slice as '&mut [T]' ('v.as_mut_slice()', '&mut a[..]') to write its elements | try: tachyonc refactor signature fill --type s '&mut [i64]'
+[exit 1]
