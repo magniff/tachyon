@@ -3,6 +3,7 @@
 ## (tests/refactor/layout/; tests/refactor/roundtrip.sh moves random
 ## items there and back).
 $ main.tach -o prog
+ok: built prog
 % ./prog; echo "exit $?"
 exit 0
 ## Into a run of constants: joined to it, as written there.
@@ -85,5 +86,6 @@ measures.tach
 mod.tach
 point.tach
 $ main.tach -o prog
+ok: built prog
 % ./prog; echo "exit $?"
 exit 0

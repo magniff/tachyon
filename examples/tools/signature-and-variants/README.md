@@ -27,6 +27,7 @@ day 7: #2 cannot read 'lend 7'
 #0 the bank   balance  99888, may go to -0
 #1 Ada        balance   8612, may go to -0
 #2 Grace      balance    500, may go to -5000
+ok: built bank
 ```
 
 ## 1. Parameters
@@ -258,6 +259,7 @@ day 9: #2 cannot read 'lend 7'
 #0 the bank   balance 100388, may go to -0, fees 0
 #1 Ada        balance   8362, may go to -0, fees 250
 #2 Grace      balance   1050, may go to -5000, fees 250
+ok: built bank
 $ git diff --stat
  account.tach | 11 ++++++-----
  event.tach   |  4 ++++

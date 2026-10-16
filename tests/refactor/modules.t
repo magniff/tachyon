@@ -2,7 +2,9 @@
 ## new-module, move-module, split; each atomic, journaled for undo, with
 ## --dry-run.
 $ check
+ok: 0 errors in main.tach
 $ main.tach -o prog
+ok: built prog
 % ./prog; echo "exit $?"
 exit 0
 ## ---- rename ----
@@ -167,6 +169,7 @@ pub fn double(p: Point) -> Point {
     scale(p, half(twice(2)))
 }
 $ main.tach -o prog
+ok: built prog
 % ./prog; echo "exit $?"
 exit 0
 $ undo
@@ -297,6 +300,7 @@ index 0c40caf..2869d54 100644
 +    }
 +}
 $ main.tach -o prog
+ok: built prog
 % ./prog; echo "exit $?"
 exit 0
 $ undo
@@ -465,6 +469,7 @@ index 620be80..b915abc 100644
      if n == 127 { 0 } else { 1 }
  }
 $ main.tach -o prog
+ok: built prog
 % ./prog; echo "exit $?"
 exit 0
 $ refactor move-module crate::figures::shapes crate::shapes
@@ -546,6 +551,7 @@ index 0c40caf..df89998 100644
  pub fn perimeter(p: Point) -> i64 {
      let q = double(p);
 $ main.tach -o prog
+ok: built prog
 % ./prog; echo "exit $?"
 exit 0
 $ undo
@@ -573,6 +579,7 @@ split crate::geom into 2 modules	5 files	+32 -24 lines
 ./shapes.tach
 ./util.tach
 $ main.tach -o prog
+ok: built prog
 % ./prog; echo "exit $?"
 exit 0
 $ undo
@@ -770,6 +777,7 @@ fn scale() -> i64 {
     2
 }
 $ main.tach -o prog
+ok: built prog
 % ./prog; echo "exit $?"
 exit 0
 $ undo

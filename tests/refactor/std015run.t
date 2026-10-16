@@ -16,5 +16,6 @@ empty 1
 total 10
 count 4
 more 0
+ok: built prog
 $ fix --only std015
 note fix.none: nothing to fix

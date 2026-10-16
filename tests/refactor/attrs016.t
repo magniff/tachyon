@@ -35,3 +35,4 @@ pub fn grow(v: *Vec<i64>) {
 }
 % "$COMPILER" main.tach -o prog && ./prog
 9
+ok: built prog

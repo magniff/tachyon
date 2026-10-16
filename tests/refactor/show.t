@@ -46,6 +46,7 @@ $ query diff
 -    k * abs(a) as i64
 +    unsafe { k * abs(a) as i64 }
 $ check
+ok: 0 errors in main.tach
 $ edit patch one --show < $T/inputs/show_add.patch
 patched crate::one	main.tach	+2 -1 lines
 // main.tach:21-22

@@ -192,7 +192,8 @@ check self_lint "$ok" "$(printf '%s\n' "$out" | head -4)"
 check self_lint_ok "$([ $? = 0 ] && echo 1)" "lint --max-lines 100000 failed"
 # check: the compiler's source has no errors, quickly.
 "$COMPILER" check compiler/src/main.tach >"$WORK/check.out" 2>&1
-check self_check "$([ $? = 0 ] && [ ! -s "$WORK/check.out" ] && echo 1)" "$(cat "$WORK/check.out")"
+# (0.18.1: a clean check says so in one line)
+check self_check "$([ $? = 0 ] && [ "$(cat "$WORK/check.out")" = "ok: 0 errors in compiler/src/main.tach" ] && echo 1)" "$(cat "$WORK/check.out")"
 # same-output: the compiler against a copy of itself (identical), and
 # against a wrapper that changes one compilation (different).
 cp "$COMPILER" "$WORK/old-tachyonc"

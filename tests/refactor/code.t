@@ -1,5 +1,6 @@
 ## 0.13: refactor extract-function and refactor inline (tests/refactor/code/).
 $ main.tach -o prog
+ok: built prog
 % ./prog; echo "exit $?"
 exit 0
 ## ---- extract-function ----
@@ -65,6 +66,7 @@ extracted lines 16-17 of crate::calc::Acc::mean into raw_mean() -> i64	calc.tach
 19	
 20	    fn raw_mean(self: *Acc) -> i64 {
 $ main.tach -o prog
+ok: built prog
 % ./prog; echo "exit $?"
 exit 0
 $ undo
@@ -124,6 +126,7 @@ inlined crate::calc::square_plus at 1 call, deleted it	calc.tach	+5 -6 lines
 67	        s + 2
 68	    } + clamp(x, 0, 9)
 $ main.tach -o prog
+ok: built prog
 % ./prog; echo "exit $?"
 exit 0
 ## Into another module: what the body names there made pub and imported;
@@ -151,6 +154,7 @@ inlined crate::calc::quad at 1 call, deleted it	2 files	+10 -12 lines
      if s == 78 { 0 } else { 1 }
  }
 $ main.tach -o prog
+ok: built prog
 % ./prog; echo "exit $?"
 exit 0
 $ undo

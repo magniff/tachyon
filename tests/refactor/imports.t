@@ -98,3 +98,4 @@ fixed 1 unused import	main.tach	+1 -1 lines
 $ fix --only reexports,tidy-imports
 note fix.none: nothing to fix
 $ check
+ok: 0 errors in main.tach

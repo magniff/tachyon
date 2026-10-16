@@ -30,6 +30,7 @@ members:
   Ada        holds 2 of 2, owes 0 cents
   Bob        holds 0 of 1, owes 100 cents
 overdue on day 30: 1
+ok: built library
 ```
 
 `before.txt` is kept, to compare with at the end.
@@ -248,6 +249,8 @@ $ git add -N fees.tach && git diff --stat
  6 files changed, 29 insertions(+), 27 deletions(-)
 $ tachyonc check && tachyonc main.tach -o library && ./library | diff before.txt - && echo same output
 same output
+ok: 0 errors in main.tach
+ok: built library
 ```
 
 ## Why not by hand

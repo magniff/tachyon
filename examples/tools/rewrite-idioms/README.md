@@ -36,6 +36,7 @@ word lengths:
    8 ##
 longest line: 3 (37 bytes): And sings the tune without the words,
 --
+ok: built wordstat
 ```
 
 ## 1. A deprecated helper becomes a method
@@ -183,6 +184,8 @@ pub fn longest_line(ls: [[u8]]) -> (i64, i64) {
 ```console
 $ tachyonc check && tachyonc main.tach -o wordstat && ./wordstat < poem.txt | diff before.txt - && echo same output
 same output
+ok: 0 errors in main.tach
+ok: built wordstat
 $ git diff HEAD --stat
  compat.tach | 19 -----------------
  main.tach   |  3 +--

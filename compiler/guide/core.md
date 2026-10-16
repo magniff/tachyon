@@ -141,7 +141,8 @@ value (`Vec`, `Buf`, `HashMap`, a struct holding one) moves: after `let
 w = v;` or `f(v)`, `v` is dead (`own.moved`); take `v: &Vec<T>` (`&mut`
 to change it) and pass `&v` (`&mut v`), or `.clone()`. A reference kept
 in a local (`let p = &mut st;`) is passed on as `p`, any number of
-times. A slice of `v` is a view: take it again after `v` grows. std's API, a line per item: `tachyonc guide std`; one name
+times. A slice of `v` is a view: take it again after `v` grows. std's most used items: `tachyonc guide std`; all, a line each:
+`tachyonc guide std#the-api`; one name
 with its comment: `tachyonc guide --find split_in`.
 
 ## The first errors and their fixes
@@ -167,7 +168,8 @@ testing`, `guide contracts`).
 ## The loop
 
 Write the program, then `tachyonc check` (a check hook, where there is
-one, runs it after each edit); fix the first error first. Before writing a construct
+one, runs it after each edit); fix the first error first. A clean check
+ends with `ok: 0 errors in main.tach`, a build with `ok: built prog`. Before writing a construct
 you are unsure of, `tachyonc guide --find WORDS` (`--find read a line`)
 or `tachyonc guide TOPIC#SECTION` prints the lines on it; `tachyonc
 try 'CODE'` runs a snippet. For an unfamiliar item, ask
