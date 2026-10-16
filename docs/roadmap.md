@@ -1021,6 +1021,69 @@ Moved to 0.17.1:
   from then on every `*T` is a raw pointer, as Rust's are (a dereference
   needs `unsafe`), `mut` or not, and borrowing is only `&` / `&mut`
 
+Done (0.18.0). The design (docs/design/contracts-verification.md, with
+the decisions taken for the user's review: contracts always checked, a
+requires checked at the call and blaming the caller, facts only from
+checks that ran, one failure line, Rust's `#[test]`, test modules
+without `use super::*`, Go's defined types, `NonNull<T>` with a null
+niche), a phase 0 that reads the syntax, and four tasks built in
+parallel on 0.17 before its value semantics, then merged onto v0.17.0:
+contracts and check positions (T1, T5: `requires`/`ensures`, the
+assertions, std's clauses, the site table and one failure line, `query
+checks`, `--no-positions`); tests and properties (T2: `#[test]`,
+`#[cfg(test)]`, snapshots, `#[property]` with generated, shrunk inputs,
+`tachyonc test` comparing -O0 and -O2); fuzzing and reduce (T3:
+`--coverage`, `#[fuzz]`, `tachyonc fuzz`, `reduce --differs/--fails/
+--test`); distinct types and `NonNull` (T4: the null niche, the checked
+cast). Also in 0.18: std's `Display`, `Debug`, `Iterator` and `Clone`
+on references and `fix --values` over traits, with the corpus moved;
+the eval harness's `+debrief`. Decided at integration (each with a
+test): a requires check reads the call's arguments in place; `old(..)`
+of a by-value owned parameter or of a view is `contract.old`; distinct
+types only over plain types (not a reference, not a `Drop` type);
+generators take `&mut Gen`; property and fuzz cases are leak-checked;
+the test runtime and the fuzzer are lazy std sections; the `note: build
+with --trace` line is gone. V4 was decided by the user (below). Not
+done in 0.18.0, and now 0.18.1's: the compiler's source on values and
+arenas, functions compiled in parallel, incremental rebuilds.
+
+Moved to 0.18.1:
+- the compiler's source on value semantics and arenas (design §4.1,
+  §4.2): the front end's tables as `Vec<T, Comp>`, the syntax tree's
+  arena released after lowering, `FnCtx`/`Program` for middle, back and
+  gen0, per-function IR arenas;
+- compile speed, part 2: functions optimized and emitted in parallel
+  (§4.3; in progress on branch p181-par), output byte-identical for every
+  `-j`, checked by the gate; incremental rebuilds from the per-function
+  cache (§4.4);
+- V4: once compiler/src uses `&`/`&mut`, the legacy rule that a non-`mut`
+  `*T` parameter is a borrow is removed (decided 2026-10-16), and every
+  `*T` is raw;
+- contracts: the checking entry for calls through `fn` values and trait
+  objects (they skip a requires today), hence facts at the callee's
+  entry and std's body checks removed behind its requires; facts from
+  `ensures` on call results (`middle::ipo`); type invariants and
+  `contract.sealed`; `contract.violated` at compile time,
+  `contract.impl-requires` and clauses on trait methods; `macro.args`;
+  values other than integers in failure lines; `query effects --why`
+  naming a clause; `Vec::get`'s body check behind its requires when the
+  length goes through `as_slice`;
+- tests: `probe --test/--seed`, `--against CMD --gen CMD`, `test --fuzz
+  S`, failing property inputs saved to a corpus, effects (no io, no
+  global) required of contracts tested as properties, the bang spellings
+  in try: lines and kept by `fmt`, a leak's site naming the property
+  rather than the generated `<test>` source;
+- reduce: expressions replaced by literals, calls inlined, several
+  files, candidates checked in the process;
+- distinct types: field access through a distinct struct, `!` on a
+  distinct bool, a distinct type's `invariant`;
+- the gate: the level comparison over tests/run as `tachyonc test` runs
+  it, a fuzz mode whose programs carry clauses, the `-j` and incremental
+  byte comparisons, `TACHYON_ARENA_SHUFFLE`, a valgrind row on
+  aarch64-linux (0.17.0's gate found two heap bugs macOS hid), a lock on
+  bootstrap.sh's shared release cache;
+- 0.17.1's list (above) stands.
+
 ## After 0.18: a standard library, and a real program on it
 
 Planned with the user on 2026-10-14, to start once 0.18 has shipped. The
