@@ -41,7 +41,9 @@ pub mod variant_fields;
 pub mod distinct;
 mod temps;
 
-use crate::base::{BUFS, IntVec, SRC, _setjmp, buf_fmt, buf_new, buf_slice, cstr, grow, intern_c};
+use crate::base::{
+    BUFS, IntVec, SRC, _setjmp, buf_bytes, buf_fmt, buf_new, buf_slice, cstr, grow, intern_c,
+};
 use crate::base::diag::{
     RECOVER_DEPTH, err_begin, err_end, err_fix, err_help, err_str, err_sym, err_try_fmt, error_at,
     error_count, errors_forget, errors_mark, exit_if_errors, recover_enter, recover_leave,
@@ -184,6 +186,36 @@ fn mismatch_help(n: i64, expected: i64, actual: i64) {
         // `tachyonc fix --suggested` makes; `&x` of a simple value only).
         let t = buf_new();
         let mut exact = true;
+        let bn = crate::front::check::distinct::BINARY_NODE;
+        if ek == TyKind::Ptr && TYPES[expected].b != 0 && TYPES[expected].a == actual
+            && (is_numeric(actual) || actual == TY_BOOL) && bn > 0
+            && NODES[bn].kind == NodeKind::Binary && (NODES[bn].b == n || NODES[bn].c == n) {
+            // (0.18.1) `n + 1` with `n: &i64` (a pattern's binding on a
+            // reference, a closure's parameter): the other operand is the
+            // reference, read through it
+            let other = if NODES[bn].b == n { NODES[bn].c } else { NODES[bn].b };
+            let ok = NODES[other].kind;
+            let plain = ok == NodeKind::Ident || ok == NodeKind::FieldAccess
+                || ok == NodeKind::TupleField || ok == NodeKind::Call || ok == NodeKind::Index;
+            err_help(c"the other operand is a reference: read through it with '*'");
+            buf_bytes(t, SRC[NODES[bn].start..NODES[other].start]);
+            buf_bytes(t, if plain { "*" } else { "*(" });
+            buf_bytes(t, SRC[NODES[other].start..NODES[other].end]);
+            buf_bytes(t, if plain { "" } else { ")" });
+            buf_bytes(t, SRC[NODES[other].end..NODES[bn].end]);
+            err_try_fmt(buf_slice(t));
+            err_fix(NODES[bn].start, NODES[bn].end, buf_slice(t));
+            return;
+        }
+        if ak == TyKind::Ptr && TYPES[actual].b != 0 && TYPES[actual].a == expected
+            && (is_numeric(expected) || expected == TY_BOOL) {
+            // (0.18.1) `n` with `n: &i64` where an i64 is wanted
+            err_help(c"it is a reference: read through it with '*'");
+            buf_fmt(t, f"*{open}{text}{close}");
+            err_try_fmt(buf_slice(t));
+            err_fix(NODES[n].start, NODES[n].end, buf_slice(t));
+            return;
+        }
         let p = if is_numeric(expected) && is_numeric(actual) { cast_parent(WRAP_NODE, n) }
             else { 0 };
         if p != 0 {

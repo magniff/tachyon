@@ -796,6 +796,15 @@ error[own.readonly] cannot write 'p.x': 'p' is '&P', a shared reference
 `v.as_mut_slice()` or `&mut a[..]`. Old code: `tachyonc fix --values`.
 
 ```text
+error[type error] expected 'i64', got '&i64' | help: it is a reference: read through it with '*' | try: *n
+error[type error] expected '&i64', got 'i64' | help: the other operand is a reference: read through it with '*' | try: 3 < *n
+```
+(0.18.1) A pattern on a reference (`match e` with `e: &E`) binds
+references, `n: &i64`, as a `sort_by` closure's parameters are: read
+them with `*n`; `fix --suggested` writes it. An index reads through one
+(`keys[n]`).
+
+```text
 error[own.readonly] changes 'v' (Vec<i64>), a copy the match on '*e' (3:11) binds: the change would not reach it, and could free memory it points to
 error[own.readonly] changes 'w' (Vec<i64>), a copy of an element 'vv.get(0)' reads: ...
 ```
