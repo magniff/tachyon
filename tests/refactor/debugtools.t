@@ -2,18 +2,12 @@
 ## --trace: a failed check prints the calls that led to it, a time limit
 ## where the program was.
 $ test --timeout 1
-test main.tach: 1 passed, 2 failed (tests/)
-FAIL crash: exit 101 (expected 0)
-  stderr: index out of bounds: index 0, length 0
-  stderr: trace, innermost call first:
-  stderr:   stats.tach:44  stats::best
-  stderr:   main.tach:25  main
-FAIL hang: no exit after 1 s (--timeout S)
-  stderr: stopped by signal 14 (SIGALRM: a time limit)
-  stderr: trace, innermost call first:
-  stderr:   stats.tach:56  stats::bar
-  stderr:   main.tach:28  main
-(outputs: .tachyonc/test/NAME.got, NAME.err)
+test main.tach: 1 passed, 2 failed (3 cases; -O0 and -O2 agree)
+FAIL crash: exit 101 (expected 0): index out of bounds: index 0, length 0
+  trace: stats.tach:44 stats::best < main.tach:25 main
+FAIL hang: no exit after 1 s (--timeout S): stopped by signal 14 (SIGALRM: a time limit)
+  trace: stats.tach:56 stats::bar < main.tach:28 main
+(outputs: .tachyonc/test/O2/case-NAME.got, .err; test-NAME.got, .err)
 [exit 1]
 ## A program built with --trace (at -O1 at least); without it, a failure's
 ## message has a note.
