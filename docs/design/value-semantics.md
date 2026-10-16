@@ -701,7 +701,7 @@ Steps 1, 2 and 4 passed. Step 3 failed the gate on the eval solutions (3.4%), wh
 
   | file | contents | in Phase 0 |
   |---|---|---|
-  | `mod.tach` | `pub fn check_own()`, hooked into `check_program` after `infer_effects()`; `--values=off\|report\|warn\|error` (`OWN_MODE`) | done; the default is `report` until T7, then `error` |
+  | `mod.tach` | `pub fn check_own()`, hooked into `check_program` after `infer_effects()`; `--values=off\|report\|warn\|error` (`OWN_MODE`) | done; the default was `report` until T7; it is `error` |
   | `kinds.tach` | `type_kind(t) -> i64` (PLAIN, OWNED, VIEW, NEEDS_DROP, LEVEL2), `view_elem(t) -> i64` | done (small, and every task uses it) |
   | `state.tach` | the walk's state layout: owned bits, slots, two-level origins, the invalidation marks, pending arguments, the pool, the bitset fast path | done |
   | `walk.tach` | the evaluation-order walk from the prototype: expressions, blocks, `let`, `match`, loops to a fixpoint, joins, exits and defers. It calls the event hooks `ev_read`, `ev_write`, `ev_move`, `ev_init`, `ev_drop`, `ev_call` and `ev_result`, and `pub fn walk_fn(f: i64, round: i64) -> ViewSummary` | the skeleton, with the events as stubs |
@@ -908,6 +908,25 @@ Phase 0 fixed the interfaces below; T1–T6 build against them in parallel. A ta
   - by-value closure parameters;
   - assignments through an index;
   - the error for calling `x.drop()` directly.
+
+**T7 as built (branch c17-t7): the migration, and `--values=error` the default.**
+
+- **What was migrated.** `tachyonc fix --values` rewrote 108 of 380 tests/run programs, 30 of 39 agent-eval programs (solutions and starters), 35 of 43 examples and 11 of 20 bench programs; the rest by hand. The proof is the same-output one: every tests/run and tests/examples case prints what it printed (EXPECT lines unchanged, except scoped-arena's scratch size, 196 → 104 bytes, as drops free sooner), every bench program gives the same output, check-tasks passes every solution and fails each starter as before, and `--check-alloc` reports nothing it did not report before (fewer leaks: drops free what programs leaked).
+- **compiler/src** checks clean under the new default and builds under it, so it needs no mode of its own: its `*T` parameters are the legacy rule's, it has no moves the checker rejects (§8.2), and its first build is v0.16.0's (no own pass), the next ones its own (drops placed, checked). The chain's fixpoint holds and the suite passes with a compiler built under `--values=error`.
+- **The hand cases the design named:**
+  - bigint's operator traits take `self: Self`: borrowing `plus`/`minus`/`times` do the work, `Add`/`Sub`/`Mul` consume and delegate; `rng.big(1 + rng.next() % 600)` hoisted.
+  - ledger's two `get_mut`: checks first, then one `get_mut` at a time.
+  - 15-multi-module's views of deliberately leaked Bufs: owned Bufs.
+  - the aliasing optimizer tests (opt_gvn, opt_slp, opt_vectorize, opt_promote, opt_noalias_gated) keep their purpose under `// FLAGS: --values=off`, as do check-alloc's run-time double-free and use-after-free tests and examples/allocators/check-alloc (its README shows 0.17's compile errors), index_order and std_self_append (err_own_self_append shows the error).
+  - What `fix --values` cannot do: written slice locals (`let s = v.as_slice()` → `as_mut_slice()`: 45 of the eval solutions' 92 errors), `&x` written through (`&mut x`), handle copies (`clone()`, `take()`, `std::replace`), views of a dropped Buf (owned Bufs), two loans in one call (hoisting).
+- **Correct code that was rejected, fixed in T7:** a view a method makes of a `&mut` parameter (`sort(v.as_mut_slice())` twice) and a view bound by `if let` out of one are reborrows; a field read or write through a `&mut` keeps another field's view; Arena is a plain handle until 0.17.1 (it was owned with no Drop or Clone); `HashMap::get_mut`/`get_or_insert` give `&mut [V]` (their documented idiom was own.readonly) and `&mut [T]` binds as a type argument; std's `#[views]` pins bind the generic instances (they never applied: every std generic fell to the parametric floor); std's debug_list borrows.
+- **Unsound code that was accepted, fixed in T7:** `a + c` on an owned type did not move its operands (double free); a copy of an element from `get`/`last`/`key_at`/`value_at` (and `unwrap`) was dropped though the collection keeps it (double free): it is borrowed now, and moving it is own.move_out; a `&mut self` method through a `&T` was accepted (own.readonly now).
+- **Left open (0.17.1, or the user's call):**
+  - std's `Ord::cmp`, `Eq::eq`, `cmp_of`, `eq_of` take legacy `*Self`, which is exclusive: `a.cmp(&a)` and `x.cmp(&y)` with a live `&x` are own.conflict. `&Self` in the traits needs impls with `*Self` accepted (the signature check is exact).
+  - `<` and `==` on two `&T` compare addresses (as on `*T`), not values, so fix rule 4 (an owned parameter → `&T`) can change a comparison's meaning; Rust compares the values.
+  - a borrowed copy (`v.get(i)`) returned, put in a struct literal or assigned is not yet own.move_out; `v.as_slice()[0] = x` and `&mut s[..]` of a read-only `s` are not own.readonly.
+  - false positives: `for x in v.iter()` over a `Vec<[u8]>` views v rather than what its elements view; a `const` array of slices iterated is own.static; std bodies instantiated for owned T (`std::swap`, `fold`, `extend_from_slice`) report move-outs inside std with no call site; a closure parameter's call makes a legacy `self: *Self` store; a Vec made on an allocator copied out of `*p` views `*p`.
+  - fix --values: written slice locals; `&mut *c` for a `&T` local `c` (a write through a shared reference); a slice passed to C counted as written.
 
 ## 8. Prototype results (§6, branch c17-proto, 2026-10-15)
 
