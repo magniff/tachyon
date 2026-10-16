@@ -72,7 +72,6 @@ fn split_tokens(line: [u8], gpa: Gpa) -> Vec<[u8]> {
 
 fn parse_command(line: [u8], gpa: Gpa) -> Command {
     let mut tokens = split_tokens(line, gpa);
-    defer tokens.free();
     let t = tokens.as_slice();
     if t.len == 0 {
         return Command::Blank;
@@ -120,7 +119,7 @@ fn parse_command(line: [u8], gpa: Gpa) -> Command {
     }
 }
 
-fn push_account(out: *Buf, a: Account) {
+fn push_account(out: &mut Buf, a: Account) {
     out.push_str(a.name);
     out.push(' ');
     out.push_int(a.balance);
@@ -129,9 +128,8 @@ fn push_account(out: *Buf, a: Account) {
     out.push('\n');
 }
 
-fn report(accounts: *HashMap<[u8], Account>, out: *Buf, gpa: Gpa) {
+fn report(accounts: &HashMap<[u8], Account>, out: &mut Buf, gpa: Gpa) {
     let mut list: Vec<Account> = Vec::new_in(gpa);
-    defer list.free();
     let mut total = 0;
     for i in 0..accounts.slots() {
         if let Some(a) = accounts.value_at(i) {
@@ -150,7 +148,7 @@ fn report(accounts: *HashMap<[u8], Account>, out: *Buf, gpa: Gpa) {
     }
 }
 
-fn execute(cmd: Command, accounts: *HashMap<[u8], Account>, out: *Buf, gpa: Gpa) -> Result<(),
+fn execute(cmd: Command, accounts: &mut HashMap<[u8], Account>, out: &mut Buf, gpa: Gpa) -> Result<(),
     [u8]> {
     match cmd {
         Command::Blank => {}
@@ -196,24 +194,29 @@ fn execute(cmd: Command, accounts: *HashMap<[u8], Account>, out: *Buf, gpa: Gpa)
             a[0].txns += 1;
         }
         Command::Transfer(from, to, amt) => {
-            let src = match accounts.get_mut(from) {
-                Some(a) => a,
+            // Every check first, then one account in place at a time: two
+            // get_mut views of one map at once would conflict (as in Rust).
+            let balance = match accounts.get(from) {
+                Some(a) => a.balance,
                 None => return Err("error: no such account"),
             };
-            let dst = match accounts.get_mut(to) {
-                Some(a) => a,
-                None => return Err("error: no such account"),
-            };
+            if !accounts.contains(to) {
+                return Err("error: no such account");
+            }
             if from == to {
                 return Err("error: same account");
             }
-            if src[0].balance < amt {
+            if balance < amt {
                 return Err("error: insufficient funds");
             }
-            src[0].balance -= amt;
-            src[0].txns += 1;
-            dst[0].balance += amt;
-            dst[0].txns += 1;
+            if let Some(src) = accounts.get_mut(from) {
+                src[0].balance -= amt;
+                src[0].txns += 1;
+            }
+            if let Some(dst) = accounts.get_mut(to) {
+                dst[0].balance += amt;
+                dst[0].txns += 1;
+            }
         }
     }
     Ok(())
@@ -223,14 +226,11 @@ fn main(gpa: Gpa) -> i32 {
     // All of stdin, not read_line: account names are views of the input,
     // kept as the map's keys.
     let mut input = read_stdin_in(gpa).unwrap();
-    defer input.free();
     let mut sc = Scanner::new(input.as_slice());
     let mut accounts: HashMap<[u8], Account> = HashMap::new_in(gpa);
-    defer accounts.free();
     let mut out = Buf::new_in(gpa);
-    defer out.free();
     while let Some(line) = sc.next_line() {
-        if let Err(msg) = execute(parse_command(line, gpa), &accounts, &out, gpa) {
+        if let Err(msg) = execute(parse_command(line, gpa), &mut accounts, &mut out, gpa) {
             out.push_str(msg);
             out.push('\n');
         }

@@ -22,15 +22,15 @@ pub struct Table {
 }
 
 impl Table {
-    pub fn ncols(self: *Table) -> i64 {
+    pub fn ncols(self: &Table) -> i64 {
         self.names.len()
     }
 
-    pub fn cell(self: *Table, row: i64, col: i64) -> Value {
+    pub fn cell(self: &Table, row: i64, col: i64) -> Value {
         self.cells.get(row * self.names.len() + col)
     }
 
-    pub fn find(self: *Table, name: [u8]) -> Option<i64> {
+    pub fn find(self: &Table, name: [u8]) -> Option<i64> {
         for i in 0..self.names.len() {
             if self.names.get(i) == name {
                 return Some(i);
@@ -103,13 +103,17 @@ pub fn parse_int(s: [u8]) -> i64 {
     }
 }
 
-// Splits one CSV line into its fields, unquoting the quoted ones.
-fn split_fields(line: [u8], gpa: Gpa) -> Vec<[u8]> {
+// Splits one CSV line into its fields. A quoted field is unquoted into a
+// Buf pushed onto `store`, and left empty here: `quoted` gets (its field,
+// its Buf), for read_table to point it at the Buf once the store is
+// complete.
+fn split_fields(line: [u8], store: &mut Vec<Buf>, quoted: &mut Vec<(i64, i64)>, gpa: Gpa) -> Vec<[
+    u8]> {
     let mut fields: Vec<[u8]> = Vec::new_in(gpa);
     let mut i = 0;
     loop {
         if i < line.len && line[i] == '"' {
-            // a new buffer for the unquoted text; it lives as long as the table
+            // the unquoted text, kept in the store
             let mut field = Buf::new_in(gpa);
             i += 1;
             while i < line.len {
@@ -126,7 +130,9 @@ fn split_fields(line: [u8], gpa: Gpa) -> Vec<[u8]> {
                     i += 1;
                 }
             }
-            fields.push(field.as_slice());
+            quoted.push((fields.len(), store.len()));
+            fields.push("");
+            store.push(field);
         } else {
             let start = i;
             while i < line.len && line[i] != ',' {
@@ -144,15 +150,19 @@ fn split_fields(line: [u8], gpa: Gpa) -> Vec<[u8]> {
 }
 
 // Reads the header and the rows from `lines`, up to the line `%%`; returns
-// the table and the index of the first line after `%%`.
-pub fn read_table(lines: [[u8]], gpa: Gpa) -> (Table, i64) {
+// the table and the index of the first line after `%%`. The unquoted text
+// of quoted fields is kept in `store`, which the table views.
+pub fn read_table(lines: [[u8]], store: &mut Vec<Buf>, gpa: Gpa) -> (Table, i64) {
     let mut t = Table {
         names: Vec::new_in(gpa), types: Vec::new_in(gpa), cells: Vec::new_in(gpa), nrows: 0
     };
     let mut k = 0;
+    // (cell, its Buf in the store) for every quoted field
+    let mut quoted: Vec<(i64, i64)> = Vec::new_in(gpa);
     if lines.len > 0 {
-        let mut header = split_fields(lines[0], gpa);
-        defer header.free();
+        // (names are never quoted)
+        let mut hq: Vec<(i64, i64)> = Vec::new_in(gpa);
+        let mut header = split_fields(lines[0], store, &mut hq, gpa);
         for item in header.as_slice() {
             let mut colon = item.len;
             for j in 0..item.len {
@@ -176,8 +186,12 @@ pub fn read_table(lines: [[u8]], gpa: Gpa) -> (Table, i64) {
         if line.len == 0 {
             continue;
         }
-        let mut fields = split_fields(line, gpa);
-        defer fields.free();
+        let first = quoted.len();
+        let mut fields = split_fields(line, store, &mut quoted, gpa);
+        let fq = quoted.as_mut_slice();
+        for j in first..fq.len {
+            fq[j].0 += t.cells.len();
+        }
         for c in 0..t.ncols() {
             let text = fields.get(c);
             let v = if t.types.get(c) == ColType::Int {
@@ -192,6 +206,11 @@ pub fn read_table(lines: [[u8]], gpa: Gpa) -> (Table, i64) {
             t.cells.push(v);
         }
         t.nrows += 1;
+    }
+    // The store is complete: the quoted cells can view it now.
+    let cells = t.cells.as_mut_slice();
+    for q in quoted.as_slice() {
+        cells[q.0] = Value::Str(store[q.1].as_slice());
     }
     (t, k)
 }

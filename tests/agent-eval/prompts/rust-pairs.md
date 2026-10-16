@@ -4,9 +4,9 @@ Tachyon looks like Rust; what differs is shown below as pairs: each
 `// Rust:` comment is the Rust you would write, the line under it is the
 tachyon for it. Both programs compile and run as shown (`tachyonc
 main.tach -o prog && ./prog < in.txt`). There are no macros, no `String`
-(text is `[u8]`, built with `std::Buf`), no references or lifetimes (a
-pointer `*T`, `&x` takes one), no `Drop` (`defer x.free();`), and nothing
-allocates without the allocator `gpa` that `main` receives.
+(text is `[u8]`, built with `std::Buf`), no lifetimes to write (`&T`,
+`&mut T` and moves are checked as in Rust; values drop at scope end), and
+nothing allocates without the allocator `gpa` that `main` receives.
 
 ```tach
 use std::{Buf, HashMap, Scanner, read_stdin_in, sort};
@@ -20,9 +20,9 @@ enum Cmd { Add([u8], i64), Show }
 
 // Rust: impl Item { fn total(&self, k: i64) -> i64 { ... } }
 impl Item {
-    fn total(self: *Item, k: i64) -> i64 { self.qty * k }
+    fn total(self: &Item, k: i64) -> i64 { self.qty * k }
     // Rust: fn bump(&mut self) { self.qty += 1; }
-    fn bump(self: *Item) { self.qty += 1; }
+    fn bump(self: &mut Item) { self.qty += 1; }
 }
 
 // Rust: fn parse(line: &str) -> Option<Cmd>
@@ -44,16 +44,12 @@ fn parse(line: [u8]) -> Option<Cmd> {
 // Rust: fn main() { let mut s = String::new(); io::stdin().read_to_string(&mut s).unwrap(); ... }
 fn main(gpa: Gpa) -> i32 {
     let input = read_stdin_in(gpa).unwrap();
-    defer input.free();
     // Rust: let mut counts: HashMap<String, i64> = HashMap::new();
     let mut counts: HashMap<[u8], i64> = HashMap::new_in(gpa);
-    defer counts.free();
     // Rust: let mut items: Vec<Item> = Vec::new();
     let mut items: Vec<Item> = Vec::new_in(gpa);
-    defer items.free();
     // Rust: let mut out = String::new();
     let mut out = Buf::new_in(gpa);
-    defer out.free();
     // Rust: for line in s.lines() {
     let mut sc = Scanner::new(input.as_slice());
     while let Some(line) = sc.next_line() {
@@ -74,13 +70,12 @@ fn main(gpa: Gpa) -> i32 {
         }
     }
     // Rust: items[0].bump();  (an element in place)
-    if items.len() > 0 { items.as_slice()[0].bump(); }
+    if items.len() > 0 { items.as_mut_slice()[0].bump(); }
     // Rust: let total: i64 = items.iter().map(|it| it.qty).sum();
     let total: i64 = items.iter().map(|it| it.qty).sum();
     // Rust: let mut qs: Vec<i64> = ...; qs.sort();
     let mut qs: Vec<i64> = items.iter().map(|it| it.qty).collect_in(gpa);
-    defer qs.free();
-    sort(qs.as_slice());
+    sort(qs.as_mut_slice());
     // Rust: if let Some(n) = counts.get("a") { ... }
     if let Some(n) = counts.get("a") { out.push_fmt(f"a: {n}\n"); }
     // Rust: println!("{}", total); (formatted with {:>5})
@@ -109,7 +104,7 @@ extern "C" { fn abs(x: i32) -> i32; }
 enum Op { Push(i64), Pop, Neg }
 
 // Rust: fn apply(stack: &mut Vec<i64>, op: &Op) -> Result<(), String>
-fn apply(stack: *Vec<i64>, op: Op) -> Result<(), [u8]> {
+fn apply(stack: &mut Vec<i64>, op: Op) -> Result<(), [u8]> {
     // Rust: match op { ... }  (every variant covered, or `_ =>`)
     match op {
         Op::Push(n) => stack.push(n),
@@ -134,20 +129,18 @@ fn first_word(s: [u8]) -> [u8] {
 
 fn main(gpa: Gpa) -> i32 {
     let mut st: Vec<i64> = Vec::new_in(gpa);
-    defer st.free();
     // Rust: apply(&mut st, &Op::Push(5)).unwrap();
-    apply(&st, Op::Push(5)).unwrap();
-    apply(&st, Op::Neg).unwrap();
+    apply(&mut st, Op::Push(5)).unwrap();
+    apply(&mut st, Op::Neg).unwrap();
     // Rust: if let Err(e) = apply(...) { eprintln!("{}", e); }
-    if let Err(e) = apply(&st, Op::Pop) { println(f"error: {e}"); }
-    if let Err(e) = apply(&st, Op::Pop) { println(f"error: {e}"); }
+    if let Err(e) = apply(&mut st, Op::Pop) { println(f"error: {e}"); }
+    if let Err(e) = apply(&mut st, Op::Pop) { println(f"error: {e}"); }
     // Rust: let n: i64 = " 42 ".trim().parse().unwrap();
     let n = parse_int(trim(" 42 ")).unwrap();
     // Rust: let a = (-7i32).abs();  (no methods on numbers: C's, or write it)
     let a = unsafe { abs(-7) };
     // Rust: let s = format!("{}-{}", n, a);
     let s = format_in(f"{n}-{a}", gpa);
-    defer s.free();
     // Rust: s.len(), &s[0..2], s.as_bytes()[0] == b'4'
     println(f"{s.as_slice()} {s.len()} {s.as_slice()[0..2]} {s.as_slice()[0] == '4'}");
     println(first_word("hello world"));
@@ -173,7 +166,9 @@ More pairs, one line each:
 - `String::from("x")`, `&str` -> `"x"` (a `[u8]`); `s.len()` -> `s.len`
   (a field) on a `[u8]`, `v.len()` on a `Vec` or `Buf`.
 - `v[i]` on a `Vec` -> `v.get(i)`, `v.set(i, x)`, `v.as_slice()[i]`.
-- `Box<T>`, `Rc<T>` -> a `Vec<T>` and indices; `&mut x` -> `&x` (a `*T`).
+- `Box<T>`, `Rc<T>` -> a `Vec<T>` and indices; `&x`, `&mut x`, `&T`,
+  `&mut T` as in Rust (a reference is not returned: return an index or the
+  owner); `&mut v[..]` / `v.as_mut_slice()` to write a slice.
 - `impl Display` / `{:?}` -> `#[derive(Debug)]` and `f"{x:?}"`; `println!`
   -> `println(f"...")`; `format!` -> `format_in(f"...", gpa)` (a `Buf`).
 - `panic!("m")` -> `unsafe { std::panic(c"m") }`; `process::exit(n)` ->

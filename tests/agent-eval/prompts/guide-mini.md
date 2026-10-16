@@ -1,7 +1,7 @@
 # tachyon in brief
 
-Rust's syntax with C's model: no borrow checker, lifetimes, destructors,
-macros or `char`. The differences that matter most, each next to the Rust
+Rust's syntax and value semantics (moves, drops at scope end, checked
+`&T`/`&mut T`), but no lifetimes to write, no macros, no `char`. The differences that matter most, each next to the Rust
 it replaces:
 
 ```tach
@@ -10,18 +10,17 @@ use std::{Buf, HashMap, Scanner, read_stdin_in};   // Rust: use std::collections
 struct P { x: i64 }
 
 impl P {
-    fn bump(self: *P) { self.x += 1; }    // Rust: &mut self   (*T: the one pointer type)
-    fn get(self: P) -> i64 { self.x }     // Rust: &self       (T: a copy)
+    fn bump(self: &mut P) { self.x += 1; }   // Rust: &mut self   (self written out)
+    fn get(self: &P) -> i64 { self.x }       // Rust: &self
 }
 
-fn total(v: Vec<i64>) -> i64 { v.iter().sum() }   // Vec is a handle: passing it copies no elements
+fn total(v: &Vec<i64>) -> i64 { v.iter().sum() }  // a Vec passed by value moves, as in Rust
 
 fn main(gpa: Gpa) -> i32 {                // Rust: fn main()   gpa: the allocator; 0: exit status
     let input = read_stdin_in(gpa).unwrap();          // all of stdin, a Buf
     let mut sc = Scanner::new(input.as_slice());      // next_int(), next_token(), next_line()
     let n = sc.next_int().unwrap_or(0);
     let mut v: Vec<i64> = Vec::new_in(gpa);   // Rust: Vec::new()   allocating takes an allocator
-    defer v.free();                           // Rust: drop at scope end
     v.push(n);
     v.set(0, v.get(0) + 1);                   // Rust: v[0] += 1
     let s: [u8] = "hi";                       // Rust: &str, String: text is [u8]; 'a' is a u8
@@ -32,9 +31,9 @@ fn main(gpa: Gpa) -> i32 {                // Rust: fn main()   gpa: the allocato
     b.push_str("k=");
     b.push_int(k);
     let mut p = P { x: 1 };
-    p.bump();                                 // passes &p
+    p.bump();                                 // passes &mut p
     if s == "hi" {                            // strings are compared with ==, not matched
-        println(f"{b.as_slice()} {v:?} {p.get()} {total(v)}");   // Rust: println!(..): f-strings
+        println(f"{b.as_slice()} {v:?} {p.get()} {total(&v)}");   // Rust: println!(..): f-strings
     }
     0
 }
