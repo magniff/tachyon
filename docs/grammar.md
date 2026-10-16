@@ -1513,12 +1513,23 @@ Forms a Rust reader writes first, with tachyon's meaning unchanged
 behind them is `.claude/briefs/research/familiar-names.md`.
 
 ```ebnf
-unary += "&" "mut" unary          (* the same as "&" unary *)
+unary += "&" "mut" unary          (* an exclusive reference *)
+type  += "&" type | "&" "mut" type  (* "&" "[" type "]" is the slice type itself *)
 ```
 
-**`&mut e`** is `&e`: tachyon has one pointer type, `*T`, for `&T` and
-`&mut T`. (The exclusive meaning `&mut` will have with value semantics
-is [design/value-semantics.md](design/value-semantics.md)'s.)
+**References** (value semantics, Phase 0;
+[design/value-semantics.md](design/value-semantics.md) §2.3). `&T` is a
+shared reference and `&mut T` an exclusive one: `&x` and `&mut x` take
+them, and reading through one is safe (`let r = &p; r.x`), as through a
+pointer parameter. `&[T]` is `[T]`; `&mut [T]` is the exclusive slice
+(`&mut a[..]`). A reference converts where a raw `*T` is wanted, `&mut T`
+where `&T` is, `&mut [T]` where `[T]` is, and a reference to a slice where
+the slice is (`f(&s)`). A `*T` parameter not written `mut` takes `&x` and
+`&mut x` alike (until 0.18 it is checked as `&mut T`). `&x` where `&mut T`
+is wanted is an error naming `&mut x`. A place reached through a raw
+pointer still gives a raw pointer (`&*p` gives a reference). Function
+attributes `#[views(a, *b)]` and `#[stores(c)]` declare a view summary.
+(Phase 0: what the own pass checks of them comes with its tasks.)
 
 **The prelude** gains `Buf`, `HashMap`, `read_line`, `read_stdin_in`,
 `Scanner`, `parse_int`, `trim`, `split_in`, `split_whitespace_in`,

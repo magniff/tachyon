@@ -1,0 +1,1038 @@
+// The own walk (0.17, docs/design/value-semantics.md §4 step 4): a forward
+// abstract interpretation of one checked function body, in the grammar's
+// evaluation order (left to right, the right-hand side before the place,
+// an index before its base is read, a `&mut self` receiver after the
+// arguments). It is the prototype's traversal (c17-proto, §8.1) with every
+// rule taken out into the event hooks below:
+//
+//   ev_read    a place is read, or borrowed (T1: use after move; T2: an
+//              invalidated view used)
+//   ev_write   a place is written, or mutably borrowed (T2: invalidation)
+//   ev_move    an owned place is moved (T1: the moved bits; T2: its views
+//              invalidated)
+//   ev_init    a place is (re)initialized (T1)
+//   ev_drop    a local's drop runs at an exit (T1: drop states; T2)
+//   ev_borrow  `&place`, `&mut place`: the loan and its origin (T2)
+//   ev_value   the views a value read out of a place holds (T2)
+//   ev_bind    a local is bound to a value (T1: initialized; T2: its slot)
+//   ev_assign  an assignment's place, after its value (T1, T2)
+//   ev_scope   a scope ends: its locals die (T2)
+//   ev_call    a call, its arguments pending (T2: conflicts, stores,
+//              statics, the result's origin through summary_of)
+//   ev_result  the function's result, at a `return` or the tail (T2:
+//              escapes; T3: the summary)
+//
+// moves.tach (T1) and views.tach/calls.tach (T2) implement the hooks;
+// summary.tach (T3) collects the result's summary. The traversal (control
+// flow: if and match join, loops iterate to a fixed point, break/continue/
+// return feed their targets, defers and drops share one exit list) is the
+// lead's: neither task changes it without the lead.
+//
+// Phase 0 contract: walk_fn and the ev_* signatures are fixed.
+
+use crate::base::{SYMS, intern_c};
+use crate::front::ast::{
+    CLOSURE_MOVE, DEFER_IMPLICIT, NODES, NODE_IN_BOUNDS, NODE_RAW, NODE_REF_MUT, NodeKind, child,
+};
+use crate::front::check::{LOCALS, Res};
+use crate::front::lexer::Tok;
+use crate::front::own::{calls, moves, views};
+use crate::front::own::kinds::{
+    P_MUT, P_MUT_VIEW, P_RAW, P_SHARED, P_VALUE, P_VIEW, is_owned_type, is_view_type, param_mode,
+};
+use crate::front::own::state::{
+    CUR, LOC_CAP, LOC_PL, LOC_SLOT, MAXNW, NW, PE, PEND, PK_MUT, PK_MUT_VIEW, PK_NONE, PK_RAW,
+    PK_RESERVE, PK_SHARED, PK_VIEW, PL_OVERFLOW, PL_PARENT, PL_RKIND, POOL, POOL_TOP, RK_STATIC,
+    SLOT_CAP, SLOT_OVERFLOW, TUPLE_FIELD, alias_local, child_place, copy_state, join_state,
+    local_place, new_ov, new_state, pend_push, reachable, reset_places, root_of, same_state,
+    set_unreachable, set_words, slot_for, static_has_place, static_place,
+};
+use crate::front::own::summary::{ViewSummary, collect_begin, collect_end, collect_result};
+use crate::front::types::{FNS, REF_MUT, REF_SHARED, TYPES, TyKind};
+
+// The value of an expression is read (a copy, or a borrow) or moved.
+pub const CX_READ: i64 = 0;
+pub const CX_MOVE: i64 = 1;
+
+// How a move leaves its place (ev_move): a local or a field of one; out of
+// an index, through a pointer or reference, out of a static (all errors,
+// T1's own.move_out).
+pub const MO_PLACE: i64 = 0;
+pub const MO_INDEX: i64 = 1;
+pub const MO_DEREF: i64 = 2;
+pub const MO_STATIC: i64 = 3;
+
+// How a write reaches its place (ev_write).
+pub const W_WRITE: i64 = 0;
+pub const W_MOVE: i64 = 1;
+pub const W_DROP: i64 = 2;
+pub const W_MUT_BORROW: i64 = 3;
+
+// The function walked, and its parameters' locals (by index).
+pub static mut CUR_F: i64 = -1;
+pub static mut PARAM_LOCALS: crate::base::IntVec =
+    crate::base::IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// Loop frames: node, break state, continue state, defer mark.
+static mut LOOPF: crate::base::IntVec = crate::base::IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// The defers (and drops) of the enclosing blocks, in order.
+pub static mut DEFS: crate::base::IntVec = crate::base::IntVec {
+    data: 0 as *i64, count: 0, cap: 0
+};
+// The locals bound in the enclosing scopes, in order (ev_scope gets the
+// ones that die).
+pub static mut BOUND: crate::base::IntVec = crate::base::IntVec {
+    data: 0 as *i64, count: 0, cap: 0
+};
+// Inside a closure that borrows its captures, or an f-string's holes (they
+// read, never move), and inside a defer.
+pub static mut NO_MOVE: i64 = 0;
+pub static mut IN_DEFER: i64 = 0;
+// Node visits, and loop rounds (for --time-passes' report and the budget).
+pub static mut VISITS: i64 = 0;
+pub static mut LOOP_ROUNDS: i64 = 0;
+pub static mut WALKED: i64 = 0;
+
+// What place_of found on the way: through a pointer or reference
+// (PO_DEREF), a raw one (PO_RAW), an index (PO_INDEX), inside what a view
+// points to (PO_INNER), into the elements of a slot's slice (PO_VIEWSLOT).
+pub static mut PO_DEREF: bool = false;
+pub static mut PO_INDEX: bool = false;
+pub static mut PO_RAW: bool = false;
+pub static mut PO_INNER: bool = false;
+pub static mut PO_VIEWSLOT: i64 = -1;
+// (whether place_rec makes the places of plain locals and statics: where
+// something borrows them)
+static mut PO_MAKE: bool = false;
+static mut SYM_FOR_SEQ: i64 = 0;
+
+// ---------------------------------------------------------------------------
+// The events
+
+pub fn ev_read(p: i64, n: i64) {
+    unsafe {
+        if p < 0 || !reachable(CUR) {
+            return;
+        }
+        moves::on_read(p, n);
+        views::on_read(p, n);
+    }
+}
+
+pub fn ev_write(p: i64, n: i64, how: i64) {
+    unsafe {
+        if p < 0 || !reachable(CUR) {
+            return;
+        }
+        views::on_write(p, n, how);
+    }
+}
+
+pub fn ev_move(p: i64, n: i64, how: i64) {
+    unsafe {
+        if p < 0 || !reachable(CUR) {
+            return;
+        }
+        if NO_MOVE > 0 {
+            ev_read(p, n);
+            return;
+        }
+        moves::on_move(p, n, how);
+        if how == MO_PLACE {
+            views::on_write(p, n, W_MOVE);
+        }
+    }
+}
+
+pub fn ev_init(p: i64) {
+    unsafe {
+        if p < 0 || !reachable(CUR) {
+            return;
+        }
+        moves::on_init(p);
+    }
+}
+
+// The drop of local l (its implicit defer d) at an exit.
+pub fn ev_drop(l: i64, d: i64) {
+    unsafe {
+        if l < 0 || !reachable(CUR) {
+            return;
+        }
+        let p = local_place(l);
+        moves::on_drop(p, l, d);
+        views::on_write(p, d, W_DROP);
+    }
+}
+
+// `&p` (kind REF_SHARED) or `&mut p` (REF_MUT) at node n; dst (an origin
+// value, or -1) gets the loan. raw: p is reached through a raw pointer.
+pub fn ev_borrow(p: i64, n: i64, kind: i64, raw: bool, dst: i64) {
+    unsafe {
+        if p < 0 || !reachable(CUR) {
+            return;
+        }
+        ev_read(p, n);
+        if kind == REF_MUT {
+            views::on_write(p, n, W_MUT_BORROW);
+        }
+        views::on_borrow(p, n, kind, raw, dst);
+    }
+}
+
+// The value read out of place p at node n, of type ty: dst gets the views
+// it holds (PO_* say how p was reached).
+pub fn ev_value(p: i64, n: i64, ty: i64, dst: i64) {
+    unsafe {
+        if p < 0 || dst < 0 || !reachable(CUR) {
+            return;
+        }
+        views::on_value(p, n, ty, dst);
+    }
+}
+
+// Local l bound at node n to a value of origin v (-1: none).
+pub fn ev_bind(l: i64, n: i64, v: i64) {
+    unsafe {
+        if l < 0 || !reachable(CUR) {
+            return;
+        }
+        BOUND.push(l);
+        views::on_bind(l, n, v);
+        if is_owned_type(LOCALS[l].ty) {
+            ev_init(local_place(l));
+        }
+    }
+}
+
+// Assignment n (`=` or `op=`) to place p, its value's origin v.
+pub fn ev_assign(p: i64, n: i64, v: i64) {
+    unsafe {
+        if p < 0 || !reachable(CUR) {
+            return;
+        }
+        let compound = NODES[n].op != Tok::Eq;
+        if PO_VIEWSLOT < 0 && !PO_RAW && compound {
+            ev_read(p, n);
+        }
+        views::on_assign(p, n, v);
+        if !compound && !PO_INDEX && !PO_DEREF {
+            ev_init(p);
+        }
+    }
+}
+
+// The end of a scope whose bindings are BOUND[mark..]: they die; v is the
+// origin of the scope's value (-1: none), tail its node (0: none).
+pub fn ev_scope(mark: i64, v: i64, tail: i64) {
+    unsafe {
+        if reachable(CUR) {
+            views::on_scope_end(mark, v, tail);
+        }
+        BOUND.count = mark;
+    }
+}
+
+// Call n of function f (-1: through a fn value), its arguments pending at
+// PEND[base..]; dst gets the result's views.
+pub fn ev_call(n: i64, f: i64, base: i64, dst: i64) {
+    calls::on_call(n, f, base, dst);
+}
+
+// The function's result: e its node (a `return`'s value, the tail, or the
+// return or body when there is none), v its origin (-1: none).
+pub fn ev_result(e: i64, v: i64) {
+    unsafe {
+        if !reachable(CUR) {
+            return;
+        }
+        views::on_result(e, v);
+        collect_result(e, v);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Places
+
+// A local whose place matters even unborrowed: it holds views or owns, or
+// is a parameter (reads through it reach its roots).
+fn relevant_local(l: i64) -> bool {
+    unsafe {
+        if l < 0 {
+            return false;
+        }
+        if l < LOC_CAP && (LOC_PL[l] != 0 || LOC_SLOT[l] != 0) {
+            return true;
+        }
+        LOCALS[l].is_param || is_owned_type(LOCALS[l].ty)
+    }
+}
+
+fn clear_po(make: bool) {
+    unsafe {
+        PO_DEREF = false;
+        PO_INDEX = false;
+        PO_RAW = false;
+        PO_INNER = false;
+        PO_VIEWSLOT = -1;
+        PO_MAKE = make;
+    }
+}
+
+// The place expression e denotes (its index expressions evaluated), or -1;
+// sets PO_*.
+pub fn place_of(e: i64) -> i64 {
+    clear_po(false);
+    place_rec(e)
+}
+
+// place_of, making the places of plain locals and statics (a loan is taken
+// on it).
+pub fn place_of_make(e: i64) -> i64 {
+    unsafe {
+        clear_po(true);
+        let p = place_rec(e);
+        PO_MAKE = false;
+        p
+    }
+}
+
+// Whether pointer expression e is a reference or a borrow (safe to
+// dereference), not raw.
+fn is_reference(e: i64) -> bool {
+    unsafe {
+        if NODES[e].ty > 0 && TYPES[NODES[e].ty].kind == TyKind::Ptr && TYPES[NODES[e].ty].b != 0 {
+            return true;
+        }
+        NODES[e].kind == NodeKind::Ident && NODES[e].res == Res::Local && NODES[e].y >= 0
+            && LOCALS[NODES[e].y].borrow
+    }
+}
+
+fn place_rec(e: i64) -> i64 {
+    unsafe {
+        let k = NODES[e].kind;
+        if k == NodeKind::Ident {
+            if NODES[e].res == Res::Local {
+                let l = NODES[e].y;
+                if !PO_MAKE && !relevant_local(l) {
+                    return -1;
+                }
+                return local_place(l);
+            }
+            if NODES[e].res == Res::Static {
+                let s = NODES[e].y;
+                if !PO_MAKE && !static_has_place(s) {
+                    return -1;
+                }
+                return static_place(s);
+            }
+            return -1;
+        }
+        if k == NodeKind::FieldAccess {
+            let base = place_rec(NODES[e].a);
+            if NODES[e].y == 1 {
+                PO_DEREF = true;
+                if !is_reference(NODES[e].a) {
+                    PO_RAW = true;
+                }
+            }
+            return child_place(base, NODES[e].b);
+        }
+        if k == NodeKind::TupleField {
+            let base = place_rec(NODES[e].a);
+            return child_place(base, TUPLE_FIELD + NODES[e].b);
+        }
+        if k == NodeKind::Unary && NODES[e].op == Tok::Star {
+            PO_DEREF = true;
+            if !is_reference(NODES[e].b) {
+                PO_RAW = true;
+            }
+            return place_rec(NODES[e].b);
+        }
+        if k == NodeKind::Index {
+            // (the index first: the 0.14 order)
+            let deref = PO_DEREF;
+            let index = PO_INDEX;
+            let raw = PO_RAW;
+            let inner = PO_INNER;
+            let vs = PO_VIEWSLOT;
+            let make = PO_MAKE;
+            eval(NODES[e].b, CX_READ, -1);
+            PO_MAKE = make;
+            PO_DEREF = deref;
+            PO_INDEX = index;
+            PO_RAW = raw;
+            PO_INNER = inner;
+            PO_VIEWSLOT = vs;
+            let base = NODES[e].a;
+            let bt = NODES[base].ty;
+            let p = place_rec(base);
+            PO_INDEX = true;
+            if bt > 0 && TYPES[bt].kind == TyKind::Slice {
+                PO_DEREF = true;
+                PO_INNER = true;
+                if p >= 0 && PL_PARENT[p] < 0 {
+                    PO_VIEWSLOT = crate::front::own::state::slot_of_place(p);
+                }
+            } else if bt > 0 && TYPES[bt].kind == TyKind::Ptr {
+                PO_DEREF = true;
+                if (NODES[e].p & NODE_RAW) != 0 || !is_reference(base) {
+                    PO_RAW = true;
+                }
+            }
+            return p;
+        }
+        // (a value: a call's result, a literal)
+        eval(e, CX_READ, -1);
+        -1
+    }
+}
+
+fn is_place_expr(e: i64) -> bool {
+    unsafe {
+        let k = NODES[e].kind;
+        if k == NodeKind::Ident {
+            return NODES[e].res == Res::Local || NODES[e].res == Res::Static;
+        }
+        if k == NodeKind::FieldAccess || k == NodeKind::TupleField {
+            return NODES[e].y == 1 || is_place_expr(NODES[e].a);
+        }
+        if k == NodeKind::Unary {
+            return NODES[e].op == Tok::Star;
+        }
+        if k == NodeKind::Index {
+            return NODES[NODES[e].b].kind != NodeKind::Range;
+        }
+        false
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Expressions
+
+fn eval_list(n: i64, ctx: i64, dst: i64) {
+    unsafe {
+        for i in 0..NODES[n].count {
+            eval(child(n, i), ctx, dst);
+        }
+    }
+}
+
+// Evaluates expression n (0: none); ctx says whether its value is moved;
+// dst (an origin value, or -1) gets the views it holds.
+pub fn eval(n: i64, ctx: i64, dst: i64) {
+    unsafe {
+        if n == 0 {
+            return;
+        }
+        VISITS += 1;
+        match NODES[n].kind {
+            NodeKind::Ident | NodeKind::FieldAccess
+                | NodeKind::TupleField => eval_place_value(n, ctx, dst),
+            NodeKind::Unary => {
+                let op = NODES[n].op;
+                if op == Tok::Star {
+                    eval_place_value(n, ctx, dst);
+                } else if op == Tok::Amp {
+                    let operand = NODES[n].b;
+                    if is_place_expr(operand) {
+                        let p = place_of_make(operand);
+                        let kind = if (NODES[n].p & NODE_REF_MUT) != 0 { REF_MUT }
+                            else { REF_SHARED };
+                        ev_borrow(p, n, kind, PO_RAW, dst);
+                    } else {
+                        eval(operand, CX_READ, dst);
+                    }
+                } else {
+                    eval(NODES[n].b, CX_READ, -1);
+                }
+            }
+            NodeKind::Index => {
+                if NODES[NODES[n].b].kind == NodeKind::Range {
+                    eval_slicing(n, dst);
+                } else {
+                    eval_place_value(n, ctx, dst);
+                }
+            }
+            NodeKind::Cast => eval(NODES[n].a, CX_READ, dst),
+            NodeKind::Binary => {
+                eval(NODES[n].b, CX_READ, -1);
+                let op = NODES[n].op;
+                if op == Tok::AmpAmp || op == Tok::PipePipe {
+                    let saved = new_state();
+                    copy_state(saved, CUR);
+                    eval(NODES[n].c, CX_READ, -1);
+                    join_state(CUR, saved);
+                    POOL_TOP = saved;
+                } else {
+                    eval(NODES[n].c, CX_READ, -1);
+                }
+            }
+            NodeKind::Assign => eval_assign(n),
+            NodeKind::Call => eval_call(n, dst),
+            NodeKind::Block => eval_block(n, ctx, dst),
+            NodeKind::If => {
+                eval(NODES[n].a, CX_READ, -1);
+                let saved = new_state();
+                copy_state(saved, CUR);
+                eval(NODES[n].b, ctx, dst);
+                let then_state = new_state();
+                copy_state(then_state, CUR);
+                copy_state(CUR, saved);
+                eval(NODES[n].c, ctx, dst);
+                join_state(CUR, then_state);
+                POOL_TOP = saved;
+            }
+            NodeKind::Match => eval_match(n, ctx, dst),
+            NodeKind::Loop | NodeKind::While | NodeKind::For => eval_loop(n),
+            NodeKind::Break => {
+                let lp = NODES[n].x;
+                eval(NODES[n].b, CX_MOVE, -1);
+                let f = find_frame(lp);
+                if f >= 0 {
+                    run_defers(LOOPF.data[f + 3]);
+                    join_state(LOOPF.data[f + 1], CUR);
+                }
+                set_unreachable(CUR);
+            }
+            NodeKind::Continue => {
+                let f = find_frame(NODES[n].x);
+                if f >= 0 {
+                    run_defers(LOOPF.data[f + 3]);
+                    join_state(LOOPF.data[f + 2], CUR);
+                }
+                set_unreachable(CUR);
+            }
+            NodeKind::Return => {
+                let v = new_ov();
+                eval(NODES[n].a, CX_MOVE, v);
+                if NODES[n].a != 0 {
+                    ev_result(NODES[n].a, v);
+                } else {
+                    ev_result(n, -1);
+                }
+                run_defers(0);
+                set_unreachable(CUR);
+                POOL_TOP = v;
+            }
+            NodeKind::Tuple | NodeKind::Array | NodeKind::StructLit | NodeKind::VariantLit => {
+                eval_list(n, CX_MOVE, dst);
+            }
+            NodeKind::FieldInit | NodeKind::NamedArg => eval(NODES[n].b, ctx, dst),
+            NodeKind::Repeat => eval(NODES[n].a, CX_MOVE, dst),
+            NodeKind::Range => {
+                eval(NODES[n].a, CX_READ, -1);
+                eval(NODES[n].b, CX_READ, -1);
+            }
+            NodeKind::Closure => {
+                let moving = (NODES[n].c & CLOSURE_MOVE) != 0;
+                if !moving {
+                    NO_MOVE += 1;
+                }
+                eval(NODES[n].y, CX_MOVE, dst);
+                if !moving {
+                    NO_MOVE -= 1;
+                }
+            }
+            NodeKind::Try => eval(NODES[n].y, ctx, dst),
+            NodeKind::Interp => {
+                // (the holes are shared borrows: no moves, §2.7)
+                NO_MOVE += 1;
+                eval(NODES[n].y, ctx, dst);
+                NO_MOVE -= 1;
+            }
+            NodeKind::EnumPanic => eval(NODES[n].a, CX_READ, -1),
+            NodeKind::VecOp => {
+                eval(NODES[n].a, CX_READ, -1);
+                eval_list(n, CX_READ, -1);
+            }
+            _ => {}
+        }
+    }
+}
+
+// The value of a place expression: a read, or a move of an owned value.
+fn eval_place_value(n: i64, ctx: i64, dst: i64) {
+    unsafe {
+        let t = NODES[n].ty;
+        if NODES[n].kind == NodeKind::Ident && NODES[n].res != Res::Local
+            && NODES[n].res != Res::Static {
+            return;
+        }
+        if !is_place_expr(n) {
+            // (a field of a call's result: the value's)
+            eval(NODES[n].a, ctx, dst);
+            return;
+        }
+        let p = place_of(n);
+        if p < 0 {
+            return;
+        }
+        if ctx == CX_MOVE && is_owned_type(t) {
+            let r = root_of(p);
+            let how = if PL_RKIND[r] == RK_STATIC { MO_STATIC } else if PO_INDEX { MO_INDEX }
+                else if PO_DEREF { MO_DEREF } else { MO_PLACE };
+            ev_move(p, n, how);
+        } else {
+            ev_read(p, n);
+        }
+        if is_view_type(t) || t > 0 && TYPES[t].kind == TyKind::Ptr {
+            ev_value(p, n, t, dst);
+        }
+    }
+}
+
+// `base[a..b]`: an array's elements are a loan on it; a slice's (or a
+// pointer's) are what the slice views.
+fn eval_slicing(n: i64, dst: i64) {
+    unsafe {
+        let base = NODES[n].a;
+        let range = NODES[n].b;
+        eval(NODES[range].a, CX_READ, -1);
+        eval(NODES[range].b, CX_READ, -1);
+        let bt = NODES[base].ty;
+        if bt > 0 && TYPES[bt].kind == TyKind::Array && is_place_expr(base) {
+            let p = place_of_make(base);
+            let kind = if (NODES[n].p & NODE_REF_MUT) != 0 { REF_MUT } else { REF_SHARED };
+            ev_borrow(p, n, kind, PO_RAW, dst);
+            return;
+        }
+        eval(base, CX_READ, dst);
+    }
+}
+
+fn eval_assign(n: i64) {
+    unsafe {
+        let target = NODES[n].b;
+        let value = NODES[n].c;
+        let v = new_ov();
+        eval(value, if NODES[n].op == Tok::Eq { CX_MOVE } else { CX_READ }, v);
+        let p = place_of(target);
+        if p >= 0 {
+            ev_assign(p, n, v);
+        }
+        POOL_TOP = v;
+    }
+}
+
+// Binds pattern pat (at node n) to a value with origin v (-1: none).
+fn bind(pat: i64, v: i64) {
+    unsafe {
+        if pat == 0 {
+            return;
+        }
+        let k = NODES[pat].kind;
+        if k == NodeKind::PatBind {
+            let l = NODES[pat].x;
+            if l >= 0 {
+                slot_for(l, is_view_type(LOCALS[l].ty));
+                ev_bind(l, pat, v);
+            }
+            return;
+        }
+        if k == NodeKind::PatTuple || k == NodeKind::PatVariant || k == NodeKind::PatOr {
+            for i in 0..NODES[pat].count {
+                bind(child(pat, i), v);
+            }
+        }
+    }
+}
+
+fn pattern_binds_owned(p: i64) -> bool {
+    unsafe {
+        if p == 0 {
+            return false;
+        }
+        let k = NODES[p].kind;
+        if k == NodeKind::PatBind {
+            return NODES[p].x >= 0 && is_owned_type(LOCALS[NODES[p].x].ty);
+        }
+        if k == NodeKind::PatTuple || k == NodeKind::PatVariant || k == NodeKind::PatOr {
+            for i in 0..NODES[p].count {
+                if pattern_binds_owned(child(p, i)) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+fn eval_match(n: i64, ctx: i64, dst: i64) {
+    unsafe {
+        let mut moves = false;
+        for i in 0..NODES[n].count {
+            if pattern_binds_owned(NODES[child(n, i)].a) {
+                moves = true;
+            }
+        }
+        let v = new_ov();
+        eval(NODES[n].a, if moves { CX_MOVE } else { CX_READ }, v);
+        let entry = new_state();
+        copy_state(entry, CUR);
+        let acc = new_state();
+        for i in 0..NODES[n].count {
+            let arm = child(n, i);
+            copy_state(CUR, entry);
+            let mark = BOUND.count;
+            bind(NODES[arm].a, v);
+            eval(NODES[arm].b, CX_READ, -1);
+            eval(NODES[arm].c, ctx, dst);
+            ev_scope(mark, -1, 0);
+            join_state(acc, CUR);
+        }
+        copy_state(CUR, acc);
+        POOL_TOP = v;
+    }
+}
+
+fn find_frame(lp: i64) -> i64 {
+    unsafe {
+        let mut f = LOOPF.count - 4;
+        while f >= 0 {
+            if LOOPF.data[f] == lp {
+                return f;
+            }
+            f -= 4;
+        }
+        -1
+    }
+}
+
+// The rounds a loop is walked at most before its head is taken as stable.
+const MAX_ROUNDS: i64 = 6;
+
+fn eval_loop(n: i64) {
+    unsafe {
+        let k = NODES[n].kind;
+        let mark = BOUND.count;
+        if k == NodeKind::For {
+            eval(NODES[n].c, CX_READ, -1);
+            bind(NODES[n].b, -1);
+        }
+        let brk = new_state();
+        let cont = new_state();
+        let head = new_state();
+        let exit = new_state();
+        LOOPF.push(n);
+        LOOPF.push(brk);
+        LOOPF.push(cont);
+        LOOPF.push(DEFS.count);
+        let mut round = 0;
+        while round < MAX_ROUNDS {
+            copy_state(head, CUR);
+            set_unreachable(brk);
+            set_unreachable(cont);
+            if k == NodeKind::While {
+                eval(NODES[n].b, CX_READ, -1);
+                copy_state(exit, CUR);
+                eval(NODES[n].c, CX_READ, -1);
+            } else if k == NodeKind::Loop {
+                set_unreachable(exit);
+                eval(NODES[n].b, CX_READ, -1);
+            } else {
+                copy_state(exit, CUR);
+                eval(NODES[n].d, CX_READ, -1);
+            }
+            LOOP_ROUNDS += 1;
+            join_state(CUR, cont);
+            join_state(CUR, head);
+            if same_state(CUR, head) {
+                break;
+            }
+            round += 1;
+        }
+        join_state(exit, brk);
+        copy_state(CUR, exit);
+        LOOPF.count -= 4;
+        BOUND.count = mark;
+        POOL_TOP = brk;
+    }
+}
+
+// The defers (and drops) registered since DEFS[mark], last first.
+fn run_defers(mark: i64) {
+    unsafe {
+        if !reachable(CUR) {
+            return;
+        }
+        let mut i = DEFS.count - 1;
+        IN_DEFER += 1;
+        while i >= mark {
+            let d = DEFS.data[i];
+            if (NODES[d].p & DEFER_IMPLICIT) != 0 {
+                let b = NODES[d].b;
+                ev_drop(if b != 0 { NODES[b].x } else { -1 }, d);
+            } else {
+                eval(NODES[d].a, CX_READ, -1);
+            }
+            i -= 1;
+        }
+        IN_DEFER -= 1;
+    }
+}
+
+// `let __for_seq = v;` of a `for` over an owned place v: __for_seq is v
+// (the loop borrows it), not a move.
+fn for_alias(s: i64) -> bool {
+    unsafe {
+        let pat = NODES[s].a;
+        let init = NODES[s].c;
+        if pat == 0 || init == 0 || NODES[pat].kind != NodeKind::PatBind
+            || NODES[pat].a != SYM_FOR_SEQ || NODES[pat].x < 0 {
+            return false;
+        }
+        let t = NODES[init].ty;
+        if !is_owned_type(t) || !is_place_expr(init) {
+            return false;
+        }
+        let p = place_of(init);
+        if p < 0 {
+            return false;
+        }
+        ev_read(p, init);
+        alias_local(NODES[pat].x, p);
+        views::on_for_alias(NODES[pat].x, p, init);
+        true
+    }
+}
+
+fn eval_block(n: i64, ctx: i64, dst: i64) {
+    unsafe {
+        let mark = BOUND.count;
+        let dmark = DEFS.count;
+        for i in 0..NODES[n].count {
+            if !reachable(CUR) {
+                break;
+            }
+            let s = child(n, i);
+            let k = NODES[s].kind;
+            if k == NodeKind::Let && for_alias(s) {
+                // (`for x in v`: the loop borrows v)
+            } else if k == NodeKind::Let {
+                eval_let(s);
+            } else if k == NodeKind::Defer {
+                DEFS.push(s);
+            } else if k == NodeKind::ExprStmt {
+                eval(NODES[s].a, CX_READ, -1);
+            } else {
+                eval(s, CX_READ, -1);
+            }
+        }
+        let tail = NODES[n].a;
+        if tail != 0 && reachable(CUR) {
+            eval(tail, ctx, dst);
+        }
+        run_defers(dmark);
+        DEFS.count = dmark;
+        ev_scope(mark, dst, tail);
+    }
+}
+
+// `let p = e;`. The checker's own lets read rather than move: structural
+// equality's `let ==l = a;`, a `for` loop's element `let x =
+// __for_seq[i];`. A tuple pattern over a tuple expression binds element by
+// element.
+fn eval_let(s: i64) {
+    unsafe {
+        let pat = NODES[s].a;
+        let init = NODES[s].c;
+        let mut ctx = CX_MOVE;
+        if pat != 0 && NODES[pat].kind == NodeKind::PatBind {
+            let name = NODES[pat].a;
+            if SYMS[name].text.len > 0 && SYMS[name].text[0] == '=' {
+                ctx = CX_READ;
+            }
+        }
+        if init != 0 && NODES[init].kind == NodeKind::Index
+            && (NODES[init].p & NODE_IN_BOUNDS) != 0 {
+            ctx = CX_READ;
+        }
+        if pat != 0 && init != 0 && NODES[pat].kind == NodeKind::PatTuple
+            && NODES[init].kind == NodeKind::Tuple && NODES[pat].count == NODES[init].count {
+            for i in 0..NODES[init].count {
+                let v = new_ov();
+                eval(child(init, i), CX_MOVE, v);
+                bind(child(pat, i), v);
+                POOL_TOP = v;
+            }
+            return;
+        }
+        let v = new_ov();
+        eval(init, ctx, v);
+        bind(pat, v);
+        POOL_TOP = v;
+        if pat != 0 && init != 0 && NODES[pat].kind == NodeKind::PatBind && NODES[pat].x >= 0 {
+            views::on_let(NODES[pat].x, init);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Calls
+
+// The mode of argument i of a call of f (-1: through a fn value: by the
+// argument's type, a pointer taken as the legacy rule takes one).
+fn arg_mode(f: i64, i: i64, arg: i64) -> i64 {
+    unsafe {
+        if f >= 0 {
+            return param_mode(f, i);
+        }
+        let t = NODES[arg].ty;
+        if t <= 0 {
+            return P_VALUE;
+        }
+        if TYPES[t].kind == TyKind::Slice {
+            return if TYPES[t].b == REF_MUT { P_MUT_VIEW } else { P_VIEW };
+        }
+        if TYPES[t].kind == TyKind::Ptr {
+            return if TYPES[t].b == REF_SHARED { P_SHARED } else { P_MUT };
+        }
+        P_VALUE
+    }
+}
+
+// Call n: its arguments left to right as pending entries, then ev_call.
+// An argument `&place` (or a reference passed on) is a loan of the
+// parameter's kind: `&x` and `&mut x` to a `&mut T` or a legacy `*T`
+// parameter are exclusive (§2.3), a `&mut self` receiver is two-phase
+// (PK_RESERVE).
+fn eval_call(n: i64, dst: i64) {
+    unsafe {
+        let f = NODES[n].x - 1;
+        if f < 0 {
+            eval(NODES[n].a, CX_READ, -1);
+        }
+        let base = PEND.count;
+        let mark = POOL_TOP;
+        let c_callee = f >= 0 && FNS[f].is_extern;
+        for i in 0..NODES[n].count {
+            let arg = child(n, i);
+            let at_ty = NODES[arg].ty;
+            let mode = arg_mode(f, i, arg);
+            let o = new_ov();
+            let mut pl = -1;
+            let mut receiver = false;
+            let mut raw = false;
+            let k = NODES[arg].kind;
+            if k == NodeKind::Unary && NODES[arg].op == Tok::Amp && is_place_expr(NODES[arg].b) {
+                let operand = NODES[arg].b;
+                receiver = i == 0 && NODES[arg].start == NODES[operand].start;
+                pl = place_of_make(operand);
+                raw = PO_RAW;
+            } else if k == NodeKind::Ident && is_reference(arg) && at_ty > 0
+                && TYPES[at_ty].kind == TyKind::Ptr {
+                // (a reference passed on: a reborrow)
+                pl = local_place(NODES[arg].y);
+                receiver = i == 0;
+            }
+            if pl >= 0 && !raw {
+                let mut kind = PK_SHARED;
+                if mode == P_MUT {
+                    kind = if receiver { PK_RESERVE } else { PK_MUT };
+                } else if mode == P_RAW || c_callee {
+                    kind = PK_RAW;
+                }
+                ev_read(pl, arg);
+                views::on_borrow(pl, arg, if kind == PK_SHARED { REF_SHARED } else { REF_MUT },
+                    false, o);
+                pend_push(kind, pl, o, arg, mode);
+            } else if pl >= 0 {
+                ev_read(pl, arg);
+                pend_push(PK_RAW, -1, o, arg, mode);
+            } else {
+                eval(arg, CX_MOVE, o);
+                let mut kind = PK_NONE;
+                if c_callee || mode == P_RAW {
+                    kind = PK_RAW;
+                } else if mode == P_MUT_VIEW {
+                    kind = PK_MUT_VIEW;
+                } else if is_view_type(at_ty) {
+                    kind = PK_VIEW;
+                } else if at_ty > 0 && TYPES[at_ty].kind == TyKind::Ptr {
+                    kind = PK_RAW;
+                }
+                pend_push(kind, -1, o, arg, mode);
+            }
+        }
+        if reachable(CUR) {
+            ev_call(n, f, base, dst);
+        }
+        PEND.count = base;
+        POOL_TOP = mark;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A function
+
+fn walk_once(f: i64) {
+    unsafe {
+        CUR_F = f;
+        WALKED += 1;
+        PARAM_LOCALS.count = 0;
+        POOL_TOP = 0;
+        PEND.count = 0;
+        LOOPF.count = 0;
+        DEFS.count = 0;
+        BOUND.count = 0;
+        NO_MOVE = 0;
+        IN_DEFER = 0;
+        PL_OVERFLOW = false;
+        SLOT_OVERFLOW = false;
+        CUR = new_state();
+        POOL[CUR] = 1;
+        let item = FNS[f].node;
+        for i in 0..NODES[item].count {
+            let l = NODES[child(item, i)].x;
+            PARAM_LOCALS.push(l);
+            if l >= 0 {
+                slot_for(l, is_view_type(LOCALS[l].ty));
+            }
+        }
+        views::on_enter(f);
+        let body = NODES[item].c;
+        let v = new_ov();
+        eval(body, CX_MOVE, v);
+        if reachable(CUR) {
+            let tail = NODES[body].a;
+            ev_result(if tail != 0 { tail } else { body }, if tail != 0 { v } else { -1 });
+        }
+    }
+}
+
+// Walks function f (round: which round of its SCC's fixed point, T3) and
+// returns the summary its body makes. A function with more places than
+// one bitset word, or more slots than a state has room for, is walked
+// again, wider; its findings are those of the last walk (diag.tach,
+// own_discard and own_flush, are the driver's).
+pub fn walk_fn(f: i64, round: i64) -> ViewSummary {
+    unsafe {
+        if SYM_FOR_SEQ == 0 {
+            SYM_FOR_SEQ = intern_c(c"__for_seq");
+        }
+        set_words(1);
+        SLOT_CAP = 8;
+        let mut tries = 0;
+        loop {
+            collect_begin(f, round);
+            moves::on_fn(f);
+            walk_once(f);
+            let wide = PL_OVERFLOW && NW == 1;
+            let more = SLOT_OVERFLOW && SLOT_CAP < 1024;
+            reset_places();
+            if !(wide || more) || tries > 4 {
+                break;
+            }
+            crate::front::own::diag::own_discard();
+            if wide {
+                set_words(MAXNW);
+            }
+            if more {
+                SLOT_CAP = SLOT_CAP * 4;
+            }
+            tries += 1;
+        }
+        collect_end(f)
+    }
+}

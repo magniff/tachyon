@@ -1,0 +1,693 @@
+// The own walk's state (0.17, docs/design/value-semantics.md §4 steps 3-4),
+// from the prototype (c17-proto, §8.1) with its apparatus taken out: one
+// origin of two levels per value, slots made on the fly.
+//
+// Places. A place is a root (a local, a static, or a parameter's root:
+// `p`, what the argument points into, and `*p`, what the views it holds
+// point into) and a path of fields; indexes collapse to their base. They
+// are interned per function, at most MAXPL (64, or 512 when a function has
+// more: the walk is redone with NW = 8 words per bitset).
+//
+// Origins (§2.4). An origin value is 2 * NW words: level 1, the places the
+// value's own views point into; level 2, the places the views at level 1
+// point to hold. ov_* below combine them.
+//
+// The state (a pool offset): [reachable] [moved: NW] [definitely moved:
+// NW], then SW words per slot (a view-holding local): its origin (2 * NW),
+// its flags (F_*) and the node that set them. States join at if and match
+// and at loop heads: moved bits and origins OR, definitely-moved bits AND.
+//
+// Pending arguments (§4 step 4, calls): PE words per argument of the call
+// being walked: its kind (PK_*), its place (a loan: `&place`, a reference
+// passed on) or -1, its origin value or -1, whether a later argument
+// invalidated it and by which node, the argument's node, and the
+// parameter's mode (kinds::param_mode).
+//
+// Phase 0 contract: the layout and these functions are fixed; T1 owns the
+// moved bits, T2 the origins, flags and pending entries. A new per-slot or
+// per-state word is a change to this file, made by the lead.
+
+use crate::base::{IntVec, alloc_array, die, realloc};
+use crate::front::check::{LOCALS, LOCAL_COUNT};
+use crate::front::types::STATIC_COUNT;
+
+// ---------------------------------------------------------------------------
+// Places
+
+// Words per bitset (1, or MAXNW when a function has more than 64 places)
+// and the places a bitset holds.
+pub static mut NW: i64 = 1;
+pub static mut MAXPL: i64 = 64;
+pub const MAXNW: i64 = 8;
+
+pub const RK_LOCAL: i64 = 0;
+pub const RK_STATIC: i64 = 1;
+// A parameter's root: PL_FIELD 0 is `p`, 1 is `*p`.
+pub const RK_ROOT: i64 = 2;
+
+pub static mut PL_COUNT: i64 = 0;
+pub static mut PL_RKIND: *i64 = 0 as *i64;
+pub static mut PL_RID: *i64 = 0 as *i64;
+pub static mut PL_PARENT: *i64 = 0 as *i64;
+pub static mut PL_FIELD: *i64 = 0 as *i64;
+// The last node that moved the place (T1's messages).
+pub static mut PL_MOVED_BY: *i64 = 0 as *i64;
+// Per place, NW words: the places it overlaps (itself, its ancestors and
+// descendants).
+pub static mut PL_MASK: *i64 = 0 as *i64;
+// The places that are statics or under one.
+pub static mut STATIC_MASK: *i64 = 0 as *i64;
+// Set when a function has more places than MAXPL: walk_fn walks again,
+// wider.
+pub static mut PL_OVERFLOW: bool = false;
+
+// Per local (a LOCALS index): its place + 1, its roots' places + 1 (`p`,
+// `*p`), its slot + 1; 0: none yet.
+pub static mut LOC_PL: *i64 = 0 as *i64;
+pub static mut LOC_ROOT: *i64 = 0 as *i64;
+pub static mut LOC_ROOT2: *i64 = 0 as *i64;
+pub static mut LOC_SLOT: *i64 = 0 as *i64;
+pub static mut LOC_CAP: i64 = 0;
+static mut TOUCHED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut STATIC_PL: *i64 = 0 as *i64;
+static mut STATIC_TOUCHED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The tables, once (check_own).
+pub fn init_state() {
+    unsafe {
+        if PL_RKIND != 0 as *i64 {
+            return;
+        }
+        PL_RKIND = alloc_array::<i64>(MAXNW * 64);
+        PL_RID = alloc_array::<i64>(MAXNW * 64);
+        PL_PARENT = alloc_array::<i64>(MAXNW * 64);
+        PL_FIELD = alloc_array::<i64>(MAXNW * 64);
+        PL_MOVED_BY = alloc_array::<i64>(MAXNW * 64);
+        PL_MASK = alloc_array::<i64>(MAXNW * 64 * MAXNW);
+        STATIC_MASK = alloc_array::<i64>(MAXNW);
+        STATIC_PL = alloc_array::<i64>(STATIC_COUNT + 1);
+        ensure_locals();
+    }
+}
+
+fn ensure_locals() {
+    unsafe {
+        if LOCAL_COUNT + 1 <= LOC_CAP {
+            return;
+        }
+        let n = LOCAL_COUNT * 2 + 64;
+        let a = alloc_array::<i64>(n);
+        let b = alloc_array::<i64>(n);
+        let c = alloc_array::<i64>(n);
+        let d = alloc_array::<i64>(n);
+        for i in 0..LOC_CAP {
+            a[i] = LOC_PL[i];
+            b[i] = LOC_ROOT[i];
+            c[i] = LOC_ROOT2[i];
+            d[i] = LOC_SLOT[i];
+        }
+        LOC_PL = a;
+        LOC_ROOT = b;
+        LOC_ROOT2 = c;
+        LOC_SLOT = d;
+        LOC_CAP = n;
+    }
+}
+
+fn touch(l: i64) {
+    unsafe {
+        if LOC_PL[l] == 0 && LOC_ROOT[l] == 0 && LOC_ROOT2[l] == 0 && LOC_SLOT[l] == 0 {
+            TOUCHED.push(l);
+        }
+    }
+}
+
+// Forgets the places and slots of the function walked.
+pub fn reset_places() {
+    unsafe {
+        for i in 0..TOUCHED.count {
+            let l = TOUCHED.data[i];
+            LOC_PL[l] = 0;
+            LOC_ROOT[l] = 0;
+            LOC_ROOT2[l] = 0;
+            LOC_SLOT[l] = 0;
+        }
+        TOUCHED.count = 0;
+        for i in 0..STATIC_TOUCHED.count {
+            STATIC_PL[STATIC_TOUCHED.data[i]] = 0;
+        }
+        STATIC_TOUCHED.count = 0;
+        for w in 0..PL_COUNT * NW {
+            PL_MASK[w] = 0;
+        }
+        for w in 0..NW {
+            STATIC_MASK[w] = 0;
+        }
+        PL_COUNT = 0;
+        NSLOT = 0;
+        SLOT_LOCAL.count = 0;
+        SLOT_PARENT.count = 0;
+    }
+}
+
+fn new_place(rkind: i64, rid: i64, parent: i64, field: i64) -> i64 {
+    unsafe {
+        if PL_COUNT >= MAXPL {
+            PL_OVERFLOW = true;
+            return -1;
+        }
+        let p = PL_COUNT;
+        PL_COUNT += 1;
+        PL_RKIND[p] = rkind;
+        PL_RID[p] = rid;
+        PL_PARENT[p] = parent;
+        PL_FIELD[p] = field;
+        PL_MOVED_BY[p] = 0;
+        set_bit(&PL_MASK[p * NW], p);
+        let mut a = parent;
+        while a >= 0 {
+            set_bit(&PL_MASK[p * NW], a);
+            set_bit(&PL_MASK[a * NW], p);
+            a = PL_PARENT[a];
+        }
+        if rkind == RK_STATIC {
+            set_bit(STATIC_MASK, p);
+        }
+        p
+    }
+}
+
+// The place of local l (made on first use), -1 past MAXPL.
+pub fn local_place(l: i64) -> i64 {
+    unsafe {
+        if l < 0 {
+            return -1;
+        }
+        ensure_locals();
+        if LOC_PL[l] != 0 {
+            return LOC_PL[l] - 1;
+        }
+        let p = new_place(RK_LOCAL, l, -1, 0);
+        if p < 0 {
+            return -1;
+        }
+        touch(l);
+        LOC_PL[l] = p + 1;
+        p
+    }
+}
+
+// Parameter l's root: `p` (inner false), what its argument points into;
+// `*p` (inner true), what the views the argument holds point into.
+pub fn root_place(l: i64, inner: bool) -> i64 {
+    unsafe {
+        ensure_locals();
+        let known = if inner { LOC_ROOT2[l] } else { LOC_ROOT[l] };
+        if known != 0 {
+            return known - 1;
+        }
+        let p = new_place(RK_ROOT, l, -1, if inner { 1 } else { 0 });
+        if p < 0 {
+            return -1;
+        }
+        touch(l);
+        if inner {
+            LOC_ROOT2[l] = p + 1;
+        } else {
+            LOC_ROOT[l] = p + 1;
+        }
+        p
+    }
+}
+
+pub fn static_place(s: i64) -> i64 {
+    unsafe {
+        if s < 0 {
+            return -1;
+        }
+        if STATIC_PL[s] != 0 {
+            return STATIC_PL[s] - 1;
+        }
+        let p = new_place(RK_STATIC, s, -1, 0);
+        if p < 0 {
+            return -1;
+        }
+        STATIC_TOUCHED.push(s);
+        STATIC_PL[s] = p + 1;
+        p
+    }
+}
+
+// Whether static s has a place in this function (something borrowed it).
+pub fn static_has_place(s: i64) -> bool {
+    unsafe { s >= 0 && STATIC_PL[s] != 0 }
+}
+
+// The place of field `field` of place parent (a tuple's element i:
+// TUPLE_FIELD + i).
+pub const TUPLE_FIELD: i64 = 1 << 40;
+
+pub fn child_place(parent: i64, field: i64) -> i64 {
+    unsafe {
+        if parent < 0 {
+            return -1;
+        }
+        for q in parent + 1..PL_COUNT {
+            if PL_PARENT[q] == parent && PL_FIELD[q] == field {
+                return q;
+            }
+        }
+        new_place(PL_RKIND[parent], PL_RID[parent], parent, field)
+    }
+}
+
+pub fn root_of(p: i64) -> i64 {
+    unsafe {
+        let mut r = p;
+        while PL_PARENT[r] >= 0 {
+            r = PL_PARENT[r];
+        }
+        r
+    }
+}
+
+// Whether place q is a part of place p.
+pub fn is_below(q: i64, p: i64) -> bool {
+    unsafe {
+        let mut a = PL_PARENT[q];
+        while a >= 0 {
+            if a == p {
+                return true;
+            }
+            a = PL_PARENT[a];
+        }
+        false
+    }
+}
+
+// The local (or static) name of place p's root, for messages; 0: none.
+pub fn place_local(p: i64) -> i64 {
+    unsafe {
+        if p < 0 {
+            return -1;
+        }
+        let r = root_of(p);
+        if PL_RKIND[r] == RK_STATIC { -1 } else { PL_RID[r] }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Slots: the view-holding locals, made when first bound
+
+pub static mut NSLOT: i64 = 0;
+// The slots a state has room for; past it, SLOT_OVERFLOW and walk_fn walks
+// again with twice the room.
+pub static mut SLOT_CAP: i64 = 8;
+pub static mut SLOT_OVERFLOW: bool = false;
+pub static mut SLOT_LOCAL: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// Per slot: the slot it reborrows (`let out = acc[..]`), -1: none.
+pub static mut SLOT_PARENT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// Local l's slot, made when l holds views (its type is a view); -1 when it
+// does not, or past SLOT_CAP.
+pub fn slot_for(l: i64, is_view: bool) -> i64 {
+    unsafe {
+        if l < 0 {
+            return -1;
+        }
+        ensure_locals();
+        if LOC_SLOT[l] != 0 {
+            return LOC_SLOT[l] - 1;
+        }
+        if !is_view {
+            return -1;
+        }
+        if NSLOT >= SLOT_CAP {
+            SLOT_OVERFLOW = true;
+            return -1;
+        }
+        touch(l);
+        LOC_SLOT[l] = NSLOT + 1;
+        SLOT_LOCAL.push(l);
+        SLOT_PARENT.push(-1);
+        NSLOT += 1;
+        NSLOT - 1
+    }
+}
+
+pub fn slot_of_local(l: i64) -> i64 {
+    unsafe {
+        if l < 0 || l >= LOC_CAP {
+            return -1;
+        }
+        LOC_SLOT[l] - 1
+    }
+}
+
+// The slot of place p's root local, or -1.
+pub fn slot_of_place(p: i64) -> i64 {
+    unsafe {
+        if p < 0 || PL_RKIND[p] != RK_LOCAL {
+            return -1;
+        }
+        slot_of_local(PL_RID[p])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bitsets of NW words
+
+pub fn set_bit(b: *i64, i: i64) {
+    unsafe { b[i >> 6] = b[i >> 6] | (1 << (i & 63)); }
+}
+
+pub fn clear_bit(b: *i64, i: i64) {
+    unsafe { b[i >> 6] = b[i >> 6] & ~(1 << (i & 63)); }
+}
+
+pub fn get_bit(b: *i64, i: i64) -> bool {
+    unsafe { (b[i >> 6] & (1 << (i & 63))) != 0 }
+}
+
+pub fn any_and(a: *i64, b: *i64) -> bool {
+    unsafe {
+        if NW == 1 {
+            return (a[0] & b[0]) != 0;
+        }
+        for w in 0..NW {
+            if (a[w] & b[w]) != 0 {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+pub fn is_empty(a: *i64) -> bool {
+    unsafe {
+        for w in 0..NW {
+            if a[w] != 0 {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+pub fn or_into(d: *i64, s: *i64) {
+    unsafe {
+        if NW == 1 {
+            d[0] = d[0] | s[0];
+            return;
+        }
+        for w in 0..NW {
+            d[w] = d[w] | s[w];
+        }
+    }
+}
+
+// d |= the places overlapping some place of s.
+pub fn or_expanded(d: *i64, s: *i64) {
+    unsafe {
+        for w in 0..NW {
+            let mut bits = s[w];
+            let mut i = w * 64;
+            while bits != 0 {
+                if (bits & 1) != 0 && i < PL_COUNT {
+                    or_into(d, &PL_MASK[i * NW]);
+                }
+                bits = (bits >> 1) & 0x7fffffffffffffff;
+                i += 1;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The pool: states, origin values and masks, allocated as a stack (a
+// caller resets POOL_TOP to what it was)
+
+pub static mut POOL: *i64 = 0 as *i64;
+pub static mut POOL_TOP: i64 = 0;
+static mut POOL_CAP: i64 = 0;
+
+// n zeroed words; their offset.
+pub fn alloc(n: i64) -> i64 {
+    unsafe {
+        if POOL_TOP + n > POOL_CAP {
+            let cap = (POOL_CAP + n) * 2 + 4096;
+            POOL = realloc(POOL as *u8, (cap * 8) as u64) as *i64;
+            if POOL == 0 as *i64 {
+                die(c"out of memory");
+            }
+            POOL_CAP = cap;
+        }
+        let off = POOL_TOP;
+        POOL_TOP += n;
+        for i in off..POOL_TOP {
+            POOL[i] = 0;
+        }
+        off
+    }
+}
+
+// The words at pool offset off (valid until the pool grows: use at once).
+pub fn at(off: i64) -> *i64 {
+    unsafe { &POOL[off] }
+}
+
+// ---------------------------------------------------------------------------
+// The state
+
+pub const S_MOVED: i64 = 1;
+pub static mut S_DMOVED: i64 = 2;
+pub static mut S_SLOTS: i64 = 3;
+// An origin value's words, and a slot's (its origin, flags, reason).
+pub static mut OV: i64 = 2;
+pub static mut SW: i64 = 4;
+
+// Slot flags: invalidated (something wrote, moved, dropped or mutably
+// borrowed a place it views), by a call writing statics, by its owner's
+// scope ending.
+pub const F_INVALID: i64 = 1;
+pub const F_STATIC: i64 = 2;
+pub const F_SCOPE: i64 = 4;
+
+pub fn set_words(nw: i64) {
+    unsafe {
+        NW = nw;
+        MAXPL = nw * 64;
+        S_DMOVED = 1 + nw;
+        S_SLOTS = 1 + 2 * nw;
+        OV = 2 * nw;
+        SW = 2 * nw + 2;
+    }
+}
+
+// The current state.
+pub static mut CUR: i64 = 0;
+
+pub fn state_size() -> i64 {
+    unsafe { S_SLOTS + SLOT_CAP * SW }
+}
+
+// The offset of slot s's words in state st (its origin value first).
+pub fn slot_off(st: i64, s: i64) -> i64 {
+    unsafe { st + S_SLOTS + s * SW }
+}
+
+// The offset of slot s's flags in the current state (the reason next).
+pub fn slot_flags(s: i64) -> i64 {
+    unsafe { slot_off(CUR, s) + OV }
+}
+
+pub fn new_state() -> i64 {
+    alloc(state_size())
+}
+
+pub fn copy_state(dst: i64, src: i64) {
+    unsafe {
+        // (the slots made so far: a state's later slots are still empty)
+        for i in 0..S_SLOTS + NSLOT * SW {
+            POOL[dst + i] = POOL[src + i];
+        }
+    }
+}
+
+pub fn reachable(st: i64) -> bool {
+    unsafe { POOL[st] != 0 }
+}
+
+pub fn set_unreachable(st: i64) {
+    unsafe { POOL[st] = 0; }
+}
+
+// dst := dst ⊔ src.
+pub fn join_state(dst: i64, src: i64) {
+    unsafe {
+        if POOL[src] == 0 {
+            return;
+        }
+        if POOL[dst] == 0 {
+            copy_state(dst, src);
+            return;
+        }
+        for w in 0..NW {
+            POOL[dst + S_MOVED + w] = POOL[dst + S_MOVED + w] | POOL[src + S_MOVED + w];
+            POOL[dst + S_DMOVED + w] = POOL[dst + S_DMOVED + w] & POOL[src + S_DMOVED + w];
+        }
+        for s in 0..NSLOT {
+            let d = slot_off(dst, s);
+            let r = slot_off(src, s);
+            for w in 0..OV + 1 {
+                POOL[d + w] = POOL[d + w] | POOL[r + w];
+            }
+            if POOL[d + OV + 1] == 0 {
+                POOL[d + OV + 1] = POOL[r + OV + 1];
+            }
+        }
+    }
+}
+
+// Whether states a and b are the same (the reasons aside): a loop's head
+// is stable.
+pub fn same_state(a: i64, b: i64) -> bool {
+    unsafe {
+        for i in 0..S_SLOTS + NSLOT * SW {
+            if POOL[a + i] != POOL[b + i] {
+                let rel = i - S_SLOTS;
+                if rel >= 0 && rel % SW == OV + 1 {
+                    continue;
+                }
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// The moved bits of the current state.
+pub fn moved_bits() -> *i64 {
+    unsafe { at(CUR + S_MOVED) }
+}
+
+pub fn dmoved_bits() -> *i64 {
+    unsafe { at(CUR + S_DMOVED) }
+}
+
+// ---------------------------------------------------------------------------
+// Origin values
+
+pub fn new_ov() -> i64 {
+    unsafe { alloc(OV) }
+}
+
+// Level 1 (what the value's views point into) and level 2 (what the views
+// those point to hold) of origin value o.
+pub fn l1(o: i64) -> *i64 {
+    at(o)
+}
+
+pub fn l2(o: i64) -> *i64 {
+    unsafe { at(o + NW) }
+}
+
+pub fn ov_or(dst: i64, src: i64) {
+    unsafe {
+        if dst < 0 || src < 0 {
+            return;
+        }
+        for w in 0..OV {
+            POOL[dst + w] = POOL[dst + w] | POOL[src + w];
+        }
+    }
+}
+
+pub fn ov_copy(dst: i64, src: i64) {
+    unsafe {
+        for w in 0..OV {
+            POOL[dst + w] = POOL[src + w];
+        }
+    }
+}
+
+pub fn ov_clear(dst: i64) {
+    unsafe {
+        for w in 0..OV {
+            POOL[dst + w] = 0;
+        }
+    }
+}
+
+// dst's level 1 gets src's level 2: an element read out of what src views.
+pub fn ov_inner(dst: i64, src: i64) {
+    unsafe {
+        if dst < 0 || src < 0 {
+            return;
+        }
+        or_into(l1(dst), l2(src));
+        or_into(l2(dst), l2(src));
+    }
+}
+
+// Whether origin o views a place of mask (at either level).
+pub fn ov_hits(o: i64, mask: *i64) -> bool {
+    unsafe { any_and(l1(o), mask) || any_and(l2(o), mask) }
+}
+
+// ---------------------------------------------------------------------------
+// Pending arguments
+
+pub const PE: i64 = 7;
+pub const PE_KIND: i64 = 0;
+pub const PE_PLACE: i64 = 1;
+pub const PE_OV: i64 = 2;
+pub const PE_INVALID: i64 = 3;
+pub const PE_BY: i64 = 4;
+pub const PE_NODE: i64 = 5;
+pub const PE_MODE: i64 = 6;
+
+// No loan and no view; a shared loan; a `&mut self` receiver (two-phase:
+// reserved during the arguments, active at the call); an exclusive loan;
+// a view (a slice, a view struct); an exclusive view (`&mut [T]`); raw (a
+// raw pointer, or what C is given: its origin counts for the result, not
+// for conflicts).
+pub const PK_NONE: i64 = 0;
+pub const PK_SHARED: i64 = 1;
+pub const PK_RESERVE: i64 = 2;
+pub const PK_MUT: i64 = 3;
+pub const PK_VIEW: i64 = 4;
+pub const PK_MUT_VIEW: i64 = 5;
+pub const PK_RAW: i64 = 6;
+
+pub static mut PEND: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+pub fn pend_push(kind: i64, place: i64, ov: i64, node: i64, mode: i64) {
+    unsafe {
+        PEND.push(kind);
+        PEND.push(place);
+        PEND.push(ov);
+        PEND.push(0);
+        PEND.push(0);
+        PEND.push(node);
+        PEND.push(mode);
+    }
+}
+
+// The name of local l, for messages.
+pub fn local_name(l: i64) -> i64 {
+    unsafe { if l < 0 { 0 } else { LOCALS[l].name } }
+}
+
+// Local l (a `for` loop's sequence, `__for_seq`) is place p: the loop
+// reads v through it, it does not move v.
+pub fn alias_local(l: i64, p: i64) {
+    unsafe {
+        if l < 0 || p < 0 {
+            return;
+        }
+        ensure_locals();
+        touch(l);
+        LOC_PL[l] = p + 1;
+    }
+}

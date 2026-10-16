@@ -40,7 +40,7 @@ on the command line make one program; `mod name;` loads `name.tach`.
 | Rust | tachyon |
 |---|---|
 | `String`, `&str` | `[u8]`, a byte slice: `"text"` is a `[u8]`; build text with `std::Buf`; `c"text"` is a NUL-terminated `*u8` for C |
-| `&T`, `&mut T`, `Box<T>` | `*T`, one raw pointer type; `&x` takes an address; no lifetimes, no borrow checker |
+| `&T`, `&mut T`, `Box<T>` | `&T`, `&mut T` (0.17): `&x`, `&mut x`, reading through one is safe; no lifetimes; `*T` is the raw pointer (a `*T` parameter is a borrow); no `Box` |
 | `fn f(&self)`, `fn f(&mut self)` | `fn f(self: *T)` (may write through it); `fn f(self: T)` takes a copy |
 | `use m::*;` | not allowed: `use m::{a, b};`, or the path `m::a` |
 | `println!("{}", x)`, `format!` | no macros: `println(f"x = {x:>4} {v:?}")`, `format_in(f"..", gpa)` (a `Buf`) (`guide formatting`) |
@@ -406,7 +406,7 @@ and linking: `guide c-interop`.
 | error (short form) | fix |
 |---|---|
 | `unknown type 'String'` (or `char`, `Box`) | `[u8]`, `u8`, `*T` or `Vec<T>` |
-| `expected type, got '&'`; `expected identifier, got '&'` | `*T` for `&T`, `&mut T`; `self: *T` |
+| `expected type, got '&'`; `expected identifier, got '&'` | `[u8]` for `&str`; `self: &T`, `self: &mut T` or `self: *T` |
 | `cannot infer the type of closure parameter 'x'` | `\|x: i64\| ...`, or pass it where an `Fn` bound or `fn` type gives it |
 | `'?' needs 'f' to return Option or Result` | `fn f(..) -> Option<T>` or `-> Result<T, E>` |
 | `'println!' is a macro call` | no macros: `println(f"{x}")` |

@@ -239,11 +239,12 @@ printf '%s\n' "$out" | grep -q '^made module report' \
     && printf '%s\n' "$out" | grep -q "^crate::report::helper${TAB}report.tach:1:8${TAB}" && ok=1
 check module_path_without_crate "$ok" "$out"
 # explain (0.13): every code the compiler's source can print has an
-# entry: the tools' codes (`c"query.no-match"`), the kinds of the
+# entry: the tools' codes (`c"query.no-match"`; 0.17: the own pass's,
+# `c"own.moved"`), the kinds of the
 # compiler's errors (ERR_KIND) and warnings and keyed errors (their
 # third argument); and every entry is such a code.
 {
-    grep -rhoE 'c"(query|edit|patch|undo|check|fix|lint|fmt|same-output|refactor|rewrite|explain|batch|conflict|try|test|probe|reduce)\.[a-z0-9-]+"' \
+    grep -rhoE 'c"(query|edit|patch|undo|check|fix|lint|fmt|same-output|refactor|rewrite|explain|batch|conflict|try|test|probe|reduce|own)\.[a-z0-9_-]+"' \
         compiler/src
     grep -rhoE 'ERR_KIND = c"[^"]*"' compiler/src
     grep -rhoE 'report_(warning|error_once)\([^,]*, [^,]*, c"[^"]*"' compiler/src
@@ -261,4 +262,8 @@ while IFS= read -r code; do
 done <"$WORK/codes"
 check self_explain "$([ "$(wc -l <"$WORK/codes")" -ge 90 ] && [ -z "$missing$extra$bad" ] && echo 1)" \
     "$(wc -l <"$WORK/codes") codes; no entry:$(echo $missing); not a code:$(echo $extra); bad:$bad"
+# The own pass (0.17, front/own): compiler/src walks clean under
+# --values=report (the default only walks when its findings are printed).
+out=$(TACHYON_CACHE="$WORK/owncache" "$COMPILER" check --values=report compiler/src/main.tach 2>&1)
+check own_report_compiler "$(printf '%s\n' "$out" | grep -q '^own: 0 findings' && echo 1)" "$out"
 exit $STATUS

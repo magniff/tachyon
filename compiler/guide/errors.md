@@ -57,22 +57,23 @@ write; another unknown method, the type's nearest methods and `tachyonc
 query items TYPE`, which lists them all.
 
 ```tach
-fn get(x: &i64) -> i64 { *x }
+fn count(s: &str) -> i64 { s.len }
 ```
 ```err
-error[parser error] expected type, got '&' | help: write `*T`: one pointer type for `&T` and `&mut T`
+error[parser error] expected type, got '&' | help: `&str` is `[u8]` in tachyon: a slice of bytes, as string literals are
 ```
-`*i64`; `&str` is `[u8]`. In an expression, `&mut x` is `&x`.
+`&T` and `&mut T` are references (0.17): `&x` and `&mut x` take them,
+and reading through one is safe; `*T` is the raw pointer.
 
 ```tach
 struct P { x: i64 }
 impl P { fn get(&self) -> i64 { self.x } }
 ```
 ```err
-error[parser error] expected identifier, got '&' | help: write the type of self: `self: *T` (a pointer: `&self`, `&mut self`) or `self: T` (a copy)
+error[parser error] expected identifier, got '&' | help: write the type of self: `self: &Self` for `&self`, `self: &mut Self` for `&mut self`, or `self: Self` (a copy)
 ```
-`fn get(self: *P) -> i64`; `fn get(self)` is an error too: write
-`self: P` for a copy.
+`fn get(self: &P) -> i64` (`self: *P` still works); `fn get(self)` is
+an error too: write `self: P` for a copy.
 
 ```tach
 println!("{}", 1);
@@ -643,7 +644,7 @@ the `try:`, `tachyonc fix --only alloc016 main.tach`, threads main's
 struct P { x: i64 }
 fn main() -> i32 {
     let mut p = P { x: 1 };
-    let q = &p;
+    let q: *P = &p;
     q.x = 9;
     0
 }
@@ -651,8 +652,9 @@ fn main() -> i32 {
 ```err
 error[unsafe] access to a field through a raw pointer is unsafe
 ```
-A local holding a pointer is raw. Use `p.x = 9;`, or pass `&p` to a
-function taking `*P` (a borrow, safe there).
+A local holding a raw pointer (`let q: *P = &p;`) is raw. Use `p.x = 9;`,
+keep a reference (`let q = &mut p;`, 0.17), or pass `&mut p` to a
+function taking `&mut P` (or `*P`: a borrow, safe there).
 
 ```tach
 struct P { x: i64 }
