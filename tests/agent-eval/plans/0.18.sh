@@ -8,7 +8,18 @@
 #   STEP=estimate sh tests/agent-eval/plans/0.18.sh   # the run count and cost, nothing run
 #   STEP=P MODELS=claude:haiku sh tests/agent-eval/plans/0.18.sh
 #
-# Environment:
+# (0.18.1) The same round again with another compiler and guide text,
+# everything else as it was (tasks, conditions, reps, models), its
+# results beside the first round's and compared with them:
+#
+#   ROUND=0.18-polish sh tests/agent-eval/plans/0.18.sh --compiler target/tachyonc
+#
+# Environment (or --compiler PATH for TACHYONC):
+#   ROUND       the round's name (default 0.18): results in $OUT/ROUND-P-*,
+#               ROUND-C-*, reports docs/eval/ROUND-*.md, and ROUND-manifest.txt
+#               (the compiler's md5 and version, the commit, the prompts' md5s)
+#   PREV        another round's results to compare with (default, when ROUND
+#               is not 0.18: $BASE/0.18, holding 0.18-P-claude-*)
 #   BASE        the earlier rounds (default: the main checkout's
 #               .claude/briefs/evalruns): 0.16/ (rust), 0.17-validation/,
 #               iter/03-night017/
@@ -26,6 +37,13 @@
 #               | estimate | check | dry | P | C | report
 set -eu
 cd "$(dirname "$0")/../../.."
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --compiler) [ $# -ge 2 ] || { echo "plan: --compiler needs a path" >&2; exit 2; }; TACHYONC=$2; shift 2 ;;
+        --compiler=*) TACHYONC=${1#--compiler=}; shift ;;
+        *) echo "plan: unknown argument '$1' (--compiler PATH; the rest is environment)" >&2; exit 2 ;;
+    esac
+done
 RUN=tests/agent-eval/run.py
 main=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
 BASE=${BASE:-$main/.claude/briefs/evalruns}
@@ -39,6 +57,9 @@ JOBS=${JOBS:-6}
 CJOBS=${CJOBS:-2}
 OUT=${OUT:-tests/agent-eval/results}
 STEP=${STEP:-all}
+ROUND=${ROUND:-0.18}
+if [ "$ROUND" = 0.18 ]; then PREV=${PREV:-}; else PREV=${PREV-$BASE/0.18}; fi
+[ -x "$TACHYONC" ] || { echo "plan: no compiler at $TACHYONC" >&2; exit 2; }
 
 # The tasks: iteration 1's seven (01, 03, 06 from a spec; 08, 10, 16, 17
 # on existing code), the 0.17 rounds' comparison set, and three where
@@ -120,12 +141,12 @@ fi
 # No model: every cell's prompt, debrief prompt, command line and hooks
 if want dry; then
     say "dry run"
-    rm -rf "$OUT/0.18-dry"
+    rm -rf "$OUT/$ROUND-dry"
     $RUN run --model claude:haiku --set programs --tasks 01-wordfreq --tachyonc "$TACHYONC" \
-        --cond "$PCONDS" --dry-run --selfcheck none --out "$OUT/0.18-dry"
+        --cond "$PCONDS" --dry-run --selfcheck none --out "$OUT/$ROUND-dry"
     $RUN run --model claude:haiku --set compiler --tasks "${CTASKS%%,*}" --base "$CBASE" \
-        --cond "$CCONDS" --dry-run --selfcheck none --out "$OUT/0.18-dry"
-    python3 - "$OUT/0.18-dry" <<'PY'
+        --cond "$CCONDS" --dry-run --selfcheck none --out "$OUT/$ROUND-dry"
+    python3 - "$OUT/$ROUND-dry" <<'PY'
 import json, os, sys
 bad = 0
 for root, _, files in os.walk(sys.argv[1]):
@@ -146,13 +167,31 @@ sys.exit(1 if bad else 0)
 PY
 fi
 
+# (0.18.1) What this round ran with: the compiler (the binaudit of the
+# report step checks every run used it), the commit, the prompts.
+manifest() {
+    mkdir -p "$OUT"
+    {
+        echo "round $ROUND"
+        echo "tachyonc $TACHYONC $(md5 -q "$TACHYONC" 2>/dev/null || md5sum "$TACHYONC" | cut -d' ' -f1)"
+        echo "version $("$TACHYONC" --version 2>/dev/null)"
+        echo "commit $(git rev-parse HEAD)$(git diff --quiet HEAD -- tests/agent-eval || echo ' (tests/agent-eval changed)')"
+        for f in tests/agent-eval/prompts/*.md; do
+            echo "prompt $(basename "$f") $(md5 -q "$f" 2>/dev/null || md5sum "$f" | cut -d' ' -f1)"
+        done
+    } >"$OUT/$ROUND-manifest.txt"
+}
+if want P || want C; then
+    manifest
+fi
+
 # P. the program tasks: the default guide and its Rust twin, with the debrief
 if want P; then
     for m in $MODELS; do
         say "P: $m $PCONDS on $(count "$TASKS") tasks x $(reps_for "$m")"
         $RUN run --model "$m" --set programs --tasks "$TASKS" --cond "$PCONDS" \
             --reps "$(reps_for "$m")" --jobs "$JOBS" --tachyonc "$TACHYONC" \
-            --out "$OUT/0.18-P-$(slug "$m")" &
+            --out "$OUT/$ROUND-P-$(slug "$m")" &
         pids="$pids $!"
     done
     wait_all
@@ -163,18 +202,18 @@ if want C; then
     for m in $MODELS; do
         say "C: $m $CCONDS on $CTASKS ($CBASE) x $(reps_for "$m")"
         $RUN run --model "$m" --set compiler --tasks "$CTASKS" --base "$CBASE" --cond "$CCONDS" \
-            --reps "$(reps_for "$m")" --jobs "$CJOBS" --out "$OUT/0.18-C-$(slug "$m")" &
+            --reps "$(reps_for "$m")" --jobs "$CJOBS" --out "$OUT/$ROUND-C-$(slug "$m")" &
         pids="$pids $!"
     done
     wait_all
 fi
 
-# The reports: docs/eval/0.18-*.md
+# The reports: docs/eval/$ROUND-*.md
 if want report; then
     say "reports"
     dirs() { for d in "$@"; do [ -d "$d" ] && printf '%s ' "$d"; done; }
-    p=$(dirs "$OUT"/0.18-P-*)
-    c=$(dirs "$OUT"/0.18-C-*)
+    p=$(dirs "$OUT"/"$ROUND"-P-*)
+    c=$(dirs "$OUT"/"$ROUND"-C-*)
     n17=$BASE/iter/03-night017
     v17=$(dirs "$BASE"/0.17-validation/0.17v-A-claude-*)
     tasks_short=$(echo "$TASKS" | tr ',' '\n' | cut -c1-2 | paste -sd, -)
@@ -191,24 +230,41 @@ if want report; then
         # (the 0.17 iterations' denominator), with the 0.17 cells beside
         $RUN costx --rust $rust18 --tasks "$tasks_short" --cell "G 0.18=$g18" \
             --cell "G night-017=$n17:$G" ${v17c:+--cell "guide-core 0.17v=$v17c"} \
-            --md docs/eval/0.18-costx.md
+            --md docs/eval/$ROUND-costx.md
         $RUN costx --rust "$BASE/0.16:rust" --tasks "$tasks_short" --cell "G 0.18=$g18" \
             --cell "rust 0.18=$(echo $rust18 | tr ' ' ',')" --cell "G night-017=$n17:$G" \
-            ${v17c:+--cell "guide-core 0.17v=$v17c"} --md docs/eval/0.18-costx-rust016.md
+            ${v17c:+--cell "guide-core 0.17v=$v17c"} --md docs/eval/$ROUND-costx-rust016.md
         # per task, paired, with the anatomy's means
         $RUN compare --baseline "$n17" --new $p --pairs "$G+debrief=$G" \
-            --md docs/eval/0.18-vs-night017.md
+            --md docs/eval/$ROUND-vs-night017.md
         [ -n "$v17" ] && $RUN compare --baseline $v17 --new $p --pairs "$G+debrief=guide-core" \
-            --md docs/eval/0.18-vs-0.17v.md
+            --md docs/eval/$ROUND-vs-0.17v.md
         $RUN compare --baseline $p --new $p --pairs "$G+debrief=new:rust+debrief" \
-            --md docs/eval/0.18-vs-rust.md
+            --md docs/eval/$ROUND-vs-rust.md
+    fi
+    # (0.18.1) against an earlier round (PREV): the same cells, by task
+    if [ -n "$PREV" ] && [ -n "$p" ]; then
+        pp=$(dirs "$PREV"/0.18-P-*)
+        if [ -n "$pp" ]; then
+            prev_g=""; prev_r=""
+            for d in $pp; do prev_g="$prev_g${prev_g:+,}$d:$G"; prev_r="$prev_r $d:rust"; done
+            $RUN costx --rust $rust18 --tasks "$tasks_short" --cell "G $ROUND=$g18" \
+                --cell "G 0.18=$prev_g" --cell "rust 0.18 (as G)=$(echo $prev_r | tr ' ' ',')" \
+                --md docs/eval/$ROUND-costx-vs-0.18.md
+            $RUN compare --baseline $pp --new $p --pairs "$G+debrief=$G+debrief,rust+debrief=rust+debrief" \
+                --md docs/eval/$ROUND-vs-0.18.md
+        fi
+        pc=$(dirs "$PREV"/0.18-C-*)
+        [ -n "$pc" ] && [ -n "$c" ] && $RUN compare --baseline $pc --new $c \
+            --pairs "compiler-tools-core+hook+rewrite+debrief=compiler-tools-core+hook+rewrite+debrief" \
+            --md docs/eval/$ROUND-compiler-vs-0.18.md
     fi
     [ -n "$c" ] && $RUN compare --baseline $c --new $c \
         --pairs "compiler-tools-core+hook+rewrite+debrief=new:compiler-plain+debrief" \
-        --md docs/eval/0.18-compiler.md
-    all=$(dirs "$OUT"/0.18-P-* "$OUT"/0.18-C-*)
-    [ -n "$all" ] && $RUN report $all --md docs/eval/0.18-results.md
-    [ -n "$all" ] && $RUN debrief $all --md docs/eval/0.18-debrief.md
+        --md docs/eval/$ROUND-compiler.md
+    all=$(dirs "$OUT"/"$ROUND"-P-* "$OUT"/"$ROUND"-C-*)
+    [ -n "$all" ] && $RUN report $all --md docs/eval/$ROUND-results.md
+    [ -n "$all" ] && $RUN debrief $all --md docs/eval/$ROUND-debrief.md
     } || true
 fi
 say "done"
