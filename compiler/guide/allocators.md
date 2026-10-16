@@ -40,7 +40,10 @@ allocated has an `_in` form taking the allocator last: `Vec::new_in(a)`,
 `with_capacity_in(n, a)`, `filled_in(n, x, a)`, `Buf::new_in(a)`,
 `HashMap::new_in(a)`, `it.collect_in(a)`, `format_in(x, a)`,
 `read_stdin_in(a)`, `split_in(s, sep, a)`, `split_whitespace_in(s, a)`,
-`sort_stable_in(s, a)`, `sort_stable_by_in(s, f, a)`, `v.clone_in(b)`.
+`sort_stable_in(s, a)`, `sort_stable_by_in(s, f, a)`, `v.clone_in(b)`,
+`BinaryHeap::new_in(a)`. The allocator is always the last argument, as
+in Rust's allocator API (`Vec::with_capacity_in(cap, alloc)`), except
+before a closure that is given it: `arena_scope(gpa, |a| ..)`.
 The 0.15 forms are errors that name the `_in` form:
 
 ```tach

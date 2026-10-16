@@ -382,7 +382,8 @@ fi
 # as `Self`, no comments, nothing of std's own workings, within about
 # 4k tokens (under the 30000 characters an agent's shell shows whole;
 # 0.18: 18500 bytes, for the assertions, Arbitrary and Gen, NonNull;
-# 0.18.1: 20000, its first page longer and no longer read by default);
+# 0.18.1: 21000, its first page longer and no longer read by default,
+# the heaps' section, Vec's sort_by_key, retain, contains, first);
 # std#every-item is not in it. (0.18.1) `guide std` alone is its first
 # page: the most used names and where the rest is (std#the-api), 4500
 # bytes at most (the 0.18 eval's agents read all 18k of it before
@@ -390,11 +391,11 @@ fi
 "$COMPILER" guide std >"$WORK/std-page.md" 2>&1
 size=$(wc -c <"$WORK/topic-std.md" | tr -d ' ')
 page=$(wc -c <"$WORK/std-page.md" | tr -d ' ')
-if [ "$size" -le 20000 ] && [ "$page" -le 4500 ] \
+if [ "$size" -le 21000 ] && [ "$page" -le 4500 ] \
     && head -1 "$WORK/std-page.md" | grep -q '^# std$' \
     && grep -q '^## The most used$' "$WORK/std-page.md" \
     && grep -qF 'Vec::new_in(gpa) -> Vec<T>' "$WORK/std-page.md" \
-    && grep -qF 'tachyonc guide std#the-api' "$WORK/std-page.md" \
+    && grep -qF 'tachyonc guide std#the-api' "$WORK/std-page.md" && grep -qF 'MinHeap::new_in(gpa)' "$WORK/std-page.md" \
     && ! grep -q '^## Overview$' "$WORK/std-page.md" && ! grep -q '@PAGE-END@' "$WORK/std-page.md" "$WORK/topic-std.md" \
     && grep -q '^## Overview$' "$WORK/topic-std.md" && grep -qF 'fn push(self: &mut Self, x: T)' "$WORK/topic-std.md" \
     && grep -qF 'fn split_in<A: Allocator>(s: [u8], sep: u8, a: A) -> Vec<[u8], A>' "$WORK/topic-std.md" \
@@ -405,7 +406,7 @@ if [ "$size" -le 20000 ] && [ "$page" -le 4500 ] \
     && grep -q '^## Every item with its comment$' "$WORK/std/every.md"; then
     result pass guide-std-index
 else
-    result FAIL guide-std-index "tachyonc guide std --whole is $size bytes (20000 at most), its first page $page (4500 at most), or not the index (most used first, then std#the-api)"
+    result FAIL guide-std-index "tachyonc guide std --whole is $size bytes (21000 at most), its first page $page (4500 at most), or not the index (most used first, then std#the-api)"
 fi
 
 # The guide by piece (0.15): --find prints the paragraphs about the

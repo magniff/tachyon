@@ -31,8 +31,8 @@ fn main(gpa: Gpa) -> i32 {                // Rust: fn main()   gpa: the allocato
 }
 ```
 
-The prelude (`Vec`, `Buf`, `HashMap`, `Scanner`, `read_line`,
-`parse_int`, `split_in`, `sort`, `cmp_of`, ...) needs no `use`; the rest:
+The prelude (`Vec`, `Buf`, `HashMap`, `MinHeap`, `Scanner`,
+`read_line`, `parse_int`, `split_in`, `sort`, `cmp_of`, ...) needs no `use`; the rest:
 `use std::{is_digit};`. Only constructors and `_in` functions take an
 allocator: pass `gpa` down from main as a parameter.
 

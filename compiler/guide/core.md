@@ -63,7 +63,7 @@ fn main(gpa: Gpa) -> i32 {             // gpa: the program's allocator; 0 = exit
     if s == "hi" && !is_digit(first(s)) { println(first(s)); }   // compared, not matched
     // Rust: *m.entry(k).or_insert(0) += 1;
     let mut m: HashMap<[u8], i64> = HashMap::new_in(gpa);
-    m.get_or_insert("k", 0)[0] += 1;
+    m.get_or_insert("k", 0)[0] += 1;   // a one-element view: [0] is the value
     // Rust: !x on an integer; x.abs(); 7 / 0 panics
     let z = 0;
     println(f"{~0u8} {7 / z} {m.get("k").unwrap()}");   // ~x; no methods on numbers; x / 0 == 0
@@ -88,7 +88,7 @@ Trait`, `#[derive(Eq, Debug)]` are Rust's; no `dyn`, `where`, `Box` (a
 `Vec` or `*T`); `&x` and `&mut x` are references (`&T`, `&mut T`,
 0.17), and `p.0`, `p.x` reach through a reference or a pointer. Arguments may have defaults and names: `fn f(a: i64, b: i64 =
 2)`, `f(1, b: 3)`. The prelude (no `use`) has `Option`, `Result`, `Vec`,
-`Buf`, `HashMap`, `print`, `println`, `format_in`, `Gpa`, `read_line`,
+`Buf`, `HashMap`, `BinaryHeap` and `MinHeap` (priority queues: `pop` the largest, the smallest), `print`, `println`, `format_in`, `Gpa`, `read_line`,
 `read_stdin_in`, `Scanner`, `parse_int`, `trim`, `split_in`,
 `split_whitespace_in`, `sort`, `sort_by`, `sort_stable_by`, `cmp_of`, `Fmt`, `panic`,
 `unreachable`; the rest of std is `use std::{...}`; `use lexer::Tok;`
