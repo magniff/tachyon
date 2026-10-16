@@ -142,7 +142,8 @@ value (`Vec`, `Buf`, `HashMap`, a struct holding one) moves: after `let
 w = v;` or `f(v)`, `v` is dead (`own.moved`); take `v: &Vec<T>` (`&mut`
 to change it) and pass `&v` (`&mut v`), or `.clone()`. A reference kept
 in a local (`let p = &mut st;`) is passed on as `p`, any number of
-times. A slice of `v` is a view: take it again after `v` grows. std's API, a line per item: `tachyonc guide std`; one name
+times. `&f(x)` makes a temporary that lives to the end of the block
+(0.18.1). A slice of `v` is a view: take it again after `v` grows. std's API, a line per item: `tachyonc guide std`; one name
 with its comment: `tachyonc guide --find split_in`.
 
 ## The first errors and their fixes

@@ -4,7 +4,7 @@
 // arrays, the binary and unary operators, and the layout queries
 // (`size_of`, `align_of`) folded to constants.
 
-use crate::base::{SRC, buf_fmt, buf_new, buf_slice, buf_uint, intern_c};
+use crate::base::{SRC, buf_bytes, buf_fmt, buf_new, buf_slice, buf_uint, intern_c};
 use crate::base::diag::{
     ERR, err_begin, err_end, err_end_soft, err_fix, err_fmt, err_help, err_help_fmt, err_help_sym,
     err_int, err_str, err_sym, err_try_fmt,
@@ -35,10 +35,11 @@ use crate::front::check::iterate::range_value;
 use crate::front::check::names::{NODE_RESOLVED, near_to, synth_name};
 use crate::front::check::resolve::resolve_type;
 use crate::front::check::sealed::{check_field, len_reads_as_method};
+use crate::front::check::temps::NODE_TEMP;
 use crate::front::check::try_op::check_try;
 use crate::front::check::unsafety::{
-    NODE_NO_READ, UNSAFE_DEPTH, U_DEREF, U_FIELD, U_INDEX, U_INT_PTR, U_SLICE, U_UNION, is_borrow,
-    mark_no_read, pointee_is_param, unsafe_index_zero, unsafe_op, unsafe_view_index,
+    NODE_NO_READ, UNSAFE_DEPTH, U_DEREF, U_FIELD, U_INDEX, U_INT_PTR, U_SLICE, U_UNION, WRAP_NODE,
+    is_borrow, mark_no_read, pointee_is_param, unsafe_index_zero, unsafe_op, unsafe_view_index,
 };
 use crate::front::check::variant_fields::{enum_field_help, variant_literal};
 use crate::front::check::vectors::{synth_vecop, vector_binary};
@@ -901,7 +902,12 @@ fn synth_unary(n: i64) -> i64 {
         }
         let ty = synth_expr(operand);
         MUT_PLACE = outer_place;
-        if !is_place(operand) {
+        // (0.18.1) a temporary's local (check/temps.tach) is the value as
+        // `&` of it was before: a slice is its own view, a function's
+        // name its pointer
+        let temp = (NODES[operand].p & NODE_TEMP) != 0
+            && (TYPES[ty].kind == TyKind::Slice || TYPES[ty].kind == TyKind::Fn);
+        if !is_place(operand) || temp {
             if TYPES[ty].kind == TyKind::Slice {
                 // (0.17) `&s[a..b]`, `&mut a[..]`: a slice value is its own
                 // view; `&mut` makes it the exclusive `&mut [T]`
@@ -916,7 +922,7 @@ fn synth_unary(n: i64) -> i64 {
                 fn_value_error(n, operand, c"address");
                 return ty;
             }
-            type_error(n, c"cannot take address of non-lvalue expression");
+            non_lvalue_error(n, operand);
         }
         // (0.17) `&place` is a reference, `&mut place` an exclusive one
         // (docs/design/value-semantics.md §2.3); a place reached through a
@@ -927,6 +933,40 @@ fn synth_unary(n: i64) -> i64 {
             return ptr_to(ty);
         }
         ref_to(ty, if mutable { REF_MUT } else { REF_SHARED })
+    }
+}
+
+// (0.18.1) `&e` of a value where no temporary is made for it
+// (check/temps.tach: something evaluated before it in its statement, or a
+// condition's other side): bind it first, `let t = e;`, then `&t`; the
+// try: is the statement so, when it is on one line.
+fn non_lvalue_error(n: i64, operand: i64) {
+    unsafe {
+        err_begin(NODES[n].start);
+        err_str(c"cannot take address of non-lvalue expression");
+        err_help(c"'&' takes a place; a value made here needs a name first: 'let t = VALUE;' before the statement, then '&t'");
+        let s = WRAP_NODE;
+        let a = NODES[n].start;
+        let b = NODES[n].end;
+        if s > 0 && NODES[s].start <= a && b <= NODES[s].end {
+            let mut one_line = true;
+            for i in NODES[s].start..NODES[s].end {
+                if SRC[i] == '\n' {
+                    one_line = false;
+                }
+            }
+            if one_line {
+                let t = buf_new();
+                buf_bytes(t, "let t = ");
+                buf_bytes(t, SRC[NODES[operand].start..NODES[operand].end]);
+                buf_bytes(t, "; ");
+                buf_bytes(t, SRC[NODES[s].start..a]);
+                buf_bytes(t, if (NODES[n].p & NODE_REF_MUT) != 0 { "&mut t" } else { "&t" });
+                buf_bytes(t, SRC[b..NODES[s].end]);
+                err_try_fmt(buf_slice(t));
+            }
+        }
+        err_end();
     }
 }
 

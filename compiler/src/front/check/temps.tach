@@ -1,0 +1,284 @@
+// `&e` of a value that is no place (0.18.1): a temporary. Before a block
+// is checked, each of its statements (and its tail) that takes `&f(x)`
+// where nothing evaluated before it in the statement can tell the
+// difference gets `let f(x) = f(x);` in front of it, and the `&` takes
+// that local: the temporary lives to the end of the block (Rust's
+// temporary lifetime extension, for `let r = &f(x);`, and longer than
+// Rust's end of the statement for a call's argument), is dropped there,
+// and the own pass checks it as any local (its name is the expression's
+// text; a literal, `&P { x: 1 }`, is hoisted from anywhere). Where the
+// order could differ (a call, an assignment or an index
+// evaluated before it, a condition's other side, a closure), it stays an
+// error with a `try:` (synth_unary).
+
+use crate::base::{IntVec, SRC, buf_bytes, buf_int, buf_new, buf_slice, intern};
+use crate::front::ast::{
+    NODES, NODE_REF_MUT, NodeKind, child, list_begin, list_end, list_push, new_node,
+};
+use crate::front::lexer::Tok;
+
+// A flag of the Ident that names a temporary (on the `&`'s operand).
+pub const NODE_TEMP: i64 = 1 << 52;
+
+// The `let`s made for the statement being visited, in evaluation order.
+static mut LETS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// The names given in this block (a second `&f(x)` is `f(x) #2`).
+static mut NAMES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// Whether something evaluated so far in the statement could be told apart
+// from what a temporary made before the statement evaluates.
+static mut IMPURE: bool = false;
+
+// Whether e, written after `&`, is a value rather than a place: what the
+// checker would call a non-lvalue (a slice or a function's value is
+// handled where it is typed: synth_unary).
+fn is_value_expr(e: i64) -> bool {
+    unsafe {
+        let k = NODES[e].kind;
+        if k == NodeKind::Unary {
+            return NODES[e].op != Tok::Star;
+        }
+        k == NodeKind::Call || k == NodeKind::MethodCall || k == NodeKind::StructLit
+            || k == NodeKind::Tuple || k == NodeKind::Array || k == NodeKind::Int
+            || k == NodeKind::Float || k == NodeKind::Char || k == NodeKind::Str
+            || k == NodeKind::Bool || k == NodeKind::Binary || k == NodeKind::Cast
+            || k == NodeKind::Try
+    }
+}
+
+// Whether evaluating e could be told apart from evaluating it later: a
+// call, an assignment, an index (it may stop the program), a block.
+fn impure(e: i64) -> bool {
+    unsafe {
+        if e == 0 {
+            return false;
+        }
+        let k = NODES[e].kind;
+        if k == NodeKind::Ident || k == NodeKind::Path || k == NodeKind::Int
+            || k == NodeKind::Float || k == NodeKind::Char || k == NodeKind::Str
+            || k == NodeKind::CStr || k == NodeKind::Bool || k == NodeKind::Unit {
+            return false;
+        }
+        if k == NodeKind::FieldAccess || k == NodeKind::TupleField || k == NodeKind::Cast {
+            return impure(NODES[e].a);
+        }
+        if k == NodeKind::Unary {
+            return impure(NODES[e].b);
+        }
+        if k == NodeKind::Binary {
+            return impure(NODES[e].b) || impure(NODES[e].c);
+        }
+        if k == NodeKind::Tuple || k == NodeKind::Array {
+            for i in 0..NODES[e].count {
+                let c = child(e, i);
+                if impure(c) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        true
+    }
+}
+
+// Whether e is made of literals only (`P { x: 1 }`, `(2, "a")`): the same
+// whenever it is evaluated.
+fn constant(e: i64) -> bool {
+    unsafe {
+        let k = NODES[e].kind;
+        if k == NodeKind::Int || k == NodeKind::Float || k == NodeKind::Char
+            || k == NodeKind::Str || k == NodeKind::CStr || k == NodeKind::Bool
+            || k == NodeKind::Unit {
+            return true;
+        }
+        if k == NodeKind::Unary {
+            return NODES[e].op == Tok::Minus && constant(NODES[e].b);
+        }
+        if k == NodeKind::Tuple || k == NodeKind::Array || k == NodeKind::StructLit {
+            for i in 0..NODES[e].count {
+                let c = child(e, i);
+                if !constant(if NODES[c].kind == NodeKind::FieldInit { NODES[c].b } else { c }) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        false
+    }
+}
+
+// The name of the temporary of e: its text (its first line), unique in
+// the block.
+fn temp_name(e: i64) -> i64 {
+    unsafe {
+        let s = NODES[e].start;
+        let mut end = NODES[e].end;
+        let mut i = s;
+        while i < end {
+            if SRC[i] == '\n' {
+                end = i;
+            }
+            i += 1;
+        }
+        let base = SRC[s..end];
+        let mut name = intern(base);
+        let mut k = 1;
+        while NAMES.items().any(|x| x == name) {
+            k += 1;
+            let b = buf_new();
+            buf_bytes(b, base);
+            buf_bytes(b, " #");
+            buf_int(b, k);
+            name = intern(buf_slice(b));
+        }
+        NAMES.push(name);
+        name
+    }
+}
+
+// `&e` (node amp): `let NAME = e;` onto LETS, and the operand made the
+// Ident NAME (NODE_TEMP), with e's position.
+fn hoist(amp: i64) {
+    unsafe {
+        let e = NODES[amp].b;
+        let start = NODES[e].start;
+        let end = NODES[e].end;
+        let name = temp_name(e);
+        let pat = new_node(NodeKind::PatBind, start, end);
+        NODES[pat].a = name;
+        // (`&mut f(x)`: a `mut` local)
+        NODES[pat].b = if (NODES[amp].p & NODE_REF_MUT) != 0 { 1 } else { 0 };
+        let st = new_node(NodeKind::Let, start, end);
+        NODES[st].a = pat;
+        NODES[st].c = e;
+        LETS.push(st);
+        let id = new_node(NodeKind::Ident, start, end);
+        NODES[id].a = name;
+        NODES[id].p |= NODE_TEMP;
+        NODES[amp].b = id;
+    }
+}
+
+// Visits expression e in evaluation order, through the positions that are
+// evaluated once and unconditionally with the statement.
+fn visit(e: i64) {
+    unsafe {
+        if e == 0 {
+            return;
+        }
+        let k = NODES[e].kind;
+        if k == NodeKind::Unary && NODES[e].op == Tok::Amp {
+            let o = NODES[e].b;
+            if !is_value_expr(o) {
+                visit(o);
+                return;
+            }
+            if IMPURE && !constant(o) {
+                return;
+            }
+            // (what e evaluates moves with it into its `let`, in order; a
+            // literal of literals may move before anything: constant)
+            let before = IMPURE;
+            visit(o);
+            IMPURE = before;
+            hoist(e);
+            return;
+        }
+        if k == NodeKind::Call {
+            visit(NODES[e].a);
+            for i in 0..NODES[e].count {
+                visit(child(e, i));
+            }
+            IMPURE = true;
+        } else if k == NodeKind::MethodCall {
+            visit(NODES[e].a);
+            for i in 0..NODES[e].count {
+                visit(child(e, i));
+            }
+            IMPURE = true;
+        } else if k == NodeKind::NamedArg {
+            visit(NODES[e].b);
+        } else if k == NodeKind::Binary {
+            visit(NODES[e].b);
+            if NODES[e].op == Tok::AmpAmp || NODES[e].op == Tok::PipePipe {
+                // (its right side is evaluated or not)
+                IMPURE = true;
+                return;
+            }
+            visit(NODES[e].c);
+        } else if k == NodeKind::Unary || k == NodeKind::Return {
+            visit(if k == NodeKind::Unary { NODES[e].b } else { NODES[e].a });
+        } else if k == NodeKind::Cast || k == NodeKind::FieldAccess || k == NodeKind::TupleField
+            || k == NodeKind::Try {
+            visit(NODES[e].a);
+        } else if k == NodeKind::Tuple || k == NodeKind::Array {
+            for i in 0..NODES[e].count {
+                visit(child(e, i));
+            }
+        } else if k == NodeKind::Interp {
+            // (an f-string's holes, evaluated in order where it stands)
+            for i in 0..NODES[e].count {
+                let h = child(e, i);
+                if NODES[h].kind == NodeKind::InterpHole {
+                    visit(NODES[h].a);
+                }
+            }
+        } else if k == NodeKind::StructLit {
+            for i in 0..NODES[e].count {
+                let f = child(e, i);
+                if NODES[f].kind == NodeKind::FieldInit {
+                    visit(NODES[f].b);
+                }
+            }
+        } else if k == NodeKind::If || k == NodeKind::Match {
+            // (the condition, the scrutinee; the rest is evaluated or not)
+            visit(NODES[e].a);
+            IMPURE = true;
+        } else if k == NodeKind::Assign {
+            visit(NODES[e].c);
+            IMPURE = true;
+        } else if impure(e) {
+            IMPURE = true;
+        }
+    }
+}
+
+// The temporaries of the statements of block (a `let`'s initializer, an
+// expression statement, the tail): their `let`s in front of each.
+pub fn hoist_temporaries(block: i64) {
+    unsafe {
+        NAMES.count = 0;
+        let mut any = false;
+        let mark = list_begin();
+        for i in 0..NODES[block].count {
+            let s = child(block, i);
+            LETS.count = 0;
+            IMPURE = false;
+            let k = NODES[s].kind;
+            if k == NodeKind::Let {
+                visit(NODES[s].c);
+            } else if k == NodeKind::ExprStmt {
+                visit(NODES[s].a);
+            }
+            for j in 0..LETS.count {
+                list_push(LETS.data[j]);
+                any = true;
+            }
+            list_push(s);
+        }
+        let tail = NODES[block].a;
+        if tail != 0 {
+            LETS.count = 0;
+            IMPURE = false;
+            visit(tail);
+            for j in 0..LETS.count {
+                list_push(LETS.data[j]);
+                any = true;
+            }
+        }
+        if any {
+            list_end(block, mark);
+        } else {
+            crate::front::ast::SCRATCH.count = mark;
+        }
+    }
+}

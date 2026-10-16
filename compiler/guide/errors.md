@@ -658,14 +658,19 @@ to a function taking `&mut P`.
 
 ```tach
 struct P { x: i64 }
-fn get(p: *P) -> i64 { p.x }
-fn main() -> i32 { get(&P { x: 1 }) as i32 }
+fn one() -> i64 { 1 }
+fn get(n: i64, p: &P) -> i64 { n + p.x }
+fn main() -> i32 { get(one(), &P { x: one() }) as i32 }
 ```
 ```err
 error[type error] cannot take address of non-lvalue expression
 ```
-`&` takes the address of a place (a variable, a field, an element):
-`let p = P { x: 1 }; get(&p)`.
+`&` takes the address of a place (a variable, a field, an element). Of
+a value, `&f(x)` or `&P { x: 1 }`, it takes a temporary (0.18.1), which
+lives to the end of the block, unless something evaluated before it in
+the statement (`one()` here, a call) could see the difference: then
+name it first, as the `try:` does: `let t = P { x: one() }; get(one(),
+&t)`.
 
 ```tach
 fn factorial(n: i64) -> i64 { if n < 2 { 1 } else { n * factorial(n - 1) } }
