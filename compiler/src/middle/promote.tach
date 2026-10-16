@@ -9,80 +9,75 @@
 // apart by the value ranges at their blocks (bounds checks, loop counters):
 // `vm.stack[vm.sp]` does not overlap `vm.sp`.
 
-use crate::back::regalloc::ORDER;
 use crate::back::regalloc::prepare::{layout_blocks, layout_order};
 use crate::base::{IntVec, free};
 use crate::front::types::{TY_BOOL, TY_U64, is_float, is_integer, type_size};
+use crate::middle::ctx::FnCtx;
 use crate::middle::gvn::{
     address_base, copy_dst, copy_size, copy_src, find_escaping_slots, is_copy, is_private_root,
     root_of,
 };
 use crate::middle::ipo::{call_reads, call_writes};
 use crate::middle::ir::{
-    ARGS, ARGTY, BLOCKS, INSTS, Op, ir_append, ir_enter, ir_insert_before, ir_make, ir_prepend,
-    ir_replace, ir_set_arg, ir_unlink, ir_val,
+    Op, ir_append, ir_enter, ir_insert_before, ir_make, ir_prepend, ir_replace, ir_set_arg,
+    ir_unlink, ir_val,
 };
 use crate::middle::ir::Op::{Add, GAddr, Load, Phi, SAddr, Store};
 use crate::middle::ir::cfg::{succ, succ_count};
 use crate::middle::ir::verify::verify_func;
 use crate::middle::loops::{
-    LP_DEPTH, LP_LIST, canonicalize_loops, is_canonical, loop_block, loop_contains, loop_count,
-    loop_exits, loop_preheader, loop_size, seal_all,
+    canonicalize_loops, is_canonical, loop_block, loop_contains, loop_count, loop_exits,
+    loop_preheader, loop_size, seal_all,
 };
 use crate::middle::lower::ssa::{new_synth_var, ssa_read, ssa_write};
 use crate::middle::opt::{remove_trivial_phis, resolve_all};
 use crate::middle::range::{prepare_ranges, value_range_at};
 
-// The memory accesses of the loop being looked at: per access, its
-// instruction, its base (resolved), its constant offset, its size, and its
-// type (0 for a copy or a call); 5 per access.
-static mut ACCESSES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
 const MAX_ACCESSES: i64 = 2000;
 
 // Promotes the memory locations of function fi's loops that can be.
 // Returns whether any was.
-pub fn promote_loop_memory(fi: i64) -> bool {
+pub fn promote_loop_memory(mut cx: *FnCtx, fi: i64) -> bool {
     unsafe {
-        ir_enter(fi);
+        ir_enter(cx, fi);
         // Most functions have no loop with memory in it: the loop analysis is
         // not worth starting for them.
-        if !has_loop_with_memory(fi) {
+        if !has_loop_with_memory(cx, fi) {
             return false;
         }
-        resolve_all(fi);
-        seal_all(fi);
-        canonicalize_loops(fi);
-        resolve_all(fi);
-        find_escaping_slots(fi);
-        prepare_ranges(fi);
+        resolve_all(cx, fi);
+        seal_all(cx, fi);
+        canonicalize_loops(cx, fi);
+        resolve_all(cx, fi);
+        find_escaping_slots(cx, fi);
+        prepare_ranges(cx, fi);
         let mut changed = false;
         // Inner loops first (deeper), so an outer loop sees what they made.
         let mut order = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for depth in 0..16 {
             let d = 16 - depth;
-            for l in 0..loop_count() {
-                if LP_DEPTH.data[l] == d {
+            for l in 0..loop_count(cx) {
+                if cx.lp_depth.data[l] == d {
                     order.push(l);
                 }
             }
         }
         for i in 0..order.count {
             let l = order.data[i];
-            if !is_canonical(l) {
+            if !is_canonical(cx, l) {
                 continue;
             }
-            if promote_in_loop(fi, l) {
+            if promote_in_loop(cx, fi, l) {
                 changed = true;
                 // The control flow is unchanged; the values are new.
-                resolve_all(fi);
+                resolve_all(cx, fi);
             }
         }
         free(order.data as *u8);
         if changed {
-            resolve_all(fi);
-            remove_trivial_phis(fi);
-            verify_func(fi, c"scalar promotion");
+            resolve_all(cx, fi);
+            remove_trivial_phis(cx, fi);
+            verify_func(cx, fi, c"scalar promotion");
         }
         changed
     }
@@ -91,28 +86,28 @@ pub fn promote_loop_memory(fi: i64) -> bool {
 // Whether function fi has a cycle (an edge to a block not later in
 // reverse post-order) with a store to a frame slot or a static in a block
 // on it: a quick filter (a location only loaded in a loop is LICM's).
-fn has_loop_with_memory(fi: i64) -> bool {
+fn has_loop_with_memory(mut cx: *FnCtx, fi: i64) -> bool {
     unsafe {
-        layout_order(fi);
-        for i in 0..ORDER.count {
-            let b = ORDER.data[i];
-            for k in 0..succ_count(b) {
-                let s = succ(b, k);
-                if BLOCKS[s].order >= 0 && BLOCKS[s].order <= BLOCKS[b].order {
+        layout_order(cx, fi);
+        for i in 0..cx.order.count {
+            let b = cx.order.data[i];
+            for k in 0..succ_count(cx, b) {
+                let s = succ(cx, b, k);
+                if cx.blocks[s].order >= 0 && cx.blocks[s].order <= cx.blocks[b].order {
                     // A back edge s <- b: the blocks from s to b in the order
                     // hold the loop (and maybe more).
-                    for j in BLOCKS[s].order..BLOCKS[b].order + 1 {
-                        let mut v = BLOCKS[ORDER.data[j]].first;
+                    for j in cx.blocks[s].order..cx.blocks[b].order + 1 {
+                        let mut v = cx.blocks[cx.order.data[j]].first;
                         while v != 0 {
-                            if INSTS[v].op == Store {
+                            if cx.insts[v].op == Store {
                                 let mut offset = 0;
-                                let base = address_base(ir_val(INSTS[v].a), &offset);
-                                let op = INSTS[base].op;
+                                let base = address_base(cx, ir_val(cx, cx.insts[v].a), &offset);
+                                let op = cx.insts[base].op;
                                 if op == Op::Slot || op == GAddr {
                                     return true;
                                 }
                             }
-                            v = INSTS[v].next;
+                            v = cx.insts[v].next;
                         }
                     }
                 }
@@ -122,78 +117,78 @@ fn has_loop_with_memory(fi: i64) -> bool {
     }
 }
 
-fn collect_accesses(l: i64) -> bool {
+fn collect_accesses(mut cx: *FnCtx, l: i64) -> bool {
     unsafe {
-        ACCESSES.count = 0;
-        for i in 0..loop_size(l) {
-            let b = loop_block(l, i);
-            let mut v = BLOCKS[b].first;
+        cx.accesses.count = 0;
+        for i in 0..loop_size(cx, l) {
+            let b = loop_block(cx, l, i);
+            let mut v = cx.blocks[b].first;
             while v != 0 {
-                let op = INSTS[v].op;
+                let op = cx.insts[v].op;
                 if op == Load || op == Store {
-                    let mut offset = INSTS[v].imm;
-                    let base = address_base(ir_val(INSTS[v].a), &offset);
-                    ACCESSES.push(v);
-                    ACCESSES.push(base);
-                    ACCESSES.push(offset);
-                    let ty = if op == Load { INSTS[v].ty } else { INSTS[v].imm2 };
-                    ACCESSES.push(type_size(ty));
-                    ACCESSES.push(ty);
-                } else if is_copy(v) || op.is_call() {
-                    ACCESSES.push(v);
-                    ACCESSES.push(0);
-                    ACCESSES.push(0);
-                    ACCESSES.push(0);
-                    ACCESSES.push(0);
+                    let mut offset = cx.insts[v].imm;
+                    let base = address_base(cx, ir_val(cx, cx.insts[v].a), &offset);
+                    cx.accesses.push(v);
+                    cx.accesses.push(base);
+                    cx.accesses.push(offset);
+                    let ty = if op == Load { cx.insts[v].ty } else { cx.insts[v].imm2 };
+                    cx.accesses.push(type_size(ty));
+                    cx.accesses.push(ty);
+                } else if is_copy(cx, v) || op.is_call() {
+                    cx.accesses.push(v);
+                    cx.accesses.push(0);
+                    cx.accesses.push(0);
+                    cx.accesses.push(0);
+                    cx.accesses.push(0);
                 }
-                if ACCESSES.count > MAX_ACCESSES * 5 {
+                if cx.accesses.count > MAX_ACCESSES * 5 {
                     return false;
                 }
-                v = INSTS[v].next;
+                v = cx.insts[v].next;
             }
         }
         true
     }
 }
 
-fn promote_in_loop(fi: i64, l: i64) -> bool {
+fn promote_in_loop(mut cx: *FnCtx, fi: i64, l: i64) -> bool {
     unsafe {
-        if !collect_accesses(l) {
+        if !collect_accesses(cx, l) {
             return false;
         }
         let mut changed = false;
-        let n = ACCESSES.count / 5;
+        let n = cx.accesses.count / 5;
         for i in 0..n {
-            let v = ACCESSES.data[5 * i];
-            let base = ACCESSES.data[5 * i + 1];
-            let ty = ACCESSES.data[5 * i + 4];
-            if base == 0 || INSTS[v].block == 0 || ty == 0 || !is_integer_like(ty) {
+            let v = cx.accesses.data[5 * i];
+            let base = cx.accesses.data[5 * i + 1];
+            let ty = cx.accesses.data[5 * i + 4];
+            if base == 0 || cx.insts[v].block == 0 || ty == 0 || !is_integer_like(ty) {
                 continue;
             }
             // The address is computed outside the loop, or is an address
             // constant (remade where it is needed).
-            if INSTS[base].block != 0 && loop_contains(l, INSTS[base].block)
-                && !is_address_constant(base) {
+            if cx.insts[base].block != 0 && loop_contains(cx, l, cx.insts[base].block)
+                && !is_address_constant(cx, base) {
                 continue;
             }
-            let root = root_of(base);
-            if root == 0 || (INSTS[root].op != Op::Slot && INSTS[root].op != GAddr) {
+            let root = root_of(cx, base);
+            if root == 0 || (cx.insts[root].op != Op::Slot && cx.insts[root].op != GAddr) {
                 continue;
             }
-            let offset = ACCESSES.data[5 * i + 2];
+            let offset = cx.accesses.data[5 * i + 2];
             // Done already (an earlier access of the same location)?
             let mut first = true;
             for j in 0..i {
-                if ACCESSES.data[5 * j + 1] == base && ACCESSES.data[5 * j + 2] == offset
-                    && INSTS[ACCESSES.data[5 * j]].block != 0 {
+                if cx.accesses.data[5 * j + 1] == base && cx.accesses.data[5 * j + 2] == offset
+                    && cx.insts[cx.accesses.data[5 * j]].block != 0 {
                     first = false;
                 }
             }
             if !first {
                 continue;
             }
-            if can_promote(l, root, base, offset, ty) {
-                promote(fi, l, base, offset, ty);
+            if can_promote(cx, l, root, base, offset, ty) {
+                promote(cx, fi, l, base, offset, ty);
                 changed = true;
             }
         }
@@ -209,28 +204,28 @@ fn is_integer_like(ty: i64) -> bool {
 // Whether the location [base + offset, + size of ty) of object `root` can
 // be promoted in loop l: every access of it is a load or store of type
 // ty at base + offset, and nothing else in the loop may reach it.
-fn can_promote(l: i64, root: i64, base: i64, offset: i64, ty: i64) -> bool {
+fn can_promote(mut cx: *FnCtx, l: i64, root: i64, base: i64, offset: i64, ty: i64) -> bool {
     unsafe {
         let size = type_size(ty);
-        let private = is_private_root(root);
+        let private = is_private_root(cx, root);
         let mut loc_lo = 0;
         let mut loc_hi = 0;
-        if !relative_range(base, root, INSTS[ACCESSES.data[0]].block, &loc_lo, &loc_hi, 0)
+        if !relative_range(cx, base, root, cx.insts[cx.accesses.data[0]].block, &loc_lo, &loc_hi, 0)
             || loc_lo != loc_hi {
             return false;
         }
         let loc = loc_lo + offset;
         let mut uses = 0;
-        for i in 0..ACCESSES.count / 5 {
-            let v = ACCESSES.data[5 * i];
-            if INSTS[v].block == 0 {
+        for i in 0..cx.accesses.count / 5 {
+            let v = cx.accesses.data[5 * i];
+            if cx.insts[v].block == 0 {
                 continue;
             }
-            let b2 = ACCESSES.data[5 * i + 1];
-            let o2 = ACCESSES.data[5 * i + 2];
-            let s2 = ACCESSES.data[5 * i + 3];
-            let t2 = ACCESSES.data[5 * i + 4];
-            let op = INSTS[v].op;
+            let b2 = cx.accesses.data[5 * i + 1];
+            let o2 = cx.accesses.data[5 * i + 2];
+            let s2 = cx.accesses.data[5 * i + 3];
+            let t2 = cx.accesses.data[5 * i + 4];
+            let op = cx.insts[v].op;
             if b2 == base && o2 == offset && t2 != 0 {
                 if t2 != ty {
                     return false;
@@ -238,25 +233,26 @@ fn can_promote(l: i64, root: i64, base: i64, offset: i64, ty: i64) -> bool {
                 uses += 1;
                 continue;
             }
-            if op.is_call() && !is_copy(v) {
-                if !private && (call_reads(v) || call_writes(v)) {
+            if op.is_call() && !is_copy(cx, v) {
+                if !private && (call_reads(cx, v) || call_writes(cx, v)) {
                     return false;
                 }
                 continue;
             }
-            if is_copy(v) {
+            if is_copy(cx, v) {
                 let mut dst_offset = 0;
-                let dst = address_base(ir_val(copy_dst(v)), &dst_offset);
+                let dst = address_base(cx, ir_val(cx, copy_dst(cx, v)), &dst_offset);
                 let mut src_offset = 0;
-                let src = address_base(ir_val(copy_src(v)), &src_offset);
-                let n = copy_size(v);
-                if !disjoint(l, root, private, loc, size, dst, dst_offset, n, INSTS[v].block)
-                    || !disjoint(l, root, private, loc, size, src, src_offset, n, INSTS[v].block) {
+                let src = address_base(cx, ir_val(cx, copy_src(cx, v)), &src_offset);
+                let n = copy_size(cx, v);
+                if !disjoint(cx, l, root, private, loc, size, dst, dst_offset, n, cx.insts[v].block)
+                    || !disjoint(cx, l, root, private, loc, size, src, src_offset, n,
+                        cx.insts[v].block) {
                     return false;
                 }
                 continue;
             }
-            if !disjoint(l, root, private, loc, size, b2, o2, s2, INSTS[v].block) {
+            if !disjoint(cx, l, root, private, loc, size, b2, o2, s2, cx.insts[v].block) {
                 return false;
             }
         }
@@ -266,9 +262,9 @@ fn can_promote(l: i64, root: i64, base: i64, offset: i64, ty: i64) -> bool {
 
 // Whether the access [b2 + o2, + s2) at block `at` cannot overlap the
 // location [loc, + size) of object `root`.
-fn disjoint(l: i64, root: i64, private: bool, loc: i64, size: i64, b2: i64, o2: i64, s2: i64,
-    at: i64) -> bool {
-    let r2 = root_of(b2);
+fn disjoint(mut cx: *FnCtx, l: i64, root: i64, private: bool, loc: i64, size: i64, b2: i64, o2: i64,
+    s2: i64, at: i64) -> bool {
+    let r2 = root_of(cx, b2);
     if r2 == 0 {
         // An unknown pointer reaches no private slot.
         return private;
@@ -276,13 +272,13 @@ fn disjoint(l: i64, root: i64, private: bool, loc: i64, size: i64, b2: i64, o2: 
     if r2 != root {
         // Another object, or constant data.
         unsafe {
-            return INSTS[r2].op == SAddr || INSTS[r2].op != INSTS[root].op
-                || INSTS[r2].imm != INSTS[root].imm;
+            return cx.insts[r2].op == SAddr || cx.insts[r2].op != cx.insts[root].op
+                || cx.insts[r2].imm != cx.insts[root].imm;
         }
     }
     let mut lo = 0;
     let mut hi = 0;
-    if !relative_range(b2, root, at, &lo, &hi, 0) {
+    if !relative_range(cx, b2, root, at, &lo, &hi, 0) {
         return false;
     }
     let limit = 1152921504606846976;
@@ -295,30 +291,30 @@ fn disjoint(l: i64, root: i64, private: bool, loc: i64, size: i64, b2: i64, o2: 
 // The range of x - root (x an address computed from `root` by additions)
 // at block `at`, in *lo and *hi. Returns false when x is not such an
 // address or its range is unknown.
-fn relative_range(x: i64, root: i64, at: i64, lo: *i64, hi: *i64, depth: i64) -> bool {
+fn relative_range(mut cx: *FnCtx, x: i64, root: i64, at: i64, lo: *i64, hi: *i64, depth: i64) -> bool {
     unsafe {
-        let v = ir_val(x);
+        let v = ir_val(cx, x);
         if v == root {
             *lo = 0;
             *hi = 0;
             return true;
         }
-        if depth > 8 || INSTS[v].op != Add || INSTS[v].ty != TY_U64 {
+        if depth > 8 || cx.insts[v].op != Add || cx.insts[v].ty != TY_U64 {
             return false;
         }
-        let a = ir_val(INSTS[v].a);
-        let c = ir_val(INSTS[v].b);
+        let a = ir_val(cx, cx.insts[v].a);
+        let c = ir_val(cx, cx.insts[v].b);
         let mut blo = 0;
         let mut bhi = 0;
         let mut other = 0;
-        if relative_range(a, root, at, lo, hi, depth + 1) {
+        if relative_range(cx, a, root, at, lo, hi, depth + 1) {
             other = c;
-        } else if relative_range(c, root, at, lo, hi, depth + 1) {
+        } else if relative_range(cx, c, root, at, lo, hi, depth + 1) {
             other = a;
         } else {
             return false;
         }
-        value_range_at(other, at, &blo, &bhi);
+        value_range_at(cx, other, at, &blo, &bhi);
         let limit = 1152921504606846976;
         if blo < 0 - limit || bhi > limit || *lo < 0 - limit || *hi > limit {
             return false;
@@ -330,97 +326,97 @@ fn relative_range(x: i64, root: i64, at: i64, lo: *i64, hi: *i64, depth: i64) ->
 }
 
 // The address of a frame slot or a static, which has no operands.
-fn is_address_constant(v: i64) -> bool {
-    unsafe { INSTS[v].op == Op::Slot || INSTS[v].op == GAddr }
+fn is_address_constant(mut cx: *FnCtx, v: i64) -> bool {
+    unsafe { cx.insts[v].op == Op::Slot || cx.insts[v].op == GAddr }
 }
 
 // `base` for a use in block b, outside loop l: base itself, or for an
 // address constant defined in the loop, a copy of it placed before `at`
 // (or at the end of b when at is 0).
-fn address_outside(l: i64, base: i64, b: i64, at: i64) -> i64 {
+fn address_outside(mut cx: *FnCtx, l: i64, base: i64, b: i64, at: i64) -> i64 {
     unsafe {
-        if INSTS[base].block == 0 || !loop_contains(l, INSTS[base].block) {
+        if cx.insts[base].block == 0 || !loop_contains(cx, l, cx.insts[base].block) {
             return base;
         }
-        let copy = ir_make(INSTS[base].op, INSTS[base].ty, 0, 0, INSTS[base].imm);
+        let copy = ir_make(cx, cx.insts[base].op, cx.insts[base].ty, 0, 0, cx.insts[base].imm);
         if at == 0 {
-            ir_append(b, copy);
+            ir_append(cx, b, copy);
         } else {
-            ir_insert_before(at, copy);
+            ir_insert_before(cx, at, copy);
         }
         copy
     }
 }
 
 // Promotes [base + offset] (type ty) in loop l.
-fn promote(fi: i64, l: i64, base: i64, offset: i64, ty: i64) {
+fn promote(mut cx: *FnCtx, fi: i64, l: i64, base: i64, offset: i64, ty: i64) {
     unsafe {
-        ir_enter(fi);
-        let pre = loop_preheader(l);
-        let initial = ir_make(Load, ty, address_outside(l, base, pre, 0), 0, offset);
-        ir_append(pre, initial);
-        let var = new_synth_var(ty);
-        ssa_write(var, pre, initial);
+        ir_enter(cx, fi);
+        let pre = loop_preheader(cx, l);
+        let initial = ir_make(cx, Load, ty, address_outside(cx, l, base, pre, 0), 0, offset);
+        ir_append(cx, pre, initial);
+        let var = new_synth_var(cx, ty);
+        ssa_write(cx, var, pre, initial);
         // The value each block leaves in the location: its last store.
         let mut stores = false;
-        for i in 0..loop_size(l) {
-            let b = loop_block(l, i);
+        for i in 0..loop_size(cx, l) {
+            let b = loop_block(cx, l, i);
             let mut last = 0;
-            let mut v = BLOCKS[b].first;
+            let mut v = cx.blocks[b].first;
             while v != 0 {
-                if is_location(v, Store, base, offset) {
+                if is_location(cx, v, Store, base, offset) {
                     last = v;
                 }
-                v = INSTS[v].next;
+                v = cx.insts[v].next;
             }
             if last != 0 {
-                ssa_write(var, b, ir_val(INSTS[last].b));
-                BLOCKS[b].aux = 1;
+                ssa_write(cx, var, b, ir_val(cx, cx.insts[last].b));
+                cx.blocks[b].aux = 1;
                 stores = true;
             } else {
-                BLOCKS[b].aux = 0;
+                cx.blocks[b].aux = 0;
             }
         }
         // Loads and stores become values.
-        for i in 0..loop_size(l) {
-            let b = loop_block(l, i);
+        for i in 0..loop_size(cx, l) {
+            let b = loop_block(cx, l, i);
             let mut current = 0;
-            let mut v = BLOCKS[b].first;
+            let mut v = cx.blocks[b].first;
             while v != 0 {
-                let next = INSTS[v].next;
-                if is_location(v, Load, base, offset) {
+                let next = cx.insts[v].next;
+                if is_location(cx, v, Load, base, offset) {
                     if current == 0 {
-                        current = value_at_start(var, b, ty);
+                        current = value_at_start(cx, var, b, ty);
                     }
-                    ir_replace(v, current);
-                } else if is_location(v, Store, base, offset) {
-                    current = ir_val(INSTS[v].b);
-                    ir_unlink(v);
+                    ir_replace(cx, v, current);
+                } else if is_location(cx, v, Store, base, offset) {
+                    current = ir_val(cx, cx.insts[v].b);
+                    ir_unlink(cx, v);
                 }
                 v = next;
             }
         }
         // Stored back in the exits.
         if stores {
-            loop_exits(l);
+            loop_exits(cx, l);
             let mut exits = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-            for i in 0..LP_LIST.count {
-                exits.push(LP_LIST.data[i]);
+            for i in 0..cx.lp_list.count {
+                exits.push(cx.lp_list.data[i]);
             }
             for i in 0..exits.count {
                 let e = exits.data[i];
-                let value = ssa_read(var, e);
-                let mut at = BLOCKS[e].first;
-                while at != 0 && INSTS[at].op == Phi {
-                    at = INSTS[at].next;
+                let value = ssa_read(cx, var, e);
+                let mut at = cx.blocks[e].first;
+                while at != 0 && cx.insts[at].op == Phi {
+                    at = cx.insts[at].next;
                 }
-                let address = address_outside(l, base, e, at);
-                let st = ir_make(Store, 0, address, value, offset);
-                INSTS[st].imm2 = ty;
+                let address = address_outside(cx, l, base, e, at);
+                let st = ir_make(cx, Store, 0, address, value, offset);
+                cx.insts[st].imm2 = ty;
                 if at == 0 {
-                    ir_append(e, st);
+                    ir_append(cx, e, st);
                 } else {
-                    ir_insert_before(at, st);
+                    ir_insert_before(cx, at, st);
                 }
             }
             free(exits.data as *u8);
@@ -428,13 +424,13 @@ fn promote(fi: i64, l: i64, base: i64, offset: i64, ty: i64) {
     }
 }
 
-fn is_location(v: i64, op: Op, base: i64, offset: i64) -> bool {
+fn is_location(mut cx: *FnCtx, v: i64, op: Op, base: i64, offset: i64) -> bool {
     unsafe {
-        if INSTS[v].op != op {
+        if cx.insts[v].op != op {
             return false;
         }
-        let mut o = INSTS[v].imm;
-        let b = address_base(ir_val(INSTS[v].a), &o);
+        let mut o = cx.insts[v].imm;
+        let b = address_base(cx, ir_val(cx, cx.insts[v].a), &o);
         b == base && o == offset
     }
 }
@@ -442,25 +438,25 @@ fn is_location(v: i64, op: Op, base: i64, offset: i64) -> bool {
 // The value of the location at the start of loop block b: with no store
 // in b, what reaches its end; else what its predecessors leave (a phi
 // when they differ).
-fn value_at_start(var: i64, b: i64, ty: i64) -> i64 {
+fn value_at_start(mut cx: *FnCtx, var: i64, b: i64, ty: i64) -> i64 {
     unsafe {
-        if BLOCKS[b].aux == 0 {
-            return ssa_read(var, b);
+        if cx.blocks[b].aux == 0 {
+            return ssa_read(cx, var, b);
         }
-        let n = BLOCKS[b].preds.count;
+        let n = cx.blocks[b].preds.count;
         if n == 1 {
-            return ssa_read(var, BLOCKS[b].preds.data[0]);
+            return ssa_read(cx, var, cx.blocks[b].preds.data[0]);
         }
-        let phi = ir_make(Phi, ty, 0, 0, 0);
-        ir_prepend(b, phi);
-        INSTS[phi].args = ARGS.count;
-        INSTS[phi].nargs = n;
+        let phi = ir_make(cx, Phi, ty, 0, 0, 0);
+        ir_prepend(cx, b, phi);
+        cx.insts[phi].args = cx.args.count;
+        cx.insts[phi].nargs = n;
         for k in 0..n {
-            ARGS.push(0);
-            ARGTY.push(0);
+            cx.args.push(0);
+            cx.argty.push(0);
         }
         for k in 0..n {
-            ir_set_arg(phi, k, ssa_read(var, BLOCKS[b].preds.data[k]));
+            ir_set_arg(cx, phi, k, ssa_read(cx, var, cx.blocks[b].preds.data[k]));
         }
         phi
     }

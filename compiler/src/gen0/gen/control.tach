@@ -22,6 +22,7 @@ use crate::gen0::target::{
     DEPTH, R_ACC, R_SECOND, emit_add_imm, emit_compare_jump, emit_drop_temps, emit_frame_addr,
     emit_jump, emit_jump_if_zero, emit_label, emit_load, emit_load_imm, new_label,
 };
+use crate::middle::ctx::FnCtx;
 use crate::middle::ir::Cond;
 
 // The temporaries depth at the start of each loop, by its continue label.
@@ -32,34 +33,34 @@ static mut LABEL_DEPTH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 // Sequential tests in arm order: the scrutinee is evaluated once (a
 // compound one stays where it is: its address is kept), every arm's
 // pattern is tested in order, its bindings copied, its guard evaluated.
-pub fn gen_match(n: i64) {
+pub fn gen_match(mut cx: *FnCtx, n: i64) {
     unsafe {
         let scrutinee = NODES[n].a;
         let st = NODES[scrutinee].ty;
-        gen_expr(scrutinee);
+        gen_expr(cx, scrutinee);
         if st == TY_NEVER {
             return;
         }
         let held = alloc_slot(8, 8);
         if is_compound(st) {
-            store_reg_to_frame(R_ACC, held);
+            store_reg_to_frame(cx, R_ACC, held);
         } else {
-            store_to_frame(st, held);
+            store_to_frame(cx, st, held);
         }
         let end = new_label();
         for arm in kids(n) {
             let next = new_label();
             alloc_pattern_slots(NODES[arm].a);
-            gen_pattern_test(NODES[arm].a, st, held, next);
+            gen_pattern_test(cx, NODES[arm].a, st, held, next);
             if NODES[arm].b != 0 {
-                gen_expr(NODES[arm].b);
-                emit_jump_if_zero(next);
+                gen_expr(cx, NODES[arm].b);
+                emit_jump_if_zero(cx, next);
             }
-            gen_expr(NODES[arm].c);
-            emit_jump(end);
-            emit_label(next);
+            gen_expr(cx, NODES[arm].c);
+            emit_jump(cx, end);
+            emit_label(cx, next);
         }
-        emit_label(end);
+        emit_label(cx, end);
     }
 }
 
@@ -85,7 +86,7 @@ fn alloc_pattern_slots(p: i64) {
 
 // Jumps to `fail` unless the value of type `ty` in frame slot `held` (the
 // address of a compound value) matches pattern p; binds its variables.
-fn gen_pattern_test(p: i64, ty: i64, held: i64, fail: i64) {
+fn gen_pattern_test(mut cx: *FnCtx, p: i64, ty: i64, held: i64, fail: i64) {
     unsafe {
         let kind = NODES[p].kind;
         if ty == TY_NEVER {
@@ -95,24 +96,24 @@ fn gen_pattern_test(p: i64, ty: i64, held: i64, fail: i64) {
             PatWild => return,
             PatBind => {
                 if !is_void(ty) {
-                    load_held(ty, held);
-                    store_to_frame(ty, LOCALS[NODES[p].x].offset);
+                    load_held(cx, ty, held);
+                    store_to_frame(cx, ty, LOCALS[NODES[p].x].offset);
                 }
                 return;
             }
             PatLit => {
-                load_held(ty, held);
-                emit_load_imm(R_SECOND, NODES[p].x as u64);
-                emit_compare_jump(Cond::Ne, is_signed(scalar_type(ty)), fail);
+                load_held(cx, ty, held);
+                emit_load_imm(cx, R_SECOND, NODES[p].x as u64);
+                emit_compare_jump(cx, Cond::Ne, is_signed(scalar_type(ty)), fail);
                 return;
             }
             PatRange => {
                 let signed = is_signed(scalar_type(ty));
-                load_held(ty, held);
-                emit_load_imm(R_SECOND, NODES[p].x as u64);
-                emit_compare_jump(Cond::Lt, signed, fail);
-                emit_load_imm(R_SECOND, NODES[p].y as u64);
-                emit_compare_jump(Cond::Gt, signed, fail);
+                load_held(cx, ty, held);
+                emit_load_imm(cx, R_SECOND, NODES[p].x as u64);
+                emit_compare_jump(cx, Cond::Lt, signed, fail);
+                emit_load_imm(cx, R_SECOND, NODES[p].y as u64);
+                emit_compare_jump(cx, Cond::Gt, signed, fail);
                 return;
             }
             PatOr => {
@@ -120,25 +121,25 @@ fn gen_pattern_test(p: i64, ty: i64, held: i64, fail: i64) {
                 let last = NODES[p].count - 1;
                 for i in 0..last {
                     let next = new_label();
-                    gen_pattern_test(child(p, i), ty, held, next);
-                    emit_jump(ok);
-                    emit_label(next);
+                    gen_pattern_test(cx, child(p, i), ty, held, next);
+                    emit_jump(cx, ok);
+                    emit_label(cx, next);
                 }
-                gen_pattern_test(child(p, last), ty, held, fail);
-                emit_label(ok);
+                gen_pattern_test(cx, child(p, last), ty, held, fail);
+                emit_label(cx, ok);
                 return;
             }
             PatVariant => {
                 let v = NODES[p].x;
                 let tag = ENUMS[TYPES[ty].a].tag;
                 if is_compound(ty) {
-                    load_reg_from_frame(R_ACC, held);
-                    emit_load(tag, R_ACC);
+                    load_reg_from_frame(cx, R_ACC, held);
+                    emit_load(cx, tag, R_ACC);
                 } else {
-                    load_held(ty, held);
+                    load_held(cx, ty, held);
                 }
-                emit_load_imm(R_SECOND, wrap_int(VARIANTS[v].discr, tag) as u64);
-                emit_compare_jump(Cond::Ne, is_signed(tag), fail);
+                emit_load_imm(cx, R_SECOND, wrap_int(VARIANTS[v].discr, tag) as u64);
+                emit_compare_jump(cx, Cond::Ne, is_signed(tag), fail);
             }
             _ => {}
         }
@@ -158,46 +159,46 @@ fn gen_pattern_test(p: i64, ty: i64, held: i64, fail: i64) {
                 offset = tuple_offset(ty, i);
             }
             let elem_held = alloc_slot(8, 8);
-            load_reg_from_frame(R_ACC, held);
-            emit_add_imm(R_ACC, offset);
+            load_reg_from_frame(cx, R_ACC, held);
+            emit_add_imm(cx, R_ACC, offset);
             if is_compound(elem_ty) {
-                store_reg_to_frame(R_ACC, elem_held);
+                store_reg_to_frame(cx, R_ACC, elem_held);
             } else if !is_void(elem_ty) {
-                emit_load(elem_ty, R_ACC);
-                store_to_frame(elem_ty, elem_held);
+                emit_load(cx, elem_ty, R_ACC);
+                store_to_frame(cx, elem_ty, elem_held);
             }
-            gen_pattern_test(sub, elem_ty, elem_held, fail);
+            gen_pattern_test(cx, sub, elem_ty, elem_held, fail);
         }
     }
 }
 
 // The accumulator = the value held in frame slot `held` (the address of a
 // compound value).
-fn load_held(ty: i64, held: i64) {
+fn load_held(mut cx: *FnCtx, ty: i64, held: i64) {
     if is_compound(ty) {
-        load_reg_from_frame(R_ACC, held);
+        load_reg_from_frame(cx, R_ACC, held);
     } else {
-        emit_frame_addr(R_ACC, held);
-        load_from_x0(ty);
+        emit_frame_addr(cx, R_ACC, held);
+        load_from_x0(cx, ty);
     }
 }
 
 // ---- Control flow ----
 
-pub fn gen_if(n: i64) {
+pub fn gen_if(mut cx: *FnCtx, n: i64) {
     unsafe {
         let else_label = new_label();
         let end_label = new_label();
-        gen_expr(NODES[n].a);
-        emit_jump_if_zero(else_label);
-        gen_block(NODES[n].b);
+        gen_expr(cx, NODES[n].a);
+        emit_jump_if_zero(cx, else_label);
+        gen_block(cx, NODES[n].b);
         if NODES[n].c != 0 {
-            emit_jump(end_label);
-            emit_label(else_label);
-            gen_block(NODES[n].c);
-            emit_label(end_label);
+            emit_jump(cx, end_label);
+            emit_label(cx, else_label);
+            gen_block(cx, NODES[n].c);
+            emit_label(cx, end_label);
         } else {
-            emit_label(else_label);
+            emit_label(cx, else_label);
         }
     }
 }
@@ -218,72 +219,72 @@ fn new_loop_labels(n: i64, count: i64) -> i64 {
 }
 
 // `loop` and `while`.
-pub fn gen_loop(n: i64) {
+pub fn gen_loop(mut cx: *FnCtx, n: i64) {
     unsafe {
         let top = new_loop_labels(n, 2);
-        emit_label(top);
+        emit_label(cx, top);
         if NODES[n].kind == While {
-            gen_expr(NODES[n].b);
-            emit_jump_if_zero(top + 1);
+            gen_expr(cx, NODES[n].b);
+            emit_jump_if_zero(cx, top + 1);
             defer_loop_enter(n);
-            gen_block(NODES[n].c);
+            gen_block(cx, NODES[n].c);
         } else {
             defer_loop_enter(n);
-            gen_block(NODES[n].b);
+            gen_block(cx, NODES[n].b);
         }
         defer_loop_leave();
-        emit_jump(top);
-        emit_label(top + 1);
+        emit_jump(cx, top);
+        emit_label(cx, top + 1);
     }
 }
 
 // `for i in a..b`: the bounds are evaluated once; the loop variable is a
 // copy of the counter.
-pub fn gen_for(n: i64) {
+pub fn gen_for(mut cx: *FnCtx, n: i64) {
     unsafe {
         let range = NODES[n].c;
         let ty = NODES[range].ty;
         let inclusive = NODES[range].c != 0;
         let counter = alloc_slot(8, 8);
         let end = alloc_slot(8, 8);
-        gen_expr(NODES[range].a);
-        store_reg_to_frame(R_ACC, counter);
-        gen_expr(NODES[range].b);
-        store_reg_to_frame(R_ACC, end);
+        gen_expr(cx, NODES[range].a);
+        store_reg_to_frame(cx, R_ACC, counter);
+        gen_expr(cx, NODES[range].b);
+        store_reg_to_frame(cx, R_ACC, end);
         let labels = new_loop_labels(n, 3);
         let next = labels;
         let exit = labels + 1;
         let test = labels + 2;
-        emit_label(test);
-        load_counter_and_end(counter, end);
-        emit_compare_jump(if inclusive { Cond::Gt } else { Cond::Ge }, is_signed(ty), exit);
-        bind(NODES[n].b);
+        emit_label(cx, test);
+        load_counter_and_end(cx, counter, end);
+        emit_compare_jump(cx, if inclusive { Cond::Gt } else { Cond::Ge }, is_signed(ty), exit);
+        bind(cx, NODES[n].b);
         defer_loop_enter(n);
-        gen_block(NODES[n].d);
+        gen_block(cx, NODES[n].d);
         defer_loop_leave();
-        emit_label(next);
-        load_counter_and_end(counter, end);
+        emit_label(cx, next);
+        load_counter_and_end(cx, counter, end);
         if inclusive {
-            emit_compare_jump(Cond::Eq, is_signed(ty), exit);
+            emit_compare_jump(cx, Cond::Eq, is_signed(ty), exit);
         }
-        emit_add_imm(R_ACC, 1);
-        store_reg_to_frame(R_ACC, counter);
-        emit_jump(test);
-        emit_label(exit);
+        emit_add_imm(cx, R_ACC, 1);
+        store_reg_to_frame(cx, R_ACC, counter);
+        emit_jump(cx, test);
+        emit_label(cx, exit);
     }
 }
 
 // The accumulator = the counter, the second operand = the end.
-fn load_counter_and_end(counter: i64, end: i64) {
-    load_reg_from_frame(R_SECOND, end);
-    load_reg_from_frame(R_ACC, counter);
+fn load_counter_and_end(mut cx: *FnCtx, counter: i64, end: i64) {
+    load_reg_from_frame(cx, R_SECOND, end);
+    load_reg_from_frame(cx, R_ACC, counter);
 }
 
 // `break` (to_end 1) or `continue` (to_end 0) out of loop `lp`.
-pub fn jump_out_to_loop(lp: i64, to_end: i64) {
+pub fn jump_out_to_loop(mut cx: *FnCtx, lp: i64, to_end: i64) {
     unsafe {
         let label = NODES[lp].z;
-        emit_drop_temps(DEPTH - LABEL_DEPTH.data[label]);
-        emit_jump(label + to_end);
+        emit_drop_temps(cx, DEPTH - LABEL_DEPTH.data[label]);
+        emit_jump(cx, label + to_end);
     }
 }

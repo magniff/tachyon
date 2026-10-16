@@ -4,34 +4,26 @@
 // shrink-wrapping.
 
 use crate::back::abi::{
-    ABI_PIECE_COUNT, ABI_PIECE_TY, AbiClass, abi_piece_locations, abi_stack_location, conv_classify,
-    conv_returns_through_pointer, fn_uses_c,
+    AbiClass, abi_piece_locations, abi_stack_location, conv_classify, conv_returns_through_pointer,
+    fn_uses_c,
 };
 use crate::back::dwarf::{dbg_function_begin, dbg_function_end, dbg_loc};
-use crate::back::emit::{
-    EPILOGUE_LABEL, FRAME_OUT, FRAME_TOTAL, LABEL_BASE, SAVE_BASE, SHORT_BRANCHES, SPILL_BASE,
-};
 use crate::back::emit::blocks::{emit_ir_block, find_trivial_jumps};
-use crate::back::emit::calls::{USES_SLOTS, call_stack_size, callee_param, callee_param_count};
-use crate::back::emit::insts::{LAST_SELECT, LAST_SELECT_END};
+use crate::back::emit::calls::{call_stack_size, callee_param, callee_param_count};
 use crate::back::emit::machine::{
-    LAST_MOV_END, LAST_STORE_END, arg_reg, conv_result_ptr_reg, m_jump, m_load, m_normalize,
-    m_store, reg_move_temp, reg_sp, spill_offset, t_arg_location, xl_from_c, xl_is_stack, xl_offset,
+    arg_reg, conv_result_ptr_reg, m_jump, m_load, m_normalize, m_store, reg_move_temp, reg_sp,
+    spill_offset, t_arg_location, xl_from_c, xl_is_stack, xl_offset,
 };
 use crate::back::emit::operands::{PM_ADDR, PM_LOC, PM_STACK, pm_add, pm_resolve, result_done};
-use crate::back::emit::stats::{STATS, ST_FN, ST_FRAME, ST_FRAMES, ST_SAVES, st_function_done};
+use crate::back::emit::stats::{STATS, ST_FRAME, ST_FRAMES, ST_SAVES, st_function_done};
 use crate::back::isel::select_function;
-use crate::back::layout::{EMIT, layout_emission};
-use crate::back::mc_arm64::{PAIR_END, ma_frame_link, ma_frame_unlink};
+use crate::back::layout::layout_emission;
+use crate::back::mc_arm64::{ma_frame_link, ma_frame_unlink};
 use crate::back::mc_arm64::ops::ma_pair;
 use crate::back::mc_x86_64::{mx_frame_link, mx_frame_unlink};
 use crate::back::objfile::asm_flush;
-use crate::back::regalloc::{
-    CALLEE_USED, LDEPTH, LOC_NONE, ORDER, SPILL_COUNT, SPILL_VECTORS, USES, VERIFY_REGALLOC,
-    allocate_registers,
-};
+use crate::back::regalloc::{LOC_NONE, VERIFY_REGALLOC, allocate_registers};
 use crate::back::regalloc::check::check_allocation;
-use crate::back::regalloc::intervals::RETURNS_TWICE;
 use crate::back::regalloc::locations::{mark_frame_blocks, tloc, vloc};
 use crate::back::regalloc::prepare::{count_uses, is_emitted, tracked};
 use crate::base::{BUFS, IntVec, buf_bytes, buf_clear, buf_slice, die, free, memcmp, strlen};
@@ -45,14 +37,14 @@ use crate::front::types::{
 use crate::gen0::arm64::{a64_align_down, a64_epilogue, a64_frame_reserve};
 use crate::gen0::gen::{fn_is_global, fn_symbol_prefix};
 use crate::gen0::target::{
-    ASM, CODE, LABEL_COUNT, arg_location, emit_function_start, emit_label, first_int_arg, ins,
-    new_label,
+    LABEL_COUNT, arg_location, emit_function_start, emit_label, first_int_arg, ins, new_label,
 };
 use crate::gen0::x86_64::{x64_epilogue, x64_frame_reserve, x64_imm};
+use crate::middle::ctx::FnCtx;
 use crate::middle::inline::{FN_LIVE, leaf_dropped, leaf_kept};
 use crate::middle::ir::{
-    ARGTY, BLOCKS, INSTS, INST_LOC, IRFUNCS, IRFUNC_COUNT, SLOTS, Term, VARIADIC_PIECE, ir_enter,
-    ir_free_func, ir_operand, ir_operand_count,
+    IRFUNCS, IRFUNC_COUNT, Term, VARIADIC_PIECE, ir_enter, ir_free_func, ir_operand,
+    ir_operand_count,
 };
 use crate::middle::ir::Op::{CallC, Param, Phi, Slot};
 use crate::middle::ir::cfg::{succ, succ_count};
@@ -60,132 +52,127 @@ use crate::middle::opt::{PER_FUNCTION, optimize_function};
 
 // ---- Functions ----
 
-// Assigns the frame offsets (after register allocation).
-// Whether the function being emitted calls anything.
-static mut HAS_CALLS: bool = false;
-
-// The alignment of the frame (above 16: sp is realigned in the prologue,
-// for slots, and stack arguments, aligned above 16).
-static mut FRAME_ALIGN: i64 = 16;
-
-fn layout_frame(fi: i64) {
+fn layout_frame(mut cx: *FnCtx, fi: i64) {
     unsafe {
-        FRAME_OUT = 0;
-        FRAME_ALIGN = 16;
-        HAS_CALLS = false;
-        USES_SLOTS = false;
+        cx.frame_out = 0;
+        cx.frame_align = 16;
+        cx.has_calls = false;
+        cx.uses_slots = false;
         // Slots no instruction refers to any more (scalar replacement took
         // them apart) get no room: offset -1.
         for i in 0..IRFUNCS[fi].slots.count {
-            SLOTS[IRFUNCS[fi].slots.data[i]].offset = -1;
+            cx.slots[IRFUNCS[fi].slots.data[i]].offset = -1;
         }
-        for i in 0..ORDER.count {
-            let mut v = BLOCKS[ORDER.data[i]].first;
+        for i in 0..cx.order.count {
+            let mut v = cx.blocks[cx.order.data[i]].first;
             while v != 0 {
-                if INSTS[v].op.is_call() && is_emitted(v) {
-                    HAS_CALLS = true;
+                if cx.insts[v].op.is_call() && is_emitted(cx, v) {
+                    cx.has_calls = true;
                 }
-                if INSTS[v].op == Slot && USES[v] > 0 {
-                    SLOTS[INSTS[v].imm].offset = 0;
-                    USES_SLOTS = true;
+                if cx.insts[v].op == Slot && cx.regalloc_uses[v] > 0 {
+                    cx.slots[cx.insts[v].imm].offset = 0;
+                    cx.uses_slots = true;
                 }
-                if INSTS[v].op.is_call() {
-                    let size = call_stack_size(v);
-                    if size > FRAME_OUT {
-                        FRAME_OUT = size;
+                if cx.insts[v].op.is_call() {
+                    let size = call_stack_size(cx, v);
+                    if size > cx.frame_out {
+                        cx.frame_out = size;
                     }
-                    if INSTS[v].op != CallC {
-                        for k in 0..callee_param_count(v) {
-                            FRAME_ALIGN = max_i64(FRAME_ALIGN, type_align(callee_param(v, k)));
+                    if cx.insts[v].op != CallC {
+                        for k in 0..callee_param_count(cx, v) {
+                            cx.frame_align = max_i64(cx.frame_align,
+                                type_align(callee_param(cx, v, k)));
                         }
                     }
                     // Aggregates passed to `...` (their first piece carries the
                     // type, negated).
-                    for k in 0..INSTS[v].nargs {
-                        let declared = ARGTY.data[INSTS[v].args + k];
+                    for k in 0..cx.insts[v].nargs {
+                        let declared = cx.argty.data[cx.insts[v].args + k];
                         if declared < 0 && declared != VARIADIC_PIECE {
-                            FRAME_ALIGN = max_i64(FRAME_ALIGN, type_align(0 - declared));
+                            cx.frame_align = max_i64(cx.frame_align, type_align(0 - declared));
                         }
                     }
                 }
-                v = INSTS[v].next;
+                v = cx.insts[v].next;
             }
         }
-        let mut offset = align_to(FRAME_OUT, if SPILL_VECTORS { 16 } else { 8 });
-        SPILL_BASE = offset;
-        offset += 8 * SPILL_COUNT;
-        SAVE_BASE = offset;
-        offset += 8 * CALLEE_USED[0..64].iter().filter(|u| u != 0).count();
+        let mut offset = align_to(cx.frame_out, if cx.spill_vectors { 16 } else { 8 });
+        cx.spill_base = offset;
+        offset += 8 * cx.spill_count;
+        cx.save_base = offset;
+        offset += 8 * cx.callee_used[0..64].iter().filter(|u| u != 0).count();
         if offset > 32760 {
             die(c"internal error: too many spill slots");
         }
         for s in IRFUNCS[fi].slots.items() {
-            if SLOTS[s].offset < 0 {
+            if cx.slots[s].offset < 0 {
                 continue;
             }
-            offset = align_to(offset, SLOTS[s].align);
-            SLOTS[s].offset = offset;
-            offset += SLOTS[s].size;
-            FRAME_ALIGN = max_i64(FRAME_ALIGN, SLOTS[s].align);
+            offset = align_to(offset, cx.slots[s].align);
+            cx.slots[s].offset = offset;
+            offset += cx.slots[s].size;
+            cx.frame_align = max_i64(cx.frame_align, cx.slots[s].align);
         }
-        FRAME_TOTAL = align_to(offset, 16);
+        cx.frame_total = align_to(offset, 16);
     }
 }
 
 // Saves (or restores) the callee-saved registers used: on AArch64 two at
 // a time (stp, ldp) when they are of one kind.
-fn save_callee_saved(restore: bool) {
-    let mut offset = SAVE_BASE;
-    let mut pending = -1;
-    for r in 0..64 {
-        if CALLEE_USED[r] == 0 {
-            continue;
-        }
-        if !X86 && pending >= 0 && (pending >= 32) == (r >= 32) && offset - 8 <= 504 {
-            ma_pair(restore, pending, r, offset - 8);
-            pending = -1;
-        } else {
-            if pending >= 0 {
-                save_one(restore, pending, offset - 8);
+fn save_callee_saved(mut cx: *FnCtx, restore: bool) {
+    unsafe {
+        let mut offset = cx.save_base;
+        let mut pending = -1;
+        for r in 0..64 {
+            if cx.callee_used[r] == 0 {
+                continue;
             }
-            pending = r;
+            if !X86 && pending >= 0 && (pending >= 32) == (r >= 32) && offset - 8 <= 504 {
+                ma_pair(cx, restore, pending, r, offset - 8);
+                pending = -1;
+            } else {
+                if pending >= 0 {
+                    save_one(cx, restore, pending, offset - 8);
+                }
+                pending = r;
+            }
+            offset += 8;
         }
-        offset += 8;
-    }
-    if pending >= 0 {
-        save_one(restore, pending, offset - 8);
+        if pending >= 0 {
+            save_one(cx, restore, pending, offset - 8);
+        }
     }
 }
 
-fn save_one(restore: bool, r: i64, offset: i64) {
+fn save_one(mut cx: *FnCtx, restore: bool, r: i64, offset: i64) {
     let ty = if r >= 32 { TY_F64 } else { TY_U64 };
     if restore {
-        m_load(ty, r, reg_sp(), offset);
+        m_load(cx, ty, r, reg_sp(), offset);
     } else {
-        m_store(ty, r, reg_sp(), offset);
+        m_store(cx, ty, r, reg_sp(), offset);
     }
 }
 
 // The location of each parameter of function `f` (by its convention): of
 // parameter i at locations[i], or of its pieces at pieces[4 * i + k] (see
 // abi.tach).
-pub fn param_locations(f: i64, locations: *i64, pieces: *i64) {
+pub fn param_locations(mut cx: *FnCtx, f: i64, locations: *i64, pieces: *i64) {
     unsafe {
         let c = fn_uses_c(f);
         let ret = FNS[f].ret;
-        let first = if c { first_int_arg(ret) }
-            else if conv_returns_through_pointer(false, ret) { 1 } else { 0 };
+        let first = if c { first_int_arg(cx, ret) }
+            else if conv_returns_through_pointer(cx, false, ret) { 1 } else { 0 };
         let mut state: [i64; 3] = [first, 0, 0];
         for i in 0..FNS[f].param_count {
             let ty = fn_param(f, i);
             if is_void(ty) {
                 continue;
             }
-            let kind = conv_classify(c, ty);
+            let kind = conv_classify(cx, c, ty);
             if !c {
                 if kind == AbiClass::Pieces {
-                    for k in 0..ABI_PIECE_COUNT {
-                        pieces[4 * i + k] = t_arg_location(ABI_PIECE_TY[k], &state as *i64);
+                    for k in 0..cx.abi_piece_count {
+                        pieces[4 * i + k] = t_arg_location(cx.abi_piece_ty[k], &state as *i64);
                     }
                 } else {
                     locations[i] = t_arg_location(if kind == AbiClass::Ref { TY_U64 }
@@ -194,8 +181,8 @@ pub fn param_locations(f: i64, locations: *i64, pieces: *i64) {
                 continue;
             }
             if kind == AbiClass::Pieces {
-                abi_piece_locations(ty, &state as *i64, &pieces[4 * i]);
-                for k in 0..ABI_PIECE_COUNT {
+                abi_piece_locations(cx, ty, &state as *i64, &pieces[4 * i]);
+                for k in 0..cx.abi_piece_count {
                     pieces[4 * i + k] = xl_from_c(pieces[4 * i + k]);
                 }
             } else if kind == AbiClass::Stack {
@@ -209,7 +196,7 @@ pub fn param_locations(f: i64, locations: *i64, pieces: *i64) {
 }
 
 // Moves the parameters from where the caller put them to their locations.
-fn emit_entry_moves(fi: i64) {
+fn emit_entry_moves(mut cx: *FnCtx, fi: i64) {
     unsafe {
         let f = IRFUNCS[fi].f;
         let mut locations: [i64; 64] = [0; 64];
@@ -217,118 +204,119 @@ fn emit_entry_moves(fi: i64) {
         if FNS[f].param_count > 64 {
             die(c"too many parameters (at most 64 are supported)");
         }
-        param_locations(f, &locations as *i64, &pieces as *i64);
+        param_locations(cx, f, &locations as *i64, &pieces as *i64);
         let entry = IRFUNCS[fi].entry;
-        let mut v = BLOCKS[entry].first;
+        let mut v = cx.blocks[entry].first;
         while v != 0 {
-            let loc = vloc(v, 0);
-            if INSTS[v].op == Param && loc != LOC_NONE {
-                let ty = INSTS[v].ty;
-                let index = INSTS[v].imm;
-                let piece = INSTS[v].imm2;
+            let loc = vloc(cx, v, 0);
+            if cx.insts[v].op == Param && loc != LOC_NONE {
+                let ty = cx.insts[v].ty;
+                let index = cx.insts[v].imm;
+                let piece = cx.insts[v].imm2;
                 if index < 0 {
-                    pm_add(loc, PM_LOC, conv_result_ptr_reg(fn_uses_c(f)), TY_U64, 0, v);
+                    pm_add(cx, loc, PM_LOC, conv_result_ptr_reg(fn_uses_c(f)), TY_U64, 0, v);
                 } else {
                     let location = if piece > 0 { pieces[4 * index + piece - 1] }
                         else { locations[index] };
                     // Stack arguments are 16 bytes above the frame pointer.
                     if piece < 0 {
-                        pm_add(loc, PM_ADDR, 16 + xl_offset(location), TY_U64, 0, v);
+                        pm_add(cx, loc, PM_ADDR, 16 + xl_offset(location), TY_U64, 0, v);
                     } else if xl_is_stack(location) {
                         let param_ty = fn_param(f, index);
                         let load_ty = if is_compound(param_ty) && piece == 0 { TY_U64 } else { ty };
-                        pm_add(loc, PM_STACK, 16 + xl_offset(location), load_ty, 0, v);
+                        pm_add(cx, loc, PM_STACK, 16 + xl_offset(location), load_ty, 0, v);
                     } else {
-                        pm_add(loc, PM_LOC, arg_reg(location), ty, 0, v);
+                        pm_add(cx, loc, PM_LOC, arg_reg(location), ty, 0, v);
                     }
                 }
             }
-            v = INSTS[v].next;
+            v = cx.insts[v].next;
         }
-        pm_resolve();
+        pm_resolve(cx);
         // Narrow integers from C callers may carry garbage above their width;
         // parameters that go to the stack are stored there.
-        v = BLOCKS[entry].first;
+        v = cx.blocks[entry].first;
         while v != 0 {
-            let ty = INSTS[v].ty;
-            let t = tracked(v);
-            if INSTS[v].op == Param && t >= 0 {
-                let narrow = INSTS[v].imm >= 0
+            let ty = cx.insts[v].ty;
+            let t = tracked(cx, v);
+            if cx.insts[v].op == Param && t >= 0 {
+                let narrow = cx.insts[v].imm >= 0
                     && (ty == TY_BOOL || (is_integer(ty) && int_bits(ty) < 64));
-                let loc = tloc(t, 0);
+                let loc = tloc(cx, t, 0);
                 if loc >= 0 {
                     if narrow {
-                        m_normalize(loc, if ty == TY_BOOL { TY_U8 } else { ty });
+                        m_normalize(cx, loc, if ty == TY_BOOL { TY_U8 } else { ty });
                     }
-                    result_done(v, loc);
+                    result_done(cx, v, loc);
                 } else if narrow {
                     let r = reg_move_temp(float: false);
-                    m_load(TY_U64, r, reg_sp(), spill_offset(loc));
-                    m_normalize(r, if ty == TY_BOOL { TY_U8 } else { ty });
-                    m_store(TY_U64, r, reg_sp(), spill_offset(loc));
+                    m_load(cx, TY_U64, r, reg_sp(), spill_offset(cx, loc));
+                    m_normalize(cx, r, if ty == TY_BOOL { TY_U8 } else { ty });
+                    m_store(cx, TY_U64, r, reg_sp(), spill_offset(cx, loc));
                 }
             }
-            v = INSTS[v].next;
+            v = cx.insts[v].next;
         }
     }
 }
 
-pub fn gen_ir_function(fi: i64) {
+pub fn gen_ir_function(mut cx: *FnCtx, fi: i64) {
     unsafe {
-        ir_enter(fi);
+        ir_enter(cx, fi);
         let f = IRFUNCS[fi].f;
-        allocate_registers(fi);
+        allocate_registers(cx, fi);
         if VERIFY_REGALLOC {
-            check_allocation(fi);
+            check_allocation(cx, fi);
         }
-        layout_frame(fi);
-        shrink_wrap(fi);
-        SHORT_BRANCHES = function_size(fi) <= 800;
-        find_trivial_jumps();
-        layout_emission();
-        buf_clear(CODE);
+        layout_frame(cx, fi);
+        shrink_wrap(cx, fi);
+        cx.short_branches = function_size(cx, fi) <= 800;
+        find_trivial_jumps(cx);
+        layout_emission(cx);
+        buf_clear(cx.code);
         // The peepholes' memory of what was just emitted belongs to the code of
         // the function before (whose length the new one's may match).
-        LAST_MOV_END = -1;
-        LAST_STORE_END = -1;
-        PAIR_END = -1;
-        LAST_SELECT = 0;
-        LAST_SELECT_END = -1;
-        LABEL_BASE = LABEL_COUNT + 1;
-        LABEL_COUNT += ORDER.count;
-        EPILOGUE_LABEL = new_label();
-        EPILOGUE_USED = false;
-        FELL_INTO_EPILOGUE = false;
-        HAS_FRAME = SAVE >= 0;
-        LAST_LOC = 0;
+        cx.last_mov_end = -1;
+        cx.last_store_end = -1;
+        cx.pair_end = -1;
+        cx.last_select = 0;
+        cx.last_select_end = -1;
+        cx.label_base = LABEL_COUNT + 1;
+        LABEL_COUNT += cx.order.count;
+        cx.epilogue_label = new_label();
+        cx.epilogue_used = false;
+        cx.fell_into_epilogue = false;
+        cx.has_frame = cx.save >= 0;
+        cx.last_loc = 0;
         let item = IRFUNCS[fi].item;
-        dbg_function_begin(f, fn_symbol_prefix(f), if item > 0 { NODES[item].start } else { -1 });
-        ir_function_start(fn_symbol_prefix(f), FNS[f].name, fn_is_global(f), SAVE == 0);
-        CUR_IN_FRAME = SAVE == 0;
-        if SAVE == 0 {
-            emit_frame_setup();
+        dbg_function_begin(cx, f, fn_symbol_prefix(f),
+            if item > 0 { NODES[item].start } else { -1 });
+        ir_function_start(cx, fn_symbol_prefix(f), FNS[f].name, fn_is_global(f), cx.save == 0);
+        cx.cur_in_frame = cx.save == 0;
+        if cx.save == 0 {
+            emit_frame_setup(cx);
         }
-        emit_entry_moves(fi);
-        for j in 0..EMIT.count {
-            emit_ir_block(EMIT.data[j], j);
+        emit_entry_moves(cx, fi);
+        for j in 0..cx.emit.count {
+            emit_ir_block(cx, cx.emit.data[j], j);
         }
         // The epilogue, when a block jumps to it or the last one falls into it
         // (blocks in the frame's region only).
-        if EPILOGUE_USED || FELL_INTO_EPILOGUE {
-            CUR_IN_FRAME = true;
-            emit_label(EPILOGUE_LABEL);
-            emit_ir_epilogue();
+        if cx.epilogue_used || cx.fell_into_epilogue {
+            cx.cur_in_frame = true;
+            emit_label(cx, cx.epilogue_label);
+            emit_ir_epilogue(cx);
         }
         if STATS > 0 {
-            if HAS_FRAME {
-                ST_FN[ST_FRAMES] = 1;
-                ST_FN[ST_FRAME] = FRAME_TOTAL + 16;
+            if cx.has_frame {
+                cx.st_fn[ST_FRAMES] = 1;
+                cx.st_fn[ST_FRAME] = cx.frame_total + 16;
             }
-            ST_FN[ST_SAVES] += CALLEE_USED[0..64].iter().filter(|u| u != 0).count();
-            st_function_done(fi);
+            cx.st_fn[ST_SAVES] += cx.callee_used[0..64].iter().filter(|u| u != 0).count();
+            st_function_done(cx, fi);
         }
-        buf_bytes(ASM, buf_slice(CODE));
-        dbg_function_end();
+        buf_bytes(cx.asm, buf_slice(cx.code));
+        dbg_function_end(cx);
     }
 }
 
@@ -339,124 +327,113 @@ pub fn gen_ir_function(fi: i64) {
 // in flight is one function's, at -O2 the optimized program's at most.
 // -O1's small leaves come last: the functions after one inline its IR as
 // the middle end left it, not as instruction selection makes it.
-pub fn emit_ir_functions() {
+pub fn emit_ir_functions(mut cx: *FnCtx) {
     unsafe {
         for fi in 0..IRFUNC_COUNT {
             if !leaf_kept(fi) {
-                emit_ir_function(fi);
+                emit_ir_function(cx, fi);
             }
         }
         for fi in 0..IRFUNC_COUNT {
             if leaf_kept(fi) {
-                emit_ir_function(fi);
+                emit_ir_function(cx, fi);
             }
         }
     }
 }
 
 // One function of emit_ir_functions, then its IR freed.
-fn emit_ir_function(fi: i64) {
+fn emit_ir_function(mut cx: *FnCtx, fi: i64) {
     unsafe {
         if FN_LIVE[fi] != 0 && !leaf_dropped(fi) {
             if PER_FUNCTION {
                 let t = timer_now();
-                optimize_function(fi);
+                optimize_function(cx, fi);
                 timer_add(T_SCALAR, t);
             }
             let t = timer_now();
-            select_function(fi);
+            select_function(cx, fi);
             timer_add(T_ISEL, t);
             let t2 = timer_now();
-            count_uses(fi);
-            gen_ir_function(fi);
+            count_uses(cx, fi);
+            gen_ir_function(cx, fi);
             timer_add(T_CODEGEN, t2);
             let t3 = timer_now();
-            asm_flush();
+            asm_flush(cx);
             timer_add(T_CODEGEN, t3);
         }
-        ir_free_func(fi);
+        ir_free_func(cx, fi);
     }
 }
-
-// (-g) The source position (+ 1) of the last `.loc` written.
-static mut LAST_LOC: i64 = 0;
 
 // (-g) The `.loc` of instruction v, when it starts another statement. The
 // peepholes that look at what was just emitted see through it.
-pub fn emit_loc(v: i64) {
+pub fn emit_loc(mut cx: *FnCtx, v: i64) {
     unsafe {
-        let loc = INST_LOC.data[v];
-        if loc == 0 || loc == LAST_LOC {
+        let loc = cx.inst_loc.data[v];
+        if loc == 0 || loc == cx.last_loc {
             return;
         }
-        LAST_LOC = loc;
-        let before = BUFS[CODE].len;
-        dbg_loc(CODE, loc - 1);
-        let after = BUFS[CODE].len;
-        if LAST_MOV_END == before {
-            LAST_MOV_END = after;
+        cx.last_loc = loc;
+        let before = BUFS[cx.code].len;
+        dbg_loc(cx.code, loc - 1);
+        let after = BUFS[cx.code].len;
+        if cx.last_mov_end == before {
+            cx.last_mov_end = after;
         }
-        if LAST_STORE_END == before {
-            LAST_STORE_END = after;
+        if cx.last_store_end == before {
+            cx.last_store_end = after;
         }
-        if LAST_SELECT_END == before {
-            LAST_SELECT_END = after;
+        if cx.last_select_end == before {
+            cx.last_select_end = after;
         }
     }
 }
 
-// Whether a jump to the epilogue was emitted.
-static mut EPILOGUE_USED: bool = false;
-
-// Whether the code emitted last returns, in the frame's region, by
-// falling into the epilogue.
-pub static mut FELL_INTO_EPILOGUE: bool = false;
-
-// Whether the function being emitted has a frame.
-static mut HAS_FRAME: bool = false;
-
-fn emit_ir_epilogue() {
+fn emit_ir_epilogue(mut cx: *FnCtx) {
     unsafe {
-        if !CUR_IN_FRAME {
-            ins(c"ret");
+        if !cx.cur_in_frame {
+            ins(cx, c"ret");
             return;
         }
-        save_callee_saved(restore: true);
-        if !HAS_FRAME {
-            ins(c"ret");
+        save_callee_saved(cx, restore: true);
+        if !cx.has_frame {
+            ins(cx, c"ret");
         } else if X86 {
-            x64_epilogue();
+            x64_epilogue(cx);
         } else {
-            a64_epilogue();
+            a64_epilogue(cx);
         }
     }
 }
 
 // A return from a block that is not the last: the epilogue itself when it
 // is short (at most 4 registers to restore), else a jump to it.
-pub fn emit_return() {
-    if !CUR_IN_FRAME {
-        unsafe { ins(c"ret"); }
-        return;
-    }
-    let saved = CALLEE_USED[0..64].iter().filter(|u| u != 0).count();
-    if saved <= 4 {
-        emit_ir_epilogue();
-    } else {
-        EPILOGUE_USED = true;
-        m_jump(EPILOGUE_LABEL);
+pub fn emit_return(mut cx: *FnCtx) {
+    unsafe {
+        if !cx.cur_in_frame {
+            unsafe { ins(cx, c"ret"); }
+            return;
+        }
+        let saved = cx.callee_used[0..64].iter().filter(|u| u != 0).count();
+        if saved <= 4 {
+            emit_ir_epilogue(cx);
+        } else {
+            cx.epilogue_used = true;
+            m_jump(cx, cx.epilogue_label);
+        }
     }
 }
 
 // The number of instructions of function fi.
-fn function_size(fi: i64) -> i64 {
+fn function_size(mut cx: *FnCtx, fi: i64) -> i64 {
     unsafe {
         let mut n = 0;
-        for i in 0..ORDER.count {
-            let mut v = BLOCKS[ORDER.data[i]].first;
+        for i in 0..cx.order.count {
+            let mut v = cx.blocks[cx.order.data[i]].first;
             while v != 0 {
                 n += 1;
-                v = INSTS[v].next;
+                v = cx.insts[v].next;
             }
         }
         n
@@ -465,7 +442,7 @@ fn function_size(fi: i64) -> i64 {
 
 // Whether function fi has parameters on the stack (read from the frame
 // pointer: the frame is then set up at its entry).
-fn has_stack_params(fi: i64) -> bool {
+fn has_stack_params(mut cx: *FnCtx, fi: i64) -> bool {
     unsafe {
         let f = IRFUNCS[fi].f;
         let mut locations: [i64; 64] = [0; 64];
@@ -473,73 +450,44 @@ fn has_stack_params(fi: i64) -> bool {
         if FNS[f].param_count > 64 {
             return true;
         }
-        param_locations(f, &locations as *i64, &pieces as *i64);
-        let mut v = BLOCKS[IRFUNCS[fi].entry].first;
+        param_locations(cx, f, &locations as *i64, &pieces as *i64);
+        let mut v = cx.blocks[IRFUNCS[fi].entry].first;
         while v != 0 {
-            if INSTS[v].op == Param && INSTS[v].imm >= 0 {
-                let index = INSTS[v].imm;
-                let piece = INSTS[v].imm2;
+            if cx.insts[v].op == Param && cx.insts[v].imm >= 0 {
+                let index = cx.insts[v].imm;
+                let piece = cx.insts[v].imm2;
                 let location = if piece > 0 { pieces[4 * index + piece - 1] }
                     else { locations[index] };
                 if piece < 0 || xl_is_stack(location) {
                     return true;
                 }
             }
-            v = INSTS[v].next;
+            v = cx.insts[v].next;
         }
         false
     }
 }
 
-// ---- Shrink-wrapping ----
-//
-// The frame (the saved frame pointer and return address, the reserved
-// area, the saved callee-saved registers) is set up at the start of block
-// SAVE (a layout index): the nearest common dominator of the blocks that
-// need it (a call, a frame slot, a value in a callee-saved register or on
-// the stack, see mark_frame_blocks), moved up the dominator tree out of
-// loops. Its region is the blocks it dominates; a jump out of the region
-// (with critical edges split, only a block ending in a jump leaves it)
-// tears the frame down after the edge's moves, and the blocks outside run
-// without a frame: no path re-enters the region but through SAVE, and
-// SAVE is in no loop, so the frame is set up and torn down at most once.
-// Blocks outside return with a bare `ret`; a block outside that ends in a
-// call that does not return (a panic) links a frame of its own first
-// (x86-64 calls need an aligned stack). SAVE is 0 (the entry) when the frame is set up with the
-// function, -1 when it has none. Functions calling setjmp and the like,
-// realigning their frame or taking parameters on the stack keep theirs
-// at the entry.
-pub static mut SAVE: i64 = -1;
-
-// Per layout index: whether the block runs with the frame set up, and its
-// immediate dominator.
-pub static mut IN_FRAME: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-static mut SW_IDOM: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-// Whether the block being emitted runs with the frame set up.
-pub static mut CUR_IN_FRAME: bool = true;
-
 // Whether block b ends in a call that does not return, passing nothing
 // on the stack (its frame can be its own).
-pub fn is_noreturn_call_block(b: i64) -> bool {
+pub fn is_noreturn_call_block(mut cx: *FnCtx, b: i64) -> bool {
     unsafe {
-        let v = BLOCKS[b].last;
-        BLOCKS[b].term == Term::Unreach && v != 0 && INSTS[v].op.is_call()
-            && call_stack_size(v) == 0
+        let v = cx.blocks[b].last;
+        cx.blocks[b].term == Term::Unreach && v != 0 && cx.insts[v].op.is_call()
+            && call_stack_size(cx, v) == 0
     }
 }
 
-fn sw_intersect(a: i64, b: i64) -> i64 {
+fn sw_intersect(mut cx: *FnCtx, a: i64, b: i64) -> i64 {
     unsafe {
         let mut x = a;
         let mut y = b;
         while x != y {
             while x > y {
-                x = SW_IDOM.data[x];
+                x = cx.sw_idom.data[x];
             }
             while y > x {
-                y = SW_IDOM.data[y];
+                y = cx.sw_idom.data[y];
             }
         }
         x
@@ -547,38 +495,38 @@ fn sw_intersect(a: i64, b: i64) -> i64 {
 }
 
 // Whether layout index a dominates layout index x.
-fn sw_dominates(a: i64, x: i64) -> bool {
+fn sw_dominates(mut cx: *FnCtx, a: i64, x: i64) -> bool {
     let mut y = x;
     while y > a {
-        unsafe { y = SW_IDOM.data[y]; }
+        unsafe { y = cx.sw_idom.data[y]; }
     }
     y == a
 }
 
 // Dominators over the layout (a reverse post-order): Cooper, Harvey and
 // Kennedy's iteration.
-fn sw_dominators() {
+fn sw_dominators(mut cx: *FnCtx) {
     unsafe {
-        let n = ORDER.count;
-        SW_IDOM.count = 0;
+        let n = cx.order.count;
+        cx.sw_idom.count = 0;
         for k in 0..n {
-            SW_IDOM.push(if k == 0 { 0 } else { -1 });
+            cx.sw_idom.push(if k == 0 { 0 } else { -1 });
         }
         let mut changed = true;
         while changed {
             changed = false;
             for k in 1..n {
-                let b = ORDER.data[k];
+                let b = cx.order.data[k];
                 let mut idom = -1;
-                for i in 0..BLOCKS[b].preds.count {
-                    let pk = BLOCKS[BLOCKS[b].preds.data[i]].order;
-                    if pk < 0 || SW_IDOM.data[pk] < 0 {
+                for i in 0..cx.blocks[b].preds.count {
+                    let pk = cx.blocks[cx.blocks[b].preds.data[i]].order;
+                    if pk < 0 || cx.sw_idom.data[pk] < 0 {
                         continue;
                     }
-                    idom = if idom < 0 { pk } else { sw_intersect(pk, idom) };
+                    idom = if idom < 0 { pk } else { sw_intersect(cx, pk, idom) };
                 }
-                if idom != SW_IDOM.data[k] {
-                    SW_IDOM.data[k] = idom;
+                if idom != cx.sw_idom.data[k] {
+                    cx.sw_idom.data[k] = idom;
                     changed = true;
                 }
             }
@@ -588,22 +536,23 @@ fn sw_dominators() {
 
 // Whether the frame can be set up at layout index s: s is in no loop, no
 // block of its region leads back to it, and only jumps leave the region.
-fn sw_valid(s: i64) -> bool {
+fn sw_valid(mut cx: *FnCtx, s: i64) -> bool {
     unsafe {
         if s == 0 {
             return true;
         }
-        if LDEPTH.data[s] != 0 {
+        if cx.ldepth.data[s] != 0 {
             return false;
         }
-        for k in s..ORDER.count {
-            if !sw_dominates(s, k) {
+        for k in s..cx.order.count {
+            if !sw_dominates(cx, s, k) {
                 continue;
             }
-            let b = ORDER.data[k];
-            for i in 0..succ_count(b) {
-                let sk = BLOCKS[succ(b, i)].order;
-                if sk == s || sk < 0 || (!sw_dominates(s, sk) && BLOCKS[b].term != Term::Jump) {
+            let b = cx.order.data[k];
+            for i in 0..succ_count(cx, b) {
+                let sk = cx.blocks[succ(cx, b, i)].order;
+                if sk == s || sk < 0
+                    || (!sw_dominates(cx, s, sk) && cx.blocks[b].term != Term::Jump) {
                     return false;
                 }
             }
@@ -614,37 +563,37 @@ fn sw_valid(s: i64) -> bool {
 
 // Tears the frame down (on a jump out of its region): restores the
 // callee-saved registers, sp, the frame pointer and the return address.
-pub fn emit_frame_teardown() {
-    save_callee_saved(restore: true);
-    if X86 { mx_frame_unlink(); } else { ma_frame_unlink(); }
+pub fn emit_frame_teardown(mut cx: *FnCtx) {
+    save_callee_saved(cx, restore: true);
+    if X86 { mx_frame_unlink(cx); } else { ma_frame_unlink(cx); }
 }
 
-fn shrink_wrap(fi: i64) {
+fn shrink_wrap(mut cx: *FnCtx, fi: i64) {
     unsafe {
-        let n = ORDER.count;
+        let n = cx.order.count;
         let mut need = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for _ in 0..n {
             need.push(0);
         }
         for k in 0..n {
-            let b = ORDER.data[k];
-            let mut v = BLOCKS[b].first;
+            let b = cx.order.data[k];
+            let mut v = cx.blocks[b].first;
             while v != 0 {
-                let op = INSTS[v].op;
-                if op.is_call() && is_emitted(v)
-                    && !(v == BLOCKS[b].last && is_noreturn_call_block(b)) {
+                let op = cx.insts[v].op;
+                if op.is_call() && is_emitted(cx, v)
+                    && !(v == cx.blocks[b].last && is_noreturn_call_block(cx, b)) {
                     need.data[k] = 1;
                 }
-                if op == Slot && is_emitted(v) {
+                if op == Slot && is_emitted(cx, v) {
                     need.data[k] = 1;
                 }
-                for i in 0..ir_operand_count(v) {
-                    let u = ir_operand(v, i);
-                    if u != 0 && INSTS[u].op == Slot {
+                for i in 0..ir_operand_count(cx, v) {
+                    let u = ir_operand(cx, v, i);
+                    if u != 0 && cx.insts[u].op == Slot {
                         need.data[k] = 1;
                         if op == Phi {
-                            for j in 0..BLOCKS[b].preds.count {
-                                let pk = BLOCKS[BLOCKS[b].preds.data[j]].order;
+                            for j in 0..cx.blocks[b].preds.count {
+                                let pk = cx.blocks[cx.blocks[b].preds.data[j]].order;
                                 if pk >= 0 {
                                     need.data[pk] = 1;
                                 }
@@ -652,39 +601,40 @@ fn shrink_wrap(fi: i64) {
                         }
                     }
                 }
-                v = INSTS[v].next;
+                v = cx.insts[v].next;
             }
-            let cond = BLOCKS[b].cond;
-            if cond != 0 && INSTS[cond].op == Slot {
+            let cond = cx.blocks[b].cond;
+            if cond != 0 && cx.insts[cond].op == Slot {
                 need.data[k] = 1;
             }
         }
-        mark_frame_blocks(need.data);
+        mark_frame_blocks(cx, need.data);
         let mut any = (0..n).any(|k| need.data[k] != 0);
-        if RETURNS_TWICE || FRAME_ALIGN > 16 || has_stack_params(fi) || (FRAME_TOTAL > 0 && !any) {
+        if cx.returns_twice || cx.frame_align > 16 || has_stack_params(cx, fi)
+            || (cx.frame_total > 0 && !any) {
             need.data[0] = 1;
             any = true;
         }
-        IN_FRAME.count = 0;
+        cx.in_frame.count = 0;
         for _ in 0..n {
-            IN_FRAME.push(0);
+            cx.in_frame.push(0);
         }
-        SAVE = -1;
+        cx.save = -1;
         if any {
-            sw_dominators();
+            sw_dominators(cx);
             let mut s = -1;
             for k in 0..n {
                 if need.data[k] != 0 {
-                    s = if s < 0 { k } else { sw_intersect(s, k) };
+                    s = if s < 0 { k } else { sw_intersect(cx, s, k) };
                 }
             }
-            while !sw_valid(s) {
-                s = SW_IDOM.data[s];
+            while !sw_valid(cx, s) {
+                s = cx.sw_idom.data[s];
             }
-            SAVE = s;
+            cx.save = s;
             for k in 0..n {
-                if sw_dominates(s, k) {
-                    IN_FRAME.data[k] = 1;
+                if sw_dominates(cx, s, k) {
+                    cx.in_frame.data[k] = 1;
                 }
             }
         }
@@ -693,47 +643,48 @@ fn shrink_wrap(fi: i64) {
 }
 
 // Links a frame: saves the frame pointer and the return address.
-pub fn emit_frame_link() {
-    if X86 { mx_frame_link(); } else { ma_frame_link(); }
+pub fn emit_frame_link(mut cx: *FnCtx) {
+    if X86 { mx_frame_link(cx); } else { ma_frame_link(cx); }
 }
 
 // Reserves the frame's area, realigns it, saves the callee-saved
 // registers.
-pub fn emit_frame_setup() {
+pub fn emit_frame_setup(mut cx: *FnCtx) {
     unsafe {
-        if FRAME_TOTAL > 0 {
-            if X86 { x64_frame_reserve(FRAME_TOTAL); } else { a64_frame_reserve(FRAME_TOTAL); }
-            if FRAME_ALIGN > 16 {
+        if cx.frame_total > 0 {
+            if X86 { x64_frame_reserve(cx, cx.frame_total); }
+            else { a64_frame_reserve(cx, cx.frame_total); }
+            if cx.frame_align > 16 {
                 // The frame is addressed from sp: aligned, its slots are (the
                 // epilogue restores sp from the frame pointer).
                 if X86 {
-                    x64_imm(c"andq", 0 - FRAME_ALIGN, c"%rsp");
+                    x64_imm(cx, c"andq", 0 - cx.frame_align, c"%rsp");
                 } else {
-                    ins(c"mov x16, sp");
-                    a64_align_down(16, FRAME_ALIGN);
-                    ins(c"mov sp, x16");
+                    ins(cx, c"mov x16, sp");
+                    a64_align_down(cx, 16, cx.frame_align);
+                    ins(cx, c"mov sp, x16");
                 }
             }
         }
-        save_callee_saved(restore: false);
+        save_callee_saved(cx, restore: false);
     }
 }
 
 // The function's label (as the shared emit_function_start writes it), and
 // the saving of the frame pointer and return address when it has a frame.
-fn ir_function_start(prefix: *u8, name: i64, global: bool, frame: bool) {
+fn ir_function_start(mut cx: *FnCtx, prefix: *u8, name: i64, global: bool, frame: bool) {
     unsafe {
-        emit_function_start(prefix, name, global);
+        emit_function_start(cx, prefix, name, global);
         if frame {
             return;
         }
         let prologue = if X86 { c"    pushq %rbp\n    movq %rsp, %rbp\n" }
             else { c"    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n" };
         let n = strlen(prologue) as i64;
-        let len = BUFS[ASM].len;
-        if len < n || memcmp(&BUFS[ASM].data[len - n], prologue, n as u64) != 0 {
+        let len = BUFS[cx.asm].len;
+        if len < n || memcmp(&BUFS[cx.asm].data[len - n], prologue, n as u64) != 0 {
             die(c"internal error: unexpected function prologue");
         }
-        BUFS[ASM].len = len - n;
+        BUFS[cx.asm].len = len - n;
     }
 }

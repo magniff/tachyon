@@ -6,54 +6,51 @@ use crate::back::emit::machine::{
     m_extern_addr, m_lea, m_load, m_load_fimm, m_load_imm, m_mov, m_store, m_string_addr,
     m_symbol_addr, reg_cycle, reg_fp, reg_move_temp, reg_sp, spill_offset, spill_type,
 };
-use crate::back::regalloc::{LOC_NONE, LOC_REMAT, RV_SLOT};
+use crate::back::regalloc::{LOC_NONE, LOC_REMAT};
 use crate::back::regalloc::locations::{stored_at_def, vloc};
 use crate::back::regalloc::prepare::tracked;
 use crate::base::{IntVec, die};
 use crate::front::types::{FNS, STATICS, SYM_STATIC, in_fregs, is_float};
 use crate::gen0::gen::{fn_symbol_prefix, static_symbol_prefix};
-use crate::middle::ir::{INSTS, SLOTS};
+use crate::middle::ctx::FnCtx;
 use crate::middle::ir::Op::{Const, GAddr, SAddr, Slot};
 
 // ---- Operands and results ----
 
-// The position of the instruction being emitted.
-pub static mut CUR_POS: i64 = 0;
-
 // Rematerializes value `v` (is_remat_op) into register `r`.
-pub fn materialize(v: i64, r: i64) {
+pub fn materialize(mut cx: *FnCtx, v: i64, r: i64) {
     unsafe {
-        let op = INSTS[v].op;
-        let imm = INSTS[v].imm;
+        let op = cx.insts[v].op;
+        let imm = cx.insts[v].imm;
         if op == Const {
-            if is_float(INSTS[v].ty) {
-                m_load_fimm(r, imm, INSTS[v].ty);
+            if is_float(cx.insts[v].ty) {
+                m_load_fimm(cx, r, imm, cx.insts[v].ty);
             } else {
-                m_load_imm(r, imm as u64);
+                m_load_imm(cx, r, imm as u64);
             }
         } else if op == Slot {
-            m_lea(r, reg_sp(), SLOTS[imm].offset);
+            m_lea(cx, r, reg_sp(), cx.slots[imm].offset);
         } else if op == GAddr {
             let st = SYM_STATIC[imm] - 1;
             if STATICS[st].linkage == 1 {
-                m_extern_addr(r, imm);
+                m_extern_addr(cx, r, imm);
             } else {
-                m_symbol_addr(r, static_symbol_prefix(st), imm);
+                m_symbol_addr(cx, r, static_symbol_prefix(st), imm);
             }
         } else if op == SAddr {
-            m_string_addr(r, imm);
+            m_string_addr(cx, r, imm);
         } else if FNS[imm].is_extern {
-            m_extern_addr(r, FNS[imm].name);
+            m_extern_addr(cx, r, FNS[imm].name);
         } else {
-            m_symbol_addr(r, fn_symbol_prefix(imm), FNS[imm].name);
+            m_symbol_addr(cx, r, fn_symbol_prefix(imm), FNS[imm].name);
         }
     }
 }
 
 // The register holding value `v`, an operand of the instruction being
 // emitted that needs one.
-fn use_reg(v: i64) -> i64 {
-    let loc = vloc(v, CUR_POS);
+fn use_reg(mut cx: *FnCtx, v: i64) -> i64 {
+    let loc = unsafe { vloc(cx, v, cx.cur_pos) };
     if loc < 0 || loc >= 64 {
         unsafe { die(c"internal error: an operand not in a register"); }
     }
@@ -62,45 +59,45 @@ fn use_reg(v: i64) -> i64 {
 
 // Value `v`, used at `pos` where it may be anywhere, in a register: its
 // own, or `scratch` after loading or rematerializing it there.
-pub fn use_any(v: i64, pos: i64, scratch: i64) -> i64 {
+pub fn use_any(mut cx: *FnCtx, v: i64, pos: i64, scratch: i64) -> i64 {
     unsafe {
-        if INSTS[v].op.is_remat() {
-            materialize(v, scratch);
+        if cx.insts[v].op.is_remat() {
+            materialize(cx, v, scratch);
             return scratch;
         }
-        let loc = vloc(v, pos);
+        let loc = vloc(cx, v, pos);
         if loc == LOC_NONE || loc == LOC_REMAT {
             die(c"internal error: operand without a location");
         }
         if loc >= 0 {
             return loc;
         }
-        m_load(spill_type(INSTS[v].ty), scratch, reg_sp(), spill_offset(loc));
+        m_load(cx, spill_type(cx.insts[v].ty), scratch, reg_sp(), spill_offset(cx, loc));
         scratch
     }
 }
 
 // Value `v` (used at `pos`) in register `r` exactly.
-pub fn use_into(v: i64, pos: i64, r: i64) {
-    let got = use_any(v, pos, r);
-    unsafe { m_mov(r, got, INSTS[v].ty); }
+pub fn use_into(mut cx: *FnCtx, v: i64, pos: i64, r: i64) {
+    let got = use_any(cx, v, pos, r);
+    unsafe { m_mov(cx, r, got, cx.insts[v].ty); }
 }
 
-pub fn int_operand(v: i64) -> i64 {
-    use_reg(v)
+pub fn int_operand(mut cx: *FnCtx, v: i64) -> i64 {
+    use_reg(cx, v)
 }
 
-pub fn float_operand(v: i64) -> i64 {
-    use_reg(v)
+pub fn float_operand(mut cx: *FnCtx, v: i64) -> i64 {
+    use_reg(cx, v)
 }
 
-pub fn operand_reg(v: i64) -> i64 {
-    use_reg(v)
+pub fn operand_reg(mut cx: *FnCtx, v: i64) -> i64 {
+    use_reg(cx, v)
 }
 
 // Where the result of `v` is computed.
-pub fn result_reg(v: i64) -> i64 {
-    let loc = vloc(v, CUR_POS + 2);
+pub fn result_reg(mut cx: *FnCtx, v: i64) -> i64 {
+    let loc = unsafe { vloc(cx, v, cx.cur_pos + 2) };
     if loc < 0 || loc >= 64 {
         unsafe { die(c"internal error: a result not in a register"); }
     }
@@ -108,20 +105,21 @@ pub fn result_reg(v: i64) -> i64 {
 }
 
 // Stores the result into its spill slot when it goes to the stack.
-pub fn result_done(v: i64, r: i64) {
-    let t = tracked(v);
-    if t >= 0 && stored_at_def(t) {
+pub fn result_done(mut cx: *FnCtx, v: i64, r: i64) {
+    let t = tracked(cx, v);
+    if t >= 0 && stored_at_def(cx, t) {
         unsafe {
-            m_store(spill_type(INSTS[v].ty), r, reg_sp(), spill_offset(0 - (1 + RV_SLOT[t])));
+            m_store(cx, spill_type(cx.insts[v].ty), r, reg_sp(),
+                spill_offset(cx, 0 - (1 + cx.rv_slot[t])));
         }
     }
 }
 
 // Whether `v` is a constant (and its value in *value).
-pub fn const_of(v: i64, value: *i64) -> bool {
+pub fn const_of(mut cx: *FnCtx, v: i64, value: *i64) -> bool {
     unsafe {
-        if INSTS[v].op == Const {
-            *value = INSTS[v].imm;
+        if cx.insts[v].op == Const {
+            *value = cx.insts[v].imm;
             return true;
         }
         false
@@ -144,60 +142,60 @@ pub const PM_ADDR: i64 = 3;
 
 pub const PM_FIELDS: i64 = 7;
 
-pub static mut PM: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
 // (A move to its own location is kept: for the checker, the location then
 // holds the value written, as a phi takes its operand's register.)
-pub fn pm_add(dst: i64, kind: i64, src: i64, ty: i64, value: i64, result: i64) {
-    PM.push(dst);
-    PM.push(kind);
-    PM.push(src);
-    PM.push(ty);
-    // Not done.
-    PM.push(0);
-    PM.push(value);
-    PM.push(result);
+pub fn pm_add(mut cx: *FnCtx, dst: i64, kind: i64, src: i64, ty: i64, value: i64, result: i64) {
+    unsafe {
+        cx.pm.push(dst);
+        cx.pm.push(kind);
+        cx.pm.push(src);
+        cx.pm.push(ty);
+        // Not done.
+        cx.pm.push(0);
+        cx.pm.push(value);
+        cx.pm.push(result);
+    }
 }
 
-pub fn pm_dst(i: i64) -> i64 { unsafe { PM.data[i * PM_FIELDS] } }
+pub fn pm_dst(mut cx: *FnCtx, i: i64) -> i64 { unsafe { cx.pm.data[i * PM_FIELDS] } }
 
-pub fn pm_kind(i: i64) -> i64 { unsafe { PM.data[i * PM_FIELDS + 1] } }
+pub fn pm_kind(mut cx: *FnCtx, i: i64) -> i64 { unsafe { cx.pm.data[i * PM_FIELDS + 1] } }
 
-pub fn pm_src(i: i64) -> i64 { unsafe { PM.data[i * PM_FIELDS + 2] } }
+pub fn pm_src(mut cx: *FnCtx, i: i64) -> i64 { unsafe { cx.pm.data[i * PM_FIELDS + 2] } }
 
-fn pm_ty(i: i64) -> i64 { unsafe { PM.data[i * PM_FIELDS + 3] } }
+fn pm_ty(mut cx: *FnCtx, i: i64) -> i64 { unsafe { cx.pm.data[i * PM_FIELDS + 3] } }
 
-fn pm_done(i: i64) -> bool { unsafe { PM.data[i * PM_FIELDS + 4] != 0 } }
+fn pm_done(mut cx: *FnCtx, i: i64) -> bool { unsafe { cx.pm.data[i * PM_FIELDS + 4] != 0 } }
 
-pub fn pm_value(i: i64) -> i64 { unsafe { PM.data[i * PM_FIELDS + 5] } }
+pub fn pm_value(mut cx: *FnCtx, i: i64) -> i64 { unsafe { cx.pm.data[i * PM_FIELDS + 5] } }
 
-pub fn pm_result(i: i64) -> i64 { unsafe { PM.data[i * PM_FIELDS + 6] } }
+pub fn pm_result(mut cx: *FnCtx, i: i64) -> i64 { unsafe { cx.pm.data[i * PM_FIELDS + 6] } }
 
 // Moves location `src` to location `dst` (a value of type `ty`).
-fn move_loc(dst: i64, src: i64, ty: i64) {
+fn move_loc(mut cx: *FnCtx, dst: i64, src: i64, ty: i64) {
     if dst == src {
         return;
     }
     let st = spill_type(ty);
     if dst >= 0 && src >= 0 {
-        m_mov(dst, src, ty);
+        m_mov(cx, dst, src, ty);
     } else if dst >= 0 {
-        m_load(st, dst, reg_sp(), spill_offset(src));
+        m_load(cx, st, dst, reg_sp(), spill_offset(cx, src));
     } else if src >= 0 {
-        m_store(st, src, reg_sp(), spill_offset(dst));
+        m_store(cx, st, src, reg_sp(), spill_offset(cx, dst));
     } else {
         let temp = reg_move_temp(in_fregs(ty));
-        m_load(st, temp, reg_sp(), spill_offset(src));
-        m_store(st, temp, reg_sp(), spill_offset(dst));
+        m_load(cx, st, temp, reg_sp(), spill_offset(cx, src));
+        m_store(cx, st, temp, reg_sp(), spill_offset(cx, dst));
     }
 }
 
 // Whether location `loc` is the source of a pending location move other
 // than move `except`.
-fn pm_is_source(loc: i64, except: i64) -> bool {
-    let n = PM.count / PM_FIELDS;
+fn pm_is_source(mut cx: *FnCtx, loc: i64, except: i64) -> bool {
+    let n = unsafe { cx.pm.count / PM_FIELDS };
     for j in 0..n {
-        if j != except && !pm_done(j) && pm_kind(j) == PM_LOC && pm_src(j) == loc {
+        if j != except && !pm_done(cx, j) && pm_kind(cx, j) == PM_LOC && pm_src(cx, j) == loc {
             return true;
         }
     }
@@ -205,25 +203,25 @@ fn pm_is_source(loc: i64, except: i64) -> bool {
 }
 
 // Emits every pending move, then clears them.
-pub fn pm_resolve() {
+pub fn pm_resolve(mut cx: *FnCtx) {
     unsafe {
-        let n = PM.count / PM_FIELDS;
+        let n = cx.pm.count / PM_FIELDS;
         for i in 0..n {
-            if pm_kind(i) == PM_LOC && pm_dst(i) == pm_src(i) {
-                PM.data[i * PM_FIELDS + 4] = 1;
+            if pm_kind(cx, i) == PM_LOC && pm_dst(cx, i) == pm_src(cx, i) {
+                cx.pm.data[i * PM_FIELDS + 4] = 1;
             }
         }
         loop {
             let mut pending = false;
             let mut progress = false;
             for i in 0..n {
-                if pm_done(i) || pm_kind(i) != PM_LOC {
+                if pm_done(cx, i) || pm_kind(cx, i) != PM_LOC {
                     continue;
                 }
                 pending = true;
-                if !pm_is_source(pm_dst(i), i) {
-                    move_loc(pm_dst(i), pm_src(i), pm_ty(i));
-                    PM.data[i * PM_FIELDS + 4] = 1;
+                if !pm_is_source(cx, pm_dst(cx, i), i) {
+                    move_loc(cx, pm_dst(cx, i), pm_src(cx, i), pm_ty(cx, i));
+                    cx.pm.data[i * PM_FIELDS + 4] = 1;
                     progress = true;
                 }
             }
@@ -236,50 +234,50 @@ pub fn pm_resolve() {
             // Only cycles are left: save one destination's current value in
             // the cycle register, and read it from there instead.
             let mut i = 0;
-            while pm_done(i) || pm_kind(i) != PM_LOC {
+            while pm_done(cx, i) || pm_kind(cx, i) != PM_LOC {
                 i += 1;
             }
-            let d = pm_dst(i);
-            let temp = reg_cycle(in_fregs(pm_ty(i)));
-            if pm_is_source(temp, -1) {
+            let d = pm_dst(cx, i);
+            let temp = reg_cycle(in_fregs(pm_ty(cx, i)));
+            if pm_is_source(cx, temp, -1) {
                 die(c"internal error: parallel move cycle register in use");
             }
-            move_loc(temp, d, pm_ty(i));
+            move_loc(cx, temp, d, pm_ty(cx, i));
             for j in 0..n {
-                if !pm_done(j) && pm_kind(j) == PM_LOC && pm_src(j) == d {
-                    PM.data[j * PM_FIELDS + 2] = temp;
+                if !pm_done(cx, j) && pm_kind(cx, j) == PM_LOC && pm_src(cx, j) == d {
+                    cx.pm.data[j * PM_FIELDS + 2] = temp;
                 }
             }
         }
         for i in 0..n {
-            if pm_done(i) || pm_kind(i) == PM_LOC {
+            if pm_done(cx, i) || pm_kind(cx, i) == PM_LOC {
                 continue;
             }
-            let dst = pm_dst(i);
-            let ty = pm_ty(i);
+            let dst = pm_dst(cx, i);
+            let ty = pm_ty(cx, i);
             let r = if dst >= 0 { dst } else { reg_move_temp(in_fregs(ty)) };
-            if pm_kind(i) == PM_REMAT {
-                materialize(pm_src(i), r);
-            } else if pm_kind(i) == PM_ADDR {
-                m_lea(r, reg_fp(), pm_src(i));
+            if pm_kind(cx, i) == PM_REMAT {
+                materialize(cx, pm_src(cx, i), r);
+            } else if pm_kind(cx, i) == PM_ADDR {
+                m_lea(cx, r, reg_fp(), pm_src(cx, i));
             } else {
-                m_load(ty, r, reg_fp(), pm_src(i));
+                m_load(cx, ty, r, reg_fp(), pm_src(cx, i));
             }
             if dst < 0 {
-                m_store(spill_type(ty), r, reg_sp(), spill_offset(dst));
+                m_store(cx, spill_type(ty), r, reg_sp(), spill_offset(cx, dst));
             }
         }
-        PM.count = 0;
+        cx.pm.count = 0;
     }
 }
 
 // Adds the move of value `v` (where it is at `pos`) into location `dst`.
-pub fn pm_add_value(dst: i64, v: i64, pos: i64) {
+pub fn pm_add_value(mut cx: *FnCtx, dst: i64, v: i64, pos: i64) {
     unsafe {
-        if INSTS[v].op.is_remat() {
-            pm_add(dst, PM_REMAT, v, INSTS[v].ty, v, v);
+        if cx.insts[v].op.is_remat() {
+            pm_add(cx, dst, PM_REMAT, v, cx.insts[v].ty, v, v);
         } else {
-            pm_add(dst, PM_LOC, vloc(v, pos), INSTS[v].ty, v, v);
+            pm_add(cx, dst, PM_LOC, vloc(cx, v, pos), cx.insts[v].ty, v, v);
         }
     }
 }

@@ -28,10 +28,10 @@ use crate::front::ast::NODES;
 use crate::front::lexer::add_string;
 use crate::front::types::{FNS, SYM_FN, SYM_STATIC, TY_I64, TY_U64};
 use crate::gen0::gen::MAIN_SYM;
+use crate::middle::ctx::FnCtx;
 use crate::middle::inline::FN_LIVE;
 use crate::middle::ir::{
-    ARGS, BLOCKS, FN_IR, INSTS, INST_LOC, IRFUNCS, IRFUNC_COUNT, Op, Term, ir_append, ir_enter,
-    ir_insert_before, ir_make,
+    FN_IR, IRFUNCS, IRFUNC_COUNT, Op, Term, ir_append, ir_enter, ir_insert_before, ir_make,
 };
 
 pub static mut TRACE: bool = false;
@@ -190,11 +190,11 @@ fn site_of(fi: i64, pos: i64, lines: *IntVec, sids: *IntVec) -> i64 {
 }
 
 // The first instruction of block b after its phis and parameters (0: none).
-fn body_start(b: i64) -> i64 {
+fn body_start(mut cx: *FnCtx, b: i64) -> i64 {
     unsafe {
-        let mut v = BLOCKS[b].first;
-        while v != 0 && (INSTS[v].op == Op::Phi || INSTS[v].op == Op::Param) {
-            v = INSTS[v].next;
+        let mut v = cx.blocks[b].first;
+        while v != 0 && (cx.insts[v].op == Op::Phi || cx.insts[v].op == Op::Param) {
+            v = cx.insts[v].next;
         }
         v
     }
@@ -202,131 +202,131 @@ fn body_start(b: i64) -> i64 {
 
 // Puts the instructions of `list` before instruction `at` (0: at the end
 // of block b).
-fn put_before(b: i64, at: i64, list: *IntVec) {
+fn put_before(mut cx: *FnCtx, b: i64, at: i64, list: *IntVec) {
     unsafe {
         for i in 0..list.count {
             if at == 0 {
-                ir_append(b, list.data[i]);
+                ir_append(cx, b, list.data[i]);
             } else {
-                ir_insert_before(at, list.data[i]);
+                ir_insert_before(cx, at, list.data[i]);
             }
         }
     }
 }
 
 // FRAMES[slot] = the string `sid`, before `at` in block b.
-fn store_site(b: i64, at: i64, slot: i64, sid: i64) {
+fn store_site(mut cx: *FnCtx, b: i64, at: i64, slot: i64, sid: i64) {
     unsafe {
-        let s = ir_make(Op::SAddr, TY_U64, 0, 0, sid);
-        let st = ir_make(Op::Store, 0, slot, s, 0);
-        INSTS[st].imm2 = TY_U64;
+        let s = ir_make(cx, Op::SAddr, TY_U64, 0, 0, sid);
+        let st = ir_make(cx, Op::Store, 0, slot, s, 0);
+        cx.insts[st].imm2 = TY_U64;
         let mut list = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         list.push(s);
         list.push(st);
-        put_before(b, at, &list);
+        put_before(cx, b, at, &list);
     }
 }
 
 // A call of `callee` (an FNS index) with no arguments, before `at`.
-fn call_before(b: i64, at: i64, callee: i64) {
+fn call_before(mut cx: *FnCtx, b: i64, at: i64, callee: i64) {
     unsafe {
-        let call = ir_make(Op::Call, 0, 0, 0, callee);
-        INSTS[call].args = ARGS.count;
-        INSTS[call].nargs = 0;
+        let call = ir_make(cx, Op::Call, 0, 0, 0, callee);
+        cx.insts[call].args = cx.args.count;
+        cx.insts[call].nargs = 0;
         let mut list = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         list.push(call);
-        put_before(b, at, &list);
+        put_before(cx, b, at, &list);
     }
 }
 
-fn instrument_function(fi: i64, depth_sym: i64, frames_sym: i64) {
+fn instrument_function(mut cx: *FnCtx, fi: i64, depth_sym: i64, frames_sym: i64) {
     unsafe {
-        ir_enter(fi);
+        ir_enter(cx, fi);
         let entry = IRFUNCS[fi].entry;
-        if BLOCKS[entry].preds.count > 0 {
+        if cx.blocks[entry].preds.count > 0 {
             // (an entry that is also a loop's header would push each time)
             return;
         }
-        let at = body_start(entry);
-        let g = ir_make(Op::GAddr, TY_U64, 0, 0, depth_sym);
-        let d = ir_make(Op::Load, TY_I64, g, 0, 0);
-        let one = ir_make(Op::Const, TY_I64, 0, 0, 1);
-        let d1 = ir_make(Op::Add, TY_I64, d, one, 0);
-        let st = ir_make(Op::Store, 0, g, d1, 0);
-        INSTS[st].imm2 = TY_I64;
-        let base = ir_make(Op::GAddr, TY_U64, 0, 0, frames_sym);
-        let mask = ir_make(Op::Const, TY_I64, 0, 0, 4095);
-        let m = ir_make(Op::And, TY_I64, d, mask, 0);
-        let three = ir_make(Op::Const, TY_I64, 0, 0, 3);
-        let off = ir_make(Op::Shl, TY_I64, m, three, 0);
-        let slot = ir_make(Op::Add, TY_U64, base, off, 0);
+        let at = body_start(cx, entry);
+        let g = ir_make(cx, Op::GAddr, TY_U64, 0, 0, depth_sym);
+        let d = ir_make(cx, Op::Load, TY_I64, g, 0, 0);
+        let one = ir_make(cx, Op::Const, TY_I64, 0, 0, 1);
+        let d1 = ir_make(cx, Op::Add, TY_I64, d, one, 0);
+        let st = ir_make(cx, Op::Store, 0, g, d1, 0);
+        cx.insts[st].imm2 = TY_I64;
+        let base = ir_make(cx, Op::GAddr, TY_U64, 0, 0, frames_sym);
+        let mask = ir_make(cx, Op::Const, TY_I64, 0, 0, 4095);
+        let m = ir_make(cx, Op::And, TY_I64, d, mask, 0);
+        let three = ir_make(cx, Op::Const, TY_I64, 0, 0, 3);
+        let off = ir_make(cx, Op::Shl, TY_I64, m, three, 0);
+        let slot = ir_make(cx, Op::Add, TY_U64, base, off, 0);
         let mut list = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let parts: [i64; 11] = [g, d, one, d1, st, base, mask, m, three, off, slot];
         for i in 0..11 {
             list.push(parts[i]);
         }
-        put_before(entry, at, &list);
-        store_site(entry, at, slot, site(fi, 0));
+        put_before(cx, entry, at, &list);
+        store_site(cx, entry, at, slot, site(fi, 0));
         // The sites of the calls (one string per line), the returns.
         let mut lines = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let mut sids = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let blocks = IRFUNCS[fi].blocks;
         for k in 0..blocks.count {
-            BLOCKS[blocks.data[k]].aux = k + 1;
+            cx.blocks[blocks.data[k]].aux = k + 1;
         }
         for k in 0..blocks.count {
             let b = blocks.data[k];
-            if BLOCKS[b].removed != 0 {
+            if cx.blocks[b].removed != 0 {
                 continue;
             }
             let mut last = -1;
             // A loop's header (a predecessor after it): its statement, each
             // time round (where a loop without calls runs, when stopped).
             let mut back = false;
-            for p in 0..BLOCKS[b].preds.count {
-                back = back || BLOCKS[BLOCKS[b].preds.data[p]].aux > k;
+            for p in 0..cx.blocks[b].preds.count {
+                back = back || cx.blocks[cx.blocks[b].preds.data[p]].aux > k;
             }
             if back {
-                let mut w = BLOCKS[b].first;
-                while w != 0 && INST_LOC.data[w] == 0 {
-                    w = INSTS[w].next;
+                let mut w = cx.blocks[b].first;
+                while w != 0 && cx.inst_loc.data[w] == 0 {
+                    w = cx.insts[w].next;
                 }
                 if w != 0 {
-                    let pos = INST_LOC.data[w] - 1;
+                    let pos = cx.inst_loc.data[w] - 1;
                     last = file_and_line(pos);
-                    store_site(b, body_start(b), slot, site_of(fi, pos, &lines, &sids));
+                    store_site(cx, b, body_start(cx, b), slot, site_of(fi, pos, &lines, &sids));
                 }
             }
-            let mut v = BLOCKS[b].first;
+            let mut v = cx.blocks[b].first;
             while v != 0 {
-                let next = INSTS[v].next;
-                if INSTS[v].op.is_call() && INST_LOC.data[v] > 0 {
-                    let pos = INST_LOC.data[v] - 1;
+                let next = cx.insts[v].next;
+                if cx.insts[v].op.is_call() && cx.inst_loc.data[v] > 0 {
+                    let pos = cx.inst_loc.data[v] - 1;
                     let line = file_and_line(pos);
                     if line != last {
-                        store_site(b, v, slot, site_of(fi, pos, &lines, &sids));
+                        store_site(cx, b, v, slot, site_of(fi, pos, &lines, &sids));
                         last = line;
                     }
                 }
                 v = next;
             }
-            if BLOCKS[b].term == Term::Ret {
-                let g2 = ir_make(Op::GAddr, TY_U64, 0, 0, depth_sym);
-                let restore = ir_make(Op::Store, 0, g2, d, 0);
-                INSTS[restore].imm2 = TY_I64;
-                ir_append(b, g2);
-                ir_append(b, restore);
+            if cx.blocks[b].term == Term::Ret {
+                let g2 = ir_make(cx, Op::GAddr, TY_U64, 0, 0, depth_sym);
+                let restore = ir_make(cx, Op::Store, 0, g2, d, 0);
+                cx.insts[restore].imm2 = TY_I64;
+                ir_append(cx, b, g2);
+                ir_append(cx, b, restore);
             }
         }
         for k in 0..blocks.count {
-            BLOCKS[blocks.data[k]].aux = 0;
+            cx.blocks[blocks.data[k]].aux = 0;
         }
     }
 }
 
 // --trace: every function's frame; main starts the runtime; std::panic
 // dumps the frames.
-pub fn trace_after_lowering() {
+pub fn trace_after_lowering(mut cx: *FnCtx) {
     unsafe {
         if !TRACE {
             return;
@@ -347,25 +347,25 @@ pub fn trace_after_lowering() {
             }
             if note >= 0 && f == panic {
                 // std::panic's note: the frames instead.
-                ir_enter(fi);
+                ir_enter(cx, fi);
                 let blocks = IRFUNCS[fi].blocks;
                 for k in 0..blocks.count {
-                    let mut v = BLOCKS[blocks.data[k]].first;
+                    let mut v = cx.blocks[blocks.data[k]].first;
                     while v != 0 {
-                        if INSTS[v].op == Op::Call && INSTS[v].imm == note {
-                            INSTS[v].imm = dump;
+                        if cx.insts[v].op == Op::Call && cx.insts[v].imm == note {
+                            cx.insts[v].imm = dump;
                         }
-                        v = INSTS[v].next;
+                        v = cx.insts[v].next;
                     }
                 }
             }
             if traced(fi) {
-                instrument_function(fi, depth_sym, frames_sym);
+                instrument_function(cx, fi, depth_sym, frames_sym);
             }
             if FNS[f].name == MAIN_SYM {
-                ir_enter(fi);
+                ir_enter(cx, fi);
                 let entry = IRFUNCS[fi].entry;
-                call_before(entry, body_start(entry), start);
+                call_before(cx, entry, body_start(cx, entry), start);
             }
         }
     }

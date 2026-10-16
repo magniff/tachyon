@@ -18,9 +18,10 @@ use crate::front::types::{
     TY_BOOL, TY_F32, TY_I64, TY_U64, int_bits, is_float, is_integer, is_signed,
 };
 use crate::gen0::target::log2;
+use crate::middle::ctx::FnCtx;
 use crate::middle::ir::{
-    BITS_LEADING, BITS_ONES, BLOCKS, Cond, INSTS, IRFUNCS, Op, Term, ir_append, ir_arg,
-    ir_insert_before, ir_make, ir_replace, ir_resolve_operands, ir_val,
+    BITS_LEADING, BITS_ONES, Cond, IRFUNCS, Op, Term, ir_append, ir_arg, ir_insert_before, ir_make,
+    ir_replace, ir_resolve_operands, ir_val,
 };
 use crate::middle::ir::Op::{
     Add, And, BNot, Cmp, Const, Conv, Div, Load, Mul, Neg, Not, Or, Phi, Rem, Shl, Shr, Store, Sub,
@@ -53,15 +54,15 @@ pub fn fold_bits(kind: i64, a: i64) -> i64 {
 }
 
 // a <op> b (or <op> a) for constant operands, as the machine computes it.
-pub fn fold_value(v: i64, a: i64, b: i64) -> i64 {
+pub fn fold_value(mut cx: *FnCtx, v: i64, a: i64, b: i64) -> i64 {
     unsafe {
-        let op = INSTS[v].op;
-        let ty = INSTS[v].ty;
+        let op = cx.insts[v].op;
+        let ty = cx.insts[v].ty;
         match op {
-            Const => return INSTS[v].imm,
-            Cmp => return fold_compare(INSTS[v].cond, INSTS[v].imm2, a, b) as i64,
-            Conv => return fold_conversion(INSTS[v].imm2, ty, a),
-            Op::Bits => return fold_bits(INSTS[v].imm, a),
+            Const => return cx.insts[v].imm,
+            Cmp => return fold_compare(cx.insts[v].cond, cx.insts[v].imm2, a, b) as i64,
+            Conv => return fold_conversion(cx.insts[v].imm2, ty, a),
+            Op::Bits => return fold_bits(cx.insts[v].imm, a),
             _ => {}
         }
         if is_float(ty) {
@@ -102,10 +103,10 @@ pub fn fold_value(v: i64, a: i64, b: i64) -> i64 {
 // is not made a constant: the target computes it at run time (and the
 // compiler's output does not depend on its host). SCCP still folds what
 // depends on it alone (sccp_rewrite).
-pub fn fold_makes_nan(v: i64, result: i64) -> bool {
+pub fn fold_makes_nan(mut cx: *FnCtx, v: i64, result: i64) -> bool {
     unsafe {
-        let op = INSTS[v].op;
-        is_float(INSTS[v].ty) && op != Neg && op != Const
+        let op = cx.insts[v].op;
+        is_float(cx.insts[v].ty) && op != Neg && op != Const
             && f64_of_bits(result) != f64_of_bits(result)
     }
 }
@@ -202,8 +203,8 @@ fn fold_float_to_int(x: f64, to: i64) -> i64 {
 
 // ---- Instruction combining ----
 
-pub fn is_const(v: i64) -> bool {
-    unsafe { INSTS[v].op == Const }
+pub fn is_const(mut cx: *FnCtx, v: i64) -> bool {
+    unsafe { cx.insts[v].op == Const }
 }
 
 // log2 of a power of two, or -1.
@@ -215,35 +216,35 @@ fn power_of_two(value: i64) -> Option<i64> {
 }
 
 // A new constant before instruction `at`.
-pub fn const_before(at: i64, value: i64, ty: i64) -> i64 {
-    let c = ir_make(Const, ty, 0, 0, value);
-    ir_insert_before(at, c);
+pub fn const_before(mut cx: *FnCtx, at: i64, value: i64, ty: i64) -> i64 {
+    let c = ir_make(cx, Const, ty, 0, 0, value);
+    ir_insert_before(cx, at, c);
     c
 }
 
-pub fn op_before(at: i64, op: Op, ty: i64, a: i64, b: i64) -> i64 {
-    let v = ir_make(op, ty, a, b, 0);
-    ir_insert_before(at, v);
+pub fn op_before(mut cx: *FnCtx, at: i64, op: Op, ty: i64, a: i64, b: i64) -> i64 {
+    let v = ir_make(cx, op, ty, a, b, 0);
+    ir_insert_before(cx, at, v);
     v
 }
 
 // Replaces v by `by` when they have the same type.
-fn replace_same_type(v: i64, by: i64) -> bool {
-    if unsafe { INSTS[by].ty != INSTS[v].ty } {
+fn replace_same_type(mut cx: *FnCtx, v: i64, by: i64) -> bool {
+    if unsafe { cx.insts[by].ty != cx.insts[v].ty } {
         return false;
     }
-    ir_replace(v, by);
+    ir_replace(cx, v, by);
     true
 }
 
-fn make_const(v: i64, value: i64) -> bool {
+fn make_const(mut cx: *FnCtx, v: i64, value: i64) -> bool {
     unsafe {
-        INSTS[v].op = Const;
-        INSTS[v].cond = Cond::Eq;
-        INSTS[v].imm = wrap_int(value, INSTS[v].ty);
-        INSTS[v].a = 0;
-        INSTS[v].b = 0;
-        INSTS[v].imm2 = 0;
+        cx.insts[v].op = Const;
+        cx.insts[v].cond = Cond::Eq;
+        cx.insts[v].imm = wrap_int(value, cx.insts[v].ty);
+        cx.insts[v].a = 0;
+        cx.insts[v].b = 0;
+        cx.insts[v].imm2 = 0;
     }
     true
 }
@@ -257,148 +258,150 @@ pub fn all_ones(ty: i64) -> i64 {
 // !(x | y) and !(x & y) when x and y negate for free (comparisons of
 // integers, negations, and and or of such): !x & !y and !x | !y (what
 // merged branch chains leave, ifconv.tach).
-fn combine_not(v: i64, a: i64) -> bool {
+fn combine_not(mut cx: *FnCtx, v: i64, a: i64) -> bool {
     unsafe {
-        if !negates_free(a, 0) || INSTS[a].op == Not {
+        if !negates_free(cx, a, 0) || cx.insts[a].op == Not {
             return false;
         }
-        let n = negated(a, v);
-        INSTS[v].op = INSTS[n].op;
-        INSTS[v].cond = INSTS[n].cond;
-        INSTS[v].a = INSTS[n].a;
-        INSTS[v].b = INSTS[n].b;
-        INSTS[v].imm2 = INSTS[n].imm2;
+        let n = negated(cx, a, v);
+        cx.insts[v].op = cx.insts[n].op;
+        cx.insts[v].cond = cx.insts[n].cond;
+        cx.insts[v].a = cx.insts[n].a;
+        cx.insts[v].b = cx.insts[n].b;
+        cx.insts[v].imm2 = cx.insts[n].imm2;
         true
     }
 }
 
 // The negation of x (negates_free), made before instruction `at`.
-fn negated(x: i64, at: i64) -> i64 {
+fn negated(mut cx: *FnCtx, x: i64, at: i64) -> i64 {
     unsafe {
-        let op = INSTS[x].op;
+        let op = cx.insts[x].op;
         if op == Not {
-            return INSTS[x].a;
+            return cx.insts[x].a;
         }
         if op == Cmp {
-            let c = op_before(at, Cmp, TY_BOOL, INSTS[x].a, INSTS[x].b);
-            INSTS[c].cond = INSTS[x].cond.negate();
-            INSTS[c].imm2 = INSTS[x].imm2;
+            let c = op_before(cx, at, Cmp, TY_BOOL, cx.insts[x].a, cx.insts[x].b);
+            cx.insts[c].cond = cx.insts[x].cond.negate();
+            cx.insts[c].imm2 = cx.insts[x].imm2;
             return c;
         }
-        let a = negated(INSTS[x].a, at);
-        let b = negated(INSTS[x].b, at);
-        op_before(at, if op == Or { And } else { Or }, TY_BOOL, a, b)
+        let a = negated(cx, cx.insts[x].a, at);
+        let b = negated(cx, cx.insts[x].b, at);
+        op_before(cx, at, if op == Or { And } else { Or }, TY_BOOL, a, b)
     }
 }
 
 // Whether bool x negates without an instruction more: a comparison of
 // integers, a negation, or an `and` or `or` of such (a few deep).
-fn negates_free(x: i64, depth: i64) -> bool {
+fn negates_free(mut cx: *FnCtx, x: i64, depth: i64) -> bool {
     unsafe {
-        let op = INSTS[x].op;
-        if op == Not || op == Cmp && !is_float(INSTS[x].imm2) {
+        let op = cx.insts[x].op;
+        if op == Not || op == Cmp && !is_float(cx.insts[x].imm2) {
             return true;
         }
-        (op == And || op == Or) && INSTS[x].ty == TY_BOOL && depth < 3
-            && negates_free(INSTS[x].a, depth + 1) && negates_free(INSTS[x].b, depth + 1)
+        (op == And || op == Or) && cx.insts[x].ty == TY_BOOL && depth < 3
+            && negates_free(cx, cx.insts[x].a, depth + 1)
+            && negates_free(cx, cx.insts[x].b, depth + 1)
     }
 }
 
 // Rewrites instruction v into something cheaper; returns whether it
 // changed (v may have been replaced).
-fn combine(v: i64) -> bool {
+fn combine(mut cx: *FnCtx, v: i64) -> bool {
     unsafe {
-        let op = INSTS[v].op;
-        let ty = INSTS[v].ty;
+        let op = cx.insts[v].op;
+        let ty = cx.insts[v].ty;
         if op == Load || op == Store {
-            return fold_address(v);
+            return fold_address(cx, v);
         }
         if op == Neg || op == Not || op == BNot {
-            let a = INSTS[v].a;
-            if INSTS[a].op == op && !(op == Neg && is_float(ty)) {
-                return replace_same_type(v, INSTS[a].a);
+            let a = cx.insts[v].a;
+            if cx.insts[a].op == op && !(op == Neg && is_float(ty)) {
+                return replace_same_type(cx, v, cx.insts[a].a);
             }
             if op == Not {
-                return combine_not(v, a);
+                return combine_not(cx, v, a);
             }
             return false;
         }
         if op == Cmp {
-            return combine_compare(v);
+            return combine_compare(cx, v);
         }
         if op == Op::Sel {
-            return combine_select(v);
+            return combine_select(cx, v);
         }
         if !op.is_binary() || is_float(ty) {
             return false;
         }
-        let mut a = INSTS[v].a;
-        let mut b = INSTS[v].b;
+        let mut a = cx.insts[v].a;
+        let mut b = cx.insts[v].b;
         // Constants go right.
-        if is_const(a) && !is_const(b) && (op == Add || op == Mul || op == And
+        if is_const(cx, a) && !is_const(cx, b) && (op == Add || op == Mul || op == And
             || op == Or || op == Xor) {
-            INSTS[v].a = b;
-            INSTS[v].b = a;
-            a = INSTS[v].a;
-            b = INSTS[v].b;
+            cx.insts[v].a = b;
+            cx.insts[v].b = a;
+            a = cx.insts[v].a;
+            b = cx.insts[v].b;
         }
-        if !is_const(b) {
+        if !is_const(cx, b) {
             if a == b {
                 if op == Sub || op == Xor {
-                    return make_const(v, 0);
+                    return make_const(cx, v, 0);
                 }
                 if op == And || op == Or {
-                    return replace_same_type(v, a);
+                    return replace_same_type(cx, v, a);
                 }
             }
             // (0.11) (x + c) - x is c (an array's end less its start).
-            if op == Sub && INSTS[a].op == Add && INSTS[a].a == b && is_const(INSTS[a].b)
-                && INSTS[a].ty == ty && is_integer(ty) {
-                return make_const(v, INSTS[INSTS[a].b].imm);
+            if op == Sub && cx.insts[a].op == Add && cx.insts[a].a == b
+                && is_const(cx, cx.insts[a].b)
+                && cx.insts[a].ty == ty && is_integer(ty) {
+                return make_const(cx, v, cx.insts[cx.insts[a].b].imm);
             }
             // (0.11) An address y + (x + c) is (y + x) + c, which loads and
             // stores take as an offset, and copies of a body share y + x.
-            if op == Add && ty == TY_U64 && INSTS[b].op == Add && is_const(INSTS[b].b)
-                && is_integer(INSTS[b].ty) && int_bits(INSTS[b].ty) == 64 {
-                let inner = op_before(v, Add, TY_U64, a, INSTS[b].a);
-                INSTS[v].a = inner;
-                INSTS[v].b = INSTS[b].b;
+            if op == Add && ty == TY_U64 && cx.insts[b].op == Add && is_const(cx, cx.insts[b].b)
+                && is_integer(cx.insts[b].ty) && int_bits(cx.insts[b].ty) == 64 {
+                let inner = op_before(cx, v, Add, TY_U64, a, cx.insts[b].a);
+                cx.insts[v].a = inner;
+                cx.insts[v].b = cx.insts[b].b;
                 return true;
             }
             return false;
         }
-        let c = INSTS[b].imm;
+        let c = cx.insts[b].imm;
         if c == 0 && (op == Add || op == Sub || op == Or || op == Xor
             || op == Shl || op == Shr) {
-            return replace_same_type(v, a);
+            return replace_same_type(cx, v, a);
         }
         if (op == Shl || op == Shr) && shift_amount(c, ty) == 0 {
-            return replace_same_type(v, a);
+            return replace_same_type(cx, v, a);
         }
         if c == 0 && (op == Mul || op == And) {
-            return make_const(v, 0);
+            return make_const(cx, v, 0);
         }
         if op == And && c == all_ones(ty) {
-            return replace_same_type(v, a);
+            return replace_same_type(cx, v, a);
         }
-        if op == Add && INSTS[a].op == Add && is_const(INSTS[a].b) && is_integer(ty)
-            && INSTS[a].ty == ty {
+        if op == Add && cx.insts[a].op == Add && is_const(cx, cx.insts[a].b) && is_integer(ty)
+            && cx.insts[a].ty == ty {
             // (x + c1) + c2, both of one type (a narrower inner sum would wrap
             // first)
-            INSTS[v].a = INSTS[a].a;
-            let operand = const_before(v, wrap_int(INSTS[INSTS[a].b].imm + c, ty), ty);
-            INSTS[v].b = operand;
+            cx.insts[v].a = cx.insts[a].a;
+            let operand = const_before(cx, v, wrap_int(cx.insts[cx.insts[a].b].imm + c, ty), ty);
+            cx.insts[v].b = operand;
             return true;
         }
         if op == Mul {
             if c == 1 {
-                return replace_same_type(v, a);
+                return replace_same_type(cx, v, a);
             }
             match power_of_two(c) {
                 Option::Some(k) if k > 0 => {
-                    INSTS[v].op = Shl;
-                    let operand = const_before(v, k, ty);
-                    INSTS[v].b = operand;
+                    cx.insts[v].op = Shl;
+                    let operand = const_before(cx, v, k, ty);
+                    cx.insts[v].b = operand;
                     return true;
                 }
                 _ => return false,
@@ -406,12 +409,12 @@ fn combine(v: i64) -> bool {
         }
         if (op == Div || op == Rem) && c == 1 {
             if op == Div {
-                return replace_same_type(v, a);
+                return replace_same_type(cx, v, a);
             }
-            return make_const(v, 0);
+            return make_const(cx, v, 0);
         }
         if op == Div || op == Rem {
-            return combine_division(v, a, c);
+            return combine_division(cx, v, a, c);
         }
         false
     }
@@ -420,41 +423,41 @@ fn combine(v: i64) -> bool {
 // (0.15) k ? x : x is x; a constant k picks; k ? t op x : t, with op one
 // of + - | ^ (0 the identity, t on the left for -), is t op (k ? x : 0):
 // the select leaves the chain through t, a reduction's (ifconv.tach).
-pub fn combine_select(v: i64) -> bool {
+pub fn combine_select(mut cx: *FnCtx, v: i64) -> bool {
     unsafe {
-        let k = INSTS[v].a;
-        let x = INSTS[v].b;
-        let y = INSTS[v].c;
+        let k = cx.insts[v].a;
+        let x = cx.insts[v].b;
+        let y = cx.insts[v].c;
         if x == y {
-            return replace_same_type(v, x);
+            return replace_same_type(cx, v, x);
         }
-        if is_const(k) {
-            return replace_same_type(v, if INSTS[k].imm != 0 { x } else { y });
+        if is_const(cx, k) {
+            return replace_same_type(cx, v, if cx.insts[k].imm != 0 { x } else { y });
         }
-        let ty = INSTS[v].ty;
-        if ty == TY_BOOL && INSTS[k].ty == TY_BOOL && (is_const(x) || is_const(y)) {
+        let ty = cx.insts[v].ty;
+        if ty == TY_BOOL && cx.insts[k].ty == TY_BOOL && (is_const(cx, x) || is_const(cx, y)) {
             // (0.16) Bools: k ? true : y is k | y, k ? x : false is k & x
             // (and with !k the other two), what if-converted `||` and `&&`
             // (a comparator's `<`) leave.
-            if is_const(x) && is_const(y) {
-                if INSTS[x].imm != 0 {
-                    return replace_same_type(v, k);
+            if is_const(cx, x) && is_const(cx, y) {
+                if cx.insts[x].imm != 0 {
+                    return replace_same_type(cx, v, k);
                 }
-                INSTS[v].op = Not;
-                INSTS[v].b = 0;
-                INSTS[v].c = 0;
+                cx.insts[v].op = Not;
+                cx.insts[v].b = 0;
+                cx.insts[v].c = 0;
                 return true;
             }
             // k ? true : y = k | y, k ? false : y = !k & y; k ? x : false =
             // k & x, k ? x : true = !k | x.
-            let then_const = is_const(x);
-            let truth = INSTS[if then_const { x } else { y }].imm != 0;
+            let then_const = is_const(cx, x);
+            let truth = cx.insts[if then_const { x } else { y }].imm != 0;
             let other = if then_const { y } else { x };
             let negate = then_const != truth;
-            INSTS[v].op = if truth { Or } else { And };
-            INSTS[v].a = if negate { op_before(v, Not, TY_BOOL, k, 0) } else { k };
-            INSTS[v].b = other;
-            INSTS[v].c = 0;
+            cx.insts[v].op = if truth { Or } else { And };
+            cx.insts[v].a = if negate { op_before(cx, v, Not, TY_BOOL, k, 0) } else { k };
+            cx.insts[v].b = other;
+            cx.insts[v].c = 0;
             return true;
         }
         if !is_integer(ty) {
@@ -464,88 +467,90 @@ pub fn combine_select(v: i64) -> bool {
         let mut t = y;
         let mut w = x;
         let mut then_side = true;
-        if INSTS[x].op != Add && INSTS[x].op != Sub && INSTS[x].op != Or && INSTS[x].op != Xor
-            || (INSTS[x].a != y && INSTS[x].b != y) {
+        if cx.insts[x].op != Add && cx.insts[x].op != Sub && cx.insts[x].op != Or
+            && cx.insts[x].op != Xor
+            || (cx.insts[x].a != y && cx.insts[x].b != y) {
             t = x;
             w = y;
             then_side = false;
         }
-        let op = INSTS[w].op;
-        if (op != Add && op != Sub && op != Or && op != Xor) || INSTS[w].ty != ty {
+        let op = cx.insts[w].op;
+        if (op != Add && op != Sub && op != Or && op != Xor) || cx.insts[w].ty != ty {
             return false;
         }
-        let other = if INSTS[w].a == t { INSTS[w].b } else if op != Sub && INSTS[w].b == t {
-            INSTS[w].a
-        } else {
-            return false;
-        };
+        let other = if cx.insts[w].a == t { cx.insts[w].b }
+            else if op != Sub && cx.insts[w].b == t {
+                cx.insts[w].a
+            } else {
+                return false;
+            };
         if other == t {
             return false;
         }
-        let zero = const_before(v, 0, ty);
-        let pick = ir_make(Op::Sel, ty, k, if then_side { other } else { zero }, 0);
-        INSTS[pick].c = if then_side { zero } else { other };
-        ir_insert_before(v, pick);
-        INSTS[v].op = op;
-        INSTS[v].a = t;
-        INSTS[v].b = pick;
-        INSTS[v].c = 0;
+        let zero = const_before(cx, v, 0, ty);
+        let pick = ir_make(cx, Op::Sel, ty, k, if then_side { other } else { zero }, 0);
+        cx.insts[pick].c = if then_side { zero } else { other };
+        ir_insert_before(cx, v, pick);
+        cx.insts[v].op = op;
+        cx.insts[v].a = t;
+        cx.insts[v].b = pick;
+        cx.insts[v].c = 0;
         true
     }
 }
 
 // Division by a power of two: a shift (with a fix-up toward zero for signed
 // values), and the remainder a mask (or x - q * 2^k).
-fn combine_division(v: i64, a: i64, c: i64) -> bool {
+fn combine_division(mut cx: *FnCtx, v: i64, a: i64, c: i64) -> bool {
     unsafe {
-        let op = INSTS[v].op;
-        let ty = INSTS[v].ty;
+        let op = cx.insts[v].op;
+        let ty = cx.insts[v].ty;
         let k = power_of_two(c).unwrap_or(0);
         if k <= 0 || k > 62 {
             return false;
         }
         if !is_signed(ty) {
             if op == Div {
-                INSTS[v].op = Shr;
-                let operand = const_before(v, k, ty);
-                INSTS[v].b = operand;
+                cx.insts[v].op = Shr;
+                let operand = const_before(cx, v, k, ty);
+                cx.insts[v].b = operand;
             } else {
-                INSTS[v].op = And;
-                let operand = const_before(v, c - 1, ty);
-                INSTS[v].b = operand;
+                cx.insts[v].op = And;
+                let operand = const_before(cx, v, c - 1, ty);
+                cx.insts[v].b = operand;
             }
             return true;
         }
         // q = (x + ((x >> 63) >>> (64 - k))) >> k, on the canonical 64-bit value.
-        let sign = op_before(v, Shr, TY_I64, a, const_before(v, 63, TY_I64));
-        let bias = op_before(v, Shr, TY_U64, sign, const_before(v, 64 - k, TY_U64));
-        let biased = op_before(v, Add, TY_I64, a, bias);
+        let sign = op_before(cx, v, Shr, TY_I64, a, const_before(cx, v, 63, TY_I64));
+        let bias = op_before(cx, v, Shr, TY_U64, sign, const_before(cx, v, 64 - k, TY_U64));
+        let biased = op_before(cx, v, Add, TY_I64, a, bias);
         if op == Div {
-            INSTS[v].op = Shr;
-            INSTS[v].a = biased;
-            let operand = const_before(v, k, ty);
-            INSTS[v].b = operand;
+            cx.insts[v].op = Shr;
+            cx.insts[v].a = biased;
+            let operand = const_before(cx, v, k, ty);
+            cx.insts[v].b = operand;
             return true;
         }
-        let q = op_before(v, Shr, TY_I64, biased, const_before(v, k, TY_I64));
-        let back = op_before(v, Shl, TY_I64, q, const_before(v, k, TY_I64));
-        INSTS[v].op = Sub;
-        INSTS[v].b = back;
+        let q = op_before(cx, v, Shr, TY_I64, biased, const_before(cx, v, k, TY_I64));
+        let back = op_before(cx, v, Shl, TY_I64, q, const_before(cx, v, k, TY_I64));
+        cx.insts[v].op = Sub;
+        cx.insts[v].b = back;
         true
     }
 }
 
 // Whether v is the address of a frame slot, a static or constant data,
 // plus a small constant offset: never null.
-fn is_object_address(v: i64) -> bool {
+fn is_object_address(mut cx: *FnCtx, v: i64) -> bool {
     unsafe {
         let mut x = v;
         let mut offset = 0;
-        while INSTS[x].op == Add && INSTS[x].ty == TY_U64 && is_const(INSTS[x].b) {
-            offset += INSTS[INSTS[x].b].imm;
-            x = INSTS[x].a;
+        while cx.insts[x].op == Add && cx.insts[x].ty == TY_U64 && is_const(cx, cx.insts[x].b) {
+            offset += cx.insts[cx.insts[x].b].imm;
+            x = cx.insts[x].a;
         }
-        let op = INSTS[x].op;
+        let op = cx.insts[x].op;
         (op == Op::Slot || op == Op::GAddr || op == Op::SAddr) && offset >= 0 && offset < 1 << 32
     }
 }
@@ -555,9 +560,9 @@ fn is_object_address(v: i64) -> bool {
 // those outcomes. A comparator's ordering (-1, 0 or 1 from the
 // arms of an inlined `cmp`) compared with 0 becomes the comparison it
 // stands for.
-fn compare_phi(v: i64, x: i64, cond: Cond, ty: i64, c: i64) -> bool {
+fn compare_phi(mut cx: *FnCtx, v: i64, x: i64, cond: Cond, ty: i64, c: i64) -> bool {
     unsafe {
-        let n = INSTS[x].nargs;
+        let n = cx.insts[x].nargs;
         if n < 2 || n > 8 {
             return false;
         }
@@ -565,12 +570,12 @@ fn compare_phi(v: i64, x: i64, cond: Cond, ty: i64, c: i64) -> bool {
         // operand from the latch arithmetic, stays what the ranges and the
         // loop passes know.)
         for i in 0..n {
-            if !outcome_known(ir_arg(x, i), x, cond, ty, c, 0) {
+            if !outcome_known(cx, ir_arg(cx, x, i), x, cond, ty, c, 0) {
                 return false;
             }
         }
-        let phi = outcome_phi(x, cond, ty, c);
-        ir_replace(v, phi);
+        let phi = outcome_phi(cx, x, cond, ty, c);
+        ir_replace(cx, v, phi);
         true
     }
 }
@@ -578,16 +583,16 @@ fn compare_phi(v: i64, x: i64, cond: Cond, ty: i64, c: i64) -> bool {
 // Whether w <cond> c is known at the end of each path to it: w a
 // constant, a select of constants, or a phi (not `top`, a few deep) of
 // such.
-fn outcome_known(w: i64, top: i64, cond: Cond, ty: i64, c: i64, depth: i64) -> bool {
+fn outcome_known(mut cx: *FnCtx, w: i64, top: i64, cond: Cond, ty: i64, c: i64, depth: i64) -> bool {
     unsafe {
-        if select_outcome(w, cond, ty, c, 0) >= 0 {
+        if select_outcome(cx, w, cond, ty, c, 0) >= 0 {
             return true;
         }
-        if INSTS[w].op != Phi || w == top || depth >= 3 || INSTS[w].nargs > 8 {
+        if cx.insts[w].op != Phi || w == top || depth >= 3 || cx.insts[w].nargs > 8 {
             return false;
         }
-        for i in 0..INSTS[w].nargs {
-            if !outcome_known(ir_arg(w, i), top, cond, ty, c, depth + 1) {
+        for i in 0..cx.insts[w].nargs {
+            if !outcome_known(cx, ir_arg(cx, w, i), top, cond, ty, c, depth + 1) {
                 return false;
             }
         }
@@ -597,85 +602,86 @@ fn outcome_known(w: i64, top: i64, cond: Cond, ty: i64, c: i64, depth: i64) -> b
 
 // The phi of x's operands' outcomes (bools) in x's block (outcome_known
 // of each).
-fn outcome_phi(x: i64, cond: Cond, ty: i64, c: i64) -> i64 {
+fn outcome_phi(mut cx: *FnCtx, x: i64, cond: Cond, ty: i64, c: i64) -> i64 {
     unsafe {
-        let n = INSTS[x].nargs;
-        let b = INSTS[x].block;
+        let n = cx.insts[x].nargs;
+        let b = cx.insts[x].block;
         let mut values = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for i in 0..n {
-            let p = BLOCKS[b].preds.data[i];
-            let w = ir_arg(x, i);
-            let known = select_outcome(w, cond, ty, c, 0);
+            let p = cx.blocks[b].preds.data[i];
+            let w = ir_arg(cx, x, i);
+            let known = select_outcome(cx, w, cond, ty, c, 0);
             if known >= 0 {
-                let k = ir_make(Const, TY_BOOL, 0, 0, known);
-                ir_append(p, k);
+                let k = ir_make(cx, Const, TY_BOOL, 0, 0, known);
+                ir_append(cx, p, k);
                 values.push(k);
             } else {
-                values.push(outcome_phi(w, cond, ty, c));
+                values.push(outcome_phi(cx, w, cond, ty, c));
             }
         }
-        let phi = new_phi_in(b, TY_BOOL, &values, 0, n);
+        let phi = new_phi_in(cx, b, TY_BOOL, &values, 0, n);
         free(values.data as *u8);
         phi
     }
 }
 
-fn combine_compare(v: i64) -> bool {
+fn combine_compare(mut cx: *FnCtx, v: i64) -> bool {
     unsafe {
-        let mut a = INSTS[v].a;
-        let mut b = INSTS[v].b;
-        let mut cond = INSTS[v].cond;
-        let ty = INSTS[v].imm2;
-        if is_const(a) && !is_const(b) {
+        let mut a = cx.insts[v].a;
+        let mut b = cx.insts[v].b;
+        let mut cond = cx.insts[v].cond;
+        let ty = cx.insts[v].imm2;
+        if is_const(cx, a) && !is_const(cx, b) {
             // Constants go right.
-            INSTS[v].a = b;
-            INSTS[v].b = a;
-            INSTS[v].cond = cond.mirror();
-            a = INSTS[v].a;
-            b = INSTS[v].b;
-            cond = INSTS[v].cond;
+            cx.insts[v].a = b;
+            cx.insts[v].b = a;
+            cx.insts[v].cond = cond.mirror();
+            a = cx.insts[v].a;
+            b = cx.insts[v].b;
+            cond = cx.insts[v].cond;
         }
         if a == b && !is_float(ty) {
-            return make_const(v, (cond == Cond::Eq || cond == Cond::Le || cond == Cond::Ge) as i64);
+            return make_const(cx, v,
+                (cond == Cond::Eq || cond == Cond::Le || cond == Cond::Ge) as i64);
         }
-        if (cond == Cond::Eq || cond == Cond::Ne) && is_const(b) && INSTS[b].imm == 0
-            && is_object_address(a) {
+        if (cond == Cond::Eq || cond == Cond::Ne) && is_const(cx, b) && cx.insts[b].imm == 0
+            && is_object_address(cx, a) {
             // (0.16) The address of a slot, a static or constant data is not
             // null (an allocation heap_to_stack made a slot, checked for
             // null).
-            return make_const(v, (cond == Cond::Ne) as i64);
+            return make_const(cx, v, (cond == Cond::Ne) as i64);
         }
         // (0.15) A select of constants compared with a constant: the
         // select's condition, its negation, or a constant (a comparator's
         // ordering, -1, 0 or 1, compared with 0, once if-converted).
-        if is_const(b) && INSTS[a].op == Op::Sel && !is_float(ty) {
-            let c = INSTS[b].imm;
-            let x = select_outcome(INSTS[a].b, cond, ty, c, 0);
-            let y = select_outcome(INSTS[a].c, cond, ty, c, 0);
+        if is_const(cx, b) && cx.insts[a].op == Op::Sel && !is_float(ty) {
+            let c = cx.insts[b].imm;
+            let x = select_outcome(cx, cx.insts[a].b, cond, ty, c, 0);
+            let y = select_outcome(cx, cx.insts[a].c, cond, ty, c, 0);
             if x >= 0 && x == y {
-                return make_const(v, x);
+                return make_const(cx, v, x);
             }
             if x == 1 && y == 0 {
-                return replace_same_type(v, INSTS[a].a);
+                return replace_same_type(cx, v, cx.insts[a].a);
             }
             if x == 0 && y == 1 {
-                INSTS[v].op = Not;
-                INSTS[v].a = INSTS[a].a;
-                INSTS[v].b = 0;
-                INSTS[v].imm2 = 0;
-                INSTS[v].cond = Cond::Eq;
+                cx.insts[v].op = Not;
+                cx.insts[v].a = cx.insts[a].a;
+                cx.insts[v].b = 0;
+                cx.insts[v].imm2 = 0;
+                cx.insts[v].cond = Cond::Eq;
                 return true;
             }
         }
-        if is_const(b) && INSTS[a].op == Phi && !is_float(ty)
-            && compare_phi(v, a, cond, ty, INSTS[b].imm) {
+        if is_const(cx, b) && cx.insts[a].op == Phi && !is_float(ty)
+            && compare_phi(cx, v, a, cond, ty, cx.insts[b].imm) {
             return true;
         }
-        if ty == TY_BOOL && is_const(b) && !is_const(a) {
+        if ty == TY_BOOL && is_const(cx, b) && !is_const(cx, a) {
             // b != false, b == true: b itself.
-            let c = INSTS[b].imm;
+            let c = cx.insts[b].imm;
             if (cond == Cond::Ne && c == 0) || (cond == Cond::Eq && c == 1) {
-                return replace_same_type(v, a);
+                return replace_same_type(cx, v, a);
             }
         }
         false
@@ -684,30 +690,31 @@ fn combine_compare(v: i64) -> bool {
 
 // (0.15) x <cond> c (operands of type ty) when x is a constant, or a
 // select whose operands all give one outcome: 1 or 0; else -1.
-fn select_outcome(x: i64, cond: Cond, ty: i64, c: i64, depth: i64) -> i64 {
+fn select_outcome(mut cx: *FnCtx, x: i64, cond: Cond, ty: i64, c: i64, depth: i64) -> i64 {
     unsafe {
-        if is_const(x) {
-            return fold_compare(cond, ty, INSTS[x].imm, c) as i64;
+        if is_const(cx, x) {
+            return fold_compare(cond, ty, cx.insts[x].imm, c) as i64;
         }
-        if INSTS[x].op != Op::Sel || depth > 3 {
+        if cx.insts[x].op != Op::Sel || depth > 3 {
             return -1;
         }
-        let p = select_outcome(INSTS[x].b, cond, ty, c, depth + 1);
-        let q = select_outcome(INSTS[x].c, cond, ty, c, depth + 1);
+        let p = select_outcome(cx, cx.insts[x].b, cond, ty, c, depth + 1);
+        let q = select_outcome(cx, cx.insts[x].c, cond, ty, c, depth + 1);
         if p >= 0 && p == q { p } else { -1 }
     }
 }
 
 // load/store at (x + c) + offset: at x + (offset + c).
-fn fold_address(v: i64) -> bool {
+fn fold_address(mut cx: *FnCtx, v: i64) -> bool {
     unsafe {
-        let addr = INSTS[v].a;
-        if INSTS[addr].op == Add && is_const(INSTS[addr].b) && INSTS[addr].ty == TY_U64 {
-            let c = INSTS[INSTS[addr].b].imm;
-            let offset = INSTS[v].imm + c;
+        let addr = cx.insts[v].a;
+        if cx.insts[addr].op == Add && is_const(cx, cx.insts[addr].b)
+            && cx.insts[addr].ty == TY_U64 {
+            let c = cx.insts[cx.insts[addr].b].imm;
+            let offset = cx.insts[v].imm + c;
             if offset >= -1073741824 && offset <= 1073741824 {
-                INSTS[v].a = INSTS[addr].a;
-                INSTS[v].imm = offset;
+                cx.insts[v].a = cx.insts[addr].a;
+                cx.insts[v].imm = offset;
                 return true;
             }
         }
@@ -715,42 +722,42 @@ fn fold_address(v: i64) -> bool {
     }
 }
 
-pub fn instcombine(fi: i64) -> bool {
+pub fn instcombine(mut cx: *FnCtx, fi: i64) -> bool {
     let mut changed = false;
     unsafe {
         for i in 0..IRFUNCS[fi].blocks.count {
             let b = IRFUNCS[fi].blocks.data[i];
-            if BLOCKS[b].removed != 0 {
+            if cx.blocks[b].removed != 0 {
                 continue;
             }
-            let mut v = BLOCKS[b].first;
+            let mut v = cx.blocks[b].first;
             while v != 0 {
-                let next = INSTS[v].next;
-                ir_resolve_operands(v);
+                let next = cx.insts[v].next;
+                ir_resolve_operands(cx, v);
                 // Up to a few rewrites of one instruction.
                 let mut rounds = 0;
-                while rounds < 4 && INSTS[v].block != 0 && combine(v) {
+                while rounds < 4 && cx.insts[v].block != 0 && combine(cx, v) {
                     changed = true;
                     rounds += 1;
-                    ir_resolve_operands(v);
+                    ir_resolve_operands(cx, v);
                 }
                 v = next;
             }
             // A branch on !x branches on x the other way.
-            if BLOCKS[b].term == Term::Branch {
-                let cond = ir_val(BLOCKS[b].cond);
-                if INSTS[cond].op == Not {
-                    BLOCKS[b].cond = INSTS[cond].a;
-                    let s0 = BLOCKS[b].s0;
-                    BLOCKS[b].s0 = BLOCKS[b].s1;
-                    BLOCKS[b].s1 = s0;
+            if cx.blocks[b].term == Term::Branch {
+                let cond = ir_val(cx, cx.blocks[b].cond);
+                if cx.insts[cond].op == Not {
+                    cx.blocks[b].cond = cx.insts[cond].a;
+                    let s0 = cx.blocks[b].s0;
+                    cx.blocks[b].s0 = cx.blocks[b].s1;
+                    cx.blocks[b].s1 = s0;
                     changed = true;
                 }
             }
         }
     }
     if changed {
-        resolve_all(fi);
+        resolve_all(cx, fi);
     }
     changed
 }

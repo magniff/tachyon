@@ -11,8 +11,8 @@
 use crate::base::IntVec;
 
 use crate::middle::ir::{
-    BLOCKS, INSTS, INST_COUNT, IRF, IRFUNCS, Op, SLOTS, Term, ir_arg, ir_enter, ir_insert_before,
-    ir_make, ir_operand, ir_operand_count, ir_replace, ir_unlink, ir_val,
+    IRFUNCS, Op, Term, ir_arg, ir_enter, ir_insert_before, ir_make, ir_operand, ir_operand_count,
+    ir_replace, ir_unlink, ir_val,
 };
 
 use crate::middle::gvn::{address_base, copy_dst, copy_src, find_escaping_slots, is_copy, root_of};
@@ -23,12 +23,8 @@ use crate::back::abi::fn_uses_c;
 use crate::front::ast::{NODES, NodeKind};
 use crate::front::own::diag::{MODE_ERROR, OWN_MODE};
 use crate::front::types::{TY_U64, type_size};
+use crate::middle::ctx::FnCtx;
 use crate::middle::loops::{analyze_loops, innermost_loop};
-
-// (slot, user instruction) for every use of a slot's address.
-static mut USES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-// The copies that are candidates.
-static mut CANDIDATES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
 // (0.17) The copies that are moves (COPY_MOVE): `let w = v` of an owned
 // local under --values=error, (function, instruction) pairs, noted by the
@@ -52,11 +48,11 @@ pub fn moves_local(n: i64) -> bool {
 
 // Notes the copies the lowering made since instruction `first` of the
 // current function as moves.
-pub fn note_move_copies(first: i64) {
+pub fn note_move_copies(mut cx: *FnCtx, first: i64) {
     unsafe {
-        for v in first..INST_COUNT {
-            if INSTS[v].block != 0 && is_copy(v) {
-                MOVE_COPIES.push(IRF);
+        for v in first..cx.inst_count {
+            if cx.insts[v].block != 0 && is_copy(cx, v) {
+                MOVE_COPIES.push(cx.irf);
                 MOVE_COPIES.push(v);
             }
         }
@@ -75,44 +71,45 @@ fn is_move_copy(fi: i64, c: i64) -> bool {
 }
 
 // The slot that address v is the start of (a SLOT instruction), or -1.
-fn whole_slot(v: i64) -> i64 {
+fn whole_slot(mut cx: *FnCtx, v: i64) -> i64 {
     unsafe {
-        let x = ir_val(v);
-        if INSTS[x].op == Op::Slot { INSTS[x].imm } else { -1 }
+        let x = ir_val(cx, v);
+        if cx.insts[x].op == Op::Slot { cx.insts[x].imm } else { -1 }
     }
 }
 
 // The slot address v points into at a constant offset (in *offset), or -1.
-fn slot_at(v: i64, offset: *i64) -> i64 {
+fn slot_at(mut cx: *FnCtx, v: i64, offset: *i64) -> i64 {
     unsafe {
-        let base = address_base(ir_val(v), offset);
-        if INSTS[base].op == Op::Slot { INSTS[base].imm } else { -1 }
+        let base = address_base(cx, ir_val(cx, v), offset);
+        if cx.insts[base].op == Op::Slot { cx.insts[base].imm } else { -1 }
     }
 }
 
 // The size copy v moves (a constant).
-fn copy_size(v: i64) -> i64 {
+fn copy_size(mut cx: *FnCtx, v: i64) -> i64 {
     unsafe {
-        if INSTS[v].op == Op::Copy { INSTS[v].imm } else { INSTS[ir_val(ir_arg(v, 2))].imm }
+        if cx.insts[v].op == Op::Copy { cx.insts[v].imm }
+        else { cx.insts[ir_val(cx, ir_arg(cx, v, 2))].imm }
     }
 }
 
 // Whether instruction u comes strictly before instruction v (u's block
 // dominates v's; INSTS[].aux numbers each block's instructions).
-fn before(u: i64, v: i64) -> bool {
+fn before(mut cx: *FnCtx, u: i64, v: i64) -> bool {
     unsafe {
-        let bu = INSTS[u].block;
-        let bv = INSTS[v].block;
-        if bu == bv { INSTS[u].aux < INSTS[v].aux } else { dominates(bu, bv) }
+        let bu = cx.insts[u].block;
+        let bv = cx.insts[v].block;
+        if bu == bv { cx.insts[u].aux < cx.insts[v].aux } else { dominates(cx, bu, bv) }
     }
 }
 
 // Whether instruction u accesses no byte of slot d in [lo, hi): a load,
 // store or copy at constant offsets elsewhere (an address computation is
 // not an access: its own uses are).
-fn misses(u: i64, d: i64, lo: i64, hi: i64) -> bool {
+fn misses(mut cx: *FnCtx, u: i64, d: i64, lo: i64, hi: i64) -> bool {
     unsafe {
-        let op = INSTS[u].op;
+        let op = cx.insts[u].op;
         if op == Op::Add {
             return true;
         }
@@ -120,29 +117,29 @@ fn misses(u: i64, d: i64, lo: i64, hi: i64) -> bool {
         let mut size = 0;
         if op == Op::Load {
             addrs = 1;
-            size = type_size(INSTS[u].ty);
+            size = type_size(cx.insts[u].ty);
         } else if op == Op::Store {
             addrs = 1;
-            size = type_size(INSTS[u].imm2);
-        } else if is_copy(u) {
+            size = type_size(cx.insts[u].imm2);
+        } else if is_copy(cx, u) {
             addrs = 2;
-            size = copy_size(u);
+            size = copy_size(cx, u);
         } else {
             return false;
         }
         for k in 0..addrs {
-            let a = if op == Op::Load || op == Op::Store { INSTS[u].a }
-                else if k == 0 { copy_dst(u) } else { copy_src(u) };
-            let root = root_of(ir_val(a));
-            if root == 0 || INSTS[root].op != Op::Slot || INSTS[root].imm != d {
+            let a = if op == Op::Load || op == Op::Store { cx.insts[u].a }
+                else if k == 0 { copy_dst(cx, u) } else { copy_src(cx, u) };
+            let root = root_of(cx, ir_val(cx, a));
+            if root == 0 || cx.insts[root].op != Op::Slot || cx.insts[root].imm != d {
                 continue;
             }
             let mut offset = 0;
-            if slot_at(a, &offset) != d {
+            if slot_at(cx, a, &offset) != d {
                 return false;
             }
             if op == Op::Load || op == Op::Store {
-                offset += INSTS[u].imm;
+                offset += cx.insts[u].imm;
             }
             if offset < hi && offset + size > lo {
                 return false;
@@ -155,19 +152,20 @@ fn misses(u: i64, d: i64, lo: i64, hi: i64) -> bool {
 // Whether copy c of slot s to slot d at `offset` can be elided: every
 // other use of s comes before it, every use of d's part after it (or
 // before, elsewhere in d).
-fn elidable(c: i64, s: i64, d: i64, offset: i64) -> bool {
+fn elidable(mut cx: *FnCtx, c: i64, s: i64, d: i64, offset: i64) -> bool {
     unsafe {
-        let n = SLOTS[s].size;
-        for k in 0..USES.count / 2 {
-            let slot = USES.data[2 * k];
-            let u = USES.data[2 * k + 1];
-            if u == c || INSTS[u].block == 0 {
+        let n = cx.slots[s].size;
+        for k in 0..cx.copies_uses.count / 2 {
+            let slot = cx.copies_uses.data[2 * k];
+            let u = cx.copies_uses.data[2 * k + 1];
+            if u == c || cx.insts[u].block == 0 {
                 continue;
             }
-            if slot == s && !before(u, c) {
+            if slot == s && !before(cx, u, c) {
                 return false;
             }
-            if slot == d && !before(c, u) && !(before(u, c) && misses(u, d, offset, offset + n)) {
+            if slot == d && !before(cx, c, u)
+                && !(before(cx, u, c) && misses(cx, u, d, offset, offset + n)) {
                 return false;
             }
         }
@@ -177,41 +175,41 @@ fn elidable(c: i64, s: i64, d: i64, offset: i64) -> bool {
 
 // Slot s becomes the part of slot d at `offset`: its SLOT instructions
 // compute that address.
-fn place_slot(fi: i64, s: i64, d: i64, offset: i64) {
+fn place_slot(mut cx: *FnCtx, fi: i64, s: i64, d: i64, offset: i64) {
     unsafe {
         for j in 0..IRFUNCS[fi].blocks.count {
             let b = IRFUNCS[fi].blocks.data[j];
-            if BLOCKS[b].removed != 0 {
+            if cx.blocks[b].removed != 0 {
                 continue;
             }
-            let mut v = BLOCKS[b].first;
+            let mut v = cx.blocks[b].first;
             while v != 0 {
-                if INSTS[v].op == Op::Slot && INSTS[v].imm == s {
+                if cx.insts[v].op == Op::Slot && cx.insts[v].imm == s {
                     if offset == 0 {
-                        INSTS[v].imm = d;
+                        cx.insts[v].imm = d;
                     } else {
-                        let base = ir_make(Op::Slot, TY_U64, 0, 0, d);
-                        let k = ir_make(Op::Const, TY_U64, 0, 0, offset);
-                        ir_insert_before(v, base);
-                        ir_insert_before(v, k);
-                        INSTS[base].aux = INSTS[v].aux;
-                        INSTS[k].aux = INSTS[v].aux;
-                        INSTS[v].op = Op::Add;
-                        INSTS[v].a = base;
-                        INSTS[v].b = k;
-                        INSTS[v].imm = 0;
+                        let base = ir_make(cx, Op::Slot, TY_U64, 0, 0, d);
+                        let k = ir_make(cx, Op::Const, TY_U64, 0, 0, offset);
+                        ir_insert_before(cx, v, base);
+                        ir_insert_before(cx, v, k);
+                        cx.insts[base].aux = cx.insts[v].aux;
+                        cx.insts[k].aux = cx.insts[v].aux;
+                        cx.insts[v].op = Op::Add;
+                        cx.insts[v].a = base;
+                        cx.insts[v].b = k;
+                        cx.insts[v].imm = 0;
                     }
                 }
-                v = INSTS[v].next;
+                v = cx.insts[v].next;
             }
         }
-        for k in 0..USES.count / 2 {
-            if USES.data[2 * k] == s {
-                USES.data[2 * k] = d;
+        for k in 0..cx.copies_uses.count / 2 {
+            if cx.copies_uses.data[2 * k] == s {
+                cx.copies_uses.data[2 * k] = d;
             }
         }
-        if SLOTS[s].align > SLOTS[d].align {
-            SLOTS[d].align = SLOTS[s].align;
+        if cx.slots[s].align > cx.slots[d].align {
+            cx.slots[d].align = cx.slots[s].align;
         }
     }
 }
@@ -225,150 +223,150 @@ fn place_slot(fi: i64, s: i64, d: i64, offset: i64) {
 // INLINE_COPY_MAX bytes): smaller locals are scalar replacement's, which
 // the result's memory would stop. A copy must end its block, which returns,
 // so that nothing reads or writes s after it (a defer after the copy).
-fn elide_result_copy(fi: i64) -> bool {
+fn elide_result_copy(mut cx: *FnCtx, fi: i64) -> bool {
     unsafe {
         let f = IRFUNCS[fi].f;
         let result = IRFUNCS[fi].result_ptr;
         if result == 0 || f < 0 || fn_uses_c(f) {
             return false;
         }
-        let r = ir_val(result);
-        CANDIDATES.count = 0;
+        let r = ir_val(cx, result);
+        cx.candidates.count = 0;
         let mut s = -1;
         for i in 0..IRFUNCS[fi].blocks.count {
             let b = IRFUNCS[fi].blocks.data[i];
-            if BLOCKS[b].removed != 0 {
+            if cx.blocks[b].removed != 0 {
                 continue;
             }
-            let mut v = BLOCKS[b].first;
+            let mut v = cx.blocks[b].first;
             while v != 0 {
-                for k in 0..ir_operand_count(v) {
-                    let w = ir_operand(v, k);
-                    if w == 0 || ir_val(w) != r {
+                for k in 0..ir_operand_count(cx, v) {
+                    let w = ir_operand(cx, v, k);
+                    if w == 0 || ir_val(cx, w) != r {
                         continue;
                     }
                     // The destination of a memcpy (its first argument).
-                    if !(is_copy(v) && INSTS[v].op != Op::Copy && k == 3) {
+                    if !(is_copy(cx, v) && cx.insts[v].op != Op::Copy && k == 3) {
                         return false;
                     }
-                    let src = whole_slot(copy_src(v));
-                    if src < 0 || s >= 0 && src != s || SLOTS[src].size != copy_size(v)
-                        || INSTS[v].next != 0 || BLOCKS[b].term != Term::Ret {
+                    let src = whole_slot(cx, copy_src(cx, v));
+                    if src < 0 || s >= 0 && src != s || cx.slots[src].size != copy_size(cx, v)
+                        || cx.insts[v].next != 0 || cx.blocks[b].term != Term::Ret {
                         return false;
                     }
                     s = src;
-                    CANDIDATES.push(v);
+                    cx.candidates.push(v);
                 }
-                v = INSTS[v].next;
+                v = cx.insts[v].next;
             }
         }
-        if s < 0 || SLOTS[s].align > 8 {
+        if s < 0 || cx.slots[s].align > 8 {
             return false;
         }
-        find_escaping_slots(fi);
-        if SLOTS[s].escapes != 0 {
+        find_escaping_slots(cx, fi);
+        if cx.slots[s].escapes != 0 {
             return false;
         }
         for i in 0..IRFUNCS[fi].blocks.count {
             let b = IRFUNCS[fi].blocks.data[i];
-            if BLOCKS[b].removed != 0 {
+            if cx.blocks[b].removed != 0 {
                 continue;
             }
-            let mut v = BLOCKS[b].first;
+            let mut v = cx.blocks[b].first;
             while v != 0 {
-                let next = INSTS[v].next;
-                if INSTS[v].op == Op::Slot && INSTS[v].imm == s {
-                    ir_replace(v, r);
+                let next = cx.insts[v].next;
+                if cx.insts[v].op == Op::Slot && cx.insts[v].imm == s {
+                    ir_replace(cx, v, r);
                 }
                 v = next;
             }
         }
-        for i in 0..CANDIDATES.count {
-            ir_unlink(CANDIDATES.data[i]);
+        for i in 0..cx.candidates.count {
+            ir_unlink(cx, cx.candidates.data[i]);
         }
-        CANDIDATES.count = 0;
-        resolve_all(fi);
+        cx.candidates.count = 0;
+        resolve_all(cx, fi);
         true
     }
 }
 
 // Elides the copies of function fi that can be. Returns whether any was.
-pub fn elide_copies(fi: i64) -> bool {
+pub fn elide_copies(mut cx: *FnCtx, fi: i64) -> bool {
     unsafe {
-        ir_enter(fi);
-        let nrvo = elide_result_copy(fi);
-        CANDIDATES.count = 0;
+        ir_enter(cx, fi);
+        let nrvo = elide_result_copy(cx, fi);
+        cx.candidates.count = 0;
         for i in 0..IRFUNCS[fi].blocks.count {
             let b = IRFUNCS[fi].blocks.data[i];
-            if BLOCKS[b].removed != 0 {
+            if cx.blocks[b].removed != 0 {
                 continue;
             }
-            let mut v = BLOCKS[b].first;
+            let mut v = cx.blocks[b].first;
             while v != 0 {
-                if is_copy(v) {
+                if is_copy(cx, v) {
                     let mut offset = 0;
-                    let d = slot_at(copy_dst(v), &offset);
-                    let s = whole_slot(copy_src(v));
-                    let n = copy_size(v);
-                    if d >= 0 && s >= 0 && d != s && SLOTS[s].size == n
-                        && offset >= 0 && offset + n <= SLOTS[d].size {
-                        CANDIDATES.push(v);
+                    let d = slot_at(cx, copy_dst(cx, v), &offset);
+                    let s = whole_slot(cx, copy_src(cx, v));
+                    let n = copy_size(cx, v);
+                    if d >= 0 && s >= 0 && d != s && cx.slots[s].size == n
+                        && offset >= 0 && offset + n <= cx.slots[d].size {
+                        cx.candidates.push(v);
                     }
                 }
-                v = INSTS[v].next;
+                v = cx.insts[v].next;
             }
         }
-        if CANDIDATES.count == 0 {
+        if cx.candidates.count == 0 {
             return nrvo;
         }
-        resolve_all(fi);
-        find_escaping_slots(fi);
-        analyze_loops(fi);
+        resolve_all(cx, fi);
+        find_escaping_slots(cx, fi);
+        analyze_loops(cx, fi);
         // The uses of the slots' addresses; the instructions numbered.
-        USES.count = 0;
+        cx.copies_uses.count = 0;
         for i in 0..IRFUNCS[fi].blocks.count {
             let b = IRFUNCS[fi].blocks.data[i];
-            if BLOCKS[b].removed != 0 {
+            if cx.blocks[b].removed != 0 {
                 continue;
             }
             let mut n = 0;
-            let mut v = BLOCKS[b].first;
+            let mut v = cx.blocks[b].first;
             while v != 0 {
-                INSTS[v].aux = n;
+                cx.insts[v].aux = n;
                 n += 1;
-                for k in 0..ir_operand_count(v) {
-                    let w = ir_operand(v, k);
+                for k in 0..ir_operand_count(cx, v) {
+                    let w = ir_operand(cx, v, k);
                     if w == 0 {
                         continue;
                     }
-                    let root = root_of(ir_val(w));
-                    if root != 0 && INSTS[root].op == Op::Slot {
-                        USES.push(INSTS[root].imm);
-                        USES.push(v);
+                    let root = root_of(cx, ir_val(cx, w));
+                    if root != 0 && cx.insts[root].op == Op::Slot {
+                        cx.copies_uses.push(cx.insts[root].imm);
+                        cx.copies_uses.push(v);
                     }
                 }
-                v = INSTS[v].next;
+                v = cx.insts[v].next;
             }
         }
         let mut changed = false;
-        for i in 0..CANDIDATES.count {
-            let c = CANDIDATES.data[i];
+        for i in 0..cx.candidates.count {
+            let c = cx.candidates.data[i];
             let mut offset = 0;
-            let d = slot_at(copy_dst(c), &offset);
-            let s = whole_slot(copy_src(c));
-            let b = INSTS[c].block;
-            if d < 0 || s < 0 || d == s || SLOTS[d].escapes != 0 || SLOTS[s].escapes != 0
-                || offset % SLOTS[s].align != 0 || BLOCKS[b].order < 0
-                || innermost_loop(b) >= 0 && !is_move_copy(fi, c)
-                || !elidable(c, s, d, offset) {
+            let d = slot_at(cx, copy_dst(cx, c), &offset);
+            let s = whole_slot(cx, copy_src(cx, c));
+            let b = cx.insts[c].block;
+            if d < 0 || s < 0 || d == s || cx.slots[d].escapes != 0 || cx.slots[s].escapes != 0
+                || offset % cx.slots[s].align != 0 || cx.blocks[b].order < 0
+                || innermost_loop(cx, b) >= 0 && !is_move_copy(fi, c)
+                || !elidable(cx, c, s, d, offset) {
                 continue;
             }
-            place_slot(fi, s, d, offset);
-            ir_unlink(c);
+            place_slot(cx, fi, s, d, offset);
+            ir_unlink(cx, c);
             changed = true;
         }
         if changed {
-            resolve_all(fi);
+            resolve_all(cx, fi);
         }
         changed || nrvo
     }

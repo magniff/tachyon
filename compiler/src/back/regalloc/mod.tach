@@ -56,16 +56,17 @@ mod scan;
 pub mod locations;
 pub mod check;
 
-use crate::back::regalloc::intervals::{RETURNS_TWICE, build_intervals};
+use crate::back::regalloc::intervals::build_intervals;
 use crate::back::regalloc::prepare::{
     compute_liveness, mark_reg_uses, number_positions, split_critical_edges,
 };
-use crate::back::regalloc::scan::{RA_IDOM_READY, linear_scan};
+use crate::back::regalloc::scan::linear_scan;
 use crate::base::{IntVec, SYMS, buf_fmt, buf_new, buf_str, buf_write_fd};
 use crate::front::types::FNS;
-use crate::middle::ir::{IRF, IRFUNCS, ir_enter};
+use crate::middle::ir::{IRFUNCS, ir_enter};
 
 // What other modules import from the allocator, from its parts.
+use crate::middle::ctx::FnCtx;
 use intervals::calls_returns_twice;
 use prepare::layout_blocks;
 
@@ -82,7 +83,7 @@ const USE_ANY: i64 = 1;
 const USE_REG: i64 = 2;
 
 // A part of a value's lifetime, with one location.
-struct Interval {
+pub struct Interval {
     // The value (a dense index into RA_VALS) and its location: a register,
     // ON_STACK or UNASSIGNED.
     value: i64, reg: i64,
@@ -92,43 +93,7 @@ struct Interval {
     next: i64,
 }
 
-// The function being allocated: its blocks in layout order, and per
-// layout index the positions of the block's start and terminator, and its
-// loop depth.
-pub static mut ORDER: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static mut BSTART: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static mut BEND: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static mut LDEPTH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-// Allocated values: value ids by dense index (INSTS[v].aux = index + 1).
-static mut RA_VALS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static mut IVS: *Interval = 0 as *Interval;
-static mut IV_COUNT: i64 = 0;
 static mut IV_CAP: i64 = 0;
-// Per dense index: the first interval, the spill slot (-1: never on the
-// stack), the value whose register it would like (-1), the register it
-// would like (-1).
-static mut RV_FIRST: *i64 = 0 as *i64;
-pub static mut RV_SLOT: *i64 = 0 as *i64;
-static mut RV_HINT: *i64 = 0 as *i64;
-static mut RV_HREG: *i64 = 0 as *i64;
-static mut RV_CAP: i64 = 0;
-// Fixed intervals: per register, the ranges where it is not available.
-static mut FIXED: *IntVec = 0 as *IntVec;
-// Moves inside blocks: (gap, dense index) pairs, sorted by gap.
-pub static mut SPLIT_MOVES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static mut SPILL_COUNT: i64 = 0;
-// Whether a vector is spilled (the spill area is then 16-aligned).
-pub static mut SPILL_VECTORS: bool = false;
-// Per register: whether a callee-saved register is used.
-pub static mut CALLEE_USED: [i64; 64] = [0; 64];
-// Uses of each instruction (indexed by value id), for the whole program,
-// and whether some use needs the value in a register.
-pub static mut USES: *i64 = 0 as *i64;
-static mut REG_USED: *i64 = 0 as *i64;
-// Liveness: bit sets of dense value indices, per layout index.
-static mut LIVE_IN: *u64 = 0 as *u64;
-static mut LIVE_OUT: *u64 = 0 as *u64;
-static mut LIVE_WORDS: i64 = 0;
 // --verify-regalloc: check every allocation by simulating its moves.
 pub static mut VERIFY_REGALLOC: bool = false;
 
@@ -136,19 +101,21 @@ pub static mut VERIFY_REGALLOC: bool = false;
 
 // Allocates function `fi`: layout, positions, liveness, intervals and
 // locations.
-pub fn allocate_registers(fi: i64) {
-    ir_enter(fi);
-    RA_IDOM_READY = false;
-    RETURNS_TWICE = calls_returns_twice(fi);
-    split_critical_edges(fi);
-    layout_blocks(fi);
-    mark_reg_uses();
-    number_positions();
-    compute_liveness();
-    build_intervals();
-    linear_scan();
-    if PRINT_REGALLOC {
-        print_allocation();
+pub fn allocate_registers(mut cx: *FnCtx, fi: i64) {
+    unsafe {
+        ir_enter(cx, fi);
+        cx.ra_idom_ready = false;
+        cx.returns_twice = calls_returns_twice(cx, fi);
+        split_critical_edges(cx, fi);
+        layout_blocks(cx, fi);
+        mark_reg_uses(cx);
+        number_positions(cx);
+        compute_liveness(cx);
+        build_intervals(cx);
+        linear_scan(cx);
+        if PRINT_REGALLOC {
+            print_allocation(cx);
+        }
     }
 }
 
@@ -156,34 +123,35 @@ pub fn allocate_registers(fi: i64) {
 // on stderr.
 pub static mut PRINT_REGALLOC: bool = false;
 
-fn print_allocation() {
+fn print_allocation(mut cx: *FnCtx) {
     unsafe {
         let out = buf_new();
-        buf_fmt(out, f"regalloc {SYMS[FNS[IRFUNCS[IRF].f].name].text}:\n");
-        for k in 0..ORDER.count {
+        buf_fmt(out, f"regalloc {SYMS[FNS[IRFUNCS[cx.irf].f].name].text}:\n");
+        for k in 0..cx.order.count {
             buf_fmt(out,
-                f"  b{ORDER.data[k]} [{BSTART.data[k]}, {BEND.data[k]}] depth {LDEPTH.data[k]}\n");
+                f"  b{cx.order.data[k]} [{cx.bstart.data[k]}, {cx.bend.data[k]}] depth {cx.ldepth.data[k]}\n");
         }
-        for t in 0..RA_VALS.count {
-            buf_fmt(out, f"  v{RA_VALS.data[t]}");
-            if RV_HINT[t] >= 0 {
-                buf_fmt(out, f" hint v{RA_VALS.data[RV_HINT[t]]}");
+        for t in 0..cx.ra_vals.count {
+            buf_fmt(out, f"  v{cx.ra_vals.data[t]}");
+            if cx.rv_hint[t] >= 0 {
+                buf_fmt(out, f" hint v{cx.ra_vals.data[cx.rv_hint[t]]}");
             }
-            if RV_HREG[t] >= 0 {
-                buf_fmt(out, f" hint r{RV_HREG[t]}");
+            if cx.rv_hreg[t] >= 0 {
+                buf_fmt(out, f" hint r{cx.rv_hreg[t]}");
             }
-            let mut i = RV_FIRST[t];
+            let mut i = cx.rv_first[t];
             while i >= 0 {
                 buf_str(out, c" |");
-                if IVS[i].reg >= 0 {
-                    buf_fmt(out, f" r{IVS[i].reg}");
+                if cx.ivs[i].reg >= 0 {
+                    buf_fmt(out, f" r{cx.ivs[i].reg}");
                 } else {
                     buf_str(out, c" stack");
                 }
-                for r in 0..IVS[i].ranges.count / 2 {
-                    buf_fmt(out, f" [{IVS[i].ranges.data[2 * r]},{IVS[i].ranges.data[2 * r + 1]})");
+                for r in 0..cx.ivs[i].ranges.count / 2 {
+                    buf_fmt(out,
+                        f" [{cx.ivs[i].ranges.data[2 * r]},{cx.ivs[i].ranges.data[2 * r + 1]})");
                 }
-                i = IVS[i].next;
+                i = cx.ivs[i].next;
             }
             buf_str(out, c"\n");
         }

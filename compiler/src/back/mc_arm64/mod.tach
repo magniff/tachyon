@@ -16,7 +16,6 @@
 pub mod ops;
 pub mod vector;
 
-use crate::back::emit::{MEM_INDEX, MEM_SCALE};
 use crate::back::mc_arm64::vector::ma_v;
 use crate::base::BUFS;
 use crate::front::consteval::{f32_bits, f64_of_bits};
@@ -26,204 +25,189 @@ use crate::front::types::{
 use crate::gen0::arm64::{
     A64_GOTPAGE, A64_GOTPAGEOFF, A64_PAGE, A64_PAGEOFF, a64_load_imm, a64_str_sym, a64_sym,
 };
-use crate::gen0::target::{CODE, end_i, global_prefix, ins, o, oi, on};
+use crate::gen0::target::{end_i, global_prefix, ins, o, oi, on};
+use crate::middle::ctx::FnCtx;
 
-// (0.16) While set, the general registers are written w<n>: a u32
-// operation on the 32-bit registers, whose results are zero-extended (so
-// canonical, without the `mov wN, wN` of ma_normalize).
-pub static mut MA_W32: bool = false;
-
-fn ma_r(r: i64) {
+fn ma_r(mut cx: *FnCtx, r: i64) {
     unsafe {
         if r == 31 {
-            o(c"sp");
+            o(cx, c"sp");
         } else {
-            o(if MA_W32 { c"w" } else { c"x" });
-            oi(r);
+            o(cx, if cx.ma_w32 { c"w" } else { c"x" });
+            oi(cx, r);
         }
     }
 }
 
-fn ma_w(r: i64) {
-    unsafe { o(c"w"); }
-    oi(r);
+fn ma_w(mut cx: *FnCtx, r: i64) {
+    unsafe { o(cx, c"w"); }
+    oi(cx, r);
 }
 
 // The float register r (32 + n) for a value of type ty (q<n> for a
 // vector).
-fn ma_f(r: i64, ty: i64) {
-    unsafe { o(if is_vector(ty) { c"q" } else if ty == TY_F32 { c"s" } else { c"d" }); }
-    oi(r - 32);
+fn ma_f(mut cx: *FnCtx, r: i64, ty: i64) {
+    unsafe { o(cx, if is_vector(ty) { c"q" } else if ty == TY_F32 { c"s" } else { c"d" }); }
+    oi(cx, r - 32);
 }
 
 // "    <mnemonic> x<d>, x<a>, x<b>\n"
-fn ma_rrr(mnemonic: *u8, d: i64, a: i64, b: i64) {
+fn ma_rrr(mut cx: *FnCtx, mnemonic: *u8, d: i64, a: i64, b: i64) {
     unsafe {
-        o(c"    ");
-        o(mnemonic);
-        o(c" ");
-        ma_r(d);
-        o(c", ");
-        ma_r(a);
-        o(c", ");
-        ma_r(b);
-        on();
+        o(cx, c"    ");
+        o(cx, mnemonic);
+        o(cx, c" ");
+        ma_r(cx, d);
+        o(cx, c", ");
+        ma_r(cx, a);
+        o(cx, c", ");
+        ma_r(cx, b);
+        on(cx);
     }
 }
 
-fn ma_rr(mnemonic: *u8, d: i64, a: i64) {
+fn ma_rr(mut cx: *FnCtx, mnemonic: *u8, d: i64, a: i64) {
     unsafe {
-        o(c"    ");
-        o(mnemonic);
-        o(c" ");
-        ma_r(d);
-        o(c", ");
-        ma_r(a);
-        on();
+        o(cx, c"    ");
+        o(cx, mnemonic);
+        o(cx, c" ");
+        ma_r(cx, d);
+        o(cx, c", ");
+        ma_r(cx, a);
+        on(cx);
     }
 }
 
-pub fn ma_mov(dst: i64, src: i64, ty: i64) {
+pub fn ma_mov(mut cx: *FnCtx, dst: i64, src: i64, ty: i64) {
     unsafe {
         if dst >= 32 && is_vector(ty) {
-            o(c"    mov ");
-            ma_v(dst, c"16b");
-            o(c", ");
-            ma_v(src, c"16b");
-            on();
+            o(cx, c"    mov ");
+            ma_v(cx, dst, c"16b");
+            o(cx, c", ");
+            ma_v(cx, src, c"16b");
+            on(cx);
         } else if dst >= 32 {
-            o(c"    fmov ");
-            ma_f(dst, TY_F64);
-            o(c", ");
-            ma_f(src, TY_F64);
-            on();
+            o(cx, c"    fmov ");
+            ma_f(cx, dst, TY_F64);
+            o(cx, c", ");
+            ma_f(cx, src, TY_F64);
+            on(cx);
         } else {
-            ma_rr(c"mov", dst, src);
+            ma_rr(cx, c"mov", dst, src);
         }
     }
 }
 
-pub fn ma_load_imm(dst: i64, value: u64) {
+pub fn ma_load_imm(mut cx: *FnCtx, dst: i64, value: u64) {
     unsafe {
         let signed = value as i64;
         // One instruction: movz, or movn for small negative values.
         if (signed >= 0 && signed < 65536) || (signed < 0 && signed >= -65536) {
-            o(c"    mov ");
-            ma_r(dst);
-            o(c", #");
-            oi(signed);
-            on();
+            o(cx, c"    mov ");
+            ma_r(cx, dst);
+            o(cx, c", #");
+            oi(cx, signed);
+            on(cx);
             return;
         }
-        a64_load_imm(dst, value);
+        a64_load_imm(cx, dst, value);
     }
 }
 
-pub fn ma_load_fimm(dst: i64, bits: i64, ty: i64) {
+pub fn ma_load_fimm(mut cx: *FnCtx, dst: i64, bits: i64, ty: i64) {
     unsafe {
         if bits == 0 {
-            o(c"    fmov ");
-            ma_f(dst, ty);
-            o(if ty == TY_F32 { c", wzr\n" } else { c", xzr\n" });
+            o(cx, c"    fmov ");
+            ma_f(cx, dst, ty);
+            o(cx, if ty == TY_F32 { c", wzr\n" } else { c", xzr\n" });
             return;
         }
         if ty == TY_F32 {
-            a64_load_imm(17, f32_bits(f64_of_bits(bits)));
-            o(c"    fmov ");
-            ma_f(dst, ty);
-            o(c", w17\n");
+            a64_load_imm(cx, 17, f32_bits(f64_of_bits(bits)));
+            o(cx, c"    fmov ");
+            ma_f(cx, dst, ty);
+            o(cx, c", w17\n");
         } else {
-            a64_load_imm(17, bits as u64);
-            o(c"    fmov ");
-            ma_f(dst, ty);
-            o(c", x17\n");
+            a64_load_imm(cx, 17, bits as u64);
+            o(cx, c"    fmov ");
+            ma_f(cx, dst, ty);
+            o(cx, c", x17\n");
         }
     }
 }
 
 // dst = base + offset.
-pub fn ma_lea(dst: i64, base: i64, offset: i64) {
+pub fn ma_lea(mut cx: *FnCtx, dst: i64, base: i64, offset: i64) {
     unsafe {
         if offset == 0 {
             if dst != base {
-                ma_rr(c"mov", dst, base);
+                ma_rr(cx, c"mov", dst, base);
             }
             return;
         }
         if offset > 0 && offset < 4096 {
-            ma_rr(c"add", dst, base);
-            o_back_imm(offset);
+            ma_rr(cx, c"add", dst, base);
+            o_back_imm(cx, offset);
             return;
         }
         if offset < 0 && offset > -4096 {
-            ma_rr(c"sub", dst, base);
-            o_back_imm(0 - offset);
+            ma_rr(cx, c"sub", dst, base);
+            o_back_imm(cx, 0 - offset);
             return;
         }
-        a64_load_imm(17, offset as u64);
-        ma_rrr(c"add", dst, base, 17);
+        a64_load_imm(cx, 17, offset as u64);
+        ma_rrr(cx, c"add", dst, base, 17);
     }
 }
 
 // Replaces the newline just written with ", #<value>\n".
-fn o_back_imm(value: i64) {
+fn o_back_imm(mut cx: *FnCtx, value: i64) {
     unsafe {
-        BUFS[CODE].len -= 1;
-        o(c", #");
+        BUFS[cx.code].len -= 1;
+        o(cx, c", #");
     }
-    oi(value);
-    on();
+    oi(cx, value);
+    on(cx);
 }
 
 // "[x<base>, #offset]" when encodable as an unsigned scaled offset;
 // otherwise the address is computed into x17 first (call before starting
 // the instruction's line).
-fn ma_address(base: i64, offset: i64, size: i64) -> i64 {
+fn ma_address(mut cx: *FnCtx, base: i64, offset: i64, size: i64) -> i64 {
     if offset >= 0 && offset % size == 0 && offset / size < 4096 {
         return offset;
     }
-    ma_lea(17, base, offset);
+    ma_lea(cx, 17, base, offset);
     -1
 }
 
-fn ma_mem_operand(base: i64, offset: i64) {
+fn ma_mem_operand(mut cx: *FnCtx, base: i64, offset: i64) {
     unsafe {
-        o(c"[");
-        if MEM_INDEX >= 0 {
+        o(cx, c"[");
+        if cx.mem_index >= 0 {
             // [base, index, lsl #s] (no offset: see isel.tach).
-            ma_r(base);
-            o(c", ");
-            ma_r(MEM_INDEX);
-            if MEM_SCALE != 0 {
-                o(c", lsl #");
-                oi(MEM_SCALE);
+            ma_r(cx, base);
+            o(cx, c", ");
+            ma_r(cx, cx.mem_index);
+            if cx.mem_scale != 0 {
+                o(cx, c", lsl #");
+                oi(cx, cx.mem_scale);
             }
-            o(c"]");
+            o(cx, c"]");
             return;
         }
         if offset < 0 {
-            o(c"x17]");
+            o(cx, c"x17]");
             return;
         }
-        ma_r(base);
+        ma_r(cx, base);
         if offset != 0 {
-            o(c", #");
-            oi(offset);
+            o(cx, c", #");
+            oi(cx, offset);
         }
-        o(c"]");
+        o(cx, c"]");
     }
 }
-
-// (0.15) The last load or store a pair may start (see pair_with_last): its
-// line's start and end in CODE (end -1: none), kind (1 an x register, 2 a
-// d register, 3 a q register; negated for a store), register, base and
-// offset.
-pub static mut PAIR_END: i64 = -1;
-static mut PAIR_START: i64 = 0;
-static mut PAIR_KIND: i64 = 0;
-static mut PAIR_REG: i64 = 0;
-static mut PAIR_BASE: i64 = 0;
-static mut PAIR_OFFSET: i64 = 0;
 
 // The kind of an access of type ty a pair can make (0: none).
 fn pair_kind(ty: i64) -> i64 {
@@ -244,262 +228,263 @@ fn pair_kind(ty: i64) -> i64 {
 // base (the next one's address changes) or the other's register is no
 // pair. Returns whether it was made; else remembers this access when it
 // may start one (call it with the line about to be written).
-fn pair_with_last(load: bool, ty: i64, r: i64, base: i64, offset: i64) -> bool {
+fn pair_with_last(mut cx: *FnCtx, load: bool, ty: i64, r: i64, base: i64, offset: i64) -> bool {
     unsafe {
         let kind = if load { pair_kind(ty) } else { 0 - pair_kind(ty) };
         let size = if kind == 3 || kind == -3 { 16 } else { 8 };
-        if kind == 0 || MEM_INDEX >= 0 {
-            PAIR_END = -1;
+        if kind == 0 || cx.mem_index >= 0 {
+            cx.pair_end = -1;
             return false;
         }
-        if BUFS[CODE].len == PAIR_END && kind == PAIR_KIND && base == PAIR_BASE
-            && offset == PAIR_OFFSET + size && !(load && (PAIR_REG == base || PAIR_REG == r)) {
-            BUFS[CODE].len = PAIR_START;
-            o(if load { c"    ldp " } else { c"    stp " });
+        if BUFS[cx.code].len == cx.pair_end && kind == cx.pair_kind && base == cx.pair_base
+            && offset == cx.pair_offset + size
+            && !(load && (cx.pair_reg == base || cx.pair_reg == r)) {
+            BUFS[cx.code].len = cx.pair_start;
+            o(cx, if load { c"    ldp " } else { c"    stp " });
             if kind == 1 || kind == -1 {
-                ma_r(PAIR_REG);
-                o(c", ");
-                ma_r(r);
+                ma_r(cx, cx.pair_reg);
+                o(cx, c", ");
+                ma_r(cx, r);
             } else {
-                ma_f(PAIR_REG, ty);
-                o(c", ");
-                ma_f(r, ty);
+                ma_f(cx, cx.pair_reg, ty);
+                o(cx, c", ");
+                ma_f(cx, r, ty);
             }
-            o(c", [");
-            ma_r(base);
-            if PAIR_OFFSET != 0 {
-                o(c", #");
-                oi(PAIR_OFFSET);
+            o(cx, c", [");
+            ma_r(cx, base);
+            if cx.pair_offset != 0 {
+                o(cx, c", #");
+                oi(cx, cx.pair_offset);
             }
-            o(c"]");
-            on();
-            PAIR_END = -1;
+            o(cx, c"]");
+            on(cx);
+            cx.pair_end = -1;
             return true;
         }
         // (ldp's offset: 7 signed bits, scaled)
         if offset >= 0 && offset % size == 0 && offset / size < 63 {
-            PAIR_START = BUFS[CODE].len;
-            PAIR_KIND = kind;
-            PAIR_REG = r;
-            PAIR_BASE = base;
-            PAIR_OFFSET = offset;
-            PAIR_END = -2;
+            cx.pair_start = BUFS[cx.code].len;
+            cx.pair_kind = kind;
+            cx.pair_reg = r;
+            cx.pair_base = base;
+            cx.pair_offset = offset;
+            cx.pair_end = -2;
         } else {
-            PAIR_END = -1;
+            cx.pair_end = -1;
         }
         false
     }
 }
 
-pub fn ma_load(ty: i64, dst: i64, base: i64, offset: i64) {
+pub fn ma_load(mut cx: *FnCtx, ty: i64, dst: i64, base: i64, offset: i64) {
     unsafe {
-        if pair_with_last(true, ty, dst, base, offset) {
+        if pair_with_last(cx, true, ty, dst, base, offset) {
             return;
         }
         let size = type_size(ty);
-        let at = if MEM_INDEX >= 0 { 0 } else { ma_address(base, offset, size) };
-        o(c"    ");
+        let at = if cx.mem_index >= 0 { 0 } else { ma_address(cx, base, offset, size) };
+        o(cx, c"    ");
         if is_float(ty) || is_vector(ty) {
-            o(c"ldr ");
-            ma_f(dst, ty);
+            o(cx, c"ldr ");
+            ma_f(cx, dst, ty);
         } else if ty == TY_I8 {
-            o(c"ldrsb ");
-            ma_r(dst);
+            o(cx, c"ldrsb ");
+            ma_r(cx, dst);
         } else if size == 1 {
-            o(c"ldrb ");
-            ma_w(dst);
+            o(cx, c"ldrb ");
+            ma_w(cx, dst);
         } else if ty == TY_I16 {
-            o(c"ldrsh ");
-            ma_r(dst);
+            o(cx, c"ldrsh ");
+            ma_r(cx, dst);
         } else if size == 2 {
-            o(c"ldrh ");
-            ma_w(dst);
+            o(cx, c"ldrh ");
+            ma_w(cx, dst);
         } else if ty == TY_I32 {
-            o(c"ldrsw ");
-            ma_r(dst);
+            o(cx, c"ldrsw ");
+            ma_r(cx, dst);
         } else if size == 4 {
-            o(c"ldr ");
-            ma_w(dst);
+            o(cx, c"ldr ");
+            ma_w(cx, dst);
         } else {
-            o(c"ldr ");
-            ma_r(dst);
+            o(cx, c"ldr ");
+            ma_r(cx, dst);
         }
-        o(c", ");
-        ma_mem_operand(base, at);
-        on();
-        if PAIR_END == -2 {
-            PAIR_END = BUFS[CODE].len;
+        o(cx, c", ");
+        ma_mem_operand(cx, base, at);
+        on(cx);
+        if cx.pair_end == -2 {
+            cx.pair_end = BUFS[cx.code].len;
         }
     }
 }
 
-pub fn ma_store(ty: i64, src: i64, base: i64, offset: i64) {
+pub fn ma_store(mut cx: *FnCtx, ty: i64, src: i64, base: i64, offset: i64) {
     unsafe {
-        if pair_with_last(false, ty, src, base, offset) {
+        if pair_with_last(cx, false, ty, src, base, offset) {
             return;
         }
         let size = type_size(ty);
-        let at = if MEM_INDEX >= 0 { 0 } else { ma_address(base, offset, size) };
-        o(c"    ");
+        let at = if cx.mem_index >= 0 { 0 } else { ma_address(cx, base, offset, size) };
+        o(cx, c"    ");
         if is_float(ty) || is_vector(ty) {
-            o(c"str ");
-            ma_f(src, ty);
+            o(cx, c"str ");
+            ma_f(cx, src, ty);
         } else if size == 1 {
-            o(c"strb ");
-            ma_w(src);
+            o(cx, c"strb ");
+            ma_w(cx, src);
         } else if size == 2 {
-            o(c"strh ");
-            ma_w(src);
+            o(cx, c"strh ");
+            ma_w(cx, src);
         } else if size == 4 {
-            o(c"str ");
-            ma_w(src);
+            o(cx, c"str ");
+            ma_w(cx, src);
         } else {
-            o(c"str ");
-            ma_r(src);
+            o(cx, c"str ");
+            ma_r(cx, src);
         }
-        o(c", ");
-        ma_mem_operand(base, at);
-        on();
-        if PAIR_END == -2 {
-            PAIR_END = BUFS[CODE].len;
+        o(cx, c", ");
+        ma_mem_operand(cx, base, at);
+        on(cx);
+        if cx.pair_end == -2 {
+            cx.pair_end = BUFS[cx.code].len;
         }
     }
 }
 
-pub fn ma_symbol_addr(dst: i64, prefix: *u8, name: i64) {
+pub fn ma_symbol_addr(mut cx: *FnCtx, dst: i64, prefix: *u8, name: i64) {
     unsafe {
-        o(c"    adrp ");
-        ma_r(dst);
-        o(c", ");
-        a64_sym(prefix, name, A64_PAGE);
-        o(c"\n    add ");
-        ma_r(dst);
-        o(c", ");
-        ma_r(dst);
-        o(c", ");
-        a64_sym(prefix, name, A64_PAGEOFF);
-        on();
+        o(cx, c"    adrp ");
+        ma_r(cx, dst);
+        o(cx, c", ");
+        a64_sym(cx, prefix, name, A64_PAGE);
+        o(cx, c"\n    add ");
+        ma_r(cx, dst);
+        o(cx, c", ");
+        ma_r(cx, dst);
+        o(cx, c", ");
+        a64_sym(cx, prefix, name, A64_PAGEOFF);
+        on(cx);
     }
 }
 
-pub fn ma_extern_addr(dst: i64, name: i64) {
+pub fn ma_extern_addr(mut cx: *FnCtx, dst: i64, name: i64) {
     unsafe {
-        o(c"    adrp ");
-        ma_r(dst);
-        o(c", ");
-        a64_sym(global_prefix(), name, A64_GOTPAGE);
-        o(c"\n    ldr ");
-        ma_r(dst);
-        o(c", [");
-        ma_r(dst);
-        o(c", ");
-        a64_sym(global_prefix(), name, A64_GOTPAGEOFF);
-        o(c"]\n");
+        o(cx, c"    adrp ");
+        ma_r(cx, dst);
+        o(cx, c", ");
+        a64_sym(cx, global_prefix(), name, A64_GOTPAGE);
+        o(cx, c"\n    ldr ");
+        ma_r(cx, dst);
+        o(cx, c", [");
+        ma_r(cx, dst);
+        o(cx, c", ");
+        a64_sym(cx, global_prefix(), name, A64_GOTPAGEOFF);
+        o(cx, c"]\n");
     }
 }
 
-pub fn ma_string_addr(dst: i64, id: i64) {
+pub fn ma_string_addr(mut cx: *FnCtx, dst: i64, id: i64) {
     unsafe {
-        o(c"    adrp ");
-        ma_r(dst);
-        o(c", ");
-        a64_str_sym(id, A64_PAGE);
-        o(c"\n    add ");
-        ma_r(dst);
-        o(c", ");
-        ma_r(dst);
-        o(c", ");
-        a64_str_sym(id, A64_PAGEOFF);
-        on();
+        o(cx, c"    adrp ");
+        ma_r(cx, dst);
+        o(cx, c", ");
+        a64_str_sym(cx, id, A64_PAGE);
+        o(cx, c"\n    add ");
+        ma_r(cx, dst);
+        o(cx, c", ");
+        ma_r(cx, dst);
+        o(cx, c", ");
+        a64_str_sym(cx, id, A64_PAGEOFF);
+        on(cx);
     }
 }
 
-pub fn ma_normalize(r: i64, ty: i64) {
+pub fn ma_normalize(mut cx: *FnCtx, r: i64, ty: i64) {
     unsafe {
         if ty == TY_I8 {
-            o(c"    sxtb ");
-            ma_r(r);
-            o(c", ");
-            ma_w(r);
-            on();
+            o(cx, c"    sxtb ");
+            ma_r(cx, r);
+            o(cx, c", ");
+            ma_w(cx, r);
+            on(cx);
         } else if ty == TY_U8 {
-            ma_rr(c"and", r, r);
-            o_back_imm(0xff);
+            ma_rr(cx, c"and", r, r);
+            o_back_imm(cx, 0xff);
         } else if ty == TY_I16 {
-            o(c"    sxth ");
-            ma_r(r);
-            o(c", ");
-            ma_w(r);
-            on();
+            o(cx, c"    sxth ");
+            ma_r(cx, r);
+            o(cx, c", ");
+            ma_w(cx, r);
+            on(cx);
         } else if ty == TY_U16 {
-            ma_rr(c"and", r, r);
-            o_back_imm(0xffff);
+            ma_rr(cx, c"and", r, r);
+            o_back_imm(cx, 0xffff);
         } else if ty == TY_I32 {
-            o(c"    sxtw ");
-            ma_r(r);
-            o(c", ");
-            ma_w(r);
-            on();
+            o(cx, c"    sxtw ");
+            ma_r(cx, r);
+            o(cx, c", ");
+            ma_w(cx, r);
+            on(cx);
         } else if ty == TY_U32 {
-            o(c"    mov ");
-            ma_w(r);
-            o(c", ");
-            ma_w(r);
-            on();
+            o(cx, c"    mov ");
+            ma_w(cx, r);
+            o(cx, c", ");
+            ma_w(cx, r);
+            on(cx);
         }
     }
 }
 
 // Links a frame: saves the frame pointer and the return address, points
 // the frame pointer at them.
-pub fn ma_frame_link() {
+pub fn ma_frame_link(mut cx: *FnCtx) {
     unsafe {
-        ins(c"stp x29, x30, [sp, #-16]!");
-        ins(c"mov x29, sp");
+        ins(cx, c"stp x29, x30, [sp, #-16]!");
+        ins(cx, c"mov x29, sp");
     }
 }
 
 // Unlinks it: sp from the frame pointer, which and the return address are
 // restored.
-pub fn ma_frame_unlink() {
+pub fn ma_frame_unlink(mut cx: *FnCtx) {
     unsafe {
-        ins(c"mov sp, x29");
-        ins(c"ldp x29, x30, [sp], #16");
+        ins(cx, c"mov sp, x29");
+        ins(cx, c"ldp x29, x30, [sp], #16");
     }
 }
 
-pub fn ma_copy(dst: i64, src: i64, size: i64) {
+pub fn ma_copy(mut cx: *FnCtx, dst: i64, src: i64, size: i64) {
     unsafe {
         let mut offset = 0;
         while offset + 8 <= size {
-            ma_copy_chunk(c"ldr x17", c"str x17", dst, src, offset);
+            ma_copy_chunk(cx, c"ldr x17", c"str x17", dst, src, offset);
             offset += 8;
         }
         if offset + 4 <= size {
-            ma_copy_chunk(c"ldr w17", c"str w17", dst, src, offset);
+            ma_copy_chunk(cx, c"ldr w17", c"str w17", dst, src, offset);
             offset += 4;
         }
         if offset + 2 <= size {
-            ma_copy_chunk(c"ldrh w17", c"strh w17", dst, src, offset);
+            ma_copy_chunk(cx, c"ldrh w17", c"strh w17", dst, src, offset);
             offset += 2;
         }
         if offset < size {
-            ma_copy_chunk(c"ldrb w17", c"strb w17", dst, src, offset);
+            ma_copy_chunk(cx, c"ldrb w17", c"strb w17", dst, src, offset);
         }
     }
 }
 
-fn ma_copy_chunk(load: *u8, store: *u8, dst: i64, src: i64, offset: i64) {
+fn ma_copy_chunk(mut cx: *FnCtx, load: *u8, store: *u8, dst: i64, src: i64, offset: i64) {
     unsafe {
-        o(c"    ");
-        o(load);
-        o(c", [");
-        ma_r(src);
-        end_i(c", #", offset, c"]");
-        o(c"    ");
-        o(store);
-        o(c", [");
-        ma_r(dst);
-        end_i(c", #", offset, c"]");
+        o(cx, c"    ");
+        o(cx, load);
+        o(cx, c", [");
+        ma_r(cx, src);
+        end_i(cx, c", #", offset, c"]");
+        o(cx, c"    ");
+        o(cx, store);
+        o(cx, c", [");
+        ma_r(cx, dst);
+        end_i(cx, c", #", offset, c"]");
     }
 }

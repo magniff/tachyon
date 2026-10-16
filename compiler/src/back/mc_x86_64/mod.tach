@@ -18,14 +18,14 @@
 pub mod ops;
 pub mod vector;
 
-use crate::back::emit::{MEM_INDEX, MEM_SCALE};
 use crate::base::buf_uint;
 use crate::front::consteval::{f32_bits, f64_of_bits};
 use crate::front::types::{
     TY_F32, TY_F64, TY_I16, TY_I32, TY_I8, TY_U16, TY_U32, TY_U8, is_float, is_vector, type_size,
 };
-use crate::gen0::target::{CODE, emit_symbol_ref, global_prefix, ins, local_prefix, o, oi, on};
+use crate::gen0::target::{emit_symbol_ref, global_prefix, ins, local_prefix, o, oi, on};
 use crate::gen0::x86_64::fits_i32;
+use crate::middle::ctx::FnCtx;
 
 fn mx_name(r: i64, size: i64) -> *u8 {
     if r >= 32 {
@@ -112,329 +112,329 @@ fn mx_name(r: i64, size: i64) -> *u8 {
 
 // Writes register r: 64-bit name for integers (size for narrower), xmm<n>
 // for floats.
-fn mx_r(r: i64) {
-    mx_rs(r, 8);
+fn mx_r(mut cx: *FnCtx, r: i64) {
+    mx_rs(cx, r, 8);
 }
 
-fn mx_rs(r: i64, size: i64) {
+fn mx_rs(mut cx: *FnCtx, r: i64, size: i64) {
     unsafe {
         if r >= 32 {
-            o(c"%xmm");
-            oi(r - 32);
+            o(cx, c"%xmm");
+            oi(cx, r - 32);
         } else {
-            o(mx_name(r, size));
+            o(cx, mx_name(r, size));
         }
     }
 }
 
 // "    <mnemonic> %a, %b\n"
-fn mx_rr(mnemonic: *u8, a: i64, b: i64) {
+fn mx_rr(mut cx: *FnCtx, mnemonic: *u8, a: i64, b: i64) {
     unsafe {
-        o(c"    ");
-        o(mnemonic);
-        o(c" ");
-        mx_r(a);
-        o(c", ");
-        mx_r(b);
-        on();
+        o(cx, c"    ");
+        o(cx, mnemonic);
+        o(cx, c" ");
+        mx_r(cx, a);
+        o(cx, c", ");
+        mx_r(cx, b);
+        on(cx);
     }
 }
 
 // "    <mnemonic> $imm, %r\n"
-fn mx_ir(mnemonic: *u8, imm: i64, r: i64) {
+fn mx_ir(mut cx: *FnCtx, mnemonic: *u8, imm: i64, r: i64) {
     unsafe {
-        o(c"    ");
-        o(mnemonic);
-        o(c" $");
-        oi(imm);
-        o(c", ");
-        mx_r(r);
-        on();
+        o(cx, c"    ");
+        o(cx, mnemonic);
+        o(cx, c" $");
+        oi(cx, imm);
+        o(cx, c", ");
+        mx_r(cx, r);
+        on(cx);
     }
 }
 
 // "<offset>(%base)"
-fn mx_mem(base: i64, offset: i64) {
+fn mx_mem(mut cx: *FnCtx, base: i64, offset: i64) {
     unsafe {
         if offset != 0 {
-            oi(offset);
+            oi(cx, offset);
         }
-        o(c"(");
-        mx_r(base);
-        if MEM_INDEX >= 0 {
+        o(cx, c"(");
+        mx_r(cx, base);
+        if cx.mem_index >= 0 {
             // disp(base, index, 1 << s) (see isel.tach).
-            o(c",");
-            mx_r(MEM_INDEX);
-            if MEM_SCALE != 0 {
-                o(c",");
-                oi(1 << MEM_SCALE as u64);
+            o(cx, c",");
+            mx_r(cx, cx.mem_index);
+            if cx.mem_scale != 0 {
+                o(cx, c",");
+                oi(cx, 1 << cx.mem_scale as u64);
             }
         }
-        o(c")");
+        o(cx, c")");
     }
 }
 
-pub fn mx_mov(dst: i64, src: i64, ty: i64) {
+pub fn mx_mov(mut cx: *FnCtx, dst: i64, src: i64, ty: i64) {
     unsafe {
         if dst >= 32 {
-            mx_rr(c"movapd", src, dst);
+            mx_rr(cx, c"movapd", src, dst);
         } else {
-            mx_rr(c"movq", src, dst);
+            mx_rr(cx, c"movq", src, dst);
         }
     }
 }
 
-pub fn mx_load_imm(dst: i64, value: u64) {
+pub fn mx_load_imm(mut cx: *FnCtx, dst: i64, value: u64) {
     unsafe {
         let signed = value as i64;
         if signed == 0 {
-            o(c"    xorl ");
-            mx_rs(dst, 4);
-            o(c", ");
-            mx_rs(dst, 4);
-            on();
+            o(cx, c"    xorl ");
+            mx_rs(cx, dst, 4);
+            o(cx, c", ");
+            mx_rs(cx, dst, 4);
+            on(cx);
         } else if signed > 0 && signed <= 4294967295 {
             // movl zero-extends to 64 bits.
-            o(c"    movl $");
-            buf_uint(CODE, value);
-            o(c", ");
-            mx_rs(dst, 4);
-            on();
+            o(cx, c"    movl $");
+            buf_uint(cx.code, value);
+            o(cx, c", ");
+            mx_rs(cx, dst, 4);
+            on(cx);
         } else if fits_i32(signed) {
-            mx_ir(c"movq", signed, dst);
+            mx_ir(cx, c"movq", signed, dst);
         } else {
-            mx_ir(c"movabsq", signed, dst);
+            mx_ir(cx, c"movabsq", signed, dst);
         }
     }
 }
 
 // Through r10 (free after the cycles of a parallel move, where constants
 // are rematerialized, and inside instructions).
-pub fn mx_load_fimm(dst: i64, bits: i64, ty: i64) {
+pub fn mx_load_fimm(mut cx: *FnCtx, dst: i64, bits: i64, ty: i64) {
     unsafe {
         if bits == 0 {
-            mx_rr(if ty == TY_F32 { c"xorps" } else { c"xorpd" }, dst, dst);
+            mx_rr(cx, if ty == TY_F32 { c"xorps" } else { c"xorpd" }, dst, dst);
             return;
         }
         if ty == TY_F32 {
-            o(c"    movl $");
-            buf_uint(CODE, f32_bits(f64_of_bits(bits)));
-            o(c", %r10d\n    movd %r10d, ");
-            mx_r(dst);
-            on();
+            o(cx, c"    movl $");
+            buf_uint(cx.code, f32_bits(f64_of_bits(bits)));
+            o(cx, c", %r10d\n    movd %r10d, ");
+            mx_r(cx, dst);
+            on(cx);
         } else {
-            mx_ir(c"movabsq", bits, 10);
-            o(c"    movq %r10, ");
-            mx_r(dst);
-            on();
+            mx_ir(cx, c"movabsq", bits, 10);
+            o(cx, c"    movq %r10, ");
+            mx_r(cx, dst);
+            on(cx);
         }
     }
 }
 
-pub fn mx_load(ty: i64, dst: i64, base: i64, offset: i64) {
+pub fn mx_load(mut cx: *FnCtx, ty: i64, dst: i64, base: i64, offset: i64) {
     unsafe {
         let size = type_size(ty);
-        o(c"    ");
+        o(cx, c"    ");
         if is_vector(ty) {
-            o(c"movups ");
+            o(cx, c"movups ");
         } else if ty == TY_F32 {
-            o(c"movss ");
+            o(cx, c"movss ");
         } else if ty == TY_F64 {
-            o(c"movsd ");
+            o(cx, c"movsd ");
         } else if ty == TY_I8 {
-            o(c"movsbq ");
+            o(cx, c"movsbq ");
         } else if size == 1 {
-            o(c"movzbl ");
+            o(cx, c"movzbl ");
         } else if ty == TY_I16 {
-            o(c"movswq ");
+            o(cx, c"movswq ");
         } else if size == 2 {
-            o(c"movzwl ");
+            o(cx, c"movzwl ");
         } else if ty == TY_I32 {
-            o(c"movslq ");
+            o(cx, c"movslq ");
         } else if size == 4 {
-            o(c"movl ");
+            o(cx, c"movl ");
         } else {
-            o(c"movq ");
+            o(cx, c"movq ");
         }
-        mx_mem(base, offset);
-        o(c", ");
+        mx_mem(cx, base, offset);
+        o(cx, c", ");
         if !is_float(ty) && (size == 1 || size == 2 || (size == 4 && ty != TY_I32)) && ty != TY_I8
             && ty != TY_I16 {
-            mx_rs(dst, 4);
+            mx_rs(cx, dst, 4);
         } else {
-            mx_r(dst);
+            mx_r(cx, dst);
         }
-        on();
+        on(cx);
     }
 }
 
-pub fn mx_store(ty: i64, src: i64, base: i64, offset: i64) {
+pub fn mx_store(mut cx: *FnCtx, ty: i64, src: i64, base: i64, offset: i64) {
     unsafe {
         let size = type_size(ty);
-        o(c"    ");
+        o(cx, c"    ");
         if is_vector(ty) {
-            o(c"movups ");
-            mx_r(src);
+            o(cx, c"movups ");
+            mx_r(cx, src);
         } else if ty == TY_F32 {
-            o(c"movss ");
-            mx_r(src);
+            o(cx, c"movss ");
+            mx_r(cx, src);
         } else if ty == TY_F64 {
-            o(c"movsd ");
-            mx_r(src);
+            o(cx, c"movsd ");
+            mx_r(cx, src);
         } else if size == 1 {
-            o(c"movb ");
-            mx_rs(src, 1);
+            o(cx, c"movb ");
+            mx_rs(cx, src, 1);
         } else if size == 2 {
-            o(c"movw ");
-            mx_rs(src, 2);
+            o(cx, c"movw ");
+            mx_rs(cx, src, 2);
         } else if size == 4 {
-            o(c"movl ");
-            mx_rs(src, 4);
+            o(cx, c"movl ");
+            mx_rs(cx, src, 4);
         } else {
-            o(c"movq ");
-            mx_r(src);
+            o(cx, c"movq ");
+            mx_r(cx, src);
         }
-        o(c", ");
-        mx_mem(base, offset);
-        on();
+        o(cx, c", ");
+        mx_mem(cx, base, offset);
+        on(cx);
     }
 }
 
-pub fn mx_lea(dst: i64, base: i64, offset: i64) {
+pub fn mx_lea(mut cx: *FnCtx, dst: i64, base: i64, offset: i64) {
     unsafe {
-        o(c"    leaq ");
-        mx_mem(base, offset);
-        o(c", ");
-        mx_r(dst);
-        on();
+        o(cx, c"    leaq ");
+        mx_mem(cx, base, offset);
+        o(cx, c", ");
+        mx_r(cx, dst);
+        on(cx);
     }
 }
 
-pub fn mx_symbol_addr(dst: i64, prefix: *u8, name: i64) {
+pub fn mx_symbol_addr(mut cx: *FnCtx, dst: i64, prefix: *u8, name: i64) {
     unsafe {
-        o(c"    leaq ");
-        emit_symbol_ref(prefix, name);
-        o(c"(%rip), ");
-        mx_r(dst);
-        on();
+        o(cx, c"    leaq ");
+        emit_symbol_ref(cx, prefix, name);
+        o(cx, c"(%rip), ");
+        mx_r(cx, dst);
+        on(cx);
     }
 }
 
-pub fn mx_extern_addr(dst: i64, name: i64) {
+pub fn mx_extern_addr(mut cx: *FnCtx, dst: i64, name: i64) {
     unsafe {
-        o(c"    movq ");
-        emit_symbol_ref(global_prefix(), name);
-        o(c"@GOTPCREL(%rip), ");
+        o(cx, c"    movq ");
+        emit_symbol_ref(cx, global_prefix(), name);
+        o(cx, c"@GOTPCREL(%rip), ");
     }
-    mx_r(dst);
-    on();
+    mx_r(cx, dst);
+    on(cx);
 }
 
-pub fn mx_string_addr(dst: i64, id: i64) {
+pub fn mx_string_addr(mut cx: *FnCtx, dst: i64, id: i64) {
     unsafe {
-        o(c"    leaq ");
-        o(local_prefix());
-        o(c"str.");
-        oi(id);
-        o(c"(%rip), ");
-        mx_r(dst);
-        on();
+        o(cx, c"    leaq ");
+        o(cx, local_prefix());
+        o(cx, c"str.");
+        oi(cx, id);
+        o(cx, c"(%rip), ");
+        mx_r(cx, dst);
+        on(cx);
     }
 }
 
-pub fn mx_normalize(r: i64, ty: i64) {
+pub fn mx_normalize(mut cx: *FnCtx, r: i64, ty: i64) {
     unsafe {
         if ty == TY_I8 {
-            o(c"    movsbq ");
-            mx_rs(r, 1);
+            o(cx, c"    movsbq ");
+            mx_rs(cx, r, 1);
         } else if ty == TY_U8 {
-            o(c"    movzbl ");
-            mx_rs(r, 1);
-            o(c", ");
-            mx_rs(r, 4);
-            on();
+            o(cx, c"    movzbl ");
+            mx_rs(cx, r, 1);
+            o(cx, c", ");
+            mx_rs(cx, r, 4);
+            on(cx);
             return;
         } else if ty == TY_I16 {
-            o(c"    movswq ");
-            mx_rs(r, 2);
+            o(cx, c"    movswq ");
+            mx_rs(cx, r, 2);
         } else if ty == TY_U16 {
-            o(c"    movzwl ");
-            mx_rs(r, 2);
-            o(c", ");
-            mx_rs(r, 4);
-            on();
+            o(cx, c"    movzwl ");
+            mx_rs(cx, r, 2);
+            o(cx, c", ");
+            mx_rs(cx, r, 4);
+            on(cx);
             return;
         } else if ty == TY_I32 {
-            o(c"    movslq ");
-            mx_rs(r, 4);
+            o(cx, c"    movslq ");
+            mx_rs(cx, r, 4);
         } else if ty == TY_U32 {
-            o(c"    movl ");
-            mx_rs(r, 4);
-            o(c", ");
-            mx_rs(r, 4);
-            on();
+            o(cx, c"    movl ");
+            mx_rs(cx, r, 4);
+            o(cx, c", ");
+            mx_rs(cx, r, 4);
+            on(cx);
             return;
         } else {
             return;
         }
-        o(c", ");
-        mx_r(r);
-        on();
+        o(cx, c", ");
+        mx_r(cx, r);
+        on(cx);
     }
 }
 
 // Links a frame: saves the frame pointer, points it at itself.
-pub fn mx_frame_link() {
+pub fn mx_frame_link(mut cx: *FnCtx) {
     unsafe {
-        ins(c"pushq %rbp");
-        ins(c"movq %rsp, %rbp");
+        ins(cx, c"pushq %rbp");
+        ins(cx, c"movq %rsp, %rbp");
     }
 }
 
 // Unlinks it: rsp from the frame pointer, which is restored.
-pub fn mx_frame_unlink() {
+pub fn mx_frame_unlink(mut cx: *FnCtx) {
     unsafe {
-        ins(c"movq %rbp, %rsp");
-        ins(c"popq %rbp");
+        ins(cx, c"movq %rbp, %rsp");
+        ins(cx, c"popq %rbp");
     }
 }
 
-pub fn mx_copy(dst: i64, src: i64, size: i64) {
+pub fn mx_copy(mut cx: *FnCtx, dst: i64, src: i64, size: i64) {
     unsafe {
         let mut offset = 0;
         while offset + 8 <= size {
-            mx_copy_chunk(c"movq", 8, dst, src, offset);
+            mx_copy_chunk(cx, c"movq", 8, dst, src, offset);
             offset += 8;
         }
         if offset + 4 <= size {
-            mx_copy_chunk(c"movl", 4, dst, src, offset);
+            mx_copy_chunk(cx, c"movl", 4, dst, src, offset);
             offset += 4;
         }
         if offset + 2 <= size {
-            mx_copy_chunk(c"movw", 2, dst, src, offset);
+            mx_copy_chunk(cx, c"movw", 2, dst, src, offset);
             offset += 2;
         }
         if offset < size {
-            mx_copy_chunk(c"movb", 1, dst, src, offset);
+            mx_copy_chunk(cx, c"movb", 1, dst, src, offset);
         }
     }
 }
 
-fn mx_copy_chunk(mnemonic: *u8, size: i64, dst: i64, src: i64, offset: i64) {
+fn mx_copy_chunk(mut cx: *FnCtx, mnemonic: *u8, size: i64, dst: i64, src: i64, offset: i64) {
     unsafe {
-        o(c"    ");
-        o(mnemonic);
-        o(c" ");
-        mx_mem(src, offset);
-        o(c", ");
-        mx_rs(11, size);
-        on();
-        o(c"    ");
-        o(mnemonic);
-        o(c" ");
-        mx_rs(11, size);
-        o(c", ");
-        mx_mem(dst, offset);
-        on();
+        o(cx, c"    ");
+        o(cx, mnemonic);
+        o(cx, c" ");
+        mx_mem(cx, src, offset);
+        o(cx, c", ");
+        mx_rs(cx, 11, size);
+        on(cx);
+        o(cx, c"    ");
+        o(cx, mnemonic);
+        o(cx, c" ");
+        mx_rs(cx, 11, size);
+        o(cx, c", ");
+        mx_mem(cx, dst, offset);
+        on(cx);
     }
 }

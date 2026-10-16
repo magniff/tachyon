@@ -42,7 +42,6 @@ use crate::base::{
     BUFS, SYMS, buf_byte, buf_fmt, buf_new, buf_reserve, buf_write_file, cstr, die, grow, intern,
     strlen,
 };
-use crate::gen0::target::ASM;
 use crate::middle::lower::ssa::HMap;
 use debug::{CFI_FNS, ROWS, compact_unwind, line_program};
 use elf::elf_write;
@@ -52,6 +51,7 @@ use resolve::{build_sections, layout, resolve_fixups};
 // The assembler's text helpers, used by the instruction encoders.
 use crate::base::target::{ELF, X86};
 use crate::base::timer::{T_CODEGEN, T_OUTPUT, timer_now, timer_sub};
+use crate::middle::ctx::FnCtx;
 use output::{c_module_symbols, link_command};
 
 // ---- Sections ----
@@ -368,18 +368,18 @@ pub fn is_debug(sec: i64) -> bool {
 
 // Assembles ASM into an object file at `path` (what asm_flush has not
 // assembled yet).
-pub fn write_object(path: *u8) {
+pub fn write_object(mut cx: *FnCtx, path: *u8) {
     unsafe {
         if !ASM_STREAM {
             assembler_begin();
         }
-        assemble_text();
+        assemble_text(cx);
         if ASM_STREAM {
-            BUFS[ASM].len = 0;
+            BUFS[cx.asm].len = 0;
         }
         new_frag(CUR_SEC);
         layout();
-        resolve_fixups();
+        resolve_fixups(cx);
         build_sections();
         if ROWS.count > 0 {
             line_program();
@@ -414,16 +414,16 @@ fn assembler_begin() {
 }
 
 // Assembles the lines in ASM.
-fn assemble_text() {
+fn assemble_text(mut cx: *FnCtx) {
     unsafe {
-        let t = BUFS[ASM].data;
-        let n = BUFS[ASM].len;
+        let t = BUFS[cx.asm].data;
+        let n = BUFS[cx.asm].len;
         let mut i = 0;
         while i < n {
             // (0.17: the end of the line by memchr, not byte by byte)
             let nl = memchr(&t[i], 10, (n - i) as u64);
             let e = if nl == 0 as *u8 { n } else { i + (nl as i64 - (&t[i]) as i64) };
-            assemble_line(i, e);
+            assemble_line(cx, i, e);
             i = e + 1;
         }
     }
@@ -449,15 +449,15 @@ pub fn asm_stream_begin() {
 
 // Assembles the text written so far (whole lines: a function's), when
 // streaming.
-pub fn asm_flush() {
+pub fn asm_flush(mut cx: *FnCtx) {
     unsafe {
         if ASM_STREAM {
             // (its time is the output's, as when the text is assembled at
             // the end, not the code generation's that runs it)
             let t = timer_now();
-            c_module_symbols();
-            assemble_text();
-            BUFS[ASM].len = 0;
+            c_module_symbols(cx);
+            assemble_text(cx);
+            BUFS[cx.asm].len = 0;
             timer_sub(T_CODEGEN, T_OUTPUT, t);
         }
     }
@@ -495,21 +495,21 @@ pub fn output_mode_of(path: *u8) -> i64 {
 }
 
 // Writes the program (ASM) to `path` as the output mode says.
-pub fn write_output(path: *u8) {
+pub fn write_output(mut cx: *FnCtx, path: *u8) {
     unsafe {
-        c_module_symbols();
+        c_module_symbols(cx);
         if OUTPUT_MODE == OUT_ASM {
-            buf_write_file(ASM, path);
+            buf_write_file(cx.asm, path);
             return;
         }
         if OUTPUT_MODE == OUT_OBJECT {
-            write_object(path);
+            write_object(cx, path);
             return;
         }
         let obj = buf_new();
         buf_fmt(obj, f"{cstr(path)}.tachyon.o\0");
         let obj_path = BUFS[obj].data;
-        write_object(obj_path);
+        write_object(cx, obj_path);
         let mut status = system(link_command(path, obj_path));
         if status == 0 && DEBUG_INFO && !ELF {
             // (-g) On macOS the debug information stays in the object, which

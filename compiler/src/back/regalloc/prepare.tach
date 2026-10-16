@@ -5,17 +5,15 @@
 use crate::back::abi::{conv_returns_through_pointer, fn_uses_c};
 use crate::back::emit::blocks::{fits_cmp_imm, is_cmp_imm_operand};
 use crate::back::emit::machine::{call_returns_through_pointer, m_int_imm_ok};
-use crate::back::regalloc::{
-    BEND, BSTART, FIXED, LDEPTH, LIVE_IN, LIVE_OUT, LIVE_WORDS, ORDER, RA_VALS, REG_USED, RV_CAP,
-    RV_FIRST, RV_HINT, RV_HREG, RV_SLOT, USES, USE_ANY, USE_NONE, USE_REG,
-};
+use crate::back::regalloc::{USE_ANY, USE_NONE, USE_REG};
 use crate::back::regalloc::locations::vloc;
 use crate::base::{IntVec, alloc_array, free};
 use crate::base::target::X86;
 use crate::front::types::{FNS, is_compound, is_float};
+use crate::middle::ctx::FnCtx;
 use crate::middle::ir::{
-    BLOCKS, INSTS, INST_COUNT, IRF, IRFUNCS, IRFUNC_COUNT, Term, ir_arg, ir_enter, ir_new_block,
-    ir_operand, ir_operand_count, ir_set_arg,
+    IRFUNCS, IRFUNC_COUNT, Term, ir_arg, ir_enter, ir_new_block, ir_operand, ir_operand_count,
+    ir_set_arg,
 };
 use crate::middle::ir::Op::{
     Cmp, Const, Div, Lea, Load, LoadX, Pack, Param, Phi, Piece, Rem, Select, Slot, Store, StoreX,
@@ -26,33 +24,33 @@ use crate::middle::ir::cfg::{pred_index, redirect_succ, succ, succ_count};
 // ---- Preparation ----
 
 // Counts the uses of every value of function fi (before it is emitted).
-pub fn count_uses(fi: i64) {
+pub fn count_uses(mut cx: *FnCtx, fi: i64) {
     unsafe {
-        ir_enter(fi);
-        free(USES as *u8);
-        free(REG_USED as *u8);
-        USES = alloc_array::<i64>(INST_COUNT + 1);
-        REG_USED = alloc_array::<i64>(INST_COUNT + 1);
-        if FIXED == 0 as *IntVec {
-            FIXED = alloc_array::<IntVec>(64);
+        ir_enter(cx, fi);
+        free(cx.regalloc_uses as *u8);
+        free(cx.reg_used as *u8);
+        cx.regalloc_uses = alloc_array::<i64>(cx.inst_count + 1);
+        cx.reg_used = alloc_array::<i64>(cx.inst_count + 1);
+        if cx.fixed == 0 as *IntVec {
+            cx.fixed = alloc_array::<IntVec>(64);
         }
         for b in IRFUNCS[fi].blocks.items() {
-            if BLOCKS[b].removed != 0 {
+            if cx.blocks[b].removed != 0 {
                 continue;
             }
-            let mut v = BLOCKS[b].first;
+            let mut v = cx.blocks[b].first;
             while v != 0 {
-                for k in 0..ir_operand_count(v) {
-                    let operand = ir_operand(v, k);
+                for k in 0..ir_operand_count(cx, v) {
+                    let operand = ir_operand(cx, v, k);
                     if operand != 0 {
-                        USES[operand] += 1;
+                        cx.regalloc_uses[operand] += 1;
                     }
                 }
-                v = INSTS[v].next;
+                v = cx.insts[v].next;
             }
-            let cond = BLOCKS[b].cond;
+            let cond = cx.blocks[b].cond;
             if cond != 0 {
-                USES[cond] += 1;
+                cx.regalloc_uses[cond] += 1;
             }
         }
     }
@@ -61,65 +59,65 @@ pub fn count_uses(fi: i64) {
 // Splits every critical edge (from a block with several successors to one
 // with several predecessors) with an empty block, so that the moves of
 // each edge have a place of their own.
-pub fn split_critical_edges(fi: i64) {
+pub fn split_critical_edges(mut cx: *FnCtx, fi: i64) {
     unsafe {
-        ir_enter(fi);
+        ir_enter(cx, fi);
         let count = IRFUNCS[fi].blocks.count;
         for i in 0..count {
             let b = IRFUNCS[fi].blocks.data[i];
-            if BLOCKS[b].removed != 0 || succ_count(b) < 2 {
+            if cx.blocks[b].removed != 0 || succ_count(cx, b) < 2 {
                 continue;
             }
-            if BLOCKS[b].term == Term::Branch && BLOCKS[b].s0 == BLOCKS[b].s1 {
+            if cx.blocks[b].term == Term::Branch && cx.blocks[b].s0 == cx.blocks[b].s1 {
                 // Both ways lead to the same block: a jump (one edge less).
-                let s = BLOCKS[b].s0;
-                let first = pred_index(s, b);
+                let s = cx.blocks[b].s0;
+                let first = pred_index(cx, s, b);
                 let mut second = -1;
-                for j in first + 1..BLOCKS[s].preds.count {
-                    if second < 0 && BLOCKS[s].preds.data[j] == b {
+                for j in first + 1..cx.blocks[s].preds.count {
+                    if second < 0 && cx.blocks[s].preds.data[j] == b {
                         second = j;
                     }
                 }
                 if second >= 0 {
-                    for j in second..BLOCKS[s].preds.count - 1 {
-                        BLOCKS[s].preds.data[j] = BLOCKS[s].preds.data[j + 1];
+                    for j in second..cx.blocks[s].preds.count - 1 {
+                        cx.blocks[s].preds.data[j] = cx.blocks[s].preds.data[j + 1];
                     }
-                    BLOCKS[s].preds.count -= 1;
-                    let mut phi = BLOCKS[s].first;
-                    while phi != 0 && INSTS[phi].op == Phi {
-                        let gone = ir_arg(phi, second);
+                    cx.blocks[s].preds.count -= 1;
+                    let mut phi = cx.blocks[s].first;
+                    while phi != 0 && cx.insts[phi].op == Phi {
+                        let gone = ir_arg(cx, phi, second);
                         if gone != 0 {
-                            USES[gone] -= 1;
+                            cx.regalloc_uses[gone] -= 1;
                         }
-                        for j in second..INSTS[phi].nargs - 1 {
-                            ir_set_arg(phi, j, ir_arg(phi, j + 1));
+                        for j in second..cx.insts[phi].nargs - 1 {
+                            ir_set_arg(cx, phi, j, ir_arg(cx, phi, j + 1));
                         }
-                        INSTS[phi].nargs -= 1;
-                        phi = INSTS[phi].next;
+                        cx.insts[phi].nargs -= 1;
+                        phi = cx.insts[phi].next;
                     }
                 }
-                USES[BLOCKS[b].cond] -= 1;
-                BLOCKS[b].cond = 0;
-                BLOCKS[b].term = Term::Jump;
-                BLOCKS[b].s1 = 0;
+                cx.regalloc_uses[cx.blocks[b].cond] -= 1;
+                cx.blocks[b].cond = 0;
+                cx.blocks[b].term = Term::Jump;
+                cx.blocks[b].s1 = 0;
                 continue;
             }
             let mut k = 0;
-            while k < succ_count(b) {
-                let s = succ(b, k);
+            while k < succ_count(cx, b) {
+                let s = succ(cx, b, k);
                 k += 1;
-                if BLOCKS[s].preds.count < 2 {
+                if cx.blocks[s].preds.count < 2 {
                     continue;
                 }
-                let e = ir_new_block();
-                BLOCKS[e].sealed = 1;
-                BLOCKS[e].term = Term::Jump;
-                BLOCKS[e].s0 = s;
-                BLOCKS[e].preds.push(b);
-                redirect_succ(b, s, e);
+                let e = ir_new_block(cx);
+                cx.blocks[e].sealed = 1;
+                cx.blocks[e].term = Term::Jump;
+                cx.blocks[e].s0 = s;
+                cx.blocks[e].preds.push(b);
+                redirect_succ(cx, b, s, e);
                 // Same index in the predecessor list, so the phis still match.
-                let index = pred_index(s, b);
-                BLOCKS[s].preds.data[index] = e;
+                let index = pred_index(cx, s, b);
+                cx.blocks[s].preds.data[index] = e;
             }
         }
     }
@@ -128,69 +126,69 @@ pub fn split_critical_edges(fi: i64) {
 // Lays out the reachable blocks in reverse post-order (BLOCKS[b].order is
 // the layout index, -1 for unreachable blocks), and finds their loop
 // depths (LDEPTH, for the back end).
-pub fn layout_blocks(fi: i64) {
-    layout_order(fi);
-    loop_depths();
+pub fn layout_blocks(mut cx: *FnCtx, fi: i64) {
+    layout_order(cx, fi);
+    loop_depths(cx);
 }
 
 // (0.17) The reverse post-order alone (BLOCKS[b].order, ORDER): what the
 // middle end's users of the layout need (dominators, unreachable blocks);
 // the loop depths cost a walk of every loop's blocks.
-pub fn layout_order(fi: i64) {
+pub fn layout_order(mut cx: *FnCtx, fi: i64) {
     unsafe {
         for b in IRFUNCS[fi].blocks.items() {
-            BLOCKS[b].order = -1;
-            BLOCKS[b].mark = 0;
+            cx.blocks[b].order = -1;
+            cx.blocks[b].mark = 0;
         }
-        ORDER.count = 0;
+        cx.order.count = 0;
         // Iterative depth-first search; post-order into ORDER, reversed below.
         let mut stack = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let entry = IRFUNCS[fi].entry;
         stack.push(entry);
         stack.push(0);
-        BLOCKS[entry].mark = 1;
+        cx.blocks[entry].mark = 1;
         while stack.count > 0 {
             let b = stack.data[stack.count - 2];
             let next = stack.data[stack.count - 1];
-            if next < succ_count(b) {
+            if next < succ_count(cx, b) {
                 stack.data[stack.count - 1] = next + 1;
                 // The second successor first, so that the first one comes
                 // right after the block when it can.
-                let s = succ(b, succ_count(b) - 1 - next);
-                if BLOCKS[s].mark == 0 {
-                    BLOCKS[s].mark = 1;
+                let s = succ(cx, b, succ_count(cx, b) - 1 - next);
+                if cx.blocks[s].mark == 0 {
+                    cx.blocks[s].mark = 1;
                     stack.push(s);
                     stack.push(0);
                 }
             } else {
                 stack.count -= 2;
-                ORDER.push(b);
+                cx.order.push(b);
             }
         }
-        let n = ORDER.count;
+        let n = cx.order.count;
         for i in 0..n / 2 {
-            let t = ORDER.data[i];
-            ORDER.data[i] = ORDER.data[n - 1 - i];
-            ORDER.data[n - 1 - i] = t;
+            let t = cx.order.data[i];
+            cx.order.data[i] = cx.order.data[n - 1 - i];
+            cx.order.data[n - 1 - i] = t;
         }
         for i in 0..n {
-            BLOCKS[ORDER.data[i]].order = i;
+            cx.blocks[cx.order.data[i]].order = i;
         }
         free(stack.data as *u8);
     }
 }
 
 // The loop depth of each block of the layout (LDEPTH, by layout index).
-fn loop_depths() {
+fn loop_depths(mut cx: *FnCtx) {
     unsafe {
-        let n = ORDER.count;
+        let n = cx.order.count;
         let mut stack = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         // Loops: an edge to a block not later in the order is a back edge
         // (the graph is reducible); the loop of header h is h and the blocks
         // reaching a latch without passing h.
-        LDEPTH.count = 0;
+        cx.ldepth.count = 0;
         for _ in 0..n {
-            LDEPTH.push(0);
+            cx.ldepth.push(0);
         }
         // (0.17) The marks of the previous walk are cleared, not every
         // block's for every header: that was quadratic in the blocks of a
@@ -199,10 +197,10 @@ fn loop_depths() {
         let mut walked = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let mut first_walk = true;
         for h in 0..n {
-            let header = ORDER.data[h];
+            let header = cx.order.data[h];
             stack.count = 0;
-            for p in BLOCKS[header].preds.items() {
-                if BLOCKS[p].order >= h {
+            for p in cx.blocks[header].preds.items() {
+                if cx.blocks[p].order >= h {
                     stack.push(p);
                 }
             }
@@ -211,27 +209,27 @@ fn loop_depths() {
             }
             if first_walk {
                 for k in 0..n {
-                    BLOCKS[ORDER.data[k]].mark = 0;
+                    cx.blocks[cx.order.data[k]].mark = 0;
                 }
                 first_walk = false;
             } else {
                 for k in 0..walked.count {
-                    BLOCKS[walked.data[k]].mark = 0;
+                    cx.blocks[walked.data[k]].mark = 0;
                 }
             }
             walked.count = 0;
-            BLOCKS[header].mark = 1;
+            cx.blocks[header].mark = 1;
             walked.push(header);
-            LDEPTH.data[h] += 1;
+            cx.ldepth.data[h] += 1;
             while stack.count > 0 {
                 let b = stack.pop();
-                if BLOCKS[b].mark != 0 || BLOCKS[b].order < 0 {
+                if cx.blocks[b].mark != 0 || cx.blocks[b].order < 0 {
                     continue;
                 }
-                BLOCKS[b].mark = 1;
+                cx.blocks[b].mark = 1;
                 walked.push(b);
-                LDEPTH.data[BLOCKS[b].order] += 1;
-                for x in BLOCKS[b].preds.items() {
+                cx.ldepth.data[cx.blocks[b].order] += 1;
+                for x in cx.blocks[b].preds.items() {
                     stack.push(x);
                 }
             }
@@ -243,25 +241,25 @@ fn loop_depths() {
 
 // Whether compare (or test) `v` is fused into the branch that ends its
 // block.
-pub fn is_fused_compare(v: i64) -> bool {
+pub fn is_fused_compare(mut cx: *FnCtx, v: i64) -> bool {
     unsafe {
-        let b = INSTS[v].block;
-        (INSTS[v].op == Cmp || INSTS[v].op == Test) && USES[v] == 1
-            && BLOCKS[b].term == Term::Branch && BLOCKS[b].cond == v && INSTS[v].next == 0
-            && !is_float(INSTS[v].imm2)
+        let b = cx.insts[v].block;
+        (cx.insts[v].op == Cmp || cx.insts[v].op == Test) && cx.regalloc_uses[v] == 1
+            && cx.blocks[b].term == Term::Branch && cx.blocks[b].cond == v && cx.insts[v].next == 0
+            && !is_float(cx.insts[v].imm2)
     }
 }
 
 // How instruction v uses its operand i (see ir_operand).
-pub fn use_kind(v: i64, i: i64) -> i64 {
+pub fn use_kind(mut cx: *FnCtx, v: i64, i: i64) -> i64 {
     unsafe {
-        let operand = ir_operand(v, i);
+        let operand = ir_operand(cx, v, i);
         if operand == 0 {
             return USE_NONE;
         }
-        let op = INSTS[v].op;
+        let op = cx.insts[v].op;
         if op.is_call() {
-            if i == 2 && INSTS[operand].op == Slot && !call_returns_through_pointer(v) {
+            if i == 2 && cx.insts[operand].op == Slot && !call_returns_through_pointer(cx, v) {
                 return USE_NONE;
             }
             return USE_ANY;
@@ -275,24 +273,25 @@ pub fn use_kind(v: i64, i: i64) -> i64 {
         if op == Phi {
             return USE_ANY;
         }
-        if (op == Load || op == Store) && i == 0 && INSTS[operand].op == Slot {
+        if (op == Load || op == Store) && i == 0 && cx.insts[operand].op == Slot {
             return USE_NONE;
         }
         // AArch64's csel and csinc read a 0 from xzr.
-        if op == Select && i < 2 && !X86 && is_zero_operand(operand) {
+        if op == Select && i < 2 && !X86 && is_zero_operand(cx, operand) {
             return USE_NONE;
         }
         // x86-64's indexed forms address a frame slot from %rsp.
-        if (op == LoadX || op == StoreX || op == Lea) && i == 0 && INSTS[operand].op == Slot {
+        if (op == LoadX || op == StoreX || op == Lea) && i == 0 && cx.insts[operand].op == Slot {
             return USE_NONE;
         }
         // An integer comparison with a constant that fits compares with an
         // immediate.
-        if op == Cmp && i == 1 && is_cmp_imm_operand(v) {
+        if op == Cmp && i == 1 && is_cmp_imm_operand(cx, v) {
             return USE_NONE;
         }
-        if op.is_binary() && i == 1 && !is_float(INSTS[v].ty) && op != Div && op != Rem
-            && INSTS[operand].op == Const && m_int_imm_ok(op, INSTS[v].ty, INSTS[operand].imm) {
+        if op.is_binary() && i == 1 && !is_float(cx.insts[v].ty) && op != Div && op != Rem
+            && cx.insts[operand].op == Const
+            && m_int_imm_ok(op, cx.insts[v].ty, cx.insts[operand].imm) {
             return USE_NONE;
         }
         USE_REG
@@ -301,46 +300,47 @@ pub fn use_kind(v: i64, i: i64) -> i64 {
 
 // The operands the terminator of block b reads (at BEND), with their
 // kinds: up to four (value, kind) pairs in out; returns the count.
-pub fn term_uses(b: i64, out: *i64) -> i64 {
+pub fn term_uses(mut cx: *FnCtx, b: i64, out: *i64) -> i64 {
     unsafe {
-        let cond = BLOCKS[b].cond;
-        let term = BLOCKS[b].term;
+        let cond = cx.blocks[b].cond;
+        let term = cx.blocks[b].term;
         if cond == 0 {
             return 0;
         }
-        if term == Term::Ret && INSTS[cond].op == Pack {
+        if term == Term::Ret && cx.insts[cond].op == Pack {
             // The pieces of an aggregate result.
-            for i in 0..INSTS[cond].nargs {
-                out[2 * i] = ir_arg(cond, i);
+            for i in 0..cx.insts[cond].nargs {
+                out[2 * i] = ir_arg(cx, cond, i);
                 out[2 * i + 1] = USE_ANY;
             }
-            return INSTS[cond].nargs;
+            return cx.insts[cond].nargs;
         }
         if term == Term::Ret {
-            let ret = FNS[IRFUNCS[IRF].f].ret;
-            if is_compound(ret) && !conv_returns_through_pointer(fn_uses_c(IRFUNCS[IRF].f), ret)
-                && INSTS[cond].op == Slot {
+            let ret = FNS[IRFUNCS[cx.irf].f].ret;
+            if is_compound(ret)
+                && !conv_returns_through_pointer(cx, fn_uses_c(IRFUNCS[cx.irf].f), ret)
+                && cx.insts[cond].op == Slot {
                 return 0;
             }
             out[0] = cond;
             out[1] = USE_ANY;
             return 1;
         }
-        if term == Term::Branch && is_fused_compare(cond) && INSTS[cond].op == Test {
-            out[0] = INSTS[cond].a;
+        if term == Term::Branch && is_fused_compare(cx, cond) && cx.insts[cond].op == Test {
+            out[0] = cx.insts[cond].a;
             out[1] = USE_REG;
-            if INSTS[cond].b == 0 {
+            if cx.insts[cond].b == 0 {
                 return 1;
             }
-            out[2] = INSTS[cond].b;
+            out[2] = cx.insts[cond].b;
             out[3] = USE_REG;
             return 2;
         }
-        if term == Term::Branch && is_fused_compare(cond) {
-            out[0] = INSTS[cond].a;
+        if term == Term::Branch && is_fused_compare(cx, cond) {
+            out[0] = cx.insts[cond].a;
             out[1] = USE_REG;
-            let rhs = INSTS[cond].b;
-            if INSTS[rhs].op == Const && fits_cmp_imm(INSTS[rhs].imm) {
+            let rhs = cx.insts[cond].b;
+            if cx.insts[rhs].op == Const && fits_cmp_imm(cx.insts[rhs].imm) {
                 return 1;
             }
             out[2] = rhs;
@@ -359,84 +359,86 @@ pub fn term_uses(b: i64, out: *i64) -> i64 {
 // Whether a use of kind `kind` of value `v` makes it live: remat values
 // only when they are needed in a register (else they are rematerialized
 // where they are needed).
-pub fn is_live_use(v: i64, kind: i64) -> bool {
-    unsafe { kind == USE_REG || (kind == USE_ANY && !INSTS[v].op.is_remat()) }
+pub fn is_live_use(mut cx: *FnCtx, v: i64, kind: i64) -> bool {
+    unsafe { kind == USE_REG || (kind == USE_ANY && !cx.insts[v].op.is_remat()) }
 }
 
 // Whether `v` is computed where it is defined.
-pub fn is_emitted(v: i64) -> bool {
+pub fn is_emitted(mut cx: *FnCtx, v: i64) -> bool {
     unsafe {
-        let op = INSTS[v].op;
+        let op = cx.insts[v].op;
         if op == Phi || op == Param || op == Piece || op == Pack {
             return false;
         }
         if op.is_remat() {
-            if INSTS[v].aux == 0 {
+            if cx.insts[v].aux == 0 {
                 return false;
             }
-            let loc = vloc(v, INSTS[v].mark + 2);
+            let loc = vloc(cx, v, cx.insts[v].mark + 2);
             return loc >= 0 && loc < 64;
         }
-        op.has_side_effect() || USES[v] > 0
+        op.has_side_effect() || cx.regalloc_uses[v] > 0
     }
 }
 
-fn needs_location(v: i64) -> bool {
+fn needs_location(mut cx: *FnCtx, v: i64) -> bool {
     unsafe {
-        let op = INSTS[v].op;
-        if INSTS[v].ty == 0 || USES[v] == 0 || is_fused_compare(v) {
+        let op = cx.insts[v].op;
+        if cx.insts[v].ty == 0 || cx.regalloc_uses[v] == 0 || is_fused_compare(cx, v) {
             return false;
         }
-        !op.is_remat() || REG_USED[v] != 0
+        !op.is_remat() || cx.reg_used[v] != 0
     }
 }
 
 // ---- Positions and liveness ----
 
-fn ra_reserve(n: i64) {
-    if n <= RV_CAP {
-        return;
-    }
-    let mut cap = RV_CAP * 2;
-    if cap < n {
-        cap = n;
-    }
-    if cap < 1024 {
-        cap = 1024;
-    }
+fn ra_reserve(mut cx: *FnCtx, n: i64) {
     unsafe {
-        free(RV_FIRST as *u8);
-        free(RV_SLOT as *u8);
-        free(RV_HINT as *u8);
-        free(RV_HREG as *u8);
+        if n <= cx.rv_cap {
+            return;
+        }
+        let mut cap = cx.rv_cap * 2;
+        if cap < n {
+            cap = n;
+        }
+        if cap < 1024 {
+            cap = 1024;
+        }
+        unsafe {
+            free(cx.rv_first as *u8);
+            free(cx.rv_slot as *u8);
+            free(cx.rv_hint as *u8);
+            free(cx.rv_hreg as *u8);
+        }
+        cx.rv_first = alloc_array::<i64>(cap);
+        cx.rv_slot = alloc_array::<i64>(cap);
+        cx.rv_hint = alloc_array::<i64>(cap);
+        cx.rv_hreg = alloc_array::<i64>(cap);
+        cx.rv_cap = cap;
     }
-    RV_FIRST = alloc_array::<i64>(cap);
-    RV_SLOT = alloc_array::<i64>(cap);
-    RV_HINT = alloc_array::<i64>(cap);
-    RV_HREG = alloc_array::<i64>(cap);
-    RV_CAP = cap;
 }
 
 // Marks the values some use needs in a register.
-pub fn mark_reg_uses() {
+pub fn mark_reg_uses(mut cx: *FnCtx) {
     unsafe {
         let mut out: [i64; 8] = [0; 8];
-        for b in ORDER.items() {
-            let mut v = BLOCKS[b].first;
+        for b in cx.order.items() {
+            let mut v = cx.blocks[b].first;
             while v != 0 {
-                if !is_fused_compare(v) {
-                    for i in 0..ir_operand_count(v) {
-                        if use_kind(v, i) == USE_REG {
-                            REG_USED[ir_operand(v, i)] = 1;
+                if !is_fused_compare(cx, v) {
+                    for i in 0..ir_operand_count(cx, v) {
+                        if use_kind(cx, v, i) == USE_REG {
+                            cx.reg_used[ir_operand(cx, v, i)] = 1;
                         }
                     }
                 }
-                v = INSTS[v].next;
+                v = cx.insts[v].next;
             }
-            let n = term_uses(b, &out as *i64);
+            let n = term_uses(cx, b, &out as *i64);
             for i in 0..n {
                 if out[2 * i + 1] == USE_REG {
-                    REG_USED[out[2 * i]] = 1;
+                    cx.reg_used[out[2 * i]] = 1;
                 }
             }
         }
@@ -444,36 +446,36 @@ pub fn mark_reg_uses() {
 }
 
 // Numbers the instructions and the allocated values.
-pub fn number_positions() {
+pub fn number_positions(mut cx: *FnCtx) {
     unsafe {
-        BSTART.count = 0;
-        BEND.count = 0;
-        RA_VALS.count = 0;
+        cx.bstart.count = 0;
+        cx.bend.count = 0;
+        cx.ra_vals.count = 0;
         let mut pos = 0;
-        for b in ORDER.items() {
+        for b in cx.order.items() {
             let start = pos;
-            BSTART.push(start);
-            let mut v = BLOCKS[b].first;
+            cx.bstart.push(start);
+            let mut v = cx.blocks[b].first;
             while v != 0 {
-                let op = INSTS[v].op;
+                let op = cx.insts[v].op;
                 if op == Phi || op == Param {
-                    INSTS[v].mark = start;
+                    cx.insts[v].mark = start;
                 } else {
                     pos += 4;
-                    INSTS[v].mark = pos;
+                    cx.insts[v].mark = pos;
                 }
-                INSTS[v].aux = 0;
-                if needs_location(v) {
-                    RA_VALS.push(v);
-                    INSTS[v].aux = RA_VALS.count;
+                cx.insts[v].aux = 0;
+                if needs_location(cx, v) {
+                    cx.ra_vals.push(v);
+                    cx.insts[v].aux = cx.ra_vals.count;
                 }
-                v = INSTS[v].next;
+                v = cx.insts[v].next;
             }
             pos += 4;
-            BEND.push(pos);
+            cx.bend.push(pos);
             pos += 4;
         }
-        ra_reserve(RA_VALS.count);
+        ra_reserve(cx, cx.ra_vals.count);
     }
 }
 
@@ -489,54 +491,55 @@ fn bit_get(set: *u64, i: i64) -> bool {
     unsafe { (set[i >> 6] >> (i & 63) as u64) & 1 != 0 }
 }
 
-pub fn live_set(sets: *u64, k: i64) -> *u64 {
-    unsafe { &sets[k * LIVE_WORDS] }
+pub fn live_set(mut cx: *FnCtx, sets: *u64, k: i64) -> *u64 {
+    unsafe { &sets[k * cx.live_words] }
 }
 
 // The dense index of operand `v` if it is allocated, else -1.
-pub fn tracked(v: i64) -> i64 {
+pub fn tracked(mut cx: *FnCtx, v: i64) -> i64 {
     if v == 0 {
         return -1;
     }
-    unsafe { INSTS[v].aux - 1 }
+    unsafe { cx.insts[v].aux - 1 }
 }
 
-pub fn compute_liveness() {
+pub fn compute_liveness(mut cx: *FnCtx) {
     unsafe {
-        let n = ORDER.count;
-        LIVE_WORDS = (RA_VALS.count + 63) / 64 + 1;
-        free(LIVE_IN as *u8);
-        free(LIVE_OUT as *u8);
-        LIVE_IN = alloc_array::<u64>(n * LIVE_WORDS + 1);
-        LIVE_OUT = alloc_array::<u64>(n * LIVE_WORDS + 1);
-        let gen = alloc_array::<u64>(n * LIVE_WORDS + 1);
-        let kill = alloc_array::<u64>(n * LIVE_WORDS + 1);
+        let n = cx.order.count;
+        cx.live_words = (cx.ra_vals.count + 63) / 64 + 1;
+        free(cx.live_in as *u8);
+        free(cx.live_out as *u8);
+        cx.live_in = alloc_array::<u64>(n * cx.live_words + 1);
+        cx.live_out = alloc_array::<u64>(n * cx.live_words + 1);
+        let gen = alloc_array::<u64>(n * cx.live_words + 1);
+        let kill = alloc_array::<u64>(n * cx.live_words + 1);
         let mut out: [i64; 8] = [0; 8];
         for k in 0..n {
-            let b = ORDER.data[k];
-            let g = live_set(gen, k);
-            let d = live_set(kill, k);
-            let mut v = BLOCKS[b].first;
+            let b = cx.order.data[k];
+            let g = live_set(cx, gen, k);
+            let d = live_set(cx, kill, k);
+            let mut v = cx.blocks[b].first;
             while v != 0 {
-                if INSTS[v].op != Phi && !is_fused_compare(v) {
-                    for i in 0..ir_operand_count(v) {
-                        let operand = ir_operand(v, i);
-                        let t = tracked(operand);
-                        if t >= 0 && is_live_use(operand, use_kind(v, i)) && !bit_get(d, t) {
+                if cx.insts[v].op != Phi && !is_fused_compare(cx, v) {
+                    for i in 0..ir_operand_count(cx, v) {
+                        let operand = ir_operand(cx, v, i);
+                        let t = tracked(cx, operand);
+                        if t >= 0 && is_live_use(cx, operand, use_kind(cx, v, i))
+                            && !bit_get(d, t) {
                             bit_set(g, t);
                         }
                     }
                 }
-                let t = tracked(v);
+                let t = tracked(cx, v);
                 if t >= 0 {
                     bit_set(d, t);
                 }
-                v = INSTS[v].next;
+                v = cx.insts[v].next;
             }
-            let count = term_uses(b, &out as *i64);
+            let count = term_uses(cx, b, &out as *i64);
             for i in 0..count {
-                let t = tracked(out[2 * i]);
-                if t >= 0 && is_live_use(out[2 * i], out[2 * i + 1]) && !bit_get(d, t) {
+                let t = tracked(cx, out[2 * i]);
+                if t >= 0 && is_live_use(cx, out[2 * i], out[2 * i + 1]) && !bit_get(d, t) {
                     bit_set(g, t);
                 }
             }
@@ -546,31 +549,31 @@ pub fn compute_liveness() {
             changed = false;
             let mut k = n - 1;
             while k >= 0 {
-                let b = ORDER.data[k];
-                let live_out = live_set(LIVE_OUT, k);
-                for i in 0..succ_count(b) {
-                    let s = succ(b, i);
-                    let sk = BLOCKS[s].order;
-                    let sin = live_set(LIVE_IN, sk);
-                    for w in 0..LIVE_WORDS {
+                let b = cx.order.data[k];
+                let live_out = live_set(cx, cx.live_out, k);
+                for i in 0..succ_count(cx, b) {
+                    let s = succ(cx, b, i);
+                    let sk = cx.blocks[s].order;
+                    let sin = live_set(cx, cx.live_in, sk);
+                    for w in 0..cx.live_words {
                         live_out[w] |= sin[w];
                     }
                     // Phi operands flowing from b.
-                    let index = pred_index(s, b);
-                    let mut phi = BLOCKS[s].first;
-                    while phi != 0 && INSTS[phi].op == Phi {
-                        let arg = ir_arg(phi, index);
-                        let t = tracked(arg);
-                        if t >= 0 && tracked(phi) >= 0 && is_live_use(arg, USE_ANY) {
+                    let index = pred_index(cx, s, b);
+                    let mut phi = cx.blocks[s].first;
+                    while phi != 0 && cx.insts[phi].op == Phi {
+                        let arg = ir_arg(cx, phi, index);
+                        let t = tracked(cx, arg);
+                        if t >= 0 && tracked(cx, phi) >= 0 && is_live_use(cx, arg, USE_ANY) {
                             bit_set(live_out, t);
                         }
-                        phi = INSTS[phi].next;
+                        phi = cx.insts[phi].next;
                     }
                 }
-                let live_in = live_set(LIVE_IN, k);
-                let g = live_set(gen, k);
-                let d = live_set(kill, k);
-                for w in 0..LIVE_WORDS {
+                let live_in = live_set(cx, cx.live_in, k);
+                let g = live_set(cx, gen, k);
+                let d = live_set(cx, kill, k);
+                for w in 0..cx.live_words {
                     let value = g[w] | (live_out[w] & ~d[w]);
                     if value != live_in[w] {
                         live_in[w] = value;
@@ -586,6 +589,6 @@ pub fn compute_liveness() {
 }
 
 // Whether `v` is the integer constant 0 (read from xzr on AArch64).
-pub fn is_zero_operand(v: i64) -> bool {
-    unsafe { INSTS[v].op == Const && INSTS[v].imm == 0 && !is_float(INSTS[v].ty) }
+pub fn is_zero_operand(mut cx: *FnCtx, v: i64) -> bool {
+    unsafe { cx.insts[v].op == Const && cx.insts[v].imm == 0 && !is_float(cx.insts[v].ty) }
 }

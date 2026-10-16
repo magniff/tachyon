@@ -28,8 +28,8 @@ mod checkalloc;
 
 use crate::version;
 use crate::back::abi::{
-    ABI_PIECE_COUNT, ABI_PIECE_OFFSET, ABI_PIECE_TY, AbiClass, abi_classify, abi_piece_locations,
-    abi_stack_location, return_piece_reg, returns_through_pointer,
+    AbiClass, abi_classify, abi_piece_locations, abi_stack_location, return_piece_reg,
+    returns_through_pointer,
 };
 use crate::back::dwarf::{
     DEBUG_INFO, dbg_function_begin, dbg_function_end, dbg_loc, dbg_place_locs, dbg_sections,
@@ -62,7 +62,7 @@ use crate::front::types::{
     type_elem, type_size, variant_field, variant_field_offset,
 };
 use crate::gen0::target::{
-    ASM, CODE, DATA, DEPTH, R_ACC, R_ADDR, R_RESULT, R_SECOND, arg_location, data_align, data_bytes,
+    DATA, DEPTH, R_ACC, R_ADDR, R_RESULT, R_SECOND, arg_location, data_align, data_bytes,
     data_label, data_section, data_string, emit_add_imm, emit_copy, emit_epilogue, emit_file_header,
     emit_file_trailer, emit_frame_addr, emit_frame_reserve, emit_function_start, emit_label,
     emit_load, emit_load_imm, emit_load_param, emit_load_reg, emit_move_to_second, emit_peek,
@@ -81,6 +81,7 @@ use expr::gen_expr;
 use crate::base::diag::{ERR_KIND, flush_warnings};
 use crate::base::target::X86;
 use crate::front::effects::{PRINT_EFFECTS, print_effects};
+use crate::middle::ctx::FnCtx;
 use crate::middle::effects_verify::{VERIFY_EFFECTS, verify_effects};
 use crate::middle::trace::trace_after_lowering;
 
@@ -158,7 +159,7 @@ pub fn static_symbol_prefix(s: i64) -> *u8 {
 
 // ---- The program ----
 
-pub fn compile_program(output: *u8) {
+pub fn compile_program(mut cx: *FnCtx, output: *u8) {
     unsafe {
         let mut t = timer_now();
         init_ast();
@@ -186,86 +187,86 @@ pub fn compile_program(output: *u8) {
             emit_c_header(program, output);
             return;
         }
-        ASM = buf_new();
+        cx.asm = buf_new();
         DATA = buf_new();
-        CODE = buf_new();
+        cx.code = buf_new();
         if OPT_LEVEL > 0 || EMIT_IR {
             t = timer_now();
-            lower_program(program);
+            lower_program(cx, program);
             // (0.16: the effects checked against the IR)
             if VERIFY_EFFECTS {
-                verify_effects();
+                verify_effects(cx);
             }
             // (0.10: profiles, on the IR as lowered)
-            profile_after_lowering();
+            profile_after_lowering(cx);
             // (0.17: --trace's frames)
-            trace_after_lowering();
+            trace_after_lowering(cx);
             flush_warnings();
             timer_add(T_LOWER, t);
             PER_FUNCTION = OPT_LEVEL == 1 && !EMIT_IR && !EMIT_MIR;
             if TIME_PASSES {
-                T_IR_BYTES[0] = ir_tables_bytes();
+                T_IR_BYTES[0] = ir_tables_bytes(cx);
             }
-            optimize_program();
+            optimize_program(cx);
             if TIME_PASSES {
-                T_IR_BYTES[1] = ir_tables_bytes();
+                T_IR_BYTES[1] = ir_tables_bytes(cx);
             }
             if EMIT_IR {
                 for fi in 0..IRFUNC_COUNT {
                     if FN_LIVE[fi] != 0 {
-                        ir_enter(fi);
-                        print_ir_func(ASM, fi);
+                        ir_enter(cx, fi);
+                        print_ir_func(cx, cx.asm, fi);
                     }
                 }
-                buf_write_file(ASM, output);
+                buf_write_file(cx.asm, output);
                 return;
             }
             if EMIT_MIR {
                 t = timer_now();
-                select_instructions();
+                select_instructions(cx);
                 timer_add(T_ISEL, t);
                 for fi in 0..IRFUNC_COUNT {
                     if FN_LIVE[fi] != 0 {
-                        ir_enter(fi);
-                        print_ir_func(ASM, fi);
+                        ir_enter(cx, fi);
+                        print_ir_func(cx, cx.asm, fi);
                     }
                 }
-                buf_write_file(ASM, output);
+                buf_write_file(cx.asm, output);
                 return;
             }
         }
         t = timer_now();
-        emit_file_header();
+        emit_file_header(cx);
         asm_stream_begin();
         if OPT_LEVEL > 0 {
             timer_add(T_CODEGEN, t);
             // (0.17: each function selected, allocated and emitted, then
             // freed; at -O1 optimized there too)
-            emit_ir_functions();
+            emit_ir_functions(cx);
             t = timer_now();
             print_stats();
         } else {
             for item in kids(program) {
                 if NODES[item].kind == Fn {
-                    gen_function(item);
-                    asm_flush();
+                    gen_function(cx, item);
+                    asm_flush(cx);
                 }
             }
         }
         timer_add(T_CODEGEN, t);
         t = timer_now();
-        emit_runtime();
-        dbg_text_end();
+        emit_runtime(cx);
+        dbg_text_end(cx);
         gen_data();
-        buf_bytes(ASM, buf_slice(DATA));
+        buf_bytes(cx.asm, buf_slice(DATA));
         if DEBUG_INFO {
             let producer = buf_new();
             buf_fmt(producer, f"tachyonc {cstr(version())}\0");
-            dbg_sections(FILES[0].path, BUFS[producer].data);
+            dbg_sections(cx, FILES[0].path, BUFS[producer].data);
         }
-        emit_file_trailer();
-        dbg_place_locs();
-        write_output(output);
+        emit_file_trailer(cx);
+        dbg_place_locs(cx);
+        write_output(cx, output);
         timer_add(T_OUTPUT, t);
         timer_report();
     }
@@ -329,42 +330,42 @@ fn gen_data() {
 
 // ---- Functions ----
 
-fn gen_function(item: i64) {
+fn gen_function(mut cx: *FnCtx, item: i64) {
     unsafe {
         let f = NODES[item].x - 1;
         CUR_FN = f;
         DEFERS.count = 0;
         DEFER_LOOPS.count = 0;
-        buf_clear(CODE);
+        buf_clear(cx.code);
         DEPTH = 0;
         FRAME_SIZE = 0;
         OVERALIGNED.count = 0;
         RETURN_LABEL = new_label();
         STMT_POS = -1;
-        dbg_function_begin(f, fn_symbol_prefix(f), NODES[item].start);
-        emit_function_start(fn_symbol_prefix(f), FNS[f].name, fn_is_global(f));
+        dbg_function_begin(cx, f, fn_symbol_prefix(f), NODES[item].start);
+        emit_function_start(cx, fn_symbol_prefix(f), FNS[f].name, fn_is_global(f));
         let ret = FNS[f].ret;
         RESULT_SLOT = 0;
-        if returns_through_pointer(ret) {
+        if returns_through_pointer(cx, ret) {
             RESULT_SLOT = alloc_slot(8, 8);
-            emit_frame_addr(R_ADDR, RESULT_SLOT);
-            emit_store(TY_U64, R_RESULT, R_ADDR);
+            emit_frame_addr(cx, R_ADDR, RESULT_SLOT);
+            emit_store(cx, TY_U64, R_RESULT, R_ADDR);
         }
-        gen_params(item, f);
+        gen_params(cx, item, f);
         let body = NODES[item].c;
-        gen_block(body);
+        gen_block(cx, body);
         if NODES[body].ty != TY_NEVER {
-            gen_return_value(ret);
+            gen_return_value(cx, ret);
         }
-        emit_label(RETURN_LABEL);
+        emit_label(cx, RETURN_LABEL);
         if is_void(ret) && FNS[f].name == MAIN_SYM {
             // `main` without a result exits with 0.
-            emit_load_imm(R_ACC, 0);
+            emit_load_imm(cx, R_ACC, 0);
         }
-        emit_epilogue();
-        emit_frame_reserve(FRAME_SIZE);
-        buf_bytes(ASM, buf_slice(CODE));
-        dbg_function_end();
+        emit_epilogue(cx);
+        emit_frame_reserve(cx, FRAME_SIZE);
+        buf_bytes(cx.asm, buf_slice(cx.code));
+        dbg_function_end(cx);
     }
 }
 
@@ -372,18 +373,18 @@ fn gen_function(item: i64) {
 static mut STMT_POS: i64 = -1;
 
 // (-g) Starts the code of the statement at `pos`.
-fn stmt_loc(pos: i64) {
+fn stmt_loc(mut cx: *FnCtx, pos: i64) {
     STMT_POS = pos;
-    dbg_loc(CODE, pos);
+    unsafe { dbg_loc(cx.code, pos); }
 }
 
 // Stores the incoming parameters in their frame slots, in order (so a
 // register is saved before another parameter's move can reuse it).
 // Aggregates in registers are stored piece by piece; those passed by
 // reference or on the stack are copied once every register is saved.
-fn gen_params(item: i64, f: i64) {
+fn gen_params(mut cx: *FnCtx, item: i64, f: i64) {
     unsafe {
-        let mut state: [i64; 3] = [first_int_arg(FNS[f].ret), 0, 0];
+        let mut state: [i64; 3] = [first_int_arg(cx, FNS[f].ret), 0, 0];
         let mut pending: [i64; 64] = [0; 64];
         let mut pending_count = 0;
         let mut pieces: [i64; 4] = [0; 4];
@@ -392,16 +393,16 @@ fn gen_params(item: i64, f: i64) {
             if is_void(ty) {
                 continue;
             }
-            let kind = abi_classify(ty);
+            let kind = abi_classify(cx, ty);
             let local = NODES[child(item, i)].x;
             if kind == AbiClass::Pieces {
-                abi_piece_locations(ty, &state as *i64, &pieces as *i64);
+                abi_piece_locations(cx, ty, &state as *i64, &pieces as *i64);
                 if local < 0 {
                     continue;
                 }
                 let slot = alloc_slot_for(ty);
                 LOCALS[local].offset = slot;
-                for k in 0..ABI_PIECE_COUNT {
+                for k in 0..cx.abi_piece_count {
                     // On x86-64 a piece on the stack is copied as an integer of
                     // its size: through the float accumulator it would
                     // overwrite the first float argument register (xmm0),
@@ -411,12 +412,12 @@ fn gen_params(item: i64, f: i64) {
                     // ran out, may come before int parameters still in
                     // registers); its float registers are all taken by earlier
                     // parameters then.
-                    let mut piece_ty = ABI_PIECE_TY[k];
+                    let mut piece_ty = cx.abi_piece_ty[k];
                     if X86 && pieces[k] >= 16 && is_float(piece_ty) {
                         piece_ty = if piece_ty == TY_F32 { TY_U32 } else { TY_U64 };
                     }
-                    emit_load_param(pieces[k], piece_ty);
-                    store_to_frame(piece_ty, slot - ABI_PIECE_OFFSET[k]);
+                    emit_load_param(cx, pieces[k], piece_ty);
+                    store_to_frame(cx, piece_ty, slot - cx.abi_piece_offset[k]);
                 }
                 continue;
             }
@@ -433,20 +434,20 @@ fn gen_params(item: i64, f: i64) {
             let slot = alloc_slot_for(ty);
             LOCALS[local].offset = slot;
             if kind == AbiClass::Scalar {
-                emit_load_param(location, ty);
-                emit_frame_addr(R_ADDR, slot);
-                emit_store(ty, R_ACC, R_ADDR);
+                emit_load_param(cx, location, ty);
+                emit_frame_addr(cx, R_ADDR, slot);
+                emit_store(cx, ty, R_ACC, R_ADDR);
                 continue;
             }
             // The accumulator = the address of the caller's copy.
             if kind == AbiClass::Stack {
-                m_lea(0, reg_fp(), location);
+                m_lea(cx, 0, reg_fp(), location);
             } else {
-                emit_load_param(location, TY_U64);
+                emit_load_param(cx, location, TY_U64);
             }
             let pointer_slot = alloc_slot(8, 8);
-            emit_frame_addr(R_ADDR, pointer_slot);
-            emit_store(TY_U64, R_ACC, R_ADDR);
+            emit_frame_addr(cx, R_ADDR, pointer_slot);
+            emit_store(cx, TY_U64, R_ACC, R_ADDR);
             pending[pending_count] = local;
             pending[pending_count + 1] = pointer_slot;
             pending_count += 2;
@@ -454,10 +455,10 @@ fn gen_params(item: i64, f: i64) {
         let mut i = 0;
         while i < pending_count {
             let local = pending[i];
-            emit_frame_addr(R_ADDR, pending[i + 1]);
-            emit_load_reg(R_ACC, R_ADDR);
-            emit_frame_addr(R_SECOND, LOCALS[local].offset);
-            emit_copy(type_size(LOCALS[local].ty));
+            emit_frame_addr(cx, R_ADDR, pending[i + 1]);
+            emit_load_reg(cx, R_ACC, R_ADDR);
+            emit_frame_addr(cx, R_SECOND, LOCALS[local].offset);
+            emit_copy(cx, type_size(LOCALS[local].ty));
             i += 2;
         }
     }
@@ -466,69 +467,71 @@ fn gen_params(item: i64, f: i64) {
 // The accumulator holds the function's result: hand it to the caller (in
 // registers, or copied through the result pointer, which x86-64 also
 // returns in rax).
-fn gen_return_value(ret: i64) {
-    if !is_compound(ret) {
-        return;
-    }
-    if returns_through_pointer(ret) {
-        emit_frame_addr(R_ADDR, RESULT_SLOT);
-        emit_load_reg(R_SECOND, R_ADDR);
-        emit_copy(type_size(ret));
-        if X86 {
-            load_reg_from_frame(R_ACC, RESULT_SLOT);
+fn gen_return_value(mut cx: *FnCtx, ret: i64) {
+    unsafe {
+        if !is_compound(ret) {
+            return;
         }
-        return;
-    }
-    let size = type_size(ret);
-    if size % 8 != 0 {
-        // Read in whole pieces from a copy of a multiple of 8 bytes.
-        let copy = alloc_slot_for(ret);
-        emit_frame_addr(R_SECOND, copy);
-        emit_copy(size);
-        emit_frame_addr(R_ACC, copy);
-    }
-    abi_classify(ret);
-    // The address moves out of the accumulator (a result register).
-    let base = if X86 { 11 } else { 16 };
-    m_mov(base, 0, TY_U64);
-    for k in 0..ABI_PIECE_COUNT {
-        m_load(ABI_PIECE_TY[k], return_piece_reg(k), base, ABI_PIECE_OFFSET[k]);
+        if returns_through_pointer(cx, ret) {
+            emit_frame_addr(cx, R_ADDR, RESULT_SLOT);
+            emit_load_reg(cx, R_SECOND, R_ADDR);
+            emit_copy(cx, type_size(ret));
+            if X86 {
+                load_reg_from_frame(cx, R_ACC, RESULT_SLOT);
+            }
+            return;
+        }
+        let size = type_size(ret);
+        if size % 8 != 0 {
+            // Read in whole pieces from a copy of a multiple of 8 bytes.
+            let copy = alloc_slot_for(ret);
+            emit_frame_addr(cx, R_SECOND, copy);
+            emit_copy(cx, size);
+            emit_frame_addr(cx, R_ACC, copy);
+        }
+        abi_classify(cx, ret);
+        // The address moves out of the accumulator (a result register).
+        let base = if X86 { 11 } else { 16 };
+        m_mov(cx, base, 0, TY_U64);
+        for k in 0..cx.abi_piece_count {
+            m_load(cx, cx.abi_piece_ty[k], return_piece_reg(cx, k), base, cx.abi_piece_offset[k]);
+        }
     }
 }
 
 // ---- Statements ----
 
-fn gen_block(block: i64) {
+fn gen_block(mut cx: *FnCtx, block: i64) {
     unsafe {
         let mark = DEFERS.count;
         // (-g) After the block, the code is the enclosing statement's again.
         let outer = STMT_POS;
         for stmt in kids(block) {
             if DEBUG_INFO {
-                stmt_loc(NODES[stmt].start);
+                stmt_loc(cx, NODES[stmt].start);
             }
             if NODES[stmt].kind == Let {
-                gen_expr(NODES[stmt].c);
-                bind(NODES[stmt].a);
+                gen_expr(cx, NODES[stmt].c);
+                bind(cx, NODES[stmt].a);
             } else if NODES[stmt].kind == Defer {
                 DEFERS.push(stmt);
             } else {
-                gen_expr(NODES[stmt].a);
+                gen_expr(cx, NODES[stmt].a);
             }
         }
         let tail = NODES[block].a;
         if tail != 0 {
             if DEBUG_INFO {
-                stmt_loc(NODES[tail].start);
+                stmt_loc(cx, NODES[tail].start);
             }
-            gen_expr(tail);
+            gen_expr(cx, tail);
         }
         if DEFERS.count > mark {
-            gen_defers(mark, if tail != 0 { NODES[tail].ty } else { TY_UNIT });
+            gen_defers(cx, mark, if tail != 0 { NODES[tail].ty } else { TY_UNIT });
             DEFERS.count = mark;
         }
         if DEBUG_INFO && outer >= 0 {
-            stmt_loc(outer);
+            stmt_loc(cx, outer);
         }
         STMT_POS = outer;
     }
@@ -537,7 +540,7 @@ fn gen_block(block: i64) {
 // Runs the deferred statements registered above DEFERS depth `depth`, last
 // first (0.6), keeping the accumulator's value of type `ty` (a compound
 // one is copied first, so a deferred statement cannot change it).
-fn gen_defers(depth: i64, ty: i64) {
+fn gen_defers(mut cx: *FnCtx, depth: i64, ty: i64) {
     if DEFERS.count <= depth {
         return;
     }
@@ -545,35 +548,35 @@ fn gen_defers(depth: i64, ty: i64) {
     let mut slot = 0;
     if keep {
         slot = alloc_slot_for(ty);
-        store_to_frame(ty, slot);
+        store_to_frame(cx, ty, slot);
     }
     let mut i = DEFERS.count - 1;
     while i >= depth {
-        unsafe { gen_expr(NODES[DEFERS.data[i]].a); }
+        unsafe { gen_expr(cx, NODES[DEFERS.data[i]].a); }
         i -= 1;
     }
     if keep {
-        emit_frame_addr(R_ACC, slot);
-        load_from_x0(ty);
+        emit_frame_addr(cx, R_ACC, slot);
+        load_from_x0(cx, ty);
     }
 }
 
 // Stores the accumulator (of type `ty`) in the frame slot at `offset`.
-fn store_to_frame(ty: i64, offset: i64) {
+fn store_to_frame(mut cx: *FnCtx, ty: i64, offset: i64) {
     if is_void(ty) {
         return;
     }
     if is_compound(ty) {
-        emit_frame_addr(R_SECOND, offset);
-        emit_copy(type_size(ty));
+        emit_frame_addr(cx, R_SECOND, offset);
+        emit_copy(cx, type_size(ty));
         return;
     }
-    emit_frame_addr(R_ADDR, offset);
-    emit_store(ty, R_ACC, R_ADDR);
+    emit_frame_addr(cx, R_ADDR, offset);
+    emit_store(cx, ty, R_ACC, R_ADDR);
 }
 
 // Binds a pattern to the value in the accumulator (of the pattern's type).
-fn bind(pattern: i64) {
+fn bind(mut cx: *FnCtx, pattern: i64) {
     unsafe {
         let kind = NODES[pattern].kind;
         let ty = NODES[pattern].ty;
@@ -584,7 +587,7 @@ fn bind(pattern: i64) {
             let local = NODES[pattern].x;
             let slot = alloc_slot_for(ty);
             LOCALS[local].offset = slot;
-            store_to_frame(ty, slot);
+            store_to_frame(cx, ty, slot);
             return;
         }
         if NODES[pattern].count == 0 {
@@ -592,7 +595,7 @@ fn bind(pattern: i64) {
         }
         // A tuple, or the only variant of an enum: the accumulator is its
         // address.
-        push_x0();
+        push_x0(cx);
         for i in 0..NODES[pattern].count {
             let mut elem_ty = 0;
             let mut offset = 0;
@@ -603,14 +606,14 @@ fn bind(pattern: i64) {
                 elem_ty = type_elem(ty, i);
                 offset = tuple_offset(ty, i);
             }
-            emit_peek(R_ACC);
-            emit_add_imm(R_ACC, offset);
+            emit_peek(cx, R_ACC);
+            emit_add_imm(cx, R_ACC, offset);
             if !is_compound(elem_ty) && !is_void(elem_ty) {
-                emit_load(elem_ty, R_ACC);
+                emit_load(cx, elem_ty, R_ACC);
             }
-            bind(child(pattern, i));
+            bind(cx, child(pattern, i));
         }
-        pop_x(R_ACC);
+        pop_x(cx, R_ACC);
     }
 }
 
@@ -618,31 +621,31 @@ fn bind(pattern: i64) {
 
 // The accumulator holds the address of a value of type `ty`: load it if it
 // is a scalar.
-fn load_from_x0(ty: i64) {
+fn load_from_x0(mut cx: *FnCtx, ty: i64) {
     if !is_compound(ty) && !is_void(ty) {
-        emit_load(ty, R_ACC);
+        emit_load(cx, ty, R_ACC);
     }
 }
 
 // Moves the accumulator to the second operand and pops the first one into
 // the accumulator.
-fn pop_second_operand(ty: i64) {
-    emit_move_to_second(ty);
+fn pop_second_operand(mut cx: *FnCtx, ty: i64) {
+    emit_move_to_second(cx, ty);
     if is_float(ty) {
-        pop_d(0);
+        pop_d(cx, 0);
     } else {
-        pop_x(R_ACC);
+        pop_x(cx, R_ACC);
     }
 }
 
 // The 8 bytes of frame slot `offset` = <reg> (R_ADDR keeps the address).
-fn store_reg_to_frame(reg: i64, offset: i64) {
-    emit_frame_addr(R_ADDR, offset);
-    emit_store(TY_U64, reg, R_ADDR);
+fn store_reg_to_frame(mut cx: *FnCtx, reg: i64, offset: i64) {
+    emit_frame_addr(cx, R_ADDR, offset);
+    emit_store(cx, TY_U64, reg, R_ADDR);
 }
 
 // <reg> = the 8 bytes of frame slot `offset` (R_ADDR keeps the address).
-fn load_reg_from_frame(reg: i64, offset: i64) {
-    emit_frame_addr(R_ADDR, offset);
-    emit_load_reg(reg, R_ADDR);
+fn load_reg_from_frame(mut cx: *FnCtx, reg: i64, offset: i64) {
+    emit_frame_addr(cx, R_ADDR, offset);
+    emit_load_reg(cx, reg, R_ADDR);
 }

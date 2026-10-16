@@ -13,14 +13,15 @@
 // new header.
 
 use crate::base::IntVec;
+use crate::middle::ctx::FnCtx;
 use crate::middle::fold::{fold_compare, is_const};
 use crate::middle::ir::{
-    ARGS, ARGTY, BLOCKS, INSTS, IRFUNCS, Op, Term, ir_append, ir_arg, ir_enter, ir_make,
-    ir_new_block, ir_operand, ir_operand_count, ir_set_arg, ir_set_operand, ir_val,
+    IRFUNCS, Op, Term, ir_append, ir_arg, ir_enter, ir_make, ir_new_block, ir_operand,
+    ir_operand_count, ir_set_arg, ir_set_operand, ir_val,
 };
 use crate::middle::ir::cfg::{pred_index, redirect_succ, switch_target};
 use crate::middle::loops::{clone_inst, seal_all};
-use crate::middle::lower::ssa::{DEFS, new_synth_var, ssa_read, ssa_write};
+use crate::middle::lower::ssa::{new_synth_var, ssa_read, ssa_write};
 use crate::middle::opt::{
     add_pred_like, remove_block, remove_pred_at, remove_trivial_phis, remove_unreachable,
     resolve_all,
@@ -31,12 +32,6 @@ const THREAD_MAX_INSTS: i64 = 12;
 // At most this many copies per call (a bound on growth).
 const THREAD_MAX_COPIES: i64 = 64;
 
-static mut COPIES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-// The chain of blocks being threaded (see decider_phi), marked STAMP in
-// BLOCKS[].mark; the copies of one.
-static mut CHAIN: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static mut COPY_OF: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static mut STAMP: i64 = 1000000000;
 // At most this many blocks in a chain.
 const MAX_CHAIN: i64 = 4;
 
@@ -46,28 +41,28 @@ const MAX_CHAIN: i64 = 4;
 // predecessor is the one before (a loop's header testing its exit before
 // the match): CHAIN is then h, those blocks, j. (0.16) Or the phi a branch
 // is on, a bool (taken when it has a constant operand, see is_tag_phi).
-fn decider_phi(j: i64) -> i64 {
+fn decider_phi(mut cx: *FnCtx, j: i64) -> i64 {
     unsafe {
-        let c = ir_val(BLOCKS[j].cond);
-        if c == 0 || INSTS[c].block == 0 {
+        let c = ir_val(cx, cx.blocks[j].cond);
+        if c == 0 || cx.insts[c].block == 0 {
             return 0;
         }
         let mut phi = 0;
-        if BLOCKS[j].term == Term::Switch {
-            if INSTS[c].op == Op::Phi {
+        if cx.blocks[j].term == Term::Switch {
+            if cx.insts[c].op == Op::Phi {
                 phi = c;
             }
-        } else if BLOCKS[j].term == Term::Branch && INSTS[c].op == Op::Cmp
-            && BLOCKS[j].s0 != BLOCKS[j].s1 {
-            let a = ir_val(INSTS[c].a);
-            let b = ir_val(INSTS[c].b);
-            if INSTS[a].op == Op::Phi && is_const(b) {
+        } else if cx.blocks[j].term == Term::Branch && cx.insts[c].op == Op::Cmp
+            && cx.blocks[j].s0 != cx.blocks[j].s1 {
+            let a = ir_val(cx, cx.insts[c].a);
+            let b = ir_val(cx, cx.insts[c].b);
+            if cx.insts[a].op == Op::Phi && is_const(cx, b) {
                 phi = a;
-            } else if INSTS[b].op == Op::Phi && is_const(a) {
+            } else if cx.insts[b].op == Op::Phi && is_const(cx, a) {
                 phi = b;
             }
-        } else if BLOCKS[j].term == Term::Branch && INSTS[c].op == Op::Phi
-            && BLOCKS[j].s0 != BLOCKS[j].s1 {
+        } else if cx.blocks[j].term == Term::Branch && cx.insts[c].op == Op::Phi
+            && cx.blocks[j].s0 != cx.blocks[j].s1 {
             // (0.16) A branch on a phi of bools (a comparison of a phi of
             // constants with a constant, folded into the phi: fold.tach).
             phi = c;
@@ -76,42 +71,43 @@ fn decider_phi(j: i64) -> i64 {
             return 0;
         }
         // The chain from the phi's block to j.
-        let h = INSTS[phi].block;
-        CHAIN.count = 0;
+        let h = cx.insts[phi].block;
+        cx.chain.count = 0;
         let mut x = j;
         let mut size = 0;
         loop {
-            CHAIN.push(x);
-            size += body_size(x);
+            cx.chain.push(x);
+            size += body_size(cx, x);
             if x == h {
                 break;
             }
-            if CHAIN.count > MAX_CHAIN || BLOCKS[x].preds.count != 1 {
+            if cx.chain.count > MAX_CHAIN || cx.blocks[x].preds.count != 1 {
                 return 0;
             }
-            x = BLOCKS[x].preds.data[0];
-            if x == j || (x != h && BLOCKS[x].term != Term::Jump && BLOCKS[x].term != Term::Branch)
-                || (BLOCKS[x].term == Term::Branch && BLOCKS[x].s0 == BLOCKS[x].s1) {
+            x = cx.blocks[x].preds.data[0];
+            if x == j
+                || (x != h && cx.blocks[x].term != Term::Jump && cx.blocks[x].term != Term::Branch)
+                || (cx.blocks[x].term == Term::Branch && cx.blocks[x].s0 == cx.blocks[x].s1) {
                 return 0;
             }
         }
-        if size > THREAD_MAX_INSTS || (h != j && BLOCKS[h].term != Term::Jump
-            && BLOCKS[h].term != Term::Branch) {
+        if size > THREAD_MAX_INSTS || (h != j && cx.blocks[h].term != Term::Jump
+            && cx.blocks[h].term != Term::Branch) {
             return 0;
         }
         // (h first)
-        let n = CHAIN.count;
+        let n = cx.chain.count;
         for i in 0..n / 2 {
-            let t = CHAIN.data[i];
-            CHAIN.data[i] = CHAIN.data[n - 1 - i];
-            CHAIN.data[n - 1 - i] = t;
+            let t = cx.chain.data[i];
+            cx.chain.data[i] = cx.chain.data[n - 1 - i];
+            cx.chain.data[n - 1 - i] = t;
         }
         // The comparison is in the chain.
-        STAMP += 1;
+        cx.tags_stamp += 1;
         for i in 0..n {
-            BLOCKS[CHAIN.data[i]].mark = STAMP;
+            cx.blocks[cx.chain.data[i]].mark = cx.tags_stamp;
         }
-        if BLOCKS[INSTS[c].block].mark != STAMP {
+        if cx.blocks[cx.insts[c].block].mark != cx.tags_stamp {
             return 0;
         }
         phi
@@ -119,33 +115,34 @@ fn decider_phi(j: i64) -> i64 {
 }
 
 // The successor of block j when its decider phi is the constant `value`.
-fn outcome(j: i64, phi: i64, value: i64) -> i64 {
+fn outcome(mut cx: *FnCtx, j: i64, phi: i64, value: i64) -> i64 {
     unsafe {
-        if BLOCKS[j].term == Term::Switch {
-            return switch_target(j, INSTS[value].imm);
+        if cx.blocks[j].term == Term::Switch {
+            return switch_target(cx, j, cx.insts[value].imm);
         }
-        let c = ir_val(BLOCKS[j].cond);
+        let c = ir_val(cx, cx.blocks[j].cond);
         if c == phi {
-            return if INSTS[value].imm != 0 { BLOCKS[j].s0 } else { BLOCKS[j].s1 };
+            return if cx.insts[value].imm != 0 { cx.blocks[j].s0 } else { cx.blocks[j].s1 };
         }
-        let a = ir_val(INSTS[c].a);
-        let b = ir_val(INSTS[c].b);
-        let x = if a == phi { INSTS[value].imm } else { INSTS[a].imm };
-        let y = if b == phi { INSTS[value].imm } else { INSTS[b].imm };
-        if fold_compare(INSTS[c].cond, INSTS[c].imm2, x, y) { BLOCKS[j].s0 } else { BLOCKS[j].s1 }
+        let a = ir_val(cx, cx.insts[c].a);
+        let b = ir_val(cx, cx.insts[c].b);
+        let x = if a == phi { cx.insts[value].imm } else { cx.insts[a].imm };
+        let y = if b == phi { cx.insts[value].imm } else { cx.insts[b].imm };
+        if fold_compare(cx.insts[c].cond, cx.insts[c].imm2, x, y) { cx.blocks[j].s0 }
+        else { cx.blocks[j].s1 }
     }
 }
 
 // The number of j's instructions other than phis.
-fn body_size(j: i64) -> i64 {
+fn body_size(mut cx: *FnCtx, j: i64) -> i64 {
     unsafe {
         let mut n = 0;
-        let mut v = BLOCKS[j].first;
+        let mut v = cx.blocks[j].first;
         while v != 0 {
-            if INSTS[v].op != Op::Phi {
+            if cx.insts[v].op != Op::Phi {
                 n += 1;
             }
-            v = INSTS[v].next;
+            v = cx.insts[v].next;
         }
         n
     }
@@ -153,28 +150,28 @@ fn body_size(j: i64) -> i64 {
 
 // Whether value w (a phi of block b) is used only by the phis of block j,
 // as their operand for b.
-fn used_only_by_phis(fi: i64, w: i64, b: i64, j: i64) -> bool {
+fn used_only_by_phis(mut cx: *FnCtx, fi: i64, w: i64, b: i64, j: i64) -> bool {
     unsafe {
-        let index = pred_index(j, b);
+        let index = pred_index(cx, j, b);
         for i in 0..IRFUNCS[fi].blocks.count {
             let u_block = IRFUNCS[fi].blocks.data[i];
-            if BLOCKS[u_block].removed != 0 {
+            if cx.blocks[u_block].removed != 0 {
                 continue;
             }
-            if ir_val(BLOCKS[u_block].cond) == w && BLOCKS[u_block].cond != 0 {
+            if ir_val(cx, cx.blocks[u_block].cond) == w && cx.blocks[u_block].cond != 0 {
                 return false;
             }
-            let mut u = BLOCKS[u_block].first;
+            let mut u = cx.blocks[u_block].first;
             while u != 0 {
-                for k in 0..ir_operand_count(u) {
-                    if ir_val(ir_operand(u, k)) == w {
+                for k in 0..ir_operand_count(cx, u) {
+                    if ir_val(cx, ir_operand(cx, u, k)) == w {
                         // (a phi's operands are 3.., one per predecessor)
-                        if u_block != j || INSTS[u].op != Op::Phi || k - 3 != index {
+                        if u_block != j || cx.insts[u].op != Op::Phi || k - 3 != index {
                             return false;
                         }
                     }
                 }
-                u = INSTS[u].next;
+                u = cx.insts[u].next;
             }
         }
         true
@@ -184,43 +181,43 @@ fn used_only_by_phis(fi: i64, w: i64, b: i64, j: i64) -> bool {
 // Merges block b (phis only, then a jump to j) into j: b's predecessors go
 // to j, whose phis take, for each, what they took from b (a phi of b: its
 // operand for that predecessor). Returns whether it did.
-pub fn merge_phi_block(fi: i64, b: i64, j: i64) -> bool {
+pub fn merge_phi_block(mut cx: *FnCtx, fi: i64, b: i64, j: i64) -> bool {
     unsafe {
-        if b == j || b == IRFUNCS[fi].entry || BLOCKS[b].term != Term::Jump
-            || BLOCKS[b].preds.count == 0 {
+        if b == j || b == IRFUNCS[fi].entry || cx.blocks[b].term != Term::Jump
+            || cx.blocks[b].preds.count == 0 {
             return false;
         }
-        let mut v = BLOCKS[b].first;
+        let mut v = cx.blocks[b].first;
         while v != 0 {
-            if INSTS[v].op != Op::Phi || !used_only_by_phis(fi, v, b, j) {
+            if cx.insts[v].op != Op::Phi || !used_only_by_phis(cx, fi, v, b, j) {
                 return false;
             }
-            v = INSTS[v].next;
+            v = cx.insts[v].next;
         }
-        for i in 0..BLOCKS[b].preds.count {
-            let q = BLOCKS[b].preds.data[i];
-            if q == b || pred_index(j, q) >= 0 {
+        for i in 0..cx.blocks[b].preds.count {
+            let q = cx.blocks[b].preds.data[i];
+            if q == b || pred_index(cx, j, q) >= 0 {
                 return false;
             }
         }
-        let index = pred_index(j, b);
-        for i in 0..BLOCKS[b].preds.count {
-            let q = BLOCKS[b].preds.data[i];
-            redirect_succ(q, b, j);
-            add_pred_like(j, q, b);
+        let index = pred_index(cx, j, b);
+        for i in 0..cx.blocks[b].preds.count {
+            let q = cx.blocks[b].preds.data[i];
+            redirect_succ(cx, q, b, j);
+            add_pred_like(cx, j, q, b);
             // The new operands: a phi of b gives its operand for q.
-            let at = BLOCKS[j].preds.count - 1;
-            let mut phi = BLOCKS[j].first;
-            while phi != 0 && INSTS[phi].op == Op::Phi {
-                let w = ir_val(ir_arg(phi, index));
-                if INSTS[w].block == b {
-                    ir_set_arg(phi, at, ir_val(ir_arg(w, i)));
+            let at = cx.blocks[j].preds.count - 1;
+            let mut phi = cx.blocks[j].first;
+            while phi != 0 && cx.insts[phi].op == Op::Phi {
+                let w = ir_val(cx, ir_arg(cx, phi, index));
+                if cx.insts[w].block == b {
+                    ir_set_arg(cx, phi, at, ir_val(cx, ir_arg(cx, w, i)));
                 }
-                phi = INSTS[phi].next;
+                phi = cx.insts[phi].next;
             }
         }
-        BLOCKS[b].preds.count = 0;
-        remove_block(b);
+        cx.blocks[b].preds.count = 0;
+        remove_block(cx, b);
         true
     }
 }
@@ -231,177 +228,184 @@ pub fn merge_phi_block(fi: i64, b: i64, j: i64) -> bool {
 // last a jump to the outcome `target`) take that predecessor's edge. Each
 // value of the chain gets its copy's value as a definition in the copy
 // (INSTS[v].mark is v's updater variable + 1).
-fn copy_chain(index: i64, target: i64) {
+fn copy_chain(mut cx: *FnCtx, index: i64, target: i64) {
     unsafe {
-        let h = CHAIN.data[0];
-        let p = BLOCKS[h].preds.data[index];
-        let first = COPY_OF.count;
-        for i in 0..CHAIN.count {
-            let nb = ir_new_block();
-            BLOCKS[nb].sealed = 1;
-            BLOCKS[nb].count = -1;
-            COPY_OF.push(nb);
+        let h = cx.chain.data[0];
+        let p = cx.blocks[h].preds.data[index];
+        let first = cx.copy_of.count;
+        for i in 0..cx.chain.count {
+            let nb = ir_new_block(cx);
+            cx.blocks[nb].sealed = 1;
+            cx.blocks[nb].count = -1;
+            cx.copy_of.push(nb);
         }
-        for i in 0..CHAIN.count {
-            let x = CHAIN.data[i];
-            let nb = COPY_OF.data[first + i];
-            let mut v = BLOCKS[x].first;
+        for i in 0..cx.chain.count {
+            let x = cx.chain.data[i];
+            let nb = cx.copy_of.data[first + i];
+            let mut v = cx.blocks[x].first;
             while v != 0 {
                 let mut nv = 0;
-                if INSTS[v].op == Op::Phi {
-                    nv = ir_make(Op::Phi, INSTS[v].ty, 0, 0, 0);
-                    INSTS[nv].args = ARGS.count;
-                    INSTS[nv].nargs = 1;
-                    let w = ir_val(ir_arg(v, if x == h { index } else { 0 }));
-                    ARGS.push(if x != h && in_chain(w) { INSTS[w].aux } else { w });
-                    ARGTY.push(0);
+                if cx.insts[v].op == Op::Phi {
+                    nv = ir_make(cx, Op::Phi, cx.insts[v].ty, 0, 0, 0);
+                    cx.insts[nv].args = cx.args.count;
+                    cx.insts[nv].nargs = 1;
+                    let w = ir_val(cx, ir_arg(cx, v, if x == h { index } else { 0 }));
+                    cx.args.push(if x != h && in_chain(cx, w) { cx.insts[w].aux } else { w });
+                    cx.argty.push(0);
                 } else {
-                    nv = clone_inst(v);
-                    for k in 0..ir_operand_count(nv) {
-                        let w = ir_val(ir_operand(nv, k));
-                        if in_chain(w) {
-                            ir_set_operand(nv, k, INSTS[w].aux);
+                    nv = clone_inst(cx, v);
+                    for k in 0..ir_operand_count(cx, nv) {
+                        let w = ir_val(cx, ir_operand(cx, nv, k));
+                        if in_chain(cx, w) {
+                            ir_set_operand(cx, nv, k, cx.insts[w].aux);
                         }
                     }
                 }
-                ir_append(nb, nv);
-                INSTS[v].aux = nv;
-                ssa_write(INSTS[v].mark - 1, nb, nv);
-                v = INSTS[v].next;
+                ir_append(cx, nb, nv);
+                cx.insts[v].aux = nv;
+                ssa_write(cx, cx.insts[v].mark - 1, nb, nv);
+                v = cx.insts[v].next;
             }
-            if i + 1 == CHAIN.count {
-                BLOCKS[nb].term = Term::Jump;
-                BLOCKS[nb].s0 = target;
-                add_pred_like(target, nb, x);
+            if i + 1 == cx.chain.count {
+                cx.blocks[nb].term = Term::Jump;
+                cx.blocks[nb].s0 = target;
+                add_pred_like(cx, target, nb, x);
             } else {
                 // The terminator: to the next block's copy, or out of the
                 // chain as x goes.
-                let next = CHAIN.data[i + 1];
-                let c = ir_val(BLOCKS[x].cond);
-                BLOCKS[nb].term = BLOCKS[x].term;
-                BLOCKS[nb].cond = if in_chain(c) { INSTS[c].aux } else { BLOCKS[x].cond };
+                let next = cx.chain.data[i + 1];
+                let c = ir_val(cx, cx.blocks[x].cond);
+                cx.blocks[nb].term = cx.blocks[x].term;
+                cx.blocks[nb].cond = if in_chain(cx, c) { cx.insts[c].aux }
+                    else { cx.blocks[x].cond };
                 for e in 0..2 {
-                    let s = if e == 0 { BLOCKS[x].s0 } else { BLOCKS[x].s1 };
+                    let s = if e == 0 { cx.blocks[x].s0 } else { cx.blocks[x].s1 };
                     if s == 0 {
                         continue;
                     }
-                    let ns = if s == next { COPY_OF.data[first + i + 1] } else { s };
+                    let ns = if s == next { cx.copy_of.data[first + i + 1] } else { s };
                     if e == 0 {
-                        BLOCKS[nb].s0 = ns;
+                        cx.blocks[nb].s0 = ns;
                     } else {
-                        BLOCKS[nb].s1 = ns;
+                        cx.blocks[nb].s1 = ns;
                     }
                     if s == next {
-                        BLOCKS[ns].preds.push(nb);
+                        cx.blocks[ns].preds.push(nb);
                     } else {
-                        add_pred_like(s, nb, x);
+                        add_pred_like(cx, s, nb, x);
                     }
                 }
             }
         }
-        let nh = COPY_OF.data[first];
-        BLOCKS[nh].preds.push(p);
-        redirect_succ(p, h, nh);
-        remove_pred_at(h, index);
-        COPY_OF.count = first;
+        let nh = cx.copy_of.data[first];
+        cx.blocks[nh].preds.push(p);
+        redirect_succ(cx, p, h, nh);
+        remove_pred_at(cx, h, index);
+        cx.copy_of.count = first;
     }
 }
 
 // Whether value w is defined in the chain being copied.
-fn in_chain(w: i64) -> bool {
-    unsafe { w != 0 && INSTS[w].block != 0 && BLOCKS[INSTS[w].block].mark == STAMP }
+fn in_chain(mut cx: *FnCtx, w: i64) -> bool {
+    unsafe {
+        w != 0 && cx.insts[w].block != 0 && cx.blocks[cx.insts[w].block].mark == cx.tags_stamp
+    }
 }
 
 // Threads the chain ending in block j (see decider_phi): copies it for
 // each predecessor of its first block giving the decider phi a constant,
 // then repairs the uses of the chain's values. Returns the number of
 // copies made.
-fn thread_block(fi: i64, j: i64, phi: i64, budget: i64) -> i64 {
+fn thread_block(mut cx: *FnCtx, fi: i64, j: i64, phi: i64, budget: i64) -> i64 {
     unsafe {
-        let h = CHAIN.data[0];
+        let h = cx.chain.data[0];
         // A predecessor holding only phis, one of them the tag, is merged
         // into h first.
         let mut k = 0;
-        while k < BLOCKS[h].preds.count {
-            let b = BLOCKS[h].preds.data[k];
-            let w = ir_val(ir_arg(phi, k));
-            if INSTS[w].op == Op::Phi && INSTS[w].block == b && BLOCKS[b].first != 0
-                && has_const_operand(w) && BLOCKS[b].mark != STAMP && merge_phi_block(fi, b, h) {
+        while k < cx.blocks[h].preds.count {
+            let b = cx.blocks[h].preds.data[k];
+            let w = ir_val(cx, ir_arg(cx, phi, k));
+            if cx.insts[w].op == Op::Phi && cx.insts[w].block == b && cx.blocks[b].first != 0
+                && has_const_operand(cx, w) && cx.blocks[b].mark != cx.tags_stamp
+                && merge_phi_block(cx, fi, b, h) {
                 k = 0;
                 continue;
             }
             k += 1;
         }
         // (pred, outcome) pairs to copy for.
-        COPIES.count = 0;
-        for i in 0..BLOCKS[h].preds.count {
-            let p = BLOCKS[h].preds.data[i];
-            let w = ir_val(ir_arg(phi, i));
-            if !is_const(w) || BLOCKS[p].mark == STAMP
-                || (BLOCKS[p].term == Term::Branch && BLOCKS[p].s0 == BLOCKS[p].s1) {
+        cx.tags_copies.count = 0;
+        for i in 0..cx.blocks[h].preds.count {
+            let p = cx.blocks[h].preds.data[i];
+            let w = ir_val(cx, ir_arg(cx, phi, i));
+            if !is_const(cx, w) || cx.blocks[p].mark == cx.tags_stamp
+                || (cx.blocks[p].term == Term::Branch && cx.blocks[p].s0 == cx.blocks[p].s1) {
                 continue;
             }
-            let t = outcome(j, phi, w);
-            if BLOCKS[t].mark == STAMP {
+            let t = outcome(cx, j, phi, w);
+            if cx.blocks[t].mark == cx.tags_stamp {
                 continue;
             }
-            COPIES.push(p);
-            COPIES.push(t);
-            if COPIES.count / 2 >= budget {
+            cx.tags_copies.push(p);
+            cx.tags_copies.push(t);
+            if cx.tags_copies.count / 2 >= budget {
                 break;
             }
         }
-        if COPIES.count == 0 {
+        if cx.tags_copies.count == 0 {
             return 0;
         }
-        DEFS.clear();
-        seal_all(fi);
-        for i in 0..CHAIN.count {
-            let x = CHAIN.data[i];
-            let mut v = BLOCKS[x].first;
+        cx.defs.clear();
+        seal_all(cx, fi);
+        for i in 0..cx.chain.count {
+            let x = cx.chain.data[i];
+            let mut v = cx.blocks[x].first;
             while v != 0 {
-                let var = new_synth_var(INSTS[v].ty);
-                INSTS[v].mark = var + 1;
-                ssa_write(var, x, v);
-                v = INSTS[v].next;
+                let var = new_synth_var(cx, cx.insts[v].ty);
+                cx.insts[v].mark = var + 1;
+                ssa_write(cx, var, x, v);
+                v = cx.insts[v].next;
             }
         }
-        let n = COPIES.count / 2;
+        let n = cx.tags_copies.count / 2;
         for c in 0..n {
-            let p = COPIES.data[2 * c];
-            let t = COPIES.data[2 * c + 1];
-            copy_chain(pred_index(h, p), t);
+            let p = cx.tags_copies.data[2 * c];
+            let t = cx.tags_copies.data[2 * c + 1];
+            copy_chain(cx, pred_index(cx, h, p), t);
         }
         // Every use of the chain's values reads the definition reaching it
         // (but in the block defining it: that one), phis in their
         // predecessors.
         for i in 0..IRFUNCS[fi].blocks.count {
             let b = IRFUNCS[fi].blocks.data[i];
-            if BLOCKS[b].removed != 0 {
+            if cx.blocks[b].removed != 0 {
                 continue;
             }
-            let mut u = BLOCKS[b].first;
+            let mut u = cx.blocks[b].first;
             while u != 0 {
-                for k in 0..ir_operand_count(u) {
-                    let w = ir_val(ir_operand(u, k));
-                    if w != 0 && INSTS[w].block != 0 && BLOCKS[INSTS[w].block].mark == STAMP
-                        && (INSTS[u].op == Op::Phi || INSTS[w].block != b) {
-                        ir_set_operand(u, k, ssa_read(INSTS[w].mark - 1, use_block(u, k)));
+                for k in 0..ir_operand_count(cx, u) {
+                    let w = ir_val(cx, ir_operand(cx, u, k));
+                    if w != 0 && cx.insts[w].block != 0
+                        && cx.blocks[cx.insts[w].block].mark == cx.tags_stamp
+                        && (cx.insts[u].op == Op::Phi || cx.insts[w].block != b) {
+                        ir_set_operand(cx, u, k,
+                            ssa_read(cx, cx.insts[w].mark - 1, use_block(cx, u, k)));
                     }
                 }
-                u = INSTS[u].next;
+                u = cx.insts[u].next;
             }
-            let c = ir_val(BLOCKS[b].cond);
-            if BLOCKS[b].cond != 0 && INSTS[c].block != 0 && BLOCKS[INSTS[c].block].mark == STAMP
-                && INSTS[c].block != b {
-                BLOCKS[b].cond = ssa_read(INSTS[c].mark - 1, b);
+            let c = ir_val(cx, cx.blocks[b].cond);
+            if cx.blocks[b].cond != 0 && cx.insts[c].block != 0
+                && cx.blocks[cx.insts[c].block].mark == cx.tags_stamp
+                && cx.insts[c].block != b {
+                cx.blocks[b].cond = ssa_read(cx, cx.insts[c].mark - 1, b);
             }
         }
-        for i in 0..CHAIN.count {
-            let mut v = BLOCKS[CHAIN.data[i]].first;
+        for i in 0..cx.chain.count {
+            let mut v = cx.blocks[cx.chain.data[i]].first;
             while v != 0 {
-                INSTS[v].mark = 0;
-                v = INSTS[v].next;
+                cx.insts[v].mark = 0;
+                v = cx.insts[v].next;
             }
         }
         n
@@ -409,10 +413,10 @@ fn thread_block(fi: i64, j: i64, phi: i64, budget: i64) -> i64 {
 }
 
 // Whether phi w has a constant operand.
-fn has_const_operand(w: i64) -> bool {
+fn has_const_operand(mut cx: *FnCtx, w: i64) -> bool {
     unsafe {
-        for k in 0..INSTS[w].nargs {
-            if is_const(ir_val(ir_arg(w, k))) {
+        for k in 0..cx.insts[w].nargs {
+            if is_const(cx, ir_val(cx, ir_arg(cx, w, k))) {
                 return true;
             }
         }
@@ -422,40 +426,41 @@ fn has_const_operand(w: i64) -> bool {
 
 // The block where a use of an operand happens: the block of instruction u,
 // or for a phi's k-th operand, the k-th predecessor of the phi's block.
-fn use_block(u: i64, k: i64) -> i64 {
+fn use_block(mut cx: *FnCtx, u: i64, k: i64) -> i64 {
     unsafe {
-        if INSTS[u].op == Op::Phi && k >= 3 {
-            return BLOCKS[INSTS[u].block].preds.data[k - 3];
+        if cx.insts[u].op == Op::Phi && k >= 3 {
+            return cx.blocks[cx.insts[u].block].preds.data[k - 3];
         }
-        INSTS[u].block
+        cx.insts[u].block
     }
 }
 
 // Threads the blocks of function fi that decide on constant tags. Returns
 // whether any was.
-pub fn thread_tags(fi: i64) -> bool {
+pub fn thread_tags(mut cx: *FnCtx, fi: i64) -> bool {
     unsafe {
-        ir_enter(fi);
+        ir_enter(cx, fi);
         let mut budget = THREAD_MAX_COPIES;
         let mut changed = false;
         let mut i = 0;
         while i < IRFUNCS[fi].blocks.count && budget > 0 {
             let j = IRFUNCS[fi].blocks.data[i];
             i += 1;
-            if BLOCKS[j].removed != 0 || j == IRFUNCS[fi].entry || body_size(j) > THREAD_MAX_INSTS {
+            if cx.blocks[j].removed != 0 || j == IRFUNCS[fi].entry
+                || body_size(cx, j) > THREAD_MAX_INSTS {
                 continue;
             }
-            let phi = decider_phi(j);
-            if phi == 0 || !is_tag_phi(phi) {
+            let phi = decider_phi(cx, j);
+            if phi == 0 || !is_tag_phi(cx, phi) {
                 continue;
             }
-            let n = thread_block(fi, j, phi, budget);
+            let n = thread_block(cx, fi, j, phi, budget);
             if n > 0 {
                 budget -= n;
                 changed = true;
-                resolve_all(fi);
-                remove_unreachable(fi);
-                remove_trivial_phis(fi);
+                resolve_all(cx, fi);
+                remove_unreachable(cx, fi);
+                remove_trivial_phis(cx, fi);
             }
         }
         changed
@@ -466,15 +471,15 @@ pub fn thread_tags(fi: i64) -> bool {
 // merged first, see thread_block), one at least constant or a phi with a
 // constant operand. (An induction variable, whose operand from the latch
 // is arithmetic, is not one: rotation takes care of its loop.)
-fn is_tag_phi(phi: i64) -> bool {
+fn is_tag_phi(mut cx: *FnCtx, phi: i64) -> bool {
     unsafe {
         let mut any = false;
-        for k in 0..INSTS[phi].nargs {
-            let w = ir_val(ir_arg(phi, k));
-            if is_const(w) {
+        for k in 0..cx.insts[phi].nargs {
+            let w = ir_val(cx, ir_arg(cx, phi, k));
+            if is_const(cx, w) {
                 any = true;
-            } else if INSTS[w].op == Op::Phi && w != phi {
-                if has_const_operand(w) {
+            } else if cx.insts[w].op == Op::Phi && w != phi {
+                if has_const_operand(cx, w) {
                     any = true;
                 }
             } else {

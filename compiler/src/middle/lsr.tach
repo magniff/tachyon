@@ -16,19 +16,18 @@
 
 use crate::base::{IntVec, free};
 use crate::front::types::{TY_BOOL, TY_U64, int_bits, is_integer};
+use crate::middle::ctx::FnCtx;
 use crate::middle::fold::{const_before, is_const, op_before};
 use crate::middle::ir::{
-    ARGS, ARGTY, BLOCKS, INSTS, IRFUNCS, Term, ir_append, ir_arg, ir_enter, ir_make, ir_prepend,
-    ir_set_arg, ir_val,
+    IRFUNCS, Term, ir_append, ir_arg, ir_enter, ir_make, ir_prepend, ir_set_arg, ir_val,
 };
 use crate::middle::ir::Op::{Add, Const, Conv, Load, Mul, Phi, Shl, Store, Sub};
 use crate::middle::ir::cfg::pred_index;
 use crate::middle::ir::verify::verify_func;
 use crate::middle::loops::{
-    LP_LIST, LP_LIST2, LP_SEEN, LP_VALUES, add_pred_values, canonicalize_loops, clone_map,
-    clone_region, form_lcssa, innermost_loop, invariant_in, is_canonical, is_innermost, loop_block,
-    loop_count, loop_exits, loop_header, loop_inst_count, loop_latch, loop_preheader, loop_size,
-    mark_loop_blocks,
+    add_pred_values, canonicalize_loops, clone_map, clone_region, form_lcssa, innermost_loop,
+    invariant_in, is_canonical, is_innermost, loop_block, loop_count, loop_exits, loop_header,
+    loop_inst_count, loop_latch, loop_preheader, loop_size, mark_loop_blocks,
 };
 use crate::middle::opt::{resolve_all, simplify_cfg};
 use crate::middle::scev::{append_const, append_inst, iv_start, iv_step};
@@ -107,53 +106,53 @@ fn af_scale(af: *i64, m: i64) {
 
 // The affine form of v in loop l over induction variable iv; *cost counts
 // the multiplications and shifts in it. False when it is not affine.
-fn affine_of(l: i64, iv: i64, v: i64, af: *i64, cost: *i64, depth: i64) -> bool {
+fn affine_of(mut cx: *FnCtx, l: i64, iv: i64, v: i64, af: *i64, cost: *i64, depth: i64) -> bool {
     unsafe {
-        let x = ir_val(v);
+        let x = ir_val(cx, v);
         if x == iv {
             af_set(af, 0, 1, 0, 0, 0, 0);
             return true;
         }
-        let ty = INSTS[x].ty;
+        let ty = cx.insts[x].ty;
         if !is_integer(ty) || int_bits(ty) != 64 || depth > 8 {
             return false;
         }
-        if is_const(x) {
-            af_set(af, INSTS[x].imm, 0, 0, 0, 0, 0);
+        if is_const(cx, x) {
+            af_set(af, cx.insts[x].imm, 0, 0, 0, 0, 0);
             return true;
         }
-        if invariant_in(l, x) {
+        if invariant_in(cx, l, x) {
             af_set(af, 0, 0, x, 1, 0, 0);
             return true;
         }
-        let op = INSTS[x].op;
+        let op = cx.insts[x].op;
         let mut fa: [i64; 8] = [0; 8];
         let mut fb: [i64; 8] = [0; 8];
         if op == Add || op == Sub {
-            if !affine_of(l, iv, INSTS[x].a, &fa[0], cost, depth + 1)
-                || !affine_of(l, iv, INSTS[x].b, &fb[0], cost, depth + 1) {
+            if !affine_of(cx, l, iv, cx.insts[x].a, &fa[0], cost, depth + 1)
+                || !affine_of(cx, l, iv, cx.insts[x].b, &fb[0], cost, depth + 1) {
                 return false;
             }
             return af_combine(af, &fa[0], &fb[0], if op == Add { 1 } else { -1 });
         }
         if op == Mul || op == Shl {
-            let b = ir_val(INSTS[x].b);
-            let a = ir_val(INSTS[x].a);
+            let b = ir_val(cx, cx.insts[x].b);
+            let a = ir_val(cx, cx.insts[x].a);
             let mut m = 0;
             let mut operand = a;
-            if op == Shl && is_const(b) {
-                let k = INSTS[b].imm & 63;
+            if op == Shl && is_const(cx, b) {
+                let k = cx.insts[b].imm & 63;
                 m = 1 << k as u64;
-            } else if op == Mul && is_const(b) {
-                m = INSTS[b].imm;
-            } else if op == Mul && is_const(a) {
-                m = INSTS[a].imm;
+            } else if op == Mul && is_const(cx, b) {
+                m = cx.insts[b].imm;
+            } else if op == Mul && is_const(cx, a) {
+                m = cx.insts[a].imm;
                 operand = b;
-            } else if op == Mul && (invariant_in(l, b) || invariant_in(l, a)) {
+            } else if op == Mul && (invariant_in(cx, l, b) || invariant_in(cx, l, a)) {
                 // By a stride known at run time: the operand must be k + s*i.
-                let stride = if invariant_in(l, b) { b } else { a };
+                let stride = if invariant_in(cx, l, b) { b } else { a };
                 let other = if stride == b { a } else { b };
-                if !affine_of(l, iv, other, af, cost, depth + 1) || af[2] != 0 || af[4] != 0
+                if !affine_of(cx, l, iv, other, af, cost, depth + 1) || af[2] != 0 || af[4] != 0
                     || af[7] != 0 {
                     return false;
                 }
@@ -167,24 +166,24 @@ fn affine_of(l: i64, iv: i64, v: i64, af: *i64, cost: *i64, depth: i64) -> bool 
             } else {
                 return false;
             }
-            if !affine_of(l, iv, operand, af, cost, depth + 1) {
+            if !affine_of(cx, l, iv, operand, af, cost, depth + 1) {
                 return false;
             }
             af_scale(af, m);
             *cost = *cost + 1;
             return true;
         }
-        if op == Conv && is_integer(INSTS[x].imm2) && int_bits(INSTS[x].imm2) == 64 {
-            return affine_of(l, iv, INSTS[x].a, af, cost, depth + 1);
+        if op == Conv && is_integer(cx.insts[x].imm2) && int_bits(cx.insts[x].imm2) == 64 {
+            return affine_of(cx, l, iv, cx.insts[x].a, af, cost, depth + 1);
         }
         false
     }
 }
 
 // Appends c1*b1 + c2*b2 + k (as u64) to block b; returns the value.
-fn materialize_affine(b: i64, af: *i64, k: i64) -> i64 {
+fn materialize_affine(mut cx: *FnCtx, b: i64, af: *i64, k: i64) -> i64 {
     unsafe {
-        let mut value = append_const(b, k, TY_U64);
+        let mut value = append_const(cx, b, k, TY_U64);
         for t in 0..2 {
             let base = af[2 + 2 * t];
             let c = af[3 + 2 * t];
@@ -193,37 +192,37 @@ fn materialize_affine(b: i64, af: *i64, k: i64) -> i64 {
             }
             let mut term = base;
             if c != 1 {
-                term = append_inst(b, Mul, TY_U64, base, append_const(b, c, TY_U64));
+                term = append_inst(cx, b, Mul, TY_U64, base, append_const(cx, b, c, TY_U64));
             }
-            value = append_inst(b, Add, TY_U64, value, term);
+            value = append_inst(cx, b, Add, TY_U64, value, term);
         }
         value
     }
 }
 
 // Strength reduction of the addresses in innermost loop l.
-fn reduce_loop(fi: i64, l: i64) -> bool {
+fn reduce_loop(mut cx: *FnCtx, fi: i64, l: i64) -> bool {
     unsafe {
-        let h = loop_header(l);
-        let pre = loop_preheader(l);
-        let latch = loop_latch(l);
-        if pre == 0 || latch == 0 || BLOCKS[h].preds.count != 2 {
+        let h = loop_header(cx, l);
+        let pre = loop_preheader(cx, l);
+        let latch = loop_latch(cx, l);
+        if pre == 0 || latch == 0 || cx.blocks[h].preds.count != 2 {
             return false;
         }
-        ir_enter(fi);
+        ir_enter(cx, fi);
         // The induction variable: the first 64-bit header phi with a constant
         // step.
         let mut iv = 0;
         let mut step = 0;
-        let mut phi = BLOCKS[h].first;
-        while phi != 0 && INSTS[phi].op == Phi {
+        let mut phi = cx.blocks[h].first;
+        while phi != 0 && cx.insts[phi].op == Phi {
             let mut s = 0;
-            if int_bits(INSTS[phi].ty) == 64 && iv_step(l, phi, &s) && s != 0 {
+            if int_bits(cx.insts[phi].ty) == 64 && iv_step(cx, l, phi, &s) && s != 0 {
                 iv = phi;
                 step = s;
                 break;
             }
-            phi = INSTS[phi].next;
+            phi = cx.insts[phi].next;
         }
         if iv == 0 {
             return false;
@@ -231,16 +230,16 @@ fn reduce_loop(fi: i64, l: i64) -> bool {
         // Candidates: (access, group, k); groups: their form (6 each).
         let mut cands = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let mut groups = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for i in 0..loop_size(l) {
-            let mut v = BLOCKS[loop_block(l, i)].first;
+        for i in 0..loop_size(cx, l) {
+            let mut v = cx.blocks[loop_block(cx, l, i)].first;
             while v != 0 {
-                let op = INSTS[v].op;
+                let op = cx.insts[v].op;
                 if op == Load || op == Store {
-                    let addr = ir_val(INSTS[v].a);
+                    let addr = ir_val(cx, cx.insts[v].a);
                     let mut af: [i64; 8] = [0; 8];
                     let mut cost = 0;
-                    if !invariant_in(l, addr) && addr != iv
-                        && affine_of(l, iv, addr, &af[0], &cost, 0) && cost > 0
+                    if !invariant_in(cx, l, addr) && addr != iv
+                        && affine_of(cx, l, iv, addr, &af[0], &cost, 0) && cost > 0
                         && (af[1] != 0 || af[7] != 0) {
                         let mut g = -1;
                         for k in 0..groups.count / AF_SIZE {
@@ -267,13 +266,13 @@ fn reduce_loop(fi: i64, l: i64) -> bool {
                         }
                     }
                 }
-                v = INSTS[v].next;
+                v = cx.insts[v].next;
             }
         }
         let ngroups = groups.count / AF_SIZE;
-        let pre_index = pred_index(h, pre);
-        let latch_index = pred_index(h, latch);
-        let start = iv_start(l, iv);
+        let pre_index = pred_index(cx, h, pre);
+        let latch_index = pred_index(cx, h, latch);
+        let start = iv_start(cx, l, iv);
         for g in 0..ngroups {
             let af = &groups.data[AF_SIZE * g];
             let s = af[1];
@@ -287,27 +286,29 @@ fn reduce_loop(fi: i64, l: i64) -> bool {
                 }
             }
             // Start: the form at the induction variable's start.
-            let base = materialize_affine(pre, af, k0);
+            let base = materialize_affine(cx, pre, af, k0);
             // The coefficient of the induction variable, s + m*v.
-            let mut coef = append_const(pre, s, TY_U64);
+            let mut coef = append_const(cx, pre, s, TY_U64);
             if af[7] != 0 {
-                let sym = append_inst(pre, Mul, TY_U64, af[6], append_const(pre, af[7], TY_U64));
-                coef = append_inst(pre, Add, TY_U64, coef, sym);
+                let sym = append_inst(cx, pre, Mul, TY_U64, af[6],
+                    append_const(cx, pre, af[7], TY_U64));
+                coef = append_inst(cx, pre, Add, TY_U64, coef, sym);
             }
-            let scaled = append_inst(pre, Mul, TY_U64, start, coef);
-            let init = append_inst(pre, Add, TY_U64, base, scaled);
-            let stride = append_inst(pre, Mul, TY_U64, coef, append_const(pre, step, TY_U64));
-            let ptr = ir_make(Phi, TY_U64, 0, 0, 0);
-            INSTS[ptr].args = ARGS.count;
-            INSTS[ptr].nargs = 2;
-            ARGS.push(0);
-            ARGTY.push(0);
-            ARGS.push(0);
-            ARGTY.push(0);
-            ir_prepend(h, ptr);
-            let next = append_inst(latch, Add, TY_U64, ptr, stride);
-            ir_set_arg(ptr, pre_index, init);
-            ir_set_arg(ptr, latch_index, next);
+            let scaled = append_inst(cx, pre, Mul, TY_U64, start, coef);
+            let init = append_inst(cx, pre, Add, TY_U64, base, scaled);
+            let stride = append_inst(cx, pre, Mul, TY_U64, coef,
+                append_const(cx, pre, step, TY_U64));
+            let ptr = ir_make(cx, Phi, TY_U64, 0, 0, 0);
+            cx.insts[ptr].args = cx.args.count;
+            cx.insts[ptr].nargs = 2;
+            cx.args.push(0);
+            cx.argty.push(0);
+            cx.args.push(0);
+            cx.argty.push(0);
+            ir_prepend(cx, h, ptr);
+            let next = append_inst(cx, latch, Add, TY_U64, ptr, stride);
+            ir_set_arg(cx, ptr, pre_index, init);
+            ir_set_arg(cx, ptr, latch_index, next);
             for c in 0..cands.count / 3 {
                 if cands.data[3 * c + 1] != g {
                     continue;
@@ -316,9 +317,9 @@ fn reduce_loop(fi: i64, l: i64) -> bool {
                 let d = cands.data[3 * c + 2] - k0;
                 let mut addr = ptr;
                 if d != 0 {
-                    addr = op_before(v, Add, TY_U64, ptr, const_before(v, d, TY_U64));
+                    addr = op_before(cx, v, Add, TY_U64, ptr, const_before(cx, v, d, TY_U64));
                 }
-                INSTS[v].a = addr;
+                cx.insts[v].a = addr;
             }
         }
         free(cands.data as *u8);
@@ -331,19 +332,19 @@ fn reduce_loop(fi: i64, l: i64) -> bool {
 
 // Unswitches innermost loop l (canonical, in LCSSA form) on the first
 // branch of its blocks on an invariant condition. Returns whether it did.
-fn unswitch_loop(fi: i64, l: i64) -> bool {
+fn unswitch_loop(mut cx: *FnCtx, fi: i64, l: i64) -> bool {
     unsafe {
-        let h = loop_header(l);
-        let pre = loop_preheader(l);
-        if pre == 0 || loop_latch(l) == 0 || loop_inst_count(l) > UNSWITCH_MAX_SIZE {
+        let h = loop_header(cx, l);
+        let pre = loop_preheader(cx, l);
+        if pre == 0 || loop_latch(cx, l) == 0 || loop_inst_count(cx, l) > UNSWITCH_MAX_SIZE {
             return false;
         }
         let mut at = 0;
-        for i in 0..loop_size(l) {
-            let b = loop_block(l, i);
-            if BLOCKS[b].term == Term::Branch && BLOCKS[b].s0 != BLOCKS[b].s1 {
-                let c = ir_val(BLOCKS[b].cond);
-                if !is_const(c) && invariant_in(l, c) {
+        for i in 0..loop_size(cx, l) {
+            let b = loop_block(cx, l, i);
+            if cx.blocks[b].term == Term::Branch && cx.blocks[b].s0 != cx.blocks[b].s1 {
+                let c = ir_val(cx, cx.blocks[b].cond);
+                if !is_const(cx, c) && invariant_in(cx, l, c) {
                     at = b;
                     break;
                 }
@@ -352,52 +353,52 @@ fn unswitch_loop(fi: i64, l: i64) -> bool {
         if at == 0 {
             return false;
         }
-        let c = ir_val(BLOCKS[at].cond);
-        ir_enter(fi);
-        loop_exits(l);
+        let c = ir_val(cx, cx.blocks[at].cond);
+        ir_enter(cx, fi);
+        loop_exits(cx, l);
         let mut exits = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for i in 0..LP_LIST.count {
-            exits.push(LP_LIST.data[i]);
+        for i in 0..cx.lp_list.count {
+            exits.push(cx.lp_list.data[i]);
         }
-        let stamp = mark_loop_blocks(l);
+        let stamp = mark_loop_blocks(cx, l);
         let mut region = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for i in 0..LP_LIST2.count {
-            region.push(LP_LIST2.data[i]);
+        for i in 0..cx.lp_list2.count {
+            region.push(cx.lp_list2.data[i]);
         }
-        clone_region(fi, &region, stamp);
+        clone_region(cx, fi, &region, stamp);
         // The exits get the copy's exiting blocks as predecessors, with the
         // copies of their phis' operands.
         for e in 0..exits.count {
             let x = exits.data[e];
-            let n = BLOCKS[x].preds.count;
+            let n = cx.blocks[x].preds.count;
             for k in 0..n {
-                let p = BLOCKS[x].preds.data[k];
-                if LP_SEEN[p] != stamp {
+                let p = cx.blocks[x].preds.data[k];
+                if cx.lp_seen[p] != stamp {
                     continue;
                 }
-                let first = LP_VALUES.count;
-                let mut phi = BLOCKS[x].first;
-                while phi != 0 && INSTS[phi].op == Phi {
-                    LP_VALUES.push(clone_map(ir_val(ir_arg(phi, k)), stamp));
-                    phi = INSTS[phi].next;
+                let first = cx.lp_values.count;
+                let mut phi = cx.blocks[x].first;
+                while phi != 0 && cx.insts[phi].op == Phi {
+                    cx.lp_values.push(clone_map(cx, ir_val(cx, ir_arg(cx, phi, k)), stamp));
+                    phi = cx.insts[phi].next;
                 }
-                add_pred_values(x, BLOCKS[p].aux, &LP_VALUES, first);
-                LP_VALUES.count = first;
+                add_pred_values(cx, x, cx.blocks[p].aux, &cx.lp_values, first);
+                cx.lp_values.count = first;
             }
         }
         // The preheader chooses; each copy's branch is decided.
-        let ch = BLOCKS[h].aux;
-        BLOCKS[pre].term = Term::Branch;
-        BLOCKS[pre].cond = c;
-        BLOCKS[pre].s0 = h;
-        BLOCKS[pre].s1 = ch;
-        let t = ir_make(Const, TY_BOOL, 0, 0, 1);
-        ir_append(at, t);
-        BLOCKS[at].cond = t;
-        let cat = BLOCKS[at].aux;
-        let f = ir_make(Const, TY_BOOL, 0, 0, 0);
-        ir_append(cat, f);
-        BLOCKS[cat].cond = f;
+        let ch = cx.blocks[h].aux;
+        cx.blocks[pre].term = Term::Branch;
+        cx.blocks[pre].cond = c;
+        cx.blocks[pre].s0 = h;
+        cx.blocks[pre].s1 = ch;
+        let t = ir_make(cx, Const, TY_BOOL, 0, 0, 1);
+        ir_append(cx, at, t);
+        cx.blocks[at].cond = t;
+        let cat = cx.blocks[at].aux;
+        let f = ir_make(cx, Const, TY_BOOL, 0, 0, 0);
+        ir_append(cx, cat, f);
+        cx.blocks[cat].cond = f;
         free(exits.data as *u8);
         free(region.data as *u8);
         true
@@ -405,16 +406,16 @@ fn unswitch_loop(fi: i64, l: i64) -> bool {
 }
 
 // Whether small loop l branches on a condition defined outside it.
-fn has_invariant_branch(l: i64) -> bool {
+fn has_invariant_branch(mut cx: *FnCtx, l: i64) -> bool {
     unsafe {
-        if loop_inst_count(l) > UNSWITCH_MAX_SIZE {
+        if loop_inst_count(cx, l) > UNSWITCH_MAX_SIZE {
             return false;
         }
-        for i in 0..loop_size(l) {
-            let b = loop_block(l, i);
-            if BLOCKS[b].term == Term::Branch && BLOCKS[b].s0 != BLOCKS[b].s1 {
-                let c = ir_val(BLOCKS[b].cond);
-                if !is_const(c) && invariant_in(l, c) {
+        for i in 0..loop_size(cx, l) {
+            let b = loop_block(cx, l, i);
+            if cx.blocks[b].term == Term::Branch && cx.blocks[b].s0 != cx.blocks[b].s1 {
+                let c = ir_val(cx, cx.blocks[b].cond);
+                if !is_const(cx, c) && invariant_in(cx, l, c) {
                     return true;
                 }
             }
@@ -424,14 +425,14 @@ fn has_invariant_branch(l: i64) -> bool {
 }
 
 // Strength reduction and unswitching over the innermost loops of fi.
-pub fn reduce_and_unswitch(fi: i64) -> bool {
+pub fn reduce_and_unswitch(mut cx: *FnCtx, fi: i64) -> bool {
     unsafe {
         let mut changed = false;
-        canonicalize_loops(fi);
+        canonicalize_loops(cx, fi);
         let mut headers = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for l in 0..loop_count() {
-            if is_innermost(l) && loop_header(l) != IRFUNCS[fi].entry {
-                headers.push(loop_header(l));
+        for l in 0..loop_count(cx) {
+            if is_innermost(cx, l) && loop_header(cx, l) != IRFUNCS[fi].entry {
+                headers.push(loop_header(cx, l));
             }
         }
         // Unswitching, one loop at a time (the loops are found again after
@@ -441,33 +442,33 @@ pub fn reduce_and_unswitch(fi: i64) -> bool {
             if unswitched >= 4 {
                 break;
             }
-            canonicalize_loops(fi);
-            let l = innermost_loop(headers.data[i]);
-            if l < 0 || loop_header(l) != headers.data[i] || !is_canonical(l)
-                || !has_invariant_branch(l) {
+            canonicalize_loops(cx, fi);
+            let l = innermost_loop(cx, headers.data[i]);
+            if l < 0 || loop_header(cx, l) != headers.data[i] || !is_canonical(cx, l)
+                || !has_invariant_branch(cx, l) {
                 continue;
             }
-            form_lcssa(fi, l);
-            resolve_all(fi);
-            if unswitch_loop(fi, l) {
+            form_lcssa(cx, fi, l);
+            resolve_all(cx, fi);
+            if unswitch_loop(cx, fi, l) {
                 unswitched += 1;
                 changed = true;
-                resolve_all(fi);
-                simplify_cfg(fi);
-                verify_func(fi, c"unswitching");
+                resolve_all(cx, fi);
+                simplify_cfg(cx, fi);
+                verify_func(cx, fi, c"unswitching");
             }
         }
-        canonicalize_loops(fi);
-        for l in 0..loop_count() {
-            if is_innermost(l) && loop_header(l) != IRFUNCS[fi].entry && is_canonical(l)
-                && reduce_loop(fi, l) {
+        canonicalize_loops(cx, fi);
+        for l in 0..loop_count(cx) {
+            if is_innermost(cx, l) && loop_header(cx, l) != IRFUNCS[fi].entry && is_canonical(cx, l)
+                && reduce_loop(cx, fi, l) {
                 changed = true;
             }
         }
         free(headers.data as *u8);
         if changed {
-            resolve_all(fi);
-            verify_func(fi, c"loop strength reduction");
+            resolve_all(cx, fi);
+            verify_func(cx, fi, c"loop strength reduction");
         }
         changed
     }
