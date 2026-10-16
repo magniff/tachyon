@@ -26,7 +26,7 @@ BEGIN {
     for (i = 1; i <= n; i++) LAZY[lz[i]] = 1
     TRIGGERS["Iterators (0.14)"] = "Iterator IntoIterator"
     TRIGGERS["Conversions (0.15)"] = "From Into main_error"
-    TRIGGERS["Clone, Eq, Ord and Hash without an impl (0.15)"] = "Eq Ord Hash Clone clone cmp eq hash sort sort_by sort_stable HashMap"
+    TRIGGERS["Clone, Eq, Ord and Hash without an impl (0.15)"] = "Eq Ord Hash Clone clone cmp eq hash sort sort_by sort_stable HashMap distinct NonNull"
     # (0.17) Words std's own code uses that need a section too: `x.clone()`
     # of a number (Vec::filled_in) is copy_clone
     NEEDS["Clone, Eq, Ord and Hash without an impl (0.15)"] = "clone"

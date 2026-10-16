@@ -28,6 +28,7 @@ use crate::front::check::body::{
 use crate::front::check::calls::{is_plain_place, synth_method, synthetic_unary};
 use crate::front::check::calls::paths::{synth_call, synth_path};
 use crate::front::check::check_mode::{check_expr, check_struct_fields, int_range_help};
+use crate::front::check::distinct::{BINARY_NODE, distinct_binary, nonnull_cast};
 use crate::front::check::equality::{eq_unsupported, structural_eq};
 use crate::front::check::interp::check_interp;
 use crate::front::check::iterate::range_value;
@@ -44,6 +45,7 @@ use crate::front::check::vectors::{synth_vecop, vector_binary};
 use crate::front::check::widen::{join_operands, takes_context};
 use crate::front::closures::check_closure;
 use crate::front::consteval::eval_array_len;
+use crate::front::distinct::{is_distinct_type, is_niche_alias, strip_distinct};
 use crate::front::lexer::{
     SUF_F32, SUF_I16, SUF_I32, SUF_I64, SUF_I8, SUF_ISIZE, SUF_NONE, SUF_U16, SUF_U32, SUF_U64,
     SUF_U8, SUF_USIZE, Tok,
@@ -209,25 +211,37 @@ fn is_valid_cast(from: i64, to: i64) -> bool {
 fn synth_cast(n: i64) -> i64 {
     unsafe {
         let operand = NODES[n].a;
-        let from = synth_expr(operand);
-        let to = resolve_type(NODES[n].b);
+        let from_ty = synth_expr(operand);
+        let to_ty = resolve_type(NODES[n].b);
+        // (0.18: a distinct type converts as its underlying type does, and
+        // to and from that type for free: the cast is its operand)
+        let from = strip_distinct(from_ty);
+        let to = strip_distinct(to_ty);
+        if (from != from_ty || to != to_ty) && from == to {
+            // (std::NonNull from a raw pointer: checked)
+            if is_distinct_type(to_ty) && is_niche_alias(TYPES[to_ty].b) && from == from_ty {
+                return nonnull_cast(n, operand, to_ty);
+            }
+            NODES[n] = NODES[operand];
+            return to_ty;
+        }
         if !is_valid_cast(from, to) {
             err_begin(NODES[operand].start);
             err_str(c"cannot cast '");
-            err_type(from);
+            err_type(from_ty);
             err_str(c"' to '");
-            err_type(to);
+            err_type(to_ty);
             err_str(c"'");
             err_end();
         }
-        if is_integer(from) && is_fieldless_enum(to) {
+        if is_integer(from) && is_fieldless_enum(to) && to == to_ty {
             return enum_cast(n, operand, from, to);
         }
         if is_integer(from) && is_pointer(to)
             && !(NODES[operand].kind == Int && NODES[operand].a == 0) {
             unsafe_op(n, U_INT_PTR, c"casting an integer to a pointer is unsafe");
         }
-        to
+        to_ty
     }
 }
 
@@ -704,15 +718,19 @@ fn synth_binary(n: i64) -> i64 {
         if op == Tok::Shl || op == Tok::Shr {
             let value_ty = synth_expr(lhs);
             let amount_ty = synth_expr(rhs);
-            if !is_integer(value_ty) {
+            // (0.18: a distinct type over an integer shifts as it does)
+            if !is_integer(strip_distinct(value_ty)) {
                 type_error_got(n, c"shift operator requires integer type", value_ty);
             }
-            if !is_integer(amount_ty) {
+            if !is_integer(strip_distinct(amount_ty)) {
                 type_error_got(n, c"shift amount must be integer", amount_ty);
             }
             return value_ty;
         }
+        let saved = BINARY_NODE;
+        BINARY_NODE = n;
         let mut ty = synth_operands(lhs, rhs);
+        BINARY_NODE = saved;
         if is_ref(ty) && is_ref(NODES[lhs].ty) && is_ref(NODES[rhs].ty)
             && (op == Tok::EqEq || op == Tok::BangEq || op == Tok::Lt || op == Tok::Gt
                 || op == Tok::LtEq || op == Tok::GtEq) {
@@ -723,6 +741,21 @@ fn synth_binary(n: i64) -> i64 {
             NODES[n].b = synthetic_unary(Tok::Star, lhs, ty);
             NODES[n].c = synthetic_unary(Tok::Star, rhs, ty);
         }
+        // (0.18: two values of a distinct type: its underlying type's
+        // operator)
+        if is_distinct_type(ty) {
+            return distinct_binary(n, op, ty);
+        }
+        binary_result(n, op, ty)
+    }
+}
+
+// The type of binary node n (operator op, not a shift), whose operands are
+// checked, of type ty.
+pub fn binary_result(n: i64, op: Tok, ty: i64) -> i64 {
+    unsafe {
+        let lhs = NODES[n].b;
+        let rhs = NODES[n].c;
         if is_vector(ty) {
             return vector_binary(n, op, ty);
         }
@@ -810,7 +843,8 @@ fn synth_unary(n: i64) -> i64 {
             } else {
                 ty = synth_expr(operand);
             }
-            if !is_numeric(ty) && !is_vector(ty) {
+            // (0.18: a distinct type over a number negates as it does)
+            if !is_numeric(strip_distinct(ty)) && !is_vector(ty) {
                 let neg = std_trait(c"Neg");
                 if neg >= 0 && has_impl(neg, ty) {
                     return negation_call(n, ty);
@@ -825,7 +859,7 @@ fn synth_unary(n: i64) -> i64 {
         }
         if op == Tok::Tilde {
             let ty = synth_expr(operand);
-            if !is_integer(ty) {
+            if !is_integer(strip_distinct(ty)) {
                 type_error_got(n, c"bitwise NOT requires integer type", ty);
             }
             return ty;

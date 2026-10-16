@@ -14,6 +14,7 @@ use crate::front::ast::NodeKind::{
 use crate::front::check::{SELF_TYPE, SELF_TYPE_SYM, mismatch_error, name_error, type_error_got};
 use crate::front::check::args::check_shorthands;
 use crate::front::check::body::{check_branch, check_if, check_loop};
+use crate::front::check::distinct::{BINARY_NODE, distinct_literal};
 use crate::front::check::interp::check_interp;
 use crate::front::check::iterate::range_value;
 use crate::front::check::names::unknown_name_error;
@@ -27,6 +28,7 @@ use crate::front::check::widen::try_widen;
 use crate::front::closures::{check_closure, coerce_closure};
 use crate::front::consteval::eval_array_len;
 use crate::front::convert::into_call;
+use crate::front::distinct::strip_distinct;
 use crate::front::generics::{HINT_NODE, HINT_TY, check_arg, env_lookup};
 use crate::front::generics::instantiate::infer_struct_literal;
 use crate::front::lexer::{SUF_NONE, Tok};
@@ -42,7 +44,9 @@ use crate::front::types::{
     struct_field, struct_type, type_elem,
 };
 
-fn passes_expected_to_operands(op: Tok, expected: i64) -> bool {
+fn passes_expected_to_operands(op: Tok, ex: i64) -> bool {
+    // (0.18: a distinct type over a number, as the number)
+    let expected = strip_distinct(ex);
     if op == Tok::Plus || op == Tok::Minus || op == Tok::Star || op == Tok::Slash
         || op == Tok::Percent {
         return is_numeric(expected);
@@ -71,6 +75,10 @@ pub fn check_expr(n: i64, expected: i64) -> i64 {
 
 fn check_expr_inner(n: i64, expected: i64) -> i64 {
     unsafe {
+        // (0.18: a literal where a distinct type over a number goes)
+        if distinct_literal(n, expected) {
+            return expected;
+        }
         match NODES[n].kind {
             Int if NODES[n].b == SUF_NONE && is_integer(expected) => {
                 check_int_fits(n, NODES[n].a as u64, expected);
@@ -128,8 +136,11 @@ fn check_expr_inner(n: i64, expected: i64) -> i64 {
             Block => return check_branch(n, expected),
             Loop => return check_loop(n, expected),
             Binary if passes_expected_to_operands(NODES[n].op, expected) => {
+                let saved = BINARY_NODE;
+                BINARY_NODE = n;
                 check_expr(NODES[n].b, expected);
                 check_expr(NODES[n].c, expected);
+                BINARY_NODE = saved;
                 return expected;
             }
             Binary if (NODES[n].op == Tok::Shl || NODES[n].op == Tok::Shr)

@@ -1449,6 +1449,36 @@ appends "Tn notes" here.
 - `TACHYON_ARENA_SHUFFLE`, which randomizes the arenas' chunk addresses, so
   that any address-dependent output shows up as a byte difference.
 
+**T4 notes** (b18-distinct).
+- A distinct type is `TyKind::Distinct` (front/distinct.tach) while the
+  program is checked; `erase_program_types` (front/check/distinct.tach)
+  then writes its underlying type wherever the code generators read
+  types (node types, fields, signatures, variants, statics, locals), so
+  middle, back and gen0 never see one. Tools (QUERY) keep it.
+- The inherited traits are std's `distinct_eq/cmp/hash/fmt/fmt_debug/clone`
+  (clone.tach), called through `intrinsic_method` with `<X, T>`; an
+  explicit impl wins. Generic distinct types have generic impls through
+  `TPL_DISTINCT + alias` (`impl<T> NonNull<T>`, `NonNull::new`).
+- The niche knows std's `NonNull` by its alias (std's module, that name),
+  not by a `#[niche_null]` attribute: the parser takes no attributes on
+  aliases yet. An enum has it with two variants, one without fields and
+  one holding only a NonNull (`enum_niche`).
+- `q as NonNull<T>` from a raw pointer is checked (chosen over making it
+  `unsafe`: §2.10 says `as` into a type with an invariant checks it, as
+  `n as E` does). It becomes `{ let p = q; if p as u64 == 0 { <panic> }
+  p }`, failing with `null pointer made NonNull` (exit 101), a gen0
+  runtime message (kind enum_panic_kind(-1)), so T5's sites give it a
+  position and the range analysis may remove it. Without it, safe code
+  could make a null NonNull whose `Some` reads back as None. T1's
+  general invariant check may take it over.
+- A `_Nonnull` result of a C function is not checked: the call is
+  unsafe, and its caller vouches for what C returns (as for every other
+  promise of a C signature).
+- Field access through a distinct struct type is not offered (convert
+  with `as`); `!` on a distinct bool is not either.
+- Found on the way: an `extern "C" fn`'s result type `X<Y<Z>>` was a
+  parser error (fixed in its own commit).
+
 ## 8. Measuring what it does for agents
 
 The user asked that the benefit be measurable. No eval is run with this design.
