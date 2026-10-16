@@ -4,10 +4,12 @@
 # the functions middle::parallel::run_task reaches (query callees
 # --transitive) and, for every static of the compiler, its writes and
 # borrows in them (query refs; a method call that changes it, X.push(..),
-# counts) are listed, and each static found must be one below, with the
-# reason it is no race. A new one fails: move it into middle::ctx::FnCtx,
-# make it before the tasks run (parallel::prepare_tasks), or join it
-# between phases.
+# and an address taken, &X, count) are listed, and each static found must
+# be one below, with the reason it is no race. A new one fails: move it
+# into middle::ctx::FnCtx, make it before the tasks run
+# (parallel::prepare_tasks), or join it between phases. The same for the
+# join (parallel::join_task: the assembler, beside the tasks): a static
+# it writes that a task reads or writes must be one of JOINED below.
 #
 # usage: tests/threads_writes.sh [-c COMPILER]
 
@@ -98,6 +100,22 @@ base::BUF_COUNT	buf_new: the printers of --stats, --print-regalloc, --print-afte
 base::FMT_SCRATCH	buf_fmt: the same, and -g (tasks format with cx_fmt)
 base::diag::ERR_POISONED	the IR printers (one thread)'
 
+# The join's writes that task code touches: static <TAB> why it is no race
+JOINED='base::BUFS	the join writes the program'"'"'s buffers'"'"' entries, a task its context'"'"'s
+middle::parallel::FN_CONSTS	the join numbers the joined function'"'"'s constants, which no running task reads
+middle::parallel::FN_TEXT	the join takes the joined function'"'"'s text, its task done
+base::FMT_SCRATCH	asm_error (an internal error, which exits) and -g (one thread)
+base::BUF_COUNT	asm_error, which exits
+base::BUF_CAP	asm_error, which exits
+base::SYMS	the -g directives (dwarf_file: one thread)
+base::SYM_COUNT	the same
+base::SYM_CAP	the same
+base::SYM_TABLE	the same
+base::SYM_TABLE_SIZE	the same
+base::SYM_TABLES_CAP	the same
+base::STRESS_GROW	read by prepare_tasks (stress_grow)
+base::timer::T_TOTALS	--time-passes, which runs on one thread'
+
 cd "$ROOT" || exit 1
 WORK="$ROOT/target/threads"
 mkdir -p "$WORK"
@@ -132,5 +150,29 @@ new=$(comm -23 "$WORK/written" "$WORK/allowed")
 for s in $new; do
     echo "FAIL $s: a task writes it; try: $COMPILER query callees crate::middle::parallel::run_task --writes crate::$s"
 done
-echo "threads-writes: $(wc -l <"$WORK/written" | tr -d ' ') statics written by tasks, $(echo "$new" | grep -c .) not known to be race-free"
-[ -z "$new" ]
+# The join's.
+{
+    echo "middle::parallel::join_task"
+    "$COMPILER" query callees crate::middle::parallel::join_task --transitive --all | awk -F'\t' 'NF >= 3 { print $3 }'
+} | sort -u >"$WORK/joined"
+awk -F'\t' -v joined="$WORK/joined" -v reached="$WORK/reached" '
+    BEGIN {
+        while ((getline f < joined) > 0) in_join[f] = 1
+        while ((getline f < reached) > 0) in_task[f] = 1
+    }
+    /^## \$ tachyonc query refs / { s = $0; sub(/^## \$ tachyonc query refs crate::/, "", s); sub(/ --all$/, "", s); n = s; sub(/.*::/, "", n); next }
+    NF >= 4 && $1 ~ /^[0-9]+:[0-9]+$/ {
+        w = ($2 == "write" || $2 == "borrow")
+        if ($2 == "read" && match($4, n "(\\[[^]]*\\])?[ \t]*\\.[ \t]*(push|pop|clear|set|insert|put|reserve|truncate|remove|append|extend)[ \t]*\\(")) w = 1
+        if ($2 == "read" && match($4, "&(mut )?" n "([^A-Za-z_0-9]|$)")) w = 1
+        if (w && ($3 in in_join)) join_writes[s] = 1
+        if ($2 != "use" && $2 != "def" && ($3 in in_task)) task_touches[s] = 1
+    }
+    END { for (s in join_writes) if (s in task_touches) print s }' "$WORK/refs" | sort -u >"$WORK/join-written"
+printf '%s\n' "$JOINED" | cut -f1 | sort -u >"$WORK/join-allowed"
+newj=$(comm -23 "$WORK/join-written" "$WORK/join-allowed")
+for s in $newj; do
+    echo "FAIL $s: the join writes it and a task uses it; try: $COMPILER query callees crate::middle::parallel::join_task --writes crate::$s"
+done
+echo "threads-writes: $(wc -l <"$WORK/written" | tr -d ' ') statics written by tasks, $(wc -l <"$WORK/join-written" | tr -d ' ') by the join and used by tasks; $(echo "$new$newj" | grep -c .) not known to be race-free"
+[ -z "$new" ] && [ -z "$newj" ]

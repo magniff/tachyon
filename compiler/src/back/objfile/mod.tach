@@ -39,10 +39,9 @@ use crate::back::dwarf::DEBUG_INFO;
 use crate::back::enc_arm64::init_a64;
 use crate::back::enc_x86::init_x86;
 use crate::base::{
-    BUFS, SYMS, buf_byte, buf_fmt, buf_new, buf_reserve, buf_write_file, cstr, die, grow, intern,
-    strlen,
+    BUFS, alloc_array, alloc_zeroed, buf_byte, buf_fmt, buf_new, buf_reserve, buf_write_file, cstr,
+    die, free, grow, memcpy, strlen,
 };
-use crate::middle::lower::ssa::HMap;
 use debug::{CFI_FNS, ROWS, compact_unwind, line_program};
 use elf::elf_write;
 use macho::macho_write;
@@ -189,8 +188,10 @@ fn put32(pos: i64, v: i64) {
 // start of fragment `frag`), or a name only referred to. `in_table`: the
 // symbol table needs it (relocations refer to it); `index`: its index
 // there.
+// (0.18.1: its name its own bytes, not an interned symbol: the assembler
+// runs beside code generation's threads, which read the symbols.)
 struct ASym {
-    name: i64, defined: bool, global: bool, frag: i64, off: i64, sec: i64, in_table: bool,
+    text: [u8], defined: bool, global: bool, frag: i64, off: i64, sec: i64, in_table: bool,
     index: i64, atom: i64
 }
 
@@ -203,31 +204,70 @@ static mut ASYMS: *ASym = 0 as *ASym;
 static mut ASYM_COUNT: i64 = 0;
 static mut ASYM_CAP: i64 = 0;
 // Interned name + 1 -> symbol + 1.
-static mut ASYM_MAP: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+static mut ASYM_TABLE: *i64 = 0 as *i64;
+static mut ASYM_TABLE_SIZE: i64 = 0;
 
 pub fn asym(name: [u8]) -> i64 {
     unsafe {
-        let id = intern(name);
-        let known = ASYM_MAP.get(id + 1);
-        if known != 0 {
-            return known - 1;
+        if (ASYM_COUNT + 1) * 2 > ASYM_TABLE_SIZE {
+            asym_rehash();
+        }
+        let hash = name_hash(name);
+        let mask = (ASYM_TABLE_SIZE - 1) as u64;
+        let mut slot = hash & mask;
+        while ASYM_TABLE[slot] != 0 {
+            let s = ASYM_TABLE[slot] - 1;
+            if ASYMS[s].text == name {
+                return s;
+            }
+            slot = (slot + 1) & mask;
         }
         ASYMS = grow(ASYMS, ASYM_COUNT, &ASYM_CAP);
         let s = ASYM_COUNT;
+        let n = name.len as i64;
+        let copy = alloc_zeroed(n + 1);
+        memcpy(copy, name.ptr, n as u64);
         ASYMS[s] = ASym {
-            name: id, defined: false, global: false, frag: -1, off: 0, sec: -1, in_table: false,
-            index: -1, atom: -1
+            text: copy[0..n], defined: false, global: false, frag: -1, off: 0, sec: -1,
+            in_table: false, index: -1, atom: -1
         };
         ASYM_COUNT += 1;
-        ASYM_MAP.put(id + 1, s + 1);
+        ASYM_TABLE[slot] = s + 1;
         s
     }
+}
+
+// The table of ASYMS by name (index + 1, open addressing), twice as large.
+fn asym_rehash() {
+    unsafe {
+        let size = if ASYM_TABLE_SIZE == 0 { 1024 } else { ASYM_TABLE_SIZE * 2 };
+        free(ASYM_TABLE as *u8);
+        ASYM_TABLE = alloc_array::<i64>(size);
+        ASYM_TABLE_SIZE = size;
+        let mask = (size - 1) as u64;
+        for s in 0..ASYM_COUNT {
+            let mut slot = name_hash(ASYMS[s].text) & mask;
+            while ASYM_TABLE[slot] != 0 {
+                slot = (slot + 1) & mask;
+            }
+            ASYM_TABLE[slot] = s + 1;
+        }
+    }
+}
+
+// FNV-1a of a name.
+fn name_hash(t: [u8]) -> u64 {
+    let mut h: u64 = 14695981039346656037;
+    for i in 0..t.len as i64 {
+        h = (h ^ t[i] as u64) * 1099511628211;
+    }
+    h
 }
 
 // A temporary label (L... on Mach-O, .L... on ELF): never in the symbol
 // table unless a relocation needs it (Mach-O only; ELF uses the section).
 fn is_temp(s: i64) -> bool {
-    let t = unsafe { SYMS[ASYMS[s].name].text };
+    let t = unsafe { ASYMS[s].text };
     if ELF { t.len >= 2 && t[0] == '.' && t[1] == 'L' } else { t.len >= 1 && t[0] == 'L' }
 }
 

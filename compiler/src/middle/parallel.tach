@@ -34,13 +34,15 @@ use crate::host_target;
 use crate::back::dwarf::DEBUG_INFO;
 use crate::back::emit::function::emit_task;
 use crate::back::emit::stats::STATS;
+use crate::back::objfile::asm_flush;
 use crate::back::regalloc::{PRINT_REGALLOC, VERIFY_REGALLOC};
 use crate::base::{
-    IntVec, alloc_array, alloc_zeroed, buf_bytes, buf_clear, buf_int, buf_slice, die, free, memcpy,
+    IntVec, alloc_array, alloc_zeroed, buf_bytes, buf_clear, buf_int, buf_slice, cstr, die, free,
+    memcpy,
 };
 use crate::base::target::{T_AARCH64_MACOS, T_X86_64_MACOS};
 use crate::base::timer::TIME_PASSES;
-use crate::front::lexer::str_at;
+use crate::front::lexer::{STR_COUNT, str_at};
 use crate::front::types::{TYPE_COUNT, compute_layout};
 use crate::gen0::target::add_const_data;
 use crate::middle::ctx::{FnCtx, main_cx};
@@ -50,11 +52,17 @@ use crate::middle::inline::{
 use crate::middle::ipo::infer_component_attrs;
 use crate::middle::ir::{FN_IR, IRFUNCS, IRFUNC_COUNT, Op, ir_enter, ir_release};
 use crate::middle::ir::verify::{PRINT_AFTER_ALL, VERIFY_IR};
-use crate::middle::opt::{cleanup_function, optimize_component_function, simplify_function};
-use crate::middle::threads::{POOL_CONTEXTS, POOL_CTX, pool_run, pool_start, pool_stop, processors};
+use crate::middle::opt::{
+    PER_FUNCTION, cleanup_function, optimize_component_function, simplify_function,
+};
+use crate::middle::threads::{
+    POOL_CONTEXTS, POOL_CTX, POOL_THREADS, pool_run, pool_run_joined, pool_start, pool_stop,
+    processors,
+};
 
 extern "C" {
     fn memchr(s: *u8, c: i32, n: u64) -> *u8;
+    fn clock_gettime(clock: i32, ts: *i64) -> i32;
 }
 
 // ---- Options ----
@@ -130,6 +138,40 @@ pub fn parallel_begin(mut cx: *FnCtx) {
 // The end of code generation: the workers stop.
 pub fn parallel_end() {
     pool_stop();
+}
+
+// (TACHYON_PHASE_TIMES=1) The wall time since the last mark, on stderr,
+// for phase `name`: --time-passes runs on one thread (its clock is the
+// process's), this measures the threads' phases as they run.
+pub fn phase_time(name: *u8) {
+    unsafe {
+        if PHASE_TIMES == 0 {
+            let on = crate::base::getenv(c"TACHYON_PHASE_TIMES");
+            PHASE_TIMES = if on != 0 as *u8 && *on == '1' { 1 } else { -1 };
+            PHASE_MARK = monotonic_ns();
+        }
+        if PHASE_TIMES < 0 || name == 0 as *u8 {
+            return;
+        }
+        let now = monotonic_ns();
+        let ms = (now - PHASE_MARK) / 100000;
+        PHASE_MARK = now;
+        eprintln(f"{ms / 10}.{ms % 10} ms\t{cstr(name)}");
+    }
+}
+
+static mut PHASE_TIMES: i64 = 0;
+static mut PHASE_MARK: i64 = 0;
+
+// Nanoseconds of the monotonic clock.
+fn monotonic_ns() -> i64 {
+    unsafe {
+        let mut ts: [i64; 2] = [0; 2];
+        let host = host_target();
+        let clock = if host == T_AARCH64_MACOS || host == T_X86_64_MACOS { 6 } else { 1 };
+        clock_gettime(clock as i32, &ts[0]);
+        ts[0] * 1000000000 + ts[1]
+    }
 }
 
 // (0.18.1) --vec-stats's counts (0 vector loops, 1 overlap tests, 2 tests
@@ -253,10 +295,42 @@ fn resolve_consts() {
             }
         }
         for i in 0..found.count {
-            let p = pending(found.data[i]);
-            (*p).id = add_const_data((*p).data[0..(*p).len], (*p).align);
+            give_id(pending(found.data[i]));
         }
         free(found.data as *u8);
+        register_consts();
+    }
+}
+
+// The constants given ids and not yet added to the program's strings (in
+// id order), and the next id. Ids are given as the join goes, while the
+// tasks run and read the strings (str_at): the strings grow only between
+// phases (register_consts), with these ids.
+static mut TO_REGISTER: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut NEXT_CONST_ID: i64 = 0;
+
+fn give_id(p: *PendingConst) {
+    unsafe {
+        if TO_REGISTER.count == 0 {
+            NEXT_CONST_ID = STR_COUNT;
+        }
+        (*p).id = NEXT_CONST_ID;
+        NEXT_CONST_ID += 1;
+        TO_REGISTER.push(p as i64);
+    }
+}
+
+// Adds the constants given ids to the program's strings (main thread,
+// between phases).
+fn register_consts() {
+    unsafe {
+        for i in 0..TO_REGISTER.count {
+            let p = TO_REGISTER.data[i] as *PendingConst;
+            if add_const_data((*p).data[0..(*p).len], (*p).align) != (*p).id {
+                die(c"internal error: constant data numbered out of order");
+            }
+        }
+        TO_REGISTER.count = 0;
     }
 }
 
@@ -353,10 +427,22 @@ fn fresh_context(mut cx: *FnCtx) -> *FnCtx {
     }
 }
 
-// Runs tasks first..end of ITEMS (a phase, or a level of one): the pool
-// takes the last first, so they are handed over reversed (one thread runs
-// them in order).
+// Runs tasks first..end of ITEMS (a phase, or a level of one).
 fn run_tasks(mut cx: *FnCtx, kind: i64, first: i64, end: i64) {
+    unsafe {
+        let mut tasks = task_list(cx, kind, first, end);
+        pool_run(kind, &tasks);
+        free(tasks.data as *u8);
+    }
+}
+
+// The tasks first..end of ITEMS for the pool, which takes the last first:
+// one thread gets them reversed, so it runs them in order; several get
+// them by size, the largest last, so that it starts first (a large
+// function started last would keep the others waiting), but emission's in
+// order (its texts are joined in order as they are done). What the tasks
+// read is made first (ir_release, prepare_layouts).
+fn task_list(mut cx: *FnCtx, kind: i64, first: i64, end: i64) -> IntVec {
     unsafe {
         ir_release(cx);
         prepare_layouts();
@@ -366,8 +452,66 @@ fn run_tasks(mut cx: *FnCtx, kind: i64, first: i64, end: i64) {
             i -= 1;
             tasks.push(i);
         }
-        pool_run(kind, &tasks);
-        free(tasks.data as *u8);
+        if POOL_THREADS > 1 && kind != K_EMIT {
+            let weight = alloc_array::<i64>(end + 1);
+            for k in first..end {
+                weight[k] = task_weight(kind, ITEMS.data[k]);
+            }
+            sort_tasks(&tasks, weight);
+            free(weight as *u8);
+        }
+        tasks
+    }
+}
+
+// An estimate of a task's work: its function's instructions, or its
+// component's.
+fn task_weight(kind: i64, item: i64) -> i64 {
+    unsafe {
+        if kind != K_COMPONENT {
+            return IRFUNCS[item].t.inst_count;
+        }
+        let mut w = 0;
+        for k in COMP_START[item]..COMP_END[item] {
+            w += IRFUNCS[SCC_ORDER.data[k]].t.inst_count;
+        }
+        w
+    }
+}
+
+// Sorts the task list by weight[task], ascending, stably (a merge sort).
+fn sort_tasks(tasks: *IntVec, weight: *i64) {
+    unsafe {
+        let n = (*tasks).count;
+        let a = (*tasks).data;
+        let b = alloc_array::<i64>(n + 1);
+        let mut width = 1;
+        while width < n {
+            let mut lo = 0;
+            while lo < n {
+                let mid = if lo + width < n { lo + width } else { n };
+                let hi = if lo + 2 * width < n { lo + 2 * width } else { n };
+                let mut i = lo;
+                let mut j = mid;
+                let mut k = lo;
+                while k < hi {
+                    if i < mid && (j >= hi || weight[a[i]] <= weight[a[j]]) {
+                        b[k] = a[i];
+                        i += 1;
+                    } else {
+                        b[k] = a[j];
+                        j += 1;
+                    }
+                    k += 1;
+                }
+                lo = hi;
+            }
+            for k in 0..n {
+                a[k] = b[k];
+            }
+            width *= 2;
+        }
+        free(b as *u8);
     }
 }
 
@@ -543,6 +687,9 @@ pub fn optimize_components(mut cx: *FnCtx) {
                 ITEMS.push(by_level.data[k]);
             }
             run_tasks(cx, K_COMPONENT, 0, ITEMS.count);
+            if crate::base::getenv(c"TACHYON_LEVEL_TIMES") != 0 as *u8 {
+                phase_time(c"level");
+            }
             // The barrier: the level's growth and inlined calls, for the
             // next levels.
             for k in start[l]..start[l + 1] {
@@ -608,28 +755,100 @@ static mut FN_TEXT: *FnText = 0 as *FnText;
 
 // Emits the functions in `order` (IR functions, program order): those
 // before `split` first, then the rest (-O1's small leaves, which the
-// others inline as the middle end left them), then joins their texts
-// into cx's (the program's) in that order.
+// others inline as the middle end left them), and joins their texts into
+// cx's (the program's) in that order: as they are done, beside the
+// emission (pool_run_joined); with one thread, after it.
 pub fn emit_functions(mut cx: *FnCtx, order: *IntVec, split: i64) {
     unsafe {
         ITEMS.count = 0;
         for i in 0..(*order).count {
             ITEMS.push((*order).data[i]);
         }
-        run_functions(cx, K_EMIT, 0, split);
-        run_functions(cx, K_EMIT, split, ITEMS.count);
-        for i in 0..ITEMS.count {
-            let fi = ITEMS.data[i];
-            let t = &FN_TEXT[fi];
-            if (*t).len > 0 {
-                join_text(cx, (*t).data, (*t).len);
-                cx.label_count += (*t).labels;
-                crate::back::objfile::asm_flush(cx);
-            }
-            free((*t).data);
-            (*t).data = 0 as *u8;
-            (*t).len = 0;
+        JOIN_CX = cx;
+        emit_range(cx, 0, split);
+        emit_range(cx, split, ITEMS.count);
+        phase_time(c"emission, join and assembly");
+    }
+}
+
+// The program's context, which the join appends to (main thread).
+static mut JOIN_CX: *FnCtx = 0 as *FnCtx;
+
+fn emit_range(mut cx: *FnCtx, first: i64, end: i64) {
+    unsafe {
+        let mut tasks = task_list(cx, K_EMIT, first, end);
+        let mut next = first;
+        if POOL_THREADS > 1 {
+            next = pool_run_joined(K_EMIT, &tasks, first, end);
+        } else {
+            pool_run(K_EMIT, &tasks);
         }
+        free(tasks.data as *u8);
+        resolve_consts();
+        while next < end {
+            join_task(next);
+            next += 1;
+        }
+    }
+}
+
+// Joins the text of task i (ITEMS' position i) to the program's (main
+// thread): false when it names constant data its phase has not numbered
+// yet (that waits for the phase's end, resolve_consts).
+pub fn join_task(i: i64) -> bool {
+    unsafe {
+        let fi = ITEMS.data[i];
+        let t = &FN_TEXT[fi];
+        // -O1 optimizes each function in its emission task, the only
+        // constant data made then: one thread numbers it in the emission's
+        // order, which is the join's, so it is numbered here.
+        if PER_FUNCTION {
+            number_consts(fi);
+        }
+        if (*t).len > 0 {
+            if !consts_numbered((*t).data, (*t).len) {
+                return false;
+            }
+            join_text(JOIN_CX, (*t).data, (*t).len);
+            JOIN_CX.label_count += (*t).labels;
+            asm_flush(JOIN_CX);
+        }
+        free((*t).data);
+        (*t).data = 0 as *u8;
+        (*t).len = 0;
+        true
+    }
+}
+
+// Numbers function fi's constant data not numbered yet, in its order.
+fn number_consts(fi: i64) {
+    unsafe {
+        for k in 0..FN_CONSTS[fi].count {
+            let p = pending(-(1 + (fi << OWNER_SHIFT) + k));
+            if (*p).id < 0 {
+                give_id(p);
+            }
+        }
+    }
+}
+
+// Whether every constant a text names (str.\x02<n>) has its id.
+fn consts_numbered(text: *u8, len: i64) -> bool {
+    unsafe {
+        let mut at = next_marker(text, 0, len, 2);
+        while at < len {
+            let mut j = at + 1;
+            let mut n = 0;
+            while j < len && text[j] >= '0' && text[j] <= '9' {
+                n = n * 10 + (text[j] - '0') as i64;
+                j += 1;
+            }
+            if const_data_id(-(n + 1)) < 0 {
+                return false;
+            }
+            at = next_marker(text, j, len, 2);
+        }
+        true
     }
 }
 

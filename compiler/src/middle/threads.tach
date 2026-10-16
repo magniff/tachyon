@@ -19,9 +19,9 @@
 // program with few functions, makes no thread: the main thread runs every
 // task, in order.
 
-use crate::base::{IntVec, alloc_zeroed, die};
+use crate::base::{IntVec, alloc_zeroed, die, free};
 use crate::middle::ctx::{FnCtx, fnctx_new};
-use crate::middle::parallel::run_task;
+use crate::middle::parallel::{join_task, run_task};
 
 extern "C" {
     fn pthread_create(thread: *u64, attr: *u8, start: extern "C" fn(*u8) -> *u8, arg: *u8) -> i32;
@@ -59,6 +59,10 @@ static mut READY: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 static mut REMAINING: i64 = 0;
 static mut PHASE_KIND: i64 = 0;
 static mut STOP: bool = false;
+
+// While a joined phase runs (pool_run_joined): per task, whether it is
+// done.
+static mut JOINED: *bool = 0 as *bool;
 
 // The number of processors online (sysconf), at least 1.
 pub fn processors(macos: bool) -> i64 {
@@ -138,6 +142,74 @@ pub fn pool_run(kind: i64, tasks: *IntVec) {
     }
 }
 
+// Runs a phase's tasks as pool_run does, task i being ITEMS' position i
+// in first..end, while the main thread hands each done task to
+// parallel::join_task in the order first, first + 1, ..., as soon as it
+// and those before it are done (the join of emission, which assembles the
+// texts in program order); while the next is not done it runs a task
+// itself, if one is left. Returns the first task not joined: join_task
+// may refuse one (it must wait for the phase's end), and the rest are the
+// caller's to join after.
+pub fn pool_run_joined(kind: i64, tasks: *IntVec, first: i64, end: i64) -> i64 {
+    unsafe {
+        pthread_mutex_lock(MUTEX);
+        PHASE_KIND = kind;
+        READY.count = 0;
+        for i in 0..(*tasks).count {
+            READY.push((*tasks).data[i]);
+        }
+        REMAINING = (*tasks).count;
+        JOINED = alloc_zeroed(end + 1) as *bool;
+        pthread_cond_broadcast(WAKE);
+        let mut next = first;
+        let mut joining = true;
+        while joining && next < end {
+            if JOINED[next] {
+                // (its task wrote its results before it took MUTEX to mark it)
+                pthread_mutex_unlock(MUTEX);
+                joining = join_task(next);
+                pthread_mutex_lock(MUTEX);
+                if joining {
+                    next += 1;
+                }
+            } else if READY.count > 0 {
+                let task = READY.pop();
+                pthread_mutex_unlock(MUTEX);
+                run_task(POOL_CTX[0], kind, task);
+                pthread_mutex_lock(MUTEX);
+                REMAINING -= 1;
+                JOINED[task] = true;
+                pthread_cond_broadcast(WAKE);
+            } else {
+                pthread_cond_wait(WAKE, MUTEX);
+            }
+        }
+        // (the tasks left, refused by the join: done by every thread)
+        pthread_mutex_unlock(MUTEX);
+        loop {
+            pthread_mutex_lock(MUTEX);
+            if READY.count == 0 {
+                break;
+            }
+            let task = READY.pop();
+            pthread_mutex_unlock(MUTEX);
+            run_task(POOL_CTX[0], kind, task);
+            pthread_mutex_lock(MUTEX);
+            REMAINING -= 1;
+            JOINED[task] = true;
+            pthread_cond_broadcast(WAKE);
+            pthread_mutex_unlock(MUTEX);
+        }
+        while REMAINING > 0 {
+            pthread_cond_wait(WAKE, MUTEX);
+        }
+        free(JOINED as *u8);
+        JOINED = 0 as *bool;
+        pthread_mutex_unlock(MUTEX);
+        next
+    }
+}
+
 // A thread's loop over the ready tasks, MUTEX held (released while a
 // task runs). The main thread (index 0) returns when the phase is done;
 // a worker when the pool stops.
@@ -157,7 +229,10 @@ fn take_tasks(index: i64) {
             run_task(cx, kind, task);
             pthread_mutex_lock(MUTEX);
             REMAINING -= 1;
-            if REMAINING == 0 {
+            if JOINED != 0 as *bool {
+                JOINED[task] = true;
+                pthread_cond_broadcast(WAKE);
+            } else if REMAINING == 0 {
                 pthread_cond_broadcast(WAKE);
             }
         }
