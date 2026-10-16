@@ -70,6 +70,11 @@ static mut TRY: i64 = -1;
 static mut M_NODE: i64 = 0;
 static mut M_CODE: i64 = 0;
 
+static mut M_SOFT: bool = false;
+// A finding's code carries this bit when it is a warning in every mode
+// (own_soft).
+const SOFT_BIT: i64 = 1 << 20;
+
 // Starts a finding of code `code` at node n.
 pub fn own_begin(n: i64, code: i64) {
     unsafe {
@@ -83,6 +88,7 @@ pub fn own_begin(n: i64, code: i64) {
         buf_clear(TRY);
         M_NODE = n;
         M_CODE = code;
+        M_SOFT = false;
     }
 }
 
@@ -131,6 +137,12 @@ pub fn own_try(s: [u8]) {
     }
 }
 
+// The finding being built is a warning even under --values=error: a
+// conflict that comes only from an assumed summary (design §7 V3).
+pub fn own_soft() {
+    unsafe { M_SOFT = true; }
+}
+
 // Ends the finding. It waits (PENDING) until the driver keeps the walk
 // it came from (own_flush) or walks again (own_discard): a function walked
 // twice, wider, or a fixed-point round that is not the last (T3).
@@ -151,7 +163,7 @@ pub fn own_end() {
             buf_bytes(help, buf_slice(TRY));
         }
         PENDING.push(NODES[M_NODE].start);
-        PENDING.push(M_CODE);
+        PENDING.push(if M_SOFT { M_CODE | SOFT_BIT } else { M_CODE });
         PENDING.push(msg);
         PENDING.push(help);
     }
@@ -185,7 +197,8 @@ pub fn own_flush() {
         let mut i = 0;
         while i < PENDING.count {
             let pos = PENDING.data[i];
-            let code = PENDING.data[i + 1];
+            let soft = (PENDING.data[i + 1] & SOFT_BIT) != 0;
+            let code = PENDING.data[i + 1] & ~SOFT_BIT;
             let msg = PENDING.data[i + 2];
             let help = PENDING.data[i + 3];
             i += 4;
@@ -213,7 +226,7 @@ pub fn own_flush() {
             buf_byte(msg, 0);
             buf_byte(help, 0);
             let h = if has_help { buf_slice(help).ptr } else { 0 as *u8 };
-            if OWN_MODE == MODE_WARN {
+            if OWN_MODE == MODE_WARN || soft {
                 report_warning(pos, 1000 + code, code_name(code), buf_slice(msg).ptr, h);
             } else {
                 report_error_once(pos, 1000 + code, code_name(code), buf_slice(msg).ptr, h, "");
@@ -235,6 +248,8 @@ pub fn print_reports() {
         buf_str(out, c" findings (");
         buf_int(out, crate::front::own::walk::WALKED);
         buf_str(out, c" functions walked, ");
+        buf_int(out, crate::front::own::fast::SKIPPED);
+        buf_str(out, c" skipped, ");
         buf_int(out, crate::front::own::walk::VISITS);
         buf_str(out, c" node visits, ");
         buf_int(out, crate::front::own::walk::LOOP_ROUNDS);

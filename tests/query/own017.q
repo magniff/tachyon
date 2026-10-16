@@ -5,14 +5,14 @@ $ own own017/main.tach:14:5
 own017/main.tach:14:5 in crate::main
 gpa    Gpa       plain
 v      Vec<i64>  owned
-first  [i64]     view
-t      Tok       view
+first  [i64]     view  views v
+t      Tok       view  views nothing (static data)
 $ own own017/main.tach:16:17
 own017/main.tach:16:17 in crate::main
 gpa    Gpa       plain
 v      Vec<i64>  owned
-first  [i64]     view
-t      Tok       view
+first  [i64]     view  views v
+t      Tok       view  views nothing (static data)
 n      i64       plain
 $ own own017/main.tach:5:23
 own017/main.tach:5:23 in crate::total
