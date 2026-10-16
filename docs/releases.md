@@ -165,6 +165,17 @@ contracts`, `guide testing`, `guide types#distinct-types`.
 - **V4 decided** (the user, 2026-10-16): once the compiler's source has
   moved to `&`/`&mut` (0.18.1), the legacy rule that a non-`mut` `*T`
   parameter is a borrow goes, and every `*T` is raw.
+- **Caught by the release gate, fixed before the tag**: the check-site
+  table wrote paths as given, so the compiler built on aarch64-linux
+  differed from the cross-built one (paths relative to the root's
+  directory, tests/refactor/paths018); GNU as refused the companions'
+  `f?pre` symbols (`f$pre` and `f$body` now, tests/refactor/symbols018);
+  nonnull_cimport needs clang (`// REQUIRES: clang`, a new directive);
+  iterchain ran 5.8% more instructions than with 0.17.0, its dot loop
+  unrolled twice instead of four times because a constant only a check's
+  cold failure reads counted in the unroller's size (no longer,
+  tests/run/opt_unroll_exit_consts); and realpath per source file had
+  made compilations slow under a large directory.
 - **Tested on aarch64 only**, as 0.15 to 0.17 (`gate.sh --with-x86`).
 - **Breaking**:
   - std's `Display`, `Debug`, `Iterator` and `Clone` are declared with
@@ -173,6 +184,9 @@ contracts`, `guide testing`, `guide types#distinct-types`.
   - `unwrap` and `Vec::get`/`set`/`swap`/`insert`/`remove` failures are
     reported at the caller's line, and every run-time failure is one line
     with a position (programs that compare stderr see the new line);
+  - a failure's position, and `--trace`'s, `--check-alloc`'s and
+    `-g`'s file names, are relative to the root file's directory, not
+    to the directory the compiler ran in;
   - the prelude gains `assert`, `assert_eq`, `assert_ne`,
     `debug_assert`, `assert_snapshot` (a program's own names hide them);
     `test`, `property`, `fuzz` and `cfg(test)` are attributes.
