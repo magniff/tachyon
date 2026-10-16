@@ -87,7 +87,13 @@ contracts`, `guide testing`, `guide types#distinct-types`.
 - **One failure line for every run-time check** (an index, a slice, `as
   E`, a vector lane, a contract, an assertion, `NonNull`): `FILE:LINE:COL:
   message`, from a site table the checks pass to the runtime; the `note:
-  build with --trace` line is gone. `--no-positions` makes every site 0,
+  build with --trace` line is gone. Every path the compiler writes into
+  what it makes (these positions, `--trace`, `--check-alloc`,
+  `--check-unsafe`, `tachyonc test`'s labels, `-g`'s line table, whose
+  `DW_AT_comp_dir` is now the root's directory) is relative to the root
+  file's directory, so the output is the same whatever the current
+  directory and however the root's path is spelled
+  (tests/refactor/paths018). `--no-positions` makes every site 0,
   so code that only moved compiles to the same assembly.
 - **The optimizer proves, never assumes**: a contract check is a check
   like a bounds check, removed only where the range analysis decides it;

@@ -31,6 +31,7 @@ pub extern "C" {
     fn write(fd: i32, buf: *u8, n: u64) -> i64;
     fn exit(code: i32) -> !;
     fn getenv(name: *u8) -> *u8;
+    fn realpath(path: *u8, resolved: *u8) -> *u8;
 }
 
 pub const STDOUT: i32 = 1;
@@ -684,6 +685,94 @@ pub fn add_source(path: *u8, text: i64) -> i64 {
         SRC = BUFS[all].data;
         SRC_LEN = BUFS[all].len - 1;
         start
+    }
+}
+
+// (0.18) Source file paths as the compiler writes them into what it makes
+// (run-time failure positions, --trace, --check-alloc and --check-unsafe
+// sites, the test runner's labels, -g's line table), by file: relative
+// to the root file's directory, so that the output is the same whatever
+// the current directory and however the root's path is spelled
+// (`main.tach`, `./main.tach`, an absolute path). A file the compiler
+// made (`<std>`) keeps its name; one outside the root's directory is
+// `../`-relative. OUT_PATHS holds each file's, made when first asked.
+static mut OUT_PATHS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut ROOT_DIR: *u8 = 0 as *u8;
+
+// The absolute directory of the root file (FILES[0]), resolved once; the
+// empty string when it cannot be.
+pub fn root_dir() -> *u8 {
+    unsafe {
+        if ROOT_DIR == 0 as *u8 {
+            ROOT_DIR = c"";
+            if FILE_COUNT > 0 {
+                let abs = realpath(FILES[0].path, 0 as *u8);
+                if abs != 0 as *u8 {
+                    let mut cut = strlen(abs) as i64;
+                    while cut > 0 && abs[cut - 1] != '/' {
+                        cut -= 1;
+                    }
+                    // (the root at "/x.tach": its directory is "/")
+                    abs[if cut > 1 { cut - 1 } else { cut }] = 0;
+                    ROOT_DIR = abs;
+                }
+            }
+        }
+        ROOT_DIR
+    }
+}
+
+// The path of file `file` relative to the root's directory (see
+// OUT_PATHS); a file that cannot be resolved keeps its path, without a
+// leading "./".
+pub fn out_path(file: i64) -> *u8 {
+    unsafe {
+        let path = FILES[file].path;
+        if path[0] == '<' {
+            return path;
+        }
+        while OUT_PATHS.count <= file {
+            OUT_PATHS.push(0);
+        }
+        if OUT_PATHS.data[file] != 0 {
+            return OUT_PATHS.data[file] as *u8;
+        }
+        let dir = root_dir();
+        let abs = realpath(path, 0 as *u8);
+        let mut made = if path[0] == '.' && path[1] == '/' { &path[2] } else { path };
+        if abs != 0 as *u8 && dir[0] == '/' {
+            // the longest common prefix of whole components
+            let mut i = 0;
+            let mut last = 0;
+            while abs[i] != 0 && abs[i] == dir[i] {
+                if abs[i] == '/' {
+                    last = i + 1;
+                }
+                i += 1;
+            }
+            let out = buf_new();
+            if dir[i] == 0 && abs[i] == '/' {
+                // under the root's directory
+                last = i + 1;
+            } else if dir[last] != 0 {
+                // one "../" for each component of dir after the common
+                // prefix (last <= i: within dir)
+                buf_str(out, c"../");
+                let mut k = last;
+                while dir[k] != 0 {
+                    if dir[k] == '/' {
+                        buf_str(out, c"../");
+                    }
+                    k += 1;
+                }
+            }
+            buf_str(out, &abs[last]);
+            buf_byte(out, 0);
+            made = BUFS[out].data;
+            free(abs);
+        }
+        OUT_PATHS.data[file] = made as i64;
+        made
     }
 }
 
