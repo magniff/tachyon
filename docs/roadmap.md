@@ -923,8 +923,8 @@ run (off from 0.15). Benchmarks and compile times in "Benchmarks", 0.16.
   peak memory down by most of today's ~700 MB; incremental rebuilds:
   unchanged functions reuse their optimized code from the cache that
   already serves the query tools
-- after 0.18 the type system has settled: the language specification is
-  written (see "Toward 1.0")
+- the language specification waits for 0.23 (see "After 0.23: the
+  specification")
 
 ## After 0.18: a standard library, and a real program on it
 
@@ -1060,6 +1060,17 @@ no-UB rule. It comes before the standard library build-out, which uses it
 - what writing it reveals feeds the surface-language rework of "Toward
   1.0"
 
+## After 0.23: the specification
+
+Decided with the user on 2026-10-16: once 0.23 has shipped, the whole
+language is specified thoroughly, its syntax and all of its semantics
+(types, values and moves, references and views, effects and
+allocation, contracts, generics and traits, modules, unsafe and the C
+boundary, concurrency and the memory model, what is and is not
+undefined), as a document a reader can check the compiler against. It
+is written with the user, and the compiler's behaviour is tested against
+it.
+
 ## Toward 1.0
 
 1.0 is not a feature milestone: it ships when the language is thought
@@ -1074,8 +1085,7 @@ through and stable, after as many 0.11.x / 0.12+ iterations as that takes:
   compiler, no known miscompiles
 - making the language and its tools work for agents as well as people:
   ideas collected in [agents.md](agents.md)
-- a written language specification, once the type system and the
-  agent-facing design have settled
+- the written language specification (after 0.23, above)
 - 1.0 freezes compatibility, not features: from 1.0 on, additions are minor
   releases and breaking changes wait for 2.0
 
