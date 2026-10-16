@@ -11,14 +11,17 @@
 use crate::base::IntVec;
 
 use crate::middle::ir::{
-    BLOCKS, INSTS, IRFUNCS, Op, SLOTS, ir_arg, ir_enter, ir_insert_before, ir_make, ir_operand,
-    ir_operand_count, ir_unlink, ir_val,
+    BLOCKS, INSTS, INST_COUNT, IRF, IRFUNCS, Op, SLOTS, Term, ir_arg, ir_enter, ir_insert_before,
+    ir_make, ir_operand, ir_operand_count, ir_replace, ir_unlink, ir_val,
 };
 
 use crate::middle::gvn::{address_base, copy_dst, copy_src, find_escaping_slots, is_copy, root_of};
 
 use crate::middle::opt::{dominates, resolve_all};
 
+use crate::back::abi::fn_uses_c;
+use crate::front::ast::{NODES, NodeKind};
+use crate::front::own::diag::{MODE_ERROR, OWN_MODE};
 use crate::front::types::{TY_U64, type_size};
 use crate::middle::loops::{analyze_loops, innermost_loop};
 
@@ -26,6 +29,50 @@ use crate::middle::loops::{analyze_loops, innermost_loop};
 static mut USES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 // The copies that are candidates.
 static mut CANDIDATES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// (0.17) The copies that are moves (COPY_MOVE): `let w = v` of an owned
+// local under --values=error, (function, instruction) pairs, noted by the
+// lowering (lower_let). The own pass guarantees v is not read again before
+// it is initialized again, and a move in a loop needs v initialized again
+// before the next one: with every other use of v before the copy (as
+// elidable requires), v is written whole in each iteration before it is
+// moved, so such a copy is elided in a loop too.
+static mut MOVE_COPIES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// Whether expression n moves an owned local (`let w = v`): its value is
+// v's, which nothing reads until v is initialized again.
+pub fn moves_local(n: i64) -> bool {
+    unsafe {
+        OWN_MODE == MODE_ERROR && NODES[n].kind == NodeKind::Ident
+            && NODES[n].res == crate::front::check::Res::Local
+            && (crate::front::own::kinds::type_kind(NODES[n].ty)
+                & crate::front::own::kinds::K_OWNED) != 0
+    }
+}
+
+// Notes the copies the lowering made since instruction `first` of the
+// current function as moves.
+pub fn note_move_copies(first: i64) {
+    unsafe {
+        for v in first..INST_COUNT {
+            if INSTS[v].block != 0 && is_copy(v) {
+                MOVE_COPIES.push(IRF);
+                MOVE_COPIES.push(v);
+            }
+        }
+    }
+}
+
+fn is_move_copy(fi: i64, c: i64) -> bool {
+    unsafe {
+        for i in 0..MOVE_COPIES.count / 2 {
+            if MOVE_COPIES.data[2 * i] == fi && MOVE_COPIES.data[2 * i + 1] == c {
+                return true;
+            }
+        }
+        false
+    }
+}
 
 // The slot that address v is the start of (a SLOT instruction), or -1.
 fn whole_slot(v: i64) -> i64 {
@@ -169,10 +216,87 @@ fn place_slot(fi: i64, s: i64, d: i64, offset: i64) {
     }
 }
 
+// (0.17) The returned local is the result (NRVO): in a function returning a
+// compound value through the result pointer, a local slot s that every
+// return copies into it (and nothing else touches the result's memory)
+// becomes that memory, and the copies go. The caller's result is a fresh
+// slot of its own (lower/calls.tach), which nothing else the function
+// sees can reach. Only for copies that are memcpy calls (over
+// INLINE_COPY_MAX bytes): smaller locals are scalar replacement's, which
+// the result's memory would stop. A copy must end its block, which returns,
+// so that nothing reads or writes s after it (a defer after the copy).
+fn elide_result_copy(fi: i64) -> bool {
+    unsafe {
+        let f = IRFUNCS[fi].f;
+        let result = IRFUNCS[fi].result_ptr;
+        if result == 0 || f < 0 || fn_uses_c(f) {
+            return false;
+        }
+        let r = ir_val(result);
+        CANDIDATES.count = 0;
+        let mut s = -1;
+        for i in 0..IRFUNCS[fi].blocks.count {
+            let b = IRFUNCS[fi].blocks.data[i];
+            if BLOCKS[b].removed != 0 {
+                continue;
+            }
+            let mut v = BLOCKS[b].first;
+            while v != 0 {
+                for k in 0..ir_operand_count(v) {
+                    let w = ir_operand(v, k);
+                    if w == 0 || ir_val(w) != r {
+                        continue;
+                    }
+                    // The destination of a memcpy (its first argument).
+                    if !(is_copy(v) && INSTS[v].op != Op::Copy && k == 3) {
+                        return false;
+                    }
+                    let src = whole_slot(copy_src(v));
+                    if src < 0 || s >= 0 && src != s || SLOTS[src].size != copy_size(v)
+                        || INSTS[v].next != 0 || BLOCKS[b].term != Term::Ret {
+                        return false;
+                    }
+                    s = src;
+                    CANDIDATES.push(v);
+                }
+                v = INSTS[v].next;
+            }
+        }
+        if s < 0 || SLOTS[s].align > 8 {
+            return false;
+        }
+        find_escaping_slots(fi);
+        if SLOTS[s].escapes != 0 {
+            return false;
+        }
+        for i in 0..IRFUNCS[fi].blocks.count {
+            let b = IRFUNCS[fi].blocks.data[i];
+            if BLOCKS[b].removed != 0 {
+                continue;
+            }
+            let mut v = BLOCKS[b].first;
+            while v != 0 {
+                let next = INSTS[v].next;
+                if INSTS[v].op == Op::Slot && INSTS[v].imm == s {
+                    ir_replace(v, r);
+                }
+                v = next;
+            }
+        }
+        for i in 0..CANDIDATES.count {
+            ir_unlink(CANDIDATES.data[i]);
+        }
+        CANDIDATES.count = 0;
+        resolve_all(fi);
+        true
+    }
+}
+
 // Elides the copies of function fi that can be. Returns whether any was.
 pub fn elide_copies(fi: i64) -> bool {
     unsafe {
         ir_enter(fi);
+        let nrvo = elide_result_copy(fi);
         CANDIDATES.count = 0;
         for i in 0..IRFUNCS[fi].blocks.count {
             let b = IRFUNCS[fi].blocks.data[i];
@@ -195,7 +319,7 @@ pub fn elide_copies(fi: i64) -> bool {
             }
         }
         if CANDIDATES.count == 0 {
-            return false;
+            return nrvo;
         }
         resolve_all(fi);
         find_escaping_slots(fi);
@@ -234,7 +358,8 @@ pub fn elide_copies(fi: i64) -> bool {
             let s = whole_slot(copy_src(c));
             let b = INSTS[c].block;
             if d < 0 || s < 0 || d == s || SLOTS[d].escapes != 0 || SLOTS[s].escapes != 0
-                || offset % SLOTS[s].align != 0 || BLOCKS[b].order < 0 || innermost_loop(b) >= 0
+                || offset % SLOTS[s].align != 0 || BLOCKS[b].order < 0
+                || innermost_loop(b) >= 0 && !is_move_copy(fi, c)
                 || !elidable(c, s, d, offset) {
                 continue;
             }
@@ -245,6 +370,6 @@ pub fn elide_copies(fi: i64) -> bool {
         if changed {
             resolve_all(fi);
         }
-        changed
+        changed || nrvo
     }
 }
