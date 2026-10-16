@@ -16,11 +16,12 @@ directory, and its output is checked against this file.
 
 ## The evidence to compare against
 
-The assembly (`-o FILE.s` writes it) and the output on every sample,
-before any change:
+The assembly (`-o FILE.s` writes it; `--no-positions` leaves out the
+positions the run-time checks print, which move with the text) and the
+output on every sample, before any change:
 
 ```console
-$ tachyonc main.tach -o before.s
+$ tachyonc main.tach --no-positions -o before.s
 $ tachyonc main.tach -o pack && for f in samples/*.txt; do ./pack < $f; done > before.out
 $ cat before.out
 in        0 bytes  adler32 00000001
@@ -60,7 +61,7 @@ $ tachyonc refactor rename main::c2 sum_out
 renamed local c2 to sum_out in crate::main, 1 use	main.tach	+2 -2 lines
 $ tachyonc refactor rename main::p out
 renamed local p to out in crate::main, 4 uses	main.tach	+4 -4 lines
-$ tachyonc main.tach -o after.s && cmp before.s after.s && echo same assembly
+$ tachyonc main.tach --no-positions -o after.s && cmp before.s after.s && echo same assembly
 same assembly
 ```
 
@@ -85,7 +86,7 @@ rewrote 2 sites in 1 file	adler.tach	+2 -2 lines
 // adler.tach:10-11
 10	        low = (low + x as u64) % MOD_ADLER;
 11	        high = (high + low) % MOD_ADLER;
-$ tachyonc main.tach -o after.s && cmp before.s after.s && echo same assembly
+$ tachyonc main.tach --no-positions -o after.s && cmp before.s after.s && echo same assembly
 same assembly
 ```
 
@@ -121,7 +122,7 @@ fn run_at(s: [u8], i: i64) -> i64 {
     while i + n < s.len && s[i + n] == s[i] && n < 255 { n += 1; }
     n
 }
-$ tachyonc main.tach -o after.s && cmp before.s after.s && echo same assembly
+$ tachyonc main.tach --no-positions -o after.s && cmp before.s after.s && echo same assembly
 same assembly
 $ tachyonc fmt --check && echo formatted
 formatted
@@ -154,7 +155,7 @@ The compiled code changes now (there is a new function), so the
 evidence is the program's behaviour, on every sample:
 
 ```console
-$ tachyonc main.tach -o after.s && cmp -s before.s after.s || echo the assembly differs
+$ tachyonc main.tach --no-positions -o after.s && cmp -s before.s after.s || echo the assembly differs
 the assembly differs
 $ tachyonc main.tach -o pack && for f in samples/*.txt; do ./pack < $f; done | diff before.out - && echo same output
 same output

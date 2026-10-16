@@ -747,20 +747,29 @@ pub fn a64_call_indirect() {
 
 // ---- Run-time checks ----
 
-pub fn a64_panic(kind: i64) {
+// (0.18) site: the check's site (front/contracts/sites.tach), 0 for none,
+// in x4.
+pub fn a64_panic(kind: i64, site: i64) {
     unsafe {
         ins(c"mov x3, x9");
         ins(c"mov x2, x1");
         ins(c"mov x1, x0");
         ins_i(c"mov x0, #", kind, c"");
+        if site >= 0 {
+            a64_load_imm(4, site as u64);
+        }
         o(c"    bl ");
         emit_symbol_ref(function_prefix(), rt_panic_sym());
     }
     on();
 }
 
-// rt.panic(kind, a, b, c): dprintf(2, message[kind], a, b, c); (--trace)
-// __trace::dump(); exit(101).
+// rt.panic(kind, a, b, c, site): (0.18) when site is not 0,
+// dprintf(2, "%s:%u:%u: ", file, line, column) from the site tables;
+// then dprintf(2, message[kind], a, b, c); (--trace) __trace::dump();
+// exit(101). The messages are a table of 32-bit offsets from
+// rt.messages, the sites one of (line, file << 16 | column) pairs and the
+// files one of offsets from rt.files (emit_runtime).
 // Apple's arm64 ABI passes the variadic arguments on the stack, AAPCS64 in
 // registers.
 pub fn a64_runtime() {
@@ -770,8 +779,37 @@ pub fn a64_runtime() {
         o(c":\n");
         ins(c"stp x29, x30, [sp, #-16]!");
         ins(c"mov x29, sp");
+        ins(c"sub sp, sp, #64");
+        ins(c"stp x0, x1, [sp, #32]");
+        ins(c"stp x2, x3, [sp, #48]");
+        o(c"    cbz x4, ");
+        o(local_prefix());
+        o(c"rt.nosite\n");
+        a64_rt_addr(8, c"rt.sites");
+        ins(c"add x9, x8, x4, lsl #3");
+        ins(c"ldr w11, [x9]");
+        ins(c"ldr w12, [x9, #4]");
+        ins(c"ubfx x10, x12, #16, #16");
+        ins(c"ubfx x12, x12, #0, #16");
+        a64_rt_addr(8, c"rt.files");
+        ins(c"ldrsw x13, [x8, x10, lsl #2]");
+        ins(c"add x13, x8, x13");
         if APPLE_A64 {
-            ins(c"sub sp, sp, #32");
+            ins(c"stp x13, x11, [sp]");
+            ins(c"str x12, [sp, #16]");
+        } else {
+            ins(c"mov x2, x13");
+            ins(c"mov x3, x11");
+            ins(c"mov x4, x12");
+        }
+        a64_rt_addr(1, c"rt.at");
+        ins(c"mov w0, #2");
+        a64_call_c(c"dprintf");
+        o(local_prefix());
+        o(c"rt.nosite:\n");
+        ins(c"ldp x0, x1, [sp, #32]");
+        ins(c"ldp x2, x3, [sp, #48]");
+        if APPLE_A64 {
             ins(c"stp x1, x2, [sp]");
             ins(c"str x3, [sp, #16]");
         } else {
@@ -779,18 +817,9 @@ pub fn a64_runtime() {
             ins(c"mov x3, x2");
             ins(c"mov x2, x1");
         }
-        o(c"    adrp x8, ");
-        a64_modifier_before(A64_PAGE);
-        o(local_prefix());
-        o(c"rt.messages");
-        a64_modifier_after(A64_PAGE);
-        o(c"\n    add x8, x8, ");
-        a64_modifier_before(A64_PAGEOFF);
-        o(local_prefix());
-        o(c"rt.messages");
-        a64_modifier_after(A64_PAGEOFF);
-        on();
-        ins(c"add x1, x8, x0, lsl #7");
+        a64_rt_addr(8, c"rt.messages");
+        ins(c"ldrsw x9, [x8, x0, lsl #2]");
+        ins(c"add x1, x8, x9");
         ins(c"mov w0, #2");
         a64_call_c(c"dprintf");
         // (0.17) --trace: the frames.
@@ -802,5 +831,28 @@ pub fn a64_runtime() {
         }
         ins(c"mov w0, #101");
         a64_call_c(c"exit");
+    }
+}
+
+// (0.18) x`reg` = the address of the run-time helper's local label `name`.
+fn a64_rt_addr(reg: i64, name: *u8) {
+    unsafe {
+        o(c"    adrp x");
+        oi(reg);
+        o(c", ");
+        a64_modifier_before(A64_PAGE);
+        o(local_prefix());
+        o(name);
+        a64_modifier_after(A64_PAGE);
+        o(c"\n    add x");
+        oi(reg);
+        o(c", x");
+        oi(reg);
+        o(c", ");
+        a64_modifier_before(A64_PAGEOFF);
+        o(local_prefix());
+        o(name);
+        a64_modifier_after(A64_PAGEOFF);
+        on();
     }
 }

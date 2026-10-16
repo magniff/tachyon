@@ -59,7 +59,7 @@ fn main() -> i32 {
 }
 ```
 ```out (exit 101)
-index out of bounds: index 3, length 3
+main.tach:4:20: index out of bounds: index 3, length 3
 note: build with --trace for the line and its callers
 ```
 

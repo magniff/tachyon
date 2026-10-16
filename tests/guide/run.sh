@@ -199,7 +199,10 @@ check_block() {
         echo "pass $name" >"$d/result"
         return
     fi
-    if ! "$COMPILER" --deny-warnings --diagnostics=short "$d/prog.tach" -o "$d/prog" >"$d/compile.out" 2>&1; then
+    # (0.18: from its directory, as main.tach: a failed check's position
+    # reads `main.tach:LINE:COL`, as the guide shows it)
+    cp "$d/prog.tach" "$d/main.tach"
+    if ! (cd "$d" && "$COMPILER" --deny-warnings --diagnostics=short main.tach -o prog) >"$d/compile.out" 2>&1; then
         { echo "FAIL $name: does not compile"; sed 's/^/    /' "$d/compile.out"; } >"$d/result"
         return
     fi
@@ -357,7 +360,8 @@ mkdir -p "$WORK/std"
 "$COMPILER" guide 'std#every-item' >"$WORK/std/every.md" 2>&1
 printf 'fn main(gpa: Gpa) -> i32 {\n    let v: Vec<i64> = Vec::new_in(gpa);\n    0\n}\n' >"$WORK/std/main.tach"
 if (cd "$WORK/std" && "$COMPILER" query items std --root main.tach) >"$WORK/std/items" 2>&1; then
-    awk -F '\t' '$3 ~ /^pub / { s = $3; sub(/^pub /, "", s); print s }' "$WORK/std/items" >"$WORK/std/want"
+    # (0.18: the index's signatures leave std's clauses out)
+    awk -F '\t' '$3 ~ /^pub / { s = $3; sub(/^pub /, "", s); sub(/ (debug )?(requires|ensures) .*$/, "", s); print s }' "$WORK/std/items" >"$WORK/std/want"
     : >"$WORK/std/missing"
     while IFS= read -r sig; do
         grep -qF -- "$sig" "$WORK/std/every.md" || echo "$sig" >>"$WORK/std/missing"
@@ -510,7 +514,7 @@ try_case tuple '(i64, bool) = (1, true)' '(1, true)'
 try_case unit '' 'let x = 3;'
 try_case error "snippet:2:5: error[type error] expected 'i64', got '[u8]'" 'let a = 1;
 a + "b"'
-try_case panic 'index out of bounds: index 3, length 0
+try_case panic 'snippet:1:37: index out of bounds: index 3, length 0
 note: build with --trace for the line and its callers
 exit 101' 'let v: Vec<i64> = Vec::new_in(gpa); v.get(3)'
 printf 'struct P { x: i64 }\n\nlet p = P { x: 4 };\np.x * 10\n' >"$WORK/snip.tach"

@@ -112,6 +112,13 @@ compile_one() { # <n> <program>
         -e 's|\.tach:[0-9][0-9]*|.tach:N|g' -e 's|at line [0-9]*|at line N|g' "$d/a.out" >"$d/a.msg"
     sed -e "s|$COMPILER|tachyonc|g" -e "s|$COPY/||g" -e 's|line [0-9]*, column [0-9]*|POS|g' \
         -e 's|\.tach:[0-9][0-9]*|.tach:N|g' -e 's|at line [0-9]*|at line N|g' "$d/b.out" >"$d/b.msg"
+    # (0.18: the run-time checks' messages and sites hold positions and the
+    # conditions' text: from rt.messages to the next label that is not the
+    # helper's, left out)
+    for s in a b; do
+        [ -f "$d/$s.s" ] && awk '/rt\.messages:$/ { skip = 1; next }
+            skip && /^[^ \t].*:$/ && !/rt\./ { skip = 0 } !skip' "$d/$s.s" >"$d/$s.t" && mv "$d/$s.t" "$d/$s.s"
+    done
     if cmp -s "$d/a.rc" "$d/b.rc" && cmp -s "$d/a.msg" "$d/b.msg" \
         && { [ ! -f "$d/a.s" ] || cmp -s "$d/a.s" "$d/b.s"; }; then
         echo same >"$d/result"

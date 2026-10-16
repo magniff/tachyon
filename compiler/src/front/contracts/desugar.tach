@@ -1,19 +1,336 @@
 // The clauses as checked AST (0.18 T1, design §5 "Desugaring"): a direct
-// call's requires checked at the call, each return's ensures, the
-// invariant at a module's boundary. Both back ends then lower the checks
-// through `lower_check` with the site's number. Phase 0: no-ops.
+// call's requires checked at the call, and the assertions made checks.
+// Both back ends then lower each `std::contract_check(COND, SITE, CHECK)`
+// as a branch to the run-time failure (front/contracts/checks.tach).
+//
+// desugar_call runs on every Call the checker has just checked (from
+// synth_expr and check_expr):
+// - a call of f that has a requires, `f(a, b)`, becomes the block
+//   `{ let ?a0 = a; let ?a1 = b; f?pre(SITE, ?a0, ?a1); f(?a0, ?a1) }`:
+//   the arguments evaluated once, in order, then checked (blaming the
+//   call's position, SITE), then the call (expand.tach makes `f?pre`);
+// - `assert(c)`, `assert(c, "m")`, `assert_eq(a, b)`, `assert_ne(a, b)`,
+//   `debug_assert(c)` (std's, not a program's own) become
+//   `std::contract_check(c, SITE, CHECK)` (`a == b`, `a != b`);
+//   `debug_assert` nothing outside test builds.
+// The node is rewritten in place (its parent keeps it); its parts are
+// checked already.
 
-// A direct call `n` of a function with requires: the arguments bound to
-// temporaries, the clauses checked, then the call.
+use crate::base::{buf_bytes, buf_clear, buf_new, buf_slice, buf_str, intern, intern_c};
+use crate::front::ast::{
+    NODES, NODE_CHECKED, NodeKind, child, list_begin, list_end, list_push, new_node,
+};
+use crate::front::check::{CUR_FN, Res, pop_scope, push_scope};
+use crate::front::check::synth_mode::synth_expr;
+use crate::front::contracts::checks::{CHECK_FN, CHECK_TEXT, CHK_ASSERT, add_check};
+use crate::front::contracts::expand::{ANY_REQUIRES, PRE_OF};
+use crate::front::contracts::flags::DEBUG_CONTRACTS;
+use crate::front::contracts::sites::site_of;
+use crate::front::generics::instantiate::fn_instance;
+use crate::front::lexer::{Tok, add_string};
+use crate::front::modules::STD_MODULE;
+use crate::front::patterns::check_pattern;
+use crate::front::types::{FNS, FN_COUNT, TLISTS, TSCRATCH, TY_BOOL, TY_I64, TY_UNIT};
+
+static mut WORDS: bool = false;
+static mut SYM_ASSERT: i64 = 0;
+static mut SYM_ASSERT_EQ: i64 = 0;
+static mut SYM_ASSERT_NE: i64 = 0;
+static mut SYM_DEBUG_ASSERT: i64 = 0;
+static mut SYM_CHECK: i64 = 0;
+static mut TEXT: i64 = -1;
+
+fn words() {
+    unsafe {
+        if WORDS {
+            return;
+        }
+        SYM_ASSERT = intern_c(c"std.assert");
+        SYM_ASSERT_EQ = intern_c(c"std.assert_eq");
+        SYM_ASSERT_NE = intern_c(c"std.assert_ne");
+        SYM_DEBUG_ASSERT = intern_c(c"std.debug_assert");
+        SYM_CHECK = intern_c(c"std.contract_check");
+        TEXT = buf_new();
+        WORDS = true;
+    }
+}
+
+// std::contract_check's FNS index (-1 when std is not loaded).
+pub fn check_fn() -> i64 {
+    unsafe {
+        if CHECK_FN >= 0 {
+            return CHECK_FN;
+        }
+        words();
+        for f in 0..FN_COUNT {
+            if FNS[f].name == SYM_CHECK && FNS[f].module == STD_MODULE {
+                CHECK_FN = f;
+                return f;
+            }
+        }
+        -1
+    }
+}
+
+// The Call n just checked, desugared when it calls a function with a
+// requires or an assertion. Returns n.
 pub fn desugar_call(n: i64) -> i64 {
-    n
+    unsafe {
+        if NODES[n].kind != NodeKind::Call || NODES[n].x <= 0 || CUR_FN < 0 {
+            return n;
+        }
+        let f = NODES[n].x - 1;
+        if FNS[f].module == STD_MODULE {
+            let name = FNS[if FNS[f].tmpl > 0 { FNS[f].tmpl - 1 } else { f }].name;
+            words();
+            if name == SYM_CHECK {
+                CHECK_FN = if FNS[f].tmpl > 0 { FNS[f].tmpl - 1 } else { f };
+                crate::front::contracts::CHECK_CALLS.push(n);
+                return n;
+            }
+            if name == SYM_ASSERT || name == SYM_DEBUG_ASSERT {
+                assertion(n, name == SYM_DEBUG_ASSERT);
+                return n;
+            }
+            if name == SYM_ASSERT_EQ || name == SYM_ASSERT_NE {
+                assert_compare(n, name == SYM_ASSERT_EQ);
+                return n;
+            }
+        }
+        if !ANY_REQUIRES || FNS[f].variadic {
+            return n;
+        }
+        let tf = if FNS[f].tmpl > 0 { FNS[f].tmpl - 1 } else { f };
+        let pre_node = PRE_OF.get(FNS[tf].node + 1);
+        if pre_node == 0 || NODES[pre_node].x <= 0 {
+            return n;
+        }
+        let pt = NODES[pre_node].x - 1;
+        let mut pre = pt;
+        if FNS[f].tmpl > 0 {
+            let mark = TSCRATCH.count;
+            for i in 0..FNS[f].targ_count {
+                TSCRATCH.push(TLISTS.data[FNS[f].targs + i]);
+            }
+            pre = fn_instance(pt, mark, n);
+        } else {
+            crate::front::assoc::ensure_checked(pt, n);
+        }
+        requires_call(n, pre);
+        n
+    }
 }
 
-// A `return` (or a tail, or `?`'s return) `n` of a function with ensures.
-pub fn desugar_return(n: i64) -> i64 {
-    n
+// Call n of a function with a requires, whose companion is `pre` (a FNS
+// index): `{ let ?aI = argI; ...; pre(SITE, ?a0, ..); f(?a0, ..) }`. An
+// argument that is a simple read (a local, a literal, `&place` of one) is
+// read again instead of bound: nothing runs between the two calls, and a
+// borrow stays a borrow (`&v` passed to `self: *Vec<T>`).
+fn requires_call(n: i64, pre: i64) {
+    unsafe {
+        words();
+        let start = NODES[n].start;
+        let end = NODES[n].end;
+        let count = NODES[n].count;
+        let inner = new_node(NodeKind::Call, start, end);
+        NODES[inner] = NODES[n];
+        NODES[inner].p |= NODE_CHECKED;
+        // The arguments' lets, checked by hand (their values are).
+        push_scope();
+        let lets = list_begin();
+        for i in 0..count {
+            let arg = child(n, i);
+            if simple_read(arg, 0) {
+                continue;
+            }
+            buf_clear(TEXT);
+            buf_str(TEXT, c"?a");
+            crate::base::buf_int(TEXT, i);
+            let sym = intern(buf_slice(TEXT));
+            let bind = new_node(NodeKind::PatBind, NODES[arg].start, NODES[arg].end);
+            NODES[bind].a = sym;
+            let s = new_node(NodeKind::Let, NODES[arg].start, NODES[arg].end);
+            NODES[s].a = bind;
+            NODES[s].c = arg;
+            check_pattern(bind, NODES[arg].ty);
+            list_push(s);
+        }
+        // pre(SITE, ?a0, ...), then f(?a0, ...).
+        let site = new_node(NodeKind::Int, start, start);
+        NODES[site].a = site_of(n, 0);
+        NODES[site].ty = TY_I64;
+        let pc = new_node(NodeKind::Call, start, end);
+        NODES[pc].x = pre + 1;
+        NODES[pc].ty = TY_UNIT;
+        NODES[pc].p |= NODE_CHECKED;
+        let pm = list_begin();
+        list_push(site);
+        for i in 0..count {
+            list_push(arg_use(child(n, i), i));
+        }
+        list_end(pc, pm);
+        let im = list_begin();
+        for i in 0..count {
+            list_push(arg_use(child(n, i), i));
+        }
+        list_end(inner, im);
+        pop_scope();
+        let stmt = new_node(NodeKind::ExprStmt, start, end);
+        NODES[stmt].a = pc;
+        NODES[stmt].b = 1;
+        list_push(stmt);
+        let ty = NODES[n].ty;
+        let p = NODES[n].p;
+        let fresh = new_node(NodeKind::Block, start, end);
+        NODES[n] = NODES[fresh];
+        NODES[n].start = start;
+        NODES[n].end = end;
+        list_end(n, lets);
+        NODES[n].a = inner;
+        NODES[n].ty = ty;
+        NODES[n].p = p | NODE_CHECKED;
+    }
 }
 
-// The boundary checks of function `f` of a module whose type has an
-// invariant.
-pub fn desugar_boundary(f: i64) {}
+// Argument i of the call as passed to each of the two calls: a copy of a
+// simple read, or an Ident of its let (`?aI`), checked: it names the local.
+fn arg_use(arg: i64, i: i64) -> i64 {
+    unsafe {
+        if simple_read(arg, 0) {
+            return copy_read(arg);
+        }
+        buf_clear(TEXT);
+        buf_str(TEXT, c"?a");
+        crate::base::buf_int(TEXT, i);
+        let id = new_node(NodeKind::Ident, NODES[arg].start, NODES[arg].end);
+        NODES[id].a = intern(buf_slice(TEXT));
+        synth_expr(id);
+        id
+    }
+}
+
+// Whether checked node n is a read that may be repeated: a literal, a
+// local or parameter, a constant, `&` or `*` or a field of one.
+fn simple_read(n: i64, depth: i64) -> bool {
+    unsafe {
+        if depth > 6 {
+            return false;
+        }
+        match NODES[n].kind {
+            NodeKind::Int | NodeKind::Bool | NodeKind::Char | NodeKind::Float
+                | NodeKind::Unit => true,
+            NodeKind::Ident => NODES[n].res == Res::Local || NODES[n].res == Res::Const,
+            NodeKind::Unary => (NODES[n].op == Tok::Amp || NODES[n].op == Tok::Star)
+                && simple_read(NODES[n].b, depth + 1),
+            NodeKind::FieldAccess | NodeKind::TupleField => simple_read(NODES[n].a, depth + 1),
+            _ => false,
+        }
+    }
+}
+
+// A copy of simple read n, with what the checker found.
+fn copy_read(n: i64) -> i64 {
+    unsafe {
+        if NODES[n].kind == NodeKind::Ident {
+            // (resolved again: a closure records its captured locals' uses)
+            let id = new_node(NodeKind::Ident, NODES[n].start, NODES[n].end);
+            NODES[id].a = NODES[n].a;
+            NODES[id].g = NODES[n].g;
+            synth_expr(id);
+            return id;
+        }
+        let c = new_node(NODES[n].kind, NODES[n].start, NODES[n].end);
+        NODES[c] = NODES[n];
+        match NODES[n].kind {
+            NodeKind::Unary => {
+                let b = copy_read(NODES[n].b);
+                NODES[c].b = b;
+            }
+            NodeKind::FieldAccess | NodeKind::TupleField => {
+                let a = copy_read(NODES[n].a);
+                NODES[c].a = a;
+            }
+            _ => {}
+        }
+        c
+    }
+}
+
+// Call n made `std::contract_check(cond, SITE, check)` (all checked).
+fn make_check(n: i64, cond: i64, check: i64) {
+    unsafe {
+        let cf = check_fn();
+        if cf < 0 {
+            return;
+        }
+        let start = NODES[n].start;
+        let site = new_node(NodeKind::Int, start, start);
+        NODES[site].a = site_of(n, 0);
+        NODES[site].ty = TY_I64;
+        let id = new_node(NodeKind::Int, start, start);
+        NODES[id].a = check;
+        NODES[id].ty = TY_I64;
+        let m = list_begin();
+        list_push(cond);
+        list_push(site);
+        list_push(id);
+        list_end(n, m);
+        NODES[n].x = cf + 1;
+        NODES[n].ty = TY_UNIT;
+    }
+}
+
+// `assert(c)`, `assert(c, "message")`, `debug_assert(..)`.
+fn assertion(n: i64, debug: bool) {
+    unsafe {
+        let cond = child(n, 0);
+        let mut message = 0;
+        if NODES[n].count > 1 {
+            let m = child(n, 1);
+            if NODES[m].kind == NodeKind::Str && crate::front::lexer::str_at(NODES[m].a).len > 0 {
+                message = m;
+            }
+        }
+        if debug && !DEBUG_CONTRACTS {
+            // Nothing: a unit value.
+            let start = NODES[n].start;
+            let end = NODES[n].end;
+            let ty = NODES[n].ty;
+            let fresh = new_node(NodeKind::Unit, start, end);
+            NODES[n] = NODES[fresh];
+            NODES[n].start = start;
+            NODES[n].end = end;
+            NODES[n].ty = ty;
+            return;
+        }
+        let check = add_check(CHK_ASSERT, cond, message, 0, NODES[n].start);
+        make_check(n, cond, check);
+    }
+}
+
+// `assert_eq(a, b)` (eq) or `assert_ne(a, b)`: the check of `a == b` or
+// `a != b`, reported with that text.
+fn assert_compare(n: i64, eq: bool) {
+    unsafe {
+        let a = child(n, 0);
+        let b = child(n, 1);
+        let cmp = new_node(NodeKind::Binary, NODES[a].start, NODES[b].end);
+        NODES[cmp].op = if eq { Tok::EqEq } else { Tok::BangEq };
+        NODES[cmp].b = a;
+        NODES[cmp].c = b;
+        NODES[a].p |= NODE_CHECKED;
+        NODES[b].p |= NODE_CHECKED;
+        synth_expr(cmp);
+        let check = add_check(CHK_ASSERT, cmp, 0, 0, NODES[n].start);
+        let text = buf_new();
+        buf_bytes(text, source(a));
+        buf_str(text, if eq { c" == " } else { c" != " });
+        buf_bytes(text, source(b));
+        CHECK_TEXT.data[check] = text;
+        make_check(n, cmp, check);
+    }
+}
+
+fn source(n: i64) -> [u8] {
+    unsafe { crate::base::SRC[NODES[n].start..NODES[n].end] }
+}

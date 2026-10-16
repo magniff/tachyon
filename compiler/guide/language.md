@@ -265,7 +265,7 @@ fn main() -> i32 {
 17
 world
 starts with hello
-index out of bounds: index 4, length 4
+main.tach:16:20: index out of bounds: index 4, length 4
 note: build with --trace for the line and its callers
 ```
 
